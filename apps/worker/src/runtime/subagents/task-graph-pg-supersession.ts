@@ -1,26 +1,20 @@
-import { taskGraphFingerprint, taskGraphItemId } from "./task-graph-snapshot.js"
+import { taskGraphFingerprint, taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 import { parseRegisteredScoutEnvelope, TaskGraphCommandError, type RegisteredScoutEnvelope, type TaskGraphTaskTemplate } from "./task-graph-command-port.js"
 import { actionList, type Queryable } from "./pg-store-persistence.js"
-import { canonicalTaskGraphJson, parseTaskGraphSnapshot, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
+import { canonicalTaskGraphJson, parseTaskGraphSnapshot, type StoredTaskGraphNode, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { reduceTaskGraphEvent, type TaskGraphNodeProposal } from "../planning/task-graph.js"
 import { taskGraphVerificationRole } from "../planning/task-graph-verification.js"
 import { createGraphTasks } from "./task-graph-pg-create.js"
-import { taskGraphSupersessionEnvelopeMatches, taskGraphSupersessionProposalMatches, writePlanReceiptWithIdentity, writeTaskLifecycleReceiptWithIdentity } from "./task-graph-pg-events.js"
-import { taskGraphLifecycleKey } from "./task-graph-snapshot.js"
+import { parseTaskGraphSupersessionRelation, TASK_GRAPH_SUPERSESSION_SCHEMA_VERSION,
+  taskGraphSupersessionEnvelopeMatches, taskGraphSupersessionProposalMatches, writePlanReceiptWithIdentity, writeTaskLifecycleReceiptWithIdentity } from "./task-graph-pg-events.js"
 import { deleteGraphDispatch } from "./task-graph-pg-lifecycle.js"
 import { prepareSteeringReconciliation, writeSteeringReconciliationReceipt } from "./steering-reconciliation-ledger.js"
 import type { SteeringReconciliationOperation } from "./steering-reconciliation-contract.js"
-import type { GraphParent, LoadedGraph } from "./task-graph-pg-state.js"
+import type { GraphEventScope, GraphParent, LoadedGraph } from "./task-graph-pg-state.js"
 import type { TaskGraphScheduleInput, TaskGraphScheduleReceipt } from "./task-graph-command-port.js"
 
-const SCHEMA_VERSION = "agent-harness.v2.task-graph-supersession.v2" as const
-const MAX_EVENT_SEQUENCE = 9_223_372_036_854_775_807n
-const OPERATION_KEY = /^agent\.plan\.reconciliation:sha256:[0-9a-f]{64}$/
-const FINGERPRINT = /^[0-9a-f]{64}$/
-const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/
-
 type Row = Record<string, unknown>
-type TaskIdentity = Readonly<{ nodeKey: string; taskId: string }>
+type TaskIdentity = Readonly<{ nodeKey: string; taskId: string; dependsOn?: readonly string[] }>
 type EventIdentity = Readonly<{ id: string; sequence: string }>
 type PlanEventIdentity = EventIdentity & Readonly<{ idempotencyKey: string }>
 const MAX_REVISION = 2_147_483_646
@@ -28,7 +22,7 @@ type PlanReplayLookup = (input: TaskGraphScheduleInput, key: string, fingerprint
   supersession?: Readonly<{ operationKey: string; observedRevision: number }>) => Promise<TaskGraphScheduleReceipt | null>
 
 export type TaskGraphSupersessionRelation = Readonly<{
-  schemaVersion: "agent-harness.v2.task-graph-supersession.v2"
+  schemaVersion: typeof TASK_GRAPH_SUPERSESSION_SCHEMA_VERSION
   operationKey: string
   observedRevision: number
   cancellationRevision: number
@@ -46,56 +40,31 @@ export type TaskGraphSupersessionRelation = Readonly<{
   }>
 }>
 
-function plainRecord(value: unknown): Row | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null
-  const prototype = Object.getPrototypeOf(value)
-  if (prototype !== Object.prototype && prototype !== null) return null
-  const descriptors = Object.getOwnPropertyDescriptors(value)
-  return Reflect.ownKeys(descriptors).every(key => typeof key === "string"
-    && descriptors[key]?.enumerable === true && "value" in descriptors[key]!)
-    ? value as Row : null
-}
+export { parseTaskGraphSupersessionRelation }
 
-function exactKeys(value: Row, keys: readonly string[]): boolean {
-  const actual = Reflect.ownKeys(value)
-  return actual.length === keys.length && actual.every(key => typeof key === "string" && keys.includes(key))
-}
-
-function boundedId(value: unknown, maximumLength = 256): value is string {
-  return typeof value === "string" && value.length > 0 && value.length <= maximumLength
-    && value.trim() === value && !CONTROL_CHARACTERS.test(value)
-}
-
-function revision(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
-}
-
-function eventSequence(value: unknown): bigint | null {
-  if (typeof value !== "string" || !/^[1-9][0-9]{0,18}$/.test(value)) return null
-  const parsed = BigInt(value)
-  return parsed <= MAX_EVENT_SEQUENCE ? parsed : null
-}
-
-function parseTaskIdentity(value: unknown): TaskIdentity | null {
-  const row = plainRecord(value)
-  if (!row || !exactKeys(row, ["nodeKey", "taskId"]) || !boundedId(row.nodeKey, 128) || !boundedId(row.taskId)) return null
-  return { nodeKey: row.nodeKey, taskId: row.taskId }
-}
-
-function parseEventIdentity(value: unknown): EventIdentity | null {
-  const row = plainRecord(value)
-  if (!row || !exactKeys(row, ["id", "sequence"]) || !boundedId(row.id) || eventSequence(row.sequence) === null) return null
-  return { id: row.id, sequence: row.sequence as string }
-}
-
-function parsePlanEventIdentity(value: unknown, observedRevision: number): PlanEventIdentity | null {
-  const row = plainRecord(value)
-  const expectedSuffix = `:supersession:${observedRevision}`
-  if (!row || !exactKeys(row, ["id", "sequence", "idempotencyKey"])
-    || !boundedId(row.id) || eventSequence(row.sequence) === null || !boundedId(row.idempotencyKey, 256)
-    || !/^task-graph-[0-9a-f]{64}:supersession:(0|[1-9][0-9]*)$/.test(row.idempotencyKey)
-    || !row.idempotencyKey.endsWith(expectedSuffix)) return null
-  return { id: row.id, sequence: row.sequence as string, idempotencyKey: row.idempotencyKey }
+export async function loadTaskGraphCancellationSource(client: Queryable, scope: GraphEventScope, selection: Readonly<{
+  eventId?: string; sequence?: string; nodeKey: string; taskId: string; expectedRevision: number; stepId: string
+}>): Promise<StoredTaskGraphNode | null> {
+  const result = await client.query<Row>(`SELECT event."payload"->'item'->'content' AS "content",
+      EXISTS (SELECT 1 FROM "agent_outbox" outbox WHERE outbox."idempotencyKey" = 'agent-event:' || event."id") AS "hasOutbox"
+    FROM "agent_events" AS event JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
+    JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
+    WHERE ($1::text IS NULL OR event."id" = $1) AND ($2::bigint IS NULL OR event."sequence" = $2::bigint)
+      AND event."sessionId" = $3 AND event."turnId" = $4 AND event."itemId" = $5 AND event."taskId" = $6
+      AND event."type" = 'item.delta' AND event."actor" = 'system' AND event."correlationId" = $4 AND event."causationId" = $7
+      AND event."idempotencyKey" = $8 AND event."payload"->>'kind' = 'lifecycle' AND event."payload"->>'revision' = $9::text
+      AND event."payload"->'event'->>'type' = 'task.cancelled' AND event."payload"->'event'->>'nodeKey' = $10
+      AND event."payload"->'event'->>'expectedRevision' = $11::text
+      AND event."payload"->'item'->>'id' = $5 AND event."payload"->'item'->>'revision' = $9::text
+      AND turn."userId" = $12 AND turn."rootTaskId" = $13 AND session."userId" = $12 LIMIT 2`,
+  [selection.eventId ?? null, selection.sequence ?? null, scope.sessionId, scope.turnId, taskGraphItemId(scope.rootTaskId), selection.taskId,
+    selection.stepId, taskGraphLifecycleKey(scope.rootTaskId, selection.nodeKey, 0, "task.cancelled"), selection.expectedRevision + 1,
+    selection.nodeKey, selection.expectedRevision, scope.userId, scope.rootTaskId])
+  if (result.rows.length !== 1 || result.rows[0]!.hasOutbox !== true) return null
+  try {
+    const source = parseTaskGraphSnapshot(result.rows[0]!.content).nodes.find(node => node.key === selection.nodeKey)
+    return source?.taskId === selection.taskId ? source : null
+  } catch { return null }
 }
 
 export function taskGraphSupersessionProposalKey(rootTaskId: string, expectedRevision: number): string {
@@ -108,8 +77,13 @@ export function taskGraphSupersessionFingerprint(source: TaskIdentity, proposal:
   nodes: readonly unknown[]
   rootSuccessCriteria?: readonly string[]
 }>): string {
+  const replacement = proposal.nodes.length === 1 && proposal.nodes[0] && typeof proposal.nodes[0] === "object"
+    ? proposal.nodes[0] as Record<string, unknown> : null
+  const oldEdgesDiffer = source.dependsOn !== undefined
+    && canonicalTaskGraphJson(source.dependsOn) !== canonicalTaskGraphJson(replacement?.dependsOn ?? null)
   return taskGraphFingerprint({
     source: { nodeKey: source.nodeKey, taskId: source.taskId },
+    ...(oldEdgesDiffer ? { sourceDependsOn: source.dependsOn } : {}),
     expectedRevision: proposal.expectedRevision,
     replaceUnstarted: { nodeKey: proposal.replaceUnstartedNodeKey },
     nodes: proposal.nodes,
@@ -137,7 +111,12 @@ export async function scheduleTaskGraphSupersession(client: Queryable, input: Ta
   const normalizedNodes = normalizeSupersessionNodes(input.proposal.nodes, input.scope.rootTaskId)
   const rootSuccessCriteria = input.rootSuccessCriteria
   if (priorRelation) {
-    const fingerprint = taskGraphSupersessionFingerprint(priorRelation.source, { expectedRevision: input.proposal.expectedRevision,
+    const cancelledSource = await loadTaskGraphCancellationSource(client, input.scope, {
+      eventId: priorRelation.cancellationEvent.id, sequence: priorRelation.cancellationEvent.sequence,
+      nodeKey: priorRelation.source.nodeKey, taskId: priorRelation.source.taskId,
+      expectedRevision: priorRelation.observedRevision, stepId: priorRelation.agentPlanCall.stepId })
+    if (!cancelledSource) throw new TaskGraphCommandError("idempotency_conflict", "Persisted supersession source proof is unavailable")
+    const fingerprint = taskGraphSupersessionFingerprint({ ...priorRelation.source, dependsOn: cancelledSource.dependsOn }, { expectedRevision: input.proposal.expectedRevision,
       replaceUnstartedNodeKey: sourceKey, nodes: normalizedNodes, rootSuccessCriteria })
     const replay = await findReplay(input, key, fingerprint, taskGraphItemId(input.scope.parentTaskId), { operationKey: prepared.idempotencyKey, observedRevision: input.proposal.expectedRevision })
     if (!replay || priorRelation.operationKey !== prepared.idempotencyKey || priorRelation.observedRevision !== input.proposal.expectedRevision
@@ -152,7 +131,7 @@ export async function scheduleTaskGraphSupersession(client: Queryable, input: Ta
   if (parent.taskType !== "root" || parent.role !== "orchestrator" || !actionList(parent.allowedActions).includes("agent.plan")) throw new TaskGraphCommandError("task_graph_supersession_not_eligible", "Only the native planning Root can supersede a typed leaf")
   const source = loaded.snapshot.nodes.find(node => node.key === sourceKey), replacement = input.proposal.nodes[0]!
   if (!source || source.taskId === replacement.key || source.key === replacement.key || source.verificationDisposition !== "typed"
-    || !taskGraphVerificationRole(source.templateId) || !taskGraphSupersessionProposalMatches(source, replacement, input.scope.rootTaskId)
+    || !taskGraphVerificationRole(source.templateId) || !taskGraphSupersessionProposalMatches(source, replacement, input.scope.rootTaskId, true)
     || loaded.snapshot.nodes.some(node => node.key !== sourceKey && (node.dependsOn.includes(sourceKey) || node.repairOf?.nodeKey === sourceKey))) {
     throw new TaskGraphCommandError("task_graph_supersession_not_eligible", "The requested typed leaf cannot be superseded")
   }
@@ -173,7 +152,7 @@ export async function scheduleTaskGraphSupersession(client: Queryable, input: Ta
   const sourceTaskId = typeof row.id === "string" ? row.id : ""
   if (!sourceTaskId || sourceTaskId !== source.taskId) throw new TaskGraphCommandError("task_graph_supersession_not_eligible", "The locked source identity changed")
   const sourceIdentity = { nodeKey: sourceKey, taskId: sourceTaskId }
-  const fingerprint = taskGraphSupersessionFingerprint(sourceIdentity, { expectedRevision: input.proposal.expectedRevision,
+  const fingerprint = taskGraphSupersessionFingerprint({ ...sourceIdentity, dependsOn: source.dependsOn }, { expectedRevision: input.proposal.expectedRevision,
     replaceUnstartedNodeKey: sourceKey, nodes: normalizedNodes, rootSuccessCriteria })
   if (await findReplay(input, key, fingerprint, taskGraphItemId(input.scope.parentTaskId), { operationKey: prepared.idempotencyKey, observedRevision: input.proposal.expectedRevision })) {
     throw new TaskGraphCommandError("idempotency_conflict", "A supersession plan event exists without its validated relation")
@@ -200,13 +179,13 @@ export async function scheduleTaskGraphSupersession(client: Queryable, input: Ta
   const snapshot = pinnedCriteria ? parseTaskGraphSnapshot({ ...stamped, rootSuccessCriteria: pinnedCriteria }) : stamped
   const replacementNode = snapshot.nodes.find(node => node.key === created.created[0]?.key)
   if (created.state.revision !== revision + 2 || created.created.length !== 1 || !replacementNode || replacementNode.taskId === source.taskId
-    || !taskGraphSupersessionEnvelopeMatches(source, replacementNode) || snapshot.nodes.some(node => node.key === sourceKey || node.taskId === sourceTaskId)
+    || !taskGraphSupersessionEnvelopeMatches(source, replacementNode, true, snapshot.nodes) || snapshot.nodes.some(node => node.key === sourceKey || node.taskId === sourceTaskId)
     || loaded.snapshot.nodes.filter(node => node.key !== sourceKey).some(node => { const next = snapshot.nodes.find(candidate => candidate.key === node.key)
       return !next || next.taskId !== node.taskId || canonicalTaskGraphJson(node) !== canonicalTaskGraphJson(next) })) throw new TaskGraphCommandError("task_graph_supersession_conflict", "Replacement does not preserve the original graph envelope")
   const receipt: TaskGraphScheduleReceipt = { status: "accepted", revision: created.state.revision, nodes: created.created, readyTaskIds: created.readyTaskIds }
   const planEvent = await writePlanReceiptWithIdentity(client, { scope: input.scope, state: created.state, snapshot, expectedRevision: revision + 1,
     now, idempotencyKey: key, fingerprint, receipt, operationKey: prepared.idempotencyKey, observedRevision: revision })
-  const relation = parseTaskGraphSupersessionRelation({ schemaVersion: SCHEMA_VERSION, operationKey: prepared.idempotencyKey,
+  const relation = parseTaskGraphSupersessionRelation({ schemaVersion: TASK_GRAPH_SUPERSESSION_SCHEMA_VERSION, operationKey: prepared.idempotencyKey,
     observedRevision: revision, cancellationRevision: revision + 1, resultingRevision: revision + 2,
     source: sourceIdentity, replacement: { nodeKey: replacementNode.key, taskId: replacementNode.taskId },
     cancellationEvent: { id: afterCancel.id, sequence: afterCancel.sequence }, planEvent: { ...planEvent, idempotencyKey: key }, replacementFingerprint: fingerprint,
@@ -215,7 +194,6 @@ export async function scheduleTaskGraphSupersession(client: Queryable, input: Ta
   await writeSteeringReconciliationReceipt(client, prepared, created.state.revision, relation)
   return receipt
 }
-
 function normalizeSupersessionNodes(nodes: readonly TaskGraphNodeProposal[], rootTaskId: string): readonly TaskGraphNodeProposal[] {
   return nodes.map(node => node.repairOf && !node.repairOf.graphRootTaskId
     ? { ...node, repairOf: { ...node.repairOf, graphRootTaskId: rootTaskId } } : node)
@@ -245,49 +223,4 @@ function parseScoutSchemaMarker(value: unknown): unknown {
   if (typeof value !== "string") return value
   try { const parsed: unknown = JSON.parse(value) as unknown; return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : undefined }
   catch { return undefined }
-}
-
-export function parseTaskGraphSupersessionRelation(value: unknown): TaskGraphSupersessionRelation | null {
-  try {
-    const row = plainRecord(value)
-    const keys = ["schemaVersion", "operationKey", "observedRevision", "cancellationRevision", "resultingRevision",
-      "source", "replacement", "cancellationEvent", "planEvent", "replacementFingerprint", "agentPlanCall"]
-    if (!row || !exactKeys(row, keys) || row.schemaVersion !== SCHEMA_VERSION
-      || typeof row.operationKey !== "string" || !OPERATION_KEY.test(row.operationKey)
-      || !revision(row.observedRevision) || row.observedRevision > Number.MAX_SAFE_INTEGER - 2
-      || row.cancellationRevision !== row.observedRevision + 1 || row.resultingRevision !== row.observedRevision + 2
-      || typeof row.replacementFingerprint !== "string" || !FINGERPRINT.test(row.replacementFingerprint)) return null
-
-    const source = parseTaskIdentity(row.source), replacement = parseTaskIdentity(row.replacement)
-    const cancellationEvent = parseEventIdentity(row.cancellationEvent), planEvent = parsePlanEventIdentity(row.planEvent, row.observedRevision)
-    const call = plainRecord(row.agentPlanCall)
-    if (!source || !replacement || source.nodeKey === replacement.nodeKey || source.taskId === replacement.taskId
-      || !cancellationEvent || !planEvent || cancellationEvent.id === planEvent.id
-      || BigInt(cancellationEvent.sequence) >= BigInt(planEvent.sequence)
-      || !call || !exactKeys(call, ["callId", "stepId", "expectedRevision", "replaceUnstarted"])
-      || !boundedId(call.callId) || !boundedId(call.stepId) || call.expectedRevision !== row.observedRevision) return null
-
-    const replaceUnstarted = plainRecord(call.replaceUnstarted)
-    if (!replaceUnstarted || !exactKeys(replaceUnstarted, ["nodeKey"]) || replaceUnstarted.nodeKey !== source.nodeKey) return null
-    return {
-      schemaVersion: SCHEMA_VERSION,
-      operationKey: row.operationKey,
-      observedRevision: row.observedRevision,
-      cancellationRevision: row.cancellationRevision as number,
-      resultingRevision: row.resultingRevision as number,
-      source,
-      replacement,
-      cancellationEvent,
-      planEvent,
-      replacementFingerprint: row.replacementFingerprint,
-      agentPlanCall: {
-        callId: call.callId,
-        stepId: call.stepId,
-        expectedRevision: call.expectedRevision as number,
-        replaceUnstarted: { nodeKey: replaceUnstarted.nodeKey as string },
-      },
-    }
-  } catch {
-    return null
-  }
 }

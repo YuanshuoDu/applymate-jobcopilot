@@ -6,8 +6,9 @@ import {
   type SteeringReconciliationReceipt, type SteeringReconciliationScope,
 } from "./steering-reconciliation-contract.js"
 import { canonicalTaskGraphJson, parseTaskGraphEvent, parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey, taskGraphProposalKey, type StoredTaskGraphNode } from "./task-graph-snapshot.js"
-import { taskGraphSupersessionFingerprint, taskGraphSupersessionProposalKey, type TaskGraphSupersessionRelation } from "./task-graph-pg-supersession.js"
+import { loadTaskGraphCancellationSource, taskGraphSupersessionFingerprint, taskGraphSupersessionProposalKey, type TaskGraphSupersessionRelation } from "./task-graph-pg-supersession.js"
 import { callMatches, type SupersessionCallBinding } from "./root-plan-criteria.js"
+import { taskGraphSupersessionEnvelopeMatches } from "./task-graph-pg-events.js"
 import type { TaskGraphExecutionScope, TaskGraphReadScope } from "./task-graph-command-port.js"
 
 type Client = Pick<pg.PoolClient, "query">
@@ -15,6 +16,7 @@ type Row = Record<string, unknown>
 type HistoryStep = Readonly<{ id: string; ordinal: number; attempt: number; cursor: bigint }>
 export type SteeringReconciliationHistoryEntry = Readonly<{ receipt: SteeringReconciliationReceipt; stepOrdinal: number; stepAttempt: number }>
 type ParsedReceipt = Readonly<{ receipt: SteeringReconciliationReceipt; sequence: bigint; id: string; idempotencyKey: string }>
+type VerifiedSupersession = Readonly<{ source: StoredTaskGraphNode; replacement: StoredTaskGraphNode }>
 const PAGE_SIZE = 64
 const STEP_STATUSES = new Set(["streaming", "waiting_for_tool", "waiting_for_approval", "waiting_for_user", "completed", "failed", "interrupted"])
 
@@ -48,7 +50,14 @@ export async function assertSteeringReconciliationCall(client: Client, scope: Ta
   if (!validSteeringReconciliationScope(scope) || !steeringReconciliationId(callId) || !steeringReconciliationRevision(expectedRevision)) throw new Error("steering_reconciliation_call_invalid")
   const result = await client.query<Row>(toolCallQuery(), [scope.sessionId, scope.turnId, scope.rootTaskId, callId, scope.stepId])
   const sequence = result.rows.length === 1 ? steeringReconciliationSequence(result.rows[0]!.eventSequence) : null
-  if (result.rows.length !== 1 || !callMatches(result.rows[0]!, scope, scope.stepId, decision, expectedRevision, binding, callMatchDependencies)
+  let matches = result.rows.length === 1 && callMatches(result.rows[0]!, scope, scope.stepId, decision, expectedRevision, binding, callMatchDependencies)
+  if (!matches && result.rows.length === 1 && binding?.replacementFingerprint && binding.source) {
+    const source = await loadTaskGraphCancellationSource(client, scope, { nodeKey: binding.source.nodeKey, taskId: binding.source.taskId,
+      expectedRevision, stepId: scope.stepId })
+    if (source) matches = callMatches(result.rows[0]!, scope, scope.stepId, decision, expectedRevision,
+      { ...binding, source: { ...binding.source, dependsOn: source.dependsOn } }, callMatchDependencies)
+  }
+  if (result.rows.length !== 1 || !matches
     || binding && (binding.callId !== undefined && binding.callId !== callId || binding.stepId !== undefined && binding.stepId !== scope.stepId
       || binding.operationKey !== undefined && binding.operationKey !== steeringReconciliationIdempotencyKey(scope, callId)
       || sequence === null)) throw new Error("steering_reconciliation_call_invalid")
@@ -56,8 +65,8 @@ export async function assertSteeringReconciliationCall(client: Client, scope: Ta
 }
 
 export async function assertSteeringReconciliationSupersessionEvents(client: Client, scope: SteeringReconciliationScope,
-  bindings: readonly Readonly<{ relation: TaskGraphSupersessionRelation; receiptEventId?: string; receiptSequence?: bigint }>[]): Promise<Map<string, StoredTaskGraphNode>> {
-  const replacements = new Map<string, StoredTaskGraphNode>()
+  bindings: readonly Readonly<{ relation: TaskGraphSupersessionRelation; receiptEventId?: string; receiptSequence?: bigint }>[]): Promise<Map<string, VerifiedSupersession>> {
+  const replacements = new Map<string, VerifiedSupersession>()
   if (!bindings.length) return replacements
   const eventIds = bindings.flatMap(binding => [binding.relation.cancellationEvent.id, binding.relation.planEvent.id])
   if (new Set(eventIds).size !== eventIds.length || bindings.some(binding => binding.receiptEventId !== undefined
@@ -85,7 +94,9 @@ export async function assertSteeringReconciliationSupersessionEvents(client: Cli
       || !cancelledSnapshot || !replacement || replacements.has(relation.agentPlanCall.callId)) {
       throw new Error("steering_reconciliation_supersession_event_invalid")
     }
-    replacements.set(relation.agentPlanCall.callId, replacement)
+    const source = cancelledSnapshot.nodes.find(node => node.key === relation.source.nodeKey && node.taskId === relation.source.taskId)
+    if (!source) throw new Error("steering_reconciliation_supersession_event_invalid")
+    replacements.set(relation.agentPlanCall.callId, { source, replacement })
   }
   return replacements
 }
@@ -121,7 +132,7 @@ function validPlanEvent(row: Row, scope: SteeringReconciliationScope, relation: 
     && unchanged.every(oldNode => {
       const current = snapshot.nodes.find(node => node.key === oldNode.key)
       return current?.taskId === oldNode.taskId && canonicalTaskGraphJson(current) === canonicalTaskGraphJson(oldNode)
-    }) && replacement && sameReplacementEnvelope(source, replacement))
+    }) && replacement && sameReplacementEnvelope(source, replacement, snapshot.nodes))
   const valid = Boolean(row.hasOutbox === true && row.itemId === taskGraphItemId(scope.rootTaskId) && row.taskId === scope.rootTaskId && row.type === "item.delta"
     && row.actor === "orchestrator" && row.correlationId === scope.turnId && row.causationId === relation.agentPlanCall.stepId
     && row.idempotencyKey === taskGraphSupersessionProposalKey(scope.rootTaskId, relation.observedRevision)
@@ -175,15 +186,11 @@ function exactAllowed(value: Row, required: readonly string[], optional: readonl
     && Boolean(descriptors[key]?.enumerable && "value" in descriptors[key]!)) && required.every(key => Object.hasOwn(value, key))
 }
 
-function sameReplacementEnvelope(sourceValue: unknown, replacementValue: unknown): boolean {
-  const source = object(sourceValue), replacement = object(replacementValue)
-  if (!source || !replacement) return false
-  const omitMutable = (node: Row) => Object.fromEntries(Object.entries(node)
-    .filter(([key]) => !["key", "taskId", "goal", "successCriteria"].includes(key)))
-  return canonicalTaskGraphJson(omitMutable(source)) === canonicalTaskGraphJson(omitMutable(replacement))
+function sameReplacementEnvelope(source: unknown, replacement: unknown, graphNodes: readonly StoredTaskGraphNode[]): boolean {
+  return taskGraphSupersessionEnvelopeMatches(source, replacement, true, graphNodes)
 }
 
-async function assertHistoryCalls(client: Client, scope: SteeringReconciliationScope, entries: readonly ParsedReceipt[], replacements: ReadonlyMap<string, StoredTaskGraphNode>): Promise<void> {
+async function assertHistoryCalls(client: Client, scope: SteeringReconciliationScope, entries: readonly ParsedReceipt[], replacements: ReadonlyMap<string, VerifiedSupersession>): Promise<void> {
   const counts = new Map(entries.map(entry => [entry, 0]))
   const byStep = new Map<string, ParsedReceipt[]>()
   for (const entry of entries) byStep.set(entry.receipt.stepId, [...(byStep.get(entry.receipt.stepId) ?? []), entry])
@@ -207,8 +214,9 @@ async function assertHistoryCalls(client: Client, scope: SteeringReconciliationS
         if (steeringReconciliationId(callId) && (!relation || relation.agentPlanCall.callId === callId)
           && callMatches(row, scope, entry.receipt.stepId, entry.receipt.decision, entry.receipt.observedRevision, relation ? {
             replaceUnstartedNodeKey: relation.agentPlanCall.replaceUnstarted.nodeKey, replacementFingerprint: relation.replacementFingerprint,
-          source: relation.source,
-            replacementNode: replacements.get(relation.agentPlanCall.callId),
+            source: replacements.has(relation.agentPlanCall.callId) ? { ...relation.source,
+              dependsOn: replacements.get(relation.agentPlanCall.callId)!.source.dependsOn } : undefined,
+            replacementNode: replacements.get(relation.agentPlanCall.callId)?.replacement,
             callId: relation.agentPlanCall.callId, stepId: relation.agentPlanCall.stepId, operationKey: relation.operationKey,
           } : undefined, callMatchDependencies)
           && steeringReconciliationIdempotencyKey({ ...scope, stepId: entry.receipt.stepId }, callId) === entry.idempotencyKey) {

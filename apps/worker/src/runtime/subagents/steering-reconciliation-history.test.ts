@@ -294,6 +294,35 @@ describe("durable steering reconciliation history", () => {
     expect(history).toEqual([{ receipt: f.receipt, stepOrdinal: 1, stepAttempt: 1 }])
   })
 
+  it("accepts a rewired dependency edge only when the cancellation snapshot binds the old edge", async () => {
+    const callInput = { expectedRevision: 1, replaceUnstarted: { nodeKey: "stale-scout" }, nodes: [{ key: "fresh-scout",
+      templateId: "scout", goal: "new goal", successCriteria: ["new criterion"], dependsOn: ["new-prerequisite"] }] }
+    const sourceNode = { key: "stale-scout", taskId: "source-task", templateId: "scout", goal: "old goal",
+      successCriteria: ["old criterion"], dependsOn: ["old-prerequisite"], depth: 1 }
+    const replacementNode = { ...sourceNode, key: "fresh-scout", taskId: "replacement-task", goal: "new goal",
+      successCriteria: ["new criterion"], dependsOn: ["new-prerequisite"], depth: 2 }
+    const relatedNodes = ["old-prerequisite", "new-prerequisite"].map((key, index) => ({ key, taskId: `${key}-task`, templateId: "analyst",
+      goal: `${key} goal`, successCriteria: [`${key} report`], dependsOn: [], depth: 1 }))
+    const seed = supersessionFixture({ callInput, sourceNode, replacementNode, relatedNodes })
+    const fingerprint = taskGraphSupersessionFingerprint({ nodeKey: "stale-scout", taskId: "source-task", dependsOn: sourceNode.dependsOn }, {
+      expectedRevision: 1, replaceUnstartedNodeKey: "stale-scout", nodes: normalizedCallNodes(callInput.nodes),
+    })
+    const relation = { ...(seed.relation as Record<string, unknown>), replacementFingerprint: fingerprint }
+    const accepted = supersessionFixture({ callInput, sourceNode, replacementNode, relatedNodes, relation })
+    await expect(historyEntries(accepted.client, 3)).resolves.toHaveLength(1)
+
+    const cancellation = accepted.events[0]!, payload = cancellation.payload as Record<string, unknown>
+    const item = payload.item as Record<string, unknown>, content = item.content as { schemaVersion: string; nodes: Array<Record<string, unknown>> }
+    const changedContent = { ...content, nodes: content.nodes.map(node => node.key === "stale-scout" ? { ...node, dependsOn: [] } : node) }
+    const events = accepted.events.map((event, index) => index === 0 ? { ...event, payload: { ...payload,
+      item: { ...item, content: changedContent } } } : event)
+    const tampered = supersessionFixture({ callInput, sourceNode, replacementNode, relatedNodes, relation, events })
+    await expect(historyEntries(tampered.client, 3)).rejects.toThrow()
+
+    const forgedDepth = supersessionFixture({ callInput, sourceNode, replacementNode: { ...replacementNode, depth: 3 }, relatedNodes, relation })
+    await expect(historyEntries(forgedDepth.client, 3)).rejects.toThrow("steering_reconciliation_supersession_event_invalid")
+  })
+
   it.each([
     ["multiple replacement nodes", (receipt: Record<string, unknown>) => ({ ...receipt, nodes: [...receipt.nodes as unknown[], ...receipt.nodes as unknown[]] })],
     ["a foreign replacement identity", (receipt: Record<string, unknown>) => ({ ...receipt, nodes: [{ ...(receipt.nodes as Record<string, unknown>[])[0]!, taskId: "foreign-task" }] })],

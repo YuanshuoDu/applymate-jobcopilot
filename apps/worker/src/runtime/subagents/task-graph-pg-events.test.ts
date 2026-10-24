@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import { appendTaskGraphReceipt, appendTaskGraphReceiptWithIdentity, taskGraphSupersessionEnvelopeMatches, taskGraphSupersessionProposalMatches, writePlanReceipt, writeTaskLifecycleReceipt, writeTaskLifecycleReceiptWithIdentity } from "./task-graph-pg-events.js"
-import { taskGraphFingerprint, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
+import { loadTaskGraphCancellationSource } from "./task-graph-pg-supersession.js"
+import { taskGraphFingerprint, taskGraphItemId, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import type { GraphScope } from "./task-graph-pg-state.js"
 import type { TaskGraphEvent } from "../planning/task-graph.js"
 
@@ -42,17 +43,51 @@ describe("TaskGraph event persistence", () => {
       { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [] })).resolves.toBe(2)
   })
 
-  it("allows only identity and explanatory text to vary in the supersession envelope", () => {
+  it("allows dependency changes only when the supersession caller opts in", () => {
     const source = { key: "old", taskId: "old-task", templateId: "scout", goal: "Old goal", successCriteria: ["Old text"],
       dependsOn: ["prerequisite"], depth: 2, verificationDisposition: "typed", verification: { role: "scout" },
       registeredScoutEnvelope: { role: "scout", taskType: "discovery" }, repairOf: { nodeKey: "prior", taskId: "prior-task" } }
     const replacement = { ...source, key: "new", taskId: "new-task", goal: "New goal", successCriteria: ["Previously verified" ] }
+    const graphNodes = [{ ...source, key: "new-prerequisite", taskId: "prerequisite-task", dependsOn: [], depth: 1 }]
     expect(taskGraphSupersessionEnvelopeMatches(source, replacement)).toBe(true)
+    const rewired = { ...replacement, dependsOn: ["new-prerequisite"] }
+    expect(taskGraphSupersessionEnvelopeMatches(source, rewired)).toBe(false)
+    expect(taskGraphSupersessionEnvelopeMatches(source, rewired, true, graphNodes)).toBe(true)
+    expect(taskGraphSupersessionEnvelopeMatches(source, rewired, true)).toBe(false)
+    expect(taskGraphSupersessionEnvelopeMatches(source, { ...rewired, depth: 3 }, true, graphNodes)).toBe(false)
+    expect(taskGraphSupersessionEnvelopeMatches(source, { ...replacement, depth: 3 }, true, graphNodes)).toBe(false)
+    expect(taskGraphSupersessionEnvelopeMatches(source, { ...rewired, verification: { role: "analyst" } }, true)).toBe(false)
     expect(taskGraphSupersessionEnvelopeMatches(source, { ...replacement, depth: 3 })).toBe(false)
     expect(taskGraphSupersessionEnvelopeMatches(source, { ...replacement, registeredScoutEnvelope: { role: "scout", taskType: "other" } })).toBe(false)
     expect(taskGraphSupersessionEnvelopeMatches(source, { ...replacement, repairOf: { nodeKey: "other", taskId: "prior-task" } })).toBe(false)
     expect(taskGraphSupersessionProposalMatches(source, replacement, "root-1")).toBe(true)
     expect(taskGraphSupersessionProposalMatches(source, { ...replacement, dependsOn: ["different"] }, "root-1")).toBe(false)
+    expect(taskGraphSupersessionProposalMatches(source, rewired, "root-1", true)).toBe(true)
+    expect(taskGraphSupersessionProposalMatches(source, { ...rewired, templateId: "analyst" }, "root-1", true)).toBe(false)
+  })
+
+  it("loads an owner-fenced cancellation snapshot only when its outbox evidence is present", async () => {
+    const scope: GraphScope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
+      stepId: "step-1", turnLeaseOwner: "turn-owner", turnLeaseVersion: 1, parentLeaseOwner: "parent-owner", parentAttemptCount: 1 }
+    const content = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
+      { key: "prior", taskId: "prior-task", templateId: "analyst", goal: "Prior goal", successCriteria: ["Report"], dependsOn: [], depth: 1 },
+      { key: "old", taskId: "old-task", templateId: "scout", goal: "Old goal", successCriteria: ["Report"], dependsOn: ["prior"], depth: 2 },
+    ] }
+    const query = vi.fn(async () => ({ rows: [{ content, hasOutbox: true }], rowCount: 1 }))
+    const client = { query } as unknown as Pick<pg.PoolClient, "query">
+    await expect(loadTaskGraphCancellationSource(client, scope, { eventId: "cancel-event", sequence: "21", nodeKey: "old",
+      taskId: "old-task", expectedRevision: 4, stepId: "step-1" })).resolves.toMatchObject({ dependsOn: ["prior"] })
+    const [sql, values] = query.mock.calls[0] as unknown as [string, unknown[]]
+    expect(sql).toContain('event."sequence" = $2::bigint')
+    expect(sql).toContain('turn."rootTaskId" = $13')
+    expect(sql).toContain('event."causationId" = $7')
+    expect(sql).toContain("agent_outbox")
+    expect(values).toEqual(["cancel-event", "21", scope.sessionId, scope.turnId, taskGraphItemId(scope.rootTaskId), "old-task", "step-1",
+      expect.stringContaining("task.cancelled"), 5, "old", 4, scope.userId, scope.rootTaskId])
+
+    const withoutOutbox = { query: vi.fn(async () => ({ rows: [{ content, hasOutbox: false }], rowCount: 1 })) } as unknown as Pick<pg.PoolClient, "query">
+    await expect(loadTaskGraphCancellationSource(withoutOutbox, scope, { eventId: "cancel-event", sequence: "21", nodeKey: "old",
+      taskId: "old-task", expectedRevision: 4, stepId: "step-1" })).resolves.toBeNull()
   })
 
   it("treats an omitted repair graph root as the active root for comparison only", () => {

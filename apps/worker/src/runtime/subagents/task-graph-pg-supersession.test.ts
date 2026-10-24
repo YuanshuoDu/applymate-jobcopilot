@@ -9,7 +9,7 @@ import {
 } from "./task-graph-pg-supersession.js"
 import { TaskGraphCommandError, type TaskGraphScheduleInput } from "./task-graph-command-port.js"
 import type { SteeringReconciliationOperation } from "./steering-reconciliation-contract.js"
-import { taskGraphProposalKey } from "./task-graph-snapshot.js"
+import { taskGraphProposalKey, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 
 const runtimeMocks = vi.hoisted(() => ({ prepare: vi.fn() }))
@@ -131,6 +131,20 @@ describe("parseTaskGraphSupersessionRelation", () => {
     expect(taskGraphSupersessionFingerprint(source, { ...proposal, rootSuccessCriteria: ["Changed checklist"] })).not.toBe(checklistFingerprint)
   })
 
+  it("binds changed old and new dependency sets while preserving the legacy digest for unchanged edges", () => {
+    const base = { expectedRevision: 12, replaceUnstartedNodeKey: "scout-old", nodes: [
+      { key: "scout-new", templateId: "scout", goal: "Find roles", successCriteria: ["Report"], dependsOn: ["new-prerequisite"] },
+    ] }
+    const oldEdges = { nodeKey: "scout-old", taskId: "task-old", dependsOn: ["old-prerequisite"] }
+    const rewired = taskGraphSupersessionFingerprint(oldEdges, base)
+    expect(rewired).not.toBe(taskGraphSupersessionFingerprint({ ...oldEdges, dependsOn: ["other-old"] }, base))
+    expect(rewired).not.toBe(taskGraphSupersessionFingerprint(oldEdges, { ...base, nodes: [{ ...base.nodes[0]!, dependsOn: ["other-new"] }] }))
+
+    const legacyProposal = { ...base, nodes: [{ ...base.nodes[0]!, dependsOn: [] }] }
+    const legacyDigest = taskGraphSupersessionFingerprint({ nodeKey: "scout-old", taskId: "task-old" }, legacyProposal)
+    expect(taskGraphSupersessionFingerprint({ nodeKey: "scout-old", taskId: "task-old", dependsOn: [] }, legacyProposal)).toBe(legacyDigest)
+  })
+
   it("rejects a persisted call that does not describe the superseded source request", () => {
     expect(parseTaskGraphSupersessionRelation(changed(["agentPlanCall", "replaceUnstarted", "nodeKey"], "scout-new"))).toBeNull()
     expect(parseTaskGraphSupersessionRelation(changed(["agentPlanCall", "replaceUnstarted"], { nodeKey: "scout-old", taskId: "task-old" }))).toBeNull()
@@ -193,14 +207,17 @@ describe("scheduleTaskGraphSupersession budget seam", () => {
     const replay = { status: "duplicate" as const, revision: 3, nodes: [{ key: "analyst-new", taskId: "replacement-task", status: "queued" as const }], readyTaskIds: ["replacement-task"] }
     const findReplay = vi.fn(async () => replay)
     const checkBudget = vi.fn(async () => { throw new Error("budget exhausted") })
-    const client = { query: vi.fn() }
+    const cancellation = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{ key: fixture.sourceNode.key, taskId: fixture.sourceNode.taskId,
+      templateId: fixture.sourceNode.templateId, goal: fixture.sourceNode.goal, successCriteria: fixture.sourceNode.successCriteria,
+      dependsOn: fixture.sourceNode.dependsOn, depth: fixture.sourceNode.depth }] }
+    const client = { query: vi.fn(async () => ({ rows: [{ content: cancellation, hasOutbox: true }], rowCount: 1 })) }
 
     await expect(scheduleTaskGraphSupersession(client as never, fixture.input, {} as never, fixture.loaded as never,
       fixture.operation, taskGraphSupersessionProposalKey("root-1", 1), findReplay, checkBudget)).resolves.toEqual(replay)
 
     expect(findReplay).toHaveBeenCalledOnce()
     expect(checkBudget).not.toHaveBeenCalled()
-    expect(client.query).not.toHaveBeenCalled()
+    expect(client.query).toHaveBeenCalledOnce()
   })
 
   it("runs the shared budget check after validation and before any supersession writes", async () => {

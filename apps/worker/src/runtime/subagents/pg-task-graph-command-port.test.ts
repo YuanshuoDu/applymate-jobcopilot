@@ -3,7 +3,7 @@ import type pg from "pg"
 
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import type { TaskGraphNativeCommandInput, TaskGraphScheduleInput, TaskGraphScheduledPrepareInput, TaskGraphScheduledPrepareReceipt } from "./task-graph-command-port.js"
-import { taskGraphFingerprint, taskGraphItemId, taskGraphProposalKey, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
+import { taskGraphFingerprint, taskGraphItemId, taskGraphLifecycleKey, taskGraphProposalKey, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import { taskGraphSupersessionFingerprint, taskGraphSupersessionProposalKey } from "./task-graph-pg-supersession.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
@@ -53,8 +53,32 @@ type FakePoolOptions = {
   sourceStepRows?: Array<Record<string, unknown>>
   replayPayload?: unknown
   sourceEvidence?: Record<string, unknown>
+  sourceCancellationEvent?: CancellationEventFixture
   sourceUpdateCount?: number
 }
+
+type CancellationEventFixture = Readonly<{
+  id: string
+  sequence: string
+  sessionId: string
+  turnId: string
+  itemId: string
+  taskId: string
+  rootTaskId: string
+  userId: string
+  type: "item.delta"
+  actor: "system"
+  correlationId: string
+  causationId: string
+  idempotencyKey: string
+  payload: Readonly<{
+    kind: "lifecycle"
+    event: Readonly<{ type: "task.cancelled"; nodeKey: string; expectedRevision: number }>
+    revision: number
+    item: Readonly<{ id: string; revision: number; content: unknown }>
+  }>
+  outboxIdempotencyKeys: readonly string[]
+}>
 
 const empty: QueryResult = { rows: [], rowCount: 0 }
 
@@ -117,6 +141,46 @@ function supersessionFixture(goal = "Refresh Dublin roles") {
     cancellationEvent: { id: "cancel-event", sequence: "11" }, planEvent: { id: "plan-event", sequence: "12", idempotencyKey: taskGraphSupersessionProposalKey(input.scope.rootTaskId, 1) },
     replacementFingerprint: fingerprint, agentPlanCall: { callId: operation.callId, stepId: input.scope.stepId!, expectedRevision: 1, replaceUnstarted } }
   return { input, operation, graphContent, taskRows, sourceEvidence, prepared, relation, sourceNode, replacementNode, operationKey, fingerprint }
+}
+
+function cancellationEventFor(fixture: ReturnType<typeof supersessionFixture>): CancellationEventFixture {
+  const { input, sourceNode, graphContent } = fixture
+  const itemId = taskGraphItemId(input.scope.rootTaskId)
+  const id = fixture.relation.cancellationEvent.id
+  return {
+    id,
+    sequence: fixture.relation.cancellationEvent.sequence,
+    sessionId: input.scope.sessionId,
+    turnId: input.scope.turnId,
+    itemId,
+    taskId: sourceNode.taskId,
+    rootTaskId: input.scope.rootTaskId,
+    userId: input.scope.userId,
+    type: "item.delta",
+    actor: "system",
+    correlationId: input.scope.turnId,
+    causationId: input.scope.stepId!,
+    idempotencyKey: taskGraphLifecycleKey(input.scope.rootTaskId, sourceNode.key, 0, "task.cancelled"),
+    payload: {
+      kind: "lifecycle",
+      event: { type: "task.cancelled", nodeKey: sourceNode.key, expectedRevision: 1 },
+      revision: 2,
+      item: { id: itemId, revision: 2, content: graphContent },
+    },
+    outboxIdempotencyKeys: [`agent-event:${id}`],
+  }
+}
+
+function cancellationSourceProofMatches(event: CancellationEventFixture, values: readonly unknown[]): boolean {
+  const [eventId, sequence, sessionId, turnId, itemId, taskId, stepId, idempotencyKey, revision, nodeKey, expectedRevision, userId, rootTaskId] = values
+  return event.id === eventId && event.sequence === String(sequence)
+    && event.sessionId === sessionId && event.turnId === turnId && event.itemId === itemId
+    && event.taskId === taskId && event.causationId === stepId && event.idempotencyKey === idempotencyKey
+    && String(event.payload.revision) === String(revision) && event.payload.event.nodeKey === nodeKey
+    && String(event.payload.event.expectedRevision) === String(expectedRevision)
+    && event.payload.item.id === itemId && String(event.payload.item.revision) === String(revision)
+    && event.rootTaskId === rootTaskId && event.userId === userId
+    && event.type === "item.delta" && event.actor === "system" && event.correlationId === turnId
 }
 
 function fakePool(input: TaskGraphScheduleInput, options: FakePoolOptions = {}) {
@@ -183,6 +247,10 @@ function fakePool(input: TaskGraphScheduleInput, options: FakePoolOptions = {}) 
       if (sql.startsWith('SELECT task."id", task."status"')) return { rows: taskRows, rowCount: taskRows.length }
       if (sql.startsWith('SELECT event."payload"')) {
         if (values.length === 5 && options.includeReplay !== false) return { rows: [{ payload: replayPayload }], rowCount: 1 }
+        if (values.length === 13 && options.sourceCancellationEvent && cancellationSourceProofMatches(options.sourceCancellationEvent, values)) {
+          return { rows: [{ content: options.sourceCancellationEvent.payload.item.content,
+            hasOutbox: options.sourceCancellationEvent.outboxIdempotencyKeys.includes(`agent-event:${options.sourceCancellationEvent.id}`) }], rowCount: 1 }
+        }
         return empty
       }
       if (sql.startsWith("SELECT EXISTS (") && sql.includes('FROM "agent_items"')) {
@@ -544,13 +612,14 @@ describe("createPgTaskGraphCommandPort", () => {
     const fake = fakePool(input, { graphRevision: 3, graphContent: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, rootSuccessCriteria: [goal, ...rootSuccessCriteria], nodes: [finalNode] },
       rootGoal: goal, turnInput: { goal, content: goal },
       taskRows: [{ id: finalNode.taskId, status: "queued", role: "analyst", taskType: "research", expectedOutputSchema: {}, attemptCount: 0, failureReason: null, result: null }],
-      replayPayload })
+      replayPayload, sourceCancellationEvent: cancellationEventFor(fixture) })
     reconciliationMocks.prepare.mockResolvedValueOnce(prepared)
 
     await expect(createPgTaskGraphCommandPort(fake.pool).appendAndScheduleWithReconciliation!(input, fixture.operation)).resolves.toMatchObject({
       status: "duplicate", revision: 3, nodes: [{ key: finalNode.key, taskId: finalNode.taskId }],
     })
     expect(reconciliationMocks.prepare).toHaveBeenCalledOnce()
+    expect(fake.calls.find(call => call.values.length === 13)?.values[0]).toBe(relation.cancellationEvent.id)
     expect(fake.calls.some(call => call.sql.includes('AS "hasChildren"'))).toBe(false)
     expect(fake.calls.some(call => call.sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
     expect(fake.calls.some(call => call.sql.startsWith('SELECT root_task."budgetSnapshot"'))).toBe(false)
@@ -567,7 +636,7 @@ describe("createPgTaskGraphCommandPort", () => {
     const fake = fakePool(fixture.input, { graphRevision: 4, graphContent: { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
       nodes: [{ key: "later-plan", templateId: "analyst", goal: "Later plan", successCriteria: ["Keep the newer plan"], dependsOn: [], depth: 1, taskId: "later-task" }] },
       taskRows: [{ id: "later-task", status: "queued", role: "analyst", taskType: "research", failureReason: null, result: null }],
-      replayPayload })
+      replayPayload, sourceCancellationEvent: cancellationEventFor(fixture) })
     reconciliationMocks.prepare.mockResolvedValueOnce(prepared)
 
     await expect(createPgTaskGraphCommandPort(fake.pool).appendAndScheduleWithReconciliation!(fixture.input, fixture.operation)).resolves.toEqual({
@@ -575,10 +644,31 @@ describe("createPgTaskGraphCommandPort", () => {
       nodes: [{ key: "replacement-analyst", taskId: "replacement-task", status: "queued" }], readyTaskIds: ["replacement-task"],
     })
     expect(reconciliationMocks.prepare).toHaveBeenCalledOnce()
+    expect(fake.calls.find(call => call.values.length === 13)?.values[0]).toBe(fixture.relation.cancellationEvent.id)
     expect(reconciliationMocks.create).not.toHaveBeenCalled()
     expect(reconciliationMocks.writePlanIdentity).not.toHaveBeenCalled()
     expect(reconciliationMocks.write).not.toHaveBeenCalled()
     expect(fake.calls.some(call => /^\s*(INSERT|UPDATE|DELETE)\b/i.test(call.sql))).toBe(false)
+  })
+
+  it("rejects a supersession replay whose cancellation event ID differs despite a matching sequence and source snapshot", async () => {
+    const fixture = supersessionFixture()
+    const relation = { ...fixture.relation, cancellationEvent: { ...fixture.relation.cancellationEvent, id: "altered-cancel-event" } }
+    const prepared = { ...fixture.prepared, resultingRevision: 3, receipt: { ...fixture.prepared.receipt,
+      schemaVersion: "agent-harness.v2.plan-reconciliation.v2", resultingRevision: 3, supersession: relation } }
+    const replayPayload = { kind: "proposal", fingerprint: fixture.fingerprint, operationKey: fixture.operationKey,
+      observedRevision: 1, revision: 3, receipt: { revision: 3, nodes: [{ key: "replacement-analyst", taskId: "replacement-task", status: "queued" }], readyTaskIds: ["replacement-task"] } }
+    const fake = fakePool(fixture.input, { graphRevision: 3, replayPayload, sourceCancellationEvent: cancellationEventFor(fixture) })
+    reconciliationMocks.prepare.mockResolvedValueOnce(prepared)
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndScheduleWithReconciliation!(fixture.input, fixture.operation))
+      .rejects.toMatchObject({ code: "idempotency_conflict" })
+
+    expect(fake.calls.find(call => call.values.length === 13)?.values[0]).toBe(relation.cancellationEvent.id)
+    expect(fake.calls.some(call => /^\s*(INSERT|UPDATE|DELETE)\b/i.test(call.sql))).toBe(false)
+    expect(reconciliationMocks.create).not.toHaveBeenCalled()
+    expect(reconciliationMocks.writePlanIdentity).not.toHaveBeenCalled()
+    expect(reconciliationMocks.write).not.toHaveBeenCalled()
   })
 
   it("conflicts on a changed replacement request after a committed supersession", async () => {

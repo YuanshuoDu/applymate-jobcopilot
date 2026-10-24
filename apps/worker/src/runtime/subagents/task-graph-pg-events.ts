@@ -4,20 +4,111 @@ import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { redactSensitiveText } from "@jobcopilot/shared"
 import type { TaskGraphEvent } from "../planning/task-graph.js"
 import type { GraphEventScope } from "./task-graph-pg-state.js"
-import { canonicalTaskGraphJson, TASK_GRAPH_ITEM_TYPE, taskGraphItemId, taskGraphSnapshot, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
+import { canonicalTaskGraphJson, TASK_GRAPH_ITEM_TYPE, parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey, taskGraphSnapshot,
+  type StoredTaskGraphNode, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
+import type { TaskGraphSupersessionRelation } from "./task-graph-pg-supersession.js"
 import type { TaskGraphState } from "../planning/task-graph.js"
 
 type Queryable = Pick<pg.PoolClient, "query">
+type Row = Record<string, unknown>
 type PlanReceipt = Readonly<{ status: "accepted" | "duplicate"; revision: number; nodes: readonly { key: string; taskId: string; status: "queued" | "waiting" }[]; readyTaskIds: readonly string[] }>
 export type TaskGraphPersistedEventIdentity = Readonly<{ id: string; sequence: string }>
-export function taskGraphSupersessionEnvelopeMatches(source: unknown, replacement: unknown): boolean {
+export const TASK_GRAPH_SUPERSESSION_SCHEMA_VERSION = "agent-harness.v2.task-graph-supersession.v2" as const
+const MAX_EVENT_SEQUENCE = 9_223_372_036_854_775_807n
+const OPERATION_KEY = /^agent\.plan\.reconciliation:sha256:[0-9a-f]{64}$/
+const FINGERPRINT = /^[0-9a-f]{64}$/
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/
+
+function plainRecord(value: unknown): Row | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null
+  const prototype = Object.getPrototypeOf(value)
+  if (prototype !== Object.prototype && prototype !== null) return null
+  const descriptors = Object.getOwnPropertyDescriptors(value)
+  return Reflect.ownKeys(descriptors).every(key => typeof key === "string"
+    && descriptors[key]?.enumerable === true && "value" in descriptors[key]!) ? value as Row : null
+}
+function exactKeys(value: Row, keys: readonly string[]): boolean {
+  const actual = Reflect.ownKeys(value)
+  return actual.length === keys.length && actual.every(key => typeof key === "string" && keys.includes(key))
+}
+function boundedId(value: unknown, maximumLength = 256): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= maximumLength
+    && value.trim() === value && !CONTROL_CHARACTERS.test(value)
+}
+function revision(value: unknown): value is number { return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 }
+function eventSequence(value: unknown): bigint | null {
+  if (typeof value !== "string" || !/^[1-9][0-9]{0,18}$/.test(value)) return null
+  const parsed = BigInt(value)
+  return parsed <= MAX_EVENT_SEQUENCE ? parsed : null
+}
+function parseTaskIdentity(value: unknown): TaskGraphSupersessionRelation["source"] | null {
+  const row = plainRecord(value)
+  if (!row || !exactKeys(row, ["nodeKey", "taskId"]) || !boundedId(row.nodeKey, 128) || !boundedId(row.taskId)) return null
+  return { nodeKey: row.nodeKey, taskId: row.taskId }
+}
+function parseEventIdentity(value: unknown): TaskGraphSupersessionRelation["cancellationEvent"] | null {
+  const row = plainRecord(value)
+  if (!row || !exactKeys(row, ["id", "sequence"]) || !boundedId(row.id) || eventSequence(row.sequence) === null) return null
+  return { id: row.id, sequence: row.sequence as string }
+}
+function parsePlanEventIdentity(value: unknown, observedRevision: number): TaskGraphSupersessionRelation["planEvent"] | null {
+  const row = plainRecord(value), suffix = `:supersession:${observedRevision}`
+  if (!row || !exactKeys(row, ["id", "sequence", "idempotencyKey"]) || !boundedId(row.id) || eventSequence(row.sequence) === null
+    || !boundedId(row.idempotencyKey, 256) || !/^task-graph-[0-9a-f]{64}:supersession:(0|[1-9][0-9]*)$/.test(row.idempotencyKey)
+    || !row.idempotencyKey.endsWith(suffix)) return null
+  return { id: row.id, sequence: row.sequence as string, idempotencyKey: row.idempotencyKey }
+}
+
+export function parseTaskGraphSupersessionRelation(value: unknown): TaskGraphSupersessionRelation | null {
+  try {
+    const row = plainRecord(value), keys = ["schemaVersion", "operationKey", "observedRevision", "cancellationRevision", "resultingRevision",
+      "source", "replacement", "cancellationEvent", "planEvent", "replacementFingerprint", "agentPlanCall"]
+    if (!row || !exactKeys(row, keys) || row.schemaVersion !== TASK_GRAPH_SUPERSESSION_SCHEMA_VERSION
+      || typeof row.operationKey !== "string" || !OPERATION_KEY.test(row.operationKey) || !revision(row.observedRevision)
+      || row.observedRevision > Number.MAX_SAFE_INTEGER - 2 || row.cancellationRevision !== row.observedRevision + 1
+      || row.resultingRevision !== row.observedRevision + 2 || typeof row.replacementFingerprint !== "string"
+      || !FINGERPRINT.test(row.replacementFingerprint)) return null
+    const source = parseTaskIdentity(row.source), replacement = parseTaskIdentity(row.replacement)
+    const cancellationEvent = parseEventIdentity(row.cancellationEvent), planEvent = parsePlanEventIdentity(row.planEvent, row.observedRevision)
+    const call = plainRecord(row.agentPlanCall)
+    if (!source || !replacement || source.nodeKey === replacement.nodeKey || source.taskId === replacement.taskId
+      || !cancellationEvent || !planEvent || cancellationEvent.id === planEvent.id
+      || BigInt(cancellationEvent.sequence) >= BigInt(planEvent.sequence) || !call
+      || !exactKeys(call, ["callId", "stepId", "expectedRevision", "replaceUnstarted"])
+      || !boundedId(call.callId) || !boundedId(call.stepId) || call.expectedRevision !== row.observedRevision) return null
+    const replaceUnstarted = plainRecord(call.replaceUnstarted)
+    if (!replaceUnstarted || !exactKeys(replaceUnstarted, ["nodeKey"]) || replaceUnstarted.nodeKey !== source.nodeKey) return null
+    return { schemaVersion: TASK_GRAPH_SUPERSESSION_SCHEMA_VERSION, operationKey: row.operationKey,
+      observedRevision: row.observedRevision, cancellationRevision: row.cancellationRevision as number,
+      resultingRevision: row.resultingRevision as number, source, replacement, cancellationEvent, planEvent,
+      replacementFingerprint: row.replacementFingerprint, agentPlanCall: { callId: call.callId, stepId: call.stepId,
+        expectedRevision: call.expectedRevision as number, replaceUnstarted: { nodeKey: replaceUnstarted.nodeKey as string } } }
+  } catch { return null }
+}
+
+export function taskGraphSupersessionEnvelopeMatches(source: unknown, replacement: unknown, allowDependencyRewire = false,
+  graphNodes?: readonly Pick<StoredTaskGraphNode, "key" | "depth">[]): boolean {
   const record = (value: unknown) => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null
   const left = record(source), right = record(replacement), mutable = new Set(["key", "taskId", "goal", "successCriteria"])
   if (!left || !right) return false
+  const rewired = allowDependencyRewire && canonicalTaskGraphJson(left.dependsOn ?? null) !== canonicalTaskGraphJson(right.dependsOn ?? null)
+  if (rewired) {
+    const dependencies: readonly unknown[] = Array.isArray(right.dependsOn) ? right.dependsOn : []
+    if (!Array.isArray(right.dependsOn) || !graphNodes) return false
+    let expectedDepth = 1
+    for (const key of dependencies) {
+      if (typeof key !== "string") return false
+      const dependency = graphNodes.find(node => node.key === key)
+      if (!dependency) return false
+      expectedDepth = Math.max(expectedDepth, dependency.depth + 1)
+    }
+    if (right.depth !== expectedDepth) return false
+    mutable.add("dependsOn"); mutable.add("depth")
+  }
   const envelope = (node: Record<string, unknown>) => Object.fromEntries(Object.entries(node).filter(([key]) => !mutable.has(key)))
   return canonicalTaskGraphJson(envelope(left)) === canonicalTaskGraphJson(envelope(right))
 }
-export function taskGraphSupersessionProposalMatches(source: unknown, proposal: unknown, rootTaskId: string): boolean {
+export function taskGraphSupersessionProposalMatches(source: unknown, proposal: unknown, rootTaskId: string, allowDependencyRewire = false): boolean {
   const left = source && typeof source === "object" && !Array.isArray(source) ? source as Record<string, unknown> : null
   const right = proposal && typeof proposal === "object" && !Array.isArray(proposal) ? proposal as Record<string, unknown> : null
   if (!left || !right) return false
@@ -26,8 +117,9 @@ export function taskGraphSupersessionProposalMatches(source: unknown, proposal: 
     const record = value as Record<string, unknown>
     return { ...record, graphRootTaskId: record.graphRootTaskId ?? rootTaskId }
   }
-  return ["templateId", "verification", "dependsOn", "nativeDelegation"]
+  return ["templateId", "verification", "nativeDelegation"]
     .every(key => canonicalTaskGraphJson(left[key] ?? null) === canonicalTaskGraphJson(right[key] ?? null))
+    && (allowDependencyRewire || canonicalTaskGraphJson(left.dependsOn ?? null) === canonicalTaskGraphJson(right.dependsOn ?? null))
     && canonicalTaskGraphJson(repairOf(left.repairOf)) === canonicalTaskGraphJson(repairOf(right.repairOf))
 }
 
