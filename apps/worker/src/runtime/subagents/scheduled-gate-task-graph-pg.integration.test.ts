@@ -57,10 +57,11 @@ let webDb: { db: { $disconnect(): Promise<void> } } | undefined
 let priorDatabaseUrl: string | undefined
 let priorAgentWebUrl: string | undefined
 let priorWorkerSecret: string | undefined
+let ownsLegacyAgentRunQuestionTable = false
 const fixtureUsers: string[] = []
 
 describeWithServices("scheduled Gate durable questions across real Worker restarts", () => {
-  beforeAll(() => {
+  beforeAll(async () => {
     pool = new Pool({ connectionString: databaseUrl!, max: 8 })
     priorDatabaseUrl = process.env.DATABASE_URL
     priorAgentWebUrl = process.env.AGENT_WEB_URL
@@ -68,6 +69,14 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
     const prismaUrl = new URL(databaseUrl!)
     prismaUrl.searchParams.set("application_name", `scheduled-gate-pg-${randomUUID()}`)
     process.env.DATABASE_URL = prismaUrl.toString()
+    const legacyTable = await pool.query<{ exists: boolean }>(`SELECT to_regclass('public."AgentRunQuestion"') IS NOT NULL AS "exists"`)
+    if (legacyTable.rows[0]?.exists !== true) {
+      // Disposable-test compatibility only; this does not verify fresh migrations.
+      await pool.query(`CREATE TABLE public."AgentRunQuestion" (
+        "id" TEXT PRIMARY KEY, "userId" TEXT NOT NULL, "runId" TEXT NOT NULL, "answer" TEXT
+      )`)
+      ownsLegacyAgentRunQuestionTable = true
+    }
   })
 
   afterEach(async () => {
@@ -102,6 +111,10 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
     await queue?.close()
     await queueRedis?.quit()
     if (pool && fixtureUsers.length) await pool.query(`DELETE FROM "User" WHERE "id" = ANY($1::text[])`, [fixtureUsers])
+    if (pool && ownsLegacyAgentRunQuestionTable) {
+      await pool.query(`DROP TABLE public."AgentRunQuestion"`)
+      ownsLegacyAgentRunQuestionTable = false
+    }
     await pool?.end()
     await webDb?.db.$disconnect()
     if (priorDatabaseUrl === undefined) delete process.env.DATABASE_URL
@@ -715,11 +728,11 @@ async function resumeCounts(clientPool: Pool, sessionId: string, turnId: string,
       AND "payload"->>'kind'='lifecycle' AND "payload"->'event'->>'type'='task.gate_choice_resumed'
       AND "payload"->'event'->>'gateTaskId'=$5 AND "payload"->'event'->>'requestAttemptCount'=$6
       AND "payload"->'event'->>'resumedAttemptCount'=$7`,
-  [sessionId, turnId, rootTaskId, lifecycleKey, gateTaskId, String(attempt), String(attempt + 1)])
+  [sessionId, turnId, gateTaskId, lifecycleKey, gateTaskId, String(attempt), String(attempt + 1)])
   const eventOutbox = await clientPool.query<{ count: string }>(`SELECT COUNT(*)::text AS "count" FROM "agent_outbox"
     WHERE "aggregateId"=$1 AND "topic"='agent.session.event' AND "payload"->>'idempotencyKey'=$2
       AND "payload"->>'type'='item.delta' AND "payload"->>'taskId'=$3 AND "payload"->>'turnId'=$4`,
-  [sessionId, lifecycleKey, rootTaskId, turnId])
+  [sessionId, lifecycleKey, gateTaskId, turnId])
   const dispatch = await dispatchState(clientPool, sessionId, gateTaskId)
   return { events: Number(events.rows[0]?.count ?? 0), eventOutbox: Number(eventOutbox.rows[0]?.count ?? 0),
     dispatchCount: dispatch.count, dispatchAttemptCount: dispatch.attemptCount, dispatchPublished: dispatch.published }
