@@ -43,7 +43,7 @@ const after: TaskGraphSnapshot = { ...before, nodes: [
   { ...proposals[0]!, taskId: "scout-new-task", depth: 1, verificationDisposition: "typed" },
   { ...proposals[1]!, taskId: "analyst-new-task", depth: 2, verificationDisposition: "typed" },
 ] }
-const callId = "branch-plan-call", observedRevision = 5, failureSequence = "10", cancellationSequence = "11", callSequence = "12", planSequence = "13"
+const callId = "branch-plan-call", observedRevision = 4, failureSequence = "10", cancellationSequence = "12", callSequence = "11", planSequence = "13"
 const failedIdentity = { id: "failed-event", sequence: failureSequence,
   idempotencyKey: taskGraphLifecycleKey(scope.rootTaskId, "scout-old", 1, "task.failed") }
 const cancellationIdentity = { id: "cancelled-event", sequence: cancellationSequence,
@@ -62,7 +62,7 @@ const relationValue = {
   failedSource: { source: branch.root, attemptCount: 1, resultDigest: "a".repeat(64), reportDigest: "b".repeat(64), event: failedIdentity },
   cancellations: [{ source: { nodeKey: "analyst-old", taskId: "analyst-old-task" }, event: cancellationIdentity }],
   verifiedExternalDependencies: [],
-  planEvent: { id: "plan-event", sequence: planSequence, idempotencyKey: taskGraphProposalKey(scope.rootTaskId, observedRevision) },
+  planEvent: { id: "plan-event", sequence: planSequence, idempotencyKey: taskGraphProposalKey(scope.rootTaskId, observedRevision + 1) },
   requestFingerprint, agentPlanCall: { callId, stepId: scope.stepId, expectedRevision: observedRevision, replaceBranch: branch },
 }
 function requiredRelation(value: unknown): TaskGraphFailedBranchRepairRelation {
@@ -98,19 +98,21 @@ function proposalRow(id: string, sequence: string, key: string, revision: number
 function fixture() {
   const graphId = taskGraphItemId(scope.rootTaskId)
   const failedPayload = { kind: "lifecycle", revision: 4,
-    event: { type: "task.failed", nodeKey: "scout-old", expectedRevision: 3, idempotencyKey: failedIdentity.idempotencyKey },
+    event: { type: "task.failed", nodeKey: "scout-old", expectedRevision: 3, idempotencyKey: failedIdentity.idempotencyKey,
+      failureReason: "task_graph_verification_unverified" },
     item: { schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: graphId, sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.rootTaskId,
       type: "task_graph", revision: 4, content: before } }
   const cancelledPayload = { kind: "lifecycle", revision: 5,
     event: { type: "task.cancelled", nodeKey: "analyst-old", expectedRevision: 4, idempotencyKey: cancellationIdentity.idempotencyKey },
     item: { schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: graphId, sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.rootTaskId,
-      type: "task_graph", revision: 5, content: before } }
+      stepId: scope.stepId, type: "task_graph", revision: 5, content: before } }
   const planPayload = { kind: "proposal", fingerprint: requestFingerprint, revision: 6, receipt, content: after,
     item: { id: graphId, sessionId: scope.sessionId, turnId: scope.turnId, stepId: scope.stepId, taskId: scope.rootTaskId,
       type: "task_graph", revision: 6, content: after } }
   const events = [
     eventRow(failedIdentity.id, failureSequence, failedIdentity.idempotencyKey, "scout-old-task", "system", failedPayload),
-    eventRow(cancellationIdentity.id, cancellationSequence, cancellationIdentity.idempotencyKey, "analyst-old-task", "system", cancelledPayload),
+    eventRow(cancellationIdentity.id, cancellationSequence, cancellationIdentity.idempotencyKey, "analyst-old-task", "system", cancelledPayload,
+      { causationId: scope.stepId }),
     eventRow("plan-event", planSequence, relation.planEvent.idempotencyKey, scope.rootTaskId, "orchestrator", planPayload,
       { itemId: graphId, causationId: scope.stepId }),
   ]
@@ -121,6 +123,10 @@ function fixture() {
     callItemId: "plan-call-item", stepId: scope.stepId, itemTaskId: scope.rootTaskId, itemType: "tool_call",
     itemContent: { toolCallId: callId, toolName: "agent.plan", toolVersion: "1", input },
   }
+  const cancelledTask = { id: "analyst-old-task", role: "analyst", status: "cancelled", attemptCount: 0, leaseOwner: null,
+    leaseExpiresAt: null, nextAttemptAt: null, startedAt: null, completedAt: new Date(0), closedAt: null,
+    interruptRequestedAt: null, failureReason: null, result: null, confidence: null, qualityGateResult: null,
+    contextSnapshotId: null, outputArtifactIds: [], sessionUserId: scope.userId, turnUserId: scope.userId, turnRootTaskId: scope.rootTaskId }
   const query = vi.fn(async (sql: string, values?: unknown[]) => {
     if (sql.includes("tool_call.started")) return { rows: [callRow], rowCount: 1 }
     if (sql.includes('event."id" = ANY($5::text[])')) {
@@ -134,22 +140,24 @@ function fixture() {
         BigInt(String(right.sequence)) > BigInt(String(left.sequence)) ? 1 : -1)[0]
       return { rows: latest ? [{ ...latest, sessionUserId: scope.userId, turnUserId: scope.userId, turnRootTaskId: scope.rootTaskId }] : [], rowCount: latest ? 1 : 0 }
     }
+    if (sql.includes('FROM "sub_agent_tasks" AS task JOIN "agent_sessions"')) return { rows: [cancelledTask], rowCount: 1 }
+    if (sql.includes('FROM "sub_agent_tasks" task WHERE')) return { rows: [{ id: "analyst-old-task", hasExecutionEvidence: false,
+      hasWaitEvidence: false, hasDispatch: false }], rowCount: 1 }
     throw new Error("unexpected history query")
   })
   const client = { query } as unknown as Pick<PoolClient, "query">
-  const evidence = { failedSource: relation.failedSource, cancellations: relation.cancellations,
-    verifiedExternalDependencies: relation.verifiedExternalDependencies }
+  const evidence = { failedSource: relation.failedSource, verifiedExternalDependencies: relation.verifiedExternalDependencies }
   prove.mockReset().mockResolvedValue(evidence)
   return { client, query, callRow, events, relation, receiptEvent: { id: "reconciliation-event", sequence: 14n,
     stepId: scope.stepId, idempotencyKey: operationKey } }
 }
 
 describe("persisted failed-branch repair history", () => {
-  it("reconstructs the accepted receipt from matching failure, automatic cancellation, original call, and public plan rows", async () => {
+  it("reconstructs the accepted receipt from matching failure, operation cancellation, original call, and public plan rows", async () => {
     const f = fixture()
     await expect(assertTaskGraphFailedBranchRepairHistory(f.client, scope, f.relation, f.receiptEvent))
       .resolves.toEqual(receipt)
-    expect(f.query).toHaveBeenCalledTimes(3)
+    expect(f.query).toHaveBeenCalledTimes(5)
     expect(prove).toHaveBeenCalledWith(f.client, expect.objectContaining({ snapshot: before, sourceNodes: expect.any(Array) }))
   })
 
@@ -158,13 +166,22 @@ describe("persisted failed-branch repair history", () => {
       successCriteria: ["Find one role"], dependsOn: [], depth: 1, verificationDisposition: "typed" as const, verification: scoutVerification }
     const observedGraph: TaskGraphSnapshot = { ...before, nodes: [...before.nodes, unrelated] }
     const finalGraph: TaskGraphSnapshot = { ...after, nodes: [...after.nodes, unrelated] }
-    const inputAtObserved = { ...input, expectedRevision: 6 }
+    const inputAtObserved = { ...input, expectedRevision: 5 }
     const fingerprint = taskGraphFailedBranchRepairFingerprint(inputAtObserved)
     const resultReceipt = { ...receipt, revision: 7 }
-    const unrelatedReceipt = { status: "accepted" as const, revision: 6,
+    const unrelatedReceipt = { status: "accepted" as const, revision: 5,
       nodes: [{ key: unrelated.key, taskId: unrelated.taskId, status: "queued" as const }], readyTaskIds: [unrelated.taskId] }
-    f.events.splice(2, 0, proposalRow("unrelated-plan", "12", taskGraphProposalKey(scope.rootTaskId, 5), 6,
+    f.events.splice(1, 0, proposalRow("unrelated-plan", "11", taskGraphProposalKey(scope.rootTaskId, 4), 5,
       "c".repeat(64), observedGraph, unrelatedReceipt))
+    const cancellation = f.events.find(row => row.id === "cancelled-event")!
+    cancellation.sequence = "13"
+    const cancellationPayload = cancellation.payload as Row
+    const cancellationItem = cancellationPayload.item as Row
+    cancellation.payload = { ...cancellationPayload, revision: 6,
+      event: { ...(cancellationPayload.event as Row), expectedRevision: 5 },
+      item: { ...cancellationItem, revision: 6, content: observedGraph } }
+    const cancellationOutbox = cancellation.outboxPayload as Row
+    cancellation.outboxPayload = { ...cancellationOutbox, sequence: "13", payload: cancellation.payload }
     const planIndex = f.events.findIndex(row => row.id === "plan-event")
     f.events[planIndex] = proposalRow("plan-event", "14", taskGraphProposalKey(scope.rootTaskId, 6), 7,
       fingerprint, finalGraph, resultReceipt)
@@ -173,16 +190,18 @@ describe("persisted failed-branch repair history", () => {
     f.events.push(proposalRow("later-plan", "16", taskGraphProposalKey(scope.rootTaskId, 7), 8,
       "d".repeat(64), laterGraph, { status: "accepted", revision: 8,
         nodes: [{ key: laterNode.key, taskId: laterNode.taskId, status: "queued" }], readyTaskIds: [laterNode.taskId] }))
-    f.callRow.eventSequence = "13"
+    f.callRow.eventSequence = "12"
     const callItem = f.callRow.itemContent as Row
     f.callRow.itemContent = { ...callItem, input: inputAtObserved }
-    const nextRelation = requiredRelation({ ...relationValue, observedRevision: 6, resultingRevision: 7,
+    const nextRelation = requiredRelation({ ...relationValue, observedRevision: 5, resultingRevision: 7,
       requestFingerprint: fingerprint,
+      cancellations: [{ source: relationValue.cancellations[0]!.source,
+        event: { ...relationValue.cancellations[0]!.event, sequence: "13" } }],
       planEvent: { id: "plan-event", sequence: "14", idempotencyKey: taskGraphProposalKey(scope.rootTaskId, 6) },
-      agentPlanCall: { ...relationValue.agentPlanCall, expectedRevision: 6 } })
+      agentPlanCall: { ...relationValue.agentPlanCall, expectedRevision: 5 } })
     f.relation = nextRelation
     f.receiptEvent = { id: "reconciliation-event", sequence: 15n, stepId: scope.stepId, idempotencyKey: operationKey }
-    prove.mockReset().mockResolvedValue({ failedSource: nextRelation.failedSource, cancellations: nextRelation.cancellations,
+    prove.mockReset().mockResolvedValue({ failedSource: nextRelation.failedSource,
       verifiedExternalDependencies: nextRelation.verifiedExternalDependencies })
     await expect(assertTaskGraphFailedBranchRepairHistory(f.client, scope, nextRelation, f.receiptEvent)).resolves.toEqual(resultReceipt)
   })
@@ -194,7 +213,7 @@ describe("persisted failed-branch repair history", () => {
       .rejects.toThrow("steering_reconciliation_failed_branch_event_invalid")
   })
 
-  it("rejects an extant cancellation whose graph revision does not continue the failed event", async () => {
+  it("rejects an extant cancellation whose revision does not match the observed graph", async () => {
     const f = fixture(), row = f.events[1]!, payload = row.payload as Row
     row.payload = { ...payload, revision: 6, event: { ...(payload.event as Row), expectedRevision: 5 } }
     await expect(assertTaskGraphFailedBranchRepairHistory(f.client, scope, f.relation, f.receiptEvent))
@@ -218,7 +237,7 @@ describe("persisted failed-branch repair history", () => {
     const outbox = row.outboxPayload as Row
     row.outboxPayload = { ...outbox, taskId: "different-task" }
     const evidence = { ...relation.failedSource, source: { nodeKey: "scout-old", taskId: "different-task" } }
-    prove.mockResolvedValueOnce({ failedSource: evidence, cancellations: relation.cancellations,
+    prove.mockResolvedValueOnce({ failedSource: evidence,
       verifiedExternalDependencies: relation.verifiedExternalDependencies })
     await expect(assertTaskGraphFailedBranchRepairHistory(f.client, scope, f.relation, f.receiptEvent))
       .rejects.toThrow("steering_reconciliation_failed_branch_event_invalid")

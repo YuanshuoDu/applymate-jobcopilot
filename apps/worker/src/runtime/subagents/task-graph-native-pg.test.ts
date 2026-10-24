@@ -169,25 +169,25 @@ function failedBranchRepairReceiptEvent(sourceTaskId: string) {
   const call = { expectedRevision: 4, replaceBranch, nodes: [{ key: "fresh-scout" }, { key: "fresh-analyst" }] }
   const relation = {
     schemaVersion: TASK_GRAPH_FAILED_BRANCH_REPAIR_RELATION_SCHEMA_VERSION,
-    operationKey, graphRootTaskId: scope.rootTaskId, observedRevision: 4, resultingRevision: 5, branchRoot,
+    operationKey, graphRootTaskId: scope.rootTaskId, observedRevision: 4, resultingRevision: 6, branchRoot,
     sources: replaceBranch.sources.map(source => ({ source: { nodeKey: source.nodeKey, taskId: source.taskId }, replacementKey: source.replacementKey })),
     failedSource: { source: branchRoot, attemptCount: 1, resultDigest: "a".repeat(64), reportDigest: "b".repeat(64),
       event: { id: "failed-event", sequence: "20", idempotencyKey: taskGraphLifecycleKey(scope.rootTaskId, branchRoot.nodeKey, 1, "task.failed") } },
     cancellations: [{ source: { nodeKey: "cancelled-analyst", taskId: sourceTaskId },
-      event: { id: "cancelled-event", sequence: "21", idempotencyKey: taskGraphLifecycleKey(scope.rootTaskId, "cancelled-analyst", 0, "task.cancelled") } }],
+      event: { id: "cancelled-event", sequence: "22", idempotencyKey: taskGraphLifecycleKey(scope.rootTaskId, "cancelled-analyst", 0, "task.cancelled") } }],
     verifiedExternalDependencies: [],
-    planEvent: { id: "plan-event", sequence: "22", idempotencyKey: taskGraphProposalKey(scope.rootTaskId, 4) },
+    planEvent: { id: "plan-event", sequence: "23", idempotencyKey: taskGraphProposalKey(scope.rootTaskId, 5) },
     requestFingerprint: taskGraphFailedBranchRepairFingerprint(call),
     agentPlanCall: { callId, stepId: scope.stepId, expectedRevision: 4, replaceBranch },
   }
   return {
     id: "failed-branch-reconciliation-event", itemId: null, taskId: scope.rootTaskId,
     type: STEERING_RECONCILIATION_EVENT_TYPE, actor: "orchestrator", correlationId: scope.turnId,
-    causationId: scope.stepId, sequence: "23", idempotencyKey: operationKey, hasOutbox: false,
+    causationId: scope.stepId, sequence: "24", idempotencyKey: operationKey, hasOutbox: false,
     payload: {
       schemaVersion: STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION,
       sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
-      stepId: scope.stepId, decision: "revise", observedRevision: 4, resultingRevision: 5,
+      stepId: scope.stepId, decision: "revise", observedRevision: 4, resultingRevision: 6,
       steerInputIds: [], inputCheckpoint: { throughSequence: "19" }, failedBranch: relation,
     }, relation,
   }
@@ -348,22 +348,29 @@ describe("native TaskGraph role admission", () => {
       { id: event.id, sequence: 44n, stepId: event.relation.agentPlanCall.stepId, idempotencyKey: event.idempotencyKey })
   })
 
-  it("blocks failed-branch sources only after validating the immutable v4 history", async () => {
+  it("blocks both the failed root and retired descendants after validating immutable v4 history", async () => {
     reconciliationMocks.assertFailedBranchHistory.mockClear()
-    const taskId = "cancelled-analyst-task", event = failedBranchRepairReceiptEvent(taskId)
-    const input: TaskGraphNativeCommandInput = {
-      scope, request: { kind: "followup", idempotencyKey: "followup-failed-branch-source", sourceTaskId: taskId, goal: "Continue audit" },
-    }
-    const fake = followupQueryFor(terminalSource(taskId), [event])
-    const loaded = { state: null, snapshot: null, tasks: new Map() } as unknown as LoadedGraph
+    const event = failedBranchRepairReceiptEvent("cancelled-analyst-task")
+    const sources = [
+      { taskId: "failed-scout-task", row: terminalSource("failed-scout-task", { role: "scout", taskType: "job_discovery", status: "failed", attemptCount: 1 }) },
+      { taskId: "cancelled-analyst-task", row: terminalSource("cancelled-analyst-task", { role: "analyst", taskType: "analysis", status: "cancelled" }) },
+    ]
+    for (const { taskId, row } of sources) {
+      const input: TaskGraphNativeCommandInput = {
+        scope, request: { kind: "followup", idempotencyKey: `followup-failed-branch-${taskId}`, sourceTaskId: taskId, goal: "Continue audit" },
+      }
+      const fake = followupQueryFor(row, [event])
+      const loaded = { state: null, snapshot: null, tasks: new Map() } as unknown as LoadedGraph
 
-    await expect(appendNativeGraphCommand(fake.client, input, normalizeNativeCommand(input), {} as GraphParent, loaded))
-      .rejects.toMatchObject({ code: "native_source_superseded" })
-    expect(fake.query.mock.calls[1]?.[0]).toContain("failedBranch")
-    const { stepId: currentStepId, ...ownerScope } = scope
-    expect(currentStepId).toBe("step-1")
-    expect(reconciliationMocks.assertFailedBranchHistory).toHaveBeenCalledWith(fake.client, ownerScope, event.relation,
-      { id: event.id, sequence: 23n, stepId: event.relation.agentPlanCall.stepId, idempotencyKey: event.idempotencyKey })
+      await expect(appendNativeGraphCommand(fake.client, input, normalizeNativeCommand(input), {} as GraphParent, loaded))
+        .rejects.toMatchObject({ code: "native_source_superseded" })
+      expect(fake.query.mock.calls[1]?.[0]).toContain("failedBranch")
+      const { stepId: currentStepId, ...ownerScope } = scope
+      expect(currentStepId).toBe("step-1")
+      expect(reconciliationMocks.assertFailedBranchHistory).toHaveBeenLastCalledWith(fake.client, ownerScope, event.relation,
+        { id: event.id, sequence: 24n, stepId: event.relation.agentPlanCall.stepId, idempotencyKey: event.idempotencyKey })
+    }
+    expect(reconciliationMocks.assertFailedBranchHistory).toHaveBeenCalledTimes(2)
   })
 
   it("fails closed when a matching v3 source receipt has invalid branch history", async () => {

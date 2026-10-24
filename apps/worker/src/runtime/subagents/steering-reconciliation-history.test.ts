@@ -19,7 +19,7 @@ import { TASK_GRAPH_FAILED_BRANCH_REPAIR_RELATION_SCHEMA_VERSION, parseTaskGraph
 import { assertSteeringReconciliationCall, readSteeringReconciliationHistory, type SteeringReconciliationHistoryEntry } from "./steering-reconciliation-history.js"
 import { resolveRootPlanCriteria } from "./root-plan-criteria.js"
 
-const failedBranchHistory = vi.hoisted(() => ({ assert: vi.fn(async () => ({ status: "accepted" as const, revision: 2,
+const failedBranchHistory = vi.hoisted(() => ({ assert: vi.fn(async () => ({ status: "accepted" as const, revision: 3,
   nodes: [{ key: "fresh-scout", taskId: "fresh-scout-task", status: "queued" as const }], readyTaskIds: ["fresh-scout-task"] })) }))
 vi.mock("./steering-reconciliation-failed-branch-history.js", () => ({
   assertTaskGraphFailedBranchRepairHistory: failedBranchHistory.assert,
@@ -42,14 +42,14 @@ function failedBranchValue() {
   const relation = parseTaskGraphFailedBranchRepairRelation({
     schemaVersion: TASK_GRAPH_FAILED_BRANCH_REPAIR_RELATION_SCHEMA_VERSION,
     operationKey: steeringReconciliationIdempotencyKey({ ...scope, stepId: decisionStepId }, callId), graphRootTaskId: scope.rootTaskId,
-    observedRevision: 1, resultingRevision: 2, branchRoot,
+    observedRevision: 1, resultingRevision: 3, branchRoot,
     sources: replaceBranch.sources.map(source => ({ source: { nodeKey: source.nodeKey, taskId: source.taskId }, replacementKey: source.replacementKey })),
     failedSource: { source: branchRoot, attemptCount: 1, resultDigest: "a".repeat(64), reportDigest: "b".repeat(64),
-      event: { id: "failed-event", sequence: "21", idempotencyKey: taskGraphLifecycleKey(scope.rootTaskId, branchRoot.nodeKey, 1, "task.failed") } },
+      event: { id: "failed-event", sequence: "19", idempotencyKey: taskGraphLifecycleKey(scope.rootTaskId, branchRoot.nodeKey, 1, "task.failed") } },
     cancellations: [{ source: { nodeKey: "cancelled-analyst", taskId: "cancelled-analyst-task" },
-      event: { id: "cancelled-event", sequence: "22", idempotencyKey: taskGraphLifecycleKey(scope.rootTaskId, "cancelled-analyst", 0, "task.cancelled") } }],
+      event: { id: "cancelled-event", sequence: "21", idempotencyKey: taskGraphLifecycleKey(scope.rootTaskId, "cancelled-analyst", 0, "task.cancelled") } }],
     verifiedExternalDependencies: [],
-    planEvent: { id: "plan-event", sequence: "23", idempotencyKey: taskGraphProposalKey(scope.rootTaskId, 1) },
+    planEvent: { id: "plan-event", sequence: "22", idempotencyKey: taskGraphProposalKey(scope.rootTaskId, 2) },
     requestFingerprint: taskGraphFailedBranchRepairFingerprint(call),
     agentPlanCall: { callId, stepId: decisionStepId, expectedRevision: 1, replaceBranch },
   })
@@ -57,7 +57,7 @@ function failedBranchValue() {
   return { replaceBranch, nodes: call.nodes, receipt: {
     schemaVersion: STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION, sessionId: scope.sessionId,
     turnId: scope.turnId, rootTaskId: scope.rootTaskId, stepId: decisionStepId, decision: "revise" as const,
-    observedRevision: 1, resultingRevision: 2, steerInputIds: [], inputCheckpoint: { throughSequence: "10" }, failedBranch: relation,
+    observedRevision: 1, resultingRevision: 3, steerInputIds: [], inputCheckpoint: { throughSequence: "10" }, failedBranch: relation,
   } }
 }
 const context: StepContext = { schemaVersion: "agent-harness.v2", sessionId: scope.sessionId, turnId: scope.turnId, stepId: decisionStepId,
@@ -701,7 +701,7 @@ describe("durable steering reconciliation history", () => {
     const value = failedBranchValue()
     const f = fixture({ planInput: { nodes: value.nodes, replaceBranch: value.replaceBranch },
       event: { payload: value.receipt, sequence: "30" } })
-    await expect(historyEntries(f.client, 2)).resolves.toEqual([{ receipt: value.receipt, stepOrdinal: 1, stepAttempt: 1 }])
+    await expect(historyEntries(f.client, 3)).resolves.toEqual([{ receipt: value.receipt, stepOrdinal: 1, stepAttempt: 1 }])
     expect(failedBranchHistory.assert).toHaveBeenCalledWith(f.client, scope, value.receipt.failedBranch,
       { id: "receipt-event", sequence: 30n, stepId: decisionStepId, idempotencyKey: f.storedEvent.idempotencyKey })
   })

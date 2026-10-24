@@ -9,11 +9,9 @@ import type { TaskGraphFailedBranchEventIdentity, TaskGraphFailedBranchIdentity 
 
 type Client = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
-const DEPENDENCY_FAILURE = "A prerequisite task did not complete."
 
 export type TaskGraphFailedBranchEvidence = Readonly<{
   failedSource: Readonly<{ source: TaskGraphFailedBranchIdentity; attemptCount: number; resultDigest: string; reportDigest: string; event: TaskGraphFailedBranchEventIdentity }>
-  cancellations: readonly Readonly<{ source: TaskGraphFailedBranchIdentity; event: TaskGraphFailedBranchEventIdentity }>[]
   verifiedExternalDependencies: readonly Readonly<{ dependency: TaskGraphFailedBranchIdentity; attemptCount: number; resultDigest: string; reportDigest: string; completedEvent: TaskGraphFailedBranchEventIdentity }>[]
 }>
 
@@ -101,7 +99,7 @@ function lifecycle(row: Row, scope: GraphIdentityScope, expected: { node: Stored
   return { event: { id: row.id, sequence, idempotencyKey: key }, graph, value: event }
 }
 
-/** Proves a failed Scout and only automatic, never-started dependent cancellations from persisted state. */
+/** Proves the immutable failed Scout and verified outside ancestors; the caller validates live descendant eligibility. */
 export async function proveTaskGraphFailedBranchEvidence(client: Client, input: Readonly<{
   scope: GraphIdentityScope
   snapshot: TaskGraphSnapshot
@@ -111,7 +109,7 @@ export async function proveTaskGraphFailedBranchEvidence(client: Client, input: 
   if (!derived || derived.root.templateId !== "scout" || !typed(derived.root) || sourceNodes.some(node => !typed(node))) return null
   const outside = externalAncestors(snapshot, sourceNodes)
   if (!outside) return null
-  const allNodes = [...sourceNodes, ...outside], ids = [...new Set(allNodes.map(node => node.taskId))].sort()
+  const ids = [...new Set([derived.root, ...outside].map(node => node.taskId))].sort()
   const taskResult = await client.query<Row>(`SELECT task."id", task."status", task."role", task."attemptCount", task."leaseOwner", task."leaseExpiresAt",
       task."nextAttemptAt", task."startedAt", task."completedAt", task."closedAt", task."interruptRequestedAt", task."failureReason", task."result",
       task."confidence", task."qualityGateResult", task."contextSnapshotId", task."outputArtifactIds"
@@ -136,7 +134,6 @@ export async function proveTaskGraphFailedBranchEvidence(client: Client, input: 
     || failedReport.resultDigest !== null || !taskGraphVerificationReportMatchesStatus(failedReport, "failed")) return null
 
   const expectedKeys = [taskGraphLifecycleKey(scope.rootTaskId, derived.root.key, Number(failedRow.attemptCount), "task.failed"),
-    ...sourceNodes.filter(node => node.key !== derived.root.key).map(node => taskGraphLifecycleKey(scope.rootTaskId, node.key, 0, "task.cancelled")),
     ...outside.map(node => taskGraphLifecycleKey(scope.rootTaskId, node.key, Number(tasks.get(node.taskId)?.attemptCount), "task.completed"))]
   if (expectedKeys.some(key => key.endsWith(":NaN:task.completed")) || new Set(expectedKeys).size !== expectedKeys.length) return null
   const eventResult = await client.query<Row>(`SELECT event."id", event."sessionId", event."turnId", event."itemId", event."taskId", event."sequence"::text AS "sequence",
@@ -158,31 +155,6 @@ export async function proveTaskGraphFailedBranchEvidence(client: Client, input: 
     || failedOutside.some((node, index) => node.key !== outside[index]?.key || node.taskId !== outside[index]?.taskId
       || !same(node, outside[index]))) return null
 
-  const cancellations: TaskGraphFailedBranchEvidence["cancellations"][number][] = []
-  const cancellationRows: { source: TaskGraphFailedBranchIdentity; event: TaskGraphFailedBranchEventIdentity; sequence: bigint; expectedRevision: number }[] = []
-  for (const node of sourceNodes) {
-    if (node.key === derived.root.key) continue
-    const key = taskGraphLifecycleKey(scope.rootTaskId, node.key, 0, "task.cancelled"), row = events.get(key), task = tasks.get(node.taskId)
-    if (!row || !task || !typed(node) || task.status !== "cancelled" || task.role !== node.templateId
-      || task.failureReason !== DEPENDENCY_FAILURE || Number(task.attemptCount) !== 0 || task.leaseOwner !== null || task.leaseExpiresAt !== null
-      || task.nextAttemptAt !== null || task.startedAt !== null || task.completedAt === null || task.closedAt !== null
-      || task.interruptRequestedAt !== null || task.result !== null || task.confidence !== null || task.qualityGateResult !== null
-      || task.contextSnapshotId !== null || !Array.isArray(task.outputArtifactIds) || task.outputArtifactIds.length !== 0) return null
-    const cancellation = lifecycle(row, scope, { node, attempt: 0, type: "task.cancelled", snapshot: failedSnapshot, exactGraph: true })
-    if (!cancellation) return null
-    cancellationRows.push({ source: identity(node), event: cancellation.event, sequence: BigInt(cancellation.event.sequence),
-      expectedRevision: Number(cancellation.value.expectedRevision) })
-  }
-  cancellationRows.sort((left, right) => left.sequence < right.sequence ? -1 : left.sequence > right.sequence ? 1 : 0)
-  let previousSequence = BigInt(failedEvent.event.sequence), previousRevision = Number(failedEvent.value.expectedRevision)
-  for (const cancellation of cancellationRows) {
-    if (cancellation.sequence <= previousSequence || cancellation.expectedRevision !== previousRevision + 1) return null
-    previousSequence = cancellation.sequence; previousRevision = cancellation.expectedRevision
-    cancellations.push({ source: cancellation.source, event: cancellation.event })
-  }
-  const evidence = await readDescendantEvidence(client, scope, cancellations)
-  if (!evidence) return null
-
   const externalProofs: TaskGraphFailedBranchEvidence["verifiedExternalDependencies"][number][] = []
   for (const node of outside) {
     if (node.repairOf) return null
@@ -202,39 +174,5 @@ export async function proveTaskGraphFailedBranchEvidence(client: Client, input: 
   }
   return { failedSource: { source: identity(derived.root), attemptCount: Number(failedRow.attemptCount),
     resultDigest: taskGraphResultDigest(failedRow.result), reportDigest: taskGraphResultDigest(failedReportRaw), event: failedEvent.event },
-  cancellations, verifiedExternalDependencies: externalProofs.sort((left, right) => left.dependency.nodeKey.localeCompare(right.dependency.nodeKey)) }
-}
-
-async function readDescendantEvidence(client: Client, scope: GraphIdentityScope,
-  cancellations: TaskGraphFailedBranchEvidence["cancellations"]): Promise<boolean> {
-  const ids = cancellations.map(item => item.source.taskId).sort(), keys = cancellations.map(item => item.event.idempotencyKey)
-  const outboxKeys = cancellations.map(item => `agent-event:${item.event.id}`)
-  const result = await client.query<Row>(`SELECT task."id",
-      (EXISTS (SELECT 1 FROM "agent_steps" step WHERE step."sessionId" = task."sessionId" AND step."taskId" = task."id")
-      OR EXISTS (SELECT 1 FROM "agent_items" item WHERE item."sessionId" = task."sessionId" AND item."taskId" = task."id")
-      OR EXISTS (SELECT 1 FROM "agent_events" event WHERE event."sessionId" = task."sessionId" AND event."taskId" = task."id"
-        AND event."idempotencyKey" <> ALL($5::text[]))
-      OR EXISTS (SELECT 1 FROM "agent_tree_budget_reservations" reservation WHERE reservation."taskId" = task."id")
-      OR EXISTS (SELECT 1 FROM "agent_native_semantic_rejections" rejection WHERE rejection."rootTaskId" = task."id" OR rejection."controlTaskId" = task."id")
-      OR EXISTS (SELECT 1 FROM "agent_mailbox_messages" message WHERE message."fromTaskId" = task."id" OR message."toTaskId" = task."id")
-      OR EXISTS (SELECT 1 FROM "agent_mailbox_hydration_checkpoints" checkpoint WHERE checkpoint."taskId" = task."id" OR checkpoint."rootTaskId" = task."id")
-      OR EXISTS (SELECT 1 FROM "agent_tool_result_references" ref WHERE ref."taskId" = task."id")
-      OR EXISTS (SELECT 1 FROM "agent_transcript_events" transcript WHERE transcript."taskId" = task."id")
-      OR EXISTS (SELECT 1 FROM "agent_approvals" approval WHERE approval."taskId" = task."id")
-      OR EXISTS (SELECT 1 FROM "agent_artifact_version" artifact WHERE artifact."taskId" = task."id")
-      OR EXISTS (SELECT 1 FROM "agent_artifact_review" review WHERE review."taskId" = task."id")
-      OR EXISTS (SELECT 1 FROM "application_tasks" application WHERE application."workerTaskId" = task."id")
-      OR EXISTS (SELECT 1 FROM "sub_agent_tasks" child WHERE child."sessionId" = task."sessionId" AND child."parentTaskId" = task."id")
-      OR EXISTS (SELECT 1 FROM "agent_outbox" outbox WHERE (outbox."payload"->>'taskId' = task."id" OR outbox."payload"->'payload'->>'taskId' = task."id")
-        AND outbox."idempotencyKey" <> ALL($6::text[])
-        AND NOT (outbox."topic" = 'agent.subagent.dispatch' AND outbox."aggregateId" = task."sessionId"
-          AND outbox."idempotencyKey" = 'subagent-dispatch:' || task."id" AND outbox."payload"->>'taskId' = task."id"
-          AND outbox."payload"->>'sessionId' = task."sessionId" AND outbox."payload"->>'rootTaskId' = task."rootTaskId"))) AS "hasExecutionEvidence",
-      EXISTS (SELECT 1 FROM "agent_wait_conditions" wait WHERE wait."sessionId" = task."sessionId" AND wait."turnId" = task."turnId"
-        AND (wait."parentTaskId" = task."id" OR wait."targetTaskIds" @> jsonb_build_array(task."id")
-          OR wait."matchedTaskIds" @> jsonb_build_array(task."id"))) AS "hasWaitEvidence"
-    FROM "sub_agent_tasks" task WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3
-      AND task."rootTaskId" = $4 AND task."parentTaskId" = $4 ORDER BY task."id"`,
-  [ids, scope.sessionId, scope.turnId, scope.rootTaskId, keys, outboxKeys])
-  return result.rows.length === ids.length && result.rows.every(row => row.hasExecutionEvidence === false && row.hasWaitEvidence === false)
+  verifiedExternalDependencies: externalProofs.sort((left, right) => left.dependency.nodeKey.localeCompare(right.dependency.nodeKey)) }
 }

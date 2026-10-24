@@ -93,20 +93,20 @@ function failedBranchRepair() {
   return {
     schemaVersion: TASK_GRAPH_FAILED_BRANCH_REPAIR_RELATION_SCHEMA_VERSION,
     operationKey: steeringReconciliationIdempotencyKey(scope, callId), graphRootTaskId: scope.rootTaskId,
-    observedRevision: 4, resultingRevision: 5, branchRoot,
+    observedRevision: 4, resultingRevision: 6, branchRoot,
     sources: replaceBranch.sources.map(({ nodeKey, taskId, replacementKey }) => ({ source: { nodeKey, taskId }, replacementKey })),
     failedSource: { source: branchRoot, attemptCount: 1, resultDigest: "a".repeat(64), reportDigest: "b".repeat(64),
       event: { id: "failed-event", sequence: "41", idempotencyKey: taskGraphLifecycleKey(scope.rootTaskId, branchRoot.nodeKey, 1, "task.failed") } },
     cancellations: [{ source: { nodeKey: "cancelled-analyst", taskId: "cancelled-analyst-task" },
-      event: { id: "cancelled-event", sequence: "42", idempotencyKey: taskGraphLifecycleKey(scope.rootTaskId, "cancelled-analyst", 0, "task.cancelled") } }],
+      event: { id: "cancelled-event", sequence: "43", idempotencyKey: taskGraphLifecycleKey(scope.rootTaskId, "cancelled-analyst", 0, "task.cancelled") } }],
     verifiedExternalDependencies: [],
-    planEvent: { id: "failed-branch-plan", sequence: "43", idempotencyKey: taskGraphProposalKey(scope.rootTaskId, 4) },
+    planEvent: { id: "failed-branch-plan", sequence: "44", idempotencyKey: taskGraphProposalKey(scope.rootTaskId, 5) },
     requestFingerprint: taskGraphFailedBranchRepairFingerprint(call),
     agentPlanCall: { callId, stepId: scope.stepId, expectedRevision: 4, replaceBranch },
   }
 }
 function v4Receipt(patch: Record<string, unknown> = {}) {
-  return { ...receipt({ decision: "revise", observedRevision: 4, resultingRevision: 5, steerInputIds: [],
+  return { ...receipt({ decision: "revise", observedRevision: 4, resultingRevision: 6, steerInputIds: [],
     inputCheckpoint: { throughSequence: "47" } }), schemaVersion: STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION,
     failedBranch: failedBranchRepair(), ...patch }
 }

@@ -841,10 +841,11 @@ async function prepareFailedBranchReplan(pool: PgPool, commandPool: PgPool, role
   await seedReconciliationAgenda(pool, value, { id: value.stepId, sequence: await nextEventSequence(pool, value), cursor: 0n,
     planRevision: 0, consumedInputIds: [] })
   const initialNodes: TaskGraphScheduleInput["proposal"]["nodes"] = [
-    { key: "source-scout", templateId: "scout", goal: "Find initial candidates", successCriteria: ["Find one candidate"],
-      dependsOn: [], verification: BRANCH_SCOUT_VERIFICATION },
+    // Keep the Analyst definition ahead of its Scout in stored graph order to prove retirement keys off branch identity.
     { key: "source-analyst", templateId: "analyst", goal: "Score initial candidates", successCriteria: ["Score one candidate"],
       dependsOn: ["source-scout"], verification: branchAnalystVerification("source-scout") },
+    { key: "source-scout", templateId: "scout", goal: "Find initial candidates", successCriteria: ["Find one candidate"],
+      dependsOn: [], verification: BRANCH_SCOUT_VERIFICATION },
     { key: "reserve-target", templateId: "analyst", goal: "Score repair target", successCriteria: ["Return one finding"],
       dependsOn: [], verification: ANALYST_VERIFICATION },
     ...["retained-a", "retained-b", "retained-c", "retained-d"].map(key => ({ key, templateId: "analyst" as const,
@@ -881,7 +882,7 @@ async function prepareFailedBranchReplan(pool: PgPool, commandPool: PgPool, role
   await failQueuedTypedTask(commandPool, value, sourceScout.taskId, `worker-fail-source-scout-${randomUUID()}`)
   const current = await command.readCurrent(readScope(value))
   if (current.nodes.length !== 8 || current.nodes.find(node => node.key === "source-scout")?.status !== "failed"
-    || current.nodes.find(node => node.key === "source-analyst")?.status !== "cancelled"
+    || current.nodes.find(node => node.key === "source-analyst")?.status !== "waiting"
     || !current.nodes.some(node => node.key === "retained-repair" && node.repairOf)) {
     const safeReason = (reason: string | null | undefined) => reason == null ? null
       : /^task_graph_[a-z_]+$/.test(reason) ? reason : "non-machine-reason"
@@ -3226,14 +3227,21 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     expect(current.nodes.map(node => node.status)).toEqual(["queued", "waiting"])
   }, 60_000)
 
-  it("retires a real failed Scout closure from a full graph without changing its history or usage", async () => {
+  it("cancels only a failed Scout's waiting descendants while preserving failed-root proof and usage", async () => {
     const value = fixture()
     additionalFixtures.push(value)
     const prepared = await prepareFailedBranchReplan(adminPool!, commandPool!, roleName, value)
-    const before = await failedBranchImmutableRows(adminPool!, value, prepared.sourceTaskIds)
-    expect(before.tasks).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: prepared.sourceTaskIds[0], status: "failed" }),
-      expect.objectContaining({ id: prepared.sourceTaskIds[1], status: "cancelled" }),
+    expect(prepared.current.nodes.filter(node => node.key === "source-analyst" || node.key === "source-scout").map(node => node.key))
+      .toEqual(["source-analyst", "source-scout"])
+    const failedRootId = prepared.sourceTaskIds[0]!
+    const waitingDescendantId = prepared.sourceTaskIds[1]!
+    const before = await failedBranchImmutableRows(adminPool!, value, [failedRootId])
+    const sourceRowsBefore = await adminPool!.query<{ id: string; status: string; attemptCount: number }>(
+      `SELECT "id", "status", "attemptCount" FROM "sub_agent_tasks" WHERE "id" = ANY($1::text[]) ORDER BY "id"`,
+      [prepared.sourceTaskIds])
+    expect(sourceRowsBefore.rows).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: failedRootId, status: "failed" }),
+      expect.objectContaining({ id: waitingDescendantId, status: "waiting", attemptCount: 0 }),
     ]))
     expect(before.usage).toMatchObject({
       turn: [{ id: value.turnId, inputTokens: 47, outputTokens: 13, estimatedCostUsd: "0.00420000" }],
@@ -3242,11 +3250,31 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       ]),
     })
     const receipt = await prepared.command.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation)
-    expect(receipt).toMatchObject({ status: "accepted", revision: prepared.current.revision + 1 })
+    expect(receipt).toMatchObject({ status: "accepted", revision: prepared.current.revision + prepared.sourceTaskIds.length })
     expect(receipt.nodes.map(node => node.key)).toEqual(["failed-replacement-scout", "failed-replacement-analyst"])
     expect(receipt.nodes.map(node => node.taskId).some(id => prepared.sourceTaskIds.includes(id))).toBe(false)
     expect(receipt.readyTaskIds).toEqual([receipt.nodes[0]!.taskId])
-    expect(await failedBranchImmutableRows(adminPool!, value, prepared.sourceTaskIds)).toEqual(before)
+    expect(receipt.revision).toBe(prepared.current.revision + 2)
+    expect(await failedBranchImmutableRows(adminPool!, value, [failedRootId])).toEqual(before)
+    const cancelledDescendant = await adminPool!.query<{ id: string; status: string; attemptCount: number; failureReason: string | null }>(
+      `SELECT "id", "status", "attemptCount", "failureReason" FROM "sub_agent_tasks" WHERE "id" = $1`, [waitingDescendantId])
+    expect(cancelledDescendant.rows).toEqual([{ id: waitingDescendantId, status: "cancelled", attemptCount: 0, failureReason: null }])
+    const cancellationKey = taskGraphLifecycleKey(value.rootTaskId, "source-analyst", 0, "task.cancelled")
+    const cancellationEvent = await adminPool!.query<{ id: string; sequence: string; type: string; actor: string; taskId: string;
+      causationId: string | null; idempotencyKey: string; payload: unknown }>(`SELECT "id", "sequence"::text AS "sequence", "type", "actor", "taskId",
+        "causationId", "idempotencyKey", "payload" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "idempotencyKey" = $3`,
+    [value.sessionId, value.turnId, cancellationKey])
+    expect(cancellationEvent.rows).toHaveLength(1)
+    expect(cancellationEvent.rows[0]).toMatchObject({ type: "item.delta", actor: "system", taskId: waitingDescendantId,
+      causationId: prepared.scope.stepId, idempotencyKey: cancellationKey })
+    const cancellationPayload = cancellationEvent.rows[0]!.payload as { event: { expectedRevision: number; nodeKey: string }; revision: number }
+    expect(cancellationPayload).toMatchObject({ event: { expectedRevision: prepared.current.revision, nodeKey: "source-analyst" },
+      revision: prepared.current.revision + 1 })
+    const cancellationOutbox = await adminPool!.query<{ topic: string; aggregateId: string; idempotencyKey: string }>(
+      `SELECT "topic", "aggregateId", "idempotencyKey" FROM "agent_outbox" WHERE "idempotencyKey" = $1`,
+      [`agent-event:${cancellationEvent.rows[0]!.id}`])
+    expect(cancellationOutbox.rows).toEqual([{ topic: "agent.session.event", aggregateId: value.sessionId,
+      idempotencyKey: `agent-event:${cancellationEvent.rows[0]!.id}` }])
 
     const current = await prepared.command.readCurrent(readScope(value))
     expect(current.nodes).toHaveLength(8)
@@ -3268,7 +3296,11 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     const relation = (persisted.rows[0]!.payload as { failedBranch?: Record<string, unknown> }).failedBranch
     expect(relation).toMatchObject({ graphRootTaskId: value.rootTaskId, observedRevision: prepared.current.revision,
       resultingRevision: receipt.revision, requestFingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
-      planEvent: { idempotencyKey: taskGraphProposalKey(value.rootTaskId, prepared.current.revision) } })
+      sources: [{ source: { nodeKey: "source-analyst", taskId: waitingDescendantId }, replacementKey: "failed-replacement-analyst" },
+        { source: { nodeKey: "source-scout", taskId: failedRootId }, replacementKey: "failed-replacement-scout" }],
+      cancellations: [expect.objectContaining({ source: { nodeKey: "source-analyst", taskId: waitingDescendantId },
+        event: { id: cancellationEvent.rows[0]!.id, sequence: cancellationEvent.rows[0]!.sequence, idempotencyKey: cancellationKey } })],
+      planEvent: { idempotencyKey: taskGraphProposalKey(value.rootTaskId, prepared.current.revision + 1) } })
   }, 60_000)
 
   it("proves exact failed-branch replay after a later replan and still fences a completed original Step", async () => {
@@ -3301,13 +3333,16 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     expect(await supersessionDurableRows(adminPool!, value)).toEqual(beforeFencedReplay)
   }, 60_000)
 
-  it("rejects extant misbound cancellation provenance before creating replacements", async () => {
+  it("rejects extant misbound failed-source provenance before creating replacements", async () => {
     const value = fixture()
     additionalFixtures.push(value)
     const prepared = await prepareFailedBranchReplan(adminPool!, commandPool!, roleName, value)
-    const cancellationKey = taskGraphLifecycleKey(value.rootTaskId, "source-analyst", 0, "task.cancelled")
+    const failedRow = await adminPool!.query<{ attemptCount: number }>(`SELECT "attemptCount" FROM "sub_agent_tasks" WHERE "id" = $1`,
+      [prepared.sourceTaskIds[0]])
+    expect(failedRow.rows).toHaveLength(1)
+    const failureKey = taskGraphLifecycleKey(value.rootTaskId, "source-scout", failedRow.rows[0]!.attemptCount, "task.failed")
     const event = await adminPool!.query<{ id: string }>(`SELECT "id" FROM "agent_events"
-      WHERE "sessionId" = $1 AND "turnId" = $2 AND "idempotencyKey" = $3`, [value.sessionId, value.turnId, cancellationKey])
+      WHERE "sessionId" = $1 AND "turnId" = $2 AND "idempotencyKey" = $3`, [value.sessionId, value.turnId, failureKey])
     expect(event.rows).toHaveLength(1)
     const tampered = await adminPool!.query(`UPDATE "agent_outbox" SET "payload" = jsonb_set("payload", '{payload,event,nodeKey}', to_jsonb('misbound-source'::text), false)
       WHERE "aggregateId" = $1 AND "idempotencyKey" = $2`, [value.sessionId, `agent-event:${event.rows[0]!.id}`])
@@ -3319,6 +3354,25 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     expect(await supersessionDurableRows(adminPool!, value)).toEqual(before)
     expect(await failedBranchImmutableRows(adminPool!, value, prepared.sourceTaskIds))
       .toEqual(immutableBefore)
+  }, 60_000)
+
+  it("rejects an extant misbound operation-created cancellation receipt on replay", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    const prepared = await prepareFailedBranchReplan(adminPool!, commandPool!, roleName, value)
+    const accepted = await prepared.command.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation)
+    const cancellationKey = taskGraphLifecycleKey(value.rootTaskId, "source-analyst", 0, "task.cancelled")
+    const event = await adminPool!.query<{ id: string }>(`SELECT "id" FROM "agent_events"
+      WHERE "sessionId" = $1 AND "turnId" = $2 AND "idempotencyKey" = $3`, [value.sessionId, value.turnId, cancellationKey])
+    expect(event.rows).toHaveLength(1)
+    const tampered = await adminPool!.query(`UPDATE "agent_outbox" SET "payload" = jsonb_set("payload", '{payload,event,nodeKey}', to_jsonb('misbound-source'::text), false)
+      WHERE "aggregateId" = $1 AND "idempotencyKey" = $2`, [value.sessionId, `agent-event:${event.rows[0]!.id}`])
+    expect(tampered.rowCount).toBe(1)
+    const beforeReplay = await supersessionDurableRows(adminPool!, value)
+    await expect(prepared.command.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation))
+      .rejects.toMatchObject({ code: "idempotency_conflict" })
+    expect(await supersessionDurableRows(adminPool!, value)).toEqual(beforeReplay)
+    expect(accepted.revision).toBe(prepared.current.revision + 2)
   }, 60_000)
 
   it("keeps typed repair reserve, owner and revision fences, and post-insert rollback on failed-branch replans", async () => {
@@ -3361,7 +3415,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     const suffix = randomUUID().replaceAll("-", "")
     const functionName = `failed_branch_plan_failure_${suffix}`
     const triggerName = `failed_branch_plan_failure_${suffix}`
-    const planKey = taskGraphProposalKey(value.rootTaskId, prepared.current.revision)
+    const planKey = taskGraphProposalKey(value.rootTaskId, prepared.current.revision + 1)
     try {
       await adminPool!.query(`CREATE FUNCTION public."${functionName}"() RETURNS trigger LANGUAGE plpgsql AS $branch_failure$
         BEGIN
@@ -3380,6 +3434,13 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       expect(await supersessionDurableRows(adminPool!, value)).toEqual(before)
       expect(await failedBranchImmutableRows(adminPool!, value, prepared.sourceTaskIds))
         .toEqual(immutableBefore)
+      const restored = await adminPool!.query<{ id: string; status: string; attemptCount: number }>(
+        `SELECT "id", "status", "attemptCount" FROM "sub_agent_tasks" WHERE "id" = ANY($1::text[]) ORDER BY "id"`,
+        [prepared.sourceTaskIds])
+      expect(restored.rows).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: prepared.sourceTaskIds[0], status: "failed" }),
+        expect.objectContaining({ id: prepared.sourceTaskIds[1], status: "waiting", attemptCount: 0 }),
+      ]))
     } finally {
       await adminPool!.query(`DROP TRIGGER IF EXISTS "${triggerName}" ON public."agent_events"`)
       await adminPool!.query(`DROP FUNCTION IF EXISTS public."${functionName}"()`)

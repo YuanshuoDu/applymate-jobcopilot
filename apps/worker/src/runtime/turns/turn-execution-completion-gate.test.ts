@@ -460,7 +460,7 @@ describe("TaskGraph terminal verification gate", () => {
       expect.objectContaining({ blocker: "task_graph_verification_unverified" }), `final-rejected:${step.id}`)
   })
 
-  it("keeps failed and automatically cancelled branch history out of fresh verification", async () => {
+  it("keeps failed-root and operation-retired descendant history out of fresh verification", async () => {
     const analystContract = { schemaVersion: "agent-harness.v2.task-graph-verification.v1", role: "analyst",
       criteria: [{ id: "finding-present", check: { kind: "finding_count_gte", minimum: 1 } }] }
     const replacements = [node("fresh-scout", "fresh-scout-task"), {

@@ -8,6 +8,7 @@ import type { StoredTaskGraphNode, TaskGraphSnapshot } from "./task-graph-snapsh
 import { parseTaskGraphFailedBranchRepairRelation, taskGraphFailedBranchRepairFingerprint,
   type TaskGraphFailedBranchRepairRelation } from "./task-graph-pg-failed-branch-relation.js"
 import { proveTaskGraphFailedBranchEvidence } from "./task-graph-pg-failed-branch-evidence.js"
+import { verifyTaskGraphFailedBranchCancellationHistory } from "./steering-reconciliation-failed-branch-cancellations.js"
 import { steeringReconciliationIdempotencyKey, validSteeringReconciliationToolCall,
   type SteeringReconciliationScope } from "./steering-reconciliation-contract.js"
 import type { TaskGraphScheduleReceipt } from "./task-graph-command-port.js"
@@ -59,7 +60,7 @@ async function readCall(client: Client, scope: SteeringReconciliationScope, rela
     ...(input.rootSuccessCriteria === undefined ? {} : { rootSuccessCriteria: input.rootSuccessCriteria as string[] }) })
   if (fingerprint !== relation.requestFingerprint || canonicalTaskGraphJson(input.replaceBranch) !== canonicalTaskGraphJson(relation.agentPlanCall.replaceBranch)
     || BigInt(relation.failedSource.event.sequence) >= seq
-    || relation.cancellations.some(cancellation => BigInt(cancellation.event.sequence) >= seq)) invalid()
+    || relation.cancellations.some(cancellation => BigInt(cancellation.event.sequence) <= seq)) invalid()
   return { sequence: seq, nodes: input.nodes as TaskGraphNodeProposal[],
     ...(input.rootSuccessCriteria === undefined ? {} : { rootSuccessCriteria: input.rootSuccessCriteria as string[] }) }
 }
@@ -153,7 +154,6 @@ export async function assertTaskGraphFailedBranchRepairHistory(client: Client, s
     turnId: scope.turnId, rootTaskId: scope.rootTaskId, parentTaskId: scope.rootTaskId }, snapshot: before,
     sourceNodes: persistedSources })
   if (!proof || canonicalTaskGraphJson(proof.failedSource) !== canonicalTaskGraphJson(relation.failedSource)
-    || canonicalTaskGraphJson(proof.cancellations) !== canonicalTaskGraphJson(relation.cancellations)
     || canonicalTaskGraphJson(proof.verifiedExternalDependencies) !== canonicalTaskGraphJson(relation.verifiedExternalDependencies)) invalid()
 
   const call = await readCall(client, scope, relation)
@@ -168,20 +168,7 @@ export async function assertTaskGraphFailedBranchRepairHistory(client: Client, s
     || validation.value.sourceNodes.some((node, index) => relation.sources[index]?.source.nodeKey !== node.key
       || relation.sources[index]?.source.taskId !== node.taskId
       || relation.sources[index]?.replacementKey !== validation.value.sourceToReplacementKey.get(node.key))) invalid()
-  const failedRevision = Number(failedPayload?.revision), failedEvent = object(failedPayload?.event)
-  if (!Number.isSafeInteger(failedRevision) || failedRevision < 1 || failedRevision !== Number(failedEvent?.expectedRevision) + 1) invalid()
-  let lastRevision = failedRevision
-  const lifecycleRows = [relation.failedSource.event, ...relation.cancellations.map(value => value.event)]
-    .slice(1).map(identity => ({ identity, row: rows.get(identity.id) }))
-  for (const { identity, row } of lifecycleRows) {
-    const payload = object(row?.payload), event = object(payload?.event), revision = Number(payload?.revision)
-    if (!row || !Number.isSafeInteger(revision) || event?.expectedRevision !== lastRevision || revision !== lastRevision + 1) invalid()
-    lastRevision = revision
-  }
-  if (lastRevision > relation.observedRevision || call.sequence <= BigInt(relation.cancellations.at(-1)!.event.sequence)) invalid()
-  const lastCancellation = relation.cancellations.at(-1)!, cancellationSequence = BigInt(lastCancellation.event.sequence)
-  if (observed.sequence < cancellationSequence || relation.observedRevision === lastRevision && observed.id !== lastCancellation.event.id
-    || relation.observedRevision > lastRevision && observed.sequence <= cancellationSequence) invalid()
+  if (!await verifyTaskGraphFailedBranchCancellationHistory(client, scope, relation, observed.snapshot, call.sequence, result.rows)) invalid()
   const planRow = rows.get(relation.planEvent.id), planSequence = sequence(planRow?.sequence), planPayload = object(planRow?.payload)
   const planItem = object(planPayload?.item), after = parseSnapshot(planItem?.content), receipt = parseReceipt(planPayload?.receipt)
   const expectedPlanOutbox = planRow && { eventId: planRow.id, sessionId: planRow.sessionId, turnId: planRow.turnId,

@@ -81,7 +81,7 @@ export function parseTaskGraphFailedBranchRepairRelation(value: unknown): TaskGr
       "failedSource", "cancellations", "verifiedExternalDependencies", "planEvent", "requestFingerprint", "agentPlanCall"])
       || row.schemaVersion !== TASK_GRAPH_FAILED_BRANCH_REPAIR_RELATION_SCHEMA_VERSION || typeof row.operationKey !== "string" || !OPERATION_KEY.test(row.operationKey)
       || !text(row.graphRootTaskId) || !revision(row.observedRevision) || row.observedRevision >= MAX_REVISION
-      || row.resultingRevision !== row.observedRevision + 1 || !revision(row.resultingRevision) || !sourceRows
+      || !revision(row.resultingRevision) || !sourceRows
       || sourceRows.length < 2 || sourceRows.length > TASK_GRAPH_LIMITS.maxNodes || !cancellationRows || cancellationRows.length !== sourceRows.length - 1
       || !externalRows || externalRows.length > TASK_GRAPH_LIMITS.maxNodes || !digest(row.requestFingerprint)) return null
 
@@ -109,12 +109,14 @@ export function parseTaskGraphFailedBranchRepairRelation(value: unknown): TaskGr
     }
     if (sourceBindings.length !== requested.size || !sourceKeys.has(branchRoot.nodeKey)) return null
 
+    const expectedCancellations = sourceBindings.filter(source => source.source.nodeKey !== branchRoot.nodeKey)
     const cancellations: TaskGraphFailedBranchRepairRelation["cancellations"][number][] = [], cancellationKeys = new Set<string>(), eventIds = new Set([failedEvent.id])
     let previousCancellation = BigInt(failedEvent.sequence)
-    for (const valueCancellation of cancellationRows) {
+    for (const [index, valueCancellation] of cancellationRows.entries()) {
       const binding = record(valueCancellation), source = identity(binding?.source), event = eventIdentity(binding?.event)
       if (!exact(binding, ["source", "event"]) || !source || !event || !sourceKeys.has(source.nodeKey) || source.nodeKey === branchRoot.nodeKey
         || sourceBindings.find(item => item.source.nodeKey === source.nodeKey)?.source.taskId !== source.taskId
+        || source.nodeKey !== expectedCancellations[index]?.source.nodeKey || source.taskId !== expectedCancellations[index]?.source.taskId
         || cancellationKeys.has(source.nodeKey) || eventIds.has(event.id)
         || event.idempotencyKey !== taskGraphLifecycleKey(row.graphRootTaskId, source.nodeKey, 0, "task.cancelled")
         || BigInt(event.sequence) <= previousCancellation) return null
@@ -139,9 +141,11 @@ export function parseTaskGraphFailedBranchRepairRelation(value: unknown): TaskGr
 
     const plan = record(row.planEvent), planEvent = plan && exact(plan, ["id", "sequence", "idempotencyKey"]) && text(plan.id)
       && sequence(plan.sequence) && text(plan.idempotencyKey) ? plan as { id: string; sequence: string; idempotencyKey: string } : null
+    const planRevision = row.observedRevision + cancellations.length
     const finalCancellationSequence = cancellations.at(-1)?.event.sequence ?? failedEvent.sequence
     if (!planEvent || eventIds.has(planEvent.id) || BigInt(planEvent.sequence) <= BigInt(finalCancellationSequence)
-      || planEvent.idempotencyKey !== taskGraphProposalKey(row.graphRootTaskId, row.observedRevision)) return null
+      || row.resultingRevision !== planRevision + 1 || !revision(row.resultingRevision)
+      || planEvent.idempotencyKey !== taskGraphProposalKey(row.graphRootTaskId, planRevision)) return null
     return {
       schemaVersion: TASK_GRAPH_FAILED_BRANCH_REPAIR_RELATION_SCHEMA_VERSION, operationKey: row.operationKey,
       graphRootTaskId: row.graphRootTaskId, observedRevision: row.observedRevision, resultingRevision: row.resultingRevision,

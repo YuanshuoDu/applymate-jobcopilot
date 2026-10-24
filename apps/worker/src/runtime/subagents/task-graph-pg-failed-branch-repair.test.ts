@@ -6,13 +6,13 @@ import { findSteeringReconciliationReplay } from "./steering-reconciliation-ledg
 import { loadTaskGraph } from "./task-graph-pg-state.js"
 import { assertTaskGraphBranchRepairToolCall } from "./steering-reconciliation-branch-repair-history.js"
 import { scheduleTaskGraphBranchRepair } from "./task-graph-pg-branch-repair.js"
-import { scheduleTaskGraphBranchOperation } from "./task-graph-pg-failed-branch-repair.js"
+import { scheduleTaskGraphBranchOperation, selectFailedBranchDescendants } from "./task-graph-pg-failed-branch-repair.js"
 
 vi.mock("./steering-reconciliation-ledger.js", () => ({ findSteeringReconciliationReplay: vi.fn() }))
 vi.mock("./task-graph-pg-state.js", () => ({ loadTaskGraph: vi.fn() }))
 vi.mock("./steering-reconciliation-branch-repair-history.js", () => ({ assertTaskGraphBranchRepairToolCall: vi.fn() }))
 vi.mock("./task-graph-pg-branch-repair.js", () => ({
-  assertReplacementSnapshot: vi.fn(), scheduleTaskGraphBranchRepair: vi.fn(),
+  assertReplacementSnapshot: vi.fn(), lockTaskGraphBranchSources: vi.fn(), scheduleTaskGraphBranchRepair: vi.fn(),
 }))
 
 const scope = {
@@ -83,5 +83,17 @@ describe("scheduleTaskGraphBranchOperation", () => {
     expect(toolCallMock).toHaveBeenCalledWith(client, scope, "plan-call", 4, branch)
     expect(legacyMock).not.toHaveBeenCalled()
     expect(checkBudget).not.toHaveBeenCalled()
+  })
+})
+
+describe("selectFailedBranchDescendants", () => {
+  it("selects the exact failed root when source order places its Analyst descendant first", () => {
+    const sources = [
+      { key: "analyst-child", taskId: "task-analyst", templateId: "analyst" },
+      { key: "failed-scout", taskId: "task-scout", templateId: "scout" },
+    ]
+    expect(selectFailedBranchDescendants(sources, { nodeKey: "failed-scout", taskId: "task-scout" }))
+      .toEqual({ failedRoot: sources[1], descendants: [sources[0]] })
+    expect(selectFailedBranchDescendants(sources, { nodeKey: "failed-scout", taskId: "foreign-task" })).toBeNull()
   })
 })

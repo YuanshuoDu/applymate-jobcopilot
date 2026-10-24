@@ -66,7 +66,7 @@ function fixture() {
     task("foundation-z-task", "scout", "completed", 1, { status: "completed", taskGraphVerificationReport: scoutCompletedReport }, null),
     task("foundation-a-task", "analyst", "completed", 1, { status: "completed", taskGraphVerificationReport: analystCompletedReport }, null),
     task("branch-scout-task", "scout", "failed", 1, { status: "failed", taskGraphVerificationReport: scoutReport }, "task_graph_verification_unverified"),
-    task("branch-analyst-task", "analyst", "cancelled", 0, null, "A prerequisite task did not complete."),
+    task("branch-analyst-task", "analyst", "waiting", 0, null, null),
   ]
   const events = [
     event("foundation-z", "foundation-z-task", 10, 0, "task.completed", graph),
@@ -74,29 +74,31 @@ function fixture() {
     event("branch-scout", "branch-scout-task", 12, 2, "task.failed", graph),
     event("branch-analyst", "branch-analyst-task", 13, 3, "task.cancelled", graph),
   ]
-  const descendantRows = [{ id: "branch-analyst-task", hasExecutionEvidence: false, hasWaitEvidence: false }]
   const query = vi.fn(async (sql: string, values?: unknown[]) => {
-    if (sql.includes('FROM "sub_agent_tasks" AS task JOIN "agent_sessions"')) return { rows: [...taskRows].sort((a, b) => a.id.localeCompare(b.id)), rowCount: taskRows.length }
-    if (sql.includes('FROM "agent_events" AS event JOIN "agent_sessions"')) return { rows: [...events].sort((a, b) => Number(a.sequence) - Number(b.sequence)), rowCount: events.length }
-    if (sql.includes('FROM "sub_agent_tasks" task WHERE')) return { rows: descendantRows, rowCount: descendantRows.length }
+    if (sql.includes('FROM "sub_agent_tasks" AS task JOIN "agent_sessions"')) {
+      const ids = values?.[0] as string[], rows = taskRows.filter(row => ids.includes(row.id)).sort((a, b) => a.id.localeCompare(b.id))
+      return { rows, rowCount: rows.length }
+    }
+    if (sql.includes('FROM "agent_events" AS event JOIN "agent_sessions"')) {
+      const keys = values?.[1] as string[], rows = events.filter(row => keys.includes(String(row.idempotencyKey)))
+        .sort((a, b) => Number(a.sequence) - Number(b.sequence))
+      return { rows, rowCount: rows.length }
+    }
     throw new Error(`unexpected query ${String(values?.length)}`)
   })
-  return { graph, taskRows, events, descendantRows, query, client: { query } as unknown as Pick<PoolClient, "query"> }
+  return { graph, taskRows, events, query, client: { query } as unknown as Pick<PoolClient, "query"> }
 }
 
 describe("persisted failed TaskGraph branch evidence", () => {
-  it("proves the exact typed failed Scout, automatic descendant cancellation, and transitive verified ancestors", async () => {
+  it("proves the exact typed failed Scout and transitive verified ancestors without assuming descendant status", async () => {
     const f = fixture(), sourceNodes = f.graph.nodes.filter(node => node.key === "branch-scout" || node.key === "branch-analyst")
     const proof = await proveTaskGraphFailedBranchEvidence(f.client, { scope, snapshot: f.graph, sourceNodes })
     expect(proof).toMatchObject({ failedSource: { source: { nodeKey: "branch-scout", taskId: "branch-scout-task" }, attemptCount: 1 },
-      cancellations: [{ source: { nodeKey: "branch-analyst", taskId: "branch-analyst-task" } }],
       verifiedExternalDependencies: [{ dependency: { nodeKey: "foundation-a" } }, { dependency: { nodeKey: "foundation-z" } }] })
+    expect(proof).not.toHaveProperty("cancellations")
     const taskLock = f.query.mock.calls[0]
-    expect(taskLock?.[1]?.[0]).toEqual(["branch-analyst-task", "branch-scout-task", "foundation-a-task", "foundation-z-task"])
-    const evidenceQuery = f.query.mock.calls[2]
-    expect(evidenceQuery?.[0]).toContain('event."idempotencyKey" <> ALL($5::text[])')
-    expect(evidenceQuery?.[0]).toContain('outbox."idempotencyKey" <> ALL($6::text[])')
-    expect(evidenceQuery?.[1]).toHaveLength(6)
+    expect(taskLock?.[1]?.[0]).toEqual(["branch-scout-task", "foundation-a-task", "foundation-z-task"])
+    expect(f.query).toHaveBeenCalledTimes(2)
   })
 
   it("accepts verified ancestor history when an unrelated node is appended before the failed Scout", async () => {
@@ -104,7 +106,7 @@ describe("persisted failed TaskGraph branch evidence", () => {
     const unrelated = node("unrelated", "scout", "unrelated-task", [], 1)
     const current: TaskGraphSnapshot = { ...historical, nodes: [...historical.nodes, unrelated] }
     f.graph = current
-    for (const index of [0, 1, 2, 3]) {
+    for (const index of [0, 1, 2]) {
       const row = f.events[index]!, payload = row.payload as Row, item = payload.item as Row
       row.payload = { ...payload, item: { ...item, content: current } }
       const outbox = row.outboxPayload as Row
@@ -140,18 +142,6 @@ describe("persisted failed TaskGraph branch evidence", () => {
     }],
     ["a currently failed external dependency", (f: ReturnType<typeof fixture>) => {
       f.taskRows[0]!.status = "failed"
-    }],
-    ["a cancellation with prior execution evidence", (f: ReturnType<typeof fixture>) => {
-      f.descendantRows[0]!.hasExecutionEvidence = true
-    }],
-    ["a cancellation that has a different cause", (f: ReturnType<typeof fixture>) => {
-      f.taskRows[3]!.failureReason = "user cancelled"
-    }],
-    ["a cancellation event with a skipped graph revision", (f: ReturnType<typeof fixture>) => {
-      const payload = f.events[3]!.payload as Row
-      f.events[3]!.payload = { ...payload, event: { ...(payload.event as Row), expectedRevision: 5 }, revision: 6 }
-      const outbox = f.events[3]!.outboxPayload as Row
-      f.events[3]!.outboxPayload = { ...outbox, payload: f.events[3]!.payload }
     }],
   ])("fails closed for %s", async (_name, mutate) => {
     const f = fixture(); mutate(f)

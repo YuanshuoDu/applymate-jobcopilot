@@ -16,7 +16,7 @@ import { prepareSteeringReconciliation, findSteeringReconciliationReplay, writeS
 import type { assertTaskGraphFailedBranchRepairHistory } from "./steering-reconciliation-failed-branch-history.js"
 
 type FailedBranchHistoryArgs = Parameters<typeof assertTaskGraphFailedBranchRepairHistory>
-const failedBranchHistory = vi.hoisted(() => ({ assert: vi.fn(async (..._args: FailedBranchHistoryArgs) => ({ status: "accepted" as const, revision: 2,
+const failedBranchHistory = vi.hoisted(() => ({ assert: vi.fn(async (..._args: FailedBranchHistoryArgs) => ({ status: "accepted" as const, revision: 3,
   nodes: [{ key: "fresh-scout", taskId: "fresh-scout-task", status: "queued" as const }], readyTaskIds: ["fresh-scout-task"] })) }))
 vi.mock("./steering-reconciliation-failed-branch-history.js", () => ({
   assertTaskGraphFailedBranchRepairHistory: failedBranchHistory.assert,
@@ -185,20 +185,20 @@ function failedBranchReplayFixture() {
   const operationKey = steeringReconciliationIdempotencyKey(scope, "call-1")!
   const relation = {
     schemaVersion: TASK_GRAPH_FAILED_BRANCH_REPAIR_RELATION_SCHEMA_VERSION, operationKey, graphRootTaskId: scope.rootTaskId,
-    observedRevision: 1, resultingRevision: 2, branchRoot: replaceBranch.root,
+    observedRevision: 1, resultingRevision: 3, branchRoot: replaceBranch.root,
     sources: replaceBranch.sources.map(source => ({ source: { nodeKey: source.nodeKey, taskId: source.taskId }, replacementKey: source.replacementKey })),
     failedSource: { source: replaceBranch.root, attemptCount: 1, resultDigest: "a".repeat(64), reportDigest: "b".repeat(64),
-      event: { id: "failed-event", sequence: "21", idempotencyKey: taskGraphLifecycleKey(scope.rootTaskId, "failed-scout", 1, "task.failed") } },
+      event: { id: "failed-event", sequence: "20", idempotencyKey: taskGraphLifecycleKey(scope.rootTaskId, "failed-scout", 1, "task.failed") } },
     cancellations: [{ source: { nodeKey: "cancelled-analyst", taskId: "cancelled-analyst-task" },
       event: { id: "cancelled-event", sequence: "22", idempotencyKey: taskGraphLifecycleKey(scope.rootTaskId, "cancelled-analyst", 0, "task.cancelled") } }],
     verifiedExternalDependencies: [],
-    planEvent: { id: "plan-event", sequence: "23", idempotencyKey: taskGraphProposalKey(scope.rootTaskId, 1) },
+    planEvent: { id: "plan-event", sequence: "23", idempotencyKey: taskGraphProposalKey(scope.rootTaskId, 2) },
     requestFingerprint: taskGraphFailedBranchRepairFingerprint(call),
     agentPlanCall: { callId: "call-1", stepId: scope.stepId, expectedRevision: 1, replaceBranch },
   }
   const payload = { schemaVersion: STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION,
     sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, stepId: scope.stepId, decision: "revise",
-    observedRevision: 1, resultingRevision: 2, steerInputIds: [], inputCheckpoint: { throughSequence: "20" }, failedBranch: relation }
+    observedRevision: 1, resultingRevision: 3, steerInputIds: [], inputCheckpoint: { throughSequence: "20" }, failedBranch: relation }
   return { replaceBranch, relation, payload, fingerprint: relation.requestFingerprint, operation: operation("revise", undefined, replaceBranch) }
 }
 
@@ -321,7 +321,7 @@ describe("durable steering reconciliation ledger", () => {
     expect(failedBranchHistory.assert).not.toHaveBeenCalled()
 
     await expect(findSteeringReconciliationReplay(fixture.client, data.operation, data.fingerprint)).resolves.toEqual({
-      status: "duplicate", revision: 2, nodes: [{ key: "fresh-scout", taskId: "fresh-scout-task", status: "queued" }],
+      status: "duplicate", revision: 3, nodes: [{ key: "fresh-scout", taskId: "fresh-scout-task", status: "queued" }],
       readyTaskIds: ["fresh-scout-task"],
     })
     expect(failedBranchHistory.assert).toHaveBeenCalledWith(fixture.client, scope, data.relation,
@@ -336,14 +336,14 @@ describe("durable steering reconciliation ledger", () => {
     const fixture = clientFixture({ pending: false, decision: "revise", replaceBranch: data.replaceBranch })
     const prepared = await prepareSteeringReconciliation(fixture.client, data.operation)
     if (!prepared) throw new Error("expected an empty-input branch decision")
-    fixture.setGraphRevision(2)
+    fixture.setGraphRevision(3)
 
-    await expect(writeSteeringReconciliationReceipt(fixture.client, prepared, 2, undefined, undefined, data.relation)).resolves.toBeUndefined()
+    await expect(writeSteeringReconciliationReceipt(fixture.client, prepared, 3, undefined, undefined, data.relation)).resolves.toBeUndefined()
     expect(fixture.events).toHaveLength(1)
     expect(fixture.events[0]).toMatchObject({ itemId: null, taskId: scope.rootTaskId,
       type: "agent.plan.reconciliation", actor: "orchestrator", idempotencyKey: prepared.idempotencyKey,
       payload: { schemaVersion: STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION,
-        observedRevision: 1, resultingRevision: 2, steerInputIds: [], failedBranch: data.relation } })
+        observedRevision: 1, resultingRevision: 3, steerInputIds: [], failedBranch: data.relation } })
     expect(failedBranchHistory.assert).toHaveBeenCalledOnce()
     expect(failedBranchHistory.assert.mock.calls[0]?.[2]).toEqual(data.relation)
   })
