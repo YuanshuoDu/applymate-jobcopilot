@@ -86,6 +86,7 @@ type Fixture = {
   readonly stepId: string
   readonly originStepId: string
   readonly keepStepId: string
+  readonly branchStepId: string
   readonly laterStepId: string
   readonly originalInputId: string
   readonly originalClientMessageId: string
@@ -118,6 +119,7 @@ function fixture(): Fixture {
     stepId: `p3-task-graph-step-${suffix}`,
     originStepId: `p3-task-graph-origin-step-${suffix}`,
     keepStepId: `p3-task-graph-keep-step-${suffix}`,
+    branchStepId: `p3-task-graph-branch-step-${suffix}`,
     laterStepId: `p3-task-graph-later-step-${suffix}`,
     originalInputId: `p3-task-graph-original-input-${suffix}`,
     originalClientMessageId: `p3-task-graph-original-client-${suffix}`,
@@ -788,6 +790,8 @@ async function prepareTypedBranchReplan(pool: PgPool, commandPool: PgPool, roleN
   const allowedActions = [...new Set(["agent.plan", ...Object.values(templates).flatMap(template => template.allowedActions)])]
   await pool.query(`UPDATE "sub_agent_tasks" SET "allowedActions" = $2::jsonb WHERE "id" = $1`, [value.rootTaskId, JSON.stringify(allowedActions)])
   const scope: TaskGraphScheduleInput["scope"] = { ...readScope(value), stepId: value.stepId }
+  await seedReconciliationAgenda(pool, value, { id: value.stepId, sequence: await nextEventSequence(pool, value), cursor: 0n,
+    planRevision: 0, consumedInputIds: [] })
   const initialNodes: TaskGraphScheduleInput["proposal"]["nodes"] = [
     { key: "source-scout", templateId: "scout", goal: "Find initial candidates", successCriteria: ["Find one candidate"],
       dependsOn: [], verification: BRANCH_SCOUT_VERIFICATION },
@@ -802,12 +806,17 @@ async function prepareTypedBranchReplan(pool: PgPool, commandPool: PgPool, roleN
   if (current.nodes.length !== 2 || current.nodes[0]?.status !== "queued" || current.nodes[1]?.status !== "waiting") {
     throw new Error("Typed branch fixture did not retain its queued Scout and waiting Analyst")
   }
-  await seedReconciliationAgenda(pool, value, { id: value.stepId, sequence: await nextEventSequence(pool, value), cursor: 0n,
+  await pool.query(`INSERT INTO "agent_steps"
+    ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
+    VALUES ($1, $2, $3, $4, 2, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
+  [value.branchStepId, value.sessionId, value.turnId, value.rootTaskId])
+  const branchScope: TaskGraphScheduleInput["scope"] = { ...readScope(value), stepId: value.branchStepId }
+  await seedReconciliationAgenda(pool, value, { id: value.branchStepId, sequence: await nextEventSequence(pool, value), cursor: 0n,
     planRevision: current.revision, consumedInputIds: [] })
-  const request = branchPlanRequest(scope, templates, current.nodes, current.revision, value.planCallId, replacementPrefix)
-  await seedReconciliationToolCall(pool, value, { id: value.planCallId, stepId: value.stepId, toolName: "agent.plan",
+  const request = branchPlanRequest(branchScope, templates, current.nodes, current.revision, value.planCallId, replacementPrefix)
+  await seedReconciliationToolCall(pool, value, { id: value.planCallId, stepId: value.branchStepId, toolName: "agent.plan",
     input: request.rawCallInput, sequence: await nextEventSequence(pool, value) })
-  return { pool, command, value, templates, scope, sourceNodes: current.nodes, ...request }
+  return { pool, command, value, templates, scope: branchScope, sourceNodes: current.nodes, ...request }
 }
 
 async function prepareNextTypedBranchReplan(prepared: Awaited<ReturnType<typeof prepareTypedBranchReplan>>, expectedRevision: number) {
@@ -815,7 +824,7 @@ async function prepareNextTypedBranchReplan(prepared: Awaited<ReturnType<typeof 
   const scope: TaskGraphScheduleInput["scope"] = { ...prepared.scope, stepId: value.laterStepId }
   await pool.query(`INSERT INTO "agent_steps"
     ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
-    VALUES ($1, $2, $3, $4, 2, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`, [value.laterStepId, value.sessionId, value.turnId, value.rootTaskId])
+    VALUES ($1, $2, $3, $4, 3, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`, [value.laterStepId, value.sessionId, value.turnId, value.rootTaskId])
   const current = await command.readCurrent(readScope(value))
   if (current.revision !== expectedRevision) throw new Error("Typed branch fixture revision changed before repeated replan")
   await seedReconciliationAgenda(pool, value, { id: value.laterStepId, sequence: await nextEventSequence(pool, value), cursor: 0n,
