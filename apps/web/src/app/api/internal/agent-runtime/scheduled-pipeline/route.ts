@@ -287,6 +287,7 @@ export async function POST(request: Request): Promise<Response> {
         ? parsed.action === "execute" ? json(202, { status: "waiting_for_user", waitId: durableWait.waitId }) : json(202, { status: "waiting_for_user", ...durableWait }, responseWaitId) : blocked(500, "scheduled_pipeline_execution_failed");
     }
     if ("status" in result && result.status === "analyze_checkpointed") return json(200, result, responseWaitId);
+    if ("status" in result && result.status === "gate_checkpointed") return json(200, result);
     return json(200, { status: "completed", report: result }, responseWaitId);
   } catch { return blocked(500, "scheduled_pipeline_execution_failed"); }
 }
