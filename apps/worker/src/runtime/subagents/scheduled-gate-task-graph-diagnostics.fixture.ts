@@ -29,6 +29,41 @@ const gateFailureReasons = new Set([
   "scheduled_pipeline_handoff_retryable", "scheduled_gate_result_invalid", "task_graph_verification_unverified",
   "task_graph_verification_failed", "task_graph_repair_target_unresolved",
 ])
+const choiceFailureReasons = new Set([
+  "scheduled_gate_choice_scope_invalid", "scheduled_gate_choice_checkpoint_invalid", "scheduled_gate_choice_graph_invalid",
+  "scheduled_gate_choice_history_invalid",
+])
+const choiceSqlStates = new Set(["23503", "23505", "23514", "40001", "40P01", "42501", "42703", "42P01", "55P03", "57014", "22P02"])
+
+export function scheduledGateChoiceFailureCode(error: unknown): string {
+  if (!error || typeof error !== "object") return "unknown"
+  const value = error as { message?: unknown; code?: unknown }
+  if (typeof value.message === "string" && choiceFailureReasons.has(value.message)) return value.message
+  return typeof value.code === "string" && choiceSqlStates.has(value.code) ? `pg_${value.code.toLowerCase()}` : "unknown"
+}
+
+export async function withScheduledGateChoiceTrace<T>(work: () => Promise<T>, onPhase: (phase: string) => void): Promise<T> {
+  onPhase("started")
+  try {
+    const value = await work()
+    onPhase("loaded")
+    return value
+  } catch (error: unknown) {
+    onPhase(`failed_${scheduledGateChoiceFailureCode(error)}`)
+    throw error
+  }
+}
+
+export function scheduledGateRuntimeDiagnostic(phase: unknown, leaseAttempt: unknown, requestedAttempt: unknown): string {
+  const safeFailure = typeof phase === "string" && phase.startsWith("failed_") ? phase.slice(7) : ""
+  const sqlState = safeFailure.startsWith("pg_") ? safeFailure.slice(3) : ""
+  const allowedPhase = phase === "not_started" || phase === "started" || phase === "loaded"
+    || choiceFailureReasons.has(safeFailure) || safeFailure === "unknown"
+    || choiceSqlStates.has(sqlState.toUpperCase()) && sqlState === sqlState.toLowerCase()
+  const safePhase = allowedPhase ? String(phase) : "unknown"
+  const safeAttempt = (value: unknown) => typeof value === "number" && Number.isSafeInteger(value) && value >= 1 && value <= 54 ? String(value) : "none"
+  return `${safePhase}_lease_${safeAttempt(leaseAttempt)}_request_${safeAttempt(requestedAttempt)}`
+}
 
 export function isScheduledGateFailureReason(value: unknown): value is string {
   return typeof value === "string" && gateFailureReasons.has(value)

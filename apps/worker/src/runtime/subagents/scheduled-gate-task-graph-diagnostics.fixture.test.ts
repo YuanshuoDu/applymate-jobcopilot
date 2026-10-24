@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 import { classifyScheduledGateFinishQuery, createScheduledGateFinishDiagnosticPool, isScheduledGateFailureReason,
+  scheduledGateChoiceFailureCode, scheduledGateRuntimeDiagnostic, withScheduledGateChoiceTrace,
   withScheduledGateFinishTrace } from "./scheduled-gate-task-graph-diagnostics.fixture.js"
 
 const identityQuery = `SELECT task."turnId", task."rootTaskId", task."parentTaskId", task."attemptCount", session."userId"
@@ -27,6 +28,31 @@ describe("scheduled Gate TaskGraph finish diagnostics", () => {
     expect(classifyScheduledGateFinishQuery("SELECT secret FROM private_table")).toBeNull()
     expect(isScheduledGateFailureReason("scheduled_gate_result_invalid")).toBe(true)
     expect(isScheduledGateFailureReason("database-provided-private-message")).toBe(false)
+  })
+
+  it("exposes only allowlisted choice-loader errors and bounded attempt values", () => {
+    expect(scheduledGateChoiceFailureCode(new Error("scheduled_gate_choice_history_invalid")))
+      .toBe("scheduled_gate_choice_history_invalid")
+    expect(scheduledGateChoiceFailureCode(Object.assign(new Error("database detail"), { code: "40001" }))).toBe("pg_40001")
+    expect(scheduledGateChoiceFailureCode(Object.assign(new Error("database detail"), { code: "40P01" }))).toBe("pg_40p01")
+    expect(scheduledGateChoiceFailureCode(Object.assign(new Error("database detail"), { code: "99999" }))).toBe("unknown")
+    expect(scheduledGateChoiceFailureCode(new Error("private database text"))).toBe("unknown")
+    expect(scheduledGateRuntimeDiagnostic("loaded", 4, 4)).toBe("loaded_lease_4_request_4")
+    expect(scheduledGateRuntimeDiagnostic("failed_pg_40p01", 4, 4)).toBe("failed_pg_40p01_lease_4_request_4")
+    expect(scheduledGateRuntimeDiagnostic("failed_pg_99999", 4, 4)).toBe("unknown_lease_4_request_4")
+    expect(scheduledGateRuntimeDiagnostic("failed_unknown", 55, null)).toBe("failed_unknown_lease_none_request_none")
+  })
+
+  it("preserves the choice-loader result or original exception while exposing only a safe phase", async () => {
+    const value = { validatedChoice: null, priorChoices: [] }
+    const phases: string[] = []
+    await expect(withScheduledGateChoiceTrace(async () => value, phase => phases.push(phase))).resolves.toBe(value)
+    expect(phases).toEqual(["started", "loaded"])
+
+    const failure = new Error("scheduled_gate_choice_history_invalid")
+    phases.length = 0
+    await expect(withScheduledGateChoiceTrace(async () => { throw failure }, phase => phases.push(phase))).rejects.toBe(failure)
+    expect(phases).toEqual(["started", "failed_scheduled_gate_choice_history_invalid"])
   })
 
   it("preserves connect, query, error, and release forwarding", async () => {

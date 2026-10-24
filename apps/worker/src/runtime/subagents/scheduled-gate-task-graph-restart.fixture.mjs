@@ -6,10 +6,11 @@ import { PgSubagentTaskStore } from "./pg-store.ts"
 import { parseSubagentDispatchJobId } from "./dispatch-identity.ts"
 import { runSubagentQueueJob } from "../../queue/subagent-pause-dispatch.ts"
 import { createScheduledGateChildExecutor } from "./scheduled-gate-child-runtime.ts"
+import { loadScheduledGateChoiceHistory } from "./pg-scheduled-task-graph-gate-choices.ts"
 import { scheduledGatePreparedJobIds, parseScheduledGateResult, parseScheduledGateChoice,
   scheduledGateCandidateSetDigest } from "./scheduled-gate-contract.ts"
 import { createScheduledGateFinishDiagnosticPool, isScheduledGateFailureReason, isScheduledGateFinishStage,
-  withScheduledGateFinishTrace } from "./scheduled-gate-task-graph-diagnostics.fixture.ts"
+  scheduledGateRuntimeDiagnostic, withScheduledGateChoiceTrace, withScheduledGateFinishTrace } from "./scheduled-gate-task-graph-diagnostics.fixture.ts"
 
 const [, , mode, queueName, expectedTaskId, rawPlan] = process.argv
 const FIXTURE_WEB_URL = "http://scheduled-gate-fixture.invalid"
@@ -32,7 +33,7 @@ function fixtureError(code) {
   emit("ERROR", { code })
 }
 
-function failedJobCode(error, outcomeDiagnostic, finishStage) {
+function failedJobCode(error, outcomeDiagnostic, finishStage, runtimeDiagnostic) {
   let cause = "unknown"
   if (error && typeof error === "object") {
     if (typeof error.message === "string" && FIXTURE_FAILURE_CODES.has(error.message)) {
@@ -54,7 +55,9 @@ function failedJobCode(error, outcomeDiagnostic, finishStage) {
   const diagnostic = typeof outcomeDiagnostic === "string" && /^[a-z0-9_]{1,180}$/.test(outcomeDiagnostic)
     ? outcomeDiagnostic : "outcome_unavailable"
   const stage = isScheduledGateFinishStage(finishStage) ? finishStage : "not_observed"
-  return `bullmq_job_failed_${cause}_${diagnostic}_${stage}`
+  const runtime = typeof runtimeDiagnostic === "string" && /^[a-z0-9_]{1,120}$/.test(runtimeDiagnostic)
+    ? runtimeDiagnostic : "runtime_unknown"
+  return `bullmq_job_failed_${cause}_${diagnostic}_${stage}_${runtime}`
 }
 
 function persistedGateOutcomeDiagnostic(task, payload, leaseScope, requestedAttempt, outcome) {
@@ -205,6 +208,7 @@ async function main() {
   let requestedAttempt = null
   let leaseScope = null
   let outcomeDiagnostic = null
+  let choicePhase = "not_started"
   let candidateFinishSeen = false
   let candidateFinishStage = "not_observed"
   const originalFinish = store.finish.bind(store)
@@ -218,7 +222,10 @@ async function main() {
     if (!traced.ok) throw traced.error
     return traced.value
   }
-  const runGate = createScheduledGateChildExecutor({ pool, fetcher: createFixtureFetcher(plan, attempt => { requestedAttempt = attempt }) })
+  const loadChoices = lease => withScheduledGateChoiceTrace(
+    () => loadScheduledGateChoiceHistory(pool, lease), phase => { choicePhase = phase })
+  const runGate = createScheduledGateChildExecutor({ pool, loadChoices,
+    fetcher: createFixtureFetcher(plan, attempt => { requestedAttempt = attempt }) })
   const executeGate = async ({ lease }) => {
     leaseScope = { taskId: lease.id, userId: lease.userId, sessionId: lease.sessionId, rootTaskId: lease.rootTaskId,
       turnId: lease.turnId, role: lease.role, taskType: lease.taskType, attemptCount: lease.attemptCount }
@@ -242,7 +249,8 @@ async function main() {
     if (job.data?.taskId !== expectedTaskId) throw new Error("unexpected_subagent_task")
     const identity = parseSubagentDispatchJobId(job.id, expectedTaskId)
     if (!identity) throw new Error("dispatch_identity_invalid")
-    requestedAttempt = null; leaseScope = null; outcomeDiagnostic = null; candidateFinishSeen = false; candidateFinishStage = "not_observed"
+    requestedAttempt = null; leaseScope = null; outcomeDiagnostic = null; choicePhase = "not_started"
+    candidateFinishSeen = false; candidateFinishStage = "not_observed"
     const outcome = await runSubagentQueueJob(pool, manager, executeGate, job.data, identity)
     if (outcome.taskId !== expectedTaskId) throw new Error("unexpected_subagent_task")
     if (!["waiting_for_user", "completed"].includes(outcome.status)) {
@@ -266,7 +274,8 @@ async function main() {
   })
   worker.on("failed", (job, error) => {
     if (job?.data?.taskId !== expectedTaskId) return
-    reportError(failedJobCode(error, outcomeDiagnostic, candidateFinishStage))
+    const runtimeDiagnostic = scheduledGateRuntimeDiagnostic(choicePhase, leaseScope?.attemptCount, requestedAttempt)
+    reportError(failedJobCode(error, outcomeDiagnostic, candidateFinishStage, runtimeDiagnostic))
   })
   worker.on("error", () => reportError("bullmq_worker_error"))
 
