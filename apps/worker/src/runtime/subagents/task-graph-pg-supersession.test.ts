@@ -9,10 +9,16 @@ import {
 } from "./task-graph-pg-supersession.js"
 import { TaskGraphCommandError, type TaskGraphScheduleInput } from "./task-graph-command-port.js"
 import type { SteeringReconciliationOperation } from "./steering-reconciliation-contract.js"
-import { taskGraphProposalKey, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
+import { parseTaskGraphSnapshot, taskGraphProposalKey, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
+import { validateTaskGraphProposal } from "../planning/task-graph.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 
 const runtimeMocks = vi.hoisted(() => ({ prepare: vi.fn() }))
+const analystVerification = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
+  role: "analyst",
+  criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }],
+} as const
 vi.mock("./steering-reconciliation-ledger.js", async importOriginal => {
   const actual = await importOriginal<typeof import("./steering-reconciliation-ledger.js")>()
   return { ...actual, prepareSteeringReconciliation: runtimeMocks.prepare }
@@ -164,13 +170,13 @@ describe("taskGraphWaitConditionEvidenceSql", () => {
   })
 })
 
-function runtimeFixture(revision = 1, replay = false) {
+function runtimeFixture(revision = 1, replay = false, dependencyNodes: readonly Record<string, unknown>[] = [], replacementDependsOn: readonly string[] = []) {
   const scope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
     stepId: "step-1", turnLeaseOwner: "turn-owner", turnLeaseVersion: 3, parentLeaseOwner: "parent-owner", parentAttemptCount: 2 }
-  const verification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst" as const, criteria: [] }
+  const verification = analystVerification
   const sourceNode = { key: "analyst-old", templateId: "analyst", goal: "Earlier query", successCriteria: ["Find evidence"], dependsOn: [],
     depth: 1, taskId: "source-task", verificationDisposition: "typed", verification }
-  const replacementNode = { key: "analyst-new", templateId: "analyst", goal: "Updated query", successCriteria: ["Find evidence"], dependsOn: [], verification }
+  const replacementNode = { key: "analyst-new", templateId: "analyst", goal: "Updated query", successCriteria: ["Find evidence"], dependsOn: [...replacementDependsOn], verification }
   const input: TaskGraphScheduleInput = { scope, proposal: { expectedRevision: revision, nodes: [replacementNode] },
     templates: { analyst: { role: "analyst", taskType: "research", allowedActions: [], constraints: [], expectedOutputSchema: {} } },
     replaceUnstarted: { nodeKey: sourceNode.key } }
@@ -190,14 +196,32 @@ function runtimeFixture(revision = 1, replay = false) {
   const prepared = { scope, callId: operation.callId, decision: "revise", expectedRevision: revision, resultingRevision: revision + 1,
     steerInputIds: ["steer-1"], inputThroughSequence: 8n, idempotencyKey: operationKey,
     receipt: { ...(replay ? { supersession: relation } : {}) } }
+  const snapshot = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [...dependencyNodes, sourceNode] })
   const loaded = { rootTaskId: scope.rootTaskId,
-    state: { revision, nodes: [sourceNode], appliedEvents: [] },
-    snapshot: { nodes: [sourceNode] }, item: { id: "graph-item", revision, content: {}, createdAt: new Date() }, tasks: new Map() }
+    state: { revision, nodes: snapshot.nodes.map(node => ({ ...node, status: node.key === sourceNode.key ? "queued" as const : "waiting" as const })), appliedEvents: [] },
+    snapshot, item: { id: "graph-item", revision, content: {}, createdAt: new Date() }, tasks: new Map() }
   const sourceEvidence = { id: sourceNode.taskId, status: "queued", role: "analyst", taskType: "research", constraints: [],
     allowedActions: [], expectedOutputSchema: {}, attemptCount: 0, leaseOwner: null, leaseExpiresAt: null, nextAttemptAt: null,
     startedAt: null, completedAt: null, closedAt: null, interruptRequestedAt: null, failureReason: null, result: null, confidence: null,
     qualityGateResult: null, outputArtifactIds: [], contextSnapshotId: null, hasExecutionEvidence: false, hasCanonicalDispatch: true }
   return { input, operation, loaded, prepared, relation, sourceEvidence, sourceNode, replacementNode, operationKey, fingerprint }
+}
+
+function dependencyNode(key: string, taskId: string, dependsOn: readonly string[], disposition: "typed" | "legacy_unverified"): Record<string, unknown> {
+  const base = { key, templateId: "analyst", goal: `Work ${key}`, successCriteria: ["Find evidence"], dependsOn: [...dependsOn],
+    depth: dependsOn.length ? 2 : 1, taskId, verificationDisposition: disposition }
+  return disposition === "typed" ? { ...base, verification: analystVerification } : base
+}
+
+function runGuard(fixture: ReturnType<typeof runtimeFixture>) {
+  runtimeMocks.prepare.mockResolvedValueOnce(fixture.prepared)
+  const query = vi.fn(async (_sql: string, _values?: readonly unknown[]) => ({ rows: [fixture.sourceEvidence], rowCount: 1 }))
+  const findReplay = vi.fn(async () => null), budgetReached = new Error("budget seam reached")
+  const checkBudget = vi.fn(async () => { throw budgetReached })
+  const result = scheduleTaskGraphSupersession({ query } as never, fixture.input,
+    { taskType: "root", role: "orchestrator", allowedActions: ["agent.plan"] }, fixture.loaded as never,
+    fixture.operation, taskGraphSupersessionProposalKey("root-1", fixture.input.proposal.expectedRevision), findReplay, checkBudget)
+  return { result, query, findReplay, checkBudget, budgetReached }
 }
 
 describe("scheduleTaskGraphSupersession budget seam", () => {
@@ -238,6 +262,66 @@ describe("scheduleTaskGraphSupersession budget seam", () => {
     expect(query).toHaveBeenCalledOnce()
     expect(String(query.mock.calls[0]?.[0])).toContain("FOR UPDATE OF task")
     expect(query.mock.calls.every(([sql]) => /^\s*SELECT\b/i.test(String(sql)))).toBe(true)
+  })
+
+  it("rejects a waiting legacy direct ancestor before replay, budget, or writes", async () => {
+    const fixture = runtimeFixture(1, false, [dependencyNode("legacy", "legacy-task", [], "legacy_unverified")], ["legacy"])
+    const run = runGuard(fixture)
+
+    await expect(run.result).rejects.toMatchObject({ code: "task_graph_dependency_unverified" })
+
+    expect(run.findReplay).not.toHaveBeenCalled()
+    expect(run.checkBudget).not.toHaveBeenCalled()
+    expect(run.query).toHaveBeenCalledOnce()
+    expect(String(run.query.mock.calls[0]?.[0])).toContain("FOR UPDATE OF task")
+  })
+
+  it("rejects a waiting legacy transitive ancestor through a waiting typed node", async () => {
+    const fixture = runtimeFixture(1, false, [
+      dependencyNode("legacy", "legacy-task", [], "legacy_unverified"),
+      dependencyNode("typed-waiting", "typed-task", ["legacy"], "typed"),
+    ], ["typed-waiting"])
+    const run = runGuard(fixture)
+
+    await expect(run.result).rejects.toMatchObject({ code: "task_graph_dependency_unverified" })
+
+    expect(run.findReplay).not.toHaveBeenCalled()
+    expect(run.checkBudget).not.toHaveBeenCalled()
+    expect(run.query).toHaveBeenCalledOnce()
+  })
+
+  it("allows an unrelated waiting legacy node", async () => {
+    const fixture = runtimeFixture(1, false, [dependencyNode("legacy-unrelated", "legacy-task", [], "legacy_unverified")])
+    const run = runGuard(fixture)
+
+    await expect(run.result).rejects.toBe(run.budgetReached)
+
+    expect(run.findReplay).toHaveBeenCalledOnce()
+    expect(run.checkBudget).toHaveBeenCalledOnce()
+  })
+
+  it("allows a replacement waiting on a typed dependency", async () => {
+    const fixture = runtimeFixture(1, false, [dependencyNode("typed-waiting", "typed-task", [], "typed")], ["typed-waiting"])
+    const run = runGuard(fixture)
+
+    await expect(run.result).rejects.toBe(run.budgetReached)
+
+    expect(run.findReplay).toHaveBeenCalledOnce()
+    expect(run.checkBudget).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    { description: "missing dependency references", dependsOn: ["missing-key"], errorCode: "missing_dependency" },
+    { description: "replacement self-cycles", dependsOn: ["analyst-new"], errorCode: "dependency_cycle" },
+  ])("leaves $description to existing TaskGraph validation", async ({ dependsOn, errorCode }) => {
+    const fixture = runtimeFixture(1, false, [], dependsOn)
+    const run = runGuard(fixture)
+
+    await expect(run.result).rejects.toBe(run.budgetReached)
+    expect(run.checkBudget).toHaveBeenCalledOnce()
+    expect(validateTaskGraphProposal({ expectedRevision: 1, nodes: [fixture.replacementNode] },
+      { revision: 1, nodes: [], appliedEvents: [] }, { registeredTemplateIds: new Set(["analyst"]), maxNodes: 8, maxDepth: 8 }))
+      .toMatchObject({ ok: false, error: { code: errorCode } })
   })
 
   it("does not run the budget check for a stale revision", async () => {

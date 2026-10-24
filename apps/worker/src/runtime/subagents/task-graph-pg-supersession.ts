@@ -151,6 +151,10 @@ export async function scheduleTaskGraphSupersession(client: Queryable, input: Ta
   }
   const sourceTaskId = typeof row.id === "string" ? row.id : ""
   if (!sourceTaskId || sourceTaskId !== source.taskId) throw new TaskGraphCommandError("task_graph_supersession_not_eligible", "The locked source identity changed")
+  const existingDependencies = loaded.snapshot.nodes.filter(node => node.key !== sourceKey && node.key !== replacement.key)
+  if (hasLegacyUnverifiedDependencyAncestor(existingDependencies, replacement.dependsOn)) {
+    throw new TaskGraphCommandError("task_graph_dependency_unverified", "TaskGraph replacement depends on legacy-unverified work")
+  }
   const sourceIdentity = { nodeKey: sourceKey, taskId: sourceTaskId }
   const fingerprint = taskGraphSupersessionFingerprint({ ...sourceIdentity, dependsOn: source.dependsOn }, { expectedRevision: input.proposal.expectedRevision,
     replaceUnstartedNodeKey: sourceKey, nodes: normalizedNodes, rootSuccessCriteria })
@@ -193,6 +197,19 @@ export async function scheduleTaskGraphSupersession(client: Queryable, input: Ta
   if (!relation) throw new Error("task_graph_supersession_relation_invalid")
   await writeSteeringReconciliationReceipt(client, prepared, created.state.revision, relation)
   return receipt
+}
+function hasLegacyUnverifiedDependencyAncestor(nodes: readonly StoredTaskGraphNode[], dependencyKeys: readonly string[]): boolean {
+  const byKey = new Map(nodes.map(node => [node.key, node] as const)), pending = [...dependencyKeys], visited = new Set<string>()
+  while (pending.length > 0) {
+    const key = pending.pop()!
+    if (visited.has(key)) continue
+    visited.add(key)
+    const node = byKey.get(key)
+    if (!node) continue
+    if (node.verificationDisposition === "legacy_unverified") return true
+    pending.push(...node.dependsOn)
+  }
+  return false
 }
 function normalizeSupersessionNodes(nodes: readonly TaskGraphNodeProposal[], rootTaskId: string): readonly TaskGraphNodeProposal[] {
   return nodes.map(node => node.repairOf && !node.repairOf.graphRootTaskId
