@@ -115,7 +115,7 @@ export function createScheduledAutomationPipelineBridge(dependencies: ScheduledA
         scheduledSnapshot.schemaVersion, scheduledSnapshot.targetRoles, scheduledSnapshot.targetLocations,
         scheduledSnapshot.minScore, scheduledSnapshot.dailyCap, scheduledSnapshot.requireApproval, scheduledSnapshot.autoApply,
       ])).digest("hex")}`
-      const graphDigest = digest(snapshot)
+      const graphDigest = digest(prefix.snapshot)
       const stable = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId, rootAttemptCount: owner.rootAttemptCount }
       const publicScout = publicTaskGraphVerificationReport(scout.report), publicAnalyst = publicTaskGraphVerificationReport(analyst.report)
       const evidenceDigest = digest({ owner: stable, snapshotDigest, graphDigest, graphRevision: prefix.current.revision, receipt: receipt.receiptDigest,

@@ -80,20 +80,22 @@ export async function createScheduledGatePrepareFixture(pool: Pool, redisUrl: st
   await pool.query(`INSERT INTO "Resume" ("id", "userId", "name", "content", "kind", "origin", "isDefault", "createdAt", "updatedAt")
     VALUES ($1, $2, 'Fixture Base Resume', $3::jsonb, 'base', 'manual', true, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
   [`scheduled-gate-resume-${seed.ids.turnId}`, seed.ids.userId, JSON.stringify(SCHEDULED_GATE_BASE_RESUME)])
+  const stepOrdinal = Number((await pool.query<{ ordinal: number | string }>(`SELECT COALESCE(MAX("ordinal"), -1) + 1 AS "ordinal" FROM "agent_steps" WHERE "turnId"=$1 AND "sessionId"=$2`, [seed.ids.turnId, seed.ids.sessionId])).rows[0]?.ordinal)
+  if (!Number.isSafeInteger(stepOrdinal) || stepOrdinal < 0) throw new Error("scheduled_gate_prepare_step_ordinal_invalid")
   const stepId = `scheduled-gate-prepare-step-${seed.ids.turnId}`
   const candidateText = "Scheduled Gate integration candidate."
   const usage = { inputTokens: 37, outputTokens: 9, estimatedCostUsd: 0.018 }
   await pool.query(`INSERT INTO "agent_steps"
     ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot", "startedAt")
-    VALUES ($1, $2, $3, $4, 8, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP)`,
-  [stepId, seed.ids.sessionId, seed.ids.turnId, seed.ids.rootTaskId])
+    VALUES ($1, $2, $3, $4, $5, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP)`,
+  [stepId, seed.ids.sessionId, seed.ids.turnId, seed.ids.rootTaskId, stepOrdinal])
   const initialTurnExecutionOwner = turnExecutionOwner(seed, seed.turnLeaseV1)
   const candidateStore = createScheduledPipelineCandidateStore(pool as never, createPgTurnEngineStore(pool as never))
-  await withScheduledPipelineCandidateModelOutput({ owner: initialTurnExecutionOwner, finalStepId: stepId, finalStepOrdinal: 8,
+  await withScheduledPipelineCandidateModelOutput({ owner: initialTurnExecutionOwner, finalStepId: stepId, finalStepOrdinal: stepOrdinal,
     candidateText, finishReason: "stop", usage }, () => candidateStore.stage({ owner: initialTurnExecutionOwner,
-    rootAttemptCount: seed.ownerV1.rootAttemptCount, finalStepId: stepId, finalStepOrdinal: 8, candidateText }))
+    rootAttemptCount: seed.ownerV1.rootAttemptCount, finalStepId: stepId, finalStepOrdinal: stepOrdinal, candidateText }))
   const prepare = await waitForPrepareChoice(pool, seed, attestationV1, initialContinuationKey, claimToken, checkpointDigest,
-    stepId, candidateText, usage, initialTurnExecutionOwner)
+    stepId, stepOrdinal, candidateText, usage, initialTurnExecutionOwner)
   const resumed = await resumePrepareChoice(pool, seed, { owner: seed.ownerV1 as ScheduledGatePrepareOwner,
     attestation: attestationV1, executionOwner, continuationKey: initialContinuationKey, choiceWaitId: prepare.choiceWaitId,
     nextTurnRevision: prepare.nextTurnRevision, answer: "keep_resume", allowedActions: scheduledGateRootActions() })
@@ -102,7 +104,7 @@ export async function createScheduledGatePrepareFixture(pool: Pool, redisUrl: st
   const analyzeAgain = await bridge(currentOwner)
   if (analyzeAgain.status !== "ready") throw new Error(`scheduled_gate_prepare_rebind_${analyzeAgain.reasonCode}`)
   const ready = await runPrepare(pool, redisUrl, seed, currentOwner, resumed.turnExecutionOwner,
-    analyzeAgain.attestation, resumed.handoff, stepId, candidateText)
+    analyzeAgain.attestation, resumed.handoff, stepId, stepOrdinal, candidateText)
   const gate = await buildAndPersistGateCheckpoint(pool, seed, currentOwner, analyzeAgain.attestation, continuationKey,
     resumed.handoff, resumed.claimToken, ready.prepareProof, prepare.choiceWaitId)
   const preparedIds = scheduledGatePreparedJobIds(ready.prepareProof)
@@ -148,10 +150,9 @@ function analyzeCheckpoint(seed: ScheduledGatePrepareSeedFixture, owner: Schedul
       owner, snapshotDigest: attestation.snapshotDigest, graphRevision: attestation.graphRevision, evidenceDigest: attestation.evidenceDigest },
     scoutedJobs: seed.jobRecords, scoredJobs: seed.scoredJobs, analysisFailed: 0 }
 }
-
 async function waitForPrepareChoice(pool: Pool, seed: ScheduledGatePrepareSeedFixture,
   attestation: ScheduledAutomationPipelineAttestation, continuationKey: string, claimToken: string, checkpointDigest: string,
-  stepId: string, candidateText: string, usage: Readonly<{ inputTokens: number; outputTokens: number; estimatedCostUsd: number }>,
+  stepId: string, stepOrdinal: number, candidateText: string, usage: Readonly<{ inputTokens: number; outputTokens: number; estimatedCostUsd: number }>,
   turnOwner: TurnExecutionOwnerFence): Promise<{ choiceWaitId: string; nextTurnRevision: number }> {
   const proof: ScheduledPipelineAnalyzeCheckpointProof = { status: "analyze_checkpointed", continuationKey, checkpointDigest,
     claimTokenDigest: `sha256:${createHash("sha256").update(claimToken, "utf8").digest("hex")}`,
@@ -165,12 +166,12 @@ async function waitForPrepareChoice(pool: Pool, seed: ScheduledGatePrepareSeedFi
       ], dependsOn: ["scheduled-analyst"] }] } }
   const contract = createScheduledTaskGraphContinuationContract(input)
   if (!contract) throw new Error("scheduled_gate_prepare_choice_contract_invalid")
-  const waitId = scheduledPrepareChoiceWaitId({ receipt: contract.receipt, finalStepId: stepId, finalStepOrdinal: 8 })
+  const waitId = scheduledPrepareChoiceWaitId({ receipt: contract.receipt, finalStepId: stepId, finalStepOrdinal: stepOrdinal })
   if (!waitId) throw new Error("scheduled_gate_prepare_choice_wait_id_invalid")
   const command = createPgTaskGraphCommandPort(pool as never), waitPort = createPgDurableWaitPort(pool as never)
   const continuation = createScheduledAutomationPrepareContinuation({ commandPort: command, waitPort })
   const waiting = await continuation({ owner: seed.ownerV1, executionOwner: turnOwner, attestation, proof,
-    candidateText, finalStepId: stepId, finalStepOrdinal: 8, signal: new AbortController().signal })
+    candidateText, finalStepId: stepId, finalStepOrdinal: stepOrdinal, signal: new AbortController().signal })
   if (waiting.status !== "waiting_for_choice" || waiting.waitId !== waitId) throw new Error("scheduled_gate_prepare_choice_not_waiting")
   const question = await createPgTurnQuestionStore(pool as never).waitForQuestion({ owner: turnOwner, stepId,
     toolCallId: null, expectedWaitId: waitId, finishReason: "stop", usage, now: new Date() })
@@ -181,7 +182,7 @@ async function waitForPrepareChoice(pool: Pool, seed: ScheduledGatePrepareSeedFi
 async function runPrepare(pool: Pool, redisUrl: string, seed: ScheduledGatePrepareSeedFixture,
   owner: ScheduledAutomationPipelineOwner, turnOwner: TurnExecutionOwnerFence,
   attestation: ScheduledAutomationPipelineAttestation, proof: ScheduledPipelineAnalyzeCheckpointProof,
-  stepId: string, candidateText: string): Promise<{ prepareTaskId: string; prepareWaitId: string; prepareProof: ScheduledPrepareTaskGraphProof }> {
+  stepId: string, stepOrdinal: number, candidateText: string): Promise<{ prepareTaskId: string; prepareWaitId: string; prepareProof: ScheduledPrepareTaskGraphProof }> {
   const scope = { ...graphScope(seed, owner), stepId }, command = createPgTaskGraphCommandPort(pool as never)
   const waitPort = createPgDurableWaitPort(pool as never)
   const continuation = createScheduledAutomationPrepareContinuation({ commandPort: command, waitPort,
@@ -194,7 +195,7 @@ async function runPrepare(pool: Pool, redisUrl: string, seed: ScheduledGatePrepa
         completionGraphRevision: current.revision, referenceVerificationMode: { phase: "persisted_gate" } })
     } })
   const input = { owner, executionOwner: turnOwner, attestation, proof, candidateText, finalStepId: stepId,
-    finalStepOrdinal: 8, signal: new AbortController().signal }
+    finalStepOrdinal: stepOrdinal, signal: new AbortController().signal }
   const waiting = await continuation(input)
   if (waiting.status !== "waiting_for_dependency") throw new Error("scheduled_gate_prepare_dependency_not_waiting")
   const graph = await command.readCurrent(scope), prepare = graph.nodes.find(node => node.key === "prepare")
