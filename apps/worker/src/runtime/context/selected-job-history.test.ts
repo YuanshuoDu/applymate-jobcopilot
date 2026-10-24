@@ -129,6 +129,42 @@ describe("selected-job history projection", () => {
     }))
   })
 
+  it("retains the canonical unresolved-repair reason from a projected memory record as one advisory hint", () => {
+    const criterionId = "private-repair-criterion"
+    const record = projectSelectedJobMemory({
+      jobId, sourceTurnId: "private-retained-repair-turn", sourceRootTaskId: "private-retained-repair-root", throughSequence: "17",
+      graph: { revision: 5, nodes: [{
+        ...node("analyst", 0, projection("analyst", {
+          findingCount: 1, evidenceCount: 1, findings: [{ jobId, score: 6, evidenceKinds: ["job"] }],
+        })),
+        status: "failed", verificationCriterionIds: [criterionId], verificationReport: {
+          verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "repair_target_unresolved",
+          evidenceDigest: null, resultDigest: "c".repeat(64),
+          criteria: [{ criterionId, status: "passed", reasonCode: "criteria_met" }],
+        },
+      }] },
+    })
+    expect(record?.nodes[0]?.verification).toEqual({
+      status: "unverified", criteria: [{ status: "passed", reasonCode: "criteria_met" }],
+    })
+    if (!record) throw new Error("expected the canonical unresolved-repair report to project into retained memory")
+
+    const retained = projectSelectedJobHistory([history(record, 53n)])
+    expect(retained).toMatchObject({
+      id: "selected-job-history",
+      content: { turns: [{ nodes: [{
+        role: "analyst", status: "failed", result: { availability: "available", score: 6, evidenceKinds: ["job"] },
+        reasonHints: ["repair_target_unresolved"],
+      }] }] },
+    })
+    const serialized = json(retained)
+    for (const privateValue of ["private-retained-repair-turn", "private-retained-repair-root", criterionId,
+      "criteria_met", "verification", "criteria", "evidenceDigest", "resultDigest", "graphDigest", "PASS"]) {
+      expect(serialized).not.toContain(privateValue)
+    }
+    expect(serialized.match(/repair_target_unresolved/g)).toHaveLength(1)
+  })
+
   it("carries only the fixed unresolved-repair hint through direct history and rejects altered hint envelopes", () => {
     const source = outcome(makeRecord("private-repair-turn", "private-repair-root", 6), 49n)
     const nodes = source.nodes.map(node => {
