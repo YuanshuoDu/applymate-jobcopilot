@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto"
+import type { RuntimePolicyDecision } from "@jobcopilot/agent-policy"
 import { describe, expect, it, vi } from "vitest"
 
-import { assertCanonicalCoordinationSurface, assertCanonicalQuestionStore, assertCanonicalQuestionSurface, classifyToolCallRecovery, durableLifecycleSink, isNativeQuestionWaitEnabled } from "./canonical-runtime-tool-recovery.js"
-import type { PersistedToolCallRecovery } from "./turn-engine-types.js"
+import { assertCanonicalCoordinationSurface, assertCanonicalQuestionStore, assertCanonicalQuestionSurface, classifyToolCallRecovery, durableLifecycleSink, durablePolicyDecisionRecorder, isNativeQuestionWaitEnabled } from "./canonical-runtime-tool-recovery.js"
+import type { PersistedToolCallRecovery, TurnEngineEventInput } from "./turn-engine-types.js"
+import type { ExecutionOwnerFence } from "../execution-owner.js"
 
 const pending: PersistedToolCallRecovery = {
   call: { id: "call-1", name: "jobs.search", arguments: { location: "Dublin" } }, toolVersion: "1", stepId: "step-0", callItem: { id: "item-1", revision: 0 },
@@ -41,6 +43,31 @@ function lifecyclePersistence() {
 
 function lifecycleDigest(): string {
   return createHash("sha256").update(JSON.stringify(lifecyclePayload)).digest("hex").slice(0, 24)
+}
+
+function policyDecision(): RuntimePolicyDecision {
+  return {
+    schemaVersion: "agent-harness.v2", policyVersion: "policy.v1", hook: "before_tool_use", outcome: "allow",
+    reasonCode: "read_allowed", reason: "Read is allowed", appliedHooks: ["policy-matrix"], safeInput: { private: true },
+    scope: {
+      userId: "user-1", sessionId: "session-shared", turnId: "turn-shared", stepId: "step-1", toolCallId: "call-shared",
+      toolName: "jobs.search", toolVersion: "1", role: "orchestrator", domain: "jobs", risk: "read",
+    },
+  }
+}
+
+function turnOwnerFence(ownerId: string, leaseVersion: number): ExecutionOwnerFence {
+  return {
+    kind: "turn", userId: "user-1", sessionId: "session-shared", turnId: "turn-shared", taskId: "root-task", rootTaskId: "root-task",
+    ownerId, leaseVersion, leaseExpiresAt: new Date("2026-10-23T00:00:00.000Z"),
+  }
+}
+
+function childOwnerFence(attemptCount: number, ownerId = "worker-a"): ExecutionOwnerFence {
+  return {
+    kind: "task", userId: "user-1", sessionId: "session-shared", turnId: "turn-shared", taskId: "child-task", rootTaskId: "root-task",
+    ownerId, attemptCount, leaseExpiresAt: new Date("2026-10-23T00:00:00.000Z"),
+  }
 }
 
 describe("canonical runtime tool recovery", () => {
@@ -130,5 +157,37 @@ describe("canonical runtime tool recovery", () => {
     expect(persistence.events.get(expectedId)?.idempotencyKey).toBe(`task:task-a:tool-lifecycle:call-shared:started:${digest}`)
     expect(persistence.outbox.size).toBe(1)
     expect(persistence.outbox.get(`agent-outbox-${expectedId}`)).toEqual({ id: `agent-outbox-${expectedId}`, idempotencyKey: `agent-event:${expectedId}`, eventId: expectedId })
+  })
+
+  it("keeps the root decision identity stable across lease changes and excludes runtime-only fields", async () => {
+    const appendEvent = vi.fn(async (_input: TurnEngineEventInput) => ({ id: "event-1" }))
+    const store = { appendEvent } as never
+    await durablePolicyDecisionRecorder(store, turnOwnerFence("worker-a", 3), 2)(policyDecision())
+    await durablePolicyDecisionRecorder(store, turnOwnerFence("worker-b", 4), 2)(policyDecision())
+
+    const [first, replay] = appendEvent.mock.calls.map(([input]) => input)
+    expect(first).toMatchObject({ type: "policy.decision", itemId: null, correlationId: "call-shared", owner: { kind: "turn", taskId: "root-task" } })
+    expect(replay?.idempotencyKey).toBe(first?.idempotencyKey)
+    expect(replay?.id).toBe(first?.id)
+    expect(JSON.stringify(first?.payload)).not.toContain("safeInput")
+    expect(first?.payload).toMatchObject({
+      hook: "before_tool_use", outcome: "allow",
+      scope: { userId: "user-1", sessionId: "session-shared", turnId: "turn-shared", toolCallId: "call-shared" },
+    })
+  })
+
+  it("gives a retrying child a distinct decision identity and propagates persistence errors", async () => {
+    const appendEvent = vi.fn(async (_input: TurnEngineEventInput) => ({ id: "event-1" }))
+    const store = { appendEvent } as never
+    await durablePolicyDecisionRecorder(store, childOwnerFence(1), 1)(policyDecision())
+    await durablePolicyDecisionRecorder(store, childOwnerFence(2), 2)(policyDecision())
+    expect(appendEvent.mock.calls[1]?.[0].idempotencyKey).not.toBe(appendEvent.mock.calls[0]?.[0].idempotencyKey)
+
+    const unavailable = { appendEvent: vi.fn(async () => { throw new Error("storage unavailable") }) } as never
+    await expect(durablePolicyDecisionRecorder(unavailable, childOwnerFence(2), 2)(policyDecision())).rejects.toThrow("storage unavailable")
+  })
+
+  it("rejects a recorder attempt that does not match the claimed child owner", () => {
+    expect(() => durablePolicyDecisionRecorder({ appendEvent: vi.fn() } as never, childOwnerFence(2), 1)).toThrow("policy_decision_attempt_invalid")
   })
 })

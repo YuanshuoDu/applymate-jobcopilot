@@ -1,4 +1,5 @@
 import type pg from "pg"
+import type { RuntimePolicyDecision } from "@jobcopilot/agent-policy"
 import type { TurnLease } from "./turns/lease.js"
 import type { TurnEngineStore } from "./turns/turn-engine-types.js"
 import type { TurnExecutionResult } from "./turns/turn-queue.js"
@@ -47,7 +48,7 @@ export type CanonicalTurnSetup = {
   readonly nativeQuestionWaitEnabled: boolean
   readonly toolCapabilities: string[]
   readonly durableWaitPort: ReturnType<typeof createPgDurableWaitPort>
-  readonly lifecycle: { sink: ToolLifecycleSink | null; owner: ExecutionOwner | null; taskGraphParentAttemptCount: number | null }
+  readonly lifecycle: { sink: ToolLifecycleSink | null; owner: ExecutionOwner | null; taskGraphParentAttemptCount: number | null; policyDecisionRecorder: ((decision: RuntimePolicyDecision) => Promise<void>) | null }
   readonly toolRuntime: RuntimeTool
   readonly rootTools: readonly unknown[]
   readonly root: RootTask
@@ -109,7 +110,7 @@ export async function prepareCanonicalTurnSetup(input: {
   const selectedPolicy = createCanonicalPolicy(state.toolPolicySnapshot, input.coordinationEnabled, graph.enabled)
   const configuredCapabilities = capabilities(state.toolPolicySnapshot).filter(capability => capability !== "canManageChildren")
   const toolCapabilities = [...new Set([...configuredCapabilities, ...(input.coordinationEnabled ? ["coordination", "canManageChildren"] : [])])]
-  const lifecycle = { sink: null as ToolLifecycleSink | null, owner: null as ExecutionOwner | null, taskGraphParentAttemptCount: null as number | null }
+  const lifecycle = { sink: null as ToolLifecycleSink | null, owner: null as ExecutionOwner | null, taskGraphParentAttemptCount: null as number | null, policyDecisionRecorder: null as ((decision: RuntimePolicyDecision) => Promise<void>) | null }
   const verificationRequirements = resolveRootTaskVerificationRequirements(state.turnInput)
   const sinkProxy: ToolLifecycleSink = { append: async event => {
     if (!lifecycle.sink) throw new Error("root_task_not_bound")
@@ -119,12 +120,17 @@ export async function prepareCanonicalTurnSetup(input: {
     if (!lifecycle.owner) throw new Error("tool_result_owner_unavailable")
     return lifecycle.owner
   }
+  const recordPolicyDecision = async (decision: RuntimePolicyDecision) => {
+    if (!lifecycle.policyDecisionRecorder) throw new Error("policy_decision_store_not_bound")
+    await lifecycle.policyDecisionRecorder(decision)
+  }
   const coordination = input.coordinationEnabled ? {
     manager, store: new PgCoordinationStore(pool), wait: toolSafeDurableWaitPort(durableWaitPort),
     nativeCoordination: turnCoordination.nativeOptions, verificationRequirements, askUserEnabled: nativeQuestionWaitEnabled,
   } : undefined
   const toolRuntime = options.toolRuntimeFactory?.({ pool, policy: selectedPolicy, manager, state })
-    ?? createWorkerToolRuntime(pool, { sink: sinkProxy, resolveOwner }, selectedPolicy, coordination)
+    ?? createWorkerToolRuntime(pool, { sink: sinkProxy, resolveOwner }, selectedPolicy, coordination,
+      undefined, undefined, undefined, undefined, undefined, recordPolicyDecision)
   registerTaskGraphPlanningTool(toolRuntime.registry, graph.enabled, {
     commandPort: options.taskGraphCommandPort, templates: turnTaskGraphTemplates, verificationRequirements,
     turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: lease.ownerId,

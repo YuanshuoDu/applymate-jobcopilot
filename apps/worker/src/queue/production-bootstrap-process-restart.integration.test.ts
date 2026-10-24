@@ -286,6 +286,7 @@ type DuplicateRedeliveryAssertionPredicate =
   | "completed_job_state_completed"
   | "first_receipt_query_succeeded"
   | "first_receipt_matches_redacted_search"
+  | "first_policy_outbox_matches_event"
   | "initial_step_snapshot_nonempty"
   | "final_response_contains_fixture_marker"
   | "final_response_json_parseable"
@@ -649,6 +650,10 @@ async function duplicateRedeliveryReceipt(pool: Pool, turnId: string, sessionId:
     stepCount: string
     toolCallStartedEventCount: string
     toolCallCompletedEventCount: string
+    policyDecisionEventCount: string
+    policyDecisionOutboxCount: string
+    policyDecisionPayload: unknown
+    policyDecisionOutboxPayload: unknown
     durableItemCount: string
     durableEventCount: string
     completionEventCount: string
@@ -674,6 +679,15 @@ async function duplicateRedeliveryReceipt(pool: Pool, turnId: string, sessionId:
         WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId"
           AND event."type" = 'tool_call.completed' AND event."correlationId" = $3
           AND event."idempotencyKey" LIKE 'turn:' || turn."rootTaskId" || ':tool-lifecycle:' || $3 || ':completed:%') AS "toolCallCompletedEventCount",
+       (SELECT COUNT(*)::text FROM "agent_events" AS event
+        WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId"
+          AND event."type" = 'policy.decision' AND event."correlationId" = $3) AS "policyDecisionEventCount",
+       (SELECT COUNT(*)::text FROM "agent_events" AS event
+        JOIN "agent_outbox" AS outbox ON outbox."idempotencyKey" = 'agent-event:' || event."id"
+          AND outbox."payload"->>'eventId' = event."id" AND outbox."aggregateId" = turn."sessionId"
+          AND outbox."topic" = 'agent.events'
+        WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId"
+          AND event."type" = 'policy.decision' AND event."correlationId" = $3) AS "policyDecisionOutboxCount",
        (SELECT COUNT(*)::text FROM "agent_items" AS item
         WHERE item."turnId" = turn."id" AND item."sessionId" = turn."sessionId") AS "durableItemCount",
        (SELECT COUNT(*)::text FROM "agent_events" AS event
@@ -691,6 +705,17 @@ async function duplicateRedeliveryReceipt(pool: Pool, turnId: string, sessionId:
           AND event."type" = 'tool_call.completed' AND event."correlationId" = $3
           AND event."idempotencyKey" LIKE 'turn:' || turn."rootTaskId" || ':tool-lifecycle:' || $3 || ':completed:%'
         ORDER BY event."sequence" DESC LIMIT 1) AS "toolResult",
+       (SELECT event."payload" FROM "agent_events" AS event
+        WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId"
+          AND event."type" = 'policy.decision' AND event."correlationId" = $3
+        ORDER BY event."sequence" DESC LIMIT 1) AS "policyDecisionPayload",
+       (SELECT outbox."payload"->'payload' FROM "agent_events" AS event
+        JOIN "agent_outbox" AS outbox ON outbox."idempotencyKey" = 'agent-event:' || event."id"
+          AND outbox."payload"->>'eventId' = event."id" AND outbox."aggregateId" = turn."sessionId"
+          AND outbox."topic" = 'agent.events'
+        WHERE event."turnId" = turn."id" AND event."sessionId" = turn."sessionId"
+          AND event."type" = 'policy.decision' AND event."correlationId" = $3
+        ORDER BY event."sequence" DESC LIMIT 1) AS "policyDecisionOutboxPayload",
        COALESCE((SELECT jsonb_agg(jsonb_build_object(
           'id', item."id", 'type', item."type", 'status', item."status", 'revision', item."revision", 'content', item."content"
         ) ORDER BY item."revision", item."id")
@@ -1856,6 +1881,12 @@ describeWithServices("production bootstrap recovery across a Worker process rest
       finalItemCount: "1",
       toolCallStartedEventCount: "1",
       toolCallCompletedEventCount: "1",
+      policyDecisionEventCount: "1",
+      policyDecisionOutboxCount: "1",
+      policyDecisionPayload: expect.objectContaining({
+        schemaVersion: "agent-harness.v2", hook: "before_tool_use", outcome: "allow",
+        scope: expect.objectContaining({ toolCallId: readCallId, toolName: "jobs.search", sessionId: redeliveryIds.sessionId, turnId: redeliveryIds.turnId }),
+      }),
       completionEventCount: "1",
       toolCallStarted: {
         toolCallId: readCallId,
@@ -1880,6 +1911,13 @@ describeWithServices("production bootstrap recovery across a Worker process rest
         },
       },
     }))
+    await assertDuplicateRedelivery("first_policy_outbox_matches_event", () => {
+      const eventPayload = jsonRecord(firstReceipt.rows[0]?.policyDecisionPayload)
+      const scope = jsonRecord(eventPayload.scope)
+      expect(Object.keys(eventPayload).sort()).toEqual(["hook", "outcome", "policyVersion", "reason", "reasonCode", "schemaVersion", "scope"])
+      expect(Object.keys(scope).sort()).toEqual(["domain", "risk", "role", "sessionId", "stepId", "toolCallId", "toolName", "toolVersion", "turnId", "userId"])
+      expect(firstReceipt.rows[0]?.policyDecisionOutboxPayload).toEqual(eventPayload)
+    })
     await assertDuplicateRedelivery("initial_step_snapshot_nonempty", () => {
       const stepCount = Number(firstReceipt.rows[0]?.stepCount)
       const steps = firstReceipt.rows[0]?.durableSteps
@@ -1897,10 +1935,18 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     const firstModelCalls = redeliveryWorker.output.filter(line => line.startsWith("DUPLICATE_MODEL_CALL "))
     await assertDuplicateRedelivery("first_model_calls_exact", () => expect(firstModelCalls).toEqual(["DUPLICATE_MODEL_CALL 1", "DUPLICATE_MODEL_CALL 2"]))
 
-    // BullMQ's retry script requeues this retained completed record in place.
-    // Pausing the queue keeps the same job hash observable before redelivery.
+    // Stop Worker A after the event/outbox commit. Worker B will receive only
+    // the retained completed Turn job and must not create duplicate rows.
     await runDuplicateRedeliveryStep("queue_paused_before_replay", () => turnQueue!.pause())
     turnQueuePaused = true
+    await runDuplicateRedeliveryStep("shutdown_command_written", () => redeliveryWorker.stdin?.write("shutdown\n"))
+    await waitForDuplicateRedeliveryLine(redeliveryWorker, "SHUTDOWN_STAGE bootstrap_close:complete", "shutdown_completion_line_received", 10_000)
+    await waitForDuplicateRedeliveryExit(redeliveryWorker, { stage: "policy-event-worker-a-shutdown", pid: redeliveryWorker.pid }, "worker_shutdown_process_exited")
+    await assertDuplicateRedelivery("worker_shutdown_exit_zero", () => expect(redeliveryWorker.exitCode).toBe(0))
+
+    const replayWorker = startWorker("duplicate-turn-redelivery", redeliveryIds)
+    workerTwo = replayWorker
+    await waitForDuplicateRedeliveryLine(replayWorker, "DUPLICATE_WORKER_READY", "duplicate_worker_ready")
     await runDuplicateRedeliveryStep("completed_job_retried", () => completedJob.retry("completed"))
     const replayJob = await waitForDuplicateRedeliveryQueueJob(turnQueue!, jobId, "replayed_queue_job_available")
     await assertDuplicateRedelivery("replay_job_id_matches_turn_job", () => expect(replayJob.id).toBe(jobId))
@@ -1910,8 +1956,8 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     await runDuplicateRedeliveryStep("queue_resumed_for_replay", () => turnQueue!.resume())
     turnQueuePaused = false
 
-    const replayDelivery = await waitForDuplicateRedeliveryLine(redeliveryWorker, "DUPLICATE_DELIVERY_FINISHED_2 ", "replay_delivery_line_received")
-    if (replayDelivery !== `DUPLICATE_DELIVERY_FINISHED_2 ${jobId} skipped lease_not_available`) {
+    const replayDelivery = await waitForDuplicateRedeliveryLine(replayWorker, "DUPLICATE_DELIVERY_FINISHED_1 ", "replay_delivery_line_received")
+    if (replayDelivery !== `DUPLICATE_DELIVERY_FINISHED_1 ${jobId} skipped lease_not_available`) {
       throw duplicateRedeliveryScenarioFailure("replay_delivery_status_matches")
     }
     const finalReceipt = await runDuplicateRedeliveryStep("final_receipt_query_succeeded", () => duplicateRedeliveryReceipt(pool!, redeliveryIds.turnId, redeliveryIds.sessionId, readCallId))
@@ -1920,16 +1966,16 @@ describeWithServices("production bootstrap recovery across a Worker process rest
       expect(finalReceipt.rows[0]?.durableSteps).toEqual(firstReceipt.rows[0]?.durableSteps)
     })
     await assertDuplicateRedelivery("final_receipt_unchanged", () => expect(finalReceipt.rows[0]).toEqual(firstReceipt.rows[0]))
-    await assertDuplicateRedelivery("replayed_model_calls_unchanged", () => expect(redeliveryWorker.output.filter(line => line.startsWith("DUPLICATE_MODEL_CALL "))).toEqual(firstModelCalls))
-    await assertDuplicateRedelivery("delivery_history_exact", () => expect(redeliveryWorker.output.filter(line => line.startsWith("DUPLICATE_DELIVERY_FINISHED_")).map(line => line.split(" ").slice(1))).toEqual([
-      [jobId, "completed", "none"],
-      [jobId, "skipped", "lease_not_available"],
-    ]))
+    await assertDuplicateRedelivery("replayed_model_calls_unchanged", () => expect(replayWorker.output.filter(line => line.startsWith("DUPLICATE_MODEL_CALL "))).toEqual([]))
+    await assertDuplicateRedelivery("delivery_history_exact", () => {
+      expect(redeliveryWorker.output.filter(line => line.startsWith("DUPLICATE_DELIVERY_FINISHED_")).map(line => line.split(" ").slice(1))).toEqual([[jobId, "completed", "none"]])
+      expect(replayWorker.output.filter(line => line.startsWith("DUPLICATE_DELIVERY_FINISHED_")).map(line => line.split(" ").slice(1))).toEqual([[jobId, "skipped", "lease_not_available"]])
+    })
 
-    await runDuplicateRedeliveryStep("shutdown_command_written", () => redeliveryWorker.stdin?.write("shutdown\n"))
-    await waitForDuplicateRedeliveryLine(redeliveryWorker, "SHUTDOWN_STAGE bootstrap_close:complete", "shutdown_completion_line_received", 10_000)
-    await waitForDuplicateRedeliveryExit(redeliveryWorker, { stage: "duplicate-redelivery-worker-shutdown", pid: redeliveryWorker.pid }, "worker_shutdown_process_exited")
-    await assertDuplicateRedelivery("worker_shutdown_exit_zero", () => expect(redeliveryWorker.exitCode).toBe(0))
+    await runDuplicateRedeliveryStep("shutdown_command_written", () => replayWorker.stdin?.write("shutdown\n"))
+    await waitForDuplicateRedeliveryLine(replayWorker, "SHUTDOWN_STAGE bootstrap_close:complete", "shutdown_completion_line_received", 10_000)
+    await waitForDuplicateRedeliveryExit(replayWorker, { stage: "duplicate-redelivery-worker-b-shutdown", pid: replayWorker.pid }, "worker_shutdown_process_exited")
+    await assertDuplicateRedelivery("worker_shutdown_exit_zero", () => expect(replayWorker.exitCode).toBe(0))
   }, 60_000)
 
   it("persists a child result, kills its Worker, and resumes the parent from PostgreSQL under a new lease", async () => {

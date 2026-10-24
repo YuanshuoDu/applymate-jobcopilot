@@ -2,31 +2,141 @@ import { Type } from "@sinclair/typebox"
 import { describe, expect, it, vi } from "vitest"
 
 import { InMemoryToolLifecycleSink, ToolLifecycle } from "./lifecycle.js"
-import { PolicyEngine } from "../policy/engine.js"
+import { PolicyEngine, type RuntimePolicyDecision } from "../policy/engine.js"
 import { ToolRegistry } from "./registry.js"
 import { InMemoryToolResultReferenceStore } from "./redaction.js"
-import { ToolRouter } from "./router.js"
+import { ToolRouter, type RuntimePolicyDecisionRecorder } from "./router.js"
 import { ToolExecutionError, type RuntimeToolDefinition } from "./types.js"
 import { SessionPauseRequestedError } from "../session-gate.js"
-import type { ExecutionOwner } from "../execution-owner.js"
+import type { ExecutionOwner, ExecutionOwnerFence } from "../execution-owner.js"
+import { durablePolicyDecisionRecorder } from "../turns/canonical-runtime-tool-recovery.js"
+import type { TurnEngineStore } from "../turns/turn-engine-types.js"
 import type { ToolResultReferenceRepository } from "./tool-result-reference-types.js"
 
 const context = { scope: { userId: "user-a" }, sessionId: "session-a", turnId: "turn-a", stepId: "step-a" }
 
-function makeRouter(execute: RuntimeToolDefinition["execute"] = async () => ({ result: "ok" }), timeoutMs = 100, requiredCapabilities: readonly string[] = []) {
+function makeRouter(
+  execute: RuntimeToolDefinition["execute"] = async () => ({ result: "ok" }),
+  timeoutMs = 100,
+  requiredCapabilities: readonly string[] = [],
+  policy = new PolicyEngine(),
+  recordPolicyDecision?: RuntimePolicyDecisionRecorder,
+) {
   const sink = new InMemoryToolLifecycleSink()
   const registry = new ToolRegistry([{
     schemaVersion: "agent-harness.v2", name: "test.read", version: "1", description: "test",
     capabilities: ["read"], domain: "jobs", inputSchema: Type.Object({ query: Type.String() }, { additionalProperties: false }),
     outputSchema: Type.Object({ result: Type.String() }, { additionalProperties: false }), risk: "read", idempotency: "read_only", timeoutMs, requiredCapabilities, execute,
   }])
-  const router = new ToolRouter(registry, new ToolLifecycle({ sink, references: new InMemoryToolResultReferenceStore(), now: () => "2026-08-31T12:00:00.000Z" }))
+  const router = new ToolRouter(
+    registry,
+    new ToolLifecycle({ sink, references: new InMemoryToolResultReferenceStore(), now: () => "2026-08-31T12:00:00.000Z" }),
+    policy,
+    recordPolicyDecision,
+  )
   return { router, sink }
+}
+
+function policyForOutcome(outcome: "allow" | "deny" | "require_approval" | "require_user_input"): PolicyEngine {
+  return new PolicyEngine({ snapshot: { version: "policy.v1", rules: [{
+    id: "test-policy", roles: ["orchestrator"], tools: ["test.read"], outcome,
+    reasonCode: "test_policy", reason: `Test policy ${outcome}`,
+  }] } })
 }
 
 const request = { id: "call-1", toolName: "test.read", toolVersion: "1", input: { query: "jobs" } }
 
 describe("ToolRouter", () => {
+  it.each([
+    { outcome: "allow" as const, status: "completed", errorCode: null },
+    { outcome: "deny" as const, status: "failed", errorCode: "policy_denied" },
+    { outcome: "require_approval" as const, status: "failed", errorCode: "policy_requires_approval" },
+    { outcome: "require_user_input" as const, status: "failed", errorCode: "policy_requires_user_input" },
+  ])("records the terminal $outcome decision before its result", async ({ outcome, status, errorCode }) => {
+    const execute = vi.fn(async () => ({ result: "ok" }))
+    const recordPolicyDecision = vi.fn(async (_decision: RuntimePolicyDecision) => undefined)
+    const { router } = makeRouter(execute, 100, [], policyForOutcome(outcome), recordPolicyDecision)
+
+    await expect(router.execute(context, request)).resolves.toMatchObject({ status, errorCode })
+
+    expect(recordPolicyDecision).toHaveBeenCalledOnce()
+    expect(recordPolicyDecision.mock.calls[0]?.[0]).toMatchObject({ outcome })
+    if (outcome === "allow") expect(execute).toHaveBeenCalledOnce()
+    else expect(execute).not.toHaveBeenCalled()
+  })
+
+  it("awaits the policy recorder before execution", async () => {
+    const order: string[] = []
+    let recordingStarted!: () => void
+    let finishRecording!: () => void
+    const started = new Promise<void>((resolve) => { recordingStarted = resolve })
+    const recordingGate = new Promise<void>((resolve) => { finishRecording = resolve })
+    const execute = vi.fn(async () => { order.push("execute"); return { result: "ok" } })
+    const recordPolicyDecision = vi.fn(async () => {
+      order.push("record-start")
+      recordingStarted()
+      await recordingGate
+      order.push("record-finish")
+    })
+    const { router } = makeRouter(execute, 100, [], policyForOutcome("allow"), recordPolicyDecision)
+    const pending = router.execute(context, request)
+
+    await started
+    expect(order).toEqual(["record-start"])
+    expect(execute).not.toHaveBeenCalled()
+    finishRecording()
+
+    await expect(pending).resolves.toMatchObject({ status: "completed" })
+    expect(order).toEqual(["record-start", "record-finish", "execute"])
+  })
+
+  it("awaits the policy recorder before returning an approval gate", async () => {
+    let recordingStarted!: () => void
+    let finishRecording!: () => void
+    const started = new Promise<void>((resolve) => { recordingStarted = resolve })
+    const recordingGate = new Promise<void>((resolve) => { finishRecording = resolve })
+    const execute = vi.fn(async () => ({ result: "must not execute" }))
+    const recordPolicyDecision = vi.fn(async () => {
+      recordingStarted()
+      await recordingGate
+    })
+    const { router } = makeRouter(execute, 100, [], policyForOutcome("require_approval"), recordPolicyDecision)
+    let settled = false
+    const pending = router.execute(context, request).finally(() => { settled = true })
+
+    await started
+    expect(settled).toBe(false)
+    expect(execute).not.toHaveBeenCalled()
+    finishRecording()
+
+    await expect(pending).resolves.toMatchObject({ status: "failed", errorCode: "policy_requires_approval" })
+    expect(execute).not.toHaveBeenCalled()
+  })
+
+  it("fails closed when the policy recorder rejects", async () => {
+    const execute = vi.fn(async () => ({ result: "must not execute" }))
+    const recordPolicyDecision = vi.fn(async () => { throw new Error("policy recorder unavailable") })
+    const { router, sink } = makeRouter(execute, 100, [], policyForOutcome("allow"), recordPolicyDecision)
+
+    await expect(router.execute(context, request)).resolves.toMatchObject({ status: "failed", errorCode: "tool_execution_failed" })
+
+    expect(recordPolicyDecision).toHaveBeenCalledOnce()
+    expect(execute).not.toHaveBeenCalled()
+    expect(sink.events.map((event) => event.phase)).toEqual(["started", "failed"])
+  })
+
+  it("fails closed when a denied policy decision cannot be recorded", async () => {
+    const execute = vi.fn(async () => ({ result: "must not execute" }))
+    const recordPolicyDecision = vi.fn(async (_decision: RuntimePolicyDecision) => { throw new Error("policy recorder unavailable") })
+    const { router } = makeRouter(execute, 100, [], policyForOutcome("deny"), recordPolicyDecision)
+
+    await expect(router.execute(context, request)).resolves.toMatchObject({ status: "failed" })
+
+    expect(recordPolicyDecision).toHaveBeenCalledOnce()
+    expect(recordPolicyDecision.mock.calls[0]?.[0]).toMatchObject({ outcome: "deny" })
+    expect(execute).not.toHaveBeenCalled()
+  })
+
   it("validates, executes once for duplicate calls, and returns lifecycle output", async () => {
     const execute = vi.fn(async () => ({ result: "ok" }))
     const { router, sink } = makeRouter(execute)
@@ -246,6 +356,10 @@ describe("ToolRouter", () => {
   it("executes only the safe input produced by a policy rewrite", async () => {
     const execute = vi.fn(async (_toolContext, input) => ({ result: (input as { query: string }).query }))
     const sink = new InMemoryToolLifecycleSink()
+    const persistedPolicyDecisions: unknown[] = []
+    const decisionSink = { append: (decision: unknown) => { persistedPolicyDecisions.push(decision) } }
+    const recordedDecisions: RuntimePolicyDecision[] = []
+    const recordPolicyDecision = vi.fn(async (decision: RuntimePolicyDecision) => { recordedDecisions.push(decision) })
     const registry = new ToolRegistry([{
       schemaVersion: "agent-harness.v2", name: "test.read", version: "1", description: "test",
       capabilities: ["read"], domain: "jobs", inputSchema: Type.Object({ query: Type.String() }, { additionalProperties: false }),
@@ -254,9 +368,47 @@ describe("ToolRouter", () => {
     const router = new ToolRouter(
       registry,
       new ToolLifecycle({ sink, references: new InMemoryToolResultReferenceStore(), now: () => "2026-08-31T12:00:00.000Z" }),
-      new PolicyEngine({ hooks: [{ name: "normalize-location", order: 10, stage: "before_tool_use", evaluate: () => ({ outcome: "rewrite_input", rewrite: { safeInput: { query: "Dublin" } } }) }] }),
+      new PolicyEngine({
+        hooks: [{ name: "normalize-location", order: 10, stage: "before_tool_use", evaluate: () => ({ outcome: "rewrite_input", rewrite: { safeInput: { query: "Dublin" } } }) }],
+        decisionSink,
+      }),
+      recordPolicyDecision,
     )
     await expect(router.execute(context, request)).resolves.toMatchObject({ status: "completed", output: { result: "Dublin" } })
     expect(execute).toHaveBeenCalledWith(expect.anything(), { query: "Dublin" })
+    expect(recordedDecisions[0]).toMatchObject({ outcome: "allow", safeInput: { query: "Dublin" } })
+    expect(persistedPolicyDecisions[0]).toMatchObject({ outcome: "allow" })
+    expect(persistedPolicyDecisions[0]).not.toHaveProperty("safeInput")
+  })
+
+  it("durably records an invalid policy rewrite before denying execution", async () => {
+    const execute = vi.fn(async () => ({ result: "must not execute" }))
+    const owner: ExecutionOwnerFence = {
+      kind: "turn", userId: "user-a", sessionId: "session-a", turnId: "turn-a",
+      taskId: "root-a", rootTaskId: "root-a", ownerId: "worker-a", leaseVersion: 1,
+      leaseExpiresAt: new Date("2099-01-01T00:00:00.000Z"),
+    }
+    const store = {
+      appendEvent: vi.fn(async () => ({ id: "policy-event-1" })),
+    } as unknown as TurnEngineStore
+    const recordPolicyDecision = durablePolicyDecisionRecorder(store, owner, 1)
+    const policy = new PolicyEngine({
+      hooks: [{
+        name: "malicious-rewrite", order: 10, stage: "before_tool_use",
+        evaluate: () => ({ outcome: "rewrite_input" }),
+      }],
+    })
+    const { router } = makeRouter(execute, 100, [], policy, recordPolicyDecision)
+
+    await expect(router.execute(context, request)).resolves.toMatchObject({
+      status: "failed", errorCode: "policy_denied",
+    })
+
+    expect(store.appendEvent).toHaveBeenCalledOnce()
+    expect(store.appendEvent).toHaveBeenCalledWith(expect.objectContaining({
+      type: "policy.decision",
+      payload: expect.objectContaining({ outcome: "deny", reasonCode: "rewrite_invalid" }),
+    }))
+    expect(execute).not.toHaveBeenCalled()
   })
 })

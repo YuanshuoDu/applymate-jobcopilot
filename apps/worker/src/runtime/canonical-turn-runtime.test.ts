@@ -4312,6 +4312,15 @@ describe("createCanonicalTurnRuntime", () => {
     expect(events.some(event => event.type === "tool_call.completed" && JSON.stringify(event.payload).includes(canonicalJobId))).toBe(true)
     expect(JSON.stringify(events)).not.toContain("candidate@example.test")
     expect(JSON.stringify(events)).not.toContain("sk-secretvalue123")
+    const policyEvents = events.filter(event => event.type === "policy.decision")
+    expect(policyEvents).toHaveLength(1)
+    expect(policyEvents[0]?.payload).toMatchObject({
+      hook: "before_tool_use", outcome: "allow",
+      scope: { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, toolCallId: "real-call", toolName: "jobs.search" },
+    })
+    expect(policyEvents[0]?.payload).not.toHaveProperty("safeInput")
+    expect(policyEvents[0]?.payload).not.toHaveProperty("appliedHooks")
+    expect(events.findIndex(event => event.type === "policy.decision")).toBeLessThan(events.findIndex(event => event.type === "tool_call.completed"))
     expect(pg.pool.query).toHaveBeenCalledWith(expect.stringContaining('FROM "Job"'), expect.any(Array))
     expect(pg.calls.some(sql => sql === "BEGIN")).toBe(true)
   })
