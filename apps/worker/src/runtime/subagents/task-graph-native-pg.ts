@@ -214,7 +214,8 @@ async function assertNotSupersededSource(client: Queryable, input: TaskGraphNati
       && receipt.schemaVersion !== STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION) {
     throw commandError("native_source_unavailable")
   }
-  if (branch) try { await assertTaskGraphBranchRepairHistory(client, { ...scope, stepId: branch.agentPlanCall.stepId }, branch, { id: event.id, sequence: eventSequence }) }
+  if (branch) try { await assertTaskGraphBranchRepairHistory(client, scope, branch,
+    { id: event.id, sequence: eventSequence, stepId: receipt!.stepId, idempotencyKey: event.idempotencyKey as string }) }
   catch { throw commandError("native_source_unavailable") }
   throw commandError("native_source_superseded")
 }

@@ -263,7 +263,7 @@ export async function* readSteeringReconciliationHistory(client: Client, scope: 
     const replacements = await assertSteeringReconciliationSupersessionEvents(client, scope, parsed.flatMap(entry => entry.receipt.supersession ?
       [{ relation: entry.receipt.supersession, receiptEventId: entry.id, receiptSequence: entry.sequence }] : []))
     await Promise.all(parsed.flatMap(entry => entry.receipt.branchRepair ? [assertTaskGraphBranchRepairHistory(client, scope,
-      entry.receipt.branchRepair, { id: entry.id, sequence: entry.sequence })] : []))
+      entry.receipt.branchRepair, { id: entry.id, sequence: entry.sequence, stepId: entry.receipt.stepId, idempotencyKey: entry.idempotencyKey })] : []))
     await assertHistoryCalls(client, scope, parsed.filter(entry => !entry.receipt.branchRepair), replacements)
     const stepIds = [...new Set(parsed.map(entry => entry.receipt.stepId))]
     const stepRows = await client.query<Row>(`SELECT "id", "taskId", "ordinal", "attempt", "status", "inputThroughSequence" FROM "agent_steps"

@@ -2934,8 +2934,8 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     expect(relation).toMatchObject({ schemaVersion: "agent-harness.v2.task-graph-branch-repair.v1", resultingRevision: repairedGraph.revision,
       root: { nodeKey: repair.sourceNodes[0]!.key, taskId: repair.sourceNodes[0]!.taskId },
       sources: repair.replaceBranch.sources.map(source => ({ source: { nodeKey: source.nodeKey, taskId: source.taskId }, replacementKey: source.replacementKey })),
-      agentPlanCall: { callId: repaired.planCallId, stepId: repaired.stepId, expectedRevision: 1, replaceBranch: repair.replaceBranch } })
-    expect(relation?.planEvent?.idempotencyKey).toBe(taskGraphProposalKey(repaired.rootTaskId, 1))
+      agentPlanCall: { callId: repaired.planCallId, stepId: repair.scope.stepId, expectedRevision: 1, replaceBranch: repair.replaceBranch } })
+    expect(relation?.planEvent?.idempotencyKey).toBe(taskGraphProposalKey(repaired.rootTaskId, 1 + repair.replaceBranch.sources.length))
     expect(relation?.sources?.every(source => Boolean(source.cancellationEvent?.id && source.cancellationEvent.sequence))).toBe(true)
     expect(BigInt(history.rows[0]!.sequence)).toBeGreaterThan(BigInt(relation!.planEvent!.sequence!))
 

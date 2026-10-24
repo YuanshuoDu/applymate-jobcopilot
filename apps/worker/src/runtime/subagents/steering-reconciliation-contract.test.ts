@@ -68,7 +68,7 @@ function branchRepair() {
       { source: { nodeKey: "scout-old", taskId: "scout-old-task" }, replacementKey: "scout-new", cancellationEvent: { id: "cancel-scout", sequence: "41" } },
       { source: { nodeKey: "analyst-old", taskId: "analyst-old-task" }, replacementKey: "analyst-new", cancellationEvent: { id: "cancel-analyst", sequence: "42" } },
     ],
-    planEvent: { id: "plan-branch", sequence: "43", idempotencyKey: taskGraphProposalKey(scope.rootTaskId, 4) },
+    planEvent: { id: "plan-branch", sequence: "43", idempotencyKey: taskGraphProposalKey(scope.rootTaskId, 6) },
     replacementFingerprint: taskGraphBranchRepairFingerprint(call),
     agentPlanCall: { callId, stepId: scope.stepId, expectedRevision: 4, replaceBranch },
   }

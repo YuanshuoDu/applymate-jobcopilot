@@ -239,7 +239,8 @@ describe("agent.plan tool executor", () => {
     expect(descriptionTool.description).toContain("Repeat exactly those criteria and checks")
     expect(descriptionTool.description).toContain("omit graphRootTaskId because the server binds the active Root")
     expect(descriptionTool.description).toContain("must not add the target to dependsOn")
-    expect(descriptionTool.description).toContain("eight-node lifetime history cap, separate from active-child concurrency")
+    expect(descriptionTool.description).toContain("eight-node limit on the current graph snapshot, including retained terminal nodes")
+    expect(descriptionTool.description).toContain("not a lifetime task-creation cap")
     expect(descriptionTool.description).toContain("task_graph_current.nodeCapacity")
     expect(descriptionTool.description).toContain("may use the reserve in any node order")
     expect(descriptionTool.description).toContain("it does not pass a criterion")
@@ -568,6 +569,29 @@ describe("agent.plan tool executor", () => {
     expect(tool.description).toContain("if none is active, correct the rejected batch so each target/criterion has only one proposed attempt")
     expect(tool.description).toContain("wait for it to become terminal and retry only if the criterion remains unresolved and capacity permits")
     expect(tool.description).toContain("An active repair is not evidence of success")
+  })
+
+  it("gives the model accurate branch-replanning and current-capacity guidance", () => {
+    const { tool } = setup()
+    const description = tool.description
+
+    expect(description).toContain("refresh the owner-scoped current TaskGraph and current Step agenda")
+    expect(description).toContain("replaceBranch: { root: { nodeKey, taskId }, sources: [{ nodeKey, taskId, replacementKey }, ...] }")
+    expect(description).toContain("every node in its transitive dependsOn descendant closure")
+    expect(description).toContain("preserve topology, registered roles, exact typed verification IDs/checks")
+    expect(description).toContain("remap only structured dependency selectors")
+    expect(description).toContain("replaceBranch and replaceUnstarted are mutually exclusive")
+    expect(description).toContain("queued or dependency-waiting sources with attemptCount=0")
+    expect(description).toContain("no lease, execution, wait condition, result, artifact, evidence, or reservation")
+    expect(description).toContain("a fresh model Step with the current graph and agenda revision")
+    expect(description).toContain("it does not require another human message")
+    expect(description).toContain("remaining is current-snapshot space")
+    expect(description).toContain("separate from active-child maxFanOut")
+    expect(description).toContain("Existing cumulative Root execution usage and reservations remain in force")
+    expect(description).toContain("not a lifetime task-creation cap")
+    expect(description).toContain("one global final current-snapshot slot for a valid failed-target criterion repair")
+    expect(description).not.toContain("eight-node lifetime history cap")
+    expect(description).not.toContain("consumes one lifetime slot")
   })
 
   it("requires two remaining root steps before persisting a plan", async () => {

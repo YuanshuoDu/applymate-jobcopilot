@@ -173,7 +173,8 @@ export async function writeSteeringReconciliationReceipt(client: Client, value: 
     if (parsedBranch) {
       const sequence = steeringReconciliationSequence(prior.sequence)
       if (!sequence || !steeringReconciliationId(prior.id)) throw new Error("steering_reconciliation_idempotency_conflict")
-      await assertTaskGraphBranchRepairHistory(client, scope, parsedBranch, { id: prior.id, sequence })
+      await assertTaskGraphBranchRepairHistory(client, scope, parsedBranch,
+        { id: prior.id, sequence, stepId: priorReceipt.stepId, idempotencyKey: String(prior.idempotencyKey) })
     }
     return
   }
@@ -189,7 +190,8 @@ export async function writeSteeringReconciliationReceipt(client: Client, value: 
   if (parsedBranch) {
     const sequence = steeringReconciliationSequence(event.sequence)
     if (!sequence || !steeringReconciliationId(event.id)) throw new Error("steering_reconciliation_branch_repair_event_invalid")
-    await assertTaskGraphBranchRepairHistory(client, scope, parsedBranch, { id: event.id, sequence })
+    await assertTaskGraphBranchRepairHistory(client, scope, parsedBranch,
+      { id: event.id, sequence, stepId: scope.stepId, idempotencyKey: key! })
   }
 }
 

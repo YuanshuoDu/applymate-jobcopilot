@@ -38,10 +38,13 @@ async function readBranchCall(client: Client, scope: SteeringReconciliationScope
   if (!scope.stepId) mismatch()
   const result = await client.query<Row>(`SELECT event."id" AS "eventId", event."sequence" AS "eventSequence", event."type", event."actor", event."taskId" AS "eventTaskId", event."itemId" AS "eventItemId", event."correlationId", event."idempotencyKey", event."payload",
       item."id" AS "callItemId", item."stepId", item."taskId" AS "itemTaskId", item."type" AS "itemType", item."content" AS "itemContent"
-    FROM "agent_events" AS event JOIN "agent_items" AS item ON item."id" = event."itemId" AND item."sessionId" = event."sessionId" AND item."turnId" = event."turnId"
+    FROM "agent_events" AS event JOIN "agent_sessions" AS session ON session."id" = event."sessionId" AND session."userId" = $6
+      JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId" AND turn."userId" = $6 AND turn."rootTaskId" = $3
+      JOIN "agent_items" AS item ON item."id" = event."itemId" AND item."sessionId" = event."sessionId" AND item."turnId" = event."turnId"
+      JOIN "agent_steps" AS step ON step."id" = item."stepId" AND step."sessionId" = item."sessionId" AND step."turnId" = item."turnId" AND step."taskId" = item."taskId"
     WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."type" = 'tool_call.started' AND event."taskId" = $3
-      AND event."correlationId" = $4 AND item."taskId" = $3 AND item."type" = 'tool_call' AND item."stepId" = $5 LIMIT 2`,
-  [scope.sessionId, scope.turnId, scope.rootTaskId, callId, scope.stepId])
+      AND event."correlationId" = $4 AND item."taskId" = $3 AND item."type" = 'tool_call' AND item."stepId" = $5 AND step."id" = $5 LIMIT 2`,
+  [scope.sessionId, scope.turnId, scope.rootTaskId, callId, scope.stepId, scope.userId])
   const row = result.rows.length === 1 ? result.rows[0]! : null
   const event: Row = row ? { id: row.eventId, sequence: row.eventSequence, type: row.type, actor: row.actor, taskId: row.eventTaskId,
     itemId: row.eventItemId, correlationId: row.correlationId, idempotencyKey: row.idempotencyKey, payload: row.payload } : {}
@@ -71,10 +74,12 @@ export async function assertTaskGraphBranchRepairCall(client: Client, scope: Ste
 }
 
 export async function assertTaskGraphBranchRepairHistory(client: Client, scope: SteeringReconciliationScope,
-  relation: TaskGraphBranchRepairRelation, receiptEvent: Readonly<{ id: string; sequence: bigint }>): Promise<TaskGraphScheduleReceipt> {
-  if (!scope.stepId || relation.graphRootTaskId !== scope.rootTaskId || !id(receiptEvent.id) || receiptEvent.sequence <= 0n
-    || relation.operationKey !== steeringReconciliationIdempotencyKey({ ...scope, stepId: scope.stepId }, relation.agentPlanCall.callId)
+  relation: TaskGraphBranchRepairRelation, receiptEvent: Readonly<{ id: string; sequence: bigint; stepId: string; idempotencyKey: string }>): Promise<TaskGraphScheduleReceipt> {
+  if (relation.graphRootTaskId !== scope.rootTaskId || !id(receiptEvent.id) || receiptEvent.sequence <= 0n
+    || receiptEvent.stepId !== relation.agentPlanCall.stepId || receiptEvent.idempotencyKey !== relation.operationKey
+    || relation.operationKey !== steeringReconciliationIdempotencyKey({ ...scope, stepId: relation.agentPlanCall.stepId }, relation.agentPlanCall.callId)
     || parseTaskGraphBranchRepairRelation(relation) === null) mismatch()
+  const historyScope = { ...scope, stepId: relation.agentPlanCall.stepId }
   const ids = [...relation.sources.map(source => source.cancellationEvent.id), relation.planEvent.id]
   if (new Set(ids).size !== ids.length || ids.includes(receiptEvent.id)) mismatch()
   const result = await client.query<Row>(`SELECT event."id", event."itemId", event."taskId", event."type", event."actor", event."correlationId", event."causationId", event."sequence", event."idempotencyKey", event."payload",
@@ -86,7 +91,7 @@ export async function assertTaskGraphBranchRepairHistory(client: Client, scope: 
   const firstItem = object(firstPayload?.item)
   let before: TaskGraphSnapshot
   try { before = parseTaskGraphSnapshot(firstItem?.content) } catch { return mismatch() }
-  const call = await assertTaskGraphBranchRepairCall(client, scope, relation)
+  const call = await assertTaskGraphBranchRepairCall(client, historyScope, relation)
   if (call.sequence >= BigInt(relation.sources[0]!.cancellationEvent.sequence)) mismatch()
   const validation = validateTaskGraphBranchReplacement({ snapshot: before, replaceBranch: relation.agentPlanCall.replaceBranch,
     proposal: { expectedRevision: relation.observedRevision, nodes: call.nodes },

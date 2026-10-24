@@ -157,7 +157,7 @@ function branchReceipt(stepId: string, cursor: string, observedRevision: number,
     root: replaceBranch.root,
     sources: replaceBranch.sources.map((source, index) => ({ source: { nodeKey: source.nodeKey, taskId: source.taskId },
       replacementKey: source.replacementKey, cancellationEvent: { id: `cancel-${suffix}-${index}`, sequence: String(sequence + index) } })),
-    planEvent: { id: `plan-${suffix}`, sequence: String(sequence + 2), idempotencyKey: taskGraphProposalKey(scope.rootTaskId, observedRevision) },
+    planEvent: { id: `plan-${suffix}`, sequence: String(sequence + 2), idempotencyKey: taskGraphProposalKey(scope.rootTaskId, observedRevision + replaceBranch.sources.length) },
     replacementFingerprint: taskGraphBranchRepairFingerprint(call),
     agentPlanCall: { callId, stepId, expectedRevision: observedRevision, replaceBranch },
   })

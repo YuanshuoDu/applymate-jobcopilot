@@ -136,7 +136,7 @@ function branchRepairReceiptEvent(sourceTaskId: string) {
       { source: { nodeKey: "scout-old", taskId: "scout-old-task" }, replacementKey: "scout-new", cancellationEvent: { id: "cancel-scout", sequence: "41" } },
       { source: { nodeKey: "analyst-old", taskId: sourceTaskId }, replacementKey: "analyst-new", cancellationEvent: { id: "cancel-analyst", sequence: "42" } },
     ],
-    planEvent: { id: "plan-branch", sequence: "43", idempotencyKey: taskGraphProposalKey(scope.rootTaskId, 4) },
+    planEvent: { id: "plan-branch", sequence: "43", idempotencyKey: taskGraphProposalKey(scope.rootTaskId, 6) },
     replacementFingerprint: taskGraphBranchRepairFingerprint(call),
     agentPlanCall: { callId, stepId: scope.stepId, expectedRevision: 4, replaceBranch },
   }
@@ -303,8 +303,10 @@ describe("native TaskGraph role admission", () => {
     await expect(appendNativeGraphCommand(fake.client, input, normalizeNativeCommand(input), {} as GraphParent, loaded))
       .rejects.toMatchObject({ code: "native_source_superseded" })
     expect(fake.query.mock.calls[1]?.[0]).toContain("jsonb_array_elements")
-    expect(reconciliationMocks.assertBranchHistory).toHaveBeenCalledWith(fake.client, { ...scope, stepId: scope.stepId }, event.relation,
-      { id: event.id, sequence: 44n })
+    const { stepId: currentStepId, ...ownerScope } = scope
+    expect(currentStepId).toBe("step-1")
+    expect(reconciliationMocks.assertBranchHistory).toHaveBeenCalledWith(fake.client, ownerScope, event.relation,
+      { id: event.id, sequence: 44n, stepId: event.relation.agentPlanCall.stepId, idempotencyKey: event.idempotencyKey })
   })
 
   it("fails closed when a matching v3 source receipt has invalid branch history", async () => {

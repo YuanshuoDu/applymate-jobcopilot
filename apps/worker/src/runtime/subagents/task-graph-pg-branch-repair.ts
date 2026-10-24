@@ -143,7 +143,8 @@ async function replay(client: Client, input: TaskGraphScheduleInput, operation: 
   if (fingerprint !== relation.replacementFingerprint || input.proposal.expectedRevision !== relation.observedRevision
     || !sameScope(input.scope, operation.scope) || operation.decision !== "revise" || operation.expectedRevision !== relation.observedRevision) throw conflict()
   await assertTaskGraphBranchRepairCall(client, operation.scope, relation, fingerprint).catch(() => { throw conflict() })
-  const original = await assertTaskGraphBranchRepairHistory(client, operation.scope, relation, { id: String(row.id), sequence: seq }).catch(() => { throw conflict() })
+  const original = await assertTaskGraphBranchRepairHistory(client, operation.scope, relation,
+    { id: String(row.id), sequence: seq, stepId: receipt.stepId, idempotencyKey: String(row.idempotencyKey) }).catch(() => { throw conflict() })
   return { ...original, status: "duplicate" }
 }
 

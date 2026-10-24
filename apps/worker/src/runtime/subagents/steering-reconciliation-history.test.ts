@@ -7,10 +7,12 @@ import { buildCognitiveActionAgenda } from "../turns/cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt } from "../turns/cognitive-agenda-receipt.js"
 import type { StepContext } from "../context/step-context-builder.js"
 import type { TaskGraphExecutionScope } from "./task-graph-command-port.js"
-import { steeringReconciliationIdempotencyKey, STEERING_RECONCILIATION_SCHEMA_VERSION, STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION, validSteeringReconciliationToolCall } from "./steering-reconciliation-contract.js"
-import { taskGraphFingerprint, taskGraphItemId, taskGraphLifecycleKey, taskGraphProposalKey } from "./task-graph-snapshot.js"
+import { steeringReconciliationIdempotencyKey, STEERING_RECONCILIATION_SCHEMA_VERSION, STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION,
+  STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION, validSteeringReconciliationToolCall } from "./steering-reconciliation-contract.js"
+import { taskGraphFingerprint, taskGraphItemId, taskGraphLifecycleKey, taskGraphProposalKey, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import { taskGraphSupersessionFingerprint, taskGraphSupersessionProposalKey } from "./task-graph-pg-supersession.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { TASK_GRAPH_BRANCH_REPAIR_RELATION_SCHEMA_VERSION, parseTaskGraphBranchRepairRelation, taskGraphBranchRepairFingerprint } from "./task-graph-pg-branch-repair-relation.js"
 import { assertSteeringReconciliationCall, readSteeringReconciliationHistory, type SteeringReconciliationHistoryEntry } from "./steering-reconciliation-history.js"
 import { resolveRootPlanCriteria } from "./root-plan-criteria.js"
 
@@ -181,6 +183,88 @@ function supersessionFixture(change: Readonly<{ relation?: Record<string, unknow
   }) } as unknown as Pick<pg.PoolClient, "query">
   return { client, relation, receipt, storedEvent, events, callInput }
 }
+function branchHistoryFixture() {
+  const stepId = decisionStepId, callId = "branch-history-call", expectedRevision = 4
+  const graphId = taskGraphItemId(scope.rootTaskId), operationScope = { ...scope, stepId }
+  const scoutCheck = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout" as const,
+    criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte" as const, minimum: 1 } }] }
+  const analystCheck = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst" as const, criteria: [
+    { id: "from-scout", check: { kind: "findings_from_scout_dependency" as const, dependencyNodeKey: "scout-old" } },
+    { id: "finding-count", check: { kind: "finding_count_gte" as const, minimum: 1 } },
+  ] }
+  const before = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
+    { key: "scout-old", taskId: "scout-old-task", templateId: "scout", goal: "Old Scout", successCriteria: ["Find a candidate"],
+      dependsOn: [], depth: 1, verificationDisposition: "typed", verification: scoutCheck },
+    { key: "analyst-old", taskId: "analyst-old-task", templateId: "analyst", goal: "Old Analyst", successCriteria: ["Score a candidate"],
+      dependsOn: ["scout-old"], depth: 2, verificationDisposition: "typed", verification: analystCheck },
+  ] }
+  const replaceBranch = { root: { nodeKey: "scout-old", taskId: "scout-old-task" }, sources: [
+    { nodeKey: "scout-old", taskId: "scout-old-task", replacementKey: "scout-new" },
+    { nodeKey: "analyst-old", taskId: "analyst-old-task", replacementKey: "analyst-new" },
+  ] }
+  const nodes = [
+    { key: "scout-new", templateId: "scout", goal: "Refreshed Scout", successCriteria: ["Find a fresh candidate"], dependsOn: [], verification: scoutCheck },
+    { key: "analyst-new", templateId: "analyst", goal: "Refreshed Analyst", successCriteria: ["Score fresh evidence"], dependsOn: ["scout-new"],
+      verification: { ...analystCheck, criteria: analystCheck.criteria.map(criterion => criterion.check.kind === "findings_from_scout_dependency"
+        ? { ...criterion, check: { ...criterion.check, dependencyNodeKey: "scout-new" } } : criterion) } },
+  ]
+  const call = { expectedRevision, replaceBranch, nodes }, fingerprint = taskGraphBranchRepairFingerprint(call)
+  const relation = parseTaskGraphBranchRepairRelation({ schemaVersion: TASK_GRAPH_BRANCH_REPAIR_RELATION_SCHEMA_VERSION,
+    operationKey: steeringReconciliationIdempotencyKey(operationScope, callId), graphRootTaskId: scope.rootTaskId,
+    observedRevision: expectedRevision, resultingRevision: 7, root: replaceBranch.root,
+    sources: replaceBranch.sources.map((source, index) => ({ source: { nodeKey: source.nodeKey, taskId: source.taskId },
+      replacementKey: source.replacementKey, cancellationEvent: { id: `branch-cancel-${index}`, sequence: String(41 + index) } })),
+    planEvent: { id: "branch-plan", sequence: "43", idempotencyKey: taskGraphProposalKey(scope.rootTaskId, 6) }, replacementFingerprint: fingerprint,
+    agentPlanCall: { callId, stepId, expectedRevision, replaceBranch } })
+  if (!relation) throw new Error("branch history relation fixture must be valid")
+  const after = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: nodes.map((node, index) => ({ ...node,
+    taskId: index === 0 ? "scout-new-task" : "analyst-new-task", depth: index + 1, verificationDisposition: "typed" })) }
+  const toolEvent = { eventId: "branch-tool-event", eventSequence: "40", type: "tool_call.started", actor: "orchestrator",
+    eventTaskId: scope.rootTaskId, eventItemId: "branch-call-item", correlationId: callId, idempotencyKey: toolStartKey(callId),
+    payload: { toolCallId: callId, toolName: "agent.plan", taskId: scope.rootTaskId }, callItemId: "branch-call-item", stepId,
+    itemTaskId: scope.rootTaskId, itemType: "tool_call", itemContent: { toolCallId: callId, toolName: "agent.plan", toolVersion: "1", input: call } }
+  const cancellations = replaceBranch.sources.map((source, index) => {
+    const cancellationKey = taskGraphLifecycleKey(scope.rootTaskId, source.nodeKey, 0, "task.cancelled"), revision = expectedRevision + index + 1
+    return { id: `branch-cancel-${index}`, itemId: graphId, taskId: source.taskId, type: "item.delta", actor: "system",
+      correlationId: scope.turnId, causationId: stepId, sequence: String(41 + index), idempotencyKey: cancellationKey, hasOutbox: true,
+      payload: { kind: "lifecycle", revision, event: { type: "task.cancelled", nodeKey: source.nodeKey,
+        expectedRevision: revision - 1, idempotencyKey: cancellationKey }, item: { id: graphId, sessionId: scope.sessionId,
+        turnId: scope.turnId, taskId: scope.rootTaskId, type: "task_graph", revision, content: before } } }
+  })
+  const receipt = { status: "accepted", revision: 7, nodes: [
+    { key: "scout-new", taskId: "scout-new-task", status: "queued" }, { key: "analyst-new", taskId: "analyst-new-task", status: "waiting" },
+  ], readyTaskIds: ["scout-new-task"] }
+  const plan = { id: relation.planEvent.id, itemId: graphId, taskId: scope.rootTaskId, type: "item.delta", actor: "orchestrator",
+    correlationId: scope.turnId, causationId: stepId, sequence: relation.planEvent.sequence, idempotencyKey: relation.planEvent.idempotencyKey,
+    hasOutbox: true, payload: { kind: "proposal", fingerprint, revision: 7, receipt, content: after,
+      item: { id: graphId, sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.rootTaskId, type: "task_graph", revision: 7, content: after } } }
+  const receiptEvent = { id: "branch-reconciliation", itemId: null, taskId: scope.rootTaskId, type: "agent.plan.reconciliation",
+    actor: "orchestrator", correlationId: scope.turnId, causationId: stepId, sequence: "44", idempotencyKey: relation.operationKey,
+    hasOutbox: false, payload: { schemaVersion: STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION, sessionId: scope.sessionId,
+      turnId: scope.turnId, rootTaskId: scope.rootTaskId, stepId, decision: "revise", observedRevision: 4, resultingRevision: 7,
+      steerInputIds: [], inputCheckpoint: { throughSequence: "10" }, branchRepair: relation } }
+  const agendaPayload = buildCognitiveAgendaReceipt({ sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.rootTaskId, stepId,
+    agenda: { ...buildCognitiveActionAgenda({ ...context, stepId }), planRevision: expectedRevision } })
+  if (!agendaPayload) throw new Error("branch history agenda fixture must be valid")
+  const query = vi.fn(async (sql: string, values?: unknown[]) => {
+    if (sql.includes('event."type" = $3')) return { rows: values?.[3] == null && values?.[4] == null ? [receiptEvent] : [], rowCount: values?.[3] == null && values?.[4] == null ? 1 : 0 }
+    if (sql.includes('event."id" = ANY($3::text[])')) {
+      const events = [...cancellations, plan].filter(event => (values?.[2] as string[]).includes(event.id))
+      return { rows: events, rowCount: events.length }
+    }
+    if (sql.includes("tool_call.started")) {
+      const match = Array.isArray(values?.[3]) ? false : values?.[4] === stepId && values?.[5] === scope.userId
+      return { rows: match ? [toolEvent] : [], rowCount: match ? 1 : 0 }
+    }
+    if (sql.includes('FROM "agent_steps"')) return { rows: [{ id: stepId, taskId: scope.rootTaskId, ordinal: 1,
+      attempt: 1, status: "completed", inputThroughSequence: "10" }], rowCount: 1 }
+    if (sql.includes("cognitive.agenda")) return { rows: [{ actor: "orchestrator", itemId: null, taskId: scope.rootTaskId,
+      correlationId: stepId, payload: agendaPayload }], rowCount: 1 }
+    return { rows: [], rowCount: 0 }
+  })
+  const client = { query } as unknown as Pick<pg.PoolClient, "query">
+  return { client, relation, receiptEvent }
+}
 function longHistoryFixture(count: number, malformedIndex = -1) {
   const receipts: Array<Record<string, unknown>> = [], toolEvents: Array<Record<string, unknown>> = []
   const steps: Array<Record<string, unknown>> = [], agendas: Array<Record<string, unknown>> = []
@@ -227,6 +311,18 @@ describe("durable steering reconciliation history", () => {
     const history = await historyEntries(f.client)
     expect(history).toEqual([{ receipt: baseReceipt, stepOrdinal: 1, stepAttempt: 1 }])
     expect(f.calls.some(sql => sql.includes('item."stepId" = ANY($4::text[])'))).toBe(true)
+  })
+
+  it("validates branch receipt history for an owner-only scope without a current Step", async () => {
+    const f = branchHistoryFixture(), { stepId: currentStepId, ...ownerScope } = scope
+    expect(currentStepId).toBe("later-step")
+    const history: SteeringReconciliationHistoryEntry[] = []
+    for await (const entry of readSteeringReconciliationHistory(f.client, ownerScope, 7)) history.push(entry)
+    expect(history).toHaveLength(1)
+    expect(history[0]).toMatchObject({
+      receipt: { schemaVersion: STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION, stepId: decisionStepId,
+        branchRepair: f.relation }, stepOrdinal: 1, stepAttempt: 1,
+    })
   })
 
   it("accepts reconciled agent.plan history with a pinned checklist and keeps omission compatible", async () => {

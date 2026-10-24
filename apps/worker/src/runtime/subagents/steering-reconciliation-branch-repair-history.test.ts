@@ -171,12 +171,16 @@ function fixture(options: Readonly<{ changedScoutMinimum?: number }> = {}) {
       const rows = events.filter(event => ids.includes(String(event.id)))
       return { rows, rowCount: rows.length }
     }
-    if (sql.includes("tool_call.started")) return { rows: [callRow], rowCount: 1 }
+    if (sql.includes("tool_call.started")) {
+      const matches = values?.[4] === callRow.stepId && values?.[5] === scope.userId
+      return { rows: matches ? [callRow] : [], rowCount: matches ? 1 : 0 }
+    }
     return { rows: [], rowCount: 0 }
   })
   const client = { query } as unknown as Pick<PoolClient, "query">
   return { client, query, events, callRow, relation, proposedNodes,
-    receiptEvent: { id: "reconciliation-receipt", sequence: 44n } }
+    receiptEvent: { id: "reconciliation-receipt", sequence: 44n, stepId: scope.stepId,
+      idempotencyKey: relation.operationKey } }
 }
 
 function changePlanContent(f: ReturnType<typeof fixture>, content: TaskGraphSnapshot): void {
@@ -198,6 +202,31 @@ describe("persisted TaskGraph branch repair history", () => {
     })
     expect(f.events.map(event => event.id)).toEqual(["cancel-scout-old", "cancel-analyst-old", "branch-plan-event"])
     expect(f.query).toHaveBeenCalledTimes(2)
+  })
+
+  it("validates an immutable prior-Step receipt against its persisted call while retaining the current owner scope", async () => {
+    const f = fixture(), laterScope = { ...scope, stepId: "later-decision-step" }
+    await expect(assertTaskGraphBranchRepairHistory(f.client, laterScope, f.relation, f.receiptEvent)).resolves.toMatchObject({ status: "accepted" })
+    const { stepId: currentStepId, ...ownerScope } = scope
+    expect(currentStepId).toBe("decision-step")
+    await expect(assertTaskGraphBranchRepairHistory(f.client, ownerScope, f.relation, f.receiptEvent)).resolves.toMatchObject({ status: "accepted" })
+    const callQuery = f.query.mock.calls.find(([sql]) => sql.includes("tool_call.started"))
+    expect(callQuery?.[1]).toEqual([scope.sessionId, scope.turnId, scope.rootTaskId, f.relation.agentPlanCall.callId, scope.stepId, scope.userId])
+  })
+
+  it("rejects a relation bound to a foreign Step or a mismatched persisted receipt key", async () => {
+    const f = fixture(), foreignStepId = "foreign-step"
+    const foreignKey = steeringReconciliationIdempotencyKey({ ...scope, stepId: foreignStepId }, f.relation.agentPlanCall.callId)!
+    const misbound = { ...f.relation, operationKey: foreignKey,
+      agentPlanCall: { ...f.relation.agentPlanCall, stepId: foreignStepId } }
+    await expect(assertTaskGraphBranchRepairHistory(f.client, scope, misbound,
+      { ...f.receiptEvent, stepId: foreignStepId, idempotencyKey: foreignKey }))
+      .rejects.toThrow("steering_reconciliation_branch_repair_event_invalid")
+    await expect(assertTaskGraphBranchRepairHistory(f.client, scope, misbound, f.receiptEvent))
+      .rejects.toThrow("steering_reconciliation_branch_repair_event_invalid")
+    await expect(assertTaskGraphBranchRepairHistory(f.client, scope, f.relation,
+      { ...f.receiptEvent, idempotencyKey: foreignKey }))
+      .rejects.toThrow("steering_reconciliation_branch_repair_event_invalid")
   })
 
   it.each([
