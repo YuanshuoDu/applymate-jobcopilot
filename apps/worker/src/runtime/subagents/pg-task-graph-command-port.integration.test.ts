@@ -2965,9 +2965,12 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       if (!("value" in claimOutcome)) throw claimOutcome.error
       expect(claimOutcome.value).toMatchObject({ status: "running", attemptCount: 1, leaseOwner: "worker-before-branch-repair" })
       const afterClaim = await supersessionDurableRows(adminPool!, claimed)
+      expect(afterClaim.items).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: taskGraphItemId(claimed.rootTaskId), revision: 2 }),
+      ]))
       commandLoserBarrier.release()
       const commandOutcome = await commandPromise
-      expect("error" in commandOutcome ? commandOutcome.error : undefined).toMatchObject({ code: "task_graph_branch_repair_not_eligible" })
+      expect("error" in commandOutcome ? commandOutcome.error.message : undefined).toBe("steering_reconciliation_revision_conflict")
       expect(await supersessionDurableRows(adminPool!, claimed)).toEqual(afterClaim)
     } finally {
       claimBarrier.release()
@@ -2975,7 +2978,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       await Promise.all([claimHolder.end(), commandLoser.end()])
     }
     const unchanged = await losingRepair.command.readCurrent(readScope(claimed))
-    expect(unchanged.revision).toBe(1)
+    expect(unchanged.revision).toBe(2)
     expect(unchanged.nodes.map(node => node.key)).toEqual(["source-scout", "source-analyst"])
     expect(unchanged.nodes.map(node => node.status)).toEqual(["running", "waiting"])
     expect((await adminPool!.query(`SELECT "id" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "parentTaskId" = $2
