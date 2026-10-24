@@ -833,13 +833,19 @@ async function makePolicyReplayWorker(firstWorker) {
                 eventId: result.id,
                 idempotencyKey: input.idempotencyKey,
                 outcome: input.payload?.outcome,
+                ownerKind: input.owner.kind,
+                ownerId: input.owner.ownerId,
+                leaseVersion: input.owner.leaseVersion,
                 taskId: input.owner.taskId,
                 attemptCount: input.owner.kind === "task" ? input.owner.attemptCount : null,
               })
               if (firstWorker) {
                 say("POLICY_DECISION_COMMITTED " + marker)
                 await waitForCommand("release-policy-decision")
-              } else say("POLICY_DECISION_REPLAYED " + marker)
+              } else {
+                say("POLICY_DECISION_REPLAYED " + marker)
+                await waitForCommand("release-policy-decision-replay")
+              }
             }
             return result
           },

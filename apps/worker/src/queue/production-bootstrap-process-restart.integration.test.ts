@@ -771,11 +771,13 @@ async function policyDecisionReplayReceipt(pool: Pool, turnId: string, sessionId
     ),
     pool.query<{
       status: string; leaseOwnerId: string | null; leaseVersion: number; rootTaskId: string
-      rootStatus: string; rootAttemptCount: number; rootLeaseOwner: string | null
+      turnLeaseActive: boolean; rootStatus: string; rootAttemptCount: number; rootLeaseOwner: string | null; rootLeaseActive: boolean
       stepId: string | null; stepAttempt: number | null; stepTaskId: string | null
     }>(
       `SELECT turn."status", turn."leaseOwnerId", turn."leaseVersion", turn."rootTaskId",
+         (turn."leaseExpiresAt" > clock_timestamp()) AS "turnLeaseActive",
          root."status" AS "rootStatus", root."attemptCount" AS "rootAttemptCount", root."leaseOwner" AS "rootLeaseOwner",
+         (root."leaseExpiresAt" > clock_timestamp()) AS "rootLeaseActive",
          step."id" AS "stepId", step."attempt" AS "stepAttempt", step."taskId" AS "stepTaskId"
        FROM "agent_turns" AS turn
        JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."turnId" = turn."id"
@@ -1680,7 +1682,8 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     workerOne = startWorker("policy-replay-worker1", policyIds)
     const committedLine = await waitForLine(workerOne, "POLICY_DECISION_COMMITTED ", 30_000)
     const committed = JSON.parse(committedLine.slice("POLICY_DECISION_COMMITTED ".length)) as {
-      eventId: string; idempotencyKey: string; outcome: string; taskId: string; attemptCount: number | null
+      eventId: string; idempotencyKey: string; outcome: string; ownerKind: string; ownerId: string; leaseVersion: number
+      taskId: string; attemptCount: number | null
     }
     const before = await policyDecisionReplayReceipt(pool!, policyIds.turnId, sessionId, toolCallId)
     expect(before.events).toHaveLength(1)
@@ -1732,10 +1735,25 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     await waitForLine(workerTwo, "POLICY_REPLAY_WORKER_READY worker2", 30_000)
     const replayLine = await waitForLine(workerTwo, "POLICY_DECISION_REPLAYED ", 60_000)
     const replayed = JSON.parse(replayLine.slice("POLICY_DECISION_REPLAYED ".length)) as typeof committed
+    if (!workerTwo.pid) throw new Error("Policy decision Worker B has no PID at the reclaimed-lease boundary")
+    const workerTwoOwnerId = `policy-replay-worker2-${workerTwo.pid}`
     expect(replayed).toMatchObject({
       eventId: decision.id, idempotencyKey: decision.idempotencyKey, outcome: "allow",
-      taskId: rootBefore?.rootTaskId, attemptCount: null,
+      ownerKind: "turn", ownerId: workerTwoOwnerId, taskId: rootBefore?.rootTaskId, attemptCount: null,
     })
+    const reclaimed = await policyDecisionReplayReceipt(pool!, policyIds.turnId, sessionId, toolCallId)
+    expect(reclaimed.events).toHaveLength(1)
+    expect(reclaimed.events[0]).toEqual(decision)
+    expect(reclaimed.root).toMatchObject({
+      status: "in_progress", rootStatus: "running", leaseOwnerId: replayed.ownerId, rootLeaseOwner: replayed.ownerId,
+      leaseVersion: replayed.leaseVersion, rootTaskId: replayed.taskId,
+      rootAttemptCount: rootBefore?.rootAttemptCount, stepId: rootBefore?.stepId, stepAttempt: rootBefore?.stepAttempt,
+      stepTaskId: rootBefore?.rootTaskId, turnLeaseActive: true, rootLeaseActive: true,
+    })
+    expect(replayed.leaseVersion).toBeGreaterThan(rootBefore?.leaseVersion ?? 0)
+    expect(reclaimed.tools).toMatchObject({ callCount: "1", resultCount: "0", completedCallCount: "0", completedEventCount: "0" })
+    expect(workerTwo.output.filter(line => line.startsWith(`POLICY_REPLAY_TOOL_EXECUTED ${toolCallId}`))).toHaveLength(0)
+    workerTwo.stdin?.write("release-policy-decision-replay\n")
     await waitForLine(workerTwo, `POLICY_REPLAY_TOOL_EXECUTED ${toolCallId}`, 30_000)
     await waitForLine(workerTwo, `POLICY_REPLAY_CONTEXT_OK ${toolCallId}`, 30_000)
     await waitForTurnStatus(pool!, policyIds.turnId, "completed", 60_000, workerTwo)
