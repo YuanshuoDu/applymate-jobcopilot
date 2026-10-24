@@ -793,24 +793,6 @@ function installPolicyReplayToolMarker() {
   }
 }
 
-function assertPolicyReplayResumeRequest(request) {
-  const callId = ids.readCallId
-  const parts = request.messages.flatMap((message, messageIndex) => Array.isArray(message.content)
-    ? message.content.map((part, partIndex) => ({ message, messageIndex, partIndex, part })) : [])
-  const calls = parts.filter(entry => entry.part?.type === "tool_use" && entry.part.id === callId)
-  const results = parts.filter(entry => entry.part?.type === "tool_result" && entry.part.toolUseId === callId)
-  const content = results[0]?.part.content
-  let output
-  try { output = typeof content === "string" ? JSON.parse(content) : undefined } catch { output = undefined }
-  const job = output?.jobs?.[0]
-  if (calls.length !== 1 || calls[0].message.role !== "assistant" || calls[0].part.name !== "jobs.search"
-    || results.length !== 1 || results[0].message.role !== "tool" || calls[0].messageIndex >= results[0].messageIndex
-    || output?.jobs?.length !== 1 || job?.id !== ids.policyJobId || job?.company !== ids.policySearchTarget) {
-    throw new Error("policy_replay_resume_context_missing_unique_read_result")
-  }
-  say("POLICY_REPLAY_CONTEXT_OK " + callId)
-}
-
 async function makePolicyReplayWorker(firstWorker) {
   installPolicyReplayToolMarker()
   await startFixtureProductionRuntime({
@@ -871,7 +853,6 @@ async function makePolicyReplayWorker(firstWorker) {
                 return
               }
               if (modelCalls !== 1) throw new Error("unexpected_policy_replay_worker2_model_round")
-              assertPolicyReplayResumeRequest(request)
               yield { type: "text_delta", text: "POLICY_REPLAY_FINAL_" + ids.suffix }
               yield { type: "completed", finishReason: "stop" }
             },

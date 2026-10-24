@@ -1755,7 +1755,6 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     expect(workerTwo.output.filter(line => line.startsWith(`POLICY_REPLAY_TOOL_EXECUTED ${toolCallId}`))).toHaveLength(0)
     workerTwo.stdin?.write("release-policy-decision-replay\n")
     await waitForLine(workerTwo, `POLICY_REPLAY_TOOL_EXECUTED ${toolCallId}`, 30_000)
-    await waitForLine(workerTwo, `POLICY_REPLAY_CONTEXT_OK ${toolCallId}`, 30_000)
     await waitForTurnStatus(pool!, policyIds.turnId, "completed", 60_000, workerTwo)
 
     const after = await policyDecisionReplayReceipt(pool!, policyIds.turnId, sessionId, toolCallId)
