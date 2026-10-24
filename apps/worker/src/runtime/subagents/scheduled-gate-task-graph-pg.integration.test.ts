@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { spawn, type ChildProcess } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { once } from "node:events"
@@ -16,11 +16,16 @@ import { createPgRootTaskStore } from "./root-task-store.js"
 import { createPgDurableWaitPort } from "./durable-wait-store.js"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import { createScheduledAutomationGateContinuation } from "./scheduled-automation-gate-bridge.js"
+import { projectScheduledAnalyzePrefix } from "./scheduled-automation-prepare-bridge.js"
 import { createScheduledGatePrepareFixture } from "./scheduled-gate-prepare-pg-runner.fixture.js"
-import { scheduledGateCandidateSetDigest, type ScheduledGateResult } from "./scheduled-gate-contract.js"
+import { scheduledGateCandidateSetDigest, scheduledGatePreparedJobIds, type ScheduledGateResult } from "./scheduled-gate-contract.js"
 import type { TurnQuestionGateChoiceBinding } from "../turns/turn-question-gate-choice-contract.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
-import { taskGraphLifecycleKey } from "./task-graph-snapshot.js"
+import { canonicalTaskGraphJson, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
+import { buildScheduledPrepareTaskGraphProof, SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA } from "./scheduled-prepare-task-graph-verification.js"
+import { loadPersistedScheduledPrepareProof } from "./scheduled-gate-wait-match.js"
+import { parseScheduledTaskGraphContinuationReceipt, scheduledTaskGraphStableContinuationKey } from "./scheduled-taskgraph-continuation-receipt.js"
+import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.js"
 
 const databaseUrl = disposableDatabaseUrl()
 const redisUrl = disposableRedisUrl()
@@ -28,6 +33,11 @@ const describeWithServices = databaseUrl && redisUrl ? describe : describe.skip
 const workerFixture = fileURLToPath(new URL("./scheduled-gate-task-graph-restart.fixture.mjs", import.meta.url))
 const workerCwd = fileURLToPath(new URL("../../..", import.meta.url))
 const zeroUsage = { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }
+const prepareGoal = "Prepare application materials using the persisted scheduled Analyze checkpoint."
+const prepareCriteria = [
+  "Prepare only jobs and 0-100 scores from the verified scheduled Analyze checkpoint.",
+  "Persist immutable owner-fenced material references and return no resume or letter bodies.",
+]
 const rootActions = [...new Set([
   ...TASK_GRAPH_TEMPLATES.scout.allowedActions,
   ...TASK_GRAPH_TEMPLATES.analyst.allowedActions,
@@ -131,8 +141,8 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
     ])
     await adoptRootLease(fixture, lease, rootStore, execution)
 
-    let nextStepOrdinal = 9
-    const firstStep = await startStep(fixture, lease, turnStore, nextStepOrdinal++)
+    await assertPrepareProofPreflight(pool, fixture, "four-job-initial-append")
+    const firstStep = await startStep(fixture, lease, turnStore)
     const initial = await continuation({ owner, executionOwner: turnFence(lease, fixture.ids.rootTaskId), attestation,
       handoff, prepareProof: preparedProof, scheduledWaitId: fixture.prepareChoiceWaitId,
       finalStepId: firstStep, signal: new AbortController().signal })
@@ -174,7 +184,7 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
       owner = { ...fixture.owner, turnLeaseOwnerId: lease.ownerId, turnLeaseVersion: lease.leaseVersion }
       attestation = await fixture.reattestCurrentTurn(lease)
 
-      const questionStep = await startStep(fixture, lease, turnStore, nextStepOrdinal++)
+      const questionStep = await startStep(fixture, lease, turnStore)
       const next = await continuation({ owner, executionOwner: turnFence(lease, fixture.ids.rootTaskId), attestation,
         handoff, prepareProof: preparedProof, scheduledWaitId: fixture.prepareChoiceWaitId,
         finalStepId: questionStep, signal: new AbortController().signal })
@@ -204,7 +214,7 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
       expect(resumedChoice).toMatchObject({ status: "answered", validatedChoice: {
         kind: "weak_cover_letter", jobIds: [fixture.preparedJobIds[attempt - 1]], choiceId: "skip",
       } })
-      const resumeStep = await startStep(fixture, lease, turnStore, nextStepOrdinal++)
+      const resumeStep = await startStep(fixture, lease, turnStore)
       const resumed = await continuation({ owner, executionOwner: turnFence(lease, fixture.ids.rootTaskId), attestation,
         handoff, prepareProof: preparedProof, scheduledWaitId: fixture.prepareChoiceWaitId,
         finalStepId: resumeStep, signal: new AbortController().signal })
@@ -223,7 +233,7 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
     await adoptRootLease(fixture, lease, rootStore, execution)
     owner = { ...fixture.owner, turnLeaseOwnerId: lease.ownerId, turnLeaseVersion: lease.leaseVersion }
     attestation = await fixture.reattestCurrentTurn(lease)
-    const completionStep = await startStep(fixture, lease, turnStore, nextStepOrdinal++)
+    const completionStep = await startStep(fixture, lease, turnStore)
     const completed = await continuation({ owner, executionOwner: turnFence(lease, fixture.ids.rootTaskId), attestation,
       handoff, prepareProof: preparedProof, scheduledWaitId: fixture.prepareChoiceWaitId,
       finalStepId: completionStep, signal: new AbortController().signal })
@@ -270,9 +280,10 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
     process.env.AGENT_WEB_URL = "http://scheduled-gate-parent.invalid"
     process.env.AGENT_WORKER_SECRET = "scheduled-gate-parent-fixture-secret"
     let owner = { ...fixture.owner, turnLeaseOwnerId: lease.ownerId, turnLeaseVersion: lease.leaseVersion }
+    await assertPrepareProofPreflight(pool, fixture, "one-job-reattest")
     let attestation = await fixture.reattestCurrentTurn(lease)
     await adoptRootLease(fixture, lease, rootStore, execution)
-    const firstStep = await startStep(fixture, lease, turnStore, 9)
+    const firstStep = await startStep(fixture, lease, turnStore)
     const initial = await continuation({ owner, executionOwner: turnFence(lease, fixture.ids.rootTaskId), attestation,
       handoff: fixture.handoff as never, prepareProof: fixture.prepareProof as never,
       scheduledWaitId: fixture.prepareChoiceWaitId, finalStepId: firstStep, signal: new AbortController().signal })
@@ -297,7 +308,7 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
     await adoptRootLease(fixture, lease, rootStore, execution)
     owner = { ...fixture.owner, turnLeaseOwnerId: lease.ownerId, turnLeaseVersion: lease.leaseVersion }
     attestation = await fixture.reattestCurrentTurn(lease)
-    const questionStep = await startStep(fixture, lease, turnStore, 10)
+    const questionStep = await startStep(fixture, lease, turnStore)
     const candidate = await continuation({ owner, executionOwner: turnFence(lease, fixture.ids.rootTaskId), attestation,
       handoff: fixture.handoff as never, prepareProof: fixture.prepareProof as never,
       scheduledWaitId: fixture.prepareChoiceWaitId, finalStepId: questionStep, signal: new AbortController().signal })
@@ -361,8 +372,180 @@ async function adoptRootLease(fixture: GateFixture, lease: TurnLease,
   await execution.start({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId })
 }
 
+type PrepareProofTaskRow = Readonly<{
+  id: string; userId: string; sessionId: string; turnId: string; rootTaskId: string; parentTaskId: string
+  role: string; taskType: string; status: string; attemptCount: number; failureReason: string | null
+  expectedOutputSchema: unknown; allowedActions: unknown; result: unknown
+}>
+type PrepareProofWaitRow = Readonly<{
+  id: string; userId: string; sessionId: string; turnId: string; parentTaskId: string; stepId: string
+  idempotencyKey: string; targetTaskIds: unknown; mode: string; status: string; matchedTaskIds: unknown; result: unknown
+}>
+
+async function assertPrepareProofPreflight(database: Pool, fixture: GateFixture, label: string): Promise<void> {
+  const loaded = await loadTaskGraph(database, fixture.graphScope, false)
+  const current = currentTaskGraph(loaded), nodes = loaded.snapshot?.nodes ?? []
+  const taskRows = await database.query<PrepareProofTaskRow>(`SELECT task."id", session."userId" AS "userId", task."sessionId", task."turnId",
+    task."rootTaskId", task."parentTaskId", task."role", task."taskType", task."status", task."attemptCount", task."failureReason",
+    task."expectedOutputSchema", task."allowedActions", task."result"
+    FROM "sub_agent_tasks" task JOIN "agent_sessions" session ON session."id"=task."sessionId"
+    WHERE task."id"=ANY($1::text[])`, [nodes.map(node => node.taskId)])
+  const prepareNode = nodes.find(node => node.key === "prepare")
+  const analystNodes = nodes.filter(node => node.taskId === fixture.ids.analystTaskId)
+  const analystNode = analystNodes[0]
+  const prepareCurrent = current.nodes.find(node => node.key === "prepare")
+  const prepareTask = taskRows.rows.find(row => row.id === fixture.ids.prepareTaskId)
+  const outer = record(prepareTask?.result), facts = record(outer?.taskGraphScheduledPrepareProofFacts)
+  const receipt = parseScheduledTaskGraphContinuationReceipt(facts?.receipt), completion = record(facts?.completion)
+  const taskProjection = loaded.snapshot && projectScheduledAnalyzePrefix(loaded.snapshot, current, taskRows.rows)
+  const waitRows = await database.query<PrepareProofWaitRow>(`SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId",
+    "idempotencyKey", "targetTaskIds", "mode", "status", "matchedTaskIds", "result"
+    FROM "agent_wait_conditions" WHERE "id"=$1`, [fixture.prepareWaitId])
+  const wait = waitRows.rows[0], request = record(record(wait?.result)?.request)
+  const stepRows = await database.query<{ id: string; sessionId: string; turnId: string; taskId: string | null; attempt: number; status: string }>(
+    `SELECT "id", "sessionId", "turnId", "taskId", "attempt", "status" FROM "agent_steps" WHERE "id"=$1`, [wait?.stepId ?? ""])
+  const step = stepRows.rows[0]
+  const targets = parseJson(wait?.targetTaskIds), matched = parseJson(wait?.matchedTaskIds)
+  const expectedAttempt = fixture.prepareProof.result.attemptCount
+  const built = facts && wait ? buildScheduledPrepareTaskGraphProof(facts, { waitId: wait.id, status: wait.status,
+    mode: wait.mode, targetTaskIds: targets, matchedTaskIds: matched }) : null
+  const proofScope = { userId: fixture.owner.userId, sessionId: fixture.owner.sessionId,
+    turnId: fixture.owner.turnId, rootTaskId: fixture.owner.rootTaskId }
+  const reloaded = await loadPersistedScheduledPrepareProof(database, proofScope, fixture.ids.prepareTaskId,
+    prepareTask?.result, fixture.prepareProof.receipt.continuationKey, fixture.prepareWaitId)
+  const preparedIds = reloaded && scheduledGatePreparedJobIds(reloaded)
+  const completionNodes = completion?.nodes
+  const expectedCompletionNodes = fixture.prepareProof.completion.nodes
+  const analyze = nodes.slice(0, 2).map(node => {
+    const live = current.nodes.find(value => value.key === node.key)
+    const task = taskRows.rows.find(row => row.id === node.taskId)
+    const result = record(task?.result), report = record(result?.taskGraphVerificationReport)
+    const currentReport = record(live?.verificationReport)
+    return { key: node.key, taskFound: !!task, taskIdentityMatches: !!task && task.userId === fixture.ids.userId
+        && task.sessionId === fixture.ids.sessionId && task.turnId === fixture.ids.turnId
+        && task.rootTaskId === fixture.ids.rootTaskId && task.parentTaskId === fixture.ids.rootTaskId,
+      role: task?.role, taskType: task?.taskType, taskStatus: task?.status, currentStatus: live?.status,
+      attemptCount: task?.attemptCount, taskFailure: task?.failureReason, currentFailure: live?.failureReason,
+      envelopeKeys: Object.keys(result ?? {}).sort(), envelopeStatus: result?.status,
+      reportStatus: report?.status, reportHasDigests: !!report?.resultDigest && !!report?.evidenceDigest,
+      currentReportStatus: currentReport?.status, resultDigestMatchesCurrent: report?.resultDigest === currentReport?.resultDigest,
+      evidenceDigestMatchesCurrent: report?.evidenceDigest === currentReport?.evidenceDigest }
+  })
+  const summary = {
+    graph: { revision: current.revision, nodeCount: nodes.length, currentNodeCount: current.nodes.length,
+      taskCount: taskRows.rows.length, analyzePrefixAccepted: !!taskProjection, analystNodeCount: analystNodes.length,
+      analystTaskIdMatches: analystNode?.taskId === fixture.ids.analystTaskId,
+      proofScopeMatchesGraphScope: proofScope.userId === fixture.graphScope.userId && proofScope.sessionId === fixture.graphScope.sessionId
+        && proofScope.turnId === fixture.graphScope.turnId && proofScope.rootTaskId === fixture.graphScope.rootTaskId },
+    analyze,
+    prepare: {
+      node: { key: prepareNode?.key, templateId: prepareNode?.templateId, depth: prepareNode?.depth,
+        dependsOn: prepareNode?.dependsOn, dependsOnAnalyst: !!analystNode && sameCanonical(prepareNode?.dependsOn, [analystNode.key]),
+        goalMatchesExpected: prepareNode?.goal === prepareGoal,
+        successCriteriaCount: Array.isArray(prepareNode?.successCriteria) ? prepareNode.successCriteria.length : -1,
+        successCriteriaMatch: sameCanonical(prepareNode?.successCriteria, prepareCriteria),
+        specialized: prepareNode?.verificationDisposition === "specialized" },
+      current: { present: !!prepareCurrent, taskMatches: prepareCurrent?.taskId === fixture.ids.prepareTaskId,
+        status: prepareCurrent?.status, failureReason: prepareCurrent?.failureReason },
+      task: { present: !!prepareTask, identityMatches: !!prepareTask && prepareTask.userId === fixture.ids.userId
+          && prepareTask.sessionId === fixture.ids.sessionId && prepareTask.turnId === fixture.ids.turnId
+          && prepareTask.rootTaskId === fixture.ids.rootTaskId && prepareTask.parentTaskId === fixture.ids.rootTaskId,
+        role: prepareTask?.role, taskType: prepareTask?.taskType, status: prepareTask?.status, attemptCount: prepareTask?.attemptCount,
+        failureReason: prepareTask?.failureReason, schemaMatches: sameCanonical(prepareTask?.expectedOutputSchema, TASK_GRAPH_TEMPLATES.prepare.expectedOutputSchema),
+        actionsMatch: sameCanonical(prepareTask?.allowedActions, TASK_GRAPH_TEMPLATES.prepare.allowedActions) },
+      envelope: { status: outer?.status, structuredStatus: record(outer?.structuredResult)?.status,
+        factsPresent: !!facts, factKeysExact: sameKeys(facts, ["schemaVersion", "receipt", "completion", "result"]),
+        schemaMatches: facts?.schemaVersion === SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA,
+        factsResultMatchesStructured: sameCanonical(facts?.result, outer?.structuredResult) },
+      facts: { receiptParsed: !!receipt,
+        receiptKeyValid: !!receipt && scheduledTaskGraphStableContinuationKey(receipt) === receipt.continuationKey,
+        receiptOwnerMatches: !!receipt && receipt.owner.userId === fixture.ids.userId
+          && receipt.owner.sessionId === fixture.ids.sessionId && receipt.owner.turnId === fixture.ids.turnId
+          && receipt.owner.rootTaskId === fixture.ids.rootTaskId,
+        receiptMatchesFixture: sameCanonical(receipt, fixture.prepareProof.receipt),
+        analyzeRevision: receipt?.analyzeGraphRevision, prepareScheduleRevision: receipt?.prepareScheduleRevision,
+        completionRevision: completion?.graphRevision, expectedCompletionRevision: fixture.prepareProof.completion.graphRevision,
+        completionRevisionMatches: completion?.graphRevision === fixture.prepareProof.completion.graphRevision,
+        completionNodeCount: Array.isArray(completionNodes) ? completionNodes.length : -1,
+        completionNodes: summarizeCompletionNodes(completionNodes),
+        expectedCompletionNodes: summarizeCompletionNodes(expectedCompletionNodes),
+        completionNodesMatch: sameCanonical(completionNodes, expectedCompletionNodes) },
+      wait: { count: waitRows.rows.length, identityMatches: wait?.id === fixture.prepareWaitId
+          && fixture.prepareProof.completion.wait.waitId === fixture.prepareWaitId,
+        ownerMatches: !!wait && wait.userId === fixture.ids.userId && wait.sessionId === fixture.ids.sessionId && wait.turnId === fixture.ids.turnId,
+        parentMatches: wait?.parentTaskId === fixture.ids.rootTaskId,
+        stepMatches: wait?.stepId === fixture.rootQuestionStepId,
+        keyMatches: !!wait && wait.idempotencyKey === prepareDependencyKey(fixture.prepareProof.receipt.continuationKey, wait.stepId),
+        status: wait?.status, mode: wait?.mode, targetMatches: sameCanonical(targets, [fixture.ids.prepareTaskId]),
+        matchedMatches: sameCanonical(matched, [fixture.ids.prepareTaskId]),
+        requestKeysExact: sameKeys(request, ["targetTaskIds", "mode", "timeoutMs"]), requestMode: request?.mode,
+        timeoutMs: request?.timeoutMs, requestTargetsMatch: sameCanonical(request?.targetTaskIds, [fixture.ids.prepareTaskId]) },
+      step: { count: stepRows.rows.length, identityMatches: !!wait && !!step && step.id === wait.stepId
+          && step.sessionId === fixture.ids.sessionId && step.turnId === fixture.ids.turnId,
+        rootTaskMatches: step?.taskId === fixture.ids.rootTaskId, attempt: step?.attempt, status: step?.status },
+      proof: { builderAccepted: !!built, builderMatchesFixture: sameCanonical(built, fixture.prepareProof),
+        loaderAccepted: !!reloaded, loaderMatchesFixture: sameCanonical(reloaded, fixture.prepareProof),
+        preparedCount: preparedIds?.length ?? -1, preparedIdsMatch: sameCanonical(preparedIds, fixture.preparedJobIds),
+        expectedAttempt },
+    },
+  }
+  expect(summary, `Prepare proof preflight ${label}: ${JSON.stringify(summary)}`).toMatchObject({
+    graph: { nodeCount: 3, currentNodeCount: 3, taskCount: 3, analyzePrefixAccepted: true },
+    prepare: {
+      node: { key: "prepare", templateId: "prepare", depth: 3, dependsOnAnalyst: true,
+        goalMatchesExpected: true, successCriteriaCount: 2, successCriteriaMatch: true, specialized: true },
+      current: { present: true, taskMatches: true, status: "completed", failureReason: null },
+      task: { present: true, identityMatches: true, role: TASK_GRAPH_TEMPLATES.prepare.role,
+        taskType: TASK_GRAPH_TEMPLATES.prepare.taskType, status: "completed", attemptCount: expectedAttempt,
+        failureReason: null, schemaMatches: true, actionsMatch: true },
+      envelope: { status: "completed", structuredStatus: "completed", factsPresent: true, factKeysExact: true,
+        schemaMatches: true, factsResultMatchesStructured: true },
+      facts: { receiptMatchesFixture: true, completionRevisionMatches: true, completionNodeCount: 3, completionNodesMatch: true },
+      wait: { count: 1, identityMatches: true, ownerMatches: true, parentMatches: true, stepMatches: true,
+        keyMatches: true, status: "ready", mode: "all", targetMatches: true, matchedMatches: true,
+        requestKeysExact: true, requestMode: "all", timeoutMs: 86_400_000, requestTargetsMatch: true },
+      step: { count: 1, identityMatches: true, rootTaskMatches: true, attempt: 1 },
+      proof: { builderAccepted: true, builderMatchesFixture: true, loaderAccepted: true, loaderMatchesFixture: true,
+        preparedCount: fixture.preparedJobIds.length, preparedIdsMatch: true, expectedAttempt },
+    },
+  })
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  const parsed = parseJson(value)
+  return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null
+}
+function parseJson(value: unknown): unknown {
+  if (typeof value !== "string") return value
+  try { return JSON.parse(value) as unknown } catch { return null }
+}
+function sameKeys(value: Record<string, unknown> | null, expected: readonly string[]): boolean {
+  return !!value && Object.keys(value).sort().join(",") === [...expected].sort().join(",")
+}
+function sameCanonical(left: unknown, right: unknown): boolean {
+  try { return canonicalTaskGraphJson(left) === canonicalTaskGraphJson(right) } catch { return false }
+}
+function summarizeCompletionNodes(value: unknown): unknown[] {
+  if (!Array.isArray(value)) return []
+  return value.map(entry => {
+    const node = record(entry)
+    const dependencies = node?.dependsOnTaskIds
+    return { taskId: node?.taskId, role: node?.role, taskType: node?.taskType, attemptCount: node?.attemptCount,
+      status: node?.status, verification: node?.verification,
+      dependsOnTaskIds: Array.isArray(dependencies) ? dependencies.filter((dependency): dependency is string => typeof dependency === "string") : null,
+      hasResultDigest: typeof node?.resultDigest === "string" && node.resultDigest.length > 0 }
+  })
+}
+function prepareDependencyKey(continuationKey: string, stepId: string): string {
+  return `scheduled-prepare-dependency:${createHash("sha256").update(`${continuationKey}\0${stepId}`, "utf8").digest("hex")}`
+}
+
 async function startStep(fixture: GateFixture, lease: TurnLease,
-  store: ReturnType<typeof createPgTurnEngineStore>, ordinal: number): Promise<string> {
+  store: ReturnType<typeof createPgTurnEngineStore>): Promise<string> {
+  const result = await pool!.query<{ ordinal: number | string }>(`SELECT COALESCE(MAX("ordinal"), -1) + 1 AS "ordinal"
+    FROM "agent_steps" WHERE "sessionId"=$1 AND "turnId"=$2`, [fixture.ids.sessionId, fixture.ids.turnId])
+  const ordinal = Number(result.rows[0]?.ordinal)
+  if (!Number.isSafeInteger(ordinal) || ordinal < 0) throw new Error("scheduled_gate_root_step_ordinal_invalid")
   const stepId = `scheduled-gate-root-step-${randomUUID()}`
   const owner = turnFence(lease, fixture.ids.rootTaskId)
   await store.startStep({ owner, stepId, ordinal, attempt: 1, inputThroughSequence: 0n,
