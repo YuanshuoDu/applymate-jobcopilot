@@ -883,7 +883,15 @@ async function prepareFailedBranchReplan(pool: PgPool, commandPool: PgPool, role
   if (current.nodes.length !== 8 || current.nodes.find(node => node.key === "source-scout")?.status !== "failed"
     || current.nodes.find(node => node.key === "source-analyst")?.status !== "cancelled"
     || !current.nodes.some(node => node.key === "retained-repair" && node.repairOf)) {
-    throw new Error("Failed-branch fixture did not reach a full graph with automatic cancellation and retained repair")
+    const safeReason = (reason: string | null | undefined) => reason == null ? null
+      : /^task_graph_[a-z_]+$/.test(reason) ? reason : "non-machine-reason"
+    const outerRoot = await pool.query<{ status: string; failureReason: string | null }>(
+      `SELECT "status", "failureReason" FROM "sub_agent_tasks" WHERE "id" = $1`, [value.rootTaskId])
+    const nodes = current.nodes.map(node => ({ key: node.key, status: node.status, dependsOn: node.dependsOn,
+      failureReason: safeReason(node.failureReason), repairOf: Boolean(node.repairOf) }))
+    throw new Error(`Failed-branch fixture state mismatch: ${JSON.stringify({ revision: current.revision, nodes,
+      outerRoot: outerRoot.rows[0] ? { status: outerRoot.rows[0].status,
+        failureReason: safeReason(outerRoot.rows[0].failureReason) } : null })}`)
   }
   await pool.query(`INSERT INTO "agent_steps"
     ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
