@@ -179,6 +179,7 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
       const waitDiagnostic = await diagnoseScheduledGateWait(pool, fixture, gateTaskId, activeWait.stepId,
         activeWait.waitId, attempt - 1)
       const reconciled = await durableWait.reconcile({ batchSize: 50 })
+      if (reconciled.woken < 1) console.error(`SCHEDULED_GATE_WAIT_DIAGNOSTIC ${JSON.stringify(waitDiagnostic)}`)
       expect(reconciled.woken, `scheduled Gate reconcile: ${JSON.stringify(waitDiagnostic)}`).toBeGreaterThanOrEqual(1)
       expect(await drainAgentWakeups(pool, 10)).toBeGreaterThanOrEqual(1)
       lease = await claimTurnLease(pool, { turnId: fixture.ids.turnId, sessionId: fixture.ids.sessionId,
@@ -307,6 +308,7 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
 
     const waitDiagnostic = await diagnoseScheduledGateWait(pool, fixture, gateTaskId, firstStep, initial.waitId, 0)
     const reconciled = await durableWait.reconcile({ batchSize: 50 })
+    if (reconciled.woken < 1) console.error(`SCHEDULED_GATE_WAIT_DIAGNOSTIC ${JSON.stringify(waitDiagnostic)}`)
     expect(reconciled.woken, `scheduled Gate reconcile: ${JSON.stringify(waitDiagnostic)}`).toBeGreaterThanOrEqual(1)
     expect(await drainAgentWakeups(pool, 10)).toBeGreaterThanOrEqual(1)
     lease = await claimTurnLease(pool, { turnId: fixture.ids.turnId, sessionId: fixture.ids.sessionId,
