@@ -2,6 +2,14 @@ import { describe, expect, it, vi } from "vitest"
 
 vi.mock("ioredis", () => ({ Redis: vi.fn().mockImplementation(() => ({ disconnect: vi.fn() })) }))
 
+const gateResumeAdmissionMock = vi.hoisted(() => ({
+  hasScheduledGateResumeAcknowledgement: vi.fn(async (_client: unknown, _input: unknown) => false),
+}))
+vi.mock("../runtime/subagents/scheduled-gate-resume-admission.js", async () => {
+  const actual = await vi.importActual<typeof import("../runtime/subagents/scheduled-gate-resume-admission.js")>("../runtime/subagents/scheduled-gate-resume-admission.js")
+  return { ...actual, hasScheduledGateResumeAcknowledgement: gateResumeAdmissionMock.hasScheduledGateResumeAcknowledgement }
+})
+
 import type pg from "pg"
 import { dispatchPendingSubagentOutbox, enqueueSubagentTask, persistSubagentDispatch, recoverSubagentQueue, repairMissingSubagentDispatches, startSubagentRecoveryScanner, subagentDispatchKey, subagentJobId, type SubagentExecutor } from "./subagent-queue.js"
 import type { AgentTreeManager } from "../runtime/subagents/manager.js"
@@ -12,7 +20,7 @@ const payload: SubagentJobPayload = { taskId: "task-1", sessionId: "session-1", 
 
 type DispatchOptions = { sessionStatus?: string | null; aggregateId?: string; payload?: unknown; sessionMissing?: boolean; sessionMissingAfterScan?: boolean; outboxMissingAfterScan?: boolean; activePause?: boolean; attemptCount?: number; task?: DispatchTaskOptions }
 
-type DispatchTaskOptions = { exists?: boolean; status?: string; sessionId?: string; rootTaskId?: string; rootId?: string; rootSessionId?: string; rootTurnId?: string; rootStatus?: string | null; turnId?: string | null; turnRowId?: string; turnSessionId?: string; turnUserId?: string; turnStatus?: string | null; leaseOwner?: string | null; leaseExpiresAt?: Date | null; interruptRequestedAt?: Date | string | null; attemptCount?: number; maxAttempts?: number; nextAttemptAt?: Date | null; retryDue?: boolean; childWaitResumable?: boolean }
+type DispatchTaskOptions = { exists?: boolean; status?: string; sessionId?: string; rootTaskId?: string; rootId?: string; rootSessionId?: string; rootTurnId?: string; rootStatus?: string | null; turnId?: string | null; turnRowId?: string; turnSessionId?: string; turnUserId?: string; turnStatus?: string | null; leaseOwner?: string | null; leaseExpiresAt?: Date | null; interruptRequestedAt?: Date | string | null; attemptCount?: number; maxAttempts?: number; nextAttemptAt?: Date | null; retryDue?: boolean; childWaitResumable?: boolean; scheduledGateResumeCandidate?: boolean; role?: string; taskType?: string }
 
 function dispatchTaskRow(options: DispatchTaskOptions = {}): Record<string, unknown> {
   return {
@@ -23,6 +31,9 @@ function dispatchTaskRow(options: DispatchTaskOptions = {}): Record<string, unkn
     rootTurnId: options.rootTurnId ?? "turn-1", rootStatus: options.rootStatus ?? "running", turnRowId: options.turnRowId ?? "turn-1",
     turnSessionId: options.turnSessionId ?? "session-1", turnUserId: options.turnUserId ?? "user-1", turnStatus: options.turnStatus ?? "in_progress",
     retryDue: options.retryDue ?? options.nextAttemptAt == null, childWaitResumable: options.childWaitResumable ?? false,
+    scheduledGateResumeCandidate: options.scheduledGateResumeCandidate ?? false,
+    role: options.role ?? (options.scheduledGateResumeCandidate ? "prepare" : "worker"),
+    taskType: options.taskType ?? (options.scheduledGateResumeCandidate ? "scheduled_taskgraph_gate" : "test_task"),
   }
 }
 
@@ -37,7 +48,7 @@ function fakePool(markError?: Error, options: DispatchOptions = {}) {
       if (sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes("ORDER BY dispatch.")) {
         scanCompleted = true
         const scopedSession = sql.includes('dispatch."aggregateId" = $3') ? params?.[2] : null
-        const matches = scopedSession == null || scopedSession === outbox.aggregateId
+        const matches = (scopedSession == null || scopedSession === outbox.aggregateId) && outbox.publishedAt === null
         return { rows: matches ? [outbox] : [], rowCount: matches ? 1 : 0 }
       }
       if (sql.includes("pause_request")) {
@@ -59,10 +70,13 @@ function fakePool(markError?: Error, options: DispatchOptions = {}) {
         const unavailable = status === "aborted" || status === "archived"
         return missing || (resetQuery && unavailable) ? { rows: [], rowCount: 0 } : { rows: [{ id: outbox.aggregateId, status, userId: "user-1" }], rowCount: 1 }
       }
-      if (sql.includes('SELECT "id", "turnId" FROM "sub_agent_tasks"')) {
+      if (sql.includes('SELECT "id", "turnId", "rootTaskId", "role", "taskType" FROM "sub_agent_tasks"')) {
         if (options.task?.exists === false) return { rows: [], rowCount: 0 }
         const turnId = options.task && Object.hasOwn(options.task, "turnId") ? options.task.turnId : "turn-1"
-        return { rows: [{ id: "task-1", turnId }], rowCount: 1 }
+        const gateCandidate = options.task?.scheduledGateResumeCandidate === true
+        return { rows: [{ id: "task-1", turnId, rootTaskId: options.task?.rootTaskId ?? "root-1",
+          role: options.task?.role ?? (gateCandidate ? "prepare" : "worker"),
+          taskType: options.task?.taskType ?? (gateCandidate ? "scheduled_taskgraph_gate" : "test_task") }], rowCount: 1 }
       }
       if (sql.includes('SELECT dispatch."id"') && sql.includes('FROM "agent_outbox" AS dispatch')) {
         return options.outboxMissingAfterScan ? { rows: [], rowCount: 0 } : { rows: [outbox], rowCount: 1 }
@@ -71,6 +85,7 @@ function fakePool(markError?: Error, options: DispatchOptions = {}) {
         return options.task?.exists === false ? { rows: [], rowCount: 0 } : { rows: [dispatchTaskRow(options.task)], rowCount: 1 }
       }
       if (sql.includes('"lastError" = $2') && sql.includes('"publishedAt" = CURRENT_TIMESTAMP')) {
+        outbox.attemptCount += 1
         outbox.lastError = String(params?.[1])
         outbox.publishedAt = new Date()
         return { rows: [], rowCount: 1 }
@@ -96,8 +111,8 @@ function fakePool(markError?: Error, options: DispatchOptions = {}) {
 }
 
 type RepairOutbox = { id: string; sessionId: string; key: string; payload: SubagentJobPayload; publishedAt: Date | null; lastError: string | null }
-type RepairCandidate = { id: string; sessionId: string; rootTaskId: string; status?: string; rootStatus?: string; turnStatus?: string; sessionStatus?: string; interruptRequestedAt?: string | null; attemptCount?: number; maxAttempts?: number; scopeValid?: boolean; childWaitResumable?: boolean }
-type RepairOptions = { candidate?: RepairCandidate | null; existing?: RepairOutbox[]; failInsert?: Error; respectExisting?: boolean }
+type RepairCandidate = { id: string; sessionId: string; rootTaskId: string; status?: string; rootStatus?: string; turnStatus?: string; sessionStatus?: string; interruptRequestedAt?: string | null; attemptCount?: number; maxAttempts?: number; scopeValid?: boolean; childWaitResumable?: boolean; role?: string; taskType?: string }
+type RepairOptions = { candidate?: RepairCandidate | null; gateCandidate?: RepairCandidate | null; existing?: RepairOutbox[]; failInsert?: Error; respectExisting?: boolean }
 
 function eligibleCandidate(candidate: RepairCandidate): boolean {
   return (candidate.status ?? "queued") === "queued" || (candidate.status ?? "queued") === "retrying"
@@ -116,6 +131,8 @@ function repairPool(options: RepairOptions = {}) {
   const calls: Array<[string, unknown[]?]> = []
   const outbox = [...(options.existing ?? [])]
   const candidate = options.candidate === undefined ? { id: "task-1", sessionId: "session-1", rootTaskId: "root-1" } : options.candidate
+  const gateCandidate = options.gateCandidate ?? null
+  const candidateById = (id: unknown) => [candidate, gateCandidate].find(row => row?.id === id)
   const client = {
     query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push([sql, params])
@@ -123,14 +140,20 @@ function repairPool(options: RepairOptions = {}) {
       if (sql.includes('FROM "agent_sessions" AS session') && sql.includes("LIMIT $2 FOR UPDATE SKIP LOCKED")) {
         return candidate ? { rows: [{ id: candidate.sessionId }], rowCount: 1 } : { rows: [], rowCount: 0 }
       }
+      if (sql.includes('SELECT task."id", task."sessionId", task."rootTaskId", task."turnId", session."userId"')) {
+        return gateCandidate ? { rows: [{ ...gateCandidate, turnId: "turn-1", userId: "user-1" }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      }
       if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("FOR UPDATE OF task SKIP LOCKED")) {
         const key = candidate ? subagentDispatchKey(candidate.id) : ""
         const exists = outbox.some(row => row.key === key)
-        const rows = candidate && eligibleCandidate(candidate) && (options.respectExisting === false || !exists) ? [candidate] : []
+        const rows = Number(params?.[2] ?? 1) > 0 && candidate && eligibleCandidate(candidate) && (options.respectExisting === false || !exists) ? [candidate] : []
         return { rows, rowCount: rows.length }
       }
-      if (sql.includes('SELECT "id", "turnId" FROM "sub_agent_tasks"')) {
-        return candidate ? { rows: [{ id: candidate.id, turnId: "turn-1" }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      if (sql.includes('SELECT "id", "turnId", "rootTaskId", "role", "taskType" FROM "sub_agent_tasks"')) {
+        const row = candidateById(params?.[0])
+        return row ? { rows: [{ id: row.id, turnId: "turn-1", rootTaskId: row.rootTaskId,
+          role: row.role ?? (row === gateCandidate ? "prepare" : "worker"),
+          taskType: row.taskType ?? (row === gateCandidate ? "scheduled_taskgraph_gate" : "test_task") }], rowCount: 1 } : { rows: [], rowCount: 0 }
       }
       if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")) {
         const terminalTurn = ["completed", "failed", "interrupted", "cancelled"].includes(candidate?.turnStatus ?? "")
@@ -138,7 +161,9 @@ function repairPool(options: RepairOptions = {}) {
       }
       if (sql.includes("pause_request")) return { rows: [{ id: "session-1" }], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes('WHERE task."id"')) {
-        const rows = candidate && eligibleCandidate(candidate) ? [dispatchTaskRow({ ...candidate, sessionId: candidate.sessionId, rootTaskId: candidate.rootTaskId })] : []
+        const row = candidateById(params?.[0])
+        const rows = row && (row === gateCandidate || eligibleCandidate(row)) ? [dispatchTaskRow({ ...row, sessionId: row.sessionId, rootTaskId: row.rootTaskId,
+          scheduledGateResumeCandidate: row === gateCandidate, role: row.role, taskType: row.taskType })] : []
         return { rows, rowCount: rows.length }
       }
       if (sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes("ORDER BY dispatch.")) {
@@ -189,7 +214,9 @@ function recoveredDispatchPool() {
       if (sql.includes('dispatch."id" IS NULL') && sql.includes("LIMIT $2 FOR UPDATE SKIP LOCKED")) return { rows: [{ id: "session-1" }], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("FOR UPDATE OF task SKIP LOCKED")) return { rows: [], rowCount: 0 }
       if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("FOR UPDATE OF task")) return { rows: [dispatchTaskRow()], rowCount: 1 }
-      if (sql.includes('SELECT "id", "turnId" FROM "sub_agent_tasks"')) return { rows: [{ id: "task-1", turnId: "turn-1" }], rowCount: 1 }
+      if (sql.includes('SELECT "id", "turnId", "rootTaskId", "role", "taskType" FROM "sub_agent_tasks"')) {
+        return { rows: [{ id: "task-1", turnId: "turn-1", rootTaskId: "root-1", role: "worker", taskType: "test_task" }], rowCount: 1 }
+      }
       if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "turn-1" }], rowCount: 1 }
       if (sql.includes("pause_request")) return { rows: [{ id: "session-1" }], rowCount: 1 }
       if (sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes("ORDER BY dispatch.")) {
@@ -344,6 +371,66 @@ describe("Subagent queue", () => {
     expect(taskFence).toContain('step."attempt" = task."attemptCount"')
   })
 
+  it("publishes an acknowledged queued Gate attempt above maxAttempts only after locked proof validation", async () => {
+    const fake = fakePool(undefined, { attemptCount: 7,
+      task: { attemptCount: 3, maxAttempts: 3, scheduledGateResumeCandidate: true } })
+    const queue = { add: vi.fn().mockImplementation(async (_name: string, _job: SubagentJobPayload,
+      _options?: { jobId?: string; attempts?: number }) => { fake.calls.push(["QUEUE_ADD", []]) }) }
+    gateResumeAdmissionMock.hasScheduledGateResumeAcknowledgement.mockReset().mockImplementation(async (_client, input) => {
+      fake.calls.push(["GATE_RESUME_PROOF", [input]])
+      return true
+    })
+
+    await expect(dispatchPendingSubagentOutbox(fake.pool, queue)).resolves.toBe(1)
+
+    expect(gateResumeAdmissionMock.hasScheduledGateResumeAcknowledgement).toHaveBeenCalledWith(expect.anything(), {
+      taskId: "task-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", userId: "user-1", attemptCount: 3,
+    })
+    expect(queue.add).toHaveBeenCalledWith("subagent", payload, { jobId: subagentJobId("task-1", 7), attempts: 3 })
+    expect(fake.outbox).toMatchObject({ attemptCount: 8, publishedAt: expect.any(Date), lastError: null })
+    const index = (predicate: (sql: string) => boolean) => fake.calls.findIndex(([sql]) => predicate(sql))
+    const sessionLock = index(sql => sql.includes('SELECT session."id"') && sql.includes("FOR UPDATE"))
+    const turnLock = index(sql => sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE"))
+    const rootLock = index(sql => sql.includes('SELECT "id" FROM "sub_agent_tasks"') && sql.includes("FOR UPDATE"))
+    const childLock = index(sql => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("FOR UPDATE OF task"))
+    const dispatchLock = index(sql => sql.includes('SELECT dispatch."id"') && sql.includes('WHERE dispatch."id"'))
+    const proof = index(sql => sql === "GATE_RESUME_PROOF")
+    const publish = index(sql => sql === "QUEUE_ADD")
+    expect([sessionLock, turnLock, rootLock, childLock, dispatchLock, proof, publish].every(value => value >= 0)).toBe(true)
+    expect([sessionLock, turnLock, rootLock, childLock, dispatchLock, proof, publish]).toEqual(
+      [...[sessionLock, turnLock, rootLock, childLock, dispatchLock, proof, publish]].sort((a, b) => a - b))
+
+    gateResumeAdmissionMock.hasScheduledGateResumeAcknowledgement.mockClear()
+    await expect(dispatchPendingSubagentOutbox(fake.pool, queue)).resolves.toBe(0)
+    expect(queue.add).toHaveBeenCalledTimes(1)
+    expect(gateResumeAdmissionMock.hasScheduledGateResumeAcknowledgement).not.toHaveBeenCalled()
+    expect(fake.outbox.attemptCount).toBe(8)
+    expect(parseSubagentDispatchJobId(queue.add.mock.calls[0]?.[2]?.jobId, "task-1")?.generation).toBe(7)
+  })
+
+  it.each(["missing acknowledgement", "stale acknowledgement", "cross-owner acknowledgement"] as const)(
+    "does not publish a structural Gate candidate with a %s", async () => {
+      const fake = fakePool(undefined, { attemptCount: 4,
+        task: { attemptCount: 3, maxAttempts: 3, scheduledGateResumeCandidate: true } })
+      const queue = { add: vi.fn() }
+      gateResumeAdmissionMock.hasScheduledGateResumeAcknowledgement.mockReset().mockImplementation(async (_client, input) => {
+        fake.calls.push(["GATE_RESUME_PROOF", [input]])
+        return false
+      })
+
+      await expect(dispatchPendingSubagentOutbox(fake.pool, queue)).resolves.toBe(0)
+
+      expect(gateResumeAdmissionMock.hasScheduledGateResumeAcknowledgement).toHaveBeenCalledWith(expect.anything(), {
+        taskId: "task-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", userId: "user-1", attemptCount: 3,
+      })
+      expect(queue.add).not.toHaveBeenCalled()
+      expect(fake.outbox).toMatchObject({ attemptCount: 5, publishedAt: expect.any(Date), lastError: "attempts_exhausted" })
+      const proofIndex = fake.calls.findIndex(([sql]) => sql === "GATE_RESUME_PROOF")
+      const terminalIndex = fake.calls.findIndex(([sql]) => sql.includes('"publishedAt" = CURRENT_TIMESTAMP'))
+      expect(proofIndex).toBeGreaterThan(-1)
+      expect(terminalIndex).toBeGreaterThan(proofIndex)
+    })
+
   it("does not dispatch an exhausted task when its current wait proof is absent", async () => {
     const fake = fakePool(undefined, { task: { attemptCount: 3, maxAttempts: 3, childWaitResumable: false } })
     const queue = { add: vi.fn() }
@@ -468,6 +555,23 @@ describe("Subagent queue", () => {
 
     const retrying = repairPool({ candidate: { ...candidate, status: "retrying" } })
     await expect(repairMissingSubagentDispatches(retrying.pool, "repair-worker")).resolves.toBe(0)
+  })
+
+  it("keeps mixed Gate and ordinary repairs within the shared batch limit", async () => {
+    const fake = repairPool({
+      candidate: { id: "ordinary-1", sessionId: "session-1", rootTaskId: "root-1" },
+      gateCandidate: { id: "gate-1", sessionId: "session-1", rootTaskId: "root-1", attemptCount: 3, maxAttempts: 3,
+        role: "prepare", taskType: "scheduled_taskgraph_gate" },
+    })
+    gateResumeAdmissionMock.hasScheduledGateResumeAcknowledgement.mockReset().mockResolvedValue(true)
+
+    await expect(repairMissingSubagentDispatches(fake.pool, "repair-worker", 1)).resolves.toBe(1)
+
+    expect(fake.outbox).toHaveLength(1)
+    expect(fake.outbox[0]).toMatchObject({ payload: { taskId: "gate-1", sessionId: "session-1", rootTaskId: "root-1" } })
+    const ordinaryScan = fake.calls.find(([sql]) => sql.includes("LIMIT $3 FOR UPDATE OF task SKIP LOCKED"))
+    expect(ordinaryScan?.[1]).toEqual([["session-1"], "agent.subagent.dispatch", 0])
+    expect(gateResumeAdmissionMock.hasScheduledGateResumeAcknowledgement).toHaveBeenCalledTimes(1)
   })
 
   it("keeps repair idempotent for repeated scanners and existing outbox rows", async () => {

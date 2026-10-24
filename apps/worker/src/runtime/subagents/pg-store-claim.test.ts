@@ -4,9 +4,9 @@ import { SessionPauseRequestedError } from "../session-gate.js"
 import { claimSubagentTask, matchesPublishedSubagentDispatch } from "./pg-store-claim.js"
 import { PAUSE_DEFERRED_MARKER, normalizeSubagentPolicy, type SubagentJobPayload } from "./types.js"
 import { parseSubagentDispatchJobId, SUBAGENT_DISPATCH_IDENTITY_MISMATCH, subagentDispatchJobId } from "./dispatch-identity.js"
-import { matchScheduledGateWaitTarget } from "./scheduled-gate-wait-match.js"
+import { hasScheduledGateResumeAcknowledgement } from "./scheduled-gate-resume-admission.js"
 
-vi.mock("./scheduled-gate-wait-match.js", () => ({ matchScheduledGateWaitTarget: vi.fn() }))
+vi.mock("./scheduled-gate-resume-admission.js", () => ({ hasScheduledGateResumeAcknowledgement: vi.fn() }))
 
 const input = {
   taskId: "child-1", sessionId: "session-1", ownerId: "worker-1", rootTaskId: "root-1",
@@ -51,7 +51,9 @@ function poolFixture(options: { pause?: boolean; rootInterrupted?: boolean; turn
         const currentDispatch = params?.[7] === true
         const gateResume = params?.[8] === true
         const exhausted = (options.taskAttemptCount ?? 1) >= (options.maxAttempts ?? 3)
-        return { rows: [], rowCount: (exactWait || gateResume) && !currentDispatch || exhausted && !(currentDispatch && (exactWait || gateResume)) ? 0 : 1 }
+        const rowCount = (exactWait || gateResume) && !currentDispatch || exhausted && !(currentDispatch && (exactWait || gateResume)) ? 0 : 1
+        if (rowCount === 1 && options.gateResumeStep && gateResume) task.attemptCount += 1
+        return { rows: [], rowCount }
       }
       if (sql.startsWith('UPDATE "agent_outbox" SET "lastError" = NULL')) { if (outbox) outbox.lastError = null; return { rows: [], rowCount: 1 } }
       if (sql.startsWith("SELECT task.*")) return { rows: [task], rowCount: 1 }
@@ -165,15 +167,15 @@ describe("atomic child claim pause fence", () => {
   it("admits a Gate claim beyond ordinary maxAttempts only for the exact private N-to-N+1 answer receipt", async () => {
     const identity = parseSubagentDispatchJobId(subagentDispatchJobId(input.taskId, 3), input.taskId)
     if (!identity) throw new Error("Fixture dispatch ID did not parse")
-    vi.mocked(matchScheduledGateWaitTarget).mockResolvedValue("pending")
+    vi.mocked(hasScheduledGateResumeAcknowledgement).mockClear()
+    vi.mocked(hasScheduledGateResumeAcknowledgement).mockResolvedValue(true)
     const fake = poolFixture({ gateResumeStep: true, taskAttemptCount: 3, maxAttempts: 3,
       outbox: { lastError: null, publishedAt: new Date("2026-10-06T09:59:00Z"), attemptCount: 4 } })
 
     await expect(claimSubagentTask(fake.pool, { ...input, dispatchIdentity: identity }, 60_000))
-      .resolves.toMatchObject({ id: "child-1", attemptCount: 3 })
-    expect(matchScheduledGateWaitTarget).toHaveBeenCalledWith(expect.anything(), {
-      userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", stepId: "root-step-1",
-      gateTaskId: "child-1", requestAttemptCount: 3,
+      .resolves.toMatchObject({ id: "child-1", attemptCount: 4 })
+    expect(hasScheduledGateResumeAcknowledgement).toHaveBeenCalledWith(expect.anything(), {
+      taskId: "child-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", attemptCount: 3,
     })
     const update = fake.calls.find(sql => sql.startsWith('UPDATE "sub_agent_tasks"')) ?? ""
     expect(update).toContain('"attemptCount" < "maxAttempts" OR ($8::boolean AND')
@@ -181,22 +183,42 @@ describe("atomic child claim pause fence", () => {
     expect(fake.parameters[fake.calls.indexOf(update)]?.slice(7)).toEqual([true, true])
   })
 
-  it.each(["stale", null] as const)("does not exceed maxAttempts when the Gate acknowledgement is %s", async disposition => {
+  it.each([false, true] as const)("uses the strict Gate acknowledgement result (%s) for an exhausted claim", async acknowledged => {
     const identity = parseSubagentDispatchJobId(subagentDispatchJobId(input.taskId, 3), input.taskId)
     if (!identity) throw new Error("Fixture dispatch ID did not parse")
-    vi.mocked(matchScheduledGateWaitTarget).mockResolvedValue(disposition)
+    vi.mocked(hasScheduledGateResumeAcknowledgement).mockClear()
+    vi.mocked(hasScheduledGateResumeAcknowledgement).mockResolvedValue(acknowledged)
     const fake = poolFixture({ gateResumeStep: true, taskAttemptCount: 3, maxAttempts: 3,
       outbox: { lastError: null, publishedAt: new Date("2026-10-06T09:59:00Z"), attemptCount: 4 } })
 
-    await expect(claimSubagentTask(fake.pool, { ...input, dispatchIdentity: identity }, 60_000)).resolves.toBeNull()
+    if (acknowledged) {
+      await expect(claimSubagentTask(fake.pool, { ...input, dispatchIdentity: identity }, 60_000)).resolves.toMatchObject({ id: "child-1" })
+    } else {
+      await expect(claimSubagentTask(fake.pool, { ...input, dispatchIdentity: identity }, 60_000)).resolves.toBeNull()
+    }
+    expect(hasScheduledGateResumeAcknowledgement).toHaveBeenCalledWith(expect.anything(), {
+      taskId: "child-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", attemptCount: 3,
+    })
     const update = fake.calls.find(sql => sql.startsWith('UPDATE "sub_agent_tasks"')) ?? ""
-    expect(fake.parameters[fake.calls.indexOf(update)]?.slice(7)).toEqual([true, false])
+    expect(fake.parameters[fake.calls.indexOf(update)]?.slice(7)).toEqual([true, acknowledged])
+  })
+
+  it("does not authorize an exhausted Gate claim without the published dispatch identity", async () => {
+    vi.mocked(hasScheduledGateResumeAcknowledgement).mockClear()
+    const fake = poolFixture({ gateResumeStep: true, taskAttemptCount: 3, maxAttempts: 3 })
+
+    await expect(claimSubagentTask(fake.pool, input, 60_000)).resolves.toBeNull()
+    expect(hasScheduledGateResumeAcknowledgement).not.toHaveBeenCalled()
+    const update = fake.calls.find(sql => sql.startsWith('UPDATE "sub_agent_tasks"')) ?? ""
+    expect(fake.parameters[fake.calls.indexOf(update)]?.slice(7)).toEqual([false, false])
   })
 
   it("preserves ordinary outbox and direct-claim owner compatibility", async () => {
+    vi.mocked(hasScheduledGateResumeAcknowledgement).mockClear()
     const fake = poolFixture({ outbox: { lastError: "queue_add_failed", payload: { taskId: "child-1", sessionId: "session-1", rootTaskId: "root-1", ownerId: "normal-outbox-owner" } } })
     await expect(claimSubagentTask(fake.pool, input, 60_000)).resolves.toMatchObject({ id: "child-1" })
     expect(fake.calls.some(sql => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(true)
+    expect(hasScheduledGateResumeAcknowledgement).not.toHaveBeenCalled()
   })
 
   it("accepts only the exact published outbox generation before counting or mutating a task", async () => {

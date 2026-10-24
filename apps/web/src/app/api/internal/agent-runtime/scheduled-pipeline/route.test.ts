@@ -817,7 +817,7 @@ describe("scheduled pipeline continuation route", () => {
     }));
   });
 
-  it("normalizes Execute-tail waits to the Worker bridge status contract", async () => {
+  it("returns only the verified persisted wait ID for an Execute-tail 202", async () => {
     const waitId = "agent-question:turn-1:canonical:q1";
     const prior = waitingState();
     mocks.turn.mockResolvedValueOnce({ id: owner.turnId, userId: owner.userId, sessionId: owner.sessionId,
@@ -833,7 +833,36 @@ describe("scheduled pipeline continuation route", () => {
       gateCompletionProof: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1", graphRevision: 1,
         prepareProof: {}, gate: { taskId: "gate-1", attemptCount: 1, resultDigest: "sha256:" + "a".repeat(64), completedEventRevision: 1 } } }));
     expect(response.status).toBe(202);
-    expect(await response.json()).toEqual({ status: "waiting_for_user" });
+    expect(await response.json()).toEqual({ status: "waiting_for_user", waitId });
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+  });
+
+  it("rejects a malformed persisted wait marker instead of returning it to Execute", async () => {
+    const malformed = waitingState();
+    (malformed.scheduledTaskGraphWait as Record<string, unknown>).waitId = " ";
+    mocks.execution.mockResolvedValueOnce({ id: "execution-1", status: "waiting_for_user", attemptCount: 0, state: malformed });
+    mocks.gateAction.mockImplementationOnce(async (parsed: unknown) => ({ kind: "execute", request: parsed as never }));
+    const { POST } = await import("./route");
+    const response = await POST(request({ action: "execute", owner, attestation, prepareProof: {},
+      gateCompletionProof: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1", graphRevision: 1,
+        prepareProof: {}, gate: { taskId: "gate-1", attemptCount: 1, resultDigest: "sha256:" + "a".repeat(64), completedEventRevision: 1 } } }));
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ status: "blocked", errorCode: "scheduled_pipeline_claim_conflict" });
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+  });
+
+  it("rejects an existing canonical question that no longer matches the persisted wait", async () => {
+    const waitId = "agent-question:turn-1:canonical:q1";
+    mocks.execution.mockResolvedValueOnce({ id: "execution-1", status: "waiting_for_user", attemptCount: 0, state: waitingState() });
+    mocks.question.mockResolvedValueOnce(canonicalQuestion(waitId, null, { questionId: "agent-question:turn-1:canonical:q2" }))
+      .mockResolvedValueOnce({ id: `agent-wait:question:${waitId}` });
+    mocks.gateAction.mockImplementationOnce(async (parsed: unknown) => ({ kind: "execute", request: parsed as never }));
+    const { POST } = await import("./route");
+    const response = await POST(request({ action: "execute", owner, attestation, prepareProof: {}, scheduledWaitId: waitId,
+      gateCompletionProof: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1", graphRevision: 1,
+        prepareProof: {}, gate: { taskId: "gate-1", attemptCount: 1, resultDigest: "sha256:" + "a".repeat(64), completedEventRevision: 1 } } }));
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ status: "blocked", errorCode: "scheduled_pipeline_claim_conflict" });
     expect(mocks.runPipeline).not.toHaveBeenCalled();
   });
   it("keeps an answered wait typed while its Turn has not resumed", async () => {

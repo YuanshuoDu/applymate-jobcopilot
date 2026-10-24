@@ -164,7 +164,7 @@ describe("scheduled pipeline HTTP handoff", () => {
       .resolves.toEqual({ status: "blocked", errorCode: "scheduled_pipeline_gate_checkpoint_unexpected" })
   })
 
-  it("posts Execute only with the typed Gate completion proof and accepts a wait response without a wait ID", async () => {
+  it("accepts only a closed Execute wait response with its persisted opaque wait ID", async () => {
     const prepared = { prepareProof: { result: {} }, scheduledWaitId: "prepare-choice-wait-1",
       gateCompletionProof: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1" } } as const
     const fetcher = vi.fn<typeof fetch>(async (_url, init) => {
@@ -174,11 +174,18 @@ describe("scheduled pipeline HTTP handoff", () => {
     await expect(postScheduledPipelineExecute({ ...input, ...prepared } as never, new AbortController().signal, fetcher))
       .resolves.toEqual({ status: "completed" })
     await expect(postScheduledPipelineExecute({ ...input, ...prepared } as never, new AbortController().signal,
-      vi.fn<typeof fetch>(async () => reply(202, { status: "waiting_for_user" }))))
-      .resolves.toEqual({ status: "waiting_for_user" })
-    await expect(postScheduledPipelineExecute({ ...input, ...prepared } as never, new AbortController().signal,
-      vi.fn<typeof fetch>(async () => reply(202, { status: "waiting_for_user", waitId: "must-not-leak" }))))
-      .rejects.toThrow("scheduled_pipeline_handoff_in_progress")
+      vi.fn<typeof fetch>(async () => reply(202, { status: "waiting_for_user", waitId: "agent-question:turn-1:canonical:q1" }))))
+      .resolves.toEqual({ status: "waiting_for_user", waitId: "agent-question:turn-1:canonical:q1" })
+    for (const invalid of [
+      { status: "waiting_for_user" },
+      { status: "waiting_for_user", waitId: "" },
+      { status: "waiting_for_user", waitId: " question-1" },
+      { status: "waiting_for_user", waitId: "x".repeat(257) },
+      { status: "waiting_for_user", waitId: "question-1", stage: "writer" },
+    ]) {
+      await expect(postScheduledPipelineExecute({ ...input, ...prepared } as never, new AbortController().signal,
+        vi.fn<typeof fetch>(async () => reply(202, invalid)))).rejects.toThrow("scheduled_pipeline_handoff_in_progress")
+    }
     await expect(postScheduledPipelineExecute({ ...input, ...prepared, scheduledWaitId: " " } as never,
       new AbortController().signal, fetcher)).rejects.toThrow("scheduled_pipeline_handoff_input_invalid")
   })

@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { TurnStateRefreshRetryError } from "../turns/turn-execution-question.js"
-import { completeScheduledPipelineBeforeTerminal } from "./scheduled-pipeline-completion.js"
+import { SCHEDULED_PIPELINE_COMPLETION, type TurnEngineCompletionGate } from "../turns/turn-execution-types.js"
+import { attachScheduledPipelineCompletion, completeScheduledPipelineBeforeTerminal } from "./scheduled-pipeline-completion.js"
+import { createScheduledAutomationGateContinuation } from "./scheduled-automation-gate-bridge.js"
 import { scheduledTaskGraphContinuationKey } from "./scheduled-pipeline-handoff.js"
 import { scheduledPrepareChoiceWaitId } from "../turns/turn-question-contract.js"
 import { SCHEDULED_PREPARE_COMPLETION_SCHEMA } from "./scheduled-prepare-task-graph-verification.js"
@@ -8,6 +10,10 @@ import { SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_SCHEMA, scheduledTaskGraphStab
 import type { ScheduledAutomationPipelineAttestation, ScheduledAutomationPipelineBridgeResult, ScheduledAutomationPipelineBridgeScope } from "./scheduled-automation-pipeline-bridge.js"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import type { TurnQuestionGateChoiceBinding } from "../turns/turn-question-gate-choice-contract.js"
+
+const gateContinuationMocks = vi.hoisted(() => ({ selectResume: vi.fn(), readCandidate: vi.fn() }))
+vi.mock("./scheduled-gate-resume-wait.js", () => ({ selectScheduledGateResumeWaitAttempt: gateContinuationMocks.selectResume }))
+vi.mock("./scheduled-gate-wait-match.js", () => ({ readScheduledGateQuestionCandidate: gateContinuationMocks.readCandidate }))
 
 const owner: ScheduledAutomationPipelineBridgeScope = {
   userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", rootAttemptCount: 2,
@@ -57,6 +63,8 @@ const base = () => ({ executionOwner, rootAttemptCount: owner.rootAttemptCount,
   finalStepId: "step-final", finalStepOrdinal: 3, stageCandidate: vi.fn(async () => undefined) })
 
 beforeEach(() => {
+  gateContinuationMocks.selectResume.mockReset()
+  gateContinuationMocks.readCandidate.mockReset()
   vi.stubEnv("AGENT_WEB_URL", "https://applymate.example")
   vi.stubEnv("AGENT_WORKER_SECRET", "worker-secret")
 })
@@ -154,6 +162,47 @@ describe("scheduled pipeline pre-terminal completion", () => {
       continueAfterAnalyze: async () => prepared, continueAfterGate: async () => ({ status: "completed" }) })
     expect(result).toEqual({ status: "completed", candidateText })
     expect(JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body))).toEqual({ owner, attestation: analyzeAttestation, prepareProof: prepared.prepareProof })
+  })
+
+  it("carries a verified Execute wait through Gate completion and accepted-Web pause", async () => {
+    const prepared = readyPrepare(), waitId = "agent-question:turn-1:canonical:durable-42", signal = new AbortController().signal
+    const gateProof = { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1", graphRevision: 9,
+      prepareProof: prepared.prepareProof, gate: { taskId: "gate-task", attemptCount: 1,
+        resultDigest: `sha256:${"d".repeat(64)}`, completedEventRevision: 9 } }
+    const fetcher = vi.fn<typeof fetch>(async (_url, init) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+      if (body.action === "execute") return response(202, { status: "waiting_for_user", waitId })
+      if (body.prepareProof) return response(200, { status: "gate_checkpointed" })
+      return response(200, analyzeProof())
+    })
+    gateContinuationMocks.selectResume.mockResolvedValue({ status: "initial" })
+    gateContinuationMocks.readCandidate.mockResolvedValue(null)
+    const gateContinuation = createScheduledAutomationGateContinuation({
+      pool: { connect: async () => ({ query: async () => ({ rows: [], rowCount: 1 }), release: () => undefined }) } as never,
+      commandPort: {
+        appendScheduledGate: async () => ({ status: "accepted", revision: 5, nodes: [{ key: "gate", taskId: "gate-task" }], readyTaskIds: ["gate-task"] }),
+        resumeScheduledGateChoice: async () => ({ status: "accepted", taskId: "gate-task", requestAttemptCount: 1,
+          resumedAttemptCount: 2, revision: 6, readyTaskIds: ["gate-task"] }),
+        verifyScheduledGateCompletion: async () => gateProof,
+      } as never,
+      waitPort: { waitScheduledGate: async () => ({ status: "ready", waitId: "gate-ready", matchedTaskIds: ["gate-task"] }) } as never,
+      nativeQuestionWaitEnabled: true, fetcher,
+    })
+    const gate = (async () => ({ ok: true as const })) as unknown as TurnEngineCompletionGate
+    const accepted = vi.fn(), stageCandidate = vi.fn(async () => undefined)
+    const attached = attachScheduledPipelineCompletion({ gate, owner, bridge: async () => ({ status: "ready", attestation: analyzeAttestation }),
+      continueAfterAnalyze: async () => prepared, continueAfterGate: gateContinuation, fetcher, onWebAccepted: accepted,
+      stageCandidate, rootAttemptCount: owner.rootAttemptCount })!
+    const complete = attached[SCHEDULED_PIPELINE_COMPLETION]
+    expect(complete).toBeDefined()
+
+    await expect(complete!({ identity: executionOwner, scope: {} as never, rootTaskId: owner.rootTaskId,
+      stepId: "step-final", stepOrdinal: 3, candidateText: "Final candidate", signal, now: new Date() } as never))
+      .resolves.toEqual({ status: "waiting_for_external_user", externalWaitId: waitId, candidateText: "Final candidate" })
+    expect(accepted).toHaveBeenCalledOnce()
+    expect(stageCandidate).toHaveBeenCalledOnce()
+    expect(fetcher).toHaveBeenCalledTimes(3)
+    expect(JSON.parse(String(fetcher.mock.calls[2]?.[1]?.body))).toMatchObject({ action: "execute", gateCompletionProof: gateProof })
   })
 
   it("rejects the legacy completed response instead of skipping the fixed Gate", async () => {

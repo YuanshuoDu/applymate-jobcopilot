@@ -7,6 +7,8 @@ import { workerPollingOptions } from "./worker-polling-options.js"
 import { repairStaleSubagentDispatches } from "./subagent-dispatch-recovery.js"
 import { recoverMissingPublishedSubagentDispatches } from "./subagent-published-dispatch-recovery.js"
 import { CHILD_WAIT_RESUMABLE_SQL, dispatchTaskInvalidReason, lockDispatchTask, lockPendingDispatch, markDispatchTerminal } from "./subagent-dispatch-eligibility.js"
+import { SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE } from "../runtime/subagents/scheduled-gate-contract.js"
+import { hasScheduledGateResumeAcknowledgement, SCHEDULED_GATE_RESUMABLE_SQL } from "../runtime/subagents/scheduled-gate-resume-admission.js"
 import { lockAndAdmitSubagentDispatch, markPauseAwareDispatchError, PAUSE_DEFERRED_MARKER, persistSubagentDispatch, repairDeferredSubagentDispatches, runSubagentQueueJob } from "./subagent-pause-dispatch.js"
 import { runWithSubagentConcurrencyDeferral } from "./subagent-concurrency-deferral.js"
 import { AgentTreeManager } from "../runtime/subagents/manager.js"
@@ -22,6 +24,7 @@ export type SubagentQueueLike = { add(name: string, payload: SubagentJobPayload,
 /** Queue boundary preserves the complete runtime outcome for manager.run to persist. */
 export type SubagentExecutor = (input: { lease: SubagentLease; continuation?: SubagentMailboxContinuation }) => Promise<SubagentExecutionResult>
 type MissingDispatchRow = { id: string; sessionId: string; rootTaskId: string }
+type MissingGateDispatchRow = MissingDispatchRow & { turnId: string; userId: string }
 /** BullMQ custom IDs reject colon characters; encode user controlled IDs. */
 export function subagentJobId(taskId: string, generation = 0): string {
   return subagentDispatchJobId(taskId, generation)
@@ -56,7 +59,7 @@ export async function repairMissingSubagentDispatches(pool: PgSubagentPool, owne
           LEFT JOIN "agent_outbox" AS dispatch
             ON dispatch."topic" = $1 AND dispatch."idempotencyKey" = 'subagent-dispatch:' || task."id"
            WHERE task."sessionId" = session."id" AND task."status" IN ('queued', 'retrying')
-             AND task."interruptRequestedAt" IS NULL AND (task."attemptCount" < task."maxAttempts" OR ${CHILD_WAIT_RESUMABLE_SQL})
+             AND task."interruptRequestedAt" IS NULL AND (task."attemptCount" < task."maxAttempts" OR ${CHILD_WAIT_RESUMABLE_SQL} OR ${SCHEDULED_GATE_RESUMABLE_SQL})
              AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP)
             AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
             AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled')
@@ -65,6 +68,27 @@ export async function repairMissingSubagentDispatches(pool: PgSubagentPool, owne
       LIMIT $2 FOR UPDATE SKIP LOCKED`, [SUBAGENT_DISPATCH_TOPIC, limit])
     const sessionIds = openSessions.rows.map(row => row.id)
     if (sessionIds.length === 0) return 0
+    const gateCandidates = await client.query<MissingGateDispatchRow>(`SELECT task."id", task."sessionId", task."rootTaskId", task."turnId", session."userId"
+      FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+      LEFT JOIN "agent_outbox" AS dispatch ON dispatch."topic" = $2 AND dispatch."idempotencyKey" = 'subagent-dispatch:' || task."id"
+      WHERE session."id" = ANY($1::text[]) AND ${RUNNABLE_SESSION} AND dispatch."id" IS NULL AND ${SCHEDULED_GATE_RESUMABLE_SQL}
+      ORDER BY task."updatedAt" ASC, task."id" ASC LIMIT $3`, [sessionIds, SUBAGENT_DISPATCH_TOPIC, limit])
+    let gateRepaired = 0
+    for (const row of gateCandidates.rows) {
+      if (!await lockAndAdmitSubagentDispatch(client, { sessionId: row.sessionId, userId: row.userId, turnId: row.turnId })) continue
+      await client.query(`SELECT "id" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 FOR UPDATE`, [row.rootTaskId, row.sessionId, row.turnId])
+      const task = await lockDispatchTask(client, { taskId: row.id, sessionId: row.sessionId, userId: row.userId })
+      if (!task || task.scheduledGateResumeCandidate !== true || task.role !== SCHEDULED_GATE_ROLE || task.taskType !== SCHEDULED_GATE_TASK_TYPE
+        || !await hasScheduledGateResumeAcknowledgement(client, { taskId: row.id, sessionId: row.sessionId, turnId: row.turnId,
+          rootTaskId: row.rootTaskId, userId: row.userId, attemptCount: Number(task.attemptCount) })) continue
+      task.scheduledGateResumable = true
+      const payload: SubagentJobPayload = { taskId: row.id, sessionId: row.sessionId, rootTaskId: row.rootTaskId, ownerId }
+      if (dispatchTaskInvalidReason(task, payload, row.sessionId, row.userId)) continue
+      const inserted = await client.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
+        VALUES ($1, $2, $3, $4, $5::jsonb) ON CONFLICT ("idempotencyKey") DO NOTHING`,
+      [randomUUID(), SUBAGENT_DISPATCH_TOPIC, row.sessionId, subagentDispatchKey(row.id), JSON.stringify(payload)])
+      gateRepaired += inserted.rowCount ?? 0
+    }
     const candidates = await client.query<MissingDispatchRow>(`SELECT task."id", task."sessionId", task."rootTaskId"
       FROM "sub_agent_tasks" AS task
       JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
@@ -82,7 +106,7 @@ export async function repairMissingSubagentDispatches(pool: PgSubagentPool, owne
         AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled')
         AND dispatch."id" IS NULL
       ORDER BY task."updatedAt" ASC, task."id" ASC
-      LIMIT $3 FOR UPDATE OF task SKIP LOCKED`, [sessionIds, SUBAGENT_DISPATCH_TOPIC, limit])
+      LIMIT $3 FOR UPDATE OF task SKIP LOCKED`, [sessionIds, SUBAGENT_DISPATCH_TOPIC, Math.max(0, limit - gateRepaired)])
     let repaired = 0
     for (const row of candidates.rows) {
       const payload: SubagentJobPayload = { taskId: row.id, sessionId: row.sessionId, rootTaskId: row.rootTaskId, ownerId }
@@ -103,7 +127,7 @@ export async function repairMissingSubagentDispatches(pool: PgSubagentPool, owne
       [randomUUID(), SUBAGENT_DISPATCH_TOPIC, row.sessionId, subagentDispatchKey(row.id), JSON.stringify(payload), row.id])
       repaired += inserted.rowCount ?? 0
     }
-    return repaired
+    return repaired + gateRepaired
   })
 }
 export async function dispatchPendingSubagentOutbox(pool: PgSubagentPool, queue: SubagentQueueLike, limit = SUBAGENT_MAX_BATCH, sessionId?: string): Promise<number> {
@@ -141,7 +165,7 @@ export async function dispatchPendingSubagentOutbox(pool: PgSubagentPool, queue:
           if (malformed) await markDispatchTerminal(client, malformed.id, "schema_invalid_payload")
           return false
         }
-        const binding = await client.query<{ id: string; turnId: string | null }>(`SELECT "id", "turnId" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`, [scannedPayload.taskId, row.aggregateId])
+        const binding = await client.query<{ id: string; turnId: string | null; rootTaskId: string; role: string; taskType: string }>(`SELECT "id", "turnId", "rootTaskId", "role", "taskType" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`, [scannedPayload.taskId, row.aggregateId])
         if (!binding.rows[0]) {
           const missing = await lockPendingDispatch(client, { ...row, topic: SUBAGENT_DISPATCH_TOPIC })
           if (missing) await markDispatchTerminal(client, missing.id, "task_missing")
@@ -154,6 +178,10 @@ export async function dispatchPendingSubagentOutbox(pool: PgSubagentPool, queue:
           return false
         }
         if (!await lockAndAdmitSubagentDispatch(client, { sessionId: session.id, userId: session.userId, turnId })) return false
+        if (binding.rows[0].role === SCHEDULED_GATE_ROLE && binding.rows[0].taskType === SCHEDULED_GATE_TASK_TYPE) {
+          await client.query(`SELECT "id" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 FOR UPDATE`,
+            [binding.rows[0].rootTaskId, row.aggregateId, turnId])
+        }
         const task = await lockDispatchTask(client, { taskId: scannedPayload.taskId, sessionId: row.aggregateId, userId: session.userId })
         const locked = await lockPendingDispatch(client, { ...row, topic: SUBAGENT_DISPATCH_TOPIC })
         if (!locked) return false
@@ -165,6 +193,11 @@ export async function dispatchPendingSubagentOutbox(pool: PgSubagentPool, queue:
         if (session.status === "aborted" || session.status === "archived") {
           await markDispatchTerminal(client, locked.id, "session_unavailable")
           return false
+        }
+        if (task?.scheduledGateResumeCandidate === true && task.role === SCHEDULED_GATE_ROLE && task.taskType === SCHEDULED_GATE_TASK_TYPE
+          && task.rootTaskId === scannedPayload.rootTaskId && task.sessionId === row.aggregateId && task.turnId === turnId) {
+          task.scheduledGateResumable = await hasScheduledGateResumeAcknowledgement(client, { taskId: scannedPayload.taskId,
+            sessionId: row.aggregateId, turnId, rootTaskId: scannedPayload.rootTaskId, userId: session.userId, attemptCount: Number(task.attemptCount) })
         }
         const invalidReason = task ? dispatchTaskInvalidReason(task, payload, session.id, session.userId) : "task_missing"
         if (invalidReason) {

@@ -87,6 +87,7 @@ export async function completeScheduledPipelineBeforeTerminal(input: Readonly<{
       if (gateResult.status === "waiting_for_dependency") return { status: gateResult.status, waitId: gateResult.waitId, candidateText: input.candidateText }
       if (gateResult.status === "waiting_for_choice") return { status: "waiting_for_scheduled_gate_choice", waitId: gateResult.waitId,
         question: gateResult.question, binding: gateResult.binding, candidateText: input.candidateText }
+      if (gateResult.status === "waiting_for_external_user") return { status: gateResult.status, externalWaitId: gateResult.waitId, candidateText: input.candidateText }
       if (gateResult.status === "blocked") return gateResult
       return { status: "completed", candidateText: input.candidateText }
     }

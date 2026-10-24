@@ -6,7 +6,7 @@ import { persistGraphTransition, prepareGraphTransition } from "./task-graph-pg-
 import { PAUSE_DEFERRED_MARKER, parseSubagentJobPayload, type PgSubagentPool, type SubagentJobPayload, type SubagentPolicy, type SubagentTaskRecord } from "./types.js"
 import { parseSubagentDispatchIdentity, SubagentDispatchIdentityMismatchError, type SubagentDispatchIdentity } from "./dispatch-identity.js"
 import { SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
-import { matchScheduledGateWaitTarget } from "./scheduled-gate-wait-match.js"
+import { hasScheduledGateResumeAcknowledgement } from "./scheduled-gate-resume-admission.js"
 
 type ClaimInput = { taskId: string; sessionId: string; ownerId: string; rootTaskId?: string; policy: SubagentPolicy; now: Date; dispatchIdentity?: SubagentDispatchIdentity }
 
@@ -51,27 +51,6 @@ const CHILD_WAIT_RESUMABLE_SQL = `(SELECT COUNT(*) = 1
       WHERE child."id" = target."value" #>> '{}' AND child."id" <> task."id"
         AND child."parentTaskId" = task."id" AND child."sessionId" = task."sessionId"
         AND child."turnId" = task."turnId" AND child."rootTaskId" = task."rootTaskId"))) = true`
-
-const ANSWER_STEP_SQL = `SELECT DISTINCT item."stepId" FROM "agent_items" AS item
-  JOIN "agent_steps" AS step ON step."id" = item."stepId" AND step."sessionId" = item."sessionId" AND step."turnId" = item."turnId"
-  WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3 AND item."type" = 'question'
-    AND item."status" = 'completed' AND item."content"->>'stage' = 'scheduled_gate'
-    AND item."content"->'scheduledGateChoiceBinding'->>'gateTaskId' = $4
-    AND item."content"->'scheduledGateChoiceBinding'->>'gateAttempt' = $5
-    AND item."content"->'scheduledGateChoiceResumeAcknowledgement'->>'requestAttemptCount' = $5
-    AND item."content"->'scheduledGateChoiceResumeAcknowledgement'->>'resumedAttemptCount' = $6
-    AND step."taskId" = $3 AND step."status" = 'waiting_for_user' LIMIT 2`
-
-async function hasScheduledGateResumeAcknowledgement(client: Pick<PoolClient, "query">, input: {
-  taskId: string; sessionId: string; turnId: string; rootTaskId: string; userId: string; attemptCount: number
-}): Promise<boolean> {
-  const steps = await client.query<{ stepId: string }>(ANSWER_STEP_SQL, [input.sessionId, input.turnId, input.rootTaskId,
-    input.taskId, String(input.attemptCount), String(input.attemptCount + 1)])
-  const stepId = steps.rows.length === 1 ? steps.rows[0]?.stepId : undefined
-  if (typeof stepId !== "string" || !stepId.trim()) return false
-  return await matchScheduledGateWaitTarget(client, { userId: input.userId, sessionId: input.sessionId, turnId: input.turnId,
-    rootTaskId: input.rootTaskId, stepId, gateTaskId: input.taskId, requestAttemptCount: input.attemptCount }) === "pending"
-}
 
 /** Read-only identity check used only to classify local concurrency denial. */
 export async function matchesPublishedSubagentDispatch(pool: PgSubagentPool, input: { payload: SubagentJobPayload; dispatchIdentity: SubagentDispatchIdentity }): Promise<boolean> {

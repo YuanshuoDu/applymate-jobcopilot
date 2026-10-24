@@ -1,6 +1,8 @@
 import type pg from "pg"
 
 import type { SubagentJobPayload } from "../runtime/subagents/types.js"
+import { SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE } from "../runtime/subagents/scheduled-gate-contract.js"
+import { SCHEDULED_GATE_RESUMABLE_SQL } from "../runtime/subagents/scheduled-gate-resume-admission.js"
 
 export type DispatchTaskRow = Record<string, unknown>
 export type PendingDispatchRow = { id: string; aggregateId: string; payload: unknown; attemptCount?: number }
@@ -67,12 +69,13 @@ export async function lockDispatchTask(
   input: { taskId: string; sessionId: string; userId: string },
 ): Promise<DispatchTaskRow | undefined> {
   const result = await client.query<DispatchTaskRow>(`SELECT task."id", task."sessionId", task."rootTaskId", task."turnId", task."status",
-      task."attemptCount", task."maxAttempts", task."leaseOwner", task."leaseExpiresAt", task."interruptRequestedAt",
+      task."role", task."taskType", task."attemptCount", task."maxAttempts", task."leaseOwner", task."leaseExpiresAt", task."interruptRequestedAt",
       task."nextAttemptAt", root."id" AS "rootId", root."sessionId" AS "rootSessionId", root."turnId" AS "rootTurnId",
       root."status" AS "rootStatus", turn."id" AS "turnRowId", turn."sessionId" AS "turnSessionId",
       turn."userId" AS "turnUserId", turn."status" AS "turnStatus",
       (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= CURRENT_TIMESTAMP) AS "retryDue",
-      ${CHILD_WAIT_RESUMABLE_SQL} AS "childWaitResumable"
+      ${CHILD_WAIT_RESUMABLE_SQL} AS "childWaitResumable",
+      ${SCHEDULED_GATE_RESUMABLE_SQL} AS "scheduledGateResumeCandidate"
     FROM "sub_agent_tasks" AS task
     LEFT JOIN "sub_agent_tasks" AS root
       ON root."id" = task."rootTaskId" AND root."sessionId" = task."sessionId" AND root."turnId" = task."turnId"
@@ -91,8 +94,10 @@ export function dispatchTaskInvalidReason(task: DispatchTaskRow, payload: Subage
   if (task.interruptRequestedAt !== null && task.interruptRequestedAt !== undefined) return "task_interrupted"
   const attemptCount = Number(task.attemptCount)
   const maxAttempts = Number(task.maxAttempts)
+  const gateResume = status === "queued" && task.role === SCHEDULED_GATE_ROLE && task.taskType === SCHEDULED_GATE_TASK_TYPE
+    && task.scheduledGateResumable === true
   if (!Number.isSafeInteger(attemptCount) || attemptCount < 0 || !Number.isSafeInteger(maxAttempts) || maxAttempts < 1
-    || (attemptCount >= maxAttempts && !(status === "queued" && task.childWaitResumable === true))) return "attempts_exhausted"
+    || (attemptCount >= maxAttempts && !(status === "queued" && task.childWaitResumable === true) && !gateResume)) return "attempts_exhausted"
   if (task.rootId !== task.rootTaskId || task.rootSessionId !== sessionId || task.rootTurnId !== task.turnId || !task.rootStatus) return "root_unavailable"
   if (isTerminalTaskStatus(typeof task.rootStatus === "string" ? task.rootStatus : null)) return "root_terminal"
   if (task.turnRowId !== task.turnId || task.turnSessionId !== sessionId || task.turnUserId !== userId || !task.turnStatus) return "turn_unavailable"

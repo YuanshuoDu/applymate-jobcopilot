@@ -39,6 +39,17 @@ describe("subagent dispatch eligibility", () => {
     expect(dispatchTaskInvalidReason(task({ attemptCount: -1, childWaitResumable: true }), payload, "session-1", "user-1")).toBe("attempts_exhausted")
   })
 
+  it("allows only a strict queued Gate resume acknowledgement beyond the retry limit", () => {
+    const gate = { role: "prepare", taskType: "scheduled_taskgraph_gate", attemptCount: 3, maxAttempts: 3 }
+    expect(dispatchTaskInvalidReason(task({ ...gate, scheduledGateResumable: true }), payload, "session-1", "user-1")).toBeNull()
+    expect(dispatchTaskInvalidReason(task({ ...gate, scheduledGateResumable: false }), payload, "session-1", "user-1")).toBe("attempts_exhausted")
+    expect(dispatchTaskInvalidReason(task({ ...gate, role: "analyst", scheduledGateResumable: true }), payload, "session-1", "user-1")).toBe("attempts_exhausted")
+    expect(dispatchTaskInvalidReason(task({ ...gate, taskType: "scheduled_taskgraph_prepare", scheduledGateResumable: true }), payload, "session-1", "user-1")).toBe("attempts_exhausted")
+    expect(dispatchTaskInvalidReason(task({ ...gate, status: "retrying", scheduledGateResumable: true }), payload, "session-1", "user-1")).toBe("attempts_exhausted")
+    expect(dispatchTaskInvalidReason(task({ ...gate, maxAttempts: 0, scheduledGateResumable: true }), payload, "session-1", "user-1")).toBe("attempts_exhausted")
+    expect(dispatchTaskInvalidReason(task({ ...gate, attemptCount: -1, scheduledGateResumable: true }), payload, "session-1", "user-1")).toBe("attempts_exhausted")
+  })
+
   it("uses bound ownership values and proves the latest same-attempt wait and direct-child set", async () => {
     const client = { query: vi.fn().mockResolvedValue({ rows: [], rowCount: 0 }) } as unknown as Pick<pg.PoolClient, "query">
     await lockDispatchTask(client, { taskId: "task-1", sessionId: "session-1", userId: "user-1" })

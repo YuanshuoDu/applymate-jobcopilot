@@ -189,12 +189,14 @@ export async function POST(request: Request): Promise<Response> {
     waitQuestion = await loadScheduledTaskGraphWaitQuestion(executionOwner, wait.waitId, wait.stage);
     if (!waitQuestion && currentWaitOwner && turn.status === "in_progress" && leaseIsCurrent(turn, owner)
       && await canonicalQuestionItemMissing(owner, wait.waitId)) {
-      return json(202, { status: "waiting_for_user", waitId: wait.waitId, stage: wait.stage }, responseWaitId);
+      return parsed.action === "execute" ? json(202, { status: "waiting_for_user", waitId: wait.waitId })
+        : json(202, { status: "waiting_for_user", waitId: wait.waitId, stage: wait.stage }, responseWaitId);
     }
     if (!waitQuestion) return blocked(409, "scheduled_pipeline_claim_conflict");
     const resumable = waitQuestion.answered && ["running", "waiting_for_user"].includes(execution.status)
       && turn.status === "in_progress" && leaseIsCurrent(turn, owner);
-    if (!resumable) return parsed.action === "execute" ? json(202, { status: "waiting_for_user" }) : json(202, { status: "waiting_for_user", waitId: wait.waitId, stage: wait.stage }, responseWaitId);
+    if (!resumable) return parsed.action === "execute" ? json(202, { status: "waiting_for_user", waitId: wait.waitId })
+      : json(202, { status: "waiting_for_user", waitId: wait.waitId, stage: wait.stage }, responseWaitId);
   } else if (!rootIsCurrent(root, owner) || !leaseIsCurrent(turn, owner)) {
     return blocked(409, "scheduled_pipeline_turn_stale");
   }
@@ -276,13 +278,13 @@ export async function POST(request: Request): Promise<Response> {
         ...(body.gateCompletionProof !== undefined ? { gateCompletionProof: body.gateCompletionProof } : {}) }, signal: request.signal });
     if (!result) {
       const wakeWait = await loadDurableScheduledTaskGraphWait({ owner: executionOwner, key, claimToken, answeredOnly: true });
-      return wakeWait ? parsed.action === "execute" ? json(202, { status: "waiting_for_user" }) : json(202, { status: "waiting_for_user", ...wakeWait }, responseWaitId)
+      return wakeWait ? parsed.action === "execute" ? json(202, { status: "waiting_for_user", waitId: wakeWait.waitId }) : json(202, { status: "waiting_for_user", ...wakeWait }, responseWaitId)
         : blocked(500, "scheduled_pipeline_execution_failed");
     }
     if (isWaitResult(result)) {
       const durableWait = await loadDurableScheduledTaskGraphWait({ owner: executionOwner, key, claimToken });
       return durableWait?.waitId === result.waitId && durableWait.stage === result.stage
-        ? parsed.action === "execute" ? json(202, { status: "waiting_for_user" }) : json(202, { status: "waiting_for_user", ...durableWait }, responseWaitId) : blocked(500, "scheduled_pipeline_execution_failed");
+        ? parsed.action === "execute" ? json(202, { status: "waiting_for_user", waitId: durableWait.waitId }) : json(202, { status: "waiting_for_user", ...durableWait }, responseWaitId) : blocked(500, "scheduled_pipeline_execution_failed");
     }
     if ("status" in result && result.status === "analyze_checkpointed") return json(200, result, responseWaitId);
     return json(200, { status: "completed", report: result }, responseWaitId);

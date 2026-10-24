@@ -3,7 +3,8 @@ import { turnScheduledGateChoiceWaitId, type TurnQuestionGateChoiceBinding } fro
 import type { DurableWaitScheduledGateInvocation } from "../tools/coordination-types.js"
 
 const mock = vi.hoisted(() => ({ selectResume: vi.fn(), readCandidate: vi.fn(),
-  execute: vi.fn<(input: unknown, signal: AbortSignal, fetcher?: typeof fetch) => Promise<{ status: "completed" }>>() }))
+  execute: vi.fn<(input: unknown, signal: AbortSignal, fetcher?: typeof fetch) => Promise<
+    { status: "completed" } | { status: "waiting_for_user"; waitId: string }>>() }))
 vi.mock("./scheduled-gate-resume-wait.js", () => ({ selectScheduledGateResumeWaitAttempt: mock.selectResume }))
 vi.mock("./scheduled-gate-wait-match.js", () => ({ readScheduledGateQuestionCandidate: mock.readCandidate }))
 vi.mock("./scheduled-pipeline-handoff.js", () => ({ postScheduledPipelineExecute: mock.execute }))
@@ -66,6 +67,17 @@ describe("scheduled automation Gate continuation", () => {
     expect(mock.execute).toHaveBeenCalledWith(expect.objectContaining({ scheduledWaitId: "prepare-choice-wait", gateCompletionProof: gateProof }),
       expect.any(AbortSignal), undefined)
     expect(mock.execute.mock.calls[0]?.[0]).not.toHaveProperty("waitId")
+  })
+
+  it("returns the exact Web durable wait instead of turning Execute 202 into a retry", async () => {
+    mock.selectResume.mockResolvedValue({ status: "initial" })
+    mock.readCandidate.mockResolvedValue(null)
+    mock.execute.mockResolvedValue({ status: "waiting_for_user", waitId: "agent-question:turn-1:canonical:q1" })
+    const deps = dependencies(), run = createScheduledAutomationGateContinuation({ ...deps, nativeQuestionWaitEnabled: true } as never)
+
+    await expect(run(continuation as never)).resolves.toEqual({ status: "waiting_for_external_user", waitId: "agent-question:turn-1:canonical:q1" })
+    expect(mock.execute).toHaveBeenCalledOnce()
+    expect(deps.commandPort.verifyScheduledGateCompletion).toHaveBeenCalledOnce()
   })
 
   it("persists an unanswered exact current question only through the existing enabled Turn wait capability", async () => {

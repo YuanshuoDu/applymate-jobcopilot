@@ -25,7 +25,8 @@ export type ScheduledPipelineHandoff =
 type AnalyzeHandoffInput = { owner: ScheduledAutomationPipelineBridgeScope; attestation: ScheduledAutomationPipelineAttestation }
 type PrepareHandoffInput = AnalyzeHandoffInput & { prepareProof: unknown; scheduledWaitId?: string }
 type HandoffInput = AnalyzeHandoffInput | PrepareHandoffInput
-export type ScheduledPipelineExecuteResult = Readonly<{ status: "completed" | "waiting_for_user" }>
+export type ScheduledPipelineExecuteResult = Readonly<{ status: "completed" }>
+  | Readonly<{ status: "waiting_for_user"; waitId: string }>
 export type ScheduledPipelineGateChoice = Readonly<{ kind: ScheduledGateQuestionKind; jobIds: readonly string[]; choiceId: ScheduledGateChoiceId }>
 export type ScheduledPipelineGateInput = Readonly<{
   owner: ScheduledAutomationPipelineBridgeScope
@@ -104,7 +105,10 @@ export async function postScheduledPipelineExecute(input: Readonly<{
   if (response.status === 200 && payload.status === "completed" && Object.keys(payload).sort().join(",") === "report,status" && validReport(payload.report)) {
     return { status: "completed" }
   }
-  if (response.status === 202 && payload.status === "waiting_for_user" && Object.keys(payload).length === 1) return { status: "waiting_for_user" }
+  if (response.status === 202 && payload.status === "waiting_for_user"
+    && Object.keys(payload).sort().join(",") === "status,waitId" && validWaitId(payload.waitId)) {
+    return { status: "waiting_for_user", waitId: payload.waitId }
+  }
   const errorCode = payload.errorCode
   if (response.status >= 400 && response.status < 500 && payload.status === "blocked" && typeof errorCode === "string" && blockedErrors.has(errorCode)) {
     return { status: "blocked", errorCode }
