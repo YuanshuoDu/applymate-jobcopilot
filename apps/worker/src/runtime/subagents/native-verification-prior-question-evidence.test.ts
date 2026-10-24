@@ -298,4 +298,19 @@ describe("native prior question evidence", () => {
     expect(await appendNativePriorQuestionSelfAttestations(noCapacity.client, current, fullButValid)).toBeNull()
     expect(noCapacity.query).toHaveBeenCalled()
   })
+
+  it("keeps scanning after malformed recent history before rejecting a valid answer at zero capacity", async () => {
+    const newest = priorTurn(1), older = priorTurn(2)
+    const malformed = sourceFor(newest, 1), valid = sourceFor(older, 1)
+    const fullPacket = currentPacket(Array.from({ length: 32 }, (_, index) => ({ referenceId: `full-${index}`,
+      kind: "artifact", summary: "bounded" })))
+    const client = mockClient([newest, older], [malformed, valid], {
+      sourceEventError: new Error("question_recovery_event_scope_invalid"), sourceEventErrorTurnId: newest.id,
+    })
+
+    await expect(appendNativePriorQuestionSelfAttestations(client.client, current, fullPacket)).resolves.toBeNull()
+    const sourceEnumerations = client.query.mock.calls.filter(([sql]) => sql.includes('FROM "agent_items" AS item')
+      && sql.includes('AS "toolCallId"'))
+    expect(sourceEnumerations.map(([, values]) => values?.[1])).toEqual([newest.id, older.id])
+  })
 })

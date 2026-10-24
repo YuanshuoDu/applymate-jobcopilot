@@ -725,6 +725,10 @@ describePg("native verification PostgreSQL producer and readback", () => {
       await expect(target ? buildNativeChildPacketContent(client, state, target) : Promise.resolve(null)).resolves.toBeNull()
     })
     await expectStaleEvidenceRejected(client => client.query(`UPDATE "agent_items"
+      SET "content" = jsonb_set("content", '{input,question}', $2::jsonb, false) WHERE "id" = $1`,
+    [priorQuestion.callItemId, JSON.stringify("Changed historical ask_user call without changing its item revision.")]))
+    await expectStaleEvidenceRejected(client => client.query(`DELETE FROM "agent_items" WHERE "id" = $1`, [priorQuestion.callItemId]))
+    await expectStaleEvidenceRejected(client => client.query(`UPDATE "agent_items"
       SET "content" = jsonb_set("content", '{answer}', $2::jsonb, false) WHERE "id" = $1`,
     [priorQuestion.itemId, JSON.stringify("Changed historical user answer without changing its item revision.")]))
     await expectStaleEvidenceRejected(client => client.query(`DELETE FROM "agent_events" WHERE "id" = $1 AND "itemId" = $2`,
@@ -736,6 +740,22 @@ describePg("native verification PostgreSQL producer and readback", () => {
     [answeredQuestion.itemId, JSON.stringify("Edited persisted answer with the original item revision.")]))
     await expectStaleEvidenceRejected(client => client.query(`UPDATE "agent_inputs" SET "content" = $2::jsonb WHERE "id" = $1`,
       [ids.rootOriginalInput, JSON.stringify([{ type: "text", text: `${originalTaskText} Exclude contract roles.` }])]))
+
+    const priorAnswerBaseline = await pool!.query<{ revision: number; content: Record<string, unknown> }>(
+      `SELECT "revision", "content" FROM "agent_items" WHERE "id" = $1`, [priorQuestion.itemId])
+    const originalPriorContent = priorAnswerBaseline.rows[0]?.content
+    const originalPriorRevision = priorAnswerBaseline.rows[0]?.revision
+    expect(originalPriorContent?.answer).toBe(priorQuestion.answer)
+    expect(Number.isSafeInteger(originalPriorRevision)).toBe(true)
+    await pool!.query(`UPDATE "agent_items" SET "content" = jsonb_set("content", '{answer}', $2::jsonb, false) WHERE "id" = $1`,
+      [priorQuestion.itemId, JSON.stringify("Changed historical answer bytes without changing the item revision.")])
+    const changedPriorRevision = await pool!.query<{ revision: number }>(
+      `SELECT "revision" FROM "agent_items" WHERE "id" = $1`, [priorQuestion.itemId])
+    expect(changedPriorRevision.rows[0]?.revision).toBe(originalPriorRevision)
+    await expect(port.readRecoverableGoal(scope)).resolves.toBeNull()
+    await pool!.query(`UPDATE "agent_items" SET "content" = jsonb_set("content", '{answer}', $2::jsonb, false) WHERE "id" = $1`,
+      [priorQuestion.itemId, JSON.stringify(priorQuestion.answer)])
+    await expect(port.readRecoverableGoal(scope)).resolves.toMatchObject({ status: "passed", candidateText })
 
     const answerBaselineClient = await pool!.connect()
     try {
