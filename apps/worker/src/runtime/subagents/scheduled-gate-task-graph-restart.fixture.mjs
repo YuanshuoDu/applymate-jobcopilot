@@ -36,6 +36,8 @@ const GATE_FAILURE_REASONS = new Set([
   "scheduled_pipeline_agent_unavailable", "scheduled_pipeline_resume_unavailable", "scheduled_pipeline_execution_failed",
   "scheduled_pipeline_gate_proof_invalid", "scheduled_pipeline_handoff_unavailable", "scheduled_pipeline_handoff_in_progress",
   "scheduled_pipeline_handoff_retryable",
+  "scheduled_gate_result_invalid", "task_graph_verification_unverified", "task_graph_verification_failed",
+  "task_graph_repair_target_unresolved",
 ])
 
 function emit(marker, value) {
