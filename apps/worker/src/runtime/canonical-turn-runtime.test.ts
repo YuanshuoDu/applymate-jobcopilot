@@ -71,7 +71,7 @@ import { nativeCoordinationReceipts } from "./canonical-turn-native-graph-contex
 import { digestNativeVerificationValue } from "./subagents/native-verification-contract.js"
 import type { NativeVerificationEnsureResult, NativeVerificationPort } from "./subagents/native-verification-port.js"
 import type { NativeVerificationRuntime } from "./canonical-turn-native-verification-runtime.js"
-import { TASK_GRAPH_VERIFIER_VERSION } from "./subagents/task-graph-pg-verification.js"
+import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "./subagents/task-graph-pg-verification.js"
 import type { ValidatedRootTaskHistoryOutcome } from "./context/root-task-history.js"
 import { projectLoadedRootTaskHistoryGraph } from "./context/root-task-history-lesson-projection.js"
 import { buildCognitiveActionAgenda } from "./turns/cognitive-action-agenda.js"
@@ -2129,8 +2129,26 @@ describe("createCanonicalTurnRuntime", () => {
         { status: "unverified", reasonCode: "canonical_evidence_missing" },
       ] },
     }
+    const repairResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [], evidence: [], summary: "Repair attempt" }
+    const repairGraph = projectSelectedJobMemory({ jobId: "job-1", sourceTurnId: "private-repair-source-turn", sourceRootTaskId: "private-repair-source-root",
+      throughSequence: "8", graph: { revision: 4, nodes: [
+        { key: "repair-target", taskId: "private-repair-target-task", templateId: "scout", goal: "Find the selected role", successCriteria: ["Find a candidate"],
+          dependsOn: [], status: "failed", readiness: "terminal", verificationCriterionIds: ["candidate-count"], verificationReport: {
+            verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "canonical_evidence_missing",
+            criteria: [{ criterionId: "candidate-count", status: "unverified", reasonCode: "canonical_evidence_missing" }], evidenceDigest: null, resultDigest: null,
+          }, resultProjection: { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "unavailable" } },
+        { key: "repair-attempt", taskId: "private-repair-attempt-task", templateId: "scout", goal: "Find the selected role", successCriteria: ["Find a candidate"],
+          dependsOn: [], status: "failed", readiness: "terminal", repairOf: { graphRootTaskId: "private-repair-source-root", nodeKey: "repair-target",
+            taskId: "private-repair-target-task", criterionIds: ["candidate-count"] }, verificationCriterionIds: ["candidate-count"], verificationReport: {
+            verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "repair_target_unresolved",
+            criteria: [{ criterionId: "candidate-count", status: "passed", reasonCode: "criteria_met" }], evidenceDigest: null,
+            resultDigest: taskGraphResultDigest(repairResult),
+          }, resultProjection: { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "unavailable" } },
+      ] } })
+    const unresolvedRepairNode = repairGraph?.nodes.find(node => node.historicalRepairReasonHint === "repair_target_unresolved")
+    if (!unresolvedRepairNode) throw new Error("canonical unresolved-repair history fixture was invalid")
     const outcomes: ValidatedSelectedJobHistoryOutcome[] = [
-      { jobId: "job-1", sourceTurnId: "private-prior-turn", sourceRootTaskId: "private-prior-root", terminalSequence: 29n, nodes: [failedNode] },
+      { jobId: "job-1", sourceTurnId: "private-prior-turn", sourceRootTaskId: "private-prior-root", terminalSequence: 29n, nodes: [failedNode, unresolvedRepairNode] },
       { jobId: "job-1", sourceTurnId: "private-unverified-turn", sourceRootTaskId: "private-unverified-root", terminalSequence: 28n, nodes: [unverifiedNode] },
     ]
     const currentGraph = graph as unknown as TaskGraphCurrentState
@@ -2172,6 +2190,7 @@ describe("createCanonicalTurnRuntime", () => {
     await runtime.execute({ lease, signal: new AbortController().signal })
     const requestText = requests[0]?.messages.flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n") ?? ""
     expect(requestText).toContain("selected_job_history")
+    expect(requestText).toContain('"reasonHints":["repair_target_unresolved"]')
     expect(requestText).toContain('"reasonHints":["criterion_not_met","reported_score_below_minimum"]')
     expect(requestText).toContain('"reasonHints":["canonical_evidence_missing"]')
     expect(requestText).toContain('"score":6.5')
@@ -2192,6 +2211,9 @@ describe("createCanonicalTurnRuntime", () => {
     expect(requestText).not.toContain("private-prior-root")
     expect(requestText).not.toContain("private-unverified-turn")
     expect(requestText).not.toContain("private-unverified-root")
+    expect(requestText).not.toContain("private-repair-source-turn")
+    expect(requestText).not.toContain("private-repair-source-root")
+    expect(requestText).not.toContain("historicalRepairReasonHint")
     expect(requestText).not.toContain("verification")
     expect(requestText).not.toContain("criteria")
     expect(requestText).not.toContain("criteria_met")

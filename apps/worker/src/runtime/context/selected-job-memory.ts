@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer"
 import { sha256Hex } from "./context-compaction-canonical.js"
 import type { TaskGraphCurrentState } from "../subagents/task-graph-command-port.js"
-import { parseSelectedJobMemoryNodes, projectSelectedJobMemoryNodes } from "./selected-job-memory-node-projection.js"
+import { parseSelectedJobMemoryNodes, projectSelectedJobHistoryMemoryNodes } from "./selected-job-memory-node-projection.js"
 import type { TaskGraphVerificationReasonCode } from "../planning/task-graph-verification.js"
 import type { SubagentTaskStatus } from "../subagents/types.js"
 import type { StepContextSnapshot } from "./step-context-builder.js"
@@ -25,6 +25,7 @@ export type SelectedJobMemoryNode = Readonly<{
   status: SubagentTaskStatus
   readiness: "ready" | "waiting_for_dependencies" | "blocked_dependency" | "active" | "terminal"
   verification?: Readonly<{ status: "passed" | "failed" | "unverified"; criteria: readonly Readonly<{ status: "passed" | "failed" | "unverified"; reasonCode: TaskGraphVerificationReasonCode }>[] }>
+  historicalRepairReasonHint?: "repair_target_unresolved"
   repairState: "none" | "pending" | "verified"
   result: SelectedJobMemoryResult
 }>
@@ -58,7 +59,7 @@ export function projectSelectedJobMemory(input: {
   if (!text(input.jobId) || !text(input.sourceTurnId) || !text(input.sourceRootTaskId) || !/^(0|[1-9][0-9]*)$/.test(input.throughSequence)
     || !Number.isSafeInteger(input.graph.revision) || input.graph.revision < 1 || !Array.isArray(input.graph.nodes)
     || input.graph.nodes.length < 1 || input.graph.nodes.length > MAX_NODES) return null
-  const nodes = projectSelectedJobMemoryNodes({ jobId: input.jobId, graph: input.graph })
+  const nodes = projectSelectedJobHistoryMemoryNodes({ jobId: input.jobId, graph: input.graph })
   if (!nodes) return null
   const identity = { schemaVersion: SELECTED_JOB_MEMORY_SCHEMA_VERSION, jobId: input.jobId, sourceTurnId: input.sourceTurnId,
     sourceRootTaskId: input.sourceRootTaskId, graphRevision: input.graph.revision, throughSequence: input.throughSequence, nodes }
@@ -120,7 +121,12 @@ export function injectSelectedJobMemory(input: {
   const fresh = projectSelectedJobMemory({ jobId: input.jobId, sourceTurnId: input.turnId, sourceRootTaskId: input.rootTaskId,
     throughSequence: stored.throughSequence, graph: { revision: graph.revision as number, nodes: graph.nodes } })
   if (!fresh || fresh.graphRevision !== stored.graphRevision || fresh.graphDigest !== stored.graphDigest) return input.snapshot
+  const nodes = stored.nodes.map(node => {
+    const visible: Record<string, unknown> = { ...node }
+    delete visible.historicalRepairReasonHint
+    return visible
+  })
   const observation = { id: "selected-job-memory", content: { kind: "selected_job_memory", informationalOnly: true,
-    schemaVersion: SELECTED_JOB_MEMORY_SCHEMA_VERSION, graphRevision: stored.graphRevision, nodes: stored.nodes } }
+    schemaVersion: SELECTED_JOB_MEMORY_SCHEMA_VERSION, graphRevision: stored.graphRevision, nodes } }
   return { ...input.snapshot, toolObservations: [...input.snapshot.toolObservations.filter(item => item.id !== observation.id), observation] }
 }

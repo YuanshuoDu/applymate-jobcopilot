@@ -149,7 +149,9 @@ function parseStoredResult(value: unknown, role: string): SelectedJobMemoryResul
 
 function parseNode(value: unknown): SelectedJobMemoryNode | null {
   const item = row(value)
-  if (!item || !(exact(item, "readiness,repairState,result,role,status") || exact(item, "readiness,repairState,result,role,status,verification"))
+  const repairHint = item?.historicalRepairReasonHint === "repair_target_unresolved" && item.status === "failed"
+    && exact(item, "historicalRepairReasonHint,readiness,repairState,result,role,status")
+  if (!item || !(repairHint || exact(item, "readiness,repairState,result,role,status") || exact(item, "readiness,repairState,result,role,status,verification"))
     || typeof item.role !== "string" || !["scout", "analyst", "writer", "reviewer"].includes(item.role)
     || typeof item.status !== "string" || !STATUSES.has(item.status) || typeof item.readiness !== "string" || !READINESS.has(item.readiness)
     || !["none", "pending", "verified"].includes(String(item.repairState))) return null
@@ -158,6 +160,7 @@ function parseNode(value: unknown): SelectedJobMemoryNode | null {
   if (!result || (item.verification !== undefined && !verification)) return null
   return { role: item.role as SelectedJobMemoryNode["role"], status: item.status as SubagentTaskStatus,
     readiness: item.readiness as SelectedJobMemoryNode["readiness"], ...(verification ? { verification } : {}),
+    ...(repairHint ? { historicalRepairReasonHint: "repair_target_unresolved" as const } : {}),
     repairState: item.repairState as SelectedJobMemoryNode["repairState"], result }
 }
 
@@ -183,7 +186,7 @@ function parseHistoryNode(value: unknown): SelectedJobHistoryMemoryNode | null {
   return parsed?.status === "failed" ? { ...parsed, historicalRepairReasonHint: "repair_target_unresolved" } : null
 }
 
-/** Strict parser for the direct-history-only fixed repair hint; retained memory stays on its original codec. */
+/** Strict parser for the fixed repair hint shared by retained memory and direct history. */
 export function parseSelectedJobHistoryMemoryNodes(value: unknown): readonly SelectedJobHistoryMemoryNode[] | null {
   if (!dense(value) || value.length < 1) return null
   const nodes = value.map(parseHistoryNode)
@@ -234,7 +237,7 @@ export function projectSelectedJobMemoryNodes(input: {
   return graphNodes(input, projectNode)
 }
 
-/** Projects direct history with one fixed negative hint that the retained-memory codec cannot represent. */
+/** Projects the one fixed negative repair hint after validating its canonical report. */
 export function projectSelectedJobHistoryMemoryNodes(input: {
   readonly jobId: string
   readonly graph: TaskGraphCurrentState | Readonly<{ revision: number; nodes: readonly unknown[] }>

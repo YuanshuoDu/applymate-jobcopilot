@@ -144,9 +144,8 @@ describe("selected-job history projection", () => {
         },
       }] },
     })
-    expect(record?.nodes[0]?.verification).toEqual({
-      status: "unverified", criteria: [{ status: "passed", reasonCode: "criteria_met" }],
-    })
+    expect(record?.nodes[0]).toMatchObject({ status: "failed", historicalRepairReasonHint: "repair_target_unresolved" })
+    expect(record?.nodes[0]).not.toHaveProperty("verification")
     if (!record) throw new Error("expected the canonical unresolved-repair report to project into retained memory")
 
     const retained = projectSelectedJobHistory([history(record, 53n)])
