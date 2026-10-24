@@ -3347,35 +3347,86 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     const prepared = await prepareFailedBranchReplan(adminPool!, commandPool!, roleName, value, "native-observed",
       { retainedNodeCount: 3, addNativeSnapshot: true })
     expect(prepared.current.nodes).toHaveLength(8)
-    const nativeEvent = await adminPool!.query<{ id: string; sequence: string; type: string; payload: unknown }>(
-      `SELECT "id", "sequence"::text AS "sequence", "type", "payload" FROM "agent_events"
-        WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3 AND "payload"->>'kind' = 'native_command'
-        ORDER BY "sequence" DESC LIMIT 1`, [value.sessionId, value.turnId, taskGraphItemId(value.rootTaskId)])
-    const native = nativeEvent.rows[0]?.payload as { kind: string; revision: number; receipt: { nodeKey: string; child: { taskId: string } } } | undefined
-    expect(nativeEvent.rows).toHaveLength(1)
-    expect(nativeEvent.rows[0]).toMatchObject({ type: "item.delta" })
-    expect(native).toMatchObject({ kind: "native_command", revision: prepared.current.revision,
-      receipt: { status: "accepted", child: { taskId: expect.any(String) } } })
-    const call = await adminPool!.query<{ sequence: string }>(`SELECT "sequence"::text AS "sequence" FROM "agent_events"
-      WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'tool_call.started' AND "correlationId" = $3`,
-    [value.sessionId, value.turnId, value.planCallId])
-    expect(call.rows).toHaveLength(1)
-    expect(BigInt(nativeEvent.rows[0]!.sequence)).toBeLessThan(BigInt(call.rows[0]!.sequence))
-    const latestBeforeCall = await adminPool!.query<{ id: string; sequence: string; payload: unknown }>(
-      `SELECT "id", "sequence"::text AS "sequence", "payload" FROM "agent_events"
-        WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3 AND "type" IN ('item.started', 'item.delta')
-          AND "sequence" < $4::bigint ORDER BY "sequence" DESC LIMIT 1`,
-    [value.sessionId, value.turnId, taskGraphItemId(value.rootTaskId), call.rows[0]!.sequence])
-    expect(latestBeforeCall.rows).toHaveLength(1)
-    expect(latestBeforeCall.rows[0]).toMatchObject({ id: nativeEvent.rows[0]!.id, sequence: nativeEvent.rows[0]!.sequence })
+    const eventSnapshot = await adminPool!.query<{
+      nativeCount: number
+      nativeEvent: null | { id: string; sequence: string; type: string; payloadKind: string; revision: number; receiptStatus: string; nodeKey: string; childTaskId: string; childTaskIdType: string }
+      callCount: number
+      callEvent: null | { id: string; sequence: string; type: string }
+      latestBeforeCall: null | { id: string; sequence: string; type: string; itemId: string }
+      preCallCandidates: Array<{ id: string; sequence: string; type: string; itemId: string }>
+      filters: unknown
+    }>(`WITH scoped_events AS MATERIALIZED (
+        SELECT event."id", event."sequence", event."type", event."itemId", event."payload"
+        FROM "agent_events" AS event
+        WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."itemId" = $3
+      ), call_events AS MATERIALIZED (
+        SELECT event."id", event."sequence", event."type"
+        FROM "agent_events" AS event
+        WHERE event."sessionId" = $1 AND event."turnId" = $2
+          AND event."type" = 'tool_call.started' AND event."correlationId" = $4
+      ), native_events AS MATERIALIZED (
+        SELECT event."id", event."sequence", event."type", event."payload"
+        FROM scoped_events AS event
+        WHERE event."payload"->>'kind' = 'native_command'
+      ), pre_call_candidates AS MATERIALIZED (
+        SELECT event."id", event."sequence", event."type", event."itemId"
+        FROM scoped_events AS event CROSS JOIN call_events AS call
+        WHERE event."type" IN ('item.started', 'item.delta') AND event."sequence" < call."sequence"
+      ), latest_pre_call AS (
+        SELECT candidate."id", candidate."sequence", candidate."type", candidate."itemId"
+        FROM pre_call_candidates AS candidate ORDER BY candidate."sequence" DESC LIMIT 1
+      )
+      SELECT
+        (SELECT count(*)::int FROM native_events) AS "nativeCount",
+        (SELECT jsonb_build_object('id', event."id", 'sequence', event."sequence"::text,
+          'type', event."type", 'payloadKind', event."payload"->>'kind', 'revision', event."payload"->'revision',
+          'receiptStatus', event."payload"->'receipt'->>'status',
+          'nodeKey', event."payload"->'receipt'->>'nodeKey',
+          'childTaskId', event."payload"->'receipt'->'child'->>'taskId',
+          'childTaskIdType', jsonb_typeof(event."payload"->'receipt'->'child'->'taskId'))
+         FROM native_events AS event ORDER BY event."sequence" DESC LIMIT 1) AS "nativeEvent",
+        (SELECT count(*)::int FROM call_events) AS "callCount",
+        (SELECT jsonb_build_object('id', event."id", 'sequence', event."sequence"::text, 'type', event."type")
+         FROM call_events AS event ORDER BY event."sequence" ASC LIMIT 1) AS "callEvent",
+        (SELECT jsonb_build_object('id', event."id", 'sequence', event."sequence"::text,
+          'type', event."type", 'itemId', event."itemId") FROM latest_pre_call AS event) AS "latestBeforeCall",
+        COALESCE((SELECT jsonb_agg(jsonb_build_object('id', event."id", 'sequence', event."sequence"::text,
+          'type', event."type", 'itemId', event."itemId") ORDER BY event."sequence" DESC)
+          FROM pre_call_candidates AS event), '[]'::jsonb) AS "preCallCandidates",
+        jsonb_build_object('sessionId', $1::text, 'turnId', $2::text, 'itemId', $3::text,
+          'callCorrelationId', $4::text, 'nativeExpectedType', 'item.delta',
+          'nativePayloadKind', 'native_command', 'candidateTypes', jsonb_build_array('item.started', 'item.delta'),
+          'boundary', 'event.sequence < call.sequence', 'latestOrder', 'event.sequence DESC LIMIT 1') AS "filters"`,
+    [value.sessionId, value.turnId, taskGraphItemId(value.rootTaskId), value.planCallId])
+    expect(eventSnapshot.rows).toHaveLength(1)
+    const observed = eventSnapshot.rows[0]!
+    const nativeEvent = observed.nativeEvent
+    const nativeDiagnostic = nativeEvent && {
+      id: nativeEvent.id, sequence: nativeEvent.sequence, type: nativeEvent.type, kind: nativeEvent.payloadKind,
+    }
+    const diagnostic = JSON.stringify({ filters: observed.filters, nativeExists: observed.nativeCount > 0,
+      nativeCount: observed.nativeCount, native: nativeDiagnostic, callCount: observed.callCount,
+      call: observed.callEvent, latestBeforeCall: observed.latestBeforeCall, preCallCandidates: observed.preCallCandidates })
+    const nativeContractIsValid = nativeEvent?.type === "item.delta" && nativeEvent.payloadKind === "native_command"
+      && nativeEvent.revision === prepared.current.revision && nativeEvent.receiptStatus === "accepted"
+      && nativeEvent.childTaskIdType === "string" && Boolean(nativeEvent.nodeKey) && Boolean(nativeEvent.childTaskId)
+    expect({ nativeCount: observed.nativeCount, nativeExists: nativeEvent !== null },
+      `Same-snapshot native receipt diagnostic: ${diagnostic}`).toEqual({ nativeCount: 1, nativeExists: true })
+    expect(nativeContractIsValid, `Same-snapshot native receipt diagnostic: ${diagnostic}`).toBe(true)
+    expect(observed.callCount, `Same-snapshot planner-call diagnostic: ${diagnostic}`).toBe(1)
+    expect(observed.callEvent, `Same-snapshot planner-call diagnostic: ${diagnostic}`).not.toBeNull()
+    expect(BigInt(nativeEvent!.sequence) < BigInt(observed.callEvent!.sequence),
+      `Same-snapshot native-before-call diagnostic: ${diagnostic}`).toBe(true)
+    expect(observed.latestBeforeCall, `Same-snapshot native event ordering diagnostic: ${diagnostic}`)
+      .toMatchObject({ id: nativeEvent!.id, sequence: nativeEvent!.sequence })
 
     const receipt = await prepared.command.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation)
     expect(receipt).toMatchObject({ status: "accepted", revision: prepared.current.revision + 2 })
     expect(receipt.nodes.map(node => node.key)).toEqual(["native-observed-scout", "native-observed-analyst"])
     const after = await prepared.command.readCurrent(readScope(value))
     expect(after.nodes).toHaveLength(8)
-    expect(after.nodes).toContainEqual(expect.objectContaining({ key: native!.receipt.nodeKey,
-      taskId: native!.receipt.child.taskId }))
+    const nativeNodeWasRetained = after.nodes.some(node => node.key === nativeEvent!.nodeKey && node.taskId === nativeEvent!.childTaskId)
+    expect(nativeNodeWasRetained).toBe(true)
     expect(after.nodes.some(node => node.key === "source-scout" || node.key === "source-analyst")).toBe(false)
   }, 60_000)
 
