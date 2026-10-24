@@ -66,7 +66,7 @@ async function recoveryStateSnapshot() {
         COALESCE(wait."result"->'request' = jsonb_build_object('targetTaskIds', wait."targetTaskIds", 'mode', wait."mode",
           'timeoutMs', wait."result"->'request'->'timeoutMs'), FALSE) AS "waitRequestMatches",
         COALESCE(wait."result"->'outcome'->>'waitId' = wait."id" AND wait."result"->'outcome'->>'status' = wait."status"
-          AND wait."result"->'outcome'->'taskIds' = wait."targetTaskIds'
+          AND wait."result"->'outcome'->'taskIds' = wait."targetTaskIds"
           AND wait."result"->'outcome'->'matchedTaskIds' = wait."matchedTaskIds", FALSE) AS "waitOutcomeMatches",
         COALESCE(jsonb_array_length(CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN wait."targetTaskIds" ELSE '[]'::jsonb END) BETWEEN 1 AND 8
           AND jsonb_array_length(CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN wait."targetTaskIds" ELSE '[]'::jsonb END)
