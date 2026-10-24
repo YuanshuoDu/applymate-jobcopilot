@@ -91,6 +91,13 @@ function fakePool(
     query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push([sql, params])
       const result = handler(sql, params)
+      if (sql.startsWith('SELECT clock_timestamp() AS "scanHorizon"')) {
+        if (result.rows?.length) {
+          const row = result.rows[0] as Record<string, unknown>
+          return { ...result, rows: [{ ...row, scanHorizon: row.scanHorizon ?? row.checkedAt }] }
+        }
+        if (result.rows === undefined) return { rows: [{ scanHorizon: now }], rowCount: 1, ...result }
+      }
       if (sql.startsWith('SELECT "leaseExpiresAt" FROM "sub_agent_tasks"') && result.rows === undefined) {
         return { rows: [{ leaseExpiresAt: new Date(now.getTime() + 60_000) }], rowCount: 1, ...result }
       }
@@ -100,6 +107,7 @@ function fakePool(
       if (sql.startsWith("SELECT clock_timestamp()") && result.rows === undefined) {
         return { rows: [{ checkedAt: now }], rowCount: 1, ...result }
       }
+      if (/^(SAVEPOINT|ROLLBACK TO SAVEPOINT|RELEASE SAVEPOINT)\b/.test(sql)) return { rows: [], rowCount: 0, ...result }
       if (sql.startsWith('SELECT "turnId", "rootTaskId" FROM "sub_agent_tasks"') && result.rows === undefined) {
         const taskId = String(params?.[0] ?? "task-1")
         const binding = bindings[taskId]
@@ -152,8 +160,9 @@ function fakePool(
         const count = sql.includes('task."turnId" = $2') ? 2 : 3
         return { rows: Array.from({ length: count }, (_, index) => ({ id: `task-${index + 1}`, status: index === 0 ? "running" : "waiting", attemptCount: 1 })), rowCount: count, ...result }
       }
-      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1") && result.rows === undefined) {
-        return { rows: [{ id: "task-1", sessionId: "session-1", rootTaskId: "task-1", userId: "user-1" }], rowCount: 1, ...result }
+      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $8") && result.rows === undefined) {
+        return { rows: [{ id: "task-1", sessionId: "session-1", rootTaskId: "task-1", turnId: "turn-1", userId: "user-1",
+          cursorRootIsNull: false, cursorRootKey: "task-1" }], rowCount: 1, ...result }
       }
       if (sql.includes('session."status" AS "sessionStatus"') && result.rows === undefined) {
         return { rows: [taskRow({ sessionStatus: "running", attemptCount: 1 })], rowCount: 1, ...result }
@@ -1368,7 +1377,8 @@ describe("PgSubagentTaskStore", () => {
 
   it.each(["running", "paused", "waiting_for_user"] as const)("reclaims stale leases from an open %s session", async sessionStatus => {
     const fake = fakePool(sql => {
-      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1")) return { rows: [{ id: "task-1", sessionId: "session-1", rootTaskId: "task-1", turnId: "turn-1", userId: "user-1" }], rowCount: 1 }
+      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $8")) return { rows: [{ id: "task-1", sessionId: "session-1", rootTaskId: "task-1", turnId: "turn-1", userId: "user-1",
+        cursorRootIsNull: false, cursorRootKey: "task-1" }], rowCount: 1 }
       if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "session-1", userId: "user-1", status: sessionStatus }], rowCount: 1 }
       if (sql.includes('session."status" AS "sessionStatus"')) return { rows: [taskRow({ status: "running", sessionStatus, leaseOwner: "dead-worker", leaseExpiresAt: new Date(now.getTime() - 1), attemptCount: 1 })], rowCount: 1 }
       if (sql.includes("leaseExpiresAt") && sql.includes("FOR UPDATE OF task")) return { rows: [taskRow({ status: "running", sessionStatus, leaseOwner: "dead-worker", leaseExpiresAt: new Date(now.getTime() - 1), attemptCount: 1 })], rowCount: 1 }
@@ -1379,16 +1389,17 @@ describe("PgSubagentTaskStore", () => {
     const result = await store.recoverExpired({ now, limit: 10 })
     expect(result).toHaveLength(1)
     expect(result[0].status).toBe("queued")
-    const scan = fake.calls.find(([sql]) => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1"))?.[0] ?? ""
+    const scan = fake.calls.find(([sql]) => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $8"))?.[0] ?? ""
     const taskLock = fake.calls.find(([sql]) => sql.includes("FOR UPDATE OF task"))?.[0] ?? ""
-    expect(scan).toContain("LIMIT $1")
+    expect(scan).toContain("LIMIT $8")
     expect(scan).not.toContain("FOR UPDATE")
     expect(taskLock).toContain("FOR UPDATE OF task")
   })
 
   it.each(["aborted", "archived"] as const)("reclaims a stale child from a %s session as interrupted", async status => {
     const fake = fakePool(sql => {
-      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1")) return { rows: [{ id: "task-1", sessionId: "session-1", rootTaskId: "task-1", turnId: "turn-1", userId: "user-1" }], rowCount: 1 }
+      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $8")) return { rows: [{ id: "task-1", sessionId: "session-1", rootTaskId: "task-1", turnId: "turn-1", userId: "user-1",
+        cursorRootIsNull: false, cursorRootKey: "task-1" }], rowCount: 1 }
       if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "session-1", userId: "user-1", status }], rowCount: 1 }
       if (sql.includes('session."status" AS "sessionStatus"')) return { rows: [taskRow({ status: "running", sessionStatus: status, leaseOwner: "dead-worker", leaseExpiresAt: new Date(now.getTime() - 1), attemptCount: 1 })], rowCount: 1 }
       if (sql.includes("leaseExpiresAt") && sql.includes("FOR UPDATE OF task")) return { rows: [taskRow({ status: "running", sessionStatus: status, leaseOwner: "dead-worker", leaseExpiresAt: new Date(now.getTime() - 1), attemptCount: 1 })], rowCount: 1 }

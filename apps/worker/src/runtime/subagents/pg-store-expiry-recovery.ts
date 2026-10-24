@@ -10,7 +10,10 @@ import { prepareTaskGraphFinish } from "./pg-store-lifecycle.js"
 import { recoverExpiredDurableSubagentWaitWithGraph } from "./durable-subagent-wait-handoff.js"
 import { recoverExpiredWaitRegistration } from "./durable-subagent-wait-store.js"
 
-type Candidate = Record<string, unknown> & Readonly<{ id: string; sessionId: string; userId: string; rootTaskId?: string; turnId?: string | null }>
+type RecoveryCursor = Readonly<{ sessionId: string; rootIsNull: boolean; rootKey: string; taskId: string }>
+type Candidate = Record<string, unknown> & Readonly<{ id: string; sessionId: string; userId: string; rootTaskId?: string | null; turnId?: string | null;
+  cursorRootIsNull: boolean; cursorRootKey: string }>
+const RECOVERY_CANDIDATE_SAVEPOINT = "subagent_expiry_recovery_candidate"
 
 const CHILD_WAIT_RESUMABLE_SQL = `(SELECT COUNT(*) = 1
   FROM "agent_wait_conditions" AS wait
@@ -108,18 +111,36 @@ export async function recoverExpired(pool: PgSubagentPool, input: { now: Date; l
   if (!Number.isInteger(input.limit) || input.limit < 1) throw new RangeError("Recovery limit must be positive")
   if (input.turnId && !input.sessionId) throw new TypeError("Turn recovery filter requires a Session")
   return transaction(pool, async client => {
-    const candidates = await client.query(`SELECT task."id", task."sessionId", task."rootTaskId", task."turnId", session."userId"
-      FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
-      WHERE task."status" = 'running' AND (session."status" IN ('aborted', 'archived') OR ${RUNNABLE_SESSION})
-        AND task."leaseExpiresAt" <= clock_timestamp()
-        AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= clock_timestamp())
-        AND ($2::text IS NULL OR task."sessionId" = $2)
-        AND ($3::text IS NULL OR task."turnId" = $3)
-        AND (${rootRecoveryEligibility})
-      ORDER BY task."sessionId", task."rootTaskId", task."id" LIMIT $1`, [input.limit, input.sessionId ?? null, input.turnId ?? null])
+    const scanHorizon = (await client.query<{ scanHorizon: Date }>(`SELECT clock_timestamp() AS "scanHorizon"`)).rows[0]?.scanHorizon
+    if (!(scanHorizon instanceof Date) || !Number.isFinite(scanHorizon.getTime())) throw new Error("Recovery scan horizon is unavailable")
     const recovered: SubagentTaskRecord[] = []
-    for (const candidate of candidates.rows as Candidate[]) {
-      const outcome = await recoverOne(client, candidate, input); if (outcome) recovered.push(outcome)
+    let cursor: RecoveryCursor | undefined
+    // A blocked backlog needs extra keyset reads; successful recoveries still cap the pass at input.limit.
+    while (recovered.length < input.limit) {
+      const candidates = await client.query<Candidate>(`SELECT task."id", task."sessionId", task."rootTaskId", task."turnId", session."userId",
+          task."rootTaskId" IS NULL AS "cursorRootIsNull", COALESCE(task."rootTaskId", '') AS "cursorRootKey"
+        FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+        WHERE task."status" = 'running' AND (session."status" IN ('aborted', 'archived') OR ${RUNNABLE_SESSION})
+          AND task."leaseExpiresAt" <= $1 AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= $1)
+          AND ($2::text IS NULL OR task."sessionId" = $2) AND ($3::text IS NULL OR task."turnId" = $3)
+          AND ($4::text IS NULL OR (task."sessionId", (task."rootTaskId" IS NULL), COALESCE(task."rootTaskId", ''), task."id")
+            > ($4::text, $5::boolean, $6::text, $7::text))
+          AND (${rootRecoveryEligibility})
+        ORDER BY task."sessionId", (task."rootTaskId" IS NULL), COALESCE(task."rootTaskId", ''), task."id" LIMIT $8`,
+      [scanHorizon, input.sessionId ?? null, input.turnId ?? null, cursor?.sessionId ?? null, cursor?.rootIsNull ?? null,
+        cursor?.rootKey ?? null, cursor?.taskId ?? null, input.limit])
+      if (candidates.rows.length === 0) break
+      for (const candidate of candidates.rows) {
+        await client.query(`SAVEPOINT ${RECOVERY_CANDIDATE_SAVEPOINT}`)
+        const outcome = await recoverOne(client, candidate, input)
+        if (!outcome) await client.query(`ROLLBACK TO SAVEPOINT ${RECOVERY_CANDIDATE_SAVEPOINT}`)
+        await client.query(`RELEASE SAVEPOINT ${RECOVERY_CANDIDATE_SAVEPOINT}`)
+        cursor = { sessionId: candidate.sessionId, rootIsNull: candidate.cursorRootIsNull,
+          rootKey: candidate.cursorRootKey, taskId: candidate.id }
+        if (outcome) recovered.push(outcome)
+        if (recovered.length >= input.limit) break
+      }
+      if (recovered.length >= input.limit || candidates.rows.length < input.limit) break
     }
     return recovered
   })

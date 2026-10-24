@@ -38,6 +38,51 @@ let stopped = false
 
 function say(value) { process.stdout.write(`${value}\n`) }
 
+async function recoveryStateSnapshot() {
+  try {
+    const result = await pool.query(`SELECT clock_timestamp() AS "databaseClock", session."status" AS "sessionStatus",
+        turn."status" AS "turnStatus", root."status" AS "rootStatus", root."interruptRequestedAt" AS "rootInterruptRequestedAt",
+        task."status" AS "taskStatus", task."attemptCount", task."maxAttempts", task."leaseOwner", task."leaseExpiresAt",
+        task."nextAttemptAt", task."interruptRequestedAt", task."status" = 'running' AND task."leaseExpiresAt" <= clock_timestamp() AS "expiredRunning",
+        task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= clock_timestamp() AS "retryDue",
+        wait."id" AS "waitId", wait."status" AS "waitStatus", wait."deadlineAt", wait."suspendedAt", wait."resolvedAt", wait."consumedAt",
+        jsonb_array_length(CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN wait."targetTaskIds" ELSE '[]'::jsonb END) AS "waitTargetCount",
+        wait."deadlineAt" IS NOT NULL AND wait."deadlineAt" <= clock_timestamp() AS "waitDeadlineDue",
+        step."id" AS "stepId", step."status" AS "stepStatus", step."attempt" AS "stepAttempt", step."ordinal" AS "stepOrdinal",
+        step."ordinal" = (SELECT MAX(latest."ordinal") FROM "agent_steps" AS latest WHERE latest."taskId" = task."id"
+          AND latest."sessionId" = task."sessionId" AND latest."turnId" = task."turnId" AND latest."attempt" = task."attemptCount") AS "stepIsLatest",
+        call."id" AS "callItemId", call."status" AS "callStatus", call."content"->>'toolName' AS "callName",
+        call."content"->>'toolVersion' AS "callVersion", call."content"->>'toolCallId' AS "callToolCallId",
+        (SELECT COUNT(*)::int FROM "agent_events" AS started WHERE started."sessionId" = task."sessionId" AND started."taskId" = task."id"
+          AND started."itemId" = call."id" AND started."type" = 'tool_call.started') AS "startedEventCount",
+        (SELECT COUNT(*)::int FROM "agent_events" AS settled WHERE settled."sessionId" = task."sessionId" AND settled."taskId" = task."id"
+          AND settled."correlationId" = call."content"->>'toolCallId' AND settled."type" IN ('tool_call.completed', 'tool_call.failed', 'tool_call.interrupted')) AS "settledEventCount",
+        dispatch."attemptCount" AS "dispatchAttemptCount", dispatch."publishedAt" AS "dispatchPublishedAt"
+      FROM "agent_sessions" AS session
+      LEFT JOIN "agent_turns" AS turn ON turn."id" = $2 AND turn."sessionId" = session."id"
+      LEFT JOIN "sub_agent_tasks" AS task ON task."id" = $4 AND task."sessionId" = session."id"
+        AND task."turnId" = turn."id" AND task."rootTaskId" = $3
+      LEFT JOIN "sub_agent_tasks" AS root ON root."id" = task."rootTaskId" AND root."sessionId" = task."sessionId"
+      LEFT JOIN LATERAL (SELECT currentWait.* FROM "agent_wait_conditions" AS currentWait
+        WHERE currentWait."parentTaskId" = task."id" AND currentWait."sessionId" = task."sessionId" AND currentWait."turnId" = task."turnId"
+        ORDER BY currentWait."createdAt" DESC, currentWait."id" DESC LIMIT 1) AS wait ON TRUE
+      LEFT JOIN "agent_steps" AS step ON step."id" = wait."stepId" AND step."sessionId" = task."sessionId"
+        AND step."turnId" = task."turnId" AND step."taskId" = task."id"
+      LEFT JOIN LATERAL (SELECT currentCall.* FROM "agent_items" AS currentCall
+        WHERE currentCall."sessionId" = task."sessionId" AND currentCall."turnId" = task."turnId" AND currentCall."taskId" = task."id"
+          AND currentCall."stepId" = step."id" AND currentCall."type" = 'tool_call' AND currentCall."content"->>'toolName' = 'wait_subagents'
+        ORDER BY currentCall."id" DESC LIMIT 1) AS call ON TRUE
+      LEFT JOIN LATERAL (SELECT currentDispatch."attemptCount", currentDispatch."publishedAt" FROM "agent_outbox" AS currentDispatch
+        WHERE currentDispatch."topic" = 'agent.subagent.dispatch' AND currentDispatch."aggregateId" = session."id"
+          AND currentDispatch."idempotencyKey" = 'subagent-dispatch:' || task."id" LIMIT 1) AS dispatch ON TRUE
+      WHERE session."id" = $1`, [ids.sessionId, ids.turnId, ids.rootTaskId, ids.waiterTaskId])
+    return result.rows[0] ?? { diagnostic: "fixture_state_missing" }
+  } catch (error) {
+    const code = typeof error?.code === "string" && /^[0-9A-Z]{5}$/.test(error.code) ? error.code : null
+    return { diagnostic: "query_failed", code }
+  }
+}
+
 function boundedErrorDetails(error) {
   if (error instanceof Error) return { name: String(error.name).slice(0, 128), message: error.message.slice(0, 1_000), stack: error.stack?.slice(0, 3_000) ?? null }
   return { name: typeof error, message: String(error).slice(0, 1_000), stack: null }
@@ -162,7 +207,22 @@ worker.on("failed", (job, error) => {
 
 try {
   if (mode.startsWith("worker-b")) {
+    const diagnosticsEnabled = mode === "worker-b-crash-resume"
+    const processStartedAt = diagnosticsEnabled ? new Date().toISOString() : undefined
+    const before = diagnosticsEnabled ? await recoveryStateSnapshot() : undefined
+    if (before?.diagnostic === "query_failed") {
+      throw new Error(`recovery_pre_snapshot_query_failed:${before.code ?? "unknown"}`)
+    }
+    const recoveryStartedAt = diagnosticsEnabled ? new Date().toISOString() : undefined
     const recovered = await manager.recover()
+    const recoveryCompletedAt = diagnosticsEnabled ? new Date().toISOString() : undefined
+    if (diagnosticsEnabled && !recovered.rows.some(row => row.id === ids.waiterTaskId)) {
+      const after = await recoveryStateSnapshot()
+      say(`WORKER_B_RECOVERY_DIAGNOSTIC ${JSON.stringify({ processStartedAt, recoveryStartedAt, recoveryCompletedAt,
+        candidateScan: { targetPageRank: ids.recoveryTargetPageRank ?? null, candidateCount: ids.recoveryCandidateCount ?? null,
+          fixtureBlockerCount: ids.recoveryFixtureBlockerCount ?? null, observedAt: ids.recoveryCandidateObservedAt ?? null },
+        recovery: { reclaimed: recovered.reclaimed, terminal: recovered.terminal, rows: recovered.rows.map(row => ({ id: row.id, status: row.status })) }, before, after })}`)
+    }
     say(`WORKER_B_RECOVERED ${JSON.stringify({ reclaimed: recovered.reclaimed, terminal: recovered.terminal, rows: recovered.rows.map(row => ({ id: row.id, status: row.status })) })}`)
   }
   await worker.waitUntilReady()
