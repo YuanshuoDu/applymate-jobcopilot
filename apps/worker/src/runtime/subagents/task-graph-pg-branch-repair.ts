@@ -37,7 +37,7 @@ export async function scheduleTaskGraphBranchRepair(client: Client, input: TaskG
   const persisted = await assertTaskGraphBranchRepairToolCall(client, operation.scope, operation.callId, operation.expectedRevision, branch)
     .catch(error => { if (error instanceof Error && error.message === "steering_reconciliation_branch_repair_event_invalid") return invalid(); throw error })
   if (persisted.fingerprint !== fingerprint) return invalid()
-  const proposalKey = taskGraphProposalKey(input.scope.rootTaskId, input.proposal.expectedRevision)
+  const proposalKey = taskGraphProposalKey(input.scope.rootTaskId, input.proposal.expectedRevision + branch.sources.length)
   if (await hasPriorPlan(client, input.scope, proposalKey)) throw conflict()
 
   const prepared = await prepareSteeringReconciliation(client, operation)
@@ -61,6 +61,7 @@ export async function scheduleTaskGraphBranchRepair(client: Client, input: TaskG
     if (validation.code === "task_graph_dependency_unverified") throw new TaskGraphCommandError(validation.code, "Replacement depends on legacy-unverified work")
     return invalid()
   }
+  if (validation.value.sourceNodes.length !== branch.sources.length) return invalid()
   if (expectedRevision > MAX_REVISION - validation.value.sourceNodes.length - 1) return invalid()
   const statusRows = await lockedSources(client, input, validation.value.sourceNodes)
   for (const source of validation.value.sourceNodes) {

@@ -119,7 +119,7 @@ function fixture(options: Readonly<{ changedScoutMinimum?: number }> = {}) {
       source: { nodeKey: source.nodeKey, taskId: source.taskId }, replacementKey: source.replacementKey,
       cancellationEvent: { id: `cancel-${source.nodeKey}`, sequence: String(41 + index) },
     })),
-    planEvent: { id: "branch-plan-event", sequence: "43", idempotencyKey: taskGraphProposalKey(scope.rootTaskId, expectedRevision) },
+    planEvent: { id: "branch-plan-event", sequence: "43", idempotencyKey: taskGraphProposalKey(scope.rootTaskId, expectedRevision + replaceBranch.sources.length) },
     replacementFingerprint: fingerprint,
     agentPlanCall: { callId, stepId: scope.stepId, expectedRevision, replaceBranch },
   }

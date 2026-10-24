@@ -130,7 +130,7 @@ export function parseTaskGraphBranchRepairRelation(value: unknown): TaskGraphBra
     const plan = object(row.planEvent)
     if (!exact(plan, ["id", "sequence", "idempotencyKey"]) || !id(plan.id) || !sequence(plan.sequence)
       || !id(plan.idempotencyKey, 256) || eventIds.has(plan.id) || BigInt(plan.sequence) <= previousSequence
-      || plan.idempotencyKey !== taskGraphProposalKey(row.graphRootTaskId, row.observedRevision)) return null
+      || plan.idempotencyKey !== taskGraphProposalKey(row.graphRootTaskId, row.observedRevision + sourceRows.length)) return null
     return {
       schemaVersion: TASK_GRAPH_BRANCH_REPAIR_RELATION_SCHEMA_VERSION,
       operationKey: row.operationKey,

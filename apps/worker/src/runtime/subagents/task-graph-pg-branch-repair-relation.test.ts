@@ -33,7 +33,7 @@ const validRelation = {
     { source: { nodeKey: "analyst-old", taskId: "task-analyst-old" }, replacementKey: "analyst-new",
       cancellationEvent: { id: "cancel-analyst", sequence: "9007199254740994" } },
   ],
-  planEvent: { id: "plan-event", sequence: "9007199254740995", idempotencyKey: taskGraphProposalKey("graph-root-task", 12) },
+  planEvent: { id: "plan-event", sequence: "9007199254740995", idempotencyKey: taskGraphProposalKey("graph-root-task", 14) },
   replacementFingerprint: taskGraphBranchRepairFingerprint(call),
   agentPlanCall: { callId: "call-branch-repair", stepId: "step-replan", expectedRevision: 12, replaceBranch: branch },
 } satisfies TaskGraphBranchRepairRelation
@@ -64,8 +64,9 @@ describe("parseTaskGraphBranchRepairRelation", () => {
     expect(parseTaskGraphBranchRepairRelation(changed(["agentPlanCall", "replaceBranch", "root", "taskId"], "foreign"))).toBeNull()
   })
 
-  it("requires the exact TaskGraph proposal key for this graph root and observed revision", () => {
-    expect(parseTaskGraphBranchRepairRelation(changed(["planEvent", "idempotencyKey"], taskGraphProposalKey("other-root", 12)))).toBeNull()
+  it("requires the exact TaskGraph proposal key at the append revision after all cancellations", () => {
+    expect(parseTaskGraphBranchRepairRelation(changed(["planEvent", "idempotencyKey"], taskGraphProposalKey("other-root", 14)))).toBeNull()
+    expect(parseTaskGraphBranchRepairRelation(changed(["planEvent", "idempotencyKey"], taskGraphProposalKey("graph-root-task", 12)))).toBeNull()
     expect(parseTaskGraphBranchRepairRelation(changed(["planEvent", "idempotencyKey"], taskGraphProposalKey("graph-root-task", 13)))).toBeNull()
     expect(parseTaskGraphBranchRepairRelation(changed(["graphRootTaskId"], "other-root"))).toBeNull()
     expect(parseTaskGraphBranchRepairRelation(changed(["planEvent", "idempotencyKey"], "task-graph-" + "a".repeat(64) + ":12"))).toBeNull()
