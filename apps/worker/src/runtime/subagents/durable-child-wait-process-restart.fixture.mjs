@@ -68,6 +68,42 @@ async function recoveryStateSnapshot() {
         COALESCE(wait."result"->'outcome'->>'waitId' = wait."id" AND wait."result"->'outcome'->>'status' = wait."status"
           AND wait."result"->'outcome'->'taskIds' = wait."targetTaskIds"
           AND wait."result"->'outcome'->'matchedTaskIds' = wait."matchedTaskIds", FALSE) AS "waitOutcomeMatches",
+        wait."result" IS NOT NULL AS "waitResultPresent", jsonb_typeof(wait."result") AS "waitResultType",
+        octet_length(wait."result"::text) AS "waitResultByteLength",
+        COALESCE(wait."result"->>'truncated' = 'true', FALSE) AS "waitResultTruncated",
+        jsonb_typeof(wait."result"->'request') AS "waitRequestType",
+        (SELECT COUNT(*)::int FROM jsonb_object_keys(CASE WHEN jsonb_typeof(wait."result"->'request') = 'object'
+          THEN wait."result"->'request' ELSE '{}'::jsonb END)) AS "waitRequestKeyCount",
+        CASE WHEN jsonb_typeof(wait."result"->'request') = 'object' THEN (wait."result"->'request') ? 'targetTaskIds' ELSE FALSE END AS "waitRequestHasTargetTaskIds",
+        CASE WHEN jsonb_typeof(wait."result"->'request') = 'object' THEN (wait."result"->'request') ? 'mode' ELSE FALSE END AS "waitRequestHasMode",
+        CASE WHEN jsonb_typeof(wait."result"->'request') = 'object' THEN (wait."result"->'request') ? 'timeoutMs' ELSE FALSE END AS "waitRequestHasTimeoutMs",
+        jsonb_typeof(wait."result"->'request'->'targetTaskIds') AS "waitRequestTargetTaskIdsType",
+        CASE WHEN jsonb_typeof(wait."result"->'request'->'targetTaskIds') = 'array'
+          THEN jsonb_array_length(wait."result"->'request'->'targetTaskIds') ELSE NULL END AS "waitRequestTargetTaskIdsCount",
+        jsonb_typeof(wait."result"->'request'->'mode') AS "waitRequestModeType",
+        jsonb_typeof(wait."result"->'request'->'timeoutMs') AS "waitRequestTimeoutMsType",
+        COALESCE(wait."result"->'request'->'targetTaskIds' = wait."targetTaskIds", FALSE) AS "waitRequestTargetTaskIdsMatch",
+        COALESCE(wait."result"->'request'->>'mode' = wait."mode", FALSE) AS "waitRequestModeMatch",
+        COALESCE(wait."result"->'request'->'timeoutMs' = call."content"->'input'->'timeoutMs', FALSE) AS "waitRequestTimeoutMsMatchCall",
+        jsonb_typeof(wait."result"->'outcome') AS "waitOutcomeType",
+        (SELECT COUNT(*)::int FROM jsonb_object_keys(CASE WHEN jsonb_typeof(wait."result"->'outcome') = 'object'
+          THEN wait."result"->'outcome' ELSE '{}'::jsonb END)) AS "waitOutcomeKeyCount",
+        CASE WHEN jsonb_typeof(wait."result"->'outcome') = 'object' THEN (wait."result"->'outcome') ? 'waitId' ELSE FALSE END AS "waitOutcomeHasWaitId",
+        CASE WHEN jsonb_typeof(wait."result"->'outcome') = 'object' THEN (wait."result"->'outcome') ? 'status' ELSE FALSE END AS "waitOutcomeHasStatus",
+        CASE WHEN jsonb_typeof(wait."result"->'outcome') = 'object' THEN (wait."result"->'outcome') ? 'taskIds' ELSE FALSE END AS "waitOutcomeHasTaskIds",
+        CASE WHEN jsonb_typeof(wait."result"->'outcome') = 'object' THEN (wait."result"->'outcome') ? 'matchedTaskIds' ELSE FALSE END AS "waitOutcomeHasMatchedTaskIds",
+        jsonb_typeof(wait."result"->'outcome'->'waitId') AS "waitOutcomeWaitIdType",
+        jsonb_typeof(wait."result"->'outcome'->'status') AS "waitOutcomeStatusType",
+        jsonb_typeof(wait."result"->'outcome'->'taskIds') AS "waitOutcomeTaskIdsType",
+        CASE WHEN jsonb_typeof(wait."result"->'outcome'->'taskIds') = 'array'
+          THEN jsonb_array_length(wait."result"->'outcome'->'taskIds') ELSE NULL END AS "waitOutcomeTaskIdsCount",
+        jsonb_typeof(wait."result"->'outcome'->'matchedTaskIds') AS "waitOutcomeMatchedTaskIdsType",
+        CASE WHEN jsonb_typeof(wait."result"->'outcome'->'matchedTaskIds') = 'array'
+          THEN jsonb_array_length(wait."result"->'outcome'->'matchedTaskIds') ELSE NULL END AS "waitOutcomeMatchedTaskIdsCount",
+        COALESCE(wait."result"->'outcome'->>'waitId' = wait."id", FALSE) AS "waitOutcomeWaitIdMatch",
+        COALESCE(wait."result"->'outcome'->>'status' = wait."status", FALSE) AS "waitOutcomeStatusMatch",
+        COALESCE(wait."result"->'outcome'->'taskIds' = wait."targetTaskIds", FALSE) AS "waitOutcomeTaskIdsMatch",
+        COALESCE(wait."result"->'outcome'->'matchedTaskIds' = wait."matchedTaskIds", FALSE) AS "waitOutcomeMatchedTaskIdsMatch",
         COALESCE(jsonb_array_length(CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN wait."targetTaskIds" ELSE '[]'::jsonb END) BETWEEN 1 AND 8
           AND jsonb_array_length(CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN wait."targetTaskIds" ELSE '[]'::jsonb END)
             = (SELECT COUNT(DISTINCT target."id") FROM jsonb_array_elements(CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN wait."targetTaskIds" ELSE '[]'::jsonb END) AS target("id") WHERE jsonb_typeof(target."id") = 'string')
