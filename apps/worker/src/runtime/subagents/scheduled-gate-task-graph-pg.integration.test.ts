@@ -3,6 +3,8 @@ import { readFileSync } from "node:fs"
 import { spawn, type ChildProcess } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { once } from "node:events"
+import { hashApprovalNonce, hashApprovalScope } from "@jobcopilot/agent-protocol"
+import { hashAgentReceiptValue } from "@jobcopilot/shared"
 import { Queue } from "bullmq"
 import Redis from "ioredis"
 import { Pool, type PoolClient } from "pg"
@@ -459,15 +461,33 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
     const approvalId = `scheduled-gate-stop-approval-${randomUUID()}`
     const approvalItemId = `agent-wait:approval:${approvalId}`
     const approvalToolCallId = `scheduled-gate-stop-call-${randomUUID()}`
+    const approvalJobId = fixture.preparedJobIds[0]!
+    const resourceHash = await hashAgentReceiptValue("resource", { jobId: approvalJobId })
+    const materialHash = await hashAgentReceiptValue("material", { jobId: approvalJobId, resume: "fixture-resume" })
+    const answersHash = await hashAgentReceiptValue("answers", null)
+    const nonceHash = await hashApprovalNonce(`scheduled-gate-stop-nonce-${randomUUID()}`)
+    const approvalRevision = 0
+    const approvalExpiresAt = new Date(Date.now() + 60 * 60_000)
+    const scopeHash = await hashApprovalScope({ userId: fixture.ids.userId, sessionId: fixture.ids.sessionId,
+      turnId: successor.turnId, jobId: approvalJobId, toolCallId: approvalToolCallId, action: "review_application",
+      resourceHash, materialHash, answersHash, revision: approvalRevision, nonceHash,
+      expiresAt: approvalExpiresAt.toISOString() })
+    const approvalImpact = { externalSubmission: false, jobId: approvalJobId }
     await pool.query(`INSERT INTO "agent_approvals"
-      ("id", "sessionId", "userId", "turnId", "type", "status", "title", "body", "payload")
-      VALUES ($1, $2, $3, $4, 'review_application', 'pending', 'Review', 'Review this application', '{}'::jsonb)`,
-    [approvalId, fixture.ids.sessionId, fixture.ids.userId, successor.turnId])
+      ("id", "sessionId", "userId", "turnId", "toolCallId", "jobId", "type", "status", "title", "body",
+        "impact", "payload", "resourceHash", "materialHash", "answersHash", "scopeHash", "nonceHash", "revision", "expiresAt")
+      VALUES ($1, $2, $3, $4, $5, $6, 'review_application', 'pending', 'Review', 'Review this application',
+        $7::jsonb, $8::jsonb, $9, $10, $11, $12, $13, $14, $15)`,
+    [approvalId, fixture.ids.sessionId, fixture.ids.userId, successor.turnId, approvalToolCallId, approvalJobId,
+      JSON.stringify(approvalImpact), JSON.stringify({ jobId: approvalJobId }), resourceHash, materialHash, answersHash,
+      scopeHash, nonceHash, approvalRevision, approvalExpiresAt])
     await pool.query(`INSERT INTO "agent_items"
       ("id", "sessionId", "turnId", "type", "status", "revision", "content", "createdAt", "updatedAt")
       VALUES ($1, $2, $3, 'approval_request', 'started', 0, $4::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
     [approvalItemId, fixture.ids.sessionId, successor.turnId,
-      JSON.stringify({ approvalId, toolCallId: approvalToolCallId })])
+      JSON.stringify({ waitKind: "approval", approvalId, toolCallId: approvalToolCallId, action: "review_application",
+        title: "Review", body: "Review this application", impact: approvalImpact, scopeHash,
+        receiptRevision: approvalRevision, expiresAt: approvalExpiresAt.toISOString(), decision: null, responseAvailable: false })])
 
     const successorStopId = `scheduled-gate-stop-filter-${randomUUID()}`
     await expect(service.interrupt({ sessionId: fixture.ids.sessionId, userId: fixture.ids.userId,
