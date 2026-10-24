@@ -103,6 +103,8 @@ export type TaskGraphScheduledGateCompletionInput = Readonly<{
   executionOwner: ScheduledTaskGraphExecutionOwner
   prepareProof: ScheduledPrepareTaskGraphProof
 }>
+export type ScheduledGateCheckpointEvidence = NonNullable<ReturnType<typeof scheduledAnalyzeCheckpointEvidence>>
+  & Readonly<{ prepareWaitContinuationKey: string }>
 
 /** The private registration command constructs this fixed server-owned leaf, never caller-supplied node content. */
 export function scheduledGateProposal(expectedRevision: number): TaskGraphProposal {
@@ -112,10 +114,13 @@ export function scheduledGateProposal(expectedRevision: number): TaskGraphPropos
 }
 
 /** Reuses the Analyze checkpoint validator while accepting only its persisted Gate-stage projection. */
-export function scheduledGateCheckpointEvidence(value: unknown): ReturnType<typeof scheduledAnalyzeCheckpointEvidence> {
+export function scheduledGateCheckpointEvidence(value: unknown): ScheduledGateCheckpointEvidence | null {
   const state = safeRecord(value)
   if (!state || state.nextStage !== "gate") return null
-  return scheduledAnalyzeCheckpointEvidence({ ...state, nextStage: "prepare" })
+  const evidence = scheduledAnalyzeCheckpointEvidence({ ...state, nextStage: "prepare" })
+  const continuation = safeRecord(state.scheduledTaskGraphContinuation)
+  return evidence && typeof continuation?.key === "string"
+    ? { ...evidence, prepareWaitContinuationKey: continuation.key } : null
 }
 
 /** Projects only jobs whose exact persisted Prepare result says material preparation succeeded. */

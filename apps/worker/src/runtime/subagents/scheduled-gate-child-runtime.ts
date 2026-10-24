@@ -142,7 +142,7 @@ async function loadInvocation(pool: Pick<pg.Pool, "connect">, lease: SubagentLea
     }
     const prepareProof = await loadPersistedScheduledPrepareProof(client,
       { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId!, rootTaskId: lease.rootTaskId },
-      prepareNode.taskId, prepareTask.result, evidence.continuationKey, registration.prepareWaitId)
+      prepareNode.taskId, prepareTask.result, evidence.prepareWaitContinuationKey, registration.prepareWaitId)
     if (!prepareProof || !scheduledGatePreparedJobIds(prepareProof) || prepareProof.completion.wait.waitId !== registration.prepareWaitId
       || registration.prepareScheduleRevision !== prepareProof.receipt.prepareScheduleRevision
       || !samePreparedLineage(prepareProof, registration)
@@ -245,7 +245,7 @@ async function validateAnalyzePrefix(client: Queryable, lease: SubagentLease, ro
       turnLeaseVersion: attestation.owner.turnLeaseVersion, parentLeaseOwner: attestation.owner.turnLeaseOwnerId,
       parentAttemptCount: attestation.owner.rootAttemptCount },
     executionOwner: { executionId: String(row.executionId), executionAttemptCount: Number(row.executionAttemptCount) },
-    handoff: { status: "analyze_checkpointed" as const, continuationKey: evidence.continuationKey,
+    handoff: { status: "analyze_checkpointed" as const, continuationKey: evidence.prepareWaitContinuationKey,
       checkpointDigest: evidence.checkpointDigest, claimTokenDigest: `sha256:${createHash("sha256").update(token).digest("hex")}`,
       executionId: String(row.executionId), executionAttemptCount: Number(row.executionAttemptCount) },
     attestation, proposal,

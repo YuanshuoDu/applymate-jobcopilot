@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { scheduledGateCandidateSetDigest, SCHEDULED_GATE_OUTPUT_SCHEMA } from "./scheduled-gate-contract.js"
+import { parseScheduledGateRegistrationReceipt } from "./scheduled-gate-registration-receipt.js"
 import { createScheduledGateChildExecutor } from "./scheduled-gate-child-runtime.js"
 import type { ScheduledPipelineGateResponse } from "./scheduled-pipeline-handoff.js"
 import type { ScheduledAutomationPipelineAttestation, ScheduledAutomationPipelineBridgeScope } from "./scheduled-automation-pipeline-bridge.js"
@@ -88,19 +89,22 @@ const question = {
 const NO_WAIT = Symbol("no persisted root question wait")
 
 function productionLoaderFixture(waitId: unknown = "agent-question:turn-1:canonical:root-wait", requireApproval = true) {
+  const handoffKey = `scheduled-taskgraph:sha256:${"f".repeat(64)}`
   const storedOwner = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
     rootAttemptCount: owner.rootAttemptCount, turnLeaseOwnerId: "expired-root-worker", turnLeaseVersion: 9,
     executionId: "execution-1", executionAttemptCount: 5 }
   const checkpoint = { ...(waitId === NO_WAIT ? {} : { scheduledTaskGraphScheduledWaitId: waitId }),
     scheduledTaskGraphClaim: { claimToken: "claim-token" },
-    scheduledTaskGraphContinuation: { owner: storedOwner } }
+    scheduledTaskGraphContinuation: { key: handoffKey, owner: storedOwner } }
   const snapshot = { schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1", targetRoles: ["Engineer"],
     targetLocations: ["Dublin"], minScore: 70, dailyCap: 2, requireApproval, autoApply: false }
   const evidence = { owner: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
     rootTaskId: owner.rootTaskId, rootAttemptCount: owner.rootAttemptCount, executionId: "execution-1", executionAttemptCount: 5 },
     continuationKey: `scheduled-taskgraph:sha256:${"b".repeat(64)}`, snapshotDigest: digest, evidenceDigest: "c".repeat(64),
-    checkpointDigest: "d".repeat(64), analyzeGraphRevision: 4 }
-  const registration = { ...evidence, schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-binding.v1",
+    checkpointDigest: "d".repeat(64), analyzeGraphRevision: 4, prepareWaitContinuationKey: handoffKey }
+  const registration = { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-binding.v1", owner: evidence.owner,
+    continuationKey: evidence.continuationKey, snapshotDigest: evidence.snapshotDigest, evidenceDigest: evidence.evidenceDigest,
+    checkpointDigest: evidence.checkpointDigest, analyzeGraphRevision: evidence.analyzeGraphRevision,
     prepareScheduleRevision: 5, prepareWaitId: "prepare-dependency-wait", gateTaskId: "gate-task-1", gateAppendRevision: 6 }
   const prepare = { receipt: { owner: storedOwner, continuationKey: evidence.continuationKey, snapshotDigest: evidence.snapshotDigest,
       evidenceDigest: evidence.evidenceDigest, checkpointDigest: evidence.checkpointDigest, analyzeGraphRevision: 4, prepareScheduleRevision: 5 },
@@ -146,7 +150,7 @@ function productionLoaderFixture(waitId: unknown = "agent-question:turn-1:canoni
     if (sql.includes('FROM "agent_wait_conditions"')) return { rows: [{ stepId: "prepare-step" }] }
     throw new Error(`unexpected fixed Gate loader query: ${sql}`)
   }), release: vi.fn() }
-  return { pool: { connect: async () => client }, client, storedOwner, registration }
+  return { pool: { connect: async () => client }, client, storedOwner, registration, evidence, handoffKey }
 }
 
 afterEach(() => {
@@ -191,7 +195,8 @@ describe("fixed scheduled Gate child runtime", () => {
   })
 
   it("loads the production checkpoint after a suspended Root wait and forwards its root wait, not the Prepare dependency wait", async () => {
-    const { pool, client, storedOwner, registration } = productionLoaderFixture()
+    const { pool, client, storedOwner, registration, evidence, handoffKey } = productionLoaderFixture()
+    expect(parseScheduledGateRegistrationReceipt(registration)).toEqual(registration)
     handoff.post.mockResolvedValue(completed)
     const executor = createScheduledGateChildExecutor({ pool: pool as never,
       loadChoices: async () => ({ validatedChoice: null, priorChoices: [] }) })
@@ -201,7 +206,31 @@ describe("fixed scheduled Gate child runtime", () => {
     expect(handoff.post.mock.calls[0]?.[0]).toMatchObject({
       scheduledWaitId: "agent-question:turn-1:canonical:root-wait", gateLeaseOwnerId: "worker-gate-1", gateAttemptCount: 3,
     })
+    expect(evidence.continuationKey).not.toBe(handoffKey)
+    expect(loader.prepareProof).toHaveBeenCalledWith(expect.anything(), expect.anything(), "prepare-task", null,
+      handoffKey, registration.prepareWaitId)
+    const analyzeInput = loader.analyzeMatches.mock.calls[0]?.[0] as { handoff: { continuationKey: string } }
+    expect(analyzeInput.handoff.continuationKey).toBe(handoffKey)
+    expect(analyzeInput.handoff.continuationKey).not.toBe(evidence.continuationKey)
     expect(handoff.post.mock.calls[0]?.[0]).toHaveProperty("prepareProof.receipt.owner.turnLeaseOwnerId", storedOwner.turnLeaseOwnerId)
+  })
+
+  it("rejects a mismatched recovered Prepare-wait handoff key before Web dispatch", async () => {
+    const fixture = productionLoaderFixture()
+    const wrongKey = `scheduled-taskgraph:sha256:${"e".repeat(64)}`
+    loader.checkpoint.mockReturnValue({ ...fixture.evidence, prepareWaitContinuationKey: wrongKey })
+    loader.analyzeMatches.mockImplementation((candidate: unknown) => {
+      const input = candidate as { handoff?: { continuationKey?: unknown } }
+      return input.handoff?.continuationKey === fixture.handoffKey ? "analyst" : null
+    })
+    const executor = createScheduledGateChildExecutor({ pool: fixture.pool as never,
+      loadChoices: async () => ({ validatedChoice: null, priorChoices: [] }) })
+    await expect(executor({ lease: lease() })).resolves.toMatchObject({
+      status: "failed", failureReason: "scheduled_gate_analyze_proof_invalid", retryDisposition: "terminal",
+    })
+    expect(handoff.post).not.toHaveBeenCalled()
+    expect(loader.prepareProof).toHaveBeenCalledWith(expect.anything(), expect.anything(), "prepare-task", null,
+      wrongKey, fixture.registration.prepareWaitId)
   })
 
   it("rejects malformed persisted root wait identity while preserving absence when approval is disabled", async () => {

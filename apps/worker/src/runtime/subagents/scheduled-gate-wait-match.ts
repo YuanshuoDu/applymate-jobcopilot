@@ -117,7 +117,7 @@ async function registeredPrepareProof(client: Queryable, scope: ScheduledPrepare
     || receipt.gateAppendRevision <= completion.graphRevision
     || receipt.gateAppendRevision > Number(graph.state?.revision)) return null
   const proof = await loadPersistedScheduledPrepareProof(client, scope, String(prepareTask.id), prepareTask.result,
-    evidence.continuationKey, receipt.prepareWaitId)
+    evidence.prepareWaitContinuationKey, receipt.prepareWaitId)
   return proof && receipt.prepareScheduleRevision === proof.receipt.prepareScheduleRevision
     && receipt.prepareWaitId === proof.completion.wait.waitId
     && gateAppendRevisionMatches(graph, gateTaskId, gateRow, receipt.gateAppendRevision, scope.rootTaskId) ? proof : null

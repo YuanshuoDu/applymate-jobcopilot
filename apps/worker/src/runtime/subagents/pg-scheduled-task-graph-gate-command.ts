@@ -42,13 +42,13 @@ export async function appendScheduledGate(client: Queryable, input: TaskGraphSch
   if (gateNode) {
     const prior = await readScheduledGateRegistrationReceipt(client, { userId: input.scope.userId,
       sessionId: input.scope.sessionId, turnId: input.scope.turnId, owner: stableOwner(owner), gateTaskId: gateNode.taskId })
-    if (!prior || !sameRegistration(prior, input, contract.binding, prep.proof)
+    if (!prior || !sameRegistration(prior, input, contract.binding, contract.receipt.continuationKey, prep.proof)
       || !(await verifyPersistedScheduledPreparePrefix(client, input.scope, loaded, prep.proof))) throw invalid("receipt_conflict")
     await verifyGateReplayPolicy(client, input.scope, loaded, gateNode.taskId, prior.gateAppendRevision)
     await requireClaim(client, input, contract.binding, contract.claimTokenDigest, true)
     return replay(loaded, gateNode.taskId)
   }
-  if (await hasOrphanRegistration(client, input.scope, contract.binding.continuationKey)) throw invalid("receipt_conflict")
+  if (await hasOrphanRegistration(client, input.scope, contract.receipt.continuationKey)) throw invalid("receipt_conflict")
   if (loaded.snapshot.nodes.length !== 3 || loaded.state.revision !== proofRevision
     || !(await verifyPersistedScheduledPreparePrefix(client, input.scope, loaded, prep.proof))) throw invalid("prepare_mismatch")
   await requireClaim(client, input, contract.binding, contract.claimTokenDigest)
@@ -73,10 +73,10 @@ export async function appendScheduledGate(client: Queryable, input: TaskGraphSch
   await writePlanReceipt(client, { scope: input.scope, state, snapshot, expectedRevision: loaded.state.revision, now: new Date(),
     idempotencyKey: taskGraphProposalKey(input.scope.rootTaskId, proofRevision),
     fingerprint: taskGraphFingerprint({ proposal: input.proposal, prepareWaitId: prep.proof.completion.wait.waitId,
-      continuationKey: contract.binding.continuationKey }), receipt })
+      continuationKey: contract.receipt.continuationKey }), receipt })
   await enqueueGraphTask(client, input.scope.sessionId, child)
   const binding: ScheduledGateRegistrationReceipt = { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-binding.v1",
-    owner: stableOwner(owner), continuationKey: contract.binding.continuationKey, snapshotDigest: contract.binding.snapshotDigest,
+    owner: stableOwner(owner), continuationKey: contract.receipt.continuationKey, snapshotDigest: contract.binding.snapshotDigest,
     evidenceDigest: contract.binding.evidenceDigest, checkpointDigest: contract.binding.checkpointDigest,
     analyzeGraphRevision: contract.binding.analyzeGraphRevision, prepareScheduleRevision: contract.binding.prepareScheduleRevision,
     prepareWaitId: prep.proof.completion.wait.waitId, gateTaskId: child.id, gateAppendRevision: state.revision }
@@ -172,9 +172,10 @@ function replay(loaded: LoadedGraph, taskId: string): TaskGraphScheduleReceipt {
 }
 
 function sameRegistration(prior: ScheduledGateRegistrationReceipt, input: TaskGraphScheduledGateInput,
-  binding: NonNullable<ReturnType<typeof createScheduledTaskGraphContinuationContract>>["binding"], proof: NonNullable<PreparedProof>): boolean {
+  binding: NonNullable<ReturnType<typeof createScheduledTaskGraphContinuationContract>>["binding"],
+  stableContinuationKey: string, proof: NonNullable<PreparedProof>): boolean {
   return canonicalTaskGraphJson(prior.owner) === canonicalTaskGraphJson(stableOwner(binding.owner))
-    && prior.continuationKey === binding.continuationKey && prior.snapshotDigest === binding.snapshotDigest
+    && prior.continuationKey === stableContinuationKey && prior.snapshotDigest === binding.snapshotDigest
     && prior.evidenceDigest === binding.evidenceDigest && prior.checkpointDigest === binding.checkpointDigest
     && prior.analyzeGraphRevision === binding.analyzeGraphRevision && prior.prepareScheduleRevision === binding.prepareScheduleRevision
     && prior.prepareWaitId === proof.completion.wait.waitId && input.proposal.expectedRevision === proof.completion.graphRevision

@@ -159,6 +159,7 @@ function setup() {
 function attachGate(input: ScheduledTaskGraphGateInputRequest, proof: ReturnType<typeof makeProof>, graph: Record<string, unknown>, attestation: Record<string, unknown>,
   overrides: { receipt?: Record<string, unknown>; wait?: Record<string, unknown> } = {}) {
   const gateTaskId = 'gate-task', continuationKey = String(proof.receipt.continuationKey)
+  const marker = (input.analyzeCheckpoint as { scheduledTaskGraphContinuation: { key: string } }).scheduledTaskGraphContinuation
   const stableOwner = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
     rootAttemptCount: owner.rootAttemptCount, executionId: owner.executionId, executionAttemptCount: owner.executionAttemptCount }
   const receipt = { schemaVersion: 'agent-harness.v2.scheduled-taskgraph-gate-binding.v1', owner: stableOwner, continuationKey,
@@ -167,7 +168,7 @@ function attachGate(input: ScheduledTaskGraphGateInputRequest, proof: ReturnType
     prepareWaitId: proof.completion.wait.waitId, gateTaskId, gateAppendRevision: proof.completion.graphRevision + 1, ...overrides.receipt }
   const eventKey = `scheduled-gate-binding:${createHash('sha256').update(JSON.stringify([continuationKey, gateTaskId]), 'utf8').digest('hex')}`
   const event = { itemId: null, taskId: null, actor: 'system', idempotencyKey: eventKey, payload: receipt, hasOutbox: false }
-  const stepId = 'prepare-root-step', waitKey = `scheduled-prepare-dependency:${createHash('sha256').update(`${continuationKey}\0${stepId}`, 'utf8').digest('hex')}`
+  const stepId = 'prepare-root-step', waitKey = `scheduled-prepare-dependency:${createHash('sha256').update(`${marker.key}\0${stepId}`, 'utf8').digest('hex')}`
   const wait = { id: receipt.prepareWaitId, userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, parentTaskId: owner.rootTaskId,
     stepId, idempotencyKey: waitKey, targetTaskIds: ['prepare-task'], mode: 'all', status: 'ready', matchedTaskIds: ['prepare-task'],
     result: { request: { targetTaskIds: ['prepare-task'], mode: 'all', timeoutMs: 86_400_000 } }, stepTaskId: owner.rootTaskId, stepAttempt: 1,
@@ -244,6 +245,8 @@ describe('scheduled TaskGraph Gate input reload', () => {
 
   it('binds Gate registration to the exact ready Prepare wait and its owning step', async () => {
     const valid = setup()
+    const marker = (valid.input.analyzeCheckpoint as { scheduledTaskGraphContinuation: { key: string } }).scheduledTaskGraphContinuation
+    expect(marker.key).not.toBe(valid.proof.receipt.continuationKey)
     await expect(loadScheduledTaskGraphGateInput(attachGate(valid.input, valid.proof, valid.graph, valid.analyzeAttestation)))
       .resolves.toMatchObject({ packages: [{ jobId: jobRow.id }] })
 

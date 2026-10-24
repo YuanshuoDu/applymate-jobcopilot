@@ -82,7 +82,7 @@ const loadedGate = { rootTaskId: owner.rootTaskId, item: { id: "graph", revision
 const registration = { schemaVersion: SCHEDULED_GATE_REGISTRATION_RECEIPT_SCHEMA, owner: {
   userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
   rootAttemptCount: owner.rootAttemptCount, executionId: owner.executionId, executionAttemptCount: owner.executionAttemptCount },
-  continuationKey, snapshotDigest: binding.snapshotDigest, evidenceDigest: binding.evidenceDigest, checkpointDigest: binding.checkpointDigest,
+  continuationKey: stableReceiptKey, snapshotDigest: binding.snapshotDigest, evidenceDigest: binding.evidenceDigest, checkpointDigest: binding.checkpointDigest,
   analyzeGraphRevision: 7, prepareScheduleRevision: 8, prepareWaitId: "prepare-wait", gateTaskId: "gate-task", gateAppendRevision: 11 }
 
 function database(graph: typeof loadedGate | ReturnType<typeof baseGraph>, allowedActions: unknown = []) {
@@ -162,21 +162,22 @@ describe("scheduled Gate append claim replay", () => {
     expect(mocks.registration).not.toHaveBeenCalled()
   })
 
-  it("validates the Prepare wait with the handoff key, distinct from the stable receipt key", async () => {
+  it("loads the Prepare wait with the handoff key while replaying the stable receipt identity", async () => {
     expect(continuationReceipt.continuationKey).not.toBe(continuationKey)
     mocks.prepareProof.mockImplementation(async (_client, _scope, _taskId, _result, key, waitId) =>
       key === continuationKey && waitId === "prepare-wait" ? proof : null)
-    const db = database(baseGraph())
-    await expect(appendScheduledGate(db.client as never, input)).rejects.toMatchObject({ code: "scheduled_gate_claim_stale" })
+    const db = database(loadedGate)
+    await expect(appendScheduledGate(db.client as never, input)).resolves.toMatchObject({ status: "duplicate", nodes: [{ taskId: "gate-task" }] })
     expect(mocks.prepareProof).toHaveBeenCalledWith(db.client, scope, "prepare-task", preparedTask.result, continuationKey, "prepare-wait")
     expect(db.calls.some(sql => /^\s*(INSERT|UPDATE|DELETE)\b/i.test(sql))).toBe(false)
+    expect(mocks.registration).toHaveBeenCalledWith(db.client, expect.objectContaining({ gateTaskId: "gate-task" }))
 
     mocks.prepareProof.mockClear()
-    mocks.contract.mockReturnValue({ ...contract, binding: { ...binding, continuationKey: stableReceiptKey } })
-    const wrongKeyDb = database(baseGraph())
-    await expect(appendScheduledGate(wrongKeyDb.client as never, input)).rejects.toMatchObject({ code: "scheduled_gate_prepare_proof" })
+    mocks.registration.mockResolvedValue({ ...registration, continuationKey })
+    const wrongKeyDb = database(loadedGate)
+    await expect(appendScheduledGate(wrongKeyDb.client as never, input)).rejects.toMatchObject({ code: "scheduled_gate_receipt_conflict" })
     expect(mocks.prepareProof).toHaveBeenCalledWith(wrongKeyDb.client, scope, "prepare-task", preparedTask.result,
-      stableReceiptKey, "prepare-wait")
+      continuationKey, "prepare-wait")
     expect(wrongKeyDb.calls.some(sql => /^\s*(INSERT|UPDATE|DELETE)\b/i.test(sql))).toBe(false)
   })
 })

@@ -79,7 +79,7 @@ export async function validateScheduledGateTaskGraphFinish(client: Queryable, in
       maxAttempts: Number(lease.maxAttempts), requestAttemptCount: latestResumeRequest(loaded.state.appliedEvents),
       currentAttemptCount: attemptCount, currentStatus: "running", events: loaded.state.appliedEvents })) return null
   const proof = await loadPersistedScheduledPrepareProof(client, graph.scope, prepare.id, prepare.result,
-    evidence.continuationKey, registration.prepareWaitId)
+    evidence.prepareWaitContinuationKey, registration.prepareWaitId)
   const expectedJobIds = proof && scheduledGatePreparedJobIds(proof)
   if (!proof || !expectedJobIds || registration.prepareWaitId !== proof.completion.wait.waitId
     || !await verifyPersistedScheduledPreparePrefix(client, graph.scope, loaded, proof)) return null
@@ -156,7 +156,7 @@ export async function verifyScheduledGateCompletion(client: Queryable,
     || receipt.evidenceDigest !== evidence.evidenceDigest || receipt.checkpointDigest !== evidence.checkpointDigest
     || receipt.analyzeGraphRevision !== evidence.analyzeGraphRevision || receipt.owner.rootAttemptCount !== evidence.owner.rootAttemptCount) return null
   const proof = await loadPersistedScheduledPrepareProof(client, graphScope, prepareTask.id, prepareTask.result,
-    evidence.continuationKey, receipt.prepareWaitId)
+    evidence.prepareWaitContinuationKey, receipt.prepareWaitId)
   if (!proof || !same(input.prepareProof, proof)) return null
   const expectedJobIds = proof && scheduledGatePreparedJobIds(proof)
   const envelope = expectedJobIds && parseScheduledGateTaskEnvelope(gate.result, gate.status, expectedJobIds)

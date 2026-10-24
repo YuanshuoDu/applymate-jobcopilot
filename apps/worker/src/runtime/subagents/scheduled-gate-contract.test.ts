@@ -169,10 +169,14 @@ describe("scheduled Gate public contract", () => {
         snapshotDigest: `sha256:${"b".repeat(64)}`, graphRevision: 2, evidenceDigest: "c".repeat(64),
       },
     }
-    expect(scheduledGateCheckpointEvidence(state)).toMatchObject({
-      owner: { userId: "user-1", executionId: "execution-1" }, analyzeGraphRevision: 2,
-    })
+    const evidence = scheduledGateCheckpointEvidence(state)
+    expect(evidence).toMatchObject({ owner: { userId: "user-1", executionId: "execution-1" }, analyzeGraphRevision: 2,
+      prepareWaitContinuationKey: state.scheduledTaskGraphContinuation.key })
+    expect(evidence?.prepareWaitContinuationKey).not.toBe(evidence?.continuationKey)
     expect(scheduledGateCheckpointEvidence({ ...state, nextStage: "prepare" })).toBeNull()
     expect(scheduledGateCheckpointEvidence({ ...state, analysisFailed: 1 })).toBeNull()
+    expect(scheduledGateCheckpointEvidence({ ...state, scheduledTaskGraphContinuation: {
+      ...state.scheduledTaskGraphContinuation, key: "malformed-handoff-key",
+    } })).toBeNull()
   })
 })

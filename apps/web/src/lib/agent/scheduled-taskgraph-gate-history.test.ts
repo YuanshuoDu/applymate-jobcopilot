@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import type { Prisma } from '@prisma/client'
 import { describe, expect, it, vi } from 'vitest'
-import { scheduledTaskGraphGateHistoryIsCurrent } from './scheduled-taskgraph-gate-history'
+import { scheduledTaskGraphGateBindingIsCurrent, scheduledTaskGraphGateHistoryIsCurrent } from './scheduled-taskgraph-gate-history'
 
 const owner = { userId: 'user-1', sessionId: 'session-1', turnId: 'turn-1', rootTaskId: 'root-1',
   rootAttemptCount: 1, turnLeaseOwnerId: 'root-lease', turnLeaseVersion: 1, executionId: 'execution-1', executionAttemptCount: 1 }
@@ -60,6 +60,18 @@ function fixture(maxAttempts = 3) {
 }
 
 describe('scheduled TaskGraph Gate lifecycle history', () => {
+  it('binds the Prepare wait to the validated handoff key, not the stable receipt key', async () => {
+    const { input, queryRaw, prepareHandoffKey, stableReceiptKey } = bindingFixture()
+    expect(prepareHandoffKey).not.toBe(stableReceiptKey)
+    await expect(scheduledTaskGraphGateBindingIsCurrent(input)).resolves.toBe(true)
+    expect(queryRaw).toHaveBeenCalledTimes(2)
+  })
+
+  it('rejects a Prepare wait hashed from the stable receipt key', async () => {
+    const { input } = bindingFixture(stableReceiptKeyForBinding)
+    await expect(scheduledTaskGraphGateBindingIsCurrent(input)).resolves.toBe(false)
+  })
+
   it('accepts a persisted retrying-to-started chain when the later attempt completes', async () => {
     const { input, findMany } = fixture()
     const result = await scheduledTaskGraphGateHistoryIsCurrent(input)
@@ -72,6 +84,39 @@ describe('scheduled TaskGraph Gate lifecycle history', () => {
     await expect(scheduledTaskGraphGateHistoryIsCurrent(input)).resolves.toBe(false)
   })
 })
+
+const prepareHandoffKey = `scheduled-taskgraph:sha256:${'a'.repeat(64)}`
+const stableReceiptKeyForBinding = `scheduled-taskgraph:sha256:${'b'.repeat(64)}`
+
+function bindingFixture(waitKeyContinuation = prepareHandoffKey) {
+  const bindingOwner = { userId: 'user-1', sessionId: 'session-1', turnId: 'turn-1', rootTaskId: 'root-1',
+    rootAttemptCount: 1, executionId: 'execution-1', executionAttemptCount: 1 }
+  const marker = { key: prepareHandoffKey, snapshotDigest: `sha256:${'c'.repeat(64)}`,
+    evidenceDigest: 'd'.repeat(64), graphRevision: 9 }
+  const checkpointDigest = `sha256:${'e'.repeat(64)}`
+  const proof = { receipt: { continuationKey: stableReceiptKeyForBinding, snapshotDigest: marker.snapshotDigest,
+    evidenceDigest: marker.evidenceDigest, checkpointDigest, analyzeGraphRevision: marker.graphRevision, prepareScheduleRevision: 10 },
+    completion: { wait: { waitId: 'prepare-wait-1' } }, graphRevision: 11, result: { taskId: 'prepare-task-1' } }
+  const gate = { taskId: 'gate-task-1', attemptCount: 1, phase: 'running' as const }
+  const eventKey = `scheduled-gate-binding:${createHash('sha256').update(JSON.stringify([stableReceiptKeyForBinding, gate.taskId]), 'utf8').digest('hex')}`
+  const event = { itemId: null, taskId: null, actor: 'system', idempotencyKey: eventKey, hasOutbox: false,
+    payload: { schemaVersion: 'agent-harness.v2.scheduled-taskgraph-gate-binding.v1', owner: bindingOwner,
+      continuationKey: stableReceiptKeyForBinding, snapshotDigest: marker.snapshotDigest, evidenceDigest: marker.evidenceDigest,
+      checkpointDigest, analyzeGraphRevision: marker.graphRevision, prepareScheduleRevision: 10,
+      prepareWaitId: 'prepare-wait-1', gateTaskId: gate.taskId, gateAppendRevision: 12 } }
+  const stepId = 'root-step-1'
+  const waitKey = `scheduled-prepare-dependency:${createHash('sha256').update(`${waitKeyContinuation}\0${stepId}`, 'utf8').digest('hex')}`
+  const wait = { id: 'prepare-wait-1', userId: bindingOwner.userId, sessionId: bindingOwner.sessionId,
+    turnId: bindingOwner.turnId, parentTaskId: bindingOwner.rootTaskId, stepId, idempotencyKey: waitKey,
+    targetTaskIds: ['prepare-task-1'], mode: 'all', status: 'ready', matchedTaskIds: ['prepare-task-1'],
+    result: { request: { targetTaskIds: ['prepare-task-1'], mode: 'all', timeoutMs: 86_400_000 } },
+    stepTaskId: bindingOwner.rootTaskId, stepAttempt: 1 }
+  const queryRaw = vi.fn().mockResolvedValueOnce([event]).mockResolvedValueOnce([wait])
+  const input = { reader: { $queryRaw: queryRaw } as unknown as Prisma.TransactionClient,
+    owner: { ...bindingOwner, turnLeaseOwnerId: 'root-lease', turnLeaseVersion: 1 }, marker, checkpointDigest,
+    proof: proof as unknown as Parameters<typeof scheduledTaskGraphGateBindingIsCurrent>[0]['proof'], gate }
+  return { input, queryRaw, prepareHandoffKey, stableReceiptKey: stableReceiptKeyForBinding }
+}
 
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`

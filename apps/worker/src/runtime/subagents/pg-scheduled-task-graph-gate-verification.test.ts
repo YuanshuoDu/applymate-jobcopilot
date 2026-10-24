@@ -39,8 +39,9 @@ const owner = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", root
 const scope = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
   parentTaskId: owner.rootTaskId, turnLeaseOwner: "turn-owner", turnLeaseVersion: 5, parentLeaseOwner: "root-owner", parentAttemptCount: 2 }
 const continuationKey = "scheduled-taskgraph:sha256:" + "a".repeat(64)
+const prepareWaitContinuationKey = "scheduled-taskgraph:sha256:" + "f".repeat(64)
 const snapshotDigest = "sha256:" + "b".repeat(64)
-const evidence = { owner, continuationKey, snapshotDigest, evidenceDigest: "c".repeat(64), checkpointDigest: "d".repeat(64), analyzeGraphRevision: 7 }
+const evidence = { owner, continuationKey, prepareWaitContinuationKey, snapshotDigest, evidenceDigest: "c".repeat(64), checkpointDigest: "d".repeat(64), analyzeGraphRevision: 7 }
 const receipt = { schemaVersion: "agent-harness.v2.scheduled-taskgraph-prepare-receipt.v1", owner,
   continuationKey, snapshotDigest, evidenceDigest: evidence.evidenceDigest, checkpointDigest: evidence.checkpointDigest,
   analyzeGraphRevision: evidence.analyzeGraphRevision, prepareScheduleRevision: 8 }
@@ -144,7 +145,8 @@ describe("persisted scheduled Gate completion proof", () => {
     mocks.evidence.mockReturnValue(evidence)
     mocks.jobIds.mockReturnValue(["job-1"])
     mocks.envelope.mockReturnValue({ structuredResult: questionResult })
-    mocks.persistedProof.mockResolvedValue(proof)
+    mocks.persistedProof.mockImplementation(async (_client, _scope, _taskId, _result, key) =>
+      key === prepareWaitContinuationKey ? proof : null)
     mocks.registration.mockResolvedValue(registration)
     mocks.snapshot.mockReturnValue(true)
     mocks.verifyPrepare.mockResolvedValue({ verified: true, facts: proofFacts })
@@ -192,6 +194,8 @@ describe("persisted scheduled Gate completion proof", () => {
     expect(result).toMatchObject({ prepareProof: proof, graphRevision: 20,
       gate: { taskId: "gate-task", attemptCount: 1, resultDigest: scheduledGateResultDigest(gateResult), completedEventRevision: 20 } })
     expect(mocks.persistedProof).toHaveBeenCalledOnce()
+    expect(mocks.persistedProof).toHaveBeenCalledWith(db.client, expect.anything(), "prepare-task",
+      expect.anything(), prepareWaitContinuationKey, "prepare-wait")
   })
 
   it.each(["stale", "different"] as const)("rejects a %s supplied Prepare proof instead of substituting the database proof", async kind => {
@@ -210,6 +214,8 @@ describe("persisted scheduled Gate completion proof", () => {
       taskId: "gate-task", ownerId: "gate-owner", attemptCount: 1, status: "completed", result: gateResult })
     expect(result).toEqual({ structuredResult: questionResult })
     expect(db.query.mock.calls.some(([sql]) => String(sql).includes('"turn"."leaseOwnerId"'))).toBe(false)
+    expect(mocks.persistedProof).toHaveBeenCalledWith(db.client, expect.anything(), "prepare-task",
+      expect.anything(), prepareWaitContinuationKey, "prepare-wait")
   })
 
   it("rejects a Gate finish if the locked Root attempt advanced after Prepare", async () => {

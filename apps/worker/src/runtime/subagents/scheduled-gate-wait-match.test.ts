@@ -49,7 +49,9 @@ const prepareFacts = { schemaVersion: SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA, rece
 const prepareProof = buildScheduledPrepareTaskGraphProof(prepareFacts, { waitId: "prepare-wait-1", status: "ready", mode: "all",
   targetTaskIds: ["prepare-1"], matchedTaskIds: ["prepare-1"] })!
 const prepareStepId = "original-prepare-step"
-const prepareWaitKey = `scheduled-prepare-dependency:${createHash("sha256").update(`${checkpointEvidence.continuationKey}\0${prepareStepId}`, "utf8").digest("hex")}`
+const prepareWaitKeyFor = (continuationKey: string) => `scheduled-prepare-dependency:${createHash("sha256").update(`${continuationKey}\0${prepareStepId}`, "utf8").digest("hex")}`
+const prepareWaitKey = prepareWaitKeyFor(checkpointEvidence.prepareWaitContinuationKey)
+const stableKeyPrepareWaitKey = prepareWaitKeyFor(checkpointEvidence.continuationKey)
 const registrationOwner = { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
   rootAttemptCount: 1, executionId: "execution-1", executionAttemptCount: 2 }
 const registrationReceipt = { schemaVersion: SCHEDULED_GATE_REGISTRATION_RECEIPT_SCHEMA, owner: registrationOwner,
@@ -184,6 +186,15 @@ describe("scheduled Gate durable wait matcher", () => {
     await expect(matchScheduledGateWaitTarget(fixture({ status: "waiting_for_user", attempts: 1, result: {
       ...waitingEnvelope, structuredResult: { ...question, jobIds: ["job-2"], candidateSetDigest: scheduledGateCandidateSetDigest("weak_cover_letter", ["job-2"]) },
     } }) as never, scope)).resolves.toBeNull()
+  })
+
+  it("loads the exact Prepare wait with the Analyze handoff key while binding Gate to the stable receipt key", async () => {
+    expect(checkpointEvidence.prepareWaitContinuationKey).not.toBe(checkpointEvidence.continuationKey)
+    expect(prepareReceipt.continuationKey).toBe(checkpointEvidence.continuationKey)
+    const client = fixture({ status: "waiting_for_user", attempts: 1, result: waitingEnvelope }) as never
+    await expect(matchScheduledGateWaitTarget(client, scope)).resolves.toBe("matched")
+    state.prepareWaitRows[0] = { ...state.prepareWaitRows[0]!, idempotencyKey: stableKeyPrepareWaitKey }
+    await expect(matchScheduledGateWaitTarget(client, scope)).resolves.toBeNull()
   })
 
   it("matches while the exact Root Turn is durably suspended on tool work and accepts JSONB schema key order", async () => {

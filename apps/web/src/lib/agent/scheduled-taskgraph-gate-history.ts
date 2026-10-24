@@ -71,7 +71,8 @@ export async function scheduledTaskGraphGateBindingIsCurrent(input: Readonly<{
     FOR UPDATE OF wait, step
   `)
   const wait = waits[0], request = record(record(wait?.result)?.request), stepId = wait?.stepId
-  const waitKey = typeof stepId === 'string' ? `scheduled-prepare-dependency:${createHash('sha256').update(`${proof.receipt.continuationKey}\0${stepId}`, 'utf8').digest('hex')}` : ''
+  const waitKey = typeof stepId === 'string' && typeof marker.key === 'string'
+    ? `scheduled-prepare-dependency:${createHash('sha256').update(`${marker.key}\0${stepId}`, 'utf8').digest('hex')}` : ''
   return waits.length === 1 && wait?.id === receipt.prepareWaitId && validId(stepId) && wait.idempotencyKey === waitKey
     && (wait.stepTaskId === null || wait.stepTaskId === owner.rootTaskId) && wait.stepAttempt === 1 && wait.mode === 'all'
     && wait.status === 'ready' && sameStrings(wait.targetTaskIds, [proof.result.taskId]) && sameStrings(wait.matchedTaskIds, [proof.result.taskId])
