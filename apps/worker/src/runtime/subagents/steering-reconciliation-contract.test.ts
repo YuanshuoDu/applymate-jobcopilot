@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest"
 import { executionKey } from "../turns/turn-execution-types.js"
 import type { TaskGraphExecutionScope } from "./task-graph-command-port.js"
 import { taskGraphSupersessionProposalKey } from "./task-graph-pg-supersession.js"
+import { TASK_GRAPH_BRANCH_REPAIR_RELATION_SCHEMA_VERSION, taskGraphBranchRepairFingerprint } from "./task-graph-pg-branch-repair-relation.js"
+import { taskGraphProposalKey } from "./task-graph-snapshot.js"
 import {
   parseSteeringReconciliationReceipt,
   steeringReconciliationIdempotencyKey,
@@ -11,6 +13,7 @@ import {
   STEERING_RECONCILIATION_EVENT_TYPE,
   STEERING_RECONCILIATION_SCHEMA_VERSION,
   STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION,
+  STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION,
   STEERING_RECONCILIATION_BLOCKER,
   STEERING_RECONCILIATION_FEEDBACK,
   type SteeringReconciliationReceipt,
@@ -47,6 +50,36 @@ function v2Receipt(relation: unknown = supersession()) {
   return { ...receipt({ decision: "revise", observedRevision: 0, resultingRevision: 2 }),
     schemaVersion: STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION, supersession: relation }
 }
+function branchRepair() {
+  const replaceBranch = {
+    root: { nodeKey: "scout-old", taskId: "scout-old-task" },
+    sources: [
+      { nodeKey: "scout-old", taskId: "scout-old-task", replacementKey: "scout-new" },
+      { nodeKey: "analyst-old", taskId: "analyst-old-task", replacementKey: "analyst-new" },
+    ],
+  }
+  const call = { expectedRevision: 4, replaceBranch, nodes: [{ key: "scout-new" }, { key: "analyst-new" }] }
+  const callId = "call-branch-repair"
+  return {
+    schemaVersion: TASK_GRAPH_BRANCH_REPAIR_RELATION_SCHEMA_VERSION,
+    operationKey: steeringReconciliationIdempotencyKey(scope, callId), graphRootTaskId: scope.rootTaskId,
+    observedRevision: 4, resultingRevision: 7, root: replaceBranch.root,
+    sources: [
+      { source: { nodeKey: "scout-old", taskId: "scout-old-task" }, replacementKey: "scout-new", cancellationEvent: { id: "cancel-scout", sequence: "41" } },
+      { source: { nodeKey: "analyst-old", taskId: "analyst-old-task" }, replacementKey: "analyst-new", cancellationEvent: { id: "cancel-analyst", sequence: "42" } },
+    ],
+    planEvent: { id: "plan-branch", sequence: "43", idempotencyKey: taskGraphProposalKey(scope.rootTaskId, 4) },
+    replacementFingerprint: taskGraphBranchRepairFingerprint(call),
+    agentPlanCall: { callId, stepId: scope.stepId, expectedRevision: 4, replaceBranch },
+  }
+}
+function v3Receipt(patch: Record<string, unknown> = {}) {
+  return {
+    ...receipt({ decision: "revise", observedRevision: 4, resultingRevision: 7, steerInputIds: [],
+      inputCheckpoint: { throughSequence: "47" } }),
+    schemaVersion: STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION, branchRepair: branchRepair(), ...patch,
+  }
+}
 
 describe("steering reconciliation receipt contract", () => {
   it("defines fixed redacted recovery vocabulary in the pure contract", () => {
@@ -78,6 +111,28 @@ describe("steering reconciliation receipt contract", () => {
     expect(parseSteeringReconciliationReceipt(receipt({ decision: "revise", observedRevision: 0, resultingRevision: 1 }), scope)).not.toBeNull()
     expect(parseSteeringReconciliationReceipt(receipt({ decision: "revise", observedRevision: 0, resultingRevision: 2 }), scope)).toBeNull()
     expect(parseSteeringReconciliationReceipt(receipt({ resultingRevision: 1 }), scope)).toBeNull()
+  })
+
+  it("accepts a no-steer v3 receipt at the persisted decision-step cursor and keeps real steer IDs when present", () => {
+    const persistedDecisionStep = { inputThroughSequence: 47n }
+    const noSteer = v3Receipt({ inputCheckpoint: { throughSequence: persistedDecisionStep.inputThroughSequence.toString() } })
+    expect(noSteer.steerInputIds).toEqual([])
+    expect(parseSteeringReconciliationReceipt(noSteer, scope)).toEqual(noSteer)
+
+    const steered = v3Receipt({ steerInputIds: ["steer-10", "steer-11"] })
+    expect(parseSteeringReconciliationReceipt(steered, scope)).toEqual(steered)
+  })
+
+  it.each([
+    ["wrong graph root", v3Receipt({ branchRepair: { ...branchRepair(), graphRootTaskId: "foreign-root" } })],
+    ["wrong branch root identity", v3Receipt({ branchRepair: { ...branchRepair(), root: { nodeKey: "other", taskId: "scout-old-task" } } })],
+    ["wrong plan event key", v3Receipt({ branchRepair: { ...branchRepair(), planEvent: { ...branchRepair().planEvent, idempotencyKey: "wrong-key" } } })],
+    ["wrong resulting revision", v3Receipt({ resultingRevision: 8 })],
+    ["wrong step binding", v3Receipt({ branchRepair: { ...branchRepair(), agentPlanCall: { ...branchRepair().agentPlanCall, stepId: "foreign-step" } } })],
+    ["missing steer checkpoint", v3Receipt({ inputCheckpoint: {} })],
+    ["unknown v3 field", { ...v3Receipt(), debug: true }],
+  ] as const)("rejects malformed v3 %s claims", (_name, value) => {
+    expect(parseSteeringReconciliationReceipt(value, scope)).toBeNull()
   })
 
   it.each([

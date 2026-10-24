@@ -21,8 +21,10 @@ import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import {
   parseSteeringReconciliationReceipt, steeringReconciliationId, steeringReconciliationSequence,
   STEERING_RECONCILIATION_EVENT_TYPE, STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION,
+  STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION,
   type SteeringReconciliationScope,
 } from "./steering-reconciliation-contract.js"
+import { assertTaskGraphBranchRepairHistory } from "./steering-reconciliation-branch-repair-history.js"
 
 type Row = Record<string, unknown>
 type Source = Row & { provenance: TaskGraphNativeSourceProvenance }
@@ -186,7 +188,9 @@ async function assertNotSupersededSource(client: Queryable, input: TaskGraphNati
     FROM "agent_events" AS event JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
     JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
     WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."taskId" = $3 AND event."type" = $4
-      AND event."payload"->'supersession'->'source'->>'taskId' = $5
+      AND (event."payload"->'supersession'->'source'->>'taskId' = $5 OR EXISTS (SELECT 1 FROM jsonb_array_elements(
+        CASE WHEN jsonb_typeof(event."payload"->'branchRepair'->'sources') = 'array' THEN event."payload"->'branchRepair'->'sources' ELSE '[]'::jsonb END
+      ) AS binding(value) WHERE binding.value->'source'->>'taskId' = $5))
       AND session."userId" = $6 AND turn."userId" = $6 LIMIT 2`,
   [input.scope.sessionId, input.scope.turnId, input.scope.rootTaskId, STEERING_RECONCILIATION_EVENT_TYPE, taskId, input.scope.userId])
   if (result.rows.length === 0) {
@@ -195,16 +199,23 @@ async function assertNotSupersededSource(client: Queryable, input: TaskGraphNati
   }
   if (result.rows.length !== 1) throw commandError("native_source_unavailable")
   const event = result.rows[0]!, receipt = parseSteeringReconciliationReceipt(event.payload, scope)
-  const relation = receipt?.supersession
+  const relation = receipt?.supersession, branch = receipt?.branchRepair
+  const eventSequence = steeringReconciliationSequence(event.sequence)
   if (!steeringReconciliationId(event.id) || event.itemId !== null || event.taskId !== input.scope.rootTaskId
     || event.type !== STEERING_RECONCILIATION_EVENT_TYPE || event.actor !== "orchestrator"
     || event.correlationId !== input.scope.turnId || event.causationId !== receipt?.stepId
-    || event.hasOutbox !== false || steeringReconciliationSequence(event.sequence) === null
+    || event.hasOutbox !== false || eventSequence === null
     || typeof event.idempotencyKey !== "string" || !receipt
-    || receipt.schemaVersion !== STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION || !relation
-    || relation.source.taskId !== taskId || event.idempotencyKey !== relation.operationKey) {
+    || receipt.schemaVersion === STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION
+      && (!relation || relation.source.taskId !== taskId || event.idempotencyKey !== relation.operationKey)
+    || receipt.schemaVersion === STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION
+      && (!branch || !branch.sources.some(source => source.source.taskId === taskId) || event.idempotencyKey !== branch.operationKey)
+    || receipt.schemaVersion !== STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION
+      && receipt.schemaVersion !== STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION) {
     throw commandError("native_source_unavailable")
   }
+  if (branch) try { await assertTaskGraphBranchRepairHistory(client, { ...scope, stepId: branch.agentPlanCall.stepId }, branch, { id: event.id, sequence: eventSequence }) }
+  catch { throw commandError("native_source_unavailable") }
   throw commandError("native_source_superseded")
 }
 

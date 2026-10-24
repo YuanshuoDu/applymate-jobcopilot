@@ -6,6 +6,7 @@ import { buildCognitiveAgendaReceipt } from "../turns/cognitive-agenda-receipt.j
 import type { StepContext } from "../context/step-context-builder.js"
 import type { TaskGraphExecutionScope } from "./task-graph-command-port.js"
 import { steeringReconciliationIdempotencyKey } from "./steering-reconciliation-contract.js"
+import type { TaskGraphBranchReplacement } from "../planning/task-graph-branch-replacement.js"
 import { taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 import { taskGraphSupersessionFingerprint, taskGraphSupersessionProposalKey } from "./task-graph-pg-supersession.js"
 import { prepareSteeringReconciliation, writeSteeringReconciliationReceipt } from "./steering-reconciliation-ledger.js"
@@ -32,7 +33,7 @@ function accepted(row: ReturnType<typeof input>) {
     acceptedEventSequence: row.acceptedSequence,
     acceptedPayload: { inputId: row.id, clientMessageId: row.clientMessageId, delivery: row.delivery, source: "user", disposition: "steered" } }
 }
-function clientFixture(options: { pending?: boolean; unconsumed?: boolean; decision?: "keep" | "revise"; replaceUnstartedNodeKey?: string } = {}) {
+function clientFixture(options: { pending?: boolean; unconsumed?: boolean; decision?: "keep" | "revise"; replaceUnstartedNodeKey?: string; replaceBranch?: TaskGraphBranchReplacement } = {}) {
   const original = input("original-input", "1", "consumed", "origin-step")
   original.clientMessageId = "root-client-message"
   const steer = input("steer-1", "10", options.unconsumed ? "accepted" : "consumed", options.unconsumed ? null : "origin-step")
@@ -42,14 +43,16 @@ function clientFixture(options: { pending?: boolean; unconsumed?: boolean; decis
   let nextSequence = 22
   const events: Array<Record<string, unknown>> = []
   const toolName = options.decision === "revise" ? "agent.plan" : "agent.reconcile"
+  const planNodes = options.replaceBranch ? options.replaceBranch.sources.map(source => ({ key: source.replacementKey }))
+    : [{ key: "next", templateId: "scout", goal: "new goal", successCriteria: ["new criterion"], dependsOn: [] }]
   const executionIdentity = { kind: "turn" as const, userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
     taskId: scope.rootTaskId, rootTaskId: scope.rootTaskId, ownerId: scope.turnLeaseOwner, leaseVersion: scope.turnLeaseVersion, leaseExpiresAt: new Date(0) }
   const toolCall = { eventId: "tool-event", eventSequence: "20", type: "tool_call.started", actor: "orchestrator", eventTaskId: scope.rootTaskId, eventItemId: "call-item",
     correlationId: "call-1", idempotencyKey: `${executionKey(executionIdentity)}:event:tool-started:call-1`,
     payload: { toolCallId: "call-1", toolName, taskId: scope.rootTaskId }, callItemId: "call-item", stepId: scope.stepId,
     itemTaskId: scope.rootTaskId, itemType: "tool_call", itemContent: { toolCallId: "call-1", toolName,
-      toolVersion: "1", input: options.decision === "revise" ? { expectedRevision: 1, nodes: [{ key: "next", templateId: "scout",
-        goal: "new goal", successCriteria: ["new criterion"], dependsOn: [] }],
+      toolVersion: "1", input: options.decision === "revise" ? { expectedRevision: 1, nodes: planNodes,
+        ...(options.replaceBranch ? { replaceBranch: options.replaceBranch } : {}),
         ...(options.replaceUnstartedNodeKey ? { replaceUnstarted: { nodeKey: options.replaceUnstartedNodeKey } } : {}) } : { decision: "keep", expectedRevision: 1 } } }
   const calls: Array<{ sql: string; values?: unknown[] }> = []
   let supersessionEvents: Array<Record<string, unknown>> = []
@@ -111,9 +114,9 @@ function clientFixture(options: { pending?: boolean; unconsumed?: boolean; decis
   }) } as unknown as Pick<pg.PoolClient, "query">
   return { client, calls, events, setGraphRevision(value: number) { graphRevision = value }, setSupersessionEvents(value: Array<Record<string, unknown>>) { supersessionEvents = value } }
 }
-function operation(decision: "keep" | "revise" = "keep", replaceUnstartedNodeKey?: string) {
+function operation(decision: "keep" | "revise" = "keep", replaceUnstartedNodeKey?: string, replaceBranch?: TaskGraphBranchReplacement) {
   return { scope, decision, expectedRevision: 1, callId: "call-1", rootInputId: null,
-    ...(replaceUnstartedNodeKey ? { replaceUnstartedNodeKey } : {}) }
+    ...(replaceUnstartedNodeKey ? { replaceUnstartedNodeKey } : {}), ...(replaceBranch ? { replaceBranch } : {}) }
 }
 function supersessionRelation() {
   const request = { expectedRevision: 1, replaceUnstarted: { nodeKey: "stale-scout" }, nodes: [{ key: "next", templateId: "scout",
@@ -252,5 +255,17 @@ describe("durable steering reconciliation ledger", () => {
     const fixture = clientFixture({ pending: false })
     await expect(prepareSteeringReconciliation(fixture.client, operation())).resolves.toBeNull()
     expect(fixture.events).toHaveLength(0)
+  })
+
+  it("prepares a no-steer branch receipt from the persisted decision Step cursor", async () => {
+    const replaceBranch: TaskGraphBranchReplacement = { root: { nodeKey: "scout-old", taskId: "scout-task" }, sources: [
+      { nodeKey: "scout-old", taskId: "scout-task", replacementKey: "scout-new" },
+      { nodeKey: "analyst-old", taskId: "analyst-task", replacementKey: "analyst-new" },
+    ] }
+    const fixture = clientFixture({ pending: false, decision: "revise", replaceBranch })
+    const prepared = await prepareSteeringReconciliation(fixture.client, operation("revise", undefined, replaceBranch))
+
+    expect(prepared).toMatchObject({ decision: "revise", expectedRevision: 1, steerInputIds: [], inputThroughSequence: 20n,
+      receipt: { steerInputIds: [], inputCheckpoint: { throughSequence: "20" } } })
   })
 })

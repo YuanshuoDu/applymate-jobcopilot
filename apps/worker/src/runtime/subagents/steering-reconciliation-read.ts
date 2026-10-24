@@ -1,7 +1,8 @@
 import type pg from "pg"
 import { parseCognitiveAgendaReceipt } from "../turns/cognitive-agenda-receipt.js"
 import { steeringReconciliationId, steeringReconciliationRevision, steeringReconciliationSequence, validSteeringReconciliationScope, STEERING_RECONCILIATION_MAX_UNRESOLVED_INPUTS,
-  type SteeringReconciliationPendingInput, type SteeringReconciliationScope, type SteeringReconciliationState } from "./steering-reconciliation-contract.js"
+  STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION, type SteeringReconciliationPendingInput, type SteeringReconciliationScope,
+  type SteeringReconciliationState } from "./steering-reconciliation-contract.js"
 import { lockTaskGraphScope } from "./task-graph-pg-state.js"
 import { taskGraphItemId } from "./task-graph-snapshot.js"
 import { readSteeringReconciliationHistory } from "./steering-reconciliation-history.js"
@@ -172,7 +173,11 @@ export async function readSteeringReconciliationState(client: Client, scope: Ste
   for await (const stored of readSteeringReconciliationHistory(client, scope, revision)) {
     if (decision && (stored.stepOrdinal > decision.ordinal || stored.stepOrdinal === decision.ordinal && stored.stepAttempt > decision.attempt)) throw new Error("steering_reconciliation_receipt_step_invalid")
     const through = BigInt(stored.receipt.inputCheckpoint.throughSequence)
-    if (previousCheckpoint !== null && through <= previousCheckpoint) throw new Error("steering_reconciliation_receipt_history_invalid")
+    const repeatedEmptyBranch = stored.receipt.schemaVersion === STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION
+      && stored.receipt.branchRepair !== undefined && stored.receipt.steerInputIds.length === 0
+    if (previousCheckpoint !== null && (through < previousCheckpoint || through === previousCheckpoint && !repeatedEmptyBranch)) {
+      throw new Error("steering_reconciliation_receipt_history_invalid")
+    }
     previousCheckpoint = through
     while (!next.done && next.value.acceptedSequence <= through) {
       unresolved.set(next.value.id, next.value)

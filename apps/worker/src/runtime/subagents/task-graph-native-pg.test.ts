@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest"
 const nativeAppendMocks = vi.hoisted(() => ({
   createChild: vi.fn(), enqueue: vi.fn(), writeSnapshot: vi.fn(), appendReceipt: vi.fn(),
 }))
+const reconciliationMocks = vi.hoisted(() => ({ assertBranchHistory: vi.fn(async () => undefined) }))
 vi.mock("./pg-store-create.js", async importOriginal => ({
   ...await importOriginal<typeof import("./pg-store-create.js")>(),
   createSubagentTask: nativeAppendMocks.createChild,
@@ -13,20 +14,25 @@ vi.mock("./task-graph-pg-events.js", async importOriginal => ({
   writeTaskGraphSnapshot: nativeAppendMocks.writeSnapshot,
   appendTaskGraphReceipt: nativeAppendMocks.appendReceipt,
 }))
+vi.mock("./steering-reconciliation-branch-repair-history.js", () => ({
+  assertTaskGraphBranchRepairHistory: reconciliationMocks.assertBranchHistory,
+}))
 
 import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { appendNativeGraphCommand, findNativeCommandReplay } from "./task-graph-native-pg.js"
 import type { TaskGraphNativeCommandInput, TaskGraphNativeCommandReceipt, TaskGraphNativeSourceProvenance } from "./task-graph-native-command.js"
 import { normalizeNativeCommand } from "./task-graph-native-request.js"
 import { TASK_GRAPH_NATIVE_METADATA_VERSION } from "./task-graph-native-state.js"
-import { taskGraphItemId, TASK_GRAPH_SNAPSHOT_VERSION, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
+import { taskGraphItemId, taskGraphProposalKey, TASK_GRAPH_SNAPSHOT_VERSION, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import type { Queryable } from "./pg-store-persistence.js"
 import type { GraphParent, LoadedGraph } from "./task-graph-pg-state.js"
 import { taskGraphSupersessionProposalKey } from "./task-graph-pg-supersession.js"
 import {
   STEERING_RECONCILIATION_EVENT_TYPE, STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION,
+  STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION,
   steeringReconciliationIdempotencyKey,
 } from "./steering-reconciliation-contract.js"
+import { TASK_GRAPH_BRANCH_REPAIR_RELATION_SCHEMA_VERSION, taskGraphBranchRepairFingerprint } from "./task-graph-pg-branch-repair-relation.js"
 
 const scope: TaskGraphNativeCommandInput["scope"] = {
   userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
@@ -109,6 +115,42 @@ function supersessionReceiptEvent(sourceTaskId: string) {
       stepId: scope.stepId, decision: "revise", observedRevision: 4, resultingRevision: 6,
       steerInputIds: ["steer-input"], inputCheckpoint: { throughSequence: "19" }, supersession: relation,
     },
+  }
+}
+
+function branchRepairReceiptEvent(sourceTaskId: string) {
+  const callId = "branch-plan-call", operationKey = steeringReconciliationIdempotencyKey(scope, callId)!
+  const replaceBranch = {
+    root: { nodeKey: "scout-old", taskId: "scout-old-task" },
+    sources: [
+      { nodeKey: "scout-old", taskId: "scout-old-task", replacementKey: "scout-new" },
+      { nodeKey: "analyst-old", taskId: "analyst-old-task", replacementKey: "analyst-new" },
+    ],
+  }
+  const call = { expectedRevision: 4, replaceBranch, nodes: [{ key: "scout-new" }, { key: "analyst-new" }] }
+  const relation = {
+    schemaVersion: TASK_GRAPH_BRANCH_REPAIR_RELATION_SCHEMA_VERSION,
+    operationKey, graphRootTaskId: scope.rootTaskId, observedRevision: 4, resultingRevision: 7,
+    root: replaceBranch.root,
+    sources: [
+      { source: { nodeKey: "scout-old", taskId: "scout-old-task" }, replacementKey: "scout-new", cancellationEvent: { id: "cancel-scout", sequence: "41" } },
+      { source: { nodeKey: "analyst-old", taskId: sourceTaskId }, replacementKey: "analyst-new", cancellationEvent: { id: "cancel-analyst", sequence: "42" } },
+    ],
+    planEvent: { id: "plan-branch", sequence: "43", idempotencyKey: taskGraphProposalKey(scope.rootTaskId, 4) },
+    replacementFingerprint: taskGraphBranchRepairFingerprint(call),
+    agentPlanCall: { callId, stepId: scope.stepId, expectedRevision: 4, replaceBranch },
+  }
+  return {
+    id: "branch-reconciliation-event", itemId: null, taskId: scope.rootTaskId,
+    type: STEERING_RECONCILIATION_EVENT_TYPE, actor: "orchestrator", correlationId: scope.turnId,
+    causationId: scope.stepId, sequence: "44", idempotencyKey: operationKey, hasOutbox: false,
+    payload: {
+      schemaVersion: STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION,
+      sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
+      stepId: scope.stepId, decision: "revise", observedRevision: 4, resultingRevision: 7,
+      steerInputIds: [], inputCheckpoint: { throughSequence: "43" }, branchRepair: relation,
+    },
+    relation,
   }
 }
 
@@ -247,6 +289,35 @@ describe("native TaskGraph role admission", () => {
     expect(fake.query.mock.calls[1]?.[1]).toEqual([
       scope.sessionId, scope.turnId, scope.rootTaskId, STEERING_RECONCILIATION_EVENT_TYPE, taskId, scope.userId,
     ])
+  })
+
+  it("blocks any source in a scoped v3 branch receipt only after validating its full history", async () => {
+    reconciliationMocks.assertBranchHistory.mockClear()
+    const taskId = "analyst-old-task", event = branchRepairReceiptEvent(taskId)
+    const input: TaskGraphNativeCommandInput = {
+      scope, request: { kind: "followup", idempotencyKey: "followup-branch-superseded", sourceTaskId: taskId, goal: "Continue audit" },
+    }
+    const fake = followupQueryFor(terminalSource(taskId), [event])
+    const loaded = { state: null, snapshot: null, tasks: new Map() } as unknown as LoadedGraph
+
+    await expect(appendNativeGraphCommand(fake.client, input, normalizeNativeCommand(input), {} as GraphParent, loaded))
+      .rejects.toMatchObject({ code: "native_source_superseded" })
+    expect(fake.query.mock.calls[1]?.[0]).toContain("jsonb_array_elements")
+    expect(reconciliationMocks.assertBranchHistory).toHaveBeenCalledWith(fake.client, { ...scope, stepId: scope.stepId }, event.relation,
+      { id: event.id, sequence: 44n })
+  })
+
+  it("fails closed when a matching v3 source receipt has invalid branch history", async () => {
+    reconciliationMocks.assertBranchHistory.mockRejectedValueOnce(new Error("invalid branch history"))
+    const taskId = "analyst-old-task", event = branchRepairReceiptEvent(taskId)
+    const input: TaskGraphNativeCommandInput = {
+      scope, request: { kind: "followup", idempotencyKey: "followup-invalid-branch-receipt", sourceTaskId: taskId, goal: "Continue audit" },
+    }
+    const fake = followupQueryFor(terminalSource(taskId), [event])
+    const loaded = { state: null, snapshot: null, tasks: new Map() } as unknown as LoadedGraph
+
+    await expect(appendNativeGraphCommand(fake.client, input, normalizeNativeCommand(input), {} as GraphParent, loaded))
+      .rejects.toMatchObject({ code: "native_source_unavailable" })
   })
 
   it("fails closed for a malformed matching supersession receipt", async () => {
