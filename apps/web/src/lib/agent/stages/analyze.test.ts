@@ -11,7 +11,8 @@ const mocks = vi.hoisted(() => ({
   applicationTaskFindUnique: vi.fn(),
   applicationTaskUpdateMany: vi.fn(),
   executionUpdateMany: vi.fn(),
-  modelChat: vi.fn(),
+  adapterResponse: vi.fn(),
+  completeAnalyzeModelCall: vi.fn(),
 }))
 
 vi.mock('@/lib/db', () => ({
@@ -28,8 +29,11 @@ vi.mock('@/lib/db', () => ({
 }))
 
 vi.mock('@/lib/model-router', () => ({
-  modelChat: mocks.modelChat,
   stripFences: (text: string) => text.replace(/```json|```/g, '').trim(),
+}))
+
+vi.mock('./analyze-model-call', () => ({
+  completeAnalyzeModelCall: mocks.completeAnalyzeModelCall,
 }))
 
 import { AnalyzeRecoveryPersistenceError, runAnalyze } from './analyze'
@@ -73,6 +77,7 @@ function deferred<T>() {
 describe('runAnalyze', () => {
   beforeEach(() => {
     vi.resetAllMocks()
+    mocks.completeAnalyzeModelCall.mockImplementation(async () => (await mocks.adapterResponse()).text)
     mocks.update.mockResolvedValue({})
     mocks.activityCreate.mockResolvedValue({})
     mocks.applicationTaskUpsert.mockResolvedValue({ id: 'task_1' })
@@ -91,12 +96,18 @@ describe('runAnalyze', () => {
     }))
   })
 
-  it('persists a structured AI score using a completion budget that supports reasoning models', async () => {
-    mocks.modelChat.mockResolvedValue({
+  it('passes the role config, messages and request identity to the model-call helper', async () => {
+    mocks.adapterResponse.mockResolvedValue({
       text: '{"score":73,"matchedKeywords":["TypeScript"],"missingKeywords":["AWS"],"recommendation":"Add cloud experience."}',
     })
 
-    const result = await runAnalyze([job], context())
+    const ctx = context()
+    const signal = new AbortController().signal
+    ctx.sessionId = 'session_1'
+    ctx.turnId = 'turn_1'
+    ctx.executionAttempt = { id: 'execution_1', attemptCount: 2 }
+    ctx.signal = signal
+    const result = await runAnalyze([job], ctx)
 
     expect(result).toMatchObject({ ok: true, data: { failed: 0, scoredJobs: [{ score: 73 }] } })
     const claimedFenceAt = (mocks.applicationTaskUpdateMany.mock.calls[0][0] as { data: { updatedAt: Date } }).data.updatedAt
@@ -104,7 +115,14 @@ describe('runAnalyze', () => {
       data: { status: 'analyzing', updatedAt: claimedFenceAt },
     }))
     expect(result).toMatchObject({ data: { scoredJobs: [{ analysisFenceAt: claimedFenceAt.toISOString() }] } })
-    expect(mocks.modelChat).toHaveBeenCalledWith(expect.any(Array), expect.any(Object), 1600)
+    expect(mocks.completeAnalyzeModelCall).toHaveBeenCalledWith(expect.objectContaining({
+      scoringConfig: expect.objectContaining({ provider: 'minimax', model: 'MiniMax-M3' }),
+      messages: [expect.objectContaining({ role: 'user', content: expect.stringContaining('TypeScript developer') })],
+      userId: 'user_1', jobId: 'job_1', analysisFenceAt: claimedFenceAt,
+      sessionId: 'session_1', turnId: 'turn_1',
+      executionAttempt: { id: 'execution_1', attemptCount: 2 }, signal,
+    }))
+    expect(mocks.adapterResponse).toHaveBeenCalledOnce()
     expect(mocks.update).toHaveBeenCalledWith(expect.objectContaining({ data: { score: 73, analysisNote: 'Add cloud experience.' } }))
   })
 
@@ -116,12 +134,12 @@ describe('runAnalyze', () => {
         applicationTask: { upsert: mocks.applicationTaskUpsert, findUnique: mocks.applicationTaskFindUnique, updateMany: mocks.applicationTaskUpdateMany },
         job: { update: mocks.update }, activity: { create: mocks.activityCreate }, agentExecution: { updateMany: mocks.executionUpdateMany },
       }
-      if (mocks.modelChat.mock.calls.length > 0) scoringTransaction = tx
+      if (mocks.adapterResponse.mock.calls.length > 0) scoringTransaction = tx
       const result = await work(tx)
       order.push('db_commit')
       return result
     })
-    mocks.modelChat.mockImplementation(async () => {
+    mocks.adapterResponse.mockImplementation(async () => {
       order.push('model_call')
       return { text: '{"score":73,"matchedKeywords":["TypeScript"],"missingKeywords":["AWS"],"recommendation":"Add cloud experience."}' }
     })
@@ -140,7 +158,7 @@ describe('runAnalyze', () => {
   })
 
   it('does not classify a durable-journal write failure as a scoring failure', async () => {
-    mocks.modelChat.mockResolvedValue({
+    mocks.adapterResponse.mockResolvedValue({
       text: '{"score":73,"matchedKeywords":["TypeScript"],"missingKeywords":["AWS"],"recommendation":"Add cloud experience."}',
     })
     const writeFailure = new AnalyzeRecoveryPersistenceError()
@@ -171,7 +189,7 @@ describe('runAnalyze', () => {
   })
 
   it('checks the scheduled claim in the score transaction before writing Job.score or Activity', async () => {
-    mocks.modelChat.mockResolvedValue({
+    mocks.adapterResponse.mockResolvedValue({
       text: '{"score":73,"matchedKeywords":["TypeScript"],"missingKeywords":["AWS"],"recommendation":"Add cloud experience."}',
     })
     let scoringTransaction: unknown
@@ -180,7 +198,7 @@ describe('runAnalyze', () => {
         applicationTask: { upsert: mocks.applicationTaskUpsert, findUnique: mocks.applicationTaskFindUnique, updateMany: mocks.applicationTaskUpdateMany },
         job: { update: mocks.update }, activity: { create: mocks.activityCreate }, agentExecution: { updateMany: mocks.executionUpdateMany },
       }
-      if (mocks.modelChat.mock.calls.length > 0) scoringTransaction = tx
+      if (mocks.adapterResponse.mock.calls.length > 0) scoringTransaction = tx
       return work(tx)
     })
     const assertScoreOwnerCurrent = vi.fn(async (_tx: unknown) => false)
@@ -194,7 +212,7 @@ describe('runAnalyze', () => {
   })
 
   it('does not classify an owner-fence transaction failure as an AI scoring failure', async () => {
-    mocks.modelChat.mockResolvedValue({
+    mocks.adapterResponse.mockResolvedValue({
       text: '{"score":73,"matchedKeywords":["TypeScript"],"missingKeywords":["AWS"],"recommendation":"Add cloud experience."}',
     })
     const fenceFailure = new Error('scheduled owner lock unavailable')
@@ -222,7 +240,7 @@ describe('runAnalyze', () => {
     let failJournal!: () => void
     const journalFailure = new Promise<void>(resolve => { failJournal = resolve })
     let modelCalls = 0
-    mocks.modelChat.mockImplementation(async () => {
+    mocks.adapterResponse.mockImplementation(async () => {
       modelCalls++
       if (modelCalls === 1) return { text: '{"score":73,"matchedKeywords":["TypeScript"],"missingKeywords":[],"recommendation":"Good fit."}' }
       signalSiblingModelStarted()
@@ -255,14 +273,14 @@ describe('runAnalyze', () => {
     const result = await runAnalyze([job], context(), { existingScoredJobs: [durable] })
 
     expect(result).toMatchObject({ ok: true, data: { failed: 0, scoredJobs: [durable] } })
-    expect(mocks.modelChat).not.toHaveBeenCalled()
+    expect(mocks.adapterResponse).not.toHaveBeenCalled()
     expect(mocks.applicationTaskUpsert).not.toHaveBeenCalled()
     expect(mocks.transaction).not.toHaveBeenCalled()
   })
 
   it('treats a non-JSON AI response as a failed score instead of persisting 0%', async () => {
     const emit = vi.fn()
-    mocks.modelChat.mockResolvedValue({ text: 'I cannot score this job.' })
+    mocks.adapterResponse.mockResolvedValue({ text: 'I cannot score this job.' })
 
     const result = await runAnalyze([job], context(emit))
 
@@ -272,6 +290,30 @@ describe('runAnalyze', () => {
       data: expect.objectContaining({ status: 'failed', checkpoint: 'match_analysis_failed' }),
     }))
     expect(emit).toHaveBeenCalledWith('job_error', expect.objectContaining({ error: 'AI returned no JSON score' }))
+  })
+
+  it('routes adapter provider failures through the existing failed checkpoint and callback', async () => {
+    const emit = vi.fn()
+    const onScoreFailure = vi.fn()
+    mocks.completeAnalyzeModelCall.mockRejectedValue(new Error('Legacy model client failed'))
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+    const result = await runAnalyze([job], context(emit), { onScoreFailure })
+    consoleError.mockRestore()
+
+    expect(result).toMatchObject({ ok: false, error: 'All jobs failed to score' })
+    expect(mocks.applicationTaskUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        status: 'failed', checkpoint: 'match_analysis_failed', error: 'Legacy model client failed',
+      }),
+    }))
+    expect(onScoreFailure).toHaveBeenCalledWith('job_1')
+    expect(emit).toHaveBeenCalledWith('job_error', expect.objectContaining({
+      jobId: 'job_1', error: 'Legacy model client failed',
+    }))
+    expect(mocks.adapterResponse).not.toHaveBeenCalled()
+    expect(mocks.update).not.toHaveBeenCalled()
+    expect(mocks.activityCreate).not.toHaveBeenCalled()
   })
 
   it('pauses for the candidate decision and records skipped jobs with no description', async () => {
@@ -285,7 +327,7 @@ describe('runAnalyze', () => {
     expect(result).toMatchObject({ ok: false, error: 'All jobs failed to score' })
     expect(onScoreFailure).not.toHaveBeenCalled()
     expect(ctx.askUser).toHaveBeenCalledWith('analyst', expect.any(String), expect.any(Array))
-    expect(mocks.modelChat).not.toHaveBeenCalled()
+    expect(mocks.adapterResponse).not.toHaveBeenCalled()
     expect(mocks.applicationTaskUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ status: 'skipped', checkpoint: 'job_description_required' }),
     }))
@@ -296,7 +338,7 @@ describe('runAnalyze', () => {
     const result = await runAnalyze([{ ...job, url: 'https://www.linkedin.com/jobs/view/123' }], context(), { onScoreFailure })
 
     expect(result).toMatchObject({ ok: false, error: 'All jobs failed to score' })
-    expect(mocks.modelChat).not.toHaveBeenCalled()
+    expect(mocks.adapterResponse).not.toHaveBeenCalled()
     expect(onScoreFailure).not.toHaveBeenCalled()
     expect(mocks.applicationTaskUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ status: 'skipped', checkpoint: 'job_preflight_failed' }),
@@ -318,7 +360,7 @@ describe('runAnalyze', () => {
     const result = await runAnalyze([input as Job], ctx)
 
     expect(result).toMatchObject({ ok: true, data: { failed: 0, scoredJobs: [] } })
-    expect(mocks.modelChat).not.toHaveBeenCalled()
+    expect(mocks.adapterResponse).not.toHaveBeenCalled()
     expect(emit).not.toHaveBeenCalled()
   })
 
@@ -337,7 +379,7 @@ describe('runAnalyze', () => {
       transactions.push(tx)
       return work(tx)
     })
-    if (mode === 'failure') mocks.modelChat.mockRejectedValue(new Error('provider unavailable'))
+    if (mode === 'failure') mocks.adapterResponse.mockRejectedValue(new Error('provider unavailable'))
     const ctx = context(vi.fn())
     if (label === 'candidate skip') ctx.askUser = vi.fn().mockResolvedValue('skip_no_desc')
     const assertScoreOwnerCurrent = vi.fn(async (_tx: unknown) => false)
@@ -386,7 +428,7 @@ describe('runAnalyze', () => {
       }),
       data: expect.objectContaining({ status: 'analyzing', checkpoint: 'match_analysis' }),
     }))
-    expect(mocks.modelChat).not.toHaveBeenCalled()
+    expect(mocks.adapterResponse).not.toHaveBeenCalled()
     expect(mocks.update).not.toHaveBeenCalled()
     expect(mocks.activityCreate).not.toHaveBeenCalled()
     expect(emit).not.toHaveBeenCalled()
@@ -412,7 +454,7 @@ describe('runAnalyze', () => {
         ]),
       }),
     }))
-    expect(mocks.modelChat).not.toHaveBeenCalled()
+    expect(mocks.adapterResponse).not.toHaveBeenCalled()
     expect(mocks.update).not.toHaveBeenCalled()
     expect(mocks.activityCreate).not.toHaveBeenCalled()
     expect(emit).not.toHaveBeenCalled()
@@ -453,13 +495,13 @@ describe('runAnalyze', () => {
         updatedAt: taskUpdatedAt,
       }),
     }))
-    expect(mocks.modelChat).not.toHaveBeenCalled()
+    expect(mocks.adapterResponse).not.toHaveBeenCalled()
     expect(mocks.update).not.toHaveBeenCalled()
     expect(mocks.activityCreate).not.toHaveBeenCalled()
   })
 
   it('re-analyzes failures owned by Analyze without reopening other failure states', async () => {
-    mocks.modelChat.mockResolvedValue({
+    mocks.adapterResponse.mockResolvedValue({
       text: '{"score":73,"matchedKeywords":["TypeScript"],"missingKeywords":[],"recommendation":"Good fit."}',
     })
     const taskUpdatedAt = new Date('2026-01-01T00:00:00.000Z')
@@ -473,7 +515,7 @@ describe('runAnalyze', () => {
         { status: 'failed', checkpoint: 'match_analysis_failed' },
       ] }),
     }))
-    expect(mocks.modelChat).toHaveBeenCalledOnce()
+    expect(mocks.adapterResponse).toHaveBeenCalledOnce()
   })
 
   it('drops an older model result after a later Analyze attempt claims the task', async () => {
@@ -508,7 +550,7 @@ describe('runAnalyze', () => {
     const pendingOlderModel = deferred<{ text: string }>()
     let markOlderModelStarted!: () => void
     const olderModelStarted = new Promise<void>(resolve => { markOlderModelStarted = resolve })
-    mocks.modelChat
+    mocks.adapterResponse
       .mockImplementationOnce(() => {
         markOlderModelStarted()
         return pendingOlderModel.promise
@@ -528,7 +570,7 @@ describe('runAnalyze', () => {
     })
     const olderResult = await olderAttempt
 
-    expect(mocks.modelChat).toHaveBeenCalledTimes(2)
+    expect(mocks.adapterResponse).toHaveBeenCalledTimes(2)
     expect(newerResult).toMatchObject({ ok: true, data: { scoredJobs: [{ score: 81 }] } })
     expect(olderResult).toMatchObject({ ok: true, data: { scoredJobs: [] } })
     expect(mocks.update).toHaveBeenCalledOnce()
@@ -547,7 +589,7 @@ describe('runAnalyze', () => {
     const pendingModel = deferred<{ text: string }>()
     let markModelStarted!: () => void
     const modelStarted = new Promise<void>(resolve => { markModelStarted = resolve })
-    mocks.modelChat.mockImplementationOnce(() => {
+    mocks.adapterResponse.mockImplementationOnce(() => {
       markModelStarted()
       return pendingModel.promise
     })
@@ -576,7 +618,7 @@ describe('runAnalyze', () => {
   it('does not emit a scoring error when the AgentExecution attempt is reclaimed before its failure transition', async () => {
     let refreshCount = 0
     mocks.executionUpdateMany.mockImplementation(async () => ({ count: ++refreshCount === 1 ? 1 : 0 }))
-    mocks.modelChat.mockRejectedValue(new Error('provider unavailable'))
+    mocks.adapterResponse.mockRejectedValue(new Error('provider unavailable'))
     const emit = vi.fn()
     const ctx = context(emit)
     ctx.sessionId = 'session_1'
@@ -598,7 +640,7 @@ describe('runAnalyze', () => {
     const pendingModel = deferred<{ text: string }>()
     let markModelStarted!: () => void
     const modelStarted = new Promise<void>(resolve => { markModelStarted = resolve })
-    mocks.modelChat.mockImplementationOnce(() => {
+    mocks.adapterResponse.mockImplementationOnce(() => {
       markModelStarted()
       return pendingModel.promise
     })
@@ -672,7 +714,7 @@ describe('runAnalyze', () => {
     const pendingModel = deferred<{ text: string }>()
     let markModelStarted!: () => void
     const modelStarted = new Promise<void>(resolve => { markModelStarted = resolve })
-    mocks.modelChat.mockImplementationOnce(() => {
+    mocks.adapterResponse.mockImplementationOnce(() => {
       markModelStarted()
       return pendingModel.promise
     })
@@ -682,7 +724,7 @@ describe('runAnalyze', () => {
     const resultPromise = runAnalyze([job], ctx)
 
     await modelStarted
-    expect(mocks.modelChat).toHaveBeenCalledOnce()
+    expect(mocks.adapterResponse).toHaveBeenCalledOnce()
     expect(task).toMatchObject({ status: 'analyzing', checkpoint: 'match_analysis', sessionId: 'session_1' })
     task.status = nextState.status
     task.checkpoint = nextState.checkpoint
@@ -713,7 +755,7 @@ describe('runAnalyze', () => {
 
   it('continues analysis for a legacy task with NULL sessionId and checkpoint', async () => {
     mocks.applicationTaskUpdateMany.mockResolvedValueOnce({ count: 1 })
-    mocks.modelChat.mockResolvedValue({
+    mocks.adapterResponse.mockResolvedValue({
       text: '{"score":73,"matchedKeywords":["TypeScript"],"missingKeywords":[],"recommendation":"Good fit."}',
     })
 
@@ -735,7 +777,7 @@ describe('runAnalyze', () => {
       where: expect.objectContaining({ status: 'analyzing', sessionId: null }),
       data: expect.objectContaining({ updatedAt: expect.any(Date) }),
     }))
-    expect(mocks.modelChat).toHaveBeenCalledOnce()
+    expect(mocks.adapterResponse).toHaveBeenCalledOnce()
     expect(mocks.update).toHaveBeenCalledWith(expect.objectContaining({ data: { score: 73, analysisNote: 'Good fit.' } }))
     expect(mocks.activityCreate).toHaveBeenCalledOnce()
   })
