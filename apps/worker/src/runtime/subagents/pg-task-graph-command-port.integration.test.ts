@@ -759,7 +759,8 @@ function branchAnalystVerification(scoutKey: string) {
 
 function branchPlanRequest(scope: TaskGraphScheduleInput["scope"], templates: TaskGraphScheduleInput["templates"],
   sourceNodes: readonly TaskGraphCurrentNode[], expectedRevision: number, callId: string, replacementPrefix: string) {
-  const scout = sourceNodes.find(node => node.templateId === "scout"), analyst = sourceNodes.find(node => node.templateId === "analyst")
+  const scout = sourceNodes.find(node => node.templateId === "scout")
+  const analyst = scout && sourceNodes.find(node => node.templateId === "analyst" && node.dependsOn.includes(scout.key))
   if (!scout || !analyst || !scout.verification || !analyst.verification) throw new Error("Typed branch fixture requires Scout and Analyst sources")
   const replacementKeys = new Map([
     [scout.key, `${replacementPrefix}-scout`],
@@ -3370,7 +3371,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     expect(tampered.rowCount).toBe(1)
     const beforeReplay = await supersessionDurableRows(adminPool!, value)
     await expect(prepared.command.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation))
-      .rejects.toMatchObject({ code: "idempotency_conflict" })
+      .rejects.toThrow("steering_reconciliation_failed_branch_event_invalid")
     expect(await supersessionDurableRows(adminPool!, value)).toEqual(beforeReplay)
     expect(accepted.revision).toBe(prepared.current.revision + 2)
   }, 60_000)
