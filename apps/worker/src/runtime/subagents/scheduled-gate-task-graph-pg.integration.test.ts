@@ -412,7 +412,7 @@ async function assertPrepareProofPreflight(database: Pool, fixture: GateFixture,
   const proofScope = { userId: fixture.owner.userId, sessionId: fixture.owner.sessionId,
     turnId: fixture.owner.turnId, rootTaskId: fixture.owner.rootTaskId }
   const reloaded = await loadPersistedScheduledPrepareProof(database, proofScope, fixture.ids.prepareTaskId,
-    prepareTask?.result, fixture.prepareProof.receipt.continuationKey, fixture.prepareWaitId)
+    prepareTask?.result, fixture.handoff.continuationKey, fixture.prepareWaitId)
   const preparedIds = reloaded && scheduledGatePreparedJobIds(reloaded)
   const completionNodes = completion?.nodes
   const expectedCompletionNodes = fixture.prepareProof.completion.nodes
@@ -463,6 +463,7 @@ async function assertPrepareProofPreflight(database: Pool, fixture: GateFixture,
           && receipt.owner.sessionId === fixture.ids.sessionId && receipt.owner.turnId === fixture.ids.turnId
           && receipt.owner.rootTaskId === fixture.ids.rootTaskId,
         receiptMatchesFixture: sameCanonical(receipt, fixture.prepareProof.receipt),
+        receiptKeyDiffersFromHandoffKey: receipt?.continuationKey !== fixture.handoff.continuationKey,
         analyzeRevision: receipt?.analyzeGraphRevision, prepareScheduleRevision: receipt?.prepareScheduleRevision,
         completionRevision: completion?.graphRevision, expectedCompletionRevision: fixture.prepareProof.completion.graphRevision,
         completionRevisionMatches: completion?.graphRevision === fixture.prepareProof.completion.graphRevision,
@@ -475,7 +476,7 @@ async function assertPrepareProofPreflight(database: Pool, fixture: GateFixture,
         ownerMatches: !!wait && wait.userId === fixture.ids.userId && wait.sessionId === fixture.ids.sessionId && wait.turnId === fixture.ids.turnId,
         parentMatches: wait?.parentTaskId === fixture.ids.rootTaskId,
         stepMatches: wait?.stepId === fixture.rootQuestionStepId,
-        keyMatches: !!wait && wait.idempotencyKey === prepareDependencyKey(fixture.prepareProof.receipt.continuationKey, wait.stepId),
+        keyMatches: !!wait && wait.idempotencyKey === prepareDependencyKey(fixture.handoff.continuationKey, wait.stepId),
         status: wait?.status, mode: wait?.mode, targetMatches: sameCanonical(targets, [fixture.ids.prepareTaskId]),
         matchedMatches: sameCanonical(matched, [fixture.ids.prepareTaskId]),
         requestKeysExact: sameKeys(request, ["targetTaskIds", "mode", "timeoutMs"]), requestMode: request?.mode,

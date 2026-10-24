@@ -29,11 +29,13 @@ vi.mock("./pg-scheduled-task-graph-gate-verification.js", () => ({ verifyPersist
 const owner = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", rootAttemptCount: 2,
   turnLeaseOwnerId: "turn-owner", turnLeaseVersion: 4, executionId: "execution-1", executionAttemptCount: 3 }
 const continuationKey = "scheduled-taskgraph:sha256:" + "a".repeat(64)
+const stableReceiptKey = "scheduled-taskgraph:sha256:" + "9".repeat(64)
 const claimToken = "claim-secret"
 const claimTokenDigest = "sha256:" + createHash("sha256").update(claimToken).digest("hex")
 const binding = { owner, continuationKey, snapshotDigest: "sha256:" + "b".repeat(64), evidenceDigest: "c".repeat(64),
   checkpointDigest: "d".repeat(64), analyzeGraphRevision: 7, prepareScheduleRevision: 8 }
-const continuationReceipt = { schemaVersion: SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_SCHEMA, ...binding }
+const continuationReceipt = { schemaVersion: SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_SCHEMA, ...binding,
+  continuationKey: stableReceiptKey }
 const contract = { binding, receipt: continuationReceipt, bindingDigest: "e".repeat(64), proposalFingerprint: "f".repeat(64), claimTokenDigest }
 const scope = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
   parentTaskId: owner.rootTaskId, stepId: "root-step", turnLeaseOwner: owner.turnLeaseOwnerId, turnLeaseVersion: owner.turnLeaseVersion,
@@ -158,5 +160,23 @@ describe("scheduled Gate append claim replay", () => {
     expect(db.calls.some(sql => sql.includes('FROM "agent_events"'))).toBe(true)
     expect(db.calls.some(sql => sql.includes('FROM "agent_executions"'))).toBe(true)
     expect(mocks.registration).not.toHaveBeenCalled()
+  })
+
+  it("validates the Prepare wait with the handoff key, distinct from the stable receipt key", async () => {
+    expect(continuationReceipt.continuationKey).not.toBe(continuationKey)
+    mocks.prepareProof.mockImplementation(async (_client, _scope, _taskId, _result, key, waitId) =>
+      key === continuationKey && waitId === "prepare-wait" ? proof : null)
+    const db = database(baseGraph())
+    await expect(appendScheduledGate(db.client as never, input)).rejects.toMatchObject({ code: "scheduled_gate_claim_stale" })
+    expect(mocks.prepareProof).toHaveBeenCalledWith(db.client, scope, "prepare-task", preparedTask.result, continuationKey, "prepare-wait")
+    expect(db.calls.some(sql => /^\s*(INSERT|UPDATE|DELETE)\b/i.test(sql))).toBe(false)
+
+    mocks.prepareProof.mockClear()
+    mocks.contract.mockReturnValue({ ...contract, binding: { ...binding, continuationKey: stableReceiptKey } })
+    const wrongKeyDb = database(baseGraph())
+    await expect(appendScheduledGate(wrongKeyDb.client as never, input)).rejects.toMatchObject({ code: "scheduled_gate_prepare_proof" })
+    expect(mocks.prepareProof).toHaveBeenCalledWith(wrongKeyDb.client, scope, "prepare-task", preparedTask.result,
+      stableReceiptKey, "prepare-wait")
+    expect(wrongKeyDb.calls.some(sql => /^\s*(INSERT|UPDATE|DELETE)\b/i.test(sql))).toBe(false)
   })
 })

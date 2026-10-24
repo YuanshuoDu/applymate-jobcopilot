@@ -37,7 +37,7 @@ export async function appendScheduledGate(client: Queryable, input: TaskGraphSch
   if (turn.rows.length !== 1 || !scheduledSnapshotMatches(turn.rows[0], contract.binding.snapshotDigest)) throw invalid("snapshot")
   const loaded = await loadTaskGraph(client, input.scope, true)
   if (!loaded.snapshot || !loaded.state || !loaded.item) throw invalid("graph_missing")
-  const prep = await requirePrepareProof(client, input, contract.receipt.continuationKey, loaded)
+  const prep = await requirePrepareProof(client, input, contract.binding.continuationKey, loaded)
   const gateNode = loaded.snapshot.nodes.find(node => node.key === "gate")
   if (gateNode) {
     const prior = await readScheduledGateRegistrationReceipt(client, { userId: input.scope.userId,

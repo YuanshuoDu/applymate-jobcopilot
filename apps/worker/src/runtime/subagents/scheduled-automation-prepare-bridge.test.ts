@@ -121,6 +121,21 @@ describe("scheduled automation Prepare continuation", () => {
     expect(projected?.tasks.map(task => task.id)).toEqual(["scout-task", "analyst-task"])
   })
 
+  it("selects exact Scout and Analyst rows despite permuted Prepare and Gate task order", () => {
+    const prepared = analyzeGraph(true)
+    const threeNode = projectScheduledAnalyzePrefix(prepared.snapshot, prepared.current,
+      [prepared.tasks[2]!, prepared.tasks[1]!, prepared.tasks[0]!])
+    expect(threeNode?.tasks.map(task => task.id)).toEqual(["scout-task", "analyst-task"])
+
+    const gated = analyzeGraphWithGate()
+    const fourNode = projectScheduledAnalyzePrefix(gated.snapshot, gated.current,
+      [gated.tasks[3]!, gated.tasks[1]!, gated.tasks[2]!, gated.tasks[0]!])
+    expect(fourNode?.tasks.map(task => task.id)).toEqual(["scout-task", "analyst-task"])
+
+    const missingAnalyst = [prepared.tasks[2]!, prepared.tasks[0]!, { ...prepared.tasks[1]!, id: "unrelated-task" }]
+    expect(projectScheduledAnalyzePrefix(prepared.snapshot, prepared.current, missingAnalyst)).toBeNull()
+  })
+
   it("rejects extra or malformed Prepare graph nodes", () => {
     const graph = analyzeGraph(true), extra = { ...graph.snapshot.nodes[2]!, key: "extra" }
     expect(projectScheduledAnalyzePrefix({ ...graph.snapshot, nodes: [...graph.snapshot.nodes, extra] }, graph.current, [...graph.tasks, graph.tasks[2]!])).toBeNull()

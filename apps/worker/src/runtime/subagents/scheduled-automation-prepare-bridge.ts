@@ -37,6 +37,9 @@ export function projectScheduledAnalyzePrefix<T extends PipelineTask>(snapshotVa
   const [scout, analyst, prepare] = snapshot.nodes
   if (scout?.templateId !== "scout" || scout.depth !== 1 || scout.dependsOn.length !== 0
     || analyst?.templateId !== "analyst" || analyst.depth !== 2 || analyst.dependsOn.length !== 1 || analyst.dependsOn[0] !== scout.key) return null
+  const scoutTask = prefixTask(scout, tasks, TASK_GRAPH_TEMPLATES.scout.role, TASK_GRAPH_TEMPLATES.scout.taskType)
+  const analystTask = prefixTask(analyst, tasks, TASK_GRAPH_TEMPLATES.analyst.role, TASK_GRAPH_TEMPLATES.analyst.taskType)
+  if (!scoutTask || !analystTask) return null
   let analyzeRevision = current.revision
   if (prepare) {
     const currentPrepare = current.nodes.find(node => node.key === prepare.key), task = tasks.find(value => value.id === prepare.taskId)
@@ -59,7 +62,12 @@ export function projectScheduledAnalyzePrefix<T extends PipelineTask>(snapshotVa
   const prefix = parseTaskGraphSnapshot({ schemaVersion: snapshot.schemaVersion, nodes: snapshot.nodes.slice(0, 2),
     ...(snapshot.rootSuccessCriteria ? { rootSuccessCriteria: snapshot.rootSuccessCriteria } : {}) })
   return { snapshot: prefix, current: { revision: analyzeRevision,
-    nodes: current.nodes.slice(0, 2), ...(current.rootSuccessCriteria ? { rootSuccessCriteria: current.rootSuccessCriteria } : {}) }, tasks: tasks.slice(0, 2) }
+    nodes: current.nodes.slice(0, 2), ...(current.rootSuccessCriteria ? { rootSuccessCriteria: current.rootSuccessCriteria } : {}) }, tasks: [scoutTask, analystTask] }
+}
+
+function prefixTask<T extends PipelineTask>(node: TaskGraphSnapshot["nodes"][number], tasks: readonly T[], role: string, taskType: string): T | null {
+  const matches = tasks.filter(task => task.id === node.taskId), task = matches[0]
+  return matches.length === 1 && task?.role === role && task.taskType === taskType ? task : null
 }
 
 function prepareAnalyzeRevision<T extends PipelineTask>(task: T, node: TaskGraphSnapshot["nodes"][number], snapshot: TaskGraphSnapshot, currentRevision: number): number | null {
