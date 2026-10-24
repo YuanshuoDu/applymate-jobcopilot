@@ -65,7 +65,7 @@ function fixture() {
   const taskRows = [
     task("foundation-z-task", "scout", "completed", 1, { status: "completed", taskGraphVerificationReport: scoutCompletedReport }, null),
     task("foundation-a-task", "analyst", "completed", 1, { status: "completed", taskGraphVerificationReport: analystCompletedReport }, null),
-    task("branch-scout-task", "scout", "failed", 1, { status: "failed", taskGraphVerificationReport: scoutReport }, "task_graph_verification_unverified"),
+    task("branch-scout-task", "scout", "failed", 1, { summary: "The executor returned no verifiable result", taskGraphVerificationReport: scoutReport }, "task_graph_verification_unverified"),
     task("branch-analyst-task", "analyst", "waiting", 0, null, null),
   ]
   const events = [
@@ -145,6 +145,13 @@ describe("persisted failed TaskGraph branch evidence", () => {
     }],
   ])("fails closed for %s", async (_name, mutate) => {
     const f = fixture(); mutate(f)
+    await expect(proveTaskGraphFailedBranchEvidence(f.client, { scope, snapshot: f.graph, sourceNodes: f.graph.nodes.slice(2) })).resolves.toBeNull()
+  })
+
+  it("requires the failed status on the durable task row, not a result payload claim", async () => {
+    const f = fixture(), source = f.taskRows[2]!
+    source.status = "completed"
+    source.result = { status: "failed", taskGraphVerificationReport: report("unverified") }
     await expect(proveTaskGraphFailedBranchEvidence(f.client, { scope, snapshot: f.graph, sourceNodes: f.graph.nodes.slice(2) })).resolves.toBeNull()
   })
 

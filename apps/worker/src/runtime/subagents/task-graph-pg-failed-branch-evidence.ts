@@ -128,7 +128,7 @@ export async function proveTaskGraphFailedBranchEvidence(client: Client, input: 
   const failedResult = object(failedRow.result), failedReportRaw = failedResult && object(failedResult.taskGraphVerificationReport)
   const failedReport = failedReportRaw && derived.root.verification
     ? parseTaskGraphVerificationReport(failedReportRaw, derived.root.verification.criteria.map(item => item.id)) : undefined
-  if (!failedResult || failedResult.status !== "failed" || Object.hasOwn(failedResult, "taskGraphRepairReceipt")
+  if (!failedResult || Object.hasOwn(failedResult, "taskGraphRepairReceipt")
     || Object.hasOwn(failedResult, "native") || Object.hasOwn(failedResult, "nativeResult") || !failedReport
     || failedReport.status !== "unverified" || failedReport.reasonCode !== "result_invalid" || failedReport.evidenceDigest !== null
     || failedReport.resultDigest !== null || !taskGraphVerificationReportMatchesStatus(failedReport, "failed")) return null
