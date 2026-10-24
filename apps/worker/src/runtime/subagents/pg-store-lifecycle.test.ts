@@ -56,9 +56,17 @@ function fakePool(handler?: (sql: string, params?: unknown[]) => { rows?: unknow
   const client = { query: vi.fn(async (sql: string, params?: unknown[]) => {
     calls.push([sql, params])
     const result = handler?.(sql, params) ?? {}
+    if (sql.startsWith('SELECT clock_timestamp() AS "scanHorizon"')) {
+      if (result.rows?.length) {
+        const row = result.rows[0] as Record<string, unknown>
+        return { ...result, rows: [{ ...row, scanHorizon: row.scanHorizon ?? row.checkedAt }] }
+      }
+      if (result.rows === undefined) return { rows: [{ scanHorizon: new Date("2026-09-23T12:00:00Z") }], rowCount: 1, ...result }
+    }
     if (sql.startsWith("SELECT clock_timestamp()") && !result.rows?.length) {
       return { rows: [{ checkedAt: new Date("2026-09-23T12:00:00Z") }], rowCount: 1, ...result }
     }
+    if (/^(SAVEPOINT|ROLLBACK TO SAVEPOINT|RELEASE SAVEPOINT)\b/.test(sql)) return { rows: [], rowCount: 0, ...result }
     if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE") && !result.rows?.length) {
       return { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1, ...result }
     }
@@ -70,8 +78,9 @@ function fakePool(handler?: (sql: string, params?: unknown[]) => { rows?: unknow
       const count = sql.includes('task."turnId" = $2') ? 2 : 3
       return { rows: Array.from({ length: count }, (_, index) => ({ id: `task-${index + 1}`, status: index === 0 ? "running" : "waiting", attemptCount: 1, turnId: "turn-1" })), rowCount: count, ...result }
     }
-    if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1") && !result.rows?.length) {
-      return { rows: [{ id: "task-1", sessionId: "session-1", rootTaskId: "task-1", turnId: "turn-1", userId: "user-1" }], rowCount: 1, ...result }
+    if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $8") && !result.rows?.length) {
+      return { rows: [{ id: "task-1", sessionId: "session-1", rootTaskId: "task-1", turnId: "turn-1", userId: "user-1",
+        cursorRootIsNull: false, cursorRootKey: "task-1" }], rowCount: 1, ...result }
     }
     if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE") && !result.rows?.length) return { rows: [{ id: "turn-1", status: "in_progress" }], rowCount: 1, ...result }
     if (sql.includes('session."status" AS "sessionStatus"') && !result.rows?.length) return { rows: [taskRow({ sessionStatus: "running" })], rowCount: 1, ...result }
@@ -128,15 +137,17 @@ function rootRecoveryPool(turnStatus: string | "missing" | "mismatched", rootOve
   const client = { query: vi.fn(async (sql: string, values?: unknown[]) => {
     calls.push([sql, values])
     if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 0 }
-    if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1")) {
-      return rootStatus === "running" ? { rows: [{ id: rootId, sessionId: "session-1", rootTaskId: rootId, turnId: "turn-1", userId: "user-1" }], rowCount: 1 } : { rows: [], rowCount: 0 }
+    if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $8")) {
+      if (values?.[3] != null) return { rows: [], rowCount: 0 }
+      return rootStatus === "running" ? { rows: [{ id: rootId, sessionId: "session-1", rootTaskId: rootId, turnId: "turn-1", userId: "user-1",
+        cursorRootIsNull: false, cursorRootKey: rootId }], rowCount: 1 } : { rows: [], rowCount: 0 }
     }
     if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1 }
     if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")) {
       if (turnStatus === "missing" || turnStatus === "mismatched") return { rows: [], rowCount: 0 }
       return { rows: [{ status: turnStatus }], rowCount: 1 }
     }
-    if (sql.startsWith("SELECT clock_timestamp()")) return { rows: [{ checkedAt: now }], rowCount: 1 }
+    if (sql.startsWith("SELECT clock_timestamp()")) return { rows: [{ scanHorizon: now, checkedAt: now }], rowCount: 1 }
     if (sql.includes('SELECT task."turnId"')) {
       const taskId = String(values?.[0])
       if (taskId === rootId) return { rows: [{ turnId: "turn-1", rootTaskId: rootId, parentTaskId: null, attemptCount: 1, userId: "user-1" }], rowCount: 1 }
@@ -569,9 +580,10 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
     const recoveryWrite = recovery.calls.find(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))
     expect(recoveryWrite?.[1]?.[5]).toBe(false)
     expect(recoveryWrite?.[1]?.[6]).toEqual(now)
-    const scan = recovery.calls.find(([sql]) => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1"))?.[0] ?? ""
-    expect(scan).toContain('task."leaseExpiresAt" <= clock_timestamp()')
-    expect(scan).toContain('task."nextAttemptAt" <= clock_timestamp()')
+    const scan = recovery.calls.find(([sql]) => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $8"))?.[0] ?? ""
+    expect(scan).toContain('task."leaseExpiresAt" <= $1')
+    expect(scan).toContain('task."nextAttemptAt" <= $1')
+    expect(scan).toContain('COALESCE(task."rootTaskId", \'\') AS "cursorRootKey"')
     expect(scan).toContain(`session."status" IN ('aborted', 'archived')`)
     expect(scan).toContain(`session."status" NOT IN ('aborted', 'archived')`)
     expect(scan).not.toContain("FOR UPDATE")
@@ -581,8 +593,12 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
     expect(sessionLock).toBeGreaterThan(-1)
     expect(turnLock).toBeGreaterThan(sessionLock)
     expect(taskLock).toBeGreaterThan(turnLock)
-    const clockCheck = recovery.calls.findIndex(([sql]) => sql.startsWith("SELECT clock_timestamp()"))
+    const scanHorizon = recovery.calls.findIndex(([sql]) => sql.includes('AS "scanHorizon"'))
+    const scanIndex = recovery.calls.findIndex(([sql]) => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $8"))
+    const clockCheck = recovery.calls.findIndex(([sql]) => sql.includes('AS "checkedAt"'))
     const recoveryWriteIndex = recovery.calls.findIndex(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))
+    expect(scanHorizon).toBeGreaterThanOrEqual(0)
+    expect(scanHorizon).toBeLessThan(scanIndex)
     expect(clockCheck).toBeGreaterThan(taskLock)
     expect(recoveryWriteIndex).toBeGreaterThan(clockCheck)
     expect(recoveryWrite?.[0]).toContain('session."userId" = $8 AND session."status" = $9::text')
@@ -625,8 +641,9 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
     const row = taskRow({ id: "subagent-standalone", rootTaskId: "subagent-standalone", parentTaskId: null,
       turnId: null, taskType, role: taskType, attemptCount: 1, maxAttempts: 1 })
     const recovery = fakePool(sql => {
-      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1")) {
-        return { rows: [{ id: row.id, sessionId: row.sessionId, rootTaskId: row.rootTaskId, turnId: null, userId: row.userId }] }
+      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $8")) {
+        return { rows: [{ id: row.id, sessionId: row.sessionId, rootTaskId: row.rootTaskId, turnId: null, userId: row.userId,
+          cursorRootIsNull: false, cursorRootKey: row.rootTaskId }] }
       }
       if (sql.includes('session."status" AS "sessionStatus"')) return { rows: [{ ...row, sessionStatus: "running" }] }
       return {}
@@ -635,9 +652,9 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
     await expect(recoverExpired(recovery.pool, { now: new Date("2026-09-23T12:00:00Z"), limit: 1 }))
       .resolves.toMatchObject([{ id: row.id, status: "failed" }])
 
-    const scan = recovery.calls.find(([sql]) => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1"))?.[0] ?? ""
+    const scan = recovery.calls.find(([sql]) => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $8"))?.[0] ?? ""
     expect(scan).toContain(`task."id" NOT LIKE 'root-%'`)
-    expect(scan.indexOf(`task."id" NOT LIKE 'root-%'`)).toBeLessThan(scan.indexOf("LIMIT $1"))
+    expect(scan.indexOf(`task."id" NOT LIKE 'root-%'`)).toBeLessThan(scan.indexOf("LIMIT $8"))
     expect(recovery.calls.some(([sql]) => sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE"))).toBe(false)
   })
 
@@ -646,8 +663,9 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
       taskType: "root", role: "orchestrator", depth: 0, attemptCount: 1, maxAttempts: 5 })
     let persistedRootStatus = "running"
     const recovery = fakePool((sql, params) => {
-      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1")) {
-        return { rows: [{ id: root.id, sessionId: root.sessionId, rootTaskId: root.rootTaskId, turnId: root.turnId, userId: root.userId }] }
+      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $8")) {
+        return { rows: [{ id: root.id, sessionId: root.sessionId, rootTaskId: root.rootTaskId, turnId: root.turnId, userId: root.userId,
+          cursorRootIsNull: false, cursorRootKey: root.rootTaskId }] }
       }
       if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")) return { rows: [{ status: "failed" }] }
       if (sql.includes('session."status" AS "sessionStatus"')) return { rows: [{ ...root, sessionStatus: "running" }] }
@@ -672,7 +690,7 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
     expect(sessionLock).toBeLessThan(recovery.calls.indexOf(turnLock!))
     expect(recovery.calls.indexOf(turnLock!)).toBeLessThan(rootLock)
     expect(update?.[1]?.[5]).toBe(true)
-    const scan = recovery.calls.find(([sql]) => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1"))?.[0] ?? ""
+    const scan = recovery.calls.find(([sql]) => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $8"))?.[0] ?? ""
     expect(scan).toContain(`task."taskType" = 'root'`)
     expect(scan).toContain(`turn."rootTaskId" = task."id" AND turn."status" = 'failed'`)
   })
@@ -736,7 +754,7 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
       await expect(recoverExpired(recovery.pool, { now: new Date("2020-01-01T00:00:00.000Z"), limit: 10 })).resolves.toEqual([])
 
       const taskLock = recovery.calls.findIndex(([sql]) => sql.includes("FOR UPDATE OF task"))
-      const clockCheck = recovery.calls.findIndex(([sql]) => sql.startsWith("SELECT clock_timestamp()"))
+      const clockCheck = recovery.calls.findIndex(([sql]) => sql.includes('AS "checkedAt"'))
       expect(clockCheck).toBeGreaterThan(taskLock)
       expect(recovery.calls.some(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))).toBe(false)
     },
@@ -755,10 +773,11 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
     const row = taskRow({ id: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", maxAttempts: 1, role: "analyst", taskType: "analysis" })
     const client = { query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push([sql, params])
-      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1")) return { rows: [{ id: "child-1", sessionId: "session-1", rootTaskId: "root-1", turnId: "turn-1", userId: "user-1" }], rowCount: 1 }
+      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $8")) return { rows: [{ id: "child-1", sessionId: "session-1", rootTaskId: "root-1", turnId: "turn-1", userId: "user-1",
+        cursorRootIsNull: false, cursorRootKey: "root-1" }], rowCount: 1 }
       if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "session-1", userId: "user-1", status: "running" }], rowCount: 1 }
       if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "turn-1" }], rowCount: 1 }
-      if (sql.startsWith("SELECT clock_timestamp()")) return { rows: [{ checkedAt }], rowCount: 1 }
+      if (sql.startsWith("SELECT clock_timestamp()")) return { rows: [{ scanHorizon: checkedAt, checkedAt }], rowCount: 1 }
       if (sql.includes('SELECT task."turnId"')) return { rows: [{ turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", attemptCount: 1, userId: "user-1" }], rowCount: 1 }
       if (sql.includes("event.\"payload\"->>'kind' IN ('proposal', 'native_command')")) return { rows: [proposalRow], rowCount: 1 }
       if (sql.includes('SELECT item."id"')) return { rows: [{ id: taskGraphItemId("root-1"), revision, content: snapshot, createdAt: checkedAt }], rowCount: 1 }
@@ -805,10 +824,14 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
     const row = taskRow({ id: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", status: taskStatus, maxAttempts: 3, sessionStatus: status })
     const client = { query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push([sql, params])
-      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1")) return { rows: [{ id: "child-1", sessionId: "session-1", rootTaskId: "root-1", turnId: "turn-1", userId: "user-1" }], rowCount: 1 }
+      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $8")) return { rows: [{ id: "child-1", sessionId: "session-1", rootTaskId: "root-1", turnId: "turn-1", userId: "user-1",
+        cursorRootIsNull: false, cursorRootKey: "root-1" }], rowCount: 1 }
       if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "session-1", userId: "user-1", status }], rowCount: 1 }
       if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "turn-1" }], rowCount: 1 }
-      if (sql.startsWith("SELECT clock_timestamp()")) return { rows: [{ checkedAt: new Date("2026-09-23T12:00:00Z") }], rowCount: 1 }
+      if (sql.startsWith("SELECT clock_timestamp()")) {
+        const clock = new Date("2026-09-23T12:00:00Z")
+        return { rows: [{ scanHorizon: clock, checkedAt: clock }], rowCount: 1 }
+      }
       if (sql.includes('SELECT task."turnId"')) return { rows: [{ turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", attemptCount: 1, userId: "user-1" }], rowCount: 1 }
       if (sql.includes("event.\"payload\"->>'kind' IN ('proposal', 'native_command')")) return { rows: [proposalRow], rowCount: 1 }
       if (sql.includes('SELECT item."id"')) return { rows: [{ id: taskGraphItemId("root-1"), revision, content: snapshot, createdAt: new Date("2026-09-01T00:00:00.000Z") }], rowCount: 1 }
@@ -855,10 +878,14 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
     const proposalRow = taskGraphProposalRow(snapshot, 1)
     const client = { query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push([sql, params])
-      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1")) return { rows: [{ id: "child-1", sessionId: "session-1", rootTaskId: "root-1", turnId: "turn-1", userId: "user-1" }], rowCount: 1 }
+      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $8")) return { rows: [{ id: "child-1", sessionId: "session-1", rootTaskId: "root-1", turnId: "turn-1", userId: "user-1",
+        cursorRootIsNull: false, cursorRootKey: "root-1" }], rowCount: 1 }
       if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "session-1", userId: "user-1", status: "aborted" }], rowCount: 1 }
       if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "turn-1" }], rowCount: 1 }
-      if (sql.startsWith("SELECT clock_timestamp()")) return { rows: [{ checkedAt: new Date("2026-09-23T12:00:00Z") }], rowCount: 1 }
+      if (sql.startsWith("SELECT clock_timestamp()")) {
+        const clock = new Date("2026-09-23T12:00:00Z")
+        return { rows: [{ scanHorizon: clock, checkedAt: clock }], rowCount: 1 }
+      }
       if (sql.includes('SELECT task."turnId"')) return { rows: [{ turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", attemptCount: 1, userId: "user-1" }], rowCount: 1 }
       if (sql.includes("event.\"payload\"->>'kind' IN ('proposal', 'native_command')")) return { rows: [proposalRow], rowCount: 1 }
       if (sql.includes('SELECT item."id"')) return { rows: [{ id: taskGraphItemId("root-1"), revision, content: snapshot, createdAt: new Date("2026-09-01T00:00:00Z") }], rowCount: 1 }

@@ -47,7 +47,8 @@ function disposableRedisUrl(): string | null {
 const databaseUrl = disposableDatabaseUrl()
 const redisUrl = disposableRedisUrl()
 const withServices = databaseUrl && redisUrl && process.env.RUN_AGENT_TURN_REDIS_INTEGRATION === "1" ? describe : describe.skip
-type FixtureIds = { userId: string; sessionId: string; turnId: string; rootTaskId: string; waiterTaskId: string; targetTaskId: string }
+type FixtureIds = { userId: string; sessionId: string; turnId: string; rootTaskId: string; waiterTaskId: string; targetTaskId: string;
+  recoveryTargetPageRank?: number; recoveryCandidateCount?: number; recoveryFixtureBlockerCount?: number; recoveryCandidateObservedAt?: string }
 type WorkerProcess = ChildProcess & {
   stdoutText: string
   stderrText: string
@@ -95,6 +96,112 @@ async function waitFor<T>(read: () => Promise<T | null>, timeoutMs = 20_000): Pr
   throw new Error("Timed out waiting for durable child-wait state")
 }
 
+async function seedExpiredUnsettledRecoveryBlockers(input: {
+  pool: Pool; taskStore: PgSubagentTaskStore; turnStore: ReturnType<typeof createPgTurnEngineStore>;
+  userId: string; suffix: string; policy: ReturnType<typeof defaultSubagentPolicy>;
+  sessionIds: string[]; taskIds: string[]; count: number;
+}): Promise<void> {
+  for (let index = 0; index < input.count; index++) {
+    const order = String(index).padStart(2, "0")
+    const sessionId = `durable-child-wait-backlog-${input.suffix}-${order}`
+    const turnId = `durable-child-wait-backlog-turn-${input.suffix}-${order}`
+    await input.pool.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
+      VALUES ($1, $2, 'unsettled recovery pagination blocker', 'running', 'test', CURRENT_TIMESTAMP)`, [sessionId, input.userId])
+    input.sessionIds.push(sessionId)
+    await input.pool.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "status", "source", "input",
+      "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "updatedAt")
+      VALUES ($1, $2, $3, 'in_progress', 'system', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP)`,
+    [turnId, sessionId, input.userId])
+    const root = await input.taskStore.create({ userId: input.userId, sessionId, turnId, role: "orchestrator",
+      taskType: "root", goal: "recovery pagination blocker root", allowedActions: ["external_action"], policy: input.policy })
+    await input.pool.query(`UPDATE "agent_turns" SET "rootTaskId" = $2 WHERE "id" = $1 AND "sessionId" = $3`, [turnId, root.id, sessionId])
+    const activatedRoot = await input.pool.query(`UPDATE "sub_agent_tasks" SET "status" = 'running'
+      WHERE "id" = $1 AND "sessionId" = $2 RETURNING "id"`, [root.id, sessionId])
+    if (activatedRoot.rowCount !== 1) throw new Error("Recovery blocker root activation lost its fixture identity")
+    const task = await input.taskStore.create({ userId: input.userId, sessionId, turnId, parentTaskId: root.id,
+      role: "analyst", taskType: "research", goal: "leave one real external call unsettled", allowedActions: ["external_action"], policy: input.policy })
+    input.taskIds.push(task.id)
+    const ownerId = `recovery-blocker-owner-${input.suffix}-${order}`
+    const claimed = await input.taskStore.claim({ taskId: task.id, sessionId, ownerId, policy: input.policy, now: new Date() })
+    if (!claimed?.leaseExpiresAt || !claimed.turnId) throw new Error("Recovery blocker did not receive a running lease")
+    const lease: SubagentLease = { ...claimed, ownerId, leaseExpiresAt: claimed.leaseExpiresAt, signal: new AbortController().signal }
+    const owner = executionOwnerFence({ kind: "task", lease })
+    const now = new Date()
+    const stepId = `recovery-blocker-step-${input.suffix}-${order}`
+    await input.turnStore.startStep({ owner, stepId, ordinal: 0, attempt: claimed.attemptCount, inputThroughSequence: 0n,
+      consumedInputIds: [], modelProfileSnapshot: {}, now })
+    const callId = `recovery-blocker-call-${input.suffix}-${order}`
+    const callItemId = `recovery-blocker-call-item-${input.suffix}-${order}`
+    await input.turnStore.createItem({ owner, itemId: callItemId, stepId, type: "tool_call", status: "started", phase: null,
+      content: { toolCallId: callId, toolName: "external_action", toolVersion: "1", input: {} }, now })
+    await input.turnStore.appendEvent({ owner, id: `task:${task.id}:event:tool-started:${callId}`, itemId: callItemId,
+      type: "tool_call.started", correlationId: callId, causationId: null,
+      idempotencyKey: `task:${task.id}:event:tool-started:${callId}`,
+      payload: { toolCallId: callId, toolName: "external_action", taskId: task.id } })
+    const expired = await input.pool.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = clock_timestamp() - interval '1 second'
+      WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running' AND "attemptCount" = 1 AND "leaseOwner" = $3 RETURNING "id"`,
+    [task.id, sessionId, ownerId])
+    if (expired.rowCount !== 1) throw new Error("Recovery blocker lease expiry lost its owner fence")
+  }
+}
+
+async function readBlockerDurableState(pool: Pool, taskIds: readonly string[]): Promise<Array<{ dispatchOutbox: unknown[] }>> {
+  const result = await pool.query<{ dispatchOutbox: unknown[] }>(`SELECT to_jsonb(session) AS "session", to_jsonb(turn) AS "turn", to_jsonb(root) AS "root",
+      to_jsonb(task) AS "task",
+      COALESCE((SELECT jsonb_agg(to_jsonb(step) ORDER BY step."id") FROM "agent_steps" AS step
+        WHERE step."sessionId" = task."sessionId" AND step."turnId" = task."turnId" AND step."taskId" = task."id"), '[]'::jsonb) AS "steps",
+      COALESCE((SELECT jsonb_agg(to_jsonb(item) ORDER BY item."id") FROM "agent_items" AS item
+        WHERE item."sessionId" = task."sessionId" AND item."turnId" = task."turnId" AND item."taskId" = task."id"), '[]'::jsonb) AS "items",
+      COALESCE((SELECT jsonb_agg(to_jsonb(event) ORDER BY event."sequence") FROM "agent_events" AS event
+        WHERE event."sessionId" = task."sessionId" AND event."turnId" = task."turnId" AND event."taskId" = task."id"), '[]'::jsonb) AS "events",
+      COALESCE((SELECT jsonb_agg(to_jsonb(outbox) ORDER BY outbox."id") FROM "agent_outbox" AS outbox
+        WHERE outbox."aggregateId" = task."sessionId" AND outbox."topic" = 'agent.events'
+          AND outbox."payload"->>'taskId' = task."id"), '[]'::jsonb) AS "eventOutbox",
+      COALESCE((SELECT jsonb_agg(jsonb_build_object('id', dispatch."id", 'topic', dispatch."topic",
+          'aggregateId', dispatch."aggregateId", 'idempotencyKey', dispatch."idempotencyKey",
+          'payload', dispatch."payload", 'attemptCount', dispatch."attemptCount", 'lastError', dispatch."lastError",
+          'published', dispatch."publishedAt" IS NOT NULL) ORDER BY dispatch."id")
+        FROM "agent_outbox" AS dispatch WHERE dispatch."aggregateId" = task."sessionId"
+          AND dispatch."topic" = 'agent.subagent.dispatch'
+          AND dispatch."idempotencyKey" = 'subagent-dispatch:' || task."id"), '[]'::jsonb) AS "dispatchOutbox"
+    FROM "sub_agent_tasks" AS task
+    JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+    JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+    JOIN "sub_agent_tasks" AS root ON root."id" = task."rootTaskId" AND root."sessionId" = task."sessionId"
+    WHERE task."id" = ANY($1::text[]) ORDER BY task."sessionId", task."id"`, [taskIds])
+  return result.rows
+}
+
+async function readRecoveryCandidateRank(pool: Pool, waiterTaskId: string, blockerTaskIds: readonly string[]): Promise<{
+  targetPageRank: string; candidateCount: string; fixturePageRank: string; fixtureCandidateCount: string; fixtureBlockerCount: string; observedAt: Date;
+}> {
+  const result = await pool.query(`WITH horizon AS (SELECT clock_timestamp() AS "at"), eligible AS (
+      SELECT task."id", task."sessionId", task."rootTaskId",
+        ROW_NUMBER() OVER (ORDER BY task."sessionId", task."rootTaskId" NULLS LAST, task."id") AS "pageRank",
+        COUNT(*) OVER () AS "candidateCount"
+      FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId" CROSS JOIN horizon
+      WHERE task."status" = 'running' AND (session."status" IN ('aborted', 'archived') OR session."status" NOT IN ('aborted', 'archived'))
+        AND task."leaseExpiresAt" <= horizon."at" AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= horizon."at")
+        AND (task."id" NOT LIKE 'root-%' OR session."status" IN ('aborted', 'archived') OR task."interruptRequestedAt" IS NOT NULL
+          OR (task."taskType" = 'root' AND task."id" = task."rootTaskId" AND task."parentTaskId" IS NULL AND task."turnId" IS NOT NULL
+            AND EXISTS (SELECT 1 FROM "agent_turns" AS rootTurn WHERE rootTurn."id" = task."turnId"
+              AND rootTurn."sessionId" = task."sessionId" AND rootTurn."userId" = session."userId"
+              AND rootTurn."rootTaskId" = task."id" AND rootTurn."status" = 'failed')))
+    ), fixture AS (
+      SELECT "id", ROW_NUMBER() OVER (ORDER BY "sessionId", "rootTaskId" NULLS LAST, "id") AS "pageRank", COUNT(*) OVER () AS "candidateCount"
+      FROM eligible WHERE "id" = $1 OR "id" = ANY($2::text[])
+    )
+    SELECT eligible."pageRank"::text AS "targetPageRank", eligible."candidateCount"::text AS "candidateCount",
+      fixture."pageRank"::text AS "fixturePageRank", fixture."candidateCount"::text AS "fixtureCandidateCount",
+      (SELECT COUNT(*)::text FROM eligible AS blocker WHERE blocker."id" = ANY($2::text[])
+        AND blocker."sessionId" < eligible."sessionId") AS "fixtureBlockerCount", horizon."at" AS "observedAt"
+    FROM eligible JOIN fixture ON fixture."id" = eligible."id" CROSS JOIN horizon WHERE eligible."id" = $1`, [waiterTaskId, blockerTaskIds])
+  const row = result.rows[0]
+  if (!row) throw new Error("Recovery candidate rank could not be observed")
+  return row as { targetPageRank: string; candidateCount: string; fixturePageRank: string; fixtureCandidateCount: string;
+    fixtureBlockerCount: string; observedAt: Date }
+}
+
 async function stopWorker(child: WorkerProcess | undefined): Promise<void> {
   if (!child || child.exitCode !== null) return
   child.kill("SIGKILL")
@@ -128,6 +235,8 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
     let workerE: WorkerProcess | undefined
     const originalRedisUrl = process.env.REDIS_URL
     let closeSharedRedisConnections: (() => Promise<void>) | undefined
+    const recoveryBlockerSessionIds: string[] = []
+    const recoveryBlockerTaskIds: string[] = []
 
     try {
       await queue.waitUntilReady()
@@ -319,9 +428,56 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       [waiter.id, ids.sessionId, preContinuationOwner])
       expect(preContinuationExpiryUpdate.rowCount).toBe(1)
 
+      await seedExpiredUnsettledRecoveryBlockers({ pool, taskStore, turnStore: createPgTurnEngineStore(pool), userId: ids.userId,
+        suffix, policy, sessionIds: recoveryBlockerSessionIds, taskIds: recoveryBlockerTaskIds, count: 50 })
+      const blockerStateBeforeRecovery = await readBlockerDurableState(pool, recoveryBlockerTaskIds)
+      expect(blockerStateBeforeRecovery).toHaveLength(50)
+      expect(blockerStateBeforeRecovery.map(blocker => blocker.dispatchOutbox)).toEqual(Array.from({ length: 50 }, () => []))
+      const blockers = await pool.query<{ blockerCount: number; eligibleCount: number; unsettledCount: number }>(
+        `SELECT COUNT(DISTINCT task."id")::int AS "blockerCount",
+          COUNT(DISTINCT task."id") FILTER (WHERE task."status" = 'running' AND task."attemptCount" = 1
+            AND task."leaseExpiresAt" <= clock_timestamp() AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= clock_timestamp())
+            AND step."status" = 'streaming' AND call."type" = 'tool_call' AND call."status" = 'started'
+            AND started."type" = 'tool_call.started' AND started."correlationId" = call."content"->>'toolCallId'
+            AND NOT EXISTS (SELECT 1 FROM "agent_events" AS settled WHERE settled."sessionId" = task."sessionId"
+              AND settled."taskId" = task."id" AND settled."correlationId" = started."correlationId"
+              AND settled."type" IN ('tool_call.completed', 'tool_call.failed', 'tool_call.interrupted'))) AS "eligibleCount",
+          COUNT(DISTINCT task."id") FILTER (WHERE started."id" IS NOT NULL AND settled."id" IS NULL) AS "unsettledCount"
+         FROM "sub_agent_tasks" AS task
+         JOIN "agent_steps" AS step ON step."sessionId" = task."sessionId" AND step."turnId" = task."turnId" AND step."taskId" = task."id"
+         JOIN "agent_items" AS call ON call."sessionId" = task."sessionId" AND call."turnId" = task."turnId"
+           AND call."taskId" = task."id" AND call."stepId" = step."id" AND call."type" = 'tool_call'
+         LEFT JOIN "agent_events" AS started ON started."sessionId" = task."sessionId" AND started."taskId" = task."id"
+           AND started."itemId" = call."id" AND started."type" = 'tool_call.started'
+         LEFT JOIN "agent_events" AS settled ON settled."sessionId" = started."sessionId" AND settled."taskId" = started."taskId"
+           AND settled."correlationId" = started."correlationId" AND settled."type" IN ('tool_call.completed', 'tool_call.failed', 'tool_call.interrupted')
+         WHERE task."id" = ANY($1::text[])`, [recoveryBlockerTaskIds],
+      )
+      expect(blockers.rows[0]).toMatchObject({ blockerCount: 50, eligibleCount: 50, unsettledCount: 50 })
+      const candidateRank = await readRecoveryCandidateRank(pool, waiter.id, recoveryBlockerTaskIds)
+      expect(Number(candidateRank.fixtureBlockerCount)).toBe(50)
+      expect(Number(candidateRank.fixtureCandidateCount)).toBe(51)
+      expect(Number(candidateRank.fixturePageRank)).toBe(51)
+      expect(Number(candidateRank.targetPageRank)).toBeGreaterThan(50)
+      expect(Number(candidateRank.candidateCount)).toBeGreaterThanOrEqual(Number(candidateRank.targetPageRank))
+      ids.recoveryTargetPageRank = Number(candidateRank.targetPageRank)
+      ids.recoveryCandidateCount = Number(candidateRank.candidateCount)
+      ids.recoveryFixtureBlockerCount = Number(candidateRank.fixtureBlockerCount)
+      ids.recoveryCandidateObservedAt = candidateRank.observedAt.toISOString()
+
       workerC = launchWorker("worker-b-crash-resume", queueName, ids)
       await waitForMarker(workerC, "WORKER_B_RECOVERED")
-      expect(workerC.stdoutText).toContain(`"id":"${waiter.id}","status":"queued"`)
+      const recoveryDiagnostic = workerC.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_RECOVERY_DIAGNOSTIC "))
+      expect(workerC.stdoutText, `Worker C missed the waiter; ${recoveryDiagnostic ?? "diagnostic missing"}`)
+        .toContain(`"id":"${waiter.id}","status":"queued"`)
+      const blockerStateAfterRecovery = await readBlockerDurableState(pool, recoveryBlockerTaskIds)
+      expect(blockerStateAfterRecovery).toEqual(blockerStateBeforeRecovery)
+      const blockerJobs = await queue.getJobs(["waiting", "active", "delayed", "completed", "failed"], 0, -1)
+      expect(blockerJobs.filter(job => recoveryBlockerTaskIds.includes(String(job.data.taskId)))).toHaveLength(0)
+      await pool.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = ANY($1::text[])`, [recoveryBlockerSessionIds])
+      await pool.query(`DELETE FROM "agent_sessions" WHERE "id" = ANY($1::text[])`, [recoveryBlockerSessionIds])
+      recoveryBlockerSessionIds.length = 0
+      recoveryBlockerTaskIds.length = 0
       const preContinuationRecovery = await pool.query<{ taskStatus: string; attemptCount: number; leaseOwner: string | null;
         sourceStatus: string; waitStatus: string; consumedAt: Date | null }>(
         `SELECT task."status" AS "taskStatus", task."attemptCount", task."leaseOwner", source."status" AS "sourceStatus",
@@ -527,6 +683,10 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       if (closeSharedRedisConnections) await closeSharedRedisConnections().catch(() => undefined)
       if (originalRedisUrl === undefined) delete process.env.REDIS_URL
       else process.env.REDIS_URL = originalRedisUrl
+      if (recoveryBlockerSessionIds.length > 0) {
+        try { await pool.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = ANY($1::text[])`, [recoveryBlockerSessionIds]) } catch { /* preserve the original failure */ }
+        try { await pool.query(`DELETE FROM "agent_sessions" WHERE "id" = ANY($1::text[])`, [recoveryBlockerSessionIds]) } catch { /* preserve the original failure */ }
+      }
       try { await pool.query(`DELETE FROM "agent_sessions" WHERE "id" = $1`, [ids.sessionId]) } catch { /* fixture setup may not have reached the session insert */ }
       try { await pool.query(`DELETE FROM "User" WHERE "id" = $1`, [ids.userId]) } catch { /* preserve the original failure */ }
       await queueRedis.quit().catch(() => queueRedis.disconnect())

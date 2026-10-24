@@ -10,15 +10,22 @@ import { recoverExpired } from "./pg-store-expiry-recovery.js"
 import type { PgSubagentPool } from "./types.js"
 
 const checkedAt = new Date("2026-10-06T10:00:00Z")
+type CandidateRow = Readonly<{ id: string; sessionId: string; rootTaskId: string | null; turnId: string | null; userId: string;
+  cursorRootIsNull: boolean; cursorRootKey: string }>
 type FixtureOptions = { pendingCall?: boolean; candidate?: boolean; childWaitResumable?: boolean; attemptCount?: number;
   maxAttempts?: number; child?: boolean; outboxOwnerId?: string; dispatchPublished?: boolean; rearmCount?: number;
   registeredWait?: boolean; targetStatus?: string; callMatches?: boolean; recoveryLeaseLost?: boolean; continuationWait?: boolean;
   exactWaitCall?: boolean; unrelatedPendingCall?: boolean; preinsertWaitCall?: boolean; unconsumedContinuation?: boolean;
   unconsumedNoContinuation?: boolean; pendingModelStart?: "exact" | "wrong-correlation" | "wrong-actor" | "wrong-item" | "wrong-key" | "wrong-payload";
-  pendingToolStart?: boolean }
+  pendingToolStart?: boolean; candidatePages?: readonly (readonly CandidateRow[])[]; blockedCandidateIds?: readonly string[];
+  missingSessionCandidateIds?: readonly string[]; missingPreviewCandidateIds?: readonly string[]; throwCandidateIds?: readonly string[];
+  waitStepStatus?: "streaming" | "waiting_for_tool" }
+function scanCandidate(id: string, sessionId = "session-1", rootTaskId: string | null = "root-1", turnId: string | null = "turn-1"): CandidateRow {
+  return { id, sessionId, rootTaskId, turnId, userId: "user-1", cursorRootIsNull: rootTaskId === null, cursorRootKey: rootTaskId ?? "" }
+}
 function fixture(options: FixtureOptions = {}) {
   const calls: string[] = []
-  const task = { id: options.child ? "child-1" : "task-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: options.child ? "root-1" : "task-1", parentTaskId: options.child ? "root-1" : null,
+  const task = { id: options.child ? "child-1" : "task-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1" as string | null, rootTaskId: (options.child ? "root-1" : "task-1") as string | null, parentTaskId: options.child ? "root-1" : null,
     path: "/task-1", depth: 0, role: "scout", taskType: "scout", status: "running", goal: "inspect", constraints: [], successCriteria: [],
     allowedActions: [], context: {}, expectedOutputSchema: {}, result: null, failureReason: null, attemptCount: options.attemptCount ?? 1, maxAttempts: options.maxAttempts ?? 3,
     leaseOwner: "worker-1" as string | null, leaseExpiresAt: new Date(checkedAt.getTime() - 1_000) as Date | null, nextAttemptAt: null as Date | null, interruptRequestedAt: null,
@@ -33,20 +40,47 @@ function fixture(options: FixtureOptions = {}) {
     suspendedAt: options.continuationWait || options.unconsumedContinuation || options.unconsumedNoContinuation ? checkedAt : null as Date | null,
     consumedAt: options.continuationWait ? checkedAt : null as Date | null,
     result: { request: { targetTaskIds: ["target-1"], mode: "any", timeoutMs: 10_000 }, outcome: { status: "waiting" } } }
+  const candidatePageCalls: Array<{ sql: string; values: unknown[] }> = []
+  const queuedCandidates: CandidateRow[] = []
+  let pageIndex = 0
+  const defaultCandidate = (): CandidateRow => ({ id: task.id, sessionId: task.sessionId, rootTaskId: task.rootTaskId,
+    turnId: task.turnId, userId: task.userId, cursorRootIsNull: task.rootTaskId === null, cursorRootKey: task.rootTaskId ?? "" })
   const client = { query: vi.fn(async (sql: string, _values?: unknown[]) => {
     calls.push(sql)
-    if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
-    if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1")) return options.candidate === false ? { rows: [], rowCount: 0 } : { rows: [{ id: task.id, sessionId: task.sessionId, rootTaskId: task.rootTaskId, turnId: task.turnId, userId: task.userId }], rowCount: 1 }
-    if (sql.startsWith('SELECT "id", "userId", "status" FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return { rows: [{ id: task.sessionId, userId: task.userId, status: "running" }], rowCount: 1 }
+    if (["BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT subagent_expiry_recovery_candidate",
+      "ROLLBACK TO SAVEPOINT subagent_expiry_recovery_candidate", "RELEASE SAVEPOINT subagent_expiry_recovery_candidate"].includes(sql)
+      || sql.includes("set_config")) return { rows: [], rowCount: 1 }
+    if (sql.startsWith('SELECT clock_timestamp() AS "scanHorizon"')) return { rows: [{ scanHorizon: checkedAt }], rowCount: 1 }
+    if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $8")) {
+      const values = [...(_values ?? [])]
+      candidatePageCalls.push({ sql, values })
+      const page = options.candidatePages ? options.candidatePages[pageIndex++] ?? []
+        : options.candidate === false ? [] : [defaultCandidate()]
+      queuedCandidates.push(...page)
+      return { rows: page, rowCount: page.length }
+    }
+    if (sql.startsWith('SELECT "id", "userId", "status" FROM "agent_sessions"') && sql.includes("FOR UPDATE")) {
+      const candidate = queuedCandidates.shift()
+      if (candidate) {
+        task.id = candidate.id; task.sessionId = candidate.sessionId; task.turnId = candidate.turnId
+        task.rootTaskId = candidate.rootTaskId; task.parentTaskId = options.child ? candidate.rootTaskId : null
+        task.status = "running"; task.leaseOwner = "worker-1"; task.leaseExpiresAt = new Date(checkedAt.getTime() - 1_000); task.nextAttemptAt = null
+      }
+      if (candidate && options.missingSessionCandidateIds?.includes(candidate.id)) return { rows: [], rowCount: 0 }
+      return { rows: [{ id: task.sessionId, userId: task.userId, status: "running" }], rowCount: 1 }
+    }
     if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")) return { rows: [{ id: task.turnId }], rowCount: 1 }
-    if (sql.includes('session."status" AS "sessionStatus"')) return { rows: [{ ...task, sessionStatus: "running", rootStatus: "running", rootInterruptRequestedAt: null,
+    if (sql.includes('session."status" AS "sessionStatus"')) {
+      if (options.missingPreviewCandidateIds?.includes(String(_values?.[0]))) return { rows: [], rowCount: 0 }
+      return { rows: [{ ...task, sessionStatus: "running", rootStatus: "running", rootInterruptRequestedAt: null,
       childWaitResumable: options.childWaitResumable ?? false, childWaitContinuationId: options.continuationWait ? "continuation-1" : null }], rowCount: 1 }
+    }
     if (sql.startsWith('SELECT task.*') && sql.includes("FOR UPDATE OF task")) return { rows: [{ ...task, sessionStatus: "running", rootStatus: "running", rootInterruptRequestedAt: null,
       childWaitResumable: options.childWaitResumable ?? false, childWaitContinuationId: options.continuationWait ? "continuation-1" : null }], rowCount: 1 }
     if (sql.includes('SELECT task."id", task."parentTaskId"') && sql.includes("FOR UPDATE OF task")) return options.recoveryLeaseLost
       ? { rows: [], rowCount: 0 } : { rows: [{ ...task, turnStatus: "in_progress", rootStatus: "running" }], rowCount: 1 }
     if (sql.includes('FROM "agent_wait_conditions" AS wait JOIN "agent_steps" AS step') && sql.includes('wait."status" = \'waiting\'')) return options.registeredWait
-      ? { rows: [{ ...wait, attempt: task.attemptCount, ordinal: 4, latestOrdinal: 4, stepStatus: "waiting_for_tool" }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      ? { rows: [{ ...wait, attempt: task.attemptCount, ordinal: 4, latestOrdinal: 4, stepStatus: options.waitStepStatus ?? "waiting_for_tool" }], rowCount: 1 } : { rows: [], rowCount: 0 }
     if (sql.includes('started."createdAt"') && sql.includes("FOR UPDATE OF task, step, call")) return options.preinsertWaitCall ? { rows: [{
       eventId: "start-event", createdAt: new Date(checkedAt.getTime() - 5_000), role: task.role, allowedActions: ["wait_subagents"], stepId: "step-1",
       content: { toolCallId: "wait-call-1", toolName: "wait_subagents", toolVersion: "1", input: { idempotencyKey: "wait-key-1", mode: "any", taskIds: ["target-1"], timeoutMs: 10_000 } },
@@ -69,10 +103,12 @@ function fixture(options: FixtureOptions = {}) {
     if (sql.startsWith('INSERT INTO "agent_outbox"')) { outbox.payload = JSON.parse(String(_values?.[3])) as typeof outbox.payload; return { rows: [{ idempotencyKey: _values?.[2] }], rowCount: 1 } }
     if (sql.startsWith("SELECT clock_timestamp()")) return { rows: [{ checkedAt }], rowCount: 1 }
     if (sql.includes('FROM "agent_events" AS started')) {
+      if (options.throwCandidateIds?.includes(String(_values?.[1]))) throw new Error("candidate_failure")
+      const blockedById = options.blockedCandidateIds?.includes(String(_values?.[1])) ?? false
       const exactWait = (options.continuationWait || options.unconsumedContinuation || options.unconsumedNoContinuation || options.registeredWait)
         && options.exactWaitCall && _values?.[8] !== "start-event"
       const exactModel = options.pendingModelStart === "exact" && _values?.[9] === "continuation-1"
-      return options.unrelatedPendingCall || options.recoveryLeaseLost || options.pendingToolStart
+      return blockedById || options.unrelatedPendingCall || options.recoveryLeaseLost || options.pendingToolStart
         || options.pendingModelStart && !exactModel
         || options.pendingCall && !exactWait && !exactModel && _values?.[8] !== "start-event"
         ? { rows: [{ id: "started-event" }], rowCount: 1 } : { rows: [], rowCount: 0 }
@@ -91,7 +127,7 @@ function fixture(options: FixtureOptions = {}) {
     }
     return { rows: [], rowCount: 1 }
   }), release: vi.fn() }
-  return { pool: { connect: vi.fn().mockResolvedValue(client) } as unknown as Pick<pg.Pool, "connect">, calls, client, task, outbox, wait }
+  return { pool: { connect: vi.fn().mockResolvedValue(client) } as unknown as Pick<pg.Pool, "connect">, calls, candidatePageCalls, client, task, outbox, wait }
 }
 
 describe("expired subagent recovery fence", () => {
@@ -107,8 +143,9 @@ describe("expired subagent recovery fence", () => {
     expect(turn).toBeLessThan(taskLock)
     expect(taskLock).toBeLessThan(external)
     expect(external).toBeLessThan(update)
-    const scan = fake.calls.find(sql => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1")) ?? ""
-    expect(scan).toContain('task."leaseExpiresAt" <= clock_timestamp()')
+    const scan = fake.calls.find(sql => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $8")) ?? ""
+    expect(scan).toContain('task."leaseExpiresAt" <= $1')
+    expect(scan).toContain('task."nextAttemptAt" <= $1')
     expect(scan).not.toContain('task."leaseExpiresAt" IS NULL')
     const eligibility = fake.calls.find(sql => sql.startsWith("SELECT task.*") && sql.includes("FOR UPDATE OF task")) ?? ""
     expect(eligibility).toContain('currentStep."attempt" = task."attemptCount"))))\n    AND wait."status" IN')
@@ -119,6 +156,79 @@ describe("expired subagent recovery fence", () => {
     await expect(recoverExpired(fake.pool as PgSubagentPool, { now: checkedAt, limit: 10 })).resolves.toEqual([])
     expect(fake.calls.some(sql => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
     expect(fake.calls.at(-1)).toBe("COMMIT")
+  })
+
+  it("pages past a safely blocked candidate, preserves filters, and caps successful recoveries", async () => {
+    const fake = fixture({ child: true, blockedCandidateIds: ["blocked-1"], candidatePages: [
+      [scanCandidate("blocked-1")], [scanCandidate("recovered-2")], [scanCandidate("not-scanned-3")],
+    ] })
+    await expect(recoverExpired(fake.pool as PgSubagentPool, {
+      now: checkedAt, limit: 1, sessionId: "session-1", turnId: "turn-1",
+    })).resolves.toMatchObject([{ id: "recovered-2", status: "queued" }])
+
+    expect(fake.candidatePageCalls).toHaveLength(2)
+    const [first, second] = fake.candidatePageCalls
+    expect(first?.values).toEqual([checkedAt, "session-1", "turn-1", null, null, null, null, 1])
+    expect(second?.values).toEqual([checkedAt, "session-1", "turn-1", "session-1", false, "root-1", "blocked-1", 1])
+    for (const page of [first, second]) {
+      expect(page?.sql).toContain('task."sessionId" = $2')
+      expect(page?.sql).toContain('task."turnId" = $3')
+      expect(page?.sql).toContain('task."leaseExpiresAt" <= $1')
+      expect(page?.sql).toContain('task."nextAttemptAt" <= $1')
+      expect(page?.sql).toContain('task."sessionId", (task."rootTaskId" IS NULL), COALESCE(task."rootTaskId", \'\'), task."id")')
+    }
+    expect(fake.calls.filter(sql => sql.startsWith('SELECT clock_timestamp() AS "scanHorizon"'))).toHaveLength(1)
+    const taskUpdates = fake.client.query.mock.calls.filter(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))
+    expect(taskUpdates).toHaveLength(1)
+    expect(taskUpdates[0]?.[1]?.[0]).toBe("recovered-2")
+    expect(fake.calls.filter(sql => sql.includes("SAVEPOINT"))).toEqual([
+      "SAVEPOINT subagent_expiry_recovery_candidate", "ROLLBACK TO SAVEPOINT subagent_expiry_recovery_candidate",
+      "RELEASE SAVEPOINT subagent_expiry_recovery_candidate", "SAVEPOINT subagent_expiry_recovery_candidate",
+      "RELEASE SAVEPOINT subagent_expiry_recovery_candidate",
+    ])
+  })
+
+  it("advances through every rejected page and terminates when the fixed candidate scan is exhausted", async () => {
+    const fake = fixture({ child: true, blockedCandidateIds: ["blocked-1", "blocked-2"], candidatePages: [
+      [scanCandidate("blocked-1")], [scanCandidate("blocked-2")], [],
+    ] })
+    await expect(recoverExpired(fake.pool as PgSubagentPool, { now: checkedAt, limit: 1 })).resolves.toEqual([])
+    expect(fake.candidatePageCalls).toHaveLength(3)
+    expect(fake.candidatePageCalls.map(page => page.values.slice(3, 7))).toEqual([
+      [null, null, null, null],
+      ["session-1", false, "root-1", "blocked-1"],
+      ["session-1", false, "root-1", "blocked-2"],
+    ])
+    expect(fake.candidatePageCalls.every(page => page.values[0] === checkedAt && page.values[7] === 1)).toBe(true)
+    expect(fake.client.query.mock.calls.some(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
+    expect(fake.client.query.mock.calls.at(-1)?.[0]).toBe("COMMIT")
+  })
+
+  it("uses a non-null normalized root cursor for legacy candidates", async () => {
+    const fake = fixture({ missingPreviewCandidateIds: ["legacy-orphan"], candidatePages: [
+      [scanCandidate("legacy-orphan", "a-session", null)], [scanCandidate("recovered-2", "z-session", "root-z")],
+    ] })
+    await expect(recoverExpired(fake.pool as PgSubagentPool, { now: checkedAt, limit: 1 })).resolves.toMatchObject([
+      { id: "recovered-2", status: "queued" },
+    ])
+    expect(fake.candidatePageCalls).toHaveLength(2)
+    expect(fake.candidatePageCalls[1]?.values.slice(3, 7)).toEqual(["a-session", true, "", "legacy-orphan"])
+    expect(fake.candidatePageCalls[1]?.sql).toContain('ORDER BY task."sessionId", (task."rootTaskId" IS NULL), COALESCE(task."rootTaskId", \'\'), task."id"')
+    expect(fake.candidatePageCalls[1]?.sql).toContain('COALESCE(task."rootTaskId", \'\') AS "cursorRootKey"')
+  })
+
+  it("rolls back the whole recovery batch when a later candidate throws", async () => {
+    const fake = fixture({ throwCandidateIds: ["failure-2"], candidatePages: [
+      [scanCandidate("recovered-1"), scanCandidate("failure-2")],
+    ] })
+    await expect(recoverExpired(fake.pool as PgSubagentPool, { now: checkedAt, limit: 2 })).rejects.toThrow("candidate_failure")
+    expect(fake.calls.filter(sql => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))).toHaveLength(1)
+    expect(fake.calls.filter(sql => sql === "COMMIT")).toHaveLength(0)
+    expect(fake.calls.at(-1)).toBe("ROLLBACK")
+    expect(fake.calls.filter(sql => sql.includes("SAVEPOINT"))).toEqual([
+      "SAVEPOINT subagent_expiry_recovery_candidate", "RELEASE SAVEPOINT subagent_expiry_recovery_candidate",
+      "SAVEPOINT subagent_expiry_recovery_candidate",
+    ])
   })
 
   it("exempts only the exact consumed durable wait call from a later expiry scan", async () => {
@@ -193,6 +303,19 @@ describe("expired subagent recovery fence", () => {
     expect(fake.calls.some(sql => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
   })
 
+  it("rolls back speculative wait-step promotion when the graph rejects recovery", async () => {
+    graphMocks.prepare.mockReturnValueOnce({ blocked: true })
+    const fake = fixture({ child: true, registeredWait: true, pendingCall: true, exactWaitCall: true, waitStepStatus: "streaming" })
+    await expect(recoverExpired(fake.pool as PgSubagentPool, { now: checkedAt, limit: 10 })).resolves.toEqual([])
+    expect(fake.calls.some(sql => sql.startsWith('UPDATE "agent_steps" SET "status" = \'waiting_for_tool\''))).toBe(true)
+    expect(fake.calls.some(sql => sql.startsWith('UPDATE "agent_wait_conditions"'))).toBe(false)
+    expect(fake.calls.some(sql => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))).toBe(false)
+    expect(fake.calls.filter(sql => sql.includes("SAVEPOINT"))).toEqual([
+      "SAVEPOINT subagent_expiry_recovery_candidate", "ROLLBACK TO SAVEPOINT subagent_expiry_recovery_candidate",
+      "RELEASE SAVEPOINT subagent_expiry_recovery_candidate",
+    ])
+  })
+
   it("terminally closes an inadmissible pre-insert wait without retry and still blocks other pending calls", async () => {
     const rejected = fixture({ child: true, pendingCall: true, preinsertWaitCall: true })
     await expect(recoverExpired(rejected.pool as PgSubagentPool, { now: checkedAt, limit: 10 })).resolves.toMatchObject([
@@ -243,6 +366,9 @@ describe("expired subagent recovery fence", () => {
     expect(dispatchUpdate).toContain('"publishedAt" IS NOT NULL')
     expect(dispatchUpdate).toContain('"payload" = $6::jsonb')
     expect(dispatchUpdate).not.toContain('SET "attemptCount"')
+    expect(fake.calls.filter(sql => sql.includes("SAVEPOINT"))).toEqual([
+      "SAVEPOINT subagent_expiry_recovery_candidate", "RELEASE SAVEPOINT subagent_expiry_recovery_candidate",
+    ])
   })
 
   it("keeps ordinary expired tasks terminal at the attempt ceiling", async () => {
@@ -434,10 +560,10 @@ describe("expired subagent recovery fence", () => {
   it("bounds pause recovery to the exact Session and Turn", async () => {
     const fake = fixture()
     await recoverExpired(fake.pool as PgSubagentPool, { now: checkedAt, limit: 10, sessionId: "session-1", turnId: "turn-1" })
-    const scan = fake.calls.find(sql => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1")) ?? ""
+    const scan = fake.calls.find(sql => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $8")) ?? ""
     expect(scan).toContain('task."sessionId" = $2')
     expect(scan).toContain('task."turnId" = $3')
-    const scanCall = fake.client.query.mock.calls.find(([sql]) => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $1"))
-    expect(scanCall?.[1]).toEqual([10, "session-1", "turn-1"])
+    const scanCall = fake.client.query.mock.calls.find(([sql]) => sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("LIMIT $8"))
+    expect(scanCall?.[1]).toEqual([checkedAt, "session-1", "turn-1", null, null, null, null, 10])
   })
 })
