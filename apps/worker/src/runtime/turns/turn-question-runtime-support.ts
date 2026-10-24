@@ -51,17 +51,11 @@ export function reconcileRecoveredQuestionHistory(
       throw new Error("question_recovery_history_collision")
     }
   }
-  const presentIds = new Set(snapshotHistory.map(entry => entry.id))
-  const presentPairs = new Set(pairs.filter(([question, answer]) => presentIds.has(question.id) || presentIds.has(answer.id)))
-  const orderedHistory: ContextHistoryEntry[] = []
-  const emitted = new Set<[ContextHistoryEntry, ContextHistoryEntry]>()
-  for (const entry of snapshotHistory) {
-    const pair = pairs.find(([question, answer]) => entry.id === question.id || entry.id === answer.id)
-    if (!pair) orderedHistory.push(entry)
-    else if (!emitted.has(pair)) { orderedHistory.push(...pair); emitted.add(pair) }
+  // Snapshot order is canonical by ID; only the validated recovery sequence carries Q/A chronology.
+  return {
+    snapshotHistory: snapshotHistory.filter(entry => !recoveredById.has(entry.id)),
+    historyToAppend: pairs.flatMap(pair => pair),
   }
-  const historyToAppend = pairs.filter(pair => !presentPairs.has(pair)).flatMap(pair => pair)
-  return { snapshotHistory: orderedHistory, historyToAppend }
 }
 
 /** Snapshot ID ordering is canonical; omit its Q/A IDs only while lineage validates their chronology. */

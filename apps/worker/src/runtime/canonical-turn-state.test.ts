@@ -17,6 +17,9 @@ import { buildModelRequest } from "./turns/turn-engine-messages.js"
 import { NATIVE_VERIFICATION_CONTROL_SCHEMA, NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA, NATIVE_VERIFICATION_PACKET_SCHEMA, digestNativeVerificationValue, type NativeVerificationControl, type NativeVerificationPacket } from "./subagents/native-verification-contract.js"
 import { createNativeVerificationContext } from "./subagents/native-verification-packet.js"
 import { attachNativeVerificationReport, parseNativeVerificationModelReport } from "./subagents/native-verification-report.js"
+import { questionId, questionItemId } from "./turns/turn-question-store-guards.js"
+import { TURN_QUESTION_INTENT_SCHEMA } from "./turns/turn-question-contract.js"
+import { TURN_QUESTION_PLANNING_EVENT_TYPE, TURN_QUESTION_PLANNING_SCHEMA_VERSION, turnQuestionPlanningEventKey } from "./turns/turn-question-planning-contract.js"
 
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 1,
@@ -38,7 +41,7 @@ function agendaEvent(sequence = "20", patch: Record<string, unknown> = {}, fence
   return { id: `agenda-${sequence}`, type: COGNITIVE_AGENDA_EVENT_TYPE, actor: "system", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null, sequence, payload: { ...value, ...patch } }
 }
 
-function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unknown>[]; items?: Record<string, unknown>[]; questionItems?: Record<string, unknown>[]; inputs?: Record<string, unknown>[]; events?: Record<string, unknown>[]; questionEvents?: Record<string, unknown>[]; snapshots?: Record<string, unknown>[]; nativeRoots?: Record<string, unknown>[]; historyTurns?: Record<string, unknown>[]; nativeControls?: Record<string, unknown>[]; steerGuard?: unknown; priorTurns?: Record<string, unknown>[]; priorQuestions?: Record<string, unknown>[]; priorCalls?: Record<string, unknown>[]; priorSteps?: Record<string, unknown>[]; priorQuestionEvents?: Record<string, unknown>[] }) {
+function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unknown>[]; items?: Record<string, unknown>[]; questionItems?: Record<string, unknown>[]; inputs?: Record<string, unknown>[]; events?: Record<string, unknown>[]; questionEvents?: Record<string, unknown>[]; planningEvents?: Record<string, unknown>[]; snapshots?: Record<string, unknown>[]; nativeRoots?: Record<string, unknown>[]; historyTurns?: Record<string, unknown>[]; nativeControls?: Record<string, unknown>[]; steerGuard?: unknown; priorTurns?: Record<string, unknown>[]; priorQuestions?: Record<string, unknown>[]; priorCalls?: Record<string, unknown>[]; priorSteps?: Record<string, unknown>[]; priorQuestionEvents?: Record<string, unknown>[] }) {
   const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
     if (sql.includes('SELECT EXISTS') && sql.includes('FROM "agent_inputs"')) return { rows: [{ hasSteer: Object.hasOwn(rows, "steerGuard") ? rows.steerGuard : false }], rowCount: 1 }
     if (sql.includes('FROM "sub_agent_tasks" AS root')) return { rows: rows.nativeRoots ?? [], rowCount: rows.nativeRoots?.length ?? 0 }
@@ -52,12 +55,20 @@ function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unk
     }
     if (sql.includes('FROM "agent_items" AS question')) return { rows: rows.priorQuestions ?? [], rowCount: rows.priorQuestions?.length ?? 0 }
     if (sql.includes('FROM "agent_items" AS call')) return { rows: rows.priorCalls ?? [], rowCount: rows.priorCalls?.length ?? 0 }
+    if (sql.includes('FROM "agent_steps" AS step') && sql.includes('WHERE step."id" = $1')) {
+      const result = (rows.steps ?? []).filter(step => step.id === values?.[0])
+      return { rows: result, rowCount: result.length }
+    }
     if (sql.includes('FROM "agent_steps" AS step')) return { rows: rows.priorSteps ?? [], rowCount: rows.priorSteps?.length ?? 0 }
     if (sql.includes('FROM "agent_items" AS item') && values?.[1] === "prior-turn") return { rows: rows.priorQuestions ?? [], rowCount: rows.priorQuestions?.length ?? 0 }
+    if (sql.includes('FROM "agent_items" AS item') && sql.includes('WHERE item."id" = $1')) {
+      const result = (rows.questionItems ?? []).filter(item => item.id === values?.[0])
+      return { rows: result, rowCount: result.length }
+    }
     if (sql.includes('"input"') && sql.includes('FROM "agent_turns"')) return { rows: rows.turn ? [{ id: "turn-1", sessionId: "session-1", userId: "user-1", status: "in_progress", leaseOwnerId: lease.ownerId, leaseVersion: lease.leaseVersion, leaseExpiresAt: lease.leaseExpiresAt, createdAt: new Date("2026-10-06T10:00:00.000Z"), ...rows.turn }] : [], rowCount: rows.turn ? 1 : 0 }
     if (sql.includes('MAX("ordinal")')) return { rows: [{ maxOrdinal: Math.max(...(rows.steps ?? []).map(step => Number(step.ordinal ?? -1)), -1) }], rowCount: 1 }
     if (sql.includes('FROM "agent_steps"')) return { rows: (rows.steps ?? []).filter(step => step.taskId === undefined || step.taskId === null || step.taskId === values?.[2]), rowCount: rows.steps?.length ?? 0 }
-    if (sql.includes('FROM "agent_events"') && sql.includes('"idempotencyKey" = ANY')) return { rows: [], rowCount: 0 }
+    if (sql.includes('FROM "agent_events"') && sql.includes('"idempotencyKey" = ANY')) return { rows: rows.planningEvents ?? [], rowCount: rows.planningEvents?.length ?? 0 }
     if (sql.includes('FROM "agent_events"') && sql.includes('event."itemId" = ANY')) {
       const result = values?.[1] === "prior-turn" ? rows.priorQuestionEvents ?? [] : rows.questionEvents ?? []
       return { rows: result, rowCount: result.length }
@@ -72,6 +83,12 @@ function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unk
     }
     if (sql.includes('FROM "agent_items"')) {
       if (sql.includes('item."type" = \'question\'')) return { rows: rows.questionItems ?? [], rowCount: rows.questionItems?.length ?? 0 }
+      if (sql.includes('"type" = \'tool_call\'') || sql.includes('"type" = \'tool_result\'')) {
+        const type = sql.includes('"type" = \'tool_call\'') ? "tool_call" : "tool_result"
+        const result = (rows.items ?? []).filter(item => item.type === type && item.stepId === values?.[2]
+          && item.taskId === values?.[3] && (item.content as Record<string, unknown> | undefined)?.toolCallId === values?.[4])
+        return { rows: result, rowCount: result.length }
+      }
       const filtered = sql.includes('item_task') ? (rows.items ?? []).filter(item => item.taskId === undefined || item.taskId === null || item.taskId === "root-1") : (rows.items ?? []).filter(item => item.taskId === undefined || item.taskId === null || item.taskId === values?.[2])
       return { rows: filtered, rowCount: filtered.length }
     }
@@ -206,9 +223,9 @@ describe("loadCanonicalTurnState", () => {
     const reloaded = await loadCanonicalTurnState(pool({ ...options, snapshots: [{ id: "snapshot-1", throughSequence: "4", version: 2, content: persisted }] }), lease)
     expect(reloaded.snapshot.steerHistory.filter(item => item.id.startsWith("native-verification-advisory:"))).toHaveLength(1)
     expect(reloaded.snapshot.steerHistory).toEqual([
+      ordinary,
       { id: "agent-question:current-question:question", content: { role: "assistant", type: "question", question: "Which city?", options: [] } },
       { id: "agent-question:current-question:answer", content: { role: "user", type: "answer", questionId: "current-wait", text: "Dublin" } },
-      ordinary,
       expect.objectContaining({ id: "native-verification-advisory:0" }),
     ])
     for (const collision of [
@@ -382,6 +399,141 @@ describe("loadCanonicalTurnState", () => {
     const orderedToolItemsQuery = fake.client.query.mock.calls.find(([sql]) => typeof sql === "string" && sql.includes("'tool_call', 'tool_result'"))?.[0]
     expect(orderedToolItemsQuery).toContain('ORDER BY "createdAt" ASC, "id" ASC')
     expect(value.snapshot).not.toHaveProperty("planningClarificationHistoryPair")
+  })
+
+  it("keeps answered Q/A in answer-event order and anchors the latest safe summary to its exact pair", async () => {
+    const options = [{ label: "Dublin", value: "dublin" }]
+    const pairs = ["step-b", "step-a"].map((stepId, ordinal) => {
+      const toolCallId = `question-call-${ordinal + 1}`
+      const waitId = questionId({ sessionId: "session-1", turnId: "turn-1" }, stepId, toolCallId)
+      const itemId = questionItemId(waitId)
+      const question = `Which city should question ${ordinal + 1} prioritize?`
+      const answer = `Private answer ${ordinal + 1}`
+      const intent = { schemaVersion: TURN_QUESTION_INTENT_SCHEMA, kind: "user_question", stage: "user_input", question, options }
+      return { stepId, ordinal, toolCallId, waitId, itemId, question, answer, intent,
+        history: [
+          { id: `agent-question:${itemId}:question`, content: { role: "assistant", type: "question", question, options } },
+          { id: `agent-question:${itemId}:answer`, content: { role: "user", type: "answer", questionId: waitId, text: answer } },
+        ] as ContextHistoryEntry[] }
+    })
+    const snapshotPairOrder = [...pairs].sort((left, right) => left.itemId.localeCompare(right.itemId))
+    const answerEventOrder = [...snapshotPairOrder].reverse()
+    const olderAnsweredPair = answerEventOrder[0]!
+    const newerAnsweredPair = answerEventOrder[1]!
+    const canonicalLatestPair = pairs[1]!
+    expect(snapshotPairOrder.map(pair => pair.stepId)).toEqual(["step-b", "step-a"])
+    expect(answerEventOrder.map(pair => pair.stepId)).toEqual(["step-a", "step-b"])
+    expect(canonicalLatestPair).not.toBe(newerAnsweredPair)
+    const safeSummary = { observedPlanRevision: 3, graphRevisionAtAsk: 7, pendingSteerCount: 0, unconsumedSteerCount: 0, inputThroughSequence: "12" }
+    const ordinaryHistory = [
+      { id: "0-ordinary-before", content: { role: "user", text: "Keep first ordinary steer" } },
+      { id: "agent-question;ordinary-between", content: { role: "assistant", text: "Keep middle ordinary history" } },
+      { id: "z-ordinary-after", content: { role: "user", text: "Keep last ordinary steer" } },
+    ]
+    const steps = pairs.map(pair => ({ id: pair.stepId, taskId: "root-1", ordinal: pair.ordinal, attempt: 1, status: "completed",
+      finishReason: "tool_calls", inputThroughSequence: "0", consumedInputIds: [], inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0 }))
+    const items = pairs.flatMap(pair => [
+      { id: `call-item-${pair.ordinal}`, sessionId: "session-1", turnId: "turn-1", taskId: "root-1", stepId: pair.stepId,
+        type: "tool_call", status: "completed", revision: 1,
+        content: { toolCallId: pair.toolCallId, toolName: "agent.ask_user", toolVersion: "1", status: "completed", errorCode: null,
+          input: { question: pair.question, choices: options } } },
+      { id: `result-item-${pair.ordinal}`, sessionId: "session-1", turnId: "turn-1", taskId: "root-1", stepId: pair.stepId,
+        type: "tool_result", status: "completed", revision: 1, content: { toolCallId: pair.toolCallId, output: pair.intent, errorCode: null } },
+    ])
+    const questionItems = pairs.map(pair => ({ id: pair.itemId, revision: 1, userId: "user-1", turnUserId: "user-1", sessionId: "session-1",
+      turnId: "turn-1", taskId: "root-1", stepId: pair.stepId, type: "question", status: "completed",
+      content: { stage: "user_input", waitKind: "question", questionId: pair.waitId, toolCallId: pair.toolCallId,
+        question: pair.question, options, answer: pair.answer, answerAvailable: true } }))
+    const questionEvents = answerEventOrder.flatMap((pair, index) => {
+      const startedSequence = String(index * 2 + 1), answeredSequence = String(index * 2 + 2)
+      return [
+        { id: `started-${pair.stepId}`, userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "root-1",
+          itemId: pair.itemId, type: "item.started", actor: "orchestrator", sequence: startedSequence,
+          correlationId: pair.itemId, causationId: pair.waitId, payload: { itemId: pair.itemId, waitKind: "question", toolCallId: pair.toolCallId } },
+        { id: `answered-${pair.stepId}`, userId: "user-1", turnUserId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: null,
+          itemId: pair.itemId, type: "question.answered", actor: "user", sequence: answeredSequence,
+          correlationId: pair.waitId, causationId: pair.itemId,
+          payload: { waitKind: "question", waitId: pair.waitId, itemId: pair.itemId, turnId: "turn-1", toolCallId: pair.toolCallId, status: "answered" } },
+      ]
+    })
+    const planningEvents = pairs.map(pair => {
+      const receipt = { schemaVersion: TURN_QUESTION_PLANNING_SCHEMA_VERSION, sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
+        stepId: pair.stepId, toolCallId: pair.toolCallId, waitId: pair.waitId, questionItemId: pair.itemId,
+        observedPlanRevision: pair === canonicalLatestPair ? safeSummary.observedPlanRevision : 2,
+        graphRevisionAtAsk: pair === canonicalLatestPair ? safeSummary.graphRevisionAtAsk : 6,
+        pendingSteers: [], inputCheckpoint: { throughSequence: "12", consumedInputIds: [] } }
+      return { id: `planning-${pair.stepId}`, sessionId: "session-1", turnId: "turn-1", taskId: "root-1", itemId: null,
+        type: TURN_QUESTION_PLANNING_EVENT_TYPE, actor: "orchestrator", correlationId: "turn-1", causationId: null,
+        idempotencyKey: turnQuestionPlanningEventKey("turn-1", pair.waitId), sequence: String(40 + pair.ordinal), payload: receipt }
+    })
+    const staleGoal = "Stale snapshot goal must not replace the current Turn goal"
+    const content = {
+      schemaVersion: "agent-harness.context.v1", ownerId: "user-1", sessionId: "session-1", throughSequence: "20", goal: staleGoal,
+      userConstraints: [], confirmedDecisions: [], completedWork: [], openWork: [], pendingApprovals: [], artifacts: [], facts: [], failedAttempts: [],
+      references: [], consumedInputIds: [], context: { system: [], profile: [], steerHistory: [], toolObservations: [] },
+      tokenAccounting: { profiles: [], totalInputTokens: 0, totalOutputTokens: 0, totalCostUsd: 0 },
+    }
+    const rows = {
+      turn: { input: { goal: "Current Turn goal" }, rootTaskId: "root-1", contextSnapshotId: "snapshot-pinned", modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+      steps, items, questionItems, questionEvents, planningEvents,
+    }
+    const snapshotCases = [
+      { name: "both Q/A pairs were snapshotted in stable-ID order", includedPairs: snapshotPairOrder },
+      { name: "the older answered pair is absent while the newer pair is snapshotted", includedPairs: [newerAnsweredPair] },
+    ]
+    expect(snapshotCases[1]!.includedPairs).not.toContain(olderAnsweredPair)
+
+    for (const scenario of snapshotCases) {
+      const snapshotHistory = [
+        ...ordinaryHistory,
+        ...scenario.includedPairs.flatMap(pair => pair.history),
+      ].sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0)
+      const snapshotContent = { ...content, context: { ...content.context, steerHistory: snapshotHistory } }
+      const fake = pool({ ...rows, snapshots: [{ id: "snapshot-pinned", throughSequence: "20", version: 1, content: snapshotContent }] })
+      const value = await loadCanonicalTurnState(fake, lease)
+      const pairHistory = value.snapshot.steerHistory.filter(entry => entry.id.startsWith("agent-question:"))
+      const expectedAnswerOrder = answerEventOrder.flatMap(pair => pair.history)
+      expect(value.contextSnapshotPinned).toBe(true)
+      expect(value.snapshot.goal?.content).toBe("Current Turn goal")
+      expect(value.snapshot.steerHistory.filter(entry => !entry.id.startsWith("agent-question:")).map(entry => entry.id))
+        .toEqual(["0-ordinary-before", "agent-question;ordinary-between", "z-ordinary-after"])
+      expect(pairHistory, scenario.name).toEqual(expectedAnswerOrder)
+
+      const expectedPair = { questionEntryId: canonicalLatestPair.history[0]!.id, answerEntryId: canonicalLatestPair.history[1]!.id }
+      expect(value.snapshot.planningClarifications).toEqual([safeSummary])
+      expect(value.snapshot.planningClarificationHistoryPair).toEqual(expectedPair)
+      const claimStore: InputClaimStore = {
+        scope: { userId: "user-1" },
+        async withTransaction<T>(work: (transaction: InputClaimTransaction) => Promise<T>): Promise<T> {
+          return work({ getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }),
+            claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }), persistCheckpoint: async () => undefined })
+        },
+      }
+      const context = await new StepContextBuilder(claimStore).build({
+        scope: { userId: "user-1" }, sessionId: "session-1", turnId: "turn-1", stepId: "resume-step", snapshot: value.snapshot, now: new Date(0),
+      })
+      const blockIds = context.blocks.map(block => block.id)
+      expect(context.blocks.filter(block => block.id.startsWith("history:agent-question:")).map(block => block.id))
+        .toEqual(expectedAnswerOrder.map(entry => `history:${entry.id}`))
+      const ordinaryBlockIds = ordinaryHistory.map(entry => `history:${entry.id}`)
+      expect(blockIds.filter(id => ordinaryBlockIds.includes(id))).toEqual(ordinaryBlockIds)
+      const questionBlockIndex = blockIds.indexOf(`history:${expectedPair.questionEntryId}`)
+      expect(questionBlockIndex, scenario.name).toBeGreaterThanOrEqual(0)
+      expect(blockIds.slice(questionBlockIndex, questionBlockIndex + 3), scenario.name).toEqual([
+        `history:${expectedPair.questionEntryId}`, `history:${expectedPair.answerEntryId}`, "planning-clarification:latest-answered-question",
+      ])
+      const summaryBlock = context.blocks.find(block => block.id === "planning-clarification:latest-answered-question")
+      expect(summaryBlock?.content).toEqual(safeSummary)
+      const serializedSummary = JSON.stringify(context.planningClarifications)
+      for (const privateId of [canonicalLatestPair.waitId, canonicalLatestPair.toolCallId, canonicalLatestPair.itemId,
+        expectedPair.questionEntryId, expectedPair.answerEntryId]) {
+        expect(serializedSummary).not.toContain(privateId)
+      }
+      expect(context).not.toHaveProperty("planningClarificationHistoryPair")
+      expect(context.canonicalJson).not.toContain("planningClarificationHistoryPair")
+      expect(context.canonicalJson).not.toContain("questionEntryId")
+      expect(context.canonicalJson).not.toContain("answerEntryId")
+    }
   })
 
   it("restores a complete earlier root answer after compaction as untrusted model history without replacing the current goal", async () => {
