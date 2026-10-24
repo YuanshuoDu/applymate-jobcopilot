@@ -435,14 +435,14 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(blockerStateBeforeRecovery.map(blocker => blocker.dispatchOutbox)).toEqual(Array.from({ length: 50 }, () => []))
       const blockers = await pool.query<{ blockerCount: number; eligibleCount: number; unsettledCount: number }>(
         `SELECT COUNT(DISTINCT task."id")::int AS "blockerCount",
-          COUNT(DISTINCT task."id") FILTER (WHERE task."status" = 'running' AND task."attemptCount" = 1
+          (COUNT(DISTINCT task."id") FILTER (WHERE task."status" = 'running' AND task."attemptCount" = 1
             AND task."leaseExpiresAt" <= clock_timestamp() AND (task."nextAttemptAt" IS NULL OR task."nextAttemptAt" <= clock_timestamp())
             AND step."status" = 'streaming' AND call."type" = 'tool_call' AND call."status" = 'started'
             AND started."type" = 'tool_call.started' AND started."correlationId" = call."content"->>'toolCallId'
             AND NOT EXISTS (SELECT 1 FROM "agent_events" AS settled WHERE settled."sessionId" = task."sessionId"
               AND settled."taskId" = task."id" AND settled."correlationId" = started."correlationId"
-              AND settled."type" IN ('tool_call.completed', 'tool_call.failed', 'tool_call.interrupted'))) AS "eligibleCount",
-          COUNT(DISTINCT task."id") FILTER (WHERE started."id" IS NOT NULL AND settled."id" IS NULL) AS "unsettledCount"
+              AND settled."type" IN ('tool_call.completed', 'tool_call.failed', 'tool_call.interrupted'))))::int AS "eligibleCount",
+          (COUNT(DISTINCT task."id") FILTER (WHERE started."id" IS NOT NULL AND settled."id" IS NULL))::int AS "unsettledCount"
          FROM "sub_agent_tasks" AS task
          JOIN "agent_steps" AS step ON step."sessionId" = task."sessionId" AND step."turnId" = task."turnId" AND step."taskId" = task."id"
          JOIN "agent_items" AS call ON call."sessionId" = task."sessionId" AND call."turnId" = task."turnId"
