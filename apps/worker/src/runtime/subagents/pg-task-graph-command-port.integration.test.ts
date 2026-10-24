@@ -856,8 +856,10 @@ async function prepareFailedBranchReplan(pool: PgPool, commandPool: PgPool, role
   if (!target) throw new Error("Failed-branch fixture lost its retained repair target")
   await failQueuedTypedTask(commandPool, value, target.taskId, `worker-fail-repair-target-${randomUUID()}`)
   const afterTargetFailure = await command.readCurrent(readScope(value))
-  if (afterTargetFailure.revision !== 2 || afterTargetFailure.nodes.find(node => node.key === "reserve-target")?.status !== "failed") {
-    throw new Error("Failed-branch fixture did not persist its retained target failure")
+  const targetStatus = afterTargetFailure.nodes.find(node => node.key === "reserve-target")?.status
+  // The real claim and terminal finish persist task.started and task.failed lifecycle revisions.
+  if (afterTargetFailure.revision !== initial.revision + 2 || targetStatus !== "failed") {
+    throw new Error(`Failed-branch fixture did not persist its retained target failure (revision ${afterTargetFailure.revision}, status ${targetStatus ?? "missing"})`)
   }
 
   await pool.query(`INSERT INTO "agent_steps"
@@ -872,7 +874,7 @@ async function prepareFailedBranchReplan(pool: PgPool, commandPool: PgPool, role
     dependsOn: [], verification: ANALYST_VERIFICATION,
     repairOf: { graphRootTaskId: value.rootTaskId, nodeKey: "reserve-target", taskId: target.taskId, criterionIds: ["finding-count"] },
   }] } })
-  if (repair.revision !== 3 || repair.nodes[0]?.status !== "queued") throw new Error("Failed-branch fixture could not use the real repair reserve")
+  if (repair.revision !== afterTargetFailure.revision + 1 || repair.nodes[0]?.status !== "queued") throw new Error("Failed-branch fixture could not use the real repair reserve")
 
   const sourceScout = initial.nodes.find(node => node.key === "source-scout"), sourceAnalyst = initial.nodes.find(node => node.key === "source-analyst")
   if (!sourceScout || !sourceAnalyst) throw new Error("Failed-branch fixture lost the Scout source")
