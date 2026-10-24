@@ -580,6 +580,14 @@ async function nextEventSequence(pool: PgPool, value: Fixture): Promise<bigint> 
   return BigInt(sequence)
 }
 
+async function syncEventSequenceToPersistedEvents(pool: PgPool, value: Fixture): Promise<void> {
+  const result = await pool.query<{ eventSequence: string | bigint }>(`UPDATE "agent_sessions"
+    SET "eventSequence" = GREATEST("eventSequence", COALESCE((
+      SELECT MAX("sequence") FROM "agent_events" WHERE "sessionId" = $1
+    ), 0)) WHERE "id" = $1 RETURNING "eventSequence"`, [value.sessionId])
+  if (result.rows.length !== 1) throw new Error("TaskGraph reconciliation fixture could not synchronize its event sequence")
+}
+
 type TypedSupersessionOptions = Readonly<{
   includeIndependentPrerequisite?: boolean
   includeWaitingLegacyDependency?: boolean
@@ -913,6 +921,7 @@ async function prepareFailedBranchReplan(pool: PgPool, commandPool: PgPool, role
     if (native.status !== "accepted" || native.graphRevision !== current.revision + 1 || native.child.status !== "queued") {
       throw new Error("Failed-branch fixture could not append its native graph snapshot")
     }
+    await syncEventSequenceToPersistedEvents(pool, value)
     current = await command.readCurrent(readScope(value))
     if (current.nodes.length !== 8 || !current.nodes.some(node => node.taskId === native.child.taskId)) {
       throw new Error("Failed-branch fixture did not retain its native task at the graph limit")
@@ -3351,6 +3360,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'tool_call.started' AND "correlationId" = $3`,
     [value.sessionId, value.turnId, value.planCallId])
     expect(call.rows).toHaveLength(1)
+    expect(BigInt(nativeEvent.rows[0]!.sequence)).toBeLessThan(BigInt(call.rows[0]!.sequence))
     const latestBeforeCall = await adminPool!.query<{ id: string; sequence: string; payload: unknown }>(
       `SELECT "id", "sequence"::text AS "sequence", "payload" FROM "agent_events"
         WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3 AND "type" IN ('item.started', 'item.delta')
