@@ -40,13 +40,15 @@ describe('POST /api/me/persona/fields', () => {
   it('stores only a valid user-confirmed field and records the save time', async () => {
     const { POST } = await import('./route')
     const response = await POST(new Request('http://localhost/api/me/persona/fields', {
-      method: 'POST', body: JSON.stringify({ fields: [{ key: 'notice_period', label: 'Notice period', value: 'One month', category: 'work', confidence: 1, source: 'manual', updatedAt: '' }] }),
+      method: 'POST', body: JSON.stringify({ fields: [{ key: 'notice_period', label: 'Notice period', value: 'One month', category: 'work', confidence: 1, source: 'manual', updatedAt: '', allowedUses: ['discovery'] }] }),
     }) as never)
 
     expect(response.status).toBe(200)
     const payload = await response.json()
     expect(payload.fields[0]).toMatchObject({ key: 'notice_period', consentAt: expect.any(String) })
     expect(mocks.confirm).toHaveBeenCalledWith('user_1', [expect.objectContaining({ key: 'notice_period' })])
+    expect(mocks.confirm.mock.calls[0]?.[1][0]).not.toHaveProperty('allowedUses')
+    expect(mocks.update.mock.calls[0]?.[0].data.personaFields[0]).not.toHaveProperty('allowedUses')
   })
 
   it('does not persist sensitive data', async () => {
@@ -67,5 +69,22 @@ describe('POST /api/me/persona/fields', () => {
     expect(response.status).toBe(200)
     expect(mocks.list).toHaveBeenCalledWith('user_1', 'form_fill')
     expect(response.headers.get('Cache-Control')).toBe('private, no-store')
+  })
+
+  it('keeps discovery out of the generic Persona reader', async () => {
+    const { GET } = await import('./route')
+    const response = await GET(new Request('http://localhost/api/me/persona/fields?use=discovery') as never)
+    expect(response.status).toBe(400)
+    await expect(response.json()).resolves.toEqual({ error: 'use must be form_fill, tailor, or cover_letter' })
+    expect(mocks.list).not.toHaveBeenCalled()
+  })
+
+  it('routes full deletion through the locked full-fact revoke', async () => {
+    const { DELETE } = await import('./route')
+    const response = await DELETE(new Request('http://localhost/api/me/persona/fields', {
+      method: 'DELETE', body: JSON.stringify({ key: 'notice_period' }),
+    }) as never)
+    expect(response.status).toBe(200)
+    expect(mocks.revoke).toHaveBeenCalledWith('user_1', 'notice_period')
   })
 })

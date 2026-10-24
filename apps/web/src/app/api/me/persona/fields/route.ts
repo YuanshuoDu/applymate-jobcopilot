@@ -40,11 +40,19 @@ export async function POST(req: NextRequest) {
   }
 
   if (body.fields.length > 100) return err('A Persona can contain at most 100 saved fields.')
-  const incoming: PersonaField[] = body.fields
-  for (const field of incoming) {
+  const rawFields: unknown[] = body.fields
+  for (const field of rawFields) {
     const validationError = validatePersonaField(field)
     if (validationError) return err(validationError)
   }
+  const incoming: PersonaField[] = rawFields.map(value => {
+    const field = value as PersonaField
+    return {
+      key: field.key, category: field.category, label: field.label, value: field.value,
+      confidence: Number.isFinite(field.confidence) ? field.confidence : 1,
+      source: typeof field.source === 'string' ? field.source : 'manual', updatedAt: '',
+    }
+  })
 
   // Fetch existing fields
   const user = await db.user.findUnique({

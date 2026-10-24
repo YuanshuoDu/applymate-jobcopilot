@@ -27,7 +27,11 @@ import { createCanonicalTurnContextBuilder } from "./canonical-turn-context-buil
 import { mergeTaskGraphCurrentObservation } from "./canonical-turn-task-graph-context.js"
 import type { DirectSelectedJobHistoryReader, SelectedJobHistoryReader } from "./canonical-turn-selected-job-history.js"
 import type { DirectRootTaskHistoryReader } from "./canonical-turn-root-task-history.js"
+import type { StepContext } from "./context/step-context-builder.js"
 import type { TurnLease } from "./turns/lease.js"
+
+const discoveryPersona = vi.hoisted(() => ({ load: vi.fn() }))
+vi.mock("./context/discovery-persona-facts-pg.js", () => ({ loadOrCreateDiscoveryPersonaSnapshot: discoveryPersona.load }))
 
 const scope: TenantScope = { userId: "user-a" }
 const now = new Date("2026-10-07T12:00:00.000Z")
@@ -158,6 +162,65 @@ function loadedHistoryGraphFixture(): LoadedGraph {
 }
 
 describe("canonical Turn context builder", () => {
+  it("adds the frozen Persona projection ephemerally to ordinary planning context after the base build", async () => {
+    const projection = { schemaVersion: "applymate.discovery-persona-projection.v1" as const, purpose: "discovery" as const,
+      facts: [{ factId: "persona-fact-1", key: "preferred_location", label: "Preferred location", category: "preferences",
+        source: "manual", value: "PRIVATE_EPHEMERAL_FACT_SENTINEL", normalizedValue: "private_ephemeral_fact_sentinel", updatedAt: "2026-10-24T12:00:00.000Z" }] }
+    discoveryPersona.load.mockResolvedValue({ kind: "accepted", projection })
+    let baseSnapshot: StepContextRequest["snapshot"] | undefined
+    const genericSnapshot: StepContextRequest["snapshot"] = { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }
+    const baseContext = (request: StepContextRequest): StepContext => ({ schemaVersion: "agent-harness.v2",
+      sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId, inputThroughSequence: 0n,
+      consumedInputIds: [], blocks: [{ id: "base-goal", layer: "goal", role: "data", trust: "external_untrusted",
+        source: "turn_goal", content: "Find suitable roles" }], canonicalJson: "base-context-json" })
+    const baseBuilder = { build: vi.fn(async (request: StepContextRequest) => {
+      baseSnapshot = request.snapshot
+      return baseContext(request)
+    }) }
+    const builder = createCanonicalTurnContextBuilder({
+      pool: { connect: async () => { throw new Error("injected readers and memory mock avoid database access") } } as unknown as Pick<pg.Pool, "connect">,
+      store: store([]), baseBuilder, scope, lease, rootTaskId: "root-a", rootAttemptCount: 4,
+      planningEnabled: true, selectedJobMode: false, discoveryPersonaMemoryEnabled: true,
+      rootTaskHistoryDirectReader: { load: async () => [] }, currentRootBudgetReader: async () => unavailableBudget,
+    })
+    const context = await builder.build({ scope, sessionId: lease.sessionId, turnId: lease.turnId, stepId: "step-memory", snapshot: genericSnapshot })
+
+    expect(discoveryPersona.load).toHaveBeenCalledWith(expect.anything(), {
+      scope, lease, rootTaskId: "root-a", rootAttemptCount: 4, stepId: "step-memory",
+    })
+    expect(JSON.stringify(baseSnapshot)).not.toContain("PRIVATE_EPHEMERAL_FACT_SENTINEL")
+    expect(JSON.stringify(baseSnapshot)).not.toContain("persona-fact-1")
+    expect(JSON.stringify(genericSnapshot)).not.toContain("PRIVATE_EPHEMERAL_FACT_SENTINEL")
+    expect(JSON.stringify(genericSnapshot)).not.toContain("persona-fact-1")
+    expect(context.blocks).toContainEqual(expect.objectContaining({ id: "discovery-persona-context-policy", layer: "system",
+      role: "instruction", trust: "system", source: "discovery_persona_context_policy" }))
+    expect(context.blocks).toContainEqual(expect.objectContaining({ id: "confirmed-persona-facts", layer: "business",
+      role: "data", trust: "external_untrusted", source: "confirmed_persona_facts", content: JSON.stringify(projection) }))
+    expect(context.canonicalJson).toContain("PRIVATE_EPHEMERAL_FACT_SENTINEL")
+    expect(context.canonicalJson).not.toBe("base-context-json")
+  })
+
+  it("does not load Persona memory outside the exact enabled ordinary-planning builder gates", async () => {
+    discoveryPersona.load.mockReset()
+    const baseBuilder = { build: vi.fn(async (request: StepContextRequest): Promise<StepContext> => ({
+      schemaVersion: "agent-harness.v2", sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId,
+      inputThroughSequence: 0n, consumedInputIds: [], blocks: [], canonicalJson: "{}",
+    })) }
+    const makeBuilder = (planningEnabled: boolean, selectedJobMode: boolean, enabled: boolean) => createCanonicalTurnContextBuilder({
+      pool: { connect: async () => { throw new Error("injected readers avoid database access") } } as unknown as Pick<pg.Pool, "connect">,
+      store: store([]), baseBuilder, scope, lease, rootTaskId: "root-a", rootAttemptCount: 4,
+      planningEnabled, selectedJobMode, discoveryPersonaMemoryEnabled: enabled,
+      ...(selectedJobMode ? { selectedJobDirectHistoryReader: { load: async () => [] } } : {}),
+      ...(planningEnabled ? { rootTaskHistoryDirectReader: { load: async () => [] }, currentRootBudgetReader: async () => unavailableBudget } : {}),
+    })
+    const build = (builder: ReturnType<typeof makeBuilder>) => builder.build({ scope, sessionId: lease.sessionId, turnId: lease.turnId,
+      stepId: "step-disabled", snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] } })
+    await build(makeBuilder(true, false, false))
+    await build(makeBuilder(false, false, true))
+    await build(makeBuilder(true, true, true))
+    expect(discoveryPersona.load).not.toHaveBeenCalled()
+  })
+
   it("injects only server-owned native-root scope into the same-client historical steering reader", async () => {
     const calls: unknown[] = []
     const builder = createCanonicalTurnContextBuilder({

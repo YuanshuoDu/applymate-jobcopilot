@@ -33,4 +33,54 @@ describe("AgentForkService Turn projection", () => {
     expect(sourceRead.select.turns.select).toEqual(agentForkTurnSelect)
     expect(Object.keys(agentForkTurnSelect)).not.toContain("nativeSemanticProgressMode")
   })
+
+  it("excludes automatic discovery-memory events while keeping selected visible history", async () => {
+    const at = new Date("2026-10-01T00:00:00.000Z")
+    const source = {
+      id: "source-session", userId: "owner", goal: "Goal", source: "user", memorySummary: null,
+      turns: [{ id: "turn-1", source: "user", status: "completed", input: { goal: "Goal" }, finalResponse: "Done",
+        error: null, modelProfileSnapshot: {}, inputTokens: 1, outputTokens: 2, estimatedCostUsd: 0,
+        durationMs: 10, startedAt: at, completedAt: at, createdAt: at }],
+      items: [{ id: "visible-item", turnId: "turn-1", type: "user_message", status: "completed", phase: "input", revision: 1,
+        content: { parts: [{ type: "text", text: "Visible user history" }] }, startedAt: at, completedAt: at, createdAt: at }],
+      events: [
+        { id: "snapshot-event", sessionId: "source-session", turnId: "turn-1", itemId: null, taskId: "root-1", sequence: BigInt(1),
+          type: "agent.plan.discovery_persona_snapshot", actor: "worker", correlationId: "turn-1", causationId: null,
+          idempotencyKey: "discovery-persona-snapshot:source-session:v1",
+          payload: { projection: { facts: [{ factId: "fact-1", value: "PRIVATE_DISCOVERY_FACT_VALUE" }] } } },
+        { id: "overflow-event", sessionId: "source-session", turnId: "turn-1", itemId: null, taskId: "root-1", sequence: BigInt(2),
+          type: "agent.plan.discovery_persona_overflow", actor: "worker", correlationId: "turn-1", causationId: null,
+          idempotencyKey: "discovery-persona-overflow:source-session:turn-1:v1",
+          payload: { observedFactCount: 33, rawValue: "PRIVATE_OVERFLOW_VALUE" } },
+        { id: "visible-event", sessionId: "source-session", turnId: "turn-1", itemId: "visible-item", taskId: null, sequence: BigInt(3),
+          type: "item.completed", actor: "worker", correlationId: "turn-1", causationId: null,
+          idempotencyKey: "visible-item:completed", payload: { status: "completed" } },
+      ],
+      contextSnapshots: [],
+    }
+    const findFirst = vi.fn(async (args: { where: { id: string } }) => args.where.id === source.id ? source : null)
+    const copiedEvents = vi.fn(async (_input: { data: Array<{ type: string; payload: unknown }> }) => ({ count: 1 }))
+    const copiedItems = vi.fn(async (_input: { data: Array<{ content: unknown }> }) => ({ count: 1 }))
+    const tx = {
+      $queryRaw: vi.fn(async () => [{ id: source.id }]),
+      agentSession: { findFirst, create: vi.fn(async () => ({})), update: vi.fn(async () => ({})) },
+      agentEvent: { findFirst: vi.fn(async () => null), create: vi.fn(async () => ({})), createMany: copiedEvents },
+      agentTurn: { createMany: vi.fn(async () => ({ count: 1 })) },
+      agentItem: { createMany: copiedItems },
+    }
+    const db = { $transaction: vi.fn(async (work: (value: typeof tx) => Promise<unknown>) => work(tx)) } as unknown as PrismaClient
+
+    const result = await new AgentForkService(db).fork({
+      sessionId: source.id, userId: source.userId, clientMessageId: "privacy-fork", source: "user", lastTurnId: "turn-1",
+    })
+
+    expect(result.disposition).toBe("forked")
+    const copied = copiedEvents.mock.calls[0]?.[0] as unknown as { data: Array<{ type: string; payload: unknown }> }
+    expect(copied.data.map(event => event.type)).toEqual(["item.completed"])
+    const visible = copiedItems.mock.calls[0]?.[0] as unknown as { data: Array<{ content: unknown }> }
+    expect(JSON.stringify(visible.data)).toContain("Visible user history")
+    const serialized = JSON.stringify({ copied: copied.data.map(({ type, payload }) => ({ type, payload })), visible: visible.data })
+    expect(serialized).not.toContain("PRIVATE_DISCOVERY_FACT_VALUE")
+    expect(serialized).not.toContain("PRIVATE_OVERFLOW_VALUE")
+  })
 })

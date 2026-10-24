@@ -5,7 +5,8 @@ import type { TurnEnginePool, TurnEngineQueryClient } from "./turn-engine-owner-
 import type { TurnExecutionOptions } from "./turn-execution-types.js"
 import { TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA, type TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
 import { NoProgressError } from "../progress.js"
-import { commitTurnNoProgress, matchedTaskGraphDenialCheckpoint, terminalizeNoProgressFailure, withTaskGraphDenialCheckpoint } from "./turn-engine-no-progress-terminalization.js"
+import { commitTurnNoProgress, matchedTaskGraphDenialCheckpoint, terminalizeNoProgressFailure, terminalizeTurnExecutionError, withTaskGraphDenialCheckpoint } from "./turn-engine-no-progress-terminalization.js"
+import { TurnEngineError } from "./turn-engine-types.js"
 import { stopForRepeatedTaskGraphDenial } from "./turn-execution-final-candidate.js"
 
 const { cleanupMock } = vi.hoisted(() => ({ cleanupMock: vi.fn(async () => undefined) }))
@@ -51,6 +52,40 @@ function withCheckpoint(readCheckpoint: (client?: TurnEngineQueryClient) => Prom
 }
 
 describe("atomic no-progress terminalization", () => {
+  it("publishes safe actionable discovery-overflow response and summary without private fact values", async () => {
+    const privateValue = "PRIVATE_DISCOVERY_FACT_SENTINEL"
+    const recovery = "Confirmed Persona facts exceed the discovery memory limit. Narrow the facts shared for discovery in Persona settings, then start a new Turn."
+    const events: Array<{ type: string; payload: unknown }> = []
+    let finalItemContent: unknown
+    let persistedResponse: string | undefined
+    const writer = {
+      startItem: vi.fn(async (input: { id: string; type: string; phase: string }) => ({ ...input, revision: 0 })),
+      completeItem: vi.fn(async (_item: unknown, content: unknown) => { finalItemContent = content }),
+      append: vi.fn(async (type: string, _correlationId: string, _itemId: string | null, payload: unknown) => { events.push({ type, payload }) }),
+    }
+    const recordFinalResponse = vi.fn(async (input: { response: string }) => { persistedResponse = input.response })
+    const result = await terminalizeTurnExecutionError({
+      error: new TurnEngineError("discovery_memory_overflow", privateValue),
+      options: { identity: owner, goal: "Discover matching jobs", store: { recordFinalResponse } } as unknown as TurnExecutionOptions,
+      writer: writer as never, signal: new AbortController().signal,
+      lastStep: { id: "step-overflow", ordinal: 0 }, stepOpen: false, stepCount: 1, toolCallCount: 0,
+      usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }, now: () => now,
+      inputThroughSequence: 0n, consumedInputIds: [],
+    })
+
+    expect(result).toMatchObject({ status: "failed", errorCode: "discovery_memory_overflow", finalItemId: expect.any(String) })
+    expect(persistedResponse).toBeDefined()
+    const final = JSON.parse(persistedResponse!) as Record<string, unknown>
+    expect(final.response).toBe(recovery)
+    expect(final.summary).toBe(recovery)
+    expect(final.blocker).toBe(recovery)
+    expect(final.next).toEqual(["Narrow the confirmed facts shared for discovery in Persona settings, then start a new Turn"])
+    expect(finalItemContent).toMatchObject({ text: recovery, final: { response: recovery, summary: recovery } })
+    const failed = events.find(event => event.type === "turn.failed")
+    expect(failed?.payload).toMatchObject({ errorCode: "discovery_memory_overflow", final: { response: recovery, summary: recovery } })
+    expect(JSON.stringify({ result, final, finalItemContent, events })).not.toContain(privateValue)
+  })
+
   it.each([{ pending: true }, { staleStepFence: true }])("returns input_changed without terminal writes when the input or Step fence changed", async race => {
     const fake = fixture(race)
     await expect(commitTurnNoProgress(fake.pool, owner, response, now, withCheckpoint(fake.readCheckpoint), fake.appendEvents)).resolves.toEqual({ status: "input_changed" })
