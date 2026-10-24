@@ -1,10 +1,11 @@
 import { createHash, randomUUID } from "node:crypto"
+import { readFileSync } from "node:fs"
 import { spawn, type ChildProcess } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { once } from "node:events"
 import { Queue } from "bullmq"
 import Redis from "ioredis"
-import { Pool } from "pg"
+import { Pool, type PoolClient } from "pg"
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest"
 import { claimTurnLease, releaseTurnLease, type TurnLease } from "../turns/lease.js"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
@@ -32,6 +33,9 @@ const redisUrl = disposableRedisUrl()
 const describeWithServices = databaseUrl && redisUrl ? describe : describe.skip
 const workerFixture = fileURLToPath(new URL("./scheduled-gate-task-graph-restart.fixture.mjs", import.meta.url))
 const workerCwd = fileURLToPath(new URL("../../..", import.meta.url))
+const agentRunQuestionMigration = readFileSync(fileURLToPath(new URL(
+  "../../../../../apps/web/prisma/migrations/20261024150000_restore_agent_run_question/migration.sql", import.meta.url,
+)), "utf8")
 const zeroUsage = { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }
 const prepareGoal = "Prepare application materials using the persisted scheduled Analyze checkpoint."
 const prepareCriteria = [
@@ -57,8 +61,27 @@ let webDb: { db: { $disconnect(): Promise<void> } } | undefined
 let priorDatabaseUrl: string | undefined
 let priorAgentWebUrl: string | undefined
 let priorWorkerSecret: string | undefined
-let ownsLegacyAgentRunQuestionTable = false
 const fixtureUsers: string[] = []
+
+async function agentRunQuestionCatalog(client: PoolClient): Promise<{
+  columns: unknown[]; constraints: unknown[]; indexes: unknown[]
+}> {
+  const columns = await client.query(`SELECT attribute.attnum::int AS ordinal, attribute.attname AS name,
+      format_type(attribute.atttypid, attribute.atttypmod) AS type, attribute.attnotnull AS required,
+      pg_get_expr(column_default.adbin, column_default.adrelid) AS default
+    FROM pg_attribute attribute
+    LEFT JOIN pg_attrdef column_default
+      ON column_default.adrelid = attribute.attrelid AND column_default.adnum = attribute.attnum
+    WHERE attribute.attrelid = 'public."AgentRunQuestion"'::regclass
+      AND attribute.attnum > 0 AND NOT attribute.attisdropped ORDER BY attribute.attnum`)
+  const constraints = await client.query(`SELECT conname AS name, contype AS type,
+      pg_get_constraintdef(oid, true) AS definition, convalidated AS validated,
+      condeferrable AS deferrable, condeferred AS deferred
+    FROM pg_constraint WHERE conrelid = 'public."AgentRunQuestion"'::regclass ORDER BY conname`)
+  const indexes = await client.query(`SELECT indexname AS name, indexdef AS definition
+    FROM pg_indexes WHERE schemaname = 'public' AND tablename = 'AgentRunQuestion' ORDER BY indexname`)
+  return { columns: columns.rows, constraints: constraints.rows, indexes: indexes.rows }
+}
 
 describeWithServices("scheduled Gate durable questions across real Worker restarts", () => {
   beforeAll(async () => {
@@ -69,14 +92,6 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
     const prismaUrl = new URL(databaseUrl!)
     prismaUrl.searchParams.set("application_name", `scheduled-gate-pg-${randomUUID()}`)
     process.env.DATABASE_URL = prismaUrl.toString()
-    const legacyTable = await pool.query<{ exists: boolean }>(`SELECT to_regclass('public."AgentRunQuestion"') IS NOT NULL AS "exists"`)
-    if (legacyTable.rows[0]?.exists !== true) {
-      // Disposable-test compatibility only; this does not verify fresh migrations.
-      await pool.query(`CREATE TABLE public."AgentRunQuestion" (
-        "id" TEXT PRIMARY KEY, "userId" TEXT NOT NULL, "runId" TEXT NOT NULL, "answer" TEXT
-      )`)
-      ownsLegacyAgentRunQuestionTable = true
-    }
   })
 
   afterEach(async () => {
@@ -111,10 +126,6 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
     await queue?.close()
     await queueRedis?.quit()
     if (pool && fixtureUsers.length) await pool.query(`DELETE FROM "User" WHERE "id" = ANY($1::text[])`, [fixtureUsers])
-    if (pool && ownsLegacyAgentRunQuestionTable) {
-      await pool.query(`DROP TABLE public."AgentRunQuestion"`)
-      ownsLegacyAgentRunQuestionTable = false
-    }
     await pool?.end()
     await webDb?.db.$disconnect()
     if (priorDatabaseUrl === undefined) delete process.env.DATABASE_URL
@@ -362,11 +373,18 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
       finishReason: "stop", usage: zeroUsage, now: new Date() })
     expect(question).toMatchObject({ status: "waiting_for_user", disposition: "created", toolCallId: null })
 
+    const legacyPrefix = `agent-question:${fixture.ids.turnId}:`
+    const legacyBeforeStop = await pool.query<{ id: string }>(`SELECT "id" FROM public."AgentRunQuestion"
+      WHERE "userId"=$1 AND "runId"=$2 AND left("id", length($3))=$3`, [fixture.ids.userId, fixture.ids.sessionId, legacyPrefix])
+    expect(legacyBeforeStop.rows).toEqual([])
+
     const dbModule = "@/lib/db"
     const commandsModule = "@/lib/agent/control-plane/commands/agent-command-service"
     const webDatabase = await import(dbModule) as unknown as { db: { $disconnect(): Promise<void> } }
     webDb = webDatabase
     const commands = await import(commandsModule) as unknown as { AgentCommandService: new(db: unknown) => {
+      start(input: { sessionId: string; userId: string; clientMessageId: string; source: "user";
+        content: { type: "text"; text: string }[] }): Promise<{ turnId: string; disposition: string }>
       interrupt(input: { sessionId: string; userId: string; clientMessageId: string; source: "user";
         expectedTurnId: string; expectedRevision: number }): Promise<{ turnId: string; disposition: string }>
     } }
@@ -403,7 +421,139 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
       JOIN "agent_items" item ON item."id"=$3 WHERE turn.id=$1 AND task.id=$2`, [fixture.ids.turnId, gateTaskId, question.itemId])
     expect(persisted.rows[0]).toMatchObject({ turnStatus: "interrupted", taskStatus: "interrupted", attemptCount: 1,
       itemStatus: "interrupted", content: { answer: null, answerAvailable: false, cancelled: true }, resumedEvents: "0" })
+
+    const service = new commands.AgentCommandService(webDatabase.db)
+    const successor = await service.start({ sessionId: fixture.ids.sessionId, userId: fixture.ids.userId,
+      clientMessageId: `scheduled-gate-stop-filter-start-${randomUUID()}`, source: "user",
+      content: [{ type: "text", text: "Stop question cleanup fixture" }] })
+    expect(successor.disposition).toBe("started")
+    const successorTurn = await pool.query<{ revision: number; status: string }>(`SELECT "revision", "status" FROM "agent_turns"
+      WHERE "id"=$1 AND "sessionId"=$2 AND "userId"=$3`, [successor.turnId, fixture.ids.sessionId, fixture.ids.userId])
+    expect(successorTurn.rows[0]?.status).toBe("queued")
+
+    const foreignUserId = `scheduled-gate-stop-foreign-${randomUUID()}`
+    fixtureUsers.push(foreignUserId)
+    await pool.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`,
+      [foreignUserId, `${foreignUserId}@example.invalid`])
+    const currentPrefix = `agent-question:${successor.turnId}:`
+    const questionRows = [
+      { id: `${currentPrefix}legacy-owned-unanswered-${randomUUID()}`, userId: fixture.ids.userId,
+        runId: fixture.ids.sessionId, answer: null, shouldDelete: true },
+      { id: `${currentPrefix}legacy-foreign-user-${randomUUID()}`, userId: foreignUserId,
+        runId: fixture.ids.sessionId, answer: null, shouldDelete: false },
+      { id: `${currentPrefix}legacy-answered-${randomUUID()}`, userId: fixture.ids.userId,
+        runId: fixture.ids.sessionId, answer: "yes", shouldDelete: false },
+      { id: `agent-question:other-turn-${randomUUID()}:legacy-unanswered`, userId: fixture.ids.userId,
+        runId: fixture.ids.sessionId, answer: null, shouldDelete: false },
+      { id: `${currentPrefix}legacy-other-run-${randomUUID()}`, userId: fixture.ids.userId,
+        runId: `other-session-${randomUUID()}`, answer: null, shouldDelete: false },
+    ]
+    for (const row of questionRows) {
+      await pool.query(`INSERT INTO public."AgentRunQuestion"
+        ("id", "userId", "runId", "stage", "question", "options", "answer", "autonomous", "createdAt", "answeredAt")
+        VALUES ($1, $2, $3, 'legacy', 'Question?', '[]'::jsonb, $4, false, CURRENT_TIMESTAMP,
+          CASE WHEN $4::text IS NULL THEN NULL ELSE CURRENT_TIMESTAMP END)`,
+      [row.id, row.userId, row.runId, row.answer])
+    }
+
+    const approvalId = `scheduled-gate-stop-approval-${randomUUID()}`
+    const approvalItemId = `agent-wait:approval:${approvalId}`
+    const approvalToolCallId = `scheduled-gate-stop-call-${randomUUID()}`
+    await pool.query(`INSERT INTO "agent_approvals"
+      ("id", "sessionId", "userId", "turnId", "type", "status", "title", "body", "payload")
+      VALUES ($1, $2, $3, $4, 'review_application', 'pending', 'Review', 'Review this application', '{}'::jsonb)`,
+    [approvalId, fixture.ids.sessionId, fixture.ids.userId, successor.turnId])
+    await pool.query(`INSERT INTO "agent_items"
+      ("id", "sessionId", "turnId", "type", "status", "revision", "content", "createdAt", "updatedAt")
+      VALUES ($1, $2, $3, 'approval_request', 'started', 0, $4::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+    [approvalItemId, fixture.ids.sessionId, successor.turnId,
+      JSON.stringify({ approvalId, toolCallId: approvalToolCallId })])
+
+    const successorStopId = `scheduled-gate-stop-filter-${randomUUID()}`
+    await expect(service.interrupt({ sessionId: fixture.ids.sessionId, userId: fixture.ids.userId,
+      clientMessageId: successorStopId, source: "user", expectedTurnId: successor.turnId,
+      expectedRevision: Number(successorTurn.rows[0]?.revision) })).resolves.toMatchObject({
+      turnId: successor.turnId, disposition: "interrupted",
+    })
+    const remainingQuestions = await pool.query<{ id: string; userId: string; runId: string; answer: string | null }>(
+      `SELECT "id", "userId", "runId", "answer" FROM public."AgentRunQuestion" WHERE "id"=ANY($1::text[]) ORDER BY "id"`,
+      [questionRows.map(row => row.id)],
+    )
+    expect(remainingQuestions.rows).toEqual(questionRows.filter(row => !row.shouldDelete)
+      .map(({ id, userId, runId, answer }) => ({ id, userId, runId, answer }))
+      .sort((left, right) => left.id.localeCompare(right.id)))
+    await expect(pool.query(`SELECT "status", "revision" FROM "agent_turns" WHERE "id"=$1`, [successor.turnId]))
+      .resolves.toMatchObject({ rows: [{ status: "interrupted", revision: Number(successorTurn.rows[0]?.revision) + 1 }] })
+    await expect(pool.query(`SELECT "status", "decidedAt" FROM "agent_approvals" WHERE "id"=$1`, [approvalId]))
+      .resolves.toMatchObject({ rows: [{ status: "rejected", decidedAt: expect.any(Date) }] })
+    await expect(pool.query(`SELECT "status", "revision", "content" FROM "agent_items" WHERE "id"=$1`, [approvalItemId]))
+      .resolves.toMatchObject({ rows: [{ status: "interrupted", revision: 1,
+        content: { approvalId, toolCallId: approvalToolCallId, cancelled: true, cancellationReason: "interrupt" } }] })
+    const resolvedApproval = await pool.query<{ id: string; itemId: string | null; causationId: string | null;
+      payload: Record<string, unknown> }>(`SELECT "id", "itemId", "causationId", "payload" FROM "agent_events"
+        WHERE "sessionId"=$1 AND "turnId"=$2 AND "type"='approval.resolved' AND "correlationId"=$3`,
+      [fixture.ids.sessionId, successor.turnId, approvalId])
+    expect(resolvedApproval.rows).toHaveLength(1)
+    expect(resolvedApproval.rows[0]).toMatchObject({ itemId: approvalItemId, causationId: successorStopId,
+      payload: { waitKind: "approval", waitId: approvalId, itemId: approvalItemId,
+        toolCallId: approvalToolCallId, outcome: "cancelled", reason: "interrupt" } })
+    const resolvedOutbox = await pool.query<{ topic: string; payload: Record<string, unknown> }>(
+      `SELECT "topic", "payload" FROM "agent_outbox" WHERE "aggregateId"=$1 AND "topic"='agent.session.event'
+        AND "payload"->>'eventId'=$2`, [fixture.ids.sessionId, resolvedApproval.rows[0]!.id])
+    expect(resolvedOutbox.rows).toHaveLength(1)
+    expect(resolvedOutbox.rows[0]).toMatchObject({ topic: "agent.session.event",
+      payload: { type: "approval.resolved", correlationId: approvalId,
+        payload: { outcome: "cancelled", reason: "interrupt" } } })
   }, 600_000)
+
+  it("reapplies the restore migration without changing a populated matching model", async () => {
+    const userId = `scheduled-gate-migration-user-${randomUUID()}`
+    fixtureUsers.push(userId)
+    await pool!.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`,
+      [userId, `${userId}@example.invalid`])
+    const client = await pool!.connect()
+    const questionId = `migration-replay-question-${randomUUID()}`
+    try {
+      await client.query("BEGIN")
+      await client.query(`INSERT INTO public."AgentRunQuestion"
+        ("id", "userId", "runId", "stage", "question", "options", "answer", "autonomous", "createdAt", "answeredAt")
+        VALUES ($1, $2, $3, 'gate', 'Preserve this row?', '[{"label":"Yes","value":"yes"}]'::jsonb,
+          'yes', true, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, [questionId, userId, `migration-run-${randomUUID()}`])
+      const beforeCatalog = await agentRunQuestionCatalog(client)
+      const beforeRow = await client.query(`SELECT "id", "userId", "runId", "stage", "question", "options", "answer",
+          "autonomous", "createdAt", "answeredAt" FROM public."AgentRunQuestion" WHERE "id"=$1`, [questionId])
+
+      await client.query(agentRunQuestionMigration)
+
+      await expect(agentRunQuestionCatalog(client)).resolves.toEqual(beforeCatalog)
+      await expect(client.query(`SELECT "id", "userId", "runId", "stage", "question", "options", "answer",
+        "autonomous", "createdAt", "answeredAt" FROM public."AgentRunQuestion" WHERE "id"=$1`, [questionId]))
+        .resolves.toEqual(beforeRow)
+      await client.query("ROLLBACK")
+    } catch (error: unknown) {
+      await client.query("ROLLBACK").catch(() => undefined)
+      throw error
+    } finally { client.release() }
+  })
+
+  it("rejects incompatible existing question columns and rolls the ALTER back", async () => {
+    const client = await pool!.connect()
+    try {
+      await client.query("BEGIN")
+      await client.query(`ALTER TABLE public."AgentRunQuestion" ALTER COLUMN "options" DROP NOT NULL`)
+      await expect(client.query(agentRunQuestionMigration)).rejects.toMatchObject({
+        code: "P0001", message: "AgentRunQuestion existing schema is incompatible",
+      })
+      await client.query("ROLLBACK")
+    } catch (error: unknown) {
+      await client.query("ROLLBACK").catch(() => undefined)
+      throw error
+    } finally { client.release() }
+
+    const restored = await pool!.query<{ is_nullable: string }>(`SELECT is_nullable FROM information_schema.columns
+      WHERE table_schema='public' AND table_name='AgentRunQuestion' AND column_name='options'`)
+    expect(restored.rows).toEqual([{ is_nullable: "NO" }])
+  })
 })
 
 async function adoptRootLease(fixture: GateFixture, lease: TurnLease,
