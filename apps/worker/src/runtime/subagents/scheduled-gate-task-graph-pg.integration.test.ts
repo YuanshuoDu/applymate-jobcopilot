@@ -5,7 +5,7 @@ import { once } from "node:events"
 import { Queue } from "bullmq"
 import Redis from "ioredis"
 import { Pool } from "pg"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest"
 import { claimTurnLease, releaseTurnLease, type TurnLease } from "../turns/lease.js"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
 import { createPgTurnQuestionStore } from "../turns/turn-question-store.js"
@@ -68,6 +68,32 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
     const prismaUrl = new URL(databaseUrl!)
     prismaUrl.searchParams.set("application_name", `scheduled-gate-pg-${randomUUID()}`)
     process.env.DATABASE_URL = prismaUrl.toString()
+  })
+
+  afterEach(async () => {
+    if (child) {
+      await stopWorker(child)
+      child = undefined
+    }
+    if (queue) {
+      await queue.obliterate({ force: true })
+      await queue.close()
+      queue = undefined
+    }
+    if (queueRedis) {
+      await queueRedis.quit()
+      queueRedis = undefined
+    }
+    queueName = undefined
+    if (!pool || fixtureUsers.length === 0) return
+    const users = [...fixtureUsers]
+    const sessions = await pool.query<{ id: string }>(`SELECT "id" FROM "agent_sessions" WHERE "userId" = ANY($1::text[])`, [users])
+    if (sessions.rows.length) {
+      const sessionIds = sessions.rows.map(row => row.id)
+      await pool.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = ANY($1::text[])`, [sessionIds])
+    }
+    await pool.query(`DELETE FROM "User" WHERE "id" = ANY($1::text[])`, [users])
+    fixtureUsers.splice(0, users.length)
   })
 
   afterAll(async () => {
