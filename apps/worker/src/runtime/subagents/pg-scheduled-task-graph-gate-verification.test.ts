@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
-import { validateScheduledGateTaskGraphFinish, verifyScheduledGateCompletion, scheduledGateResultDigest } from "./pg-scheduled-task-graph-gate-verification.js"
+import { validateScheduledGateTaskGraphFinish, verifyPersistedScheduledPreparePrefix, verifyScheduledGateCompletion,
+  scheduledGateResultDigest } from "./pg-scheduled-task-graph-gate-verification.js"
 import { scheduledGateProposal, SCHEDULED_GATE_OUTPUT_SCHEMA, SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
 import { taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 import { SCHEDULED_PREPARE_COMPLETION_SCHEMA, SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA } from "./scheduled-prepare-task-graph-verification.js"
@@ -126,6 +127,14 @@ function finishDatabase(rootAndTurn: Record<string, unknown> = suspendedOwner) {
   return db
 }
 
+function preparePrefixFixture(keys: readonly [string, string, string] = ["scout", "analyst", "prepare"]) {
+  const prefixNodes = prefix.map((node, index) => ({ ...node, key: keys[index]!,
+    dependsOn: index === 0 ? [] : [keys[index - 1]!] }))
+  const prefixCurrentNodes = prefixNodes.map(node => ({ key: node.key, taskId: node.taskId, status: "completed" }))
+  return { proof, facts: proofFacts, currentNodes: prefixCurrentNodes,
+    loaded: { ...loaded, snapshot: { ...loaded.snapshot, nodes: prefixNodes }, state: { ...loaded.state, nodes: prefixCurrentNodes } } }
+}
+
 describe("persisted scheduled Gate completion proof", () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -139,6 +148,41 @@ describe("persisted scheduled Gate completion proof", () => {
     mocks.registration.mockResolvedValue(registration)
     mocks.snapshot.mockReturnValue(true)
     mocks.verifyPrepare.mockResolvedValue({ verified: true, facts: proofFacts })
+  })
+
+  it.each([
+    ["canonical", ["scout", "analyst", "prepare"] as const],
+    ["persisted scheduled", ["scheduled-scout", "scheduled-analyst", "prepare"] as const],
+  ])("accepts the %s Scout/Analyst keys with the exact certified role and dependency chain", async (_label, keys) => {
+    const fixture = preparePrefixFixture(keys)
+    mocks.current.mockReturnValue({ nodes: fixture.currentNodes })
+    mocks.verifyPrepare.mockResolvedValue({ verified: true, facts: fixture.facts })
+
+    await expect(verifyPersistedScheduledPreparePrefix(database().client as never, scope as never,
+      fixture.loaded as never, fixture.proof as never)).resolves.toBe(true)
+    expect(mocks.verifyPrepare).toHaveBeenCalledOnce()
+  })
+
+  it.each(["role", "certified task identity", "dependency chain"] as const)("rejects a wrong Prepare prefix %s", async mismatch => {
+    const fixture = preparePrefixFixture(["scheduled-scout", "scheduled-analyst", "prepare"])
+    const nodes = [...fixture.loaded.snapshot.nodes]
+    const certificates = [...fixture.proof.completion.nodes]
+    const currentNodes = [...fixture.currentNodes]
+    if (mismatch === "role") nodes[0] = { ...nodes[0]!, templateId: "analyst" }
+    if (mismatch === "certified task identity") {
+      nodes[0] = { ...nodes[0]!, taskId: "analyst-task" }
+      currentNodes[0] = { ...currentNodes[0]!, taskId: "analyst-task" }
+    }
+    if (mismatch === "dependency chain") nodes[1] = { ...nodes[1]!, dependsOn: ["unrelated-key"] }
+    const candidate = { ...fixture, proof: { ...fixture.proof,
+      completion: { ...fixture.proof.completion, nodes: certificates } },
+      currentNodes, loaded: { ...fixture.loaded, snapshot: { ...fixture.loaded.snapshot, nodes },
+        state: { ...fixture.loaded.state, nodes: currentNodes } } }
+    mocks.current.mockReturnValue({ nodes: currentNodes })
+
+    await expect(verifyPersistedScheduledPreparePrefix(database().client as never, scope as never,
+      candidate.loaded as never, candidate.proof as never)).resolves.toBe(false)
+    expect(mocks.verifyPrepare).not.toHaveBeenCalled()
   })
 
   it("returns the exact persisted Prepare proof and whole-envelope digest when the supplied proof matches", async () => {

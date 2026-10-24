@@ -95,9 +95,11 @@ export async function verifyPersistedScheduledPreparePrefix(client: Queryable, s
   const snapshot = loaded.snapshot, state = loaded.state
   if (!snapshot || !state || (snapshot.nodes.length !== 3 && snapshot.nodes.length !== 4)) return false
   const nodes = snapshot.nodes.slice(0, 3), currentNodes = currentTaskGraph(loaded).nodes.filter(node => nodes.some(prefix => prefix.key === node.key))
+  const expectedRoles = ["scout", "analyst", "prepare"] as const
   if (nodes.length !== 3 || currentNodes.length !== 3 || nodes.some((node, index) => {
     const certified = proof.completion.nodes[index], current = currentNodes.find(value => value.key === node.key)
-    return !certified || !current || node.key !== ["scout", "analyst", "prepare"][index] || node.templateId !== certified.role
+    return !certified || !current || certified.role !== expectedRoles[index] || node.templateId !== expectedRoles[index]
+      || index === 2 && node.key !== "prepare"
       || node.taskId !== certified.taskId || node.depth !== index + 1 || current.taskId !== node.taskId
       || current.status !== "completed" || node.verificationDisposition !== (index === 2 ? "specialized" : "typed")
       || node.dependsOn.length !== (index === 0 ? 0 : 1) || index > 0 && node.dependsOn[0] !== nodes[index - 1]?.key
