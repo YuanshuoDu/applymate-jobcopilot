@@ -460,6 +460,45 @@ describe("TaskGraph terminal verification gate", () => {
       expect.objectContaining({ blocker: "task_graph_verification_unverified" }), `final-rejected:${step.id}`)
   })
 
+  it("keeps failed-root and operation-retired descendant history out of fresh verification", async () => {
+    const analystContract = { schemaVersion: "agent-harness.v2.task-graph-verification.v1", role: "analyst",
+      criteria: [{ id: "finding-present", check: { kind: "finding_count_gte", minimum: 1 } }] }
+    const replacements = [node("fresh-scout", "fresh-scout-task"), {
+      key: "fresh-analyst", taskId: "fresh-analyst-task", templateId: "analyst", goal: "Analyze refreshed candidates",
+      successCriteria: ["Score a refreshed candidate"], dependsOn: ["fresh-scout"], depth: 2,
+      verificationDisposition: "typed", verification: analystContract,
+    }]
+    const priorRows = [
+      { id: "failed-scout-task", status: "failed", role: "scout", failureReason: "task_graph_verification_unverified", result: storedResult("unverified") },
+      { id: "cancelled-analyst-task", status: "cancelled", role: "analyst", failureReason: "A prerequisite task did not complete.", result: null },
+    ]
+    const replacementRows = [
+      { id: "fresh-scout-task", status: "queued", role: "scout", failureReason: null, result: null },
+      { id: "fresh-analyst-task", status: "waiting", role: "analyst", failureReason: null, result: null },
+    ]
+    const allRows = [...priorRows, ...replacementRows], taskReads: string[][] = []
+    const content = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: replacements }
+    const client = { query: vi.fn(async (sql: string, params?: unknown[]) => {
+      if (sql.includes('FROM "agent_items" AS item')) return { rows: [{ id: "graph-item", revision: 5, content }], rowCount: 1 }
+      if (sql.includes('FROM "sub_agent_tasks" AS task')) {
+        const requested = params?.[0] as string[]
+        taskReads.push([...requested])
+        const rows = allRows.filter(task => requested.includes(task.id))
+        return { rows: rows.map(task => ({ taskType: "scout", ...task })), rowCount: rows.length }
+      }
+      if (sql.includes('FROM "agent_events" AS event')) return { rows: [], rowCount: 0 }
+      throw new Error(`Unexpected graph query: ${sql}`)
+    }) } as never
+
+    const decision = await checkTaskGraphTerminalVerification(client, graphLease, "root-1")
+    expect(decision).toMatchObject({ ok: false, blocker: "task_graph_verification_unverified" })
+    expect(taskReads).toEqual([["fresh-scout-task", "fresh-analyst-task"]])
+    expect(priorRows).toMatchObject([
+      { id: "failed-scout-task", status: "failed", result: { taskGraphVerificationReport: { status: "unverified" } } },
+      { id: "cancelled-analyst-task", status: "cancelled", result: null },
+    ])
+  })
+
   it("requires fresh Scout and Analyst reports after branch replanning", async () => {
     const analystContract = {
       schemaVersion: "agent-harness.v2.task-graph-verification.v1",

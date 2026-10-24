@@ -11,13 +11,16 @@ import {
   STEERING_RECONCILIATION_SCHEMA_VERSION,
   STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION,
   STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION,
+  STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION,
   type SteeringReconciliationReceipt,
 } from "./steering-reconciliation-contract.js"
 import type { SteeringReconciliationHistoryEntry } from "./steering-reconciliation-history.js"
 import { TASK_GRAPH_BRANCH_REPAIR_RELATION_SCHEMA_VERSION, parseTaskGraphBranchRepairRelation,
   taskGraphBranchRepairFingerprint, type TaskGraphBranchRepairCall } from "./task-graph-pg-branch-repair-relation.js"
-import { taskGraphProposalKey } from "./task-graph-snapshot.js"
+import { taskGraphLifecycleKey, taskGraphProposalKey } from "./task-graph-snapshot.js"
 import { taskGraphSupersessionProposalKey } from "./task-graph-pg-supersession.js"
+import { TASK_GRAPH_FAILED_BRANCH_REPAIR_RELATION_SCHEMA_VERSION, parseTaskGraphFailedBranchRepairRelation,
+  taskGraphFailedBranchRepairFingerprint } from "./task-graph-pg-failed-branch-relation.js"
 import { assertNoUnresolvedSteering, readSteeringReconciliationState } from "./steering-reconciliation-read.js"
 
 const historyOverride = vi.hoisted(() => ({ entries: null as readonly unknown[] | null }))
@@ -168,6 +171,39 @@ function branchReceipt(stepId: string, cursor: string, observedRevision: number,
     steerInputIds: [], inputCheckpoint: { throughSequence: cursor }, branchRepair: relation,
   }, { ...scope, stepId })
   if (!parsed) throw new Error("v3 branch receipt fixture must satisfy the stored contract")
+  return parsed
+}
+
+function failedBranchReceipt(stepId: string, cursor: string, observedRevision: number, suffix: string, sequence: number): SteeringReconciliationReceipt {
+  const branchRoot = { nodeKey: "failed-scout", taskId: "failed-scout-task" }
+  const replaceBranch = { root: branchRoot, sources: [
+    { ...branchRoot, replacementKey: "fresh-scout" },
+    { nodeKey: "cancelled-analyst", taskId: "cancelled-analyst-task", replacementKey: "fresh-analyst" },
+  ] }
+  const callId = `failed-branch-${suffix}`, call = { expectedRevision: observedRevision, replaceBranch,
+    nodes: [{ key: "fresh-scout" }, { key: "fresh-analyst" }] }
+  const relation = parseTaskGraphFailedBranchRepairRelation({
+    schemaVersion: TASK_GRAPH_FAILED_BRANCH_REPAIR_RELATION_SCHEMA_VERSION,
+    operationKey: steeringReconciliationIdempotencyKey({ ...scope, stepId }, callId), graphRootTaskId: scope.rootTaskId,
+    observedRevision, resultingRevision: observedRevision + 2, branchRoot,
+    sources: replaceBranch.sources.map(source => ({ source: { nodeKey: source.nodeKey, taskId: source.taskId }, replacementKey: source.replacementKey })),
+    failedSource: { source: branchRoot, attemptCount: 1, resultDigest: "a".repeat(64), reportDigest: "b".repeat(64),
+      event: { id: `failed-${suffix}`, sequence: String(sequence), idempotencyKey: taskGraphLifecycleKey(scope.rootTaskId, branchRoot.nodeKey, 1, "task.failed") } },
+    cancellations: [{ source: { nodeKey: "cancelled-analyst", taskId: "cancelled-analyst-task" },
+      event: { id: `cancelled-${suffix}`, sequence: String(sequence + 2),
+        idempotencyKey: taskGraphLifecycleKey(scope.rootTaskId, "cancelled-analyst", 0, "task.cancelled") } }],
+    verifiedExternalDependencies: [],
+    planEvent: { id: `failed-plan-${suffix}`, sequence: String(sequence + 3), idempotencyKey: taskGraphProposalKey(scope.rootTaskId, observedRevision + 1) },
+    requestFingerprint: taskGraphFailedBranchRepairFingerprint(call),
+    agentPlanCall: { callId, stepId, expectedRevision: observedRevision, replaceBranch },
+  })
+  if (!relation) throw new Error("v4 failed-branch relation fixture must be valid")
+  const parsed = parseSteeringReconciliationReceipt({
+    schemaVersion: STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION, sessionId: scope.sessionId, turnId: scope.turnId,
+    rootTaskId: scope.rootTaskId, stepId, decision: "revise", observedRevision, resultingRevision: observedRevision + 2,
+    steerInputIds: [], inputCheckpoint: { throughSequence: cursor }, failedBranch: relation,
+  }, { ...scope, stepId })
+  if (!parsed) throw new Error("v4 failed-branch receipt fixture must satisfy the stored contract")
   return parsed
 }
 
@@ -543,6 +579,47 @@ describe("durable steering reconciliation reader", () => {
     const state = await readSteeringReconciliationState(f.client, { ...scope, stepId: "current-step" })
     expect(state.unresolvedInputs).toEqual([])
     expect(state.decisionStepId).toBe("current-step")
+  })
+
+  it("accepts an empty validated v4 receipt at its own persisted decision-Step cursor", async () => {
+    const entries = [historyEntry(failedBranchReceipt("same-v4-step", "10", 1, "same-step", 110), 1)]
+    historyOverride.entries = entries
+    const f = cursorFixture({ entries, currentStepId: "same-v4-step", currentOrdinal: 1, currentCursor: "10", currentRevision: 3 })
+    const state = await readSteeringReconciliationState(f.client, { ...scope, stepId: "same-v4-step" })
+    expect(state.decisionStepId).toBe("same-v4-step")
+    expect(state.unresolvedInputs).toEqual([])
+  })
+
+  it("retains repeated empty v4 branch receipts at one cursor across later Steps", async () => {
+    const entries = [
+      historyEntry(failedBranchReceipt("first-failed-step", "10", 1, "first-empty", 120), 1),
+      historyEntry(failedBranchReceipt("later-failed-step", "10", 2, "later-empty", 123), 2),
+    ]
+    historyOverride.entries = entries
+    const f = cursorFixture({ entries, currentStepId: "current-step", currentOrdinal: 3, currentCursor: "10", currentRevision: 4 })
+    const state = await readSteeringReconciliationState(f.client, { ...scope, stepId: "current-step" })
+    expect(state.unresolvedInputs).toEqual([])
+    expect(state.decisionStepId).toBe("current-step")
+  })
+
+  it("rejects a decreasing v4 checkpoint and never infers an omitted consumed steer", async () => {
+    const decreasing = [
+      historyEntry(failedBranchReceipt("first-failed-step", "10", 1, "decrease-first", 130), 1),
+      historyEntry(failedBranchReceipt("second-failed-step", "9", 2, "decrease-second", 133), 2),
+    ]
+    historyOverride.entries = decreasing
+    const lower = cursorFixture({ entries: decreasing, currentStepId: "current-step", currentOrdinal: 3, currentCursor: "10", currentRevision: 4 })
+    await expect(readSteeringReconciliationState(lower.client, { ...scope, stepId: "current-step" }))
+      .rejects.toThrow("steering_reconciliation_receipt_history_invalid")
+
+    const steer = input("steer-1", "steer", "consumed", "10", "consumer-step")
+    const omitted = [historyEntry(failedBranchReceipt("empty-failed-step", "10", 1, "omitted-steer", 140), 1)]
+    historyOverride.entries = omitted
+    const f = cursorFixture({ entries: omitted, currentStepId: "current-step", currentOrdinal: 2, currentCursor: "10", currentRevision: 3,
+      inputs: [steer], consumers: [{ id: "consumer-step", taskId: scope.rootTaskId, ordinal: 0, attempt: 1,
+        status: "completed", inputThroughSequence: "10", consumedInputIds: [steer.id] }] })
+    await expect(readSteeringReconciliationState(f.client, { ...scope, stepId: "current-step" }))
+      .rejects.toThrow("steering_reconciliation_receipt_incomplete")
   })
 
   it.each(["v1", "v2"] as const)("rejects repeated equal-cursor legacy %s receipts", async version => {

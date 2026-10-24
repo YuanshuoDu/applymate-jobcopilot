@@ -17,7 +17,8 @@ import { prepareSteeringReconciliation, writeSteeringReconciliationReceipt } fro
 import { parseTaskGraphBranchRepairRelation, TASK_GRAPH_BRANCH_REPAIR_RELATION_SCHEMA_VERSION,
   taskGraphBranchRepairFingerprint } from "./task-graph-pg-branch-repair-relation.js"
 
-type Row = Record<string, unknown>
+export type TaskGraphBranchSourceRow = Record<string, unknown>
+type Row = TaskGraphBranchSourceRow
 type Client = Queryable
 const MAX_REVISION = 2_147_483_646
 
@@ -25,8 +26,8 @@ export async function scheduleTaskGraphBranchRepair(client: Client, input: TaskG
   operation: SteeringReconciliationOperation, checkBudget: () => Promise<void>): Promise<TaskGraphScheduleReceipt> {
   const opKey = steeringReconciliationIdempotencyKey(operation.scope, operation.callId)
   if (!opKey) return invalid()
-  const existing = await readReceipt(client, operation.scope.sessionId, operation.scope.userId, opKey)
-  if (existing) return replay(client, input, operation, opKey, existing)
+  const existingReplay = await replayTaskGraphBranchRepairIfPresent(client, input, operation)
+  if (existingReplay) return existingReplay
 
   const branch = sameBranch(input.replaceBranch, operation.replaceBranch)
   if (!branch || !sameScope(input.scope, operation.scope) || operation.decision !== "revise"
@@ -63,7 +64,7 @@ export async function scheduleTaskGraphBranchRepair(client: Client, input: TaskG
   }
   if (validation.value.sourceNodes.length !== branch.sources.length) return invalid()
   if (expectedRevision > MAX_REVISION - validation.value.sourceNodes.length - 1) return invalid()
-  const statusRows = await lockedSources(client, input, validation.value.sourceNodes)
+  const statusRows = await lockTaskGraphBranchSources(client, input, validation.value.sourceNodes)
   for (const source of validation.value.sourceNodes) {
     const row = statusRows.get(source.taskId), graphNode = current.nodes.find(node => node.key === source.key)
     if (!row || !graphNode || graphNode.taskId !== source.taskId || graphNode.status !== row.status
@@ -126,6 +127,15 @@ export async function scheduleTaskGraphBranchRepair(client: Client, input: TaskG
   return receipt
 }
 
+/** Replay a persisted v3 branch receipt without loading or validating the current graph. */
+export async function replayTaskGraphBranchRepairIfPresent(client: Client, input: TaskGraphScheduleInput,
+  operation: SteeringReconciliationOperation): Promise<TaskGraphScheduleReceipt | null> {
+  const key = steeringReconciliationIdempotencyKey(operation.scope, operation.callId)
+  if (!key) return invalid()
+  const row = await readReceipt(client, operation.scope.sessionId, operation.scope.userId, key)
+  return row ? replay(client, input, operation, key, row) : null
+}
+
 async function replay(client: Client, input: TaskGraphScheduleInput, operation: SteeringReconciliationOperation, key: string, row: Row): Promise<TaskGraphScheduleReceipt> {
   const seq = steeringReconciliationSequence(row.sequence), receipt = parseSteeringReconciliationReceipt(row.payload, operation.scope)
   const relation = receipt?.branchRepair
@@ -167,7 +177,8 @@ async function hasPriorPlan(client: Client, scope: TaskGraphScheduleInput["scope
   return result.rows[0]?.exists === true
 }
 
-async function lockedSources(client: Client, input: TaskGraphScheduleInput, sources: readonly StoredTaskGraphNode[]): Promise<Map<string, Row>> {
+export async function lockTaskGraphBranchSources(client: Client, input: TaskGraphScheduleInput,
+  sources: readonly StoredTaskGraphNode[]): Promise<Map<string, TaskGraphBranchSourceRow>> {
   const result = await client.query<Row>(`SELECT task."id", task."status", task."role", task."taskType", task."constraints", task."allowedActions", task."expectedOutputSchema",
       task."attemptCount", task."leaseOwner", task."leaseExpiresAt", task."nextAttemptAt", task."startedAt", task."completedAt", task."closedAt",
       task."interruptRequestedAt", task."failureReason", task."result", task."confidence", task."qualityGateResult", task."outputArtifactIds", task."contextSnapshotId",
@@ -204,7 +215,7 @@ async function lockedSources(client: Client, input: TaskGraphScheduleInput, sour
 function waitEvidenceSql(): string { return `SELECT 1 FROM "agent_wait_conditions" wait WHERE wait."sessionId" = task."sessionId" AND wait."turnId" = task."turnId"
   AND (wait."parentTaskId" = task."id" OR wait."targetTaskIds" @> jsonb_build_array(task."id") OR wait."matchedTaskIds" @> jsonb_build_array(task."id"))` }
 
-function assertReplacementSnapshot(before: TaskGraphSnapshot, after: TaskGraphSnapshot, sources: readonly StoredTaskGraphNode[], mapping: ReadonlyMap<string, string>): void {
+export function assertReplacementSnapshot(before: TaskGraphSnapshot, after: TaskGraphSnapshot, sources: readonly StoredTaskGraphNode[], mapping: ReadonlyMap<string, string>): void {
   const oldKeys = new Set(sources.map(node => node.key)), oldIds = new Set(before.nodes.map(node => node.taskId))
   const retained = before.nodes.filter(node => !oldKeys.has(node.key)), inserted = after.nodes.filter(node => !before.nodes.some(old => old.key === node.key))
   if (after.nodes.length !== retained.length + sources.length || inserted.length !== sources.length

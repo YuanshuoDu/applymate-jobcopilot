@@ -27,7 +27,7 @@ import { appendScheduledPrepare as appendScheduledPrepareCommand } from "./pg-sc
 import { appendScheduledGate as appendScheduledGateCommand } from "./pg-scheduled-task-graph-gate-command.js"
 import { resumeScheduledGateChoice as resumeScheduledGateChoiceCommand } from "./pg-scheduled-task-graph-gate-resume.js"
 import { verifyScheduledGateCompletion as verifyScheduledGateCompletionCommand } from "./pg-scheduled-task-graph-gate-verification.js"
-import { scheduleTaskGraphBranchRepair } from "./task-graph-pg-branch-repair.js"
+import { scheduleTaskGraphBranchOperation } from "./task-graph-pg-failed-branch-repair.js"
 
 const MAX_REVISION = 2_147_483_646
 type Row = Record<string, unknown>
@@ -118,7 +118,7 @@ async function schedule(client: Queryable, input: TaskGraphScheduleInput, operat
   }
   if (input.replaceBranch || operation?.replaceBranch) {
     if (!operation) throw new TaskGraphCommandError("task_graph_branch_repair_not_eligible", "The branch replacement request is incomplete")
-    return scheduleTaskGraphBranchRepair(client, input, parent, operation, () => requireTaskGraphContinuationBudget(client, input.scope))
+    return scheduleTaskGraphBranchOperation(client, input, parent, operation, () => requireTaskGraphContinuationBudget(client, input.scope))
   }
   if (operation && operation.expectedRevision !== input.proposal.expectedRevision) {
     throw new TaskGraphCommandError("steering_reconciliation_operation_invalid", "Plan reconciliation scope is invalid")

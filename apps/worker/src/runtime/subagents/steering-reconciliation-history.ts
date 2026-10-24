@@ -9,7 +9,7 @@ import { callMatches, type SupersessionCallBinding } from "./root-plan-criteria.
 import { taskGraphSupersessionEnvelopeMatches } from "./task-graph-pg-events.js"
 import type { TaskGraphExecutionScope, TaskGraphReadScope } from "./task-graph-command-port.js"
 import { assertTaskGraphBranchRepairHistory } from "./steering-reconciliation-branch-repair-history.js"
-
+import { assertTaskGraphFailedBranchRepairHistory } from "./steering-reconciliation-failed-branch-history.js"
 type Client = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
 type HistoryStep = Readonly<{ id: string; ordinal: number; attempt: number; cursor: bigint }>
@@ -31,7 +31,6 @@ function historyStep(row: Row | undefined): HistoryStep | null {
     || !Number.isSafeInteger(row.attempt) || Number(row.attempt) < 1 || typeof row.status !== "string" || !STEP_STATUSES.has(row.status) || cursor === null) return null
   return { id: row.id, ordinal: Number(row.ordinal), attempt: Number(row.attempt), cursor }
 }
-
 function ownerScope(scope: SteeringReconciliationScope): TaskGraphReadScope {
   return { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId,
     turnLeaseOwner: scope.turnLeaseOwner, turnLeaseVersion: scope.turnLeaseVersion, parentLeaseOwner: scope.parentLeaseOwner, parentAttemptCount: scope.parentAttemptCount }
@@ -262,9 +261,11 @@ export async function* readSteeringReconciliationHistory(client: Client, scope: 
     afterId = String(result.rows.at(-1)?.id)
     const replacements = await assertSteeringReconciliationSupersessionEvents(client, scope, parsed.flatMap(entry => entry.receipt.supersession ?
       [{ relation: entry.receipt.supersession, receiptEventId: entry.id, receiptSequence: entry.sequence }] : []))
-    await Promise.all(parsed.flatMap(entry => entry.receipt.branchRepair ? [assertTaskGraphBranchRepairHistory(client, scope,
-      entry.receipt.branchRepair, { id: entry.id, sequence: entry.sequence, stepId: entry.receipt.stepId, idempotencyKey: entry.idempotencyKey })] : []))
-    await assertHistoryCalls(client, scope, parsed.filter(entry => !entry.receipt.branchRepair), replacements)
+    await Promise.all(parsed.flatMap(entry => entry.receipt.failedBranch ? [assertTaskGraphFailedBranchRepairHistory(client, scope,
+      entry.receipt.failedBranch, { id: entry.id, sequence: entry.sequence, stepId: entry.receipt.stepId, idempotencyKey: entry.idempotencyKey })]
+      : entry.receipt.branchRepair ? [assertTaskGraphBranchRepairHistory(client, scope, entry.receipt.branchRepair,
+        { id: entry.id, sequence: entry.sequence, stepId: entry.receipt.stepId, idempotencyKey: entry.idempotencyKey })] : []))
+    await assertHistoryCalls(client, scope, parsed.filter(entry => !entry.receipt.branchRepair && !entry.receipt.failedBranch), replacements)
     const stepIds = [...new Set(parsed.map(entry => entry.receipt.stepId))]
     const stepRows = await client.query<Row>(`SELECT "id", "taskId", "ordinal", "attempt", "status", "inputThroughSequence" FROM "agent_steps"
       WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = ANY($4::text[])`, [scope.sessionId, scope.turnId, scope.rootTaskId, stepIds])
