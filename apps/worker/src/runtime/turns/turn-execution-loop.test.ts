@@ -2650,6 +2650,48 @@ describe("owner-agnostic turn execution loop", () => {
     })
   })
 
+  it("keeps a final rejected when captured current evidence misses the configured expected evidence", async () => {
+    const completionGate = vi.fn(async () => ({ ok: true as const }))
+    const root = fixture(identity("turn", "root-1"), undefined, [{ id: "current-job", content: {
+      toolCallId: "current-job-read", toolName: "jobs.get", input: { jobId: "current-role" }, status: "completed",
+      output: { job: { id: "current-role", title: "CURRENT_EVIDENCE_CANARY" } }, errorCode: null,
+    } }], completionGate)
+    const executeTool = vi.fn(root.options.executeTool)
+    const usage = { inputTokens: 7, outputTokens: 3, estimatedCostUsd: 0.04 }
+    root.options = { ...root.options, expectedEvidence: ["read:job:expected-role"], budget: { maxSteps: 4 }, maxSteps: 4,
+      tools: [{ name: "jobs.get", version: "1" }], executeTool,
+      model: { ...root.options.model, async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+        root.requests.push(request)
+        yield { type: "text_delta", text: "The expected role is available." }
+        yield { type: "usage", ...usage }
+        yield { type: "completed", finishReason: "stop" }
+      } },
+    }
+    const updateStep = vi.spyOn(root.options.store, "updateStep")
+
+    const result = await runTurnExecutionLoop(root.options)
+    const requestText = JSON.stringify(root.requests[0]?.messages)
+
+    expect(result).toMatchObject({ status: "failed", errorCode: "evidence_missing", stepCount: 1, toolCallCount: 0 })
+    expect(root.requests).toHaveLength(1)
+    expect(requestText).toContain("CURRENT_EVIDENCE_CANARY")
+    expect(requestText).not.toContain("Do not repeat a final response without evidence")
+    expect(executeTool).not.toHaveBeenCalled()
+    expect(completionGate).not.toHaveBeenCalled()
+    expect(root.stepStatuses).toEqual(["failed"])
+    expect(updateStep.mock.calls[0]?.[0]).toMatchObject({ status: "failed", finishReason: "stop", ...usage })
+    expect(root.events.filter(event => event.type === "model.usage" && event.payload !== undefined)).toHaveLength(1)
+    expect(root.events.find(event => event.type === "model.usage")?.payload).toMatchObject({ usage })
+    const denial = root.events.find(event => event.type === "final.rejected")!
+    expect(denial.idempotencyKey).toBe("turn:turn-1:event:final-rejected:turn:turn-1:step:0")
+    expect(denial.idempotencyKey).not.toContain("evidence-recovery-once")
+    expect(denial.payload).toMatchObject({ code: "evidence_missing", blocker: "Missing evidence: read:job:expected-role", taskId: "root-1" })
+    expect(root.events.some(event => event.type === "turn.completed")).toBe(false)
+    expect(JSON.parse(root.finalResponses[0]!.slice("root-1:".length))).toMatchObject({
+      completed: false, terminalReason: "final_unverified", usage,
+    })
+  })
+
   it("restores the consumed recovery instruction across restart and accounts prior usage once", async () => {
     const root = fixture(identity("turn", "root-1"))
     const baseBuilder = root.options.contextBuilder
