@@ -67,6 +67,9 @@ const CHILD_WAIT_CONSUMED_SQL = `(SELECT CASE WHEN COUNT(*) = 1 THEN MAX(continu
       WHERE currentWait."parentTaskId" = task."id" AND currentWait."sessionId" = task."sessionId" AND currentWait."turnId" = task."turnId" ORDER BY currentWaitStep."ordinal" DESC, currentWait."createdAt" DESC, currentWait."id" DESC LIMIT 1))`
 
 type ExpiredWaitDispatch = { id: string; payload: unknown; attemptCount: unknown; publishedAt: unknown }
+type RecoveryStage = "candidate_not_seen" | "candidate_seen" | "session_lock_mismatch" | "turn_lock_mismatch" | "expiry_preview_rejected" | "root_turn_not_recoverable" | "task_lock_parity_mismatch" | "recovery_clock_missing" | "lease_expiry_fence_mismatch" | "unsettled_external_call_rejected" | "durable_wait_graph_blocked" | "task_graph_transition_blocked" | "task_graph_finish_blocked" | "task_update_rejected"
+type RecoveryTrace = { taskId: string; pageCount: number; pages: Array<{ page: number; candidates: number; targetSeen: boolean; cursorUsed: boolean }>; pagesTruncated: boolean; rejectionStage: RecoveryStage; childWaitResumable: boolean | null; waitRegistrationFound: boolean | null; waitRegistrationRejected: boolean | null; blockingExternalCall: boolean | null; dispatch: Record<string, boolean> | null }
+function rejectRecovery(trace: RecoveryTrace | undefined, stage: RecoveryStage): null { if (trace) trace.rejectionStage = stage; return null }
 async function hasBlockingExternalCall(client: pg.PoolClient, task: Record<string, unknown>, ignoredEventId?: string, continuationId?: string): Promise<boolean> {
   const result = await client.query(`SELECT started."id" FROM "agent_events" AS started WHERE started."sessionId" = $1 AND started."taskId" = $2 AND started."type" IN ('tool_call.started', 'model.started')
       AND NOT EXISTS (SELECT 1 FROM "agent_events" AS settled WHERE settled."sessionId" = started."sessionId" AND settled."taskId" = started."taskId"
@@ -110,7 +113,10 @@ async function hasBlockingExternalCall(client: pg.PoolClient, task: Record<strin
 export async function recoverExpired(pool: PgSubagentPool, input: { now: Date; limit: number; sessionId?: string; turnId?: string }): Promise<SubagentTaskRecord[]> {
   if (!Number.isInteger(input.limit) || input.limit < 1) throw new RangeError("Recovery limit must be positive")
   if (input.turnId && !input.sessionId) throw new TypeError("Turn recovery filter requires a Session")
-  return transaction(pool, async client => {
+  const traceTaskId = process.env.NODE_ENV === "test" ? process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID : undefined
+  const trace: RecoveryTrace | undefined = traceTaskId ? { taskId: traceTaskId, pageCount: 0, pages: [], pagesTruncated: false, rejectionStage: "candidate_not_seen",
+    childWaitResumable: null, waitRegistrationFound: null, waitRegistrationRejected: null, blockingExternalCall: null, dispatch: null } : undefined
+  const recovered = await transaction(pool, async client => {
     const scanHorizon = (await client.query<{ scanHorizon: Date }>(`SELECT clock_timestamp() AS "scanHorizon"`)).rows[0]?.scanHorizon
     if (!(scanHorizon instanceof Date) || !Number.isFinite(scanHorizon.getTime())) throw new Error("Recovery scan horizon is unavailable")
     const recovered: SubagentTaskRecord[] = []
@@ -129,10 +135,18 @@ export async function recoverExpired(pool: PgSubagentPool, input: { now: Date; l
         ORDER BY task."sessionId", (task."rootTaskId" IS NULL), COALESCE(task."rootTaskId", ''), task."id" LIMIT $8`,
       [scanHorizon, input.sessionId ?? null, input.turnId ?? null, cursor?.sessionId ?? null, cursor?.rootIsNull ?? null,
         cursor?.rootKey ?? null, cursor?.taskId ?? null, input.limit])
+      if (trace) {
+        const page = ++trace.pageCount
+        const targetSeen = candidates.rows.some(candidate => candidate.id === trace.taskId)
+        const summary = { page, candidates: candidates.rows.length, targetSeen, cursorUsed: cursor !== undefined }
+        if (trace.pages.length < 16) trace.pages.push(summary)
+        else { trace.pagesTruncated = true; if (targetSeen) trace.pages[15] = summary }
+        if (targetSeen) trace.rejectionStage = "candidate_seen"
+      }
       if (candidates.rows.length === 0) break
       for (const candidate of candidates.rows) {
         await client.query(`SAVEPOINT ${RECOVERY_CANDIDATE_SAVEPOINT}`)
-        const outcome = await recoverOne(client, candidate, input)
+        const outcome = await recoverOne(client, candidate, input, candidate.id === trace?.taskId ? trace : undefined)
         if (!outcome) await client.query(`ROLLBACK TO SAVEPOINT ${RECOVERY_CANDIDATE_SAVEPOINT}`)
         await client.query(`RELEASE SAVEPOINT ${RECOVERY_CANDIDATE_SAVEPOINT}`)
         cursor = { sessionId: candidate.sessionId, rootIsNull: candidate.cursorRootIsNull,
@@ -144,17 +158,23 @@ export async function recoverExpired(pool: PgSubagentPool, input: { now: Date; l
     }
     return recovered
   })
+  if (trace && !recovered.some(row => row.id === trace.taskId)) {
+    const { taskId, ...safeTrace } = trace
+    void taskId
+    console.info(`WORKER_B_RECOVERY_PREDICATE_TRACE ${JSON.stringify(safeTrace)}`)
+  }
+  return recovered
 }
 
-async function recoverOne(client: pg.PoolClient, candidate: Candidate, filter: { sessionId?: string; turnId?: string }): Promise<SubagentTaskRecord | null> {
+async function recoverOne(client: pg.PoolClient, candidate: Candidate, filter: { sessionId?: string; turnId?: string }, trace?: RecoveryTrace): Promise<SubagentTaskRecord | null> {
   const session = await client.query(`SELECT "id", "userId", "status" FROM "agent_sessions" WHERE "id" = $1 FOR UPDATE`, [candidate.sessionId])
   const sessionRow = session.rows[0] as Record<string, unknown> | undefined
-  if (!sessionRow || sessionRow.userId !== candidate.userId) return null
+  if (!sessionRow || sessionRow.userId !== candidate.userId) return rejectRecovery(trace, "session_lock_mismatch")
   await client.query(`SELECT set_config('app.user_id', $1, true)`, [candidate.userId])
   if (typeof candidate.turnId === "string") {
     const turn = await client.query(`SELECT "id" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2
       AND "userId" = $3 AND "rootTaskId" = $4 FOR UPDATE`, [candidate.turnId, candidate.sessionId, candidate.userId, candidate.rootTaskId])
-    if (!turn.rows[0]) return null
+    if (!turn.rows[0]) return rejectRecovery(trace, "turn_lock_mismatch")
   }
   const sql = `SELECT task.*, session."userId" AS "userId", session."status" AS "sessionStatus",
       ${CHILD_WAIT_RESUMABLE_SQL} AS "childWaitResumable", ${CHILD_WAIT_CONSUMED_SQL} AS "childWaitContinuationId",
@@ -171,13 +191,14 @@ async function recoverOne(client: pg.PoolClient, candidate: Candidate, filter: {
   const values = [candidate.id, candidate.sessionId, candidate.userId, candidate.turnId ?? null, candidate.rootTaskId ?? candidate.id, filter.sessionId ?? null, filter.turnId ?? null]
   const preview = await client.query(sql, values)
   const old = preview.rows[0] as Record<string, unknown> | undefined
-  if (!old) return null
+  if (!old) return rejectRecovery(trace, "expiry_preview_rejected")
+  if (trace) trace.childWaitResumable = old.childWaitResumable === true
   const attemptCount = Number(old.attemptCount)
   const closedSession = old.sessionStatus === "aborted" || old.sessionStatus === "archived"
   const interrupted = closedSession || old.interruptRequestedAt !== null || old.rootInterruptRequestedAt != null
   const canonicalRoot = typeof old.id === "string" && old.id.startsWith("root-")
   const failedRootTurn = canonicalRoot && !interrupted ? await lockFailedRootTurn(client, old) : false
-  if (canonicalRoot && !interrupted && !failedRootTurn) return null
+  if (canonicalRoot && !interrupted && !failedRootTurn) return rejectRecovery(trace, "root_turn_not_recoverable")
   const atAttemptCeiling = attemptCount >= Number(old.maxAttempts)
   const childWaitResumable = old.childWaitResumable === true
   const childWaitContinuationId = typeof old.childWaitContinuationId === "string" ? old.childWaitContinuationId : undefined
@@ -187,22 +208,25 @@ async function recoverOne(client: pg.PoolClient, candidate: Candidate, filter: {
   const row = locked.rows[0] as Record<string, unknown> | undefined
   if (!row || Number(row.attemptCount) !== attemptCount || row.turnId !== (candidate.turnId ?? null)
     || (row.childWaitResumable === true) !== childWaitResumable || (typeof row.childWaitContinuationId === "string" ? row.childWaitContinuationId : undefined) !== childWaitContinuationId
-    || (canonicalRoot && (row.taskType !== old.taskType || row.id !== old.id || row.rootTaskId !== old.rootTaskId
-      || row.parentTaskId !== old.parentTaskId || row.turnId !== old.turnId))) return null
+      || (canonicalRoot && (row.taskType !== old.taskType || row.id !== old.id || row.rootTaskId !== old.rootTaskId
+       || row.parentTaskId !== old.parentTaskId || row.turnId !== old.turnId))) return rejectRecovery(trace, "task_lock_parity_mismatch")
   const checkedAt = (await client.query<{ checkedAt: Date }>(`SELECT clock_timestamp() AS "checkedAt"`)).rows[0]?.checkedAt
-  if (!checkedAt) return null
+  if (!checkedAt) return rejectRecovery(trace, "recovery_clock_missing")
   const lockedExpiry = dateValue(row.leaseExpiresAt)
   const lockedRetryAt = dateValue(row.nextAttemptAt)
-  if (!lockedExpiry || lockedExpiry > checkedAt || (lockedRetryAt && lockedRetryAt > checkedAt)) return null
+  if (!lockedExpiry || lockedExpiry > checkedAt || (lockedRetryAt && lockedRetryAt > checkedAt)) return rejectRecovery(trace, "lease_expiry_fence_mismatch")
   let rejectedWaitCallId: string | undefined
   if (!interrupted && row.parentTaskId != null && typeof row.leaseOwner === "string" && typeof row.turnId === "string") {
     const lease = { id: candidate.id, userId: candidate.userId, sessionId: candidate.sessionId, turnId: row.turnId,
       rootTaskId: String(row.rootTaskId), ownerId: row.leaseOwner, attemptCount, leaseExpiresAt: lockedExpiry }
     const registration = await recoverExpiredWaitRegistration(client, lease, checkedAt)
+    if (trace) { trace.waitRegistrationFound = Boolean(registration); trace.waitRegistrationRejected = Boolean(registration && "rejectedCallId" in registration) }
     if (registration && "rejectedCallId" in registration) rejectedWaitCallId = registration.rejectedCallId
-    if (await hasBlockingExternalCall(client, row, rejectedWaitCallId, waitContinuation && childWaitConsumed && !rejectedWaitCallId ? childWaitContinuationId : undefined)) return null
+    const blockedByExternalCall = await hasBlockingExternalCall(client, row, rejectedWaitCallId, waitContinuation && childWaitConsumed && !rejectedWaitCallId ? childWaitContinuationId : undefined)
+    if (trace) trace.blockingExternalCall = blockedByExternalCall
+    if (blockedByExternalCall) return rejectRecovery(trace, "unsettled_external_call_rejected")
     const wait = await recoverExpiredDurableSubagentWaitWithGraph(client, { lease, now: checkedAt })
-    if (wait && "blocked" in wait) return null
+    if (wait && "blocked" in wait) return rejectRecovery(trace, "durable_wait_graph_blocked")
     if (wait) return { ...rowToTask(row), status: wait.handoff === "suspended" ? "waiting" : "queued",
       nextAttemptAt: null, leaseOwner: null, leaseExpiresAt: null }
   }
@@ -216,6 +240,9 @@ async function recoverOne(client: pg.PoolClient, candidate: Candidate, filter: {
     waitDispatch = result.rows[0]
     const payload = waitDispatch ? parseSubagentJobPayload(waitDispatch.payload) : null
     const generation = waitDispatch ? Number(waitDispatch.attemptCount) : Number.NaN
+    if (trace) trace.dispatch = { present: Boolean(waitDispatch), payloadValid: payload !== null, task: payload?.taskId === candidate.id, session: payload?.sessionId === candidate.sessionId,
+      root: payload?.rootTaskId === candidate.rootTaskId, owner: typeof row.leaseOwner === "string" && payload?.ownerId === row.leaseOwner,
+      generation: Number.isSafeInteger(generation) && generation >= 1 && generation < 2_147_483_647, published: waitDispatch?.publishedAt != null }
     if (waitDispatch && payload && waitDispatch.publishedAt != null && Number.isSafeInteger(generation)
       && generation >= 1 && generation < 2_147_483_647 && payload.taskId === candidate.id
       && payload.sessionId === candidate.sessionId && payload.rootTaskId === candidate.rootTaskId
@@ -226,7 +253,8 @@ async function recoverOne(client: pg.PoolClient, candidate: Candidate, filter: {
     }
   }
   const unsettledExternalCall = await hasBlockingExternalCall(client, row, rejectedWaitCallId, waitContinuation && childWaitConsumed && !rejectedWaitCallId ? childWaitContinuationId : undefined)
-  if (unsettledExternalCall && (!waitContinuation || childWaitConsumed)) return null
+  if (trace) trace.blockingExternalCall = unsettledExternalCall
+  if (unsettledExternalCall && (!waitContinuation || childWaitConsumed)) return rejectRecovery(trace, "unsettled_external_call_rejected")
   const terminal = Boolean(rejectedWaitCallId) || interrupted || failedRootTurn || atAttemptCeiling && !waitContinuation
   const status = terminal ? interrupted ? "interrupted" : "failed" : "queued"
   let failureReason = status === "failed" ? rejectedWaitCallId ? "Persisted wait_subagents call was not admitted for the current child role." : failedRootTurn ? "Linked Turn failed before root lease recovery." : "Worker lease expired after maximum attempts." : old.failureReason ?? null
@@ -235,10 +263,10 @@ async function recoverOne(client: pg.PoolClient, candidate: Candidate, filter: {
     type: status === "interrupted" ? "task.interrupted" : status === "failed" ? "task.failed" : "task.retrying",
     attemptCount, ...(status === "failed" ? { failureReason: String(failureReason) } : {}),
   })
-  if (graph && "blocked" in graph) return null
+  if (graph && "blocked" in graph) return rejectRecovery(trace, "task_graph_transition_blocked")
   let persistedResult: unknown, resultUpdated = false
   if (status === "failed" && graph && !("blocked" in graph) && graph.snapshot.nodes.some(node => node.taskId === candidate.id && node.verificationDisposition === "typed" && node.verification)) {
-    const finish = await prepareTaskGraphFinish(client, { taskId: candidate.id, sessionId: candidate.sessionId, attemptCount, status, retry: false, failureReason: String(failureReason), result: row.result ?? null }); if (finish.graph && "blocked" in finish.graph) return null
+    const finish = await prepareTaskGraphFinish(client, { taskId: candidate.id, sessionId: candidate.sessionId, attemptCount, status, retry: false, failureReason: String(failureReason), result: row.result ?? null }); if (finish.graph && "blocked" in finish.graph) return rejectRecovery(trace, "task_graph_finish_blocked")
     graph = finish.graph; failureReason = finish.failureReason ?? failureReason; persistedResult = finish.result; resultUpdated = true
   }
   const nextAttemptAt = status === "queued" && !waitContinuation ? computeSubagentNextAttemptAt(attemptCount, checkedAt) : null
@@ -253,7 +281,7 @@ async function recoverOne(client: pg.PoolClient, candidate: Candidate, filter: {
   [candidate.id, candidate.sessionId, status, nextAttemptAt, failureReason, terminal, checkedAt, candidate.userId, row.sessionStatus, resultUpdated, resultUpdated ? json(persistedResult, null, "subagent_task_result") : null])
   if (updated.rowCount !== 1) {
     if (waitContinuation) throw new Error("expired_child_wait_task_rearm_conflict")
-    return null
+    return rejectRecovery(trace, "task_update_rejected")
   }
   if (waitContinuation && waitDispatch && nextWaitPayload) {
     const rearmed = await client.query(`UPDATE "agent_outbox" SET "payload" = $1::jsonb, "publishedAt" = NULL, "lastError" = NULL
