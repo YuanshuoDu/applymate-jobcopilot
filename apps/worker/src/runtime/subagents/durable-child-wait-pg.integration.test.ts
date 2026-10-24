@@ -59,7 +59,8 @@ type WorkerProcess = ChildProcess & {
 function launchWorker(mode: "worker-a" | "worker-a-crash" | "worker-b-crash-before-resume" | "worker-b-crash-resume" | "worker-b-crash-after-wait-ack" | "worker-b", queueName: string, ids: FixtureIds): WorkerProcess {
   const child = spawn(process.execPath, ["--import", "tsx", fixturePath, mode, queueName, JSON.stringify(ids)], {
     cwd: workerCwd,
-    env: { ...process.env, DATABASE_URL: databaseUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl!, AGENT_TURN_REDIS_TEST_URL: redisUrl! },
+    env: { ...process.env, DATABASE_URL: databaseUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl!, AGENT_TURN_REDIS_TEST_URL: redisUrl!,
+      ...(mode === "worker-b-crash-resume" ? { AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID: ids.waiterTaskId } : {}) },
     stdio: ["ignore", "pipe", "pipe"],
   }) as WorkerProcess
   child.stdoutText = ""
@@ -468,7 +469,8 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       workerC = launchWorker("worker-b-crash-resume", queueName, ids)
       await waitForMarker(workerC, "WORKER_B_RECOVERED")
       const recoveryDiagnostic = workerC.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_RECOVERY_DIAGNOSTIC "))
-      expect(workerC.stdoutText, `Worker C missed the waiter; ${recoveryDiagnostic ?? "diagnostic missing"}`)
+      const predicateTrace = workerC.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_RECOVERY_PREDICATE_TRACE "))
+      expect(workerC.stdoutText, `Worker C missed the waiter; ${recoveryDiagnostic ?? "diagnostic missing"}; ${predicateTrace ?? "predicate trace missing"}`)
         .toContain(`"id":"${waiter.id}","status":"queued"`)
       const blockerStateAfterRecovery = await readBlockerDurableState(pool, recoveryBlockerTaskIds)
       expect(blockerStateAfterRecovery).toEqual(blockerStateBeforeRecovery)

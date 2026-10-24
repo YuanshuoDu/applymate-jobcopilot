@@ -204,6 +204,36 @@ describe("expired subagent recovery fence", () => {
     expect(fake.client.query.mock.calls.at(-1)?.[0]).toBe("COMMIT")
   })
 
+  it("traces bounded production candidate pages and a fixed target rejection stage only for a test target", async () => {
+    const taskId = "synthetic-trace-target"
+    const blockers = Array.from({ length: 10 }, (_, index) => `blocked-${index}`)
+    const fake = fixture({ blockedCandidateIds: blockers, missingPreviewCandidateIds: [taskId], candidatePages: [
+      blockers.map(id => scanCandidate(id)), [scanCandidate(taskId)],
+    ] })
+    const previousNodeEnv = process.env.NODE_ENV
+    const previousTraceTarget = process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID
+    const output = vi.spyOn(console, "info").mockImplementation(() => undefined)
+    process.env.NODE_ENV = "test"
+    process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID = taskId
+    try {
+      await expect(recoverExpired(fake.pool as PgSubagentPool, { now: checkedAt, limit: 10 })).resolves.toEqual([])
+      const line = output.mock.calls.map(([value]) => String(value)).find(value => value.startsWith("WORKER_B_RECOVERY_PREDICATE_TRACE "))
+      expect(line).toBeDefined()
+      const trace = JSON.parse(line!.slice("WORKER_B_RECOVERY_PREDICATE_TRACE ".length))
+      expect(trace).not.toHaveProperty("taskId")
+      expect(trace).toMatchObject({ rejectionStage: "expiry_preview_rejected", childWaitResumable: null,
+        pages: [{ page: 1, candidates: 10, targetSeen: false, cursorUsed: false },
+          { page: 2, candidates: 1, targetSeen: true, cursorUsed: true }],
+      })
+    } finally {
+      output.mockRestore()
+      if (previousNodeEnv === undefined) delete process.env.NODE_ENV
+      else process.env.NODE_ENV = previousNodeEnv
+      if (previousTraceTarget === undefined) delete process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID
+      else process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID = previousTraceTarget
+    }
+  })
+
   it("uses a non-null normalized root cursor for legacy candidates", async () => {
     const fake = fixture({ missingPreviewCandidateIds: ["legacy-orphan"], candidatePages: [
       [scanCandidate("legacy-orphan", "a-session", null)], [scanCandidate("recovered-2", "z-session", "root-z")],
