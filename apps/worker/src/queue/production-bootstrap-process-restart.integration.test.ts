@@ -757,7 +757,7 @@ async function policyDecisionReplayReceipt(pool: Pool, turnId: string, sessionId
       [sessionId, turnId, toolCallId],
     ),
     pool.query<{
-      callCount: string; resultCount: string; completedCallCount: string; completedEventCount: string
+      callCount: string; resultCount: string; completedCallCount: string; completedRecoveryEventCount: string
       result: Record<string, unknown> | null
     }>(
       `SELECT
@@ -765,7 +765,10 @@ async function policyDecisionReplayReceipt(pool: Pool, turnId: string, sessionId
          (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = $1 AND "type" = 'tool_result' AND "content"->>'toolCallId' = $2) AS "resultCount",
          (SELECT COUNT(*)::text FROM "agent_items" WHERE "turnId" = $1 AND "type" = 'tool_call' AND "status" = 'completed'
            AND "content"->>'toolCallId' = $2 AND "content"->>'status' = 'completed') AS "completedCallCount",
-         (SELECT COUNT(*)::text FROM "agent_events" WHERE "turnId" = $1 AND "type" = 'tool_call.completed' AND "correlationId" = $2) AS "completedEventCount",
+         (SELECT COUNT(*)::text FROM "agent_events" AS event
+           JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
+           WHERE event."turnId" = $1 AND event."type" = 'tool_call.completed' AND event."correlationId" = $2
+             AND event."idempotencyKey" = 'turn:' || turn."id" || ':event:tool-finished:' || $2) AS "completedRecoveryEventCount",
          (SELECT "content" FROM "agent_items" WHERE "turnId" = $1 AND "type" = 'tool_result' AND "content"->>'toolCallId' = $2 LIMIT 1) AS "result"`,
       [turnId, toolCallId],
     ),
@@ -1711,7 +1714,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
       eventId: decision.id, idempotencyKey: decision.idempotencyKey, outcome: "allow",
       taskId: rootBefore?.rootTaskId, attemptCount: null,
     })
-    expect(before.tools).toMatchObject({ callCount: "1", resultCount: "0", completedCallCount: "0", completedEventCount: "0" })
+    expect(before.tools).toMatchObject({ callCount: "1", resultCount: "0", completedCallCount: "0", completedRecoveryEventCount: "0" })
     expect(workerOne.output.filter(line => line.startsWith(`POLICY_REPLAY_TOOL_EXECUTED ${toolCallId}`))).toHaveLength(0)
 
     if (!workerOne.pid) throw new Error("Policy decision Worker A has no PID at the restart boundary")
@@ -1751,7 +1754,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
       stepTaskId: rootBefore?.rootTaskId, turnLeaseActive: true, rootLeaseActive: true,
     })
     expect(replayed.leaseVersion).toBeGreaterThan(rootBefore?.leaseVersion ?? 0)
-    expect(reclaimed.tools).toMatchObject({ callCount: "1", resultCount: "0", completedCallCount: "0", completedEventCount: "0" })
+    expect(reclaimed.tools).toMatchObject({ callCount: "1", resultCount: "0", completedCallCount: "0", completedRecoveryEventCount: "0" })
     expect(workerTwo.output.filter(line => line.startsWith(`POLICY_REPLAY_TOOL_EXECUTED ${toolCallId}`))).toHaveLength(0)
     workerTwo.stdin?.write("release-policy-decision-replay\n")
     await waitForLine(workerTwo, `POLICY_REPLAY_TOOL_EXECUTED ${toolCallId}`, 30_000)
@@ -1762,7 +1765,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     expect(after.events[0]).toEqual(decision)
     expect(after.root).toMatchObject({ rootTaskId: rootBefore?.rootTaskId, rootAttemptCount: rootBefore?.rootAttemptCount,
       stepId: rootBefore?.stepId, stepAttempt: rootBefore?.stepAttempt, stepTaskId: rootBefore?.rootTaskId })
-    expect(after.tools).toMatchObject({ callCount: "1", resultCount: "1", completedCallCount: "1", completedEventCount: "1" })
+    expect(after.tools).toMatchObject({ callCount: "1", resultCount: "1", completedCallCount: "1", completedRecoveryEventCount: "1" })
     expect(after.tools?.result).toMatchObject({
       toolCallId, toolName: "jobs.search", status: "completed",
       output: { jobs: [{ id: jobId, company: searchTarget }] },
