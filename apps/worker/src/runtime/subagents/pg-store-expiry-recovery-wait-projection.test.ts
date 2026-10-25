@@ -147,6 +147,27 @@ describe("expired wait projection repair", () => {
     expect(valid.calls.some(call => call.sql.startsWith('UPDATE "agent_wait_conditions"'))).toBe(false)
   })
 
+  it("accepts a canonical unconsumed wait with its latest streaming continuation", async () => {
+    const fake = fixture({ noCall: true, wait: { result: canonicalProjection(), repairLatestOrdinal: 5,
+      repairNextStatus: "streaming", repairNextOrdinal: 5 } })
+    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toBe(true)
+    const waitQuery = fake.calls[0]?.sql ?? ""
+    expect(waitQuery).toContain(`step."status" IN ('waiting_for_tool', 'completed') AND EXISTS`)
+    expect(waitQuery).toContain(`continuation."status" = 'streaming'`)
+    expect(fake.calls.some(call => call.sql.startsWith('UPDATE "agent_wait_conditions"'))).toBe(false)
+  })
+
+  it.each([
+    { label: "owner", wait: { repairLeaseOwner: "other-owner" } },
+    { label: "attempt", wait: { repairTaskAttempt: 2, repairAttempt: 2 } },
+  ])("rejects a canonical streaming continuation with a mismatched $label", async options => {
+    const fake = fixture({ noCall: true, wait: { result: canonicalProjection(), repairLatestOrdinal: 5,
+      repairNextStatus: "streaming", repairNextOrdinal: 5, ...options.wait } })
+    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toBe(false)
+    expect(fake.calls.some(call => call.sql.includes('FROM "sub_agent_tasks" AS child'))).toBe(false)
+    expect(fake.calls.some(call => call.sql.startsWith('UPDATE "agent_wait_conditions"'))).toBe(false)
+  })
+
   it("rejects duplicate exact unresolved wait calls even when the projection matches", async () => {
     const fake = fixture({ duplicateCalls: true, wait: { result: canonicalProjection() } })
     await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toBe(false)
