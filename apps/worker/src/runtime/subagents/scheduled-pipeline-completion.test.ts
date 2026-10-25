@@ -122,7 +122,7 @@ describe("scheduled pipeline pre-terminal completion", () => {
     expect(bridge).not.toHaveBeenCalled()
     expect(fetcher).not.toHaveBeenCalled()
     expect(stageCandidate).not.toHaveBeenCalled()
-    expect(onWebAccepted).not.toHaveBeenCalled()
+    expect(onWebAccepted).toHaveBeenCalledOnce()
   })
 
   it("returns a completed Audit proof only to the canonical-gate retry", async () => {
@@ -146,7 +146,7 @@ describe("scheduled pipeline pre-terminal completion", () => {
     expect(bridge).not.toHaveBeenCalled()
     expect(fetcher).not.toHaveBeenCalled()
     expect(stageCandidate).not.toHaveBeenCalled()
-    expect(onWebAccepted).not.toHaveBeenCalled()
+    expect(onWebAccepted).toHaveBeenCalledOnce()
   })
 
   it("does not resume an Audit child for a changed candidate or foreign root owner", async () => {

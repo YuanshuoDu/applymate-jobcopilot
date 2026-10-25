@@ -204,8 +204,13 @@ export function attachScheduledPipelineCompletion(input: Readonly<{
       try {
         const result = await resumeGate({ owner, executionOwner: identity, mode: "resume_audit",
           finalStepId: recovered.finalStepId, recoveryStepId: stepId, signal })
-        if (result.status === "waiting_for_dependency") return { status: result.status, waitId: result.waitId }
-        return result.status === "completed" ? { status: "completed" } : { status: "not_applicable" }
+        if (result.status === "waiting_for_dependency" && result.waitId.trim() === result.waitId
+          && result.waitId.length > 0 && result.waitId.length <= 128) {
+          input.onWebAccepted()
+          return { status: result.status, waitId: result.waitId }
+        }
+        if (result.status === "completed") { input.onWebAccepted(); return { status: "completed" } }
+        return { status: "not_applicable" }
       } catch (error: unknown) {
         if (isTurnStateRefreshRetryError(error) || isSessionPauseRequestedError(error) || signalWasInterrupted(signal)
           || signal.aborted || isOwnershipLost?.(error, signal)) throw error
