@@ -1,7 +1,8 @@
 import { signalWasInterrupted } from "../interrupt/registry.js"
 import { isSessionPauseRequestedError } from "../session-gate.js"
 import { TurnStateRefreshRetryError, isTurnStateRefreshRetryError } from "../turns/turn-execution-question.js"
-import { SCHEDULED_PIPELINE_COMPLETION, type ScheduledPipelineCompletionDisposition, type TurnEngineCompletionGate } from "../turns/turn-execution-types.js"
+import { SCHEDULED_PIPELINE_COMPLETION, SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME, type ScheduledPipelineCompletionDisposition,
+  type ScheduledPipelineExistingAuditResumeDisposition, type TurnEngineCompletionGate } from "../turns/turn-execution-types.js"
 import { postScheduledPipelineContinuation, scheduledTaskGraphContinuationKey, type ScheduledPipelineAnalyzeCheckpointProof } from "./scheduled-pipeline-handoff.js"
 import type { ScheduledAutomationPipelineAttestation, ScheduledAutomationPipelineBridgeResult, ScheduledAutomationPipelineBridgeScope } from "./scheduled-automation-pipeline-bridge.js"
 import type { ScheduledPipelineCandidate, ScheduledPipelineCandidateIdentity } from "./scheduled-pipeline-candidate-store.js"
@@ -175,6 +176,7 @@ export function attachScheduledPipelineCompletion(input: Readonly<{
   rootAttemptCount: number
 }>): TurnEngineCompletionGate | undefined {
   if (!input.gate || !input.owner) return input.gate
+  delete input.gate[SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME]
   input.gate[SCHEDULED_PIPELINE_COMPLETION] = async ({ identity, candidateText, signal, stepId, stepOrdinal, isOwnershipLost }) => {
     if (identity.kind !== "turn" || identity.taskId !== input.owner!.rootTaskId) throw new Error("scheduled_candidate_owner_invalid")
     const recovered = input.recoveredCandidate?.candidateText === candidateText ? input.recoveredCandidate : undefined
@@ -189,6 +191,27 @@ export function attachScheduledPipelineCompletion(input: Readonly<{
       || disposition.status === "waiting_for_external_user"
       || disposition.status === "waiting_for_dependency") input.onWebAccepted()
     return disposition
+  }
+  const recovered = input.recoveredCandidate, owner = input.owner, resumeGate = input.continueAfterGate
+  if (recovered && resumeGate && input.rootAttemptCount === owner.rootAttemptCount && recovered.recoverySource.rootAttemptCount === input.rootAttemptCount
+    && recovered.recoverySource.owner.userId === owner.userId && recovered.recoverySource.owner.sessionId === owner.sessionId
+    && recovered.recoverySource.owner.turnId === owner.turnId && recovered.recoverySource.owner.rootTaskId === owner.rootTaskId) {
+    input.gate[SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME] = async ({ identity, candidateText, signal, stepId, isOwnershipLost }): Promise<ScheduledPipelineExistingAuditResumeDisposition> => {
+      if (identity.kind !== "turn" || identity.taskId !== owner.rootTaskId || identity.rootTaskId !== owner.rootTaskId
+        || identity.userId !== owner.userId || identity.sessionId !== owner.sessionId || identity.turnId !== owner.turnId
+        || identity.ownerId !== owner.turnLeaseOwnerId || identity.leaseVersion !== owner.turnLeaseVersion
+        || candidateText !== recovered.candidateText) return { status: "not_applicable" }
+      try {
+        const result = await resumeGate({ owner, executionOwner: identity, mode: "resume_audit",
+          finalStepId: recovered.finalStepId, recoveryStepId: stepId, signal })
+        if (result.status === "waiting_for_dependency") return { status: result.status, waitId: result.waitId }
+        return result.status === "completed" ? { status: "completed" } : { status: "not_applicable" }
+      } catch (error: unknown) {
+        if (isTurnStateRefreshRetryError(error) || isSessionPauseRequestedError(error) || signalWasInterrupted(signal)
+          || signal.aborted || isOwnershipLost?.(error, signal)) throw error
+        throw new TurnStateRefreshRetryError()
+      }
+    }
   }
   return input.gate
 }

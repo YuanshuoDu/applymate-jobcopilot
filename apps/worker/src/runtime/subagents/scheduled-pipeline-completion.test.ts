@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { createHash } from "node:crypto"
 import { TurnStateRefreshRetryError } from "../turns/turn-execution-question.js"
-import { SCHEDULED_PIPELINE_COMPLETION, type TurnEngineCompletionGate } from "../turns/turn-execution-types.js"
-import { attachScheduledPipelineCompletion, completeScheduledPipelineBeforeTerminal } from "./scheduled-pipeline-completion.js"
+import { SCHEDULED_PIPELINE_COMPLETION, SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME, type TurnEngineCompletionGate } from "../turns/turn-execution-types.js"
+import { attachScheduledPipelineCompletion, completeScheduledPipelineBeforeTerminal,
+  type ScheduledPipelineGateContinuation } from "./scheduled-pipeline-completion.js"
+import type { ScheduledPipelineCandidate } from "./scheduled-pipeline-candidate-store.js"
 import { createScheduledAutomationGateContinuation } from "./scheduled-automation-gate-bridge.js"
 import { scheduledTaskGraphContinuationKey } from "./scheduled-pipeline-handoff.js"
 import { scheduledPrepareChoiceWaitId } from "../turns/turn-question-contract.js"
@@ -81,6 +83,13 @@ const readyPrepare = (choiceRequired = true): Readonly<{ status: "ready"; choice
 }
 const base = () => ({ executionOwner, rootAttemptCount: owner.rootAttemptCount,
   finalStepId: "step-final", finalStepOrdinal: 3, recoveryStepId: "step-final", stageCandidate: vi.fn(async () => undefined) })
+const recoveredCandidate = (candidateText = "Final candidate"): ScheduledPipelineCandidate => ({
+  candidateText, finalStepId: "step-final", finalStepOrdinal: 3, finishReason: "stop", usage: null,
+  recoverySource: { owner: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId },
+    sourceEventId: "candidate-event-1", sourceStepId: "step-final", sourceStepOrdinal: 3,
+    rootAttemptCount: owner.rootAttemptCount, inputThroughSequence: "10" },
+  recoveryTail: null,
+})
 
 beforeEach(() => {
   gateContinuationMocks.selectResume.mockReset()
@@ -91,6 +100,108 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllEnvs())
 
 describe("scheduled pipeline pre-terminal completion", () => {
+  it("resumes only the exact recovered candidate's Audit child on the current active Step", async () => {
+    const candidate = recoveredCandidate(), signal = new AbortController().signal
+    const gate: TurnEngineCompletionGate = async () => ({ ok: false, blocker: "child_tasks_pending", feedback: "Audit is pending" })
+    const bridge = vi.fn(), fetcher = vi.fn<typeof fetch>(), stageCandidate = vi.fn(async () => undefined), onWebAccepted = vi.fn()
+    const continueAfterGate = vi.fn<ScheduledPipelineGateContinuation>(async input => {
+      expect(input).toEqual({ owner, executionOwner, mode: "resume_audit", finalStepId: "step-final",
+        recoveryStepId: "active-recovery-step", signal })
+      return { status: "waiting_for_dependency", waitId: "audit-wait-current" }
+    })
+    const attached = attachScheduledPipelineCompletion({ gate, owner, recoveredCandidate: candidate, bridge,
+      continueAfterGate, fetcher, onWebAccepted, stageCandidate, rootAttemptCount: owner.rootAttemptCount })
+    const resumeAudit = attached?.[SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME]
+    expect(resumeAudit).toBeDefined()
+
+    await expect(resumeAudit!({ identity: executionOwner, scope: {} as never, rootTaskId: owner.rootTaskId,
+      stepId: "active-recovery-step", stepOrdinal: 8, candidateText: candidate.candidateText, signal,
+      now: new Date("2026-10-25T12:00:00.000Z") }))
+      .resolves.toEqual({ status: "waiting_for_dependency", waitId: "audit-wait-current" })
+    expect(continueAfterGate).toHaveBeenCalledOnce()
+    expect(bridge).not.toHaveBeenCalled()
+    expect(fetcher).not.toHaveBeenCalled()
+    expect(stageCandidate).not.toHaveBeenCalled()
+    expect(onWebAccepted).not.toHaveBeenCalled()
+  })
+
+  it("returns a completed Audit proof only to the canonical-gate retry", async () => {
+    const candidate = recoveredCandidate(), signal = new AbortController().signal
+    const gate: TurnEngineCompletionGate = async () => ({ ok: false, blocker: "child_tasks_pending", feedback: "Audit is pending" })
+    const bridge = vi.fn(), fetcher = vi.fn<typeof fetch>(), stageCandidate = vi.fn(async () => undefined), onWebAccepted = vi.fn()
+    const continueAfterGate = vi.fn<ScheduledPipelineGateContinuation>(async input => {
+      expect(input).toEqual({ owner, executionOwner, mode: "resume_audit", finalStepId: candidate.finalStepId,
+        recoveryStepId: "active-recovery-step", signal })
+      return { status: "completed" }
+    })
+    const attached = attachScheduledPipelineCompletion({ gate, owner, recoveredCandidate: candidate, bridge,
+      continueAfterGate, fetcher, onWebAccepted, stageCandidate, rootAttemptCount: owner.rootAttemptCount })
+    const resumeAudit = attached?.[SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME]
+    expect(resumeAudit).toBeDefined()
+
+    await expect(resumeAudit!({ identity: executionOwner, scope: {} as never, rootTaskId: owner.rootTaskId,
+      stepId: "active-recovery-step", stepOrdinal: 8, candidateText: candidate.candidateText, signal, now: new Date() }))
+      .resolves.toEqual({ status: "completed" })
+    expect(continueAfterGate).toHaveBeenCalledOnce()
+    expect(bridge).not.toHaveBeenCalled()
+    expect(fetcher).not.toHaveBeenCalled()
+    expect(stageCandidate).not.toHaveBeenCalled()
+    expect(onWebAccepted).not.toHaveBeenCalled()
+  })
+
+  it("does not resume an Audit child for a changed candidate or foreign root owner", async () => {
+    const candidate = recoveredCandidate(), signal = new AbortController().signal
+    const gate: TurnEngineCompletionGate = async () => ({ ok: false, blocker: "child_tasks_pending", feedback: "Audit is pending" })
+    const continueAfterGate = vi.fn<ScheduledPipelineGateContinuation>(async () => ({ status: "completed" }))
+    const attached = attachScheduledPipelineCompletion({ gate, owner, recoveredCandidate: candidate,
+      bridge: vi.fn(), continueAfterGate, fetcher: vi.fn<typeof fetch>(), onWebAccepted: vi.fn(),
+      stageCandidate: vi.fn(async () => undefined), rootAttemptCount: owner.rootAttemptCount })
+    const resumeAudit = attached?.[SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME]
+    expect(resumeAudit).toBeDefined()
+    const input = { identity: executionOwner, scope: {} as never, rootTaskId: owner.rootTaskId,
+      stepId: "active-recovery-step", stepOrdinal: 8, candidateText: candidate.candidateText, signal, now: new Date() }
+
+    await expect(resumeAudit!({ ...input, candidateText: "Changed candidate" })).resolves.toEqual({ status: "not_applicable" })
+    await expect(resumeAudit!({ ...input, identity: { ...executionOwner, ownerId: "worker-foreign", leaseVersion: 6 } }))
+      .resolves.toEqual({ status: "not_applicable" })
+    expect(continueAfterGate).not.toHaveBeenCalled()
+  })
+
+  it("does not attach the Audit-only callback without both a recovered candidate and Gate continuation", () => {
+    const gate: TurnEngineCompletionGate = async () => ({ ok: true })
+    const shared = { gate, owner, bridge: async () => ready, fetcher: vi.fn<typeof fetch>(),
+      onWebAccepted: vi.fn(), stageCandidate: vi.fn(async () => undefined), rootAttemptCount: owner.rootAttemptCount }
+    const withoutCandidate = attachScheduledPipelineCompletion({ ...shared,
+      continueAfterGate: async () => ({ status: "completed" }) })
+    const withoutContinuation = attachScheduledPipelineCompletion({ ...shared, recoveredCandidate: recoveredCandidate() })
+    expect(withoutCandidate?.[SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME]).toBeUndefined()
+    expect(withoutContinuation?.[SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME]).toBeUndefined()
+  })
+
+  it.each([
+    { status: "not_registered" } as const,
+    { status: "blocked", errorCode: "scheduled_audit_resume_invalid" } as const,
+    { status: "gate_continuation", handoff: analyzeProof(), prepareProof: readyPrepare().prepareProof } as const,
+    { status: "waiting_for_choice", waitId: "gate-choice", question: "Choose", binding: {} as TurnQuestionGateChoiceBinding } as const,
+  ])("does not route unsupported Audit resume result to bridge, staging, or Web: $status", async outcome => {
+    const gate: TurnEngineCompletionGate = async () => ({ ok: false, blocker: "child_tasks_pending", feedback: "Audit is pending" })
+    const bridge = vi.fn(), fetcher = vi.fn<typeof fetch>(), stageCandidate = vi.fn(async () => undefined), onWebAccepted = vi.fn()
+    const continueAfterGate = vi.fn<ScheduledPipelineGateContinuation>(async () => outcome)
+    const attached = attachScheduledPipelineCompletion({ gate, owner, recoveredCandidate: recoveredCandidate(), bridge,
+      continueAfterGate, fetcher, onWebAccepted, stageCandidate, rootAttemptCount: owner.rootAttemptCount })
+    const resumeAudit = attached?.[SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME]
+    expect(resumeAudit).toBeDefined()
+
+    await expect(resumeAudit!({ identity: executionOwner, scope: {} as never, rootTaskId: owner.rootTaskId,
+      stepId: "active-recovery-step", stepOrdinal: 8, candidateText: "Final candidate", signal: new AbortController().signal,
+      now: new Date() })).resolves.toEqual({ status: "not_applicable" })
+    expect(continueAfterGate).toHaveBeenCalledOnce()
+    expect(bridge).not.toHaveBeenCalled()
+    expect(fetcher).not.toHaveBeenCalled()
+    expect(stageCandidate).not.toHaveBeenCalled()
+    expect(onWebAccepted).not.toHaveBeenCalled()
+  })
+
   it("recovers an exact Audit completion before Web and stages the resumed candidate", async () => {
     const stageCandidate = vi.fn(async () => undefined), bridge = vi.fn()
     const continueAfterGate = vi.fn(async input => {
