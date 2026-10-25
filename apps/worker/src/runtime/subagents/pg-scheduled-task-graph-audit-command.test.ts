@@ -3,6 +3,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 import { appendScheduledAudit, verifyScheduledAuditCompletion,
   verifyScheduledGateCompletionWithAuditReplay } from "./pg-scheduled-task-graph-audit-command.js"
 import { canonicalTaskGraphJson, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
+import { ROLE_RESULT_SCHEMA, type PrepareResult } from "./role-results.js"
+import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
+import { buildScheduledPrepareTaskGraphProof, SCHEDULED_PREPARE_COMPLETION_SCHEMA,
+  SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA, scheduledPrepareResultDigest } from "./scheduled-prepare-task-graph-verification.js"
+import { scheduledTaskGraphContinuationKey } from "./scheduled-pipeline-handoff.js"
+import { buildScheduledTaskGraphContinuationReceipt, scheduledTaskGraphStableContinuationKey } from "./scheduled-taskgraph-continuation-receipt.js"
+import { SCHEDULED_GATE_COMPLETION_PROOF_SCHEMA, type ScheduledGateCompletionProof } from "./scheduled-gate-contract.js"
 import { SCHEDULED_AUDIT_OUTPUT_SCHEMA, SCHEDULED_AUDIT_REGISTRATION_RECEIPT_SCHEMA,
   SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE, SCHEDULED_AUDIT_TEMPLATE_ID,
   SCHEDULED_AUDIT_NODE_CRITERIA, SCHEDULED_AUDIT_NODE_GOAL, parseScheduledAuditRegistrationReceipt } from "./scheduled-audit-contract.js"
@@ -62,12 +69,48 @@ const owner = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", root
 const scope = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
   parentTaskId: owner.rootTaskId, stepId: "step-1", turnLeaseOwner: "turn-owner", turnLeaseVersion: 5,
   parentLeaseOwner: "root-owner", parentAttemptCount: 2 }
-const continuationKey = `scheduled-taskgraph:sha256:${"a".repeat(64)}`
 const snapshotDigest = `sha256:${"b".repeat(64)}`
-const binding = { owner, snapshotDigest, evidenceDigest: "c".repeat(64), checkpointDigest: "d".repeat(64),
-  analyzeGraphRevision: 7, prepareScheduleRevision: 8 }
-const proof = { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1" as const, graphRevision: 12,
-  prepareProof: { completion: { wait: { waitId: "prepare-wait" } } },
+const evidenceDigest = "c".repeat(64), checkpointDigest = "d".repeat(64), analyzeGraphRevision = 7
+const attestation = {
+  schemaVersion: "agent-harness.v2.scheduled-pipeline-attestation.v1" as const,
+  owner: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+    rootAttemptCount: owner.rootAttemptCount, turnLeaseOwnerId: scope.turnLeaseOwner, turnLeaseVersion: scope.turnLeaseVersion },
+  snapshotDigest, graphRevision: analyzeGraphRevision,
+  scout: { taskId: "scout-task", attemptCount: 1, status: "completed" as const, verification: "passed" as const,
+    resultDigest: `sha256:${"1".repeat(64)}`, candidateJobIds: ["job-1"], discoveryReceipt: { status: "complete" as const,
+      taskId: "scout-task", attemptCount: 1, completedCalls: 1, candidateCount: 1, providerFailures: 0 as const,
+      materializationFailures: 0 as const, hasMore: false as const, receiptDigest: `sha256:${"2".repeat(64)}` } },
+  analyst: { taskId: "analyst-task", attemptCount: 1, status: "completed" as const, verification: "passed" as const,
+    resultDigest: `sha256:${"3".repeat(64)}`, dependsOnTaskIds: ["scout-task"], jobIds: ["job-1"] },
+  evidenceDigest,
+}
+const handoffContinuationKey = scheduledTaskGraphContinuationKey(attestation.owner, attestation, owner.executionId, owner.executionAttemptCount)
+const binding = { owner: { ...attestation.owner, executionId: owner.executionId,
+    executionAttemptCount: owner.executionAttemptCount }, continuationKey: handoffContinuationKey,
+  snapshotDigest, evidenceDigest, checkpointDigest, analyzeGraphRevision, prepareScheduleRevision: analyzeGraphRevision + 1 }
+const continuationKey = scheduledTaskGraphStableContinuationKey(binding)
+if (!continuationKey) throw new Error("Invalid scheduled TaskGraph continuation fixture")
+const prepareReceipt = buildScheduledTaskGraphContinuationReceipt({ ...binding, continuationKey })
+if (!prepareReceipt) throw new Error("Invalid scheduled TaskGraph continuation receipt fixture")
+const prepareResult: PrepareResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status: "completed",
+  taskId: "prepare-task", attemptCount: 1, snapshotDigest, checkpointDigest, jobs: [], materials: [] }
+const prepareCompletion = { schemaVersion: SCHEDULED_PREPARE_COMPLETION_SCHEMA, graphRevision: analyzeGraphRevision + 2,
+  nodes: [
+    { taskId: "scout-task", attemptCount: 1, role: "scout", taskType: TASK_GRAPH_TEMPLATES.scout.taskType,
+      status: "completed", verification: "passed", dependsOnTaskIds: [] },
+    { taskId: "analyst-task", attemptCount: 1, role: "analyst", taskType: TASK_GRAPH_TEMPLATES.analyst.taskType,
+      status: "completed", verification: "passed", dependsOnTaskIds: ["scout-task"] },
+    { taskId: prepareResult.taskId, attemptCount: prepareResult.attemptCount, role: "prepare", taskType: TASK_GRAPH_TEMPLATES.prepare.taskType,
+      status: "completed", verification: "passed", dependsOnTaskIds: ["analyst-task"], tool: "scheduled.application.prepare@1",
+      resultDigest: scheduledPrepareResultDigest(prepareResult) },
+  ],
+}
+const prepareProof = buildScheduledPrepareTaskGraphProof({ schemaVersion: SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA,
+  receipt: prepareReceipt, completion: prepareCompletion, result: prepareResult }, { waitId: "prepare-wait", status: "ready",
+  mode: "all", targetTaskIds: [prepareResult.taskId], matchedTaskIds: [prepareResult.taskId] })
+if (!prepareProof) throw new Error("Invalid scheduled Prepare proof fixture")
+const proof: ScheduledGateCompletionProof = { schemaVersion: SCHEDULED_GATE_COMPLETION_PROOF_SCHEMA, graphRevision: 12,
+  prepareProof,
   gate: { taskId: "gate-task", attemptCount: 1, resultDigest: `sha256:${"e".repeat(64)}`, completedEventRevision: 12 } }
 const proofDigest = `sha256:${createHash("sha256").update(canonicalTaskGraphJson(proof), "utf8").digest("hex")}`
 const registration = parseScheduledAuditRegistrationReceipt({ schemaVersion: SCHEDULED_AUDIT_REGISTRATION_RECEIPT_SCHEMA,
@@ -76,21 +119,8 @@ const registration = parseScheduledAuditRegistrationReceipt({ schemaVersion: SCH
   gateAttemptCount: 1, gateResultDigest: proof.gate.resultDigest, gateCompletedEventRevision: 12, gateProofDigest: proofDigest,
   scheduledWaitId: "scheduled-wait", auditTaskId: "audit-task", gateGraphRevision: 12, auditAppendRevision: 13,
   expectedAttemptCount: 1 })!
-const contract = { binding, receipt: { continuationKey } }
-const attestation = {
-  schemaVersion: "agent-harness.v2.scheduled-pipeline-attestation.v1" as const,
-  owner: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
-    rootAttemptCount: owner.rootAttemptCount, turnLeaseOwnerId: scope.turnLeaseOwner, turnLeaseVersion: scope.turnLeaseVersion },
-  snapshotDigest, graphRevision: binding.analyzeGraphRevision,
-  scout: { taskId: "scout-task", attemptCount: 1, status: "completed" as const, verification: "passed" as const,
-    resultDigest: `sha256:${"1".repeat(64)}`, candidateJobIds: ["job-1"], discoveryReceipt: { status: "complete" as const,
-      taskId: "scout-task", attemptCount: 1, completedCalls: 1, candidateCount: 1, providerFailures: 0 as const,
-      materializationFailures: 0 as const, hasMore: false as const, receiptDigest: `sha256:${"2".repeat(64)}` } },
-  analyst: { taskId: "analyst-task", attemptCount: 1, status: "completed" as const, verification: "passed" as const,
-    resultDigest: `sha256:${"3".repeat(64)}`, dependsOnTaskIds: ["scout-task"], jobIds: ["job-1"] },
-  evidenceDigest: binding.evidenceDigest,
-}
-const handoff = { status: "analyze_checkpointed" as const, continuationKey, checkpointDigest: binding.checkpointDigest,
+const contract = { binding, receipt: prepareReceipt }
+const handoff = { status: "analyze_checkpointed" as const, continuationKey: handoffContinuationKey, checkpointDigest: binding.checkpointDigest,
   claimTokenDigest: `sha256:${"f".repeat(64)}`, executionId: owner.executionId,
   executionAttemptCount: owner.executionAttemptCount }
 const report = { processed: 2, applied: 0, queued: 1, pending: 1, skipped: 0, failed: 0, durationMs: 10 }
