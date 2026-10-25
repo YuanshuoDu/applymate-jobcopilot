@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   turn: vi.fn(), root: vi.fn(), session: vi.fn(), user: vi.fn(), execution: vi.fn(), claim: vi.fn(), jobs: vi.fn(),
   question: vi.fn(), runPipeline: vi.fn(), gateAction: vi.fn(), validatePrepareWait: vi.fn(), snapshot: vi.fn(), loadAi: vi.fn(), resolveConfig: vi.fn(), featureAllowed: vi.fn(), entitlement: vi.fn(), aiAccess: vi.fn(),
+  auditCurrent: vi.fn(), auditClaim: vi.fn(), auditRace: vi.fn(), validateAuditPrepare: vi.fn(),
 }));
 vi.mock("@/lib/db", () => ({ db: {
   agentTurn: { findFirst: mocks.turn }, subAgentTask: { findFirst: mocks.root },
@@ -12,9 +13,25 @@ vi.mock("@/lib/db", () => ({ db: {
 } }));
 vi.mock("@/lib/agent/run-service", () => ({ runAgentPipeline: mocks.runPipeline }));
 vi.mock("@/lib/agent/scheduled-taskgraph-gate-runtime-rpc", () => ({ runScheduledTaskGraphActionRpc: mocks.gateAction }));
+vi.mock("@/lib/agent/scheduled-taskgraph-audit-action", () => ({
+  claimScheduledAuditExecution: mocks.auditClaim, scheduledAuditChildIsCurrent: mocks.auditCurrent,
+  scheduledAuditClaimRaceResponse: mocks.auditRace,
+  scheduledTaskGraphRunInput: (base: Record<string, unknown>, mode: { kind: string; auditActor?: unknown }) => mode.kind === "audit"
+    ? { ...base, action: "scheduled_audit_execute", auditActor: mode.auditActor } : base,
+  scheduledRootIdentityMatches: (root: Record<string, unknown>, owner: Record<string, unknown>) => root.id === owner.rootTaskId
+    && root.sessionId === owner.sessionId && root.turnId === owner.turnId && root.rootTaskId === owner.rootTaskId
+    && root.parentTaskId === null && root.attemptCount === owner.rootAttemptCount,
+  scheduledRootIsCurrent: (root: Record<string, unknown>) => root.status === "running"
+    && root.interruptRequestedAt === null && root.closedAt === null,
+  scheduledTurnLeaseIsCurrent: (turn: Record<string, unknown>, owner: Record<string, unknown>) => turn.status === "in_progress"
+    && turn.leaseOwnerId === owner.turnLeaseOwnerId && turn.leaseVersion === owner.turnLeaseVersion
+    && turn.leaseExpiresAt instanceof Date && turn.leaseExpiresAt.getTime() > Date.now(),
+  validateScheduledTaskGraphAuditPrepareSource: mocks.validateAuditPrepare,
+}));
 vi.mock("@/lib/agent/scheduled-taskgraph-run-service", () => ({
   isScheduledPrepareChoiceWaitId: (turnId: string, value: unknown) => typeof value === "string" && value.startsWith(`agent-question:${turnId}:canonical:`) && /^[a-f0-9]{64}$/.test(value.slice(`agent-question:${turnId}:canonical:`.length)),
   validateScheduledPrepareWaitIdentity: mocks.validatePrepareWait,
+  validateScheduledTaskGraphAuditPrepareSource: mocks.validateAuditPrepare,
 }));
 vi.mock("@/lib/model-router", () => ({
   APPLYMATE_BACKING: "platform", loadUserAiConfig: mocks.loadAi, resolveConfig: mocks.resolveConfig,
@@ -139,6 +156,13 @@ describe("scheduled pipeline continuation route", () => {
     mocks.featureAllowed.mockResolvedValue(true);
     mocks.entitlement.mockResolvedValue(true);
     mocks.aiAccess.mockResolvedValue("available");
+    mocks.auditCurrent.mockResolvedValue(true);
+    mocks.auditClaim.mockResolvedValue(true);
+    mocks.auditRace.mockImplementation(async (result: Promise<Response | { kind: string }>) => {
+      const response = await result;
+      return response instanceof Response ? response : Response.json({ status: "blocked", errorCode: "scheduled_pipeline_execution_mismatch" }, { status: 409 });
+    });
+    mocks.validateAuditPrepare.mockResolvedValue(true);
   });
 
   it("authenticates the Worker before reading owner state", async () => {
@@ -250,6 +274,116 @@ describe("scheduled pipeline continuation route", () => {
     expect(mocks.turn).not.toHaveBeenCalled();
     expect(mocks.execution).not.toHaveBeenCalled();
     expect(mocks.claim).not.toHaveBeenCalled();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+  });
+
+  it("continues only the dedicated Audit action with its live child lease while the Root and Turn are parked", async () => {
+    const scheduledWaitId = `agent-question:${owner.turnId}:canonical:${"a".repeat(64)}`;
+    const prepareProof = { receipt: { schemaVersion: "receipt" }, completion: { schemaVersion: "completion" }, result: { role: "prepare" } };
+    const auditActor = { taskId: "audit-1", attemptCount: 2, leaseOwner: "audit-worker-2" };
+    const auditRequest = { action: "scheduled_audit_execute", owner, attestation, prepareProof, scheduledWaitId,
+      gateCompletionProof: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1", graphRevision: 1,
+        prepareProof, gate: { taskId: "gate-1", attemptCount: 1, resultDigest: `sha256:${"b".repeat(64)}`, completedEventRevision: 1 } }, auditActor };
+    const state = { ...initialExecution.state, nextStage: "audit", scheduledTaskGraphScheduledWaitId: scheduledWaitId,
+      scheduledTaskGraphClaim: ownerClaim(), scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1",
+        key, owner: fullOwner, snapshotDigest: attestation.snapshotDigest, graphRevision: attestation.graphRevision,
+        evidenceDigest: attestation.evidenceDigest } };
+    mocks.turn.mockResolvedValueOnce({ id: owner.turnId, userId: owner.userId, sessionId: owner.sessionId, status: "waiting_for_dependency",
+      source: "automation", executionMode: "canonical_task_graph", input: { automationRunMode: "scheduled", scheduledAutomationSnapshot: {} },
+      rootTaskId: owner.rootTaskId, leaseOwnerId: null, leaseVersion: owner.turnLeaseVersion + 1, leaseExpiresAt: null });
+    mocks.root.mockResolvedValueOnce({ id: owner.rootTaskId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+      parentTaskId: null, status: "waiting", attemptCount: owner.rootAttemptCount, interruptRequestedAt: null, closedAt: null });
+    mocks.execution.mockResolvedValueOnce({ ...initialExecution, state });
+    mocks.gateAction.mockResolvedValueOnce({ kind: "scheduled_audit_execute", request: auditRequest });
+    const { POST } = await import("./route");
+
+    const response = await POST(request(auditRequest));
+
+    expect(response.status).toBe(200);
+    const responseBody = await response.json();
+    expect(responseBody).toEqual({ status: "completed", report });
+    expect(Object.keys(responseBody).sort()).toEqual(["report", "status"]);
+    expect(mocks.auditCurrent).toHaveBeenCalledWith(fullOwner, auditActor);
+    expect(mocks.auditClaim).toHaveBeenCalledWith(expect.objectContaining({ owner: fullOwner, auditActor,
+      currentClaimToken: claimToken, executionAttemptCount: 0 }));
+    expect(mocks.validateAuditPrepare).toHaveBeenCalledWith({ owner: fullOwner, snapshot: scheduledSnapshot,
+      proof: prepareProof, scheduledWaitId });
+    expect(mocks.validatePrepareWait).not.toHaveBeenCalled();
+    expect(mocks.claim).not.toHaveBeenCalled();
+    expect(mocks.runPipeline).toHaveBeenCalledWith(expect.objectContaining({ scheduledTaskGraph: expect.objectContaining({
+      action: "scheduled_audit_execute", auditActor, owner: fullOwner,
+    }) }));
+  });
+
+  it("reports a fenced Audit actor without starting the root pipeline", async () => {
+    const scheduledWaitId = `agent-question:${owner.turnId}:canonical:${"a".repeat(64)}`;
+    const auditActor = { taskId: "audit-1", attemptCount: 2, leaseOwner: "stale-worker" };
+    const auditRequest = { action: "scheduled_audit_execute", owner, attestation, prepareProof: {}, scheduledWaitId,
+      gateCompletionProof: {}, auditActor };
+    mocks.turn.mockResolvedValueOnce({ id: owner.turnId, userId: owner.userId, sessionId: owner.sessionId, status: "waiting_for_dependency",
+      source: "automation", executionMode: "canonical_task_graph", input: { automationRunMode: "scheduled", scheduledAutomationSnapshot: {} },
+      rootTaskId: owner.rootTaskId, leaseOwnerId: null, leaseVersion: owner.turnLeaseVersion + 1, leaseExpiresAt: null });
+    mocks.root.mockResolvedValueOnce({ id: owner.rootTaskId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+      parentTaskId: null, status: "waiting", attemptCount: owner.rootAttemptCount, interruptRequestedAt: null, closedAt: null });
+    mocks.execution.mockResolvedValueOnce(initialExecution);
+    mocks.gateAction.mockResolvedValueOnce({ kind: "scheduled_audit_execute", request: auditRequest });
+    mocks.auditCurrent.mockResolvedValueOnce(false);
+    const { POST } = await import("./route");
+
+    const response = await POST(request(auditRequest));
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ errorCode: "scheduled_pipeline_audit_child_fenced" });
+    expect(mocks.auditClaim).not.toHaveBeenCalled();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+  });
+
+  it("rechecks Audit authority through the dedicated replay after the claim loses its fence", async () => {
+    const scheduledWaitId = `agent-question:${owner.turnId}:canonical:${"a".repeat(64)}`;
+    const auditActor = { taskId: "audit-1", attemptCount: 2, leaseOwner: "audit-worker-2" };
+    const auditRequest = { action: "scheduled_audit_execute", owner, attestation, prepareProof: {}, scheduledWaitId,
+      gateCompletionProof: {}, auditActor };
+    mocks.turn.mockResolvedValueOnce({ id: owner.turnId, userId: owner.userId, sessionId: owner.sessionId, status: "waiting_for_dependency",
+      source: "automation", executionMode: "canonical_task_graph", input: { automationRunMode: "scheduled", scheduledAutomationSnapshot: {} },
+      rootTaskId: owner.rootTaskId, leaseOwnerId: null, leaseVersion: owner.turnLeaseVersion + 1, leaseExpiresAt: null });
+    mocks.root.mockResolvedValueOnce({ id: owner.rootTaskId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+      parentTaskId: null, status: "waiting", attemptCount: owner.rootAttemptCount, interruptRequestedAt: null, closedAt: null });
+    const state = { ...initialExecution.state, nextStage: "audit", scheduledTaskGraphScheduledWaitId: scheduledWaitId,
+      scheduledTaskGraphClaim: ownerClaim(), scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1",
+        key, owner: fullOwner, snapshotDigest: attestation.snapshotDigest, graphRevision: attestation.graphRevision,
+        evidenceDigest: attestation.evidenceDigest } };
+    mocks.execution.mockResolvedValueOnce({ ...initialExecution, state });
+    mocks.gateAction.mockResolvedValueOnce({ kind: "scheduled_audit_execute", request: auditRequest });
+    mocks.gateAction.mockResolvedValueOnce(Response.json({ status: "blocked", errorCode: "scheduled_pipeline_audit_child_fenced" }, { status: 409 }));
+    mocks.auditClaim.mockResolvedValueOnce(false);
+    const { POST } = await import("./route");
+
+    const response = await POST(request(auditRequest));
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ errorCode: "scheduled_pipeline_audit_child_fenced" });
+    expect(mocks.auditRace).toHaveBeenCalledOnce();
+    expect(mocks.gateAction).toHaveBeenCalledTimes(2);
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
+  });
+
+  it("does not extend the parked-parent exception to ordinary Execute", async () => {
+    const executeRequest = executeBody(`agent-question:${owner.turnId}:canonical:${"a".repeat(64)}`);
+    mocks.turn.mockResolvedValueOnce({ id: owner.turnId, userId: owner.userId, sessionId: owner.sessionId, status: "waiting_for_dependency",
+      source: "automation", executionMode: "canonical_task_graph", input: { automationRunMode: "scheduled", scheduledAutomationSnapshot: {} },
+      rootTaskId: owner.rootTaskId, leaseOwnerId: null, leaseVersion: owner.turnLeaseVersion + 1, leaseExpiresAt: null });
+    mocks.root.mockResolvedValueOnce({ id: owner.rootTaskId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+      parentTaskId: null, status: "waiting", attemptCount: owner.rootAttemptCount, interruptRequestedAt: null, closedAt: null });
+    mocks.execution.mockResolvedValueOnce(initialExecution);
+    mocks.gateAction.mockResolvedValueOnce({ kind: "execute", request: executeRequest });
+    const { POST } = await import("./route");
+
+    const response = await POST(request(executeRequest));
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ errorCode: "scheduled_pipeline_turn_stale" });
+    expect(mocks.auditCurrent).not.toHaveBeenCalled();
+    expect(mocks.auditClaim).not.toHaveBeenCalled();
     expect(mocks.runPipeline).not.toHaveBeenCalled();
   });
 

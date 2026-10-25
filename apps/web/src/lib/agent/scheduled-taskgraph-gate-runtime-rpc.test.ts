@@ -5,7 +5,7 @@ const mocks = vi.hoisted(() => ({
   transaction: vi.fn(), queryRaw: vi.fn(), jobs: vi.fn(), update: vi.fn(), turn: vi.fn(), config: vi.fn(), resume: vi.fn(),
   active: vi.fn(), feature: vi.fn(), access: vi.fn(), entitlement: vi.fn(), aiConfig: vi.fn(), roles: vi.fn(),
   isProof: vi.fn(), loadInput: vi.fn(), buildCheckpoint: vi.fn(), validateWait: vi.fn(), executeGate: vi.fn(),
-  policy: vi.fn(), completedReplay: vi.fn(),
+  policy: vi.fn(), completedReplay: vi.fn(), auditCompletedReplay: vi.fn(),
 }))
 
 vi.mock('@/lib/db', () => ({ db: {
@@ -27,7 +27,8 @@ vi.mock('./scheduled-taskgraph-gate-input', () => ({ isScheduledTaskGraphGatePro
 vi.mock('./scheduled-taskgraph-pipeline-checkpoint', () => ({ scheduledAutomationSnapshotDigest: vi.fn(() => 'sha256:snapshot'),
   scheduledTaskGraphContinuationKey: vi.fn(() => 'scheduled-taskgraph:key') }))
 vi.mock('./scheduled-taskgraph-run-service', () => ({ validateScheduledPrepareWaitIdentity: mocks.validateWait }))
-vi.mock('./scheduled-taskgraph-completed-report-replay', () => ({ replayCompletedScheduledTaskGraphReport: mocks.completedReplay }))
+vi.mock('./scheduled-taskgraph-completed-report-replay', () => ({ replayCompletedScheduledTaskGraphReport: mocks.completedReplay,
+  replayCompletedScheduledTaskGraphAuditReport: mocks.auditCompletedReplay }))
 vi.mock('./stages/gate', () => ({ runScheduledGate: mocks.policy }))
 vi.mock('./scheduled-taskgraph-gate-service', () => ({ executeScheduledTaskGraphGate: mocks.executeGate }))
 
@@ -73,6 +74,14 @@ function executeRequest() {
   return { action: 'execute' as const, owner: requestOwner, attestation, prepareProof: proof, gateCompletionProof }
 }
 
+function auditExecuteRequest() {
+  const prepareProof = { receipt: { owner: { executionId: owner.executionId, executionAttemptCount: owner.executionAttemptCount } } }
+  const gateCompletionProof = { schemaVersion: 'agent-harness.v2.scheduled-taskgraph-gate-completion.v1', graphRevision: 15,
+    prepareProof, gate: { taskId: gateTask.id, attemptCount: 2, resultDigest: `sha256:${'a'.repeat(64)}`, completedEventRevision: 15 } }
+  return { action: 'scheduled_audit_execute' as const, owner: requestOwner, attestation, prepareProof, gateCompletionProof,
+    auditActor: { taskId: 'audit-1', attemptCount: 2, leaseOwner: 'audit-worker-2' } }
+}
+
 beforeEach(() => {
   for (const mock of Object.values(mocks)) mock.mockReset()
   queryIndex = 0
@@ -90,6 +99,7 @@ beforeEach(() => {
   mocks.buildCheckpoint.mockReturnValue({ checkpoint: { nextStage: 'gate' }, packages: [] })
   mocks.validateWait.mockResolvedValue(true)
   mocks.completedReplay.mockResolvedValue(null)
+  mocks.auditCompletedReplay.mockResolvedValue(null)
   mocks.executeGate.mockResolvedValue({ status: 'question_required', kind: 'weak_cover_letter', jobIds: ['job-1'],
     candidateSetDigest: `sha256:${'b'.repeat(64)}`, allowedChoiceIds: ['continue', 'review', 'skip'] })
   mocks.jobs.mockResolvedValue([job])
@@ -311,5 +321,20 @@ describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
     expect(mocks.queryRaw).not.toHaveBeenCalled()
     expect(mocks.update).not.toHaveBeenCalled()
     expect(mocks.executeGate).not.toHaveBeenCalled()
+  })
+
+  it('routes completed Audit replay through the live child actor before attempting root claim locks', async () => {
+    const request = auditExecuteRequest()
+    const response = Response.json({ status: 'completed', report: { processed: 1 } })
+    mocks.auditCompletedReplay.mockResolvedValueOnce(response)
+
+    const result = await runScheduledTaskGraphActionRpc(request)
+
+    expect(result).toBe(response)
+    expect(mocks.auditCompletedReplay).toHaveBeenCalledWith(request,
+      { taskId: gateTask.id, attemptCount: 2 }, undefined)
+    expect(mocks.completedReplay).not.toHaveBeenCalled()
+    expect(mocks.transaction).not.toHaveBeenCalled()
+    expect(mocks.queryRaw).not.toHaveBeenCalled()
   })
 })

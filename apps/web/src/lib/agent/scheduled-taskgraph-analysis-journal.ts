@@ -1,7 +1,9 @@
 import { Prisma, type Job } from '@prisma/client'
+import { db } from '@/lib/db'
 import { AgentExecutionCancelledError } from './execution-control'
-import { rebindScheduledTaskGraphClaimForLease, scheduledTaskGraphClaimMatches, scheduledTaskGraphOwnerMatches } from './scheduled-taskgraph-pipeline-fence'
+import { rebindScheduledTaskGraphClaimForLease, scheduledTaskGraphAuditChildOwnerIsCurrent, scheduledTaskGraphClaimMatches, scheduledTaskGraphOwnerMatches } from './scheduled-taskgraph-pipeline-fence'
 import { buildScheduledTaskGraphPrepareCheckpoint, type ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
+import type { ScheduledTaskGraphAuditActor } from './scheduled-taskgraph-audit-child-fence'
 import { hasScheduledTaskGraphGateProof } from './scheduled-taskgraph-approval-fence'
 import { AnalyzeRecoveryPersistenceError, runAnalyze, type AnalyzeRecoveryHooks } from './stages/analyze'
 import type { AnalyzeOutput, PipelineCheckpointState, PipelineCtx, ScoredJob, StageResult } from './types'
@@ -226,6 +228,17 @@ export function createScheduledTaskGraphOwnerFence(scheduled: {
   owner: ScheduledTaskGraphPipelineOwner; key: string; claimToken: string
 } | undefined) {
   return scheduled ? (tx: Prisma.TransactionClient) => scheduledTaskGraphScoreOwnerIsCurrent({ tx, ...scheduled }) : async () => false
+}
+
+export type ScheduledTaskGraphAuditChildOwnerInput = Readonly<{
+  owner: ScheduledTaskGraphPipelineOwner; auditActor: ScheduledTaskGraphAuditActor; key: string; claimToken: string
+}>
+export function createScheduledTaskGraphAuditChildOwnerFence(scheduled: ScheduledTaskGraphAuditChildOwnerInput | undefined) {
+  return scheduled ? (tx: Prisma.TransactionClient) => scheduledTaskGraphAuditChildOwnerIsCurrent({ tx, ...scheduled }) : async () => false
+}
+export async function isScheduledTaskGraphAuditChildOwnerCurrent(input: ScheduledTaskGraphAuditChildOwnerInput): Promise<boolean> {
+  try { return await db.$transaction(tx => scheduledTaskGraphAuditChildOwnerIsCurrent({ tx, ...input })) }
+  catch { return false }
 }
 
 function sameOwner(value: unknown, expected: ScheduledTaskGraphPipelineOwner): boolean {

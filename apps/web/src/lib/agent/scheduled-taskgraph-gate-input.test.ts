@@ -5,19 +5,20 @@ import { hashArtifactContent } from './artifacts/hash'
 import { scheduledAutomationSnapshotDigest, type ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 import { scheduledTaskGraphAnalyzeCheckpointDigest } from './scheduled-taskgraph-gate-checkpoint'
 
-const mocks = vi.hoisted(() => ({ session: vi.fn(), jobs: vi.fn(), resume: vi.fn(), facts: vi.fn(), versions: vi.fn(), heads: vi.fn(), graph: vi.fn(), tasks: vi.fn(), task: vi.fn(), events: vi.fn(), queryRaw: vi.fn(), gateHistory: vi.fn() }))
+const mocks = vi.hoisted(() => ({ session: vi.fn(), jobs: vi.fn(), resume: vi.fn(), facts: vi.fn(), versions: vi.fn(), heads: vi.fn(), graph: vi.fn(), tasks: vi.fn(), task: vi.fn(), events: vi.fn(), queryRaw: vi.fn(), transaction: vi.fn(), gateHistory: vi.fn() }))
 vi.mock('@/lib/db', () => ({ db: {
   agentSession: { findFirst: mocks.session }, job: { findMany: mocks.jobs }, resume: { findFirst: mocks.resume },
   personaFact: { findMany: mocks.facts }, agentArtifactVersion: { findMany: mocks.versions }, agentArtifact: { findMany: mocks.heads },
   agentItem: { findFirst: mocks.graph }, subAgentTask: { findMany: mocks.tasks, findFirst: mocks.task }, agentEvent: { findMany: mocks.events },
-  $queryRaw: mocks.queryRaw,
+  $queryRaw: mocks.queryRaw, $transaction: mocks.transaction,
 } }))
 vi.mock('./scheduled-taskgraph-gate-history', async importOriginal => ({
   ...await importOriginal<typeof import('./scheduled-taskgraph-gate-history')>(),
   scheduledTaskGraphGateHistoryIsCurrent: mocks.gateHistory,
 }))
 
-import { isScheduledTaskGraphGateProofCurrent, loadScheduledTaskGraphGateInput, scheduledTaskGraphAnalyzeCheckpointForGate, type ScheduledTaskGraphGateInputRequest } from './scheduled-taskgraph-gate-input'
+import { isScheduledTaskGraphAuditChildGateProofCurrent, isScheduledTaskGraphGateProofCurrent, loadScheduledTaskGraphAuditChildGateInput,
+  loadScheduledTaskGraphGateInput, scheduledTaskGraphAnalyzeCheckpointForGate, type ScheduledTaskGraphGateInputRequest } from './scheduled-taskgraph-gate-input'
 
 const owner: ScheduledTaskGraphPipelineOwner = { userId: 'user-1', sessionId: 'session-1', turnId: 'turn-1', rootTaskId: 'root-1',
   rootAttemptCount: 2, turnLeaseOwnerId: 'lease-1', turnLeaseVersion: 4, executionId: 'execution-1', executionAttemptCount: 1 }
@@ -87,6 +88,7 @@ function taskRows(proof: ReturnType<typeof makeProof>, attestation: Record<strin
         receipt: proof.receipt, completion, result: proof.result } } }]
 }
 function recordForTest(value: unknown): Record<string, unknown> { return value as Record<string, unknown> }
+let gateBindingRows: Record<string, unknown>[] = []
 
 function sourceDigest(job: Job, resumeRow = resume, facts: typeof fact[] = [fact]): string {
   const jobSource = { id: job.id, company: job.company, role: job.role, location: job.location ?? null, status: job.status,
@@ -182,6 +184,7 @@ function attachGate(input: ScheduledTaskGraphGateInputRequest, proof: ReturnType
     result: null, expectedOutputSchema: { schemaVersion: 'agent-harness.v2.subagent.result', role: 'prepare', taskType: 'scheduled_taskgraph_gate' }, allowedActions: [] })
   mocks.tasks.mockResolvedValue(rows)
   mocks.queryRaw.mockResolvedValueOnce([event]).mockResolvedValueOnce([wait])
+  gateBindingRows = [event, wait]
   mocks.gateHistory.mockResolvedValue(true)
   return { ...input, gate: { taskId: gateTaskId, attemptCount: 1, phase: 'running' as const } }
 }
@@ -204,7 +207,7 @@ function attachAudit(input: ScheduledTaskGraphGateInputRequest, proof: ReturnTyp
     expectedOutputSchema: { schemaVersion: 'agent-harness.v2.subagent.result', role: 'prepare', taskType: 'scheduled_taskgraph_gate' }, allowedActions: [] })
   rows.push({ id: 'audit-task', sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId, parentTaskId: owner.rootTaskId,
     depth: auditDepth, role: 'auditor', taskType: 'scheduled_taskgraph_audit', status: 'queued', attemptCount: 0, maxAttempts: 3, failureReason: null,
-    expectedOutputSchema: { schemaVersion: 'agent-harness.v2.subagent.result', role: 'auditor', taskType: 'scheduled_taskgraph_audit' }, allowedActions: [] })
+    expectedOutputSchema: { schemaVersion: 'agent-harness.v2.subagent.result', role: 'auditor', taskType: 'scheduled_taskgraph_audit' }, context: {}, allowedActions: [] })
   mocks.tasks.mockResolvedValue(rows)
   mocks.task.mockResolvedValue({ result: { structuredResult: { status: 'completed', nextStage: 'execute', approvedJobIds: [],
     pendingJobIds: ['job-1'], skippedJobIds: [], counts: { approved: 0, pending: 1, skipped: 0 } } } })
@@ -215,6 +218,7 @@ function attachAudit(input: ScheduledTaskGraphGateInputRequest, proof: ReturnTyp
 describe('scheduled TaskGraph Gate input reload', () => {
   beforeEach(() => {
     for (const mock of Object.values(mocks)) mock.mockReset()
+    gateBindingRows = []
   })
 
   it('accepts the exact fixed Audit suffix only after Gate completion', async () => {
@@ -226,6 +230,62 @@ describe('scheduled TaskGraph Gate input reload', () => {
     expect(mocks.gateHistory).toHaveBeenCalledWith(expect.objectContaining({
       auditTask: { id: 'audit-task', status: 'queued', attemptCount: 0 },
     }))
+  })
+
+  it('admits only the dispatched live Audit actor while Root is parked; generic Gate proof remains running-root-only', async () => {
+    const { input, proof, graph, analyzeAttestation } = setup()
+    const request = attachAudit(input, proof, graph, analyzeAttestation)
+    const auditActor = { taskId: 'audit-task', attemptCount: 2, leaseOwner: 'audit-worker-2' }
+    const rows = taskRows(proof, analyzeAttestation)
+    rows[0] = { ...rows[0]!, status: 'waiting' }
+    rows.push({ id: 'gate-task', sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+      parentTaskId: owner.rootTaskId, depth: 1, role: 'prepare', taskType: 'scheduled_taskgraph_gate', status: 'completed',
+      attemptCount: 1, maxAttempts: 3, failureReason: null, result: { status: 'completed' },
+      expectedOutputSchema: { schemaVersion: 'agent-harness.v2.subagent.result', role: 'prepare', taskType: 'scheduled_taskgraph_gate' },
+      allowedActions: [] })
+    rows.push({ id: 'audit-task', sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+      parentTaskId: owner.rootTaskId, depth: 1, role: 'auditor', taskType: 'scheduled_taskgraph_audit', status: 'running',
+      attemptCount: auditActor.attemptCount, maxAttempts: 3, failureReason: null, context: {},
+      expectedOutputSchema: { schemaVersion: 'agent-harness.v2.subagent.result', role: 'auditor', taskType: 'scheduled_taskgraph_audit' },
+      allowedActions: [] })
+    mocks.tasks.mockResolvedValue(rows)
+    mocks.queryRaw.mockReset()
+    const queryRaw = vi.fn(async (query: { sql: string }) => {
+      const sql = query.sql
+      if (sql.includes('FROM "agent_sessions"')) return [{ id: owner.sessionId, status: 'running' }]
+      if (sql.includes('FROM "agent_events" AS pause')) return []
+      if (sql.includes('FROM "agent_turns"')) return [{ id: owner.turnId, userId: owner.userId, sessionId: owner.sessionId,
+        rootTaskId: owner.rootTaskId, source: 'automation', executionMode: 'canonical_task_graph',
+        input: { automationRunMode: 'scheduled' }, status: 'waiting_for_dependency', leaseOwnerId: null,
+        leaseExpiresAt: null, leaseStartedAt: null, terminalEventSequence: null, terminalEventAt: null }]
+      if (sql.includes('FROM "agent_events" AS event')) return [gateBindingRows[0]]
+      if (sql.includes('FROM "agent_wait_conditions"')) return [gateBindingRows[1]]
+      if (sql.includes('FROM "agent_outbox"')) return [{ id: 'dispatch-event' }]
+      if (sql.includes('FROM "agent_items"')) return [{ id: graph.id }]
+      if (sql.includes('FROM "agent_events"')) return [{ id: 'prepare-binding' }]
+      if (sql.includes('FROM "sub_agent_tasks"') && sql.includes('ORDER BY "id" FOR UPDATE')) return rows.map(row => ({ id: row.id }))
+      if (sql.includes('FROM "sub_agent_tasks"') && sql.includes('"depth" = 1')) return [{ id: auditActor.taskId, sessionId: owner.sessionId,
+        turnId: owner.turnId, rootTaskId: owner.rootTaskId, parentTaskId: owner.rootTaskId, depth: 1, role: 'auditor',
+        taskType: 'scheduled_taskgraph_audit', status: 'running', attemptCount: auditActor.attemptCount, maxAttempts: 3,
+        leaseOwner: auditActor.leaseOwner, leaseExpiresAt: new Date(Date.now() + 60_000), interruptRequestedAt: null,
+        closedAt: null, failureReason: null, context: {}, expectedOutputSchema: { schemaVersion: 'agent-harness.v2.subagent.result',
+          role: 'auditor', taskType: 'scheduled_taskgraph_audit' }, allowedActions: [], hasLiveLease: true }]
+      if (sql.includes('FROM "sub_agent_tasks"')) return [{ id: owner.rootTaskId, sessionId: owner.sessionId,
+        turnId: owner.turnId, rootTaskId: owner.rootTaskId, parentTaskId: null, status: 'waiting', attemptCount: owner.rootAttemptCount,
+        role: 'orchestrator', taskType: 'root', failureReason: null, interruptRequestedAt: null, closedAt: null }]
+      throw new Error('unexpected query in focused Audit actor test')
+    })
+    const tx = { $queryRaw: queryRaw, agentItem: { findFirst: mocks.graph },
+      subAgentTask: { findMany: mocks.tasks }, agentEvent: { findMany: mocks.events } } as unknown as Prisma.TransactionClient
+    mocks.transaction.mockImplementation((work: (client: Prisma.TransactionClient) => Promise<unknown>) => work(tx))
+
+    await expect(loadScheduledTaskGraphAuditChildGateInput({ ...request, auditActor })).resolves.toMatchObject({
+      packages: [{ jobId: jobRow.id }], gateResult: { status: 'completed' },
+    })
+    await expect(loadScheduledTaskGraphGateInput(request)).resolves.toBeNull()
+    expect(queryRaw.mock.calls.map(([query]) => query.sql.match(/FROM "([^"]+)"/)?.[1]).slice(0, 6))
+      .toEqual(['agent_sessions', 'agent_events', 'agent_turns', 'sub_agent_tasks', 'sub_agent_tasks', 'agent_outbox'])
+    await expect(isScheduledTaskGraphAuditChildGateProofCurrent({ ...request, auditActor }, tx)).resolves.toBe(true)
   })
 
   it('rejects a changed Audit suffix and any sixth node', async () => {

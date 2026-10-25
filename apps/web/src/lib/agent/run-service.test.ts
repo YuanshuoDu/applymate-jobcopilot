@@ -61,10 +61,13 @@ vi.mock("@/lib/agent/orchestrator", () => ({
 vi.mock("@/lib/agent/stages/analyze", () => ({ runAnalyze: mocks.runAnalyze }));
 vi.mock("@/lib/agent/scheduled-taskgraph-analysis-journal", async importOriginal => {
   const actual = await importOriginal<typeof import("@/lib/agent/scheduled-taskgraph-analysis-journal")>();
-  return { ...actual, createScheduledTaskGraphOwnerFence: () => mocks.ownerFenceCheck };
+  return { ...actual, createScheduledTaskGraphOwnerFence: () => mocks.ownerFenceCheck,
+    createScheduledTaskGraphAuditChildOwnerFence: () => mocks.ownerFenceCheck,
+    isScheduledTaskGraphAuditChildOwnerCurrent: mocks.isScheduledOwnerCurrent };
 });
 vi.mock("@/lib/agent/scheduled-taskgraph-gate-input", () => ({
   isScheduledTaskGraphGateProofCurrent: mocks.gateProofCurrent,
+  isScheduledTaskGraphAuditChildGateProofCurrent: mocks.gateProofCurrent,
 }));
 vi.mock("@/lib/agent/scheduled-taskgraph-run-service", () => ({
   runScheduledTaskGraphAnalyzeOnly: mocks.runScheduledTaskGraphAnalyzeOnly,
@@ -284,6 +287,39 @@ describe("runAgentPipeline", () => {
     }), {});
     expect(mocks.runPipeline).not.toHaveBeenCalled();
     expect(mocks.finishScheduledExecution).not.toHaveBeenCalled();
+  });
+
+  it("brands only the persisted dedicated Audit context passed to runPipeline", async () => {
+    const { runAgentPipeline } = await import("./run-service");
+    const { isScheduledTaskGraphAuditRuntime } = await import("./scheduled-taskgraph-audit-runtime");
+    const continuationKey = scheduledTaskGraphContinuationKey(scheduledOwner, scheduledAttestation);
+    const claim = { schemaVersion: "agent-harness.v2.scheduled-pipeline-claim.v1", key: continuationKey,
+      claimToken: scheduledClaimToken, owner: scheduledOwner, claimedAt: "2026-10-25T10:00:00.000Z", leaseExpiresAt: "2026-10-25T10:05:00.000Z" };
+    const continuation = { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1", key: continuationKey,
+      owner: scheduledOwner, snapshotDigest: `sha256:${"b".repeat(64)}`, graphRevision: 9, evidenceDigest: "c".repeat(64) };
+    const initialState = { nextStage: "scout", scheduledTaskGraphClaim: claim, scheduledTaskGraphContinuation: continuation };
+    const prepareProof = { receipt: {}, completion: {}, result: {} };
+    const gateCompletionProof = { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1", graphRevision: 1,
+      prepareProof, gate: { taskId: "gate_1", attemptCount: 1, resultDigest: `sha256:${"a".repeat(64)}`, completedEventRevision: 1 } };
+    mocks.buildScheduledTaskGraphGateResumeState.mockResolvedValue({ nextStage: "audit", scheduledTaskGraphClaim: claim,
+      scheduledTaskGraphContinuation: continuation });
+    const contexts: unknown[] = [];
+    mocks.runPipeline.mockImplementation(async (context: unknown) => {
+      contexts.push(context);
+      return { processed: 0, queued: 0, applied: 0, pending: 0, skipped: 0, failed: 0, durationMs: 10 };
+    });
+    const auditInput = scheduledRunInput(initialState, scheduledSnapshot, scheduledAttestation, prepareProof);
+    Object.assign(auditInput.scheduledTaskGraph, { action: "scheduled_audit_execute",
+      auditActor: { taskId: "auditor_1", attemptCount: 2, leaseOwner: "audit_lease_1" }, gateCompletionProof });
+
+    await expect(runAgentPipeline(auditInput)).resolves.toMatchObject({ processed: 0 });
+    expect(mocks.saveScheduledCheckpoint).toHaveBeenCalledBefore(mocks.runPipeline);
+    expect(isScheduledTaskGraphAuditRuntime(contexts[0] as Parameters<typeof isScheduledTaskGraphAuditRuntime>[0])).toBe(true);
+
+    const executeInput = scheduledRunInput(initialState, scheduledSnapshot, scheduledAttestation, prepareProof);
+    Object.assign(executeInput.scheduledTaskGraph, { gateCompletionProof });
+    await expect(runAgentPipeline(executeInput)).resolves.toMatchObject({ processed: 0 });
+    expect(isScheduledTaskGraphAuditRuntime(contexts[1] as Parameters<typeof isScheduledTaskGraphAuditRuntime>[0])).toBe(false);
   });
 
   it("does not complete or publish when the scheduled Analyze owner fence is lost", async () => {

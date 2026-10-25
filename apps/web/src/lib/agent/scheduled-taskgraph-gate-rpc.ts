@@ -1,4 +1,5 @@
 import type { ScheduledTaskGraphPipelineOwner } from "./scheduled-taskgraph-pipeline-checkpoint"
+import type { ScheduledTaskGraphAuditActor } from "./scheduled-taskgraph-audit-child-fence"
 
 export type ScheduledTaskGraphGateRequestOwner = Pick<ScheduledTaskGraphPipelineOwner,
   "userId" | "sessionId" | "turnId" | "rootTaskId" | "rootAttemptCount" | "turnLeaseOwnerId" | "turnLeaseVersion">
@@ -22,6 +23,15 @@ export type ScheduledTaskGraphExecuteRpcRequest = Readonly<{
   scheduledWaitId?: string
   gateCompletionProof: unknown
 }>
+export type ScheduledTaskGraphAuditExecuteRpcRequest = Readonly<{
+  action: "scheduled_audit_execute"
+  owner: ScheduledTaskGraphGateRequestOwner
+  attestation: unknown
+  prepareProof: unknown
+  scheduledWaitId?: string
+  gateCompletionProof: unknown
+  auditActor: ScheduledTaskGraphAuditActor
+}>
 export type ScheduledTaskGraphLegacyRpcRequest = Readonly<{
   action: "legacy"
   owner: ScheduledTaskGraphGateRequestOwner
@@ -29,7 +39,8 @@ export type ScheduledTaskGraphLegacyRpcRequest = Readonly<{
   prepareProof?: unknown
   scheduledWaitId?: string
 }>
-export type ScheduledTaskGraphActionRequest = ScheduledTaskGraphGateRpcRequest | ScheduledTaskGraphExecuteRpcRequest | ScheduledTaskGraphLegacyRpcRequest
+export type ScheduledTaskGraphActionRequest = ScheduledTaskGraphGateRpcRequest | ScheduledTaskGraphExecuteRpcRequest
+  | ScheduledTaskGraphAuditExecuteRpcRequest | ScheduledTaskGraphLegacyRpcRequest
 
 const ROLE_RESULT_SCHEMA = "agent-harness.v2.subagent.result"
 const GATE_TASK_TYPE = "scheduled_taskgraph_gate"
@@ -39,6 +50,8 @@ const GATE_KEYS = ["action", "attestation", "gateAttemptCount", "gateLeaseOwnerI
 const GATE_OPTIONAL_KEYS = ["priorChoices", "scheduledWaitId", "validatedChoice"]
 const EXECUTE_KEYS = ["action", "attestation", "gateCompletionProof", "owner", "prepareProof"]
 const EXECUTE_OPTIONAL_KEYS = ["scheduledWaitId"]
+const AUDIT_EXECUTE_KEYS = ["action", "attestation", "auditActor", "gateCompletionProof", "owner", "prepareProof"]
+const AUDIT_EXECUTE_OPTIONAL_KEYS = ["scheduledWaitId"]
 const LEGACY_OWNER_KEYS = ["userId", "sessionId", "turnId", "rootTaskId", "rootAttemptCount", "turnLeaseOwnerId", "turnLeaseVersion"]
 
 /** Parses the fixed Worker action envelope; snapshots, jobs and claim tokens are always reloaded by Web. */
@@ -67,7 +80,21 @@ export function parseScheduledTaskGraphActionRequest(value: unknown): ScheduledT
       prepareProof: row.prepareProof, gateCompletionProof: row.gateCompletionProof,
       ...(Object.hasOwn(row, "scheduledWaitId") ? { scheduledWaitId: row.scheduledWaitId as string } : {}) }
   }
+  if (row.action === "scheduled_audit_execute") {
+    if (!onlyKeys(row, AUDIT_EXECUTE_KEYS, AUDIT_EXECUTE_OPTIONAL_KEYS) || !Object.hasOwn(row, "gateCompletionProof")
+      || Object.hasOwn(row, "scheduledWaitId") && !validId(row.scheduledWaitId) || !validAuditActor(row.auditActor)) return null
+    return { action: "scheduled_audit_execute", owner: row.owner as unknown as ScheduledTaskGraphGateRequestOwner,
+      attestation: row.attestation, prepareProof: row.prepareProof, gateCompletionProof: row.gateCompletionProof,
+      auditActor: row.auditActor as ScheduledTaskGraphAuditActor,
+      ...(Object.hasOwn(row, "scheduledWaitId") ? { scheduledWaitId: row.scheduledWaitId as string } : {}) }
+  }
   return null
+}
+
+function validAuditActor(value: unknown): value is ScheduledTaskGraphAuditActor {
+  const actor = record(value)
+  return Boolean(actor && exactKeys(actor, ["taskId", "attemptCount", "leaseOwner"])
+    && validId(actor.taskId) && positive(actor.attemptCount) && validId(actor.leaseOwner))
 }
 
 function parseLegacyRequest(row: Record<string, unknown>): ScheduledTaskGraphLegacyRpcRequest | null {
@@ -126,6 +153,14 @@ export function scheduledTaskGraphExecuteGateCompletionProof(value: unknown): Re
     && positive(gate.completedEventRevision) && gate.completedEventRevision === proof.graphRevision ? proof : null
 }
 
+/** Derives only the execution identity needed to lock an Audit actor before full proof validation. */
+export function scheduledTaskGraphAuditExecutionOwner(request: Pick<ScheduledTaskGraphAuditExecuteRpcRequest, "owner">,
+  proof: unknown): ScheduledTaskGraphPipelineOwner | null {
+  const owner = record(record(record(record(proof)?.prepareProof)?.receipt)?.owner)
+  return owner && validId(owner.executionId) && nonNegative(owner.executionAttemptCount)
+    ? { ...request.owner, executionId: owner.executionId, executionAttemptCount: Number(owner.executionAttemptCount) } : null
+}
+
 function record(value: unknown): Record<string, unknown> | null { return plainObject(value) ? value as Record<string, unknown> : null }
 function plainObject(value: unknown): value is Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false
@@ -142,6 +177,7 @@ function onlyKeys(value: Record<string, unknown>, required: readonly string[], o
 }
 function validId(value: unknown): value is string { return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value }
 function positive(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) > 0 }
+function nonNegative(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 0 }
 function isDigest(value: unknown): boolean { return typeof value === "string" && /^sha256:[a-f0-9]{64}$/.test(value) }
 function dateNumber(value: unknown): number {
   return value instanceof Date ? value.getTime() : typeof value === "string" ? Date.parse(value) : Number.NaN

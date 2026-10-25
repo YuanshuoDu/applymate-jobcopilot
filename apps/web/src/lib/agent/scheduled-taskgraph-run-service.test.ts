@@ -10,10 +10,10 @@ const mocks = vi.hoisted(() => ({ analyze: vi.fn(), scoreOwner: vi.fn(), ownerCu
   gateMaterials: vi.fn(), taskRows: vi.fn(), useActualGateInput: false, useActualGateCheckpoint: false, events: vi.fn(), steps: vi.fn(), items: vi.fn() }))
 vi.mock("@/lib/db", () => ({ db: { agentEvent: { findMany: mocks.events }, agentStep: { findFirst: mocks.steps }, agentItem: { findFirst: mocks.items },
   subAgentTask: { findMany: mocks.taskRows } } }))
-vi.mock("./scheduled-taskgraph-analysis-journal", () => ({
-  runScheduledTaskGraphAnalyze: mocks.analyze,
-  scheduledTaskGraphScoreOwnerIsCurrent: mocks.scoreOwner,
-}))
+vi.mock("./scheduled-taskgraph-analysis-journal", async importOriginal => {
+  const actual = await importOriginal<typeof import("./scheduled-taskgraph-analysis-journal")>()
+  return { ...actual, runScheduledTaskGraphAnalyze: mocks.analyze, scheduledTaskGraphScoreOwnerIsCurrent: mocks.scoreOwner }
+})
 vi.mock("./scheduled-taskgraph-pipeline-fence", async importOriginal => {
   const actual = await importOriginal<typeof import("./scheduled-taskgraph-pipeline-fence")>()
   return { ...actual, isScheduledTaskGraphOwnerCurrent: mocks.ownerCurrent, saveScheduledTaskGraphCheckpoint: mocks.save }
