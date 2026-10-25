@@ -320,7 +320,7 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
     expect(generations).toEqual([0, 2, 4, 6, 8])
     expect(completedQuestionItems.map(item => item.attempt)).toEqual([1, 2, 3, 4])
     expect(new Set(completedQuestionItems.map(item => item.itemId)).size).toBe(4)
-    expect(fetchCalls).toHaveLength(1)
+    expect(fetchCalls).toHaveLength(0)
     const gate = await pool.query<{ status: string; attemptCount: number; maxAttempts: number; result: Record<string, unknown> }>(
       `SELECT "status", "attemptCount", "maxAttempts", "result" FROM "sub_agent_tasks" WHERE "id"=$1 AND "sessionId"=$2`, [gateTaskId, fixture.ids.sessionId])
     expect(gate.rows[0]).toMatchObject({ status: "completed", attemptCount: 5, maxAttempts: 3,
