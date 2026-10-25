@@ -462,13 +462,16 @@ async function runAttachedScheduledAuditRoot(fixture: Fixture, fetcher: typeof f
 }
 
 async function readScheduledAuditRootRecoveryTrace(fixture: Fixture) {
-  const sourceResult = await pool!.query<{ id: string; ordinal: number | string; status: string; inputTokens: number;
-    outputTokens: number; estimatedCostUsd: number; consumedInputIds: unknown; modelProfileSnapshot: unknown }>(
+  const sourceResult = await pool!.query<{ id: string; ordinal: number | string; status: string; inputTokens: number | string;
+    outputTokens: number | string; estimatedCostUsd: number | string; consumedInputIds: unknown; modelProfileSnapshot: unknown }>(
     `SELECT "id", "ordinal", "status", "inputTokens", "outputTokens", "estimatedCostUsd", "consumedInputIds", "modelProfileSnapshot"
        FROM "agent_steps" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4`,
     [fixture.rootQuestionStepId, fixture.ids.sessionId, fixture.ids.turnId, fixture.ids.rootTaskId])
-  const sourceStep = sourceResult.rows[0]
-  if (!sourceStep) throw new Error("scheduled Audit candidate source Step missing")
+  const sourceRow = sourceResult.rows[0]
+  if (!sourceRow) throw new Error("scheduled Audit candidate source Step missing")
+  const sourceUsage = numericUsage(sourceRow)
+  if (!sourceUsage) throw new Error("scheduled Audit candidate source Step usage missing")
+  const sourceStep = { ...sourceRow, ...sourceUsage }
   const candidateResult = await pool!.query<{ id: string; payload: unknown }>(
     `SELECT "id", "payload" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
        AND "type" = $4 AND "correlationId" = $5 ORDER BY "sequence" ASC`,
@@ -477,7 +480,7 @@ async function readScheduledAuditRootRecoveryTrace(fixture: Fixture) {
   const candidatePayload = debugRecord(candidateEvent?.payload)
   if (!candidateEvent || !candidatePayload) throw new Error("scheduled Audit candidate source receipt missing")
   const recoveryResult = await pool!.query<{ id: string; ordinal: number | string; attempt: number; status: string;
-    errorCode: string | null; inputTokens: number; outputTokens: number; estimatedCostUsd: number;
+    errorCode: string | null; inputTokens: number | string; outputTokens: number | string; estimatedCostUsd: number | string;
     consumedInputIds: unknown; modelProfileSnapshot: unknown }>(
     `SELECT "id", "ordinal", "attempt", "status", "errorCode", "inputTokens", "outputTokens", "estimatedCostUsd",
         "consumedInputIds", "modelProfileSnapshot" FROM "agent_steps"
@@ -495,12 +498,32 @@ async function readScheduledAuditRootRecoveryTrace(fixture: Fixture) {
     [fixture.ids.sessionId, fixture.ids.turnId, fixture.ids.rootTaskId, stepIds]) : { rows: [] }
   const steps = recoveryResult.rows.map(step => {
     const stepEvents = events.rows.filter(event => event.correlationId === step.id)
-    return { ...step, marker: readScheduledPipelineRecoveryStepProfile(step.modelProfileSnapshot),
+    const usage = numericUsage(step)
+    if (!usage) throw new Error("scheduled Audit recovery Step usage missing")
+    return { ...step, ...usage, marker: readScheduledPipelineRecoveryStepProfile(step.modelProfileSnapshot),
       startEvents: stepEvents.filter(event => event.type === "step.started"),
       completionEvents: stepEvents.filter(event => event.type === "step.completed"),
       waits: waits.rows.filter(wait => wait.stepId === step.id) }
   })
   return { sourceStep, candidateEvent, candidateEventCount: candidateResult.rows.length, candidatePayload, steps }
+}
+
+function numericUsage(value: unknown): { inputTokens: number; outputTokens: number; estimatedCostUsd: number } | null {
+  const row = debugRecord(value)
+  if (!row) return null
+  const inputTokens = numericValue(row.inputTokens), outputTokens = numericValue(row.outputTokens)
+  const estimatedCostUsd = numericValue(row.estimatedCostUsd)
+  return inputTokens !== null && Number.isSafeInteger(inputTokens) && inputTokens >= 0
+    && outputTokens !== null && Number.isSafeInteger(outputTokens) && outputTokens >= 0
+    && estimatedCostUsd !== null && estimatedCostUsd >= 0
+    ? { inputTokens, outputTokens, estimatedCostUsd } : null
+}
+
+function numericValue(value: unknown): number | null {
+  if (typeof value !== "number" && typeof value !== "string") return null
+  if (typeof value === "string" && (!value || value.trim() !== value)) return null
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : null
 }
 
 function expectScheduledAuditRecoveryTrace(trace: Awaited<ReturnType<typeof readScheduledAuditRootRecoveryTrace>>,
