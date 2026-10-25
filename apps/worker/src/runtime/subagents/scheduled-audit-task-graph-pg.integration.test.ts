@@ -365,6 +365,26 @@ async function setupFetcher(fixture: Fixture) {
   const continuationCheckpoint = await vi.importActual<{
     scheduledTaskGraphContinuationKey(owner: unknown, attestation: unknown): string
   }>("@/lib/agent/scheduled-taskgraph-pipeline-checkpoint")
+  type ScheduledTaskGraphFenceProbe = {
+    isScheduledTaskGraphOwnerCurrent(owner: unknown, key: string, claimToken: string): Promise<boolean>
+    saveScheduledTaskGraphCheckpoint(input: unknown): Promise<boolean>
+  }
+  const taskGraphFence = await vi.importActual<ScheduledTaskGraphFenceProbe>(scheduledTaskGraphFencePath)
+  vi.doMock(scheduledTaskGraphFencePath, () => ({
+    ...taskGraphFence,
+    isScheduledTaskGraphOwnerCurrent: async (owner: unknown, key: string, claimToken: string) => {
+      const current = await taskGraphFence.isScheduledTaskGraphOwnerCurrent(owner, key, claimToken)
+      if (continuation.ownerCurrentChecks.length < 8) continuation.ownerCurrentChecks.push(current ? "current" : "rejected")
+      return current
+    },
+    saveScheduledTaskGraphCheckpoint: async (input: unknown) => {
+      try {
+        const saved = await taskGraphFence.saveScheduledTaskGraphCheckpoint(input)
+        continuation.checkpointSave = saved ? "saved" : "rejected"
+        return saved
+      } catch (error) { continuation.checkpointSave = "threw"; throw error }
+    },
+  }))
   type ScheduledTaskGraphRunServiceProbe = {
     buildScheduledTaskGraphGateResumeState(input: unknown): Promise<unknown>
     serializeScheduledTaskGraphCheckpoint(value: unknown): unknown
@@ -398,26 +418,6 @@ async function setupFetcher(fixture: Fixture) {
       continuation.serializedCheckpoint = result === null ? "rejected"
         : debugSafeEnum(stage, ["scout", "analyze", "prepare", "gate", "execute", "audit", "completed"]) ?? "invalid"
       return result
-    },
-  }))
-  type ScheduledTaskGraphFenceProbe = {
-    isScheduledTaskGraphOwnerCurrent(owner: unknown, key: string, claimToken: string): Promise<boolean>
-    saveScheduledTaskGraphCheckpoint(input: unknown): Promise<boolean>
-  }
-  const taskGraphFence = await vi.importActual<ScheduledTaskGraphFenceProbe>(scheduledTaskGraphFencePath)
-  vi.doMock(scheduledTaskGraphFencePath, () => ({
-    ...taskGraphFence,
-    isScheduledTaskGraphOwnerCurrent: async (owner: unknown, key: string, claimToken: string) => {
-      const current = await taskGraphFence.isScheduledTaskGraphOwnerCurrent(owner, key, claimToken)
-      if (continuation.ownerCurrentChecks.length < 8) continuation.ownerCurrentChecks.push(current ? "current" : "rejected")
-      return current
-    },
-    saveScheduledTaskGraphCheckpoint: async (input: unknown) => {
-      try {
-        const saved = await taskGraphFence.saveScheduledTaskGraphCheckpoint(input)
-        continuation.checkpointSave = saved ? "saved" : "rejected"
-        return saved
-      } catch (error) { continuation.checkpointSave = "threw"; throw error }
     },
   }))
   type RunServiceProbe = { runAgentPipeline(input: unknown): Promise<unknown> }
