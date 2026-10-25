@@ -303,6 +303,15 @@ describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
   })
 
   it('renews the owner-fenced claim before handing a valid Execute continuation to the Pipeline', async () => {
+    queryIndex = 0
+    mocks.queryRaw.mockImplementation(async () => {
+      const position = queryIndex++ % 5
+      if (position === 0) return [{ id: owner.sessionId, status: 'active' }]
+      if (position === 1) return [databaseTurn('in_progress')]
+      if (position === 2) return [rootTask]
+      if (position === 3) return [{ ...gateTask, status: 'completed' }]
+      return [{ id: owner.executionId, status: 'running', attemptCount: owner.executionAttemptCount, checkpoint: 'gate', state }]
+    })
     const accepted = await runScheduledTaskGraphActionRpc(executeRequest())
 
     expect(accepted).toMatchObject({ kind: 'execute' })
