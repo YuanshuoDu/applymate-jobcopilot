@@ -182,7 +182,7 @@ async function validateHistory(input: ScheduledTaskGraphGateHistoryInput, graphI
 function validAuditNode(node: Record<string, unknown>, taskId: string): boolean {
   return Boolean(exactRecord(node, ['key', 'templateId', 'goal', 'successCriteria', 'dependsOn', 'depth', 'taskId', 'verificationDisposition'])
     && node.key === 'scheduled_audit' && node.templateId === 'scheduled_audit' && node.taskId === taskId && node.depth === 5
-    && node.goal === AUDIT_GOAL && sameJson(node.successCriteria, AUDIT_CRITERIA) && node.verificationDisposition === 'legacy_unverified'
+    && node.goal === AUDIT_GOAL && sameJson(node.successCriteria, AUDIT_CRITERIA) && node.verificationDisposition === 'specialized'
     && sameStrings(node.dependsOn, ['gate']))
 }
 

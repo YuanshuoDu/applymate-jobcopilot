@@ -196,7 +196,7 @@ async function verifyCurrentTaskGraph(owner: ScheduledTaskGraphPipelineOwner, ma
 function validScheduledAuditNode(node: Record<string, unknown>, taskId: string): boolean {
   return Boolean(exactRecord(node, ['key', 'templateId', 'goal', 'successCriteria', 'dependsOn', 'depth', 'taskId', 'verificationDisposition'])
     && node.key === 'scheduled_audit' && node.templateId === 'scheduled_audit' && node.taskId === taskId && node.depth === 5
-    && sameStrings(node.dependsOn, ['gate']) && node.verificationDisposition === 'legacy_unverified'
+    && sameStrings(node.dependsOn, ['gate']) && node.verificationDisposition === 'specialized'
     && node.goal === AUDIT_GOAL && sameJson(node.successCriteria, AUDIT_CRITERIA))
 }
 

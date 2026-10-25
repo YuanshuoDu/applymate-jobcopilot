@@ -140,7 +140,7 @@ function verifyAttestation(loaded: LoadedGraph, attestation: ScheduledAutomation
 function validAuditNode(loaded: LoadedGraph, taskId: string): boolean {
   const node = loaded.snapshot?.nodes.find(value => value.key === SCHEDULED_AUDIT_TEMPLATE_ID)
   return !!node && node.taskId === taskId && node.templateId === SCHEDULED_AUDIT_TEMPLATE_ID && node.depth === 5
-    && node.verificationDisposition === "legacy_unverified" && node.goal === SCHEDULED_AUDIT_NODE_GOAL
+    && node.verificationDisposition === "specialized" && node.goal === SCHEDULED_AUDIT_NODE_GOAL
     && same(node.successCriteria, SCHEDULED_AUDIT_NODE_CRITERIA) && node.dependsOn.length === 1 && node.dependsOn[0] === "gate"
 }
 

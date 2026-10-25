@@ -55,7 +55,7 @@ function setup() {
     { key: "prepare", taskId: "prepare-task", templateId: "prepare" },
     { key: "gate", taskId: "gate-task", templateId: "gate", verificationDisposition: "specialized", dependsOn: ["prepare"] },
     { key: SCHEDULED_AUDIT_TEMPLATE_ID, taskId: "audit-task", templateId: SCHEDULED_AUDIT_TEMPLATE_ID, depth: 5,
-      verificationDisposition: "legacy_unverified", dependsOn: ["gate"] },
+      verificationDisposition: "specialized", dependsOn: ["gate"] },
   ]
   const tasks = new Map<string, unknown>([
     ["scout-task", { id: "scout-task", status: "completed", role: "scout", attemptCount: 1, result: envelope(scout, {}) }],
@@ -198,9 +198,9 @@ describe("fixed scheduled Audit child runtime", () => {
     expect(mocks.post).toHaveBeenCalledOnce()
   })
 
-  it("reserves legacy_unverified for the private Audit proof path, never the generic verifier", async () => {
+  it("reserves the specialized Audit template for its private proof path, never the generic verifier", async () => {
     const fixture = setup()
-    expect(fixture.nodes[4]?.verificationDisposition).toBe("legacy_unverified")
+    expect(fixture.nodes[4]?.verificationDisposition).toBe("specialized")
     expect(taskGraphVerificationRole(SCHEDULED_AUDIT_TEMPLATE_ID)).toBeUndefined()
     expect(isScheduledAuditCandidate({ role: SCHEDULED_AUDIT_ROLE, taskType: "other" })).toBe(false)
     expect(isScheduledAuditLease(lease())).toBe(true)

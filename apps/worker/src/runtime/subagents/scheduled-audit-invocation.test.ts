@@ -62,7 +62,7 @@ const nodes = [
   { key: "analyst", templateId: "analyst", taskId: "analyst-task", goal: "Review", successCriteria: ["Reviewed"], dependsOn: ["scout"], depth: 2, verificationDisposition: "typed" },
   { key: "prepare", templateId: "prepare", taskId: "prepare-task", goal: "Prepare", successCriteria: ["Prepared"], dependsOn: ["analyst"], depth: 3, verificationDisposition: "specialized" },
   { ...gateDefinition, taskId: "gate-task", depth: 4, verificationDisposition: "specialized" },
-  { ...auditDefinition, taskId: "audit-task", depth: 5, verificationDisposition: "legacy_unverified" },
+  { ...auditDefinition, taskId: "audit-task", depth: 5, verificationDisposition: "specialized" },
 ]
 const statuses = ["completed", "completed", "completed", "completed", "running"]
 const current = nodes.map((node, index) => ({ key: node.key, taskId: node.taskId, status: statuses[index], failureReason: null }))
@@ -139,6 +139,14 @@ describe("scheduled Audit invocation proof readback", () => {
     await expect(readScheduledAuditInvocationProof(database(registration, false, "waiting_for_dependency"),
       { scope, auditTaskId: "audit-task", attemptCount: 2, attestation } as never)).resolves.toBeNull()
     expect(mocks.gateRegistration).not.toHaveBeenCalled()
+  })
+
+  it("rejects the former legacy Audit disposition", async () => {
+    const invalid = { ...loaded, snapshot: { ...loaded.snapshot, nodes: loaded.snapshot.nodes.map(node =>
+      node.key === "scheduled_audit" ? { ...node, verificationDisposition: "legacy_unverified" } : node) } }
+    mocks.load.mockResolvedValue(invalid as never)
+    await expect(readScheduledAuditInvocationProof(database(), { scope, auditTaskId: "audit-task", attemptCount: 2, attestation } as never))
+      .resolves.toBeNull()
   })
 
   it("rejects an execution waiting for user input before Gate completes", async () => {

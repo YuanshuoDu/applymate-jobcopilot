@@ -139,7 +139,7 @@ const oldLoaded = { rootTaskId: owner.rootTaskId, item: { id: "graph", revision:
   state: { revision: 12, nodes: currentNodes.slice(0, 4), appliedEvents: [] }, tasks: new Map() }
 const auditNode = { key: SCHEDULED_AUDIT_TEMPLATE_ID, templateId: SCHEDULED_AUDIT_TEMPLATE_ID, taskId: "audit-task",
   goal: SCHEDULED_AUDIT_NODE_GOAL, successCriteria: SCHEDULED_AUDIT_NODE_CRITERIA, dependsOn: ["gate"], depth: 5,
-  verificationDisposition: "legacy_unverified" }
+  verificationDisposition: "specialized" }
 const task = (status: string, attemptCount: number) => ({ id: "audit-task", status, attemptCount, role: SCHEDULED_AUDIT_ROLE,
   taskType: SCHEDULED_AUDIT_TASK_TYPE, expectedOutputSchema: SCHEDULED_AUDIT_OUTPUT_SCHEMA, allowedActions: [],
   contextIsEmpty: true, failureReason: null, result: status === "completed" ? auditResult : null })
@@ -210,6 +210,7 @@ describe("PostgreSQL scheduled Audit command", () => {
   it.each([
     ["generic extra node", { ...auditNode, key: "review", templateId: "review" }],
     ["legacy Audit content", { ...auditNode, goal: "Legacy Audit" }],
+    ["legacy Audit disposition", { ...auditNode, verificationDisposition: "legacy_unverified" }],
   ] as const)("does not accept a %s as registered Audit replay", async (_label, extraNode) => {
     const loaded = { ...startedLoaded, snapshot: { ...startedLoaded.snapshot, nodes: [...baseNodes, extraNode] } }
     writes.load.mockResolvedValue(loaded)

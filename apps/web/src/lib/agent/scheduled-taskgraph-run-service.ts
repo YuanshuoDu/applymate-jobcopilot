@@ -134,13 +134,13 @@ export async function buildScheduledTaskGraphGateResumeState(input: ScheduledTas
   if (!persisted) throw new AgentExecutionCancelledError()
   const artifactRefs = loaded.materials.map(({ jobId, kind, artifactRef }) => ({ jobId, kind, artifactRef }))
   if (persisted?.scheduledTaskGraphPreparedArtifacts !== undefined
-    && !sameJson(persisted.scheduledTaskGraphPreparedArtifacts, artifactRefs)) throw new AgentExecutionCancelledError()
+    && !sameCanonicalJson(persisted.scheduledTaskGraphPreparedArtifacts, artifactRefs)) throw new AgentExecutionCancelledError()
   if (!["prepare", "gate", "execute", "audit"].includes(requestedStage)) throw new AgentExecutionCancelledError()
   const decisions = loaded.gateResult?.status === 'completed' ? parseGateDecisions({
     approvedJobIds: loaded.gateResult.approvedJobIds, pendingJobIds: loaded.gateResult.pendingJobIds, skippedJobIds: loaded.gateResult.skippedJobIds })
     : parseGateDecisions(persisted?.scheduledTaskGraphGateDecisions)
   if (loaded.gateResult && persisted?.scheduledTaskGraphGateDecisions !== undefined
-    && !sameJson(persisted.scheduledTaskGraphGateDecisions, decisions)) throw new AgentExecutionCancelledError()
+    && !sameCanonicalJson(persisted.scheduledTaskGraphGateDecisions, decisions)) throw new AgentExecutionCancelledError()
   const gateOutput = decisions ? restoreGateOutput(decisions, loaded.packages) : undefined
   if (completion && loaded.gateResult?.status !== 'completed') throw new AgentExecutionCancelledError()
   if (["execute", "audit"].includes(requestedStage) && !gateOutput) throw new AgentExecutionCancelledError()
@@ -172,7 +172,7 @@ export function serializeScheduledTaskGraphCheckpoint(value: PipelineCheckpointS
     if (!stage) return null
     if (stageOrder(stage) > stageOrder("gate") && value.gateOutput) {
       const decisions = gateDecisionsFromOutput(value.gateOutput)
-      if (!decisions || (state.scheduledTaskGraphGateDecisions && !sameJson(state.scheduledTaskGraphGateDecisions, decisions))) return null
+      if (!decisions || (state.scheduledTaskGraphGateDecisions && !sameCanonicalJson(state.scheduledTaskGraphGateDecisions, decisions))) return null
       state.scheduledTaskGraphGateDecisions = decisions
     }
     delete state.gateOutput
@@ -205,7 +205,6 @@ function pipelineStage(value: unknown): PipelineStage | null {
     ? value as PipelineStage : null
 }
 function stageOrder(stage: PipelineStage): number { return ["scout", "analyze", "prepare", "gate", "execute", "audit", "completed"].indexOf(stage) }
-function sameJson(left: unknown, right: unknown): boolean { try { return JSON.stringify(left) === JSON.stringify(right) } catch { return false } }
 
 /** Persists Web's authoritative Analyze checkpoint and returns only its opaque proof. */
 export async function runScheduledTaskGraphAnalyzeOnly(input: ScheduledTaskGraphAnalyzeOnlyInput): Promise<ScheduledTaskGraphAnalyzeCheckpointProof> {

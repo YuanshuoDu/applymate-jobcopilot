@@ -191,7 +191,7 @@ function attachAudit(input: ScheduledTaskGraphGateInputRequest, proof: ReturnTyp
   const gateInput = attachGate(input, proof, graph, attestation)
   const content = graph.content as { nodes: Record<string, unknown>[] }
   const auditNode = { key: 'scheduled_audit', templateId: 'scheduled_audit', taskId: 'audit-task', depth: 5, dependsOn: ['gate'],
-    verificationDisposition: 'legacy_unverified', goal: 'Return the exact report from the authenticated scheduled Audit continuation after Gate completion.',
+    verificationDisposition: 'specialized', goal: 'Return the exact report from the authenticated scheduled Audit continuation after Gate completion.',
     successCriteria: ['Continue the exact scheduled execution only after its canonical Gate proof is verified.',
       'Return only the fixed seven-field report without adding actions or interpreting historical counts.',
       'Never submit applications or invoke model or tool runtimes.'] }
@@ -243,6 +243,11 @@ describe('scheduled TaskGraph Gate input reload', () => {
     const waitingInput = attachAudit(beforeCompletion.input, beforeCompletion.proof, beforeCompletion.graph,
       beforeCompletion.analyzeAttestation, 'running')
     await expect(loadScheduledTaskGraphGateInput(waitingInput)).resolves.toBeNull()
+
+    const legacyDisposition = setup()
+    const legacyInput = attachAudit(legacyDisposition.input, legacyDisposition.proof, legacyDisposition.graph, legacyDisposition.analyzeAttestation)
+    ;(legacyDisposition.graph.content as { nodes: Record<string, unknown>[] }).nodes[4]!.verificationDisposition = 'legacy_unverified'
+    await expect(loadScheduledTaskGraphGateInput(legacyInput)).resolves.toBeNull()
 
     const wrongDepth = setup()
     const wrongDepthInput = attachAudit(wrongDepth.input, wrongDepth.proof, wrongDepth.graph, wrongDepth.analyzeAttestation, 'completed', 2)

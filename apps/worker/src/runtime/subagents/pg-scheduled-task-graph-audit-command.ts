@@ -85,7 +85,7 @@ export async function appendScheduledAudit(client: Queryable, input: TaskGraphSc
     goal: added.goal, constraints: [], successCriteria: added.successCriteria, allowedActions: [], context: {},
     expectedOutputSchema: SCHEDULED_AUDIT_OUTPUT_SCHEMA, policy: inheritSubagentPolicy(policy) }, true, { preserveEmptyAllowedActions: true })
   const nodes = append.state.nodes.map(node => node.key === SCHEDULED_AUDIT_TEMPLATE_ID
-    ? { ...node, taskId: child.id, verificationDisposition: "legacy_unverified" as const } : node)
+    ? { ...node, taskId: child.id, verificationDisposition: "specialized" as const } : node)
   const state = { ...append.state, nodes }, taskIds = new Map(loaded.snapshot.nodes.map(node => [node.key, node.taskId] as const))
   taskIds.set(SCHEDULED_AUDIT_TEMPLATE_ID, child.id)
   const snapshot = taskGraphSnapshot(state, taskIds, loaded.snapshot.rootSuccessCriteria)
@@ -203,7 +203,7 @@ async function lockAuditTask(client: Queryable, scope: GraphIdentityScope, taskI
 function validAuditNode(loaded: LoadedGraph, taskId: string): boolean {
   const node = loaded.snapshot?.nodes.find(value => value.key === SCHEDULED_AUDIT_TEMPLATE_ID)
   return !!node && node.taskId === taskId && node.templateId === SCHEDULED_AUDIT_TEMPLATE_ID && node.depth === 5
-    && node.verificationDisposition === "legacy_unverified" && node.goal === SCHEDULED_AUDIT_NODE_GOAL
+    && node.verificationDisposition === "specialized" && node.goal === SCHEDULED_AUDIT_NODE_GOAL
     && same(node.successCriteria, SCHEDULED_AUDIT_NODE_CRITERIA) && node.dependsOn.length === 1 && node.dependsOn[0] === "gate"
 }
 

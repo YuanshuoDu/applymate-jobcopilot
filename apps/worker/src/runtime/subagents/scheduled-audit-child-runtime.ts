@@ -88,7 +88,7 @@ async function loadScheduledAuditInvocation(pool: Pick<pg.Pool, "connect">, leas
     const gate = snapshot?.nodes.find(node => node.key === "gate"), prepare = snapshot?.nodes.find(node => node.key === "prepare")
     const auditTask = audit && graph.tasks.get(audit.taskId), gateTask = gate && graph.tasks.get(gate.taskId), prepareTask = prepare && graph.tasks.get(prepare.taskId)
     if (!snapshot || !state || snapshot.nodes.length !== 5 || !audit || audit.taskId !== lease.id || audit.templateId !== "scheduled_audit"
-      || audit.depth !== 5 || audit.verificationDisposition !== "legacy_unverified" || !same(audit.dependsOn, ["gate"])
+      || audit.depth !== 5 || audit.verificationDisposition !== "specialized" || !same(audit.dependsOn, ["gate"])
       || !auditState || auditState.status !== "running" || !auditTask || auditTask.status !== "running"
       || auditTask.attemptCount !== lease.attemptCount || auditTask.role !== SCHEDULED_AUDIT_ROLE || auditTask.taskType !== SCHEDULED_AUDIT_TASK_TYPE
       || !same(auditTask.expectedOutputSchema, SCHEDULED_AUDIT_OUTPUT_SCHEMA) || !same(auditTask.allowedActions, [])

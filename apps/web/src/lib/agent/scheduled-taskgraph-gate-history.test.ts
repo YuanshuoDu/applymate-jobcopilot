@@ -62,7 +62,7 @@ function fixture(maxAttempts = 3) {
 
 function auditSuffix(input: ReturnType<typeof fixture>['input'], nodeOverrides: Record<string, unknown> = {}) {
   const node = { key: 'scheduled_audit', templateId: 'scheduled_audit', taskId: 'audit-1', depth: 5, dependsOn: ['gate'],
-    verificationDisposition: 'legacy_unverified', goal: 'Return the exact report from the authenticated scheduled Audit continuation after Gate completion.',
+    verificationDisposition: 'specialized', goal: 'Return the exact report from the authenticated scheduled Audit continuation after Gate completion.',
     successCriteria: ['Continue the exact scheduled execution only after its canonical Gate proof is verified.',
       'Return only the fixed seven-field report without adding actions or interpreting historical counts.',
       'Never submit applications or invoke model or tool runtimes.'], ...nodeOverrides }
@@ -121,6 +121,11 @@ describe('scheduled TaskGraph Gate lifecycle history', () => {
     const changed = fixture()
     await expect(scheduledTaskGraphGateHistoryIsCurrent(auditSuffix(changed.input, { goal: 'changed' }))).resolves.toBe(false)
     expect(changed.findAuditTask).not.toHaveBeenCalled()
+
+    const legacyDisposition = fixture()
+    await expect(scheduledTaskGraphGateHistoryIsCurrent(auditSuffix(legacyDisposition.input,
+      { verificationDisposition: 'legacy_unverified' }))).resolves.toBe(false)
+    expect(legacyDisposition.findAuditTask).not.toHaveBeenCalled()
 
     const extra = fixture()
     const current = auditSuffix(extra.input)
