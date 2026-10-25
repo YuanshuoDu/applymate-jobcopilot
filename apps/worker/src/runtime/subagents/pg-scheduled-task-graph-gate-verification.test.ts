@@ -157,12 +157,14 @@ describe("persisted scheduled Gate completion proof", () => {
     ["persisted scheduled", ["scheduled-scout", "scheduled-analyst", "prepare"] as const],
   ])("accepts the %s Scout/Analyst keys with the exact certified role and dependency chain", async (_label, keys) => {
     const fixture = preparePrefixFixture(keys)
+    const db = database()
     mocks.current.mockReturnValue({ nodes: fixture.currentNodes })
     mocks.verifyPrepare.mockResolvedValue({ verified: true, facts: fixture.facts })
 
-    await expect(verifyPersistedScheduledPreparePrefix(database().client as never, scope as never,
+    await expect(verifyPersistedScheduledPreparePrefix(db.client as never, scope as never,
       fixture.loaded as never, fixture.proof as never)).resolves.toBe(true)
     expect(mocks.verifyPrepare).toHaveBeenCalledOnce()
+    expect(mocks.verifyPrepare).toHaveBeenCalledWith(db.client, expect.objectContaining({ checkpointStage: "gate" }))
   })
 
   it.each(["role", "certified task identity", "dependency chain"] as const)("rejects a wrong Prepare prefix %s", async mismatch => {

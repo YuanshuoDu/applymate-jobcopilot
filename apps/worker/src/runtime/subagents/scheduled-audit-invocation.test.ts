@@ -129,6 +129,7 @@ describe("scheduled Audit invocation proof readback", () => {
       scheduledWaitId: "scheduled-wait", auditTaskId: "audit-task", attemptCount: 2, graphRevision: 14 })
     expect(mocks.load).toHaveBeenCalledWith(db, { ...scope, parentTaskId: scope.rootTaskId }, false)
     expect(mocks.verifyPrefix).toHaveBeenCalledOnce()
+    expect(mocks.verifyPrefix).toHaveBeenCalledWith(db, expect.objectContaining({ ...scope, parentTaskId: scope.rootTaskId }), expect.anything(), expect.anything(), "gate")
   })
 
   it("rebinds the same exact Gate proof after Web persisted the scheduled report", async () => {
@@ -137,6 +138,7 @@ describe("scheduled Audit invocation proof readback", () => {
     expect(result).toMatchObject({ owner, snapshotDigest, attestation, prepareProof: prepare, gateProof,
       scheduledWaitId: "scheduled-wait", auditTaskId: "audit-task", attemptCount: 2, graphRevision: 14 })
     expect(mocks.verifyPrefix).toHaveBeenCalledOnce()
+    expect(mocks.verifyPrefix).toHaveBeenCalledWith(db, expect.objectContaining({ ...scope, parentTaskId: scope.rootTaskId }), expect.anything(), expect.anything(), "audit_completed_report")
   })
 
   it("adapts only an exact completed Audit report through the unchanged Gate checkpoint parser", async () => {
@@ -167,6 +169,7 @@ describe("scheduled Audit invocation proof readback", () => {
     expect(result).toMatchObject({ owner, snapshotDigest, attestation, prepareProof: prepare, gateProof,
       scheduledWaitId: "scheduled-wait", auditTaskId: "audit-task", attemptCount: 2, graphRevision: 14 })
     expect(mocks.verifyPrefix).toHaveBeenCalledOnce()
+    expect(mocks.verifyPrefix).toHaveBeenCalledWith(db, expect.objectContaining({ ...scope, parentTaskId: scope.rootTaskId }), expect.anything(), expect.anything(), "gate")
   })
 
   it("rejects the unprojected Turn dependency status", async () => {

@@ -113,7 +113,8 @@ export async function verifyRegisteredScheduledAuditGate(client: Queryable, scop
     || !same(proof.receipt.owner, expected?.prepareProof.receipt.owner ?? proof.receipt.owner)) return null
   const prefix = { ...loaded, snapshot: { ...snapshot, nodes: snapshot.nodes.slice(0, 4) },
     state: { ...state, nodes: state.nodes.slice(0, 4) } }
-  if (!await verifyPersistedScheduledPreparePrefix(client, scope, prefix, proof)
+  const checkpointStage = execution.status === "completed" ? "audit_completed_report" : "gate"
+  if (!await verifyPersistedScheduledPreparePrefix(client, scope, prefix, proof, checkpointStage)
     || attestation && !verifyAttestation(loaded, attestation)) return null
   const gateRows = await client.query(`SELECT "status", "attemptCount", "role", "taskType", "expectedOutputSchema", "allowedActions", "context", "result", "failureReason", "leaseOwner", "leaseExpiresAt"
     FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4

@@ -100,7 +100,7 @@ function completedReferenceFixture(expected: PrepareResult) {
   return { ...active, row: { ...active.row, currentTaskStatus: "completed", currentLeaseOwner: null, currentLeaseExpiresAt: null } }
 }
 
-function checkpointFixture(stage: "prepare" | "gate") {
+function checkpointFixture(stage: "prepare" | "gate" | "audit_completed_report") {
   const owner = binding.owner, automation = { schemaVersion: SCHEDULED_AUTOMATION_SNAPSHOT_SCHEMA_VERSION,
     targetRoles: ["Software Engineer"], targetLocations: [], minScore: 50, dailyCap: 50, requireApproval: true, autoApply: false }
   const snapshotDigest = `sha256:${createHash("sha256").update(JSON.stringify([automation.schemaVersion, automation.targetRoles,
@@ -174,17 +174,21 @@ function checkpointFixture(stage: "prepare" | "gate") {
     status: "completed", readiness: "ready", failureReason: null,
     verificationReport: node.key === "scout" ? publicTaskGraphVerificationReport(scoutReport)
       : node.key === "analyst" ? publicTaskGraphVerificationReport(analystReport) : null })) }
-  const state = { nextStage: stage, analysisFailed: 0, scoutedJobs: [{ id: "job-1", userId: owner.userId }], scoredJobs,
+  const persistedStage = stage === "audit_completed_report" ? "completed" : stage
+  const state = { nextStage: persistedStage, analysisFailed: 0, scoutedJobs: [{ id: "job-1", userId: owner.userId }], scoredJobs,
     scheduledTaskGraphContinuation: { key: "handoff-key", snapshotDigest, graphRevision: 12, evidenceDigest,
-      owner: stage === "gate" ? { ...owner, turnLeaseOwnerId: "turn-owner-2", turnLeaseVersion: 5 } : owner } }
+      owner: stage !== "prepare" ? { ...owner, turnLeaseOwnerId: "turn-owner-2", turnLeaseVersion: 5 } : owner },
+    ...(stage === "audit_completed_report" ? { report: { processed: 1, applied: 0, queued: 0, pending: 0,
+      skipped: 1, failed: 0, durationMs: 9 } } : {}) }
+  const execution = { id: owner.executionId, status: stage === "audit_completed_report" ? "completed" : "running",
+    attemptCount: owner.executionAttemptCount, checkpoint: persistedStage, state }
   const query = vi.fn(async (sql: string) => {
     if (sql.includes('FROM "agent_events" AS event')) return { rows: [{ type: SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_EVENT,
       itemId: null, taskId: null, actor: "system", payload: privateReceipt, idempotencyKey: "scheduled-prepare:fixture", hasOutbox: false }] }
     if (sql.includes('FROM "sub_agent_tasks" AS task')) return { rows: [{ attemptCount: owner.rootAttemptCount }] }
     if (sql.includes('FROM "agent_turns"')) return { rows: [{ source: "automation", executionMode: "canonical_task_graph",
       input: { automationRunMode: "scheduled", scheduledAutomationSnapshot: automation } }] }
-    if (sql.includes('FROM "agent_executions"')) return { rows: [{ status: "running", attemptCount: owner.executionAttemptCount,
-      checkpoint: stage, state }] }
+    if (sql.includes('FROM "agent_executions"')) return { rows: [execution] }
     return { rows: [] }
   })
   const call = { toolCallId: "prepare-call", toolName: "scheduled.application.prepare", toolVersion: "1", input: {}, status: "completed", errorCode: null }
@@ -194,7 +198,7 @@ function checkpointFixture(stage: "prepare" | "gate") {
     { type: "tool_call", stepId: "prepare-step", content: call },
     { type: "tool_result", stepId: "prepare-step", content: { errorCode: null, output: prepareResult } },
   ], replayReceipts: [], outcomes: new Map([["prepare-call", "completed"]]) })
-  return { query, state, input: { scope: prepareScope, snapshot, current, tasks, structuredResult: prepareResult,
+  return { query, state, execution, input: { scope: prepareScope, snapshot, current, tasks, structuredResult: prepareResult,
     completionGraphRevision: 14, referenceVerificationMode: { phase: "persisted_gate" as const } } }
 }
 
@@ -327,6 +331,46 @@ describe("scheduled Prepare TaskGraph proof", () => {
       { ...fixture.input, checkpointStage: "gate" } as never)
     expect(verified).toMatchObject({ verified: true, facts: { receipt: { checkpointDigest: expect.any(String) } } })
     expect(fixture.query.mock.calls.some(([sql]) => String(sql).includes('FROM "agent_executions"'))).toBe(true)
+  })
+
+  it("verifies only an exact completed Audit report checkpoint while preserving the Analyze digest", async () => {
+    const fixture = checkpointFixture("audit_completed_report"), before = structuredClone(fixture.state)
+    const verified = await verifyScheduledPrepareTaskGraphEvidence({ query: fixture.query } as never,
+      { ...fixture.input, checkpointStage: "audit_completed_report" } as never)
+    expect(verified).toMatchObject({ verified: true, facts: { receipt: { checkpointDigest: expect.any(String) } } })
+    expect(fixture.state).toEqual(before)
+    expect(fixture.query.mock.calls.some(([sql]) => String(sql).includes('FROM "agent_executions"'))).toBe(true)
+  })
+
+  it("keeps completed-report admission separate from the default Prepare and Gate checkpoint modes", async () => {
+    for (const mode of [undefined, "gate"] as const) {
+      const fixture = checkpointFixture("audit_completed_report")
+      const input = mode ? { ...fixture.input, checkpointStage: mode } : fixture.input
+      await expect(verifyScheduledPrepareTaskGraphEvidence({ query: fixture.query } as never, input as never))
+        .resolves.toMatchObject({ verified: false, reasonCode: "scheduled_prepare_checkpoint_invalid" })
+    }
+  })
+
+  it.each(["missing report", "malformed report", "wrong execution status", "wrong checkpoint stage",
+    "foreign marker owner", "changed Analyze digest"] as const)("rejects completed-report replay with %s", async mismatch => {
+    const fixture = checkpointFixture("audit_completed_report"), state = fixture.state as Record<string, unknown>
+    if (mismatch === "missing report") delete state.report
+    if (mismatch === "malformed report") state.report = { ...(state.report as object), extra: true }
+    if (mismatch === "wrong execution status") (fixture.execution as { status: string }).status = "running"
+    if (mismatch === "wrong checkpoint stage") {
+      (fixture.execution as { checkpoint: string }).checkpoint = "execute"
+      state.nextStage = "execute"
+    }
+    if (mismatch === "foreign marker owner") {
+      const marker = state.scheduledTaskGraphContinuation as Record<string, unknown>
+      marker.owner = { ...(marker.owner as object), rootTaskId: "other-root" }
+    }
+    if (mismatch === "changed Analyze digest") {
+      ;(state.scoredJobs as Array<{ score: number }>)[0]!.score = 81
+    }
+    await expect(verifyScheduledPrepareTaskGraphEvidence({ query: fixture.query } as never,
+      { ...fixture.input, checkpointStage: "audit_completed_report" } as never))
+      .resolves.toMatchObject({ verified: false, reasonCode: "scheduled_prepare_checkpoint_invalid" })
   })
 
   it("keeps Prepare as the default checkpoint stage and rejects Gate stage, changed digest, or changed stable owner", async () => {
