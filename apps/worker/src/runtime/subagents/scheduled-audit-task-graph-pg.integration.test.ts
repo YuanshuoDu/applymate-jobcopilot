@@ -29,8 +29,24 @@ type Runner = Readonly<{ worker: Worker<SubagentJobPayload, unknown>; redis: Red
 type ScheduledPipelineRoute = Readonly<{ POST(request: Request): Promise<Response> }>
 type ExecuteHttpResponse = Readonly<{ status: number; body: Record<string, unknown> }>
 type GateFailureDiagnostics = Readonly<Record<string, unknown>>
+type GateHttpFailure = Readonly<{ status: number; errorCode: string | null }>
 type GateHistoryProbeRow = Readonly<{ actor: string | null; taskId: string | null; idempotencyKey: string | null; sequence: bigint; payload: unknown }>
 const diagnosticOutcomeStatuses = new Set(["completed", "retrying", "failed", "waiting", "waiting_for_user", "interrupted", "skipped", "lease_lost"])
+const diagnosticGateErrorCodes = new Set([
+  "scheduled_pipeline_account_unavailable", "scheduled_pipeline_agent_unavailable", "scheduled_pipeline_ai_budget_exhausted",
+  "scheduled_pipeline_ai_unavailable", "scheduled_pipeline_analysis_interrupted", "scheduled_pipeline_attestation_invalid",
+  "scheduled_pipeline_claim_conflict", "scheduled_pipeline_discovery_incomplete", "scheduled_pipeline_entitlement_required",
+  "scheduled_pipeline_execution_failed", "scheduled_pipeline_execution_mismatch", "scheduled_pipeline_gate_proof_invalid",
+  "scheduled_pipeline_jobs_mismatch", "scheduled_pipeline_mode_mismatch", "scheduled_pipeline_owner_mismatch",
+  "scheduled_pipeline_request_invalid", "scheduled_pipeline_resume_unavailable", "scheduled_pipeline_snapshot_mismatch",
+  "scheduled_pipeline_turn_stale", "scheduled_pipeline_unauthorized",
+])
+const diagnosticWorkerErrorCodes = new Set([
+  ...diagnosticGateErrorCodes, "scheduled_gate_analyze_proof_invalid", "scheduled_gate_completion_unverified",
+  "scheduled_gate_graph_invalid", "scheduled_gate_handoff_retryable", "scheduled_gate_owner_stale",
+  "scheduled_gate_prepare_proof_invalid", "scheduled_gate_registration_invalid", "scheduled_gate_runtime_failed",
+  "scheduled_gate_task_invalid", "scheduled_gate_wait_invalid",
+])
 const scheduledPipelineRoutePath = "@/app/api/internal/agent-runtime/scheduled-pipeline/route"
 const scheduledGateQualityReviewPath = "@/lib/agent/stages/gate-quality-review"
 const scheduledModelRouterPath = "@/lib/model-router"
@@ -96,8 +112,12 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
       const rawOutcomeStatus = debugRecord(gateOutcome)?.status
       const outcomeStatus = typeof rawOutcomeStatus === "string" && diagnosticOutcomeStatuses.has(rawOutcomeStatus)
         ? rawOutcomeStatus : "other"
+      const workerErrorCode = diagnosticWorkerErrorCode(debugRecord(gateOutcome)?.reason)
+        ?? diagnosticWorkerErrorCode((await taskState(gateTaskId)).failureReason)
+      const gateDiagnostics = response.gateDiagnostics()
       throw new Error(`Scheduled Gate child did not complete: ${JSON.stringify({ outcomeStatus,
-        gateDiagnostics: response.gateDiagnostics() })}`)
+        ...(workerErrorCode ? { workerErrorCode } : {}), gateHttpFailures: response.gateHttpFailures(),
+        ...(gateDiagnostics ? { gateDiagnostics } : {}) })}`)
     }
     expect(gateOutcome).toMatchObject({ status: "completed" })
     expect(response.gateCalls()).toBe(1)
@@ -232,6 +252,7 @@ async function setupFetcher(fixture: Fixture) {
   disconnectWebDatabase = () => webDb.db.$disconnect()
   let loseFirstExecuteResponse = true, gates = 0, executes = 0
   let gateDiagnostics: GateFailureDiagnostics | undefined
+  const gateHttpFailures: GateHttpFailure[] = []
   let firstExecute: ExecuteHttpResponse | undefined
   let replayedExecute: ExecuteHttpResponse | undefined
   let firstExecuteRequest: Record<string, unknown> | undefined
@@ -246,6 +267,9 @@ async function setupFetcher(fixture: Fixture) {
       gates += 1
       const payload = await response.clone().json().catch(() => null)
       const routeBody = debugRecord(payload)
+      if ((response.status < 200 || response.status >= 300) && gateHttpFailures.length < 4) {
+        gateHttpFailures.push({ status: response.status, errorCode: diagnosticGateErrorCode(routeBody?.errorCode) })
+      }
       if (response.status === 409 && routeBody?.errorCode === "scheduled_pipeline_turn_stale") {
         gateDiagnostics = await readGateFailureDiagnostics(fixture, body, request.signal.aborted, response.status)
       }
@@ -274,6 +298,7 @@ async function setupFetcher(fixture: Fixture) {
     fetcher,
     gateCalls: () => gates,
     gateDiagnostics: () => gateDiagnostics,
+    gateHttpFailures: () => [...gateHttpFailures],
     executeCalls: () => executes,
     firstExecuteRequest: () => firstExecuteRequest,
     replayedExecuteRequest: () => replayedExecuteRequest,
@@ -789,6 +814,12 @@ function debugSafeInteger(value: unknown): number | null {
 function debugSafeEnum(value: unknown, allowed: readonly string[]): string | null {
   return typeof value === "string" ? allowed.includes(value) ? value : "other" : null
 }
+function diagnosticGateErrorCode(value: unknown): string | null {
+  return typeof value === "string" && diagnosticGateErrorCodes.has(value) ? value : null
+}
+function diagnosticWorkerErrorCode(value: unknown): string | null {
+  return typeof value === "string" && diagnosticWorkerErrorCodes.has(value) ? value : null
+}
 
 function assertExactExecuteResponse(value: ExecuteHttpResponse): void {
   expect(value.status).toBe(200)
@@ -825,9 +856,9 @@ async function findTaskId(taskType: string, rootTaskId: string): Promise<string>
   if (rows.rows.length !== 1) throw new Error(`scheduled Audit task identity invalid: ${taskType}`)
   return rows.rows[0]!.id
 }
-async function taskState(taskId: string): Promise<{ status: string; attemptCount: number; result: unknown }> {
-  const row = (await pool!.query<{ status: string; attemptCount: number; result: unknown }>(
-    `SELECT "status", "attemptCount", "result" FROM "sub_agent_tasks" WHERE "id"=$1`, [taskId])).rows[0]
+async function taskState(taskId: string): Promise<{ status: string; attemptCount: number; result: unknown; failureReason: string | null }> {
+  const row = (await pool!.query<{ status: string; attemptCount: number; result: unknown; failureReason: string | null }>(
+    `SELECT "status", "attemptCount", "result", "failureReason" FROM "sub_agent_tasks" WHERE "id"=$1`, [taskId])).rows[0]
   if (!row) throw new Error("scheduled Audit task missing")
   return row
 }
