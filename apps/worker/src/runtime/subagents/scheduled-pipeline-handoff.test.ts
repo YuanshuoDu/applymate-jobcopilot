@@ -111,6 +111,7 @@ describe("scheduled pipeline HTTP handoff", () => {
 
   it.each([
     {}, { ...report, failed: -1 }, { ...report, processed: Number.MAX_SAFE_INTEGER + 1 },
+    { ...report, queued: 1.5 }, { ...report, unexpected: 1 },
   ])("rejects an incomplete or unsafe completion report", async invalidReport => {
     await expect(postScheduledPipelineContinuation(input, new AbortController().signal,
       vi.fn<typeof fetch>(async () => reply(200, { status: "completed", report: invalidReport })))).rejects.toThrow("scheduled_pipeline_handoff_retryable")
@@ -172,7 +173,7 @@ describe("scheduled pipeline HTTP handoff", () => {
       return reply(200, { status: "completed", report })
     })
     await expect(postScheduledPipelineExecute({ ...input, ...prepared } as never, new AbortController().signal, fetcher))
-      .resolves.toEqual({ status: "completed" })
+      .resolves.toEqual({ status: "completed", report })
     await expect(postScheduledPipelineExecute({ ...input, ...prepared } as never, new AbortController().signal,
       vi.fn<typeof fetch>(async () => reply(202, { status: "waiting_for_user", waitId: "agent-question:turn-1:canonical:q1" }))))
       .resolves.toEqual({ status: "waiting_for_user", waitId: "agent-question:turn-1:canonical:q1" })
@@ -188,6 +189,16 @@ describe("scheduled pipeline HTTP handoff", () => {
     }
     await expect(postScheduledPipelineExecute({ ...input, ...prepared, scheduledWaitId: " " } as never,
       new AbortController().signal, fetcher)).rejects.toThrow("scheduled_pipeline_handoff_input_invalid")
+  })
+
+  it.each([
+    { ...report, extra: true }, { ...report, processed: -1 }, { ...report, queued: 1.25 },
+    { ...report, durationMs: Number.MAX_SAFE_INTEGER + 1 },
+  ])("does not return a report unless every exact field is a safe non-negative integer", async invalidReport => {
+    const prepared = { prepareProof: { result: {} }, gateCompletionProof: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1" } } as const
+    const fetcher = vi.fn<typeof fetch>(async () => reply(200, { status: "completed", report: invalidReport }))
+    await expect(postScheduledPipelineExecute({ ...input, ...prepared } as never, new AbortController().signal, fetcher))
+      .rejects.toThrow("scheduled_pipeline_handoff_retryable")
   })
 
   it("posts only the fixed child fence and projected current/prior Gate choices", async () => {

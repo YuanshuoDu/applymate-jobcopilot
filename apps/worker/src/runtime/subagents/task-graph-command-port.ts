@@ -21,6 +21,7 @@ import type { TaskGraphStructuredOutputFailureCategory } from "./task-graph-stru
 import type { DiscoveryAttemptHealth } from "./child-discovery-attempt.js"
 import type { TaskGraphHistoricalDiscoveryPage, TaskGraphHistoricalDiscoveryPageRequest } from "./task-graph-historical-discovery-page-contract.js"
 import type { TaskGraphSourceCheckpoint, TaskGraphSourceIntentNode } from "./task-graph-pg-source-provenance.js"
+import type { TaskGraphScheduledAuditInput, TaskGraphScheduledAuditCompletionInput, TaskGraphScheduledAuditInvocationInput, ScheduledAuditAppendReceipt, ScheduledAuditCompletionProof, ScheduledAuditInvocationProof } from "./scheduled-audit-contract.js"
 import type {
   ScheduledAnalyzeCheckpointHandoff,
   ScheduledGateCompletionProof,
@@ -275,6 +276,10 @@ export type TaskGraphCommandPort = Readonly<{
   resumeScheduledGateChoice?(input: TaskGraphScheduledGateResumeInput): Promise<TaskGraphScheduledGateResumeReceipt>
   /** Re-loads strict Gate result/history and returns proof only after canonical completion validation. */
   verifyScheduledGateCompletion?(input: TaskGraphScheduledGateCompletionInput): Promise<ScheduledGateCompletionProof | null>
+  /** Server-only fixed Audit registration and owner-fenced completion proof. */
+  appendScheduledAudit?(input: TaskGraphScheduledAuditInput): Promise<ScheduledAuditAppendReceipt>
+  verifyScheduledAuditCompletion?(input: TaskGraphScheduledAuditCompletionInput): Promise<ScheduledAuditCompletionProof | null>
+  readScheduledAuditInvocationProof?(input: TaskGraphScheduledAuditInvocationInput): Promise<ScheduledAuditInvocationProof | null>
   appendAndScheduleWithReconciliation?(input: TaskGraphScheduleInput, operation: import("./steering-reconciliation-contract.js").SteeringReconciliationOperation): Promise<TaskGraphScheduleReceipt>
   reconcileSteering?(operation: import("./steering-reconciliation-contract.js").SteeringReconciliationOperation): Promise<TaskGraphKeepReconciliationReceipt>
   /** Native root coordination is optional for legacy ports; production callers must fail closed if absent. */

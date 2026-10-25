@@ -5,6 +5,64 @@ import { emptyReport } from './types'
 import type { PipelineExecuteAuditInput, PipelineExecuteAuditResult, PipelineStageRuntimeContext } from './pipeline-context'
 import type { ExecuteOutput, RunReport } from './types'
 
+const SCHEDULED_CONTINUATION_SCHEMA = 'agent-harness.v2.scheduled-pipeline-continuation.v1'
+const SCHEDULED_CLAIM_SCHEMA = 'agent-harness.v2.scheduled-pipeline-claim.v1'
+const SCHEDULED_KEY = /^scheduled-taskgraph:sha256:[a-f0-9]{64}$/
+const SNAPSHOT_DIGEST = /^sha256:[a-f0-9]{64}$/
+const HEX_DIGEST = /^[a-f0-9]{64}$/
+const OWNER_KEYS = ['userId', 'sessionId', 'turnId', 'rootTaskId', 'rootAttemptCount', 'turnLeaseOwnerId', 'turnLeaseVersion', 'executionId', 'executionAttemptCount']
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
+}
+
+function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  return Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key))
+}
+
+function validId(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= 256 && value.trim() === value
+}
+
+function positiveSafeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) > 0
+}
+
+function scheduledTaskGraphOwnerIsValidated(runtime: PipelineStageRuntimeContext): boolean {
+  const fence = runtime.ctx.scheduledTaskGraphOwnerFence
+  const owner = record(fence?.owner)
+  const state = record(runtime.getState())
+  const continuation = record(state?.scheduledTaskGraphContinuation)
+  const continuationOwner = record(continuation?.owner)
+  const claim = record(state?.scheduledTaskGraphClaim)
+  const claimOwner = record(claim?.owner)
+  const ownerMatches = (value: Record<string, unknown> | null): boolean => Boolean(value
+    && exactKeys(value, OWNER_KEYS)
+    && OWNER_KEYS.every(key => value[key] === owner?.[key]))
+  if (!fence || !owner || !state || !continuation || !continuationOwner || !claim || !claimOwner
+    || !exactKeys(owner, OWNER_KEYS) || !ownerMatches(continuationOwner) || !ownerMatches(claimOwner)
+    || owner.userId !== runtime.ctx.userId || owner.sessionId !== runtime.ctx.sessionId || owner.turnId !== runtime.ctx.turnId
+    || owner.executionId !== runtime.ctx.executionAttempt?.id || owner.executionAttemptCount !== runtime.ctx.executionAttempt?.attemptCount
+    || ![owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.turnLeaseOwnerId, owner.executionId].every(validId)
+    || !positiveSafeInteger(owner.rootAttemptCount) || !positiveSafeInteger(owner.turnLeaseVersion)
+    || !Number.isSafeInteger(owner.executionAttemptCount) || Number(owner.executionAttemptCount) < 0
+    || !exactKeys(continuation, ['schemaVersion', 'key', 'owner', 'snapshotDigest', 'graphRevision', 'evidenceDigest'])
+    || continuation.schemaVersion !== SCHEDULED_CONTINUATION_SCHEMA || continuation.key !== fence.key
+    || typeof continuation.key !== 'string' || !SCHEDULED_KEY.test(continuation.key)
+    || typeof continuation.snapshotDigest !== 'string' || !SNAPSHOT_DIGEST.test(continuation.snapshotDigest)
+    || !positiveSafeInteger(continuation.graphRevision)
+    || typeof continuation.evidenceDigest !== 'string' || !HEX_DIGEST.test(continuation.evidenceDigest)
+    || !exactKeys(claim, ['schemaVersion', 'key', 'claimToken', 'owner', 'claimedAt', 'leaseExpiresAt'])
+    || claim.schemaVersion !== SCHEDULED_CLAIM_SCHEMA || claim.key !== fence.key || claim.claimToken !== fence.claimToken
+    || !validId(claim.claimToken) || !validTimestamp(claim.claimedAt) || !validTimestamp(claim.leaseExpiresAt)
+    || Date.parse(claim.leaseExpiresAt) <= Date.parse(claim.claimedAt)) return false
+  return typeof fence.assertCurrent === 'function'
+}
+
+function validTimestamp(value: unknown): value is string {
+  return typeof value === 'string' && Number.isFinite(Date.parse(value))
+}
+
 export async function runExecuteAuditStages(
   runtime: PipelineStageRuntimeContext,
   input: PipelineExecuteAuditInput,
@@ -120,22 +178,26 @@ export async function runExecuteAuditStages(
     const customSummary = summarizeCustomAgentResults(runtime.getCustomAgentResults())
     if (customSummary.length > 0) emit('custom_agent_summary', { findings: customSummary })
 
-    const postRunAvg = scoredJobs.length
-      ? Math.round(scoredJobs.reduce((sum, job) => sum + job.score, 0) / scoredJobs.length)
-      : 0
-    const decPost = await orch.evaluate('post-run',
-      `Complete: ${report.processed} processed, ${report.queued} dispatched, ${report.applied} confirmed submitted, ${report.pending} pending review, ${report.skipped} skipped, avg score ${postRunAvg}%`,
-      { processed: report.processed, queued: report.queued, applied: report.applied, pending: report.pending, skipped: report.skipped, avgScore: postRunAvg, threshold: ctx.agentCfg.minMatchScore, autoApply: ctx.agentCfg.autoApply },
-    )
-    await runtime.assertAlive()
-    if (decPost.decision === 'ask_user' && decPost.ask_question) {
-      const options = decPost.ask_options ?? [{ label: '✓ learn', value: 'ok' }]
-      const answer = await orch.ask('post-run', decPost.ask_question, options)
+    if (scheduledTaskGraphOwnerIsValidated(runtime)) {
       await runtime.assertAlive()
-      await orch.applyOptionAction(answer, options)
+    } else {
+      const postRunAvg = scoredJobs.length
+        ? Math.round(scoredJobs.reduce((sum, job) => sum + job.score, 0) / scoredJobs.length)
+        : 0
+      const decPost = await orch.evaluate('post-run',
+        `Complete: ${report.processed} processed, ${report.queued} dispatched, ${report.applied} confirmed submitted, ${report.pending} pending review, ${report.skipped} skipped, avg score ${postRunAvg}%`,
+        { processed: report.processed, queued: report.queued, applied: report.applied, pending: report.pending, skipped: report.skipped, avgScore: postRunAvg, threshold: ctx.agentCfg.minMatchScore, autoApply: ctx.agentCfg.autoApply },
+      )
       await runtime.assertAlive()
+      if (decPost.decision === 'ask_user' && decPost.ask_question) {
+        const options = decPost.ask_options ?? [{ label: '✓ learn', value: 'ok' }]
+        const answer = await orch.ask('post-run', decPost.ask_question, options)
+        await runtime.assertAlive()
+        await orch.applyOptionAction(answer, options)
+        await runtime.assertAlive()
+      }
+      if (decPost.decision === 'retry' && decPost.retry_fix) orch.applyFix(decPost.retry_fix, 'post-run')
     }
-    if (decPost.decision === 'retry' && decPost.retry_fix) orch.applyFix(decPost.retry_fix, 'post-run')
 
     await runtime.assertAlive()
     orch.complete({

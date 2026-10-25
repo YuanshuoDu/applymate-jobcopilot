@@ -33,6 +33,7 @@ import { createScheduledPrepareReferenceResolver } from "./child-scheduled-prepa
 import { createPrivateSelectedJobToolExecutor, registerProductionChildWaitTool } from "./production-child-tools.js"
 import { createScheduledGateChildExecutor, isScheduledGateTask } from "./scheduled-gate-child-runtime.js"
 import { SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
+import { createScheduledAuditChildExecutor, isScheduledAuditCandidate } from "./scheduled-audit-child-runtime.js"
 export { createProductionChildPolicy } from "./production-child-policy.js"
 
 export type ProductionChildRuntimeOptions = {
@@ -53,13 +54,11 @@ type WriterReviewRevision = Readonly<{
   context: ArtifactToolRevisionContext
   feedback: TaskGraphWriterReviewFeedbackFrame
 }>
-
 type ScheduledPrepareRuntimeOptions = Readonly<{
   authorizeUsage: ChildExecutorOptions["authorizeUsage"]
   treeBudget: TreeBudgetReservationStore
   modelRuntimeFactory?: ChildExecutorOptions["modelRuntimeFactory"]
 }>
-
 function configWithSnapshot(config: AiConfig, snapshot: unknown): AiConfig {
   const value = record(snapshot)
   return {
@@ -68,13 +67,11 @@ function configWithSnapshot(config: AiConfig, snapshot: unknown): AiConfig {
     ...(typeof value.model === "string" && value.model.trim() ? { model: value.model } : {}),
   }
 }
-
 async function resolveScheduledPrepareModel(task: SubagentTaskRecord, factory: ChildExecutorOptions["modelRuntimeFactory"]): Promise<ModelAdapter> {
   if (factory) return factory({ task })
   const primary = configWithSnapshot(await loadWorkerAiConfig(task.userId), task.modelProfileSnapshot)
   return (await createHarnessModelRuntime({ primary, fallbacks: [], allowEnvironmentFallbacks: false })).adapter
 }
-
 function artifactTaskFence(lease: SubagentLease): AgentArtifactTaskFence {
   if (!lease.turnId || lease.status !== "running" || lease.interruptRequestedAt !== null
     || !lease.ownerId.trim() || lease.leaseOwner !== lease.ownerId || !Number.isSafeInteger(lease.attemptCount) || lease.attemptCount < 1
@@ -86,7 +83,6 @@ function artifactTaskFence(lease: SubagentLease): AgentArtifactTaskFence {
     rootTaskId: lease.rootTaskId, parentTaskId: lease.parentTaskId, leaseOwner: lease.ownerId, attemptCount: lease.attemptCount,
   }
 }
-
 function selectedJobId(task: SubagentTaskRecord): string | undefined {
   const selection = record(record(task.context).selectedJobPreparation)
   return Object.keys(selection).sort().join(",") === "jobId"
@@ -94,7 +90,6 @@ function selectedJobId(task: SubagentTaskRecord): string | undefined {
     ? selection.jobId
     : undefined
 }
-
 function bindStore(store: TurnEngineStore): TurnExecutionStore {
   return {
     startStep: input => store.startStep({ ...withoutIdentity(input), owner: input.identity }),
@@ -105,7 +100,6 @@ function bindStore(store: TurnEngineStore): TurnExecutionStore {
     appendEvents: store.appendEvents ? (inputs) => store.appendEvents!(inputs.map(input => ({ ...withoutIdentity(input), owner: input.identity }))) : undefined,
   }
 }
-
 function withoutIdentity<T extends { identity: ExecutionOwnerFence }>(input: T): Omit<T, "identity"> {
   const { identity: _identity, ...rest } = input
   return rest
@@ -218,9 +212,9 @@ function defaultSameAttemptContinuationLoader(pool: pg.Pool): ChildExecutorOptio
 }
 /** Build the production child seam only when the explicit feature flag is on. */
 export function createProductionChildExecutor(options: ProductionChildRuntimeOptions): SubagentExecutor {
-  let genericExecutor: SubagentExecutor | undefined
-  let gateExecutor: SubagentExecutor | undefined
+  let genericExecutor: SubagentExecutor | undefined, gateExecutor: SubagentExecutor | undefined
   return async ({ lease, continuation }) => {
+    if (isScheduledAuditCandidate(lease)) return createScheduledAuditChildExecutor({ pool: options.pool })({ lease, ...(continuation ? { continuation } : {}) })
     if (lease.taskType === SCHEDULED_GATE_TASK_TYPE) {
       if (!isScheduledGateTask(lease)) return { status: "failed", failureReason: "scheduled_gate_role_task_type_mismatch", retryDisposition: "terminal" }
       gateExecutor ??= createScheduledGateChildExecutor({ pool: options.pool })

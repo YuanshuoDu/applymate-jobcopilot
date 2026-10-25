@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto"
+import { parseScheduledAuditReport, type ScheduledAuditReport } from "./scheduled-audit-contract.js"
 import type { ScheduledAutomationPipelineAttestation, ScheduledAutomationPipelineBridgeScope } from "./scheduled-automation-pipeline-bridge.js"
 import { parseScheduledGateResult, scheduledGatePreparedJobIds, type ScheduledGateChoiceId, type ScheduledGateCompletionProof,
   type ScheduledGateQuestionKind, type ScheduledGateResult } from "./scheduled-gate-contract.js"
@@ -25,7 +26,7 @@ export type ScheduledPipelineHandoff =
 type AnalyzeHandoffInput = { owner: ScheduledAutomationPipelineBridgeScope; attestation: ScheduledAutomationPipelineAttestation }
 type PrepareHandoffInput = AnalyzeHandoffInput & { prepareProof: unknown; scheduledWaitId?: string }
 type HandoffInput = AnalyzeHandoffInput | PrepareHandoffInput
-export type ScheduledPipelineExecuteResult = Readonly<{ status: "completed" }>
+export type ScheduledPipelineExecuteResult = Readonly<{ status: "completed"; report: ScheduledAuditReport }>
   | Readonly<{ status: "waiting_for_user"; waitId: string }>
 export type ScheduledPipelineGateChoice = Readonly<{ kind: ScheduledGateQuestionKind; jobIds: readonly string[]; choiceId: ScheduledGateChoiceId }>
 export type ScheduledPipelineGateInput = Readonly<{
@@ -55,7 +56,7 @@ export async function postScheduledPipelineContinuation(input: HandoffInput, sig
   const response = await fetcher(url.toString(), { method: "POST", headers: { "content-type": "application/json", "x-agent-worker-secret": secret }, body: JSON.stringify(input), cache: "no-store", redirect: "error", signal })
   let payload: Record<string, unknown>
   try { payload = record(await response.json()) } catch { throw new Error("scheduled_pipeline_handoff_response_invalid") }
-  if (response.status === 200 && payload.status === "completed" && validReport(payload.report)) {
+  if (response.status === 200 && payload.status === "completed" && parseScheduledAuditReport(payload.report)) {
     // The Prepare handoff must stop at the durable Gate checkpoint. Treating a
     // legacy completed report as success here would skip the fixed Gate task.
     if ("prepareProof" in input) return { status: "blocked", errorCode: "scheduled_pipeline_gate_checkpoint_missing" }
@@ -102,8 +103,9 @@ export async function postScheduledPipelineExecute(input: Readonly<{
     body: JSON.stringify(body), cache: "no-store", redirect: "error", signal })
   let payload: Record<string, unknown>
   try { payload = record(await response.json()) } catch { throw new Error("scheduled_pipeline_handoff_response_invalid") }
-  if (response.status === 200 && payload.status === "completed" && Object.keys(payload).sort().join(",") === "report,status" && validReport(payload.report)) {
-    return { status: "completed" }
+  const report = parseScheduledAuditReport(payload.report)
+  if (response.status === 200 && payload.status === "completed" && Object.keys(payload).sort().join(",") === "report,status" && report) {
+    return { status: "completed", report }
   }
   if (response.status === 202 && payload.status === "waiting_for_user"
     && Object.keys(payload).sort().join(",") === "status,waitId" && validWaitId(payload.waitId)) {
@@ -168,11 +170,6 @@ function projectGateChoice(value: ScheduledPipelineGateChoice, expectedJobIds: r
 function scheduledWaitEchoMatches(input: HandoffInput, payload: Record<string, unknown>): boolean {
   if (!("prepareProof" in input)) return true
   return input.scheduledWaitId === undefined ? !Object.hasOwn(payload, "scheduledWaitId") : payload.scheduledWaitId === input.scheduledWaitId
-}
-
-function validReport(value: unknown): boolean {
-  const report = record(value)
-  return ["processed", "applied", "queued", "pending", "skipped", "failed", "durationMs"].every(key => Number.isSafeInteger(report[key]) && Number(report[key]) >= 0)
 }
 
 function validWaitId(value: unknown): value is string {

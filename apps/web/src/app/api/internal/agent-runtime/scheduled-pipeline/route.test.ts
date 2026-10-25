@@ -83,6 +83,12 @@ function request(body: unknown = { owner, attestation }) {
     body: JSON.stringify(body),
   });
 }
+function executeBody(scheduledWaitId: string) {
+  const prepareProof = { receipt: { schemaVersion: "receipt" }, completion: { schemaVersion: "completion" }, result: { role: "prepare" } };
+  const gateCompletionProof = { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1", graphRevision: 1,
+    prepareProof, gate: { taskId: "gate-1", attemptCount: 1, resultDigest: `sha256:${"b".repeat(64)}`, completedEventRevision: 1 } };
+  return { action: "execute", owner, attestation, prepareProof, scheduledWaitId, gateCompletionProof };
+}
 function waitingState(previousOwner = fullOwner, previousKey = key) {
   return { nextStage: "prepare", scoutedJobs: [{ id: "job-1", userId: owner.userId }], scoredJobs: [scoredJobRow()], analysisFailed: 0,
     scheduledTaskGraphClaim: { schemaVersion: "agent-harness.v2.scheduled-pipeline-claim.v1", key: previousKey,
@@ -213,6 +219,38 @@ describe("scheduled pipeline continuation route", () => {
     expect(await response.json()).toEqual({ status: "completed", report });
     expect(mocks.validatePrepareWait).toHaveBeenCalledWith({ owner: fullOwner, snapshot, proof: prepareProof });
     expect(mocks.runPipeline.mock.calls[0]?.[0]?.scheduledTaskGraph).not.toHaveProperty("scheduledWaitId");
+  });
+
+  it("returns the exact completed response envelope for an approval-required Execute", async () => {
+    const scheduledWaitId = `agent-question:${owner.turnId}:canonical:${"a".repeat(64)}`;
+    const executeRequest = executeBody(scheduledWaitId);
+    mocks.execution.mockResolvedValueOnce({ ...initialExecution,
+      state: { ...initialExecution.state, scheduledTaskGraphScheduledWaitId: scheduledWaitId } });
+    mocks.gateAction.mockResolvedValueOnce({ kind: "execute", request: executeRequest });
+    const { POST } = await import("./route");
+
+    const response = await POST(request(executeRequest));
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body).toEqual({ status: "completed", report });
+    expect(Object.keys(body).sort()).toEqual(["report", "status"]);
+  });
+
+  it("passes a verified completed replay through without repeating route work", async () => {
+    const body = executeBody(`agent-question:${owner.turnId}:canonical:${"a".repeat(64)}`);
+    const replay = Response.json({ status: "completed", report });
+    mocks.gateAction.mockResolvedValueOnce(replay);
+    const { POST } = await import("./route");
+
+    const response = await POST(request(body));
+
+    expect(response).toBe(replay);
+    expect(await response.json()).toEqual({ status: "completed", report });
+    expect(mocks.turn).not.toHaveBeenCalled();
+    expect(mocks.execution).not.toHaveBeenCalled();
+    expect(mocks.claim).not.toHaveBeenCalled();
+    expect(mocks.runPipeline).not.toHaveBeenCalled();
   });
 
   it("replays a completed approval-free Prepare proof without a saved choice ID", async () => {

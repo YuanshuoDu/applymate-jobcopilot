@@ -24,6 +24,7 @@ function validId(value: unknown): value is string { return typeof value === "str
 function safeCount(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 0; }
 function json(status: number, value: unknown, scheduledWaitId?: string): Response { const row = record(value); return Response.json(scheduledWaitId && row ? { ...row, scheduledWaitId } : value, { status }); }
 function blocked(status: number, errorCode: string): Response { return json(status, { status: "blocked", errorCode }); }
+function completedResponse(report: unknown, waitId: string | undefined, action: string): Response { return json(200, { status: "completed", report }, action === "execute" ? undefined : waitId); }
 function candidates(value: unknown): string[] | null {
   const scout = record(record(value)?.scout), ids = scout?.candidateJobIds;
   return Array.isArray(ids) && ids.every(validId) && new Set(ids).size === ids.length ? [...ids] : null;
@@ -161,13 +162,13 @@ export async function POST(request: Request): Promise<Response> {
   if (body.prepareProof !== undefined && !await validateScheduledPrepareWaitIdentity({ owner: executionOwner, snapshot, proof: body.prepareProof, ...(body.scheduledWaitId ? { scheduledWaitId: body.scheduledWaitId } : {}) }).catch(() => false)) return blocked(409, "scheduled_pipeline_claim_conflict");
   const report = completedScheduledTaskGraphReport({ execution, key, owner: executionOwner, snapshot, attestation, ownedJobs: jobs });
   if (report) return await completedReportLeaseIsCurrent(owner)
-    ? json(200, { status: "completed", report }, responseWaitId) : blocked(409, "scheduled_pipeline_turn_stale");
+    ? completedResponse(report, responseWaitId, parsed.action) : blocked(409, "scheduled_pipeline_turn_stale");
   if (execution.status === "completed") {
     const prior = priorScheduledTaskGraphContinuation({ state: execution.state, owner: executionOwner, snapshot, attestation, ownedJobs: jobs });
     const replay = prior && completedScheduledTaskGraphReport({ execution, key: prior.key, owner: prior.owner, snapshot, attestation,
       ownedJobs: jobs, checkpointValidatedByPrior: true });
     const currentTurn = replay ? await readTurnLease(owner) : null;
-    if (replay && currentTurn && leaseIsCurrent(currentTurn, owner)) return json(200, { status: "completed", report: replay }, responseWaitId);
+    if (replay && currentTurn && leaseIsCurrent(currentTurn, owner)) return completedResponse(replay, responseWaitId, parsed.action);
     return blocked(409, "scheduled_pipeline_execution_mismatch");
   }
   const wait = readScheduledTaskGraphWaitMarker(state);
@@ -258,13 +259,13 @@ export async function POST(request: Request): Promise<Response> {
   if (claimed.count !== 1) {
     const latest = await loadExecution(owner);
     const exactReport = latest && completedScheduledTaskGraphReport({ execution: latest, key, owner: executionOwner, snapshot, attestation, ownedJobs: jobs });
-    if (exactReport && await completedReportLeaseIsCurrent(owner)) return json(200, { status: "completed", report: exactReport }, responseWaitId);
+    if (exactReport && await completedReportLeaseIsCurrent(owner)) return completedResponse(exactReport, responseWaitId, parsed.action);
     const prior = latest && priorScheduledTaskGraphContinuation({ state: latest.state, owner: executionOwner, snapshot, attestation, ownedJobs: jobs });
     const priorReport = latest && prior && completedScheduledTaskGraphReport({ execution: latest, key: prior.key, owner: prior.owner,
       snapshot, attestation, ownedJobs: jobs, checkpointValidatedByPrior: true });
     if (priorReport) {
       const currentTurn = await readTurnLease(owner).catch(() => null);
-      if (currentTurn && leaseIsCurrent(currentTurn, owner)) return json(200, { status: "completed", report: priorReport }, responseWaitId);
+      if (currentTurn && leaseIsCurrent(currentTurn, owner)) return completedResponse(priorReport, responseWaitId, parsed.action);
     }
     if (latest && sameClaim(latest.state, key, executionOwner)) { const latestWaitId = record(latest.state)?.scheduledTaskGraphScheduledWaitId; return latestWaitId !== undefined && (!isScheduledPrepareChoiceWaitId(owner.turnId, latestWaitId) || body.scheduledWaitId !== undefined && body.scheduledWaitId !== latestWaitId) ? blocked(409, "scheduled_pipeline_claim_conflict") : json(202, { status: "accepted", duplicate: true }, typeof latestWaitId === "string" ? latestWaitId : body.scheduledWaitId); }
     return blocked(409, "scheduled_pipeline_claim_conflict");
@@ -288,7 +289,7 @@ export async function POST(request: Request): Promise<Response> {
     }
     if ("status" in result && result.status === "analyze_checkpointed") return json(200, result, responseWaitId);
     if ("status" in result && result.status === "gate_checkpointed") return json(200, result);
-    return json(200, { status: "completed", report: result }, responseWaitId);
+    return completedResponse(result, responseWaitId, parsed.action);
   } catch { return blocked(500, "scheduled_pipeline_execution_failed"); }
 }
 

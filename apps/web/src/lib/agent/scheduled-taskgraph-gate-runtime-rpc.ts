@@ -16,6 +16,7 @@ import { parseScheduledAutomationSnapshot } from './scheduled-automation-snapsho
 import { scheduledAutomationSnapshotDigest, scheduledTaskGraphContinuationKey,
   type ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 import { scheduledTaskGraphClaimMatches } from './scheduled-taskgraph-pipeline-fence'
+import { replayCompletedScheduledTaskGraphReport } from './scheduled-taskgraph-completed-report-replay'
 import { runScheduledGate } from './stages/gate'
 import { executeScheduledTaskGraphGate } from './scheduled-taskgraph-gate-service'
 import { scheduledTaskGraphExecuteGateCompletionProof,
@@ -100,6 +101,8 @@ async function runGateAction(request: ScheduledTaskGraphGateRpcRequest, signal?:
 async function authorizeExecute(request: ScheduledTaskGraphExecuteRpcRequest, signal?: AbortSignal): Promise<Response | ExecuteContinuation> {
   const proof = scheduledTaskGraphExecuteGateCompletionProof(request.gateCompletionProof), gate = record(proof?.gate)
   if (!proof || !gate || !sameJson(proof.prepareProof, request.prepareProof)) return blocked(409, 'scheduled_pipeline_gate_proof_invalid')
+  const replay = await replayCompletedScheduledTaskGraphReport(request, { taskId: String(gate.taskId), attemptCount: Number(gate.attemptCount) }, signal)
+  if (replay) return replay
   const locked = await db.$transaction(tx => lockOwner(tx, request, signal, false, {
     taskId: String(gate.taskId), attemptCount: Number(gate.attemptCount), completionProof: request.gateCompletionProof }))
   if (!locked) return blocked(409, 'scheduled_pipeline_gate_proof_invalid')

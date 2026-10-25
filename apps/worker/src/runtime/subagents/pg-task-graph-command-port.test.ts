@@ -16,7 +16,7 @@ import type { TaskGraphNodeProposal } from "../planning/task-graph.js"
 
 const reconciliationMocks = vi.hoisted(() => ({
   prepare: vi.fn(), write: vi.fn(), create: vi.fn(), writePlan: vi.fn(), writePlanIdentity: vi.fn(), writeLifecycleIdentity: vi.fn(), assertNoUnresolvedSteering: vi.fn(),
-  scheduledPrepare: vi.fn(),
+  scheduledPrepare: vi.fn(), scheduledAuditAppend: vi.fn(), scheduledAuditCompletion: vi.fn(), scheduledAuditInvocation: vi.fn(), scheduledGateVerification: vi.fn(),
 }))
 vi.mock("./steering-reconciliation-ledger.js", () => ({
   prepareSteeringReconciliation: reconciliationMocks.prepare,
@@ -25,6 +25,10 @@ vi.mock("./steering-reconciliation-ledger.js", () => ({
 }))
 vi.mock("./task-graph-pg-create.js", () => ({ createGraphTasks: reconciliationMocks.create }))
 vi.mock("./pg-scheduled-task-graph-prepare-command.js", () => ({ appendScheduledPrepare: reconciliationMocks.scheduledPrepare }))
+vi.mock("./pg-scheduled-task-graph-audit-command.js", () => ({ appendScheduledAudit: reconciliationMocks.scheduledAuditAppend,
+  verifyScheduledAuditCompletion: reconciliationMocks.scheduledAuditCompletion,
+  readScheduledAuditInvocationProof: reconciliationMocks.scheduledAuditInvocation,
+  verifyScheduledGateCompletionWithAuditReplay: reconciliationMocks.scheduledGateVerification }))
 vi.mock("./task-graph-pg-events.js", async importOriginal => {
   const actual = await importOriginal<typeof import("./task-graph-pg-events.js")>()
   return { ...actual, appendTaskGraphReceipt: vi.fn(async () => undefined), writeTaskGraphSnapshot: vi.fn(async () => undefined),
@@ -296,6 +300,47 @@ function invalidSelectorProposal(kind: "unknown" | "indirect" | "wrong-template"
 
 describe("createPgTaskGraphCommandPort", () => {
   beforeEach(() => { vi.clearAllMocks() })
+  it("routes the fixed Audit append and proof reads through owner-scoped transactions", async () => {
+    const fake = fakePool(scheduleInput()), input = {} as never
+    reconciliationMocks.scheduledAuditAppend.mockResolvedValue({ status: "accepted", revision: 13, nodes: [],
+      readyTaskIds: ["audit-task"], auditTaskId: "audit-task", expectedAttemptCount: 1 })
+    reconciliationMocks.scheduledAuditCompletion.mockResolvedValue({ report: { processed: 0 } })
+    reconciliationMocks.scheduledAuditInvocation.mockResolvedValue({ auditTaskId: "audit-task", attemptCount: 1 })
+    const port = createPgTaskGraphCommandPort(fake.pool)
+
+    await expect(port.appendScheduledAudit!(input)).resolves.toMatchObject({ auditTaskId: "audit-task", expectedAttemptCount: 1 })
+    await expect(port.verifyScheduledAuditCompletion!(input)).resolves.toMatchObject({ report: { processed: 0 } })
+    await expect(port.readScheduledAuditInvocationProof!(input)).resolves.toMatchObject({ auditTaskId: "audit-task" })
+    expect(reconciliationMocks.scheduledAuditAppend).toHaveBeenCalledWith(fake.client, input)
+    expect(reconciliationMocks.scheduledAuditCompletion).toHaveBeenCalledWith(fake.client, input)
+    expect(reconciliationMocks.scheduledAuditInvocation).toHaveBeenCalledWith(fake.client, input)
+    expect(fake.calls.filter(call => call.sql === "BEGIN")).toHaveLength(3)
+    expect(fake.calls.filter(call => call.sql === "COMMIT")).toHaveLength(3)
+  })
+
+  it("routes Gate proof reads through the Audit-aware verifier in an owner-scoped transaction", async () => {
+    const fake = fakePool(scheduleInput()), input = {} as never
+    reconciliationMocks.scheduledGateVerification.mockResolvedValue({ graphRevision: 12 })
+    const port = createPgTaskGraphCommandPort(fake.pool)
+    await expect(port.verifyScheduledGateCompletion(input)).resolves.toEqual({ graphRevision: 12 })
+    expect(reconciliationMocks.scheduledGateVerification).toHaveBeenCalledWith(fake.client, input)
+    expect(fake.calls.filter(call => call.sql === "BEGIN")).toHaveLength(1)
+    expect(fake.calls.filter(call => call.sql === "COMMIT")).toHaveLength(1)
+  })
+
+  it("keeps the server-owned scheduled Audit node out of generic model proposals", async () => {
+    const base = scheduleInput()
+    const input = { ...base, proposal: { expectedRevision: 1, nodes: [{ key: "scheduled_audit", templateId: "scheduled_audit",
+      goal: "Audit", successCriteria: ["Report"], dependsOn: ["gate"] }] } } as unknown as TaskGraphScheduleInput
+    const fake = fakePool(input)
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndSchedule(input)).rejects.toMatchObject({
+      code: "scheduled_audit_private",
+    })
+    expect(fake.calls.map(call => call.sql)).toContain("ROLLBACK")
+    expect(reconciliationMocks.create).not.toHaveBeenCalled()
+    expect(reconciliationMocks.writePlan).not.toHaveBeenCalled()
+  })
+
   it("preserves the specialized scheduled Prepare choice receipt through the PostgreSQL transaction port", async () => {
     const fake = fakePool(scheduleInput())
     const input = {} as unknown as TaskGraphScheduledPrepareInput

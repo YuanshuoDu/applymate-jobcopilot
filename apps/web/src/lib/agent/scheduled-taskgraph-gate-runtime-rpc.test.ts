@@ -4,7 +4,7 @@ const mocks = vi.hoisted(() => ({
   transaction: vi.fn(), queryRaw: vi.fn(), jobs: vi.fn(), update: vi.fn(), turn: vi.fn(), config: vi.fn(), resume: vi.fn(),
   active: vi.fn(), feature: vi.fn(), access: vi.fn(), entitlement: vi.fn(), aiConfig: vi.fn(), roles: vi.fn(),
   isProof: vi.fn(), loadInput: vi.fn(), buildCheckpoint: vi.fn(), validateWait: vi.fn(), executeGate: vi.fn(),
-  policy: vi.fn(),
+  policy: vi.fn(), completedReplay: vi.fn(),
 }))
 
 vi.mock('@/lib/db', () => ({ db: {
@@ -26,6 +26,7 @@ vi.mock('./scheduled-taskgraph-gate-input', () => ({ isScheduledTaskGraphGatePro
 vi.mock('./scheduled-taskgraph-pipeline-checkpoint', () => ({ scheduledAutomationSnapshotDigest: vi.fn(() => 'sha256:snapshot'),
   scheduledTaskGraphContinuationKey: vi.fn(() => 'scheduled-taskgraph:key') }))
 vi.mock('./scheduled-taskgraph-run-service', () => ({ validateScheduledPrepareWaitIdentity: mocks.validateWait }))
+vi.mock('./scheduled-taskgraph-completed-report-replay', () => ({ replayCompletedScheduledTaskGraphReport: mocks.completedReplay }))
 vi.mock('./stages/gate', () => ({ runScheduledGate: mocks.policy }))
 vi.mock('./scheduled-taskgraph-gate-service', () => ({ executeScheduledTaskGraphGate: mocks.executeGate }))
 
@@ -87,6 +88,7 @@ beforeEach(() => {
   mocks.loadInput.mockResolvedValue(loaded)
   mocks.buildCheckpoint.mockReturnValue({ checkpoint: { nextStage: 'gate' }, packages: [] })
   mocks.validateWait.mockResolvedValue(true)
+  mocks.completedReplay.mockResolvedValue(null)
   mocks.executeGate.mockResolvedValue({ status: 'question_required', kind: 'weak_cover_letter', jobIds: ['job-1'],
     candidateSetDigest: `sha256:${'b'.repeat(64)}`, allowedChoiceIds: ['continue', 'review', 'skip'] })
   mocks.jobs.mockResolvedValue([job])
@@ -202,5 +204,19 @@ describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
     })
     const accepted = await runScheduledTaskGraphActionRpc(request)
     expect(accepted).toMatchObject({ kind: 'execute', request: { action: 'execute', gateCompletionProof: request.gateCompletionProof } })
+  })
+
+  it('returns a completed replay before the running-only Execute lock is attempted', async () => {
+    const response = Response.json({ status: 'completed', report: { processed: 1 } })
+    mocks.completedReplay.mockResolvedValueOnce(response)
+
+    const result = await runScheduledTaskGraphActionRpc(executeRequest())
+
+    expect(result).toBe(response)
+    expect(mocks.completedReplay).toHaveBeenCalledWith(expect.objectContaining({ action: 'execute' }),
+      { taskId: gateTask.id, attemptCount: 2 }, undefined)
+    expect(mocks.queryRaw).not.toHaveBeenCalled()
+    expect(mocks.update).not.toHaveBeenCalled()
+    expect(mocks.executeGate).not.toHaveBeenCalled()
   })
 })
