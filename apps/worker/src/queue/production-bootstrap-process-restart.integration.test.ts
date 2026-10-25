@@ -1719,7 +1719,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
       eventId: decision.id, idempotencyKey: decision.idempotencyKey, outcome: "allow",
       taskId: rootBefore?.rootTaskId, attemptCount: null,
     })
-    expect(before.tools).toMatchObject({ callCount: "1", resultCount: "0", completedCallCount: "0", completedRecoveryEventCount: "0" })
+    expect(before.tools).toMatchObject({ callCount: "1", resultCount: "0", completedCallCount: "0", recoveredTurnEventCount: "0", lifecycleCompletionEventCount: "0" })
     expect(workerOne.output.filter(line => line.startsWith(`POLICY_REPLAY_TOOL_EXECUTED ${toolCallId}`))).toHaveLength(0)
 
     if (!workerOne.pid) throw new Error("Policy decision Worker A has no PID at the restart boundary")
