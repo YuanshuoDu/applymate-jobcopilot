@@ -34,7 +34,8 @@ type GateHttpFailure = Readonly<{ status: number; errorCode: string | null; test
 }> }>
 type ExecuteHttpFailure = Readonly<{ status: number; errorCode: string | null; keys: readonly string[]; reportValid: boolean;
   executionStatus?: string | null; executionCheckpoint?: string | null; executionNextStage?: string | null;
-  hasExecutionError?: boolean; executionErrorCode?: string | null; pipelineOutcome?: string }>
+  hasExecutionError?: boolean; executionErrorCode?: string | null; pipelineOutcome?: string;
+  continuation?: Readonly<{ gateResume: string; serializedCheckpoint: string; checkpointSave: string }> }>
 type GateHistoryProbeRow = Readonly<{ actor: string | null; taskId: string | null; idempotencyKey: string | null; sequence: bigint; payload: unknown }>
 const diagnosticOutcomeStatuses = new Set(["completed", "retrying", "failed", "waiting", "waiting_for_user", "interrupted", "skipped", "lease_lost"])
 const diagnosticGateErrorCodes = new Set([
@@ -70,6 +71,8 @@ const diagnosticAuditFailureReasons = new Set([
 ])
 const scheduledPipelineRoutePath = "@/app/api/internal/agent-runtime/scheduled-pipeline/route"
 const scheduledRunServicePath = "@/lib/agent/run-service"
+const scheduledTaskGraphRunServicePath = "@/lib/agent/scheduled-taskgraph-run-service"
+const scheduledTaskGraphFencePath = "@/lib/agent/scheduled-taskgraph-pipeline-fence"
 const scheduledGateQualityReviewPath = "@/lib/agent/stages/gate-quality-review"
 const scheduledModelRouterPath = "@/lib/model-router"
 const scheduledEntitlementsPath = "@/lib/entitlements"
@@ -98,6 +101,8 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     vi.doUnmock(scheduledModelRouterPath)
     vi.doUnmock(scheduledEntitlementsPath)
     vi.doUnmock(scheduledRunServicePath)
+    vi.doUnmock(scheduledTaskGraphRunServicePath)
+    vi.doUnmock(scheduledTaskGraphFencePath)
     vi.resetModules()
   })
   afterAll(async () => {
@@ -289,6 +294,38 @@ async function setupFetcher(fixture: Fixture) {
   vi.doMock(scheduledEntitlementsPath, () => ({ isFeatureAllowed: async () => true,
     hasEffectiveEntitlement: async () => true, resolveAiAccess: async () => "available" }))
   let pipelineOutcome = "not_called"
+  let continuation = { gateResume: "not_called", serializedCheckpoint: "not_called", checkpointSave: "not_called" }
+  type ScheduledTaskGraphRunServiceProbe = {
+    buildScheduledTaskGraphGateResumeState(input: unknown): Promise<unknown>
+    serializeScheduledTaskGraphCheckpoint(value: unknown): unknown
+  }
+  const taskGraphRunService = await vi.importActual<ScheduledTaskGraphRunServiceProbe>(scheduledTaskGraphRunServicePath)
+  vi.doMock(scheduledTaskGraphRunServicePath, () => ({
+    ...taskGraphRunService,
+    buildScheduledTaskGraphGateResumeState: async (input: unknown) => {
+      try {
+        const result = await taskGraphRunService.buildScheduledTaskGraphGateResumeState(input)
+        continuation.gateResume = debugSafeEnum(debugRecord(result)?.nextStage, ["scout", "analyze", "prepare", "gate", "execute", "audit", "completed"]) ?? "invalid"
+        return result
+      } catch (error) { continuation.gateResume = "threw"; throw error }
+    },
+    serializeScheduledTaskGraphCheckpoint: (value: unknown) => {
+      const result = taskGraphRunService.serializeScheduledTaskGraphCheckpoint(value)
+      const stage = debugRecord(result)?.nextStage
+      continuation.serializedCheckpoint = result === null ? "rejected"
+        : debugSafeEnum(stage, ["scout", "analyze", "prepare", "gate", "execute", "audit", "completed"]) ?? "invalid"
+      return result
+    },
+  }))
+  type ScheduledTaskGraphFenceProbe = { saveScheduledTaskGraphCheckpoint(input: unknown): Promise<boolean> }
+  const taskGraphFence = await vi.importActual<ScheduledTaskGraphFenceProbe>(scheduledTaskGraphFencePath)
+  vi.doMock(scheduledTaskGraphFencePath, () => ({ ...taskGraphFence, saveScheduledTaskGraphCheckpoint: async (input: unknown) => {
+    try {
+      const saved = await taskGraphFence.saveScheduledTaskGraphCheckpoint(input)
+      continuation.checkpointSave = saved ? "saved" : "rejected"
+      return saved
+    } catch (error) { continuation.checkpointSave = "threw"; throw error }
+  } }))
   type RunServiceProbe = { runAgentPipeline(input: unknown): Promise<unknown> }
   const runService = await vi.importActual<RunServiceProbe>(scheduledRunServicePath)
   vi.doMock(scheduledRunServicePath, () => ({ ...runService, runAgentPipeline: async (input: unknown) => {
@@ -319,6 +356,10 @@ async function setupFetcher(fixture: Fixture) {
     const body = await request.clone().json() as Record<string, unknown>
     expect(request.method).toBe("POST")
     expect(request.headers.get("x-agent-worker-secret")).toBe("scheduled-audit-fixture-secret")
+    if (body.action === "execute") {
+      pipelineOutcome = "not_called"
+      continuation = { gateResume: "not_called", serializedCheckpoint: "not_called", checkpointSave: "not_called" }
+    }
     const response = await route.POST(request)
     if (body.action === "gate") {
       gates += 1
@@ -342,7 +383,7 @@ async function setupFetcher(fixture: Fixture) {
       const errorCode = typeof payload?.errorCode === "string" && diagnosticAuditFailureReasons.has(payload.errorCode)
         ? payload.errorCode : null
       const execution = await readExecutionFailureDiagnostic(fixture)
-      executeHttpFailures.push({ status: response.status, errorCode, keys, reportValid, pipelineOutcome, ...execution })
+      executeHttpFailures.push({ status: response.status, errorCode, keys, reportValid, pipelineOutcome, continuation: { ...continuation }, ...execution })
       return response
     }
     expect(body).toMatchObject({ owner: fixture.owner, attestation: fixture.attestation, prepareProof: fixture.prepareProof,
