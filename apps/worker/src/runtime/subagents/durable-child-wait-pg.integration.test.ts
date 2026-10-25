@@ -476,6 +476,8 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         `SELECT "status", "result" FROM "agent_wait_conditions" WHERE "parentTaskId" = $1 AND "sessionId" = $2`, [waiter.id, ids.sessionId])
       expect(staleProjection.rows[0]).toMatchObject({ status: "ready", result: { outcome: { status: "waiting" } } })
 
+      queuePaused = true
+      await queue.pause()
       workerC = launchWorker("worker-b-crash-resume", queueName, ids)
       await waitForMarker(workerC, "WORKER_B_RECOVERED")
       const recoveryDiagnostic = workerC.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_RECOVERY_DIAGNOSTIC "))
@@ -528,6 +530,9 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       const resumeJob = await queue.getJob(subagentDispatchJobId(waiter.id, generation))
       expect(resumeJob).toBeDefined()
 
+      expect(workerC.stdoutText).not.toContain("WORKER_B_RESUME_STEP_STARTED")
+      await queue.resume()
+      queuePaused = false
       await waitForMarker(workerC, "WORKER_B_RESUME_STEP_STARTED")
       const secondCut = await pool.query<{ taskStatus: string; attemptCount: number; leaseOwner: string | null; leaseExpiresAt: Date | null;
         stepOrdinal: number; stepStatus: string; consumedAt: Date | null; callStatus: string; settledCount: number }>(
