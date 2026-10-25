@@ -37,6 +37,8 @@ type ExecuteHttpFailure = Readonly<{ status: number; errorCode: string | null; k
   hasExecutionError?: boolean; executionErrorCode?: string | null; pipelineOutcome?: string;
   continuation?: Readonly<{ gateResume: string; analyzeCheckpoint: string; continuationKey: string; waitBinding: string;
     ownerCurrentRecheck: string; prepareWait: string; gateInputRecheck: string; gateProofCurrent: string;
+    gateHandoff: string; claimLease: string; storedStage: string; completionProof: string; completionPrepareProof: string;
+    preparedArtifactRefs: string; gateDecisions: string; persistedGateDecisions: string; gateOutput: string;
     serializedCheckpoint: string; checkpointSave: string }> }>
 type GateHistoryProbeRow = Readonly<{ actor: string | null; taskId: string | null; idempotencyKey: string | null; sequence: bigint; payload: unknown }>
 const diagnosticOutcomeStatuses = new Set(["completed", "retrying", "failed", "waiting", "waiting_for_user", "interrupted", "skipped", "lease_lost"])
@@ -76,6 +78,7 @@ const scheduledRunServicePath = "@/lib/agent/run-service"
 const scheduledTaskGraphRunServicePath = "@/lib/agent/scheduled-taskgraph-run-service"
 const scheduledTaskGraphFencePath = "@/lib/agent/scheduled-taskgraph-pipeline-fence"
 const scheduledTaskGraphGateInputPath = "@/lib/agent/scheduled-taskgraph-gate-input"
+const scheduledTaskGraphGateCheckpointPath = "@/lib/agent/scheduled-taskgraph-gate-checkpoint"
 const scheduledGateQualityReviewPath = "@/lib/agent/stages/gate-quality-review"
 const scheduledModelRouterPath = "@/lib/model-router"
 const scheduledEntitlementsPath = "@/lib/entitlements"
@@ -301,6 +304,9 @@ async function setupFetcher(fixture: Fixture) {
   let continuation = { gateResume: "not_called", analyzeCheckpoint: "not_checked", continuationKey: "not_checked",
     waitBinding: "not_checked", ownerCurrentRecheck: "not_checked", prepareWait: "not_checked",
     gateInputRecheck: "not_checked", gateProofCurrent: "not_checked",
+    gateHandoff: "not_called", claimLease: "not_checked", storedStage: "not_checked", completionProof: "not_checked",
+    completionPrepareProof: "not_checked", preparedArtifactRefs: "not_checked", gateDecisions: "not_checked",
+    persistedGateDecisions: "not_checked", gateOutput: "not_checked",
     serializedCheckpoint: "not_called", checkpointSave: "not_called" }
   type GateInputProbe = {
     loadScheduledTaskGraphGateInput(input: unknown): Promise<unknown>
@@ -308,6 +314,21 @@ async function setupFetcher(fixture: Fixture) {
     isScheduledTaskGraphGateProofCurrent(input: unknown, tx: unknown): Promise<boolean>
   }
   const gateInput = await vi.importActual<GateInputProbe>(scheduledTaskGraphGateInputPath)
+  type GateCheckpointProbe = { buildScheduledTaskGraphGateCheckpoint(input: unknown, now?: number): unknown }
+  const gateCheckpoint = await vi.importActual<GateCheckpointProbe>(scheduledTaskGraphGateCheckpointPath)
+  vi.doMock(scheduledTaskGraphGateCheckpointPath, () => ({
+    ...gateCheckpoint,
+    buildScheduledTaskGraphGateCheckpoint: (input: unknown, now?: number) => {
+      try {
+        const result = gateCheckpoint.buildScheduledTaskGraphGateCheckpoint(input, now)
+        continuation.gateHandoff = result && typeof result === "object" ? "built" : "rejected"
+        return result
+      } catch (error) {
+        continuation.gateHandoff = "rejected"
+        throw error
+      }
+    },
+  }))
   const gateRpc = await vi.importActual<{
     scheduledTaskGraphExecuteGateCompletionProof(value: unknown): Record<string, unknown> | null
   }>("@/lib/agent/scheduled-taskgraph-gate-rpc")
@@ -341,6 +362,15 @@ async function setupFetcher(fixture: Fixture) {
   vi.doMock(scheduledTaskGraphRunServicePath, () => ({
     ...taskGraphRunService,
     buildScheduledTaskGraphGateResumeState: async (input: unknown) => {
+      continuation.gateHandoff = "not_called"
+      continuation.claimLease = "not_checked"
+      continuation.storedStage = "not_checked"
+      continuation.completionProof = "not_checked"
+      continuation.completionPrepareProof = "not_checked"
+      continuation.preparedArtifactRefs = "not_checked"
+      continuation.gateDecisions = "not_checked"
+      continuation.persistedGateDecisions = "not_checked"
+      continuation.gateOutput = "not_checked"
       try {
         const result = await taskGraphRunService.buildScheduledTaskGraphGateResumeState(input)
         continuation.gateResume = debugSafeEnum(debugRecord(result)?.nextStage, ["scout", "analyze", "prepare", "gate", "execute", "audit", "completed"]) ?? "invalid"
@@ -349,6 +379,20 @@ async function setupFetcher(fixture: Fixture) {
         continuation.gateResume = "threw"
         const resume = debugRecord(input), owner = resume?.owner
         if (resume && owner) {
+          const persisted = debugRecord(resume.persistedCheckpoint)
+          const claim = debugRecord(persisted?.scheduledTaskGraphClaim), claimExpiry = claim?.leaseExpiresAt
+          const claimExpiryMs = typeof claimExpiry === "string" ? Date.parse(claimExpiry) : Number.NaN
+          continuation.claimLease = !claim ? "missing"
+            : !Number.isFinite(claimExpiryMs) || !(new Date(claimExpiryMs).toISOString() === claimExpiry) ? "invalid"
+              : claimExpiryMs > Date.now() ? "unexpired" : "expired"
+          const stageValue = persisted?.nextStage
+          continuation.storedStage = debugSafeEnum(stageValue,
+            ["scout", "analyze", "prepare", "gate", "execute", "audit", "completed"])
+            ?? (stageValue === undefined ? "missing" : "invalid")
+          const completion = gateRpc.scheduledTaskGraphExecuteGateCompletionProof(resume.gateCompletionProof)
+          continuation.completionProof = completion ? "valid" : "invalid"
+          continuation.completionPrepareProof = completion
+            ? debugSameJson(completion.prepareProof, resume.prepareProof) ? "matches" : "mismatch" : "unavailable"
           const analyzeCheckpoint = gateInput.scheduledTaskGraphAnalyzeCheckpointForGate(resume.persistedCheckpoint)
           continuation.analyzeCheckpoint = analyzeCheckpoint ? "valid" : "invalid"
           try { continuation.continuationKey = continuationCheckpoint.scheduledTaskGraphContinuationKey(owner, resume.attestation)
@@ -365,7 +409,6 @@ async function setupFetcher(fixture: Fixture) {
           try { continuation.prepareWait = await taskGraphRunService.validateScheduledPrepareWaitIdentity({
             owner, snapshot: resume.snapshot, proof: resume.prepareProof, scheduledWaitId: resume.scheduledWaitId,
           }) ? "current" : "rejected" } catch { continuation.prepareWait = "threw" }
-          const completion = gateRpc.scheduledTaskGraphExecuteGateCompletionProof(resume.gateCompletionProof)
           const gate = debugRecord(completion?.gate)
           if (analyzeCheckpoint && completion && gate && typeof gate.taskId === "string" && Number.isSafeInteger(gate.attemptCount)) {
             const request = { owner, snapshot: resume.snapshot, analyzeCheckpoint, analyzeAttestation: resume.attestation,
@@ -375,8 +418,29 @@ async function setupFetcher(fixture: Fixture) {
             try { continuation.gateProofCurrent = await diagnosticWebDb.db.$transaction(tx =>
               gateInput.isScheduledTaskGraphGateProofCurrent(request, tx)) ? "current" : "rejected" }
             catch { continuation.gateProofCurrent = "threw" }
-            try { continuation.gateInputRecheck = await gateInput.loadScheduledTaskGraphGateInput(request) ? "loaded" : "rejected" }
-            catch { continuation.gateInputRecheck = "threw" }
+            let loaded: unknown
+            try {
+              loaded = await gateInput.loadScheduledTaskGraphGateInput(request)
+              continuation.gateInputRecheck = loaded ? "loaded" : "rejected"
+            } catch { continuation.gateInputRecheck = "threw" }
+            if (loaded) {
+              const loadedRecord = debugRecord(loaded), persistedArtifacts = persisted?.scheduledTaskGraphPreparedArtifacts
+              const materials = loadedRecord?.materials
+              continuation.preparedArtifactRefs = persistedArtifacts === undefined ? "not_present"
+                : Array.isArray(materials) ? debugExactJson(persistedArtifacts, materials.map(value => {
+                  const row = debugRecord(value)
+                  return row ? { jobId: row.jobId, kind: row.kind, artifactRef: row.artifactRef } : null
+                })) ? "matches" : "mismatch" : "unavailable"
+              const gateState = debugScheduledGateOutput(loaded, persisted)
+              continuation.gateDecisions = gateState.decisions
+              continuation.persistedGateDecisions = gateState.persistedDecisions
+              continuation.gateOutput = gateState.output
+            } else {
+              continuation.preparedArtifactRefs = "unavailable"
+              continuation.gateDecisions = "unavailable"
+              continuation.persistedGateDecisions = "unavailable"
+              continuation.gateOutput = "unavailable"
+            }
           }
         }
         throw error
@@ -782,10 +846,51 @@ function debugDate(value: unknown): number {
 function debugSameJson(left: unknown, right: unknown): boolean {
   try { return JSON.stringify(debugCanonical(left)) === JSON.stringify(debugCanonical(right)) } catch { return false }
 }
+function debugExactJson(left: unknown, right: unknown): boolean {
+  try { return JSON.stringify(left) === JSON.stringify(right) } catch { return false }
+}
 function debugCanonical(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(debugCanonical)
   const row = debugRecord(value)
   return row ? Object.fromEntries(Object.keys(row).sort().map(key => [key, debugCanonical(row[key])])) : value
+}
+function debugScheduledGateOutput(loadedValue: unknown, persistedValue: unknown): {
+  decisions: string; persistedDecisions: string; output: string
+} {
+  const loaded = debugRecord(loadedValue), persisted = debugRecord(persistedValue), gateResult = debugRecord(loaded?.gateResult)
+  const persistedDecisionValue = persisted?.scheduledTaskGraphGateDecisions
+  const decisionSource = gateResult?.status === "completed"
+    ? { approvedJobIds: gateResult.approvedJobIds, pendingJobIds: gateResult.pendingJobIds, skippedJobIds: gateResult.skippedJobIds }
+    : persistedDecisionValue
+  const decisions = debugParseGateDecisions(decisionSource)
+  const persistedParsed = debugParseGateDecisions(persistedDecisionValue)
+  const persistedDecisions = persistedDecisionValue === undefined ? "not_present"
+    : !persistedParsed ? "invalid"
+      : gateResult ? decisions && debugExactJson(persistedDecisionValue, decisions) ? "matches" : "mismatch" : "valid"
+  if (!decisions) return { decisions: decisionSource === undefined ? "missing" : "invalid",
+    persistedDecisions, output: "unavailable" }
+  const packages = loaded?.packages
+  if (!Array.isArray(packages)) return { decisions: "valid", persistedDecisions, output: "unavailable" }
+  const byId = new Map<string, true>()
+  for (const value of packages) {
+    const row = debugRecord(value)
+    if (!row || typeof row.jobId !== "string") return { decisions: "valid", persistedDecisions, output: "unavailable" }
+    byId.set(row.jobId, true)
+  }
+  const ids = [...decisions.approvedJobIds, ...decisions.pendingJobIds, ...decisions.skippedJobIds]
+  const restored = ids.length === byId.size && new Set(ids).size === ids.length && ids.every(id => byId.has(id))
+  return { decisions: "valid", persistedDecisions, output: restored ? "restored" : "rejected" }
+}
+function debugParseGateDecisions(value: unknown): {
+  approvedJobIds: string[]; pendingJobIds: string[]; skippedJobIds: string[]
+} | null {
+  const row = debugRecord(value), keys = ["approvedJobIds", "pendingJobIds", "skippedJobIds"]
+  if (!row || Object.keys(row).length !== keys.length || keys.some(key => !Object.hasOwn(row, key))) return null
+  const lists = keys.map(key => row[key])
+  if (lists.some(list => !Array.isArray(list) || !list.every(id => typeof id === "string" && id.length > 0 && id.trim() === id)
+    || new Set(list as string[]).size !== (list as string[]).length)) return null
+  return { approvedJobIds: [...lists[0] as string[]], pendingJobIds: [...lists[1] as string[]],
+    skippedJobIds: [...lists[2] as string[]] }
 }
 function debugValidId(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value
