@@ -29,6 +29,7 @@ type Runner = Readonly<{ worker: Worker<SubagentJobPayload, unknown>; redis: Red
 type ScheduledPipelineRoute = Readonly<{ POST(request: Request): Promise<Response> }>
 type ExecuteHttpResponse = Readonly<{ status: number; body: Record<string, unknown> }>
 type GateFailureDiagnostics = Readonly<Record<string, unknown>>
+type GateHistoryProbeRow = Readonly<{ actor: string | null; idempotencyKey: string | null; sequence: bigint; payload: unknown }>
 const diagnosticOutcomeStatuses = new Set(["completed", "retrying", "failed", "waiting", "waiting_for_user", "interrupted", "skipped", "lease_lost"])
 const scheduledPipelineRoutePath = "@/app/api/internal/agent-runtime/scheduled-pipeline/route"
 const scheduledGateQualityReviewPath = "@/lib/agent/stages/gate-quality-review"
@@ -416,6 +417,7 @@ async function readGateFailureDiagnostics(fixture: Fixture, requestBody: Record<
       subAgentTask: { findFirst(args: unknown): Promise<{
         id: string; status: string; attemptCount: number; maxAttempts: number; result: unknown
       } | null> }
+      agentEvent: { findMany(args: unknown): Promise<GateHistoryProbeRow[]> }
     }
     const webDb = await vi.importActual<{ db: { $transaction<T>(work: (tx: unknown) => Promise<T>): Promise<T> } }>(scheduledWebDbPath)
     const analyzeCheckpoint = gateInput.scheduledTaskGraphAnalyzeCheckpointForGate(execution?.state)
@@ -444,14 +446,23 @@ async function readGateFailureDiagnostics(fixture: Fixture, requestBody: Record<
       if (gateBindingCurrent && parsedProof) {
         const reader = tx as GateProofDebugReader
         const graphId = `task-graph-${createHash("sha256").update(rootTaskId).digest("hex")}`
-        const [graph, historyGateTask] = await Promise.all([
+        const [graph, historyGateTask, historyEvents] = await Promise.all([
           reader.agentItem.findFirst({ where: { id: graphId, sessionId: owner.sessionId, turnId: owner.turnId,
             taskId: owner.rootTaskId, type: "task_graph", session: { is: { userId: owner.userId } },
             turn: { is: { userId: owner.userId, rootTaskId: owner.rootTaskId } } }, select: { revision: true, content: true } }),
           reader.subAgentTask.findFirst({ where: { id: gateTaskId, sessionId: owner.sessionId, turnId: owner.turnId,
             rootTaskId: owner.rootTaskId, session: { is: { userId: owner.userId } } },
             select: { id: true, status: true, attemptCount: true, maxAttempts: true, result: true } }),
+          reader.agentEvent.findMany({ where: { sessionId: owner.sessionId, turnId: owner.turnId, itemId: graphId,
+            taskId: owner.rootTaskId, type: "item.delta" }, orderBy: { sequence: "asc" }, take: 256,
+            select: { actor: true, idempotencyKey: true, sequence: true, payload: true } }),
         ])
+        const gateHistoryEventSummary = summarizeGateHistoryEvents({ rows: historyEvents, graphId, rootTaskId,
+          sessionId: owner.sessionId, turnId: owner.turnId, graphContent: graph?.content,
+          prepareGraphRevision: parsedProof.graphRevision, prepareAttemptCount: parsedProof.nodes[2].attemptCount,
+          gateTaskId, gateAttemptCount: gate.attemptCount, gateTaskStatus: historyGateTask?.status ?? null,
+          gateTaskAttemptCount: historyGateTask?.attemptCount ?? null, gateMaxAttempts: historyGateTask?.maxAttempts ?? null,
+          graphRevision: graph?.revision ?? null })
         gateHistoryCurrent = Boolean(graph && historyGateTask)
         if (graph && historyGateTask) {
           try {
@@ -469,7 +480,8 @@ async function readGateFailureDiagnostics(fixture: Fixture, requestBody: Record<
           analyzeCheckpoint, analyzeAttestation: requestBody.attestation, prepareProof: requestBody.prepareProof, gate }, tx))
       return { prepareProofParsed: Boolean(parsedProof), analyzeCheckpointDigestPresent: Boolean(checkpointDigest),
         prepareProofMatchesCheckpoint, gateBindingEvaluated, gateBindingCurrent,
-        gateBindingError, gateHistoryEvaluated: gateHistoryCurrent !== null, gateHistoryCurrent, gateHistoryError, gateProofCurrent }
+        gateBindingError, gateHistoryEvaluated: gateHistoryCurrent !== null, gateHistoryCurrent, gateHistoryError,
+        gateHistoryEventSummary, gateProofCurrent }
     })
     const prepareWait = await vi.importActual<{
       validateScheduledPrepareWaitIdentity(input: { owner: unknown; snapshot: unknown; proof: unknown; scheduledWaitId?: string }): Promise<boolean>
@@ -554,6 +566,207 @@ function debugSameLineageOwner(value: unknown, owner: Record<string, unknown>): 
   const row = debugRecord(value)
   return Boolean(row && ["userId", "sessionId", "turnId", "rootTaskId", "rootAttemptCount", "executionId", "executionAttemptCount"]
     .every(key => row[key] === owner[key]))
+}
+function summarizeGateHistoryEvents(input: {
+  rows: readonly GateHistoryProbeRow[]; graphId: string; rootTaskId: string; sessionId: string; turnId: string; graphContent: unknown
+  prepareGraphRevision: number
+  prepareAttemptCount: number; gateTaskId: string; gateAttemptCount: number; gateTaskStatus: string | null
+  gateTaskAttemptCount: number | null; gateMaxAttempts: number | null; graphRevision: number | null
+}): Record<string, unknown> {
+  const lifecycleKey = (nodeKey: string, attempt: number, type: string) =>
+    `${input.graphId}:node:${createHash("sha256").update(nodeKey).digest("hex").slice(0, 20)}:${attempt}:${type}`
+  const prepareKey = lifecycleKey("prepare", input.prepareAttemptCount, "task.completed")
+  const prepareMatches = input.rows.filter(row => row.idempotencyKey === prepareKey)
+  const prepareRow = prepareMatches.length === 1 ? prepareMatches[0] : null
+  const prepareSequence = prepareRow ? debugSequence(prepareRow.sequence) : null
+  const laterRows = prepareSequence === null ? [] : input.rows.filter(row => {
+    const sequence = debugSequence(row.sequence)
+    return sequence !== null && sequence > prepareSequence
+  })
+  const proposalRow = laterRows[0] ?? null
+  const preparePayload = debugRecord(prepareRow?.payload)
+  const proposalPayload = debugRecord(proposalRow?.payload)
+  const receipt = debugRecord(proposalPayload?.receipt)
+  const receiptNodes = Array.isArray(receipt?.nodes) ? receipt.nodes : null
+  const priorItem = debugRecord(preparePayload?.item)
+  const priorSnapshot = debugGateHistorySnapshot(priorItem?.content)
+  const proposedSnapshot = debugGateHistorySnapshot(proposalPayload?.content)
+  const prefixMatches = Boolean(priorSnapshot && proposedSnapshot && priorSnapshot.nodes.length === 3
+    && proposedSnapshot.nodes.length === 4
+    && debugSameJson(priorSnapshot, { ...proposedSnapshot, nodes: proposedSnapshot.nodes.slice(0, 3) }))
+  const proposalGateNode = proposedSnapshot?.nodes[3]
+  const proposalGateNodeStatus = debugSafeEnum(proposalGateNode?.status,
+    ["queued", "running", "waiting_for_user", "completed", "failed", "skipped"])
+  const proposalGateDependencies = proposalGateNode?.dependsOn
+  const proposalGateNodeMatches = Boolean(proposalGateNode && proposalGateNode.key === "gate"
+    && proposalGateNode.templateId === "gate" && proposalGateNode.taskId === input.gateTaskId
+    && proposalGateNode.depth === 4 && Array.isArray(proposalGateDependencies)
+    && proposalGateDependencies.length === 1 && proposalGateDependencies[0] === "prepare"
+    && proposalGateNode.verificationDisposition === "specialized"
+    && !Object.hasOwn(proposalGateNode, "verification") && !Object.hasOwn(proposalGateNode, "repairOf")
+    && !Object.hasOwn(proposalGateNode, "nativeDelegation"))
+  const persistedSnapshot = debugGateHistorySnapshot(input.graphContent)
+  const persistedGateNodeStatus = debugSafeEnum(persistedSnapshot?.nodes[3]?.status,
+    ["queued", "running", "waiting_for_user", "completed", "failed", "skipped"])
+  const proposalKey = `${input.graphId}:proposal:${input.prepareGraphRevision}`
+  const receiptNode = receiptNodes?.length === 1 ? debugRecord(receiptNodes[0]) : null
+  const receiptReadyIds = Array.isArray(receipt?.readyTaskIds) ? receipt.readyTaskIds : null
+  const proposalValid = Boolean(proposalRow && proposalRow.actor === "orchestrator"
+    && proposalRow.idempotencyKey === proposalKey && proposalPayload?.kind === "proposal"
+    && proposalPayload.revision === input.prepareGraphRevision + 1
+    && typeof proposalPayload.fingerprint === "string" && /^[a-f0-9]{64}$/.test(proposalPayload.fingerprint)
+    && receipt?.status === "accepted" && receipt.revision === input.prepareGraphRevision + 1
+    && receiptNodes?.length === 1 && receiptNode?.key === "gate" && receiptNode?.taskId === input.gateTaskId
+    && receiptNode?.status === "queued" && receiptReadyIds?.length === 1 && receiptReadyIds[0] === input.gateTaskId
+    && proposedSnapshot?.nodes.length === 4 && prefixMatches && input.graphRevision !== null
+    && input.graphRevision >= input.prepareGraphRevision + 1
+    && proposalGateNodeMatches && input.gateMaxAttempts !== null && input.gateMaxAttempts >= 1)
+  let expectedRevision = input.prepareGraphRevision + 1
+  let expectedStatus: "queued" | "running" | "waiting_for_user" | "completed" = "queued"
+  let expectedAttempt = 1
+  let timelineValid = proposalValid
+  const eventRows = prepareRow ? [prepareRow, ...laterRows] : [...input.rows]
+  const eventOrder = eventRows.map((row, index) => {
+    const payload = debugRecord(row.payload), event = debugRecord(payload?.event)
+    const kind = payload?.kind
+    const isPrepare = row === prepareRow
+    const isProposal = !isPrepare && row === proposalRow
+    let rowExpectedRevision: number | null = null
+    let expectedPayloadRevision: number | null = null
+    let expectedKey: string | null = null
+    if (isPrepare) {
+      rowExpectedRevision = input.prepareGraphRevision - 1
+      expectedPayloadRevision = input.prepareGraphRevision
+      expectedKey = prepareKey
+    } else if (isProposal) {
+      rowExpectedRevision = input.prepareGraphRevision
+      expectedPayloadRevision = input.prepareGraphRevision + 1
+      expectedKey = proposalKey
+    } else if (prepareRow && index >= 2 && event && typeof event.type === "string" && event.nodeKey === "gate") {
+      rowExpectedRevision = expectedRevision
+      expectedPayloadRevision = expectedRevision + 1
+      expectedKey = lifecycleKey("gate", expectedAttempt, event.type)
+    }
+    const payloadRevision = debugSafeInteger(payload?.revision)
+    const eventExpectedRevision = debugSafeInteger(event?.expectedRevision)
+    const rowEventKeyMatches = typeof event?.idempotencyKey === "string"
+      ? row.idempotencyKey === event.idempotencyKey : null
+    const expectedKeyMatches = expectedKey !== null && row.idempotencyKey === expectedKey
+      && (typeof event?.idempotencyKey !== "string" || event.idempotencyKey === expectedKey)
+    const expectedRevisionMatches = isProposal
+      ? expectedKeyMatches
+      : eventExpectedRevision !== null && eventExpectedRevision === rowExpectedRevision
+    const payloadRevisionMatches = expectedPayloadRevision !== null && payloadRevision === expectedPayloadRevision
+    const eventItem = debugRecord(payload?.item)
+    const eventGraphContent = isProposal ? payload?.content : eventItem?.content
+    const eventSnapshot = debugGateHistorySnapshot(eventGraphContent)
+    const eventGateNodeStatus = debugSafeEnum(eventSnapshot?.nodes[3]?.status,
+      ["queued", "running", "waiting_for_user", "completed", "failed", "skipped"])
+    const result = {
+      order: index + 1,
+      actor: debugSafeEnum(row.actor, ["system", "orchestrator", "user", "assistant", "worker"]),
+      kind: debugSafeEnum(kind, ["lifecycle", "proposal"]),
+      lifecycleType: debugSafeEnum(event?.type, ["task.completed", "task.started", "task.waiting_for_user",
+        "task.gate_choice_resumed", "task.retrying"]),
+      nodeKey: debugSafeEnum(event?.nodeKey, ["scout", "analyst", "prepare", "gate"]),
+      expectedRevision: rowExpectedRevision,
+      payloadRevision,
+      expectedRevisionMatches,
+      payloadRevisionMatches,
+      rowEventKeyMatches,
+      expectedKeyMatches,
+      gateNodeStatus: eventGateNodeStatus,
+    }
+    const eventItemValid = Boolean(eventItem && eventItem.id === input.graphId && eventItem.sessionId === input.sessionId
+      && eventItem.turnId === input.turnId && eventItem.taskId === input.rootTaskId && eventItem.type === "task_graph"
+      && eventItem.revision === payloadRevision)
+    const eventKeys = event ? Object.keys(event).sort().join(",") : ""
+    const eventShapeMatches = event?.type === "task.gate_choice_resumed"
+      ? eventKeys === "expectedRevision,gateTaskId,idempotencyKey,nodeKey,requestAttemptCount,resumedAttemptCount,type"
+        && event.gateTaskId === input.gateTaskId && event.requestAttemptCount === expectedAttempt
+        && event.resumedAttemptCount === expectedAttempt + 1
+      : eventKeys === "expectedRevision,idempotencyKey,nodeKey,type"
+    if (prepareRow && index >= 2 && timelineValid) {
+      let nextStatus: typeof expectedStatus | null = null
+      let nextAttempt = expectedAttempt
+      const type = event?.type
+      if (type === "task.started" && expectedStatus === "queued") nextStatus = "running"
+      else if (type === "task.waiting_for_user" && expectedStatus === "running") nextStatus = "waiting_for_user"
+      else if (type === "task.gate_choice_resumed" && expectedStatus === "waiting_for_user") {
+        nextAttempt += 1; nextStatus = "queued"
+      } else if (type === "task.retrying" && expectedStatus === "running" && input.gateMaxAttempts !== null
+        && expectedAttempt < input.gateMaxAttempts) {
+        nextAttempt += 1; nextStatus = "queued"
+      } else if (type === "task.completed" && expectedStatus === "running") nextStatus = "completed"
+      const eventEnvelopeMatches = row.actor === "system" && kind === "lifecycle" && event?.nodeKey === "gate"
+        && eventShapeMatches && eventItemValid && expectedRevisionMatches && payloadRevisionMatches
+        && rowEventKeyMatches === true && expectedKeyMatches
+      const expectedContent = proposedSnapshot && nextStatus
+        ? { ...proposedSnapshot, nodes: [...proposedSnapshot.nodes.slice(0, 3), { ...proposedSnapshot.nodes[3]!, status: nextStatus }] }
+        : null
+      const eventContent = debugGateHistorySnapshot(eventItem?.content)
+      timelineValid = Boolean(nextStatus && eventEnvelopeMatches && eventContent && expectedContent
+        && debugSameJson(eventContent, expectedContent))
+      if (timelineValid && nextStatus) {
+        expectedStatus = nextStatus
+        expectedAttempt = nextAttempt
+        expectedRevision += 1
+      }
+    }
+    return result
+  })
+  const allSequences = input.rows.map(row => debugSequence(row.sequence))
+  const sequenceOrderMatches = allSequences.every((sequence, index) => sequence !== null
+    && (index === 0 || allSequences[index - 1] !== null && sequence > allSequences[index - 1]!))
+  const persistedStatus = debugSafeEnum(input.gateTaskStatus,
+    ["queued", "running", "waiting_for_user", "completed", "failed", "interrupted", "skipped"])
+  return {
+    eventCount: input.rows.length,
+    sequenceOrderMatches,
+    prepareEventMatchCount: prepareMatches.length,
+    prepareEventOrder: prepareRow ? input.rows.indexOf(prepareRow) + 1 : null,
+    prepareSequenceFound: prepareSequence !== null,
+    postPrepareEventCount: laterRows.length,
+    events: eventOrder,
+    proposalReceiptStatus: debugSafeEnum(receipt?.status, ["accepted", "rejected"]),
+    proposalReceiptNodeCount: receiptNodes?.length ?? null,
+    proposalReceiptNodeCountMatches: Boolean(receiptNodes && receiptNodes.length === 1
+      && Reflect.ownKeys(receiptNodes).length === receiptNodes.length + 1),
+    proposalPrefixMatches: prefixMatches,
+    proposalGateNodeStatus,
+    persistedGateNodeStatus,
+    final: {
+      expectedRevision, persistedRevision: input.graphRevision,
+      revisionMatches: input.graphRevision === expectedRevision,
+      expectedStatus, persistedStatus, statusMatches: persistedStatus === expectedStatus,
+      expectedAttempt, persistedAttempt: input.gateTaskAttemptCount,
+      attemptMatches: input.gateTaskAttemptCount === expectedAttempt,
+      requestedAttempt: input.gateAttemptCount, requestedAttemptMatches: input.gateAttemptCount === expectedAttempt,
+    },
+  }
+}
+function debugGateHistorySnapshot(value: unknown): { schemaVersion: string; nodes: Record<string, unknown>[]; rootSuccessCriteria?: unknown } | null {
+  const row = debugRecord(value), rawNodes = row?.nodes
+  if (!row || row.schemaVersion !== "agent-harness.v2.task-graph" || !Array.isArray(rawNodes)
+    || Reflect.ownKeys(rawNodes).length !== rawNodes.length + 1) return null
+  const nodes = rawNodes.map(debugRecord).filter((node): node is Record<string, unknown> => node !== null)
+  if (nodes.length !== rawNodes.length) return null
+  return { schemaVersion: "agent-harness.v2.task-graph", nodes,
+    ...(Object.hasOwn(row, "rootSuccessCriteria") ? { rootSuccessCriteria: row.rootSuccessCriteria } : {}) }
+}
+function debugSequence(value: unknown): bigint | null {
+  try {
+    if (typeof value === "bigint") return value
+    if (typeof value === "number" && Number.isSafeInteger(value)) return BigInt(value)
+    if (typeof value === "string" && /^\d+$/.test(value)) return BigInt(value)
+  } catch { return null }
+  return null
+}
+function debugSafeInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) ? value : null
+}
+function debugSafeEnum(value: unknown, allowed: readonly string[]): string | null {
+  return typeof value === "string" ? allowed.includes(value) ? value : "other" : null
 }
 
 function assertExactExecuteResponse(value: ExecuteHttpResponse): void {
