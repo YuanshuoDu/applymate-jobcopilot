@@ -426,11 +426,13 @@ async function setupFetcher(fixture: Fixture) {
             if (loaded) {
               const loadedRecord = debugRecord(loaded), persistedArtifacts = persisted?.scheduledTaskGraphPreparedArtifacts
               const materials = loadedRecord?.materials
+              const loadedArtifactRefs = Array.isArray(materials) ? materials.map(value => {
+                const row = debugRecord(value)
+                return row ? { jobId: row.jobId, kind: row.kind, artifactRef: row.artifactRef } : null
+              }) : null
               continuation.preparedArtifactRefs = persistedArtifacts === undefined ? "not_present"
-                : Array.isArray(materials) ? debugExactJson(persistedArtifacts, materials.map(value => {
-                  const row = debugRecord(value)
-                  return row ? { jobId: row.jobId, kind: row.kind, artifactRef: row.artifactRef } : null
-                })) ? "matches" : "mismatch" : "unavailable"
+                : loadedArtifactRefs ? debugExactJson(persistedArtifacts, loadedArtifactRefs) ? "matches"
+                  : debugSameJson(persistedArtifacts, loadedArtifactRefs) ? "order_only_mismatch" : "mismatch" : "unavailable"
               const gateState = debugScheduledGateOutput(loaded, persisted)
               continuation.gateDecisions = gateState.decisions
               continuation.persistedGateDecisions = gateState.persistedDecisions
