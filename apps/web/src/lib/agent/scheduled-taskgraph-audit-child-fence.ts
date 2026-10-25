@@ -15,9 +15,31 @@ export type ScheduledTaskGraphAuditChildFence = Readonly<{
   taskId: string; attemptCount: number; leaseOwner: string; rootStatus: string; turnStatus: string
 }>
 
+export function scheduledTaskGraphAuditTaskMatches(task: Record<string, unknown>, owner: ScheduledTaskGraphPipelineOwner): boolean {
+  const status = task.status, attempt = task.attemptCount
+  return task.sessionId === owner.sessionId && task.turnId === owner.turnId && task.rootTaskId === owner.rootTaskId
+    && task.parentTaskId === owner.rootTaskId && task.depth === 1 && task.role === 'auditor' && task.taskType === AUDIT_TYPE
+    && (status === 'queued' || status === 'running' || status === 'retrying' || status === 'completed')
+    && (status === 'queued' ? nonNegative(attempt) : positive(attempt)) && positive(task.maxAttempts) && task.failureReason === null
+    && Array.isArray(task.allowedActions) && task.allowedActions.length === 0 && sameJson(task.expectedOutputSchema, AUDIT_SCHEMA)
+    && sameJson(task.context, {})
+}
+
 /** Locks the complete parent/child scope before authorizing a dispatched Audit lease. */
 export async function lockScheduledTaskGraphAuditChildFence(tx: Prisma.TransactionClient,
   input: ScheduledTaskGraphAuditChildFenceInput): Promise<ScheduledTaskGraphAuditChildFence | null> {
+  return lockAuditChildFence(tx, input, 'execution')
+}
+
+/** Locks the same scope for read-only replay of an already completed Audit report. */
+export async function lockScheduledTaskGraphAuditCompletedReportChildFence(tx: Prisma.TransactionClient,
+  input: ScheduledTaskGraphAuditChildFenceInput): Promise<ScheduledTaskGraphAuditChildFence | null> {
+  return lockAuditChildFence(tx, input, 'completed_report')
+}
+
+async function lockAuditChildFence(tx: Prisma.TransactionClient, input: ScheduledTaskGraphAuditChildFenceInput,
+  phase: 'execution' | 'completed_report'): Promise<ScheduledTaskGraphAuditChildFence | null> {
+  if (phase !== 'execution' && phase !== 'completed_report') return null
   const { owner, auditActor } = input
   if (!validOwner(owner) || !validActor(auditActor)) return null
   try {
@@ -25,7 +47,8 @@ export async function lockScheduledTaskGraphAuditChildFence(tx: Prisma.Transacti
       SELECT "id", "status" FROM "agent_sessions"
       WHERE "id" = ${owner.sessionId} AND "userId" = ${owner.userId} FOR UPDATE
     `)
-    if (sessions.length !== 1 || sessions[0]!.status !== 'running') return null
+    const allowedSessions = phase === 'execution' ? ['running', 'paused'] : ['running', 'paused', 'waiting_for_user', 'completed']
+    if (sessions.length !== 1 || !allowedSessions.includes(sessions[0]!.status)) return null
     const pauses = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
       SELECT pause."id" FROM "agent_events" AS pause
       WHERE pause."sessionId" = ${owner.sessionId} AND pause."turnId" = ${owner.turnId}
@@ -84,6 +107,17 @@ export async function lockScheduledTaskGraphAuditChildFence(tx: Prisma.Transacti
       || child.status !== 'running' || child.attemptCount !== auditActor.attemptCount || child.leaseOwner !== auditActor.leaseOwner
       || child.interruptRequestedAt != null || child.closedAt != null || child.failureReason !== null
       || !sameJson(child.context, {}) || !sameJson(child.expectedOutputSchema, AUDIT_SCHEMA) || !sameJson(child.allowedActions, [])) return null
+    if (phase === 'completed_report') {
+      const executions = await tx.$queryRaw<Array<Record<string, unknown>>>(Prisma.sql`
+        SELECT "id", "userId", "sessionId", "status", "attemptCount" FROM "agent_executions"
+        WHERE "id" = ${owner.executionId} AND "userId" = ${owner.userId} AND "sessionId" = ${owner.sessionId}
+          AND "attemptCount" = ${owner.executionAttemptCount} AND "status" = 'completed' FOR UPDATE
+      `)
+      const execution = executions[0]
+      if (executions.length !== 1 || !execution || execution.id !== owner.executionId || execution.userId !== owner.userId
+        || execution.sessionId !== owner.sessionId || execution.attemptCount !== owner.executionAttemptCount
+        || execution.status !== 'completed') return null
+    }
     const dispatches = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
       SELECT "id" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch'
         AND "aggregateId" = ${owner.sessionId} AND "idempotencyKey" = ${`subagent-dispatch:${auditActor.taskId}`}
@@ -122,6 +156,8 @@ function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boo
   return Reflect.ownKeys(value).length === keys.length && Reflect.ownKeys(value).every(key => typeof key === 'string' && keys.includes(key))
 }
 function validId(value: unknown): value is string { return typeof value === 'string' && value.length > 0 && value.length <= 256 && value.trim() === value }
+function positive(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) > 0 }
+function nonNegative(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 0 }
 function sameJson(left: unknown, right: unknown): boolean {
   try { return JSON.stringify(canonical(left)) === JSON.stringify(canonical(right)) } catch { return false }
 }

@@ -69,6 +69,7 @@ const diagnosticGateErrorCodes = new Set([
   "scheduled_pipeline_ai_unavailable", "scheduled_pipeline_analysis_interrupted", "scheduled_pipeline_attestation_invalid",
   "scheduled_pipeline_claim_conflict", "scheduled_pipeline_discovery_incomplete", "scheduled_pipeline_entitlement_required",
   "scheduled_pipeline_execution_failed", "scheduled_pipeline_execution_mismatch", "scheduled_pipeline_gate_proof_invalid",
+  "scheduled_pipeline_audit_child_fenced", "scheduled_pipeline_audit_gate_proof_invalid",
   "scheduled_pipeline_jobs_mismatch", "scheduled_pipeline_mode_mismatch", "scheduled_pipeline_owner_mismatch",
   "scheduled_pipeline_request_invalid", "scheduled_pipeline_resume_unavailable", "scheduled_pipeline_snapshot_mismatch",
   "scheduled_pipeline_turn_stale", "scheduled_pipeline_unauthorized",
@@ -101,6 +102,8 @@ const scheduledTaskGraphRunServicePath = "@/lib/agent/scheduled-taskgraph-run-se
 const scheduledTaskGraphFencePath = "@/lib/agent/scheduled-taskgraph-pipeline-fence"
 const scheduledTaskGraphGateInputPath = "@/lib/agent/scheduled-taskgraph-gate-input"
 const scheduledTaskGraphGateCheckpointPath = "@/lib/agent/scheduled-taskgraph-gate-checkpoint"
+const scheduledTaskGraphAuditChildFencePath = "@/lib/agent/scheduled-taskgraph-audit-child-fence"
+const scheduledTaskGraphAuditPrepareSourcePath = "@/lib/agent/scheduled-taskgraph-audit-prepare-source"
 const scheduledGateQualityReviewPath = "@/lib/agent/stages/gate-quality-review"
 const scheduledModelRouterPath = "@/lib/model-router"
 const scheduledEntitlementsPath = "@/lib/entitlements"
@@ -132,6 +135,8 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     vi.doUnmock(scheduledTaskGraphRunServicePath)
     vi.doUnmock(scheduledTaskGraphFencePath)
     vi.doUnmock(scheduledTaskGraphGateInputPath)
+    vi.doUnmock(scheduledTaskGraphAuditChildFencePath)
+    vi.doUnmock(scheduledTaskGraphAuditPrepareSourcePath)
     vi.doUnmock(scheduledWebDbPath)
     vi.resetModules()
   })
@@ -697,12 +702,59 @@ async function setupFetcher(fixture: Fixture) {
     completionPrepareProof: "not_checked", preparedArtifactRefs: "not_checked", gateDecisions: "not_checked",
     persistedGateDecisions: "not_checked", gateOutput: "not_checked",
     serializedCheckpoint: "not_called", checkpointSave: "not_called" }
+  type AuditChildFenceProbe = {
+    lockScheduledTaskGraphAuditChildFence(tx: unknown, input: unknown): Promise<unknown>
+    scheduledTaskGraphAuditChildFenceIsCurrent(tx: unknown, input: unknown): Promise<boolean>
+  }
+  const auditChildFence = await vi.importActual<AuditChildFenceProbe>(scheduledTaskGraphAuditChildFencePath)
+  vi.doMock(scheduledTaskGraphAuditChildFencePath, () => ({
+    ...auditChildFence,
+    lockScheduledTaskGraphAuditChildFence: async (tx: unknown, input: unknown) => {
+      try {
+        const result = await auditChildFence.lockScheduledTaskGraphAuditChildFence(tx, input)
+        continuation.ownerCurrentRecheck = result ? "current" : "rejected"
+        return result
+      } catch (error) { continuation.ownerCurrentRecheck = "threw"; throw error }
+    },
+    scheduledTaskGraphAuditChildFenceIsCurrent: async (tx: unknown, input: unknown) => {
+      try {
+        const result = await auditChildFence.scheduledTaskGraphAuditChildFenceIsCurrent(tx, input)
+        continuation.ownerCurrentRecheck = result ? "current" : "rejected"
+        return result
+      } catch (error) { continuation.ownerCurrentRecheck = "threw"; throw error }
+    },
+  }))
+  type AuditPrepareSourceProbe = {
+    validateScheduledTaskGraphAuditPrepareSource(input: unknown): Promise<boolean>
+  }
+  const auditPrepareSource = await vi.importActual<AuditPrepareSourceProbe>(scheduledTaskGraphAuditPrepareSourcePath)
+  vi.doMock(scheduledTaskGraphAuditPrepareSourcePath, () => ({
+    ...auditPrepareSource,
+    validateScheduledTaskGraphAuditPrepareSource: async (input: unknown) => {
+      try {
+        const result = await auditPrepareSource.validateScheduledTaskGraphAuditPrepareSource(input)
+        continuation.prepareWait = result ? "current" : "rejected"
+        return result
+      } catch (error) { continuation.prepareWait = "threw"; throw error }
+    },
+  }))
   type GateInputProbe = {
     loadScheduledTaskGraphGateInput(input: unknown): Promise<unknown>
     scheduledTaskGraphAnalyzeCheckpointForGate(value: unknown): Record<string, unknown> | null
     isScheduledTaskGraphGateProofCurrent(input: unknown, tx: unknown): Promise<boolean>
+    isScheduledTaskGraphAuditChildGateProofCurrent(input: unknown, tx: unknown): Promise<boolean>
   }
   const gateInput = await vi.importActual<GateInputProbe>(scheduledTaskGraphGateInputPath)
+  vi.doMock(scheduledTaskGraphGateInputPath, () => ({
+    ...gateInput,
+    isScheduledTaskGraphAuditChildGateProofCurrent: async (input: unknown, tx: unknown) => {
+      try {
+        const result = await gateInput.isScheduledTaskGraphAuditChildGateProofCurrent(input, tx)
+        continuation.gateProofCurrent = result ? "current" : "rejected"
+        return result
+      } catch (error) { continuation.gateProofCurrent = "threw"; throw error }
+    },
+  }))
   type GateCheckpointProbe = { buildScheduledTaskGraphGateCheckpoint(input: unknown, now?: number): unknown }
   const gateCheckpoint = await vi.importActual<GateCheckpointProbe>(scheduledTaskGraphGateCheckpointPath)
   vi.doMock(scheduledTaskGraphGateCheckpointPath, () => ({

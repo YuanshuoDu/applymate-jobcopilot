@@ -3,7 +3,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({
   execution: vi.fn(), turn: vi.fn(), root: vi.fn(), session: vi.fn(), jobs: vi.fn(), transaction: vi.fn(),
   digest: vi.fn(), key: vi.fn(), completedReport: vi.fn(), prior: vi.fn(), gateProof: vi.fn(), validatePrepare: vi.fn(), snapshot: vi.fn(),
-  auditGateProof: vi.fn(), auditFence: vi.fn(), auditPrepareSource: vi.fn(), queryRaw: vi.fn(),
+  auditGateProof: vi.fn(), auditCompletedGateProof: vi.fn(), auditFence: vi.fn(), auditCompletedFence: vi.fn(),
+  auditPrepareSource: vi.fn(), queryRaw: vi.fn(),
 }))
 
 vi.mock('@/lib/db', () => ({ db: {
@@ -12,8 +13,10 @@ vi.mock('@/lib/db', () => ({ db: {
 } }))
 vi.mock('./scheduled-taskgraph-analysis-journal', () => ({ completedScheduledTaskGraphReport: mocks.completedReport }))
 vi.mock('./scheduled-taskgraph-gate-input', () => ({ isScheduledTaskGraphGateProofCurrent: mocks.gateProof,
-  isScheduledTaskGraphAuditChildGateProofCurrent: mocks.auditGateProof }))
-vi.mock('./scheduled-taskgraph-audit-child-fence', () => ({ lockScheduledTaskGraphAuditChildFence: mocks.auditFence }))
+  isScheduledTaskGraphAuditChildGateProofCurrent: mocks.auditGateProof,
+  isScheduledTaskGraphAuditCompletedReportGateProofCurrent: mocks.auditCompletedGateProof }))
+vi.mock('./scheduled-taskgraph-audit-child-fence', () => ({ lockScheduledTaskGraphAuditChildFence: mocks.auditFence,
+  lockScheduledTaskGraphAuditCompletedReportChildFence: mocks.auditCompletedFence }))
 vi.mock('./scheduled-taskgraph-audit-prepare-source', () => ({ validateScheduledTaskGraphAuditPrepareSource: mocks.auditPrepareSource }))
 vi.mock('./scheduled-automation-snapshot', () => ({ parseScheduledAutomationSnapshot: mocks.snapshot }))
 vi.mock('./scheduled-taskgraph-pipeline-checkpoint', () => ({
@@ -63,7 +66,11 @@ beforeEach(() => {
   mocks.prior.mockReturnValue(null)
   mocks.gateProof.mockResolvedValue(true)
   mocks.auditGateProof.mockResolvedValue(true)
+  mocks.auditCompletedGateProof.mockResolvedValue(true)
   mocks.auditFence.mockResolvedValue(true)
+  mocks.auditCompletedFence.mockResolvedValue({ taskId: auditRequest.auditActor.taskId,
+    attemptCount: auditRequest.auditActor.attemptCount, leaseOwner: auditRequest.auditActor.leaseOwner,
+    rootStatus: 'waiting', turnStatus: 'waiting_for_dependency' })
   mocks.auditPrepareSource.mockResolvedValue(true)
   mocks.validatePrepare.mockResolvedValue(true)
   mocks.snapshot.mockReturnValue(snapshot)
@@ -73,19 +80,20 @@ describe('completed scheduled TaskGraph report replay', () => {
   it('replays an exact completed report to a live Audit retry after Root parked and released its Turn lease', async () => {
     mocks.turn.mockResolvedValue({ ...turn, status: 'waiting_for_dependency', leaseOwnerId: null, leaseExpiresAt: null })
     mocks.root.mockResolvedValue({ ...root, status: 'waiting' })
-    mocks.session.mockResolvedValue({ id: owner.sessionId, status: 'running' })
+    mocks.session.mockResolvedValue({ id: owner.sessionId, status: 'paused' })
 
     const response = await replayCompletedScheduledTaskGraphAuditReport(auditRequest, gate)
 
     expect(response?.status).toBe(200)
     expect(await response?.json()).toEqual({ status: 'completed', report })
     expect(mocks.completedReport).toHaveBeenCalledWith(expect.objectContaining({ owner, execution }))
-    expect(mocks.auditGateProof).toHaveBeenCalledWith(expect.objectContaining({ owner,
+    expect(mocks.auditCompletedGateProof).toHaveBeenCalledWith(expect.objectContaining({ owner,
       auditActor: auditRequest.auditActor, gate: expect.objectContaining({ taskId: gate.taskId, phase: 'completed' }) }), lockedTransaction)
-    expect(mocks.auditFence).toHaveBeenCalledWith(lockedTransaction, { owner, auditActor: auditRequest.auditActor })
+    expect(mocks.auditCompletedFence).toHaveBeenCalledWith(lockedTransaction, { owner, auditActor: auditRequest.auditActor })
     expect(mocks.auditPrepareSource).toHaveBeenCalledWith(expect.objectContaining({ owner, reader: lockedTransaction }))
     expect(mocks.queryRaw).toHaveBeenCalledOnce()
     expect(mocks.gateProof).not.toHaveBeenCalled()
+    expect(mocks.auditGateProof).not.toHaveBeenCalled()
     expect(mocks.transaction).toHaveBeenCalledOnce()
   })
 
@@ -98,31 +106,88 @@ describe('completed scheduled TaskGraph report replay', () => {
       auditActor: { ...auditRequest.auditActor, attemptCount: 3 } }, { ...gate, attemptCount: 1 })
 
     expect(response?.status).toBe(200)
-    expect(mocks.auditGateProof).toHaveBeenCalledWith(expect.objectContaining({ auditActor: { ...auditRequest.auditActor, attemptCount: 3 } }), lockedTransaction)
+    expect(mocks.auditCompletedGateProof).toHaveBeenCalledWith(expect.objectContaining({ auditActor: { ...auditRequest.auditActor, attemptCount: 3 } }), lockedTransaction)
+  })
+
+  it.each(['waiting_for_user', 'completed'] as const)('replays a completed Audit report with Session status %s', async sessionStatus => {
+    mocks.turn.mockResolvedValue({ ...turn, status: 'waiting_for_dependency', leaseOwnerId: null, leaseExpiresAt: null })
+    mocks.root.mockResolvedValue({ ...root, status: 'waiting' })
+    mocks.session.mockResolvedValue({ id: owner.sessionId, status: sessionStatus })
+
+    const response = await replayCompletedScheduledTaskGraphAuditReport(auditRequest, gate)
+
+    expect(response?.status).toBe(200)
+    expect(await response?.json()).toEqual({ status: 'completed', report })
+    expect(mocks.auditCompletedFence).toHaveBeenCalledWith(lockedTransaction, { owner, auditActor: auditRequest.auditActor })
+    expect(mocks.auditCompletedGateProof).toHaveBeenCalledOnce()
   })
 
   it('rejects terminal parents before report replay and uses only the actor proof path', async () => {
     mocks.turn.mockResolvedValue({ ...turn, status: 'completed', leaseOwnerId: null, leaseExpiresAt: null })
     mocks.root.mockResolvedValue({ ...root, status: 'completed', closedAt: new Date() })
-    mocks.session.mockResolvedValue({ id: owner.sessionId, status: 'running' })
+    mocks.session.mockResolvedValue({ id: owner.sessionId, status: 'paused' })
 
     const response = await replayCompletedScheduledTaskGraphAuditReport(auditRequest, gate)
 
     expect(await response?.json()).toMatchObject({ errorCode: 'scheduled_pipeline_owner_mismatch' })
-    expect(mocks.auditGateProof).not.toHaveBeenCalled()
+    expect(mocks.auditCompletedGateProof).not.toHaveBeenCalled()
   })
 
-  it('does not return a cached report when the execution changes before the locked proof check', async () => {
+  it.each(['state', 'attempt'] as const)('does not return a cached report when the locked execution %s changes', async changedField => {
     mocks.turn.mockResolvedValue({ ...turn, status: 'waiting_for_dependency', leaseOwnerId: null, leaseExpiresAt: null })
     mocks.root.mockResolvedValue({ ...root, status: 'waiting' })
     mocks.session.mockResolvedValue({ id: owner.sessionId, status: 'running' })
-    mocks.queryRaw.mockResolvedValue([{ ...execution, state: { nextStage: 'completed', changed: true } }])
+    const changed = changedField === 'state'
+      ? { ...execution, state: { nextStage: 'completed', changed: true } }
+      : { ...execution, attemptCount: owner.executionAttemptCount + 1 }
+    mocks.queryRaw.mockResolvedValue([changed])
 
     const response = await replayCompletedScheduledTaskGraphAuditReport(auditRequest, gate)
 
     expect(await response?.json()).toMatchObject({ errorCode: 'scheduled_pipeline_gate_proof_invalid' })
-    expect(mocks.auditGateProof).not.toHaveBeenCalled()
+    expect(mocks.auditCompletedGateProof).not.toHaveBeenCalled()
     expect(mocks.queryRaw).toHaveBeenCalledOnce()
+  })
+
+  it('rejects an unresolved user pause before replaying a completed report', async () => {
+    mocks.turn.mockResolvedValue({ ...turn, status: 'waiting_for_dependency', leaseOwnerId: null, leaseExpiresAt: null })
+    mocks.root.mockResolvedValue({ ...root, status: 'waiting' })
+    mocks.session.mockResolvedValue({ id: owner.sessionId, status: 'paused' })
+    mocks.auditCompletedFence.mockResolvedValue(null)
+
+    const response = await replayCompletedScheduledTaskGraphAuditReport(auditRequest, gate)
+
+    expect(await response?.json()).toMatchObject({ errorCode: 'scheduled_pipeline_gate_proof_invalid' })
+    expect(mocks.auditCompletedFence).toHaveBeenCalledOnce()
+    expect(mocks.auditCompletedGateProof).not.toHaveBeenCalled()
+  })
+
+  it('does not use completed-report replay for a non-completed execution', async () => {
+    mocks.execution.mockResolvedValue({ ...execution, status: 'running' })
+
+    await expect(replayCompletedScheduledTaskGraphAuditReport(auditRequest, gate)).resolves.toBeNull()
+
+    expect(mocks.completedReport).not.toHaveBeenCalled()
+    expect(mocks.auditCompletedFence).not.toHaveBeenCalled()
+  })
+
+  it('requires current Prepare and Gate proofs for a completed Audit report', async () => {
+    mocks.turn.mockResolvedValue({ ...turn, status: 'waiting_for_dependency', leaseOwnerId: null, leaseExpiresAt: null })
+    mocks.root.mockResolvedValue({ ...root, status: 'waiting' })
+    mocks.session.mockResolvedValue({ id: owner.sessionId, status: 'waiting_for_user' })
+    mocks.auditPrepareSource.mockResolvedValue(false)
+
+    const stalePrepare = await replayCompletedScheduledTaskGraphAuditReport(auditRequest, gate)
+
+    expect(await stalePrepare?.json()).toMatchObject({ errorCode: 'scheduled_pipeline_gate_proof_invalid' })
+    expect(mocks.auditCompletedGateProof).not.toHaveBeenCalled()
+
+    mocks.auditPrepareSource.mockResolvedValue(true)
+    mocks.auditCompletedGateProof.mockResolvedValue(false)
+    const staleGate = await replayCompletedScheduledTaskGraphAuditReport(auditRequest, gate)
+
+    expect(await staleGate?.json()).toMatchObject({ errorCode: 'scheduled_pipeline_gate_proof_invalid' })
+    expect(mocks.auditCompletedGateProof).toHaveBeenCalledOnce()
   })
 
   it('returns the exact report response for an approval wait after a lost response', async () => {

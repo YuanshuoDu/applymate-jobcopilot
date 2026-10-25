@@ -1,8 +1,8 @@
 import { Prisma, type Job } from '@prisma/client'
 import { db } from '@/lib/db'
 import { completedScheduledTaskGraphReport } from './scheduled-taskgraph-analysis-journal'
-import { isScheduledTaskGraphAuditChildGateProofCurrent, isScheduledTaskGraphGateProofCurrent } from './scheduled-taskgraph-gate-input'
-import { lockScheduledTaskGraphAuditChildFence } from './scheduled-taskgraph-audit-child-fence'
+import { isScheduledTaskGraphAuditCompletedReportGateProofCurrent, isScheduledTaskGraphGateProofCurrent } from './scheduled-taskgraph-gate-input'
+import { lockScheduledTaskGraphAuditCompletedReportChildFence } from './scheduled-taskgraph-audit-child-fence'
 import { validateScheduledTaskGraphAuditPrepareSource } from './scheduled-taskgraph-audit-prepare-source'
 import type { ScheduledTaskGraphAuditExecuteRpcRequest, ScheduledTaskGraphExecuteRpcRequest } from './scheduled-taskgraph-gate-rpc'
 import { parseScheduledAutomationSnapshot } from './scheduled-automation-snapshot'
@@ -117,7 +117,7 @@ async function replayPersistedCompletedAuditReport(request: ScheduledTaskGraphAu
         interruptRequestedAt: true, closedAt: true } }),
     db.agentSession.findFirst({ where: { id: owner.sessionId, userId: owner.userId }, select: { id: true, status: true } }),
   ])
-  if (!turn || !root || !session || session.status !== 'running' || turn.userId !== owner.userId
+  if (!turn || !root || !session || !['running', 'paused', 'waiting_for_user', 'completed'].includes(session.status) || turn.userId !== owner.userId
     || turn.sessionId !== owner.sessionId || turn.rootTaskId !== owner.rootTaskId
     || !['queued', 'in_progress', 'waiting_for_dependency'].includes(turn.status)
     || root.id !== owner.rootTaskId || root.sessionId !== owner.sessionId || root.turnId !== owner.turnId
@@ -158,7 +158,7 @@ async function replayPersistedCompletedAuditReport(request: ScheduledTaskGraphAu
   if (!isExactCompletedReport(report)) return blocked(409, 'scheduled_pipeline_execution_mismatch')
   const proofCheckpoint = { ...state, nextStage: 'audit' }
   const proofCurrent = await db.$transaction(async tx => {
-    if (!await lockScheduledTaskGraphAuditChildFence(tx, { owner, auditActor: request.auditActor })) return false
+    if (!await lockScheduledTaskGraphAuditCompletedReportChildFence(tx, { owner, auditActor: request.auditActor })) return false
     if (!await validateScheduledTaskGraphAuditPrepareSource({ owner, snapshot, proof: request.prepareProof,
       ...(request.scheduledWaitId ? { scheduledWaitId: request.scheduledWaitId } : {}), reader: tx })) return false
     const currentRows = await tx.$queryRaw<Array<{ id: string; status: string; attemptCount: number; state: unknown }>>(Prisma.sql`
@@ -178,7 +178,7 @@ async function replayPersistedCompletedAuditReport(request: ScheduledTaskGraphAu
       ? completedScheduledTaskGraphReport({ execution: current, key: currentPrior.key, owner: currentPrior.owner, snapshot,
         attestation: request.attestation, ownedJobs: jobs, checkpointValidatedByPrior: true }) : null)
     if (!isExactCompletedReport(currentReport) || !sameJson(currentReport, report)) return false
-    return isScheduledTaskGraphAuditChildGateProofCurrent({ owner, snapshot, analyzeCheckpoint: proofCheckpoint,
+    return isScheduledTaskGraphAuditCompletedReportGateProofCurrent({ owner, snapshot, analyzeCheckpoint: proofCheckpoint,
       analyzeAttestation: request.attestation, prepareProof: request.prepareProof,
       gate: { taskId: gate.taskId, attemptCount: gate.attemptCount, phase: 'completed', completionProof: request.gateCompletionProof },
       auditActor: request.auditActor }, tx)
