@@ -836,7 +836,7 @@ describe("production child runtime", () => {
     scheduledAuditRuntimeMock.factory.mockReturnValue(fixed)
     const modelFactory = vi.fn(async () => { throw new Error("malformed Audit must not construct a model") })
     const executor = createProductionChildExecutor({ pool: {} as never, modelRuntimeFactory: modelFactory })
-    await expect(executor({ lease: { ...lease(), role: SCHEDULED_AUDIT_ROLE } })).resolves.toEqual({
+    await expect(executor({ lease: { ...lease(), role: "prepare", taskType: SCHEDULED_AUDIT_TASK_TYPE } })).resolves.toEqual({
       status: "failed", failureReason: "scheduled_audit_task_invalid", retryDisposition: "terminal",
     })
     expect(scheduledAuditRuntimeMock.factory).toHaveBeenCalledOnce()
