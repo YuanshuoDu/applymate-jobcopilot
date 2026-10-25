@@ -191,6 +191,16 @@ describe("scheduled pipeline HTTP handoff", () => {
       new AbortController().signal, fetcher)).rejects.toThrow("scheduled_pipeline_handoff_input_invalid")
   })
 
+  it("preserves the terminal invalid Gate proof block from Execute", async () => {
+    const prepared = { prepareProof: { result: {} },
+      gateCompletionProof: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1" } } as const
+    const blocked = { status: "blocked", errorCode: "scheduled_pipeline_gate_proof_invalid" } as const
+    const fetcher = vi.fn<typeof fetch>(async () => reply(409, blocked))
+
+    await expect(postScheduledPipelineExecute({ ...input, ...prepared } as never, new AbortController().signal, fetcher))
+      .resolves.toEqual(blocked)
+  })
+
   it.each([
     { ...report, extra: true }, { ...report, processed: -1 }, { ...report, queued: 1.25 },
     { ...report, durationMs: Number.MAX_SAFE_INTEGER + 1 },

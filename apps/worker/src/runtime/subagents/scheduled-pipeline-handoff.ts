@@ -112,7 +112,8 @@ export async function postScheduledPipelineExecute(input: Readonly<{
     return { status: "waiting_for_user", waitId: payload.waitId }
   }
   const errorCode = payload.errorCode
-  if (response.status >= 400 && response.status < 500 && payload.status === "blocked" && typeof errorCode === "string" && blockedErrors.has(errorCode)) {
+  if (response.status >= 400 && response.status < 500 && payload.status === "blocked" && typeof errorCode === "string"
+    && (blockedErrors.has(errorCode) || errorCode === "scheduled_pipeline_gate_proof_invalid")) {
     return { status: "blocked", errorCode }
   }
   throw new Error(response.status === 202 ? "scheduled_pipeline_handoff_in_progress" : "scheduled_pipeline_handoff_retryable")
