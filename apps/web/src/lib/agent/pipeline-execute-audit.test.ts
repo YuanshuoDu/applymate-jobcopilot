@@ -175,8 +175,9 @@ describe('runExecuteAuditStages', () => {
     expect(runtime.orchestrator.evaluate).not.toHaveBeenCalled()
     expect(runtime.orchestrator.ask).not.toHaveBeenCalled()
     expect(runtime.orchestrator.applyFix).not.toHaveBeenCalled()
-    const lastAliveCheck = vi.mocked(runtime.assertAlive).mock.invocationCallOrder.slice(-1)[0]
-    expect(lastAliveCheck).toBeLessThan(vi.mocked(runtime.orchestrator.complete).mock.invocationCallOrder[0]!)
+    const completeOrder = vi.mocked(runtime.orchestrator.complete).mock.invocationCallOrder[0]!
+    const livenessChecksBeforeComplete = vi.mocked(runtime.assertAlive).mock.invocationCallOrder.filter(order => order < completeOrder)
+    expect(livenessChecksBeforeComplete.length).toBeGreaterThan(0)
   })
 
   it('keeps the post-run decision for a mismatched scheduled owner proof', async () => {

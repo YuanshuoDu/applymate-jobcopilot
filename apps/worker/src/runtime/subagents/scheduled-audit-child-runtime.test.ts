@@ -29,6 +29,8 @@ vi.mock("./pg-task-graph-command-port.js", () => ({ createPgTaskGraphCommandPort
 const digest = `sha256:${"a".repeat(64)}`
 const owner = { userId: "user-audit", sessionId: "session-audit", turnId: "turn-audit", rootTaskId: "root-audit", rootAttemptCount: 1,
   turnLeaseOwnerId: "root-lease", turnLeaseVersion: 2, executionId: "execution-audit", executionAttemptCount: 1 }
+const pipelineOwner = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+  rootAttemptCount: owner.rootAttemptCount, turnLeaseOwnerId: owner.turnLeaseOwnerId, turnLeaseVersion: owner.turnLeaseVersion }
 const stableOwner = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
   rootAttemptCount: owner.rootAttemptCount, executionId: owner.executionId, executionAttemptCount: owner.executionAttemptCount }
 const evidence = { owner, continuationKey: `scheduled-taskgraph:sha256:${"b".repeat(64)}`, snapshotDigest: digest,
@@ -119,8 +121,8 @@ describe("fixed scheduled Audit child runtime", () => {
     expect(fixture.client.release).toHaveBeenCalledOnce()
     expect(mocks.readInvocation).toHaveBeenCalledWith({ scope: { userId: owner.userId, sessionId: owner.sessionId,
       turnId: owner.turnId, rootTaskId: owner.rootTaskId }, auditTaskId: task.id, attemptCount: task.attemptCount,
-      attestation: expect.objectContaining({ owner, graphRevision: 2 }) })
-    expect(mocks.post).toHaveBeenCalledWith(expect.objectContaining({ owner, prepareProof,
+      attestation: expect.objectContaining({ owner: pipelineOwner, graphRevision: 2 }) })
+    expect(mocks.post).toHaveBeenCalledWith(expect.objectContaining({ owner: pipelineOwner, prepareProof,
       gateCompletionProof: gateProof }), task.signal, expect.any(Function))
   })
 

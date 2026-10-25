@@ -127,7 +127,7 @@ export async function verifyScheduledAuditCompletion(client: Queryable,
   const registration = await readScheduledAuditRegistration(client, scope, input.auditTaskId,
     stableOwnerForScope(input.scope, input.executionOwner))
   const task = loaded.tasks.get(input.auditTaskId), current = loaded.state && currentTaskGraph(loaded)
-  if (!registration || !sameRegistrationForCompletion(registration, input) || !loaded.state || !loaded.snapshot || !task
+  if (!registration || !sameRegistrationForCompletion(registration, input) || !loaded.state || !loaded.snapshot || !task || !row
     || !validAuditNode(loaded, input.auditTaskId) || !validAuditTaskRow(row, task) || row.status !== "completed"
     || row.attemptCount !== input.attemptCount || task.attemptCount !== input.attemptCount || task.status !== "completed"
     || task.failureReason !== null || row.failureReason !== null || row.leaseOwner !== null || row.leaseExpiresAt !== null) return null

@@ -124,6 +124,11 @@ function sameJson(left: unknown, right: unknown): boolean {
   try { return stableJson(left) === stableJson(right) } catch { return false }
 }
 
+function record(value: unknown): Record<string, unknown> | null {
+  const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
+  return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null
+}
+
 async function withRead<T>(pool: Pick<pg.Pool, "connect">, userId: string, work: (client: pg.PoolClient) => Promise<T>): Promise<T> {
   const client = await pool.connect(); let committed = false
   try {

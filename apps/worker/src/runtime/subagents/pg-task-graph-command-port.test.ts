@@ -322,7 +322,7 @@ describe("createPgTaskGraphCommandPort", () => {
     const fake = fakePool(scheduleInput()), input = {} as never
     reconciliationMocks.scheduledGateVerification.mockResolvedValue({ graphRevision: 12 })
     const port = createPgTaskGraphCommandPort(fake.pool)
-    await expect(port.verifyScheduledGateCompletion(input)).resolves.toEqual({ graphRevision: 12 })
+    await expect(port.verifyScheduledGateCompletion!(input)).resolves.toEqual({ graphRevision: 12 })
     expect(reconciliationMocks.scheduledGateVerification).toHaveBeenCalledWith(fake.client, input)
     expect(fake.calls.filter(call => call.sql === "BEGIN")).toHaveLength(1)
     expect(fake.calls.filter(call => call.sql === "COMMIT")).toHaveLength(1)

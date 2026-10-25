@@ -4,6 +4,7 @@ import { readScheduledAuditInvocationProof, readScheduledAuditRegistration } fro
 import { SCHEDULED_PIPELINE_ATTESTATION_SCHEMA } from "./scheduled-automation-pipeline-bridge.js"
 import { scheduledGateProposal, SCHEDULED_GATE_OUTPUT_SCHEMA, SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
 import { canonicalTaskGraphJson, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
+import type { Queryable } from "./pg-store-persistence.js"
 import { scheduledAuditProposal, scheduledAuditRegistrationReceiptKey, SCHEDULED_AUDIT_OUTPUT_SCHEMA,
   SCHEDULED_AUDIT_REGISTRATION_RECEIPT_SCHEMA, SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE } from "./scheduled-audit-contract.js"
 
@@ -79,7 +80,7 @@ const loaded = { rootTaskId: owner.rootTaskId, item: { id: "graph", revision: 14
     ["audit-task", task("audit-task", "running", SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE, SCHEDULED_AUDIT_OUTPUT_SCHEMA, 2, null)],
   ]) }
 
-function database(eventPayload: unknown = registration, hasOutbox = false, executionStatus = "running") {
+function database(eventPayload: unknown = registration, hasOutbox = false, executionStatus = "running"): Queryable {
   const query = vi.fn(async (sql: string) => {
     if (sql.includes("FROM \"agent_events\" AS event")) return { rows: [{ itemId: null, taskId: null, actor: "system",
       idempotencyKey: scheduledAuditRegistrationReceiptKey(continuationKey, "audit-task"), payload: eventPayload, hasOutbox }], rowCount: 1 }
@@ -91,7 +92,7 @@ function database(eventPayload: unknown = registration, hasOutbox = false, execu
       allowedActions: [], context: {}, result: gateResult, failureReason: null, leaseOwner: null, leaseExpiresAt: null }], rowCount: 1 }
     return { rows: [], rowCount: 0 }
   })
-  return { query }
+  return { query } as unknown as Queryable
 }
 
 describe("scheduled Audit invocation proof readback", () => {

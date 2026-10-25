@@ -78,7 +78,9 @@ const registration = parseScheduledAuditRegistrationReceipt({ schemaVersion: SCH
   expectedAttemptCount: 1 })!
 const contract = { binding, receipt: { continuationKey } }
 const attestation = { snapshotDigest }
-const handoff = {}
+const handoff = { status: "analyze_checkpointed" as const, continuationKey, checkpointDigest: binding.checkpointDigest,
+  claimTokenDigest: `sha256:${"f".repeat(64)}`, executionId: owner.executionId,
+  executionAttemptCount: owner.executionAttemptCount }
 const report = { processed: 2, applied: 0, queued: 1, pending: 1, skipped: 0, failed: 0, durationMs: 10 }
 const auditResult = { finalItemId: null, finalText: "", status: "completed", stepCount: 0, toolCallCount: 0,
   taskGraphVerificationReport: null, structuredResult: report }

@@ -79,7 +79,7 @@ export async function verifyRegisteredScheduledAuditGate(client: Queryable, scop
   const turn = await readTurn(client, scope)
   if (!snapshot || !state || snapshot.nodes.length !== 5 || state.revision < registration.auditAppendRevision
     || !gateNode || !gate || !prepareNode || !prepare
-    || executionRows.rows.length !== 1 || !["running", "completed"].includes(String(execution?.status))
+    || executionRows.rows.length !== 1 || !execution || !["running", "completed"].includes(String(execution.status))
     || Number(execution.attemptCount) !== registration.owner.executionAttemptCount || !evidence || !turn
     || !scheduledSnapshotMatches(turn, registration.snapshotDigest) || !evidenceOwns(evidence, registration)
     || gateNode.templateId !== "gate" || gateNode.depth !== 4 || gateNode.verificationDisposition !== "specialized"
