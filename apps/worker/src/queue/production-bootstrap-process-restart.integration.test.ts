@@ -1662,7 +1662,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     const suffix = randomUUID()
     const userId = `policy-replay-user-${suffix}`
     const sessionId = `policy-replay-session-${suffix}`
-    const jobId = `policy-replay-job-${suffix}`
+    const jobId = randomUUID()
     const searchTarget = `PolicyReplay-${suffix}`
     const toolCallId = `policy-replay-read-${suffix}`
     const policyIds: FixtureIds = {
