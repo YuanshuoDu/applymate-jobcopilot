@@ -194,10 +194,12 @@ describe("fixed scheduled Audit child runtime", () => {
   it("replays only the exact persisted report when the execution is already completed", async () => {
     const fixture = setup()
     fixture.live.executionStatus = "completed"
+    fixture.live.state = { nextStage: "completed", report }
     await expect(createScheduledAuditChildExecutor({ pool: fixture.pool as never })({ lease: lease() })).resolves.toEqual({
       status: "completed", result: { finalItemId: null, finalText: "", status: "completed", stepCount: 0, toolCallCount: 0,
         taskGraphVerificationReport: null, structuredResult: report },
     })
+    expect(mocks.evidence).toHaveBeenCalledWith({ nextStage: "gate", report })
     expect(mocks.post).toHaveBeenCalledOnce()
   })
 

@@ -14,12 +14,24 @@ import { canonicalTaskGraphJson as snapshotJson, taskGraphLifecycleKey } from ".
 import { parseScheduledAuditRegistrationReceipt, scheduledAuditRegistrationReceiptKey,
   SCHEDULED_AUDIT_INVOCATION_PROOF_SCHEMA, SCHEDULED_AUDIT_NODE_CRITERIA, SCHEDULED_AUDIT_NODE_GOAL,
   SCHEDULED_AUDIT_OUTPUT_SCHEMA, SCHEDULED_AUDIT_REGISTRATION_RECEIPT_EVENT,
-  SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE, SCHEDULED_AUDIT_TEMPLATE_ID,
+  SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE, SCHEDULED_AUDIT_TEMPLATE_ID, parseScheduledAuditReport,
   type ScheduledAuditInvocationProof, type ScheduledAuditOwner, type ScheduledAuditRegistrationReceipt,
   type ScheduledAuditInvocationScope, type TaskGraphScheduledAuditInvocationInput } from "./scheduled-audit-contract.js"
+import type { ScheduledGateCheckpointEvidence } from "./scheduled-gate-contract.js"
 
 type Row = Record<string, unknown>
 type Registration = ScheduledAuditRegistrationReceipt
+
+/** Adapts only an exact completed Audit report checkpoint to the unchanged Gate evidence parser. */
+export function scheduledAuditGateCheckpointEvidence(value: unknown, executionStatus: unknown): ScheduledGateCheckpointEvidence | null {
+  const state = record(value)
+  if (executionStatus === "completed") {
+    if (!state || state.nextStage !== "completed" || !parseScheduledAuditReport(state.report)) return null
+    return scheduledGateCheckpointEvidence({ ...state, nextStage: "gate" })
+  }
+  if (executionStatus !== "running" && executionStatus !== "paused") return null
+  return scheduledGateCheckpointEvidence(value)
+}
 
 /** Reloads the server-only binding and canonical Gate/Prepare proof for a running Audit lease. */
 export async function readScheduledAuditInvocationProof(client: Queryable,
@@ -75,7 +87,7 @@ export async function verifyRegisteredScheduledAuditGate(client: Queryable, scop
   const prepare = prepareNode && loaded.tasks.get(prepareNode.taskId)
   const executionRows = await client.query(`SELECT "id", "status", "attemptCount", "state" FROM "agent_executions"
     WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3`, [registration.owner.executionId, scope.userId, scope.sessionId])
-  const execution = record(executionRows.rows[0]), evidence = scheduledGateCheckpointEvidence(execution?.state)
+  const execution = record(executionRows.rows[0]), evidence = scheduledAuditGateCheckpointEvidence(execution?.state, execution?.status)
   const turn = await readTurn(client, scope)
   if (!snapshot || !state || snapshot.nodes.length !== 5 || state.revision < registration.auditAppendRevision
     || !gateNode || !gate || !prepareNode || !prepare

@@ -4,7 +4,8 @@ import { postScheduledPipelineExecute } from "./scheduled-pipeline-handoff.js"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import { currentTaskGraph, loadTaskGraph, type GraphIdentityScope, type GraphTaskRow } from "./task-graph-pg-state.js"
 import { canonicalTaskGraphJson, taskGraphFingerprint } from "./task-graph-snapshot.js"
-import { scheduledGateCheckpointEvidence, scheduledGatePreparedJobIds, SCHEDULED_GATE_OUTPUT_SCHEMA, SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
+import { scheduledGatePreparedJobIds, SCHEDULED_GATE_OUTPUT_SCHEMA, SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
+import { scheduledAuditGateCheckpointEvidence } from "./scheduled-audit-invocation.js"
 import { readScheduledGateRegistrationReceipt } from "./scheduled-gate-registration-receipt.js"
 import { loadPersistedScheduledPrepareProof } from "./scheduled-gate-wait-match.js"
 import { scheduledSnapshotMatches } from "./scheduled-taskgraph-continuation-receipt.js"
@@ -73,7 +74,7 @@ async function loadScheduledAuditInvocation(pool: Pick<pg.Pool, "connect">, leas
   try {
     await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
     await client.query("SELECT set_config('app.user_id', $1, true)", [lease.userId])
-    const live = await readLiveScope(client, lease, now), evidence = scheduledGateCheckpointEvidence(live.state)
+    const live = await readLiveScope(client, lease, now), evidence = scheduledAuditGateCheckpointEvidence(live.state, live.executionStatus)
     if (!evidence || evidence.owner.userId !== lease.userId || evidence.owner.sessionId !== lease.sessionId
       || evidence.owner.turnId !== lease.turnId || evidence.owner.rootTaskId !== lease.rootTaskId
       || evidence.owner.rootAttemptCount !== Number(live.rootAttemptCount) || evidence.owner.executionId !== live.executionId

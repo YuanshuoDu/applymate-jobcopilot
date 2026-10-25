@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 import { beforeEach, describe, expect, it, vi } from "vitest"
-import { readScheduledAuditInvocationProof, readScheduledAuditRegistration } from "./scheduled-audit-invocation.js"
+import { readScheduledAuditInvocationProof, readScheduledAuditRegistration, scheduledAuditGateCheckpointEvidence } from "./scheduled-audit-invocation.js"
 import { SCHEDULED_PIPELINE_ATTESTATION_SCHEMA } from "./scheduled-automation-pipeline-bridge.js"
 import { scheduledGateProposal, SCHEDULED_GATE_OUTPUT_SCHEMA, SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
 import { canonicalTaskGraphJson, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
@@ -54,6 +54,7 @@ const registration = { schemaVersion: SCHEDULED_AUDIT_REGISTRATION_RECEIPT_SCHEM
   prepareScheduleRevision: 8, prepareWaitId: "prepare-wait", gateTaskId: "gate-task", gateAttemptCount: 1,
   gateResultDigest, gateCompletedEventRevision: 12, gateProofDigest, scheduledWaitId: "scheduled-wait", auditTaskId: "audit-task",
   gateGraphRevision: 12, auditAppendRevision: 13, expectedAttemptCount: 1 }
+const auditReport = { processed: 2, applied: 0, queued: 0, pending: 1, skipped: 1, failed: 0, durationMs: 9 }
 const gateRegistration = { owner, continuationKey, prepareWaitId: "prepare-wait", gateAppendRevision: 9 }
 const gateDefinition = scheduledGateProposal(11).nodes[0]!
 const auditDefinition = scheduledAuditProposal(12).nodes[0]!
@@ -80,12 +81,23 @@ const loaded = { rootTaskId: owner.rootTaskId, item: { id: "graph", revision: 14
     ["audit-task", task("audit-task", "running", SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE, SCHEDULED_AUDIT_OUTPUT_SCHEMA, 2, null)],
   ]) }
 
-function database(eventPayload: unknown = registration, hasOutbox = false, executionStatus = "running"): Queryable {
+function checkpointState(nextStage: string, report?: unknown) {
+  return { nextStage, scoutedJobs: [{ id: "job-1", userId: owner.userId }],
+    scoredJobs: [{ job: { id: "job-1", userId: owner.userId }, score: 80, matchedKeywords: ["TypeScript"],
+      missingKeywords: [], recommendation: "Apply after tailoring.", analysisFenceAt: "2026-10-06T10:00:00.000Z" }],
+    analysisFailed: 0, scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1",
+      key: continuationKey, owner: { ...attestation.owner, executionId: owner.executionId,
+        executionAttemptCount: owner.executionAttemptCount }, snapshotDigest, graphRevision: 7, evidenceDigest: evidence.evidenceDigest },
+    ...(report === undefined ? {} : { report }) }
+}
+
+function database(eventPayload: unknown = registration, hasOutbox = false, executionStatus = "running",
+  executionState: unknown = executionStatus === "completed" ? checkpointState("completed", auditReport) : {}): Queryable {
   const query = vi.fn(async (sql: string) => {
     if (sql.includes("FROM \"agent_events\" AS event")) return { rows: [{ itemId: null, taskId: null, actor: "system",
       idempotencyKey: scheduledAuditRegistrationReceiptKey(continuationKey, "audit-task"), payload: eventPayload, hasOutbox }], rowCount: 1 }
     if (sql.includes("FROM \"agent_executions\"")) return { rows: [{ id: owner.executionId, status: executionStatus,
-      attemptCount: owner.executionAttemptCount, state: {} }], rowCount: 1 }
+      attemptCount: owner.executionAttemptCount, state: executionState }], rowCount: 1 }
     if (sql.includes("FROM \"agent_turns\"")) return { rows: [{ source: "automation", executionMode: "canonical_task_graph", input: {} }], rowCount: 1 }
     if (sql.includes("FROM \"sub_agent_tasks\"")) return { rows: [{ status: "completed", attemptCount: 1,
       role: SCHEDULED_GATE_ROLE, taskType: SCHEDULED_GATE_TASK_TYPE, expectedOutputSchema: SCHEDULED_GATE_OUTPUT_SCHEMA,
@@ -125,6 +137,28 @@ describe("scheduled Audit invocation proof readback", () => {
     expect(result).toMatchObject({ owner, snapshotDigest, attestation, prepareProof: prepare, gateProof,
       scheduledWaitId: "scheduled-wait", auditTaskId: "audit-task", attemptCount: 2, graphRevision: 14 })
     expect(mocks.verifyPrefix).toHaveBeenCalledOnce()
+  })
+
+  it("adapts only an exact completed Audit report through the unchanged Gate checkpoint parser", async () => {
+    const actual = await vi.importActual<typeof import("./scheduled-gate-contract.js")>("./scheduled-gate-contract.js")
+    mocks.evidence.mockImplementation(actual.scheduledGateCheckpointEvidence)
+    const completed = checkpointState("completed", auditReport), before = structuredClone(completed)
+    const expected = actual.scheduledGateCheckpointEvidence({ ...completed, nextStage: "gate" })
+    expect(expected).not.toBeNull()
+    expect(scheduledAuditGateCheckpointEvidence(completed, "completed")).toEqual(expected)
+    expect(completed).toEqual(before)
+
+    const withoutReport = Object.fromEntries(Object.entries(completed).filter(([key]) => key !== "report"))
+    expect(scheduledAuditGateCheckpointEvidence(withoutReport, "completed")).toBeNull()
+    expect(scheduledAuditGateCheckpointEvidence({ ...completed, report: { ...auditReport, extra: true } }, "completed")).toBeNull()
+    for (const stage of ["execute", "audit"]) {
+      expect(scheduledAuditGateCheckpointEvidence({ ...completed, nextStage: stage }, "completed")).toBeNull()
+    }
+    expect(scheduledAuditGateCheckpointEvidence(completed, "running")).toBeNull()
+
+    const gateState = checkpointState("gate")
+    expect(scheduledAuditGateCheckpointEvidence(gateState, "running")).toEqual(actual.scheduledGateCheckpointEvidence(gateState))
+    expect(scheduledAuditGateCheckpointEvidence(gateState, "paused")).toEqual(actual.scheduledGateCheckpointEvidence(gateState))
   })
 
   it("rebinds Gate proof while the execution is paused for its Audit child", async () => {
