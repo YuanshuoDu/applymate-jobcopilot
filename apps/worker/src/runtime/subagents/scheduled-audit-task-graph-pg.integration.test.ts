@@ -7,7 +7,12 @@ import type { ModelAdapter } from "@jobcopilot/agent-model"
 import { TurnEngine } from "../turns/turn-engine.js"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
 import type { TurnEngineOptions, TurnEngineResult } from "../turns/turn-engine-types.js"
+import { runTurnJob } from "../turns/turn-queue.js"
+import { dispatchPendingTurnOutbox } from "../turns/recovery-scanner.js"
+import type { TurnJobPayload, TurnLease } from "../turns/lease.js"
 import { createPgDurableWaitPort } from "./durable-wait-store.js"
+import { suspendAndReleaseWait } from "./durable-wait-handoff.js"
+import { reconcileDurableWaits } from "./durable-wait-resolver.js"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import { createPgRootTaskStore } from "./root-task-store.js"
 import { createScheduledPipelineCandidateStore, SCHEDULED_PIPELINE_CANDIDATE_EVENT } from "./scheduled-pipeline-candidate-store.js"
@@ -201,8 +206,11 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(auditWait.waitId).not.toBe(initialGateWait.waitId)
     expect(await requireGateProof(fixture)).toEqual(gateProof)
     await rootStore.finish({ lease: fixture.turnLease, rootTaskId: fixture.ids.rootTaskId, result: pendingRoot })
+    await expect(suspendAndReleaseWait(pool as never, { lease: fixture.turnLease, waitId: auditWait.waitId }))
+      .resolves.toMatchObject({ waitId: auditWait.waitId, handoff: "suspended", waitStatus: "waiting" })
     const pendingRootState = await readRootTurnState(fixture)
-    expect(pendingRootState.turnStatus).toBe("in_progress")
+    expect(pendingRootState.turnStatus).toBe("waiting_for_dependency")
+    expect(pendingRootState.turnLeaseOwnerId).toBeNull()
     expect(pendingRootState.rootStatus).toBe("waiting")
     expect(pendingRootState.rootResult).toMatchObject({ status: "waiting_for_dependency", waitId: auditWait.waitId })
     const auditTaskId = await findTaskId(SCHEDULED_AUDIT_TASK_TYPE, fixture.ids.rootTaskId)
@@ -246,35 +254,23 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     const queued = await taskState(auditTaskId)
     expect(queued).toMatchObject({ status: "queued", attemptCount: 1, result: null })
 
-    const retryRoot = await runAttachedScheduledAuditRoot(fixture, response.fetcher, command, waitPort,
-      "waiting_for_dependency", captureAuditAppendReplay)
-    expect(retryRoot.status).toBe("waiting_for_dependency")
-    if (retryRoot.status !== "waiting_for_dependency" || !retryRoot.waitId) throw new Error("scheduled Audit retry root wait missing")
-    const retryTrace = await readScheduledAuditRootRecoveryTrace(fixture)
-    expectScheduledAuditRecoveryTrace(retryTrace, fixture, 2, "waiting_for_tool", null)
-    expect(retryTrace.candidateEvent.id).toBe(pendingTrace.candidateEvent.id)
-    expect(retryTrace.candidatePayload).toEqual(pendingTrace.candidatePayload)
-    expect(retryTrace.sourceStep).toEqual(pendingTrace.sourceStep)
-    expect(auditReplayCaptures).toHaveLength(2)
-    expect(auditReplayCaptures[1]).toMatchObject({ mode: "resume_audit", recoveryStepId: retryTrace.steps[1]?.id,
-      receipt: { status: "duplicate", auditTaskId, expectedAttemptCount: 2 } })
-    expect(auditReplayCaptures[1]?.recoveryStepId).not.toBe(auditReplayCaptures[0]?.recoveryStepId)
-    expect((await graphCount(fixture)).auditNodes).toBe(1)
-    const retryDispatchOutbox = await pool!.query<{ id: string }>(`SELECT "id" FROM "agent_outbox"
-      WHERE "topic" = 'agent.subagent.dispatch' AND "aggregateId" = $1 AND "idempotencyKey" = $2`,
-    [fixture.ids.sessionId, `subagent-dispatch:${auditTaskId}`])
-    expect(retryDispatchOutbox.rows).toHaveLength(1)
-    expect(await requireGateProof(fixture)).toEqual(gateProof)
-    const retryWait = { status: "waiting_for_dependency" as const, waitId: retryRoot.waitId }
-    await rootStore.finish({ lease: fixture.turnLease, rootTaskId: fixture.ids.rootTaskId, result: retryRoot })
-    const retryRootState = await readRootTurnState(fixture)
-    expect(retryRootState.turnStatus).toBe("in_progress")
-    expect(retryRootState.rootStatus).toBe("waiting")
-    expect(retryRootState.rootResult).toMatchObject({ status: "waiting_for_dependency", waitId: retryWait.waitId })
+    const parkedAfterRetry = await readRootTurnState(fixture)
+    expect(parkedAfterRetry).toMatchObject({ turnStatus: "waiting_for_dependency", turnLeaseOwnerId: null,
+      rootStatus: "waiting", rootResult: { status: "waiting_for_dependency", waitId: auditWait.waitId } })
+    await expect(reconcileDurableWaits(pool as never, { ownerId: "scheduled-audit-resolver-before-retry" }))
+      .resolves.toMatchObject({ woken: 0 })
+    expect(await readRootTurnState(fixture)).toMatchObject({ turnStatus: "waiting_for_dependency", turnLeaseOwnerId: null })
     runner = startRunner(fixture, response.fetcher)
+    expect(await readRootTurnState(fixture)).toMatchObject({ turnStatus: "waiting_for_dependency", turnLeaseOwnerId: null })
     await expect(dispatchAndWait(runner, auditTaskId, fixture.ids.sessionId)).resolves.toMatchObject({ status: "completed" })
     expect(response.executeCalls()).toBe(2)
-    expect(response.replayedExecuteRequest()).toEqual(response.firstExecuteRequest())
+    const firstRequest = response.firstExecuteRequest()!
+    const retryRequest = response.replayedExecuteRequest()!
+    const { auditActor: firstActor, ...firstRequestProof } = firstRequest
+    const { auditActor: retryActor, ...retryRequestProof } = retryRequest
+    expect(retryRequestProof).toEqual(firstRequestProof)
+    expect(firstActor).toMatchObject({ taskId: auditTaskId, attemptCount: 1, leaseOwner: expect.any(String) })
+    expect(retryActor).toMatchObject({ taskId: auditTaskId, attemptCount: 2, leaseOwner: expect.any(String) })
     expect(response.replayedExecuteResponse()).toEqual(firstHttpResponse)
     expect(await readExecutionState(fixture)).toEqual(firstExecutionState)
 
@@ -284,46 +280,57 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
       finalItemId: null, finalText: "", status: "completed", stepCount: 0, toolCallCount: 0,
       taskGraphVerificationReport: null, structuredResult: response.report(),
     })
-    const proofInput = { scope: { ...fixture.graphScope, turnLeaseOwner: fixture.owner.turnLeaseOwnerId,
-      turnLeaseVersion: fixture.owner.turnLeaseVersion, parentLeaseOwner: fixture.owner.turnLeaseOwnerId,
-      parentAttemptCount: fixture.owner.rootAttemptCount }, executionOwner: fixture.executionOwner,
-      gateProof, auditTaskId, attemptCount: 2 }
+    let proofLease = fixture.turnLease
     const terminalAuditProofCaptures: Array<{ current: Awaited<ReturnType<NonNullable<typeof command.verifyScheduledAuditCompletion>>>;
       staleAttempt: Awaited<ReturnType<NonNullable<typeof command.verifyScheduledAuditCompletion>>> }> = []
     const captureTerminalAuditProof = async (_recoveryStepId: string, mode: "append_audit" | "resume_audit"): Promise<void> => {
       if (mode !== "resume_audit") throw new Error("terminal Audit proof must use the existing Audit resume path")
+      const proofInput = { scope: { ...fixture.graphScope, turnLeaseOwner: proofLease.ownerId,
+        turnLeaseVersion: proofLease.leaseVersion, parentLeaseOwner: proofLease.ownerId,
+        parentAttemptCount: fixture.owner.rootAttemptCount }, executionOwner: fixture.executionOwner,
+        gateProof, auditTaskId, attemptCount: 2 }
       const current = await command.verifyScheduledAuditCompletion!(proofInput)
       const staleAttempt = await command.verifyScheduledAuditCompletion!({ ...proofInput, attemptCount: 1 })
       terminalAuditProofCaptures.push({ current, staleAttempt })
     }
 
-    const auditWake = await waitPort.resolve({ userId: fixture.ids.userId, sessionId: fixture.ids.sessionId, waitId: retryWait.waitId })
-    expect(auditWake).toMatchObject({ status: "ready", matchedTaskIds: [auditTaskId] })
-    const staleAuditPort = command as typeof command & {
-      verifyScheduledAuditCompletion: NonNullable<typeof command.verifyScheduledAuditCompletion>
-    }
-    const verifyAudit = staleAuditPort.verifyScheduledAuditCompletion.bind(staleAuditPort)
-    const staleAuditProof = vi.spyOn(staleAuditPort, "verifyScheduledAuditCompletion").mockImplementation(proof =>
-      verifyAudit({ ...proof, attemptCount: 1 }))
-    let staleRoot: TurnEngineResult
-    try { staleRoot = await runAttachedScheduledAuditRoot(fixture, response.fetcher, command, waitPort) }
-    finally { staleAuditProof.mockRestore() }
-    expect(staleRoot).toMatchObject({ status: "waiting_for_dependency", errorCode: "scheduled_audit_completion_unverified" })
-    await rootStore.finish({ lease: fixture.turnLease, rootTaskId: fixture.ids.rootTaskId, result: staleRoot })
-    const staleTrace = await readScheduledAuditRootRecoveryTrace(fixture)
-    expectScheduledAuditRecoveryTrace(staleTrace, fixture, 3, "waiting_for_tool", "scheduled_audit_completion_unverified")
-    expect(staleTrace.candidateEvent.id).toBe(pendingTrace.candidateEvent.id)
-    expect(staleTrace.candidatePayload).toEqual(pendingTrace.candidatePayload)
-    expect(staleTrace.sourceStep).toEqual(pendingTrace.sourceStep)
-    expect(staleTrace.steps[2]?.completionEvents[0]?.payload).toEqual({ stepId: staleTrace.steps[2]?.id,
-      status: "waiting_for_dependency", errorCode: "scheduled_audit_completion_unverified", taskId: fixture.ids.rootTaskId })
-    expect(staleTrace.steps[2]?.waits).toEqual([])
-    const staleRootState = await readRootTurnState(fixture)
-    expect(staleRootState.turnStatus).toBe("in_progress")
-    expect(staleRootState.rootStatus).toBe("waiting")
-
-    const terminalRoot = await runAttachedScheduledAuditRoot(fixture, response.fetcher, command, waitPort,
-      undefined, undefined, captureTerminalAuditProof)
+    const reconciled = await reconcileDurableWaits(pool as never, { ownerId: "scheduled-audit-resolver" })
+    expect(reconciled.woken).toBe(1)
+    const auditWake = await pool!.query<{ status: string; matchedTaskIds: unknown }>(
+      `SELECT "status", "matchedTaskIds" FROM "agent_wait_conditions" WHERE "id"=$1`, [auditWait.waitId])
+    expect(auditWake.rows).toMatchObject([{ status: "ready", matchedTaskIds: [auditTaskId] }])
+    expect(await readRootTurnState(fixture)).toMatchObject({ turnStatus: "queued", turnLeaseOwnerId: null, rootStatus: "waiting" })
+    const turnJobs: TurnJobPayload[] = []
+    expect(await dispatchPendingTurnOutbox(pool as never, { add: async (_name, payload) => { turnJobs.push(payload) } })).toBe(1)
+    expect(turnJobs).toHaveLength(1)
+    let terminalRoot: TurnEngineResult | undefined
+    let resumedLease: TurnLease | undefined
+    const resumedJob = await runTurnJob({ data: turnJobs[0]!, attemptsMade: 0 }, { pool: pool as never,
+      requireCanonicalAutomationMode: true, heartbeatMs: 60_000,
+      async execute({ lease }) {
+        resumedLease = lease
+        proofLease = lease
+        const staleAuditPort = command as typeof command & {
+          verifyScheduledAuditCompletion: NonNullable<typeof command.verifyScheduledAuditCompletion>
+        }
+        const verifyAudit = staleAuditPort.verifyScheduledAuditCompletion.bind(staleAuditPort)
+        const staleAuditProof = vi.spyOn(staleAuditPort, "verifyScheduledAuditCompletion").mockImplementation(proof =>
+          verifyAudit({ ...proof, attemptCount: 1 }))
+        let staleRoot: TurnEngineResult
+        try { staleRoot = await runAttachedScheduledAuditRoot(fixture, response.fetcher, command, waitPort,
+          undefined, undefined, undefined, lease) }
+        finally { staleAuditProof.mockRestore() }
+        expect(staleRoot).toMatchObject({ status: "waiting_for_dependency", errorCode: "scheduled_audit_completion_unverified" })
+        expect(staleRoot).not.toMatchObject({ status: "completed" })
+        expect(await readRootTurnState(fixture)).toMatchObject({ turnStatus: "in_progress",
+          turnLeaseOwnerId: lease.ownerId, rootStatus: "running" })
+        terminalRoot = await runAttachedScheduledAuditRoot(fixture, response.fetcher, command, waitPort,
+          undefined, undefined, captureTerminalAuditProof, lease)
+        await rootStore.finish({ lease, rootTaskId: fixture.ids.rootTaskId, result: terminalRoot })
+        return terminalRoot
+      } })
+    expect(resumedJob).toMatchObject({ status: "completed" })
+    expect(resumedLease?.leaseVersion).toBe(fixture.turnLease.leaseVersion + 1)
     expect(terminalRoot).toMatchObject({ status: "completed", finalText: "Scheduled Gate integration candidate." })
     expect(terminalAuditProofCaptures.length).toBeGreaterThan(0)
     const terminalAuditProof = terminalAuditProofCaptures.at(-1)
@@ -331,21 +338,20 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
       audit: { taskId: auditTaskId, attemptCount: 2 }, report: response.report() })
     expect(terminalAuditProof?.current?.report).toEqual(response.report())
     expect(terminalAuditProof?.staleAttempt).toBeNull()
-    await rootStore.finish({ lease: fixture.turnLease, rootTaskId: fixture.ids.rootTaskId, result: terminalRoot })
     const terminalTrace = await readScheduledAuditRootRecoveryTrace(fixture)
-    expectScheduledAuditRecoveryTrace(terminalTrace, fixture, 4, "completed", null)
+    expectScheduledAuditRecoveryTrace(terminalTrace, fixture, 3, "completed", null)
     expect(terminalTrace.candidateEvent.id).toBe(pendingTrace.candidateEvent.id)
     expect(terminalTrace.candidatePayload).toEqual(pendingTrace.candidatePayload)
     expect(terminalTrace.sourceStep).toEqual(pendingTrace.sourceStep)
-    expect(terminalTrace.steps[3]?.completionEvents[0]?.payload).toEqual({ stepId: terminalTrace.steps[3]?.id,
+    expect(terminalTrace.steps[2]?.completionEvents[0]?.payload).toEqual({ stepId: terminalTrace.steps[2]?.id,
       status: "completed", taskId: fixture.ids.rootTaskId })
     expect(terminalTrace.steps.map(step => step.id)).toEqual(expect.arrayContaining([
-      pendingTrace.steps[0]?.id, retryTrace.steps[1]?.id, staleTrace.steps[2]?.id, terminalTrace.steps[3]?.id,
+      pendingTrace.steps[0]?.id, terminalTrace.steps[1]?.id, terminalTrace.steps[2]?.id,
     ]))
     const terminalRootState = await readRootTurnState(fixture)
     expect(terminalRootState.turnStatus).toBe("completed")
     expect(terminalRootState.rootStatus).toBe("completed")
-    expect(terminalRootState.rootResult).toMatchObject({ status: "completed", finalItemId: terminalRoot.finalItemId })
+    expect(terminalRootState.rootResult).toMatchObject({ status: "completed", finalItemId: terminalRoot!.finalItemId })
 
     const graph = await loadTaskGraph(pool as never, fixture.graphScope, false)
     const auditNode = graph.snapshot?.nodes.find(node => node.key === SCHEDULED_AUDIT_TEMPLATE_ID)
@@ -365,7 +371,8 @@ async function runAttachedScheduledAuditRoot(fixture: Fixture, fetcher: typeof f
   commandPort: ReturnType<typeof createPgTaskGraphCommandPort>, waitPort: ReturnType<typeof createPgDurableWaitPort>,
   expectedStatus?: "waiting_for_dependency",
   afterAuditWait?: (recoveryStepId: string, mode: "append_audit" | "resume_audit") => Promise<void>,
-  afterAuditCompletion?: (recoveryStepId: string, mode: "append_audit" | "resume_audit") => Promise<void>): Promise<TurnEngineResult> {
+  afterAuditCompletion?: (recoveryStepId: string, mode: "append_audit" | "resume_audit") => Promise<void>,
+  activeLease: TurnLease = fixture.turnLease): Promise<TurnEngineResult> {
   const phases: Array<{ phase: string; outcome?: string; errorClass?: string; errorCode?: string }> = []
   const safeStatuses = new Set(["ready", "blocked", "not_registered", "completed", "waiting_for_dependency", "waiting_for_choice",
     "waiting_for_external_user", "waiting_for_user", "invalid", "failed", "interrupted"])
@@ -404,8 +411,9 @@ async function runAttachedScheduledAuditRoot(fixture: Fixture, fetcher: typeof f
     }
   }
   const run = async (): Promise<TurnEngineResult> => {
-    const lease = fixture.turnLease, owner = { ...fixture.owner, turnLeaseOwnerId: lease.ownerId, turnLeaseVersion: lease.leaseVersion }
-    const executionOwner = fixture.turnExecutionOwner as TurnExecutionOwnerFence
+    const lease = activeLease, owner = { ...fixture.owner, turnLeaseOwnerId: lease.ownerId, turnLeaseVersion: lease.leaseVersion }
+    const executionOwner: TurnExecutionOwnerFence = { ...fixture.turnExecutionOwner, ownerId: lease.ownerId,
+      leaseVersion: lease.leaseVersion, leaseExpiresAt: lease.leaseExpiresAt }
     const store = createPgTurnEngineStore(pool as never), candidateStore = createScheduledPipelineCandidateStore(pool as never, store)
     const rootStore = createPgRootTaskStore(pool as never)
     await observe("root.ensure", () => rootStore.ensure({ lease, goal: "Finish the scheduled automation only after its current Audit proof",
@@ -413,6 +421,7 @@ async function runAttachedScheduledAuditRoot(fixture: Fixture, fetcher: typeof f
     const recoveredCandidate = await observe("candidate.read", () => candidateStore.read({ owner: executionOwner,
       rootAttemptCount: owner.rootAttemptCount }), value => value ? "present" : "absent")
     if (!recoveredCandidate) throw new Error("scheduled Audit root candidate missing")
+    const resumeOrdinal = recoveredCandidate.recoveryTail?.ordinal ?? recoveredCandidate.finalStepOrdinal
     phases.push({ phase: "owner_attempt_binding", outcome: owner.rootAttemptCount === fixture.owner.rootAttemptCount
       && owner.turnLeaseOwnerId === lease.ownerId && owner.turnLeaseVersion === lease.leaseVersion
       && executionOwner.userId === owner.userId && executionOwner.sessionId === owner.sessionId
@@ -476,7 +485,7 @@ async function runAttachedScheduledAuditRoot(fixture: Fixture, fetcher: typeof f
       store, model, tools: [], executeTool: async ({ call }) => ({ id: call.id, toolName: call.toolName,
         toolVersion: call.toolVersion, status: "completed", errorCode: null }), completionGate,
       recoveredFinalCandidate: recoveredCandidate.candidateText,
-      resume: { nextOrdinal: recoveredCandidate.finalStepOrdinal + 1, stepCount: recoveredCandidate.finalStepOrdinal + 1,
+      resume: { nextOrdinal: resumeOrdinal + 1, stepCount: resumeOrdinal + 1,
         toolCallCount: 0, inputThroughSequence: 0n, consumedInputIds: [],
         usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } } }
     return new TurnEngine(options).run()
@@ -586,15 +595,18 @@ function expectScheduledAuditRecoveryTrace(trace: Awaited<ReturnType<typeof read
   expect(trace.steps.at(-1)).toMatchObject({ status, errorCode })
 }
 
-async function readRootTurnState(fixture: Fixture): Promise<Readonly<{ turnStatus: string; rootStatus: string; rootResult: Record<string, unknown> | null }>> {
-  const result = await pool!.query<{ turnStatus: string; rootStatus: string; rootResult: unknown }>(
-    `SELECT turn."status" AS "turnStatus", root."status" AS "rootStatus", root."result" AS "rootResult"
+async function readRootTurnState(fixture: Fixture): Promise<Readonly<{ turnStatus: string; turnLeaseOwnerId: string | null;
+  rootStatus: string; rootResult: Record<string, unknown> | null }>> {
+  const result = await pool!.query<{ turnStatus: string; turnLeaseOwnerId: string | null; rootStatus: string; rootResult: unknown }>(
+    `SELECT turn."status" AS "turnStatus", turn."leaseOwnerId" AS "turnLeaseOwnerId",
+       root."status" AS "rootStatus", root."result" AS "rootResult"
        FROM "agent_turns" AS turn JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId"
        WHERE turn."id" = $1 AND turn."sessionId" = $2 AND root."id" = $3`,
     [fixture.ids.turnId, fixture.ids.sessionId, fixture.ids.rootTaskId])
   const row = result.rows[0]
   if (!row) throw new Error("scheduled Audit root Turn state missing")
-  return { turnStatus: row.turnStatus, rootStatus: row.rootStatus, rootResult: debugRecord(row.rootResult) }
+  return { turnStatus: row.turnStatus, turnLeaseOwnerId: row.turnLeaseOwnerId,
+    rootStatus: row.rootStatus, rootResult: debugRecord(row.rootResult) }
 }
 
 function startRunner(fixture: Fixture, fetcher: typeof fetch): Runner {
@@ -862,7 +874,7 @@ async function setupFetcher(fixture: Fixture) {
     const body = await request.clone().json() as Record<string, unknown>
     expect(request.method).toBe("POST")
     expect(request.headers.get("x-agent-worker-secret")).toBe("scheduled-audit-fixture-secret")
-    if (body.action === "execute") {
+    if (body.action === "scheduled_audit_execute") {
       pipelineOutcome = "not_called"
       continuation = { gateResume: "not_called", analyzeCheckpoint: "not_checked", continuationKey: "not_checked", waitBinding: "not_checked",
         ownerCurrentRecheck: "not_checked", prepareWait: "not_checked", gateInputRecheck: "not_checked", gateProofCurrent: "not_checked",
@@ -886,8 +898,16 @@ async function setupFetcher(fixture: Fixture) {
       return response
     }
     if (body.action === undefined) return response
-    if (body.action !== "execute") throw new Error("scheduled Audit action invalid")
+    if (body.action !== "scheduled_audit_execute") throw new Error("scheduled Audit action invalid")
     executes += 1
+    const auditActor = debugRecord(body.auditActor)
+    if (!auditActor || Object.keys(auditActor).sort().join(",") !== "attemptCount,leaseOwner,taskId"
+      || typeof auditActor.taskId !== "string") throw new Error("scheduled Audit actor invalid")
+    const liveAuditTask = await taskState(auditActor.taskId)
+    expect(liveAuditTask.status).toBe("running")
+    expect(auditActor).toEqual({ taskId: auditActor.taskId, attemptCount: liveAuditTask.attemptCount,
+      leaseOwner: liveAuditTask.leaseOwner })
+    expect(liveAuditTask.attemptCount).toBe(executes)
     const payload = debugRecord(await response.clone().json().catch(() => null))
     const keys = payload ? Object.keys(payload).sort() : []
     const reportValid = payload !== null && parseScheduledAuditReport(payload.report) !== null
@@ -909,7 +929,13 @@ async function setupFetcher(fixture: Fixture) {
       throw new Error("scheduled_pipeline_handoff_unavailable")
     }
     replayedExecuteRequest = body
-    expect(replayedExecuteRequest).toEqual(firstExecuteRequest)
+    const firstBody = debugRecord(firstExecuteRequest)
+    const firstActor = debugRecord(firstBody?.auditActor)
+    const currentRequest = { ...body }, firstRequest = { ...(firstBody ?? {}) }
+    delete currentRequest.auditActor
+    delete firstRequest.auditActor
+    expect(currentRequest).toEqual(firstRequest)
+    expect(auditActor.attemptCount).toBe(Number(firstActor?.attemptCount) + 1)
     expect(completed).toEqual(firstExecute)
     replayedExecute = completed
     return response
@@ -1545,9 +1571,10 @@ async function findTaskId(taskType: string, rootTaskId: string): Promise<string>
   if (rows.rows.length !== 1) throw new Error(`scheduled Audit task identity invalid: ${taskType}`)
   return rows.rows[0]!.id
 }
-async function taskState(taskId: string): Promise<{ status: string; attemptCount: number; result: unknown; failureReason: string | null }> {
-  const row = (await pool!.query<{ status: string; attemptCount: number; result: unknown; failureReason: string | null }>(
-    `SELECT "status", "attemptCount", "result", "failureReason" FROM "sub_agent_tasks" WHERE "id"=$1`, [taskId])).rows[0]
+async function taskState(taskId: string): Promise<{ status: string; attemptCount: number; result: unknown;
+  failureReason: string | null; leaseOwner: string | null }> {
+  const row = (await pool!.query<{ status: string; attemptCount: number; result: unknown; failureReason: string | null; leaseOwner: string | null }>(
+    `SELECT "status", "attemptCount", "result", "failureReason", "leaseOwner" FROM "sub_agent_tasks" WHERE "id"=$1`, [taskId])).rows[0]
   if (!row) throw new Error("scheduled Audit task missing")
   return row
 }

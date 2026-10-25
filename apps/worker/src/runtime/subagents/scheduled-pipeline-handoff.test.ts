@@ -19,6 +19,7 @@ const attestation: ScheduledAutomationPipelineAttestation = {
 }
 const input = { owner, attestation }
 const report = { processed: 1, applied: 0, queued: 0, pending: 0, skipped: 1, failed: 0, durationMs: 7 }
+const auditActor = { taskId: "audit-task-1", attemptCount: 2, leaseOwner: "worker-audit-1" }
 const reply = (status: number, body: unknown) => new Response(JSON.stringify(body), { status })
 const analyzeProof = (handoffOwner = owner) => {
   const executionId = "execution-1", executionAttemptCount = 4
@@ -167,9 +168,9 @@ describe("scheduled pipeline HTTP handoff", () => {
 
   it("accepts only a closed Execute wait response with its persisted opaque wait ID", async () => {
     const prepared = { prepareProof: { result: {} }, scheduledWaitId: "prepare-choice-wait-1",
-      gateCompletionProof: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1" } } as const
+      gateCompletionProof: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1" }, auditActor } as const
     const fetcher = vi.fn<typeof fetch>(async (_url, init) => {
-      expect(JSON.parse(String(init?.body))).toEqual({ action: "execute", ...input, ...prepared })
+      expect(JSON.parse(String(init?.body))).toEqual({ action: "scheduled_audit_execute", ...input, ...prepared })
       return reply(200, { status: "completed", report })
     })
     await expect(postScheduledPipelineExecute({ ...input, ...prepared } as never, new AbortController().signal, fetcher))
@@ -193,7 +194,7 @@ describe("scheduled pipeline HTTP handoff", () => {
 
   it("preserves the terminal invalid Gate proof block from Execute", async () => {
     const prepared = { prepareProof: { result: {} },
-      gateCompletionProof: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1" } } as const
+      gateCompletionProof: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1" }, auditActor } as const
     const blocked = { status: "blocked", errorCode: "scheduled_pipeline_gate_proof_invalid" } as const
     const fetcher = vi.fn<typeof fetch>(async () => reply(409, blocked))
 
@@ -205,10 +206,35 @@ describe("scheduled pipeline HTTP handoff", () => {
     { ...report, extra: true }, { ...report, processed: -1 }, { ...report, queued: 1.25 },
     { ...report, durationMs: Number.MAX_SAFE_INTEGER + 1 },
   ])("does not return a report unless every exact field is a safe non-negative integer", async invalidReport => {
-    const prepared = { prepareProof: { result: {} }, gateCompletionProof: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1" } } as const
+    const prepared = { prepareProof: { result: {} }, gateCompletionProof: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1" }, auditActor } as const
     const fetcher = vi.fn<typeof fetch>(async () => reply(200, { status: "completed", report: invalidReport }))
     await expect(postScheduledPipelineExecute({ ...input, ...prepared } as never, new AbortController().signal, fetcher))
       .rejects.toThrow("scheduled_pipeline_handoff_retryable")
+  })
+
+  it.each([
+    { ...auditActor, extra: true }, { ...auditActor, attemptCount: 0 }, { ...auditActor, leaseOwner: " " },
+    { taskId: auditActor.taskId, attemptCount: auditActor.attemptCount, leaseOwner: auditActor.leaseOwner, leaseExpiresAt: "later" },
+  ])("rejects an invalid or expanded child lease actor before sending the Audit action", async invalidActor => {
+    const prepared = { prepareProof: { result: {} }, gateCompletionProof: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1" },
+      auditActor: invalidActor }
+    const fetcher = vi.fn<typeof fetch>(async () => reply(200, { status: "completed", report }))
+    await expect(postScheduledPipelineExecute({ ...input, ...prepared } as never, new AbortController().signal, fetcher))
+      .rejects.toThrow("scheduled_pipeline_handoff_input_invalid")
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it("keeps the Audit action server-selected and omits caller-supplied lease metadata", async () => {
+    const prepared = { prepareProof: { result: {} },
+      gateCompletionProof: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1" }, auditActor,
+      action: "execute", leaseExpiresAt: "client-controlled" }
+    const fetcher = vi.fn<typeof fetch>(async () => reply(200, { status: "completed", report }))
+    await postScheduledPipelineExecute({ ...input, ...prepared } as never, new AbortController().signal, fetcher)
+    const body = JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body)) as Record<string, unknown>
+    expect(body.action).toBe("scheduled_audit_execute")
+    expect(body.auditActor).toEqual(auditActor)
+    expect(body).not.toHaveProperty("leaseExpiresAt")
+    expect(Object.keys(body).sort()).toEqual(["action", "attestation", "auditActor", "gateCompletionProof", "owner", "prepareProof"])
   })
 
   it("posts only the fixed child fence and projected current/prior Gate choices", async () => {

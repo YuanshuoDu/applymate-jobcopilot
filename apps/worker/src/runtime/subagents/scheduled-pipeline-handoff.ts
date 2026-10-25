@@ -28,6 +28,15 @@ type PrepareHandoffInput = AnalyzeHandoffInput & { prepareProof: unknown; schedu
 type HandoffInput = AnalyzeHandoffInput | PrepareHandoffInput
 export type ScheduledPipelineExecuteResult = Readonly<{ status: "completed"; report: ScheduledAuditReport }>
   | Readonly<{ status: "waiting_for_user"; waitId: string }>
+export type ScheduledPipelineAuditActor = Readonly<{ taskId: string; attemptCount: number; leaseOwner: string }>
+export type ScheduledPipelineAuditExecuteInput = Readonly<{
+  owner: ScheduledAutomationPipelineBridgeScope
+  attestation: ScheduledAutomationPipelineAttestation
+  prepareProof: ScheduledPrepareTaskGraphProof
+  scheduledWaitId?: string
+  gateCompletionProof: ScheduledGateCompletionProof
+  auditActor: ScheduledPipelineAuditActor
+}>
 export type ScheduledPipelineGateChoice = Readonly<{ kind: ScheduledGateQuestionKind; jobIds: readonly string[]; choiceId: ScheduledGateChoiceId }>
 export type ScheduledPipelineGateInput = Readonly<{
   owner: ScheduledAutomationPipelineBridgeScope
@@ -85,20 +94,19 @@ export async function postScheduledPipelineContinuation(input: HandoffInput, sig
   throw new Error(response.status === 202 ? "scheduled_pipeline_handoff_in_progress" : "scheduled_pipeline_handoff_retryable")
 }
 
-/** Continues only after the canonical Worker Gate completion proof is present. */
-export async function postScheduledPipelineExecute(input: Readonly<{
-  owner: ScheduledAutomationPipelineBridgeScope
-  attestation: ScheduledAutomationPipelineAttestation
-  prepareProof: ScheduledPrepareTaskGraphProof
-  scheduledWaitId?: string
-  gateCompletionProof: ScheduledGateCompletionProof
-}>, signal: AbortSignal, fetcher: typeof fetch = globalThis.fetch): Promise<ScheduledPipelineExecuteResult | { status: "blocked"; errorCode: string }> {
-  if (input.scheduledWaitId !== undefined && !validWaitId(input.scheduledWaitId)) throw new Error("scheduled_pipeline_handoff_input_invalid")
+/** Runs only the model-free Audit action under its current child lease fence. */
+export async function postScheduledPipelineExecute(input: ScheduledPipelineAuditExecuteInput, signal: AbortSignal,
+  fetcher: typeof fetch = globalThis.fetch): Promise<ScheduledPipelineExecuteResult | { status: "blocked"; errorCode: string }> {
+  if ((input.scheduledWaitId !== undefined && !validWaitId(input.scheduledWaitId)) || !validAuditActor(input.auditActor)) {
+    throw new Error("scheduled_pipeline_handoff_input_invalid")
+  }
   const base = process.env.AGENT_WEB_URL?.trim() || process.env.WEB_APP_URL?.trim() || process.env.APPLYMATE_WEB_URL?.trim(), secret = process.env.AGENT_WORKER_SECRET?.trim()
   if (!base || !secret || typeof fetcher !== "function") throw new Error("scheduled_pipeline_handoff_unavailable")
   const url = new URL(`${base.replace(/\/$/, "")}${path}`)
   if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) throw new Error("scheduled_pipeline_handoff_unavailable")
-  const body = { action: "execute", ...input }
+  const body = { action: "scheduled_audit_execute", owner: input.owner, attestation: input.attestation,
+    prepareProof: input.prepareProof, ...(input.scheduledWaitId ? { scheduledWaitId: input.scheduledWaitId } : {}),
+    gateCompletionProof: input.gateCompletionProof, auditActor: input.auditActor }
   const response = await fetcher(url.toString(), { method: "POST", headers: { "content-type": "application/json", "x-agent-worker-secret": secret },
     body: JSON.stringify(body), cache: "no-store", redirect: "error", signal })
   let payload: Record<string, unknown>
@@ -175,6 +183,14 @@ function scheduledWaitEchoMatches(input: HandoffInput, payload: Record<string, u
 
 function validWaitId(value: unknown): value is string {
   return typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= 256
+}
+
+function validAuditActor(value: unknown): value is ScheduledPipelineAuditActor {
+  const actor = record(value)
+  return Reflect.ownKeys(actor).length === 3 && Reflect.ownKeys(actor).every(key =>
+    key === "taskId" || key === "attemptCount" || key === "leaseOwner")
+    && validId(actor.taskId) && Number.isSafeInteger(actor.attemptCount) && Number(actor.attemptCount) > 0
+    && validId(actor.leaseOwner)
 }
 
 function parseAnalyzeCheckpointProof(value: unknown, input: HandoffInput): ScheduledPipelineAnalyzeCheckpointProof | null {

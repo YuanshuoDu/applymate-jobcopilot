@@ -126,7 +126,10 @@ describe("fixed scheduled Audit child runtime", () => {
       turnId: owner.turnId, rootTaskId: owner.rootTaskId }, auditTaskId: task.id, attemptCount: task.attemptCount,
       attestation: expect.objectContaining({ owner: pipelineOwner, graphRevision: 2 }) })
     expect(mocks.post).toHaveBeenCalledWith(expect.objectContaining({ owner: pipelineOwner, prepareProof,
-      gateCompletionProof: gateProof }), task.signal, expect.any(Function))
+      gateCompletionProof: gateProof, auditActor: { taskId: task.id, attemptCount: task.attemptCount, leaseOwner: task.ownerId } }),
+    task.signal, expect.any(Function))
+    expect(fixture.live.rootStatus).toBe("waiting_for_dependency")
+    expect(fixture.live.turnStatus).toBe("waiting_for_dependency")
   })
 
   it.each([

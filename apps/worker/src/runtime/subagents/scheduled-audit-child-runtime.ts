@@ -127,7 +127,8 @@ async function loadScheduledAuditInvocation(pool: Pick<pg.Pool, "connect">, leas
     turnId: lease.turnId!, rootTaskId: lease.rootTaskId }, auditTaskId: lease.id, attemptCount: lease.attemptCount, attestation })
   if (!validInvocationProof(proof, lease, gateTaskId, attestation, prepareProof)) throw new Error("scheduled_audit_invocation_proof_invalid")
   return { owner: proof.attestation.owner, attestation: proof.attestation, prepareProof: proof.prepareProof,
-    gateCompletionProof: proof.gateProof, ...(proof.scheduledWaitId ? { scheduledWaitId: proof.scheduledWaitId } : {}) }
+    gateCompletionProof: proof.gateProof, auditActor: { taskId: lease.id, attemptCount: lease.attemptCount, leaseOwner: lease.ownerId },
+    ...(proof.scheduledWaitId ? { scheduledWaitId: proof.scheduledWaitId } : {}) }
 }
 async function readLiveScope(client: Queryable, lease: SubagentLease, now: Date): Promise<Row> {
   const result = await client.query<Row>(`SELECT audit."id", audit."role", audit."taskType", audit."status", audit."attemptCount", audit."leaseOwner",
