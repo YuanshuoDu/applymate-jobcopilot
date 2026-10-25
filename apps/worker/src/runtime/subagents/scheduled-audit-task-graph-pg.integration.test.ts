@@ -324,6 +324,7 @@ async function readGateFailureDiagnostics(fixture: Fixture, requestBody: Record<
       latestStep = stepResult.rows[0], state = debugRecord(execution?.state),
       claim = debugRecord(state?.scheduledTaskGraphClaim), continuation = debugRecord(state?.scheduledTaskGraphContinuation)
     const ownerForLock = { ...owner, executionId: execution?.id, executionAttemptCount: Number(execution?.attemptCount) }
+    const ownerSessionId = owner.sessionId as string, ownerTurnId = owner.turnId as string
     const turnDate = debugDate(turn?.leaseExpiresAt), gateDate = debugDate(gate?.leaseExpiresAt)
     const turnIdentityMatches = Boolean(turn && turn.id === owner.turnId && turn.userId === owner.userId
       && turn.sessionId === owner.sessionId && turn.rootTaskId === owner.rootTaskId)
@@ -443,6 +444,7 @@ async function readGateFailureDiagnostics(fixture: Fixture, requestBody: Record<
       }
       let gateHistoryCurrent: boolean | null = null
       let gateHistoryError = false
+      let gateHistoryEventSummary: Record<string, unknown> | null = null
       if (gateBindingCurrent && parsedProof) {
         const reader = tx as GateProofDebugReader
         const graphId = `task-graph-${createHash("sha256").update(rootTaskId).digest("hex")}`
@@ -457,8 +459,8 @@ async function readGateFailureDiagnostics(fixture: Fixture, requestBody: Record<
             taskId: owner.rootTaskId, type: "item.delta" }, orderBy: { sequence: "asc" }, take: 256,
             select: { actor: true, idempotencyKey: true, sequence: true, payload: true } }),
         ])
-        const gateHistoryEventSummary = summarizeGateHistoryEvents({ rows: historyEvents, graphId, rootTaskId,
-          sessionId: owner.sessionId, turnId: owner.turnId, graphContent: graph?.content,
+        gateHistoryEventSummary = summarizeGateHistoryEvents({ rows: historyEvents, graphId, rootTaskId,
+          sessionId: ownerSessionId, turnId: ownerTurnId, graphContent: graph?.content,
           prepareGraphRevision: parsedProof.graphRevision, prepareAttemptCount: parsedProof.nodes[2].attemptCount,
           gateTaskId, gateAttemptCount: gate.attemptCount, gateTaskStatus: historyGateTask?.status ?? null,
           gateTaskAttemptCount: historyGateTask?.attemptCount ?? null, gateMaxAttempts: historyGateTask?.maxAttempts ?? null,
