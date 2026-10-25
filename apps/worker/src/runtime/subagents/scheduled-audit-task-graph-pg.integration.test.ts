@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from "node:crypto"
+import { createRequire } from "node:module"
 import { Queue, Worker, type Job } from "bullmq"
 import Redis from "ioredis"
 import { Pool } from "pg"
-import type { Prisma } from "@prisma/client"
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
@@ -59,7 +59,10 @@ type CustomAgentRoleLookup = Readonly<{ userId: string; insertAfter: string; ena
 type GateFailureDiagnostics = Readonly<Record<string, unknown>>
 type AuditPreflightState = "not_checked" | "passed" | "rejected" | "threw"
 type ReadTraceCount = { reached: boolean; rowCount: number | null }
-type PrismaDecimalClass = typeof import("@prisma/client").Prisma.Decimal
+type PrismaDecimalInstance = Readonly<{ isZero(): boolean; toString(): string }>
+type PrismaDecimalClass = (new (...args: unknown[]) => PrismaDecimalInstance) & { isDecimal?: (value: unknown) => boolean }
+type WebPrismaRuntime = Readonly<{ Prisma: Readonly<{ Decimal: PrismaDecimalClass }> }>
+const requireFromWeb = createRequire(new URL("../../../../web/package.json", import.meta.url))
 type PrepareSourceReadTrace = {
   receiptEvents: ReadTraceCount
   candidateEvents: ReadTraceCount
@@ -1028,9 +1031,9 @@ async function setupFetcher(fixture: Fixture) {
         } catch {
           diagnostic.prepareSource = "threw"
         }
-        const prismaRuntime = await vi.importActual<typeof import("@prisma/client")>("@prisma/client")
+        const decimalClass = (requireFromWeb("@prisma/client") as unknown as WebPrismaRuntime).Prisma.Decimal
         const webGraphHelperResult = await inspectActualWebRecoveryGraphHelper(prepareReader, prepareSourceCapture, owner)
-        populateRecoveryDiagnostics(prepareSourceTrace, prepareSourceCapture, owner, webGraphHelperResult, prismaRuntime.Prisma.Decimal)
+        populateRecoveryDiagnostics(prepareSourceTrace, prepareSourceCapture, owner, webGraphHelperResult, decimalClass)
         diagnostic.prepareSourceTrace = prepareSourceTrace
         const gateProofInput = { owner, snapshot: fixture.scheduleSnapshot, analyzeCheckpoint,
           analyzeAttestation: parsed.attestation, prepareProof: parsed.prepareProof,
@@ -1447,6 +1450,14 @@ type PrepareSourceDbReader = {
   agentWaitCondition: { findMany(args: unknown): Promise<readonly unknown[]> }
   subAgentTask: { findMany(args: unknown): Promise<readonly unknown[]> }
 }
+type WebRecoveryGraphHelperModule = Readonly<{
+  isScheduledTaskGraphAuditRecoveryGraphItem(input: Readonly<{
+    reader: PrepareSourceDbReader
+    owner: AuditExecutionOwner
+    stepId: string
+    item: unknown
+  }>): Promise<boolean>
+}>
 
 function emptyReadTraceCount(): ReadTraceCount { return { reached: false, rowCount: null } }
 function emptyPrepareSourceReadTrace(): PrepareSourceReadTrace {
@@ -1559,10 +1570,11 @@ async function inspectActualWebRecoveryGraphHelper(reader: PrepareSourceDbReader
   const stepId = diagnosticValidId(item?.stepId) ? item.stepId : null
   if (!item || !stepId) return { stepId, result: 'not_checked' }
   try {
-    const module = await vi.importActual<typeof import("@/lib/agent/scheduled-taskgraph-audit-recovery-graph-item")>(
+    const module = await vi.importActual<WebRecoveryGraphHelperModule>(
       "@/lib/agent/scheduled-taskgraph-audit-recovery-graph-item")
+    type WebRecoveryReader = Parameters<typeof module.isScheduledTaskGraphAuditRecoveryGraphItem>[0]["reader"]
     const result = await module.isScheduledTaskGraphAuditRecoveryGraphItem({
-      reader: reader as unknown as Prisma.TransactionClient,
+      reader: reader as WebRecoveryReader,
       owner: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
         rootAttemptCount: owner.rootAttemptCount, executionId: owner.executionId, executionAttemptCount: owner.executionAttemptCount,
         turnLeaseOwnerId: owner.turnLeaseOwnerId, turnLeaseVersion: owner.turnLeaseVersion },
@@ -1578,7 +1590,7 @@ function populateRecoveryDiagnostics(trace: PrepareSourceReadTrace, capture: Pre
   const sourceStep = capture.sourceSteps.map(debugRecord).find(Boolean) ?? null
   const sourceCandidate = sourceStep ? capture.candidateEvents.map(debugRecord).find(event => {
     const payload = debugRecord(event?.payload)
-    return payload?.finalStepId === sourceStep.id && payload.finalStepOrdinal === sourceStep.ordinal
+    return payload !== null && payload.finalStepId === sourceStep.id && payload.finalStepOrdinal === sourceStep.ordinal
       && event?.correlationId === sourceStep.id
   }) ?? null : null
   const sourcePayload = debugRecord(sourceCandidate?.payload)
@@ -1605,8 +1617,9 @@ function populateRecoveryDiagnostics(trace: PrepareSourceReadTrace, capture: Pre
     const classification = stepId ? classifyGraphItem(graphOwner, stepId, ownItems, ownEvents) : 'invalid'
     const cost = step.estimatedCostUsd
     const costString = safeString(cost)
-    const decimalApi = decimalClass as unknown as { isDecimal?: (value: unknown) => boolean }
-    const prismaIsDecimal = typeof decimalApi.isDecimal === 'function' ? safeBoolean(() => decimalApi.isDecimal!(cost)) : null
+    const decimalCost = cost instanceof decimalClass ? cost : null
+    const prismaIsDecimal = typeof decimalClass.isDecimal === 'function' ? safeBoolean(() => decimalClass.isDecimal!(cost)) : null
+    const decimalCostZero = decimalCost ? safeBoolean(() => decimalCost.isZero()) : false
     const started = ownEvents.filter(event => event.type === 'step.started')
     const completed = ownEvents.filter(event => event.type === 'step.completed')
     trace.recoverySteps.push({ step: { id: diagnosticValidId(step.id) ? step.id : null,
@@ -1615,7 +1628,7 @@ function populateRecoveryDiagnostics(trace: PrepareSourceReadTrace, capture: Pre
         status: safeRecoveryStatus(step.status) ?? 'other', errorCode: safeRecoveryErrorCode(step.errorCode),
         inputThroughSequence: stepCursor, consumedInputIds: diagnosticStringList(step.consumedInputIds),
         recoveryMarker: marker, usageTypes: { inputTokens: cursorType(step.inputTokens), outputTokens: cursorType(step.outputTokens),
-        estimatedCostUsd: cursorType(cost), estimatedCostPrismaDecimalInstance: cost instanceof decimalClass,
+        estimatedCostUsd: cursorType(cost), estimatedCostPrismaDecimalInstance: decimalCost !== null,
           estimatedCostPrismaIsDecimal: prismaIsDecimal } },
       status: safeRecoveryStatus(step.status) ?? 'other', taskMatchesRoot: step.taskId === owner.rootTaskId,
       ordinalValid: Number.isSafeInteger(step.ordinal) && Number(step.ordinal) > 0,
@@ -1640,10 +1653,9 @@ function populateRecoveryDiagnostics(trace: PrepareSourceReadTrace, capture: Pre
         && BigInt(stepCursor) >= BigInt(previousCursor)),
       inputTokensType: cursorType(step.inputTokens), inputTokensZero: step.inputTokens === 0 || step.inputTokens === '0',
       outputTokensType: cursorType(step.outputTokens), outputTokensZero: step.outputTokens === 0 || step.outputTokens === '0',
-       estimatedCostType: cursorType(cost), estimatedCostPrismaDecimalInstance: cost instanceof decimalClass,
+       estimatedCostType: cursorType(cost), estimatedCostPrismaDecimalInstance: decimalCost !== null,
       estimatedCostPrismaIsDecimal: prismaIsDecimal, estimatedCostStringIsCanonicalZero: costString !== null && /^0(?:\.0+)?$/.test(costString),
-      estimatedCostZeroByWorkerPredicate: cost === 0 || typeof cost === 'string' && /^0(?:\.0+)?$/.test(cost)
-         || cost instanceof decimalClass && safeBoolean(() => cost.isZero()),
+       estimatedCostZeroByWorkerPredicate: cost === 0 || typeof cost === 'string' && /^0(?:\.0+)?$/.test(cost) || decimalCostZero === true,
       consumedInputIdsEmpty: diagnosticStringList(step.consumedInputIds)?.length === 0,
       startedEventCount: started.length, completedEventCount: completed.length,
       stepEvents: [...started, ...completed].map(event => recoveryEventDiagnostics(event, step, owner, marker, ownWaits)),
