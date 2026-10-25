@@ -234,6 +234,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
     let workerC: WorkerProcess | undefined
     let workerD: WorkerProcess | undefined
     let workerE: WorkerProcess | undefined
+    let queuePaused = false
     const originalRedisUrl = process.env.REDIS_URL
     let closeSharedRedisConnections: (() => Promise<void>) | undefined
     const recoveryBlockerSessionIds: string[] = []
@@ -558,6 +559,9 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       [waiter.id, ids.sessionId, secondOwner])
       expect(secondExpiry.rowCount).toBe(1)
 
+      // Hold a stalled prior generation until recovery and replacement dispatch are asserted.
+      queuePaused = true
+      await queue.pause()
       workerD = launchWorker("worker-b-crash-after-wait-ack", queueName, ids)
       await waitForMarker(workerD, "WORKER_B_RECOVERED")
       const continuationRecovery = await pool.query<{ taskStatus: string; attemptCount: number; leaseOwner: string | null;
@@ -587,6 +591,8 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       )
       expect(ackResumeDispatch.rows[0]).toMatchObject({ attemptCount: finalGeneration + 1 })
       expect(ackResumeDispatch.rows[0]?.publishedAt).toBeInstanceOf(Date)
+      await queue.resume()
+      queuePaused = false
 
       await waitForMarker(workerD, "WORKER_B_RESUME_ACK_COMMITTED")
       const ackCut = await pool.query<{ taskStatus: string; attemptCount: number; leaseOwner: string | null; leaseExpiresAt: Date | null;
@@ -700,6 +706,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       await stopWorker(workerC)
       await stopWorker(workerD)
       await stopWorker(workerE)
+      if (queuePaused) await queue.resume().catch(() => undefined)
       await queue.obliterate({ force: true }).catch(() => undefined)
       await queue.close().catch(() => undefined)
       if (closeSharedRedisConnections) await closeSharedRedisConnections().catch(() => undefined)
