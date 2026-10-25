@@ -10,7 +10,10 @@ vi.mock('./scheduled-taskgraph-audit-child-fence', () => ({ scheduledTaskGraphAu
   lockScheduledTaskGraphAuditChildFence: lockChild }))
 vi.mock('./scheduled-taskgraph-analysis-journal', () => ({ createScheduledTaskGraphAuditChildOwnerFence: ownerFence,
   createScheduledTaskGraphOwnerFence: rootOwnerFence, isScheduledTaskGraphAuditChildOwnerCurrent: auditOwnerCurrent }))
-vi.mock('./scheduled-taskgraph-pipeline-fence', () => ({ isScheduledTaskGraphOwnerCurrent: rootOwnerCurrent }))
+vi.mock('./scheduled-taskgraph-pipeline-fence', async importOriginal => ({
+  ...await importOriginal<typeof import('./scheduled-taskgraph-pipeline-fence')>(),
+  isScheduledTaskGraphOwnerCurrent: rootOwnerCurrent,
+}))
 vi.mock('./scheduled-taskgraph-gate-input', () => ({ isScheduledTaskGraphAuditChildGateProofCurrent: auditProof,
   isScheduledTaskGraphGateProofCurrent: rootProof, loadScheduledTaskGraphAuditChildGateInput: auditGateInput,
   loadScheduledTaskGraphGateInput: rootGateInput }))
@@ -19,12 +22,23 @@ import { claimScheduledAuditExecution, lockScheduledAuditContinuation, scheduled
   scheduledRootIsCurrent, scheduledTurnLeaseIsCurrent, createScheduledTaskGraphContinuationFence,
   scheduledAuditClaimRaceResponse, scheduledTaskGraphContinuationOwnerIsCurrent, scheduledTaskGraphRunOwnerFence,
   scheduledTaskGraphRunCheckpointIsCurrent, scheduledTaskGraphGateResumeOwnerIsCurrent,
-  loadScheduledTaskGraphResumeGateInput, scheduledTaskGraphRunInput } from './scheduled-taskgraph-audit-action'
+  loadScheduledTaskGraphResumeGateInput, scheduledTaskGraphRunInput, resolveScheduledTaskGraphAuditClaimOwner,
+  authorizeScheduledAuditContinuation } from './scheduled-taskgraph-audit-action'
 
 const owner = { userId: 'user', sessionId: 'session', turnId: 'turn', rootTaskId: 'root', rootAttemptCount: 1,
   turnLeaseOwnerId: 'old-root-owner', turnLeaseVersion: 2, executionId: 'execution', executionAttemptCount: 3 }
 const auditActor = { taskId: 'audit', attemptCount: 2, leaseOwner: 'audit-worker' }
 const tx = { agentExecution: { updateMany: db.agentExecution.updateMany } }
+const canonicalOwner = { ...owner, turnLeaseOwnerId: 'root-owner-v2', turnLeaseVersion: owner.turnLeaseVersion + 1 }
+
+function auditOwnerState(claimOwner: unknown, continuationOwner: unknown = claimOwner, key = 'key', token = 'claim') {
+  return {
+    scheduledTaskGraphClaim: { schemaVersion: 'agent-harness.v2.scheduled-pipeline-claim.v1', key, claimToken: token,
+      owner: claimOwner, claimedAt: '2026-10-25T10:00:00.000Z', leaseExpiresAt: '2026-10-25T10:10:00.000Z' },
+    scheduledTaskGraphContinuation: { schemaVersion: 'agent-harness.v2.scheduled-pipeline-continuation.v1', key,
+      owner: continuationOwner, snapshotDigest: 'sha256:snapshot', graphRevision: 4, evidenceDigest: 'a'.repeat(64) },
+  }
+}
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -43,6 +57,55 @@ beforeEach(() => {
 })
 
 describe('scheduled Audit action fence adapter', () => {
+  it('uses the exact persisted canonical owner when only the Root lease rotated', () => {
+    expect(resolveScheduledTaskGraphAuditClaimOwner({ requestOwner: owner,
+      proofOwner: owner, state: auditOwnerState(canonicalOwner), key: 'key', claimToken: 'claim' })).toEqual(canonicalOwner)
+  })
+
+  it('rejects stable-lineage drift, split persisted owners, and malformed stored owner shapes', () => {
+    for (const changed of [
+      { ...owner, userId: 'other-user' }, { ...owner, sessionId: 'other-session' },
+      { ...owner, rootTaskId: 'other-root' }, { ...owner, rootAttemptCount: owner.rootAttemptCount + 1 },
+      { ...owner, executionId: 'other-execution' }, { ...owner, executionAttemptCount: owner.executionAttemptCount + 1 },
+    ]) {
+      expect(resolveScheduledTaskGraphAuditClaimOwner({ requestOwner: changed, proofOwner: owner, state: auditOwnerState(canonicalOwner),
+        key: 'key', claimToken: 'claim' })).toBeNull()
+    }
+    expect(resolveScheduledTaskGraphAuditClaimOwner({ requestOwner: owner, proofOwner: owner,
+      state: auditOwnerState(canonicalOwner, { ...canonicalOwner, turnLeaseVersion: canonicalOwner.turnLeaseVersion + 1 }),
+      key: 'key', claimToken: 'claim' })).toBeNull()
+    expect(resolveScheduledTaskGraphAuditClaimOwner({ requestOwner: owner, proofOwner: owner,
+      state: auditOwnerState({ ...canonicalOwner, unexpected: true }), key: 'key', claimToken: 'claim' })).toBeNull()
+    expect(resolveScheduledTaskGraphAuditClaimOwner({ requestOwner: owner, proofOwner: owner,
+      state: auditOwnerState({ ...canonicalOwner, executionAttemptCount: undefined }), key: 'key', claimToken: 'claim' })).toBeNull()
+    expect(resolveScheduledTaskGraphAuditClaimOwner({ requestOwner: owner, proofOwner: owner,
+      state: auditOwnerState(canonicalOwner, canonicalOwner, 'different-key'), key: 'key', claimToken: 'claim' })).toBeNull()
+    expect(resolveScheduledTaskGraphAuditClaimOwner({ requestOwner: owner, proofOwner: owner,
+      state: auditOwnerState(canonicalOwner, canonicalOwner, 'key', 'different-claim'), key: 'key', claimToken: 'claim' })).toBeNull()
+  })
+
+  it('returns only the locked canonical Root owner on the internal Audit continuation', async () => {
+    const prepareProof = { receipt: { owner: { executionId: owner.executionId, executionAttemptCount: owner.executionAttemptCount } } }
+    const request = {
+      action: 'scheduled_audit_execute' as const,
+      owner: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+        rootAttemptCount: owner.rootAttemptCount, turnLeaseOwnerId: 'root-owner-v1', turnLeaseVersion: 1 },
+      attestation: { snapshotDigest: 'sha256:snapshot' },
+      prepareProof,
+      gateCompletionProof: { schemaVersion: 'agent-harness.v2.scheduled-taskgraph-gate-completion.v1', graphRevision: 4,
+        prepareProof,
+        gate: { taskId: 'gate', attemptCount: 2, resultDigest: `sha256:${'a'.repeat(64)}`, completedEventRevision: 4 } },
+      auditActor,
+    }
+    const result = await authorizeScheduledAuditContinuation({ request, matchesProof: (left, right) => left === right,
+      replay: async () => null, load: async () => ({ owner: canonicalOwner, waitId: 'audit-wait' }) })
+    expect(result).toEqual({ kind: 'scheduled_audit_execute', request: { ...request,
+      owner: { ...request.owner, turnLeaseOwnerId: canonicalOwner.turnLeaseOwnerId, turnLeaseVersion: canonicalOwner.turnLeaseVersion },
+      scheduledWaitId: 'audit-wait' } })
+    expect(request.owner).toMatchObject({ turnLeaseOwnerId: 'root-owner-v1', turnLeaseVersion: 1 })
+    expect(request.prepareProof).toEqual(request.gateCompletionProof.prepareProof)
+  })
+
   it('constructs a strict root or Audit run input from the explicit mode', () => {
     const base = { owner, snapshot: {}, attestation: {}, continuationKey: 'key', claimToken: 'claim', ownedJobs: [], prepareProof: {} }
     expect(scheduledTaskGraphRunInput(base, { kind: 'root' })).toEqual(base)

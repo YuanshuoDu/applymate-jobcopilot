@@ -2,7 +2,7 @@ import { Prisma, type Job } from '@prisma/client'
 import { db } from '@/lib/db'
 import { lockScheduledTaskGraphAuditChildFence, scheduledTaskGraphAuditChildFenceIsCurrent, type ScheduledTaskGraphAuditActor } from './scheduled-taskgraph-audit-child-fence'
 import { createScheduledTaskGraphAuditChildOwnerFence, createScheduledTaskGraphOwnerFence, isScheduledTaskGraphAuditChildOwnerCurrent } from './scheduled-taskgraph-analysis-journal'
-import { isScheduledTaskGraphOwnerCurrent } from './scheduled-taskgraph-pipeline-fence'
+import { isScheduledTaskGraphOwnerCurrent, scheduledTaskGraphOwnerMatches } from './scheduled-taskgraph-pipeline-fence'
 import type { ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 import { isScheduledTaskGraphAuditChildGateProofCurrent, isScheduledTaskGraphGateProofCurrent,
   loadScheduledTaskGraphAuditChildGateInput, loadScheduledTaskGraphGateInput, type ScheduledTaskGraphGateInputRequest } from './scheduled-taskgraph-gate-input'
@@ -13,6 +13,9 @@ import { markScheduledTaskGraphAuditRuntime } from './scheduled-taskgraph-audit-
 
 type AuditOwner = ScheduledTaskGraphPipelineOwner
 type RootOwner = Pick<AuditOwner, 'userId' | 'sessionId' | 'turnId' | 'rootTaskId' | 'rootAttemptCount' | 'turnLeaseOwnerId' | 'turnLeaseVersion'>
+const CLAIM_SCHEMA = 'agent-harness.v2.scheduled-pipeline-claim.v1'
+const OWNER_KEYS = ['userId', 'sessionId', 'turnId', 'rootTaskId', 'rootAttemptCount', 'turnLeaseOwnerId',
+  'turnLeaseVersion', 'executionId', 'executionAttemptCount'] as const
 export type ScheduledTaskGraphRequestOwner = RootOwner
 export type ScheduledTaskGraphContinuationFence =
   | Readonly<{ mode: 'root'; owner: AuditOwner; key: string; claimToken: string }>
@@ -38,6 +41,33 @@ export function scheduledTaskGraphRunContext(context: PipelineCtx, resumeState: 
 
 export function scheduledTaskGraphRunInput(base: ScheduledTaskGraphRunInputBase, mode: ScheduledTaskGraphRunInputMode): ScheduledTaskGraphRunInput {
   return mode.kind === 'audit' ? { ...base, action: 'scheduled_audit_execute', auditActor: mode.auditActor } : base
+}
+
+/** Resolves the current persisted owner for an Audit child without trusting its historical Root lease. */
+export function resolveScheduledTaskGraphAuditClaimOwner(input: {
+  requestOwner: AuditOwner; proofOwner: AuditOwner | null; state: unknown; key: string; claimToken: unknown
+}): AuditOwner | null {
+  const state = record(input.state), claim = record(state?.scheduledTaskGraphClaim)
+  const continuation = record(state?.scheduledTaskGraphContinuation)
+  const requested = parseAuditOwner(input.requestOwner), proofOwner = parseAuditOwner(input.proofOwner)
+  const claimOwner = parseAuditOwner(claim?.owner)
+  const continuationOwner = parseAuditOwner(continuation?.owner)
+  if (!requested || !proofOwner || !claim || !continuation || !claimOwner || !continuationOwner
+    || !validId(input.key) || !validId(input.claimToken) || claim.schemaVersion !== CLAIM_SCHEMA
+    || claim.key !== input.key || claim.claimToken !== input.claimToken
+    || continuation.schemaVersion !== 'agent-harness.v2.scheduled-pipeline-continuation.v1' || continuation.key !== input.key
+    || !scheduledTaskGraphOwnerMatches(continuation.owner, claimOwner)
+    || !sameAuditStableOwner(proofOwner, requested) || !sameAuditStableOwner(claimOwner, requested)) return null
+  return claimOwner
+}
+
+export function scheduledTaskGraphPrepareWaitId(request: { owner: { turnId: string }; scheduledWaitId?: string },
+  state: Record<string, unknown> | null, requireApproval: boolean): string | undefined | null {
+  const stored = state?.scheduledTaskGraphScheduledWaitId, supplied = request.scheduledWaitId
+  if (stored !== undefined && (typeof stored !== 'string' || supplied !== undefined && supplied !== stored)) return null
+  const id = typeof stored === 'string' ? stored : supplied
+  if (!requireApproval) return id === undefined ? undefined : null
+  return typeof id === 'string' && id.startsWith(`agent-question:${request.owner.turnId}:canonical:`) ? id : null
 }
 
 export function scheduledTaskGraphGateResumeOwnerIsCurrent(input: ScheduledTaskGraphGateResumeInput): Promise<boolean> {
@@ -116,7 +146,7 @@ export async function lockScheduledAuditContinuation<T>(input: {
   })
 }
 
-export async function authorizeScheduledAuditContinuation<T extends { waitId?: string }>(input: {
+export async function authorizeScheduledAuditContinuation<T extends { owner: AuditOwner; waitId?: string }>(input: {
   request: ScheduledTaskGraphAuditExecuteRpcRequest; matchesProof: (left: unknown, right: unknown) => boolean
   replay: (gate: { taskId: string; attemptCount: number }) => Promise<Response | null>
   load: (tx: Prisma.TransactionClient, gate: { taskId: string; attemptCount: number }) => Promise<T | null>
@@ -132,7 +162,7 @@ export async function authorizeScheduledAuditContinuation<T extends { waitId?: s
   const locked = await lockScheduledAuditContinuation({ owner, auditActor: input.request.auditActor,
     load: tx => input.load(tx, gateIdentity) })
   if (locked.status === 'locked') return { kind: 'scheduled_audit_execute',
-    request: { ...input.request, ...(locked.value.waitId ? { scheduledWaitId: locked.value.waitId } : {}) } }
+    request: { ...input.request, owner: auditRequestOwner(locked.value.owner), ...(locked.value.waitId ? { scheduledWaitId: locked.value.waitId } : {}) } }
   return Response.json({ status: 'blocked', errorCode: locked.status === 'actor_fenced'
     ? 'scheduled_pipeline_audit_child_fenced' : 'scheduled_pipeline_audit_gate_proof_invalid' }, { status: 409 })
 }
@@ -170,6 +200,28 @@ export async function claimScheduledAuditExecution(input: {
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
 }
+function parseAuditOwner(value: unknown): AuditOwner | null {
+  const row = record(value)
+  if (!row || Reflect.ownKeys(row).length !== OWNER_KEYS.length || !OWNER_KEYS.every(key => Object.hasOwn(row, key))
+    || ![row.userId, row.sessionId, row.turnId, row.rootTaskId, row.turnLeaseOwnerId, row.executionId].every(validId)
+    || !Number.isSafeInteger(row.rootAttemptCount) || Number(row.rootAttemptCount) < 1
+    || !Number.isSafeInteger(row.turnLeaseVersion) || Number(row.turnLeaseVersion) < 1
+    || !Number.isSafeInteger(row.executionAttemptCount) || Number(row.executionAttemptCount) < 0) return null
+  return { userId: row.userId as string, sessionId: row.sessionId as string, turnId: row.turnId as string,
+    rootTaskId: row.rootTaskId as string, rootAttemptCount: row.rootAttemptCount as number,
+    turnLeaseOwnerId: row.turnLeaseOwnerId as string, turnLeaseVersion: row.turnLeaseVersion as number,
+    executionId: row.executionId as string, executionAttemptCount: row.executionAttemptCount as number }
+}
+function sameAuditStableOwner(left: AuditOwner, right: AuditOwner): boolean {
+  return left.userId === right.userId && left.sessionId === right.sessionId && left.turnId === right.turnId
+    && left.rootTaskId === right.rootTaskId && left.rootAttemptCount === right.rootAttemptCount
+    && left.executionId === right.executionId && left.executionAttemptCount === right.executionAttemptCount
+}
+function auditRequestOwner(owner: AuditOwner): RootOwner {
+  return { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+    rootAttemptCount: owner.rootAttemptCount, turnLeaseOwnerId: owner.turnLeaseOwnerId, turnLeaseVersion: owner.turnLeaseVersion }
+}
+function validId(value: unknown): value is string { return typeof value === 'string' && value.length > 0 && value.length <= 256 && value.trim() === value }
 function dateNumber(value: unknown): number {
   return value instanceof Date ? value.getTime() : typeof value === 'string' ? Date.parse(value) : Number.NaN
 }

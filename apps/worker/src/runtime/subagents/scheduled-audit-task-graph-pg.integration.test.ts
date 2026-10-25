@@ -57,6 +57,14 @@ type AuditPreflightDiagnostics = {
   executionOwnerDerived: boolean
   prepareProofCanonicalMatch: boolean
   executionContext: AuditPreflightState
+  markerKeyMatches: boolean
+  claimKeyMatches: boolean
+  markerOwnerExact9Matches: boolean
+  markerOwnerStable7Matches: boolean
+  claimOwnerExact9Matches: boolean
+  claimOwnerStable7Matches: boolean
+  claimTokenValid: boolean
+  savedScheduledWaitIdMatchesRequest: boolean
   prepareSource: AuditPreflightState
   gateProofCurrent: AuditPreflightState
 }
@@ -948,18 +956,33 @@ async function setupFetcher(fixture: Fixture) {
       if (!gate || typeof gate.taskId !== "string" || !Number.isSafeInteger(gate.attemptCount)) return diagnostic
       await diagnosticWebDb.db.$transaction(async tx => {
         let analyzeCheckpoint: Record<string, unknown> | null = null
+        let persistedState: Record<string, unknown> | null = null
         try {
           const execution = debugRecord(await tx.agentExecution.findFirst({
             where: { id: owner.executionId, userId: owner.userId, sessionId: owner.sessionId,
               attemptCount: owner.executionAttemptCount },
             select: { id: true, status: true, attemptCount: true, state: true },
           }))
-          analyzeCheckpoint = gateInput.scheduledTaskGraphAnalyzeCheckpointForGate(execution?.state)
+          persistedState = debugRecord(execution?.state)
+          analyzeCheckpoint = gateInput.scheduledTaskGraphAnalyzeCheckpointForGate(persistedState)
           diagnostic.executionContext = analyzeCheckpoint ? "passed" : "rejected"
         } catch {
           diagnostic.executionContext = "threw"
         }
-        const prepareSourceInput = { owner, snapshot: fixture.snapshot, proof: parsed.prepareProof,
+        if (persistedState) {
+          const marker = debugRecord(persistedState.scheduledTaskGraphContinuation), claim = debugRecord(persistedState.scheduledTaskGraphClaim)
+          let expectedKey: string | null = null
+          try { expectedKey = continuationCheckpoint.scheduledTaskGraphContinuationKey(owner, parsed.attestation) } catch { /* closed diagnostic false */ }
+          diagnostic.markerKeyMatches = expectedKey !== null && marker?.key === expectedKey
+          diagnostic.claimKeyMatches = expectedKey !== null && claim?.key === expectedKey
+          diagnostic.markerOwnerExact9Matches = diagnosticExactOwnerMatches(marker?.owner, owner)
+          diagnostic.markerOwnerStable7Matches = diagnosticStableOwnerMatches(marker?.owner, owner)
+          diagnostic.claimOwnerExact9Matches = diagnosticExactOwnerMatches(claim?.owner, owner)
+          diagnostic.claimOwnerStable7Matches = diagnosticStableOwnerMatches(claim?.owner, owner)
+          diagnostic.claimTokenValid = diagnosticValidId(claim?.claimToken)
+          diagnostic.savedScheduledWaitIdMatchesRequest = persistedState.scheduledTaskGraphScheduledWaitId === parsed.scheduledWaitId
+        }
+        const prepareSourceInput = { owner, snapshot: fixture.scheduleSnapshot, proof: parsed.prepareProof,
           ...(parsed.scheduledWaitId === undefined ? {} : { scheduledWaitId: parsed.scheduledWaitId }), reader: tx }
         try {
           diagnostic.prepareSource = await auditPrepareSource.validateScheduledTaskGraphAuditPrepareSource(prepareSourceInput)
@@ -967,7 +990,7 @@ async function setupFetcher(fixture: Fixture) {
         } catch {
           diagnostic.prepareSource = "threw"
         }
-        const gateProofInput = { owner, snapshot: fixture.snapshot, analyzeCheckpoint,
+        const gateProofInput = { owner, snapshot: fixture.scheduleSnapshot, analyzeCheckpoint,
           analyzeAttestation: parsed.attestation, prepareProof: parsed.prepareProof,
           gate: { taskId: gate.taskId, attemptCount: Number(gate.attemptCount), phase: "completed" as const,
             completionProof: parsed.gateCompletionProof }, auditActor: parsed.auditActor }
@@ -1377,7 +1400,10 @@ function debugRecord(value: unknown): Record<string, unknown> | null {
 }
 function emptyAuditPreflight(): AuditPreflightDiagnostics {
   return { gateCompletionProofValid: false, executionOwnerDerived: false, prepareProofCanonicalMatch: false,
-    executionContext: "not_checked", prepareSource: "not_checked", gateProofCurrent: "not_checked" }
+    executionContext: "not_checked", markerKeyMatches: false, claimKeyMatches: false,
+    markerOwnerExact9Matches: false, markerOwnerStable7Matches: false, claimOwnerExact9Matches: false,
+    claimOwnerStable7Matches: false, claimTokenValid: false, savedScheduledWaitIdMatchesRequest: false,
+    prepareSource: "not_checked", gateProofCurrent: "not_checked" }
 }
 function isAuditAction(value: Record<string, unknown> | null): value is AuditAction {
   return Boolean(value && value.action === "scheduled_audit_execute" && isAuditRequestOwner(value.owner)
@@ -1399,6 +1425,17 @@ function isAuditActor(value: unknown): value is AuditAction["auditActor"] {
 }
 function diagnosticValidId(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value
+}
+function diagnosticExactOwnerMatches(value: unknown, expected: AuditExecutionOwner): boolean {
+  const row = debugRecord(value), fields = ["userId", "sessionId", "turnId", "rootTaskId", "rootAttemptCount",
+    "turnLeaseOwnerId", "turnLeaseVersion", "executionId", "executionAttemptCount"] as const
+  return Boolean(row && Object.keys(row).length === fields.length && fields.every(field => Object.hasOwn(row, field)
+    && row[field] === expected[field]))
+}
+function diagnosticStableOwnerMatches(value: unknown, expected: AuditExecutionOwner): boolean {
+  const row = debugRecord(value), fields = ["userId", "sessionId", "turnId", "rootTaskId", "rootAttemptCount",
+    "executionId", "executionAttemptCount"] as const
+  return Boolean(row && fields.every(field => row[field] === expected[field]))
 }
 function debugDate(value: unknown): number {
   return value instanceof Date ? value.getTime() : typeof value === "string" ? Date.parse(value) : Number.NaN

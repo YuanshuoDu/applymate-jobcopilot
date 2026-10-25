@@ -4,8 +4,9 @@ import { Prisma } from '@prisma/client'
 const mocks = vi.hoisted(() => ({
   transaction: vi.fn(), queryRaw: vi.fn(), jobs: vi.fn(), update: vi.fn(), turn: vi.fn(), config: vi.fn(), resume: vi.fn(),
   active: vi.fn(), feature: vi.fn(), access: vi.fn(), entitlement: vi.fn(), aiConfig: vi.fn(), roles: vi.fn(),
-  isProof: vi.fn(), loadInput: vi.fn(), buildCheckpoint: vi.fn(), validateWait: vi.fn(), executeGate: vi.fn(),
+  isProof: vi.fn(), auditProof: vi.fn(), auditPrepareSource: vi.fn(), loadInput: vi.fn(), buildCheckpoint: vi.fn(), validateWait: vi.fn(), executeGate: vi.fn(),
   policy: vi.fn(), completedReplay: vi.fn(), auditCompletedReplay: vi.fn(),
+  childFence: vi.fn(),
 }))
 
 vi.mock('@/lib/db', () => ({ db: {
@@ -23,7 +24,13 @@ vi.mock('./role-config', () => ({ loadRoleConfigs: mocks.roles, toRoleConfigMap:
 vi.mock('./run-service-helpers', () => ({ isActiveAccount: mocks.active }))
 vi.mock('./scheduled-taskgraph-gate-checkpoint', () => ({ buildScheduledTaskGraphGateCheckpoint: mocks.buildCheckpoint }))
 vi.mock('./scheduled-taskgraph-gate-input', () => ({ isScheduledTaskGraphGateProofCurrent: mocks.isProof,
+  isScheduledTaskGraphAuditChildGateProofCurrent: mocks.auditProof,
   loadScheduledTaskGraphGateInput: mocks.loadInput, scheduledTaskGraphAnalyzeCheckpointForGate: (value: unknown) => value }))
+vi.mock('./scheduled-taskgraph-audit-child-fence', async importOriginal => ({
+  ...await importOriginal<typeof import('./scheduled-taskgraph-audit-child-fence')>(),
+  lockScheduledTaskGraphAuditChildFence: mocks.childFence,
+}))
+vi.mock('./scheduled-taskgraph-audit-prepare-source', () => ({ validateScheduledTaskGraphAuditPrepareSource: mocks.auditPrepareSource }))
 vi.mock('./scheduled-taskgraph-pipeline-checkpoint', () => ({ scheduledAutomationSnapshotDigest: vi.fn(() => 'sha256:snapshot'),
   scheduledTaskGraphContinuationKey: vi.fn(() => 'scheduled-taskgraph:key') }))
 vi.mock('./scheduled-taskgraph-run-service', () => ({ validateScheduledPrepareWaitIdentity: mocks.validateWait }))
@@ -39,10 +46,16 @@ const snapshot = { schemaVersion: 'agent-harness.v2.scheduled-automation-snapsho
 const requestOwner = { userId: 'user-1', sessionId: 'session-1', turnId: 'turn-1', rootTaskId: 'root-1',
   rootAttemptCount: 2, turnLeaseOwnerId: 'root-lease', turnLeaseVersion: 4 }
 const owner = { ...requestOwner, executionId: 'execution-1', executionAttemptCount: 5 }
+const canonicalAuditOwner = { ...owner, turnLeaseOwnerId: 'root-lease-v2', turnLeaseVersion: requestOwner.turnLeaseVersion + 1 }
 const claim = { schemaVersion: 'agent-harness.v2.scheduled-pipeline-claim.v1', key: 'scheduled-taskgraph:key', claimToken: 'private-claim', owner,
   claimedAt: '2026-10-23T10:00:00.000Z', leaseExpiresAt: '2026-10-23T10:01:00.000Z' }
 const state = { nextStage: 'gate', scheduledTaskGraphClaim: claim,
   scheduledTaskGraphContinuation: { key: claim.key, owner } }
+function auditStateWithOwners(claimOwner: unknown, continuationOwner: unknown = claimOwner) {
+  return { nextStage: 'gate', scheduledTaskGraphClaim: { ...claim, owner: claimOwner },
+    scheduledTaskGraphContinuation: { schemaVersion: 'agent-harness.v2.scheduled-pipeline-continuation.v1',
+      key: claim.key, owner: continuationOwner, snapshotDigest: 'sha256:snapshot', graphRevision: 15, evidenceDigest: 'b'.repeat(64) } }
+}
 const attestation = { snapshotDigest: 'sha256:snapshot', scout: { candidateJobIds: ['job-1'] } }
 const proof = { receipt: { proof: true } }
 const job = { id: 'job-1', userId: owner.userId }
@@ -62,6 +75,18 @@ const databaseTurn = (status: string, leaseVersion = requestOwner.turnLeaseVersi
   source: 'automation', executionMode: 'canonical_task_graph', input: { automationRunMode: 'scheduled', scheduledAutomationSnapshot: snapshot },
   status, leaseOwnerId: status === 'in_progress' ? leaseOwnerId : null, leaseVersion,
   leaseExpiresAt: status === 'in_progress' ? new Date(Date.now() + 60_000) : null })
+
+function configureAuditLock(auditState: unknown) {
+  queryIndex = 0
+  mocks.queryRaw.mockImplementation(async () => {
+    const position = queryIndex++ % 5
+    if (position === 0) return [{ id: owner.sessionId, status: 'active' }]
+    if (position === 1) return [databaseTurn('waiting_for_dependency', canonicalAuditOwner.turnLeaseVersion)]
+    if (position === 2) return [{ ...rootTask, status: 'waiting' }]
+    if (position === 3) return [{ ...gateTask, status: 'completed' }]
+    return [{ id: owner.executionId, status: 'running', attemptCount: owner.executionAttemptCount, checkpoint: 'gate', state: auditState }]
+  })
+}
 
 function gateRequest() {
   return { action: 'gate' as const, owner: requestOwner, attestation, prepareProof: proof, gateTaskId: gateTask.id,
@@ -95,6 +120,9 @@ beforeEach(() => {
   mocks.resume.mockResolvedValue({ id: 'resume-1', name: 'Resume', content: {} })
   mocks.roles.mockResolvedValue([])
   mocks.isProof.mockResolvedValue(true)
+  mocks.auditProof.mockResolvedValue(true)
+  mocks.auditPrepareSource.mockResolvedValue(true)
+  mocks.childFence.mockResolvedValue(true)
   mocks.loadInput.mockResolvedValue(loaded)
   mocks.buildCheckpoint.mockReturnValue({ checkpoint: { nextStage: 'gate' }, packages: [] })
   mocks.validateWait.mockResolvedValue(true)
@@ -336,5 +364,43 @@ describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
     expect(mocks.completedReplay).not.toHaveBeenCalled()
     expect(mocks.transaction).not.toHaveBeenCalled()
     expect(mocks.queryRaw).not.toHaveBeenCalled()
+  })
+
+  it('authorizes an exact Audit actor with the persisted canonical Root owner after the request lease went stale', async () => {
+    const request = auditExecuteRequest(), persisted = auditStateWithOwners(canonicalAuditOwner)
+    configureAuditLock(persisted)
+
+    const result = await runScheduledTaskGraphActionRpc(request)
+
+    expect(result).toMatchObject({ kind: 'scheduled_audit_execute', request: { action: 'scheduled_audit_execute',
+      owner: { ...requestOwner, turnLeaseOwnerId: canonicalAuditOwner.turnLeaseOwnerId,
+        turnLeaseVersion: canonicalAuditOwner.turnLeaseVersion }, auditActor: request.auditActor } })
+    if (!result || result instanceof Response || result.kind !== 'scheduled_audit_execute') throw new Error('audit_continuation_expected')
+    expect(result.request.owner).toEqual({ ...requestOwner, turnLeaseOwnerId: canonicalAuditOwner.turnLeaseOwnerId,
+      turnLeaseVersion: canonicalAuditOwner.turnLeaseVersion })
+    expect(result.request.prepareProof).toBe(request.prepareProof)
+    expect(result.request.gateCompletionProof).toBe(request.gateCompletionProof)
+    expect(request.owner).toEqual(requestOwner)
+    expect(mocks.auditProof).toHaveBeenCalledWith(expect.objectContaining({ owner: canonicalAuditOwner, auditActor: request.auditActor }), tx)
+    expect(mocks.auditPrepareSource).toHaveBeenCalledWith(expect.objectContaining({ owner: canonicalAuditOwner }))
+    expect(mocks.update).not.toHaveBeenCalled()
+    expect(mocks.executeGate).not.toHaveBeenCalled()
+  })
+
+  it('rejects split or malformed persisted Audit owners without rewriting the claim or reactivating the Root', async () => {
+    const splitOwner = { ...canonicalAuditOwner, turnLeaseVersion: canonicalAuditOwner.turnLeaseVersion + 1 }
+    for (const persisted of [
+      auditStateWithOwners(canonicalAuditOwner, splitOwner),
+      auditStateWithOwners({ ...canonicalAuditOwner, unexpected: true }),
+    ]) {
+      configureAuditLock(persisted)
+      const result = await runScheduledTaskGraphActionRpc(auditExecuteRequest())
+      expect(result).toBeInstanceOf(Response)
+      expect((result as Response).status).toBe(409)
+      expect(mocks.auditProof).not.toHaveBeenCalled()
+      expect(mocks.auditPrepareSource).not.toHaveBeenCalled()
+      expect(mocks.update).not.toHaveBeenCalled()
+      expect(mocks.executeGate).not.toHaveBeenCalled()
+    }
   })
 })

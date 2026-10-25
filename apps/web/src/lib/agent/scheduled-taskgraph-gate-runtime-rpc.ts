@@ -18,9 +18,9 @@ import { scheduledTaskGraphClaimMatches } from './scheduled-taskgraph-pipeline-f
 import { replayCompletedScheduledTaskGraphAuditReport, replayCompletedScheduledTaskGraphReport } from './scheduled-taskgraph-completed-report-replay'
 import { runScheduledGate } from './stages/gate'
 import { executeScheduledTaskGraphGate } from './scheduled-taskgraph-gate-service'
-import { scheduledTaskGraphExecuteGateCompletionProof, scheduledTaskGraphGateTaskLeaseIsCurrent, scheduledTaskGraphGateTurnIsCurrent, type ScheduledTaskGraphAuditExecuteRpcRequest, type ScheduledTaskGraphExecuteRpcRequest, type ScheduledTaskGraphGateRpcRequest } from './scheduled-taskgraph-gate-rpc'
+import { scheduledTaskGraphAuditExecutionOwner, scheduledTaskGraphExecuteGateCompletionProof, scheduledTaskGraphGateTaskLeaseIsCurrent, scheduledTaskGraphGateTurnIsCurrent, type ScheduledTaskGraphAuditExecuteRpcRequest, type ScheduledTaskGraphExecuteRpcRequest, type ScheduledTaskGraphGateRpcRequest } from './scheduled-taskgraph-gate-rpc'
 import { validateScheduledPrepareWaitIdentity } from './scheduled-taskgraph-run-service'
-import { authorizeScheduledAuditContinuation, validateScheduledTaskGraphAuditPrepareSource } from './scheduled-taskgraph-audit-action'
+import { authorizeScheduledAuditContinuation, resolveScheduledTaskGraphAuditClaimOwner, scheduledTaskGraphPrepareWaitId, validateScheduledTaskGraphAuditPrepareSource } from './scheduled-taskgraph-audit-action'
 import type { PipelineCtx } from './pipeline-context'
 type GateAction = ScheduledTaskGraphGateRpcRequest | ScheduledTaskGraphExecuteRpcRequest | ScheduledTaskGraphAuditExecuteRpcRequest
 type ExecuteContinuation = Readonly<{ kind: 'execute'; request: ScheduledTaskGraphExecuteRpcRequest }>
@@ -173,13 +173,20 @@ async function lockOwner(tx: Prisma.TransactionClient, request: GateAction, sign
   const execution = executions[0]
   if (signal?.aborted || !execution || execution.status !== 'running' || !Number.isSafeInteger(execution.attemptCount)) return null
   if (request.action === 'execute' && !liveRootLease(turn, request.owner)) return null
-  const owner: ScheduledTaskGraphPipelineOwner = { ...request.owner, executionId: execution.id, executionAttemptCount: execution.attemptCount }
+  const requestOwner: ScheduledTaskGraphPipelineOwner = { ...request.owner, executionId: execution.id, executionAttemptCount: execution.attemptCount }
   let key: string
-  try { key = scheduledTaskGraphContinuationKey(owner, request.attestation) } catch { return null }
+  try { key = scheduledTaskGraphContinuationKey(requestOwner, request.attestation) } catch { return null }
   if (record(request.attestation)?.snapshotDigest !== scheduledAutomationSnapshotDigest(snapshot)) return null
-  const state = record(execution.state), waitId = persistedPrepareWait(request, state, snapshot)
+  const state = record(execution.state), claim = record(state?.scheduledTaskGraphClaim), claimToken = claim?.claimToken
+  let owner = requestOwner
+  if (request.action === 'scheduled_audit_execute') {
+    const canonical = resolveScheduledTaskGraphAuditClaimOwner({ requestOwner,
+      proofOwner: scheduledTaskGraphAuditExecutionOwner(request, request.gateCompletionProof), state, key, claimToken })
+    if (!canonical) return null
+    owner = canonical
+  }
+  const waitId = scheduledTaskGraphPrepareWaitId(request, state, snapshot.requireApproval)
   if (waitId === null) return null
-  const claim = record(state?.scheduledTaskGraphClaim), claimToken = claim?.claimToken
   if (!state || !['gate', 'execute', 'audit'].includes(String(state.nextStage)) || !validClaim(claim, owner, key, claimToken)
     || !scheduledTaskGraphClaimMatches(state, key, owner, claimToken as string)
     || request.action === 'gate' && state.nextStage !== 'gate') return null
@@ -239,13 +246,6 @@ function scheduledSnapshot(value: unknown) {
   const input = record(value)
   if (input?.automationRunMode !== 'scheduled') return null
   try { return parseScheduledAutomationSnapshot(input.scheduledAutomationSnapshot) } catch { return null }
-}
-function persistedPrepareWait(request: GateAction, state: Record<string, unknown> | null, snapshot: ReturnType<typeof parseScheduledAutomationSnapshot>): string | undefined | null {
-  const stored = state?.scheduledTaskGraphScheduledWaitId, supplied = request.scheduledWaitId
-  if (stored !== undefined && (typeof stored !== 'string' || supplied !== undefined && supplied !== stored)) return null
-  const id = typeof stored === 'string' ? stored : supplied
-  if (!snapshot.requireApproval) return id === undefined ? undefined : null
-  return typeof id === 'string' && id.startsWith(`agent-question:${request.owner.turnId}:canonical:`) ? id : null
 }
 function candidateIds(attestation: unknown): string[] | null {
   const scout = record(record(attestation)?.scout), ids = scout?.candidateJobIds
