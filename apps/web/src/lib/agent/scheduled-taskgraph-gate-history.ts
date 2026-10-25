@@ -13,6 +13,7 @@ const GATE_SCHEMA = { schemaVersion: RESULT_SCHEMA, role: 'prepare', taskType: G
 export type ScheduledTaskGraphGateHistoryInput = Readonly<{
   reader: Prisma.TransactionClient
   owner: ScheduledTaskGraphPipelineOwner
+  prepareTaskId: string
   prepareGraphRevision: number
   prepareAttemptCount: number
   graphRevision: number
@@ -84,24 +85,25 @@ export async function scheduledTaskGraphGateBindingIsCurrent(input: Readonly<{
 export async function scheduledTaskGraphGateHistoryIsCurrent(input: ScheduledTaskGraphGateHistoryInput): Promise<boolean> {
   try {
     const graphId = taskGraphItemId(input.owner.rootTaskId)
+    if (!validId(input.prepareTaskId)) return false
     const prepareKey = lifecycleKey(input.owner.rootTaskId, 'prepare', input.prepareAttemptCount, 'task.completed')
     const prepareRows = await input.reader.agentEvent.findMany({
       where: { sessionId: input.owner.sessionId, turnId: input.owner.turnId, itemId: graphId,
-        taskId: input.owner.rootTaskId, type: 'item.delta', idempotencyKey: prepareKey },
+        type: 'item.delta', idempotencyKey: prepareKey },
       orderBy: { sequence: 'asc' }, take: 2,
       select: { id: true, sessionId: true, turnId: true, itemId: true, taskId: true, type: true, actor: true,
         idempotencyKey: true, sequence: true, payload: true },
     })
     if (prepareRows.length !== 1) return false
     const prepare = parseLifecycle(prepareRows[0], { owner: input.owner, graphId, expectedRevision: input.prepareGraphRevision - 1,
-      nodeKey: 'prepare', attempt: input.prepareAttemptCount, type: 'task.completed' })
+      nodeKey: 'prepare', taskId: input.prepareTaskId, attempt: input.prepareAttemptCount, type: 'task.completed' })
     if (!prepare) return false
     const priorSnapshot = snapshot(prepare.content)
-    if (!priorSnapshot || priorSnapshot.nodes.length !== 3) return false
+    if (!priorSnapshot || priorSnapshot.nodes.length !== 3 || taskNodeTaskId(priorSnapshot, 'prepare') !== input.prepareTaskId) return false
     const prepareSequence = BigInt(String(prepare.row.sequence))
     const later = await input.reader.agentEvent.findMany({
       where: { sessionId: input.owner.sessionId, turnId: input.owner.turnId, itemId: graphId,
-        taskId: input.owner.rootTaskId, type: 'item.delta', sequence: { gt: prepareSequence } },
+        type: 'item.delta', sequence: { gt: prepareSequence } },
       orderBy: { sequence: 'asc' }, take: MAX_EVENTS,
       select: { id: true, sessionId: true, turnId: true, itemId: true, taskId: true, type: true, actor: true,
         idempotencyKey: true, sequence: true, payload: true },
@@ -140,7 +142,7 @@ function validateHistory(input: ScheduledTaskGraphGateHistoryInput, graphId: str
     if (type !== 'task.started' && type !== 'task.waiting_for_user' && type !== 'task.gate_choice_resumed'
       && type !== 'task.retrying' && type !== 'task.completed') return false
     const next = parseLifecycle(raw, { owner: input.owner, graphId, expectedRevision: revision,
-      nodeKey: 'gate', attempt, type, gateTaskId: input.gate.taskId })
+      nodeKey: 'gate', taskId: input.gate.taskId, attempt, type, gateTaskId: input.gate.taskId })
     if (!next) return false
     revision += 1
     if (type === 'task.started' && status === 'queued') status = 'running'
@@ -172,10 +174,10 @@ function validCompletedGate(input: ScheduledTaskGraphGateHistoryInput, revision:
 }
 
 function parseLifecycle(value: unknown, expected: { owner: ScheduledTaskGraphPipelineOwner; graphId: string; expectedRevision: number;
-  nodeKey: string; attempt: number; type: string; gateTaskId?: string }) {
+  nodeKey: string; taskId: string; attempt: number; type: string; gateTaskId?: string }) {
   const row = record(value), payload = record(row?.payload), event = record(payload?.event), revision = payload?.revision
   if (!row || row.type !== 'item.delta' || row.actor !== 'system' || row.itemId !== expected.graphId
-    || row.taskId !== expected.owner.rootTaskId || row.sessionId !== expected.owner.sessionId || row.turnId !== expected.owner.turnId
+    || row.taskId !== expected.taskId || row.sessionId !== expected.owner.sessionId || row.turnId !== expected.owner.turnId
     || payload?.kind !== 'lifecycle' || !event || event.type !== expected.type || event.nodeKey !== expected.nodeKey
     || event.expectedRevision !== expected.expectedRevision || payload.revision !== expected.expectedRevision + 1
     || event.idempotencyKey !== lifecycleKey(expected.owner.rootTaskId, expected.nodeKey, expected.attempt, expected.type)
@@ -194,6 +196,11 @@ function snapshot(value: unknown): Snapshot | null {
   return row?.schemaVersion === GRAPH_SCHEMA && nodes && nodes.every(Boolean)
     ? { schemaVersion: GRAPH_SCHEMA, nodes: nodes as Record<string, unknown>[], ...(Object.hasOwn(row, 'rootSuccessCriteria') ? { rootSuccessCriteria: row.rootSuccessCriteria } : {}) }
     : null
+}
+function taskNodeTaskId(value: Snapshot, key: string): string | null {
+  const matches = value.nodes.filter(node => node.key === key)
+  const taskId = matches.length === 1 ? matches[0]?.taskId : null
+  return validId(taskId) ? taskId : null
 }
 function samePrefix(prior: Snapshot, proposed: Snapshot): boolean {
   if (prior.nodes.length !== 3 || proposed.nodes.length !== 4) return false

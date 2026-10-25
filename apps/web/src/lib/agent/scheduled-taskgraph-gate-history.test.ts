@@ -22,7 +22,7 @@ function lifecycle(type: string, attempt: number, expectedRevision: number, sequ
   const idempotencyKey = `${graphId}:node:${createHash('sha256').update('gate').digest('hex').slice(0, 20)}:${attempt}:${type}`
   const status = type === 'task.started' ? 'running' : type === 'task.completed' ? 'completed' : 'queued'
   const content = { ...proposalSnapshot, nodes: [...proposalSnapshot.nodes.slice(0, 3), { ...proposalSnapshot.nodes[3], status }] }
-  return { id: `event-${sequence}`, sessionId: owner.sessionId, turnId: owner.turnId, itemId: graphId, taskId: owner.rootTaskId,
+  return { id: `event-${sequence}`, sessionId: owner.sessionId, turnId: owner.turnId, itemId: graphId, taskId: 'gate-1',
     type: 'item.delta', actor: 'system', idempotencyKey, sequence,
     payload: { kind: 'lifecycle', revision: expectedRevision + 1,
       event: { type, idempotencyKey, expectedRevision, nodeKey: 'gate' },
@@ -32,7 +32,7 @@ function lifecycle(type: string, attempt: number, expectedRevision: number, sequ
 
 function fixture(maxAttempts = 3) {
   const prepareKey = `${graphId}:node:${createHash('sha256').update('prepare').digest('hex').slice(0, 20)}:1:task.completed`
-  const prepare = { id: 'prepare-event', sessionId: owner.sessionId, turnId: owner.turnId, itemId: graphId, taskId: owner.rootTaskId,
+  const prepare = { id: 'prepare-event', sessionId: owner.sessionId, turnId: owner.turnId, itemId: graphId, taskId: 'prepare-1',
     type: 'item.delta', actor: 'system', idempotencyKey: prepareKey, sequence: BigInt(100),
     payload: { kind: 'lifecycle', revision: 10,
       event: { type: 'task.completed', idempotencyKey: prepareKey, expectedRevision: 9, nodeKey: 'prepare' },
@@ -51,12 +51,12 @@ function fixture(maxAttempts = 3) {
   const reader = { agentEvent: { findMany } } as unknown as Prisma.TransactionClient
   const digest = `sha256:${createHash('sha256').update(canonicalJson(gateResult), 'utf8').digest('hex')}`
   const completedSnapshot = { ...proposalSnapshot, nodes: [...proposalSnapshot.nodes.slice(0, 3), { ...proposalSnapshot.nodes[3], status: 'completed' }] }
-  const input = { reader, owner, prepareGraphRevision: 10, prepareAttemptCount: 1, graphRevision: 15, graphContent: completedSnapshot,
+  const input = { reader, owner, prepareTaskId: 'prepare-1', prepareGraphRevision: 10, prepareAttemptCount: 1, graphRevision: 15, graphContent: completedSnapshot,
     gateTask: { id: 'gate-1', status: 'completed', attemptCount: 2, maxAttempts, result: gateResult },
     gate: { taskId: 'gate-1', attemptCount: 2, phase: 'completed' as const, completionProof: { schemaVersion:
       'agent-harness.v2.scheduled-taskgraph-gate-completion.v1', graphRevision: 15, prepareProof: {}, gate: { taskId: 'gate-1',
         attemptCount: 2, resultDigest: digest, completedEventRevision: 15 } } }, expectedJobIds: ['job-1'] }
-  return { input, findMany }
+  return { input, findMany, prepare, rows }
 }
 
 describe('scheduled TaskGraph Gate lifecycle history', () => {
@@ -76,7 +76,36 @@ describe('scheduled TaskGraph Gate lifecycle history', () => {
     const { input, findMany } = fixture()
     const result = await scheduledTaskGraphGateHistoryIsCurrent(input)
     expect(findMany).toHaveBeenCalledTimes(2)
+    expect(findMany.mock.calls[0]?.[0].where).toMatchObject({
+      sessionId: owner.sessionId, turnId: owner.turnId, itemId: graphId, idempotencyKey: expect.any(String),
+    })
+    expect(findMany.mock.calls[0]?.[0].where).not.toHaveProperty('taskId')
+    expect(findMany.mock.calls[1]?.[0].where).not.toHaveProperty('taskId')
     expect(result).toBe(true)
+  })
+
+  it('rejects a Prepare completion event attached to the root task', async () => {
+    const { input, prepare } = fixture()
+    prepare.taskId = owner.rootTaskId
+    await expect(scheduledTaskGraphGateHistoryIsCurrent(input)).resolves.toBe(false)
+  })
+
+  it('rejects a Prepare completion event attached to another child task', async () => {
+    const { input, prepare } = fixture()
+    prepare.taskId = 'other-prepare'
+    await expect(scheduledTaskGraphGateHistoryIsCurrent(input)).resolves.toBe(false)
+  })
+
+  it('rejects a Gate lifecycle event attached to the root task', async () => {
+    const { input, rows } = fixture()
+    rows[1]!.taskId = owner.rootTaskId
+    await expect(scheduledTaskGraphGateHistoryIsCurrent(input)).resolves.toBe(false)
+  })
+
+  it('rejects a Gate lifecycle event attached to a different child task', async () => {
+    const { input, rows } = fixture()
+    rows[1]!.taskId = 'other-gate'
+    await expect(scheduledTaskGraphGateHistoryIsCurrent(input)).resolves.toBe(false)
   })
 
   it('rejects a generic retry beyond the persisted maxAttempts ceiling', async () => {

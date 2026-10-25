@@ -249,6 +249,7 @@ describe('scheduled TaskGraph Gate input reload', () => {
     expect(marker.key).not.toBe(valid.proof.receipt.continuationKey)
     await expect(loadScheduledTaskGraphGateInput(attachGate(valid.input, valid.proof, valid.graph, valid.analyzeAttestation)))
       .resolves.toMatchObject({ packages: [{ jobId: jobRow.id }] })
+    expect(mocks.gateHistory).toHaveBeenCalledWith(expect.objectContaining({ prepareTaskId: 'prepare-task' }))
 
     mocks.jobs.mockClear()
     const mismatched = setup()

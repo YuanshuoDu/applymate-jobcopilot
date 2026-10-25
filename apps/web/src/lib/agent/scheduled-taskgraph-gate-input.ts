@@ -169,7 +169,8 @@ async function verifyCurrentTaskGraph(owner: ScheduledTaskGraphPipelineOwner, ma
       || !Array.isArray(gateTask.allowedActions) || gateTask.allowedActions.length !== 0
       || !sameJson(gateTask.expectedOutputSchema, { schemaVersion: 'agent-harness.v2.subagent.result', role: 'prepare', taskType: 'scheduled_taskgraph_gate' })
       || !await scheduledTaskGraphGateHistoryIsCurrent({ reader, owner, prepareGraphRevision: proof.graphRevision,
-        prepareAttemptCount: proof.nodes[2].attemptCount, graphRevision: graph.revision, graphContent: graph.content,
+        prepareTaskId: proof.nodes[2].taskId, prepareAttemptCount: proof.nodes[2].attemptCount,
+        graphRevision: graph.revision, graphContent: graph.content,
         gateTask: { id: gateTask.id, status: gateTask.status, attemptCount: gateTask.attemptCount, maxAttempts: gateTask.maxAttempts, result: gateTask.result },
         gate, expectedJobIds: proof.result.jobs.filter(job => job.status === 'prepared').map(job => job.jobId) })) return false
   }

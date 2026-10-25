@@ -29,7 +29,7 @@ type Runner = Readonly<{ worker: Worker<SubagentJobPayload, unknown>; redis: Red
 type ScheduledPipelineRoute = Readonly<{ POST(request: Request): Promise<Response> }>
 type ExecuteHttpResponse = Readonly<{ status: number; body: Record<string, unknown> }>
 type GateFailureDiagnostics = Readonly<Record<string, unknown>>
-type GateHistoryProbeRow = Readonly<{ actor: string | null; idempotencyKey: string | null; sequence: bigint; payload: unknown }>
+type GateHistoryProbeRow = Readonly<{ actor: string | null; taskId: string | null; idempotencyKey: string | null; sequence: bigint; payload: unknown }>
 const diagnosticOutcomeStatuses = new Set(["completed", "retrying", "failed", "waiting", "waiting_for_user", "interrupted", "skipped", "lease_lost"])
 const scheduledPipelineRoutePath = "@/app/api/internal/agent-runtime/scheduled-pipeline/route"
 const scheduledGateQualityReviewPath = "@/lib/agent/stages/gate-quality-review"
@@ -247,7 +247,7 @@ async function setupFetcher(fixture: Fixture) {
       const payload = await response.clone().json().catch(() => null)
       const routeBody = debugRecord(payload)
       if (response.status === 409 && routeBody?.errorCode === "scheduled_pipeline_turn_stale") {
-        gateDiagnostics = await readGateFailureDiagnostics(fixture, body, request.signal.aborted, response.status, payload)
+        gateDiagnostics = await readGateFailureDiagnostics(fixture, body, request.signal.aborted, response.status)
       }
       return response
     }
@@ -289,12 +289,11 @@ async function setupFetcher(fixture: Fixture) {
 
 /** Captures only redacted lock predicates while the rejected Gate lease is still live. */
 async function readGateFailureDiagnostics(fixture: Fixture, requestBody: Record<string, unknown>, signalAborted: boolean,
-  responseStatus: number, responsePayload: unknown): Promise<GateFailureDiagnostics> {
-  const response = debugRecord(responsePayload)
+  responseStatus: number): Promise<GateFailureDiagnostics> {
   const owner = debugRecord(requestBody.owner), rootTaskId = owner?.rootTaskId, gateTaskId = requestBody.gateTaskId,
     gateLeaseOwnerId = requestBody.gateLeaseOwnerId, gateAttemptCount = requestBody.gateAttemptCount,
     suppliedWaitId = requestBody.scheduledWaitId
-  const safeResponse = { responseStatus, responseErrorCode: typeof response?.errorCode === "string" ? response.errorCode : null, signalAborted }
+  const safeResponse = { responseStatus, signalAborted }
   if (!owner || typeof owner.userId !== "string" || typeof owner.sessionId !== "string" || typeof owner.turnId !== "string"
     || typeof rootTaskId !== "string" || typeof gateTaskId !== "string" || typeof gateLeaseOwnerId !== "string"
     || !Number.isSafeInteger(gateAttemptCount) || suppliedWaitId !== undefined && typeof suppliedWaitId !== "string") {
@@ -407,7 +406,7 @@ async function readGateFailureDiagnostics(fixture: Fixture, requestBody: Record<
         gate: { taskId: string; attemptCount: number; phase: "running" }
       }): Promise<boolean>
       scheduledTaskGraphGateHistoryIsCurrent(input: {
-        reader: unknown; owner: unknown; prepareGraphRevision: number; prepareAttemptCount: number
+        reader: unknown; owner: unknown; prepareTaskId: string; prepareGraphRevision: number; prepareAttemptCount: number
         graphRevision: number; graphContent: unknown
         gateTask: { id: string; status: string; attemptCount: number; maxAttempts: number; result: unknown }
         gate: { taskId: string; attemptCount: number; phase: "running" }; expectedJobIds: readonly string[]
@@ -448,7 +447,9 @@ async function readGateFailureDiagnostics(fixture: Fixture, requestBody: Record<
       if (gateBindingCurrent && parsedProof) {
         const reader = tx as GateProofDebugReader
         const graphId = `task-graph-${createHash("sha256").update(rootTaskId).digest("hex")}`
-        const [graph, historyGateTask, historyEvents] = await Promise.all([
+        const prepareNodeHash = createHash("sha256").update("prepare").digest("hex").slice(0, 20)
+        const prepareEventKey = `${graphId}:node:${prepareNodeHash}:${parsedProof.nodes[2].attemptCount}:task.completed`
+        const [graph, historyGateTask, prepareEvents] = await Promise.all([
           reader.agentItem.findFirst({ where: { id: graphId, sessionId: owner.sessionId, turnId: owner.turnId,
             taskId: owner.rootTaskId, type: "task_graph", session: { is: { userId: owner.userId } },
             turn: { is: { userId: owner.userId, rootTaskId: owner.rootTaskId } } }, select: { revision: true, content: true } }),
@@ -456,10 +457,18 @@ async function readGateFailureDiagnostics(fixture: Fixture, requestBody: Record<
             rootTaskId: owner.rootTaskId, session: { is: { userId: owner.userId } } },
             select: { id: true, status: true, attemptCount: true, maxAttempts: true, result: true } }),
           reader.agentEvent.findMany({ where: { sessionId: owner.sessionId, turnId: owner.turnId, itemId: graphId,
-            taskId: owner.rootTaskId, type: "item.delta" }, orderBy: { sequence: "asc" }, take: 256,
-            select: { actor: true, idempotencyKey: true, sequence: true, payload: true } }),
+            type: "item.delta", idempotencyKey: prepareEventKey }, orderBy: { sequence: "asc" }, take: 2,
+            select: { actor: true, taskId: true, idempotencyKey: true, sequence: true, payload: true } }),
         ])
+        const prepareEvent = prepareEvents.length === 1 ? prepareEvents[0] : null
+        const laterEvents = prepareEvent
+          ? await reader.agentEvent.findMany({ where: { sessionId: owner.sessionId, turnId: owner.turnId, itemId: graphId,
+            type: "item.delta", sequence: { gt: prepareEvent.sequence } }, orderBy: { sequence: "asc" }, take: 256,
+          select: { actor: true, taskId: true, idempotencyKey: true, sequence: true, payload: true } })
+          : []
+        const historyEvents = [...prepareEvents, ...laterEvents]
         gateHistoryEventSummary = summarizeGateHistoryEvents({ rows: historyEvents, graphId, rootTaskId,
+          prepareTaskId: parsedProof.nodes[2].taskId,
           sessionId: ownerSessionId, turnId: ownerTurnId, graphContent: graph?.content,
           prepareGraphRevision: parsedProof.graphRevision, prepareAttemptCount: parsedProof.nodes[2].attemptCount,
           gateTaskId, gateAttemptCount: gate.attemptCount, gateTaskStatus: historyGateTask?.status ?? null,
@@ -470,7 +479,8 @@ async function readGateFailureDiagnostics(fixture: Fixture, requestBody: Record<
           try {
             gateHistoryCurrent = await gateHistory.scheduledTaskGraphGateHistoryIsCurrent({
               reader: tx, owner: ownerForLock, prepareGraphRevision: parsedProof.graphRevision,
-              prepareAttemptCount: parsedProof.nodes[2].attemptCount, graphRevision: graph.revision, graphContent: graph.content,
+              prepareTaskId: parsedProof.nodes[2].taskId, prepareAttemptCount: parsedProof.nodes[2].attemptCount,
+              graphRevision: graph.revision, graphContent: graph.content,
               gateTask: historyGateTask, gate, expectedJobIds: parsedProof.result.jobs
                 .filter(job => job.status === "prepared").map(job => job.jobId),
             })
@@ -571,6 +581,7 @@ function debugSameLineageOwner(value: unknown, owner: Record<string, unknown>): 
 }
 function summarizeGateHistoryEvents(input: {
   rows: readonly GateHistoryProbeRow[]; graphId: string; rootTaskId: string; sessionId: string; turnId: string; graphContent: unknown
+  prepareTaskId: string
   prepareGraphRevision: number
   prepareAttemptCount: number; gateTaskId: string; gateAttemptCount: number; gateTaskStatus: string | null
   gateTaskAttemptCount: number | null; gateMaxAttempts: number | null; graphRevision: number | null
@@ -580,6 +591,7 @@ function summarizeGateHistoryEvents(input: {
   const prepareKey = lifecycleKey("prepare", input.prepareAttemptCount, "task.completed")
   const prepareMatches = input.rows.filter(row => row.idempotencyKey === prepareKey)
   const prepareRow = prepareMatches.length === 1 ? prepareMatches[0] : null
+  const prepareTaskIdentityMatches = Boolean(prepareRow && prepareRow.taskId === input.prepareTaskId)
   const prepareSequence = prepareRow ? debugSequence(prepareRow.sequence) : null
   const laterRows = prepareSequence === null ? [] : input.rows.filter(row => {
     const sequence = debugSequence(row.sequence)
@@ -613,8 +625,9 @@ function summarizeGateHistoryEvents(input: {
   const proposalKey = `${input.graphId}:proposal:${input.prepareGraphRevision}`
   const receiptNode = receiptNodes?.length === 1 ? debugRecord(receiptNodes[0]) : null
   const receiptReadyIds = Array.isArray(receipt?.readyTaskIds) ? receipt.readyTaskIds : null
+  const proposalTaskIdentityMatches = Boolean(proposalRow && proposalRow.taskId === input.rootTaskId)
   const proposalValid = Boolean(proposalRow && proposalRow.actor === "orchestrator"
-    && proposalRow.idempotencyKey === proposalKey && proposalPayload?.kind === "proposal"
+    && proposalTaskIdentityMatches && proposalRow.idempotencyKey === proposalKey && proposalPayload?.kind === "proposal"
     && proposalPayload.revision === input.prepareGraphRevision + 1
     && typeof proposalPayload.fingerprint === "string" && /^[a-f0-9]{64}$/.test(proposalPayload.fingerprint)
     && receipt?.status === "accepted" && receipt.revision === input.prepareGraphRevision + 1
@@ -633,6 +646,9 @@ function summarizeGateHistoryEvents(input: {
     const kind = payload?.kind
     const isPrepare = row === prepareRow
     const isProposal = !isPrepare && row === proposalRow
+    const taskIdentityMatches = isPrepare ? prepareTaskIdentityMatches
+      : isProposal ? row.taskId === input.rootTaskId
+        : kind === "lifecycle" && event?.nodeKey === "gate" ? row.taskId === input.gateTaskId : false
     let rowExpectedRevision: number | null = null
     let expectedPayloadRevision: number | null = null
     let expectedKey: string | null = null
@@ -677,6 +693,7 @@ function summarizeGateHistoryEvents(input: {
       payloadRevisionMatches,
       rowEventKeyMatches,
       expectedKeyMatches,
+      taskIdentityMatches,
       gateNodeStatus: eventGateNodeStatus,
     }
     const eventItemValid = Boolean(eventItem && eventItem.id === input.graphId && eventItem.sessionId === input.sessionId
@@ -701,7 +718,7 @@ function summarizeGateHistoryEvents(input: {
         nextAttempt += 1; nextStatus = "queued"
       } else if (type === "task.completed" && expectedStatus === "running") nextStatus = "completed"
       const eventEnvelopeMatches = row.actor === "system" && kind === "lifecycle" && event?.nodeKey === "gate"
-        && eventShapeMatches && eventItemValid && expectedRevisionMatches && payloadRevisionMatches
+        && taskIdentityMatches && eventShapeMatches && eventItemValid && expectedRevisionMatches && payloadRevisionMatches
         && rowEventKeyMatches === true && expectedKeyMatches
       const expectedContent = proposedSnapshot && nextStatus
         ? { ...proposedSnapshot, nodes: [...proposedSnapshot.nodes.slice(0, 3), { ...proposedSnapshot.nodes[3]!, status: nextStatus }] }
@@ -727,6 +744,8 @@ function summarizeGateHistoryEvents(input: {
     sequenceOrderMatches,
     prepareEventMatchCount: prepareMatches.length,
     prepareEventOrder: prepareRow ? input.rows.indexOf(prepareRow) + 1 : null,
+    prepareTaskIdentityMatches,
+    proposalTaskIdentityMatches,
     prepareSequenceFound: prepareSequence !== null,
     postPrepareEventCount: laterRows.length,
     events: eventOrder,
