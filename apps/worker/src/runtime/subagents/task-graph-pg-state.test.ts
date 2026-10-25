@@ -11,6 +11,8 @@ import { TASK_GRAPH_NATIVE_METADATA_VERSION, TASK_GRAPH_NATIVE_TEMPLATE_ID } fro
 import { DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION } from "./child-discovery-attempt.js"
 import { SCHEDULED_GATE_NODE_CRITERIA, SCHEDULED_GATE_NODE_GOAL, SCHEDULED_GATE_OUTPUT_SCHEMA,
   SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE, scheduledGateCandidateSetDigest } from "./scheduled-gate-contract.js"
+import { SCHEDULED_AUDIT_NODE_CRITERIA, SCHEDULED_AUDIT_NODE_GOAL, SCHEDULED_AUDIT_OUTPUT_SCHEMA,
+  SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE, SCHEDULED_AUDIT_TEMPLATE_ID } from "./scheduled-audit-contract.js"
 import { SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA } from "./scheduled-prepare-task-graph-verification.js"
 
 type QueryResult = { rows: Array<Record<string, unknown>>; rowCount: number }
@@ -265,6 +267,74 @@ describe("TaskGraph PostgreSQL state loading", () => {
       .toThrow("task_graph_verification_report_invalid")
   })
 
+  it("allows only an exact completed scheduled Audit report envelope with the null generic-report sentinel", () => {
+    const report = { processed: 2, applied: 0, queued: 1, pending: 1, skipped: 0, failed: 0, durationMs: 15 }
+    const envelope = (overrides: Record<string, unknown> = {}) => ({ finalItemId: null, finalText: "", status: "completed",
+      stepCount: 0, toolCallCount: 0, taskGraphVerificationReport: null, structuredResult: report, ...overrides })
+    type AuditFixtureInput = Readonly<{ node?: Record<string, unknown>; task?: Partial<GraphTaskRow>; result?: unknown }>
+    const fixture = (input: AuditFixtureInput) => {
+      const snapshot = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
+        { key: "scheduled-scout", templateId: "scout", goal: "Discover jobs", successCriteria: ["Record candidates"], dependsOn: [], depth: 1, taskId: "scout-1" },
+        { key: "scheduled-analyst", templateId: "analyst", goal: "Analyze jobs", successCriteria: ["Record evidence"], dependsOn: ["scheduled-scout"], depth: 2, taskId: "analyst-1" },
+        { key: "prepare", templateId: "prepare", goal: "Prepare exact materials", successCriteria: ["Prepared"], dependsOn: ["scheduled-analyst"], depth: 3,
+          taskId: "prepare-1", verificationDisposition: "specialized" },
+        { key: "gate", templateId: "gate", goal: SCHEDULED_GATE_NODE_GOAL, successCriteria: SCHEDULED_GATE_NODE_CRITERIA,
+          dependsOn: ["prepare"], depth: 4, taskId: "gate-1", verificationDisposition: "specialized" },
+        { key: SCHEDULED_AUDIT_TEMPLATE_ID, templateId: SCHEDULED_AUDIT_TEMPLATE_ID, goal: SCHEDULED_AUDIT_NODE_GOAL,
+          successCriteria: SCHEDULED_AUDIT_NODE_CRITERIA, dependsOn: ["gate"], depth: 5, taskId: "audit-1",
+          verificationDisposition: "specialized", ...input.node },
+      ] })
+      const prepareResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status: "completed", taskId: "prepare-1", attemptCount: 1,
+        snapshotDigest: `sha256:${"a".repeat(64)}`, checkpointDigest: "b".repeat(64), jobs: [{ jobId: "job-1", status: "prepared" }], materials: [] }
+      const tasks = new Map<string, GraphTaskRow>([
+        ["scout-1", { ...validTaskRow({ id: "scout-1", role: "scout", taskType: "job_discovery" }), status: "completed" }],
+        ["analyst-1", { ...validTaskRow({ id: "analyst-1", role: "analyst", taskType: "job_analysis" }), status: "completed" }],
+        ["prepare-1", { ...validTaskRow({ id: "prepare-1", role: "prepare", taskType: "scheduled_application_prepare",
+          expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", taskType: "scheduled_application_prepare" },
+          result: { structuredResult: prepareResult, taskGraphScheduledPrepareProofFacts: {
+            schemaVersion: SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA, result: prepareResult } } }), status: "completed" }],
+        ["gate-1", { ...validTaskRow({ id: "gate-1", role: SCHEDULED_GATE_ROLE, taskType: SCHEDULED_GATE_TASK_TYPE,
+          expectedOutputSchema: SCHEDULED_GATE_OUTPUT_SCHEMA, allowedActions: [], contextIsEmpty: true,
+          result: { finalItemId: null, finalText: "", status: "completed", stepCount: 0, toolCallCount: 0,
+            taskGraphVerificationReport: null, structuredResult: { status: "completed", nextStage: "execute", approvedJobIds: [],
+              pendingJobIds: ["job-1"], skippedJobIds: [], counts: { approved: 0, pending: 1, skipped: 0 } } } }), status: "completed" }],
+        ["audit-1", { ...validTaskRow({ id: "audit-1", role: SCHEDULED_AUDIT_ROLE, taskType: SCHEDULED_AUDIT_TASK_TYPE,
+          expectedOutputSchema: SCHEDULED_AUDIT_OUTPUT_SCHEMA, allowedActions: [], contextIsEmpty: true,
+          result: input.result === undefined ? envelope() : input.result }), ...input.task,
+          status: input.task?.status ?? "completed" }],
+      ])
+      const state = taskGraphState(snapshot, 8, new Map([...tasks].map(([id, task]) => [id, { status: task.status, failureReason: task.failureReason }])), [])
+      return { rootTaskId: identity.rootTaskId, snapshot, state, tasks, item: { id: taskGraphItemId(identity.rootTaskId), revision: 8, content: snapshot, createdAt: new Date() } }
+    }
+
+    const current = currentTaskGraph(fixture({}))
+    expect(current.nodes[4]).toMatchObject({ key: SCHEDULED_AUDIT_TEMPLATE_ID, status: "completed",
+      resultProjection: { availability: "unavailable" } })
+    expect(current.nodes[4]).not.toHaveProperty("verificationReport")
+
+    const invalid: Array<AuditFixtureInput & { label: string }> = [
+      { label: "missing generic-report sentinel", result: { finalItemId: null, finalText: "", status: "completed", stepCount: 0,
+        toolCallCount: 0, structuredResult: report } },
+      { label: "non-null forged generic report", result: envelope({ taskGraphVerificationReport: { status: "passed" } }) },
+      { label: "extra result field", result: { ...envelope(), extra: true } },
+      { label: "extra report field", result: envelope({ structuredResult: { ...report, extra: 0 } }) },
+      { label: "malformed fixed report", result: envelope({ structuredResult: { ...report, failed: -1 } }) },
+      { label: "role mismatch", task: { role: "reviewer" } },
+      { label: "task type mismatch", task: { taskType: "other" } },
+      { label: "output schema mismatch", task: { expectedOutputSchema: { ...SCHEDULED_AUDIT_OUTPUT_SCHEMA, taskType: "other" } } },
+      { label: "extra allowed action", task: { allowedActions: ["agent.plan"] } },
+      { label: "nonempty private context", task: { contextIsEmpty: false } },
+      { label: "template mismatch", node: { templateId: "cover_letter_writer" } },
+      { label: "goal mismatch", node: { goal: "different" } },
+      { label: "criteria mismatch", node: { successCriteria: ["different"] } },
+      { label: "dependency mismatch", node: { dependsOn: ["prepare"] } },
+      { label: "depth mismatch", node: { depth: 4 } },
+      { label: "legacy disposition", node: { verificationDisposition: "legacy_unverified" } },
+      { label: "status mismatch", task: { status: "failed", failureReason: "invalid_structured_result" } },
+    ]
+    for (const input of invalid) expect(() => currentTaskGraph(fixture(input))).toThrow("task_graph_verification_report_invalid")
+  })
+
   it("restores a typed contract from persisted canonical content across a Worker restart", async () => {
     const persisted = canonicalTaskGraphJson(typedSnapshot())
     const firstWorker = await loadTaskGraph(fakeClient({ itemContent: persisted }).client, identity)
@@ -296,6 +366,9 @@ describe("TaskGraph PostgreSQL state loading", () => {
     await expect(loadTaskGraph(wrongCriterion.client, identity).then(currentTaskGraph)).rejects.toThrow("task_graph_verification_report_invalid")
     const missing = fakeClient({ itemContent: typedSnapshot(), taskRows: [validTaskRow({ status: "completed", role: "analyst" })] })
     await expect(loadTaskGraph(missing.client, identity).then(currentTaskGraph)).rejects.toThrow("task_graph_verification_report_invalid")
+    const nullSentinel = fakeClient({ itemContent: typedSnapshot(), taskRows: [validTaskRow({ status: "completed", role: "analyst",
+      result: { taskGraphVerificationReport: null } })] })
+    await expect(loadTaskGraph(nullSentinel.client, identity).then(currentTaskGraph)).rejects.toThrow("task_graph_verification_report_invalid")
     const incoherent = fakeClient({ itemContent: typedSnapshot(), taskRows: [validTaskRow({
       status: "completed", role: "analyst", result: { taskGraphVerificationReport: { ...findingReport, status: "passed", reasonCode: "criteria_met" } },
     })] })
