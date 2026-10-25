@@ -334,7 +334,75 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     runner = startRunner(fixture, response.fetcher)
     expect(await readRootTurnState(fixture)).toMatchObject({ turnStatus: "waiting_for_dependency", turnLeaseOwnerId: null, sessionStatus: "running" })
     await waitForAuditRetryDue(auditTaskId)
-    await expect(dispatchAndWait(runner, auditTaskId, fixture.ids.sessionId)).resolves.toMatchObject({ status: "completed" })
+    const secondTaskOutcome = await dispatchAndWait(runner, auditTaskId, fixture.ids.sessionId)
+    const secondOutcomeRow = debugRecord(secondTaskOutcome)
+    if (secondOutcomeRow?.status !== "completed") {
+      const [failedTask, rootState] = await Promise.all([taskState(auditTaskId), readRootTurnState(fixture)])
+      const safeStatus = (value: unknown) => typeof value === "string" && (diagnosticOutcomeStatuses.has(value)
+        || ["queued", "in_progress", "running", "cancelled", "closed", "paused", "aborted", "not_called", "gate_checkpointed",
+          "scout", "analyze", "prepare", "gate", "execute", "audit"].includes(value)) ? value : "other"
+      const safeFailureReason = (value: unknown) => typeof value === "string"
+        ? diagnosticAuditFailureReasons.has(value) ? value : "other" : null
+      const safeRetryDisposition = (value: unknown) => value === "retryable" || value === "terminal" ? value : null
+      const replay = response.replayedExecuteResponse()
+      const safeReplay = replay ? {
+        status: replay.status,
+        bodyStatus: safeStatus(debugRecord(replay.body)?.status),
+        bodyKeys: Object.keys(replay.body).filter(key => ["status", "report", "errorCode"].includes(key)).sort(),
+        reportValid: parseScheduledAuditReport(replay.body.report) !== null,
+      } : null
+      const safeExecuteFailures = response.executeHttpFailures().map(failure => ({
+        status: failure.status,
+        errorCode: failure.errorCode && diagnosticAuditFailureReasons.has(failure.errorCode) ? failure.errorCode : failure.errorCode ? "other" : null,
+        keys: failure.keys.filter(key => ["status", "report", "errorCode"].includes(key)).sort(),
+        reportValid: failure.reportValid,
+        executionStatus: safeStatus(failure.executionStatus),
+        executionCheckpoint: safeStatus(failure.executionCheckpoint),
+        executionNextStage: safeStatus(failure.executionNextStage),
+        hasExecutionError: failure.hasExecutionError ?? false,
+        executionErrorCode: safeFailureReason(failure.executionErrorCode),
+        pipelineOutcome: safeStatus(failure.pipelineOutcome),
+        auditPreflight: {
+          gateCompletionProofValid: failure.auditPreflight.gateCompletionProofValid,
+          executionOwnerDerived: failure.auditPreflight.executionOwnerDerived,
+          prepareProofCanonicalMatch: failure.auditPreflight.prepareProofCanonicalMatch,
+          executionContext: failure.auditPreflight.executionContext,
+          markerKeyMatches: failure.auditPreflight.markerKeyMatches,
+          claimKeyMatches: failure.auditPreflight.claimKeyMatches,
+          markerOwnerExact9Matches: failure.auditPreflight.markerOwnerExact9Matches,
+          markerOwnerStable7Matches: failure.auditPreflight.markerOwnerStable7Matches,
+          claimOwnerExact9Matches: failure.auditPreflight.claimOwnerExact9Matches,
+          claimOwnerStable7Matches: failure.auditPreflight.claimOwnerStable7Matches,
+          claimTokenValid: failure.auditPreflight.claimTokenValid,
+          savedScheduledWaitIdMatchesRequest: failure.auditPreflight.savedScheduledWaitIdMatchesRequest,
+          prepareSource: failure.auditPreflight.prepareSource,
+          gateProofCurrent: failure.auditPreflight.gateProofCurrent,
+        },
+        continuation: failure.continuation ? {
+          gateResume: safeStatus(failure.continuation.gateResume), analyzeCheckpoint: safeStatus(failure.continuation.analyzeCheckpoint),
+          continuationKey: safeStatus(failure.continuation.continuationKey), waitBinding: safeStatus(failure.continuation.waitBinding),
+          ownerCurrentRecheck: safeStatus(failure.continuation.ownerCurrentRecheck), prepareWait: safeStatus(failure.continuation.prepareWait),
+          gateInputRecheck: safeStatus(failure.continuation.gateInputRecheck), gateProofCurrent: safeStatus(failure.continuation.gateProofCurrent),
+          gateHandoff: safeStatus(failure.continuation.gateHandoff), claimLease: safeStatus(failure.continuation.claimLease),
+          storedStage: safeStatus(failure.continuation.storedStage), completionProof: safeStatus(failure.continuation.completionProof),
+          completionPrepareProof: safeStatus(failure.continuation.completionPrepareProof),
+          preparedArtifactRefs: safeStatus(failure.continuation.preparedArtifactRefs), gateDecisions: safeStatus(failure.continuation.gateDecisions),
+          persistedGateDecisions: safeStatus(failure.continuation.persistedGateDecisions), gateOutput: safeStatus(failure.continuation.gateOutput),
+          serializedCheckpoint: safeStatus(failure.continuation.serializedCheckpoint), checkpointSave: safeStatus(failure.continuation.checkpointSave),
+        } : null,
+      }))
+      const taskFailureReason = failedTask.failureReason === null ? null : safeFailureReason(failedTask.failureReason)
+      throw new Error(`Scheduled Audit retry returned a non-completed outcome: ${JSON.stringify({
+        result: { status: safeStatus(secondOutcomeRow?.status), failureReason: safeFailureReason(secondOutcomeRow?.failureReason),
+          retryDisposition: safeRetryDisposition(secondOutcomeRow?.retryDisposition) },
+        task: { status: safeStatus(failedTask.status), attemptCount: failedTask.attemptCount, failureReason: taskFailureReason },
+        executeCalls: response.executeCalls(), executeHttpFailures: safeExecuteFailures, replay: safeReplay,
+        root: { turnStatus: safeStatus(rootState.turnStatus), turnLeaseOwned: rootState.turnLeaseOwnerId !== null,
+          sessionStatus: safeStatus(rootState.sessionStatus), rootStatus: safeStatus(rootState.rootStatus),
+          resultStatus: safeStatus(debugRecord(rootState.rootResult)?.status) },
+      })}`)
+    }
+    expect(secondTaskOutcome).toMatchObject({ status: "completed" })
     expect(response.executeCalls()).toBe(2)
     const firstRequest = response.firstExecuteRequest()!
     const retryRequest = response.replayedExecuteRequest()!
