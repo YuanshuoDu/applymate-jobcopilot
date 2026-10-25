@@ -172,6 +172,7 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(firstTaskOutcome).toMatchObject({ status: "retrying" })
     expect(response.executeCalls()).toBe(1)
     const firstHttpResponse = response.firstExecuteResponse()
+    if (!firstHttpResponse) throw new Error(`Scheduled Audit execute response missing: ${JSON.stringify(response.executeHttpFailures())}`)
     expect(firstHttpResponse).toBeDefined()
     expect(firstHttpResponse?.status).toBe(200)
     expect(Object.keys(firstHttpResponse?.body ?? {}).sort()).toEqual(["report", "status"])
