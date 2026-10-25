@@ -289,10 +289,11 @@ async function setupFetcher(fixture: Fixture) {
   vi.doMock(scheduledEntitlementsPath, () => ({ isFeatureAllowed: async () => true,
     hasEffectiveEntitlement: async () => true, resolveAiAccess: async () => "available" }))
   let pipelineOutcome = "not_called"
-  const runService = await vi.importActual<typeof import("@/lib/agent/run-service")>(scheduledRunServicePath)
-  vi.doMock(scheduledRunServicePath, () => ({ ...runService, runAgentPipeline: async (...args: Parameters<typeof runService.runAgentPipeline>) => {
+  type RunServiceProbe = { runAgentPipeline(input: unknown): Promise<unknown> }
+  const runService = await vi.importActual<RunServiceProbe>(scheduledRunServicePath)
+  vi.doMock(scheduledRunServicePath, () => ({ ...runService, runAgentPipeline: async (input: unknown) => {
     try {
-      const result = await runService.runAgentPipeline(...args)
+      const result = await runService.runAgentPipeline(input)
       const status = debugRecord(result)?.status
       pipelineOutcome = result === null ? "returned_null" : status === "waiting_for_user" ? "returned_wait"
         : status === "gate_checkpointed" ? "returned_gate_checkpoint" : status === "analyze_checkpointed" ? "returned_analyze_checkpoint" : "returned_report"
