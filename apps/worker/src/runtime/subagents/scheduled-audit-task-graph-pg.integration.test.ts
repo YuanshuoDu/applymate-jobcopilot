@@ -109,7 +109,9 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
       handoff: fixture.handoff, prepareProof: fixture.prepareProof, scheduledWaitId: fixture.prepareChoiceWaitId,
       finalStepId: stepId, signal: new AbortController().signal }
 
-    await expect(continuation(input)).resolves.toMatchObject({ status: "waiting_for_dependency" })
+    const initialGateWait = await continuation(input)
+    expect(initialGateWait.status).toBe("waiting_for_dependency")
+    if (initialGateWait.status !== "waiting_for_dependency") throw new Error("scheduled Audit Gate wait missing")
     const gateTaskId = await findTaskId("scheduled_taskgraph_gate", fixture.ids.rootTaskId)
     runner = startRunner(fixture, response.fetcher)
     const gateOutcome = await dispatchAndWait(runner, gateTaskId, fixture.ids.sessionId)
@@ -126,10 +128,17 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     }
     expect(gateOutcome).toMatchObject({ status: "completed" })
     expect(response.gateCalls()).toBe(1)
+    const gateResolution = await waitPort.resolve({ userId: fixture.ids.userId, sessionId: fixture.ids.sessionId,
+      waitId: initialGateWait.waitId })
+    expect(gateResolution).not.toBeNull()
+    expect(gateResolution?.status).toBe("ready")
+    expect(gateResolution?.matchedTaskIds).toEqual([gateTaskId])
 
     const gateProof = await requireGateProof(fixture)
     const auditWait = await continuation(input)
     expect(auditWait.status).toBe("waiting_for_dependency")
+    if (auditWait.status !== "waiting_for_dependency") throw new Error("scheduled Audit wait missing")
+    expect(auditWait.waitId).not.toBe(initialGateWait.waitId)
     const auditTaskId = await findTaskId(SCHEDULED_AUDIT_TASK_TYPE, fixture.ids.rootTaskId)
     const appended = await command.appendScheduledAudit!({ scope, executionOwner: fixture.executionOwner, handoff: fixture.handoff,
       attestation: fixture.attestation, gateProof, scheduledWaitId: fixture.prepareChoiceWaitId })
