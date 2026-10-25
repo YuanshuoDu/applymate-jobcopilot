@@ -15,7 +15,7 @@ import type { V2TurnSource } from "@/lib/agent/session/v2-turn";
 import { parseScheduledAutomationSnapshot } from "@/lib/agent/scheduled-automation-snapshot";
 import { scheduledTaskGraphContinuationKey } from "@/lib/agent/scheduled-taskgraph-pipeline-checkpoint";
 import { finishScheduledTaskGraphExecution, persistScheduledTaskGraphWaitMarker, saveScheduledTaskGraphCheckpoint, scheduledTaskGraphClaimMatches } from "@/lib/agent/scheduled-taskgraph-pipeline-fence";
-import { scheduledTaskGraphRunCheckpointIsCurrent, scheduledTaskGraphRunContext, scheduledTaskGraphRunOwnerFence, type ScheduledTaskGraphRunInput } from "@/lib/agent/scheduled-taskgraph-audit-action";
+import { scheduledTaskGraphRecorderLifecycleOptions, scheduledTaskGraphRunCheckpointIsCurrent, scheduledTaskGraphRunContext, scheduledTaskGraphRunOwnerFence, type ScheduledTaskGraphRunInput } from "@/lib/agent/scheduled-taskgraph-audit-action";
 import type { PipelineCtx } from "@/lib/agent/pipeline-context";
 import { buildScheduledTaskGraphGateResumeState, runScheduledTaskGraphAnalyzeOnly, serializeScheduledTaskGraphCheckpoint, type ScheduledTaskGraphAnalyzeCheckpointProof } from "@/lib/agent/scheduled-taskgraph-run-service";
 import { scheduledTaskGraphExecuteGateCompletionProof } from "@/lib/agent/scheduled-taskgraph-gate-rpc";
@@ -59,7 +59,7 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
     source: input.source ?? "system",
     turnId: input.turnId ?? input.legacyTurnId,
     legacyResumeQuestionId: !input.turnId && !input.legacyTurnId && input.questionId && !input.questionId.startsWith("agent-question:") ? input.questionId : undefined,
-    manageV2Lifecycle: !input.turnId,
+    ...scheduledTaskGraphRecorderLifecycleOptions(input),
     deferActivation: true,
     ensureTurn: true,
   });
@@ -245,7 +245,7 @@ export async function runAgentPipeline(input: AgentPipelineRunInput): Promise<Ru
     const report = await runPipeline(scheduledTaskGraphRunContext(pipelineInput, resumeState, scheduled));
     const finished = await finishOwnedAttempt("completed")
     if (!finished || !await canPublishAttemptResult("completed")) return null
-    if (report.pending > 0) {
+    if (report.pending > 0 && scheduled?.action !== "scheduled_audit_execute") {
       const owner = recorderOwner("completed");
       const paused = await recorder.pause(
         `${report.pending} application package${report.pending === 1 ? " is" : "s are"} ready for your review and final submit authorization.`,

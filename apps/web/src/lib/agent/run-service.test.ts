@@ -315,11 +315,60 @@ describe("runAgentPipeline", () => {
     await expect(runAgentPipeline(auditInput)).resolves.toMatchObject({ processed: 0 });
     expect(mocks.saveScheduledCheckpoint).toHaveBeenCalledBefore(mocks.runPipeline);
     expect(isScheduledTaskGraphAuditRuntime(contexts[0] as Parameters<typeof isScheduledTaskGraphAuditRuntime>[0])).toBe(true);
+    expect(mocks.createRecorder).toHaveBeenNthCalledWith(1, expect.anything(), expect.objectContaining({
+      manageV2Lifecycle: false, manageSessionLifecycle: false,
+    }));
 
     const executeInput = scheduledRunInput(initialState, scheduledSnapshot, scheduledAttestation, prepareProof);
     Object.assign(executeInput.scheduledTaskGraph, { gateCompletionProof });
     await expect(runAgentPipeline(executeInput)).resolves.toMatchObject({ processed: 0 });
     expect(isScheduledTaskGraphAuditRuntime(contexts[1] as Parameters<typeof isScheduledTaskGraphAuditRuntime>[0])).toBe(false);
+    expect(mocks.createRecorder).toHaveBeenNthCalledWith(2, expect.anything(), expect.objectContaining({
+      manageV2Lifecycle: false, manageSessionLifecycle: true,
+    }));
+  });
+
+  it("persists a pending Audit report and emitted usage without pausing the canonical Session", async () => {
+    const { runAgentPipeline } = await import("./run-service");
+    const continuationKey = scheduledTaskGraphContinuationKey(scheduledOwner, scheduledAttestation);
+    const claim = { schemaVersion: "agent-harness.v2.scheduled-pipeline-claim.v1", key: continuationKey,
+      claimToken: scheduledClaimToken, owner: scheduledOwner, claimedAt: "2026-10-25T10:00:00.000Z", leaseExpiresAt: "2026-10-25T10:05:00.000Z" };
+    const continuation = { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1", key: continuationKey,
+      owner: scheduledOwner, snapshotDigest: `sha256:${"b".repeat(64)}`, graphRevision: 9, evidenceDigest: "c".repeat(64) };
+    const initialState = { nextStage: "scout", scheduledTaskGraphClaim: claim, scheduledTaskGraphContinuation: continuation };
+    const prepareProof = { receipt: {}, completion: {}, result: {} };
+    const gateCompletionProof = { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1", graphRevision: 1,
+      prepareProof, gate: { taskId: "gate_1", attemptCount: 1, resultDigest: `sha256:${"a".repeat(64)}`, completedEventRevision: 1 } };
+    mocks.buildScheduledTaskGraphGateResumeState.mockResolvedValue({ nextStage: "audit", scheduledTaskGraphClaim: claim,
+      scheduledTaskGraphContinuation: continuation });
+    const report = { processed: 2, queued: 0, applied: 0, pending: 1, skipped: 0, failed: 0, durationMs: 10 };
+    const usage = { inputTokens: 23, outputTokens: 8, estimatedCostUsd: 0.004 };
+    mocks.runPipeline.mockImplementationOnce(async (rawContext: unknown) => {
+      const context = rawContext as { emit: (event: string, data: unknown) => void };
+      context.emit("done", report);
+      context.emit("usage", usage);
+      return report;
+    });
+    const auditInput = scheduledRunInput(initialState, scheduledSnapshot, scheduledAttestation, prepareProof);
+    Object.assign(auditInput.scheduledTaskGraph, { action: "scheduled_audit_execute",
+      auditActor: { taskId: "auditor_1", attemptCount: 2, leaseOwner: "audit_lease_1" }, gateCompletionProof });
+
+    await expect(runAgentPipeline(auditInput)).resolves.toEqual(report);
+
+    expect(mocks.createRecorder).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      manageSessionLifecycle: false, manageV2Lifecycle: false,
+    }));
+    expect(mocks.pause).not.toHaveBeenCalled();
+    expect(mocks.finalize).toHaveBeenCalledWith(expect.objectContaining({ status: "completed", report }));
+    expect(mocks.record).toHaveBeenCalledWith("done", report);
+    expect(mocks.record).toHaveBeenCalledWith("usage", usage);
+    expect(mocks.createHistory).toHaveBeenCalledWith({ data: expect.objectContaining({
+      status: "completed", report,
+      log: expect.arrayContaining([
+        expect.objectContaining({ event: "done", data: report }),
+        expect.objectContaining({ event: "usage", data: usage }),
+      ]),
+    }) });
   });
 
   it("does not complete or publish when the scheduled Analyze owner fence is lost", async () => {

@@ -8,6 +8,7 @@ import type { ModelAdapter } from "@jobcopilot/agent-model"
 import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { TurnEngine } from "../turns/turn-engine.js"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
+import { createCanonicalSessionProjection } from "../canonical-session-projection.js"
 import type { TurnEngineOptions, TurnEngineResult } from "../turns/turn-engine-types.js"
 import { runTurnJob } from "../turns/turn-queue.js"
 import { dispatchPendingTurnOutbox } from "../turns/recovery-scanner.js"
@@ -255,6 +256,8 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
 
     const gateProof = await requireGateProof(fixture)
     const rootStore = createPgRootTaskStore(pool as never)
+    const sessionProjection = createCanonicalSessionProjection(pool as never)
+    const projectionIdentity = { userId: fixture.ids.userId, sessionId: fixture.ids.sessionId, turnId: fixture.ids.turnId }
     const auditReplayCaptures: Array<{ mode: "append_audit" | "resume_audit"; recoveryStepId: string; receipt: unknown }> = []
     const captureAuditAppendReplay = async (recoveryStepId: string, mode: "append_audit" | "resume_audit"): Promise<void> => {
       const receipt = await command.appendScheduledAudit!({ scope: { ...scopeBase, stepId: recoveryStepId },
@@ -274,10 +277,12 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(auditWait.waitId).not.toBe(initialGateWait.waitId)
     expect(await requireGateProof(fixture)).toEqual(gateProof)
     await rootStore.finish({ lease: fixture.turnLease, rootTaskId: fixture.ids.rootTaskId, result: pendingRoot })
+    await sessionProjection.finish({ ...projectionIdentity, result: { status: "waiting_for_dependency" } })
     await expect(suspendAndReleaseWait(pool as never, { lease: fixture.turnLease, waitId: auditWait.waitId }))
       .resolves.toMatchObject({ waitId: auditWait.waitId, handoff: "suspended", waitStatus: "waiting" })
     const pendingRootState = await readRootTurnState(fixture)
     expect(pendingRootState.turnStatus).toBe("waiting_for_dependency")
+    expect(pendingRootState.sessionStatus).toBe("running")
     expect(pendingRootState.turnLeaseOwnerId).toBeNull()
     expect(pendingRootState.rootStatus).toBe("waiting")
     expect(pendingRootState.rootResult).toMatchObject({ status: "waiting_for_dependency", waitId: auditWait.waitId })
@@ -322,12 +327,13 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
 
     const parkedAfterRetry = await readRootTurnState(fixture)
     expect(parkedAfterRetry).toMatchObject({ turnStatus: "waiting_for_dependency", turnLeaseOwnerId: null,
-      rootStatus: "waiting", rootResult: { status: "waiting_for_dependency", waitId: auditWait.waitId } })
+      rootStatus: "waiting", sessionStatus: "running", rootResult: { status: "waiting_for_dependency", waitId: auditWait.waitId } })
     await expect(reconcileDurableWaits(pool as never, { ownerId: "scheduled-audit-resolver-before-retry" }))
       .resolves.toMatchObject({ woken: 0 })
-    expect(await readRootTurnState(fixture)).toMatchObject({ turnStatus: "waiting_for_dependency", turnLeaseOwnerId: null })
+    expect(await readRootTurnState(fixture)).toMatchObject({ turnStatus: "waiting_for_dependency", turnLeaseOwnerId: null, sessionStatus: "running" })
     runner = startRunner(fixture, response.fetcher)
-    expect(await readRootTurnState(fixture)).toMatchObject({ turnStatus: "waiting_for_dependency", turnLeaseOwnerId: null })
+    expect(await readRootTurnState(fixture)).toMatchObject({ turnStatus: "waiting_for_dependency", turnLeaseOwnerId: null, sessionStatus: "running" })
+    await waitForAuditRetryDue(auditTaskId)
     await expect(dispatchAndWait(runner, auditTaskId, fixture.ids.sessionId)).resolves.toMatchObject({ status: "completed" })
     expect(response.executeCalls()).toBe(2)
     const firstRequest = response.firstExecuteRequest()!
@@ -365,7 +371,8 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     const auditWake = await pool!.query<{ status: string; matchedTaskIds: unknown }>(
       `SELECT "status", "matchedTaskIds" FROM "agent_wait_conditions" WHERE "id"=$1`, [auditWait.waitId])
     expect(auditWake.rows).toMatchObject([{ status: "ready", matchedTaskIds: [auditTaskId] }])
-    expect(await readRootTurnState(fixture)).toMatchObject({ turnStatus: "queued", turnLeaseOwnerId: null, rootStatus: "waiting" })
+    expect(await readRootTurnState(fixture)).toMatchObject({ turnStatus: "queued", turnLeaseOwnerId: null,
+      rootStatus: "waiting", sessionStatus: "running" })
     const turnJobs: TurnJobPayload[] = []
     expect(await dispatchPendingTurnOutbox(pool as never, { add: async (_name, payload) => { turnJobs.push(payload) } })).toBe(1)
     expect(turnJobs).toHaveLength(1)
@@ -376,6 +383,7 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
       async execute({ lease }) {
         resumedLease = lease
         proofLease = lease
+        await sessionProjection.start(projectionIdentity)
         const staleAuditPort = command as typeof command & {
           verifyScheduledAuditCompletion: NonNullable<typeof command.verifyScheduledAuditCompletion>
         }
@@ -389,10 +397,11 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
         expect(staleRoot).toMatchObject({ status: "waiting_for_dependency", errorCode: "scheduled_audit_completion_unverified" })
         expect(staleRoot).not.toMatchObject({ status: "completed" })
         expect(await readRootTurnState(fixture)).toMatchObject({ turnStatus: "in_progress",
-          turnLeaseOwnerId: lease.ownerId, rootStatus: "running" })
+          turnLeaseOwnerId: lease.ownerId, rootStatus: "running", sessionStatus: "running" })
         terminalRoot = await runAttachedScheduledAuditRoot(fixture, response.fetcher, command, waitPort,
           undefined, undefined, captureTerminalAuditProof, lease)
         await rootStore.finish({ lease, rootTaskId: fixture.ids.rootTaskId, result: terminalRoot })
+        await sessionProjection.finish({ ...projectionIdentity, result: { status: terminalRoot.status } })
         return terminalRoot
       } })
     expect(resumedJob).toMatchObject({ status: "completed" })
@@ -417,6 +426,7 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     const terminalRootState = await readRootTurnState(fixture)
     expect(terminalRootState.turnStatus).toBe("completed")
     expect(terminalRootState.rootStatus).toBe("completed")
+    expect(terminalRootState.sessionStatus).toBe("completed")
     expect(terminalRootState.rootResult).toMatchObject({ status: "completed", finalItemId: terminalRoot!.finalItemId })
 
     const graph = await loadTaskGraph(pool as never, fixture.graphScope, false)
@@ -661,18 +671,36 @@ function expectScheduledAuditRecoveryTrace(trace: Awaited<ReturnType<typeof read
   expect(trace.steps.at(-1)).toMatchObject({ status, errorCode })
 }
 
-async function readRootTurnState(fixture: Fixture): Promise<Readonly<{ turnStatus: string; turnLeaseOwnerId: string | null;
+async function readRootTurnState(fixture: Fixture): Promise<Readonly<{ turnStatus: string; turnLeaseOwnerId: string | null; sessionStatus: string;
   rootStatus: string; rootResult: Record<string, unknown> | null }>> {
-  const result = await pool!.query<{ turnStatus: string; turnLeaseOwnerId: string | null; rootStatus: string; rootResult: unknown }>(
+  const result = await pool!.query<{ turnStatus: string; turnLeaseOwnerId: string | null; sessionStatus: string; rootStatus: string; rootResult: unknown }>(
     `SELECT turn."status" AS "turnStatus", turn."leaseOwnerId" AS "turnLeaseOwnerId",
-       root."status" AS "rootStatus", root."result" AS "rootResult"
-       FROM "agent_turns" AS turn JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId"
+       session."status" AS "sessionStatus", root."status" AS "rootStatus", root."result" AS "rootResult"
+       FROM "agent_turns" AS turn JOIN "agent_sessions" AS session ON session."id" = turn."sessionId"
+       JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId"
        WHERE turn."id" = $1 AND turn."sessionId" = $2 AND root."id" = $3`,
     [fixture.ids.turnId, fixture.ids.sessionId, fixture.ids.rootTaskId])
   const row = result.rows[0]
   if (!row) throw new Error("scheduled Audit root Turn state missing")
-  return { turnStatus: row.turnStatus, turnLeaseOwnerId: row.turnLeaseOwnerId,
+  return { turnStatus: row.turnStatus, turnLeaseOwnerId: row.turnLeaseOwnerId, sessionStatus: row.sessionStatus,
     rootStatus: row.rootStatus, rootResult: debugRecord(row.rootResult) }
+}
+
+async function waitForAuditRetryDue(taskId: string, timeoutMs = 20_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const row = (await pool!.query<{ status: string; attemptCount: number; hasNextAttempt: boolean; retryDue: boolean }>(
+      `SELECT "status", "attemptCount", "nextAttemptAt" IS NOT NULL AS "hasNextAttempt",
+        COALESCE("nextAttemptAt" <= clock_timestamp(), false) AS "retryDue"
+       FROM "sub_agent_tasks" WHERE "id" = $1`, [taskId])).rows[0]
+    if (!row) throw new Error("scheduled Audit retry task missing while waiting for due time")
+    if (row.status !== "queued" || row.attemptCount !== 1 || !row.hasNextAttempt) {
+      throw new Error("scheduled Audit retry did not retain its queued first-attempt state")
+    }
+    if (row.retryDue) return
+    await new Promise(resolve => setTimeout(resolve, 40))
+  }
+  throw new Error("scheduled Audit retry did not become due according to the PostgreSQL clock")
 }
 
 function startRunner(fixture: Fixture, fetcher: typeof fetch): Runner {

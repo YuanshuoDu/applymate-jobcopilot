@@ -43,6 +43,13 @@ export function scheduledTaskGraphRunInput(base: ScheduledTaskGraphRunInputBase,
   return mode.kind === 'audit' ? { ...base, action: 'scheduled_audit_execute', auditActor: mode.auditActor } : base
 }
 
+export function scheduledTaskGraphRecorderLifecycleOptions(input: {
+  turnId?: string; scheduledTaskGraph?: ScheduledTaskGraphRunInput
+}): { manageV2Lifecycle: boolean; manageSessionLifecycle: boolean } {
+  return { manageV2Lifecycle: !input.turnId,
+    manageSessionLifecycle: input.scheduledTaskGraph?.action !== 'scheduled_audit_execute' }
+}
+
 /** Resolves the current persisted owner for an Audit child without trusting its historical Root lease. */
 export function resolveScheduledTaskGraphAuditClaimOwner(input: {
   requestOwner: AuditOwner; proofOwner: AuditOwner | null; state: unknown; key: string; claimToken: unknown

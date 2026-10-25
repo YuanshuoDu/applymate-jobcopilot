@@ -23,7 +23,7 @@ import { claimScheduledAuditExecution, lockScheduledAuditContinuation, scheduled
   scheduledAuditClaimRaceResponse, scheduledTaskGraphContinuationOwnerIsCurrent, scheduledTaskGraphRunOwnerFence,
   scheduledTaskGraphRunCheckpointIsCurrent, scheduledTaskGraphGateResumeOwnerIsCurrent,
   loadScheduledTaskGraphResumeGateInput, scheduledTaskGraphRunInput, resolveScheduledTaskGraphAuditClaimOwner,
-  authorizeScheduledAuditContinuation } from './scheduled-taskgraph-audit-action'
+  authorizeScheduledAuditContinuation, scheduledTaskGraphRecorderLifecycleOptions } from './scheduled-taskgraph-audit-action'
 
 const owner = { userId: 'user', sessionId: 'session', turnId: 'turn', rootTaskId: 'root', rootAttemptCount: 1,
   turnLeaseOwnerId: 'old-root-owner', turnLeaseVersion: 2, executionId: 'execution', executionAttemptCount: 3 }
@@ -111,6 +111,29 @@ describe('scheduled Audit action fence adapter', () => {
     expect(scheduledTaskGraphRunInput(base, { kind: 'root' })).toEqual(base)
     expect(scheduledTaskGraphRunInput(base, { kind: 'audit', auditActor })).toEqual({
       ...base, action: 'scheduled_audit_execute', auditActor,
+    })
+  })
+
+  it('leaves Session lifecycle with the canonical Root only for the dedicated Audit action', () => {
+    const base = { owner, snapshot: {}, attestation: {}, continuationKey: 'key', claimToken: 'claim', ownedJobs: [] }
+    const audit = scheduledTaskGraphRunInput(base, { kind: 'audit', auditActor })
+    const execute = scheduledTaskGraphRunInput(base, { kind: 'root' })
+
+    expect(scheduledTaskGraphRecorderLifecycleOptions({ turnId: owner.turnId, scheduledTaskGraph: audit })).toEqual({
+      manageV2Lifecycle: false,
+      manageSessionLifecycle: false,
+    })
+    expect(scheduledTaskGraphRecorderLifecycleOptions({ turnId: owner.turnId, scheduledTaskGraph: execute })).toEqual({
+      manageV2Lifecycle: false,
+      manageSessionLifecycle: true,
+    })
+    expect(scheduledTaskGraphRecorderLifecycleOptions({ turnId: owner.turnId })).toEqual({
+      manageV2Lifecycle: false,
+      manageSessionLifecycle: true,
+    })
+    expect(scheduledTaskGraphRecorderLifecycleOptions({})).toEqual({
+      manageV2Lifecycle: true,
+      manageSessionLifecycle: true,
     })
   })
 
