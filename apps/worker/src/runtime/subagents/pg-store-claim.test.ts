@@ -5,6 +5,7 @@ import { claimSubagentTask, matchesPublishedSubagentDispatch } from "./pg-store-
 import { PAUSE_DEFERRED_MARKER, normalizeSubagentPolicy, type SubagentJobPayload } from "./types.js"
 import { parseSubagentDispatchJobId, SUBAGENT_DISPATCH_IDENTITY_MISMATCH, subagentDispatchJobId } from "./dispatch-identity.js"
 import { hasScheduledGateResumeAcknowledgement } from "./scheduled-gate-resume-admission.js"
+import { SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE } from "./scheduled-audit-contract.js"
 
 vi.mock("./scheduled-gate-resume-admission.js", () => ({ hasScheduledGateResumeAcknowledgement: vi.fn() }))
 
@@ -14,14 +15,16 @@ const input = {
 }
 
 type DeferredFence = { lastError: string | null; payload?: unknown; publishedAt?: unknown; attemptCount?: unknown }
-function poolFixture(options: { pause?: boolean; rootInterrupted?: boolean; turnUnavailable?: boolean; childWaitResumable?: boolean; gateResumeStep?: boolean; taskAttemptCount?: number; maxAttempts?: number; outbox?: DeferredFence } = {}) {
+function poolFixture(options: { pause?: boolean; rootInterrupted?: boolean; turnUnavailable?: boolean; childWaitResumable?: boolean; gateResumeStep?: boolean; taskAttemptCount?: number; maxAttempts?: number; role?: string; taskType?: string; failureReason?: string | null; outbox?: DeferredFence } = {}) {
   const calls: string[] = []
   const parameters: Array<unknown[] | undefined> = []
   const outbox = options.outbox ? { id: "dispatch-1", ...options.outbox, payload: options.outbox.payload ?? { taskId: "child-1", sessionId: "session-1", rootTaskId: "root-1", ownerId: "worker-1" } } : null
+  const role = options.role ?? (options.gateResumeStep ? "prepare" : "analyst")
+  const taskType = options.taskType ?? (options.gateResumeStep ? "scheduled_taskgraph_gate" : "test")
   const task = { id: "child-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
-    path: "/root-1/child-1", depth: 1, role: options.gateResumeStep ? "prepare" : "analyst", taskType: options.gateResumeStep ? "scheduled_taskgraph_gate" : "test", status: "running", goal: "inspect", constraints: [],
+    path: "/root-1/child-1", depth: 1, role, taskType, status: "running", goal: "inspect", constraints: [],
     successCriteria: [], allowedActions: [], context: {}, expectedOutputSchema: {}, attemptCount: options.taskAttemptCount ?? 1, maxAttempts: options.maxAttempts ?? 3,
-    leaseOwner: "worker-1", leaseExpiresAt: new Date("2026-10-06T10:01:00Z"), interruptRequestedAt: null }
+    leaseOwner: "worker-1", leaseExpiresAt: new Date("2026-10-06T10:01:00Z"), interruptRequestedAt: null, failureReason: options.failureReason ?? null }
   const client = {
     query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push(sql)
@@ -39,7 +42,7 @@ function poolFixture(options: { pause?: boolean; rootInterrupted?: boolean; turn
         : { rows: [{ id: "turn-1" }], rowCount: 1 }
       if (sql.includes('SELECT "id", "turnId", "status", "attemptCount", "interruptRequestedAt"')) return { rows: [{ id: "root-1", turnId: "turn-1", status: "running", attemptCount: 1, interruptRequestedAt: options.rootInterrupted ? new Date() : null }], rowCount: 1 }
       if (sql.includes('SELECT "id", "turnId", "rootTaskId", "status", "interruptRequestedAt"')) return { rows: [{ id: "child-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1", status: "queued", interruptRequestedAt: null,
-        role: options.gateResumeStep ? "prepare" : "analyst", taskType: options.gateResumeStep ? "scheduled_taskgraph_gate" : "test",
+        role, taskType,
         attemptCount: options.taskAttemptCount ?? 1, maxAttempts: options.maxAttempts ?? 3 }], rowCount: 1 }
       if (sql.includes('SELECT session."id" FROM "agent_sessions"')) return options.pause ? { rows: [], rowCount: 0 } : { rows: [{ id: "session-1" }], rowCount: 1 }
       if (sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes("FOR UPDATE")) return outbox ? { rows: [outbox], rowCount: 1 } : { rows: [], rowCount: 0 }
@@ -50,9 +53,12 @@ function poolFixture(options: { pause?: boolean; rootInterrupted?: boolean; turn
         const exactWait = options.childWaitResumable === true
         const currentDispatch = params?.[7] === true
         const gateResume = params?.[8] === true
+        const scheduledAudit = params?.[9] === true
+        const sameAttemptContinuation = currentDispatch && exactWait
         const exhausted = (options.taskAttemptCount ?? 1) >= (options.maxAttempts ?? 3)
         const rowCount = (exactWait || gateResume) && !currentDispatch || exhausted && !(currentDispatch && (exactWait || gateResume)) ? 0 : 1
         if (rowCount === 1 && options.gateResumeStep && gateResume) task.attemptCount += 1
+        if (rowCount === 1 && scheduledAudit && !sameAttemptContinuation) task.failureReason = null
         return { rows: [], rowCount }
       }
       if (sql.startsWith('UPDATE "agent_outbox" SET "lastError" = NULL')) { if (outbox) outbox.lastError = null; return { rows: [], rowCount: 1 } }
@@ -149,10 +155,10 @@ describe("atomic child claim pause fence", () => {
     expect(update).toContain('ORDER BY currentWaitStep."ordinal" DESC, currentWait."createdAt" DESC, currentWait."id" DESC LIMIT 1')
     expect(update).toContain('wait."status" IN (\'ready\', \'timed_out\') AND wait."suspendedAt" IS NOT NULL')
     expect(update).toContain('wait."consumedAt" IS NULL AND step."status" = \'waiting_for_tool\'')
-    expect(update.match(/wait\."consumedAt" IS NULL/g)).toHaveLength(3)
+    expect(update.match(/wait\."consumedAt" IS NULL/g)).toHaveLength(4)
     expect(update).toContain('"attemptCount" < "maxAttempts" OR ($8::boolean AND (SELECT COUNT(*) = 1')
     expect(update).toContain('AND (NOT ((SELECT COUNT(*) = 1')
-    expect(fake.parameters[fake.calls.indexOf(update)]).toEqual(["child-1", "session-1", "worker-1", 60_000, "turn-1", "root-1", "user-1", true, false])
+    expect(fake.parameters[fake.calls.indexOf(update)]).toEqual(["child-1", "session-1", "worker-1", 60_000, "turn-1", "root-1", "user-1", true, false, false])
     expect(fake.outbox).toMatchObject({ attemptCount: 4 })
   })
 
@@ -180,7 +186,7 @@ describe("atomic child claim pause fence", () => {
     const update = fake.calls.find(sql => sql.startsWith('UPDATE "sub_agent_tasks"')) ?? ""
     expect(update).toContain('"attemptCount" < "maxAttempts" OR ($8::boolean AND')
     expect(update).toContain('OR $9::boolean')
-    expect(fake.parameters[fake.calls.indexOf(update)]?.slice(7)).toEqual([true, true])
+    expect(fake.parameters[fake.calls.indexOf(update)]?.slice(7)).toEqual([true, true, false])
   })
 
   it.each([false, true] as const)("uses the strict Gate acknowledgement result (%s) for an exhausted claim", async acknowledged => {
@@ -200,7 +206,7 @@ describe("atomic child claim pause fence", () => {
       taskId: "child-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", attemptCount: 3,
     })
     const update = fake.calls.find(sql => sql.startsWith('UPDATE "sub_agent_tasks"')) ?? ""
-    expect(fake.parameters[fake.calls.indexOf(update)]?.slice(7)).toEqual([true, acknowledged])
+    expect(fake.parameters[fake.calls.indexOf(update)]?.slice(7)).toEqual([true, acknowledged, false])
   })
 
   it("does not authorize an exhausted Gate claim without the published dispatch identity", async () => {
@@ -210,7 +216,49 @@ describe("atomic child claim pause fence", () => {
     await expect(claimSubagentTask(fake.pool, input, 60_000)).resolves.toBeNull()
     expect(hasScheduledGateResumeAcknowledgement).not.toHaveBeenCalled()
     const update = fake.calls.find(sql => sql.startsWith('UPDATE "sub_agent_tasks"')) ?? ""
-    expect(fake.parameters[fake.calls.indexOf(update)]?.slice(7)).toEqual([false, false])
+    expect(fake.parameters[fake.calls.indexOf(update)]?.slice(7)).toEqual([false, false, false])
+  })
+
+  it("clears a prior failure reason on a fresh scheduled Audit attempt", async () => {
+    const identity = parseSubagentDispatchJobId(subagentDispatchJobId(input.taskId, 1), input.taskId)
+    if (!identity) throw new Error("Fixture dispatch ID did not parse")
+    const fake = poolFixture({ role: SCHEDULED_AUDIT_ROLE, taskType: SCHEDULED_AUDIT_TASK_TYPE,
+      failureReason: "scheduled_audit_handoff_retryable",
+      outbox: { lastError: null, publishedAt: new Date("2026-10-06T09:59:00Z"), attemptCount: 2 } })
+
+    await expect(claimSubagentTask(fake.pool, { ...input, dispatchIdentity: identity }, 60_000))
+      .resolves.toMatchObject({ id: "child-1", failureReason: null })
+    const update = fake.calls.find(sql => sql.startsWith('UPDATE "sub_agent_tasks"')) ?? ""
+    expect(update).toContain('"failureReason" = CASE WHEN $10::boolean AND NOT ($8::boolean AND (SELECT COUNT(*) = 1')
+    expect(fake.parameters[fake.calls.indexOf(update)]?.slice(7)).toEqual([true, false, true])
+  })
+
+  it.each([
+    { role: "analyst", taskType: SCHEDULED_AUDIT_TASK_TYPE },
+    { role: SCHEDULED_AUDIT_ROLE, taskType: "native_verification" },
+  ])("preserves a failure reason unless both scheduled Audit identity fields match ($role/$taskType)", async ({ role, taskType }) => {
+    const identity = parseSubagentDispatchJobId(subagentDispatchJobId(input.taskId, 1), input.taskId)
+    if (!identity) throw new Error("Fixture dispatch ID did not parse")
+    const fake = poolFixture({ role, taskType, failureReason: "preserve-this-reason",
+      outbox: { lastError: null, publishedAt: new Date("2026-10-06T09:59:00Z"), attemptCount: 2 } })
+
+    await expect(claimSubagentTask(fake.pool, { ...input, dispatchIdentity: identity }, 60_000))
+      .resolves.toMatchObject({ id: "child-1", failureReason: "preserve-this-reason" })
+    const update = fake.calls.find(sql => sql.startsWith('UPDATE "sub_agent_tasks"')) ?? ""
+    expect(fake.parameters[fake.calls.indexOf(update)]?.[9]).toBe(false)
+  })
+
+  it("preserves a scheduled Audit failure reason on a same-attempt durable-wait continuation", async () => {
+    const identity = parseSubagentDispatchJobId(subagentDispatchJobId(input.taskId, 3), input.taskId)
+    if (!identity) throw new Error("Fixture dispatch ID did not parse")
+    const fake = poolFixture({ role: SCHEDULED_AUDIT_ROLE, taskType: SCHEDULED_AUDIT_TASK_TYPE,
+      failureReason: "preserve-this-reason", childWaitResumable: true, taskAttemptCount: 3, maxAttempts: 3,
+      outbox: { lastError: null, publishedAt: new Date("2026-10-06T09:59:00Z"), attemptCount: 4 } })
+
+    await expect(claimSubagentTask(fake.pool, { ...input, dispatchIdentity: identity }, 60_000))
+      .resolves.toMatchObject({ id: "child-1", failureReason: "preserve-this-reason" })
+    const update = fake.calls.find(sql => sql.startsWith('UPDATE "sub_agent_tasks"')) ?? ""
+    expect(fake.parameters[fake.calls.indexOf(update)]?.slice(7)).toEqual([true, false, true])
   })
 
   it("preserves ordinary outbox and direct-claim owner compatibility", async () => {

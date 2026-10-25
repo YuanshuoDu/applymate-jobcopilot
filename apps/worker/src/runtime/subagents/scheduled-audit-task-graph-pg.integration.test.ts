@@ -59,6 +59,15 @@ type FixtureWebDatabase = Readonly<{ db: {
 type CustomAgentRoleLookup = Readonly<{ userId: string; insertAfter: string; enabled: true }>
 type GateFailureDiagnostics = Readonly<Record<string, unknown>>
 type AuditPreflightState = "not_checked" | "passed" | "rejected" | "threw"
+type CompletedAuditReplayDiagnostics = Readonly<{
+  checkpoint: "not_applicable" | "completed_report"
+  childFence: AuditPreflightState
+  prepareSource: AuditPreflightState
+  executionCurrent: boolean | null
+  gateProofCurrent: AuditPreflightState
+}>
+type MutableCompletedAuditReplayDiagnostics = { -readonly [Key in keyof CompletedAuditReplayDiagnostics]:
+  CompletedAuditReplayDiagnostics[Key] }
 type ReadTraceCount = { reached: boolean; rowCount: number | null }
 type PrismaDecimalInstance = Readonly<{ isZero(): boolean; toString(): string }>
 type PrismaDecimalClass = (new (...args: unknown[]) => PrismaDecimalInstance) & { isDecimal?: (value: unknown) => boolean }
@@ -106,6 +115,7 @@ type AuditPreflightDiagnostics = {
   prepareSource: AuditPreflightState
   prepareSourceTrace: PrepareSourceReadTrace
   gateProofCurrent: AuditPreflightState
+  completedReportReplay: CompletedAuditReplayDiagnostics
 }
 type AuditRequestOwner = Readonly<{ userId: string; sessionId: string; turnId: string; rootTaskId: string;
   rootAttemptCount: number; turnLeaseOwnerId: string; turnLeaseVersion: number }>
@@ -377,6 +387,7 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
           savedScheduledWaitIdMatchesRequest: failure.auditPreflight.savedScheduledWaitIdMatchesRequest,
           prepareSource: failure.auditPreflight.prepareSource,
           gateProofCurrent: failure.auditPreflight.gateProofCurrent,
+          completedReportReplay: failure.auditPreflight.completedReportReplay,
         },
         continuation: failure.continuation ? {
           gateResume: safeStatus(failure.continuation.gateResume), analyzeCheckpoint: safeStatus(failure.continuation.analyzeCheckpoint),
@@ -861,6 +872,7 @@ async function setupFetcher(fixture: Fixture) {
     serializedCheckpoint: "not_called", checkpointSave: "not_called" }
   type AuditChildFenceProbe = {
     lockScheduledTaskGraphAuditChildFence(tx: unknown, input: unknown): Promise<unknown>
+    lockScheduledTaskGraphAuditCompletedReportChildFence(tx: unknown, input: unknown): Promise<unknown>
     scheduledTaskGraphAuditChildFenceIsCurrent(tx: unknown, input: unknown): Promise<boolean>
   }
   const auditChildFence = await vi.importActual<AuditChildFenceProbe>(scheduledTaskGraphAuditChildFencePath)
@@ -900,6 +912,7 @@ async function setupFetcher(fixture: Fixture) {
     scheduledTaskGraphAnalyzeCheckpointForGate(value: unknown): Record<string, unknown> | null
     isScheduledTaskGraphGateProofCurrent(input: unknown, tx: unknown): Promise<boolean>
     isScheduledTaskGraphAuditChildGateProofCurrent(input: unknown, tx: unknown): Promise<boolean>
+    isScheduledTaskGraphAuditCompletedReportGateProofCurrent(input: unknown, tx: unknown): Promise<boolean>
   }
   const gateInput = await vi.importActual<GateInputProbe>(scheduledTaskGraphGateInputPath)
   vi.doMock(scheduledTaskGraphGateInputPath, () => ({
@@ -933,16 +946,27 @@ async function setupFetcher(fixture: Fixture) {
     scheduledTaskGraphAuditExecutionOwner(request: { owner: AuditRequestOwner }, proof: unknown): AuditExecutionOwner | null
   }>("@/lib/agent/scheduled-taskgraph-gate-rpc")
   const diagnosticWebDb = await vi.importActual<{
-    db: { $transaction<T>(work: (tx: DiagnosticAuditReader) => Promise<T>): Promise<T> }
+    db: {
+      $transaction<T>(work: (tx: DiagnosticAuditReader) => Promise<T>): Promise<T>
+      agentExecution: { findFirst(args: unknown): Promise<unknown> }
+      job: { findMany(args: unknown): Promise<readonly unknown[]> }
+    }
   }>(scheduledWebDbPath)
   const continuationCheckpoint = await vi.importActual<{
     scheduledTaskGraphContinuationKey(owner: unknown, attestation: unknown): string
   }>("@/lib/agent/scheduled-taskgraph-pipeline-checkpoint")
   type ScheduledTaskGraphFenceProbe = {
     isScheduledTaskGraphOwnerCurrent(owner: unknown, key: string, claimToken: string): Promise<boolean>
+    priorScheduledTaskGraphContinuation(input: { state: unknown; owner: AuditExecutionOwner; snapshot: unknown;
+      attestation: unknown; ownedJobs: readonly unknown[] }): { owner: AuditExecutionOwner; key: string } | null
     saveScheduledTaskGraphCheckpoint(input: unknown): Promise<boolean>
   }
   const taskGraphFence = await vi.importActual<ScheduledTaskGraphFenceProbe>(scheduledTaskGraphFencePath)
+  const completedReportJournal = await vi.importActual<{
+    completedScheduledTaskGraphReport(input: { execution: { status: string; state: unknown }; key: string;
+      owner: AuditExecutionOwner; snapshot: unknown; attestation: unknown; ownedJobs: readonly unknown[];
+      checkpointValidatedByPrior?: boolean }): Record<string, unknown> | null
+  }>("@/lib/agent/scheduled-taskgraph-analysis-journal")
   vi.doMock(scheduledTaskGraphFencePath, () => ({
     ...taskGraphFence,
     saveScheduledTaskGraphCheckpoint: async (input: unknown) => {
@@ -1145,6 +1169,96 @@ async function setupFetcher(fixture: Fixture) {
     }
     return diagnostic
   }
+  const inspectCompletedAuditReplay = async (body: Record<string, unknown>): Promise<CompletedAuditReplayDiagnostics> => {
+    const diagnostic: MutableCompletedAuditReplayDiagnostics = { checkpoint: "not_applicable", childFence: "not_checked",
+      prepareSource: "not_checked", executionCurrent: null, gateProofCurrent: "not_checked" }
+    try {
+      const parsed = debugRecord(gateRpc.parseScheduledTaskGraphActionRequest(body))
+      if (!isAuditAction(parsed)) return diagnostic
+      const completion = gateRpc.scheduledTaskGraphExecuteGateCompletionProof(parsed.gateCompletionProof)
+      const owner = completion ? gateRpc.scheduledTaskGraphAuditExecutionOwner({ owner: parsed.owner }, completion) : null
+      const gate = debugRecord(completion?.gate)
+      if (!owner || !gate || typeof gate.taskId !== "string" || !Number.isSafeInteger(gate.attemptCount)) return diagnostic
+      const execution = debugRecord(await diagnosticWebDb.db.agentExecution.findFirst({
+        where: { id: owner.executionId, userId: owner.userId, sessionId: owner.sessionId },
+        select: { id: true, status: true, attemptCount: true, state: true },
+      }))
+      const state = debugRecord(execution?.state), initialReport = parseScheduledAuditReport(state?.report)
+      if (execution?.status !== "completed" || state?.nextStage !== "completed" || !initialReport) return diagnostic
+      diagnostic.checkpoint = "completed_report"
+      const scout = debugRecord(debugRecord(parsed.attestation)?.scout), rawIds = scout?.candidateJobIds
+      if (!Array.isArray(rawIds) || !rawIds.every(diagnosticValidId) || new Set(rawIds).size !== rawIds.length) {
+        diagnostic.executionCurrent = false
+        return diagnostic
+      }
+      const ids = rawIds as string[]
+      const snapshot = fixture.scheduleSnapshot
+      const key = continuationCheckpoint.scheduledTaskGraphContinuationKey(owner, parsed.attestation)
+      const jobs = await diagnosticWebDb.db.job.findMany({ where: { userId: owner.userId, id: { in: ids } } })
+      const reportFor = (rowValue: unknown): Record<string, unknown> | null => {
+        const row = debugRecord(rowValue), rowState = debugRecord(row?.state)
+        if (!row || typeof row.status !== "string" || !rowState) return null
+        const input = { execution: { status: row.status, state: rowState }, key, owner, snapshot,
+          attestation: parsed.attestation, ownedJobs: jobs }
+        const exact = completedReportJournal.completedScheduledTaskGraphReport(input)
+        const prior = exact ? null : taskGraphFence.priorScheduledTaskGraphContinuation({ state: rowState, owner,
+          snapshot, attestation: parsed.attestation, ownedJobs: jobs })
+        return exact ?? (prior && prior.owner.executionId === owner.executionId
+          && prior.owner.executionAttemptCount === owner.executionAttemptCount
+          ? completedReportJournal.completedScheduledTaskGraphReport({ ...input, key: prior.key, owner: prior.owner,
+            checkpointValidatedByPrior: true }) : null)
+      }
+      const report = reportFor(execution)
+      const proofCheckpoint = { ...state, nextStage: "audit" }
+      await diagnosticWebDb.db.$transaction(async tx => {
+        try {
+          const fence = await auditChildFence.lockScheduledTaskGraphAuditCompletedReportChildFence(tx, {
+            owner, auditActor: parsed.auditActor,
+          })
+          diagnostic.childFence = fence ? "passed" : "rejected"
+        } catch {
+          diagnostic.childFence = "threw"
+        }
+        if (diagnostic.childFence !== "passed") return
+        try {
+          diagnostic.prepareSource = await auditPrepareSource.validateScheduledTaskGraphAuditPrepareSource({
+            owner, snapshot, proof: parsed.prepareProof,
+            ...(parsed.scheduledWaitId ? { scheduledWaitId: parsed.scheduledWaitId } : {}), reader: tx,
+          }) ? "passed" : "rejected"
+        } catch {
+          diagnostic.prepareSource = "threw"
+        }
+        if (diagnostic.prepareSource !== "passed") return
+        try {
+          const current = await tx.agentExecution.findFirst({ where: { id: owner.executionId, userId: owner.userId,
+            sessionId: owner.sessionId, attemptCount: owner.executionAttemptCount },
+            select: { id: true, status: true, attemptCount: true, state: true } })
+          const currentRow = debugRecord(current), currentState = debugRecord(currentRow?.state)
+          const currentReport = reportFor(current)
+          diagnostic.executionCurrent = Boolean(currentRow?.id === owner.executionId && currentRow.status === "completed"
+            && currentRow.attemptCount === owner.executionAttemptCount && currentState?.nextStage === "completed"
+            && parseScheduledAuditReport(currentState?.report) && debugSameJson(currentState, state)
+            && report && currentReport && parseScheduledAuditReport(currentReport)
+            && debugSameJson(currentReport, report) && debugSameJson(currentReport, initialReport))
+        } catch {
+          diagnostic.executionCurrent = false
+        }
+        if (diagnostic.executionCurrent !== true) return
+        try {
+          diagnostic.gateProofCurrent = await gateInput.isScheduledTaskGraphAuditCompletedReportGateProofCurrent({
+            owner, snapshot, analyzeCheckpoint: proofCheckpoint, analyzeAttestation: parsed.attestation,
+            prepareProof: parsed.prepareProof, gate: { taskId: gate.taskId, attemptCount: Number(gate.attemptCount),
+              phase: "completed" as const, completionProof: parsed.gateCompletionProof }, auditActor: parsed.auditActor,
+          }, tx) ? "passed" : "rejected"
+        } catch {
+          diagnostic.gateProofCurrent = "threw"
+        }
+      })
+    } catch {
+      if (diagnostic.checkpoint === "completed_report" && diagnostic.executionCurrent === null) diagnostic.executionCurrent = false
+    }
+    return diagnostic
+  }
   let loseFirstExecuteResponse = true, gates = 0, executes = 0
   let gateDiagnostics: GateFailureDiagnostics | undefined
   const gateHttpFailures: GateHttpFailure[] = []
@@ -1170,6 +1284,9 @@ async function setupFetcher(fixture: Fixture) {
         serializedCheckpoint: "not_called", checkpointSave: "not_called" }
     }
     const response = await route.POST(request)
+    if (body.action === "scheduled_audit_execute" && response.status === 409) {
+      auditPreflight = { ...auditPreflight, completedReportReplay: await inspectCompletedAuditReplay(body) }
+    }
     if (body.action === "gate") {
       gates += 1
       const payload = await response.clone().json().catch(() => null)
@@ -1194,6 +1311,7 @@ async function setupFetcher(fixture: Fixture) {
     expect(auditActor).toEqual({ taskId: auditActor.taskId, attemptCount: liveAuditTask.attemptCount,
       leaseOwner: liveAuditTask.leaseOwner })
     expect(liveAuditTask.attemptCount).toBe(executes)
+    if (executes === 2) expect(liveAuditTask.failureReason).toBeNull()
     const payload = debugRecord(await response.clone().json().catch(() => null))
     const keys = payload ? Object.keys(payload).sort() : []
     const reportValid = payload !== null && parseScheduledAuditReport(payload.report) !== null
@@ -2033,7 +2151,9 @@ function emptyAuditPreflight(): AuditPreflightDiagnostics {
     executionContext: "not_checked", markerKeyMatches: false, claimKeyMatches: false,
     markerOwnerExact9Matches: false, markerOwnerStable7Matches: false, claimOwnerExact9Matches: false,
     claimOwnerStable7Matches: false, claimTokenValid: false, savedScheduledWaitIdMatchesRequest: false,
-    prepareSource: "not_checked", prepareSourceTrace: emptyPrepareSourceReadTrace(), gateProofCurrent: "not_checked" }
+    prepareSource: "not_checked", prepareSourceTrace: emptyPrepareSourceReadTrace(), gateProofCurrent: "not_checked",
+    completedReportReplay: { checkpoint: "not_applicable", childFence: "not_checked",
+      prepareSource: "not_checked", executionCurrent: null, gateProofCurrent: "not_checked" } }
 }
 function isAuditAction(value: Record<string, unknown> | null): value is AuditAction {
   return Boolean(value && value.action === "scheduled_audit_execute" && isAuditRequestOwner(value.owner)
