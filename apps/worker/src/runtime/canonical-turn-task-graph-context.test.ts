@@ -564,6 +564,30 @@ describe("TaskGraph turn observation", () => {
     expect(nodes[0]).not.toHaveProperty("authority")
   })
 
+  it("adds an optional current same-artifact review conflict without changing conflict-free observation shape", () => {
+    const artifactRef = { artifactId: "draft-current", version: 3, contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: `sha256:${"b".repeat(64)}` }
+    const reviewer = (key: string, taskId: string, reviewStatus: "passed" | "rejected"): TaskGraphCurrentNode => ({
+      key, templateId: "cover_letter_reviewer", goal: "Review the exact draft", successCriteria: [], dependsOn: [],
+      taskId, status: "completed", readiness: "terminal", resultSummary: null, failureReason: null,
+      resultProjection: { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available",
+        role: "reviewer", status: "completed", artifactRef, reviewStatus, reviewHash: `sha256:${"c".repeat(64)}` },
+    })
+    const conflictContent = mergeTaskGraphCurrentObservation(snapshot(), { revision: 6, nodes: [
+      reviewer("review-passed", "reviewer-passed", "passed"), reviewer("review-rejected", "reviewer-rejected", "rejected"),
+    ] }).toolObservations.at(-1)?.content as Record<string, unknown>
+    const unchangedContent = mergeTaskGraphCurrentObservation(snapshot(), state).toolObservations.at(-1)?.content as Record<string, unknown>
+
+    expect(conflictContent.reviewConflicts).toEqual([{
+      artifactId: "draft-current", version: 3,
+      outcomes: [
+        { taskId: "reviewer-passed", reviewStatus: "passed" },
+        { taskId: "reviewer-rejected", reviewStatus: "rejected" },
+      ], truncated: false,
+    }])
+    expect(conflictContent.kind).toBe("task_graph_current")
+    expect(Object.hasOwn(unchangedContent, "reviewConflicts")).toBe(false)
+  })
+
   it("sends the validated full current check contract as untrusted model data", async () => {
     const failedReport = (contract: TaskGraphVerificationContract, digest: string) => ({
       verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "failed" as const, reasonCode: "criterion_not_met" as const,

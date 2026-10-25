@@ -1173,6 +1173,21 @@ describe("createCanonicalTurnRuntime", () => {
       schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout" as const,
       criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte" as const, minimum: 1 } }],
     }
+    const reviewContentHash = `sha256:${"a".repeat(64)}`
+    const reviewSourceDigest = `sha256:${"b".repeat(64)}`
+    const reviewArtifactRef = { artifactId: "draft-current", version: 3, contentHash: reviewContentHash, sourceDigest: reviewSourceDigest }
+    const writerNode: TaskGraphCurrentState["nodes"][number] = {
+      key: "draft-writer", templateId: "cover_letter_writer", goal: "Create a draft", successCriteria: [], dependsOn: [],
+      taskId: "child-writer", status: "completed", readiness: "terminal", resultSummary: null, failureReason: null,
+      resultProjection: { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available",
+        role: "writer", status: "completed", artifactRef: reviewArtifactRef },
+    }
+    const reviewerNode = (key: string, taskId: string, reviewStatus: "passed" | "rejected"): TaskGraphCurrentState["nodes"][number] => ({
+      key, templateId: "cover_letter_reviewer", goal: "Review exact draft", successCriteria: [], dependsOn: ["draft-writer"],
+      taskId, status: "completed", readiness: "terminal", resultSummary: "PRIVATE_REVIEW_PROSE_SENTINEL", failureReason: null,
+      resultProjection: { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available",
+        role: "reviewer", status: "completed", artifactRef: reviewArtifactRef, reviewStatus, reviewHash: `sha256:${"c".repeat(64)}` },
+    })
     const currentPlan: TaskGraphCurrentState = {
       revision: 12,
       nodes: [
@@ -1199,6 +1214,9 @@ describe("createCanonicalTurnRuntime", () => {
             callerTaskId: "root-1", role: "scout", taskType: "job_discovery", contextDigest: "d".repeat(64),
           },
         },
+        writerNode,
+        reviewerNode("review-passed", "reviewer-passed", "passed"),
+        reviewerNode("review-rejected", "reviewer-rejected", "rejected"),
       ],
     }
     async function capture(plan: TaskGraphCurrentState, capabilities: readonly string[] = ["read"]) {
@@ -1250,6 +1268,11 @@ describe("createCanonicalTurnRuntime", () => {
       .flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
     const userText = messages.filter(message => message.role === "user")
       .flatMap(message => message.content).flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    const graphText = messages.filter(message => message.role === "user").flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : [])
+      .find(text => text.startsWith("[harness context layer=tool_observation trust=UNTRUSTED_DATA source=tool_or_subagent]\n") && text.includes("\"reviewConflicts\""))
+    const graphPayload = graphText ? JSON.parse(graphText.slice(graphText.indexOf("\n") + 1)) as { reviewConflicts?: unknown } : undefined
+    const reviewConflicts = graphPayload?.reviewConflicts as Array<Record<string, unknown>> | undefined
     const byKey = new Map((projected?.nodes ?? []).map(node => [node.key, node]))
     const toolNames = request?.tools.flatMap(tool => tool && typeof tool === "object" && "name" in tool && typeof tool.name === "string" ? [tool.name] : []) ?? []
     const categoryGuidance = messages.filter(message => message.role === "system")
@@ -1292,6 +1315,22 @@ describe("createCanonicalTurnRuntime", () => {
     expect(categoryGuidance[0]).toContain("If the request-visible agent.list is available, use it only to inspect matching current result pages.")
     expect(categoryGuidance[0]).toContain("A result page does not refresh the graph, and a null cursor does not mean completion.")
     expect(categoryGuidance[0]).not.toContain("No result-page tool is visible")
+    expect(reviewConflicts).toEqual([{
+      artifactId: "draft-current", version: 3,
+      outcomes: [
+        { taskId: "reviewer-passed", reviewStatus: "passed" },
+        { taskId: "reviewer-rejected", reviewStatus: "rejected" },
+      ], truncated: false,
+    }])
+    expect(systemText).toContain("Treat the review as unsettled")
+    expect(systemText).toContain("do not silently select a winner")
+    expect(systemText).toContain("report the disagreement accurately")
+    expect(request?.tools).toContainEqual(expect.objectContaining({ name: "agent.plan" }))
+    expect(JSON.stringify(reviewConflicts)).not.toContain(reviewContentHash)
+    expect(JSON.stringify(reviewConflicts)).not.toContain(reviewSourceDigest)
+    expect(JSON.stringify(reviewConflicts)).not.toContain("sha256:")
+    expect(JSON.stringify(reviewConflicts)).not.toContain("PRIVATE_REVIEW_PROSE_SENTINEL")
+    expect(Object.keys(reviewConflicts?.[0] ?? {}).sort()).toEqual(["artifactId", "outcomes", "truncated", "version"])
     expect(taskGraphCommandPort.appendAndSchedule).not.toHaveBeenCalled()
     expect(reads.length).toBeGreaterThan(0)
     expect(reads.every(scope => scope.userId === lease.userId && scope.sessionId === lease.sessionId && scope.turnId === lease.turnId
@@ -1305,6 +1344,8 @@ describe("createCanonicalTurnRuntime", () => {
     const excludedSystem = excludedMessages.filter(message => message.role === "system").flatMap(message => message.content)
       .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
     expect(excluded.requests.length).toBeGreaterThan(0)
+    expect(excluded.requests[0]?.tools).toEqual(request?.tools)
+    expect(excludedSystem).not.toContain("Treat the review as unsettled")
     expect(excludedSystem).not.toContain("Current child failure-category cues")
     expect(excludedSystem).not.toContain("execution-setup cues")
     expect(excludedSystem).not.toContain("resume-state cues")

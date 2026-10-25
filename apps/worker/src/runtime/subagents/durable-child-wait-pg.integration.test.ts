@@ -234,6 +234,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
     let workerC: WorkerProcess | undefined
     let workerD: WorkerProcess | undefined
     let workerE: WorkerProcess | undefined
+    let queuePaused = false
     const originalRedisUrl = process.env.REDIS_URL
     let closeSharedRedisConnections: (() => Promise<void>) | undefined
     const recoveryBlockerSessionIds: string[] = []
@@ -465,13 +466,35 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       ids.recoveryCandidateCount = Number(candidateRank.candidateCount)
       ids.recoveryFixtureBlockerCount = Number(candidateRank.fixtureBlockerCount)
       ids.recoveryCandidateObservedAt = candidateRank.observedAt.toISOString()
+      const corruptedMirror = await pool.query(`UPDATE "agent_wait_conditions" SET "result" = jsonb_set(
+          jsonb_set("result", '{request,timeoutMs}', to_jsonb(("result"->'request'->>'timeoutMs')::integer + 1), false),
+          '{outcome,status}', '"waiting"'::jsonb, false)
+        WHERE "id" = (SELECT "id" FROM "agent_wait_conditions" WHERE "parentTaskId" = $1 AND "sessionId" = $2)
+          AND "status" = 'ready' AND "suspendedAt" IS NOT NULL AND "consumedAt" IS NULL RETURNING "id"`, [waiter.id, ids.sessionId])
+      expect(corruptedMirror.rowCount).toBe(1)
+      const staleProjection = await pool.query<{ status: string; result: { request: { timeoutMs: number }; outcome: { status: string } } }>(
+        `SELECT "status", "result" FROM "agent_wait_conditions" WHERE "parentTaskId" = $1 AND "sessionId" = $2`, [waiter.id, ids.sessionId])
+      expect(staleProjection.rows[0]).toMatchObject({ status: "ready", result: { outcome: { status: "waiting" } } })
 
+      queuePaused = true
+      await queue.pause()
       workerC = launchWorker("worker-b-crash-resume", queueName, ids)
       await waitForMarker(workerC, "WORKER_B_RECOVERED")
       const recoveryDiagnostic = workerC.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_RECOVERY_DIAGNOSTIC "))
       const predicateTrace = workerC.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_RECOVERY_PREDICATE_TRACE "))
       expect(workerC.stdoutText, `Worker C missed the waiter; ${recoveryDiagnostic ?? "diagnostic missing"}; ${predicateTrace ?? "predicate trace missing"}`)
         .toContain(`"id":"${waiter.id}","status":"queued"`)
+      const repairedProjection = await pool.query<{ status: string; result: { request: { timeoutMs: number }; outcome: { waitId: string; status: string; taskIds: string[] } }; createdAt: Date; deadlineAt: Date; callTimeoutMs: string }>(
+        `SELECT wait."status", wait."result", wait."createdAt", wait."deadlineAt", call."content"->'input'->>'timeoutMs' AS "callTimeoutMs"
+         FROM "agent_wait_conditions" AS wait JOIN "agent_items" AS call ON call."stepId" = wait."stepId" AND call."taskId" = wait."parentTaskId"
+           AND call."sessionId" = wait."sessionId" AND call."type" = 'tool_call' AND call."content"->>'toolName' = 'wait_subagents'
+         WHERE wait."parentTaskId" = $1 AND wait."sessionId" = $2`, [waiter.id, ids.sessionId])
+      expect(repairedProjection.rows).toHaveLength(1)
+      const repaired = repairedProjection.rows[0]!
+      expect(repaired.status).toBe("ready")
+      expect(repaired.result.request.timeoutMs).toBe(Number(repaired.callTimeoutMs))
+      expect(repaired.result.request.timeoutMs).toBe(repaired.deadlineAt.getTime() - repaired.createdAt.getTime())
+      expect(repaired.result.outcome).toMatchObject({ waitId: expect.any(String), status: "ready", taskIds: [target.id] })
       const blockerStateAfterRecovery = await readBlockerDurableState(pool, recoveryBlockerTaskIds)
       expect(blockerStateAfterRecovery).toEqual(blockerStateBeforeRecovery)
       const blockerJobs = await queue.getJobs(["waiting", "active", "delayed", "completed", "failed"], 0, -1)
@@ -507,6 +530,9 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       const resumeJob = await queue.getJob(subagentDispatchJobId(waiter.id, generation))
       expect(resumeJob).toBeDefined()
 
+      expect(workerC.stdoutText).not.toContain("WORKER_B_RESUME_STEP_STARTED")
+      await queue.resume()
+      queuePaused = false
       await waitForMarker(workerC, "WORKER_B_RESUME_STEP_STARTED")
       const secondCut = await pool.query<{ taskStatus: string; attemptCount: number; leaseOwner: string | null; leaseExpiresAt: Date | null;
         stepOrdinal: number; stepStatus: string; consumedAt: Date | null; callStatus: string; settledCount: number }>(
@@ -538,6 +564,9 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       [waiter.id, ids.sessionId, secondOwner])
       expect(secondExpiry.rowCount).toBe(1)
 
+      // Hold a stalled prior generation until recovery and replacement dispatch are asserted.
+      queuePaused = true
+      await queue.pause()
       workerD = launchWorker("worker-b-crash-after-wait-ack", queueName, ids)
       await waitForMarker(workerD, "WORKER_B_RECOVERED")
       const continuationRecovery = await pool.query<{ taskStatus: string; attemptCount: number; leaseOwner: string | null;
@@ -567,6 +596,8 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       )
       expect(ackResumeDispatch.rows[0]).toMatchObject({ attemptCount: finalGeneration + 1 })
       expect(ackResumeDispatch.rows[0]?.publishedAt).toBeInstanceOf(Date)
+      await queue.resume()
+      queuePaused = false
 
       await waitForMarker(workerD, "WORKER_B_RESUME_ACK_COMMITTED")
       const ackCut = await pool.query<{ taskStatus: string; attemptCount: number; leaseOwner: string | null; leaseExpiresAt: Date | null;
@@ -680,6 +711,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       await stopWorker(workerC)
       await stopWorker(workerD)
       await stopWorker(workerE)
+      if (queuePaused) await queue.resume().catch(() => undefined)
       await queue.obliterate({ force: true }).catch(() => undefined)
       await queue.close().catch(() => undefined)
       if (closeSharedRedisConnections) await closeSharedRedisConnections().catch(() => undefined)

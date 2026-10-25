@@ -237,6 +237,60 @@ describe("TurnEngine", () => {
     expect(fixture.fake.events.filter((event) => event.type === "tool_call.completed")).toHaveLength(1)
   })
 
+  it("preflights nested discovery memory before replaying a recovered tool call", async () => {
+    const timeline: string[] = []
+    const preflight = vi.fn(async (_stepIds: readonly string[]) => { timeline.push("preflight") })
+    const executeTool = vi.fn(async ({ call }: Parameters<TurnEngineOptions["executeTool"]>[0]) => {
+      if (call.id === "persisted-call") timeline.push("replay")
+      return { id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed" as const, output: { replaySafe: true }, errorCode: null }
+    })
+    const fixture = baseOptions({
+      toolCallRecovery: [{ action: "replay", stepId: "persisted-step", toolVersion: "1", call: {
+        id: "persisted-call", name: "jobs.search", arguments: { location: "Dublin" },
+      }, callItem: { id: "persisted-call-item", revision: 0 } }],
+      executeTool,
+    })
+    fixture.fake.items.push({ id: "persisted-call-item", type: "tool_call", phase: null, status: "streaming", revision: 0 })
+    const options: TurnEngineOptions = {
+      ...fixture.options,
+      contextBuilder: { ...fixture.options.contextBuilder, preflightDiscoveryPersonaMemory: preflight },
+    }
+
+    expect(options.preflightDiscoveryPersonaMemory).toBeUndefined()
+    await expect(new TurnEngine(options).run()).resolves.toMatchObject({ status: "completed" })
+
+    expect(preflight).toHaveBeenCalledWith(["persisted-step"])
+    expect(timeline.slice(0, 2)).toEqual(["preflight", "replay"])
+  })
+
+  it("prefers the explicit preflight callback over the nested callback for recovered replay", async () => {
+    const timeline: string[] = []
+    const nestedPreflight = vi.fn(async () => { timeline.push("nested") })
+    const explicitPreflight = vi.fn(async () => { timeline.push("explicit") })
+    const executeTool = vi.fn(async ({ call }: Parameters<TurnEngineOptions["executeTool"]>[0]) => {
+      timeline.push("replay")
+      return { id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "completed" as const, output: { replaySafe: true }, errorCode: null }
+    })
+    const fixture = baseOptions({
+      toolCallRecovery: [{ action: "replay", stepId: "persisted-step", toolVersion: "1", call: {
+        id: "persisted-call", name: "jobs.search", arguments: { location: "Dublin" },
+      }, callItem: { id: "persisted-call-item", revision: 0 } }],
+      executeTool,
+    })
+    fixture.fake.items.push({ id: "persisted-call-item", type: "tool_call", phase: null, status: "streaming", revision: 0 })
+    const options: TurnEngineOptions = {
+      ...fixture.options,
+      preflightDiscoveryPersonaMemory: explicitPreflight,
+      contextBuilder: { ...fixture.options.contextBuilder, preflightDiscoveryPersonaMemory: nestedPreflight },
+    }
+
+    await expect(new TurnEngine(options).run()).resolves.toMatchObject({ status: "completed" })
+
+    expect(explicitPreflight).toHaveBeenCalledWith(["persisted-step"])
+    expect(nestedPreflight).not.toHaveBeenCalled()
+    expect(timeline.slice(0, 2)).toEqual(["explicit", "replay"])
+  })
+
   it("charges replayed model calls against the tool budget without persisting duplicate calls", async () => {
     const executeTool = vi.fn()
     const fixture = baseOptions({
