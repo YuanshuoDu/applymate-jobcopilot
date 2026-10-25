@@ -203,6 +203,7 @@ export type TurnExecutionOptions = {
   readonly goal: string
   readonly snapshot: StepContextSnapshot
   readonly contextBuilder: TurnExecutionContextBuilder
+  readonly preflightDiscoveryPersonaMemory?: (stepIds: readonly string[]) => Promise<void>
   readonly store: TurnExecutionStore
   readonly model: ModelAdapter
   readonly outputSchema?: unknown

@@ -14,7 +14,7 @@ import type { NativeVerificationFeedback } from "../subagents/native-verificatio
 import { runTurnExecutionLoop } from "./turn-execution-loop.js"
 import { createPgTurnEngineStore } from "./turn-engine-store.js"
 import { createHarnessModelRuntime } from "../harness-model.js"
-import { toRepositoryJson, type TurnEngineEvent, type TurnEngineItem, type TurnEngineStore, type TurnEngineToolResult } from "./turn-engine-types.js"
+import { toRepositoryJson, TurnEngineError, type TurnEngineEvent, type TurnEngineItem, type TurnEngineStore, type TurnEngineToolResult } from "./turn-engine-types.js"
 import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, READ_TASK_GRAPH_DENIAL_CHECKPOINT, RESET_NATIVE_SEMANTIC_PROGRESS, TASK_GRAPH_DENIAL_CHECKPOINT, type TurnExecutionIdentity, type TurnExecutionOptions, type TurnExecutionStore } from "./turn-execution-types.js"
 import { steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "../context/steering-marker.js"
 import { COGNITIVE_AGENDA_EVENT_TYPE } from "./cognitive-agenda-receipt.js"
@@ -362,6 +362,41 @@ function addSteeringInput(root: Fixture, alreadyConsumed = false): void {
 }
 
 describe("owner-agnostic turn execution loop", () => {
+  it("blocks recovered replay and model calls on discovery overflow after closing the persisted Step", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const execute = vi.fn(root.options.executeTool)
+    const preflight = vi.fn(async (_stepIds: readonly string[]) => {
+      throw new TurnEngineError("discovery_memory_overflow", "Confirmed Persona facts exceed the discovery memory limit.")
+    })
+    root.options = {
+      ...root.options,
+      resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 0n, consumedInputIds: [], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
+      toolCallRecovery: [{ action: "replay", stepId: "persisted-step-a", toolVersion: "1", call: {
+        id: "persisted-call", name: "jobs.search", arguments: { location: "Dublin" },
+      }, callItem: { id: "persisted-call-item", revision: 0 } }, { action: "replay", stepId: "persisted-step-b", toolVersion: "1", call: {
+        id: "persisted-call-b", name: "jobs.search", arguments: { location: "Dublin" },
+      }, callItem: { id: "persisted-call-item-b", revision: 0 } }],
+      executeTool: execute,
+      preflightDiscoveryPersonaMemory: preflight,
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(preflight).toHaveBeenCalledWith(["persisted-step-a", "persisted-step-b"])
+    expect(execute).not.toHaveBeenCalled()
+    expect(root.requests).toHaveLength(0)
+    expect(root.stepStatuses).toEqual(["failed", "failed"])
+    expect(result).toMatchObject({ status: "failed", errorCode: "discovery_memory_overflow" })
+    const stepClosedAt = root.events.findIndex(event => event.type === "step.completed" && event.payload && (event.payload as Record<string, unknown>).stepId === "persisted-step-a")
+    const secondStepClosedAt = root.events.findIndex(event => event.type === "step.completed" && event.payload && (event.payload as Record<string, unknown>).stepId === "persisted-step-b")
+    const turnFailedAt = root.events.findIndex(event => event.type === "turn.failed")
+    expect(stepClosedAt).toBeGreaterThanOrEqual(0)
+    expect(secondStepClosedAt).toBeGreaterThan(stepClosedAt)
+    expect(turnFailedAt).toBeGreaterThan(stepClosedAt)
+    expect(turnFailedAt).toBeGreaterThan(secondStepClosedAt)
+    expect(root.events.filter(event => event.type.startsWith("tool_call."))).toEqual([])
+  })
+
   it("stages real model usage and commits the root question after its completed tool receipt", async () => {
     const root = nativeQuestionFixture()
     const result = await runTurnExecutionLoop(root.options)
