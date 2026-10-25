@@ -2,8 +2,10 @@ import { createHash, randomUUID } from "node:crypto"
 import { Queue, Worker, type Job } from "bullmq"
 import Redis from "ioredis"
 import { Pool } from "pg"
+import type { Prisma } from "@prisma/client"
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
+import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { TurnEngine } from "../turns/turn-engine.js"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
 import type { TurnEngineOptions, TurnEngineResult } from "../turns/turn-engine-types.js"
@@ -17,6 +19,7 @@ import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import { createPgRootTaskStore } from "./root-task-store.js"
 import { createScheduledPipelineCandidateStore, SCHEDULED_PIPELINE_CANDIDATE_EVENT } from "./scheduled-pipeline-candidate-store.js"
 import { readScheduledPipelineRecoveryStepProfile, SCHEDULED_PIPELINE_RECOVERY_STEP_PROFILE_KEY } from "./scheduled-pipeline-recovery-step.js"
+import { classifyScheduledPipelineRecoveryGraphItem } from "./scheduled-pipeline-recovery-graph-item.js"
 import { attachScheduledPipelineCompletion } from "./scheduled-pipeline-completion.js"
 import { createScheduledAutomationGateContinuation } from "./scheduled-automation-gate-bridge.js"
 import { createScheduledAutomationPrepareContinuation } from "./scheduled-automation-prepare-bridge.js"
@@ -24,9 +27,12 @@ import { createScheduledGateChildExecutor } from "./scheduled-gate-child-runtime
 import { createScheduledAuditChildExecutor } from "./scheduled-audit-child-runtime.js"
 import { createScheduledGatePrepareFixture } from "./scheduled-gate-prepare-pg-runner.fixture.js"
 import { scheduledGateRootActions } from "./scheduled-gate-prepare-pg-resume.fixture.js"
-import { parseScheduledAuditReport, SCHEDULED_AUDIT_TASK_TYPE, SCHEDULED_AUDIT_TEMPLATE_ID } from "./scheduled-audit-contract.js"
+import { parseScheduledAuditReport, SCHEDULED_AUDIT_NODE_CRITERIA, SCHEDULED_AUDIT_NODE_GOAL, SCHEDULED_AUDIT_TASK_TYPE,
+  SCHEDULED_AUDIT_TEMPLATE_ID } from "./scheduled-audit-contract.js"
 import { verifyCompletedTaskGraphNodeEvidence } from "./task-graph-pg-verification.js"
 import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.js"
+import { canonicalTaskGraphJson, parseTaskGraphSnapshot, taskGraphItemId, taskGraphProposalKey,
+  TASK_GRAPH_ITEM_TYPE } from "./task-graph-snapshot.js"
 import { verifyScheduledPrepareTaskGraphEvidence } from "./scheduled-prepare-task-graph-verification.js"
 import { AgentTreeManager } from "./manager.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
@@ -53,6 +59,7 @@ type CustomAgentRoleLookup = Readonly<{ userId: string; insertAfter: string; ena
 type GateFailureDiagnostics = Readonly<Record<string, unknown>>
 type AuditPreflightState = "not_checked" | "passed" | "rejected" | "threw"
 type ReadTraceCount = { reached: boolean; rowCount: number | null }
+type PrismaDecimalClass = typeof import("@prisma/client").Prisma.Decimal
 type PrepareSourceReadTrace = {
   receiptEvents: ReadTraceCount
   candidateEvents: ReadTraceCount
@@ -64,6 +71,20 @@ type PrepareSourceReadTrace = {
   tailWaits: ReadTraceCount
   targetTasks: ReadTraceCount
   graphProposalEvents: ReadTraceCount
+  recoverySteps: Array<Readonly<Record<string, unknown>>>
+  waitEvidence: Array<Readonly<Record<string, unknown>>>
+  targetEvidence: Array<Readonly<Record<string, unknown>>>
+}
+type PrepareSourceTraceCapture = {
+  candidateEvents: unknown[]
+  sourceSteps: Array<unknown | null>
+  choiceItems: Array<unknown | null>
+  tailSteps: unknown[]
+  tailEvents: unknown[]
+  tailItems: unknown[]
+  tailWaits: unknown[]
+  targetTasks: unknown[]
+  graphProposalEvents: unknown[]
 }
 type AuditPreflightDiagnostics = {
   gateCompletionProofValid: boolean
@@ -997,7 +1018,8 @@ async function setupFetcher(fixture: Fixture) {
           diagnostic.savedScheduledWaitIdMatchesRequest = persistedState.scheduledTaskGraphScheduledWaitId === parsed.scheduledWaitId
         }
         const prepareSourceTrace = emptyPrepareSourceReadTrace()
-        const prepareReader = tracePrepareSourceReader(tx as unknown as PrepareSourceDbReader, prepareSourceTrace)
+        const prepareSourceCapture = emptyPrepareSourceTraceCapture()
+        const prepareReader = tracePrepareSourceReader(tx as unknown as PrepareSourceDbReader, prepareSourceTrace, prepareSourceCapture)
         const prepareSourceInput = { owner, snapshot: fixture.scheduleSnapshot, proof: parsed.prepareProof,
           ...(parsed.scheduledWaitId === undefined ? {} : { scheduledWaitId: parsed.scheduledWaitId }), reader: prepareReader }
         try {
@@ -1006,6 +1028,9 @@ async function setupFetcher(fixture: Fixture) {
         } catch {
           diagnostic.prepareSource = "threw"
         }
+        const prismaRuntime = await vi.importActual<typeof import("@prisma/client")>("@prisma/client")
+        const webGraphHelperResult = await inspectActualWebRecoveryGraphHelper(prepareReader, prepareSourceCapture, owner)
+        populateRecoveryDiagnostics(prepareSourceTrace, prepareSourceCapture, owner, webGraphHelperResult, prismaRuntime.Prisma.Decimal)
         diagnostic.prepareSourceTrace = prepareSourceTrace
         const gateProofInput = { owner, snapshot: fixture.scheduleSnapshot, analyzeCheckpoint,
           analyzeAttestation: parsed.attestation, prepareProof: parsed.prepareProof,
@@ -1427,9 +1452,15 @@ function emptyReadTraceCount(): ReadTraceCount { return { reached: false, rowCou
 function emptyPrepareSourceReadTrace(): PrepareSourceReadTrace {
   return { receiptEvents: emptyReadTraceCount(), candidateEvents: emptyReadTraceCount(), sourceStepLookups: [], choiceItemLookups: [],
     tailSteps: { ...emptyReadTraceCount(), statuses: [] }, tailEvents: emptyReadTraceCount(), tailItems: emptyReadTraceCount(),
-    tailWaits: emptyReadTraceCount(), targetTasks: emptyReadTraceCount(), graphProposalEvents: emptyReadTraceCount() }
+    tailWaits: emptyReadTraceCount(), targetTasks: emptyReadTraceCount(), graphProposalEvents: emptyReadTraceCount(),
+    recoverySteps: [], waitEvidence: [], targetEvidence: [] }
 }
-function tracePrepareSourceReader(reader: PrepareSourceDbReader, trace: PrepareSourceReadTrace): PrepareSourceDbReader {
+function emptyPrepareSourceTraceCapture(): PrepareSourceTraceCapture {
+  return { candidateEvents: [], sourceSteps: [], choiceItems: [], tailSteps: [], tailEvents: [], tailItems: [],
+    tailWaits: [], targetTasks: [], graphProposalEvents: [] }
+}
+function tracePrepareSourceReader(reader: PrepareSourceDbReader, trace: PrepareSourceReadTrace,
+  capture: PrepareSourceTraceCapture): PrepareSourceDbReader {
   return {
     agentEvent: { findMany: async args => {
       const where = debugRecord(debugRecord(args)?.where)
@@ -1438,13 +1469,21 @@ function tracePrepareSourceReader(reader: PrepareSourceDbReader, trace: PrepareS
       const rows = await reader.agentEvent.findMany(args)
       const count = Array.isArray(rows) ? rows.length : 0
       if (countTrace) completeReadTrace(countTrace, count)
+      if (where?.type === 'native_verification.scheduled_candidate_staged') capture.candidateEvents = [...rows]
+      else if (where?.type === 'item.delta' && where.actor === 'orchestrator' && Object.hasOwn(where, 'causationId')) {
+        capture.graphProposalEvents = [...rows]
+      } else if (debugRecord(where?.correlationId) && Array.isArray(debugRecord(where?.correlationId)?.in)) {
+        capture.tailEvents = [...rows]
+      }
       return rows
     } },
     agentStep: {
       findFirst: async args => {
         const lookup = { found: false, status: null as string | null, cursorType: 'pending' }
         trace.sourceStepLookups.push(lookup)
+        const captureIndex = capture.sourceSteps.push(null) - 1
         const result = debugRecord(await reader.agentStep.findFirst(args))
+        capture.sourceSteps[captureIndex] = result
         lookup.found = !!result
         lookup.status = safeRecoveryStatus(result?.status)
         lookup.cursorType = cursorType(result?.inputThroughSequence)
@@ -1453,6 +1492,7 @@ function tracePrepareSourceReader(reader: PrepareSourceDbReader, trace: PrepareS
       findMany: async args => {
         beginReadTrace(trace.tailSteps)
         const rows = await reader.agentStep.findMany(args)
+        capture.tailSteps = [...rows]
         const statuses = rows.map(value => safeRecoveryStatus(debugRecord(value)?.status) ?? 'other')
         completeReadTrace(trace.tailSteps, rows.length)
         trace.tailSteps.statuses = statuses
@@ -1464,7 +1504,9 @@ function tracePrepareSourceReader(reader: PrepareSourceDbReader, trace: PrepareS
         const lookup = { found: false, itemKeys: [] as string[], extraItemKeyCount: 0,
           contentKeys: [] as string[], extraContentKeyCount: 0 }
         trace.choiceItemLookups.push(lookup)
+        const captureIndex = capture.choiceItems.push(null) - 1
         const result = debugRecord(await reader.agentItem.findFirst(args)), content = debugRecord(result?.content)
+        capture.choiceItems[captureIndex] = result
         const itemFields = ['id', 'sessionId', 'turnId', 'stepId', 'taskId', 'type', 'status', 'content']
         const contentFields = ['waitKind', 'questionId', 'toolCallId', 'stage', 'question', 'options', 'answer', 'answerAvailable',
           'scheduledPrepareChoiceBinding', 'answeredAt']
@@ -1479,6 +1521,7 @@ function tracePrepareSourceReader(reader: PrepareSourceDbReader, trace: PrepareS
       findMany: async args => {
         beginReadTrace(trace.tailItems)
         const rows = await reader.agentItem.findMany(args)
+        capture.tailItems = [...rows]
         completeReadTrace(trace.tailItems, rows.length)
         return rows
       },
@@ -1486,12 +1529,14 @@ function tracePrepareSourceReader(reader: PrepareSourceDbReader, trace: PrepareS
     agentWaitCondition: { findMany: async args => {
       beginReadTrace(trace.tailWaits)
       const rows = await reader.agentWaitCondition.findMany(args)
+      capture.tailWaits = [...rows]
       completeReadTrace(trace.tailWaits, rows.length)
       return rows
     } },
     subAgentTask: { findMany: async args => {
       beginReadTrace(trace.targetTasks)
       const rows = await reader.subAgentTask.findMany(args)
+      capture.targetTasks = [...rows]
       completeReadTrace(trace.targetTasks, rows.length)
       return rows
     } },
@@ -1508,6 +1553,360 @@ function eventReadTrace(where: Record<string, unknown> | null, trace: PrepareSou
 }
 function beginReadTrace(trace: ReadTraceCount): void { trace.reached = true; trace.rowCount = null }
 function completeReadTrace(trace: ReadTraceCount, rowCount: number): void { trace.rowCount = rowCount }
+async function inspectActualWebRecoveryGraphHelper(reader: PrepareSourceDbReader, capture: PrepareSourceTraceCapture,
+  owner: AuditExecutionOwner): Promise<Readonly<{ stepId: string | null; result: 'true' | 'false' | 'threw' | 'not_checked' }>> {
+  const item = capture.tailItems.map(debugRecord).find(row => row?.type === TASK_GRAPH_ITEM_TYPE || row?.id === taskGraphItemId(owner.rootTaskId))
+  const stepId = diagnosticValidId(item?.stepId) ? item.stepId : null
+  if (!item || !stepId) return { stepId, result: 'not_checked' }
+  try {
+    const module = await vi.importActual<typeof import("@/lib/agent/scheduled-taskgraph-audit-recovery-graph-item")>(
+      "@/lib/agent/scheduled-taskgraph-audit-recovery-graph-item")
+    const result = await module.isScheduledTaskGraphAuditRecoveryGraphItem({
+      reader: reader as unknown as Prisma.TransactionClient,
+      owner: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+        rootAttemptCount: owner.rootAttemptCount, executionId: owner.executionId, executionAttemptCount: owner.executionAttemptCount,
+        turnLeaseOwnerId: owner.turnLeaseOwnerId, turnLeaseVersion: owner.turnLeaseVersion },
+      stepId,
+      item,
+    })
+    return { stepId, result: result ? 'true' : 'false' }
+  } catch { return { stepId, result: 'threw' } }
+}
+function populateRecoveryDiagnostics(trace: PrepareSourceReadTrace, capture: PrepareSourceTraceCapture,
+  owner: AuditExecutionOwner, webGraphHelper: Readonly<{ stepId: string | null; result: 'true' | 'false' | 'threw' | 'not_checked' }>,
+  decimalClass: PrismaDecimalClass): void {
+  const sourceStep = capture.sourceSteps.map(debugRecord).find(Boolean) ?? null
+  const sourceCandidate = sourceStep ? capture.candidateEvents.map(debugRecord).find(event => {
+    const payload = debugRecord(event?.payload)
+    return payload?.finalStepId === sourceStep.id && payload.finalStepOrdinal === sourceStep.ordinal
+      && event?.correlationId === sourceStep.id
+  }) ?? null : null
+  const sourcePayload = debugRecord(sourceCandidate?.payload)
+  const sourceCursor = diagnosticCursor(sourceStep?.inputThroughSequence)
+  const steps = capture.tailSteps.map(debugRecord).filter((row): row is Record<string, unknown> => row !== null)
+  const rows = (values: readonly unknown[]) => values.map(debugRecord).filter((row): row is Record<string, unknown> => row !== null)
+  const events = rows([...capture.tailEvents, ...capture.graphProposalEvents])
+  const items = rows(capture.tailItems), waits = rows(capture.tailWaits), targets = rows(capture.targetTasks)
+  const graphOwner = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId }
+  let previousId = typeof sourceStep?.id === 'string' ? sourceStep.id : null
+  let previousOrdinal = sourceStep?.ordinal
+  let previousCursor = sourceCursor
+  let recoveryCursor = 0
+  for (const step of steps) {
+    const stepId = typeof step.id === 'string' ? step.id : null
+    const markerProfile = debugRecord(step.modelProfileSnapshot)
+    const markerExists = Boolean(markerProfile && Object.hasOwn(markerProfile, SCHEDULED_PIPELINE_RECOVERY_STEP_PROFILE_KEY))
+    const marker = readScheduledPipelineRecoveryStepProfile(step.modelProfileSnapshot)
+    const stepCursor = diagnosticCursor(step.inputThroughSequence)
+    const ownEvents = stepId ? events.filter(event => event.correlationId === stepId || event.causationId === stepId) : []
+    const ownItems = stepId ? items.filter(item => item.stepId === stepId) : []
+    const ownWaits = stepId ? waits.filter(wait => wait.stepId === stepId) : []
+    const ownTargets = linkedRecoveryTargets(ownItems, ownWaits, targets)
+    const classification = stepId ? classifyGraphItem(graphOwner, stepId, ownItems, ownEvents) : 'invalid'
+    const cost = step.estimatedCostUsd
+    const costString = safeString(cost)
+    const decimalApi = decimalClass as unknown as { isDecimal?: (value: unknown) => boolean }
+    const prismaIsDecimal = typeof decimalApi.isDecimal === 'function' ? safeBoolean(() => decimalApi.isDecimal!(cost)) : null
+    const started = ownEvents.filter(event => event.type === 'step.started')
+    const completed = ownEvents.filter(event => event.type === 'step.completed')
+    trace.recoverySteps.push({ step: { id: diagnosticValidId(step.id) ? step.id : null,
+        taskId: diagnosticValidId(step.taskId) ? step.taskId : null, ordinal: Number.isSafeInteger(step.ordinal) ? Number(step.ordinal) : null,
+        attempt: Number.isSafeInteger(step.attempt) ? Number(step.attempt) : null,
+        status: safeRecoveryStatus(step.status) ?? 'other', errorCode: safeRecoveryErrorCode(step.errorCode),
+        inputThroughSequence: stepCursor, consumedInputIds: diagnosticStringList(step.consumedInputIds),
+        recoveryMarker: marker, usageTypes: { inputTokens: cursorType(step.inputTokens), outputTokens: cursorType(step.outputTokens),
+        estimatedCostUsd: cursorType(cost), estimatedCostPrismaDecimalInstance: cost instanceof decimalClass,
+          estimatedCostPrismaIsDecimal: prismaIsDecimal } },
+      status: safeRecoveryStatus(step.status) ?? 'other', taskMatchesRoot: step.taskId === owner.rootTaskId,
+      ordinalValid: Number.isSafeInteger(step.ordinal) && Number(step.ordinal) > 0,
+      ordinalAfterPredecessor: Number.isSafeInteger(step.ordinal) && Number.isSafeInteger(previousOrdinal)
+        && Number(step.ordinal) > Number(previousOrdinal),
+      attemptIsOne: step.attempt === 1, cursorType: cursorType(step.inputThroughSequence), hasValidCursor: stepCursor !== null,
+      markerExists, markerValid: marker !== null,
+      markerOwnerMatches: Boolean(marker && marker.owner.userId === owner.userId && marker.owner.sessionId === owner.sessionId
+        && marker.owner.turnId === owner.turnId && marker.owner.rootTaskId === owner.rootTaskId),
+      markerRootAttemptMatches: marker?.rootAttemptCount === owner.rootAttemptCount,
+      markerSourceEventMatchesCandidate: Boolean(marker && sourceCandidate && marker.sourceEventId === sourceCandidate.id),
+      markerSourceStepMatchesCandidate: Boolean(marker && sourcePayload && marker.sourceStepId === sourcePayload.finalStepId
+        && marker.sourceStepId === sourceStep?.id),
+      markerSourceOrdinalMatchesCandidate: Boolean(marker && sourcePayload && marker.sourceStepOrdinal === sourcePayload.finalStepOrdinal
+        && marker.sourceStepOrdinal === sourceStep?.ordinal),
+      markerSourceCursorMatchesDb: Boolean(marker && sourceCursor !== null && marker.sourceInputThroughSequence === sourceCursor),
+      markerRecoveryStepMatchesDb: Boolean(marker && stepId && marker.recoveryStepId === stepId),
+      markerRecoveryCursorMatchesChain: marker?.recoveryCursor === recoveryCursor + 1,
+      markerPredecessorMatchesChain: Boolean(marker && previousId && marker.predecessorStepId === previousId),
+      markerCursorMatchesDb: Boolean(marker && stepCursor !== null && marker.inputThroughSequence === stepCursor),
+      markerCursorDoesNotRegress: Boolean(marker && previousCursor !== null && stepCursor !== null
+        && BigInt(stepCursor) >= BigInt(previousCursor)),
+      inputTokensType: cursorType(step.inputTokens), inputTokensZero: step.inputTokens === 0 || step.inputTokens === '0',
+      outputTokensType: cursorType(step.outputTokens), outputTokensZero: step.outputTokens === 0 || step.outputTokens === '0',
+       estimatedCostType: cursorType(cost), estimatedCostPrismaDecimalInstance: cost instanceof decimalClass,
+      estimatedCostPrismaIsDecimal: prismaIsDecimal, estimatedCostStringIsCanonicalZero: costString !== null && /^0(?:\.0+)?$/.test(costString),
+      estimatedCostZeroByWorkerPredicate: cost === 0 || typeof cost === 'string' && /^0(?:\.0+)?$/.test(cost)
+         || cost instanceof decimalClass && safeBoolean(() => cost.isZero()),
+      consumedInputIdsEmpty: diagnosticStringList(step.consumedInputIds)?.length === 0,
+      startedEventCount: started.length, completedEventCount: completed.length,
+      stepEvents: [...started, ...completed].map(event => recoveryEventDiagnostics(event, step, owner, marker, ownWaits)),
+      graphItem: graphItemDiagnostics(graphOwner, stepId ?? '', ownItems, ownEvents, classification,
+        webGraphHelper.stepId === stepId ? webGraphHelper.result : 'not_checked'),
+      waitCount: ownWaits.length, targetCount: ownTargets.length,
+    })
+    trace.waitEvidence.push(...ownWaits.map(wait => waitDiagnostics(wait, stepId, owner, ownTargets)))
+    trace.targetEvidence.push(...ownTargets.map(target => targetDiagnostics(target, owner)))
+    if (stepId) previousId = stepId
+    if (Number.isSafeInteger(step.ordinal)) previousOrdinal = Number(step.ordinal)
+    if (marker) { previousCursor = marker.inputThroughSequence; recoveryCursor = marker.recoveryCursor }
+  }
+}
+function classifyGraphItem(owner: { userId: string; sessionId: string; turnId: string; rootTaskId: string }, stepId: string,
+  items: readonly Record<string, unknown>[], events: readonly Record<string, unknown>[]): 'absent' | 'verified_plan' | 'invalid' {
+  try { return classifyScheduledPipelineRecoveryGraphItem({ owner, stepId, items, events }) } catch { return 'invalid' }
+}
+function graphItemDiagnostics(owner: { userId: string; sessionId: string; turnId: string; rootTaskId: string }, stepId: string,
+  items: readonly Record<string, unknown>[], events: readonly Record<string, unknown>[], classification: 'absent' | 'verified_plan' | 'invalid',
+  webHelperResult: 'true' | 'false' | 'threw' | 'not_checked') {
+  const itemId = taskGraphItemId(owner.rootTaskId)
+  const graphItems = items.filter(item => item.id === itemId || item.type === TASK_GRAPH_ITEM_TYPE)
+  const matches = events.filter(event => graphProposalCandidate(event, itemId, stepId))
+  const item = graphItems.length === 1 ? graphItems[0] : null
+  const event = matches.length === 1 ? matches[0] : null
+  const payload = debugRecord(event?.payload), dto = debugRecord(payload?.item), receipt = debugRecord(payload?.receipt)
+  const nodes = Array.isArray(receipt?.nodes) ? receipt.nodes : []
+  const node = nodes.length === 1 ? debugRecord(nodes[0]) : null
+  const revision = payload?.revision
+  const keys = ['content', 'fingerprint', 'item', 'kind', 'receipt', 'revision']
+  const snapshot = safeTaskGraphSnapshot(payload?.content, owner.rootTaskId)
+  const taskId = node?.taskId
+  const auditNode = snapshot?.nodes[4]
+  const eventEnvelopeValid = Boolean(event && event.sessionId === owner.sessionId && event.turnId === owner.turnId
+    && event.taskId === owner.rootTaskId && event.itemId === itemId && event.type === 'item.delta' && event.actor === 'orchestrator'
+    && event.correlationId === owner.turnId && event.causationId === stepId
+    && typeof revision === 'number' && Number.isSafeInteger(revision)
+    && event.idempotencyKey === taskGraphProposalKey(owner.rootTaskId, revision - 1))
+  const proposalEnvelopeValid = Boolean(payload && exactDiagnosticKeys(payload, keys) && payload.kind === 'proposal'
+    && typeof payload.fingerprint === 'string' && /^[a-f0-9]{64}$/.test(payload.fingerprint)
+    && typeof revision === 'number' && Number.isSafeInteger(revision) && revision >= 2)
+  const receiptValid = Boolean(receipt && exactDiagnosticKeys(receipt, ['nodes', 'readyTaskIds', 'revision', 'status'])
+    && receipt.status === 'accepted' && receipt.revision === revision && node
+    && exactDiagnosticKeys(node, ['key', 'status', 'taskId']) && node.key === SCHEDULED_AUDIT_TEMPLATE_ID && node.status === 'queued'
+    && diagnosticValidId(taskId) && diagnosticArrayEquals(receipt.readyTaskIds, [taskId]))
+  const dtoFields = ['completedAt', 'content', 'createdAt', 'id', 'phase', 'revision', 'schemaVersion', 'sessionId', 'startedAt',
+    'status', 'stepId', 'taskId', 'turnId', 'type', 'updatedAt']
+  const dtoValid = Boolean(dto && exactDiagnosticKeys(dto, dtoFields) && dto.schemaVersion === AGENT_STREAM_SCHEMA_VERSION
+    && dto.id === itemId && dto.sessionId === owner.sessionId && dto.turnId === owner.turnId && dto.stepId === stepId
+    && dto.taskId === owner.rootTaskId && dto.type === TASK_GRAPH_ITEM_TYPE && dto.status === 'streaming'
+    && dto.phase === null && dto.completedAt === null && dto.revision === revision
+    && validDiagnosticIso(dto.startedAt) && validDiagnosticIso(dto.createdAt) && validDiagnosticIso(dto.updatedAt))
+  const itemValid = Boolean(item && item.id === itemId && item.sessionId === owner.sessionId && item.turnId === owner.turnId
+    && item.stepId === stepId && item.taskId === owner.rootTaskId && item.type === TASK_GRAPH_ITEM_TYPE && item.status === 'streaming'
+    && item.phase === null && typeof item.revision === 'number' && Number.isSafeInteger(item.revision)
+    && typeof revision === 'number' && Number(item.revision) >= revision)
+  return { classification, helperVerified: classification === 'verified_plan', webHelperResult, graphItemCount: graphItems.length,
+    eventMatchCount: matches.length === 0 ? 'zero' : matches.length === 1 ? 'one' : 'many', itemValid, eventEnvelopeValid,
+    proposalEnvelopeValid, receiptValid, snapshotValid: snapshot !== null, auditNodeValid: Boolean(snapshot && auditNode
+      && auditNode.key === SCHEDULED_AUDIT_TEMPLATE_ID && auditNode.templateId === SCHEDULED_AUDIT_TEMPLATE_ID
+      && auditNode.taskId === taskId && auditNode.depth === 5 && auditNode.goal === SCHEDULED_AUDIT_NODE_GOAL
+      && canonicalEqual(auditNode.successCriteria, SCHEDULED_AUDIT_NODE_CRITERIA) && canonicalEqual(auditNode.dependsOn, ['gate'])
+      && auditNode.verificationDisposition === 'specialized'), dtoValid,
+    contentEqual: Boolean(payload && dto && item && canonicalEqual(payload.content, dto.content)
+      && canonicalEqual(payload.content, item.content)),
+    itemWitness: item ? { fieldKeys: ['id', 'sessionId', 'turnId', 'stepId', 'taskId', 'type', 'status', 'phase', 'revision', 'content']
+        .filter(key => Object.hasOwn(item, key)), contentKeys: Object.keys(debugRecord(item.content) ?? {}).sort(),
+      revision: Number.isSafeInteger(item.revision) ? Number(item.revision) : null,
+      stepId: diagnosticValidId(item.stepId) ? item.stepId : null,
+      taskId: diagnosticValidId(item.taskId) ? item.taskId : null, status: safeGraphItemStatus(item.status), phase: item.phase ?? null } : null,
+    proposalWitness: event && payload ? { eventFieldKeys: ['id', 'sessionId', 'turnId', 'taskId', 'itemId', 'type', 'actor',
+          'correlationId', 'causationId', 'idempotencyKey', 'payload'].filter(key => Object.hasOwn(event, key)),
+      eventType: event.type === 'item.delta' ? 'item.delta' : 'other', actor: event.actor === 'orchestrator' ? 'orchestrator' : 'other',
+      correlationId: diagnosticValidId(event.correlationId) ? event.correlationId : null,
+      causationId: diagnosticValidId(event.causationId) ? event.causationId : null,
+      payloadKeys: ['content', 'fingerprint', 'item', 'kind', 'receipt', 'revision'].filter(key => Object.hasOwn(payload, key)),
+      revision: Number.isSafeInteger(revision) ? Number(revision) : null,
+      fingerprintPresent: typeof payload.fingerprint === 'string', dtoKeys: dto ? Object.keys(dto).sort() : [],
+      receiptKeys: receipt ? Object.keys(receipt).sort() : [], receiptStatus: receipt?.status === 'accepted' ? 'accepted' : 'other',
+      receiptRevision: Number.isSafeInteger(receipt?.revision) ? Number(receipt?.revision) : null,
+      receiptNodeKeys: node ? Object.keys(node).sort() : [], readyTaskCount: Array.isArray(receipt?.readyTaskIds) ? receipt.readyTaskIds.length : null,
+      snapshotKeys: debugRecord(payload.content) ? Object.keys(debugRecord(payload.content)!).sort() : [],
+      snapshotNodeKeys: snapshot ? snapshot.nodes.map(value => value.key) : [],
+      keyMatchesExpected: eventEnvelopeValid } : null }
+}
+function graphProposalCandidate(event: Record<string, unknown>, itemId: string, stepId: string): boolean {
+  const payload = debugRecord(event.payload), dto = debugRecord(payload?.item)
+  return event.itemId === itemId || dto?.id === itemId
+    || typeof event.idempotencyKey === 'string' && event.idempotencyKey.startsWith(`${itemId}:proposal:`)
+    || event.type === 'item.delta' && event.causationId === stepId && payload?.kind === 'proposal'
+}
+function recoveryEventDiagnostics(event: Record<string, unknown>, step: Record<string, unknown>, owner: AuditExecutionOwner,
+  marker: ReturnType<typeof readScheduledPipelineRecoveryStepProfile>, waits: readonly Record<string, unknown>[]) {
+  const payload = debugRecord(event.payload), stepId = typeof step.id === 'string' ? step.id : null
+  const eventType = ['step.started', 'step.completed', 'final.rejected', 'item.delta'].includes(String(event.type))
+    ? String(event.type) : 'other'
+  const allowedPayloadKeys = ['stepId', 'status', 'taskId', 'ordinal', 'waitId', 'errorCode', SCHEDULED_PIPELINE_RECOVERY_STEP_PROFILE_KEY,
+    'kind', 'fingerprint', 'revision', 'item', 'receipt', 'content']
+  const payloadKeys = payload ? Object.keys(payload) : []
+  const isStepEvent = eventType === 'step.started' || eventType === 'step.completed'
+  const expectedPayloadKeys = eventType === 'step.started'
+    ? ['stepId', 'ordinal', 'taskId', SCHEDULED_PIPELINE_RECOVERY_STEP_PROFILE_KEY]
+    : eventType === 'step.completed'
+      ? payload && Object.hasOwn(payload, 'errorCode') ? ['stepId', 'status', 'errorCode', 'taskId']
+        : payload && Object.hasOwn(payload, 'waitId') ? ['stepId', 'status', 'taskId', 'waitId'] : ['stepId', 'status', 'taskId']
+      : null
+  const expectedStatus = step.status === 'waiting_for_tool' ? 'waiting_for_dependency' : step.status
+  const waitId = payload?.waitId
+  const payloadRecoveryMarker = payload?.[SCHEDULED_PIPELINE_RECOVERY_STEP_PROFILE_KEY]
+  const safePayload: Record<string, unknown> = {}
+  if (isStepEvent && payload) {
+    for (const key of ['stepId', 'taskId', 'waitId']) if (typeof payload[key] === 'string') safePayload[key] = payload[key]
+    if (Number.isSafeInteger(payload.ordinal)) safePayload.ordinal = Number(payload.ordinal)
+    const status = safeCompletionStatus(payload.status)
+    if (status) safePayload.status = status
+    const errorCode = safeRecoveryErrorCode(payload.errorCode)
+    if (errorCode) safePayload.errorCode = errorCode
+    if (eventType === 'step.started' && marker) safePayload[SCHEDULED_PIPELINE_RECOVERY_STEP_PROFILE_KEY] = marker
+  }
+  const expectedKey = !stepId ? null : eventType === 'step.started'
+    ? `turn:${owner.turnId}:event:step-started:${stepId}`
+    : eventType === 'step.completed' ? `turn:${owner.turnId}:event:step-completed:${stepId}` : null
+  return { eventType, id: diagnosticValidId(event.id) ? event.id : null,
+    actor: event.actor === 'orchestrator' ? 'orchestrator' : event.actor === 'system' ? 'system' : 'other',
+    taskId: diagnosticValidId(event.taskId) ? event.taskId : null, itemId: event.itemId === null ? null
+      : diagnosticValidId(event.itemId) ? event.itemId : 'other',
+    correlationId: diagnosticValidId(event.correlationId) ? event.correlationId : null,
+    causationId: !Object.hasOwn(event, 'causationId') ? 'not_selected'
+      : diagnosticValidId(event.causationId) ? event.causationId : null,
+    key: typeof event.idempotencyKey === 'string' && event.idempotencyKey.length <= 512 ? event.idempotencyKey : null,
+    eventSessionScope: Object.hasOwn(event, 'sessionId') ? event.sessionId === owner.sessionId : 'not_selected',
+    eventTurnScope: Object.hasOwn(event, 'turnId') ? event.turnId === owner.turnId : 'not_selected',
+    eventScopeMatchesSelectedFields: event.taskId === owner.rootTaskId && event.correlationId === stepId
+      && event.itemId === null && event.actor === 'orchestrator',
+    keyMatchesExpected: expectedKey !== null && event.idempotencyKey === expectedKey,
+    payloadKeys: allowedPayloadKeys.filter(key => payloadKeys.includes(key)),
+    extraPayloadKeyCount: payloadKeys.filter(key => !allowedPayloadKeys.includes(key)).length,
+    payloadKeysMatchExpected: expectedPayloadKeys !== null && !!payload && exactDiagnosticKeys(payload, expectedPayloadKeys),
+    payloadStepMatches: payload?.stepId === stepId, payloadTaskMatchesRoot: payload?.taskId === owner.rootTaskId,
+    payloadOrdinalMatches: eventType !== 'step.started' || payload?.ordinal === step.ordinal,
+    payloadStatusMatches: eventType !== 'step.completed' || payload?.status === expectedStatus,
+    payloadErrorCodeMatches: eventType !== 'step.completed' || !Object.hasOwn(payload ?? {}, 'errorCode')
+      || payload?.errorCode === step.errorCode && step.errorCode === 'scheduled_audit_completion_unverified',
+    payloadWaitIdMatchesOwnedWait: typeof waitId === 'string' && waits.some(wait => wait.id === waitId),
+    payloadRecoveryMarkerMatchesProfile: eventType !== 'step.started' || Boolean(marker && debugSameJson(payloadRecoveryMarker, marker)),
+    fixedPayload: safePayload }
+}
+function linkedRecoveryTargets(items: readonly Record<string, unknown>[], waits: readonly Record<string, unknown>[],
+  targets: readonly Record<string, unknown>[]): Record<string, unknown>[] {
+  const ids = new Set<string>()
+  for (const wait of waits) for (const id of diagnosticStringList(wait.targetTaskIds) ?? []) ids.add(id)
+  for (const item of items) {
+    const content = debugRecord(item.content), binding = debugRecord(content?.scheduledGateChoiceBinding)
+    if (diagnosticValidId(binding?.gateTaskId)) ids.add(binding.gateTaskId)
+  }
+  return targets.filter(target => typeof target.id === 'string' && ids.has(target.id))
+}
+function waitDiagnostics(wait: Record<string, unknown>, stepId: string | null, owner: AuditExecutionOwner,
+  targets: readonly Record<string, unknown>[]) {
+  const request = debugRecord(debugRecord(wait.result)?.request), targetIds = diagnosticStringList(wait.targetTaskIds)
+  const matchedIds = diagnosticStringList(wait.matchedTaskIds), expectedOwnerKeys = ['userId', 'sessionId', 'turnId', 'parentTaskId', 'stepId']
+  const requestKeys = request ? Object.keys(request) : []
+  const gate = debugRecord(request?.scheduledGate)
+  const targetRows = targets.filter(target => targetIds?.includes(String(target.id)))
+  const auditTarget = targetRows.find(target => target.role === 'auditor' && target.taskType === SCHEDULED_AUDIT_TASK_TYPE)
+  const maxAttempts = auditTarget?.maxAttempts
+  let auditKeyMatches = false
+  if (typeof wait.idempotencyKey === 'string' && diagnosticValidId(stepId) && diagnosticValidId(targetIds?.[0])) {
+    const attempts = Number.isSafeInteger(maxAttempts) && Number(maxAttempts) > 0 && Number(maxAttempts) <= 32 ? Number(maxAttempts) : 32
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const digest = createHash('sha256').update(JSON.stringify([targetIds![0], stepId, attempt]), 'utf8').digest('hex')
+      if (wait.idempotencyKey === `scheduled-audit-wait:${digest}`) auditKeyMatches = true
+    }
+  }
+  return { id: diagnosticValidId(wait.id) ? wait.id : null, stepId: diagnosticValidId(wait.stepId) ? wait.stepId : null,
+    ownerFields: expectedOwnerKeys.filter(key => Object.hasOwn(wait, key)),
+    ownerMatches: { user: wait.userId === owner.userId, session: wait.sessionId === owner.sessionId,
+      turn: wait.turnId === owner.turnId, parent: wait.parentTaskId === owner.rootTaskId, step: wait.stepId === stepId },
+    mode: wait.mode === 'all' || wait.mode === 'any' ? wait.mode : 'other',
+    status: wait.status === 'waiting' || wait.status === 'ready' ? wait.status : 'other',
+    targetTaskIds: targetIds, targetIdsUnique: !!targetIds && new Set(targetIds).size === targetIds.length,
+    matchedTaskIds: matchedIds, resultKeys: Object.keys(debugRecord(wait.result) ?? {}).filter(key => ['request', 'outcome'].includes(key)),
+    requestKeys: ['mode', 'scheduledGate', 'targetTaskIds', 'timeoutMs'].filter(key => requestKeys.includes(key)),
+    extraRequestKeyCount: requestKeys.filter(key => !['mode', 'scheduledGate', 'targetTaskIds', 'timeoutMs'].includes(key)).length,
+    request: request ? { mode: request.mode === 'all' || request.mode === 'any' ? request.mode : 'other',
+      targetTaskIds: diagnosticStringList(request.targetTaskIds),
+      timeoutMs: Number.isSafeInteger(request.timeoutMs) ? Number(request.timeoutMs) : null,
+      scheduledGate: gate ? { gateTaskId: diagnosticValidId(gate.gateTaskId) ? gate.gateTaskId : null,
+        requestAttemptCount: Number.isSafeInteger(gate.requestAttemptCount) ? Number(gate.requestAttemptCount) : null } : null } : null,
+    requestModeMatches: request?.mode === wait.mode, requestTargetsMatch: diagnosticArrayEquals(request?.targetTaskIds, targetIds ?? []),
+    requestTimeoutValid: request?.timeoutMs === 86_400_000,
+    scheduledGate: gate ? { gateTaskId: diagnosticValidId(gate.gateTaskId) ? gate.gateTaskId : null,
+      requestAttemptCount: Number.isSafeInteger(gate.requestAttemptCount) ? Number(gate.requestAttemptCount) : null,
+      keys: Object.keys(gate).filter(key => ['gateTaskId', 'requestAttemptCount'].includes(key)),
+      extraKeyCount: Object.keys(gate).filter(key => !['gateTaskId', 'requestAttemptCount'].includes(key)).length } : null,
+    auditKeyMatches, targetCount: targetRows.length }
+}
+function targetDiagnostics(target: Record<string, unknown>, owner: AuditExecutionOwner) {
+  const session = debugRecord(target.session)
+  return { id: diagnosticValidId(target.id) ? target.id : null,
+    parentTaskId: diagnosticValidId(target.parentTaskId) ? target.parentTaskId : null,
+    rootTaskId: diagnosticValidId(target.rootTaskId) ? target.rootTaskId : null,
+    sessionId: diagnosticValidId(target.sessionId) ? target.sessionId : null,
+    turnId: diagnosticValidId(target.turnId) ? target.turnId : null,
+    role: ['auditor', 'prepare'].includes(String(target.role)) ? target.role : 'other',
+    taskType: [SCHEDULED_AUDIT_TASK_TYPE, 'scheduled_taskgraph_gate', 'scheduled_application_prepare'].includes(String(target.taskType))
+      ? target.taskType : 'other',
+    taskStatus: target.status === 'queued' || target.status === 'running' || target.status === 'waiting'
+      || target.status === 'completed' || target.status === 'failed' ? target.status : 'not_selected',
+    depth: Number.isSafeInteger(target.depth) ? Number(target.depth) : null,
+    maxAttempts: Number.isSafeInteger(target.maxAttempts) ? Number(target.maxAttempts) : null,
+    sessionUserId: diagnosticValidId(session?.userId) ? session.userId : null,
+    ownerMatches: target.parentTaskId === owner.rootTaskId && target.rootTaskId === owner.rootTaskId
+      && target.sessionId === owner.sessionId && target.turnId === owner.turnId && session?.userId === owner.userId }
+}
+function safeCompletionStatus(value: unknown): string | null {
+  return typeof value === 'string' && ['waiting_for_dependency', 'waiting_for_user', 'completed'].includes(value) ? value : null
+}
+function safeGraphItemStatus(value: unknown): string | null {
+  return typeof value === 'string' && ['streaming', 'started', 'completed', 'waiting_for_tool', 'waiting_for_user'].includes(value)
+    ? value : null
+}
+function safeGraphNodeKey(value: unknown): string {
+  return typeof value === 'string' && ['scout', 'analyst', 'prepare', 'gate', SCHEDULED_AUDIT_TEMPLATE_ID].includes(value)
+    ? value : 'other'
+}
+function safeRecoveryErrorCode(value: unknown): string | null {
+  return value === 'scheduled_audit_completion_unverified' ? value : null
+}
+function safeTaskGraphSnapshot(value: unknown, rootTaskId: string) {
+  try {
+    const snapshot = parseTaskGraphSnapshot(value)
+    const keys = ['scout', 'analyst', 'prepare', 'gate', SCHEDULED_AUDIT_TEMPLATE_ID]
+    return canonicalEqual(value, snapshot) && snapshot.nodes.length === 5
+      && canonicalEqual(snapshot.nodes.map(node => node.key), keys)
+      && snapshot.nodes.every(node => diagnosticValidId(node.taskId) && node.taskId !== rootTaskId)
+      && new Set(snapshot.nodes.map(node => node.taskId)).size === 5 ? snapshot : null
+  } catch { return null }
+}
+function exactDiagnosticKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  return Object.keys(value).sort().join(',') === [...keys].sort().join(',')
+}
+function canonicalEqual(left: unknown, right: unknown): boolean {
+  try { return canonicalTaskGraphJson(left) === canonicalTaskGraphJson(right) } catch { return false }
+}
+function diagnosticArrayEquals(value: unknown, expected: readonly unknown[]): boolean {
+  return Array.isArray(value) && canonicalEqual(value, expected)
+}
+function diagnosticCursor(value: unknown): string | null {
+  const cursor = typeof value === 'bigint' || typeof value === 'number' ? String(value) : value
+  if (typeof cursor !== 'string' || !/^(0|[1-9]\d{0,18})$/.test(cursor)) return null
+  try { return BigInt(cursor) <= 9_223_372_036_854_775_807n ? cursor : null } catch { return null }
+}
+function diagnosticStringList(value: unknown): string[] | null {
+  const parsed = typeof value === 'string' ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
+  return Array.isArray(parsed) && parsed.every(item => typeof item === 'string') ? parsed : null
+}
+function safeString(value: unknown): string | null { try { return value === null || value === undefined ? null : String(value) } catch { return null } }
+function safeBoolean(callback: () => unknown): boolean | null { try { return Boolean(callback()) } catch { return null } }
+function validDiagnosticIso(value: unknown): boolean {
+  return typeof value === 'string' && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value
+}
 function cursorType(value: unknown): string { return value === null ? 'null' : typeof value }
 function safeRecoveryStatus(value: unknown): string | null {
   return typeof value === 'string' && ['streaming', 'interrupted', 'waiting_for_tool', 'waiting_for_user', 'completed'].includes(value)
