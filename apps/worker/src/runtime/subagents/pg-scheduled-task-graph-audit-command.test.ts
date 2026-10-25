@@ -77,7 +77,19 @@ const registration = parseScheduledAuditRegistrationReceipt({ schemaVersion: SCH
   scheduledWaitId: "scheduled-wait", auditTaskId: "audit-task", gateGraphRevision: 12, auditAppendRevision: 13,
   expectedAttemptCount: 1 })!
 const contract = { binding, receipt: { continuationKey } }
-const attestation = { snapshotDigest }
+const attestation = {
+  schemaVersion: "agent-harness.v2.scheduled-pipeline-attestation.v1" as const,
+  owner: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+    rootAttemptCount: owner.rootAttemptCount, turnLeaseOwnerId: scope.turnLeaseOwner, turnLeaseVersion: scope.turnLeaseVersion },
+  snapshotDigest, graphRevision: binding.analyzeGraphRevision,
+  scout: { taskId: "scout-task", attemptCount: 1, status: "completed" as const, verification: "passed" as const,
+    resultDigest: `sha256:${"1".repeat(64)}`, candidateJobIds: ["job-1"], discoveryReceipt: { status: "complete" as const,
+      taskId: "scout-task", attemptCount: 1, completedCalls: 1, candidateCount: 1, providerFailures: 0 as const,
+      materializationFailures: 0 as const, hasMore: false as const, receiptDigest: `sha256:${"2".repeat(64)}` } },
+  analyst: { taskId: "analyst-task", attemptCount: 1, status: "completed" as const, verification: "passed" as const,
+    resultDigest: `sha256:${"3".repeat(64)}`, dependsOnTaskIds: ["scout-task"], jobIds: ["job-1"] },
+  evidenceDigest: binding.evidenceDigest,
+}
 const handoff = { status: "analyze_checkpointed" as const, continuationKey, checkpointDigest: binding.checkpointDigest,
   claimTokenDigest: `sha256:${"f".repeat(64)}`, executionId: owner.executionId,
   executionAttemptCount: owner.executionAttemptCount }
