@@ -134,6 +134,32 @@ describe("atomic TaskGraph finalization recovery", () => {
     expect(options.store.recordFinalResponse).not.toHaveBeenCalled()
   })
 
+  it("records the exact durable wait only for a scheduled recovery Step", async () => {
+    const snapshot = { system: [], profile: [], steerHistory: [], businessRefs: [{ id: "job-1", kind: "job" as const, ownerId: "user-1" }], toolObservations: [] }
+    const waitId = "scheduled-audit-wait:exact"
+    const execute = async (provider: string, stepId: string) => {
+      const appended: Array<{ type: string; stepId: string; payload: unknown }> = [], updates: unknown[] = []
+      const completionGate: TurnEngineCompletionGate = async () => ({ ok: true })
+      completionGate[SCHEDULED_PIPELINE_COMPLETION] = async input => ({ status: "waiting_for_dependency", waitId, candidateText: input.candidateText })
+      const options = { identity: { kind: "turn" as const, taskId: "root-1", rootTaskId: "root-1", userId: "user-1", sessionId: "session-1",
+        turnId: "turn-1", ownerId: "worker-1", leaseVersion: 1, leaseExpiresAt: new Date() }, scope: { userId: "user-1" },
+        goal: "Find a role", snapshot, completionGate, store: { updateStep: vi.fn(async (input: unknown) => { updates.push(input) }) } } as unknown as TurnExecutionOptions
+      const outcome = await completeTurnCandidate({ options, writer: { append: vi.fn(async (type: string, eventStepId: string,
+        _itemId: string | null, payload: unknown) => { appended.push({ type, stepId: eventStepId, payload }); return { id: "event-1" } }) } as unknown as TurnExecutionEventWriter,
+        step: { id: stepId, ordinal: 8 }, output: { text: "Exact candidate.", reasoningSummary: "", toolCalls: [], provider,
+          model: "recovered", finishReason: "stop", usage: null, continuation: null } satisfies ModelStepResult,
+        snapshot, stepCount: 2, toolCallCount: 0, usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+        signal: new AbortController().signal, now: () => new Date(), onStepClosed: vi.fn() })
+      expect(outcome).toEqual({ kind: "wait", result: { status: "waiting_for_dependency", waitId, stepCount: 2, toolCallCount: 0 } })
+      expect(updates[0]).toMatchObject({ stepId, status: "waiting_for_tool", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 })
+      return appended.find(event => event.type === "step.completed")
+    }
+    await expect(execute("scheduled_recovery", "recovery-step-8")).resolves.toEqual({ type: "step.completed", stepId: "recovery-step-8",
+      payload: { stepId: "recovery-step-8", status: "waiting_for_dependency", taskId: "root-1", waitId } })
+    await expect(execute("recovered", "generic-recovery-step")).resolves.toEqual({ type: "step.completed", stepId: "generic-recovery-step",
+      payload: { stepId: "generic-recovery-step", status: "waiting_for_dependency", taskId: "root-1" } })
+  })
+
   it("refreshes when the Gate answer arrives before the private wait is inserted", async () => {
     const binding = { schemaVersion: TURN_SCHEDULED_GATE_CHOICE_SCHEMA,
       owner: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", rootAttemptCount: 2,

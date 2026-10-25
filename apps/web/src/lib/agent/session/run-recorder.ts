@@ -28,6 +28,8 @@ interface RunSessionRecorderInput {
   legacyResumeQuestionId?: string
   /** Canonical TurnEngine owns the V2 terminal status for this run. */
   manageV2Lifecycle?: boolean
+  /** Canonical Root owns Session lifecycle when false. Defaults to true. */
+  manageSessionLifecycle?: boolean
   /** Delay existing-session reopen and V2 projection until the execution is claimed. */
   deferActivation?: boolean
   /** Create or capture the exact canonical Turn without enabling transcript projection. */
@@ -46,7 +48,17 @@ function qualityScore(report: RunReport | null, status: AgentSessionStatus) {
   return Math.max(0, Math.round(((report.processed - report.failed) / report.processed) * 100))
 }
 
+async function confirmOpenSession(db: AgentSessionDb, sessionId: string, userId: string) {
+  try {
+    return await withOpenSession(db, { sessionId, userId }, async () => true)
+  } catch (error) {
+    if (error instanceof Error && error.message === `Agent session ${sessionId} does not exist for this user`) return false
+    throw error
+  }
+}
+
 export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSessionRecorderInput) {
+  const manageSessionLifecycle = input.manageSessionLifecycle !== false
   const session = input.sessionId
     ? { id: input.sessionId }
     : await createAgentSession(db, {
@@ -66,8 +78,8 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
     turnId: input.turnId,
     legacyResumeQuestionId: input.legacyResumeQuestionId,
     dualWrite: Boolean(input.dualWrite),
-    deferActivation: Boolean(input.deferActivation),
-    reopenSession: Boolean(input.sessionId),
+    deferActivation: Boolean(input.deferActivation && manageSessionLifecycle),
+    reopenSession: Boolean(input.sessionId && manageSessionLifecycle),
     ensureTurn: Boolean(input.ensureTurn),
   })
   if (!input.deferActivation) await activation.activate()
@@ -157,6 +169,10 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
     async finalize(finalizeInput: FinalizeInput): Promise<boolean> {
       assertActivated()
       const dualWrite = activation.getDualWrite()
+      const openSession = !manageSessionLifecycle && !finalizeInput.owner
+        ? await confirmOpenSession(db, session.id, input.userId)
+        : null
+      if (openSession === false) return false
       if (finalizeInput.owner) {
         const owned = await withRunRecorderTerminalOwnership(db, {
           sessionId: session.id,
@@ -167,13 +183,15 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
             finalResponse: summarizeReport(finalizeInput.report),
             error: finalizeInput.status === "failed" ? summarizeReport(finalizeInput.report) : null,
           } } : {}),
-        }, tx => updateAgentSession(tx, {
-          sessionId: session.id,
-          status: finalizeInput.status,
-          completedAt: new Date(),
-          qualityScore: qualityScore(finalizeInput.report, finalizeInput.status),
-          memorySummary: summarizeReport(finalizeInput.report),
-        }).then(() => undefined))
+        }, async tx => {
+          if (manageSessionLifecycle) await updateAgentSession(tx, {
+            sessionId: session.id,
+            status: finalizeInput.status,
+            completedAt: new Date(),
+            qualityScore: qualityScore(finalizeInput.report, finalizeInput.status),
+            memorySummary: summarizeReport(finalizeInput.report),
+          })
+        })
         if (!owned) return false
         return true
       }
@@ -185,6 +203,7 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
         })
         if (!terminalized) return false
       }
+      if (!manageSessionLifecycle) return openSession === true
       const result = await withOpenSession(db, { sessionId: session.id, userId: input.userId }, tx => updateAgentSession(tx, {
         sessionId: session.id,
         status: finalizeInput.status,
@@ -198,6 +217,10 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
       assertActivated()
       const dualWrite = activation.getDualWrite()
       const taskId = role ? taskIdsByRole.get(role) : undefined
+      const openSession = !manageSessionLifecycle && !owner
+        ? await confirmOpenSession(db, session.id, input.userId)
+        : null
+      if (openSession === false) return false
       if (owner) {
         const owned = await withRunRecorderTerminalOwnership(db, {
           sessionId: session.id,
@@ -210,7 +233,7 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
             status: "waiting_for_user",
             failureReason: message,
           })
-          await updateAgentSession(tx, {
+          if (manageSessionLifecycle) await updateAgentSession(tx, {
             sessionId: session.id,
             status: "waiting_for_user",
             ...(taskId ? { currentTaskId: taskId } : {}),
@@ -232,6 +255,7 @@ export async function createRunSessionRecorder(db: AgentSessionDb, input: RunSes
         const terminalized = await dualWrite.finalize({ status: "waiting_for_user", finalResponse: message })
         if (!terminalized) return false
       }
+      if (!manageSessionLifecycle) return openSession === true
       const result = await withOpenSession(db, { sessionId: session.id, userId: input.userId }, tx => updateAgentSession(tx, {
         sessionId: session.id,
         status: "waiting_for_user",

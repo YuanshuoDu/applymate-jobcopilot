@@ -1,12 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { createHash } from "node:crypto"
 import { TurnStateRefreshRetryError } from "../turns/turn-execution-question.js"
-import { SCHEDULED_PIPELINE_COMPLETION, type TurnEngineCompletionGate } from "../turns/turn-execution-types.js"
-import { attachScheduledPipelineCompletion, completeScheduledPipelineBeforeTerminal } from "./scheduled-pipeline-completion.js"
+import { SCHEDULED_PIPELINE_COMPLETION, SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME, type TurnEngineCompletionGate } from "../turns/turn-execution-types.js"
+import { attachScheduledPipelineCompletion, completeScheduledPipelineBeforeTerminal,
+  type ScheduledPipelineGateContinuation } from "./scheduled-pipeline-completion.js"
+import type { ScheduledPipelineCandidate } from "./scheduled-pipeline-candidate-store.js"
 import { createScheduledAutomationGateContinuation } from "./scheduled-automation-gate-bridge.js"
-import { scheduledTaskGraphContinuationKey } from "./scheduled-pipeline-handoff.js"
+import { scheduledTaskGraphContinuationKey, type ScheduledPipelineAnalyzeCheckpointProof } from "./scheduled-pipeline-handoff.js"
 import { scheduledPrepareChoiceWaitId } from "../turns/turn-question-contract.js"
-import { SCHEDULED_PREPARE_COMPLETION_SCHEMA } from "./scheduled-prepare-task-graph-verification.js"
+import { SCHEDULED_PREPARE_COMPLETION_SCHEMA, scheduledPrepareResultDigest,
+  type ScheduledPrepareTaskGraphProof } from "./scheduled-prepare-task-graph-verification.js"
 import { SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_SCHEMA, scheduledTaskGraphStableContinuationKey } from "./scheduled-taskgraph-continuation-receipt.js"
+import { ROLE_RESULT_SCHEMA, type PrepareResult } from "./role-results.js"
+import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
 import type { ScheduledAutomationPipelineAttestation, ScheduledAutomationPipelineBridgeResult, ScheduledAutomationPipelineBridgeScope } from "./scheduled-automation-pipeline-bridge.js"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import type { TurnQuestionGateChoiceBinding } from "../turns/turn-question-gate-choice-contract.js"
@@ -35,32 +41,55 @@ const analyzeAttestation: ScheduledAutomationPipelineAttestation = {
     resultDigest: `sha256:${"4".repeat(64)}`, dependsOnTaskIds: ["scout-1"], jobIds: ["job-1"] },
   evidenceDigest: "5".repeat(64),
 }
-const analyzeProof = () => {
+const analyzeProof = (): ScheduledPipelineAnalyzeCheckpointProof => {
   const executionId = "execution-1", executionAttemptCount = 4
   return { status: "analyze_checkpointed", continuationKey: scheduledTaskGraphContinuationKey(owner, analyzeAttestation, executionId, executionAttemptCount),
     checkpointDigest: "b".repeat(64), claimTokenDigest: `sha256:${"c".repeat(64)}`, executionId, executionAttemptCount }
 }
-const readyPrepare = (choiceRequired = true) => {
+const readyPrepare = (choiceRequired = true): Readonly<{ status: "ready"; choice:
+  | Readonly<{ required: true; status: "answered"; scheduledWaitId: string }>
+  | Readonly<{ required: false }>; prepareProof: ScheduledPrepareTaskGraphProof }> => {
   const handoff = analyzeProof()
   const baseReceipt = { schemaVersion: SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_SCHEMA,
     owner: { ...owner, executionId: handoff.executionId, executionAttemptCount: handoff.executionAttemptCount },
     continuationKey: handoff.continuationKey, snapshotDigest: analyzeAttestation.snapshotDigest,
     evidenceDigest: analyzeAttestation.evidenceDigest, checkpointDigest: handoff.checkpointDigest,
     analyzeGraphRevision: analyzeAttestation.graphRevision, prepareScheduleRevision: analyzeAttestation.graphRevision + 1 }
-  const receipt = { ...baseReceipt, continuationKey: scheduledTaskGraphStableContinuationKey(baseReceipt)! }
-  const scheduledWaitId = scheduledPrepareChoiceWaitId({ receipt, finalStepId: "step-final", finalStepOrdinal: 3 })!
-  const nodes = [
-    { taskId: "scout-1", role: "scout", status: "completed" },
-    { taskId: "analyst-1", role: "analyst", status: "completed" },
-    { taskId: "prepare-1", role: "prepare", status: "completed" },
+  const continuationKey = scheduledTaskGraphStableContinuationKey(baseReceipt)
+  if (!continuationKey) throw new Error("invalid Prepare continuation receipt fixture")
+  const receipt: ScheduledPrepareTaskGraphProof["receipt"] = { ...baseReceipt, continuationKey }
+  const result: PrepareResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status: "completed", taskId: "prepare-1",
+    attemptCount: 1, snapshotDigest: analyzeAttestation.snapshotDigest, checkpointDigest: handoff.checkpointDigest,
+    jobs: [{ jobId: "job-1", status: "prepared" }], materials: [{ jobId: "job-1", kind: "resume", artifactRef: {
+      artifactId: "scheduled-draft:resume-1", version: 1, contentHash: `sha256:${"c".repeat(64)}`, sourceDigest: `sha256:${"d".repeat(64)}`,
+    } }] }
+  const nodes: ScheduledPrepareTaskGraphProof["completion"]["nodes"] = [
+    { taskId: "scout-1", attemptCount: 1, role: "scout", taskType: TASK_GRAPH_TEMPLATES.scout.taskType,
+      status: "completed", verification: "passed", dependsOnTaskIds: [] },
+    { taskId: "analyst-1", attemptCount: 1, role: "analyst", taskType: TASK_GRAPH_TEMPLATES.analyst.taskType,
+      status: "completed", verification: "passed", dependsOnTaskIds: ["scout-1"] },
+    { taskId: "prepare-1", attemptCount: 1, role: "prepare", taskType: TASK_GRAPH_TEMPLATES.prepare.taskType,
+      status: "completed", verification: "passed", dependsOnTaskIds: ["analyst-1"],
+      tool: "scheduled.application.prepare@1", resultDigest: scheduledPrepareResultDigest(result) },
   ]
-  return { status: "ready" as const, choice: choiceRequired ? { required: true as const, status: "answered" as const, scheduledWaitId } : { required: false as const }, prepareProof: { receipt,
-    completion: { schemaVersion: SCHEDULED_PREPARE_COMPLETION_SCHEMA, graphRevision: 4, nodes,
-      wait: { status: "ready", mode: "all", waitId: "graph-wait-1", targetTaskIds: ["prepare-1"], matchedTaskIds: ["prepare-1"] } },
-    result: { role: "prepare", status: "completed" } } }
+  const completion: ScheduledPrepareTaskGraphProof["completion"] = { schemaVersion: SCHEDULED_PREPARE_COMPLETION_SCHEMA,
+    graphRevision: 4, nodes, wait: { status: "ready", mode: "all", waitId: "graph-wait-1",
+      targetTaskIds: ["prepare-1"], matchedTaskIds: ["prepare-1"] } }
+  const prepareProof: ScheduledPrepareTaskGraphProof = { receipt, completion, result }
+  const scheduledWaitId = scheduledPrepareChoiceWaitId({ receipt, finalStepId: "step-final", finalStepOrdinal: 3 })
+  if (!scheduledWaitId) throw new Error("invalid scheduled Prepare choice fixture")
+  return { status: "ready", choice: choiceRequired ? { required: true, status: "answered", scheduledWaitId } : { required: false },
+    prepareProof }
 }
 const base = () => ({ executionOwner, rootAttemptCount: owner.rootAttemptCount,
-  finalStepId: "step-final", finalStepOrdinal: 3, stageCandidate: vi.fn(async () => undefined) })
+  finalStepId: "step-final", finalStepOrdinal: 3, recoveryStepId: "step-final", stageCandidate: vi.fn(async () => undefined) })
+const recoveredCandidate = (candidateText = "Final candidate"): ScheduledPipelineCandidate => ({
+  candidateText, finalStepId: "step-final", finalStepOrdinal: 3, finishReason: "stop", usage: null,
+  recoverySource: { owner: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId },
+    sourceEventId: "candidate-event-1", sourceStepId: "step-final", sourceStepOrdinal: 3,
+    rootAttemptCount: owner.rootAttemptCount, inputThroughSequence: "10" },
+  recoveryTail: null,
+})
 
 beforeEach(() => {
   gateContinuationMocks.selectResume.mockReset()
@@ -71,6 +100,221 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllEnvs())
 
 describe("scheduled pipeline pre-terminal completion", () => {
+  it("resumes only the exact recovered candidate's Audit child on the current active Step", async () => {
+    const candidate = recoveredCandidate(), signal = new AbortController().signal
+    const gate: TurnEngineCompletionGate = async () => ({ ok: false, blocker: "child_tasks_pending", feedback: "Audit is pending" })
+    const bridge = vi.fn(), fetcher = vi.fn<typeof fetch>(), stageCandidate = vi.fn(async () => undefined), onWebAccepted = vi.fn()
+    const continueAfterGate = vi.fn<ScheduledPipelineGateContinuation>(async input => {
+      expect(input).toEqual({ owner, executionOwner, mode: "resume_audit", finalStepId: "step-final",
+        recoveryStepId: "active-recovery-step", signal })
+      return { status: "waiting_for_dependency", waitId: "audit-wait-current" }
+    })
+    const attached = attachScheduledPipelineCompletion({ gate, owner, recoveredCandidate: candidate, bridge,
+      continueAfterGate, fetcher, onWebAccepted, stageCandidate, rootAttemptCount: owner.rootAttemptCount })
+    const resumeAudit = attached?.[SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME]
+    expect(resumeAudit).toBeDefined()
+
+    await expect(resumeAudit!({ identity: executionOwner, scope: {} as never, rootTaskId: owner.rootTaskId,
+      stepId: "active-recovery-step", stepOrdinal: 8, candidateText: candidate.candidateText, signal,
+      now: new Date("2026-10-25T12:00:00.000Z") }))
+      .resolves.toEqual({ status: "waiting_for_dependency", waitId: "audit-wait-current" })
+    expect(continueAfterGate).toHaveBeenCalledOnce()
+    expect(bridge).not.toHaveBeenCalled()
+    expect(fetcher).not.toHaveBeenCalled()
+    expect(stageCandidate).not.toHaveBeenCalled()
+    expect(onWebAccepted).toHaveBeenCalledOnce()
+  })
+
+  it("returns a completed Audit proof only to the canonical-gate retry", async () => {
+    const candidate = recoveredCandidate(), signal = new AbortController().signal
+    const gate: TurnEngineCompletionGate = async () => ({ ok: false, blocker: "child_tasks_pending", feedback: "Audit is pending" })
+    const bridge = vi.fn(), fetcher = vi.fn<typeof fetch>(), stageCandidate = vi.fn(async () => undefined), onWebAccepted = vi.fn()
+    const continueAfterGate = vi.fn<ScheduledPipelineGateContinuation>(async input => {
+      expect(input).toEqual({ owner, executionOwner, mode: "resume_audit", finalStepId: candidate.finalStepId,
+        recoveryStepId: "active-recovery-step", signal })
+      return { status: "completed" }
+    })
+    const attached = attachScheduledPipelineCompletion({ gate, owner, recoveredCandidate: candidate, bridge,
+      continueAfterGate, fetcher, onWebAccepted, stageCandidate, rootAttemptCount: owner.rootAttemptCount })
+    const resumeAudit = attached?.[SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME]
+    expect(resumeAudit).toBeDefined()
+
+    await expect(resumeAudit!({ identity: executionOwner, scope: {} as never, rootTaskId: owner.rootTaskId,
+      stepId: "active-recovery-step", stepOrdinal: 8, candidateText: candidate.candidateText, signal, now: new Date() }))
+      .resolves.toEqual({ status: "completed" })
+    expect(continueAfterGate).toHaveBeenCalledOnce()
+    expect(bridge).not.toHaveBeenCalled()
+    expect(fetcher).not.toHaveBeenCalled()
+    expect(stageCandidate).not.toHaveBeenCalled()
+    expect(onWebAccepted).toHaveBeenCalledOnce()
+  })
+
+  it("does not resume an Audit child for a changed candidate or foreign root owner", async () => {
+    const candidate = recoveredCandidate(), signal = new AbortController().signal
+    const gate: TurnEngineCompletionGate = async () => ({ ok: false, blocker: "child_tasks_pending", feedback: "Audit is pending" })
+    const continueAfterGate = vi.fn<ScheduledPipelineGateContinuation>(async () => ({ status: "completed" }))
+    const attached = attachScheduledPipelineCompletion({ gate, owner, recoveredCandidate: candidate,
+      bridge: vi.fn(), continueAfterGate, fetcher: vi.fn<typeof fetch>(), onWebAccepted: vi.fn(),
+      stageCandidate: vi.fn(async () => undefined), rootAttemptCount: owner.rootAttemptCount })
+    const resumeAudit = attached?.[SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME]
+    expect(resumeAudit).toBeDefined()
+    const input = { identity: executionOwner, scope: {} as never, rootTaskId: owner.rootTaskId,
+      stepId: "active-recovery-step", stepOrdinal: 8, candidateText: candidate.candidateText, signal, now: new Date() }
+
+    await expect(resumeAudit!({ ...input, candidateText: "Changed candidate" })).resolves.toEqual({ status: "not_applicable" })
+    await expect(resumeAudit!({ ...input, identity: { ...executionOwner, ownerId: "worker-foreign", leaseVersion: 6 } }))
+      .resolves.toEqual({ status: "not_applicable" })
+    expect(continueAfterGate).not.toHaveBeenCalled()
+  })
+
+  it("does not attach the Audit-only callback without both a recovered candidate and Gate continuation", () => {
+    const gate: TurnEngineCompletionGate = async () => ({ ok: true })
+    const shared = { gate, owner, bridge: async () => ready, fetcher: vi.fn<typeof fetch>(),
+      onWebAccepted: vi.fn(), stageCandidate: vi.fn(async () => undefined), rootAttemptCount: owner.rootAttemptCount }
+    const withoutCandidate = attachScheduledPipelineCompletion({ ...shared,
+      continueAfterGate: async () => ({ status: "completed" }) })
+    const withoutContinuation = attachScheduledPipelineCompletion({ ...shared, recoveredCandidate: recoveredCandidate() })
+    expect(withoutCandidate?.[SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME]).toBeUndefined()
+    expect(withoutContinuation?.[SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME]).toBeUndefined()
+  })
+
+  it.each([
+    { status: "not_registered" } as const,
+    { status: "blocked", errorCode: "scheduled_audit_resume_invalid" } as const,
+    { status: "gate_continuation", handoff: analyzeProof(), prepareProof: readyPrepare().prepareProof } as const,
+    { status: "waiting_for_choice", waitId: "gate-choice", question: "Choose", binding: {} as TurnQuestionGateChoiceBinding } as const,
+  ])("does not route unsupported Audit resume result to bridge, staging, or Web: $status", async outcome => {
+    const gate: TurnEngineCompletionGate = async () => ({ ok: false, blocker: "child_tasks_pending", feedback: "Audit is pending" })
+    const bridge = vi.fn(), fetcher = vi.fn<typeof fetch>(), stageCandidate = vi.fn(async () => undefined), onWebAccepted = vi.fn()
+    const continueAfterGate = vi.fn<ScheduledPipelineGateContinuation>(async () => outcome)
+    const attached = attachScheduledPipelineCompletion({ gate, owner, recoveredCandidate: recoveredCandidate(), bridge,
+      continueAfterGate, fetcher, onWebAccepted, stageCandidate, rootAttemptCount: owner.rootAttemptCount })
+    const resumeAudit = attached?.[SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME]
+    expect(resumeAudit).toBeDefined()
+
+    await expect(resumeAudit!({ identity: executionOwner, scope: {} as never, rootTaskId: owner.rootTaskId,
+      stepId: "active-recovery-step", stepOrdinal: 8, candidateText: "Final candidate", signal: new AbortController().signal,
+      now: new Date() })).resolves.toEqual({ status: "not_applicable" })
+    expect(continueAfterGate).toHaveBeenCalledOnce()
+    expect(bridge).not.toHaveBeenCalled()
+    expect(fetcher).not.toHaveBeenCalled()
+    expect(stageCandidate).not.toHaveBeenCalled()
+    expect(onWebAccepted).not.toHaveBeenCalled()
+  })
+
+  it("recovers an exact Audit completion before Web and stages the resumed candidate", async () => {
+    const stageCandidate = vi.fn(async () => undefined), bridge = vi.fn()
+    const continueAfterGate = vi.fn(async input => {
+      expect(input).toMatchObject({ owner, executionOwner, mode: "resume_audit", finalStepId: "step-final", recoveryStepId: "step-final" })
+      return { status: "completed" as const }
+    })
+    await expect(completeScheduledPipelineBeforeTerminal({ ...base(), stageCandidate, owner, candidateText: "Final.",
+      signal: new AbortController().signal, bridge, continueAfterGate, fetcher: vi.fn<typeof fetch>() }))
+      .resolves.toEqual({ status: "completed", candidateText: "Final." })
+    expect(stageCandidate).toHaveBeenCalledWith({ owner: executionOwner, rootAttemptCount: owner.rootAttemptCount,
+      finalStepId: "step-final", finalStepOrdinal: 3, candidateText: "Final." })
+    expect(bridge).not.toHaveBeenCalled()
+  })
+
+  it("stages the exact candidate before returning a recovered Audit dependency wait", async () => {
+    const stageCandidate = vi.fn(async () => undefined), bridge = vi.fn()
+    const continueAfterGate = vi.fn(async () => ({ status: "waiting_for_dependency" as const, waitId: "audit-wait" }))
+    await expect(completeScheduledPipelineBeforeTerminal({ ...base(), stageCandidate, owner, candidateText: "Final.",
+      signal: new AbortController().signal, bridge, continueAfterGate }))
+      .resolves.toEqual({ status: "waiting_for_dependency", waitId: "audit-wait", candidateText: "Final." })
+    expect(stageCandidate).toHaveBeenCalledOnce()
+    expect(bridge).not.toHaveBeenCalled()
+  })
+
+  it("reconstructs a persisted Gate continuation before Web and preserves its choice wait", async () => {
+    const prepared = readyPrepare(), handoff = { ...analyzeProof(), status: "analyze_checkpointed" as const },
+      scheduledWaitId = "agent-question:turn-1:canonical:root-wait"
+    const binding = {} as TurnQuestionGateChoiceBinding
+    const order: string[] = [], stageCandidate = vi.fn(async () => { order.push("stage") })
+    const bridge = vi.fn(async () => { order.push("bridge"); return { status: "ready" as const, attestation: analyzeAttestation } })
+    const fetcher = vi.fn<typeof fetch>()
+    const continueAfterGate = vi.fn(async input => {
+      if ("mode" in input && input.mode === "resume_audit") {
+        order.push("recover")
+        return { status: "gate_continuation" as const, handoff, prepareProof: prepared.prepareProof, scheduledWaitId }
+      }
+      order.push("gate")
+      expect(input).toMatchObject({ owner, executionOwner, attestation: analyzeAttestation, handoff,
+        prepareProof: prepared.prepareProof, scheduledWaitId, finalStepId: "step-final", recoveryStepId: "step-recovery" })
+      return { status: "waiting_for_choice" as const, waitId: "gate-question-wait",
+        question: "Choose a fixed option.", binding }
+    })
+
+    await expect(completeScheduledPipelineBeforeTerminal({ ...base(), recoveryStepId: "step-recovery", owner, candidateText: "Final candidate", stageCandidate,
+      signal: new AbortController().signal, bridge, continueAfterGate, fetcher }))
+      .resolves.toEqual({ status: "waiting_for_scheduled_gate_choice", waitId: "gate-question-wait",
+        question: "Choose a fixed option.", binding, candidateText: "Final candidate" })
+    expect(order).toEqual(["recover", "bridge", "stage", "gate"])
+    expect(stageCandidate).toHaveBeenCalledOnce()
+    expect(stageCandidate).toHaveBeenCalledWith({ owner: executionOwner, rootAttemptCount: owner.rootAttemptCount,
+      finalStepId: "step-final", finalStepOrdinal: 3, candidateText: "Final candidate" })
+    expect(fetcher).not.toHaveBeenCalled()
+    expect(continueAfterGate).toHaveBeenCalledTimes(2)
+    expect(continueAfterGate).toHaveBeenNthCalledWith(1, expect.objectContaining({ mode: "resume_audit",
+      finalStepId: "step-final", recoveryStepId: "step-recovery" }))
+  })
+
+  it("does not call the bridge or Web when Audit resume finds an orphan registration", async () => {
+    const bridge = vi.fn(), fetcher = vi.fn<typeof fetch>()
+    const readContext = vi.fn(async () => ({ status: "invalid" as const }))
+    const continueAfterGate = createScheduledAutomationGateContinuation({
+      pool: { connect: vi.fn() } as never,
+      commandPort: { readScheduledAuditResumeContext: readContext, verifyScheduledAuditCompletion: vi.fn() } as never,
+      waitPort: { wait: vi.fn() } as never, nativeQuestionWaitEnabled: false,
+    })
+    await expect(completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText: "Final.",
+      signal: new AbortController().signal, bridge, continueAfterGate, fetcher }))
+      .resolves.toEqual({ status: "blocked", errorCode: "scheduled_audit_resume_invalid" })
+    expect(readContext).toHaveBeenCalledOnce()
+    expect(bridge).not.toHaveBeenCalled()
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it("does not trust a bare Web completed report when Audit registration is absent", async () => {
+    const order: string[] = [], stageCandidate = vi.fn(async () => { order.push("stage") })
+    const continueAfterGate = vi.fn(async () => { order.push("resume"); return { status: "not_registered" as const } })
+    const bridge = vi.fn(async () => { order.push("bridge"); return ready })
+    const fetcher = vi.fn<typeof fetch>(async () => { order.push("web"); return response(200,
+      { status: "completed", report: { processed: 1, applied: 0, queued: 0, pending: 0, skipped: 1, failed: 0, durationMs: 1 } }) })
+    await expect(completeScheduledPipelineBeforeTerminal({ ...base(), stageCandidate, owner, candidateText: "Final.",
+      signal: new AbortController().signal, bridge, continueAfterGate, fetcher }))
+      .resolves.toEqual({ status: "blocked", errorCode: "scheduled_audit_not_registered" })
+    expect(order).toEqual(["resume", "bridge", "stage", "web", "resume"])
+    expect(stageCandidate).toHaveBeenCalledOnce()
+  })
+
+  it("rechecks Audit proof after a bare Web completed report before accepting completion", async () => {
+    const order: string[] = [], stageCandidate = vi.fn(async () => { order.push("stage") })
+    let recoveryCount = 0
+    const continueAfterGate = vi.fn(async () => {
+      recoveryCount += 1
+      order.push("resume")
+      return { status: recoveryCount === 1 ? "not_registered" as const : "completed" as const }
+    })
+    const bridge = vi.fn(async () => { order.push("bridge"); return ready })
+    const fetcher = vi.fn<typeof fetch>(async () => { order.push("web"); return response(200,
+      { status: "completed", report: { processed: 1, applied: 0, queued: 0, pending: 0, skipped: 1, failed: 0, durationMs: 1 } }) })
+    await expect(completeScheduledPipelineBeforeTerminal({ ...base(), stageCandidate, owner, candidateText: "Final.",
+      signal: new AbortController().signal, bridge, continueAfterGate, fetcher }))
+      .resolves.toEqual({ status: "completed", candidateText: "Final." })
+    expect(order).toEqual(["resume", "bridge", "stage", "web", "resume"])
+    expect(stageCandidate).toHaveBeenCalledOnce()
+  })
+
+  it("does not treat not-registered as a completed normal Gate continuation", async () => {
+    const prepared = readyPrepare(), fetcher = vi.fn<typeof fetch>(async (_url, init) => JSON.parse(String(init?.body)).prepareProof
+      ? response(200, { status: "gate_checkpointed" }) : response(200, analyzeProof()))
+    await expect(completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText: "Final.", signal: new AbortController().signal,
+      bridge: async () => ({ status: "ready", attestation: analyzeAttestation }), fetcher,
+      continueAfterAnalyze: async () => prepared, continueAfterGate: async () => ({ status: "not_registered" }) }))
+      .resolves.toEqual({ status: "blocked", errorCode: "scheduled_audit_not_registered" })
+  })
+
   it("posts the verified owner before returning the exact completed candidate", async () => {
     const order: string[] = [], stageCandidate = vi.fn(async (input: { candidateText: string }) => { order.push("stage"); expect(input.candidateText).toBe("  Exact final candidate.  ") })
     const bridge = vi.fn(async () => { order.push("bridge"); return ready })
@@ -98,7 +342,7 @@ describe("scheduled pipeline pre-terminal completion", () => {
     const signal = new AbortController().signal
     const continueAfterAnalyze = vi.fn(async input => {
       expect(input).toMatchObject({ owner, executionOwner, attestation: analyzeAttestation, proof, candidateText,
-        finalStepId: "step-final", finalStepOrdinal: 3, signal })
+        finalStepId: "step-final", finalStepOrdinal: 3, recoveryStepId: "step-final", signal })
       return { status: "waiting_for_dependency" as const, waitId: "agent-wait:prepare:exact" }
     })
     await expect(completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText, signal,
@@ -137,20 +381,28 @@ describe("scheduled pipeline pre-terminal completion", () => {
       ? response(200, { status: "gate_checkpointed" })
       : response(200, analyzeProof()))
     const continueAfterGate = vi.fn(async input => {
+      if (input.mode === "resume_audit") return { status: "not_registered" as const }
       expect(input).toMatchObject({ owner, executionOwner, attestation: analyzeAttestation, handoff: analyzeProof(),
         prepareProof: prepared.prepareProof, scheduledWaitId: prepared.choice.required ? prepared.choice.scheduledWaitId : undefined,
-        finalStepId: "step-final", signal })
+        finalStepId: "step-final", recoveryStepId: "step-recovery", signal })
       return { status: "waiting_for_dependency" as const, waitId: "agent-wait:gate:exact" }
     })
-    const result = await completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText, signal,
+    const continueAfterAnalyze = vi.fn(async input => {
+      expect(input).toMatchObject({ finalStepId: "step-final", finalStepOrdinal: 3, recoveryStepId: "step-recovery" })
+      return prepared
+    })
+    const result = await completeScheduledPipelineBeforeTerminal({ ...base(), recoveryStepId: "step-recovery", owner, candidateText, signal,
       bridge: async () => ({ status: "ready", attestation: analyzeAttestation }), fetcher,
-      continueAfterAnalyze: async () => prepared, continueAfterGate })
+      continueAfterAnalyze, continueAfterGate })
     expect(result).toEqual({ status: "waiting_for_dependency", waitId: "agent-wait:gate:exact", candidateText })
     expect(JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body))).toMatchObject({
       owner, attestation: analyzeAttestation, prepareProof: prepared.prepareProof,
       ...(prepared.choice.required ? { scheduledWaitId: prepared.choice.scheduledWaitId } : {}),
     })
-    expect(continueAfterGate).toHaveBeenCalledOnce()
+    expect(continueAfterGate).toHaveBeenCalledTimes(2)
+    expect(continueAfterAnalyze).toHaveBeenCalledOnce()
+    expect(continueAfterGate).toHaveBeenNthCalledWith(1, expect.objectContaining({ mode: "resume_audit",
+      finalStepId: "step-final", recoveryStepId: "step-recovery" }))
   })
 
   it("continues approval-disabled snapshots through the fixed Gate without a Prepare choice ID", async () => {
@@ -159,19 +411,33 @@ describe("scheduled pipeline pre-terminal completion", () => {
       ? response(200, { status: "gate_checkpointed" }) : response(200, analyzeProof()))
     const result = await completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText, signal,
       bridge: async () => ({ status: "ready", attestation: analyzeAttestation }), fetcher,
-      continueAfterAnalyze: async () => prepared, continueAfterGate: async () => ({ status: "completed" }) })
+      continueAfterAnalyze: async () => prepared, continueAfterGate: async input => "mode" in input && input.mode === "resume_audit"
+        ? { status: "not_registered" as const } : { status: "completed" as const } })
     expect(result).toEqual({ status: "completed", candidateText })
     expect(JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body))).toEqual({ owner, attestation: analyzeAttestation, prepareProof: prepared.prepareProof })
   })
 
-  it("carries a verified Execute wait through Gate completion and accepted-Web pause", async () => {
-    const prepared = readyPrepare(), waitId = "agent-question:turn-1:canonical:durable-42", signal = new AbortController().signal
+  it("waits on the exact Audit child after verifying Gate and pauses accepted-Web completion", async () => {
+    const prepared = readyPrepare(), auditWaitId = "durable-audit-wait", signal = new AbortController().signal
     const gateProof = { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1", graphRevision: 9,
       prepareProof: prepared.prepareProof, gate: { taskId: "gate-task", attemptCount: 1,
         resultDigest: `sha256:${"d".repeat(64)}`, completedEventRevision: 9 } }
+    const order: string[] = []
+    const appendAudit = vi.fn(async () => {
+      order.push("append-audit")
+      return { status: "accepted" as const, revision: 10,
+        nodes: [{ key: "scheduled_audit", taskId: "audit-task", status: "queued" as const }],
+        readyTaskIds: ["audit-task"], auditTaskId: "audit-task", expectedAttemptCount: 1 }
+    })
+    const waitAudit = vi.fn(async () => {
+      order.push("wait-audit")
+      return { status: "waiting" as const, waitId: auditWaitId,
+        deadlineAt: "2026-10-20T12:00:00.000Z", matchedTaskIds: [] }
+    })
+    const verifyAudit = vi.fn()
     const fetcher = vi.fn<typeof fetch>(async (_url, init) => {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>
-      if (body.action === "execute") return response(202, { status: "waiting_for_user", waitId })
+      if (body.action === "execute") throw new Error("Audit child owns the Execute continuation")
       if (body.prepareProof) return response(200, { status: "gate_checkpointed" })
       return response(200, analyzeProof())
     })
@@ -180,13 +446,28 @@ describe("scheduled pipeline pre-terminal completion", () => {
     const gateContinuation = createScheduledAutomationGateContinuation({
       pool: { connect: async () => ({ query: async () => ({ rows: [], rowCount: 1 }), release: () => undefined }) } as never,
       commandPort: {
-        appendScheduledGate: async () => ({ status: "accepted", revision: 5, nodes: [{ key: "gate", taskId: "gate-task" }], readyTaskIds: ["gate-task"] }),
-        resumeScheduledGateChoice: async () => ({ status: "accepted", taskId: "gate-task", requestAttemptCount: 1,
-          resumedAttemptCount: 2, revision: 6, readyTaskIds: ["gate-task"] }),
-        verifyScheduledGateCompletion: async () => gateProof,
+        readScheduledAuditResumeContext: vi.fn(async () => ({ status: "not_registered" as const })),
+        appendScheduledGate: vi.fn(async () => {
+          order.push("append-gate")
+          return { status: "accepted" as const, revision: 5, nodes: [{ key: "gate", taskId: "gate-task" }], readyTaskIds: ["gate-task"] }
+        }),
+        resumeScheduledGateChoice: vi.fn(async () => ({ status: "accepted" as const, taskId: "gate-task", requestAttemptCount: 1,
+          resumedAttemptCount: 2, revision: 6, readyTaskIds: ["gate-task"] })),
+        verifyScheduledGateCompletion: vi.fn(async () => {
+          order.push("verify-gate")
+          return gateProof
+        }),
+        appendScheduledAudit: appendAudit,
+        verifyScheduledAuditCompletion: verifyAudit,
       } as never,
-      waitPort: { waitScheduledGate: async () => ({ status: "ready", waitId: "gate-ready", matchedTaskIds: ["gate-task"] }) } as never,
-      nativeQuestionWaitEnabled: true, fetcher,
+      waitPort: {
+        waitScheduledGate: vi.fn(async () => {
+          order.push("wait-gate")
+          return { status: "ready" as const, waitId: "gate-ready", matchedTaskIds: ["gate-task"] }
+        }),
+        wait: waitAudit,
+      } as never,
+      nativeQuestionWaitEnabled: true,
     })
     const gate = (async () => ({ ok: true as const })) as unknown as TurnEngineCompletionGate
     const accepted = vi.fn(), stageCandidate = vi.fn(async () => undefined)
@@ -198,11 +479,24 @@ describe("scheduled pipeline pre-terminal completion", () => {
 
     await expect(complete!({ identity: executionOwner, scope: {} as never, rootTaskId: owner.rootTaskId,
       stepId: "step-final", stepOrdinal: 3, candidateText: "Final candidate", signal, now: new Date() } as never))
-      .resolves.toEqual({ status: "waiting_for_external_user", externalWaitId: waitId, candidateText: "Final candidate" })
+      .resolves.toEqual({ status: "waiting_for_dependency", waitId: auditWaitId, candidateText: "Final candidate" })
     expect(accepted).toHaveBeenCalledOnce()
     expect(stageCandidate).toHaveBeenCalledOnce()
-    expect(fetcher).toHaveBeenCalledTimes(3)
-    expect(JSON.parse(String(fetcher.mock.calls[2]?.[1]?.body))).toMatchObject({ action: "execute", gateCompletionProof: gateProof })
+    expect(fetcher).toHaveBeenCalledTimes(2)
+    expect(fetcher.mock.calls.map(([, init]) => JSON.parse(String(init?.body)) as Record<string, unknown>)
+      .some(body => body.action === "execute")).toBe(false)
+    expect(appendAudit).toHaveBeenCalledWith(expect.objectContaining({
+      executionOwner: { executionId: "execution-1", executionAttemptCount: 4 },
+      handoff: analyzeProof(), attestation: analyzeAttestation, gateProof,
+      scheduledWaitId: prepared.choice.required ? prepared.choice.scheduledWaitId : undefined,
+    }))
+    const auditWaitKey = `scheduled-audit-wait:${createHash("sha256")
+      .update(JSON.stringify(["audit-task", "step-final", 1]), "utf8").digest("hex")}`
+    expect(waitAudit).toHaveBeenCalledWith({ userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
+      stepId: "step-final", taskId: owner.rootTaskId, rootTaskId: owner.rootTaskId,
+      targetTaskIds: ["audit-task"], mode: "all", timeoutMs: 24 * 60 * 60 * 1_000, idempotencyKey: auditWaitKey })
+    expect(order).toEqual(["append-gate", "wait-gate", "verify-gate", "append-audit", "wait-audit"])
+    expect(verifyAudit).not.toHaveBeenCalled()
   })
 
   it("rejects the legacy completed response instead of skipping the fixed Gate", async () => {
@@ -223,7 +517,8 @@ describe("scheduled pipeline pre-terminal completion", () => {
     await expect(completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText: "Final.", signal: new AbortController().signal,
       bridge: async () => ({ status: "ready", attestation: analyzeAttestation }), fetcher,
       continueAfterAnalyze: async () => prepared,
-      continueAfterGate: async () => ({ status: "waiting_for_choice", waitId: "gate-question-wait", question: "Choose a fixed option.", binding }) }))
+      continueAfterGate: async input => "mode" in input && input.mode === "resume_audit" ? { status: "not_registered" as const }
+        : { status: "waiting_for_choice" as const, waitId: "gate-question-wait", question: "Choose a fixed option.", binding } }))
       .resolves.toEqual({ status: "waiting_for_scheduled_gate_choice", waitId: "gate-question-wait", candidateText: "Final.",
         question: "Choose a fixed option.", binding })
   })

@@ -7,9 +7,15 @@ import { parseScheduledTaskGraphPrepareProof, scheduledTaskGraphAnalyzeCheckpoin
 import { loadScheduledTaskGraphGateMaterials } from './scheduled-taskgraph-gate-materials'
 import { scheduledTaskGraphGateBindingIsCurrent, scheduledTaskGraphGateHistoryIsCurrent } from './scheduled-taskgraph-gate-history'
 import { parseScheduledTaskGraphGateResult, type ScheduledTaskGraphGateResult } from './scheduled-taskgraph-gate-service'
-
+import { lockScheduledTaskGraphAuditChildFence, lockScheduledTaskGraphAuditCompletedReportChildFence,
+  scheduledTaskGraphAuditTaskMatches, type ScheduledTaskGraphAuditActor } from './scheduled-taskgraph-audit-child-fence'
+type AuditChildFenceLock = typeof lockScheduledTaskGraphAuditChildFence
 const CONTINUATION_SCHEMA = 'agent-harness.v2.scheduled-pipeline-continuation.v1'
 const COMPLETION_SCHEMA = 'agent-harness.v2.scheduled-taskgraph-prepare-completion.v1'
+const AUDIT_GOAL = 'Return the exact report from the authenticated scheduled Audit continuation after Gate completion.'
+const AUDIT_CRITERIA = ['Continue the exact scheduled execution only after its canonical Gate proof is verified.',
+  'Return only the fixed seven-field report without adding actions or interpreting historical counts.',
+  'Never submit applications or invoke model or tool runtimes.']
 const DIGEST = /^sha256:[a-f0-9]{64}$/
 const ID = /^[^\u0000-\u001f\u007f]{1,256}$/
 export type ScheduledTaskGraphGateInputRequest = Readonly<{
@@ -20,12 +26,12 @@ export type ScheduledTaskGraphGateInputRequest = Readonly<{
   prepareProof: unknown
   gate?: Readonly<{ taskId: string; attemptCount: number; phase: 'running' | 'completed'; completionProof?: unknown }>
 }>
+export type ScheduledTaskGraphAuditChildGateInputRequest = ScheduledTaskGraphGateInputRequest & Readonly<{ auditActor: ScheduledTaskGraphAuditActor }>
 export type ScheduledTaskGraphGateInput = Readonly<{
   packages: readonly ScheduledTaskGraphPreparedPackageRow[]
   materials: readonly ScheduledTaskGraphPreparedMaterialRow[]
   gateResult?: ScheduledTaskGraphGateResult
 }>
-
 /** Reconstructs immutable Analyze facts from an allowed persisted Gate-family stage. */
 export function scheduledTaskGraphAnalyzeCheckpointForGate(value: unknown): Record<string, unknown> | null {
   const checkpoint = record(value)
@@ -33,12 +39,16 @@ export function scheduledTaskGraphAnalyzeCheckpointForGate(value: unknown): Reco
   if (!checkpoint || stage !== 'prepare' && stage !== 'gate' && stage !== 'execute' && stage !== 'audit') return null
   return checkpoint.nextStage === 'prepare' ? checkpoint : { ...checkpoint, nextStage: 'prepare' }
 }
-
 /** Rechecks the exact Worker proof while the caller's Gate checkpoint transaction holds proof-row locks. */
-export async function isScheduledTaskGraphGateProofCurrent(
-  input: ScheduledTaskGraphGateInputRequest,
-  tx: Prisma.TransactionClient,
-): Promise<boolean> {
+export function isScheduledTaskGraphGateProofCurrent(input: ScheduledTaskGraphGateInputRequest, tx: Prisma.TransactionClient): Promise<boolean> {
+  return gateProofCurrent(input, tx)
+}
+export function isScheduledTaskGraphAuditChildGateProofCurrent(input: ScheduledTaskGraphAuditChildGateInputRequest,
+  tx: Prisma.TransactionClient): Promise<boolean> { return gateProofCurrent(input, tx, input.auditActor) }
+export function isScheduledTaskGraphAuditCompletedReportGateProofCurrent(input: ScheduledTaskGraphAuditChildGateInputRequest,
+  tx: Prisma.TransactionClient): Promise<boolean> { return gateProofCurrent(input, tx, input.auditActor, lockScheduledTaskGraphAuditCompletedReportChildFence) }
+async function gateProofCurrent(input: ScheduledTaskGraphGateInputRequest, tx: Prisma.TransactionClient,
+  auditActor?: ScheduledTaskGraphAuditActor, auditFence: AuditChildFenceLock = lockScheduledTaskGraphAuditChildFence): Promise<boolean> {
   try {
     const owner = parseOwner(input.owner), snapshot = parseScheduledAutomationSnapshot(input.snapshot)
     const checkpoint = scheduledTaskGraphAnalyzeCheckpointForGate(input.analyzeCheckpoint), marker = exactRecord(checkpoint?.scheduledTaskGraphContinuation,
@@ -50,12 +60,17 @@ export async function isScheduledTaskGraphGateProofCurrent(
     const proof = parseScheduledTaskGraphPrepareProof(input.prepareProof)
     return Boolean(proof && proof.result.snapshotDigest === marker.snapshotDigest
       && proof.result.checkpointDigest === checkpointDigest
-      && await verifyCurrentTaskGraph(owner, marker, checkpointDigest, input.analyzeAttestation, proof, tx, input.gate, true))
+      && await verifyCurrentTaskGraph(owner, marker, checkpointDigest, input.analyzeAttestation, proof, tx, input.gate, true, auditActor, auditFence))
   } catch { return false }
 }
-
 /** Revalidates the live TaskGraph before reloading proof-named materials for Gate. */
-export async function loadScheduledTaskGraphGateInput(input: ScheduledTaskGraphGateInputRequest): Promise<ScheduledTaskGraphGateInput | null> {
+export function loadScheduledTaskGraphGateInput(input: ScheduledTaskGraphGateInputRequest): Promise<ScheduledTaskGraphGateInput | null> {
+  return loadGateInput(input)
+}
+export function loadScheduledTaskGraphAuditChildGateInput(input: ScheduledTaskGraphAuditChildGateInputRequest): Promise<ScheduledTaskGraphGateInput | null> {
+  return loadGateInput(input, input.auditActor)
+}
+async function loadGateInput(input: ScheduledTaskGraphGateInputRequest, auditActor?: ScheduledTaskGraphAuditActor): Promise<ScheduledTaskGraphGateInput | null> {
   try {
     const owner = parseOwner(input.owner), snapshot = parseScheduledAutomationSnapshot(input.snapshot)
     const checkpoint = scheduledTaskGraphAnalyzeCheckpointForGate(input.analyzeCheckpoint), marker = exactRecord(checkpoint?.scheduledTaskGraphContinuation,
@@ -64,10 +79,11 @@ export async function loadScheduledTaskGraphGateInput(input: ScheduledTaskGraphG
     if (!owner || !snapshot || !checkpoint || !marker
       || marker.schemaVersion !== CONTINUATION_SCHEMA || !sameLineageOwner(parseOwner(marker.owner), owner)
       || marker.snapshotDigest !== scheduledAutomationSnapshotDigest(snapshot) || !checkpointDigest) return null
-
     const proof = parseScheduledTaskGraphPrepareProof(input.prepareProof)
     if (!proof || proof.result.snapshotDigest !== marker.snapshotDigest || proof.result.checkpointDigest !== checkpointDigest
-      || !await verifyCurrentTaskGraph(owner, marker, checkpointDigest, input.analyzeAttestation, proof, db, input.gate)) return null
+      || !await (auditActor ? db.$transaction(tx => verifyCurrentTaskGraph(owner, marker, checkpointDigest, input.analyzeAttestation,
+        proof, tx, input.gate, true, auditActor)) : verifyCurrentTaskGraph(owner, marker, checkpointDigest,
+        input.analyzeAttestation, proof, db, input.gate))) return null
     const loaded = await loadScheduledTaskGraphGateMaterials({ owner, scoredJobs: checkpoint.scoredJobs,
       minScore: snapshot.minScore, dailyCap: snapshot.dailyCap, taskId: proof.result.taskId,
       jobs: proof.result.jobs, materials: proof.result.materials })
@@ -79,10 +95,11 @@ export async function loadScheduledTaskGraphGateInput(input: ScheduledTaskGraphG
     return gateResult?.status === 'completed' ? { ...loaded, gateResult } : null
   } catch { return null }
 }
-
 async function verifyCurrentTaskGraph(owner: ScheduledTaskGraphPipelineOwner, marker: Record<string, unknown>, checkpointDigest: string,
   attestationValue: unknown, proof: ParsedScheduledTaskGraphPrepareProof, reader: Prisma.TransactionClient,
-  gate?: ScheduledTaskGraphGateInputRequest['gate'], lockRows = false): Promise<boolean> {
+  gate?: ScheduledTaskGraphGateInputRequest['gate'], lockRows = false, auditActor?: ScheduledTaskGraphAuditActor,
+  auditFence: AuditChildFenceLock = lockScheduledTaskGraphAuditChildFence): Promise<boolean> {
+  if (auditActor && !await auditFence(reader, { owner, auditActor })) return false
   const { receipt, nodes } = proof, attestation = record(attestationValue), attestedOwner = record(attestation?.owner)
   const scoutProof = record(attestation?.scout), analystProof = record(attestation?.analyst)
   if (!attestation || !attestedOwner || !scoutProof || !analystProof || attestation.snapshotDigest !== marker.snapshotDigest
@@ -95,8 +112,8 @@ async function verifyCurrentTaskGraph(owner: ScheduledTaskGraphPipelineOwner, ma
     || receipt.checkpointDigest !== checkpointDigest || receipt.analyzeGraphRevision !== marker.graphRevision
     || receipt.prepareScheduleRevision !== Number(marker.graphRevision) + 1 || receipt.continuationKey !== stableReceiptKey(owner, receipt)) return false
   if (gate && !await scheduledTaskGraphGateBindingIsCurrent({ reader, owner, marker, checkpointDigest, proof, gate })) return false
+  let lockedTaskCount: number | null = null
   if (lockRows) {
-    const taskIds = [owner.rootTaskId, ...nodes.map(node => node.taskId), ...(gate ? [gate.taskId] : [])]
     const graphLocks = await reader.$queryRaw<Array<{ id: string }>>(Prisma.sql`
       SELECT "id" FROM "agent_items"
       WHERE "id" = ${taskGraphItemId(owner.rootTaskId)} AND "sessionId" = ${owner.sessionId}
@@ -106,7 +123,6 @@ async function verifyCurrentTaskGraph(owner: ScheduledTaskGraphPipelineOwner, ma
     const taskLocks = await reader.$queryRaw<Array<{ id: string }>>(Prisma.sql`
       SELECT "id" FROM "sub_agent_tasks"
       WHERE "sessionId" = ${owner.sessionId} AND "turnId" = ${owner.turnId} AND "rootTaskId" = ${owner.rootTaskId}
-        AND "id" IN (${Prisma.join(taskIds)})
       ORDER BY "id" FOR UPDATE
     `)
     const receiptLocks = await reader.$queryRaw<Array<{ id: string }>>(Prisma.sql`
@@ -115,32 +131,36 @@ async function verifyCurrentTaskGraph(owner: ScheduledTaskGraphPipelineOwner, ma
         AND "type" = 'agent.plan.scheduled_prepare_binding' AND "itemId" IS NULL AND "taskId" IS NULL AND "actor" = 'system'
       ORDER BY "id" FOR UPDATE
     `)
-    if (graphLocks.length !== 1 || taskLocks.length !== (gate ? 5 : 4) || receiptLocks.length !== 1) return false
+    if (graphLocks.length !== 1 || (gate ? taskLocks.length < 5 || taskLocks.length > 6 : taskLocks.length !== 4)
+      || receiptLocks.length !== 1) return false
+    lockedTaskCount = taskLocks.length
   }
   const [graph, tasks, receipts] = await Promise.all([
     reader.agentItem.findFirst({ where: { id: taskGraphItemId(owner.rootTaskId), sessionId: owner.sessionId, turnId: owner.turnId,
       taskId: owner.rootTaskId, type: 'task_graph', session: { is: { userId: owner.userId } }, turn: { is: { userId: owner.userId, rootTaskId: owner.rootTaskId } } },
     select: { id: true, sessionId: true, turnId: true, taskId: true, type: true, revision: true, content: true } }),
-    reader.subAgentTask.findMany({ where: { id: { in: [owner.rootTaskId, ...nodes.map(node => node.taskId), ...(gate ? [gate.taskId] : [])] }, sessionId: owner.sessionId, turnId: owner.turnId,
+    reader.subAgentTask.findMany({ where: { sessionId: owner.sessionId, turnId: owner.turnId,
       rootTaskId: owner.rootTaskId, session: { is: { userId: owner.userId } } },
     select: { id: true, sessionId: true, turnId: true, rootTaskId: true, parentTaskId: true, status: true, role: true,
       taskType: true, attemptCount: true, maxAttempts: true, failureReason: true, result: true, depth: true,
-      expectedOutputSchema: true, allowedActions: true } }),
+      expectedOutputSchema: true, allowedActions: true, context: true } }),
     reader.agentEvent.findMany({ where: { sessionId: owner.sessionId, turnId: owner.turnId, type: 'agent.plan.scheduled_prepare_binding',
       itemId: null, taskId: null, actor: 'system', session: { is: { userId: owner.userId } }, turn: { is: { userId: owner.userId, rootTaskId: owner.rootTaskId } } },
     select: { payload: true }, take: 2 }),
   ])
   if (!graph || graph.id !== taskGraphItemId(owner.rootTaskId) || graph.sessionId !== owner.sessionId || graph.turnId !== owner.turnId
     || graph.taskId !== owner.rootTaskId || graph.type !== 'task_graph'
-    || (!gate && graph.revision !== proof.graphRevision) || tasks.length !== (gate ? 5 : 4) || receipts.length !== 1
+    || (!gate && graph.revision !== proof.graphRevision) || receipts.length !== 1
     || !sameJson(receipts[0]?.payload, receipt)) return false
   const content = record(graph.content), graphNodes = denseArray(content?.nodes)?.map(record), roles = ['scout', 'analyst', 'prepare']
-  if (content?.schemaVersion !== 'agent-harness.v2.task-graph' || !graphNodes || graphNodes.length !== (gate ? 4 : 3)
+  if (content?.schemaVersion !== 'agent-harness.v2.task-graph' || !graphNodes
+    || (!gate && graphNodes.length !== 3) || (gate && graphNodes.length !== 4 && graphNodes.length !== 5)
+    || tasks.length !== graphNodes.length + 1 || lockedTaskCount !== null && lockedTaskCount !== tasks.length
     || new Set(nodes.map(node => node.taskId)).size !== 3) return false
   const byTask = uniqueMap(tasks, task => task.id)
   const root = byTask?.get(owner.rootTaskId)
   if (!byTask || !root || root.attemptCount !== owner.rootAttemptCount || root.parentTaskId !== null
-    || root.status !== 'running' || root.failureReason !== null) return false
+    || root.status !== 'running' && !(auditActor && root.status === 'waiting') || root.failureReason !== null) return false
   for (let i = 0; i < 3; i += 1) {
     const proofNode = nodes[i]!, graphNode = graphNodes[i], role = roles[i]!, task = byTask.get(proofNode.taskId)
     const dependencies = i === 0 ? [] : [String(graphNodes[i - 1]?.key)]
@@ -168,12 +188,30 @@ async function verifyCurrentTaskGraph(owner: ScheduledTaskGraphPipelineOwner, ma
       || !Number.isSafeInteger(gateTask.maxAttempts) || gateTask.maxAttempts < 1 || gateTask.failureReason !== null
       || !Array.isArray(gateTask.allowedActions) || gateTask.allowedActions.length !== 0
       || !sameJson(gateTask.expectedOutputSchema, { schemaVersion: 'agent-harness.v2.subagent.result', role: 'prepare', taskType: 'scheduled_taskgraph_gate' })
-      || !await scheduledTaskGraphGateHistoryIsCurrent({ reader, owner, prepareGraphRevision: proof.graphRevision,
-        prepareAttemptCount: proof.nodes[2].attemptCount, graphRevision: graph.revision, graphContent: graph.content,
+      ) return false
+    const hasAudit = graphNodes.length === 5, auditNode = hasAudit ? graphNodes[4] : null
+    const auditTask = auditNode && typeof auditNode.taskId === 'string' ? record(byTask.get(auditNode.taskId)) : null
+    const auditTaskInfo = auditTask && typeof auditTask.id === 'string' && typeof auditTask.status === 'string'
+      && typeof auditTask.attemptCount === 'number' ? { id: auditTask.id, status: auditTask.status, attemptCount: auditTask.attemptCount } : undefined
+    if (hasAudit && (gate.phase !== 'completed' || !auditNode || !auditTask || !auditTaskInfo
+      || !validScheduledAuditNode(auditNode, auditTaskInfo.id) || !scheduledTaskGraphAuditTaskMatches(auditTask, owner))) return false
+    if (auditActor && (auditNode?.taskId !== auditActor.taskId || auditTask?.status !== 'running'
+      || auditTask.attemptCount !== auditActor.attemptCount)) return false
+    if (!await scheduledTaskGraphGateHistoryIsCurrent({ reader, owner, prepareGraphRevision: proof.graphRevision,
+        prepareTaskId: proof.nodes[2].taskId, prepareAttemptCount: proof.nodes[2].attemptCount,
+        graphRevision: graph.revision, graphContent: graph.content,
         gateTask: { id: gateTask.id, status: gateTask.status, attemptCount: gateTask.attemptCount, maxAttempts: gateTask.maxAttempts, result: gateTask.result },
-        gate, expectedJobIds: proof.result.jobs.filter(job => job.status === 'prepared').map(job => job.jobId) })) return false
+        gate, expectedJobIds: proof.result.jobs.filter(job => job.status === 'prepared').map(job => job.jobId),
+        ...(auditTaskInfo ? { auditTask: auditTaskInfo } : {}) })) return false
   }
   return true
+}
+
+function validScheduledAuditNode(node: Record<string, unknown>, taskId: string): boolean {
+  return Boolean(exactRecord(node, ['key', 'templateId', 'goal', 'successCriteria', 'dependsOn', 'depth', 'taskId', 'verificationDisposition'])
+    && node.key === 'scheduled_audit' && node.templateId === 'scheduled_audit' && node.taskId === taskId && node.depth === 5
+    && sameStrings(node.dependsOn, ['gate']) && node.verificationDisposition === 'specialized'
+    && node.goal === AUDIT_GOAL && sameJson(node.successCriteria, AUDIT_CRITERIA))
 }
 
 function verifiedReport(report: Record<string, unknown> | null, node: Record<string, unknown>, attestation: Record<string, unknown>): boolean {

@@ -37,6 +37,7 @@ export const RESET_NATIVE_SEMANTIC_PROGRESS: unique symbol = Symbol("reset-nativ
 export const TASK_GRAPH_DENIAL_CHECKPOINT: unique symbol = Symbol("task-graph-denial-checkpoint")
 export const READ_TASK_GRAPH_DENIAL_CHECKPOINT: unique symbol = Symbol("read-task-graph-denial-checkpoint")
 export const SCHEDULED_PIPELINE_COMPLETION: unique symbol = Symbol("scheduled-pipeline-completion")
+export const SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME: unique symbol = Symbol("scheduled-pipeline-existing-audit-resume")
 
 export type ScheduledPipelineCompletionDisposition =
   | Readonly<{ status: "completed"; candidateText: string }>
@@ -48,6 +49,25 @@ export type ScheduledPipelineCompletionDisposition =
   /** A Web-owned question; its ID is never the Worker-owned Prepare choice ID. */
   | Readonly<{ status: "waiting_for_external_user"; externalWaitId: string; scheduledWaitId?: string; candidateText: string }>
   | Readonly<{ status: "blocked"; errorCode: string }>
+
+export type ScheduledPipelineExistingAuditResumeDisposition = Readonly<{ status: "not_applicable" }>
+  | Readonly<{ status: "waiting_for_dependency"; waitId: string }> | Readonly<{ status: "completed" }>
+
+export function parseScheduledPipelineExistingAuditResumeDisposition(value: unknown): ScheduledPipelineExistingAuditResumeDisposition | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null
+  try {
+    if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return null
+    const keys = Reflect.ownKeys(value), record = value as Record<string, unknown>
+    if (keys.some(key => {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key)
+      return typeof key !== "string" || !descriptor?.enumerable || !("value" in descriptor)
+    })) return null
+    if (keys.length === 1 && keys[0] === "status" && (record.status === "not_applicable" || record.status === "completed")) return { status: record.status }
+    if (record.status === "waiting_for_dependency" && keys.length === 2 && keys.includes("status") && keys.includes("waitId")
+      && typeof record.waitId === "string" && record.waitId.trim() === record.waitId && record.waitId.length > 0 && record.waitId.length <= 128) return { status: "waiting_for_dependency", waitId: record.waitId }
+    return null
+  } catch { return null }
+}
 
 export function parseScheduledPipelineCompletionDisposition(value: unknown): ScheduledPipelineCompletionDisposition | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null
@@ -118,6 +138,10 @@ export type TurnEngineCompletionGateResult =
       readonly [TASK_GRAPH_DENIAL_CHECKPOINT]?: TaskGraphDenialCheckpoint }
       & { readonly [TASK_GRAPH_FINAL_SUMMARY_BINDING]?: TaskGraphFinalSummaryBinding })
 
+type ScheduledPipelineCompletionCallbackInput = Readonly<{
+  identity: TurnExecutionIdentity; scope: TenantScope; rootTaskId: string; stepId: string; stepOrdinal: number
+  candidateText: string; signal: AbortSignal; now: Date; isOwnershipLost?: (error: unknown, signal: AbortSignal) => boolean
+}>
 export type TurnEngineCompletionGate = ((input: {
   readonly identity: TurnExecutionIdentity
   readonly scope: TenantScope
@@ -130,18 +154,8 @@ export type TurnEngineCompletionGate = ((input: {
 }) => Promise<TurnEngineCompletionGateResult> | TurnEngineCompletionGateResult) & {
   [RESET_NATIVE_SEMANTIC_PROGRESS]?: () => void
   [READ_TASK_GRAPH_DENIAL_CHECKPOINT]?: (client?: TurnEngineQueryClient) => Promise<TaskGraphDenialCheckpoint | null>
-  [SCHEDULED_PIPELINE_COMPLETION]?: (input: {
-    readonly identity: TurnExecutionIdentity
-    readonly scope: TenantScope
-    readonly rootTaskId: string
-    readonly stepId: string
-    readonly stepOrdinal: number
-    /** Exact verified response candidate staged before terminal Turn persistence. */
-    readonly candidateText: string
-    readonly signal: AbortSignal
-    readonly now: Date
-    readonly isOwnershipLost?: (error: unknown, signal: AbortSignal) => boolean
-  }) => Promise<ScheduledPipelineCompletionDisposition> | ScheduledPipelineCompletionDisposition
+  [SCHEDULED_PIPELINE_COMPLETION]?: (input: ScheduledPipelineCompletionCallbackInput) => Promise<ScheduledPipelineCompletionDisposition> | ScheduledPipelineCompletionDisposition
+  [SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME]?: (input: ScheduledPipelineCompletionCallbackInput) => Promise<ScheduledPipelineExistingAuditResumeDisposition> | ScheduledPipelineExistingAuditResumeDisposition
 }
 
 export type TurnExecutionStepBudget = { readonly remainingTurnSteps?: number }

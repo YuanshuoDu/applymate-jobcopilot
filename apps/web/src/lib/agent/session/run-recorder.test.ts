@@ -234,6 +234,102 @@ describe("run session recorder", () => {
     expect(db.agentSession.update).not.toHaveBeenCalled()
   })
 
+  it.each(["completed", "failed"] as const)("keeps Session lifecycle with Root during owned Audit %s while preserving writes", async status => {
+    const { db, tx } = mockDb({ sessionStatus: "paused" })
+    const recorder = await createRunSessionRecorder(db, {
+      userId: "user_1", goal: "Canonical Root owns lifecycle", sessionId: "session_1", turnId: "turn_1",
+      manageV2Lifecycle: false, manageSessionLifecycle: false, deferActivation: true,
+    })
+    const assertCurrent = vi.fn(async () => true)
+    await expect(recorder.record("usage", { inputTokens: 23, outputTokens: 8, estimatedCostUsd: 0.004 }))
+      .rejects.toThrow("must be activated after claiming")
+    await expect(recorder.activate({ executionAttempt: { id: "execution_1", attemptCount: 3 }, assertCurrent: async () => false }))
+      .resolves.toBe(false)
+    expect(db.agentSession.updateMany).not.toHaveBeenCalled()
+    await expect(recorder.activate({ executionAttempt: { id: "execution_1", attemptCount: 3 }, assertCurrent }))
+      .resolves.toBe(true)
+    expect(assertCurrent).toHaveBeenCalled()
+    expect(db.agentSession.updateMany).not.toHaveBeenCalled()
+
+    const usage = { inputTokens: 23, outputTokens: 8, estimatedCostUsd: 0.004 }
+    await recorder.record("usage", usage)
+    expect(tx.agentTranscriptEvent.create).toHaveBeenCalledWith({ data: expect.objectContaining({
+      type: "subagent_result", data: { event: "usage", payload: {
+        inputTokens: "[REDACTED]", outputTokens: "[REDACTED]", estimatedCostUsd: usage.estimatedCostUsd,
+      } },
+    }) })
+    tx.agentExecution.updateMany.mockClear()
+    db.agentSession.update.mockClear()
+    const report = status === "completed"
+      ? { processed: 2, applied: 1, queued: 0, pending: 0, skipped: 1, failed: 0, durationMs: 10 }
+      : null
+
+    await expect(recorder.finalize({ status, report, owner: {
+      turnId: "turn_1", executionAttempt: { id: "execution_1", userId: "user_1", attemptCount: 3 }, terminalStatus: status,
+    } })).resolves.toBe(true)
+
+    expect(tx.$queryRaw.mock.calls.map(([query]) => queryText(query)).join(" ")).toContain('FROM "agent_sessions"')
+    expect(tx.$queryRaw.mock.calls.map(([query]) => queryText(query)).join(" ")).toContain('FROM "agent_turns"')
+    expect(tx.agentExecution.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ id: "execution_1", attemptCount: 3, status }),
+    }))
+    expect(db.agentSession.update).not.toHaveBeenCalled()
+    expect(db.agentSession.updateMany).not.toHaveBeenCalled()
+  })
+
+  it("keeps an owned Audit pause behind Root lifecycle while retaining the execution transition", async () => {
+    const { db, tx } = mockDb({ sessionStatus: "running" })
+    const recorder = await createRunSessionRecorder(db, {
+      userId: "user_1", goal: "Canonical Root owns pause", sessionId: "session_1", turnId: "turn_1",
+      manageV2Lifecycle: false, manageSessionLifecycle: false, deferActivation: true,
+    })
+    await recorder.activate({ executionAttempt: { id: "execution_1", attemptCount: 4 }, assertCurrent: async () => true })
+    db.agentSession.update.mockClear()
+    db.agentSession.updateMany.mockClear()
+    tx.agentExecution.updateMany.mockClear()
+
+    await expect(recorder.pause("Audit child is waiting", undefined, {
+      turnId: "turn_1", executionAttempt: { id: "execution_1", userId: "user_1", attemptCount: 4 },
+      terminalStatus: "running", executionTransitionTo: "waiting_for_user",
+    })).resolves.toBe(true)
+
+    expect(tx.agentExecution.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ id: "execution_1", attemptCount: 4, status: "running" }),
+      data: expect.objectContaining({ status: "waiting_for_user" }),
+    }))
+    expect(tx.agentTurn.updateMany).not.toHaveBeenCalled()
+    expect(db.agentSession.update).not.toHaveBeenCalled()
+    expect(db.agentSession.updateMany).not.toHaveBeenCalled()
+  })
+
+  it.each(["finalize", "pause"] as const)("checks open-session ownership for unowned %s when Session projection is disabled", async operation => {
+    const open = mockDb()
+    const recorder = await createRunSessionRecorder(open.db, {
+      userId: "user_1", goal: "Open no-op lifecycle", sessionId: "session_1", manageSessionLifecycle: false,
+    })
+    if (operation === "finalize") {
+      await expect(recorder.finalize({ status: "completed", report: null })).resolves.toBe(true)
+    } else {
+      await expect(recorder.pause("Waiting for Root", undefined)).resolves.toBe(true)
+    }
+    expect(open.db.agentSession.update).not.toHaveBeenCalled()
+    expect(open.db.agentSession.updateMany).not.toHaveBeenCalled()
+
+    for (const options of [{ sessionExists: false }, { sessionUserId: "another_user" }, { sessionStatus: "aborted" }]) {
+      const unavailable = mockDb(options)
+      const unavailableRecorder = await createRunSessionRecorder(unavailable.db, {
+        userId: "user_1", goal: "Unavailable no-op lifecycle", sessionId: "session_1", manageSessionLifecycle: false,
+      })
+      if (operation === "finalize") {
+        await expect(unavailableRecorder.finalize({ status: "completed", report: null })).resolves.toBe(false)
+      } else {
+        await expect(unavailableRecorder.pause("Waiting for Root", undefined)).resolves.toBe(false)
+      }
+      expect(unavailable.db.agentSession.update).not.toHaveBeenCalled()
+      expect(unavailable.db.agentSession.updateMany).not.toHaveBeenCalled()
+    }
+  })
+
   it("atomically terminalizes an implicit V2 Turn and its session before a later Stop", async () => {
     const db = mockDb()
     const recorder = await createRunSessionRecorder(db, {

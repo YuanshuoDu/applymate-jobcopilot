@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { scheduledGateCandidateSetDigest, SCHEDULED_GATE_OUTPUT_SCHEMA } from "./scheduled-gate-contract.js"
 import { parseScheduledGateRegistrationReceipt } from "./scheduled-gate-registration-receipt.js"
-import { createScheduledGateChildExecutor } from "./scheduled-gate-child-runtime.js"
+import { createScheduledGateChildExecutor, scheduledQuestionWaitId } from "./scheduled-gate-child-runtime.js"
 import type { ScheduledPipelineGateResponse } from "./scheduled-pipeline-handoff.js"
 import type { ScheduledAutomationPipelineAttestation, ScheduledAutomationPipelineBridgeScope } from "./scheduled-automation-pipeline-bridge.js"
 import type { ScheduledPrepareTaskGraphProof } from "./scheduled-prepare-task-graph-verification.js"
@@ -85,6 +85,25 @@ const question = {
   candidateSetDigest: scheduledGateCandidateSetDigest("weak_cover_letter", ["job-a"]),
   allowedChoiceIds: ["continue", "review", "skip"] as const,
 }
+
+describe("scheduled Gate wait identity", () => {
+  const snapshot = { schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1", targetRoles: ["Engineer"],
+    targetLocations: ["Dublin"], minScore: 70, dailyCap: 2, requireApproval: true, autoApply: false }
+  it("accepts only the persisted canonical wait required by the scheduled snapshot", () => {
+    const turnInput = { scheduledAutomationSnapshot: snapshot }
+    expect(scheduledQuestionWaitId(turnInput, { scheduledTaskGraphScheduledWaitId: "agent-question:turn-1:canonical:root-wait" }, "turn-1"))
+      .toBe("agent-question:turn-1:canonical:root-wait")
+    expect(scheduledQuestionWaitId(turnInput, {}, "turn-1")).toBeNull()
+    expect(scheduledQuestionWaitId(turnInput, { scheduledTaskGraphScheduledWaitId: "agent-question:turn-2:canonical:root-wait" }, "turn-1"))
+      .toBeNull()
+    expect(scheduledQuestionWaitId(turnInput, { scheduledTaskGraphScheduledWaitId: " agent-question:turn-1:canonical:root-wait" }, "turn-1"))
+      .toBeNull()
+    expect(scheduledQuestionWaitId({ scheduledAutomationSnapshot: { ...snapshot, requireApproval: false } }, {}, "turn-1"))
+      .toBeUndefined()
+    expect(scheduledQuestionWaitId({ scheduledAutomationSnapshot: { ...snapshot, requireApproval: false } },
+      { scheduledTaskGraphScheduledWaitId: "agent-question:turn-1:canonical:root-wait" }, "turn-1")).toBeNull()
+  })
+})
 
 const NO_WAIT = Symbol("no persisted root question wait")
 

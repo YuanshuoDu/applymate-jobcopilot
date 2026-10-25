@@ -96,10 +96,11 @@ async function startSession(client: ProjectionClient, input: CanonicalSessionIde
   )
 }
 
-function sessionStatus(status: TurnEngineResult["status"]): "completed" | "failed" | "paused" | "waiting_for_user" | null {
+function sessionStatus(status: TurnEngineResult["status"]): "completed" | "failed" | "running" | "paused" | "waiting_for_user" | null {
   if (status === "completed") return "completed"
   if (status === "failed") return "failed"
-  if (status === "waiting_for_dependency" || status === "interrupted") return "paused"
+  if (status === "waiting_for_dependency") return "running"
+  if (status === "interrupted") return "paused"
   if (status === "waiting_for_user" || status === "waiting_for_approval") return "waiting_for_user"
   return null
 }

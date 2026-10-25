@@ -7,12 +7,12 @@ const owner = { userId: 'user-1', sessionId: 'session-1', turnId: 'turn-1', root
   rootAttemptCount: 1, turnLeaseOwnerId: 'root-lease', turnLeaseVersion: 1, executionId: 'execution-1', executionAttemptCount: 1 }
 const graphId = `task-graph-${createHash('sha256').update(owner.rootTaskId).digest('hex')}`
 const prefix = { schemaVersion: 'agent-harness.v2.task-graph', nodes: [
-  { key: 'scout', taskId: 'scout-1', status: 'completed' },
-  { key: 'analyze', taskId: 'analyze-1', status: 'completed' },
-  { key: 'prepare', taskId: 'prepare-1', status: 'completed' },
+  { key: 'scout', taskId: 'scout-1' },
+  { key: 'analyze', taskId: 'analyze-1' },
+  { key: 'prepare', taskId: 'prepare-1' },
 ] }
 const proposalSnapshot = { ...prefix, nodes: [...prefix.nodes, { key: 'gate', templateId: 'gate', taskId: 'gate-1', depth: 4,
-  dependsOn: ['prepare'], verificationDisposition: 'specialized', status: 'queued' }] }
+  dependsOn: ['prepare'], verificationDisposition: 'specialized' }] }
 const gateResult = { finalItemId: null, finalText: '', status: 'completed', stepCount: 0, toolCallCount: 0,
   taskGraphVerificationReport: null,
   structuredResult: { status: 'completed', nextStage: 'execute', approvedJobIds: [], pendingJobIds: ['job-1'], skippedJobIds: [],
@@ -20,19 +20,17 @@ const gateResult = { finalItemId: null, finalText: '', status: 'completed', step
 
 function lifecycle(type: string, attempt: number, expectedRevision: number, sequence: bigint) {
   const idempotencyKey = `${graphId}:node:${createHash('sha256').update('gate').digest('hex').slice(0, 20)}:${attempt}:${type}`
-  const status = type === 'task.started' ? 'running' : type === 'task.completed' ? 'completed' : 'queued'
-  const content = { ...proposalSnapshot, nodes: [...proposalSnapshot.nodes.slice(0, 3), { ...proposalSnapshot.nodes[3], status }] }
-  return { id: `event-${sequence}`, sessionId: owner.sessionId, turnId: owner.turnId, itemId: graphId, taskId: owner.rootTaskId,
+  return { id: `event-${sequence}`, sessionId: owner.sessionId, turnId: owner.turnId, itemId: graphId, taskId: 'gate-1',
     type: 'item.delta', actor: 'system', idempotencyKey, sequence,
     payload: { kind: 'lifecycle', revision: expectedRevision + 1,
       event: { type, idempotencyKey, expectedRevision, nodeKey: 'gate' },
       item: { id: graphId, sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.rootTaskId,
-        type: 'task_graph', revision: expectedRevision + 1, content } } }
+        type: 'task_graph', revision: expectedRevision + 1, content: proposalSnapshot } } }
 }
 
 function fixture(maxAttempts = 3) {
   const prepareKey = `${graphId}:node:${createHash('sha256').update('prepare').digest('hex').slice(0, 20)}:1:task.completed`
-  const prepare = { id: 'prepare-event', sessionId: owner.sessionId, turnId: owner.turnId, itemId: graphId, taskId: owner.rootTaskId,
+  const prepare = { id: 'prepare-event', sessionId: owner.sessionId, turnId: owner.turnId, itemId: graphId, taskId: 'prepare-1',
     type: 'item.delta', actor: 'system', idempotencyKey: prepareKey, sequence: BigInt(100),
     payload: { kind: 'lifecycle', revision: 10,
       event: { type: 'task.completed', idempotencyKey: prepareKey, expectedRevision: 9, nodeKey: 'prepare' },
@@ -48,15 +46,29 @@ function fixture(maxAttempts = 3) {
     lifecycle('task.started', 2, 13, BigInt(104)),
     lifecycle('task.completed', 2, 14, BigInt(105))]
   const findMany = vi.fn(async (args: { where: { idempotencyKey?: string } }) => args.where.idempotencyKey ? [prepare] : rows)
-  const reader = { agentEvent: { findMany } } as unknown as Prisma.TransactionClient
+  const findAuditTask = vi.fn().mockResolvedValue({ id: 'audit-1', sessionId: owner.sessionId, turnId: owner.turnId,
+    rootTaskId: owner.rootTaskId, parentTaskId: owner.rootTaskId, depth: 1, status: 'queued', role: 'auditor',
+    taskType: 'scheduled_taskgraph_audit', attemptCount: 0, maxAttempts: 3, failureReason: null,
+    expectedOutputSchema: { schemaVersion: 'agent-harness.v2.subagent.result', role: 'auditor', taskType: 'scheduled_taskgraph_audit' }, allowedActions: [] })
+  const reader = { agentEvent: { findMany }, subAgentTask: { findFirst: findAuditTask } } as unknown as Prisma.TransactionClient
   const digest = `sha256:${createHash('sha256').update(canonicalJson(gateResult), 'utf8').digest('hex')}`
-  const completedSnapshot = { ...proposalSnapshot, nodes: [...proposalSnapshot.nodes.slice(0, 3), { ...proposalSnapshot.nodes[3], status: 'completed' }] }
-  const input = { reader, owner, prepareGraphRevision: 10, prepareAttemptCount: 1, graphRevision: 15, graphContent: completedSnapshot,
+  const input = { reader, owner, prepareTaskId: 'prepare-1', prepareGraphRevision: 10, prepareAttemptCount: 1, graphRevision: 15, graphContent: proposalSnapshot,
     gateTask: { id: 'gate-1', status: 'completed', attemptCount: 2, maxAttempts, result: gateResult },
     gate: { taskId: 'gate-1', attemptCount: 2, phase: 'completed' as const, completionProof: { schemaVersion:
       'agent-harness.v2.scheduled-taskgraph-gate-completion.v1', graphRevision: 15, prepareProof: {}, gate: { taskId: 'gate-1',
         attemptCount: 2, resultDigest: digest, completedEventRevision: 15 } } }, expectedJobIds: ['job-1'] }
-  return { input, findMany }
+  return { input, findMany, findAuditTask, prepare, rows }
+}
+
+function auditSuffix(input: ReturnType<typeof fixture>['input'], nodeOverrides: Record<string, unknown> = {}) {
+  const node = { key: 'scheduled_audit', templateId: 'scheduled_audit', taskId: 'audit-1', depth: 5, dependsOn: ['gate'],
+    verificationDisposition: 'specialized', goal: 'Return the exact report from the authenticated scheduled Audit continuation after Gate completion.',
+    successCriteria: ['Continue the exact scheduled execution only after its canonical Gate proof is verified.',
+      'Return only the fixed seven-field report without adding actions or interpreting historical counts.',
+      'Never submit applications or invoke model or tool runtimes.'], ...nodeOverrides }
+  return { ...input, graphRevision: 16, graphContent: { ...proposalSnapshot, nodes: [...proposalSnapshot.nodes, node] },
+    auditTask: { id: 'audit-1', status: 'queued', attemptCount: 0 },
+    gate: { ...input.gate, phase: 'completed' as const } }
 }
 
 describe('scheduled TaskGraph Gate lifecycle history', () => {
@@ -76,7 +88,96 @@ describe('scheduled TaskGraph Gate lifecycle history', () => {
     const { input, findMany } = fixture()
     const result = await scheduledTaskGraphGateHistoryIsCurrent(input)
     expect(findMany).toHaveBeenCalledTimes(2)
+    expect(findMany.mock.calls[0]?.[0].where).toMatchObject({
+      sessionId: owner.sessionId, turnId: owner.turnId, itemId: graphId, idempotencyKey: expect.any(String),
+    })
+    expect(findMany.mock.calls[0]?.[0].where).not.toHaveProperty('taskId')
+    expect(findMany.mock.calls[1]?.[0].where).not.toHaveProperty('taskId')
     expect(result).toBe(true)
+  })
+
+  it('accepts a statusless snapshot while the Gate child is running', async () => {
+    const { input, rows } = fixture()
+    const proposal = rows[0]!
+    rows.splice(0, rows.length, proposal, lifecycle('task.started', 1, 11, BigInt(102)))
+    const runningInput = { ...input, graphRevision: 12, graphContent: proposalSnapshot,
+      gateTask: { ...input.gateTask, status: 'running', attemptCount: 1 },
+      gate: { taskId: 'gate-1', attemptCount: 1, phase: 'running' as const } }
+    await expect(scheduledTaskGraphGateHistoryIsCurrent(runningInput)).resolves.toBe(true)
+  })
+
+  it('accepts the exact Audit suffix only after reconstructing Gate completion', async () => {
+    const { input, findAuditTask, findMany } = fixture()
+    const current = auditSuffix(input)
+    await expect(scheduledTaskGraphGateHistoryIsCurrent(current)).resolves.toBe(true)
+    expect(findMany).toHaveBeenCalledTimes(2)
+    expect(findAuditTask).toHaveBeenCalledWith(expect.objectContaining({ where: {
+      id: 'audit-1', sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+      parentTaskId: owner.rootTaskId, session: { is: { userId: owner.userId } },
+    } }))
+  })
+
+  it('rejects changed or extra Audit suffix content and a mismatched task row', async () => {
+    const changed = fixture()
+    await expect(scheduledTaskGraphGateHistoryIsCurrent(auditSuffix(changed.input, { goal: 'changed' }))).resolves.toBe(false)
+    expect(changed.findAuditTask).not.toHaveBeenCalled()
+
+    const legacyDisposition = fixture()
+    await expect(scheduledTaskGraphGateHistoryIsCurrent(auditSuffix(legacyDisposition.input,
+      { verificationDisposition: 'legacy_unverified' }))).resolves.toBe(false)
+    expect(legacyDisposition.findAuditTask).not.toHaveBeenCalled()
+
+    const extra = fixture()
+    const current = auditSuffix(extra.input)
+    current.graphContent = { ...current.graphContent, nodes: [...current.graphContent.nodes, { key: 'extra', taskId: 'extra-task' }] }
+    await expect(scheduledTaskGraphGateHistoryIsCurrent(current)).resolves.toBe(false)
+    expect(extra.findAuditTask).not.toHaveBeenCalled()
+
+    const mismatched = fixture()
+    mismatched.findAuditTask.mockResolvedValueOnce({ id: 'audit-1', sessionId: owner.sessionId, turnId: 'foreign-turn',
+      rootTaskId: owner.rootTaskId, parentTaskId: owner.rootTaskId, depth: 1, status: 'queued', role: 'auditor',
+      taskType: 'scheduled_taskgraph_audit', attemptCount: 0, maxAttempts: 3, failureReason: null,
+      expectedOutputSchema: { schemaVersion: 'agent-harness.v2.subagent.result', role: 'auditor', taskType: 'scheduled_taskgraph_audit' }, allowedActions: [] })
+    await expect(scheduledTaskGraphGateHistoryIsCurrent(auditSuffix(mismatched.input))).resolves.toBe(false)
+
+    const wrongDepth = fixture()
+    wrongDepth.findAuditTask.mockResolvedValueOnce({ id: 'audit-1', sessionId: owner.sessionId, turnId: owner.turnId,
+      rootTaskId: owner.rootTaskId, parentTaskId: owner.rootTaskId, depth: 2, status: 'queued', role: 'auditor',
+      taskType: 'scheduled_taskgraph_audit', attemptCount: 0, maxAttempts: 3, failureReason: null,
+      expectedOutputSchema: { schemaVersion: 'agent-harness.v2.subagent.result', role: 'auditor', taskType: 'scheduled_taskgraph_audit' }, allowedActions: [] })
+    await expect(scheduledTaskGraphGateHistoryIsCurrent(auditSuffix(wrongDepth.input))).resolves.toBe(false)
+  })
+
+  it('rejects extra content on a Gate lifecycle snapshot', async () => {
+    const { input, rows } = fixture()
+    const event = rows[1] as ReturnType<typeof lifecycle>
+    const statusNode = { ...proposalSnapshot.nodes[3]!, status: 'running' }
+    event.payload.item.content = { ...proposalSnapshot, nodes: [...proposalSnapshot.nodes.slice(0, 3), statusNode] }
+    await expect(scheduledTaskGraphGateHistoryIsCurrent(input)).resolves.toBe(false)
+  })
+
+  it('rejects a Prepare completion event attached to the root task', async () => {
+    const { input, prepare } = fixture()
+    prepare.taskId = owner.rootTaskId
+    await expect(scheduledTaskGraphGateHistoryIsCurrent(input)).resolves.toBe(false)
+  })
+
+  it('rejects a Prepare completion event attached to another child task', async () => {
+    const { input, prepare } = fixture()
+    prepare.taskId = 'other-prepare'
+    await expect(scheduledTaskGraphGateHistoryIsCurrent(input)).resolves.toBe(false)
+  })
+
+  it('rejects a Gate lifecycle event attached to the root task', async () => {
+    const { input, rows } = fixture()
+    rows[1]!.taskId = owner.rootTaskId
+    await expect(scheduledTaskGraphGateHistoryIsCurrent(input)).resolves.toBe(false)
+  })
+
+  it('rejects a Gate lifecycle event attached to a different child task', async () => {
+    const { input, rows } = fixture()
+    rows[1]!.taskId = 'other-gate'
+    await expect(scheduledTaskGraphGateHistoryIsCurrent(input)).resolves.toBe(false)
   })
 
   it('rejects a generic retry beyond the persisted maxAttempts ceiling', async () => {

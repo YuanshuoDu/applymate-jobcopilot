@@ -11,6 +11,7 @@ import type { PipelineStageRuntimeContext } from './pipeline-context'
 import { runScoutAnalyzeStages } from './pipeline-scout-analyze'
 import { runPrepareGateStages } from './pipeline-prepare-gate'
 import { runExecuteAuditStages } from './pipeline-execute-audit'
+import { isScheduledTaskGraphAuditRuntime } from './scheduled-taskgraph-audit-runtime'
 
 export type { PipelineCtx }
 
@@ -50,6 +51,7 @@ function needsStage(state: PipelineCheckpointState, stage: PipelineStage) {
 }
 
 export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
+  const scheduledAuditRuntime = isScheduledTaskGraphAuditRuntime(ctx)
   const startedAt = Date.now()
   let state: PipelineCheckpointState = ctx.resumeState ?? { nextStage: 'scout', startedAt: new Date().toISOString() }
   let eventIndex = state.eventIndex ?? 0
@@ -93,12 +95,13 @@ export async function runPipeline(ctx: PipelineCtx): Promise<RunReport> {
     await assertAlive()
   }
   const collectCustomResults = async (jobs: Parameters<typeof runCustomAgents>[1], afterStage: string) => {
+    if (scheduledAuditRuntime) return
     const results = await runCustomAgents(controlledCtx, jobs, afterStage)
     if (Array.isArray(results)) customAgentResults = [...customAgentResults, ...results]
   }
 
   await assertAlive()
-  await orch.plan()
+  if (!scheduledAuditRuntime) await orch.plan()
   await assertAlive()
 
   const runtime: PipelineStageRuntimeContext = {

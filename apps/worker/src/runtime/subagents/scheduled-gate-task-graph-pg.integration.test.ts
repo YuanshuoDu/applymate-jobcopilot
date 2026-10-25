@@ -21,6 +21,7 @@ import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import { createScheduledAutomationGateContinuation } from "./scheduled-automation-gate-bridge.js"
 import { projectScheduledAnalyzePrefix } from "./scheduled-automation-prepare-bridge.js"
 import { createScheduledGatePrepareFixture } from "./scheduled-gate-prepare-pg-runner.fixture.js"
+import { SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE } from "./scheduled-audit-contract.js"
 import { scheduledGateCandidateSetDigest, scheduledGatePreparedJobIds, type ScheduledGateResult } from "./scheduled-gate-contract.js"
 import type { TurnQuestionGateChoiceBinding } from "../turns/turn-question-gate-choice-contract.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
@@ -197,7 +198,7 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
     const firstStep = await startStep(fixture, lease, turnStore)
     const initial = await continuation({ owner, executionOwner: turnFence(lease, fixture.ids.rootTaskId), attestation,
       handoff, prepareProof: preparedProof, scheduledWaitId: fixture.prepareChoiceWaitId,
-      finalStepId: firstStep, signal: new AbortController().signal })
+      finalStepId: firstStep, recoveryStepId: firstStep, signal: new AbortController().signal })
     expect(initial.status).toBe("waiting_for_dependency")
     if (initial.status !== "waiting_for_dependency") throw new Error("scheduled_gate_initial_wait_missing")
     await suspendRoot(fixture, lease, firstStep, initial.waitId, turnStore, durableWait)
@@ -240,7 +241,7 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
       const questionStep = await startStep(fixture, lease, turnStore)
       const next = await continuation({ owner, executionOwner: turnFence(lease, fixture.ids.rootTaskId), attestation,
         handoff, prepareProof: preparedProof, scheduledWaitId: fixture.prepareChoiceWaitId,
-        finalStepId: questionStep, signal: new AbortController().signal })
+        finalStepId: questionStep, recoveryStepId: questionStep, signal: new AbortController().signal })
       expect(next.status).toBe("waiting_for_choice")
       if (next.status !== "waiting_for_choice") throw new Error("scheduled_gate_question_missing")
       expect(next.binding).toMatchObject({ gateAttempt: attempt, kind: "weak_cover_letter", jobIds: [fixture.preparedJobIds[attempt - 1]] })
@@ -270,7 +271,7 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
       const resumeStep = await startStep(fixture, lease, turnStore)
       const resumed = await continuation({ owner, executionOwner: turnFence(lease, fixture.ids.rootTaskId), attestation,
         handoff, prepareProof: preparedProof, scheduledWaitId: fixture.prepareChoiceWaitId,
-        finalStepId: resumeStep, signal: new AbortController().signal })
+        finalStepId: resumeStep, recoveryStepId: resumeStep, signal: new AbortController().signal })
       expect(resumed.status).toBe("waiting_for_dependency")
       if (resumed.status !== "waiting_for_dependency") throw new Error("scheduled_gate_answer_resume_missing")
       await assertResumeReplayFences(pool, command, fixture, lease, owner, resumeStep, question, attempt)
@@ -288,15 +289,38 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
     owner = { ...fixture.owner, turnLeaseOwnerId: lease.ownerId, turnLeaseVersion: lease.leaseVersion }
     attestation = await fixture.reattestCurrentTurn(lease)
     const completionStep = await startStep(fixture, lease, turnStore)
-    const completed = await continuation({ owner, executionOwner: turnFence(lease, fixture.ids.rootTaskId), attestation,
+    const auditWait = await continuation({ owner, executionOwner: turnFence(lease, fixture.ids.rootTaskId), attestation,
       handoff, prepareProof: preparedProof, scheduledWaitId: fixture.prepareChoiceWaitId,
-      finalStepId: completionStep, signal: new AbortController().signal })
-    expect(completed).toEqual({ status: "completed" })
+      finalStepId: completionStep, recoveryStepId: completionStep, signal: new AbortController().signal })
+    expect(auditWait.status).toBe("waiting_for_dependency")
+    if (auditWait.status !== "waiting_for_dependency") throw new Error("scheduled_gate_audit_wait_missing")
+    const durableAuditWait = await pool.query<{ status: string; mode: string; targetTaskIds: unknown; matchedTaskIds: unknown }>(
+      `SELECT "status", "mode", "targetTaskIds", "matchedTaskIds" FROM "agent_wait_conditions"
+        WHERE "id"=$1 AND "sessionId"=$2 AND "turnId"=$3 AND "parentTaskId"=$4`,
+      [auditWait.waitId, fixture.ids.sessionId, fixture.ids.turnId, fixture.ids.rootTaskId])
+    expect(durableAuditWait.rows).toHaveLength(1)
+    const waitRow = durableAuditWait.rows[0]!
+    const auditTaskIds = parseJson(waitRow.targetTaskIds)
+    expect(waitRow).toMatchObject({ status: "waiting", mode: "all" })
+    expect(Array.isArray(auditTaskIds) ? auditTaskIds.length : -1).toBe(1)
+    if (!Array.isArray(auditTaskIds) || auditTaskIds.length !== 1 || typeof auditTaskIds[0] !== "string") {
+      throw new Error("scheduled_gate_audit_wait_target_missing")
+    }
+    const auditTaskId = auditTaskIds[0]
+    const auditTasks = await pool.query<{ id: string; sessionId: string; turnId: string; rootTaskId: string; parentTaskId: string;
+      status: string; role: string; taskType: string }>(
+      `SELECT "id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "status", "role", "taskType"
+        FROM "sub_agent_tasks" WHERE "id"=$1 AND "sessionId"=$2`, [auditTaskId, fixture.ids.sessionId])
+    expect(auditTasks.rows).toHaveLength(1)
+    expect(auditTasks.rows[0]).toMatchObject({ id: auditTaskId, sessionId: fixture.ids.sessionId, turnId: fixture.ids.turnId,
+      rootTaskId: fixture.ids.rootTaskId, parentTaskId: fixture.ids.rootTaskId, status: "queued",
+      role: SCHEDULED_AUDIT_ROLE, taskType: SCHEDULED_AUDIT_TASK_TYPE })
+    expect(parseJson(waitRow.matchedTaskIds)).toEqual([])
 
     expect(generations).toEqual([0, 2, 4, 6, 8])
     expect(completedQuestionItems.map(item => item.attempt)).toEqual([1, 2, 3, 4])
     expect(new Set(completedQuestionItems.map(item => item.itemId)).size).toBe(4)
-    expect(fetchCalls).toHaveLength(1)
+    expect(fetchCalls).toHaveLength(0)
     const gate = await pool.query<{ status: string; attemptCount: number; maxAttempts: number; result: Record<string, unknown> }>(
       `SELECT "status", "attemptCount", "maxAttempts", "result" FROM "sub_agent_tasks" WHERE "id"=$1 AND "sessionId"=$2`, [gateTaskId, fixture.ids.sessionId])
     expect(gate.rows[0]).toMatchObject({ status: "completed", attemptCount: 5, maxAttempts: 3,
@@ -340,7 +364,8 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
     const firstStep = await startStep(fixture, lease, turnStore)
     const initial = await continuation({ owner, executionOwner: turnFence(lease, fixture.ids.rootTaskId), attestation,
       handoff: fixture.handoff as never, prepareProof: fixture.prepareProof as never,
-      scheduledWaitId: fixture.prepareChoiceWaitId, finalStepId: firstStep, signal: new AbortController().signal })
+      scheduledWaitId: fixture.prepareChoiceWaitId, finalStepId: firstStep, recoveryStepId: firstStep,
+      signal: new AbortController().signal })
     expect(initial.status).toBe("waiting_for_dependency")
     if (initial.status !== "waiting_for_dependency") throw new Error("scheduled_gate_cancel_initial_wait_missing")
     await suspendRoot(fixture, lease, firstStep, initial.waitId, turnStore, durableWait)
@@ -366,7 +391,8 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
     const questionStep = await startStep(fixture, lease, turnStore)
     const candidate = await continuation({ owner, executionOwner: turnFence(lease, fixture.ids.rootTaskId), attestation,
       handoff: fixture.handoff as never, prepareProof: fixture.prepareProof as never,
-      scheduledWaitId: fixture.prepareChoiceWaitId, finalStepId: questionStep, signal: new AbortController().signal })
+      scheduledWaitId: fixture.prepareChoiceWaitId, finalStepId: questionStep, recoveryStepId: questionStep,
+      signal: new AbortController().signal })
     expect(candidate.status).toBe("waiting_for_choice")
     if (candidate.status !== "waiting_for_choice") throw new Error("scheduled_gate_cancel_question_missing")
     expect(candidate.binding).toMatchObject({ gateAttempt: 1, kind: "weak_cover_letter", jobIds: [fixture.preparedJobIds[0]] })

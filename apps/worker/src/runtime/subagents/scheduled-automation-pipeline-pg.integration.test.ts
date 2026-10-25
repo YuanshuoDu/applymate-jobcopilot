@@ -999,7 +999,7 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       const initialContinuation = createScheduledAutomationPrepareContinuation({ commandPort: command, waitPort: durableWait })
       const initialContinuationInput = {
         owner, executionOwner: turnExecutionOwner, attestation: result.attestation,
-        proof: prepareInput.handoff, candidateText, finalStepId: stepId, finalStepOrdinal: 8,
+        proof: prepareInput.handoff, candidateText, finalStepId: stepId, finalStepOrdinal: 8, recoveryStepId: stepId,
         signal: new AbortController().signal,
       }
       await expect(initialContinuation(initialContinuationInput)).resolves.toEqual({
@@ -1170,7 +1170,7 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       const continuationInput = {
         owner: resumedOwner, executionOwner: resumedTurnExecutionOwner, attestation: resumedBridge.attestation,
         proof: reboundHandoff.proof,
-        candidateText, finalStepId: stepId, finalStepOrdinal: 8, signal: new AbortController().signal,
+        candidateText, finalStepId: stepId, finalStepOrdinal: 8, recoveryStepId: stepId, signal: new AbortController().signal,
       }
       const resumedPrepare = await restartedContinuation(continuationInput)
       expect(resumedPrepare).toMatchObject({ status: "waiting_for_dependency" })

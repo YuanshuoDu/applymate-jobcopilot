@@ -20,9 +20,17 @@ const pool = { connect: vi.fn() } as unknown as pg.Pool
 
 describe("canonical Turn scheduled pipeline assembly", () => {
   it("binds only scheduled TaskGraph turns and recovers candidates under the live Turn owner", async () => {
+    const recoveredCandidate = {
+      candidateText: "Recovered candidate.", finalStepId: "step-final-4", finalStepOrdinal: 4, finishReason: "stop", usage: null,
+      recoverySource: { owner: { userId: executionOwner.userId, sessionId: executionOwner.sessionId,
+        turnId: executionOwner.turnId, rootTaskId: executionOwner.rootTaskId }, sourceEventId: "candidate-event-4",
+        sourceStepId: "step-final-4", sourceStepOrdinal: 4, rootAttemptCount: root.attemptCount,
+        inputThroughSequence: "10", consumedInputIds: [] },
+      recoveryTail: null,
+    }
     const candidateStore: ScheduledPipelineCandidateStore = {
       stage: vi.fn(async () => undefined),
-      read: vi.fn(async () => ({ candidateText: "Recovered candidate.", finalStepId: "step-final-4", finalStepOrdinal: 4, finishReason: "stop", usage: null })),
+      read: vi.fn(async () => recoveredCandidate),
     }
     const candidateStoreFactory = vi.fn(() => candidateStore)
     const eventStore = { appendEvent: vi.fn() } as unknown as Pick<TurnEngineStore, "appendEvent">
@@ -37,9 +45,7 @@ describe("canonical Turn scheduled pipeline assembly", () => {
       userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: root.id,
       rootAttemptCount: root.attemptCount, turnLeaseOwnerId: lease.ownerId, turnLeaseVersion: lease.leaseVersion,
     })
-    await expect(assembly.readCandidate({ store: candidateStore, owner, executionOwner })).resolves.toEqual({
-      candidateText: "Recovered candidate.", finalStepId: "step-final-4", finalStepOrdinal: 4, finishReason: "stop", usage: null,
-    })
+    await expect(assembly.readCandidate({ store: candidateStore, owner, executionOwner })).resolves.toEqual(recoveredCandidate)
     expect(candidateStore.read).toHaveBeenCalledWith({ owner: executionOwner, rootAttemptCount: root.attemptCount })
 
     expect(assembly.owner({ taskGraphPlanningEnabled: true, state: { ...scheduledState, automationRunMode: "manual" }, lease, root })).toBeUndefined()

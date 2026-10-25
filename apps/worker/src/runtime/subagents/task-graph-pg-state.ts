@@ -14,9 +14,9 @@ import { projectTaskGraphResult, taskGraphResultProjectionBytes, taskGraphResult
   TASK_GRAPH_RESULT_PROJECTION_ITEMS_TOTAL, TASK_GRAPH_RESULT_PROJECTION_TOTAL_BYTE_LIMIT } from "./task-graph-result-projection.js"
 import type { SubagentTaskStatus } from "./types.js"
 import { projectTaskGraphDiscoveryAttemptHealth } from "./task-graph-discovery-attempt-health.js"
-import { parseScheduledGateTaskEnvelope, scheduledGatePreparedJobIdsFromResult, SCHEDULED_GATE_OUTPUT_SCHEMA,
-  SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE, SCHEDULED_GATE_TEMPLATE_ID } from "./scheduled-gate-contract.js"
-import { SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA } from "./scheduled-prepare-task-graph-verification.js"
+import { SCHEDULED_AUDIT_TEMPLATE_ID } from "./scheduled-audit-contract.js"
+import { SCHEDULED_GATE_TEMPLATE_ID } from "./scheduled-gate-contract.js"
+import { isScheduledTaskGraphSpecializedEnvelope } from "./task-graph-pg-specialized-envelope.js"
 import {
   loadTaskGraphSourceProvenance,
   type TaskGraphInputRelation, type TaskGraphSourceCheckpoint,
@@ -210,8 +210,12 @@ export function currentTaskGraph(loaded: LoadedGraph): TaskGraphCurrentState {
       verificationCriterionIds = verification?.criteria.map(criterion => criterion.id), taskResult = parseObject(task.result)
     const hasReport = Boolean(taskResult && Object.hasOwn(taskResult, "taskGraphVerificationReport")), verificationReport = verificationCriterionIds
       ? parseTaskGraphVerificationReport(taskResult?.taskGraphVerificationReport, verificationCriterionIds) : undefined
-    const gateEnvelope = scheduledGateEnvelope(loaded, stored, task)
+    const specializedEnvelope = isScheduledTaskGraphSpecializedEnvelope({ snapshot: loaded.snapshot, tasks: loaded.tasks, node: stored, task })
+    const gateEnvelope = specializedEnvelope === "gate"
     if (stored.templateId === SCHEDULED_GATE_TEMPLATE_ID && (task.status === "waiting_for_user" || task.status === "completed") && !gateEnvelope) {
+      throw new Error("task_graph_verification_report_invalid")
+    }
+    if (stored.templateId === SCHEDULED_AUDIT_TEMPLATE_ID && task.status === "completed" && specializedEnvelope !== "audit") {
       throw new Error("task_graph_verification_report_invalid")
     }
     const repairOf = stored.repairOf?.graphRootTaskId === loaded.rootTaskId ? stored.repairOf : undefined
@@ -219,7 +223,7 @@ export function currentTaskGraph(loaded: LoadedGraph): TaskGraphCurrentState {
     const repairReceipt = parseTaskGraphRepairReceipt(taskResult?.taskGraphRepairReceipt, {
       repairOf, repairNodeKey: stored.key, repairTaskId: stored.taskId, report: verificationReport,
     })
-    if (hasReport && !gateEnvelope && (!verificationReport || !taskGraphVerificationReportMatchesStatus(verificationReport, task.status)
+    if (hasReport && specializedEnvelope === null && (!verificationReport || !taskGraphVerificationReportMatchesStatus(verificationReport, task.status)
       || verificationReport.reasonCode === "repair_target_unresolved" && !repairOf)
       || stored.verificationDisposition === "typed" && (task.status === "completed" || task.status === "failed") && !verificationReport
       || hasReceipt && !repairReceipt
@@ -250,23 +254,6 @@ export function currentTaskGraph(loaded: LoadedGraph): TaskGraphCurrentState {
   })
   return { revision: loaded.state.revision, nodes }
 }
-function scheduledGateEnvelope(loaded: LoadedGraph, node: TaskGraphSnapshot["nodes"][number], task: GraphTaskRow): boolean {
-  if (node.key !== SCHEDULED_GATE_TEMPLATE_ID || node.templateId !== SCHEDULED_GATE_TEMPLATE_ID
-    || node.verificationDisposition !== "specialized" || task.role !== SCHEDULED_GATE_ROLE
-    || task.taskType !== SCHEDULED_GATE_TASK_TYPE || task.contextIsEmpty !== true
-    || !sameJson(task.expectedOutputSchema, SCHEDULED_GATE_OUTPUT_SCHEMA) || !sameJson(task.allowedActions, [])
-    || task.status !== "waiting_for_user" && task.status !== "completed") return false
-  const prepareNode = loaded.snapshot?.nodes.find(candidate => candidate.key === "prepare")
-  const prepare = prepareNode && loaded.tasks.get(prepareNode.taskId), prepareResult = parseObject(prepare?.result)
-  const facts = parseObject(prepareResult?.taskGraphScheduledPrepareProofFacts)
-  if (!prepareNode || prepareNode.templateId !== "prepare" || prepareNode.verificationDisposition !== "specialized"
-    || !prepare || prepare.role !== "prepare" || prepare.taskType !== "scheduled_application_prepare" || prepare.status !== "completed"
-    || !facts || facts.schemaVersion !== SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA
-    || canonicalTaskGraphJson(facts.result) !== canonicalTaskGraphJson(prepareResult?.structuredResult)) return false
-  const preparedIds = scheduledGatePreparedJobIdsFromResult(facts.result)
-  return preparedIds !== null && parseScheduledGateTaskEnvelope(task.result, task.status, preparedIds) !== null
-}
-function sameJson(left: unknown, right: unknown): boolean { try { return canonicalTaskGraphJson(left) === canonicalTaskGraphJson(right) } catch { return false } }
 function taskGraphProjectionSource(
   original: unknown,
   result: Record<string, unknown> | null,
