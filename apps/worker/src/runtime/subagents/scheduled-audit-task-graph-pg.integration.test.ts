@@ -28,6 +28,8 @@ type Fixture = Awaited<ReturnType<typeof createScheduledGatePrepareFixture>>
 type Runner = Readonly<{ worker: Worker<SubagentJobPayload, unknown>; redis: Redis; queue: Queue<SubagentJobPayload> }>
 type ScheduledPipelineRoute = Readonly<{ POST(request: Request): Promise<Response> }>
 type ExecuteHttpResponse = Readonly<{ status: number; body: Record<string, unknown> }>
+type GateFailureDiagnostics = Readonly<Record<string, unknown>>
+const diagnosticOutcomeStatuses = new Set(["completed", "retrying", "failed", "waiting", "waiting_for_user", "interrupted", "skipped", "lease_lost"])
 const scheduledPipelineRoutePath = "@/app/api/internal/agent-runtime/scheduled-pipeline/route"
 const scheduledGateQualityReviewPath = "@/lib/agent/stages/gate-quality-review"
 const scheduledModelRouterPath = "@/lib/model-router"
@@ -90,8 +92,11 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     runner = startRunner(fixture, response.fetcher)
     const gateOutcome = await dispatchAndWait(runner, gateTaskId, fixture.ids.sessionId)
     if (!gateOutcome || typeof gateOutcome !== "object" || !("status" in gateOutcome) || gateOutcome.status !== "completed") {
-      const failedTask = await taskState(gateTaskId)
-      throw new Error(`Scheduled Gate child did not complete: ${JSON.stringify({ outcome: gateOutcome, failureReason: failedTask.failureReason })}`)
+      const rawOutcomeStatus = debugRecord(gateOutcome)?.status
+      const outcomeStatus = typeof rawOutcomeStatus === "string" && diagnosticOutcomeStatuses.has(rawOutcomeStatus)
+        ? rawOutcomeStatus : "other"
+      throw new Error(`Scheduled Gate child did not complete: ${JSON.stringify({ outcomeStatus,
+        gateDiagnostics: response.gateDiagnostics() })}`)
     }
     expect(gateOutcome).toMatchObject({ status: "completed" })
     expect(response.gateCalls()).toBe(1)
@@ -225,6 +230,7 @@ async function setupFetcher(fixture: Fixture) {
   const webDb = await vi.importActual<{ db: { $disconnect(): Promise<void> } }>(scheduledWebDbPath)
   disconnectWebDatabase = () => webDb.db.$disconnect()
   let loseFirstExecuteResponse = true, gates = 0, executes = 0
+  let gateDiagnostics: GateFailureDiagnostics | undefined
   let firstExecute: ExecuteHttpResponse | undefined
   let replayedExecute: ExecuteHttpResponse | undefined
   let firstExecuteRequest: Record<string, unknown> | undefined
@@ -237,6 +243,11 @@ async function setupFetcher(fixture: Fixture) {
     const response = await route.POST(request)
     if (body.action === "gate") {
       gates += 1
+      const payload = await response.clone().json().catch(() => null)
+      const routeBody = debugRecord(payload)
+      if (response.status === 409 && routeBody?.errorCode === "scheduled_pipeline_turn_stale") {
+        gateDiagnostics = await readGateFailureDiagnostics(fixture, body, request.signal.aborted, response.status, payload)
+      }
       return response
     }
     if (body.action !== "execute") throw new Error("scheduled Audit action invalid")
@@ -261,6 +272,7 @@ async function setupFetcher(fixture: Fixture) {
   return {
     fetcher,
     gateCalls: () => gates,
+    gateDiagnostics: () => gateDiagnostics,
     executeCalls: () => executes,
     firstExecuteRequest: () => firstExecuteRequest,
     replayedExecuteRequest: () => replayedExecuteRequest,
@@ -272,6 +284,203 @@ async function setupFetcher(fixture: Fixture) {
       return report
     },
   }
+}
+
+/** Captures only redacted lock predicates while the rejected Gate lease is still live. */
+async function readGateFailureDiagnostics(fixture: Fixture, requestBody: Record<string, unknown>, signalAborted: boolean,
+  responseStatus: number, responsePayload: unknown): Promise<GateFailureDiagnostics> {
+  const response = debugRecord(responsePayload)
+  const owner = debugRecord(requestBody.owner), gateTaskId = requestBody.gateTaskId,
+    gateLeaseOwnerId = requestBody.gateLeaseOwnerId, gateAttemptCount = requestBody.gateAttemptCount,
+    suppliedWaitId = requestBody.scheduledWaitId
+  const safeResponse = { responseStatus, responseErrorCode: typeof response?.errorCode === "string" ? response.errorCode : null, signalAborted }
+  if (!owner || typeof owner.userId !== "string" || typeof owner.sessionId !== "string" || typeof owner.turnId !== "string"
+    || typeof owner.rootTaskId !== "string" || typeof gateTaskId !== "string" || typeof gateLeaseOwnerId !== "string"
+    || !Number.isSafeInteger(gateAttemptCount) || suppliedWaitId !== undefined && typeof suppliedWaitId !== "string") {
+    return { requestShapeValid: false, ...safeResponse }
+  }
+  try {
+    const [sessionResult, turnResult, rootResult, gateResult, executionResult, stepResult] = await Promise.all([
+      pool!.query<Record<string, unknown>>(`SELECT "status" FROM "agent_sessions" WHERE "id"=$1 AND "userId"=$2`,
+        [owner.sessionId, owner.userId]),
+      pool!.query<Record<string, unknown>>(`SELECT "id", "userId", "sessionId", "rootTaskId", "source", "executionMode", "input",
+          "status", "leaseOwnerId", "leaseVersion", "leaseExpiresAt"
+        FROM "agent_turns" WHERE "id"=$1 AND "userId"=$2 AND "sessionId"=$3`, [owner.turnId, owner.userId, owner.sessionId]),
+      pool!.query<Record<string, unknown>>(`SELECT "id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "status", "attemptCount",
+          "interruptRequestedAt", "closedAt"
+        FROM "sub_agent_tasks" WHERE "id"=$1 AND "sessionId"=$2 AND "turnId"=$3`, [owner.rootTaskId, owner.sessionId, owner.turnId]),
+      pool!.query<Record<string, unknown>>(`SELECT "id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "depth", "role", "taskType",
+          "status", "attemptCount", "leaseOwner", "leaseExpiresAt", "interruptRequestedAt", "closedAt", "expectedOutputSchema", "allowedActions"
+        FROM "sub_agent_tasks" WHERE "id"=$1 AND "sessionId"=$2 AND "turnId"=$3 AND "rootTaskId"=$4`,
+      [gateTaskId, owner.sessionId, owner.turnId, owner.rootTaskId]),
+      pool!.query<Record<string, unknown>>(`SELECT "id", "status", "attemptCount", "state" FROM "agent_executions"
+        WHERE "userId"=$1 AND "sessionId"=$2`, [owner.userId, owner.sessionId]),
+      pool!.query<Record<string, unknown>>(`SELECT "id", "taskId", "attempt", "ordinal", "status" FROM "agent_steps"
+        WHERE "sessionId"=$1 AND "turnId"=$2 AND "taskId"=$3 ORDER BY "ordinal" DESC LIMIT 1`,
+      [owner.sessionId, owner.turnId, owner.rootTaskId]),
+    ])
+    const session = sessionResult.rows[0], turn = turnResult.rows[0], root = rootResult.rows[0], gate = gateResult.rows[0], execution = executionResult.rows[0],
+      latestStep = stepResult.rows[0], state = debugRecord(execution?.state),
+      claim = debugRecord(state?.scheduledTaskGraphClaim), continuation = debugRecord(state?.scheduledTaskGraphContinuation)
+    const ownerForLock = { ...owner, executionId: execution?.id, executionAttemptCount: Number(execution?.attemptCount) }
+    const turnDate = debugDate(turn?.leaseExpiresAt), gateDate = debugDate(gate?.leaseExpiresAt)
+    const turnIdentityMatches = Boolean(turn && turn.id === owner.turnId && turn.userId === owner.userId
+      && turn.sessionId === owner.sessionId && turn.rootTaskId === owner.rootTaskId)
+    const rootIdentityMatches = Boolean(root && root.id === owner.rootTaskId && root.sessionId === owner.sessionId
+      && root.turnId === owner.turnId && root.rootTaskId === owner.rootTaskId && root.parentTaskId == null
+      && Number(root.attemptCount) === Number(owner.rootAttemptCount))
+    const gateRpc = await vi.importActual<{
+      scheduledTaskGraphGateTurnIsCurrent(value: unknown, input: { owner: unknown; mode: "gate_child" }): boolean
+      scheduledTaskGraphGateTaskLeaseIsCurrent(value: unknown, input: { owner: unknown; taskId: string; leaseOwnerId: string; attemptCount: number }): boolean
+    }>("@/lib/agent/scheduled-taskgraph-gate-rpc")
+    const turnFenceCurrent = gateRpc.scheduledTaskGraphGateTurnIsCurrent(turn, { owner, mode: "gate_child" })
+    const gateLeaseCurrent = gateRpc.scheduledTaskGraphGateTaskLeaseIsCurrent(gate, { owner, taskId: gateTaskId,
+      leaseOwnerId: gateLeaseOwnerId, attemptCount: Number(gateAttemptCount) })
+    const gateTaskPolicyMatches = Boolean(gate && Number(gate.depth) === 1 && gate.role === "prepare"
+      && gate.taskType === "scheduled_taskgraph_gate" && gate.status === "running"
+      && Number(gate.attemptCount) === Number(gateAttemptCount) && gate.leaseOwner === gateLeaseOwnerId
+      && gate.interruptRequestedAt == null && gate.closedAt == null
+      && debugSameJson(gate.expectedOutputSchema, { schemaVersion: "agent-harness.v2.subagent.result",
+        role: "prepare", taskType: "scheduled_taskgraph_gate" }) && debugSameJson(gate.allowedActions, []))
+    const pipelineFence = await vi.importActual<{
+      scheduledTaskGraphContinuationKey(owner: unknown, attestation: unknown): string
+    }>("@/lib/agent/scheduled-taskgraph-pipeline-checkpoint")
+    const storedClaimToken = typeof claim?.claimToken === "string" ? claim.claimToken : ""
+    let continuationKey: string | undefined
+    try { continuationKey = pipelineFence.scheduledTaskGraphContinuationKey(ownerForLock, requestBody.attestation) }
+    catch { continuationKey = undefined }
+    const executionFence = await vi.importActual<{
+      scheduledTaskGraphClaimMatches(state: unknown, key: string, owner: unknown, claimToken?: string): boolean
+    }>("@/lib/agent/scheduled-taskgraph-pipeline-fence")
+    const claimMatchesCurrent = Boolean(continuationKey && executionFence.scheduledTaskGraphClaimMatches(
+      execution?.state, continuationKey, ownerForLock, storedClaimToken))
+    const continuationMatchesCurrent = Boolean(continuationKey && continuation?.key === continuationKey
+      && debugSameLineageOwner(continuation.owner, ownerForLock))
+    const turnInput = debugRecord(turn?.input)
+    const automationSnapshot = await vi.importActual<{
+      parseScheduledAutomationSnapshot(value: unknown): unknown
+    }>("@/lib/agent/scheduled-automation-snapshot")
+    let persistedSnapshot: unknown
+    try { persistedSnapshot = automationSnapshot.parseScheduledAutomationSnapshot(turnInput?.scheduledAutomationSnapshot) }
+    catch { persistedSnapshot = undefined }
+    const persistedSnapshotValid = turnInput?.automationRunMode === "scheduled"
+      && persistedSnapshot !== undefined && persistedSnapshot !== null
+    const scheduledWaitStored = state?.scheduledTaskGraphScheduledWaitId
+    const scheduledWaitIdConsistent = scheduledWaitStored === undefined
+      || typeof scheduledWaitStored === "string" && (suppliedWaitId === undefined || scheduledWaitStored === suppliedWaitId)
+    const effectiveWaitId = scheduledWaitIdConsistent
+      ? typeof scheduledWaitStored === "string" ? scheduledWaitStored : suppliedWaitId : undefined
+    const snapshotRequiresApproval = debugRecord(persistedSnapshot)?.requireApproval === true
+    const effectiveWaitIdValid = snapshotRequiresApproval
+      ? typeof effectiveWaitId === "string" && effectiveWaitId.startsWith(`agent-question:${owner.turnId}:canonical:`)
+      : effectiveWaitId === undefined
+    const persistedPrepareWaitValid = persistedSnapshotValid && scheduledWaitIdConsistent && effectiveWaitIdValid
+    const claimValid = Boolean(continuationKey && claim && Object.keys(claim).length === 6
+      && claim.schemaVersion === "agent-harness.v2.scheduled-pipeline-claim.v1"
+      && debugValidId(claim.claimToken) && claim.claimToken === storedClaimToken
+      && claim.key === continuationKey && debugSameLineageOwner(claim.owner, ownerForLock)
+      && typeof claim.claimedAt === "string" && Number.isFinite(Date.parse(claim.claimedAt))
+      && typeof claim.leaseExpiresAt === "string" && Number.isFinite(Date.parse(claim.leaseExpiresAt)))
+    const questionResult = typeof effectiveWaitId === "string"
+      ? await pool!.query<Record<string, unknown>>(`SELECT "id", "stepId", "taskId", "type", "status", "content" FROM "agent_items"
+          WHERE "id"=$1 AND "sessionId"=$2 AND "turnId"=$3`,
+        [`agent-wait:question:${effectiveWaitId}`, owner.sessionId, owner.turnId])
+      : null
+    const question = questionResult?.rows[0]
+    const gateInput = await vi.importActual<{
+      scheduledTaskGraphAnalyzeCheckpointForGate(state: unknown): unknown
+      isScheduledTaskGraphGateProofCurrent(input: Record<string, unknown>, tx: unknown): Promise<boolean>
+    }>("@/lib/agent/scheduled-taskgraph-gate-input")
+    const webDb = await vi.importActual<{ db: { $transaction<T>(work: (tx: unknown) => Promise<T>): Promise<T> } }>(scheduledWebDbPath)
+    const analyzeCheckpoint = gateInput.scheduledTaskGraphAnalyzeCheckpointForGate(execution?.state)
+    const gateProofCurrent = Boolean(persistedSnapshotValid && analyzeCheckpoint && await webDb.db.$transaction(tx => gateInput.isScheduledTaskGraphGateProofCurrent({
+      owner: ownerForLock, snapshot: persistedSnapshot, analyzeCheckpoint,
+      analyzeAttestation: requestBody.attestation, prepareProof: requestBody.prepareProof,
+      gate: { taskId: gateTaskId, attemptCount: Number(gateAttemptCount), phase: "running" },
+    }, tx)))
+    const prepareWait = await vi.importActual<{
+      validateScheduledPrepareWaitIdentity(input: { owner: unknown; snapshot: unknown; proof: unknown; scheduledWaitId?: string }): Promise<boolean>
+    }>("@/lib/agent/scheduled-taskgraph-run-service")
+    const prepareWaitIdentityValid = persistedPrepareWaitValid && await prepareWait.validateScheduledPrepareWaitIdentity({ owner: ownerForLock,
+      snapshot: persistedSnapshot, proof: requestBody.prepareProof,
+      ...(effectiveWaitId !== undefined ? { scheduledWaitId: effectiveWaitId } : {}) })
+    const questionContent = debugRecord(question?.content)
+    const attestation = debugRecord(requestBody.attestation), scout = debugRecord(attestation?.scout), candidateIds = scout?.candidateJobIds
+    const candidateIdsValid = Array.isArray(candidateIds) && candidateIds.length <= 100
+      && candidateIds.every(id => typeof id === "string" && id.length > 0 && id.length <= 256 && id.trim() === id)
+      && new Set(candidateIds).size === candidateIds.length
+    const ownedJobRows = candidateIdsValid
+      ? await pool!.query<{ id: string }>(`SELECT "id" FROM "Job" WHERE "userId"=$1 AND "id" = ANY($2::text[])`,
+        [owner.userId, candidateIds]) : null
+    const candidateJobsMatch = Boolean(candidateIdsValid && ownedJobRows && ownedJobRows.rows.length === candidateIds.length
+      && new Set(ownedJobRows.rows.map(row => row.id)).size === candidateIds.length)
+    return {
+      ...safeResponse,
+      session: { rowPresent: Boolean(session), status: session?.status ?? null,
+        available: Boolean(session && !["aborted", "archived"].includes(String(session.status))) },
+      turn: { identityMatches: turnIdentityMatches, sourceMatches: turn?.source === "automation",
+        modeMatches: turn?.executionMode === "canonical_task_graph", snapshotValid: persistedSnapshotValid, status: turn?.status ?? null,
+        leaseVersion: Number.isSafeInteger(turn?.leaseVersion) ? Number(turn?.leaseVersion) : null,
+        leaseOwnerMatchesRequest: turn?.leaseOwnerId === owner.turnLeaseOwnerId,
+        leaseUnexpired: Number.isFinite(turnDate) && turnDate > Date.now(), gateChildFenceCurrent: turnFenceCurrent },
+      root: { identityMatches: rootIdentityMatches, status: root?.status ?? null,
+        attemptCount: Number.isSafeInteger(root?.attemptCount) ? Number(root?.attemptCount) : null,
+        interruptRequested: root?.interruptRequestedAt != null, closed: root?.closedAt != null },
+      gate: { identityMatches: Boolean(gate && gate.id === gateTaskId && gate.sessionId === owner.sessionId
+          && gate.turnId === owner.turnId && gate.rootTaskId === owner.rootTaskId && gate.parentTaskId === owner.rootTaskId),
+        depth: Number.isSafeInteger(gate?.depth) ? Number(gate?.depth) : null, status: gate?.status ?? null,
+        attemptCount: Number.isSafeInteger(gate?.attemptCount) ? Number(gate?.attemptCount) : null,
+        leaseOwnerMatchesRequest: gate?.leaseOwner === gateLeaseOwnerId,
+        leaseUnexpired: Number.isFinite(gateDate) && gateDate > Date.now(), taskPolicyMatches: gateTaskPolicyMatches,
+        exactChildFenceCurrent: gateLeaseCurrent },
+      execution: { rowPresent: Boolean(execution), status: execution?.status ?? null,
+        attemptCount: Number.isSafeInteger(execution?.attemptCount) ? Number(execution?.attemptCount) : null,
+        nextStage: typeof state?.nextStage === "string" ? state.nextStage : null,
+        stageAllowsGateAction: ["gate", "execute", "audit"].includes(String(state?.nextStage)),
+        stageIsGate: state?.nextStage === "gate",
+        scheduledWaitIdConsistent, effectiveWaitIdPresent: typeof effectiveWaitId === "string",
+        persistedPrepareWaitValid,
+        claimPresent: Boolean(claim), claimValid, claimMatchesCurrent, continuationMatchesCurrent,
+        claimLeaseUnexpired: Boolean(claim && typeof claim.leaseExpiresAt === "string" && Date.parse(claim.leaseExpiresAt) > Date.now()) },
+      prepareWait: { identityValid: prepareWaitIdentityValid, itemPresent: Boolean(question), type: question?.type ?? null,
+        status: question?.status ?? null, latestRootStepStatus: latestStep?.status ?? null,
+        latestRootStepOrdinal: Number.isSafeInteger(latestStep?.ordinal) ? Number(latestStep?.ordinal) : null,
+        latestRootStepAttempt: Number.isSafeInteger(latestStep?.attempt) ? Number(latestStep?.attempt) : null,
+        latestStepMatchesQuestionStep: Boolean(latestStep && question && latestStep.id === question.stepId
+          && latestStep.id === fixture.rootQuestionStepId),
+        questionTaskMatchesRoot: question?.taskId === owner.rootTaskId,
+        questionAnswered: typeof questionContent?.answeredAt === "string",
+        answerAvailable: questionContent?.answerAvailable === true },
+      jobs: { candidateIdsValid, candidateCount: candidateIdsValid ? candidateIds.length : null, candidateJobsMatch },
+      gateProofCurrent,
+    }
+  } catch {
+    return { ...safeResponse, diagnosticsUnavailable: true }
+  }
+}
+
+function debugRecord(value: unknown): Record<string, unknown> | null {
+  const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
+  return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null
+}
+function debugDate(value: unknown): number {
+  return value instanceof Date ? value.getTime() : typeof value === "string" ? Date.parse(value) : Number.NaN
+}
+function debugSameJson(left: unknown, right: unknown): boolean {
+  try { return JSON.stringify(debugCanonical(left)) === JSON.stringify(debugCanonical(right)) } catch { return false }
+}
+function debugCanonical(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(debugCanonical)
+  const row = debugRecord(value)
+  return row ? Object.fromEntries(Object.keys(row).sort().map(key => [key, debugCanonical(row[key])])) : value
+}
+function debugValidId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value
+}
+function debugSameLineageOwner(value: unknown, owner: Record<string, unknown>): boolean {
+  const row = debugRecord(value)
+  return Boolean(row && ["userId", "sessionId", "turnId", "rootTaskId", "rootAttemptCount", "executionId", "executionAttemptCount"]
+    .every(key => row[key] === owner[key]))
 }
 
 function assertExactExecuteResponse(value: ExecuteHttpResponse): void {
@@ -309,10 +518,11 @@ async function findTaskId(taskType: string, rootTaskId: string): Promise<string>
   if (rows.rows.length !== 1) throw new Error(`scheduled Audit task identity invalid: ${taskType}`)
   return rows.rows[0]!.id
 }
-async function taskState(taskId: string): Promise<Record<string, unknown>> {
-  const row = (await pool!.query(`SELECT "status", "attemptCount", "result", "failureReason" FROM "sub_agent_tasks" WHERE "id"=$1`, [taskId])).rows[0]
+async function taskState(taskId: string): Promise<{ status: string; attemptCount: number; result: unknown }> {
+  const row = (await pool!.query<{ status: string; attemptCount: number; result: unknown }>(
+    `SELECT "status", "attemptCount", "result" FROM "sub_agent_tasks" WHERE "id"=$1`, [taskId])).rows[0]
   if (!row) throw new Error("scheduled Audit task missing")
-  return row as Record<string, unknown>
+  return row
 }
 async function graphCount(fixture: Fixture): Promise<{ auditNodes: number }> {
   const loaded = await loadTaskGraph(pool as never, fixture.graphScope, false)
