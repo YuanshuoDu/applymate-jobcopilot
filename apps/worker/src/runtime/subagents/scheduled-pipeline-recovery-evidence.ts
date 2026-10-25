@@ -3,6 +3,8 @@ import type pg from "pg"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import { parseTurnQuestionGateChoiceBinding, parseTurnScheduledGateChoiceItemState, turnScheduledGateChoiceWaitId } from "../turns/turn-question-gate-choice-contract.js"
 import { scheduledAuditWaitKey } from "./scheduled-audit-resume.js"
+import { classifyScheduledPipelineRecoveryGraphItem } from "./scheduled-pipeline-recovery-graph-item.js"
+import { taskGraphItemId } from "./task-graph-snapshot.js"
 import { validateScheduledPipelineRecoverySteps, type ScheduledPipelineRecoveryOwner, type ScheduledPipelineRecoverySource,
   type ScheduledPipelineRecoveryStepEvidence, type ScheduledPipelineRecoveryTail } from "./scheduled-pipeline-recovery-step.js"
 
@@ -18,10 +20,10 @@ export async function readScheduledPipelineRecoveryEvidence(client: QueryClient,
   [owner.sessionId, owner.turnId, owner.rootTaskId, source.sourceStepOrdinal])
   if (!steps.rows.length) return null
   const ids = steps.rows.map(step => String(step.id))
-  const events = await client.query<Row>(`SELECT "id", "taskId", "itemId", "type", "actor", "correlationId", "idempotencyKey", "payload"
-    FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "correlationId" = ANY($4::text[])`,
-  [owner.sessionId, owner.turnId, owner.rootTaskId, ids])
-  const items = await client.query<Row>(`SELECT "id", "stepId", "taskId", "type", "status", "content"
+  const events = await client.query<Row>(`SELECT "id", "sessionId", "turnId", "taskId", "itemId", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload"
+    FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND ("correlationId" = ANY($4::text[]) OR ("itemId" = $5 AND "type" = 'item.delta' AND "actor" = 'orchestrator' AND "correlationId" = $6 AND "causationId" = ANY($4::text[])))`,
+  [owner.sessionId, owner.turnId, owner.rootTaskId, ids, taskGraphItemId(owner.rootTaskId), owner.turnId])
+  const items = await client.query<Row>(`SELECT "id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "revision", "content"
     FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = ANY($4::text[])`,
   [owner.sessionId, owner.turnId, owner.rootTaskId, ids])
   const waits = await client.query<Row>(`SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "idempotencyKey",
@@ -30,13 +32,15 @@ export async function readScheduledPipelineRecoveryEvidence(client: QueryClient,
   [owner.sessionId, owner.turnId, owner.rootTaskId, ids])
   const evidence: ScheduledPipelineRecoveryStepEvidence[] = []
   for (const step of steps.rows) {
-    const id = String(step.id), ownEvents = events.rows.filter(event => event.correlationId === id)
+    const id = String(step.id), ownEvents = events.rows.filter(event => event.correlationId === id || event.causationId === id)
     const starts = ownEvents.filter(event => event.type === "step.started"), completes = ownEvents.filter(event => event.type === "step.completed")
     const ownItems = items.rows.filter(item => item.stepId === id), ownWaits = waits.rows.filter(wait => wait.stepId === id)
+    const graphItem = classifyScheduledPipelineRecoveryGraphItem({ owner: source.owner, stepId: id, items: ownItems, events: ownEvents })
+    const recoveryItems = graphItem === "verified_plan" ? ownItems.filter(item => item.id !== taskGraphItemId(owner.rootTaskId)) : ownItems
     const consumedInputIds = idsFrom(step.consumedInputIds)
     const completion = completes.length === 1 ? object(completes[0]?.payload) : null
     const completionWaitId = typeof completion?.waitId === "string" ? completion.waitId : null
-    const receipt = consumedInputIds ? await recoveryReceipt(client, owner, source, step, ownItems, ownWaits,
+    const receipt = consumedInputIds && graphItem !== "invalid" ? await recoveryReceipt(client, owner, source, step, recoveryItems, ownWaits,
       completionWaitId) : "invalid"
     const waitId = receipt === "scheduled_wait" ? completionWaitId : null
     evidence.push({ id, taskId: typeof step.taskId === "string" ? step.taskId : null, ordinal: Number(step.ordinal),
@@ -45,9 +49,9 @@ export async function readScheduledPipelineRecoveryEvidence(client: QueryClient,
       estimatedCostUsd: Number(step.estimatedCostUsd), consumedInputIds: consumedInputIds ?? [],
       modelProfileSnapshot: step.modelProfileSnapshot as ScheduledPipelineRecoveryStepEvidence["modelProfileSnapshot"],
       startedEvents: starts, completedEvents: completes, waitId,
-      hasModelActivity: ownEvents.some(event => String(event.type).startsWith("model.")) || ownItems.some(item => item.type !== "question"),
+      hasModelActivity: ownEvents.some(event => String(event.type).startsWith("model.")) || recoveryItems.some(item => item.type !== "question"),
       hasToolActivity: ownEvents.some(event => String(event.type).startsWith("tool_call."))
-        || ownItems.some(item => item.type === "tool_call" || item.type === "tool_result"),
+        || recoveryItems.some(item => item.type === "tool_call" || item.type === "tool_result"),
       hasFinalRejection: ownEvents.some(event => event.type === "final.rejected"), receipt })
   }
   return validateScheduledPipelineRecoverySteps(source, evidence) ?? false

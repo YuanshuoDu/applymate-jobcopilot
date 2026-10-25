@@ -1,9 +1,15 @@
 import { createHash } from 'node:crypto'
+import { AGENT_STREAM_SCHEMA_VERSION } from '@jobcopilot/agent-protocol'
 import { Prisma } from '@prisma/client'
 import { describe, expect, it, vi } from 'vitest'
 import type { ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 import { validateScheduledTaskGraphAuditRecoveryEvidence } from './scheduled-taskgraph-audit-recovery-evidence'
 
+const SCHEDULED_AUDIT_TEMPLATE_ID = 'scheduled_audit'
+const SCHEDULED_AUDIT_NODE_GOAL = 'Return the exact report from the authenticated scheduled Audit continuation after Gate completion.'
+const SCHEDULED_AUDIT_NODE_CRITERIA = ['Continue the exact scheduled execution only after its canonical Gate proof is verified.',
+  'Return only the fixed seven-field report without adding actions or interpreting historical counts.',
+  'Never submit applications or invoke model or tool runtimes.']
 const owner: ScheduledTaskGraphPipelineOwner = { userId: 'user-1', sessionId: 'session-1', turnId: 'turn-1', rootTaskId: 'root-1',
   rootAttemptCount: 2, turnLeaseOwnerId: 'worker-1', turnLeaseVersion: 3, executionId: 'execution-1', executionAttemptCount: 0 }
 const source = { sourceEventId: 'candidate-event-1', stepId: 'candidate-step-4', ordinal: 4 }
@@ -24,10 +30,10 @@ function recoveryStep(status: string, options: Readonly<{ errorCode?: string | n
     inputTokens: 0, outputTokens: 0, estimatedCostUsd: options.decimal ? new Prisma.Decimal(0) : 0, marker }
 }
 function lifecycle(step: ReturnType<typeof recoveryStep>, completion?: Record<string, unknown>) {
-  const events = [{ id: `${step.id}-start`, taskId: owner.rootTaskId, itemId: null, type: 'step.started', actor: 'orchestrator',
+  const events = [{ id: `${step.id}-start`, sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.rootTaskId, itemId: null, type: 'step.started', actor: 'orchestrator',
     correlationId: step.id, idempotencyKey: `turn:${owner.turnId}:event:step-started:${step.id}`,
     payload: { stepId: step.id, ordinal: step.ordinal, taskId: owner.rootTaskId, scheduledPipelineRecoveryStep: step.marker } }]
-  if (completion) events.push({ id: `${step.id}-complete`, taskId: owner.rootTaskId, itemId: null, type: 'step.completed', actor: 'orchestrator',
+  if (completion) events.push({ id: `${step.id}-complete`, sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.rootTaskId, itemId: null, type: 'step.completed', actor: 'orchestrator',
     correlationId: step.id, idempotencyKey: `turn:${owner.turnId}:event:step-completed:${step.id}`, payload: completion } as typeof events[number])
   return events
 }
@@ -67,15 +73,57 @@ function choiceItem(status: 'started' | 'completed' = 'started') {
       answerAvailable: status === 'completed', scheduledGateChoiceBinding: binding,
       ...(status === 'completed' ? { answeredAt: '2026-10-25T12:00:00.000Z' } : {}) } }
 }
+function auditGraphContent() { return { schemaVersion: 'agent-harness.v2.task-graph', nodes: [
+  { key: 'scout', templateId: 'scout', goal: 'Find evidence', successCriteria: ['Found evidence'], dependsOn: [], depth: 1,
+    taskId: 'scout-child-1', verificationDisposition: 'legacy_unverified' },
+  { key: 'analyst', templateId: 'analyst', goal: 'Review evidence', successCriteria: ['Reviewed evidence'], dependsOn: ['scout'], depth: 2,
+    taskId: 'analyst-child-1', verificationDisposition: 'legacy_unverified' },
+  { key: 'prepare', templateId: 'prepare', goal: 'Prepare the application', successCriteria: ['Preparation is complete'], dependsOn: ['analyst'], depth: 3,
+    taskId: 'prepare-child-1', verificationDisposition: 'specialized' },
+  { key: 'gate', templateId: 'gate', goal: 'Review the application', successCriteria: ['Review is complete'], dependsOn: ['prepare'], depth: 4,
+    taskId: 'gate-1', verificationDisposition: 'specialized' },
+  { key: SCHEDULED_AUDIT_TEMPLATE_ID, templateId: SCHEDULED_AUDIT_TEMPLATE_ID, goal: SCHEDULED_AUDIT_NODE_GOAL,
+    successCriteria: SCHEDULED_AUDIT_NODE_CRITERIA, dependsOn: ['gate'], depth: 5,
+    taskId: 'audit-1', verificationDisposition: 'specialized' },
+] } }
+function taskGraphId() { return `task-graph-${createHash('sha256').update(owner.rootTaskId).digest('hex')}` }
+function auditGraphItem(stepId: string, revision = 7, content = auditGraphContent()) {
+  return { id: taskGraphId(), sessionId: owner.sessionId, turnId: owner.turnId, stepId, taskId: owner.rootTaskId,
+    type: 'task_graph', status: 'streaming', phase: null, revision, content }
+}
+function auditGraphProposal(stepId: string, revision = 6, content = auditGraphContent()) {
+  const id = taskGraphId(), now = '2026-10-25T12:10:00.000Z'
+  const item = { schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id, sessionId: owner.sessionId, turnId: owner.turnId,
+    stepId, taskId: owner.rootTaskId, type: 'task_graph', status: 'streaming', phase: null, revision, content,
+    startedAt: now, completedAt: null, createdAt: now, updatedAt: now }
+  const payload = { kind: 'proposal', fingerprint: 'f'.repeat(64), revision,
+    receipt: { status: 'accepted', revision, nodes: [{ key: SCHEDULED_AUDIT_TEMPLATE_ID, taskId: 'audit-1', status: 'queued' }],
+      readyTaskIds: ['audit-1'] }, item, content }
+  return { id: `${stepId}-proposal`, sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.rootTaskId,
+    itemId: id, type: 'item.delta', actor: 'orchestrator', correlationId: owner.turnId, causationId: stepId,
+    idempotencyKey: `${id}:proposal:${revision - 1}`, payload }
+}
 function auditWaitKey(taskId: string, stepId: string, attempt: number) { const digest = createHash('sha256')
   .update(JSON.stringify([taskId, stepId, attempt]), 'utf8').digest('hex'); return `scheduled-audit-wait:${digest}` }
 function fixture(options: Readonly<{ steps?: readonly Record<string, unknown>[]; events?: readonly Record<string, unknown>[];
   items?: readonly Record<string, unknown>[]; waits?: readonly Record<string, unknown>[]; tasks?: readonly Record<string, unknown>[] }> = {}) {
   const steps = options.steps ?? [], events = options.events ?? [], items = options.items ?? [], waits = options.waits ?? [], tasks = options.tasks ?? []
-  const reader = { agentStep: { findMany: vi.fn(async () => steps) }, agentEvent: { findMany: vi.fn(async () => events) },
+  const reader = { agentStep: { findMany: vi.fn(async () => steps) }, agentEvent: { findMany: vi.fn(async (args?: unknown) => filterEvents(events, args)) },
     agentItem: { findMany: vi.fn(async () => items) }, agentWaitCondition: { findMany: vi.fn(async () => waits) },
     subAgentTask: { findMany: vi.fn(async () => tasks) } } as unknown as Prisma.TransactionClient
   return { reader }
+}
+function filterEvents(events: readonly Record<string, unknown>[], args: unknown) {
+  const where = args && typeof args === 'object' ? (args as { where?: Record<string, unknown> }).where : undefined
+  if (!where) return events
+  return events.filter(event => Object.entries(where).every(([key, filter]) => {
+    if (filter && typeof filter === 'object' && !Array.isArray(filter)) {
+      const row = filter as Record<string, unknown>
+      if (Array.isArray(row.in)) return row.in.includes(event[key])
+      if (typeof row.startsWith === 'string') return typeof event[key] === 'string' && event[key].startsWith(row.startsWith)
+    }
+    return event[key] === filter
+  }))
 }
 function validate(reader: Prisma.TransactionClient, fields: Partial<{ owner: ScheduledTaskGraphPipelineOwner; rootAttemptCount: number }> = {}) {
   return validateScheduledTaskGraphAuditRecoveryEvidence({ reader, owner: fields.owner ?? owner, source,
@@ -184,12 +232,56 @@ describe('scheduled TaskGraph Audit recovery evidence', () => {
   it('rejects model, tool, replan, and non-question item receipts', async () => {
     const step = recoveryStep('completed'), base = lifecycle(step, completedPayload(step, 'completed'))
     for (const event of ['model.started', 'tool_call.started', 'final.rejected']) {
-      const f = fixture({ steps: [step], events: [...base, { id: `e-${event}`, type: event, correlationId: step.id }] })
+      const f = fixture({ steps: [step], events: [...base, { id: `e-${event}`, sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.rootTaskId, itemId: null, actor: 'orchestrator', type: event, correlationId: step.id }] })
       await expect(validate(f.reader)).resolves.toBe(false)
     }
     const withToolItem = fixture({ steps: [step], events: base, items: [{ id: 'tool-item', stepId: step.id,
       taskId: owner.rootTaskId, type: 'tool_call', status: 'completed', content: {} }] })
     await expect(validate(withToolItem.reader)).resolves.toBe(false)
+  })
+
+  it('accepts a streaming recovery Step after stripping its exact graph item', async () => {
+    const step = recoveryStep('streaming'), content = auditGraphContent()
+    const f = fixture({ steps: [step], events: [...lifecycle(step), auditGraphProposal(step.id, 6, content)],
+      items: [auditGraphItem(step.id, 7, content)] })
+    await expect(validate(f.reader)).resolves.toBe(true)
+  })
+
+  it('strips the exact graph item while retaining the scheduled Gate question', async () => {
+    const step = recoveryStep('waiting_for_user'), question = choiceItem(), content = auditGraphContent()
+    const f = fixture({ steps: [step], events: [...lifecycle(step, completedPayload(step, 'waiting_for_user')),
+      auditGraphProposal(step.id, 6, content)], items: [question, auditGraphItem(step.id, 7, content)], tasks: [gateTask()] })
+    await expect(validate(f.reader)).resolves.toBe(true)
+  })
+
+  it('requires a fresh R2 receipt after the singleton moves from R1', async () => {
+    const first = recoveryStep('waiting_for_tool'), second = recoveryStep('waiting_for_tool', { id: 'recovery-step-2', ordinal: 8,
+      cursor: '12', recoveryCursor: 2, predecessorStepId: first.id, errorCode: 'scheduled_audit_completion_unverified' })
+    const content = auditGraphContent(), gate = gateWait(first.id), audit = auditWait(first.id)
+    const events = [...lifecycle(first, completedPayload(first, 'waiting_for_dependency', { waitId: audit.id })),
+      ...lifecycle(second, completedPayload(second, 'waiting_for_dependency', { errorCode: second.errorCode! })),
+      auditGraphProposal(first.id, 6, content), auditGraphProposal(second.id, 7, content)]
+    const current = fixture({ steps: [first, second], events, items: [auditGraphItem(second.id, 8, content)],
+      waits: [gate, audit], tasks: [gateTask(), auditTask(2)] })
+    await expect(validate(current.reader)).resolves.toBe(true)
+    const staleOnly = fixture({ steps: [first, second], events: [...events.filter(event => !String(event.id).startsWith(`${second.id}-proposal`))],
+      items: [auditGraphItem(second.id, 8, content)], waits: [gate, audit], tasks: [gateTask(), auditTask(2)] })
+    await expect(validate(staleOnly.reader)).resolves.toBe(false)
+  })
+
+  it('rejects duplicate graph singleton rows', async () => {
+    const step = recoveryStep('streaming'), content = auditGraphContent(), graph = auditGraphItem(step.id, 7, content)
+    const f = fixture({ steps: [step], events: [...lifecycle(step), auditGraphProposal(step.id, 6, content)], items: [graph, { ...graph }] })
+    await expect(validate(f.reader)).resolves.toBe(false)
+  })
+
+  it('does not remove an unrelated item when a verified graph item is present', async () => {
+    const step = recoveryStep('waiting_for_user'), question = choiceItem(), content = auditGraphContent()
+    const f = fixture({ steps: [step], events: [...lifecycle(step, completedPayload(step, 'waiting_for_user')),
+      auditGraphProposal(step.id, 6, content)], items: [question, auditGraphItem(step.id, 7, content),
+        { id: 'tool-item', stepId: step.id, taskId: owner.rootTaskId, type: 'tool_call', status: 'completed', content: {} }],
+      tasks: [gateTask()] })
+    await expect(validate(f.reader)).resolves.toBe(false)
   })
 
   it('accepts a genuine completion and an exact no-new-wait blocker', async () => {

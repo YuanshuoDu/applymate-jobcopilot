@@ -1,7 +1,11 @@
 import { createHash } from "node:crypto"
+import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { describe, expect, it, vi } from "vitest"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import { scheduledAuditWaitKey } from "./scheduled-audit-resume.js"
+import { SCHEDULED_AUDIT_NODE_CRITERIA, SCHEDULED_AUDIT_NODE_GOAL, SCHEDULED_AUDIT_TEMPLATE_ID } from "./scheduled-audit-contract.js"
+import { createTurnScheduledGateChoiceContent, TURN_SCHEDULED_GATE_CHOICE_SCHEMA, turnScheduledGateChoiceWaitId } from "../turns/turn-question-gate-choice-contract.js"
+import { taskGraphItemId, taskGraphProposalKey, TASK_GRAPH_ITEM_TYPE, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import { readScheduledPipelineRecoveryEvidence } from "./scheduled-pipeline-recovery-evidence.js"
 import { SCHEDULED_PIPELINE_RECOVERY_STEP_PROFILE_KEY, scheduledPipelineRecoveryStepMarker,
   withScheduledPipelineRecoveryStepProfile, type ScheduledPipelineRecoverySource,
@@ -85,6 +89,49 @@ function gateTask() {
   return { id: "gate-child-1", parentTaskId: owner.rootTaskId, rootTaskId: owner.rootTaskId, sessionId: owner.sessionId,
     turnId: owner.turnId, depth: 1, role: "prepare", taskType: "scheduled_taskgraph_gate", maxAttempts: 3,
     userId: owner.userId }
+}
+
+function auditGraphContent() {
+  return { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
+    { key: "scout", templateId: "scout", goal: "Find evidence", successCriteria: ["Found evidence"], dependsOn: [], depth: 1,
+      taskId: "scout-child-1", verificationDisposition: "legacy_unverified" },
+    { key: "analyst", templateId: "analyst", goal: "Review evidence", successCriteria: ["Reviewed evidence"], dependsOn: ["scout"], depth: 2,
+      taskId: "analyst-child-1", verificationDisposition: "legacy_unverified" },
+    { key: "prepare", templateId: "prepare", goal: "Prepare the application", successCriteria: ["Preparation is complete"], dependsOn: ["analyst"], depth: 3,
+      taskId: "prepare-child-1", verificationDisposition: "specialized" },
+    { key: "gate", templateId: "gate", goal: "Review the application", successCriteria: ["Review is complete"], dependsOn: ["prepare"], depth: 4,
+      taskId: "gate-child-1", verificationDisposition: "specialized" },
+    { key: SCHEDULED_AUDIT_TEMPLATE_ID, templateId: SCHEDULED_AUDIT_TEMPLATE_ID, goal: SCHEDULED_AUDIT_NODE_GOAL,
+      successCriteria: SCHEDULED_AUDIT_NODE_CRITERIA, dependsOn: ["gate"], depth: 5,
+      taskId: "audit-child-1", verificationDisposition: "specialized" },
+  ] }
+}
+function auditGraphItem(stepId: string, revision = 7, content = auditGraphContent()) {
+  return { id: taskGraphItemId(owner.rootTaskId), sessionId: owner.sessionId, turnId: owner.turnId, stepId,
+    taskId: owner.rootTaskId, type: TASK_GRAPH_ITEM_TYPE, status: "streaming", phase: null, revision, content }
+}
+function auditGraphProposal(stepId: string, revision = 6, content = auditGraphContent(), eventId = `${stepId}-proposal`) {
+  const id = taskGraphItemId(owner.rootTaskId), now = "2026-10-25T12:10:00.000Z"
+  const item = { schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id, sessionId: owner.sessionId, turnId: owner.turnId,
+    stepId, taskId: owner.rootTaskId, type: TASK_GRAPH_ITEM_TYPE, status: "streaming", phase: null, revision,
+    content, startedAt: now, completedAt: null, createdAt: now, updatedAt: now }
+  const payload = { kind: "proposal", fingerprint: "f".repeat(64), revision,
+    receipt: { status: "accepted", revision, nodes: [{ key: SCHEDULED_AUDIT_TEMPLATE_ID,
+      taskId: "audit-child-1", status: "queued" }], readyTaskIds: ["audit-child-1"] }, item, content }
+  return { id: eventId, sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.rootTaskId, itemId: id,
+    type: "item.delta", actor: "orchestrator", correlationId: owner.turnId, causationId: stepId,
+    idempotencyKey: taskGraphProposalKey(owner.rootTaskId, revision - 1), payload }
+}
+function gateQuestion(stepId: string) {
+  const binding = { schemaVersion: TURN_SCHEDULED_GATE_CHOICE_SCHEMA, owner: { userId: owner.userId,
+    sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId, rootAttemptCount: 2,
+    executionId: "execution-1", executionAttemptCount: 0 }, continuationKey: `scheduled-taskgraph:sha256:${"a".repeat(64)}`,
+    snapshotDigest: `sha256:${"b".repeat(64)}`, evidenceDigest: "c".repeat(64), checkpointDigest: "d".repeat(64),
+    analyzeGraphRevision: 9, graphRevision: 10, gateTaskId: "gate-child-1", gateAttempt: 1, kind: "weak_cover_letter",
+    jobIds: ["job-1"], allowedChoiceIds: ["continue", "review", "skip"] as const }
+  const waitId = turnScheduledGateChoiceWaitId(binding)!
+  return { id: `agent-wait:question:${waitId}`, stepId, taskId: owner.rootTaskId, type: "question", status: "started",
+    content: createTurnScheduledGateChoiceContent(waitId, binding, "A prepared application has a weak cover letter.")! }
 }
 
 function fixture(options: FixtureOptions = {}) {
@@ -195,6 +242,48 @@ describe("scheduled pipeline recovery evidence reader", () => {
     await expect(readScheduledPipelineRecoveryEvidence(withQuestion.client, owner, source)).resolves.toMatchObject({
       marker: { recoveryStepId: "recovery-step-2" }, status: "waiting_for_tool",
     })
+  })
+
+  it("accepts a streaming recovery Step after stripping its exact graph item", async () => {
+    const step = makeStep("recovery-step-1", 5, "11", "streaming", null), content = auditGraphContent()
+    const f = fixture({ steps: [step], events: [...lifecycleEvents(step, null), auditGraphProposal(step.id, 6, content)],
+      items: [auditGraphItem(step.id, 7, content)] })
+    await expect(readScheduledPipelineRecoveryEvidence(f.client, owner, source)).resolves.toMatchObject({
+      marker: { recoveryStepId: step.id }, status: "streaming",
+    })
+  })
+
+  it("keeps a moved singleton on R2 only when R2 has its own proposal receipt", async () => {
+    const base = validAuditAndBlockerFixture(), r1 = "recovery-step-1", r2 = "recovery-step-2", content = auditGraphContent()
+    const events = [...base.events, auditGraphProposal(r1, 6, content), auditGraphProposal(r2, 7, content)]
+    const moved = fixture({ steps: base.steps, events, items: [auditGraphItem(r2, 8, content)], waits: base.waits, tasks: base.tasks })
+    await expect(readScheduledPipelineRecoveryEvidence(moved.client, owner, source)).resolves.toMatchObject({
+      marker: { recoveryStepId: r2, recoveryCursor: 2, predecessorStepId: r1 },
+      status: "waiting_for_tool", errorCode: "scheduled_audit_completion_unverified",
+    })
+
+    const missingR2Receipt = fixture({ steps: base.steps,
+      events: [...base.events, auditGraphProposal(r1, 6, content)], items: [auditGraphItem(r2, 8, content)],
+      waits: base.waits, tasks: base.tasks })
+    await expect(readScheduledPipelineRecoveryEvidence(missingR2Receipt.client, owner, source)).resolves.toBe(false)
+  })
+
+  it("strips only the exact graph item while preserving the scheduled Gate question", async () => {
+    const step = makeStep("recovery-step-1", 5, "11", "waiting_for_user", null), content = auditGraphContent()
+    const question = gateQuestion(step.id)
+    const f = fixture({ steps: [step], events: [...lifecycleEvents(step, { status: "waiting_for_user" }),
+      auditGraphProposal(step.id, 6, content)], items: [auditGraphItem(step.id, 7, content), question], tasks: [gateTask()] })
+    await expect(readScheduledPipelineRecoveryEvidence(f.client, owner, source)).resolves.toMatchObject({
+      marker: { recoveryStepId: step.id }, status: "waiting_for_user",
+    })
+  })
+
+  it("still rejects an unrelated item beside the verified graph item", async () => {
+    const step = makeStep("recovery-step-1", 5, "11", "streaming", null), content = auditGraphContent()
+    const f = fixture({ steps: [step], events: [...lifecycleEvents(step, null), auditGraphProposal(step.id, 6, content)],
+      items: [auditGraphItem(step.id, 7, content), { id: "unrelated-tool", stepId: step.id, taskId: owner.rootTaskId,
+        type: "tool_call", status: "completed", content: {} }] })
+    await expect(readScheduledPipelineRecoveryEvidence(f.client, owner, source)).resolves.toBe(false)
   })
 
   it.each(["model", "tool"] as const)("invalidates recovery evidence after %s activity", async activity => {
