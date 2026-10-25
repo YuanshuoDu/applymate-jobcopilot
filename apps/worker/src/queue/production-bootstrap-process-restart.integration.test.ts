@@ -759,6 +759,7 @@ async function policyDecisionReplayReceipt(pool: Pool, turnId: string, sessionId
     pool.query<{
       callCount: string; resultCount: string; completedCallCount: string
       recoveredTurnEventCount: string; lifecycleCompletionEventCount: string
+      resultStatus: string | null; toolName: string | null
       result: Record<string, unknown> | null
     }>(
       `SELECT
@@ -774,6 +775,8 @@ async function policyDecisionReplayReceipt(pool: Pool, turnId: string, sessionId
            JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
            WHERE event."turnId" = $1 AND event."type" = 'tool_call.completed' AND event."correlationId" = $2
              AND event."idempotencyKey" LIKE 'turn:' || turn."rootTaskId" || ':tool-lifecycle:' || $2 || ':completed:%') AS "lifecycleCompletionEventCount",
+         (SELECT "status" FROM "agent_items" WHERE "turnId" = $1 AND "type" = 'tool_result' AND "content"->>'toolCallId' = $2 LIMIT 1) AS "resultStatus",
+         (SELECT "content"->>'toolName' FROM "agent_items" WHERE "turnId" = $1 AND "type" = 'tool_call' AND "content"->>'toolCallId' = $2 LIMIT 1) AS "toolName",
          (SELECT "content" FROM "agent_items" WHERE "turnId" = $1 AND "type" = 'tool_result' AND "content"->>'toolCallId' = $2 LIMIT 1) AS "result"`,
       [turnId, toolCallId],
     ),
@@ -1663,7 +1666,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     const userId = `policy-replay-user-${suffix}`
     const sessionId = `policy-replay-session-${suffix}`
     const jobId = randomUUID()
-    const searchTarget = `PolicyReplay-${suffix}`
+    const searchTarget = "PolicyReplay Fixture Company"
     const toolCallId = `policy-replay-read-${suffix}`
     const policyIds: FixtureIds = {
       suffix, userId, sessionId, turnId: `policy-replay-turn-pending-${suffix}`,
@@ -1771,9 +1774,11 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     expect(after.root).toMatchObject({ rootTaskId: rootBefore?.rootTaskId, rootAttemptCount: rootBefore?.rootAttemptCount,
       stepId: rootBefore?.stepId, stepAttempt: rootBefore?.stepAttempt, stepTaskId: rootBefore?.rootTaskId })
     expect(after.tools).toMatchObject({ callCount: "1", resultCount: "1", completedCallCount: "1", recoveredTurnEventCount: "1", lifecycleCompletionEventCount: "1" })
-    expect(after.tools?.result).toMatchObject({
-      toolCallId, toolName: "jobs.search", status: "completed",
+    expect(after.tools).toMatchObject({ resultStatus: "completed", toolName: "jobs.search" })
+    expect(after.tools?.result).toEqual({
+      toolCallId,
       output: { jobs: [{ id: jobId, company: searchTarget }] },
+      errorCode: null,
     })
     const final = await pool!.query<{ finalResponse: string | null }>(`SELECT "finalResponse" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`, [policyIds.turnId, sessionId])
     expect(final.rows[0]?.finalResponse).toContain(`POLICY_REPLAY_FINAL_${suffix}`)
