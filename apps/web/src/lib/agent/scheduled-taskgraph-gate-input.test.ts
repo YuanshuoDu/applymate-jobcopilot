@@ -5,11 +5,11 @@ import { hashArtifactContent } from './artifacts/hash'
 import { scheduledAutomationSnapshotDigest, type ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 import { scheduledTaskGraphAnalyzeCheckpointDigest } from './scheduled-taskgraph-gate-checkpoint'
 
-const mocks = vi.hoisted(() => ({ session: vi.fn(), jobs: vi.fn(), resume: vi.fn(), facts: vi.fn(), versions: vi.fn(), heads: vi.fn(), graph: vi.fn(), tasks: vi.fn(), events: vi.fn(), queryRaw: vi.fn(), gateHistory: vi.fn() }))
+const mocks = vi.hoisted(() => ({ session: vi.fn(), jobs: vi.fn(), resume: vi.fn(), facts: vi.fn(), versions: vi.fn(), heads: vi.fn(), graph: vi.fn(), tasks: vi.fn(), task: vi.fn(), events: vi.fn(), queryRaw: vi.fn(), gateHistory: vi.fn() }))
 vi.mock('@/lib/db', () => ({ db: {
   agentSession: { findFirst: mocks.session }, job: { findMany: mocks.jobs }, resume: { findFirst: mocks.resume },
   personaFact: { findMany: mocks.facts }, agentArtifactVersion: { findMany: mocks.versions }, agentArtifact: { findMany: mocks.heads },
-  agentItem: { findFirst: mocks.graph }, subAgentTask: { findMany: mocks.tasks }, agentEvent: { findMany: mocks.events },
+  agentItem: { findFirst: mocks.graph }, subAgentTask: { findMany: mocks.tasks, findFirst: mocks.task }, agentEvent: { findMany: mocks.events },
   $queryRaw: mocks.queryRaw,
 } }))
 vi.mock('./scheduled-taskgraph-gate-history', async importOriginal => ({
@@ -186,9 +186,67 @@ function attachGate(input: ScheduledTaskGraphGateInputRequest, proof: ReturnType
   return { ...input, gate: { taskId: gateTaskId, attemptCount: 1, phase: 'running' as const } }
 }
 
+function attachAudit(input: ScheduledTaskGraphGateInputRequest, proof: ReturnType<typeof makeProof>, graph: Record<string, unknown>,
+  attestation: Record<string, unknown>, gatePhase: 'running' | 'completed' = 'completed', auditDepth = 1) {
+  const gateInput = attachGate(input, proof, graph, attestation)
+  const content = graph.content as { nodes: Record<string, unknown>[] }
+  const auditNode = { key: 'scheduled_audit', templateId: 'scheduled_audit', taskId: 'audit-task', depth: 5, dependsOn: ['gate'],
+    verificationDisposition: 'legacy_unverified', goal: 'Return the exact report from the authenticated scheduled Audit continuation after Gate completion.',
+    successCriteria: ['Continue the exact scheduled execution only after its canonical Gate proof is verified.',
+      'Return only the fixed seven-field report without adding actions or interpreting historical counts.',
+      'Never submit applications or invoke model or tool runtimes.'] }
+  content.nodes.push(auditNode)
+  graph.revision = Number(graph.revision) + 1
+  const rows = taskRows(proof, attestation)
+  rows.push({ id: 'gate-task', sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId, parentTaskId: owner.rootTaskId,
+    depth: 1, role: 'prepare', taskType: 'scheduled_taskgraph_gate', status: gatePhase, attemptCount: 1, maxAttempts: 3, failureReason: null,
+    result: gatePhase === 'completed' ? { status: 'completed' } : null,
+    expectedOutputSchema: { schemaVersion: 'agent-harness.v2.subagent.result', role: 'prepare', taskType: 'scheduled_taskgraph_gate' }, allowedActions: [] })
+  rows.push({ id: 'audit-task', sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId, parentTaskId: owner.rootTaskId,
+    depth: auditDepth, role: 'auditor', taskType: 'scheduled_taskgraph_audit', status: 'queued', attemptCount: 0, maxAttempts: 3, failureReason: null,
+    expectedOutputSchema: { schemaVersion: 'agent-harness.v2.subagent.result', role: 'auditor', taskType: 'scheduled_taskgraph_audit' }, allowedActions: [] })
+  mocks.tasks.mockResolvedValue(rows)
+  mocks.task.mockResolvedValue({ result: { structuredResult: { status: 'completed', nextStage: 'execute', approvedJobIds: [],
+    pendingJobIds: ['job-1'], skippedJobIds: [], counts: { approved: 0, pending: 1, skipped: 0 } } } })
+  return { ...gateInput, gate: { taskId: 'gate-task', attemptCount: 1, phase: gatePhase,
+    ...(gatePhase === 'completed' ? { completionProof: {} } : {}) } }
+}
+
 describe('scheduled TaskGraph Gate input reload', () => {
   beforeEach(() => {
     for (const mock of Object.values(mocks)) mock.mockReset()
+  })
+
+  it('accepts the exact fixed Audit suffix only after Gate completion', async () => {
+    const { input, proof, graph, analyzeAttestation } = setup()
+    const request = attachAudit(input, proof, graph, analyzeAttestation)
+    await expect(loadScheduledTaskGraphGateInput(request)).resolves.toMatchObject({
+      packages: [{ jobId: jobRow.id }], gateResult: { status: 'completed' },
+    })
+    expect(mocks.gateHistory).toHaveBeenCalledWith(expect.objectContaining({
+      auditTask: { id: 'audit-task', status: 'queued', attemptCount: 0 },
+    }))
+  })
+
+  it('rejects a changed Audit suffix and any sixth node', async () => {
+    const mismatched = setup()
+    const mismatchedInput = attachAudit(mismatched.input, mismatched.proof, mismatched.graph, mismatched.analyzeAttestation)
+    ;(mismatched.graph.content as { nodes: Record<string, unknown>[] }).nodes[4]!.goal = 'Different Audit goal'
+    await expect(loadScheduledTaskGraphGateInput(mismatchedInput)).resolves.toBeNull()
+
+    const extra = setup()
+    const extraInput = attachAudit(extra.input, extra.proof, extra.graph, extra.analyzeAttestation)
+    ;(extra.graph.content as { nodes: Record<string, unknown>[] }).nodes.push({ key: 'extra' })
+    await expect(loadScheduledTaskGraphGateInput(extraInput)).resolves.toBeNull()
+
+    const beforeCompletion = setup()
+    const waitingInput = attachAudit(beforeCompletion.input, beforeCompletion.proof, beforeCompletion.graph,
+      beforeCompletion.analyzeAttestation, 'running')
+    await expect(loadScheduledTaskGraphGateInput(waitingInput)).resolves.toBeNull()
+
+    const wrongDepth = setup()
+    const wrongDepthInput = attachAudit(wrongDepth.input, wrongDepth.proof, wrongDepth.graph, wrongDepth.analyzeAttestation, 'completed', 2)
+    await expect(loadScheduledTaskGraphGateInput(wrongDepthInput)).resolves.toBeNull()
   })
 
   it.each(['prepare', 'gate', 'execute', 'audit'] as const)('locks the current graph and proof for a %s checkpoint', async stage => {
