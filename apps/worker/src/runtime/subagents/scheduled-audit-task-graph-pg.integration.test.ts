@@ -88,7 +88,12 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     await expect(continuation(input)).resolves.toMatchObject({ status: "waiting_for_dependency" })
     const gateTaskId = await findTaskId("scheduled_taskgraph_gate", fixture.ids.rootTaskId)
     runner = startRunner(fixture, response.fetcher)
-    await expect(dispatchAndWait(runner, gateTaskId, fixture.ids.sessionId)).resolves.toMatchObject({ status: "completed" })
+    const gateOutcome = await dispatchAndWait(runner, gateTaskId, fixture.ids.sessionId)
+    if (!gateOutcome || typeof gateOutcome !== "object" || !("status" in gateOutcome) || gateOutcome.status !== "completed") {
+      const failedTask = await taskState(gateTaskId)
+      throw new Error(`Scheduled Gate child did not complete: ${JSON.stringify({ outcome: gateOutcome, failureReason: failedTask.failureReason })}`)
+    }
+    expect(gateOutcome).toMatchObject({ status: "completed" })
     expect(response.gateCalls()).toBe(1)
 
     const gateProof = await requireGateProof(fixture)
