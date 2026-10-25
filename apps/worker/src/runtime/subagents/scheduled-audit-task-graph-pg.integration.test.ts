@@ -35,9 +35,9 @@ type GateHttpFailure = Readonly<{ status: number; errorCode: string | null; test
 type ExecuteHttpFailure = Readonly<{ status: number; errorCode: string | null; keys: readonly string[]; reportValid: boolean;
   executionStatus?: string | null; executionCheckpoint?: string | null; executionNextStage?: string | null;
   hasExecutionError?: boolean; executionErrorCode?: string | null; pipelineOutcome?: string;
-  continuation?: Readonly<{ gateResume: string; analyzeCheckpoint: string; continuationKey: string; prepareWait: string;
-    ownerCurrentChecks: readonly string[]; gateInput: string; gateBinding: string; gateHistory: string;
-    gateMaterials: string; gateResult: string; serializedCheckpoint: string; checkpointSave: string }> }>
+  continuation?: Readonly<{ gateResume: string; analyzeCheckpoint: string; continuationKey: string; waitBinding: string;
+    ownerCurrentRecheck: string; prepareWait: string; gateInputRecheck: string; gateProofCurrent: string;
+    serializedCheckpoint: string; checkpointSave: string }> }>
 type GateHistoryProbeRow = Readonly<{ actor: string | null; taskId: string | null; idempotencyKey: string | null; sequence: bigint; payload: unknown }>
 const diagnosticOutcomeStatuses = new Set(["completed", "retrying", "failed", "waiting", "waiting_for_user", "interrupted", "skipped", "lease_lost"])
 const diagnosticGateErrorCodes = new Set([
@@ -76,9 +76,6 @@ const scheduledRunServicePath = "@/lib/agent/run-service"
 const scheduledTaskGraphRunServicePath = "@/lib/agent/scheduled-taskgraph-run-service"
 const scheduledTaskGraphFencePath = "@/lib/agent/scheduled-taskgraph-pipeline-fence"
 const scheduledTaskGraphGateInputPath = "@/lib/agent/scheduled-taskgraph-gate-input"
-const scheduledTaskGraphGateHistoryPath = "@/lib/agent/scheduled-taskgraph-gate-history"
-const scheduledTaskGraphGateMaterialsPath = "@/lib/agent/scheduled-taskgraph-gate-materials"
-const scheduledTaskGraphGateServicePath = "@/lib/agent/scheduled-taskgraph-gate-service"
 const scheduledGateQualityReviewPath = "@/lib/agent/stages/gate-quality-review"
 const scheduledModelRouterPath = "@/lib/model-router"
 const scheduledEntitlementsPath = "@/lib/entitlements"
@@ -110,9 +107,6 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     vi.doUnmock(scheduledTaskGraphRunServicePath)
     vi.doUnmock(scheduledTaskGraphFencePath)
     vi.doUnmock(scheduledTaskGraphGateInputPath)
-    vi.doUnmock(scheduledTaskGraphGateHistoryPath)
-    vi.doUnmock(scheduledTaskGraphGateMaterialsPath)
-    vi.doUnmock(scheduledTaskGraphGateServicePath)
     vi.resetModules()
   })
   afterAll(async () => {
@@ -304,64 +298,22 @@ async function setupFetcher(fixture: Fixture) {
   vi.doMock(scheduledEntitlementsPath, () => ({ isFeatureAllowed: async () => true,
     hasEffectiveEntitlement: async () => true, resolveAiAccess: async () => "available" }))
   let pipelineOutcome = "not_called"
-  let continuation = { gateResume: "not_called", analyzeCheckpoint: "not_checked", continuationKey: "not_checked", prepareWait: "not_checked",
-    ownerCurrentChecks: [] as string[], gateInput: "not_called", gateBinding: "not_called", gateHistory: "not_called",
-    gateMaterials: "not_called", gateResult: "not_called", serializedCheckpoint: "not_called", checkpointSave: "not_called" }
-  type GateHistoryProbe = {
-    scheduledTaskGraphGateBindingIsCurrent(input: unknown): Promise<boolean>
-    scheduledTaskGraphGateHistoryIsCurrent(input: unknown): Promise<boolean>
-  }
-  const gateHistory = await vi.importActual<GateHistoryProbe>(scheduledTaskGraphGateHistoryPath)
-  vi.doMock(scheduledTaskGraphGateHistoryPath, () => ({
-    ...gateHistory,
-    scheduledTaskGraphGateBindingIsCurrent: async (input: unknown) => {
-      const result = await gateHistory.scheduledTaskGraphGateBindingIsCurrent(input)
-      continuation.gateBinding = result ? "current" : "rejected"
-      return result
-    },
-    scheduledTaskGraphGateHistoryIsCurrent: async (input: unknown) => {
-      const result = await gateHistory.scheduledTaskGraphGateHistoryIsCurrent(input)
-      continuation.gateHistory = result ? "current" : "rejected"
-      return result
-    },
-  }))
-  type GateMaterialsProbe = { loadScheduledTaskGraphGateMaterials(input: unknown): Promise<unknown> }
-  const gateMaterials = await vi.importActual<GateMaterialsProbe>(scheduledTaskGraphGateMaterialsPath)
-  vi.doMock(scheduledTaskGraphGateMaterialsPath, () => ({
-    ...gateMaterials,
-    loadScheduledTaskGraphGateMaterials: async (input: unknown) => {
-      try {
-        const result = await gateMaterials.loadScheduledTaskGraphGateMaterials(input)
-        continuation.gateMaterials = result ? "loaded" : "rejected"
-        return result
-      } catch { continuation.gateMaterials = "threw"; throw new Error("scheduled_gate_material_reload_failed") }
-    },
-  }))
-  type GateServiceProbe = { parseScheduledTaskGraphGateResult(value: unknown, jobIds: readonly string[]): unknown }
-  const gateService = await vi.importActual<GateServiceProbe>(scheduledTaskGraphGateServicePath)
-  vi.doMock(scheduledTaskGraphGateServicePath, () => ({
-    ...gateService,
-    parseScheduledTaskGraphGateResult: (value: unknown, jobIds: readonly string[]) => {
-      const result = gateService.parseScheduledTaskGraphGateResult(value, jobIds)
-      continuation.gateResult = result ? "valid" : "rejected"
-      return result
-    },
-  }))
+  let continuation = { gateResume: "not_called", analyzeCheckpoint: "not_checked", continuationKey: "not_checked",
+    waitBinding: "not_checked", ownerCurrentRecheck: "not_checked", prepareWait: "not_checked",
+    gateInputRecheck: "not_checked", gateProofCurrent: "not_checked",
+    serializedCheckpoint: "not_called", checkpointSave: "not_called" }
   type GateInputProbe = {
     loadScheduledTaskGraphGateInput(input: unknown): Promise<unknown>
     scheduledTaskGraphAnalyzeCheckpointForGate(value: unknown): Record<string, unknown> | null
+    isScheduledTaskGraphGateProofCurrent(input: unknown, tx: unknown): Promise<boolean>
   }
   const gateInput = await vi.importActual<GateInputProbe>(scheduledTaskGraphGateInputPath)
-  vi.doMock(scheduledTaskGraphGateInputPath, () => ({
-    ...gateInput,
-    loadScheduledTaskGraphGateInput: async (input: unknown) => {
-      try {
-        const result = await gateInput.loadScheduledTaskGraphGateInput(input)
-        continuation.gateInput = result ? "loaded" : "rejected"
-        return result
-      } catch { continuation.gateInput = "threw"; throw new Error("scheduled_gate_input_reload_failed") }
-    },
-  }))
+  const gateRpc = await vi.importActual<{
+    scheduledTaskGraphExecuteGateCompletionProof(value: unknown): Record<string, unknown> | null
+  }>("@/lib/agent/scheduled-taskgraph-gate-rpc")
+  const diagnosticWebDb = await vi.importActual<{
+    db: { $transaction<T>(work: (tx: unknown) => Promise<T>): Promise<T> }
+  }>(scheduledWebDbPath)
   const continuationCheckpoint = await vi.importActual<{
     scheduledTaskGraphContinuationKey(owner: unknown, attestation: unknown): string
   }>("@/lib/agent/scheduled-taskgraph-pipeline-checkpoint")
@@ -372,11 +324,6 @@ async function setupFetcher(fixture: Fixture) {
   const taskGraphFence = await vi.importActual<ScheduledTaskGraphFenceProbe>(scheduledTaskGraphFencePath)
   vi.doMock(scheduledTaskGraphFencePath, () => ({
     ...taskGraphFence,
-    isScheduledTaskGraphOwnerCurrent: async (owner: unknown, key: string, claimToken: string) => {
-      const current = await taskGraphFence.isScheduledTaskGraphOwnerCurrent(owner, key, claimToken)
-      if (continuation.ownerCurrentChecks.length < 8) continuation.ownerCurrentChecks.push(current ? "current" : "rejected")
-      return current
-    },
     saveScheduledTaskGraphCheckpoint: async (input: unknown) => {
       try {
         const saved = await taskGraphFence.saveScheduledTaskGraphCheckpoint(input)
@@ -402,12 +349,35 @@ async function setupFetcher(fixture: Fixture) {
         continuation.gateResume = "threw"
         const resume = debugRecord(input), owner = resume?.owner
         if (resume && owner) {
-          continuation.analyzeCheckpoint = gateInput.scheduledTaskGraphAnalyzeCheckpointForGate(resume.persistedCheckpoint) ? "valid" : "invalid"
+          const analyzeCheckpoint = gateInput.scheduledTaskGraphAnalyzeCheckpointForGate(resume.persistedCheckpoint)
+          continuation.analyzeCheckpoint = analyzeCheckpoint ? "valid" : "invalid"
           try { continuation.continuationKey = continuationCheckpoint.scheduledTaskGraphContinuationKey(owner, resume.attestation)
             === resume.continuationKey ? "matches" : "mismatch" } catch { continuation.continuationKey = "invalid" }
+          const persistedWaitId = debugRecord(resume.persistedCheckpoint)?.scheduledTaskGraphScheduledWaitId
+          const approvalRequired = debugRecord(resume.snapshot)?.requireApproval === true
+          continuation.waitBinding = approvalRequired
+            ? persistedWaitId === undefined || persistedWaitId === resume.scheduledWaitId ? "consistent" : "mismatch"
+            : persistedWaitId === undefined && resume.scheduledWaitId === undefined ? "consistent" : "mismatch"
+          try {
+            continuation.ownerCurrentRecheck = typeof resume.continuationKey === "string" && typeof resume.claimToken === "string"
+              && await taskGraphFence.isScheduledTaskGraphOwnerCurrent(owner, resume.continuationKey, resume.claimToken) ? "current" : "rejected"
+          } catch { continuation.ownerCurrentRecheck = "threw" }
           try { continuation.prepareWait = await taskGraphRunService.validateScheduledPrepareWaitIdentity({
             owner, snapshot: resume.snapshot, proof: resume.prepareProof, scheduledWaitId: resume.scheduledWaitId,
           }) ? "current" : "rejected" } catch { continuation.prepareWait = "threw" }
+          const completion = gateRpc.scheduledTaskGraphExecuteGateCompletionProof(resume.gateCompletionProof)
+          const gate = debugRecord(completion?.gate)
+          if (analyzeCheckpoint && completion && gate && typeof gate.taskId === "string" && Number.isSafeInteger(gate.attemptCount)) {
+            const request = { owner, snapshot: resume.snapshot, analyzeCheckpoint, analyzeAttestation: resume.attestation,
+              prepareProof: resume.prepareProof,
+              gate: { taskId: gate.taskId, attemptCount: Number(gate.attemptCount), phase: "completed" as const,
+                completionProof: resume.gateCompletionProof } }
+            try { continuation.gateProofCurrent = await diagnosticWebDb.db.$transaction(tx =>
+              gateInput.isScheduledTaskGraphGateProofCurrent(request, tx)) ? "current" : "rejected" }
+            catch { continuation.gateProofCurrent = "threw" }
+            try { continuation.gateInputRecheck = await gateInput.loadScheduledTaskGraphGateInput(request) ? "loaded" : "rejected" }
+            catch { continuation.gateInputRecheck = "threw" }
+          }
         }
         throw error
       }
@@ -452,9 +422,9 @@ async function setupFetcher(fixture: Fixture) {
     expect(request.headers.get("x-agent-worker-secret")).toBe("scheduled-audit-fixture-secret")
     if (body.action === "execute") {
       pipelineOutcome = "not_called"
-      continuation = { gateResume: "not_called", analyzeCheckpoint: "not_checked", continuationKey: "not_checked", prepareWait: "not_checked",
-        ownerCurrentChecks: [], gateInput: "not_called", gateBinding: "not_called", gateHistory: "not_called",
-        gateMaterials: "not_called", gateResult: "not_called", serializedCheckpoint: "not_called", checkpointSave: "not_called" }
+      continuation = { gateResume: "not_called", analyzeCheckpoint: "not_checked", continuationKey: "not_checked", waitBinding: "not_checked",
+        ownerCurrentRecheck: "not_checked", prepareWait: "not_checked", gateInputRecheck: "not_checked", gateProofCurrent: "not_checked",
+        serializedCheckpoint: "not_called", checkpointSave: "not_called" }
     }
     const response = await route.POST(request)
     if (body.action === "gate") {
