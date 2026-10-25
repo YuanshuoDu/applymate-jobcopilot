@@ -1,6 +1,7 @@
 import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { describe, expect, it } from "vitest"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { SCHEDULED_AUDIT_NODE_CRITERIA, SCHEDULED_AUDIT_NODE_GOAL, SCHEDULED_AUDIT_TEMPLATE_ID } from "./scheduled-audit-contract.js"
 import { classifyScheduledPipelineRecoveryGraphItem } from "./scheduled-pipeline-recovery-graph-item.js"
 import { taskGraphItemId, taskGraphProposalKey, TASK_GRAPH_ITEM_TYPE, TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
@@ -14,12 +15,23 @@ const proposalRevision = 6
 const proposalDate = new Date("2026-10-25T12:10:00.000Z").toISOString()
 const persistedDate = new Date("2026-10-25T12:00:00.000Z").toISOString()
 const lifecycleDate = new Date("2026-10-25T12:20:00.000Z").toISOString()
-const contentFor = (auditTaskId = "audit-child-1") => ({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
-  { key: "scout", templateId: "scout", goal: "Find evidence", successCriteria: ["Found evidence"], dependsOn: [], depth: 1,
-    taskId: "scout-child-1", verificationDisposition: "legacy_unverified" },
-  { key: "analyst", templateId: "analyst", goal: "Review evidence", successCriteria: ["Reviewed evidence"], dependsOn: ["scout"], depth: 2,
-    taskId: "analyst-child-1", verificationDisposition: "legacy_unverified" },
-  { key: "prepare", templateId: "prepare", goal: "Prepare the application", successCriteria: ["Preparation is complete"], dependsOn: ["analyst"], depth: 3,
+const scoutVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria: [
+  { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+  { id: "candidate-evidence", check: { kind: "all_candidates_have_evidence", minimumItems: 1 } },
+] }
+const analystVerification = (scoutKey: string) => ({ schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [
+  { id: "scout-membership", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: scoutKey } },
+  { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
+] })
+type RecoveryGraphNode = { key: string; templateId: string; goal: string; successCriteria: readonly string[]; dependsOn: string[];
+  depth: number; taskId: string; verificationDisposition: string; verification?: unknown }
+type RecoveryGraphContent = { schemaVersion: string; nodes: RecoveryGraphNode[] }
+const contentFor = (auditTaskId = "audit-child-1", scoutKey = "scout", analystKey = "analyst"): RecoveryGraphContent => ({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
+  { key: scoutKey, templateId: "scout", goal: "Find evidence", successCriteria: ["Found evidence"], dependsOn: [], depth: 1,
+    taskId: "scout-child-1", verificationDisposition: "typed", verification: scoutVerification },
+  { key: analystKey, templateId: "analyst", goal: "Review evidence", successCriteria: ["Reviewed evidence"], dependsOn: [scoutKey], depth: 2,
+    taskId: "analyst-child-1", verificationDisposition: "typed", verification: analystVerification(scoutKey) },
+  { key: "prepare", templateId: "prepare", goal: "Prepare the application", successCriteria: ["Preparation is complete"], dependsOn: [analystKey], depth: 3,
     taskId: "prepare-child-1", verificationDisposition: "specialized" },
   { key: "gate", templateId: "gate", goal: "Review the application", successCriteria: ["Review is complete"], dependsOn: ["prepare"], depth: 4,
     taskId: "gate-child-1", verificationDisposition: "specialized" },
@@ -63,6 +75,11 @@ describe("scheduled pipeline recovery graph item classification", () => {
     expect(classify("recovery-step-1", [item], [event])).toBe("verified_plan")
   })
 
+  it("accepts the scheduled Scout and Analyst keys while preserving semantic templates", () => {
+    const content = contentFor("audit-child-1", "scheduled-scout", "scheduled-analyst"), stepId = "recovery-step-1"
+    expect(classify(stepId, [graphItem(stepId, content)], [planEvent(stepId, proposalRevision, content)])).toBe("verified_plan")
+  })
+
   it("allows the exact graph item beside a scheduled Gate question item", () => {
     const content = contentFor(), stepId = "recovery-step-1"
     const question = { id: "agent-wait:question:gate-question-1", sessionId: owner.sessionId,
@@ -104,10 +121,16 @@ describe("scheduled pipeline recovery graph item classification", () => {
     expect(classify(stepId, items, eventRows)).toBe("invalid")
   })
 
-  it.each(["unexpected base-node order", "root task reused as a child"] as const)("rejects %s", change => {
+  it.each(["unexpected base-node order", "broken predecessor edge", "wrong semantic template", "duplicate aliases",
+    "fixed key collision", "invalid alias", "root task reused as a child"] as const)("rejects %s", change => {
     const valid = contentFor()
     const nodes = [...valid.nodes]
     if (change === "unexpected base-node order") [nodes[0], nodes[1]] = [nodes[1]!, nodes[0]!]
+    else if (change === "broken predecessor edge") nodes[2] = { ...nodes[2]!, dependsOn: ["scout"] }
+    else if (change === "wrong semantic template") nodes[0] = { ...nodes[0]!, templateId: "analyst" }
+    else if (change === "duplicate aliases") { nodes[0] = { ...nodes[0]!, key: "same" }; nodes[1] = { ...nodes[1]!, key: "same", dependsOn: ["same"] } }
+    else if (change === "fixed key collision") nodes[0] = { ...nodes[0]!, key: "prepare" }
+    else if (change === "invalid alias") nodes[0] = { ...nodes[0]!, key: " " }
     else nodes[0] = { ...nodes[0]!, taskId: rootId }
     const changed = { ...valid, nodes }
     const stepId = "recovery-step-1"

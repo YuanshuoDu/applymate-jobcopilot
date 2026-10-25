@@ -2,6 +2,7 @@ import { createHash } from "node:crypto"
 import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { describe, expect, it, vi } from "vitest"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { scheduledAuditWaitKey } from "./scheduled-audit-resume.js"
 import { SCHEDULED_AUDIT_NODE_CRITERIA, SCHEDULED_AUDIT_NODE_GOAL, SCHEDULED_AUDIT_TEMPLATE_ID } from "./scheduled-audit-contract.js"
 import { createTurnScheduledGateChoiceContent, TURN_SCHEDULED_GATE_CHOICE_SCHEMA, turnScheduledGateChoiceWaitId } from "../turns/turn-question-gate-choice-contract.js"
@@ -91,13 +92,21 @@ function gateTask() {
     userId: owner.userId }
 }
 
-function auditGraphContent() {
+const scoutVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria: [
+  { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+  { id: "candidate-evidence", check: { kind: "all_candidates_have_evidence", minimumItems: 1 } },
+] }
+const analystVerification = (scoutKey: string) => ({ schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [
+  { id: "scout-membership", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: scoutKey } },
+  { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
+] })
+function auditGraphContent(scoutKey = "scout", analystKey = "analyst") {
   return { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
-    { key: "scout", templateId: "scout", goal: "Find evidence", successCriteria: ["Found evidence"], dependsOn: [], depth: 1,
-      taskId: "scout-child-1", verificationDisposition: "legacy_unverified" },
-    { key: "analyst", templateId: "analyst", goal: "Review evidence", successCriteria: ["Reviewed evidence"], dependsOn: ["scout"], depth: 2,
-      taskId: "analyst-child-1", verificationDisposition: "legacy_unverified" },
-    { key: "prepare", templateId: "prepare", goal: "Prepare the application", successCriteria: ["Preparation is complete"], dependsOn: ["analyst"], depth: 3,
+    { key: scoutKey, templateId: "scout", goal: "Find evidence", successCriteria: ["Found evidence"], dependsOn: [], depth: 1,
+      taskId: "scout-child-1", verificationDisposition: "typed", verification: scoutVerification },
+    { key: analystKey, templateId: "analyst", goal: "Review evidence", successCriteria: ["Reviewed evidence"], dependsOn: [scoutKey], depth: 2,
+      taskId: "analyst-child-1", verificationDisposition: "typed", verification: analystVerification(scoutKey) },
+    { key: "prepare", templateId: "prepare", goal: "Prepare the application", successCriteria: ["Preparation is complete"], dependsOn: [analystKey], depth: 3,
       taskId: "prepare-child-1", verificationDisposition: "specialized" },
     { key: "gate", templateId: "gate", goal: "Review the application", successCriteria: ["Review is complete"], dependsOn: ["prepare"], depth: 4,
       taskId: "gate-child-1", verificationDisposition: "specialized" },
@@ -246,6 +255,16 @@ describe("scheduled pipeline recovery evidence reader", () => {
 
   it("accepts a streaming recovery Step after stripping its exact graph item", async () => {
     const step = makeStep("recovery-step-1", 5, "11", "streaming", null), content = auditGraphContent()
+    const f = fixture({ steps: [step], events: [...lifecycleEvents(step, null), auditGraphProposal(step.id, 6, content)],
+      items: [auditGraphItem(step.id, 7, content)] })
+    await expect(readScheduledPipelineRecoveryEvidence(f.client, owner, source)).resolves.toMatchObject({
+      marker: { recoveryStepId: step.id }, status: "streaming",
+    })
+  })
+
+  it("accepts production scheduled Scout and Analyst keys in recovery evidence", async () => {
+    const step = makeStep("recovery-step-1", 5, "11", "streaming", null)
+    const content = auditGraphContent("scheduled-scout", "scheduled-analyst")
     const f = fixture({ steps: [step], events: [...lifecycleEvents(step, null), auditGraphProposal(step.id, 6, content)],
       items: [auditGraphItem(step.id, 7, content)] })
     await expect(readScheduledPipelineRecoveryEvidence(f.client, owner, source)).resolves.toMatchObject({

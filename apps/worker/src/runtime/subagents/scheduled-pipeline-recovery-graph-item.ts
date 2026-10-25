@@ -47,12 +47,17 @@ export function classifyScheduledPipelineRecoveryGraphItem(input: Readonly<{
     || !sameCanonical(payload.content, dto.content) || !sameCanonical(payload.content, item.content)) return "invalid"
   try {
     const snapshot = parseTaskGraphSnapshot(payload.content)
-    if (!sameCanonical(payload.content, snapshot) || snapshot.nodes.length !== 5
-      || !same(snapshot.nodes.map(node => node.key), ["scout", "analyst", "prepare", "gate", SCHEDULED_AUDIT_TEMPLATE_ID])
-      || snapshot.nodes.some(node => !validId(node.taskId) || node.taskId === input.owner.rootTaskId)
-      || new Set(snapshot.nodes.map(node => node.taskId)).size !== 5) return "invalid"
-    const audits = snapshot.nodes.filter(node => node.key === SCHEDULED_AUDIT_TEMPLATE_ID)
-    const audit = snapshot.nodes[4]
+    const nodes = snapshot.nodes
+    const templateOrder = ["scout", "analyst", "prepare", "gate", SCHEDULED_AUDIT_TEMPLATE_ID]
+    if (!sameCanonical(payload.content, snapshot) || nodes.length !== 5
+      || !same(nodes.map(node => node.templateId), templateOrder)
+      || nodes[2]?.key !== "prepare" || nodes[3]?.key !== "gate" || nodes[4]?.key !== SCHEDULED_AUDIT_TEMPLATE_ID
+      || nodes.some((node, index) => node.depth !== index + 1
+        || !same(node.dependsOn, index === 0 ? [] : [nodes[index - 1]?.key]))
+      || nodes.some(node => !validId(node.taskId) || node.taskId === input.owner.rootTaskId)
+      || new Set(nodes.map(node => node.taskId)).size !== 5) return "invalid"
+    const audits = nodes.filter(node => node.key === SCHEDULED_AUDIT_TEMPLATE_ID)
+    const audit = nodes[4]
     if (audits.length !== 1 || !audit || audit.key !== SCHEDULED_AUDIT_TEMPLATE_ID
       || audit.templateId !== SCHEDULED_AUDIT_TEMPLATE_ID || audit.taskId !== taskId || audit.depth !== 5
       || audit.goal !== SCHEDULED_AUDIT_NODE_GOAL || !same(audit.successCriteria, SCHEDULED_AUDIT_NODE_CRITERIA)

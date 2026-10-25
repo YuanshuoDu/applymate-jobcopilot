@@ -102,7 +102,11 @@ function receiptMatches(receipt: Row, revision: number, snapshot: Row, rootTaskI
   const nodes = Array.isArray(receipt.nodes) ? receipt.nodes : [], node = row(nodes[0])
   const ready = Array.isArray(receipt.readyTaskIds) ? receipt.readyTaskIds : []
   const graph = Array.isArray(snapshot.nodes) ? snapshot.nodes : []
-  const audit = row(graph[4]), taskIds = graph.map(value => row(value)?.taskId)
+  const graphNodes = graph.map(row), taskIds = graphNodes.map(value => value?.taskId)
+  const graphKeys = graphNodes.map(value => value?.key)
+  const templates = graphNodes.map(value => value?.templateId)
+  const depths = graphNodes.map(value => value?.depth)
+  const [scout, analyst, prepare, gate, audit] = graphNodes
   if (!exactKeys(receipt, ['status', 'revision', 'nodes', 'readyTaskIds']) || receipt.status !== 'accepted'
     || receipt.revision !== revision || nodes.length !== 1 || !node
     || !exactKeys(node, ['key', 'taskId', 'status']) || node.key !== 'scheduled_audit'
@@ -110,8 +114,14 @@ function receiptMatches(receipt: Row, revision: number, snapshot: Row, rootTaskI
     || ready.length !== 1 || ready[0] !== node.taskId || snapshot.schemaVersion !== 'agent-harness.v2.task-graph'
     || !exactKeys(snapshot, Object.hasOwn(snapshot, 'rootSuccessCriteria')
       ? ['nodes', 'rootSuccessCriteria', 'schemaVersion'] : ['nodes', 'schemaVersion'])
-    || graph.length !== 5 || taskIds.some(id => !validId(id) || id === rootTaskId) || new Set(taskIds).size !== 5
-    || !same(graph.map(value => row(value)?.key), ['scout', 'analyst', 'prepare', 'gate', 'scheduled_audit'])
+    || graph.length !== 5 || graphNodes.some(value => !value) || taskIds.some(id => !validId(id) || id === rootTaskId)
+    || new Set(taskIds).size !== 5 || graphKeys.some(key => !validNodeKey(key)) || new Set(graphKeys).size !== 5
+    || !same(templates, ['scout', 'analyst', 'prepare', 'gate', 'scheduled_audit'])
+    || !same(graphKeys.slice(2), ['prepare', 'gate', 'scheduled_audit'])
+    || !same(depths, [1, 2, 3, 4, 5])
+    || !scout || !analyst || !prepare || !gate
+    || !same(scout.dependsOn, []) || !same(analyst.dependsOn, [scout.key])
+    || !same(prepare.dependsOn, [analyst.key]) || !same(gate.dependsOn, [prepare.key])
     || !audit || !exactKeys(audit, ['key', 'templateId', 'goal', 'successCriteria', 'dependsOn', 'depth', 'taskId', 'verificationDisposition'])
     || audit.key !== 'scheduled_audit' || audit.templateId !== 'scheduled_audit' || audit.depth !== 5
     || audit.taskId !== node.taskId || audit.verificationDisposition !== 'specialized'
@@ -141,6 +151,7 @@ function same(left: unknown, right: unknown): boolean {
   return keys.length === other.length && keys.every((key, index) => key === other[index] && same(a[key], b[key]))
 }
 function validId(value: unknown): value is string { return typeof value === 'string' && value.trim() === value && value.length > 0 && value.length <= 256 && !/[\u0000-\u001f\u007f]/.test(value) }
+function validNodeKey(value: unknown): value is string { return typeof value === 'string' && value.trim().length > 0 && value.length <= 128 }
 function positive(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) > 0 }
 function nonNegative(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 0 }
 function hex(value: unknown): boolean { return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value) }

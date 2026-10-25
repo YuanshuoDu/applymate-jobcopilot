@@ -1889,9 +1889,19 @@ function safeRecoveryErrorCode(value: unknown): string | null {
 function safeTaskGraphSnapshot(value: unknown, rootTaskId: string) {
   try {
     const snapshot = parseTaskGraphSnapshot(value)
-    const keys = ['scout', 'analyst', 'prepare', 'gate', SCHEDULED_AUDIT_TEMPLATE_ID]
-    return canonicalEqual(value, snapshot) && snapshot.nodes.length === 5
-      && canonicalEqual(snapshot.nodes.map(node => node.key), keys)
+    const nodes = snapshot.nodes
+    const templates = ['scout', 'analyst', 'prepare', 'gate', SCHEDULED_AUDIT_TEMPLATE_ID]
+    const fixedKeys = ['prepare', 'gate', SCHEDULED_AUDIT_TEMPLATE_ID]
+    const firstKeys = nodes.slice(0, 2).map(node => node.key)
+    const keys = nodes.map(node => node.key)
+    return canonicalEqual(value, snapshot) && nodes.length === 5
+      && canonicalEqual(nodes.map(node => node.templateId), templates)
+      && canonicalEqual(keys.slice(2), fixedKeys)
+      && firstKeys.every(key => typeof key === 'string' && key.trim().length > 0 && key.length <= 128
+        && !fixedKeys.includes(key))
+      && new Set(keys).size === 5
+      && nodes.every((node, index) => node.depth === index + 1
+        && canonicalEqual(node.dependsOn, index === 0 ? [] : [nodes[index - 1]!.key]))
       && snapshot.nodes.every(node => diagnosticValidId(node.taskId) && node.taskId !== rootTaskId)
       && new Set(snapshot.nodes.map(node => node.taskId)).size === 5 ? snapshot : null
   } catch { return null }

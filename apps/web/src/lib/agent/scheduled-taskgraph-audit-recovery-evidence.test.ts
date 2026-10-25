@@ -10,6 +10,15 @@ const SCHEDULED_AUDIT_NODE_GOAL = 'Return the exact report from the authenticate
 const SCHEDULED_AUDIT_NODE_CRITERIA = ['Continue the exact scheduled execution only after its canonical Gate proof is verified.',
   'Return only the fixed seven-field report without adding actions or interpreting historical counts.',
   'Never submit applications or invoke model or tool runtimes.']
+const VERIFICATION_SCHEMA = 'agent-harness.v2.task-graph-verification.v1'
+const scoutVerification = { schemaVersion: VERIFICATION_SCHEMA, role: 'scout', criteria: [
+  { id: 'candidate-count', check: { kind: 'candidate_count_gte', minimum: 1 } },
+  { id: 'candidate-evidence', check: { kind: 'all_candidates_have_evidence', minimumItems: 1 } },
+] }
+const analystVerification = (scoutKey: string) => ({ schemaVersion: VERIFICATION_SCHEMA, role: 'analyst', criteria: [
+  { id: 'scout-membership', check: { kind: 'findings_from_scout_dependency', dependencyNodeKey: scoutKey } },
+  { id: 'finding-count', check: { kind: 'finding_count_gte', minimum: 1 } },
+] })
 const owner: ScheduledTaskGraphPipelineOwner = { userId: 'user-1', sessionId: 'session-1', turnId: 'turn-1', rootTaskId: 'root-1',
   rootAttemptCount: 2, turnLeaseOwnerId: 'worker-1', turnLeaseVersion: 3, executionId: 'execution-1', executionAttemptCount: 0 }
 const source = { sourceEventId: 'candidate-event-1', stepId: 'candidate-step-4', ordinal: 4 }
@@ -73,12 +82,12 @@ function choiceItem(status: 'started' | 'completed' = 'started') {
       answerAvailable: status === 'completed', scheduledGateChoiceBinding: binding,
       ...(status === 'completed' ? { answeredAt: '2026-10-25T12:00:00.000Z' } : {}) } }
 }
-function auditGraphContent() { return { schemaVersion: 'agent-harness.v2.task-graph', nodes: [
-  { key: 'scout', templateId: 'scout', goal: 'Find evidence', successCriteria: ['Found evidence'], dependsOn: [], depth: 1,
-    taskId: 'scout-child-1', verificationDisposition: 'legacy_unverified' },
-  { key: 'analyst', templateId: 'analyst', goal: 'Review evidence', successCriteria: ['Reviewed evidence'], dependsOn: ['scout'], depth: 2,
-    taskId: 'analyst-child-1', verificationDisposition: 'legacy_unverified' },
-  { key: 'prepare', templateId: 'prepare', goal: 'Prepare the application', successCriteria: ['Preparation is complete'], dependsOn: ['analyst'], depth: 3,
+function auditGraphContent(scoutKey = 'scout', analystKey = 'analyst') { return { schemaVersion: 'agent-harness.v2.task-graph', nodes: [
+  { key: scoutKey, templateId: 'scout', goal: 'Find evidence', successCriteria: ['Found evidence'], dependsOn: [], depth: 1,
+    taskId: 'scout-child-1', verificationDisposition: 'typed', verification: scoutVerification },
+  { key: analystKey, templateId: 'analyst', goal: 'Review evidence', successCriteria: ['Reviewed evidence'], dependsOn: [scoutKey], depth: 2,
+    taskId: 'analyst-child-1', verificationDisposition: 'typed', verification: analystVerification(scoutKey) },
+  { key: 'prepare', templateId: 'prepare', goal: 'Prepare the application', successCriteria: ['Preparation is complete'], dependsOn: [analystKey], depth: 3,
     taskId: 'prepare-child-1', verificationDisposition: 'specialized' },
   { key: 'gate', templateId: 'gate', goal: 'Review the application', successCriteria: ['Review is complete'], dependsOn: ['prepare'], depth: 4,
     taskId: 'gate-1', verificationDisposition: 'specialized' },
@@ -242,6 +251,13 @@ describe('scheduled TaskGraph Audit recovery evidence', () => {
 
   it('accepts a streaming recovery Step after stripping its exact graph item', async () => {
     const step = recoveryStep('streaming'), content = auditGraphContent()
+    const f = fixture({ steps: [step], events: [...lifecycle(step), auditGraphProposal(step.id, 6, content)],
+      items: [auditGraphItem(step.id, 7, content)] })
+    await expect(validate(f.reader)).resolves.toBe(true)
+  })
+
+  it('accepts production scheduled Scout and Analyst keys in recovery evidence', async () => {
+    const step = recoveryStep('streaming'), content = auditGraphContent('scheduled-scout', 'scheduled-analyst')
     const f = fixture({ steps: [step], events: [...lifecycle(step), auditGraphProposal(step.id, 6, content)],
       items: [auditGraphItem(step.id, 7, content)] })
     await expect(validate(f.reader)).resolves.toBe(true)
