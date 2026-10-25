@@ -91,7 +91,14 @@ export async function prepareTaskGraphFinish(client: pg.PoolClient, input: { tas
   if (input.status !== "completed") {
     if (input.status === "failed") {
       const report = unverifiedFailureReport(node)
-      const failureReason = "task_graph_verification_unverified"
+      const resumeFailureReason = input.failureReason === "child_resume_unavailable" || input.failureReason === "child_resume_evidence_unavailable"
+        ? input.failureReason : undefined
+      const fixedTypedResumeNode = node.verificationDisposition === "typed" && node.verification?.role === node.templateId
+        && (node.templateId === "scout" && input.taskRole === "scout" && input.taskType === "job_discovery"
+          || node.templateId === "analyst" && input.taskRole === "analyst" && input.taskType === "job_analysis")
+      const preserveResumeFailure = !input.retry && (input.result === null || input.result === undefined)
+        && fixedTypedResumeNode && resumeFailureReason !== undefined
+      const failureReason = preserveResumeFailure ? resumeFailureReason : "task_graph_verification_unverified"
       graph = await prepareGraphTransition(client, { taskId: input.taskId, sessionId: input.sessionId, type: "task.failed", attemptCount: input.attemptCount, failureReason })
       return { graph, status: input.status, failureReason, result: finalizedResult(taskGraphVerificationResult(safeInputResult, report, undefined, null), input.status) }
     }

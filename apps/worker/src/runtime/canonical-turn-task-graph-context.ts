@@ -60,6 +60,12 @@ const UNAVAILABLE_PROJECTION: TaskGraphResultProjection = {
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null
 }
+function ownEnumerableDataValue(value: object, key: string): unknown {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    return descriptor?.enumerable && Object.hasOwn(descriptor, "value") ? descriptor.value : undefined
+  } catch { return undefined }
+}
 function text(value: unknown, maxLength: number, path: string, clip = false): string {
   if (typeof value !== "string" || !value.trim()) throw new Error("task_graph_current_state_invalid")
   if (value.length > maxLength && !clip) throw new Error(`task_graph_current_state_invalid:${path}`)
@@ -182,7 +188,14 @@ function node(value: unknown): TaskGraphCurrentNode {
   if (!verification) throw new Error("task_graph_current_state_invalid:verification")
   const native = nativeGraphNodeFields(row)
   const discoveryAttemptHealth = parseTaskGraphCurrentDiscoveryAttemptHealth(row, { templateId, status: row.status, verification: verification.verification, repairOf: verification.repairOf, repairReceipt: verification.repairReceipt, native: Boolean(native.native), nativeResult: Boolean(native.nativeResult) })
-  const executionFailureCategory = classifyCurrentTaskGraphExecutionFailure(row, { hasVerifiedReport: Boolean(verification.verificationReport), isNative: Boolean(native.native || native.nativeResult) })
+  const failureReason = ownEnumerableDataValue(row, "failureReason")
+  const unverifiedResumeFailure = verification.verification !== undefined && verification.verificationReport?.status === "unverified"
+    && (templateId === "scout" && verification.verification.role === "scout" || templateId === "analyst" && verification.verification.role === "analyst")
+    && (failureReason === "child_resume_unavailable" || failureReason === "child_resume_evidence_unavailable")
+  const executionFailureCategory = classifyCurrentTaskGraphExecutionFailure(row, {
+    hasVerifiedReport: Boolean(verification.verificationReport) && !unverifiedResumeFailure,
+    isNative: Boolean(native.native || native.nativeResult),
+  })
   const structuredOutputFailureCategory = verification.repairOf || verification.repairReceipt || native.native || native.nativeResult || !hasTaskGraphVerificationUnverifiedFailureReason(row) ? undefined
     : projectTaskGraphStructuredFailureCategory(row, { status: row.status, templateId, verification: verification.verification, verificationReport: verification.verificationReport })
   return {
