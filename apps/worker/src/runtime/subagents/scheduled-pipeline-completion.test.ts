@@ -6,7 +6,7 @@ import { attachScheduledPipelineCompletion, completeScheduledPipelineBeforeTermi
   type ScheduledPipelineGateContinuation } from "./scheduled-pipeline-completion.js"
 import type { ScheduledPipelineCandidate } from "./scheduled-pipeline-candidate-store.js"
 import { createScheduledAutomationGateContinuation } from "./scheduled-automation-gate-bridge.js"
-import { scheduledTaskGraphContinuationKey } from "./scheduled-pipeline-handoff.js"
+import { scheduledTaskGraphContinuationKey, type ScheduledPipelineAnalyzeCheckpointProof } from "./scheduled-pipeline-handoff.js"
 import { scheduledPrepareChoiceWaitId } from "../turns/turn-question-contract.js"
 import { SCHEDULED_PREPARE_COMPLETION_SCHEMA, scheduledPrepareResultDigest,
   type ScheduledPrepareTaskGraphProof } from "./scheduled-prepare-task-graph-verification.js"
@@ -41,7 +41,7 @@ const analyzeAttestation: ScheduledAutomationPipelineAttestation = {
     resultDigest: `sha256:${"4".repeat(64)}`, dependsOnTaskIds: ["scout-1"], jobIds: ["job-1"] },
   evidenceDigest: "5".repeat(64),
 }
-const analyzeProof = () => {
+const analyzeProof = (): ScheduledPipelineAnalyzeCheckpointProof => {
   const executionId = "execution-1", executionAttemptCount = 4
   return { status: "analyze_checkpointed", continuationKey: scheduledTaskGraphContinuationKey(owner, analyzeAttestation, executionId, executionAttemptCount),
     checkpointDigest: "b".repeat(64), claimTokenDigest: `sha256:${"c".repeat(64)}`, executionId, executionAttemptCount }

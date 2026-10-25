@@ -147,7 +147,9 @@ describe("assertCompletionAllowed", () => {
   })
 
   it("does not invoke Audit resume for a malformed denial", async () => {
-    const completionGate = (async () => ({ ok: false, blocker: "child_tasks_pending" })) as TurnEngineCompletionGate
+    // Intentionally omit feedback to exercise fail-closed validation before the Audit callback.
+    const malformedGate: unknown = async () => ({ ok: false, blocker: "child_tasks_pending" })
+    const completionGate = malformedGate as TurnEngineCompletionGate
     const auditResume = vi.fn(async () => ({ status: "completed" as const }))
     completionGate[SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME] = auditResume
     const writer = gateWriter()
@@ -401,9 +403,10 @@ describe("assertCompletionAllowed", () => {
 
   it("returns only redacted steering recovery feedback and resets semantic progress", async () => {
     const reset = vi.fn()
-    const completionGate = Object.assign(vi.fn(async () => ({
+    const rawCompletionGate = vi.fn(async () => ({
       ok: false as const, blocker: STEERING_RECONCILIATION_BLOCKER, feedback: STEERING_RECONCILIATION_FEEDBACK,
-    })), { [RESET_NATIVE_SEMANTIC_PROGRESS]: reset })
+    }))
+    const completionGate: TurnEngineCompletionGate = Object.assign(rawCompletionGate, { [RESET_NATIVE_SEMANTIC_PROGRESS]: reset })
     const auditResume = vi.fn(async () => ({ status: "completed" as const }))
     completionGate[SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME] = auditResume
     const writer = gateWriter()
@@ -412,6 +415,7 @@ describe("assertCompletionAllowed", () => {
       .resolves.toEqual({ feedback: STEERING_RECONCILIATION_FEEDBACK })
 
     expect(reset).toHaveBeenCalledOnce()
+    expect(rawCompletionGate).toHaveBeenCalledOnce()
     expect(auditResume).not.toHaveBeenCalled()
     expect(writer.append).toHaveBeenCalledWith("final.rejected", step.id, null, {
       code: STEERING_RECONCILIATION_BLOCKER, blocker: STEERING_RECONCILIATION_BLOCKER,
