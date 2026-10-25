@@ -90,8 +90,10 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     runner = startRunner(fixture, response.fetcher)
     const gateOutcome = await dispatchAndWait(runner, gateTaskId, fixture.ids.sessionId)
     if (!gateOutcome || typeof gateOutcome !== "object" || !("status" in gateOutcome) || gateOutcome.status !== "completed") {
-      const failedTask = await taskState(gateTaskId)
-      throw new Error(`Scheduled Gate child did not complete: ${JSON.stringify({ outcome: gateOutcome, failureReason: failedTask.failureReason })}`)
+      const [failedTask, fenceState] = await Promise.all([taskState(gateTaskId), readGateFenceState(fixture, gateTaskId)])
+      throw new Error(`Scheduled Gate child did not complete: ${JSON.stringify({ outcome: gateOutcome,
+        failureReason: failedTask.failureReason, expectedOwner: { rootAttemptCount: fixture.owner.rootAttemptCount,
+          turnLeaseVersion: fixture.owner.turnLeaseVersion }, gateResponse: response.gateResponse(), fenceState })}`)
     }
     expect(gateOutcome).toMatchObject({ status: "completed" })
     expect(response.gateCalls()).toBe(1)
@@ -229,6 +231,7 @@ async function setupFetcher(fixture: Fixture) {
   let replayedExecute: ExecuteHttpResponse | undefined
   let firstExecuteRequest: Record<string, unknown> | undefined
   let replayedExecuteRequest: Record<string, unknown> | undefined
+  let gateResponse: { status: number; body: unknown } | undefined
   const fetcher: typeof fetch = async (input, init = {}) => {
     const request = new Request(input, init)
     const body = await request.clone().json() as Record<string, unknown>
@@ -237,6 +240,7 @@ async function setupFetcher(fixture: Fixture) {
     const response = await route.POST(request)
     if (body.action === "gate") {
       gates += 1
+      gateResponse = { status: response.status, body: await response.clone().json().catch(() => null) }
       return response
     }
     if (body.action !== "execute") throw new Error("scheduled Audit action invalid")
@@ -261,6 +265,7 @@ async function setupFetcher(fixture: Fixture) {
   return {
     fetcher,
     gateCalls: () => gates,
+    gateResponse: () => gateResponse,
     executeCalls: () => executes,
     firstExecuteRequest: () => firstExecuteRequest,
     replayedExecuteRequest: () => replayedExecuteRequest,
@@ -322,6 +327,21 @@ async function taskState(taskId: string): Promise<Record<string, unknown>> {
   const row = (await pool!.query(`SELECT "status", "attemptCount", "result", "failureReason" FROM "sub_agent_tasks" WHERE "id"=$1`, [taskId])).rows[0]
   if (!row) throw new Error("scheduled Audit task missing")
   return row as Record<string, unknown>
+}
+async function readGateFenceState(fixture: Fixture, gateTaskId: string): Promise<Record<string, unknown>> {
+  const rows = await pool!.query(`SELECT turn."status" AS "turnStatus", turn."leaseOwnerId", turn."leaseVersion",
+      turn."leaseExpiresAt", root."status" AS "rootStatus", root."attemptCount" AS "rootAttemptCount",
+      root."leaseOwner" AS "rootLeaseOwner", root."interruptRequestedAt" AS "rootInterruptRequestedAt",
+      gate."status" AS "gateStatus", gate."attemptCount" AS "gateAttemptCount", gate."leaseOwner" AS "gateLeaseOwner",
+      gate."leaseExpiresAt" AS "gateLeaseExpiresAt", execution."status" AS "executionStatus",
+      execution."attemptCount" AS "executionAttemptCount", execution."state"->>'nextStage' AS "nextStage"
+    FROM "agent_turns" AS turn
+    JOIN "sub_agent_tasks" AS root ON root."id"=turn."rootTaskId" AND root."sessionId"=turn."sessionId"
+    JOIN "sub_agent_tasks" AS gate ON gate."id"=$2 AND gate."sessionId"=turn."sessionId"
+    JOIN "agent_executions" AS execution ON execution."id"=$5 AND execution."sessionId"=turn."sessionId" AND execution."userId"=turn."userId"
+    WHERE turn."id"=$1 AND turn."userId"=$3 AND turn."sessionId"=$4`,
+  [fixture.ids.turnId, gateTaskId, fixture.ids.userId, fixture.ids.sessionId, fixture.executionOwner.executionId])
+  return rows.rows[0] as Record<string, unknown> ?? {}
 }
 async function graphCount(fixture: Fixture): Promise<{ auditNodes: number }> {
   const loaded = await loadTaskGraph(pool as never, fixture.graphScope, false)
