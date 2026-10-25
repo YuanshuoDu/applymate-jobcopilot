@@ -152,7 +152,7 @@ function validateHistory(input: ScheduledTaskGraphGateHistoryInput, graphId: str
     else if (type === 'task.completed' && status === 'running') status = 'completed'
     else return false
     const nextContent = snapshot(next.content)
-    if (!nextContent || !sameJson(nextContent, withGateStatus(proposedSnapshot, status))) return false
+    if (!nextContent || !sameJson(nextContent, proposedSnapshot)) return false
     currentContent = nextContent
   }
   if (revision !== input.graphRevision || input.gateTask.status !== status || input.gateTask.attemptCount !== input.gate.attemptCount
@@ -210,11 +210,6 @@ function validGateNode(node: Record<string, unknown>, taskId: string): boolean {
   return node.key === 'gate' && node.templateId === 'gate' && node.taskId === taskId && node.depth === 4
     && sameStrings(node.dependsOn, ['prepare']) && node.verificationDisposition === 'specialized'
     && !Object.hasOwn(node, 'verification') && !Object.hasOwn(node, 'repairOf') && !Object.hasOwn(node, 'nativeDelegation')
-}
-function withGateStatus(proposed: Snapshot, status: string): Snapshot {
-  const nodes = [...proposed.nodes]
-  nodes[3] = { ...nodes[3]!, status }
-  return { ...proposed, nodes }
 }
 function validItem(value: unknown, graphId: string, owner: ScheduledTaskGraphPipelineOwner, revision: unknown): boolean {
   const item = record(value)
