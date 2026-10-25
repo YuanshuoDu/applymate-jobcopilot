@@ -32,7 +32,9 @@ type GateFailureDiagnostics = Readonly<Record<string, unknown>>
 type GateHttpFailure = Readonly<{ status: number; errorCode: string | null; testDiagnostic: Readonly<{
   phase: string | null; errorClass: string | null; prismaCode: string | null; safeErrorCode: string | null
 }> }>
-type ExecuteHttpFailure = Readonly<{ status: number; errorCode: string | null; keys: readonly string[]; reportValid: boolean }>
+type ExecuteHttpFailure = Readonly<{ status: number; errorCode: string | null; keys: readonly string[]; reportValid: boolean;
+  executionStatus?: string | null; executionCheckpoint?: string | null; executionNextStage?: string | null;
+  hasExecutionError?: boolean; executionErrorCode?: string | null; pipelineOutcome?: string }>
 type GateHistoryProbeRow = Readonly<{ actor: string | null; taskId: string | null; idempotencyKey: string | null; sequence: bigint; payload: unknown }>
 const diagnosticOutcomeStatuses = new Set(["completed", "retrying", "failed", "waiting", "waiting_for_user", "interrupted", "skipped", "lease_lost"])
 const diagnosticGateErrorCodes = new Set([
@@ -67,6 +69,7 @@ const diagnosticAuditFailureReasons = new Set([
   "scheduled_pipeline_wait_identity_mismatch",
 ])
 const scheduledPipelineRoutePath = "@/app/api/internal/agent-runtime/scheduled-pipeline/route"
+const scheduledRunServicePath = "@/lib/agent/run-service"
 const scheduledGateQualityReviewPath = "@/lib/agent/stages/gate-quality-review"
 const scheduledModelRouterPath = "@/lib/model-router"
 const scheduledEntitlementsPath = "@/lib/entitlements"
@@ -94,6 +97,7 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     vi.doUnmock(scheduledGateQualityReviewPath)
     vi.doUnmock(scheduledModelRouterPath)
     vi.doUnmock(scheduledEntitlementsPath)
+    vi.doUnmock(scheduledRunServicePath)
     vi.resetModules()
   })
   afterAll(async () => {
@@ -284,6 +288,20 @@ async function setupFetcher(fixture: Fixture) {
     resolveConfig: () => ({ resolvedKey: "fixture-key", provider: "fixture", model: "scheduled-audit-route" }) }))
   vi.doMock(scheduledEntitlementsPath, () => ({ isFeatureAllowed: async () => true,
     hasEffectiveEntitlement: async () => true, resolveAiAccess: async () => "available" }))
+  let pipelineOutcome = "not_called"
+  const runService = await vi.importActual<typeof import("@/lib/agent/run-service")>(scheduledRunServicePath)
+  vi.doMock(scheduledRunServicePath, () => ({ ...runService, runAgentPipeline: async (...args: Parameters<typeof runService.runAgentPipeline>) => {
+    try {
+      const result = await runService.runAgentPipeline(...args)
+      const status = debugRecord(result)?.status
+      pipelineOutcome = result === null ? "returned_null" : status === "waiting_for_user" ? "returned_wait"
+        : status === "gate_checkpointed" ? "returned_gate_checkpoint" : status === "analyze_checkpointed" ? "returned_analyze_checkpoint" : "returned_report"
+      return result
+    } catch (error) {
+      pipelineOutcome = "threw"
+      throw error
+    }
+  } }))
   const route = await vi.importActual<ScheduledPipelineRoute>(scheduledPipelineRoutePath)
   const webDb = await vi.importActual<{ db: { $disconnect(): Promise<void> } }>(scheduledWebDbPath)
   disconnectWebDatabase = () => webDb.db.$disconnect()
@@ -322,7 +340,8 @@ async function setupFetcher(fixture: Fixture) {
     if (!payload || response.status !== 200 || payload.status !== "completed" || keys.join(",") !== "report,status" || !reportValid) {
       const errorCode = typeof payload?.errorCode === "string" && diagnosticAuditFailureReasons.has(payload.errorCode)
         ? payload.errorCode : null
-      executeHttpFailures.push({ status: response.status, errorCode, keys, reportValid })
+      const execution = await readExecutionFailureDiagnostic(fixture)
+      executeHttpFailures.push({ status: response.status, errorCode, keys, reportValid, pipelineOutcome, ...execution })
       return response
     }
     expect(body).toMatchObject({ owner: fixture.owner, attestation: fixture.attestation, prepareProof: fixture.prepareProof,
@@ -358,6 +377,22 @@ async function setupFetcher(fixture: Fixture) {
       return report
     },
   }
+}
+
+async function readExecutionFailureDiagnostic(fixture: Fixture): Promise<Pick<ExecuteHttpFailure,
+  "executionStatus" | "executionCheckpoint" | "executionNextStage" | "hasExecutionError" | "executionErrorCode">> {
+  const result = await pool!.query<{ status: string; checkpoint: string | null; nextStage: string | null; error: string | null }>(
+    `SELECT "status", "checkpoint", "state"->>'nextStage' AS "nextStage", "error" FROM "agent_executions"
+      WHERE "id"=$1 AND "userId"=$2 AND "sessionId"=$3`,
+    [fixture.executionOwner.executionId, fixture.ids.userId, fixture.ids.sessionId])
+  const row = result.rows[0]
+  if (!row) return { executionStatus: null, executionCheckpoint: null, executionNextStage: null,
+    hasExecutionError: false, executionErrorCode: null }
+  return { executionStatus: debugSafeEnum(row.status, ["running", "completed", "failed", "waiting_for_user", "cancelled"]),
+    executionCheckpoint: debugSafeEnum(row.checkpoint, ["scout", "analyze", "prepare", "gate", "execute", "audit", "completed"]),
+    executionNextStage: debugSafeEnum(row.nextStage, ["scout", "analyze", "prepare", "gate", "execute", "audit", "completed"]),
+    hasExecutionError: typeof row.error === "string" && row.error.length > 0,
+    executionErrorCode: typeof row.error === "string" && diagnosticAuditFailureReasons.has(row.error) ? row.error : null }
 }
 
 /** Captures only redacted lock predicates while the rejected Gate lease is still live. */
