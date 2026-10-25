@@ -32,6 +32,7 @@ type GateFailureDiagnostics = Readonly<Record<string, unknown>>
 type GateHttpFailure = Readonly<{ status: number; errorCode: string | null; testDiagnostic: Readonly<{
   phase: string | null; errorClass: string | null; prismaCode: string | null; safeErrorCode: string | null
 }> }>
+type ExecuteHttpFailure = Readonly<{ status: number; errorCode: string | null; keys: readonly string[]; reportValid: boolean }>
 type GateHistoryProbeRow = Readonly<{ actor: string | null; taskId: string | null; idempotencyKey: string | null; sequence: bigint; payload: unknown }>
 const diagnosticOutcomeStatuses = new Set(["completed", "retrying", "failed", "waiting", "waiting_for_user", "interrupted", "skipped", "lease_lost"])
 const diagnosticGateErrorCodes = new Set([
@@ -165,7 +166,7 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
       const failureReason = diagnosticAuditFailureReasons.has(failedTask.failureReason ?? "")
         ? failedTask.failureReason : "other"
       throw new Error(`Scheduled Audit first attempt did not retry: ${JSON.stringify({
-        status: failedTask.status, failureReason,
+        status: failedTask.status, failureReason, executeCalls: response.executeCalls(), executeHttpFailures: response.executeHttpFailures(),
       })}`)
     }
     expect(firstTaskOutcome).toMatchObject({ status: "retrying" })
@@ -288,6 +289,7 @@ async function setupFetcher(fixture: Fixture) {
   let loseFirstExecuteResponse = true, gates = 0, executes = 0
   let gateDiagnostics: GateFailureDiagnostics | undefined
   const gateHttpFailures: GateHttpFailure[] = []
+  const executeHttpFailures: ExecuteHttpFailure[] = []
   let firstExecute: ExecuteHttpResponse | undefined
   let replayedExecute: ExecuteHttpResponse | undefined
   let firstExecuteRequest: Record<string, unknown> | undefined
@@ -313,9 +315,17 @@ async function setupFetcher(fixture: Fixture) {
     }
     if (body.action !== "execute") throw new Error("scheduled Audit action invalid")
     executes += 1
+    const payload = debugRecord(await response.clone().json().catch(() => null))
+    const keys = payload ? Object.keys(payload).sort() : []
+    const reportValid = payload !== null && parseScheduledAuditReport(payload.report) !== null
+    if (!payload || response.status !== 200 || payload.status !== "completed" || keys.join(",") !== "report,status" || !reportValid) {
+      const errorCode = typeof payload?.errorCode === "string" && diagnosticAuditFailureReasons.has(payload.errorCode)
+        ? payload.errorCode : null
+      executeHttpFailures.push({ status: response.status, errorCode, keys, reportValid })
+      return response
+    }
     expect(body).toMatchObject({ owner: fixture.owner, attestation: fixture.attestation, prepareProof: fixture.prepareProof,
       scheduledWaitId: fixture.prepareChoiceWaitId, gateCompletionProof: expect.objectContaining({ gate: expect.objectContaining({ taskId: expect.any(String) }) }) })
-    const payload = await response.clone().json() as Record<string, unknown>
     const completed = { status: response.status, body: payload }
     assertExactExecuteResponse(completed)
     if (loseFirstExecuteResponse) {
@@ -336,6 +346,7 @@ async function setupFetcher(fixture: Fixture) {
     gateDiagnostics: () => gateDiagnostics,
     gateHttpFailures: () => [...gateHttpFailures],
     executeCalls: () => executes,
+    executeHttpFailures: () => [...executeHttpFailures],
     firstExecuteRequest: () => firstExecuteRequest,
     replayedExecuteRequest: () => replayedExecuteRequest,
     firstExecuteResponse: () => firstExecute,
