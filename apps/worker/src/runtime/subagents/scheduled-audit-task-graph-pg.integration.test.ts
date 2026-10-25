@@ -312,7 +312,7 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     const customRoleLookups = response.customRoleLookups()
     expect(customRoleLookups).toEqual([])
     expect(response.customModelCalls()).toEqual([])
-    expect(response.report()).toMatchObject({ processed: fixture.preparedJobIds.length, pending: fixture.preparedJobIds.length })
+    expect(response.report()).toMatchObject({ processed: fixture.preparedJobIds.length, pending: 0 })
     const firstExecutionState = await readExecutionState(fixture)
     expect(firstExecutionState.status).toBe("completed")
     expect(firstExecutionState.state.report).toEqual(response.report())
