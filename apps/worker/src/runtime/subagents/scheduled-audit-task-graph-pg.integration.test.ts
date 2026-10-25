@@ -4,7 +4,6 @@ import Redis from "ioredis"
 import { Pool } from "pg"
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest"
 import { createPgDurableWaitPort } from "./durable-wait-store.js"
-import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import { createScheduledAutomationGateContinuation } from "./scheduled-automation-gate-bridge.js"
 import { createScheduledGateChildExecutor } from "./scheduled-gate-child-runtime.js"
@@ -74,7 +73,8 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     await seedScheduledAuditAgentConfig(fixture)
     const command = createPgTaskGraphCommandPort(pool as never), waitPort = createPgDurableWaitPort(pool!)
     const turnOwner = fixture.turnExecutionOwner as TurnExecutionOwnerFence
-    const stepId = await startRootStep(fixture, turnOwner)
+    // Keep the step that owns the persisted Prepare choice; a newer root step makes its wait proof stale.
+    const stepId = fixture.rootQuestionStepId
     const scope = { ...fixture.graphScope, stepId, turnLeaseOwner: fixture.owner.turnLeaseOwnerId,
       turnLeaseVersion: fixture.owner.turnLeaseVersion, parentLeaseOwner: fixture.owner.turnLeaseOwnerId,
       parentAttemptCount: fixture.owner.rootAttemptCount }
@@ -90,10 +90,8 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     runner = startRunner(fixture, response.fetcher)
     const gateOutcome = await dispatchAndWait(runner, gateTaskId, fixture.ids.sessionId)
     if (!gateOutcome || typeof gateOutcome !== "object" || !("status" in gateOutcome) || gateOutcome.status !== "completed") {
-      const [failedTask, fenceState] = await Promise.all([taskState(gateTaskId), readGateFenceState(fixture, gateTaskId)])
-      throw new Error(`Scheduled Gate child did not complete: ${JSON.stringify({ outcome: gateOutcome,
-        failureReason: failedTask.failureReason, expectedOwner: { rootAttemptCount: fixture.owner.rootAttemptCount,
-          turnLeaseVersion: fixture.owner.turnLeaseVersion }, gateResponse: response.gateResponse(), fenceState })}`)
+      const failedTask = await taskState(gateTaskId)
+      throw new Error(`Scheduled Gate child did not complete: ${JSON.stringify({ outcome: gateOutcome, failureReason: failedTask.failureReason })}`)
     }
     expect(gateOutcome).toMatchObject({ status: "completed" })
     expect(response.gateCalls()).toBe(1)
@@ -231,7 +229,6 @@ async function setupFetcher(fixture: Fixture) {
   let replayedExecute: ExecuteHttpResponse | undefined
   let firstExecuteRequest: Record<string, unknown> | undefined
   let replayedExecuteRequest: Record<string, unknown> | undefined
-  let gateResponse: { status: number; body: unknown } | undefined
   const fetcher: typeof fetch = async (input, init = {}) => {
     const request = new Request(input, init)
     const body = await request.clone().json() as Record<string, unknown>
@@ -240,7 +237,6 @@ async function setupFetcher(fixture: Fixture) {
     const response = await route.POST(request)
     if (body.action === "gate") {
       gates += 1
-      gateResponse = { status: response.status, body: await response.clone().json().catch(() => null) }
       return response
     }
     if (body.action !== "execute") throw new Error("scheduled Audit action invalid")
@@ -265,7 +261,6 @@ async function setupFetcher(fixture: Fixture) {
   return {
     fetcher,
     gateCalls: () => gates,
-    gateResponse: () => gateResponse,
     executeCalls: () => executes,
     firstExecuteRequest: () => firstExecuteRequest,
     replayedExecuteRequest: () => replayedExecuteRequest,
@@ -309,15 +304,6 @@ async function requireGateProof(fixture: Fixture) {
   if (!proof) throw new Error("scheduled Audit fixture Gate proof missing")
   return proof
 }
-async function startRootStep(fixture: Fixture, owner: TurnExecutionOwnerFence): Promise<string> {
-  const turnStore = createPgTurnEngineStore(pool as never)
-  const ordinal = Number((await pool!.query(`SELECT COALESCE(MAX("ordinal"), -1) + 1 AS ordinal FROM "agent_steps" WHERE "turnId"=$1 AND "sessionId"=$2`,
-    [fixture.ids.turnId, fixture.ids.sessionId])).rows[0]?.ordinal)
-  const stepId = `scheduled-audit-root-step-${randomUUID()}`
-  await turnStore.startStep({ owner, stepId, ordinal, attempt: 1, inputThroughSequence: 0n, consumedInputIds: [],
-    modelProfileSnapshot: { provider: "fixture", model: "scheduled-audit-root" }, now: new Date() })
-  return stepId
-}
 async function findTaskId(taskType: string, rootTaskId: string): Promise<string> {
   const rows = await pool!.query<{ id: string }>(`SELECT "id" FROM "sub_agent_tasks" WHERE "rootTaskId"=$1 AND "taskType"=$2`, [rootTaskId, taskType])
   if (rows.rows.length !== 1) throw new Error(`scheduled Audit task identity invalid: ${taskType}`)
@@ -327,21 +313,6 @@ async function taskState(taskId: string): Promise<Record<string, unknown>> {
   const row = (await pool!.query(`SELECT "status", "attemptCount", "result", "failureReason" FROM "sub_agent_tasks" WHERE "id"=$1`, [taskId])).rows[0]
   if (!row) throw new Error("scheduled Audit task missing")
   return row as Record<string, unknown>
-}
-async function readGateFenceState(fixture: Fixture, gateTaskId: string): Promise<Record<string, unknown>> {
-  const rows = await pool!.query(`SELECT turn."status" AS "turnStatus", turn."leaseOwnerId", turn."leaseVersion",
-      turn."leaseExpiresAt", root."status" AS "rootStatus", root."attemptCount" AS "rootAttemptCount",
-      root."leaseOwner" AS "rootLeaseOwner", root."interruptRequestedAt" AS "rootInterruptRequestedAt",
-      gate."status" AS "gateStatus", gate."attemptCount" AS "gateAttemptCount", gate."leaseOwner" AS "gateLeaseOwner",
-      gate."leaseExpiresAt" AS "gateLeaseExpiresAt", execution."status" AS "executionStatus",
-      execution."attemptCount" AS "executionAttemptCount", execution."state"->>'nextStage' AS "nextStage"
-    FROM "agent_turns" AS turn
-    JOIN "sub_agent_tasks" AS root ON root."id"=turn."rootTaskId" AND root."sessionId"=turn."sessionId"
-    JOIN "sub_agent_tasks" AS gate ON gate."id"=$2 AND gate."sessionId"=turn."sessionId"
-    JOIN "agent_executions" AS execution ON execution."id"=$5 AND execution."sessionId"=turn."sessionId" AND execution."userId"=turn."userId"
-    WHERE turn."id"=$1 AND turn."userId"=$3 AND turn."sessionId"=$4`,
-  [fixture.ids.turnId, gateTaskId, fixture.ids.userId, fixture.ids.sessionId, fixture.executionOwner.executionId])
-  return rows.rows[0] as Record<string, unknown> ?? {}
 }
 async function graphCount(fixture: Fixture): Promise<{ auditNodes: number }> {
   const loaded = await loadTaskGraph(pool as never, fixture.graphScope, false)
