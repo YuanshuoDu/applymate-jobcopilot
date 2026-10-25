@@ -757,7 +757,8 @@ async function policyDecisionReplayReceipt(pool: Pool, turnId: string, sessionId
       [sessionId, turnId, toolCallId],
     ),
     pool.query<{
-      callCount: string; resultCount: string; completedCallCount: string; completedRecoveryEventCount: string
+      callCount: string; resultCount: string; completedCallCount: string
+      recoveredTurnEventCount: string; lifecycleCompletionEventCount: string
       result: Record<string, unknown> | null
     }>(
       `SELECT
@@ -768,7 +769,11 @@ async function policyDecisionReplayReceipt(pool: Pool, turnId: string, sessionId
          (SELECT COUNT(*)::text FROM "agent_events" AS event
            JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
            WHERE event."turnId" = $1 AND event."type" = 'tool_call.completed' AND event."correlationId" = $2
-             AND event."idempotencyKey" = 'turn:' || turn."id" || ':event:tool-finished:' || $2) AS "completedRecoveryEventCount",
+             AND event."idempotencyKey" = 'turn:' || turn."id" || ':event:tool-recovered:' || $2) AS "recoveredTurnEventCount",
+         (SELECT COUNT(*)::text FROM "agent_events" AS event
+           JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
+           WHERE event."turnId" = $1 AND event."type" = 'tool_call.completed' AND event."correlationId" = $2
+             AND event."idempotencyKey" LIKE 'turn:' || turn."rootTaskId" || ':tool-lifecycle:' || $2 || ':completed:%') AS "lifecycleCompletionEventCount",
          (SELECT "content" FROM "agent_items" WHERE "turnId" = $1 AND "type" = 'tool_result' AND "content"->>'toolCallId' = $2 LIMIT 1) AS "result"`,
       [turnId, toolCallId],
     ),
@@ -1754,7 +1759,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
       stepTaskId: rootBefore?.rootTaskId, turnLeaseActive: true, rootLeaseActive: true,
     })
     expect(replayed.leaseVersion).toBeGreaterThan(rootBefore?.leaseVersion ?? 0)
-    expect(reclaimed.tools).toMatchObject({ callCount: "1", resultCount: "0", completedCallCount: "0", completedRecoveryEventCount: "0" })
+    expect(reclaimed.tools).toMatchObject({ callCount: "1", resultCount: "0", completedCallCount: "0", recoveredTurnEventCount: "0", lifecycleCompletionEventCount: "0" })
     expect(workerTwo.output.filter(line => line.startsWith(`POLICY_REPLAY_TOOL_EXECUTED ${toolCallId}`))).toHaveLength(0)
     workerTwo.stdin?.write("release-policy-decision-replay\n")
     await waitForLine(workerTwo, `POLICY_REPLAY_TOOL_EXECUTED ${toolCallId}`, 30_000)
@@ -1765,7 +1770,7 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     expect(after.events[0]).toEqual(decision)
     expect(after.root).toMatchObject({ rootTaskId: rootBefore?.rootTaskId, rootAttemptCount: rootBefore?.rootAttemptCount,
       stepId: rootBefore?.stepId, stepAttempt: rootBefore?.stepAttempt, stepTaskId: rootBefore?.rootTaskId })
-    expect(after.tools).toMatchObject({ callCount: "1", resultCount: "1", completedCallCount: "1", completedRecoveryEventCount: "1" })
+    expect(after.tools).toMatchObject({ callCount: "1", resultCount: "1", completedCallCount: "1", recoveredTurnEventCount: "1", lifecycleCompletionEventCount: "1" })
     expect(after.tools?.result).toMatchObject({
       toolCallId, toolName: "jobs.search", status: "completed",
       output: { jobs: [{ id: jobId, company: searchTarget }] },
