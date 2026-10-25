@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { Prisma } from '@prisma/client'
 
 const mocks = vi.hoisted(() => ({
   transaction: vi.fn(), queryRaw: vi.fn(), jobs: vi.fn(), update: vi.fn(), turn: vi.fn(), config: vi.fn(), resume: vi.fn(),
@@ -145,6 +146,76 @@ describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
     expect(mocks.executeGate).toHaveBeenCalledOnce()
     expect(mocks.executeGate.mock.calls[0]?.[0]).toMatchObject({ handoff: { checkpoint: { nextStage: 'gate' } }, priorChoices: [] })
     expect(JSON.stringify(responseBody)).not.toContain('private-claim')
+  })
+
+  it('projects a safe test-only owner assertion phase without exposing the thrown message', async () => {
+    const secretMessage = 'private database detail and fixture identity'
+    vi.stubEnv('NODE_ENV', 'test')
+    try {
+      mocks.queryRaw.mockImplementation(async () => {
+        if (queryIndex >= 5) throw new Error(secretMessage)
+        const position = queryIndex++ % 5
+        if (position === 0) return [{ id: owner.sessionId, status: 'active' }]
+        if (position === 1) return [databaseTurn('waiting_for_tool')]
+        if (position === 2) return [rootTask]
+        if (position === 3) return [gateTask]
+        return [{ id: owner.executionId, status: 'running', attemptCount: owner.executionAttemptCount, checkpoint: 'gate', state }]
+      })
+      const result = await runScheduledTaskGraphActionRpc(gateRequest()) as Response
+      const body = await result.json()
+      expect(result.status).toBe(500)
+      expect(body).toMatchObject({ status: 'blocked', errorCode: 'scheduled_pipeline_execution_failed',
+        testDiagnostic: { phase: 'owner_assertion', errorClass: 'error' } })
+      expect(JSON.stringify(body)).not.toContain(secretMessage)
+      expect(mocks.executeGate).not.toHaveBeenCalled()
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it('projects only a Prisma code and safe class in tests, with no production diagnostics', async () => {
+    const secretMessage = 'private prisma detail and fixture identity'
+    mocks.executeGate.mockRejectedValue(new Prisma.PrismaClientKnownRequestError(secretMessage,
+      { code: 'P2002', clientVersion: 'test' }))
+    vi.stubEnv('NODE_ENV', 'test')
+    try {
+      const testResult = await runScheduledTaskGraphActionRpc(gateRequest()) as Response
+      const testBody = await testResult.json()
+      expect(testResult.status).toBe(500)
+      expect(testBody).toMatchObject({ testDiagnostic: {
+        phase: 'gate_execution', errorClass: 'prisma_known_request_error', prismaCode: 'P2002' } })
+      expect(JSON.stringify(testBody)).not.toContain(secretMessage)
+
+      vi.stubEnv('NODE_ENV', 'production')
+      queryIndex = 0
+      const productionResult = await runScheduledTaskGraphActionRpc(gateRequest()) as Response
+      const productionBody = await productionResult.json()
+      expect(Object.keys(productionBody).sort()).toEqual(['errorCode', 'status'])
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it('projects built-in TypeError and only exact allowlisted Gate error literals', async () => {
+    const secretMessage = 'private database password and fixture identity'
+    mocks.executeGate.mockRejectedValueOnce(new TypeError('scheduled_taskgraph_gate_result_invalid'))
+      .mockRejectedValueOnce(new TypeError(secretMessage))
+    vi.stubEnv('NODE_ENV', 'test')
+    try {
+      const knownResult = await runScheduledTaskGraphActionRpc(gateRequest()) as Response
+      const knownBody = await knownResult.json()
+      expect(knownBody).toMatchObject({ testDiagnostic: { phase: 'gate_execution', errorClass: 'type_error',
+        safeErrorCode: 'scheduled_taskgraph_gate_result_invalid' } })
+
+      queryIndex = 0
+      const secretResult = await runScheduledTaskGraphActionRpc(gateRequest()) as Response
+      const secretBody = await secretResult.json()
+      expect(secretBody.testDiagnostic).toMatchObject({ phase: 'gate_execution', errorClass: 'type_error' })
+      expect(secretBody.testDiagnostic).not.toHaveProperty('safeErrorCode')
+      expect(JSON.stringify(secretBody)).not.toContain(secretMessage)
+    } finally {
+      vi.unstubAllEnvs()
+    }
   })
 
   it('accepts the exact live child while a newer Root lease is active, without borrowing that lease', async () => {

@@ -29,7 +29,9 @@ type Runner = Readonly<{ worker: Worker<SubagentJobPayload, unknown>; redis: Red
 type ScheduledPipelineRoute = Readonly<{ POST(request: Request): Promise<Response> }>
 type ExecuteHttpResponse = Readonly<{ status: number; body: Record<string, unknown> }>
 type GateFailureDiagnostics = Readonly<Record<string, unknown>>
-type GateHttpFailure = Readonly<{ status: number; errorCode: string | null }>
+type GateHttpFailure = Readonly<{ status: number; errorCode: string | null; testDiagnostic: Readonly<{
+  phase: string | null; errorClass: string | null; prismaCode: string | null; safeErrorCode: string | null
+}> }>
 type GateHistoryProbeRow = Readonly<{ actor: string | null; taskId: string | null; idempotencyKey: string | null; sequence: bigint; payload: unknown }>
 const diagnosticOutcomeStatuses = new Set(["completed", "retrying", "failed", "waiting", "waiting_for_user", "interrupted", "skipped", "lease_lost"])
 const diagnosticGateErrorCodes = new Set([
@@ -46,6 +48,9 @@ const diagnosticWorkerErrorCodes = new Set([
   "scheduled_gate_graph_invalid", "scheduled_gate_handoff_retryable", "scheduled_gate_owner_stale",
   "scheduled_gate_prepare_proof_invalid", "scheduled_gate_registration_invalid", "scheduled_gate_runtime_failed",
   "scheduled_gate_task_invalid", "scheduled_gate_wait_invalid",
+])
+const diagnosticGateSafeErrorCodes = new Set([
+  "scheduled_taskgraph_gate_result_invalid", "application_review_session_scope_required",
 ])
 const scheduledPipelineRoutePath = "@/app/api/internal/agent-runtime/scheduled-pipeline/route"
 const scheduledGateQualityReviewPath = "@/lib/agent/stages/gate-quality-review"
@@ -268,7 +273,8 @@ async function setupFetcher(fixture: Fixture) {
       const payload = await response.clone().json().catch(() => null)
       const routeBody = debugRecord(payload)
       if ((response.status < 200 || response.status >= 300) && gateHttpFailures.length < 4) {
-        gateHttpFailures.push({ status: response.status, errorCode: diagnosticGateErrorCode(routeBody?.errorCode) })
+        gateHttpFailures.push({ status: response.status, errorCode: diagnosticGateErrorCode(routeBody?.errorCode),
+          testDiagnostic: diagnosticGateFailure(routeBody?.testDiagnostic) })
       }
       if (response.status === 409 && routeBody?.errorCode === "scheduled_pipeline_turn_stale") {
         gateDiagnostics = await readGateFailureDiagnostics(fixture, body, request.signal.aborted, response.status)
@@ -819,6 +825,15 @@ function diagnosticGateErrorCode(value: unknown): string | null {
 }
 function diagnosticWorkerErrorCode(value: unknown): string | null {
   return typeof value === "string" && diagnosticWorkerErrorCodes.has(value) ? value : null
+}
+function diagnosticGateFailure(value: unknown): GateHttpFailure["testDiagnostic"] {
+  const row = debugRecord(value)
+  return { phase: row ? debugSafeEnum(row.phase, ["owner_assertion", "gate_execution"]) : null,
+    errorClass: row ? debugSafeEnum(row.errorClass, ["prisma_known_request_error", "agent_execution_cancelled", "type_error",
+      "range_error", "syntax_error", "error", "non_error"]) : null,
+    prismaCode: typeof row?.prismaCode === "string" && /^P\d{4}$/.test(row.prismaCode) ? row.prismaCode : null,
+    safeErrorCode: typeof row?.safeErrorCode === "string" && diagnosticGateSafeErrorCodes.has(row.safeErrorCode)
+      ? row.safeErrorCode : null }
 }
 
 function assertExactExecuteResponse(value: ExecuteHttpResponse): void {

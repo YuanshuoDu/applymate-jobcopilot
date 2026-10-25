@@ -28,6 +28,10 @@ import type { PipelineCtx } from './pipeline-context'
 
 type GateAction = ScheduledTaskGraphGateRpcRequest | ScheduledTaskGraphExecuteRpcRequest
 type ExecuteContinuation = Readonly<{ kind: 'execute'; request: ScheduledTaskGraphExecuteRpcRequest }>
+type GateFailurePhase = 'owner_assertion' | 'gate_execution'
+type GateFailureErrorClass = 'prisma_known_request_error' | 'agent_execution_cancelled' | 'type_error' | 'range_error'
+  | 'syntax_error' | 'error' | 'non_error'
+type GateFailureDiagnostic = Readonly<{ phase: GateFailurePhase; errorClass: GateFailureErrorClass; prismaCode?: string; safeErrorCode?: string }>
 type TurnRow = { id: string; userId: string; sessionId: string; rootTaskId: string | null; source: string; executionMode: string | null;
   input: unknown; status: string; leaseOwnerId: string | null; leaseVersion: number; leaseExpiresAt: Date | null }
 type OwnerState = { owner: ScheduledTaskGraphPipelineOwner; key: string; snapshot: ReturnType<typeof parseScheduledAutomationSnapshot>;
@@ -35,6 +39,8 @@ type OwnerState = { owner: ScheduledTaskGraphPipelineOwner; key: string; snapsho
 
 const CLAIM_SCHEMA = 'agent-harness.v2.scheduled-pipeline-claim.v1'
 const CLAIM_TTL_MS = 600_000
+const GATE_SAFE_ERROR_CODES = ['scheduled_taskgraph_gate_result_invalid', 'application_review_session_scope_required'] as const
+type GateSafeErrorCode = typeof GATE_SAFE_ERROR_CODES[number]
 
 /** Runs the private Gate action or returns an Execute request after persisted proof validation. */
 export async function runScheduledTaskGraphActionRpc(request: GateAction, signal?: AbortSignal): Promise<Response | ExecuteContinuation> {
@@ -86,15 +92,18 @@ async function runGateAction(request: ScheduledTaskGraphGateRpcRequest, signal?:
     assertExecutionCurrent: async () => !signal?.aborted && db.$transaction(assertCurrent),
     autonomous: snapshot.autoApply, emit: () => undefined, signal,
   }
+  let failurePhase: GateFailurePhase = 'owner_assertion'
   try {
     if (!await context.assertExecutionCurrent?.()) throw new AgentExecutionCancelledError()
+    failurePhase = 'gate_execution'
     const result = await executeScheduledTaskGraphGate({ handoff, context,
       ...(request.validatedChoice !== undefined ? { validatedChoice: request.validatedChoice } : {}),
       priorChoices: request.priorChoices ?? [] }, runScheduledGate)
     return Response.json(result)
   } catch (error) {
     return blocked(error instanceof AgentExecutionCancelledError ? 409 : 500,
-      error instanceof AgentExecutionCancelledError ? 'scheduled_pipeline_turn_stale' : 'scheduled_pipeline_execution_failed')
+      error instanceof AgentExecutionCancelledError ? 'scheduled_pipeline_turn_stale' : 'scheduled_pipeline_execution_failed',
+      gateFailureDiagnostic(failurePhase, error))
   }
 }
 
@@ -258,4 +267,20 @@ function record(value: unknown): Record<string, unknown> | null {
   return prototype === Object.prototype || prototype === null ? value as Record<string, unknown> : null
 }
 function validId(value: unknown): value is string { return typeof value === 'string' && value.length > 0 && value.length <= 256 && value.trim() === value }
-function blocked(status: number, errorCode: string): Response { return Response.json({ status: 'blocked', errorCode }, { status }) }
+function gateFailureDiagnostic(phase: GateFailurePhase, error: unknown): GateFailureDiagnostic {
+  const safeErrorCode = error instanceof Error && GATE_SAFE_ERROR_CODES.includes(error.message as GateSafeErrorCode)
+    ? error.message as GateSafeErrorCode : undefined
+  if (error instanceof Prisma.PrismaClientKnownRequestError) {
+    const prismaCode = /^P\d{4}$/.test(error.code) ? error.code : undefined
+    return { phase, errorClass: 'prisma_known_request_error', ...(prismaCode ? { prismaCode } : {}),
+      ...(safeErrorCode ? { safeErrorCode } : {}) }
+  }
+  const errorClass: GateFailureErrorClass = error instanceof AgentExecutionCancelledError ? 'agent_execution_cancelled'
+    : error instanceof TypeError ? 'type_error' : error instanceof RangeError ? 'range_error'
+      : error instanceof SyntaxError ? 'syntax_error' : error instanceof Error ? 'error' : 'non_error'
+  return { phase, errorClass, ...(safeErrorCode ? { safeErrorCode } : {}) }
+}
+function blocked(status: number, errorCode: string, testDiagnostic?: GateFailureDiagnostic): Response {
+  return Response.json({ status: 'blocked', errorCode,
+    ...(process.env.NODE_ENV === 'test' && testDiagnostic ? { testDiagnostic } : {}) }, { status })
+}
