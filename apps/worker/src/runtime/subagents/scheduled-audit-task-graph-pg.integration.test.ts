@@ -52,6 +52,19 @@ const diagnosticWorkerErrorCodes = new Set([
 const diagnosticGateSafeErrorCodes = new Set([
   "scheduled_taskgraph_gate_result_invalid", "application_review_session_scope_required",
 ])
+const diagnosticAuditFailureReasons = new Set([
+  "scheduled_audit_analyze_proof_invalid", "scheduled_audit_cancelled", "scheduled_audit_checkpoint_invalid",
+  "scheduled_audit_continuation_unsupported", "scheduled_audit_gate_registration_invalid", "scheduled_audit_graph_invalid",
+  "scheduled_audit_handoff_retryable", "scheduled_audit_invocation_proof_invalid", "scheduled_audit_owner_stale",
+  "scheduled_audit_prepare_proof_invalid", "scheduled_audit_report_invalid", "scheduled_audit_runtime_failed",
+  "scheduled_audit_task_invalid", "scheduled_audit_wait_unsupported",
+  ...diagnosticGateErrorCodes,
+  "scheduled_pipeline_agent_unavailable", "scheduled_pipeline_gate_checkpoint_missing", "scheduled_pipeline_gate_checkpoint_unexpected",
+  "scheduled_pipeline_gate_input_invalid", "scheduled_pipeline_gate_response_invalid", "scheduled_pipeline_handoff_in_progress",
+  "scheduled_pipeline_handoff_input_invalid", "scheduled_pipeline_handoff_response_invalid", "scheduled_pipeline_handoff_retryable",
+  "scheduled_pipeline_handoff_unavailable", "scheduled_pipeline_resume_unavailable", "scheduled_pipeline_root_mismatch",
+  "scheduled_pipeline_wait_identity_mismatch",
+])
 const scheduledPipelineRoutePath = "@/app/api/internal/agent-runtime/scheduled-pipeline/route"
 const scheduledGateQualityReviewPath = "@/lib/agent/stages/gate-quality-review"
 const scheduledModelRouterPath = "@/lib/model-router"
@@ -147,6 +160,14 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(await requireGateProof(fixture)).toEqual(gateProof)
 
     const firstTaskOutcome = await dispatchAndWait(runner, auditTaskId, fixture.ids.sessionId)
+    if (debugRecord(firstTaskOutcome)?.status !== "retrying") {
+      const failedTask = await taskState(auditTaskId)
+      const failureReason = diagnosticAuditFailureReasons.has(failedTask.failureReason ?? "")
+        ? failedTask.failureReason : "other"
+      throw new Error(`Scheduled Audit first attempt did not retry: ${JSON.stringify({
+        status: failedTask.status, failureReason,
+      })}`)
+    }
     expect(firstTaskOutcome).toMatchObject({ status: "retrying" })
     expect(response.executeCalls()).toBe(1)
     const firstHttpResponse = response.firstExecuteResponse()
