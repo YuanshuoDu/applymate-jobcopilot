@@ -57,6 +57,9 @@ const rootTask = { id: owner.rootTaskId, sessionId: owner.sessionId, turnId: own
   parentTaskId: null, status: 'running', attemptCount: owner.rootAttemptCount, interruptRequestedAt: null, closedAt: null }
 let queryIndex = 0
 const tx = { $queryRaw: mocks.queryRaw, job: { findMany: mocks.jobs }, agentExecution: { updateMany: mocks.update } }
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
+}
 const databaseTurn = (status: string, leaseVersion = requestOwner.turnLeaseVersion, leaseOwnerId = requestOwner.turnLeaseOwnerId) => ({ id: owner.turnId, userId: owner.userId, sessionId: owner.sessionId, rootTaskId: owner.rootTaskId,
   source: 'automation', executionMode: 'canonical_task_graph', input: { automationRunMode: 'scheduled', scheduledAutomationSnapshot: snapshot },
   status, leaseOwnerId: status === 'in_progress' ? leaseOwnerId : null, leaseVersion,
@@ -297,6 +300,22 @@ describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
     })
     const accepted = await runScheduledTaskGraphActionRpc(request)
     expect(accepted).toMatchObject({ kind: 'execute', request: { action: 'execute', gateCompletionProof: request.gateCompletionProof } })
+  })
+
+  it('renews the owner-fenced claim before handing a valid Execute continuation to the Pipeline', async () => {
+    const accepted = await runScheduledTaskGraphActionRpc(executeRequest())
+
+    expect(accepted).toMatchObject({ kind: 'execute' })
+    expect(mocks.update).toHaveBeenCalledOnce()
+    const update = record(mocks.update.mock.calls[0]?.[0])
+    const data = record(update?.data), nextState = record(data?.state)
+    const renewedClaim = record(nextState?.scheduledTaskGraphClaim)
+    expect(renewedClaim?.claimToken).toBe(claim.claimToken)
+    expect(renewedClaim?.owner).toEqual(owner)
+    const leaseExpiresAt = renewedClaim?.leaseExpiresAt
+    expect(typeof leaseExpiresAt).toBe('string')
+    if (typeof leaseExpiresAt !== 'string') throw new Error('scheduled_pipeline_claim_not_renewed')
+    expect(Date.parse(leaseExpiresAt)).toBeGreaterThan(Date.now())
   })
 
   it('returns a completed replay before the running-only Execute lock is attempted', async () => {
