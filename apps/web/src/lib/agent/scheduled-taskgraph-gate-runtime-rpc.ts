@@ -121,7 +121,7 @@ async function authorizeExecute(request: ScheduledTaskGraphExecuteRpcRequest, si
   if (!proof || !gate || !sameJson(proof.prepareProof, request.prepareProof)) return blocked(409, 'scheduled_pipeline_gate_proof_invalid')
   const replay = await replayCompletedScheduledTaskGraphReport(request, { taskId: String(gate.taskId), attemptCount: Number(gate.attemptCount) }, signal)
   if (replay) return replay
-  const locked = await db.$transaction(tx => lockOwner(tx, request, signal, true, {
+  const locked = await db.$transaction(tx => lockOwner(tx, request, signal, false, {
     taskId: String(gate.taskId), attemptCount: Number(gate.attemptCount), completionProof: request.gateCompletionProof }))
   if (!locked) return blocked(409, 'scheduled_pipeline_gate_proof_invalid')
   return { kind: 'execute', request: { ...request, ...(locked.waitId ? { scheduledWaitId: locked.waitId } : {}) } }
