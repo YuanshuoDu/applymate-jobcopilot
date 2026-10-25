@@ -30,9 +30,9 @@ import { appendScheduledAudit as appendScheduledAuditCommand,
   verifyScheduledAuditCompletion as verifyScheduledAuditCompletionCommand,
   readScheduledAuditInvocationProof as readScheduledAuditInvocationProofCommand,
   verifyScheduledGateCompletionWithAuditReplay as verifyScheduledGateCompletionCommand } from "./pg-scheduled-task-graph-audit-command.js"
+import { readScheduledAuditResumeContext as readScheduledAuditResumeContextCommand } from "./scheduled-audit-resume.js"
 import { SCHEDULED_AUDIT_TEMPLATE_ID } from "./scheduled-audit-contract.js"
 import { scheduleTaskGraphBranchOperation } from "./task-graph-pg-failed-branch-repair.js"
-
 const MAX_REVISION = 2_147_483_646
 type Row = Record<string, unknown>
 type LoadedCurrentGraph = Awaited<ReturnType<typeof loadTaskGraph>> & Readonly<{ rootSuccessCriteria?: readonly string[] }>
@@ -62,6 +62,9 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
     },
     async readScheduledAuditInvocationProof(input) {
       return transaction(pool, client => readScheduledAuditInvocationProofCommand(client, input))
+    },
+    async readScheduledAuditResumeContext(input) {
+      return transaction(pool, client => readScheduledAuditResumeContextCommand(client, input))
     },
     async appendAndScheduleWithReconciliation(input, operation) {
       return transaction(pool, client => schedule(client, input, operation))

@@ -16,7 +16,8 @@ import type { TaskGraphNodeProposal } from "../planning/task-graph.js"
 
 const reconciliationMocks = vi.hoisted(() => ({
   prepare: vi.fn(), write: vi.fn(), create: vi.fn(), writePlan: vi.fn(), writePlanIdentity: vi.fn(), writeLifecycleIdentity: vi.fn(), assertNoUnresolvedSteering: vi.fn(),
-  scheduledPrepare: vi.fn(), scheduledAuditAppend: vi.fn(), scheduledAuditCompletion: vi.fn(), scheduledAuditInvocation: vi.fn(), scheduledGateVerification: vi.fn(),
+  scheduledPrepare: vi.fn(), scheduledAuditAppend: vi.fn(), scheduledAuditCompletion: vi.fn(), scheduledAuditInvocation: vi.fn(),
+  scheduledAuditResumeContext: vi.fn(), scheduledGateVerification: vi.fn(),
 }))
 vi.mock("./steering-reconciliation-ledger.js", () => ({
   prepareSteeringReconciliation: reconciliationMocks.prepare,
@@ -29,6 +30,7 @@ vi.mock("./pg-scheduled-task-graph-audit-command.js", () => ({ appendScheduledAu
   verifyScheduledAuditCompletion: reconciliationMocks.scheduledAuditCompletion,
   readScheduledAuditInvocationProof: reconciliationMocks.scheduledAuditInvocation,
   verifyScheduledGateCompletionWithAuditReplay: reconciliationMocks.scheduledGateVerification }))
+vi.mock("./scheduled-audit-resume.js", () => ({ readScheduledAuditResumeContext: reconciliationMocks.scheduledAuditResumeContext }))
 vi.mock("./task-graph-pg-events.js", async importOriginal => {
   const actual = await importOriginal<typeof import("./task-graph-pg-events.js")>()
   return { ...actual, appendTaskGraphReceipt: vi.fn(async () => undefined), writeTaskGraphSnapshot: vi.fn(async () => undefined),
@@ -306,16 +308,19 @@ describe("createPgTaskGraphCommandPort", () => {
       readyTaskIds: ["audit-task"], auditTaskId: "audit-task", expectedAttemptCount: 1 })
     reconciliationMocks.scheduledAuditCompletion.mockResolvedValue({ report: { processed: 0 } })
     reconciliationMocks.scheduledAuditInvocation.mockResolvedValue({ auditTaskId: "audit-task", attemptCount: 1 })
+    reconciliationMocks.scheduledAuditResumeContext.mockResolvedValue({ status: "not_registered" })
     const port = createPgTaskGraphCommandPort(fake.pool)
 
     await expect(port.appendScheduledAudit!(input)).resolves.toMatchObject({ auditTaskId: "audit-task", expectedAttemptCount: 1 })
     await expect(port.verifyScheduledAuditCompletion!(input)).resolves.toMatchObject({ report: { processed: 0 } })
     await expect(port.readScheduledAuditInvocationProof!(input)).resolves.toMatchObject({ auditTaskId: "audit-task" })
+    await expect(port.readScheduledAuditResumeContext!(input)).resolves.toEqual({ status: "not_registered" })
     expect(reconciliationMocks.scheduledAuditAppend).toHaveBeenCalledWith(fake.client, input)
     expect(reconciliationMocks.scheduledAuditCompletion).toHaveBeenCalledWith(fake.client, input)
     expect(reconciliationMocks.scheduledAuditInvocation).toHaveBeenCalledWith(fake.client, input)
-    expect(fake.calls.filter(call => call.sql === "BEGIN")).toHaveLength(3)
-    expect(fake.calls.filter(call => call.sql === "COMMIT")).toHaveLength(3)
+    expect(reconciliationMocks.scheduledAuditResumeContext).toHaveBeenCalledWith(fake.client, input)
+    expect(fake.calls.filter(call => call.sql === "BEGIN")).toHaveLength(4)
+    expect(fake.calls.filter(call => call.sql === "COMMIT")).toHaveLength(4)
   })
 
   it("routes Gate proof reads through the Audit-aware verifier in an owner-scoped transaction", async () => {

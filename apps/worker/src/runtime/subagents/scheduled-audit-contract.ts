@@ -130,6 +130,12 @@ export type TaskGraphScheduledAuditCompletionInput = Readonly<{
   auditTaskId: string
   attemptCount: number
 }>
+export type TaskGraphScheduledAuditResumeInput = Readonly<{ scope: TaskGraphReadScope }>
+export type ScheduledAuditResumeContext =
+  | Readonly<{ status: "not_registered" | "invalid" }>
+  | Readonly<{ status: "registered"; auditTaskId: string; auditStatus: "queued" | "retrying" | "running" | "completed";
+      expectedAttemptCount: number; owner: ScheduledAuditOwner; executionOwner: ScheduledTaskGraphExecutionOwner;
+      snapshotDigest: string; gateProof: ScheduledGateCompletionProof }>
 
 export function scheduledAuditRegistrationReceiptKey(continuationKey: string, auditTaskId: string): string {
   const digest = createHash("sha256").update(JSON.stringify([continuationKey, auditTaskId]), "utf8").digest("hex")

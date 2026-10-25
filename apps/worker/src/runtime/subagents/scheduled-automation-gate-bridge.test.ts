@@ -93,6 +93,26 @@ describe("scheduled automation Gate continuation", () => {
       .toBeLessThan(deps.commandPort.verifyScheduledAuditCompletion.mock.invocationCallOrder[0]!)
   })
 
+  it("recovers a completed registered Audit without appending another Gate or Audit", async () => {
+    const expectedOwner = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+      rootAttemptCount: owner.rootAttemptCount, executionId: "execution-1", executionAttemptCount: 3 }
+    const deps = dependencies({ readScheduledAuditResumeContext: vi.fn(async () => ({ status: "registered" as const,
+      auditTaskId: "audit-task", auditStatus: "completed" as const, expectedAttemptCount: 1, owner: expectedOwner,
+      executionOwner: { executionId: "execution-1", executionAttemptCount: 3 },
+      snapshotDigest: continuation.attestation.snapshotDigest, gateProof })) })
+    const run = createScheduledAutomationGateContinuation({ ...deps, nativeQuestionWaitEnabled: true } as never)
+    await expect(run({ owner, executionOwner, mode: "resume_audit", finalStepId: "root-final-step",
+      signal: new AbortController().signal } as never)).resolves.toEqual({ status: "completed" })
+    expect(deps.commandPort.readScheduledAuditResumeContext).toHaveBeenCalledWith(expect.objectContaining({
+      scope: expect.objectContaining({ rootTaskId: owner.rootTaskId, parentAttemptCount: owner.rootAttemptCount }),
+    }))
+    expect(deps.commandPort.verifyScheduledAuditCompletion).toHaveBeenCalledWith(expect.objectContaining({
+      executionOwner: { executionId: "execution-1", executionAttemptCount: 3 }, auditTaskId: "audit-task", attemptCount: 1,
+    }))
+    expect(deps.commandPort.appendScheduledGate).not.toHaveBeenCalled()
+    expect(deps.commandPort.appendScheduledAudit).not.toHaveBeenCalled()
+  })
+
   it("does not append Audit when exact Gate completion proof is missing", async () => {
     mock.selectResume.mockResolvedValue({ status: "initial" })
     mock.readCandidate.mockResolvedValue(null)

@@ -51,14 +51,38 @@ export async function completeScheduledPipelineBeforeTerminal(input: Readonly<{
       || input.executionOwner.turnId !== input.owner.turnId || input.executionOwner.rootTaskId !== input.owner.rootTaskId
       || input.executionOwner.ownerId !== input.owner.turnLeaseOwnerId || input.executionOwner.leaseVersion !== input.owner.turnLeaseVersion
       || input.rootAttemptCount !== input.owner.rootAttemptCount) throw new Error("scheduled_candidate_owner_invalid")
+    const candidate = { owner: input.executionOwner, rootAttemptCount: input.rootAttemptCount,
+      finalStepId: input.finalStepId, finalStepOrdinal: input.finalStepOrdinal, candidateText: input.candidateText }
+    const resumeAudit = async (stage = true): Promise<ScheduledPipelineCompletionDisposition | null> => {
+      if (!input.continueAfterGate) return null
+      const result = await input.continueAfterGate({ owner: input.owner, executionOwner: input.executionOwner,
+        mode: "resume_audit", finalStepId: input.finalStepId, signal: input.signal })
+      if (result.status === "not_registered") return null
+      if (result.status === "blocked") return result
+      if (result.status === "completed") {
+        if (stage) await input.stageCandidate(candidate)
+        return { status: "completed", candidateText: input.candidateText }
+      }
+      if (result.status === "waiting_for_dependency") {
+        if (stage) await input.stageCandidate(candidate)
+        return { status: result.status, waitId: result.waitId, candidateText: input.candidateText }
+      }
+      return { status: "blocked", errorCode: "scheduled_audit_resume_result_invalid" }
+    }
+    if (input.continueAfterGate) {
+      const recovered = await resumeAudit()
+      if (recovered) return recovered
+    }
     const evidence = await input.bridge(input.owner)
     if (evidence.status === "blocked") return { status: "blocked", errorCode: `scheduled_pipeline_${evidence.reasonCode}` }
-    await input.stageCandidate({ owner: input.executionOwner,
-      rootAttemptCount: input.rootAttemptCount,
-      finalStepId: input.finalStepId, finalStepOrdinal: input.finalStepOrdinal, candidateText: input.candidateText })
+    await input.stageCandidate(candidate)
     const continuation = await postScheduledPipelineContinuation({ owner: input.owner, attestation: evidence.attestation }, input.signal, input.fetcher)
     if (continuation.status === "blocked") return { status: "blocked", errorCode: continuation.errorCode }
     if (continuation.status === "waiting_for_user") return { status: "waiting_for_external_user", externalWaitId: continuation.waitId, candidateText: input.candidateText }
+    if (continuation.status === "completed") {
+      if (!input.continueAfterGate) return { status: "completed", candidateText: input.candidateText }
+      return await resumeAudit(false) ?? { status: "blocked", errorCode: "scheduled_audit_not_registered" }
+    }
     if (continuation.status === "analyze_checkpointed") {
       if (!input.continueAfterAnalyze) return { status: "blocked", errorCode: "scheduled_pipeline_prepare_continuation_unavailable" }
       const prepared = parsePrepareContinuationResult(await input.continueAfterAnalyze({ owner: input.owner, executionOwner: input.executionOwner,
@@ -89,9 +113,11 @@ export async function completeScheduledPipelineBeforeTerminal(input: Readonly<{
         question: gateResult.question, binding: gateResult.binding, candidateText: input.candidateText }
       if (gateResult.status === "waiting_for_external_user") return { status: gateResult.status, externalWaitId: gateResult.waitId, candidateText: input.candidateText }
       if (gateResult.status === "blocked") return gateResult
+      if (gateResult.status === "not_registered") return { status: "blocked", errorCode: "scheduled_audit_not_registered" }
+      if (gateResult.status !== "completed") return { status: "blocked", errorCode: "scheduled_audit_result_invalid" }
       return { status: "completed", candidateText: input.candidateText }
     }
-    return { status: "completed", candidateText: input.candidateText }
+    return { status: "blocked", errorCode: "scheduled_pipeline_handoff_result_invalid" }
   } catch (error: unknown) {
     if (isTurnStateRefreshRetryError(error) || isSessionPauseRequestedError(error) || signalWasInterrupted(input.signal)
       || input.signal.aborted || input.isOwnershipLost?.(error, input.signal)) throw error

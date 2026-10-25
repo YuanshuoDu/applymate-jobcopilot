@@ -3,15 +3,25 @@ import { Queue, Worker, type Job } from "bullmq"
 import Redis from "ioredis"
 import { Pool } from "pg"
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest"
+import type { ModelAdapter } from "@jobcopilot/agent-model"
+import { TurnEngine } from "../turns/turn-engine.js"
+import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
+import type { TurnEngineOptions, TurnEngineResult } from "../turns/turn-engine-types.js"
 import { createPgDurableWaitPort } from "./durable-wait-store.js"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
+import { createPgRootTaskStore } from "./root-task-store.js"
+import { createScheduledPipelineCandidateStore } from "./scheduled-pipeline-candidate-store.js"
+import { attachScheduledPipelineCompletion } from "./scheduled-pipeline-completion.js"
 import { createScheduledAutomationGateContinuation } from "./scheduled-automation-gate-bridge.js"
+import { createScheduledAutomationPrepareContinuation } from "./scheduled-automation-prepare-bridge.js"
 import { createScheduledGateChildExecutor } from "./scheduled-gate-child-runtime.js"
 import { createScheduledAuditChildExecutor } from "./scheduled-audit-child-runtime.js"
 import { createScheduledGatePrepareFixture } from "./scheduled-gate-prepare-pg-runner.fixture.js"
+import { scheduledGateRootActions } from "./scheduled-gate-prepare-pg-resume.fixture.js"
 import { parseScheduledAuditReport, SCHEDULED_AUDIT_TASK_TYPE, SCHEDULED_AUDIT_TEMPLATE_ID } from "./scheduled-audit-contract.js"
 import { verifyCompletedTaskGraphNodeEvidence } from "./task-graph-pg-verification.js"
-import { loadTaskGraph } from "./task-graph-pg-state.js"
+import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.js"
+import { verifyScheduledPrepareTaskGraphEvidence } from "./scheduled-prepare-task-graph-verification.js"
 import { AgentTreeManager } from "./manager.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
 import { parseSubagentDispatchJobId } from "./dispatch-identity.js"
@@ -28,6 +38,12 @@ type Fixture = Awaited<ReturnType<typeof createScheduledGatePrepareFixture>>
 type Runner = Readonly<{ worker: Worker<SubagentJobPayload, unknown>; redis: Redis; queue: Queue<SubagentJobPayload> }>
 type ScheduledPipelineRoute = Readonly<{ POST(request: Request): Promise<Response> }>
 type ExecuteHttpResponse = Readonly<{ status: number; body: Record<string, unknown> }>
+type FixtureWebDatabase = Readonly<{ db: {
+  $disconnect(): Promise<void>
+  $transaction<T>(work: (tx: unknown) => Promise<T>): Promise<T>
+  customAgentRole: { findMany(args: unknown): Promise<readonly unknown[]> }
+} }>
+type CustomAgentRoleLookup = Readonly<{ userId: string; insertAfter: string; enabled: true }>
 type GateFailureDiagnostics = Readonly<Record<string, unknown>>
 type GateHttpFailure = Readonly<{ status: number; errorCode: string | null; testDiagnostic: Readonly<{
   phase: string | null; errorClass: string | null; prismaCode: string | null; safeErrorCode: string | null
@@ -110,6 +126,7 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     vi.doUnmock(scheduledTaskGraphRunServicePath)
     vi.doUnmock(scheduledTaskGraphFencePath)
     vi.doUnmock(scheduledTaskGraphGateInputPath)
+    vi.doUnmock(scheduledWebDbPath)
     vi.resetModules()
   })
   afterAll(async () => {
@@ -165,10 +182,17 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(gateResolution?.matchedTaskIds).toEqual([gateTaskId])
 
     const gateProof = await requireGateProof(fixture)
-    const auditWait = await continuation(input)
-    expect(auditWait.status).toBe("waiting_for_dependency")
-    if (auditWait.status !== "waiting_for_dependency") throw new Error("scheduled Audit wait missing")
+    const rootStore = createPgRootTaskStore(pool as never)
+    const pendingRoot = await runAttachedScheduledAuditRoot(fixture, response.fetcher, command, waitPort)
+    expect(pendingRoot.status).toBe("waiting_for_dependency")
+    if (pendingRoot.status !== "waiting_for_dependency" || !pendingRoot.waitId) throw new Error("scheduled Audit root wait missing")
+    const auditWait = { status: "waiting_for_dependency" as const, waitId: pendingRoot.waitId }
     expect(auditWait.waitId).not.toBe(initialGateWait.waitId)
+    await rootStore.finish({ lease: fixture.turnLease, rootTaskId: fixture.ids.rootTaskId, result: pendingRoot })
+    const pendingRootState = await readRootTurnState(fixture)
+    expect(pendingRootState.turnStatus).toBe("in_progress")
+    expect(pendingRootState.rootStatus).toBe("waiting")
+    expect(pendingRootState.rootResult).toMatchObject({ status: "waiting_for_dependency", waitId: auditWait.waitId })
     const auditTaskId = await findTaskId(SCHEDULED_AUDIT_TASK_TYPE, fixture.ids.rootTaskId)
     const appended = await command.appendScheduledAudit!({ scope, executionOwner: fixture.executionOwner, handoff: fixture.handoff,
       attestation: fixture.attestation, gateProof, scheduledWaitId: fixture.prepareChoiceWaitId })
@@ -194,6 +218,11 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(Object.keys(firstHttpResponse?.body ?? {}).sort()).toEqual(["report", "status"])
     expect(firstHttpResponse?.body.status).toBe("completed")
     expect(firstHttpResponse?.body.report).toEqual(response.report())
+    const customRoleLookups = response.customRoleLookups()
+    expect(customRoleLookups.length).toBeGreaterThan(0)
+    expect(customRoleLookups.every(lookup => lookup.userId === fixture.ids.userId && lookup.enabled
+      && typeof lookup.insertAfter === "string")).toBe(true)
+    expect(response.customModelCalls()).toEqual([])
     expect(response.report()).toMatchObject({ processed: fixture.preparedJobIds.length, pending: fixture.preparedJobIds.length })
     const firstExecutionState = await readExecutionState(fixture)
     expect(firstExecutionState.status).toBe("completed")
@@ -231,9 +260,34 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(privateProof?.report).toEqual(response.report())
     await expect(command.verifyScheduledAuditCompletion!({ ...proofInput, attemptCount: 1 })).resolves.toBeNull()
 
+    const auditWake = await waitPort.resolve({ userId: fixture.ids.userId, sessionId: fixture.ids.sessionId, waitId: retryWait.waitId })
+    expect(auditWake).toMatchObject({ status: "ready", matchedTaskIds: [auditTaskId] })
+    const staleAuditPort = command as typeof command & {
+      verifyScheduledAuditCompletion: NonNullable<typeof command.verifyScheduledAuditCompletion>
+    }
+    const verifyAudit = staleAuditPort.verifyScheduledAuditCompletion.bind(staleAuditPort)
+    const staleAuditProof = vi.spyOn(staleAuditPort, "verifyScheduledAuditCompletion").mockImplementation(proof =>
+      verifyAudit({ ...proof, attemptCount: 1 }))
+    let staleRoot: TurnEngineResult
+    try { staleRoot = await runAttachedScheduledAuditRoot(fixture, response.fetcher, command, waitPort) }
+    finally { staleAuditProof.mockRestore() }
+    expect(staleRoot).toMatchObject({ status: "waiting_for_dependency", errorCode: "scheduled_audit_completion_unverified" })
+    await rootStore.finish({ lease: fixture.turnLease, rootTaskId: fixture.ids.rootTaskId, result: staleRoot })
+    const staleRootState = await readRootTurnState(fixture)
+    expect(staleRootState.turnStatus).toBe("in_progress")
+    expect(staleRootState.rootStatus).toBe("waiting")
+
+    const terminalRoot = await runAttachedScheduledAuditRoot(fixture, response.fetcher, command, waitPort)
+    expect(terminalRoot).toMatchObject({ status: "completed", finalText: "Scheduled Gate integration candidate." })
+    await rootStore.finish({ lease: fixture.turnLease, rootTaskId: fixture.ids.rootTaskId, result: terminalRoot })
+    const terminalRootState = await readRootTurnState(fixture)
+    expect(terminalRootState.turnStatus).toBe("completed")
+    expect(terminalRootState.rootStatus).toBe("completed")
+    expect(terminalRootState.rootResult).toMatchObject({ status: "completed", finalItemId: terminalRoot.finalItemId })
+
     const graph = await loadTaskGraph(pool as never, fixture.graphScope, false)
     const auditNode = graph.snapshot?.nodes.find(node => node.key === SCHEDULED_AUDIT_TEMPLATE_ID)
-    expect(auditNode?.verificationDisposition).toBe("legacy_unverified")
+    expect(auditNode?.verificationDisposition).toBe("specialized")
     const generic = await verifyCompletedTaskGraphNodeEvidence({ query: async () => { throw new Error("unverified Audit must not reach generic evidence queries") } } as never, {
       scope: { ...fixture.graphScope, taskId: auditTaskId, attemptCount: 2 }, snapshot: graph.snapshot!, node: auditNode!,
       structuredResult: response.report(),
@@ -259,6 +313,65 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     await expect(continuation(input)).resolves.toMatchObject({ status: "completed" })
   }, 600_000)
 })
+
+async function runAttachedScheduledAuditRoot(fixture: Fixture, fetcher: typeof fetch,
+  commandPort: ReturnType<typeof createPgTaskGraphCommandPort>, waitPort: ReturnType<typeof createPgDurableWaitPort>): Promise<TurnEngineResult> {
+  const lease = fixture.turnLease, owner = { ...fixture.owner, turnLeaseOwnerId: lease.ownerId, turnLeaseVersion: lease.leaseVersion }
+  const executionOwner = fixture.turnExecutionOwner as TurnExecutionOwnerFence
+  const store = createPgTurnEngineStore(pool as never), candidateStore = createScheduledPipelineCandidateStore(pool as never, store)
+  const rootStore = createPgRootTaskStore(pool as never)
+  await rootStore.ensure({ lease, goal: "Finish the scheduled automation only after its current Audit proof", allowedActions: scheduledGateRootActions() })
+  const recoveredCandidate = await candidateStore.read({ owner: executionOwner, rootAttemptCount: owner.rootAttemptCount })
+  if (!recoveredCandidate) throw new Error("scheduled Audit root candidate missing")
+  const prepareContinuation = createScheduledAutomationPrepareContinuation({ commandPort, waitPort,
+    async verifyReadyPrepare({ scope, prepareTaskId }) {
+      const graph = await loadTaskGraph(pool as never, scope, false), current = currentTaskGraph(graph), task = graph.tasks.get(prepareTaskId)
+      if (!graph.snapshot || !task || !Number.isSafeInteger(task.attemptCount)) return { verified: false, reasonCode: "scheduled_prepare_graph_invalid" }
+      return verifyScheduledPrepareTaskGraphEvidence(pool as never, { scope: { ...scope, taskId: prepareTaskId, attemptCount: task.attemptCount! },
+        snapshot: graph.snapshot, current, tasks: graph.tasks, structuredResult: debugRecord(task.result)?.structuredResult,
+        completionGraphRevision: current.revision, referenceVerificationMode: { phase: "persisted_gate" } })
+    } })
+  const gateContinuation = createScheduledAutomationGateContinuation({ pool: pool as never, commandPort, waitPort,
+    nativeQuestionWaitEnabled: false, fetcher })
+  const baseCompletionGate: NonNullable<TurnEngineOptions["completionGate"]> = async () =>
+    rootStore.checkCompletion({ lease, rootTaskId: fixture.ids.rootTaskId, taskGraphVerification: true })
+  const completionGate = attachScheduledPipelineCompletion({ gate: baseCompletionGate, owner,
+    async bridge() { return { status: "ready", attestation: await fixture.reattestCurrentTurn(lease) } },
+    continueAfterAnalyze: prepareContinuation, continueAfterGate: gateContinuation, fetcher,
+    stageCandidate: input => candidateStore.stage(input), onWebAccepted() {},
+    rootAttemptCount: owner.rootAttemptCount, recoveredCandidate })
+  const profile: ModelAdapter["profile"] = { provider: "fixture", model: "scheduled-audit-root", nativeTools: true,
+    structuredOutput: true, streaming: true, continuationCursor: false, supportsParallelTools: false,
+    supportsStreamingToolArgs: false, supportsReasoningSummary: false, supportsResponseContinuation: false,
+    supportsProviderConversation: false, supportsBackgroundResponse: false, maxContextTokens: null,
+    maxOutputTokens: 128, costClass: "low" }
+  const model: ModelAdapter = { id: "scheduled-audit-root", profile,
+    async *stream() { throw new Error("scheduled Audit root candidate replay unexpectedly called the model") } }
+  const options: TurnEngineOptions = { lease, rootTaskId: fixture.ids.rootTaskId, taskId: fixture.ids.rootTaskId,
+    scope: { userId: fixture.ids.userId }, goal: "Complete the verified scheduled automation",
+    snapshot: { system: [], profile: [], steerHistory: [], toolObservations: [],
+      businessRefs: fixture.preparedJobIds.map(id => ({ id, kind: "job" as const, ownerId: fixture.ids.userId })) },
+    contextBuilder: { async build(request) { return { schemaVersion: "agent-harness.v2", sessionId: request.sessionId,
+      turnId: request.turnId, stepId: request.stepId, inputThroughSequence: 0n, consumedInputIds: [], blocks: [], canonicalJson: "{}" } } },
+    store, model, tools: [], executeTool: async ({ call }) => ({ id: call.id, toolName: call.toolName,
+      toolVersion: call.toolVersion, status: "completed", errorCode: null }), completionGate,
+    recoveredFinalCandidate: recoveredCandidate.candidateText,
+    resume: { nextOrdinal: recoveredCandidate.finalStepOrdinal + 1, stepCount: recoveredCandidate.finalStepOrdinal + 1,
+      toolCallCount: 0, inputThroughSequence: 0n, consumedInputIds: [],
+      usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } } }
+  return new TurnEngine(options).run()
+}
+
+async function readRootTurnState(fixture: Fixture): Promise<Readonly<{ turnStatus: string; rootStatus: string; rootResult: Record<string, unknown> | null }>> {
+  const result = await pool!.query<{ turnStatus: string; rootStatus: string; rootResult: unknown }>(
+    `SELECT turn."status" AS "turnStatus", root."status" AS "rootStatus", root."result" AS "rootResult"
+       FROM "agent_turns" AS turn JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId"
+       WHERE turn."id" = $1 AND turn."sessionId" = $2 AND root."id" = $3`,
+    [fixture.ids.turnId, fixture.ids.sessionId, fixture.ids.rootTaskId])
+  const row = result.rows[0]
+  if (!row) throw new Error("scheduled Audit root Turn state missing")
+  return { turnStatus: row.turnStatus, rootStatus: row.rootStatus, rootResult: debugRecord(row.rootResult) }
+}
 
 function startRunner(fixture: Fixture, fetcher: typeof fetch): Runner {
   const redis = new Redis(redisUrl!, { maxRetriesPerRequest: null, connectTimeout: 2_000, retryStrategy: attempt => attempt > 3 ? null : 100 })
@@ -306,9 +419,38 @@ async function stopRunner(): Promise<void> {
 }
 async function setupFetcher(fixture: Fixture) {
   vi.doMock(scheduledGateQualityReviewPath, () => ({ reviewApplicationQuality: async () => ({ kind: "unavailable" }) }))
+  const customRoleLookups: CustomAgentRoleLookup[] = []
+  const customModelCalls: string[] = []
+  const fixtureWebDb = await vi.importActual<FixtureWebDatabase>(scheduledWebDbPath)
+  const databaseWithoutCustomAgents = new Proxy(fixtureWebDb.db, {
+    get(target, property, receiver) {
+      if (property !== "customAgentRole") return Reflect.get(target, property, receiver)
+      const delegate = Reflect.get(target, property, target)
+      if (!delegate || typeof delegate !== "object") return delegate
+      return new Proxy(delegate, {
+        get(delegateTarget, operation, delegateReceiver) {
+          if (operation !== "findMany") return Reflect.get(delegateTarget, operation, delegateReceiver)
+          return async (args: unknown) => {
+            const where = debugRecord(debugRecord(args)?.where)
+            if (where?.userId !== fixture.ids.userId || where.enabled !== true || typeof where.insertAfter !== "string") {
+              throw new Error("scheduled Audit fixture custom role lookup escaped its empty user scope")
+            }
+            customRoleLookups.push({ userId: fixture.ids.userId, insertAfter: where.insertAfter, enabled: true })
+            return []
+          }
+        },
+      })
+    },
+  })
+  vi.doMock(scheduledWebDbPath, () => ({ ...fixtureWebDb, db: databaseWithoutCustomAgents }))
   vi.doMock(scheduledModelRouterPath, () => ({ APPLYMATE_BACKING: "fixture",
     loadUserAiConfig: async () => ({ resolvedKey: "fixture-key", provider: "fixture", model: "scheduled-audit-route" }),
-    resolveConfig: () => ({ resolvedKey: "fixture-key", provider: "fixture", model: "scheduled-audit-route" }) }))
+    resolveConfig: () => ({ resolvedKey: "fixture-key", provider: "fixture", model: "scheduled-audit-route" }),
+    modelChat: vi.fn(async (_messages: unknown, config: unknown) => {
+      const feature = debugRecord(config)?.usageFeatureKey
+      if (typeof feature === "string" && feature.startsWith("custom_")) customModelCalls.push(feature)
+      return { text: "fixture model response" }
+    }) }))
   vi.doMock(scheduledEntitlementsPath, () => ({ isFeatureAllowed: async () => true,
     hasEffectiveEntitlement: async () => true, resolveAiAccess: async () => "available" }))
   let pipelineOutcome = "not_called"
@@ -482,8 +624,7 @@ async function setupFetcher(fixture: Fixture) {
     }
   } }))
   const route = await vi.importActual<ScheduledPipelineRoute>(scheduledPipelineRoutePath)
-  const webDb = await vi.importActual<{ db: { $disconnect(): Promise<void> } }>(scheduledWebDbPath)
-  disconnectWebDatabase = () => webDb.db.$disconnect()
+  disconnectWebDatabase = () => fixtureWebDb.db.$disconnect()
   let loseFirstExecuteResponse = true, gates = 0, executes = 0
   let gateDiagnostics: GateFailureDiagnostics | undefined
   const gateHttpFailures: GateHttpFailure[] = []
@@ -520,6 +661,7 @@ async function setupFetcher(fixture: Fixture) {
       }
       return response
     }
+    if (body.action === undefined) return response
     if (body.action !== "execute") throw new Error("scheduled Audit action invalid")
     executes += 1
     const payload = debugRecord(await response.clone().json().catch(() => null))
@@ -564,6 +706,8 @@ async function setupFetcher(fixture: Fixture) {
       if (!report) throw new Error("scheduled Audit route report missing")
       return report
     },
+    customRoleLookups: () => [...customRoleLookups],
+    customModelCalls: () => [...customModelCalls],
   }
 }
 

@@ -72,6 +72,86 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllEnvs())
 
 describe("scheduled pipeline pre-terminal completion", () => {
+  it("recovers an exact Audit completion before Web and stages the resumed candidate", async () => {
+    const stageCandidate = vi.fn(async () => undefined), bridge = vi.fn()
+    const continueAfterGate = vi.fn(async input => {
+      expect(input).toMatchObject({ owner, executionOwner, mode: "resume_audit", finalStepId: "step-final" })
+      return { status: "completed" as const }
+    })
+    await expect(completeScheduledPipelineBeforeTerminal({ ...base(), stageCandidate, owner, candidateText: "Final.",
+      signal: new AbortController().signal, bridge, continueAfterGate, fetcher: vi.fn<typeof fetch>() }))
+      .resolves.toEqual({ status: "completed", candidateText: "Final." })
+    expect(stageCandidate).toHaveBeenCalledWith({ owner: executionOwner, rootAttemptCount: owner.rootAttemptCount,
+      finalStepId: "step-final", finalStepOrdinal: 3, candidateText: "Final." })
+    expect(bridge).not.toHaveBeenCalled()
+  })
+
+  it("stages the exact candidate before returning a recovered Audit dependency wait", async () => {
+    const stageCandidate = vi.fn(async () => undefined), bridge = vi.fn()
+    const continueAfterGate = vi.fn(async () => ({ status: "waiting_for_dependency" as const, waitId: "audit-wait" }))
+    await expect(completeScheduledPipelineBeforeTerminal({ ...base(), stageCandidate, owner, candidateText: "Final.",
+      signal: new AbortController().signal, bridge, continueAfterGate }))
+      .resolves.toEqual({ status: "waiting_for_dependency", waitId: "audit-wait", candidateText: "Final." })
+    expect(stageCandidate).toHaveBeenCalledOnce()
+    expect(bridge).not.toHaveBeenCalled()
+  })
+
+  it("does not call the bridge or Web when Audit resume finds an orphan registration", async () => {
+    const bridge = vi.fn(), fetcher = vi.fn<typeof fetch>()
+    const readContext = vi.fn(async () => ({ status: "invalid" as const }))
+    const continueAfterGate = createScheduledAutomationGateContinuation({
+      pool: { connect: vi.fn() } as never,
+      commandPort: { readScheduledAuditResumeContext: readContext, verifyScheduledAuditCompletion: vi.fn() } as never,
+      waitPort: { wait: vi.fn() } as never, nativeQuestionWaitEnabled: false,
+    })
+    await expect(completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText: "Final.",
+      signal: new AbortController().signal, bridge, continueAfterGate, fetcher }))
+      .resolves.toEqual({ status: "blocked", errorCode: "scheduled_audit_resume_invalid" })
+    expect(readContext).toHaveBeenCalledOnce()
+    expect(bridge).not.toHaveBeenCalled()
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it("does not trust a bare Web completed report when Audit registration is absent", async () => {
+    const order: string[] = [], stageCandidate = vi.fn(async () => { order.push("stage") })
+    const continueAfterGate = vi.fn(async () => { order.push("resume"); return { status: "not_registered" as const } })
+    const bridge = vi.fn(async () => { order.push("bridge"); return ready })
+    const fetcher = vi.fn<typeof fetch>(async () => { order.push("web"); return response(200,
+      { status: "completed", report: { processed: 1, applied: 0, queued: 0, pending: 0, skipped: 1, failed: 0, durationMs: 1 } }) })
+    await expect(completeScheduledPipelineBeforeTerminal({ ...base(), stageCandidate, owner, candidateText: "Final.",
+      signal: new AbortController().signal, bridge, continueAfterGate, fetcher }))
+      .resolves.toEqual({ status: "blocked", errorCode: "scheduled_audit_not_registered" })
+    expect(order).toEqual(["resume", "bridge", "stage", "web", "resume"])
+    expect(stageCandidate).toHaveBeenCalledOnce()
+  })
+
+  it("rechecks Audit proof after a bare Web completed report before accepting completion", async () => {
+    const order: string[] = [], stageCandidate = vi.fn(async () => { order.push("stage") })
+    let recoveryCount = 0
+    const continueAfterGate = vi.fn(async () => {
+      recoveryCount += 1
+      order.push("resume")
+      return { status: recoveryCount === 1 ? "not_registered" as const : "completed" as const }
+    })
+    const bridge = vi.fn(async () => { order.push("bridge"); return ready })
+    const fetcher = vi.fn<typeof fetch>(async () => { order.push("web"); return response(200,
+      { status: "completed", report: { processed: 1, applied: 0, queued: 0, pending: 0, skipped: 1, failed: 0, durationMs: 1 } }) })
+    await expect(completeScheduledPipelineBeforeTerminal({ ...base(), stageCandidate, owner, candidateText: "Final.",
+      signal: new AbortController().signal, bridge, continueAfterGate, fetcher }))
+      .resolves.toEqual({ status: "completed", candidateText: "Final." })
+    expect(order).toEqual(["resume", "bridge", "stage", "web", "resume"])
+    expect(stageCandidate).toHaveBeenCalledOnce()
+  })
+
+  it("does not treat not-registered as a completed normal Gate continuation", async () => {
+    const prepared = readyPrepare(), fetcher = vi.fn<typeof fetch>(async (_url, init) => JSON.parse(String(init?.body)).prepareProof
+      ? response(200, { status: "gate_checkpointed" }) : response(200, analyzeProof()))
+    await expect(completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText: "Final.", signal: new AbortController().signal,
+      bridge: async () => ({ status: "ready", attestation: analyzeAttestation }), fetcher,
+      continueAfterAnalyze: async () => prepared, continueAfterGate: async () => ({ status: "not_registered" }) }))
+      .resolves.toEqual({ status: "blocked", errorCode: "scheduled_audit_not_registered" })
+  })
+
   it("posts the verified owner before returning the exact completed candidate", async () => {
     const order: string[] = [], stageCandidate = vi.fn(async (input: { candidateText: string }) => { order.push("stage"); expect(input.candidateText).toBe("  Exact final candidate.  ") })
     const bridge = vi.fn(async () => { order.push("bridge"); return ready })
@@ -138,6 +218,7 @@ describe("scheduled pipeline pre-terminal completion", () => {
       ? response(200, { status: "gate_checkpointed" })
       : response(200, analyzeProof()))
     const continueAfterGate = vi.fn(async input => {
+      if (input.mode === "resume_audit") return { status: "not_registered" as const }
       expect(input).toMatchObject({ owner, executionOwner, attestation: analyzeAttestation, handoff: analyzeProof(),
         prepareProof: prepared.prepareProof, scheduledWaitId: prepared.choice.required ? prepared.choice.scheduledWaitId : undefined,
         finalStepId: "step-final", signal })
@@ -160,7 +241,8 @@ describe("scheduled pipeline pre-terminal completion", () => {
       ? response(200, { status: "gate_checkpointed" }) : response(200, analyzeProof()))
     const result = await completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText, signal,
       bridge: async () => ({ status: "ready", attestation: analyzeAttestation }), fetcher,
-      continueAfterAnalyze: async () => prepared, continueAfterGate: async () => ({ status: "completed" }) })
+      continueAfterAnalyze: async () => prepared, continueAfterGate: async input => input.mode === "resume_audit"
+        ? { status: "not_registered" as const } : { status: "completed" as const } })
     expect(result).toEqual({ status: "completed", candidateText })
     expect(JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body))).toEqual({ owner, attestation: analyzeAttestation, prepareProof: prepared.prepareProof })
   })
@@ -194,6 +276,7 @@ describe("scheduled pipeline pre-terminal completion", () => {
     const gateContinuation = createScheduledAutomationGateContinuation({
       pool: { connect: async () => ({ query: async () => ({ rows: [], rowCount: 1 }), release: () => undefined }) } as never,
       commandPort: {
+        readScheduledAuditResumeContext: vi.fn(async () => ({ status: "not_registered" as const })),
         appendScheduledGate: vi.fn(async () => {
           order.push("append-gate")
           return { status: "accepted" as const, revision: 5, nodes: [{ key: "gate", taskId: "gate-task" }], readyTaskIds: ["gate-task"] }
@@ -264,7 +347,8 @@ describe("scheduled pipeline pre-terminal completion", () => {
     await expect(completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText: "Final.", signal: new AbortController().signal,
       bridge: async () => ({ status: "ready", attestation: analyzeAttestation }), fetcher,
       continueAfterAnalyze: async () => prepared,
-      continueAfterGate: async () => ({ status: "waiting_for_choice", waitId: "gate-question-wait", question: "Choose a fixed option.", binding }) }))
+      continueAfterGate: async input => input.mode === "resume_audit" ? { status: "not_registered" as const }
+        : { status: "waiting_for_choice" as const, waitId: "gate-question-wait", question: "Choose a fixed option.", binding } }))
       .resolves.toEqual({ status: "waiting_for_scheduled_gate_choice", waitId: "gate-question-wait", candidateText: "Final.",
         question: "Choose a fixed option.", binding })
   })
