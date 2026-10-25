@@ -51,12 +51,29 @@ type FixtureWebDatabase = Readonly<{ db: {
 } }>
 type CustomAgentRoleLookup = Readonly<{ userId: string; insertAfter: string; enabled: true }>
 type GateFailureDiagnostics = Readonly<Record<string, unknown>>
+type AuditPreflightState = "not_checked" | "passed" | "rejected" | "threw"
+type AuditPreflightDiagnostics = {
+  gateCompletionProofValid: boolean
+  executionOwnerDerived: boolean
+  prepareProofCanonicalMatch: boolean
+  executionContext: AuditPreflightState
+  prepareSource: AuditPreflightState
+  gateProofCurrent: AuditPreflightState
+}
+type AuditRequestOwner = Readonly<{ userId: string; sessionId: string; turnId: string; rootTaskId: string;
+  rootAttemptCount: number; turnLeaseOwnerId: string; turnLeaseVersion: number }>
+type AuditExecutionOwner = AuditRequestOwner & Readonly<{ executionId: string; executionAttemptCount: number }>
+type DiagnosticAuditReader = Readonly<{ agentExecution: { findFirst(args: unknown): Promise<unknown> } }>
+type AuditAction = Readonly<{ action: "scheduled_audit_execute"; owner: AuditRequestOwner; attestation: unknown;
+  prepareProof: unknown; gateCompletionProof: unknown; auditActor: Readonly<{ taskId: string; attemptCount: number; leaseOwner: string }>;
+  scheduledWaitId?: string }>
 type GateHttpFailure = Readonly<{ status: number; errorCode: string | null; testDiagnostic: Readonly<{
   phase: string | null; errorClass: string | null; prismaCode: string | null; safeErrorCode: string | null
 }> }>
 type ExecuteHttpFailure = Readonly<{ status: number; errorCode: string | null; keys: readonly string[]; reportValid: boolean;
   executionStatus?: string | null; executionCheckpoint?: string | null; executionNextStage?: string | null;
   hasExecutionError?: boolean; executionErrorCode?: string | null; pipelineOutcome?: string;
+  auditPreflight: AuditPreflightDiagnostics;
   continuation?: Readonly<{ gateResume: string; analyzeCheckpoint: string; continuationKey: string; waitBinding: string;
     ownerCurrentRecheck: string; prepareWait: string; gateInputRecheck: string; gateProofCurrent: string;
     gateHandoff: string; claimLease: string; storedStage: string; completionProof: string; completionPrepareProof: string;
@@ -771,10 +788,12 @@ async function setupFetcher(fixture: Fixture) {
     },
   }))
   const gateRpc = await vi.importActual<{
+    parseScheduledTaskGraphActionRequest(value: unknown): unknown
     scheduledTaskGraphExecuteGateCompletionProof(value: unknown): Record<string, unknown> | null
+    scheduledTaskGraphAuditExecutionOwner(request: { owner: AuditRequestOwner }, proof: unknown): AuditExecutionOwner | null
   }>("@/lib/agent/scheduled-taskgraph-gate-rpc")
   const diagnosticWebDb = await vi.importActual<{
-    db: { $transaction<T>(work: (tx: unknown) => Promise<T>): Promise<T> }
+    db: { $transaction<T>(work: (tx: DiagnosticAuditReader) => Promise<T>): Promise<T> }
   }>(scheduledWebDbPath)
   const continuationCheckpoint = await vi.importActual<{
     scheduledTaskGraphContinuationKey(owner: unknown, attestation: unknown): string
@@ -913,6 +932,57 @@ async function setupFetcher(fixture: Fixture) {
   } }))
   const route = await vi.importActual<ScheduledPipelineRoute>(scheduledPipelineRoutePath)
   disconnectWebDatabase = () => fixtureWebDb.db.$disconnect()
+  const inspectAuditPreflight = async (body: Record<string, unknown>): Promise<AuditPreflightDiagnostics> => {
+    const diagnostic = emptyAuditPreflight()
+    try {
+      const parsed = debugRecord(gateRpc.parseScheduledTaskGraphActionRequest(body))
+      if (!isAuditAction(parsed)) return diagnostic
+      const completion = gateRpc.scheduledTaskGraphExecuteGateCompletionProof(parsed.gateCompletionProof)
+      diagnostic.gateCompletionProofValid = completion !== null
+      if (!completion) return diagnostic
+      const owner = gateRpc.scheduledTaskGraphAuditExecutionOwner({ owner: parsed.owner }, completion)
+      diagnostic.executionOwnerDerived = owner !== null
+      diagnostic.prepareProofCanonicalMatch = debugSameJson(completion.prepareProof, parsed.prepareProof)
+      if (!owner) return diagnostic
+      const gate = debugRecord(completion.gate)
+      if (!gate || typeof gate.taskId !== "string" || !Number.isSafeInteger(gate.attemptCount)) return diagnostic
+      await diagnosticWebDb.db.$transaction(async tx => {
+        let analyzeCheckpoint: Record<string, unknown> | null = null
+        try {
+          const execution = debugRecord(await tx.agentExecution.findFirst({
+            where: { id: owner.executionId, userId: owner.userId, sessionId: owner.sessionId,
+              attemptCount: owner.executionAttemptCount },
+            select: { id: true, status: true, attemptCount: true, state: true },
+          }))
+          analyzeCheckpoint = gateInput.scheduledTaskGraphAnalyzeCheckpointForGate(execution?.state)
+          diagnostic.executionContext = analyzeCheckpoint ? "passed" : "rejected"
+        } catch {
+          diagnostic.executionContext = "threw"
+        }
+        const prepareSourceInput = { owner, snapshot: fixture.snapshot, proof: parsed.prepareProof,
+          ...(parsed.scheduledWaitId === undefined ? {} : { scheduledWaitId: parsed.scheduledWaitId }), reader: tx }
+        try {
+          diagnostic.prepareSource = await auditPrepareSource.validateScheduledTaskGraphAuditPrepareSource(prepareSourceInput)
+            ? "passed" : "rejected"
+        } catch {
+          diagnostic.prepareSource = "threw"
+        }
+        const gateProofInput = { owner, snapshot: fixture.snapshot, analyzeCheckpoint,
+          analyzeAttestation: parsed.attestation, prepareProof: parsed.prepareProof,
+          gate: { taskId: gate.taskId, attemptCount: Number(gate.attemptCount), phase: "completed" as const,
+            completionProof: parsed.gateCompletionProof }, auditActor: parsed.auditActor }
+        try {
+          diagnostic.gateProofCurrent = await gateInput.isScheduledTaskGraphAuditChildGateProofCurrent(gateProofInput, tx)
+            ? "passed" : "rejected"
+        } catch {
+          diagnostic.gateProofCurrent = "threw"
+        }
+      })
+    } catch {
+      if (diagnostic.executionContext === "not_checked") diagnostic.executionContext = "threw"
+    }
+    return diagnostic
+  }
   let loseFirstExecuteResponse = true, gates = 0, executes = 0
   let gateDiagnostics: GateFailureDiagnostics | undefined
   const gateHttpFailures: GateHttpFailure[] = []
@@ -924,9 +994,11 @@ async function setupFetcher(fixture: Fixture) {
   const fetcher: typeof fetch = async (input, init = {}) => {
     const request = new Request(input, init)
     const body = await request.clone().json() as Record<string, unknown>
+    let auditPreflight = emptyAuditPreflight()
     expect(request.method).toBe("POST")
     expect(request.headers.get("x-agent-worker-secret")).toBe("scheduled-audit-fixture-secret")
     if (body.action === "scheduled_audit_execute") {
+      auditPreflight = await inspectAuditPreflight(body)
       pipelineOutcome = "not_called"
       continuation = { gateResume: "not_called", analyzeCheckpoint: "not_checked", continuationKey: "not_checked", waitBinding: "not_checked",
         ownerCurrentRecheck: "not_checked", prepareWait: "not_checked", gateInputRecheck: "not_checked", gateProofCurrent: "not_checked",
@@ -967,7 +1039,8 @@ async function setupFetcher(fixture: Fixture) {
       const errorCode = typeof payload?.errorCode === "string" && diagnosticAuditFailureReasons.has(payload.errorCode)
         ? payload.errorCode : null
       const execution = await readExecutionFailureDiagnostic(fixture)
-      executeHttpFailures.push({ status: response.status, errorCode, keys, reportValid, pipelineOutcome, continuation: { ...continuation }, ...execution })
+      executeHttpFailures.push({ status: response.status, errorCode, keys, reportValid, pipelineOutcome,
+        auditPreflight, continuation: { ...continuation }, ...execution })
       return response
     }
     expect(body).toMatchObject({ owner: fixture.owner, attestation: fixture.attestation, prepareProof: fixture.prepareProof,
@@ -1301,6 +1374,31 @@ async function readGateFailureDiagnostics(fixture: Fixture, requestBody: Record<
 function debugRecord(value: unknown): Record<string, unknown> | null {
   const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
   return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null
+}
+function emptyAuditPreflight(): AuditPreflightDiagnostics {
+  return { gateCompletionProofValid: false, executionOwnerDerived: false, prepareProofCanonicalMatch: false,
+    executionContext: "not_checked", prepareSource: "not_checked", gateProofCurrent: "not_checked" }
+}
+function isAuditAction(value: Record<string, unknown> | null): value is AuditAction {
+  return Boolean(value && value.action === "scheduled_audit_execute" && isAuditRequestOwner(value.owner)
+    && Object.hasOwn(value, "attestation") && Object.hasOwn(value, "prepareProof") && Object.hasOwn(value, "gateCompletionProof")
+    && isAuditActor(value.auditActor) && (value.scheduledWaitId === undefined || diagnosticValidId(value.scheduledWaitId)))
+}
+function isAuditRequestOwner(value: unknown): value is AuditRequestOwner {
+  const row = debugRecord(value), keys = ["userId", "sessionId", "turnId", "rootTaskId", "rootAttemptCount", "turnLeaseOwnerId", "turnLeaseVersion"]
+  return Boolean(row && Object.keys(row).length === keys.length && keys.every(key => Object.hasOwn(row, key))
+    && [row.userId, row.sessionId, row.turnId, row.rootTaskId, row.turnLeaseOwnerId].every(diagnosticValidId)
+    && Number.isSafeInteger(row.rootAttemptCount) && Number(row.rootAttemptCount) > 0
+    && Number.isSafeInteger(row.turnLeaseVersion) && Number(row.turnLeaseVersion) > 0)
+}
+function isAuditActor(value: unknown): value is AuditAction["auditActor"] {
+  const row = debugRecord(value)
+  return Boolean(row && Object.keys(row).length === 3 && Object.hasOwn(row, "taskId") && Object.hasOwn(row, "attemptCount")
+    && Object.hasOwn(row, "leaseOwner") && diagnosticValidId(row.taskId) && diagnosticValidId(row.leaseOwner)
+    && Number.isSafeInteger(row.attemptCount) && Number(row.attemptCount) > 0)
+}
+function diagnosticValidId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value
 }
 function debugDate(value: unknown): number {
   return value instanceof Date ? value.getTime() : typeof value === "string" ? Date.parse(value) : Number.NaN
