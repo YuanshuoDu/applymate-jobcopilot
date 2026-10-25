@@ -124,7 +124,7 @@ describe('scheduled TaskGraph Gate lifecycle history', () => {
 
     const extra = fixture()
     const current = auditSuffix(extra.input)
-    current.graphContent = { ...current.graphContent, nodes: [...current.graphContent.nodes, { key: 'extra' }] }
+    current.graphContent = { ...current.graphContent, nodes: [...current.graphContent.nodes, { key: 'extra', taskId: 'extra-task' }] }
     await expect(scheduledTaskGraphGateHistoryIsCurrent(current)).resolves.toBe(false)
     expect(extra.findAuditTask).not.toHaveBeenCalled()
 
