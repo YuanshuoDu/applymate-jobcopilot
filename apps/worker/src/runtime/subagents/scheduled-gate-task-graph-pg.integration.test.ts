@@ -198,7 +198,7 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
     const firstStep = await startStep(fixture, lease, turnStore)
     const initial = await continuation({ owner, executionOwner: turnFence(lease, fixture.ids.rootTaskId), attestation,
       handoff, prepareProof: preparedProof, scheduledWaitId: fixture.prepareChoiceWaitId,
-      finalStepId: firstStep, signal: new AbortController().signal })
+      finalStepId: firstStep, recoveryStepId: firstStep, signal: new AbortController().signal })
     expect(initial.status).toBe("waiting_for_dependency")
     if (initial.status !== "waiting_for_dependency") throw new Error("scheduled_gate_initial_wait_missing")
     await suspendRoot(fixture, lease, firstStep, initial.waitId, turnStore, durableWait)
@@ -241,7 +241,7 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
       const questionStep = await startStep(fixture, lease, turnStore)
       const next = await continuation({ owner, executionOwner: turnFence(lease, fixture.ids.rootTaskId), attestation,
         handoff, prepareProof: preparedProof, scheduledWaitId: fixture.prepareChoiceWaitId,
-        finalStepId: questionStep, signal: new AbortController().signal })
+        finalStepId: questionStep, recoveryStepId: questionStep, signal: new AbortController().signal })
       expect(next.status).toBe("waiting_for_choice")
       if (next.status !== "waiting_for_choice") throw new Error("scheduled_gate_question_missing")
       expect(next.binding).toMatchObject({ gateAttempt: attempt, kind: "weak_cover_letter", jobIds: [fixture.preparedJobIds[attempt - 1]] })
@@ -271,7 +271,7 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
       const resumeStep = await startStep(fixture, lease, turnStore)
       const resumed = await continuation({ owner, executionOwner: turnFence(lease, fixture.ids.rootTaskId), attestation,
         handoff, prepareProof: preparedProof, scheduledWaitId: fixture.prepareChoiceWaitId,
-        finalStepId: resumeStep, signal: new AbortController().signal })
+        finalStepId: resumeStep, recoveryStepId: resumeStep, signal: new AbortController().signal })
       expect(resumed.status).toBe("waiting_for_dependency")
       if (resumed.status !== "waiting_for_dependency") throw new Error("scheduled_gate_answer_resume_missing")
       await assertResumeReplayFences(pool, command, fixture, lease, owner, resumeStep, question, attempt)
@@ -291,7 +291,7 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
     const completionStep = await startStep(fixture, lease, turnStore)
     const auditWait = await continuation({ owner, executionOwner: turnFence(lease, fixture.ids.rootTaskId), attestation,
       handoff, prepareProof: preparedProof, scheduledWaitId: fixture.prepareChoiceWaitId,
-      finalStepId: completionStep, signal: new AbortController().signal })
+      finalStepId: completionStep, recoveryStepId: completionStep, signal: new AbortController().signal })
     expect(auditWait.status).toBe("waiting_for_dependency")
     if (auditWait.status !== "waiting_for_dependency") throw new Error("scheduled_gate_audit_wait_missing")
     const durableAuditWait = await pool.query<{ status: string; mode: string; targetTaskIds: unknown; matchedTaskIds: unknown }>(
@@ -364,7 +364,8 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
     const firstStep = await startStep(fixture, lease, turnStore)
     const initial = await continuation({ owner, executionOwner: turnFence(lease, fixture.ids.rootTaskId), attestation,
       handoff: fixture.handoff as never, prepareProof: fixture.prepareProof as never,
-      scheduledWaitId: fixture.prepareChoiceWaitId, finalStepId: firstStep, signal: new AbortController().signal })
+      scheduledWaitId: fixture.prepareChoiceWaitId, finalStepId: firstStep, recoveryStepId: firstStep,
+      signal: new AbortController().signal })
     expect(initial.status).toBe("waiting_for_dependency")
     if (initial.status !== "waiting_for_dependency") throw new Error("scheduled_gate_cancel_initial_wait_missing")
     await suspendRoot(fixture, lease, firstStep, initial.waitId, turnStore, durableWait)
@@ -390,7 +391,8 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
     const questionStep = await startStep(fixture, lease, turnStore)
     const candidate = await continuation({ owner, executionOwner: turnFence(lease, fixture.ids.rootTaskId), attestation,
       handoff: fixture.handoff as never, prepareProof: fixture.prepareProof as never,
-      scheduledWaitId: fixture.prepareChoiceWaitId, finalStepId: questionStep, signal: new AbortController().signal })
+      scheduledWaitId: fixture.prepareChoiceWaitId, finalStepId: questionStep, recoveryStepId: questionStep,
+      signal: new AbortController().signal })
     expect(candidate.status).toBe("waiting_for_choice")
     if (candidate.status !== "waiting_for_choice") throw new Error("scheduled_gate_cancel_question_missing")
     expect(candidate.binding).toMatchObject({ gateAttempt: 1, kind: "weak_cover_letter", jobIds: [fixture.preparedJobIds[0]] })

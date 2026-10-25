@@ -80,7 +80,7 @@ const readyPrepare = (choiceRequired = true): Readonly<{ status: "ready"; choice
     prepareProof }
 }
 const base = () => ({ executionOwner, rootAttemptCount: owner.rootAttemptCount,
-  finalStepId: "step-final", finalStepOrdinal: 3, stageCandidate: vi.fn(async () => undefined) })
+  finalStepId: "step-final", finalStepOrdinal: 3, recoveryStepId: "step-final", stageCandidate: vi.fn(async () => undefined) })
 
 beforeEach(() => {
   gateContinuationMocks.selectResume.mockReset()
@@ -94,7 +94,7 @@ describe("scheduled pipeline pre-terminal completion", () => {
   it("recovers an exact Audit completion before Web and stages the resumed candidate", async () => {
     const stageCandidate = vi.fn(async () => undefined), bridge = vi.fn()
     const continueAfterGate = vi.fn(async input => {
-      expect(input).toMatchObject({ owner, executionOwner, mode: "resume_audit", finalStepId: "step-final" })
+      expect(input).toMatchObject({ owner, executionOwner, mode: "resume_audit", finalStepId: "step-final", recoveryStepId: "step-final" })
       return { status: "completed" as const }
     })
     await expect(completeScheduledPipelineBeforeTerminal({ ...base(), stageCandidate, owner, candidateText: "Final.",
@@ -129,19 +129,23 @@ describe("scheduled pipeline pre-terminal completion", () => {
       }
       order.push("gate")
       expect(input).toMatchObject({ owner, executionOwner, attestation: analyzeAttestation, handoff,
-        prepareProof: prepared.prepareProof, scheduledWaitId, finalStepId: "step-final" })
+        prepareProof: prepared.prepareProof, scheduledWaitId, finalStepId: "step-final", recoveryStepId: "step-recovery" })
       return { status: "waiting_for_choice" as const, waitId: "gate-question-wait",
         question: "Choose a fixed option.", binding }
     })
 
-    await expect(completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText: "Final candidate", stageCandidate,
+    await expect(completeScheduledPipelineBeforeTerminal({ ...base(), recoveryStepId: "step-recovery", owner, candidateText: "Final candidate", stageCandidate,
       signal: new AbortController().signal, bridge, continueAfterGate, fetcher }))
       .resolves.toEqual({ status: "waiting_for_scheduled_gate_choice", waitId: "gate-question-wait",
         question: "Choose a fixed option.", binding, candidateText: "Final candidate" })
     expect(order).toEqual(["recover", "bridge", "stage", "gate"])
     expect(stageCandidate).toHaveBeenCalledOnce()
+    expect(stageCandidate).toHaveBeenCalledWith({ owner: executionOwner, rootAttemptCount: owner.rootAttemptCount,
+      finalStepId: "step-final", finalStepOrdinal: 3, candidateText: "Final candidate" })
     expect(fetcher).not.toHaveBeenCalled()
     expect(continueAfterGate).toHaveBeenCalledTimes(2)
+    expect(continueAfterGate).toHaveBeenNthCalledWith(1, expect.objectContaining({ mode: "resume_audit",
+      finalStepId: "step-final", recoveryStepId: "step-recovery" }))
   })
 
   it("does not call the bridge or Web when Audit resume finds an orphan registration", async () => {
@@ -227,7 +231,7 @@ describe("scheduled pipeline pre-terminal completion", () => {
     const signal = new AbortController().signal
     const continueAfterAnalyze = vi.fn(async input => {
       expect(input).toMatchObject({ owner, executionOwner, attestation: analyzeAttestation, proof, candidateText,
-        finalStepId: "step-final", finalStepOrdinal: 3, signal })
+        finalStepId: "step-final", finalStepOrdinal: 3, recoveryStepId: "step-final", signal })
       return { status: "waiting_for_dependency" as const, waitId: "agent-wait:prepare:exact" }
     })
     await expect(completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText, signal,
@@ -269,19 +273,25 @@ describe("scheduled pipeline pre-terminal completion", () => {
       if (input.mode === "resume_audit") return { status: "not_registered" as const }
       expect(input).toMatchObject({ owner, executionOwner, attestation: analyzeAttestation, handoff: analyzeProof(),
         prepareProof: prepared.prepareProof, scheduledWaitId: prepared.choice.required ? prepared.choice.scheduledWaitId : undefined,
-        finalStepId: "step-final", signal })
+        finalStepId: "step-final", recoveryStepId: "step-recovery", signal })
       return { status: "waiting_for_dependency" as const, waitId: "agent-wait:gate:exact" }
     })
-    const result = await completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText, signal,
+    const continueAfterAnalyze = vi.fn(async input => {
+      expect(input).toMatchObject({ finalStepId: "step-final", finalStepOrdinal: 3, recoveryStepId: "step-recovery" })
+      return prepared
+    })
+    const result = await completeScheduledPipelineBeforeTerminal({ ...base(), recoveryStepId: "step-recovery", owner, candidateText, signal,
       bridge: async () => ({ status: "ready", attestation: analyzeAttestation }), fetcher,
-      continueAfterAnalyze: async () => prepared, continueAfterGate })
+      continueAfterAnalyze, continueAfterGate })
     expect(result).toEqual({ status: "waiting_for_dependency", waitId: "agent-wait:gate:exact", candidateText })
     expect(JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body))).toMatchObject({
       owner, attestation: analyzeAttestation, prepareProof: prepared.prepareProof,
       ...(prepared.choice.required ? { scheduledWaitId: prepared.choice.scheduledWaitId } : {}),
     })
     expect(continueAfterGate).toHaveBeenCalledTimes(2)
-    expect(continueAfterGate).toHaveBeenNthCalledWith(1, expect.objectContaining({ mode: "resume_audit" }))
+    expect(continueAfterAnalyze).toHaveBeenCalledOnce()
+    expect(continueAfterGate).toHaveBeenNthCalledWith(1, expect.objectContaining({ mode: "resume_audit",
+      finalStepId: "step-final", recoveryStepId: "step-recovery" }))
   })
 
   it("continues approval-disabled snapshots through the fixed Gate without a Prepare choice ID", async () => {

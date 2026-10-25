@@ -144,20 +144,20 @@ describe("scheduled Audit root resume", () => {
     const completedContext = context()
     if (completedContext.status !== "registered") throw new Error("expected a registered Audit context")
     const deps = dependencies([completedContext])
-    await expect(resumeScheduledAudit({ ...deps, scope, finalStepId: "final-step", signal: new AbortController().signal } as never))
+    await expect(resumeScheduledAudit({ ...deps, scope, recoveryStepId: "recovery-step", signal: new AbortController().signal } as never))
       .resolves.toEqual({ status: "completed" })
     expect(deps.wait).not.toHaveBeenCalled()
     expect(deps.verifyScheduledAuditCompletion).toHaveBeenCalledWith({ scope, executionOwner: completedContext.executionOwner,
       gateProof, auditTaskId: "audit-1", attemptCount: 1 })
   })
 
-  it("waits on the exact registered Audit task and attempt, then rereads before verification", async () => {
+  it("waits on the exact registered Audit task and attempt under the active recovery step", async () => {
     const deps = dependencies([context("queued"), context()])
-    await expect(resumeScheduledAudit({ ...deps, scope, finalStepId: "final-step", signal: new AbortController().signal } as never))
+    await expect(resumeScheduledAudit({ ...deps, scope, recoveryStepId: "recovery-step", signal: new AbortController().signal } as never))
       .resolves.toEqual({ status: "completed" })
-    const key = `scheduled-audit-wait:${createHash("sha256").update(JSON.stringify(["audit-1", "final-step", 1]), "utf8").digest("hex")}`
+    const key = `scheduled-audit-wait:${createHash("sha256").update(JSON.stringify(["audit-1", "recovery-step", 1]), "utf8").digest("hex")}`
     expect(deps.wait).toHaveBeenCalledWith({ userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
-      stepId: "final-step", taskId: scope.rootTaskId, rootTaskId: scope.rootTaskId, targetTaskIds: ["audit-1"], mode: "all",
+      stepId: "recovery-step", taskId: scope.rootTaskId, rootTaskId: scope.rootTaskId, targetTaskIds: ["audit-1"], mode: "all",
       timeoutMs: 24 * 60 * 60 * 1_000, idempotencyKey: key })
     expect(deps.readScheduledAuditResumeContext).toHaveBeenCalledTimes(2)
     expect(deps.verifyScheduledAuditCompletion).toHaveBeenCalledOnce()
@@ -173,7 +173,7 @@ describe("scheduled Audit root resume", () => {
     }
     const command = new ReceiverCommand(), wait = vi.fn(async () => ({ waitId: "audit-wait", status: "ready" as const,
       deadlineAt: "2026-10-25T10:00:00.000Z", matchedTaskIds: ["audit-1"] }))
-    await expect(resumeScheduledAudit({ command, waitPort: { wait }, scope, finalStepId: "final-step",
+    await expect(resumeScheduledAudit({ command, waitPort: { wait }, scope, recoveryStepId: "recovery-step",
       signal: new AbortController().signal } as never)).resolves.toEqual({ status: "completed" })
     expect(command.reads).toBe(2)
     expect(command.verifications).toBe(1)
@@ -182,7 +182,7 @@ describe("scheduled Audit root resume", () => {
   it("rejects a ready wake for another child before reading completion proof", async () => {
     const deps = dependencies([context("queued")], { wait: { waitId: "wrong", status: "ready",
       deadlineAt: "2026-10-25T10:00:00.000Z", matchedTaskIds: ["gate-1"] } })
-    await expect(resumeScheduledAudit({ ...deps, scope, finalStepId: "final-step", signal: new AbortController().signal } as never))
+    await expect(resumeScheduledAudit({ ...deps, scope, recoveryStepId: "recovery-step", signal: new AbortController().signal } as never))
       .resolves.toEqual({ status: "blocked", errorCode: "scheduled_audit_wait_invalid" })
     expect(deps.verifyScheduledAuditCompletion).not.toHaveBeenCalled()
   })
@@ -190,17 +190,17 @@ describe("scheduled Audit root resume", () => {
   it("blocks if the registered Audit binding changes while the root waits", async () => {
     const changed = { ...context(), auditTaskId: "audit-2" } as ScheduledAuditResumeContext
     const deps = dependencies([context("queued"), changed])
-    await expect(resumeScheduledAudit({ ...deps, scope, finalStepId: "final-step", signal: new AbortController().signal } as never))
+    await expect(resumeScheduledAudit({ ...deps, scope, recoveryStepId: "recovery-step", signal: new AbortController().signal } as never))
       .resolves.toEqual({ status: "blocked", errorCode: "scheduled_audit_wait_binding_changed" })
     expect(deps.verifyScheduledAuditCompletion).not.toHaveBeenCalled()
   })
 
   it("distinguishes a missing Audit registration from an invalid completion proof", async () => {
     const missing = dependencies([{ status: "not_registered" }])
-    await expect(resumeScheduledAudit({ ...missing, scope, finalStepId: "final-step", signal: new AbortController().signal } as never))
+    await expect(resumeScheduledAudit({ ...missing, scope, recoveryStepId: "recovery-step", signal: new AbortController().signal } as never))
       .resolves.toEqual({ status: "not_registered" })
     const invalid = dependencies([context()], { proof: null })
-    await expect(resumeScheduledAudit({ ...invalid, scope, finalStepId: "final-step", signal: new AbortController().signal } as never))
+    await expect(resumeScheduledAudit({ ...invalid, scope, recoveryStepId: "recovery-step", signal: new AbortController().signal } as never))
       .resolves.toEqual({ status: "blocked", errorCode: "scheduled_audit_completion_unverified" })
   })
 
@@ -208,7 +208,7 @@ describe("scheduled Audit root resume", () => {
     const controller = new AbortController(), cancelled = new Error("cancelled")
     const command = { async readScheduledAuditResumeContext() { return context() },
       async verifyScheduledAuditCompletion() { controller.abort(cancelled); return completionProof } }
-    await expect(resumeScheduledAudit({ command, waitPort: { wait: vi.fn() }, scope, finalStepId: "final-step",
+    await expect(resumeScheduledAudit({ command, waitPort: { wait: vi.fn() }, scope, recoveryStepId: "recovery-step",
       signal: controller.signal } as never)).rejects.toBe(cancelled)
   })
 

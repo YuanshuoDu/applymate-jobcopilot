@@ -10,7 +10,8 @@ import type { TurnEngineOptions, TurnEngineResult } from "../turns/turn-engine-t
 import { createPgDurableWaitPort } from "./durable-wait-store.js"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import { createPgRootTaskStore } from "./root-task-store.js"
-import { createScheduledPipelineCandidateStore } from "./scheduled-pipeline-candidate-store.js"
+import { createScheduledPipelineCandidateStore, SCHEDULED_PIPELINE_CANDIDATE_EVENT } from "./scheduled-pipeline-candidate-store.js"
+import { readScheduledPipelineRecoveryStepProfile, SCHEDULED_PIPELINE_RECOVERY_STEP_PROFILE_KEY } from "./scheduled-pipeline-recovery-step.js"
 import { attachScheduledPipelineCompletion } from "./scheduled-pipeline-completion.js"
 import { createScheduledAutomationGateContinuation } from "./scheduled-automation-gate-bridge.js"
 import { createScheduledAutomationPrepareContinuation } from "./scheduled-automation-prepare-bridge.js"
@@ -154,7 +155,7 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
       waitPort, nativeQuestionWaitEnabled: false, fetcher: response.fetcher })
     const input = { owner: fixture.owner, executionOwner: turnOwner, attestation: fixture.attestation,
       handoff: fixture.handoff, prepareProof: fixture.prepareProof, scheduledWaitId: fixture.prepareChoiceWaitId,
-      finalStepId: stepId, signal: new AbortController().signal }
+      finalStepId: stepId, recoveryStepId: stepId, signal: new AbortController().signal }
 
     const initialGateWait = await continuation(input)
     expect(initialGateWait.status).toBe("waiting_for_dependency")
@@ -186,6 +187,10 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     const pendingRoot = await runAttachedScheduledAuditRoot(fixture, response.fetcher, command, waitPort, "waiting_for_dependency")
     expect(pendingRoot.status).toBe("waiting_for_dependency")
     if (pendingRoot.status !== "waiting_for_dependency" || !pendingRoot.waitId) throw new Error("scheduled Audit root wait missing")
+    const pendingTrace = await readScheduledAuditRootRecoveryTrace(fixture)
+    expectScheduledAuditRecoveryTrace(pendingTrace, fixture, 1, "waiting_for_tool", null)
+    expect(pendingTrace.steps[0]?.completionEvents[0]?.payload).toMatchObject({ status: "waiting_for_dependency", waitId: pendingRoot.waitId })
+    expect(pendingTrace.steps[0]?.waits.some(wait => wait.id === pendingRoot.waitId)).toBe(true)
     const auditWait = { status: "waiting_for_dependency" as const, waitId: pendingRoot.waitId }
     expect(auditWait.waitId).not.toBe(initialGateWait.waitId)
     await rootStore.finish({ lease: fixture.turnLease, rootTaskId: fixture.ids.rootTaskId, result: pendingRoot })
@@ -276,6 +281,14 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     finally { staleAuditProof.mockRestore() }
     expect(staleRoot).toMatchObject({ status: "waiting_for_dependency", errorCode: "scheduled_audit_completion_unverified" })
     await rootStore.finish({ lease: fixture.turnLease, rootTaskId: fixture.ids.rootTaskId, result: staleRoot })
+    const staleTrace = await readScheduledAuditRootRecoveryTrace(fixture)
+    expectScheduledAuditRecoveryTrace(staleTrace, fixture, 2, "waiting_for_tool", "scheduled_audit_completion_unverified")
+    expect(staleTrace.candidateEvent.id).toBe(pendingTrace.candidateEvent.id)
+    expect(staleTrace.candidatePayload).toEqual(pendingTrace.candidatePayload)
+    expect(staleTrace.sourceStep).toEqual(pendingTrace.sourceStep)
+    expect(staleTrace.steps[1]?.completionEvents[0]?.payload).toEqual({ stepId: staleTrace.steps[1]?.id,
+      status: "waiting_for_dependency", errorCode: "scheduled_audit_completion_unverified", taskId: fixture.ids.rootTaskId })
+    expect(staleTrace.steps[1]?.waits).toEqual([])
     const staleRootState = await readRootTurnState(fixture)
     expect(staleRootState.turnStatus).toBe("in_progress")
     expect(staleRootState.rootStatus).toBe("waiting")
@@ -283,6 +296,16 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     const terminalRoot = await runAttachedScheduledAuditRoot(fixture, response.fetcher, command, waitPort)
     expect(terminalRoot).toMatchObject({ status: "completed", finalText: "Scheduled Gate integration candidate." })
     await rootStore.finish({ lease: fixture.turnLease, rootTaskId: fixture.ids.rootTaskId, result: terminalRoot })
+    const terminalTrace = await readScheduledAuditRootRecoveryTrace(fixture)
+    expectScheduledAuditRecoveryTrace(terminalTrace, fixture, 3, "completed", null)
+    expect(terminalTrace.candidateEvent.id).toBe(pendingTrace.candidateEvent.id)
+    expect(terminalTrace.candidatePayload).toEqual(pendingTrace.candidatePayload)
+    expect(terminalTrace.sourceStep).toEqual(pendingTrace.sourceStep)
+    expect(terminalTrace.steps[2]?.completionEvents[0]?.payload).toEqual({ stepId: terminalTrace.steps[2]?.id,
+      status: "completed", taskId: fixture.ids.rootTaskId })
+    expect(terminalTrace.steps.map(step => step.id)).toEqual(expect.arrayContaining([
+      pendingTrace.steps[0]?.id, staleTrace.steps[1]?.id, terminalTrace.steps[2]?.id,
+    ]))
     const terminalRootState = await readRootTurnState(fixture)
     expect(terminalRootState.turnStatus).toBe("completed")
     expect(terminalRootState.rootStatus).toBe("completed")
@@ -436,6 +459,75 @@ async function runAttachedScheduledAuditRoot(fixture: Fixture, fetcher: typeof f
     throw new Error(`Scheduled Audit root returned an unexpected outcome: ${JSON.stringify({ status, errorCode, phases })}`)
   }
   return result
+}
+
+async function readScheduledAuditRootRecoveryTrace(fixture: Fixture) {
+  const sourceResult = await pool!.query<{ id: string; ordinal: number | string; status: string; inputTokens: number;
+    outputTokens: number; estimatedCostUsd: number; consumedInputIds: unknown; modelProfileSnapshot: unknown }>(
+    `SELECT "id", "ordinal", "status", "inputTokens", "outputTokens", "estimatedCostUsd", "consumedInputIds", "modelProfileSnapshot"
+       FROM "agent_steps" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4`,
+    [fixture.rootQuestionStepId, fixture.ids.sessionId, fixture.ids.turnId, fixture.ids.rootTaskId])
+  const sourceStep = sourceResult.rows[0]
+  if (!sourceStep) throw new Error("scheduled Audit candidate source Step missing")
+  const candidateResult = await pool!.query<{ id: string; payload: unknown }>(
+    `SELECT "id", "payload" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+       AND "type" = $4 AND "correlationId" = $5 ORDER BY "sequence" ASC`,
+    [fixture.ids.sessionId, fixture.ids.turnId, fixture.ids.rootTaskId, SCHEDULED_PIPELINE_CANDIDATE_EVENT, fixture.rootQuestionStepId])
+  const candidateEvent = candidateResult.rows[0]
+  const candidatePayload = debugRecord(candidateEvent?.payload)
+  if (!candidateEvent || !candidatePayload) throw new Error("scheduled Audit candidate source receipt missing")
+  const recoveryResult = await pool!.query<{ id: string; ordinal: number | string; attempt: number; status: string;
+    errorCode: string | null; inputTokens: number; outputTokens: number; estimatedCostUsd: number;
+    consumedInputIds: unknown; modelProfileSnapshot: unknown }>(
+    `SELECT "id", "ordinal", "attempt", "status", "errorCode", "inputTokens", "outputTokens", "estimatedCostUsd",
+        "consumedInputIds", "modelProfileSnapshot" FROM "agent_steps"
+       WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "ordinal" > $4 ORDER BY "ordinal" ASC`,
+    [fixture.ids.sessionId, fixture.ids.turnId, fixture.ids.rootTaskId, Number(sourceStep.ordinal)])
+  const stepIds = recoveryResult.rows.map(step => step.id)
+  const events = stepIds.length ? await pool!.query<{ id: string; type: string; payload: unknown; correlationId: string }>(
+    `SELECT "id", "type", "payload", "correlationId" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
+       AND "taskId" = $3 AND "correlationId" = ANY($4::text[]) ORDER BY "sequence" ASC`,
+    [fixture.ids.sessionId, fixture.ids.turnId, fixture.ids.rootTaskId, stepIds]) : { rows: [] }
+  const waits = stepIds.length ? await pool!.query<{ id: string; stepId: string; status: string; targetTaskIds: unknown;
+    mode: string; idempotencyKey: string; result: unknown }>(
+    `SELECT "id", "stepId", "status", "targetTaskIds", "mode", "idempotencyKey", "result" FROM "agent_wait_conditions"
+       WHERE "sessionId" = $1 AND "turnId" = $2 AND "parentTaskId" = $3 AND "stepId" = ANY($4::text[])`,
+    [fixture.ids.sessionId, fixture.ids.turnId, fixture.ids.rootTaskId, stepIds]) : { rows: [] }
+  const steps = recoveryResult.rows.map(step => {
+    const stepEvents = events.rows.filter(event => event.correlationId === step.id)
+    return { ...step, marker: readScheduledPipelineRecoveryStepProfile(step.modelProfileSnapshot),
+      startEvents: stepEvents.filter(event => event.type === "step.started"),
+      completionEvents: stepEvents.filter(event => event.type === "step.completed"),
+      waits: waits.rows.filter(wait => wait.stepId === step.id) }
+  })
+  return { sourceStep, candidateEvent, candidateEventCount: candidateResult.rows.length, candidatePayload, steps }
+}
+
+function expectScheduledAuditRecoveryTrace(trace: Awaited<ReturnType<typeof readScheduledAuditRootRecoveryTrace>>,
+  fixture: Fixture, stepCount: number, status: string, errorCode: string | null): void {
+  expect(trace.sourceStep.id).toBe(fixture.rootQuestionStepId)
+  expect(trace.candidateEventCount).toBe(1)
+  expect(trace.sourceStep).toMatchObject({ inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, consumedInputIds: [] })
+  expect(trace.candidatePayload).toMatchObject({ finalStepId: fixture.rootQuestionStepId,
+    finalStepOrdinal: Number(trace.sourceStep.ordinal), candidateText: "Scheduled Gate integration candidate.",
+    usage: { inputTokens: 37, outputTokens: 9, estimatedCostUsd: 0.018 } })
+  expect(trace.steps).toHaveLength(stepCount)
+  for (const [index, step] of trace.steps.entries()) {
+    const previousStepId = index === 0 ? fixture.rootQuestionStepId : trace.steps[index - 1]!.id
+    expect(step).toMatchObject({ attempt: 1, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, consumedInputIds: [] })
+    expect(step.id).not.toBe(fixture.rootQuestionStepId)
+    expect(step.marker).toMatchObject({ kind: "scheduled_pipeline_recovery", recoveryStepId: step.id,
+      recoveryCursor: index + 1, predecessorStepId: previousStepId, sourceStepId: fixture.rootQuestionStepId,
+      sourceStepOrdinal: Number(trace.sourceStep.ordinal), sourceEventId: trace.candidateEvent.id,
+      rootAttemptCount: fixture.owner.rootAttemptCount, owner: { userId: fixture.ids.userId,
+        sessionId: fixture.ids.sessionId, turnId: fixture.ids.turnId, rootTaskId: fixture.ids.rootTaskId } })
+    expect(step.startEvents).toHaveLength(1)
+    expect(debugRecord(step.startEvents[0]?.payload)?.[SCHEDULED_PIPELINE_RECOVERY_STEP_PROFILE_KEY]).toMatchObject({
+      recoveryStepId: step.id, sourceEventId: trace.candidateEvent.id,
+    })
+    expect(step.completionEvents).toHaveLength(1)
+  }
+  expect(trace.steps.at(-1)).toMatchObject({ status, errorCode })
 }
 
 async function readRootTurnState(fixture: Fixture): Promise<Readonly<{ turnStatus: string; rootStatus: string; rootResult: Record<string, unknown> | null }>> {

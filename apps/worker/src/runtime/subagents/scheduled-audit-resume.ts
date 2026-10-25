@@ -171,7 +171,7 @@ async function hasOrphanAuditRegistration(client: Queryable, scope: GraphIdentit
 }
 
 export async function resumeScheduledAudit(input: Readonly<{ command: ResumeCommand; waitPort: Pick<DurableWaitPort, "wait">;
-  scope: TaskGraphReadScope; finalStepId: string; signal: AbortSignal }>): Promise<
+  scope: TaskGraphReadScope; recoveryStepId: string; signal: AbortSignal }>): Promise<
   | Readonly<{ status: "not_registered" | "completed" }>
   | Extract<ScheduledAuditResumeContext, { status: "gate_continuation" }>
   | Readonly<{ status: "waiting_for_dependency"; waitId: string }>
@@ -188,9 +188,9 @@ export async function resumeScheduledAudit(input: Readonly<{ command: ResumeComm
   if (context.auditStatus !== "completed") {
     const initialContext = context
     const wait = await input.waitPort.wait({ userId: input.scope.userId, sessionId: input.scope.sessionId,
-      turnId: input.scope.turnId, stepId: input.finalStepId, taskId: input.scope.rootTaskId, rootTaskId: input.scope.rootTaskId,
+      turnId: input.scope.turnId, stepId: input.recoveryStepId, taskId: input.scope.rootTaskId, rootTaskId: input.scope.rootTaskId,
       targetTaskIds: [context.auditTaskId], mode: "all", timeoutMs: WAIT_TIMEOUT_MS,
-      idempotencyKey: scheduledAuditWaitKey(context.auditTaskId, input.finalStepId, context.expectedAttemptCount) })
+      idempotencyKey: scheduledAuditWaitKey(context.auditTaskId, input.recoveryStepId, context.expectedAttemptCount) })
     if (!validScheduledAuditWait(wait, context.auditTaskId)) return { status: "blocked", errorCode: "scheduled_audit_wait_invalid" }
     if (wait.status === "waiting") return { status: "waiting_for_dependency", waitId: wait.waitId }
     if (wait.status !== "ready") return { status: "blocked", errorCode: `scheduled_audit_wait_${wait.status}` }

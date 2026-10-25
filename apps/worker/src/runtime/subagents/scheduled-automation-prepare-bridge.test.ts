@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { describe, expect, it, vi } from "vitest"
 import type { DurableWaitPort, DurableWaitInvocation } from "../tools/coordination-types.js"
 import type { TaskGraphCommandPort, TaskGraphReadScope, TaskGraphScheduledPrepareReceipt } from "./task-graph-command-port.js"
@@ -31,7 +32,8 @@ const executionOwner = { kind: "turn" as const, userId: owner.userId, sessionId:
   taskId: owner.rootTaskId, rootTaskId: owner.rootTaskId, ownerId: owner.turnLeaseOwnerId, leaseVersion: owner.turnLeaseVersion,
   leaseExpiresAt: new Date("2026-10-21T00:00:00.000Z") }
 const base: ScheduledPipelinePrepareContinuationInput = { owner, executionOwner, attestation, proof,
-  candidateText: "Final response", finalStepId: "step-original", finalStepOrdinal: 9, signal: new AbortController().signal }
+  candidateText: "Final response", finalStepId: "step-original", finalStepOrdinal: 9,
+  recoveryStepId: "step-recovery", signal: new AbortController().signal }
 const scoutVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria: [
   { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
 ] }
@@ -159,20 +161,24 @@ describe("scheduled automation Prepare continuation", () => {
     expect(projectScheduledAnalyzePrefix(changedRevision.snapshot, changedRevision.current, changedRevision.tasks)).toBeNull()
   })
 
-  it("appends the fixed child and durable same-root wait using the original final step", async () => {
+  it("uses the active recovery step for commands and waits while preserving source choice identity", async () => {
     const fixture = ports({ choice: { required: true, status: "answered", waitId: expectedChoiceWaitId } }), continuation = createScheduledAutomationPrepareContinuation(fixture)
     await expect(continuation(base)).resolves.toEqual({ status: "waiting_for_dependency", waitId: "wait-1" })
     expect(fixture.readCurrent).toHaveBeenCalledOnce()
     expect(fixture.readCurrent.mock.calls[0]?.[0]).not.toHaveProperty("stepId")
     expect(fixture.appendScheduledPrepare).toHaveBeenCalledWith(expect.objectContaining({
-      scope: expect.objectContaining({ parentTaskId: "root-1", stepId: "step-original", parentAttemptCount: 2 }),
+      scope: expect.objectContaining({ parentTaskId: "root-1", stepId: "step-recovery", parentAttemptCount: 2 }),
       handoff: proof, attestation,
       proposal: { expectedRevision: 7, nodes: [{ key: "prepare", templateId: "prepare",
         goal: expect.any(String), successCriteria: expect.any(Array), dependsOn: ["analysis"] }] },
     }))
+    const recoveryWaitKey = `scheduled-prepare-dependency:${createHash("sha256")
+      .update(`${proof.continuationKey}\0step-recovery`, "utf8").digest("hex")}`
+    expect(expectedChoiceWaitId).toBe(scheduledPrepareChoiceWaitId({ receipt: prepareFacts().receipt,
+      finalStepId: "step-original", finalStepOrdinal: 9 }))
     expect(fixture.wait).toHaveBeenCalledWith(expect.objectContaining({ userId: "user-1", sessionId: "session-1",
-      turnId: "turn-1", taskId: "root-1", rootTaskId: "root-1", stepId: "step-original", targetTaskIds: ["prepare-task"],
-      mode: "all", timeoutMs: 86_400_000, idempotencyKey: expect.stringMatching(/^scheduled-prepare-dependency:[a-f0-9]{64}$/) }))
+      turnId: "turn-1", taskId: "root-1", rootTaskId: "root-1", stepId: "step-recovery", targetTaskIds: ["prepare-task"],
+      mode: "all", timeoutMs: 86_400_000, idempotencyKey: recoveryWaitKey }))
   })
 
   it("persists the scheduled choice before waiting on the Prepare task", async () => {
@@ -204,7 +210,8 @@ describe("scheduled automation Prepare continuation", () => {
     } } } })
     if (result.status === "ready") expect(result.choice.required && result.choice.scheduledWaitId).toBe(scheduledPrepareChoiceWaitId({ receipt: result.prepareProof.receipt,
       finalStepId: base.finalStepId, finalStepOrdinal: base.finalStepOrdinal }))
-    expect(verifyReadyPrepare).toHaveBeenCalledWith(expect.objectContaining({ prepareTaskId: "prepare-task", scope: expect.objectContaining({ rootTaskId: owner.rootTaskId }) }))
+    expect(verifyReadyPrepare).toHaveBeenCalledWith(expect.objectContaining({ prepareTaskId: "prepare-task",
+      scope: expect.objectContaining({ rootTaskId: owner.rootTaskId, stepId: "step-recovery" }) }))
   })
 
   it("keeps the durable Prepare proof when the persisted snapshot does not require a choice", async () => {

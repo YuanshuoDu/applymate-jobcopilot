@@ -24,6 +24,7 @@ export type ScheduledPipelinePrepareContinuationInput = Readonly<{
   candidateText: string
   finalStepId: string
   finalStepOrdinal: number
+  recoveryStepId: string
   signal: AbortSignal
 }>
 /** Must idempotently append or schedule Prepare under this exact root and replay its durable wait. */
@@ -37,6 +38,8 @@ export async function completeScheduledPipelineBeforeTerminal(input: Readonly<{
   stageCandidate(input: ScheduledPipelineCandidateIdentity & { candidateText: string }): Promise<void>
   finalStepId: string
   finalStepOrdinal: number
+  /** Current active Step for new waits and TaskGraph commands; finalStepId remains the candidate source. */
+  recoveryStepId: string
   rootAttemptCount: number
   signal: AbortSignal
   bridge: (scope: ScheduledAutomationPipelineBridgeScope) => Promise<ScheduledAutomationPipelineBridgeResult>
@@ -56,7 +59,7 @@ export async function completeScheduledPipelineBeforeTerminal(input: Readonly<{
     const resumeAudit = async (stage = true): Promise<ScheduledPipelineCompletionDisposition | null> => {
       if (!input.continueAfterGate) return null
       const result = await input.continueAfterGate({ owner: input.owner, executionOwner: input.executionOwner,
-        mode: "resume_audit", finalStepId: input.finalStepId, signal: input.signal })
+        mode: "resume_audit", finalStepId: input.finalStepId, recoveryStepId: input.recoveryStepId, signal: input.signal })
       if (result.status === "not_registered") return null
       if (result.status === "gate_continuation") {
         const evidence = await input.bridge(input.owner)
@@ -68,7 +71,7 @@ export async function completeScheduledPipelineBeforeTerminal(input: Readonly<{
         const continued = await input.continueAfterGate({ owner: input.owner, executionOwner: input.executionOwner,
           attestation: evidence.attestation, handoff: result.handoff, prepareProof: result.prepareProof,
           ...(result.scheduledWaitId ? { scheduledWaitId: result.scheduledWaitId } : {}),
-          finalStepId: input.finalStepId, signal: input.signal })
+          finalStepId: input.finalStepId, recoveryStepId: input.recoveryStepId, signal: input.signal })
         return mapGateContinuationResult(continued, input.candidateText)
       }
       if (result.status === "blocked") return result
@@ -100,7 +103,7 @@ export async function completeScheduledPipelineBeforeTerminal(input: Readonly<{
       if (!input.continueAfterAnalyze) return { status: "blocked", errorCode: "scheduled_pipeline_prepare_continuation_unavailable" }
       const prepared = parsePrepareContinuationResult(await input.continueAfterAnalyze({ owner: input.owner, executionOwner: input.executionOwner,
         attestation: evidence.attestation, proof: continuation.proof, candidateText: input.candidateText,
-        finalStepId: input.finalStepId, finalStepOrdinal: input.finalStepOrdinal, signal: input.signal }), input.owner,
+        finalStepId: input.finalStepId, finalStepOrdinal: input.finalStepOrdinal, recoveryStepId: input.recoveryStepId, signal: input.signal }), input.owner,
         evidence.attestation, continuation.proof, input.finalStepId, input.finalStepOrdinal)
       if (!prepared) return { status: "blocked", errorCode: "scheduled_pipeline_prepare_proof_invalid" }
       if (prepared.status === "waiting_for_dependency") return { status: prepared.status, waitId: prepared.waitId, candidateText: input.candidateText }
@@ -121,7 +124,7 @@ export async function completeScheduledPipelineBeforeTerminal(input: Readonly<{
         attestation: evidence.attestation, handoff: continuation.proof,
         prepareProof: prepared.prepareProof as Extract<ScheduledPipelineGateContinuationInput, { prepareProof: unknown }>["prepareProof"],
         ...(prepared.choice.required ? { scheduledWaitId: prepared.choice.scheduledWaitId } : {}),
-        finalStepId: input.finalStepId, signal: input.signal })
+        finalStepId: input.finalStepId, recoveryStepId: input.recoveryStepId, signal: input.signal })
       return mapGateContinuationResult(gateResult, input.candidateText)
     }
     return { status: "blocked", errorCode: "scheduled_pipeline_handoff_result_invalid" }
@@ -178,6 +181,7 @@ export function attachScheduledPipelineCompletion(input: Readonly<{
     const disposition = await completeScheduledPipelineBeforeTerminal({ owner: input.owner!, executionOwner: identity, candidateText, signal,
       stageCandidate: input.stageCandidate, rootAttemptCount: input.rootAttemptCount,
       finalStepId: recovered?.finalStepId ?? stepId, finalStepOrdinal: recovered?.finalStepOrdinal ?? stepOrdinal,
+      recoveryStepId: stepId,
       bridge: input.bridge, ...(input.continueAfterAnalyze ? { continueAfterAnalyze: input.continueAfterAnalyze } : {}),
       ...(input.continueAfterGate ? { continueAfterGate: input.continueAfterGate } : {}),
       ...(input.fetcher ? { fetcher: input.fetcher } : {}), ...(isOwnershipLost ? { isOwnershipLost } : {}) })

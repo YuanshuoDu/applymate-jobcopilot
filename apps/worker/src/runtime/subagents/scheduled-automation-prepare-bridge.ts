@@ -150,7 +150,7 @@ export function createScheduledAutomationPrepareContinuation(input: Readonly<{
       turnLeaseVersion: continuation.owner.turnLeaseVersion, parentLeaseOwner: continuation.owner.turnLeaseOwnerId,
       parentAttemptCount: continuation.owner.rootAttemptCount,
     }
-    const scope: TaskGraphExecutionScope = { ...readScope, stepId: continuation.finalStepId }
+    const scope: TaskGraphExecutionScope = { ...readScope, stepId: continuation.recoveryStepId }
     const graph = await input.commandPort.readCurrent(readScope)
     const analyzeRevision = continuation.attestation.graphRevision
     if (!Number.isSafeInteger(analyzeRevision) || !Number.isSafeInteger(analyzeRevision + 1)
@@ -187,9 +187,9 @@ export function createScheduledAutomationPrepareContinuation(input: Readonly<{
     if (choice.required && (choice.waitId.trim() !== choice.waitId || !choice.waitId || choice.waitId.length > 256
       || choice.status !== "answered")) throw new Error("scheduled_prepare_choice_invalid")
     const wait = await input.waitPort.wait({ userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
-      stepId: continuation.finalStepId, taskId: scope.rootTaskId, rootTaskId: scope.rootTaskId,
+      stepId: continuation.recoveryStepId, taskId: scope.rootTaskId, rootTaskId: scope.rootTaskId,
       targetTaskIds: [nodes[0].taskId], mode: "all", timeoutMs: WAIT_TIMEOUT_MS,
-      idempotencyKey: waitKey(continuation.proof.continuationKey, continuation.finalStepId) })
+      idempotencyKey: waitKey(continuation.proof.continuationKey, continuation.recoveryStepId) })
     const prepareTaskId = nodes[0]!.taskId
     if (!wait.waitId.trim() || !["waiting", "ready"].includes(wait.status) || wait.matchedTaskIds.some(taskId => taskId !== prepareTaskId)
       || (wait.status === "ready" && (wait.matchedTaskIds.length !== 1 || wait.matchedTaskIds[0] !== prepareTaskId))) throw new Error("scheduled_prepare_wait_invalid")
@@ -219,8 +219,8 @@ function hasScheduledPrepare(graph: Awaited<ReturnType<TaskGraphCommandPort["rea
     && gate[0].status !== "failed" && gate[0].status !== "cancelled" && gate[0].failureReason === null
 }
 
-function waitKey(continuationKey: string, finalStepId: string): string {
-  const digest = createHash("sha256").update(`${continuationKey}\0${finalStepId}`, "utf8").digest("hex")
+function waitKey(continuationKey: string, recoveryStepId: string): string {
+  const digest = createHash("sha256").update(`${continuationKey}\0${recoveryStepId}`, "utf8").digest("hex")
   return `scheduled-prepare-dependency:${digest}`
 }
 

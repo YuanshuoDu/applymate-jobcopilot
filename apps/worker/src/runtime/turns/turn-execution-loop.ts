@@ -1,4 +1,5 @@
 import type { ModelContinuation } from "@jobcopilot/agent-model"
+import { createHash } from "node:crypto"
 import { createTurnBudgetLedger, type TurnBudgetLimits } from "../budget.js"
 import { createProgressDetector, progressCheckpointFromStepContext } from "../progress.js"
 import { buildModelRequest } from "./turn-engine-messages.js"
@@ -17,6 +18,8 @@ import { hasNewlyAcceptedInput } from "../context/step-context-support.js"
 import { handoffRecoveredArchivedWait } from "./turn-execution-wait.js"
 import { createTaskGraphDenialProgressTracker } from "./task-graph-denial-progress.js"
 import { takeRecoveredScheduledPipelineCandidate, withScheduledPipelineCandidateModelOutput } from "../subagents/scheduled-pipeline-candidate-store.js"
+import { SCHEDULED_PIPELINE_RECOVERY_STEP_PROFILE_KEY, scheduledPipelineRecoveryStepMarker,
+  withScheduledPipelineRecoveryStepProfile } from "../subagents/scheduled-pipeline-recovery-step.js"
 import { handleTurnExecutionStepError, matchedTaskGraphDenialCheckpoint, terminalizeTurnExecutionError, withTaskGraphDenialCheckpoint } from "./turn-engine-no-progress-terminalization.js"
 const DEFAULT_MAX_STEPS = 32
 export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promise<TurnEngineResult> {
@@ -69,32 +72,50 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
     if (recoveredToolObservations.length > 0) snapshot = { ...snapshot, toolObservations: [...snapshot.toolObservations, ...recoveredToolObservations] }
     const recoveredQuestion = await recoverPendingNativeQuestion(executionOptions, now, steps, toolCalls)
     if (recoveredQuestion) return recoveredQuestion
-    if (recoveredScheduledCandidate && (!options.resume || options.resume.nextOrdinal !== recoveredScheduledCandidate.finalStepOrdinal + 1)) {
+    if (recoveredScheduledCandidate && !options.resume) {
       throw new TurnEngineError("persistence_conflict", "Scheduled candidate recovery does not match the next durable step")
     }
     for (let ordinal = options.resume?.nextOrdinal ?? 0; ; ordinal += 1) {
       assertExecutionAlive(options, signal)
       const replayCandidate = recoveredScheduledCandidate && ordinal === options.resume?.nextOrdinal ? recoveredScheduledCandidate : undefined
       const replayScheduled = replayCandidate !== undefined
-      if (!replayScheduled) { budget.reserveStep(); steps += 1 }
-      const stepId = replayCandidate?.finalStepId ?? makeExecutionId(options, `step:${ordinal}`)
-      const stepOrdinal = replayCandidate?.finalStepOrdinal ?? ordinal
-      const step = replayScheduled ? { id: stepId, ordinal: stepOrdinal } : await options.store.startStep({
-        identity: options.identity, stepId, ordinal, attempt: options.identity.kind === "task" ? options.identity.attemptCount ?? 1 : 1,
-        inputThroughSequence, consumedInputIds: [], modelProfileSnapshot: toRepositoryJson(options.model.profile), now: now(),
+      const tail = replayCandidate?.recoveryTail
+      const existingRecovery = tail?.status === "streaming" ? tail : undefined
+      const recoveryStepId = replayCandidate ? existingRecovery?.marker.recoveryStepId
+        ?? makeExecutionId(options, `scheduled-recovery:${createHash("sha256").update(replayCandidate.recoverySource.sourceEventId, "utf8").digest("hex")}:${(tail?.marker.recoveryCursor ?? 0) + 1}`) : undefined
+      const recoveryMarker = replayCandidate ? existingRecovery?.marker ?? scheduledPipelineRecoveryStepMarker({
+        owner: replayCandidate.recoverySource.owner, source: replayCandidate.recoverySource, recoveryStepId: recoveryStepId!,
+        recoveryCursor: (tail?.marker.recoveryCursor ?? 0) + 1, inputThroughSequence: inputThroughSequence.toString(),
+        ...(tail ? { previous: tail.marker } : {}),
+      }) : undefined
+      if (!replayScheduled) budget.reserveStep()
+      if (!replayScheduled || !existingRecovery) steps += 1
+      const stepId = recoveryStepId ?? makeExecutionId(options, `step:${ordinal}`)
+      const stepStartOrdinal = existingRecovery?.ordinal ?? ordinal
+      const recoveryInputThroughSequence = recoveryMarker ? BigInt(recoveryMarker.inputThroughSequence) : inputThroughSequence
+      const modelProfileSnapshot = recoveryMarker
+        ? existingRecovery?.modelProfileSnapshot ?? withScheduledPipelineRecoveryStepProfile(toRepositoryJson(options.model.profile), recoveryMarker)
+        : toRepositoryJson(options.model.profile)
+      const step = await options.store.startStep({
+        identity: options.identity, stepId, ordinal: stepStartOrdinal, attempt: options.identity.kind === "task" ? options.identity.attemptCount ?? 1 : 1,
+        inputThroughSequence: recoveryInputThroughSequence, consumedInputIds: [], modelProfileSnapshot, now: now(),
       })
       lastStep = step
       let stepOutput: ModelStepResult | null = null
       let questionIntentCallId: string | null = null
       try {
         if (replayCandidate) {
+          if (!recoveryMarker) throw new TurnEngineError("persistence_conflict", "Scheduled recovery marker is unavailable")
+          recoveredCandidate = undefined
           if (!isModelFinishReason(replayCandidate.finishReason)) throw new TurnEngineError("persistence_conflict", "Scheduled candidate finish reason is invalid")
           const owner = options.identity
           if (owner.kind !== "turn" || owner.taskId !== owner.rootTaskId) throw new TurnEngineError("persistence_conflict", "Scheduled candidate owner is invalid")
+          await writer.append("step.started", step.id, null, { stepId: step.id, ordinal: step.ordinal, taskId: options.identity.taskId,
+            [SCHEDULED_PIPELINE_RECOVERY_STEP_PROFILE_KEY]: recoveryMarker }, `step-started:${step.id}`)
           if (options.refreshTaskGraphBeforeStep) snapshot = await options.refreshTaskGraphBeforeStep(snapshot)
           const output: ModelStepResult = { text: replayCandidate.candidateText, reasoningSummary: "", toolCalls: [],
-            provider: "recovered", model: "recovered", finishReason: replayCandidate.finishReason,
-            usage: replayCandidate.usage, continuation: null }
+            provider: "scheduled_recovery", model: "recovered", finishReason: replayCandidate.finishReason,
+            usage: null, continuation: null }
           stepOutput = output
           const replayContext = { taskGraphRevision: snapshot.taskGraphRevision, inputThroughSequence, consumedInputIds }
           const complete = () => completeTurnCandidate({ options, writer, step, output, snapshot, stepCount: steps, toolCallCount: toolCalls,
@@ -102,8 +123,9 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
               closedSteps.add(step.id)
               if (kind === "native_semantic_receipt") receiptClosedSteps.add(step.id)
             } })
-          const outcome = await withScheduledPipelineCandidateModelOutput({ owner, finalStepId: step.id,
-            finalStepOrdinal: step.ordinal, candidateText: output.text, finishReason: output.finishReason, usage: output.usage }, complete)
+          const outcome = await withScheduledPipelineCandidateModelOutput({ owner, finalStepId: replayCandidate.finalStepId,
+            finalStepOrdinal: replayCandidate.finalStepOrdinal, candidateText: output.text, finishReason: output.finishReason,
+            usage: replayCandidate.usage }, complete)
           if (outcome.kind === "wait" || outcome.kind === "completed") return outcome.result
           snapshot = denialProgress.replan(snapshot, step.id, outcome.feedback, outcome.taskGraphDenialCheckpoint, replayContext)
           continuation = undefined

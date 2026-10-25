@@ -27,7 +27,10 @@ export type ScheduledPipelineGateContinuationResult = Readonly<{ status: "waitin
 type ScheduledPipelineGateContinuationBase = Readonly<{
   owner: ScheduledAutomationPipelineBridgeScope
   executionOwner: TurnExecutionOwnerFence
+  /** Candidate source identity; retained for existing Prepare choice derivation. */
   finalStepId: string
+  /** Active operational Step that owns new TaskGraph scopes and durable waits. */
+  recoveryStepId: string
   signal: AbortSignal
 }>
 export type ScheduledPipelineGateContinuationInput = ScheduledPipelineGateContinuationBase & (
@@ -113,12 +116,12 @@ export function createScheduledAutomationGateContinuation(input: Readonly<{
   now?: () => Date
 }>): (continuation: ScheduledPipelineGateContinuationInput) => Promise<ScheduledPipelineGateContinuationResult> {
   return async continuation => {
-    const { owner, executionOwner, finalStepId, signal } = continuation
+    const { owner, executionOwner, recoveryStepId, signal } = continuation
     if (signal.aborted) throw signal.reason ?? new Error("scheduled_gate_cancelled")
-    const scope = scopes(owner, finalStepId, executionOwner)
+    const scope = scopes(owner, recoveryStepId, executionOwner)
     if (!scope) return { status: "blocked", errorCode: "scheduled_gate_owner_invalid" }
     const command = input.commandPort, waitPort = input.waitPort as DurableWaitPort & Partial<DurableWaitScheduledGatePort>
-    if ("mode" in continuation) return resumeScheduledAudit({ command, waitPort, scope: scope.readScope, finalStepId, signal })
+    if ("mode" in continuation) return resumeScheduledAudit({ command, waitPort, scope: scope.readScope, recoveryStepId, signal })
     const gateWait = waitPort.waitScheduledGate
     if (!command.appendScheduledGate || typeof gateWait !== "function"
       || !command.resumeScheduledGateChoice || !command.verifyScheduledGateCompletion
@@ -145,7 +148,7 @@ export function createScheduledAutomationGateContinuation(input: Readonly<{
 
     const candidate = await withRead(input.pool, owner.userId, client => readScheduledGateQuestionCandidate(client, {
       userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
-      stepId: finalStepId, gateTaskId: taskId, requestAttemptCount: firstWait.requestAttemptCount }))
+      stepId: recoveryStepId, gateTaskId: taskId, requestAttemptCount: firstWait.requestAttemptCount }))
     if (candidate) {
       const question = scheduledGateQuestionText(candidate.binding.kind), readChoice = input.questionStore?.readScheduledGateChoice
       if (!input.nativeQuestionWaitEnabled || !question || !readChoice) return { status: "blocked", errorCode: "scheduled_gate_question_wait_unavailable" }
@@ -166,7 +169,7 @@ export function createScheduledAutomationGateContinuation(input: Readonly<{
       if (resumedWait.status !== "ready") return { status: "blocked", errorCode: `scheduled_gate_wait_${resumedWait.status}` }
       const next = await withRead(input.pool, owner.userId, client => readScheduledGateQuestionCandidate(client, {
         userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
-        stepId: finalStepId, gateTaskId: taskId, requestAttemptCount: candidate.binding.gateAttempt }))
+        stepId: recoveryStepId, gateTaskId: taskId, requestAttemptCount: candidate.binding.gateAttempt }))
       if (next) {
         const nextQuestion = scheduledGateQuestionText(next.binding.kind), nextWaitId = turnScheduledGateChoiceWaitId(next.binding)
         return nextQuestion && nextWaitId ? { status: "waiting_for_choice", waitId: nextWaitId, question: nextQuestion, binding: next.binding }
@@ -186,8 +189,8 @@ export function createScheduledAutomationGateContinuation(input: Readonly<{
     const audit = auditTarget(appendedAudit)
     if (!audit) return { status: "blocked", errorCode: "scheduled_audit_schedule_invalid" }
     const auditWait = await waitPort.wait({ userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
-      stepId: finalStepId, taskId: owner.rootTaskId, rootTaskId: owner.rootTaskId, targetTaskIds: [audit.taskId], mode: "all",
-      timeoutMs: WAIT_TIMEOUT_MS, idempotencyKey: scheduledAuditWaitKey(audit.taskId, finalStepId, audit.attemptCount) })
+      stepId: recoveryStepId, taskId: owner.rootTaskId, rootTaskId: owner.rootTaskId, targetTaskIds: [audit.taskId], mode: "all",
+      timeoutMs: WAIT_TIMEOUT_MS, idempotencyKey: scheduledAuditWaitKey(audit.taskId, recoveryStepId, audit.attemptCount) })
     if (!validScheduledAuditWait(auditWait, audit.taskId)) return { status: "blocked", errorCode: "scheduled_audit_wait_invalid" }
     if (auditWait.status === "waiting") return { status: "waiting_for_dependency", waitId: auditWait.waitId }
     if (auditWait.status !== "ready") return { status: "blocked", errorCode: `scheduled_audit_wait_${auditWait.status}` }
@@ -212,9 +215,9 @@ type ScheduledGateWaitOutcome = Readonly<{ status: "waiting"; waitId: string; re
 async function waitFor(gatePort: DurableWaitScheduledGatePort, continuation: ScheduledPipelineGateContinuationInput,
   gateTaskId: string, requestAttemptCount: number): Promise<ScheduledGateWaitOutcome> {
   const result = await gatePort.waitScheduledGate({ userId: continuation.owner.userId, sessionId: continuation.owner.sessionId,
-    turnId: continuation.owner.turnId, stepId: continuation.finalStepId, taskId: continuation.owner.rootTaskId,
+    turnId: continuation.owner.turnId, stepId: continuation.recoveryStepId, taskId: continuation.owner.rootTaskId,
     rootTaskId: continuation.owner.rootTaskId, gateTaskId, requestAttemptCount, timeoutMs: WAIT_TIMEOUT_MS,
-    idempotencyKey: waitKey(gateTaskId, continuation.finalStepId, requestAttemptCount) })
+    idempotencyKey: waitKey(gateTaskId, continuation.recoveryStepId, requestAttemptCount) })
   if (!validWait(result, gateTaskId)) throw new Error("scheduled_gate_wait_invalid")
   return { status: result.status, waitId: result.waitId, requestAttemptCount } as ScheduledGateWaitOutcome
 }

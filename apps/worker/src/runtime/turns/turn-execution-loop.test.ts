@@ -12,6 +12,7 @@ import { nativeVerificationFeedbackText } from "../canonical-turn-native-verific
 import { buildCanonicalTurnResumeState } from "../canonical-turn-wait-resume-accounting.js"
 import type { NativeVerificationFeedback } from "../subagents/native-verification-port.js"
 import { runTurnExecutionLoop } from "./turn-execution-loop.js"
+import { TurnExecutionEventWriter } from "./turn-execution-events.js"
 import { createPgTurnEngineStore } from "./turn-engine-store.js"
 import { createHarnessModelRuntime } from "../harness-model.js"
 import { toRepositoryJson, TurnEngineError, type TurnEngineEvent, type TurnEngineItem, type TurnEngineStore, type TurnEngineToolResult } from "./turn-engine-types.js"
@@ -40,6 +41,9 @@ import { steeringReconciliationRecoveryError } from "./turn-execution-completion
 import { applyCompletionRecovery, FINAL_EVIDENCE_RECOVERY_FEEDBACK, tagTaskGraphRepairRecovery, TASK_GRAPH_RECOVERY_REVISION } from "./completion-recovery-context.js"
 import { TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA, type TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
 import { TurnStateRefreshRetryError } from "./turn-execution-question.js"
+import { TURN_SCHEDULED_GATE_CHOICE_SCHEMA, turnScheduledGateChoiceWaitId } from "./turn-question-gate-choice-contract.js"
+import { SCHEDULED_PIPELINE_RECOVERY_STEP_PROFILE_KEY, scheduledPipelineRecoveryStepMarker,
+  withScheduledPipelineRecoveryStepProfile } from "../subagents/scheduled-pipeline-recovery-step.js"
 
 const profile = {
   provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false,
@@ -147,6 +151,37 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
     ...(completionGate ? { completionGate } : {}),
   }
   return { options, events, notifications, items, finalResponses, stepTasks, stepAttempts, stepStatuses, stepInputs, requests }
+}
+
+function scheduledCandidateReadFixture(input: Readonly<{
+  owner: TurnExecutionIdentity
+  sourceEventId: string
+  recoveryStep?: { row: Record<string, unknown>; events: readonly Record<string, unknown>[] }
+}>): { store: ReturnType<typeof createScheduledPipelineCandidateStore>; staged: unknown[] } {
+  const owner = input.owner
+  if (owner.kind !== "turn") throw new Error("Fixture expected a Turn owner")
+  const finalStepId = "step:1", finalStepOrdinal = 1, candidateText = "done:root-1", usage = { inputTokens: 17, outputTokens: 9, estimatedCostUsd: 0.23 }
+  const payload = { schemaVersion: SCHEDULED_PIPELINE_CANDIDATE_SCHEMA, sessionId: owner.sessionId, turnId: owner.turnId,
+    rootTaskId: owner.rootTaskId, rootAttemptCount: 2, finalStepId, finalStepOrdinal, stepAttempt: 1, candidateText,
+    finishReason: "stop", usage }
+  const event = { sourceEventId: input.sourceEventId, userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
+    taskId: owner.rootTaskId, type: SCHEDULED_PIPELINE_CANDIDATE_EVENT, correlationId: finalStepId, payload, stepId: finalStepId,
+    stepTaskId: owner.rootTaskId, stepAttempt: 1, stepOrdinal: finalStepOrdinal, stepStatus: "streaming",
+    stepInputThroughSequence: "10", stepConsumedInputIds: [], stepModelProfileSnapshot: toRepositoryJson(profile), stepFinishReason: null }
+  const client = { query: vi.fn(async (sql: string) => {
+    if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
+    if (sql.includes('SELECT "id" FROM "agent_sessions"') || sql.includes('SELECT turn."id" FROM "agent_turns"')) return { rows: [{ id: "owned" }], rowCount: 1 }
+    if (sql.includes('SELECT task."attemptCount"')) return { rows: [{ attemptCount: 2 }], rowCount: 1 }
+    if (sql.includes('FROM "agent_events" AS event')) return { rows: [event], rowCount: 1 }
+    if (sql.includes('FROM "agent_steps"') && sql.includes('"ordinal" > $4')) return { rows: input.recoveryStep ? [input.recoveryStep.row] : [], rowCount: input.recoveryStep ? 1 : 0 }
+    if (sql.includes('FROM "agent_events"') && sql.includes('ANY($4::text[])')) return { rows: input.recoveryStep?.events ?? [], rowCount: input.recoveryStep?.events.length ?? 0 }
+    if (sql.includes('FROM "agent_items"') || sql.includes('FROM "agent_wait_conditions"') || sql.includes('FROM "agent_inputs"')) return { rows: [], rowCount: 0 }
+    return { rows: [], rowCount: 0 }
+  }), release: vi.fn() }
+  const staged: unknown[] = []
+  const store = createScheduledPipelineCandidateStore({ connect: vi.fn(async () => client) } as never,
+    { appendEvent: vi.fn(async (value: unknown) => { staged.push(value); return { id: "staged" } }) } as never)
+  return { store, staged }
 }
 
 function repeatedSearchModel(root: Fixture): ModelAdapter {
@@ -1054,52 +1089,135 @@ describe("owner-agnostic turn execution loop", () => {
     expect(saved.usage).toEqual(resume.usage)
   })
 
-  it("replays a scheduled final candidate on its original step with exact finish reason and usage", async () => {
-    const candidateText = "done:root-1", finalStepId = "step:1", finalStepOrdinal = 1
+  it("reuses a streaming recovery Step with its actual ordinal and strict start-event receipt", async () => {
     const owner = identity("turn", "root-1")
     if (owner.kind !== "turn") throw new Error("Fixture expected a Turn owner")
-    const payload = { schemaVersion: SCHEDULED_PIPELINE_CANDIDATE_SCHEMA, sessionId: owner.sessionId, turnId: owner.turnId,
-      rootTaskId: owner.rootTaskId, rootAttemptCount: 2, finalStepId, finalStepOrdinal, stepAttempt: 1, candidateText,
-      finishReason: "stop", usage: { inputTokens: 17, outputTokens: 9, estimatedCostUsd: 0.23 } }
-    const event = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.rootTaskId,
-      type: SCHEDULED_PIPELINE_CANDIDATE_EVENT, correlationId: finalStepId, payload, stepId: finalStepId, stepTaskId: owner.rootTaskId,
-      stepAttempt: 1, stepOrdinal: finalStepOrdinal, stepStatus: "streaming", stepInputThroughSequence: "10", stepFinishReason: null }
-    const client = { query: vi.fn(async (sql: string) => {
-      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
-      if (sql.includes('SELECT "id" FROM "agent_sessions"') || sql.includes('SELECT turn."id" FROM "agent_turns"')) return { rows: [{ id: "owned" }], rowCount: 1 }
-      if (sql.includes('SELECT task."attemptCount"')) return { rows: [{ attemptCount: 2 }], rowCount: 1 }
-      if (sql.includes('FROM "agent_events" AS event')) return { rows: [event], rowCount: 1 }
-      if (sql.includes('SELECT "id", "ordinal", "attempt" FROM "agent_steps"')) return { rows: [{ id: finalStepId, ordinal: finalStepOrdinal, attempt: 1 }], rowCount: 1 }
-      if (sql.includes('FROM "agent_inputs"')) return { rows: [], rowCount: 0 }
-      return { rows: [], rowCount: 0 }
-    }), release: vi.fn() }
-    const candidateStore = createScheduledPipelineCandidateStore({ connect: vi.fn(async () => client) } as never,
-      { appendEvent: vi.fn(async () => ({ id: "staged" })) } as never)
-    await expect(candidateStore.read({ owner, rootAttemptCount: 2 })).resolves.toMatchObject({ finalStepId, finalStepOrdinal, finishReason: "stop" })
+    const sourceEventId = "candidate-event-streaming", finalStepId = "step:1", finalStepOrdinal = 1
+    const stableOwner = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId }
+    const source = { owner: stableOwner, sourceEventId, sourceStepId: finalStepId, sourceStepOrdinal: finalStepOrdinal,
+      rootAttemptCount: 2, inputThroughSequence: "10", consumedInputIds: [] }
+    const recoveryStepId = "recovery-existing-1", recoveryOrdinal = 7
+    const marker = scheduledPipelineRecoveryStepMarker({ owner: stableOwner, source, recoveryStepId, recoveryCursor: 1, inputThroughSequence: "10" })
+    const modelProfileSnapshot = withScheduledPipelineRecoveryStepProfile(toRepositoryJson(profile), marker)
+    const recoveryRow = { id: recoveryStepId, taskId: owner.rootTaskId, ordinal: recoveryOrdinal, attempt: 1, status: "streaming",
+      errorCode: null, inputThroughSequence: "10", consumedInputIds: [], modelProfileSnapshot, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }
+    const startEvent = { id: "recovery-started-event", taskId: owner.rootTaskId, itemId: null, type: "step.started", actor: "orchestrator",
+      correlationId: recoveryStepId, idempotencyKey: `turn:${owner.turnId}:event:step-started:${recoveryStepId}`,
+      payload: { stepId: recoveryStepId, ordinal: recoveryOrdinal, taskId: owner.rootTaskId,
+        [SCHEDULED_PIPELINE_RECOVERY_STEP_PROFILE_KEY]: marker } }
+    const { store: candidateStore, staged } = scheduledCandidateReadFixture({ owner, sourceEventId,
+      recoveryStep: { row: recoveryRow, events: [startEvent] } })
+    await expect(candidateStore.read({ owner, rootAttemptCount: 2 })).resolves.toMatchObject({ recoveryTail: { ordinal: recoveryOrdinal, status: "streaming" } })
+
     const root = fixture(owner, undefined, [{ id: "resume-evidence", content: { toolCallId: "resume-evidence", status: "completed" } }])
-    const scheduledWaitId = `agent-question:${owner.turnId}:canonical:${"a".repeat(64)}`
-    const waitForQuestion = vi.fn(async () => ({ status: "waiting_for_user" as const, disposition: "created" as const, waitId: scheduledWaitId,
-      itemId: `agent-wait:question:${scheduledWaitId}`, turnId: owner.turnId, toolCallId: null, nextTurnRevision: 2 }))
-    const scheduled = Object.assign(vi.fn(async () => ({ ok: true as const })), {
+    type EventInput = Parameters<NonNullable<TurnExecutionStore["appendEvent"]>>[0]
+    const saved = new Map<string, { id: string; identity: unknown }>()
+    const appendEvent = vi.fn(async (input: EventInput) => {
+      const identity = { userId: input.identity.userId, sessionId: input.identity.sessionId, turnId: input.identity.turnId,
+        taskId: input.identity.taskId, type: input.type, itemId: input.itemId, correlationId: input.correlationId,
+        causationId: input.causationId, payload: toRepositoryJson(input.payload) }
+      const existing = saved.get(input.idempotencyKey)
+      if (existing) {
+        if (JSON.stringify(existing.identity) !== JSON.stringify(identity)) throw new TurnEngineError("persistence_conflict", "strict event identity changed")
+        return { id: existing.id }
+      }
+      saved.set(input.idempotencyKey, { id: input.id, identity })
+      return { id: input.id }
+    })
+    const strictOptions = { ...root.options, store: { ...root.options.store, appendEvent } }
+    const priorWriter = new TurnExecutionEventWriter(strictOptions)
+    await priorWriter.append("turn.started", owner.turnId, null, { goal: root.options.goal, taskId: owner.taskId, rootTaskId: owner.rootTaskId }, "turn-started")
+    await priorWriter.append("step.started", recoveryStepId, null, { stepId: recoveryStepId, ordinal: recoveryOrdinal, taskId: owner.taskId,
+      [SCHEDULED_PIPELINE_RECOVERY_STEP_PROFILE_KEY]: marker }, `step-started:${recoveryStepId}`)
+
+    const binding = { schemaVersion: TURN_SCHEDULED_GATE_CHOICE_SCHEMA,
+      owner: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId, rootAttemptCount: 2,
+        executionId: "execution-1", executionAttemptCount: 4 }, continuationKey: `scheduled-taskgraph:sha256:${"a".repeat(64)}`,
+      snapshotDigest: `sha256:${"b".repeat(64)}`, evidenceDigest: "c".repeat(64), checkpointDigest: "d".repeat(64),
+      analyzeGraphRevision: 3, graphRevision: 5, gateTaskId: "gate-1", gateAttempt: 1, kind: "weak_cover_letter" as const,
+      jobIds: ["job-1"], allowedChoiceIds: ["continue", "review", "skip"] as const }
+    const waitId = turnScheduledGateChoiceWaitId(binding)!, question = "A prepared application has a weak cover letter. How should I handle it?"
+    const waitForQuestion = vi.fn(async (input: { expectedWaitId?: string }) => ({ status: "waiting_for_user" as const,
+      disposition: "created" as const, waitId: input.expectedWaitId!, itemId: `agent-wait:question:${input.expectedWaitId}`,
+      turnId: owner.turnId, toolCallId: null, nextTurnRevision: 2 }))
+    const stagedCompletion = Object.assign(vi.fn(async () => ({ ok: true as const })), {
       [SCHEDULED_PIPELINE_COMPLETION]: vi.fn(async input => {
         if (input.identity.kind !== "turn") throw new Error("Fixture received a non-Turn owner")
-        await candidateStore.stage({ owner: input.identity, rootAttemptCount: 2, finalStepId: input.stepId,
-          finalStepOrdinal: input.stepOrdinal, candidateText: input.candidateText })
-        return { status: "waiting_for_user" as const, waitId: scheduledWaitId, candidateText: input.candidateText }
+        await candidateStore.stage({ owner: input.identity, rootAttemptCount: 2, finalStepId, finalStepOrdinal, candidateText: input.candidateText })
+        return { status: "waiting_for_scheduled_gate_choice" as const, waitId, question, binding, candidateText: input.candidateText }
       }),
     })
-    const resume = { nextOrdinal: finalStepOrdinal + 1, stepCount: 2, toolCallCount: 0, inputThroughSequence: 10n,
-      consumedInputIds: [], usage: payload.usage }
-    root.options = { ...root.options, resume, expectedEvidence: ["resume-evidence"], recoveredFinalCandidate: candidateText,
-      completionGate: scheduled as TurnExecutionOptions["completionGate"],
-      store: { ...root.options.store, waitForQuestion } }
+    const resume = { nextOrdinal: 20, stepCount: 2, toolCallCount: 0, inputThroughSequence: 10n, consumedInputIds: [],
+      usage: { inputTokens: 17, outputTokens: 9, estimatedCostUsd: 0.23 } }
+    const startInputs: Array<{ stepId: string; ordinal: number; inputThroughSequence: bigint; modelProfileSnapshot: unknown }> = []
+    const originalStartStep = root.options.store.startStep
+    const startStep = async (input: Parameters<typeof originalStartStep>[0]) => {
+      startInputs.push({ stepId: input.stepId, ordinal: input.ordinal, inputThroughSequence: input.inputThroughSequence,
+        modelProfileSnapshot: input.modelProfileSnapshot })
+      return originalStartStep(input)
+    }
+    root.options = { ...root.options, resume, budget: { maxSteps: 2 }, expectedEvidence: ["resume-evidence"], recoveredFinalCandidate: "done:root-1",
+      completionGate: stagedCompletion as TurnExecutionOptions["completionGate"],
+      store: { ...root.options.store, startStep, appendEvent, waitForQuestion } }
 
-    await expect(runTurnExecutionLoop(root.options)).resolves.toMatchObject({ status: "waiting_for_user", waitId: scheduledWaitId, stepCount: 2 })
+    await expect(runTurnExecutionLoop(root.options)).resolves.toMatchObject({ status: "waiting_for_user", waitId, stepCount: 2 })
     expect(root.requests).toHaveLength(0)
-    expect(root.stepTasks).toHaveLength(0)
-    expect(scheduled[SCHEDULED_PIPELINE_COMPLETION]).toHaveBeenCalledWith(expect.objectContaining({ stepId: finalStepId, stepOrdinal: finalStepOrdinal, candidateText }))
-    expect(waitForQuestion).toHaveBeenCalledWith(expect.objectContaining({ stepId: finalStepId, toolCallId: null, expectedWaitId: scheduledWaitId,
-      finishReason: "stop", usage: payload.usage }))
+    expect(startInputs).toEqual([{ stepId: recoveryStepId, ordinal: recoveryOrdinal, inputThroughSequence: 10n, modelProfileSnapshot }])
+    expect(stagedCompletion[SCHEDULED_PIPELINE_COMPLETION]).toHaveBeenCalledWith(expect.objectContaining({ stepId: recoveryStepId,
+      stepOrdinal: recoveryOrdinal, candidateText: "done:root-1" }))
+    expect(waitForQuestion).toHaveBeenCalledWith(expect.objectContaining({ stepId: recoveryStepId, toolCallId: null, expectedWaitId: waitId,
+      gateChoiceBinding: binding, gateChoiceQuestion: question, finishReason: "stop", usage: null }))
+    expect(staged[0]).toMatchObject({ correlationId: finalStepId, payload: expect.objectContaining({ finalStepId, finalStepOrdinal }) })
+    expect(saved.size).toBe(2)
+  })
+
+  it("scopes a new recovery Step to its candidate event and completes without model-step budget", async () => {
+    const run = async (sourceEventId: string): Promise<string> => {
+      const owner = identity("turn", "root-1")
+      if (owner.kind !== "turn") throw new Error("Fixture expected a Turn owner")
+      const { store: candidateStore } = scheduledCandidateReadFixture({ owner, sourceEventId })
+      await candidateStore.read({ owner, rootAttemptCount: 2 })
+      const root = fixture(owner, undefined, [{ id: "resume-evidence", content: { toolCallId: "resume-evidence", status: "completed" } }])
+      let recoveryStepId = ""
+      const scheduled = Object.assign(vi.fn(async () => ({ ok: true as const })), {
+        [SCHEDULED_PIPELINE_COMPLETION]: vi.fn(async input => {
+          if (input.identity.kind !== "turn") throw new Error("Fixture received a non-Turn owner")
+          recoveryStepId = input.stepId
+          await candidateStore.stage({ owner: input.identity, rootAttemptCount: 2, finalStepId: "step:1", finalStepOrdinal: 1,
+            candidateText: input.candidateText })
+          return { status: "completed" as const, candidateText: input.candidateText }
+        }),
+      })
+      const resume = { nextOrdinal: 20, stepCount: 1, toolCallCount: 0, inputThroughSequence: 10n, consumedInputIds: [],
+        usage: { inputTokens: 17, outputTokens: 9, estimatedCostUsd: 0.23 } }
+      const startInputs: Array<{ stepId: string; ordinal: number; inputThroughSequence: bigint; modelProfileSnapshot: unknown }> = []
+      const updates: Array<{ stepId: string; inputTokens: number; outputTokens: number; estimatedCostUsd: number }> = []
+      const originalStartStep = root.options.store.startStep, originalUpdateStep = root.options.store.updateStep
+      const startStep = async (input: Parameters<typeof originalStartStep>[0]) => {
+        startInputs.push({ stepId: input.stepId, ordinal: input.ordinal, inputThroughSequence: input.inputThroughSequence,
+          modelProfileSnapshot: input.modelProfileSnapshot })
+        return originalStartStep(input)
+      }
+      const updateStep = async (input: Parameters<typeof originalUpdateStep>[0]) => {
+        updates.push({ stepId: input.stepId, inputTokens: input.inputTokens, outputTokens: input.outputTokens,
+          estimatedCostUsd: input.estimatedCostUsd })
+        return originalUpdateStep(input)
+      }
+      root.options = { ...root.options, resume, budget: { maxSteps: 1 }, expectedEvidence: ["resume-evidence"],
+        recoveredFinalCandidate: "done:root-1", completionGate: scheduled as TurnExecutionOptions["completionGate"],
+        store: { ...root.options.store, startStep, updateStep } }
+      await expect(runTurnExecutionLoop(root.options)).resolves.toMatchObject({ status: "completed", stepCount: 2, finalText: "done:root-1" })
+      expect(root.requests).toHaveLength(0)
+      expect(startInputs[0]).toMatchObject({ ordinal: 20, inputThroughSequence: 10n })
+      expect(startInputs[0]?.modelProfileSnapshot).toMatchObject({ scheduledPipelineRecoveryStep: expect.objectContaining({
+        sourceEventId, recoveryCursor: 1, sourceStepId: "step:1" }) })
+      expect(updates).toEqual([expect.objectContaining({ stepId: recoveryStepId, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 })])
+      const saved = JSON.parse(root.finalResponses[0]!.slice("root-1:".length)) as { usage: unknown }
+      expect(saved.usage).toEqual(resume.usage)
+      return recoveryStepId
+    }
+    const first = await run("candidate-event-a"), second = await run("candidate-event-b")
+    expect(first).not.toBe(second)
   })
 
   it("fails once when the full resumed Turn request outgrows every route after an earlier provider attempt", async () => {

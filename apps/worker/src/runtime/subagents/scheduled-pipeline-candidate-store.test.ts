@@ -19,9 +19,10 @@ function candidateEvent(owner = oldOwner, overrides: Record<string, unknown> = {
     finalStepId: "step-final-4", finalStepOrdinal: 4, stepAttempt: 1, candidateText: "Exact final answer.", finishReason: "stop",
     usage: { inputTokens: 12, outputTokens: 4, estimatedCostUsd: 0.02 },
     ...overrides }
-  return { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.rootTaskId,
+  return { sourceEventId: "candidate-event-1", userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.rootTaskId,
     type: SCHEDULED_PIPELINE_CANDIDATE_EVENT, correlationId: "step-final-4", payload, stepId: "step-final-4",
     stepTaskId: owner.rootTaskId, stepAttempt: 1, stepOrdinal: 4, stepStatus: "streaming", stepInputThroughSequence: "10",
+    stepConsumedInputIds: [], stepModelProfileSnapshot: { provider: "fixture" },
     stepFinishReason: null, stepInputTokens: 0, stepOutputTokens: 0, stepEstimatedCostUsd: 0 }
 }
 
@@ -30,7 +31,7 @@ function withModelOutput<T>(owner: TurnExecutionOwnerFence, work: () => Promise<
     candidateText: "Exact final answer.", finishReason: "stop", usage: { inputTokens: 12, outputTokens: 4, estimatedCostUsd: 0.02 } }, work)
 }
 
-function poolFor(event: Record<string, unknown> | null, options: { rootAttempt?: number; latestStep?: Record<string, unknown>; unconsumedInput?: boolean } = {}) {
+function poolFor(event: Record<string, unknown> | null, options: { rootAttempt?: number; recoverySteps?: Record<string, unknown>[]; unconsumedInput?: boolean } = {}) {
   const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
   const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
     calls.push({ sql, values })
@@ -39,7 +40,8 @@ function poolFor(event: Record<string, unknown> | null, options: { rootAttempt?:
     if (sql.includes('SELECT turn."id" FROM "agent_turns"')) return { rows: [{ id: "turn-1" }], rowCount: 1 }
     if (sql.includes('SELECT task."attemptCount"')) return { rows: [{ attemptCount: options.rootAttempt ?? 2 }], rowCount: 1 }
     if (sql.includes('FROM "agent_events" AS event')) return { rows: event ? [event] : [], rowCount: event ? 1 : 0 }
-    if (sql.includes('SELECT "id", "ordinal", "attempt" FROM "agent_steps"')) return { rows: [options.latestStep ?? { id: "step-final-4", ordinal: 4, attempt: 1 }], rowCount: 1 }
+    if (sql.includes('FROM "agent_steps"') && sql.includes('"ordinal" > $4')) return { rows: options.recoverySteps ?? [], rowCount: options.recoverySteps?.length ?? 0 }
+    if (sql.includes('FROM "agent_events"') || sql.includes('FROM "agent_items"') || sql.includes('FROM "agent_wait_conditions"')) return { rows: [], rowCount: 0 }
     if (sql.includes('FROM "agent_inputs"')) return { rows: options.unconsumedInput ? [{ id: "input-1" }] : [], rowCount: options.unconsumedInput ? 1 : 0 }
     return { rows: [], rowCount: 0 }
   }), release: vi.fn() }
@@ -81,6 +83,9 @@ describe("scheduled pipeline durable candidate", () => {
     await expect(store.read({ owner: newOwner, rootAttemptCount: 2 })).resolves.toEqual({
       candidateText: "Exact final answer.", finalStepId: "step-final-4", finalStepOrdinal: 4, finishReason: "stop",
       usage: { inputTokens: 12, outputTokens: 4, estimatedCostUsd: 0.02 },
+      recoverySource: { owner: { userId: newOwner.userId, sessionId: newOwner.sessionId, turnId: newOwner.turnId,
+        rootTaskId: newOwner.rootTaskId }, sourceEventId: "candidate-event-1", sourceStepId: "step-final-4",
+        sourceStepOrdinal: 4, rootAttemptCount: 2, inputThroughSequence: "10", consumedInputIds: [] }, recoveryTail: null,
     })
     expect(takeRecoveredScheduledPipelineCandidate({ owner: newOwner, candidateText: "Exact final answer." })).toMatchObject({ finishReason: "stop", usage: { inputTokens: 12 } })
     expect(takeRecoveredScheduledPipelineCandidate({ owner: newOwner, candidateText: "Exact final answer." })).toBeUndefined()
@@ -123,7 +128,9 @@ describe("scheduled pipeline durable candidate", () => {
   })
 
   it("marks a staged candidate invalid after a later root step or new unconsumed input", async () => {
-    const laterStep = poolFor(candidateEvent(newOwner), { latestStep: { id: "step-after-final", ordinal: 5, attempt: 1 } })
+    const laterStep = poolFor(candidateEvent(newOwner), { recoverySteps: [{ id: "step-after-final", taskId: "root-1", ordinal: 5,
+      attempt: 1, status: "completed", errorCode: null, inputThroughSequence: "10", consumedInputIds: [], modelProfileSnapshot: {},
+      inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0.01 }] })
     const first = createScheduledPipelineCandidateStore(laterStep.pool, { appendEvent: vi.fn() } as unknown as Pick<TurnEngineStore, "appendEvent">)
     await expect(first.read({ owner: newOwner, rootAttemptCount: 2 })).resolves.toBeNull()
 

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { turnScheduledGateChoiceWaitId, type TurnQuestionGateChoiceBinding } from "../turns/turn-question-gate-choice-contract.js"
 import type { DurableWaitInvocation, DurableWaitResult, DurableWaitScheduledGateInvocation } from "../tools/coordination-types.js"
@@ -8,13 +9,16 @@ vi.mock("./scheduled-gate-resume-wait.js", () => ({ selectScheduledGateResumeWai
 vi.mock("./scheduled-gate-wait-match.js", () => ({ readScheduledGateQuestionCandidate: mock.readCandidate }))
 
 import { createScheduledAutomationGateContinuation } from "./scheduled-automation-gate-bridge.js"
+import { scheduledAuditWaitKey } from "./scheduled-audit-resume.js"
+import { scheduledGateQuestionText } from "../turns/turn-execution-types.js"
 
 const owner = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", rootAttemptCount: 2,
   turnLeaseOwnerId: "turn-owner", turnLeaseVersion: 4 }
 const executionOwner = { kind: "turn" as const, ...owner, taskId: owner.rootTaskId, ownerId: owner.turnLeaseOwnerId, leaseVersion: owner.turnLeaseVersion }
 const prepareProof = { receipt: { continuationKey: "continuation-1" }, completion: { graphRevision: 8 } }
 const continuation = { owner, executionOwner, attestation: { graphRevision: 7, snapshotDigest: "sha256:" + "b".repeat(64) }, handoff: { executionId: "execution-1", executionAttemptCount: 3 },
-  prepareProof, scheduledWaitId: "prepare-choice-wait", finalStepId: "root-final-step", signal: new AbortController().signal }
+  prepareProof, scheduledWaitId: "prepare-choice-wait", finalStepId: "root-final-step", recoveryStepId: "root-final-step",
+  signal: new AbortController().signal }
 const binding: TurnQuestionGateChoiceBinding = { schemaVersion: "agent-harness.v2.scheduled-gate-choice-wait.v1",
   owner: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
     rootAttemptCount: owner.rootAttemptCount, executionId: "execution-1", executionAttemptCount: 3 },
@@ -35,6 +39,10 @@ function auditCompletionProof(attemptCount = 1) {
     rootAttemptCount: owner.rootAttemptCount, executionId: "execution-1", executionAttemptCount: 3,
   }, snapshotDigest: continuation.attestation.snapshotDigest, graphRevision: 19, gateProof,
   audit: { taskId: "audit-task", attemptCount, resultDigest: "sha256:" + "f".repeat(64), completedEventRevision: 19 }, report: auditReport }
+}
+function gateWaitKey(taskId: string, stepId: string, requestAttemptCount: number): string {
+  const digest = createHash("sha256").update(JSON.stringify([taskId, stepId, requestAttemptCount]), "utf8").digest("hex")
+  return `scheduled-gate-wait:${digest}`
 }
 
 function dependencies(overrides: Record<string, unknown> = {}) {
@@ -60,7 +68,7 @@ function dependencies(overrides: Record<string, unknown> = {}) {
 describe("scheduled automation Gate continuation", () => {
   beforeEach(() => { mock.selectResume.mockReset(); mock.readCandidate.mockReset() })
 
-  it("verifies Gate before appending Audit and waits for that exact child", async () => {
+  it("uses the active recovery step for Gate and Audit waits while preserving the Prepare choice ID", async () => {
     mock.selectResume.mockResolvedValue({ status: "resumed", requestAttemptCount: 2 })
     mock.readCandidate.mockResolvedValueOnce({ question: { status: "question_required", kind: "weak_cover_letter", jobIds: ["job-2"],
       candidateSetDigest: "sha256:" + "f".repeat(64), allowedChoiceIds: ["continue", "review", "skip"] }, binding }).mockResolvedValueOnce(null)
@@ -69,20 +77,27 @@ describe("scheduled automation Gate continuation", () => {
     const run = createScheduledAutomationGateContinuation({ ...deps, questionStore, nativeQuestionWaitEnabled: true,
       now: () => new Date("2026-10-23T12:00:00.000Z") } as never)
 
-    await expect(run(continuation as never)).resolves.toEqual({ status: "completed" })
+    const recovered = { ...continuation, finalStepId: "prepare-source-step", recoveryStepId: "active-recovery-step" }
+    await expect(run(recovered as never)).resolves.toEqual({ status: "completed" })
     expect(deps.commandPort.appendScheduledGate).toHaveBeenCalledWith(expect.objectContaining({
+      scope: expect.objectContaining({ stepId: "active-recovery-step" }),
       proposal: expect.objectContaining({ expectedRevision: 8 }),
     }))
     expect(deps.waitPort.waitScheduledGate).toHaveBeenCalledTimes(2)
     expect(deps.waitPort.waitScheduledGate.mock.calls.map(([call]) => call.requestAttemptCount)).toEqual([2, 2])
+    expect(deps.waitPort.waitScheduledGate.mock.calls.map(([call]) => call.stepId)).toEqual(["active-recovery-step", "active-recovery-step"])
+    expect(deps.waitPort.waitScheduledGate.mock.calls.map(([call]) => call.idempotencyKey)).toEqual([
+      gateWaitKey("gate-task", "active-recovery-step", 2), gateWaitKey("gate-task", "active-recovery-step", 2),
+    ])
+    expect(mock.readCandidate.mock.calls.map(([, scope]) => scope.stepId)).toEqual(["active-recovery-step", "active-recovery-step"])
     expect(deps.commandPort.resumeScheduledGateChoice).toHaveBeenCalledWith(expect.objectContaining({
       gateTaskId: "gate-task", requestAttemptCount: 2, waitId: "private-question-wait",
     }))
     expect(deps.commandPort.appendScheduledAudit).toHaveBeenCalledWith(expect.objectContaining({
-      scope: expect.objectContaining({ stepId: "root-final-step" }), gateProof, scheduledWaitId: "prepare-choice-wait",
+      scope: expect.objectContaining({ stepId: "active-recovery-step" }), gateProof, scheduledWaitId: "prepare-choice-wait",
     }))
     expect(deps.waitPort.wait).toHaveBeenCalledWith(expect.objectContaining({ targetTaskIds: ["audit-task"], mode: "all",
-      stepId: "root-final-step", idempotencyKey: expect.stringMatching(/^scheduled-audit-wait:/) }))
+      stepId: "active-recovery-step", idempotencyKey: scheduledAuditWaitKey("audit-task", "active-recovery-step", 1) }))
     expect(deps.commandPort.verifyScheduledAuditCompletion).toHaveBeenCalledWith(expect.objectContaining({
       auditTaskId: "audit-task", attemptCount: 1, gateProof,
     }))
@@ -94,6 +109,28 @@ describe("scheduled automation Gate continuation", () => {
       .toBeLessThan(deps.commandPort.verifyScheduledAuditCompletion.mock.invocationCallOrder[0]!)
   })
 
+  it("returns a new Gate question after an answered historical question under the active recovery step", async () => {
+    const nextBinding = { ...binding, gateAttempt: 3, graphRevision: 13 }
+    mock.selectResume.mockResolvedValue({ status: "resumed", requestAttemptCount: 2 })
+    mock.readCandidate.mockResolvedValueOnce({ question: { status: "question_required", kind: "weak_cover_letter", jobIds: ["job-2"],
+      candidateSetDigest: "sha256:" + "f".repeat(64), allowedChoiceIds: ["continue", "review", "skip"] }, binding })
+      .mockResolvedValueOnce({ question: { status: "question_required", kind: "weak_cover_letter", jobIds: ["job-2"],
+        candidateSetDigest: "sha256:" + "f".repeat(64), allowedChoiceIds: ["continue", "review", "skip"] }, binding: nextBinding })
+    const deps = dependencies(), questionStore = { readScheduledGateChoice: vi.fn(async () => ({ status: "answered" as const,
+      waitId: "private-question-wait", itemId: "private-question-item", binding,
+      validatedChoice: { kind: binding.kind, jobIds: binding.jobIds, choiceId: "skip" as const } })) }
+    const run = createScheduledAutomationGateContinuation({ ...deps, questionStore, nativeQuestionWaitEnabled: true } as never)
+    const recovered = { ...continuation, finalStepId: "prepare-source-step", recoveryStepId: "active-recovery-step" }
+
+    await expect(run(recovered as never)).resolves.toEqual({ status: "waiting_for_choice",
+      waitId: turnScheduledGateChoiceWaitId(nextBinding), question: scheduledGateQuestionText(nextBinding.kind), binding: nextBinding })
+    expect(mock.readCandidate.mock.calls.map(([, scope]) => scope.stepId)).toEqual(["active-recovery-step", "active-recovery-step"])
+    expect(deps.waitPort.waitScheduledGate.mock.calls.map(([call]) => call.stepId)).toEqual(["active-recovery-step", "active-recovery-step"])
+    expect(questionStore.readScheduledGateChoice).toHaveBeenCalledWith(expect.objectContaining({ binding }))
+    expect(questionStore.readScheduledGateChoice).toHaveBeenCalledTimes(1)
+    expect(deps.commandPort.appendScheduledAudit).not.toHaveBeenCalled()
+  })
+
   it("recovers a completed registered Audit without appending another Gate or Audit", async () => {
     const expectedOwner = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
       rootAttemptCount: owner.rootAttemptCount, executionId: "execution-1", executionAttemptCount: 3 }
@@ -102,7 +139,7 @@ describe("scheduled automation Gate continuation", () => {
       executionOwner: { executionId: "execution-1", executionAttemptCount: 3 },
       snapshotDigest: continuation.attestation.snapshotDigest, gateProof })) })
     const run = createScheduledAutomationGateContinuation({ ...deps, nativeQuestionWaitEnabled: true } as never)
-    await expect(run({ owner, executionOwner, mode: "resume_audit", finalStepId: "root-final-step",
+    await expect(run({ owner, executionOwner, mode: "resume_audit", finalStepId: "root-final-step", recoveryStepId: "active-recovery-step",
       signal: new AbortController().signal } as never)).resolves.toEqual({ status: "completed" })
     expect(deps.commandPort.readScheduledAuditResumeContext).toHaveBeenCalledWith(expect.objectContaining({
       scope: expect.objectContaining({ rootTaskId: owner.rootTaskId, parentAttemptCount: owner.rootAttemptCount }),
@@ -121,7 +158,7 @@ describe("scheduled automation Gate continuation", () => {
         executionId: "execution-1", executionAttemptCount: 3 }, prepareProof, scheduledWaitId: "agent-question:turn-1:canonical:wait" }
     const deps = dependencies({ readScheduledAuditResumeContext: vi.fn(async () => recovery as never) })
     const run = createScheduledAutomationGateContinuation({ ...deps, nativeQuestionWaitEnabled: true } as never)
-    await expect(run({ owner, executionOwner, mode: "resume_audit", finalStepId: "root-final-step",
+    await expect(run({ owner, executionOwner, mode: "resume_audit", finalStepId: "root-final-step", recoveryStepId: "active-recovery-step",
       signal: new AbortController().signal } as never)).resolves.toEqual(recovery)
     expect(deps.commandPort.readScheduledAuditResumeContext).toHaveBeenCalledOnce()
     expect(deps.commandPort.appendScheduledGate).not.toHaveBeenCalled()

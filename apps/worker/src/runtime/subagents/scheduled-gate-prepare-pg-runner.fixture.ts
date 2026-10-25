@@ -171,7 +171,7 @@ async function waitForPrepareChoice(pool: Pool, seed: ScheduledGatePrepareSeedFi
   const command = createPgTaskGraphCommandPort(pool as never), waitPort = createPgDurableWaitPort(pool as never)
   const continuation = createScheduledAutomationPrepareContinuation({ commandPort: command, waitPort })
   const waiting = await continuation({ owner: seed.ownerV1, executionOwner: turnOwner, attestation, proof,
-    candidateText, finalStepId: stepId, finalStepOrdinal: stepOrdinal, signal: new AbortController().signal })
+    candidateText, finalStepId: stepId, finalStepOrdinal: stepOrdinal, recoveryStepId: stepId, signal: new AbortController().signal })
   if (waiting.status !== "waiting_for_choice" || waiting.waitId !== waitId) throw new Error("scheduled_gate_prepare_choice_not_waiting")
   const question = await createPgTurnQuestionStore(pool as never).waitForQuestion({ owner: turnOwner, stepId,
     toolCallId: null, expectedWaitId: waitId, finishReason: "stop", usage, now: new Date() })
@@ -195,7 +195,7 @@ async function runPrepare(pool: Pool, redisUrl: string, seed: ScheduledGatePrepa
         completionGraphRevision: current.revision, referenceVerificationMode: { phase: "persisted_gate" } })
     } })
   const input = { owner, executionOwner: turnOwner, attestation, proof, candidateText, finalStepId: stepId,
-    finalStepOrdinal: stepOrdinal, signal: new AbortController().signal }
+    finalStepOrdinal: stepOrdinal, recoveryStepId: stepId, signal: new AbortController().signal }
   const waiting = await continuation(input)
   if (waiting.status !== "waiting_for_dependency") throw new Error("scheduled_gate_prepare_dependency_not_waiting")
   const graph = await command.readCurrent(scope), prepare = graph.nodes.find(node => node.key === "prepare")

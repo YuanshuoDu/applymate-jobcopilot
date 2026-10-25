@@ -4,6 +4,9 @@ import type { TurnUsage } from "../budget.js"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import { lockTurnEngineOpenSession, lockTurnEngineOwnedTurn, turnEngineTenantTransaction } from "../turns/turn-engine-owner-sql.js"
 import type { TurnEngineStore } from "../turns/turn-engine-types.js"
+import { readScheduledPipelineRecoveryStepProfile, type ScheduledPipelineRecoveryOwner,
+  type ScheduledPipelineRecoverySource, type ScheduledPipelineRecoveryTail } from "./scheduled-pipeline-recovery-step.js"
+import { readScheduledPipelineRecoveryEvidence } from "./scheduled-pipeline-recovery-evidence.js"
 
 export const SCHEDULED_PIPELINE_CANDIDATE_EVENT = "native_verification.scheduled_candidate_staged"
 export const SCHEDULED_PIPELINE_CANDIDATE_SCHEMA = "agent-harness.v2.scheduled-pipeline-candidate.v2"
@@ -30,7 +33,8 @@ export type ScheduledPipelineCandidateIdentity = Readonly<{
   finalStepId: string
   finalStepOrdinal: number
 }>
-export type ScheduledPipelineCandidate = Readonly<{ candidateText: string; finalStepId: string; finalStepOrdinal: number; finishReason: string; usage: TurnUsage | null }>
+export type ScheduledPipelineCandidate = Readonly<{ candidateText: string; finalStepId: string; finalStepOrdinal: number; finishReason: string; usage: TurnUsage | null;
+  recoverySource: ScheduledPipelineRecoverySource; recoveryTail: ScheduledPipelineRecoveryTail | null }>
 export type ScheduledPipelineCandidateStore = Readonly<{
   stage(input: ScheduledPipelineCandidateIdentity & { candidateText: string }): Promise<void>
   /** undefined means no staged event; null means a staged event was invalidated by later state. */
@@ -91,7 +95,8 @@ function parseCandidatePayload(value: unknown): CandidatePayload | null {
 }
 function candidateIdentityMatches(row: CandidateRow, payload: CandidatePayload, input: Pick<ScheduledPipelineCandidateIdentity, "owner" | "rootAttemptCount">): boolean {
   const owner = input.owner
-  return row.userId === owner.userId && row.sessionId === owner.sessionId && row.turnId === owner.turnId
+  return nonempty(row.sourceEventId) && row.sourceEventId.length <= 256
+    && row.userId === owner.userId && row.sessionId === owner.sessionId && row.turnId === owner.turnId
     && row.taskId === owner.rootTaskId && row.type === SCHEDULED_PIPELINE_CANDIDATE_EVENT
     && payload.schemaVersion === CANDIDATE_SCHEMA && payload.sessionId === owner.sessionId && payload.turnId === owner.turnId
     && payload.rootTaskId === owner.rootTaskId && payload.rootAttemptCount === input.rootAttemptCount
@@ -117,6 +122,15 @@ function validUsage(value: unknown): value is TurnUsage | null {
 function candidateOwnerKey(owner: TurnExecutionOwnerFence): string {
   return JSON.stringify([owner.userId, owner.sessionId, owner.turnId, owner.taskId, owner.ownerId, owner.leaseVersion])
 }
+function stableOwner(owner: TurnExecutionOwnerFence): ScheduledPipelineRecoveryOwner {
+  return { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId }
+}
+function parseJson(value: unknown): unknown { if (typeof value !== "string") return value; try { return JSON.parse(value) as unknown } catch { return null } }
+function stringIds(value: unknown): string[] | null {
+  const row = parseJson(value)
+  return Array.isArray(row) && row.every(id => typeof id === "string" && id.trim() === id && id.length > 0) && new Set(row).size === row.length ? row : null
+}
+function validCursor(value: string): boolean { return /^(0|[1-9]\d{0,18})$/.test(value) && BigInt(value) <= 9_223_372_036_854_775_807n }
 function modelOutputKey(owner: TurnExecutionOwnerFence, stepId: string, ordinal: number): string {
   return JSON.stringify([candidateOwnerKey(owner), stepId, ordinal])
 }
@@ -166,9 +180,10 @@ export function createScheduledPipelineCandidateStore(
             AND session."userId" = $4 AND task."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed') FOR SHARE`,
         [input.owner.rootTaskId, input.owner.sessionId, input.owner.turnId, input.owner.userId])
         if (Number(root.rows[0]?.attemptCount) !== input.rootAttemptCount) throw new Error("scheduled_candidate_root_attempt_changed")
-        const latest = await client.query<CandidateRow>(`SELECT session."userId" AS "userId", event."sessionId", event."turnId", event."taskId", event."type",
+        const latest = await client.query<CandidateRow>(`SELECT event."id" AS "sourceEventId", session."userId" AS "userId", event."sessionId", event."turnId", event."taskId", event."type",
             event."correlationId", event."payload", step."id" AS "stepId", step."taskId" AS "stepTaskId", step."attempt" AS "stepAttempt",
             step."ordinal" AS "stepOrdinal", step."status" AS "stepStatus", step."inputThroughSequence" AS "stepInputThroughSequence",
+            step."consumedInputIds" AS "stepConsumedInputIds", step."modelProfileSnapshot" AS "stepModelProfileSnapshot",
             step."finishReason" AS "stepFinishReason", step."inputTokens" AS "stepInputTokens", step."outputTokens" AS "stepOutputTokens",
             step."estimatedCostUsd" AS "stepEstimatedCostUsd"
           FROM "agent_events" AS event JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
@@ -189,20 +204,22 @@ export function createScheduledPipelineCandidateStore(
         if (payload.usage && row.stepFinishReason !== null && row.stepFinishReason !== undefined
           && (Number(row.stepInputTokens) !== payload.usage.inputTokens || Number(row.stepOutputTokens) !== payload.usage.outputTokens
             || Number(row.stepEstimatedCostUsd) !== payload.usage.estimatedCostUsd)) throw new Error("scheduled_candidate_usage_mismatch")
-        const newestStep = await client.query<CandidateRow>(`SELECT "id", "ordinal", "attempt" FROM "agent_steps"
-          WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 ORDER BY "ordinal" DESC LIMIT 1`,
-        [input.owner.sessionId, input.owner.turnId, input.owner.rootTaskId])
-        const last = newestStep.rows[0]
-        if (!last || last.id !== payload.finalStepId || Number(last.ordinal) !== payload.finalStepOrdinal || Number(last.attempt) !== 1) return null
         const inputCursor = String(row.stepInputThroughSequence)
-        if (!/^\d+$/.test(inputCursor)) throw new Error("scheduled_candidate_step_mismatch")
+        const consumedInputIds = stringIds(row.stepConsumedInputIds)
+        if (!validCursor(inputCursor) || !consumedInputIds || readScheduledPipelineRecoveryStepProfile(row.stepModelProfileSnapshot)) throw new Error("scheduled_candidate_step_mismatch")
+        const recoverySource: ScheduledPipelineRecoverySource = { owner: stableOwner(input.owner), sourceEventId: String(row.sourceEventId),
+          sourceStepId: payload.finalStepId, sourceStepOrdinal: payload.finalStepOrdinal, rootAttemptCount: input.rootAttemptCount,
+          inputThroughSequence: inputCursor, consumedInputIds }
+        const recoveryTail = await readScheduledPipelineRecoveryEvidence(client, input.owner, recoverySource)
+        if (recoveryTail === false) return null
         const unconsumed = await client.query(`SELECT 1 FROM "agent_inputs" WHERE "sessionId" = $1 AND "userId" = $2
           AND "targetTurnId" = $3 AND "acceptedSequence" > $4::bigint AND "status" IN ('accepted', 'queued')
           AND "consumedByStepId" IS NULL AND "consumedAt" IS NULL AND "cancelledAt" IS NULL LIMIT 1`,
         [input.owner.sessionId, input.owner.userId, input.owner.turnId, inputCursor])
         if (unconsumed.rows.length) return null
         const recovered: ScheduledPipelineCandidate = { candidateText: payload.candidateText, finalStepId: payload.finalStepId,
-          finalStepOrdinal: payload.finalStepOrdinal, finishReason: payload.finishReason, usage: payload.usage }
+          finalStepOrdinal: payload.finalStepOrdinal, finishReason: payload.finishReason, usage: payload.usage,
+          recoverySource, recoveryTail }
         rememberRecoveredCandidate(input.owner, recovered)
         return recovered
       })

@@ -522,8 +522,7 @@ function scheduledPipelineRuntimeFixture(overrides: Partial<CanonicalTurnRuntime
     stage: vi.fn<ScheduledPipelineCandidateStore["stage"]>(async input => { stagedCandidates.push(input) }),
     read: vi.fn<ScheduledPipelineCandidateStore["read"]>(async () => {
       const candidate = stagedCandidates.at(-1)
-      return candidate ? { candidateText: candidate.candidateText, finalStepId: candidate.finalStepId, finalStepOrdinal: candidate.finalStepOrdinal,
-        finishReason: "stop", usage: null } : undefined
+      return candidate ? fixtureRecoveredScheduledCandidate(candidate, `fixture-candidate-event-${stagedCandidates.length}`) : undefined
     }),
   } satisfies ScheduledPipelineCandidateStore
   let modelCalls = 0
@@ -570,6 +569,14 @@ function scheduledPipelineRuntimeFixture(overrides: Partial<CanonicalTurnRuntime
   })
   return { runtime, roots, executionProjection, sessionProjection, bridge, fetcher, candidateStore, stagedCandidates,
     readScheduledAuditResumeContext, verifyScheduledAuditCompletion, getModelCalls: () => modelCalls }
+}
+
+function fixtureRecoveredScheduledCandidate(candidate: Parameters<ScheduledPipelineCandidateStore["stage"]>[0], sourceEventId: string) {
+  return { candidateText: candidate.candidateText, finalStepId: candidate.finalStepId, finalStepOrdinal: candidate.finalStepOrdinal,
+    finishReason: "stop", usage: null, recoverySource: { owner: { userId: candidate.owner.userId,
+      sessionId: candidate.owner.sessionId, turnId: candidate.owner.turnId, rootTaskId: candidate.owner.rootTaskId },
+    sourceEventId, sourceStepId: candidate.finalStepId, sourceStepOrdinal: candidate.finalStepOrdinal,
+    rootAttemptCount: candidate.rootAttemptCount, inputThroughSequence: "0", consumedInputIds: [] }, recoveryTail: null }
 }
 
 function scheduledAuditResumeFixtureContext(scope: TaskGraphReadScope): Extract<ScheduledAuditResumeContext, { status: "registered" }> {
@@ -5061,8 +5068,7 @@ describe("createCanonicalTurnRuntime", () => {
       stage: vi.fn(async input => { staged.push(input) }),
       read: vi.fn(async () => {
         const candidate = staged.at(-1)
-        return steeringAccepted ? null : candidate ? { candidateText: candidate.candidateText, finalStepId: candidate.finalStepId,
-          finalStepOrdinal: candidate.finalStepOrdinal, finishReason: "stop", usage: null } : undefined
+        return steeringAccepted ? null : candidate ? fixtureRecoveredScheduledCandidate(candidate, `fixture-candidate-event-${staged.length}`) : undefined
       }),
     }
     const fixture = scheduledPipelineRuntimeFixture({

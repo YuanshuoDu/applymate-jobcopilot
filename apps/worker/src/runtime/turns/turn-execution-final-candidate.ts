@@ -107,7 +107,7 @@ export async function completeTurnCandidate(input: Readonly<{
     throw new TurnEngineError(verification.code, verification.blocker)
   }
   const gate = await assertCompletionAllowed(options, writer, step, signal, now, output.text,
-    output.provider !== "recovered" && output.toolCalls.length === 0)
+    output.provider !== "recovered" && output.provider !== "scheduled_recovery" && output.toolCalls.length === 0)
   if (gate && "scheduledBlocker" in gate) {
     await updateExecutionStep(options, { stepId: step.id, status: "waiting_for_tool", finishReason: output.finishReason,
       errorCode: gate.scheduledBlocker, inputTokens: output.usage?.inputTokens ?? 0, outputTokens: output.usage?.outputTokens ?? 0,
@@ -169,7 +169,8 @@ export async function completeTurnCandidate(input: Readonly<{
     await updateExecutionStep(options, { stepId: step.id, status: "waiting_for_tool", finishReason: output.finishReason, errorCode: null,
       inputTokens: output.usage?.inputTokens ?? 0, outputTokens: output.usage?.outputTokens ?? 0,
       estimatedCostUsd: output.usage?.estimatedCostUsd ?? 0, now: now() })
-    await writer.append("step.completed", step.id, null, { stepId: step.id, status: "waiting_for_dependency", taskId: options.identity.taskId }, `step-completed:${step.id}`)
+    await writer.append("step.completed", step.id, null, { stepId: step.id, status: "waiting_for_dependency", taskId: options.identity.taskId,
+      ...(output.provider === "scheduled_recovery" ? { waitId: gate.waitId } : {}) }, `step-completed:${step.id}`)
     input.onStepClosed()
     return { kind: "wait", result: { status: "waiting_for_dependency", waitId: gate.waitId, stepCount: input.stepCount, toolCallCount: input.toolCallCount } }
   }
