@@ -91,6 +91,55 @@ describe("expired wait projection repair", () => {
     expect(callQuery).toContain('result."type" = \'tool_result\'')
   })
 
+  it("keeps the resolution-time matches when another any-wait target becomes terminal later", async () => {
+    const secondTarget = { id: "target-2", parentTaskId: lease.id, rootTaskId: lease.rootTaskId, sessionId: lease.sessionId,
+      turnId: lease.turnId, userId: lease.userId, status: "failed", role: "reviewer", result: null, failureReason: "failed later" }
+    const fake = fixture({
+      wait: { targetTaskIds: ["target-1", "target-2"] },
+      call: { content: { toolCallId: "call-1", toolName: "wait_subagents", toolVersion: "1",
+        input: { idempotencyKey: "wait-key-1", mode: "any", taskIds: ["target-1", "target-2"], timeoutMs: 10_000 } } },
+      targets: [
+        { id: "target-1", parentTaskId: lease.id, rootTaskId: lease.rootTaskId, sessionId: lease.sessionId,
+          turnId: lease.turnId, userId: lease.userId, status: "completed", role: "writer", result: { finalText: "done" }, failureReason: null },
+        secondTarget,
+      ],
+    })
+
+    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toBe(true)
+    const update = fake.calls.find(call => call.sql.startsWith('UPDATE "agent_wait_conditions"'))
+    const persisted = JSON.parse(String(update?.values?.[0])) as Record<string, unknown>
+    expect(persisted.outcome).toMatchObject({
+      status: "ready",
+      taskIds: ["target-1", "target-2"],
+      matchedTaskIds: ["target-1"],
+      tasks: [
+        { taskId: "target-1", status: "completed" },
+        { taskId: "target-2", status: "failed", failureReason: "failed later" },
+      ],
+    })
+  })
+
+  it.each([
+    { label: "a persisted match that is no longer terminal", wait: { targetTaskIds: ["target-1", "target-2"] }, targets: [
+      { id: "target-1", parentTaskId: lease.id, rootTaskId: lease.rootTaskId, sessionId: lease.sessionId,
+        turnId: lease.turnId, userId: lease.userId, status: "running", role: "writer", result: null, failureReason: null },
+      { id: "target-2", parentTaskId: lease.id, rootTaskId: lease.rootTaskId, sessionId: lease.sessionId,
+        turnId: lease.turnId, userId: lease.userId, status: "failed", role: "reviewer", result: null, failureReason: null },
+    ] },
+    { label: "ready all wait without every persisted match", wait: { targetTaskIds: ["target-1", "target-2"], mode: "all" }, targets: [
+      { id: "target-1", parentTaskId: lease.id, rootTaskId: lease.rootTaskId, sessionId: lease.sessionId,
+        turnId: lease.turnId, userId: lease.userId, status: "completed", role: "writer", result: { finalText: "done" }, failureReason: null },
+      { id: "target-2", parentTaskId: lease.id, rootTaskId: lease.rootTaskId, sessionId: lease.sessionId,
+        turnId: lease.turnId, userId: lease.userId, status: "running", role: "reviewer", result: null, failureReason: null },
+    ] },
+    { label: "duplicate persisted match IDs", wait: { matchedTaskIds: ["target-1", "target-1"] } },
+    { label: "persisted match outside the target scope", wait: { matchedTaskIds: ["other-target"] } },
+  ])("fails closed for $label", async options => {
+    const fake = fixture(options)
+    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toBe(false)
+    expect(fake.calls.some(call => call.sql.startsWith('UPDATE "agent_wait_conditions"'))).toBe(false)
+  })
+
   it("leaves a matching projection alone without requiring a pending started call", async () => {
     const valid = fixture({ noCall: true, wait: { result: canonicalProjection() } })
     await expect(repairStaleWaitProjection(valid.client as never, lease, now)).resolves.toBe(true)

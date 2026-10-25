@@ -86,8 +86,8 @@ export async function repairStaleWaitProjection(client: Client, lease: Lease, no
   if (targets.length !== ids.length || targets.some(target => !ids.includes(String(target.id)) || target.parentTaskId !== lease.id
     || target.rootTaskId !== lease.rootTaskId || target.sessionId !== lease.sessionId || target.turnId !== lease.turnId
     || target.userId !== lease.userId || typeof target.status !== "string" || typeof target.role !== "string")) return false
-  const currentMatched = targets.filter(target => TERMINAL_TARGET.has(String(target.status))).map(target => String(target.id))
-  if (!sameIds(matched, currentMatched) || wait.status === "ready" && (wait.mode === "any" ? !matched.length : matched.length !== ids.length)) return false
+  const currentMatched = new Set(targets.filter(target => TERMINAL_TARGET.has(String(target.status))).map(target => String(target.id)))
+  if (matched.some(id => !currentMatched.has(id)) || wait.status === "ready" && (wait.mode === "any" ? !matched.length : matched.length !== ids.length)) return false
   const request = { targetTaskIds: ids, mode: wait.mode, timeoutMs }
   const outcome = projectDurableSubagentWait({ ...wait, deadlineAt }, targets, wait.status, matched)
   const calls = await client.query<Row>(CALL_SQL, [lease.sessionId, lease.turnId, lease.id, wait.stepId])
