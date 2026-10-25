@@ -183,7 +183,7 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
 
     const gateProof = await requireGateProof(fixture)
     const rootStore = createPgRootTaskStore(pool as never)
-    const pendingRoot = await runAttachedScheduledAuditRoot(fixture, response.fetcher, command, waitPort)
+    const pendingRoot = await runAttachedScheduledAuditRoot(fixture, response.fetcher, command, waitPort, "waiting_for_dependency")
     expect(pendingRoot.status).toBe("waiting_for_dependency")
     if (pendingRoot.status !== "waiting_for_dependency" || !pendingRoot.waitId) throw new Error("scheduled Audit root wait missing")
     const auditWait = { status: "waiting_for_dependency" as const, waitId: pendingRoot.waitId }
@@ -318,11 +318,15 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
 })
 
 async function runAttachedScheduledAuditRoot(fixture: Fixture, fetcher: typeof fetch,
-  commandPort: ReturnType<typeof createPgTaskGraphCommandPort>, waitPort: ReturnType<typeof createPgDurableWaitPort>): Promise<TurnEngineResult> {
+  commandPort: ReturnType<typeof createPgTaskGraphCommandPort>, waitPort: ReturnType<typeof createPgDurableWaitPort>,
+  expectedStatus?: "waiting_for_dependency"): Promise<TurnEngineResult> {
   const phases: Array<{ phase: string; outcome?: string; errorClass?: string; errorCode?: string }> = []
   const safeStatuses = new Set(["ready", "blocked", "not_registered", "completed", "waiting_for_dependency", "waiting_for_choice",
-    "waiting_for_external_user", "waiting_for_user", "invalid"])
+    "waiting_for_external_user", "waiting_for_user", "invalid", "failed", "interrupted"])
   const safeErrorCodes = new Set([...diagnosticAuditFailureReasons, ...diagnosticGateErrorCodes,
+    "evidence_missing", "evidence_conflict", "final_unverified", "business_precondition_failed",
+    "invalid_output", "persistence_conflict", "step_limit", "model_incomplete", "budget_exhausted",
+    "no_progress", "discovery_memory_overflow", "turn_execution_failed",
     "scheduled_candidate_identity_invalid", "scheduled_candidate_model_receipt_conflict", "scheduled_candidate_model_receipt_missing",
     "scheduled_candidate_owner_invalid", "scheduled_candidate_recovery_mismatch", "root_objective_history_projection_failed",
     "root_session_fenced", "root_task_fenced", "root_turn_fenced"])
@@ -421,11 +425,17 @@ async function runAttachedScheduledAuditRoot(fixture: Fixture, fetcher: typeof f
         usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } } }
     return new TurnEngine(options).run()
   }
-  try {
-    return await run()
-  } catch (error: unknown) {
+  let result: TurnEngineResult
+  try { result = await run() }
+  catch (error: unknown) {
     throw new Error(`Scheduled Audit root failed with redacted diagnostics: ${JSON.stringify({ ...errorDiagnostic(error), phases })}`)
   }
+  if (expectedStatus && result.status !== expectedStatus) {
+    const row = debugRecord(result), status = typeof result.status === "string" && safeStatuses.has(result.status) ? result.status : "unknown"
+    const errorCode = typeof row?.errorCode === "string" && safeErrorCodes.has(row.errorCode) ? row.errorCode : "unknown"
+    throw new Error(`Scheduled Audit root returned an unexpected outcome: ${JSON.stringify({ status, errorCode, phases })}`)
+  }
+  return result
 }
 
 async function readRootTurnState(fixture: Fixture): Promise<Readonly<{ turnStatus: string; rootStatus: string; rootResult: Record<string, unknown> | null }>> {
