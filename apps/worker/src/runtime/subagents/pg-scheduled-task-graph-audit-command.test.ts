@@ -66,7 +66,7 @@ const continuationKey = `scheduled-taskgraph:sha256:${"a".repeat(64)}`
 const snapshotDigest = `sha256:${"b".repeat(64)}`
 const binding = { owner, snapshotDigest, evidenceDigest: "c".repeat(64), checkpointDigest: "d".repeat(64),
   analyzeGraphRevision: 7, prepareScheduleRevision: 8 }
-const proof = { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1", graphRevision: 12,
+const proof = { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1" as const, graphRevision: 12,
   prepareProof: { completion: { wait: { waitId: "prepare-wait" } } },
   gate: { taskId: "gate-task", attemptCount: 1, resultDigest: `sha256:${"e".repeat(64)}`, completedEventRevision: 12 } }
 const proofDigest = `sha256:${createHash("sha256").update(canonicalTaskGraphJson(proof), "utf8").digest("hex")}`
