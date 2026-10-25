@@ -16,6 +16,7 @@ import { classifyCurrentTaskGraphExecutionFailure } from "./subagents/task-graph
 import { hasTaskGraphVerificationUnverifiedFailureReason, projectTaskGraphStructuredFailureCategory, taskGraphStructuredFailureCategoryBytes } from "./subagents/task-graph-structured-failure-category.js"
 import { parseTaskGraphCurrentDiscoveryAttemptHealth } from "./subagents/task-graph-discovery-attempt-health.js"
 import { withTaskGraphRootSourceIntent } from "./subagents/task-graph-source-intent-context.js"
+import { taskGraphReviewConflictObservation } from "./context/task-graph-review-conflicts.js"
 const SELECTED_JOB_ROOT_TOOLS = new Set(["agent.plan", "agent.wait", "agent.list", "list_subagents", "agent.ask_user", "agent.reconcile"])
 
 export function isSelectedJobRootTool(definition: unknown): boolean {
@@ -224,7 +225,7 @@ export function mergeTaskGraphCurrentObservation(snapshot: StepContextSnapshot, 
   try { planningFacts = Object.getOwnPropertyDescriptor(state, "planningFacts")?.value } catch { planningFacts = undefined }
   const baseContent = withTaskGraphCurrentPlanningObservation({
     kind: "task_graph_current", revision: Number(state.revision),
-    ...(rootSuccessCriteria?.length ? { rootSuccessCriteria } : {}), nodes,
+    ...(rootSuccessCriteria?.length ? { rootSuccessCriteria } : {}), ...taskGraphReviewConflictObservation(nodes), nodes,
   }, planningFacts, Number(state.revision), nodes, MAX_TEXT)
   let sourceIntent: unknown
   try { sourceIntent = Object.getOwnPropertyDescriptor(state, "sourceIntent")?.value } catch { sourceIntent = undefined }
