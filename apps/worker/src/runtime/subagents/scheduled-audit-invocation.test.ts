@@ -127,6 +127,26 @@ describe("scheduled Audit invocation proof readback", () => {
     expect(mocks.verifyPrefix).toHaveBeenCalledOnce()
   })
 
+  it("rebinds Gate proof while the execution is paused for its Audit child", async () => {
+    const db = database(registration, false, "paused")
+    const result = await readScheduledAuditInvocationProof(db, { scope, auditTaskId: "audit-task", attemptCount: 2, attestation } as never)
+    expect(result).toMatchObject({ owner, snapshotDigest, attestation, prepareProof: prepare, gateProof,
+      scheduledWaitId: "scheduled-wait", auditTaskId: "audit-task", attemptCount: 2, graphRevision: 14 })
+    expect(mocks.verifyPrefix).toHaveBeenCalledOnce()
+  })
+
+  it("rejects the unprojected Turn dependency status", async () => {
+    await expect(readScheduledAuditInvocationProof(database(registration, false, "waiting_for_dependency"),
+      { scope, auditTaskId: "audit-task", attemptCount: 2, attestation } as never)).resolves.toBeNull()
+    expect(mocks.gateRegistration).not.toHaveBeenCalled()
+  })
+
+  it("rejects an execution waiting for user input before Gate completes", async () => {
+    await expect(readScheduledAuditInvocationProof(database(registration, false, "waiting_for_user"),
+      { scope, auditTaskId: "audit-task", attemptCount: 2, attestation } as never)).resolves.toBeNull()
+    expect(mocks.gateRegistration).not.toHaveBeenCalled()
+  })
+
   it.each([
     ["wrong attempt", { scope, auditTaskId: "audit-task", attemptCount: 3, attestation }],
     ["wrong owner", { scope: { ...scope, rootTaskId: "other-root" }, auditTaskId: "audit-task", attemptCount: 2, attestation }],

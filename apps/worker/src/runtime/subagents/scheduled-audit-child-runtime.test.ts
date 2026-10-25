@@ -88,10 +88,11 @@ function setup() {
     rootStatus: "waiting_for_dependency", rootInterruptRequestedAt: null, source: "automation", executionMode: "canonical_task_graph",
     turnInput: { automationRunMode: "scheduled", scheduledAutomationSnapshot: {} }, turnStatus: "waiting_for_dependency",
     turnRootTaskId: owner.rootTaskId, userId: owner.userId, sessionStatus: "active", executionId: owner.executionId,
-    executionAttemptCount: 1, executionStatus: "waiting_for_user", state: {} }
+    executionAttemptCount: 1, executionStatus: "paused", state: {} }
   const client = { query: vi.fn(async (sql: string) => {
     if (/^BEGIN|^COMMIT|^ROLLBACK/.test(sql) || sql.includes("set_config('app.user_id'")) return { rows: [] }
-    if (sql.includes('FROM "sub_agent_tasks" AS audit')) return { rows: [live] }
+    if (sql.includes('FROM "sub_agent_tasks" AS audit')) return { rows: hasExactExecutionStatusFilter(sql)
+      && ["running", "paused", "completed"].includes(live.executionStatus) ? [live] : [] }
     throw new Error(`unexpected Audit runtime query: ${sql}`)
   }), release: vi.fn() }
   mocks.post.mockResolvedValue({ status: "completed", report })
@@ -148,6 +149,43 @@ describe("fixed scheduled Audit child runtime", () => {
     })
   })
 
+  it.each(["waiting_for_dependency", "waiting_for_user"])("rejects unsupported execution status %s", async executionStatus => {
+    const fixture = setup()
+    fixture.live.executionStatus = executionStatus
+    await expect(createScheduledAuditChildExecutor({ pool: fixture.pool as never })({ lease: lease() })).resolves.toMatchObject({
+      status: "failed", failureReason: "scheduled_audit_owner_stale", retryDisposition: "terminal",
+    })
+    expect(mocks.readInvocation).not.toHaveBeenCalled()
+  })
+
+  const validationCases: ReadonlyArray<readonly [string, (fixture: ReturnType<typeof setup>) => void]> = [
+    ["scheduled_audit_checkpoint_invalid", () => mocks.evidence.mockReturnValue(null)],
+    ["scheduled_audit_owner_stale", fixture => { fixture.live.turnStatus = "completed" }],
+    ["scheduled_audit_graph_invalid", () => mocks.loadGraph.mockResolvedValue({ snapshot: null, state: null, tasks: new Map() })],
+    ["scheduled_audit_gate_registration_invalid", () => mocks.registration.mockResolvedValue(null)],
+    ["scheduled_audit_prepare_proof_invalid", () => mocks.prepareProof.mockResolvedValue(null)],
+    ["scheduled_audit_analyze_proof_invalid", () => mocks.parseReport.mockReturnValue(null)],
+    ["scheduled_audit_invocation_proof_invalid", () => mocks.readInvocation.mockResolvedValue(null)],
+  ]
+  for (const [failureReason, invalidate] of validationCases) {
+    it(`preserves the safe validation code ${failureReason}`, async () => {
+      const fixture = setup()
+      invalidate(fixture)
+      await expect(createScheduledAuditChildExecutor({ pool: fixture.pool as never })({ lease: lease() })).resolves.toEqual({
+        status: "failed", failureReason, retryDisposition: "terminal",
+      })
+    })
+  }
+
+  it.each(["database secret detail: password=private", "scheduled_audit_unrecognized: private row data"])(
+    "redacts arbitrary invocation errors", async message => {
+      const fixture = setup()
+      mocks.loadGraph.mockRejectedValue(new Error(message))
+      const result = await createScheduledAuditChildExecutor({ pool: fixture.pool as never })({ lease: lease() })
+      expect(result).toEqual({ status: "failed", failureReason: "scheduled_audit_runtime_failed", retryDisposition: "terminal" })
+      expect(JSON.stringify(result)).not.toContain(message)
+    })
+
   it("replays only the exact persisted report when the execution is already completed", async () => {
     const fixture = setup()
     fixture.live.executionStatus = "completed"
@@ -182,3 +220,8 @@ describe("fixed scheduled Audit child runtime", () => {
     expect(mocks.post).not.toHaveBeenCalled()
   })
 })
+
+function hasExactExecutionStatusFilter(sql: string): boolean {
+  const statuses = sql.match(/execution\."status"\s+IN\s*\(([^)]*)\)/)?.[1]
+  return statuses?.replace(/\s/g, "") === "'running','paused','completed'"
+}

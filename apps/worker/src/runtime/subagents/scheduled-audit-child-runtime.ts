@@ -22,6 +22,11 @@ import type { SubagentExecutionResult, SubagentLease } from "./types.js"
 type Queryable = Pick<pg.PoolClient, "query">; type Row = Record<string, unknown>
 type Invocation = Parameters<typeof postScheduledPipelineExecute>[0]; type RuntimeOptions = Readonly<{ pool: Pick<pg.Pool, "connect">; fetcher?: typeof fetch; now?: () => Date }>
 type StableOwner = Readonly<{ userId: string; sessionId: string; turnId: string; rootTaskId: string; rootAttemptCount: number; executionId: string; executionAttemptCount: number }>
+const invocationValidationFailures = new Set([
+  "scheduled_audit_checkpoint_invalid", "scheduled_audit_owner_stale", "scheduled_audit_graph_invalid",
+  "scheduled_audit_gate_registration_invalid", "scheduled_audit_prepare_proof_invalid",
+  "scheduled_audit_analyze_proof_invalid", "scheduled_audit_invocation_proof_invalid",
+])
 export function isScheduledAuditCandidate(task: Pick<SubagentLease, "role" | "taskType">): boolean {
   return task.taskType === SCHEDULED_AUDIT_TASK_TYPE
 }
@@ -58,7 +63,7 @@ export function createScheduledAuditChildExecutor(options: RuntimeOptions): Suba
       if (lease.signal.aborted) throw lease.signal.reason ?? error
       const code = error instanceof Error ? error.message : ""
       return retryable(code) ? { status: "failed", failureReason: "scheduled_audit_handoff_retryable", retryDisposition: "retryable" }
-        : { status: "failed", failureReason: "scheduled_audit_runtime_failed", retryDisposition: "terminal" }
+        : { status: "failed", failureReason: invocationValidationFailures.has(code) ? code : "scheduled_audit_runtime_failed", retryDisposition: "terminal" }
     }
   }
 }
@@ -141,7 +146,7 @@ async function readLiveScope(client: Queryable, lease: SubagentLease, now: Date)
       AND root."taskType" = 'root' AND root."interruptRequestedAt" IS NULL AND turn."rootTaskId" = $5
       AND turn."userId" = $2
       AND turn."source" = 'automation' AND turn."executionMode" = 'canonical_task_graph'
-      AND session."status" NOT IN ('aborted','archived') AND execution."status" IN ('running','waiting_for_user','completed')
+      AND session."status" NOT IN ('aborted','archived') AND execution."status" IN ('running','paused','completed')
       AND turn."status" NOT IN ('completed','failed','interrupted','cancelled','closed')`,
   [lease.id, lease.userId, lease.sessionId, lease.turnId, lease.rootTaskId, SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE,
     lease.ownerId, lease.attemptCount, now])
