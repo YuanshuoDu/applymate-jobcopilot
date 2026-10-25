@@ -507,7 +507,7 @@ function expectScheduledAuditRecoveryTrace(trace: Awaited<ReturnType<typeof read
   fixture: Fixture, stepCount: number, status: string, errorCode: string | null): void {
   expect(trace.sourceStep.id).toBe(fixture.rootQuestionStepId)
   expect(trace.candidateEventCount).toBe(1)
-  expect(trace.sourceStep).toMatchObject({ inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, consumedInputIds: [] })
+  expect(trace.sourceStep).toMatchObject({ inputTokens: 37, outputTokens: 9, estimatedCostUsd: 0.018, consumedInputIds: [] })
   expect(trace.candidatePayload).toMatchObject({ finalStepId: fixture.rootQuestionStepId,
     finalStepOrdinal: Number(trace.sourceStep.ordinal), candidateText: "Scheduled Gate integration candidate.",
     usage: { inputTokens: 37, outputTokens: 9, estimatedCostUsd: 0.018 } })
