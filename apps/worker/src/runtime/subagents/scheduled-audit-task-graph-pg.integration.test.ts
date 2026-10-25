@@ -290,12 +290,12 @@ async function setupFetcher(fixture: Fixture) {
 async function readGateFailureDiagnostics(fixture: Fixture, requestBody: Record<string, unknown>, signalAborted: boolean,
   responseStatus: number, responsePayload: unknown): Promise<GateFailureDiagnostics> {
   const response = debugRecord(responsePayload)
-  const owner = debugRecord(requestBody.owner), gateTaskId = requestBody.gateTaskId,
+  const owner = debugRecord(requestBody.owner), rootTaskId = owner?.rootTaskId, gateTaskId = requestBody.gateTaskId,
     gateLeaseOwnerId = requestBody.gateLeaseOwnerId, gateAttemptCount = requestBody.gateAttemptCount,
     suppliedWaitId = requestBody.scheduledWaitId
   const safeResponse = { responseStatus, responseErrorCode: typeof response?.errorCode === "string" ? response.errorCode : null, signalAborted }
   if (!owner || typeof owner.userId !== "string" || typeof owner.sessionId !== "string" || typeof owner.turnId !== "string"
-    || typeof owner.rootTaskId !== "string" || typeof gateTaskId !== "string" || typeof gateLeaseOwnerId !== "string"
+    || typeof rootTaskId !== "string" || typeof gateTaskId !== "string" || typeof gateLeaseOwnerId !== "string"
     || !Number.isSafeInteger(gateAttemptCount) || suppliedWaitId !== undefined && typeof suppliedWaitId !== "string") {
     return { requestShapeValid: false, ...safeResponse }
   }
@@ -443,7 +443,7 @@ async function readGateFailureDiagnostics(fixture: Fixture, requestBody: Record<
       let gateHistoryError = false
       if (gateBindingCurrent && parsedProof) {
         const reader = tx as GateProofDebugReader
-        const graphId = `task-graph-${createHash("sha256").update(owner.rootTaskId).digest("hex")}`
+        const graphId = `task-graph-${createHash("sha256").update(rootTaskId).digest("hex")}`
         const [graph, historyGateTask] = await Promise.all([
           reader.agentItem.findFirst({ where: { id: graphId, sessionId: owner.sessionId, turnId: owner.turnId,
             taskId: owner.rootTaskId, type: "task_graph", session: { is: { userId: owner.userId } },
