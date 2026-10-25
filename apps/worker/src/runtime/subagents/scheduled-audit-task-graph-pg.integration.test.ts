@@ -389,7 +389,7 @@ async function readExecutionFailureDiagnostic(fixture: Fixture): Promise<Pick<Ex
   const row = result.rows[0]
   if (!row) return { executionStatus: null, executionCheckpoint: null, executionNextStage: null,
     hasExecutionError: false, executionErrorCode: null }
-  return { executionStatus: debugSafeEnum(row.status, ["running", "completed", "failed", "waiting_for_user", "cancelled"]),
+  return { executionStatus: debugSafeEnum(row.status, ["queued", "running", "waiting_for_user", "paused", "completed", "failed", "cancelled"]),
     executionCheckpoint: debugSafeEnum(row.checkpoint, ["scout", "analyze", "prepare", "gate", "execute", "audit", "completed"]),
     executionNextStage: debugSafeEnum(row.nextStage, ["scout", "analyze", "prepare", "gate", "execute", "audit", "completed"]),
     hasExecutionError: typeof row.error === "string" && row.error.length > 0,
