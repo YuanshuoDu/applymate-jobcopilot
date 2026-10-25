@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { Queue, Worker, type Job } from "bullmq"
 import Redis from "ioredis"
 import { Pool } from "pg"
@@ -391,13 +391,86 @@ async function readGateFailureDiagnostics(fixture: Fixture, requestBody: Record<
       scheduledTaskGraphAnalyzeCheckpointForGate(state: unknown): unknown
       isScheduledTaskGraphGateProofCurrent(input: Record<string, unknown>, tx: unknown): Promise<boolean>
     }>("@/lib/agent/scheduled-taskgraph-gate-input")
+    const gateCheckpoint = await vi.importActual<{
+      scheduledTaskGraphAnalyzeCheckpointDigest(value: unknown): string | null
+      parseScheduledTaskGraphPrepareProof(value: unknown): null | {
+        graphRevision: number
+        nodes: [{ attemptCount: number }, { attemptCount: number }, { attemptCount: number }]
+        result: { snapshotDigest: string; checkpointDigest: string; jobs: Array<{ jobId: string; status: string }> }
+      }
+    }>("@/lib/agent/scheduled-taskgraph-gate-checkpoint")
+    const gateHistory = await vi.importActual<{
+      scheduledTaskGraphGateBindingIsCurrent(input: {
+        reader: unknown; owner: unknown; marker: Record<string, unknown>; checkpointDigest: string; proof: unknown
+        gate: { taskId: string; attemptCount: number; phase: "running" }
+      }): Promise<boolean>
+      scheduledTaskGraphGateHistoryIsCurrent(input: {
+        reader: unknown; owner: unknown; prepareGraphRevision: number; prepareAttemptCount: number
+        graphRevision: number; graphContent: unknown
+        gateTask: { id: string; status: string; attemptCount: number; maxAttempts: number; result: unknown }
+        gate: { taskId: string; attemptCount: number; phase: "running" }; expectedJobIds: readonly string[]
+      }): Promise<boolean>
+    }>("@/lib/agent/scheduled-taskgraph-gate-history")
+    type GateProofDebugReader = {
+      agentItem: { findFirst(args: unknown): Promise<{ revision: number; content: unknown } | null> }
+      subAgentTask: { findFirst(args: unknown): Promise<{
+        id: string; status: string; attemptCount: number; maxAttempts: number; result: unknown
+      } | null> }
+    }
     const webDb = await vi.importActual<{ db: { $transaction<T>(work: (tx: unknown) => Promise<T>): Promise<T> } }>(scheduledWebDbPath)
     const analyzeCheckpoint = gateInput.scheduledTaskGraphAnalyzeCheckpointForGate(execution?.state)
-    const gateProofCurrent = Boolean(persistedSnapshotValid && analyzeCheckpoint && await webDb.db.$transaction(tx => gateInput.isScheduledTaskGraphGateProofCurrent({
-      owner: ownerForLock, snapshot: persistedSnapshot, analyzeCheckpoint,
-      analyzeAttestation: requestBody.attestation, prepareProof: requestBody.prepareProof,
-      gate: { taskId: gateTaskId, attemptCount: Number(gateAttemptCount), phase: "running" },
-    }, tx)))
+    const gateProofDiagnostics = await webDb.db.$transaction(async tx => {
+      const checkpointRecord = debugRecord(analyzeCheckpoint)
+      const marker = debugRecord(checkpointRecord?.scheduledTaskGraphContinuation)
+      const checkpointDigest = analyzeCheckpoint
+        ? gateCheckpoint.scheduledTaskGraphAnalyzeCheckpointDigest(analyzeCheckpoint) : null
+      const parsedProof = gateCheckpoint.parseScheduledTaskGraphPrepareProof(requestBody.prepareProof)
+      const prepareProofMatchesCheckpoint = Boolean(parsedProof && marker && checkpointDigest
+        && parsedProof.result.snapshotDigest === marker.snapshotDigest
+        && parsedProof.result.checkpointDigest === checkpointDigest)
+      const gate = { taskId: gateTaskId, attemptCount: Number(gateAttemptCount), phase: "running" as const }
+      const gateBindingEvaluated = Boolean(persistedSnapshotValid && analyzeCheckpoint && marker && checkpointDigest
+        && parsedProof && prepareProofMatchesCheckpoint)
+      let gateBindingCurrent = false
+      let gateBindingError = false
+      if (gateBindingEvaluated && parsedProof && marker && checkpointDigest) {
+        try {
+          gateBindingCurrent = await gateHistory.scheduledTaskGraphGateBindingIsCurrent({ reader: tx, owner: ownerForLock,
+            marker, checkpointDigest, proof: parsedProof, gate })
+        } catch { gateBindingError = true }
+      }
+      let gateHistoryCurrent: boolean | null = null
+      let gateHistoryError = false
+      if (gateBindingCurrent && parsedProof) {
+        const reader = tx as GateProofDebugReader
+        const graphId = `task-graph-${createHash("sha256").update(owner.rootTaskId).digest("hex")}`
+        const [graph, historyGateTask] = await Promise.all([
+          reader.agentItem.findFirst({ where: { id: graphId, sessionId: owner.sessionId, turnId: owner.turnId,
+            taskId: owner.rootTaskId, type: "task_graph", session: { is: { userId: owner.userId } },
+            turn: { is: { userId: owner.userId, rootTaskId: owner.rootTaskId } } }, select: { revision: true, content: true } }),
+          reader.subAgentTask.findFirst({ where: { id: gateTaskId, sessionId: owner.sessionId, turnId: owner.turnId,
+            rootTaskId: owner.rootTaskId, session: { is: { userId: owner.userId } } },
+            select: { id: true, status: true, attemptCount: true, maxAttempts: true, result: true } }),
+        ])
+        gateHistoryCurrent = Boolean(graph && historyGateTask)
+        if (graph && historyGateTask) {
+          try {
+            gateHistoryCurrent = await gateHistory.scheduledTaskGraphGateHistoryIsCurrent({
+              reader: tx, owner: ownerForLock, prepareGraphRevision: parsedProof.graphRevision,
+              prepareAttemptCount: parsedProof.nodes[2].attemptCount, graphRevision: graph.revision, graphContent: graph.content,
+              gateTask: historyGateTask, gate, expectedJobIds: parsedProof.result.jobs
+                .filter(job => job.status === "prepared").map(job => job.jobId),
+            })
+          } catch { gateHistoryCurrent = false; gateHistoryError = true }
+        }
+      }
+      const gateProofCurrent = Boolean(persistedSnapshotValid && analyzeCheckpoint
+        && await gateInput.isScheduledTaskGraphGateProofCurrent({ owner: ownerForLock, snapshot: persistedSnapshot,
+          analyzeCheckpoint, analyzeAttestation: requestBody.attestation, prepareProof: requestBody.prepareProof, gate }, tx))
+      return { prepareProofParsed: Boolean(parsedProof), analyzeCheckpointDigestPresent: Boolean(checkpointDigest),
+        prepareProofMatchesCheckpoint, gateBindingEvaluated, gateBindingCurrent,
+        gateBindingError, gateHistoryEvaluated: gateHistoryCurrent !== null, gateHistoryCurrent, gateHistoryError, gateProofCurrent }
+    })
     const prepareWait = await vi.importActual<{
       validateScheduledPrepareWaitIdentity(input: { owner: unknown; snapshot: unknown; proof: unknown; scheduledWaitId?: string }): Promise<boolean>
     }>("@/lib/agent/scheduled-taskgraph-run-service")
@@ -452,7 +525,7 @@ async function readGateFailureDiagnostics(fixture: Fixture, requestBody: Record<
         questionAnswered: typeof questionContent?.answeredAt === "string",
         answerAvailable: questionContent?.answerAvailable === true },
       jobs: { candidateIdsValid, candidateCount: candidateIdsValid ? candidateIds.length : null, candidateJobsMatch },
-      gateProofCurrent,
+      gateProof: gateProofDiagnostics,
     }
   } catch {
     return { ...safeResponse, diagnosticsUnavailable: true }
