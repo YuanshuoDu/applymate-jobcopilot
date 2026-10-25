@@ -19,6 +19,7 @@ export class TurnEngine {
       identity,
       store: bindStore(this.options.store),
       contextBuilder: bindContextBuilder(this.options, identity),
+      preflightDiscoveryPersonaMemory: this.options.preflightDiscoveryPersonaMemory ?? this.options.contextBuilder.preflightDiscoveryPersonaMemory,
       signalError: () => new TurnLeaseError("lease_lost", "Turn execution stopped after lease loss"),
       isOwnershipLost: (error, signal) => error instanceof TurnLeaseError || signal.aborted,
     })
