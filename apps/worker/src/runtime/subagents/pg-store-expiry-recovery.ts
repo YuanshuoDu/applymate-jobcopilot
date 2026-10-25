@@ -9,6 +9,7 @@ import { parseSubagentJobPayload, type PgSubagentPool, type SubagentTaskRecord }
 import { prepareTaskGraphFinish } from "./pg-store-lifecycle.js"
 import { recoverExpiredDurableSubagentWaitWithGraph } from "./durable-subagent-wait-handoff.js"
 import { recoverExpiredWaitRegistration } from "./durable-subagent-wait-store.js"
+import { repairStaleWaitProjection } from "./pg-store-expiry-recovery-wait-projection.js"
 
 type RecoveryCursor = Readonly<{ sessionId: string; rootIsNull: boolean; rootKey: string; taskId: string }>
 type Candidate = Record<string, unknown> & Readonly<{ id: string; sessionId: string; userId: string; rootTaskId?: string | null; turnId?: string | null;
@@ -222,9 +223,9 @@ async function recoverOne(client: pg.PoolClient, candidate: Candidate, filter: {
     const registration = await recoverExpiredWaitRegistration(client, lease, checkedAt)
     if (trace) { trace.waitRegistrationFound = Boolean(registration); trace.waitRegistrationRejected = Boolean(registration && "rejectedCallId" in registration) }
     if (registration && "rejectedCallId" in registration) rejectedWaitCallId = registration.rejectedCallId
-    const blockedByExternalCall = await hasBlockingExternalCall(client, row, rejectedWaitCallId, waitContinuation && childWaitConsumed && !rejectedWaitCallId ? childWaitContinuationId : undefined)
+    const projectionRejected = waitContinuation && !childWaitConsumed && !rejectedWaitCallId && !await repairStaleWaitProjection(client, lease, checkedAt), blockedByExternalCall = await hasBlockingExternalCall(client, row, rejectedWaitCallId, waitContinuation && childWaitConsumed && !rejectedWaitCallId ? childWaitContinuationId : undefined)
     if (trace) trace.blockingExternalCall = blockedByExternalCall
-    if (blockedByExternalCall) return rejectRecovery(trace, "unsettled_external_call_rejected")
+    if (projectionRejected || blockedByExternalCall) return rejectRecovery(trace, projectionRejected ? "durable_wait_graph_blocked" : "unsettled_external_call_rejected")
     const wait = await recoverExpiredDurableSubagentWaitWithGraph(client, { lease, now: checkedAt })
     if (wait && "blocked" in wait) return rejectRecovery(trace, "durable_wait_graph_blocked")
     if (wait) return { ...rowToTask(row), status: wait.handoff === "suspended" ? "waiting" : "queued",

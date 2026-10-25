@@ -17,7 +17,7 @@ type FixtureOptions = { pendingCall?: boolean; candidate?: boolean; childWaitRes
   registeredWait?: boolean; targetStatus?: string; callMatches?: boolean; recoveryLeaseLost?: boolean; continuationWait?: boolean;
   exactWaitCall?: boolean; unrelatedPendingCall?: boolean; preinsertWaitCall?: boolean; unconsumedContinuation?: boolean;
   unconsumedNoContinuation?: boolean; pendingModelStart?: "exact" | "wrong-correlation" | "wrong-actor" | "wrong-item" | "wrong-key" | "wrong-payload";
-  pendingToolStart?: boolean; candidatePages?: readonly (readonly CandidateRow[])[]; blockedCandidateIds?: readonly string[];
+  pendingToolStart?: boolean; waitCallStatus?: string; candidatePages?: readonly (readonly CandidateRow[])[]; blockedCandidateIds?: readonly string[];
   missingSessionCandidateIds?: readonly string[]; missingPreviewCandidateIds?: readonly string[]; throwCandidateIds?: readonly string[];
   waitStepStatus?: "streaming" | "waiting_for_tool" }
 function scanCandidate(id: string, sessionId = "session-1", rootTaskId: string | null = "root-1", turnId: string | null = "turn-1"): CandidateRow {
@@ -34,12 +34,21 @@ function fixture(options: FixtureOptions = {}) {
     idempotencyKey: `subagent-dispatch:${task.id}`, payload: { taskId: task.id, sessionId: task.sessionId,
       rootTaskId: task.rootTaskId, ownerId: options.outboxOwnerId ?? task.leaseOwner }, attemptCount: 4,
     publishedAt: options.dispatchPublished === false ? null : new Date(checkedAt.getTime() - 1_000), lastError: "previous_error" as string | null }
-  const wait = { id: "wait-1", userId: task.userId, sessionId: task.sessionId, turnId: task.turnId, parentTaskId: task.id,
+  const wait: { id: string; userId: string; sessionId: string; turnId: string | null; parentTaskId: string; stepId: string; idempotencyKey: string;
+    targetTaskIds: string[]; mode: string; status: string; createdAt: Date; deadlineAt: Date; resolvedAt: Date | null; matchedTaskIds: string[]; suspendedAt: Date | null;
+    consumedAt: Date | null; result: Record<string, unknown> } = { id: "wait-1", userId: task.userId, sessionId: task.sessionId, turnId: task.turnId, parentTaskId: task.id,
     stepId: "step-1", idempotencyKey: "wait-key-1", targetTaskIds: ["target-1"], mode: "any", status: options.continuationWait || options.unconsumedContinuation || options.unconsumedNoContinuation ? "ready" : "waiting",
-    deadlineAt: new Date(checkedAt.getTime() + 10_000), matchedTaskIds: [] as string[],
+    createdAt: checkedAt, deadlineAt: new Date(checkedAt.getTime() + 10_000), resolvedAt: null, matchedTaskIds: [] as string[],
     suspendedAt: options.continuationWait || options.unconsumedContinuation || options.unconsumedNoContinuation ? checkedAt : null as Date | null,
     consumedAt: options.continuationWait ? checkedAt : null as Date | null,
     result: { request: { targetTaskIds: ["target-1"], mode: "any", timeoutMs: 10_000 }, outcome: { status: "waiting" } } }
+  if (options.childWaitResumable && !options.continuationWait) {
+    wait.status = "ready"; wait.resolvedAt = checkedAt; wait.suspendedAt = checkedAt; wait.matchedTaskIds = ["target-1"]
+    wait.result = { request: { targetTaskIds: ["target-1"], mode: "any", timeoutMs: 10_000 }, outcome: {
+      waitId: wait.id, status: "ready", taskIds: ["target-1"], deadlineAt: wait.deadlineAt.toISOString(), matchedTaskIds: ["target-1"],
+      tasks: [{ taskId: "target-1", status: options.targetStatus ?? "completed", role: "writer", result: null, failureReason: null }],
+    } }
+  }
   const candidatePageCalls: Array<{ sql: string; values: unknown[] }> = []
   const queuedCandidates: CandidateRow[] = []
   let pageIndex = 0
@@ -79,6 +88,24 @@ function fixture(options: FixtureOptions = {}) {
       childWaitResumable: options.childWaitResumable ?? false, childWaitContinuationId: options.continuationWait ? "continuation-1" : null }], rowCount: 1 }
     if (sql.includes('SELECT task."id", task."parentTaskId"') && sql.includes("FOR UPDATE OF task")) return options.recoveryLeaseLost
       ? { rows: [], rowCount: 0 } : { rows: [{ ...task, turnStatus: "in_progress", rootStatus: "running" }], rowCount: 1 }
+    if (sql.startsWith('SELECT wait.*, task."status" AS "repairTaskStatus"')) return options.childWaitResumable && !options.continuationWait ? { rows: [{ ...wait,
+      repairTaskStatus: "running", repairLeaseOwner: task.leaseOwner, repairTaskAttempt: task.attemptCount, repairLeaseExpiresAt: task.leaseExpiresAt,
+      repairInterruptAt: null, repairNextAttemptAt: null, repairUserId: task.userId, repairSessionStatus: "running", repairTurnStatus: "in_progress",
+      repairRootStatus: "running", repairRootInterruptAt: null, repairAttempt: task.attemptCount, repairOrdinal: 4,
+      repairLatestOrdinal: options.unconsumedContinuation ? 5 : 4, repairNextStatus: options.unconsumedContinuation ? "streaming" : null,
+      repairNextOrdinal: options.unconsumedContinuation ? 5 : null, repairStepStatus: options.unconsumedContinuation ? "completed" : "waiting_for_tool",
+    }], rowCount: 1 } : { rows: [], rowCount: 0 }
+    if (sql.includes('FROM "agent_items" AS call') && sql.includes('AS "eventCreatedAt"')) return { rows: options.exactWaitCall ? [{
+      callId: "wait-call-item", callSessionId: task.sessionId, callTurnId: task.turnId, callTaskId: task.id, callStepId: wait.stepId, status: options.waitCallStatus ?? "started",
+      content: { toolCallId: "wait-call-1", toolName: "wait_subagents", toolVersion: "1", input: { idempotencyKey: wait.idempotencyKey,
+        mode: wait.mode, taskIds: wait.targetTaskIds, timeoutMs: 10_000 } }, eventId: "start-event", eventSessionId: task.sessionId,
+      eventTurnId: task.turnId, eventTaskId: task.id, eventItemId: "wait-call-item", eventCorrelationId: "wait-call-1",
+      eventCreatedAt: new Date(checkedAt.getTime() - 5_000),
+    }] : [], rowCount: options.exactWaitCall ? 1 : 0 }
+    if (sql.includes('FROM "sub_agent_tasks" AS child') && sql.includes("ANY($1::text[])")) return { rows: [{
+      id: "target-1", parentTaskId: task.id, rootTaskId: task.rootTaskId, turnId: task.turnId, sessionId: task.sessionId,
+      status: options.targetStatus ?? (options.childWaitResumable ? "completed" : "running"), role: "writer", result: null, failureReason: null, userId: task.userId,
+    }], rowCount: 1 }
     if (sql.includes('FROM "agent_wait_conditions" AS wait JOIN "agent_steps" AS step') && sql.includes('wait."status" = \'waiting\'')) return options.registeredWait
       ? { rows: [{ ...wait, attempt: task.attemptCount, ordinal: 4, latestOrdinal: 4, stepStatus: options.waitStepStatus ?? "waiting_for_tool" }], rowCount: 1 } : { rows: [], rowCount: 0 }
     if (sql.includes('started."createdAt"') && sql.includes("FOR UPDATE OF task, step, call")) return options.preinsertWaitCall ? { rows: [{
@@ -564,6 +591,16 @@ describe("expired subagent recovery fence", () => {
     expect(fake.task.status).toBe("running")
     expect(fake.calls.some(sql => sql.startsWith('UPDATE "agent_wait_conditions"'))).toBe(false)
     expect(fake.calls.some(sql => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
+  })
+
+  it("does not fall through to generic continuation for a streaming wait call", async () => {
+    const fake = fixture({ child: true, childWaitResumable: true, pendingCall: true, exactWaitCall: true, waitCallStatus: "streaming" })
+    await expect(recoverExpired(fake.pool as PgSubagentPool, { now: checkedAt, limit: 10 })).resolves.toEqual([])
+    expect(fake.client.query.mock.calls.some(([sql]) => sql.startsWith('SELECT wait.*, task."status" AS "repairTaskStatus"'))).toBe(true)
+    expect(fake.client.query.mock.calls.some(([sql]) => sql.includes('FROM "agent_items" AS call') && sql.includes('AS "eventCreatedAt"'))).toBe(true)
+    expect(fake.task.status).toBe("running")
+    expect(fake.calls.some(sql => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))).toBe(false)
+    expect(fake.calls.some(sql => sql.startsWith('UPDATE "agent_outbox" SET "payload"'))).toBe(false)
   })
 
   it("falls through when the expired owner fence no longer matches", async () => {

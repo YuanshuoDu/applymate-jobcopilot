@@ -465,6 +465,15 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       ids.recoveryCandidateCount = Number(candidateRank.candidateCount)
       ids.recoveryFixtureBlockerCount = Number(candidateRank.fixtureBlockerCount)
       ids.recoveryCandidateObservedAt = candidateRank.observedAt.toISOString()
+      const corruptedMirror = await pool.query(`UPDATE "agent_wait_conditions" SET "result" = jsonb_set(
+          jsonb_set("result", '{request,timeoutMs}', to_jsonb(("result"->'request'->>'timeoutMs')::integer + 1), false),
+          '{outcome,status}', '"waiting"'::jsonb, false)
+        WHERE "id" = (SELECT "id" FROM "agent_wait_conditions" WHERE "parentTaskId" = $1 AND "sessionId" = $2)
+          AND "status" = 'ready' AND "suspendedAt" IS NOT NULL AND "consumedAt" IS NULL RETURNING "id"`, [waiter.id, ids.sessionId])
+      expect(corruptedMirror.rowCount).toBe(1)
+      const staleProjection = await pool.query<{ status: string; result: { request: { timeoutMs: number }; outcome: { status: string } } }>(
+        `SELECT "status", "result" FROM "agent_wait_conditions" WHERE "parentTaskId" = $1 AND "sessionId" = $2`, [waiter.id, ids.sessionId])
+      expect(staleProjection.rows[0]).toMatchObject({ status: "ready", result: { outcome: { status: "waiting" } } })
 
       workerC = launchWorker("worker-b-crash-resume", queueName, ids)
       await waitForMarker(workerC, "WORKER_B_RECOVERED")
@@ -472,6 +481,17 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       const predicateTrace = workerC.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_RECOVERY_PREDICATE_TRACE "))
       expect(workerC.stdoutText, `Worker C missed the waiter; ${recoveryDiagnostic ?? "diagnostic missing"}; ${predicateTrace ?? "predicate trace missing"}`)
         .toContain(`"id":"${waiter.id}","status":"queued"`)
+      const repairedProjection = await pool.query<{ status: string; result: { request: { timeoutMs: number }; outcome: { waitId: string; status: string; taskIds: string[] } }; createdAt: Date; deadlineAt: Date; callTimeoutMs: string }>(
+        `SELECT wait."status", wait."result", wait."createdAt", wait."deadlineAt", call."content"->'input'->>'timeoutMs' AS "callTimeoutMs"
+         FROM "agent_wait_conditions" AS wait JOIN "agent_items" AS call ON call."stepId" = wait."stepId" AND call."taskId" = wait."parentTaskId"
+           AND call."sessionId" = wait."sessionId" AND call."type" = 'tool_call' AND call."content"->>'toolName' = 'wait_subagents'
+         WHERE wait."parentTaskId" = $1 AND wait."sessionId" = $2`, [waiter.id, ids.sessionId])
+      expect(repairedProjection.rows).toHaveLength(1)
+      const repaired = repairedProjection.rows[0]!
+      expect(repaired.status).toBe("ready")
+      expect(repaired.result.request.timeoutMs).toBe(Number(repaired.callTimeoutMs))
+      expect(repaired.result.request.timeoutMs).toBe(repaired.deadlineAt.getTime() - repaired.createdAt.getTime())
+      expect(repaired.result.outcome).toMatchObject({ waitId: expect.any(String), status: "ready", taskIds: [target.id] })
       const blockerStateAfterRecovery = await readBlockerDurableState(pool, recoveryBlockerTaskIds)
       expect(blockerStateAfterRecovery).toEqual(blockerStateBeforeRecovery)
       const blockerJobs = await queue.getJobs(["waiting", "active", "delayed", "completed", "failed"], 0, -1)
