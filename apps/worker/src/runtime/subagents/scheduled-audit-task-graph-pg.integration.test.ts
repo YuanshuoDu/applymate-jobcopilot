@@ -245,7 +245,10 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
       attestation: fixture.attestation, gateProof, scheduledWaitId: fixture.prepareChoiceWaitId })
     expect(replay).toMatchObject({ status: "duplicate", auditTaskId, expectedAttemptCount: 2 })
     expect((await graphCount(fixture)).auditNodes).toBe(1)
-    const auditProofSpy = vi.spyOn(command, "verifyScheduledAuditCompletion").mockResolvedValueOnce(null)
+    const auditProofPort = command as typeof command & {
+      verifyScheduledAuditCompletion: NonNullable<typeof command.verifyScheduledAuditCompletion>
+    }
+    const auditProofSpy = vi.spyOn(auditProofPort, "verifyScheduledAuditCompletion").mockResolvedValueOnce(null)
     try {
       await expect(continuation(input)).resolves.toMatchObject({
         status: "blocked", errorCode: "scheduled_audit_completion_unverified",
