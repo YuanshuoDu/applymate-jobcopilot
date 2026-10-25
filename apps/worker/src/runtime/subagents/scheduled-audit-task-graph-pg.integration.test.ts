@@ -396,7 +396,7 @@ async function readGateFailureDiagnostics(fixture: Fixture, requestBody: Record<
       scheduledTaskGraphAnalyzeCheckpointDigest(value: unknown): string | null
       parseScheduledTaskGraphPrepareProof(value: unknown): null | {
         graphRevision: number
-        nodes: [{ attemptCount: number }, { attemptCount: number }, { attemptCount: number }]
+        nodes: [{ attemptCount: number }, { attemptCount: number }, { taskId: string; attemptCount: number }]
         result: { snapshotDigest: string; checkpointDigest: string; jobs: Array<{ jobId: string; status: string }> }
       }
     }>("@/lib/agent/scheduled-taskgraph-gate-checkpoint")
