@@ -81,6 +81,41 @@ function prepareAuditCase() {
   return { initial, input }
 }
 
+const scheduledOwner = {
+  userId: 'user-1', sessionId: 'session-1', turnId: 'turn-1', rootTaskId: 'root-task-1', rootAttemptCount: 1,
+  turnLeaseOwnerId: 'lease-owner-1', turnLeaseVersion: 1, executionId: 'execution-1', executionAttemptCount: 0,
+}
+const scheduledKey = `scheduled-taskgraph:sha256:${'a'.repeat(64)}`
+const scheduledClaimToken = 'claim-token-1'
+
+function withScheduledOwnerProof(initial: Partial<PipelineCheckpointState> = {}): Partial<PipelineCheckpointState> {
+  return {
+    ...initial,
+    scheduledTaskGraphContinuation: {
+      schemaVersion: 'agent-harness.v2.scheduled-pipeline-continuation.v1', key: scheduledKey,
+      owner: scheduledOwner, snapshotDigest: `sha256:${'b'.repeat(64)}`, graphRevision: 2, evidenceDigest: 'c'.repeat(64),
+    },
+    scheduledTaskGraphClaim: {
+      schemaVersion: 'agent-harness.v2.scheduled-pipeline-claim.v1', key: scheduledKey, claimToken: scheduledClaimToken,
+      owner: scheduledOwner, claimedAt: '2026-10-25T09:00:00.000Z', leaseExpiresAt: '2026-10-25T10:00:00.000Z',
+    },
+  } as unknown as Partial<PipelineCheckpointState>
+}
+
+function attachScheduledOwnerFence(
+  runtime: PipelineStageRuntimeContext,
+  owner = scheduledOwner,
+): void {
+  Object.assign(runtime.ctx, {
+    sessionId: owner.sessionId,
+    turnId: owner.turnId,
+    executionAttempt: { id: owner.executionId, attemptCount: owner.executionAttemptCount },
+    scheduledTaskGraphOwnerFence: {
+      owner, key: scheduledKey, claimToken: scheduledClaimToken, assertCurrent: vi.fn(async () => true),
+    },
+  })
+}
+
 describe('runExecuteAuditStages', () => {
   beforeEach(() => vi.clearAllMocks())
 
@@ -124,6 +159,36 @@ describe('runExecuteAuditStages', () => {
     const completedCheckpointIndex = vi.mocked(runtime.persist).mock.calls.findIndex(([stage]) => stage === 'completed')
     expect(vi.mocked(runtime.emit).mock.invocationCallOrder[doneEventIndex]).toBeLessThan(vi.mocked(runtime.persist).mock.invocationCallOrder[completedCheckpointIndex])
     expect(result.report).toMatchObject({ processed: 1, queued: 1, failed: 0 })
+    expect(runtime.orchestrator.evaluate).toHaveBeenCalledWith('post-run', expect.any(String), expect.any(Object))
+  })
+
+  it('skips post-run model decisions only for a validated scheduled TaskGraph owner', async () => {
+    const { initial, input } = prepareAuditCase()
+    const runtime = makeRuntime(withScheduledOwnerProof(initial))
+    attachScheduledOwnerFence(runtime)
+
+    const result = await runExecuteAuditStages(runtime, input)
+
+    expect(result.report).toMatchObject({ processed: 1, applied: 0, queued: 1 })
+    expect(runExecute).toHaveBeenCalledOnce()
+    expect(runAudit).toHaveBeenCalledOnce()
+    expect(runtime.orchestrator.evaluate).not.toHaveBeenCalled()
+    expect(runtime.orchestrator.ask).not.toHaveBeenCalled()
+    expect(runtime.orchestrator.applyFix).not.toHaveBeenCalled()
+    const completeOrder = vi.mocked(runtime.orchestrator.complete).mock.invocationCallOrder[0]!
+    const livenessChecksBeforeComplete = vi.mocked(runtime.assertAlive).mock.invocationCallOrder.filter(order => order < completeOrder)
+    expect(livenessChecksBeforeComplete.length).toBeGreaterThan(0)
+  })
+
+  it('keeps the post-run decision for a mismatched scheduled owner proof', async () => {
+    const { initial, input } = prepareAuditCase()
+    const runtime = makeRuntime(withScheduledOwnerProof(initial))
+    attachScheduledOwnerFence(runtime, { ...scheduledOwner, rootTaskId: 'other-root' })
+
+    await runExecuteAuditStages(runtime, input)
+
+    expect(runtime.orchestrator.evaluate).toHaveBeenCalledOnce()
+    expect(runtime.orchestrator.evaluate).toHaveBeenCalledWith('post-run', expect.any(String), expect.any(Object))
   })
 
   it('returns a saved report without rerunning completed stages', async () => {
@@ -141,6 +206,22 @@ describe('runExecuteAuditStages', () => {
     expect(result).toEqual({ report: savedReport })
     expect(runExecute).not.toHaveBeenCalled()
     expect(runAudit).not.toHaveBeenCalled()
+  })
+
+  it('preserves historical report counts on scheduled owner-bound replay', async () => {
+    const { initial, input } = prepareAuditCase()
+    const savedReport = { processed: 9, applied: 4, queued: 3, pending: 1, skipped: 2, failed: 1, durationMs: 4_200 }
+    const runtime = makeRuntime(withScheduledOwnerProof({
+      ...initial, nextStage: 'completed', report: savedReport, executeOutput: { queued: ['job-1'], failed: [] },
+    }))
+    attachScheduledOwnerFence(runtime)
+
+    const result = await runExecuteAuditStages(runtime, input)
+
+    expect(result).toEqual({ report: savedReport })
+    expect(runExecute).not.toHaveBeenCalled()
+    expect(runAudit).not.toHaveBeenCalled()
+    expect(runtime.orchestrator.complete).not.toHaveBeenCalled()
   })
 
   it('does not advance the completed checkpoint when persistence fails after done is queued', async () => {

@@ -14,6 +14,7 @@ import { recoverExpired as recoverExpiredImpl } from "./pg-store-expiry-recovery
 import { deleteGraphDispatch, persistGraphTransition, prepareGraphTransition, reconcileGraphDependents, taskGraphEventType, type GraphTransitionPreparation } from "./task-graph-pg-lifecycle.js"
 import { SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
 import { validateScheduledGateTaskGraphFinish } from "./pg-scheduled-task-graph-gate-verification.js"
+import { SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE, SCHEDULED_AUDIT_TEMPLATE_ID } from "./scheduled-audit-contract.js"
 type Selector = Readonly<{ sessionId: string; userId?: string; turnId?: string; rootTaskId?: string; targetPath?: string }>
 type Candidate = Record<string, unknown> & Readonly<{ id: string; status: string; attemptCount: number; sessionId: string; userId: string; rootTaskId?: string; turnId?: string | null }>
 export async function prepareTaskGraphFinish(client: pg.PoolClient, input: { taskId: string; sessionId: string; attemptCount: number; status: string; retry: boolean; failureReason?: string; result: unknown; ownerId?: string; taskRole?: string; taskType?: string }): Promise<{ graph: GraphTransitionPreparation; status: string; failureReason?: string; result: unknown; reconcileDependents?: boolean }> {
@@ -42,6 +43,14 @@ export async function prepareTaskGraphFinish(client: pg.PoolClient, input: { tas
       if (envelope) return { graph, status: envelope.status, result: envelope, reconcileDependents: envelope.status === "completed" }
       return rejectGate()
     }
+  }
+  if (input.status === "completed" && node?.key === SCHEDULED_AUDIT_TEMPLATE_ID
+    && node.templateId === SCHEDULED_AUDIT_TEMPLATE_ID && node.verificationDisposition === "specialized"
+    && node.taskId === input.taskId
+    && input.taskRole === SCHEDULED_AUDIT_ROLE && input.taskType === SCHEDULED_AUDIT_TASK_TYPE) {
+    const source = plainObject(safeInputResult)
+    const result = source ? { ...source, taskGraphVerificationReport: null } : safeInputResult
+    return { graph, status: input.status, failureReason: input.failureReason, result: finalizedResult(result, input.status) }
   }
   if (!node || (node.templateId !== "scout" && node.templateId !== "analyst" && node.templateId !== "prepare")) return { graph, status: input.status, failureReason: input.failureReason, result: finalizedResult(safeInputResult, input.status) }
   if (node.templateId === "prepare") {

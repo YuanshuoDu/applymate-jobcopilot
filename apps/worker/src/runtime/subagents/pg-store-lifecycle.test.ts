@@ -11,6 +11,7 @@ import type { PgSubagentPool } from "./types.js"
 import { TASK_GRAPH_ITEM_TYPE, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId, taskGraphLifecycleKey, taskGraphProposalKey } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { parseTaskGraphVerificationReport, taskGraphVerificationReportMatchesStatus } from "./task-graph-command-port.js"
+import { parseScheduledAuditTaskEnvelope, SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE, SCHEDULED_AUDIT_TEMPLATE_ID } from "./scheduled-audit-contract.js"
 
 function taskRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -215,6 +216,68 @@ function rootRecoveryPool(turnStatus: string | "missing" | "mismatched", rootOve
 }
 
 describe("subagent PostgreSQL lifecycle helpers", () => {
+  it("stores a canonical null verification marker for the exact scheduled Audit result", async () => {
+    const report = { processed: 3, applied: 1, queued: 2, pending: 0, skipped: 0, failed: 0, durationMs: 45 }
+    const forged = { verifierVersion: "worker-supplied", status: "passed" }
+    const rawResult = { finalItemId: null, finalText: "", status: "completed", stepCount: 0, toolCallCount: 0,
+      taskGraphVerificationReport: forged, verificationReport: forged, taskGraphRepairReceipt: forged,
+      taskGraphScheduledPrepareProofFacts: forged, structuredResult: report }
+    const graph = { snapshot: { nodes: [{ key: SCHEDULED_AUDIT_TEMPLATE_ID, templateId: SCHEDULED_AUDIT_TEMPLATE_ID,
+      taskId: "audit-1", verificationDisposition: "specialized" }] } }
+    const transition = vi.spyOn(taskGraphLifecycle, "prepareGraphTransition").mockResolvedValueOnce(graph as never)
+
+    try {
+      const completed = await prepareTaskGraphFinish({ query: vi.fn() } as never, {
+        taskId: "audit-1", sessionId: "session-1", attemptCount: 1, status: "completed", retry: false,
+        taskRole: SCHEDULED_AUDIT_ROLE, taskType: SCHEDULED_AUDIT_TASK_TYPE, result: rawResult,
+      })
+      const persisted = completed.result as Record<string, unknown>
+
+      expect(completed.status).toBe("completed")
+      expect(persisted).toEqual({ finalItemId: null, finalText: "", status: "completed", stepCount: 0, toolCallCount: 0,
+        taskGraphVerificationReport: null, structuredResult: report })
+      expect(parseScheduledAuditTaskEnvelope(persisted, completed.status)).toEqual({ ...persisted, structuredResult: report })
+    } finally { transition.mockRestore() }
+  })
+
+  it.each([
+    { label: "row role", taskRole: "reviewer", taskType: SCHEDULED_AUDIT_TASK_TYPE,
+      node: { key: SCHEDULED_AUDIT_TEMPLATE_ID, templateId: SCHEDULED_AUDIT_TEMPLATE_ID, verificationDisposition: "specialized" } },
+    { label: "row task type", taskRole: SCHEDULED_AUDIT_ROLE, taskType: "ordinary_audit",
+      node: { key: SCHEDULED_AUDIT_TEMPLATE_ID, templateId: SCHEDULED_AUDIT_TEMPLATE_ID, verificationDisposition: "specialized" } },
+    { label: "graph node key", taskRole: SCHEDULED_AUDIT_ROLE, taskType: SCHEDULED_AUDIT_TASK_TYPE,
+      node: { key: "other", templateId: SCHEDULED_AUDIT_TEMPLATE_ID, verificationDisposition: "specialized" } },
+    { label: "graph node template", taskRole: SCHEDULED_AUDIT_ROLE, taskType: SCHEDULED_AUDIT_TASK_TYPE,
+      node: { key: SCHEDULED_AUDIT_TEMPLATE_ID, templateId: "other", verificationDisposition: "specialized" } },
+    { label: "graph task binding", taskRole: SCHEDULED_AUDIT_ROLE, taskType: SCHEDULED_AUDIT_TASK_TYPE,
+      node: { key: SCHEDULED_AUDIT_TEMPLATE_ID, templateId: SCHEDULED_AUDIT_TEMPLATE_ID, taskId: "other-audit", verificationDisposition: "specialized" } },
+    { label: "legacy-unverified disposition", taskRole: SCHEDULED_AUDIT_ROLE, taskType: SCHEDULED_AUDIT_TASK_TYPE,
+      node: { key: SCHEDULED_AUDIT_TEMPLATE_ID, templateId: SCHEDULED_AUDIT_TEMPLATE_ID, verificationDisposition: "legacy_unverified" } },
+    { label: "unrelated specialized node", taskRole: SCHEDULED_AUDIT_ROLE, taskType: SCHEDULED_AUDIT_TASK_TYPE,
+      node: { key: "other", templateId: "other", verificationDisposition: "specialized" } },
+  ])("continues stripping forged metadata for a mismatched $label", async ({ taskRole, taskType, node }) => {
+    const forged = { forged: true }
+    const rawResult = { taskGraphVerificationReport: forged, verificationReport: forged, taskGraphRepairReceipt: forged,
+      taskGraphScheduledPrepareProofFacts: forged, nested: { keep: true, taskGraphVerificationReport: forged,
+        verificationReport: forged, taskGraphRepairReceipt: forged, taskGraphScheduledPrepareProofFacts: forged } }
+    const graph = { snapshot: { nodes: [{ ...node, taskId: "taskId" in node ? node.taskId : "audit-1" }] } }
+    const transition = vi.spyOn(taskGraphLifecycle, "prepareGraphTransition").mockResolvedValueOnce(graph as never)
+
+    try {
+      const completed = await prepareTaskGraphFinish({ query: vi.fn() } as never, {
+        taskId: "audit-1", sessionId: "session-1", attemptCount: 1, status: "completed", retry: false,
+        taskRole, taskType, result: rawResult,
+      })
+      const persisted = completed.result as Record<string, unknown>
+
+      expect(persisted).not.toHaveProperty("taskGraphVerificationReport")
+      expect(persisted).not.toHaveProperty("verificationReport")
+      expect(persisted).not.toHaveProperty("taskGraphRepairReceipt")
+      expect(persisted).not.toHaveProperty("taskGraphScheduledPrepareProofFacts")
+      expect(persisted.nested).toEqual({ keep: true })
+    } finally { transition.mockRestore() }
+  })
+
   it("persists a Gate question only through the exact specialized waiting envelope", async () => {
     const snapshot = { nodes: [{ key: "gate", templateId: "gate", taskId: "gate-1" }] }
     const graph = { scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" },

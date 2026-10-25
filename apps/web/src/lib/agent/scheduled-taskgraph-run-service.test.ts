@@ -10,10 +10,10 @@ const mocks = vi.hoisted(() => ({ analyze: vi.fn(), scoreOwner: vi.fn(), ownerCu
   gateMaterials: vi.fn(), taskRows: vi.fn(), useActualGateInput: false, useActualGateCheckpoint: false, events: vi.fn(), steps: vi.fn(), items: vi.fn() }))
 vi.mock("@/lib/db", () => ({ db: { agentEvent: { findMany: mocks.events }, agentStep: { findFirst: mocks.steps }, agentItem: { findFirst: mocks.items },
   subAgentTask: { findMany: mocks.taskRows } } }))
-vi.mock("./scheduled-taskgraph-analysis-journal", () => ({
-  runScheduledTaskGraphAnalyze: mocks.analyze,
-  scheduledTaskGraphScoreOwnerIsCurrent: mocks.scoreOwner,
-}))
+vi.mock("./scheduled-taskgraph-analysis-journal", async importOriginal => {
+  const actual = await importOriginal<typeof import("./scheduled-taskgraph-analysis-journal")>()
+  return { ...actual, runScheduledTaskGraphAnalyze: mocks.analyze, scheduledTaskGraphScoreOwnerIsCurrent: mocks.scoreOwner }
+})
 vi.mock("./scheduled-taskgraph-pipeline-fence", async importOriginal => {
   const actual = await importOriginal<typeof import("./scheduled-taskgraph-pipeline-fence")>()
   return { ...actual, isScheduledTaskGraphOwnerCurrent: mocks.ownerCurrent, saveScheduledTaskGraphCheckpoint: mocks.save }
@@ -368,5 +368,92 @@ describe("runScheduledTaskGraphAnalyzeOnly", () => {
     })
     expect(serialized?.scheduledTaskGraphGateDecisions).toEqual({ approvedJobIds: [], pendingJobIds: [job.id], skippedJobIds: [] })
     expect(JSON.stringify(serialized)).not.toContain("private-letter-body")
+  })
+
+  it("compares persisted prepared artifacts canonically while preserving content and array order", async () => {
+    const { buildScheduledTaskGraphGateResumeState } = await import("./scheduled-taskgraph-run-service")
+    const artifactRefs = [
+      { jobId: job.id, kind: "resume" as const, artifactRef: { artifactId: "artifact_1", version: 3,
+        contentHash: "sha256:" + "1".repeat(64), sourceDigest: "sha256:" + "2".repeat(64) } },
+      { jobId: job.id, kind: "cover_letter" as const, artifactRef: { artifactId: "artifact_2", version: 4,
+        contentHash: "sha256:" + "3".repeat(64), sourceDigest: "sha256:" + "4".repeat(64) } },
+    ]
+    mocks.gateInput.mockResolvedValue({
+      packages: [{ userId: owner.userId, sessionId: owner.sessionId, jobId: job.id, package: { job: { id: job.id } } as never }],
+      materials: artifactRefs.map(row => ({ userId: owner.userId, sessionId: owner.sessionId, ...row })),
+    })
+    const persisted = { ...buildScheduledTaskGraphPrepareCheckpoint({ owner, snapshot, attestation: baseAttestation,
+      ownedJobs: [job], analyzeResult: analysis, existingCheckpoint: initialState }).checkpoint,
+      scheduledTaskGraphClaim: initialState.scheduledTaskGraphClaim,
+      scheduledTaskGraphPreparedArtifacts: [
+        { artifactRef: { sourceDigest: artifactRefs[0]!.artifactRef.sourceDigest, version: 3, artifactId: "artifact_1",
+          contentHash: artifactRefs[0]!.artifactRef.contentHash }, kind: "resume", jobId: job.id },
+        { artifactRef: { version: 4, sourceDigest: artifactRefs[1]!.artifactRef.sourceDigest, contentHash: artifactRefs[1]!.artifactRef.contentHash,
+          artifactId: "artifact_2" }, jobId: job.id, kind: "cover_letter" },
+      ],
+    }
+    const resume = (persistedCheckpoint: unknown) => buildScheduledTaskGraphGateResumeState({ owner, snapshot,
+      attestation: baseAttestation, continuationKey: key, claimToken, ownedJobs: [job], persistedCheckpoint,
+      prepareProof: workerPrepareProof() })
+
+    await expect(resume(persisted)).resolves.toMatchObject({ scheduledTaskGraphPreparedArtifacts: artifactRefs })
+    await expect(resume({ ...persisted, scheduledTaskGraphPreparedArtifacts: artifactRefs.map((row, index) => index === 0
+      ? { ...row, artifactRef: { ...row.artifactRef, contentHash: "sha256:" + "9".repeat(64) } } : row) }))
+      .rejects.toBeInstanceOf(Error)
+    await expect(resume({ ...persisted, scheduledTaskGraphPreparedArtifacts: artifactRefs.map((row, index) => index === 0
+      ? { ...row, jobId: "other_job" } : row) })).rejects.toBeInstanceOf(Error)
+    await expect(resume({ ...persisted, scheduledTaskGraphPreparedArtifacts: [...artifactRefs].reverse() })).rejects.toBeInstanceOf(Error)
+  })
+
+  it("compares persisted Gate decisions canonically in resume and serialization", async () => {
+    const { buildScheduledTaskGraphGateResumeState, serializeScheduledTaskGraphCheckpoint } = await import("./scheduled-taskgraph-run-service")
+    const secondJob = { id: "job_2", userId: owner.userId } as Job
+    const secondScore = { ...score, job: secondJob }
+    const attestation = { ...baseAttestation,
+      scout: { ...baseAttestation.scout, candidateJobIds: [job.id, secondJob.id],
+        discoveryReceipt: { ...baseAttestation.scout.discoveryReceipt, candidateCount: 2 } },
+      analyst: { ...baseAttestation.analyst, jobIds: [job.id, secondJob.id] },
+    }
+    const continuationKey = scheduledTaskGraphContinuationKey(owner, attestation)
+    const analysisForJobs = { ...analysis, data: { ...analysis.data, scoredJobs: [score, secondScore] },
+      metrics: { ...analysis.metrics, count: 2 } }
+    const checkpoint = buildScheduledTaskGraphPrepareCheckpoint({ owner, snapshot, attestation, ownedJobs: [job, secondJob],
+      analyzeResult: analysisForJobs, existingCheckpoint: { ...initialState,
+        scheduledTaskGraphClaim: { ...initialState.scheduledTaskGraphClaim, key: continuationKey } } }).checkpoint
+    const jobIds = [job.id, secondJob.id]
+    const packages = [job, secondJob].map(row => ({ userId: owner.userId, sessionId: owner.sessionId, jobId: row.id,
+      package: { job: { id: row.id }, coverLetter: null } as never }))
+    const materials = jobIds.map((jobId, index) => ({ userId: owner.userId, sessionId: owner.sessionId, jobId, kind: "resume" as const,
+      artifactRef: { artifactId: `artifact_${index + 1}`, version: index + 1, contentHash: `sha256:${String(index + 1).repeat(64)}`,
+        sourceDigest: `sha256:${String(index + 3).repeat(64)}` } }))
+    const expectedDecisions = { approvedJobIds: jobIds, pendingJobIds: [] as string[], skippedJobIds: [] as string[] }
+    const reorderedKeys = { skippedJobIds: [], approvedJobIds: jobIds, pendingJobIds: [] }
+    mocks.gateInput.mockResolvedValue({ packages, materials, gateResult: { status: "completed", ...expectedDecisions } })
+    mocks.gateCheckpoint.mockImplementation(({ analyze }: { analyze: { persistedCheckpoint: Record<string, unknown> } }) => ({
+      checkpoint: { ...analyze.persistedCheckpoint, nextStage: "gate" }, packages: packages.map(row => row.package),
+    }))
+    const prepareProof = workerPrepareProof()
+    const gateCompletionProof = { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1", graphRevision: 12,
+      prepareProof, gate: { taskId: "gate_1", attemptCount: 1, resultDigest: "sha256:" + "5".repeat(64), completedEventRevision: 12 } }
+    const persisted = { ...checkpoint, nextStage: "gate" as const, scheduledTaskGraphClaim: { ...initialState.scheduledTaskGraphClaim, key: continuationKey },
+      scheduledTaskGraphPreparedArtifacts: materials.map(({ jobId, kind, artifactRef }) => ({ jobId, kind, artifactRef })),
+      scheduledTaskGraphGateDecisions: reorderedKeys }
+    const resume = (scheduledTaskGraphGateDecisions: unknown) => buildScheduledTaskGraphGateResumeState({ owner, snapshot, attestation,
+      continuationKey, claimToken, ownedJobs: [job, secondJob], persistedCheckpoint: { ...persisted, scheduledTaskGraphGateDecisions },
+      prepareProof, gateCompletionProof })
+
+    const resumed = await resume(reorderedKeys)
+    expect(resumed.scheduledTaskGraphGateDecisions).toEqual(expectedDecisions)
+    expect(resumed.gateOutput?.approved.map(pkg => pkg.job.id)).toEqual(jobIds)
+    await expect(resume({ ...reorderedKeys, approvedJobIds: [job.id, "different_job"] })).rejects.toBeInstanceOf(Error)
+    await expect(resume({ ...reorderedKeys, approvedJobIds: [...jobIds].reverse() })).rejects.toBeInstanceOf(Error)
+
+    const serializerInput = { nextStage: "execute", scheduledTaskGraphGateDecisions: reorderedKeys,
+      gateOutput: { approved: packages.map(row => row.package), pending: [], skipped: [] } }
+    expect(serializeScheduledTaskGraphCheckpoint(serializerInput as never)?.scheduledTaskGraphGateDecisions).toEqual(expectedDecisions)
+    expect(serializeScheduledTaskGraphCheckpoint({ ...serializerInput,
+      scheduledTaskGraphGateDecisions: { ...reorderedKeys, approvedJobIds: [job.id, "different_job"] } } as never)).toBeNull()
+    expect(serializeScheduledTaskGraphCheckpoint({ ...serializerInput,
+      scheduledTaskGraphGateDecisions: { ...reorderedKeys, approvedJobIds: [...jobIds].reverse() } } as never)).toBeNull()
   })
 })

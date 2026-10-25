@@ -465,7 +465,8 @@ jobs:
           test "$AGENT_TURN_REDIS_TEST_URL" = "redis://127.0.0.1:6379/15"
           test "$REDIS_URL" = "$AGENT_TURN_REDIS_TEST_URL"
           pnpm --filter @jobcopilot/worker exec vitest run --no-file-parallelism \
-            src/runtime/subagents/scheduled-automation-pipeline-pg.integration.test.ts
+            src/runtime/subagents/scheduled-automation-pipeline-pg.integration.test.ts \
+            src/runtime/subagents/scheduled-audit-task-graph-pg.integration.test.ts
       - name: Verify scheduled Gate questions across real Worker restarts on disposable PostgreSQL and Redis
         env:
           CI: "true"

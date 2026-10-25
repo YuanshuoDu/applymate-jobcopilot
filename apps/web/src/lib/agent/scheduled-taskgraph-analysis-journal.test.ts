@@ -4,7 +4,8 @@ import { AgentExecutionCancelledError } from './execution-control'
 import { scheduledAutomationSnapshotDigest, scheduledTaskGraphContinuationKey, type ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 import { AnalyzeRecoveryPersistenceError, runAnalyze } from './stages/analyze'
 import type { AnalyzeOutput, PipelineCheckpointState, PipelineCtx, ScoredJob, StageResult } from './types'
-import { rebindScheduledTaskGraphAnalysisJournalForLease, runScheduledTaskGraphAnalyze, scheduledTaskGraphScoreOwnerIsCurrent } from './scheduled-taskgraph-analysis-journal'
+import { createScheduledTaskGraphAuditChildOwnerFence, rebindScheduledTaskGraphAnalysisJournalForLease,
+  runScheduledTaskGraphAnalyze, scheduledTaskGraphScoreOwnerIsCurrent } from './scheduled-taskgraph-analysis-journal'
 
 const gateFence = vi.hoisted(() => ({ proof: vi.fn() }))
 vi.mock('./stages/analyze', async importOriginal => ({
@@ -326,5 +327,36 @@ describe('runScheduledTaskGraphAnalyze', () => {
 
     await expect(scheduledTaskGraphScoreOwnerIsCurrent({ tx, owner, key, claimToken })).resolves.toBe(false)
     expect(queryRaw).toHaveBeenCalledTimes(4)
+  })
+
+  it('provides a transaction callback that fences the live Audit actor and its persisted claim', async () => {
+    const auditActor = { taskId: 'audit-task', attemptCount: 2, leaseOwner: 'audit-worker-2' }
+    const rows: unknown[][] = [
+      [{ id: owner.sessionId, status: 'running' }], [],
+      [{ id: owner.turnId, userId: owner.userId, sessionId: owner.sessionId, rootTaskId: owner.rootTaskId,
+        source: 'automation', executionMode: 'canonical_task_graph', input: { automationRunMode: 'scheduled' }, status: 'waiting_for_dependency',
+        leaseOwnerId: null, leaseExpiresAt: null, leaseStartedAt: null, terminalEventSequence: null, terminalEventAt: null }],
+      [{ id: owner.rootTaskId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+        parentTaskId: null, status: 'waiting', attemptCount: owner.rootAttemptCount, role: 'orchestrator', taskType: 'root',
+        failureReason: null, interruptRequestedAt: null, closedAt: null }],
+      [{ id: auditActor.taskId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+        parentTaskId: owner.rootTaskId, depth: 1, role: 'auditor', taskType: 'scheduled_taskgraph_audit', status: 'running',
+        attemptCount: auditActor.attemptCount, maxAttempts: 3, leaseOwner: auditActor.leaseOwner, leaseExpiresAt: new Date(),
+        interruptRequestedAt: null, closedAt: null, failureReason: null, context: {},
+        expectedOutputSchema: { schemaVersion: 'agent-harness.v2.subagent.result', role: 'auditor', taskType: 'scheduled_taskgraph_audit' },
+        allowedActions: [], hasLiveLease: true }],
+      [{ id: 'dispatch-event' }],
+      [{ id: owner.executionId, status: 'running', attemptCount: owner.executionAttemptCount,
+        state: initialState() }],
+    ]
+    const queryRaw = vi.fn(async (_statement: unknown) => rows.shift() ?? [])
+    const tx = { $queryRaw: queryRaw } as unknown as Prisma.TransactionClient
+    const assertOwnerCurrent = createScheduledTaskGraphAuditChildOwnerFence({ owner, auditActor, key, claimToken })
+
+    await expect(assertOwnerCurrent(tx)).resolves.toBe(true)
+
+    expect(queryRaw).toHaveBeenCalledTimes(7)
+    expect(queryRaw.mock.calls.map(([query]) => (query as { sql: string }).sql.match(/FROM "([^"]+)"/)?.[1]))
+      .toEqual(['agent_sessions', 'agent_events', 'agent_turns', 'sub_agent_tasks', 'sub_agent_tasks', 'agent_outbox', 'agent_executions'])
   })
 })

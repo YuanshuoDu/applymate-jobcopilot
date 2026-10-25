@@ -6,6 +6,7 @@ import { persistGraphTransition, prepareGraphTransition } from "./task-graph-pg-
 import { PAUSE_DEFERRED_MARKER, parseSubagentJobPayload, type PgSubagentPool, type SubagentJobPayload, type SubagentPolicy, type SubagentTaskRecord } from "./types.js"
 import { parseSubagentDispatchIdentity, SubagentDispatchIdentityMismatchError, type SubagentDispatchIdentity } from "./dispatch-identity.js"
 import { SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
+import { SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE } from "./scheduled-audit-contract.js"
 import { hasScheduledGateResumeAcknowledgement } from "./scheduled-gate-resume-admission.js"
 
 type ClaimInput = { taskId: string; sessionId: string; ownerId: string; rootTaskId?: string; policy: SubagentPolicy; now: Date; dispatchIdentity?: SubagentDispatchIdentity }
@@ -111,6 +112,7 @@ export async function claimSubagentTask(pool: PgSubagentPool, input: ClaimInput,
     const taskRow = task.rows[0] as Record<string, unknown> | undefined
     if (!taskRow || taskRow.turnId !== turnId || taskRow.rootTaskId !== rootTaskId
       || taskRow.status !== "queued" || taskRow.interruptRequestedAt != null) return null
+    const scheduledAudit = taskRow.role === SCHEDULED_AUDIT_ROLE && taskRow.taskType === SCHEDULED_AUDIT_TASK_TYPE
 
     const dispatch = await client.query<{ id: string; payload: unknown; lastError: string | null; attemptCount: unknown; publishedAt: unknown }>(`SELECT dispatch."id", dispatch."payload", dispatch."lastError", dispatch."attemptCount", dispatch."publishedAt"
       FROM "agent_outbox" AS dispatch WHERE dispatch."topic" = 'agent.subagent.dispatch'
@@ -148,6 +150,7 @@ export async function claimSubagentTask(pool: PgSubagentPool, input: ClaimInput,
     const updated = await client.query(`UPDATE "sub_agent_tasks" AS task
       SET "status" = 'running', "leaseOwner" = $3, "leaseExpiresAt" = clock_timestamp() + ($4 * INTERVAL '1 millisecond'),
         "attemptCount" = CASE WHEN $8::boolean AND ${CHILD_WAIT_RESUMABLE_SQL} THEN "attemptCount" ELSE "attemptCount" + 1 END,
+        "failureReason" = CASE WHEN $10::boolean AND NOT ($8::boolean AND ${CHILD_WAIT_RESUMABLE_SQL}) THEN NULL ELSE "failureReason" END,
         "startedAt" = COALESCE("startedAt", clock_timestamp()), "updatedAt" = clock_timestamp()
       WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $5 AND "rootTaskId" = $6
         AND "status" = 'queued' AND "interruptRequestedAt" IS NULL
@@ -158,7 +161,7 @@ export async function claimSubagentTask(pool: PgSubagentPool, input: ClaimInput,
         AND EXISTS (SELECT 1 FROM "sub_agent_tasks" root WHERE root."id" = $6 AND root."sessionId" = $2
           AND root."turnId" = $5 AND root."interruptRequestedAt" IS NULL
           AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed'))`,
-    [input.taskId, input.sessionId, input.ownerId, leaseMs, turnId, rootTaskId, userId, currentDispatchIdentity, scheduledGateResume])
+    [input.taskId, input.sessionId, input.ownerId, leaseMs, turnId, rootTaskId, userId, currentDispatchIdentity, scheduledGateResume, scheduledAudit])
     if (updated.rowCount !== 1) return null
     if (graph) await persistGraphTransition(client, graph, input.now)
     return readSubagentTask(client, input.taskId, input.sessionId)

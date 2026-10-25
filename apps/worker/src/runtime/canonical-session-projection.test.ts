@@ -73,7 +73,7 @@ describe("canonical automation session projection", () => {
   it.each([
     ["completed", "completed", "failure-code"],
     ["failed", "failed", "failure-code"],
-    ["waiting_for_dependency", "paused", "failure-code"],
+    ["waiting_for_dependency", "running", "failure-code"],
     ["waiting_for_user", "waiting_for_user", "failure-code"],
     ["waiting_for_approval", "waiting_for_user", "failure-code"],
     ["interrupted", "paused", "failure-code"],
@@ -85,6 +85,20 @@ describe("canonical automation session projection", () => {
     expect(call.params?.slice(0, 4)).toEqual(["user-1", "session-1", "turn-1", expectedStatus])
     expect(call.params?.[4]).toBe(expectedStatus === "failed" ? errorCode : null)
     expect(call.sql).toContain('"completedAt" = CASE WHEN $4 IN (\'completed\', \'failed\') THEN CURRENT_TIMESTAMP ELSE NULL END')
+  })
+
+  it("keeps descendant work runnable while a canonical Turn waits for dependencies", async () => {
+    const fake = fakePool()
+    await createCanonicalSessionProjection(fake.pool).finish({ ...identity, result: { status: "waiting_for_dependency" } })
+
+    const call = update(fake)
+    expect(call.params?.slice(0, 4)).toEqual(["user-1", "session-1", "turn-1", "running"])
+    expect(call.params?.[4]).toBeNull()
+    expect(call.sql).toContain('automation_session."source" = \'automation\'')
+    expect(call.sql).toContain('newer_turn."createdAt" > turn."createdAt"')
+    expect(call.sql).toContain(`session."status" IN ('queued', 'running')`)
+    expect(call.sql).toContain('pause_request."type" = \'session.pause_requested\'')
+    expect(call.sql).toContain('resumed."sequence" > pause_request."sequence"')
   })
 
   it("preserves cancelled, aborted, and terminal sessions through conditional status guards", async () => {

@@ -263,7 +263,7 @@ describe("parseTaskGraphSnapshot", () => {
     }
   })
 
-  it("round-trips unsupported legacy templates but limits new specialized nodes to Writer and Reviewer", () => {
+  it("round-trips unsupported legacy templates but limits new specialized nodes to registered templates", () => {
     const unknownLegacy = storedNode("old-custom")
     unknownLegacy.templateId = "custom_agent"
     const legacySnapshot = parseTaskGraphSnapshot(snapshotWithNodes([unknownLegacy]))
@@ -288,7 +288,7 @@ describe("parseTaskGraphSnapshot", () => {
       .toThrow("task_graph_snapshot_template_unsupported")
   })
 
-  it("keeps Writer, Reviewer, and the fixed Prepare template on specialized verification paths", () => {
+  it("keeps Writer, Reviewer, Prepare, and fixed Audit templates on specialized verification paths", () => {
     const state: TaskGraphState = {
       revision: 1,
       nodes: [{
@@ -300,20 +300,32 @@ describe("parseTaskGraphSnapshot", () => {
       }, {
         key: "prepare", templateId: "prepare", goal: "Prepare scheduled materials",
         successCriteria: ["Persist safe artifact references"], dependsOn: [], depth: 1, status: "queued",
+      }, {
+        key: "gate", templateId: "gate", goal: "Authorize scheduled apply",
+        successCriteria: ["Approve safe applications"], dependsOn: ["prepare"], depth: 4, status: "queued",
+      }, {
+        key: "scheduled_audit", templateId: "scheduled_audit", goal: "Run fixed scheduled Audit",
+        successCriteria: ["Return exact report"], dependsOn: ["gate"], depth: 5, status: "queued",
       }],
       appliedEvents: [],
     }
-    const snapshot = taskGraphSnapshot(state, new Map([["writer", "task-writer"], ["reviewer", "task-reviewer"], ["prepare", "task-prepare"]]))
+    const snapshot = taskGraphSnapshot(state, new Map([["writer", "task-writer"], ["reviewer", "task-reviewer"], ["prepare", "task-prepare"],
+      ["gate", "task-gate"], ["scheduled_audit", "task-audit"]]))
 
     expect(snapshot.nodes).toMatchObject([
       { key: "writer", verificationDisposition: "specialized" },
       { key: "reviewer", verificationDisposition: "specialized" },
       { key: "prepare", verificationDisposition: "specialized" },
+      { key: "gate", verificationDisposition: "specialized" },
+      { key: "scheduled_audit", verificationDisposition: "specialized" },
     ])
     expect(snapshot.nodes.every(node => !Object.hasOwn(node, "verification"))).toBe(true)
     expect(parseTaskGraphSnapshot(snapshot)).toEqual(snapshot)
     expect(() => parseTaskGraphSnapshot(snapshotWithNodes([{
       ...storedNode("invalid-prepare"), templateId: "prepare", verification: analystVerification, verificationDisposition: "typed",
+    }]))).toThrow("task_graph_snapshot_verification_invalid")
+    expect(() => parseTaskGraphSnapshot(snapshotWithNodes([{
+      ...storedNode("invalid-audit"), templateId: "scheduled_audit", verification: analystVerification, verificationDisposition: "typed",
     }]))).toThrow("task_graph_snapshot_verification_invalid")
   })
 

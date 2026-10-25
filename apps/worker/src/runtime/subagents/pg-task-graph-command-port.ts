@@ -26,9 +26,13 @@ import { requireNormalizedRootPlanCriteria, requireOwnedRootPlanCriteria, requir
 import { appendScheduledPrepare as appendScheduledPrepareCommand } from "./pg-scheduled-task-graph-prepare-command.js"
 import { appendScheduledGate as appendScheduledGateCommand } from "./pg-scheduled-task-graph-gate-command.js"
 import { resumeScheduledGateChoice as resumeScheduledGateChoiceCommand } from "./pg-scheduled-task-graph-gate-resume.js"
-import { verifyScheduledGateCompletion as verifyScheduledGateCompletionCommand } from "./pg-scheduled-task-graph-gate-verification.js"
+import { appendScheduledAudit as appendScheduledAuditCommand,
+  verifyScheduledAuditCompletion as verifyScheduledAuditCompletionCommand,
+  readScheduledAuditInvocationProof as readScheduledAuditInvocationProofCommand,
+  verifyScheduledGateCompletionWithAuditReplay as verifyScheduledGateCompletionCommand } from "./pg-scheduled-task-graph-audit-command.js"
+import { readScheduledAuditResumeContext as readScheduledAuditResumeContextCommand } from "./scheduled-audit-resume.js"
+import { SCHEDULED_AUDIT_TEMPLATE_ID } from "./scheduled-audit-contract.js"
 import { scheduleTaskGraphBranchOperation } from "./task-graph-pg-failed-branch-repair.js"
-
 const MAX_REVISION = 2_147_483_646
 type Row = Record<string, unknown>
 type LoadedCurrentGraph = Awaited<ReturnType<typeof loadTaskGraph>> & Readonly<{ rootSuccessCriteria?: readonly string[] }>
@@ -49,6 +53,18 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
     },
     async verifyScheduledGateCompletion(input) {
       return transaction(pool, client => verifyScheduledGateCompletionCommand(client, input))
+    },
+    async appendScheduledAudit(input) {
+      return transaction(pool, client => appendScheduledAuditCommand(client, input))
+    },
+    async verifyScheduledAuditCompletion(input) {
+      return transaction(pool, client => verifyScheduledAuditCompletionCommand(client, input))
+    },
+    async readScheduledAuditInvocationProof(input) {
+      return transaction(pool, client => readScheduledAuditInvocationProofCommand(client, input))
+    },
+    async readScheduledAuditResumeContext(input) {
+      return transaction(pool, client => readScheduledAuditResumeContextCommand(client, input))
     },
     async appendAndScheduleWithReconciliation(input, operation) {
       return transaction(pool, client => schedule(client, input, operation))
@@ -163,6 +179,9 @@ async function schedule(client: Queryable, input: TaskGraphScheduleInput, operat
   return receipt
 }
 function rejectPrivateScheduledGate(proposal: TaskGraphScheduleInput["proposal"]): void {
+  if (proposal.nodes.some(node => node.key === SCHEDULED_AUDIT_TEMPLATE_ID || node.templateId === SCHEDULED_AUDIT_TEMPLATE_ID)) {
+    throw new TaskGraphCommandError("scheduled_audit_private", "The scheduled Audit is available only through its fixed server command")
+  }
   if (proposal.nodes.some(node => node.key === "gate" || node.templateId === "gate")) {
     throw new TaskGraphCommandError("scheduled_gate_private", "The scheduled Gate is available only through its fixed server command")
   }

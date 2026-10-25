@@ -282,7 +282,7 @@ function sameLiveLease(row: Row, lease: SubagentLease, now: Date): boolean {
     && row.interruptRequestedAt == null && expiry.getTime() > now.getTime() && lease.leaseExpiresAt.getTime() > now.getTime()
 }
 function active(value: unknown): boolean { return ["queued", "running", "retrying", "waiting", "waiting_for_user", "waiting_for_tool", "waiting_for_dependency", "waiting_for_approval", "in_progress"].includes(String(value)) }
-function scheduledQuestionWaitId(turnInput: unknown, checkpoint: unknown, turnId: string): string | undefined | null {
+export function scheduledQuestionWaitId(turnInput: unknown, checkpoint: unknown, turnId: string): string | undefined | null {
   const snapshot = parseScheduledAutomationSnapshot(record(turnInput)?.scheduledAutomationSnapshot), state = record(checkpoint)
   const waitId = state?.scheduledTaskGraphScheduledWaitId
   if (!snapshot || waitId !== undefined && !validId(waitId)) return null

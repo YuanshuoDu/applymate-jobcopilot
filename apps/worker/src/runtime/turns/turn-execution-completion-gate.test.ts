@@ -3,7 +3,9 @@ import { describe, expect, it, vi } from "vitest"
 import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
 import type { TurnEngineStep } from "./turn-engine-types.js"
 import type { TurnExecutionOptions } from "./turn-execution-types.js"
-import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, RESET_NATIVE_SEMANTIC_PROGRESS, SCHEDULED_PIPELINE_COMPLETION, TASK_GRAPH_DENIAL_CHECKPOINT, type TurnEngineCompletionGate } from "./turn-execution-types.js"
+import { NATIVE_SEMANTIC_NO_PROGRESS, NATIVE_SEMANTIC_REJECTION, RESET_NATIVE_SEMANTIC_PROGRESS,
+  SCHEDULED_PIPELINE_COMPLETION, SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME, TASK_GRAPH_DENIAL_CHECKPOINT,
+  type TurnEngineCompletionGate } from "./turn-execution-types.js"
 import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
 import { assertCompletionAllowed, checkTaskGraphTerminalVerification, completionRecoverySnapshot, repairReportState, TASK_GRAPH_VERIFICATION_BLOCKER } from "./turn-execution-completion-gate.js"
 import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "../subagents/task-graph-pg-verification.js"
@@ -99,10 +101,118 @@ describe("assertCompletionAllowed", () => {
     const completionGate: TurnEngineCompletionGate = async () => ({ ok: false, blocker: "child_tasks_pending", feedback: "Children still run" })
     const continuation = vi.fn(async () => ({ status: "completed" as const, candidateText: "answer" }))
     completionGate[SCHEDULED_PIPELINE_COMPLETION] = continuation
+    const auditResume = vi.fn(async () => ({ status: "not_applicable" as const }))
+    completionGate[SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME] = auditResume
 
     await expect(assertCompletionAllowed(gateOptions(completionGate), gateWriter(), step, new AbortController().signal, () => nowValue, "answer"))
       .rejects.toMatchObject({ code: "business_precondition_failed" })
     expect(continuation).not.toHaveBeenCalled()
+    expect(auditResume).toHaveBeenCalledOnce()
+  })
+
+  it("returns only the exact Audit wait for a validated child-pending denial", async () => {
+    const signal = new AbortController().signal
+    const completionGate: TurnEngineCompletionGate = async () => ({
+      ok: false, blocker: "child_tasks_pending", feedback: "Audit child is still running",
+    })
+    const auditResume = vi.fn(async input => {
+      expect(input).toMatchObject({ identity, rootTaskId: identity.rootTaskId, stepId: step.id,
+        stepOrdinal: step.ordinal, candidateText: "candidate", signal, now: nowValue })
+      return { status: "waiting_for_dependency" as const, waitId: "audit-wait-current" }
+    })
+    const regularCompletion = vi.fn(async () => ({ status: "completed" as const, candidateText: "candidate" }))
+    completionGate[SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME] = auditResume
+    completionGate[SCHEDULED_PIPELINE_COMPLETION] = regularCompletion
+    const writer = gateWriter()
+
+    await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, signal, () => nowValue, "candidate"))
+      .resolves.toEqual({ waitId: "audit-wait-current" })
+    expect(auditResume).toHaveBeenCalledOnce()
+    expect(regularCompletion).not.toHaveBeenCalled()
+    expect(writer.append).not.toHaveBeenCalled()
+  })
+
+  it("rejects an Audit wait whose durable ID fails the strict disposition parser", async () => {
+    const completionGate: TurnEngineCompletionGate = async () => ({
+      ok: false, blocker: "child_tasks_pending", feedback: "Audit child is still running",
+    })
+    const auditResume = vi.fn(async () => ({ status: "waiting_for_dependency" as const, waitId: " " }))
+    completionGate[SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME] = auditResume
+    const writer = gateWriter()
+
+    await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, new AbortController().signal, () => nowValue, "candidate"))
+      .rejects.toMatchObject({ code: "invalid_output", message: "Scheduled Audit resume returned an invalid disposition" })
+    expect(auditResume).toHaveBeenCalledOnce()
+    expect(writer.append).not.toHaveBeenCalled()
+  })
+
+  it("does not invoke Audit resume for a malformed denial", async () => {
+    // Intentionally omit feedback to exercise fail-closed validation before the Audit callback.
+    const malformedGate: unknown = async () => ({ ok: false, blocker: "child_tasks_pending" })
+    const completionGate = malformedGate as TurnEngineCompletionGate
+    const auditResume = vi.fn(async () => ({ status: "completed" as const }))
+    completionGate[SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME] = auditResume
+    const writer = gateWriter()
+
+    await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, new AbortController().signal, () => nowValue, "candidate"))
+      .rejects.toMatchObject({ code: "invalid_output" })
+    expect(auditResume).not.toHaveBeenCalled()
+    expect(writer.append).not.toHaveBeenCalled()
+  })
+
+  it("does not resume Audit for a different business blocker", async () => {
+    const completionGate: TurnEngineCompletionGate = async () => ({
+      ok: false, blocker: "account_policy_denied", feedback: "This action is not permitted",
+    })
+    const auditResume = vi.fn(async () => ({ status: "completed" as const }))
+    completionGate[SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME] = auditResume
+
+    await expect(assertCompletionAllowed(gateOptions(completionGate), gateWriter(), step, new AbortController().signal, () => nowValue, "candidate"))
+      .rejects.toMatchObject({ code: "business_precondition_failed", message: "account_policy_denied" })
+    expect(auditResume).not.toHaveBeenCalled()
+  })
+
+  it("rechecks the canonical gate once after Audit completes and still requires normal private completion", async () => {
+    let gateCalls = 0
+    const completionGate: TurnEngineCompletionGate = async () => {
+      gateCalls += 1
+      return gateCalls === 1
+        ? { ok: false, blocker: "child_tasks_pending", feedback: "Audit child is still running" }
+        : { ok: true }
+    }
+    const auditResume = vi.fn(async () => ({ status: "completed" as const }))
+    const normalCompletion = vi.fn(async () => ({ status: "blocked" as const, errorCode: "scheduled_audit_completion_unverified" }))
+    completionGate[SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME] = auditResume
+    completionGate[SCHEDULED_PIPELINE_COMPLETION] = normalCompletion
+    const writer = gateWriter()
+
+    await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, new AbortController().signal, () => nowValue, "candidate"))
+      .resolves.toEqual({ scheduledBlocker: "scheduled_audit_completion_unverified" })
+    expect(gateCalls).toBe(2)
+    expect(auditResume).toHaveBeenCalledOnce()
+    expect(normalCompletion).toHaveBeenCalledOnce()
+    expect(writer.append).not.toHaveBeenCalled()
+  })
+
+  it("does not publish or retry Audit resume when the one canonical recheck still denies", async () => {
+    let gateCalls = 0
+    const completionGate: TurnEngineCompletionGate = async () => {
+      gateCalls += 1
+      return { ok: false, blocker: "child_tasks_pending", feedback: gateCalls === 1 ? "Audit child is still running" : "Audit is still pending" }
+    }
+    const auditResume = vi.fn(async () => ({ status: "completed" as const }))
+    const normalCompletion = vi.fn(async () => ({ status: "completed" as const, candidateText: "candidate" }))
+    completionGate[SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME] = auditResume
+    completionGate[SCHEDULED_PIPELINE_COMPLETION] = normalCompletion
+    const writer = gateWriter()
+
+    await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, new AbortController().signal, () => nowValue, "candidate"))
+      .rejects.toMatchObject({ code: "business_precondition_failed", message: "child_tasks_pending" })
+    expect(gateCalls).toBe(2)
+    expect(auditResume).toHaveBeenCalledOnce()
+    expect(normalCompletion).not.toHaveBeenCalled()
+    expect(writer.append).toHaveBeenCalledTimes(1)
+    expect(writer.append).toHaveBeenCalledWith("final.rejected", step.id, null, expect.objectContaining({ blocker: "child_tasks_pending" }), `final-rejected:${step.id}`)
   })
 
   it("returns a typed blocker without fabricating a durable user wait", async () => {
@@ -120,6 +230,20 @@ describe("assertCompletionAllowed", () => {
 
     await expect(assertCompletionAllowed(gateOptions(completionGate), gateWriter(), step, new AbortController().signal, () => nowValue, "answer"))
       .rejects.toBe(retry)
+  })
+
+  it("preserves an ownership-loss denial without invoking Audit resume", async () => {
+    const lost = Object.assign(new Error("Turn ownership was lost"), { code: "turn_lease_lost" })
+    const completionGate: TurnEngineCompletionGate = async () => { throw lost }
+    const auditResume = vi.fn(async () => ({ status: "completed" as const }))
+    completionGate[SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME] = auditResume
+    const isOwnershipLost = vi.fn((error: unknown) => error === lost)
+    const options = { ...gateOptions(completionGate), isOwnershipLost }
+
+    await expect(assertCompletionAllowed(options, gateWriter(), step, new AbortController().signal, () => nowValue, "candidate"))
+      .rejects.toBe(lost)
+    expect(isOwnershipLost).toHaveBeenCalledWith(lost, expect.anything())
+    expect(auditResume).not.toHaveBeenCalled()
   })
 
   it("keeps TaskGraph repair guidance and gives steering a distinct recovery instruction", () => {
@@ -279,15 +403,20 @@ describe("assertCompletionAllowed", () => {
 
   it("returns only redacted steering recovery feedback and resets semantic progress", async () => {
     const reset = vi.fn()
-    const completionGate = Object.assign(vi.fn(async () => ({
+    const rawCompletionGate = vi.fn(async () => ({
       ok: false as const, blocker: STEERING_RECONCILIATION_BLOCKER, feedback: STEERING_RECONCILIATION_FEEDBACK,
-    })), { [RESET_NATIVE_SEMANTIC_PROGRESS]: reset })
+    }))
+    const completionGate: TurnEngineCompletionGate = Object.assign(rawCompletionGate, { [RESET_NATIVE_SEMANTIC_PROGRESS]: reset })
+    const auditResume = vi.fn(async () => ({ status: "completed" as const }))
+    completionGate[SCHEDULED_PIPELINE_EXISTING_AUDIT_RESUME] = auditResume
     const writer = gateWriter()
 
     await expect(assertCompletionAllowed(gateOptions(completionGate), writer, step, new AbortController().signal, () => nowValue, "candidate"))
       .resolves.toEqual({ feedback: STEERING_RECONCILIATION_FEEDBACK })
 
     expect(reset).toHaveBeenCalledOnce()
+    expect(rawCompletionGate).toHaveBeenCalledOnce()
+    expect(auditResume).not.toHaveBeenCalled()
     expect(writer.append).toHaveBeenCalledWith("final.rejected", step.id, null, {
       code: STEERING_RECONCILIATION_BLOCKER, blocker: STEERING_RECONCILIATION_BLOCKER,
       feedback: STEERING_RECONCILIATION_FEEDBACK, taskId: identity.taskId,

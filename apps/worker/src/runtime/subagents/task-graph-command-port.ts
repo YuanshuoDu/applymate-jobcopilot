@@ -21,6 +21,7 @@ import type { TaskGraphStructuredOutputFailureCategory } from "./task-graph-stru
 import type { DiscoveryAttemptHealth } from "./child-discovery-attempt.js"
 import type { TaskGraphHistoricalDiscoveryPage, TaskGraphHistoricalDiscoveryPageRequest } from "./task-graph-historical-discovery-page-contract.js"
 import type { TaskGraphSourceCheckpoint, TaskGraphSourceIntentNode } from "./task-graph-pg-source-provenance.js"
+import type { TaskGraphScheduledAuditInput, TaskGraphScheduledAuditCompletionInput, TaskGraphScheduledAuditInvocationInput, TaskGraphScheduledAuditResumeInput, ScheduledAuditAppendReceipt, ScheduledAuditCompletionProof, ScheduledAuditInvocationProof, ScheduledAuditResumeContext } from "./scheduled-audit-contract.js"
 import type {
   ScheduledAnalyzeCheckpointHandoff,
   ScheduledGateCompletionProof,
@@ -76,7 +77,6 @@ export type TaskGraphRepairReceipt = Readonly<{
   schemaVersion: typeof TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION; graphRootTaskId: string; targetNodeKey: string; targetTaskId: string; criterionIds: string[]
   repairNodeKey: string; repairTaskId: string; verifierVersion: typeof TASK_GRAPH_VERIFIER_VERSION; evidenceDigest: string
 }>
-
 export function parseTaskGraphVerificationCriterionIds(value: unknown): string[] | undefined {
   if (!denseArray(value, 8) || value.some(id => typeof id !== "string" || !CRITERION_ID.test(id)) || new Set(value).size !== value.length) return undefined
   return [...value] as string[]
@@ -275,6 +275,11 @@ export type TaskGraphCommandPort = Readonly<{
   resumeScheduledGateChoice?(input: TaskGraphScheduledGateResumeInput): Promise<TaskGraphScheduledGateResumeReceipt>
   /** Re-loads strict Gate result/history and returns proof only after canonical completion validation. */
   verifyScheduledGateCompletion?(input: TaskGraphScheduledGateCompletionInput): Promise<ScheduledGateCompletionProof | null>
+  /** Server-only fixed Audit registration and owner-fenced completion proof. */
+  appendScheduledAudit?(input: TaskGraphScheduledAuditInput): Promise<ScheduledAuditAppendReceipt>
+  verifyScheduledAuditCompletion?(input: TaskGraphScheduledAuditCompletionInput): Promise<ScheduledAuditCompletionProof | null>
+  readScheduledAuditInvocationProof?(input: TaskGraphScheduledAuditInvocationInput): Promise<ScheduledAuditInvocationProof | null>
+  readScheduledAuditResumeContext?(input: TaskGraphScheduledAuditResumeInput): Promise<ScheduledAuditResumeContext>
   appendAndScheduleWithReconciliation?(input: TaskGraphScheduleInput, operation: import("./steering-reconciliation-contract.js").SteeringReconciliationOperation): Promise<TaskGraphScheduleReceipt>
   reconcileSteering?(operation: import("./steering-reconciliation-contract.js").SteeringReconciliationOperation): Promise<TaskGraphKeepReconciliationReceipt>
   /** Native root coordination is optional for legacy ports; production callers must fail closed if absent. */

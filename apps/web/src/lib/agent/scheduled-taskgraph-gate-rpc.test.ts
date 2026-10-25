@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { parseScheduledTaskGraphActionRequest, scheduledTaskGraphExecuteGateCompletionProof,
-  scheduledTaskGraphGateTaskLeaseIsCurrent, scheduledTaskGraphGateTurnIsCurrent } from "./scheduled-taskgraph-gate-rpc"
+  scheduledTaskGraphAuditExecutionOwner, scheduledTaskGraphGateTaskLeaseIsCurrent, scheduledTaskGraphGateTurnIsCurrent } from "./scheduled-taskgraph-gate-rpc"
 
 const owner = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
   rootAttemptCount: 2, turnLeaseOwnerId: "root-lease", turnLeaseVersion: 4 }
@@ -75,5 +75,32 @@ describe("scheduled TaskGraph Gate RPC contract", () => {
       .toMatchObject({ action: "execute", gateCompletionProof: proof })
     expect(parseScheduledTaskGraphActionRequest({ action: "execute", owner, attestation: {}, prepareProof: {}, gateCompletionProof: proof,
       gateAttemptCount: 3 })).toBeNull()
+  })
+
+  it("parses Audit child authority as a separate closed action", () => {
+    const proof = { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1", graphRevision: 15,
+      prepareProof: {}, gate: { taskId: "gate-1", attemptCount: 3, resultDigest: digest, completedEventRevision: 15 } }
+    const auditActor = { taskId: "audit-1", attemptCount: 2, leaseOwner: "audit-worker-2" }
+    const request = { action: "scheduled_audit_execute", owner, attestation: {}, prepareProof: {}, gateCompletionProof: proof, auditActor }
+    expect(parseScheduledTaskGraphActionRequest(request)).toEqual(request)
+    for (const invalid of [
+      { ...request, auditActor: undefined }, { ...request, auditActor: { ...auditActor, attemptCount: 0 } },
+      { ...request, auditActor: { ...auditActor, leaseOwner: " " } },
+      { ...request, auditActor: { ...auditActor, expiresAt: "client deadline" } },
+      { ...request, expiresAt: "client deadline" },
+    ]) expect(parseScheduledTaskGraphActionRequest(invalid)).toBeNull()
+    expect(parseScheduledTaskGraphActionRequest({ action: "execute", owner, attestation: {}, prepareProof: {},
+      gateCompletionProof: proof, auditActor })).toBeNull()
+  })
+
+  it("derives the Audit proof execution identity from its persisted receipt", () => {
+    const request = { owner, action: "scheduled_audit_execute" as const, attestation: {}, prepareProof: {},
+      gateCompletionProof: {}, auditActor: { taskId: "audit-1", attemptCount: 2, leaseOwner: "audit-worker" } }
+    const proof = { prepareProof: { receipt: { owner: { ...owner, executionId: "execution-1", executionAttemptCount: 5 } } } }
+    expect(scheduledTaskGraphAuditExecutionOwner(request, proof)).toEqual({ ...owner, executionId: "execution-1", executionAttemptCount: 5 })
+    expect(scheduledTaskGraphAuditExecutionOwner(request, { prepareProof: { receipt: { owner: { ...owner, executionId: "execution-1", executionAttemptCount: 0 } } } }))
+      .toEqual({ ...owner, executionId: "execution-1", executionAttemptCount: 0 })
+    expect(scheduledTaskGraphAuditExecutionOwner(request, { prepareProof: { receipt: { owner: { ...owner, executionId: " " } } } })).toBeNull()
+    expect(scheduledTaskGraphAuditExecutionOwner(request, { prepareProof: { receipt: { owner: { ...owner, executionId: "execution-1", executionAttemptCount: -1 } } } })).toBeNull()
   })
 })

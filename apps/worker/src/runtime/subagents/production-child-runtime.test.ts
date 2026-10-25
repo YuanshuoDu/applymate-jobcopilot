@@ -21,6 +21,7 @@ import type { ChildMailboxReader } from "./child-context.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "./task-graph-snapshot.js"
 import type { GraphIdentityScope } from "./task-graph-pg-state.js"
 import type { PolicyEvaluationContext } from "@jobcopilot/agent-policy"
+import { SCHEDULED_AUDIT_OUTPUT_SCHEMA, SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE } from "./scheduled-audit-contract.js"
 
 const artifactStoreMock = vi.hoisted(() => ({ current: null as unknown, sourceDigestReader: null as unknown }))
 const applicationFillExecutorMock = vi.hoisted(() => ({
@@ -29,11 +30,16 @@ const applicationFillExecutorMock = vi.hoisted(() => ({
   })),
 }))
 const scheduledGateRuntimeMock = vi.hoisted(() => ({ factory: vi.fn() }))
+const scheduledAuditRuntimeMock = vi.hoisted(() => ({ factory: vi.fn() }))
 const selectedJobSourceCanary = "APPLYMATE_TRANSIENT_SELECTED_JOB_CANARY"
 vi.mock("./application-fill-for-review.js", () => ({ executeApplicationFillForReview: applicationFillExecutorMock.execute }))
 vi.mock("./scheduled-gate-child-runtime.js", async importOriginal => ({
   ...await importOriginal<typeof import("./scheduled-gate-child-runtime.js")>(),
   createScheduledGateChildExecutor: scheduledGateRuntimeMock.factory,
+}))
+vi.mock("./scheduled-audit-child-runtime.js", async importOriginal => ({
+  ...await importOriginal<typeof import("./scheduled-audit-child-runtime.js")>(),
+  createScheduledAuditChildExecutor: scheduledAuditRuntimeMock.factory,
 }))
 vi.mock("../tools/artifact-tools.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../tools/artifact-tools.js")>()
@@ -52,6 +58,7 @@ afterEach(() => {
   vi.unstubAllEnvs()
   vi.resetModules()
   scheduledGateRuntimeMock.factory.mockReset()
+  scheduledAuditRuntimeMock.factory.mockReset()
 })
 
 const profile = {
@@ -802,6 +809,53 @@ describe("production child runtime", () => {
       status: "failed", failureReason: "scheduled_gate_role_task_type_mismatch", retryDisposition: "terminal",
     })
     expect(scheduledGateRuntimeMock.factory).not.toHaveBeenCalled()
+    expect(modelFactory).not.toHaveBeenCalled()
+  })
+
+  it("routes the fixed Audit child before generic model or tool runtime setup", async () => {
+    const child = { ...lease(), role: SCHEDULED_AUDIT_ROLE, taskType: SCHEDULED_AUDIT_TASK_TYPE,
+      allowedActions: [], expectedOutputSchema: SCHEDULED_AUDIT_OUTPUT_SCHEMA } satisfies SubagentLease
+    const fixed = vi.fn(async (_input: { lease: SubagentLease }) => ({ status: "completed" as const, result: { processed: 0 } }))
+    scheduledAuditRuntimeMock.factory.mockReturnValue(fixed)
+    const modelFactory = vi.fn(async () => { throw new Error("Audit must not construct a model runtime") })
+    const toolFactory = vi.fn(async () => { throw new Error("Audit must not construct a tool runtime") })
+    const pool = { connect: vi.fn(), query: vi.fn() }
+    const executor = createProductionChildExecutor({ pool: pool as never, modelRuntimeFactory: modelFactory, toolRuntimeFactory: toolFactory as never })
+
+    await expect(executor({ lease: child })).resolves.toEqual({ status: "completed", result: { processed: 0 } })
+    expect(scheduledAuditRuntimeMock.factory).toHaveBeenCalledWith({ pool })
+    expect(fixed).toHaveBeenCalledWith({ lease: child })
+    expect(modelFactory).not.toHaveBeenCalled()
+    expect(toolFactory).not.toHaveBeenCalled()
+    expect(pool.connect).not.toHaveBeenCalled()
+    expect(pool.query).not.toHaveBeenCalled()
+  })
+
+  it("rejects an Audit role/type mismatch before generic execution", async () => {
+    const fixed = vi.fn(async () => ({ status: "failed" as const, failureReason: "scheduled_audit_task_invalid", retryDisposition: "terminal" as const }))
+    scheduledAuditRuntimeMock.factory.mockReturnValue(fixed)
+    const modelFactory = vi.fn(async () => { throw new Error("malformed Audit must not construct a model") })
+    const executor = createProductionChildExecutor({ pool: {} as never, modelRuntimeFactory: modelFactory })
+    await expect(executor({ lease: { ...lease(), role: "prepare", taskType: SCHEDULED_AUDIT_TASK_TYPE } })).resolves.toEqual({
+      status: "failed", failureReason: "scheduled_audit_task_invalid", retryDisposition: "terminal",
+    })
+    expect(scheduledAuditRuntimeMock.factory).toHaveBeenCalledOnce()
+    expect(fixed).toHaveBeenCalledOnce()
+    expect(modelFactory).not.toHaveBeenCalled()
+  })
+
+  it("routes a non-Auditor with the Audit task type through the fixed fail-closed runtime", async () => {
+    const fixed = vi.fn(async () => ({ status: "failed" as const, failureReason: "scheduled_audit_task_invalid", retryDisposition: "terminal" as const }))
+    scheduledAuditRuntimeMock.factory.mockReturnValue(fixed)
+    const modelFactory = vi.fn(async () => { throw new Error("mismatched Audit type must not construct a model") })
+    const executor = createProductionChildExecutor({ pool: {} as never, modelRuntimeFactory: modelFactory })
+    const child = { ...lease(), role: "prepare", taskType: SCHEDULED_AUDIT_TASK_TYPE }
+    const continuation = { kind: "stale" } as never
+    await expect(executor({ lease: child, continuation })).resolves.toEqual({
+      status: "failed", failureReason: "scheduled_audit_task_invalid", retryDisposition: "terminal",
+    })
+    expect(scheduledAuditRuntimeMock.factory).toHaveBeenCalledOnce()
+    expect(fixed).toHaveBeenCalledWith({ lease: child, continuation })
     expect(modelFactory).not.toHaveBeenCalled()
   })
 

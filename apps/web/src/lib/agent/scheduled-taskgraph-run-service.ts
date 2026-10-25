@@ -4,17 +4,18 @@ import { db } from "@/lib/db"
 import { AgentExecutionCancelledError } from "./execution-control"
 import { runScheduledTaskGraphAnalyze, scheduledTaskGraphScoreOwnerIsCurrent } from "./scheduled-taskgraph-analysis-journal"
 import { buildScheduledTaskGraphGateCheckpoint, scheduledTaskGraphAnalyzeCheckpointDigest, type ScheduledTaskGraphPreparedPackageRow } from "./scheduled-taskgraph-gate-checkpoint"
-import { loadScheduledTaskGraphGateInput, scheduledTaskGraphAnalyzeCheckpointForGate } from "./scheduled-taskgraph-gate-input"
+import { scheduledTaskGraphAnalyzeCheckpointForGate } from "./scheduled-taskgraph-gate-input"
 import { buildScheduledTaskGraphPrepareCheckpoint, scheduledAutomationSnapshotDigest, scheduledTaskGraphContinuationKey, type ScheduledTaskGraphPipelineOwner } from "./scheduled-taskgraph-pipeline-checkpoint"
 import { isScheduledTaskGraphOwnerCurrent, saveScheduledTaskGraphCheckpoint, scheduledTaskGraphClaimMatches } from "./scheduled-taskgraph-pipeline-fence"
 import { parseScheduledAutomationSnapshot } from "./scheduled-automation-snapshot"
 import { scheduledTaskGraphExecuteGateCompletionProof } from "./scheduled-taskgraph-gate-rpc"
+import { loadScheduledTaskGraphResumeGateInput, scheduledTaskGraphGateResumeOwnerIsCurrent,
+  validateScheduledTaskGraphAuditPrepareSource, type ScheduledTaskGraphGateResumeInput } from "./scheduled-taskgraph-audit-action"
 import type { PipelineCtx } from "./pipeline-context"
 import type { GateOutput, PipelineCheckpointState, PipelineStage } from "./types"
 
 export type ScheduledTaskGraphAnalyzeCheckpointProof = Readonly<{ status: "analyze_checkpointed"; continuationKey: string; checkpointDigest: string; claimTokenDigest: string; executionId: string; executionAttemptCount: number }>
 export type ScheduledTaskGraphAnalyzeOnlyInput = Readonly<{ owner: ScheduledTaskGraphPipelineOwner; snapshot: unknown; attestation: unknown; continuationKey: string; claimToken: string; ownedJobs: readonly Job[]; context: PipelineCtx; state: unknown; onStateChange: (state: unknown) => void }>
-export type ScheduledTaskGraphGateResumeInput = Readonly<{ owner: ScheduledTaskGraphPipelineOwner; snapshot: unknown; attestation: unknown; continuationKey: string; claimToken: string; ownedJobs: readonly Job[]; persistedCheckpoint: unknown; prepareProof: unknown; scheduledWaitId?: string; gateCompletionProof?: unknown }>
 
 const CHOICE_SCHEMA = "agent-harness.v2.scheduled-prepare-choice-wait.v1"
 const RECEIPT_EVENT = "agent.plan.scheduled_prepare_binding"
@@ -110,37 +111,38 @@ function validIso(value: unknown): boolean { return typeof value === "string" &&
 /** Rebuilds a private Gate/Execute state from a verified Worker proof and owner-scoped artifact rows. */
 export async function buildScheduledTaskGraphGateResumeState(input: ScheduledTaskGraphGateResumeInput): Promise<PipelineCheckpointState> {
   const { owner, continuationKey, claimToken } = input
+  const ownerIsCurrent = () => scheduledTaskGraphGateResumeOwnerIsCurrent(input)
   const persisted = record(input.persistedCheckpoint), snapshot = parseScheduledAutomationSnapshot(input.snapshot)
   const analyzeCheckpoint = scheduledTaskGraphAnalyzeCheckpointForGate(input.persistedCheckpoint)
   const persistedWaitId = persisted?.scheduledTaskGraphScheduledWaitId
   if (!analyzeCheckpoint || scheduledTaskGraphContinuationKey(owner, input.attestation) !== continuationKey
     || (snapshot.requireApproval ? persistedWaitId !== undefined && persistedWaitId !== input.scheduledWaitId : persistedWaitId !== undefined || input.scheduledWaitId !== undefined)
-    || !await isScheduledTaskGraphOwnerCurrent(owner, continuationKey, claimToken)) throw new AgentExecutionCancelledError()
-  if (!await validateScheduledPrepareWaitIdentity({ owner, snapshot, proof: input.prepareProof, scheduledWaitId: input.scheduledWaitId })) throw new AgentExecutionCancelledError()
+    || !await ownerIsCurrent()) throw new AgentExecutionCancelledError()
+  const prepareIsCurrent = input.auditActor
+    ? await validateScheduledTaskGraphAuditPrepareSource({ owner, snapshot, proof: input.prepareProof, scheduledWaitId: input.scheduledWaitId })
+    : await validateScheduledPrepareWaitIdentity({ owner, snapshot, proof: input.prepareProof, scheduledWaitId: input.scheduledWaitId })
+  if (!prepareIsCurrent) throw new AgentExecutionCancelledError()
   const storedStage = pipelineStage(persisted?.nextStage), completion = scheduledTaskGraphExecuteGateCompletionProof(input.gateCompletionProof)
   const completionGate = completion?.gate as { taskId: string; attemptCount: number } | undefined
   if (!storedStage || input.gateCompletionProof !== undefined && (!completion || !sameCanonicalJson(completion.prepareProof, input.prepareProof))) throw new AgentExecutionCancelledError()
   const requestedStage = completion && storedStage === 'gate' ? 'execute' : storedStage
   if ((storedStage === 'execute' || storedStage === 'audit') && !completion || input.gateCompletionProof !== undefined && requestedStage === 'prepare') throw new AgentExecutionCancelledError()
-  const loaded = await loadScheduledTaskGraphGateInput({ owner, snapshot: input.snapshot,
-    analyzeCheckpoint, analyzeAttestation: input.attestation, prepareProof: input.prepareProof,
-    ...(completionGate ? { gate: { taskId: completionGate.taskId, attemptCount: completionGate.attemptCount, phase: 'completed' as const,
-      completionProof: input.gateCompletionProof } } : {}) })
+  const loaded = await loadScheduledTaskGraphResumeGateInput(input, analyzeCheckpoint, completionGate)
   if (!loaded) throw new AgentExecutionCancelledError()
   const handoff = buildScheduledTaskGraphGateCheckpoint({
     analyze: { owner, snapshot: input.snapshot, attestation: input.attestation, ownedJobs: input.ownedJobs, persistedCheckpoint: analyzeCheckpoint, activeClaimToken: claimToken },
     proof: input.prepareProof, packages: loaded.packages, materials: loaded.materials })
-  if (!handoff || !await isScheduledTaskGraphOwnerCurrent(owner, continuationKey, claimToken)) throw new AgentExecutionCancelledError()
+  if (!handoff || !await ownerIsCurrent()) throw new AgentExecutionCancelledError()
   if (!persisted) throw new AgentExecutionCancelledError()
   const artifactRefs = loaded.materials.map(({ jobId, kind, artifactRef }) => ({ jobId, kind, artifactRef }))
   if (persisted?.scheduledTaskGraphPreparedArtifacts !== undefined
-    && !sameJson(persisted.scheduledTaskGraphPreparedArtifacts, artifactRefs)) throw new AgentExecutionCancelledError()
+    && !sameCanonicalJson(persisted.scheduledTaskGraphPreparedArtifacts, artifactRefs)) throw new AgentExecutionCancelledError()
   if (!["prepare", "gate", "execute", "audit"].includes(requestedStage)) throw new AgentExecutionCancelledError()
   const decisions = loaded.gateResult?.status === 'completed' ? parseGateDecisions({
     approvedJobIds: loaded.gateResult.approvedJobIds, pendingJobIds: loaded.gateResult.pendingJobIds, skippedJobIds: loaded.gateResult.skippedJobIds })
     : parseGateDecisions(persisted?.scheduledTaskGraphGateDecisions)
   if (loaded.gateResult && persisted?.scheduledTaskGraphGateDecisions !== undefined
-    && !sameJson(persisted.scheduledTaskGraphGateDecisions, decisions)) throw new AgentExecutionCancelledError()
+    && !sameCanonicalJson(persisted.scheduledTaskGraphGateDecisions, decisions)) throw new AgentExecutionCancelledError()
   const gateOutput = decisions ? restoreGateOutput(decisions, loaded.packages) : undefined
   if (completion && loaded.gateResult?.status !== 'completed') throw new AgentExecutionCancelledError()
   if (["execute", "audit"].includes(requestedStage) && !gateOutput) throw new AgentExecutionCancelledError()
@@ -159,7 +161,6 @@ export async function buildScheduledTaskGraphGateResumeState(input: ScheduledTas
     preparedPackages: [...handoff.packages],
   }
 }
-
 /** Removes private artifact bodies before any scheduled checkpoint write. */
 export function serializeScheduledTaskGraphCheckpoint(value: PipelineCheckpointState): PipelineCheckpointState | null {
   try {
@@ -172,7 +173,7 @@ export function serializeScheduledTaskGraphCheckpoint(value: PipelineCheckpointS
     if (!stage) return null
     if (stageOrder(stage) > stageOrder("gate") && value.gateOutput) {
       const decisions = gateDecisionsFromOutput(value.gateOutput)
-      if (!decisions || (state.scheduledTaskGraphGateDecisions && !sameJson(state.scheduledTaskGraphGateDecisions, decisions))) return null
+      if (!decisions || (state.scheduledTaskGraphGateDecisions && !sameCanonicalJson(state.scheduledTaskGraphGateDecisions, decisions))) return null
       state.scheduledTaskGraphGateDecisions = decisions
     }
     delete state.gateOutput
@@ -205,7 +206,6 @@ function pipelineStage(value: unknown): PipelineStage | null {
     ? value as PipelineStage : null
 }
 function stageOrder(stage: PipelineStage): number { return ["scout", "analyze", "prepare", "gate", "execute", "audit", "completed"].indexOf(stage) }
-function sameJson(left: unknown, right: unknown): boolean { try { return JSON.stringify(left) === JSON.stringify(right) } catch { return false } }
 
 /** Persists Web's authoritative Analyze checkpoint and returns only its opaque proof. */
 export async function runScheduledTaskGraphAnalyzeOnly(input: ScheduledTaskGraphAnalyzeOnlyInput): Promise<ScheduledTaskGraphAnalyzeCheckpointProof> {

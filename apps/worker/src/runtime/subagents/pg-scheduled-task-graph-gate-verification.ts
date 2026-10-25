@@ -91,7 +91,7 @@ export async function validateScheduledGateTaskGraphFinish(client: Queryable, in
 
 /** Re-verifies the immutable three-node prefix from its stored, exact Prepare proof. */
 export async function verifyPersistedScheduledPreparePrefix(client: Queryable, scope: GraphIdentityScope,
-  loaded: LoadedGraph, proof: PreparedProof): Promise<boolean> {
+  loaded: LoadedGraph, proof: PreparedProof, checkpointStage: "gate" | "audit_completed_report" = "gate"): Promise<boolean> {
   const snapshot = loaded.snapshot, state = loaded.state
   if (!snapshot || !state || (snapshot.nodes.length !== 3 && snapshot.nodes.length !== 4)) return false
   const nodes = snapshot.nodes.slice(0, 3), currentNodes = currentTaskGraph(loaded).nodes.filter(node => nodes.some(prefix => prefix.key === node.key))
@@ -110,7 +110,7 @@ export async function verifyPersistedScheduledPreparePrefix(client: Queryable, s
   const verified = await verifyScheduledPrepareTaskGraphEvidence(client, { scope: { ...scope,
     taskId: prepare.taskId, attemptCount: task.attemptCount ?? 0 }, snapshot: prefix, current: prefixCurrent,
     tasks: loaded.tasks, structuredResult: record(task.result)?.structuredResult,
-    completionGraphRevision: proof.completion.graphRevision, referenceVerificationMode: { phase: "persisted_gate" }, checkpointStage: "gate" })
+    completionGraphRevision: proof.completion.graphRevision, referenceVerificationMode: { phase: "persisted_gate" }, checkpointStage })
   const facts = record(task.result)?.taskGraphScheduledPrepareProofFacts
   return verified.verified && canonicalTaskGraphJson(verified.facts) === canonicalTaskGraphJson(facts)
     && canonicalTaskGraphJson(verified.facts) === canonicalTaskGraphJson({ schemaVersion: SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA,

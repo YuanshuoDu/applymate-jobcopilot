@@ -9,16 +9,23 @@ const GRAPH_SCHEMA = 'agent-harness.v2.task-graph'
 const RESULT_SCHEMA = 'agent-harness.v2.subagent.result'
 const GATE_TYPE = 'scheduled_taskgraph_gate'
 const GATE_SCHEMA = { schemaVersion: RESULT_SCHEMA, role: 'prepare', taskType: GATE_TYPE }
+const AUDIT_GOAL = 'Return the exact report from the authenticated scheduled Audit continuation after Gate completion.'
+const AUDIT_CRITERIA = ['Continue the exact scheduled execution only after its canonical Gate proof is verified.',
+  'Return only the fixed seven-field report without adding actions or interpreting historical counts.',
+  'Never submit applications or invoke model or tool runtimes.']
+const AUDIT_SCHEMA = { schemaVersion: RESULT_SCHEMA, role: 'auditor', taskType: 'scheduled_taskgraph_audit' }
 
 export type ScheduledTaskGraphGateHistoryInput = Readonly<{
   reader: Prisma.TransactionClient
   owner: ScheduledTaskGraphPipelineOwner
+  prepareTaskId: string
   prepareGraphRevision: number
   prepareAttemptCount: number
   graphRevision: number
   graphContent: unknown
   gateTask: Readonly<{ id: string; status: string; attemptCount: number; maxAttempts: number; result: unknown }>
   gate: Readonly<{ taskId: string; attemptCount: number; phase: 'running' | 'completed'; completionProof?: unknown }>
+  auditTask?: Readonly<{ id: string; status: string; attemptCount: number }>
   expectedJobIds: readonly string[]
 }>
 
@@ -84,34 +91,35 @@ export async function scheduledTaskGraphGateBindingIsCurrent(input: Readonly<{
 export async function scheduledTaskGraphGateHistoryIsCurrent(input: ScheduledTaskGraphGateHistoryInput): Promise<boolean> {
   try {
     const graphId = taskGraphItemId(input.owner.rootTaskId)
+    if (!validId(input.prepareTaskId)) return false
     const prepareKey = lifecycleKey(input.owner.rootTaskId, 'prepare', input.prepareAttemptCount, 'task.completed')
     const prepareRows = await input.reader.agentEvent.findMany({
       where: { sessionId: input.owner.sessionId, turnId: input.owner.turnId, itemId: graphId,
-        taskId: input.owner.rootTaskId, type: 'item.delta', idempotencyKey: prepareKey },
+        type: 'item.delta', idempotencyKey: prepareKey },
       orderBy: { sequence: 'asc' }, take: 2,
       select: { id: true, sessionId: true, turnId: true, itemId: true, taskId: true, type: true, actor: true,
         idempotencyKey: true, sequence: true, payload: true },
     })
     if (prepareRows.length !== 1) return false
     const prepare = parseLifecycle(prepareRows[0], { owner: input.owner, graphId, expectedRevision: input.prepareGraphRevision - 1,
-      nodeKey: 'prepare', attempt: input.prepareAttemptCount, type: 'task.completed' })
+      nodeKey: 'prepare', taskId: input.prepareTaskId, attempt: input.prepareAttemptCount, type: 'task.completed' })
     if (!prepare) return false
     const priorSnapshot = snapshot(prepare.content)
-    if (!priorSnapshot || priorSnapshot.nodes.length !== 3) return false
+    if (!priorSnapshot || priorSnapshot.nodes.length !== 3 || taskNodeTaskId(priorSnapshot, 'prepare') !== input.prepareTaskId) return false
     const prepareSequence = BigInt(String(prepare.row.sequence))
     const later = await input.reader.agentEvent.findMany({
       where: { sessionId: input.owner.sessionId, turnId: input.owner.turnId, itemId: graphId,
-        taskId: input.owner.rootTaskId, type: 'item.delta', sequence: { gt: prepareSequence } },
+        type: 'item.delta', sequence: { gt: prepareSequence } },
       orderBy: { sequence: 'asc' }, take: MAX_EVENTS,
       select: { id: true, sessionId: true, turnId: true, itemId: true, taskId: true, type: true, actor: true,
         idempotencyKey: true, sequence: true, payload: true },
     })
     if (later.length < 2 || later.length >= MAX_EVENTS) return false
-    return validateHistory(input, graphId, priorSnapshot, later)
+    return await validateHistory(input, graphId, priorSnapshot, later)
   } catch { return false }
 }
 
-function validateHistory(input: ScheduledTaskGraphGateHistoryInput, graphId: string, prior: Snapshot, rows: readonly unknown[]): boolean {
+async function validateHistory(input: ScheduledTaskGraphGateHistoryInput, graphId: string, prior: Snapshot, rows: readonly unknown[]): Promise<boolean> {
   const proposal = record(rows[0]), proposalPayload = record(proposal?.payload), proposalRevision = input.prepareGraphRevision + 1
   const proposalKey = `${graphId}:proposal:${input.prepareGraphRevision}`
   if (!proposal || proposal.type !== 'item.delta' || proposal.actor !== 'orchestrator' || proposal.idempotencyKey !== proposalKey
@@ -120,10 +128,14 @@ function validateHistory(input: ScheduledTaskGraphGateHistoryInput, graphId: str
     || proposalPayload.revision !== proposalRevision || !isHex(proposalPayload.fingerprint)) return false
   const receipt = record(proposalPayload.receipt), receiptNodes = denseArray(receipt?.nodes)
   const proposedSnapshot = snapshot(proposalPayload.content)
+  const currentSnapshot = snapshot(input.graphContent), hasAudit = currentSnapshot?.nodes.length === 5
   if (!receipt || receipt.status !== 'accepted' || receipt.revision !== proposalRevision || !receiptNodes || receiptNodes.length !== 1
     || record(receiptNodes[0])?.key !== 'gate' || record(receiptNodes[0])?.taskId !== input.gate.taskId
     || record(receiptNodes[0])?.status !== 'queued' || !sameStrings(receipt?.readyTaskIds, [input.gate.taskId])
     || !proposedSnapshot || proposedSnapshot.nodes.length !== 4 || !samePrefix(prior, proposedSnapshot)
+    || !currentSnapshot || currentSnapshot.nodes.length !== (hasAudit ? 5 : 4)
+    || hasAudit && (input.gate.phase !== 'completed' || !input.auditTask
+      || !validAuditNode(currentSnapshot.nodes[4]!, input.auditTask.id))
     || input.graphRevision < proposalRevision) return false
   const gateNode = proposedSnapshot.nodes[3]!
   if (!validGateNode(gateNode, input.gate.taskId)) return false
@@ -133,14 +145,19 @@ function validateHistory(input: ScheduledTaskGraphGateHistoryInput, graphId: str
   let currentContent: Snapshot = proposedSnapshot
   const lifecycleRows = rows.slice(1)
   if (!lifecycleRows.length) return false
-  for (const raw of lifecycleRows) {
+  const completedIndex = hasAudit ? lifecycleRows.findIndex(raw => {
+    const event = record(record(record(raw)?.payload)?.event)
+    return event?.nodeKey === 'gate' && event.type === 'task.completed'
+  }) : lifecycleRows.length - 1
+  if (hasAudit && completedIndex < 0) return false
+  for (const raw of lifecycleRows.slice(0, completedIndex + 1)) {
     const payload = record(record(raw)?.payload), event = record(payload?.event)
     if (!event || event.nodeKey !== 'gate' || payload?.kind !== 'lifecycle') return false
     const type = event.type
     if (type !== 'task.started' && type !== 'task.waiting_for_user' && type !== 'task.gate_choice_resumed'
       && type !== 'task.retrying' && type !== 'task.completed') return false
     const next = parseLifecycle(raw, { owner: input.owner, graphId, expectedRevision: revision,
-      nodeKey: 'gate', attempt, type, gateTaskId: input.gate.taskId })
+      nodeKey: 'gate', taskId: input.gate.taskId, attempt, type, gateTaskId: input.gate.taskId })
     if (!next) return false
     revision += 1
     if (type === 'task.started' && status === 'queued') status = 'running'
@@ -150,13 +167,41 @@ function validateHistory(input: ScheduledTaskGraphGateHistoryInput, graphId: str
     else if (type === 'task.completed' && status === 'running') status = 'completed'
     else return false
     const nextContent = snapshot(next.content)
-    if (!nextContent || !sameJson(nextContent, withGateStatus(proposedSnapshot, status))) return false
+    if (!nextContent || !sameJson(nextContent, proposedSnapshot)) return false
     currentContent = nextContent
   }
-  if (revision !== input.graphRevision || input.gateTask.status !== status || input.gateTask.attemptCount !== input.gate.attemptCount
-    || attempt !== input.gate.attemptCount || !sameJson(currentContent, input.graphContent)) return false
+  const currentPrefix = hasAudit ? { ...currentSnapshot!, nodes: currentSnapshot!.nodes.slice(0, 4) } : currentSnapshot!
+  if ((hasAudit ? input.graphRevision <= revision : revision !== input.graphRevision)
+    || input.gateTask.status !== status || input.gateTask.attemptCount !== input.gate.attemptCount
+    || attempt !== input.gate.attemptCount || !sameJson(currentContent, currentPrefix)) return false
   if (input.gate.phase === 'running') return status === 'running' && input.gateTask.status === 'running'
-  return status === 'completed' && validCompletedGate(input, revision)
+  if (status !== 'completed' || !validCompletedGate(input, revision)) return false
+  return !hasAudit || await validAuditTaskRow(input, currentSnapshot!.nodes[4]!, revision)
+}
+
+function validAuditNode(node: Record<string, unknown>, taskId: string): boolean {
+  return Boolean(exactRecord(node, ['key', 'templateId', 'goal', 'successCriteria', 'dependsOn', 'depth', 'taskId', 'verificationDisposition'])
+    && node.key === 'scheduled_audit' && node.templateId === 'scheduled_audit' && node.taskId === taskId && node.depth === 5
+    && node.goal === AUDIT_GOAL && sameJson(node.successCriteria, AUDIT_CRITERIA) && node.verificationDisposition === 'specialized'
+    && sameStrings(node.dependsOn, ['gate']))
+}
+
+async function validAuditTaskRow(input: ScheduledTaskGraphGateHistoryInput, node: Record<string, unknown>, gateRevision: number): Promise<boolean> {
+  const expected = input.auditTask
+  if (!expected || !validAuditNode(node, expected.id)) return false
+  const task = await input.reader.subAgentTask.findFirst({ where: { id: expected.id, sessionId: input.owner.sessionId,
+    turnId: input.owner.turnId, rootTaskId: input.owner.rootTaskId, parentTaskId: input.owner.rootTaskId,
+    session: { is: { userId: input.owner.userId } } }, select: { id: true, sessionId: true, turnId: true, rootTaskId: true,
+    parentTaskId: true, depth: true, status: true, role: true, taskType: true, attemptCount: true, maxAttempts: true, failureReason: true,
+    expectedOutputSchema: true, allowedActions: true } })
+  return Boolean(task && input.graphRevision > gateRevision && task.id === expected.id && task.sessionId === input.owner.sessionId
+    && task.turnId === input.owner.turnId && task.rootTaskId === input.owner.rootTaskId && task.parentTaskId === input.owner.rootTaskId && task.depth === 1
+    && task.status === expected.status && task.attemptCount === expected.attemptCount
+    && (task.status === 'queued' || task.status === 'running' || task.status === 'retrying' || task.status === 'completed')
+    && Number.isSafeInteger(task.attemptCount) && (task.status === 'queued' ? task.attemptCount >= 0 : task.attemptCount > 0)
+    && Number.isSafeInteger(task.maxAttempts) && task.maxAttempts > 0 && task.failureReason === null
+    && task.role === 'auditor' && task.taskType === 'scheduled_taskgraph_audit'
+    && sameJson(task.expectedOutputSchema, AUDIT_SCHEMA) && sameJson(task.allowedActions, []))
 }
 
 function validCompletedGate(input: ScheduledTaskGraphGateHistoryInput, revision: number): boolean {
@@ -172,10 +217,10 @@ function validCompletedGate(input: ScheduledTaskGraphGateHistoryInput, revision:
 }
 
 function parseLifecycle(value: unknown, expected: { owner: ScheduledTaskGraphPipelineOwner; graphId: string; expectedRevision: number;
-  nodeKey: string; attempt: number; type: string; gateTaskId?: string }) {
+  nodeKey: string; taskId: string; attempt: number; type: string; gateTaskId?: string }) {
   const row = record(value), payload = record(row?.payload), event = record(payload?.event), revision = payload?.revision
   if (!row || row.type !== 'item.delta' || row.actor !== 'system' || row.itemId !== expected.graphId
-    || row.taskId !== expected.owner.rootTaskId || row.sessionId !== expected.owner.sessionId || row.turnId !== expected.owner.turnId
+    || row.taskId !== expected.taskId || row.sessionId !== expected.owner.sessionId || row.turnId !== expected.owner.turnId
     || payload?.kind !== 'lifecycle' || !event || event.type !== expected.type || event.nodeKey !== expected.nodeKey
     || event.expectedRevision !== expected.expectedRevision || payload.revision !== expected.expectedRevision + 1
     || event.idempotencyKey !== lifecycleKey(expected.owner.rootTaskId, expected.nodeKey, expected.attempt, expected.type)
@@ -195,6 +240,11 @@ function snapshot(value: unknown): Snapshot | null {
     ? { schemaVersion: GRAPH_SCHEMA, nodes: nodes as Record<string, unknown>[], ...(Object.hasOwn(row, 'rootSuccessCriteria') ? { rootSuccessCriteria: row.rootSuccessCriteria } : {}) }
     : null
 }
+function taskNodeTaskId(value: Snapshot, key: string): string | null {
+  const matches = value.nodes.filter(node => node.key === key)
+  const taskId = matches.length === 1 ? matches[0]?.taskId : null
+  return validId(taskId) ? taskId : null
+}
 function samePrefix(prior: Snapshot, proposed: Snapshot): boolean {
   if (prior.nodes.length !== 3 || proposed.nodes.length !== 4) return false
   return sameJson({ ...prior, nodes: prior.nodes }, { ...proposed, nodes: proposed.nodes.slice(0, 3) })
@@ -203,11 +253,6 @@ function validGateNode(node: Record<string, unknown>, taskId: string): boolean {
   return node.key === 'gate' && node.templateId === 'gate' && node.taskId === taskId && node.depth === 4
     && sameStrings(node.dependsOn, ['prepare']) && node.verificationDisposition === 'specialized'
     && !Object.hasOwn(node, 'verification') && !Object.hasOwn(node, 'repairOf') && !Object.hasOwn(node, 'nativeDelegation')
-}
-function withGateStatus(proposed: Snapshot, status: string): Snapshot {
-  const nodes = [...proposed.nodes]
-  nodes[3] = { ...nodes[3]!, status }
-  return { ...proposed, nodes }
 }
 function validItem(value: unknown, graphId: string, owner: ScheduledTaskGraphPipelineOwner, revision: unknown): boolean {
   const item = record(value)

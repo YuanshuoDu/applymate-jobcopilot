@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 
-import { executionId, executionKey, parseScheduledPipelineCompletionDisposition, type TurnExecutionIdentity } from "./turn-execution-types.js"
+import { executionId, executionKey, parseScheduledPipelineCompletionDisposition,
+  parseScheduledPipelineExistingAuditResumeDisposition, type TurnExecutionIdentity } from "./turn-execution-types.js"
 import { TURN_SCHEDULED_GATE_CHOICE_SCHEMA, turnScheduledGateChoiceWaitId } from "./turn-question-gate-choice-contract.js"
 
 const root: TurnExecutionIdentity = {
@@ -91,5 +92,42 @@ describe("scheduled pipeline completion disposition", () => {
     expect(parseScheduledPipelineCompletionDisposition(symbol)).toBeNull()
     expect(parseScheduledPipelineCompletionDisposition(dependencyAccessor)).toBeNull()
     expect(parseScheduledPipelineCompletionDisposition(dependencySymbol)).toBeNull()
+  })
+})
+
+describe("scheduled existing Audit resume disposition", () => {
+  it("accepts only the three exact Audit resume outcomes", () => {
+    expect(parseScheduledPipelineExistingAuditResumeDisposition({ status: "not_applicable" }))
+      .toEqual({ status: "not_applicable" })
+    expect(parseScheduledPipelineExistingAuditResumeDisposition({ status: "waiting_for_dependency", waitId: "audit-wait-1" }))
+      .toEqual({ status: "waiting_for_dependency", waitId: "audit-wait-1" })
+    expect(parseScheduledPipelineExistingAuditResumeDisposition({ status: "completed" }))
+      .toEqual({ status: "completed" })
+  })
+
+  it.each([
+    null,
+    [],
+    { status: "not_applicable", waitId: "unexpected" },
+    { status: "waiting_for_dependency" },
+    { status: "waiting_for_dependency", waitId: "" },
+    { status: "waiting_for_dependency", waitId: " audit-wait-1" },
+    { status: "waiting_for_dependency", waitId: "audit-wait-1 " },
+    { status: "waiting_for_dependency", waitId: "w".repeat(129) },
+    { status: "waiting_for_dependency", waitId: "audit-wait-1", extra: true },
+    { status: "completed", waitId: "audit-wait-1" },
+    { status: "completed", extra: true },
+    { status: "unknown" },
+  ])("rejects malformed or widened Audit resume outcomes", value => {
+    expect(parseScheduledPipelineExistingAuditResumeDisposition(value)).toBeNull()
+  })
+
+  it("rejects accessors and symbol properties without evaluating or ignoring them", () => {
+    const accessor = Object.defineProperty({ status: "waiting_for_dependency" }, "waitId", {
+      enumerable: true, get: () => "audit-wait-1",
+    })
+    const symbol = { status: "completed", [Symbol("extra")]: true }
+    expect(parseScheduledPipelineExistingAuditResumeDisposition(accessor)).toBeNull()
+    expect(parseScheduledPipelineExistingAuditResumeDisposition(symbol)).toBeNull()
   })
 })
