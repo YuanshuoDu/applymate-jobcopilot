@@ -537,7 +537,10 @@ async function runAttachedScheduledAuditRoot(fixture: Fixture, fetcher: typeof f
     "no_progress", "discovery_memory_overflow", "turn_execution_failed",
     "scheduled_candidate_identity_invalid", "scheduled_candidate_model_receipt_conflict", "scheduled_candidate_model_receipt_missing",
     "scheduled_candidate_owner_invalid", "scheduled_candidate_recovery_mismatch", "root_objective_history_projection_failed",
-    "root_session_fenced", "root_task_fenced", "root_turn_fenced"])
+    "root_session_fenced", "root_task_fenced", "root_turn_fenced",
+    "task_graph_scope_invalid", "task_graph_session_fenced", "task_graph_turn_fenced", "task_graph_parent_fenced",
+    "task_graph_step_fenced", "task_graph_revision_invalid", "task_graph_task_scope_invalid",
+    "task_graph_verification_report_invalid", "task_graph_receipt_invalid", "scheduled_audit_resume_cancelled"])
   const errorDiagnostic = (error: unknown): Pick<typeof phases[number], "errorClass" | "errorCode"> => {
     const name = error instanceof Error ? error.constructor.name : "NonError"
     const errorClass = new Set(["AbortError", "DatabaseError", "Error", "RangeError", "TaskGraphCommandError",
