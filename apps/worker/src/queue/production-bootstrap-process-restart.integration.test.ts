@@ -1777,8 +1777,24 @@ describeWithServices("production bootstrap recovery across a Worker process rest
     expect(after.tools).toMatchObject({ resultStatus: "completed", toolName: "jobs.search" })
     expect(after.tools?.result).toEqual({
       toolCallId,
-      output: { jobs: [{ id: jobId, company: searchTarget }] },
       errorCode: null,
+      output: {
+        hasMore: false,
+        jobs: [{
+          id: jobId,
+          company: searchTarget,
+          description: null,
+          keywords: null,
+          location: null,
+          role: "Fixture Engineer",
+          salary: null,
+          score: null,
+          source: "manual",
+          status: "saved",
+          url: null,
+        }],
+        page: 1,
+      },
     })
     const final = await pool!.query<{ finalResponse: string | null }>(`SELECT "finalResponse" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`, [policyIds.turnId, sessionId])
     expect(final.rows[0]?.finalResponse).toContain(`POLICY_REPLAY_FINAL_${suffix}`)
