@@ -33,7 +33,7 @@ const pipelineOwner = { userId: owner.userId, sessionId: owner.sessionId, turnId
   rootAttemptCount: owner.rootAttemptCount, turnLeaseOwnerId: owner.turnLeaseOwnerId, turnLeaseVersion: owner.turnLeaseVersion }
 const stableOwner = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
   rootAttemptCount: owner.rootAttemptCount, executionId: owner.executionId, executionAttemptCount: owner.executionAttemptCount }
-const evidence = { owner, continuationKey: `scheduled-taskgraph:sha256:${"b".repeat(64)}`, snapshotDigest: digest,
+const evidence = { owner: stableOwner, continuationKey: `scheduled-taskgraph:sha256:${"b".repeat(64)}`, snapshotDigest: digest,
   evidenceDigest: "c".repeat(64), checkpointDigest: "d".repeat(64), analyzeGraphRevision: 2, prepareWaitContinuationKey: "prepare-key" }
 const prepareProof = { receipt: { owner, continuationKey: evidence.continuationKey, snapshotDigest: digest,
   evidenceDigest: evidence.evidenceDigest, checkpointDigest: evidence.checkpointDigest, analyzeGraphRevision: 2, prepareScheduleRevision: 3 },
@@ -112,9 +112,11 @@ function lease(overrides: Partial<SubagentLease> = {}): SubagentLease {
 }
 
 describe("fixed scheduled Audit child runtime", () => {
-  it("rebinds the current Audit lease and private Gate proof before returning only the exact report", async () => {
+  it("rebinds the current Audit lease and stable Prepare owner despite lease fields in its receipt", async () => {
     const fixture = setup(), task = lease(), executor = createScheduledAuditChildExecutor({ pool: fixture.pool as never,
       fetcher: vi.fn(async () => new Response()) })
+    expect(prepareProof.receipt.owner).toHaveProperty("turnLeaseOwnerId", owner.turnLeaseOwnerId)
+    expect(evidence.owner).not.toHaveProperty("turnLeaseOwnerId")
     await expect(executor({ lease: task })).resolves.toEqual({ status: "completed", result: {
       finalItemId: null, finalText: "", status: "completed", stepCount: 0, toolCallCount: 0,
       taskGraphVerificationReport: null, structuredResult: report,
@@ -140,7 +142,7 @@ describe("fixed scheduled Audit child runtime", () => {
     const missing = setup()
     mocks.readInvocation.mockResolvedValue(null)
     await expect(createScheduledAuditChildExecutor({ pool: missing.pool as never })({ lease: lease() })).resolves.toMatchObject({
-      status: "failed", failureReason: "scheduled_audit_runtime_failed", retryDisposition: "terminal",
+      status: "failed", failureReason: "scheduled_audit_invocation_proof_invalid", retryDisposition: "terminal",
     })
     const waiting = setup()
     mocks.post.mockResolvedValue({ status: "waiting_for_user", waitId: "external-wait" })

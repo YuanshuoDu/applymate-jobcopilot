@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { createHash } from "node:crypto"
 import { TurnStateRefreshRetryError } from "../turns/turn-execution-question.js"
 import { SCHEDULED_PIPELINE_COMPLETION, type TurnEngineCompletionGate } from "../turns/turn-execution-types.js"
 import { attachScheduledPipelineCompletion, completeScheduledPipelineBeforeTerminal } from "./scheduled-pipeline-completion.js"
@@ -164,14 +165,27 @@ describe("scheduled pipeline pre-terminal completion", () => {
     expect(JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body))).toEqual({ owner, attestation: analyzeAttestation, prepareProof: prepared.prepareProof })
   })
 
-  it("carries a verified Execute wait through Gate completion and accepted-Web pause", async () => {
-    const prepared = readyPrepare(), waitId = "agent-question:turn-1:canonical:durable-42", signal = new AbortController().signal
+  it("waits on the exact Audit child after verifying Gate and pauses accepted-Web completion", async () => {
+    const prepared = readyPrepare(), auditWaitId = "durable-audit-wait", signal = new AbortController().signal
     const gateProof = { schemaVersion: "agent-harness.v2.scheduled-taskgraph-gate-completion.v1", graphRevision: 9,
       prepareProof: prepared.prepareProof, gate: { taskId: "gate-task", attemptCount: 1,
         resultDigest: `sha256:${"d".repeat(64)}`, completedEventRevision: 9 } }
+    const order: string[] = []
+    const appendAudit = vi.fn(async () => {
+      order.push("append-audit")
+      return { status: "accepted" as const, revision: 10,
+        nodes: [{ key: "scheduled_audit", taskId: "audit-task", status: "queued" as const }],
+        readyTaskIds: ["audit-task"], auditTaskId: "audit-task", expectedAttemptCount: 1 }
+    })
+    const waitAudit = vi.fn(async () => {
+      order.push("wait-audit")
+      return { status: "waiting" as const, waitId: auditWaitId,
+        deadlineAt: "2026-10-20T12:00:00.000Z", matchedTaskIds: [] }
+    })
+    const verifyAudit = vi.fn()
     const fetcher = vi.fn<typeof fetch>(async (_url, init) => {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>
-      if (body.action === "execute") return response(202, { status: "waiting_for_user", waitId })
+      if (body.action === "execute") throw new Error("Audit child owns the Execute continuation")
       if (body.prepareProof) return response(200, { status: "gate_checkpointed" })
       return response(200, analyzeProof())
     })
@@ -180,13 +194,27 @@ describe("scheduled pipeline pre-terminal completion", () => {
     const gateContinuation = createScheduledAutomationGateContinuation({
       pool: { connect: async () => ({ query: async () => ({ rows: [], rowCount: 1 }), release: () => undefined }) } as never,
       commandPort: {
-        appendScheduledGate: async () => ({ status: "accepted", revision: 5, nodes: [{ key: "gate", taskId: "gate-task" }], readyTaskIds: ["gate-task"] }),
-        resumeScheduledGateChoice: async () => ({ status: "accepted", taskId: "gate-task", requestAttemptCount: 1,
-          resumedAttemptCount: 2, revision: 6, readyTaskIds: ["gate-task"] }),
-        verifyScheduledGateCompletion: async () => gateProof,
+        appendScheduledGate: vi.fn(async () => {
+          order.push("append-gate")
+          return { status: "accepted" as const, revision: 5, nodes: [{ key: "gate", taskId: "gate-task" }], readyTaskIds: ["gate-task"] }
+        }),
+        resumeScheduledGateChoice: vi.fn(async () => ({ status: "accepted" as const, taskId: "gate-task", requestAttemptCount: 1,
+          resumedAttemptCount: 2, revision: 6, readyTaskIds: ["gate-task"] })),
+        verifyScheduledGateCompletion: vi.fn(async () => {
+          order.push("verify-gate")
+          return gateProof
+        }),
+        appendScheduledAudit: appendAudit,
+        verifyScheduledAuditCompletion: verifyAudit,
       } as never,
-      waitPort: { waitScheduledGate: async () => ({ status: "ready", waitId: "gate-ready", matchedTaskIds: ["gate-task"] }) } as never,
-      nativeQuestionWaitEnabled: true, fetcher,
+      waitPort: {
+        waitScheduledGate: vi.fn(async () => {
+          order.push("wait-gate")
+          return { status: "ready" as const, waitId: "gate-ready", matchedTaskIds: ["gate-task"] }
+        }),
+        wait: waitAudit,
+      } as never,
+      nativeQuestionWaitEnabled: true,
     })
     const gate = (async () => ({ ok: true as const })) as unknown as TurnEngineCompletionGate
     const accepted = vi.fn(), stageCandidate = vi.fn(async () => undefined)
@@ -198,11 +226,24 @@ describe("scheduled pipeline pre-terminal completion", () => {
 
     await expect(complete!({ identity: executionOwner, scope: {} as never, rootTaskId: owner.rootTaskId,
       stepId: "step-final", stepOrdinal: 3, candidateText: "Final candidate", signal, now: new Date() } as never))
-      .resolves.toEqual({ status: "waiting_for_external_user", externalWaitId: waitId, candidateText: "Final candidate" })
+      .resolves.toEqual({ status: "waiting_for_dependency", waitId: auditWaitId, candidateText: "Final candidate" })
     expect(accepted).toHaveBeenCalledOnce()
     expect(stageCandidate).toHaveBeenCalledOnce()
-    expect(fetcher).toHaveBeenCalledTimes(3)
-    expect(JSON.parse(String(fetcher.mock.calls[2]?.[1]?.body))).toMatchObject({ action: "execute", gateCompletionProof: gateProof })
+    expect(fetcher).toHaveBeenCalledTimes(2)
+    expect(fetcher.mock.calls.map(([, init]) => JSON.parse(String(init?.body)) as Record<string, unknown>)
+      .some(body => body.action === "execute")).toBe(false)
+    expect(appendAudit).toHaveBeenCalledWith(expect.objectContaining({
+      executionOwner: { executionId: "execution-1", executionAttemptCount: 4 },
+      handoff: analyzeProof(), attestation: analyzeAttestation, gateProof,
+      scheduledWaitId: prepared.choice.required ? prepared.choice.scheduledWaitId : undefined,
+    }))
+    const auditWaitKey = `scheduled-audit-wait:${createHash("sha256")
+      .update(JSON.stringify(["audit-task", "step-final", 1]), "utf8").digest("hex")}`
+    expect(waitAudit).toHaveBeenCalledWith({ userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
+      stepId: "step-final", taskId: owner.rootTaskId, rootTaskId: owner.rootTaskId,
+      targetTaskIds: ["audit-task"], mode: "all", timeoutMs: 24 * 60 * 60 * 1_000, idempotencyKey: auditWaitKey })
+    expect(order).toEqual(["append-gate", "wait-gate", "verify-gate", "append-audit", "wait-audit"])
+    expect(verifyAudit).not.toHaveBeenCalled()
   })
 
   it("rejects the legacy completed response instead of skipping the fixed Gate", async () => {

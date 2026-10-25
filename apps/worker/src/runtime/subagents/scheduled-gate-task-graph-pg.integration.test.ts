@@ -21,6 +21,7 @@ import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import { createScheduledAutomationGateContinuation } from "./scheduled-automation-gate-bridge.js"
 import { projectScheduledAnalyzePrefix } from "./scheduled-automation-prepare-bridge.js"
 import { createScheduledGatePrepareFixture } from "./scheduled-gate-prepare-pg-runner.fixture.js"
+import { SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE } from "./scheduled-audit-contract.js"
 import { scheduledGateCandidateSetDigest, scheduledGatePreparedJobIds, type ScheduledGateResult } from "./scheduled-gate-contract.js"
 import type { TurnQuestionGateChoiceBinding } from "../turns/turn-question-gate-choice-contract.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
@@ -288,10 +289,23 @@ describeWithServices("scheduled Gate durable questions across real Worker restar
     owner = { ...fixture.owner, turnLeaseOwnerId: lease.ownerId, turnLeaseVersion: lease.leaseVersion }
     attestation = await fixture.reattestCurrentTurn(lease)
     const completionStep = await startStep(fixture, lease, turnStore)
-    const completed = await continuation({ owner, executionOwner: turnFence(lease, fixture.ids.rootTaskId), attestation,
+    const auditWait = await continuation({ owner, executionOwner: turnFence(lease, fixture.ids.rootTaskId), attestation,
       handoff, prepareProof: preparedProof, scheduledWaitId: fixture.prepareChoiceWaitId,
       finalStepId: completionStep, signal: new AbortController().signal })
-    expect(completed).toEqual({ status: "completed" })
+    expect(auditWait.status).toBe("waiting_for_dependency")
+    if (auditWait.status !== "waiting_for_dependency") throw new Error("scheduled_gate_audit_wait_missing")
+    const auditTasks = await pool.query<{ id: string; status: string; role: string; taskType: string }>(
+      `SELECT "id", "status", "role", "taskType" FROM "sub_agent_tasks"
+        WHERE "sessionId"=$1 AND "turnId"=$2 AND "rootTaskId"=$3 AND "parentTaskId"=$3 AND "taskType"=$4`,
+      [fixture.ids.sessionId, fixture.ids.turnId, fixture.ids.rootTaskId, SCHEDULED_AUDIT_TASK_TYPE])
+    expect(auditTasks.rows).toHaveLength(1)
+    const auditTask = auditTasks.rows[0]!
+    expect(auditTask).toMatchObject({ status: "queued", role: SCHEDULED_AUDIT_ROLE, taskType: SCHEDULED_AUDIT_TASK_TYPE })
+    const durableAuditWait = await pool.query<{ status: string; mode: string; targetTaskIds: string[]; matchedTaskIds: string[] }>(
+      `SELECT "status", "mode", "targetTaskIds", "matchedTaskIds" FROM "agent_wait_conditions"
+        WHERE "id"=$1 AND "sessionId"=$2 AND "turnId"=$3 AND "parentTaskId"=$4`,
+      [auditWait.waitId, fixture.ids.sessionId, fixture.ids.turnId, fixture.ids.rootTaskId])
+    expect(durableAuditWait.rows).toEqual([{ status: "waiting", mode: "all", targetTaskIds: [auditTask.id], matchedTaskIds: [] }])
 
     expect(generations).toEqual([0, 2, 4, 6, 8])
     expect(completedQuestionItems.map(item => item.attempt)).toEqual([1, 2, 3, 4])

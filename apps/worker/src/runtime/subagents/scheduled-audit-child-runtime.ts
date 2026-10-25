@@ -111,7 +111,7 @@ async function loadScheduledAuditInvocation(pool: Pick<pg.Pool, "connect">, leas
       { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId!, rootTaskId: lease.rootTaskId }, prepare.taskId,
       prepareTask.result, evidence.prepareWaitContinuationKey, gateRegistration.prepareWaitId)
     if (!loadedPrepare || !scheduledGatePreparedJobIds(loadedPrepare) || !samePreparedLineage(loadedPrepare, gateRegistration)
-      || !same(loadedPrepare.receipt.owner, evidence.owner)) throw new Error("scheduled_audit_prepare_proof_invalid")
+      || !same(stableOwner(loadedPrepare.receipt.owner), evidence.owner)) throw new Error("scheduled_audit_prepare_proof_invalid")
     prepareProof = loadedPrepare
     const built = buildAttestation(pipelineOwner(prepareProof.receipt.owner), evidence.snapshotDigest, evidence.evidenceDigest,
       evidence.analyzeGraphRevision, snapshot.nodes, graph.tasks)
