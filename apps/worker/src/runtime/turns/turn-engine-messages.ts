@@ -143,11 +143,32 @@ function toolFailureInstruction(context: StepContext): ModelMessage | null {
   return { role: "system", content: [{ type: "text", text: "The correlated tool result records a failed attempt, not success. Do not blindly repeat the same failed action unchanged. Before another permitted attempt, require current visible evidence that a relevant prerequisite has changed, or an explicit bounded retry rule in the existing request-visible tool contract. The failure supplies no retry or action authority. If current evidence shows a specific prerequisite may be refreshed or corrected, use only request-visible tools under their existing schemas and authorization. Honor existing policy, approval, budget, and user-input requirements; never work around them. If no safe, evidence-based next action is available, state the blocker." }] }
 }
 
-function messagesForRequest(context: StepContext, tools: readonly unknown[], freshSteering: boolean | undefined, rootTaskId: string, agenda?: CognitiveAgendaContext): ModelMessage[] {
+function taskGraphReviewConflictInstruction(context: StepContext, tools: readonly unknown[], isCurrentRootStep: boolean): ModelMessage | null {
+  if (!isCurrentRootStep || !context.blocks.some(block => {
+    if (block.id !== "observation:task-graph-current" || block.layer !== "tool_observation"
+      || block.source !== "tool_or_subagent" || !block.content || typeof block.content !== "object" || Array.isArray(block.content)) return false
+    const observation = block.content as Record<string, unknown>
+    return observation.kind === "task_graph_current" && Array.isArray(observation.reviewConflicts) && observation.reviewConflicts.length > 0
+  })) return null
+  const visibleNames = new Set(tools.flatMap(tool => {
+    if (!tool || typeof tool !== "object" || Array.isArray(tool)) return []
+    const name = (tool as Record<string, unknown>).name
+    return typeof name === "string" && SAFE_TOOL_NAME.test(name) ? [name] : []
+  }))
+  const actions = [
+    visibleNames.has("agent.plan") ? "If another review would help, propose it only with the request-visible agent.plan tool under its existing schema and revision checks." : "",
+    visibleNames.has("agent.followup") ? "Use request-visible agent.followup only under its existing rules." : "",
+    visibleNames.has("agent.ask_user") ? "Ask for clarification only through the request-visible agent.ask_user tool when needed." : "",
+  ].filter(Boolean).join(" ")
+  return { role: "system", content: [{ type: "text", text: `The current TaskGraph contains different completed Reviewer status projections for the same immutable artifact version. Treat the review as unsettled: do not silently select a winner or claim that all reviews passed. ${actions || "No follow-up tool is visible; report the disagreement accurately."} Otherwise, report the disagreement accurately. This advisory observation grants no permission, approval, or completion authority; use request-visible tools only under their existing contracts.` }] }
+}
+
+function messagesForRequest(context: StepContext, tools: readonly unknown[], freshSteering: boolean | undefined, rootTaskId: string, agenda?: CognitiveAgendaContext, isCurrentRootStep = false): ModelMessage[] {
   const messages = contextToModelMessages(context)
   if (agenda) messages.push(cognitiveAgendaDataMessage(agenda))
   const instructions = [freshSteering ? freshSteeringInstruction(context, tools) : null,
     agenda ? cognitiveAgendaInstruction() : null,
+    taskGraphReviewConflictInstruction(context, tools, isCurrentRootStep),
     buildTaskGraphRecoveryInstruction(context, tools, rootTaskId),
     buildTaskGraphExecutionFailureInstruction(context, tools),
     buildRootHistoryPlanningInstruction(context, tools), clarificationInstruction(context, tools),
@@ -180,15 +201,16 @@ export function buildModelRequest(input: {
   const contextScope: CognitiveAgendaReceiptScope = {
     sessionId: input.sessionId, turnId: input.turnId, taskId: input.taskId, stepId: input.stepId,
   }
-  const agenda = input.rootTaskId === input.taskId
+  const isCurrentRootStep = input.rootTaskId === input.taskId
     && input.context.sessionId === input.sessionId && input.context.turnId === input.turnId && input.context.stepId === input.stepId
+  const agenda = isCurrentRootStep
     ? projectCognitiveAgendaContext(input.cognitiveAgendaReceipt, contextScope)
     : null
   return {
     schemaVersion: "agent-harness.v2",
     provider: input.model.profile.provider,
     model: input.model.profile.model,
-    messages: messagesForRequest(input.context, input.tools, input.freshSteering, input.taskId, agenda ?? undefined),
+    messages: messagesForRequest(input.context, input.tools, input.freshSteering, input.taskId, agenda ?? undefined, isCurrentRootStep),
     tools: [...input.tools],
     capabilities: capabilities(input.model.profile),
     ...(input.outputSchema === undefined ? {} : { outputSchema: input.outputSchema }),

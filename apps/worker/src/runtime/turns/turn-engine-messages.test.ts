@@ -96,12 +96,25 @@ function taskGraphContext(nodes: readonly TaskGraphCurrentNode[], withRecovery =
   return { ...context(), taskGraphRevision: revision, blocks: [...context().blocks, ...recovery, ...additional] }
 }
 
-function requestFor(contextValue: StepContext, tools: readonly unknown[] = []) {
+function requestFor(contextValue: StepContext, tools: readonly unknown[] = [], identity: Readonly<{ taskId?: string; rootTaskId?: string; stepId?: string }> = {}) {
   const model = { profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter
   return buildModelRequest({
-    context: contextValue, model, tools, sessionId: "session-1", turnId: "turn-1", stepId: "step-2",
-    userId: "user-1", taskId: "root-task-private", signal: new AbortController().signal, maxOutputTokens: 777,
+    context: contextValue, model, tools, sessionId: "session-1", turnId: "turn-1", stepId: identity.stepId ?? "step-2",
+    userId: "user-1", taskId: identity.taskId ?? "root-task-private", ...(identity.rootTaskId ? { rootTaskId: identity.rootTaskId } : {}),
+    signal: new AbortController().signal, maxOutputTokens: 777,
   })
+}
+
+function reviewerTaskGraphNode(taskId: string, reviewStatus: "passed" | "needs_revision" | "rejected" | "stale"): TaskGraphCurrentNode {
+  return {
+    key: taskId, templateId: "cover_letter_reviewer", goal: "Review the same immutable draft", successCriteria: [], dependsOn: [],
+    taskId, status: "completed", readiness: "terminal", resultSummary: null, failureReason: null,
+    resultProjection: {
+      schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available", role: "reviewer",
+      status: "completed", artifactRef: { artifactId: "draft-1", version: 2, contentHash: `sha256:${"a".repeat(64)}`, sourceDigest: `sha256:${"b".repeat(64)}` },
+      reviewStatus, reviewHash: `sha256:${"c".repeat(64)}`,
+    },
+  }
 }
 
 function requestSystemText(request: ReturnType<typeof requestFor>): string {
@@ -122,6 +135,30 @@ function replaceGraphNodes(contextValue: StepContext, nodes: readonly unknown[])
     ? { ...block, content: { ...graph, nodes } as unknown as JsonValue } : block) }
 }
 describe("TurnEngine model message mapping", () => {
+  it("guides only the current Root to report or replan around a review conflict", () => {
+    const tools = [{ name: "agent.plan", version: "1" }, { name: "agent.ask_user", version: "1" }]
+    const conflictContext = taskGraphContext([
+      reviewerTaskGraphNode("reviewer-passed", "passed"), reviewerTaskGraphNode("reviewer-rejected", "rejected"),
+    ])
+    const rootRequest = requestFor(conflictContext, tools, { rootTaskId: "root-task-private", stepId: "step-1" })
+    const rootGuidance = requestSystemText(rootRequest)
+
+    expect(currentGraphBlock(conflictContext).content).toMatchObject({ reviewConflicts: [{ artifactId: "draft-1", version: 2,
+      outcomes: [{ taskId: "reviewer-passed", reviewStatus: "passed" }, { taskId: "reviewer-rejected", reviewStatus: "rejected" }], truncated: false }] })
+    expect(rootGuidance).toContain("Treat the review as unsettled")
+    expect(rootGuidance).toContain("do not silently select a winner")
+    expect(rootGuidance).toContain("agent.plan")
+    expect(rootGuidance).toContain("agent.ask_user")
+    expect(rootGuidance).toContain("grants no permission, approval, or completion authority")
+    expect(rootRequest.tools).toEqual(tools)
+
+    const childRequest = requestFor(conflictContext, tools, { taskId: "child-task", rootTaskId: "root-task-private", stepId: "step-1" })
+    expect(requestSystemText(childRequest)).not.toContain("Treat the review as unsettled")
+    const oneReviewContext = taskGraphContext([reviewerTaskGraphNode("reviewer-only", "passed")])
+    expect(requestSystemText(requestFor(oneReviewContext, tools, { rootTaskId: "root-task-private", stepId: "step-1" })))
+      .not.toContain("Treat the review as unsettled")
+  })
+
   it("places a redacted same-Step agenda in untrusted user context with fixed advisory gates", () => {
     const tools = [{ name: "jobs.search", version: "1" }]
     const request = buildModelRequest({
