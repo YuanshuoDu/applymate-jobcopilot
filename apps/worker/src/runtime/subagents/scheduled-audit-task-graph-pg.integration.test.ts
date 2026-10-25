@@ -232,6 +232,9 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(queued).toMatchObject({ status: "queued", attemptCount: 1, result: null })
 
     const retryWait = await continuation(input)
+    if (retryWait.status !== "waiting_for_dependency") {
+      throw new Error(`Scheduled Audit expected an exact-child wait, received ${retryWait.status}`)
+    }
     expect(retryWait.status).toBe("waiting_for_dependency")
     expect(await requireGateProof(fixture)).toEqual(gateProof)
     const retryReceipt = await command.appendScheduledAudit!({ scope, executionOwner: fixture.executionOwner, handoff: fixture.handoff,
@@ -333,8 +336,10 @@ async function runAttachedScheduledAuditRoot(fixture: Fixture, fetcher: typeof f
     } })
   const gateContinuation = createScheduledAutomationGateContinuation({ pool: pool as never, commandPort, waitPort,
     nativeQuestionWaitEnabled: false, fetcher })
+  const checkRootCompletion = rootStore.checkCompletion
+  if (typeof checkRootCompletion !== "function") throw new Error("Scheduled Audit fixture requires the production root completion verifier")
   const baseCompletionGate: NonNullable<TurnEngineOptions["completionGate"]> = async () =>
-    rootStore.checkCompletion({ lease, rootTaskId: fixture.ids.rootTaskId, taskGraphVerification: true })
+    checkRootCompletion.call(rootStore, { lease, rootTaskId: fixture.ids.rootTaskId, taskGraphVerification: true })
   const completionGate = attachScheduledPipelineCompletion({ gate: baseCompletionGate, owner,
     async bridge() { return { status: "ready", attestation: await fixture.reattestCurrentTurn(lease) } },
     continueAfterAnalyze: prepareContinuation, continueAfterGate: gateContinuation, fetcher,

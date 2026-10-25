@@ -232,7 +232,8 @@ describe("scheduled pipeline pre-terminal completion", () => {
       owner, attestation: analyzeAttestation, prepareProof: prepared.prepareProof,
       ...(prepared.choice.required ? { scheduledWaitId: prepared.choice.scheduledWaitId } : {}),
     })
-    expect(continueAfterGate).toHaveBeenCalledOnce()
+    expect(continueAfterGate).toHaveBeenCalledTimes(2)
+    expect(continueAfterGate).toHaveBeenNthCalledWith(1, expect.objectContaining({ mode: "resume_audit" }))
   })
 
   it("continues approval-disabled snapshots through the fixed Gate without a Prepare choice ID", async () => {
@@ -241,7 +242,7 @@ describe("scheduled pipeline pre-terminal completion", () => {
       ? response(200, { status: "gate_checkpointed" }) : response(200, analyzeProof()))
     const result = await completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText, signal,
       bridge: async () => ({ status: "ready", attestation: analyzeAttestation }), fetcher,
-      continueAfterAnalyze: async () => prepared, continueAfterGate: async input => input.mode === "resume_audit"
+      continueAfterAnalyze: async () => prepared, continueAfterGate: async input => "mode" in input && input.mode === "resume_audit"
         ? { status: "not_registered" as const } : { status: "completed" as const } })
     expect(result).toEqual({ status: "completed", candidateText })
     expect(JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body))).toEqual({ owner, attestation: analyzeAttestation, prepareProof: prepared.prepareProof })
@@ -347,7 +348,7 @@ describe("scheduled pipeline pre-terminal completion", () => {
     await expect(completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText: "Final.", signal: new AbortController().signal,
       bridge: async () => ({ status: "ready", attestation: analyzeAttestation }), fetcher,
       continueAfterAnalyze: async () => prepared,
-      continueAfterGate: async input => input.mode === "resume_audit" ? { status: "not_registered" as const }
+      continueAfterGate: async input => "mode" in input && input.mode === "resume_audit" ? { status: "not_registered" as const }
         : { status: "waiting_for_choice" as const, waitId: "gate-question-wait", question: "Choose a fixed option.", binding } }))
       .resolves.toEqual({ status: "waiting_for_scheduled_gate_choice", waitId: "gate-question-wait", candidateText: "Final.",
         question: "Choose a fixed option.", binding })

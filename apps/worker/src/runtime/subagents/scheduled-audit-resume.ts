@@ -84,7 +84,7 @@ export async function resumeScheduledAudit(input: Readonly<{ command: ResumeComm
     return { status: "blocked", errorCode: "scheduled_audit_resume_unavailable" }
   }
   let context = await command.readScheduledAuditResumeContext({ scope: input.scope })
-  if (context.status === "not_registered") return context
+  if (context.status === "not_registered") return { status: "not_registered" }
   if (context.status !== "registered") return { status: "blocked", errorCode: "scheduled_audit_resume_invalid" }
   if (context.auditStatus !== "completed") {
     const initialContext = context

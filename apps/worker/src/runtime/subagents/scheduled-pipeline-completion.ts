@@ -105,7 +105,8 @@ export async function completeScheduledPipelineBeforeTerminal(input: Readonly<{
         return { status: "blocked", errorCode: "scheduled_pipeline_gate_checkpoint_missing" }
       }
       const gateResult = await input.continueAfterGate({ owner: input.owner, executionOwner: input.executionOwner,
-        attestation: evidence.attestation, handoff: continuation.proof, prepareProof: prepared.prepareProof as ScheduledPipelineGateContinuationInput["prepareProof"],
+        attestation: evidence.attestation, handoff: continuation.proof,
+        prepareProof: prepared.prepareProof as Extract<ScheduledPipelineGateContinuationInput, { prepareProof: unknown }>["prepareProof"],
         ...(prepared.choice.required ? { scheduledWaitId: prepared.choice.scheduledWaitId } : {}),
         finalStepId: input.finalStepId, signal: input.signal })
       if (gateResult.status === "waiting_for_dependency") return { status: gateResult.status, waitId: gateResult.waitId, candidateText: input.candidateText }

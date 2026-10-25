@@ -42,11 +42,13 @@ function dependencies(contexts: ScheduledAuditResumeContext[], overrides: Readon
 
 describe("scheduled Audit root resume", () => {
   it("verifies a completed Audit against its registered owner and Gate proof", async () => {
-    const deps = dependencies([context()])
+    const completedContext = context()
+    if (completedContext.status !== "registered") throw new Error("expected a registered Audit context")
+    const deps = dependencies([completedContext])
     await expect(resumeScheduledAudit({ ...deps, scope, finalStepId: "final-step", signal: new AbortController().signal } as never))
       .resolves.toEqual({ status: "completed" })
     expect(deps.wait).not.toHaveBeenCalled()
-    expect(deps.verifyScheduledAuditCompletion).toHaveBeenCalledWith({ scope, executionOwner: context().executionOwner,
+    expect(deps.verifyScheduledAuditCompletion).toHaveBeenCalledWith({ scope, executionOwner: completedContext.executionOwner,
       gateProof, auditTaskId: "audit-1", attemptCount: 1 })
   })
 

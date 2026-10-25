@@ -47,6 +47,7 @@ function dependencies(overrides: Record<string, unknown> = {}) {
     verifyScheduledGateCompletion: vi.fn(async () => gateProof),
     appendScheduledAudit: vi.fn(async () => auditReceipt()),
     verifyScheduledAuditCompletion: vi.fn(async () => auditCompletionProof()),
+    readScheduledAuditResumeContext: vi.fn(async () => ({ status: "not_registered" as const })),
     ...overrides,
   }
   const waitPort = { waitScheduledGate: vi.fn(async (_invocation: DurableWaitScheduledGateInvocation) =>
