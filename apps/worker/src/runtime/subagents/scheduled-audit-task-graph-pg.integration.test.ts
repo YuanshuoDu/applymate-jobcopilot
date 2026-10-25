@@ -52,6 +52,19 @@ type FixtureWebDatabase = Readonly<{ db: {
 type CustomAgentRoleLookup = Readonly<{ userId: string; insertAfter: string; enabled: true }>
 type GateFailureDiagnostics = Readonly<Record<string, unknown>>
 type AuditPreflightState = "not_checked" | "passed" | "rejected" | "threw"
+type ReadTraceCount = { reached: boolean; rowCount: number | null }
+type PrepareSourceReadTrace = {
+  receiptEvents: ReadTraceCount
+  candidateEvents: ReadTraceCount
+  sourceStepLookups: Array<{ found: boolean; status: string | null; cursorType: string }>
+  choiceItemLookups: Array<{ found: boolean; itemKeys: string[]; extraItemKeyCount: number; contentKeys: string[]; extraContentKeyCount: number }>
+  tailSteps: ReadTraceCount & { statuses: string[] }
+  tailEvents: ReadTraceCount
+  tailItems: ReadTraceCount
+  tailWaits: ReadTraceCount
+  targetTasks: ReadTraceCount
+  graphProposalEvents: ReadTraceCount
+}
 type AuditPreflightDiagnostics = {
   gateCompletionProofValid: boolean
   executionOwnerDerived: boolean
@@ -66,6 +79,7 @@ type AuditPreflightDiagnostics = {
   claimTokenValid: boolean
   savedScheduledWaitIdMatchesRequest: boolean
   prepareSource: AuditPreflightState
+  prepareSourceTrace: PrepareSourceReadTrace
   gateProofCurrent: AuditPreflightState
 }
 type AuditRequestOwner = Readonly<{ userId: string; sessionId: string; turnId: string; rootTaskId: string;
@@ -982,14 +996,17 @@ async function setupFetcher(fixture: Fixture) {
           diagnostic.claimTokenValid = diagnosticValidId(claim?.claimToken)
           diagnostic.savedScheduledWaitIdMatchesRequest = persistedState.scheduledTaskGraphScheduledWaitId === parsed.scheduledWaitId
         }
+        const prepareSourceTrace = emptyPrepareSourceReadTrace()
+        const prepareReader = tracePrepareSourceReader(tx as unknown as PrepareSourceDbReader, prepareSourceTrace)
         const prepareSourceInput = { owner, snapshot: fixture.scheduleSnapshot, proof: parsed.prepareProof,
-          ...(parsed.scheduledWaitId === undefined ? {} : { scheduledWaitId: parsed.scheduledWaitId }), reader: tx }
+          ...(parsed.scheduledWaitId === undefined ? {} : { scheduledWaitId: parsed.scheduledWaitId }), reader: prepareReader }
         try {
           diagnostic.prepareSource = await auditPrepareSource.validateScheduledTaskGraphAuditPrepareSource(prepareSourceInput)
             ? "passed" : "rejected"
         } catch {
           diagnostic.prepareSource = "threw"
         }
+        diagnostic.prepareSourceTrace = prepareSourceTrace
         const gateProofInput = { owner, snapshot: fixture.scheduleSnapshot, analyzeCheckpoint,
           analyzeAttestation: parsed.attestation, prepareProof: parsed.prepareProof,
           gate: { taskId: gate.taskId, attemptCount: Number(gate.attemptCount), phase: "completed" as const,
@@ -1398,12 +1415,110 @@ function debugRecord(value: unknown): Record<string, unknown> | null {
   const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
   return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null
 }
+type PrepareSourceDbReader = {
+  agentEvent: { findMany(args: unknown): Promise<readonly unknown[]> }
+  agentStep: { findFirst(args: unknown): Promise<unknown>; findMany(args: unknown): Promise<readonly unknown[]> }
+  agentItem: { findFirst(args: unknown): Promise<unknown>; findMany(args: unknown): Promise<readonly unknown[]> }
+  agentWaitCondition: { findMany(args: unknown): Promise<readonly unknown[]> }
+  subAgentTask: { findMany(args: unknown): Promise<readonly unknown[]> }
+}
+
+function emptyReadTraceCount(): ReadTraceCount { return { reached: false, rowCount: null } }
+function emptyPrepareSourceReadTrace(): PrepareSourceReadTrace {
+  return { receiptEvents: emptyReadTraceCount(), candidateEvents: emptyReadTraceCount(), sourceStepLookups: [], choiceItemLookups: [],
+    tailSteps: { ...emptyReadTraceCount(), statuses: [] }, tailEvents: emptyReadTraceCount(), tailItems: emptyReadTraceCount(),
+    tailWaits: emptyReadTraceCount(), targetTasks: emptyReadTraceCount(), graphProposalEvents: emptyReadTraceCount() }
+}
+function tracePrepareSourceReader(reader: PrepareSourceDbReader, trace: PrepareSourceReadTrace): PrepareSourceDbReader {
+  return {
+    agentEvent: { findMany: async args => {
+      const where = debugRecord(debugRecord(args)?.where)
+      const countTrace = eventReadTrace(where, trace)
+      if (countTrace) beginReadTrace(countTrace)
+      const rows = await reader.agentEvent.findMany(args)
+      const count = Array.isArray(rows) ? rows.length : 0
+      if (countTrace) completeReadTrace(countTrace, count)
+      return rows
+    } },
+    agentStep: {
+      findFirst: async args => {
+        const lookup = { found: false, status: null as string | null, cursorType: 'pending' }
+        trace.sourceStepLookups.push(lookup)
+        const result = debugRecord(await reader.agentStep.findFirst(args))
+        lookup.found = !!result
+        lookup.status = safeRecoveryStatus(result?.status)
+        lookup.cursorType = cursorType(result?.inputThroughSequence)
+        return result
+      },
+      findMany: async args => {
+        beginReadTrace(trace.tailSteps)
+        const rows = await reader.agentStep.findMany(args)
+        const statuses = rows.map(value => safeRecoveryStatus(debugRecord(value)?.status) ?? 'other')
+        completeReadTrace(trace.tailSteps, rows.length)
+        trace.tailSteps.statuses = statuses
+        return rows
+      },
+    },
+    agentItem: {
+      findFirst: async args => {
+        const lookup = { found: false, itemKeys: [] as string[], extraItemKeyCount: 0,
+          contentKeys: [] as string[], extraContentKeyCount: 0 }
+        trace.choiceItemLookups.push(lookup)
+        const result = debugRecord(await reader.agentItem.findFirst(args)), content = debugRecord(result?.content)
+        const itemFields = ['id', 'sessionId', 'turnId', 'stepId', 'taskId', 'type', 'status', 'content']
+        const contentFields = ['waitKind', 'questionId', 'toolCallId', 'stage', 'question', 'options', 'answer', 'answerAvailable',
+          'scheduledPrepareChoiceBinding', 'answeredAt']
+        const keys = result ? Object.keys(result) : [], contentKeys = content ? Object.keys(content) : []
+        lookup.found = !!result
+        lookup.itemKeys = itemFields.filter(key => keys.includes(key))
+        lookup.extraItemKeyCount = keys.filter(key => !itemFields.includes(key)).length
+        lookup.contentKeys = contentFields.filter(key => contentKeys.includes(key))
+        lookup.extraContentKeyCount = contentKeys.filter(key => !contentFields.includes(key)).length
+        return result
+      },
+      findMany: async args => {
+        beginReadTrace(trace.tailItems)
+        const rows = await reader.agentItem.findMany(args)
+        completeReadTrace(trace.tailItems, rows.length)
+        return rows
+      },
+    },
+    agentWaitCondition: { findMany: async args => {
+      beginReadTrace(trace.tailWaits)
+      const rows = await reader.agentWaitCondition.findMany(args)
+      completeReadTrace(trace.tailWaits, rows.length)
+      return rows
+    } },
+    subAgentTask: { findMany: async args => {
+      beginReadTrace(trace.targetTasks)
+      const rows = await reader.subAgentTask.findMany(args)
+      completeReadTrace(trace.targetTasks, rows.length)
+      return rows
+    } },
+  }
+}
+function eventReadTrace(where: Record<string, unknown> | null, trace: PrepareSourceReadTrace): ReadTraceCount | null {
+  if (where?.type === 'agent.plan.scheduled_prepare_binding') return trace.receiptEvents
+  if (where?.type === 'native_verification.scheduled_candidate_staged') return trace.candidateEvents
+  if (where?.type === 'item.delta' && where.actor === 'orchestrator' && Object.hasOwn(where, 'causationId')) {
+    return trace.graphProposalEvents
+  }
+  if (debugRecord(where?.correlationId) && Array.isArray(debugRecord(where?.correlationId)?.in)) return trace.tailEvents
+  return null
+}
+function beginReadTrace(trace: ReadTraceCount): void { trace.reached = true; trace.rowCount = null }
+function completeReadTrace(trace: ReadTraceCount, rowCount: number): void { trace.rowCount = rowCount }
+function cursorType(value: unknown): string { return value === null ? 'null' : typeof value }
+function safeRecoveryStatus(value: unknown): string | null {
+  return typeof value === 'string' && ['streaming', 'interrupted', 'waiting_for_tool', 'waiting_for_user', 'completed'].includes(value)
+    ? value : null
+}
 function emptyAuditPreflight(): AuditPreflightDiagnostics {
   return { gateCompletionProofValid: false, executionOwnerDerived: false, prepareProofCanonicalMatch: false,
     executionContext: "not_checked", markerKeyMatches: false, claimKeyMatches: false,
     markerOwnerExact9Matches: false, markerOwnerStable7Matches: false, claimOwnerExact9Matches: false,
     claimOwnerStable7Matches: false, claimTokenValid: false, savedScheduledWaitIdMatchesRequest: false,
-    prepareSource: "not_checked", gateProofCurrent: "not_checked" }
+    prepareSource: "not_checked", prepareSourceTrace: emptyPrepareSourceReadTrace(), gateProofCurrent: "not_checked" }
 }
 function isAuditAction(value: Record<string, unknown> | null): value is AuditAction {
   return Boolean(value && value.action === "scheduled_audit_execute" && isAuditRequestOwner(value.owner)
