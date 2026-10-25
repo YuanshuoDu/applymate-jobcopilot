@@ -58,6 +58,19 @@ export async function completeScheduledPipelineBeforeTerminal(input: Readonly<{
       const result = await input.continueAfterGate({ owner: input.owner, executionOwner: input.executionOwner,
         mode: "resume_audit", finalStepId: input.finalStepId, signal: input.signal })
       if (result.status === "not_registered") return null
+      if (result.status === "gate_continuation") {
+        const evidence = await input.bridge(input.owner)
+        if (evidence.status === "blocked") return { status: "blocked", errorCode: `scheduled_pipeline_${evidence.reasonCode}` }
+        if (!recoveredGateMatches(input.owner, evidence.attestation, result)) {
+          return { status: "blocked", errorCode: "scheduled_pipeline_gate_recovery_invalid" }
+        }
+        if (stage) await input.stageCandidate(candidate)
+        const continued = await input.continueAfterGate({ owner: input.owner, executionOwner: input.executionOwner,
+          attestation: evidence.attestation, handoff: result.handoff, prepareProof: result.prepareProof,
+          ...(result.scheduledWaitId ? { scheduledWaitId: result.scheduledWaitId } : {}),
+          finalStepId: input.finalStepId, signal: input.signal })
+        return mapGateContinuationResult(continued, input.candidateText)
+      }
       if (result.status === "blocked") return result
       if (result.status === "completed") {
         if (stage) await input.stageCandidate(candidate)
@@ -109,14 +122,7 @@ export async function completeScheduledPipelineBeforeTerminal(input: Readonly<{
         prepareProof: prepared.prepareProof as Extract<ScheduledPipelineGateContinuationInput, { prepareProof: unknown }>["prepareProof"],
         ...(prepared.choice.required ? { scheduledWaitId: prepared.choice.scheduledWaitId } : {}),
         finalStepId: input.finalStepId, signal: input.signal })
-      if (gateResult.status === "waiting_for_dependency") return { status: gateResult.status, waitId: gateResult.waitId, candidateText: input.candidateText }
-      if (gateResult.status === "waiting_for_choice") return { status: "waiting_for_scheduled_gate_choice", waitId: gateResult.waitId,
-        question: gateResult.question, binding: gateResult.binding, candidateText: input.candidateText }
-      if (gateResult.status === "waiting_for_external_user") return { status: gateResult.status, externalWaitId: gateResult.waitId, candidateText: input.candidateText }
-      if (gateResult.status === "blocked") return gateResult
-      if (gateResult.status === "not_registered") return { status: "blocked", errorCode: "scheduled_audit_not_registered" }
-      if (gateResult.status !== "completed") return { status: "blocked", errorCode: "scheduled_audit_result_invalid" }
-      return { status: "completed", candidateText: input.candidateText }
+      return mapGateContinuationResult(gateResult, input.candidateText)
     }
     return { status: "blocked", errorCode: "scheduled_pipeline_handoff_result_invalid" }
   } catch (error: unknown) {
@@ -125,6 +131,33 @@ export async function completeScheduledPipelineBeforeTerminal(input: Readonly<{
     throw new TurnStateRefreshRetryError()
   }
 }
+function mapGateContinuationResult(result: ScheduledPipelineGateContinuationResult, candidateText: string): ScheduledPipelineCompletionDisposition {
+  if (result.status === "waiting_for_dependency") return { status: result.status, waitId: result.waitId, candidateText }
+  if (result.status === "waiting_for_choice") return { status: "waiting_for_scheduled_gate_choice", waitId: result.waitId,
+    question: result.question, binding: result.binding, candidateText }
+  if (result.status === "waiting_for_external_user") return { status: result.status, externalWaitId: result.waitId, candidateText }
+  if (result.status === "blocked") return result
+  if (result.status === "completed") return { status: "completed", candidateText }
+  return { status: "blocked", errorCode: result.status === "not_registered" ? "scheduled_audit_not_registered" : "scheduled_pipeline_gate_recovery_unexpected" }
+}
+function recoveredGateMatches(owner: ScheduledAutomationPipelineBridgeScope, attestation: ScheduledAutomationPipelineAttestation, recovery: Extract<ScheduledPipelineGateContinuationResult, { status: "gate_continuation" }>): boolean {
+  const { handoff, prepareProof } = recovery, receipt = prepareProof.receipt, bound = receipt.owner
+  return attestation.owner.userId === owner.userId && attestation.owner.sessionId === owner.sessionId
+    && attestation.owner.turnId === owner.turnId && attestation.owner.rootTaskId === owner.rootTaskId
+    && attestation.owner.rootAttemptCount === owner.rootAttemptCount
+    && attestation.owner.turnLeaseOwnerId === owner.turnLeaseOwnerId && attestation.owner.turnLeaseVersion === owner.turnLeaseVersion
+    && handoff.status === "analyze_checkpointed" && /^sha256:[a-f0-9]{64}$/.test(handoff.claimTokenDigest)
+    && handoff.continuationKey === scheduledTaskGraphContinuationKey(owner, attestation, handoff.executionId, handoff.executionAttemptCount)
+    && bound.userId === owner.userId && bound.sessionId === owner.sessionId && bound.turnId === owner.turnId
+    && bound.rootTaskId === owner.rootTaskId && bound.rootAttemptCount === owner.rootAttemptCount
+    && bound.executionId === handoff.executionId && bound.executionAttemptCount === handoff.executionAttemptCount
+    && receipt.continuationKey === scheduledTaskGraphStableContinuationKey(receipt)
+    && receipt.snapshotDigest === attestation.snapshotDigest && receipt.evidenceDigest === attestation.evidenceDigest
+    && receipt.checkpointDigest === handoff.checkpointDigest
+    && receipt.analyzeGraphRevision === attestation.graphRevision && receipt.prepareScheduleRevision === attestation.graphRevision + 1
+    && (recovery.scheduledWaitId === undefined || validWaitId(recovery.scheduledWaitId))
+}
+function validWaitId(value: unknown): value is string { return typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= 256 }
 
 export function attachScheduledPipelineCompletion(input: Readonly<{
   gate: TurnEngineCompletionGate | undefined

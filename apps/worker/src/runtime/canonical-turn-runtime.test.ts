@@ -41,6 +41,10 @@ import type { CanonicalTurnState, CanonicalTurnStateLoadOptions } from "./canoni
 import { SCHEDULED_AUTOMATION_SNAPSHOT_SCHEMA_VERSION } from "./subagents/scheduled-automation-snapshot.js"
 import { TASK_GRAPH_TEMPLATES } from "./subagents/task-graph-templates.js"
 import type { ScheduledAutomationPipelineAttestation, ScheduledAutomationPipelineBridgeScope } from "./subagents/scheduled-automation-pipeline-bridge.js"
+import { SCHEDULED_AUDIT_COMPLETION_PROOF_SCHEMA, type ScheduledAuditCompletionProof, type ScheduledAuditResumeContext } from "./subagents/scheduled-audit-contract.js"
+import { SCHEDULED_GATE_COMPLETION_PROOF_SCHEMA, type ScheduledGateCompletionProof } from "./subagents/scheduled-gate-contract.js"
+import { SCHEDULED_PREPARE_COMPLETION_SCHEMA, type ScheduledPrepareTaskGraphProof } from "./subagents/scheduled-prepare-task-graph-verification.js"
+import { SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_SCHEMA, scheduledTaskGraphStableContinuationKey } from "./subagents/scheduled-taskgraph-continuation-receipt.js"
 import type { ScheduledPipelineCandidateStore } from "./subagents/scheduled-pipeline-candidate-store.js"
 import type { TurnEngineEvent, TurnEngineStore } from "./turns/turn-engine-types.js"
 import { TurnStateRefreshRetryError } from "./turns/turn-execution-question.js"
@@ -496,7 +500,23 @@ function scheduledPipelineRuntimeFixture(overrides: Partial<CanonicalTurnRuntime
   const roots = rootStore(), executionProjection = { start: vi.fn(async () => undefined), finish: vi.fn(async () => undefined) }
   const sessionProjection = { start: vi.fn(async () => undefined), finish: vi.fn(async () => undefined) }
   const bridge = vi.fn(async (owner: ScheduledAutomationPipelineBridgeScope) => ({ status: "ready" as const, attestation: scheduledPipelineAttestation(owner) }))
-  const fetcher = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({ status: "completed", report: scheduledPipelineReport }), { status: 200 }))
+  const defaultFetcher = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({ status: "completed", report: scheduledPipelineReport }), { status: 200 }))
+  const { scheduledPipelineFetch: fetchOverride, scheduledPipelineBridge: bridgeOverride,
+    taskGraphCommandPort: commandPortOverride, ...otherOverrides } = overrides
+  const configuredFetcher = fetchOverride ?? defaultFetcher
+  let independentAuditCompletionVisible = false
+  let currentAuditContext: Extract<ScheduledAuditResumeContext, { status: "registered" }> | undefined
+  const fetcher = vi.fn<typeof fetch>(async (...args) => {
+    const response = await configuredFetcher(...args)
+    if (response.ok) {
+      const body: unknown = await response.clone().json().catch(() => undefined)
+      if (body && typeof body === "object" && "status" in body && body.status === "completed") {
+        // Simulate the independently persisted Audit child becoming visible at the handoff boundary; the Web report is not proof.
+        independentAuditCompletionVisible = true
+      }
+    }
+    return response
+  })
   const stagedCandidates: Array<Parameters<ScheduledPipelineCandidateStore["stage"]>[0]> = []
   const candidateStore = {
     stage: vi.fn<ScheduledPipelineCandidateStore["stage"]>(async input => { stagedCandidates.push(input) }),
@@ -507,9 +527,21 @@ function scheduledPipelineRuntimeFixture(overrides: Partial<CanonicalTurnRuntime
     }),
   } satisfies ScheduledPipelineCandidateStore
   let modelCalls = 0
+  const readScheduledAuditResumeContext = vi.fn(async ({ scope }: { scope: TaskGraphReadScope }): Promise<ScheduledAuditResumeContext> => {
+    if (!independentAuditCompletionVisible) return { status: "not_registered" }
+    currentAuditContext = scheduledAuditResumeFixtureContext(scope)
+    return currentAuditContext
+  })
+  const verifyScheduledAuditCompletion = vi.fn(async (input: Parameters<NonNullable<TaskGraphCommandPort["verifyScheduledAuditCompletion"]>>[0]) => {
+    if (!currentAuditContext) return null
+    return scheduledAuditResumeFixtureProof(currentAuditContext, input.auditTaskId, input.attemptCount)
+  })
   const commandPort: TaskGraphCommandPort = {
     appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
     readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
+    readScheduledAuditResumeContext,
+    verifyScheduledAuditCompletion,
+    ...commandPortOverride,
   }
   const runtime = createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
     workerId: lease.ownerId,
@@ -532,11 +564,51 @@ function scheduledPipelineRuntimeFixture(overrides: Partial<CanonicalTurnRuntime
       { type: "completed", finishReason: "stop" },
     ] }), registry: {} as never, candidates: [] }),
     authorizeUsage: async () => ({ settle: async () => undefined }), executionProjection, sessionProjection,
-    scheduledPipelineBridge: bridge, scheduledPipelineFetch: fetcher as typeof fetch,
+    scheduledPipelineBridge: bridgeOverride ?? bridge, scheduledPipelineFetch: fetcher,
     scheduledPipelineCandidateStoreFactory: () => candidateStore,
-    ...overrides,
+    ...otherOverrides,
   })
-  return { runtime, roots, executionProjection, sessionProjection, bridge, fetcher, candidateStore, stagedCandidates, getModelCalls: () => modelCalls }
+  return { runtime, roots, executionProjection, sessionProjection, bridge, fetcher, candidateStore, stagedCandidates,
+    readScheduledAuditResumeContext, verifyScheduledAuditCompletion, getModelCalls: () => modelCalls }
+}
+
+function scheduledAuditResumeFixtureContext(scope: TaskGraphReadScope): Extract<ScheduledAuditResumeContext, { status: "registered" }> {
+  const executionOwner = { executionId: "fixture-execution", executionAttemptCount: 0 }
+  const snapshotDigest = `sha256:${"a".repeat(64)}`
+  const continuationOwner = { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
+    rootTaskId: scope.rootTaskId, rootAttemptCount: scope.parentAttemptCount, turnLeaseOwnerId: scope.turnLeaseOwner,
+    turnLeaseVersion: scope.turnLeaseVersion, ...executionOwner }
+  const binding = { owner: continuationOwner, continuationKey: `scheduled-taskgraph:sha256:${"e".repeat(64)}`,
+    snapshotDigest, evidenceDigest: "c".repeat(64), checkpointDigest: "d".repeat(64), analyzeGraphRevision: 3, prepareScheduleRevision: 4 }
+  const continuationKey = scheduledTaskGraphStableContinuationKey(binding)
+  if (!continuationKey) throw new Error("scheduled_audit_fixture_continuation_invalid")
+  const prepareProof: ScheduledPrepareTaskGraphProof = {
+    receipt: { schemaVersion: SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_SCHEMA, ...binding, continuationKey },
+    completion: { schemaVersion: SCHEDULED_PREPARE_COMPLETION_SCHEMA, graphRevision: 4, nodes: [
+      { taskId: "fixture-scout", attemptCount: 1, role: "scout", taskType: "scout", status: "completed", verification: "passed", dependsOnTaskIds: [] },
+      { taskId: "fixture-analyst", attemptCount: 1, role: "analyst", taskType: "analyst", status: "completed", verification: "passed", dependsOnTaskIds: ["fixture-scout"] },
+      { taskId: "fixture-prepare", attemptCount: 1, role: "prepare", taskType: "prepare", status: "completed", verification: "passed",
+        dependsOnTaskIds: ["fixture-analyst"], tool: "scheduled.application.prepare@1", resultDigest: `sha256:${"f".repeat(64)}` },
+    ] as const, wait: { waitId: "fixture-prepare-wait", status: "ready", mode: "all",
+      targetTaskIds: ["fixture-prepare"], matchedTaskIds: ["fixture-prepare"] } },
+    result: { schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status: "completed", taskId: "fixture-prepare", attemptCount: 1,
+      snapshotDigest, checkpointDigest: binding.checkpointDigest, jobs: [], materials: [] },
+  }
+  const gateProof: ScheduledGateCompletionProof = { schemaVersion: SCHEDULED_GATE_COMPLETION_PROOF_SCHEMA, graphRevision: 5,
+    prepareProof, gate: { taskId: "fixture-gate-task", attemptCount: 1, resultDigest: `sha256:${"9".repeat(64)}`, completedEventRevision: 5 } }
+  return { status: "registered", auditTaskId: "fixture-audit-task", auditStatus: "completed", expectedAttemptCount: 1,
+    owner: { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
+      rootAttemptCount: scope.parentAttemptCount, ...executionOwner }, executionOwner,
+    snapshotDigest, gateProof }
+}
+
+function scheduledAuditResumeFixtureProof(context: Extract<ScheduledAuditResumeContext, { status: "registered" }>,
+  auditTaskId: string, attemptCount: number): ScheduledAuditCompletionProof {
+  const completedEventRevision = context.gateProof.graphRevision + 1
+  return { schemaVersion: SCHEDULED_AUDIT_COMPLETION_PROOF_SCHEMA, owner: context.owner, snapshotDigest: context.snapshotDigest,
+    gateProof: context.gateProof, graphRevision: completedEventRevision,
+    audit: { taskId: auditTaskId, attemptCount, resultDigest: `sha256:${"b".repeat(64)}`, completedEventRevision },
+    report: scheduledPipelineReport }
 }
 
 const scheduledPipelineReport = { processed: 1, applied: 0, queued: 0, pending: 0, skipped: 1, failed: 0, durationMs: 12 }
@@ -4850,6 +4922,8 @@ describe("createCanonicalTurnRuntime", () => {
     expect(body.owner).toEqual(expect.objectContaining({ userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId,
       rootTaskId: "root-1", rootAttemptCount: 1, turnLeaseOwnerId: lease.ownerId, turnLeaseVersion: lease.leaseVersion }))
     expect(String(init?.body)).not.toContain("worker-secret-canary")
+    expect(fixture.readScheduledAuditResumeContext).toHaveBeenCalledTimes(2)
+    expect(fixture.verifyScheduledAuditCompletion).toHaveBeenCalledOnce()
     expect(fixture.candidateStore.stage).toHaveBeenCalledWith(expect.objectContaining({
       candidateText: "The scheduled task graph is complete using the reviewed role evidence.", finalStepOrdinal: 0,
     }))
@@ -4858,7 +4932,7 @@ describe("createCanonicalTurnRuntime", () => {
     expect(fixture.sessionProjection.finish).toHaveBeenCalledWith(expect.objectContaining({ result: expect.objectContaining({ status: "completed" }) }))
   })
 
-  it("reuses the durably staged candidate after the Web-complete crash window without another model or compaction call", async () => {
+  it("reuses the durably staged candidate and completed Audit proof after the Web-complete crash window", async () => {
     vi.stubEnv("AGENT_WEB_URL", "https://applymate.example")
     vi.stubEnv("AGENT_WORKER_SECRET", "worker-secret-canary")
     const enabled = resolveProductionAgentFlags({ ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1",
@@ -4918,7 +4992,8 @@ describe("createCanonicalTurnRuntime", () => {
       finalStepId: fixture.stagedCandidates[0]?.finalStepId,
       finalStepOrdinal: fixture.stagedCandidates[0]?.finalStepOrdinal,
     })
-    expect(fixture.fetcher).toHaveBeenCalledTimes(2)
+    expect(fixture.fetcher).toHaveBeenCalledOnce()
+    expect(fixture.verifyScheduledAuditCompletion).toHaveBeenCalledTimes(2)
     expect(fixture.getModelCalls()).toBe(1)
     expect(compaction).toHaveBeenCalledOnce()
     expect(terminalCommits).toBe(1)

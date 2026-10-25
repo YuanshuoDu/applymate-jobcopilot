@@ -319,52 +319,113 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
 
 async function runAttachedScheduledAuditRoot(fixture: Fixture, fetcher: typeof fetch,
   commandPort: ReturnType<typeof createPgTaskGraphCommandPort>, waitPort: ReturnType<typeof createPgDurableWaitPort>): Promise<TurnEngineResult> {
-  const lease = fixture.turnLease, owner = { ...fixture.owner, turnLeaseOwnerId: lease.ownerId, turnLeaseVersion: lease.leaseVersion }
-  const executionOwner = fixture.turnExecutionOwner as TurnExecutionOwnerFence
-  const store = createPgTurnEngineStore(pool as never), candidateStore = createScheduledPipelineCandidateStore(pool as never, store)
-  const rootStore = createPgRootTaskStore(pool as never)
-  await rootStore.ensure({ lease, goal: "Finish the scheduled automation only after its current Audit proof", allowedActions: scheduledGateRootActions() })
-  const recoveredCandidate = await candidateStore.read({ owner: executionOwner, rootAttemptCount: owner.rootAttemptCount })
-  if (!recoveredCandidate) throw new Error("scheduled Audit root candidate missing")
-  const prepareContinuation = createScheduledAutomationPrepareContinuation({ commandPort, waitPort,
-    async verifyReadyPrepare({ scope, prepareTaskId }) {
-      const graph = await loadTaskGraph(pool as never, scope, false), current = currentTaskGraph(graph), task = graph.tasks.get(prepareTaskId)
-      if (!graph.snapshot || !task || !Number.isSafeInteger(task.attemptCount)) return { verified: false, reasonCode: "scheduled_prepare_graph_invalid" }
-      return verifyScheduledPrepareTaskGraphEvidence(pool as never, { scope: { ...scope, taskId: prepareTaskId, attemptCount: task.attemptCount! },
-        snapshot: graph.snapshot, current, tasks: graph.tasks, structuredResult: debugRecord(task.result)?.structuredResult,
-        completionGraphRevision: current.revision, referenceVerificationMode: { phase: "persisted_gate" } })
-    } })
-  const gateContinuation = createScheduledAutomationGateContinuation({ pool: pool as never, commandPort, waitPort,
-    nativeQuestionWaitEnabled: false, fetcher })
-  const checkRootCompletion = rootStore.checkCompletion
-  if (typeof checkRootCompletion !== "function") throw new Error("Scheduled Audit fixture requires the production root completion verifier")
-  const baseCompletionGate: NonNullable<TurnEngineOptions["completionGate"]> = async () =>
-    checkRootCompletion.call(rootStore, { lease, rootTaskId: fixture.ids.rootTaskId, taskGraphVerification: true })
-  const completionGate = attachScheduledPipelineCompletion({ gate: baseCompletionGate, owner,
-    async bridge() { return { status: "ready", attestation: await fixture.reattestCurrentTurn(lease) } },
-    continueAfterAnalyze: prepareContinuation, continueAfterGate: gateContinuation, fetcher,
-    stageCandidate: input => candidateStore.stage(input), onWebAccepted() {},
-    rootAttemptCount: owner.rootAttemptCount, recoveredCandidate })
-  const profile: ModelAdapter["profile"] = { provider: "fixture", model: "scheduled-audit-root", nativeTools: true,
-    structuredOutput: true, streaming: true, continuationCursor: false, supportsParallelTools: false,
-    supportsStreamingToolArgs: false, supportsReasoningSummary: false, supportsResponseContinuation: false,
-    supportsProviderConversation: false, supportsBackgroundResponse: false, maxContextTokens: null,
-    maxOutputTokens: 128, costClass: "low" }
-  const model: ModelAdapter = { id: "scheduled-audit-root", profile,
-    async *stream() { throw new Error("scheduled Audit root candidate replay unexpectedly called the model") } }
-  const options: TurnEngineOptions = { lease, rootTaskId: fixture.ids.rootTaskId, taskId: fixture.ids.rootTaskId,
-    scope: { userId: fixture.ids.userId }, goal: "Complete the verified scheduled automation",
-    snapshot: { system: [], profile: [], steerHistory: [], toolObservations: [],
-      businessRefs: fixture.preparedJobIds.map(id => ({ id, kind: "job" as const, ownerId: fixture.ids.userId })) },
-    contextBuilder: { async build(request) { return { schemaVersion: "agent-harness.v2", sessionId: request.sessionId,
-      turnId: request.turnId, stepId: request.stepId, inputThroughSequence: 0n, consumedInputIds: [], blocks: [], canonicalJson: "{}" } } },
-    store, model, tools: [], executeTool: async ({ call }) => ({ id: call.id, toolName: call.toolName,
-      toolVersion: call.toolVersion, status: "completed", errorCode: null }), completionGate,
-    recoveredFinalCandidate: recoveredCandidate.candidateText,
-    resume: { nextOrdinal: recoveredCandidate.finalStepOrdinal + 1, stepCount: recoveredCandidate.finalStepOrdinal + 1,
-      toolCallCount: 0, inputThroughSequence: 0n, consumedInputIds: [],
-      usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } } }
-  return new TurnEngine(options).run()
+  const phases: Array<{ phase: string; outcome?: string; errorClass?: string; errorCode?: string }> = []
+  const safeStatuses = new Set(["ready", "blocked", "not_registered", "completed", "waiting_for_dependency", "waiting_for_choice",
+    "waiting_for_external_user", "waiting_for_user", "invalid"])
+  const safeErrorCodes = new Set([...diagnosticAuditFailureReasons, ...diagnosticGateErrorCodes,
+    "scheduled_candidate_identity_invalid", "scheduled_candidate_model_receipt_conflict", "scheduled_candidate_model_receipt_missing",
+    "scheduled_candidate_owner_invalid", "scheduled_candidate_recovery_mismatch", "root_objective_history_projection_failed",
+    "root_session_fenced", "root_task_fenced", "root_turn_fenced"])
+  const errorDiagnostic = (error: unknown): Pick<typeof phases[number], "errorClass" | "errorCode"> => {
+    const name = error instanceof Error ? error.constructor.name : "NonError"
+    const errorClass = new Set(["AbortError", "DatabaseError", "Error", "RangeError", "TaskGraphCommandError",
+      "TurnStateRefreshRetryError", "TypeError"]).has(name) ? name : error instanceof Error ? "OtherError" : "NonError"
+    const row = debugRecord(error), candidates = [row?.code, error instanceof Error ? error.message : undefined]
+    const code = candidates.find((value): value is string => typeof value === "string"
+      && (safeErrorCodes.has(value) || /^[0-9A-Z]{5}$/.test(value)))
+    return { errorClass, ...(code ? { errorCode: /^[0-9A-Z]{5}$/.test(code) ? `pg_sqlstate_${code}` : code } : {}) }
+  }
+  const outcome = (value: unknown): string => {
+    const row = debugRecord(value), status = row?.status
+    if (row && typeof status === "string" && safeStatuses.has(status)) {
+      const code = typeof row.errorCode === "string" && safeErrorCodes.has(row.errorCode) ? `:${row.errorCode}` : ""
+      return `${status}${code}`
+    }
+    return row?.ok === false ? "blocked" : "ok"
+  }
+  const observe = async <T>(phase: string, work: () => Promise<T>, describe: (value: T) => string = outcome): Promise<T> => {
+    try {
+      const result = await work()
+      phases.push({ phase, outcome: describe(result) })
+      return result
+    } catch (error: unknown) {
+      phases.push({ phase, ...errorDiagnostic(error) })
+      throw error
+    }
+  }
+  const run = async (): Promise<TurnEngineResult> => {
+    const lease = fixture.turnLease, owner = { ...fixture.owner, turnLeaseOwnerId: lease.ownerId, turnLeaseVersion: lease.leaseVersion }
+    const executionOwner = fixture.turnExecutionOwner as TurnExecutionOwnerFence
+    const store = createPgTurnEngineStore(pool as never), candidateStore = createScheduledPipelineCandidateStore(pool as never, store)
+    const rootStore = createPgRootTaskStore(pool as never)
+    await observe("root.ensure", () => rootStore.ensure({ lease, goal: "Finish the scheduled automation only after its current Audit proof",
+      allowedActions: scheduledGateRootActions() }), () => "ensured")
+    const recoveredCandidate = await observe("candidate.read", () => candidateStore.read({ owner: executionOwner,
+      rootAttemptCount: owner.rootAttemptCount }), value => value ? "present" : "absent")
+    if (!recoveredCandidate) throw new Error("scheduled Audit root candidate missing")
+    phases.push({ phase: "owner_attempt_binding", outcome: owner.rootAttemptCount === fixture.owner.rootAttemptCount
+      && owner.turnLeaseOwnerId === lease.ownerId && owner.turnLeaseVersion === lease.leaseVersion
+      && executionOwner.userId === owner.userId && executionOwner.sessionId === owner.sessionId
+      && executionOwner.turnId === owner.turnId && executionOwner.taskId === owner.rootTaskId
+      && executionOwner.ownerId === lease.ownerId && executionOwner.leaseVersion === lease.leaseVersion ? "matched" : "mismatch" })
+    phases.push({ phase: "candidate_step_binding", outcome: recoveredCandidate.finalStepId === fixture.rootQuestionStepId
+      && Number.isSafeInteger(recoveredCandidate.finalStepOrdinal) ? "matched_historical_step" : "other_step" })
+    const tracedFetcher: typeof fetch = (...args) => observe("web.fetch", () => fetcher(...args), response => response.ok ? "http_ok" : "http_non_ok")
+    const prepareContinuationBase = createScheduledAutomationPrepareContinuation({ commandPort, waitPort,
+      async verifyReadyPrepare({ scope, prepareTaskId }) {
+        const graph = await loadTaskGraph(pool as never, scope, false), current = currentTaskGraph(graph), task = graph.tasks.get(prepareTaskId)
+        if (!graph.snapshot || !task || !Number.isSafeInteger(task.attemptCount)) return { verified: false, reasonCode: "scheduled_prepare_graph_invalid" }
+        return verifyScheduledPrepareTaskGraphEvidence(pool as never, { scope: { ...scope, taskId: prepareTaskId, attemptCount: task.attemptCount! },
+          snapshot: graph.snapshot, current, tasks: graph.tasks, structuredResult: debugRecord(task.result)?.structuredResult,
+          completionGraphRevision: current.revision, referenceVerificationMode: { phase: "persisted_gate" } })
+      } })
+    const prepareContinuation: typeof prepareContinuationBase = input => observe("continue_after_analyze",
+      () => prepareContinuationBase(input))
+    const gateContinuationBase = createScheduledAutomationGateContinuation({ pool: pool as never, commandPort, waitPort,
+      nativeQuestionWaitEnabled: false, fetcher: tracedFetcher })
+    const gateContinuation: typeof gateContinuationBase = input => observe(
+      "mode" in input && input.mode === "resume_audit" ? "continue_after_gate.resume_audit" : "continue_after_gate.append_audit",
+      () => gateContinuationBase(input))
+    const checkRootCompletion = rootStore.checkCompletion
+    if (typeof checkRootCompletion !== "function") throw new Error("Scheduled Audit fixture requires the production root completion verifier")
+    const baseCompletionGate: NonNullable<TurnEngineOptions["completionGate"]> = async () => observe("root.completion_verifier",
+      () => checkRootCompletion.call(rootStore, { lease, rootTaskId: fixture.ids.rootTaskId, taskGraphVerification: true }),
+      result => result.ok ? "allowed" : "blocked")
+    const completionGate = attachScheduledPipelineCompletion({ gate: baseCompletionGate, owner,
+      async bridge() {
+        const attestation = await observe("pipeline.bridge", () => fixture.reattestCurrentTurn(lease), () => "reattested")
+        return { status: "ready" as const, attestation }
+      },
+      continueAfterAnalyze: prepareContinuation, continueAfterGate: gateContinuation, fetcher: tracedFetcher,
+      stageCandidate: input => observe("candidate.stage", () => candidateStore.stage(input), () => "staged"),
+      onWebAccepted() { phases.push({ phase: "web.accepted", outcome: "called" }) },
+      rootAttemptCount: owner.rootAttemptCount, recoveredCandidate })
+    const profile: ModelAdapter["profile"] = { provider: "fixture", model: "scheduled-audit-root", nativeTools: true,
+      structuredOutput: true, streaming: true, continuationCursor: false, supportsParallelTools: false,
+      supportsStreamingToolArgs: false, supportsReasoningSummary: false, supportsResponseContinuation: false,
+      supportsProviderConversation: false, supportsBackgroundResponse: false, maxContextTokens: null,
+      maxOutputTokens: 128, costClass: "low" }
+    const model: ModelAdapter = { id: "scheduled-audit-root", profile,
+      async *stream() { throw new Error("scheduled Audit root candidate replay unexpectedly called the model") } }
+    const options: TurnEngineOptions = { lease, rootTaskId: fixture.ids.rootTaskId, taskId: fixture.ids.rootTaskId,
+      scope: { userId: fixture.ids.userId }, goal: "Complete the verified scheduled automation",
+      snapshot: { system: [], profile: [], steerHistory: [], toolObservations: [],
+        businessRefs: fixture.preparedJobIds.map(id => ({ id, kind: "job" as const, ownerId: fixture.ids.userId })) },
+      contextBuilder: { async build(request) { return { schemaVersion: "agent-harness.v2", sessionId: request.sessionId,
+        turnId: request.turnId, stepId: request.stepId, inputThroughSequence: 0n, consumedInputIds: [], blocks: [], canonicalJson: "{}" } } },
+      store, model, tools: [], executeTool: async ({ call }) => ({ id: call.id, toolName: call.toolName,
+        toolVersion: call.toolVersion, status: "completed", errorCode: null }), completionGate,
+      recoveredFinalCandidate: recoveredCandidate.candidateText,
+      resume: { nextOrdinal: recoveredCandidate.finalStepOrdinal + 1, stepCount: recoveredCandidate.finalStepOrdinal + 1,
+        toolCallCount: 0, inputThroughSequence: 0n, consumedInputIds: [],
+        usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } } }
+    return new TurnEngine(options).run()
+  }
+  try {
+    return await run()
+  } catch (error: unknown) {
+    throw new Error(`Scheduled Audit root failed with redacted diagnostics: ${JSON.stringify({ ...errorDiagnostic(error), phases })}`)
+  }
 }
 
 async function readRootTurnState(fixture: Fixture): Promise<Readonly<{ turnStatus: string; rootStatus: string; rootResult: Record<string, unknown> | null }>> {

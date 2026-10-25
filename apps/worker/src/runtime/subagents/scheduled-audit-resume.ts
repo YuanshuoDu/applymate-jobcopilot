@@ -3,8 +3,15 @@ import type { DurableWaitPort, DurableWaitResult } from "../tools/coordination-t
 import type { TaskGraphCommandPort, TaskGraphReadScope } from "./task-graph-command-port.js"
 import { currentTaskGraph, loadTaskGraph, lockTaskGraphScope, type GraphIdentityScope } from "./task-graph-pg-state.js"
 import type { Queryable } from "./pg-store-persistence.js"
-import { canonicalTaskGraphJson } from "./task-graph-snapshot.js"
+import { canonicalTaskGraphJson, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 import { readScheduledAuditRegistration, verifyRegisteredScheduledAuditGate } from "./scheduled-audit-invocation.js"
+import { scheduledGateCheckpointEvidence, scheduledGatePreparedJobIds, SCHEDULED_GATE_NODE_CRITERIA, SCHEDULED_GATE_NODE_GOAL,
+  SCHEDULED_GATE_OUTPUT_SCHEMA, SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE, SCHEDULED_GATE_TEMPLATE_ID } from "./scheduled-gate-contract.js"
+import { readScheduledGateRegistrationReceipt } from "./scheduled-gate-registration-receipt.js"
+import { loadPersistedScheduledPrepareProof } from "./scheduled-gate-wait-match.js"
+import { verifyPersistedScheduledPreparePrefix } from "./pg-scheduled-task-graph-gate-verification.js"
+import { scheduledSnapshotMatches, scheduledTaskGraphClaimMatches, type ScheduledTaskGraphContinuationBinding } from "./scheduled-taskgraph-continuation-receipt.js"
+import { scheduledQuestionWaitId } from "./scheduled-gate-child-runtime.js"
 import {
   SCHEDULED_AUDIT_NODE_CRITERIA, SCHEDULED_AUDIT_NODE_GOAL, SCHEDULED_AUDIT_OUTPUT_SCHEMA,
   SCHEDULED_AUDIT_REGISTRATION_RECEIPT_EVENT, SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE,
@@ -26,9 +33,12 @@ export async function readScheduledAuditResumeContext(client: Queryable,
   if (!loaded.item || !loaded.snapshot || !loaded.state || !nodes) return { status: "invalid" }
   const audits = nodes.filter(node => node.key === SCHEDULED_AUDIT_TEMPLATE_ID)
   if (audits.length === 0) {
-    if (nodes.length < 2 || nodes.length > 4) return { status: "invalid" }
-    return await hasOrphanAuditRegistration(client, scope, input.scope.parentAttemptCount)
-      ? { status: "invalid" } : { status: "not_registered" }
+    if (nodes.length === 4) {
+      if (await hasOrphanAuditRegistration(client, scope, input.scope.parentAttemptCount)) return { status: "invalid" }
+      return readRegisteredGateContinuation(client, input.scope, loaded)
+    }
+    if (nodes.length < 2 || nodes.length > 3) return { status: "invalid" }
+    return await hasOrphanAuditRegistration(client, scope, input.scope.parentAttemptCount) ? { status: "invalid" } : { status: "not_registered" }
   }
   const node = audits.length === 1 ? audits[0] : undefined
   const task = node && loaded.tasks.get(node.taskId), current = currentTaskGraph(loaded)
@@ -54,6 +64,93 @@ export async function readScheduledAuditResumeContext(client: Queryable,
       executionAttemptCount: registration.owner.executionAttemptCount }, snapshotDigest: registration.snapshotDigest, gateProof }
 }
 
+async function readRegisteredGateContinuation(client: Queryable, scope: TaskGraphReadScope,
+  loaded: Awaited<ReturnType<typeof loadTaskGraph>>): Promise<ScheduledAuditResumeContext> {
+  const nodes = loaded.snapshot?.nodes, gateNode = nodes?.[3], gate = gateNode && loaded.tasks.get(gateNode.taskId)
+  const current = currentTaskGraph(loaded), currentGate = current.nodes.find(node => node.key === SCHEDULED_GATE_TEMPLATE_ID)
+  if (!nodes || nodes.length !== 4 || !gateNode || gateNode.key !== SCHEDULED_GATE_TEMPLATE_ID
+    || gateNode.templateId !== SCHEDULED_GATE_TEMPLATE_ID || gateNode.depth !== 4
+    || gateNode.verificationDisposition !== "specialized" || gateNode.verification !== undefined
+    || gateNode.goal !== SCHEDULED_GATE_NODE_GOAL || !same(gateNode.successCriteria, SCHEDULED_GATE_NODE_CRITERIA)
+    || !same(gateNode.dependsOn, ["prepare"]) || !gate || !currentGate || currentGate.taskId !== gate.id
+    || currentGate.status !== gate.status || (currentGate.failureReason ?? null) !== gate.failureReason
+    || !["queued", "running", "retrying", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"].includes(gate.status)
+    || gate.role !== SCHEDULED_GATE_ROLE || gate.taskType !== SCHEDULED_GATE_TASK_TYPE
+    || !same(gate.expectedOutputSchema, SCHEDULED_GATE_OUTPUT_SCHEMA) || !same(gate.allowedActions, []) || gate.contextIsEmpty !== true
+    || !Number.isSafeInteger(gate.attemptCount) || gate.attemptCount! < 0
+    || gate.status === "completed" && gate.failureReason !== null) return { status: "invalid" }
+  const executionRows = await client.query(`SELECT "id", "status", "attemptCount", "state", clock_timestamp() AS "now"
+    FROM "agent_executions" WHERE "userId" = $1 AND "sessionId" = $2 FOR UPDATE`, [scope.userId, scope.sessionId])
+  if (executionRows.rows.length !== 1) return { status: "invalid" }
+  const execution = record(executionRows.rows[0]), evidence = scheduledGateCheckpointEvidence(execution?.state)
+  const owner = evidence && { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
+    rootAttemptCount: evidence.owner.rootAttemptCount, executionId: evidence.owner.executionId,
+    executionAttemptCount: evidence.owner.executionAttemptCount }
+  const registration = owner && evidence && await readScheduledGateRegistrationReceipt(client, {
+    userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, owner, gateTaskId: gate.id })
+  if (!execution || !evidence || !owner || !registration || execution.id !== registration.owner.executionId
+    || execution.status !== "running" || Number(execution.attemptCount) !== registration.owner.executionAttemptCount
+    || evidence.owner.userId !== scope.userId || evidence.owner.sessionId !== scope.sessionId
+    || evidence.owner.turnId !== scope.turnId || evidence.owner.rootTaskId !== scope.rootTaskId
+    || evidence.owner.rootAttemptCount !== scope.parentAttemptCount
+    || registration.owner.rootAttemptCount !== scope.parentAttemptCount
+    || registration.continuationKey !== evidence.continuationKey || registration.snapshotDigest !== evidence.snapshotDigest
+    || registration.evidenceDigest !== evidence.evidenceDigest || registration.checkpointDigest !== evidence.checkpointDigest
+    || registration.analyzeGraphRevision !== evidence.analyzeGraphRevision
+    || registration.gateTaskId !== gate.id || registration.gateAppendRevision <= 0
+    || !gateAppendRevisionMatches(loaded, gate.id, registration.gateAppendRevision, scope.rootTaskId)) return { status: "invalid" }
+  const executionState = record(execution.state), claim = record(executionState?.scheduledTaskGraphClaim)
+  const checkpointOwner = record(record(executionState?.scheduledTaskGraphContinuation)?.owner)
+  const turnLeaseOwnerId = checkpointOwner?.turnLeaseOwnerId, turnLeaseVersion = checkpointOwner?.turnLeaseVersion
+  const claimToken = claim?.claimToken
+  if (!checkpointOwner || typeof claimToken !== "string" || typeof turnLeaseOwnerId !== "string" || !Number.isSafeInteger(turnLeaseVersion)
+    || checkpointOwner.userId !== evidence.owner.userId || checkpointOwner.sessionId !== evidence.owner.sessionId
+    || checkpointOwner.turnId !== evidence.owner.turnId || checkpointOwner.rootTaskId !== evidence.owner.rootTaskId
+    || checkpointOwner.rootAttemptCount !== evidence.owner.rootAttemptCount
+    || checkpointOwner.executionId !== evidence.owner.executionId
+    || checkpointOwner.executionAttemptCount !== evidence.owner.executionAttemptCount) return { status: "invalid" }
+  const binding: ScheduledTaskGraphContinuationBinding = { owner: { ...evidence.owner,
+    turnLeaseOwnerId, turnLeaseVersion: Number(turnLeaseVersion) }, continuationKey: evidence.prepareWaitContinuationKey,
+    snapshotDigest: evidence.snapshotDigest, evidenceDigest: evidence.evidenceDigest, checkpointDigest: evidence.checkpointDigest,
+    analyzeGraphRevision: evidence.analyzeGraphRevision, prepareScheduleRevision: evidence.analyzeGraphRevision + 1 }
+  const now = execution.now instanceof Date || typeof execution.now === "string" ? execution.now : undefined
+  const claimDigest = `sha256:${createHash("sha256").update(claimToken, "utf8").digest("hex")}`
+  if (!scheduledTaskGraphClaimMatches(execution.state, binding, claimDigest, now)) return { status: "invalid" }
+  const turnRows = await client.query(`SELECT "source", "executionMode", "input" FROM "agent_turns"
+    WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 AND "rootTaskId" = $4`,
+  [scope.turnId, scope.sessionId, scope.userId, scope.rootTaskId])
+  const turn = record(turnRows.rows[0]), scheduledWaitId = scheduledQuestionWaitId(turn?.input, execution.state, scope.turnId)
+  const prepareNode = nodes[2], prepare = prepareNode && loaded.tasks.get(prepareNode.taskId)
+  const proof = prepare && prepare.status === "completed" ? await loadPersistedScheduledPrepareProof(client, scope,
+    prepare.id, prepare.result, evidence.prepareWaitContinuationKey, registration.prepareWaitId) : null
+  if (turnRows.rows.length !== 1 || !scheduledSnapshotMatches(turn, evidence.snapshotDigest) || scheduledWaitId === null
+    || !prepareNode || prepareNode.key !== "prepare" || !prepare || !proof || !scheduledGatePreparedJobIds(proof)
+    || proof.receipt.continuationKey !== evidence.continuationKey
+    || proof.receipt.owner.userId !== registration.owner.userId || proof.receipt.owner.sessionId !== registration.owner.sessionId
+    || proof.receipt.owner.turnId !== registration.owner.turnId || proof.receipt.owner.rootTaskId !== registration.owner.rootTaskId
+    || proof.receipt.owner.rootAttemptCount !== registration.owner.rootAttemptCount
+    || proof.receipt.owner.executionId !== registration.owner.executionId
+    || proof.receipt.owner.executionAttemptCount !== registration.owner.executionAttemptCount
+    || proof.receipt.snapshotDigest !== evidence.snapshotDigest || proof.receipt.evidenceDigest !== evidence.evidenceDigest
+    || proof.receipt.checkpointDigest !== evidence.checkpointDigest || proof.receipt.analyzeGraphRevision !== evidence.analyzeGraphRevision
+    || proof.receipt.prepareScheduleRevision !== registration.prepareScheduleRevision
+    || proof.completion.wait.waitId !== registration.prepareWaitId
+    || registration.gateAppendRevision <= proof.completion.graphRevision || registration.gateAppendRevision > loaded.state!.revision
+    || !await verifyPersistedScheduledPreparePrefix(client, scope, loaded, proof)) return { status: "invalid" }
+  const handoff = { status: "analyze_checkpointed" as const, continuationKey: evidence.prepareWaitContinuationKey,
+    checkpointDigest: evidence.checkpointDigest, claimTokenDigest: claimDigest,
+    executionId: registration.owner.executionId, executionAttemptCount: registration.owner.executionAttemptCount }
+  return { status: "gate_continuation", handoff, prepareProof: proof, ...(scheduledWaitId ? { scheduledWaitId } : {}) }
+}
+
+function gateAppendRevisionMatches(loaded: Awaited<ReturnType<typeof loadTaskGraph>>, gateTaskId: string, revision: number, rootTaskId: string): boolean {
+  const events = loaded.state?.appliedEvents.filter(event => event.nodeKey === SCHEDULED_GATE_TEMPLATE_ID && event.type === "task.started"
+    && event.idempotencyKey === taskGraphLifecycleKey(rootTaskId, SCHEDULED_GATE_TEMPLATE_ID, 1, "task.started")) ?? []
+  const gate = loaded.tasks.get(gateTaskId)
+  return events.length === 1 ? events[0]?.expectedRevision === revision
+    : events.length === 0 && gate?.status === "queued" && gate.attemptCount === 0 && loaded.state?.revision === revision
+}
+
 async function hasOrphanAuditRegistration(client: Queryable, scope: GraphIdentityScope, rootAttemptCount: number): Promise<boolean> {
   const result = await client.query(`SELECT event."itemId", event."taskId", event."actor", event."idempotencyKey", event."payload",
       EXISTS (SELECT 1 FROM "agent_outbox" AS outbox WHERE outbox."idempotencyKey" = 'agent-event:' || event."id"
@@ -76,6 +173,7 @@ async function hasOrphanAuditRegistration(client: Queryable, scope: GraphIdentit
 export async function resumeScheduledAudit(input: Readonly<{ command: ResumeCommand; waitPort: Pick<DurableWaitPort, "wait">;
   scope: TaskGraphReadScope; finalStepId: string; signal: AbortSignal }>): Promise<
   | Readonly<{ status: "not_registered" | "completed" }>
+  | Extract<ScheduledAuditResumeContext, { status: "gate_continuation" }>
   | Readonly<{ status: "waiting_for_dependency"; waitId: string }>
   | Readonly<{ status: "blocked"; errorCode: string }>> {
   if (input.signal.aborted) throw input.signal.reason ?? new Error("scheduled_audit_resume_cancelled")
@@ -85,6 +183,7 @@ export async function resumeScheduledAudit(input: Readonly<{ command: ResumeComm
   }
   let context = await command.readScheduledAuditResumeContext({ scope: input.scope })
   if (context.status === "not_registered") return { status: "not_registered" }
+  if (context.status === "gate_continuation") return context
   if (context.status !== "registered") return { status: "blocked", errorCode: "scheduled_audit_resume_invalid" }
   if (context.auditStatus !== "completed") {
     const initialContext = context

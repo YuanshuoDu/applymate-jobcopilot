@@ -6,8 +6,11 @@ import { attachScheduledPipelineCompletion, completeScheduledPipelineBeforeTermi
 import { createScheduledAutomationGateContinuation } from "./scheduled-automation-gate-bridge.js"
 import { scheduledTaskGraphContinuationKey } from "./scheduled-pipeline-handoff.js"
 import { scheduledPrepareChoiceWaitId } from "../turns/turn-question-contract.js"
-import { SCHEDULED_PREPARE_COMPLETION_SCHEMA } from "./scheduled-prepare-task-graph-verification.js"
+import { SCHEDULED_PREPARE_COMPLETION_SCHEMA, scheduledPrepareResultDigest,
+  type ScheduledPrepareTaskGraphProof } from "./scheduled-prepare-task-graph-verification.js"
 import { SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_SCHEMA, scheduledTaskGraphStableContinuationKey } from "./scheduled-taskgraph-continuation-receipt.js"
+import { ROLE_RESULT_SCHEMA, type PrepareResult } from "./role-results.js"
+import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
 import type { ScheduledAutomationPipelineAttestation, ScheduledAutomationPipelineBridgeResult, ScheduledAutomationPipelineBridgeScope } from "./scheduled-automation-pipeline-bridge.js"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import type { TurnQuestionGateChoiceBinding } from "../turns/turn-question-gate-choice-contract.js"
@@ -41,24 +44,40 @@ const analyzeProof = () => {
   return { status: "analyze_checkpointed", continuationKey: scheduledTaskGraphContinuationKey(owner, analyzeAttestation, executionId, executionAttemptCount),
     checkpointDigest: "b".repeat(64), claimTokenDigest: `sha256:${"c".repeat(64)}`, executionId, executionAttemptCount }
 }
-const readyPrepare = (choiceRequired = true) => {
+const readyPrepare = (choiceRequired = true): Readonly<{ status: "ready"; choice:
+  | Readonly<{ required: true; status: "answered"; scheduledWaitId: string }>
+  | Readonly<{ required: false }>; prepareProof: ScheduledPrepareTaskGraphProof }> => {
   const handoff = analyzeProof()
   const baseReceipt = { schemaVersion: SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_SCHEMA,
     owner: { ...owner, executionId: handoff.executionId, executionAttemptCount: handoff.executionAttemptCount },
     continuationKey: handoff.continuationKey, snapshotDigest: analyzeAttestation.snapshotDigest,
     evidenceDigest: analyzeAttestation.evidenceDigest, checkpointDigest: handoff.checkpointDigest,
     analyzeGraphRevision: analyzeAttestation.graphRevision, prepareScheduleRevision: analyzeAttestation.graphRevision + 1 }
-  const receipt = { ...baseReceipt, continuationKey: scheduledTaskGraphStableContinuationKey(baseReceipt)! }
-  const scheduledWaitId = scheduledPrepareChoiceWaitId({ receipt, finalStepId: "step-final", finalStepOrdinal: 3 })!
-  const nodes = [
-    { taskId: "scout-1", role: "scout", status: "completed" },
-    { taskId: "analyst-1", role: "analyst", status: "completed" },
-    { taskId: "prepare-1", role: "prepare", status: "completed" },
+  const continuationKey = scheduledTaskGraphStableContinuationKey(baseReceipt)
+  if (!continuationKey) throw new Error("invalid Prepare continuation receipt fixture")
+  const receipt: ScheduledPrepareTaskGraphProof["receipt"] = { ...baseReceipt, continuationKey }
+  const result: PrepareResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status: "completed", taskId: "prepare-1",
+    attemptCount: 1, snapshotDigest: analyzeAttestation.snapshotDigest, checkpointDigest: handoff.checkpointDigest,
+    jobs: [{ jobId: "job-1", status: "prepared" }], materials: [{ jobId: "job-1", kind: "resume", artifactRef: {
+      artifactId: "scheduled-draft:resume-1", version: 1, contentHash: `sha256:${"c".repeat(64)}`, sourceDigest: `sha256:${"d".repeat(64)}`,
+    } }] }
+  const nodes: ScheduledPrepareTaskGraphProof["completion"]["nodes"] = [
+    { taskId: "scout-1", attemptCount: 1, role: "scout", taskType: TASK_GRAPH_TEMPLATES.scout.taskType,
+      status: "completed", verification: "passed", dependsOnTaskIds: [] },
+    { taskId: "analyst-1", attemptCount: 1, role: "analyst", taskType: TASK_GRAPH_TEMPLATES.analyst.taskType,
+      status: "completed", verification: "passed", dependsOnTaskIds: ["scout-1"] },
+    { taskId: "prepare-1", attemptCount: 1, role: "prepare", taskType: TASK_GRAPH_TEMPLATES.prepare.taskType,
+      status: "completed", verification: "passed", dependsOnTaskIds: ["analyst-1"],
+      tool: "scheduled.application.prepare@1", resultDigest: scheduledPrepareResultDigest(result) },
   ]
-  return { status: "ready" as const, choice: choiceRequired ? { required: true as const, status: "answered" as const, scheduledWaitId } : { required: false as const }, prepareProof: { receipt,
-    completion: { schemaVersion: SCHEDULED_PREPARE_COMPLETION_SCHEMA, graphRevision: 4, nodes,
-      wait: { status: "ready", mode: "all", waitId: "graph-wait-1", targetTaskIds: ["prepare-1"], matchedTaskIds: ["prepare-1"] } },
-    result: { role: "prepare", status: "completed" } } }
+  const completion: ScheduledPrepareTaskGraphProof["completion"] = { schemaVersion: SCHEDULED_PREPARE_COMPLETION_SCHEMA,
+    graphRevision: 4, nodes, wait: { status: "ready", mode: "all", waitId: "graph-wait-1",
+      targetTaskIds: ["prepare-1"], matchedTaskIds: ["prepare-1"] } }
+  const prepareProof: ScheduledPrepareTaskGraphProof = { receipt, completion, result }
+  const scheduledWaitId = scheduledPrepareChoiceWaitId({ receipt, finalStepId: "step-final", finalStepOrdinal: 3 })
+  if (!scheduledWaitId) throw new Error("invalid scheduled Prepare choice fixture")
+  return { status: "ready", choice: choiceRequired ? { required: true, status: "answered", scheduledWaitId } : { required: false },
+    prepareProof }
 }
 const base = () => ({ executionOwner, rootAttemptCount: owner.rootAttemptCount,
   finalStepId: "step-final", finalStepOrdinal: 3, stageCandidate: vi.fn(async () => undefined) })
@@ -94,6 +113,35 @@ describe("scheduled pipeline pre-terminal completion", () => {
       .resolves.toEqual({ status: "waiting_for_dependency", waitId: "audit-wait", candidateText: "Final." })
     expect(stageCandidate).toHaveBeenCalledOnce()
     expect(bridge).not.toHaveBeenCalled()
+  })
+
+  it("reconstructs a persisted Gate continuation before Web and preserves its choice wait", async () => {
+    const prepared = readyPrepare(), handoff = { ...analyzeProof(), status: "analyze_checkpointed" as const },
+      scheduledWaitId = "agent-question:turn-1:canonical:root-wait"
+    const binding = {} as TurnQuestionGateChoiceBinding
+    const order: string[] = [], stageCandidate = vi.fn(async () => { order.push("stage") })
+    const bridge = vi.fn(async () => { order.push("bridge"); return { status: "ready" as const, attestation: analyzeAttestation } })
+    const fetcher = vi.fn<typeof fetch>()
+    const continueAfterGate = vi.fn(async input => {
+      if ("mode" in input && input.mode === "resume_audit") {
+        order.push("recover")
+        return { status: "gate_continuation" as const, handoff, prepareProof: prepared.prepareProof, scheduledWaitId }
+      }
+      order.push("gate")
+      expect(input).toMatchObject({ owner, executionOwner, attestation: analyzeAttestation, handoff,
+        prepareProof: prepared.prepareProof, scheduledWaitId, finalStepId: "step-final" })
+      return { status: "waiting_for_choice" as const, waitId: "gate-question-wait",
+        question: "Choose a fixed option.", binding }
+    })
+
+    await expect(completeScheduledPipelineBeforeTerminal({ ...base(), owner, candidateText: "Final candidate", stageCandidate,
+      signal: new AbortController().signal, bridge, continueAfterGate, fetcher }))
+      .resolves.toEqual({ status: "waiting_for_scheduled_gate_choice", waitId: "gate-question-wait",
+        question: "Choose a fixed option.", binding, candidateText: "Final candidate" })
+    expect(order).toEqual(["recover", "bridge", "stage", "gate"])
+    expect(stageCandidate).toHaveBeenCalledOnce()
+    expect(fetcher).not.toHaveBeenCalled()
+    expect(continueAfterGate).toHaveBeenCalledTimes(2)
   })
 
   it("does not call the bridge or Web when Audit resume finds an orphan registration", async () => {

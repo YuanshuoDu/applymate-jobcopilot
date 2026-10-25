@@ -19,6 +19,8 @@ const WAIT_TIMEOUT_MS = 24 * 60 * 60 * 1_000
 export type ScheduledPipelineGateContinuationResult = Readonly<{ status: "waiting_for_dependency"; waitId: string }>
   | Readonly<{ status: "waiting_for_choice"; waitId: string; question: string; binding: TurnQuestionGateChoiceBinding }>
   | Readonly<{ status: "waiting_for_external_user"; waitId: string }>
+  | Readonly<{ status: "gate_continuation"; handoff: ScheduledAnalyzeCheckpointHandoff;
+      prepareProof: ScheduledPrepareTaskGraphProof; scheduledWaitId?: string }>
   | Readonly<{ status: "not_registered" }>
   | Readonly<{ status: "completed" }>
   | Readonly<{ status: "blocked"; errorCode: string }>

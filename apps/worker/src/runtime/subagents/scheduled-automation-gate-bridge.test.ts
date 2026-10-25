@@ -114,6 +114,21 @@ describe("scheduled automation Gate continuation", () => {
     expect(deps.commandPort.appendScheduledAudit).not.toHaveBeenCalled()
   })
 
+  it("propagates a validated Gate continuation context for root recovery", async () => {
+    const recovery = { status: "gate_continuation" as const,
+      handoff: { status: "analyze_checkpointed" as const, continuationKey: `scheduled-taskgraph:sha256:${"a".repeat(64)}`,
+        checkpointDigest: "d".repeat(64), claimTokenDigest: `sha256:${"e".repeat(64)}`,
+        executionId: "execution-1", executionAttemptCount: 3 }, prepareProof, scheduledWaitId: "agent-question:turn-1:canonical:wait" }
+    const deps = dependencies({ readScheduledAuditResumeContext: vi.fn(async () => recovery as never) })
+    const run = createScheduledAutomationGateContinuation({ ...deps, nativeQuestionWaitEnabled: true } as never)
+    await expect(run({ owner, executionOwner, mode: "resume_audit", finalStepId: "root-final-step",
+      signal: new AbortController().signal } as never)).resolves.toEqual(recovery)
+    expect(deps.commandPort.readScheduledAuditResumeContext).toHaveBeenCalledOnce()
+    expect(deps.commandPort.appendScheduledGate).not.toHaveBeenCalled()
+    expect(deps.commandPort.appendScheduledAudit).not.toHaveBeenCalled()
+    expect(deps.waitPort.wait).not.toHaveBeenCalled()
+  })
+
   it("does not append Audit when exact Gate completion proof is missing", async () => {
     mock.selectResume.mockResolvedValue({ status: "initial" })
     mock.readCandidate.mockResolvedValue(null)

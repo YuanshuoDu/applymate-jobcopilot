@@ -133,6 +133,8 @@ export type TaskGraphScheduledAuditCompletionInput = Readonly<{
 export type TaskGraphScheduledAuditResumeInput = Readonly<{ scope: TaskGraphReadScope }>
 export type ScheduledAuditResumeContext =
   | Readonly<{ status: "not_registered" | "invalid" }>
+  | Readonly<{ status: "gate_continuation"; handoff: ScheduledAnalyzeCheckpointHandoff;
+      prepareProof: ScheduledGateCompletionProof["prepareProof"]; scheduledWaitId?: string }>
   | Readonly<{ status: "registered"; auditTaskId: string; auditStatus: "queued" | "retrying" | "running" | "completed";
       expectedAttemptCount: number; owner: ScheduledAuditOwner; executionOwner: ScheduledTaskGraphExecutionOwner;
       snapshotDigest: string; gateProof: ScheduledGateCompletionProof }>
