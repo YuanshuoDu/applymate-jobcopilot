@@ -488,6 +488,9 @@ async function setupFetcher(fixture: Fixture) {
       pipelineOutcome = "not_called"
       continuation = { gateResume: "not_called", analyzeCheckpoint: "not_checked", continuationKey: "not_checked", waitBinding: "not_checked",
         ownerCurrentRecheck: "not_checked", prepareWait: "not_checked", gateInputRecheck: "not_checked", gateProofCurrent: "not_checked",
+        gateHandoff: "not_called", claimLease: "not_checked", storedStage: "not_checked", completionProof: "not_checked",
+        completionPrepareProof: "not_checked", preparedArtifactRefs: "not_checked", gateDecisions: "not_checked",
+        persistedGateDecisions: "not_checked", gateOutput: "not_checked",
         serializedCheckpoint: "not_called", checkpointSave: "not_called" }
     }
     const response = await route.POST(request)
