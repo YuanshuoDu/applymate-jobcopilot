@@ -68,7 +68,16 @@ async function runGateAction(request: ScheduledTaskGraphGateRpcRequest, signal?:
     packages: loaded.packages, materials: loaded.materials })
   if (!handoff) return blocked(409, 'scheduled_pipeline_attestation_invalid')
 
-  const assertCurrent = (tx: Prisma.TransactionClient) => assertGateActionCurrent(tx, request, locked, signal, loaded.materials)
+  const assertCurrent = (tx: Prisma.TransactionClient) => assertGateActionCurrent(tx, request, locked, signal)
+  const assertFenceCurrent = (tx: Prisma.TransactionClient) => assertGateActionCurrent(tx, request, locked, signal, loaded.materials)
+  const assertFreshCurrent = async () => {
+    if (signal?.aborted) return false
+    const fresh = await loadScheduledTaskGraphGateInput({ owner: locked.owner, snapshot, analyzeCheckpoint: checkpoint,
+      analyzeAttestation: request.attestation, prepareProof: request.prepareProof,
+      gate: { taskId: request.gateTaskId, attemptCount: request.gateAttemptCount, phase: 'running' } })
+    return Boolean(fresh && sameJson(materialRefs(fresh.materials), materialRefs(loaded.materials))
+      && !signal?.aborted && await db.$transaction(assertCurrent))
+  }
   const configured = await loadUserAiConfig(locked.owner.userId, 'autoApply')
   const aiConfig = configured.resolvedKey
     ? { ...configured, usageUserId: locked.owner.userId, usageFeatureKey: 'autoApply', usageRuntime: 'worker' as const }
@@ -88,8 +97,8 @@ async function runGateAction(request: ScheduledTaskGraphGateRpcRequest, signal?:
     defaultResume: { id: resume.id, name: resume.name, templateId: resume.templateId ?? null,
       templateOptions: resume.templateOptions, directionId: resume.directionId ?? null, basicsDetached: resume.basicsDetached ?? false },
     aiConfig, executionAttempt: { id: locked.owner.executionId, attemptCount: locked.owner.executionAttemptCount },
-    scheduledTaskGraphOwnerFence: { owner: locked.owner, key: locked.key, claimToken: locked.claimToken, assertCurrent },
-    assertExecutionCurrent: async () => !signal?.aborted && db.$transaction(assertCurrent),
+    scheduledTaskGraphOwnerFence: { owner: locked.owner, key: locked.key, claimToken: locked.claimToken, assertCurrent: assertFenceCurrent },
+    assertExecutionCurrent: assertFreshCurrent,
     autonomous: snapshot.autoApply, emit: () => undefined, signal,
   }
   let failurePhase: GateFailurePhase = 'owner_assertion'
@@ -200,11 +209,12 @@ async function lockOwner(tx: Prisma.TransactionClient, request: GateAction, sign
 }
 
 async function assertGateActionCurrent(tx: Prisma.TransactionClient, request: ScheduledTaskGraphGateRpcRequest, locked: OwnerState,
-  signal: AbortSignal | undefined, expectedMaterials: readonly { jobId: string; kind: string; artifactRef: unknown }[]): Promise<boolean> {
+  signal: AbortSignal | undefined, expectedMaterials?: readonly { jobId: string; kind: string; artifactRef: unknown }[]): Promise<boolean> {
   if (signal?.aborted) return false
   const current = await lockOwner(tx, request, signal)
   if (!current || current.owner.executionId !== locked.owner.executionId || current.owner.executionAttemptCount !== locked.owner.executionAttemptCount
     || current.key !== locked.key || current.claimToken !== locked.claimToken) return false
+  if (!expectedMaterials) return true
   const checkpoint = scheduledTaskGraphAnalyzeCheckpointForGate(current.state)
   const fresh = checkpoint && await loadScheduledTaskGraphGateInput({ owner: current.owner, snapshot: current.snapshot,
     analyzeCheckpoint: checkpoint, analyzeAttestation: request.attestation, prepareProof: request.prepareProof,

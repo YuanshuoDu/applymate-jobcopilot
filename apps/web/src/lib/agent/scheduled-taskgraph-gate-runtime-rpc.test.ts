@@ -148,6 +148,28 @@ describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
     expect(JSON.stringify(responseBody)).not.toContain('private-claim')
   })
 
+  it('reloads Gate materials before a short current-owner transaction', async () => {
+    const events: string[] = []
+    let transactionCallbackActive = false, inputLoads = 0
+    mocks.loadInput.mockImplementation(async () => {
+      expect(transactionCallbackActive).toBe(false)
+      inputLoads += 1
+      if (inputLoads === 2) events.push('fresh_input')
+      return loaded
+    })
+    mocks.transaction.mockImplementation(async (work: (client: unknown) => unknown) => {
+      if (inputLoads === 2) events.push('owner_recheck')
+      transactionCallbackActive = true
+      try { return await work(tx) } finally { transactionCallbackActive = false }
+    })
+
+    const result = await runScheduledTaskGraphActionRpc(gateRequest()) as Response
+
+    expect(result.status).toBe(200)
+    expect(inputLoads).toBe(2)
+    expect(events).toEqual(['fresh_input', 'owner_recheck'])
+  })
+
   it('projects a safe test-only owner assertion phase without exposing the thrown message', async () => {
     const secretMessage = 'private database detail and fixture identity'
     vi.stubEnv('NODE_ENV', 'test')
