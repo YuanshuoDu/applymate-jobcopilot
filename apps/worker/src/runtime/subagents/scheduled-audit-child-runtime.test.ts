@@ -162,9 +162,23 @@ describe("fixed scheduled Audit child runtime", () => {
     const fixture = setup()
     expect(fixture.nodes[4]?.verificationDisposition).toBe("legacy_unverified")
     expect(taskGraphVerificationRole(SCHEDULED_AUDIT_TEMPLATE_ID)).toBeUndefined()
-    expect(isScheduledAuditCandidate({ role: SCHEDULED_AUDIT_ROLE, taskType: "other" })).toBe(true)
+    expect(isScheduledAuditCandidate({ role: SCHEDULED_AUDIT_ROLE, taskType: "other" })).toBe(false)
     expect(isScheduledAuditLease(lease())).toBe(true)
     expect(isScheduledAuditLease(lease({ role: "prepare" }))).toBe(false)
     expect(isScheduledAuditLease(lease({ allowedActions: ["jobs.discover"] }))).toBe(false)
+  })
+
+  it("routes only the scheduled Audit task type and rejects a mismatched role", async () => {
+    const generic = lease({ role: SCHEDULED_AUDIT_ROLE, taskType: "native_verification" })
+    expect(isScheduledAuditCandidate(generic)).toBe(false)
+
+    const scheduledWithWrongRole = lease({ role: "analyst", taskType: SCHEDULED_AUDIT_TASK_TYPE })
+    expect(isScheduledAuditCandidate(scheduledWithWrongRole)).toBe(true)
+    const fixture = setup()
+    await expect(createScheduledAuditChildExecutor({ pool: fixture.pool as never })({ lease: scheduledWithWrongRole })).resolves.toEqual({
+      status: "failed", failureReason: "scheduled_audit_task_invalid", retryDisposition: "terminal",
+    })
+    expect(fixture.pool.connect).not.toHaveBeenCalled()
+    expect(mocks.post).not.toHaveBeenCalled()
   })
 })

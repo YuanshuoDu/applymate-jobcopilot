@@ -251,6 +251,7 @@ describe("PostgreSQL scheduled Audit command", () => {
         node.key === SCHEDULED_AUDIT_TEMPLATE_ID ? { ...node, status } : node) },
         tasks: new Map([["audit-task", task(status, rowAttempt)]]) }
       writes.load.mockResolvedValue(loaded)
+      writes.current.mockReturnValue({ nodes: loaded.state.nodes })
       const row = { ...task(status, rowAttempt), id: "audit-task", leaseOwner: status === "running" ? "lease" : null,
         leaseExpiresAt: status === "running" ? new Date("2026-10-25T12:00:00.000Z") : null, context: {} }
       const client = db(sql => sql.includes('FROM "sub_agent_tasks"') ? [row]

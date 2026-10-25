@@ -23,7 +23,7 @@ type Queryable = Pick<pg.PoolClient, "query">; type Row = Record<string, unknown
 type Invocation = Parameters<typeof postScheduledPipelineExecute>[0]; type RuntimeOptions = Readonly<{ pool: Pick<pg.Pool, "connect">; fetcher?: typeof fetch; now?: () => Date }>
 type StableOwner = Readonly<{ userId: string; sessionId: string; turnId: string; rootTaskId: string; rootAttemptCount: number; executionId: string; executionAttemptCount: number }>
 export function isScheduledAuditCandidate(task: Pick<SubagentLease, "role" | "taskType">): boolean {
-  return task.role === SCHEDULED_AUDIT_ROLE || task.taskType === SCHEDULED_AUDIT_TASK_TYPE
+  return task.taskType === SCHEDULED_AUDIT_TASK_TYPE
 }
 export function isScheduledAuditTask(task: Pick<SubagentLease, "role" | "taskType">): boolean {
   return task.role === SCHEDULED_AUDIT_ROLE && task.taskType === SCHEDULED_AUDIT_TASK_TYPE
