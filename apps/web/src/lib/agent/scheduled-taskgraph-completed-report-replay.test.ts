@@ -79,6 +79,17 @@ describe('completed scheduled TaskGraph report replay', () => {
     expect(mocks.transaction).toHaveBeenCalledTimes(2)
   })
 
+  it('rechecks Gate proof against an audit-stage copy of the completed checkpoint', async () => {
+    const response = await replayCompletedScheduledTaskGraphReport(request, gate)
+
+    expect(response?.status).toBe(200)
+    expect(await response?.json()).toEqual({ status: 'completed', report })
+    expect(mocks.gateProof.mock.calls[0]?.[0]).toMatchObject({
+      analyzeCheckpoint: { ...execution.state, nextStage: 'audit' },
+    })
+    expect(execution.state.nextStage).toBe('completed')
+  })
+
   it.each(['current', 'prior'] as const)('fails closed for an %s report with an extra key', async source => {
     const malformed = { ...report, scheduledWaitId: 'unexpected' }
     if (source === 'current') mocks.completedReport.mockReturnValue(malformed)

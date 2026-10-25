@@ -81,7 +81,8 @@ async function replayPersistedCompletedReport(request: ScheduledTaskGraphExecute
   const report = exact ?? (prior && completedScheduledTaskGraphReport({ execution, key: prior.key, owner: prior.owner, snapshot,
     attestation: request.attestation, ownedJobs: jobs, checkpointValidatedByPrior: true }))
   if (!isExactCompletedReport(report)) return blocked(409, 'scheduled_pipeline_execution_mismatch')
-  const proofCurrent = await db.$transaction(tx => isScheduledTaskGraphGateProofCurrent({ owner, snapshot, analyzeCheckpoint: state,
+  const proofCheckpoint = { ...state, nextStage: 'audit' }
+  const proofCurrent = await db.$transaction(tx => isScheduledTaskGraphGateProofCurrent({ owner, snapshot, analyzeCheckpoint: proofCheckpoint,
     analyzeAttestation: request.attestation, prepareProof: request.prepareProof,
     gate: { taskId: gate.taskId, attemptCount: gate.attemptCount, phase: 'completed', completionProof: request.gateCompletionProof } }, tx)).catch(() => false)
   if (signal?.aborted) return blocked(409, 'scheduled_pipeline_turn_stale')
