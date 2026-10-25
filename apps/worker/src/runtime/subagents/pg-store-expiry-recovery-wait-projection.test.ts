@@ -83,6 +83,7 @@ describe("expired wait projection repair", () => {
     const waitQuery = fake.calls[0]?.sql ?? ""
     expect(waitQuery).toContain('task."leaseOwner" = $6 AND task."attemptCount" = $7 AND task."leaseExpiresAt" = $8')
     expect(waitQuery).toContain('step."status" = \'waiting_for_tool\'')
+    expect(waitQuery).toContain('current."attempt" = task."attemptCount"))))\n  AND wait."id" =')
     const callQuery = fake.calls.find(call => call.sql.includes('FROM "agent_items" AS call'))?.sql ?? ""
     expect(callQuery).toContain('call."stepId" = $4')
     expect(callQuery).toContain('started."type" = \'tool_call.started\'')
