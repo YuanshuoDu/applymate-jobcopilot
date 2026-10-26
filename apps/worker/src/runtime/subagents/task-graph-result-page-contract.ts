@@ -53,7 +53,14 @@ const Unavailable = Type.Object({
 }, { additionalProperties: false })
 const AvailableScoutV1 = Type.Object({ ...V1Common, role: Type.Literal("scout"), items: Type.Array(ScoutItem, { maxItems: TASK_GRAPH_RESULT_PAGE_SIZE }) }, { additionalProperties: false })
 const AvailableAnalystV1 = Type.Object({ ...V1Common, role: Type.Literal("analyst"), items: Type.Array(AnalystItem, { maxItems: TASK_GRAPH_RESULT_PAGE_SIZE }) }, { additionalProperties: false })
-const UnavailableV1 = Type.Object({ ...Unavailable, schemaVersion: Type.Literal(TASK_GRAPH_RESULT_PAGE_V1_SCHEMA) }, { additionalProperties: false })
+const UnavailableV1 = Type.Object({
+  schemaVersion: Type.Literal(TASK_GRAPH_RESULT_PAGE_V1_SCHEMA), trust: Type.Literal("untrusted"),
+  availability: Type.Literal("unavailable"), graphRevision: Type.Integer({ minimum: 0, maximum: MAX_GRAPH_REVISION }),
+  reason: Type.Union([
+    Type.Literal("no_graph"), Type.Literal("revision_mismatch"), Type.Literal("node_unavailable"),
+    Type.Literal("result_unavailable"), Type.Literal("offset_out_of_range"), Type.Literal("source_too_large"),
+  ]),
+}, { additionalProperties: false })
 
 export const TaskGraphResultPageRequestSchema = Type.Object({
   nodeKey: Type.String({ minLength: 1, maxLength: 128 }),

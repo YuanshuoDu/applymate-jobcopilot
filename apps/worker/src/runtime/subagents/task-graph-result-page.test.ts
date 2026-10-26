@@ -94,14 +94,16 @@ describe("TaskGraph current result pages", () => {
     const exact = projectTaskGraphResultPage(loaded([registered("analyst", "analyst-1", { summary: "🌱".repeat(128) })]),
       { nodeKey: "analyst-1", expectedRevision: 7, offset: 0 })
     expect(exact).toMatchObject({ trust: "untrusted", resultStatus: "completed", analysisSummary: "🌱".repeat(128), analysisSummaryTruncated: false })
-    if (exact.availability !== "available" || exact.role !== "analyst" || !("analysisSummary" in exact)) throw new Error("expected summary preview")
-    expect(Buffer.byteLength(exact.analysisSummary, "utf8")).toBe(512)
+    const exactSummary = exact.availability === "available" && exact.role === "analyst" ? exact.analysisSummary : undefined
+    if (typeof exactSummary !== "string") throw new Error("expected summary preview")
+    expect(Buffer.byteLength(exactSummary, "utf8")).toBe(512)
 
     const truncated = projectTaskGraphResultPage(loaded([registered("analyst", "analyst-1", { summary: "🌱".repeat(129) })]),
       { nodeKey: "analyst-1", expectedRevision: 7, offset: 0 })
     expect(truncated).toMatchObject({ analysisSummary: "🌱".repeat(128), analysisSummaryTruncated: true })
-    if (truncated.availability !== "available" || truncated.role !== "analyst" || !("analysisSummary" in truncated)) throw new Error("expected summary preview")
-    expect(Buffer.byteLength(truncated.analysisSummary, "utf8")).toBe(512)
+    const truncatedSummary = truncated.availability === "available" && truncated.role === "analyst" ? truncated.analysisSummary : undefined
+    if (typeof truncatedSummary !== "string") throw new Error("expected summary preview")
+    expect(Buffer.byteLength(truncatedSummary, "utf8")).toBe(512)
   })
 
   it("redacts the complete model-authored summary before applying the preview boundary", () => {
@@ -109,9 +111,10 @@ describe("TaskGraph current result pages", () => {
       summary: `${"x".repeat(500)} private@example.com`,
     })]), { nodeKey: "analyst-1", expectedRevision: 7, offset: 0 })
     expect(page).toMatchObject({ analysisSummaryTruncated: true })
-    if (page.availability !== "available" || page.role !== "analyst" || !("analysisSummary" in page)) throw new Error("expected summary preview")
-    expect(Buffer.byteLength(page.analysisSummary, "utf8")).toBeLessThanOrEqual(512)
-    expect(page.analysisSummary).not.toContain("private")
+    const pageSummary = page.availability === "available" && page.role === "analyst" ? page.analysisSummary : undefined
+    if (typeof pageSummary !== "string") throw new Error("expected summary preview")
+    expect(Buffer.byteLength(pageSummary, "utf8")).toBeLessThanOrEqual(512)
+    expect(pageSummary).not.toContain("private")
   })
 
   it("omits summaries from Scout, later, partial, and unavailable pages", () => {
