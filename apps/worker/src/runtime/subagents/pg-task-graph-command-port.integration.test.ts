@@ -852,7 +852,8 @@ async function failQueuedOperationalTask(pool: PgPool, value: Fixture, taskId: s
 }
 
 async function prepareOperationalFailureReplan(pool: PgPool, commandPool: PgPool, roleName: string, value: Fixture,
-  shape: "scout_leaf" | "analyst_leaf" | "scout_analyst_closure") {
+  shape: "scout_leaf" | "analyst_leaf" | "scout_analyst_closure",
+  options: Readonly<{ leaveDependentWaiting?: boolean }> = {}) {
   await seed(pool, value)
   const templates = { scout: TASK_GRAPH_TEMPLATES.scout, analyst: TASK_GRAPH_TEMPLATES.analyst }
   const allowedActions = [...new Set(["agent.plan", ...Object.values(templates).flatMap(template => template.allowedActions)])]
@@ -900,7 +901,33 @@ async function prepareOperationalFailureReplan(pool: PgPool, commandPool: PgPool
   const failedRootDefinition = shape === "analyst_leaf" ? sourceDefinitions[0]! : scout
   const failedRoot = current.nodes.find(node => node.key === failedRootDefinition.key)
   if (!failedRoot) throw new Error("Operational-failure fixture lost its failure root")
-  await failQueuedOperationalTask(commandPool, value, failedRoot.taskId, `worker-fail-operational-source-${randomUUID()}`)
+  const heldDependent = options.leaveDependentWaiting && shape === "scout_analyst_closure"
+    ? current.nodes.find(node => node.key === "resume-analyst") : undefined
+  if (options.leaveDependentWaiting && !heldDependent) throw new Error("Operational-failure fixture lost its held descendant")
+  const triggerName = heldDependent ? `op_wait_cancel_${randomUUID().replaceAll("-", "")}` : null
+  const functionName = triggerName ? `${triggerName}_fn` : null
+  if (triggerName && functionName) {
+    await pool.query(`CREATE FUNCTION public."${functionName}"() RETURNS trigger
+      LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $operational_wait_test$
+      BEGIN
+        IF NEW."id" = TG_ARGV[0] AND NEW."status" = 'cancelled'
+          AND NEW."failureReason" = 'A prerequisite task did not complete.' THEN
+          RETURN NULL;
+        END IF;
+        RETURN NEW;
+      END
+      $operational_wait_test$`)
+    await pool.query(`CREATE TRIGGER "${triggerName}" BEFORE UPDATE ON public."sub_agent_tasks"
+      FOR EACH ROW EXECUTE FUNCTION public."${functionName}"('${heldDependent!.taskId}')`)
+  }
+  try {
+    await failQueuedOperationalTask(commandPool, value, failedRoot.taskId, `worker-fail-operational-source-${randomUUID()}`)
+  } finally {
+    if (triggerName && functionName) {
+      await pool.query(`DROP TRIGGER IF EXISTS "${triggerName}" ON public."sub_agent_tasks"`)
+      await pool.query(`DROP FUNCTION IF EXISTS public."${functionName}"()`)
+    }
+  }
   current = await command.readCurrent(readScope(value))
   const sourceNodes = sourceDefinitions.map(definition => current.nodes.find(node => node.key === definition.key))
     .filter((node): node is TaskGraphCurrentNode => node !== undefined)
@@ -912,9 +939,11 @@ async function prepareOperationalFailureReplan(pool: PgPool, commandPool: PgPool
     const row = dependent && await pool.query<{ status: string; attemptCount: number; failureReason: string | null }>(
       `SELECT "status", "attemptCount", "failureReason" FROM "sub_agent_tasks" WHERE "id" = $1`, [dependent.taskId])
     const persisted = row?.rows[0]
-    if (dependent?.status !== "cancelled" || !persisted || persisted.status !== "cancelled" || persisted.attemptCount !== 0
-      || persisted.failureReason !== "A prerequisite task did not complete.") {
-      throw new Error("Operational-failure fixture lost its canonical automatic dependency cancellation")
+    const expectedStatus = options.leaveDependentWaiting ? "waiting" : "cancelled"
+    const expectedReason = options.leaveDependentWaiting ? null : "A prerequisite task did not complete."
+    if (dependent?.status !== expectedStatus || !persisted || persisted.status !== expectedStatus || persisted.attemptCount !== 0
+      || persisted.failureReason !== expectedReason) {
+      throw new Error("Operational-failure fixture lost its expected dependent lifecycle state")
     }
   }
 
@@ -3456,6 +3485,57 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     const restored = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
     await expect(restored.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation))
       .resolves.toEqual({ ...accepted, status: "duplicate" })
+    expect(await supersessionDurableRows(adminPool!, value)).toEqual(durable)
+  }, 90_000)
+
+  it("replays a replacement with a retained Root wait over its newly cancelled descendant", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    const prepared = await prepareOperationalFailureReplan(adminPool!, commandPool!, roleName, value,
+      "scout_analyst_closure", { leaveDependentWaiting: true })
+
+    const dependent = prepared.sourceNodes.find(node => node.key === "resume-analyst")
+    if (!dependent) throw new Error("Operational-wait fixture lost its dependent Analyst")
+    expect(prepared.current.nodes.find(node => node.taskId === dependent.taskId)?.status).toBe("waiting")
+    const targetTaskIds = [prepared.failedRoot.taskId, dependent.taskId].sort()
+    const matchedTaskIds = [prepared.failedRoot.taskId]
+    const timeoutMs = 60_000
+    const createdAt = new Date()
+    const waitId = `p3-operational-root-wait-${randomUUID()}`
+    await adminPool!.query(`INSERT INTO "agent_wait_conditions"
+      ("id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "idempotencyKey", "targetTaskIds",
+       "mode", "status", "deadlineAt", "matchedTaskIds", "result", "createdAt", "updatedAt")
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, 'any', 'ready', $9, $10::jsonb, $11::jsonb, $12, $12)`, [
+      waitId, value.userId, value.sessionId, value.turnId, value.rootTaskId, value.laterStepId,
+      `operational-root-wait-${randomUUID()}`, JSON.stringify(targetTaskIds),
+      new Date(createdAt.getTime() + timeoutMs), JSON.stringify(matchedTaskIds),
+      JSON.stringify({ request: { targetTaskIds, mode: "any", timeoutMs } }), createdAt,
+    ])
+    const waitBefore = await adminPool!.query(`SELECT * FROM "agent_wait_conditions" WHERE "id" = $1`, [waitId])
+    expect(waitBefore.rows).toHaveLength(1)
+    expect(waitBefore.rows[0]).toMatchObject({ userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+      parentTaskId: value.rootTaskId, stepId: value.laterStepId, targetTaskIds, mode: "any", status: "ready", matchedTaskIds,
+      result: { request: { targetTaskIds, mode: "any", timeoutMs } }, suspendedAt: null, resolvedAt: null, consumedAt: null })
+
+    const accepted = await prepared.command.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation)
+    expect(accepted.status).toBe("accepted")
+    const cancelled = await adminPool!.query<{ status: string; attemptCount: number; failureReason: string | null }>(
+      `SELECT "status", "attemptCount", "failureReason" FROM "sub_agent_tasks" WHERE "id" = $1`, [dependent.taskId])
+    expect(cancelled.rows).toEqual([{ status: "cancelled", attemptCount: 0, failureReason: null }])
+    const receiptKey = steeringReconciliationIdempotencyKey(prepared.scope, value.planCallId)
+    const receipt = await adminPool!.query<{ payload: { operationalFailure?: { cancellations?: unknown[] } } }>(
+      `SELECT "payload" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "idempotencyKey" = $3`,
+      [value.sessionId, value.turnId, receiptKey])
+    expect(receipt.rows[0]?.payload.operationalFailure?.cancellations).toEqual(expect.arrayContaining([
+      expect.objectContaining({ source: { nodeKey: "resume-analyst", taskId: dependent.taskId } }),
+    ]))
+    expect(await adminPool!.query(`SELECT * FROM "agent_wait_conditions" WHERE "id" = $1`, [waitId])).toEqual(waitBefore)
+
+    const durable = await supersessionDurableRows(adminPool!, value)
+    const replay = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
+    await expect(replay.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation))
+      .resolves.toEqual({ ...accepted, status: "duplicate" })
+    expect(await adminPool!.query(`SELECT * FROM "agent_wait_conditions" WHERE "id" = $1`, [waitId])).toEqual(waitBefore)
     expect(await supersessionDurableRows(adminPool!, value)).toEqual(durable)
   }, 90_000)
 

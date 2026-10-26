@@ -1,9 +1,12 @@
 import type pg from "pg"
 import type { GraphIdentityScope } from "./task-graph-pg-state.js"
+import type { TaskGraphOperationalFailedBranchRelation } from "./task-graph-pg-operational-failed-branch-relation.js"
+import { taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 
 type Client = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
-type Input = Readonly<{ scope: GraphIdentityScope; taskIds: readonly string[] }>
+type OperationCancellation = TaskGraphOperationalFailedBranchRelation["cancellations"][number]
+type Input = Readonly<{ scope: GraphIdentityScope; taskIds: readonly string[]; operationCancellations?: readonly OperationCancellation[] }>
 type WaitShape = Readonly<{ targets: readonly string[]; matched: readonly string[]; mode: "all" | "any"; timeoutMs: number }>
 const TERMINAL = new Set(["completed", "failed", "interrupted", "cancelled", "closed"])
 const TASK_STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", ...TERMINAL])
@@ -31,6 +34,22 @@ function sortedIds(value: unknown): string[] | null {
   const parsed = strings(value)
   return parsed && new Set(parsed).size === parsed.length && parsed.every((item, index) => index === 0 || parsed[index - 1]! < item) ? parsed : null
 }
+function operationCancellationIds(value: unknown, selected: ReadonlySet<string>, rootTaskId: string): Set<string> | null {
+  if (value === undefined) return new Set()
+  if (!Array.isArray(value) || value.length > 8) return null
+  const result = new Set<string>()
+  for (const raw of value) {
+    const entry = record(raw), source = record(entry?.source), event = record(entry?.event)
+    if (!exact(entry, ["source", "event"]) || !exact(source, ["nodeKey", "taskId"])
+      || !id(source.nodeKey) || !id(source.taskId) || !selected.has(source.taskId) || result.has(source.taskId)
+      || !exact(event, ["id", "sequence", "idempotencyKey"]) || !id(event.id)
+      || typeof event.sequence !== "string" || !/^[1-9][0-9]{0,18}$/.test(event.sequence)
+      || BigInt(event.sequence) > 9_223_372_036_854_775_807n
+      || event.idempotencyKey !== taskGraphLifecycleKey(rootTaskId, source.nodeKey, 0, "task.cancelled")) return null
+    result.add(source.taskId)
+  }
+  return result
+}
 function request(wait: Row): WaitShape | null {
   const targets = sortedIds(wait.targetTaskIds), matched = sortedIds(wait.matchedTaskIds), result = record(wait.result)
   const body = record(result?.request)
@@ -55,22 +74,23 @@ function lineage(wait: Row, scope: GraphIdentityScope, shape: WaitShape): boolea
     && (wait.stepTaskId === scope.rootTaskId || wait.stepTaskId === null) && Number(wait.stepAttempt) === 1
     && wait.resolvedStepId === wait.stepId && created !== null && deadline !== null && deadline - created === shape.timeoutMs
 }
-function validTargetRows(shape: WaitShape, rows: ReadonlyMap<string, Row>, selected: ReadonlySet<string>): boolean {
+function validTargetRows(shape: WaitShape, rows: ReadonlyMap<string, Row>, selected: ReadonlySet<string>, operationCancellations: ReadonlySet<string>): boolean {
   if (shape.targets.some(id => !rows.has(id))) return false
   for (const taskId of shape.targets) {
     const row = rows.get(taskId)!
     if (typeof row.role !== "string" || row.role.length === 0 || row.role.length > 256 || !TASK_STATUSES.has(String(row.status))) return false
-    if (selected.has(taskId) && !validSelectedTarget(row)) return false
+    if (selected.has(taskId) && !validSelectedTarget(row, operationCancellations.has(taskId))) return false
   }
   return true
 }
-function validSelectedTarget(row: Row): boolean {
+function validSelectedTarget(row: Row, operationCancelled: boolean): boolean {
   if (!SELECTED_STATUSES.has(String(row.status)) || Number(row.attemptCount) !== 0
     || row.startedAt !== null || row.leaseOwner !== null || row.leaseExpiresAt !== null || row.nextAttemptAt !== null
     || row.closedAt !== null || row.interruptRequestedAt !== null || row.result !== null || row.confidence !== null
     || row.qualityGateResult !== null || row.contextSnapshotId !== null || !Array.isArray(row.outputArtifactIds)
     || row.outputArtifactIds.length !== 0 || row.hasCanonicalDispatch !== false) return false
-  if (row.status === "cancelled") return row.failureReason === PREREQUISITE_FAILURE && timestamp(row.completedAt) !== null
+  if (row.status === "cancelled") return timestamp(row.completedAt) !== null
+    && (operationCancelled ? row.failureReason === null : row.failureReason === PREREQUISITE_FAILURE)
   return row.failureReason === null && row.completedAt === null
 }
 function validOutcomeTasks(value: unknown, shape: WaitShape, rows: ReadonlyMap<string, Row>, selected: ReadonlySet<string>): boolean {
@@ -100,8 +120,9 @@ function matchedOutcomeIsTerminal(value: unknown, matched: readonly string[]): b
   const byId = new Map(value.map(raw => { const task = record(raw); return [String(task?.taskId), task] as const }))
   return matched.every(taskId => TERMINAL.has(String(byId.get(taskId)?.status)))
 }
-function validWait(wait: Row, scope: GraphIdentityScope, shape: WaitShape, rows: ReadonlyMap<string, Row>, selected: ReadonlySet<string>): boolean {
-  if (!lineage(wait, scope, shape) || !validTargetRows(shape, rows, selected)) return false
+function validWait(wait: Row, scope: GraphIdentityScope, shape: WaitShape, rows: ReadonlyMap<string, Row>, selected: ReadonlySet<string>,
+  operationCancellations: ReadonlySet<string>): boolean {
+  if (!lineage(wait, scope, shape) || !validTargetRows(shape, rows, selected, operationCancellations)) return false
   const result = record(wait.result)!, resolved = timestamp(wait.resolvedAt), suspended = timestamp(wait.suspendedAt), consumed = timestamp(wait.consumedAt)
   if (wait.status === "ready" && suspended === null && resolved === null && consumed === null && exact(result, ["request"])) {
     return shape.matched.length > 0 && (shape.mode === "any" || sameIds(shape.matched, shape.targets))
@@ -122,6 +143,8 @@ export async function proveTaskGraphOperationalRootWaitReferences(client: Client
   const { scope } = input, taskIds = [...new Set(input.taskIds)]
   if (!id(scope.userId) || !id(scope.sessionId) || !id(scope.turnId) || !id(scope.rootTaskId)
     || scope.parentTaskId !== scope.rootTaskId || taskIds.length !== input.taskIds.length || taskIds.some(value => !id(value))) return false
+  const selected = new Set(taskIds), operationCancellations = operationCancellationIds(input.operationCancellations, selected, scope.rootTaskId)
+  if (!operationCancellations) return false
   if (taskIds.length === 0) return true
   const waits = await client.query<Row>(`SELECT wait."id", wait."userId", wait."sessionId", wait."turnId", wait."parentTaskId", wait."stepId", wait."idempotencyKey",
       wait."targetTaskIds", wait."mode", wait."status", wait."matchedTaskIds", wait."result", wait."createdAt", wait."deadlineAt", wait."resolvedAt", wait."suspendedAt", wait."consumedAt",
@@ -145,8 +168,8 @@ export async function proveTaskGraphOperationalRootWaitReferences(client: Client
     FROM "sub_agent_tasks" task JOIN "agent_sessions" session ON session."id" = task."sessionId"
     WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4 AND session."userId" = $5`,
   [targetIds, scope.sessionId, scope.turnId, scope.rootTaskId, scope.userId])
-  const rows = new Map(targets.rows.map(row => [String(row.id), row])), selected = new Set(taskIds)
+  const rows = new Map(targets.rows.map(row => [String(row.id), row]))
   if (rows.size !== targetIds.length || targets.rows.some(row => row.sessionId !== scope.sessionId || row.turnId !== scope.turnId
     || String(row.rootTaskId) !== scope.rootTaskId || row.userId !== scope.userId)) return false
-  return parsed.every(item => validWait(item.wait, scope, item.shape!, rows, selected))
+  return parsed.every(item => validWait(item.wait, scope, item.shape!, rows, selected, operationCancellations))
 }

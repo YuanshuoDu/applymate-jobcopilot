@@ -8,7 +8,7 @@ import { parseTaskGraphOperationalFailedBranchRelation, parseTaskGraphOperationa
 import { canonicalTaskGraphJson, parseTaskGraphEvent, parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey, taskGraphProposalKey, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { taskGraphResultDigest } from "./task-graph-pg-verification.js"
 import { proveTaskGraphOperationalObservedGraph } from "./task-graph-pg-operational-failure-observation.js"
-import { proveTaskGraphOperationalFailureCancellations } from "./task-graph-pg-operational-failure-cancellations.js"
+import { operationalCancellationsHaveNoOtherEvidence, proveTaskGraphOperationalHistoryCancellations } from "./task-graph-pg-operational-failure-cancellations.js"
 import { steeringReconciliationId, steeringReconciliationIdempotencyKey, validSteeringReconciliationToolCall, type SteeringReconciliationScope } from "./steering-reconciliation-contract.js"
 import { normalizeRootPlanCriteria } from "./root-plan-criteria.js"
 
@@ -117,7 +117,7 @@ async function callInput(client: Client, scope: SteeringReconciliationScope, rel
 async function readTasks(client: Client, scope: SteeringReconciliationScope, ids: readonly string[]): Promise<Map<string, Row>> {
   const result = await client.query<Row>(`SELECT task."id", task."status", task."role", task."taskType", task."attemptCount", task."leaseOwner",
       task."leaseExpiresAt", task."nextAttemptAt", task."startedAt", task."completedAt", task."closedAt",
-      task."interruptRequestedAt", task."failureReason", task."result", task."outputArtifactIds",
+      task."interruptRequestedAt", task."failureReason", task."result", task."confidence", task."qualityGateResult", task."contextSnapshotId", task."outputArtifactIds",
       EXISTS (SELECT 1 FROM "agent_outbox" dispatch WHERE dispatch."topic" = 'agent.subagent.dispatch'
         AND dispatch."aggregateId" = task."sessionId" AND dispatch."idempotencyKey" = 'subagent-dispatch:' || task."id") AS "hasCanonicalDispatch",
       session."userId" AS "sessionUserId", turn."userId" AS "turnUserId", turn."rootTaskId" AS "turnRootTaskId"
@@ -138,36 +138,6 @@ function validReport(task: Row, node: TaskGraphSnapshot["nodes"][number], status
     && taskGraphVerificationReportMatchesStatus(report, status === "passed" ? "completed" : "failed")
     && (status !== "unverified" || report.reasonCode === "result_invalid" && exact(result, ["workerResult", "taskGraphVerificationReport"])
       && result.workerResult === null) ? raw : null
-}
-async function cancelledRowsClean(client: Client, scope: SteeringReconciliationScope,
-  sources: readonly TaskGraphOperationalFailedBranchRelation["sources"][number]["source"][],
-  cancellations: TaskGraphOperationalFailedBranchRelation["cancellations"]): Promise<boolean> {
-  if (!sources.length) return true
-  const ids = sources.map(source => source.taskId), eventKeys = cancellations.map(item => item.event.idempotencyKey)
-  const result = await client.query<Row>(`SELECT task."id",
-      (EXISTS (SELECT 1 FROM "agent_steps" step WHERE step."sessionId" = task."sessionId" AND step."taskId" = task."id")
-      OR EXISTS (SELECT 1 FROM "agent_items" item WHERE item."sessionId" = task."sessionId" AND item."taskId" = task."id")
-      OR EXISTS (SELECT 1 FROM "agent_events" event WHERE event."sessionId" = task."sessionId" AND event."taskId" = task."id"
-        AND event."idempotencyKey" <> ALL($5::text[]))
-      OR EXISTS (SELECT 1 FROM "agent_tree_budget_reservations" reservation WHERE reservation."taskId" = task."id")
-      OR EXISTS (SELECT 1 FROM "agent_wait_conditions" wait WHERE wait."sessionId" = task."sessionId" AND wait."turnId" = task."turnId"
-        AND (wait."parentTaskId" = task."id" OR wait."targetTaskIds" @> jsonb_build_array(task."id") OR wait."matchedTaskIds" @> jsonb_build_array(task."id")))
-      OR EXISTS (SELECT 1 FROM "agent_native_semantic_rejections" row WHERE row."rootTaskId" = task."id" OR row."controlTaskId" = task."id")
-      OR EXISTS (SELECT 1 FROM "agent_tool_result_references" row WHERE row."taskId" = task."id")
-      OR EXISTS (SELECT 1 FROM "agent_transcript_events" row WHERE row."taskId" = task."id")
-      OR EXISTS (SELECT 1 FROM "agent_approvals" row WHERE row."taskId" = task."id")
-      OR EXISTS (SELECT 1 FROM "agent_artifact_version" row WHERE row."taskId" = task."id")
-      OR EXISTS (SELECT 1 FROM "agent_artifact_review" row WHERE row."taskId" = task."id")
-      OR EXISTS (SELECT 1 FROM "application_tasks" row WHERE row."workerTaskId" = task."id")
-      OR EXISTS (SELECT 1 FROM "sub_agent_tasks" child WHERE child."sessionId" = task."sessionId" AND child."parentTaskId" = task."id")
-      OR EXISTS (SELECT 1 FROM "agent_outbox" outbox WHERE (outbox."payload"->>'taskId' = task."id" OR outbox."payload"->'payload'->>'taskId' = task."id")
-        AND outbox."idempotencyKey" <> ALL($6::text[]))) AS "hasEvidence",
-      EXISTS (SELECT 1 FROM "agent_outbox" dispatch WHERE dispatch."topic" = 'agent.subagent.dispatch'
-        AND dispatch."aggregateId" = task."sessionId" AND dispatch."idempotencyKey" = 'subagent-dispatch:' || task."id") AS "hasDispatch"
-    FROM "sub_agent_tasks" task WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3
-      AND task."rootTaskId" = $4 AND task."parentTaskId" = $4 ORDER BY task."id"`,
-  [ids, scope.sessionId, scope.turnId, scope.rootTaskId, eventKeys, cancellations.map(item => `agent-event:${item.event.id}`)])
-  return result.rows.length === ids.length && result.rows.every(row => row.hasEvidence === false && row.hasDispatch === false)
 }
 function deltaMatches(before: TaskGraphSnapshot, after: TaskGraphSnapshot, sources: readonly TaskGraphSnapshot["nodes"][number][],
   mapping: ReadonlyMap<string, string>, proposals: readonly unknown[], receipt: TaskGraphScheduleReceipt, revision: number): boolean {
@@ -249,9 +219,6 @@ export async function assertTaskGraphOperationalFailedBranchHistory(client: Clie
   if (failedEventData.failureReason !== relation.failedSource.failureReason) return invalid()
   const graphScope = { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
     rootTaskId: scope.rootTaskId, parentTaskId: scope.rootTaskId }
-  const prior = await proveTaskGraphOperationalFailureCancellations(client, { scope: graphScope, failureGraph: before,
-    failureSequence: relation.failedSource.event.sequence, observedSequence: relation.observedGraphEvent.sequence, sourceNodes, failedNode })
-  if (!prior || !same(prior, relation.priorCancellations)) return invalid()
   for (const [index, cancellation] of relation.cancellations.entries()) {
     const row = events.get(cancellation.event.id)!, source = cancellation.source, node = sourceNodes.find(value => value.key === source.nodeKey)
     if (!node || source.nodeKey === relation.failedSource.source.nodeKey
@@ -263,11 +230,16 @@ export async function assertTaskGraphOperationalFailedBranchHistory(client: Clie
     if (!task || !validTaskOwner(task, scope) || task.status !== "cancelled" || task.role !== node.templateId
       || task.taskType !== taskType(node.templateId) || Number(task.attemptCount) !== 0
       || task.result !== null || task.failureReason !== null || task.leaseOwner !== null || task.leaseExpiresAt !== null
-      || task.nextAttemptAt !== null || task.startedAt !== null || task.closedAt !== null || task.interruptRequestedAt !== null
+      || task.nextAttemptAt !== null || task.startedAt !== null || task.completedAt === null || task.closedAt !== null || task.interruptRequestedAt !== null
+      || task.confidence !== null || task.qualityGateResult !== null || task.contextSnapshotId !== null
       || !Array.isArray(task.outputArtifactIds) || task.outputArtifactIds.length !== 0) return invalid()
   }
-  if (relation.cancellations.length && !await cancelledRowsClean(client, scope,
+  if (relation.cancellations.length && !await operationalCancellationsHaveNoOtherEvidence(client, graphScope,
     relation.cancellations.map(value => value.source), relation.cancellations)) return invalid()
+  const prior = await proveTaskGraphOperationalHistoryCancellations(client, { scope: graphScope, failureGraph: before,
+    failureSequence: relation.failedSource.event.sequence, observedSequence: relation.observedGraphEvent.sequence, sourceNodes, failedNode,
+    operationCancellations: relation.cancellations })
+  if (!prior || !same(prior, relation.priorCancellations)) return invalid()
   for (const [index, dependency] of relation.verifiedExternalDependencies.entries()) {
     const node = external[index], task = node && tasks.get(node.taskId), event = events.get(dependency.completedEvent.id)
     const report = node && task && validReport(task, node, "passed")

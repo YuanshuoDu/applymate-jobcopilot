@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import { proveTaskGraphOperationalRootWaitReferences } from "./task-graph-pg-operational-failure-root-waits.js"
 import type { GraphIdentityScope } from "./task-graph-pg-state.js"
+import { taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 
 type Row = Record<string, unknown>
 type Client = Pick<pg.PoolClient, "query">
@@ -95,6 +96,35 @@ describe("proveTaskGraphOperationalRootWaitReferences", () => {
     })
     const f = fixture([wait], [canceled, pending])
     await expect(proveTaskGraphOperationalRootWaitReferences(f.client, input)).resolves.toBe(true)
+  })
+
+  it("allows a same-root wait to retain a newly relation-cancelled pristine target only after exact receipt proof", async () => {
+    const priorWaiting = { ...canceled, status: "waiting", failureReason: null, completedAt: null }
+    const operationCancelled = { ...canceled, failureReason: null }
+    const wait = consumed("timed_out", "all", [failed.id])
+    const result = wait.result as Row, priorOutcome = result.outcome as Row
+    priorOutcome.tasks = targetIds.map(taskId => taskId === canceled.id
+      ? { taskId, status: "waiting", role: canceled.role, result: null, failureReason: null }
+      : { taskId, status: failed.status, role: failed.role, result: null, failureReason: failed.failureReason })
+    const receipt = { source: { nodeKey: "analyst-node", taskId: canceled.id }, event: { id: "cancel-event", sequence: "90",
+      idempotencyKey: taskGraphLifecycleKey(scope.rootTaskId, "analyst-node", 0, "task.cancelled") } }
+    const before = fixture([wait], [priorWaiting, failed])
+    await expect(proveTaskGraphOperationalRootWaitReferences(before.client, input)).resolves.toBe(true)
+
+    const after = fixture([wait], [operationCancelled, failed])
+    await expect(proveTaskGraphOperationalRootWaitReferences(after.client, input)).resolves.toBe(false)
+    await expect(proveTaskGraphOperationalRootWaitReferences(after.client, { ...input, operationCancellations: [receipt] }))
+      .resolves.toBe(true)
+    await expect(proveTaskGraphOperationalRootWaitReferences(after.client, { ...input, operationCancellations: [
+      { ...receipt, event: { ...receipt.event, idempotencyKey: "wrong-event-key" } },
+    ] })).resolves.toBe(false)
+    const childOwned = fixture([rootWait({ parentTaskId: canceled.id, parentId: canceled.id, parentParentTaskId: scope.rootTaskId,
+      parentRole: "analyst", parentTaskType: "analyst" })], [operationCancelled, failed])
+    await expect(proveTaskGraphOperationalRootWaitReferences(childOwned.client, { ...input, operationCancellations: [receipt] }))
+      .resolves.toBe(false)
+    const malformed = fixture([rootWait({ targetTaskIds: [canceled.id, canceled.id] })], [operationCancelled, failed])
+    await expect(proveTaskGraphOperationalRootWaitReferences(malformed.client, { ...input, operationCancellations: [receipt] }))
+      .resolves.toBe(false)
   })
 
   it("accepts stale unrelated target observations without treating them as fresh authority", async () => {
