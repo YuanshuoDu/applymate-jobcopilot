@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest"
+import { Buffer } from "node:buffer"
 import { TASK_GRAPH_NATIVE_METADATA_VERSION, TASK_GRAPH_NATIVE_TEMPLATE_ID } from "./task-graph-native-state.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphState } from "./task-graph-snapshot.js"
@@ -87,6 +88,59 @@ describe("TaskGraph current result pages", () => {
       { jobId: CUID(3), score: 7, evidenceKinds: ["job", "persona"] },
       { jobId: CUID(4), score: 8, evidenceKinds: ["job", "persona"] },
     ] })
+  })
+
+  it("returns completed Analyst previews at an exact UTF-8 byte boundary and truncates whole code points", () => {
+    const exact = projectTaskGraphResultPage(loaded([registered("analyst", "analyst-1", { summary: "🌱".repeat(128) })]),
+      { nodeKey: "analyst-1", expectedRevision: 7, offset: 0 })
+    expect(exact).toMatchObject({ trust: "untrusted", resultStatus: "completed", analysisSummary: "🌱".repeat(128), analysisSummaryTruncated: false })
+    const exactSummary = exact.availability === "available" && exact.role === "analyst" ? exact.analysisSummary : undefined
+    if (typeof exactSummary !== "string") throw new Error("expected summary preview")
+    expect(Buffer.byteLength(exactSummary, "utf8")).toBe(512)
+
+    const truncated = projectTaskGraphResultPage(loaded([registered("analyst", "analyst-1", { summary: "🌱".repeat(129) })]),
+      { nodeKey: "analyst-1", expectedRevision: 7, offset: 0 })
+    expect(truncated).toMatchObject({ analysisSummary: "🌱".repeat(128), analysisSummaryTruncated: true })
+    const truncatedSummary = truncated.availability === "available" && truncated.role === "analyst" ? truncated.analysisSummary : undefined
+    if (typeof truncatedSummary !== "string") throw new Error("expected summary preview")
+    expect(Buffer.byteLength(truncatedSummary, "utf8")).toBe(512)
+  })
+
+  it("redacts the complete model-authored summary before applying the preview boundary", () => {
+    const page = projectTaskGraphResultPage(loaded([registered("analyst", "analyst-1", {
+      summary: `${"x".repeat(500)} private@example.com`,
+    })]), { nodeKey: "analyst-1", expectedRevision: 7, offset: 0 })
+    expect(page).toMatchObject({ analysisSummaryTruncated: true })
+    const pageSummary = page.availability === "available" && page.role === "analyst" ? page.analysisSummary : undefined
+    if (typeof pageSummary !== "string") throw new Error("expected summary preview")
+    expect(Buffer.byteLength(pageSummary, "utf8")).toBeLessThanOrEqual(512)
+    expect(pageSummary).not.toContain("private")
+  })
+
+  it("omits summaries from Scout, later, partial, and unavailable pages", () => {
+    const scout = projectTaskGraphResultPage(loaded([registered("scout")]), { nodeKey: "scout-1", expectedRevision: 7, offset: 0 })
+    expect(scout).not.toHaveProperty("analysisSummary")
+    expect(scout).not.toHaveProperty("analysisSummaryTruncated")
+
+    const analyst = registered("analyst", "analyst-1", { summary: "advisory" })
+    const later = projectTaskGraphResultPage(loaded([analyst]), { nodeKey: analyst.key, expectedRevision: 7, offset: 3 })
+    expect(later).not.toHaveProperty("analysisSummary")
+    const partial = projectTaskGraphResultPage(loaded([registered("analyst", "analyst-1", { resultStatus: "partial" })]),
+      { nodeKey: "analyst-1", expectedRevision: 7, offset: 0 })
+    expect(partial).not.toHaveProperty("analysisSummary")
+    const failedWithCompletedResult = projectTaskGraphResultPage(loaded([registered("analyst", "analyst-1", {
+      taskStatus: "failed", resultStatus: "completed", summary: "advisory",
+    })]), { nodeKey: "analyst-1", expectedRevision: 7, offset: 0 })
+    expect(failedWithCompletedResult).toMatchObject({ availability: "available", taskStatus: "failed", resultStatus: "completed" })
+    expect(failedWithCompletedResult).not.toHaveProperty("analysisSummary")
+    const stale = projectTaskGraphResultPage(loaded([analyst]), { nodeKey: analyst.key, expectedRevision: 6, offset: 0 })
+    expect(stale).toMatchObject({ availability: "unavailable", reason: "revision_mismatch" })
+    expect(stale).not.toHaveProperty("analysisSummary")
+    const graph = loaded([analyst])
+    const missingNode = projectTaskGraphResultPage({ ...graph, state: { ...graph.state!, nodes: [] } },
+      { nodeKey: analyst.key, expectedRevision: 7, offset: 0 })
+    expect(missingNode).toMatchObject({ availability: "unavailable", reason: "node_unavailable" })
+    expect(missingNode).not.toHaveProperty("analysisSummary")
   })
 
   it.each(["failed", "interrupted", "cancelled", "closed"] as const)("allows validated partial results for terminal task status %s", taskStatus => {

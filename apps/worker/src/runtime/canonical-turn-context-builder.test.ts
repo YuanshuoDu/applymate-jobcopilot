@@ -18,6 +18,7 @@ import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphState } f
 import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "./subagents/task-graph-pg-verification.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "./planning/task-graph-verification.js"
 import { ROLE_RESULT_SCHEMA } from "./subagents/role-results.js"
+import { discoveryPersonaContextBlocks } from "./context/discovery-persona-context-blocks.js"
 import { projectSelectedJobMemory, type SelectedJobMemoryNode } from "./context/selected-job-memory.js"
 import type { ValidatedSelectedJobHistoryOutcome } from "./context/selected-job-history.js"
 import type { ValidatedRootTaskHistoryOutcome } from "./context/root-task-history.js"
@@ -229,6 +230,7 @@ describe("canonical Turn context builder", () => {
       role: "instruction", trust: "system", source: "discovery_persona_context_policy" }))
     expect(context.blocks).toContainEqual(expect.objectContaining({ id: "confirmed-persona-facts", layer: "business",
       role: "data", trust: "external_untrusted", source: "confirmed_persona_facts", content: JSON.stringify(projection) }))
+    expect(context.blocks.slice(-2)).toEqual(discoveryPersonaContextBlocks(projection))
     expect(context.canonicalJson).toContain("PRIVATE_EPHEMERAL_FACT_SENTINEL")
     expect(context.canonicalJson).not.toBe("base-context-json")
   })

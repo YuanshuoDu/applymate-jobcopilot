@@ -1,11 +1,14 @@
+import { Buffer } from "node:buffer"
 import { types as nodeTypes } from "node:util"
 import { Type, type Static } from "@sinclair/typebox"
 import { Value } from "@sinclair/typebox/value"
 
 
-export const TASK_GRAPH_RESULT_PAGE_SCHEMA = "agent-harness.v2.task-graph.result-page.v1" as const
+export const TASK_GRAPH_RESULT_PAGE_SCHEMA = "agent-harness.v2.task-graph.result-page.v2" as const
+export const TASK_GRAPH_RESULT_PAGE_V1_SCHEMA = "agent-harness.v2.task-graph.result-page.v1" as const
 export const TASK_GRAPH_RESULT_PAGE_SIZE = 3
 export const TASK_GRAPH_RESULT_SOURCE_BYTE_LIMIT = 256 * 1024
+export const TASK_GRAPH_RESULT_SUMMARY_PREVIEW_BYTE_LIMIT = 512
 const MAX_GRAPH_REVISION = 2_147_483_646
 const CANONICAL_JOB_ID_PATTERN = "^(?:c[a-z0-9]{24}|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})(?![\\s\\S])"
 const CANONICAL_JOB_ID = new RegExp(CANONICAL_JOB_ID_PATTERN)
@@ -33,10 +36,25 @@ const Common = {
   offset: Type.Integer({ minimum: 0 }),
   nextOffset: Type.Union([Type.Integer({ minimum: 0 }), Type.Null()]),
 }
+const V1Common = { ...Common, schemaVersion: Type.Literal(TASK_GRAPH_RESULT_PAGE_V1_SCHEMA) }
 const AvailableScout = Type.Object({ ...Common, role: Type.Literal("scout"), items: Type.Array(ScoutItem, { maxItems: TASK_GRAPH_RESULT_PAGE_SIZE }) }, { additionalProperties: false })
-const AvailableAnalyst = Type.Object({ ...Common, role: Type.Literal("analyst"), items: Type.Array(AnalystItem, { maxItems: TASK_GRAPH_RESULT_PAGE_SIZE }) }, { additionalProperties: false })
+const AvailableAnalyst = Type.Object({
+  ...Common, role: Type.Literal("analyst"), items: Type.Array(AnalystItem, { maxItems: TASK_GRAPH_RESULT_PAGE_SIZE }),
+  analysisSummary: Type.Optional(Type.String({ maxLength: TASK_GRAPH_RESULT_SUMMARY_PREVIEW_BYTE_LIMIT })),
+  analysisSummaryTruncated: Type.Optional(Type.Boolean()),
+}, { additionalProperties: false })
 const Unavailable = Type.Object({
   schemaVersion: Type.Literal(TASK_GRAPH_RESULT_PAGE_SCHEMA), trust: Type.Literal("untrusted"),
+  availability: Type.Literal("unavailable"), graphRevision: Type.Integer({ minimum: 0, maximum: MAX_GRAPH_REVISION }),
+  reason: Type.Union([
+    Type.Literal("no_graph"), Type.Literal("revision_mismatch"), Type.Literal("node_unavailable"),
+    Type.Literal("result_unavailable"), Type.Literal("offset_out_of_range"), Type.Literal("source_too_large"),
+  ]),
+}, { additionalProperties: false })
+const AvailableScoutV1 = Type.Object({ ...V1Common, role: Type.Literal("scout"), items: Type.Array(ScoutItem, { maxItems: TASK_GRAPH_RESULT_PAGE_SIZE }) }, { additionalProperties: false })
+const AvailableAnalystV1 = Type.Object({ ...V1Common, role: Type.Literal("analyst"), items: Type.Array(AnalystItem, { maxItems: TASK_GRAPH_RESULT_PAGE_SIZE }) }, { additionalProperties: false })
+const UnavailableV1 = Type.Object({
+  schemaVersion: Type.Literal(TASK_GRAPH_RESULT_PAGE_V1_SCHEMA), trust: Type.Literal("untrusted"),
   availability: Type.Literal("unavailable"), graphRevision: Type.Integer({ minimum: 0, maximum: MAX_GRAPH_REVISION }),
   reason: Type.Union([
     Type.Literal("no_graph"), Type.Literal("revision_mismatch"), Type.Literal("node_unavailable"),
@@ -54,6 +72,8 @@ export type TaskGraphResultPageAvailable = Static<typeof AvailableScout> | Stati
 export type TaskGraphResultPageUnavailable = Static<typeof Unavailable>
 export type TaskGraphResultPage = TaskGraphResultPageAvailable | TaskGraphResultPageUnavailable
 export const TaskGraphResultPageSchema = Type.Union([AvailableScout, AvailableAnalyst, Unavailable])
+const TaskGraphResultPageV1Schema = Type.Union([AvailableScoutV1, AvailableAnalystV1, UnavailableV1])
+type TaskGraphResultPageV1 = Static<typeof TaskGraphResultPageV1Schema>
 
 export function isCanonicalTaskGraphJobId(value: unknown): value is string {
   return typeof value === "string" && CANONICAL_JOB_ID.test(value)
@@ -78,6 +98,15 @@ export function parseTaskGraphResultPage(value: unknown): TaskGraphResultPage | 
   const totalCount = row.totalCount as number, offset = row.offset as number
   if (offset > totalCount || !Array.isArray(row.items)
     || row.items.length !== Math.min(TASK_GRAPH_RESULT_PAGE_SIZE, totalCount - offset)) return null
+  const hasAnalysisSummary = Object.hasOwn(row, "analysisSummary")
+  const hasSummaryTruncated = Object.hasOwn(row, "analysisSummaryTruncated")
+  if (hasAnalysisSummary !== hasSummaryTruncated) return null
+  if (hasAnalysisSummary) {
+    const summary = row.analysisSummary
+    if (row.role !== "analyst" || row.taskStatus !== "completed" || row.resultStatus !== "completed" || offset !== 0
+      || typeof summary !== "string" || Buffer.from(summary, "utf8").toString("utf8") !== summary
+      || Buffer.byteLength(summary, "utf8") > TASK_GRAPH_RESULT_SUMMARY_PREVIEW_BYTE_LIMIT) return null
+  }
   const expectedNextOffset = offset + row.items.length < totalCount ? offset + row.items.length : null
   if (row.nextOffset !== expectedNextOffset) return null
   const evidenceKinds = (items: unknown[]): boolean => items.every(item => {
@@ -100,6 +129,40 @@ export function parseTaskGraphResultPage(value: unknown): TaskGraphResultPage | 
     role: "analyst", taskStatus: row.taskStatus as Static<typeof TerminalStatus>, resultStatus: row.resultStatus as "completed" | "partial",
     totalCount: row.totalCount as number, evidenceCount: row.evidenceCount as number, offset: row.offset as number,
     nextOffset: row.nextOffset as number | null,
+    ...(hasAnalysisSummary ? { analysisSummary: row.analysisSummary as string, analysisSummaryTruncated: row.analysisSummaryTruncated as boolean } : {}),
+    items: (row.items as Array<{ jobId: string; score: number; evidenceKinds: string[] }>).map(item => ({
+      jobId: item.jobId, score: item.score, evidenceKinds: [...item.evidenceKinds] as Array<Static<typeof EvidenceKind>>,
+    })),
+  }
+}
+
+/** Reads only exact persisted v1 pages for history; current tool output accepts v2 only. */
+export function parseTaskGraphResultPageV1(value: unknown): TaskGraphResultPageV1 | null {
+  if (!safeData(value) || !Value.Check(TaskGraphResultPageV1Schema, value)) return null
+  const row = value as Record<string, unknown>
+  if (row.availability === "unavailable") {
+    if (!Number.isSafeInteger(row.graphRevision)) return null
+    return { schemaVersion: TASK_GRAPH_RESULT_PAGE_V1_SCHEMA, trust: "untrusted", availability: "unavailable",
+      graphRevision: row.graphRevision as number, reason: row.reason as TaskGraphResultPageUnavailable["reason"] }
+  }
+  if (!safePageIntegers(row)) return null
+  const totalCount = row.totalCount as number, offset = row.offset as number
+  if (offset > totalCount || !Array.isArray(row.items)
+    || row.items.length !== Math.min(TASK_GRAPH_RESULT_PAGE_SIZE, totalCount - offset)) return null
+  const expectedNextOffset = offset + row.items.length < totalCount ? offset + row.items.length : null
+  if (row.nextOffset !== expectedNextOffset || !validEvidenceKinds(row.items)) return null
+  if (row.role === "scout") return {
+    schemaVersion: TASK_GRAPH_RESULT_PAGE_V1_SCHEMA, trust: "untrusted", availability: "available", graphRevision: row.graphRevision as number,
+    role: "scout", taskStatus: row.taskStatus as Static<typeof TerminalStatus>, resultStatus: row.resultStatus as "completed" | "partial",
+    totalCount, evidenceCount: row.evidenceCount as number, offset, nextOffset: expectedNextOffset,
+    items: (row.items as Array<{ jobId: string; source: string; evidenceKinds: string[] }>).map(item => ({
+      jobId: item.jobId, source: item.source as Static<typeof AtsSource>, evidenceKinds: [...item.evidenceKinds] as Array<Static<typeof EvidenceKind>>,
+    })),
+  }
+  return {
+    schemaVersion: TASK_GRAPH_RESULT_PAGE_V1_SCHEMA, trust: "untrusted", availability: "available", graphRevision: row.graphRevision as number,
+    role: "analyst", taskStatus: row.taskStatus as Static<typeof TerminalStatus>, resultStatus: row.resultStatus as "completed" | "partial",
+    totalCount, evidenceCount: row.evidenceCount as number, offset, nextOffset: expectedNextOffset,
     items: (row.items as Array<{ jobId: string; score: number; evidenceKinds: string[] }>).map(item => ({
       jobId: item.jobId, score: item.score, evidenceKinds: [...item.evidenceKinds] as Array<Static<typeof EvidenceKind>>,
     })),
@@ -113,6 +176,14 @@ function safePageIntegers(value: unknown): boolean {
   const integer = (candidate: unknown): candidate is number => Number.isSafeInteger(candidate) && Number(candidate) >= 0
   return integer(row.graphRevision) && row.graphRevision > 0 && integer(row.totalCount) && integer(row.evidenceCount) && integer(row.offset)
     && (row.nextOffset === null || integer(row.nextOffset))
+}
+
+function validEvidenceKinds(items: unknown[]): boolean {
+  return items.every(item => {
+    const kinds = (item as { evidenceKinds: unknown[] }).evidenceKinds
+    return new Set(kinds).size === kinds.length && kinds.every((kind, index) => EVIDENCE_KIND_ORDER.indexOf(kind as typeof EVIDENCE_KIND_ORDER[number])
+      > (index === 0 ? -1 : EVIDENCE_KIND_ORDER.indexOf(kinds[index - 1] as typeof EVIDENCE_KIND_ORDER[number])))
+  })
 }
 
 /** Rejects proxies, accessors, symbols, sparse arrays and cycles before schema checks read properties. */

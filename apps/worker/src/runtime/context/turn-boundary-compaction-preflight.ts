@@ -13,6 +13,8 @@ import { collectCompactionState } from "./context-compaction-collector.js"
 import { createPgCompactionSource } from "./context-compaction-pg-source.js"
 import { createPgContextSnapshotCompactionPort } from "./context-snapshot-compaction-pg.js"
 import type { TaskGraphCommandPort } from "../subagents/task-graph-command-port.js"
+import { estimateMaximumDiscoveryPersonaContextTokens } from "./discovery-persona-context-blocks.js"
+import { readDiscoveryPersonaSnapshotForCompaction } from "./discovery-persona-facts-pg.js"
 
 export type TurnBoundaryState = {
   readonly goal: string
@@ -47,6 +49,49 @@ export async function runTurnBoundaryCompactionPreflight<State extends TurnBound
   }
 }
 
+export function createTurnBoundaryMemoryPreflight<State>(input: {
+  readonly enabled: boolean
+  readonly signal: AbortSignal
+  readonly pool: Pick<pg.Pool, "connect">
+  readonly scope: TenantScope
+  readonly owner: TurnExecutionOwnerFence
+  readonly lease: TurnLease
+  readonly rootTaskId: string
+  readonly rootAttemptCount: number
+  readonly taskGraphCommandPort?: TaskGraphCommandPort
+  readonly discoveryPersonaMemoryEnabled: boolean
+  readonly model: ModelAdapter
+  readonly runner: ((input: Parameters<typeof runTurnBoundaryContextCompaction>[0]) => Promise<{ readonly status: string }>) | undefined
+  readonly readMemory?: typeof readDiscoveryPersonaSnapshotForCompaction
+  readonly reload: () => Promise<State>
+}): {
+  readonly enabled: boolean
+  readonly signal: AbortSignal
+  readonly compact: () => Promise<{ readonly status: string }>
+  readonly reload: () => Promise<State>
+} {
+  return {
+    enabled: input.enabled,
+    signal: input.signal,
+    reload: input.reload,
+    compact: async () => {
+      let additionalInputTokens = 0
+      if (input.discoveryPersonaMemoryEnabled) {
+        const memory = await (input.readMemory ?? readDiscoveryPersonaSnapshotForCompaction)(input.pool, {
+          scope: input.scope, lease: input.lease, rootTaskId: input.rootTaskId, rootAttemptCount: input.rootAttemptCount,
+        })
+        if (memory.kind === "overflow") return { status: "skipped" }
+        additionalInputTokens = memory.kind === "accepted" ? memory.estimatedTokens : estimateMaximumDiscoveryPersonaContextTokens()
+      }
+      return (input.runner ?? runTurnBoundaryContextCompaction)({
+        pool: input.pool, scope: input.scope, owner: input.owner, lease: input.lease,
+        taskGraphCommandPort: input.taskGraphCommandPort, model: input.model, signal: input.signal,
+        ...(input.discoveryPersonaMemoryEnabled ? { additionalInputTokens } : {}),
+      })
+    },
+  }
+}
+
 function preserveInitialTurnContext(initial: StepContextSnapshot, refreshed: StepContextSnapshot): StepContextSnapshot {
   const consumedWaitResults = initial.toolObservations.filter(observation => observation.id.startsWith("wait-result:"))
   const consumedById = new Map(consumedWaitResults.map(observation => [observation.id, observation]))
@@ -67,6 +112,7 @@ export async function runTurnBoundaryContextCompaction(input: {
   readonly owner: TurnExecutionOwnerFence
   readonly lease: TurnLease
   readonly taskGraphCommandPort?: TaskGraphCommandPort
+  readonly additionalInputTokens?: number
   /** This is the same usage-authorized Harness adapter used by TurnEngine. */
   readonly model: ModelAdapter
   readonly signal: AbortSignal
@@ -74,8 +120,12 @@ export async function runTurnBoundaryContextCompaction(input: {
   const source = await createPgCompactionSource(input.pool).load({ scope: input.scope, owner: input.owner })
   if (!source || !source.items.some(item => item.type !== "compaction_summary")) return { status: "skipped" }
   const collection = collectCompactionState(source)
+  const additionalInputTokens = input.additionalInputTokens ?? 0
+  if (!Number.isSafeInteger(additionalInputTokens) || additionalInputTokens < 0) throw new RangeError("additionalInputTokens must be a non-negative safe integer")
+  const inputTokens = collection.beforeInputTokens + additionalInputTokens
+  if (!Number.isSafeInteger(inputTokens)) throw new RangeError("input token estimate exceeds the safe integer range")
   const trigger = evaluateCompactionTrigger({
-    inputTokens: collection.beforeInputTokens,
+    inputTokens,
     itemCount: collection.sourceItemCount,
     atTurnBoundary: false,
     requested: false,
@@ -96,6 +146,7 @@ export async function runTurnBoundaryContextCompaction(input: {
     turnId: input.lease.turnId,
     source: compactionSource,
     policy: DEFAULT_COMPACTION_POLICY,
+    ...(additionalInputTokens > 0 ? { additionalInputTokens } : {}),
     // This preflight runs at the boundary; the boundary itself is not a trigger.
     atTurnBoundary: false,
     requested: false,

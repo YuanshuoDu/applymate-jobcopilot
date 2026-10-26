@@ -1,10 +1,13 @@
 import { describe, expect, it, vi } from "vitest"
 import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
-import type { CompactionSource } from "./context-compaction-types.js"
+import type pg from "pg"
+import type { CompactionItemRecord, CompactionSource } from "./context-compaction-types.js"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import type { TurnLease } from "../turns/lease.js"
 import type { CanonicalTurnState } from "../canonical-turn-state.js"
 import { projectSelectedJobMemory } from "./selected-job-memory.js"
+import { collectCompactionState } from "./context-compaction-collector.js"
+import { estimateDiscoveryPersonaContextTokens, estimateMaximumDiscoveryPersonaContextTokens } from "./discovery-persona-context-blocks.js"
 
 const source: CompactionSource = {
   state: {
@@ -26,7 +29,7 @@ const publishedItemIds: string[] = []
 const startedItemIds: string[] = []
 const compactionPort = {
   loadLatest: vi.fn(async (): Promise<{ id: string; sessionId: string; throughSequence: bigint; version: number } | null> => null),
-  recordStarted: vi.fn(async (item: { id: string }) => { startedItemIds.push(item.id) }),
+  recordStarted: vi.fn(async (item: CompactionItemRecord) => { startedItemIds.push(item.id) }),
   publishAtomically: vi.fn(async (input: { startedItem: { id: string }; draft: { state: { throughSequence: bigint } } }) => {
     publishedItemIds.push(input.startedItem.id)
     return { id: "snapshot-2", sessionId: "session-1", throughSequence: input.draft.state.throughSequence, version: 2 }
@@ -40,7 +43,7 @@ vi.mock("./context-compaction-pg-source.js", () => ({ createPgCompactionSource: 
 } }))
 vi.mock("./context-snapshot-compaction-pg.js", () => ({ createPgContextSnapshotCompactionPort: () => compactionPort }))
 
-import { runTurnBoundaryCompactionPreflight, runTurnBoundaryContextCompaction } from "./turn-boundary-compaction-preflight.js"
+import { createTurnBoundaryMemoryPreflight, runTurnBoundaryCompactionPreflight, runTurnBoundaryContextCompaction } from "./turn-boundary-compaction-preflight.js"
 import { createPgContextSnapshotCompactionPort } from "./context-snapshot-compaction-pg.js"
 
 const lease: TurnLease = {
@@ -71,6 +74,23 @@ const itemThresholdSourceWithMemory: CompactionSource = {
   state: { ...itemThresholdSource.state, selectedJobMemories: [selectedJobMemory] },
 }
 
+function historyAtInputTokens(tokens: number): CompactionSource {
+  const targetCharacters = tokens * 4
+  const firstPrefix = "[100] agent_message "
+  const secondPrefix = "[101] agent_message "
+  const firstRenderedLength = 20_000
+  const secondContentLength = targetCharacters - firstRenderedLength - 1 - secondPrefix.length
+  return {
+    ...source,
+    items: [
+      { id: "large-history-1", sessionId: "session-1", turnId: "turn-1", sequence: 100n,
+        type: "agent_message", status: "completed", content: "x".repeat(firstRenderedLength - firstPrefix.length) },
+      { id: "large-history-2", sessionId: "session-1", turnId: "turn-1", sequence: 101n,
+        type: "agent_message", status: "completed", content: "y".repeat(secondContentLength) },
+    ],
+  }
+}
+
 function model(
   events: ModelStreamEvent[] = [{ type: "text_delta", text: "Short narrative" }, { type: "completed", finishReason: "stop" }],
   requests: HarnessModelRequest[] = [],
@@ -86,6 +106,62 @@ function model(
 }
 
 describe("turn-boundary context compaction preflight", () => {
+  it("uses accepted discovery memory size when wiring boundary compaction", async () => {
+    const readMemory = vi.fn(async () => ({ kind: "accepted" as const, estimatedTokens: 37 }))
+    const runner = vi.fn(async () => ({ status: "compacted" }))
+    const preflight = createTurnBoundaryMemoryPreflight({
+      enabled: true, signal: new AbortController().signal,
+      pool: { connect: vi.fn() } as unknown as Pick<pg.Pool, "connect">,
+      scope: { userId: "user-1" }, owner, lease, rootTaskId: "root-1", rootAttemptCount: 1,
+      discoveryPersonaMemoryEnabled: true, model: model(), runner, readMemory, reload: async () => state(),
+    })
+
+    await expect(preflight.compact()).resolves.toEqual({ status: "compacted" })
+    expect(readMemory).toHaveBeenCalledOnce()
+    expect(runner).toHaveBeenCalledWith(expect.objectContaining({ additionalInputTokens: 37 }))
+  })
+
+  it("uses the bounded reserve only when the discovery snapshot is absent", async () => {
+    const readMemory = vi.fn(async () => ({ kind: "absent" as const }))
+    const runner = vi.fn(async () => ({ status: "compacted" }))
+    const preflight = createTurnBoundaryMemoryPreflight({
+      enabled: true, signal: new AbortController().signal,
+      pool: { connect: vi.fn() } as unknown as Pick<pg.Pool, "connect">,
+      scope: { userId: "user-1" }, owner, lease, rootTaskId: "root-1", rootAttemptCount: 1,
+      discoveryPersonaMemoryEnabled: true, model: model(), runner, readMemory, reload: async () => state(),
+    })
+
+    await preflight.compact()
+    expect(runner).toHaveBeenCalledWith(expect.objectContaining({
+      additionalInputTokens: estimateMaximumDiscoveryPersonaContextTokens(),
+    }))
+  })
+
+  it("keeps overflow fail-closed and avoids memory reads when ineligible", async () => {
+    const overflowRead = vi.fn(async () => ({ kind: "overflow" as const }))
+    const skippedRunner = vi.fn(async () => ({ status: "compacted" }))
+    const overflow = createTurnBoundaryMemoryPreflight({
+      enabled: true, signal: new AbortController().signal,
+      pool: { connect: vi.fn() } as unknown as Pick<pg.Pool, "connect">,
+      scope: { userId: "user-1" }, owner, lease, rootTaskId: "root-1", rootAttemptCount: 1,
+      discoveryPersonaMemoryEnabled: true, model: model(), runner: skippedRunner, readMemory: overflowRead, reload: async () => state(),
+    })
+    await expect(overflow.compact()).resolves.toEqual({ status: "skipped" })
+    expect(skippedRunner).not.toHaveBeenCalled()
+
+    const ineligibleRead = vi.fn(async () => ({ kind: "accepted" as const, estimatedTokens: 37 }))
+    const ineligibleRunner = vi.fn(async () => ({ status: "compacted" }))
+    const ineligible = createTurnBoundaryMemoryPreflight({
+      enabled: true, signal: new AbortController().signal,
+      pool: { connect: vi.fn() } as unknown as Pick<pg.Pool, "connect">,
+      scope: { userId: "user-1" }, owner, lease, rootTaskId: "root-1", rootAttemptCount: 1,
+      discoveryPersonaMemoryEnabled: false, model: model(), runner: ineligibleRunner, readMemory: ineligibleRead, reload: async () => state(),
+    })
+    await ineligible.compact()
+    expect(ineligibleRead).not.toHaveBeenCalled()
+    expect(ineligibleRunner).toHaveBeenCalledWith(expect.not.objectContaining({ additionalInputTokens: expect.anything() }))
+  })
+
   it.each([
     ["disabled", { enabled: false, state: state() }],
     ["pinned", { enabled: true, state: state({ contextSnapshotPinned: true }) }],
@@ -180,6 +256,71 @@ describe("turn-boundary context compaction preflight", () => {
     expect(compactionSourceCalls).toEqual([[pool]])
     expect(taskGraphCommandPort.readCurrent).not.toHaveBeenCalled()
     expect(taskGraphCommandPort.readCurrentWithClient).not.toHaveBeenCalled()
+  })
+
+  it("adds the actual discovery-memory reserve only to the input-token threshold", async () => {
+    const history = historyAtInputTokens(11_990)
+    expect(collectCompactionState(history).beforeInputTokens).toBe(11_990)
+    expect(history.items).toHaveLength(2)
+    const projection = {
+      schemaVersion: "applymate.discovery-persona-projection.v1", purpose: "discovery",
+      facts: [{ factId: "fact-1", key: "preferred_location", label: "Preferred location", category: "preferences",
+        source: "manual", value: "Dublin", normalizedValue: "dublin", updatedAt: "2026-10-24T12:00:00.000Z" }],
+    } as const
+    const reserve = estimateDiscoveryPersonaContextTokens(projection)
+    expect(estimateMaximumDiscoveryPersonaContextTokens()).toBeGreaterThanOrEqual(reserve)
+    expect(11_990 + reserve).toBeGreaterThanOrEqual(12_000)
+
+    loadSource.mockReset().mockResolvedValue(history)
+    compactionSourceCalls.length = 0
+    compactionPort.loadLatest.mockClear(); compactionPort.recordStarted.mockClear()
+    compactionPort.publishAtomically.mockClear(); compactionPort.recordFailed.mockClear()
+    const requests: HarnessModelRequest[] = []
+    const pool = { connect: vi.fn() }
+
+    const withoutReserve = await runTurnBoundaryContextCompaction({
+      pool, scope: { userId: "user-1" }, owner, lease, additionalInputTokens: 0,
+      model: model(undefined, requests), signal: new AbortController().signal,
+    })
+    expect(withoutReserve.status).toBe("skipped")
+    if (withoutReserve.status !== "skipped") throw new Error("Expected history alone to stay below the input threshold")
+    if (!("trigger" in withoutReserve)) throw new Error("Expected a below-threshold trigger decision")
+    expect(withoutReserve.trigger).toEqual({ shouldCompact: false, reason: null })
+    expect(requests).toHaveLength(0)
+
+    const withReserve = await runTurnBoundaryContextCompaction({
+      pool, scope: { userId: "user-1" }, owner, lease, additionalInputTokens: reserve,
+      model: model(undefined, requests), signal: new AbortController().signal,
+    })
+    expect("trigger" in withReserve ? withReserve.trigger : null).toEqual({ shouldCompact: true, reason: "input_tokens" })
+    expect(compactionSourceCalls).toEqual([[pool], [pool]])
+    expect(requests).toHaveLength(1)
+    const summarizedHistory = requests[0]?.messages[1]?.content[0]
+    if (summarizedHistory?.type !== "text") throw new Error("Expected history-only narrative input")
+    expect(summarizedHistory.text).not.toContain("Dublin")
+    expect(summarizedHistory.text).not.toContain("confirmed_persona_facts")
+    expect(compactionPort.recordStarted).toHaveBeenCalledOnce()
+    expect(compactionPort.recordStarted).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ reason: "input_tokens", sourceItemCount: 2 }),
+    }), { userId: "user-1" })
+    expect(compactionPort.publishAtomically).toHaveBeenCalledOnce()
+    expect(compactionPort.recordFailed).not.toHaveBeenCalled()
+  })
+
+  it.each([-1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1, Number.MAX_SAFE_INTEGER])("fails closed for invalid additional input tokens: %s", async additionalInputTokens => {
+    loadSource.mockReset().mockResolvedValue(source)
+    compactionPort.recordStarted.mockClear(); compactionPort.publishAtomically.mockClear()
+    compactionPort.recordFailed.mockClear()
+    const requests: HarnessModelRequest[] = []
+    await expect(runTurnBoundaryContextCompaction({
+      pool: { connect: vi.fn() }, scope: { userId: "user-1" }, owner, lease, additionalInputTokens,
+      model: model(undefined, requests), signal: new AbortController().signal,
+    })).rejects.toThrow(additionalInputTokens === Number.MAX_SAFE_INTEGER
+      ? "input token estimate exceeds the safe integer range"
+      : "additionalInputTokens must be a non-negative safe integer")
+    expect(requests).toHaveLength(0)
+    expect(compactionPort.recordStarted).not.toHaveBeenCalled()
+    expect(compactionPort.publishAtomically).not.toHaveBeenCalled()
   })
 
   it("retries a failed item under a new lease while keeping IDs stable within each lease", async () => {
