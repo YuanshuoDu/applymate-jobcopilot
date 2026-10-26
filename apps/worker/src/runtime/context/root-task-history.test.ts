@@ -206,6 +206,117 @@ describe("root task history projection", () => {
     expect(projectRootTaskHistory([setterLocality], true)).toBeUndefined()
   })
 
+  it("emits a same-session plan skeleton using source ordinals, independent of public node sorting", () => {
+    const analyst = node({ key: "private-analyst-key", taskId: "private-analyst-task", templateId: "analyst",
+      dependsOn: ["private-scout-key"] })
+    const scout = node({ key: "private-scout-key", taskId: "private-scout-task", templateId: "scout" })
+    const local = { ...outcome("shape-local", 25n, [analyst, scout]), sourceNodeOrdinals: [2, 1] }
+    const projected = projectRootTaskHistory([local])
+    const turns = (projected?.content as { turns?: Array<{ nodes: unknown[]; planShape?: unknown }> } | undefined)?.turns
+
+    expect(turns?.[0]?.nodes).toMatchObject([{ taskKind: "analyst" }, { taskKind: "scout" }])
+    expect(turns?.[0]?.planShape).toEqual({
+      schemaVersion: "agent-harness.v2.root-task-history-plan-shape.v1",
+      ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
+      nodes: [
+        { ordinal: 1, role: "scout", dependsOnOrdinals: [] },
+        { ordinal: 2, role: "analyst", dependsOnOrdinals: [1] },
+      ],
+    })
+    const serialized = JSON.stringify(projected)
+    for (const privateValue of ["private-analyst-key", "private-scout-key", "private-analyst-task", "private-scout-task", "PRIVATE_GOAL"]) {
+      expect(serialized).not.toContain(privateValue)
+    }
+
+    const terminalAt = new Date("2026-10-08T11:00:00.000Z")
+    const explicitLocality = { ...local, terminalAt, sourceSessionDiffers: false }
+    const foreign = { ...local, terminalAt, sourceSessionDiffers: true }
+    const unknownLocality = { ...local, terminalAt }
+    const localShape = (value: ValidatedRootTaskHistoryOutcome) => {
+      const projected = projectRootTaskHistory([value], true)
+      return (projected?.content as { turns?: Array<{ planShape?: unknown }> } | undefined)?.turns?.[0]?.planShape
+    }
+    expect(localShape(explicitLocality)).toBeDefined()
+    expect(localShape(foreign)).toBeUndefined()
+    expect(localShape(unknownLocality)).toBeUndefined()
+  })
+
+  it("omits an invalid or incomplete optional skeleton while retaining the history outcome", () => {
+    const scout = node({ key: "scout-key", taskId: "scout-task", templateId: "scout" })
+    const analyst = node({ key: "analyst-key", taskId: "analyst-task", templateId: "analyst", dependsOn: ["scout-key"] })
+    const source = { ...outcome("shape-fail-closed", 26n, [scout, analyst]), sourceNodeOrdinals: [1, 2] }
+    const dangling = { ...source, taskGraph: graph([scout, { ...analyst, dependsOn: ["missing-key"] }]) }
+    const missingMapping = { ...source, sourceNodeOrdinals: undefined }
+    for (const candidate of [dangling, missingMapping]) {
+      const projected = projectRootTaskHistory([candidate])
+      expect(projected?.content).toMatchObject({ turns: [{ nodes: [{ taskKind: "analyst" }, { taskKind: "scout" }] }] })
+      expect((projected?.content as { turns: Array<{ planShape?: unknown }> }).turns[0]?.planShape).toBeUndefined()
+    }
+  })
+
+  it("drops a whole skeleton when global node truncation makes its turn incomplete", () => {
+    const newestNodes = Array.from({ length: 7 }, (_, index) => node({ key: `new-${index}`, taskId: `new-task-${index}`,
+      templateId: "analyst" }))
+    const oldScout = node({ key: "old-scout", taskId: "old-scout-task", templateId: "scout" })
+    const oldAnalyst = node({ key: "old-analyst", taskId: "old-analyst-task", templateId: "analyst", dependsOn: ["old-scout"] })
+    const newest = { ...outcome("shape-newest", 28n, newestNodes), sourceNodeOrdinals: [1, 2, 3, 4, 5, 6, 7] }
+    const older = { ...outcome("shape-truncated", 27n, [oldScout, oldAnalyst]), sourceNodeOrdinals: [1, 2] }
+    const turns = (projectRootTaskHistory([older, newest])?.content as {
+      turns?: Array<{ nodes: unknown[]; planShape?: { nodes: unknown[] } }>
+    } | undefined)?.turns
+
+    expect(turns).toHaveLength(2)
+    expect(turns?.[0]?.nodes).toHaveLength(7)
+    expect(turns?.[0]?.planShape?.nodes).toHaveLength(7)
+    expect(turns?.[1]?.nodes).toHaveLength(1)
+    expect(turns?.[1]?.planShape).toBeUndefined()
+  })
+
+  it("drops whole plan shapes before changing otherwise fitting outcomes or lessons at the byte cap", () => {
+    const maxBytes = 8 * 1024
+    const criterionIds = Array.from({ length: 8 }, (_, index) => `criterion-${index + 1}`)
+    const report = { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "failed" as const, reasonCode: "criterion_not_met" as const,
+      criteria: criterionIds.map(criterionId => ({ criterionId, status: "failed" as const, reasonCode: "criterion_not_met" as const })),
+      evidenceDigest: null, resultDigest: null }
+    let witness: { withShape: ReturnType<typeof projectRootTaskHistory>; withoutShape: ReturnType<typeof projectRootTaskHistory> } | undefined
+
+    for (let count = 1; count <= 8 && !witness; count++) {
+      const nodes = Array.from({ length: 8 }, (_, index) => node({ key: `budget-key-${index + 1}`,
+        taskId: `budget-task-${index + 1}`, templateId: "analyst", status: "failed", verificationCriterionIds: criterionIds,
+        verificationReport: report, dependsOn: index ? [`budget-key-${index}`] : [] }))
+      const ordinals = nodes.map((_, index) => index + 1)
+      const failures = Array.from({ length: count }, (_, index) => ({ criterionOrdinal: index + 1, status: "failed" as const,
+        reasonCode: "criterion_not_met" as const,
+        check: { role: "analyst" as const, kind: "reported_score_gte" as const, minimumScore: 10, minimumFindings: 8, aggregation: "all" as const } }))
+      const lessons = nodes.map((_, index) => ({ ordinalScope: "source_graph_local" as const, advisoryOnly: true as const,
+        notCurrentEvidence: true as const, nodeOrdinal: index + 1, criterionFailures: failures }))
+      const valid = { ...outcome(`shape-byte-${count}`, 40n, nodes), sourceNodeOrdinals: ordinals, nodeLessons: lessons }
+      const invalidGraph = nodes.map((item, index) => index === 7 ? { ...item, dependsOn: [...item.dependsOn, "missing-key"] } : item)
+      const withoutShape = projectRootTaskHistory([{ ...valid, taskGraph: graph(invalidGraph) }])
+      const baselineContent = withoutShape?.content as { turns?: Array<Record<string, unknown>> } | undefined
+      const baselineTurn = baselineContent?.turns?.[0]
+      if (!withoutShape || !baselineTurn || !Array.isArray(baselineTurn.nodes)) continue
+      const hypothetical = { ...withoutShape, content: { ...baselineContent, turns: [
+        { ...baselineTurn, planShape: {
+          schemaVersion: "agent-harness.v2.root-task-history-plan-shape.v1", ordinalScope: "source_graph_local",
+          advisoryOnly: true, notCurrentEvidence: true,
+          nodes: nodes.map((item, index) => ({ ordinal: index + 1, role: "analyst", dependsOnOrdinals: index ? [index] : [] })),
+        } },
+      ] } }
+      if (Buffer.byteLength(JSON.stringify(withoutShape), "utf8") <= maxBytes
+        && Buffer.byteLength(JSON.stringify(hypothetical), "utf8") > maxBytes
+        && (baselineTurn.nodes as Array<{ lesson?: { criterionFailures?: unknown[] } }>).length === 8
+        && (baselineTurn.nodes as Array<{ lesson?: { criterionFailures?: unknown[] } }>).every(item => item.lesson?.criterionFailures?.length === count)) {
+        witness = { withoutShape, withShape: projectRootTaskHistory([valid]) }
+      }
+    }
+
+    expect(witness).toBeDefined()
+    expect(Buffer.byteLength(JSON.stringify(witness?.withoutShape), "utf8")).toBeLessThanOrEqual(maxBytes)
+    expect(Buffer.byteLength(JSON.stringify(witness?.withShape), "utf8")).toBeLessThanOrEqual(maxBytes)
+    expect(witness?.withShape).toEqual(witness?.withoutShape)
+  })
+
   it("applies the byte cap to the final sanitized cross-session frame", () => {
     const criterionIds = Array.from({ length: 8 }, (_, index) => "criterion-" + (index + 1))
     const failedReport = {

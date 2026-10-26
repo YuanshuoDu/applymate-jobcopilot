@@ -20,6 +20,8 @@ type Options = {
   targets?: Array<Record<string, unknown>>
   noCall?: boolean
   duplicateCalls?: boolean
+  missingWait?: boolean
+  updateRowCount?: number
 }
 function fixture(options: Options = {}) {
   const createdAt = new Date(now.getTime() - 20_000)
@@ -46,7 +48,8 @@ function fixture(options: Options = {}) {
   const calls: Array<{ sql: string; values?: unknown[] }> = []
   const client = { query: vi.fn(async (sql: string, values?: unknown[]) => {
     calls.push({ sql, values })
-    if (sql.includes('FROM "agent_wait_conditions" AS wait')) return { rows: [{ ...wait, ...options.wait }], rowCount: 1 }
+    if (sql.includes('FROM "agent_wait_conditions" AS wait')) return options.missingWait
+      ? { rows: [], rowCount: 0 } : { rows: [{ ...wait, ...options.wait }], rowCount: 1 }
     if (sql.includes('FROM "sub_agent_tasks" AS child')) return { rows: options.targets ?? [target], rowCount: (options.targets ?? [target]).length }
     if (sql.includes('FROM "agent_items" AS call')) {
       if (options.noCall) return { rows: [], rowCount: 0 }
@@ -55,7 +58,7 @@ function fixture(options: Options = {}) {
         eventCorrelationId: "call-2", content: { ...call.content, toolCallId: "call-2" } })
       return { rows: callRows, rowCount: callRows.length }
     }
-    if (sql.startsWith('UPDATE "agent_wait_conditions"')) return { rows: [{ id: "wait-1" }], rowCount: 1 }
+    if (sql.startsWith('UPDATE "agent_wait_conditions"')) return { rows: [{ id: "wait-1" }], rowCount: options.updateRowCount ?? 1 }
     throw new Error(`Unexpected SQL in projection test: ${sql}`)
   }) }
   return { client, calls }
@@ -70,7 +73,7 @@ function canonicalProjection() {
 describe("expired wait projection repair", () => {
   it("repairs only request/outcome from the exact call, canonical row, and current targets", async () => {
     const fake = fixture()
-    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toBe(true)
+    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toEqual({ status: "repaired" })
     const update = fake.calls.find(call => call.sql.startsWith('UPDATE "agent_wait_conditions"'))
     expect(update?.values?.slice(1, 11)).toEqual(["wait-1", lease.userId, lease.sessionId, lease.turnId, lease.id, "step-1",
       "wait-key-1", JSON.stringify(["target-1"]), JSON.stringify(["target-1"]), "any"])
@@ -91,6 +94,15 @@ describe("expired wait projection repair", () => {
     expect(callQuery).toContain('result."type" = \'tool_result\'')
   })
 
+  it("repairs a phone-like UUID waitId through safe whole-result serialization", async () => {
+    const waitId = "00000000-0000-4000-8000-000000000000"
+    const fake = fixture({ wait: { id: waitId } })
+    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toEqual({ status: "repaired" })
+    const update = fake.calls.find(call => call.sql.startsWith('UPDATE "agent_wait_conditions"'))
+    const persisted = JSON.parse(String(update?.values?.[0])) as { outcome?: { waitId?: unknown } }
+    expect(persisted.outcome?.waitId).toBe(waitId)
+  })
+
   it("keeps the resolution-time matches when another any-wait target becomes terminal later", async () => {
     const secondTarget = { id: "target-2", parentTaskId: lease.id, rootTaskId: lease.rootTaskId, sessionId: lease.sessionId,
       turnId: lease.turnId, userId: lease.userId, status: "failed", role: "reviewer", result: null, failureReason: "failed later" }
@@ -105,7 +117,7 @@ describe("expired wait projection repair", () => {
       ],
     })
 
-    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toBe(true)
+    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toEqual({ status: "repaired" })
     const update = fake.calls.find(call => call.sql.startsWith('UPDATE "agent_wait_conditions"'))
     const persisted = JSON.parse(String(update?.values?.[0])) as Record<string, unknown>
     expect(persisted.outcome).toMatchObject({
@@ -120,37 +132,67 @@ describe("expired wait projection repair", () => {
   })
 
   it.each([
-    { label: "a persisted match that is no longer terminal", wait: { targetTaskIds: ["target-1", "target-2"] }, targets: [
+    { label: "a persisted match that is no longer terminal", stage: "target_match_validation", wait: { targetTaskIds: ["target-1", "target-2"] }, targets: [
       { id: "target-1", parentTaskId: lease.id, rootTaskId: lease.rootTaskId, sessionId: lease.sessionId,
         turnId: lease.turnId, userId: lease.userId, status: "running", role: "writer", result: null, failureReason: null },
       { id: "target-2", parentTaskId: lease.id, rootTaskId: lease.rootTaskId, sessionId: lease.sessionId,
         turnId: lease.turnId, userId: lease.userId, status: "failed", role: "reviewer", result: null, failureReason: null },
     ] },
-    { label: "ready all wait without every persisted match", wait: { targetTaskIds: ["target-1", "target-2"], mode: "all" }, targets: [
+    { label: "ready all wait without every persisted match", stage: "target_match_validation", wait: { targetTaskIds: ["target-1", "target-2"], mode: "all" }, targets: [
       { id: "target-1", parentTaskId: lease.id, rootTaskId: lease.rootTaskId, sessionId: lease.sessionId,
         turnId: lease.turnId, userId: lease.userId, status: "completed", role: "writer", result: { finalText: "done" }, failureReason: null },
       { id: "target-2", parentTaskId: lease.id, rootTaskId: lease.rootTaskId, sessionId: lease.sessionId,
         turnId: lease.turnId, userId: lease.userId, status: "running", role: "reviewer", result: null, failureReason: null },
     ] },
-    { label: "duplicate persisted match IDs", wait: { matchedTaskIds: ["target-1", "target-1"] } },
-    { label: "persisted match outside the target scope", wait: { matchedTaskIds: ["other-target"] } },
+    { label: "duplicate persisted match IDs", stage: "wait_validation", wait: { matchedTaskIds: ["target-1", "target-1"] } },
+    { label: "persisted match outside the target scope", stage: "wait_validation", wait: { matchedTaskIds: ["other-target"] } },
   ])("fails closed for $label", async options => {
     const fake = fixture(options)
-    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toBe(false)
+    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toMatchObject({
+      status: "rejected", stage: options.stage,
+    })
     expect(fake.calls.some(call => call.sql.startsWith('UPDATE "agent_wait_conditions"'))).toBe(false)
   })
 
   it("leaves a matching projection alone without requiring a pending started call", async () => {
     const valid = fixture({ noCall: true, wait: { result: canonicalProjection() } })
-    await expect(repairStaleWaitProjection(valid.client as never, lease, now)).resolves.toBe(true)
+    await expect(repairStaleWaitProjection(valid.client as never, lease, now)).resolves.toEqual({ status: "already_current" })
     expect(valid.calls.some(call => call.sql.includes('FROM "agent_items" AS call'))).toBe(true)
     expect(valid.calls.some(call => call.sql.startsWith('UPDATE "agent_wait_conditions"'))).toBe(false)
+  })
+
+  it("reports when WAIT_SQL finds no canonical wait row", async () => {
+    const fake = fixture({ missingWait: true })
+    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toEqual({
+      status: "rejected", stage: "wait_row_count",
+    })
+    expect(fake.calls).toHaveLength(1)
+  })
+
+  it("rejects invalid helper input before issuing SQL", async () => {
+    const fake = fixture()
+    await expect(repairStaleWaitProjection(fake.client as never, { ...lease, attemptCount: 0 } as never, now)).resolves.toEqual({
+      status: "rejected", stage: "invalid_input",
+    })
+    expect(fake.calls).toHaveLength(0)
+  })
+
+  it.each([
+    { label: "a different lease expiry", stage: "lease_fence_validation", wait: { repairLeaseExpiresAt: new Date(now.getTime() - 2_000) } },
+    { label: "an invalid wait timestamp", stage: "wait_timestamp_validation", wait: { createdAt: "invalid-date" } },
+    { label: "an invalid timeout", stage: "timeout_validation", wait: { deadlineAt: new Date(now.getTime() - 20_000) } },
+  ])("reports $label as a finite rejection stage", async options => {
+    const fake = fixture({ wait: options.wait })
+    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toMatchObject({
+      status: "rejected", stage: options.stage,
+    })
+    expect(fake.calls.some(call => call.sql.includes('FROM "sub_agent_tasks" AS child'))).toBe(false)
   })
 
   it("accepts a canonical unconsumed wait with its latest streaming continuation", async () => {
     const fake = fixture({ noCall: true, wait: { result: canonicalProjection(), repairLatestOrdinal: 5,
       repairNextStatus: "streaming", repairNextOrdinal: 5 } })
-    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toBe(true)
+    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toEqual({ status: "already_current" })
     const waitQuery = fake.calls[0]?.sql ?? ""
     expect(waitQuery).toContain(`step."status" IN ('waiting_for_tool', 'completed') AND EXISTS`)
     expect(waitQuery).toContain(`continuation."status" = 'streaming'`)
@@ -163,14 +205,18 @@ describe("expired wait projection repair", () => {
   ])("rejects a canonical streaming continuation with a mismatched $label", async options => {
     const fake = fixture({ noCall: true, wait: { result: canonicalProjection(), repairLatestOrdinal: 5,
       repairNextStatus: "streaming", repairNextOrdinal: 5, ...options.wait } })
-    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toBe(false)
+    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toMatchObject({
+      status: "rejected", stage: "wait_validation",
+    })
     expect(fake.calls.some(call => call.sql.includes('FROM "sub_agent_tasks" AS child'))).toBe(false)
     expect(fake.calls.some(call => call.sql.startsWith('UPDATE "agent_wait_conditions"'))).toBe(false)
   })
 
   it("rejects duplicate exact unresolved wait calls even when the projection matches", async () => {
     const fake = fixture({ duplicateCalls: true, wait: { result: canonicalProjection() } })
-    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toBe(false)
+    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toEqual({
+      status: "rejected", stage: "call_result_validation",
+    })
     expect(fake.calls.some(call => call.sql.startsWith('UPDATE "agent_wait_conditions"'))).toBe(false)
   })
 
@@ -184,30 +230,44 @@ describe("expired wait projection repair", () => {
     { label: "missing started event", call: { eventId: null } },
   ])("rejects a matching projection with $label", async options => {
     const fake = fixture({ wait: { result: canonicalProjection() }, call: options.call })
-    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toBe(false)
+    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toMatchObject({
+      status: "rejected", stage: "call_contract_validation",
+    })
     expect(fake.calls.some(call => call.sql.startsWith('UPDATE "agent_wait_conditions"'))).toBe(false)
   })
 
   it("accepts a canonical projection with the downstream completed call state", async () => {
     const fake = fixture({ wait: { result: canonicalProjection() }, call: { status: "completed" } })
-    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toBe(true)
+    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toEqual({ status: "already_current" })
+    expect(fake.calls.some(call => call.sql.startsWith('UPDATE "agent_wait_conditions"'))).toBe(false)
+  })
+
+  it("reports a future started event timestamp without changing the wait", async () => {
+    const fake = fixture({ call: { eventCreatedAt: new Date(now.getTime() + 1_000) } })
+    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toEqual({
+      status: "rejected", stage: "call_timestamp_validation",
+    })
     expect(fake.calls.some(call => call.sql.startsWith('UPDATE "agent_wait_conditions"'))).toBe(false)
   })
 
   it("fails closed when no pending call exists for a stale projection", async () => {
     const fake = fixture({ noCall: true })
-    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toBe(false)
+    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toEqual({
+      status: "rejected", stage: "call_result_validation",
+    })
     expect(fake.calls.some(call => call.sql.startsWith('UPDATE "agent_wait_conditions"'))).toBe(false)
   })
 
   it.each(["suspendedAt", "resolvedAt"] as const)("accepts future app-clock %s only with exact canonical evidence", async field => {
     const future = new Date(now.getTime() + 1_000)
     const eligible = fixture({ wait: { [field]: future } })
-    await expect(repairStaleWaitProjection(eligible.client as never, lease, now)).resolves.toBe(true)
+    await expect(repairStaleWaitProjection(eligible.client as never, lease, now)).resolves.toEqual({ status: "repaired" })
     expect(eligible.calls.some(call => call.sql.startsWith('UPDATE "agent_wait_conditions"'))).toBe(true)
 
     const mismatched = fixture({ wait: { [field]: future }, call: { eventCorrelationId: "wrong-call" } })
-    await expect(repairStaleWaitProjection(mismatched.client as never, lease, now)).resolves.toBe(false)
+    await expect(repairStaleWaitProjection(mismatched.client as never, lease, now)).resolves.toMatchObject({
+      status: "rejected", stage: "call_contract_validation",
+    })
     expect(mismatched.calls.some(call => call.sql.startsWith('UPDATE "agent_wait_conditions"'))).toBe(false)
   })
 
@@ -218,35 +278,47 @@ describe("expired wait projection repair", () => {
       suspendedAt: deadlineAt, resolvedAt: new Date(deadlineAt.getTime() + 1) },
     targets: [{ id: "target-1", parentTaskId: lease.id, rootTaskId: lease.rootTaskId, sessionId: lease.sessionId,
       turnId: lease.turnId, userId: lease.userId, status: "running", role: "writer", result: null, failureReason: null }] })
-    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toBe(true)
+    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toEqual({ status: "repaired" })
     expect(fake.calls.some(call => call.sql.startsWith('UPDATE "agent_wait_conditions"'))).toBe(true)
   })
 
   it("does not write if the safe whole-result projection would truncate", async () => {
     const fake = fixture()
     projectionMocks.forceTruncation = true
-    try { await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toBe(false) }
+    try { await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toMatchObject({
+      status: "rejected", stage: "safe_serialization_validation",
+    }) }
     finally { projectionMocks.forceTruncation = false }
     expect(projectionMocks.limits).toContain(16_384)
     expect(fake.calls.some(call => call.sql.startsWith('UPDATE "agent_wait_conditions"'))).toBe(false)
   })
 
+  it("reports an optimistic UPDATE that no longer matches its owner and projection fences", async () => {
+    const fake = fixture({ updateRowCount: 0 })
+    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toEqual({
+      status: "rejected", stage: "optimistic_update_missed",
+    })
+    expect(fake.calls.some(call => call.sql.startsWith('UPDATE "agent_wait_conditions"'))).toBe(true)
+  })
+
   it.each([
-    { label: "wrong owner", wait: { repairLeaseOwner: "other-owner" } },
-    { label: "wrong attempt", wait: { repairTaskAttempt: 2, repairAttempt: 2 } },
-    { label: "wrong step", wait: { repairStepStatus: "streaming" } },
-    { label: "wrong call step", wait: { stepId: "other-step" } },
-    { label: "consumed wait", wait: { consumedAt: now } },
-    { label: "unresolved wait timestamp", wait: { resolvedAt: null } },
-    { label: "wrong call identity", call: { content: { toolCallId: "call-1", toolName: "wait_subagents", toolVersion: "1",
+    { label: "wrong owner", stage: "wait_validation", wait: { repairLeaseOwner: "other-owner" } },
+    { label: "wrong attempt", stage: "wait_validation", wait: { repairTaskAttempt: 2, repairAttempt: 2 } },
+    { label: "wrong step", stage: "wait_validation", wait: { repairStepStatus: "streaming" } },
+    { label: "wrong call step", stage: "call_contract_validation", wait: { stepId: "other-step" } },
+    { label: "consumed wait", stage: "wait_validation", wait: { consumedAt: now } },
+    { label: "unresolved wait timestamp", stage: "wait_validation", wait: { resolvedAt: null } },
+    { label: "wrong call identity", stage: "call_contract_validation", call: { content: { toolCallId: "call-1", toolName: "wait_subagents", toolVersion: "1",
       input: { idempotencyKey: "other-key", mode: "any", taskIds: ["target-1"], timeoutMs: 10_000 } } } },
-    { label: "wrong event identity", call: { eventCorrelationId: "other-call" } },
-    { label: "wrong target owner", targets: [{ id: "target-1", parentTaskId: "other-parent", rootTaskId: lease.rootTaskId,
+    { label: "wrong event identity", stage: "call_contract_validation", call: { eventCorrelationId: "other-call" } },
+    { label: "wrong target owner", stage: "target_validation", targets: [{ id: "target-1", parentTaskId: "other-parent", rootTaskId: lease.rootTaskId,
       sessionId: lease.sessionId, turnId: lease.turnId, userId: lease.userId, status: "completed", role: "writer", result: null, failureReason: null }] },
-    { label: "incomplete targets", targets: [] },
+    { label: "incomplete targets", stage: "target_validation", targets: [] },
   ])("fails closed for $label", async options => {
     const fake = fixture(options)
-    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toBe(false)
+    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toMatchObject({
+      status: "rejected", stage: options.stage,
+    })
     expect(fake.calls.some(call => call.sql.startsWith('UPDATE "agent_wait_conditions"'))).toBe(false)
   })
 })

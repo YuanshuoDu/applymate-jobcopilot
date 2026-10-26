@@ -248,10 +248,38 @@ describe("expired subagent recovery fence", () => {
       expect(line).toBeDefined()
       const trace = JSON.parse(line!.slice("WORKER_B_RECOVERY_PREDICATE_TRACE ".length))
       expect(trace).not.toHaveProperty("taskId")
-      expect(trace).toMatchObject({ rejectionStage: "expiry_preview_rejected", childWaitResumable: null,
+      expect(trace).toMatchObject({ rejectionStage: "expiry_preview_rejected", childWaitResumable: null, waitProjectionDisposition: "skipped",
         pages: [{ page: 1, candidates: 10, targetSeen: false, cursorUsed: false },
           { page: 2, candidates: 1, targetSeen: true, cursorUsed: true }],
       })
+    } finally {
+      output.mockRestore()
+      if (previousNodeEnv === undefined) delete process.env.NODE_ENV
+      else process.env.NODE_ENV = previousNodeEnv
+      if (previousTraceTarget === undefined) delete process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID
+      else process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID = previousTraceTarget
+    }
+  })
+
+  it("adds wait-projection disposition and rejection stage to the test-only recovery trace", async () => {
+    const previousNodeEnv = process.env.NODE_ENV
+    const previousTraceTarget = process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID
+    const output = vi.spyOn(console, "info").mockImplementation(() => undefined)
+    process.env.NODE_ENV = "test"
+    process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID = "child-1"
+    try {
+      const fake = fixture({ child: true, childWaitResumable: true, targetStatus: "running" })
+      await expect(recoverExpired(fake.pool as PgSubagentPool, { now: checkedAt, limit: 10 })).resolves.toEqual([])
+      const line = output.mock.calls.map(([value]) => String(value)).find(value => value.startsWith("WORKER_B_RECOVERY_PREDICATE_TRACE "))
+      expect(line).toBeDefined()
+      const trace = JSON.parse(line!.slice("WORKER_B_RECOVERY_PREDICATE_TRACE ".length))
+      expect(trace).toMatchObject({
+        rejectionStage: "durable_wait_graph_blocked",
+        waitProjectionDisposition: "rejected",
+        waitProjectionStage: "target_match_validation",
+      })
+      expect(trace).not.toHaveProperty("waitProjectionResult")
+      expect(trace).not.toHaveProperty("taskId")
     } finally {
       output.mockRestore()
       if (previousNodeEnv === undefined) delete process.env.NODE_ENV
