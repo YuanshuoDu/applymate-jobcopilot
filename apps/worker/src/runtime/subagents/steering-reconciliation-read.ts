@@ -2,6 +2,7 @@ import type pg from "pg"
 import { parseCognitiveAgendaReceipt } from "../turns/cognitive-agenda-receipt.js"
 import { steeringReconciliationId, steeringReconciliationRevision, steeringReconciliationSequence, validSteeringReconciliationScope, STEERING_RECONCILIATION_MAX_UNRESOLVED_INPUTS,
   STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION, STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION,
+  STEERING_RECONCILIATION_OPERATIONAL_FAILURE_SCHEMA_VERSION,
   type SteeringReconciliationPendingInput, type SteeringReconciliationScope,
   type SteeringReconciliationState } from "./steering-reconciliation-contract.js"
 import { lockTaskGraphScope } from "./task-graph-pg-state.js"
@@ -178,6 +179,8 @@ export async function readSteeringReconciliationState(client: Client, scope: Ste
       && stored.receipt.branchRepair !== undefined && stored.receipt.steerInputIds.length === 0
       || stored.receipt.schemaVersion === STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION
         && stored.receipt.failedBranch !== undefined && stored.receipt.steerInputIds.length === 0
+      || stored.receipt.schemaVersion === STEERING_RECONCILIATION_OPERATIONAL_FAILURE_SCHEMA_VERSION
+        && stored.receipt.operationalFailure !== undefined && stored.receipt.steerInputIds.length === 0
     if (previousCheckpoint !== null && (through < previousCheckpoint || through === previousCheckpoint && !repeatedEmptyBranch)) {
       throw new Error("steering_reconciliation_receipt_history_invalid")
     }

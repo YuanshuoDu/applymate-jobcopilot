@@ -6,7 +6,7 @@ import { lockTaskGraphScope, loadTaskGraph, currentTaskGraph } from "./task-grap
 import { buildTaskGraphPlanningFacts } from "./task-graph-planning-facts.js"
 import { createGraphTasks } from "./task-graph-pg-create.js"
 import { writePlanReceipt } from "./task-graph-pg-events.js"
-import { parseTaskGraphSnapshot, taskGraphFingerprint, taskGraphItemId, taskGraphProposalKey, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
+import { canonicalTaskGraphJson, parseTaskGraphSnapshot, taskGraphFingerprint, taskGraphItemId, taskGraphProposalKey, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { normalizeNativeCommand } from "./task-graph-native-request.js"
 import { appendNativeGraphCommand, findNativeCommandReplay } from "./task-graph-native-pg.js"
 import { replaceUnstartedNativeFollowup } from "./task-graph-native-pending-replacement.js"
@@ -33,6 +33,7 @@ import { appendScheduledAudit as appendScheduledAuditCommand,
 import { readScheduledAuditResumeContext as readScheduledAuditResumeContextCommand } from "./scheduled-audit-resume.js"
 import { SCHEDULED_AUDIT_TEMPLATE_ID } from "./scheduled-audit-contract.js"
 import { scheduleTaskGraphBranchOperation } from "./task-graph-pg-failed-branch-repair.js"
+import { scheduleTaskGraphOperationalFailureReplacement } from "./task-graph-pg-operational-failure-replacement.js"
 const MAX_REVISION = 2_147_483_646
 type Row = Record<string, unknown>
 type LoadedCurrentGraph = Awaited<ReturnType<typeof loadTaskGraph>> & Readonly<{ rootSuccessCriteria?: readonly string[] }>
@@ -120,17 +121,17 @@ export function createPgTaskGraphCommandPort(pool: PgSubagentPool): TaskGraphCom
     readCurrentForPlanningWithClient(client, scope) { return readCurrentForPlanningWithClient(client, scope) },
   }
 }
-function sameExecutionScope(left: TaskGraphScheduleInput["scope"], right: SteeringReconciliationOperation["scope"]): boolean {
-  return left.userId === right.userId && left.sessionId === right.sessionId && left.turnId === right.turnId && left.stepId === right.stepId
-    && left.rootTaskId === right.rootTaskId && left.parentTaskId === right.parentTaskId && left.turnLeaseOwner === right.turnLeaseOwner
-    && left.turnLeaseVersion === right.turnLeaseVersion && left.parentLeaseOwner === right.parentLeaseOwner && left.parentAttemptCount === right.parentAttemptCount
-}
+function sameExecutionScope(left: TaskGraphScheduleInput["scope"], right: SteeringReconciliationOperation["scope"]): boolean { return canonicalTaskGraphJson(left) === canonicalTaskGraphJson(right) }
+
 async function schedule(client: Queryable, input: TaskGraphScheduleInput, operation?: SteeringReconciliationOperation): Promise<TaskGraphScheduleReceipt> {
   rejectPrivateScheduledGate(input.proposal)
   await client.query(`SELECT set_config('app.user_id', $1, true)`, [input.scope.userId])
   const parent = await lockTaskGraphScope(client, input.scope, true)
-  if (operation && (operation.decision !== "revise" || !sameExecutionScope(input.scope, operation.scope))) {
-    throw new TaskGraphCommandError("steering_reconciliation_operation_invalid", "Plan reconciliation scope is invalid")
+  if (operation && (operation.decision !== "revise" || !sameExecutionScope(input.scope, operation.scope))) throw new TaskGraphCommandError("steering_reconciliation_operation_invalid", "Plan reconciliation scope is invalid")
+  if (input.replaceOperationalFailure || operation?.replaceOperationalFailure) {
+    if (!operation) throw new TaskGraphCommandError("task_graph_operational_failure_replacement_not_eligible", "The replacement operation is incomplete")
+    return scheduleTaskGraphOperationalFailureReplacement(client, input, parent, operation,
+      () => requireTaskGraphContinuationBudget(client, input.scope))
   }
   if (input.replaceBranch || operation?.replaceBranch) {
     if (!operation) throw new TaskGraphCommandError("task_graph_branch_repair_not_eligible", "The branch replacement request is incomplete")
@@ -139,7 +140,6 @@ async function schedule(client: Queryable, input: TaskGraphScheduleInput, operat
   if (operation && operation.expectedRevision !== input.proposal.expectedRevision) {
     throw new TaskGraphCommandError("steering_reconciliation_operation_invalid", "Plan reconciliation scope is invalid")
   }
-  rejectPrivateScheduledGate(input.proposal)
   const rootSuccessCriteria = requireNormalizedRootPlanCriteria(input.rootSuccessCriteria)
   const loaded = await loadTaskGraph(client, input.scope, true, {
     includeSourceProvenance: !input.replaceUnstarted, currentStepId: input.scope.stepId,

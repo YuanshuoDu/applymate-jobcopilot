@@ -533,6 +533,79 @@ describe("agent.plan tool executor", () => {
     expect(commandPort.appendAndScheduleWithReconciliation).toHaveBeenCalledOnce()
   })
 
+  it("passes a singleton operational-failure mapping and keeps it exclusive from legacy modes", async () => {
+    const { tool, commandPort, getReceived, getOperation } = setup({
+      scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
+      analyst: { role: "analyst", taskType: "job_analysis", allowedActions: ["jobs.get"] },
+    })
+    const input = {
+      expectedRevision: 11,
+      nodes: [{ key: "analyst-retry", templateId: "analyst", goal: "Reassess available evidence",
+        successCriteria: ["Return current findings"], dependsOn: ["scout-source"], verification: {
+          schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
+          criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }],
+        } }],
+      replaceOperationalFailure: {
+        root: { nodeKey: "analyst-old", taskId: "task-analyst-old" },
+        sources: [{ nodeKey: "analyst-old", taskId: "task-analyst-old", replacementKey: "analyst-retry" }],
+      },
+    }
+    const registry = new ToolRegistry([tool])
+    expect(registry.validateArguments("agent.plan", input, "1")).toBe(true)
+    await expect(tool.execute(context(), input)).resolves.toEqual(receipt)
+    expect(getReceived()?.replaceOperationalFailure).toEqual(input.replaceOperationalFailure)
+    expect(getReceived()?.replaceBranch).toBeUndefined()
+    expect(getReceived()?.replaceUnstarted).toBeUndefined()
+    expect(getOperation()).toMatchObject({ decision: "revise", expectedRevision: 11,
+      replaceOperationalFailure: input.replaceOperationalFailure })
+
+    for (const conflict of [
+      { replaceUnstarted: { nodeKey: "analyst-old" } },
+      { replaceBranch: { root: input.replaceOperationalFailure.root, sources: [
+        { ...input.replaceOperationalFailure.sources[0], replacementKey: "analyst-retry" },
+        { nodeKey: "second", taskId: "task-second", replacementKey: "second-new" },
+      ] } },
+    ]) {
+      expect(registry.validateArguments("agent.plan", { ...input, ...conflict }, "1")).toBe(true)
+      await expect(tool.execute(context(), { ...input, ...conflict })).rejects.toMatchObject({
+        code: "task_graph_replacement_modes_conflict",
+      })
+    }
+    expect(commandPort.appendAndScheduleWithReconciliation).toHaveBeenCalledOnce()
+  })
+
+  it("rejects operational mappings with model-authored failure claims or unmapped proposals", async () => {
+    const { tool, commandPort } = setup()
+    const operational = { root: { nodeKey: "scout-old", taskId: "scout-old-task" },
+      sources: [{ nodeKey: "scout-old", taskId: "scout-old-task", replacementKey: "research" }] }
+    const registry = new ToolRegistry([tool])
+    for (const value of [
+      { ...proposal, replaceOperationalFailure: { ...operational, reason: "child_resume_unavailable" } },
+      { ...proposal, replaceOperationalFailure: { ...operational, sources: [{ ...operational.sources[0], proof: "passed" }] } },
+      { ...proposal, replaceOperationalFailure: operational, failureReason: "child_resume_unavailable" },
+      { ...proposal, replaceOperationalFailure: operational, status: "failed" },
+      { ...proposal, replaceOperationalFailure: operational, nodes: [{ ...proposal.nodes[0], result: { status: "passed" } }] },
+    ]) expect(registry.validateArguments("agent.plan", value, "1")).not.toBe(true)
+    const unmapped = { ...proposal, replaceOperationalFailure: operational,
+      nodes: [proposal.nodes[0], { ...proposal.nodes[0], key: "extra" }] }
+    expect(registry.validateArguments("agent.plan", unmapped, "1")).toBe(true)
+    await expect(tool.execute(context(), unmapped)).rejects.toMatchObject({
+      code: "task_graph_operational_failure_replacement_invalid",
+    })
+    expect(commandPort.appendAndScheduleWithReconciliation).not.toHaveBeenCalled()
+  })
+
+  it("rejects accessor-backed replacement fields before executing their getters", async () => {
+    const { tool, commandPort } = setup()
+    let invoked = false
+    const input = Object.defineProperty({ ...proposal }, "replaceOperationalFailure", {
+      enumerable: true, get: () => { invoked = true; return { root: {}, sources: [] } },
+    })
+    await expect(tool.execute(context(), input)).rejects.toMatchObject({ code: "task_graph_replacement_mode_invalid" })
+    expect(invoked).toBe(false)
+    expect(commandPort.appendAndScheduleWithReconciliation).not.toHaveBeenCalled()
+  })
+
   it("rejects an incomplete branch mapping before calling the command port", async () => {
     const { tool, commandPort } = setup({
       scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
@@ -589,7 +662,11 @@ describe("agent.plan tool executor", () => {
     expect(description).toContain("every node in its transitive dependsOn descendant closure")
     expect(description).toContain("preserve topology, registered roles, exact typed verification IDs/checks")
     expect(description).toContain("remap only structured dependency selectors")
-    expect(description).toContain("replaceBranch and replaceUnstarted are mutually exclusive")
+    expect(description).toContain("replaceBranch, replaceUnstarted, and replaceOperationalFailure are mutually exclusive")
+    expect(description).toContain("replaceOperationalFailure: { root: { nodeKey, taskId }, sources: [{ nodeKey, taskId, replacementKey }, ...] }")
+    expect(description).toContain("one source")
+    expect(description).toContain("The server proves the failure")
+    expect(description).toContain("Replacements inherit no evidence or authorization")
     expect(description).toContain("every source must be queued or dependency-waiting with attemptCount=0")
     expect(description).toContain("no lease, execution, wait condition, result, artifact, evidence, or reservation")
     expect(description).toContain("a fresh model Step with the current graph and agenda revision")

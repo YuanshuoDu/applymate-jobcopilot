@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto"
 import { appendTaskGraphProposal, TASK_GRAPH_LIMITS, type TaskGraphNodeProposal, type TaskGraphProposal, type TaskGraphState } from "../planning/task-graph.js"
-import { taskGraphNodeCapacity } from "../planning/task-graph-capacity.js"
+import { taskGraphCreateCapacityAllowed, type OperationalFailureCapacityReuse } from "./task-graph-pg-create-capacity.js"
 import { hasOverlappingTaskGraphRepair } from "./task-graph-repair-conflicts.js"
 import { APPLICATION_FILLER_TEMPLATE_ID, isApplicationFillerTemplate, isHarnessSubagentRole } from "./role-policy.js"
 import { createSubagentTask } from "./pg-store-create.js"
@@ -55,6 +55,7 @@ function assertWriterReviewPlan(nodes: readonly TaskGraphNodeProposal[]): void {
 export async function createGraphTasks(
   client: Queryable, input: TaskGraphScheduleInput, parent: GraphParent, current: TaskGraphState,
   priorTaskIds: ReadonlyMap<string, string>, provenance?: Pick<LoadedGraph, "sourceInputCheckpointByNodeKey" | "currentInputCheckpoint">,
+  operationalFailureReuse?: OperationalFailureCapacityReuse,
 ): Promise<CreatedGraphTasks> {
   const parentTask = { budgetSnapshot: parent.budgetSnapshot } as Pick<SubagentTaskRecord, "budgetSnapshot">
   const policy = policyFromTask(parentTask)
@@ -79,12 +80,9 @@ export async function createGraphTasks(
     throw Object.assign(new Error("Scheduled draft Turns cannot create an application filler"), { code: "task_graph_scheduled_application_filler_rejected" })
   }
   if (hasOverlappingTaskGraphRepair(current.nodes, appended.addedNodes)) throw Object.assign(new Error("Overlapping TaskGraph repair"), { code: "task_graph_repair_conflict" })
-  const capacity = taskGraphNodeCapacity({
-    nodeCount: current.nodes.length,
+  if (!taskGraphCreateCapacityAllowed({ nodeCount: current.nodes.length, proposalCount: input.proposal.nodes.length,
     hasTypedVerification: appended.state.nodes.some(node => (node.verification?.criteria.length ?? 0) > 0),
-    repairRecorded: appended.state.nodes.some(node => node.repairOf !== undefined),
-  })
-  if (!capacity || input.proposal.nodes.length > capacity.ordinaryRemaining) {
+    repairRecorded: appended.state.nodes.some(node => node.repairOf !== undefined), operationalFailureReuse })) {
     throw Object.assign(new Error("TaskGraph node limit exceeded"), { code: "node_limit" })
   }
   const existingIds = new Map(priorTaskIds)

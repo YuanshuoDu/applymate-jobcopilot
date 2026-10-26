@@ -1,15 +1,12 @@
 import type pg from "pg"
 import { parseCognitiveAgendaReceipt } from "../turns/cognitive-agenda-receipt.js"
-import { parseSteeringReconciliationReceipt, steeringReconciliationId, steeringReconciliationIdempotencyKey, steeringReconciliationRevision,
-  steeringReconciliationSequence, STEERING_RECONCILIATION_EVENT_TYPE, validSteeringReconciliationScope, validSteeringReconciliationToolCall,
-  type SteeringReconciliationReceipt, type SteeringReconciliationScope } from "./steering-reconciliation-contract.js"
+import { parseSteeringReconciliationReceipt, steeringReconciliationId, steeringReconciliationIdempotencyKey, steeringReconciliationRevision, steeringReconciliationSequence, STEERING_RECONCILIATION_EVENT_TYPE, validSteeringReconciliationScope, validSteeringReconciliationToolCall, type SteeringReconciliationReceipt, type SteeringReconciliationScope } from "./steering-reconciliation-contract.js"
 import { canonicalTaskGraphJson, parseTaskGraphEvent, parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey, taskGraphProposalKey, type StoredTaskGraphNode } from "./task-graph-snapshot.js"
 import { loadTaskGraphCancellationSource, taskGraphSupersessionFingerprint, taskGraphSupersessionProposalKey, type TaskGraphSupersessionRelation } from "./task-graph-pg-supersession.js"
 import { callMatches, type SupersessionCallBinding } from "./root-plan-criteria.js"
 import { taskGraphSupersessionEnvelopeMatches } from "./task-graph-pg-events.js"
 import type { TaskGraphExecutionScope, TaskGraphReadScope } from "./task-graph-command-port.js"
-import { assertTaskGraphBranchRepairHistory } from "./steering-reconciliation-branch-repair-history.js"
-import { assertTaskGraphFailedBranchRepairHistory } from "./steering-reconciliation-failed-branch-history.js"
+import { assertTaskGraphBranchRepairHistory } from "./steering-reconciliation-branch-repair-history.js"; import { assertTaskGraphFailedBranchRepairHistory } from "./steering-reconciliation-failed-branch-history.js"; import { assertTaskGraphOperationalFailedBranchHistory } from "./steering-reconciliation-operational-failed-branch-history.js"; import type { TaskGraphOperationalFailureReplacement } from "../planning/task-graph-operational-failure-replacement.js"
 type Client = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
 type HistoryStep = Readonly<{ id: string; ordinal: number; attempt: number; cursor: bigint }>
@@ -18,7 +15,6 @@ type ParsedReceipt = Readonly<{ receipt: SteeringReconciliationReceipt; sequence
 type VerifiedSupersession = Readonly<{ source: StoredTaskGraphNode; replacement: StoredTaskGraphNode }>
 const PAGE_SIZE = 64
 const STEP_STATUSES = new Set(["streaming", "waiting_for_tool", "waiting_for_approval", "waiting_for_user", "completed", "failed", "interrupted"])
-
 function object(value: unknown): Row | null {
   const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null
@@ -35,7 +31,6 @@ function ownerScope(scope: SteeringReconciliationScope): TaskGraphReadScope {
   return { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId, parentTaskId: scope.parentTaskId,
     turnLeaseOwner: scope.turnLeaseOwner, turnLeaseVersion: scope.turnLeaseVersion, parentLeaseOwner: scope.parentLeaseOwner, parentAttemptCount: scope.parentAttemptCount }
 }
-
 const callMatchDependencies = { object, validToolCall: validSteeringReconciliationToolCall, normalizedProposalNode,
   fingerprint: taskGraphSupersessionFingerprint, sameProposalNode }
 function toolCallQuery(): string {
@@ -45,14 +40,19 @@ function toolCallQuery(): string {
     WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."type" = 'tool_call.started' AND event."taskId" = $3
       AND event."correlationId" = $4 AND item."taskId" = $3 AND item."type" = 'tool_call' AND item."stepId" = $5 LIMIT 2`
 }
-
 export async function assertSteeringReconciliationCall(client: Client, scope: TaskGraphExecutionScope, callId: string,
-  decision: "keep" | "revise", expectedRevision: number, binding?: SupersessionCallBinding): Promise<bigint | null> {
+  decision: "keep" | "revise", expectedRevision: number, binding?: SupersessionCallBinding,
+  operationalFailure?: TaskGraphOperationalFailureReplacement): Promise<bigint | null> {
   if (!validSteeringReconciliationScope(scope) || !steeringReconciliationId(callId) || !steeringReconciliationRevision(expectedRevision)) throw new Error("steering_reconciliation_call_invalid")
   const result = await client.query<Row>(toolCallQuery(), [scope.sessionId, scope.turnId, scope.rootTaskId, callId, scope.stepId])
   const sequence = result.rows.length === 1 ? steeringReconciliationSequence(result.rows[0]!.eventSequence) : null
   const row = result.rows[0]
-  let matches = result.rows.length === 1 && callMatches(row!, scope, scope.stepId, decision, expectedRevision, binding, callMatchDependencies)
+  const event = row && { type: row.type, actor: row.actor, taskId: row.eventTaskId, itemId: row.eventItemId,
+    correlationId: row.correlationId, idempotencyKey: row.idempotencyKey, payload: row.payload }
+  const item = row && { id: row.callItemId, stepId: row.stepId, taskId: row.itemTaskId, type: row.itemType, content: row.itemContent }
+  let matches = result.rows.length === 1 && (operationalFailure
+    ? validSteeringReconciliationToolCall(event!, item!, scope, scope.stepId, decision, expectedRevision, undefined, undefined, operationalFailure)
+    : callMatches(row!, scope, scope.stepId, decision, expectedRevision, binding, callMatchDependencies))
   if (!matches && result.rows.length === 1 && binding?.replacementFingerprint && binding.source) {
     const source = await loadTaskGraphCancellationSource(client, scope, { nodeKey: binding.source.nodeKey, taskId: binding.source.taskId,
       expectedRevision, stepId: scope.stepId })
@@ -65,7 +65,6 @@ export async function assertSteeringReconciliationCall(client: Client, scope: Ta
       || sequence === null)) throw new Error("steering_reconciliation_call_invalid")
   return sequence
 }
-
 export async function assertSteeringReconciliationSupersessionEvents(client: Client, scope: SteeringReconciliationScope,
   bindings: readonly Readonly<{ relation: TaskGraphSupersessionRelation; receiptEventId?: string; receiptSequence?: bigint }>[]): Promise<Map<string, VerifiedSupersession>> {
   const replacements = new Map<string, VerifiedSupersession>()
@@ -102,7 +101,6 @@ export async function assertSteeringReconciliationSupersessionEvents(client: Cli
   }
   return replacements
 }
-
 function validCancellationEvent(row: Row, scope: SteeringReconciliationScope, relation: TaskGraphSupersessionRelation): ReturnType<typeof parseTaskGraphSnapshot> | null {
   const payload = object(row.payload), event = parseTaskGraphEvent(payload?.event), item = object(payload?.item)
   const key = taskGraphLifecycleKey(scope.rootTaskId, relation.source.nodeKey, 0, "task.cancelled")
@@ -120,7 +118,6 @@ function validCancellationEvent(row: Row, scope: SteeringReconciliationScope, re
       || node.taskId === relation.replacement.taskId) ? snapshot : null
   } catch { return null }
 }
-
 function validPlanEvent(row: Row, scope: SteeringReconciliationScope, relation: TaskGraphSupersessionRelation,
   before: ReturnType<typeof parseTaskGraphSnapshot>): StoredTaskGraphNode | null {
   const payload = object(row.payload), item = object(payload?.item)
@@ -254,18 +251,21 @@ export async function* readSteeringReconciliationHistory(client: Client, scope: 
         || row.correlationId !== scope.turnId || row.causationId !== receipt.stepId || row.hasOutbox !== false
         || typeof row.idempotencyKey !== "string" || !/^agent\.plan\.reconciliation:sha256:[a-f0-9]{64}$/.test(row.idempotencyKey)) throw new Error("steering_reconciliation_receipt_invalid")
       previousSequence = sequence
-      if (receipt.supersession && receipt.supersession.operationKey !== row.idempotencyKey) throw new Error("steering_reconciliation_receipt_invalid")
+      if (receipt.supersession && receipt.supersession.operationKey !== row.idempotencyKey
+        || receipt.operationalFailure && receipt.operationalFailure.operationKey !== row.idempotencyKey) throw new Error("steering_reconciliation_receipt_invalid")
       return { receipt, sequence, id: row.id, idempotencyKey: row.idempotencyKey }
     })
     afterSequence = parsed.at(-1)!.sequence
     afterId = String(result.rows.at(-1)?.id)
     const replacements = await assertSteeringReconciliationSupersessionEvents(client, scope, parsed.flatMap(entry => entry.receipt.supersession ?
       [{ relation: entry.receipt.supersession, receiptEventId: entry.id, receiptSequence: entry.sequence }] : []))
-    await Promise.all(parsed.flatMap(entry => entry.receipt.failedBranch ? [assertTaskGraphFailedBranchRepairHistory(client, scope,
-      entry.receipt.failedBranch, { id: entry.id, sequence: entry.sequence, stepId: entry.receipt.stepId, idempotencyKey: entry.idempotencyKey })]
-      : entry.receipt.branchRepair ? [assertTaskGraphBranchRepairHistory(client, scope, entry.receipt.branchRepair,
-        { id: entry.id, sequence: entry.sequence, stepId: entry.receipt.stepId, idempotencyKey: entry.idempotencyKey })] : []))
-    await assertHistoryCalls(client, scope, parsed.filter(entry => !entry.receipt.branchRepair && !entry.receipt.failedBranch), replacements)
+    await Promise.all(parsed.flatMap(entry => {
+      const event = { id: entry.id, sequence: entry.sequence, stepId: entry.receipt.stepId, idempotencyKey: entry.idempotencyKey }
+      return entry.receipt.operationalFailure ? [assertTaskGraphOperationalFailedBranchHistory(client, scope, entry.receipt.operationalFailure, event)]
+        : entry.receipt.failedBranch ? [assertTaskGraphFailedBranchRepairHistory(client, scope, entry.receipt.failedBranch, event)]
+        : entry.receipt.branchRepair ? [assertTaskGraphBranchRepairHistory(client, scope, entry.receipt.branchRepair, event)] : []
+    }))
+    await assertHistoryCalls(client, scope, parsed.filter(entry => !entry.receipt.branchRepair && !entry.receipt.failedBranch && !entry.receipt.operationalFailure), replacements)
     const stepIds = [...new Set(parsed.map(entry => entry.receipt.stepId))]
     const stepRows = await client.query<Row>(`SELECT "id", "taskId", "ordinal", "attempt", "status", "inputThroughSequence" FROM "agent_steps"
       WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = ANY($4::text[])`, [scope.sessionId, scope.turnId, scope.rootTaskId, stepIds])

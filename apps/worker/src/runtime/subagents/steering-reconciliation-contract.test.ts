@@ -4,6 +4,9 @@ import type { TaskGraphExecutionScope } from "./task-graph-command-port.js"
 import { taskGraphSupersessionProposalKey } from "./task-graph-pg-supersession.js"
 import { TASK_GRAPH_BRANCH_REPAIR_RELATION_SCHEMA_VERSION, taskGraphBranchRepairFingerprint } from "./task-graph-pg-branch-repair-relation.js"
 import { TASK_GRAPH_FAILED_BRANCH_REPAIR_RELATION_SCHEMA_VERSION, taskGraphFailedBranchRepairFingerprint } from "./task-graph-pg-failed-branch-relation.js"
+import { TASK_GRAPH_OPERATIONAL_FAILED_BRANCH_RELATION_SCHEMA_VERSION, taskGraphOperationalFailedBranchFingerprint } from "./task-graph-pg-operational-failed-branch-relation.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import type { TaskGraphOperationalFailureReplacement } from "../planning/task-graph-operational-failure-replacement.js"
 import { taskGraphLifecycleKey, taskGraphProposalKey } from "./task-graph-snapshot.js"
 import {
   parseSteeringReconciliationReceipt,
@@ -16,6 +19,7 @@ import {
   STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION,
   STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION,
   STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION,
+  STEERING_RECONCILIATION_OPERATIONAL_FAILURE_SCHEMA_VERSION,
   STEERING_RECONCILIATION_BLOCKER,
   STEERING_RECONCILIATION_FEEDBACK,
   type SteeringReconciliationReceipt,
@@ -110,6 +114,34 @@ function v4Receipt(patch: Record<string, unknown> = {}) {
     inputCheckpoint: { throughSequence: "47" } }), schemaVersion: STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION,
     failedBranch: failedBranchRepair(), ...patch }
 }
+function operationalFailure() {
+  const callId = "call-operational"
+  const replaceOperationalFailure: TaskGraphOperationalFailureReplacement = { root: { nodeKey: "analyst-old", taskId: "analyst-task" },
+    sources: [{ nodeKey: "analyst-old", taskId: "analyst-task", replacementKey: "analyst-fresh" }] }
+  const nodes = [{ key: "analyst-fresh", templateId: "analyst", goal: "Review evidence", successCriteria: ["Rank findings"], dependsOn: [],
+    verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst" as const,
+      criteria: [{ id: "findings", check: { kind: "finding_count_gte" as const, minimum: 1 } }] } }]
+  const failedEvent = { id: "failed-event", sequence: "41",
+    idempotencyKey: taskGraphLifecycleKey(scope.rootTaskId, "analyst-old", 2, "task.failed") }
+  const planEvent = { id: "operational-plan", sequence: "43", idempotencyKey: taskGraphProposalKey(scope.rootTaskId, 4) }
+  return { schemaVersion: TASK_GRAPH_OPERATIONAL_FAILED_BRANCH_RELATION_SCHEMA_VERSION,
+    operationKey: steeringReconciliationIdempotencyKey(scope, callId), graphRootTaskId: scope.rootTaskId,
+    observedRevision: 4, resultingRevision: 5,
+    failedSource: { source: replaceOperationalFailure.root, attemptCount: 2, failureReason: "child_resume_evidence_unavailable",
+      resultDigest: "a".repeat(64), event: failedEvent },
+    observedGraphEvent: failedEvent,
+    sources: [{ source: replaceOperationalFailure.root, replacementKey: "analyst-fresh" }], priorCancellations: [], cancellations: [],
+    verifiedExternalDependencies: [], planEvent,
+    requestFingerprint: taskGraphOperationalFailedBranchFingerprint({ rootTaskId: scope.rootTaskId, expectedRevision: 4,
+      replaceOperationalFailure, nodes }),
+    agentPlanCall: { callId, stepId: scope.stepId, expectedRevision: 4, replaceOperationalFailure } }
+}
+function v5Receipt(patch: Record<string, unknown> = {}) {
+  const relation = operationalFailure()
+  return { ...receipt({ decision: "revise", observedRevision: 4, resultingRevision: 5, steerInputIds: [],
+    inputCheckpoint: { throughSequence: "47" } }), schemaVersion: STEERING_RECONCILIATION_OPERATIONAL_FAILURE_SCHEMA_VERSION,
+    operationalFailure: relation, ...patch }
+}
 
 describe("steering reconciliation receipt contract", () => {
   it("defines fixed redacted recovery vocabulary in the pure contract", () => {
@@ -171,6 +203,16 @@ describe("steering reconciliation receipt contract", () => {
     expect(parseSteeringReconciliationReceipt(v4Receipt({ resultingRevision: 8 }), scope)).toBeNull()
     expect(parseSteeringReconciliationReceipt(v4Receipt({ failedBranch: { ...failedBranchRepair(), graphRootTaskId: "foreign-root" } }), scope)).toBeNull()
     expect(parseSteeringReconciliationReceipt({ ...v3Receipt(), failedBranch: failedBranchRepair() }, scope)).toBeNull()
+    expect(parseSteeringReconciliationReceipt({ ...value, debug: true }, scope)).toBeNull()
+  })
+
+  it("parses v5 operational failure history without changing the v4 contract", () => {
+    const value = v5Receipt()
+    expect(parseSteeringReconciliationReceipt(value, scope)).toEqual(value)
+    expect(parseSteeringReconciliationReceipt(v4Receipt(), scope)?.failedBranch).toBeDefined()
+    expect(parseSteeringReconciliationReceipt(v5Receipt({ resultingRevision: 6 }), scope)).toBeNull()
+    expect(parseSteeringReconciliationReceipt(v5Receipt({ operationalFailure: { ...operationalFailure(), graphRootTaskId: "foreign-root" } }), scope)).toBeNull()
+    expect(parseSteeringReconciliationReceipt({ ...v4Receipt(), operationalFailure: operationalFailure() }, scope)).toBeNull()
     expect(parseSteeringReconciliationReceipt({ ...value, debug: true }, scope)).toBeNull()
   })
 
@@ -245,6 +287,24 @@ describe("steering reconciliation receipt contract", () => {
     }
     expect(validSteeringReconciliationToolCall(event, makeItem({ expectedRevision: 0, nodes: [{ key: "research" }], rootSuccessCriteria: ["💼".repeat(128)] }),
       scope, scope.stepId, "revise", 0)).toBe(true)
+  })
+
+  it("accepts only the mutually exclusive operational failure agent.plan mode", () => {
+    const callId = "call-operational", relation = operationalFailure(), replacement = relation.agentPlanCall.replaceOperationalFailure
+    const event = { type: "tool_call.started", actor: "orchestrator", taskId: scope.rootTaskId, itemId: "operational-item",
+      correlationId: callId, idempotencyKey: toolStartKey(callId),
+      payload: { toolCallId: callId, toolName: "agent.plan", taskId: scope.rootTaskId } }
+    const baseInput = { expectedRevision: 4, nodes: [{ key: "analyst-fresh" }], replaceOperationalFailure: replacement }
+    const makeItem = (input: Record<string, unknown>) => ({ id: "operational-item", stepId: scope.stepId, taskId: scope.rootTaskId,
+      type: "tool_call", content: { toolCallId: callId, toolName: "agent.plan", toolVersion: "1", input } })
+    expect(validSteeringReconciliationToolCall(event, makeItem(baseInput), scope, scope.stepId, "revise", 4,
+      undefined, undefined, replacement)).toBe(true)
+    expect(validSteeringReconciliationToolCall(event, makeItem(baseInput), scope, scope.stepId, "revise", 4)).toBe(false)
+    expect(validSteeringReconciliationToolCall(event, makeItem({ ...baseInput, failureReason: "child_resume_unavailable" }), scope,
+      scope.stepId, "revise", 4, undefined, undefined, replacement)).toBe(false)
+    const mixed = { ...baseInput, replaceBranch: { root: replacement.root, sources: replacement.sources } }
+    expect(validSteeringReconciliationToolCall(event, makeItem(mixed), scope, scope.stepId, "revise", 4, undefined,
+      mixed.replaceBranch, replacement)).toBe(false)
   })
 
   it("requires the exact source key and a single node on a supersession agent.plan call", () => {

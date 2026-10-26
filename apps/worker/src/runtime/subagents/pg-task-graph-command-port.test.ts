@@ -18,6 +18,7 @@ const reconciliationMocks = vi.hoisted(() => ({
   prepare: vi.fn(), write: vi.fn(), create: vi.fn(), writePlan: vi.fn(), writePlanIdentity: vi.fn(), writeLifecycleIdentity: vi.fn(), assertNoUnresolvedSteering: vi.fn(),
   scheduledPrepare: vi.fn(), scheduledAuditAppend: vi.fn(), scheduledAuditCompletion: vi.fn(), scheduledAuditInvocation: vi.fn(),
   scheduledAuditResumeContext: vi.fn(), scheduledGateVerification: vi.fn(),
+  operationalFailureReplacement: vi.fn(),
 }))
 vi.mock("./steering-reconciliation-ledger.js", () => ({
   prepareSteeringReconciliation: reconciliationMocks.prepare,
@@ -25,6 +26,9 @@ vi.mock("./steering-reconciliation-ledger.js", () => ({
   assertNoUnresolvedSteering: reconciliationMocks.assertNoUnresolvedSteering,
 }))
 vi.mock("./task-graph-pg-create.js", () => ({ createGraphTasks: reconciliationMocks.create }))
+vi.mock("./task-graph-pg-operational-failure-replacement.js", () => ({
+  scheduleTaskGraphOperationalFailureReplacement: reconciliationMocks.operationalFailureReplacement,
+}))
 vi.mock("./pg-scheduled-task-graph-prepare-command.js", () => ({ appendScheduledPrepare: reconciliationMocks.scheduledPrepare }))
 vi.mock("./pg-scheduled-task-graph-audit-command.js", () => ({ appendScheduledAudit: reconciliationMocks.scheduledAuditAppend,
   verifyScheduledAuditCompletion: reconciliationMocks.scheduledAuditCompletion,
@@ -344,6 +348,32 @@ describe("createPgTaskGraphCommandPort", () => {
     expect(fake.calls.map(call => call.sql)).toContain("ROLLBACK")
     expect(reconciliationMocks.create).not.toHaveBeenCalled()
     expect(reconciliationMocks.writePlan).not.toHaveBeenCalled()
+  })
+
+  it("routes only the dedicated operational-failure mode to its private scheduler", async () => {
+    const input = { ...scheduleInput(), replaceOperationalFailure: { root: { nodeKey: "failed", taskId: "failed-task" },
+      sources: [{ nodeKey: "failed", taskId: "failed-task", replacementKey: "fresh" }] } }
+    const operation = { scope: input.scope, decision: "revise" as const, expectedRevision: 1, callId: "plan-call",
+      replaceOperationalFailure: input.replaceOperationalFailure }
+    const fake = fakePool(input), receipt = { status: "accepted" as const, revision: 2, nodes: [], readyTaskIds: [] }
+    reconciliationMocks.operationalFailureReplacement.mockResolvedValueOnce(receipt)
+
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndScheduleWithReconciliation!(input, operation)).resolves.toBe(receipt)
+    expect(reconciliationMocks.operationalFailureReplacement).toHaveBeenCalledWith(fake.client, input,
+      expect.objectContaining({ taskType: "root", role: "orchestrator" }), operation, expect.any(Function))
+    expect(reconciliationMocks.create).not.toHaveBeenCalled()
+    expect(fake.calls.map(call => call.sql)).toContain("COMMIT")
+  })
+
+  it("does not admit an operational-failure proposal without its persisted plan operation", async () => {
+    const input = { ...scheduleInput(), replaceOperationalFailure: { root: { nodeKey: "failed", taskId: "failed-task" },
+      sources: [{ nodeKey: "failed", taskId: "failed-task", replacementKey: "fresh" }] } }
+    const fake = fakePool(input)
+    await expect(createPgTaskGraphCommandPort(fake.pool).appendAndSchedule(input)).rejects.toMatchObject({
+      code: "task_graph_operational_failure_replacement_not_eligible",
+    })
+    expect(reconciliationMocks.operationalFailureReplacement).not.toHaveBeenCalled()
+    expect(fake.calls.map(call => call.sql)).toContain("ROLLBACK")
   })
 
   it("preserves the specialized scheduled Prepare choice receipt through the PostgreSQL transaction port", async () => {
