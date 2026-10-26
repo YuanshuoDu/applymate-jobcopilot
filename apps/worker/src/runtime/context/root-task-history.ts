@@ -160,7 +160,7 @@ function candidate(value: unknown, crossSession: boolean): Candidate | null {
     safeNodes, identity: JSON.stringify([item.sourceTurnId, item.sourceRootTaskId]),
   }
 }
-function content(turns: readonly Readonly<{ label: string; nodes: readonly SafeNode[]; planShape?: RootTaskHistoryPlanShape }>[], crossSession = false) {
+function content(turns: readonly Readonly<{ label: string; nodes: readonly SafeNode[]; planShape?: rootTaskHistoryPlanShape.RootTaskHistoryPlanShape }>[], crossSession = false) {
   return {
     kind: "root_task_history",
     informationalOnly: true,
