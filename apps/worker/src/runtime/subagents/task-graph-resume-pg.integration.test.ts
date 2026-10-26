@@ -10629,7 +10629,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const persistedObservedSnapshotContent = record(observedReceiptItem?.content)
     const rawPersistedObservedNodes = Array.isArray(persistedObservedSnapshotContent?.nodes)
       ? persistedObservedSnapshotContent.nodes.map(record) : []
-    const requestObservedSnapshot = observedGraphSnapshot
+    const requestObservedSnapshot = observedGraphSnapshot as RecordValue | null
     const requestObservedNodes = Array.isArray(requestObservedSnapshot?.nodes) ? requestObservedSnapshot.nodes.map(record) : []
     expect(requestObservedSnapshot?.kind).toBe("task_graph_current")
     expect(requestObservedSnapshot?.revision).toBe(observedGraphRevision)
