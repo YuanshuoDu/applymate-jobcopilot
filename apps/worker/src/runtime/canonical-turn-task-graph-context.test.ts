@@ -225,8 +225,24 @@ describe("TaskGraph turn observation", () => {
     }
 
     const genericReason = projectedNode(resumeFailureNode("scout", "child_resume_wait_step_lineage"))
-    const nonTypedRole = { ...ordinaryFailedNode(), templateId: "writer", failureReason: "child_resume_unavailable",
+    const otherRole = { ...ordinaryFailedNode(), templateId: "writer", failureReason: "child_resume_unavailable",
       resultProjection: { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "unavailable" } }
+    const missingReportRow = resumeFailureNode("scout", "child_resume_unavailable")
+    delete missingReportRow.verificationReport
+    const missingReport = projectedNode(missingReportRow)
+    const nonCanonicalReport = projectedNode({
+      ...resumeFailureNode("scout", "child_resume_unavailable"),
+      verificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "contract_invalid",
+        criteria: [{ criterionId: "candidate-count", status: "unverified", reasonCode: "contract_invalid" }], evidenceDigest: null, resultDigest: null },
+    })
+    const passedReport = projectedNode({
+      ...resumeFailureNode("scout", "child_resume_unavailable"),
+      verificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
+        criteria: [{ criterionId: "candidate-count", status: "passed", reasonCode: "criteria_met" }],
+        evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64) },
+    })
+    expect(() => projectedNode({ ...resumeFailureNode("scout", "child_resume_unavailable"), verificationReport: { status: "unverified" } }))
+      .toThrow("task_graph_current_state_invalid:verification")
     const passedResume = projectedNode({
       ...resumeFailureNode("scout", "child_resume_unavailable"), status: "completed",
       verificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
@@ -237,8 +253,8 @@ describe("TaskGraph turn observation", () => {
       operationKind: "spawn", operationId: "operation-1", requestFingerprint: "f".repeat(64), callerTaskId: "root-1",
       role: "analyst", taskType: "job_analysis", contextDigest: "c".repeat(64),
     } })
-    expect(projectedNode(nonTypedRole).executionFailureCategory).toBe("resume_state_unavailable")
-    for (const node of [genericReason, passedResume, native]) {
+    expect(projectedNode(otherRole)).not.toHaveProperty("executionFailureCategory")
+    for (const node of [genericReason, missingReport, nonCanonicalReport, passedReport, passedResume, native]) {
       expect(node).not.toHaveProperty("executionFailureCategory")
       expect(node.failureReason).toBeNull()
       expect(node.resultSummary).toBeNull()
