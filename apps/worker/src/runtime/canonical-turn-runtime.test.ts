@@ -3524,7 +3524,7 @@ describe("createCanonicalTurnRuntime", () => {
     expect(expectedAnalystNextPage).toMatchObject({ availability: "available", graphRevision: 7, role: "analyst", offset: 3,
       resultStatus: "partial", totalCount: 4, evidenceCount: 6, nextOffset: null,
       items: [{ jobId: numericUuid, score: 9.25, evidenceKinds: ["job"] }] })
-    expect(expectedStalePage).toEqual({ schemaVersion: "agent-harness.v2.task-graph.result-page.v1", trust: "untrusted", availability: "unavailable",
+    expect(expectedStalePage).toEqual({ schemaVersion: "agent-harness.v2.task-graph.result-page.v2", trust: "untrusted", availability: "unavailable",
       graphRevision: 8, reason: "revision_mismatch" })
     expect(pageReads.map(entry => entry.request)).toEqual([
       { nodeKey: "scout-node", expectedRevision: 7, offset: 0 },

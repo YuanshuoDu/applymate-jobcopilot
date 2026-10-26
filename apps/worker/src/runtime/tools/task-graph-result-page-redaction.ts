@@ -1,11 +1,15 @@
+import { Buffer } from "node:buffer"
 import { types as nodeTypes } from "node:util"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
-import { parseTaskGraphResultPage, parseTaskGraphResultPageRequest } from "../subagents/task-graph-result-page-contract.js"
+import {
+  parseTaskGraphResultPage, parseTaskGraphResultPageRequest, parseTaskGraphResultPageV1,
+  TASK_GRAPH_RESULT_SUMMARY_PREVIEW_BYTE_LIMIT,
+} from "../subagents/task-graph-result-page-contract.js"
 import { parseTaskGraphHistoricalDiscoveryPage, parseTaskGraphHistoricalDiscoveryPageRequest } from "../subagents/task-graph-historical-discovery-page-contract.js"
 import { parseTaskGraphDiscoveryRecoveryPage, parseTaskGraphDiscoveryRecoveryPageRequest } from "../subagents/task-graph-discovery-recovery-page-contract.js"
 import { prepareLifecycleValue, prepareSafeValue, sanitizeLifecyclePreview, type PreparedLifecycleValue } from "./redaction.js"
 
-const PAGE_KEYS = new Set(["schemaVersion", "trust", "availability", "graphRevision", "reason", "role", "taskStatus", "resultStatus", "totalCount", "evidenceCount", "offset", "nextOffset", "items", "attemptCount", "observation", "verificationStatus", "truncated"])
+const PAGE_KEYS = new Set(["schemaVersion", "trust", "availability", "graphRevision", "reason", "role", "taskStatus", "resultStatus", "totalCount", "evidenceCount", "offset", "nextOffset", "items", "analysisSummary", "analysisSummaryTruncated", "attemptCount", "observation", "verificationStatus", "truncated"])
 const INVALID_AGENT_LIST_INPUT = "[invalid agent.list input]"
 
 export function prepareAgentListLifecycleInput(value: unknown, maxBytes: number): { pageRequest: boolean; safeInput: unknown } {
@@ -55,10 +59,42 @@ export function prepareTaskGraphResultPageOutput(value: unknown): PreparedLifecy
   if (historical) return prepareHistoricalDiscoveryPageOutput(historical)
   const recovery = parseTaskGraphDiscoveryRecoveryPage(value)
   if (recovery) return prepareTaskGraphDiscoveryRecoveryPageOutput(recovery)
+  const persistedV1 = parseTaskGraphResultPageV1(value)
+  if (persistedV1) return prepareTaskGraphResultPageV1Output(persistedV1)
   const page = parseTaskGraphResultPage(value)
   if (!page) throw new Error("invalid_page")
   const redacted = prepareLifecycleValue(page)
   if (page.availability === "unavailable") return redacted
+  const safePage = plainRecord(redacted.safe)
+  const safeItems = safePage ? denseArray(safePage.items) : null
+  const hasSummary = page.role === "analyst" && Object.hasOwn(page, "analysisSummary")
+  const rootKeys = ["availability", "evidenceCount", "graphRevision", "items", "nextOffset", "offset", "resultStatus", "role", "schemaVersion",
+    ...(hasSummary ? ["analysisSummary", "analysisSummaryTruncated"] : []), "taskStatus", "totalCount", "trust"].sort().join(",")
+  if (!safePage || Object.keys(safePage).sort().join(",") !== rootKeys || !safeItems || safeItems.length !== page.items.length) throw new Error("invalid_redaction")
+  const expectedItemKeys = page.role === "scout" ? "evidenceKinds,jobId,source" : "evidenceKinds,jobId,score"
+  const items = safeItems.map((item, index) => {
+    const row = plainRecord(item)
+    if (!row || Object.keys(row).sort().join(",") !== expectedItemKeys) throw new Error("invalid_redaction")
+    return { ...row, jobId: page.items[index]!.jobId }
+  })
+  let restoredValue: RepositoryJsonValue = { ...safePage, items } as RepositoryJsonValue
+  if (hasSummary) {
+    if (typeof safePage.analysisSummary !== "string" || typeof safePage.analysisSummaryTruncated !== "boolean") throw new Error("invalid_redaction")
+    const bounded = boundedSummaryPreview(safePage.analysisSummary)
+    restoredValue = { ...safePage, items, analysisSummary: bounded.preview,
+      analysisSummaryTruncated: safePage.analysisSummaryTruncated || bounded.truncated } as RepositoryJsonValue
+  }
+  const restored = prepareSafeValue(restoredValue)
+  if (!parseTaskGraphResultPage(restored.safe)) throw new Error("invalid_redaction")
+  return restored
+}
+
+function prepareTaskGraphResultPageV1Output(page: NonNullable<ReturnType<typeof parseTaskGraphResultPageV1>>): PreparedLifecycleValue {
+  const redacted = prepareLifecycleValue(page)
+  if (page.availability === "unavailable") {
+    if (!parseTaskGraphResultPageV1(redacted.safe)) throw new Error("invalid_redaction")
+    return redacted
+  }
   const safePage = plainRecord(redacted.safe)
   const safeItems = safePage ? denseArray(safePage.items) : null
   const rootKeys = "availability,evidenceCount,graphRevision,items,nextOffset,offset,resultStatus,role,schemaVersion,taskStatus,totalCount,trust"
@@ -70,8 +106,20 @@ export function prepareTaskGraphResultPageOutput(value: unknown): PreparedLifecy
     return { ...row, jobId: page.items[index]!.jobId }
   })
   const restored = prepareSafeValue({ ...safePage, items } as RepositoryJsonValue)
-  if (!parseTaskGraphResultPage(restored.safe)) throw new Error("invalid_redaction")
+  if (!parseTaskGraphResultPageV1(restored.safe)) throw new Error("invalid_redaction")
   return restored
+}
+
+function boundedSummaryPreview(value: string): { preview: string; truncated: boolean } {
+  const normalized = Buffer.from(value, "utf8").toString("utf8")
+  let preview = "", byteLength = 0
+  for (const character of normalized) {
+    const characterBytes = Buffer.byteLength(character, "utf8")
+    if (byteLength + characterBytes > TASK_GRAPH_RESULT_SUMMARY_PREVIEW_BYTE_LIMIT) return { preview, truncated: true }
+    preview += character
+    byteLength += characterBytes
+  }
+  return { preview, truncated: false }
 }
 
 function prepareHistoricalDiscoveryPageOutput(page: NonNullable<ReturnType<typeof parseTaskGraphHistoricalDiscoveryPage>>): PreparedLifecycleValue {
