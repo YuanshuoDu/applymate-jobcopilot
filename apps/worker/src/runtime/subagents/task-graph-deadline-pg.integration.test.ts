@@ -121,7 +121,7 @@ async function seed(pool: Pool): Promise<{ fixture: Fixture; children: Record<st
   const suffix = randomUUID()
   const value = {
     userId: `deadline-user-${suffix}`, sessionId: `deadline-session-${suffix}`,
-    turnId: `deadline-turn-${suffix}`, rootTaskId: `deadline-root-${suffix}`,
+    turnId: `deadline-turn-${suffix}`, rootTaskId: `root-deadline-turn-${suffix}`,
     stepId: `deadline-step-${suffix}`, suffix,
   }
   fixtureUsers.push(value.userId)
@@ -133,17 +133,12 @@ async function seed(pool: Pool): Promise<{ fixture: Fixture; children: Record<st
       "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "inputTokens", "outputTokens", "estimatedCostUsd", "updatedAt")
     VALUES ($1, $2, $3, 'queued', 'user', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 71, 19, 0.125, CURRENT_TIMESTAMP)`,
   [value.turnId, value.sessionId, value.userId])
-  await pool.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "path", "depth", "role", "taskType",
-      "status", "goal", "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema",
-      "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "leaseOwner", "leaseExpiresAt", "updatedAt")
-    VALUES ($1, $2, $3, '/root', 0, 'orchestrator', 'root', 'running', 'TaskGraph deadline recovery',
-      '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
-      '{"subagentPolicy":{"maxConcurrency":4,"maxDepth":4,"maxFanOut":4,"maxAttempts":2}}'::jsonb,
-      1, 2, $4, CURRENT_TIMESTAMP + INTERVAL '5 minutes', CURRENT_TIMESTAMP)`,
-  [value.rootTaskId, value.sessionId, value.turnId, `root-owner-${suffix}`])
-  await pool.query(`UPDATE "sub_agent_tasks" SET "rootTaskId" = "id" WHERE "id" = $1`, [value.rootTaskId])
-  await pool.query(`UPDATE "agent_turns" SET "rootTaskId" = $2 WHERE "id" = $1`, [value.turnId, value.rootTaskId])
   const lease = await claimTurnLease(pool, { turnId: value.turnId, sessionId: value.sessionId, ownerId: `turn-owner-${suffix}` })
+  const root = await createPgRootTaskStore(pool).ensure({ lease, goal: "TaskGraph deadline recovery",
+    allowedActions: [], budgetSnapshot: { subagentPolicy: { maxConcurrency: 4, maxDepth: 4, maxFanOut: 4, maxAttempts: 2 } } })
+  if (root.id !== value.rootTaskId || root.status !== "running" || root.leaseOwner !== lease.ownerId) {
+    throw new Error("deadline fixture root lease does not match the production Turn lease")
+  }
   await pool.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status",
       "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
     VALUES ($1, $2, $3, $4, 1, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
@@ -152,7 +147,7 @@ async function seed(pool: Pool): Promise<{ fixture: Fixture; children: Record<st
   const graph = await createPgTaskGraphCommandPort(pool).appendAndSchedule({
     scope: { userId: value.userId, sessionId: value.sessionId, turnId: value.turnId, rootTaskId: value.rootTaskId,
       parentTaskId: value.rootTaskId, stepId: value.stepId, turnLeaseOwner: lease.ownerId,
-      turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: `root-owner-${suffix}`, parentAttemptCount: 1 },
+      turnLeaseVersion: lease.leaseVersion, parentLeaseOwner: root.leaseOwner!, parentAttemptCount: root.attemptCount },
     proposal: { expectedRevision: 0, nodes: [
       { key: "paused", templateId: "analyst", goal: "Wait for a user decision", successCriteria: ["Wait"], dependsOn: [], verification: {
         schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }],
