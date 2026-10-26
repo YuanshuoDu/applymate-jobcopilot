@@ -96,6 +96,19 @@ describe("proveTaskGraphOperationalRootWaitReferences", () => {
     }
   })
 
+  it("rejects request-only ready all and any waits when a nonselected matched target is nonterminal", async () => {
+    const pending = { ...failed, id: "pending-unselected", status: "waiting", attemptCount: 0,
+      failureReason: null, startedAt: null, completedAt: null, hasCanonicalDispatch: false }
+    const ids = [canceled.id, pending.id].sort()
+    for (const mode of ["all", "any"] as const) {
+      const matchedTaskIds = mode === "all" ? ids : [pending.id]
+      const wait = rootWait({ targetTaskIds: ids, mode, matchedTaskIds,
+        result: { request: request(mode, ids) } })
+      const f = fixture([wait], [canceled, pending])
+      await expect(proveTaskGraphOperationalRootWaitReferences(f.client, input)).resolves.toBe(false)
+    }
+  })
+
   it.each(["ready", "timed_out"] as const)("accepts suspended consumed all-target %s waits without exporting proof", async status => {
     const f = fixture([consumed(status)])
     await expect(proveTaskGraphOperationalRootWaitReferences(f.client, input)).resolves.toBe(true)
