@@ -3429,13 +3429,28 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     const receiptRows = await adminPool!.query<{ payload: unknown }>(`SELECT "payload" FROM "agent_events"
       WHERE "sessionId" = $1 AND "turnId" = $2 AND "idempotencyKey" = $3`, [value.sessionId, value.turnId, receiptKey])
     const relation = (receiptRows.rows[0]?.payload as { operationalFailure?: Record<string, unknown> } | undefined)?.operationalFailure
+    const expectedPrior = prepared.sourceNodes.filter(node => priorIds.has(node.taskId)).map(node => expect.objectContaining({
+      source: expect.objectContaining({ nodeKey: node.key, taskId: node.taskId }),
+      event: expect.objectContaining({ id: expect.any(String), sequence: expect.any(String),
+        idempotencyKey: taskGraphLifecycleKey(value.rootTaskId, node.key, 0, "task.cancelled") }),
+    }))
+    const expectedNewCancellations = prepared.sourceNodes.filter(node => node.taskId !== prepared.failedRoot.taskId
+      && !priorIds.has(node.taskId)).map(node => expect.objectContaining({
+      source: expect.objectContaining({ nodeKey: node.key, taskId: node.taskId }),
+      event: expect.objectContaining({ id: expect.any(String), sequence: expect.any(String),
+        idempotencyKey: taskGraphLifecycleKey(value.rootTaskId, node.key, 0, "task.cancelled") }),
+    }))
     expect(relation).toMatchObject({ graphRootTaskId: value.rootTaskId, resultingRevision: accepted.revision,
       failedSource: { source: { nodeKey: prepared.failedRoot.key, taskId: prepared.failedRoot.taskId },
         attemptCount: 1, failureReason: "child_resume_unavailable" },
       sources: expect.arrayContaining(prepared.sourceNodes.map(node => expect.objectContaining({
         source: { nodeKey: node.key, taskId: node.taskId }, replacementKey: `replacement-${node.key}`,
-      }))), priorCancellations: [...priorIds].map(taskId => expect.objectContaining({ source: { taskId } })),
-      cancellations: descendants.filter(taskId => !priorIds.has(taskId)).map(taskId => expect.objectContaining({ source: { taskId } })) })
+      }))),
+    })
+    expect(relation?.priorCancellations).toHaveLength(expectedPrior.length)
+    expect(relation?.priorCancellations).toEqual(expect.arrayContaining(expectedPrior))
+    expect(relation?.cancellations).toHaveLength(expectedNewCancellations.length)
+    expect(relation?.cancellations).toEqual(expect.arrayContaining(expectedNewCancellations))
 
     const durable = await supersessionDurableRows(adminPool!, value)
     const restored = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
@@ -3468,11 +3483,17 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
         replaceOperationalFailure: invalidMode }
       const operation = { ...prepared.operation, replaceOperationalFailure: invalidMode }
       const before = await supersessionDurableRows(adminPool!, value)
-      await expect(prepared.command.appendAndScheduleWithReconciliation!(input, operation)).rejects.toMatchObject({
-        code: invalidKind === "partial"
-          ? "task_graph_operational_failure_replacement_not_eligible"
-          : "steering_reconciliation_call_invalid",
-      })
+      const attempt = prepared.command.appendAndScheduleWithReconciliation!(input, operation)
+      if (invalidKind === "partial") {
+        await expect(attempt).rejects.toMatchObject({ code: "task_graph_operational_failure_replacement_not_eligible" })
+      } else {
+        let rejection: unknown = null
+        try { await attempt } catch (error) { rejection = error }
+        expect(rejection).toBeInstanceOf(Error)
+        if (!(rejection instanceof Error)) throw new Error("Wrong replacement count did not reject")
+        expect(rejection.message).toBe("steering_reconciliation_call_invalid")
+        expect(Object.hasOwn(rejection, "code")).toBe(false)
+      }
       expect(await supersessionDurableRows(adminPool!, value)).toEqual(before)
     }
   }, 90_000)
@@ -3559,7 +3580,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     const suffix = randomUUID().replaceAll("-", "")
     const functionName = `operational_plan_failure_${suffix}`
     const triggerName = `operational_plan_failure_${suffix}`
-    const planKey = taskGraphProposalKey(value.rootTaskId, prepared.input.proposal.expectedRevision + 1)
+    const planKey = taskGraphProposalKey(value.rootTaskId, prepared.current.revision)
     try {
       await adminPool!.query(`CREATE FUNCTION public."${functionName}"() RETURNS trigger LANGUAGE plpgsql AS $operational_failure$
         BEGIN
