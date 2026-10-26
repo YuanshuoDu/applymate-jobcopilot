@@ -31,9 +31,7 @@ import { defaultAuthorization, modelWithUsage, type UsageAuthorizer } from "./ca
 import { selectedJobArtifactCompletionGateWithWitness } from "./selected-job-completion-gate.js"
 import { selectedJobArtifactFinalizationGuard } from "./selected-job-finalization-guard.js"
 import { createAgentArtifactRepository, findCurrentDraftHeadWithClient, findReviewReceiptWithClient, type AgentArtifactDraftHead, type AgentArtifactDraftHeadScope } from "../db/agent-artifact-repo.js"
-import { runTurnBoundaryContextCompaction } from "./context/turn-boundary-compaction-preflight.js"
-import { estimateMaximumDiscoveryPersonaContextTokens } from "./context/discovery-persona-context-blocks.js"
-import { readDiscoveryPersonaSnapshotForCompaction } from "./context/discovery-persona-facts-pg.js"
+import { createTurnBoundaryMemoryPreflight, runTurnBoundaryContextCompaction } from "./context/turn-boundary-compaction-preflight.js"
 import { createCanonicalRootToolGuards, interactiveDiscoveryCompletionGate } from "./interactive-discovery-runtime.js"
 import { terminalInteractiveDiscoveryShortlist, type InteractiveDiscoveryShortlistProjection } from "./interactive-discovery-contract.js"
 import type { SubagentTaskRecord } from "./subagents/types.js"
@@ -183,24 +181,13 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       state, selectedJobMode, taskGraphPlanningEnabled, ...nativeRootContext,
       ...(recoveredScheduledCandidate === undefined ? {} : { nativeRecovery: { ...nativeRootContext.nativeRecovery, candidateText: recoveredScheduledCandidate?.candidateText } }),
       refreshTaskGraph: turnCoordination.refresh,
-      preflight: {
+      preflight: createTurnBoundaryMemoryPreflight({
         enabled: productionFlags?.turnBoundaryCompactionEnabled === true && !state.recoveredWaitControl, signal,
-        compact: async () => {
-          let additionalInputTokens = 0
-          if (discoveryPersonaMemoryEnabled) {
-            const memory = await readDiscoveryPersonaSnapshotForCompaction(pool, {
-              scope: state.scope, lease, rootTaskId: root.id, rootAttemptCount: root.attemptCount,
-            })
-            if (memory.kind === "overflow") return { status: "skipped" }
-            additionalInputTokens = memory.kind === "accepted" ? memory.estimatedTokens : estimateMaximumDiscoveryPersonaContextTokens()
-          }
-          return (options.turnBoundaryCompactionRunner ?? runTurnBoundaryContextCompaction)({
-            pool, scope: state.scope, owner, lease, taskGraphCommandPort: options.taskGraphCommandPort, model, signal,
-            ...(discoveryPersonaMemoryEnabled ? { additionalInputTokens } : {}),
-          })
-        },
+        pool, scope: state.scope, owner, lease, rootTaskId: root.id, rootAttemptCount: root.attemptCount,
+        taskGraphCommandPort: options.taskGraphCommandPort, discoveryPersonaMemoryEnabled, model,
+        runner: options.turnBoundaryCompactionRunner,
         reload: () => options.stateLoader?.(pool, lease, now(), { consumeWaitOutcomes: false, durableWaitControlReader: durableWaitPort }) ?? loadCanonicalTurnState(pool, lease, now(), { consumeWaitOutcomes: false, durableWaitControlReader: durableWaitPort }),
-      },
+      }),
     })
     state = preparedContext.state
     const nativeRecovery = preparedContext.nativeRecovery, recoveredFinalCandidate = recoveredScheduledCandidate === null

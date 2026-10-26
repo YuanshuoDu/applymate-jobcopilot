@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
+import type pg from "pg"
 import type { CompactionItemRecord, CompactionSource } from "./context-compaction-types.js"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import type { TurnLease } from "../turns/lease.js"
@@ -42,7 +43,7 @@ vi.mock("./context-compaction-pg-source.js", () => ({ createPgCompactionSource: 
 } }))
 vi.mock("./context-snapshot-compaction-pg.js", () => ({ createPgContextSnapshotCompactionPort: () => compactionPort }))
 
-import { runTurnBoundaryCompactionPreflight, runTurnBoundaryContextCompaction } from "./turn-boundary-compaction-preflight.js"
+import { createTurnBoundaryMemoryPreflight, runTurnBoundaryCompactionPreflight, runTurnBoundaryContextCompaction } from "./turn-boundary-compaction-preflight.js"
 import { createPgContextSnapshotCompactionPort } from "./context-snapshot-compaction-pg.js"
 
 const lease: TurnLease = {
@@ -105,6 +106,62 @@ function model(
 }
 
 describe("turn-boundary context compaction preflight", () => {
+  it("uses accepted discovery memory size when wiring boundary compaction", async () => {
+    const readMemory = vi.fn(async () => ({ kind: "accepted" as const, estimatedTokens: 37 }))
+    const runner = vi.fn(async () => ({ status: "compacted" }))
+    const preflight = createTurnBoundaryMemoryPreflight({
+      enabled: true, signal: new AbortController().signal,
+      pool: { connect: vi.fn() } as unknown as Pick<pg.Pool, "connect">,
+      scope: { userId: "user-1" }, owner, lease, rootTaskId: "root-1", rootAttemptCount: 1,
+      discoveryPersonaMemoryEnabled: true, model: model(), runner, readMemory, reload: async () => state(),
+    })
+
+    await expect(preflight.compact()).resolves.toEqual({ status: "compacted" })
+    expect(readMemory).toHaveBeenCalledOnce()
+    expect(runner).toHaveBeenCalledWith(expect.objectContaining({ additionalInputTokens: 37 }))
+  })
+
+  it("uses the bounded reserve only when the discovery snapshot is absent", async () => {
+    const readMemory = vi.fn(async () => ({ kind: "absent" as const }))
+    const runner = vi.fn(async () => ({ status: "compacted" }))
+    const preflight = createTurnBoundaryMemoryPreflight({
+      enabled: true, signal: new AbortController().signal,
+      pool: { connect: vi.fn() } as unknown as Pick<pg.Pool, "connect">,
+      scope: { userId: "user-1" }, owner, lease, rootTaskId: "root-1", rootAttemptCount: 1,
+      discoveryPersonaMemoryEnabled: true, model: model(), runner, readMemory, reload: async () => state(),
+    })
+
+    await preflight.compact()
+    expect(runner).toHaveBeenCalledWith(expect.objectContaining({
+      additionalInputTokens: estimateMaximumDiscoveryPersonaContextTokens(),
+    }))
+  })
+
+  it("keeps overflow fail-closed and avoids memory reads when ineligible", async () => {
+    const overflowRead = vi.fn(async () => ({ kind: "overflow" as const }))
+    const skippedRunner = vi.fn(async () => ({ status: "compacted" }))
+    const overflow = createTurnBoundaryMemoryPreflight({
+      enabled: true, signal: new AbortController().signal,
+      pool: { connect: vi.fn() } as unknown as Pick<pg.Pool, "connect">,
+      scope: { userId: "user-1" }, owner, lease, rootTaskId: "root-1", rootAttemptCount: 1,
+      discoveryPersonaMemoryEnabled: true, model: model(), runner: skippedRunner, readMemory: overflowRead, reload: async () => state(),
+    })
+    await expect(overflow.compact()).resolves.toEqual({ status: "skipped" })
+    expect(skippedRunner).not.toHaveBeenCalled()
+
+    const ineligibleRead = vi.fn(async () => ({ kind: "accepted" as const, estimatedTokens: 37 }))
+    const ineligibleRunner = vi.fn(async () => ({ status: "compacted" }))
+    const ineligible = createTurnBoundaryMemoryPreflight({
+      enabled: true, signal: new AbortController().signal,
+      pool: { connect: vi.fn() } as unknown as Pick<pg.Pool, "connect">,
+      scope: { userId: "user-1" }, owner, lease, rootTaskId: "root-1", rootAttemptCount: 1,
+      discoveryPersonaMemoryEnabled: false, model: model(), runner: ineligibleRunner, readMemory: ineligibleRead, reload: async () => state(),
+    })
+    await ineligible.compact()
+    expect(ineligibleRead).not.toHaveBeenCalled()
+    expect(ineligibleRunner).toHaveBeenCalledWith(expect.not.objectContaining({ additionalInputTokens: expect.anything() }))
+  })
+
   it.each([
     ["disabled", { enabled: false, state: state() }],
     ["pinned", { enabled: true, state: state({ contextSnapshotPinned: true }) }],
