@@ -139,13 +139,18 @@ describe("createGraphTasks", () => {
   it("preserves the filler template's empty actions while generic roles keep parent action inheritance", async () => {
     const create = async (templateId: string, role: string, taskType: string) => {
       let insertedActions: unknown
+      let insertedDeadlineOptIn: unknown
       const query = vi.fn(async (sql: string, values?: unknown[]) => {
         const admission = ownedTurnScopeRow(sql, values)
         if (admission) return admission
         if (sql.includes("COUNT(*)::int")) return { rows: [{ count: 0 }], rowCount: 1 }
         if (sql.startsWith('SELECT "rootTaskId", "turnId"')) return { rows: [{ rootTaskId: "root-1", turnId: "turn-1" }], rowCount: 1 }
         if (sql.startsWith('SELECT root."id", root."turnId"')) return { rows: [{ id: "root-1", turnId: "turn-1", status: "running", interruptRequestedAt: null }], rowCount: 1 }
-        if (sql.startsWith('INSERT INTO "sub_agent_tasks"')) { insertedActions = JSON.parse(String(values?.[12])) as unknown; return { rows: [{ id: "child-1" }], rowCount: 1 } }
+        if (sql.startsWith('INSERT INTO "sub_agent_tasks"')) {
+          insertedActions = JSON.parse(String(values?.[12])) as unknown
+          insertedDeadlineOptIn = values?.[19]
+          return { rows: [{ id: "child-1" }], rowCount: 1 }
+        }
         if (sql.startsWith('SELECT task.*, session."userId"')) return { rows: [{ ...taskRow(), role, taskType, allowedActions: insertedActions }], rowCount: 1 }
         return { rows: [], rowCount: 1 }
       })
@@ -158,6 +163,7 @@ describe("createGraphTasks", () => {
       }
       await createGraphTasks({ query } as unknown as Pick<pg.PoolClient, "query">, input,
         { budgetSnapshot: { subagentPolicy: { maxConcurrency: 2, maxDepth: 4, maxFanOut: 2, maxAttempts: 2 } } }, createInitialTaskGraphState(), new Map())
+      expect(insertedDeadlineOptIn).toBe(true)
       return insertedActions
     }
 

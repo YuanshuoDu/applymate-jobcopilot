@@ -47,7 +47,7 @@ export async function createSubagentTask(
   client: Queryable,
   input: SubagentTaskSpec & { policy: SubagentPolicy },
   sessionLocked = false,
-  options: { preserveEmptyAllowedActions?: boolean } = {},
+  options: { preserveEmptyAllowedActions?: boolean; taskGraphChildDeadline?: boolean } = {},
 ): Promise<SubagentTaskRecord> {
   if (!sessionLocked) await lockSubagentSession(client, input)
   if (input.turnId) await lockSubagentTurnForWork(client, { sessionId: input.sessionId, userId: input.userId, turnId: input.turnId })
@@ -98,6 +98,7 @@ export async function createSubagentTask(
     input.role, input.taskType, input.goal, json(input.constraints, []), json(input.successCriteria, []),
     json(allowedActions, []), json(input.context, {}), json(input.expectedOutputSchema, {}),
     json(modelProfile, {}, "model_profile"), json(toolPolicy, {}, "tool_policy"), json(budget, {}, "budget"), input.policy.maxAttempts,
+    options.taskGraphChildDeadline === true,
   ])
   if (!result.rows[0]?.id) throw new Error("Subagent task insert failed")
   return readSubagentTask(client, String(result.rows[0].id), input.sessionId)

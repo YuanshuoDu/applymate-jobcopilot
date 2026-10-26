@@ -233,7 +233,7 @@ describe("PostgreSQL scheduled Audit command", () => {
     expect(order).toEqual(["gate-proof", "plan-and-outbox", "dispatch", "private-binding"])
     expect(writes.create).toHaveBeenCalledWith(client, expect.objectContaining({ role: SCHEDULED_AUDIT_ROLE,
       taskType: SCHEDULED_AUDIT_TASK_TYPE, allowedActions: [], expectedOutputSchema: SCHEDULED_AUDIT_OUTPUT_SCHEMA }),
-      true, { preserveEmptyAllowedActions: true })
+      true, { preserveEmptyAllowedActions: true, taskGraphChildDeadline: true })
   })
 
   it("does not create or write an Audit child when fresh Gate proof differs", async () => {
