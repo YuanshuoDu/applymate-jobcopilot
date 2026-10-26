@@ -4,10 +4,10 @@ import { deriveRootTaskHistoryLessonFacts, filterRootTaskHistoryLessonsForEmitte
 import { currentTaskGraph, type GraphTaskRow, type LoadedGraph } from "../subagents/task-graph-pg-state.js"
 import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphState, type StoredTaskGraphNode, type TaskGraphSnapshot } from "../subagents/task-graph-snapshot.js"
 import { TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION } from "../subagents/task-graph-command-port.js"
-import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-pg-verification.js"
+import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "../subagents/task-graph-pg-verification.js"
 import { resolveTaskGraphRepairDependencies } from "../subagents/task-graph-dependency-context.js"
 import { TASK_GRAPH_NATIVE_METADATA_VERSION, TASK_GRAPH_NATIVE_TEMPLATE_ID } from "../subagents/task-graph-native-state.js"
-import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
+import { ROLE_RESULT_SCHEMA, validateRoleResult } from "../subagents/role-results.js"
 
 const ROOT = "private-root-id"
 const CRITERIA = [
@@ -61,6 +61,45 @@ function fixture(options: { repairCount?: number; targetStatuses?: readonly ("fa
   const state = { ...base, repairSatisfiedNodeKeys: coverage.satisfied, repairPendingNodeKeys: coverage.pending }
   const loaded: LoadedGraph = { rootTaskId: ROOT, snapshot, state, tasks, item: { id: "private-item", revision: 7, content: snapshot, createdAt: new Date(0) } }
   return { loaded, graph: currentTaskGraph(loaded) }
+}
+
+function failedRepairFixture(options: { role?: "scout" | "analyst"; targetCriteria?: readonly ("failed" | "passed" | "unverified")[];
+  repairCriteria?: readonly ("failed" | "passed" | "unverified")[]; targetReportStatus?: "failed" | "unverified";
+  repairReportStatus?: "failed" | "unverified"; repairStatus?: "failed" | "running"; failureReason?: string | null;
+  resultDigest?: string; omitStructuredResult?: boolean; omitRepairReport?: boolean; wrongStructuredRole?: boolean;
+  repairAttemptCount?: number; targetAttemptCount?: number;
+  graphRootTaskId?: string } = {}) {
+  const role = options.role ?? "scout", ids = CRITERIA.map(item => item.id)
+  const criteria = role === "scout" ? CRITERIA : ids.map((id, index) => ({ id, check: { kind: "finding_count_gte" as const, minimum: index + 2 } }))
+  const contract = { schemaVersion: "agent-harness.v2.task-graph-verification.v1", role, criteria }
+  const target = { key: "failed-target-private", templateId: role, goal: "private target goal", successCriteria: ["private target criterion"],
+    dependsOn: [], depth: 1, taskId: "failed-target-task", verificationDisposition: "typed", verification: contract }
+  const repair = { key: "failed-repair-private", templateId: role, goal: "private repair goal", successCriteria: ["private repair criterion"],
+    dependsOn: [], depth: 2, taskId: "failed-repair-task", verificationDisposition: "typed", verification: contract,
+    repairOf: { graphRootTaskId: options.graphRootTaskId ?? ROOT, nodeKey: target.key, taskId: target.taskId, criterionIds: ids } }
+  const snapshot = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [target, repair] })
+  const structuredResult = role === "scout"
+    ? { schemaVersion: ROLE_RESULT_SCHEMA, role, status: "partial", candidates: [], evidence: [], summary: "private structured summary" }
+    : { schemaVersion: ROLE_RESULT_SCHEMA, role, status: "partial", findings: [], evidence: [], summary: "private structured summary" }
+  const persistedStructuredResult = options.wrongStructuredRole ? { ...structuredResult, role: role === "scout" ? "analyst" : "scout" } : structuredResult
+  const digest = taskGraphResultDigest(validateRoleResult(structuredResult, role))
+  const targetReport = report(options.targetReportStatus ?? "failed", ids, options.targetCriteria ?? ["failed", "failed"])
+  const repairReport = report(options.repairReportStatus ?? "failed", ids, options.repairCriteria ?? ["failed", "failed"])
+  const targetTask: GraphTaskRow = { id: target.taskId, status: "failed", role, attemptCount: options.targetAttemptCount ?? 1,
+    failureReason: "task_graph_verification_failed", result: { taskGraphVerificationReport: targetReport } }
+  const repairTask: GraphTaskRow = { id: repair.taskId, status: options.repairStatus ?? "failed", role,
+    attemptCount: options.repairAttemptCount ?? 1,
+    failureReason: options.failureReason === undefined ? "task_graph_verification_failed" : options.failureReason,
+    result: { ...(options.omitStructuredResult ? {} : { structuredResult: persistedStructuredResult }),
+      ...(!options.omitRepairReport ? { taskGraphVerificationReport: {
+        ...repairReport, resultDigest: options.resultDigest === undefined ? digest : options.resultDigest,
+      } } : {}) } }
+  const tasks = new Map([[target.taskId, targetTask], [repair.taskId, repairTask]])
+  const statuses = new Map([...tasks].map(([id, task]) => [id, { status: task.status, failureReason: task.failureReason }] as const))
+  const state = taskGraphState(snapshot, 9, statuses, [])
+  const loaded: LoadedGraph = { rootTaskId: ROOT, snapshot, state, tasks,
+    item: { id: "failed-repair-item", revision: 9, content: snapshot, createdAt: new Date(0) } }
+  return { loaded, graph: currentTaskGraph(loaded), structuredResult }
 }
 
 function executionFailureFixture(reason: string, status: "failed" | "running" = "failed", native = false) {
@@ -227,6 +266,42 @@ describe("root history ordinal lessons", () => {
       criterionFailures: [], successfulRepairs: [{ targetNodeOrdinal: 1, targetCriterionOrdinals: [1, 2], status: "passed" }] })
     const serialized = JSON.stringify(lessons)
     for (const privateValue of [ROOT, "source-node-private", "source-task-private", "first-count", "private goal", DIGEST]) expect(serialized).not.toContain(privateValue)
+  })
+
+  it("projects only digest-bound failed repair criteria that were explicitly failed on both typed reports", () => {
+    const cases = [
+      { role: "scout", targetCriteria: ["failed", "passed"], repairCriteria: ["failed", "failed"], expected: [1] },
+      { role: "analyst", targetCriteria: ["failed", "failed"], repairCriteria: ["passed", "failed"], expected: [2] },
+    ] as const
+    for (const item of cases) {
+      const { loaded, graph } = failedRepairFixture(item), lessons = deriveRootTaskHistoryLessonFacts(loaded, graph)
+      expect(lessons[1]?.failedRepairOf).toEqual({ targetNodeOrdinal: 1, targetCriterionOrdinals: item.expected, outcome: "verified_failed" })
+      expect(lessons[1]?.criterionFailures.map(failure => failure.criterionOrdinal)).toEqual(item.repairCriteria.flatMap((status, index) => status === "failed" ? [index + 1] : []))
+      const serialized = JSON.stringify(lessons)
+      for (const privateValue of [ROOT, "failed-target-private", "failed-target-task", "failed-repair-private", "failed-repair-task",
+        "first-count", "second-count", "private structured summary", taskGraphResultDigest(validateRoleResult(failedRepairFixture(item).structuredResult, item.role))]) {
+        expect(serialized).not.toContain(privateValue)
+      }
+    }
+  })
+
+  it("omits failed repair links for unstarted, unverified, misreported, or digest-mismatched task evidence", () => {
+    const cases = [
+      { repairAttemptCount: 0 },
+      { targetAttemptCount: 0 },
+      { failureReason: "child_turn_missing" },
+      { repairReportStatus: "unverified", repairCriteria: ["unverified", "unverified"] },
+      { targetReportStatus: "unverified", targetCriteria: ["unverified", "unverified"] },
+      { omitStructuredResult: true },
+      { wrongStructuredRole: true },
+      { resultDigest: "f".repeat(64) },
+      { repairStatus: "running", omitRepairReport: true },
+    ] as const
+    for (const options of cases) {
+      const { loaded, graph } = failedRepairFixture(options), lessons = deriveRootTaskHistoryLessonFacts(loaded, graph)
+      expect(lessons).toHaveLength(2)
+      expect(lessons[1]?.failedRepairOf).toBeUndefined()
+    }
   })
 
   it("adapts one loaded graph once and aligns safe facts with its original source ordinals", () => {
