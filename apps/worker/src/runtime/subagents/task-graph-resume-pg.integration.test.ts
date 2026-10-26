@@ -9990,6 +9990,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let replacementPlanResultDiagnostic = "not_observed"
     let replacementPlanCommandDiagnostic = "not_called"
     let canonicalExecutionDiagnostic = "not_observed"
+    let modelCallbackStageDiagnostic = "not_entered"
+    let modelCallbackStatusDiagnostic = "not_observed"
+    let modelCallbackFailureDiagnostic = "none"
     let finalGraphVerified = false
     let replacementWaitResumePath: "same_adapter" | "fresh_adapter" | null = null
     const flags: ProductionAgentFlags = {
@@ -10006,6 +10009,14 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const appendWithReconciliation = commandPort.appendAndScheduleWithReconciliation
     if (typeof appendWithReconciliation !== "function") throw new Error("Operational failure fixture requires reconciliation planning")
     const safeLabel = (value: unknown): string => typeof value === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(value) ? value : "unknown"
+    const safeModelFailure = (error: unknown): string => {
+      const className = error instanceof Error && ["AssertionError", "Error", "TypeError", "RangeError"].includes(error.name)
+        ? error.name : "OtherError"
+      const frame = error instanceof Error ? error.stack?.split(/\r?\n/).map(line =>
+        /task-graph-resume-pg\.integration\.test\.(?:ts|js):(\d+):(\d+)/.exec(line),
+      ).find(Boolean) : undefined
+      return `${className}@${frame?.[1] ?? "frame_unavailable"}:${frame?.[2] ?? "0"}`
+    }
     const safeOperationalStackSites = (stack: unknown): string => {
       if (typeof stack !== "string") return "none"
       const allowed = new Set([
@@ -10128,7 +10139,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         const adapter: ModelAdapter = {
           id: "p3-operational-failure-replan-root-fixture", profile,
           async *stream(request) {
+            try {
             round += 1
+            modelCallbackStageDiagnostic = `execution_${execution}_round_${round}`
             if (execution === 1 && round === 1) {
               yield { type: "tool_call_completed", callId: planCallId, name: "agent.plan", arguments: {
                 expectedRevision: 0,
@@ -10159,11 +10172,15 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               return
             }
             if (execution === 2 && round === 1) {
+              modelCallbackStageDiagnostic = "failure_context_graph"
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+              modelCallbackStatusDiagnostic = nodes.map(node => safeLabel(node?.status)).join(",")
               expect(nodes.slice(0, 2).map(node => [node?.key, node?.status])).toEqual([["scout", "failed"], ["analyst", "cancelled"]])
               expect(nodes.map(node => node?.key)).toEqual(initialIndependent ? ["scout", "analyst", "independent"] : ["scout", "analyst"])
+              modelCallbackStageDiagnostic = "failure_context_graph_ok"
               expect(nodes.find(node => node?.key === "scout")?.executionFailureCategory).toBe(expectedFailureCategory)
+              modelCallbackStageDiagnostic = "failure_context_category_ok"
               const planTool = request.tools.map(record).find(tool => tool?.name === "agent.plan")
               const planProperties = record(record(planTool?.inputSchema)?.properties)
               expect(planProperties).toHaveProperty("replaceOperationalFailure")
@@ -10176,6 +10193,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               }
               expect(waitTasks.get(initialTaskIds[0]!)).toBe("failed")
               expect(waitTasks.get(initialTaskIds[1]!)).toBe("cancelled")
+              modelCallbackStageDiagnostic = "failure_context_wait_outcome_ok"
               const source = await pool!.query<{ status: string; failureReason: string | null; result: unknown }>(
                 `SELECT "status", "failureReason", "result" FROM "sub_agent_tasks"
                  WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4 AND "parentTaskId" = $4`,
@@ -10192,9 +10210,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               }
               failedEventRevision = failureRevision
               const sourceResult = record(source.rows[0]?.result)
-              expect(Object.keys(sourceResult ?? {}).sort()).toEqual(["taskGraphVerificationReport"])
-              expect(Object.hasOwn(sourceResult ?? {}, "workerResult")).toBe(false)
+              expect(Object.keys(sourceResult ?? {}).sort()).toEqual(
+                ["taskGraphVerificationReport", ...(deadlineExpiry ? ["workerResult"] : [])].sort(),
+              )
+              if (deadlineExpiry) expect(sourceResult?.workerResult).toBeNull()
+              else expect(Object.hasOwn(sourceResult ?? {}, "workerResult")).toBe(false)
               expectUnverifiedVerificationReport(sourceResult?.taskGraphVerificationReport, "candidate-count")
+              modelCallbackStageDiagnostic = "failure_context_source_proof_ok"
               originalOperationalFailureResult = source.rows[0]?.result
               originalFailureEnvelopeObserved = true
               const descendant = await pool!.query<{ status: string; failureReason: string | null; result: unknown }>(
@@ -10226,6 +10248,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               }
               expect(persistedTaskStatuses.get(initialTaskIds[0]!)).toBe("failed")
               expect(persistedTaskStatuses.get(initialTaskIds[1]!)).toBe("cancelled")
+              modelCallbackStageDiagnostic = "failure_context_persisted_wait_ok"
               consumedFailureWaitObserved = true
               consumedFailureWaitSnapshot = JSON.stringify({
                 id: waitRow.rows[0]?.id,
@@ -10238,8 +10261,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 consumedAt: waitRow.rows[0]?.consumedAt?.toISOString() ?? null,
               })
               if (initialIndependent) {
+                modelCallbackStageDiagnostic = "failure_context_release_independent"
                 releaseIndependentCompletion()
                 await waitForTaskStatus(independentTaskId, "completed")
+                modelCallbackStageDiagnostic = "failure_context_independent_completed"
               }
               expect(request.tools.map(tool => record(tool)?.name)).toContain("agent.wait")
               if (appendIndependent) {
@@ -10309,11 +10334,14 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               return
             }
             if (execution === 2 && round === inlineWaitObserveRound) {
+              modelCallbackStageDiagnostic = "inline_wait_graph"
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+              modelCallbackStatusDiagnostic = nodes.map(node => safeLabel(node?.status)).join(",")
               expect(nodes.map(node => [node?.key, node?.status])).toEqual([
                 ["scout", "failed"], ["analyst", "cancelled"], ["independent", "completed"],
               ])
+              modelCallbackStageDiagnostic = "inline_wait_graph_ok"
               expect(nodes.find(node => node?.key === "scout")?.executionFailureCategory).toBe(expectedFailureCategory)
               const inlineOutcome = repairWaitOutcomeFromRequest(request, inlineWaitCallId, initialTaskIds)
               expect(inlineOutcome.status).toBe("ready")
@@ -10447,6 +10475,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               return
             }
             throw new Error(`Unexpected operational failure Root execution ${execution}/${round}`)
+            } catch (error) {
+              if (modelCallbackFailureDiagnostic === "none") modelCallbackFailureDiagnostic = safeModelFailure(error)
+              throw error
+            }
           },
         }
         return { adapter, registry: {} as never, candidates: [] }
@@ -10518,7 +10550,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       await waitForTurnStatus(pool!, value.turnId, "completed", 90_000, replacementWaitCallId)
     } catch (error) {
       const reason = error instanceof Error ? error.message : "Turn status wait failed"
-      throw new Error(reason + "; replacementPlanCommand=" + replacementPlanCommandDiagnostic + "; replacementPlanResult=" + replacementPlanResultDiagnostic + "; canonicalExecution=" + canonicalExecutionDiagnostic + "; rootExecutions=" + rootExecutions)
+      throw new Error(reason + "; replacementPlanCommand=" + replacementPlanCommandDiagnostic + "; replacementPlanResult=" + replacementPlanResultDiagnostic + "; canonicalExecution=" + canonicalExecutionDiagnostic + "; rootExecutions=" + rootExecutions + "; modelCallbackStage=" + modelCallbackStageDiagnostic + "; modelCallbackStatuses=" + modelCallbackStatusDiagnostic + "; modelCallbackFailure=" + modelCallbackFailureDiagnostic)
     }
     const turn = await pool!.query<{ rootTaskId: string | null; finalResponse: string | null; status: string }>(
       `SELECT "rootTaskId", "finalResponse", "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`,
