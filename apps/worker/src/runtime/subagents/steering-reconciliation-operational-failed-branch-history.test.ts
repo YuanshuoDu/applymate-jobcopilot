@@ -101,6 +101,90 @@ function fixture(inputOverrides: Partial<typeof callInput> = {}, callSequence = 
   return { client: { query } as unknown as Client, query, relation, receiptEvent, callRow }
 }
 
+function cancellationFixture(causationId: string | null) {
+  const scoutVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout" as const,
+    criteria: [{ id: "candidates", check: { kind: "candidate_count_gte" as const, minimum: 1 } }] }
+  const analystVerification = (dependencyNodeKey: string) => ({ schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst" as const,
+    criteria: [{ id: "from-scout", check: { kind: "findings_from_scout_dependency" as const, dependencyNodeKey } }] })
+  const graphBefore = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
+    { key: "scout-old", templateId: "scout", goal: "Find evidence", successCriteria: ["Collect sources"], dependsOn: [], depth: 1,
+      taskId: "scout-1", verificationDisposition: "typed" as const, verification: scoutVerification },
+    { key: "analyst-old", templateId: "analyst", goal: "Analyze evidence", successCriteria: ["Explain findings"], dependsOn: ["scout-old"], depth: 2,
+      taskId: "analyst-1", verificationDisposition: "typed" as const, verification: analystVerification("scout-old") },
+  ] }
+  const mode: TaskGraphOperationalFailureReplacement = { root: { nodeKey: "scout-old", taskId: "scout-1" }, sources: [
+    { nodeKey: "scout-old", taskId: "scout-1", replacementKey: "scout-new" },
+    { nodeKey: "analyst-old", taskId: "analyst-1", replacementKey: "analyst-new" },
+  ] }
+  const nodes = [
+    { key: "scout-new", templateId: "scout", goal: "Find evidence again", successCriteria: ["Collect sources"], dependsOn: [], verification: scoutVerification },
+    { key: "analyst-new", templateId: "analyst", goal: "Analyze evidence again", successCriteria: ["Explain findings"], dependsOn: ["scout-new"], verification: analystVerification("scout-new") },
+  ]
+  const graphAfter = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
+    { ...nodes[0], depth: 1, taskId: "scout-2", verificationDisposition: "typed" as const },
+    { ...nodes[1], depth: 2, taskId: "analyst-2", verificationDisposition: "typed" as const },
+  ] }
+  const failedResult = { workerResult: null, taskGraphVerificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION,
+    status: "unverified", reasonCode: "result_invalid", criteria: [{ criterionId: "candidates", status: "unverified", reasonCode: "result_invalid" }],
+    evidenceDigest: null, resultDigest: null } }
+  const failedDigest = taskGraphResultDigest(failedResult), failedKey = taskGraphLifecycleKey(scope.rootTaskId, "scout-old", 2, "task.failed")
+  const cancellationKey = taskGraphLifecycleKey(scope.rootTaskId, "analyst-old", 0, "task.cancelled"), proposalKey = taskGraphProposalKey(scope.rootTaskId, 9)
+  const operationKey = steeringReconciliationIdempotencyKey({ ...scope, stepId: scope.stepId! }, callId)!
+  const fingerprint = taskGraphOperationalFailedBranchFingerprint({ rootTaskId: scope.rootTaskId, expectedRevision: 8,
+    replaceOperationalFailure: mode, nodes })
+  const item = (content: unknown, revision: number) => ({ schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: taskGraphItemId(scope.rootTaskId),
+    sessionId: scope.sessionId, turnId: scope.turnId, stepId: scope.stepId, taskId: scope.rootTaskId, type: "task_graph", status: "streaming",
+    phase: null, revision, content, startedAt: eventTime, completedAt: null, createdAt: eventTime, updatedAt: eventTime })
+  const failedPayload = { kind: "lifecycle", revision: 8,
+    event: { type: "task.failed", nodeKey: "scout-old", expectedRevision: 7, idempotencyKey: failedKey, failureReason }, item: item(graphBefore, 8) }
+  const cancellationPayload = { kind: "lifecycle", revision: 9,
+    event: { type: "task.cancelled", nodeKey: "analyst-old", expectedRevision: 8, idempotencyKey: cancellationKey }, item: item(graphBefore, 9) }
+  const receipt = { status: "accepted", revision: 10, nodes: [{ key: "scout-new", taskId: "scout-2", status: "queued" },
+    { key: "analyst-new", taskId: "analyst-2", status: "waiting" }], readyTaskIds: ["scout-2"] }
+  const planPayload = { kind: "proposal", fingerprint, receipt, revision: 10, item: item(graphAfter, 10), content: graphAfter }
+  const rows = [eventRow("failure-event", "20", taskGraphItemId(scope.rootTaskId), "scout-1", "item.delta", "system", scope.turnId, null, failedKey, failedPayload),
+    eventRow("cancel-event", "22", taskGraphItemId(scope.rootTaskId), "analyst-1", "item.delta", "system", scope.turnId, causationId, cancellationKey, cancellationPayload),
+    eventRow("plan-event", "24", taskGraphItemId(scope.rootTaskId), scope.rootTaskId, "item.delta", "orchestrator", scope.turnId, scope.stepId!, proposalKey, planPayload)]
+  const callRow = { sequence: "21", type: "tool_call.started", actor: "orchestrator", eventTaskId: scope.rootTaskId, eventItemId: "call-item",
+    correlationId: callId, idempotencyKey: `${executionKey({ kind: "turn", userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
+      taskId: scope.rootTaskId, rootTaskId: scope.rootTaskId, ownerId: scope.turnLeaseOwner, leaseVersion: scope.turnLeaseVersion, leaseExpiresAt: new Date(0) })}:event:tool-started:${callId}`,
+    payload: { toolCallId: callId, taskId: scope.rootTaskId, toolName: "agent.plan" }, id: "call-item", stepId: scope.stepId,
+    itemTaskId: scope.rootTaskId, itemType: "tool_call", content: { toolCallId: callId, toolName: "agent.plan", toolVersion: "1",
+      input: { expectedRevision: 8, nodes, replaceOperationalFailure: mode } } }
+  const taskRows = [
+    { id: "scout-1", status: "failed", role: "scout", taskType: "job_discovery", attemptCount: 2, leaseOwner: null, leaseExpiresAt: null,
+      nextAttemptAt: null, startedAt: new Date(eventTime), completedAt: new Date(eventTime), closedAt: null, interruptRequestedAt: null,
+      failureReason, result: failedResult, outputArtifactIds: [], confidence: null, qualityGateResult: null, contextSnapshotId: null,
+      sessionUserId: scope.userId, turnUserId: scope.userId, turnRootTaskId: scope.rootTaskId },
+    { id: "analyst-1", status: "cancelled", role: "analyst", taskType: "job_analysis", attemptCount: 0, leaseOwner: null, leaseExpiresAt: null,
+      nextAttemptAt: null, startedAt: null, completedAt: new Date(eventTime), closedAt: null, interruptRequestedAt: null, failureReason: null,
+      result: null, outputArtifactIds: [], confidence: null, qualityGateResult: null, contextSnapshotId: null,
+      sessionUserId: scope.userId, turnUserId: scope.userId, turnRootTaskId: scope.rootTaskId },
+  ]
+  const query = vi.fn(async (sql: string) => {
+    if (sql.includes("tool_call.started")) return { rows: [callRow] }
+    if (sql.includes('event."payload"->>\'revision\'')) return { rows: [{ ...rows[0], currentItemId: taskGraphItemId(scope.rootTaskId),
+      currentSessionId: scope.sessionId, currentTurnId: scope.turnId, currentTaskId: scope.rootTaskId, currentType: "task_graph",
+      currentRevision: 10, currentContent: graphAfter }] }
+    if (sql.includes('AS "hasEvidence"')) return { rows: [{ id: "analyst-1", hasEvidence: false, hasDispatch: false }] }
+    if (sql.includes('task."taskType"')) return { rows: taskRows }
+    if (sql.includes('FROM "agent_wait_conditions"')) return { rows: [] }
+    if (sql.includes('FROM "sub_agent_tasks" task')) return { rows: [{ id: "analyst-1", failureReason: null }] }
+    if (sql.includes('JOIN "agent_sessions"')) return { rows }
+    throw new Error("unexpected cancellation history query")
+  })
+  const relation = { schemaVersion: TASK_GRAPH_OPERATIONAL_FAILED_BRANCH_RELATION_SCHEMA_VERSION, operationKey, graphRootTaskId: scope.rootTaskId,
+    observedRevision: 8, resultingRevision: 10,
+    failedSource: { source: mode.root, attemptCount: 2, failureReason, resultDigest: failedDigest,
+      event: { id: "failure-event", sequence: "20", idempotencyKey: failedKey } },
+    observedGraphEvent: { id: "failure-event", sequence: "20", idempotencyKey: failedKey },
+    sources: mode.sources.map(({ nodeKey, taskId, replacementKey }) => ({ source: { nodeKey, taskId }, replacementKey })), priorCancellations: [],
+    cancellations: [{ source: { nodeKey: "analyst-old", taskId: "analyst-1" }, event: { id: "cancel-event", sequence: "22", idempotencyKey: cancellationKey } }],
+    verifiedExternalDependencies: [], planEvent: { id: "plan-event", sequence: "24", idempotencyKey: proposalKey }, requestFingerprint: fingerprint,
+    agentPlanCall: { callId, stepId: scope.stepId, expectedRevision: 8, replaceOperationalFailure: mode } } as TaskGraphOperationalFailedBranchRelation
+  return { client: { query } as unknown as Client, relation, receiptEvent: { id: "receipt-event", sequence: 25n, stepId: scope.stepId!, idempotencyKey: operationKey } }
+}
+
 describe("operational failed-branch history", () => {
   it("revalidates the exact failed source, persisted plan call, and accepted proposal", async () => {
     const test = fixture()
@@ -139,5 +223,17 @@ describe("operational failed-branch history", () => {
     const mismatch = fixture({}, "21", { taskType: "job_discovery" })
     await expect(assertTaskGraphOperationalFailedBranchHistory(mismatch.client, scope, mismatch.relation, mismatch.receiptEvent))
       .rejects.toThrow("steering_reconciliation_operational_failure_event_invalid")
+  })
+
+  it("binds replacement cancellation causation to the persisted agent.plan Step", async () => {
+    const exact = cancellationFixture(scope.stepId!)
+    await expect(assertTaskGraphOperationalFailedBranchHistory(exact.client, scope, exact.relation, exact.receiptEvent))
+      .resolves.toEqual({ status: "accepted", revision: 10, nodes: [
+        { key: "scout-new", taskId: "scout-2", status: "queued" }, { key: "analyst-new", taskId: "analyst-2", status: "waiting" }], readyTaskIds: ["scout-2"] })
+    for (const causation of [null, "another-root-step"]) {
+      const wrong = cancellationFixture(causation)
+      await expect(assertTaskGraphOperationalFailedBranchHistory(wrong.client, scope, wrong.relation, wrong.receiptEvent))
+        .rejects.toThrow("steering_reconciliation_operational_failure_event_invalid")
+    }
   })
 })

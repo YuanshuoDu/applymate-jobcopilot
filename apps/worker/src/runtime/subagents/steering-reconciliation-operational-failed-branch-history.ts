@@ -64,14 +64,15 @@ function outboxMatches(row: Row): boolean {
     type: row.type, actor: row.actor, correlationId: row.correlationId, causationId: row.causationId, idempotencyKey: row.idempotencyKey, payload: row.payload }
   return row.outboxTopic === "agent.session.event" && row.outboxAggregateId === row.sessionId && row.outboxIdempotencyKey === `agent-event:${row.id}` && same(row.outboxPayload, expected)
 }
-function lifecycleSnapshot(row: Row, scope: SteeringReconciliationScope, type: string, nodeKey: string, taskId: string, attempt: number, expectedRevision: number): TaskGraphSnapshot {
+function lifecycleSnapshot(row: Row, scope: SteeringReconciliationScope, type: string, nodeKey: string, taskId: string, attempt: number,
+  expectedRevision: number, expectedCausationId: string | null = null): TaskGraphSnapshot {
   const payload = object(row.payload), item = object(payload?.item), event = parseTaskGraphEvent(payload?.event), key = taskGraphLifecycleKey(scope.rootTaskId, nodeKey, attempt, type)
   let snapshot: TaskGraphSnapshot
   try { snapshot = parseTaskGraphSnapshot(item?.content) } catch { return invalid() }
   const sequence = seq(row.sequence)
   if (!sequence || !outboxMatches(row) || row.sessionId !== scope.sessionId || row.turnId !== scope.turnId
     || row.itemId !== taskGraphItemId(scope.rootTaskId) || row.taskId !== taskId || row.type !== "item.delta"
-    || row.actor !== "system" || row.correlationId !== scope.turnId || row.causationId !== null || row.idempotencyKey !== key
+    || row.actor !== "system" || row.correlationId !== scope.turnId || row.causationId !== expectedCausationId || row.idempotencyKey !== key
     || payload?.kind !== "lifecycle" || !exact(payload, ["kind", "event", "revision", "item"])
     || event?.type !== type || event.nodeKey !== nodeKey || event.expectedRevision !== expectedRevision
     || event.idempotencyKey !== key || payload.revision !== expectedRevision + 1
@@ -225,7 +226,8 @@ export async function assertTaskGraphOperationalFailedBranchHistory(client: Clie
       || String(row.sequence) !== cancellation.event.sequence
       || BigInt(cancellation.event.sequence) <= read.sequence
       || BigInt(cancellation.event.sequence) >= BigInt(relation.planEvent.sequence)
-      || !same(lifecycleSnapshot(row, scope, "task.cancelled", source.nodeKey, source.taskId, 0, relation.observedRevision + index), observed.snapshot)) return invalid()
+      || !same(lifecycleSnapshot(row, scope, "task.cancelled", source.nodeKey, source.taskId, 0, relation.observedRevision + index,
+        call.stepId), observed.snapshot)) return invalid()
     const task = tasks.get(source.taskId)
     if (!task || !validTaskOwner(task, scope) || task.status !== "cancelled" || task.role !== node.templateId
       || task.taskType !== taskType(node.templateId) || Number(task.attemptCount) !== 0
