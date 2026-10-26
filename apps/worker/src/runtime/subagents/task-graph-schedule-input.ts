@@ -16,7 +16,6 @@ export type TaskGraphExecutionScope = Readonly<{
   parentLeaseOwner: string
   parentAttemptCount: number
 }>
-
 /** Server-owned template data; model input may choose only the registered ID. */
 export type TaskGraphTaskTemplate = Readonly<{
   role: string
@@ -43,4 +42,3 @@ export type TaskGraphScheduleInput = Readonly<{
   /** Server-resolved from the persisted Turn objective; never populated from model tool input. */
   verificationRequirements?: RootTaskVerificationRequirementsResolution
 }>
-

@@ -9960,6 +9960,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let replacementPlanAccepted = false
     let replacementPlanResultDiagnostic = "not_observed"
     let replacementPlanCommandDiagnostic = "not_called"
+    let canonicalExecutionDiagnostic = "not_observed"
     let finalGraphVerified = false
     const flags: ProductionAgentFlags = {
       taskGraphPlanningEnabled: true, childExecutionEnabled: true, coordinationEnabled: true,
@@ -9978,6 +9979,14 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const safeOperationalStackSites = (stack: unknown): string => {
       if (typeof stack !== "string") return "none"
       const allowed = new Set([
+        "canonical-turn-runtime.ts",
+        "canonical-turn-runtime-turn-setup.ts",
+        "canonical-turn-scheduled-pipeline.ts",
+        "scheduled-pipeline-candidate-store.ts",
+        "task-graph-pg-state.ts",
+        "turn-engine.ts",
+        "turn-engine-store.ts",
+        "turn-queue.ts",
         "task-graph-pg-operational-failure-replacement.ts",
         "task-graph-pg-operational-failure-evidence.ts",
         "task-graph-pg-operational-failure-cancellations.ts",
@@ -9987,6 +9996,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         "task-graph-pg-operational-failed-branch-relation.ts",
         "steering-reconciliation-history.ts",
         "steering-reconciliation-ledger.ts",
+        "canonical-turn-state.ts",
+        "durable-wait-consumer.ts",
+        "durable-wait-historical-failure-proof.ts",
       ])
       const sites: string[] = []
       for (const line of stack.split(/\r?\n/)) {
@@ -10244,6 +10256,20 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         return { adapter, registry: {} as never, candidates: [] }
       },
     })
+    const canonicalRuntimeExecute = runtime.execute
+    runtime.execute = async input => {
+      try {
+        const result = await canonicalRuntimeExecute.call(runtime, input)
+        const row = record(result)
+        canonicalExecutionDiagnostic = "returned_" + safeLabel(row?.status) + "/" + safeLabel(row?.summary ?? row?.errorCode)
+        return result
+      } catch (error) {
+        const code = error && typeof error === "object" && "code" in error ? error.code : undefined
+        const label = safeLabel(typeof code === "string" ? code : error instanceof Error ? error.name : "unknown")
+        canonicalExecutionDiagnostic = "threw_" + label + "@" + safeOperationalStackSites(error instanceof Error ? error.stack : undefined)
+        throw error
+      }
+    }
     await activateFixtureTurn(pool!, value)
     bootstrap = await createProductionWorkerBootstrap({
       pool: pool!, runtime, ownerId: value.ownerId, turnQueueFactory: createTurnQueue, turnRecoveryIntervalMs: 100,
@@ -10271,7 +10297,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       await waitForTurnStatus(pool!, value.turnId, "completed", 90_000, replacementWaitCallId)
     } catch (error) {
       const reason = error instanceof Error ? error.message : "Turn status wait failed"
-      throw new Error(`${reason}; replacementPlanCommand=${replacementPlanCommandDiagnostic}; replacementPlanResult=${replacementPlanResultDiagnostic}; rootExecutions=${rootExecutions}`)
+      throw new Error(reason + "; replacementPlanCommand=" + replacementPlanCommandDiagnostic + "; replacementPlanResult=" + replacementPlanResultDiagnostic + "; canonicalExecution=" + canonicalExecutionDiagnostic + "; rootExecutions=" + rootExecutions)
     }
     const turn = await pool!.query<{ rootTaskId: string | null; finalResponse: string | null; status: string }>(
       `SELECT "rootTaskId", "finalResponse", "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`,
@@ -10321,6 +10347,16 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(initialWait?.suspendedAt).toBeInstanceOf(Date)
     expect(initialWait?.resolvedAt).toBeInstanceOf(Date)
     expect(initialWait?.consumedAt).toBeInstanceOf(Date)
+    expect(JSON.stringify({
+      id: initialWait?.id,
+      status: initialWait?.status,
+      targetTaskIds: initialWait?.targetTaskIds,
+      matchedTaskIds: initialWait?.matchedTaskIds,
+      result: initialWait?.result,
+      suspendedAt: initialWait?.suspendedAt?.toISOString() ?? null,
+      resolvedAt: initialWait?.resolvedAt?.toISOString() ?? null,
+      consumedAt: initialWait?.consumedAt?.toISOString() ?? null,
+    })).toBe(consumedFailureWaitSnapshot)
     expect(inlineWait).toMatchObject({ status: "ready", targetTaskIds: [...initialTaskIds].sort(),
       matchedTaskIds: [...initialTaskIds].sort(), suspendedAt: null, resolvedAt: null, consumedAt: null })
     expect(inlineWait?.result).toEqual({ request: { targetTaskIds: [...initialTaskIds].sort(), mode: "all", timeoutMs: 30_000 } })

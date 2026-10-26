@@ -3,8 +3,9 @@ import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import type pg from "pg"
 import type { TurnLease } from "../turns/lease.js"
 import { parseTaskGraphRepairReceipt, parseTaskGraphVerificationReport, taskGraphVerificationReportMatchesStatus, type TaskGraphRepairReceipt, type TaskGraphVerificationReport } from "./task-graph-command-port.js"
-import type { TaskGraphSnapshot } from "./task-graph-snapshot.js"
+import { canonicalTaskGraphJson, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { durableWaitReportMatchesCurrent, projectDurableWaitOutcome, readDurableWaitSnapshot, revalidateDurableWaitDependencies, type DurableWaitProjection } from "./durable-wait-dependency-revalidation.js"
+import { readConsumedTaskGraphFailureReport } from "./durable-wait-historical-failure-proof.js"
 import { isTerminalSubagentStatus } from "./types.js"
 type Queryable = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
@@ -181,7 +182,7 @@ function generatedOutcome(wait: Row, targets: readonly Row[], snapshot: TaskGrap
   })
   return states.every(state => state.role !== null) ? makeOutcome(waitId, status, targetIds, matchedIds, states, currentMode) : null
 }
-function storedOutcome(wait: Row, snapshot: TaskGraphSnapshot | null, rootTaskId: string, targets: readonly Row[], dependencyTaskIds: ReadonlySet<string>): PreparedOutcome | null {
+async function storedOutcome(client: Queryable, scope: Parameters<typeof readDurableWaitSnapshot>[1], wait: Row, snapshot: TaskGraphSnapshot | null, rootTaskId: string, targets: readonly Row[], dependencyTaskIds: ReadonlySet<string>): Promise<PreparedOutcome | null> {
   const raw = record(object(wait.result).outcome), waitId = safeText(wait.id), status = raw ? waitStatus(raw.status) : null, currentMode = waitMode(wait.mode)
   const expectedIds = boundedIds(wait.targetTaskIds), expectedMatchedIds = boundedIds(wait.matchedTaskIds, true), targetIds = raw ? boundedIds(raw.targetTaskIds) : null, matchedIds = raw ? boundedIds(raw.matchedTaskIds, true) : null
   if (!raw || raw.waitId !== waitId || !status || status !== waitStatus(wait.status) || !currentMode || !expectedIds || !expectedMatchedIds || !targetIds || !matchedIds
@@ -195,14 +196,24 @@ function storedOutcome(wait: Row, snapshot: TaskGraphSnapshot | null, rootTaskId
     const hasRole = Object.prototype.hasOwnProperty.call(task, "role"), role = hasRole ? taskRole(task.role) : null, rowRole = taskRole(authoritative.role)
     if (hasRole && (!role || !rowRole || role !== rowRole)) return null
     const node = snapshot?.nodes.find(candidate => candidate.taskId === task.taskId)
-    const criterionIds = node?.verificationDisposition === "typed" && node.verification ? node.verification.criteria.map(item => item.id) : undefined
-    const hasReport = Object.prototype.hasOwnProperty.call(task, "verificationReport"), verificationReport = hasReport && criterionIds ? parseTaskGraphVerificationReport(task.verificationReport, criterionIds) : undefined
+    let criterionIds: readonly string[] | undefined = node?.verificationDisposition === "typed" && node.verification ? node.verification.criteria.map(item => item.id) : undefined
+    const hasReport = Object.prototype.hasOwnProperty.call(task, "verificationReport"), hasReceipt = Object.prototype.hasOwnProperty.call(task, "repairReceipt")
+    let historicalReport: TaskGraphVerificationReport | undefined
+    if (!node && hasReport && !hasReceipt && childStatus === "failed" && rowStatus === "failed") {
+      const proof = await readConsumedTaskGraphFailureReport(client, { scope, task: {
+        id: authoritative.id, status: authoritative.status, attemptCount: authoritative.attemptCount,
+        role: authoritative.role, taskType: authoritative.taskType, failureReason: authoritative.failureReason, result: authoritative.result,
+      }, archivedReport: task.verificationReport })
+      if (!proof) return null
+      criterionIds = proof.criterionIds; historicalReport = proof.report
+    }
+    const verificationReport = hasReport && criterionIds ? parseTaskGraphVerificationReport(task.verificationReport, criterionIds) : undefined
     if (hasReport && !verificationReport) return null
+    if (historicalReport && canonicalTaskGraphJson(verificationReport) !== canonicalTaskGraphJson(historicalReport)) return null
     if (hasReport && !taskGraphVerificationReportMatchesStatus(verificationReport!, childStatus)
       || criterionIds && (childStatus === "completed" || childStatus === "failed") && !verificationReport) return null
     if (dependencyTaskIds.has(task.taskId) && hasReport && (childStatus !== rowStatus || !verificationReport
       || !durableWaitReportMatchesCurrent(snapshot, task.taskId, task.verificationReport, authoritative.result))) return null
-    const hasReceipt = Object.prototype.hasOwnProperty.call(task, "repairReceipt")
     const repairOf = node?.repairOf?.graphRootTaskId === rootTaskId ? node.repairOf : undefined
     const repairReceipt = hasReceipt && node ? parseTaskGraphRepairReceipt(task.repairReceipt, { repairOf, repairNodeKey: node.key, repairTaskId: node.taskId, report: verificationReport }) : undefined
     if (hasReceipt && !repairReceipt) return null
@@ -223,7 +234,7 @@ export async function consumeDurableWaitOutcomes(input: DurableWaitConsumerInput
     if (!step || String(step.status) !== "waiting_for_tool" || Number(step.attempt) !== 1) continue
     const targetIds = boundedIds(wait.targetTaskIds)
     if (!targetIds || !boundedIds(wait.matchedTaskIds, true)?.every(id => targetIds.includes(id))) throw new Error("wait_consume_outcome_invalid")
-    const targets = await input.client.query<Row>(`SELECT task."id", task."rootTaskId", task."turnId", task."sessionId", task."role", task."status", task."result", task."failureReason", session."userId" AS "userId" FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId" WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3 AND session."userId" = $4 AND task."rootTaskId" = $5 AND session."status" NOT IN ('aborted', 'archived')`, [targetIds, input.lease.sessionId, input.lease.turnId, input.lease.userId, input.turn.rootTaskId])
+    const targets = await input.client.query<Row>(`SELECT task."id", task."rootTaskId", task."turnId", task."sessionId", task."role", task."taskType", task."attemptCount", task."status", task."result", task."failureReason", session."userId" AS "userId" FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId" WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3 AND session."userId" = $4 AND task."rootTaskId" = $5 AND session."status" NOT IN ('aborted', 'archived')`, [targetIds, input.lease.sessionId, input.lease.turnId, input.lease.userId, input.turn.rootTaskId])
     if (targets.rows.length !== targetIds.length || targets.rows.some(target => !targetIds.includes(String(target.id)) || String(target.rootTaskId ?? target.id) !== input.turn.rootTaskId || String(target.id) === input.turn.rootTaskId)) { if (wait.consumedAt) throw new Error("wait_consume_outcome_invalid"); continue }
     const graphScope = { userId: input.lease.userId, sessionId: input.lease.sessionId, turnId: input.lease.turnId, rootTaskId: input.turn.rootTaskId, parentTaskId: String(parent.id) }
     let snapshot = await readDurableWaitSnapshot(input.client, graphScope), currentTargets = targets.rows, dependencyTaskIds: ReadonlySet<string>
@@ -231,7 +242,7 @@ export async function consumeDurableWaitOutcomes(input: DurableWaitConsumerInput
       const fresh = await revalidateDurableWaitDependencies(input.client, graphScope, snapshot, currentTargets)
       snapshot = fresh.snapshot; currentTargets = [...fresh.targets]; dependencyTaskIds = fresh.dependencyTaskIds
     } catch { throw new Error("wait_consume_verification_report_invalid") }
-    const prior = wait.consumedAt ? storedOutcome(wait, snapshot, input.turn.rootTaskId, currentTargets, dependencyTaskIds) : null
+    const prior = wait.consumedAt ? await storedOutcome(input.client, graphScope, wait, snapshot, input.turn.rootTaskId, currentTargets, dependencyTaskIds) : null
     if (wait.consumedAt && !prior) throw new Error("wait_consume_outcome_invalid")
     if (prior) { projections.push(projectDurableWaitOutcome(safeText(wait.id), prior)); continue }
     const value = generatedOutcome(wait, currentTargets, snapshot, input.turn.rootTaskId)
