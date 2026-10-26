@@ -33,9 +33,9 @@ export class DurableSubagentWaitError extends Error {
 }
 
 export function safeSubagentWaitJson(value: unknown, maxBytes = MAX_RESULT_BYTES): unknown {
-  const clean = (item: unknown, seen = new Set<object>(), depth = 0): unknown => {
+  const clean = (item: unknown, seen = new Set<object>(), depth = 0, key?: string): unknown => {
     if (item === null || typeof item === "boolean") return item
-    if (typeof item === "string") return redactSensitiveText(item).slice(0, 2_000)
+    if (typeof item === "string") return key === "waitId" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(item) ? item : redactSensitiveText(item).slice(0, 2_000)
     if (typeof item === "number") return Number.isFinite(item) ? item : null
     if (!item || typeof item !== "object" || depth > 12 || seen.has(item)) return "[TRUNCATED]"
     seen.add(item)
@@ -44,7 +44,7 @@ export function safeSubagentWaitJson(value: unknown, maxBytes = MAX_RESULT_BYTES
       const output: Record<string, unknown> = {}
       for (const key of Object.keys(item).sort().slice(0, 64)) {
         if (/api.?key|secret|password|(?:access|refresh).?token|authorization/i.test(key)) continue
-        output[key] = clean((item as Record<string, unknown>)[key], seen, depth + 1)
+        output[key] = clean((item as Record<string, unknown>)[key], seen, depth + 1, key)
       }
       return output
     } finally { seen.delete(item) }
