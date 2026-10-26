@@ -10402,6 +10402,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               expect(replacementAnalyst?.taskId).toBe(replacementTaskIds[1])
               expect(["queued", "running", "completed"]).toContain(replacementScout?.status)
               expect(["waiting", "queued", "running", "completed"]).toContain(replacementAnalyst?.status)
+              if (replacementAnalyst?.status !== "waiting") expect(replacementScout?.status).toBe("completed")
               expect(replacementAnalyst?.dependsOn).toEqual(["scout-replacement"])
               expect(independent).toEqual(observedIndependentNode)
               replacementPlanAccepted = true
