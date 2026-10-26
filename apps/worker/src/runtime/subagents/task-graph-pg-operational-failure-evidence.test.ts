@@ -53,6 +53,14 @@ describe("proveTaskGraphOperationalFailureEvidence", () => {
     expect(f.query).toHaveBeenCalledTimes(1)
   })
 
+  it("accepts the persisted no-result resume envelope after JSON drops undefined workerResult", async () => {
+    const f = clientFor(failureEvent())
+    const task = { ...failedRow(), result: { taskGraphVerificationReport: failedReport } }
+    const proof = await proveTaskGraphOperationalFailureEvidence(f.client,
+      { scope, snapshot: graph, sourceNodes: [node], failedNode: node, failedRow: task })
+    expect(proof?.failedSource).toMatchObject({ failureReason: "child_resume_unavailable", resultDigest: expect.any(String) })
+  })
+
   it("rejects prior-attempt, category-only, role/task-type, and forged model-result evidence", async () => {
     const client = clientFor(failureEvent()).client
     const base = { scope, snapshot: graph, sourceNodes: [node], failedNode: node, failedRow: failedRow() }
@@ -60,6 +68,8 @@ describe("proveTaskGraphOperationalFailureEvidence", () => {
     await expect(proveTaskGraphOperationalFailureEvidence(client, { ...base, failedRow: { ...base.failedRow, failureReason: "task_graph_verification_unverified" } })).resolves.toBeNull()
     await expect(proveTaskGraphOperationalFailureEvidence(client, { ...base, failedRow: { ...base.failedRow, taskType: "job_analysis" } })).resolves.toBeNull()
     await expect(proveTaskGraphOperationalFailureEvidence(client, { ...base, failedRow: { ...base.failedRow, result: { workerResult: { status: "completed" }, taskGraphVerificationReport: failedReport } } })).resolves.toBeNull()
+    await expect(proveTaskGraphOperationalFailureEvidence(client, { ...base, failedRow: { ...base.failedRow, result: {
+      workerResult: null, taskGraphVerificationReport: failedReport, rawOutput: "extra" } } })).resolves.toBeNull()
   })
 
   it("binds the failed closure to its failure-time graph while tolerating unrelated later nodes", async () => {

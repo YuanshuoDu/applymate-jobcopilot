@@ -7,6 +7,7 @@ import { parseTaskGraphOperationalFailedBranchRelation, parseTaskGraphOperationa
   type TaskGraphOperationalFailedBranchRelation } from "./task-graph-pg-operational-failed-branch-relation.js"
 import { canonicalTaskGraphJson, parseTaskGraphEvent, parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey, taskGraphProposalKey, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { taskGraphResultDigest } from "./task-graph-pg-verification.js"
+import { isTaskGraphOperationalNoResultEnvelope } from "./task-graph-pg-operational-failure-evidence.js"
 import { proveTaskGraphOperationalObservedGraph } from "./task-graph-pg-operational-failure-observation.js"
 import { operationalCancellationsHaveNoOtherEvidence, proveTaskGraphOperationalHistoryCancellations } from "./task-graph-pg-operational-failure-cancellations.js"
 import { steeringReconciliationId, steeringReconciliationIdempotencyKey, validSteeringReconciliationToolCall, type SteeringReconciliationScope } from "./steering-reconciliation-contract.js"
@@ -137,8 +138,7 @@ function validReport(task: Row, node: TaskGraphSnapshot["nodes"][number], status
   const report = raw && node.verification ? parseTaskGraphVerificationReport(raw, node.verification.criteria.map(item => item.id)) : null
   return task.role === node.templateId && report?.status === status
     && taskGraphVerificationReportMatchesStatus(report, status === "passed" ? "completed" : "failed")
-    && (status !== "unverified" || report.reasonCode === "result_invalid" && exact(result, ["workerResult", "taskGraphVerificationReport"])
-      && result.workerResult === null) ? raw : null
+    && (status !== "unverified" || report.reasonCode === "result_invalid" && isTaskGraphOperationalNoResultEnvelope(task.result)) ? raw : null
 }
 function deltaMatches(before: TaskGraphSnapshot, after: TaskGraphSnapshot, sources: readonly TaskGraphSnapshot["nodes"][number][],
   mapping: ReadonlyMap<string, string>, proposals: readonly unknown[], receipt: TaskGraphScheduleReceipt, revision: number): boolean {

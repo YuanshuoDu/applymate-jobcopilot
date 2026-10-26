@@ -31,7 +31,6 @@ const failureReason = "child_resume_unavailable" as const
 const failedResult = { workerResult: null, taskGraphVerificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION,
   status: "unverified", reasonCode: "result_invalid", criteria: [{ criterionId: "findings", status: "unverified", reasonCode: "result_invalid" }],
   evidenceDigest: null, resultDigest: null } }
-const failedDigest = taskGraphResultDigest(failedResult)
 const callId = "plan-call"
 const callInput = { expectedRevision: 8, nodes: proposalNodes, replaceOperationalFailure: mode }
 const fingerprint = taskGraphOperationalFailedBranchFingerprint({ rootTaskId: scope.rootTaskId, expectedRevision: 8,
@@ -88,7 +87,7 @@ function fixture(inputOverrides: Partial<typeof callInput> = {}, callSequence = 
   })
   const relationRaw = { schemaVersion: TASK_GRAPH_OPERATIONAL_FAILED_BRANCH_RELATION_SCHEMA_VERSION, operationKey,
     graphRootTaskId: scope.rootTaskId, observedRevision: 8, resultingRevision: 9,
-    failedSource: { source: mode.root, attemptCount: 2, failureReason, resultDigest: failedDigest,
+    failedSource: { source: mode.root, attemptCount: 2, failureReason, resultDigest: taskGraphResultDigest(taskRow.result),
       event: { id: failureEventId, sequence: "20", idempotencyKey: failureKey } },
     observedGraphEvent: { id: failureEventId, sequence: "20", idempotencyKey: failureKey },
     sources: [{ source: mode.root, replacementKey: "analyst-fresh" }], priorCancellations: [], cancellations: [], verifiedExternalDependencies: [],
@@ -205,6 +204,24 @@ describe("operational failed-branch history", () => {
     await expect(assertTaskGraphOperationalFailedBranchHistory(test.client, scope, test.relation, test.receiptEvent))
       .resolves.toEqual(planReceipt)
     expect(test.query).toHaveBeenCalledTimes(5)
+  })
+
+  it("replays only the exact serialized no-result report forms for an operational failure", async () => {
+    const report = failedResult.taskGraphVerificationReport
+    const persisted = JSON.parse(JSON.stringify({ workerResult: undefined, taskGraphVerificationReport: report })) as unknown
+    expect(persisted).toEqual({ taskGraphVerificationReport: report })
+    const reportOnly = fixture({}, "21", { result: persisted })
+    await expect(assertTaskGraphOperationalFailedBranchHistory(reportOnly.client, scope, reportOnly.relation, reportOnly.receiptEvent))
+      .resolves.toEqual(planReceipt)
+    for (const result of [
+      { workerResult: { status: "failed" }, taskGraphVerificationReport: report },
+      { workerResult: null, taskGraphVerificationReport: report, untrusted: true },
+      { taskGraphVerificationReport: report, untrusted: true },
+    ]) {
+      const invalid = fixture({}, "21", { result })
+      await expect(assertTaskGraphOperationalFailedBranchHistory(invalid.client, scope, invalid.relation, invalid.receiptEvent))
+        .rejects.toThrow("steering_reconciliation_operational_failure_event_invalid")
+    }
   })
 
   it("rejects a persisted agent.plan call whose public proposal no longer matches its fingerprint", async () => {

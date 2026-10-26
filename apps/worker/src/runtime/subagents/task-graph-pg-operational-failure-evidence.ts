@@ -18,9 +18,14 @@ function object(value: unknown): Row | null {
   try { const prototype = Object.getPrototypeOf(parsed); return prototype === Object.prototype || prototype === null ? parsed as Row : null } catch { return null }
 }
 function same(left: unknown, right: unknown): boolean { return canonicalTaskGraphJson(left) === canonicalTaskGraphJson(right) }
+export function isTaskGraphOperationalNoResultEnvelope(value: unknown): boolean {
+  const row = object(value)
+  const keys = row && Object.keys(row).sort().join(",")
+  return keys === "taskGraphVerificationReport" || keys === "taskGraphVerificationReport,workerResult" && row?.workerResult === null
+}
 function exactResult(value: unknown): Readonly<{ report: Row }> | null {
   const row = object(value)
-  return row && Object.keys(row).sort().join(",") === "taskGraphVerificationReport,workerResult" && row.workerResult === null
+  return row && isTaskGraphOperationalNoResultEnvelope(row)
     ? { report: object(row.taskGraphVerificationReport) ?? {} } : null
 }
 function reasonFor(node: StoredTaskGraphNode, taskType: unknown, role: unknown, reason: unknown): reason is TaskGraphOperationalResumeFailureReason {

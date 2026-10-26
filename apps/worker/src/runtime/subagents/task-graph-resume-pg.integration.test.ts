@@ -9950,6 +9950,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     childQueueName = subagentQueue.SUBAGENT_QUEUE_NAME
     let rootExecutions = 0
     let rootTaskId = ""
+    let originalOperationalFailureResult: unknown
+    let originalFailureEnvelopeObserved = false
     let initialTaskIds: string[] = []
     let replacementTaskIds: string[] = []
     let consumedFailureWaitObserved = false
@@ -10074,7 +10076,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 [initialTaskIds[0], value.sessionId, value.turnId, rootTaskId],
               )
               expect(source.rows[0]).toMatchObject({ status: "failed", failureReason: "child_resume_unavailable" })
-              expectUnverifiedVerificationReport(record(source.rows[0]?.result)?.taskGraphVerificationReport, "candidate-count")
+              const sourceResult = record(source.rows[0]?.result)
+              expect(Object.keys(sourceResult ?? {}).sort()).toEqual(["taskGraphVerificationReport"])
+              expect(Object.hasOwn(sourceResult ?? {}, "workerResult")).toBe(false)
+              expectUnverifiedVerificationReport(sourceResult?.taskGraphVerificationReport, "candidate-count")
+              originalOperationalFailureResult = source.rows[0]?.result
+              originalFailureEnvelopeObserved = true
               const descendant = await pool!.query<{ status: string; failureReason: string | null; result: unknown }>(
                 `SELECT "status", "failureReason", "result" FROM "sub_agent_tasks"
                  WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4 AND "parentTaskId" = $4`,
@@ -10287,6 +10294,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const byGoal = new Map(tasks.rows.map(task => [task.goal, task] as const))
     const failedSource = byGoal.get(sourceGoal)
     expect(failedSource).toMatchObject({ id: initialTaskIds[0], status: "failed", failureReason: "child_resume_unavailable" })
+    expect(originalFailureEnvelopeObserved).toBe(true)
+    expect(failedSource?.result).toEqual(originalOperationalFailureResult)
     expectUnverifiedVerificationReport(record(failedSource?.result)?.taskGraphVerificationReport, "candidate-count")
     expect(byGoal.get(dependentGoal)).toMatchObject({ id: initialTaskIds[1], status: "cancelled", failureReason: "A prerequisite task did not complete." })
     expect(byGoal.get(replacementScoutGoal)).toMatchObject({ id: replacementTaskIds[0], status: "completed", failureReason: null })
