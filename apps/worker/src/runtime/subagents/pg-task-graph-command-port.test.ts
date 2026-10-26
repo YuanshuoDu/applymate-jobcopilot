@@ -1063,7 +1063,7 @@ describe("createPgTaskGraphCommandPort", () => {
     const port = createPgTaskGraphCommandPort(fake.pool)
 
     await expect(port.readCurrentResultPage!(scope, { nodeKey: "planned", expectedRevision: 8, offset: 0 })).resolves.toEqual({
-      schemaVersion: "agent-harness.v2.task-graph.result-page.v1", trust: "untrusted", availability: "available",
+      schemaVersion: "agent-harness.v2.task-graph.result-page.v2", trust: "untrusted", availability: "available",
       graphRevision: 8, role: "analyst", taskStatus: "failed", resultStatus: "partial", totalCount: 1,
       evidenceCount: 1, offset: 0, nextOffset: null, items: [{ jobId, score: 8, evidenceKinds: ["job"] }],
     })

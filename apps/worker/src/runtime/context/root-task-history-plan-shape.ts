@@ -52,7 +52,7 @@ function denseValues(value: unknown, maximum: number): unknown[] | undefined {
 function validKey(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= TASK_GRAPH_LIMITS.maxKeyLength && value.trim() === value
 }
-function validOrdinals(value: unknown, count: number): number[] | undefined {
+export function parseRootTaskHistorySourceOrdinals(value: unknown, count: number): number[] | undefined {
   const ordinals = denseValues(value, count)
   if (!ordinals || ordinals.length !== count) return undefined
   return ordinals.every((ordinal, index) => typeof ordinal === "number" && Number.isSafeInteger(ordinal) && ordinal >= 1 && ordinal <= count
@@ -103,7 +103,7 @@ export function buildRootTaskHistoryPlanShape(graph: unknown, sourceNodeOrdinals
   const graphRow = record(graph), rawNodes = graphRow && data(graphRow, "nodes")
   const graphNodes = denseValues(rawNodes, TASK_GRAPH_LIMITS.maxNodes)
   if (!graphNodes || graphNodes.length < 1) return undefined
-  const ordinals = validOrdinals(sourceNodeOrdinals, graphNodes.length)
+  const ordinals = parseRootTaskHistorySourceOrdinals(sourceNodeOrdinals, graphNodes.length)
   if (!ordinals) return undefined
   const keyOrdinals = new Map<string, number>(), source: Array<{ key: string; role: RootTaskHistoryPlanRole; dependencies: string[] }> = []
   for (let index = 0; index < graphNodes.length; index++) {
@@ -126,4 +126,28 @@ export function buildRootTaskHistoryPlanShape(graph: unknown, sourceNodeOrdinals
   const packet = { schemaVersion: "agent-harness.v2.root-task-history-plan-shape.v1", ordinalScope: "source_graph_local",
     advisoryOnly: true, notCurrentEvidence: true, nodes }
   return parseRootTaskHistoryPlanShape(packet)
+}
+
+/** Attaches a shape only when every source-local ordinal is still represented in the selected turn. */
+export function attachCompleteRootTaskHistoryPlanShape(
+  target: { planShape?: RootTaskHistoryPlanShape },
+  shape: RootTaskHistoryPlanShape | undefined,
+  selectedOrdinals: readonly number[],
+): void {
+  if (!shape || selectedOrdinals.length !== shape.nodes.length) return
+  const selected = new Set(selectedOrdinals)
+  if (shape.nodes.every(node => selected.has(node.ordinal))) target.planShape = shape
+}
+
+/** Drops whole optional shapes from oldest selected turns first until the caller's packet fits. */
+export function dropRootTaskHistoryPlanShapesUntilFits<T extends { planShape?: RootTaskHistoryPlanShape }>(
+  turns: readonly T[],
+  withinLimit: (turns: readonly T[]) => boolean,
+): void {
+  if (withinLimit(turns)) return
+  for (const turn of [...turns].reverse()) {
+    if (!turn.planShape) continue
+    delete turn.planShape
+    if (withinLimit(turns)) break
+  }
 }
