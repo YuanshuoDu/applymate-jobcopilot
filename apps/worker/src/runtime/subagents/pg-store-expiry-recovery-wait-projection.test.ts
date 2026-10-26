@@ -296,7 +296,7 @@ describe("expired wait projection repair", () => {
     { label: "wrong owner", stage: "wait_validation", wait: { repairLeaseOwner: "other-owner" } },
     { label: "wrong attempt", stage: "wait_validation", wait: { repairTaskAttempt: 2, repairAttempt: 2 } },
     { label: "wrong step", stage: "wait_validation", wait: { repairStepStatus: "streaming" } },
-    { label: "wrong call step", stage: "wait_validation", wait: { stepId: "other-step" } },
+    { label: "wrong call step", stage: "call_contract_validation", wait: { stepId: "other-step" } },
     { label: "consumed wait", stage: "wait_validation", wait: { consumedAt: now } },
     { label: "unresolved wait timestamp", stage: "wait_validation", wait: { resolvedAt: null } },
     { label: "wrong call identity", stage: "call_contract_validation", call: { content: { toolCallId: "call-1", toolName: "wait_subagents", toolVersion: "1",
