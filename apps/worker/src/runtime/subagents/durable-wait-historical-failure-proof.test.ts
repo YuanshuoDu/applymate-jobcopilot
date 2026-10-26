@@ -64,6 +64,28 @@ describe("readConsumedTaskGraphFailureReport", () => {
     await expect(readConsumedTaskGraphFailureReport(explicitNull.client, { scope, task: explicitNull.task, archivedReport: explicitNull.taskReport })).resolves.toMatchObject({ criterionIds: ["finding-count"] })
   })
 
+  it("selects the current-attempt receipt when an earlier failed attempt is also present", async () => {
+    const prior = fixture({ attempt: 1 }), current = fixture({ attempt: 2 })
+    const withIdentity = (event: Row, id: string, sequence: string): Row => ({
+      ...event, id, sequence, outboxIdempotencyKey: `agent-event:${id}`,
+      outboxPayload: { ...(event.outboxPayload as Row), eventId: id, sequence },
+    })
+    const { client } = withRows([
+      withIdentity(current.event, "current-failure", "11"),
+      withIdentity(prior.event, "prior-failure", "10"),
+    ])
+    await expect(readConsumedTaskGraphFailureReport(client, { scope, task: current.task, archivedReport: current.taskReport }))
+      .resolves.toEqual({ criterionIds: ["candidate-count"], report: current.taskReport })
+  })
+
+  it("rejects duplicate receipts for the current attempt", async () => {
+    const f = fixture(), duplicate = { ...f.event, id: "duplicate-current-failure", sequence: "11",
+      outboxIdempotencyKey: "agent-event:duplicate-current-failure",
+      outboxPayload: { ...(f.event.outboxPayload as Row), eventId: "duplicate-current-failure", sequence: "11" } }
+    await expect(readConsumedTaskGraphFailureReport(withRows([f.event, duplicate]).client,
+      { scope, task: f.task, archivedReport: f.taskReport })).resolves.toBeNull()
+  })
+
   it("rejects changed output, failure cause, role/type, status, and attempt", async () => {
     const f = fixture(), call = (task: TaskInput) => readConsumedTaskGraphFailureReport(f.client, { scope, task, archivedReport: f.taskReport })
     await expect(call({ ...f.task, failureReason: "task_graph_verification_unverified" })).resolves.toBeNull()

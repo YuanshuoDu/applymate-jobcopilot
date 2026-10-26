@@ -1,12 +1,16 @@
 import type pg from "pg"
 import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
+import { parseTaskGraphOperationalFailureReplacement } from "../planning/task-graph-operational-failure-replacement.js"
 import { parseTaskGraphVerificationReport, taskGraphVerificationReportMatchesStatus } from "./task-graph-command-port.js"
-import type { TaskGraphOperationalFailedBranchRelation, TaskGraphOperationalResumeFailureReason } from "./task-graph-pg-operational-failed-branch-relation.js"
+import { parseTaskGraphOperationalFailurePlanNodes, taskGraphOperationalFailedBranchFingerprint,
+  type TaskGraphOperationalFailedBranchRelation, type TaskGraphOperationalResumeFailureReason } from "./task-graph-pg-operational-failed-branch-relation.js"
 import { proveTaskGraphOperationalExternalDependencies } from "./task-graph-pg-operational-failure-dependencies.js"
 import { taskGraphResultDigest } from "./task-graph-pg-verification.js"
 import type { GraphIdentityScope } from "./task-graph-pg-state.js"
 import { canonicalTaskGraphJson, parseTaskGraphEvent, parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey,
   type StoredTaskGraphNode, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
+import { normalizeRootPlanCriteria } from "./root-plan-criteria.js"
+import { steeringReconciliationSequence, validSteeringReconciliationToolCall, type SteeringReconciliationScope } from "./steering-reconciliation-contract.js"
 
 type Client = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
@@ -18,11 +22,57 @@ function object(value: unknown): Row | null {
   try { const prototype = Object.getPrototypeOf(parsed); return prototype === Object.prototype || prototype === null ? parsed as Row : null } catch { return null }
 }
 function same(left: unknown, right: unknown): boolean { return canonicalTaskGraphJson(left) === canonicalTaskGraphJson(right) }
+function invalidPersistedPlanCall(): never { throw new Error("steering_reconciliation_operational_failure_event_invalid") }
 export function isTaskGraphOperationalNoResultEnvelope(value: unknown): boolean {
   const row = object(value)
   const keys = row && Object.keys(row).sort().join(",")
   return keys === "taskGraphVerificationReport" || keys === "taskGraphVerificationReport,workerResult" && row?.workerResult === null
 }
+
+export type TaskGraphOperationalFailurePlanCallInput = Readonly<{
+  sequence: bigint
+  nodes: NonNullable<ReturnType<typeof parseTaskGraphOperationalFailurePlanNodes>>
+  criteria?: readonly string[]
+}>
+
+/** Reads and verifies the persisted agent.plan call that authorized an operational-failure replacement. */
+export async function readTaskGraphOperationalFailurePlanCallInput(
+  client: Client,
+  scope: SteeringReconciliationScope,
+  relation: TaskGraphOperationalFailedBranchRelation,
+): Promise<TaskGraphOperationalFailurePlanCallInput> {
+  const call = relation.agentPlanCall
+  const result = await client.query<Row>(`SELECT event."sequence"::text AS "sequence", event."type", event."actor",
+      event."taskId" AS "eventTaskId", event."itemId" AS "eventItemId", event."correlationId", event."idempotencyKey", event."payload",
+      item."id", item."stepId", item."taskId" AS "itemTaskId", item."type" AS "itemType", item."content"
+    FROM "agent_events" AS event JOIN "agent_items" AS item ON item."id" = event."itemId"
+      AND item."sessionId" = event."sessionId" AND item."turnId" = event."turnId"
+    WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."type" = 'tool_call.started'
+      AND event."taskId" = $3 AND event."correlationId" = $4 AND item."taskId" = $3 AND item."stepId" = $5 LIMIT 2`,
+  [scope.sessionId, scope.turnId, scope.rootTaskId, call.callId, call.stepId])
+  const row = result.rows[0]
+  const sequence = steeringReconciliationSequence(row?.sequence)
+  const content = object(row?.content), input = object(content?.input)
+  const nodes = input && typeof input.expectedRevision === "number" ? parseTaskGraphOperationalFailurePlanNodes(input.nodes) : null
+  const criteria = normalizeRootPlanCriteria(input?.rootSuccessCriteria)
+  const mode = nodes && parseTaskGraphOperationalFailureReplacement(input?.replaceOperationalFailure, nodes)
+  const event = row && { type: row.type, actor: row.actor, taskId: row.eventTaskId, itemId: row.eventItemId,
+    correlationId: row.correlationId, idempotencyKey: row.idempotencyKey, payload: row.payload }
+  const item = row && { id: row.id, stepId: row.stepId, taskId: row.itemTaskId, type: row.itemType, content: row.content }
+  if (result.rows.length !== 1 || !sequence || sequence <= 0n || !row || row.stepId !== call.stepId
+    || row.itemType !== "tool_call" || content?.toolName !== "agent.plan" || !nodes || criteria === null || !mode?.ok
+    || !event || !item || !validSteeringReconciliationToolCall(event, item, scope, call.stepId, "revise", relation.observedRevision,
+      undefined, undefined, call.replaceOperationalFailure)
+    || !same(mode.value, call.replaceOperationalFailure) || input?.expectedRevision !== relation.observedRevision
+    || sequence <= BigInt(relation.failedSource.event.sequence) || sequence <= BigInt(relation.observedGraphEvent.sequence)
+    || sequence >= BigInt(relation.cancellations[0]?.event.sequence ?? relation.planEvent.sequence)) invalidPersistedPlanCall()
+  const fingerprint = taskGraphOperationalFailedBranchFingerprint({ rootTaskId: scope.rootTaskId,
+    expectedRevision: relation.observedRevision, replaceOperationalFailure: call.replaceOperationalFailure, nodes,
+    ...(criteria === undefined ? {} : { rootSuccessCriteria: criteria }) })
+  if (fingerprint !== relation.requestFingerprint) invalidPersistedPlanCall()
+  return { sequence, nodes, ...(criteria === undefined ? {} : { criteria }) }
+}
+
 function exactResult(value: unknown): Readonly<{ report: Row }> | null {
   const row = object(value)
   return row && isTaskGraphOperationalNoResultEnvelope(row)

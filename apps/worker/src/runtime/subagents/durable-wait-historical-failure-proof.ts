@@ -112,8 +112,11 @@ export async function readConsumedTaskGraphFailureReport(client: Client, input: 
       AND event."payload"->>'kind' = 'lifecycle' AND event."payload"->'event'->>'type' = 'task.failed'
     ORDER BY event."sequence" DESC LIMIT ${EVENT_LIMIT}`, [scope.sessionId, scope.turnId, taskId, scope.userId,
     scope.rootTaskId, taskGraphItemId(scope.rootTaskId)])
-  if (rows.rows.length !== 1) return null
-  const row = rows.rows[0]!
+  const currentAttemptSuffix = `:${attemptCount}:task.failed`
+  const currentAttemptRows = rows.rows.filter(row => typeof row.idempotencyKey === "string"
+    && row.idempotencyKey.endsWith(currentAttemptSuffix))
+  if (currentAttemptRows.length !== 1) return null
+  const row = currentAttemptRows[0]!
   const resultEnvelope = object(task.result)!
   return receiptMatches(row, scope, taskId, attemptCount, task.failureReason, role, input.archivedReport,
     resultEnvelope.taskGraphVerificationReport)

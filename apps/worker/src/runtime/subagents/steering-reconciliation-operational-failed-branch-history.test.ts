@@ -73,7 +73,7 @@ function fixture(inputOverrides: Partial<typeof callInput> = {}, callSequence = 
     itemTaskId: scope.rootTaskId, itemType: "tool_call", content: callContent }
   const taskRow = { id: "analyst-1", status: "failed", role: "analyst", taskType: "job_analysis", attemptCount: 2, leaseOwner: null, leaseExpiresAt: null,
     nextAttemptAt: null, startedAt: new Date("2026-01-01T00:00:00Z"), completedAt: new Date("2026-01-01T00:01:00Z"),
-    closedAt: null, interruptRequestedAt: null, failureReason, result: failedResult, outputArtifactIds: [],
+    closedAt: null, interruptRequestedAt: null, failureReason, result: failedResult, confidence: null, qualityGateResult: null, contextSnapshotId: null, outputArtifactIds: [],
     sessionUserId: scope.userId, turnUserId: scope.userId, turnRootTaskId: scope.rootTaskId, ...taskOverrides }
   const query = vi.fn(async (sql: string) => {
     if (sql.includes("tool_call.started")) return { rows: [callRow] }
@@ -240,6 +240,16 @@ describe("operational failed-branch history", () => {
     const mismatch = fixture({}, "21", { taskType: "job_discovery" })
     await expect(assertTaskGraphOperationalFailedBranchHistory(mismatch.client, scope, mismatch.relation, mismatch.receiptEvent))
       .rejects.toThrow("steering_reconciliation_operational_failure_event_invalid")
+  })
+
+  it("rejects a failed row whose no-output proof fields were tampered", async () => {
+    for (const overrides of [
+      { confidence: 0.8 }, { qualityGateResult: { passed: true } }, { contextSnapshotId: "snapshot-1" }, { outputArtifactIds: ["artifact-1"] },
+    ]) {
+      const tampered = fixture({}, "21", overrides)
+      await expect(assertTaskGraphOperationalFailedBranchHistory(tampered.client, scope, tampered.relation, tampered.receiptEvent))
+        .rejects.toThrow("steering_reconciliation_operational_failure_event_invalid")
+    }
   })
 
   it("binds replacement cancellation causation to the persisted agent.plan Step", async () => {
