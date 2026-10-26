@@ -43,7 +43,11 @@ export class ContextCompactor {
   async compact(request: CompactionRequest): Promise<CompactionResult> {
     const limits = bounds(request.bounds)
     const collection = collectCompactionState(request.source, limits.maxNarrativeInputCharacters)
-    const trigger = evaluateCompactionTrigger({ inputTokens: collection.beforeInputTokens, itemCount: collection.sourceItemCount, atTurnBoundary: request.atTurnBoundary, requested: request.requested }, request.policy)
+    const additionalInputTokens = request.additionalInputTokens ?? 0
+    if (!Number.isSafeInteger(additionalInputTokens) || additionalInputTokens < 0) throw new CompactionError("invalid_source", "additionalInputTokens must be a non-negative safe integer")
+    const inputTokens = collection.beforeInputTokens + additionalInputTokens
+    if (!Number.isSafeInteger(inputTokens)) throw new CompactionError("invalid_source", "input token estimate exceeds the safe integer range")
+    const trigger = evaluateCompactionTrigger({ inputTokens, itemCount: collection.sourceItemCount, atTurnBoundary: request.atTurnBoundary, requested: request.requested }, request.policy)
     if (!trigger.shouldCompact || !trigger.reason) return { status: "skipped", trigger, item: null }
 
     const started = createCompactionStartedItem({ sessionId: collection.state.sessionId, turnId: request.turnId, throughSequence: collection.state.throughSequence, source: request.source, reason: trigger.reason, id: request.itemId }, this.idFactory)

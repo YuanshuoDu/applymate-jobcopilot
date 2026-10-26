@@ -4,6 +4,7 @@ import type { TenantScope, RepositoryJsonValue } from "@jobcopilot/agent-protoco
 import { matchesAgentOutboxIdentity, type AgentOutboxIdentity, type AgentOutboxPayload } from "../outbox-identity.js"
 import { TurnLeaseError, type TurnLease } from "../turns/lease.js"
 import { TurnEngineError, toRepositoryJson } from "../turns/turn-engine-output.js"
+import { estimateDiscoveryPersonaContextTokens } from "./discovery-persona-context-blocks.js"
 import {
   DISCOVERY_PERSONA_FACT_LIMIT, DISCOVERY_PERSONA_BYTE_LIMIT, parseDiscoveryPersonaOverflowPayload,
   parseDiscoveryPersonaSnapshotPayload, projectDiscoveryPersonaFacts, type DiscoveryPersonaFactRow,
@@ -17,9 +18,8 @@ const OVERFLOW_KEY = (sessionId: string, turnId: string) => `discovery-persona-o
 const SAFE_STATE_ERROR = "Discovery memory could not be verified; start a new Turn."
 type Row = Record<string, unknown>
 type EventRow = Row & { id: string; sessionId: string; turnId: string; taskId: string; sequence: string | number | bigint; type: string; payload: unknown }
-type Input = Readonly<{
-  scope: Pick<TenantScope, "userId">; lease: TurnLease; rootTaskId: string; rootAttemptCount: number; stepId: string
-}>
+type OwnerInput = Readonly<{ scope: Pick<TenantScope, "userId">; lease: TurnLease; rootTaskId: string; rootAttemptCount: number }>
+type Input = OwnerInput & Readonly<{ stepId: string }>
 export type DiscoveryPersonaSnapshotResult =
   | { readonly kind: "accepted"; readonly projection: DiscoveryPersonaProjection }
   | { readonly kind: "overflow"; readonly reason: "fact_limit" | "byte_limit"; readonly observedFactCount: number; readonly canonicalUtf8Bytes: number | null }
@@ -35,7 +35,15 @@ function sequence(value: unknown): string | null {
 }
 
 async function assertCurrentOwner(client: pg.PoolClient, input: Input): Promise<void> {
+  await assertCurrentRootOwner(client, input)
   const { lease, rootTaskId, rootAttemptCount, stepId } = input
+  const step = await client.query<Row>(`SELECT "id" FROM "agent_steps" WHERE "id"=$1 AND "sessionId"=$2 AND "turnId"=$3
+    AND "taskId"=$4 AND "attempt"=$5 AND "status"='streaming' FOR UPDATE`, [stepId, lease.sessionId, lease.turnId, rootTaskId, rootAttemptCount])
+  if (!step.rows[0]) throw new TurnLeaseError("lease_lost", "Turn step is no longer active")
+}
+
+async function assertCurrentRootOwner(client: pg.PoolClient, input: OwnerInput): Promise<void> {
+  const { lease, rootTaskId, rootAttemptCount } = input
   const session = await client.query<Row>(`SELECT "id" FROM "agent_sessions" WHERE "id"=$1 AND "userId"=$2
     AND "status" NOT IN ('aborted','archived') FOR UPDATE`, [lease.sessionId, lease.userId])
   if (!session.rows[0]) throw new TurnLeaseError("lease_lost", "Turn session is no longer owned")
@@ -49,9 +57,6 @@ async function assertCurrentOwner(client: pg.PoolClient, input: Input): Promise<
     AND task."attemptCount"=$6 AND task."leaseExpiresAt">clock_timestamp() AND task."interruptRequestedAt" IS NULL FOR UPDATE OF task`,
   [rootTaskId, lease.sessionId, lease.turnId, lease.userId, lease.ownerId, rootAttemptCount])
   if (!root.rows[0]) throw new TurnLeaseError("lease_lost", "Root task is no longer owned")
-  const step = await client.query<Row>(`SELECT "id" FROM "agent_steps" WHERE "id"=$1 AND "sessionId"=$2 AND "turnId"=$3
-    AND "taskId"=$4 AND "attempt"=$5 AND "status"='streaming' FOR UPDATE`, [stepId, lease.sessionId, lease.turnId, rootTaskId, rootAttemptCount])
-  if (!step.rows[0]) throw new TurnLeaseError("lease_lost", "Turn step is no longer active")
 }
 
 async function readEvent(client: pg.PoolClient, key: string): Promise<EventRow | null> {
@@ -60,7 +65,7 @@ async function readEvent(client: pg.PoolClient, key: string): Promise<EventRow |
   if (result.rows.length > 1) throw conflict()
   return result.rows[0] ?? null
 }
-async function assertRetainedEventOwner(client: pg.PoolClient, row: EventRow, input: Input): Promise<void> {
+async function assertRetainedEventOwner(client: pg.PoolClient, row: EventRow, input: OwnerInput): Promise<void> {
   const { lease } = input
   if (row.sessionId !== lease.sessionId || typeof row.turnId !== "string" || typeof row.taskId !== "string") throw conflict()
   const turn = await client.query<Row>(`SELECT "id" FROM "agent_turns"
@@ -154,6 +159,55 @@ export async function loadOrCreateDiscoveryPersonaSnapshot(pool: Pick<pg.Pool, "
     await client.query("COMMIT"); committed = true
     return projection.kind === "accepted" ? { kind: "accepted", projection: projection.payload.projection }
       : { kind: "overflow", reason: projection.payload.reason, observedFactCount: projection.payload.observedFactCount, canonicalUtf8Bytes: projection.payload.canonicalUtf8Bytes }
+  } catch (error: unknown) {
+    if (!committed) await client.query("ROLLBACK").catch(() => undefined)
+    if (error instanceof TurnLeaseError || error instanceof TurnEngineError) throw error
+    throw conflict()
+  } finally { client.release() }
+}
+
+export type DiscoveryPersonaSnapshotEstimate =
+  | { readonly kind: "accepted"; readonly estimatedTokens: number }
+  | { readonly kind: "absent" }
+  | { readonly kind: "overflow" }
+
+/** Read only an already-persisted, verified same-Session snapshot before the first Step. */
+export async function readDiscoveryPersonaSnapshotForCompaction(
+  pool: Pick<pg.Pool, "connect">, input: OwnerInput,
+): Promise<DiscoveryPersonaSnapshotEstimate> {
+  const { lease, rootTaskId } = input
+  if (input.scope.userId !== lease.userId) throw conflict()
+  const client = await pool.connect(); let committed = false
+  try {
+    await client.query("BEGIN ISOLATION LEVEL READ COMMITTED")
+    await client.query("SELECT set_config($1,$2,true)", ["app.user_id", lease.userId])
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended('applymate:persona-facts:' || $1::text, 0))", [lease.userId])
+    await assertCurrentRootOwner(client, input)
+    const overflowKey = OVERFLOW_KEY(lease.sessionId, lease.turnId)
+    const priorOverflow = await readEvent(client, overflowKey)
+    if (priorOverflow) {
+      await assertRetainedEventOwner(client, priorOverflow, input)
+      const payload = parseDiscoveryPersonaOverflowPayload(parsedJson(priorOverflow.payload))
+      if (!envelope(priorOverflow, DISCOVERY_PERSONA_OVERFLOW_EVENT, overflowKey) || priorOverflow.turnId !== lease.turnId
+        || priorOverflow.taskId !== rootTaskId || !payload) throw conflict()
+      await verifyOutbox(client, expectedOutbox(priorOverflow, toRepositoryJson(payload)))
+      await client.query("COMMIT"); committed = true
+      return { kind: "overflow" }
+    }
+    const snapshotKey = SNAPSHOT_KEY(lease.sessionId)
+    const priorSnapshot = await readEvent(client, snapshotKey)
+    if (!priorSnapshot) {
+      await client.query("COMMIT"); committed = true
+      return { kind: "absent" }
+    }
+    await assertRetainedEventOwner(client, priorSnapshot, input)
+    const payload = parseDiscoveryPersonaSnapshotPayload(parsedJson(priorSnapshot.payload))
+    if (!envelope(priorSnapshot, DISCOVERY_PERSONA_SNAPSHOT_EVENT, snapshotKey) || !payload) throw conflict()
+    await verifyOutbox(client, expectedOutbox(priorSnapshot, toRepositoryJson(payload)))
+    const estimatedTokens = estimateDiscoveryPersonaContextTokens(payload.projection)
+    if (!Number.isSafeInteger(estimatedTokens) || estimatedTokens < 0) throw conflict()
+    await client.query("COMMIT"); committed = true
+    return { kind: "accepted", estimatedTokens }
   } catch (error: unknown) {
     if (!committed) await client.query("ROLLBACK").catch(() => undefined)
     if (error instanceof TurnLeaseError || error instanceof TurnEngineError) throw error

@@ -67,6 +67,7 @@ export async function runTurnBoundaryContextCompaction(input: {
   readonly owner: TurnExecutionOwnerFence
   readonly lease: TurnLease
   readonly taskGraphCommandPort?: TaskGraphCommandPort
+  readonly additionalInputTokens?: number
   /** This is the same usage-authorized Harness adapter used by TurnEngine. */
   readonly model: ModelAdapter
   readonly signal: AbortSignal
@@ -74,8 +75,12 @@ export async function runTurnBoundaryContextCompaction(input: {
   const source = await createPgCompactionSource(input.pool).load({ scope: input.scope, owner: input.owner })
   if (!source || !source.items.some(item => item.type !== "compaction_summary")) return { status: "skipped" }
   const collection = collectCompactionState(source)
+  const additionalInputTokens = input.additionalInputTokens ?? 0
+  if (!Number.isSafeInteger(additionalInputTokens) || additionalInputTokens < 0) throw new RangeError("additionalInputTokens must be a non-negative safe integer")
+  const inputTokens = collection.beforeInputTokens + additionalInputTokens
+  if (!Number.isSafeInteger(inputTokens)) throw new RangeError("input token estimate exceeds the safe integer range")
   const trigger = evaluateCompactionTrigger({
-    inputTokens: collection.beforeInputTokens,
+    inputTokens,
     itemCount: collection.sourceItemCount,
     atTurnBoundary: false,
     requested: false,
@@ -96,6 +101,7 @@ export async function runTurnBoundaryContextCompaction(input: {
     turnId: input.lease.turnId,
     source: compactionSource,
     policy: DEFAULT_COMPACTION_POLICY,
+    ...(additionalInputTokens > 0 ? { additionalInputTokens } : {}),
     // This preflight runs at the boundary; the boundary itself is not a trigger.
     atTurnBoundary: false,
     requested: false,
