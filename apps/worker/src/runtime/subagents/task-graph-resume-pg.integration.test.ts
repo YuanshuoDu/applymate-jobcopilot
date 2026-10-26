@@ -10205,7 +10205,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
               expect(nodes.map(node => node?.key)).toEqual(["scout-replacement", "analyst-replacement"])
-              expect(nodes.map(node => node?.status)).toEqual(["queued", "waiting"])
+              expect(nodes.map(node => node?.taskId)).toEqual(replacementTaskIds)
+              expect(["queued", "running"]).toContain(nodes[0]?.status)
+              expect(nodes[1]?.status).toBe("waiting")
+              expect(nodes[1]?.dependsOn).toEqual(["scout-replacement"])
               replacementPlanAccepted = true
               yield { type: "tool_call_completed", callId: replacementWaitCallId, name: "agent.wait", arguments: {
                 idempotencyKey: replacementWaitKey, taskIds: replacementTaskIds, mode: "all", timeoutMs: 30_000,
