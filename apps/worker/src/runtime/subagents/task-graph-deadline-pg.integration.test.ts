@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto"
+import { readFile } from "node:fs/promises"
 import { Pool } from "pg"
 import { Redis } from "ioredis"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
@@ -11,7 +12,9 @@ import { PgSubagentTaskStore } from "./pg-store.js"
 import { defaultSubagentPolicy } from "./types.js"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
-import { taskGraphLifecycleKey } from "./task-graph-snapshot.js"
+import { ROLE_RESULT_SCHEMA } from "./role-results.js"
+import { TASK_GRAPH_NATIVE_METADATA_VERSION, TASK_GRAPH_NATIVE_TEMPLATE_ID } from "./task-graph-native-state.js"
+import { parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const ROLLBACK_TRIGGER = "task_graph_deadline_rollback_fixture"
@@ -181,11 +184,11 @@ async function seed(pool: Pool): Promise<{ fixture: Fixture; children: Record<st
   }
   const paused = await claim("paused")
   const running = await claim("running")
-  for (const [key, task] of [["paused", paused], ["running", running]] as const) {
+  for (const [key, task, ordinal] of [["paused", paused, 2], ["running", running, 3]] as const) {
     await pool.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status",
         "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
-      VALUES ($1, $2, $3, $4, 0, $5, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
-    [`deadline-child-step-${key}-${suffix}`, value.sessionId, value.turnId, task.id, task.attemptCount])
+      VALUES ($1, $2, $3, $4, $5, $6, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
+    [`deadline-child-step-${key}-${suffix}`, value.sessionId, value.turnId, task.id, ordinal, task.attemptCount])
   }
   const pausedOwner = paused.leaseOwner!
   await tasks.finish({ taskId: paused.id, sessionId: value.sessionId, ownerId: pausedOwner,
@@ -213,6 +216,45 @@ async function seed(pool: Pool): Promise<{ fixture: Fixture; children: Record<st
     staleOwner: running.leaseOwner!, staleAttempt: String(running.attemptCount), publishedDispatch: `subagent-dispatch:${running.id}` } }
 }
 
+type FixtureGraphSnapshot = { schemaVersion: string; nodes: Record<string, unknown>[]; rootSuccessCriteria?: string[] }
+async function readFixtureGraph(pool: Pool, fixture: Fixture): Promise<FixtureGraphSnapshot> {
+  const result = await pool.query<{ content: unknown }>(`SELECT "content" FROM "agent_items"
+    WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 AND "type" = 'task_graph'`,
+  [taskGraphItemId(fixture.rootTaskId), fixture.sessionId, fixture.turnId, fixture.rootTaskId])
+  const content = result.rows[0]?.content
+  if (!content || typeof content !== "object" || Array.isArray(content)
+    || !Array.isArray((content as Record<string, unknown>).nodes)) throw new Error("migration fixture graph is missing")
+  return structuredClone(content as FixtureGraphSnapshot)
+}
+
+async function writeFixtureGraph(pool: Pool, fixture: Fixture, content: FixtureGraphSnapshot): Promise<void> {
+  await pool.query(`UPDATE "agent_items" SET "content" = $2::jsonb
+    WHERE "id" = $1 AND "sessionId" = $3 AND "turnId" = $4 AND "taskId" = $5 AND "type" = 'task_graph'`,
+  [taskGraphItemId(fixture.rootTaskId), JSON.stringify(content), fixture.sessionId, fixture.turnId, fixture.rootTaskId])
+}
+
+async function insertMigrationFixtureTask(pool: Pool, input: {
+  id: string; fixture: Fixture; parentTaskId: string; depth: number; role: string; taskType: string; goal: string
+}): Promise<void> {
+  await pool.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth",
+      "role", "taskType", "status", "goal", "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema")
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'queued', $10, '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, '{}'::jsonb)`,
+  [input.id, input.fixture.sessionId, input.fixture.turnId, input.fixture.rootTaskId, input.parentTaskId,
+    `/root/${input.id}`, input.depth, input.role, input.taskType, input.goal])
+}
+
+async function insertMigrationFixtureGraph(pool: Pool, input: {
+  id: string; fixture: Fixture; parentTaskId: string; childTaskId: string; depth: number
+}): Promise<void> {
+  const content = { schemaVersion: "agent-harness.v2.task-graph", nodes: [{
+    dependsOn: [], depth: input.depth, goal: "Nested graph child", key: "nested-child", successCriteria: ["Finish"],
+    taskId: input.childTaskId, templateId: "analyst",
+  }] }
+  await pool.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "taskId", "type", "status", "revision", "content", "createdAt", "updatedAt")
+    VALUES ($1, $2, $3, $4, 'task_graph', 'streaming', 1, $5::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+  [input.id, input.fixture.sessionId, input.fixture.turnId, input.parentTaskId, JSON.stringify(content)])
+}
+
 async function dropRollbackTrigger(): Promise<void> {
   if (!pool) return
   await pool.query(`DROP TRIGGER IF EXISTS ${ROLLBACK_TRIGGER} ON "agent_outbox"`)
@@ -235,6 +277,150 @@ withServices("TaskGraph deadline recovery on disposable PostgreSQL and Redis", (
     }
     await redis?.quit()
     await pool?.end()
+  })
+
+  it("backfills only current, owned, unfinished root TaskGraph children from createdAt", async () => {
+    const ordinary = await seed(pool!)
+    const scheduled = await seed(pool!)
+    const wrongAutomationMode = await seed(pool!)
+    const malformed = await seed(pool!)
+    const duplicateTarget = await seed(pool!)
+    const strayGraph = await seed(pool!)
+    const mismatchedGraphScope = await seed(pool!)
+    const mismatchedOwner = await seed(pool!)
+    const entries = [ordinary, scheduled, wrongAutomationMode, malformed, duplicateTarget, strayGraph, mismatchedGraphScope, mismatchedOwner]
+    const childIds = (entry: Awaited<ReturnType<typeof seed>>) => [entry.children.paused, entry.children.running, entry.children.dependent]
+    const originalCreatedAt = new Date("2000-01-01T00:00:00.000Z")
+    const preservedDeadline = new Date("2035-05-06T07:08:09.000Z")
+    const preservedSegment = new Date("2035-05-06T07:09:09.000Z")
+    for (const entry of entries) {
+      await pool!.query(`UPDATE "sub_agent_tasks" SET "absoluteDeadlineAt" = NULL, "createdAt" = $2,
+          "leaseSegmentStartedAt" = NULL WHERE "id" = ANY($1::text[])`, [childIds(entry), originalCreatedAt])
+    }
+    await pool!.query(`UPDATE "sub_agent_tasks" SET "status" = 'completed', "completedAt" = CURRENT_TIMESTAMP
+      WHERE "id" = $1`, [ordinary.children.dependent])
+    await pool!.query(`UPDATE "sub_agent_tasks" SET "leaseSegmentStartedAt" = $2 WHERE "id" = $1`,
+      [ordinary.children.running, preservedSegment])
+
+    await pool!.query(`UPDATE "agent_turns" SET "source" = 'automation', "executionMode" = 'canonical_task_graph' WHERE "id" = $1`,
+      [scheduled.fixture.turnId])
+    await pool!.query(`UPDATE "sub_agent_tasks" SET "absoluteDeadlineAt" = $2, "leaseSegmentStartedAt" = $3 WHERE "id" = $1`,
+      [scheduled.children.running, preservedDeadline, preservedSegment])
+    await pool!.query(`UPDATE "agent_turns" SET "source" = 'automation', "executionMode" = 'legacy_pipeline_adapter' WHERE "id" = $1`,
+      [wrongAutomationMode.fixture.turnId])
+
+    const scoutId = `deadline-scout-${ordinary.fixture.suffix}`
+    const nativeId = `deadline-native-${ordinary.fixture.suffix}`
+    await insertMigrationFixtureTask(pool!, { id: scoutId, fixture: ordinary.fixture, parentTaskId: ordinary.fixture.rootTaskId,
+      depth: 1, role: "scout", taskType: "research", goal: "Registered Scout graph child" })
+    await pool!.query(`UPDATE "sub_agent_tasks" SET "allowedActions" = '["jobs.search"]'::jsonb,
+        "expectedOutputSchema" = '{"schemaVersion":"${ROLE_RESULT_SCHEMA}","role":"scout"}'::jsonb WHERE "id" = $1`, [scoutId])
+    await insertMigrationFixtureTask(pool!, { id: nativeId, fixture: ordinary.fixture, parentTaskId: ordinary.fixture.rootTaskId,
+      depth: 1, role: "analyst", taskType: "research", goal: "Native graph child" })
+    const ordinaryGraph = await readFixtureGraph(pool!, ordinary.fixture)
+    ordinaryGraph.nodes.push({ dependsOn: [], depth: 1, goal: "Registered Scout graph child", key: "registered-scout",
+      registeredScoutEnvelope: { allowedActions: ["jobs.search"], expectedOutputSchema: { role: "scout", schemaVersion: ROLE_RESULT_SCHEMA },
+        role: "scout", taskType: "research" }, successCriteria: ["Evidence found"], taskId: scoutId, templateId: "scout",
+      verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria: [
+        { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+        { id: "candidate-evidence", check: { kind: "all_candidates_have_evidence", minimumItems: 1 } },
+      ] }, verificationDisposition: "typed" })
+    ordinaryGraph.nodes.push({ dependsOn: [], depth: 1, goal: "Native graph child", key: "native-child", successCriteria: [],
+      taskId: nativeId, templateId: TASK_GRAPH_NATIVE_TEMPLATE_ID, verificationDisposition: "legacy_unverified",
+      nativeDelegation: { schemaVersion: TASK_GRAPH_NATIVE_METADATA_VERSION, operationKind: "spawn",
+        operationId: `native-migration-${ordinary.fixture.suffix}`, requestFingerprint: "a".repeat(64),
+        callerTaskId: ordinary.fixture.rootTaskId, role: "analyst", taskType: "research", contextDigest: "b".repeat(64), contextBytes: 0 } })
+    expect(parseTaskGraphSnapshot(ordinaryGraph).nodes).toHaveLength(5)
+    await writeFixtureGraph(pool!, ordinary.fixture, ordinaryGraph)
+
+    const malformedGraph = await readFixtureGraph(pool!, malformed.fixture)
+    malformedGraph.nodes[0]!["verificationDisposition"] = null
+    await writeFixtureGraph(pool!, malformed.fixture, malformedGraph)
+    const duplicateGraph = await readFixtureGraph(pool!, duplicateTarget.fixture)
+    duplicateGraph.nodes.push(structuredClone(duplicateGraph.nodes[0]!))
+    await writeFixtureGraph(pool!, duplicateTarget.fixture, duplicateGraph)
+
+    const strayContent = await readFixtureGraph(pool!, strayGraph.fixture)
+    await pool!.query(`DELETE FROM "agent_items" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`,
+      [taskGraphItemId(strayGraph.fixture.rootTaskId), strayGraph.fixture.sessionId, strayGraph.fixture.turnId])
+    await pool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "taskId", "type", "status", "revision", "content", "createdAt", "updatedAt")
+      VALUES ($1, $2, $3, $4, 'task_graph', 'streaming', 1, $5::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+    [`stray-task-graph-${strayGraph.fixture.suffix}`, strayGraph.fixture.sessionId, strayGraph.fixture.turnId,
+      strayGraph.fixture.rootTaskId, JSON.stringify(strayContent)])
+
+    const foreignTurnId = `deadline-migration-other-turn-${mismatchedGraphScope.fixture.suffix}`
+    await pool!.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot",
+        "toolPolicySnapshot", "budgetSnapshot", "rootTaskId", "updatedAt")
+      VALUES ($1, $2, $3, 'completed', 'user', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $4, CURRENT_TIMESTAMP)`,
+    [foreignTurnId, mismatchedGraphScope.fixture.sessionId, mismatchedGraphScope.fixture.userId, mismatchedGraphScope.fixture.rootTaskId])
+    await pool!.query(`UPDATE "agent_items" SET "turnId" = $2 WHERE "id" = $1 AND "sessionId" = $3 AND "taskId" = $4`,
+      [taskGraphItemId(mismatchedGraphScope.fixture.rootTaskId), foreignTurnId, mismatchedGraphScope.fixture.sessionId,
+        mismatchedGraphScope.fixture.rootTaskId])
+
+    const foreignUserId = `deadline-migration-other-owner-${mismatchedOwner.fixture.suffix}`
+    fixtureUsers.push(foreignUserId)
+    await pool!.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`,
+      [foreignUserId, `${foreignUserId}@example.invalid`])
+    await pool!.query(`DELETE FROM "agent_wait_conditions" WHERE "turnId" = $1`, [mismatchedOwner.fixture.turnId])
+    await pool!.query(`DELETE FROM "agent_tool_result_references" WHERE "turnId" = $1`, [mismatchedOwner.fixture.turnId])
+    await pool!.query(`UPDATE "agent_turns" SET "userId" = $2 WHERE "id" = $1`, [mismatchedOwner.fixture.turnId, foreignUserId])
+
+    const genericId = `deadline-generic-${ordinary.fixture.suffix}`
+    const verifierId = `deadline-native-control-${ordinary.fixture.suffix}`
+    await insertMigrationFixtureTask(pool!, { id: genericId, fixture: ordinary.fixture, parentTaskId: ordinary.fixture.rootTaskId,
+      depth: 1, role: "analyst", taskType: "manual_spawn", goal: "Generic child under the same parent" })
+    await insertMigrationFixtureTask(pool!, { id: verifierId, fixture: ordinary.fixture, parentTaskId: ordinary.fixture.rootTaskId,
+      depth: 1, role: "auditor", taskType: "native_verification", goal: "Native verification control" })
+    const nestedId = `deadline-nested-child-${ordinary.fixture.suffix}`
+    await insertMigrationFixtureTask(pool!, { id: nestedId, fixture: ordinary.fixture, parentTaskId: ordinary.children.paused,
+      depth: 2, role: "analyst", taskType: "research", goal: "Unsupported nested Graph child" })
+    await pool!.query(`UPDATE "sub_agent_tasks" SET "createdAt" = $2 WHERE "id" = ANY($1::text[])`,
+      [[genericId, verifierId, nestedId], originalCreatedAt])
+    await insertMigrationFixtureGraph(pool!, { id: taskGraphItemId(ordinary.children.paused), fixture: ordinary.fixture,
+      parentTaskId: ordinary.children.paused, childTaskId: nestedId, depth: 2 })
+
+    const rootIds = entries.map(entry => entry.fixture.rootTaskId)
+    const allIds = [...rootIds, ...entries.flatMap(childIds), genericId, verifierId, nestedId, scoutId, nativeId]
+    const migration = await readFile(new URL("../../../../../apps/web/prisma/migrations/20261026180000_add_task_graph_child_deadline/migration.sql", import.meta.url), "utf8")
+    const client = await pool!.connect()
+    try {
+      await client.query("BEGIN")
+      await client.query(migration)
+      const first = await client.query<{ id: string; status: string; createdAt: Date; absoluteDeadlineAt: Date | null; leaseSegmentStartedAt: Date | null }>(
+        `SELECT "id", "status", "createdAt", "absoluteDeadlineAt", "leaseSegmentStartedAt" FROM "sub_agent_tasks"
+          WHERE "id" = ANY($1::text[]) ORDER BY "id"`, [allIds])
+      await client.query(migration)
+      const second = await client.query(`SELECT "id", "status", "createdAt", "absoluteDeadlineAt", "leaseSegmentStartedAt" FROM "sub_agent_tasks"
+        WHERE "id" = ANY($1::text[]) ORDER BY "id"`, [allIds])
+      const databaseNow = await client.query<{ dbNow: Date }>(`SELECT clock_timestamp() AS "dbNow"`)
+      expect(second.rows).toEqual(first.rows)
+      expect(first.rows).toHaveLength(allIds.length)
+      const byId = new Map(first.rows.map(row => [row.id, row]))
+      const expectBackfilled = (id: string) => {
+        const row = byId.get(id)
+        if (!row) throw new Error(`migration fixture task ${id} is missing`)
+        expect(row.absoluteDeadlineAt?.getTime()).toBe(row.createdAt.getTime() + 60 * 60 * 1000)
+      }
+      for (const id of [ordinary.children.paused, ordinary.children.running, scoutId, nativeId,
+        scheduled.children.paused, scheduled.children.dependent]) expectBackfilled(id)
+      const overdue = byId.get(ordinary.children.paused)?.absoluteDeadlineAt
+      expect(overdue?.getTime()).toBeLessThan(databaseNow.rows[0]!.dbNow.getTime())
+      expect(byId.get(ordinary.children.paused)?.leaseSegmentStartedAt).toBeNull()
+      expect(byId.get(ordinary.children.running)?.leaseSegmentStartedAt).toEqual(preservedSegment)
+      expect(byId.get(scheduled.children.running)?.absoluteDeadlineAt).toEqual(preservedDeadline)
+      expect(byId.get(scheduled.children.running)?.leaseSegmentStartedAt).toEqual(preservedSegment)
+      expect(byId.get(ordinary.children.dependent)).toMatchObject({ status: "completed", absoluteDeadlineAt: null })
+      for (const id of rootIds) expect(byId.get(id)).toMatchObject({ absoluteDeadlineAt: null, leaseSegmentStartedAt: null })
+      for (const id of [...childIds(wrongAutomationMode), ...childIds(malformed), ...childIds(duplicateTarget),
+        ...childIds(strayGraph), ...childIds(mismatchedGraphScope), ...childIds(mismatchedOwner), genericId, verifierId, nestedId]) {
+        expect(byId.get(id)?.absoluteDeadlineAt).toBeNull()
+      }
+      expect(byId.get(genericId)?.status).toBe("queued")
+      expect(byId.get(verifierId)?.status).toBe("queued")
+    } finally {
+      await client.query("ROLLBACK").catch(() => undefined)
+      client.release()
+    }
   })
 
   it("recovers once under concurrent scans, rolls back atomically, and wakes the durable parent", async () => {
