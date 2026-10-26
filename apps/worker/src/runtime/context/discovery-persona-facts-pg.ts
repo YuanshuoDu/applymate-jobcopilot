@@ -93,6 +93,12 @@ async function verifyOutbox(client: pg.PoolClient, expected: AgentOutboxIdentity
   const row = await client.query<Row>(`SELECT "id","topic","aggregateId","idempotencyKey","payload" FROM "agent_outbox" WHERE "idempotencyKey"=$1 FOR UPDATE`, [expected.idempotencyKey])
   if (!matchesAgentOutboxIdentity(row.rows[0], expected)) throw conflict()
 }
+async function assertNoOrphanOutbox(client: pg.PoolClient, key: string): Promise<void> {
+  const eventId = idempotencyId(key)
+  const rows = await client.query<Row>(`SELECT "id" FROM "agent_outbox"
+    WHERE "idempotencyKey"=$1 OR "id"=$2 FOR UPDATE`, [`agent-event:${eventId}`, `agent-outbox-${eventId}`])
+  if (rows.rows.length > 0) throw conflict()
+}
 async function appendEvent(client: pg.PoolClient, input: Input, type: string, key: string, payload: RepositoryJsonValue): Promise<void> {
   const { lease, rootTaskId } = input, id = idempotencyId(key)
   const next = await client.query<{ eventSequence: string | number | bigint }>(`UPDATE "agent_sessions" SET "eventSequence"="eventSequence"+1
@@ -194,9 +200,11 @@ export async function readDiscoveryPersonaSnapshotForCompaction(
       await client.query("COMMIT"); committed = true
       return { kind: "overflow" }
     }
+    await assertNoOrphanOutbox(client, overflowKey)
     const snapshotKey = SNAPSHOT_KEY(lease.sessionId)
     const priorSnapshot = await readEvent(client, snapshotKey)
     if (!priorSnapshot) {
+      await assertNoOrphanOutbox(client, snapshotKey)
       await client.query("COMMIT"); committed = true
       return { kind: "absent" }
     }

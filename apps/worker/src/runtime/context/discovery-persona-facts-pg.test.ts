@@ -93,7 +93,7 @@ function fakeReadPool(options: {
         return { rows: row ? [row] : [], rowCount: row ? 1 : 0 }
       }
       if (sql.includes('FROM "agent_outbox"')) {
-        const row = options.outboxes?.[String(values[0])]
+        const row = options.outboxes?.[String(values[0])] ?? Object.values(options.outboxes ?? {}).find(candidate => candidate.id === values[1])
         return { rows: row ? [row] : [], rowCount: row ? 1 : 0 }
       }
       if (sql.includes('FROM "persona_facts"')) return { rows: [fact], rowCount: 1 }
@@ -203,6 +203,30 @@ describe("read-only discovery persona snapshot for compaction", () => {
     await expect(readDiscoveryPersonaSnapshotForCompaction(fake.pool, readInput)).resolves.toEqual({ kind: "absent" })
     expect(fake.queries.filter(query => query.sql.includes('FROM "agent_events"'))).toHaveLength(2)
     expect(fake.queries.at(-1)?.sql).toBe("COMMIT")
+    noWritesOrFactReads(fake.queries)
+  })
+
+  it.each([
+    ["snapshot", retainedSnapshotEvent],
+    ["overflow", retainedOverflowEvent],
+  ] as const)("rejects an orphaned %s outbox instead of treating memory as absent", async (_label, makeEvent) => {
+    const event = makeEvent()
+    const fake = fakeReadPool({ outboxes: { [`agent-event:${event.id}`]: outboxFixture(event) } })
+    await expect(readDiscoveryPersonaSnapshotForCompaction(fake.pool, readInput)).rejects.toMatchObject({ code: "persistence_conflict" })
+    expect(fake.queries.some(query => query.sql.includes('FROM "agent_outbox"'))).toBe(true)
+    expect(fake.queries.at(-1)?.sql).toBe("ROLLBACK")
+    noWritesOrFactReads(fake.queries)
+  })
+
+  it.each([
+    ["snapshot", retainedSnapshotEvent],
+    ["overflow", retainedOverflowEvent],
+  ] as const)("rejects an orphaned deterministic %s outbox ID with a mismatched key", async (_label, makeEvent) => {
+    const event = makeEvent(), orphan = { ...outboxFixture(event), idempotencyKey: "agent-event:wrong-key" }
+    const fake = fakeReadPool({ outboxes: { [orphan.idempotencyKey]: orphan } })
+    await expect(readDiscoveryPersonaSnapshotForCompaction(fake.pool, readInput)).rejects.toMatchObject({ code: "persistence_conflict" })
+    expect(fake.queries.some(query => query.sql.includes('FROM "agent_outbox"') && query.sql.includes('OR "id"=$2'))).toBe(true)
+    expect(fake.queries.at(-1)?.sql).toBe("ROLLBACK")
     noWritesOrFactReads(fake.queries)
   })
 
