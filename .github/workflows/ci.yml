@@ -172,6 +172,24 @@ jobs:
           pnpm --filter @jobcopilot/web exec vitest run src/lib/persona-facts.pg.integration.test.ts
       - name: Build Worker workspace before focused test
         run: pnpm turbo build --filter=@jobcopilot/worker
+      - name: Verify TaskGraph child deadline terminalization on disposable PostgreSQL and Redis
+        env:
+          CI: "true"
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+          RUN_AGENT_TURN_REDIS_INTEGRATION: "1"
+          AGENT_TURN_REDIS_TEST_URL: redis://127.0.0.1:6379/15
+          AGENT_TURN_REDIS_TEST_DISPOSABLE: "true"
+        run: |
+          test "$CI" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          test "$RUN_AGENT_TURN_REDIS_INTEGRATION" = "1"
+          test "$AGENT_TURN_REDIS_TEST_URL" = "redis://127.0.0.1:6379/15"
+          test "$AGENT_TURN_REDIS_TEST_DISPOSABLE" = "true"
+          pnpm --filter @jobcopilot/worker exec vitest run --no-file-parallelism src/runtime/subagents/task-graph-deadline-pg.integration.test.ts
       - name: Verify PersonaFact Web and Worker snapshot serialization on disposable PostgreSQL
         env:
           CI: "true"
@@ -569,24 +587,6 @@ jobs:
           test "$AGENT_TURN_REDIS_TEST_DISPOSABLE" = "true"
           test "$REDIS_URL" = "$AGENT_TURN_REDIS_TEST_URL"
           pnpm --filter @jobcopilot/worker exec vitest run --no-file-parallelism src/runtime/subagents/durable-child-wait-pg.integration.test.ts
-      - name: Verify TaskGraph child deadline terminalization on disposable PostgreSQL and Redis
-        env:
-          CI: "true"
-          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
-          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
-          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
-          RUN_AGENT_TURN_REDIS_INTEGRATION: "1"
-          AGENT_TURN_REDIS_TEST_URL: redis://127.0.0.1:6379/15
-          AGENT_TURN_REDIS_TEST_DISPOSABLE: "true"
-        run: |
-          test "$CI" = "true"
-          test "$AGENT_RUNTIME_PG_TEST_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
-          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
-          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
-          test "$RUN_AGENT_TURN_REDIS_INTEGRATION" = "1"
-          test "$AGENT_TURN_REDIS_TEST_URL" = "redis://127.0.0.1:6379/15"
-          test "$AGENT_TURN_REDIS_TEST_DISPOSABLE" = "true"
-          pnpm --filter @jobcopilot/worker exec vitest run --no-file-parallelism src/runtime/subagents/task-graph-deadline-pg.integration.test.ts
       - name: Verify disconnected Worker event replay through the authenticated SSE route
         if: ${{ !cancelled() }}
         env:
