@@ -10003,6 +10003,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
               expect(nodes.map(node => [node?.key, node?.status])).toEqual([["scout", "failed"], ["analyst", "cancelled"]])
+              expect(nodes.find(node => node?.key === "scout")?.executionFailureCategory).toBe("resume_state_unavailable")
+              const planTool = request.tools.map(record).find(tool => tool?.name === "agent.plan")
+              const planProperties = record(record(planTool?.inputSchema)?.properties)
+              expect(planProperties).toHaveProperty("replaceOperationalFailure")
               const outcome = repairWaitOutcomeFromRequest(request, initialWaitCallId, initialTaskIds)
               expect(outcome.status).toBe("ready")
               const waitTasks = new Map<string, unknown>()
