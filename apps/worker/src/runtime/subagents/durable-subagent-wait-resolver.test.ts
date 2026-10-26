@@ -12,7 +12,7 @@ const now = new Date("2026-10-22T10:00:00.000Z")
 
 type DispatchFixture = { id: string; topic: string; aggregateId: string; idempotencyKey: string; payload: Record<string, unknown>; attemptCount: number; publishedAt: Date | null }
 
-function fixture(input: { targetStatus?: string; deadline?: Date; targetParent?: string; rootOwnedWait?: boolean; includeRootOwnedWaitInCandidateScan?: boolean; batchSize?: number; dispatchRow?: DispatchFixture | null } = {}) {
+function fixture(input: { targetStatus?: string; deadline?: Date; targetParent?: string; rootOwnedWait?: boolean; includeRootOwnedWaitInCandidateScan?: boolean; batchSize?: number; dispatchRow?: DispatchFixture | null; deadlineCrossesDuringResume?: boolean } = {}) {
   const calls: { sql: string; params: unknown[] }[] = []
   const queryRowCounts = { candidateSessions: undefined as number | undefined, lockedWaits: undefined as number | undefined }
   const state = { waitStatus: "waiting", parentStatus: "waiting", matched: [] as string[], outbox: input.dispatchRow ? 1 : 0,
@@ -31,6 +31,10 @@ function fixture(input: { targetStatus?: string; deadline?: Date; targetParent?:
       if (sql === "ROLLBACK") { if (rollbackSnapshot) Object.assign(state, rollbackSnapshot); rollbackSnapshot = undefined; return { rows: [], rowCount: 1 } }
       if (sql === "COMMIT") { rollbackSnapshot = undefined; return { rows: [], rowCount: 1 } }
       if (sql.includes("set_config")) return { rows: [], rowCount: 1 }
+      if (sql.startsWith('SELECT 1 FROM "sub_agent_tasks"')) {
+        const live = !input.deadlineCrossesDuringResume
+        return { rows: live ? [{}] : [], rowCount: live ? 1 : 0 }
+      }
       if (sql.includes('SELECT session."id", session."userId"') && sql.includes('JOIN "sub_agent_tasks" AS parent')) {
         const excludesRootWait = input.rootOwnedWait && !input.includeRootOwnedWaitInCandidateScan
           && sql.includes('parent."parentTaskId" IS NOT NULL')
@@ -153,6 +157,20 @@ describe("reconcileDurableSubagentWaits", () => {
       payload: { taskId: "parent-1", sessionId: "session-1", rootTaskId: "root-1" },
     })
     expect(fake.state.dispatchRow?.payload.ownerId).toEqual(expect.any(String))
+  })
+
+  it("rolls back wait acknowledgement, parent requeue, and dispatch when its deadline crosses", async () => {
+    const fake = fixture({ deadlineCrossesDuringResume: true })
+    await expect(reconcileDurableSubagentWaits(fake.pool as never, { now })).rejects.toMatchObject({ code: "wait_scope_error" })
+
+    const waitUpdate = fake.calls.find(call => call.sql.includes('UPDATE "agent_wait_conditions"'))
+    const parentUpdate = fake.calls.find(call => call.sql.includes('UPDATE "sub_agent_tasks"'))
+    expect(waitUpdate?.sql).toContain('parent."absoluteDeadlineAt" IS NULL OR parent."absoluteDeadlineAt" > clock_timestamp()')
+    expect(parentUpdate?.sql).toContain('"absoluteDeadlineAt" IS NULL OR "absoluteDeadlineAt" > clock_timestamp()')
+    expect(fake.state).toMatchObject({ waitStatus: "waiting", parentStatus: "waiting", outbox: 0 })
+    expect(fake.calls.some(call => call.sql.includes('INSERT INTO "agent_outbox"'))).toBe(true)
+    expect(fake.calls.map(call => call.sql)).toContain("ROLLBACK")
+    expect(fake.calls.map(call => call.sql)).not.toContain("COMMIT")
   })
 
   it("leaves a nonterminal any/all wait parked until a child or timeout resolves it", async () => {

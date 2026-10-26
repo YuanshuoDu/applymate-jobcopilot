@@ -115,8 +115,9 @@ function database(graph: typeof loadedGate | ReturnType<typeof baseGraph>, allow
   return { query, calls, client: { query } }
 }
 function baseGraph() {
+  const rootSuccessCriteria: string[] = []
   return { rootTaskId: owner.rootTaskId, item: { id: "graph", revision: 7, content: {} },
-    snapshot: { schemaVersion: "agent-harness.v2.task-graph.v1", rootSuccessCriteria: [], nodes: nodes.slice(0, 3) },
+    snapshot: { schemaVersion: "agent-harness.v2.task-graph.v1", rootSuccessCriteria, nodes: nodes.slice(0, 3) },
     state: { revision: 7, appliedEvents: [] }, tasks: new Map([["prepare-task", preparedTask]]) }
 }
 

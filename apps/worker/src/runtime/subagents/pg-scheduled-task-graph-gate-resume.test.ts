@@ -4,6 +4,7 @@ import { resumeScheduledGateChoice } from "./pg-scheduled-task-graph-gate-resume
 import { scheduledGateCandidateSetDigest, scheduledGateProposal, SCHEDULED_GATE_OUTPUT_SCHEMA,
   SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
 import { taskGraphLifecycleKey } from "./task-graph-snapshot.js"
+import { transaction } from "./pg-store-persistence.js"
 
 const mocks = vi.hoisted(() => ({ load: vi.fn(), readCandidate: vi.fn(), match: vi.fn(), acknowledge: vi.fn(),
   prepare: vi.fn(), persist: vi.fn(), enqueue: vi.fn() }))
@@ -56,10 +57,26 @@ const preparedTransition = { scope: { userId: scope.userId, sessionId: scope.ses
     expectedRevision: 13, gateTaskId: "gate-task", requestAttemptCount: 1, resumedAttemptCount: 2,
   }] }, duplicate: false }
 
-function database(status: "waiting_for_user" | "queued" | "running" = "waiting_for_user", attemptCount = 1) {
+function database(status: "waiting_for_user" | "queued" | "running" = "waiting_for_user", attemptCount = 1,
+  options: { deadlineLive?: boolean; expireAfterChecks?: number } = {}) {
   const calls: Array<{ sql: string; values: unknown[] }> = []
+  const state = { acknowledged: false, requeued: false, enqueued: false }
+  let deadlineChecks = 0
+  let beforeTransaction: typeof state | null = null
   const query = vi.fn(async (sql: string, values: unknown[] = []) => {
     calls.push({ sql, values })
+    if (sql === "BEGIN") { beforeTransaction = { ...state }; return { rows: [], rowCount: 1 } }
+    if (sql === "COMMIT") return { rows: [], rowCount: 1 }
+    if (sql === "ROLLBACK") {
+      if (beforeTransaction) Object.assign(state, beforeTransaction)
+      return { rows: [], rowCount: 1 }
+    }
+    if (sql.startsWith('SELECT 1 FROM "sub_agent_tasks"')) {
+      deadlineChecks += 1
+      const live = options.expireAfterChecks === undefined
+        ? options.deadlineLive !== false : deadlineChecks <= options.expireAfterChecks
+      return { rows: live ? [{}] : [], rowCount: live ? 1 : 0 }
+    }
     if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: scope.sessionId, status: "active" }], rowCount: 1 }
     if (sql.includes('FROM "agent_turns"')) return { rows: [{ id: scope.turnId, status: "in_progress", leaseOwnerId: scope.turnLeaseOwner,
       leaseVersion: scope.turnLeaseVersion, leaseExpiresAt: new Date("2026-10-23T10:10:00Z"), leaseValid: true }], rowCount: 1 }
@@ -76,10 +93,10 @@ function database(status: "waiting_for_user" | "queued" | "running" = "waiting_f
     if (sql.includes('FROM "agent_items" AS item')) return { rows: [{ id: `agent-wait:question:${waitId}`, stepId: "question-step", taskId: scope.rootTaskId,
       type: "question", status: "completed", content: answeredContent, stepStatus: "waiting_for_user" }], rowCount: 1 }
     if (sql.includes('UPDATE "agent_steps"')) return { rows: [{ id: "question-step" }], rowCount: 1 }
-    if (sql.includes('UPDATE "sub_agent_tasks"')) return { rows: [{ id: "gate-task" }], rowCount: 1 }
+    if (sql.includes('UPDATE "sub_agent_tasks"')) { state.requeued = true; return { rows: [{ id: "gate-task" }], rowCount: 1 } }
     return { rows: [], rowCount: 0 }
   })
-  return { calls, client: { query } }
+  return { calls, client: { query, release: vi.fn() }, pool: { connect: vi.fn().mockResolvedValue({ query, release: vi.fn() }) }, state }
 }
 
 function resumeInput(requestAttemptCount = 1) {
@@ -143,5 +160,29 @@ describe("scheduled Gate answer resume command", () => {
     expect(mocks.acknowledge).not.toHaveBeenCalled()
     expect(mocks.prepare).not.toHaveBeenCalled()
     expect(db.calls.some(call => /^\s*UPDATE\b/i.test(call.sql))).toBe(false)
+  })
+
+  it("does not acknowledge an answer after the database-clock deadline", async () => {
+    const db = database("waiting_for_user", 1, { deadlineLive: false })
+    await expect(resumeScheduledGateChoice(db.client as never, resumeInput())).rejects.toMatchObject({ code: "scheduled_gate_resume_deadline" })
+    expect(mocks.acknowledge).not.toHaveBeenCalled()
+    expect(db.calls.some(call => call.sql.includes('"absoluteDeadlineAt" > clock_timestamp()'))).toBe(true)
+    expect(db.calls.some(call => call.sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
+  })
+
+  it("rolls back the answer acknowledgement and Gate requeue when the deadline crosses during resume", async () => {
+    const db = database("waiting_for_user", 1, { expireAfterChecks: 1 })
+    mocks.acknowledge.mockImplementationOnce(async () => {
+      db.state.acknowledged = true
+      return { kind: "weak_cover_letter", jobIds: ["job-1"], choiceId: "continue" }
+    })
+    mocks.enqueue.mockImplementationOnce(async () => { db.state.enqueued = true })
+
+    await expect(transaction(db.pool as never, client => resumeScheduledGateChoice(client, resumeInput())))
+      .rejects.toMatchObject({ code: "scheduled_gate_resume_deadline" })
+
+    expect(db.state).toEqual({ acknowledged: false, requeued: false, enqueued: false })
+    expect(db.calls.map(call => call.sql)).toContain("ROLLBACK")
+    expect(db.calls.map(call => call.sql)).not.toContain("COMMIT")
   })
 })

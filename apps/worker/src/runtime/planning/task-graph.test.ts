@@ -13,6 +13,7 @@ import {
   type TaskGraphValidationOptions,
 } from "./task-graph.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "./task-graph-verification.js"
+import { TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON } from "../subagents/task-graph-child-deadline.js"
 
 const options: TaskGraphValidationOptions = {
   registeredTemplateIds: new Set(["scout", "analyst", "writer"]), maxNodes: 8, maxDepth: 4,
@@ -61,6 +62,11 @@ function stateAtStatus(status: TaskGraphNodeStatus): TaskGraphState {
 }
 
 describe("TaskGraph planning kernel", () => {
+  it.each(["queued", "retrying", "waiting", "waiting_for_user"] as const)("accepts the internal deadline failure from %s only", status => {
+    const state = stateAtStatus(status)
+    expect(event(state, "task.failed", "a", `deadline-${status}`, { failureReason: TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON })).toMatchObject({ ok: true })
+    expect(event(state, "task.failed", "a", `worker-${status}`, { failureReason: "worker failed" })).toMatchObject({ ok: false, error: { code: "invalid_transition" } })
+  })
   it("rejects malformed exact-shape proposals and unregistered templates", () => {
     const state = createInitialTaskGraphState()
     expect(validateTaskGraphProposal({ expectedRevision: 0, nodes: [node("a")], extra: true }, state, options)).toMatchObject({ ok: false, error: { code: "invalid_shape" } })
