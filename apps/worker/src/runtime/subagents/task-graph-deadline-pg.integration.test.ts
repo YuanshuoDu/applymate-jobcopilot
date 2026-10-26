@@ -11,6 +11,7 @@ import { PgSubagentTaskStore } from "./pg-store.js"
 import { defaultSubagentPolicy } from "./types.js"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const ROLLBACK_TRIGGER = "task_graph_deadline_rollback_fixture"
@@ -144,6 +145,7 @@ async function seed(pool: Pool): Promise<{ fixture: Fixture; children: Record<st
       "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
     VALUES ($1, $2, $3, $4, 1, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
   [value.stepId, value.sessionId, value.turnId, value.rootTaskId])
+  const deadlineBefore = await pool.query<{ dbNow: Date }>(`SELECT clock_timestamp() AS "dbNow"`)
   const graph = await createPgTaskGraphCommandPort(pool).appendAndSchedule({
     scope: { userId: value.userId, sessionId: value.sessionId, turnId: value.turnId, rootTaskId: value.rootTaskId,
       parentTaskId: value.rootTaskId, stepId: value.stepId, turnLeaseOwner: lease.ownerId,
@@ -160,6 +162,15 @@ async function seed(pool: Pool): Promise<{ fixture: Fixture; children: Record<st
       } },
     ] }, templates: { analyst: { role: "analyst", taskType: "research", allowedActions: [] } },
   })
+  const deadlineAfter = await pool.query<{ dbNow: Date }>(`SELECT clock_timestamp() AS "dbNow"`)
+  const insertedDeadlines = await pool.query<{ id: string; absoluteDeadlineAt: Date }>(`SELECT "id", "absoluteDeadlineAt"
+    FROM "sub_agent_tasks" WHERE "id" = ANY($1::text[])`, [graph.nodes.map(node => node.taskId)])
+  expect(insertedDeadlines.rows).toHaveLength(graph.nodes.length)
+  const lifetimeMs = 60 * 60 * 1000
+  for (const row of insertedDeadlines.rows) {
+    expect(row.absoluteDeadlineAt.getTime()).toBeGreaterThanOrEqual(deadlineBefore.rows[0]!.dbNow.getTime() + lifetimeMs - 1)
+    expect(row.absoluteDeadlineAt.getTime()).toBeLessThanOrEqual(deadlineAfter.rows[0]!.dbNow.getTime() + lifetimeMs + 1)
+  }
   const ids = Object.fromEntries(graph.nodes.map(node => [node.key, node.taskId]))
   const tasks = new PgSubagentTaskStore(pool)
   const claim = async (key: string) => {
@@ -351,5 +362,112 @@ withServices("TaskGraph deadline recovery on disposable PostgreSQL and Redis", (
       await competitor.query("ROLLBACK").catch(() => undefined)
       competitor.release()
     }
+  })
+
+  it("preserves a pre-deadline durable interrupt during paused-session lease recovery", async () => {
+    const { fixture, children } = await seed(pool!)
+    const store = new PgSubagentTaskStore(pool!)
+    await pool!.query(`UPDATE "agent_sessions" SET "status" = 'paused' WHERE "id" = $1`, [fixture.sessionId])
+    await pool!.query(`UPDATE "sub_agent_tasks" SET "absoluteDeadlineAt" = clock_timestamp() + INTERVAL '1 hour'
+      WHERE "id" = ANY($1::text[])`, [[children.paused, children.running]])
+    const target = await pool!.query(`SELECT "path" FROM "sub_agent_tasks" WHERE "id" = $1`, [children.running])
+    const targetPath = target.rows[0]?.path
+    if (typeof targetPath !== "string") throw new Error("interrupt recovery fixture child path is missing")
+
+    const actionItemId = `deadline-interrupt-action-${fixture.suffix}`
+    const toolCallId = `deadline-interrupt-call-${fixture.suffix}`
+    const stepId = `deadline-child-step-running-${fixture.suffix}`
+    const actionContent = { toolCallId, toolName: "external_action", toolVersion: "1", input: { action: "preserve" } }
+    await pool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "content", "startedAt", "createdAt", "updatedAt")
+      VALUES ($1, $2, $3, $4, $5, 'tool_call', 'started', $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+    [actionItemId, fixture.sessionId, fixture.turnId, stepId, children.running, JSON.stringify(actionContent)])
+    const sequence = await pool!.query<{ nextSequence: string }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1
+      WHERE "id" = $1 RETURNING "eventSequence"::text AS "nextSequence"`, [fixture.sessionId])
+    if (!sequence.rows[0]?.nextSequence) throw new Error("interrupt fixture could not allocate event sequence")
+    const startedEventId = `deadline-interrupt-started-${fixture.suffix}`
+    const startedKey = `task:${children.running}:event:tool-started:${toolCallId}`
+    await pool!.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload")
+      VALUES ($1, $2, $3, $4, $5, $6, 'tool_call.started', 'subagent', $7, $8, $9::jsonb)`,
+    [startedEventId, fixture.sessionId, fixture.turnId, actionItemId, children.running, sequence.rows[0].nextSequence,
+      toolCallId, startedKey, JSON.stringify({ taskId: children.running, toolCallId, toolName: "external_action", toolVersion: "1" })])
+    const actionBefore = await pool!.query(`SELECT to_jsonb(item) AS "action" FROM "agent_items" AS item WHERE item."id" = $1`, [actionItemId])
+    const startedBefore = await pool!.query(`SELECT to_jsonb(event) AS "event" FROM "agent_events" AS event WHERE event."id" = $1`, [startedEventId])
+    const receiptBefore = await pool!.query(`SELECT to_jsonb(reference) AS "receipt" FROM "agent_tool_result_references" AS reference WHERE reference."id" = $1`, [children.receipt])
+    expect(actionBefore.rows).toHaveLength(1)
+    expect(actionBefore.rows).toMatchObject([{ action: { type: "tool_call", status: "started", content: actionContent } }])
+    expect(startedBefore.rows).toMatchObject([{ event: { type: "tool_call.started", actor: "subagent", itemId: actionItemId,
+      taskId: children.running, correlationId: toolCallId, idempotencyKey: startedKey } }])
+    expect(receiptBefore.rows).toHaveLength(1)
+
+    const requestedAt = new Date()
+    await expect(store.interruptSubtree({ sessionId: fixture.sessionId, rootTaskId: fixture.rootTaskId,
+      targetPath, now: requestedAt })).resolves.toBe(1)
+    const interrupted = await pool!.query(`SELECT task."status", task."interruptRequestedAt", task."absoluteDeadlineAt",
+        session."status" AS "sessionStatus"
+      FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+      WHERE task."id" = $1`, [children.running])
+    const marker = interrupted.rows[0]?.interruptRequestedAt
+    expect(interrupted.rows[0]).toMatchObject({ status: "running", sessionStatus: "paused" })
+    expect(marker).toBeTruthy()
+    expect(new Date(String(marker)).getTime()).toBeLessThan(new Date(String(interrupted.rows[0]?.absoluteDeadlineAt)).getTime())
+    const history = await pool!.query(`SELECT "id", "idempotencyKey", "actor", "payload" FROM "agent_events"
+      WHERE "sessionId" = $1 AND "taskId" = $2 AND "type" = 'task.interrupt.accepted'`, [fixture.sessionId, children.running])
+    expect(history.rows).toHaveLength(1)
+    expect(history.rows[0]).toMatchObject({ actor: "system", payload: { status: "accepted" } })
+
+    await pool!.query(`UPDATE "sub_agent_tasks" SET "absoluteDeadlineAt" = clock_timestamp() + INTERVAL '300 milliseconds',
+        "leaseExpiresAt" = clock_timestamp() + INTERVAL '300 milliseconds' WHERE "id" = $1`, [children.running])
+    await poll(async () => {
+      const elapsed = await pool!.query(`SELECT "absoluteDeadlineAt" <= clock_timestamp() AS "deadlinePassed",
+          "leaseExpiresAt" <= clock_timestamp() AS "leasePassed" FROM "sub_agent_tasks" WHERE "id" = $1`, [children.running])
+      const row = elapsed.rows[0]
+      return row?.deadlinePassed && row?.leasePassed ? row : null
+    }, "interrupted child deadline and lease did not expire")
+
+    await expect(store.finish({ taskId: children.running, sessionId: fixture.sessionId, ownerId: children.staleOwner,
+      attemptCount: Number(children.staleAttempt), status: "completed", result: { finalText: "late finish" }, now: new Date() }))
+      .resolves.toBeNull()
+    const recovered = await new AgentTreeManager(store).recover(10)
+    expect(recovered.rows.filter(row => row.id === children.running)).toMatchObject([{ status: "interrupted" }])
+    const terminal = await pool!.query(`SELECT "status", "interruptRequestedAt", "failureReason" FROM "sub_agent_tasks" WHERE "id" = $1`, [children.running])
+    expect(terminal.rows[0]).toMatchObject({ status: "interrupted" })
+    expect(String(terminal.rows[0]?.interruptRequestedAt)).toBe(String(marker))
+    expect(terminal.rows[0]?.failureReason).not.toBe("task_graph_child_deadline_exceeded")
+    const historyAfter = await pool!.query(`SELECT "id", "idempotencyKey", "actor", "payload" FROM "agent_events"
+      WHERE "sessionId" = $1 AND "taskId" = $2 AND "type" = 'task.interrupt.accepted'`, [fixture.sessionId, children.running])
+    expect(historyAfter.rows).toEqual(history.rows)
+    const actionAfter = await pool!.query(`SELECT to_jsonb(item) AS "action" FROM "agent_items" AS item WHERE item."id" = $1`, [actionItemId])
+    const startedAfter = await pool!.query(`SELECT to_jsonb(event) AS "event" FROM "agent_events" AS event WHERE event."id" = $1`, [startedEventId])
+    const receiptAfter = await pool!.query(`SELECT to_jsonb(reference) AS "receipt" FROM "agent_tool_result_references" AS reference WHERE reference."id" = $1`, [children.receipt])
+    expect(actionAfter.rows).toEqual(actionBefore.rows)
+    expect(startedAfter.rows).toEqual(startedBefore.rows)
+    expect(receiptAfter.rows).toEqual(receiptBefore.rows)
+    const deadlineFailures = await pool!.query(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "taskId" = $2
+      AND "type" = 'task.failed' AND "payload"->'event'->>'failureReason' = 'task_graph_child_deadline_exceeded'`,
+    [fixture.sessionId, children.running])
+    expect(deadlineFailures.rows).toEqual([])
+    const lifecycleKey = taskGraphLifecycleKey(fixture.rootTaskId, "running", Number(children.staleAttempt), "task.interrupted")
+    const lifecycle = await pool!.query(`SELECT "id", "type", "actor", "idempotencyKey", "payload" FROM "agent_events"
+      WHERE "sessionId" = $1 AND "idempotencyKey" = $2`, [fixture.sessionId, lifecycleKey])
+    expect(lifecycle.rows).toMatchObject([{ type: "item.delta", actor: "system", idempotencyKey: lifecycleKey,
+      payload: { kind: "lifecycle", event: { type: "task.interrupted", nodeKey: "running" } } }])
+    const lifecycleOutbox = await pool!.query(`SELECT "idempotencyKey", "payload" FROM "agent_outbox"
+      WHERE "topic" = 'agent.session.event' AND "idempotencyKey" = $1`, [`agent-event:${lifecycle.rows[0]?.id}`])
+    expect(lifecycleOutbox.rows).toHaveLength(1)
+
+    const replay = await new AgentTreeManager(store).recover(10)
+    expect(replay.rows).toEqual([])
+    const lifecycleAfterReplay = await pool!.query(`SELECT "id", "type", "actor", "idempotencyKey", "payload" FROM "agent_events"
+      WHERE "sessionId" = $1 AND "idempotencyKey" = $2`, [fixture.sessionId, lifecycleKey])
+    const outboxAfterReplay = await pool!.query(`SELECT "idempotencyKey", "payload" FROM "agent_outbox"
+      WHERE "topic" = 'agent.session.event' AND "idempotencyKey" = $1`, [`agent-event:${lifecycle.rows[0]?.id}`])
+    const actionAfterReplay = await pool!.query(`SELECT to_jsonb(item) AS "action" FROM "agent_items" AS item WHERE item."id" = $1`, [actionItemId])
+    const startedAfterReplay = await pool!.query(`SELECT to_jsonb(event) AS "event" FROM "agent_events" AS event WHERE event."id" = $1`, [startedEventId])
+    const receiptAfterReplay = await pool!.query(`SELECT to_jsonb(reference) AS "receipt" FROM "agent_tool_result_references" AS reference WHERE reference."id" = $1`, [children.receipt])
+    expect(lifecycleAfterReplay.rows).toEqual(lifecycle.rows)
+    expect(outboxAfterReplay.rows).toEqual(lifecycleOutbox.rows)
+    expect(actionAfterReplay.rows).toEqual(actionBefore.rows)
+    expect(startedAfterReplay.rows).toEqual(startedBefore.rows)
+    expect(receiptAfterReplay.rows).toEqual(receiptBefore.rows)
   })
 })

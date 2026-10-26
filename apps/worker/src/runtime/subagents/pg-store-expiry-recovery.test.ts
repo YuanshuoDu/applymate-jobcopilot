@@ -1,13 +1,15 @@
 import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
-const graphMocks = vi.hoisted(() => ({ prepare: vi.fn(), persist: vi.fn() }))
+const graphMocks = vi.hoisted(() => ({ prepare: vi.fn(), persist: vi.fn(), reconcile: vi.fn() }))
 vi.mock("./task-graph-pg-lifecycle.js", async importOriginal => ({
   ...await importOriginal<typeof import("./task-graph-pg-lifecycle.js")>(),
   prepareGraphTransition: graphMocks.prepare,
   persistGraphTransition: graphMocks.persist,
+  reconcileGraphDependents: graphMocks.reconcile,
 }))
 import { recoverExpired } from "./pg-store-expiry-recovery.js"
 import type { PgSubagentPool } from "./types.js"
+import { taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 
 const checkedAt = new Date("2026-10-06T10:00:00Z")
 type CandidateRow = Readonly<{ id: string; sessionId: string; rootTaskId: string | null; turnId: string | null; userId: string;
@@ -19,7 +21,7 @@ type FixtureOptions = { pendingCall?: boolean; candidate?: boolean; childWaitRes
   unconsumedNoContinuation?: boolean; pendingModelStart?: "exact" | "wrong-correlation" | "wrong-actor" | "wrong-item" | "wrong-key" | "wrong-payload";
   pendingToolStart?: boolean; waitCallStatus?: string; candidatePages?: readonly (readonly CandidateRow[])[]; blockedCandidateIds?: readonly string[];
   missingSessionCandidateIds?: readonly string[]; missingPreviewCandidateIds?: readonly string[]; throwCandidateIds?: readonly string[];
-  waitStepStatus?: "streaming" | "waiting_for_tool" }
+  waitStepStatus?: "streaming" | "waiting_for_tool"; interruptRequested?: boolean; rootInterrupted?: boolean; deadlineExpired?: boolean }
 function scanCandidate(id: string, sessionId = "session-1", rootTaskId: string | null = "root-1", turnId: string | null = "turn-1"): CandidateRow {
   return { id, sessionId, rootTaskId, turnId, userId: "user-1", cursorRootIsNull: rootTaskId === null, cursorRootKey: rootTaskId ?? "" }
 }
@@ -28,7 +30,10 @@ function fixture(options: FixtureOptions = {}) {
   const task = { id: options.child ? "child-1" : "task-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1" as string | null, rootTaskId: (options.child ? "root-1" : "task-1") as string | null, parentTaskId: options.child ? "root-1" : null,
     path: "/task-1", depth: 0, role: "scout", taskType: "scout", status: "running", goal: "inspect", constraints: [], successCriteria: [],
     allowedActions: [], context: {}, expectedOutputSchema: {}, result: null, failureReason: null, attemptCount: options.attemptCount ?? 1, maxAttempts: options.maxAttempts ?? 3,
-    leaseOwner: "worker-1" as string | null, leaseExpiresAt: new Date(checkedAt.getTime() - 1_000) as Date | null, nextAttemptAt: null as Date | null, interruptRequestedAt: null,
+    leaseOwner: "worker-1" as string | null, leaseExpiresAt: new Date(checkedAt.getTime() - 1_000) as Date | null, nextAttemptAt: null as Date | null,
+    absoluteDeadlineAt: options.deadlineExpired ? new Date(checkedAt.getTime() - 1_000) : new Date(checkedAt.getTime() + 60_000),
+    leaseSegmentStartedAt: new Date(checkedAt.getTime() - 10_000) as Date | null,
+    interruptRequestedAt: options.interruptRequested ? new Date(checkedAt.getTime() - 2_000) : null as Date | null,
     budgetSnapshot: {}, toolPolicySnapshot: {} }
   const outbox = { id: "dispatch-1", topic: "agent.subagent.dispatch", aggregateId: task.sessionId,
     idempotencyKey: `subagent-dispatch:${task.id}`, payload: { taskId: task.id, sessionId: task.sessionId,
@@ -81,10 +86,10 @@ function fixture(options: FixtureOptions = {}) {
     if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")) return { rows: [{ id: task.turnId }], rowCount: 1 }
     if (sql.includes('session."status" AS "sessionStatus"')) {
       if (options.missingPreviewCandidateIds?.includes(String(_values?.[0]))) return { rows: [], rowCount: 0 }
-      return { rows: [{ ...task, sessionStatus: "running", rootStatus: "running", rootInterruptRequestedAt: null,
+      return { rows: [{ ...task, sessionStatus: "running", rootStatus: "running", rootInterruptRequestedAt: options.rootInterrupted ? checkedAt : null,
       childWaitResumable: options.childWaitResumable ?? false, childWaitContinuationId: options.continuationWait ? "continuation-1" : null }], rowCount: 1 }
     }
-    if (sql.startsWith('SELECT task.*') && sql.includes("FOR UPDATE OF task")) return { rows: [{ ...task, sessionStatus: "running", rootStatus: "running", rootInterruptRequestedAt: null,
+    if (sql.startsWith('SELECT task.*') && sql.includes("FOR UPDATE OF task")) return { rows: [{ ...task, sessionStatus: "running", rootStatus: "running", rootInterruptRequestedAt: options.rootInterrupted ? checkedAt : null,
       childWaitResumable: options.childWaitResumable ?? false, childWaitContinuationId: options.continuationWait ? "continuation-1" : null }], rowCount: 1 }
     if (sql.includes('SELECT task."id", task."parentTaskId"') && sql.includes("FOR UPDATE OF task")) return options.recoveryLeaseLost
       ? { rows: [], rowCount: 0 } : { rows: [{ ...task, turnStatus: "in_progress", rootStatus: "running" }], rowCount: 1 }
@@ -143,6 +148,7 @@ function fixture(options: FixtureOptions = {}) {
     if (sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes("FOR UPDATE")) return { rows: [outbox], rowCount: 1 }
     if (sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3')) {
       task.status = String(_values?.[2]); task.leaseOwner = null; task.leaseExpiresAt = null; task.nextAttemptAt = _values?.[3] as Date | null
+      if (sql.includes('"leaseSegmentStartedAt" = CASE WHEN $6 THEN NULL')) task.leaseSegmentStartedAt = null
       return { rows: [], rowCount: 1 }
     }
     if (sql.startsWith('UPDATE "agent_outbox" SET "payload"')) {
@@ -155,6 +161,15 @@ function fixture(options: FixtureOptions = {}) {
     return { rows: [], rowCount: 1 }
   }), release: vi.fn() }
   return { pool: { connect: vi.fn().mockResolvedValue(client) } as unknown as Pick<pg.Pool, "connect">, calls, candidatePageCalls, client, task, outbox, wait }
+}
+
+function interruptedGraph(sessionId = "session-1", duplicate = false) {
+  return { taskId: "child-1", duplicate, itemId: "graph-item", expectedRevision: 4,
+    scope: { userId: "user-1", sessionId, turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" },
+    snapshot: { nodes: [{ taskId: "child-1", key: "current-child" }] },
+    event: { type: "task.interrupted", nodeKey: "current-child", expectedRevision: 4,
+      idempotencyKey: taskGraphLifecycleKey("root-1", "current-child", 1, "task.interrupted") },
+    state: { revision: 5 } }
 }
 
 describe("expired subagent recovery fence", () => {
@@ -183,6 +198,47 @@ describe("expired subagent recovery fence", () => {
     await expect(recoverExpired(fake.pool as PgSubagentPool, { now: checkedAt, limit: 10 })).resolves.toEqual([])
     expect(fake.calls.some(sql => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
     expect(fake.calls.at(-1)).toBe("COMMIT")
+  })
+
+  it.each(["child", "root"] as const)("terminalizes only a current expired Graph child with an accepted %s interrupt despite unmatched action evidence", async marker => {
+    graphMocks.prepare.mockReturnValueOnce(interruptedGraph())
+    graphMocks.reconcile.mockResolvedValueOnce(undefined)
+    const fake = fixture({ child: true, pendingToolStart: true, deadlineExpired: true,
+      ...(marker === "child" ? { interruptRequested: true } : { rootInterrupted: true }) })
+    await expect(recoverExpired(fake.pool as PgSubagentPool, { now: checkedAt, limit: 10 })).resolves.toMatchObject([
+      { id: "child-1", status: "interrupted", nextAttemptAt: null, leaseOwner: null, leaseExpiresAt: null, leaseSegmentStartedAt: null },
+    ])
+    expect(fake.task).toMatchObject({ status: "interrupted", leaseOwner: null, leaseExpiresAt: null, leaseSegmentStartedAt: null })
+    const graphTransition = graphMocks.prepare.mock.calls.at(-1)?.[1]
+    expect(graphTransition).toMatchObject({ taskId: "child-1", sessionId: "session-1", type: "task.interrupted", attemptCount: 1 })
+    const externalCheck = fake.calls.find(sql => sql.includes('FROM "agent_events" AS started'))
+    expect(externalCheck).toBeDefined()
+    const update = fake.client.query.mock.calls.find(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))
+    expect(update?.[1]?.[2]).toBe("interrupted")
+    expect(update?.[0]).toContain('"leaseSegmentStartedAt" = CASE WHEN $6 THEN NULL')
+    expect(fake.client.query.mock.calls.some(([sql]) => sql.startsWith('UPDATE "agent_outbox" SET "payload"'))).toBe(false)
+  })
+
+  it.each([
+    { label: "no accepted interrupt marker", options: { deadlineExpired: true } },
+    { label: "an interrupt before its deadline", options: { interruptRequested: true, deadlineExpired: false } },
+  ])("keeps unmatched action evidence blocking with $label", async ({ options }) => {
+    const fake = fixture({ child: true, pendingToolStart: true, ...options })
+    await expect(recoverExpired(fake.pool as PgSubagentPool, { now: checkedAt, limit: 10 })).resolves.toEqual([])
+    expect(fake.task.status).toBe("running")
+    expect(fake.client.query.mock.calls.some(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))).toBe(false)
+  })
+
+  it.each([
+    { label: "missing", transition: null },
+    { label: "foreign-owned", transition: interruptedGraph("other-session") },
+    { label: "already duplicated", transition: interruptedGraph("session-1", true) },
+  ])("does not bypass an unmatched action when the current Graph transition is $label", async ({ transition }) => {
+    graphMocks.prepare.mockReturnValueOnce(transition)
+    const fake = fixture({ child: true, pendingToolStart: true, interruptRequested: true, deadlineExpired: true })
+    await expect(recoverExpired(fake.pool as PgSubagentPool, { now: checkedAt, limit: 10 })).resolves.toEqual([])
+    expect(fake.task.status).toBe("running")
+    expect(fake.client.query.mock.calls.some(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))).toBe(false)
   })
 
   it("pages past a safely blocked candidate, preserves filters, and caps successful recoveries", async () => {

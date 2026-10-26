@@ -153,6 +153,74 @@ describe("scheduled Gate answer resume command", () => {
     expect(dbWithAck.calls.some(call => /^\s*UPDATE\b/i.test(call.sql))).toBe(false)
   })
 
+  it("reads back an exact prior acknowledgement after deadline without authorizing new work", async () => {
+    const replayGraph = { ...waitingGraph, state: { ...preparedTransition.state, revision: 14,
+      nodes: [...prefix.map(node => ({ ...node, status: "completed" })), {
+        key: "gate", taskId: "gate-task", status: "queued",
+      }] },
+      snapshot: { ...waitingGraph.snapshot, nodes: [...prefix, { ...gateNode, status: "queued", readiness: "ready" }] } }
+    mocks.load.mockResolvedValue(replayGraph)
+    mocks.match.mockResolvedValue("pending")
+    mocks.acknowledge.mockResolvedValue({ kind: "weak_cover_letter", jobIds: ["job-1"], choiceId: "continue" })
+    const expiredDb = database("queued", 1, { deadlineLive: false })
+
+    await expect(resumeScheduledGateChoice(expiredDb.client as never, resumeInput()))
+      .resolves.toMatchObject({ status: "duplicate", readyTaskIds: ["gate-task"] })
+
+    expect(mocks.acknowledge).toHaveBeenCalledOnce()
+    expect(mocks.prepare).not.toHaveBeenCalled()
+    expect(mocks.persist).not.toHaveBeenCalled()
+    expect(mocks.enqueue).not.toHaveBeenCalled()
+    expect(expiredDb.calls.some(call => /^\s*UPDATE\b/i.test(call.sql))).toBe(false)
+    expect(expiredDb.calls.some(call => call.sql.startsWith('SELECT 1 FROM "sub_agent_tasks"'))).toBe(false)
+  })
+
+  it("reads back an expired Gate acknowledgement while its resumed attempt is running", async () => {
+    const startedNextAttempt = { type: "task.started", nodeKey: "gate",
+      idempotencyKey: taskGraphLifecycleKey(scope.rootTaskId, "gate", 2, "task.started"), expectedRevision: 14 }
+    const runningGraph = { ...waitingGraph, state: { ...preparedTransition.state, revision: 15,
+      appliedEvents: [...preparedTransition.state.appliedEvents, startedNextAttempt],
+      nodes: [...prefix.map(node => ({ ...node, status: "completed" })), {
+        key: "gate", taskId: "gate-task", status: "running",
+      }] },
+      snapshot: { ...waitingGraph.snapshot, nodes: [...prefix, { ...gateNode, status: "running", readiness: "ready" }] } }
+    mocks.load.mockResolvedValue(runningGraph)
+    mocks.match.mockResolvedValue("pending")
+    mocks.acknowledge.mockResolvedValue({ kind: "weak_cover_letter", jobIds: ["job-1"], choiceId: "continue" })
+    const expiredDb = database("running", 2, { deadlineLive: false })
+
+    await expect(resumeScheduledGateChoice(expiredDb.client as never, resumeInput()))
+      .resolves.toMatchObject({ status: "duplicate", readyTaskIds: ["gate-task"] })
+
+    expect(mocks.acknowledge).toHaveBeenCalledOnce()
+    expect(mocks.prepare).not.toHaveBeenCalled()
+    expect(mocks.persist).not.toHaveBeenCalled()
+    expect(mocks.enqueue).not.toHaveBeenCalled()
+    expect(expiredDb.calls.some(call => /^\s*UPDATE\b/i.test(call.sql))).toBe(false)
+    expect(expiredDb.calls.some(call => call.sql.startsWith('SELECT 1 FROM "sub_agent_tasks"'))).toBe(false)
+  })
+
+  it.each([
+    ["missing", null],
+    ["foreign", { kind: "weak_cover_letter", jobIds: ["job-1"], choiceId: "skip" }],
+  ] as const)("rejects a %s prior acknowledgement for an already queued Gate", async (_kind, acknowledgement) => {
+    const replayGraph = { ...waitingGraph, state: { ...preparedTransition.state, revision: 14,
+      nodes: [...prefix.map(node => ({ ...node, status: "completed" })), {
+        key: "gate", taskId: "gate-task", status: "queued",
+      }] },
+      snapshot: { ...waitingGraph.snapshot, nodes: [...prefix, { ...gateNode, status: "queued", readiness: "ready" }] } }
+    mocks.load.mockResolvedValue(replayGraph)
+    mocks.match.mockResolvedValue("pending")
+    mocks.acknowledge.mockResolvedValue(acknowledgement as never)
+    const db = database("queued", 1, { deadlineLive: false })
+
+    await expect(resumeScheduledGateChoice(db.client as never, resumeInput())).rejects.toMatchObject({ code: "scheduled_gate_resume_stale_resume" })
+    expect(mocks.prepare).not.toHaveBeenCalled()
+    expect(mocks.persist).not.toHaveBeenCalled()
+    expect(mocks.enqueue).not.toHaveBeenCalled()
+    expect(db.calls.some(call => /^\s*UPDATE\b/i.test(call.sql))).toBe(false)
+  })
+
   it("rejects a stale or mismatched question before acknowledging or changing lifecycle state", async () => {
     const db = database()
     mocks.readCandidate.mockResolvedValue({ question, binding: { ...binding, gateAttempt: 2 } })

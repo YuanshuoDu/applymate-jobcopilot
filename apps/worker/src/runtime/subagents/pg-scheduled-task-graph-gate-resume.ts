@@ -42,7 +42,6 @@ export async function resumeScheduledGateChoice(client: Queryable,
   const graph = await loadTaskGraph(client, GATE_GRAPH_SCOPE(scope), true)
   if (!fixedGate(gate, scope, gateTaskId) || !sameGraphGate(graph, gateTaskId, gate.status)
     || Number(gate.maxAttempts) < 1 || !Number.isSafeInteger(Number(gate.attemptCount))) throw invalid("graph")
-  if (!await taskGraphDeadlineLive(client, gateTaskId, scope.sessionId)) throw invalid("deadline")
   const rowBinding = await readQuestion(client, scope, gateTaskId, waitId)
   const binding = rowBinding?.binding
   if (!rowBinding || !binding || binding.gateAttempt !== requestAttemptCount || binding.gateTaskId !== gateTaskId
@@ -54,6 +53,7 @@ export async function resumeScheduledGateChoice(client: Queryable,
       requestAttemptCount: requestAttemptCount - 1 })
     if (!candidate || !sameCandidate(candidate, rowBinding, gate.result)) throw invalid("question")
     if (rowBinding.stepStatus !== "waiting_for_user") throw invalid("question_step")
+    if (!await taskGraphDeadlineLive(client, gateTaskId, scope.sessionId)) throw invalid("deadline")
     const owner = executionOwner(scope, turn)
     const choice = await acknowledgeScheduledGateChoiceResume(client as Parameters<typeof acknowledgeScheduledGateChoiceResume>[0], {
       owner, binding, gateTaskId, requestAttemptCount, waitId, itemId: rowBinding.id,
@@ -86,10 +86,10 @@ export async function resumeScheduledGateChoice(client: Queryable,
     owner: executionOwner(scope, turn), binding, gateTaskId, requestAttemptCount, waitId, itemId: rowBinding.id,
     resumedAttemptCount: requestAttemptCount + 1, now,
   })
-  if (!acknowledgement || !scheduledGateAttemptLineageMatches({ rootTaskId: scope.rootTaskId, gateTaskId,
+  if (!acknowledgement || acknowledgement.kind !== binding.kind || !same(acknowledgement.jobIds, binding.jobIds)
+    || acknowledgement.choiceId !== rowBinding.state.answer || !scheduledGateAttemptLineageMatches({ rootTaskId: scope.rootTaskId, gateTaskId,
     maxAttempts: Number(gate.maxAttempts), requestAttemptCount, currentAttemptCount: Number(gate.attemptCount),
     currentStatus: String(gate.status), events: graph.state!.appliedEvents })) throw invalid("stale_resume")
-  if (!await taskGraphDeadlineLive(client, gateTaskId, scope.sessionId)) throw invalid("deadline")
   return { status: "duplicate", taskId: gateTaskId, requestAttemptCount, resumedAttemptCount: requestAttemptCount + 1,
     revision: graph.state!.revision, readyTaskIds: [gateTaskId] }
 }
