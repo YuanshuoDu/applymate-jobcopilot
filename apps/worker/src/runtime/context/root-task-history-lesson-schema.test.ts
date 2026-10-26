@@ -161,4 +161,44 @@ describe("historical execution failure category lessons", () => {
     expect(filterRootTaskHistoryLessonsForEmittedNodes([categoryLesson], [1], [])).toEqual([undefined])
     expect(filterRootTaskHistoryLessonsForEmittedNodes([categoryLesson], [], [1])).toEqual([undefined])
   })
+
+  it("parses only a closed failed-repair ordinal link on a failed lesson", () => {
+    const lesson = { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 3,
+      criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" }],
+      failedRepairOf: { targetNodeOrdinal: 2, targetCriterionOrdinals: [1, 3], outcome: "verified_failed" } } as const
+    expect(parseRootTaskHistoryNodeLesson(lesson, "analyst", "failed")).toEqual(lesson)
+    expect(parseRootTaskHistoryNodeLesson(lesson, "analyst", "completed")).toBeUndefined()
+    expect(parseRootTaskHistoryNodeLesson({ ...lesson, criterionFailures: [] }, "analyst", "failed")).toBeUndefined()
+    for (const failedRepairOf of [
+      { ...lesson.failedRepairOf, outcome: "passed" },
+      { ...lesson.failedRepairOf, targetNodeOrdinal: lesson.nodeOrdinal },
+      { ...lesson.failedRepairOf, targetNodeOrdinal: 4 },
+      { ...lesson.failedRepairOf, targetCriterionOrdinals: [] },
+      { ...lesson.failedRepairOf, targetCriterionOrdinals: [1, 1] },
+      { ...lesson.failedRepairOf, targetCriterionOrdinals: [3, 1] },
+      { ...lesson.failedRepairOf, targetCriterionOrdinals: [1, 9] },
+      { ...lesson.failedRepairOf, privateCriterionId: "secret" },
+    ]) expect(parseRootTaskHistoryNodeLesson({ ...lesson, failedRepairOf }, "analyst", "failed")).toBeUndefined()
+  })
+
+  it("drops failed-repair links when their target lesson or any failed criterion is pruned", () => {
+    const base = { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true }
+    const target = parseRootTaskHistoryNodeLesson({ ...base, nodeOrdinal: 1, criterionFailures: [
+      { criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" },
+      { criterionOrdinal: 3, status: "failed", reasonCode: "criterion_not_met" },
+    ] })!
+    const repair = parseRootTaskHistoryNodeLesson({ ...base, nodeOrdinal: 2,
+      criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" }],
+      failedRepairOf: { targetNodeOrdinal: 1, targetCriterionOrdinals: [1, 3], outcome: "verified_failed" } }, "analyst", "failed")!
+    expect(filterRootTaskHistoryLessonsForEmittedNodes([target, repair], [1, 2], [1, 2])[1]?.failedRepairOf).toEqual(repair.failedRepairOf)
+    expect(filterRootTaskHistoryLessonsForEmittedNodes([target, repair], [2], [1, 2])[1]?.failedRepairOf).toBeUndefined()
+    const missingCriterion = parseRootTaskHistoryNodeLesson({ ...base, nodeOrdinal: 1,
+      criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" }] })!
+    expect(filterRootTaskHistoryLessonsForEmittedNodes([missingCriterion, repair], [1, 2], [1, 2])[1]?.failedRepairOf).toBeUndefined()
+    const unverifiedTarget = parseRootTaskHistoryNodeLesson({ ...base, nodeOrdinal: 1, criterionFailures: [
+      { criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" },
+      { criterionOrdinal: 3, status: "unverified", reasonCode: "criterion_not_met" },
+    ] })!
+    expect(filterRootTaskHistoryLessonsForEmittedNodes([unverifiedTarget, repair], [1, 2], [1, 2])[1]?.failedRepairOf).toBeUndefined()
+  })
 })

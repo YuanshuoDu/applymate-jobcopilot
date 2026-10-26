@@ -182,6 +182,38 @@ describe("root task history projection", () => {
       .toEqual(projectRootTaskHistory([foreign], true)?.content)
   })
 
+  it("keeps only ordinal failed-repair lineage across sessions and prunes it when target evidence is absent", () => {
+    const target = node({ key: "private-target-key", taskId: "private-target-task" })
+    const repair = node({ key: "private-repair-key", taskId: "private-repair-task" })
+    const targetLesson = { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 1,
+      criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met",
+        check: { role: "scout", kind: "candidate_count_gte", minimum: 2 } }] } as const
+    const repairLesson = { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 2,
+      criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met",
+        check: { role: "scout", kind: "candidate_count_gte", minimum: 3 } }],
+      failedRepairOf: { targetNodeOrdinal: 1, targetCriterionOrdinals: [1], outcome: "verified_failed" } } as const
+    const source = outcome("failed-repair-history", 40n, [target, repair])
+    const foreign = { ...source, terminalAt: new Date("2026-10-07T11:00:00.000Z"), sourceSessionDiffers: true,
+      sourceNodeOrdinals: [1, 2], nodeLessons: [targetLesson, repairLesson] as const }
+    const projected = projectRootTaskHistory([foreign], true)
+    expect(projected?.content).toMatchObject({ historical: true, turns: [{ nodes: expect.arrayContaining([
+      expect.objectContaining({ taskKind: "scout", status: "failed", lesson: expect.objectContaining({ nodeOrdinal: 2, failedRepairOf: {
+        targetNodeOrdinal: 1, targetCriterionOrdinals: [1], outcome: "verified_failed" } }) }),
+    ]) }] })
+    const serialized = JSON.stringify(projected)
+    for (const privateValue of ["private-target-key", "private-target-task", "private-repair-key", "private-repair-task", "criterion-a", "evidenceDigest"]) {
+      expect(serialized).not.toContain(privateValue)
+    }
+    expect(serialized).not.toContain('"check"')
+
+    const missingTargetFailure = { ...foreign, sourceTurnId: "turn-missing-failure", sourceRootTaskId: "root-missing-failure",
+      nodeLessons: [{ ...targetLesson, criterionFailures: [{ ...targetLesson.criterionFailures[0], criterionOrdinal: 2 }] }, repairLesson] as const }
+    const pruned = projectRootTaskHistory([missingTargetFailure], true)
+    const prunedRepair = (pruned?.content as { turns?: Array<{ nodes: Array<{ taskKind: string; lesson?: Record<string, unknown> }> }> } | undefined)
+      ?.turns?.[0]?.nodes.find(item => item.taskKind === "scout" && item.lesson?.nodeOrdinal === 2)
+    expect(prunedRepair?.lesson).not.toHaveProperty("failedRepairOf")
+  })
+
   it("rejects changing locality accessors before they can leak historical private fields", () => {
     const resultProjection = { schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted",
       availability: "available", role: "scout", status: "partial", candidateCount: 1, evidenceCount: 1,

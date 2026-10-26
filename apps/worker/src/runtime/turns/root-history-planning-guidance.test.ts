@@ -89,6 +89,43 @@ describe("root history planning guidance", () => {
     expect(text).not.toContain("step-current")
   })
 
+  it("adds one fixed current-evidence cue only for a validated failed repair link", () => {
+    const targetLesson = { ...lesson, nodeOrdinal: 2, criterionFailures: [
+      { criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" },
+      { criterionOrdinal: 2, status: "failed", reasonCode: "criterion_not_met" },
+    ] }
+    const repairLesson = { ...lesson, nodeOrdinal: 4, failedRepairOf: {
+      targetNodeOrdinal: 2, targetCriterionOrdinals: [1, 2], outcome: "verified_failed" as const,
+    } }
+    const content = { ...defaultHistoryContent(), turns: [{ label: "earlier terminal attempt", nodes: [
+      { taskKind: "analyst", status: "failed", lesson: targetLesson },
+      { taskKind: "analyst", status: "failed", lesson: repairLesson },
+    ] }] }
+    const cue = "A historical repair was verifier-failed; reassess the current graph, verifier evidence, and current result pages before planning."
+    const text = textOf(buildRootHistoryPlanningInstruction(context([historyBlock(content)]), [{ name: "agent.plan" }]))
+
+    expect(text.split(cue)).toHaveLength(2)
+    expect(text).not.toContain("failedRepairOf")
+    expect(text).not.toContain("targetNodeOrdinal")
+    expect(text).not.toContain("targetCriterionOrdinals")
+    expect(text).not.toContain("verified_failed")
+    expect(text).not.toContain("criterion_not_met")
+    expect(text).not.toContain("finding_count_gte")
+  })
+
+  it("keeps legacy history free of the failed-repair cue and rejects malformed links", () => {
+    const cue = "A historical repair was verifier-failed; reassess the current graph, verifier evidence, and current result pages before planning."
+    const legacyText = textOf(buildRootHistoryPlanningInstruction(context(), [{ name: "agent.plan" }]))
+    expect(legacyText).not.toContain(cue)
+
+    const malformedContent = { ...defaultHistoryContent(), turns: [{ label: "earlier terminal attempt", nodes: [
+      { taskKind: "analyst", status: "failed", lesson: { ...lesson, failedRepairOf: {
+        targetNodeOrdinal: 2, targetCriterionOrdinals: [1], outcome: "verified_failed",
+      } } },
+    ] }] }
+    expect(buildRootHistoryPlanningInstruction(context([historyBlock(malformedContent)]), [{ name: "agent.plan" }])).toBeNull()
+  })
+
   it("activates fixed advisory guidance from a valid complete plan shape without lessons or counts", () => {
     const content = { ...defaultHistoryContent(), turns: [{ label: "earlier terminal attempt", nodes: [
       { taskKind: "scout", status: "completed" }, { taskKind: "analyst", status: "failed" },
