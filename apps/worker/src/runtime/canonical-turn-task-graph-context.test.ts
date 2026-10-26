@@ -105,6 +105,21 @@ function structuredOutputFailureNode(category: unknown): Record<string, unknown>
   }
 }
 
+function resumeFailureNode(templateId: "scout" | "analyst", failureReason: string): Record<string, unknown> {
+  const criterionId = templateId === "scout" ? "candidate-count" : "finding-count"
+  const check = templateId === "scout"
+    ? { kind: "candidate_count_gte", minimum: 1 }
+    : { kind: "finding_count_gte", minimum: 1 }
+  return {
+    ...ordinaryFailedNode(), key: `${templateId}-resume`, templateId, failureReason,
+    resultProjection: { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "unavailable" },
+    verificationCriterionIds: [criterionId],
+    verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: templateId, criteria: [{ id: criterionId, check }] },
+    verificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "result_invalid",
+      criteria: [{ criterionId, status: "unverified", reasonCode: "result_invalid" }], evidenceDigest: null, resultDigest: null },
+  }
+}
+
 function projectedNode(row: Record<string, unknown>): Record<string, unknown> {
   const projected = mergeTaskGraphCurrentObservation(snapshot(), {
     revision: state.revision, nodes: [row as unknown as TaskGraphCurrentState["nodes"][number]],
@@ -193,6 +208,57 @@ describe("TaskGraph turn observation", () => {
     expect(JSON.stringify(node)).not.toContain("selected_job_context_unavailable")
     expect(JSON.stringify(node)).not.toContain("private provider detail")
     expect(JSON.stringify(node)).not.toContain("person@example.test")
+  })
+
+  it("exposes report-bearing resume failures for typed Scout or Analyst and preserves legacy no-report behavior", () => {
+    for (const [templateId, failureReason] of [
+      ["scout", "child_resume_unavailable"],
+      ["analyst", "child_resume_evidence_unavailable"],
+    ] as const) {
+      const node = projectedNode(resumeFailureNode(templateId, failureReason))
+      expect(node).toMatchObject({
+        templateId, status: "failed", executionFailureCategory: "resume_state_unavailable",
+        verificationReport: { status: "unverified", reasonCode: "result_invalid", evidenceDigest: null, resultDigest: null },
+        failureReason: null, resultSummary: null,
+      })
+      expect(JSON.stringify(node)).not.toContain("child_resume_")
+    }
+
+    const genericReason = projectedNode(resumeFailureNode("scout", "child_resume_wait_step_lineage"))
+    const otherRole = { ...ordinaryFailedNode(), templateId: "writer", failureReason: "child_resume_unavailable",
+      resultProjection: { schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "unavailable" } }
+    const missingReportRow = resumeFailureNode("scout", "child_resume_unavailable")
+    delete missingReportRow.verificationReport
+    const missingReport = projectedNode(missingReportRow)
+    const nonCanonicalReport = projectedNode({
+      ...resumeFailureNode("scout", "child_resume_unavailable"),
+      verificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "contract_invalid",
+        criteria: [{ criterionId: "candidate-count", status: "unverified", reasonCode: "contract_invalid" }], evidenceDigest: null, resultDigest: null },
+    })
+    const passedReport = projectedNode({
+      ...resumeFailureNode("scout", "child_resume_unavailable"),
+      verificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
+        criteria: [{ criterionId: "candidate-count", status: "passed", reasonCode: "criteria_met" }],
+        evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64) },
+    })
+    expect(() => projectedNode({ ...resumeFailureNode("scout", "child_resume_unavailable"), verificationReport: { status: "unverified" } }))
+      .toThrow("task_graph_current_state_invalid:verification")
+    const passedResume = projectedNode({
+      ...resumeFailureNode("scout", "child_resume_unavailable"), status: "completed",
+      verificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
+        criteria: [{ criterionId: "candidate-count", status: "passed", reasonCode: "criteria_met" }],
+        evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64) },
+    })
+    const native = projectedNode({ ...resumeFailureNode("analyst", "child_resume_unavailable"), native: {
+      operationKind: "spawn", operationId: "operation-1", requestFingerprint: "f".repeat(64), callerTaskId: "root-1",
+      role: "analyst", taskType: "job_analysis", contextDigest: "c".repeat(64),
+    } })
+    expect(projectedNode(otherRole)).not.toHaveProperty("executionFailureCategory")
+    for (const node of [genericReason, missingReport, nonCanonicalReport, passedReport, passedResume, native]) {
+      expect(node).not.toHaveProperty("executionFailureCategory")
+      expect(node.failureReason).toBeNull()
+      expect(node.resultSummary).toBeNull()
+    }
   })
 
   it("omits the category for unknown reasons, nonfailed tasks, verified failures, and native nodes", () => {

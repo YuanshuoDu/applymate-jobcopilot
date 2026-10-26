@@ -34,6 +34,7 @@ import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
 import { claimTurnLease, parseTurnJobPayload, releaseTurnLease, type TurnLease } from "../turns/lease.js"
 import { turnJobId } from "../turns/recovery-scanner.js"
 import { loadCanonicalTurnState } from "../canonical-turn-state.js"
+import { loadTaskGraphCurrentObservation } from "../canonical-turn-task-graph-context.js"
 import { createPgInputClaimStore } from "../context/input-claim-store.js"
 import { createPgContextOwnerFence, StepContextBuilder } from "../context/step-context-builder.js"
 import { checkTaskGraphTerminalVerification, TASK_GRAPH_VERIFICATION_BLOCKER } from "../turns/turn-execution-completion-gate.js"
@@ -7199,6 +7200,7 @@ describe("TaskGraph fixture lease guard unit", () => {
 describeWithServices("production TaskGraph lifecycle and root resume (disposable PostgreSQL + Redis)", () => {
   const priorStalledIntervalMs = process.env.BULLMQ_STALLED_INTERVAL_MS
   const owner = fixture()
+  const resumeFailureOwner = fixture()
   const failureOwner = fixture()
   const stopOwner = fixture()
   const restartOwner = fixture()
@@ -7243,6 +7245,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     }))
     // Each production bootstrap runs database-wide turn recovery; keep inactive fixtures out of its queue scan.
     await seed(pool, owner)
+    await seed(pool, resumeFailureOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
     await seed(pool, failureOwner, "waiting_for_user")
     await seed(pool, stopOwner, "waiting_for_user")
     await seed(pool, restartOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
@@ -7285,7 +7288,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         cleanupFailures.push("bootstrap close: " + (error instanceof Error ? error.stack ?? error.message : String(error)))
       }
     }
-    const fixtureOwners = [owner, failureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner,
+    const fixtureOwners = [owner, resumeFailureOwner, failureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner,
       discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, lateRepairOwner, leaseRecoveryOwner,
       coverageRepairOwner, rootRecoveryScanOwner, archivedWaitOwner]
     const allFixtureWorkersExited = [...fixtureProcessChildren].every(processFixtureExited)
@@ -7367,6 +7370,130 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     vi.doUnmock("../../redis.js")
     if (cleanupFailures.length > 0) throw new Error("TaskGraph integration cleanup failed:\n" + cleanupFailures.join("\n"))
   })
+
+  it("persists exact typed resume failures through TaskGraph lifecycle and Root context projection", async () => {
+    const value = resumeFailureOwner
+    let cleanupRoot: (() => Promise<void>) | undefined
+    try {
+      await activateFixtureTurn(pool!, value)
+      const lease = await claimTurnLease(pool!, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
+      const { createPgRootTaskStore } = await import("./root-task-store.js")
+      const rootStore = createPgRootTaskStore(pool!)
+      const root = await rootStore.ensure({
+        lease, goal: "Recover the fixed Scout and Analyst child state",
+        allowedActions: [...new Set([
+          ...TASK_GRAPH_TEMPLATES.scout.allowedActions,
+          ...TASK_GRAPH_TEMPLATES.analyst.allowedActions,
+        ])],
+      })
+      cleanupRoot = async () => {
+        await rootStore.finish({ lease, rootTaskId: root.id, result: {
+          status: "failed", stepCount: 0, toolCallCount: 0, errorCode: "test_fixture_cleanup",
+        } })
+        await releaseTurnLease(pool!, lease, "failed")
+      }
+      const rootStepId = `p3-resume-classification-root-step-${value.suffix}`
+      await pool!.query(`INSERT INTO "agent_steps"
+        ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
+        VALUES ($1, $2, $3, $4, 0, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
+      [rootStepId, value.sessionId, value.turnId, root.id])
+      const command = createPgTaskGraphCommandPort(pool!)
+      const graph = await command.appendAndSchedule({
+        scope: {
+          userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+          rootTaskId: root.id, parentTaskId: root.id, stepId: rootStepId,
+          turnLeaseOwner: lease.ownerId, turnLeaseVersion: lease.leaseVersion,
+          parentLeaseOwner: lease.ownerId, parentAttemptCount: root.attemptCount,
+        },
+        proposal: { expectedRevision: 0, nodes: [
+          { key: "resume-scout", templateId: "scout", goal: "Read current source state", successCriteria: ["Return source evidence"], dependsOn: [], verification: SCOUT_VERIFICATION },
+          { key: "resume-analyst", templateId: "analyst", goal: "Read current analysis state", successCriteria: ["Return analysis evidence"], dependsOn: [], verification: ANALYST_VERIFICATION },
+          { key: "generic-control", templateId: "scout", goal: "Exercise generic typed failure handling", successCriteria: ["Return source evidence"], dependsOn: [], verification: SCOUT_VERIFICATION },
+        ] },
+        templates: { ...TASK_GRAPH_TEMPLATES },
+      })
+      const taskIds = new Map(graph.nodes.map(node => [node.key, node.taskId] as const))
+      const store = new PgSubagentTaskStore(pool!, 300_000)
+      const cases = [
+        { key: "resume-scout", role: "scout", taskType: "job_discovery", criterionId: "candidate-count", reason: "child_resume_unavailable" },
+        { key: "resume-analyst", role: "analyst", taskType: "job_analysis", criterionId: "finding-count", reason: "child_resume_evidence_unavailable" },
+        { key: "generic-control", role: "scout", taskType: "job_discovery", criterionId: "candidate-count", reason: "child_resume_wait_step_lineage" },
+      ] as const
+      for (const [index, item] of cases.entries()) {
+        const taskId = taskIds.get(item.key)
+        if (!taskId) throw new Error("Resume classification graph omitted a fixed child")
+        const childOwner = `p3-resume-classification-child-${index}-${value.suffix}`
+        const claimed = await store.claim({ taskId, sessionId: value.sessionId, ownerId: childOwner,
+          policy: defaultSubagentPolicy(), now: new Date() })
+        expect(claimed).toMatchObject({ id: taskId, status: "running", attemptCount: 1 })
+        if (!claimed) throw new Error("Resume classification child did not acquire its lease")
+        const finished = await store.finish({
+          taskId, sessionId: value.sessionId, ownerId: childOwner, attemptCount: claimed.attemptCount,
+          status: "failed", result: null, failureReason: item.reason, retryDisposition: "terminal", now: new Date(),
+        })
+        expect(finished).toBe("failed")
+
+        const row = await pool!.query<{ role: string; taskType: string; status: string; attemptCount: number; failureReason: string | null; result: unknown }>(
+          `SELECT "role", "taskType", "status", "attemptCount", "failureReason", "result"
+           FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4 AND "parentTaskId" = $4`,
+          [taskId, value.sessionId, value.turnId, root.id],
+        )
+        expect(row.rows).toHaveLength(1)
+        const expectedReason = item.reason === "child_resume_unavailable" || item.reason === "child_resume_evidence_unavailable"
+          ? item.reason : "task_graph_verification_unverified"
+        expect(row.rows[0]).toMatchObject({
+          role: item.role, taskType: item.taskType, status: "failed", attemptCount: claimed.attemptCount,
+          failureReason: expectedReason,
+        })
+        expectUnverifiedVerificationReport(record(row.rows[0]?.result)?.taskGraphVerificationReport, item.criterionId)
+        expect(record(row.rows[0]?.result)?.structuredResult).toBeUndefined()
+
+        const key = taskGraphLifecycleKey(root.id, item.key, claimed.attemptCount, "task.failed")
+        const event = await pool!.query<{ id: string; type: string; actor: string; taskId: string; idempotencyKey: string; payload: unknown }>(
+          `SELECT "id", "type", "actor", "taskId", "idempotencyKey", "payload" FROM "agent_events"
+           WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3 AND "taskId" = $4 AND "idempotencyKey" = $5`,
+          [value.sessionId, value.turnId, taskGraphItemId(root.id), taskId, key],
+        )
+        expect(event.rows).toHaveLength(1)
+        const eventPayload = record(event.rows[0]?.payload)
+        expect(event.rows[0]).toMatchObject({ type: "item.delta", actor: "system", taskId, idempotencyKey: key })
+        expect(eventPayload).toMatchObject({ kind: "lifecycle", event: { type: "task.failed", nodeKey: item.key, failureReason: expectedReason } })
+        const outbox = await pool!.query<{ topic: string; aggregateId: string; idempotencyKey: string; payload: unknown }>(
+          `SELECT "topic", "aggregateId", "idempotencyKey", "payload" FROM "agent_outbox"
+           WHERE "topic" = 'agent.session.event' AND "aggregateId" = $1 AND "idempotencyKey" = $2`,
+          [value.sessionId, `agent-event:${event.rows[0]!.id}`],
+        )
+        expect(outbox.rows).toHaveLength(1)
+        expect(outbox.rows[0]).toMatchObject({ topic: "agent.session.event", aggregateId: value.sessionId,
+          idempotencyKey: `agent-event:${event.rows[0]!.id}` })
+        expect(record(outbox.rows[0]?.payload)).toMatchObject({
+          eventId: event.rows[0]!.id, taskId, type: "item.delta", actor: "system", idempotencyKey: key,
+        })
+      }
+
+      const projected = await loadTaskGraphCurrentObservation({
+        system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [],
+      }, command, lease, root)
+      const observation = record(projected.toolObservations.at(-1)?.content)
+      const projectedNodes = Array.isArray(observation?.nodes) ? observation.nodes.map(record) : []
+      const scout = projectedNodes.find(node => node?.key === "resume-scout")
+      const analyst = projectedNodes.find(node => node?.key === "resume-analyst")
+      const generic = projectedNodes.find(node => node?.key === "generic-control")
+      expect(projectedNodes).toHaveLength(3)
+      expect(scout?.executionFailureCategory).toBe("resume_state_unavailable")
+      expect(analyst?.executionFailureCategory).toBe("resume_state_unavailable")
+      expect(generic).not.toBeNull()
+      expect(generic).not.toHaveProperty("executionFailureCategory")
+      expect([scout, analyst, generic].every(node => node?.failureReason === null)).toBe(true)
+      const serialized = JSON.stringify(observation)
+      expect(serialized).not.toContain("child_resume_unavailable")
+      expect(serialized).not.toContain("child_resume_evidence_unavailable")
+      expect(serialized).not.toContain("child_resume_wait_step_lineage")
+    } finally {
+      // Quiesce this exact fixture owner so a later database-wide bootstrap cannot reclaim its live Turn.
+      if (cleanupRoot) await cleanupRoot()
+    }
+  }, 30_000)
 
   it("rejects a consumed wait archive whose target belongs to another session", async () => {
     const value = fixture(), foreign = fixture(), tasks = new PgSubagentTaskStore(pool!, 300_000)

@@ -29,10 +29,14 @@ describe("current TaskGraph execution failure categories", () => {
   it("omits categories for free text, near matches, other statuses and verifier/native cases", () => {
     for (const failureReason of [
       "provider_timeout", "Task setup unavailable", " selected_job_context_unavailable", "selected_job_context_unavailable:private",
-      "native_verification_packet_invalid", "task_graph_verification_failed", "",
+      "native_verification_packet_invalid", "task_graph_verification_failed", "task_graph_verification_unverified",
+      "child_resume_wait_step_lineage", "",
     ]) {
       expect(classifyCurrentTaskGraphExecutionFailure({ status: "failed", failureReason }, eligible)).toBeUndefined()
     }
+    expect(classifyCurrentTaskGraphExecutionFailure({
+      status: "failed", result: { failureReason: "child_resume_unavailable" },
+    }, eligible)).toBeUndefined()
     for (const status of ["completed", "retrying", "cancelled", "interrupted", "waiting", "running"]) {
       expect(classifyCurrentTaskGraphExecutionFailure({ status, failureReason: "invalid_structured_result" }, eligible)).toBeUndefined()
     }

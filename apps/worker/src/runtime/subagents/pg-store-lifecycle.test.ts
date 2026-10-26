@@ -52,6 +52,19 @@ function lifecycleEventRow(payload: unknown) {
   return { type: "item.delta", itemId: taskGraphItemId("root-1"), taskId: "root-1", idempotencyKey: event?.idempotencyKey, payload }
 }
 
+function typedFailureGraph(templateId: "scout" | "analyst", verificationDisposition = "typed") {
+  const verification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: templateId,
+    criteria: [{ id: "output-count", check: templateId === "scout" ? { kind: "candidate_count_gte", minimum: 1 } : { kind: "finding_count_gte", minimum: 1 } }] }
+  const node = { key: templateId, taskId: "child-1", templateId, goal: "Inspect", successCriteria: ["Return evidence"], dependsOn: [],
+    verificationDisposition, verification }
+  const graph = { scope: { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" },
+    itemId: "task-graph-item", taskId: "child-1", expectedRevision: 4, snapshot: { nodes: [node] },
+    event: { type: "task.failed", nodeKey: templateId, expectedRevision: 4,
+      idempotencyKey: taskGraphLifecycleKey("root-1", templateId, 2, "task.failed") },
+    state: { revision: 5, nodes: [{ ...node, status: "failed", failureReason: "task_graph_verification_unverified" }] }, duplicate: false }
+  return { graph, node, verification }
+}
+
 function fakePool(handler?: (sql: string, params?: unknown[]) => { rows?: unknown[]; rowCount?: number }) {
   const calls: Array<[string, unknown[]?]> = []
   const client = { query: vi.fn(async (sql: string, params?: unknown[]) => {
@@ -452,6 +465,88 @@ describe("subagent PostgreSQL lifecycle helpers", () => {
       expect(Object.keys((terminal.result as Record<string, unknown>).discoveryRecovery as object).sort())
         .toEqual(["attemptCount", "jobIds", "schemaVersion", "truncated"])
       expect(terminal.result).toHaveProperty("discoveryAttempt", discoveryAttempt)
+    } finally { prepare.mockRestore() }
+  })
+
+  it.each([
+    { templateId: "scout" as const, role: "scout", taskType: "job_discovery", failureReason: "child_resume_unavailable", result: null },
+    { templateId: "scout" as const, role: "scout", taskType: "job_discovery", failureReason: "child_resume_evidence_unavailable", result: undefined },
+    { templateId: "analyst" as const, role: "analyst", taskType: "job_analysis", failureReason: "child_resume_unavailable", result: undefined },
+    { templateId: "analyst" as const, role: "analyst", taskType: "job_analysis", failureReason: "child_resume_evidence_unavailable", result: null },
+  ])("preserves only the server resume cause for a terminal typed $templateId failure", async ({ templateId, role, taskType, failureReason, result: modelResult }) => {
+    const { graph, verification } = typedFailureGraph(templateId)
+    const prepare = vi.spyOn(taskGraphLifecycle, "prepareGraphTransition").mockResolvedValue(graph as never)
+    try {
+      const result = await prepareTaskGraphFinish({ query: vi.fn() } as never, {
+        taskId: "child-1", sessionId: "session-1", attemptCount: 2, status: "failed", retry: false,
+        failureReason, result: modelResult, taskRole: role, taskType,
+      })
+
+      expect(result).toMatchObject({ status: "failed", failureReason })
+      expect(prepare).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        type: "task.failed", attemptCount: 2, failureReason,
+      }))
+      const stored = result.result as Record<string, unknown>
+      const report = parseTaskGraphVerificationReport(stored.taskGraphVerificationReport, verification.criteria.map(item => item.id))
+      expect(report).toMatchObject({ status: "unverified", reasonCode: "result_invalid", resultDigest: null, evidenceDigest: null })
+      expect(report && taskGraphVerificationReportMatchesStatus(report, "failed")).toBe(true)
+      expect(report && taskGraphVerificationReportMatchesStatus(report, "completed")).toBe(false)
+    } finally { prepare.mockRestore() }
+  })
+
+  it.each([
+    { name: "an unknown resume reason", failureReason: "child_resume_wait_step_lineage", result: null, role: "analyst", taskType: "job_analysis", templateId: "analyst" as const, retry: false },
+    { name: "a mismatched persisted role", failureReason: "child_resume_unavailable", result: null, role: "scout", taskType: "job_discovery", templateId: "analyst" as const, retry: false },
+    { name: "a mismatched persisted task type", failureReason: "child_resume_evidence_unavailable", result: null, role: "analyst", taskType: "research", templateId: "analyst" as const, retry: false },
+    { name: "a mismatched graph template", failureReason: "child_resume_unavailable", result: null, role: "analyst", taskType: "job_analysis", templateId: "scout" as const, retry: false },
+    { name: "a model result carrying the same text", failureReason: "child_resume_unavailable", result: { error: "child_resume_unavailable" }, role: "analyst", taskType: "job_analysis", templateId: "analyst" as const, retry: false },
+    { name: "a matching string only in model output", failureReason: undefined, result: { failureReason: "child_resume_evidence_unavailable" }, role: "analyst", taskType: "job_analysis", templateId: "analyst" as const, retry: false },
+    { name: "a retry decision", failureReason: "child_resume_unavailable", result: null, role: "analyst", taskType: "job_analysis", templateId: "analyst" as const, retry: true },
+  ])("keeps $name on the generic unverified path", async ({ failureReason, result: modelResult, role, taskType, templateId, retry }) => {
+    const { graph } = typedFailureGraph(templateId)
+    const prepare = vi.spyOn(taskGraphLifecycle, "prepareGraphTransition").mockResolvedValue(graph as never)
+    try {
+      const result = await prepareTaskGraphFinish({ query: vi.fn() } as never, {
+        taskId: "child-1", sessionId: "session-1", attemptCount: 2, status: "failed", retry,
+        failureReason, result: modelResult, taskRole: role, taskType,
+      })
+
+      expect(result.failureReason).toBe("task_graph_verification_unverified")
+      expect(prepare).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({
+        type: "task.failed", failureReason: "task_graph_verification_unverified",
+      }))
+      const stored = result.result as Record<string, unknown>
+      expect(parseTaskGraphVerificationReport(stored.taskGraphVerificationReport, ["output-count"]))
+        .toMatchObject({ status: "unverified", reasonCode: "result_invalid" })
+    } finally { prepare.mockRestore() }
+  })
+
+  it("keeps the generic contract-invalid report for a legacy-unverified graph node", async () => {
+    const { graph } = typedFailureGraph("analyst", "legacy_unverified")
+    const prepare = vi.spyOn(taskGraphLifecycle, "prepareGraphTransition").mockResolvedValue(graph as never)
+    try {
+      const result = await prepareTaskGraphFinish({ query: vi.fn() } as never, {
+        taskId: "child-1", sessionId: "session-1", attemptCount: 2, status: "failed", retry: false,
+        failureReason: "child_resume_unavailable", result: null, taskRole: "analyst", taskType: "job_analysis",
+      })
+      expect(result.failureReason).toBe("task_graph_verification_unverified")
+      const stored = result.result as Record<string, unknown>
+      expect(parseTaskGraphVerificationReport(stored.taskGraphVerificationReport, ["output-count"]))
+        .toMatchObject({ status: "unverified", reasonCode: "contract_invalid" })
+    } finally { prepare.mockRestore() }
+  })
+
+  it("leaves a queued retry nonterminal and does not issue a task.failed report", async () => {
+    const { graph } = typedFailureGraph("analyst")
+    const prepare = vi.spyOn(taskGraphLifecycle, "prepareGraphTransition").mockResolvedValue(graph as never)
+    try {
+      const result = await prepareTaskGraphFinish({ query: vi.fn() } as never, {
+        taskId: "child-1", sessionId: "session-1", attemptCount: 1, status: "queued", retry: true,
+        failureReason: "child_resume_unavailable", result: null, taskRole: "analyst", taskType: "job_analysis",
+      })
+      expect(result).toMatchObject({ status: "queued", failureReason: "child_resume_unavailable" })
+      expect(result.result).toBeNull()
+      expect(prepare).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ type: "task.retrying" }))
     } finally { prepare.mockRestore() }
   })
 
