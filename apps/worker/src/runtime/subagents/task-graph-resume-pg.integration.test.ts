@@ -7373,14 +7373,25 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
 
   it("persists exact typed resume failures through TaskGraph lifecycle and Root context projection", async () => {
     const value = resumeFailureOwner
+    let cleanupRoot: (() => Promise<void>) | undefined
     try {
       await activateFixtureTurn(pool!, value)
       const lease = await claimTurnLease(pool!, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
       const { createPgRootTaskStore } = await import("./root-task-store.js")
-      const root = await createPgRootTaskStore(pool!).ensure({
+      const rootStore = createPgRootTaskStore(pool!)
+      const root = await rootStore.ensure({
         lease, goal: "Recover the fixed Scout and Analyst child state",
-        allowedActions: TASK_GRAPH_TEMPLATES.analyst.allowedActions,
+        allowedActions: [...new Set([
+          ...TASK_GRAPH_TEMPLATES.scout.allowedActions,
+          ...TASK_GRAPH_TEMPLATES.analyst.allowedActions,
+        ])],
       })
+      cleanupRoot = async () => {
+        await rootStore.finish({ lease, rootTaskId: root.id, result: {
+          status: "failed", stepCount: 0, toolCallCount: 0, errorCode: "test_fixture_cleanup",
+        } })
+        await releaseTurnLease(pool!, lease, "failed")
+      }
       const rootStepId = `p3-resume-classification-root-step-${value.suffix}`
       await pool!.query(`INSERT INTO "agent_steps"
         ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
@@ -7479,7 +7490,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(serialized).not.toContain("child_resume_evidence_unavailable")
       expect(serialized).not.toContain("child_resume_wait_step_lineage")
     } finally {
-      // The suite-level cleanup removes exact queue jobs before deleting this fixture owner.
+      // Quiesce this exact fixture owner so a later database-wide bootstrap cannot reclaim its live Turn.
+      if (cleanupRoot) await cleanupRoot()
     }
   }, 30_000)
 
