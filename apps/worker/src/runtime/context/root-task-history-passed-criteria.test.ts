@@ -67,7 +67,7 @@ describe("root task history passed criteria derivation", () => {
     const base = inputFor("scout")
     const invalid: Partial<Input>[] = [
       { status: "running" }, { failureReason: undefined }, { failureReason: "failed" },
-      { verificationDisposition: "legacy" }, { isNative: true }, { isRepair: true },
+      { verificationDisposition: "legacy" }, { verificationDisposition: undefined }, { isNative: true }, { isRepair: true },
       { attemptCount: 0 }, { attemptCount: -1 }, { attemptCount: 1.5 }, { attemptCount: Number.MAX_SAFE_INTEGER + 1 },
       { templateId: "analyst" }, { taskRole: "analyst" }, { verificationRole: "analyst" },
     ]

@@ -88,7 +88,7 @@ export function deriveRootTaskHistoryPassedCriteria(input: Readonly<{
   templateId: string
   taskRole: unknown
   verificationRole: unknown
-  verificationDisposition: string
+  verificationDisposition: string | undefined
   status: string
   failureReason: unknown
   attemptCount: unknown
