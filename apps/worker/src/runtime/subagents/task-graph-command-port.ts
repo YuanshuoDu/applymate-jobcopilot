@@ -1,6 +1,6 @@
 import type { PoolClient } from "pg"
 import type { TaskGraphProposal, TaskGraphReadiness, TaskGraphRepairOf } from "../planning/task-graph.js"
-import type { TaskGraphExecutionScope, TaskGraphScheduleInput } from "./task-graph-schedule-input.js"
+import type { TaskGraphExecutionScope, TaskGraphScheduleInput, TaskGraphScheduleNode, TaskGraphScheduleReceipt, TaskGraphScheduledPrepareReceipt } from "./task-graph-schedule-input.js"
 import type { SubagentTaskStatus } from "./types.js"
 import {
   TASK_GRAPH_VERIFIER_VERSION,
@@ -21,7 +21,7 @@ import type { DiscoveryAttemptHealth } from "./child-discovery-attempt.js"
 import type { TaskGraphHistoricalDiscoveryPage, TaskGraphHistoricalDiscoveryPageRequest } from "./task-graph-historical-discovery-page-contract.js"
 import type { TaskGraphSourceCheckpoint, TaskGraphSourceIntentNode } from "./task-graph-pg-source-provenance.js"
 import type { TaskGraphScheduledAuditInput, TaskGraphScheduledAuditCompletionInput, TaskGraphScheduledAuditInvocationInput, TaskGraphScheduledAuditResumeInput, ScheduledAuditAppendReceipt, ScheduledAuditCompletionProof, ScheduledAuditInvocationProof, ScheduledAuditResumeContext } from "./scheduled-audit-contract.js"
-export type { TaskGraphExecutionScope, TaskGraphScheduleInput, TaskGraphTaskTemplate } from "./task-graph-schedule-input.js"
+export type { TaskGraphExecutionScope, TaskGraphScheduleInput, TaskGraphScheduleNode, TaskGraphScheduleReceipt, TaskGraphScheduledPrepareReceipt, TaskGraphTaskTemplate } from "./task-graph-schedule-input.js"
 import type {
   ScheduledAnalyzeCheckpointHandoff,
   ScheduledGateCompletionProof,
@@ -115,26 +115,6 @@ export function parseTaskGraphRepairReceipt(value: unknown, expected: Readonly<{
     ? { schemaVersion: TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION, graphRootTaskId: relation.graphRootTaskId, targetNodeKey: relation.nodeKey, targetTaskId: relation.taskId, criterionIds, repairNodeKey: expected.repairNodeKey, repairTaskId: expected.repairTaskId, verifierVersion: TASK_GRAPH_VERIFIER_VERSION, evidenceDigest: report.evidenceDigest }
     : undefined
 }
-
-export type TaskGraphScheduleNode = Readonly<{
-  key: string
-  taskId: string
-  status: Extract<SubagentTaskStatus, "queued" | "waiting">
-}>
-
-export type TaskGraphScheduleReceipt = Readonly<{
-  status: "accepted" | "duplicate"
-  revision: number
-  nodes: readonly TaskGraphScheduleNode[]
-  readyTaskIds: readonly string[]
-}>
-
-/** A choice wait has no scheduled node; accepted receipts describe the later atomic append. */
-export type TaskGraphScheduledPrepareReceipt =
-  | Readonly<{ status: "waiting_for_choice"; revision: number; nodes: readonly []; readyTaskIds: readonly [];
-      choice: Readonly<{ required: true; status: "waiting"; waitId: string }> }>
-  | (TaskGraphScheduleReceipt & Readonly<{ choice: Readonly<{ required: true; status: "answered"; waitId: string }>
-      | Readonly<{ required: false }> }>)
 
 /** Exact proposal shape accepted by the scheduled-only Prepare command. */
 export function parseScheduledPrepareProposal(value: unknown, analystKey: string, analyzeRevision: number): TaskGraphProposal | undefined {

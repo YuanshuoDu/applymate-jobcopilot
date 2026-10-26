@@ -2,6 +2,7 @@ import type { RootTaskVerificationRequirementsResolution } from "../context/root
 import type { TaskGraphProposal, TaskGraphRepairOf } from "../planning/task-graph.js"
 import type { TaskGraphBranchReplacement } from "../planning/task-graph-branch-replacement.js"
 import type { TaskGraphOperationalFailureReplacement } from "../planning/task-graph-operational-failure-replacement.js"
+import type { SubagentTaskStatus } from "./types.js"
 
 /** Lease and lineage supplied by the currently executing parent task. */
 export type TaskGraphExecutionScope = Readonly<{
@@ -42,3 +43,23 @@ export type TaskGraphScheduleInput = Readonly<{
   /** Server-resolved from the persisted Turn objective; never populated from model tool input. */
   verificationRequirements?: RootTaskVerificationRequirementsResolution
 }>
+
+export type TaskGraphScheduleNode = Readonly<{
+  key: string
+  taskId: string
+  status: Extract<SubagentTaskStatus, "queued" | "waiting">
+}>
+
+export type TaskGraphScheduleReceipt = Readonly<{
+  status: "accepted" | "duplicate"
+  revision: number
+  nodes: readonly TaskGraphScheduleNode[]
+  readyTaskIds: readonly string[]
+}>
+
+/** A choice wait has no scheduled node; accepted receipts describe the later atomic append. */
+export type TaskGraphScheduledPrepareReceipt =
+  | Readonly<{ status: "waiting_for_choice"; revision: number; nodes: readonly []; readyTaskIds: readonly [];
+      choice: Readonly<{ required: true; status: "waiting"; waitId: string }> }>
+  | (TaskGraphScheduleReceipt & Readonly<{ choice: Readonly<{ required: true; status: "answered"; waitId: string }>
+      | Readonly<{ required: false }> }>)
