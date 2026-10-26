@@ -10315,8 +10315,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(replacementPlanAccepted).toBe(true)
     expect(finalGraphVerified).toBe(true)
     const tasks = await pool!.query<{ id: string; goal: string; status: string; failureReason: string | null; result: unknown }>(
-      `SELECT "id", "goal", "status", "failureReason", "result" FROM "sub_agent_tasks"
-       WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "parentTaskId" = $4`,
+      `SELECT task."id", task."goal", task."status", task."failureReason", task."result"
+       FROM "sub_agent_tasks" AS task
+       JOIN "agent_sessions" AS session ON session."id" = task."sessionId" AND session."userId" = $1
+       JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+         AND turn."userId" = $1 AND turn."rootTaskId" = $4
+       WHERE task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4 AND task."parentTaskId" = $4`,
       [value.userId, value.sessionId, value.turnId, rootTaskId],
     )
     expect(tasks.rows).toHaveLength(4)
