@@ -11,29 +11,40 @@ vi.mock("./context/selected-job-history-direct-store.js", () => ({ createPgDirec
 const rootTaskHistory = vi.hoisted(() => ({ load: vi.fn(async (..._args: unknown[]) => [] as unknown[]) }))
 const discoveryPersonaMemory = vi.hoisted(() => {
   const state: { kind: "accepted" | "overflow" } = { kind: "accepted" }
+  const compaction: { kind: "accepted" | "absent" | "overflow"; estimatedTokens: number } = { kind: "accepted", estimatedTokens: 137 }
   const projection = {
     schemaVersion: "applymate.discovery-persona-projection.v1" as const, purpose: "discovery" as const,
     facts: [{ factId: "persona-fact-discovery-1", key: "target_role", label: "Target role", category: "career",
       source: "manual", value: "PRIVATE_DISCOVERY_PREFERENCE_SENTINEL", normalizedValue: "private_discovery_preference_sentinel",
       updatedAt: "2026-10-24T12:00:00.000Z" }],
   }
-  return { state, load: vi.fn(async () => state.kind === "accepted"
+  return { state, compaction, projection, load: vi.fn(async () => state.kind === "accepted"
     ? { kind: "accepted" as const, projection }
-    : { kind: "overflow" as const, reason: "byte_limit" as const, observedFactCount: 1, canonicalUtf8Bytes: 8193 }) }
+    : { kind: "overflow" as const, reason: "byte_limit" as const, observedFactCount: 1, canonicalUtf8Bytes: 8193 }),
+    read: vi.fn(async () => compaction.kind === "accepted"
+      ? { kind: "accepted" as const, estimatedTokens: compaction.estimatedTokens }
+      : compaction.kind === "absent" ? { kind: "absent" as const } : { kind: "overflow" as const }) }
 })
-vi.mock("./context/discovery-persona-facts-pg.js", () => ({ loadOrCreateDiscoveryPersonaSnapshot: discoveryPersonaMemory.load }))
+vi.mock("./context/discovery-persona-facts-pg.js", () => ({
+  loadOrCreateDiscoveryPersonaSnapshot: discoveryPersonaMemory.load,
+  readDiscoveryPersonaSnapshotForCompaction: discoveryPersonaMemory.read,
+}))
 vi.mock("./context/root-task-history-direct-store.js", () => ({ createPgDirectRootTaskHistoryStore: () => rootTaskHistory }))
 beforeEach(() => {
   selectedJobHistory.load.mockReset().mockImplementation(async () => [])
   selectedJobDirectHistory.load.mockReset().mockImplementation(async () => [])
   rootTaskHistory.load.mockReset().mockImplementation(async () => [])
   discoveryPersonaMemory.state.kind = "accepted"
+  discoveryPersonaMemory.compaction.kind = "accepted"
+  discoveryPersonaMemory.compaction.estimatedTokens = 137
   discoveryPersonaMemory.load.mockClear()
+  discoveryPersonaMemory.read.mockClear()
 })
 afterEach(() => vi.unstubAllEnvs())
 
 import { redactSensitiveValue } from "@jobcopilot/shared"
 import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
+import { createHarnessModelRuntime, type HarnessFetch } from "./harness-model.js"
 import type pg from "pg"
 import { StepContextBuilder, type ContextBlock, type ContextOwnerFence, type StepContext } from "./context/step-context-builder.js"
 import type { InputClaimStore, InputClaimTransaction, StoredAgentInput } from "./context/input-claim-store.js"
@@ -58,6 +69,7 @@ import { TASK_GRAPH_DISCOVERY_RECOVERY_PAGE_SCHEMA } from "./subagents/task-grap
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
 import { priorConversation } from "./canonical-steering-markers.js"
 import { projectSelectedJobMemory, type SelectedJobMemoryNode } from "./context/selected-job-memory.js"
+import { discoveryPersonaContextBlocks, estimateMaximumDiscoveryPersonaContextTokens } from "./context/discovery-persona-context-blocks.js"
 import type { ValidatedSelectedJobHistoryOutcome } from "./context/selected-job-history.js"
 import { TurnEngine } from "./turns/turn-engine.js"
 import { createCoordinationTools, createWorkerToolRuntime, InMemoryToolLifecycleSink, ToolLifecycle, ToolRegistry, ToolRouter, type CoordinationStore, type CoordinationTaskView, type DurableWaitPort } from "./tools/index.js"
@@ -670,12 +682,21 @@ async function taskGraphRootSurface(
   taskGraphPlanningEnabled = true,
   emitToolCall = true,
   scheduledAutomation = false,
-  objectiveProgressFixture?: Readonly<{
+  objectiveProgressOrBoundaryOptions?: Readonly<{
     graph: TaskGraphCurrentState
     templates: Readonly<Record<string, TaskGraphTaskTemplate>>
+  }> | Readonly<{
+    enabled?: boolean
+    runner?: NonNullable<CanonicalTurnRuntimeOptions["turnBoundaryCompactionRunner"]>
+    stateLoader?: NonNullable<CanonicalTurnRuntimeOptions["stateLoader"]>
+    modelRuntimeFactory?: NonNullable<CanonicalTurnRuntimeOptions["modelRuntimeFactory"]>
   }>,
   requestCapture?: HarnessModelRequest[],
 ) {
+  const objectiveProgressFixture = objectiveProgressOrBoundaryOptions && "graph" in objectiveProgressOrBoundaryOptions
+    ? objectiveProgressOrBoundaryOptions : undefined
+  const boundaryOptions = objectiveProgressOrBoundaryOptions && "graph" in objectiveProgressOrBoundaryOptions
+    ? {} : objectiveProgressOrBoundaryOptions ?? {}
   const requests: HarnessModelRequest[] = []
   const events: RuntimeEvent[] = []
   const contexts: StepContext[] = []
@@ -712,6 +733,7 @@ async function taskGraphRootSurface(
   const runtime = await createCanonicalTurnRuntime(runtimePool, {
     workerId: "worker-1", productionFlags: resolveProductionAgentFlags({
       ...(taskGraphPlanningEnabled ? { ENABLE_AGENT_TASK_GRAPH_PLANNING: "1" } : {}),
+      ...(boundaryOptions.enabled ? { ENABLE_AGENT_TURN_BOUNDARY_COMPACTION: "1" } : {}),
       ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
     }),
     taskGraphCommandPort: taskGraphCommandPort as never,
@@ -722,9 +744,9 @@ async function taskGraphRootSurface(
       reviewer: { role: "reviewer", taskType: "cover_letter_review", allowedActions: ["artifact.review"] },
     } : { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search", "jobs.get", "jobs.discover", "tool_results.read"] } }),
     selectedJobPreparationLoader: async () => selectedJob ? { jobId: "job-1" } : undefined,
-    stateLoader: async () => ({
-      ...state(scheduledAutomation ? { source: "automation", automationRunMode: "scheduled" }
-        : { source: "user" }),
+    stateLoader: boundaryOptions.stateLoader ?? (async () => ({
+      ...state(scheduledAutomation ? { source: "automation", automationRunMode: "scheduled", contextSnapshotPinned: false }
+        : boundaryOptions.enabled ? { source: "user", contextSnapshotPinned: false } : { source: "user" }),
       toolPolicySnapshot: { capabilities: ["read"] },
       ...(persistedTurnInput === undefined ? {} : { turnInput: persistedTurnInput }),
       ...(interactiveDiscovery ? { intent: { kind: "interactive_discovery_shortlist" as const, version: 1 as const } } : {}),
@@ -732,12 +754,13 @@ async function taskGraphRootSurface(
         pendingToolCalls: [{ call: { id: "persisted-hidden-call", name: recoveredToolName, arguments: recoveredToolName === "jobs.get" ? { jobId: "job-other" } : {} }, toolVersion: "1", stepId: "prior-step", callItem: { id: "persisted-call-item", revision: 0 } }],
         resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 0n, consumedInputIds: [], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
       } : {}),
-    }),
+    })),
     rootTaskStore: roots as never, turnEngineStoreFactory: () => store(events), contextBuilderFactory: () => ({ build: async request => {
       const built = await contextBuilder().build(request)
       contexts.push(built)
       return built
     } }),
+    ...(boundaryOptions.runner ? { turnBoundaryCompactionRunner: boundaryOptions.runner } : {}),
     ...(interactiveDiscovery ? { interactiveDiscoveryShortlistLoader: async () => undefined } : {}),
     ...(scheduledAutomation ? {
       scheduledPipelineBridge: async () => ({ status: "blocked" as const, reasonCode: "task_graph_incomplete" as const }),
@@ -745,7 +768,11 @@ async function taskGraphRootSurface(
     } : {}),
     toolRuntimeFactory: () => ({
       registry: {
-        list: () => definitions,
+        list: () => definitions.map(definition => {
+          if (!("execute" in definition)) return definition
+          const { execute: _execute, ...publicDefinition } = definition
+          return publicDefinition
+        }),
         resolve: (name: string) => ({ idempotency: name === "agent.interrupt" ? "idempotent" as const : name === "agent.spawn" ? "requires_key" as const : "read_only" as const }),
         validateArguments: () => true as const,
         register: (definition: RuntimeToolDefinition) => { definitions.push(definition); registeredTools.push(definition) },
@@ -766,6 +793,7 @@ async function taskGraphRootSurface(
         }
       },
     }, registry: {} as never, candidates: [] }),
+    ...(boundaryOptions.modelRuntimeFactory ? { modelRuntimeFactory: boundaryOptions.modelRuntimeFactory } : {}),
     authorizeUsage: async () => ({ settle: async () => undefined }),
   })
   const result = await runtime.execute({ lease, signal: new AbortController().signal })
@@ -2955,6 +2983,7 @@ describe("createCanonicalTurnRuntime", () => {
       expect(firstMessages).toContain(attributedValue)
     }
     expect(discoveryPersonaMemory.load).toHaveBeenCalledOnce()
+    expect(discoveryPersonaMemory.read).not.toHaveBeenCalled()
 
     discoveryPersonaMemory.load.mockClear()
     const ordinary = await taskGraphRootSurface(false, false, "agent.spawn", "agent.interrupt", false, undefined, true, false)
@@ -2977,6 +3006,131 @@ describe("createCanonicalTurnRuntime", () => {
     const generic = await taskGraphRootSurface(false, false, "agent.spawn", "agent.interrupt", false, { goal: "Find jobs", intent: { kind: "generic", version: 1 } }, true, false)
     expect(discoveryPersonaMemory.load).not.toHaveBeenCalled()
     expect(JSON.stringify(generic.requests[0]?.messages)).not.toContain("PRIVATE_DISCOVERY_PREFERENCE_SENTINEL")
+  })
+
+  it("charges eligible Persona memory to compaction and uses the maximum when its snapshot is absent", async () => {
+    const runner = vi.fn(async () => ({ status: "skipped" as const }))
+    discoveryPersonaMemory.compaction.kind = "accepted"
+    discoveryPersonaMemory.compaction.estimatedTokens = 137
+    await taskGraphRootSurface(false, false, "agent.spawn", "agent.interrupt", true, undefined, true, false, false,
+      { enabled: true, runner })
+    expect(discoveryPersonaMemory.read).toHaveBeenCalledOnce()
+    expect(discoveryPersonaMemory.read).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      scope: { userId: "user-1" }, lease, rootTaskId: "root-1", rootAttemptCount: 1,
+    }))
+    expect(runner).toHaveBeenCalledWith(expect.objectContaining({ additionalInputTokens: 137 }))
+
+    discoveryPersonaMemory.read.mockClear()
+    runner.mockClear()
+    discoveryPersonaMemory.compaction.kind = "absent"
+    await taskGraphRootSurface(false, false, "agent.spawn", "agent.interrupt", true, undefined, true, false, false,
+      { enabled: true, runner })
+    expect(discoveryPersonaMemory.read).toHaveBeenCalledOnce()
+    expect(runner).toHaveBeenCalledWith(expect.objectContaining({
+      additionalInputTokens: estimateMaximumDiscoveryPersonaContextTokens(),
+    }))
+  })
+
+  it("keeps compaction memory preflight out of ineligible modes and fails closed on overflow", async () => {
+    const runner = vi.fn(async () => ({ status: "skipped" as const }))
+    await taskGraphRootSurface(true, false, "agent.spawn", "agent.interrupt", true, undefined, true, false, false,
+      { enabled: true, runner })
+    expect(discoveryPersonaMemory.read).not.toHaveBeenCalled()
+
+    discoveryPersonaMemory.read.mockClear()
+    await taskGraphRootSurface(false, false, "agent.spawn", "agent.interrupt", false, undefined, true, false, false,
+      { enabled: true, runner })
+    expect(discoveryPersonaMemory.read).not.toHaveBeenCalled()
+
+    discoveryPersonaMemory.read.mockClear()
+    await taskGraphRootSurface(false, false, "agent.spawn", "agent.interrupt", true, undefined, false, false, false,
+      { enabled: true, runner })
+    expect(discoveryPersonaMemory.read).not.toHaveBeenCalled()
+
+    discoveryPersonaMemory.read.mockClear()
+    await taskGraphRootSurface(false, false, "agent.spawn", "agent.interrupt", true, undefined, true, false, true,
+      { enabled: true, runner })
+    expect(discoveryPersonaMemory.read).not.toHaveBeenCalled()
+
+    discoveryPersonaMemory.read.mockClear()
+    runner.mockClear()
+    discoveryPersonaMemory.compaction.kind = "overflow"
+    discoveryPersonaMemory.state.kind = "overflow"
+    const overflow = await taskGraphRootSurface(false, false, "agent.spawn", "agent.interrupt", true, undefined, true, false, false,
+      { enabled: true, runner })
+    expect(discoveryPersonaMemory.read).toHaveBeenCalledOnce()
+    expect(runner).not.toHaveBeenCalled()
+    expect(overflow.requests).toEqual([])
+    expect(overflow.route).not.toHaveBeenCalled()
+    expect(overflow.result).toMatchObject({ status: "failed" })
+  })
+
+  it("reloads compacted discovery state before sending the next full-memory request", async () => {
+    let compacted = false
+    const makeState = (narrative: string) => state({
+      source: "user", contextSnapshotPinned: false,
+      intent: { kind: "interactive_discovery_shortlist", version: 1 },
+      snapshot: { ...state().snapshot, toolObservations: [{ id: "discovery-narrative", content: { narrative } }] },
+    })
+    const initial = makeState("STALE_DISCOVERY_NARRATIVE_SENTINEL")
+    const refreshed = makeState("REFRESHED_DISCOVERY_NARRATIVE_SENTINEL")
+    const stateLoader = vi.fn(async () => compacted ? refreshed : initial)
+    const runner = vi.fn(async () => {
+      compacted = true
+      return { status: "compacted" as const }
+    })
+    const result = await taskGraphRootSurface(false, false, "agent.spawn", "agent.interrupt", true, undefined, true, false, false,
+      { enabled: true, runner, stateLoader })
+    const request = result.requests[0]
+    expect(request).toBeDefined()
+    expect(stateLoader).toHaveBeenCalledTimes(2)
+    expect(discoveryPersonaMemory.read).toHaveBeenCalledOnce()
+    expect(discoveryPersonaMemory.read).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      scope: { userId: "user-1" }, lease, rootTaskId: "root-1", rootAttemptCount: 1,
+    }))
+    expect(runner).toHaveBeenCalledWith(expect.objectContaining({ additionalInputTokens: 137 }))
+
+    const requestText = request?.messages.flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n") ?? ""
+    const [policyBlock, factsBlock] = discoveryPersonaContextBlocks(discoveryPersonaMemory.projection)
+    expect(requestText).toContain("REFRESHED_DISCOVERY_NARRATIVE_SENTINEL")
+    expect(requestText).not.toContain("STALE_DISCOVERY_NARRATIVE_SENTINEL")
+    expect(requestText).toContain(policyBlock.content)
+    expect(requestText).toContain(JSON.stringify(factsBlock.content))
+    expect(requestText).toContain("PRIVATE_DISCOVERY_PREFERENCE_SENTINEL")
+  })
+
+  it("rejects a full Persona-bearing request at real Harness admission before provider fetch", async () => {
+    let providerCalls = 0
+    const providerFetch: HarnessFetch = async () => {
+      providerCalls += 1
+      return new Response("provider_should_not_be_reached", { status: 500 })
+    }
+    const admissions: unknown[] = []
+    const modelRuntimeFactory: NonNullable<CanonicalTurnRuntimeOptions["modelRuntimeFactory"]> = async () => {
+      const runtime = createHarnessModelRuntime({
+        primary: { provider: "minimax", model: "MiniMax-M3", apiKey: "fixture-only-key" },
+        allowEnvironmentFallbacks: false, fetch: providerFetch,
+        onRequestAdmission: diagnostic => { admissions.push(diagnostic) },
+      })
+      const route = runtime.registry.list()[0]
+      if (!route) throw new Error("fixture_harness_route_missing")
+      runtime.registry.unregister(route.id)
+      runtime.registry.register({ ...route, profile: {
+        ...route.profile, maxContextTokens: 64, maxOutputTokens: 32, defaultMaxOutputTokens: 16,
+      } })
+      return runtime
+    }
+    const runner = vi.fn(async () => ({ status: "skipped" as const }))
+    const result = await taskGraphRootSurface(false, false, "agent.spawn", "agent.interrupt", true, undefined, true, false, false,
+      { enabled: true, runner, modelRuntimeFactory })
+
+    expect(discoveryPersonaMemory.load).toHaveBeenCalledOnce()
+    expect(admissions).toHaveLength(1)
+    expect(admissions[0]).toMatchObject({ status: "known", withinWindow: false })
+    expect(providerCalls).toBe(0)
+    expect(result.result).toMatchObject({ status: "failed" })
+    expect(result.route).not.toHaveBeenCalled()
   })
 
   it("fails before any model or tool call on overflow with safe visible recovery", async () => {
@@ -3609,7 +3763,7 @@ describe("createCanonicalTurnRuntime", () => {
     expect(expectedAnalystNextPage).toMatchObject({ availability: "available", graphRevision: 7, role: "analyst", offset: 3,
       resultStatus: "partial", totalCount: 4, evidenceCount: 6, nextOffset: null,
       items: [{ jobId: numericUuid, score: 9.25, evidenceKinds: ["job"] }] })
-    expect(expectedStalePage).toEqual({ schemaVersion: "agent-harness.v2.task-graph.result-page.v1", trust: "untrusted", availability: "unavailable",
+    expect(expectedStalePage).toEqual({ schemaVersion: "agent-harness.v2.task-graph.result-page.v2", trust: "untrusted", availability: "unavailable",
       graphRevision: 8, reason: "revision_mismatch" })
     expect(pageReads.map(entry => entry.request)).toEqual([
       { nodeKey: "scout-node", expectedRevision: 7, offset: 0 },

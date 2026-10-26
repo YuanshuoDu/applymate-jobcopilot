@@ -181,6 +181,8 @@ export type CompactionRequest = {
   readonly policy: CompactionTriggerPolicy
   readonly atTurnBoundary: boolean
   readonly requested: boolean
+  /** Advisory input budget reserve used only to decide whether compaction is due. */
+  readonly additionalInputTokens?: number
   readonly itemId?: string
   readonly bounds?: Partial<CompactionBounds>
 }
