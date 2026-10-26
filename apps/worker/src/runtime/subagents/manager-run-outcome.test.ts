@@ -11,6 +11,47 @@ const interrupted = new SubagentLeaseError("lost", "Parent was interrupted")
 const runNow = new Date("2026-09-23T00:00:00Z")
 
 describe("runClaimedSubagent", () => {
+  it.each(["child_resume_unavailable", "child_resume_evidence_unavailable"])(
+    "uses the generic failure reason when execute throws the reserved %s reason",
+    async failureReason => {
+      const finish = vi.fn().mockResolvedValue("failed")
+
+      await expect(runClaimedSubagent(
+        { finish }, payload, runLease, { lost: new Promise(() => undefined), interrupted: false },
+        async () => { throw new Error(failureReason) }, () => runNow, vi.fn(),
+      )).resolves.toEqual({ taskId: "task-1", status: "failed" })
+
+      expect(finish).toHaveBeenCalledWith(expect.objectContaining({ status: "failed", failureReason: "Subagent execution failed" }))
+    },
+  )
+
+  it.each(["child_resume_unavailable", "child_resume_evidence_unavailable"])(
+    "preserves an explicit returned failure reason of %s",
+    async failureReason => {
+      const finish = vi.fn().mockResolvedValue("failed")
+      const execute = vi.fn(async (): Promise<SubagentExecutionResult> => ({ status: "failed", failureReason }))
+
+      await expect(runClaimedSubagent(
+        { finish }, payload, runLease, { lost: new Promise(() => undefined), interrupted: false },
+        execute, () => runNow, vi.fn(),
+      )).resolves.toEqual({ taskId: "task-1", status: "failed" })
+
+      expect(finish).toHaveBeenCalledWith(expect.objectContaining({ status: "failed", failureReason }))
+    },
+  )
+
+  it("keeps the original message for unrelated execution exceptions", async () => {
+    const finish = vi.fn().mockResolvedValue("failed")
+    const exceptionMessage = "unexpected child execution failure"
+
+    await runClaimedSubagent(
+      { finish }, payload, runLease, { lost: new Promise(() => undefined), interrupted: false },
+      async () => { throw new Error(exceptionMessage) }, () => runNow, vi.fn(),
+    )
+
+    expect(finish).toHaveBeenCalledWith(expect.objectContaining({ status: "failed", failureReason: exceptionMessage }))
+  })
+
   it("finishes an ordinary result and always disposes the active lease", async () => {
     const finish = vi.fn().mockResolvedValue("completed")
     const dispose = vi.fn()

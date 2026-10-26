@@ -76,7 +76,7 @@ import { digestNativeVerificationValue } from "./subagents/native-verification-c
 import type { NativeVerificationEnsureResult, NativeVerificationPort } from "./subagents/native-verification-port.js"
 import type { NativeVerificationRuntime } from "./canonical-turn-native-verification-runtime.js"
 import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "./subagents/task-graph-pg-verification.js"
-import type { ValidatedRootTaskHistoryOutcome } from "./context/root-task-history.js"
+import { projectRootTaskHistory, type ValidatedRootTaskHistoryOutcome } from "./context/root-task-history.js"
 import { projectLoadedRootTaskHistoryGraph } from "./context/root-task-history-lesson-projection.js"
 import { buildCognitiveActionAgenda } from "./turns/cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE } from "./turns/cognitive-agenda-receipt.js"
@@ -1096,6 +1096,12 @@ describe("createCanonicalTurnRuntime", () => {
       ENABLE_AGENT_CROSS_SESSION_ROOT_TASK_HISTORY: "1",
       ENABLE_AGENT_OBJECTIVE_HISTORY_INDEX: "1",
     })
+    const crossSessionOutcome = { ...failedRootHistoryOutcome(), sourceNodeOrdinals: [1], sourceSessionDiffers: true,
+      terminalAt: new Date("2026-10-20T12:00:00.000Z") }
+    const sameSessionProbe = projectRootTaskHistory([{ ...crossSessionOutcome, sourceSessionDiffers: false }], true)
+    expect((sameSessionProbe?.content as { turns?: Array<{ planShape?: { nodes?: unknown[] } }> } | undefined)?.turns?.[0]?.planShape?.nodes)
+      .toEqual([{ ordinal: 1, role: "scout", dependsOnOrdinals: [] }])
+    rootTaskHistory.load.mockReset().mockImplementation(async () => [crossSessionOutcome])
     const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
       workerId: "worker-1", productionFlags: planningFlags, taskGraphCommandPort,
       taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
@@ -1123,6 +1129,15 @@ describe("createCanonicalTurnRuntime", () => {
 
     await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed", summary: "evidence_missing" })
     expect(requests).toHaveLength(2)
+    const capturedHistory = modelSnapshots[0]?.toolObservations.find(observation => observation.id === "root-task-history")
+    expect(capturedHistory?.content).toMatchObject({ kind: "root_task_history", historical: true,
+      turns: [{ nodes: [expect.objectContaining({ taskKind: "scout", status: "failed" })] }] })
+    expect(JSON.stringify(capturedHistory?.content)).not.toContain("planShape")
+    const capturedRequestText = requests[0]!.messages.flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    expect(capturedRequestText).toContain("root_task_history")
+    expect(capturedRequestText).toContain('"historical":true')
+    expect(capturedRequestText).not.toContain('"planShape"')
     for (const request of requests) {
       const names = request.tools.flatMap(tool => tool && typeof tool === "object" && "name" in tool && typeof tool.name === "string" ? [tool.name] : [])
       expect(names).toContain("agent.plan")
@@ -1192,7 +1207,16 @@ describe("createCanonicalTurnRuntime", () => {
       revision: 12,
       nodes: [
         failedNode("setup-failed", "child-setup", "selected_job_context_unavailable"),
-        failedNode("resume-failed", "child-resume", "child_resume_unavailable"),
+        {
+          ...failedNode("resume-failed", "child-resume", "child_resume_unavailable"),
+          verification,
+          verificationCriterionIds: ["candidate-count"],
+          verificationReport: {
+            verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "result_invalid",
+            criteria: [{ criterionId: "candidate-count", status: "unverified", reasonCode: "result_invalid" }],
+            evidenceDigest: null, resultDigest: null,
+          },
+        },
         failedNode("output-failed", "child-output", "invalid_structured_result"),
         { ...failedNode("unknown-failed", "child-unknown", privateReason), executionFailureCategory: "execution_setup_unavailable" },
         { ...failedNode("nonfailed-known-reason", "child-nonfailed", "selected_job_context_unavailable"), status: "completed", readiness: "terminal" },
@@ -3259,7 +3283,9 @@ describe("createCanonicalTurnRuntime", () => {
         ] },
       }, ...historicalFailureCases.map((failure, index) => ({
         key: failure.key, templateId: failure.templateId, goal: `PRIVATE_${failure.key.toUpperCase()}_GOAL`,
-        successCriteria: [`PRIVATE_${failure.key.toUpperCase()}_CRITERIA`], dependsOn: [], depth: 1,
+        successCriteria: [`PRIVATE_${failure.key.toUpperCase()}_CRITERIA`],
+        dependsOn: ["historical-scout", "historical-setup", "historical-resume"][index] ? [["historical-scout", "historical-setup", "historical-resume"][index]!] : [],
+        depth: index + 2,
         taskId: `${failure.key}-task`, verificationDisposition: "legacy_unverified" as const,
       }))],
     })
@@ -3634,6 +3660,18 @@ describe("createCanonicalTurnRuntime", () => {
           turns: [{ label: "earlier terminal attempt", nodes: expect.any(Array) }] } })
       const historyNodes = (block?.content as { turns?: Array<{ nodes?: Array<Record<string, unknown>> }> })?.turns?.[0]?.nodes ?? []
       expect(historyNodes).toHaveLength(4)
+      const shape = (block?.content as { turns?: Array<{ planShape?: unknown }> })?.turns?.[0]?.planShape
+      expect(shape).toEqual({
+        schemaVersion: "agent-harness.v2.root-task-history-plan-shape.v1",
+        ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
+        nodes: [
+          { ordinal: 1, role: "scout", dependsOnOrdinals: [] },
+          { ordinal: 2, role: "scout", dependsOnOrdinals: [1] },
+          { ordinal: 3, role: "analyst", dependsOnOrdinals: [2] },
+          { ordinal: 4, role: "writer", dependsOnOrdinals: [3] },
+        ],
+      })
+      expect(JSON.stringify(shape)).not.toMatch(/PRIVATE_HISTORY|private-history|PRIVATE_HISTORICAL|criterion|taskId|historical/)
       expect(historyNodes).toEqual(expect.arrayContaining([
         expect.objectContaining({ taskKind: "scout", status: "failed", negativeReasonHints: ["criterion_not_met"],
           lesson: expect.objectContaining({ ordinalScope: "source_graph_local", nodeOrdinal: 1,
@@ -3674,6 +3712,13 @@ describe("createCanonicalTurnRuntime", () => {
       expect(text).toContain("CURRENT_STEERING: prioritize roles with explicit salary ranges.")
       expect(text).toContain('"graphRevisionAtAsk":7')
       expect(text).toContain("root_task_history")
+      expect(text).toContain('"schemaVersion":"agent-harness.v2.root-task-history-plan-shape.v1"')
+      expect(text).toContain('"dependsOnOrdinals":[1],"ordinal":2,"role":"scout"')
+      expect(text).toContain('"dependsOnOrdinals":[2],"ordinal":3,"role":"analyst"')
+      expect(text).toContain('"dependsOnOrdinals":[3],"ordinal":4,"role":"writer"')
+      expect(text).toContain("A prior same-objective plan shape is a comparison hint about source-local roles and dependencies only")
+      expect(text).toContain("Historical source-local ordinals and reported success are never current command targets")
+      expect(text).toContain("current verification and completion gates remain authoritative")
       expect(text).toContain("criterion_not_met")
       expect(text).toContain('"kind":"candidate_count_gte"')
       expect(text).toContain('"minimum":1')
@@ -3710,6 +3755,7 @@ describe("createCanonicalTurnRuntime", () => {
       "For execution-setup cues, inspect the existing execution prerequisites for the child.",
       "For resume-state cues, inspect the current resume state and available evidence.",
       "For structured-output cues, inspect the existing typed output contract and current available result evidence.",
+      "A prior same-objective plan shape is a comparison hint about source-local roles and dependencies only. Its ordinals and edges are not current graph keys, identities, revision, objective, criteria, evidence, permission, authorization, approval, progress, or completion. Rebuild any plan from the current owner-read graph, current objective and criteria, current evidence, and visible tools; current verification and completion gates remain authoritative.",
     ].join(" ")
     for (const text of planningGuidance) {
       expect(text).toContain("owner-read graph observation for current node, criterion, and revision identities")

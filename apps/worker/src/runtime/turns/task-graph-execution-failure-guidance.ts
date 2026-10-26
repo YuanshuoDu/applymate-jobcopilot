@@ -1,5 +1,6 @@
 import type { ModelMessage } from "@jobcopilot/agent-model"
 import type { StepContext } from "../context/step-context-builder.js"
+import { parseTaskGraphCurrentVerificationMetadata } from "../canonical-turn-task-graph-verification-context.js"
 
 const CURRENT_GRAPH_ID = "observation:task-graph-current"
 const CURRENT_GRAPH_KIND = "task_graph_current"
@@ -66,6 +67,17 @@ function own(row: Row, key: string): Readonly<{ present: boolean; value?: unknow
   } catch { return { present: false } }
 }
 
+function canonicalResumeReport(node: Row): boolean {
+  const templateId = own(node, "templateId").value, key = own(node, "key").value, taskId = own(node, "taskId").value
+  if ((templateId !== "scout" && templateId !== "analyst") || typeof key !== "string" || typeof taskId !== "string") return false
+  const metadata = parseTaskGraphCurrentVerificationMetadata(node, templateId, key, taskId)
+  const ids = metadata?.verificationCriterionIds, contract = metadata?.verification, report = metadata?.verificationReport
+  return Boolean(ids && contract?.role === templateId && report?.status === "unverified" && report.reasonCode === "result_invalid"
+    && report.evidenceDigest === null && report.resultDigest === null && report.criteria.length === ids.length
+    && report.criteria.every((criterion, index) => criterion.criterionId === ids[index]
+      && criterion.status === "unverified" && criterion.reasonCode === "result_invalid"))
+}
+
 function currentCategories(context: StepContext): ReadonlySet<Category> | undefined {
   const contextRow = dataRecord(context)
   if (!contextRow) return undefined
@@ -96,9 +108,10 @@ function currentCategories(context: StepContext): ReadonlySet<Category> | undefi
     const category = own(node, "executionFailureCategory")
     if (!category.present) continue
     if (own(node, "status").value !== "failed" || own(node, "failureReason").value !== null
-      || own(node, "resultSummary").value !== null || own(node, "verificationReport").present
-      || own(node, "native").present || own(node, "nativeResult").present) continue
+      || own(node, "resultSummary").value !== null || own(node, "native").present || own(node, "nativeResult").present) continue
     if (typeof category.value !== "string" || !CATEGORIES.has(category.value as Category)) continue
+    const hasReport = own(node, "verificationReport").present
+    if (category.value === "resume_state_unavailable" ? !hasReport || !canonicalResumeReport(node) : hasReport) continue
     categories.add(category.value as Category)
   }
   return categories

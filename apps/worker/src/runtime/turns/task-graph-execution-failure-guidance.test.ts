@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest"
 import type { StepContext } from "../context/step-context-builder.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-verification-report.js"
 import {
   buildTaskGraphExecutionFailureInstruction,
   getTaskGraphExecutionFailureInspectionAdvice,
@@ -62,6 +64,17 @@ function failedNode(category: unknown, extra: Record<string, unknown> = {}) {
     failureReason: null, resultSummary: null, executionFailureCategory: category, ...extra }
 }
 
+function resumeFailedNode(role: "scout" | "analyst" = "scout") {
+  const criterionId = role === "scout" ? "candidate-count" : "finding-count"
+  const check = role === "scout" ? { kind: "candidate_count_gte", minimum: 4 } : { kind: "finding_count_gte", minimum: 2 }
+  return {
+    ...failedNode("resume_state_unavailable"), templateId: role, verificationCriterionIds: [criterionId],
+    verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role, criteria: [{ id: criterionId, check }] },
+    verificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "result_invalid",
+      criteria: [{ criterionId, status: "unverified", reasonCode: "result_invalid" }], evidenceDigest: null, resultDigest: null },
+  }
+}
+
 function context(nodes: unknown[], options: {
   contextRevision?: unknown
   graphRevision?: unknown
@@ -87,7 +100,8 @@ function text(value: ReturnType<typeof buildTaskGraphExecutionFailureInstruction
 
 describe("TaskGraph execution failure inspection guidance", () => {
   it.each(categories)("uses fixed advisory wording for %s", (category, expected) => {
-    const message = buildTaskGraphExecutionFailureInstruction(context([failedNode(category)]), [])
+    const node = category === "resume_state_unavailable" ? resumeFailedNode() : failedNode(category)
+    const message = buildTaskGraphExecutionFailureInstruction(context([node]), [])
     expect(message?.role).toBe("system")
     expect(message?.content).toHaveLength(1)
     expect(text(message)).toContain("untrusted advisory signals, not established root causes")
@@ -99,7 +113,7 @@ describe("TaskGraph execution failure inspection guidance", () => {
   })
 
   it("deduplicates categories in fixed order and keeps one bounded message", () => {
-    const nodes = [failedNode(categories[2][0]), failedNode(categories[0][0]), failedNode(categories[2][0]), failedNode(categories[1][0])]
+    const nodes = [failedNode(categories[2][0]), failedNode(categories[0][0]), failedNode(categories[2][0]), resumeFailedNode()]
     const first = buildTaskGraphExecutionFailureInstruction(context(nodes), [{ name: "agent.list" }])
     const second = buildTaskGraphExecutionFailureInstruction(context([...nodes].reverse()), [{ name: "agent.list" }])
     const guidance = text(first)
@@ -162,6 +176,33 @@ describe("TaskGraph execution failure inspection guidance", () => {
     ]
     for (const node of cases) expect(buildTaskGraphExecutionFailureInstruction(context([node]), [])).toBeNull()
     expect(buildTaskGraphExecutionFailureInstruction(context([{ status: "failed", failureReason: null, resultSummary: null }]), [])).toBeNull()
+  })
+
+  it("allows report-bearing resume advice only for the canonical typed Scout or Analyst failure", () => {
+    for (const role of ["scout", "analyst"] as const) {
+      expect(text(buildTaskGraphExecutionFailureInstruction(context([resumeFailedNode(role)]), [])))
+        .toContain("For resume-state cues, inspect the current resume state and available evidence.")
+    }
+
+    const valid = resumeFailedNode()
+    const report = valid.verificationReport
+    const criterion = report.criteria[0]!
+    const { verificationReport: _report, ...withoutReport } = valid
+    const rejected = [
+      withoutReport,
+      { ...valid, templateId: "writer" },
+      { ...valid, verificationReport: { ...report, reasonCode: "contract_invalid",
+        criteria: [{ ...criterion, reasonCode: "contract_invalid" }] } },
+      { ...valid, verificationReport: { ...report, criteria: [{ ...criterion, status: "failed" }] } },
+      { ...valid, verificationReport: { ...report, status: "passed", reasonCode: "criteria_met",
+        criteria: [{ ...criterion, status: "passed", reasonCode: "criteria_met" }], evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64) } },
+      { ...valid, verificationReport: { ...report, criteria: [{ ...criterion, criterionId: "other-criterion" }] } },
+      { ...valid, verificationReport: { ...report, evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64) } },
+      { ...valid, executionFailureCategory: "structured_output_invalid" },
+      { ...valid, native: {} },
+      { ...valid, nativeResult: {} },
+    ]
+    for (const node of rejected) expect(buildTaskGraphExecutionFailureInstruction(context([node]), [])).toBeNull()
   })
 
   it("does not invoke accessor-backed or proxied current records", () => {

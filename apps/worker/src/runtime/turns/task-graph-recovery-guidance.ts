@@ -58,6 +58,15 @@ function stringArray(value: unknown, maximum: number, itemLength: number): strin
   return values && values.every(item => boundedText(item, itemLength)) ? values as string[] : undefined
 }
 
+function canonicalResumeFailureReport(templateId: string, metadata: NonNullable<ReturnType<typeof parseTaskGraphCurrentVerificationMetadata>>): boolean {
+  const ids = metadata.verificationCriterionIds, contract = metadata.verification, report = metadata.verificationReport
+  return (templateId === "scout" || templateId === "analyst") && contract?.role === templateId
+    && !!ids && report?.status === "unverified"
+    && report.reasonCode === "result_invalid" && report.evidenceDigest === null && report.resultDigest === null
+    && report.criteria.length === ids.length && report.criteria.every((criterion, index) => criterion.criterionId === ids[index]
+      && criterion.status === "unverified" && criterion.reasonCode === "result_invalid")
+}
+
 function parseNode(value: unknown, rootTaskId: string): TaskGraphCurrentNode | undefined {
   const row = record(value, ["dependsOn", "failureReason", "goal", "key", "readiness", "resultProjection", "resultSummary", "status", "successCriteria", "taskId", "templateId"],
     ["executionFailureCategory", "native", "nativeResult", "repairOf", "repairReceipt", "structuredOutputFailureCategory", "verification", "verificationCriterionIds", "verificationReport"])
@@ -85,7 +94,10 @@ function parseNode(value: unknown, rootTaskId: string): TaskGraphCurrentNode | u
       }))) return undefined
   if (Object.hasOwn(row, "executionFailureCategory") && (row.status !== "failed"
     || typeof row.executionFailureCategory !== "string" || !EXECUTION_FAILURE_CATEGORIES.has(row.executionFailureCategory)
-    || Object.hasOwn(row, "verificationReport") || Object.hasOwn(row, "native") || Object.hasOwn(row, "nativeResult"))) return undefined
+    || Object.hasOwn(row, "native") || Object.hasOwn(row, "nativeResult")
+    || (row.executionFailureCategory === "resume_state_unavailable"
+      ? !Object.hasOwn(row, "verificationReport") || !canonicalResumeFailureReport(row.templateId, verification)
+      : Object.hasOwn(row, "verificationReport")))) return undefined
   return {
     key: row.key, taskId: row.taskId, templateId: row.templateId, goal: row.goal, successCriteria, dependsOn,
     status: row.status as TaskGraphCurrentNode["status"], readiness: row.readiness as TaskGraphCurrentNode["readiness"],

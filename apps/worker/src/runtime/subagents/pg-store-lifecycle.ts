@@ -2,7 +2,7 @@ import type pg from "pg"
 import { appendInternalAcceptedInterrupt } from "./task-interrupt-outbox.js"
 import { verifyTaskGraphNodeEvidence } from "./task-graph-pg-verification.js"
 import { parseTaskGraphRepairReceipt, parseTaskGraphVerificationReport, taskGraphVerificationReportMatchesStatus } from "./task-graph-command-port.js"
-import { TASK_GRAPH_VERIFIER_VERSION, type TaskGraphVerificationReport } from "./task-graph-verification-report.js"
+import type { TaskGraphVerificationReport } from "./task-graph-verification-report.js"
 import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.js"
 import { verifyScheduledPrepareTaskGraphEvidence } from "./scheduled-prepare-task-graph-verification.js"
 import { taskGraphVerificationDependencyNodeKeys } from "../planning/task-graph-verification.js"
@@ -15,6 +15,7 @@ import { deleteGraphDispatch, persistGraphTransition, prepareGraphTransition, re
 import { SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
 import { validateScheduledGateTaskGraphFinish } from "./pg-scheduled-task-graph-gate-verification.js"
 import { SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE, SCHEDULED_AUDIT_TEMPLATE_ID } from "./scheduled-audit-contract.js"
+import { plainObject, stripNonterminalDiscoveryRecovery, stripTaskGraphMetadata, taskGraphVerificationResult, unverifiedFailureReport } from "./pg-store-lifecycle-result.js"
 type Selector = Readonly<{ sessionId: string; userId?: string; turnId?: string; rootTaskId?: string; targetPath?: string }>
 type Candidate = Record<string, unknown> & Readonly<{ id: string; status: string; attemptCount: number; sessionId: string; userId: string; rootTaskId?: string; turnId?: string | null }>
 export async function prepareTaskGraphFinish(client: pg.PoolClient, input: { taskId: string; sessionId: string; attemptCount: number; status: string; retry: boolean; failureReason?: string; result: unknown; ownerId?: string; taskRole?: string; taskType?: string }): Promise<{ graph: GraphTransitionPreparation; status: string; failureReason?: string; result: unknown; reconcileDependents?: boolean }> {
@@ -141,38 +142,7 @@ export async function prepareTaskGraphFinish(client: pg.PoolClient, input: { tas
   graph = await prepareGraphTransition(client, { taskId: input.taskId, sessionId: input.sessionId, type: "task.failed", attemptCount: input.attemptCount, failureReason })
   return { graph, status: "failed", failureReason, result: finalizedResult(safeResult, "failed") }
 }
-const TASK_GRAPH_REPAIR_RECEIPT_SCHEMA = "agent-harness.v2.task-graph-repair-receipt.v1" as const; const RESERVED_RESULT_KEYS = new Set(["taskGraphVerificationReport", "verificationReport", "taskGraphRepairReceipt", "taskGraphScheduledPrepareProofFacts"])
-function unverifiedFailureReport(node: StoredTaskGraphNode): TaskGraphVerificationReport {
-  const reasonCode = node.verificationDisposition === "typed" && node.verification ? "result_invalid" : "contract_invalid"
-  return { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode, criteria: node.verification?.criteria.map(item => ({ criterionId: item.id, status: "unverified", reasonCode })) ?? [], evidenceDigest: null, resultDigest: null }
-}
-function plainObject(value: unknown): Record<string, unknown> | null {
-  let parsed = value; if (typeof parsed === "string") { try { parsed = JSON.parse(parsed) as unknown } catch { return null } }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null; const prototype = Object.getPrototypeOf(parsed)
-  return prototype === Object.prototype || prototype === null ? parsed as Record<string, unknown> : null
-}
-function stripNonterminalDiscoveryRecovery(value: unknown, status: string, retry: boolean): unknown {
-  if (status === "failed" && !retry) return value
-  const source = plainObject(value)
-  if (!source || !Object.hasOwn(source, "discoveryRecovery")) return value
-  const result = { ...source }
-  delete result.discoveryRecovery
-  return result
-}
-function stripTaskGraphMetadata(value: unknown, active = new Set<object>(), depth = 0): unknown {
-  if (depth > 32) return null
-  if (typeof value === "string" && depth > 0) return value
-  if (Array.isArray(value)) {
-    if (active.has(value)) return null; active.add(value)
-    try { return value.map(item => stripTaskGraphMetadata(item, active, depth + 1)) } finally { active.delete(value) }
-  }
-  const source = plainObject(value)
-  if (!source) return value; if (active.has(source)) return null
-  active.add(source)
-  try {
-    return Object.fromEntries(Object.entries(source).filter(([key]) => !RESERVED_RESULT_KEYS.has(key)).map(([key, child]) => [key, stripTaskGraphMetadata(child, active, depth + 1)]))
-  } finally { active.delete(source) }
-}
+const TASK_GRAPH_REPAIR_RECEIPT_SCHEMA = "agent-harness.v2.task-graph-repair-receipt.v1" as const
 async function validateRepairTarget(client: pg.PoolClient, graph: Exclude<GraphTransitionPreparation, null | Readonly<{ blocked: true }>>, node: (typeof graph.snapshot.nodes)[number], taskId: string, report: TaskGraphVerificationReport): Promise<Record<string, unknown> | null> { const relation = node.repairOf
   if (!relation || relation.graphRootTaskId !== graph.scope.rootTaskId || !/^[a-f0-9]{64}$/.test(report.evidenceDigest ?? "")) return null
   const targetNode = graph.snapshot.nodes.find(candidate => candidate.key === relation.nodeKey)
@@ -208,10 +178,6 @@ async function priorRepairResolves(client: pg.PoolClient, graph: Exclude<GraphTr
     const ids = node.verification.criteria.map(item => item.id), report = parseTaskGraphVerificationReport(result?.taskGraphVerificationReport, ids)
     return Boolean(parseTaskGraphRepairReceipt(result?.taskGraphRepairReceipt, { repairOf: node.repairOf, repairNodeKey: node.key, repairTaskId: node.taskId, report })?.criterionIds.some(id => relation.criterionIds.includes(id)))
   })
-}
-function taskGraphVerificationResult(value: unknown, report: unknown, boundResult: unknown, repairReceipt: Record<string, unknown> | null): unknown { const safe = stripTaskGraphMetadata(plainObject(value) ?? { workerResult: value }) as Record<string, unknown>
-  if (boundResult !== undefined) safe.structuredResult = boundResult; else delete safe.structuredResult
-  return { ...safe, taskGraphVerificationReport: report, ...(repairReceipt ? { taskGraphRepairReceipt: repairReceipt } : {}) }
 }
 export async function interruptTree(pool: PgSubagentPool, input: { sessionId: string; rootTaskId: string; now: Date }): Promise<number> {
   return interruptMatching(pool, { sessionId: input.sessionId, rootTaskId: input.rootTaskId }, input.now)

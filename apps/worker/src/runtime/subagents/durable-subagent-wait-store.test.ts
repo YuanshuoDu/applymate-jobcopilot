@@ -5,7 +5,7 @@ vi.mock("./role-policy.js", async importOriginal => {
   const scout = actual.getSubagentRolePolicy("scout")!
   return { ...actual, getSubagentRolePolicy: (role: string) => role === "wait-enabled" ? { ...scout, canManageChildren: true } : actual.getSubagentRolePolicy(role) }
 })
-import { recoverExpiredWaitRegistration, registerDurableSubagentWait } from "./durable-subagent-wait-store.js"
+import { recoverExpiredWaitRegistration, registerDurableSubagentWait, safeSubagentWaitJson } from "./durable-subagent-wait-store.js"
 import type { SubagentLease } from "./types.js"
 
 const now = new Date("2026-10-22T10:00:00.000Z")
@@ -71,6 +71,13 @@ function fixture() {
 }
 
 describe("registerDurableSubagentWait", () => {
+  it("preserves only a structurally valid UUID in a waitId field while redacting other strings", () => {
+    const waitId = "00000000-0000-4000-8000-000000000000"
+    expect(safeSubagentWaitJson({ outcome: { waitId, note: waitId, nested: { waitId: "+353 87 123 4567" } } })).toEqual({
+      outcome: { waitId, note: "[REDACTED_PHONE]", nested: { waitId: "[REDACTED_PHONE]" } },
+    })
+  })
+
   it("reconstructs only the exact persisted, admitted pre-insert wait and preserves its original deadline", async () => {
     const fake = fixture(), startedAt = new Date(now.getTime() - 10_000), expiredLease = new Date(now.getTime() - 1_000)
     const oldLease = { ...lease(), leaseExpiresAt: expiredLease }

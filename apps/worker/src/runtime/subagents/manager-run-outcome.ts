@@ -49,7 +49,13 @@ export async function runClaimedSubagent(
           if (!active.interrupted) return { taskId: payload.taskId, status: "lease_lost", reason: error.message }
           return await finishInterrupted(store, payload, lease, error, now())
         }
-        result = { status: "failed", failureReason: error instanceof Error ? error.message : "Subagent execution failed" }
+        const failureReason = error instanceof Error ? error.message : "Subagent execution failed"
+        result = {
+          status: "failed",
+          failureReason: failureReason === "child_resume_unavailable" || failureReason === "child_resume_evidence_unavailable"
+            ? "Subagent execution failed"
+            : failureReason,
+        }
       }
       for (const id of uniqueIds(result.mailboxMessageIds)) observed.add(id)
       if (continuation && result.status === "failed") {

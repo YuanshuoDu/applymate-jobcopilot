@@ -77,6 +77,18 @@ function failedTaskGraphNode(
   }
 }
 
+function resumeFailedTaskGraphNode(key: string): TaskGraphCurrentNode {
+  const criterionId = "candidate-count"
+  return {
+    ...failedTaskGraphNode("child_resume_unavailable", key),
+    verificationCriterionIds: [criterionId],
+    verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+      criteria: [{ id: criterionId, check: { kind: "candidate_count_gte", minimum: 1 } }] },
+    verificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "result_invalid",
+      criteria: [{ criterionId, status: "unverified", reasonCode: "result_invalid" }], evidenceDigest: null, resultDigest: null },
+  }
+}
+
 function taskGraphContext(nodes: readonly TaskGraphCurrentNode[], withRecovery = false): StepContext {
   const revision = GRAPH_REVISION
   let seed: StepContextSnapshot = { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }
@@ -670,7 +682,7 @@ describe("TurnEngine model message mapping", () => {
   it("adds fixed advisory guidance from the actual current projection and keeps every category signal untrusted", () => {
     const nodes = [
       failedTaskGraphNode("child_turn_missing", "setup"),
-      failedTaskGraphNode("child_resume_unavailable", "resume"),
+      resumeFailedTaskGraphNode("resume"),
       failedTaskGraphNode("invalid_structured_result", "structured"),
     ]
     const tools = [{ name: "agent.list", version: "1" }, { name: "agent.plan", version: "1" }]
@@ -760,7 +772,7 @@ describe("TurnEngine model message mapping", () => {
     const categorizedContext = taskGraphContext([
       typed,
       failedTaskGraphNode("child_turn_missing", "setup"),
-      failedTaskGraphNode("child_resume_unavailable", "resume"),
+      resumeFailedTaskGraphNode("resume"),
       failedTaskGraphNode("invalid_structured_result", "structured"),
     ], true)
     const baselineBlocks = JSON.stringify(baselineContext.blocks)

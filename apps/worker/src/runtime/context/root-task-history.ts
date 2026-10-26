@@ -10,6 +10,7 @@ import type { SubagentTaskStatus } from "../subagents/types.js"
 import type { ContextSeedBlock } from "./step-context-builder.js"
 import { filterRootTaskHistoryLessonsForEmittedNodes, parseRootTaskHistoryNodeLesson, sanitizeRootTaskHistoryNodeLessonForCrossSession, type RootTaskHistoryNodeLesson } from "./root-task-history-lesson-projection.js"
 import { parseRootTaskHistoryReportedOutput, type RootTaskHistoryReportedOutput } from "./root-task-history-result-counts.js"
+import { buildRootTaskHistoryPlanShape, type RootTaskHistoryPlanShape } from "./root-task-history-plan-shape.js"
 
 export type ValidatedRootTaskHistoryOutcome = Readonly<{
   sourceTurnId: string
@@ -30,8 +31,8 @@ type SafeNode = Readonly<{
 }>
 type CandidateNode = Readonly<{ nodeOrdinal: number; projection: Omit<SafeNode, "lesson" | "reportedOutput">; lesson?: RootTaskHistoryNodeLesson; reportedOutput?: RootTaskHistoryReportedOutput }>
 type Candidate = Readonly<{ sourceTurnId: string; sourceRootTaskId: string; terminalSequence: bigint; terminalAt?: Date; sourceSessionDiffers: boolean; safeNodes: readonly CandidateNode[];
-  lessonsBySourceOrdinal?: readonly (RootTaskHistoryNodeLesson | undefined)[]; identity: string }>
-type SelectedTurn = { label: string; candidate: Candidate; nodes: CandidateNode[]; lessonOrdinals: Set<number>; reportedOutputOrdinals: Set<number> }
+  lessonsBySourceOrdinal?: readonly (RootTaskHistoryNodeLesson | undefined)[]; planShape?: RootTaskHistoryPlanShape; identity: string }>
+type SelectedTurn = { label: string; candidate: Candidate; nodes: CandidateNode[]; lessonOrdinals: Set<number>; reportedOutputOrdinals: Set<number>; planShape?: RootTaskHistoryPlanShape }
 type Row = Record<string, unknown>
 const MAX_CANDIDATES = 64
 const MAX_TURNS = 2
@@ -144,6 +145,7 @@ function candidate(value: unknown, crossSession: boolean): Candidate | null {
     || !Array.isArray(graph.nodes) || graph.nodes.length < 1 || graph.nodes.length > MAX_NODES || !dense(graph.nodes)) return null
   const ordinals = hasOrdinals ? sourceOrdinals(item.sourceNodeOrdinals, graph.nodes.length) : undefined
   const effectiveOrdinals = ordinals ?? graph.nodes.map((_, index) => index + 1)
+  const planShape = !sourceSessionDiffers && ordinals ? buildRootTaskHistoryPlanShape(graph, item.sourceNodeOrdinals) : undefined
   const lessons = hasLessons && ordinals ? nodeLessons(item.nodeLessons, graph.nodes.length, ordinals, graph.nodes) : undefined
   const outputs = hasOutputs ? reportedOutputs(item.reportedOutputs, graph.nodes) : undefined
   const nodes = graph.nodes.map((value, index) => {
@@ -160,10 +162,11 @@ function candidate(value: unknown, crossSession: boolean): Candidate | null {
     sourceTurnId: item.sourceTurnId, sourceRootTaskId: item.sourceRootTaskId,
     terminalSequence: item.terminalSequence, ...(crossSession ? { terminalAt: item.terminalAt as Date } : {}),
     sourceSessionDiffers, ...(lessons ? { lessonsBySourceOrdinal: lessons } : {}),
+    ...(planShape ? { planShape } : {}),
     safeNodes, identity: JSON.stringify([item.sourceTurnId, item.sourceRootTaskId]),
   }
 }
-function content(turns: readonly Readonly<{ label: string; nodes: readonly SafeNode[] }>[], crossSession = false) {
+function content(turns: readonly Readonly<{ label: string; nodes: readonly SafeNode[]; planShape?: RootTaskHistoryPlanShape }>[], crossSession = false) {
   return {
     kind: "root_task_history",
     informationalOnly: true,
@@ -185,7 +188,8 @@ function emittedNodes(turn: SelectedTurn, withLessons: boolean, withReportedOutp
   })
 }
 function emittedTurns(turns: readonly SelectedTurn[], withLessons: boolean, withReportedOutputs: boolean) {
-  return turns.map(turn => ({ label: turn.label, nodes: emittedNodes(turn, withLessons, withReportedOutputs) }))
+  return turns.map(turn => ({ label: turn.label, nodes: emittedNodes(turn, withLessons, withReportedOutputs),
+    ...(turn.planShape ? { planShape: turn.planShape } : {}) }))
 }
 function withinContentLimit(turns: readonly SelectedTurn[], withLessons = false, withReportedOutputs = false, crossSession = false): boolean {
   const serialized = JSON.stringify({ id: "root-task-history", content: content(emittedTurns(turns, withLessons, withReportedOutputs), crossSession) })
@@ -198,7 +202,7 @@ function projectCandidates(values: readonly Candidate[], crossSession: boolean):
     const previous = byIdentity.get(value.identity)
     if (!previous) byIdentity.set(value.identity, value)
     else if (previous.terminalSequence !== value.terminalSequence || previous.sourceSessionDiffers !== value.sourceSessionDiffers || previous.terminalAt?.getTime() !== value.terminalAt?.getTime()
-      || JSON.stringify(previous.safeNodes) !== JSON.stringify(value.safeNodes)) {
+      || JSON.stringify(previous.safeNodes) !== JSON.stringify(value.safeNodes) || JSON.stringify(previous.planShape) !== JSON.stringify(value.planShape)) {
       byIdentity.delete(value.identity); conflicts.add(value.identity)
     }
   }
@@ -218,9 +222,19 @@ function projectCandidates(values: readonly Candidate[], crossSession: boolean):
       if (node.reportedOutput) entry.reportedOutputOrdinals.add(node.nodeOrdinal)
       nodeCount += 1
     }
+    const selectedOrdinals = new Set(entry.nodes.map(node => node.nodeOrdinal))
+    if (value.planShape && entry.nodes.length === value.planShape.nodes.length
+      && value.planShape.nodes.every(node => selectedOrdinals.has(node.ordinal))) entry.planShape = value.planShape
     if (entry.nodes.length) turns.push(entry)
   }
   if (!turns.length) return undefined
+  if (!withinContentLimit(turns, true, true, crossSession)) {
+    for (const turn of [...turns].reverse()) {
+      if (!turn.planShape) continue
+      delete turn.planShape
+      if (withinContentLimit(turns, true, true, crossSession)) break
+    }
+  }
   if (!withinContentLimit(turns, true, true, crossSession)) {
     for (const turn of [...turns].reverse()) for (const node of [...turn.nodes].reverse()) turn.reportedOutputOrdinals.delete(node.nodeOrdinal)
   }
