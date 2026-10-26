@@ -232,8 +232,8 @@ async function insertMigrationFixtureTask(pool: Pool, input: {
   id: string; fixture: Fixture; parentTaskId: string; depth: number; role: string; taskType: string; goal: string
 }): Promise<void> {
   await pool.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth",
-      "role", "taskType", "status", "goal", "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema")
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'queued', $10, '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, '{}'::jsonb)`,
+      "role", "taskType", "status", "goal", "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "updatedAt")
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'queued', $10, '[]'::jsonb, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP)`,
   [input.id, input.fixture.sessionId, input.fixture.turnId, input.fixture.rootTaskId, input.parentTaskId,
     `/root/${input.id}`, input.depth, input.role, input.taskType, input.goal])
 }
@@ -479,8 +479,10 @@ withServices("TaskGraph deadline recovery on disposable PostgreSQL and Redis", (
       .resolves.toBeNull()
     const dependent = await pool!.query(`SELECT "status" FROM "sub_agent_tasks" WHERE "id" = $1`, [children.dependent])
     expect(dependent.rows[0]?.status).toBe("cancelled")
-    const usage = await pool!.query(`SELECT "status", "inputTokens", "outputTokens", "estimatedCostUsd" FROM "agent_turns" WHERE "id" = $1`, [fixture.fixture.turnId])
-    expect(usage.rows[0]).toMatchObject({ status: "waiting_for_dependency", inputTokens: 71, outputTokens: 19, estimatedCostUsd: "0.125" })
+    const usage = await pool!.query(`SELECT "status", "inputTokens", "outputTokens",
+        "estimatedCostUsd" = 0.125::numeric AS "estimatedCostUsdPreserved"
+      FROM "agent_turns" WHERE "id" = $1`, [fixture.fixture.turnId])
+    expect(usage.rows[0]).toMatchObject({ status: "waiting_for_dependency", inputTokens: 71, outputTokens: 19, estimatedCostUsdPreserved: true })
 
     const resolver = startDurableWaitResolver(pool!, { intervalMs: 10, batchSize: 10, ownerId: `deadline-wake-${fixture.fixture.suffix}` })
     try {
@@ -496,8 +498,10 @@ withServices("TaskGraph deadline recovery on disposable PostgreSQL and Redis", (
         FROM "agent_events" AS event JOIN "agent_outbox" AS outbox ON outbox."idempotencyKey" = 'agent-event:' || event."id"
         WHERE event."turnId" = $1 AND event."type" = 'turn.resumed' AND event."causationId" = $2`, [fixture.fixture.turnId, children.waitId])
       expect(wake.rows).toMatchObject([{ actor: "system", type: "turn.resumed" }])
-      const finalUsage = await pool!.query(`SELECT "inputTokens", "outputTokens", "estimatedCostUsd" FROM "agent_turns" WHERE "id" = $1`, [fixture.fixture.turnId])
-      expect(finalUsage.rows[0]).toMatchObject({ inputTokens: 71, outputTokens: 19, estimatedCostUsd: "0.125" })
+      const finalUsage = await pool!.query(`SELECT "inputTokens", "outputTokens",
+          "estimatedCostUsd" = 0.125::numeric AS "estimatedCostUsdPreserved"
+        FROM "agent_turns" WHERE "id" = $1`, [fixture.fixture.turnId])
+      expect(finalUsage.rows[0]).toMatchObject({ inputTokens: 71, outputTokens: 19, estimatedCostUsdPreserved: true })
     } finally { await resolver.close() }
   })
 
