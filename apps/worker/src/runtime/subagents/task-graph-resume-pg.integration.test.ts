@@ -9985,6 +9985,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let replacementPlanCommandDiagnostic = "not_called"
     let canonicalExecutionDiagnostic = "not_observed"
     let finalGraphVerified = false
+    let replacementWaitResumePath: "same_adapter" | "fresh_adapter" | null = null
     const flags: ProductionAgentFlags = {
       taskGraphPlanningEnabled: true, childExecutionEnabled: true, coordinationEnabled: true,
       consumeWaitOutcomes: true, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false,
@@ -10401,7 +10402,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               yield { type: "completed", finishReason: "tool_calls" }
               return
             }
-            if (execution === 3 && round === 1) {
+            // A durable wait may resume the same adapter or create a fresh one.
+            // Both paths must consume the replacement wait result and verify the new graph.
+            if ((execution === 2 && round === replacementAcceptedRound + 1) || (execution === 3 && round === 1)) {
               const outcome = repairWaitOutcomeFromRequest(request, replacementWaitCallId, replacementTaskIds)
               expect(outcome.status).toBe("ready")
               const waitTaskStatuses = new Map<string, unknown>()
@@ -10422,6 +10425,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               expectPassedVerificationReport(nodes.find(node => node?.key === "analyst-replacement")?.verificationReport, "finding-count")
               expect(nodes.find(node => node?.key === "independent")).toEqual(observedIndependentNode)
               finalGraphVerified = true
+              replacementWaitResumePath = execution === 2 ? "same_adapter" : "fresh_adapter"
               yield { type: "text_delta", text: "The operational failure was replaced and verified with fresh Scout and Analyst tasks." }
               yield { type: "completed", finishReason: "stop" }
               return
@@ -10492,7 +10496,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(turn.rows[0]?.rootTaskId).toBe(rootTaskId)
     expect(turn.rows[0]?.status).toBe("completed")
     expect(turn.rows[0]?.finalResponse).toContain("operational failure was replaced and verified")
-    expect(rootExecutions).toBe(3)
+    if (replacementWaitResumePath === "same_adapter") {
+      expect(rootExecutions).toBe(2)
+    } else {
+      expect(replacementWaitResumePath).toBe("fresh_adapter")
+      expect(rootExecutions).toBe(3)
+    }
     expect(initialTaskIds).toHaveLength(2)
     expect(independentTaskId).not.toBe("")
     expect(replacementTaskIds).toHaveLength(2)
