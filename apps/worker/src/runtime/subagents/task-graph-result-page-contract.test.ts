@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import {
-  TASK_GRAPH_RESULT_PAGE_SCHEMA, isCanonicalTaskGraphJobId, parseTaskGraphResultPage,
+  TASK_GRAPH_RESULT_PAGE_SCHEMA, TASK_GRAPH_RESULT_PAGE_V1_SCHEMA, isCanonicalTaskGraphJobId,
+  parseTaskGraphResultPage, parseTaskGraphResultPageV1,
   parseTaskGraphResultPageRequest,
 } from "./task-graph-result-page-contract.js"
 
@@ -62,6 +63,41 @@ describe("TaskGraph result page contract", () => {
     expect(parseTaskGraphResultPage({ schemaVersion: TASK_GRAPH_RESULT_PAGE_SCHEMA, trust: "untrusted", availability: "unavailable",
       graphRevision: 0, reason: "no_graph" })).toEqual({ schemaVersion: TASK_GRAPH_RESULT_PAGE_SCHEMA, trust: "untrusted",
       availability: "unavailable", graphRevision: 0, reason: "no_graph" })
+  })
+
+  it("accepts only well-formed bounded summaries on completed Analyst offset-zero pages", () => {
+    const analystPage = {
+      schemaVersion: TASK_GRAPH_RESULT_PAGE_SCHEMA, trust: "untrusted", availability: "available", graphRevision: 7,
+      role: "analyst", taskStatus: "completed", resultStatus: "completed", totalCount: 1, evidenceCount: 1,
+      offset: 0, nextOffset: null, analysisSummary: "🌱".repeat(128), analysisSummaryTruncated: false,
+      items: [{ jobId: CUID, score: 8, evidenceKinds: ["job"] }],
+    }
+    expect(parseTaskGraphResultPage(analystPage)).toEqual(analystPage)
+    expect(parseTaskGraphResultPage({ ...analystPage, analysisSummary: "🌱".repeat(129) })).toBeNull()
+    expect(parseTaskGraphResultPage({ ...analystPage, analysisSummary: "bad\ud800text" })).toBeNull()
+    expect(parseTaskGraphResultPage({ ...analystPage, analysisSummaryTruncated: undefined })).toBeNull()
+    expect(parseTaskGraphResultPage({ ...analystPage, totalCount: 4, offset: 3, nextOffset: null,
+      items: [{ jobId: CUID, score: 8, evidenceKinds: ["job"] }] })).toBeNull()
+    expect(parseTaskGraphResultPage({ ...analystPage, resultStatus: "partial" })).toBeNull()
+    expect(parseTaskGraphResultPage({ ...analystPage, taskStatus: "failed" })).toBeNull()
+    expect(parseTaskGraphResultPage({ ...analystPage, role: "scout", items: [{ jobId: CUID, source: "other", evidenceKinds: ["job"] }] })).toBeNull()
+  })
+
+  it("reads only exact v1 pages for historical compatibility, outside the v2 output schema", () => {
+    const v1 = {
+      schemaVersion: TASK_GRAPH_RESULT_PAGE_V1_SCHEMA, trust: "untrusted", availability: "available", graphRevision: 7,
+      role: "analyst", taskStatus: "completed", resultStatus: "completed", totalCount: 1, evidenceCount: 1,
+      offset: 0, nextOffset: null, items: [{ jobId: CUID, score: 8, evidenceKinds: ["job"] }],
+    }
+    expect(parseTaskGraphResultPageV1(v1)).toEqual(v1)
+    expect(parseTaskGraphResultPage(v1)).toBeNull()
+    expect(parseTaskGraphResultPageV1({ ...v1, analysisSummary: "not part of v1" })).toBeNull()
+    expect(parseTaskGraphResultPageV1({ ...v1, schemaVersion: TASK_GRAPH_RESULT_PAGE_SCHEMA })).toBeNull()
+    const unavailableV1 = {
+      schemaVersion: TASK_GRAPH_RESULT_PAGE_V1_SCHEMA, trust: "untrusted", availability: "unavailable",
+      graphRevision: 0, reason: "no_graph",
+    }
+    expect(parseTaskGraphResultPageV1(unavailableV1)).toEqual(unavailableV1)
   })
 
   it("rejects sparse arrays, symbol keys, proxies and cycles before validation reads them", () => {
