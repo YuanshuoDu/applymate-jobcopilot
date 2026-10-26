@@ -344,10 +344,15 @@ describe("TurnEngine model message mapping", () => {
       ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 3,
       criterionFailures: [], executionFailureCategory: "structured_output_invalid",
     } }
+    const failedRepairNode: JsonValue = { taskKind: "analyst", status: "failed", lesson: {
+      ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 4,
+      criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" }],
+      failedRepairOf: { targetNodeOrdinal: 2, targetCriterionOrdinals: [1], outcome: "verified_failed" },
+    } }
     const rootHistoryContent: JsonValue = {
       kind: "root_task_history", informationalOnly: true, advisoryOnly: true, notCurrentEvidence: true,
       label: "Earlier outcomes for the same verifier objective; advisory context only.",
-      turns: [{ label: "earlier terminal attempt", nodes: [...rootHistoryNodes, categoryNode] }],
+      turns: [{ label: "earlier terminal attempt", nodes: [...rootHistoryNodes, categoryNode, failedRepairNode] }],
     }
     const rootHistory = {
       id: "observation:root-task-history", layer: "tool_observation" as const, role: "data" as const,
@@ -372,12 +377,21 @@ describe("TurnEngine model message mapping", () => {
     expect(system).toContain("use the visible agent.list only for matching result pages")
     expect(system).toContain("Null ends paging for that node and revision only")
     expect(system).toContain("expectedRevision 12")
+    const failedRepairCue = "A historical repair was verifier-failed; reassess the current graph, verifier evidence, and current result pages before planning."
+    expect(system.split(failedRepairCue)).toHaveLength(2)
+    expect(system).not.toContain("failedRepairOf")
+    expect(system).not.toContain("targetNodeOrdinal")
+    expect(system).not.toContain("targetCriterionOrdinals")
+    expect(system).not.toContain("verified_failed")
     expect(system).not.toContain("criterion_not_met")
     expect(system).not.toContain("nodeOrdinal")
     expect(system).not.toContain("criterionOrdinal")
     expect(system).not.toContain("33")
     expect(user).toContain("\"kind\":\"root_task_history\"")
+    expect(user).toContain("UNTRUSTED_DATA source=tool_or_subagent")
     expect(user).toContain("executionFailureCategory")
+    expect(user).toContain('"targetNodeOrdinal":2')
+    expect(user).toContain('"targetCriterionOrdinals":[1]')
     expect(user).toContain("structured_output_invalid")
     expect(request.tools).toEqual(tools)
 
@@ -409,7 +423,7 @@ describe("TurnEngine model message mapping", () => {
       "Use the visible agent.plan only with current node/criterion identities and expectedRevision 12; if current evidence does not support a targeted change, preserve the valid plan. Current verification and completion gates remain authoritative.",
     ].join(" ")
     expect(historyText(baseline.messages)).toBe(legacyHistoryText)
-    expect(historyText(request.messages)).toBe(`${legacyHistoryText} ${expectedSuffix}`)
+    expect(historyText(request.messages)).toBe(`${legacyHistoryText} ${failedRepairCue} ${expectedSuffix}`)
     expect(request.messages.filter(message => message.role === "system" && !isHistoryInstruction(message)))
       .toEqual(baseline.messages.filter(message => message.role === "system" && !isHistoryInstruction(message)))
     expect(system).not.toBe(systemWithoutCategory)
