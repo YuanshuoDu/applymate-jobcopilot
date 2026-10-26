@@ -1,9 +1,15 @@
-import { Type, type TSchema } from "@sinclair/typebox"
+import { Type } from "@sinclair/typebox"
 import { schemaVersion } from "@jobcopilot/agent-protocol"
 import { redactSensitiveText } from "@jobcopilot/shared"
-import { TASK_GRAPH_LIMITS, type TaskGraphNodeProposal, type TaskGraphProposal, type TaskGraphRepairOf } from "../planning/task-graph.js"
-import { TaskGraphBranchReplacementInputSchema, parseTaskGraphBranchReplacement, type TaskGraphBranchReplacement } from "../planning/task-graph-branch-replacement.js"
-import { TASK_GRAPH_VERIFICATION_LIMITS, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, taskGraphVerificationRole, type TaskGraphVerificationRole } from "../planning/task-graph-verification.js"
+import { TASK_GRAPH_LIMITS, type TaskGraphProposal } from "../planning/task-graph.js"
+import {
+  TaskGraphProposalInputSchema,
+  buildTaskGraphProposalInputSchema,
+  normalizeTaskGraphPlanningNodes,
+  parseTaskGraphPlanningReplacementModes,
+  type TaskGraphProposalInput,
+} from "./task-graph-planning-input.js"
+import { TASK_GRAPH_VERIFICATION_LIMITS, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import type { TaskGraphObjectiveCoverageRejection } from "../planning/task-graph-objective-coverage.js"
 import type { RootTaskVerificationRequirementsResolution } from "../context/root-task-objective.js"
 import type {
@@ -15,97 +21,9 @@ import { normalizeRootPlanCriteria } from "../subagents/root-plan-criteria.js"
 
 import { ToolExecutionError, type RuntimeToolDefinition, type ToolExecutionContext } from "./types.js"
 import { createSteeringReconciliationTool, steeringReconciliationOperation, type ReconciliationFenceOptions } from "./steering-reconciliation.js"
+export { TaskGraphProposalInputSchema }
 
-function verificationCheckSchema(role: TaskGraphVerificationRole): TSchema {
-  const evidence = Type.Object({ kind: Type.Literal("evidence_count_gte"), minimum: Type.Integer({ minimum: 1, maximum: TASK_GRAPH_VERIFICATION_LIMITS.maxItems }) }, { additionalProperties: false })
-  const roleChecks: TSchema[] = role === "scout"
-    ? [
-      Type.Object({ kind: Type.Literal("candidate_count_gte"), minimum: Type.Integer({ minimum: 1, maximum: TASK_GRAPH_VERIFICATION_LIMITS.maxItems }) }, { additionalProperties: false }),
-      Type.Object({ kind: Type.Literal("all_candidates_have_evidence"), minimumItems: Type.Integer({ minimum: 1, maximum: TASK_GRAPH_VERIFICATION_LIMITS.maxItems }) }, { additionalProperties: false }),
-    ]
-    : [
-      Type.Object({ kind: Type.Literal("finding_count_gte"), minimum: Type.Integer({ minimum: 1, maximum: TASK_GRAPH_VERIFICATION_LIMITS.maxItems }) }, { additionalProperties: false }),
-      Type.Object({ kind: Type.Literal("all_findings_have_evidence"), minimumItems: Type.Integer({ minimum: 1, maximum: TASK_GRAPH_VERIFICATION_LIMITS.maxItems }) }, { additionalProperties: false }),
-      Type.Object({
-        kind: Type.Literal("reported_score_gte"), minimumScore: Type.Number({ minimum: 0, maximum: TASK_GRAPH_VERIFICATION_LIMITS.maxScore }),
-        minimumFindings: Type.Integer({ minimum: 1, maximum: TASK_GRAPH_VERIFICATION_LIMITS.maxItems }),
-        aggregation: Type.Union([Type.Literal("any"), Type.Literal("all")]),
-      }, { additionalProperties: false }),
-      Type.Object({
-        kind: Type.Literal("findings_from_scout_dependency"),
-        dependencyNodeKey: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
-      }, { additionalProperties: false }),
-      Type.Object({
-        kind: Type.Literal("findings_cover_scout_candidates_gte"),
-        dependencyNodeKey: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
-        minimumPercent: Type.Integer({ minimum: 1, maximum: 100 }),
-      }, { additionalProperties: false }),
-    ]
-  return Type.Union([evidence, ...roleChecks] as [TSchema, ...TSchema[]])
-}
-
-function verificationSchema(role: TaskGraphVerificationRole): TSchema {
-  return Type.Object({
-    schemaVersion: Type.Literal(TASK_GRAPH_VERIFICATION_SCHEMA_VERSION),
-    role: Type.Literal(role),
-    criteria: Type.Array(Type.Object({
-      id: Type.String({ minLength: 1, maxLength: TASK_GRAPH_VERIFICATION_LIMITS.maxCriterionIdLength, pattern: "^[a-z][a-z0-9._-]{0,63}$" }),
-      check: verificationCheckSchema(role),
-    }, { additionalProperties: false }), { minItems: 1, maxItems: TASK_GRAPH_VERIFICATION_LIMITS.maxCriteria }),
-  }, { additionalProperties: false })
-}
-function repairOfSchema(): TSchema {
-  return Type.Object({
-    graphRootTaskId: Type.Optional(Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength })),
-    nodeKey: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
-    taskId: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
-    criterionIds: Type.Array(Type.String({ minLength: 1, maxLength: TASK_GRAPH_VERIFICATION_LIMITS.maxCriterionIdLength, pattern: "^[a-z][a-z0-9._-]{0,63}$" }), { minItems: 1, maxItems: TASK_GRAPH_LIMITS.maxSuccessCriteria }),
-  }, { additionalProperties: false })
-}
-function proposalNodeSchema<T extends TSchema>(templateIdSchema: T, role?: TaskGraphVerificationRole, genericVerification = false) {
-  const properties = {
-    key: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
-    templateId: templateIdSchema,
-    goal: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxGoalLength }),
-    successCriteria: Type.Array(Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxCriterionLength }), { minItems: 1, maxItems: TASK_GRAPH_LIMITS.maxSuccessCriteria }),
-    dependsOn: Type.Array(Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }), { maxItems: TASK_GRAPH_LIMITS.maxDependencies }),
-  }
-  if (role) Object.assign(properties, { verification: verificationSchema(role) })
-  else if (genericVerification) Object.assign(properties, {
-    verification: Type.Optional(Type.Union([verificationSchema("scout"), verificationSchema("analyst")])),
-  })
-  if (role || genericVerification) Object.assign(properties, { repairOf: Type.Optional(repairOfSchema()) })
-  return Type.Object(properties, { additionalProperties: false })
-}
-
-function proposalInputSchema<T extends TSchema>(templateIdSchema: T, templates?: readonly (readonly [string, TaskGraphTaskTemplate])[]) {
-  const nodeSchemas: TSchema[] = templates ? templates.map(([templateId, template]) => {
-    const role = taskGraphVerificationRole(templateId)
-    if (role && template.role !== role) throw new Error("task_graph_verification_template_role_mismatch")
-    return proposalNodeSchema(Type.Literal(templateId), role)
-  }) : [proposalNodeSchema(templateIdSchema, undefined, true)]
-  const nodeSchema = nodeSchemas.length === 1 ? nodeSchemas[0]! : Type.Union(nodeSchemas as [TSchema, ...TSchema[]])
-  return Type.Object({
-    expectedRevision: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
-    nodes: Type.Array(nodeSchema, { minItems: 1, maxItems: TASK_GRAPH_LIMITS.maxNodes }),
-    rootSuccessCriteria: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 4 })),
-    replaceUnstarted: Type.Optional(Type.Object({
-      nodeKey: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
-    }, { additionalProperties: false })),
-    replaceBranch: Type.Optional(TaskGraphBranchReplacementInputSchema),
-  }, { additionalProperties: false })
-}
-
-export const TaskGraphProposalInputSchema = proposalInputSchema(Type.String({ minLength: 1, maxLength: 128 }))
-
-type ModelTaskGraphRepairOf = Omit<TaskGraphRepairOf, "graphRootTaskId"> & Readonly<{ graphRootTaskId?: string }>
-type ModelTaskGraphNodeProposal = Omit<TaskGraphNodeProposal, "repairOf"> & Readonly<{ repairOf?: ModelTaskGraphRepairOf }>
-export type TaskGraphProposalInput = Omit<TaskGraphProposal, "nodes"> & Readonly<{
-  nodes: readonly ModelTaskGraphNodeProposal[]
-  rootSuccessCriteria?: readonly string[]
-  replaceUnstarted?: Readonly<{ nodeKey: string }>
-  replaceBranch?: TaskGraphBranchReplacement
-}>
+export type { TaskGraphProposalInput } from "./task-graph-planning-input.js"
 
 export type PlanningExecutorOptions = ReconciliationFenceOptions & Readonly<{
   commandPort: TaskGraphCommandPort
@@ -191,6 +109,11 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
       throw new ToolExecutionError(code, "The Turn needs two remaining steps to supervise a TaskGraph plan", { code, requiredSteps: MIN_CONTINUATION_STEPS })
     }
     const input = value as TaskGraphProposalInput
+    const parsedModes = parseTaskGraphPlanningReplacementModes(input)
+    if (!parsedModes.ok) {
+      throw new ToolExecutionError(parsedModes.code, "Choose one valid replacement mode and provide its exact source mapping", { code: parsedModes.code })
+    }
+    const modes = parsedModes.value
     const rootSuccessCriteria = normalizeRootPlanCriteria(input.rootSuccessCriteria)
     if (rootSuccessCriteria === null) {
       const code = "task_graph_root_criteria_invalid"
@@ -203,38 +126,18 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
     if (input.nodes.some(node => redactSensitiveText(node.key) !== node.key)) {
       throw new ToolExecutionError("task_graph_sensitive_key_rejected", "TaskGraph keys cannot contain contact or credential data")
     }
-    if (input.replaceUnstarted && input.replaceBranch) {
-      throw new ToolExecutionError("task_graph_replacement_modes_conflict", "Choose either single-node or branch replacement")
-    }
-    if (input.replaceUnstarted && input.nodes.length !== 1) {
-      throw new ToolExecutionError("task_graph_supersession_requires_one_replacement", "Supersession accepts exactly one replacement node")
-    }
-    const branch = input.replaceBranch ? parseTaskGraphBranchReplacement(input.replaceBranch, input.nodes) : undefined
-    if (branch && !branch.ok) {
-      throw new ToolExecutionError(branch.code, "Branch replacement mapping must be complete and match the proposed nodes", { code: branch.code })
-    }
     const reconciliation = steeringReconciliationOperation(context, options, "revise", input.expectedRevision)
     const operation = {
       ...reconciliation,
-      ...(input.replaceUnstarted ? { replaceUnstartedNodeKey: input.replaceUnstarted.nodeKey } : {}),
-      ...(branch?.ok ? { replaceBranch: branch.value } : {}),
+      ...(modes.replaceUnstarted ? { replaceUnstartedNodeKey: modes.replaceUnstarted.nodeKey } : {}),
+      ...(modes.replaceBranch ? { replaceBranch: modes.replaceBranch } : {}),
+      ...(modes.replaceOperationalFailure ? { replaceOperationalFailure: modes.replaceOperationalFailure } : {}),
     }
     const scope = operation.scope
-    const proposal: TaskGraphProposal = {
-      expectedRevision: input.expectedRevision,
-      nodes: input.nodes.map(node => {
-        const repairOf = node.repairOf
-        if (repairOf?.graphRootTaskId !== undefined && repairOf.graphRootTaskId !== scope.rootTaskId) {
-          throw new ToolExecutionError("task_graph_repair_root_mismatch", "The repair target does not belong to the active root task", { code: "task_graph_repair_root_mismatch" })
-        }
-        return {
-          key: node.key, templateId: node.templateId, goal: node.goal,
-          successCriteria: [...node.successCriteria], dependsOn: [...node.dependsOn],
-          ...(node.verification ? { verification: node.verification } : {}),
-          ...(repairOf ? { repairOf: { ...repairOf, graphRootTaskId: scope.rootTaskId, criterionIds: [...repairOf.criterionIds] } } : {}),
-        }
-      }),
-    }
+    const normalizedNodes = normalizeTaskGraphPlanningNodes(input.nodes, scope.rootTaskId)
+    if (!normalizedNodes.ok) throw new ToolExecutionError("task_graph_repair_root_mismatch",
+      "The repair target does not belong to the active root task", { code: "task_graph_repair_root_mismatch" })
+    const proposal: TaskGraphProposal = { expectedRevision: input.expectedRevision, nodes: normalizedNodes.nodes }
     try {
       if (typeof options.commandPort.appendAndScheduleWithReconciliation !== "function") {
         throw new ToolExecutionError("steering_reconciliation_unavailable", "TaskGraph revision requires an atomic reconciliation-capable port")
@@ -245,10 +148,11 @@ export function createTaskGraphPlanningTool(options: PlanningExecutorOptions): R
         ...(rootSuccessCriteria === undefined ? {} : { rootSuccessCriteria }),
         templates: options.templates,
         verificationRequirements: options.verificationRequirements ?? { status: "absent" },
-        ...(input.replaceUnstarted ? {
-          replaceUnstarted: { nodeKey: input.replaceUnstarted.nodeKey },
+        ...(modes.replaceUnstarted ? {
+          replaceUnstarted: { nodeKey: modes.replaceUnstarted.nodeKey },
         } : {}),
-        ...(branch?.ok ? { replaceBranch: branch.value } : {}),
+        ...(modes.replaceBranch ? { replaceBranch: modes.replaceBranch } : {}),
+        ...(modes.replaceOperationalFailure ? { replaceOperationalFailure: modes.replaceOperationalFailure } : {}),
       }, operation)
       return receipt
     } catch (error: unknown) {
@@ -266,8 +170,9 @@ Scout and Analyst nodes must include verification {schemaVersion:"${TASK_GRAPH_V
 findings_from_scout_dependency is Analyst-only and names a direct Scout dependency by dependencyNodeKey. findings_cover_scout_candidates_gte is Analyst-only; use it only when the plan explicitly declares a cohort percentage, with a direct Scout dependency and minimumPercent from 1 to 100. Omitting it preserves normal top-N selection; do not infer a percentage or require processing of every candidate.
 A repair uses repairOf={nodeKey,taskId,criterionIds} for a prior typed same-template node; omit graphRootTaskId because the server binds the active Root. A matching legacy graphRootTaskId is accepted, but a mismatch is rejected. Repeat exactly those criteria and checks, and must not add the target to dependsOn; this relation does not pass the target or alter its verdict. successCriteria prose is explanatory and never proof. reported_score_gte checks an Analyst-reported number, not its correctness. ${selectedJobWriterGuidance}
 When new information changes an unstarted Scout/Analyst approach, refresh the owner-scoped current TaskGraph and current Step agenda; use that graph revision as expectedRevision. For a branch of at least two sources, send replaceBranch: { root: { nodeKey, taskId }, sources: [{ nodeKey, taskId, replacementKey }, ...] }.
-List the exact root and every node in its transitive dependsOn descendant closure in sources, mapping each source once to a fresh replacementKey and providing one fresh node per mapping. You may revise node goals and explanatory criteria; preserve topology, registered roles, exact typed verification IDs/checks, and retained edges; remap only structured dependency selectors. Keep canonical Root criteria unchanged.
-replaceBranch and replaceUnstarted are mutually exclusive. For ordinary unstarted replanning, every source must be queued or dependency-waiting with attemptCount=0 and no lease, execution, wait condition, result, artifact, evidence, or reservation; never include running, completed, attempted, or genuinely waiting work.
+For a server-reported resume_state_unavailable failure on a fixed typed read-only Scout or Analyst, use replaceOperationalFailure: { root: { nodeKey, taskId }, sources: [{ nodeKey, taskId, replacementKey }, ...] }. Include the failed root and its complete transitive descendant closure, even for a failed leaf (one source); propose exactly one fresh same-template typed node per mapping. Only pristine unstarted read-only descendants can be replaced. Preserve each source's successCriteria and exact verification IDs/checks; keep successCriteria canonical and each check's IDs, kinds, thresholds, and aggregations unchanged; you may update its goal. In replacement nodes, remap both dependsOn edges and structured dependencyNodeKey selectors that point inside the source-to-replacement mapping; keep dependencies outside that mapping unchanged. The server proves the failure and cancels eligible descendants; never supply a failure reason, status, proof, or claim that the old work passed. Replacements inherit no evidence or authorization, and consumed usage is not refunded.
+List the exact root and every node in its transitive dependsOn descendant closure in sources, mapping each source once to a fresh replacementKey and providing one fresh node per mapping. For replaceBranch, you may revise node goals and explanatory criteria; preserve topology, registered roles, exact typed verification IDs/checks, and retained edges; remap only structured dependency selectors. Keep canonical Root criteria unchanged.
+replaceBranch, replaceUnstarted, and replaceOperationalFailure are mutually exclusive. For ordinary unstarted replanning, every source must be queued or dependency-waiting with attemptCount=0 and no lease, execution, wait condition, result, artifact, evidence, or reservation; never include running, completed, attempted, or genuinely waiting work.
 To retire a failed strategy, use one explicit complete branch request only when its root is a persisted failed ordinary typed Scout and every descendant is queued or dependency-waiting with attemptCount=0 and no lease, execution, wait condition, result, or evidence. The server preserves the failed Scout and atomically cancels eligible descendants as part of this plan before scheduling fresh mapped replacements; failure alone does not cancel them. Use repairOf for an ordinary criterion retry when the strategy remains sound; this branch operation is for changing the failed approach. Every ancestor outside the closure must be an ordinary typed node completed and verified before the Scout failure; repairOf ancestors are unsupported. Do not use this for intentional/user cancellation, Root-failure cleanup, ordinary criterion repair, or ambiguous provenance; the server derives eligibility from persisted task/event history, not a model-supplied failure label. Old task rows and results remain history, replacements inherit no evidence, and consumed execution usage is not refunded; reused slots are current-snapshot capacity only.
 A distinct replan uses a fresh model Step with the current graph and agenda revision; after new information, it does not require another human message. The server still requires two Root steps for the durable wait/result cycle.
 TaskGraph maxNodes is an eight-node limit on the current graph snapshot, including retained terminal nodes, not a lifetime task-creation cap; it is separate from active-child maxFanOut. Read current owner-scoped task_graph_current.nodeCapacity: remaining is current-snapshot space; ordinaryRemaining is the ordinary-addition budget while reserveActive is true. Existing cumulative Root execution usage and reservations remain in force; canceled work never refunds consumed usage.
@@ -276,7 +181,7 @@ If agent.plan returns task_graph_repair_conflict, inspect or refresh the current
 Wait for children, inspect their evidence, then replan or complete the goal. Registered templates:
 ${templateCatalog}`,
     capabilities: ["coordination"],
-    inputSchema: proposalInputSchema(templateIdSchema, templates),
+    inputSchema: buildTaskGraphProposalInputSchema(templateIdSchema, templates),
     outputSchema: ReceiptSchema,
     risk: "internal_write",
     domain: "coordination",

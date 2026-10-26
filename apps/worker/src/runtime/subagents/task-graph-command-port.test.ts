@@ -61,6 +61,22 @@ describe("branch replacement scheduling input", () => {
   })
 })
 
+describe("operational failure replacement scheduling input", () => {
+  it("re-exports the schedule input ABI with the singleton-capable mode", () => {
+    const input: TaskGraphScheduleInput = {
+      scope: { userId: "user", sessionId: "session", turnId: "turn", rootTaskId: "root", parentTaskId: "root",
+        stepId: "step", turnLeaseOwner: "worker", turnLeaseVersion: 1, parentLeaseOwner: "worker", parentAttemptCount: 1 },
+      proposal: { expectedRevision: 5, nodes: [] }, templates: {},
+      replaceOperationalFailure: {
+        root: { nodeKey: "scout-leaf", taskId: "scout-task" },
+        sources: [{ nodeKey: "scout-leaf", taskId: "scout-task", replacementKey: "scout-retry" }],
+      },
+    }
+    expect(input.replaceOperationalFailure?.sources).toHaveLength(1)
+    expect(input.replaceBranch).toBeUndefined()
+  })
+})
+
 describe("TaskGraph verification public report reader", () => {
   it("strips private dependency bindings while preserving the legacy six-field report", () => {
     const digest = "a".repeat(64)

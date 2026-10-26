@@ -28,6 +28,8 @@ import { buildCognitiveActionAgenda } from "../turns/cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, COGNITIVE_AGENDA_EVENT_TYPE } from "../turns/cognitive-agenda-receipt.js"
 import type { StepContext } from "../context/step-context-builder.js"
 import { steeringReconciliationIdempotencyKey, STEERING_RECONCILIATION_EVENT_TYPE } from "./steering-reconciliation-contract.js"
+import type { SteeringReconciliationOperation } from "./steering-reconciliation-contract.js"
+import type { TaskGraphOperationalFailureReplacement } from "../planning/task-graph-operational-failure-replacement.js"
 import { loadSelectedJobArtifactContext } from "./selected-job-artifact-context.js"
 import { taskGraphSupersessionFingerprint, taskGraphSupersessionProposalKey } from "./task-graph-pg-supersession.js"
 
@@ -837,6 +839,144 @@ async function failQueuedTypedTask(pool: PgPool, value: Fixture, taskId: string,
     status: "failed", retryDisposition: "terminal", failureReason: "private executor detail",
     result: { summary: "The executor returned no verifiable result" }, now: new Date() })
   if (result !== "failed") throw new Error("Failed-branch fixture did not terminalize through Worker finish")
+}
+
+type OperationalResumeFailureReason = "child_resume_unavailable" | "child_resume_evidence_unavailable"
+
+async function failQueuedOperationalTask(pool: PgPool, value: Fixture, taskId: string, ownerId: string,
+  failureReason: OperationalResumeFailureReason = "child_resume_unavailable"): Promise<void> {
+  const store = new PgSubagentTaskStore(pool)
+  const claimed = await store.claim({ taskId, sessionId: value.sessionId, ownerId,
+    policy: { maxConcurrency: 8, maxDepth: 8, maxFanOut: 8, maxAttempts: 2 }, now: new Date() })
+  if (!claimed || claimed.status !== "running") throw new Error("Operational-failure fixture could not claim its typed task")
+  const result = await store.finish({ taskId, sessionId: value.sessionId, ownerId, attemptCount: claimed.attemptCount,
+    status: "failed", retryDisposition: "terminal", failureReason, result: null, now: new Date() })
+  if (result !== "failed") throw new Error("Operational-failure fixture did not persist the canonical failure")
+}
+
+async function prepareOperationalFailureReplan(pool: PgPool, commandPool: PgPool, roleName: string, value: Fixture,
+  shape: "scout_leaf" | "analyst_leaf" | "scout_analyst_closure",
+  options: Readonly<{ leaveDependentWaiting?: boolean; failureReason?: OperationalResumeFailureReason }> = {}) {
+  await seed(pool, value)
+  const templates = { scout: TASK_GRAPH_TEMPLATES.scout, analyst: TASK_GRAPH_TEMPLATES.analyst }
+  const allowedActions = [...new Set(["agent.plan", ...Object.values(templates).flatMap(template => template.allowedActions)])]
+  await pool.query(`UPDATE "sub_agent_tasks" SET "allowedActions" = $2::jsonb WHERE "id" = $1`, [value.rootTaskId, JSON.stringify(allowedActions)])
+  const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool, roleName, value.userId))
+  const initialScope: TaskGraphScheduleInput["scope"] = { ...readScope(value), stepId: value.stepId }
+  await seedReconciliationAgenda(pool, value, { id: value.stepId, sequence: await nextEventSequence(pool, value), cursor: 0n,
+    planRevision: 0, consumedInputIds: [] })
+  const scout = { key: "resume-scout", templateId: "scout", goal: "Find candidates", successCriteria: ["Find one candidate"],
+    dependsOn: [], verification: BRANCH_SCOUT_VERIFICATION }
+  const failureReason = options.failureReason ?? "child_resume_unavailable"
+  const analyst = (key: string, dependsOn: string[]) => ({ key, templateId: "analyst", goal: "Score candidates",
+    successCriteria: ["Score one candidate"], dependsOn, verification: dependsOn.length ? branchAnalystVerification(dependsOn[0]!) : ANALYST_VERIFICATION })
+  const sourceDefinitions = shape === "scout_leaf" ? [scout] : shape === "analyst_leaf" ? [analyst("resume-analyst", [])] : [scout, analyst("resume-analyst", [scout.key])]
+  const repairTarget = analyst("repair-target", [])
+  const retained = Array.from({ length: 6 - sourceDefinitions.length }, (_, index) => analyst(`retained-${index + 1}`, []))
+  const initialNodes: TaskGraphScheduleInput["proposal"]["nodes"] = [...sourceDefinitions, repairTarget, ...retained]
+  const initialInput: TaskGraphScheduleInput = { scope: initialScope, proposal: { expectedRevision: 0, nodes: initialNodes }, templates }
+  const initial = await command.appendAndSchedule(initialInput)
+  if (initial.revision !== 1 || initial.nodes.length !== 7) throw new Error("Operational-failure fixture did not create seven typed nodes")
+  const target = initial.nodes.find(node => node.key === repairTarget.key)
+  if (!target) throw new Error("Operational-failure fixture lost its repair target")
+  await failQueuedTypedTask(commandPool, value, target.taskId, `worker-fail-operational-target-${randomUUID()}`)
+  const afterTargetFailure = await command.readCurrent(readScope(value))
+  if (afterTargetFailure.revision !== 3 || afterTargetFailure.nodes.find(node => node.key === target.key)?.status !== "failed") {
+    throw new Error("Operational-failure fixture did not persist the repair target failure")
+  }
+
+  await pool.query(`INSERT INTO "agent_steps"
+    ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
+    VALUES ($1, $2, $3, $4, 2, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
+  [value.branchStepId, value.sessionId, value.turnId, value.rootTaskId])
+  const repairScope: TaskGraphScheduleInput["scope"] = { ...readScope(value), stepId: value.branchStepId }
+  await seedReconciliationAgenda(pool, value, { id: value.branchStepId, sequence: await nextEventSequence(pool, value), cursor: 0n,
+    planRevision: afterTargetFailure.revision, consumedInputIds: [] })
+  const repairInput: TaskGraphScheduleInput = { scope: repairScope, templates, proposal: { expectedRevision: afterTargetFailure.revision, nodes: [{
+    key: "retained-repair", templateId: "analyst", goal: "Repair the retained finding", successCriteria: ["Score one candidate"],
+    dependsOn: [], verification: ANALYST_VERIFICATION,
+    repairOf: { graphRootTaskId: value.rootTaskId, nodeKey: target.key, taskId: target.taskId, criterionIds: ["finding-count"] },
+  }] } }
+  const repaired = await command.appendAndSchedule(repairInput)
+  if (repaired.revision !== 4 || repaired.nodes[0]?.status !== "queued") throw new Error("Operational-failure fixture could not create its typed repair reserve")
+  let current = await command.readCurrent(readScope(value))
+  if (current.nodes.length !== 8) throw new Error("Operational-failure fixture did not fill the eight-node capacity")
+
+  const failedRootDefinition = shape === "analyst_leaf" ? sourceDefinitions[0]! : scout
+  const failedRoot = current.nodes.find(node => node.key === failedRootDefinition.key)
+  if (!failedRoot) throw new Error("Operational-failure fixture lost its failure root")
+  const heldDependent = options.leaveDependentWaiting && shape === "scout_analyst_closure"
+    ? current.nodes.find(node => node.key === "resume-analyst") : undefined
+  if (options.leaveDependentWaiting && !heldDependent) throw new Error("Operational-failure fixture lost its held descendant")
+  const triggerName = heldDependent ? `op_wait_cancel_${randomUUID().replaceAll("-", "")}` : null
+  const functionName = triggerName ? `${triggerName}_fn` : null
+  if (triggerName && functionName) {
+    await pool.query(`CREATE FUNCTION public."${functionName}"() RETURNS trigger
+      LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $operational_wait_test$
+      BEGIN
+        IF NEW."id" = TG_ARGV[0] AND NEW."status" = 'cancelled'
+          AND NEW."failureReason" = 'A prerequisite task did not complete.' THEN
+          RETURN NULL;
+        END IF;
+        RETURN NEW;
+      END
+      $operational_wait_test$`)
+    await pool.query(`CREATE TRIGGER "${triggerName}" BEFORE UPDATE ON public."sub_agent_tasks"
+      FOR EACH ROW EXECUTE FUNCTION public."${functionName}"('${heldDependent!.taskId}')`)
+  }
+  try {
+    await failQueuedOperationalTask(commandPool, value, failedRoot.taskId, `worker-fail-operational-source-${randomUUID()}`, failureReason)
+  } finally {
+    if (triggerName && functionName) {
+      await pool.query(`DROP TRIGGER IF EXISTS "${triggerName}" ON public."sub_agent_tasks"`)
+      await pool.query(`DROP FUNCTION IF EXISTS public."${functionName}"()`)
+    }
+  }
+  current = await command.readCurrent(readScope(value))
+  const sourceNodes = sourceDefinitions.map(definition => current.nodes.find(node => node.key === definition.key))
+    .filter((node): node is TaskGraphCurrentNode => node !== undefined)
+  if (sourceNodes.length !== sourceDefinitions.length || current.nodes.find(node => node.key === failedRoot.key)?.status !== "failed") {
+    throw new Error("Operational-failure fixture did not persist its exact typed source failure")
+  }
+  if (shape === "scout_analyst_closure") {
+    const dependent = current.nodes.find(node => node.key === "resume-analyst")
+    const row = dependent && await pool.query<{ status: string; attemptCount: number; failureReason: string | null }>(
+      `SELECT "status", "attemptCount", "failureReason" FROM "sub_agent_tasks" WHERE "id" = $1`, [dependent.taskId])
+    const persisted = row?.rows[0]
+    const expectedStatus = options.leaveDependentWaiting ? "waiting" : "cancelled"
+    const expectedReason = options.leaveDependentWaiting ? null : "A prerequisite task did not complete."
+    if (dependent?.status !== expectedStatus || !persisted || persisted.status !== expectedStatus || persisted.attemptCount !== 0
+      || persisted.failureReason !== expectedReason) {
+      throw new Error("Operational-failure fixture lost its expected dependent lifecycle state")
+    }
+  }
+
+  await pool.query(`INSERT INTO "agent_steps"
+    ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
+    VALUES ($1, $2, $3, $4, 3, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
+  [value.laterStepId, value.sessionId, value.turnId, value.rootTaskId])
+  const scope: TaskGraphScheduleInput["scope"] = { ...readScope(value), stepId: value.laterStepId }
+  await seedReconciliationAgenda(pool, value, { id: value.laterStepId, sequence: await nextEventSequence(pool, value), cursor: 0n,
+    planRevision: current.revision, consumedInputIds: [] })
+  const keyMap = new Map(sourceNodes.map(node => [node.key, `replacement-${node.key}`] as const))
+  const mode: TaskGraphOperationalFailureReplacement = { root: { nodeKey: failedRoot.key, taskId: failedRoot.taskId },
+    sources: sourceNodes.map(node => ({ nodeKey: node.key, taskId: node.taskId, replacementKey: keyMap.get(node.key)! })) }
+  const proposalNodes: TaskGraphScheduleInput["proposal"]["nodes"] = sourceNodes.map(node => ({ key: keyMap.get(node.key)!,
+    templateId: node.templateId, goal: `Retry ${node.goal}`, successCriteria: node.successCriteria,
+    dependsOn: node.dependsOn.map(key => keyMap.get(key) ?? key),
+    verification: node.templateId === "analyst" && node.dependsOn.length ? branchAnalystVerification(keyMap.get(node.dependsOn[0]!) ?? node.dependsOn[0]!) : node.verification }))
+  const rawCallInput = { expectedRevision: current.revision, nodes: proposalNodes, replaceOperationalFailure: mode }
+  const input: TaskGraphScheduleInput = { scope, templates, proposal: { expectedRevision: current.revision, nodes: proposalNodes }, replaceOperationalFailure: mode }
+  const operation: SteeringReconciliationOperation = { scope, decision: "revise", expectedRevision: current.revision,
+    callId: value.planCallId, replaceOperationalFailure: mode }
+  await seedReconciliationToolCall(pool, value, { id: value.planCallId, stepId: scope.stepId!, toolName: "agent.plan",
+    input: rawCallInput, sequence: await nextEventSequence(pool, value) })
+  await pool.query(`UPDATE "agent_turns" SET "inputTokens" = 47, "outputTokens" = 13, "estimatedCostUsd" = 0.0042 WHERE "id" = $1 AND "sessionId" = $2`,
+  [value.turnId, value.sessionId])
+  await pool.query(`UPDATE "agent_steps" SET "inputTokens" = 47, "outputTokens" = 13, "estimatedCostUsd" = 0.0042 WHERE "id" = $1 AND "turnId" = $2 AND "sessionId" = $3`,
+  [value.laterStepId, value.turnId, value.sessionId])
+  return { pool, command, value, templates, scope, current, sourceNodes, sourceTaskIds: sourceNodes.map(node => node.taskId),
+    failedRoot, failureReason, input, operation, rawCallInput }
 }
 
 async function prepareFailedBranchReplan(pool: PgPool, commandPool: PgPool, roleName: string, value: Fixture,
@@ -3264,6 +3404,321 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     expect(replacementRows.rows.every(row => row.attemptCount === 0 && row.result === null)).toBe(true)
     expect(current.nodes.map(node => node.status)).toEqual(["queued", "waiting"])
   }, 60_000)
+
+  it.each([
+    { label: "a Scout leaf after child_resume_unavailable", shape: "scout_leaf" as const,
+      failureReason: "child_resume_unavailable" as const, role: "scout", taskType: "job_discovery" },
+    { label: "a Scout leaf after child_resume_evidence_unavailable", shape: "scout_leaf" as const,
+      failureReason: "child_resume_evidence_unavailable" as const, role: "scout", taskType: "job_discovery" },
+    { label: "an Analyst leaf after child_resume_unavailable", shape: "analyst_leaf" as const,
+      failureReason: "child_resume_unavailable" as const, role: "analyst", taskType: "job_analysis" },
+    { label: "an Analyst leaf after child_resume_evidence_unavailable", shape: "analyst_leaf" as const,
+      failureReason: "child_resume_evidence_unavailable" as const, role: "analyst", taskType: "job_analysis" },
+    { label: "the complete Scout and Analyst closure after child_resume_unavailable", shape: "scout_analyst_closure" as const,
+      failureReason: "child_resume_unavailable" as const, role: "scout", taskType: "job_discovery" },
+  ])("replaces $label at the eight-node limit and restores only an exact stored replay", async ({ shape, failureReason, role, taskType }) => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    const prepared = await prepareOperationalFailureReplan(adminPool!, commandPool!, roleName, value, shape, { failureReason })
+    expect(prepared.failedRoot.templateId).toBe(role)
+    expect(prepared.current.nodes).toHaveLength(8)
+    const rootBefore = await failedBranchImmutableRows(adminPool!, value, [prepared.failedRoot.taskId])
+    const descendants = prepared.sourceTaskIds.filter(taskId => taskId !== prepared.failedRoot.taskId)
+    const priorIds = new Set(prepared.current.nodes.filter(node => descendants.includes(node.taskId) && node.status === "cancelled")
+      .map(node => node.taskId))
+    const newCancellationCount = descendants.filter(taskId => !priorIds.has(taskId)).length
+    const beforeRows = await adminPool!.query<{ id: string; status: string; attemptCount: number; role: string;
+      taskType: string; failureReason: string | null }>(
+      `SELECT "id", "status", "attemptCount", "role", "taskType", "failureReason"
+       FROM "sub_agent_tasks" WHERE "id" = ANY($1::text[]) ORDER BY "id"`,
+      [prepared.sourceTaskIds])
+    expect(beforeRows.rows.find(row => row.id === prepared.failedRoot.taskId)).toMatchObject({
+      status: "failed", attemptCount: 1, role, taskType, failureReason,
+    })
+    const failureKey = taskGraphLifecycleKey(value.rootTaskId, prepared.failedRoot.key, 1, "task.failed")
+    const failureEvent = await adminPool!.query<{ id: string; type: string; actor: string; taskId: string;
+      idempotencyKey: string; payload: unknown }>(
+      `SELECT "id", "type", "actor", "taskId", "idempotencyKey", "payload" FROM "agent_events"
+       WHERE "sessionId" = $1 AND "turnId" = $2 AND "idempotencyKey" = $3`,
+      [value.sessionId, value.turnId, failureKey])
+    expect(failureEvent.rows).toHaveLength(1)
+    expect(failureEvent.rows[0]).toMatchObject({ type: "item.delta", actor: "system",
+      taskId: prepared.failedRoot.taskId, idempotencyKey: failureKey,
+      payload: { kind: "lifecycle", event: { type: "task.failed", failureReason } },
+    })
+    const failureOutbox = await adminPool!.query<{ topic: string; aggregateId: string; idempotencyKey: string }>(
+      `SELECT "topic", "aggregateId", "idempotencyKey" FROM "agent_outbox" WHERE "idempotencyKey" = $1`,
+      [`agent-event:${failureEvent.rows[0]!.id}`])
+    expect(failureOutbox.rows).toEqual([{ topic: "agent.session.event", aggregateId: value.sessionId,
+      idempotencyKey: `agent-event:${failureEvent.rows[0]!.id}` }])
+    for (const taskId of descendants) expect(beforeRows.rows.find(row => row.id === taskId)).toMatchObject({ status: "cancelled", attemptCount: 0 })
+
+    const accepted = await prepared.command.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation)
+    expect(accepted).toMatchObject({ status: "accepted", revision: prepared.current.revision + newCancellationCount + 1 })
+    expect(accepted.nodes).toHaveLength(prepared.sourceNodes.length)
+    expect(accepted.nodes.every(node => !prepared.sourceTaskIds.includes(node.taskId))).toBe(true)
+    expect(accepted.readyTaskIds).toEqual(accepted.nodes.filter(node => node.status === "queued").map(node => node.taskId))
+    expect(await failedBranchImmutableRows(adminPool!, value, [prepared.failedRoot.taskId])).toEqual(rootBefore)
+    const current = await prepared.command.readCurrent(readScope(value))
+    expect(current.nodes).toHaveLength(8)
+    expect(current.nodes.some(node => prepared.sourceTaskIds.includes(node.taskId))).toBe(false)
+    expect(current.nodes.filter(node => node.key.startsWith("replacement-")).map(node => node.status)).toEqual(
+      shape === "scout_analyst_closure" ? ["queued", "waiting"] : ["queued"])
+
+    if (descendants.length) {
+      const cancelled = await adminPool!.query<{ status: string; attemptCount: number; failureReason: string | null }>(
+        `SELECT "status", "attemptCount", "failureReason" FROM "sub_agent_tasks" WHERE "id" = $1`, [descendants[0]])
+      expect(cancelled.rows).toEqual([{ status: "cancelled", attemptCount: 0, failureReason: "A prerequisite task did not complete." }])
+      const cancellation = await adminPool!.query<{ idempotencyKey: string; actor: string; taskId: string }>(
+        `SELECT "idempotencyKey", "actor", "taskId" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "idempotencyKey" = $3`,
+        [value.sessionId, value.turnId, taskGraphLifecycleKey(value.rootTaskId, "resume-analyst", 0, "task.cancelled")])
+      expect(cancellation.rows).toEqual([{ idempotencyKey: taskGraphLifecycleKey(value.rootTaskId, "resume-analyst", 0, "task.cancelled"),
+        actor: "system", taskId: descendants[0] }])
+    } else {
+      const cancellation = await adminPool!.query(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
+        AND "idempotencyKey" = $3`, [value.sessionId, value.turnId, taskGraphLifecycleKey(value.rootTaskId, "resume-analyst", 0, "task.cancelled")])
+      expect(cancellation.rows).toHaveLength(0)
+    }
+    const newTasks = await adminPool!.query<{ id: string; status: string; attemptCount: number; result: unknown }>(
+      `SELECT "id", "status", "attemptCount", "result" FROM "sub_agent_tasks" WHERE "id" = ANY($1::text[]) ORDER BY "id"`,
+      [accepted.nodes.map(node => node.taskId)])
+    expect(newTasks.rows).toHaveLength(prepared.sourceNodes.length)
+    expect(newTasks.rows.every(row => row.attemptCount === 0 && row.result === null)).toBe(true)
+    expect(new Set(newTasks.rows.map(row => row.id)).size).toBe(prepared.sourceNodes.length)
+
+    const receiptKey = steeringReconciliationIdempotencyKey(prepared.scope, value.planCallId)
+    const receiptRows = await adminPool!.query<{ payload: unknown }>(`SELECT "payload" FROM "agent_events"
+      WHERE "sessionId" = $1 AND "turnId" = $2 AND "idempotencyKey" = $3`, [value.sessionId, value.turnId, receiptKey])
+    const relation = (receiptRows.rows[0]?.payload as { operationalFailure?: Record<string, unknown> } | undefined)?.operationalFailure
+    const expectedPrior = prepared.sourceNodes.filter(node => priorIds.has(node.taskId)).map(node => expect.objectContaining({
+      source: expect.objectContaining({ nodeKey: node.key, taskId: node.taskId }),
+      event: expect.objectContaining({ id: expect.any(String), sequence: expect.any(String),
+        idempotencyKey: taskGraphLifecycleKey(value.rootTaskId, node.key, 0, "task.cancelled") }),
+    }))
+    const expectedNewCancellations = prepared.sourceNodes.filter(node => node.taskId !== prepared.failedRoot.taskId
+      && !priorIds.has(node.taskId)).map(node => expect.objectContaining({
+      source: expect.objectContaining({ nodeKey: node.key, taskId: node.taskId }),
+      event: expect.objectContaining({ id: expect.any(String), sequence: expect.any(String),
+        idempotencyKey: taskGraphLifecycleKey(value.rootTaskId, node.key, 0, "task.cancelled") }),
+    }))
+    expect(relation).toMatchObject({ graphRootTaskId: value.rootTaskId, resultingRevision: accepted.revision,
+      failedSource: { source: { nodeKey: prepared.failedRoot.key, taskId: prepared.failedRoot.taskId },
+        attemptCount: 1, failureReason },
+      sources: expect.arrayContaining(prepared.sourceNodes.map(node => expect.objectContaining({
+        source: { nodeKey: node.key, taskId: node.taskId }, replacementKey: `replacement-${node.key}`,
+      }))),
+    })
+    expect(relation?.priorCancellations).toHaveLength(expectedPrior.length)
+    expect(relation?.priorCancellations).toEqual(expect.arrayContaining(expectedPrior))
+    expect(relation?.cancellations).toHaveLength(expectedNewCancellations.length)
+    expect(relation?.cancellations).toEqual(expect.arrayContaining(expectedNewCancellations))
+
+    const durable = await supersessionDurableRows(adminPool!, value)
+    const restored = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
+    await expect(restored.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation))
+      .resolves.toEqual({ ...accepted, status: "duplicate" })
+    expect(await supersessionDurableRows(adminPool!, value)).toEqual(durable)
+  }, 90_000)
+
+  it("replays a replacement with a retained Root wait over its newly cancelled descendant", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    const prepared = await prepareOperationalFailureReplan(adminPool!, commandPool!, roleName, value,
+      "scout_analyst_closure", { leaveDependentWaiting: true })
+
+    const dependent = prepared.sourceNodes.find(node => node.key === "resume-analyst")
+    if (!dependent) throw new Error("Operational-wait fixture lost its dependent Analyst")
+    expect(prepared.current.nodes.find(node => node.taskId === dependent.taskId)?.status).toBe("waiting")
+    const targetTaskIds = [prepared.failedRoot.taskId, dependent.taskId].sort()
+    const matchedTaskIds = [prepared.failedRoot.taskId]
+    const timeoutMs = 60_000
+    const createdAt = new Date()
+    const waitId = `p3-operational-root-wait-${randomUUID()}`
+    await adminPool!.query(`INSERT INTO "agent_wait_conditions"
+      ("id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "idempotencyKey", "targetTaskIds",
+       "mode", "status", "deadlineAt", "matchedTaskIds", "result", "createdAt", "updatedAt")
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, 'any', 'ready', $9, $10::jsonb, $11::jsonb, $12, $12)`, [
+      waitId, value.userId, value.sessionId, value.turnId, value.rootTaskId, value.laterStepId,
+      `operational-root-wait-${randomUUID()}`, JSON.stringify(targetTaskIds),
+      new Date(createdAt.getTime() + timeoutMs), JSON.stringify(matchedTaskIds),
+      JSON.stringify({ request: { targetTaskIds, mode: "any", timeoutMs } }), createdAt,
+    ])
+    const waitBefore = await adminPool!.query(`SELECT * FROM "agent_wait_conditions" WHERE "id" = $1`, [waitId])
+    expect(waitBefore.rows).toHaveLength(1)
+    expect(waitBefore.rows[0]).toMatchObject({ userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+      parentTaskId: value.rootTaskId, stepId: value.laterStepId, targetTaskIds, mode: "any", status: "ready", matchedTaskIds,
+      result: { request: { targetTaskIds, mode: "any", timeoutMs } }, suspendedAt: null, resolvedAt: null, consumedAt: null })
+
+    const accepted = await prepared.command.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation)
+    expect(accepted.status).toBe("accepted")
+    const cancelled = await adminPool!.query<{ status: string; attemptCount: number; failureReason: string | null }>(
+      `SELECT "status", "attemptCount", "failureReason" FROM "sub_agent_tasks" WHERE "id" = $1`, [dependent.taskId])
+    expect(cancelled.rows).toEqual([{ status: "cancelled", attemptCount: 0, failureReason: null }])
+    const receiptKey = steeringReconciliationIdempotencyKey(prepared.scope, value.planCallId)
+    const receipt = await adminPool!.query<{ payload: { operationalFailure?: { cancellations?: unknown[] } } }>(
+      `SELECT "payload" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "idempotencyKey" = $3`,
+      [value.sessionId, value.turnId, receiptKey])
+    expect(receipt.rows[0]?.payload.operationalFailure?.cancellations).toEqual(expect.arrayContaining([
+      expect.objectContaining({ source: { nodeKey: "resume-analyst", taskId: dependent.taskId } }),
+    ]))
+    expect(await adminPool!.query(`SELECT * FROM "agent_wait_conditions" WHERE "id" = $1`, [waitId])).toEqual(waitBefore)
+
+    const durable = await supersessionDurableRows(adminPool!, value)
+    const replay = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
+    await expect(replay.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation))
+      .resolves.toEqual({ ...accepted, status: "duplicate" })
+    expect(await adminPool!.query(`SELECT * FROM "agent_wait_conditions" WHERE "id" = $1`, [waitId])).toEqual(waitBefore)
+    expect(await supersessionDurableRows(adminPool!, value)).toEqual(durable)
+  }, 90_000)
+
+  it("rejects partial operational closures and wrong replacement counts before any durable write", async () => {
+    for (const invalidKind of ["partial", "count"] as const) {
+      const value = fixture()
+      additionalFixtures.push(value)
+      const prepared = await prepareOperationalFailureReplan(adminPool!, commandPool!, roleName, value, "scout_analyst_closure")
+      const replacement = prepared.input.replaceOperationalFailure!
+      const rootMapping = replacement.sources.find(source => source.taskId === prepared.failedRoot.taskId)
+      const rootReplacement = prepared.input.proposal.nodes.find(node => node.key === rootMapping?.replacementKey)
+      if (!rootMapping || !rootReplacement) throw new Error("Operational-failure test lost its root replacement mapping")
+      const proposalNodes = [rootReplacement]
+      const invalidMode = invalidKind === "partial"
+        ? { ...replacement, sources: replacement.sources.filter(source => source.taskId === prepared.failedRoot.taskId) }
+        : replacement
+      const rawCallInput = { expectedRevision: prepared.input.proposal.expectedRevision, nodes: proposalNodes,
+        replaceOperationalFailure: invalidMode }
+      const callItem = await adminPool!.query<{ id: string }>(`SELECT "id" FROM "agent_items"
+        WHERE "sessionId" = $1 AND "turnId" = $2 AND "id" = $3`, [value.sessionId, value.turnId, `${value.planCallId}-item`])
+      expect(callItem.rows).toHaveLength(1)
+      await adminPool!.query(`UPDATE "agent_items" SET "content" = $2::jsonb WHERE "id" = $1 AND "sessionId" = $3`,
+        [callItem.rows[0]!.id, JSON.stringify({ toolCallId: value.planCallId, toolName: "agent.plan", toolVersion: "1", input: rawCallInput }), value.sessionId])
+      const input: TaskGraphScheduleInput = { ...prepared.input, proposal: { ...prepared.input.proposal, nodes: proposalNodes },
+        replaceOperationalFailure: invalidMode }
+      const operation = { ...prepared.operation, replaceOperationalFailure: invalidMode }
+      const before = await supersessionDurableRows(adminPool!, value)
+      const attempt = prepared.command.appendAndScheduleWithReconciliation!(input, operation)
+      if (invalidKind === "partial") {
+        await expect(attempt).rejects.toMatchObject({ code: "task_graph_operational_failure_replacement_not_eligible" })
+      } else {
+        let rejection: unknown = null
+        try { await attempt } catch (error) { rejection = error }
+        expect(rejection).toBeInstanceOf(Error)
+        if (!(rejection instanceof Error)) throw new Error("Wrong replacement count did not reject")
+        expect(rejection.message).toBe("steering_reconciliation_call_invalid")
+        expect(Object.hasOwn(rejection, "code")).toBe(false)
+      }
+      expect(await supersessionDurableRows(adminPool!, value)).toEqual(before)
+    }
+  }, 90_000)
+
+  it.each(["forged_result", "stale_attempt", "foreign_outbox"] as const)("rejects a %s failure proof without changing its graph", async variant => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    const prepared = await prepareOperationalFailureReplan(adminPool!, commandPool!, roleName, value, "scout_leaf")
+    const failureKey = taskGraphLifecycleKey(value.rootTaskId, prepared.failedRoot.key, 1, "task.failed")
+    if (variant === "forged_result") {
+      await adminPool!.query(`UPDATE "sub_agent_tasks" SET "result" = jsonb_set("result", '{workerResult}',
+        '{"status":"completed"}'::jsonb) WHERE "id" = $1 AND "sessionId" = $2`, [prepared.failedRoot.taskId, value.sessionId])
+    } else if (variant === "stale_attempt") {
+      await adminPool!.query(`UPDATE "sub_agent_tasks" SET "attemptCount" = "attemptCount" + 1 WHERE "id" = $1 AND "sessionId" = $2`,
+        [prepared.failedRoot.taskId, value.sessionId])
+    } else {
+      const event = await adminPool!.query<{ id: string }>(`SELECT "id" FROM "agent_events"
+        WHERE "sessionId" = $1 AND "turnId" = $2 AND "idempotencyKey" = $3`, [value.sessionId, value.turnId, failureKey])
+      expect(event.rows).toHaveLength(1)
+      await adminPool!.query(`UPDATE "agent_outbox" SET "aggregateId" = $2,
+        "payload" = jsonb_set("payload", '{sessionId}', to_jsonb($2::text)) WHERE "idempotencyKey" = $1`,
+        [`agent-event:${event.rows[0]!.id}`, value.foreignSessionId])
+    }
+    const failureEvent = await adminPool!.query<{ id: string }>(`SELECT "id" FROM "agent_events"
+      WHERE "sessionId" = $1 AND "turnId" = $2 AND "idempotencyKey" = $3`, [value.sessionId, value.turnId, failureKey])
+    expect(failureEvent.rows).toHaveLength(1)
+    const failureOutboxBefore = await adminPool!.query(`SELECT * FROM "agent_outbox" WHERE "idempotencyKey" = $1`,
+      [`agent-event:${failureEvent.rows[0]!.id}`])
+    const before = await supersessionDurableRows(adminPool!, value)
+    await expect(prepared.command.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation)).rejects.toMatchObject({
+      code: "task_graph_operational_failure_replacement_not_eligible",
+    })
+    expect(await supersessionDurableRows(adminPool!, value)).toEqual(before)
+    expect(await adminPool!.query(`SELECT * FROM "agent_outbox" WHERE "idempotencyKey" = $1`,
+      [`agent-event:${failureEvent.rows[0]!.id}`])).toEqual(failureOutboxBefore)
+  }, 90_000)
+
+  it("refuses claims and serializes a forged attempted descendant before replacement", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    const prepared = await prepareOperationalFailureReplan(adminPool!, commandPool!, roleName, value, "scout_analyst_closure")
+    const descendant = prepared.sourceNodes.find(node => node.taskId !== prepared.failedRoot.taskId)
+    if (!descendant) throw new Error("Operational-failure race fixture lost its cancelled descendant")
+    const claim = await new PgSubagentTaskStore(commandPool!).claim({ taskId: descendant.taskId, sessionId: value.sessionId,
+      ownerId: `worker-claim-operational-descendant-${randomUUID()}`,
+      policy: { maxConcurrency: 8, maxDepth: 8, maxFanOut: 8, maxAttempts: 2 }, now: new Date() })
+    expect(claim).toBeNull()
+    const lock = await adminPool!.connect()
+    let transactionOpen = false
+    try {
+      await lock.query("BEGIN")
+      transactionOpen = true
+      await lock.query(`SELECT "id" FROM "sub_agent_tasks" WHERE "id" = $1 FOR UPDATE`, [descendant.taskId])
+      let settled = false
+      const replacement = prepared.command.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation).then(
+        () => ({ status: "fulfilled" as const }), error => ({ status: "rejected" as const, error }))
+      void replacement.then(() => { settled = true })
+      await new Promise(resolve => setTimeout(resolve, 40))
+      expect(settled).toBe(false)
+      const changed = await lock.query(`UPDATE "sub_agent_tasks" SET "attemptCount" = 1
+        WHERE "id" = $1 AND "status" = 'cancelled' AND "attemptCount" = 0`, [descendant.taskId])
+      expect(changed.rowCount).toBe(1)
+      await lock.query("COMMIT")
+      transactionOpen = false
+      const outcome = await replacement
+      expect(outcome.status).toBe("rejected")
+      if (outcome.status === "rejected") expect(outcome.error).toMatchObject({ code: "task_graph_operational_failure_replacement_not_eligible" })
+      const unchanged = await prepared.command.readCurrent(readScope(value))
+      expect(unchanged.revision).toBe(prepared.current.revision)
+      expect(unchanged.nodes.map(node => node.taskId)).toEqual(prepared.current.nodes.map(node => node.taskId))
+      const plan = await adminPool!.query(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "idempotencyKey" = $3`,
+        [value.sessionId, value.turnId, taskGraphProposalKey(value.rootTaskId, prepared.input.proposal.expectedRevision)])
+      expect(plan.rows).toHaveLength(0)
+    } finally {
+      if (transactionOpen) await lock.query("ROLLBACK").catch(() => undefined)
+      lock.release()
+    }
+  }, 90_000)
+
+  it("keeps automatic descendant cancellation intact and rolls back replacements after a late plan-event failure", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    const prepared = await prepareOperationalFailureReplan(adminPool!, commandPool!, roleName, value, "scout_analyst_closure")
+    const suffix = randomUUID().replaceAll("-", "")
+    const functionName = `operational_plan_failure_${suffix}`
+    const triggerName = `operational_plan_failure_${suffix}`
+    const planKey = taskGraphProposalKey(value.rootTaskId, prepared.current.revision)
+    try {
+      await adminPool!.query(`CREATE FUNCTION public."${functionName}"() RETURNS trigger LANGUAGE plpgsql AS $operational_failure$
+        BEGIN
+          IF NEW."sessionId" = TG_ARGV[0] AND NEW."idempotencyKey" = TG_ARGV[1] THEN
+            RAISE EXCEPTION 'operational_failure_test_plan_receipt_failure';
+          END IF;
+          RETURN NEW;
+        END
+        $operational_failure$`)
+      await adminPool!.query(`CREATE TRIGGER "${triggerName}" BEFORE INSERT ON public."agent_events"
+        FOR EACH ROW EXECUTE FUNCTION public."${functionName}"('${value.sessionId}', '${planKey}')`)
+      const before = await supersessionDurableRows(adminPool!, value)
+      const immutable = await failedBranchImmutableRows(adminPool!, value, [prepared.failedRoot.taskId])
+      await expect(prepared.command.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation))
+        .rejects.toThrow("operational_failure_test_plan_receipt_failure")
+      expect(await supersessionDurableRows(adminPool!, value)).toEqual(before)
+      expect(await failedBranchImmutableRows(adminPool!, value, [prepared.failedRoot.taskId])).toEqual(immutable)
+      const sources = await adminPool!.query<{ id: string; status: string; attemptCount: number }>(
+        `SELECT "id", "status", "attemptCount" FROM "sub_agent_tasks" WHERE "id" = ANY($1::text[]) ORDER BY "id"`,
+        [prepared.sourceTaskIds])
+      expect(sources.rows.map(row => row.status).sort()).toEqual(["cancelled", "failed"])
+    } finally {
+      await adminPool!.query(`DROP TRIGGER IF EXISTS "${triggerName}" ON public."agent_events"`)
+      await adminPool!.query(`DROP FUNCTION IF EXISTS public."${functionName}"()`)
+    }
+  }, 90_000)
 
   it("cancels only a failed Scout's waiting descendants while preserving failed-root proof and usage", async () => {
     const value = fixture()
