@@ -10184,6 +10184,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         return { adapter, registry: {} as never, candidates: [] }
       },
     })
+    await activateFixtureTurn(pool!, value)
     bootstrap = await createProductionWorkerBootstrap({
       pool: pool!, runtime, ownerId: value.ownerId, turnQueueFactory: createTurnQueue, turnRecoveryIntervalMs: 100,
       waitResolver: { intervalMs: 10, batchSize: 10, ownerId: `p3-operational-failure-resolver-${value.suffix}` },
