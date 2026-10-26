@@ -13,6 +13,8 @@ import { isValidTaskGraphRepairRelation } from "../planning/task-graph.js"
 import { validateTaskGraphVerificationContract, type TaskGraphVerificationReasonCode } from "../planning/task-graph-verification.js"
 import type { StoredTaskGraphNode } from "../subagents/task-graph-snapshot.js"
 import { currentTaskGraph } from "../subagents/task-graph-pg-state.js"
+import { validateRoleResult } from "../subagents/role-results.js"
+import { taskGraphResultDigest } from "../subagents/task-graph-pg-verification.js"
 import { parseRootTaskHistoryReportedOutput, type RootTaskHistoryReportedOutput } from "./root-task-history-result-counts.js"
 import { describeValidatedRootTaskHistoryChecks, filterRootTaskHistoryLessonsForEmittedNodes,
   parseRootTaskHistoryNodeLesson, type RootTaskHistoryCheckDescriptor, type RootTaskHistoryNodeLesson } from "./root-task-history-lesson-schema.js"
@@ -30,6 +32,7 @@ export type LoadedRootTaskHistoryGraphProjection = Readonly<{
 type Pair = Readonly<{ source: StoredTaskGraphNode; current: TaskGraphCurrentNode; task: GraphTaskRow; status: string; failureReason: unknown; result: Record<string, unknown> | null }>
 type Row = Record<string, unknown>
 type SuccessfulRepair = NonNullable<RootTaskHistoryNodeLesson["successfulRepairs"]>[number]
+type FailedRepair = NonNullable<RootTaskHistoryNodeLesson["failedRepairOf"]>
 const MAX_NODES = 8
 const REASONS = new Set<TaskGraphVerificationReasonCode>([
   "criterion_not_met", "reported_score_below_minimum", "contract_invalid", "projection_invalid", "role_mismatch",
@@ -118,11 +121,14 @@ export function sanitizeRootTaskHistoryNodeLessonForCrossSession(value: unknown)
   const successfulRepairs = lesson.successfulRepairs?.map(({ targetNodeOrdinal, targetCriterionOrdinals, status }) => ({
     targetNodeOrdinal, targetCriterionOrdinals: [...targetCriterionOrdinals], status,
   }))
-  if (!criterionFailures.length && !successfulRepairs?.length) return undefined
+  const failedRepair = lesson.failedRepairOf && { targetNodeOrdinal: lesson.failedRepairOf.targetNodeOrdinal,
+    targetCriterionOrdinals: [...lesson.failedRepairOf.targetCriterionOrdinals], outcome: "verified_failed" as const }
+  if (!criterionFailures.length && !successfulRepairs?.length && !failedRepair) return undefined
   return {
     ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
     nodeOrdinal: lesson.nodeOrdinal, criterionFailures,
     ...(successfulRepairs?.length ? { successfulRepairs } : {}),
+    ...(failedRepair ? { failedRepairOf: failedRepair } : {}),
   }
 }
 
@@ -145,6 +151,36 @@ function successfulRepair(pair: Pair, index: number, pairs: readonly Pair[], loa
   return { targetNodeOrdinal: targetIndex + 1, targetCriterionOrdinals: targetOrdinals.map(value => value + 1).sort((a, b) => a - b), status: "passed" }
 }
 
+function failedRepairOf(pair: Pair, index: number, pairs: readonly Pair[], loaded: LoadedGraph): FailedRepair | undefined {
+  const repair = pair.source, relation = repair.repairOf, report = pair.current.verificationReport
+  if (!relation || repair.verificationDisposition !== "typed" || !repair.verification || pair.status !== "failed"
+    || pair.failureReason !== "task_graph_verification_failed" || !report || report.status !== "failed"
+    || !Number.isSafeInteger(pair.task.attemptCount) || (pair.task.attemptCount ?? 0) < 1
+    || !taskGraphVerificationReportMatchesStatus(report, pair.status)
+    || repair.nativeDelegation || pair.current.native || pair.current.nativeResult || !pair.result) return undefined
+  try {
+    const result = validateRoleResult(ownDataValue(pair.result, "structuredResult"), repair.verification.role)
+    if (!report.resultDigest || taskGraphResultDigest(result) !== report.resultDigest) return undefined
+    const targetIndex = loaded.snapshot!.nodes.findIndex(node => node.key === relation.nodeKey)
+    const targetPair = targetIndex >= 0 ? pairs[targetIndex] : undefined, target = targetPair?.source
+    const targetReport = targetPair?.current.verificationReport
+    if (!targetPair || !target || targetIndex >= index || targetPair.status !== "failed"
+      || targetPair.failureReason !== "task_graph_verification_failed" || !targetReport || targetReport.status !== "failed"
+      || !Number.isSafeInteger(targetPair.task.attemptCount) || (targetPair.task.attemptCount ?? 0) < 1
+      || !taskGraphVerificationReportMatchesStatus(targetReport, targetPair.status)
+      || target.nativeDelegation || targetPair.current.native || targetPair.current.nativeResult
+      || relation.graphRootTaskId !== loaded.rootTaskId || target.taskId !== relation.taskId
+      || !isValidTaskGraphRepairRelation(repair, target)) return undefined
+    const targetCriteria = target.verification?.criteria
+    if (!targetCriteria) return undefined
+    const failedTargetIds = new Set(targetReport.criteria.filter(item => item.status === "failed").map(item => item.criterionId))
+    const failedRepairIds = new Set(report.criteria.filter(item => item.status === "failed").map(item => item.criterionId))
+    const targetCriterionOrdinals = targetCriteria.flatMap((criterion, criterionIndex) =>
+      relation.criterionIds.includes(criterion.id) && failedTargetIds.has(criterion.id) && failedRepairIds.has(criterion.id) ? [criterionIndex + 1] : [])
+    return targetCriterionOrdinals.length ? { targetNodeOrdinal: targetIndex + 1, targetCriterionOrdinals, outcome: "verified_failed" } : undefined
+  } catch { return undefined }
+}
+
 /** Derives only allowlisted local-ordinal facts from an owner-loaded graph and its matching public view. */
 export function deriveRootTaskHistoryLessonFacts(loaded: LoadedGraph, currentGraph: TaskGraphCurrentState): readonly (RootTaskHistoryNodeLesson | undefined)[] {
   try {
@@ -156,9 +192,11 @@ export function deriveRootTaskHistoryLessonFacts(loaded: LoadedGraph, currentGra
     const satisfied = new Set(coverage.satisfied.filter(key => loaded.state!.repairSatisfiedNodeKeys?.includes(key)))
     return pairs.map((pair, index) => {
       const failures = criterionFailures(pair, 0, checkMatrix[index] ?? []), repair = successfulRepair(pair, index, pairs, loaded, satisfied)
-      const category = !failures.length && !repair ? executionFailureCategory(pair) : undefined
+      const failedRepair = failedRepairOf(pair, index, pairs, loaded)
+      const category = !failures.length && !repair && !failedRepair ? executionFailureCategory(pair) : undefined
       return parseRootTaskHistoryNodeLesson({ ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
         nodeOrdinal: index + 1, criterionFailures: failures, ...(repair ? { successfulRepairs: [repair] } : {}),
+        ...(failedRepair ? { failedRepairOf: failedRepair } : {}),
         ...(category ? { executionFailureCategory: category } : {}) }, pair.source.verification?.role, pair.status)
     })
   } catch { return [] }

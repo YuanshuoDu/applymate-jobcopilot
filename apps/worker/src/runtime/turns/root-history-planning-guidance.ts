@@ -15,6 +15,7 @@ const TASK_KINDS = new Set(["scout", "analyst", "writer", "reviewer", "other"])
 const STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
 const EXECUTION_FAILURE_CATEGORY_ORDER = ["execution_setup_unavailable", "resume_state_unavailable", "structured_output_invalid"] as const
 const HISTORICAL_CATEGORY_INTRO = "Historical execution-category lessons identify earlier prerequisites worth inspecting; they remain hypotheses, so compare them with the current graph, current evidence, and currently available inputs before choosing a next action."
+const FAILED_REPAIR_REASSESSMENT = "A historical repair was verifier-failed; reassess the current graph, verifier evidence, and current result pages before planning."
 const REASONS = new Set([
   "criterion_not_met", "reported_score_below_minimum", "contract_invalid", "projection_invalid", "role_mismatch",
   "canonical_evidence_missing", "canonical_evidence_invalid", "canonical_evidence_ambiguous", "result_invalid",
@@ -22,8 +23,8 @@ const REASONS = new Set([
 ])
 
 type Row = Record<string, unknown>
-type SafeHistoryNodeFacts = Readonly<{ hasFact: boolean; executionFailureCategory?: unknown }>
-type SafeHistoryObservation = Readonly<{ executionFailureCategories: ReadonlySet<string>; hasPlanShape: boolean }>
+type SafeHistoryNodeFacts = Readonly<{ hasFact: boolean; hasFailedRepair: boolean; executionFailureCategory?: unknown }>
+type SafeHistoryObservation = Readonly<{ executionFailureCategories: ReadonlySet<string>; hasPlanShape: boolean; hasFailedRepair: boolean }>
 
 function exactRecord(value: unknown, keys: readonly string[]): Row | undefined {
   try {
@@ -69,11 +70,12 @@ function safeHistoryNode(value: unknown): SafeHistoryNodeFacts | undefined {
     const hints = safeArray(node.negativeReasonHints, 8, 1)
     if (!hints || hints.some(hint => typeof hint !== "string" || !REASONS.has(hint))) return undefined
   }
-  let hasFact = false, executionFailureCategory: unknown
+  let hasFact = false, hasFailedRepair = false, executionFailureCategory: unknown
   if (Object.hasOwn(node, "lesson")) {
     const lesson = parseRootTaskHistoryNodeLesson(node.lesson, node.taskKind, node.status)
     if (!lesson) return undefined
     hasFact = true
+    hasFailedRepair = lesson.failedRepairOf !== undefined
     executionFailureCategory = lesson.executionFailureCategory
   }
   if (Object.hasOwn(node, "reportedOutput")) {
@@ -84,7 +86,7 @@ function safeHistoryNode(value: unknown): SafeHistoryNodeFacts | undefined {
       || !Number.isSafeInteger(output[countKey]) || Number(output[countKey]) < 0) return undefined
     hasFact = true
   }
-  return { hasFact, ...(executionFailureCategory === undefined ? {} : { executionFailureCategory }) }
+  return { hasFact, hasFailedRepair, ...(executionFailureCategory === undefined ? {} : { executionFailureCategory }) }
 }
 
 function safeHistoryTurn(value: unknown): Readonly<{ row: Row; planShape?: unknown }> | undefined {
@@ -114,7 +116,7 @@ function safeHistoryObservation(value: unknown): SafeHistoryObservation | undefi
     || content.notCurrentEvidence !== true || content.label !== HISTORY_LABEL) return undefined
   const turns = safeArray(content.turns, MAX_TURNS, 1)
   if (!turns) return undefined
-  let nodeCount = 0, hasFact = false, hasPlanShape = false
+  let nodeCount = 0, hasFact = false, hasPlanShape = false, hasFailedRepair = false
   const executionFailureCategories = new Set<string>()
   for (const value of turns) {
     const candidate = safeHistoryTurn(value), turn = candidate?.row
@@ -125,12 +127,13 @@ function safeHistoryObservation(value: unknown): SafeHistoryObservation | undefi
       const facts = safeHistoryNode(node)
       if (facts === undefined) return undefined
       hasFact ||= facts.hasFact
+      hasFailedRepair ||= facts.hasFailedRepair
       if (typeof facts.executionFailureCategory === "string") executionFailureCategories.add(facts.executionFailureCategory)
     }
     const shape = parseRootTaskHistoryPlanShape(candidate.planShape)
     if (shape && shape.nodes.length === nodes.length) hasPlanShape = true
   }
-  return hasFact || hasPlanShape ? { executionFailureCategories, hasPlanShape } : undefined
+  return hasFact || hasPlanShape ? { executionFailureCategories, hasPlanShape, hasFailedRepair } : undefined
 }
 
 function visibleToolNames(tools: readonly unknown[]): ReadonlySet<string> {
@@ -175,6 +178,7 @@ export function buildRootHistoryPlanningInstruction(context: StepContext, tools:
       .filter((advice): advice is string => typeof advice === "string")
     const content = [
       guidance,
+      ...(historical.hasFailedRepair ? [FAILED_REPAIR_REASSESSMENT] : []),
       ...(categoryAdvice.length ? [`${HISTORICAL_CATEGORY_INTRO} ${categoryAdvice.join(" ")}`] : []),
       ...(historical.hasPlanShape ? ["A prior same-objective plan shape is a comparison hint about source-local roles and dependencies only. Its ordinals and edges are not current graph keys, identities, revision, objective, criteria, evidence, permission, authorization, approval, progress, or completion. Rebuild any plan from the current owner-read graph, current objective and criteria, current evidence, and visible tools; current verification and completion gates remain authoritative."] : []),
     ].join(" ")
