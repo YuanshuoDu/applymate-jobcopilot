@@ -47,7 +47,7 @@ describe("TaskGraph result-page lifecycle redaction", () => {
     const summaryPage: TaskGraphResultPage = {
       ...page, taskStatus: "completed", resultStatus: "completed", totalCount: 1, offset: 0, nextOffset: null,
       items: [{ jobId: numericUuid, score: 8.5, evidenceKinds: ["job", "source"] }],
-      analysisSummary: `${"x".repeat(503)}secret=x`, analysisSummaryTruncated: false,
+      analysisSummary: `${"x".repeat(503)} secret=x`, analysisSummaryTruncated: false,
     }
     const safe = prepareTaskGraphResultPageOutput(summaryPage).safe as Record<string, unknown>
     expect(Buffer.byteLength(safe.analysisSummary as string, "utf8")).toBeLessThanOrEqual(512)
