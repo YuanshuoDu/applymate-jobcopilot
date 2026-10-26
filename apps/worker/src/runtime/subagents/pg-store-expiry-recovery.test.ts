@@ -248,7 +248,7 @@ describe("expired subagent recovery fence", () => {
       expect(line).toBeDefined()
       const trace = JSON.parse(line!.slice("WORKER_B_RECOVERY_PREDICATE_TRACE ".length))
       expect(trace).not.toHaveProperty("taskId")
-      expect(trace).toMatchObject({ rejectionStage: "expiry_preview_rejected", childWaitResumable: null,
+      expect(trace).toMatchObject({ rejectionStage: "expiry_preview_rejected", childWaitResumable: null, waitProjectionDisposition: "skipped",
         pages: [{ page: 1, candidates: 10, targetSeen: false, cursorUsed: false },
           { page: 2, candidates: 1, targetSeen: true, cursorUsed: true }],
       })
@@ -261,7 +261,7 @@ describe("expired subagent recovery fence", () => {
     }
   })
 
-  it("adds only the wait-projection rejection stage to the test-only recovery trace", async () => {
+  it("adds wait-projection disposition and rejection stage to the test-only recovery trace", async () => {
     const previousNodeEnv = process.env.NODE_ENV
     const previousTraceTarget = process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID
     const output = vi.spyOn(console, "info").mockImplementation(() => undefined)
@@ -275,6 +275,7 @@ describe("expired subagent recovery fence", () => {
       const trace = JSON.parse(line!.slice("WORKER_B_RECOVERY_PREDICATE_TRACE ".length))
       expect(trace).toMatchObject({
         rejectionStage: "durable_wait_graph_blocked",
+        waitProjectionDisposition: "rejected",
         waitProjectionStage: "target_match_validation",
       })
       expect(trace).not.toHaveProperty("waitProjectionResult")

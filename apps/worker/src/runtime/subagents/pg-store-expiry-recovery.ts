@@ -19,7 +19,8 @@ const RECOVERY_CANDIDATE_SAVEPOINT = "subagent_expiry_recovery_candidate"
 
 type ExpiredWaitDispatch = { id: string; payload: unknown; attemptCount: unknown; publishedAt: unknown }
 type RecoveryStage = "candidate_not_seen" | "candidate_seen" | "session_lock_mismatch" | "turn_lock_mismatch" | "expiry_preview_rejected" | "root_turn_not_recoverable" | "task_lock_parity_mismatch" | "recovery_clock_missing" | "lease_expiry_fence_mismatch" | "unsettled_external_call_rejected" | "durable_wait_graph_blocked" | "task_graph_transition_blocked" | "task_graph_finish_blocked" | "task_update_rejected"
-type RecoveryTrace = { taskId: string; pageCount: number; pages: Array<{ page: number; candidates: number; targetSeen: boolean; cursorUsed: boolean }>; pagesTruncated: boolean; rejectionStage: RecoveryStage; waitProjectionStage?: WaitProjectionRejectionStage; childWaitResumable: boolean | null; waitRegistrationFound: boolean | null; waitRegistrationRejected: boolean | null; blockingExternalCall: boolean | null; dispatch: Record<string, boolean> | null }
+type WaitProjectionDisposition = "skipped" | "repaired" | "already_current" | "rejected"
+type RecoveryTrace = { taskId: string; pageCount: number; pages: Array<{ page: number; candidates: number; targetSeen: boolean; cursorUsed: boolean }>; pagesTruncated: boolean; rejectionStage: RecoveryStage; waitProjectionDisposition: WaitProjectionDisposition; waitProjectionStage?: WaitProjectionRejectionStage; childWaitResumable: boolean | null; waitRegistrationFound: boolean | null; waitRegistrationRejected: boolean | null; blockingExternalCall: boolean | null; dispatch: Record<string, boolean> | null }
 function rejectRecovery(trace: RecoveryTrace | undefined, stage: RecoveryStage): null { if (trace) trace.rejectionStage = stage; return null }
 
 export async function recoverExpired(pool: PgSubagentPool, input: { now: Date; limit: number; sessionId?: string; turnId?: string }): Promise<SubagentTaskRecord[]> {
@@ -27,7 +28,7 @@ export async function recoverExpired(pool: PgSubagentPool, input: { now: Date; l
   if (input.turnId && !input.sessionId) throw new TypeError("Turn recovery filter requires a Session")
   const traceTaskId = process.env.NODE_ENV === "test" ? process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID : undefined
   const trace: RecoveryTrace | undefined = traceTaskId ? { taskId: traceTaskId, pageCount: 0, pages: [], pagesTruncated: false, rejectionStage: "candidate_not_seen",
-    childWaitResumable: null, waitRegistrationFound: null, waitRegistrationRejected: null, blockingExternalCall: null, dispatch: null } : undefined
+    waitProjectionDisposition: "skipped", childWaitResumable: null, waitRegistrationFound: null, waitRegistrationRejected: null, blockingExternalCall: null, dispatch: null } : undefined
   const recovered = await transaction(pool, async client => {
     const scanHorizon = (await client.query<{ scanHorizon: Date }>(`SELECT clock_timestamp() AS "scanHorizon"`)).rows[0]?.scanHorizon
     if (!(scanHorizon instanceof Date) || !Number.isFinite(scanHorizon.getTime())) throw new Error("Recovery scan horizon is unavailable")
@@ -137,7 +138,10 @@ async function recoverOne(client: pg.PoolClient, candidate: Candidate, filter: {
     const projectionRepair = waitContinuation && !childWaitConsumed && !rejectedWaitCallId
       ? await repairStaleWaitProjection(client, lease, checkedAt) : undefined
     const projectionRejected = projectionRepair?.status === "rejected"
-    if (trace && projectionRepair?.status === "rejected") trace.waitProjectionStage = projectionRepair.stage
+    if (trace) {
+      trace.waitProjectionDisposition = projectionRepair?.status ?? "skipped"
+      if (projectionRepair?.status === "rejected") trace.waitProjectionStage = projectionRepair.stage
+    }
     const blockedByExternalCall = await hasBlockingExternalCall(client, row, rejectedWaitCallId, waitContinuation && childWaitConsumed && !rejectedWaitCallId ? childWaitContinuationId : undefined)
     if (trace) trace.blockingExternalCall = blockedByExternalCall
     if (projectionRejected || blockedByExternalCall) return rejectRecovery(trace, projectionRejected ? "durable_wait_graph_blocked" : "unsettled_external_call_rejected")

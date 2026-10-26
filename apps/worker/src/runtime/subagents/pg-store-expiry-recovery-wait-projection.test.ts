@@ -94,6 +94,15 @@ describe("expired wait projection repair", () => {
     expect(callQuery).toContain('result."type" = \'tool_result\'')
   })
 
+  it("repairs a phone-like UUID waitId through safe whole-result serialization", async () => {
+    const waitId = "00000000-0000-4000-8000-000000000000"
+    const fake = fixture({ wait: { id: waitId } })
+    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toEqual({ status: "repaired" })
+    const update = fake.calls.find(call => call.sql.startsWith('UPDATE "agent_wait_conditions"'))
+    const persisted = JSON.parse(String(update?.values?.[0])) as { outcome?: { waitId?: unknown } }
+    expect(persisted.outcome?.waitId).toBe(waitId)
+  })
+
   it("keeps the resolution-time matches when another any-wait target becomes terminal later", async () => {
     const secondTarget = { id: "target-2", parentTaskId: lease.id, rootTaskId: lease.rootTaskId, sessionId: lease.sessionId,
       turnId: lease.turnId, userId: lease.userId, status: "failed", role: "reviewer", result: null, failureReason: "failed later" }
