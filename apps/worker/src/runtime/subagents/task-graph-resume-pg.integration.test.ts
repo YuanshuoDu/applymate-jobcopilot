@@ -9940,9 +9940,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const replacementAnalystGoal = `Analyze the fresh Scout result ${value.suffix}`
     const planCallId = `p3-operational-failure-plan:${value.turnId}`
     const initialWaitCallId = `p3-operational-failure-wait:${value.turnId}`
+    const inlineWaitCallId = `p3-operational-failure-inline-ready-wait:${value.turnId}`
     const replacementPlanCallId = `p3-operational-failure-replan:${value.turnId}`
     const replacementWaitCallId = `p3-operational-failure-replacement-wait:${value.turnId}`
     const initialWaitKey = `p3-operational-failure-wait:${value.turnId}`
+    const inlineWaitKey = `p3-operational-failure-inline-ready-wait:${value.turnId}`
     const replacementWaitKey = `p3-operational-failure-replacement-wait:${value.turnId}`
     turnQueueName = TURN_QUEUE_NAME
     childQueueName = subagentQueue.SUBAGENT_QUEUE_NAME
@@ -9951,6 +9953,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let initialTaskIds: string[] = []
     let replacementTaskIds: string[] = []
     let consumedFailureWaitObserved = false
+    let inlineFailureWaitObserved = false
+    let consumedFailureWaitSnapshot: string | null = null
     let replacementPlanAccepted = false
     let finalGraphVerified = false
     const flags: ProductionAgentFlags = {
@@ -10029,8 +10033,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 [initialTaskIds[1], value.sessionId, value.turnId, rootTaskId],
               )
               expect(descendant.rows[0]).toMatchObject({ status: "cancelled", failureReason: "A prerequisite task did not complete." })
-              const waitRow = await pool!.query<{ id: string; status: string; targetTaskIds: string[]; matchedTaskIds: string[]; suspendedAt: Date | null; consumedAt: Date | null; result: unknown }>(
-                `SELECT "id", "status", "targetTaskIds", "matchedTaskIds", "suspendedAt", "consumedAt", "result"
+              const waitRow = await pool!.query<{ id: string; status: string; targetTaskIds: string[]; matchedTaskIds: string[];
+                suspendedAt: Date | null; resolvedAt: Date | null; consumedAt: Date | null; result: unknown }>(
+                `SELECT "id", "status", "targetTaskIds", "matchedTaskIds", "suspendedAt", "resolvedAt", "consumedAt", "result"
                  FROM "agent_wait_conditions" WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3
                    AND "parentTaskId" = $4 AND "idempotencyKey" = $5 AND "mode" = 'all'`,
                 [value.userId, value.sessionId, value.turnId, rootTaskId, initialWaitKey],
@@ -10052,6 +10057,74 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               expect(persistedTaskStatuses.get(initialTaskIds[0]!)).toBe("failed")
               expect(persistedTaskStatuses.get(initialTaskIds[1]!)).toBe("cancelled")
               consumedFailureWaitObserved = true
+              consumedFailureWaitSnapshot = JSON.stringify({
+                id: waitRow.rows[0]?.id,
+                status: waitRow.rows[0]?.status,
+                targetTaskIds: waitRow.rows[0]?.targetTaskIds,
+                matchedTaskIds: waitRow.rows[0]?.matchedTaskIds,
+                result: waitRow.rows[0]?.result,
+                suspendedAt: waitRow.rows[0]?.suspendedAt?.toISOString() ?? null,
+                resolvedAt: waitRow.rows[0]?.resolvedAt?.toISOString() ?? null,
+                consumedAt: waitRow.rows[0]?.consumedAt?.toISOString() ?? null,
+              })
+              expect(request.tools.map(tool => record(tool)?.name)).toContain("agent.wait")
+              yield { type: "tool_call_completed", callId: inlineWaitCallId, name: "agent.wait", arguments: {
+                idempotencyKey: inlineWaitKey, taskIds: initialTaskIds, mode: "all", timeoutMs: 30_000,
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if (execution === 2 && round === 2) {
+              const graph = currentGraphFromRequest(request)
+              const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+              expect(nodes.map(node => [node?.key, node?.status])).toEqual([["scout", "failed"], ["analyst", "cancelled"]])
+              expect(nodes.find(node => node?.key === "scout")?.executionFailureCategory).toBe("resume_state_unavailable")
+              const inlineOutcome = repairWaitOutcomeFromRequest(request, inlineWaitCallId, initialTaskIds)
+              expect(inlineOutcome.status).toBe("ready")
+              const inlineTaskStatuses = new Map<string, unknown>()
+              for (const value of Array.isArray(inlineOutcome.tasks) ? inlineOutcome.tasks : []) {
+                const task = record(value)
+                if (typeof task?.taskId === "string") inlineTaskStatuses.set(task.taskId, task.status)
+              }
+              expect(inlineTaskStatuses.get(initialTaskIds[0]!)).toBe("failed")
+              expect(inlineTaskStatuses.get(initialTaskIds[1]!)).toBe("cancelled")
+              const inlineSource = (Array.isArray(inlineOutcome.tasks) ? inlineOutcome.tasks : []).map(record).find(task => task?.taskId === initialTaskIds[0])
+              expectUnverifiedVerificationReport(record(inlineSource?.result)?.taskGraphVerificationReport, "candidate-count")
+
+              const inlineWaitRow = await pool!.query<{ id: string; status: string; targetTaskIds: string[]; matchedTaskIds: string[];
+                suspendedAt: Date | null; resolvedAt: Date | null; consumedAt: Date | null; result: unknown }>(
+                `SELECT "id", "status", "targetTaskIds", "matchedTaskIds", "suspendedAt", "resolvedAt", "consumedAt", "result"
+                 FROM "agent_wait_conditions" WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3
+                   AND "parentTaskId" = $4 AND "idempotencyKey" = $5 AND "mode" = 'all'`,
+                [value.userId, value.sessionId, value.turnId, rootTaskId, inlineWaitKey],
+              )
+              expect(inlineWaitRow.rows).toHaveLength(1)
+              const sortedInitialTaskIds = [...initialTaskIds].sort()
+              expect(inlineWaitRow.rows[0]).toMatchObject({ status: "ready", targetTaskIds: sortedInitialTaskIds,
+                matchedTaskIds: sortedInitialTaskIds, suspendedAt: null, resolvedAt: null, consumedAt: null })
+              expect(inlineWaitRow.rows[0]?.result).toEqual({
+                request: { targetTaskIds: sortedInitialTaskIds, mode: "all", timeoutMs: 30_000 },
+              })
+
+              const originalWait = await pool!.query<{ id: string; status: string; targetTaskIds: string[]; matchedTaskIds: string[];
+                suspendedAt: Date | null; resolvedAt: Date | null; consumedAt: Date | null; result: unknown }>(
+                `SELECT "id", "status", "targetTaskIds", "matchedTaskIds", "suspendedAt", "resolvedAt", "consumedAt", "result"
+                 FROM "agent_wait_conditions" WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3
+                   AND "parentTaskId" = $4 AND "idempotencyKey" = $5 AND "mode" = 'all'`,
+                [value.userId, value.sessionId, value.turnId, rootTaskId, initialWaitKey],
+              )
+              expect(originalWait.rows).toHaveLength(1)
+              expect(JSON.stringify({
+                id: originalWait.rows[0]?.id,
+                status: originalWait.rows[0]?.status,
+                targetTaskIds: originalWait.rows[0]?.targetTaskIds,
+                matchedTaskIds: originalWait.rows[0]?.matchedTaskIds,
+                result: originalWait.rows[0]?.result,
+                suspendedAt: originalWait.rows[0]?.suspendedAt?.toISOString() ?? null,
+                resolvedAt: originalWait.rows[0]?.resolvedAt?.toISOString() ?? null,
+                consumedAt: originalWait.rows[0]?.consumedAt?.toISOString() ?? null,
+              })).toBe(consumedFailureWaitSnapshot)
+              inlineFailureWaitObserved = true
               if (!graph || typeof graph.revision !== "number") throw new Error("Operational failure fixture lost the current graph revision")
               yield { type: "tool_call_completed", callId: replacementPlanCallId, name: "agent.plan", arguments: {
                 expectedRevision: graph.revision,
@@ -10070,7 +10143,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               yield { type: "completed", finishReason: "tool_calls" }
               return
             }
-            if (execution === 2 && round === 2) {
+            if (execution === 2 && round === 3) {
               replacementTaskIds = planTaskIds(request, replacementPlanCallId, 2)
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
@@ -10146,6 +10219,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(replacementTaskIds).toHaveLength(2)
     expect(new Set([...initialTaskIds, ...replacementTaskIds]).size).toBe(4)
     expect(consumedFailureWaitObserved).toBe(true)
+    expect(inlineFailureWaitObserved).toBe(true)
     expect(replacementPlanAccepted).toBe(true)
     expect(finalGraphVerified).toBe(true)
     const tasks = await pool!.query<{ id: string; goal: string; status: string; failureReason: string | null; result: unknown }>(
@@ -10163,19 +10237,30 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expectPassedVerificationReport(record(byGoal.get(replacementScoutGoal)?.result)?.taskGraphVerificationReport, "candidate-count")
     expect(byGoal.get(replacementAnalystGoal)).toMatchObject({ id: replacementTaskIds[1], status: "completed", failureReason: null })
     expectPassedVerificationReport(record(byGoal.get(replacementAnalystGoal)?.result)?.taskGraphVerificationReport, "finding-count")
-    const waits = await pool!.query<{ id: string; idempotencyKey: string; status: string; targetTaskIds: string[]; matchedTaskIds: string[]; suspendedAt: Date | null; consumedAt: Date | null }>(
-      `SELECT "id", "idempotencyKey", "status", "targetTaskIds", "matchedTaskIds", "suspendedAt", "consumedAt"
+    const waits = await pool!.query<{ id: string; idempotencyKey: string; status: string; targetTaskIds: string[]; matchedTaskIds: string[];
+      suspendedAt: Date | null; resolvedAt: Date | null; consumedAt: Date | null; result: unknown }>(
+      `SELECT "id", "idempotencyKey", "status", "targetTaskIds", "matchedTaskIds", "suspendedAt", "resolvedAt", "consumedAt", "result"
        FROM "agent_wait_conditions" WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "parentTaskId" = $4 ORDER BY "createdAt"`,
       [value.userId, value.sessionId, value.turnId, rootTaskId],
     )
-    expect(waits.rows).toHaveLength(2)
-    expect(waits.rows.map(wait => wait.status)).toEqual(["ready", "ready"])
-    expect(waits.rows.every(wait => wait.suspendedAt instanceof Date && wait.consumedAt instanceof Date)).toBe(true)
-    expect(waits.rows.map(wait => wait.idempotencyKey)).toEqual([initialWaitKey, replacementWaitKey])
-    expect(waits.rows[0]?.targetTaskIds).toEqual([...initialTaskIds].sort())
-    expect(waits.rows[0]?.matchedTaskIds).toEqual([...initialTaskIds].sort())
-    expect(waits.rows[1]?.targetTaskIds).toEqual([...replacementTaskIds].sort())
-    expect(waits.rows[1]?.matchedTaskIds).toEqual([...replacementTaskIds].sort())
+    expect(waits.rows).toHaveLength(3)
+    expect(waits.rows.map(wait => wait.idempotencyKey)).toEqual(expect.arrayContaining([initialWaitKey, inlineWaitKey, replacementWaitKey]))
+    const initialWait = waits.rows.find(wait => wait.idempotencyKey === initialWaitKey)
+    const inlineWait = waits.rows.find(wait => wait.idempotencyKey === inlineWaitKey)
+    const replacementWait = waits.rows.find(wait => wait.idempotencyKey === replacementWaitKey)
+    expect(initialWait).toMatchObject({ status: "ready", targetTaskIds: [...initialTaskIds].sort(),
+      matchedTaskIds: [...initialTaskIds].sort() })
+    expect(initialWait?.suspendedAt).toBeInstanceOf(Date)
+    expect(initialWait?.resolvedAt).toBeInstanceOf(Date)
+    expect(initialWait?.consumedAt).toBeInstanceOf(Date)
+    expect(inlineWait).toMatchObject({ status: "ready", targetTaskIds: [...initialTaskIds].sort(),
+      matchedTaskIds: [...initialTaskIds].sort(), suspendedAt: null, resolvedAt: null, consumedAt: null })
+    expect(inlineWait?.result).toEqual({ request: { targetTaskIds: [...initialTaskIds].sort(), mode: "all", timeoutMs: 30_000 } })
+    expect(replacementWait).toMatchObject({ status: "ready", targetTaskIds: [...replacementTaskIds].sort(),
+      matchedTaskIds: [...replacementTaskIds].sort() })
+    expect(replacementWait?.suspendedAt).toBeInstanceOf(Date)
+    expect(replacementWait?.resolvedAt).toBeInstanceOf(Date)
+    expect(replacementWait?.consumedAt).toBeInstanceOf(Date)
     const graphEvents = await pool!.query<{ payload: unknown; idempotencyKey: string }>(
       `SELECT "payload", "idempotencyKey" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3 ORDER BY "sequence"`,
       [value.sessionId, value.turnId, taskGraphItemId(rootTaskId!)],

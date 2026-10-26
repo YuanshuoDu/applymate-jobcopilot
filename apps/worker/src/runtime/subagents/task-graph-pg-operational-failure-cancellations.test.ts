@@ -47,19 +47,24 @@ function rootWait(changes: Row = {}): Row {
     : { taskId, status: "failed", role: "scout", result: null, failureReason: "source failed" })
   return { id: "root-wait", userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
     parentTaskId: scope.rootTaskId, stepId: "root-step", idempotencyKey: "wait-call", targetTaskIds, mode: "all", status: "ready", matchedTaskIds: targetTaskIds,
-    createdAt: new Date(10), resolvedAt: new Date(30), suspendedAt: new Date(20), consumedAt: new Date(40),
+    createdAt: new Date(10), deadlineAt: new Date(1010), resolvedAt: new Date(30), suspendedAt: new Date(20), consumedAt: new Date(40),
     result: { request: { targetTaskIds, mode: "all", timeoutMs: 1000 }, outcome: { waitId: "root-wait", status: "ready",
       matchedTaskIds: targetTaskIds, targetTaskIds, tasks } },
     sessionUserId: scope.userId, parentId: scope.rootTaskId, parentSessionId: scope.sessionId, parentTurnId: scope.turnId,
     parentRootTaskId: scope.rootTaskId, parentParentTaskId: null, parentRole: "orchestrator", parentTaskType: "root",
-    turnUserId: scope.userId, turnRootTaskId: scope.rootTaskId, stepTaskId: scope.rootTaskId, stepAttempt: 1, ...changes }
+    turnUserId: scope.userId, turnRootTaskId: scope.rootTaskId, resolvedStepId: changes.stepId ?? "root-step",
+    stepTaskId: scope.rootTaskId, stepAttempt: 1, ...changes }
 }
 function fixture(event: Row | null = eventRow(), row: TaskGraphBranchSourceRow = sourceRow(), waits: readonly Row[] = []) {
   const targetRows = [
     { id: child.taskId, rootTaskId: scope.rootTaskId, sessionId: scope.sessionId, turnId: scope.turnId,
-      status: "cancelled", role: "analyst", userId: scope.userId },
+      status: "cancelled", role: "analyst", userId: scope.userId, attemptCount: 0,
+      failureReason: "A prerequisite task did not complete.", startedAt: null, leaseOwner: null, leaseExpiresAt: null,
+      nextAttemptAt: null, completedAt: new Date(20), closedAt: null, interruptRequestedAt: null, result: null,
+      confidence: null, qualityGateResult: null, contextSnapshotId: null, outputArtifactIds: [], hasCanonicalDispatch: false },
     { id: root.taskId, rootTaskId: scope.rootTaskId, sessionId: scope.sessionId, turnId: scope.turnId,
-      status: "failed", role: "scout", userId: scope.userId },
+      status: "failed", role: "scout", userId: scope.userId, attemptCount: 2,
+      failureReason: "child_resume_unavailable", startedAt: new Date(1), leaseOwner: null, result: null },
   ]
   const query = vi.fn(async (sql: string) => sql.includes('FROM "agent_wait_conditions" wait')
     ? { rows: [...waits], rowCount: waits.length }

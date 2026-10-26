@@ -101,6 +101,8 @@ describe("scheduleTaskGraphOperationalFailureReplacement", () => {
       parent, expect.objectContaining({ nodes: [] }), expect.any(Map), expect.any(Object), { originalNodeCount: 1, removedNodeCount: 1 })
     expect(mocks.writePlan).toHaveBeenCalledWith(client, expect.objectContaining({ expectedRevision: 1,
       idempotencyKey: taskGraphProposalKey(scope.rootTaskId, 1) }))
+    expect(client.query).toHaveBeenCalledWith(expect.stringContaining('session."userId" = $5 AND turn."userId" = $5'),
+      [scope.sessionId, scope.turnId, taskGraphItemId(scope.rootTaskId), taskGraphProposalKey(scope.rootTaskId, 1), scope.userId])
     expect(mocks.writeReceipt).toHaveBeenCalledWith(client, expect.any(Object), 2, undefined, undefined, undefined,
       expect.objectContaining({ failedSource: expect.objectContaining({ attemptCount: 2 }), priorCancellations: [], cancellations: [],
         observedGraphEvent: expect.objectContaining({ id: "failure-event" }) }))

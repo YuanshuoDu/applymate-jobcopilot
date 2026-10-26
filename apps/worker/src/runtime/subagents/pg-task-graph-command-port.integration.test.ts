@@ -3450,7 +3450,10 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       additionalFixtures.push(value)
       const prepared = await prepareOperationalFailureReplan(adminPool!, commandPool!, roleName, value, "scout_analyst_closure")
       const replacement = prepared.input.replaceOperationalFailure!
-      const proposalNodes = invalidKind === "partial" ? [prepared.input.proposal.nodes[0]!] : [prepared.input.proposal.nodes[0]!]
+      const rootMapping = replacement.sources.find(source => source.taskId === prepared.failedRoot.taskId)
+      const rootReplacement = prepared.input.proposal.nodes.find(node => node.key === rootMapping?.replacementKey)
+      if (!rootMapping || !rootReplacement) throw new Error("Operational-failure test lost its root replacement mapping")
+      const proposalNodes = [rootReplacement]
       const invalidMode = invalidKind === "partial"
         ? { ...replacement, sources: replacement.sources.filter(source => source.taskId === prepared.failedRoot.taskId) }
         : replacement
@@ -3466,7 +3469,9 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       const operation = { ...prepared.operation, replaceOperationalFailure: invalidMode }
       const before = await supersessionDurableRows(adminPool!, value)
       await expect(prepared.command.appendAndScheduleWithReconciliation!(input, operation)).rejects.toMatchObject({
-        code: "task_graph_operational_failure_replacement_not_eligible",
+        code: invalidKind === "partial"
+          ? "task_graph_operational_failure_replacement_not_eligible"
+          : "steering_reconciliation_call_invalid",
       })
       expect(await supersessionDurableRows(adminPool!, value)).toEqual(before)
     }

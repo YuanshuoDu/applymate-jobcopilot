@@ -177,7 +177,7 @@ async function hasPriorPlan(client: Client, input: TaskGraphScheduleInput, key: 
     JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
     WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."itemId" = $3 AND event."idempotencyKey" = $4
       AND session."userId" = $5 AND turn."userId" = $5) AS "exists"`,
-  [input.scope.sessionId, input.scope.turnId, taskGraphItemId(input.scope.rootTaskId), key])
+  [input.scope.sessionId, input.scope.turnId, taskGraphItemId(input.scope.rootTaskId), key, input.scope.userId])
   return (result.rows[0] as Row | undefined)?.exists === true
 }
 function sameReplacement(left: TaskGraphOperationalFailureReplacement | undefined,

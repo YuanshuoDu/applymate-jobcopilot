@@ -2,6 +2,7 @@ import type pg from "pg"
 import type { TaskGraphOperationalFailedBranchRelation, TaskGraphOperationalIdentity } from "./task-graph-pg-operational-failed-branch-relation.js"
 import type { TaskGraphBranchSourceRow } from "./task-graph-pg-branch-repair.js"
 import type { GraphIdentityScope } from "./task-graph-pg-state.js"
+import { proveTaskGraphOperationalRootWaitReferences } from "./task-graph-pg-operational-failure-root-waits.js"
 import { canonicalTaskGraphJson, parseTaskGraphEvent, parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey,
   type StoredTaskGraphNode, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
@@ -57,90 +58,6 @@ function eventEnvelope(row: Row, scope: GraphIdentityScope, node: StoredTaskGrap
   if (BigInt(seq) > observedSequence) return null
   return { id: row.id, sequence: seq, idempotencyKey: key }
 }
-function strings(value: unknown): string[] | null {
-  const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
-  return Array.isArray(parsed) && parsed.every(item => id(item) && item.length <= 256) ? parsed as string[] : null
-}
-function exactKeys(value: Row | null, keys: readonly string[]): boolean {
-  return value !== null && Object.keys(value).sort().join(",") === [...keys].sort().join(",")
-}
-function sameIds(left: readonly string[], right: readonly string[]): boolean {
-  return left.length === right.length && left.every((value, index) => value === right[index])
-}
-function terminal(value: unknown): boolean { return ["completed", "failed", "interrupted", "cancelled", "closed"].includes(String(value)) }
-function time(value: unknown): number | null {
-  const parsed = value instanceof Date ? value.getTime() : typeof value === "string" ? Date.parse(value) : Number.NaN
-  return Number.isFinite(parsed) ? parsed : null
-}
-function validConsumedRootWait(wait: Row, scope: GraphIdentityScope, targetRows: ReadonlyMap<string, Row>): boolean {
-  const targets = strings(wait.targetTaskIds), matched = strings(wait.matchedTaskIds), result = object(wait.result)
-  const request = object(result?.request), outcome = object(result?.outcome), taskValues = Array.isArray(outcome?.tasks) ? outcome.tasks : null
-  const created = time(wait.createdAt), resolved = time(wait.resolvedAt), consumed = time(wait.consumedAt)
-  if (!result || !request || !outcome || !taskValues) return false
-  if (wait.parentTaskId !== scope.rootTaskId || wait.userId !== scope.userId || wait.sessionUserId !== scope.userId
-    || wait.sessionId !== scope.sessionId || wait.turnId !== scope.turnId
-    || !id(wait.id) || !id(wait.stepId) || !id(wait.idempotencyKey)
-    || wait.parentId !== scope.rootTaskId || wait.parentSessionId !== scope.sessionId || wait.parentTurnId !== scope.turnId
-    || wait.parentRootTaskId !== null && wait.parentRootTaskId !== undefined && wait.parentRootTaskId !== scope.rootTaskId
-    || wait.parentParentTaskId !== null || wait.parentRole !== "orchestrator" || wait.parentTaskType !== "root"
-    || wait.turnUserId !== scope.userId || wait.turnRootTaskId !== null && wait.turnRootTaskId !== undefined && wait.turnRootTaskId !== scope.rootTaskId
-    || wait.stepTaskId !== scope.rootTaskId && wait.stepTaskId !== null || Number(wait.stepAttempt) !== 1
-    || wait.mode !== "all" || wait.status !== "ready" || created === null || resolved === null || consumed === null
-    || !timestamp(wait.suspendedAt) || resolved < created || consumed < resolved
-    || !targets || !matched || targets.length === 0 || targets.length > 8 || new Set(targets).size !== targets.length
-    || !sameIds(targets, [...targets].sort()) || !sameIds(matched, targets) || !exactKeys(result, ["request", "outcome"])
-    || !exactKeys(request, ["mode", "targetTaskIds", "timeoutMs"]) || request.mode !== "all"
-    || !Number.isSafeInteger(request.timeoutMs) || Number(request.timeoutMs) < 1 || Number(request.timeoutMs) > 86_400_000
-    || !sameIds(strings(request.targetTaskIds) ?? [], targets)
-    || !exactKeys(outcome, ["waitId", "status", "matchedTaskIds", "targetTaskIds", "tasks"])
-    || outcome.waitId !== wait.id || outcome.status !== "ready" || !sameIds(strings(outcome.targetTaskIds) ?? [], targets)
-    || !sameIds(strings(outcome.matchedTaskIds) ?? [], targets) || taskValues.length !== targets.length) return false
-  const tasks = new Map<string, Row>()
-  for (const value of taskValues) {
-    const task = object(value)
-    const keys = task && Object.hasOwn(task, "verificationReport")
-      ? ["taskId", "status", "role", "result", "failureReason", "verificationReport"]
-      : task && Object.hasOwn(task, "repairReceipt")
-        ? ["taskId", "status", "role", "result", "failureReason", "repairReceipt"]
-        : ["taskId", "status", "role", "result", "failureReason"]
-    if (!task || !exactKeys(task, keys) || !id(task.taskId) || tasks.has(task.taskId) || !terminal(task.status)
-      || typeof task.role !== "string" || !task.role.trim() || task.role.length > 256) return false
-    tasks.set(task.taskId, task)
-  }
-  if (targets.some(taskId => !tasks.has(taskId) || !targetRows.has(taskId))) return false
-  for (const taskId of targets) {
-    const task = tasks.get(taskId)!, row = targetRows.get(taskId)!
-    if (task.status !== row.status || task.role !== row.role || String(row.rootTaskId ?? row.id) !== scope.rootTaskId
-      || row.sessionId !== scope.sessionId || row.turnId !== scope.turnId || row.userId !== scope.userId) return false
-    if (row.status === "cancelled" && (!exactKeys(task, ["taskId", "status", "role", "result", "failureReason"])
-      || task.result !== null || task.failureReason !== null)) return false
-  }
-  return true
-}
-async function rootWaitReferencesAreValid(client: Client, scope: GraphIdentityScope, descendantIds: readonly string[]): Promise<boolean> {
-  if (descendantIds.length === 0) return true
-  const rows = await client.query<Row>(`SELECT wait."id", wait."userId", wait."sessionId", wait."turnId", wait."parentTaskId", wait."stepId", wait."idempotencyKey",
-      wait."targetTaskIds", wait."mode", wait."status", wait."matchedTaskIds", wait."result", wait."createdAt", wait."resolvedAt", wait."suspendedAt", wait."consumedAt",
-      session."userId" AS "sessionUserId",
-      parent."id" AS "parentId", parent."sessionId" AS "parentSessionId", parent."turnId" AS "parentTurnId",
-      parent."rootTaskId" AS "parentRootTaskId", parent."parentTaskId" AS "parentParentTaskId", parent."role" AS "parentRole", parent."taskType" AS "parentTaskType",
-      turn."userId" AS "turnUserId", turn."rootTaskId" AS "turnRootTaskId", step."taskId" AS "stepTaskId", step."attempt" AS "stepAttempt"
-    FROM "agent_wait_conditions" wait LEFT JOIN "agent_sessions" session ON session."id" = wait."sessionId"
-    LEFT JOIN "agent_turns" turn ON turn."id" = wait."turnId" AND turn."sessionId" = wait."sessionId"
-    LEFT JOIN "sub_agent_tasks" parent ON parent."id" = wait."parentTaskId" AND parent."sessionId" = wait."sessionId"
-    LEFT JOIN "agent_steps" step ON step."id" = wait."stepId" AND step."sessionId" = wait."sessionId" AND step."turnId" = wait."turnId"
-    WHERE wait."parentTaskId" = ANY($1::text[]) OR wait."targetTaskIds" ?| $1::text[] OR wait."matchedTaskIds" ?| $1::text[]`,
-  [descendantIds])
-  if (rows.rows.length === 0) return true
-  const targetIds = [...new Set(rows.rows.flatMap(wait => strings(wait.targetTaskIds) ?? []))]
-  const targets = targetIds.length ? await client.query<Row>(`SELECT task."id", task."rootTaskId", task."sessionId", task."turnId", task."status", task."role", session."userId" AS "userId"
-    FROM "sub_agent_tasks" task JOIN "agent_sessions" session ON session."id" = task."sessionId"
-    WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4 AND session."userId" = $5`,
-  [targetIds, scope.sessionId, scope.turnId, scope.rootTaskId, scope.userId]) : { rows: [] }
-  const targetRows = new Map(targets.rows.map(row => [String(row.id), row]))
-  return rows.rows.every(wait => validConsumedRootWait(wait, scope, targetRows))
-}
-
 const OTHER_EVIDENCE = `EXISTS (SELECT 1 FROM "sub_agent_tasks" child WHERE child."sessionId" = task."sessionId" AND child."parentTaskId" = task."id")
   OR EXISTS (SELECT 1 FROM "agent_steps" row WHERE row."sessionId" = task."sessionId" AND row."taskId" = task."id")
   OR EXISTS (SELECT 1 FROM "agent_items" row WHERE row."sessionId" = task."sessionId" AND row."taskId" = task."id")
@@ -188,7 +105,7 @@ export async function proveTaskGraphOperationalFailureCancellations(client: Clie
   [descendants.map(node => node.taskId), input.scope.sessionId, input.scope.turnId, input.scope.rootTaskId, input.scope.userId])
   if (taskRows.rows.length !== descendants.length) return null
   const taskById = new Map(taskRows.rows.map(row => [String(row.id), row]))
-  if (!await rootWaitReferencesAreValid(client, input.scope, descendants.map(node => node.taskId))) return null
+  if (!await proveTaskGraphOperationalRootWaitReferences(client, { scope: input.scope, taskIds: descendants.map(node => node.taskId) })) return null
   for (const node of descendants) {
     const task = taskById.get(node.taskId)!
     if (task.failureReason !== PREREQUISITE_FAILURE) continue
