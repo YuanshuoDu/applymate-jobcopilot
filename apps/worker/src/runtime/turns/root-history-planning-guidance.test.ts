@@ -18,6 +18,14 @@ const lesson = {
     check: { role: "analyst", kind: "finding_count_gte", minimum: 2 } }],
 }
 const report = { role: "scout", candidateCount: 12345, resultStatus: "partial" }
+const planShape = {
+  schemaVersion: "agent-harness.v2.root-task-history-plan-shape.v1",
+  ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
+  nodes: [
+    { ordinal: 1, role: "scout", dependsOnOrdinals: [] },
+    { ordinal: 2, role: "analyst", dependsOnOrdinals: [1] },
+  ],
+}
 
 function defaultHistoryContent(): HistoryContent {
   return {
@@ -79,6 +87,34 @@ describe("root history planning guidance", () => {
     expect(text).not.toContain("session-current")
     expect(text).not.toContain("turn-current")
     expect(text).not.toContain("step-current")
+  })
+
+  it("activates fixed advisory guidance from a valid complete plan shape without lessons or counts", () => {
+    const content = { ...defaultHistoryContent(), turns: [{ label: "earlier terminal attempt", nodes: [
+      { taskKind: "scout", status: "completed" }, { taskKind: "analyst", status: "failed" },
+    ], planShape }] }
+    const text = textOf(buildRootHistoryPlanningInstruction(context([historyBlock(content)]), [{ name: "agent.plan" }]))
+    expect(text).toContain("A prior same-objective plan shape is a comparison hint")
+    expect(text).toContain("source-local roles and dependencies only")
+    expect(text).toContain("not current graph keys, identities, revision, objective, criteria, evidence, permission, authorization, approval, progress, or completion")
+    expect(text).toContain("current verification and completion gates remain authoritative")
+    expect(text).not.toContain("ordinal 1")
+    expect(text).not.toContain("dependsOnOrdinals")
+  })
+
+  it("ignores malformed optional shapes while preserving legacy facts and rejects shape-only mismatches", () => {
+    const lessonNode = { taskKind: "analyst", status: "failed", negativeReasonHints: ["criterion_not_met"], lesson }
+    const malformed = { ...planShape, privateField: "DO_NOT_TRUST" }
+    const legacyWithMalformedShape = { ...defaultHistoryContent(), turns: [{ label: "earlier terminal attempt",
+      nodes: [lessonNode], planShape: malformed }] }
+    const legacyText = textOf(buildRootHistoryPlanningInstruction(context([historyBlock(legacyWithMalformedShape)]), [{ name: "agent.plan" }]))
+    expect(legacyText).toContain("hypotheses only")
+    expect(legacyText).not.toContain("A prior same-objective plan shape is a comparison hint")
+    expect(legacyText).not.toContain("DO_NOT_TRUST")
+
+    const mismatched = { ...defaultHistoryContent(), turns: [{ label: "earlier terminal attempt",
+      nodes: [{ taskKind: "scout", status: "completed" }], planShape }] }
+    expect(buildRootHistoryPlanningInstruction(context([historyBlock(mismatched)]), [{ name: "agent.plan" }])).toBeNull()
   })
 
   it("accepts the bounded coverage lesson without placing its operands or ordinals in guidance", () => {
