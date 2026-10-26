@@ -5,7 +5,7 @@ vi.mock("./role-policy.js", async importOriginal => {
   const scout = actual.getSubagentRolePolicy("scout")!
   return { ...actual, getSubagentRolePolicy: (role: string) => role === "wait-enabled" ? { ...scout, canManageChildren: true } : actual.getSubagentRolePolicy(role) }
 })
-import { recoverExpiredWaitRegistration, registerDurableSubagentWait, safeSubagentWaitJson } from "./durable-subagent-wait-store.js"
+import { projectDurableSubagentWait, recoverExpiredWaitRegistration, registerDurableSubagentWait, safeSubagentWaitJson } from "./durable-subagent-wait-store.js"
 import type { SubagentLease } from "./types.js"
 
 const now = new Date("2026-10-22T10:00:00.000Z")
@@ -71,11 +71,31 @@ function fixture() {
 }
 
 describe("registerDurableSubagentWait", () => {
-  it("preserves only a structurally valid UUID in a waitId field while redacting other strings", () => {
+  it("redacts UUID-shaped values in arbitrary waitId fields and other strings", () => {
     const waitId = "00000000-0000-4000-8000-000000000000"
     expect(safeSubagentWaitJson({ outcome: { waitId, note: waitId, nested: { waitId: "+353 87 123 4567" } } })).toEqual({
-      outcome: { waitId, note: "[REDACTED_PHONE]", nested: { waitId: "[REDACTED_PHONE]" } },
+      outcome: { waitId: "[REDACTED_PHONE]", note: "[REDACTED_PHONE]", nested: { waitId: "[REDACTED_PHONE]" } },
     })
+  })
+
+  it("preserves only the row-bound canonical waitId and redacts nested child-result UUIDs", () => {
+    const waitId = "00000000-0000-4000-8000-000000000000"
+    const row = { id: waitId, targetTaskIds: ["child-1"], deadlineAt: now }
+    const outcome = projectDurableSubagentWait(row, [{ id: "child-1", status: "completed", role: "writer",
+      result: { nested: { waitId } }, failureReason: null }], "ready", ["child-1"])
+    const request = { targetTaskIds: ["child-1"], mode: "any", timeoutMs: 5_000 }
+    const persisted = safeSubagentWaitJson({ request, outcome }, 16_384) as {
+      outcome: { waitId: string; tasks: Array<{ result: unknown }> }
+    }
+
+    expect(outcome.waitId).toBe(row.id)
+    expect(persisted.outcome.waitId).toBe(row.id)
+    expect(persisted.outcome.tasks[0]?.result).toEqual({ nested: { waitId: "[REDACTED_PHONE]" } })
+
+    const mismatched = projectDurableSubagentWait(row, [], "ready", ["child-1"])
+    Object.assign(mismatched, { waitId: "11111111-1111-4111-8111-111111111111" })
+    const rejected = safeSubagentWaitJson({ request, outcome: mismatched }, 16_384) as { outcome: { waitId: string } }
+    expect(rejected.outcome.waitId).toBe("[REDACTED_PHONE]")
   })
 
   it("reconstructs only the exact persisted, admitted pre-insert wait and preserves its original deadline", async () => {

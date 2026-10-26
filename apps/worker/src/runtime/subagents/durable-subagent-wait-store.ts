@@ -23,6 +23,7 @@ export type RegisterDurableSubagentWaitInput = Readonly<{
 const MAX_WAIT_MS = 24 * 60 * 60 * 1_000
 const MAX_TARGETS = 8
 const MAX_RESULT_BYTES = 512
+const canonicalWaitIds = new WeakMap<object, string>()
 const OPEN_SESSION = `session."status" NOT IN ('aborted', 'archived')`
 const TERMINAL = new Set(["completed", "failed", "interrupted", "cancelled", "closed", "passed", "skipped"])
 
@@ -33,18 +34,19 @@ export class DurableSubagentWaitError extends Error {
 }
 
 export function safeSubagentWaitJson(value: unknown, maxBytes = MAX_RESULT_BYTES): unknown {
-  const clean = (item: unknown, seen = new Set<object>(), depth = 0, key?: string): unknown => {
+  const clean = (item: unknown, seen = new Set<object>(), depth = 0, key?: string, expectedWaitId?: string): unknown => {
     if (item === null || typeof item === "boolean") return item
-    if (typeof item === "string") return key === "waitId" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(item) ? item : redactSensitiveText(item).slice(0, 2_000)
+    if (typeof item === "string") return key === "waitId" && item === expectedWaitId && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(item) ? item : redactSensitiveText(item).slice(0, 2_000)
     if (typeof item === "number") return Number.isFinite(item) ? item : null
     if (!item || typeof item !== "object" || depth > 12 || seen.has(item)) return "[TRUNCATED]"
     seen.add(item)
     try {
       if (Array.isArray(item)) return item.slice(0, 64).map(child => clean(child, seen, depth + 1))
       const output: Record<string, unknown> = {}
+      const canonicalWaitId = canonicalWaitIds.get(item)
       for (const key of Object.keys(item).sort().slice(0, 64)) {
         if (/api.?key|secret|password|(?:access|refresh).?token|authorization/i.test(key)) continue
-        output[key] = clean((item as Record<string, unknown>)[key], seen, depth + 1, key)
+        output[key] = clean((item as Record<string, unknown>)[key], seen, depth + 1, key, key === "waitId" ? canonicalWaitId : undefined)
       }
       return output
     } finally { seen.delete(item) }
@@ -65,7 +67,7 @@ export function safeSubagentWaitJson(value: unknown, maxBytes = MAX_RESULT_BYTES
 export function projectDurableSubagentWait(row: Row, taskRows: readonly Row[], status: DurableSubagentWaitStatus, matchedTaskIds: readonly string[]): DurableSubagentWaitResult {
   const ids = parseIds(row.targetTaskIds)
   const byId = new Map(taskRows.map(task => [String(task.id), task]))
-  return {
+  const projection: DurableSubagentWaitResult = {
     waitId: String(row.id), status, taskIds: ids,
     deadlineAt: dateValue(row.deadlineAt, "deadlineAt").toISOString(), matchedTaskIds: [...matchedTaskIds].sort(),
     tasks: ids.map(taskId => {
@@ -77,6 +79,8 @@ export function projectDurableSubagentWait(row: Row, taskRows: readonly Row[], s
       }
     }),
   }
+  canonicalWaitIds.set(projection, projection.waitId)
+  return projection
 }
 
 export function parseIds(value: unknown): string[] {
@@ -107,11 +111,13 @@ export function waitResult(row: Row): DurableSubagentWaitResult {
       })
       const status = ["waiting", "ready", "timed_out"].includes(String(row.status))
         ? String(row.status) as DurableSubagentWaitStatus : "waiting"
-      return {
+      const projection: DurableSubagentWaitResult = {
         waitId: String(row.id), status, taskIds: ids,
         deadlineAt: dateValue(row.deadlineAt, "deadlineAt").toISOString(),
         matchedTaskIds: parseIds(row.matchedTaskIds).sort(), tasks,
       }
+      canonicalWaitIds.set(projection, projection.waitId)
+      return projection
     }
   }
   const status = ["waiting", "ready", "timed_out"].includes(String(row.status)) ? String(row.status) as DurableSubagentWaitStatus : "waiting"
