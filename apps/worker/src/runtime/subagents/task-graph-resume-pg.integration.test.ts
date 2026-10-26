@@ -9956,6 +9956,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let inlineFailureWaitObserved = false
     let consumedFailureWaitSnapshot: string | null = null
     let replacementPlanAccepted = false
+    let replacementPlanResultDiagnostic = "not_observed"
+    let replacementPlanCommandDiagnostic = "not_called"
     let finalGraphVerified = false
     const flags: ProductionAgentFlags = {
       taskGraphPlanningEnabled: true, childExecutionEnabled: true, coordinationEnabled: true,
@@ -9967,9 +9969,55 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       supportsReasoningSummary: false, supportsResponseContinuation: false, supportsProviderConversation: false,
       supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low" as const,
     }
+    const commandPort = createPgTaskGraphCommandPort(pool!)
+    const appendWithReconciliation = commandPort.appendAndScheduleWithReconciliation
+    if (typeof appendWithReconciliation !== "function") throw new Error("Operational failure fixture requires reconciliation planning")
+    const safeLabel = (value: unknown): string => typeof value === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(value) ? value : "unknown"
+    const safeOperationalStackSites = (stack: unknown): string => {
+      if (typeof stack !== "string") return "none"
+      const allowed = new Set([
+        "task-graph-pg-operational-failure-replacement.ts",
+        "task-graph-pg-operational-failure-evidence.ts",
+        "task-graph-pg-operational-failure-cancellations.ts",
+        "task-graph-pg-operational-failure-root-waits.ts",
+        "task-graph-pg-operational-failure-observation.ts",
+        "steering-reconciliation-operational-failed-branch-history.ts",
+        "task-graph-pg-operational-failed-branch-relation.ts",
+        "steering-reconciliation-history.ts",
+        "steering-reconciliation-ledger.ts",
+      ])
+      const sites: string[] = []
+      for (const line of stack.split(/\r?\n/)) {
+        const match = /([A-Za-z0-9._-]+\.ts):(\d+):(\d+)/.exec(line)
+        const basename = match?.[1]
+        if (!match || !basename || (!allowed.has(basename) && !/^steering-reconciliation-[a-z0-9-]+\.ts$/.test(basename))) continue
+        sites.push(`${basename}:${match[2]}:${match[3]}`)
+        if (sites.length === 3) break
+      }
+      return sites.length ? sites.join(",") : "none"
+    }
     const runtime = await createCanonicalTurnRuntime(pool!, {
       workerId: value.ownerId, productionFlags: flags,
-      taskGraphCommandPort: createPgTaskGraphCommandPort(pool!), taskGraphTemplates: { ...TASK_GRAPH_TEMPLATES },
+      taskGraphCommandPort: {
+        ...commandPort,
+        async appendAndScheduleWithReconciliation(input, operation) {
+          const operational = input.replaceOperationalFailure !== undefined || operation.replaceOperationalFailure !== undefined
+          try {
+            const receipt = await appendWithReconciliation.call(commandPort, input, operation)
+            if (operational) replacementPlanCommandDiagnostic = `returned_${safeLabel(receipt.status)}`
+            return receipt
+          } catch (error) {
+            if (operational) {
+              const code = error && typeof error === "object" && "code" in error ? error.code : undefined
+              const label = safeLabel(typeof code === "string" ? code : error instanceof Error ? error.name : "unknown")
+              const stackSites = safeOperationalStackSites(error instanceof Error ? error.stack : undefined)
+              replacementPlanCommandDiagnostic = `threw_${label}@${stackSites}`
+            }
+            throw error
+          }
+        },
+      },
+      taskGraphTemplates: { ...TASK_GRAPH_TEMPLATES },
       authorizeUsage: async () => ({ settle: async () => undefined }),
       modelRuntimeFactory: () => {
         const execution = ++rootExecutions
@@ -10144,6 +10192,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               return
             }
             if (execution === 2 && round === 3) {
+              const planResult = record(latestToolResult(request, replacementPlanCallId))
+              replacementPlanResultDiagnostic = `${safeLabel(planResult?.status)}/${safeLabel(planResult?.errorCode ?? planResult?.code)}`
               replacementTaskIds = planTaskIds(request, replacementPlanCallId, 2)
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
@@ -10207,7 +10257,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       },
     })
     await enqueueTurn(pool!, bootstrap.turns.queue, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
-    await waitForTurnStatus(pool!, value.turnId, "completed", 90_000, replacementWaitCallId)
+    try {
+      await waitForTurnStatus(pool!, value.turnId, "completed", 90_000, replacementWaitCallId)
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "Turn status wait failed"
+      throw new Error(`${reason}; replacementPlanCommand=${replacementPlanCommandDiagnostic}; replacementPlanResult=${replacementPlanResultDiagnostic}; rootExecutions=${rootExecutions}`)
+    }
     const turn = await pool!.query<{ rootTaskId: string | null; finalResponse: string | null; status: string }>(
       `SELECT "rootTaskId", "finalResponse", "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`,
       [value.turnId, value.sessionId],

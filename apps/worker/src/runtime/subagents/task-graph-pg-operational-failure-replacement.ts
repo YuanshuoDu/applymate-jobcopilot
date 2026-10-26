@@ -72,7 +72,11 @@ export async function scheduleTaskGraphOperationalFailureReplacement(client: Cli
     sourceNodes: validation.value.sourceNodes, failedNode: root })
   if (!priorCancellations) return invalid()
   const priorCancellationIds = new Set(priorCancellations.map(value => value.source.taskId))
-  if (!eligibleSources(input, current, validation.value.sourceNodes, root, rows, priorCancellationIds)) return invalid()
+  const freshDescendantIds = validation.value.sourceNodes.filter(node => node.taskId !== root.taskId && !priorCancellationIds.has(node.taskId))
+    .map(node => node.taskId)
+  const nonWaitEvidenceFree = await readNonWaitEvidenceFreeIds(client, input, freshDescendantIds)
+  if (!nonWaitEvidenceFree || !eligibleSources(input, current, validation.value.sourceNodes, root, rows,
+    priorCancellationIds, nonWaitEvidenceFree)) return invalid()
   const prepared = await prepareSteeringReconciliation(client, { ...operation, replaceOperationalFailure: replacement })
   if (!prepared || prepared.decision !== "revise" || prepared.expectedRevision !== input.proposal.expectedRevision
     || prepared.idempotencyKey !== operationKey || prepared.resultingRevision !== input.proposal.expectedRevision + 1) return invalid()
@@ -146,7 +150,7 @@ function sourceRowsMatch(input: TaskGraphScheduleInput, state: TaskGraphState, s
 }
 function eligibleSources(input: TaskGraphScheduleInput, state: TaskGraphState, sources: readonly Readonly<{ key: string; taskId: string; templateId: string }>[],
   root: Readonly<{ key: string; taskId: string; templateId: string }>, rows: ReadonlyMap<string, TaskGraphBranchSourceRow>,
-  priorCancellationIds: ReadonlySet<string>): boolean {
+  priorCancellationIds: ReadonlySet<string>, nonWaitEvidenceFree: ReadonlySet<string>): boolean {
   if (!sourceRowsMatch(input, state, sources, root, rows)) return false
   for (const source of sources) {
     if (source.taskId === root.taskId || priorCancellationIds.has(source.taskId)) continue
@@ -155,11 +159,42 @@ function eligibleSources(input: TaskGraphScheduleInput, state: TaskGraphState, s
       || row.leaseExpiresAt !== null || row.nextAttemptAt !== null || row.startedAt !== null || row.completedAt !== null
       || row.closedAt !== null || row.interruptRequestedAt !== null || row.failureReason !== null || row.result !== null
       || row.confidence !== null || row.qualityGateResult !== null || row.contextSnapshotId !== null
-      || !Array.isArray(row.outputArtifactIds) || row.outputArtifactIds.length !== 0 || row.hasExecutionEvidence !== false
+      || !Array.isArray(row.outputArtifactIds) || row.outputArtifactIds.length !== 0
+      || typeof row.hasExecutionEvidence !== "boolean" || !nonWaitEvidenceFree.has(source.taskId)
       || row.hasCanonicalDispatch !== (row.status === "queued")) return false
   }
   const cancelled = sources.filter(source => source.taskId !== root.taskId && rows.get(source.taskId)?.status === "cancelled")
   return cancelled.length === priorCancellationIds.size && cancelled.every(source => priorCancellationIds.has(source.taskId))
+}
+async function readNonWaitEvidenceFreeIds(client: Client, input: TaskGraphScheduleInput, taskIds: readonly string[]): Promise<ReadonlySet<string> | null> {
+  if (!taskIds.length) return new Set()
+  const result = await client.query<Row>(`SELECT task."id",
+      (EXISTS (SELECT 1 FROM "sub_agent_tasks" child WHERE child."sessionId" = task."sessionId" AND child."parentTaskId" = task."id")
+      OR EXISTS (SELECT 1 FROM "agent_steps" row WHERE row."sessionId" = task."sessionId" AND row."taskId" = task."id")
+      OR EXISTS (SELECT 1 FROM "agent_items" row WHERE row."sessionId" = task."sessionId" AND row."taskId" = task."id")
+      OR EXISTS (SELECT 1 FROM "agent_events" row WHERE row."sessionId" = task."sessionId" AND row."taskId" = task."id")
+      OR EXISTS (SELECT 1 FROM "agent_tree_budget_reservations" row WHERE row."taskId" = task."id" OR row."rootTaskId" = task."id")
+      OR EXISTS (SELECT 1 FROM "agent_native_semantic_rejections" row WHERE row."rootTaskId" = task."id" OR row."controlTaskId" = task."id")
+      OR EXISTS (SELECT 1 FROM "agent_mailbox_messages" row WHERE row."fromTaskId" = task."id" OR row."toTaskId" = task."id")
+      OR EXISTS (SELECT 1 FROM "agent_mailbox_hydration_checkpoints" row WHERE row."rootTaskId" = task."id" OR row."taskId" = task."id")
+      OR EXISTS (SELECT 1 FROM "agent_tool_result_references" row WHERE row."taskId" = task."id")
+      OR EXISTS (SELECT 1 FROM "agent_transcript_events" row WHERE row."taskId" = task."id")
+      OR EXISTS (SELECT 1 FROM "agent_approvals" row WHERE row."taskId" = task."id")
+      OR EXISTS (SELECT 1 FROM "agent_artifact_version" row WHERE row."taskId" = task."id")
+      OR EXISTS (SELECT 1 FROM "agent_artifact_review" row WHERE row."taskId" = task."id")
+      OR EXISTS (SELECT 1 FROM "application_tasks" row WHERE row."workerTaskId" = task."id")
+      OR EXISTS (SELECT 1 FROM "agent_outbox" row WHERE (row."payload"->>'taskId' = task."id" OR row."payload"->'payload'->>'taskId' = task."id")
+        AND NOT (row."topic" = 'agent.subagent.dispatch' AND row."aggregateId" = task."sessionId"
+          AND row."idempotencyKey" = 'subagent-dispatch:' || task."id" AND row."payload"->>'taskId' = task."id"
+          AND row."payload"->>'sessionId' = task."sessionId" AND row."payload"->>'rootTaskId' = task."rootTaskId"))) AS "hasNonWaitEvidence"
+    FROM "sub_agent_tasks" task JOIN "agent_sessions" session ON session."id" = task."sessionId"
+    JOIN "agent_turns" turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+    WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3
+      AND task."rootTaskId" = $4 AND task."parentTaskId" = $4 AND session."userId" = $5 AND turn."userId" = $5 ORDER BY task."id"`,
+  [taskIds, input.scope.sessionId, input.scope.turnId, input.scope.rootTaskId, input.scope.userId])
+  if (result.rows.length !== taskIds.length || result.rows.some(row => row.hasNonWaitEvidence !== false)) return null
+  const ids = new Set(result.rows.map(row => String(row.id)))
+  return ids.size === taskIds.length && taskIds.every(taskId => ids.has(taskId)) ? ids : null
 }
 async function cancelPristineDescendant(client: Client, input: TaskGraphScheduleInput, taskId: string, row: TaskGraphBranchSourceRow, now: Date): Promise<number | null> {
   const result = await client.query(`UPDATE "sub_agent_tasks" SET "status" = 'cancelled', "nextAttemptAt" = NULL, "completedAt" = $6, "updatedAt" = $6
