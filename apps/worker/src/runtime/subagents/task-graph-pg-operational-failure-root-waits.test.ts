@@ -76,6 +76,26 @@ describe("proveTaskGraphOperationalRootWaitReferences", () => {
     await expect(proveTaskGraphOperationalRootWaitReferences(f.client, input)).resolves.toBe(true)
   })
 
+  it("rejects inline ready waits that mark a selected nonterminal target as matched", async () => {
+    const pending = { ...canceled, status: "waiting", failureReason: null, completedAt: null }
+    for (const mode of ["all", "any"] as const) {
+      const matchedTaskIds = mode === "all" ? targetIds : [canceled.id]
+      const wait = rootWait({ mode, matchedTaskIds, result: { request: request(mode) } })
+      const f = fixture([wait], [pending, failed])
+      await expect(proveTaskGraphOperationalRootWaitReferences(f.client, input)).resolves.toBe(false)
+    }
+  })
+
+  it("rejects inline ready waits that match nonselected nonterminal targets", async () => {
+    const pending = { ...failed, status: "waiting" }
+    for (const mode of ["all", "any"] as const) {
+      const matchedTaskIds = mode === "all" ? targetIds : [pending.id]
+      const wait = rootWait({ mode, matchedTaskIds, result: { request: request(mode) } })
+      const f = fixture([wait], [canceled, pending])
+      await expect(proveTaskGraphOperationalRootWaitReferences(f.client, input)).resolves.toBe(false)
+    }
+  })
+
   it.each(["ready", "timed_out"] as const)("accepts suspended consumed all-target %s waits without exporting proof", async status => {
     const f = fixture([consumed(status)])
     await expect(proveTaskGraphOperationalRootWaitReferences(f.client, input)).resolves.toBe(true)

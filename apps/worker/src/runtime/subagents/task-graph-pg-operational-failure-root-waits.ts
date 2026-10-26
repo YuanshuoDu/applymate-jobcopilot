@@ -125,7 +125,9 @@ function validWait(wait: Row, scope: GraphIdentityScope, shape: WaitShape, rows:
   if (!lineage(wait, scope, shape) || !validTargetRows(shape, rows, selected, operationCancellations)) return false
   const result = record(wait.result)!, resolved = timestamp(wait.resolvedAt), suspended = timestamp(wait.suspendedAt), consumed = timestamp(wait.consumedAt)
   if (wait.status === "ready" && suspended === null && resolved === null && consumed === null && exact(result, ["request"])) {
-    return shape.matched.length > 0 && (shape.mode === "any" || sameIds(shape.matched, shape.targets))
+    return shape.matched.length > 0
+      && shape.matched.every(taskId => TERMINAL.has(String(rows.get(taskId)?.status)))
+      && (shape.mode === "any" || sameIds(shape.matched, shape.targets))
   }
   if ((wait.status !== "ready" && wait.status !== "timed_out") || suspended === null || resolved === null || consumed === null
     || resolved < timestamp(wait.createdAt)! || suspended < timestamp(wait.createdAt)! || consumed < Math.max(resolved, suspended)
