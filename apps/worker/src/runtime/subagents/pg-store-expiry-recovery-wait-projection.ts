@@ -8,6 +8,29 @@ type Lease = Pick<SubagentLease, "id" | "userId" | "sessionId" | "turnId" | "roo
 type Row = Record<string, unknown>
 const TERMINAL_TARGET = new Set(["completed", "failed", "interrupted", "cancelled", "closed", "passed", "skipped"])
 
+export type WaitProjectionRejectionStage =
+  | "invalid_input"
+  | "wait_row_count"
+  | "wait_validation"
+  | "lease_fence_validation"
+  | "wait_timestamp_validation"
+  | "timeout_validation"
+  | "target_validation"
+  | "target_match_validation"
+  | "call_result_validation"
+  | "call_timestamp_validation"
+  | "call_contract_validation"
+  | "safe_serialization_validation"
+  | "optimistic_update_missed"
+
+export type WaitProjectionRepairResult =
+  | Readonly<{ status: "repaired" | "already_current" }>
+  | Readonly<{ status: "rejected"; stage: WaitProjectionRejectionStage }>
+
+function rejected(stage: WaitProjectionRejectionStage): WaitProjectionRepairResult {
+  return { status: "rejected", stage }
+}
+
 function strictIds(value: unknown): string[] | undefined {
   if (!Array.isArray(value) || value.some(id => typeof id !== "string" || !id.trim() || id !== id.trim() || id.length > 256)) return undefined
   const ids = value as string[]
@@ -52,10 +75,10 @@ const TARGETS_SQL = `SELECT child."id", child."parentTaskId", child."rootTaskId"
     AND session."userId" = $6 AND session."status" NOT IN ('aborted', 'archived') FOR SHARE OF child`
 
 /** Repair only a stale projection for the owner's current, unconsumed wait after its canonical evidence validates. */
-export async function repairStaleWaitProjection(client: Client, lease: Lease, now: Date): Promise<boolean> {
-  if (!(now instanceof Date) || !Number.isFinite(now.getTime()) || !Number.isSafeInteger(lease.attemptCount) || lease.attemptCount < 1) return false
+export async function repairStaleWaitProjection(client: Client, lease: Lease, now: Date): Promise<WaitProjectionRepairResult> {
+  if (!(now instanceof Date) || !Number.isFinite(now.getTime()) || !Number.isSafeInteger(lease.attemptCount) || lease.attemptCount < 1) return rejected("invalid_input")
   const rows = await client.query<Row>(WAIT_SQL, [lease.id, lease.sessionId, lease.userId, lease.turnId, lease.rootTaskId, lease.ownerId, lease.attemptCount, lease.leaseExpiresAt, now])
-  if (rows.rows.length !== 1) return false
+  if (rows.rows.length !== 1) return rejected("wait_row_count")
   const wait = rows.rows[0]!, ids = strictIds(wait.targetTaskIds), matched = strictIds(wait.matchedTaskIds)
   const saved = wait.result && typeof wait.result === "object" && !Array.isArray(wait.result) ? wait.result as Row : undefined
   if (!ids || ids.length < 1 || ids.length > 8 || !matched || matched.some(id => !ids.includes(id)) || !saved
@@ -72,43 +95,43 @@ export async function repairStaleWaitProjection(client: Client, lease: Lease, no
     || wait.repairStepStatus === "completed" && (wait.repairNextStatus !== "streaming" || Number(wait.repairNextOrdinal) !== Number(wait.repairLatestOrdinal))
     || wait.repairInterruptAt != null || wait.repairRootInterruptAt != null
     || ["completed", "failed", "interrupted", "cancelled", "closed"].includes(String(wait.repairTurnStatus))
-    || ["completed", "failed", "interrupted", "cancelled", "closed"].includes(String(wait.repairRootStatus))) return false
+      || ["completed", "failed", "interrupted", "cancelled", "closed"].includes(String(wait.repairRootStatus))) return rejected("wait_validation")
   try {
     const ownerExpiry = dateValue(wait.repairLeaseExpiresAt, "task.leaseExpiresAt")
     if (ownerExpiry.getTime() !== lease.leaseExpiresAt.getTime() || ownerExpiry > now
-      || wait.repairNextAttemptAt != null && dateValue(wait.repairNextAttemptAt, "task.nextAttemptAt") > now) return false
-  } catch { return false }
+      || wait.repairNextAttemptAt != null && dateValue(wait.repairNextAttemptAt, "task.nextAttemptAt") > now) return rejected("lease_fence_validation")
+  } catch { return rejected("lease_fence_validation") }
   let createdAt: Date, deadlineAt: Date
-  try { createdAt = dateValue(wait.createdAt, "wait.createdAt"); deadlineAt = dateValue(wait.deadlineAt, "wait.deadlineAt") } catch { return false }
+  try { createdAt = dateValue(wait.createdAt, "wait.createdAt"); deadlineAt = dateValue(wait.deadlineAt, "wait.deadlineAt") } catch { return rejected("wait_timestamp_validation") }
   const timeoutMs = deadlineAt.getTime() - createdAt.getTime()
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 86_400_000) return false
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 86_400_000) return rejected("timeout_validation")
   const targetsResult = await client.query<Row>(TARGETS_SQL, [ids, lease.id, lease.rootTaskId, lease.sessionId, lease.turnId, lease.userId])
   const targets = targetsResult.rows
   if (targets.length !== ids.length || targets.some(target => !ids.includes(String(target.id)) || target.parentTaskId !== lease.id
     || target.rootTaskId !== lease.rootTaskId || target.sessionId !== lease.sessionId || target.turnId !== lease.turnId
-    || target.userId !== lease.userId || typeof target.status !== "string" || typeof target.role !== "string")) return false
+    || target.userId !== lease.userId || typeof target.status !== "string" || typeof target.role !== "string")) return rejected("target_validation")
   const currentMatched = new Set(targets.filter(target => TERMINAL_TARGET.has(String(target.status))).map(target => String(target.id)))
-  if (matched.some(id => !currentMatched.has(id)) || wait.status === "ready" && (wait.mode === "any" ? !matched.length : matched.length !== ids.length)) return false
+  if (matched.some(id => !currentMatched.has(id)) || wait.status === "ready" && (wait.mode === "any" ? !matched.length : matched.length !== ids.length)) return rejected("target_match_validation")
   const request = { targetTaskIds: ids, mode: wait.mode, timeoutMs }
   const outcome = projectDurableSubagentWait({ ...wait, deadlineAt }, targets, wait.status, matched)
   const calls = await client.query<Row>(CALL_SQL, [lease.sessionId, lease.turnId, lease.id, wait.stepId])
   const projectionMatches = isDeepStrictEqual(saved.request, request) && isDeepStrictEqual(saved.outcome, outcome)
-  if (calls.rows.length > 1 || calls.rows.length === 0 && !projectionMatches) return false
-  if (calls.rows.length === 0) return true
+  if (calls.rows.length > 1 || calls.rows.length === 0 && !projectionMatches) return rejected("call_result_validation")
+  if (calls.rows.length === 0) return { status: "already_current" }
   const callRow = calls.rows[0]!, call = object(callRow.content), input = object(call.input), callIds = strictIds(input.taskIds)
   try {
-    if (dateValue(callRow.eventCreatedAt, "event.createdAt") > now) return false
-  } catch { return false }
+    if (dateValue(callRow.eventCreatedAt, "event.createdAt") > now) return rejected("call_timestamp_validation")
+  } catch { return rejected("call_timestamp_validation") }
   if (callRow.callSessionId !== lease.sessionId || callRow.callTurnId !== lease.turnId || callRow.callTaskId !== lease.id
     || callRow.callStepId !== wait.stepId || callRow.eventSessionId !== lease.sessionId || callRow.eventTurnId !== lease.turnId
     || callRow.eventTaskId !== lease.id || callRow.eventItemId !== callRow.callId || callRow.eventCorrelationId !== call.toolCallId
     || !callRow.eventId || !["started", "completed"].includes(String(callRow.status))
     || call.toolName !== "wait_subagents" || call.toolVersion !== "1" || typeof call.toolCallId !== "string" || !call.toolCallId.trim()
     || Object.keys(input).sort().join(",") !== "idempotencyKey,mode,taskIds,timeoutMs" || input.idempotencyKey !== wait.idempotencyKey
-    || input.mode !== wait.mode || input.timeoutMs !== timeoutMs || !callIds || !sameIds(callIds, ids)) return false
-  if (projectionMatches) return true
+    || input.mode !== wait.mode || input.timeoutMs !== timeoutMs || !callIds || !sameIds(callIds, ids)) return rejected("call_contract_validation")
+  if (projectionMatches) return { status: "already_current" }
   const canonical = { request, outcome }, persisted = safeSubagentWaitJson(canonical, 16_384)
-  if (!isDeepStrictEqual(persisted, canonical)) return false
+  if (!isDeepStrictEqual(persisted, canonical)) return rejected("safe_serialization_validation")
   const updated = await client.query(`UPDATE "agent_wait_conditions" AS wait SET "result" = $1::jsonb
     WHERE wait."id" = $2 AND wait."userId" = $3 AND wait."sessionId" = $4 AND wait."turnId" = $5 AND wait."parentTaskId" = $6 AND wait."stepId" = $7
       AND wait."idempotencyKey" = $8 AND wait."targetTaskIds" = $9::jsonb AND wait."matchedTaskIds" = $10::jsonb AND wait."mode" = $11
@@ -118,5 +141,5 @@ export async function repairStaleWaitProjection(client: Client, lease: Lease, no
     RETURNING wait."id"`, [JSON.stringify(persisted), wait.id, lease.userId, lease.sessionId, lease.turnId, lease.id,
     wait.stepId, wait.idempotencyKey, JSON.stringify(ids), JSON.stringify(matched), wait.mode, deadlineAt, createdAt, wait.resolvedAt, JSON.stringify(saved),
     lease.rootTaskId, lease.ownerId, lease.attemptCount, lease.leaseExpiresAt])
-  return updated.rowCount === 1
+  return updated.rowCount === 1 ? { status: "repaired" } : rejected("optimistic_update_missed")
 }
