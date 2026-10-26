@@ -9,7 +9,7 @@ export const TASK_GRAPH_OPERATIONAL_FAILED_BRANCH_RELATION_SCHEMA_VERSION = "age
 const OPERATION_KEY = /^agent\.plan\.reconciliation:sha256:[0-9a-f]{64}$/
 const SHA256 = /^[0-9a-f]{64}$/
 const MAX_SEQUENCE = 9_223_372_036_854_775_807n
-export type TaskGraphOperationalResumeFailureReason = "child_resume_unavailable" | "child_resume_evidence_unavailable"
+export type TaskGraphOperationalFailureReason = "child_resume_unavailable" | "child_resume_evidence_unavailable" | "task_graph_child_deadline_exceeded"
 type Row = Record<string, unknown>
 
 export type TaskGraphOperationalIdentity = Readonly<{ nodeKey: string; taskId: string }>
@@ -20,7 +20,7 @@ export type TaskGraphOperationalFailedBranchRelation = Readonly<{
   graphRootTaskId: string
   observedRevision: number
   resultingRevision: number
-  failedSource: Readonly<{ source: TaskGraphOperationalIdentity; attemptCount: number; failureReason: TaskGraphOperationalResumeFailureReason; resultDigest: string; event: TaskGraphOperationalEventIdentity }>
+  failedSource: Readonly<{ source: TaskGraphOperationalIdentity; attemptCount: number; failureReason: TaskGraphOperationalFailureReason; resultDigest: string; event: TaskGraphOperationalEventIdentity }>
   observedGraphEvent: TaskGraphOperationalEventIdentity
   sources: readonly Readonly<{ source: TaskGraphOperationalIdentity; replacementKey: string }>[]
   priorCancellations: readonly Readonly<{ source: TaskGraphOperationalIdentity; event: TaskGraphOperationalEventIdentity }>[]
@@ -63,8 +63,9 @@ function sequence(value: unknown): value is string {
   return typeof value === "string" && /^[1-9][0-9]{0,18}$/.test(value) && BigInt(value) <= MAX_SEQUENCE
 }
 function digest(value: unknown): value is string { return typeof value === "string" && SHA256.test(value) }
-function failureReason(value: unknown): value is TaskGraphOperationalResumeFailureReason {
+function failureReason(value: unknown): value is TaskGraphOperationalFailureReason {
   return value === "child_resume_unavailable" || value === "child_resume_evidence_unavailable"
+    || value === "task_graph_child_deadline_exceeded"
 }
 function identity(value: unknown): TaskGraphOperationalIdentity | null {
   const row = record(value)

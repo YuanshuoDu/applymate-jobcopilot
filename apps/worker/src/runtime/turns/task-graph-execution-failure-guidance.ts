@@ -10,12 +10,13 @@ const MAX_VISIBLE_TOOLS = 128
 const MAX_RECORD_KEYS = 32
 
 type Row = Record<string, unknown>
-type Category = "execution_setup_unavailable" | "resume_state_unavailable" | "structured_output_invalid"
+type Category = "execution_setup_unavailable" | "resume_state_unavailable" | "structured_output_invalid" | "execution_deadline_exceeded"
 
 const CATEGORY_GUIDANCE: ReadonlyArray<readonly [Category, string]> = [
   ["execution_setup_unavailable", "For execution-setup cues, inspect the existing execution prerequisites for the child."],
   ["resume_state_unavailable", "For resume-state cues, inspect the current resume state and available evidence."],
   ["structured_output_invalid", "For structured-output cues, inspect the existing typed output contract and current available result evidence."],
+  ["execution_deadline_exceeded", "For deadline cues, inspect the current blocker and evidence. They do not prove a child started or authorize replacement. Only the server can admit an explicit replacement for eligible started typed Scout or Analyst work; a new child still needs ordinary independent verification."],
 ]
 const CATEGORIES = new Set<Category>(CATEGORY_GUIDANCE.map(([category]) => category))
 
@@ -78,6 +79,14 @@ function canonicalResumeReport(node: Row): boolean {
       && criterion.status === "unverified" && criterion.reasonCode === "result_invalid"))
 }
 
+function nonverifiedDeadlineReport(node: Row): boolean {
+  const templateId = own(node, "templateId").value, key = own(node, "key").value, taskId = own(node, "taskId").value
+  if (typeof templateId !== "string" || typeof key !== "string" || typeof taskId !== "string") return false
+  const metadata = parseTaskGraphCurrentVerificationMetadata(node, templateId, key, taskId)
+  const report = own(node, "verificationReport")
+  return Boolean(metadata && (!report.present || metadata.verificationReport?.status === "unverified"))
+}
+
 function currentCategories(context: StepContext): ReadonlySet<Category> | undefined {
   const contextRow = dataRecord(context)
   if (!contextRow) return undefined
@@ -111,7 +120,8 @@ function currentCategories(context: StepContext): ReadonlySet<Category> | undefi
       || own(node, "resultSummary").value !== null || own(node, "native").present || own(node, "nativeResult").present) continue
     if (typeof category.value !== "string" || !CATEGORIES.has(category.value as Category)) continue
     const hasReport = own(node, "verificationReport").present
-    if (category.value === "resume_state_unavailable" ? !hasReport || !canonicalResumeReport(node) : hasReport) continue
+    if (category.value === "resume_state_unavailable" ? !hasReport || !canonicalResumeReport(node)
+      : category.value === "execution_deadline_exceeded" ? !nonverifiedDeadlineReport(node) : hasReport) continue
     categories.add(category.value as Category)
   }
   return categories
