@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest"
+import { Buffer } from "node:buffer"
 import { TASK_GRAPH_RESULT_PAGE_SCHEMA, type TaskGraphResultPage } from "../subagents/task-graph-result-page-contract.js"
 import { TASK_GRAPH_HISTORICAL_DISCOVERY_PAGE_SCHEMA } from "../subagents/task-graph-historical-discovery-page-contract.js"
 import { TASK_GRAPH_DISCOVERY_RECOVERY_PAGE_SCHEMA } from "../subagents/task-graph-discovery-recovery-page-contract.js"
@@ -28,6 +29,40 @@ describe("TaskGraph result-page lifecycle redaction", () => {
   it("restores only canonical item job IDs after generic redaction", () => {
     const prepared = prepareTaskGraphResultPageOutput(page)
     expect(prepared.safe).toMatchObject({ availability: "available", graphRevision: 5, items: [{ jobId: numericUuid }] })
+  })
+
+  it("preserves the untrusted bounded Analyst preview through lifecycle redaction", () => {
+    const summaryPage: TaskGraphResultPage = {
+      ...page, taskStatus: "completed", resultStatus: "completed", totalCount: 1, offset: 0, nextOffset: null,
+      items: [{ jobId: numericUuid, score: 8.5, evidenceKinds: ["job", "source"] }],
+      analysisSummary: "Contact private@example.com for details", analysisSummaryTruncated: false,
+    }
+    const prepared = prepareTaskGraphResultPageOutput(summaryPage)
+    expect(prepared.safe).toMatchObject({ trust: "untrusted", analysisSummaryTruncated: false })
+    expect(prepared.safe).toHaveProperty("analysisSummary")
+    expect(JSON.stringify(prepared.safe)).not.toContain("private@example.com")
+  })
+
+  it("enforces the 512-byte limit after lifecycle redaction expands a secret marker", () => {
+    const summaryPage: TaskGraphResultPage = {
+      ...page, taskStatus: "completed", resultStatus: "completed", totalCount: 1, offset: 0, nextOffset: null,
+      items: [{ jobId: numericUuid, score: 8.5, evidenceKinds: ["job", "source"] }],
+      analysisSummary: `${"x".repeat(503)} secret=x`, analysisSummaryTruncated: false,
+    }
+    const safe = prepareTaskGraphResultPageOutput(summaryPage).safe as Record<string, unknown>
+    expect(Buffer.byteLength(safe.analysisSummary as string, "utf8")).toBeLessThanOrEqual(512)
+    expect(safe.analysisSummaryTruncated).toBe(true)
+    expect(safe.analysisSummary).not.toContain("secret=x")
+  })
+
+  it("redacts and reads exact persisted v1 pages without adding summary fields", () => {
+    const v1Page = {
+      ...page, schemaVersion: "agent-harness.v2.task-graph.result-page.v1", resultStatus: "completed" as const,
+      offset: 0, totalCount: 1, nextOffset: null, items: [{ jobId: numericUuid, score: 8.5, evidenceKinds: ["job", "source"] }],
+    }
+    const prepared = prepareTaskGraphResultPageOutput(v1Page)
+    expect(prepared.safe).toMatchObject({ schemaVersion: "agent-harness.v2.task-graph.result-page.v1", trust: "untrusted" })
+    expect(prepared.safe).not.toHaveProperty("analysisSummary")
   })
 
   it("accepts strict unavailable pages without introducing item fields", () => {

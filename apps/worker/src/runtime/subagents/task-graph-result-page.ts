@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer"
 import { types as nodeTypes } from "node:util"
+import { redactSensitiveText } from "@jobcopilot/shared"
 import type { TaskGraphNode } from "../planning/task-graph.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
 import { TASK_GRAPH_NATIVE_TEMPLATE_ID, parseTaskGraphNativeDelegation } from "./task-graph-native-state.js"
@@ -9,7 +10,8 @@ import type { LoadedGraph, GraphTaskRow } from "./task-graph-pg-state.js"
 import type { StoredTaskGraphNode } from "./task-graph-snapshot.js"
 import {
   isCanonicalTaskGraphJobId, TASK_GRAPH_RESULT_PAGE_SCHEMA, TASK_GRAPH_RESULT_PAGE_SIZE,
-  TASK_GRAPH_RESULT_SOURCE_BYTE_LIMIT, type TaskGraphResultPage, type TaskGraphResultPageRequest,
+  TASK_GRAPH_RESULT_SOURCE_BYTE_LIMIT, TASK_GRAPH_RESULT_SUMMARY_PREVIEW_BYTE_LIMIT,
+  type TaskGraphResultPage, type TaskGraphResultPageRequest,
 } from "./task-graph-result-page-contract.js"
 
 const ATS_SOURCES = new Set(["greenhouse", "lever", "workday", "smartrecruiters", "personio"])
@@ -59,10 +61,13 @@ export function projectTaskGraphResultPage(loaded: LoadedGraph, request: TaskGra
     jobId: item.jobId, score: item.score, evidenceKinds: evidenceKinds(item.evidenceIds, result),
   }))
   const next = request.offset + items.length
+  const summary = task.status === "completed" && request.offset === 0 && result.status === "completed"
+    ? boundedSummaryPreview(redactSensitiveText(result.summary)) : null
   return {
     schemaVersion: TASK_GRAPH_RESULT_PAGE_SCHEMA, trust: "untrusted", availability: "available", graphRevision: revision,
     role: "analyst", taskStatus: task.status, resultStatus: result.status, totalCount: result.findings.length,
-    evidenceCount: result.evidence.length, offset: request.offset, nextOffset: next < result.findings.length ? next : null, items,
+    evidenceCount: result.evidence.length, offset: request.offset, nextOffset: next < result.findings.length ? next : null,
+    ...(summary ? { analysisSummary: summary.preview, analysisSummaryTruncated: summary.truncated } : {}), items,
   }
 }
 
@@ -153,6 +158,18 @@ function normalizeSource(value: string): "greenhouse" | "lever" | "workday" | "s
 function evidenceKinds(ids: readonly string[], result: ScoutResult | AnalystResult): Array<typeof EVIDENCE_KINDS[number]> {
   const linked = new Set(result.evidence.filter(item => ids.includes(item.id)).map(item => item.kind))
   return EVIDENCE_KINDS.filter(kind => linked.has(kind))
+}
+
+function boundedSummaryPreview(value: string): { preview: string; truncated: boolean } {
+  const normalized = Buffer.from(value, "utf8").toString("utf8")
+  let preview = "", byteLength = 0
+  for (const character of normalized) {
+    const characterBytes = Buffer.byteLength(character, "utf8")
+    if (byteLength + characterBytes > TASK_GRAPH_RESULT_SUMMARY_PREVIEW_BYTE_LIMIT) return { preview, truncated: true }
+    preview += character
+    byteLength += characterBytes
+  }
+  return { preview, truncated: false }
 }
 
 function unavailable(graphRevision: number, reason: Extract<TaskGraphResultPage, { availability: "unavailable" }>["reason"]): TaskGraphResultPage {
