@@ -1,14 +1,13 @@
 import type pg from "pg"
 import {
-  matchSteeringReconciliationOperationReceipt, parseSteeringReconciliationReceipt, steeringReconciliationIdempotencyKey, steeringReconciliationRevision,
+  parseSteeringReconciliationReceipt, steeringReconciliationIdempotencyKey, steeringReconciliationRevision,
   steeringReconciliationId, steeringReconciliationSequence, STEERING_RECONCILIATION_EVENT_TYPE,
-  STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION, STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION,
-  STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION,
-  STEERING_RECONCILIATION_OPERATIONAL_FAILURE_SCHEMA_VERSION,
   type PreparedSteeringReconciliation, type SteeringReconciliationOperation, type SteeringReconciliationReceipt,
 } from "./steering-reconciliation-contract.js"
+import { branchRepairReceipt, failedBranchRepairReceipt, matchSteeringReconciliationOperationReceipt, operationalFailureReceipt, relationReceipt } from "./steering-reconciliation-operation-receipt.js"
 import { assertNoUnresolvedSteering, readSteeringReconciliationState } from "./steering-reconciliation-read.js"
-import { assertSteeringReconciliationCall, assertSteeringReconciliationSupersessionEvents } from "./steering-reconciliation-history.js"
+import { assertSteeringReconciliationCall } from "./steering-reconciliation-history.js"
+import { assertSteeringReconciliationSupersessionEvents } from "./steering-reconciliation-history-supersession.js"
 import { assertTaskGraphBranchRepairCall, assertTaskGraphBranchRepairHistory, assertTaskGraphBranchRepairToolCall } from "./steering-reconciliation-branch-repair-history.js"
 import { assertTaskGraphFailedBranchRepairHistory } from "./steering-reconciliation-failed-branch-history.js"
 import { appendTaskGraphReceiptWithIdentity } from "./task-graph-pg-events.js"
@@ -111,23 +110,6 @@ function matchesPrepared(state: Awaited<ReturnType<typeof readSteeringReconcilia
 function sameReceipt(actual: unknown, expected: SteeringReconciliationReceipt): boolean {
   const parsed = parseSteeringReconciliationReceipt(object(actual))
   return Boolean(parsed && JSON.stringify(parsed) === JSON.stringify(expected))
-}
-
-function relationReceipt(base: SteeringReconciliationReceipt, relation: TaskGraphSupersessionRelation): SteeringReconciliationReceipt {
-  return { ...base, schemaVersion: STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION,
-    resultingRevision: relation.resultingRevision, supersession: relation }
-}
-function branchRepairReceipt(base: SteeringReconciliationReceipt, relation: TaskGraphBranchRepairRelation): SteeringReconciliationReceipt {
-  return { ...base, schemaVersion: STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION,
-    resultingRevision: relation.resultingRevision, branchRepair: relation }
-}
-function failedBranchRepairReceipt(base: SteeringReconciliationReceipt, relation: TaskGraphFailedBranchRepairRelation): SteeringReconciliationReceipt {
-  return { ...base, schemaVersion: STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION,
-    resultingRevision: relation.resultingRevision, failedBranch: relation }
-}
-function operationalFailureReceipt(base: SteeringReconciliationReceipt, relation: TaskGraphOperationalFailedBranchRelation): SteeringReconciliationReceipt {
-  return { ...base, schemaVersion: STEERING_RECONCILIATION_OPERATIONAL_FAILURE_SCHEMA_VERSION,
-    resultingRevision: relation.resultingRevision, operationalFailure: relation }
 }
 
 async function validateSupersession(client: Client, scope: SteeringReconciliationOperation["scope"], relation: TaskGraphSupersessionRelation,

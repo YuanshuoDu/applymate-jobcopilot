@@ -56,7 +56,7 @@ import { PgSubagentTaskStore } from "./pg-store.js"
 import { defaultSubagentPolicy, parseSubagentJobPayload, type SubagentLease, type SubagentTaskRecord } from "./types.js"
 import { subagentDispatchJobId } from "./dispatch-identity.js"
 import { drainTaskGraphStopOutbox, TASK_GRAPH_STOP_OUTBOX_TOPIC } from "./task-graph-stop-outbox.js"
-import { parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey } from "./task-graph-snapshot.js"
+import { parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey, taskGraphProposalKey } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./task-graph-final-summary-binding.js"
 import { parseStoredTaskGraphVerificationReport } from "./task-graph-verification-report.js"
 import { rootRecoveryEligibility } from "./task-graph-pg-lifecycle.js"
@@ -7203,6 +7203,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   const resumeFailureOwner = fixture()
   const failureOwner = fixture()
   const operationalFailureOwner = fixture()
+  const operationalAppendOwner = fixture()
   const stopOwner = fixture()
   const restartOwner = fixture()
   const artifactOwner = fixture()
@@ -7249,6 +7250,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await seed(pool, resumeFailureOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
     await seed(pool, failureOwner, "waiting_for_user")
     await seed(pool, operationalFailureOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
+    await seed(pool, operationalAppendOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
     await seed(pool, stopOwner, "waiting_for_user")
     await seed(pool, restartOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
     await seed(pool, artifactOwner, "waiting_for_user")
@@ -7290,7 +7292,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         cleanupFailures.push("bootstrap close: " + (error instanceof Error ? error.stack ?? error.message : String(error)))
       }
     }
-    const fixtureOwners = [owner, resumeFailureOwner, failureOwner, operationalFailureOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner,
+    const fixtureOwners = [owner, resumeFailureOwner, failureOwner, operationalFailureOwner, operationalAppendOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner,
       discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, lateRepairOwner, leaseRecoveryOwner,
       coverageRepairOwner, rootRecoveryScanOwner, archivedWaitOwner]
     const allFixtureWorkersExited = [...fixtureProcessChildren].every(processFixtureExited)
@@ -9926,19 +9928,25 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(descendantDispatch.rowCount).toBe(0)
   }, 90_000)
 
-  it("replans an operational Scout failure after its all-target Root wait consumes the automatic descendant cancellation", async () => {
+  it.each(["unrelated completion", "independent append"] as const)(
+    "replans an operational Scout failure after an %s changes the observed graph",
+    async interleaving => {
     const [{ createProductionWorkerBootstrap }, { createTurnQueue, enqueueTurn, TURN_QUEUE_NAME },
       subagentQueue, { createCanonicalTurnRuntime }, { createPgTaskGraphCommandPort }] = await Promise.all([
       import("../../queue/production-bootstrap.js"), import("../turns/turn-queue.js"),
       import("../../queue/subagent-queue.js"), import("../canonical-turn-runtime.js"),
       import("./pg-task-graph-command-port.js"),
     ])
-    const value = operationalFailureOwner
+    const value = interleaving === "independent append" ? operationalAppendOwner : operationalFailureOwner
+    const appendIndependent = interleaving === "independent append"
+    const initialIndependent = !appendIndependent
     const sourceGoal = `Recover Scout after its persisted execution state is unavailable ${value.suffix}`
     const dependentGoal = `Keep the Analyst behind the failed Scout ${value.suffix}`
+    const independentGoal = `Complete unrelated Analyst work after the Scout failure ${value.suffix}`
     const replacementScoutGoal = `Read the source again with a fresh Scout ${value.suffix}`
     const replacementAnalystGoal = `Analyze the fresh Scout result ${value.suffix}`
     const planCallId = `p3-operational-failure-plan:${value.turnId}`
+    const appendCallId = `p3-operational-failure-independent-append:${value.turnId}`
     const initialWaitCallId = `p3-operational-failure-wait:${value.turnId}`
     const inlineWaitCallId = `p3-operational-failure-inline-ready-wait:${value.turnId}`
     const replacementPlanCallId = `p3-operational-failure-replan:${value.turnId}`
@@ -9946,6 +9954,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const initialWaitKey = `p3-operational-failure-wait:${value.turnId}`
     const inlineWaitKey = `p3-operational-failure-inline-ready-wait:${value.turnId}`
     const replacementWaitKey = `p3-operational-failure-replacement-wait:${value.turnId}`
+    const inlineWaitObserveRound = appendIndependent ? 3 : 2
+    const replacementAcceptedRound = inlineWaitObserveRound + 1
     turnQueueName = TURN_QUEUE_NAME
     childQueueName = subagentQueue.SUBAGENT_QUEUE_NAME
     let rootExecutions = 0
@@ -9953,11 +9963,24 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let originalOperationalFailureResult: unknown
     let originalFailureEnvelopeObserved = false
     let initialTaskIds: string[] = []
+    let independentTaskId = ""
     let replacementTaskIds: string[] = []
     let consumedFailureWaitObserved = false
     let inlineFailureWaitObserved = false
     let consumedFailureWaitSnapshot: string | null = null
     let replacementPlanAccepted = false
+    let observedGraphRevision: number | null = null
+    let observedGraphSnapshot: RecordValue | null = null
+    let observedIndependentNode: RecordValue | null = null
+    let appendExpectedRevision: number | null = null
+    let appendEventRevision: number | null = null
+    let appendEventId: string | null = null
+    let appendEventSequence: string | null = null
+    let failedEventRevision: number | null = null
+    let failedEventId: string | null = null
+    let failedEventSequence: string | null = null
+    let releaseIndependentCompletion!: () => void
+    const independentCompletionAllowed = new Promise<void>(resolve => { releaseIndependentCompletion = resolve })
     let replacementPlanResultDiagnostic = "not_observed"
     let replacementPlanCommandDiagnostic = "not_called"
     let canonicalExecutionDiagnostic = "not_observed"
@@ -10010,6 +10033,65 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       }
       return sites.length ? sites.join(",") : "none"
     }
+    const readExactFailureReceipt = async () => {
+      if (!rootTaskId || !initialTaskIds[0]) return null
+      const failureKey = taskGraphLifecycleKey(rootTaskId, "scout", 1, "task.failed")
+      const result = await pool!.query<{
+        id: string; sequence: string; eventType: string; actor: string; taskId: string | null; itemId: string | null;
+        correlationId: string; causationId: string | null; idempotencyKey: string; payload: unknown;
+        outboxTopic: string; outboxAggregateId: string; outboxIdempotencyKey: string; outboxPayload: unknown;
+      }>(`SELECT event."id", event."sequence"::text AS "sequence", event."type" AS "eventType", event."actor",
+          event."taskId", event."itemId", event."correlationId", event."causationId", event."idempotencyKey", event."payload",
+          outbox."topic" AS "outboxTopic", outbox."aggregateId" AS "outboxAggregateId",
+          outbox."idempotencyKey" AS "outboxIdempotencyKey", outbox."payload" AS "outboxPayload"
+        FROM "agent_events" AS event JOIN "agent_outbox" AS outbox
+          ON outbox."idempotencyKey" = 'agent-event:' || event."id" AND outbox."topic" = 'agent.session.event'
+            AND outbox."aggregateId" = event."sessionId" AND outbox."payload"->>'eventId' = event."id"
+        WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."itemId" = $3 AND event."taskId" = $4
+          AND event."idempotencyKey" = $5`,
+      [value.sessionId, value.turnId, taskGraphItemId(rootTaskId), initialTaskIds[0], failureKey])
+      if (!result.rows.length) return null
+      if (result.rows.length !== 1) throw new Error("Operational failure fixture found duplicate task.failed event/outbox receipts")
+      const row = result.rows[0]!
+      const envelope = record(row.payload), lifecycle = record(envelope?.event), outbox = record(row.outboxPayload)
+      if (row.eventType !== "item.delta" || row.actor !== "system" || row.taskId !== initialTaskIds[0]
+        || row.itemId !== taskGraphItemId(rootTaskId) || row.correlationId !== value.turnId
+        || row.idempotencyKey !== failureKey || envelope?.kind !== "lifecycle"
+        || lifecycle?.type !== "task.failed" || lifecycle.nodeKey !== "scout"
+        || lifecycle.failureReason !== "child_resume_unavailable" || row.outboxTopic !== "agent.session.event"
+        || row.outboxAggregateId !== value.sessionId || row.outboxIdempotencyKey !== `agent-event:${row.id}`
+        ) {
+        throw new Error("Operational failure fixture did not find the exact current-attempt system task.failed event/outbox")
+      }
+      expect(outbox).toEqual({ eventId: row.id, sessionId: value.sessionId, turnId: value.turnId,
+        itemId: row.itemId, taskId: row.taskId, sequence: row.sequence, type: row.eventType, actor: row.actor,
+        correlationId: row.correlationId, causationId: row.causationId, idempotencyKey: row.idempotencyKey, payload: row.payload })
+      return row
+    }
+    const waitForExactFailureReceipt = async () => {
+      const deadline = Date.now() + 30_000
+      while (Date.now() < deadline) {
+        const receipt = await readExactFailureReceipt()
+        if (receipt) return receipt
+        await new Promise(resolve => setTimeout(resolve, 25))
+      }
+      throw new Error("Operational failure fixture did not persist its exact task.failed event/outbox")
+    }
+    const waitForTaskStatus = async (taskId: string, wanted: string) => {
+      const deadline = Date.now() + 30_000
+      while (Date.now() < deadline) {
+        const result = await pool!.query<{ status: string }>(
+          `SELECT "status" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`,
+          [taskId, value.sessionId, value.turnId],
+        )
+        if (result.rows[0]?.status === wanted) return
+        if (result.rows[0] && ["failed", "cancelled", "interrupted", "closed"].includes(result.rows[0].status)) {
+          throw new Error(`Independent TaskGraph task entered ${result.rows[0].status} before ${wanted}`)
+        }
+        await new Promise(resolve => setTimeout(resolve, 25))
+      }
+      throw new Error(`Independent TaskGraph task did not reach ${wanted}`)
+    }
     const runtime = await createCanonicalTurnRuntime(pool!, {
       workerId: value.ownerId, productionFlags: flags,
       taskGraphCommandPort: {
@@ -10046,13 +10128,17 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 nodes: [
                   { key: "scout", templateId: "scout", goal: sourceGoal, successCriteria: ["Return one source candidate"], dependsOn: [], verification: SCOUT_VERIFICATION },
                   { key: "analyst", templateId: "analyst", goal: dependentGoal, successCriteria: ["Return one analysis finding"], dependsOn: ["scout"], verification: ANALYST_VERIFICATION },
+                  ...(initialIndependent ? [{ key: "independent", templateId: "analyst", goal: independentGoal,
+                    successCriteria: ["Return one independent finding"], dependsOn: [], verification: ANALYST_VERIFICATION }] : []),
                 ],
               } }
               yield { type: "completed", finishReason: "tool_calls" }
               return
             }
             if (execution === 1 && round === 2) {
-              initialTaskIds = planTaskIds(request, planCallId, 2)
+              const initialPlanTaskIds = planTaskIds(request, planCallId, initialIndependent ? 3 : 2)
+              initialTaskIds = initialPlanTaskIds.slice(0, 2)
+              if (initialIndependent) independentTaskId = initialPlanTaskIds[2]!
               const root = await pool!.query<{ rootTaskId: string | null }>(
                 `SELECT "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
                 [value.turnId, value.sessionId, value.userId],
@@ -10068,7 +10154,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             if (execution === 2 && round === 1) {
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
-              expect(nodes.map(node => [node?.key, node?.status])).toEqual([["scout", "failed"], ["analyst", "cancelled"]])
+              expect(nodes.slice(0, 2).map(node => [node?.key, node?.status])).toEqual([["scout", "failed"], ["analyst", "cancelled"]])
+              expect(nodes.map(node => node?.key)).toEqual(initialIndependent ? ["scout", "analyst", "independent"] : ["scout", "analyst"])
               expect(nodes.find(node => node?.key === "scout")?.executionFailureCategory).toBe("resume_state_unavailable")
               const planTool = request.tools.map(record).find(tool => tool?.name === "agent.plan")
               const planProperties = record(record(planTool?.inputSchema)?.properties)
@@ -10088,6 +10175,15 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 [initialTaskIds[0], value.sessionId, value.turnId, rootTaskId],
               )
               expect(source.rows[0]).toMatchObject({ status: "failed", failureReason: "child_resume_unavailable" })
+              const failureReceipt = await readExactFailureReceipt()
+              if (!failureReceipt) throw new Error("Root observed the failed child before its exact event/outbox receipt was persisted")
+              failedEventId = failureReceipt.id
+              failedEventSequence = failureReceipt.sequence
+              const failureRevision = record(failureReceipt.payload)?.revision
+              if (typeof failureRevision !== "number" || !Number.isSafeInteger(failureRevision)) {
+                throw new Error("Operational failure fixture did not find the task.failed graph revision")
+              }
+              failedEventRevision = failureRevision
               const sourceResult = record(source.rows[0]?.result)
               expect(Object.keys(sourceResult ?? {}).sort()).toEqual(["taskGraphVerificationReport"])
               expect(Object.hasOwn(sourceResult ?? {}, "workerResult")).toBe(false)
@@ -10134,17 +10230,83 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 resolvedAt: waitRow.rows[0]?.resolvedAt?.toISOString() ?? null,
                 consumedAt: waitRow.rows[0]?.consumedAt?.toISOString() ?? null,
               })
+              if (initialIndependent) {
+                releaseIndependentCompletion()
+                await waitForTaskStatus(independentTaskId, "completed")
+              }
               expect(request.tools.map(tool => record(tool)?.name)).toContain("agent.wait")
+              if (appendIndependent) {
+                if (!graph || typeof graph.revision !== "number") throw new Error("Operational failure append lost the current graph revision")
+                appendExpectedRevision = graph.revision
+                yield { type: "tool_call_completed", callId: appendCallId, name: "agent.plan", arguments: {
+                  expectedRevision: graph.revision,
+                  nodes: [{ key: "independent", templateId: "analyst", goal: independentGoal,
+                    successCriteria: ["Return one independent finding"], dependsOn: [], verification: ANALYST_VERIFICATION }],
+                } }
+                yield { type: "completed", finishReason: "tool_calls" }
+                return
+              }
               yield { type: "tool_call_completed", callId: inlineWaitCallId, name: "agent.wait", arguments: {
                 idempotencyKey: inlineWaitKey, taskIds: initialTaskIds, mode: "all", timeoutMs: 30_000,
               } }
               yield { type: "completed", finishReason: "tool_calls" }
               return
             }
-            if (execution === 2 && round === 2) {
+            if (execution === 2 && round === 2 && appendIndependent) {
+              const appendResult = record(latestToolResult(request, appendCallId))
+              expect(appendResult?.status).toBe("accepted")
+              independentTaskId = planTaskIds(request, appendCallId, 1)[0]!
+              if (appendExpectedRevision === null) throw new Error("Independent append lost its expected revision")
+              const appendEventKey = taskGraphProposalKey(rootTaskId, appendExpectedRevision)
+              const appendEvent = await pool!.query<{
+                id: string; sequence: string; eventType: string; actor: string; taskId: string | null; itemId: string | null;
+                correlationId: string; causationId: string | null; idempotencyKey: string; payload: unknown;
+                outboxTopic: string; outboxAggregateId: string; outboxIdempotencyKey: string; outboxPayload: unknown;
+              }>(`SELECT event."id", event."sequence"::text AS "sequence", event."type" AS "eventType", event."actor",
+                  event."taskId", event."itemId", event."correlationId", event."causationId", event."idempotencyKey", event."payload",
+                  outbox."topic" AS "outboxTopic", outbox."aggregateId" AS "outboxAggregateId",
+                  outbox."idempotencyKey" AS "outboxIdempotencyKey", outbox."payload" AS "outboxPayload"
+                FROM "agent_events" AS event JOIN "agent_outbox" AS outbox
+                  ON outbox."idempotencyKey" = 'agent-event:' || event."id" AND outbox."topic" = 'agent.session.event'
+                    AND outbox."aggregateId" = event."sessionId" AND outbox."payload"->>'eventId' = event."id"
+                WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."itemId" = $3 AND event."taskId" = $4
+                  AND event."idempotencyKey" = $5`,
+              [value.sessionId, value.turnId, taskGraphItemId(rootTaskId), rootTaskId, appendEventKey])
+              expect(appendEvent.rows).toHaveLength(1)
+              const appendReceipt = appendEvent.rows[0]!
+              const appendPayload = record(appendReceipt.payload), appendSnapshot = record(record(appendPayload?.item)?.content)
+              const proposalRevision = appendPayload?.revision
+              if (typeof proposalRevision !== "number" || !Number.isSafeInteger(proposalRevision)) {
+                throw new Error("Independent append fixture did not find the proposal graph revision")
+              }
+              appendEventRevision = proposalRevision
+              expect(appendReceipt).toMatchObject({ eventType: "item.delta", actor: "orchestrator", taskId: rootTaskId,
+                itemId: taskGraphItemId(rootTaskId), correlationId: value.turnId, idempotencyKey: appendEventKey,
+                outboxTopic: "agent.session.event", outboxAggregateId: value.sessionId,
+                outboxIdempotencyKey: `agent-event:${appendReceipt.id}` })
+              expect(appendPayload).toMatchObject({ kind: "proposal", revision: appendExpectedRevision + 1 })
+              expect(appendSnapshot?.nodes).toEqual(expect.arrayContaining([
+                expect.objectContaining({ key: "independent", taskId: independentTaskId, goal: independentGoal }),
+              ]))
+              expect(record(appendReceipt.outboxPayload)).toEqual({ eventId: appendReceipt.id, sessionId: value.sessionId,
+                turnId: value.turnId, itemId: appendReceipt.itemId, taskId: appendReceipt.taskId, sequence: appendReceipt.sequence,
+                type: appendReceipt.eventType, actor: appendReceipt.actor, correlationId: appendReceipt.correlationId,
+                causationId: appendReceipt.causationId, idempotencyKey: appendReceipt.idempotencyKey, payload: appendReceipt.payload })
+              appendEventId = appendReceipt.id
+              appendEventSequence = appendReceipt.sequence
+              await waitForTaskStatus(independentTaskId, "completed")
+              yield { type: "tool_call_completed", callId: inlineWaitCallId, name: "agent.wait", arguments: {
+                idempotencyKey: inlineWaitKey, taskIds: initialTaskIds, mode: "all", timeoutMs: 30_000,
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if (execution === 2 && round === inlineWaitObserveRound) {
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
-              expect(nodes.map(node => [node?.key, node?.status])).toEqual([["scout", "failed"], ["analyst", "cancelled"]])
+              expect(nodes.map(node => [node?.key, node?.status])).toEqual([
+                ["scout", "failed"], ["analyst", "cancelled"], ["independent", "completed"],
+              ])
               expect(nodes.find(node => node?.key === "scout")?.executionFailureCategory).toBe("resume_state_unavailable")
               const inlineOutcome = repairWaitOutcomeFromRequest(request, inlineWaitCallId, initialTaskIds)
               expect(inlineOutcome.status).toBe("ready")
@@ -10193,6 +10355,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               })).toBe(consumedFailureWaitSnapshot)
               inlineFailureWaitObserved = true
               if (!graph || typeof graph.revision !== "number") throw new Error("Operational failure fixture lost the current graph revision")
+              observedGraphRevision = graph.revision
+              observedGraphSnapshot = graph
+              observedIndependentNode = nodes.find(node => node?.key === "independent") ?? null
+              expect(observedIndependentNode?.taskId).toBe(independentTaskId)
+              expect(observedIndependentNode?.status).toBe("completed")
               yield { type: "tool_call_completed", callId: replacementPlanCallId, name: "agent.plan", arguments: {
                 expectedRevision: graph.revision,
                 replaceOperationalFailure: {
@@ -10210,17 +10377,23 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               yield { type: "completed", finishReason: "tool_calls" }
               return
             }
-            if (execution === 2 && round === 3) {
+            if (execution === 2 && round === replacementAcceptedRound) {
               const planResult = record(latestToolResult(request, replacementPlanCallId))
               replacementPlanResultDiagnostic = `${safeLabel(planResult?.status)}/${safeLabel(planResult?.errorCode ?? planResult?.code)}`
               replacementTaskIds = planTaskIds(request, replacementPlanCallId, 2)
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
-              expect(nodes.map(node => node?.key)).toEqual(["scout-replacement", "analyst-replacement"])
-              expect(nodes.map(node => node?.taskId)).toEqual(replacementTaskIds)
-              expect(["queued", "running"]).toContain(nodes[0]?.status)
-              expect(nodes[1]?.status).toBe("waiting")
-              expect(nodes[1]?.dependsOn).toEqual(["scout-replacement"])
+              expect(nodes).toHaveLength(3)
+              const replacementScout = nodes.find(node => node?.key === "scout-replacement")
+              const replacementAnalyst = nodes.find(node => node?.key === "analyst-replacement")
+              const independent = nodes.find(node => node?.key === "independent")
+              expect(replacementScout?.taskId).toBe(replacementTaskIds[0])
+              expect(replacementAnalyst?.taskId).toBe(replacementTaskIds[1])
+              expect(["queued", "running"]).toContain(replacementScout?.status)
+              expect(replacementAnalyst?.status).toBe("waiting")
+              expect(replacementAnalyst?.dependsOn).toEqual(["scout-replacement"])
+              expect(independent).toEqual(observedIndependentNode)
+              expect(graph?.revision).toBe((observedGraphRevision ?? -2) + 1)
               replacementPlanAccepted = true
               yield { type: "tool_call_completed", callId: replacementWaitCallId, name: "agent.wait", arguments: {
                 idempotencyKey: replacementWaitKey, taskIds: replacementTaskIds, mode: "all", timeoutMs: 30_000,
@@ -10240,11 +10413,14 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               expect(waitTaskStatuses.get(replacementTaskIds[1]!)).toBe("completed")
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
-              expect(nodes.map(node => [node?.key, node?.status])).toEqual([
-                ["scout-replacement", "completed"], ["analyst-replacement", "completed"],
-              ])
-              expectPassedVerificationReport(nodes[0]?.verificationReport, "candidate-count")
-              expectPassedVerificationReport(nodes[1]?.verificationReport, "finding-count")
+              const finalStatuses = new Map(nodes.flatMap(node => typeof node?.key === "string" && typeof node.status === "string"
+                ? [[node.key, node.status] as const] : []))
+              expect(finalStatuses).toEqual(new Map([
+                ["scout-replacement", "completed"], ["analyst-replacement", "completed"], ["independent", "completed"],
+              ]))
+              expectPassedVerificationReport(nodes.find(node => node?.key === "scout-replacement")?.verificationReport, "candidate-count")
+              expectPassedVerificationReport(nodes.find(node => node?.key === "analyst-replacement")?.verificationReport, "finding-count")
+              expect(nodes.find(node => node?.key === "independent")).toEqual(observedIndependentNode)
               finalGraphVerified = true
               yield { type: "text_delta", text: "The operational failure was replaced and verified with fresh Scout and Analyst tasks." }
               yield { type: "completed", finishReason: "stop" }
@@ -10277,12 +10453,22 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       subagents: {
         intervalMs: 10,
         async execute({ lease }) {
-          await waitForSuspendedParent(pool!, value.turnId, lease.goal === sourceGoal ? 1 : 2)
+          if (lease.goal === sourceGoal) await waitForSuspendedParent(pool!, value.turnId, 1)
+          else if (lease.goal === dependentGoal || lease.goal === replacementScoutGoal || lease.goal === replacementAnalystGoal) {
+            await waitForSuspendedParent(pool!, value.turnId, 2)
+          }
           if (lease.goal === sourceGoal) {
             expect(lease.role).toBe("scout")
             return { status: "failed", failureReason: "child_resume_unavailable", retryDisposition: "terminal" }
           }
           if (lease.goal === dependentGoal) throw new Error("The waiting Analyst descendant was dispatched before source failure")
+          if (lease.goal === independentGoal) {
+            expect(lease.role).toBe("analyst")
+            await waitForExactFailureReceipt()
+            if (initialIndependent) await independentCompletionAllowed
+            await persistTaskGraphChildReadEvidence(pool!, lease)
+            return { status: "completed", result: structuredChildResult("analyst", independentGoal) }
+          }
           if (lease.goal === replacementScoutGoal || lease.goal === replacementAnalystGoal) {
             if (lease.role !== "scout" && lease.role !== "analyst") throw new Error("Replacement child role changed unexpectedly")
             await persistTaskGraphChildReadEvidence(pool!, lease)
@@ -10308,8 +10494,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(turn.rows[0]?.finalResponse).toContain("operational failure was replaced and verified")
     expect(rootExecutions).toBe(3)
     expect(initialTaskIds).toHaveLength(2)
+    expect(independentTaskId).not.toBe("")
     expect(replacementTaskIds).toHaveLength(2)
-    expect(new Set([...initialTaskIds, ...replacementTaskIds]).size).toBe(4)
+    expect(new Set([...initialTaskIds, independentTaskId, ...replacementTaskIds]).size).toBe(5)
     expect(consumedFailureWaitObserved).toBe(true)
     expect(inlineFailureWaitObserved).toBe(true)
     expect(replacementPlanAccepted).toBe(true)
@@ -10323,7 +10510,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
        WHERE task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4 AND task."parentTaskId" = $4`,
       [value.userId, value.sessionId, value.turnId, rootTaskId],
     )
-    expect(tasks.rows).toHaveLength(4)
+    expect(tasks.rows).toHaveLength(5)
     const byGoal = new Map(tasks.rows.map(task => [task.goal, task] as const))
     const failedSource = byGoal.get(sourceGoal)
     expect(failedSource).toMatchObject({ id: initialTaskIds[0], status: "failed", failureReason: "child_resume_unavailable" })
@@ -10331,6 +10518,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(failedSource?.result).toEqual(originalOperationalFailureResult)
     expectUnverifiedVerificationReport(record(failedSource?.result)?.taskGraphVerificationReport, "candidate-count")
     expect(byGoal.get(dependentGoal)).toMatchObject({ id: initialTaskIds[1], status: "cancelled", failureReason: "A prerequisite task did not complete." })
+    expect(byGoal.get(independentGoal)).toMatchObject({ id: independentTaskId, status: "completed", failureReason: null })
+    expectPassedVerificationReport(record(byGoal.get(independentGoal)?.result)?.taskGraphVerificationReport, "finding-count")
     expect(byGoal.get(replacementScoutGoal)).toMatchObject({ id: replacementTaskIds[0], status: "completed", failureReason: null })
     expectPassedVerificationReport(record(byGoal.get(replacementScoutGoal)?.result)?.taskGraphVerificationReport, "candidate-count")
     expect(byGoal.get(replacementAnalystGoal)).toMatchObject({ id: replacementTaskIds[1], status: "completed", failureReason: null })
@@ -10369,6 +10558,81 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(replacementWait?.suspendedAt).toBeInstanceOf(Date)
     expect(replacementWait?.resolvedAt).toBeInstanceOf(Date)
     expect(replacementWait?.consumedAt).toBeInstanceOf(Date)
+    expect(observedGraphRevision).not.toBeNull()
+    expect(observedGraphSnapshot).not.toBeNull()
+    expect(failedEventId).not.toBeNull()
+    expect(failedEventSequence).not.toBeNull()
+    expect(failedEventRevision).not.toBeNull()
+    expect(failedEventRevision!).toBeLessThan(observedGraphRevision!)
+    const reconciliation = await pool!.query<{ id: string; sequence: string; payload: unknown }>(
+      `SELECT "id", "sequence"::text AS "sequence", "payload" FROM "agent_events"
+       WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'agent.plan.reconciliation'
+         AND "payload"->'operationalFailure' IS NOT NULL ORDER BY "sequence"`,
+      [value.sessionId, value.turnId],
+    )
+    expect(reconciliation.rows).toHaveLength(1)
+    const relation = record(record(reconciliation.rows[0]?.payload)?.operationalFailure)
+    const relationFailure = record(relation?.failedSource)
+    const relationObservedEvent = record(relation?.observedGraphEvent)
+    const relationPlanEvent = record(relation?.planEvent)
+    expect(relation).toMatchObject({ observedRevision: observedGraphRevision, resultingRevision: observedGraphRevision! + 1 })
+    expect(record(relationFailure?.event)).toMatchObject({ id: failedEventId, sequence: failedEventSequence,
+      idempotencyKey: taskGraphLifecycleKey(rootTaskId!, "scout", 1, "task.failed") })
+    expect(typeof relationObservedEvent?.id).toBe("string")
+    expect(typeof relationObservedEvent?.sequence).toBe("string")
+    expect(typeof relationPlanEvent?.sequence).toBe("string")
+    const observedEvent = await pool!.query<{
+      id: string; sequence: string; eventType: string; actor: string; taskId: string | null; itemId: string | null;
+      correlationId: string; causationId: string | null; idempotencyKey: string; payload: unknown;
+      outboxTopic: string; outboxAggregateId: string; outboxIdempotencyKey: string; outboxPayload: unknown;
+    }>(`SELECT event."id", event."sequence"::text AS "sequence", event."type" AS "eventType", event."actor",
+        event."taskId", event."itemId", event."correlationId", event."causationId", event."idempotencyKey", event."payload",
+        outbox."topic" AS "outboxTopic", outbox."aggregateId" AS "outboxAggregateId",
+        outbox."idempotencyKey" AS "outboxIdempotencyKey", outbox."payload" AS "outboxPayload"
+      FROM "agent_events" AS event JOIN "agent_outbox" AS outbox
+        ON outbox."idempotencyKey" = 'agent-event:' || event."id" AND outbox."topic" = 'agent.session.event'
+          AND outbox."aggregateId" = event."sessionId" AND outbox."payload"->>'eventId' = event."id"
+      WHERE event."id" = $1 AND event."sessionId" = $2 AND event."turnId" = $3 AND event."itemId" = $4`,
+    [relationObservedEvent?.id, value.sessionId, value.turnId, taskGraphItemId(rootTaskId!)])
+    expect(observedEvent.rows).toHaveLength(1)
+    const observedReceipt = observedEvent.rows[0]!
+    const observedPayload = record(observedReceipt.payload)
+    expect(observedReceipt.sequence).toBe(relationObservedEvent?.sequence)
+    expect(observedReceipt).toMatchObject({ eventType: "item.delta", actor: "system", taskId: independentTaskId,
+      itemId: taskGraphItemId(rootTaskId!), correlationId: value.turnId,
+      idempotencyKey: taskGraphLifecycleKey(rootTaskId!, "independent", 1, "task.completed"),
+      outboxTopic: "agent.session.event", outboxAggregateId: value.sessionId,
+      outboxIdempotencyKey: `agent-event:${observedReceipt.id}` })
+    expect(observedPayload).toMatchObject({ kind: "lifecycle", revision: observedGraphRevision,
+      event: { type: "task.completed", nodeKey: "independent" } })
+    const persistedObservedSnapshot = record(record(observedPayload?.item)?.content)
+    const persistedObservedNodes = Array.isArray(persistedObservedSnapshot?.nodes) ? persistedObservedSnapshot.nodes.map(record) : []
+    expect(persistedObservedNodes).toHaveLength(3)
+    expect(persistedObservedNodes.map(node => [node?.key, node?.taskId, node?.status])).toEqual(expect.arrayContaining([
+      ["scout", initialTaskIds[0], "failed"], ["analyst", initialTaskIds[1], "cancelled"],
+      ["independent", independentTaskId, "completed"],
+    ]))
+    const requestObservedSnapshot = observedGraphSnapshot as RecordValue | null
+    expect(requestObservedSnapshot?.revision).toBe(observedGraphRevision)
+    expect(record(observedReceipt.outboxPayload)).toEqual({ eventId: observedReceipt.id, sessionId: value.sessionId,
+      turnId: value.turnId, itemId: observedReceipt.itemId, taskId: observedReceipt.taskId, sequence: observedReceipt.sequence,
+      type: observedReceipt.eventType, actor: observedReceipt.actor, correlationId: observedReceipt.correlationId,
+      causationId: observedReceipt.causationId, idempotencyKey: observedReceipt.idempotencyKey, payload: observedReceipt.payload })
+    expect(BigInt(failedEventSequence!)).toBeLessThan(BigInt(observedReceipt.sequence))
+    expect(BigInt(observedReceipt.sequence)).toBeLessThan(BigInt(String(relationPlanEvent?.sequence)))
+    if (appendIndependent) {
+      expect(appendExpectedRevision).not.toBeNull()
+      expect(appendEventRevision).not.toBeNull()
+      expect(appendEventRevision!).toBeLessThan(observedGraphRevision!)
+      expect(appendEventId).not.toBeNull()
+      expect(appendEventSequence).not.toBeNull()
+      expect(BigInt(failedEventSequence!)).toBeLessThan(BigInt(appendEventSequence!))
+      expect(BigInt(appendEventSequence!)).toBeLessThan(BigInt(observedReceipt.sequence))
+      expect(appendEventId).not.toBe(relationObservedEvent?.id)
+    } else {
+      expect(appendEventId).toBeNull()
+      expect(BigInt(failedEventSequence!)).toBeLessThan(BigInt(observedReceipt.sequence))
+    }
     const graphEvents = await pool!.query<{ payload: unknown; idempotencyKey: string }>(
       `SELECT "payload", "idempotencyKey" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3 ORDER BY "sequence"`,
       [value.sessionId, value.turnId, taskGraphItemId(rootTaskId!)],

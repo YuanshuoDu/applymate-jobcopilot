@@ -1,7 +1,12 @@
+import { Type } from "@sinclair/typebox"
+import { Value } from "@sinclair/typebox/value"
 import { describe, expect, it } from "vitest"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import {
+  buildTaskGraphProposalInputSchema,
   normalizeTaskGraphPlanningNodes,
   parseTaskGraphPlanningReplacementModes,
+  TaskGraphProposalInputSchema,
   type TaskGraphModelNodeProposal,
   type TaskGraphProposalInput,
 } from "./task-graph-planning-input.js"
@@ -16,6 +21,28 @@ const singleton = {
 function input(overrides: Partial<TaskGraphProposalInput> = {}): TaskGraphProposalInput {
   return { expectedRevision: 3, nodes: oneNode, ...overrides }
 }
+
+describe("agent.plan proposal schema construction", () => {
+  it("preserves the generic proposal schema and builds strict role-specific registered templates", () => {
+    expect(Value.Check(TaskGraphProposalInputSchema, input())).toBe(true)
+    const templates = [
+      ["scout", { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] }],
+      ["analyst", { role: "analyst", taskType: "job_analysis", allowedActions: ["persona.retrieve"] }],
+    ] as const
+    const schema = buildTaskGraphProposalInputSchema(Type.Union([Type.Literal("scout"), Type.Literal("analyst")]), templates)
+    const scout = { key: "scout-new", templateId: "scout", goal: "Find candidates", successCriteria: ["Find one candidate"],
+      dependsOn: [], verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+        criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }] } }
+    expect(Value.Check(schema, { expectedRevision: 0, nodes: [scout] })).toBe(true)
+    expect(Value.Check(schema, { expectedRevision: 0, nodes: [{ ...scout, verification: {
+      ...scout.verification, role: "analyst",
+    } }] })).toBe(false)
+    expect(Value.Check(schema, { expectedRevision: 0, nodes: [{ ...scout, taskId: "server-owned" }] })).toBe(false)
+    expect(() => buildTaskGraphProposalInputSchema(Type.String(), [
+      ["scout", { role: "analyst", taskType: "job_analysis", allowedActions: [] }],
+    ])).toThrow("task_graph_verification_template_role_mismatch")
+  })
+})
 
 describe("agent.plan replacement mode parsing", () => {
   it("parses the singleton operational mode without changing expectedRevision placement", () => {

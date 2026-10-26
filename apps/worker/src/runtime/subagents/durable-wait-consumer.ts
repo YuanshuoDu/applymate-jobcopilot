@@ -195,17 +195,11 @@ async function storedOutcome(client: Queryable, scope: Parameters<typeof readDur
     seen.add(task.taskId)
     const hasRole = Object.prototype.hasOwnProperty.call(task, "role"), role = hasRole ? taskRole(task.role) : null, rowRole = taskRole(authoritative.role)
     if (hasRole && (!role || !rowRole || role !== rowRole)) return null
-    const node = snapshot?.nodes.find(candidate => candidate.taskId === task.taskId)
-    let criterionIds: readonly string[] | undefined = node?.verificationDisposition === "typed" && node.verification ? node.verification.criteria.map(item => item.id) : undefined
-    const hasReport = Object.prototype.hasOwnProperty.call(task, "verificationReport"), hasReceipt = Object.prototype.hasOwnProperty.call(task, "repairReceipt")
-    let historicalReport: TaskGraphVerificationReport | undefined
+    const node = snapshot?.nodes.find(candidate => candidate.taskId === task.taskId), hasReport = Object.prototype.hasOwnProperty.call(task, "verificationReport"), hasReceipt = Object.prototype.hasOwnProperty.call(task, "repairReceipt")
+    let criterionIds: readonly string[] | undefined = node?.verificationDisposition === "typed" && node.verification ? node.verification.criteria.map(item => item.id) : undefined, historicalReport: TaskGraphVerificationReport | undefined
     if (!node && hasReport && !hasReceipt && childStatus === "failed" && rowStatus === "failed") {
-      const proof = await readConsumedTaskGraphFailureReport(client, { scope, task: {
-        id: authoritative.id, status: authoritative.status, attemptCount: authoritative.attemptCount,
-        role: authoritative.role, taskType: authoritative.taskType, failureReason: authoritative.failureReason, result: authoritative.result,
-      }, archivedReport: task.verificationReport })
-      if (!proof) return null
-      criterionIds = proof.criterionIds; historicalReport = proof.report
+      const proof = await readConsumedTaskGraphFailureReport(client, { scope, task: authoritative, archivedReport: task.verificationReport })
+      if (!proof) return null; criterionIds = proof.criterionIds; historicalReport = proof.report
     }
     const verificationReport = hasReport && criterionIds ? parseTaskGraphVerificationReport(task.verificationReport, criterionIds) : undefined
     if (hasReport && !verificationReport) return null

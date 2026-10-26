@@ -1,6 +1,9 @@
-import { Type } from "@sinclair/typebox"
+import { Type, type TSchema } from "@sinclair/typebox"
 import type { TaskGraphNodeProposal, TaskGraphProposal, TaskGraphRepairOf } from "../planning/task-graph.js"
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
+import { TASK_GRAPH_VERIFICATION_LIMITS, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, taskGraphVerificationRole,
+  type TaskGraphVerificationRole } from "../planning/task-graph-verification.js"
+import type { TaskGraphTaskTemplate } from "../subagents/task-graph-command-port.js"
 import { TaskGraphBranchReplacementInputSchema, parseTaskGraphBranchReplacement, type TaskGraphBranchReplacement } from "../planning/task-graph-branch-replacement.js"
 import {
   TaskGraphOperationalFailureReplacementInputSchema,
@@ -25,6 +28,90 @@ export const TASK_GRAPH_PLANNING_REPLACEMENT_SCHEMA_PROPERTIES = {
   replaceBranch: Type.Optional(TaskGraphBranchReplacementInputSchema),
   replaceOperationalFailure: Type.Optional(TaskGraphOperationalFailureReplacementInputSchema),
 }
+
+function verificationCheckSchema(role: TaskGraphVerificationRole): TSchema {
+  const evidence = Type.Object({ kind: Type.Literal("evidence_count_gte"), minimum: Type.Integer({ minimum: 1, maximum: TASK_GRAPH_VERIFICATION_LIMITS.maxItems }) }, { additionalProperties: false })
+  const roleChecks: TSchema[] = role === "scout"
+    ? [
+      Type.Object({ kind: Type.Literal("candidate_count_gte"), minimum: Type.Integer({ minimum: 1, maximum: TASK_GRAPH_VERIFICATION_LIMITS.maxItems }) }, { additionalProperties: false }),
+      Type.Object({ kind: Type.Literal("all_candidates_have_evidence"), minimumItems: Type.Integer({ minimum: 1, maximum: TASK_GRAPH_VERIFICATION_LIMITS.maxItems }) }, { additionalProperties: false }),
+    ]
+    : [
+      Type.Object({ kind: Type.Literal("finding_count_gte"), minimum: Type.Integer({ minimum: 1, maximum: TASK_GRAPH_VERIFICATION_LIMITS.maxItems }) }, { additionalProperties: false }),
+      Type.Object({ kind: Type.Literal("all_findings_have_evidence"), minimumItems: Type.Integer({ minimum: 1, maximum: TASK_GRAPH_VERIFICATION_LIMITS.maxItems }) }, { additionalProperties: false }),
+      Type.Object({
+        kind: Type.Literal("reported_score_gte"), minimumScore: Type.Number({ minimum: 0, maximum: TASK_GRAPH_VERIFICATION_LIMITS.maxScore }),
+        minimumFindings: Type.Integer({ minimum: 1, maximum: TASK_GRAPH_VERIFICATION_LIMITS.maxItems }),
+        aggregation: Type.Union([Type.Literal("any"), Type.Literal("all")]),
+      }, { additionalProperties: false }),
+      Type.Object({
+        kind: Type.Literal("findings_from_scout_dependency"),
+        dependencyNodeKey: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
+      }, { additionalProperties: false }),
+      Type.Object({
+        kind: Type.Literal("findings_cover_scout_candidates_gte"),
+        dependencyNodeKey: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
+        minimumPercent: Type.Integer({ minimum: 1, maximum: 100 }),
+      }, { additionalProperties: false }),
+    ]
+  return Type.Union([evidence, ...roleChecks] as [TSchema, ...TSchema[]])
+}
+
+function verificationSchema(role: TaskGraphVerificationRole): TSchema {
+  return Type.Object({
+    schemaVersion: Type.Literal(TASK_GRAPH_VERIFICATION_SCHEMA_VERSION),
+    role: Type.Literal(role),
+    criteria: Type.Array(Type.Object({
+      id: Type.String({ minLength: 1, maxLength: TASK_GRAPH_VERIFICATION_LIMITS.maxCriterionIdLength, pattern: "^[a-z][a-z0-9._-]{0,63}$" }),
+      check: verificationCheckSchema(role),
+    }, { additionalProperties: false }), { minItems: 1, maxItems: TASK_GRAPH_VERIFICATION_LIMITS.maxCriteria }),
+  }, { additionalProperties: false })
+}
+
+function repairOfSchema(): TSchema {
+  return Type.Object({
+    graphRootTaskId: Type.Optional(Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength })),
+    nodeKey: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
+    taskId: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
+    criterionIds: Type.Array(Type.String({ minLength: 1, maxLength: TASK_GRAPH_VERIFICATION_LIMITS.maxCriterionIdLength, pattern: "^[a-z][a-z0-9._-]{0,63}$" }), { minItems: 1, maxItems: TASK_GRAPH_LIMITS.maxSuccessCriteria }),
+  }, { additionalProperties: false })
+}
+
+function proposalNodeSchema<T extends TSchema>(templateIdSchema: T, role?: TaskGraphVerificationRole, genericVerification = false) {
+  const properties = {
+    key: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
+    templateId: templateIdSchema,
+    goal: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxGoalLength }),
+    successCriteria: Type.Array(Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxCriterionLength }), { minItems: 1, maxItems: TASK_GRAPH_LIMITS.maxSuccessCriteria }),
+    dependsOn: Type.Array(Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }), { maxItems: TASK_GRAPH_LIMITS.maxDependencies }),
+  }
+  if (role) Object.assign(properties, { verification: verificationSchema(role) })
+  else if (genericVerification) Object.assign(properties, {
+    verification: Type.Optional(Type.Union([verificationSchema("scout"), verificationSchema("analyst")])),
+  })
+  if (role || genericVerification) Object.assign(properties, { repairOf: Type.Optional(repairOfSchema()) })
+  return Type.Object(properties, { additionalProperties: false })
+}
+
+export function buildTaskGraphProposalInputSchema<T extends TSchema>(
+  templateIdSchema: T,
+  templates?: readonly (readonly [string, TaskGraphTaskTemplate])[],
+) {
+  const nodeSchemas: TSchema[] = templates ? templates.map(([templateId, template]) => {
+    const role = taskGraphVerificationRole(templateId)
+    if (role && template.role !== role) throw new Error("task_graph_verification_template_role_mismatch")
+    return proposalNodeSchema(Type.Literal(templateId), role)
+  }) : [proposalNodeSchema(templateIdSchema, undefined, true)]
+  const nodeSchema = nodeSchemas.length === 1 ? nodeSchemas[0]! : Type.Union(nodeSchemas as [TSchema, ...TSchema[]])
+  return Type.Object({
+    expectedRevision: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
+    nodes: Type.Array(nodeSchema, { minItems: 1, maxItems: TASK_GRAPH_LIMITS.maxNodes }),
+    rootSuccessCriteria: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 4 })),
+    ...TASK_GRAPH_PLANNING_REPLACEMENT_SCHEMA_PROPERTIES,
+  }, { additionalProperties: false })
+}
+
+export const TaskGraphProposalInputSchema = buildTaskGraphProposalInputSchema(Type.String({ minLength: 1, maxLength: 128 }))
 
 export type TaskGraphPlanningReplacementModes = Readonly<{
   replaceUnstarted?: Readonly<{ nodeKey: string }>

@@ -120,40 +120,6 @@ export function steeringReconciliationIdempotencyKey(scope: TaskGraphExecutionSc
   const identity = JSON.stringify([scope.userId, scope.sessionId, scope.turnId, scope.rootTaskId, scope.stepId, callId])
   return `agent.plan.reconciliation:sha256:${createHash("sha256").update(identity, "utf8").digest("hex")}`
 }
-export function matchSteeringReconciliationOperationReceipt(row: Readonly<Record<string, unknown>>, operation: SteeringReconciliationOperation,
-  key: string, requestFingerprint?: string): SteeringReconciliationReceipt {
-  const receipt = parseSteeringReconciliationReceipt(record(row.payload), operation.scope)
-  const branch = operation.replaceBranch && parseTaskGraphBranchReplacement(operation.replaceBranch)
-  const branchMatches = Boolean(branch?.ok && receipt?.branchRepair && receipt.branchRepair.operationKey === key
-    && receipt.branchRepair.agentPlanCall.callId === operation.callId && receipt.branchRepair.agentPlanCall.stepId === operation.scope.stepId
-    && JSON.stringify(branch.value) === JSON.stringify(receipt.branchRepair.agentPlanCall.replaceBranch)
-    && requestFingerprint === receipt.branchRepair.replacementFingerprint)
-  const failed = operation.replaceBranch && receipt?.failedBranch
-  const failedBranchMatches = Boolean(failed && failed.operationKey === key && failed.agentPlanCall.callId === operation.callId
-    && failed.agentPlanCall.stepId === operation.scope.stepId && branch?.ok
-    && JSON.stringify(branch.value) === JSON.stringify(failed.agentPlanCall.replaceBranch) && requestFingerprint === failed.requestFingerprint)
-  const failedReplacement = operation.replaceOperationalFailure && receipt?.operationalFailure
-  const operationalMatches = Boolean(failedReplacement && failedReplacement.operationKey === key
-    && failedReplacement.agentPlanCall.callId === operation.callId && failedReplacement.agentPlanCall.stepId === operation.scope.stepId
-    && JSON.stringify(operation.replaceOperationalFailure) === JSON.stringify(failedReplacement.agentPlanCall.replaceOperationalFailure)
-    && (requestFingerprint === undefined || requestFingerprint === failedReplacement.requestFingerprint))
-  if (!receipt || row.turnId !== operation.scope.turnId || row.type !== STEERING_RECONCILIATION_EVENT_TYPE || row.itemId !== null
-    || row.taskId !== operation.scope.rootTaskId || row.actor !== "orchestrator" || row.correlationId !== operation.scope.turnId
-    || row.causationId !== operation.scope.stepId || row.idempotencyKey !== key || row.hasOutbox !== false
-    || receipt.decision !== operation.decision || receipt.observedRevision !== operation.expectedRevision
-    || operation.replaceUnstartedNodeKey === undefined && receipt.supersession !== undefined
-    || operation.replaceUnstartedNodeKey !== undefined && (!receipt.supersession || receipt.supersession.operationKey !== key
-      || receipt.supersession.agentPlanCall.callId !== operation.callId || receipt.supersession.agentPlanCall.stepId !== operation.scope.stepId
-      || receipt.supersession.agentPlanCall.replaceUnstarted.nodeKey !== operation.replaceUnstartedNodeKey)
-    || operation.replaceBranch === undefined && (receipt.branchRepair !== undefined || receipt.failedBranch !== undefined)
-    || operation.replaceBranch !== undefined && !branchMatches && !failedBranchMatches
-    || operation.replaceOperationalFailure === undefined && receipt.operationalFailure !== undefined
-    || operation.replaceOperationalFailure !== undefined && (!operationalMatches || operation.replaceBranch !== undefined
-      || operation.replaceUnstartedNodeKey !== undefined || receipt.branchRepair !== undefined || receipt.failedBranch !== undefined || receipt.supersession !== undefined)) {
-    throw new Error("steering_reconciliation_idempotency_conflict")
-  }
-  return receipt
-}
 export function validSteeringReconciliationToolCall(event: Row, item: Row, scope: TaskGraphReadScope, stepId: string,
   decision: "keep" | "revise", expectedRevision: number, replaceUnstartedNodeKey?: string, replaceBranch?: TaskGraphBranchReplacement,
   replaceOperationalFailure?: TaskGraphOperationalFailureReplacement): boolean {

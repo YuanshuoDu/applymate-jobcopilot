@@ -7,9 +7,7 @@ import { canonicalTaskGraphJson, parseTaskGraphEvent, parseTaskGraphSnapshot, ta
 
 type Client = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
-type HistoricalFailureTask = Readonly<{
-  id: unknown; status: unknown; attemptCount: unknown; role: unknown; taskType: unknown; failureReason: unknown; result: unknown
-}>
+type HistoricalFailureTask = Readonly<Record<string, unknown>>
 type Input = Readonly<{ scope: GraphIdentityScope; task: HistoricalFailureTask; archivedReport: unknown }>
 export type ConsumedTaskGraphFailureReport = Readonly<{ criterionIds: readonly string[]; report: TaskGraphVerificationReport }>
 

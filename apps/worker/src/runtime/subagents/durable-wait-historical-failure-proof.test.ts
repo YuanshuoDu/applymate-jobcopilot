@@ -58,6 +58,14 @@ describe("readConsumedTaskGraphFailureReport", () => {
     expect(f.query).toHaveBeenCalledTimes(1)
   })
 
+  it("accepts the full persisted task row used by consumed-wait replay", async () => {
+    const f = fixture(), persistedTask = { ...f.task, sessionId: scope.sessionId, rootTaskId: scope.rootTaskId,
+      leaseOwnerId: "worker-1", updatedAt: new Date("2026-10-26T10:00:00.000Z") }
+    await expect(readConsumedTaskGraphFailureReport(f.client, { scope, task: persistedTask, archivedReport: f.taskReport }))
+      .resolves.toEqual({ criterionIds: ["candidate-count"], report: f.taskReport })
+    expect(f.query).toHaveBeenCalledTimes(1)
+  })
+
   it("accepts the serialized report-only and explicit-null no-output envelopes", async () => {
     const reportOnly = fixture(), explicitNull = fixture({ role: "analyst", result: { workerResult: null, taskGraphVerificationReport: report("finding-count") } })
     await expect(readConsumedTaskGraphFailureReport(reportOnly.client, { scope, task: reportOnly.task, archivedReport: reportOnly.taskReport })).resolves.toMatchObject({ criterionIds: ["candidate-count"] })

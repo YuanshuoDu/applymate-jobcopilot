@@ -841,19 +841,22 @@ async function failQueuedTypedTask(pool: PgPool, value: Fixture, taskId: string,
   if (result !== "failed") throw new Error("Failed-branch fixture did not terminalize through Worker finish")
 }
 
-async function failQueuedOperationalTask(pool: PgPool, value: Fixture, taskId: string, ownerId: string): Promise<void> {
+type OperationalResumeFailureReason = "child_resume_unavailable" | "child_resume_evidence_unavailable"
+
+async function failQueuedOperationalTask(pool: PgPool, value: Fixture, taskId: string, ownerId: string,
+  failureReason: OperationalResumeFailureReason = "child_resume_unavailable"): Promise<void> {
   const store = new PgSubagentTaskStore(pool)
   const claimed = await store.claim({ taskId, sessionId: value.sessionId, ownerId,
     policy: { maxConcurrency: 8, maxDepth: 8, maxFanOut: 8, maxAttempts: 2 }, now: new Date() })
   if (!claimed || claimed.status !== "running") throw new Error("Operational-failure fixture could not claim its typed task")
   const result = await store.finish({ taskId, sessionId: value.sessionId, ownerId, attemptCount: claimed.attemptCount,
-    status: "failed", retryDisposition: "terminal", failureReason: "child_resume_unavailable", result: null, now: new Date() })
+    status: "failed", retryDisposition: "terminal", failureReason, result: null, now: new Date() })
   if (result !== "failed") throw new Error("Operational-failure fixture did not persist the canonical failure")
 }
 
 async function prepareOperationalFailureReplan(pool: PgPool, commandPool: PgPool, roleName: string, value: Fixture,
   shape: "scout_leaf" | "analyst_leaf" | "scout_analyst_closure",
-  options: Readonly<{ leaveDependentWaiting?: boolean }> = {}) {
+  options: Readonly<{ leaveDependentWaiting?: boolean; failureReason?: OperationalResumeFailureReason }> = {}) {
   await seed(pool, value)
   const templates = { scout: TASK_GRAPH_TEMPLATES.scout, analyst: TASK_GRAPH_TEMPLATES.analyst }
   const allowedActions = [...new Set(["agent.plan", ...Object.values(templates).flatMap(template => template.allowedActions)])]
@@ -864,6 +867,7 @@ async function prepareOperationalFailureReplan(pool: PgPool, commandPool: PgPool
     planRevision: 0, consumedInputIds: [] })
   const scout = { key: "resume-scout", templateId: "scout", goal: "Find candidates", successCriteria: ["Find one candidate"],
     dependsOn: [], verification: BRANCH_SCOUT_VERIFICATION }
+  const failureReason = options.failureReason ?? "child_resume_unavailable"
   const analyst = (key: string, dependsOn: string[]) => ({ key, templateId: "analyst", goal: "Score candidates",
     successCriteria: ["Score one candidate"], dependsOn, verification: dependsOn.length ? branchAnalystVerification(dependsOn[0]!) : ANALYST_VERIFICATION })
   const sourceDefinitions = shape === "scout_leaf" ? [scout] : shape === "analyst_leaf" ? [analyst("resume-analyst", [])] : [scout, analyst("resume-analyst", [scout.key])]
@@ -921,7 +925,7 @@ async function prepareOperationalFailureReplan(pool: PgPool, commandPool: PgPool
       FOR EACH ROW EXECUTE FUNCTION public."${functionName}"('${heldDependent!.taskId}')`)
   }
   try {
-    await failQueuedOperationalTask(commandPool, value, failedRoot.taskId, `worker-fail-operational-source-${randomUUID()}`)
+    await failQueuedOperationalTask(commandPool, value, failedRoot.taskId, `worker-fail-operational-source-${randomUUID()}`, failureReason)
   } finally {
     if (triggerName && functionName) {
       await pool.query(`DROP TRIGGER IF EXISTS "${triggerName}" ON public."sub_agent_tasks"`)
@@ -972,7 +976,7 @@ async function prepareOperationalFailureReplan(pool: PgPool, commandPool: PgPool
   await pool.query(`UPDATE "agent_steps" SET "inputTokens" = 47, "outputTokens" = 13, "estimatedCostUsd" = 0.0042 WHERE "id" = $1 AND "turnId" = $2 AND "sessionId" = $3`,
   [value.laterStepId, value.turnId, value.sessionId])
   return { pool, command, value, templates, scope, current, sourceNodes, sourceTaskIds: sourceNodes.map(node => node.taskId),
-    failedRoot, input, operation, rawCallInput }
+    failedRoot, failureReason, input, operation, rawCallInput }
 }
 
 async function prepareFailedBranchReplan(pool: PgPool, commandPool: PgPool, roleName: string, value: Fixture,
@@ -3402,23 +3406,51 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
   }, 60_000)
 
   it.each([
-    { label: "a Scout leaf", shape: "scout_leaf" as const },
-    { label: "an Analyst leaf", shape: "analyst_leaf" as const },
-    { label: "the complete Scout and Analyst closure", shape: "scout_analyst_closure" as const },
-  ])("replaces $label at the eight-node limit and restores only an exact stored replay", async ({ shape }) => {
+    { label: "a Scout leaf after child_resume_unavailable", shape: "scout_leaf" as const,
+      failureReason: "child_resume_unavailable" as const, role: "scout", taskType: "job_discovery" },
+    { label: "a Scout leaf after child_resume_evidence_unavailable", shape: "scout_leaf" as const,
+      failureReason: "child_resume_evidence_unavailable" as const, role: "scout", taskType: "job_discovery" },
+    { label: "an Analyst leaf after child_resume_unavailable", shape: "analyst_leaf" as const,
+      failureReason: "child_resume_unavailable" as const, role: "analyst", taskType: "job_analysis" },
+    { label: "an Analyst leaf after child_resume_evidence_unavailable", shape: "analyst_leaf" as const,
+      failureReason: "child_resume_evidence_unavailable" as const, role: "analyst", taskType: "job_analysis" },
+    { label: "the complete Scout and Analyst closure after child_resume_unavailable", shape: "scout_analyst_closure" as const,
+      failureReason: "child_resume_unavailable" as const, role: "scout", taskType: "job_discovery" },
+  ])("replaces $label at the eight-node limit and restores only an exact stored replay", async ({ shape, failureReason, role, taskType }) => {
     const value = fixture()
     additionalFixtures.push(value)
-    const prepared = await prepareOperationalFailureReplan(adminPool!, commandPool!, roleName, value, shape)
+    const prepared = await prepareOperationalFailureReplan(adminPool!, commandPool!, roleName, value, shape, { failureReason })
+    expect(prepared.failedRoot.templateId).toBe(role)
     expect(prepared.current.nodes).toHaveLength(8)
     const rootBefore = await failedBranchImmutableRows(adminPool!, value, [prepared.failedRoot.taskId])
     const descendants = prepared.sourceTaskIds.filter(taskId => taskId !== prepared.failedRoot.taskId)
     const priorIds = new Set(prepared.current.nodes.filter(node => descendants.includes(node.taskId) && node.status === "cancelled")
       .map(node => node.taskId))
     const newCancellationCount = descendants.filter(taskId => !priorIds.has(taskId)).length
-    const beforeRows = await adminPool!.query<{ id: string; status: string; attemptCount: number }>(
-      `SELECT "id", "status", "attemptCount" FROM "sub_agent_tasks" WHERE "id" = ANY($1::text[]) ORDER BY "id"`,
+    const beforeRows = await adminPool!.query<{ id: string; status: string; attemptCount: number; role: string;
+      taskType: string; failureReason: string | null }>(
+      `SELECT "id", "status", "attemptCount", "role", "taskType", "failureReason"
+       FROM "sub_agent_tasks" WHERE "id" = ANY($1::text[]) ORDER BY "id"`,
       [prepared.sourceTaskIds])
-    expect(beforeRows.rows.find(row => row.id === prepared.failedRoot.taskId)).toMatchObject({ status: "failed", attemptCount: 1 })
+    expect(beforeRows.rows.find(row => row.id === prepared.failedRoot.taskId)).toMatchObject({
+      status: "failed", attemptCount: 1, role, taskType, failureReason,
+    })
+    const failureKey = taskGraphLifecycleKey(value.rootTaskId, prepared.failedRoot.key, 1, "task.failed")
+    const failureEvent = await adminPool!.query<{ id: string; type: string; actor: string; taskId: string;
+      idempotencyKey: string; payload: unknown }>(
+      `SELECT "id", "type", "actor", "taskId", "idempotencyKey", "payload" FROM "agent_events"
+       WHERE "sessionId" = $1 AND "turnId" = $2 AND "idempotencyKey" = $3`,
+      [value.sessionId, value.turnId, failureKey])
+    expect(failureEvent.rows).toHaveLength(1)
+    expect(failureEvent.rows[0]).toMatchObject({ type: "item.delta", actor: "system",
+      taskId: prepared.failedRoot.taskId, idempotencyKey: failureKey,
+      payload: { kind: "lifecycle", event: { type: "task.failed", failureReason } },
+    })
+    const failureOutbox = await adminPool!.query<{ topic: string; aggregateId: string; idempotencyKey: string }>(
+      `SELECT "topic", "aggregateId", "idempotencyKey" FROM "agent_outbox" WHERE "idempotencyKey" = $1`,
+      [`agent-event:${failureEvent.rows[0]!.id}`])
+    expect(failureOutbox.rows).toEqual([{ topic: "agent.session.event", aggregateId: value.sessionId,
+      idempotencyKey: `agent-event:${failureEvent.rows[0]!.id}` }])
     for (const taskId of descendants) expect(beforeRows.rows.find(row => row.id === taskId)).toMatchObject({ status: "cancelled", attemptCount: 0 })
 
     const accepted = await prepared.command.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation)
@@ -3471,7 +3503,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     }))
     expect(relation).toMatchObject({ graphRootTaskId: value.rootTaskId, resultingRevision: accepted.revision,
       failedSource: { source: { nodeKey: prepared.failedRoot.key, taskId: prepared.failedRoot.taskId },
-        attemptCount: 1, failureReason: "child_resume_unavailable" },
+        attemptCount: 1, failureReason },
       sources: expect.arrayContaining(prepared.sourceNodes.map(node => expect.objectContaining({
         source: { nodeKey: node.key, taskId: node.taskId }, replacementKey: `replacement-${node.key}`,
       }))),
