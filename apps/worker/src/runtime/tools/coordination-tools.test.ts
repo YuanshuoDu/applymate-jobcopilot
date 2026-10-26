@@ -150,6 +150,7 @@ describe("coordination tool definitions", () => {
     expect(listDescription).toContain("fresh ordinary Scout jobs.get")
     expect(listDescription).toContain("sourceToken binds pages only")
     expect(listDescription).toContain("establish global discovery completeness")
+    expect(listDescription).toContain("analysisSummary, which is advisory and never verification evidence")
     const spawnDescription = registry.resolve("agent.spawn", "1").description
     const followupDescription = registry.resolve("agent.followup", "1").description
     expect(spawnDescription).toContain("eight-node limit on the current graph snapshot, including retained terminal nodes")
@@ -200,6 +201,16 @@ describe("coordination tool definitions", () => {
     }
     expect(() => registry.validators.validate(definitions.find(tool => tool.name === "agent.list")!.outputSchema, page, "agent.list output")).not.toThrow()
     expect(() => registry.validators.validate(definitions.find(tool => tool.name === "list_subagents")!.outputSchema, page, "list_subagents output")).toThrow()
+    const analystPage = {
+      schemaVersion: TASK_GRAPH_RESULT_PAGE_SCHEMA, trust: "untrusted", availability: "available", graphRevision: 2,
+      role: "analyst", taskStatus: "completed", resultStatus: "completed", totalCount: 1, evidenceCount: 1,
+      offset: 0, nextOffset: null, analysisSummary: "Advisory only", analysisSummaryTruncated: false,
+      items: [{ jobId: "00000000-0000-4000-8000-000000000000", score: 8, evidenceKinds: ["job"] }],
+    }
+    expect(() => registry.validators.validate(definitions.find(tool => tool.name === "agent.list")!.outputSchema,
+      analystPage, "agent.list Analyst output")).not.toThrow()
+    expect(() => registry.validators.validate(definitions.find(tool => tool.name === "list_subagents")!.outputSchema,
+      analystPage, "list_subagents Analyst output")).toThrow()
     const historicalPage = {
       schemaVersion: TASK_GRAPH_HISTORICAL_DISCOVERY_PAGE_SCHEMA, trust: "untrusted", availability: "available",
       observation: "historical_discovery", verificationStatus: "unverified", sourceToken: "a".repeat(64),
