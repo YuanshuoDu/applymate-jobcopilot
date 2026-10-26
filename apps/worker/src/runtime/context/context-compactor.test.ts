@@ -188,4 +188,34 @@ describe("ContextCompactor", () => {
     expect(result).toMatchObject({ status: "skipped", item: null })
     expect(runtime.recordStarted).not.toHaveBeenCalled()
   })
+
+  it("applies an input-only reserve to the trigger without adding it to narrative or token measurements", async () => {
+    const oneItemSource: CompactionSource = { state: { ...source.state, throughSequence: source.items[1]!.sequence }, items: [source.items[1]!] }
+    const collection = collectCompactionState(oneItemSource)
+    const reserve = 100
+    const policy = { inputTokenThreshold: collection.beforeInputTokens + reserve, itemCountThreshold: 2, compactAtTurnBoundary: false }
+    const runtime = port()
+    const received: string[] = []
+    const result = await new ContextCompactor(runtime, input => { received.push(input.narrativeText); return "short summary" }, () => "compaction-item")
+      .compact(request({ source: oneItemSource, policy, additionalInputTokens: reserve }))
+
+    expect(result).toMatchObject({ status: "compacted", trigger: { reason: "input_tokens" } })
+    expect(received).toEqual([collection.narrativeText])
+    expect(result.tokenMeasurement?.beforeInputTokens).toBe(collection.coveredInputTokens)
+    expect(result.item?.data).toMatchObject({ reason: "input_tokens", beforeInputTokens: collection.coveredInputTokens })
+    expect(runtime.publishAtomically).toHaveBeenCalledOnce()
+
+    const belowRuntime = port()
+    const below = await new ContextCompactor(belowRuntime, () => "must not run").compact(request({
+      source: oneItemSource, policy, additionalInputTokens: reserve - 1,
+    }))
+    expect(below).toMatchObject({ status: "skipped", trigger: { shouldCompact: false, reason: null }, item: null })
+    expect(belowRuntime.recordStarted).not.toHaveBeenCalled()
+  })
+
+  it.each([-1, 1.5, Number.MAX_SAFE_INTEGER])("rejects an invalid or overflowing input reserve %s", async additionalInputTokens => {
+    const oneItemSource: CompactionSource = { state: { ...source.state, throughSequence: source.items[1]!.sequence }, items: [source.items[1]!] }
+    await expect(new ContextCompactor(port(), () => "unused").compact(request({ source: oneItemSource, additionalInputTokens })))
+      .rejects.toMatchObject({ code: "invalid_source" })
+  })
 })
