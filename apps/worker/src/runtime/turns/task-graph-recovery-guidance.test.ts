@@ -48,6 +48,17 @@ function ordinaryFailedNode(failureReason: string | null = null): TaskGraphCurre
   return { ...extraNode(99), key: "ordinary-failed", taskId: "ordinary-failed-task", status: "failed", readiness: "terminal", failureReason }
 }
 
+function resumeFailedNode(role: "scout" | "analyst" = "scout"): TaskGraphCurrentNode {
+  const criterionId = role === "scout" ? "candidate-count" : "finding-count"
+  return {
+    ...ordinaryFailedNode("child_resume_unavailable"), templateId: role,
+    verificationCriterionIds: [criterionId], verification: role === "scout" ? CHECK : ANALYST_CHECK,
+    verificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "result_invalid",
+      criteria: [{ criterionId, status: "unverified", reasonCode: "result_invalid" }],
+      evidenceDigest: null, resultDigest: null },
+  }
+}
+
 function structuredFailureNode(
   category?: NonNullable<TaskGraphCurrentNode["structuredOutputFailureCategory"]>, role: "scout" | "analyst" = "scout",
 ): TaskGraphCurrentNode {
@@ -268,7 +279,8 @@ describe("TaskGraph recovery guidance", () => {
       ["invalid_structured_result", "structured_output_invalid"],
     ] as const
     for (const [reason, category] of examples) {
-      const context = contextFor({ nodes: [sourceNode(), ordinaryFailedNode(reason)] })
+      const failureNode = reason === "child_resume_unavailable" ? resumeFailedNode() : ordinaryFailedNode(reason)
+      const context = contextFor({ nodes: [sourceNode(), failureNode] })
       const expectedGuidance = buildTaskGraphRecoveryInstruction(context, tools, ROOT_ID)
       const request = buildModelRequest({ context, model, tools, sessionId: "session", turnId: "turn", stepId: "step-resume",
         userId: "user", taskId: ROOT_ID, signal: new AbortController().signal })
@@ -291,6 +303,37 @@ describe("TaskGraph recovery guidance", () => {
     const categoryContext = contextFor({ nodes: [ordinaryFailedNode("selected_job_context_unavailable")] })
     const withoutMarker = { ...categoryContext, blocks: categoryContext.blocks.filter(block => !block.id.startsWith("system:completion-recovery:task-graph:")) }
     expect(buildTaskGraphRecoveryInstruction(withoutMarker, tools, ROOT_ID)).toBeNull()
+  })
+
+  it("preserves only canonical Scout or Analyst resume failures beside matching typed-denial guidance", () => {
+    const tools = [{ name: "agent.list" }, { name: "agent.plan" }]
+    const context = contextFor({ nodes: [sourceNode(), resumeFailedNode()] })
+    const graphBlock = context.blocks.find(block => block.id === `observation:${CURRENT_GRAPH_ID}`)!
+    const graph = graphBlock.content as unknown as { nodes: TaskGraphCurrentNode[] }
+    const resume = graph.nodes[1]!
+    expect(resume.executionFailureCategory).toBe("resume_state_unavailable")
+    expect(resume.verificationReport).toEqual(resumeFailedNode().verificationReport)
+    expect(buildTaskGraphRecoveryInstruction(context, tools, ROOT_ID)).not.toBeNull()
+    expect(buildTaskGraphRecoveryInstruction(contextFor({ nodes: [sourceNode(), resumeFailedNode("analyst")] }), tools, ROOT_ID)).not.toBeNull()
+
+    const currentReport = resume.verificationReport!
+    const criterion = currentReport.criteria[0]!
+    const { verificationReport: _report, ...withoutReport } = resume
+    const rejected = [
+      withoutReport,
+      { ...resume, templateId: "writer" },
+      { ...resume, verificationReport: { ...currentReport, reasonCode: "contract_invalid",
+        criteria: [{ ...criterion, reasonCode: "contract_invalid" }] } },
+      { ...resume, verificationReport: { ...currentReport, criteria: [{ ...criterion, status: "failed" }] } },
+      { ...resume, verificationReport: report("passed") },
+      { ...resume, verificationReport: { ...currentReport, criteria: [{ ...criterion, criterionId: "other-criterion" }] } },
+      { ...resume, executionFailureCategory: "structured_output_invalid" },
+      { ...resume, native: {} },
+      { ...resume, nativeResult: {} },
+    ]
+    for (const row of rejected) {
+      expect(buildTaskGraphRecoveryInstruction(replaceGraphNode(context, 1, row), tools, ROOT_ID)).toBeNull()
+    }
   })
 
   it("rejects malformed, nonfailed, verified, native, inherited, and accessor category fields", () => {

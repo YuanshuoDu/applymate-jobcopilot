@@ -1192,7 +1192,16 @@ describe("createCanonicalTurnRuntime", () => {
       revision: 12,
       nodes: [
         failedNode("setup-failed", "child-setup", "selected_job_context_unavailable"),
-        failedNode("resume-failed", "child-resume", "child_resume_unavailable"),
+        {
+          ...failedNode("resume-failed", "child-resume", "child_resume_unavailable"),
+          verification,
+          verificationCriterionIds: ["candidate-count"],
+          verificationReport: {
+            verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "result_invalid",
+            criteria: [{ criterionId: "candidate-count", status: "unverified", reasonCode: "result_invalid" }],
+            evidenceDigest: null, resultDigest: null,
+          },
+        },
         failedNode("output-failed", "child-output", "invalid_structured_result"),
         { ...failedNode("unknown-failed", "child-unknown", privateReason), executionFailureCategory: "execution_setup_unavailable" },
         { ...failedNode("nonfailed-known-reason", "child-nonfailed", "selected_job_context_unavailable"), status: "completed", readiness: "terminal" },
