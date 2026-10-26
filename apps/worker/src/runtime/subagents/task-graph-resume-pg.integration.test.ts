@@ -9986,7 +9986,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let canonicalExecutionDiagnostic = "not_observed"
     let finalGraphVerified = false
     let replacementWaitResumePath: "same_adapter" | "fresh_adapter" | null = null
-    let modelStreamFailureDiagnostic: string | null = null
     const flags: ProductionAgentFlags = {
       taskGraphPlanningEnabled: true, childExecutionEnabled: true, coordinationEnabled: true,
       consumeWaitOutcomes: true, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false,
@@ -10120,14 +10119,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       modelRuntimeFactory: () => {
         const execution = ++rootExecutions
         let round = 0
-        let modelStreamStage = "not_started"
         const adapter: ModelAdapter = {
           id: "p3-operational-failure-replan-root-fixture", profile,
           async *stream(request) {
             round += 1
-            modelStreamStage = "execution_round_dispatch"
             if (execution === 1 && round === 1) {
-              modelStreamStage = "initial_plan_emission"
               yield { type: "tool_call_completed", callId: planCallId, name: "agent.plan", arguments: {
                 expectedRevision: 0,
                 nodes: [
@@ -10141,7 +10137,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               return
             }
             if (execution === 1 && round === 2) {
-              modelStreamStage = "initial_wait_emission"
               const initialPlanTaskIds = planTaskIds(request, planCallId, initialIndependent ? 3 : 2)
               initialTaskIds = initialPlanTaskIds.slice(0, 2)
               if (initialIndependent) independentTaskId = initialPlanTaskIds[2]!
@@ -10158,7 +10153,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               return
             }
             if (execution === 2 && round === 1) {
-              modelStreamStage = "recovered_failure_observation"
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
               expect(nodes.slice(0, 2).map(node => [node?.key, node?.status])).toEqual([["scout", "failed"], ["analyst", "cancelled"]])
@@ -10243,7 +10237,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               }
               expect(request.tools.map(tool => record(tool)?.name)).toContain("agent.wait")
               if (appendIndependent) {
-                modelStreamStage = "independent_append_emission"
                 if (!graph || typeof graph.revision !== "number") throw new Error("Operational failure append lost the current graph revision")
                 appendExpectedRevision = graph.revision
                 yield { type: "tool_call_completed", callId: appendCallId, name: "agent.plan", arguments: {
@@ -10254,7 +10247,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 yield { type: "completed", finishReason: "tool_calls" }
                 return
               }
-              modelStreamStage = "inline_wait_emission"
               yield { type: "tool_call_completed", callId: inlineWaitCallId, name: "agent.wait", arguments: {
                 idempotencyKey: inlineWaitKey, taskIds: initialTaskIds, mode: "all", timeoutMs: 30_000,
               } }
@@ -10262,7 +10254,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               return
             }
             if (execution === 2 && round === 2 && appendIndependent) {
-              modelStreamStage = "independent_append_receipt"
               const appendResult = record(latestToolResult(request, appendCallId))
               expect(appendResult?.status).toBe("accepted")
               independentTaskId = planTaskIds(request, appendCallId, 1)[0]!
@@ -10305,7 +10296,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               appendEventId = appendReceipt.id
               appendEventSequence = appendReceipt.sequence
               await waitForTaskStatus(independentTaskId, "completed")
-              modelStreamStage = "inline_wait_after_append_emission"
               yield { type: "tool_call_completed", callId: inlineWaitCallId, name: "agent.wait", arguments: {
                 idempotencyKey: inlineWaitKey, taskIds: initialTaskIds, mode: "all", timeoutMs: 30_000,
               } }
@@ -10313,7 +10303,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               return
             }
             if (execution === 2 && round === inlineWaitObserveRound) {
-              modelStreamStage = "inline_wait_resume_and_replan"
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
               expect(nodes.map(node => [node?.key, node?.status])).toEqual([
@@ -10367,14 +10356,14 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               })).toBe(consumedFailureWaitSnapshot)
               inlineFailureWaitObserved = true
               if (!graph || typeof graph.revision !== "number") throw new Error("Operational failure fixture lost the current graph revision")
-              observedGraphRevision = graph.revision
               observedGraphSnapshot = graph
               observedIndependentNode = nodes.find(node => node?.key === "independent") ?? null
               expect(observedIndependentNode?.taskId).toBe(independentTaskId)
               expect(observedIndependentNode?.status).toBe("completed")
-              modelStreamStage = "replacement_plan_emission"
+              const replacementExpectedRevision = graph.revision
+              observedGraphRevision = replacementExpectedRevision
               yield { type: "tool_call_completed", callId: replacementPlanCallId, name: "agent.plan", arguments: {
-                expectedRevision: graph.revision,
+                expectedRevision: replacementExpectedRevision,
                 replaceOperationalFailure: {
                   root: { nodeKey: "scout", taskId: initialTaskIds[0] },
                   sources: [
@@ -10391,32 +10380,31 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               return
             }
             if (execution === 2 && round === replacementAcceptedRound) {
-              modelStreamStage = "replacement_plan_result"
               const planResult = record(latestToolResult(request, replacementPlanCallId))
               replacementPlanResultDiagnostic = `${safeLabel(planResult?.status)}/${safeLabel(planResult?.errorCode ?? planResult?.code)}`
-              modelStreamStage = "replacement_plan_task_receipt"
               replacementTaskIds = planTaskIds(request, replacementPlanCallId, 2)
-              modelStreamStage = "replacement_graph_read"
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
-              modelStreamStage = "replacement_graph_node_count"
               expect(nodes).toHaveLength(3)
               const replacementScout = nodes.find(node => node?.key === "scout-replacement")
               const replacementAnalyst = nodes.find(node => node?.key === "analyst-replacement")
               const independent = nodes.find(node => node?.key === "independent")
-              modelStreamStage = "replacement_graph_task_ids"
+              // The receipt captures acceptance state; child claims may advance the later graph snapshot.
+              const acceptedNodes = Array.isArray(planResult?.nodes) ? planResult.nodes.map(record) : []
+              expect(acceptedNodes).toHaveLength(2)
+              expect(acceptedNodes).toEqual(expect.arrayContaining([
+                expect.objectContaining({ key: "scout-replacement", taskId: replacementTaskIds[0], status: "queued" }),
+                expect.objectContaining({ key: "analyst-replacement", taskId: replacementTaskIds[1], status: "waiting" }),
+              ]))
+              if (observedGraphRevision === null) throw new Error("Replacement plan lost its exact expected revision")
+              expect(planResult?.revision).toBe(observedGraphRevision + 1)
               expect(replacementScout?.taskId).toBe(replacementTaskIds[0])
               expect(replacementAnalyst?.taskId).toBe(replacementTaskIds[1])
-              modelStreamStage = "replacement_graph_statuses"
-              expect(["queued", "running"]).toContain(replacementScout?.status)
-              expect(replacementAnalyst?.status).toBe("waiting")
+              expect(["queued", "running", "completed"]).toContain(replacementScout?.status)
+              expect(["waiting", "queued", "running", "completed"]).toContain(replacementAnalyst?.status)
               expect(replacementAnalyst?.dependsOn).toEqual(["scout-replacement"])
-              modelStreamStage = "replacement_graph_independent_node"
               expect(independent).toEqual(observedIndependentNode)
-              modelStreamStage = "replacement_graph_revision"
-              expect(graph?.revision).toBe((observedGraphRevision ?? -2) + 1)
               replacementPlanAccepted = true
-              modelStreamStage = "replacement_wait_emission"
               yield { type: "tool_call_completed", callId: replacementWaitCallId, name: "agent.wait", arguments: {
                 idempotencyKey: replacementWaitKey, taskIds: replacementTaskIds, mode: "all", timeoutMs: 30_000,
               } }
@@ -10426,7 +10414,6 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             // A durable wait may resume the same adapter or create a fresh one.
             // Both paths must consume the replacement wait result and verify the new graph.
             if ((execution === 2 && round === replacementAcceptedRound + 1) || (execution === 3 && round === 1)) {
-              modelStreamStage = "replacement_wait_resume_verification"
               const outcome = repairWaitOutcomeFromRequest(request, replacementWaitCallId, replacementTaskIds)
               expect(outcome.status).toBe("ready")
               const waitTaskStatuses = new Map<string, unknown>()
@@ -10452,21 +10439,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               yield { type: "completed", finishReason: "stop" }
               return
             }
-            modelStreamStage = "unexpected_execution_round"
             throw new Error(`Unexpected operational failure Root execution ${execution}/${round}`)
           },
         }
-        return {
-          adapter: captureModelStreamFailure(adapter, error => {
-            if (modelStreamFailureDiagnostic !== null) return
-            const summary = childFixtureErrorSummary(error).replace(/[\r\n\t]+/g, " ")
-            modelStreamFailureDiagnostic = boundedDiagnostic(
-              `execution=${execution};round=${round};stage=${modelStreamStage};error=${summary}`, 512,
-            )
-          }),
-          registry: {} as never,
-          candidates: [],
-        }
+        return { adapter, registry: {} as never, candidates: [] }
       },
     })
     const canonicalRuntimeExecute = runtime.execute
@@ -10520,7 +10496,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       await waitForTurnStatus(pool!, value.turnId, "completed", 90_000, replacementWaitCallId)
     } catch (error) {
       const reason = error instanceof Error ? error.message : "Turn status wait failed"
-      throw new Error(reason + "; replacementPlanCommand=" + replacementPlanCommandDiagnostic + "; replacementPlanResult=" + replacementPlanResultDiagnostic + "; canonicalExecution=" + canonicalExecutionDiagnostic + "; rootExecutions=" + rootExecutions + "; modelStreamFailure=" + (modelStreamFailureDiagnostic ?? "not_observed"))
+      throw new Error(reason + "; replacementPlanCommand=" + replacementPlanCommandDiagnostic + "; replacementPlanResult=" + replacementPlanResultDiagnostic + "; canonicalExecution=" + canonicalExecutionDiagnostic + "; rootExecutions=" + rootExecutions)
     }
     const turn = await pool!.query<{ rootTaskId: string | null; finalResponse: string | null; status: string }>(
       `SELECT "rootTaskId", "finalResponse", "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`,
