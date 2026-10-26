@@ -56,7 +56,7 @@ import { PgSubagentTaskStore } from "./pg-store.js"
 import { defaultSubagentPolicy, parseSubagentJobPayload, type SubagentLease, type SubagentTaskRecord } from "./types.js"
 import { subagentDispatchJobId } from "./dispatch-identity.js"
 import { drainTaskGraphStopOutbox, TASK_GRAPH_STOP_OUTBOX_TOPIC } from "./task-graph-stop-outbox.js"
-import { parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey, taskGraphProposalKey } from "./task-graph-snapshot.js"
+import { TASK_GRAPH_SNAPSHOT_VERSION, parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey, taskGraphProposalKey } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./task-graph-final-summary-binding.js"
 import { parseStoredTaskGraphVerificationReport } from "./task-graph-verification-report.js"
 import { rootRecoveryEligibility } from "./task-graph-pg-lifecycle.js"
@@ -10624,15 +10624,38 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       outboxIdempotencyKey: `agent-event:${observedReceipt.id}` })
     expect(observedPayload).toMatchObject({ kind: "lifecycle", revision: observedGraphRevision,
       event: { type: "task.completed", nodeKey: "independent" } })
-    const persistedObservedSnapshot = record(record(observedPayload?.item)?.content)
-    const persistedObservedNodes = Array.isArray(persistedObservedSnapshot?.nodes) ? persistedObservedSnapshot.nodes.map(record) : []
-    expect(persistedObservedNodes).toHaveLength(3)
-    expect(persistedObservedNodes.map(node => [node?.key, node?.taskId, node?.status])).toEqual(expect.arrayContaining([
+    const observedReceiptItem = record(observedPayload?.item)
+    expect(observedReceiptItem?.revision).toBe(observedGraphRevision)
+    const persistedObservedSnapshotContent = record(observedReceiptItem?.content)
+    const rawPersistedObservedNodes = Array.isArray(persistedObservedSnapshotContent?.nodes)
+      ? persistedObservedSnapshotContent.nodes.map(record) : []
+    const requestObservedSnapshot = observedGraphSnapshot
+    const requestObservedNodes = Array.isArray(requestObservedSnapshot?.nodes) ? requestObservedSnapshot.nodes.map(record) : []
+    expect(requestObservedSnapshot?.kind).toBe("task_graph_current")
+    expect(requestObservedSnapshot?.revision).toBe(observedGraphRevision)
+    expect(requestObservedNodes.map(node => [node?.key, node?.taskId, node?.status])).toEqual([
       ["scout", initialTaskIds[0], "failed"], ["analyst", initialTaskIds[1], "cancelled"],
       ["independent", independentTaskId, "completed"],
-    ]))
-    const requestObservedSnapshot = observedGraphSnapshot as RecordValue | null
-    expect(requestObservedSnapshot?.revision).toBe(observedGraphRevision)
+    ])
+    expect(rawPersistedObservedNodes).toHaveLength(3)
+    expect(rawPersistedObservedNodes.every(node => node !== null
+      && !Object.hasOwn(node, "status") && !Object.hasOwn(node, "failureReason"))).toBe(true)
+    const persistedObservedSnapshot = parseTaskGraphSnapshot(persistedObservedSnapshotContent)
+    expect(persistedObservedSnapshot.schemaVersion).toBe(TASK_GRAPH_SNAPSHOT_VERSION)
+    expect(persistedObservedSnapshot.nodes).toHaveLength(3)
+    const snapshotNodeStructure = (value: unknown) => {
+      const node = record(value)
+      return {
+        key: node?.key, taskId: node?.taskId, templateId: node?.templateId, goal: node?.goal,
+        successCriteria: node?.successCriteria, dependsOn: node?.dependsOn,
+        verificationDisposition: node?.verification ? "typed" : "legacy_unverified",
+        ...(node?.verification ? { verification: node.verification } : {}),
+        ...(node?.repairOf ? { repairOf: node.repairOf } : {}),
+      }
+    }
+    expect(persistedObservedSnapshot.nodes.map(node => snapshotNodeStructure(node))).toEqual(
+      requestObservedNodes.map(snapshotNodeStructure),
+    )
     expect(record(observedReceipt.outboxPayload)).toEqual({ eventId: observedReceipt.id, sessionId: value.sessionId,
       turnId: value.turnId, itemId: observedReceipt.itemId, taskId: observedReceipt.taskId, sequence: observedReceipt.sequence,
       type: observedReceipt.eventType, actor: observedReceipt.actor, correlationId: observedReceipt.correlationId,
