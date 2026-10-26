@@ -93,6 +93,11 @@ describe("TaskGraph result page contract", () => {
     expect(parseTaskGraphResultPage(v1)).toBeNull()
     expect(parseTaskGraphResultPageV1({ ...v1, analysisSummary: "not part of v1" })).toBeNull()
     expect(parseTaskGraphResultPageV1({ ...v1, schemaVersion: TASK_GRAPH_RESULT_PAGE_SCHEMA })).toBeNull()
+    const unavailableV1 = {
+      schemaVersion: TASK_GRAPH_RESULT_PAGE_V1_SCHEMA, trust: "untrusted", availability: "unavailable",
+      graphRevision: 0, reason: "no_graph",
+    }
+    expect(parseTaskGraphResultPageV1(unavailableV1)).toEqual(unavailableV1)
   })
 
   it("rejects sparse arrays, symbol keys, proxies and cycles before validation reads them", () => {
