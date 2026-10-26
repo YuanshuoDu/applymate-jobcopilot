@@ -61,7 +61,8 @@ async function assertCurrentRootOwner(client: pg.PoolClient, input: OwnerInput):
 
 async function readEvent(client: pg.PoolClient, key: string): Promise<EventRow | null> {
   const result = await client.query<EventRow>(`SELECT "id","sessionId","turnId","taskId","sequence","type","actor","itemId",
-    "correlationId","causationId","idempotencyKey","payload" FROM "agent_events" WHERE "idempotencyKey"=$1 FOR UPDATE`, [key])
+    "correlationId","causationId","idempotencyKey","payload" FROM "agent_events"
+    WHERE "idempotencyKey"=$1 OR "id"=$2 FOR UPDATE`, [key, idempotencyId(key)])
   if (result.rows.length > 1) throw conflict()
   return result.rows[0] ?? null
 }
@@ -69,7 +70,7 @@ async function assertRetainedEventOwner(client: pg.PoolClient, row: EventRow, in
   const { lease } = input
   if (row.sessionId !== lease.sessionId || typeof row.turnId !== "string" || typeof row.taskId !== "string") throw conflict()
   const turn = await client.query<Row>(`SELECT "id" FROM "agent_turns"
-    WHERE "id"=$1 AND "sessionId"=$2 AND "userId"=$3`, [row.turnId, lease.sessionId, lease.userId])
+    WHERE "id"=$1 AND "sessionId"=$2 AND "userId"=$3 AND "rootTaskId"=$4`, [row.turnId, lease.sessionId, lease.userId, row.taskId])
   if (!turn.rows[0]) throw conflict()
   const task = await client.query<Row>(`SELECT task."id" FROM "sub_agent_tasks" task JOIN "agent_sessions" session
     ON session."id"=task."sessionId" AND session."userId"=$4 WHERE task."id"=$1 AND task."sessionId"=$2

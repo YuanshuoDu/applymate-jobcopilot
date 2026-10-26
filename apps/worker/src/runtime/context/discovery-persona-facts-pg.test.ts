@@ -72,6 +72,7 @@ function fakeReadPool(options: {
   readonly missingRoot?: boolean
   readonly missingRetainedTurn?: boolean
   readonly missingRetainedTask?: boolean
+  readonly mismatchedRetainedRoot?: boolean
 } = {}) {
   const queries: Array<{ sql: string; values: unknown[] }> = []
   const client = {
@@ -79,8 +80,9 @@ function fakeReadPool(options: {
       queries.push({ sql, values })
       if (sql.includes('FROM "agent_sessions"')) return { rows: options.missingSession ? [] : [{ id: lease.sessionId }], rowCount: options.missingSession ? 0 : 1 }
       if (sql.includes('FROM "agent_turns"')) {
-        const currentOwner = sql.includes('"rootTaskId"=$4')
+        const currentOwner = sql.includes('"rootTaskId"=$4') && sql.includes("FOR UPDATE")
         const missing = currentOwner ? options.missingTurn : options.missingRetainedTurn
+          || options.mismatchedRetainedRoot && sql.includes('"rootTaskId"=$4')
         return { rows: missing ? [] : [{ id: currentOwner ? lease.turnId : String(values[0]) }], rowCount: missing ? 0 : 1 }
       }
       if (sql.includes('FROM "sub_agent_tasks"')) {
@@ -89,8 +91,8 @@ function fakeReadPool(options: {
         return { rows: missing ? [] : [{ id: currentOwner ? "root-a" : String(values[0]) }], rowCount: missing ? 0 : 1 }
       }
       if (sql.includes('FROM "agent_events"')) {
-        const row = options.events?.[String(values[0])]
-        return { rows: row ? [row] : [], rowCount: row ? 1 : 0 }
+        const rows = Object.values(options.events ?? {}).filter(event => event.idempotencyKey === values[0] || event.id === values[1])
+        return { rows, rowCount: rows.length }
       }
       if (sql.includes('FROM "agent_outbox"')) {
         const row = options.outboxes?.[String(values[0])] ?? Object.values(options.outboxes ?? {}).find(candidate => candidate.id === values[1])
@@ -195,6 +197,33 @@ describe("read-only discovery persona snapshot for compaction", () => {
       .toEqual(["turn-history", lease.sessionId, lease.userId])
     expect(fake.queries.find(query => query.sql.includes('FROM "sub_agent_tasks"') && !query.sql.includes('task."status"=\'running\''))?.values)
       .toEqual(["root-history", lease.sessionId, "turn-history", lease.userId])
+    noWritesOrFactReads(fake.queries)
+  })
+
+  it("rejects a retained historical Turn when its canonical Root differs from the event Root", async () => {
+    const event = historicalSnapshotEvent()
+    const fake = fakeReadPool({ events: { [snapshotKey]: event }, outboxes: { [`agent-event:${event.id}`]: outboxFixture(event) },
+      mismatchedRetainedRoot: true })
+
+    await expect(readDiscoveryPersonaSnapshotForCompaction(fake.pool, readInput)).rejects.toMatchObject({ code: "persistence_conflict" })
+    const historicalTurn = fake.queries.find(query => query.sql.includes('FROM "agent_turns"') && query.values[0] === "turn-history")
+    expect(historicalTurn?.sql).toContain('AND "rootTaskId"=$4')
+    expect(historicalTurn?.values).toEqual(["turn-history", lease.sessionId, lease.userId, "root-history"])
+    expect(fake.queries.some(query => query.sql.includes('FROM "sub_agent_tasks"') && !query.sql.includes('task."status"=\'running\'')))
+      .toBe(false)
+    expect(fake.queries.at(-1)?.sql).toBe("ROLLBACK")
+    noWritesOrFactReads(fake.queries)
+  })
+
+  it("rejects a deterministic retained event ID with a mismatched idempotency key", async () => {
+    const event = { ...retainedSnapshotEvent(), idempotencyKey: "corrupted-idempotency-key" }
+    const fake = fakeReadPool({ events: { orphanedEvent: event } })
+
+    await expect(readDiscoveryPersonaSnapshotForCompaction(fake.pool, readInput)).rejects.toMatchObject({ code: "persistence_conflict" })
+    const snapshotRead = fake.queries.find(query => query.sql.includes('FROM "agent_events"') && query.values[0] === snapshotKey)
+    expect(snapshotRead?.sql).toContain('OR "id"=$2')
+    expect(snapshotRead?.values).toEqual([snapshotKey, event.id])
+    expect(fake.queries.at(-1)?.sql).toBe("ROLLBACK")
     noWritesOrFactReads(fake.queries)
   })
 
