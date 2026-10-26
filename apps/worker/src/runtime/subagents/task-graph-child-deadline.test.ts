@@ -40,7 +40,7 @@ describe("TaskGraph child deadline contract", () => {
         taskId: "native-task", templateId: TASK_GRAPH_NATIVE_TEMPLATE_ID, verificationDisposition: "legacy_unverified",
         nativeDelegation: { schemaVersion: TASK_GRAPH_NATIVE_METADATA_VERSION, operationKind: "spawn",
           operationId: "native-migration-fixture", requestFingerprint: "a".repeat(64), callerTaskId: "root-task",
-          role: "analyst", taskType: "research", contextDigest: "b".repeat(64), contextBytes: 0 } },
+          role: "auditor", taskType: "native_verification", contextDigest: "b".repeat(64), contextBytes: 0 } },
     ] })
     expect(snapshot.nodes.map(node => node.taskId)).toEqual(["scout-task", "native-task"])
   })

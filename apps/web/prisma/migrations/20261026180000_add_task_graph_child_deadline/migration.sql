@@ -160,7 +160,6 @@ WITH valid_graph_items AS MATERIALIZED (
         WHERE owned."id" = node.value->>'taskId' AND owned."sessionId" = item."sessionId"
           AND owned."turnId" = item."turnId" AND owned."rootTaskId" = root."id"
           AND owned."parentTaskId" = parent."id" AND owned."role" <> 'orchestrator'
-          AND owned."taskType" <> 'native_verification'
       )
     )
 ), eligible_children AS (
@@ -172,7 +171,6 @@ WITH valid_graph_items AS MATERIALIZED (
       AND child."turnId" = graph."turnId" AND child."rootTaskId" = graph."rootTaskId"
       AND child."parentTaskId" = graph."parentTaskId"
   WHERE child."id" <> graph."rootTaskId" AND child."role" <> 'orchestrator'
-    AND child."taskType" <> 'native_verification'
     AND child."status" IN ('queued', 'running', 'retrying', 'waiting', 'waiting_for_user')
 )
 UPDATE "sub_agent_tasks" AS task

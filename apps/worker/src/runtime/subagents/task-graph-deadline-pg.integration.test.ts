@@ -316,7 +316,7 @@ withServices("TaskGraph deadline recovery on disposable PostgreSQL and Redis", (
     await pool!.query(`UPDATE "sub_agent_tasks" SET "allowedActions" = '["jobs.search"]'::jsonb,
         "expectedOutputSchema" = '{"schemaVersion":"${ROLE_RESULT_SCHEMA}","role":"scout"}'::jsonb WHERE "id" = $1`, [scoutId])
     await insertMigrationFixtureTask(pool!, { id: nativeId, fixture: ordinary.fixture, parentTaskId: ordinary.fixture.rootTaskId,
-      depth: 1, role: "analyst", taskType: "research", goal: "Native graph child" })
+      depth: 1, role: "auditor", taskType: "native_verification", goal: "Native graph child" })
     const ordinaryGraph = await readFixtureGraph(pool!, ordinary.fixture)
     ordinaryGraph.nodes.push({ dependsOn: [], depth: 1, goal: "Registered Scout graph child", key: "registered-scout",
       registeredScoutEnvelope: { allowedActions: ["jobs.search"], expectedOutputSchema: { role: "scout", schemaVersion: ROLE_RESULT_SCHEMA },
@@ -329,7 +329,7 @@ withServices("TaskGraph deadline recovery on disposable PostgreSQL and Redis", (
       taskId: nativeId, templateId: TASK_GRAPH_NATIVE_TEMPLATE_ID, verificationDisposition: "legacy_unverified",
       nativeDelegation: { schemaVersion: TASK_GRAPH_NATIVE_METADATA_VERSION, operationKind: "spawn",
         operationId: `native-migration-${ordinary.fixture.suffix}`, requestFingerprint: "a".repeat(64),
-        callerTaskId: ordinary.fixture.rootTaskId, role: "analyst", taskType: "research", contextDigest: "b".repeat(64), contextBytes: 0 } })
+        callerTaskId: ordinary.fixture.rootTaskId, role: "auditor", taskType: "native_verification", contextDigest: "b".repeat(64), contextBytes: 0 } })
     expect(parseTaskGraphSnapshot(ordinaryGraph).nodes).toHaveLength(5)
     await writeFixtureGraph(pool!, ordinary.fixture, ordinaryGraph)
 
