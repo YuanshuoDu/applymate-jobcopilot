@@ -196,6 +196,7 @@ export async function createCanonicalTurnRuntime(pool: pg.Pool, options: Canonic
       pool, store: inputStore, baseBuilder: options.contextBuilderFactory?.({ pool, scope: state.scope }), scope: state.scope, lease,
       rootTaskId: root.id, rootAttemptCount: root.attemptCount, rootInputId: state.rootInputId,
       turnInput: state.turnInput, rootTaskObjective: { goal: root.goal, successCriteria: root.successCriteria },
+      taskGraphTemplateRoles: setup.taskGraphTemplateRoles,
       planningEnabled: taskGraphPlanningEnabled, selectedJobMode,
       discoveryPersonaMemoryEnabled: state.source === "user" && state.automationRunMode !== "scheduled"
         && interactiveDiscoveryMode && taskGraphPlanningEnabled && !selectedJobMode,

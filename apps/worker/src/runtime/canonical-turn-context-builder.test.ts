@@ -23,6 +23,7 @@ import type { ValidatedSelectedJobHistoryOutcome } from "./context/selected-job-
 import type { ValidatedRootTaskHistoryOutcome } from "./context/root-task-history.js"
 import { projectLoadedRootTaskHistoryGraph } from "./context/root-task-history-lesson-projection.js"
 import { ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID } from "./context/root-task-goal-criteria-context.js"
+import { TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID } from "./context/task-graph-objective-progress.js"
 import { createCanonicalTurnContextBuilder } from "./canonical-turn-context-builder.js"
 import { mergeTaskGraphCurrentObservation } from "./canonical-turn-task-graph-context.js"
 import type { DirectSelectedJobHistoryReader, SelectedJobHistoryReader } from "./canonical-turn-selected-job-history.js"
@@ -422,7 +423,10 @@ describe("canonical Turn context builder", () => {
         scope, sessionId: lease.sessionId, turnId: lease.turnId, stepId,
         snapshot: {
           system: [], profile: [], goal: { id: "goal", content: goal }, steerHistory: [], businessRefs: [],
-          toolObservations: [{ id: ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID, content: { privateSpoof: "PRIVATE_SPOOFED_OBSERVATION" } }],
+          toolObservations: [
+            { id: ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID, content: { privateSpoof: "PRIVATE_SPOOFED_OBSERVATION" } },
+            { id: TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID, content: { privateSpoof: "PRIVATE_OLD_PROGRESS" } },
+          ],
         },
       })
     }
@@ -439,6 +443,7 @@ describe("canonical Turn context builder", () => {
     const initial = await build("initial-plan")
     const replan = await build("replan-plan")
     const observationId = `observation:${ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID}`
+    const progressId = `observation:${TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID}`
     for (const context of [initial, replan]) {
       const observations = context.blocks.filter(block => block.id === observationId)
       expect(observations).toHaveLength(1)
@@ -450,10 +455,17 @@ describe("canonical Turn context builder", () => {
           requirements: [{ id: "candidate-count", kind: "candidate_count_gte", minimum: 3 }],
         },
       })
+      const progress = context.blocks.filter(block => block.id === progressId)
+      expect(progress).toHaveLength(1)
+      expect(progress[0]).toMatchObject({ layer: "tool_observation", role: "data", trust: "external_untrusted", content: {
+        schemaVersion: "agent-harness.v2.objective-progress.v1", advisory: true, revision: null,
+        requirements: [{ id: "candidate-count", kind: "candidate_count_gte", minimum: 3, status: "unknown" }],
+      } })
+      expect(context.blocks.findIndex(block => block.id === observationId)).toBeLessThan(context.blocks.findIndex(block => block.id === progressId))
       expect(context.blocks.find(block => block.id === "goal:root-task-success-criteria")?.content)
         .toEqual({ successCriteria: ["Legacy prose criterion", "Explain the shortlist"] })
       const serialized = JSON.stringify(context.blocks)
-      expect(serialized).not.toMatch(/PRIVATE_ROOT_ID|PRIVATE_ROOT_CONTEXT|PRIVATE_TURN_ID|PRIVATE_ENVELOPE_VALUE|PRIVATE_SPOOFED_OBSERVATION/)
+      expect(serialized).not.toMatch(/PRIVATE_ROOT_ID|PRIVATE_ROOT_CONTEXT|PRIVATE_TURN_ID|PRIVATE_ENVELOPE_VALUE|PRIVATE_SPOOFED_OBSERVATION|PRIVATE_OLD_PROGRESS/)
     }
     expect(replan.blocks.find(block => block.id === observationId)?.content).toEqual(initial.blocks.find(block => block.id === observationId)?.content)
     const model = { profile: { provider: "fixture", model: "fixture", nativeTools: false, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter
@@ -469,9 +481,11 @@ describe("canonical Turn context builder", () => {
       trust: "external_untrusted",
       content: { kind: "canonical_objective_verification_requirements", trust: "external_untrusted", source: "canonical_turn_objective", status: "invalid" },
     })
+    expect(invalid.blocks.some(block => block.id === progressId)).toBe(false)
     expect(JSON.stringify(invalid.blocks)).not.toContain("PRIVATE_MALFORMED_VALUE")
     const absent = await buildFor({ input: { goal } })("absent-plan")
     expect(absent.blocks.some(block => block.id === observationId)).toBe(false)
+    expect(absent.blocks.some(block => block.id === progressId)).toBe(false)
     const validPlanningDisabled = await buildFor(turnInput, false, false)("valid-no-plan")
     expect(validPlanningDisabled.blocks.some(block => block.id === observationId)).toBe(false)
     const invalidPlanningDisabled = await buildFor({ input: {
@@ -481,6 +495,7 @@ describe("canonical Turn context builder", () => {
       layer: "tool_observation", role: "data", trust: "external_untrusted",
       content: { kind: "canonical_objective_verification_requirements", trust: "external_untrusted", source: "canonical_turn_objective", status: "invalid" },
     })
+    expect(invalidPlanningDisabled.blocks.some(block => block.id === progressId)).toBe(false)
     expect(JSON.stringify(invalidPlanningDisabled.blocks.find(block => block.id === observationId))).not.toContain("PRIVATE_MALFORMED_VALUE")
     const absentPlanningDisabled = await buildFor({ input: { goal } }, false, false)("absent-no-plan")
     expect(absentPlanningDisabled.blocks.some(block => block.id === observationId)).toBe(false)
@@ -506,9 +521,11 @@ describe("canonical Turn context builder", () => {
     })
     for (const invalidSelectedContext of [invalidSelectedJob, invalidSelectedJobPlanningDisabled]) {
       expect(JSON.stringify(invalidSelectedContext.blocks.find(block => block.id === observationId))).not.toContain("PRIVATE_MALFORMED_VALUE")
+      expect(invalidSelectedContext.blocks.some(block => block.id === progressId)).toBe(false)
     }
     const absentSelectedJob = await buildFor({ input: { goal } }, false, true)("selected-job-absent-plan")
     expect(absentSelectedJob.blocks.some(block => block.id === observationId)).toBe(false)
+    expect(absentSelectedJob.blocks.some(block => block.id === progressId)).toBe(false)
   })
 
   it("adds bounded Root-task history as untrusted advisory context without changing current graph evidence", async () => {

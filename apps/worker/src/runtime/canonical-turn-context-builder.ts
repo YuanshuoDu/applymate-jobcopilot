@@ -17,6 +17,7 @@ import {
   ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID, type RootTaskGoalObjective,
 } from "./context/root-task-goal-criteria-context.js"
 import { resolveRootTaskVerificationRequirements } from "./context/root-task-objective.js"
+import { taskGraphObjectiveProgressObservation, TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID } from "./context/task-graph-objective-progress.js"
 import {
   appendCanonicalSelectedJobHistory, appendCanonicalSelectedJobHistoryOutcomes,
   type DirectSelectedJobHistoryReader, type SelectedJobHistoryReader,
@@ -42,6 +43,7 @@ type Input = Readonly<{
   rootInputId?: string
   turnInput?: unknown
   rootTaskObjective?: RootTaskGoalObjective
+  taskGraphTemplateRoles?: Readonly<Record<string, string>>
   planningEnabled: boolean
   selectedJobMode: boolean
   discoveryPersonaMemoryEnabled?: boolean
@@ -145,14 +147,21 @@ export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder 
       }
       const rootTaskGoalCriteria = input.planningEnabled && !input.selectedJobMode && input.rootTaskObjective
         ? projectRootTaskGoalCriteria(input.turnInput, input.rootTaskObjective) : undefined
+      const objectiveRequirements = resolveRootTaskVerificationRequirements(input.turnInput)
       let verificationRequirements = input.planningEnabled || input.selectedJobMode
         ? rootTaskVerificationRequirementsObservation(input.turnInput) : undefined
-      if (!input.planningEnabled && !input.selectedJobMode
-        && resolveRootTaskVerificationRequirements(input.turnInput).status === "invalid") {
+      if (!input.planningEnabled && !input.selectedJobMode && objectiveRequirements.status === "invalid") {
         verificationRequirements = rootTaskVerificationRequirementsObservation(input.turnInput)
       }
-      const toolObservations = snapshot.toolObservations.filter(observation => observation.id !== ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID)
+      const toolObservations = snapshot.toolObservations.filter(observation => observation.id !== ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID
+        && observation.id !== TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID)
       if (verificationRequirements) toolObservations.push(verificationRequirements)
+      const objectiveProgress = taskGraphObjectiveProgressObservation({
+        resolution: objectiveRequirements, observations: toolObservations,
+        taskGraphRevision: snapshot.taskGraphRevision, rootTaskId: input.rootTaskId,
+        taskGraphTemplateRoles: input.taskGraphTemplateRoles,
+      })
+      if (objectiveProgress) toolObservations.push(objectiveProgress)
       snapshot = { ...snapshot, rootTaskGoalCriteria, toolObservations }
       const built = await base.build({ ...request, snapshot, taskId: input.rootTaskId })
       if (!discoveryMemoryEnabled) return built
