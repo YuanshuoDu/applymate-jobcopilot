@@ -21,21 +21,21 @@ export function projectScheduledTaskGraphCanonicalPrefix(
   const nodes = rawNodes.map(parseNode)
   if (nodes.some(node => !node) || !unique(nodes as ScheduledTaskGraphCanonicalNode[])) return null
   const parsed = nodes as ScheduledTaskGraphCanonicalNode[]
-  const sources = attestation.schemaVersion === "agent-harness.v2.scheduled-pipeline-attestation.v1"
-    ? [{ nodeKey: "scout", taskId: attestation.scout.taskId }]
-    : attestation.scouts.map(source => ({ nodeKey: source.nodeKey, taskId: source.taskId }))
-  const scoutCount = sources.length, analyzeCount = scoutCount + 1, prepareCount = analyzeCount + 1
+  const legacy = attestation.schemaVersion === "agent-harness.v2.scheduled-pipeline-attestation.v1"
+  const sources = legacy ? [] : attestation.scouts.map(source => ({ nodeKey: source.nodeKey, taskId: source.taskId }))
+  const scoutCount = legacy ? 1 : sources.length, analyzeCount = scoutCount + 1, prepareCount = analyzeCount + 1
   const expectedCount = stage === "analyze" ? analyzeCount : stage === "prepare" ? prepareCount
     : stage === "audit" ? prepareCount + 2 : prepareCount + 1
   const maxCount = stage === "gate" ? expectedCount + 1 : expectedCount
   if (parsed.length < expectedCount || parsed.length > maxCount) return null
   const scouts = parsed.slice(0, scoutCount), sourceKeys = new Set(sources.map(source => source.nodeKey))
-  if (scouts.some(node => !sourceKeys.has(node.key) || !sources.some(source => source.nodeKey === node.key && source.taskId === node.taskId)
-    || node.templateId !== "scout" || node.depth !== 1 || node.dependsOn.length !== 0 || node.verificationDisposition !== "typed")) return null
+  if (scouts.some(node => (!legacy && (!sourceKeys.has(node.key) || !sources.some(source => source.nodeKey === node.key && source.taskId === node.taskId)))
+    || (legacy && node.taskId !== attestation.scout.taskId) || node.templateId !== "scout" || node.depth !== 1
+    || node.dependsOn.length !== 0 || node.verificationDisposition !== "typed")) return null
   const analyst = parsed[scoutCount]!
-  if (analyst.key !== (attestation.schemaVersion === "agent-harness.v2.scheduled-pipeline-attestation.v1" ? "analyst" : attestation.analyst.nodeKey)
-    || analyst.templateId !== "analyst" || analyst.taskId !== attestation.analyst.taskId || analyst.depth !== 2
-    || !sameIds(analyst.dependsOn, sources.map(source => source.nodeKey)) || analyst.verificationDisposition !== "typed") return null
+  if ((!legacy && analyst.key !== attestation.analyst.nodeKey) || analyst.templateId !== "analyst"
+    || analyst.taskId !== attestation.analyst.taskId || analyst.depth !== 2
+    || !sameIds(analyst.dependsOn, scouts.map(node => node.key)) || analyst.verificationDisposition !== "typed") return null
   if (stage === "analyze") return { scouts, analyst }
   const prepare = parsed[scoutCount + 1]!
   if (prepare.key !== "prepare" || prepare.templateId !== "prepare" || prepare.depth !== 3

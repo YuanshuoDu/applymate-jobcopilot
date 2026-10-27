@@ -166,8 +166,8 @@ async function verifyCurrentTaskGraph(owner: ScheduledTaskGraphPipelineOwner, ma
     || root.status !== 'running' && !(auditActor && root.status === 'waiting') || root.failureReason !== null) return false
   const sourceCount = nodes.length - 2
   const attestedScouts = attestation.schemaVersion === 'agent-harness.v2.scheduled-pipeline-attestation.v1'
-    ? [{ nodeKey: 'scout', ...attestation.scout }] : attestation.scouts
-  const scoutByKey = new Map(attestedScouts.map(source => [source.nodeKey, source]))
+    ? [attestation.scout] : attestation.scouts
+  const scoutByKey = new Map(projection.scouts.map(node => [node.key, attestedScouts.find(source => source.taskId === node.taskId)]))
   for (let i = 0; i < nodes.length; i += 1) {
     const proofNode = nodes[i]!, graphNode = graphNodes[i], role = i < sourceCount ? 'scout' : i === sourceCount ? 'analyst' : 'prepare'
     const task = byTask.get(proofNode.taskId), expected = role === 'scout' ? record(scoutByKey.get(String(graphNode?.key)))

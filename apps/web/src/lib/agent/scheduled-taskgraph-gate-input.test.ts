@@ -398,6 +398,17 @@ describe('scheduled TaskGraph Gate input reload', () => {
     expect(mocks.versions).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ userId: owner.userId, sessionId: owner.sessionId }) }))
   })
 
+  it('accepts historical v1 graph aliases when task IDs and typed dependencies match', async () => {
+    const { input, graph } = setup()
+    const nodes = (graph.content as { nodes: Record<string, unknown>[] }).nodes
+    ;(graph.content as { nodes: Record<string, unknown>[] }).nodes = [
+      { ...nodes[0]!, key: 'scheduled-scout' },
+      { ...nodes[1]!, key: 'scheduled-analyst', dependsOn: ['scheduled-scout'] },
+      { ...nodes[2]!, dependsOn: ['scheduled-analyst'] },
+    ]
+    await expect(loadScheduledTaskGraphGateInput(input)).resolves.toMatchObject({ packages: [{ jobId: jobRow.id }] })
+  })
+
   it('rejects a TaskGraph revision that changes after Worker completion proof and before Gate hydration', async () => {
     const { input, graph, proof } = setup()
     graph.revision = proof.completion.graphRevision + 1

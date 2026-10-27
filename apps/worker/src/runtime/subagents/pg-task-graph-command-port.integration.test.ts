@@ -1965,7 +1965,10 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       [value.turnId, JSON.stringify({ automationRunMode: "scheduled", scheduledAutomationSnapshot: scheduledSnapshot })])
     const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
     const scope = scheduleInput(value, 1, true).scope
-    const templates = { scout: { ...TASK_GRAPH_TEMPLATES.scout, allowedActions: [] }, analyst: TASK_GRAPH_TEMPLATES.analyst }
+    const templates = {
+      scout: { ...TASK_GRAPH_TEMPLATES.scout, allowedActions: [] },
+      analyst: { ...TASK_GRAPH_TEMPLATES.analyst, allowedActions: [] },
+    }
     const plan = (expectedRevision: number, first: number, count: number): TaskGraphScheduleInput => ({ scope, templates,
       proposal: { expectedRevision, nodes: Array.from({ length: count }, (_, index) => ({ key: `scout-${first + index}`,
         templateId: "scout", goal: "Discover candidates for the schedule", successCriteria: ["Return candidates"],

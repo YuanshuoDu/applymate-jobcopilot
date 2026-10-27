@@ -27,6 +27,22 @@ function graph() {
     node("scheduled_audit", "scheduled_audit", "audit", 5, ["gate"], "specialized"),
   ] }
 }
+function legacyAttestation() {
+  return { schemaVersion: "agent-harness.v2.scheduled-pipeline-attestation.v1", owner, snapshotDigest: `sha256:${digest("a")}`,
+    graphRevision: 1, scout: { taskId: "scout-task", attemptCount: 1, status: "completed", verification: "passed",
+      resultDigest: digest("b"), candidateJobIds: ["job-a"], discoveryReceipt: { status: "complete", taskId: "scout-task",
+        attemptCount: 1, completedCalls: 1, candidateCount: 1, providerFailures: 0, materializationFailures: 0, hasMore: false, receiptDigest: digest("c") } },
+    analyst: { taskId: "analyst-task", attemptCount: 1, status: "completed", verification: "passed", resultDigest: digest("d"),
+      dependsOnTaskIds: ["scout-task"], jobIds: ["job-a"] }, evidenceDigest: digest("e") }
+}
+function legacyGraph() {
+  return { schemaVersion: "agent-harness.v2.task-graph", nodes: [
+    node("scheduled-scout", "scout", "scout-task", 1, [], "typed"),
+    node("scheduled-analyst", "analyst", "analyst-task", 2, ["scheduled-scout"], "typed"),
+    node("prepare", "prepare", "prepare-task", 3, ["scheduled-analyst"], "specialized"),
+    node("gate", "gate", "gate-task", 4, ["prepare"], "specialized"),
+  ] }
+}
 
 describe("scheduled TaskGraph canonical prefix projection", () => {
   it("projects authored-order Scouts, all-source Analyst and typed stage suffixes", () => {
@@ -34,6 +50,20 @@ describe("scheduled TaskGraph canonical prefix projection", () => {
     expect(projected?.scouts.map(source => source.taskId)).toEqual(["scout-b", "scout-a"])
     expect(projected).toMatchObject({ analyst: { taskId: "analyst" }, prepare: { taskId: "prepare" },
       gate: { taskId: "gate" }, audit: { taskId: "audit" } })
+  })
+
+  it("binds v1 Scout and Analyst aliases by their attested task IDs", () => {
+    const current = legacyGraph(), attestation = legacyAttestation()
+    expect(projectScheduledTaskGraphCanonicalPrefix(current, attestation, "gate")).toMatchObject({
+      scouts: [{ key: "scheduled-scout", taskId: "scout-task" }],
+      analyst: { key: "scheduled-analyst", taskId: "analyst-task" },
+    })
+    const wrongTask = legacyGraph()
+    wrongTask.nodes[0] = { ...wrongTask.nodes[0]!, taskId: "other-scout" }
+    expect(projectScheduledTaskGraphCanonicalPrefix(wrongTask, attestation, "gate")).toBeNull()
+    const wrongDependency = legacyGraph()
+    wrongDependency.nodes[1] = { ...wrongDependency.nodes[1]!, dependsOn: ["other-scout"] }
+    expect(projectScheduledTaskGraphCanonicalPrefix(wrongDependency, attestation, "gate")).toBeNull()
   })
 
   it("rejects a missing source, wrong dependency set or unsupported stage length", () => {
