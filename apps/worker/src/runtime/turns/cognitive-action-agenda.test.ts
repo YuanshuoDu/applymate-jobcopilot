@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest"
 
+import { mergeTaskGraphCurrentObservation } from "../canonical-turn-task-graph-context.js"
+import type { StepContextSnapshot } from "../context/step-context-builder.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import type { TaskGraphCurrentNode } from "../subagents/task-graph-command-port.js"
+import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-verification-report.js"
 import { buildCognitiveActionAgenda, COGNITIVE_ACTION_AGENDA_SCHEMA_VERSION, excludeUnconsumedRootReferenceFromAgenda, type CognitiveAction } from "./cognitive-action-agenda.js"
 import type { StepContext } from "../context/step-context-builder.js"
 
@@ -14,6 +19,23 @@ function goal(): StepContext["blocks"][number] {
 }
 function observation(id: string, content: Record<string, unknown>): StepContext["blocks"][number] {
   return block(id, "tool_observation", content)
+}
+function verificationBlock(): StepContext["blocks"][number] {
+  const node: TaskGraphCurrentNode = {
+    key: "private-node-key", taskId: "private-task-id", templateId: "scout", goal: "PRIVATE_GOAL",
+    successCriteria: ["PRIVATE_SUCCESS_CRITERION"], dependsOn: [], status: "failed", readiness: "terminal",
+    resultSummary: "PRIVATE_RESULT", failureReason: "PRIVATE_REASON", verificationCriterionIds: ["candidate-count"],
+    verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria: [
+      { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
+    ] },
+    verificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met",
+      criteria: [{ criterionId: "candidate-count", status: "failed", reasonCode: "criterion_not_met" }],
+      evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64) },
+  }
+  const seed: StepContextSnapshot = { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }
+  const snapshot = mergeTaskGraphCurrentObservation(seed, { revision: 7, nodes: [node] })
+  return { id: "observation:task-graph-current", layer: "tool_observation", role: "data", trust: "external_untrusted",
+    source: "tool_or_subagent", content: snapshot.toolObservations[0]!.content as never }
 }
 
 describe("cognitive action agenda", () => {
@@ -60,6 +82,22 @@ describe("cognitive action agenda", () => {
     expect(payload).not.toContain("secret failure")
     expect(payload).not.toContain("ignore server")
     expect(payload).not.toContain("never place this raw goal")
+  })
+
+  it("projects only a count for current failed typed verification without changing action priority", () => {
+    const agenda = buildCognitiveActionAgenda(context([
+      goal(), verificationBlock(), block("input:part:0", "pending_input", { inputId: "input-private", text: "PRIVATE_INPUT" }),
+    ], undefined, 7))
+    const payload = JSON.stringify(agenda)
+
+    expect(agenda.signals.completionVerification).toEqual({ count: 1, ids: [] })
+    expect(agenda.nextAction).toBe("resolve_pending_input")
+    expect(agenda.blockedBy).toEqual({ kind: "pending_input", ids: ["input-private"] })
+    expect(payload).not.toContain("private-node-key")
+    expect(payload).not.toContain("private-task-id")
+    expect(payload).not.toContain("candidate-count")
+    expect(payload).not.toContain("PRIVATE_REASON")
+    expect(payload).not.toContain("PRIVATE_RESULT")
   })
 
   it.each(["agent.wait", "wait_subagents"] as const)("recognizes %s as an active child wait", toolName => {
