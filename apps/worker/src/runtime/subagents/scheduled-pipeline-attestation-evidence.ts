@@ -29,13 +29,14 @@ export function projectScheduledPipelineV2Attestation(input: Readonly<{
   analyst: Omit<ScheduledPipelineAttestationV2['analyst'], 'dependsOnTaskIds'>
   bindings: NonNullable<TaskGraphStoredVerificationReport['dependencyBindings']>
 }>): ScheduledPipelineAttestationV2 {
+  const owner = exactOwnerProjection(input.owner)
   const scouts = [...input.scouts].sort((left, right) => compareCodepoint(left.nodeKey, right.nodeKey))
   const candidateUnionJobIds = [...new Set(scouts.flatMap(source => source.candidateJobIds))].sort(compareCodepoint)
   const analyst = { ...input.analyst, dependsOnTaskIds: scouts.map(source => source.taskId).sort(compareCodepoint) }
   const evidenceDigest = digest({ schemaVersion: SCHEDULED_PIPELINE_ATTESTATION_V2_SCHEMA,
-    owner: stableOwnerProjection(input.owner), snapshotDigest: input.snapshotDigest, graphDigest: input.graphDigest,
+    owner: stableOwnerProjection(owner), snapshotDigest: input.snapshotDigest, graphDigest: input.graphDigest,
     graphRevision: input.graphRevision, scouts, candidateUnionJobIds, analyst, bindings: input.bindings })
-  return { schemaVersion: SCHEDULED_PIPELINE_ATTESTATION_V2_SCHEMA, owner: input.owner, snapshotDigest: input.snapshotDigest,
+  return { schemaVersion: SCHEDULED_PIPELINE_ATTESTATION_V2_SCHEMA, owner, snapshotDigest: input.snapshotDigest,
     graphRevision: input.graphRevision, scouts, candidateUnionJobIds, analyst, evidenceDigest }
 }
 
@@ -76,7 +77,7 @@ export async function buildScheduledPipelineAttestationEvidence(input: Readonly<
   if (!analystProof || analystProof.projection?.role !== 'analyst' || !validDependencyBindings(analyst.report, sources, sourceProofs)) {
     return blocked('task_graph_evidence_unverified')
   }
-  const owner = { ...input.scope }, snapshotDigest = scheduleDigest(input.schedule), graphDigest = digest(input.prefix.snapshot)
+  const owner = exactOwnerProjection(input.scope), snapshotDigest = scheduleDigest(input.schedule), graphDigest = digest(input.prefix.snapshot)
   if (!v2) return { status: 'ready', attestation: buildV1(owner, input.prefix, snapshotDigest, graphDigest, sources[0]!, receipts[0]!, candidateLists[0]!, analyst, analystJobIds) }
   const scouts: ScheduledPipelineScoutProofV2[] = sources.map((source, index) => ({ nodeKey: source.node.key, taskId: source.task.id,
     attemptCount: source.task.attemptCount, status: 'completed', verification: 'passed', resultDigest: source.report.resultDigest!,
@@ -170,6 +171,10 @@ function validDependencyBindings(report: TaskGraphStoredVerificationReport, sour
 function uniqueIds(values: readonly string[]): string[] | null { return new Set(values).size === values.length ? [...values] : null }
 function stableOwnerProjection(owner: ScheduledAutomationPipelineBridgeScope) {
   return { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId, rootAttemptCount: owner.rootAttemptCount }
+}
+function exactOwnerProjection(owner: ScheduledAutomationPipelineBridgeScope): ScheduledPipelineAttestationV1['owner'] {
+  return { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+    rootAttemptCount: owner.rootAttemptCount, turnLeaseOwnerId: owner.turnLeaseOwnerId, turnLeaseVersion: owner.turnLeaseVersion }
 }
 function scheduleDigest(snapshot: ScheduledAutomationSnapshot): string {
   return `sha256:${createHash('sha256').update(JSON.stringify([snapshot.schemaVersion, snapshot.targetRoles, snapshot.targetLocations,

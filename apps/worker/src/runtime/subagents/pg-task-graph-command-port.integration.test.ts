@@ -1968,7 +1968,8 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     const templates = { scout: { ...TASK_GRAPH_TEMPLATES.scout, allowedActions: [] }, analyst: TASK_GRAPH_TEMPLATES.analyst }
     const plan = (expectedRevision: number, first: number, count: number): TaskGraphScheduleInput => ({ scope, templates,
       proposal: { expectedRevision, nodes: Array.from({ length: count }, (_, index) => ({ key: `scout-${first + index}`,
-        templateId: "scout", goal: "Discover candidates for the schedule", successCriteria: ["Return candidates"], dependsOn: [] })) } })
+        templateId: "scout", goal: "Discover candidates for the schedule", successCriteria: ["Return candidates"],
+        verification: SCHEDULED_DRAFT_SCOUT_VERIFICATION, dependsOn: [] })) } })
     const accepted = await command.appendAndSchedule(plan(0, 1, 4))
     expect(accepted).toMatchObject({ status: "accepted", revision: 1 })
     expect(accepted.nodes).toHaveLength(4)
@@ -1998,7 +1999,8 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     const ordinaryScope = scheduleInput(ordinary, 1, true).scope
     const ordinaryReceipt = await ordinaryCommand.appendAndSchedule({ scope: ordinaryScope, templates,
       proposal: { expectedRevision: 0, nodes: Array.from({ length: 5 }, (_, index) => ({ key: `ordinary-scout-${index + 1}`,
-        templateId: "scout", goal: "Discover candidates", successCriteria: ["Return candidates"], dependsOn: [] })) } })
+        templateId: "scout", goal: "Discover candidates", successCriteria: ["Return candidates"],
+        verification: SCHEDULED_DRAFT_SCOUT_VERIFICATION, dependsOn: [] })) } })
     expect(ordinaryReceipt).toMatchObject({ status: "accepted", revision: 1 })
     expect(ordinaryReceipt.nodes).toHaveLength(5)
 

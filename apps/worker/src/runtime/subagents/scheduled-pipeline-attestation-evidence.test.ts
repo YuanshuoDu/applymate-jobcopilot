@@ -29,11 +29,12 @@ describe("scheduled Analyze attestation evidence", () => {
         providerFailures: 0, materializationFailures: 0, hasMore: false, receiptDigest: hex("e") },
     })
     const scouts = [scout("scout-a", "task-a", ["job-z", "job-a"]), scout("scout-A", "task-A", ["job-A"])]
+    const ownerWithExecution = { userId: "user", sessionId: "session", turnId: "turn", rootTaskId: "root", rootAttemptCount: 1,
+      turnLeaseOwnerId: "lease", turnLeaseVersion: 1, executionId: "", executionAttemptCount: 0 }
     const bindings = ["scout-A", "scout-a"].map((nodeKey, index) => ({ nodeKey, taskId: index === 0 ? "task-A" : "task-a",
       attemptCount: 1, nodeDigest: hex("b"), resultDigest: hex("a"), evidenceDigest: hex("c"), reportDigest: hex("d") }))
     const attestation = projectScheduledPipelineV2Attestation({
-      owner: { userId: "user", sessionId: "session", turnId: "turn", rootTaskId: "root", rootAttemptCount: 1,
-        turnLeaseOwnerId: "lease", turnLeaseVersion: 1 },
+      owner: ownerWithExecution,
       snapshotDigest: `sha256:${hex("f")}`, graphDigest: hex("9"), graphRevision: 4, scouts,
       analyst: { nodeKey: "analyst", taskId: "analyst-task", attemptCount: 1, status: "completed", verification: "passed",
         resultDigest: hex("6"), nodeDigest: hex("7"), evidenceDigest: hex("8"), reportDigest: hex("5"), jobIds: ["job-z", "job-A"] },
@@ -43,6 +44,7 @@ describe("scheduled Analyze attestation evidence", () => {
     expect(parsed).not.toBeNull()
     expect(parsed?.schemaVersion).toBe("agent-harness.v2.scheduled-pipeline-attestation.v2")
     if (!parsed || !("scouts" in parsed)) throw new Error("V2 producer output did not parse")
+    expect(Object.keys(parsed.owner).sort()).toEqual(["rootAttemptCount", "rootTaskId", "sessionId", "turnId", "turnLeaseOwnerId", "turnLeaseVersion", "userId"])
     expect(parsed.scouts.map(source => source.nodeKey)).toEqual(["scout-A", "scout-a"])
     expect(parsed.scouts.find(source => source.nodeKey === "scout-a")?.candidateJobIds).toEqual(["job-z", "job-a"])
     expect(parsed.candidateUnionJobIds).toEqual(["job-A", "job-a", "job-z"])

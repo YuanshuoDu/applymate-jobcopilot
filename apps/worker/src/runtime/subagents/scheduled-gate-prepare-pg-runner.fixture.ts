@@ -27,6 +27,7 @@ import type { TaskGraphScheduledPrepareInput } from "./task-graph-command-port.j
 import { createScheduledPipelineCandidateStore, withScheduledPipelineCandidateModelOutput } from "./scheduled-pipeline-candidate-store.js"
 import { createScheduledTaskGraphContinuationContract } from "./scheduled-taskgraph-continuation-receipt.js"
 import { scheduledGatePreparedJobIds } from "./scheduled-gate-contract.js"
+import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
 import type { ScheduledPrepareTaskGraphProof } from "./scheduled-prepare-task-graph-verification.js"
 import type { ScheduledPipelineAnalyzeCheckpointProof } from "./scheduled-pipeline-handoff.js"
 import { seedScheduledGatePrepareFixture, type ScheduledGatePrepareSeedFixture } from "./scheduled-gate-prepare-pg.fixture.js"
@@ -147,11 +148,12 @@ function createBridge(pool: Pool, seed: ScheduledGatePrepareSeedFixture) {
 function analyzeCheckpoint(seed: ScheduledGatePrepareSeedFixture, owner: ScheduledAutomationPipelineOwner,
   claimToken: string, continuationKey: string, attestation: ScheduledAutomationPipelineAttestation): Record<string, unknown> {
   const lease = seed.turnLeaseV1
+  const selectedJobRecords = seed.jobRecords.filter(job => seed.selectedJobIds.includes(job.id))
   return { nextStage: "prepare", scheduledTaskGraphClaim: { schemaVersion: "agent-harness.v2.scheduled-pipeline-claim.v1",
     key: continuationKey, claimToken, owner, claimedAt: lease.leaseStartedAt.toISOString(), leaseExpiresAt: lease.leaseExpiresAt.toISOString() },
     scheduledTaskGraphContinuation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-continuation.v1", key: continuationKey,
       owner, snapshotDigest: attestation.snapshotDigest, graphRevision: attestation.graphRevision, evidenceDigest: attestation.evidenceDigest },
-    scoutedJobs: seed.jobRecords, scoredJobs: seed.scoredJobs, analysisFailed: 0 }
+    scoutedJobs: selectedJobRecords, scoredJobs: seed.scoredJobs, analysisFailed: 0 }
 }
 async function waitForPrepareChoice(pool: Pool, seed: ScheduledGatePrepareSeedFixture,
   attestation: ScheduledAutomationPipelineAttestation, continuationKey: string, claimToken: string, checkpointDigest: string,
@@ -254,8 +256,13 @@ async function executePrepareChild(pool: Pool, redisUrl: string, seed: Scheduled
     const completed = waitForChild(worker, subagentJobId(taskId))
     await worker.waitUntilReady()
     const outcome = await completed
-    if (!outcome || typeof outcome !== "object" || (outcome as { status?: unknown }).status !== "completed") {
-      throw new Error("scheduled Prepare child did not complete")
+    const outcomeStatus = outcome && typeof outcome === "object" ? ownData(outcome, "status") : undefined
+    if (!outcome || typeof outcome !== "object" || outcomeStatus !== "completed") {
+      const returnedStatus = safeStatus(outcomeStatus)
+      const returnedFailure = safeFailureCode(outcome && typeof outcome === "object"
+        ? ownData(outcome, "failureReason") ?? ownData(outcome, "errorCode") : undefined)
+      const persisted = await readPrepareFailure(pool, seed, taskId)
+      throw new Error(`scheduled Prepare child did not complete: returnedStatus=${returnedStatus}; returnedFailure=${returnedFailure}; persistedStatus=${persisted.status}; persistedFailure=${persisted.failure}`)
     }
   } finally {
     await worker?.close().catch(() => undefined)
@@ -265,6 +272,41 @@ async function executePrepareChild(pool: Pool, redisUrl: string, seed: Scheduled
     await connection.quit().catch(() => connection.disconnect())
     await redis.quit().catch(() => redis.disconnect())
   }
+}
+
+const SAFE_TASK_STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
+const SAFE_FAILURE_CODES = new Set([
+  "child_turn_missing", "subagent_role_unknown", "selected_job_context_unavailable", "writer_dependency_unavailable",
+  "selected_job_sources_unavailable", "selected_job_output_contract_unavailable", "child_resume_evidence_unavailable",
+  "child_resume_unavailable", "invalid_structured_result", "task_graph_child_deadline_exceeded",
+  "task_graph_verification_failed", "task_graph_verification_unverified", "task_graph_other",
+  "execution_setup_unavailable", "resume_state_unavailable", "structured_output_invalid", "lease_lost",
+  "scheduled_gate_role_task_type_mismatch",
+])
+
+function ownData(value: object, key: string): unknown {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    return descriptor?.enumerable && Object.hasOwn(descriptor, "value") ? descriptor.value : undefined
+  } catch { return undefined }
+}
+function safeStatus(value: unknown): string {
+  return typeof value === "string" && SAFE_TASK_STATUSES.has(value) ? value : value === undefined ? "missing" : "other"
+}
+function safeFailureCode(value: unknown): string {
+  return value === null ? "none" : typeof value === "string" && SAFE_FAILURE_CODES.has(value)
+    ? value : value === undefined ? "missing" : "other"
+}
+async function readPrepareFailure(pool: Pool, seed: ScheduledGatePrepareSeedFixture, taskId: string): Promise<{ status: string; failure: string }> {
+  try {
+    const row = (await pool.query<{ status: string; failureReason: string | null }>(
+      `SELECT "status", "failureReason" FROM "sub_agent_tasks"
+        WHERE "id"=$1 AND "sessionId"=$2 AND "turnId"=$3 AND "rootTaskId"=$4 AND "parentTaskId"=$4 AND "role"=$5 AND "taskType"=$6`,
+      [taskId, seed.ids.sessionId, seed.ids.turnId, seed.ids.rootTaskId, TASK_GRAPH_TEMPLATES.prepare.role,
+        TASK_GRAPH_TEMPLATES.prepare.taskType])).rows[0]
+    return row ? { status: safeStatus(row.status), failure: safeFailureCode(row.failureReason) }
+      : { status: "missing", failure: "missing" }
+  } catch { return { status: "read_failed", failure: "read_failed" } }
 }
 
 function waitForChild(worker: Worker<SubagentJobPayload, unknown>, jobId: string): Promise<unknown> {

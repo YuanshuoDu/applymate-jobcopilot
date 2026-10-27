@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 import { createHash } from "node:crypto"
+import { parseScheduledPipelineAttestation } from "@jobcopilot/agent-protocol"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, type TaskGraphVerificationEvaluation } from "../planning/task-graph-verification.js"
 import { SCHEDULED_AUTOMATION_SNAPSHOT_SCHEMA_VERSION } from "./scheduled-automation-snapshot.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
@@ -244,6 +245,18 @@ function verificationProof(value: unknown, role: string): TaskGraphPgVerificatio
 }
 
 describe("scheduled automation TaskGraph pipeline bridge", () => {
+  it("projects execution-scoped extras out of the exact V1 attestation owner", async () => {
+    const fixture = makeFixture()
+    const executionScope = { ...scope, executionId: "", executionAttemptCount: 0 }
+    const result = await createScheduledAutomationPipelineBridge(fixture.dependencies)(executionScope)
+    expect(result.status).toBe("ready")
+    if (result.status !== "ready") return
+    const parsed = parseScheduledPipelineAttestation(result.attestation)
+    expect(parsed).not.toBeNull()
+    expect(Object.keys(result.attestation.owner).sort()).toEqual(["rootAttemptCount", "rootTaskId", "sessionId", "turnId", "turnLeaseOwnerId", "turnLeaseVersion", "userId"])
+    expect(parsed?.owner).toEqual(scope)
+  })
+
   it("returns a bounded owner-fenced attestation from verified Scout and Analyst outputs", async () => {
     const fixture = makeFixture()
     const result = await createScheduledAutomationPipelineBridge(fixture.dependencies)(scope)
