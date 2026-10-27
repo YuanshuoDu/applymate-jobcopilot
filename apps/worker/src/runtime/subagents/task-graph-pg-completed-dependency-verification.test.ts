@@ -178,4 +178,69 @@ describe("verifyCompletedScoutDependencies", () => {
     await expect(verifyCompletedScoutDependencies({ query } as unknown as Pick<pg.PoolClient, "query">, scope, value.snapshot, value.analyst)).resolves.toBeNull()
     expect(verification.verifyCompletedTaskGraphNodeEvidence).toHaveBeenCalledOnce()
   })
+  it("rebuilds every selected Scout proof, including an empty receipt, in sorted binding order", async () => {
+    const base = graph()
+    const sourceA = { ...base.snapshot.nodes[0]!, key: "scout-a", taskId: "scout-a-task" }
+    const sourceB = { ...base.snapshot.nodes[0]!, key: "scout-b", taskId: "scout-b-task" }
+    const unionVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [
+      { id: "membership", check: { kind: "findings_from_scout_union", dependencyNodeKeys: ["scout-b", "scout-a"] } },
+    ] }
+    const analystNode = { ...base.analyst, dependsOn: ["scout-b", "scout-a"], verification: unionVerification }
+    const snapshot = parseTaskGraphSnapshot({ schemaVersion: "agent-harness.v2.task-graph", nodes: [sourceA, sourceB, analystNode] })
+    const analyst = snapshot.nodes[2]!
+    const emptyDigest = "c".repeat(64)
+    const fullProjection: TaskGraphVerificationEvidenceProjection = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "scout",
+      candidates: [{ jobId: "job-1", evidenceIds: ["job-evidence"] }], evidenceIds: ["job-evidence"],
+    }
+    const emptyProjection: TaskGraphVerificationEvidenceProjection = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "scout", candidates: [],
+      evidenceIds: [`read:source:jobs.discover:${emptyDigest}`], emptyDiscoveryReceipt: { digest: emptyDigest },
+    }
+    const report: TaskGraphVerificationReport = { verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status: "passed", reasonCode: "criteria_met",
+      criteria: [{ criterionId: "candidates", status: "passed", reasonCode: "criteria_met" }], evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64) }
+    const evaluation: TaskGraphVerificationEvaluation = { status: "passed", reasonCode: "criteria_met",
+      criteria: [{ criterionId: "candidates", status: "passed", reasonCode: "criteria_met" }] }
+    let proofCall = 0
+    vi.mocked(verification.verifyCompletedTaskGraphNodeEvidence).mockImplementation(async () => ({
+      verified: true, report, evaluation, structuredResult: base.task.result,
+      projection: proofCall++ === 0 ? fullProjection : emptyProjection,
+    }))
+    const rows = new Map([["scout-a-task", { ...base.task, id: "scout-a-task" }], ["scout-b-task", { ...base.task, id: "scout-b-task" }]])
+    const query = vi.fn(async (_sql: string, params: readonly unknown[]) => ({ rows: [rows.get(String(params[0]))], rowCount: 1 }))
+
+    const proof = await verifyCompletedScoutDependencies({ query } as unknown as Pick<pg.PoolClient, "query">, scope, snapshot, analyst)
+
+    expect(proof?.projections).toEqual(new Map([["scout-a", fullProjection], ["scout-b", emptyProjection]]))
+    expect(proof?.bindings.map(binding => ({ nodeKey: binding.nodeKey, taskId: binding.taskId, attemptCount: binding.attemptCount })))
+      .toEqual([{ nodeKey: "scout-a", taskId: "scout-a-task", attemptCount: 2 }, { nodeKey: "scout-b", taskId: "scout-b-task", attemptCount: 2 }])
+    expect(query).toHaveBeenCalledTimes(2)
+    expect(verification.verifyCompletedTaskGraphNodeEvidence).toHaveBeenCalledTimes(2)
+    expect(verification.verifyCompletedTaskGraphNodeEvidence).toHaveBeenNthCalledWith(1, expect.anything(), expect.objectContaining({ scope: expect.objectContaining({ taskId: "scout-a-task", attemptCount: 2 }) }))
+    expect(verification.verifyCompletedTaskGraphNodeEvidence).toHaveBeenNthCalledWith(2, expect.anything(), expect.objectContaining({ scope: expect.objectContaining({ taskId: "scout-b-task", attemptCount: 2 }) }))
+  })
+
+  it("rejects a stale second Scout attempt and a union key that is not a direct dependency", async () => {
+    const base = graph()
+    const sourceA = { ...base.snapshot.nodes[0]!, key: "scout-a", taskId: "scout-a-task" }
+    const sourceB = { ...base.snapshot.nodes[0]!, key: "scout-b", taskId: "scout-b-task" }
+    const unionVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [
+      { id: "membership", check: { kind: "findings_from_scout_union", dependencyNodeKeys: ["scout-a", "scout-b"] } },
+    ] }
+    const validAnalyst = { ...base.analyst, dependsOn: ["scout-a", "scout-b"], verification: unionVerification }
+    const snapshot = parseTaskGraphSnapshot({ schemaVersion: "agent-harness.v2.task-graph", nodes: [sourceA, sourceB, validAnalyst] })
+    const query = vi.fn(async (_sql: string, params: readonly unknown[]) => ({
+      rows: [{ ...base.task, id: String(params[0]), attemptCount: String(params[0]) === "scout-b-task" ? 0 : 2 }], rowCount: 1,
+    }))
+    const matchingCriteria = [{ criterionId: "candidates", status: "passed" as const, reasonCode: "criteria_met" as const }]
+    vi.mocked(verification.verifyCompletedTaskGraphNodeEvidence).mockResolvedValue({ verified: true, report: { verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status: "passed", reasonCode: "criteria_met", criteria: matchingCriteria, evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64) }, evaluation: { status: "passed", reasonCode: "criteria_met", criteria: matchingCriteria }, projection: { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "scout", candidates: [{ jobId: "job-1", evidenceIds: ["read:job:job-1"] }], evidenceIds: ["job-evidence"] } })
+
+    await expect(verifyCompletedScoutDependencies({ query } as unknown as Pick<pg.PoolClient, "query">, scope, snapshot, snapshot.nodes[2]!)).resolves.toBeNull()
+    expect(query).toHaveBeenCalledTimes(2)
+    const misbound = { schemaVersion: "agent-harness.v2.task-graph", nodes: [sourceA, sourceB,
+      { ...validAnalyst, dependsOn: ["scout-a"] }] }
+    expect(() => parseTaskGraphSnapshot(misbound)).toThrow("task_graph_snapshot_verification_dependency_invalid")
+    const unusedQuery = vi.fn()
+    expect(unusedQuery).not.toHaveBeenCalled()
+  })
 })

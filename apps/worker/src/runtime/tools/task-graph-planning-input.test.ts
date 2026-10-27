@@ -1,7 +1,7 @@
 import { Type } from "@sinclair/typebox"
 import { Value } from "@sinclair/typebox/value"
 import { describe, expect, it } from "vitest"
-import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification-contract.js"
 import {
   buildTaskGraphProposalInputSchema,
   normalizeTaskGraphPlanningNodes,
@@ -41,6 +41,50 @@ describe("agent.plan proposal schema construction", () => {
     expect(() => buildTaskGraphProposalInputSchema(Type.String(), [
       ["scout", { role: "analyst", taskType: "job_analysis", allowedActions: [] }],
     ])).toThrow("task_graph_verification_template_role_mismatch")
+  })
+
+  it("accepts only bounded unique Analyst union selectors in the native planning schema", () => {
+    const templates = [
+      ["scout", { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] }],
+      ["analyst", { role: "analyst", taskType: "job_analysis", allowedActions: ["persona.retrieve"] }],
+    ] as const
+    const schema = buildTaskGraphProposalInputSchema(Type.Union([Type.Literal("scout"), Type.Literal("analyst")]), templates)
+    const analyst = {
+      key: "analyst-union", templateId: "analyst", goal: "Synthesize both source sets", successCriteria: ["Report verified findings"],
+      dependsOn: ["scout-a", "scout-b"], verification: {
+        schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
+        criteria: [
+          { id: "union-membership", check: { kind: "findings_from_scout_union", dependencyNodeKeys: ["scout-b", "scout-a"] } },
+          { id: "union-coverage", check: { kind: "findings_cover_scout_candidate_union_gte", dependencyNodeKeys: ["scout-a", "scout-b"], minimumPercent: 75 } },
+        ],
+      },
+    }
+    expect(Value.Check(schema, { expectedRevision: 0, nodes: [analyst] })).toBe(true)
+    for (const dependencyNodeKeys of [[], ["scout-a"], ["scout-a", " "], ["scout-a", "scout-a"],
+      ["scout-a", "scout-b\n"], ["scout-a", "scout-b\r"], ["scout-a", "scout-b\u2028"], ["scout-a", "scout-b\u2029"],
+      ["scout-a", "scout-b", "scout-c", "scout-d", "scout-e", "scout-f", "scout-g", "scout-h", "scout-i"]]) {
+      const invalid = { ...analyst, verification: { ...analyst.verification, criteria: [
+        { id: "union-membership", check: { kind: "findings_from_scout_union", dependencyNodeKeys } },
+      ] } }
+      expect(Value.Check(schema, { expectedRevision: 0, nodes: [invalid] })).toBe(false)
+    }
+    for (const dependencyNodeKeys of [["scout-a", "scout-b\n"], ["scout-a", "scout-b\r"],
+      ["scout-a", "scout-b\u2028"], ["scout-a", "scout-b\u2029"]]) {
+      const invalid = { ...analyst, verification: { ...analyst.verification, criteria: [
+        { id: "union-coverage", check: { kind: "findings_cover_scout_candidate_union_gte", dependencyNodeKeys, minimumPercent: 75 } },
+      ] } }
+      expect(Value.Check(schema, { expectedRevision: 0, nodes: [invalid] })).toBe(false)
+    }
+    expect(Value.Check(schema, { expectedRevision: 0, nodes: [{ ...analyst, verification: {
+      ...analyst.verification, criteria: [{ id: "union-membership", check: {
+        kind: "findings_from_scout_union", dependencyNodeKeys: ["scout-a", "scout-b"], extra: true,
+      } }],
+    } }] })).toBe(false)
+    const scout = { ...analyst, key: "scout-union", templateId: "scout", dependsOn: [], verification: {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+      criteria: [{ id: "union-membership", check: { kind: "findings_from_scout_union", dependencyNodeKeys: ["scout-a", "scout-b"] } }],
+    } }
+    expect(Value.Check(schema, { expectedRevision: 0, nodes: [scout] })).toBe(false)
   })
 })
 

@@ -2,6 +2,7 @@ import type pg from "pg"
 import { validateTaskGraphBranchReplacement } from "../planning/task-graph-branch-replacement.js"
 import type { TaskGraphNodeProposal } from "../planning/task-graph.js"
 import type { TaskGraphVerificationContract } from "../planning/task-graph-verification.js"
+import { remapTaskGraphVerificationCheckDependencies } from "../planning/task-graph-verification-scout-union.js"
 import { canonicalTaskGraphJson, parseTaskGraphEvent, parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey,
   type StoredTaskGraphNode, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { parseTaskGraphBranchRepairRelation, taskGraphBranchRepairFingerprint, type TaskGraphBranchRepairRelation } from "./task-graph-pg-branch-repair-relation.js"
@@ -167,12 +168,8 @@ function sameProposal(stored: TaskGraphSnapshot["nodes"][number], proposed: unkn
 }
 function remapVerification(value: TaskGraphVerificationContract | undefined, mapping: ReadonlyMap<string, string>): TaskGraphVerificationContract | undefined {
   if (!value) return value
-  return { ...value, criteria: value.criteria.map(criterion => {
-    const check = criterion.check
-    if (check.kind !== "findings_from_scout_dependency" && check.kind !== "findings_cover_scout_candidates_gte") return criterion
-    const dependencyNodeKey = mapping.get(check.dependencyNodeKey)
-    return dependencyNodeKey ? { ...criterion, check: { ...check, dependencyNodeKey } } : criterion
-  }) }
+  return { ...value, criteria: value.criteria.map(criterion => ({ ...criterion,
+    check: remapTaskGraphVerificationCheckDependencies(criterion.check, mapping) })) }
 }
 function branchEnvelopeMatches(source: StoredTaskGraphNode, replacement: StoredTaskGraphNode, mapping: ReadonlyMap<string, string>): boolean {
   const normalized = { ...source, dependsOn: source.dependsOn.map(key => mapping.get(key) ?? key),
