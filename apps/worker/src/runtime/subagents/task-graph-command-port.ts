@@ -18,6 +18,7 @@ import type { TaskGraphVerificationContract } from "../planning/task-graph-verif
 import type { TaskGraphExecutionFailureCategory } from "./task-graph-failure-category.js"
 import type { TaskGraphStructuredOutputFailureCategory } from "./task-graph-structured-failure-category.js"
 import type { DiscoveryAttemptHealth } from "./child-discovery-attempt.js"
+import type { DiscoveryQueryFootprint } from "./child-discovery-query-footprint.js"
 import type { TaskGraphHistoricalDiscoveryPage, TaskGraphHistoricalDiscoveryPageRequest } from "./task-graph-historical-discovery-page-contract.js"
 import type { TaskGraphSourceCheckpoint, TaskGraphSourceIntentNode } from "./task-graph-pg-source-provenance.js"
 import type { TaskGraphScheduledAuditInput, TaskGraphScheduledAuditCompletionInput, TaskGraphScheduledAuditInvocationInput, TaskGraphScheduledAuditResumeInput, ScheduledAuditAppendReceipt, ScheduledAuditCompletionProof, ScheduledAuditInvocationProof, ScheduledAuditResumeContext } from "./scheduled-audit-contract.js"
@@ -177,6 +178,7 @@ export type TaskGraphCurrentNode = Readonly<{
   resultSummary: string | null
   resultProjection?: TaskGraphResultProjection
   discoveryAttemptHealth?: DiscoveryAttemptHealth
+  discoveryQueryFootprint?: DiscoveryQueryFootprint
   verificationCriterionIds?: readonly string[]
   verification?: TaskGraphVerificationContract
   verificationReport?: TaskGraphVerificationReport
@@ -193,6 +195,8 @@ export type TaskGraphCurrentState = Readonly<{
   nodes: readonly TaskGraphCurrentNode[]
   rootSuccessCriteria?: readonly string[]
   planningFacts?: import("./task-graph-planning-facts.js").TaskGraphPlanningFacts
+  /** Internal owner-read provenance; stripped before model-facing observation construction. */
+  discoveryTurnEligibility?: "ordinary"
 }>
 /** Private planning read; checkpoint data stays outside the model-facing state. */
 export type TaskGraphPlanningCurrentState = Readonly<{

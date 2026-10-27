@@ -72,11 +72,55 @@ describe("jobs.discover tool", () => {
 
   it("fails closed when runtime scope or role differs from the captured lease", async () => {
     const client: JobDiscoveryClient = { discover: vi.fn(async () => output) }
-    const tool = createJobsDiscoverTool({ client, fence })
+    const onEffectiveCriteria = vi.fn()
+    const tool = createJobsDiscoverTool({ client, fence, onEffectiveCriteria })
     await expect(tool.execute(context({ userId: "user-2" }), input)).rejects.toMatchObject({ code: "job_discovery_context_unavailable" })
     await expect(tool.execute(context({ taskId: "child-2" }), input)).rejects.toMatchObject({ code: "job_discovery_context_unavailable" })
     await expect(tool.execute(context({ actorRole: "orchestrator" }), input)).rejects.toMatchObject({ code: "job_discovery_context_unavailable" })
     expect(client.discover).not.toHaveBeenCalled()
+    expect(onEffectiveCriteria).not.toHaveBeenCalled()
+  })
+
+  it("captures only effective post-policy criteria while leaving the client cursor intact", async () => {
+    const client: JobDiscoveryClient = { discover: vi.fn(async () => output) }
+    const onEffectiveCriteria = vi.fn()
+    const tool = createJobsDiscoverTool({ client, fence, onEffectiveCriteria })
+    const registry = new ToolRegistry([tool as RuntimeToolDefinition])
+    const sink = new InMemoryToolLifecycleSink()
+    const policy = new PolicyEngine({
+      snapshot: { version: "policy.v1", rules: [{
+        id: "test-discovery-write", roles: ["subagent"], tools: ["jobs.discover"], toolVersions: ["1"], risks: ["internal_write"],
+        domains: ["jobs"], requiredCapabilities: ["read"], outcome: "allow", reasonCode: "test_discovery_allowed", reason: "Test-only exact discovery permission",
+      }] },
+      hooks: [{ name: "normalize-discovery", order: 10, stage: "before_tool_use", evaluate: () => ({
+        outcome: "rewrite_input", rewrite: { safeInput: {
+          targetRoles: ["Normalized Engineer"], targetLocations: ["Dublin"], source: "lever", pageSize: 10, cursor: "opaque-cursor",
+        } },
+      }) }],
+    })
+    const router = new ToolRouter(registry, new ToolLifecycle({ sink, references: new InMemoryToolResultReferenceStore() }), policy)
+
+    await expect(router.execute(context(), { id: "call-1", toolName: "jobs.discover", toolVersion: "1", input: {
+      targetRoles: ["Unnormalized Engineer"], targetLocations: ["Warsaw"], cursor: "model-cursor",
+    } })).resolves.toMatchObject({ status: "completed" })
+
+    expect(onEffectiveCriteria).toHaveBeenCalledWith(expect.objectContaining({ toolCallId: "call-1" }), {
+      availability: "captured", criteria: {
+        targetRoles: ["Normalized Engineer"], targetLocations: ["Dublin"], source: "lever", pageSize: 10, hasCursor: true,
+      },
+    })
+    expect(client.discover).toHaveBeenCalledWith({ ...fence, stepId: "step-1", toolCallId: "call-1",
+      targetRoles: ["Normalized Engineer"], targetLocations: ["Dublin"], source: "lever", pageSize: 10, cursor: "opaque-cursor",
+    }, expect.anything())
+    expect(JSON.stringify(onEffectiveCriteria.mock.calls[0])).not.toContain("opaque-cursor")
+    expect(JSON.stringify(onEffectiveCriteria.mock.calls[0])).not.toContain("model-cursor")
+  })
+
+  it("keeps discovery execution when the observation callback throws", async () => {
+    const client: JobDiscoveryClient = { discover: vi.fn(async () => output) }
+    const tool = createJobsDiscoverTool({ client, fence, onEffectiveCriteria: () => { throw new Error("observer failure") } })
+    await expect(tool.execute(context(), input)).resolves.toEqual(output)
+    expect(client.discover).toHaveBeenCalledOnce()
   })
 
   it("marks a cancelled in-flight request without emitting a completed receipt", async () => {

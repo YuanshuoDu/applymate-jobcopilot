@@ -167,7 +167,7 @@ async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: Subagen
     resolveOwner: () => executionOwner,
     ...(discoveryObservers ? { onDiscoveryAttemptLifecycleEvent: discoveryObservers.observeLifecycleEvent } : {}),
   }, toolPolicy, undefined, undefined, artifacts ? { store: artifacts } : undefined, undefined,
-  discoveryFence ? { client: discoveryClient ?? createJobDiscoveryClient(), fence: discoveryFence } : undefined, scheduledPrepare, recordPolicyDecision)
+  discoveryFence ? { client: discoveryClient ?? createJobDiscoveryClient(), fence: discoveryFence, ...(discoveryObservers ? { onEffectiveCriteria: discoveryObservers.observeEffectiveCriteria } : {}) } : undefined, scheduledPrepare, recordPolicyDecision)
   registerProductionChildWaitTool({ pool, task, lease, registry: runtime.registry })
   return {
     definitions: runtime.registry.list(), router: runtime.router,

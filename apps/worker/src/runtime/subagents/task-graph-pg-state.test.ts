@@ -19,6 +19,8 @@ type QueryResult = { rows: Array<Record<string, unknown>>; rowCount: number }
 type QueryCall = { sql: string; values: readonly unknown[] }
 type ClientOptions = {
   itemContent?: unknown
+  turnSource?: string
+  turnExecutionMode?: string | null
   taskRows?: Array<Record<string, unknown>>
   events?: Array<Record<string, unknown>>
   sourceStepRows?: Array<Record<string, unknown>>
@@ -166,7 +168,8 @@ function fakeClient(options: ClientOptions = {}) {
         }
       }
       if (sql.startsWith('SELECT item."id"')) {
-        return { rows: [{ id: itemId, revision: 4, content: options.itemContent ?? validSnapshot(), createdAt: new Date("2026-09-20T12:00:00.000Z") }], rowCount: 1 }
+        return { rows: [{ id: itemId, revision: 4, content: options.itemContent ?? validSnapshot(), createdAt: new Date("2026-09-20T12:00:00.000Z"),
+          turnSource: options.turnSource, turnExecutionMode: options.turnExecutionMode }], rowCount: 1 }
       }
       if (sql.startsWith('SELECT task."id", task."status"')) {
         return { rows: options.taskRows ?? [validTaskRow()], rowCount: (options.taskRows ?? [validTaskRow()]).length }
@@ -186,6 +189,20 @@ function fakeClient(options: ClientOptions = {}) {
 }
 
 describe("TaskGraph PostgreSQL state loading", () => {
+  it("derives discovery eligibility from the owner-scoped Turn without selecting private input", async () => {
+    const ordinary = fakeClient({ turnSource: "user", turnExecutionMode: "canonical_task_graph" })
+    expect((await loadTaskGraph(ordinary.client, identity, false)).discoveryTurnEligibility).toBe("ordinary")
+    const itemQuery = ordinary.calls.find(call => call.sql.startsWith('SELECT item."id"'))?.sql ?? ""
+    expect(itemQuery).toContain('to_jsonb(turn)->>\'source\' AS "turnSource"')
+    expect(itemQuery).toContain('to_jsonb(turn)->>\'executionMode\' AS "turnExecutionMode"')
+    expect(itemQuery).not.toContain('turn."input"')
+
+    const scheduled = fakeClient({ turnSource: "automation", turnExecutionMode: "canonical_task_graph" })
+    expect((await loadTaskGraph(scheduled.client, identity, false)).discoveryTurnEligibility).toBe("scheduled")
+    const unknown = fakeClient({ turnSource: "user", turnExecutionMode: null })
+    expect((await loadTaskGraph(unknown.client, identity, false)).discoveryTurnEligibility).toBe("unknown")
+  })
+
   it("keeps provenance opt-in and returns only the private current checkpoint on a planning read", async () => {
     const currentStep = { id: "root-step", userId: identity.userId, turnUserId: identity.userId,
       sessionId: identity.sessionId, turnId: identity.turnId, rootTaskId: identity.rootTaskId, taskId: identity.rootTaskId,
