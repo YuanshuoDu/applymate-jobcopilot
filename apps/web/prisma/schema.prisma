@@ -2225,6 +2225,8 @@ model SubAgentTask {
   attemptCount         Int       @default(0)
   maxAttempts          Int       @default(1)
   nextAttemptAt        DateTime?
+  absoluteDeadlineAt   DateTime?
+  leaseSegmentStartedAt DateTime?
   leaseOwner           String?
   leaseExpiresAt       DateTime?
   startedAt            DateTime?
@@ -2254,6 +2256,7 @@ model SubAgentTask {
 
   @@index([sessionId, status])
   @@index([status, nextAttemptAt, updatedAt])
+  @@index([status, absoluteDeadlineAt])
   @@index([sessionId, role])
   @@index([sessionId, path])
   @@index([sessionId, rootTaskId, path])

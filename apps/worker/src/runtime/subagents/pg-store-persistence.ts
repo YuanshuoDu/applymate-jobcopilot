@@ -35,6 +35,7 @@ export function rowToTask(row: Record<string, unknown>): SubagentTaskRecord {
     context: row.context, expectedOutputSchema: row.expectedOutputSchema, result: row.result ?? null,
     failureReason: row.failureReason ? String(row.failureReason) : null, attemptCount: Number(row.attemptCount),
     maxAttempts: Number(row.maxAttempts), nextAttemptAt: dateValue(row.nextAttemptAt), leaseOwner: row.leaseOwner ? String(row.leaseOwner) : null,
+    absoluteDeadlineAt: dateValue(row.absoluteDeadlineAt), leaseSegmentStartedAt: dateValue(row.leaseSegmentStartedAt),
     leaseExpiresAt: dateValue(row.leaseExpiresAt), interruptRequestedAt: dateValue(row.interruptRequestedAt),
     modelProfileSnapshot: row.modelProfileSnapshot, budgetSnapshot: row.budgetSnapshot, toolPolicySnapshot: row.toolPolicySnapshot,
   }
@@ -74,6 +75,8 @@ export function spawnKey(sessionId: string, key: string): string { return `coord
 export const INSERT_TASK = `INSERT INTO "sub_agent_tasks" (
   "id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status",
   "goal", "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema",
-  "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "updatedAt")
+  "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "updatedAt",
+  "absoluteDeadlineAt", "leaseSegmentStartedAt")
   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'queued', $10, $11::jsonb, $12::jsonb, $13::jsonb,
-    $14::jsonb, $15::jsonb, $16::jsonb, $17::jsonb, $18::jsonb, 0, $19, CURRENT_TIMESTAMP)`
+    $14::jsonb, $15::jsonb, $16::jsonb, $17::jsonb, $18::jsonb, 0, $19, CURRENT_TIMESTAMP,
+    CASE WHEN $20::boolean THEN clock_timestamp() + interval '60 minutes' ELSE NULL END, NULL)`

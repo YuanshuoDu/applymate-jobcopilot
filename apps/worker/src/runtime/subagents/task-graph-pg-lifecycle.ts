@@ -1,12 +1,14 @@
 import { deriveTaskGraphReadModel, reduceTaskGraphEvent, type TaskGraphEvent, type TaskGraphEventType, type TaskGraphState } from "../planning/task-graph.js"
 import type { Queryable } from "./pg-store-persistence.js"
-import { hasPersistedTaskGraphMembership, loadTaskGraph, type GraphIdentityScope, type GraphTaskRow } from "./task-graph-pg-state.js"
+import { hasPersistedTaskGraphMembership, loadTaskGraph, type GraphIdentityScope } from "./task-graph-pg-state.js"
 import { sanitizeTaskGraphLifecycleEvent, writeTaskLifecycleReceipt } from "./task-graph-pg-events.js"
-import { taskGraphLifecycleKey, type StoredTaskGraphNode } from "./task-graph-snapshot.js"
+import { taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 import { isTaskGraphDependencyContextError, materializeTaskGraphDependencyContext } from "./task-graph-dependency-context.js"
 import { loadScopedTaskGraphDependencyContext } from "./task-graph-pg-dependency-context-loader.js"
 import { enqueueReadyGraphTask } from "./task-graph-pg-dispatch.js"
 import { sourceIntentForTaskGraphNode } from "./task-graph-source-intent-context.js"
+import { deleteGraphDispatch, hasCompletedLegacyAncestor, isActiveGraphStatus } from "./task-graph-pg-reconcile-helpers.js"
+export { deleteGraphDispatch }
 
 export type PreparedGraphTransition = Readonly<{
   scope: GraphIdentityScope
@@ -213,6 +215,7 @@ export async function reconcileGraphDependents(
           "status" = 'queued', "nextAttemptAt" = NULL, "updatedAt" = $7
         WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4
           AND "parentTaskId" = $5 AND "status" = 'waiting'
+          AND ("absoluteDeadlineAt" IS NULL OR "absoluteDeadlineAt" > clock_timestamp())
           AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = $2 AND session."userId" = $8)`,
       [row.id, scope.sessionId, scope.turnId, scope.rootTaskId, scope.parentTaskId, JSON.stringify(dependencyContext), now, scope.userId])
       if (updated.rowCount === 1) {
@@ -224,29 +227,6 @@ export async function reconcileGraphDependents(
     if (!changed) return
   }
   throw new Error("task_graph_dependency_reconciliation_limit")
-}
-
-/** A repair receipt satisfies its typed target; it does not replace that node's dependency lineage. */
-function hasCompletedLegacyAncestor(
-  key: string,
-  nodes: ReadonlyMap<string, StoredTaskGraphNode>,
-  tasks: ReadonlyMap<string, GraphTaskRow>,
-): boolean {
-  const node = nodes.get(key)
-  if (!node) return false
-  if (node.verificationDisposition === "legacy_unverified" && tasks.get(node.taskId)?.status === "completed") return true
-  return node.verificationDisposition === "typed" && node.dependsOn.some(dependency => hasCompletedLegacyAncestor(dependency, nodes, tasks))
-}
-
-function isActiveGraphStatus(status: string): boolean {
-  return status === "queued" || status === "retrying" || status === "waiting"
-    || status === "waiting_for_user" || status === "running"
-}
-
-export async function deleteGraphDispatch(client: Queryable, sessionId: string, taskId: string): Promise<void> {
-  await client.query(`DELETE FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch'
-    AND "aggregateId" = $1 AND "idempotencyKey" = $2 AND "publishedAt" IS NULL`,
-  [sessionId, `subagent-dispatch:${taskId}`])
 }
 
 function makeEvent(input: { type: TaskGraphEventType; attemptCount: number; failureReason?: string; taskId: string;

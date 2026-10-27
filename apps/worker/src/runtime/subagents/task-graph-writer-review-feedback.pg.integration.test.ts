@@ -176,7 +176,8 @@ describeWithPostgres("Writer review feedback persistence on disposable PostgreSQ
         "id" text PRIMARY KEY, "sessionId" text NOT NULL, "turnId" text NOT NULL, "rootTaskId" text NOT NULL,
         "parentTaskId" text, "role" text NOT NULL, "taskType" text NOT NULL, "status" text NOT NULL,
         "leaseOwner" text, "leaseExpiresAt" timestamptz,
-        "attemptCount" integer NOT NULL DEFAULT 1, "interruptRequestedAt" timestamptz, "context" jsonb NOT NULL
+        "attemptCount" integer NOT NULL DEFAULT 1, "interruptRequestedAt" timestamptz, "context" jsonb NOT NULL,
+        "absoluteDeadlineAt" TIMESTAMP(3), "leaseSegmentStartedAt" TIMESTAMP(3)
       )`,
       `CREATE TABLE "agent_artifact" (
         "id" text PRIMARY KEY, "userId" text NOT NULL, "jobId" text NOT NULL, "artifactType" text NOT NULL,

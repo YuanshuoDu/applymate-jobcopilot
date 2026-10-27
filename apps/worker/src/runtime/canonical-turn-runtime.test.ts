@@ -3913,7 +3913,7 @@ describe("createCanonicalTurnRuntime", () => {
       expect(text).toContain("visible agent.list only for matching result pages")
       expect(text).toContain("complete current result pages")
       expect(text).toContain("preserve the valid plan")
-      expect(text).toContain("Historical typed-check descriptors distinguish count, evidence-completeness, score, Scout-dependency, and declared cohort-coverage failure shapes only")
+      expect(text).toContain("Historical typed-check descriptors distinguish count, evidence-completeness, score, Scout-dependency, and declared cohort-coverage checks in their source graph")
       expect(text?.endsWith(expectedHistoricalInspectionSuffix)).toBe(true)
       expect(text?.split("Historical execution-category lessons identify").length).toBe(2)
       expect(text).not.toMatch(/PRIVATE_HISTORY|historical-scout|candidate-count|nodeOrdinal|criterionOrdinal|reported count/i)

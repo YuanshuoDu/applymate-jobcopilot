@@ -15,7 +15,7 @@ const input = {
 }
 
 type DeferredFence = { lastError: string | null; payload?: unknown; publishedAt?: unknown; attemptCount?: unknown }
-function poolFixture(options: { pause?: boolean; rootInterrupted?: boolean; turnUnavailable?: boolean; childWaitResumable?: boolean; gateResumeStep?: boolean; taskAttemptCount?: number; maxAttempts?: number; role?: string; taskType?: string; failureReason?: string | null; outbox?: DeferredFence } = {}) {
+function poolFixture(options: { pause?: boolean; rootInterrupted?: boolean; turnUnavailable?: boolean; childWaitResumable?: boolean; gateResumeStep?: boolean; taskAttemptCount?: number; maxAttempts?: number; role?: string; taskType?: string; failureReason?: string | null; outbox?: DeferredFence; graphDeadlineAt?: Date | null; expiredGraphChild?: boolean } = {}) {
   const calls: string[] = []
   const parameters: Array<unknown[] | undefined> = []
   const outbox = options.outbox ? { id: "dispatch-1", ...options.outbox, payload: options.outbox.payload ?? { taskId: "child-1", sessionId: "session-1", rootTaskId: "root-1", ownerId: "worker-1" } } : null
@@ -24,7 +24,9 @@ function poolFixture(options: { pause?: boolean; rootInterrupted?: boolean; turn
   const task = { id: "child-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1",
     path: "/root-1/child-1", depth: 1, role, taskType, status: "running", goal: "inspect", constraints: [],
     successCriteria: [], allowedActions: [], context: {}, expectedOutputSchema: {}, attemptCount: options.taskAttemptCount ?? 1, maxAttempts: options.maxAttempts ?? 3,
-    leaseOwner: "worker-1", leaseExpiresAt: new Date("2026-10-06T10:01:00Z"), interruptRequestedAt: null, failureReason: options.failureReason ?? null }
+    leaseOwner: "worker-1", leaseExpiresAt: new Date("2026-10-06T10:01:00Z"), startedAt: null,
+    absoluteDeadlineAt: options.graphDeadlineAt ?? null, leaseSegmentStartedAt: null,
+    interruptRequestedAt: null, failureReason: options.failureReason ?? null }
   const client = {
     query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push(sql)
@@ -56,7 +58,7 @@ function poolFixture(options: { pause?: boolean; rootInterrupted?: boolean; turn
         const scheduledAudit = params?.[9] === true
         const sameAttemptContinuation = currentDispatch && exactWait
         const exhausted = (options.taskAttemptCount ?? 1) >= (options.maxAttempts ?? 3)
-        const rowCount = (exactWait || gateResume) && !currentDispatch || exhausted && !(currentDispatch && (exactWait || gateResume)) ? 0 : 1
+        const rowCount = options.expiredGraphChild || (exactWait || gateResume) && !currentDispatch || exhausted && !(currentDispatch && (exactWait || gateResume)) ? 0 : 1
         if (rowCount === 1 && options.gateResumeStep && gateResume) task.attemptCount += 1
         if (rowCount === 1 && scheduledAudit && !sameAttemptContinuation) task.failureReason = null
         return { rows: [], rowCount }
@@ -86,6 +88,26 @@ describe("atomic child claim pause fence", () => {
     expect(admission).toBeLessThan(root)
     expect(root).toBeLessThan(child)
     expect(admission).toBeLessThan(update)
+  })
+
+  it("starts a fresh bounded execution segment for each Graph claim without replacing the first start time", async () => {
+    const deadline = new Date("2026-10-06T11:00:00Z")
+    const fake = poolFixture({ graphDeadlineAt: deadline })
+    await expect(claimSubagentTask(fake.pool, input, 600_000)).resolves.toMatchObject({ id: "child-1", absoluteDeadlineAt: deadline })
+    const update = fake.calls.find(sql => sql.startsWith('UPDATE "sub_agent_tasks"')) ?? ""
+    expect(update).toContain('"leaseSegmentStartedAt" = CASE WHEN task."absoluteDeadlineAt" IS NULL THEN task."leaseSegmentStartedAt" ELSE clock_timestamp() END')
+    expect(update).toContain('"leaseExpiresAt" = LEAST(clock_timestamp() + ($4 * INTERVAL \'1 millisecond\')')
+    expect(update).toContain('COALESCE(task."absoluteDeadlineAt", \'infinity\'::timestamptz)')
+    expect(update).toContain('"startedAt" = COALESCE("startedAt", clock_timestamp())')
+    expect(update).toContain('task."absoluteDeadlineAt" > clock_timestamp()')
+  })
+
+  it("rejects a Graph claim when the database clock reaches its absolute deadline", async () => {
+    const fake = poolFixture({ graphDeadlineAt: input.now, expiredGraphChild: true })
+    await expect(claimSubagentTask(fake.pool, input, 60_000)).resolves.toBeNull()
+    const update = fake.calls.find(sql => sql.startsWith('UPDATE "sub_agent_tasks"')) ?? ""
+    expect(update).toContain('task."absoluteDeadlineAt" > clock_timestamp()')
+    expect(fake.calls.at(-1)).toBe("COMMIT")
   })
 
   it("does not claim or spend an attempt when pause admission is denied", async () => {

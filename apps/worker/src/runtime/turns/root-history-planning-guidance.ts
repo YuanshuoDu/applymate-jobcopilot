@@ -16,6 +16,7 @@ const STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_f
 const EXECUTION_FAILURE_CATEGORY_ORDER = ["execution_setup_unavailable", "resume_state_unavailable", "structured_output_invalid"] as const
 const HISTORICAL_CATEGORY_INTRO = "Historical execution-category lessons identify earlier prerequisites worth inspecting; they remain hypotheses, so compare them with the current graph, current evidence, and currently available inputs before choosing a next action."
 const FAILED_REPAIR_REASSESSMENT = "A historical repair was verifier-failed; reassess the current graph, verifier evidence, and current result pages before planning."
+const PASSED_CRITERIA_REASSESSMENT = "Historical passed-check descriptors are advisory source-graph checks only; compare them with current accepted instructions, the current graph, criteria, and results, and reverify current work. They do not establish current progress or proof, and past queries or results need not match current ones."
 const REASONS = new Set([
   "criterion_not_met", "reported_score_below_minimum", "contract_invalid", "projection_invalid", "role_mismatch",
   "canonical_evidence_missing", "canonical_evidence_invalid", "canonical_evidence_ambiguous", "result_invalid",
@@ -23,8 +24,8 @@ const REASONS = new Set([
 ])
 
 type Row = Record<string, unknown>
-type SafeHistoryNodeFacts = Readonly<{ hasFact: boolean; hasFailedRepair: boolean; executionFailureCategory?: unknown }>
-type SafeHistoryObservation = Readonly<{ executionFailureCategories: ReadonlySet<string>; hasPlanShape: boolean; hasFailedRepair: boolean }>
+type SafeHistoryNodeFacts = Readonly<{ hasFact: boolean; hasFailedRepair: boolean; hasPassedCriteria: boolean; executionFailureCategory?: unknown }>
+type SafeHistoryObservation = Readonly<{ executionFailureCategories: ReadonlySet<string>; hasPlanShape: boolean; hasFailedRepair: boolean; hasPassedCriteria: boolean }>
 
 function exactRecord(value: unknown, keys: readonly string[]): Row | undefined {
   try {
@@ -70,12 +71,13 @@ function safeHistoryNode(value: unknown): SafeHistoryNodeFacts | undefined {
     const hints = safeArray(node.negativeReasonHints, 8, 1)
     if (!hints || hints.some(hint => typeof hint !== "string" || !REASONS.has(hint))) return undefined
   }
-  let hasFact = false, hasFailedRepair = false, executionFailureCategory: unknown
+  let hasFact = false, hasFailedRepair = false, hasPassedCriteria = false, executionFailureCategory: unknown
   if (Object.hasOwn(node, "lesson")) {
     const lesson = parseRootTaskHistoryNodeLesson(node.lesson, node.taskKind, node.status)
     if (!lesson) return undefined
     hasFact = true
     hasFailedRepair = lesson.failedRepairOf !== undefined
+    hasPassedCriteria = lesson.passedCriteria !== undefined
     executionFailureCategory = lesson.executionFailureCategory
   }
   if (Object.hasOwn(node, "reportedOutput")) {
@@ -86,7 +88,7 @@ function safeHistoryNode(value: unknown): SafeHistoryNodeFacts | undefined {
       || !Number.isSafeInteger(output[countKey]) || Number(output[countKey]) < 0) return undefined
     hasFact = true
   }
-  return { hasFact, hasFailedRepair, ...(executionFailureCategory === undefined ? {} : { executionFailureCategory }) }
+  return { hasFact, hasFailedRepair, hasPassedCriteria, ...(executionFailureCategory === undefined ? {} : { executionFailureCategory }) }
 }
 
 function safeHistoryTurn(value: unknown): Readonly<{ row: Row; planShape?: unknown }> | undefined {
@@ -116,7 +118,7 @@ function safeHistoryObservation(value: unknown): SafeHistoryObservation | undefi
     || content.notCurrentEvidence !== true || content.label !== HISTORY_LABEL) return undefined
   const turns = safeArray(content.turns, MAX_TURNS, 1)
   if (!turns) return undefined
-  let nodeCount = 0, hasFact = false, hasPlanShape = false, hasFailedRepair = false
+  let nodeCount = 0, hasFact = false, hasPlanShape = false, hasFailedRepair = false, hasPassedCriteria = false
   const executionFailureCategories = new Set<string>()
   for (const value of turns) {
     const candidate = safeHistoryTurn(value), turn = candidate?.row
@@ -128,12 +130,13 @@ function safeHistoryObservation(value: unknown): SafeHistoryObservation | undefi
       if (facts === undefined) return undefined
       hasFact ||= facts.hasFact
       hasFailedRepair ||= facts.hasFailedRepair
+      hasPassedCriteria ||= facts.hasPassedCriteria
       if (typeof facts.executionFailureCategory === "string") executionFailureCategories.add(facts.executionFailureCategory)
     }
     const shape = parseRootTaskHistoryPlanShape(candidate.planShape)
     if (shape && shape.nodes.length === nodes.length) hasPlanShape = true
   }
-  return hasFact || hasPlanShape ? { executionFailureCategories, hasPlanShape, hasFailedRepair } : undefined
+  return hasFact || hasPlanShape ? { executionFailureCategories, hasPlanShape, hasFailedRepair, hasPassedCriteria } : undefined
 }
 
 function visibleToolNames(tools: readonly unknown[]): ReadonlySet<string> {
@@ -160,7 +163,7 @@ export function buildRootHistoryPlanningInstruction(context: StepContext, tools:
     const revision = Number.isSafeInteger(context.taskGraphRevision) && Number(context.taskGraphRevision) >= 0
       ? Number(context.taskGraphRevision) : undefined
     const guidance = [
-      "Keep the complete original Turn task, accepted current user instructions, and success criteria authoritative. Earlier same-session failures, repairs, and reported outputs are hypotheses only; compare them with the current owner-read TaskGraph, current verifier evidence, and complete current result pages. Historical typed-check descriptors distinguish count, evidence-completeness, score, Scout-dependency, and declared cohort-coverage failure shapes only; reconstruct their meaning from the current typed criteria before planning.",
+      "Keep the complete original Turn task, accepted current user instructions, and success criteria authoritative. Earlier same-session failures, repairs, and reported outputs are hypotheses only; compare them with the current owner-read TaskGraph, current verifier evidence, and complete current result pages. Historical typed-check descriptors distinguish count, evidence-completeness, score, Scout-dependency, and declared cohort-coverage checks in their source graph. Interpret each descriptor only as its historical source check; derive any current plan independently from current accepted instructions, the current graph, and current typed criteria.",
       "Historical source-local ordinals and reported success are never current command targets, proof, permission, approval, progress, or completion. Only current observed node and criterion identities may target a repair.",
       names.has("agent.list")
         ? "Use the owner-read graph observation for current node, criterion, and revision identities; use the visible agent.list only for matching result pages. Continue with exactly the returned nextOffset on the same node and revision until it is null. A stale or unavailable page requires a refreshed owner-read graph observation before retry. Null ends paging for that node and revision only, never the task or verification. A short page or sample count is not proof of completeness."
@@ -179,6 +182,7 @@ export function buildRootHistoryPlanningInstruction(context: StepContext, tools:
     const content = [
       guidance,
       ...(historical.hasFailedRepair ? [FAILED_REPAIR_REASSESSMENT] : []),
+      ...(historical.hasPassedCriteria ? [PASSED_CRITERIA_REASSESSMENT] : []),
       ...(categoryAdvice.length ? [`${HISTORICAL_CATEGORY_INTRO} ${categoryAdvice.join(" ")}`] : []),
       ...(historical.hasPlanShape ? ["A prior same-objective plan shape is a comparison hint about source-local roles and dependencies only. Its ordinals and edges are not current graph keys, identities, revision, objective, criteria, evidence, permission, authorization, approval, progress, or completion. Rebuild any plan from the current owner-read graph, current objective and criteria, current evidence, and visible tools; current verification and completion gates remain authoritative."] : []),
     ].join(" ")

@@ -11,6 +11,7 @@ import { recoverExpiredDurableSubagentWaitWithGraph } from "./durable-subagent-w
 import { recoverExpiredWaitRegistration } from "./durable-subagent-wait-store.js"
 import { repairStaleWaitProjection, type WaitProjectionRejectionStage } from "./pg-store-expiry-recovery-wait-projection.js"
 import { CHILD_WAIT_CONSUMED_SQL, CHILD_WAIT_RESUMABLE_SQL, hasBlockingExternalCall } from "./pg-store-expiry-recovery-predicates.js"
+import { taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 
 type RecoveryCursor = Readonly<{ sessionId: string; rootIsNull: boolean; rootKey: string; taskId: string }>
 type Candidate = Record<string, unknown> & Readonly<{ id: string; sessionId: string; userId: string; rootTaskId?: string | null; turnId?: string | null;
@@ -108,21 +109,25 @@ async function recoverOne(client: pg.PoolClient, candidate: Candidate, filter: {
   if (trace) trace.childWaitResumable = old.childWaitResumable === true
   const attemptCount = Number(old.attemptCount)
   const closedSession = old.sessionStatus === "aborted" || old.sessionStatus === "archived"
-  const interrupted = closedSession || old.interruptRequestedAt !== null || old.rootInterruptRequestedAt != null
+  const previewInterrupted = closedSession || old.interruptRequestedAt != null || old.rootInterruptRequestedAt != null
   const canonicalRoot = typeof old.id === "string" && old.id.startsWith("root-")
-  const failedRootTurn = canonicalRoot && !interrupted ? await lockFailedRootTurn(client, old) : false
-  if (canonicalRoot && !interrupted && !failedRootTurn) return rejectRecovery(trace, "root_turn_not_recoverable")
+  const failedRootTurn = canonicalRoot && !previewInterrupted ? await lockFailedRootTurn(client, old) : false
+  if (canonicalRoot && !previewInterrupted && !failedRootTurn) return rejectRecovery(trace, "root_turn_not_recoverable")
   const atAttemptCeiling = attemptCount >= Number(old.maxAttempts)
   const childWaitResumable = old.childWaitResumable === true
   const childWaitContinuationId = typeof old.childWaitContinuationId === "string" ? old.childWaitContinuationId : undefined
   const childWaitConsumed = childWaitContinuationId !== undefined
-  let waitContinuation = !interrupted && !failedRootTurn && childWaitResumable
   const locked = await client.query(`${sql} FOR UPDATE OF task`, values)
   const row = locked.rows[0] as Record<string, unknown> | undefined
   if (!row || Number(row.attemptCount) !== attemptCount || row.turnId !== (candidate.turnId ?? null)
     || (row.childWaitResumable === true) !== childWaitResumable || (typeof row.childWaitContinuationId === "string" ? row.childWaitContinuationId : undefined) !== childWaitContinuationId
+    || (old.interruptRequestedAt != null) !== (row.interruptRequestedAt != null)
+    || (old.rootInterruptRequestedAt != null) !== (row.rootInterruptRequestedAt != null)
       || (canonicalRoot && (row.taskType !== old.taskType || row.id !== old.id || row.rootTaskId !== old.rootTaskId
        || row.parentTaskId !== old.parentTaskId || row.turnId !== old.turnId))) return rejectRecovery(trace, "task_lock_parity_mismatch")
+  const acceptedInterrupt = row.interruptRequestedAt != null || row.rootInterruptRequestedAt != null
+  const interrupted = closedSession || acceptedInterrupt
+  let waitContinuation = !interrupted && !failedRootTurn && childWaitResumable
   const checkedAt = (await client.query<{ checkedAt: Date }>(`SELECT clock_timestamp() AS "checkedAt"`)).rows[0]?.checkedAt
   if (!checkedAt) return rejectRecovery(trace, "recovery_clock_missing")
   const lockedExpiry = dateValue(row.leaseExpiresAt)
@@ -174,11 +179,28 @@ async function recoverOne(client: pg.PoolClient, candidate: Candidate, filter: {
   }
   const unsettledExternalCall = await hasBlockingExternalCall(client, row, rejectedWaitCallId, waitContinuation && childWaitConsumed && !rejectedWaitCallId ? childWaitContinuationId : undefined)
   if (trace) trace.blockingExternalCall = unsettledExternalCall
-  if (unsettledExternalCall && (!waitContinuation || childWaitConsumed)) return rejectRecovery(trace, "unsettled_external_call_rejected")
+  let graph: Awaited<ReturnType<typeof prepareGraphTransition>> = null
+  if (unsettledExternalCall && (!waitContinuation || childWaitConsumed)) {
+    const deadline = dateValue(row.absoluteDeadlineAt)
+    if (!acceptedInterrupt || !deadline || deadline > checkedAt || typeof candidate.turnId !== "string"
+      || typeof candidate.rootTaskId !== "string" || row.parentTaskId !== candidate.rootTaskId) return rejectRecovery(trace, "unsettled_external_call_rejected")
+    const prepared = await prepareGraphTransition(client, { taskId: candidate.id, sessionId: candidate.sessionId,
+      type: "task.interrupted", attemptCount })
+    const node = prepared && !("blocked" in prepared) ? prepared.snapshot.nodes.find(item => item.taskId === candidate.id) : undefined
+    if (!prepared || "blocked" in prepared || prepared.duplicate || !node
+      || prepared.taskId !== candidate.id || prepared.scope.userId !== candidate.userId
+      || prepared.scope.sessionId !== candidate.sessionId || prepared.scope.turnId !== candidate.turnId
+      || prepared.scope.rootTaskId !== candidate.rootTaskId || prepared.scope.parentTaskId !== candidate.rootTaskId
+      || prepared.event.type !== "task.interrupted" || prepared.event.nodeKey !== node.key
+      || prepared.event.idempotencyKey !== taskGraphLifecycleKey(candidate.rootTaskId, node.key, attemptCount, "task.interrupted")) {
+      return rejectRecovery(trace, "unsettled_external_call_rejected")
+    }
+    graph = prepared
+  }
   const terminal = Boolean(rejectedWaitCallId) || interrupted || failedRootTurn || atAttemptCeiling && !waitContinuation
   const status = terminal ? interrupted ? "interrupted" : "failed" : "queued"
   let failureReason = status === "failed" ? rejectedWaitCallId ? "Persisted wait_subagents call was not admitted for the current child role." : failedRootTurn ? "Linked Turn failed before root lease recovery." : "Worker lease expired after maximum attempts." : old.failureReason ?? null
-  let graph = await prepareGraphTransition(client, {
+  graph ??= await prepareGraphTransition(client, {
     taskId: candidate.id, sessionId: candidate.sessionId,
     type: status === "interrupted" ? "task.interrupted" : status === "failed" ? "task.failed" : "task.retrying",
     attemptCount, ...(status === "failed" ? { failureReason: String(failureReason) } : {}),
@@ -191,6 +213,7 @@ async function recoverOne(client: pg.PoolClient, candidate: Candidate, filter: {
   }
   const nextAttemptAt = status === "queued" && !waitContinuation ? computeSubagentNextAttemptAt(attemptCount, checkedAt) : null
   const updated = await client.query(`UPDATE "sub_agent_tasks" SET "status" = $3, "leaseOwner" = NULL, "leaseExpiresAt" = NULL,
+    "leaseSegmentStartedAt" = CASE WHEN $6 THEN NULL ELSE "leaseSegmentStartedAt" END,
     "nextAttemptAt" = $4, "failureReason" = $5, "completedAt" = CASE WHEN $6 THEN $7::timestamp(3) ELSE NULL::timestamp(3) END, "updatedAt" = $7,
     "result" = CASE WHEN $10 THEN $11::jsonb ELSE "result" END
     WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running'
@@ -215,5 +238,8 @@ async function recoverOne(client: pg.PoolClient, candidate: Candidate, filter: {
     task: rowToTask(row), graph, status, terminal, closedSession, now: checkedAt,
     canonicalFailedRoot: canonicalRoot && failedRootTurn && status === "failed",
   })
-  return { ...rowToTask(row), status, nextAttemptAt, leaseOwner: null, leaseExpiresAt: null, failureReason: failureReason ? String(failureReason) : null, ...(resultUpdated ? { result: persistedResult } : {}) }
+  const recoveredTask = rowToTask(row)
+  return { ...recoveredTask, status, nextAttemptAt, leaseOwner: null, leaseExpiresAt: null,
+    leaseSegmentStartedAt: terminal ? null : recoveredTask.leaseSegmentStartedAt,
+    failureReason: failureReason ? String(failureReason) : null, ...(resultUpdated ? { result: persistedResult } : {}) }
 }

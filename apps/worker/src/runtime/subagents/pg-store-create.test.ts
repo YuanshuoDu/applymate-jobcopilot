@@ -69,6 +69,49 @@ describe("pg-store task creation helpers", () => {
       JSON.stringify(["jobs.search"]), JSON.stringify(parent.modelProfileSnapshot), JSON.stringify(parent.toolPolicySnapshot),
       JSON.stringify({ subagentPolicy: normalizeSubagentPolicy() }),
     ]))
+    expect(calls[insertIndex]?.[1]?.[19]).toBe(false)
+  })
+
+  it("stamps an opted-in canonical child from the database clock and starts with no segment", async () => {
+    const deadline = new Date("2026-10-26T13:00:00.000Z")
+    let insertSql = "", insertValues: unknown[] = []
+    const parent = {
+      id: "parent-1", rootTaskId: "root-1", path: "/root-1", depth: 0, status: "running",
+      allowedActions: ["jobs.search"], modelProfileSnapshot: {}, budgetSnapshot: {}, toolPolicySnapshot: {},
+    }
+    const client = {
+      query: vi.fn(async (sql: string, params?: unknown[]) => {
+        if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")) return { rows: [{ id: "turn-1" }], rowCount: 1 }
+        if (sql.includes('SELECT session."id" FROM "agent_sessions"')) return { rows: [{ id: "session-1" }], rowCount: 1 }
+        if (sql.includes('SELECT "rootTaskId", "turnId"')) return { rows: [{ rootTaskId: "root-1", turnId: "turn-1" }], rowCount: 1 }
+        if (sql.includes('FROM "sub_agent_tasks" AS root')) return { rows: [{ id: "root-1", turnId: "turn-1", status: "running", interruptRequestedAt: null }], rowCount: 1 }
+        if (sql.includes('FROM "sub_agent_tasks"') && sql.includes("FOR UPDATE")) return { rows: [parent], rowCount: 1 }
+        if (sql.includes("COUNT(*)")) return { rows: [{ count: 0 }], rowCount: 1 }
+        if (sql.startsWith('INSERT INTO "sub_agent_tasks"')) {
+          insertSql = sql
+          insertValues = params ?? []
+          return { rows: [{ id: "child-1" }], rowCount: 1 }
+        }
+        if (sql.includes('FROM "sub_agent_tasks" task')) return { rows: [{
+          id: "child-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
+          parentTaskId: "parent-1", path: "/root-1/child-1", depth: 1, role: "analyst", taskType: "research",
+          status: "queued", goal: "inspect", attemptCount: 0, maxAttempts: 3, absoluteDeadlineAt: deadline,
+          leaseSegmentStartedAt: null, leaseOwner: null, leaseExpiresAt: null, interruptRequestedAt: null,
+          modelProfileSnapshot: {}, budgetSnapshot: {}, toolPolicySnapshot: {},
+        }], rowCount: 1 }
+        return { rows: [], rowCount: 0 }
+      }),
+    } as unknown as Queryable
+
+    const child = await createSubagentTask(client, {
+      userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "parent-1",
+      role: "analyst", taskType: "research", goal: "inspect", policy: normalizeSubagentPolicy(),
+    }, true, { taskGraphChildDeadline: true })
+
+    expect(insertSql).toContain(`CASE WHEN $20::boolean THEN clock_timestamp() + interval '60 minutes' ELSE NULL END`)
+    expect(insertValues[19]).toBe(true)
+    expect(child.absoluteDeadlineAt).toEqual(deadline)
+    expect(child.leaseSegmentStartedAt).toBeNull()
   })
 
   it("can preserve an explicit action intersection, including an empty one, in the inserted task", async () => {

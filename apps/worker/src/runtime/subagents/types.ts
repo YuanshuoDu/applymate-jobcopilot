@@ -97,6 +97,10 @@ export type SubagentTaskRecord = {
   maxAttempts: number
   /** Server-owned durable retry eligibility; null means immediately eligible. */
   nextAttemptAt?: Date | null
+  /** Immutable, server-owned TaskGraph child lifetime deadline; legacy rows remain null. */
+  absoluteDeadlineAt?: Date | null
+  /** Database timestamp for the current continuous running segment; legacy rows remain null. */
+  leaseSegmentStartedAt?: Date | null
   leaseOwner: string | null
   leaseExpiresAt: Date | null
   interruptRequestedAt: Date | null

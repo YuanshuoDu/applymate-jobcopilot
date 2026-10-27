@@ -397,7 +397,7 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
     await adminPool.query(`GRANT SELECT ("id", "sessionId", "toTaskId", "turnId", "consumedAt", "targetAttemptCount", "kind", "createdAt") ON "agent_mailbox_messages" TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT UPDATE ("consumedAt") ON "agent_mailbox_messages" TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT SELECT ON "agent_wait_conditions" TO ${RUNTIME_ROLE}`)
-    await adminPool.query(`GRANT UPDATE ("status", "leaseOwner", "leaseExpiresAt", "attemptCount", "startedAt", "updatedAt", "result", "failureReason", "nextAttemptAt", "completedAt") ON "sub_agent_tasks" TO ${RUNTIME_ROLE}`)
+    await adminPool.query(`GRANT UPDATE ("status", "leaseOwner", "leaseExpiresAt", "leaseSegmentStartedAt", "attemptCount", "startedAt", "updatedAt", "result", "failureReason", "nextAttemptAt", "completedAt") ON "sub_agent_tasks" TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT SELECT ON "agent_outbox" TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT UPDATE ("publishedAt", "attemptCount", "lastError", "payload") ON "agent_outbox" TO ${RUNTIME_ROLE}`)
     await adminPool.query(`GRANT UPDATE ("eventSequence") ON "agent_sessions" TO ${RUNTIME_ROLE}`)
@@ -451,6 +451,10 @@ describeWithPostgres("PostgreSQL subagent claim and attempt fencing (P1 acceptan
         tableRlsEnabled: true,
         rowSecurityActive: true,
       })))
+      const deadlinePrivileges = await roleProbe.query<{ leaseSegmentUpdate: boolean; absoluteDeadlineUpdate: boolean }>(`SELECT
+          has_column_privilege(current_user, 'public."sub_agent_tasks"', 'leaseSegmentStartedAt', 'UPDATE') AS "leaseSegmentUpdate",
+          has_column_privilege(current_user, 'public."sub_agent_tasks"', 'absoluteDeadlineAt', 'UPDATE') AS "absoluteDeadlineUpdate"`)
+      expect(deadlinePrivileges.rows[0]).toEqual({ leaseSegmentUpdate: true, absoluteDeadlineUpdate: false })
     } finally {
       roleProbe.release()
     }

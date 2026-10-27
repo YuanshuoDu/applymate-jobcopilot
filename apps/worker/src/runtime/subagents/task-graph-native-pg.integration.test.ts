@@ -123,7 +123,7 @@ async function installRestrictedRoles(): Promise<void> {
 
   await pool!.query(`GRANT SELECT ON "agent_sessions", "agent_turns", "sub_agent_tasks" TO "${claimRole}"`)
   await pool!.query(`GRANT UPDATE ("id") ON "agent_turns" TO "${claimRole}"`)
-  await pool!.query(`GRANT UPDATE ("status", "leaseOwner", "leaseExpiresAt", "attemptCount", "startedAt", "updatedAt", "result", "failureReason", "nextAttemptAt", "completedAt") ON "sub_agent_tasks" TO "${claimRole}"`)
+  await pool!.query(`GRANT UPDATE ("status", "leaseOwner", "leaseExpiresAt", "leaseSegmentStartedAt", "attemptCount", "startedAt", "updatedAt", "result", "failureReason", "nextAttemptAt", "completedAt") ON "sub_agent_tasks" TO "${claimRole}"`)
   await pool!.query(`GRANT SELECT ON "agent_outbox" TO "${claimRole}"`)
   await pool!.query(`GRANT UPDATE ("publishedAt", "attemptCount", "lastError", "payload") ON "agent_outbox" TO "${claimRole}"`)
   await pool!.query(`GRANT UPDATE ("eventSequence") ON "agent_sessions" TO "${claimRole}"`)
@@ -712,10 +712,10 @@ describePg("native TaskGraph PostgreSQL command durability", () => {
     const port = restrictedCommand()
     const sourceA = await port.appendNativeCoordination!(spawn("replace-first-" + suffix))
     const sourceB = await port.appendNativeCoordination!(spawn("claim-first-" + suffix))
-    const roleRows = await pool!.query<{ role: string; superuser: boolean; bypass: boolean; outboxDelete: boolean; turnLock: boolean }>("SELECT role.rolname AS role, role.rolsuper AS superuser, role.rolbypassrls AS bypass, has_table_privilege(role.rolname, 'public.agent_outbox', 'DELETE') AS \"outboxDelete\", has_column_privilege(role.rolname, 'public.\"agent_turns\"', 'id', 'UPDATE') AS \"turnLock\" FROM pg_roles AS role WHERE role.rolname = ANY($1::text[]) ORDER BY role.rolname", [[commandRole, claimRole]])
+    const roleRows = await pool!.query<{ role: string; superuser: boolean; bypass: boolean; outboxDelete: boolean; turnLock: boolean; segmentUpdate: boolean; deadlineUpdate: boolean }>("SELECT role.rolname AS role, role.rolsuper AS superuser, role.rolbypassrls AS bypass, has_table_privilege(role.rolname, 'public.agent_outbox', 'DELETE') AS \"outboxDelete\", has_column_privilege(role.rolname, 'public.\"agent_turns\"', 'id', 'UPDATE') AS \"turnLock\", has_column_privilege(role.rolname, 'public.\"sub_agent_tasks\"', 'leaseSegmentStartedAt', 'UPDATE') AS \"segmentUpdate\", has_column_privilege(role.rolname, 'public.\"sub_agent_tasks\"', 'absoluteDeadlineAt', 'UPDATE') AS \"deadlineUpdate\" FROM pg_roles AS role WHERE role.rolname = ANY($1::text[]) ORDER BY role.rolname", [[commandRole, claimRole]])
     expect(roleRows.rows).toEqual([
-      { role: claimRole, superuser: false, bypass: false, outboxDelete: false, turnLock: true },
-      { role: commandRole, superuser: false, bypass: false, outboxDelete: false, turnLock: true },
+      { role: claimRole, superuser: false, bypass: false, outboxDelete: false, turnLock: true, segmentUpdate: true, deadlineUpdate: false },
+      { role: commandRole, superuser: false, bypass: false, outboxDelete: false, turnLock: true, segmentUpdate: false, deadlineUpdate: false },
     ])
     const immutableBefore = await pool!.query("SELECT session.\"goal\" AS \"sessionGoal\", root.\"goal\" AS \"rootGoal\", root.\"successCriteria\" AS \"rootCriteria\", turn.\"input\" AS \"turnInput\" FROM \"agent_sessions\" AS session JOIN \"sub_agent_tasks\" AS root ON root.\"sessionId\" = session.\"id\" AND root.\"id\" = $2 JOIN \"agent_turns\" AS turn ON turn.\"sessionId\" = session.\"id\" AND turn.\"id\" = $3 WHERE session.\"id\" = $1", [ids.session, ids.root, ids.turn])
     const initial = await port.readCurrent(scope)

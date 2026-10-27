@@ -238,6 +238,9 @@ describe("durable native TaskGraph replay", () => {
 
     await appendNativeGraphCommand(client, input, command, { budgetSnapshot: {}, allowedActions: [] }, loaded)
 
+    expect(nativeAppendMocks.createChild).toHaveBeenCalledWith(client, expect.objectContaining({
+      role: kind === "spawn" ? "scout" : "auditor",
+    }), true, { preserveEmptyAllowedActions: kind === "followup", taskGraphChildDeadline: true })
     const written = nativeAppendMocks.writeSnapshot.mock.calls[0]?.[2] as TaskGraphSnapshot | undefined
     expect(written?.rootSuccessCriteria).toEqual(pinned)
     expect(nativeAppendMocks.appendReceipt.mock.calls[0]?.[1]).toMatchObject({

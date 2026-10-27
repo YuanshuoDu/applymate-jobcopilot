@@ -7,21 +7,18 @@ import { persistGraphTransition, prepareGraphTransition, reconcileGraphDependent
 import { handoffDurableSubagentWaitWithGraph, releaseDurableSubagentWaitWithGraph } from "./durable-subagent-wait-handoff.js"
 import { assertSessionWorkAdmission, RUNNABLE_SESSION } from "../session-gate.js"
 import { assertFallbackPlannerRootCanDispatch, createSubagentTask, lockSubagentSession, lockSubagentTurn, lockSubagentTurnForWork, readSubagentTask } from "./pg-store-create.js"
-import { claimSubagentTask, matchesPublishedSubagentDispatch } from "./pg-store-claim.js"
+import { claimSubagentTask, heartbeatSubagentTask, leaseTimeAfterLock, matchesPublishedSubagentDispatch, taskGraphDeadlineLive } from "./pg-store-claim.js"
 import type { SubagentDispatchIdentity } from "./dispatch-identity.js"
 import { dateValue, json, rowToTask, SELECT_TASK, spawnKey, transaction, uniqueMessageIds } from "./pg-store-persistence.js"
 import { findUnobservedMailboxMessageIds } from "./subagent-mailbox-completion.js"
 import { interruptSubtree as interruptStoreSubtree, interruptTree as interruptStoreTree, interruptTurn as interruptStoreTurn, prepareTaskGraphFinish, recoverExpired as recoverStoreExpired } from "./pg-store-lifecycle.js"
-import { SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
-import { parseScheduledGateRegistrationReceipt, readScheduledGateRegistrationReceipt } from "./scheduled-gate-registration-receipt.js"
 import type { SubagentFinishResult } from "./types.js"
+import { closeSubagentTask } from "./pg-store-close.js"
+import { lockScheduledGateFinish } from "./pg-store-gate-finish.js"
+import { recoverExpiredTaskGraphChildren } from "./pg-store-task-graph-deadline-recovery.js"
+import { SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
 export class PgSubagentTaskStore implements SubagentStore {
   constructor(private readonly pool: PgSubagentPool, private readonly leaseMs = 60_000) {}
-  private async leaseTimeAfterLock(client: pg.PoolClient, input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number }): Promise<Date | null> {
-    const lease = await client.query<{ leaseExpiresAt: Date }>(`SELECT "leaseExpiresAt" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $3 AND "attemptCount" = $4 AND "status" = 'running' FOR UPDATE`, [input.taskId, input.sessionId, input.ownerId, input.attemptCount])
-    const checkedAt = (await client.query<{ checkedAt: Date }>(`SELECT clock_timestamp() AS "checkedAt"`)).rows[0]?.checkedAt
-    return lease.rows[0]?.leaseExpiresAt && checkedAt && lease.rows[0].leaseExpiresAt > checkedAt ? checkedAt : null
-  }
   async get(taskId: string, sessionId: string): Promise<SubagentTaskRecord | null> {
     const client = await this.pool.connect()
     try { const result = await client.query(SELECT_TASK, [taskId, sessionId]); return result.rows[0] ? rowToTask(result.rows[0] as Record<string, unknown>) : null }
@@ -72,34 +69,7 @@ export class PgSubagentTaskStore implements SubagentStore {
   matchesPublishedDispatch(input: { payload: import("./types.js").SubagentJobPayload; dispatchIdentity: SubagentDispatchIdentity }): Promise<boolean> {
     return matchesPublishedSubagentDispatch(this.pool, input)
   }
-  async heartbeat(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; now: Date }): Promise<"renewed" | "interrupted" | "lost"> {
-    return transaction(this.pool, async (client) => {
-      const session = await client.query(`SELECT "status" FROM "agent_sessions" WHERE "id" = $1 FOR UPDATE`, [input.sessionId])
-      const sessionStatus = String(session.rows[0]?.status ?? "")
-      if (!session.rows[0]) return "lost"
-      if (sessionStatus === "aborted" || sessionStatus === "archived") return "interrupted"
-      if (!await this.leaseTimeAfterLock(client, input)) return "lost"
-      const result = await client.query(`UPDATE "sub_agent_tasks"
-        SET "leaseExpiresAt" = LEAST(clock_timestamp() + ($4 * INTERVAL '1 millisecond'),
-          COALESCE("startedAt", clock_timestamp()) + (300000 * INTERVAL '1 millisecond')), "updatedAt" = clock_timestamp()
-        WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $3 AND "attemptCount" = $5 AND "status" = 'running'
-          AND "leaseExpiresAt" > clock_timestamp() AND EXISTS (SELECT 1 FROM "sub_agent_tasks" AS root JOIN "agent_turns" AS turn ON turn."id" = root."turnId"
-            WHERE root."id" = "sub_agent_tasks"."rootTaskId" AND root."sessionId" = "sub_agent_tasks"."sessionId"
-              AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
-              AND turn."id" = "sub_agent_tasks"."turnId" AND turn."sessionId" = "sub_agent_tasks"."sessionId"
-              AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled'))
-          AND EXISTS (SELECT 1 FROM "agent_sessions" AS session
-            WHERE session."id" = "sub_agent_tasks"."sessionId"
-              AND session."status" NOT IN ('aborted', 'archived')) RETURNING "interruptRequestedAt"`, [input.taskId, input.sessionId, input.ownerId, this.leaseMs, input.attemptCount])
-      if (result.rowCount === 1) return result.rows[0].interruptRequestedAt ? "interrupted" : "renewed"
-      const state = await client.query(`SELECT task."interruptRequestedAt", turn."status" AS "turnStatus" FROM "sub_agent_tasks" AS task
-        JOIN "agent_sessions" AS session ON session."id" = task."sessionId" JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
-        JOIN "sub_agent_tasks" AS root ON root."id" = task."rootTaskId" AND root."sessionId" = task."sessionId" AND root."turnId" = task."turnId"
-        WHERE task."id" = $1 AND task."sessionId" = $2 AND task."leaseOwner" = $3 AND task."attemptCount" = $4
-          AND task."status" = 'running' AND task."leaseExpiresAt" > clock_timestamp() AND session."status" NOT IN ('aborted', 'archived')`, [input.taskId, input.sessionId, input.ownerId, input.attemptCount])
-      return state.rows[0]?.interruptRequestedAt && state.rows[0]?.turnStatus === "interrupted" ? "interrupted" : "lost"
-    })
-  }
+  async heartbeat(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; now: Date }): Promise<"renewed" | "interrupted" | "lost"> { return heartbeatSubagentTask(this.pool, input, this.leaseMs) }
   async finish(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; status: SubagentExecutionResult["status"]; result?: unknown; failureReason?: string; retryDisposition?: SubagentRetryDisposition; mailboxMessageIds?: readonly string[]; now: Date }): Promise<SubagentFinishResult | null> {
     const mailboxMessageIds = uniqueMessageIds(input.mailboxMessageIds)
     try {
@@ -111,6 +81,7 @@ export class PgSubagentTaskStore implements SubagentStore {
         const taskSql = `${SELECT_TASK}
           AND task."status" = 'running' AND task."leaseOwner" = $3 AND task."attemptCount" = $4
           AND task."leaseExpiresAt" > clock_timestamp()
+          AND (task."absoluteDeadlineAt" IS NULL OR task."absoluteDeadlineAt" > clock_timestamp())
           AND session."status" NOT IN ('aborted', 'archived')
           AND EXISTS (SELECT 1 FROM "sub_agent_tasks" AS root JOIN "agent_turns" AS turn ON turn."id" = root."turnId"
             WHERE root."id" = task."rootTaskId" AND root."sessionId" = task."sessionId" AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
@@ -142,10 +113,21 @@ export class PgSubagentTaskStore implements SubagentStore {
         const lockedExpiry = dateValue(lockedRow.leaseExpiresAt)
         const leaseClock = await client.query<{ checkedAt: Date }>(`SELECT clock_timestamp() AS "checkedAt"`)
         const finishAt = leaseClock.rows[0]?.checkedAt
-        if (!lockedExpiry || !finishAt || lockedExpiry <= finishAt) return null
+        const absoluteDeadlineAt = dateValue(lockedRow.absoluteDeadlineAt)
+        if (!lockedExpiry || !finishAt || lockedExpiry <= finishAt
+          || absoluteDeadlineAt && absoluteDeadlineAt <= finishAt) return null
         if (input.status === "waiting" && row.parentTaskId !== null && row.parentTaskId !== undefined) {
           const handoff = await handoffDurableSubagentWaitWithGraph(client, { lease: { id: input.taskId, userId: sessionRow.userId, sessionId: input.sessionId, turnId: String(row.turnId), rootTaskId: String(row.rootTaskId), ownerId: input.ownerId, attemptCount: input.attemptCount, leaseExpiresAt: lockedExpiry }, now: finishAt })
-          if (handoff) return "blocked" in handoff ? null : "waiting"
+          if (handoff) {
+            if ("blocked" in handoff) return null
+            const closedSegment = await client.query(`UPDATE "sub_agent_tasks" SET "leaseSegmentStartedAt" = CASE WHEN "absoluteDeadlineAt" IS NOT NULL THEN NULL ELSE "leaseSegmentStartedAt" END
+              WHERE "id" = $1 AND "sessionId" = $2 AND "attemptCount" = $3 AND "status" IN ('waiting', 'queued')
+                AND "leaseOwner" IS NULL AND "leaseExpiresAt" IS NULL
+                AND ("absoluteDeadlineAt" IS NULL OR "absoluteDeadlineAt" > clock_timestamp()) RETURNING "id"`,
+            [input.taskId, input.sessionId, input.attemptCount])
+            if (closedSegment.rowCount !== 1) throw new FinishFenceSignal()
+            return "waiting"
+          }
         }
         if (input.status === "completed" && !interrupted) {
           const missingMessageIds = await findUnobservedMailboxMessageIds(client, {
@@ -156,10 +138,12 @@ export class PgSubagentTaskStore implements SubagentStore {
         const nextAttemptAt = retry ? computeSubagentNextAttemptAt(input.attemptCount, finishAt) : null
         const updated = await client.query(`UPDATE "sub_agent_tasks" SET "status" = $3, "result" = $4::jsonb,
           "failureReason" = $5, "leaseOwner" = NULL, "leaseExpiresAt" = NULL,
+          "leaseSegmentStartedAt" = CASE WHEN "absoluteDeadlineAt" IS NOT NULL THEN NULL ELSE "leaseSegmentStartedAt" END,
           "nextAttemptAt" = $10, "completedAt" = CASE WHEN $6 THEN $7::timestamp(3) ELSE NULL::timestamp(3) END,
           "updatedAt" = $7::timestamp(3)
           WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $8 AND "status" = 'running'
             AND "attemptCount" = $9 AND "leaseExpiresAt" > clock_timestamp()
+            AND ("absoluteDeadlineAt" IS NULL OR "absoluteDeadlineAt" > clock_timestamp())
             AND EXISTS (SELECT 1 FROM "agent_sessions" AS session
               WHERE session."id" = "sub_agent_tasks"."sessionId"
                 AND session."status" NOT IN ('aborted', 'archived'))
@@ -193,6 +177,7 @@ export class PgSubagentTaskStore implements SubagentStore {
                   AND message."turnId" = target."turnId")`,
           [input.sessionId, input.taskId, mailboxMessageIds])
         }
+        if (!await taskGraphDeadlineLive(client, input.taskId, input.sessionId)) throw new FinishFenceSignal()
         if (interrupted) return "interrupted"
         if (retry) return "retrying"
         return status as "completed" | "failed" | "waiting" | "waiting_for_user"
@@ -203,85 +188,60 @@ export class PgSubagentTaskStore implements SubagentStore {
     }
   }
   async release(input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number; now: Date }): Promise<boolean> {
-    return transaction(this.pool, async client => {
-      const session = await client.query<{ userId: string }>(`SELECT "userId" FROM "agent_sessions" WHERE "id" = $1 FOR UPDATE`, [input.sessionId])
-      const userId = session.rows[0]?.userId
-      if (!userId) return false
-      await client.query(`SELECT set_config('app.user_id', $1, true)`, [userId])
-      const releasedAt = await this.leaseTimeAfterLock(client, input)
-      if (!releasedAt) return false
-      const waitRelease = await releaseDurableSubagentWaitWithGraph(client, { id: input.taskId, userId, sessionId: input.sessionId, ownerId: input.ownerId, attemptCount: input.attemptCount, now: releasedAt })
-      if (waitRelease !== undefined) return waitRelease
-      const graph = await prepareGraphTransition(client, { taskId: input.taskId, sessionId: input.sessionId, type: "task.retrying", attemptCount: input.attemptCount })
-      if (graph && "blocked" in graph) return false
-      const updated = await client.query(`UPDATE "sub_agent_tasks" SET "status" = 'queued', "nextAttemptAt" = NULL, "leaseOwner" = NULL, "leaseExpiresAt" = NULL, "updatedAt" = $5
-        WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $3 AND "attemptCount" = $4 AND "interruptRequestedAt" IS NULL
-          AND "status" = 'running' AND "leaseExpiresAt" > clock_timestamp() AND EXISTS (SELECT 1 FROM "agent_sessions" AS session
-            WHERE session."id" = "sub_agent_tasks"."sessionId" AND session."status" NOT IN ('aborted', 'archived'))`,
-      [input.taskId, input.sessionId, input.ownerId, input.attemptCount, releasedAt])
-      if (updated.rowCount !== 1) return false
-      if (graph) await persistGraphTransition(client, graph, releasedAt)
-      await client.query(`UPDATE "agent_outbox" SET "publishedAt" = NULL, "attemptCount" = "attemptCount" + 1,
-        "payload" = CASE WHEN "lastError" = $3 THEN jsonb_set("payload", '{ownerId}', to_jsonb($4::text), true) ELSE "payload" END,
-        "lastError" = CASE WHEN "lastError" = $3 THEN "lastError" ELSE NULL END WHERE "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $1 AND "aggregateId" = $2`,
-      [`subagent-dispatch:${input.taskId}`, input.sessionId, PAUSE_DEFERRED_MARKER, `release-${randomUUID()}`])
-      return true
-    })
+    try {
+      return await transaction(this.pool, async client => {
+        const session = await client.query<{ userId: string }>(`SELECT "userId" FROM "agent_sessions" WHERE "id" = $1 FOR UPDATE`, [input.sessionId])
+        const userId = session.rows[0]?.userId
+        if (!userId) return false
+        await client.query(`SELECT set_config('app.user_id', $1, true)`, [userId])
+        const releasedAt = await leaseTimeAfterLock(client, input)
+        if (!releasedAt) return false
+        const waitRelease = await releaseDurableSubagentWaitWithGraph(client, { id: input.taskId, userId, sessionId: input.sessionId, ownerId: input.ownerId, attemptCount: input.attemptCount, now: releasedAt })
+        if (waitRelease !== undefined) {
+          if (!waitRelease) return false
+          const closedSegment = await client.query(`UPDATE "sub_agent_tasks" SET "leaseSegmentStartedAt" = CASE WHEN "absoluteDeadlineAt" IS NOT NULL THEN NULL ELSE "leaseSegmentStartedAt" END
+            WHERE "id" = $1 AND "sessionId" = $2 AND "attemptCount" = $3 AND "status" IN ('waiting', 'queued')
+              AND "leaseOwner" IS NULL AND "leaseExpiresAt" IS NULL
+              AND ("absoluteDeadlineAt" IS NULL OR "absoluteDeadlineAt" > clock_timestamp()) RETURNING "id"`,
+          [input.taskId, input.sessionId, input.attemptCount])
+          if (closedSegment.rowCount !== 1) throw new DeadlineFenceSignal()
+          return true
+        }
+        const graph = await prepareGraphTransition(client, { taskId: input.taskId, sessionId: input.sessionId, type: "task.retrying", attemptCount: input.attemptCount })
+        if (graph && "blocked" in graph) return false
+        const updated = await client.query(`UPDATE "sub_agent_tasks" SET "status" = 'queued', "nextAttemptAt" = NULL, "leaseOwner" = NULL, "leaseExpiresAt" = NULL,
+            "leaseSegmentStartedAt" = CASE WHEN "absoluteDeadlineAt" IS NOT NULL THEN NULL ELSE "leaseSegmentStartedAt" END, "updatedAt" = $5
+          WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $3 AND "attemptCount" = $4 AND "interruptRequestedAt" IS NULL
+            AND "status" = 'running' AND "leaseExpiresAt" > clock_timestamp()
+            AND ("absoluteDeadlineAt" IS NULL OR "absoluteDeadlineAt" > clock_timestamp())
+            AND EXISTS (SELECT 1 FROM "agent_sessions" AS session
+              WHERE session."id" = "sub_agent_tasks"."sessionId" AND session."status" NOT IN ('aborted', 'archived'))`,
+        [input.taskId, input.sessionId, input.ownerId, input.attemptCount, releasedAt])
+        if (updated.rowCount !== 1) return false
+        if (graph) await persistGraphTransition(client, graph, releasedAt)
+        await client.query(`UPDATE "agent_outbox" SET "publishedAt" = NULL, "attemptCount" = "attemptCount" + 1,
+          "payload" = CASE WHEN "lastError" = $3 THEN jsonb_set("payload", '{ownerId}', to_jsonb($4::text), true) ELSE "payload" END,
+          "lastError" = CASE WHEN "lastError" = $3 THEN "lastError" ELSE NULL END WHERE "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = $1 AND "aggregateId" = $2`,
+        [`subagent-dispatch:${input.taskId}`, input.sessionId, PAUSE_DEFERRED_MARKER, `release-${randomUUID()}`])
+        if (!await taskGraphDeadlineLive(client, input.taskId, input.sessionId)) throw new DeadlineFenceSignal()
+        return true
+      })
+    } catch (error: unknown) {
+      if (error instanceof DeadlineFenceSignal) return false
+      throw error
+    }
   }
-  async close(input: { taskId: string; sessionId: string; now: Date }): Promise<boolean> {
-    return transaction(this.pool, async client => {
-      const session = await client.query<{ userId: string }>(`SELECT "userId" FROM "agent_sessions" WHERE "id" = $1 FOR UPDATE`, [input.sessionId])
-      const userId = session.rows[0]?.userId
-      if (!userId) return false
-      await client.query(`SELECT set_config('app.user_id', $1, true)`, [userId])
-      const task = await client.query(`SELECT task."attemptCount" FROM "sub_agent_tasks" AS task
-        WHERE task."id" = $1 AND task."sessionId" = $2
-          AND task."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')`, [input.taskId, input.sessionId])
-      if (!task.rows[0]) return false
-      const graph = await prepareGraphTransition(client, { taskId: input.taskId, sessionId: input.sessionId, type: "task.closed", attemptCount: Number((task.rows[0] as Record<string, unknown>).attemptCount) })
-      if (graph && "blocked" in graph) return false
-      const result = await client.query(`UPDATE "sub_agent_tasks" SET "status" = 'closed', "leaseOwner" = NULL,
-        "leaseExpiresAt" = NULL, "nextAttemptAt" = NULL, "closedAt" = $3, "completedAt" = $3, "updatedAt" = $3
-        WHERE "id" = $1 AND "sessionId" = $2 AND "status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')`, [input.taskId, input.sessionId, input.now])
-      if (result.rowCount !== 1) return false
-      if (graph) {
-        await persistGraphTransition(client, graph, input.now)
-        await reconcileGraphDependents(client, graph.scope, input.now)
-      }
-      return true
-    })
-  }
+  async close(input: { taskId: string; sessionId: string; now: Date }): Promise<boolean> { return closeSubagentTask(this.pool, input) }
   async interruptTree(input: { sessionId: string; rootTaskId: string; now: Date }): Promise<number> { return interruptStoreTree(this.pool, input) }
   async interruptTurn(input: { userId: string; sessionId: string; turnId: string; now: Date }): Promise<number> { return interruptStoreTurn(this.pool, input) }
   async interruptSubtree(input: { sessionId: string; rootTaskId: string; targetPath: string; now: Date }): Promise<number> { return interruptStoreSubtree(this.pool, input) }
-  async recoverExpired(input: { now: Date; limit: number }): Promise<SubagentTaskRecord[]> { return recoverStoreExpired(this.pool, input) }
+  async recoverExpired(input: { now: Date; limit: number }): Promise<SubagentTaskRecord[]> {
+    const deadlineRecovered = await recoverExpiredTaskGraphChildren(this.pool as unknown as pg.Pool, input.limit)
+    const remaining = Math.max(0, input.limit - deadlineRecovered.length)
+    const leaseRecovered = remaining ? await recoverStoreExpired(this.pool, { ...input, limit: remaining }) : []
+    return [...deadlineRecovered, ...leaseRecovered]
+  }
 }
 class FinishFenceSignal extends Error {}
+class DeadlineFenceSignal extends Error {}
 class DuplicateSpawnSignal extends Error {}
-
-async function lockScheduledGateFinish(client: pg.PoolClient, task: Record<string, unknown>, input: {
-  taskId: string; sessionId: string; ownerId: string; attemptCount: number
-}): Promise<boolean> {
-  const userId = String(task.userId), turnId = String(task.turnId), rootTaskId = String(task.rootTaskId)
-  if (task.parentTaskId !== rootTaskId || task.role !== SCHEDULED_GATE_ROLE) return false
-  const turn = await client.query(`SELECT "id" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 FOR UPDATE`, [turnId, input.sessionId, userId])
-  const root = await client.query(`SELECT "id" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3
-    AND "rootTaskId" = $1 AND "parentTaskId" IS NULL FOR UPDATE`, [rootTaskId, input.sessionId, turnId])
-  const gate = await client.query(`SELECT "id" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3
-    AND "rootTaskId" = $4 AND "parentTaskId" = $4 AND "role" = $5 AND "taskType" = $6
-    AND "status" = 'running' AND "leaseOwner" = $7 AND "attemptCount" = $8
-    AND "leaseExpiresAt" > clock_timestamp() AND "interruptRequestedAt" IS NULL FOR UPDATE`,
-  [input.taskId, input.sessionId, turnId, rootTaskId, SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE, input.ownerId, input.attemptCount])
-  if (turn.rows.length !== 1 || root.rows.length !== 1 || gate.rows.length !== 1) return false
-  const event = await client.query(`SELECT "payload" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
-    AND "type" = 'agent.plan.scheduled_gate_binding' AND "payload"->>'gateTaskId' = $3`, [input.sessionId, turnId, input.taskId])
-  const receipt = event.rows.length === 1 && parseScheduledGateRegistrationReceipt(event.rows[0]?.payload)
-  if (!receipt || receipt.gateTaskId !== input.taskId) return false
-  const registered = await readScheduledGateRegistrationReceipt(client, { userId, sessionId: input.sessionId, turnId,
-    owner: receipt.owner, gateTaskId: input.taskId })
-  if (!registered) return false
-  const execution = await client.query(`SELECT "id" FROM "agent_executions" WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3
-    AND "status" = 'running' AND "attemptCount" = $4 FOR UPDATE`,
-  [registered.owner.executionId, userId, input.sessionId, registered.owner.executionAttemptCount])
-  return execution.rows.length === 1
-}
