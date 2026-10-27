@@ -363,6 +363,7 @@ jobs:
           test "$RLS_RUNTIME_MODE" = "on"
           test "$RLS_CANDIDATE_ROLE" = "applymate_candidate"
           pnpm --filter @jobcopilot/web exec vitest run --no-file-parallelism "src/app/api/agent/sessions/[id]/tasks/[taskId]/waits/route.pg.integration.test.ts"
+          pnpm --filter @jobcopilot/web exec vitest run --no-file-parallelism "src/app/api/agent/sessions/[id]/tasks/route.pg.integration.test.ts"
       - name: Verify PersonaFact Web consent writes on disposable PostgreSQL
         env:
           CI: "true"
