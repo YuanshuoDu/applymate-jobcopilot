@@ -334,16 +334,20 @@ describeWithPostgres("session-control recovery on disposable PostgreSQL", () => 
 
       const firstMarkers = new Map(afterFirst.sessions.map(row => [row.id, row.marker?.toISOString() ?? null]))
       const secondReport = await reconcilePendingSessionControls(scannerPool())
-      expect(secondReport).toEqual({ scanned: 25, reconciled: 0, failed: 25 })
+      expect(secondReport).toEqual({ scanned: 50, reconciled: 0, failed: 50 })
+      const secondClaimIds = coordinators.calls.slice(firstClaimIds.length).map(call => call.sessionId)
+      expect(secondClaimIds).toEqual([...ids.slice(50), ...ids.slice(0, 25)])
       const allClaimIds = coordinators.calls.map(call => call.sessionId)
-      expect(allClaimIds).toEqual(ids)
+      expect(allClaimIds).toEqual([...ids.slice(0, 50), ...ids.slice(50), ...ids.slice(0, 25)])
 
       const afterSecond = await readSnapshots(ids)
       expect(markedIds(afterSecond.sessions)).toEqual(ids)
       expect(sessionActivity(afterSecond.sessions)).toEqual(sessionActivity(before.sessions))
       expect(afterSecond.events).toEqual(before.events)
+      const retriedIds = new Set(ids.slice(0, 25))
       for (const row of afterSecond.sessions) {
-        if (firstMarkers.get(row.id) !== null) {
+        const firstMarker = firstMarkers.get(row.id) ?? null
+        if (firstMarker !== null && !retriedIds.has(row.id)) {
           expect(row.marker?.toISOString()).toBe(firstMarkers.get(row.id))
         } else {
           expect(row.marker).toBeInstanceOf(Date)
