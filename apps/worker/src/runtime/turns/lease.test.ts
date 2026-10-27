@@ -14,11 +14,11 @@ import {
 
 const now = new Date("2026-09-01T00:00:00.000Z")
 const row = {
-  id: "turn_1", sessionId: "session_1", userId: "user_1", leaseOwnerId: "owner_1", leaseVersion: 8,
+  id: "turn_1", sessionId: "session_1", userId: "user_1", rootTaskId: null, leaseOwnerId: "owner_1", leaseVersion: 8,
   leaseStartedAt: now, leaseExpiresAt: new Date(now.getTime() + 60_000),
 }
 
-function fakePool(rows: unknown[] = [row], sessionStatus = "running", sessionUserId = "user_1") {
+function fakePool(rows: unknown[] = [row], sessionStatus = "running", sessionUserId = "user_1", rootRows?: unknown[]) {
   const calls: Array<[string, unknown[]?]> = []
   const client = {
     query: vi.fn(async (sql: string, params?: unknown[]) => {
@@ -29,6 +29,7 @@ function fakePool(rows: unknown[] = [row], sessionStatus = "running", sessionUse
       if (sql.includes('SELECT session."id" FROM "agent_sessions"')) {
         return sessionStatus === "running" ? { rows: [{ id: "session_1" }], rowCount: 1 } : { rows: [], rowCount: 0 }
       }
+      if (sql.includes('UPDATE "sub_agent_tasks"')) return { rows: rootRows ?? rows, rowCount: (rootRows ?? rows).length }
       if (sql.includes('UPDATE "agent_turns"') && ["missing", "aborted", "archived"].includes(sessionStatus)) return { rows: [], rowCount: 0 }
       if (sql.includes('UPDATE "agent_turns"') && sessionUserId !== "user_1") return { rows: [], rowCount: 0 }
       return { rows, rowCount: rows.length }
@@ -171,15 +172,71 @@ describe("database Turn lease", () => {
     expect(results.filter((result) => result.status === "rejected" && result.reason instanceof TurnLeaseError && result.reason.code === "lease_not_available")).toHaveLength(99)
   })
 
-  it("fences heartbeat renewal by owner and lease version and caps the lease", async () => {
+  it("renews a startup Turn without a Root and fences the owner/version/deadlines", async () => {
     const fake = fakePool([{ ...row, leaseExpiresAt: new Date(now.getTime() + 120_000) }])
     const current: TurnLease = { ...payload, userId: row.userId, leaseVersion: row.leaseVersion, leaseStartedAt: now, leaseExpiresAt: row.leaseExpiresAt }
     const result = await renewTurnLease(fake.pool, current, new Date(now.getTime() + 20_000))
+    expect(result).not.toBeNull()
+    expect(row.rootTaskId).toBeNull()
     expect(result?.leaseVersion).toBe(row.leaseVersion)
     const sql = fake.calls.find(([text]) => text.includes('UPDATE "agent_turns"'))?.[0] ?? ""
     expect(sql).toContain('"leaseOwnerId" = $3')
+    expect(sql).toContain('"leaseVersion" = $4')
+    expect(sql).toContain('"status" = \'in_progress\'')
+    expect(sql).toContain('"leaseExpiresAt" > $6')
+    expect(sql).toContain('"leaseStartedAt" + ($7 * INTERVAL \'1 millisecond\') > $6')
     expect(sql).toContain("LEAST")
+    expect(sql).not.toContain('"rootTaskId" =')
     expect(fake.calls.find(([text]) => text.includes('UPDATE "agent_turns"'))?.[1]).toContain(TURN_MAX_LEASE_MS)
+    expect(fake.calls.some(([text]) => text.includes('UPDATE "sub_agent_tasks"'))).toBe(false)
+  })
+
+  it("syncs only the exact running Root to the bounded renewed Turn expiry after locking the Turn", async () => {
+    const rootTaskId = "root_turn_1"
+    const renewedExpiry = new Date(now.getTime() + 80_000)
+    const linkedTurn = { ...row, rootTaskId, leaseExpiresAt: renewedExpiry }
+    const fake = fakePool([linkedTurn], "running", "user_1", [{ id: rootTaskId }])
+    const current: TurnLease = { ...payload, userId: row.userId, leaseVersion: row.leaseVersion, leaseStartedAt: now, leaseExpiresAt: row.leaseExpiresAt }
+
+    const result = await renewTurnLease(fake.pool, current, new Date(now.getTime() + 20_000))
+    const sessionLock = fake.calls.findIndex(([sql]) => sql.includes('SELECT session."id" FROM "agent_sessions"'))
+    const turnWrite = fake.calls.findIndex(([sql]) => sql.includes('UPDATE "agent_turns"'))
+    const rootWrite = fake.calls.findIndex(([sql]) => sql.includes('UPDATE "sub_agent_tasks"'))
+    const [sql, params] = fake.calls[rootWrite] ?? ["", []]
+
+    expect(result?.leaseExpiresAt).toEqual(renewedExpiry)
+    expect(sessionLock).toBeGreaterThan(-1)
+    expect(turnWrite).toBeGreaterThan(sessionLock)
+    expect(turnWrite).toBeGreaterThan(-1)
+    expect(rootWrite).toBeGreaterThan(turnWrite)
+    expect(fake.calls.at(-1)?.[0]).toBe("COMMIT")
+    expect(sql).toContain('SET "leaseExpiresAt" = turn."leaseExpiresAt"')
+    expect(sql).toContain('turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3')
+    expect(sql).toContain('turn."leaseOwnerId" = $4 AND turn."leaseVersion" = $5 AND turn."status" = \'in_progress\'')
+    expect(sql).toContain('turn."rootTaskId" = $6')
+    expect(sql).toContain('root."id" = turn."rootTaskId" AND root."sessionId" = $2 AND root."turnId" = $1')
+    expect(sql).toContain('root."rootTaskId" = root."id" AND root."parentTaskId" IS NULL')
+    expect(sql).toContain('root."role" = \'orchestrator\' AND root."taskType" = \'root\'')
+    expect(sql).toContain('root."leaseOwner" = $4 AND root."attemptCount" = 1')
+    expect(sql).toContain('root."status" = \'running\'')
+    expect(sql).toContain('root."leaseExpiresAt" IS NOT NULL')
+    expect(sql).toContain('root."interruptRequestedAt" IS NULL AND root."failureReason" IS NULL')
+    expect(sql).toContain('root."completedAt" IS NULL AND root."closedAt" IS NULL')
+    expect(sql).toContain('root."nextAttemptAt" IS NULL')
+    expect(params).toEqual([current.turnId, current.sessionId, current.userId, current.ownerId, current.leaseVersion,
+      rootTaskId, new Date(now.getTime() + 20_000)])
+  })
+
+  it("rolls back Turn renewal when its linked Root no longer passes the running owner and attempt fence", async () => {
+    const linkedTurn = { ...row, rootTaskId: "root_turn_1" }
+    const fake = fakePool([linkedTurn], "running", "user_1", [])
+    const current: TurnLease = { ...payload, userId: row.userId, leaseVersion: row.leaseVersion, leaseStartedAt: now, leaseExpiresAt: row.leaseExpiresAt }
+
+    await expect(renewTurnLease(fake.pool, current, now)).resolves.toBeNull()
+    expect(fake.calls.some(([sql]) => sql.includes('UPDATE "agent_turns"'))).toBe(true)
+    expect(fake.calls.some(([sql]) => sql.includes('UPDATE "sub_agent_tasks"'))).toBe(true)
+    expect(fake.calls.some(([sql]) => sql === "ROLLBACK")).toBe(true)
+    expect(fake.calls.some(([sql]) => sql === "COMMIT")).toBe(false)
   })
 
   it("does not release a lease after another owner fenced it", async () => {

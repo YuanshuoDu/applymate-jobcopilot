@@ -1,8 +1,9 @@
 import { Type, type TSchema } from "@sinclair/typebox"
 import type { TaskGraphNodeProposal, TaskGraphProposal, TaskGraphRepairOf } from "../planning/task-graph.js"
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
-import { TASK_GRAPH_VERIFICATION_LIMITS, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, taskGraphVerificationRole,
-  type TaskGraphVerificationRole } from "../planning/task-graph-verification.js"
+import { TASK_GRAPH_VERIFICATION_LIMITS } from "../planning/task-graph-verification-cross-node.js"
+import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, taskGraphVerificationRole,
+  type TaskGraphVerificationRole } from "../planning/task-graph-verification-contract.js"
 import type { TaskGraphTaskTemplate } from "../subagents/task-graph-command-port.js"
 import { TaskGraphBranchReplacementInputSchema, parseTaskGraphBranchReplacement, type TaskGraphBranchReplacement } from "../planning/task-graph-branch-replacement.js"
 import {
@@ -29,6 +30,8 @@ export const TASK_GRAPH_PLANNING_REPLACEMENT_SCHEMA_PROPERTIES = {
   replaceOperationalFailure: Type.Optional(TaskGraphOperationalFailureReplacementInputSchema),
 }
 
+const DEPENDENCY_SELECTOR_PATTERN = "^\\S(?:[\\s\\S]*\\S)?(?![\\s\\S])"
+
 function verificationCheckSchema(role: TaskGraphVerificationRole): TSchema {
   const evidence = Type.Object({ kind: Type.Literal("evidence_count_gte"), minimum: Type.Integer({ minimum: 1, maximum: TASK_GRAPH_VERIFICATION_LIMITS.maxItems }) }, { additionalProperties: false })
   const roleChecks: TSchema[] = role === "scout"
@@ -51,6 +54,17 @@ function verificationCheckSchema(role: TaskGraphVerificationRole): TSchema {
       Type.Object({
         kind: Type.Literal("findings_cover_scout_candidates_gte"),
         dependencyNodeKey: Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength }),
+        minimumPercent: Type.Integer({ minimum: 1, maximum: 100 }),
+      }, { additionalProperties: false }),
+      Type.Object({
+        kind: Type.Literal("findings_from_scout_union"),
+        dependencyNodeKeys: Type.Array(Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength, pattern: DEPENDENCY_SELECTOR_PATTERN }),
+          { minItems: 2, maxItems: 8, uniqueItems: true }),
+      }, { additionalProperties: false }),
+      Type.Object({
+        kind: Type.Literal("findings_cover_scout_candidate_union_gte"),
+        dependencyNodeKeys: Type.Array(Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength, pattern: DEPENDENCY_SELECTOR_PATTERN }),
+          { minItems: 2, maxItems: 8, uniqueItems: true }),
         minimumPercent: Type.Integer({ minimum: 1, maximum: 100 }),
       }, { additionalProperties: false }),
     ]

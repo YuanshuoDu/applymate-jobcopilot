@@ -152,6 +152,18 @@ jobs:
         env:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
         run: pnpm --filter @jobcopilot/web exec prisma migrate deploy --schema prisma/schema.prisma
+      - name: Verify session-control recovery claims and rotation on disposable PostgreSQL
+        env:
+          CI: "true"
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+        run: |
+          test "$CI" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          pnpm --filter @jobcopilot/worker exec vitest run --no-file-parallelism src/runtime/session-control/pause-recovery-pg.integration.test.ts
       - name: Generate Web Prisma client for the Worker usage-route integration
         env:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
@@ -612,6 +624,56 @@ jobs:
         env:
           AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
         run: pnpm --filter @jobcopilot/worker exec vitest run src/runtime/turns/recovery-scanner-lock-order-pg.integration.test.ts
+  custom-agent-role-migration-postgres:
+    name: CustomAgentRole migration PostgreSQL integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: applymate_custom_agent_role_ci
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d applymate_custom_agent_role_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      CI: "true"
+      CUSTOM_AGENT_ROLE_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_custom_agent_role_ci
+      CUSTOM_AGENT_ROLE_PG_TEST_DISPOSABLE: "true"
+      CUSTOM_AGENT_ROLE_PG_TEST_REQUIRED: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - name: Guard the dedicated disposable PostgreSQL target
+        run: |
+          test "$CI" = "true"
+          test "$CUSTOM_AGENT_ROLE_PG_TEST_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_custom_agent_role_ci"
+          test "$CUSTOM_AGENT_ROLE_PG_TEST_DISPOSABLE" = "true"
+          test "$CUSTOM_AGENT_ROLE_PG_TEST_REQUIRED" = "true"
+      - name: Apply all migrations to the fresh disposable PostgreSQL database
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_custom_agent_role_ci
+        run: |
+          test "$DATABASE_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_custom_agent_role_ci"
+          test "$CUSTOM_AGENT_ROLE_PG_TEST_URL" = "$DATABASE_URL"
+          test "$CUSTOM_AGENT_ROLE_PG_TEST_DISPOSABLE" = "true"
+          test "$CUSTOM_AGENT_ROLE_PG_TEST_REQUIRED" = "true"
+          pnpm --filter @jobcopilot/web exec prisma migrate deploy --schema prisma/schema.prisma
+      - name: Verify CustomAgentRole migration and candidate RLS on disposable PostgreSQL
+        run: |
+          test "$CI" = "true"
+          test "$CUSTOM_AGENT_ROLE_PG_TEST_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_custom_agent_role_ci"
+          test "$CUSTOM_AGENT_ROLE_PG_TEST_DISPOSABLE" = "true"
+          test "$CUSTOM_AGENT_ROLE_PG_TEST_REQUIRED" = "true"
+          pnpm --filter @jobcopilot/web exec vitest run --no-file-parallelism src/__tests__/custom-agent-role-migration.pg.integration.test.ts
   lockfile:
     name: Lockfile
     runs-on: ubuntu-latest

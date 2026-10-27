@@ -288,6 +288,47 @@ describe("TaskGraph durable evidence verification", () => {
       .toMatchObject({ status: "failed" })
   })
 
+  it("evaluates each union check against its own deduplicated Scout set and never passes empty findings", () => {
+    const typed = validatedContract("analyst", [
+      { id: "membership", check: { kind: "findings_from_scout_union", dependencyNodeKeys: ["scout-a", "scout-b"] } },
+      { id: "coverage", check: { kind: "findings_cover_scout_candidate_union_gte", dependencyNodeKeys: ["scout-a", "scout-c"], minimumPercent: 66 } },
+    ])
+    const dependencies: TaskGraphVerificationDependencyEvidence = new Map([
+      ["scout-a", projectionForScout(["job-1", "shared"])],
+      ["scout-b", projectionForScout(["shared", "job-3"])],
+      ["scout-c", projectionForScout(["job-3"])],
+    ])
+    expect(evaluateTaskGraphVerification(typed, projectionForAnalyst(["job-1", "job-3"]), dependencies)).toEqual({
+      status: "passed", reasonCode: "criteria_met", criteria: [
+        { criterionId: "membership", status: "passed", reasonCode: "criteria_met" },
+        { criterionId: "coverage", status: "passed", reasonCode: "criteria_met" },
+      ],
+    })
+    expect(evaluateTaskGraphVerification(typed, projectionForAnalyst(["job-1", "job-3"]), dependencies))
+      .toMatchObject({ status: "passed" })
+    const aboveBoundary = validatedContract("analyst", [
+      { id: "coverage", check: { kind: "findings_cover_scout_candidate_union_gte", dependencyNodeKeys: ["scout-a", "scout-c"], minimumPercent: 67 } },
+    ])
+    expect(evaluateTaskGraphVerification(aboveBoundary, projectionForAnalyst(["job-1", "job-3"]), new Map([["scout-a", projectionForScout(["job-1", "shared"])], ["scout-c", projectionForScout(["job-3"])] ])))
+      .toMatchObject({ status: "failed", reasonCode: "criterion_not_met" })
+    expect(evaluateTaskGraphVerification(typed, projectionForAnalyst([]), dependencies))
+      .toMatchObject({ status: "failed", criteria: expect.arrayContaining([
+        { criterionId: "membership", status: "failed", reasonCode: "criterion_not_met" },
+        { criterionId: "coverage", status: "failed", reasonCode: "criterion_not_met" },
+      ]) })
+
+    const onlyC = validatedContract("analyst", [
+      { id: "membership-ab", check: { kind: "findings_from_scout_union", dependencyNodeKeys: ["scout-a", "scout-b"] } },
+      { id: "membership-cd", check: { kind: "findings_from_scout_union", dependencyNodeKeys: ["scout-c", "scout-d"] } },
+    ])
+    expect(evaluateTaskGraphVerification(onlyC, projectionForAnalyst(["job-c-only"]), new Map([
+      ["scout-a", projectionForScout(["job-a-only"])], ["scout-b", projectionForScout(["job-b-only"])],
+      ["scout-c", projectionForScout(["job-c-only"])], ["scout-d", projectionForScout(["job-d-only"])],
+    ]))).toMatchObject({ status: "failed", criteria: [
+      { criterionId: "membership-ab", status: "failed", reasonCode: "criterion_not_met" },
+      { criterionId: "membership-cd", status: "passed", reasonCode: "criteria_met" },
+    ] })
+  })
   it("keeps empty membership vacuous and leaves minimum counts as independent checks", () => {
     const typed = validatedContract("analyst", [
       { id: "minimum-findings", check: { kind: "finding_count_gte", minimum: 1 } },

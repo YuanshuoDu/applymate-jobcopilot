@@ -392,12 +392,19 @@ const SCHEDULED_DRAFT_SCOUT_VERIFICATION = {
   ],
 } as const
 
-function scheduledDraftAnalystVerification(hasFinding: boolean, scoutKey: string): TaskGraphVerificationContract {
+function scheduledDraftAnalystVerification(hasFinding: boolean, scoutKeys: readonly string[], unionCheck?: "membership" | "coverage-only"): TaskGraphVerificationContract {
+  if (unionCheck === "coverage-only") return {
+    schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
+    criteria: [{ id: "scout-union-coverage", check: { kind: "findings_cover_scout_candidate_union_gte", dependencyNodeKeys: [...scoutKeys], minimumPercent: 100 } }],
+  }
+  const membership = unionCheck === "membership"
+    ? { kind: "findings_from_scout_union" as const, dependencyNodeKeys: [...scoutKeys] }
+    : { kind: "findings_from_scout_dependency" as const, dependencyNodeKey: scoutKeys[0]! }
   return {
     schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
     role: "analyst",
     criteria: [
-      { id: "scout-membership", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: scoutKey } },
+      { id: "scout-membership", check: membership },
       hasFinding
         ? { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }
         : { id: "evidence-count", check: { kind: "evidence_count_gte", minimum: 1 } },
@@ -506,14 +513,18 @@ async function persistVerifiedScheduledDraftRole(pool: PgPool, value: Fixture, s
 }
 
 async function seedVerifiedScheduledDraftSources(pool: PgPool, value: Fixture, command: ReturnType<typeof createPgTaskGraphCommandPort>, sources: readonly {
-  readonly scoutKey: string; readonly analystKey: string; readonly jobId: string; readonly score: number; readonly hasFinding: boolean
+  readonly scoutKey: string; readonly extraScouts?: readonly Readonly<{ key: string; jobId: string }>[]
+  readonly analystKey: string; readonly jobId: string; readonly score: number; readonly hasFinding: boolean
+  readonly unionCheck?: "membership" | "coverage-only"
 }[]) {
   const nodes: TaskGraphScheduleInput["proposal"]["nodes"][number][] = []
   for (const source of sources) {
-    nodes.push({ key: source.scoutKey, templateId: "scout", goal: `Find ${source.jobId}`, successCriteria: ["Return an evidenced job candidate"],
+    const scoutSources = [{ key: source.scoutKey, jobId: source.jobId }, ...(source.extraScouts ?? [])]
+    const scoutKeys = scoutSources.map(scout => scout.key)
+    for (const scout of scoutSources) nodes.push({ key: scout.key, templateId: "scout", goal: `Find ${scout.jobId}`, successCriteria: ["Return an evidenced job candidate"],
       verification: SCHEDULED_DRAFT_SCOUT_VERIFICATION, dependsOn: [] })
     nodes.push({ key: source.analystKey, templateId: "analyst", goal: `Verify ${source.jobId}`, successCriteria: ["Return a dependency-bound analysis"],
-      verification: scheduledDraftAnalystVerification(source.hasFinding, source.scoutKey), dependsOn: [source.scoutKey] })
+      verification: scheduledDraftAnalystVerification(source.hasFinding, scoutKeys, source.unionCheck), dependsOn: scoutKeys })
   }
   const input = scheduledDraftInput(value, 0, nodes)
   const rootAllowedActions = selectedJobRootAllowedActions(input.templates)
@@ -538,9 +549,12 @@ async function seedVerifiedScheduledDraftSources(pool: PgPool, value: Fixture, c
   const snapshot = parseTaskGraphSnapshot(row.rows[0]?.content)
   const analysts: StoredTaskGraphNode[] = []
   for (const source of sources) {
-    const scout = snapshot.nodes.find(node => node.key === source.scoutKey), analyst = snapshot.nodes.find(node => node.key === source.analystKey)
-    if (!scout || !analyst) throw new Error("Scheduled-draft PostgreSQL fixture could not read its Scout and Analyst nodes")
-    await persistVerifiedScheduledDraftRole(pool, value, snapshot, scout, scheduledDraftRoleResult("scout", source.jobId))
+    const scoutSources = [{ key: source.scoutKey, jobId: source.jobId }, ...(source.extraScouts ?? [])]
+    const scouts = scoutSources.map(scout => snapshot.nodes.find(node => node.key === scout.key))
+    const analyst = snapshot.nodes.find(node => node.key === source.analystKey)
+    if (scouts.some(scout => !scout) || !analyst) throw new Error("Scheduled-draft PostgreSQL fixture could not read its Scout and Analyst nodes")
+    for (const [index, scout] of scouts.entries()) await persistVerifiedScheduledDraftRole(pool, value, snapshot, scout!,
+      scheduledDraftRoleResult("scout", scoutSources[index]!.jobId))
     const scoutDependencies = await verifyCompletedScoutDependencies(pool, scheduledDraftGraphScope(value), snapshot, analyst)
     if (!scoutDependencies) throw new Error("Scheduled-draft PostgreSQL fixture could not reconstruct its completed Scout proof")
     await persistVerifiedScheduledDraftRole(pool, value, snapshot, analyst,
@@ -2647,6 +2661,47 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
       persistedBinding.jobId, persistedBinding.witness)).resolves.toBe(false)
   }, 60_000)
 
+  it("revalidates every Scout proof bound by a union-member Analyst before scheduled drafting", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    await seed(adminPool!, value)
+    const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
+    const firstJobId = scheduledDraftJobId(value, "union-a"), secondJobId = scheduledDraftJobId(value, "union-b")
+    const sources = await seedVerifiedScheduledDraftSources(adminPool!, value, command, [{
+      scoutKey: "scout-union-a", extraScouts: [{ key: "scout-union-b", jobId: secondJobId }],
+      analystKey: "analyst-union", jobId: firstJobId, score: 9, hasFinding: true, unionCheck: "membership",
+    }])
+    const scope = scheduledDraftGraphScope(value)
+    await expect(command.appendAndSchedule(scheduledDraftInput(value, 1, [
+      { key: "writer", templateId: "cover_letter_writer", goal: "Draft from the union-verified finding", successCriteria: ["Persist the selected-job draft"], dependsOn: ["analyst-union"] },
+      { key: "reviewer", templateId: "cover_letter_reviewer", goal: "Review the selected-job draft", successCriteria: ["Persist the review receipt"], dependsOn: ["writer"] },
+    ]))).resolves.toMatchObject({ status: "accepted", revision: 2 })
+
+    const binding = await readScheduledDraftCandidateBinding(adminPool!, scope)
+    if (binding.status !== "bound") throw new Error("Union scheduled-draft fixture did not persist its candidate binding")
+    const analystBinding = binding.witness.analysts.find(analyst => analyst.nodeKey === "analyst-union")
+    expect(binding).toMatchObject({ jobId: firstJobId, witness: { candidate: { jobId: firstJobId, score: 9 }, sourceAnalystKeys: ["analyst-union"] } })
+    if (!analystBinding) throw new Error("Union scheduled-draft witness omitted its Analyst proof")
+    expect(analystBinding.scouts.map(scout => scout.nodeKey)).toEqual(["scout-union-a", "scout-union-b"])
+    await expect(validateScheduledDraftCandidateWitness(adminPool!, scope, binding.snapshot, binding.graphRevision,
+      binding.jobId, binding.witness)).resolves.toBe(true)
+
+    for (const scoutKey of ["scout-union-a", "scout-union-b"]) {
+      const scoutTaskId = sources.snapshot.nodes.find(node => node.key === scoutKey)?.taskId
+      if (!scoutTaskId) throw new Error(`Union scheduled-draft fixture lost ${scoutKey}`)
+      const changed = await adminPool!.query(`UPDATE "sub_agent_tasks" SET "attemptCount" = 2
+        WHERE "id" = $1 AND "sessionId" = $2 AND "attemptCount" = 1`, [scoutTaskId, value.sessionId])
+      expect(changed.rowCount).toBe(1)
+      await expect(validateScheduledDraftCandidateWitness(adminPool!, scope, binding.snapshot, binding.graphRevision,
+        binding.jobId, binding.witness)).resolves.toBe(false)
+      const restored = await adminPool!.query(`UPDATE "sub_agent_tasks" SET "attemptCount" = 1
+        WHERE "id" = $1 AND "sessionId" = $2 AND "attemptCount" = 2`, [scoutTaskId, value.sessionId])
+      expect(restored.rowCount).toBe(1)
+      await expect(validateScheduledDraftCandidateWitness(adminPool!, scope, binding.snapshot, binding.graphRevision,
+        binding.jobId, binding.witness)).resolves.toBe(true)
+    }
+  }, 60_000)
+
   it("rejects scheduled drafting without a verified Analyst finding before any TaskGraph task, event, or outbox write", async () => {
     const value = fixture()
     additionalFixtures.push(value)
@@ -2666,6 +2721,28 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
 
     expect(await scheduledDraftDurableRows(adminPool!, value)).toEqual(before)
     expect(await readScheduledDraftCandidateBinding(adminPool!, scheduledDraftGraphScope(value))).toEqual({ status: "absent" })
+  }, 60_000)
+
+  it("does not qualify a coverage-only union Analyst for scheduled drafting", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    await seed(adminPool!, value)
+    const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
+    const firstJobId = scheduledDraftJobId(value, "coverage-a")
+    await seedVerifiedScheduledDraftSources(adminPool!, value, command, [{
+      scoutKey: "scout-coverage-a", extraScouts: [{ key: "scout-coverage-b", jobId: firstJobId }],
+      analystKey: "analyst-coverage-only", jobId: firstJobId, score: 9, hasFinding: true, unionCheck: "coverage-only",
+    }])
+    const scope = scheduledDraftGraphScope(value)
+    await expect(readScheduledDraftCandidateBinding(adminPool!, scope)).resolves.toEqual({ status: "absent" })
+    const writerReviewer = scheduledDraftInput(value, 1, [
+      { key: "writer", templateId: "cover_letter_writer", goal: "Draft only from membership-verified findings", successCriteria: ["Persist the selected-job draft"], dependsOn: ["analyst-coverage-only"] },
+      { key: "reviewer", templateId: "cover_letter_reviewer", goal: "Review the selected-job draft", successCriteria: ["Persist the review receipt"], dependsOn: ["writer"] },
+    ])
+    const before = await scheduledDraftDurableRows(adminPool!, value)
+    await expect(command.appendAndSchedule(writerReviewer)).rejects.toMatchObject({ code: "task_graph_scheduled_draft_candidate_missing" })
+    expect(await scheduledDraftDurableRows(adminPool!, value)).toEqual(before)
+    await expect(readScheduledDraftCandidateBinding(adminPool!, scope)).resolves.toEqual({ status: "absent" })
   }, 60_000)
 
   it("rejects a scheduled draft plan that omits the highest verified Analyst candidate before durable writes", async () => {

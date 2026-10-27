@@ -510,7 +510,7 @@ describePg("direct selected-job history PostgreSQL source validation", () => {
       `${unresolvedRepairSource.childId}-repair`, "repair-target", "repair-attempt", "candidate-count", "evidence-count", TASK_GRAPH_VERIFIER_VERSION,
       jobId, `repair-secondary-${suffix}`, `read:job:${jobId}`, `read:job:repair-secondary-${suffix}`,
       "verification", "criteria", "criteria_met", "evidenceDigest", "resultDigest", "structuredResult", "Found two candidate roles",
-      "task_graph_repair_target_unresolved"]) {
+      "task_graph_repair_target_unresolved", "historicalRepairReasonHint"]) {
       expect(encoded).not.toContain(privateValue)
     }
   })
