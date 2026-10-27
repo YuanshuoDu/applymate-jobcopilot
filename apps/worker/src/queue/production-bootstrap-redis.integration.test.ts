@@ -84,12 +84,14 @@ function createSqlFixture(ids: { turnId: string; sessionId: string; userId: stri
       if (isSessionControlRecoveryScan) {
         if (
           !sql.includes('COALESCE(session."sessionControlRecoveryAttemptedAt", session."createdAt")')
+          || !sql.includes('session."sessionControlRecoveryClaimToken" IS NULL')
+          || !sql.includes('session."sessionControlRecoveryClaimExpiresAt" <= clock_timestamp()')
           || !sql.includes("FOR UPDATE OF session SKIP LOCKED")
           || !sql.includes("LIMIT $1")
           || values.length !== 1
           || values[0] !== SESSION_CONTROL_RECOVERY_MAX_BATCH
         ) {
-          throw new Error("Session control recovery fixture expected the ordered, locked 50-row marker claim query")
+          throw new Error("Session control recovery fixture expected the ordered, locked 50-row lease claim query")
         }
         return none
       }
