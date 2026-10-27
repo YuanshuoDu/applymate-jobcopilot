@@ -102,7 +102,9 @@ type CandidateTransactionObservation = Readonly<{
   tenantUserId: string | null
   visibleUserIds: readonly string[]
   emptyContextVisibleUserIds: readonly string[]
+  routeReadOperations: readonly string[]
 }>
+const WAIT_ROUTE_READ_MODELS = new Set(["agentSession", "subAgentTask", "agentTurn", "agentStep", "agentWaitCondition"])
 let routeBaseClient: PrismaClient | undefined
 let restoreRouteTransactionObserver: (() => void) | undefined
 let tenantContextRoot: AsyncResource | undefined
@@ -149,61 +151,88 @@ function installRouteTransactionObserver(): () => void {
       const callback = args[0]
       if (typeof callback !== "function") return Reflect.apply(target, thisArg, args)
 
-      const observedCallback = (tx: Prisma.TransactionClient) => {
+      const observedCallback = async (tx: Prisma.TransactionClient) => {
+        const routeReadOperations: string[] = []
+        let candidateState: Omit<CandidateTransactionObservation, "routeReadOperations"> | null = null
         const observedTx = new Proxy(tx, {
           get(transaction, property) {
             const method = Reflect.get(transaction, property, transaction)
-            if (property !== "$executeRawUnsafe" || typeof method !== "function") return method
+            if (property === "$executeRawUnsafe" && typeof method === "function") {
+              return async (...sqlArgs: unknown[]) => {
+                const result = await Reflect.apply(method, transaction, sqlArgs)
+                if (sqlArgs[0] !== 'SET LOCAL ROLE "applymate_candidate"') return result
 
-            return async (...sqlArgs: unknown[]) => {
-              const result = await Reflect.apply(method, transaction, sqlArgs)
-              if (sqlArgs[0] !== 'SET LOCAL ROLE "applymate_candidate"') return result
+                const queryRaw = Reflect.get(transaction, "$queryRawUnsafe", transaction)
+                if (typeof queryRaw !== "function") throw new Error("The candidate transaction cannot inspect its current role")
+                const query = async <T>(sql: string, ...values: unknown[]) =>
+                  await Reflect.apply(queryRaw, transaction, [sql, ...values]) as T
+                const stateRows = await query<Array<{ current_role: string; tenant_user_id: string | null }>>(
+                  "SELECT current_user::text AS current_role, current_setting('app.user_id', true) AS tenant_user_id",
+                )
+                const state = stateRows[0]
+                if (!state) throw new Error("The candidate transaction returned no role state")
 
-              const queryRaw = Reflect.get(transaction, "$queryRawUnsafe", transaction)
-              if (typeof queryRaw !== "function") throw new Error("The candidate transaction cannot inspect its current role")
-              const query = async <T>(sql: string, ...values: unknown[]) =>
-                await Reflect.apply(queryRaw, transaction, [sql, ...values]) as T
-              const stateRows = await query<Array<{ current_role: string; tenant_user_id: string | null }>>(
-                "SELECT current_user::text AS current_role, current_setting('app.user_id', true) AS tenant_user_id",
-              )
-              const state = stateRows[0]
-              if (!state) throw new Error("The candidate transaction returned no role state")
-
-              const probe = activeUserPolicyProbe
-              let visibleUserIds: string[] = []
-              let emptyContextVisibleUserIds: string[] = []
-              if (probe) {
-                const readVisibleUserIds = async () => {
-                  const visible: string[] = []
-                  for (const userId of probe.fixtureUserIds) {
-                    const rows = await query<Array<{ id: string }>>('SELECT "id" FROM "User" WHERE "id" = $1', userId)
-                    if (rows[0]) visible.push(rows[0].id)
+                const probe = activeUserPolicyProbe
+                let visibleUserIds: string[] = []
+                let emptyContextVisibleUserIds: string[] = []
+                if (probe) {
+                  const readVisibleUserIds = async () => {
+                    const visible: string[] = []
+                    for (const userId of probe.fixtureUserIds) {
+                      const rows = await query<Array<{ id: string }>>('SELECT "id" FROM "User" WHERE "id" = $1', userId)
+                      if (rows[0]) visible.push(rows[0].id)
+                    }
+                    return visible
                   }
-                  return visible
+
+                  visibleUserIds = await readVisibleUserIds()
+                  await query("SELECT set_config('app.user_id', '', true)")
+                  try {
+                    emptyContextVisibleUserIds = await readVisibleUserIds()
+                  } finally {
+                    // Restore the authenticated tenant before the route callback
+                    // starts so the probe cannot change route query visibility.
+                    await query("SELECT set_config('app.user_id', $1, true)", state.tenant_user_id ?? "")
+                  }
                 }
 
-                visibleUserIds = await readVisibleUserIds()
-                await query("SELECT set_config('app.user_id', '', true)")
-                try {
-                  emptyContextVisibleUserIds = await readVisibleUserIds()
-                } finally {
-                  // Restore the authenticated tenant before the route callback
-                  // starts so the probe cannot change route query visibility.
-                  await query("SELECT set_config('app.user_id', $1, true)", state.tenant_user_id ?? "")
+                candidateState = {
+                  currentRole: state.current_role,
+                  tenantUserId: state.tenant_user_id,
+                  visibleUserIds,
+                  emptyContextVisibleUserIds,
                 }
+                return result
               }
-
-              candidateTransactionObservations.push({
-                currentRole: state.current_role,
-                tenantUserId: state.tenant_user_id,
-                visibleUserIds,
-                emptyContextVisibleUserIds,
-              })
-              return result
             }
+
+            if (typeof property === "string" && WAIT_ROUTE_READ_MODELS.has(property)
+              && method !== null && typeof method === "object") {
+              return new Proxy(method, {
+                get(delegate, operation) {
+                  const operationMethod = Reflect.get(delegate, operation, delegate)
+                  if (typeof operationMethod !== "function") return operationMethod
+                  return (...operationArgs: unknown[]) => {
+                    routeReadOperations.push(`${property}.${String(operation)}`)
+                    return Reflect.apply(operationMethod, delegate, operationArgs)
+                  }
+                },
+              })
+            }
+
+            return method
           },
         }) as Prisma.TransactionClient
-        return Reflect.apply(callback, undefined, [observedTx])
+        try {
+          return await Reflect.apply(callback, undefined, [observedTx])
+        } finally {
+          // The auth User lookup is a separate transaction. Only retain role
+          // and policy evidence from the transaction that actually reads the
+          // wait route's persisted models.
+          if (candidateState && routeReadOperations.includes("agentSession.findFirst")) {
+            candidateTransactionObservations.push({ ...candidateState, routeReadOperations: [...routeReadOperations] })
+          }
+        }
       }
 
       return Reflect.apply(target, thisArg, [observedCallback, ...args.slice(1)])
@@ -259,13 +288,16 @@ async function getWait(
         params: Promise.resolve({ id: fixture.sessionId, taskId: fixture.parentTaskId }),
       })
 
-      if (tenantStore) expect(tenantStore.currentTenantUserId()).toBe(expectedUserId)
+      // The route's runWithTenantContext scope must restore this request's
+      // initially empty tenant state when it returns.
+      if (tenantStore) expect(tenantStore.currentTenantUserId()).toBeNull()
       if (activeUserPolicyProbe) {
         const observations = candidateTransactionObservations.slice(observationStart)
         expect(observations.length).toBeGreaterThan(0)
         for (const observation of observations) {
           expect(observation.currentRole).toBe("applymate_candidate")
-          // The route transaction GUC must match the signed Bearer subject.
+          expect(observation.routeReadOperations).toContain("agentSession.findFirst")
+          // The actual route transaction GUC must match the signed Bearer subject.
           expect(observation.tenantUserId).toBe(activeUserPolicyProbe.expectedUserId)
           expect(observation.visibleUserIds).toEqual([activeUserPolicyProbe.expectedUserId])
           expect(observation.emptyContextVisibleUserIds).toEqual([])

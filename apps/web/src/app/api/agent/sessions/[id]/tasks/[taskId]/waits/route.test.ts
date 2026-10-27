@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(), transaction: vi.fn(), sessionFindFirst: vi.fn(), parentFindFirst: vi.fn(), clock: vi.fn(),
   turnFindFirst: vi.fn(), rootFindFirst: vi.fn(), stepFindFirst: vi.fn(), waitFindMany: vi.fn(), targetFindMany: vi.fn(),
+  runWithTenantContext: vi.fn(),
 }))
 let rootTaskStatus = "running"
 
@@ -12,6 +13,7 @@ vi.mock("@/lib/api-helpers", () => ({
   ok: (data: unknown, status = 200) => Response.json(data, { status }),
 }))
 vi.mock("@/lib/db", () => ({ db: { $transaction: mocks.transaction } }))
+vi.mock("@/lib/db/tenant-store", () => ({ runWithTenantContext: mocks.runWithTenantContext }))
 
 const transactionClient = {
   $queryRaw: mocks.clock,
@@ -61,6 +63,7 @@ describe("authenticated current child-wait route", () => {
     for (const mock of Object.values(mocks)) mock.mockReset()
     rootTaskStatus = "running"
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
+    mocks.runWithTenantContext.mockImplementation(async (_userId: string, callback: () => Promise<unknown>) => await callback())
     mocks.transaction.mockImplementation(async (callback: unknown) => {
       if (typeof callback !== "function") throw new Error("expected interactive transaction")
       return (callback as (client: typeof transactionClient) => Promise<unknown>)(transactionClient)
@@ -86,6 +89,7 @@ describe("authenticated current child-wait route", () => {
     const body = await response.json()
 
     expect(response.status).toBe(200)
+    expect(mocks.runWithTenantContext).toHaveBeenCalledWith("user_1", expect.any(Function))
     expect(response.headers.get("cache-control")).toBe("private, no-store")
     expect(body).toEqual({ wait: {
       mode: "all", status: "waiting", deadlineAt: waitDeadline.toISOString(), parentDeadlineAt: null, targets: [
@@ -231,7 +235,9 @@ describe("authenticated current child-wait route", () => {
     expect(notFound.headers.get("cache-control")).toBe("private, no-store")
 
     mocks.requireAuth.mockResolvedValueOnce(new Response("Unauthorized", { status: 401 }))
+    mocks.runWithTenantContext.mockClear()
     expect((await GET(request(), params)).status).toBe(401)
+    expect(mocks.runWithTenantContext).not.toHaveBeenCalled()
 
     const invalidQuery = await GET(request("?targetTaskId=foreign"), params)
     expect(invalidQuery.status).toBe(400)
