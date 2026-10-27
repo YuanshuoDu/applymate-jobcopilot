@@ -1641,6 +1641,146 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
     expect(providerFailure.verified).toBe(false)
     expect(providerFailure.projection).toBeUndefined()
   })
+
+  it("binds a union Analyst to independently proven empty and populated Scout receipts", async () => {
+    const value = fixture()
+    fixtureUserIds.push(value.userId)
+    const populatedScoutTaskId = `${value.scoutTaskId}-populated`
+    const snapshot = unionGraphSnapshot(value, populatedScoutTaskId)
+    await seedGraph(pool!, value, snapshot, true)
+    const [emptyScout, populatedScout, analyst] = snapshot.nodes
+    if (!emptyScout || !populatedScout || !analyst) throw new Error("Union fixture omitted a typed graph node")
+    const scope = { userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+      rootTaskId: value.rootTaskId, parentTaskId: value.rootTaskId }
+    await pool!.query(`INSERT INTO "Job"
+      ("id", "userId", "company", "role", "location", "status", "url", "description", "source", "keywords", "updatedAt")
+      VALUES ($1, $2, 'Fixture Systems', 'Software Engineer', 'Dublin', 'saved', 'https://jobs.example.invalid/union',
+        'Build reliable TypeScript services for European customers.', 'fixture', 'TypeScript', CURRENT_TIMESTAMP)`, [value.jobId, value.userId])
+    const populatedScoutResult = roleResult("scout", value.jobId)
+    await pool!.query(`UPDATE "sub_agent_tasks" SET "result" = jsonb_set("result", '{structuredResult}', $2::jsonb)
+      WHERE "id" = $1 AND "sessionId" = $3`, [populatedScoutTaskId, JSON.stringify(populatedScoutResult), value.sessionId])
+
+    const emptyCallSuffix = "union-empty-discover-a"
+    await persistToolReceipt(pool!, value, emptyScout.taskId, "scout-step", "jobs.discover", emptyCallSuffix, {
+      targetRoles: ["Software Engineer"], targetLocations: ["Dublin"],
+    }, emptyDiscoveryOutput(value, emptyCallSuffix), 1)
+    await persistToolReceipt(pool!, value, populatedScout.taskId, "scout-step", "jobs.discover", "discover-call", {
+      query: "Software Engineer Dublin",
+    }, discoveryOutput(value), 1)
+    await persistToolReceipt(pool!, value, populatedScout.taskId, "scout-step", "jobs.get", "union-scout-read", {
+      jobId: value.jobId,
+    }, { job: { id: value.jobId, source: "fixture" } }, 2)
+    await persistToolReceipt(pool!, value, analyst.taskId, "analyst-step", "jobs.get", "union-analyst-read", {
+      jobId: value.jobId,
+    }, { job: { id: value.jobId, source: "fixture" } }, 1)
+
+    const emptyProof = await verifyCompletedTaskGraphNodeEvidence(pool!, {
+      scope: { ...scope, taskId: emptyScout.taskId, attemptCount: 1 }, snapshot, node: emptyScout, structuredResult: emptyRoleResult("scout"),
+    })
+    expect(emptyProof).toMatchObject({ verified: true, projection: { role: "scout", candidates: [], emptyDiscoveryReceipt: { digest: expect.any(String) } } })
+    await persistVerification(pool!, emptyScout.taskId, emptyProof, {
+      discoveryAttempt: completeDiscoverySidecar(0), toolCallCount: 1,
+    })
+    const populatedProof = await verifyCompletedTaskGraphNodeEvidence(pool!, {
+      scope: { ...scope, taskId: populatedScout.taskId, attemptCount: 1 }, snapshot, node: populatedScout, structuredResult: populatedScoutResult,
+    })
+    expect(populatedProof).toMatchObject({ verified: true, projection: { role: "scout", candidates: [{ jobId: value.jobId }] } })
+    await persistVerification(pool!, populatedScout.taskId, populatedProof, {
+      discoveryAttempt: completeDiscoverySidecar(1), toolCallCount: 2,
+    })
+
+    const dependencies = await verifyCompletedScoutDependencies(pool!, scope, snapshot, analyst)
+    expect(dependencies).not.toBeNull()
+    expect(dependencies!.bindings.map(binding => binding.nodeKey)).toEqual(["scheduled-scout-a", "scheduled-scout-b"])
+    const analystResult = roleResult("analyst", value.jobId)
+    const analystProof = await verifyCompletedTaskGraphNodeEvidence(pool!, {
+      scope: { ...scope, taskId: analyst.taskId, attemptCount: 1 }, snapshot, node: analyst,
+      structuredResult: analystResult, dependencies: dependencies!.projections,
+    })
+    expect(analystProof).toMatchObject({ verified: true, evaluation: { status: "passed" } })
+    await persistVerification(pool!, analyst.taskId, analystProof, {
+      dependencyBindings: dependencies!.bindings, toolCallCount: 1,
+    })
+
+    const loaded = await loadTaskGraph(pool!, scope, false)
+    expect(loaded.tasks.get(analyst.taskId)?.result).toMatchObject({ taskGraphVerificationReport: {
+      status: "passed", dependencyBindings: [
+        { nodeKey: "scheduled-scout-a", taskId: emptyScout.taskId, attemptCount: 1 },
+        { nodeKey: "scheduled-scout-b", taskId: populatedScout.taskId, attemptCount: 1 },
+      ],
+    } })
+    expect(currentTaskGraph(loaded).nodes.find(node => node.key === analyst.key)).toMatchObject({
+      status: "completed", verificationReport: { status: "passed" },
+    })
+
+    for (const corruption of ["missing-result", "misbound-result"] as const) {
+      const client = await pool!.connect()
+      try {
+        await client.query("BEGIN")
+        const emptyResultItemId = `${emptyCallSuffix}-${value.turnId}-result`
+        if (corruption === "missing-result") {
+          const deleted = await client.query(`DELETE FROM "agent_items" WHERE "id" = $1 AND "type" = 'tool_result'`, [emptyResultItemId])
+          expect(deleted.rowCount).toBe(1)
+        } else {
+          const changed = await client.query(`UPDATE "agent_items" SET "content" = jsonb_set("content", '{toolCallId}', to_jsonb($2::text))
+            WHERE "id" = $1 AND "type" = 'tool_result'`, [emptyResultItemId, `wrong-${emptyCallSuffix}-${value.turnId}`])
+          expect(changed.rowCount).toBe(1)
+        }
+        await expect(verifyCompletedScoutDependencies(client, scope, snapshot, analyst)).resolves.toBeNull()
+      } finally {
+        await client.query("ROLLBACK").catch(() => undefined)
+        client.release()
+      }
+    }
+  }, 60_000)
+
+  it("rejects all-empty and empty-Analyst unions despite persisted empty Scout receipts", async () => {
+    const value = fixture()
+    fixtureUserIds.push(value.userId)
+    const secondScoutTaskId = `${value.scoutTaskId}-second-empty`
+    const snapshot = unionGraphSnapshot(value, secondScoutTaskId)
+    await seedGraph(pool!, value, snapshot, true)
+    const [firstScout, secondScout, analyst] = snapshot.nodes
+    if (!firstScout || !secondScout || !analyst) throw new Error("All-empty union fixture omitted a typed graph node")
+    const scope = { userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+      rootTaskId: value.rootTaskId, parentTaskId: value.rootTaskId }
+    for (const [node, suffix] of [[firstScout, "union-empty-first"], [secondScout, "union-empty-second"]] as const) {
+      await persistToolReceipt(pool!, value, node.taskId, "scout-step", "jobs.discover", suffix, {
+        targetRoles: ["Software Engineer"], targetLocations: ["Dublin"],
+      }, emptyDiscoveryOutput(value, suffix), 1)
+      const proof = await verifyCompletedTaskGraphNodeEvidence(pool!, {
+        scope: { ...scope, taskId: node.taskId, attemptCount: 1 }, snapshot, node, structuredResult: emptyRoleResult("scout"),
+      })
+      expect(proof.verified).toBe(true)
+      await persistVerification(pool!, node.taskId, proof, {
+        discoveryAttempt: completeDiscoverySidecar(0), toolCallCount: 1,
+      })
+    }
+    const dependencies = await verifyCompletedScoutDependencies(pool!, scope, snapshot, analyst)
+    expect(dependencies?.bindings.map(binding => binding.nodeKey)).toEqual(["scheduled-scout-a", "scheduled-scout-b"])
+
+    const emptyAnalystProof = await verifyCompletedTaskGraphNodeEvidence(pool!, {
+      scope: { ...scope, taskId: analyst.taskId, attemptCount: 1 }, snapshot, node: analyst,
+      structuredResult: emptyRoleResult("analyst"), dependencies: dependencies!.projections,
+    })
+    expect(emptyAnalystProof.verified).toBe(false)
+
+    await pool!.query(`INSERT INTO "Job"
+      ("id", "userId", "company", "role", "location", "status", "url", "description", "source", "keywords", "updatedAt")
+      VALUES ($1, $2, 'Fixture Systems', 'Software Engineer', 'Dublin', 'saved', 'https://jobs.example.invalid/all-empty',
+        'Build reliable TypeScript services for European customers.', 'fixture', 'TypeScript', CURRENT_TIMESTAMP)`, [value.jobId, value.userId])
+    const outOfUnionResult = roleResult("analyst", value.jobId)
+    await pool!.query(`UPDATE "sub_agent_tasks" SET "result" = jsonb_set("result", '{structuredResult}', $2::jsonb)
+      WHERE "id" = $1 AND "sessionId" = $3`, [analyst.taskId, JSON.stringify(outOfUnionResult), value.sessionId])
+    await persistToolReceipt(pool!, value, analyst.taskId, "analyst-step", "jobs.get", "all-empty-analyst-read", {
+      jobId: value.jobId,
+    }, { job: { id: value.jobId, source: "fixture" } }, 1)
+    const allEmptyProof = await verifyCompletedTaskGraphNodeEvidence(pool!, {
+      scope: { ...scope, taskId: analyst.taskId, attemptCount: 1 }, snapshot, node: analyst,
+      structuredResult: outOfUnionResult, dependencies: dependencies!.projections,
+    })
+    expect(allEmptyProof).toMatchObject({ verified: false, evaluation: { status: "failed", reasonCode: "criterion_not_met" } })
+  }, 60_000)
 })
 
 type ScheduledContinuationPayload = Readonly<{ owner: {
@@ -1947,6 +2087,29 @@ function graphSnapshot(value: Fixture) {
   })
 }
 
+function unionGraphSnapshot(value: Fixture, secondScoutTaskId: string) {
+  const scoutKeys = ["scheduled-scout-a", "scheduled-scout-b"] as const
+  return parseTaskGraphSnapshot({
+    schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
+    nodes: [
+      { key: scoutKeys[0], templateId: "scout", goal: "Discover the first source", successCriteria: ["Return an evidenced source result"],
+        dependsOn: [], depth: 1, taskId: value.scoutTaskId, verificationDisposition: "typed", verification: SCOUT_VERIFICATION },
+      { key: scoutKeys[1], templateId: "scout", goal: "Discover the second source", successCriteria: ["Return an evidenced source result"],
+        dependsOn: [], depth: 1, taskId: secondScoutTaskId, verificationDisposition: "typed", verification: SCOUT_VERIFICATION },
+      { key: "scheduled-analyst-union", templateId: "analyst", goal: "Synthesize both Scout cohorts",
+        successCriteria: ["Return only source-bound findings"], dependsOn: [...scoutKeys], depth: 2,
+        taskId: value.analystTaskId, verificationDisposition: "typed", verification: {
+          schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
+          criteria: [
+            { id: "source-membership", check: { kind: "findings_from_scout_union", dependencyNodeKeys: [scoutKeys[1], scoutKeys[0]] } },
+            { id: "cohort-coverage", check: { kind: "findings_cover_scout_candidate_union_gte", dependencyNodeKeys: [...scoutKeys], minimumPercent: 100 } },
+            { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
+          ],
+        } },
+    ],
+  })
+}
+
 async function seedGraph(database: PgPool, value: Fixture, snapshot: ReturnType<typeof parseTaskGraphSnapshot>, empty = false,
   automationSnapshot = scheduledAutomationSnapshot()): Promise<void> {
   const scheduledInput = { automationRunMode: "scheduled", scheduledAutomationSnapshot: automationSnapshot }
@@ -2043,8 +2206,8 @@ function discoveryOutput(value: Fixture) {
   }
 }
 
-function emptyDiscoveryOutput(value: Fixture) {
-  const toolCallId = `zero-discover-${value.turnId}`, stepId = `scout-step-${toolCallId}`
+function emptyDiscoveryOutput(value: Fixture, callSuffix = "zero-discover") {
+  const toolCallId = `${callSuffix}-${value.turnId}`, stepId = `scout-step-${toolCallId}`
   return {
     jobs: [], evidence: [], nextCursor: null,
     usage: {

@@ -66,7 +66,7 @@ describe("TaskGraph verification Scout union checks", () => {
   })
 
   it("fails closed for empty findings, duplicate findings, invalid selectors, and non-Scout projections", () => {
-    const parsed: ReadonlyMap<string, TaskGraphVerificationParsedProjection> = new Map([
+    const parsed: ReadonlyMap<string, TaskGraphVerificationParsedProjection> = new Map<string, TaskGraphVerificationParsedProjection>([
       ["a", scout("one")], ["b", scout("two")], ["analyst", { ...scout("three"), role: "analyst" as const }],
     ])
     expect(evaluateFindingsFromScoutUnion(["a", "b"], [], parsed)).toBe("criterion_not_met")
