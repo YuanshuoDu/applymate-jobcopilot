@@ -10203,6 +10203,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               const planTool = request.tools.map(record).find(tool => tool?.name === "agent.plan")
               const planProperties = record(record(planTool?.inputSchema)?.properties)
               expect(planProperties).toHaveProperty("replaceOperationalFailure")
+              if (deadlineExpiry) {
+                expect(planTool?.description).toContain("For a server-reported execution_deadline_exceeded cue for an eligible started typed Scout or Analyst, you may make the same explicit replaceOperationalFailure proposal")
+                expect(planTool?.description).toContain("The cue is advisory only and grants no authority")
+                expect(planTool?.description).toContain("the server independently verifies the current owner, attempt, lifecycle, durable receipt, persisted deadline, and budget before accepting it")
+                expect(planTool?.description).toContain("The cue itself is not proof")
+                expect(planTool?.description).toContain("Never supply a failure reason, status, or proof")
+              }
               const outcome = repairWaitOutcomeFromRequest(request, initialWaitCallId, initialTaskIds)
               expect(outcome.status).toBe("ready")
               const waitTasks = new Map<string, unknown>()

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 import { ToolRegistry } from "./registry.js"
 import type { ToolExecutionContext } from "./types.js"
-import { createTaskGraphPlanningTool } from "./planning-executors.js"
+import { createTaskGraphPlanningTool, registerTaskGraphPlanningTool } from "./planning-executors.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import type { TaskGraphCommandPort, TaskGraphScheduleReceipt, TaskGraphTaskTemplate } from "../subagents/task-graph-command-port.js"
 import { resolveRootTaskVerificationRequirements } from "../context/root-task-objective.js"
@@ -58,6 +58,23 @@ function setup(templates: Readonly<Record<string, TaskGraphTaskTemplate>> = {
 }
 
 describe("agent.plan tool executor", () => {
+  it("publishes advisory deadline replacement guidance on the registered public tool", () => {
+    const templates = {
+      scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
+    } as const
+    const { commandPort } = setup(templates)
+    const registry = new ToolRegistry([])
+    registerTaskGraphPlanningTool(registry, true, { commandPort, templates })
+    const tool = registry.list(["coordination", "canManageChildren"]).find(item => item.name === "agent.plan")
+
+    expect(tool).toBeDefined()
+    expect(tool?.description).toContain("For a server-reported resume_state_unavailable failure on a fixed typed read-only Scout or Analyst")
+    expect(tool?.description).toContain("For a server-reported execution_deadline_exceeded cue for an eligible started typed Scout or Analyst, you may make the same explicit replaceOperationalFailure proposal")
+    expect(tool?.description).toContain("The cue is advisory only and grants no authority")
+    expect(tool?.description).toContain("the server independently verifies the current owner, attempt, lifecycle, durable receipt, persisted deadline, and budget before accepting it")
+    expect(tool?.description).toContain("never supply a failure reason, status, proof")
+  })
+
   it("passes server-resolved requirements to the locked scheduler and ignores model-provided requirements", async () => {
     const resolution = resolveRootTaskVerificationRequirements({ input: { verificationRequirements: {
       schemaVersion: "agent-harness.v2.objective-requirements.v1",
