@@ -263,7 +263,7 @@ describe('Agent task wait refresh controller', () => {
 
   it('marks an overdue deadline locally and revalidates that deadline once', async () => {
     vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-27T11:59:59.000Z'))
-    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(response(waiting))
+    const fetcher = vi.fn<typeof fetch>(async () => response(waiting))
     const test = harness(fetcher)
     test.controller.start()
     await test.waitForState(state => state.phase === 'available' && state.wait !== null)
@@ -282,7 +282,7 @@ describe('Agent task wait refresh controller', () => {
   it('revalidates once at the earlier parent deadline while displaying both dates', async () => {
     vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-27T11:00:00.000Z'))
     const earlierParent = { wait: { ...waitingWait, deadlineAt: '2026-10-27T11:00:10.000Z', parentDeadlineAt: '2026-10-27T11:00:01.000Z' } }
-    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(response(earlierParent))
+    const fetcher = vi.fn<typeof fetch>(async () => response(earlierParent))
     const test = harness(fetcher)
     test.controller.start()
     await test.waitForState(state => state.phase === 'available' && state.wait !== null)

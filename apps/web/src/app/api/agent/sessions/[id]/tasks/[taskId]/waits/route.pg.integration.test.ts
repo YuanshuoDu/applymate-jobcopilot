@@ -245,7 +245,7 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
     userId: ownerId,
     sessionId,
     status: "in_progress",
-    source: "test",
+    source: "user",
     input: { privateInput: secret },
     modelProfileSnapshot: { privateSnapshot: secret },
     toolPolicySnapshot: {},
@@ -282,7 +282,7 @@ async function createForeignTarget(fixture: Fixture, ownerId: string): Promise<s
   const rootTaskId = `foreign-root-${suffix}`
   const taskId = `foreign-target-${suffix}`
   await db().agentSession.create({ data: { id: sessionId, userId: ownerId, goal: `${fixture.secret} foreign goal`, status: "running", source: "test" } })
-  await db().agentTurn.create({ data: { id: turnId, userId: ownerId, sessionId, status: "in_progress", source: "test",
+  await db().agentTurn.create({ data: { id: turnId, userId: ownerId, sessionId, status: "in_progress", source: "user",
     input: {}, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} } })
   await createTask({ id: rootTaskId, sessionId, turnId, rootTaskId: null, parentTaskId: null,
     secret: fixture.secret, role: "orchestrator", taskType: "root", status: "running", depth: 0 })
@@ -357,7 +357,7 @@ const invalidWaitCases: readonly InvalidCase[] = [
     const turnId = `other-turn-${randomUUID()}`
     const stepId = `other-turn-step-${randomUUID()}`
     await db().agentTurn.create({ data: { id: turnId, userId: fixture.ownerId, sessionId: fixture.sessionId,
-      status: "in_progress", source: "test", input: {}, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} } })
+      status: "in_progress", source: "user", input: {}, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} } })
     await createStep({ id: stepId, sessionId: fixture.sessionId, turnId, taskId: fixture.parentTaskId,
       attempt: 1, ordinal: 9, secret: fixture.secret })
     await db().agentWaitCondition.update({ where: { id: fixture.waitId }, data: { turnId, stepId } })
@@ -496,16 +496,17 @@ describeWithDatabase("authenticated task wait projection on disposable PostgreSQ
     } })
   })
 
-  it("returns unknown for unsafe child status and never projects its private text", async () => {
+  it("projects a persisted child status while redacting private labels and text", async () => {
     const fixture = await createFixture()
-    await db().subAgentTask.update({ where: { id: fixture.targetIds[1] }, data: { status: "PRIVATE_STATUS" } })
+    await db().subAgentTask.update({ where: { id: fixture.targetIds[1] }, data: {
+      status: "waiting_for_user", role: fixture.secret, taskType: fixture.secret,
+    } })
     const response = await getWait(fixture, await signedBearer(fixture.ownerId))
     const text = await response.text()
     expect(JSON.parse(text)).toMatchObject({ wait: { targets: [
       { taskId: fixture.targetIds[0], status: "completed", matched: true },
-      { taskId: fixture.targetIds[1], status: "unknown", matched: false },
+      { taskId: fixture.targetIds[1], label: null, status: "waiting_for_user", matched: false },
     ] } })
-    expect(text).not.toContain("PRIVATE_STATUS")
     expect(text).not.toContain(fixture.secret)
   })
 
