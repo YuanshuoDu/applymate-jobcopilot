@@ -1,12 +1,20 @@
 import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 import { Pool as PgPool } from "pg"
+import type { HarnessModelRequest, ModelAdapter } from "@jobcopilot/agent-model"
 
+import { loadCanonicalTurnState } from "../canonical-turn-state.js"
+import { buildModelRequest } from "../turns/turn-engine-messages.js"
 import { ContextCompactor } from "./context-compactor.js"
 import { executionOwnerFence, type TurnExecutionOwnerFence } from "../execution-owner.js"
 import type { TurnLease } from "../turns/lease.js"
+import { StepContextBuilder } from "./step-context-builder.js"
+import type { InputClaimStore, InputClaimTransaction } from "./input-claim-store.js"
 import { completeCompactionItem, createCompactionStartedItem } from "./context-compaction-items.js"
 import type { CompactionSource } from "./context-compaction-types.js"
+import { snapshotCanonicalJson, snapshotChecksum } from "./context-snapshot-canonical.js"
+import { CONTEXT_SNAPSHOT_SCHEMA_VERSION, type AgentContextSnapshot, type ContextSnapshotContent } from "./context-snapshot-types.js"
+import { createPgContextSnapshotStore } from "./context-snapshot-store.js"
 import { createPgCompactionSource } from "./context-compaction-pg-source.js"
 import { createPgContextSnapshotCompactionPort } from "./context-snapshot-compaction-pg.js"
 
@@ -30,6 +38,7 @@ type OwnerFixture = {
   readonly sessionId: string
   readonly turnId: string
   readonly taskId: string
+  readonly lease: TurnLease
   readonly owner: TurnExecutionOwnerFence
   readonly scope: { readonly userId: string }
 }
@@ -48,7 +57,7 @@ async function seedOwnerFixture(pool: PgPool): Promise<OwnerFixture> {
     await pool.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`, [userId, `${userId}@example.invalid`])
     await pool.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt") VALUES ($1, $2, 'Find a role', 'running', 'test', CURRENT_TIMESTAMP)`, [sessionId, userId])
     await pool.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "rootTaskId", "contextSnapshotId", "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
-      VALUES ($1, $2, $3, 'in_progress', 'user', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $4, NULL, $5, $6, $7, 1, CURRENT_TIMESTAMP)`, [turnId, sessionId, userId, taskId, fence.ownerId, leaseExpiresAt, lease.leaseStartedAt])
+      VALUES ($1, $2, $3, 'in_progress', 'user', '{"goal":"Find a role"}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $4, NULL, $5, $6, $7, 1, CURRENT_TIMESTAMP)`, [turnId, sessionId, userId, taskId, fence.ownerId, leaseExpiresAt, lease.leaseStartedAt])
     await pool.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal", "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "updatedAt")
       VALUES ($1, $2, $3, NULL, NULL, '/root', 0, 'orchestrator', 'root', 'running', 'Find a role', '{}'::jsonb, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 0, 1, CURRENT_TIMESTAMP)`, [taskId, sessionId, turnId])
     await pool.query(`UPDATE "sub_agent_tasks" SET "rootTaskId" = $1 WHERE "id" = $1`, [taskId])
@@ -57,7 +66,7 @@ async function seedOwnerFixture(pool: PgPool): Promise<OwnerFixture> {
     await pool.query(`DELETE FROM "User" WHERE "id" = $1`, [userId]).catch(() => undefined)
     throw error
   }
-  return { userId, sessionId, turnId, taskId, owner: fence, scope: { userId } }
+  return { userId, sessionId, turnId, taskId, lease, owner: fence, scope: { userId } }
 }
 
 function emptySource(fixture: OwnerFixture): CompactionSource {
@@ -83,6 +92,43 @@ async function insertCompletedItem(pool: PgPool, fixture: OwnerFixture, label: s
 
 function occurrenceCount(value: string, marker: string): number {
   return value.split(marker).length - 1
+}
+
+function testSnapshot(fixture: OwnerFixture, id: string, throughSequence: bigint, observation: string, version = 1): AgentContextSnapshot {
+  const content: ContextSnapshotContent = {
+    schemaVersion: CONTEXT_SNAPSHOT_SCHEMA_VERSION,
+    ownerId: fixture.userId,
+    sessionId: fixture.sessionId,
+    throughSequence: throughSequence.toString(),
+    goal: "Find a role",
+    userConstraints: [],
+    confirmedDecisions: [],
+    completedWork: [],
+    openWork: [],
+    pendingApprovals: [],
+    artifacts: [],
+    facts: [],
+    failedAttempts: [],
+    references: [],
+    consumedInputIds: [],
+    context: { system: [], profile: [], steerHistory: [], toolObservations: [{ id: "persisted-summary", content: observation }] },
+    tokenAccounting: { profiles: [], totalInputTokens: 0, totalOutputTokens: 0, totalCostUsd: 0 },
+  }
+  const base = { sessionId: fixture.sessionId, throughSequence, version, content }
+  return {
+    id,
+    ...base,
+    schemaVersion: CONTEXT_SNAPSHOT_SCHEMA_VERSION,
+    summary: observation,
+    memorySummary: observation,
+    checksum: snapshotChecksum(base),
+    inputTokens: 0,
+    outputTokens: 0,
+    estimatedCostUsd: 0,
+    tokenAccounting: content.tokenAccounting,
+    canonicalJson: snapshotCanonicalJson(base),
+    createdAt: new Date("2026-10-27T00:00:00.000Z"),
+  }
 }
 
 describeWithPostgres("PostgreSQL context compaction atomic publisher", () => {
@@ -116,6 +162,91 @@ describeWithPostgres("PostgreSQL context compaction atomic publisher", () => {
       await pool.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [ownerIds.sessionId])
       await pool.query(`DELETE FROM "User" WHERE "id" = $1`, [ownerIds.userId])
       await pool.end()
+    }
+  })
+
+  it("restores pinned v1 context into a captured model request and rejects a corrupt latest row before invocation", async () => {
+    const fixtures: OwnerFixture[] = []
+    const requests: HarnessModelRequest[] = []
+    const invokeModel = vi.fn((request: HarnessModelRequest) => { requests.push(request) })
+    const captureTurnRequest = async (fixture: OwnerFixture) => {
+      const state = await loadCanonicalTurnState(pool!, fixture.lease)
+      const claimStore: InputClaimStore = {
+        scope: fixture.scope,
+        async withTransaction<T>(work: (transaction: InputClaimTransaction) => Promise<T>): Promise<T> {
+          return work({
+            getCheckpoint: async () => ({ inputThroughSequence: 0n, consumedInputIds: [] }),
+            claimInputs: async () => ({ inputs: [], newlyClaimedInputIds: [] }),
+            persistCheckpoint: async () => undefined,
+          })
+        },
+      }
+      const stepId = `snapshot-recovery-step-${fixture.turnId}`
+      const context = await new StepContextBuilder(claimStore).build({
+        scope: fixture.scope,
+        sessionId: fixture.sessionId,
+        turnId: fixture.turnId,
+        stepId,
+        snapshot: state.snapshot,
+      })
+      const model = { profile: { provider: "test", model: "snapshot-recovery", nativeTools: false, structuredOutput: false, streaming: false, continuationCursor: false } } as unknown as ModelAdapter
+      const request = buildModelRequest({
+        context, model, tools: [], sessionId: fixture.sessionId, turnId: fixture.turnId, stepId,
+        userId: fixture.userId, taskId: fixture.taskId, rootTaskId: fixture.taskId, signal: new AbortController().signal,
+      })
+      invokeModel(request)
+      return request
+    }
+
+    try {
+      const pinnedFixture = await seedOwnerFixture(pool!)
+      fixtures.push(pinnedFixture)
+      const valid = testSnapshot(pinnedFixture, `snapshot-valid-${randomUUID()}`, 0n, "POSTGRES_VALID_V1_SUMMARY")
+      await createPgContextSnapshotStore(pool!).save(valid, pinnedFixture.scope)
+      await pool!.query(`UPDATE "agent_turns" SET "contextSnapshotId" = $1 WHERE "id" = $2`, [valid.id, pinnedFixture.turnId])
+
+      const validRequest = await captureTurnRequest(pinnedFixture)
+      const validPrompt = JSON.stringify(validRequest.messages)
+      expect(validPrompt).toContain("POSTGRES_VALID_V1_SUMMARY")
+      expect(valid.content.compaction).toBeUndefined()
+      expect(invokeModel).toHaveBeenCalledTimes(1)
+
+      const latestFixture = await seedOwnerFixture(pool!)
+      fixtures.push(latestFixture)
+      const fallback = testSnapshot(latestFixture, `snapshot-fallback-${randomUUID()}`, 0n, "POSTGRES_FALLBACK_SUMMARY")
+      await createPgContextSnapshotStore(pool!).save(fallback, latestFixture.scope)
+      const corruptOriginal = testSnapshot(latestFixture, `snapshot-corrupt-${randomUUID()}`, 1n, "ORIGINAL_SUMMARY", 2)
+      const corruptContent: ContextSnapshotContent = {
+        ...corruptOriginal.content,
+        context: { ...corruptOriginal.content.context, toolObservations: [{ id: "persisted-summary", content: "CORRUPTED_SUMMARY" }] },
+      }
+      await pool!.query(`INSERT INTO "agent_context_snapshots" ("id", "sessionId", "throughSequence", "version", "schemaVersion", "content", "summary", "checksum", "inputTokens", "outputTokens", "estimatedCostUsd", "tokenAccounting", "createdAt")
+        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12::jsonb, CURRENT_TIMESTAMP)`, [
+        corruptOriginal.id, latestFixture.sessionId, corruptOriginal.throughSequence.toString(), corruptOriginal.version,
+        corruptOriginal.schemaVersion, JSON.stringify(corruptContent), corruptOriginal.summary, corruptOriginal.checksum,
+        corruptOriginal.inputTokens, corruptOriginal.outputTokens, corruptOriginal.estimatedCostUsd.toFixed(8), JSON.stringify(corruptOriginal.tokenAccounting),
+      ])
+      await pool!.query(`UPDATE "agent_sessions" SET "eventSequence" = 1 WHERE "id" = $1`, [latestFixture.sessionId])
+
+      let caught: unknown
+      try {
+        await captureTurnRequest(latestFixture)
+      } catch (error: unknown) {
+        caught = error
+      }
+      expect(caught).toMatchObject({ code: "checksum_mismatch" })
+      const message = caught instanceof Error ? caught.message : ""
+      expect(message).not.toContain("CORRUPTED_SUMMARY")
+      expect(message).not.toContain(corruptOriginal.checksum)
+      expect(invokeModel).toHaveBeenCalledTimes(1)
+      expect(JSON.stringify(requests)).toContain("POSTGRES_VALID_V1_SUMMARY")
+      expect(JSON.stringify(requests)).not.toContain("CORRUPTED_SUMMARY")
+      expect(JSON.stringify(requests)).not.toContain("POSTGRES_FALLBACK_SUMMARY")
+    } finally {
+      for (const fixture of fixtures) {
+        await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [fixture.sessionId])
+        await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [fixture.userId])
+      }
     }
   })
 
