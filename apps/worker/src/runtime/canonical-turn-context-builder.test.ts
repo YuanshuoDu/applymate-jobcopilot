@@ -648,7 +648,6 @@ describe("canonical Turn context builder", () => {
 
     const outcome: ValidatedRootTaskHistoryOutcome = {
       sourceTurnId: "PRIVATE_HISTORY_SOURCE_TURN", sourceRootTaskId: HISTORY_ROOT_ID, terminalSequence: 19n,
-      terminalAt: now, sourceSessionDiffers: false,
       taskGraph: source.taskGraph, sourceNodeOrdinals: source.sourceNodeOrdinals,
       ...(source.nodeLessons ? { nodeLessons: source.nodeLessons } : {}),
       ...(source.reportedOutputs ? { reportedOutputs: source.reportedOutputs } : {}),
@@ -715,7 +714,6 @@ describe("canonical Turn context builder", () => {
       pool: { connect: async () => { throw new Error("injected readers and the base builder must avoid a database connection") } } as unknown as Pick<pg.Pool, "connect">,
       store: claimStore, baseBuilder, scope, lease, rootTaskId: "current-root-task", rootAttemptCount: 2,
       rootInputId: rootInput.id, planningEnabled: true, selectedJobMode: false, rootTaskHistoryDirectReader: historyReader,
-      crossSessionRootTaskHistoryEnabled: true,
       currentRootBudgetReader: async () => unavailableBudget,
     })
     const context = await builder.build({
@@ -735,6 +733,7 @@ describe("canonical Turn context builder", () => {
     const requestText = requestMessages.map(message => message.text).join("\n")
     const systemText = requestMessages.filter(message => message.role === "system").map(message => message.text).join("\n")
     const historyBlock = context.blocks.find(block => block.id === "observation:root-task-history")
+    expect(historyBlock?.content).not.toHaveProperty("historical")
     const graphBlock = context.blocks.find(block => block.id === "observation:task-graph-current")
     const historyJson = JSON.stringify(historyBlock?.content)
     const historyContent = historyBlock?.content as { turns?: Array<{ nodes?: Array<Record<string, unknown>> }> } | undefined
@@ -750,7 +749,7 @@ describe("canonical Turn context builder", () => {
     const clarification = context.blocks.find(block => block.id === "planning-clarification:latest-answered-question")
 
     expect(historyReader.load).toHaveBeenCalledWith({ lease, rootTaskId: "current-root-task", rootAttemptCount: 2,
-      stepId: "step-history-composition", now, crossSessionRootTaskHistoryEnabled: true })
+      stepId: "step-history-composition", now })
     expect(persistedCheckpoint).toEqual({ inputThroughSequence: 5n, consumedInputIds: [steerInput.id] })
     expect(context.inputThroughSequence).toBe(5n)
     expect(context.consumedInputIds).toEqual([steerInput.id])
@@ -817,10 +816,11 @@ describe("canonical Turn context builder", () => {
     expect(historyGuidance[0]?.text).toContain("preserve the valid plan")
     expect(historyGuidance[0]?.text).toContain("Historical typed-check descriptors distinguish count, evidence-completeness, score, Scout-dependency, and declared cohort-coverage checks in their source graph.")
     expect(historyGuidance[0]?.text).toContain("Historical passed-check descriptors are advisory source-graph checks only")
+    expect(historyGuidance[0]?.text).toContain("Historical Scout query footprints are advisory source-history observations only")
     expect(historyGuidance[0]?.text).toContain("past queries or results need not match current ones")
     expect(historyGuidance[0]?.text).not.toContain("root_task_history")
     for (const historicalFact of ["source_graph_local", "nodeOrdinal", "criterionOrdinal", "targetNodeOrdinal", "candidate_count_gte",
-      '"minimum":8', '"candidateCount":5', '"findingCount":6']) {
+      '"minimum":8', '"candidateCount":5', '"findingCount":6', "priorScoutQueryFootprint", "targetRoles", "Backend Engineer", "Dublin", "hasCursor"]) {
       expect(historyGuidance[0]?.text).not.toContain(historicalFact)
     }
     const privateValues = [
@@ -851,7 +851,14 @@ describe("canonical Turn context builder", () => {
       taskGraph: source.taskGraph,
     }]
     const crossSessionStepId = "step-history-cross-session"
-    const crossSessionContext = await builder.build({
+    const crossSessionBuilder = createCanonicalTurnContextBuilder({
+      pool: { connect: async () => { throw new Error("injected history readers and the base builder must avoid a database connection") } } as unknown as Pick<pg.Pool, "connect">,
+      store: claimStore, baseBuilder, scope, lease, rootTaskId: "current-root-task", rootAttemptCount: 2,
+      rootInputId: rootInput.id, planningEnabled: true, selectedJobMode: false, rootTaskHistoryDirectReader: historyReader,
+      crossSessionRootTaskHistoryEnabled: true,
+      currentRootBudgetReader: async () => unavailableBudget,
+    })
+    const crossSessionContext = await crossSessionBuilder.build({
       scope, sessionId: lease.sessionId, turnId: lease.turnId, stepId: crossSessionStepId, snapshot: requestSnapshot,
       rootInputId: rootInput.id, rootContextInputId: rootInput.id, mode: "new", now,
       lease: { ownerId: lease.ownerId, leaseVersion: lease.leaseVersion, now },
