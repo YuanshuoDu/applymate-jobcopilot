@@ -115,6 +115,98 @@ describe("root history check descriptor schema", () => {
   })
 })
 
+describe("ordinary passed criteria lesson schema", () => {
+  const scoutCheck = { role: "scout", kind: "candidate_count_gte", minimum: 2 } as const
+  const analystDependencyCheck = { role: "analyst", kind: "findings_from_scout_dependency", dependencyNodeOrdinal: 1 } as const
+  const lesson = (passedCriteria: unknown) => ({ ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
+    nodeOrdinal: 2, criterionFailures: [], passedCriteria })
+
+  it("accepts only the positive-only completed lesson and rebuilds known role-bound descriptors", () => {
+    const value = lesson([{ criterionOrdinal: 1, status: "passed", check: scoutCheck }])
+    expect(parseRootTaskHistoryNodeLesson(value, "scout", "completed")).toEqual(value)
+    expect(parseRootTaskHistoryNodeLesson(value, "scout", "failed")).toBeUndefined()
+    expect(parseRootTaskHistoryNodeLesson(value, "analyst", "completed")).toBeUndefined()
+    expect(parseRootTaskHistoryNodeLesson({ ...value, criterionFailures: [{ criterionOrdinal: 1,
+      status: "failed", reasonCode: "criterion_not_met" }] }, "scout", "completed")).toBeUndefined()
+    expect(parseRootTaskHistoryNodeLesson({ ...value, successfulRepairs: [] }, "scout", "completed")).toBeUndefined()
+    expect(parseRootTaskHistoryNodeLesson({ ...value, failedRepairOf: { targetNodeOrdinal: 1,
+      targetCriterionOrdinals: [1], outcome: "verified_failed" } }, "scout", "completed")).toBeUndefined()
+    expect(parseRootTaskHistoryNodeLesson({ ...value, executionFailureCategory: "execution_setup_unavailable" },
+      "scout", "completed")).toBeUndefined()
+  })
+
+  it("rejects empty, unordered, duplicated, augmented, and mixed-role pass facts", () => {
+    const valid = lesson([{ criterionOrdinal: 1, status: "passed", check: scoutCheck }])
+    for (const passedCriteria of [
+      [], [{ criterionOrdinal: 1, status: "failed", check: scoutCheck }],
+      [{ criterionOrdinal: 0, status: "passed", check: scoutCheck }],
+      [{ criterionOrdinal: 9, status: "passed", check: scoutCheck }],
+      [{ criterionOrdinal: 2, status: "passed", check: scoutCheck }, { criterionOrdinal: 1, status: "passed", check: scoutCheck }],
+      [{ criterionOrdinal: 1, status: "passed", check: scoutCheck }, { criterionOrdinal: 1, status: "passed", check: scoutCheck }],
+      [{ criterionOrdinal: 1, status: "passed", check: { ...scoutCheck, privateId: "secret" } }],
+      [{ criterionOrdinal: 1, status: "passed", check: scoutCheck }, { criterionOrdinal: 2, status: "passed", check: analystDependencyCheck }],
+    ]) expect(parseRootTaskHistoryNodeLesson({ ...valid, passedCriteria }, "scout", "completed")).toBeUndefined()
+  })
+
+  it("drops dependency pass facts when their referenced source is absent from emitted history", () => {
+    const dependent = parseRootTaskHistoryNodeLesson(lesson([
+      { criterionOrdinal: 1, status: "passed", check: analystDependencyCheck },
+    ]), "analyst", "completed")!
+    expect(filterRootTaskHistoryLessonsForEmittedNodes([undefined, dependent], [2], [1, 2])[1]).toEqual(dependent)
+    expect(filterRootTaskHistoryLessonsForEmittedNodes([undefined, dependent], [2], [2])).toEqual([undefined, undefined])
+    const independent = parseRootTaskHistoryNodeLesson(lesson([
+      { criterionOrdinal: 1, status: "passed", check: { role: "analyst", kind: "finding_count_gte", minimum: 1 } },
+    ]), "analyst", "completed")!
+    expect(filterRootTaskHistoryLessonsForEmittedNodes([undefined, independent], [2], [2])[1]?.passedCriteria).toEqual(independent.passedCriteria)
+  })
+})
+
+describe("ordinary passed criteria lesson schema", () => {
+  const scoutCheck = { role: "scout", kind: "candidate_count_gte", minimum: 2 } as const
+  const analystDependencyCheck = { role: "analyst", kind: "findings_from_scout_dependency", dependencyNodeOrdinal: 1 } as const
+  const lesson = (passedCriteria: unknown) => ({ ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
+    nodeOrdinal: 2, criterionFailures: [], passedCriteria })
+
+  it("accepts only the positive-only completed lesson and rebuilds known role-bound descriptors", () => {
+    const value = lesson([{ criterionOrdinal: 1, status: "passed", check: scoutCheck }])
+    expect(parseRootTaskHistoryNodeLesson(value, "scout", "completed")).toEqual(value)
+    expect(parseRootTaskHistoryNodeLesson(value, "scout", "failed")).toBeUndefined()
+    expect(parseRootTaskHistoryNodeLesson(value, "analyst", "completed")).toBeUndefined()
+    expect(parseRootTaskHistoryNodeLesson({ ...value, criterionFailures: [{ criterionOrdinal: 1,
+      status: "failed", reasonCode: "criterion_not_met" }] }, "scout", "completed")).toBeUndefined()
+    expect(parseRootTaskHistoryNodeLesson({ ...value, successfulRepairs: [] }, "scout", "completed")).toBeUndefined()
+    expect(parseRootTaskHistoryNodeLesson({ ...value, failedRepairOf: { targetNodeOrdinal: 1,
+      targetCriterionOrdinals: [1], outcome: "verified_failed" } }, "scout", "completed")).toBeUndefined()
+    expect(parseRootTaskHistoryNodeLesson({ ...value, executionFailureCategory: "execution_setup_unavailable" },
+      "scout", "completed")).toBeUndefined()
+  })
+
+  it("rejects empty, unordered, duplicated, augmented, and mixed-role pass facts", () => {
+    const valid = lesson([{ criterionOrdinal: 1, status: "passed", check: scoutCheck }])
+    for (const passedCriteria of [
+      [], [{ criterionOrdinal: 1, status: "failed", check: scoutCheck }],
+      [{ criterionOrdinal: 0, status: "passed", check: scoutCheck }],
+      [{ criterionOrdinal: 9, status: "passed", check: scoutCheck }],
+      [{ criterionOrdinal: 2, status: "passed", check: scoutCheck }, { criterionOrdinal: 1, status: "passed", check: scoutCheck }],
+      [{ criterionOrdinal: 1, status: "passed", check: scoutCheck }, { criterionOrdinal: 1, status: "passed", check: scoutCheck }],
+      [{ criterionOrdinal: 1, status: "passed", check: { ...scoutCheck, privateId: "secret" } }],
+      [{ criterionOrdinal: 1, status: "passed", check: scoutCheck }, { criterionOrdinal: 2, status: "passed", check: analystDependencyCheck }],
+    ]) expect(parseRootTaskHistoryNodeLesson({ ...valid, passedCriteria }, "scout", "completed")).toBeUndefined()
+  })
+
+  it("drops dependency pass facts when their referenced source is absent from emitted history", () => {
+    const dependent = parseRootTaskHistoryNodeLesson(lesson([
+      { criterionOrdinal: 1, status: "passed", check: analystDependencyCheck },
+    ]), "analyst", "completed")!
+    expect(filterRootTaskHistoryLessonsForEmittedNodes([undefined, dependent], [2], [1, 2])[1]).toEqual(dependent)
+    expect(filterRootTaskHistoryLessonsForEmittedNodes([undefined, dependent], [2], [2])).toEqual([undefined, undefined])
+    const independent = parseRootTaskHistoryNodeLesson(lesson([
+      { criterionOrdinal: 1, status: "passed", check: { role: "analyst", kind: "finding_count_gte", minimum: 1 } },
+    ]), "analyst", "completed")!
+    expect(filterRootTaskHistoryLessonsForEmittedNodes([undefined, independent], [2], [2])[1]?.passedCriteria).toEqual(independent.passedCriteria)
+  })
+})
+
 describe("historical execution failure category lessons", () => {
   const categories = ["execution_setup_unavailable", "resume_state_unavailable", "structured_output_invalid"] as const
   const lesson = (executionFailureCategory: string) => ({ ordinalScope: "source_graph_local", advisoryOnly: true,

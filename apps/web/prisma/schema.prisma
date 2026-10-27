@@ -1924,6 +1924,9 @@ model AgentSession {
   qualityScore  Float?
   currentTaskId String?
   lastViewedAt  DateTime?
+  sessionControlRecoveryAttemptedAt DateTime? @db.Timestamp(3)
+  sessionControlRecoveryClaimToken String?
+  sessionControlRecoveryClaimExpiresAt DateTime? @db.Timestamp(3)
   completedAt   DateTime?
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt

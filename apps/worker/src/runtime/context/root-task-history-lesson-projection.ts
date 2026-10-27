@@ -18,6 +18,7 @@ import { taskGraphResultDigest } from "../subagents/task-graph-pg-verification.j
 import { parseRootTaskHistoryReportedOutput, type RootTaskHistoryReportedOutput } from "./root-task-history-result-counts.js"
 import { describeValidatedRootTaskHistoryChecks, filterRootTaskHistoryLessonsForEmittedNodes,
   parseRootTaskHistoryNodeLesson, type RootTaskHistoryCheckDescriptor, type RootTaskHistoryNodeLesson } from "./root-task-history-lesson-schema.js"
+import { copyRootTaskHistoryPassedCriteria, deriveRootTaskHistoryPassedCriteria } from "./root-task-history-passed-criteria.js"
 
 export { filterRootTaskHistoryLessonsForEmittedNodes, parseRootTaskHistoryNodeLesson }
 export type { RootTaskHistoryCheckDescriptor, RootTaskHistoryNodeLesson } from "./root-task-history-lesson-schema.js"
@@ -118,15 +119,17 @@ export function sanitizeRootTaskHistoryNodeLessonForCrossSession(value: unknown)
   const lesson = parseRootTaskHistoryNodeLesson(value)
   if (!lesson) return undefined
   const criterionFailures = lesson.criterionFailures.map(({ criterionOrdinal, status, reasonCode }) => ({ criterionOrdinal, status, reasonCode }))
+  const passedCriteria = copyRootTaskHistoryPassedCriteria(lesson.passedCriteria)
   const successfulRepairs = lesson.successfulRepairs?.map(({ targetNodeOrdinal, targetCriterionOrdinals, status }) => ({
     targetNodeOrdinal, targetCriterionOrdinals: [...targetCriterionOrdinals], status,
   }))
   const failedRepair = lesson.failedRepairOf && { targetNodeOrdinal: lesson.failedRepairOf.targetNodeOrdinal,
     targetCriterionOrdinals: [...lesson.failedRepairOf.targetCriterionOrdinals], outcome: "verified_failed" as const }
-  if (!criterionFailures.length && !successfulRepairs?.length && !failedRepair) return undefined
+  if (!criterionFailures.length && !passedCriteria?.length && !successfulRepairs?.length && !failedRepair) return undefined
   return {
     ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
     nodeOrdinal: lesson.nodeOrdinal, criterionFailures,
+    ...(passedCriteria?.length ? { passedCriteria } : {}),
     ...(successfulRepairs?.length ? { successfulRepairs } : {}),
     ...(failedRepair ? { failedRepairOf: failedRepair } : {}),
   }
@@ -193,9 +196,17 @@ export function deriveRootTaskHistoryLessonFacts(loaded: LoadedGraph, currentGra
     return pairs.map((pair, index) => {
       const failures = criterionFailures(pair, 0, checkMatrix[index] ?? []), repair = successfulRepair(pair, index, pairs, loaded, satisfied)
       const failedRepair = failedRepairOf(pair, index, pairs, loaded)
-      const category = !failures.length && !repair && !failedRepair ? executionFailureCategory(pair) : undefined
+      const passedCriteria = deriveRootTaskHistoryPassedCriteria({ role: pair.source.verification?.role ?? "", templateId: pair.source.templateId,
+        taskRole: pair.task.role, verificationRole: pair.source.verification?.role, verificationDisposition: pair.source.verificationDisposition,
+        status: pair.status, failureReason: pair.failureReason, attemptCount: pair.task.attemptCount,
+        isRepair: pair.source.repairOf !== undefined, isNative: Boolean(pair.source.nativeDelegation || pair.current.native || pair.current.nativeResult),
+        criterionIds: pair.source.verification?.criteria.map(item => item.id) ?? [], currentReport: pair.current.verificationReport,
+        persistedReport: ownDataValue(pair.result ?? {}, "taskGraphVerificationReport"),
+        structuredResult: ownDataValue(pair.result ?? {}, "structuredResult"), checkDescriptors: checkMatrix[index] ?? [] })
+      const category = !failures.length && !repair && !failedRepair && !passedCriteria ? executionFailureCategory(pair) : undefined
       return parseRootTaskHistoryNodeLesson({ ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
         nodeOrdinal: index + 1, criterionFailures: failures, ...(repair ? { successfulRepairs: [repair] } : {}),
+        ...(passedCriteria ? { passedCriteria } : {}),
         ...(failedRepair ? { failedRepairOf: failedRepair } : {}),
         ...(category ? { executionFailureCategory: category } : {}) }, pair.source.verification?.role, pair.status)
     })

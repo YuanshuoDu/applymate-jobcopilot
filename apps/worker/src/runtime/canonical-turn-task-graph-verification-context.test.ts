@@ -6,6 +6,7 @@ import {
 } from "./canonical-turn-task-graph-verification-context.js"
 import type { TaskGraphCurrentNode } from "./subagents/task-graph-command-port.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, type TaskGraphVerificationContract } from "./planning/task-graph-verification.js"
+import type { TaskGraphVerificationContract as ExtendedVerificationContract } from "./planning/task-graph-verification-contract.js"
 
 const scoutVerification: TaskGraphVerificationContract = {
   schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria: [
@@ -23,6 +24,15 @@ const analystVerification: TaskGraphVerificationContract = {
     { id: "scout-source", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout" } },
   ],
 }
+const unionAnalystVerification: ExtendedVerificationContract = {
+  ...analystVerification,
+  criteria: [
+    ...analystVerification.criteria,
+    { id: "scout-coverage", check: { kind: "findings_cover_scout_candidates_gte", dependencyNodeKey: "scout", minimumPercent: 75 } },
+    { id: "scout-union", check: { kind: "findings_from_scout_union", dependencyNodeKeys: ["scout-b", "scout-a"] } },
+    { id: "scout-union-coverage", check: { kind: "findings_cover_scout_candidate_union_gte", dependencyNodeKeys: ["scout-a", "scout-b"], minimumPercent: 75 } },
+  ],
+}
 
 function node(value: Partial<TaskGraphCurrentNode> & Pick<TaskGraphCurrentNode, "key" | "taskId" | "templateId">): TaskGraphCurrentNode {
   return {
@@ -36,23 +46,30 @@ function node(value: Partial<TaskGraphCurrentNode> & Pick<TaskGraphCurrentNode, 
   }
 }
 
-function row(verification: TaskGraphVerificationContract, ids = verification.criteria.map(item => item.id)) {
-  return { verification, verificationCriterionIds: ids }
+function row(verification: unknown, ids?: readonly string[]) {
+  const criteria = verification && typeof verification === "object" && "criteria" in verification
+    && Array.isArray(verification.criteria) ? verification.criteria as unknown[] : []
+  const criterionIds = ids ?? criteria.map(item => item && typeof item === "object" && "id" in item
+    && typeof item.id === "string" ? item.id : "")
+  return { verification, verificationCriterionIds: criterionIds }
 }
 
 describe("current TaskGraph verification context", () => {
-  it("retains all seven canonical check kinds and their exact ordered meanings", () => {
+  it("retains all ten canonical check kinds and their exact ordered meanings", () => {
     const scout = parseTaskGraphCurrentVerificationMetadata(row(scoutVerification), "scout", "scout", "task-scout")
     const analyst = parseTaskGraphCurrentVerificationMetadata(row(analystVerification), "analyst", "analyst", "task-analyst")
+    const unionAnalyst = parseTaskGraphCurrentVerificationMetadata(row(unionAnalystVerification), "analyst", "analyst-union", "task-analyst-union")
 
     expect(scout?.verification).toEqual(scoutVerification)
     expect(analyst?.verification).toEqual(analystVerification)
+    expect(unionAnalyst?.verification).toEqual(unionAnalystVerification)
     expect(new Set([
       ...scoutVerification.criteria.map(item => item.check.kind),
-      ...analystVerification.criteria.map(item => item.check.kind),
+      ...unionAnalystVerification.criteria.map(item => item.check.kind),
     ])).toEqual(new Set([
       "candidate_count_gte", "finding_count_gte", "evidence_count_gte", "all_candidates_have_evidence",
       "all_findings_have_evidence", "reported_score_gte", "findings_from_scout_dependency",
+      "findings_cover_scout_candidates_gte", "findings_from_scout_union", "findings_cover_scout_candidate_union_gte",
     ]))
   })
 

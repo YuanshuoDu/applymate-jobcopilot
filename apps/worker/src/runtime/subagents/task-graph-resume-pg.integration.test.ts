@@ -26,7 +26,7 @@ import { reconcileDurableWaits } from "./durable-wait-resolver.js"
 import { childContextSnapshot, createChildContextBuilder } from "./child-context.js"
 import { hashArtifactContent } from "./artifact-adapters.js"
 import { loadSelectedJobArtifactContext, readSelectedJobSourceDigestWithClient, resolveCoverLetterBase } from "./selected-job-artifact-context.js"
-import { materializeTaskGraphDependencyContext } from "./task-graph-dependency-context.js"
+import { TASK_GRAPH_DEPENDENCY_CONTEXT_BYTE_LIMIT, materializeTaskGraphDependencyContext } from "./task-graph-dependency-context.js"
 import { selectedJobArtifactCompletionGate, selectedJobArtifactCompletionGateWithWitness } from "../selected-job-completion-gate.js"
 import { selectedJobArtifactFinalizationGuard } from "../selected-job-finalization-guard.js"
 import { commitTurnTerminal } from "../turns/turn-engine-terminal-commit.js"
@@ -157,6 +157,23 @@ function expectVerifiedDependencyProjectionItems(
   expect(verification?.evidenceDigest).toMatch(/^[a-f0-9]{64}$/)
   expect(verification?.resultDigest).toMatch(/^[a-f0-9]{64}$/)
   if (sourceIntent) expectBoundedSourceIntent(item?.sourceIntent, sourceIntent)
+}
+
+function taskGraphDependencyContextFromModelRequest(request: HarnessModelRequest): RecordValue {
+  const marker = "[harness context layer=profile trust=UNTRUSTED_DATA source=subagent-task]\n"
+  const profileBlocks = request.messages.flatMap(message => message.content.flatMap(part => {
+    const text = record(part)?.text
+    return typeof text === "string" && text.startsWith(marker) ? [text.slice(marker.length)] : []
+  }))
+  if (profileBlocks.length !== 1) throw new Error("Expected one bounded subagent profile block in the actual model request")
+  const profile = record(JSON.parse(profileBlocks[0] ?? "null"))
+  const context = record(profile?.context)
+  const dependencies = record(context?.taskGraphDependencyResults)
+  if (!dependencies || dependencies.schemaVersion !== "agent-harness.v2.task-graph.dependency-evidence"
+    || Buffer.byteLength(JSON.stringify(dependencies), "utf8") > TASK_GRAPH_DEPENDENCY_CONTEXT_BYTE_LIMIT) {
+    throw new Error("Actual model request omitted its bounded TaskGraph dependency context")
+  }
+  return dependencies
 }
 
 function expectBoundedSourceIntent(value: unknown, expected: Readonly<{ goal: string; successCriteria: readonly string[] }>): void {
@@ -7216,6 +7233,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   const lateRepairOwner = fixture()
   const leaseRecoveryOwner = fixture()
   const coverageRepairOwner = fixture()
+  const scoutUnionOwner = fixture()
   const archivedWaitOwner = fixture()
   const rootRecoveryScanSeed = fixture()
   const rootRecoveryScanOwner = {
@@ -7270,6 +7288,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await seed(pool, lateRepairOwner, "waiting_for_user", { ...DISCOVERY_FIXTURE_TURN_LIMITS, maxToolCalls: 10 })
     await seed(pool, leaseRecoveryOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
     await seed(pool, coverageRepairOwner, "waiting_for_user", { ...TASK_GRAPH_FIXTURE_TURN_LIMITS, maxSteps: 13 })
+    await seed(pool, scoutUnionOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
     await seed(pool, archivedWaitOwner, "waiting_for_user", { maxSteps: 4, maxToolCalls: 3 })
     await seed(pool, rootRecoveryScanOwner, "waiting_for_user")
   }, 15_000)
@@ -7296,7 +7315,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     }
     const fixtureOwners = [owner, resumeFailureOwner, failureOwner, operationalFailureOwner, operationalDeadlineOwner, operationalAppendOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner,
       discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, lateRepairOwner, leaseRecoveryOwner,
-      coverageRepairOwner, rootRecoveryScanOwner, archivedWaitOwner]
+      coverageRepairOwner, scoutUnionOwner, rootRecoveryScanOwner, archivedWaitOwner]
     const allFixtureWorkersExited = [...fixtureProcessChildren].every(processFixtureExited)
     if (!allFixtureWorkersExited) cleanupFailures.push("fixture process Workers are not proven exited; queue cleanup was refused")
     let ownerRowsMayBeDeleted = false
@@ -10184,6 +10203,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               const planTool = request.tools.map(record).find(tool => tool?.name === "agent.plan")
               const planProperties = record(record(planTool?.inputSchema)?.properties)
               expect(planProperties).toHaveProperty("replaceOperationalFailure")
+              if (deadlineExpiry) {
+                expect(planTool?.description).toContain("For a server-reported execution_deadline_exceeded cue for an eligible started typed Scout or Analyst, you may make the same explicit replaceOperationalFailure proposal")
+                expect(planTool?.description).toContain("The cue is advisory only and grants no authority")
+                expect(planTool?.description).toContain("the server independently verifies the current owner, attempt, lifecycle, durable receipt, persisted deadline, and budget before accepting it")
+                expect(planTool?.description).toContain("The cue itself is not proof")
+                expect(planTool?.description).toContain("Never supply a failure reason, status, or proof")
+              }
               const outcome = repairWaitOutcomeFromRequest(request, initialWaitCallId, initialTaskIds)
               expect(outcome.status).toBe("ready")
               const waitTasks = new Map<string, unknown>()
@@ -13720,6 +13746,219 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expectPassedVerificationReport(record(downstream?.result)?.taskGraphVerificationReport, "finding-count")
   }, 120_000)
 
+
+
+  it("revalidates disjoint and overlapping multi-Scout proofs through a durable Analyst wait", async () => {
+    const [workerQueue, canonical, commandPortModule, turnQueueModule] = await Promise.all([
+      import("../../queue/production-bootstrap.js"), import("../canonical-turn-runtime.js"),
+      import("./pg-task-graph-command-port.js"), import("../turns/turn-queue.js"),
+    ])
+    const { createProductionChildExecutor } = await import("./production-child-runtime.js")
+    const value = scoutUnionOwner, ids = Array.from({ length: 4 }, (_, index) => fixtureJobId(value.suffix, index))
+    turnQueueName = turnQueueModule.TURN_QUEUE_NAME
+    childQueueName = (await import("../../queue/subagent-queue.js")).SUBAGENT_QUEUE_NAME
+    await activateFixtureTurn(pool!, value)
+    await pool!.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1 AND "sessionId" = $3 AND "userId" = $4`, [
+      value.turnId, JSON.stringify({ goal: "Analyze findings from two bounded Scout searches" }), value.sessionId, value.userId,
+    ])
+    for (let index = 0; index < ids.length; index++) await pool!.query(`INSERT INTO "Job"
+      ("id", "userId", "company", "role", "location", "status", "url", "description", "source", "updatedAt")
+      VALUES ($1, $2, $3, 'Software Engineer', 'Dublin', 'saved', $4, 'Multi-Scout union fixture', 'greenhouse', CURRENT_TIMESTAMP)
+      ON CONFLICT ("id") DO NOTHING`, [ids[index], value.userId, `Union Fixture ${index + 1}`, `https://jobs.example.invalid/${ids[index]}`])
+
+    const flags: ProductionAgentFlags = {
+      taskGraphPlanningEnabled: true, childExecutionEnabled: true, coordinationEnabled: true,
+      consumeWaitOutcomes: true, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false,
+    }
+    const profile = {
+      provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true,
+      continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false,
+      supportsReasoningSummary: false, supportsResponseContinuation: false, supportsProviderConversation: false,
+      supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: 128, costClass: "low" as const,
+    }
+    const scoutAGoal = "Find the first two current fixture roles", scoutBGoal = "Find the overlapping final three fixture roles"
+    const unionVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [
+      { id: "union-membership", check: { kind: "findings_from_scout_union", dependencyNodeKeys: ["scout-b", "scout-a"] } },
+      { id: "union-coverage", check: { kind: "findings_cover_scout_candidate_union_gte", dependencyNodeKeys: ["scout-a", "scout-b"], minimumPercent: 100 } },
+    ] } as const
+    const scoutVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+      criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }] } as const
+    const planCallId = `p3-scout-union-plan:${value.turnId}`, waitCallId = `p3-scout-union-wait:${value.turnId}`
+    const waitKey = `p3-scout-union-wait:${value.turnId}`
+    let rootExecution = 0, initialTaskIds: string[] = []
+    let scoutATaskId = "", scoutBTaskId = "", analystTaskId = "", finalWaitReport: RecordValue | null = null
+    const runtime = await canonical.createCanonicalTurnRuntime(pool!, {
+      workerId: value.ownerId, productionFlags: flags,
+      taskGraphCommandPort: commandPortModule.createPgTaskGraphCommandPort(pool!),
+      taskGraphTemplates: { ...TASK_GRAPH_TEMPLATES }, authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => {
+        const execution = ++rootExecution
+        let round = 0
+        const adapter: ModelAdapter = {
+          id: "p3-multi-scout-union-root-fixture", profile,
+          async *stream(request) {
+            round += 1
+            if (execution === 1 && round === 1) {
+              yield { type: "tool_call_completed", callId: planCallId, name: "agent.plan", arguments: {
+                expectedRevision: 0, nodes: [
+                  { key: "scout-a", templateId: "scout", goal: scoutAGoal, successCriteria: ["Return two evidence-bound candidates"], dependsOn: [], verification: scoutVerification },
+                  { key: "scout-b", templateId: "scout", goal: scoutBGoal, successCriteria: ["Return three candidates with one overlap"], dependsOn: [], verification: scoutVerification },
+                  { key: "analysis", templateId: "analyst", goal: "Verify both Scout result sets as unions", successCriteria: ["Cover every unique union candidate"], dependsOn: ["scout-a", "scout-b"], verification: unionVerification },
+                ],
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if (execution === 1 && round === 2) {
+              initialTaskIds = planTaskIds(request, planCallId, 3)
+              scoutATaskId = initialTaskIds[0]!
+              scoutBTaskId = initialTaskIds[1]!
+              analystTaskId = initialTaskIds[2]!
+              yield { type: "tool_call_completed", callId: waitCallId, name: "agent.wait", arguments: {
+                idempotencyKey: waitKey, taskIds: [analystTaskId], mode: "all", timeoutMs: 30_000,
+              } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            if (execution === 2 && round === 1) {
+              const graph = currentGraphFromRequest(request), nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+              expect(nodes.map(node => node?.key)).toEqual(["scout-a", "scout-b", "analysis"])
+              expect(nodes.map(node => node?.status)).toEqual(["completed", "completed", "completed"])
+              expectPassedVerificationReport(nodes[2]?.verificationReport, "union-membership", "union-coverage")
+              const outcome = waitOutcomeFromRequest(request, 1, "analyst")
+              expect(outcome.status).toBe("ready")
+              expect(record(outcome.tasks[0])).toMatchObject({ taskId: analystTaskId, status: "completed", role: "analyst" })
+              finalWaitReport = record(record(outcome.tasks[0])?.verificationReport)
+              expectPassedVerificationReport(finalWaitReport, "union-membership", "union-coverage")
+              expect(Object.keys(finalWaitReport ?? {}).sort()).toEqual(["criteria", "evidenceDigest", "reasonCode", "resultDigest", "status", "verifierVersion"])
+              expect(JSON.stringify(finalWaitReport)).not.toContain("dependencyBindings")
+              yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: "Both Scout sources passed the current union checks" }) }
+              yield { type: "completed", finishReason: "stop" }
+              return
+            }
+            throw new Error(`Unexpected multi-Scout union root round ${execution}/${round}`)
+          },
+        }
+        return { adapter, registry: {} as never, candidates: [] }
+      },
+    })
+    const childExecutor = createProductionChildExecutor({
+      pool: pool!, authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: ({ task }) => {
+        let round = 0
+        const callId = `p3-scout-union-search:${task.id}:${task.attemptCount}`
+        const adapter: ModelAdapter = {
+          id: `p3-scout-union-${task.role}-child`, profile,
+          async *stream(request) {
+            round += 1
+            if (round === 1) {
+              if (task.role === "analyst") {
+                const dependencyContext = taskGraphDependencyContextFromModelRequest(request)
+                const items = Array.isArray(dependencyContext.items) ? dependencyContext.items.map(record) : []
+                expect(items.map(item => item?.dependencyKey)).toEqual(["scout-a", "scout-b"])
+                for (const [dependencyKey, candidateIds] of [
+                  ["scout-a", ids.slice(0, 2)], ["scout-b", ids.slice(1)],
+                ] as const) {
+                  const item = items.find(candidate => candidate?.dependencyKey === dependencyKey)
+                  expect(item).toMatchObject({ dependencyKey, role: "scout", taskStatus: "completed" })
+                  expect(record(item?.result)).toMatchObject({
+                    schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available",
+                    role: "scout", status: "completed", candidateCount: candidateIds.length, evidenceCount: candidateIds.length,
+                    candidates: candidateIds.map(jobId => ({ jobId, source: "greenhouse", evidenceKinds: ["job"] })),
+                  })
+                  const verification = record(item?.verification)
+                  expect(verification).toMatchObject({
+                    verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
+                    criteria: [{ criterionId: "candidate-count", status: "passed", reasonCode: "criteria_met" }],
+                  })
+                  expect(verification?.evidenceDigest).toMatch(/^[a-f0-9]{64}$/)
+                  expect(verification?.resultDigest).toMatch(/^[a-f0-9]{64}$/)
+                }
+              }
+              expect(request.tools.map(tool => record(tool)?.name)).toContain("jobs.search")
+              yield { type: "tool_call_completed", callId, name: "jobs.search", arguments: { target: "Software Engineer", location: "Dublin", limit: 10 } }
+              yield { type: "completed", finishReason: "tool_calls" }
+              return
+            }
+            const search = record(latestToolResult(request, callId))
+            const jobs = Array.isArray(search?.jobs) ? search.jobs.map(record).filter((job): job is RecordValue => job !== null) : []
+            const cohort = ids.map(id => jobs.find(job => job.id === id)).filter((job): job is RecordValue => job !== undefined)
+            if (cohort.length !== 4) throw new Error("Multi-Scout union child did not observe all fixture jobs")
+            const selected = task.role === "scout" ? cohort.slice(task.goal === scoutAGoal ? 0 : 1, task.goal === scoutAGoal ? 2 : 4) : cohort
+            const evidence = selected.map(job => ({ id: `read:job:${job.id}`, kind: "job", ref: job.id, source: "greenhouse" }))
+            const structuredResult = task.role === "scout"
+              ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+                candidates: selected.map((job, index) => ({ jobId: job.id as string, source: evidence[index]!.source, url: null, evidenceIds: [evidence[index]!.id] })),
+                evidence, summary: "Evidence-bound multi-Scout candidate slice" }
+              : task.role === "analyst"
+                ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
+                  findings: selected.map((job, index) => ({ jobId: job.id as string, score: 8, evidenceIds: [evidence[index]!.id] })),
+                  evidence, summary: "Every unique Scout union candidate was assessed" }
+                : null
+            if (!structuredResult) throw new Error("Multi-Scout union fixture received an unsupported child role")
+            yield { type: "text_delta", text: JSON.stringify(structuredResult) }
+            yield { type: "completed", finishReason: "stop" }
+          },
+        }
+        return adapter
+      },
+    })
+    bootstrap = await workerQueue.createProductionWorkerBootstrap({
+      pool: pool!, runtime, ownerId: value.ownerId, turnQueueFactory: turnQueueModule.createTurnQueue,
+      turnRecoveryIntervalMs: 100,
+      waitResolver: { intervalMs: 10, batchSize: 10, ownerId: `p3-scout-union-resolver-${value.suffix}` },
+      subagents: {
+        execute: async () => { throw new Error("Multi-Scout union fixture manually executes only its scoped children") }, intervalMs: 10,
+        queueFactory: () => {
+          const queue = { add: async () => undefined, close: async () => undefined }, worker = { pause: async () => undefined, close: async () => undefined }
+          return { queue, worker, close: async () => { await worker.close(); await queue.close() } } as never
+        },
+        recoveryFactory: () => ({ close: async () => undefined }) as never,
+      },
+    })
+    await turnQueueModule.enqueueTurn(pool!, bootstrap.turns.queue, { turnId: value.turnId, sessionId: value.sessionId, ownerId: value.ownerId })
+    await waitForPersistedTaskWait(pool!, value.turnId, waitKey)
+    expect(initialTaskIds).toHaveLength(3)
+    const taskStore = new PgSubagentTaskStore(pool!)
+    const executeChild = async (taskId: string, ownerId: string) => {
+      const claimed = await taskStore.claim({ taskId, sessionId: value.sessionId, ownerId, policy: defaultSubagentPolicy(), now: new Date() })
+      if (!claimed) throw new Error("Multi-Scout union fixture child did not acquire its task")
+      const leaseExpiresAt = claimed.leaseExpiresAt
+      if (!(leaseExpiresAt instanceof Date) || !Number.isFinite(leaseExpiresAt.getTime())) throw new Error("Multi-Scout union child lease expired before execution")
+      const lease: SubagentLease = { ...claimed, ownerId, leaseExpiresAt, signal: new AbortController().signal }
+      const result = await childExecutor({ lease })
+      const finished = await taskStore.finish({ taskId, sessionId: value.sessionId, ownerId, attemptCount: claimed.attemptCount,
+        status: result.status, result: result.result, failureReason: result.failureReason, retryDisposition: result.retryDisposition,
+        mailboxMessageIds: result.mailboxMessageIds, now: new Date() })
+      expect(finished).toBe("completed")
+    }
+    await executeChild(scoutATaskId, `p3-scout-union-a-${value.suffix}`)
+    await executeChild(scoutBTaskId, `p3-scout-union-b-${value.suffix}`)
+    await executeChild(analystTaskId, `p3-scout-union-analyst-${value.suffix}`)
+    await waitForTurnStatus(pool!, value.turnId, "completed", 45_000, waitKey)
+    expect(finalWaitReport).not.toBeNull()
+    const turn = await pool!.query<{ status: string; rootTaskId: string | null; finalResponse: string | null }>(
+      `SELECT "status", "rootTaskId", "finalResponse" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+      [value.turnId, value.sessionId, value.userId],
+    )
+    expect(turn.rows[0]).toMatchObject({ status: "completed", finalResponse: expect.stringContaining("Both Scout sources passed") })
+    const tasks = await pool!.query<{ id: string; goal: string; status: string; result: unknown }>(
+      `SELECT "id", "goal", "status", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "parentTaskId" = $3`,
+      [value.turnId, value.sessionId, turn.rows[0]?.rootTaskId],
+    )
+    const analyst = tasks.rows.find(task => task.id === analystTaskId)
+    const report = record(record(analyst?.result)?.taskGraphVerificationReport)
+    expect(tasks.rows).toHaveLength(3)
+    expect(analyst).toMatchObject({ status: "completed" })
+    expect(report?.dependencyBindings).toHaveLength(2)
+    const bindings = Array.isArray(report?.dependencyBindings) ? report.dependencyBindings.map(record) : []
+    expect(bindings.map(binding => binding?.nodeKey)).toEqual(["scout-a", "scout-b"])
+    expect(bindings.map(binding => binding?.taskId)).toEqual([scoutATaskId, scoutBTaskId])
+    for (const binding of bindings) {
+      expect(binding).toMatchObject({ attemptCount: 1 })
+      for (const field of ["nodeDigest", "resultDigest", "evidenceDigest", "reportDigest"]) expect(binding?.[field]).toMatch(/^[a-f0-9]{64}$/)
+    }
+  }, 120_000)
   it("drains a fenced running TaskGraph child after root failure without changing root or Turn", async () => {
     const seedValue = fixture()
     const value = { ...seedValue, sessionId: `000-0-root-running-drain-${seedValue.suffix}` }

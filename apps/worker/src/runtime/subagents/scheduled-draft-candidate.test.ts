@@ -27,46 +27,58 @@ vi.mock("./task-graph-pg-verification.js", async importOriginal => {
 
 const scope: GraphIdentityScope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", parentTaskId: "root-1" }
 const passed = (criterionId: string) => ({ criterionId, status: "passed", reasonCode: "criteria_met" }) as const
-type Spec = Readonly<{ key: string; scoutKey: string; findings: readonly Readonly<{ jobId: string; score: number }>[] }>
+type Spec = Readonly<{ key: string; scoutKey: string; scoutKeys?: readonly string[]; candidatesByScout?: Readonly<Record<string, readonly string[]>>;
+  findings: readonly Readonly<{ jobId: string; score: number }>[] }>
 
 function fixture(specs: readonly Spec[]) {
   const nodes: Record<string, unknown>[] = [], rows = new Map<string, Record<string, unknown>>(), sourceProofs = new Map<string, unknown>()
   const resultByTask = new Map<string, { result: Record<string, unknown>; projection: TaskGraphVerificationEvidenceProjection; report: Record<string, unknown> }>()
   for (const [index, spec] of specs.entries()) {
-    const scoutTaskId = `scout-task-${spec.key}`, analystTaskId = `analyst-task-${spec.key}`
+    const scoutKeys = spec.scoutKeys ?? [spec.scoutKey], analystTaskId = `analyst-task-${spec.key}`
     const scoutVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }] }
     const analystVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [
-      { id: "membership", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: spec.scoutKey } },
+      { id: "membership", check: scoutKeys.length === 1
+        ? { kind: "findings_from_scout_dependency", dependencyNodeKey: scoutKeys[0]! }
+        : { kind: "findings_from_scout_union", dependencyNodeKeys: [...scoutKeys] } },
       { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
     ] }
-    nodes.push(
-      { key: spec.scoutKey, taskId: scoutTaskId, templateId: "scout", goal: "Find current jobs", successCriteria: ["Find jobs"], dependsOn: [], depth: 1, verificationDisposition: "typed", verification: scoutVerification },
-      { key: spec.key, taskId: analystTaskId, templateId: "analyst", goal: "Analyze current jobs", successCriteria: ["Analyze jobs"], dependsOn: [spec.scoutKey], depth: 2, verificationDisposition: "typed", verification: analystVerification },
-    )
     const jobIds = [...new Set(spec.findings.map(item => item.jobId))]
     const evidence = jobIds.map(jobId => ({ id: `read:job:${jobId}`, kind: "job", ref: jobId, source: "jobs.get" }))
     const analystResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
       findings: spec.findings.map(item => ({ ...item, evidenceIds: [`read:job:${item.jobId}`] })), evidence, summary: "Persisted analysis" }
     const reportBase = { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
       criteria: [passed("membership"), passed("finding-count")], evidenceDigest: `${index + 1}`.repeat(64), resultDigest: taskGraphResultDigest(analystResult) }
-    const scoutBinding = { nodeKey: spec.scoutKey, taskId: scoutTaskId, attemptCount: 2, nodeDigest: `${index + 2}`.repeat(64),
-      resultDigest: `${index + 3}`.repeat(64), evidenceDigest: `${index + 4}`.repeat(64), reportDigest: `${index + 5}`.repeat(64) }
-    const report = { ...reportBase, dependencyBindings: [scoutBinding] }
+    const sourceBindings = scoutKeys.map((scoutKey, sourceIndex) => {
+      const scoutTaskId = scoutKeys.length === 1 ? `scout-task-${spec.key}` : `scout-task-${scoutKey}`
+      const digest = (index * 8 + sourceIndex + 2).toString(16).repeat(64)
+      const scoutBinding = { nodeKey: scoutKey, taskId: scoutTaskId, attemptCount: 2, nodeDigest: digest,
+        resultDigest: (index * 8 + sourceIndex + 3).toString(16).repeat(64),
+        evidenceDigest: (index * 8 + sourceIndex + 4).toString(16).repeat(64), reportDigest: (index * 8 + sourceIndex + 5).toString(16).repeat(64) }
+      const sourceJobIds = spec.candidatesByScout?.[scoutKey] ?? jobIds
+      const scoutEvidenceIds = sourceJobIds.map(jobId => `read:job:${jobId}`)
+      const scoutProjection: TaskGraphVerificationEvidenceProjection = { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "scout",
+        candidates: sourceJobIds.map(jobId => ({ jobId, evidenceIds: [`read:job:${jobId}`] })), evidenceIds: scoutEvidenceIds }
+      nodes.push({ key: scoutKey, taskId: scoutTaskId, templateId: "scout", goal: "Find current jobs", successCriteria: ["Find jobs"],
+        dependsOn: [], depth: 1, verificationDisposition: "typed", verification: scoutVerification })
+      rows.set(scoutTaskId, { id: scoutTaskId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
+        parentTaskId: scope.parentTaskId, turnRootTaskId: scope.rootTaskId, userId: scope.userId, status: "completed", role: "scout", context: {} })
+      return { binding: scoutBinding, projection: scoutProjection }
+    })
+    const scoutBindings = sourceBindings.map(source => source.binding).sort((left, right) => left.nodeKey < right.nodeKey ? -1 : left.nodeKey > right.nodeKey ? 1 : 0)
+    const report = { ...reportBase, dependencyBindings: scoutBindings }
     const envelope = { finalItemId: `item-${spec.key}`, finalText: "done", status: "completed", stepCount: 2, toolCallCount: 1,
       structuredResult: analystResult, taskGraphVerificationReport: report }
-    rows.set(scoutTaskId, { id: scoutTaskId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
-      parentTaskId: scope.parentTaskId, turnRootTaskId: scope.rootTaskId, userId: scope.userId, status: "completed", role: "scout", context: {} })
     rows.set(analystTaskId, { id: analystTaskId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
       parentTaskId: scope.parentTaskId, turnRootTaskId: scope.rootTaskId, userId: scope.userId, attemptCount: 3, status: "completed",
       role: "analyst", taskType: TASK_GRAPH_TEMPLATES.analyst.taskType, failureReason: null,
       expectedOutputSchema: TASK_GRAPH_TEMPLATES.analyst.expectedOutputSchema, allowedActions: TASK_GRAPH_TEMPLATES.analyst.allowedActions,
       context: {}, result: envelope, resultProjection: { role: "analyst", findings: [{ jobId: "model-projection-job", score: 10 }] } })
-    const scoutProjection: TaskGraphVerificationEvidenceProjection = { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "scout",
-      candidates: jobIds.map(jobId => ({ jobId, evidenceIds: [`read:job:${jobId}`] })), evidenceIds: evidence.map(item => item.id) }
-    sourceProofs.set(spec.key, { projections: new Map([[spec.scoutKey, scoutProjection]]), bindings: [scoutBinding] })
+    sourceProofs.set(spec.key, { projections: new Map(sourceBindings.map(source => [source.binding.nodeKey, source.projection] as const)), bindings: scoutBindings })
     const analystProjection: TaskGraphVerificationEvidenceProjection = { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "analyst",
       findings: analystResult.findings.map(({ jobId, score, evidenceIds }) => ({ jobId, score, evidenceIds })), evidenceIds: evidence.map(item => item.id) }
     resultByTask.set(analystTaskId, { result: analystResult, projection: analystProjection, report: reportBase })
+    nodes.push({ key: spec.key, taskId: analystTaskId, templateId: "analyst", goal: "Analyze current jobs", successCriteria: ["Analyze jobs"],
+      dependsOn: [...scoutKeys], depth: 2, verificationDisposition: "typed", verification: analystVerification })
   }
   const snapshot = parseTaskGraphSnapshot({ schemaVersion: "agent-harness.v2.task-graph", nodes })
   const statuses = new Map(snapshot.nodes.map(node => [node.key, "completed"] as const))
@@ -142,6 +154,27 @@ describe("verified scheduled draft candidate lane", () => {
     expect(selected?.candidate).toEqual({ jobId: "db-job", score: 8 })
     expect(selected?.witness).toMatchObject({ graphRevision: 7, candidate: { jobId: "db-job", score: 8 }, analysts: [{ nodeKey: "analyst", taskId: "analyst-task-analyst", attemptCount: 3, scouts: [{ nodeKey: "scout", taskId: "scout-task-analyst", attemptCount: 2 }] }] })
     expect(value.client.query.mock.calls[0]?.[0]).not.toContain("resultProjection")
+  })
+
+  it("accepts explicit union membership only after binding every selected Scout", async () => {
+    const value = fixture([{ key: "analyst", scoutKey: "scout-a", scoutKeys: ["scout-a", "scout-b"],
+      candidatesByScout: { "scout-a": ["db-job", "shared-job"], "scout-b": ["shared-job", "other-job"] },
+      findings: [{ jobId: "db-job", score: 8 }, { jobId: "other-job", score: 7 }] }])
+    const selected = await selectCandidate(value)
+    expect(selected?.candidate).toEqual({ jobId: "db-job", score: 8 })
+    expect(selected?.witness.analysts[0]?.scouts.map(item => item.nodeKey)).toEqual(["scout-a", "scout-b"])
+  })
+
+  it("does not make a coverage-only Analyst eligible for review-only drafting", async () => {
+    const value = fixture([{ key: "analyst", scoutKey: "scout-a", scoutKeys: ["scout-a", "scout-b"],
+      candidatesByScout: { "scout-a": ["db-job"], "scout-b": ["other-job"] },
+      findings: [{ jobId: "db-job", score: 8 }] }])
+    const snapshot = parseTaskGraphSnapshot({ ...value.snapshot, nodes: value.snapshot.nodes.map(node => node.key === "analyst"
+      ? { ...node, verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
+        criteria: [{ id: "coverage", check: { kind: "findings_cover_scout_candidate_union_gte",
+          dependencyNodeKeys: ["scout-a", "scout-b"], minimumPercent: 100 } }] } } : node) })
+    await expect(selectCandidate(value, ["analyst"], snapshot)).resolves.toBeUndefined()
+    expect(verifyCompletedScoutDependencies).not.toHaveBeenCalled()
   })
 
   it("adds the server-owned candidate mode marker to scheduled child context", async () => {

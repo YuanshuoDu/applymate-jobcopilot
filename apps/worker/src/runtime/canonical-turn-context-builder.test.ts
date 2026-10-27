@@ -17,7 +17,7 @@ import { resolveTaskGraphRepairDependencies } from "./subagents/task-graph-depen
 import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphState } from "./subagents/task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "./subagents/task-graph-pg-verification.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "./planning/task-graph-verification.js"
-import { ROLE_RESULT_SCHEMA } from "./subagents/role-results.js"
+import { ROLE_RESULT_SCHEMA, validateRoleResult } from "./subagents/role-results.js"
 import { discoveryPersonaContextBlocks } from "./context/discovery-persona-context-blocks.js"
 import { projectSelectedJobMemory, type SelectedJobMemoryNode } from "./context/selected-job-memory.js"
 import type { ValidatedSelectedJobHistoryOutcome } from "./context/selected-job-history.js"
@@ -166,11 +166,17 @@ function loadedHistoryGraphFixture(): LoadedGraph {
     }
     if (report !== undefined) result.taskGraphVerificationReport = report
     if (receipt !== undefined) result.taskGraphRepairReceipt = receipt
-    tasks.set(node.taskId, { id: node.taskId, status, role: node.templateId, failureReason, result })
+    tasks.set(node.taskId, { id: node.taskId, status, role: node.templateId, attemptCount: 1, failureReason, result })
   }
   const scoutFailureReport = historyReport("failed", scoutFailures.map(item => item.id), "b")
   const analystFailureReport = historyReport("failed", analystFailures.map(item => item.id), "c")
   const analystRepairReport = historyReport("passed", analystFailures.map(item => item.id), "d")
+  const scoutPartial = historicalRoleResult("scout", 5, "partial", "SCOUT")
+  const analystPartial = historicalRoleResult("analyst", 6, "partial", "ANALYST")
+  const scoutPassReport = { ...historyReport("passed", scoutOutputCriteria.map(item => item.id), "e"),
+    resultDigest: taskGraphResultDigest(validateRoleResult(scoutPartial, "scout")) }
+  const analystPassReport = { ...historyReport("passed", analystOutputCriteria.map(item => item.id), "f"),
+    resultDigest: taskGraphResultDigest(validateRoleResult(analystPartial, "analyst")) }
   const repairNode = snapshot.nodes[2]!
   const repairReceipt = {
     schemaVersion: TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION, graphRootTaskId: HISTORY_ROOT_ID,
@@ -181,8 +187,8 @@ function loadedHistoryGraphFixture(): LoadedGraph {
   add(0, "failed", scoutFailureReport)
   add(1, "failed", analystFailureReport)
   add(2, "completed", analystRepairReport, undefined, repairReceipt)
-  add(3, "completed", historyReport("passed", scoutOutputCriteria.map(item => item.id), "e"), historicalRoleResult("scout", 5, "partial", "SCOUT"))
-  add(4, "completed", historyReport("passed", analystOutputCriteria.map(item => item.id), "f"), historicalRoleResult("analyst", 6, "partial", "ANALYST"))
+  add(3, "completed", scoutPassReport, scoutPartial)
+  add(4, "completed", analystPassReport, analystPartial)
   add(5, "failed", historyReport("failed", scoutRepairCriteria.map(item => item.id), "1"))
   add(6, "failed", historyReport("unverified", scoutRepairCriteria.map(item => item.id), "2"))
   add(7, "completed", undefined, historicalRoleResult("scout", 0, "completed", "ZERO"))
@@ -588,7 +594,7 @@ describe("canonical Turn context builder", () => {
     expect(requestText).toContain("root_task_history")
     expect(requestText).toContain('"kind":"finding_count_gte"')
     expect(requestText).toContain('"minimum":2')
-    expect(systemText).toContain("Historical typed-check descriptors distinguish count, evidence-completeness, score, Scout-dependency, and declared cohort-coverage failure shapes only")
+    expect(systemText).toContain("Historical typed-check descriptors distinguish count, evidence-completeness, score, Scout-dependency, and declared cohort-coverage checks in their source graph.")
     expect(systemText).not.toContain("finding_count_gte")
     expect(systemText).not.toContain('"minimum":2')
     expect(requestText).toContain('"taskKind":"analyst"')
@@ -744,6 +750,10 @@ describe("canonical Turn context builder", () => {
     expect(unresolvedRepair).toMatchObject({ taskKind: "scout", status: "failed", negativeReasonHints: ["repair_target_unresolved"] })
     expect(scoutOutput).toMatchObject({ reportedOutput: { role: "scout", candidateCount: 5, resultStatus: "partial" } })
     expect(analystOutput).toMatchObject({ reportedOutput: { role: "analyst", findingCount: 6, resultStatus: "partial" } })
+    expect(scoutOutput).toMatchObject({ lesson: { nodeOrdinal: 4, passedCriteria: [{ criterionOrdinal: 1, status: "passed",
+      check: { role: "scout", kind: "candidate_count_gte", minimum: 1 } }] } })
+    expect(analystOutput).toMatchObject({ lesson: { nodeOrdinal: 5, passedCriteria: [{ criterionOrdinal: 1, status: "passed",
+      check: { role: "analyst", kind: "finding_count_gte", minimum: 1 } }] } })
     expect(zeroOutput).toMatchObject({ reportedOutput: { role: "scout", candidateCount: 0, resultStatus: "completed" } })
     expect(historyNodes.find(node => node.taskKind === "scout" && node.status === "failed" && !(node.negativeReasonHints as unknown[] | undefined)?.includes("repair_target_unresolved")))
       .not.toHaveProperty("reportedOutput")
@@ -761,6 +771,7 @@ describe("canonical Turn context builder", () => {
     expect(requestText).toContain('"candidateCount":0')
     expect(requestText).toContain('"kind":"candidate_count_gte"')
     expect(requestText).toContain('"kind":"evidence_count_gte"')
+    expect(requestText).toContain('"passedCriteria"')
     expect(requestText).toContain('"minimum":8')
     expect(requestText).not.toContain("CALLER_HISTORY_SPOOF")
     const historyGuidance = requestMessages.filter(message => message.role === "system"
@@ -771,7 +782,9 @@ describe("canonical Turn context builder", () => {
     expect(historyGuidance[0]?.text).toContain("visible agent.list only for matching result pages")
     expect(historyGuidance[0]?.text).toContain("expectedRevision 23")
     expect(historyGuidance[0]?.text).toContain("preserve the valid plan")
-    expect(historyGuidance[0]?.text).toContain("Historical typed-check descriptors distinguish count, evidence-completeness, score, Scout-dependency, and declared cohort-coverage failure shapes only")
+    expect(historyGuidance[0]?.text).toContain("Historical typed-check descriptors distinguish count, evidence-completeness, score, Scout-dependency, and declared cohort-coverage checks in their source graph.")
+    expect(historyGuidance[0]?.text).toContain("Historical passed-check descriptors are advisory source-graph checks only")
+    expect(historyGuidance[0]?.text).toContain("past queries or results need not match current ones")
     expect(historyGuidance[0]?.text).not.toContain("root_task_history")
     for (const historicalFact of ["source_graph_local", "nodeOrdinal", "criterionOrdinal", "targetNodeOrdinal", "candidate_count_gte",
       '"minimum":8', '"candidateCount":5', '"findingCount":6']) {

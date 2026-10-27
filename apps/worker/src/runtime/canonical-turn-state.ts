@@ -1,7 +1,7 @@
 import type pg from "pg"
 import type { TenantScope, RepositoryJsonValue, TurnSource } from "@jobcopilot/agent-protocol"
 
-import { restoreCanonicalTurnSnapshot } from "./context/canonical-turn-snapshot-state.js"
+import { loadCanonicalTurnSnapshot } from "./context/canonical-turn-snapshot-loader.js"
 import type { SelectedJobMemoryRecord } from "./context/selected-job-memory.js"
 import type { StepContextSnapshot } from "./context/step-context-builder.js"
 import type { TurnLease } from "./turns/lease.js"
@@ -168,24 +168,13 @@ export async function loadCanonicalTurnState(pool: Pick<pg.Pool, "connect">, lea
     let snapshot: StepContextSnapshot = { system: [{ id: "canonical-runtime", content: "Use only scoped, policy-approved tools and continue until the stated goal is verifiably complete." }], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }
     let selectedJobMemories: readonly SelectedJobMemoryRecord[] | undefined
     let snapshotThroughSequence: bigint | null = null
-    if (turn.contextSnapshotId) {
-      const contextResult = await client.query<Row>(`SELECT snapshot."content", snapshot."throughSequence" FROM "agent_context_snapshots" AS snapshot
-        JOIN "agent_sessions" AS session ON session."id" = snapshot."sessionId"
-        WHERE snapshot."id" = $1 AND snapshot."sessionId" = $2 AND session."userId" = $3`, [turn.contextSnapshotId, lease.sessionId, lease.userId])
-      if (!contextResult.rows[0]) throw new Error("context_snapshot_missing")
-      const restored = restoreCanonicalTurnSnapshot(contextResult.rows[0].content, contextResult.rows[0].throughSequence, scope, lease.sessionId)
-      snapshot = restored.snapshot; selectedJobMemories = restored.selectedJobMemories
-      snapshotThroughSequence = BigInt(String(contextResult.rows[0].throughSequence))
-    } else {
-      const contextResult = await client.query<Row>(`SELECT snapshot."content", snapshot."throughSequence" FROM "agent_context_snapshots" AS snapshot
-        JOIN "agent_sessions" AS session ON session."id" = snapshot."sessionId"
-        WHERE snapshot."sessionId" = $1 AND session."userId" = $2
-        ORDER BY snapshot."throughSequence" DESC, snapshot."version" DESC LIMIT 1`, [lease.sessionId, lease.userId])
-      if (contextResult.rows[0]) {
-        const restored = restoreCanonicalTurnSnapshot(contextResult.rows[0].content, contextResult.rows[0].throughSequence, scope, lease.sessionId)
-        snapshot = restored.snapshot; selectedJobMemories = restored.selectedJobMemories
-        snapshotThroughSequence = BigInt(String(contextResult.rows[0].throughSequence))
-      }
+    const restoredSnapshot = await loadCanonicalTurnSnapshot(client, {
+      scope, sessionId: lease.sessionId, pinnedSnapshotId: turn.contextSnapshotId,
+    })
+    if (restoredSnapshot) {
+      snapshot = restoredSnapshot.snapshot
+      selectedJobMemories = restoredSnapshot.selectedJobMemories
+      snapshotThroughSequence = restoredSnapshot.throughSequence
     }
     const goal = turnGoal(turn.input), source = turnSource(turn.source), runMode = automationRunMode(object(turn.input).automationRunMode)
     const rootTaskId = typeof turn.rootTaskId === "string" ? turn.rootTaskId : null, steeringMarkers = restoreCanonicalSteeringMarkers(eventsResult.rows, { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId })

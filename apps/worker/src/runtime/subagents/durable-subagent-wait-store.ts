@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto"
-import { Buffer } from "node:buffer"
-import { redactSensitiveText } from "@jobcopilot/shared"
 import type pg from "pg"
+import { redactSensitiveText } from "@jobcopilot/shared"
 import type { SubagentLease } from "./types.js"
+import { markCanonicalSubagentWaitId, markCanonicalSubagentWaitTargetIds, safeSubagentWaitJson } from "./subagent-wait-structural-ids.js"
 import { canManageChildrenWithWaitAction } from "./child-executor-admission.js"
 import { getSubagentRolePolicy } from "./role-policy.js"
+export { safeSubagentWaitJson } from "./subagent-wait-structural-ids.js"
 
 type Queryable = Pick<pg.PoolClient, "query">
 type Pool = Pick<pg.Pool, "connect">
@@ -22,8 +23,6 @@ export type RegisterDurableSubagentWaitInput = Readonly<{
 
 const MAX_WAIT_MS = 24 * 60 * 60 * 1_000
 const MAX_TARGETS = 8
-const MAX_RESULT_BYTES = 512
-const canonicalWaitIds = new WeakMap<object, string>()
 const OPEN_SESSION = `session."status" NOT IN ('aborted', 'archived')`
 const TERMINAL = new Set(["completed", "failed", "interrupted", "cancelled", "closed", "passed", "skipped"])
 
@@ -33,40 +32,13 @@ export class DurableSubagentWaitError extends Error {
   }
 }
 
-export function safeSubagentWaitJson(value: unknown, maxBytes = MAX_RESULT_BYTES): unknown {
-  const clean = (item: unknown, seen = new Set<object>(), depth = 0, key?: string, expectedWaitId?: string): unknown => {
-    if (item === null || typeof item === "boolean") return item
-    if (typeof item === "string") return key === "waitId" && item === expectedWaitId && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(item) ? item : redactSensitiveText(item).slice(0, 2_000)
-    if (typeof item === "number") return Number.isFinite(item) ? item : null
-    if (!item || typeof item !== "object" || depth > 12 || seen.has(item)) return "[TRUNCATED]"
-    seen.add(item)
-    try {
-      if (Array.isArray(item)) return item.slice(0, 64).map(child => clean(child, seen, depth + 1))
-      const output: Record<string, unknown> = {}
-      const canonicalWaitId = canonicalWaitIds.get(item)
-      for (const key of Object.keys(item).sort().slice(0, 64)) {
-        if (/api.?key|secret|password|(?:access|refresh).?token|authorization/i.test(key)) continue
-        output[key] = clean((item as Record<string, unknown>)[key], seen, depth + 1, key, key === "waitId" ? canonicalWaitId : undefined)
-      }
-      return output
-    } finally { seen.delete(item) }
-  }
-  const normalized = clean(value)
-  const encoded = JSON.stringify(normalized)
-  if (Buffer.byteLength(encoded, "utf8") <= maxBytes) return normalized
-  const marker = { truncated: true, byteLength: Buffer.byteLength(encoded, "utf8"), preview: "" }
-  let budget = Math.max(0, maxBytes - Buffer.byteLength(JSON.stringify(marker), "utf8") - 1)
-  while (budget >= 0) {
-    marker.preview = Array.from(encoded).reduce((result, character) => Buffer.byteLength(result + character, "utf8") <= budget ? result + character : result, "")
-    if (Buffer.byteLength(JSON.stringify(marker), "utf8") <= maxBytes) return marker
-    budget -= 32
-  }
-  return { truncated: true, byteLength: marker.byteLength, preview: "" }
-}
-
 export function projectDurableSubagentWait(row: Row, taskRows: readonly Row[], status: DurableSubagentWaitStatus, matchedTaskIds: readonly string[]): DurableSubagentWaitResult {
   const ids = parseIds(row.targetTaskIds)
   const byId = new Map(taskRows.map(task => [String(task.id), task]))
+  const persistedIds = structuralIds(row.targetTaskIds)
+  const targetRows = taskRows.map(task => task.id)
+  const completeTargets = persistedIds !== undefined && sameIdsInOrder(persistedIds, ids) && taskRows.length === ids.length
+    && targetRows.every((id): id is string => typeof id === "string" && ids.includes(id)) && new Set(targetRows).size === ids.length
   const projection: DurableSubagentWaitResult = {
     waitId: String(row.id), status, taskIds: ids,
     deadlineAt: dateValue(row.deadlineAt, "deadlineAt").toISOString(), matchedTaskIds: [...matchedTaskIds].sort(),
@@ -79,7 +51,8 @@ export function projectDurableSubagentWait(row: Row, taskRows: readonly Row[], s
       }
     }),
   }
-  canonicalWaitIds.set(projection, projection.waitId)
+  markCanonicalSubagentWaitId(projection, projection.waitId)
+  if (completeTargets) markCanonicalSubagentWaitTargetIds({ targetTaskIds: ids }, projection, ids)
   return projection
 }
 
@@ -98,6 +71,8 @@ export function waitResult(row: Row): DurableSubagentWaitResult {
     const candidate = raw as Record<string, unknown>
     if (candidate.waitId === row.id && Array.isArray(candidate.tasks)) {
       const ids = parseIds(row.targetTaskIds)
+      const persistedIds = structuralIds(row.targetTaskIds), candidateIds = structuralIds(candidate.taskIds)
+      const matchedIds = structuralIds(row.matchedTaskIds, 0, 8)?.sort(), candidateMatchedIds = structuralIds(candidate.matchedTaskIds, 0, 8)
       const savedTasks = candidate.tasks.filter((task): task is Record<string, unknown> => !!task && typeof task === "object" && !Array.isArray(task))
       const tasks = ids.map(taskId => {
         const task = savedTasks.find(item => item.taskId === taskId)
@@ -105,7 +80,7 @@ export function waitResult(row: Row): DurableSubagentWaitResult {
           taskId,
           status: safeText(task?.status, 32),
           role: safeText(task?.role, 80),
-          result: task?.result === null || task?.result === undefined ? null : safeSubagentWaitJson(task.result, MAX_RESULT_BYTES),
+          result: task?.result === null || task?.result === undefined ? null : safeSubagentWaitJson(task.result),
           failureReason: task?.failureReason === null || task?.failureReason === undefined ? null : safeText(task.failureReason, 256),
         }
       })
@@ -116,7 +91,12 @@ export function waitResult(row: Row): DurableSubagentWaitResult {
         deadlineAt: dateValue(row.deadlineAt, "deadlineAt").toISOString(),
         matchedTaskIds: parseIds(row.matchedTaskIds).sort(), tasks,
       }
-      canonicalWaitIds.set(projection, projection.waitId)
+      markCanonicalSubagentWaitId(projection, projection.waitId)
+      if (persistedIds !== undefined && sameIdsInOrder(persistedIds, ids) && candidateIds !== undefined && sameIdsInOrder(candidateIds, ids)
+        && matchedIds !== undefined && candidateMatchedIds !== undefined && sameIdsInOrder(candidateMatchedIds, matchedIds)
+        && candidate.tasks.length === ids.length && savedTasks.length === ids.length && savedTasks.every((task, index) => task.taskId === ids[index])) {
+        markCanonicalSubagentWaitTargetIds({ targetTaskIds: ids }, projection, ids)
+      }
       return projection
     }
   }
@@ -129,6 +109,17 @@ export function object(value: unknown): Record<string, unknown> {
 }
 export function safeText(value: unknown, max: number): string {
   return typeof value === "string" ? redactSensitiveText(value).slice(0, max) : "unknown"
+}
+
+function structuralIds(value: unknown, min = 1, max = 8): string[] | undefined {
+  const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return undefined } })() : value
+  if (!Array.isArray(parsed) || parsed.length < min || parsed.length > max
+    || !parsed.every(id => typeof id === "string" && id.length > 0 && id.length <= 256 && id.trim() === id)
+    || new Set(parsed).size !== parsed.length) return undefined
+  return parsed as string[]
+}
+function sameIdsInOrder(actual: readonly string[], expected: readonly string[]): boolean {
+  return actual.length === expected.length && actual.every((id, index) => id === expected[index])
 }
 export function required(value: unknown, name: string, max = 256): string {
   if (typeof value !== "string" || !value.trim() || value !== value.trim() || value.length > max) throw new DurableSubagentWaitError("wait_invalid", `${name} is invalid`)
