@@ -11,6 +11,7 @@ const STEP_A = 'fixture-step-a'
 const ITEM_A = 'fixture-item-a'
 const ITEM_B = 'fixture-item-b'
 const CHILD_TASK_A = 'task-child-a'
+const WAIT_TARGET_TASK = 'task-wait-target'
 const APPROVAL_ID = 'fixture-approval-a'
 const SELECTED_JOB_TURN_A = 'fixture-preparation-turn'
 const SELECTED_JOB_TURN_B = 'fixture-preparation-turn-next'
@@ -80,7 +81,7 @@ function event(sessionId: string, turnId: string, id: string, sequence: string, 
   }
 }
 
-async function installSupervisorFixture(page: Page, selectedJobEnabled = false, selectedJobTurnGateRegression = false, selectedJobPendingWriter = false, selectedJobHistoricalArtifact = false) {
+async function installSupervisorFixture(page: Page, selectedJobEnabled = false, selectedJobTurnGateRegression = false, selectedJobPendingWriter = false, selectedJobHistoricalArtifact = false, waitDetailsEnabled = false) {
   const fixture = {
     aStreamCount: 0,
     eventSequence: 0,
@@ -121,6 +122,20 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false, 
     selectedJobPlanEventSent: false,
     ordinaryChatRequests: [] as Array<Record<string, unknown>>,
     ordinaryChatEventSent: false,
+    waitStartArmed: false,
+    waitStarted: false,
+    waitRegistrationScheduled: false,
+    waitRegistered: false,
+    waitRegistrationRetryServed: false,
+    waitDeadlineAt: null as string | null,
+    waitParentDeadlineAt: null as string | null,
+    waitQueryCount: 0,
+    waitParentIds: [] as string[],
+    activeWaitRequests: 0,
+    maxActiveWaitRequests: 0,
+    waitHoldNextRequest: false,
+    waitRequestHeld: false,
+    releaseWaitRequest: null as (() => void) | null,
   }
   const stageStatus = () => {
     if (fixture.retryTurnStatus) return fixture.retryTurnStatus
@@ -176,6 +191,17 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false, 
   })
   await page.route('**/__agent_fixture__/selected-job-graph', async route => {
     fixture.selectedJobGraphReleaseArmed = true
+    return json(route, { ok: true })
+  })
+  await page.route('**/__agent_fixture__/wait-start', async route => {
+    fixture.waitStartArmed = true
+    const body = route.request().postDataJSON() as Record<string, unknown>
+    if (typeof body.deadlineAt === 'string') fixture.waitDeadlineAt = body.deadlineAt
+    if (typeof body.parentDeadlineAt === 'string') fixture.waitParentDeadlineAt = body.parentDeadlineAt
+    return json(route, { ok: true })
+  })
+  await page.route('**/__agent_fixture__/wait-hold', async route => {
+    fixture.waitHoldNextRequest = true
     return json(route, { ok: true })
   })
   await page.route('**/__agent_fixture__/retryable', async route => {
@@ -287,12 +313,45 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false, 
         : null
       return json(route, { turns: preparationTurn ? [selected, preparationTurn] : [selected], projection: { activeTurnId: selected.status === 'completed' ? null : selected.id, activeTurn: selected.status === 'completed' ? null : { id: selected.id, status: selected.status, revision: selected.revision }, queuedInputCount: 0 } })
     }
+    if (resource === 'tasks' && parts[6] === 'waits' && route.request().method() === 'GET') {
+      const parentTaskId = parts[5] ?? ''
+      fixture.waitQueryCount += 1
+      fixture.waitParentIds.push(parentTaskId)
+      fixture.activeWaitRequests += 1
+      fixture.maxActiveWaitRequests = Math.max(fixture.maxActiveWaitRequests, fixture.activeWaitRequests)
+      let delayRegistration = false
+      if (waitDetailsEnabled && sessionId === SESSION_A && parentTaskId === CHILD_TASK_A && fixture.waitStarted
+        && !fixture.waitRegistered && !fixture.waitRegistrationScheduled) {
+        fixture.waitRegistrationScheduled = true
+        delayRegistration = true
+      }
+      if (fixture.waitHoldNextRequest) {
+        fixture.waitHoldNextRequest = false
+        fixture.waitRequestHeld = true
+        await new Promise<void>(resolve => { fixture.releaseWaitRequest = resolve })
+        fixture.waitRequestHeld = false
+        fixture.releaseWaitRequest = null
+      }
+      if (delayRegistration) setTimeout(() => { fixture.waitRegistered = true }, 180)
+      const wait = waitDetailsEnabled && sessionId === SESSION_A && parentTaskId === CHILD_TASK_A && fixture.waitRegistered
+        ? { mode: 'any', status: 'waiting', deadlineAt: fixture.waitDeadlineAt ?? '2026-10-27T12:00:10.000Z', parentDeadlineAt: fixture.waitParentDeadlineAt, targets: [
+          { taskId: WAIT_TARGET_TASK, label: 'analyst', status: 'queued', matched: false },
+        ] }
+        : null
+      if (waitDetailsEnabled && sessionId === SESSION_A && parentTaskId === CHILD_TASK_A && fixture.waitRegistrationScheduled && fixture.waitRegistered) fixture.waitRegistrationRetryServed = true
+      fixture.activeWaitRequests -= 1
+      return json(route, { wait })
+    }
     if (resource === 'tasks') {
       fixture.tasksQueryCount += 1
       const selected = sessionId === SESSION_A ? stageStatus() : 'completed'
       const tasks = [{ id: `task-${sessionId}`, sessionId, turnId: sessionId === SESSION_A ? TURN_A : TURN_B, parentTaskId: null, role: 'Scout', taskType: 'read', status: selected, goal: sessionId === SESSION_A ? 'Inspect saved roles' : 'B session evidence', hasResult: selected === 'completed' }]
       const selectedJobTaskGoal = selectedJobPendingWriter ? 'Prepare Systems Engineer at Fixture Systems' : 'Prepare the selected saved job'
-      if (sessionId === SESSION_A) tasks.push({ id: CHILD_TASK_A, sessionId, turnId: TURN_A, parentTaskId: `task-${SESSION_A}`, role: 'Scout', taskType: 'research', status: childStatus(), goal: 'Check child evidence', hasResult: childStatus() === 'completed' })
+      if (sessionId === SESSION_A) tasks.push({ id: CHILD_TASK_A, sessionId, turnId: TURN_A, ...(waitDetailsEnabled ? { rootTaskId: `task-${SESSION_A}` } : {}), parentTaskId: `task-${SESSION_A}`, role: 'Scout', taskType: 'research', status: childStatus(), goal: 'Check child evidence', hasResult: childStatus() === 'completed' })
+      if (sessionId === SESSION_A && waitDetailsEnabled) tasks.push({
+        id: WAIT_TARGET_TASK, sessionId, turnId: TURN_A, rootTaskId: `task-${SESSION_A}`, parentTaskId: CHILD_TASK_A,
+        role: 'analyst', taskType: 'research', status: 'queued', goal: 'Inspect the awaited child', hasResult: false,
+      })
       if (sessionId === SESSION_A && selectedJobTurnGateRegression) {
         tasks.push({
           id: 'selected-job-plan-root', sessionId, turnId: SELECTED_JOB_TURN_A, rootTaskId: 'selected-job-plan-root', parentTaskId: null,
@@ -394,6 +453,13 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false, 
     if (resource === 'events') {
       if (sessionId !== SESSION_A) {
         return route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': fixture B stream\n\n' })
+      }
+      if (waitDetailsEnabled && fixture.waitStartArmed && !fixture.waitStarted) {
+        fixture.waitStartArmed = false
+        fixture.waitStarted = true
+        fixture.childTaskStarted = true
+        const started = event(SESSION_A, TURN_A, 'fixture-event-wait-parent-started', nextEventSequence(), 'task.started', { status: 'running' }, { itemId: null, taskId: CHILD_TASK_A })
+        return route.fulfill({ status: 200, contentType: 'text/event-stream', body: `event: timeline\ndata: ${JSON.stringify(started)}\n\n` })
       }
       if (fixture.selectedJobDisconnectArmed) {
         const afterSequence = url.searchParams.get('afterSequence')
@@ -873,4 +939,94 @@ test('a newer selected-job Turn hides the prior plan and draft until its graph a
   await expect(draft).toBeVisible()
   await expect(draft).toHaveAttribute('aria-label', 'Principal Engineer · Northstar Robotics v1')
   await expect(draft).toContainText('Second selected-job cover-letter fixture body.')
+})
+
+test('durable child wait details revalidate in the mounted mocked supervisor fixture', async ({ page }, testInfo) => {
+  // This fixture mocks /api/auth/session and all session routes; it covers browser wiring, not authenticated PostgreSQL evidence.
+  const fixture = await installSupervisorFixture(page, false, false, false, false, true)
+  await page.clock.install({ time: new Date('2026-10-27T11:59:00.000Z') })
+  await page.addInitScript(() => {
+    let hidden = false
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => hidden ? 'hidden' : 'visible' })
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => hidden })
+    Object.assign(window, { __setWaitHidden: (value: boolean) => {
+      hidden = value
+      document.dispatchEvent(new Event('visibilitychange'))
+    } })
+  })
+  const isZh = testInfo.project.name.includes('zh')
+  const copy = isZh
+    ? { any: '任一子任务', empty: '当前没有等待中的子任务。', matched: '尚未匹配', waitDeadline: '等待截止时间', taskDeadline: '任务总截止时间', due: '任务总截止时间已到', select: '选择analyst' }
+    : { any: 'Any child', empty: 'No current child wait.', matched: 'Not matched', waitDeadline: 'Wait deadline', taskDeadline: 'Task deadline', due: 'Task deadline reached', select: 'Select analyst' }
+  await page.goto(`/agent-preview?supervisor=1&locale=${isZh ? 'zh' : 'en'}&sessionId=${SESSION_A}`)
+
+  const parentNode = page.locator(`[data-task-node-id="task:${CHILD_TASK_A}"]`)
+  await expect(parentNode).toBeVisible({ timeout: 20_000 })
+  await parentNode.click()
+  const waitCard = page.locator('[data-agent-task-wait-details="true"]')
+  await expect(waitCard).toContainText(copy.empty)
+  await expect(waitCard).toHaveAttribute('data-wait-loading', 'false')
+  await expect.poll(() => fixture.waitParentIds.filter(id => id === CHILD_TASK_A).length).toBeGreaterThanOrEqual(1)
+
+  await page.evaluate(async () => { await fetch('/__agent_fixture__/wait-hold', { method: 'POST' }) })
+  await page.evaluate(async () => {
+    const now = Date.now()
+    const deadlineAt = new Date(now + 10_000).toISOString()
+    const parentDeadlineAt = new Date(now + 5_000).toISOString()
+    const response = await fetch('/__agent_fixture__/wait-start', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ deadlineAt, parentDeadlineAt }),
+    })
+    if (!response.ok) throw new Error('Could not arm the delayed child-wait fixture.')
+  })
+  await expect(parentNode).toContainText(isZh ? '运行中' : 'Running', { timeout: 10_000 })
+  await expect.poll(() => fixture.waitRequestHeld, { timeout: 10_000 }).toBe(true)
+  const heldRequestCount = fixture.waitQueryCount
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+  await page.clock.fastForward(0)
+  expect(fixture.waitQueryCount).toBe(heldRequestCount)
+  expect(fixture.activeWaitRequests).toBe(1)
+  fixture.releaseWaitRequest?.()
+  await expect.poll(() => fixture.waitRegistrationRetryServed, { timeout: 10_000 }).toBe(true)
+  await expect(waitCard).toContainText(copy.any)
+  await expect(waitCard).toContainText(copy.matched)
+  await expect(waitCard).toContainText(copy.waitDeadline)
+  await expect(waitCard).toContainText(copy.taskDeadline)
+  await expect(waitCard).toHaveAttribute('data-wait-loading', 'false')
+  expect(fixture.maxActiveWaitRequests).toBe(1)
+
+  const clockNow = await page.evaluate(() => Date.now())
+  await page.clock.pauseAt(clockNow)
+  const beforeDeadline = fixture.waitQueryCount
+  await page.clock.fastForward(5_000)
+  await expect(waitCard).toContainText(copy.due)
+  await expect.poll(() => fixture.waitQueryCount).toBe(beforeDeadline + 1)
+  await expect(waitCard).toHaveAttribute('data-wait-loading', 'false')
+
+  const beforePoll = fixture.waitQueryCount
+  await page.clock.fastForward(29_999)
+  expect(fixture.waitQueryCount).toBe(beforePoll)
+  await page.clock.fastForward(1)
+  await expect.poll(() => fixture.waitQueryCount).toBe(beforePoll + 1)
+  await expect(waitCard).toHaveAttribute('data-wait-loading', 'false')
+
+  await page.evaluate(() => (window as Window & { __setWaitHidden?: (value: boolean) => void }).__setWaitHidden?.(true))
+  const whileHidden = fixture.waitQueryCount
+  await page.clock.fastForward(60_000)
+  expect(fixture.waitQueryCount).toBe(whileHidden)
+  await page.evaluate(() => (window as Window & { __setWaitHidden?: (value: boolean) => void }).__setWaitHidden?.(false))
+  await page.clock.fastForward(0)
+  await expect.poll(() => fixture.waitQueryCount).toBe(whileHidden + 1)
+  await expect(waitCard).toHaveAttribute('data-wait-loading', 'false')
+
+  await waitCard.getByRole('button', { name: copy.select }).click()
+  const targetNode = page.locator(`[data-task-node-id="task:${WAIT_TARGET_TASK}"]`)
+  await expect(targetNode).toHaveAttribute('aria-current', 'true')
+  await expect(waitCard).toContainText(copy.empty)
+  await expect(waitCard).toHaveAttribute('data-wait-loading', 'false')
+  expect(fixture.waitParentIds.at(-1)).toBe(WAIT_TARGET_TASK)
+  await expect(waitCard).not.toContainText(copy.any)
+  const afterSelection = fixture.waitParentIds.length
+  await page.clock.fastForward(30_000)
+  await expect.poll(() => fixture.waitQueryCount).toBeGreaterThan(afterSelection)
+  expect(fixture.waitParentIds.slice(afterSelection).every(id => id === WAIT_TARGET_TASK)).toBe(true)
 })

@@ -168,6 +168,95 @@ jobs:
         env:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
         run: pnpm --filter @jobcopilot/web exec prisma generate --schema prisma/schema.prisma
+      - name: Create isolated disposable database for task wait RLS verification
+        env:
+          WAIT_RLS_ADMIN_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+        run: |
+          test "$WAIT_RLS_ADMIN_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
+          pnpm --filter @jobcopilot/worker exec node - <<'NODE'
+          const { Client } = require("pg")
+          const admin = new Client({ connectionString: process.env.WAIT_RLS_ADMIN_URL })
+          async function main() {
+            await admin.connect()
+            try {
+              const existing = await admin.query("SELECT 1 FROM pg_database WHERE datname = $1", ["applymate_wait_rls_ci"])
+              if (existing.rowCount !== 0) throw new Error("Expected a fresh task wait RLS disposable database")
+              await admin.query('CREATE DATABASE "applymate_wait_rls_ci"')
+            } finally {
+              await admin.end()
+            }
+          }
+          main().catch(error => { console.error(error); process.exitCode = 1 })
+          NODE
+      - name: Migrate the isolated task wait RLS database
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_wait_rls_ci
+        run: pnpm --filter @jobcopilot/web exec prisma migrate deploy --schema prisma/schema.prisma
+      - name: Enable RLS and candidate grants in the isolated task wait database
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_wait_rls_ci
+        run: |
+          test "$DATABASE_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_wait_rls_ci"
+          pnpm --filter @jobcopilot/worker exec node - <<'NODE'
+          const { readFileSync } = require("node:fs")
+          const { Client } = require("pg")
+          const { resolve } = require("node:path")
+          const root = process.env.GITHUB_WORKSPACE
+          const client = new Client({ connectionString: process.env.DATABASE_URL })
+          async function main() {
+            await client.connect()
+            try {
+              await client.query("BEGIN")
+              await client.query("SELECT set_config('app.applymate_enable_rls', 'on', true)")
+              await client.query(readFileSync(resolve(root, "apps/web/prisma/rls/enable.sql"), "utf8"))
+              await client.query("COMMIT")
+              await client.query(readFileSync(resolve(root, "apps/web/prisma/rls/role-grants.sql"), "utf8"))
+            } catch (error) {
+              await client.query("ROLLBACK").catch(() => undefined)
+              throw error
+            } finally {
+              await client.end()
+            }
+          }
+          main().catch(error => { console.error(error); process.exitCode = 1 })
+          NODE
+      - name: Verify authenticated task wait projection on disposable PostgreSQL
+        env:
+          CI: "true"
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+          RLS_RUNTIME_MODE: "off"
+        run: |
+          test "$CI" = "true"
+          test "$DATABASE_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "$DATABASE_URL"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          pnpm --filter @jobcopilot/web exec vitest run --no-file-parallelism "src/app/api/agent/sessions/[id]/tasks/[taskId]/waits/route.pg.integration.test.ts"
+      - name: Verify authenticated task wait projection under candidate RLS
+        env:
+          CI: "true"
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_wait_rls_ci
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+          AGENT_WAIT_RLS_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_wait_rls_ci
+          AGENT_WAIT_RLS_ADMIN_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_wait_rls_ci
+          RLS_RUNTIME_MODE: "on"
+          RLS_CANDIDATE_ROLE: applymate_candidate
+        run: |
+          test "$CI" = "true"
+          test "$DATABASE_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_wait_rls_ci"
+          test "$AGENT_WAIT_RLS_DATABASE_URL" = "$DATABASE_URL"
+          test "$AGENT_WAIT_RLS_ADMIN_URL" = "$DATABASE_URL"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          test "$RLS_RUNTIME_MODE" = "on"
+          test "$RLS_CANDIDATE_ROLE" = "applymate_candidate"
+          pnpm --filter @jobcopilot/web exec vitest run --no-file-parallelism "src/app/api/agent/sessions/[id]/tasks/[taskId]/waits/route.pg.integration.test.ts"
       - name: Verify PersonaFact Web consent writes on disposable PostgreSQL
         env:
           CI: "true"
@@ -547,6 +636,8 @@ jobs:
           AGENT_PLAN_LEDGER_TRACE_ARTIFACT_PATH: ${{ runner.temp }}/task-graph-plan-ledger.json
           AGENT_INTERACTIVE_DISCOVERY_TRACE_ARTIFACT_PATH: ${{ runner.temp }}/interactive-discovery-trace.json
         run: pnpm exec playwright test e2e/agent-task-graph-plan.spec.ts
+      - name: Verify durable child wait details in the mounted Workbench
+        run: pnpm exec playwright test e2e/agent-supervisor.spec.ts --grep "durable child wait details"
       - name: Verify production Turn dispatch on disposable Redis/BullMQ
         env:
           RUN_AGENT_TURN_REDIS_INTEGRATION: "1"

@@ -39,6 +39,20 @@ describe('candidate RLS rollout SQL', () => {
     for (const table of ['"agent_turns"', '"agent_steps"', '"agent_inputs"', '"agent_items"', '"agent_events"', '"agent_outbox"', '"agent_action_reservations"']) {
       expect(sql).toContain(table)
     }
+    expect(sql).toContain('GRANT SELECT ON TABLE "agent_wait_conditions" TO applymate_candidate')
+    const broadGrantStart = sql.indexOf('GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE')
+    const broadGrantEnd = sql.indexOf('\nTO applymate_candidate;', broadGrantStart)
+    expect(broadGrantStart).toBeGreaterThanOrEqual(0)
+    expect(broadGrantEnd).toBeGreaterThan(broadGrantStart)
+    expect(sql.slice(broadGrantStart, broadGrantEnd)).not.toContain('"agent_wait_conditions"')
     expect(sql).not.toContain('GRANT ALL PRIVILEGES ON ALL TABLES')
+  })
+
+  it('keeps agent wait visibility scoped to the current tenant', () => {
+    const migration = readFileSync(fileURLToPath(new URL('../../prisma/migrations/20260908030000_add_agent_tool_result_references/migration.sql', import.meta.url)), 'utf8')
+    expect(migration).toContain('ALTER TABLE "agent_wait_conditions" ENABLE ROW LEVEL SECURITY')
+    expect(migration).toContain('CREATE POLICY agent_wait_condition_user_isolation')
+    expect(migration).toContain('USING ("userId" = NULLIF(current_setting(\'app.user_id\', true), \'\'))')
+    expect(migration).toContain('WITH CHECK ("userId" = NULLIF(current_setting(\'app.user_id\', true), \'\'))')
   })
 })
