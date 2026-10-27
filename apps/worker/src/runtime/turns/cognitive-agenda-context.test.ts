@@ -70,6 +70,20 @@ describe("Cognitive agenda request projection", () => {
     expect(JSON.stringify(projected)).not.toContain("ids")
   })
 
+  it("projects a positive verification count without IDs or report text", () => {
+    const base = receiptFor({ nextAction: "continue_turn", blocker: null })
+    const receipt = {
+      ...base,
+      signals: { ...base.signals, completionVerification: { count: 2, ids: [] } },
+    }
+    const projected = projectCognitiveAgendaContext(receipt, scope)
+
+    expect(projected?.signals.completionVerification).toBe(2)
+    expect(JSON.stringify(projected)).not.toContain("PRIVATE_")
+    expect(JSON.stringify(projected)).not.toContain("ids")
+    expect(JSON.stringify(projected)).not.toContain("verificationReport")
+  })
+
   it.each(["sessionId", "turnId", "taskId", "stepId"] as const)("rejects a receipt with mismatched %s scope", field => {
     const receipt = receiptFor({ nextAction: "continue_turn", blocker: null })
     expect(projectCognitiveAgendaContext(receipt, { ...scope, [field]: `other-${field}` })).toBeNull()
