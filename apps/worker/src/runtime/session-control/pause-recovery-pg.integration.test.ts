@@ -2,18 +2,18 @@ import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest"
 import { Pool as PgPool, type PoolClient } from "pg"
 
-type ControlIdentity = { userId: string; sessionId: string; turnId: string }
+type ControlIdentity = { userId: string; sessionId: string; turnId: string; recoveryClaimToken: string }
 
 const coordinators = vi.hoisted(() => {
-  const calls: Array<{ sessionId: string; pool: unknown }> = []
+  const calls: Array<{ sessionId: string; claimToken: string; pool: unknown }> = []
   return {
     calls,
     pause: vi.fn(async (pool: unknown, identity: ControlIdentity) => {
-      calls.push({ sessionId: identity.sessionId, pool })
+      calls.push({ sessionId: identity.sessionId, claimToken: identity.recoveryClaimToken, pool })
       return { state: "paused" as const }
     }),
     resume: vi.fn(async (pool: unknown, identity: ControlIdentity) => {
-      calls.push({ sessionId: identity.sessionId, pool })
+      calls.push({ sessionId: identity.sessionId, claimToken: identity.recoveryClaimToken, pool })
       return { status: "queued" as const }
     }),
   }
@@ -76,6 +76,8 @@ type SessionSnapshot = {
   createdAt: Date
   updatedAt: Date
   marker: Date | null
+  claimToken: string | null
+  claimExpiresAt: Date | null
 }
 
 type EventSnapshot = {
@@ -92,6 +94,8 @@ type EventSnapshot = {
   type: string
   payload: { turnId: string }
 }
+
+type TurnSnapshot = { id: string; sessionId: string; status: string; revision: number }
 
 type Deferred = { promise: Promise<void>; resolve: () => void }
 type Outcome<T> = { status: "fulfilled"; value: T } | { status: "rejected"; reason: unknown }
@@ -189,11 +193,17 @@ async function insertCandidates(candidates: Candidate[]): Promise<void> {
   })
 }
 
-async function readSnapshots(sessionIds: string[]): Promise<{ sessions: SessionSnapshot[]; events: EventSnapshot[] }> {
+async function readSnapshots(sessionIds: string[]): Promise<{ sessions: SessionSnapshot[]; turns: TurnSnapshot[]; events: EventSnapshot[] }> {
   return withSchemaClient(async client => {
     const sessions = await client.query<SessionSnapshot>(
-      `SELECT "id", "status", "createdAt", "updatedAt", "sessionControlRecoveryAttemptedAt" AS "marker"
+      `SELECT "id", "status", "createdAt", "updatedAt", "sessionControlRecoveryAttemptedAt" AS "marker",
+              "sessionControlRecoveryClaimToken" AS "claimToken", "sessionControlRecoveryClaimExpiresAt" AS "claimExpiresAt"
        FROM "agent_sessions" WHERE "id" = ANY($1::text[]) ORDER BY "id"`,
+      [sessionIds],
+    )
+    const turns = await client.query<TurnSnapshot>(
+      `SELECT "id", "sessionId", "status", "revision" FROM "agent_turns"
+       WHERE "sessionId" = ANY($1::text[]) ORDER BY "id"`,
       [sessionIds],
     )
     const events = await client.query<EventSnapshot>(
@@ -202,7 +212,7 @@ async function readSnapshots(sessionIds: string[]): Promise<{ sessions: SessionS
        FROM "agent_events" WHERE "sessionId" = ANY($1::text[]) ORDER BY "sessionId", "sequence", "id"`,
       [sessionIds],
     )
-    return { sessions: sessions.rows, events: events.rows }
+    return { sessions: sessions.rows, turns: turns.rows, events: events.rows }
   })
 }
 
@@ -222,6 +232,7 @@ function markedIds(snapshot: SessionSnapshot[]): string[] {
 function scannerPool(
   afterClaimSelect?: () => Promise<void>,
   backendPids?: number[],
+  onClaimRelease?: (committed: boolean) => void,
 ): LeasePool {
   return {
     async connect() {
@@ -236,18 +247,21 @@ function scannerPool(
       }
 
       const originalQuery = client.query.bind(client) as unknown as (sql: string, values?: unknown[]) => Promise<unknown>
+      let claimScan = false, committed = false
       return {
         async query(sql: string, values?: unknown[]) {
           const result = await originalQuery(sql, values)
+          if (sql === "COMMIT") committed = true
           if (
             sql.includes('SELECT session."userId", session."id" AS "sessionId", control."turnId", session."status"')
             && sql.includes("FOR UPDATE OF session SKIP LOCKED")
           ) {
+            claimScan = true
             await afterClaimSelect?.()
           }
           return result
         },
-        release() { client.release() },
+        release() { client.release(); if (claimScan) onClaimRelease?.(committed) },
       } as unknown as PoolClient
     },
   } as unknown as LeasePool
@@ -263,12 +277,16 @@ describeWithPostgres("session-control recovery on disposable PostgreSQL", () => 
         "status" text NOT NULL,
         "createdAt" timestamp(3) NOT NULL,
         "updatedAt" timestamp(3) NOT NULL,
-        "sessionControlRecoveryAttemptedAt" timestamp(3) NULL
+        "sessionControlRecoveryAttemptedAt" timestamp(3) NULL,
+        "sessionControlRecoveryClaimToken" text NULL,
+        "sessionControlRecoveryClaimExpiresAt" timestamp(3) NULL
       )`)
       await client.query(`CREATE TABLE "agent_turns" (
         "id" text PRIMARY KEY,
         "sessionId" text NOT NULL,
-        "userId" text NOT NULL
+        "userId" text NOT NULL,
+        "status" text NOT NULL DEFAULT 'queued',
+        "revision" integer NOT NULL DEFAULT 0
       )`)
       await client.query(`CREATE TABLE "agent_events" (
         "id" text PRIMARY KEY,
@@ -299,11 +317,11 @@ describeWithPostgres("session-control recovery on disposable PostgreSQL", () => 
   beforeEach(async () => {
     coordinators.calls.length = 0
     coordinators.pause.mockImplementation(async (scanner, identity) => {
-      coordinators.calls.push({ sessionId: identity.sessionId, pool: scanner })
+      coordinators.calls.push({ sessionId: identity.sessionId, claimToken: identity.recoveryClaimToken, pool: scanner })
       return { state: "paused" }
     })
     coordinators.resume.mockImplementation(async (scanner, identity) => {
-      coordinators.calls.push({ sessionId: identity.sessionId, pool: scanner })
+      coordinators.calls.push({ sessionId: identity.sessionId, claimToken: identity.recoveryClaimToken, pool: scanner })
       return { status: "queued" }
     })
     await withSchemaClient(client => client.query('TRUNCATE "agent_events", "agent_turns", "agent_sessions"'))
@@ -316,7 +334,7 @@ describeWithPostgres("session-control recovery on disposable PostgreSQL", () => 
     const before = await readSnapshots(ids)
     const failure = new Error("coordinator unavailable")
     coordinators.pause.mockImplementation(async (scanner, identity) => {
-      coordinators.calls.push({ sessionId: identity.sessionId, pool: scanner })
+      coordinators.calls.push({ sessionId: identity.sessionId, claimToken: identity.recoveryClaimToken, pool: scanner })
       throw failure
     })
     const log = vi.spyOn(console, "error").mockImplementation(() => undefined)
@@ -329,7 +347,9 @@ describeWithPostgres("session-control recovery on disposable PostgreSQL", () => 
 
       const afterFirst = await readSnapshots(ids)
       expect(markedIds(afterFirst.sessions)).toEqual(firstClaimIds)
+      expect(afterFirst.sessions.every(row => row.claimToken === null && row.claimExpiresAt === null)).toBe(true)
       expect(sessionActivity(afterFirst.sessions)).toEqual(sessionActivity(before.sessions))
+      expect(afterFirst.turns).toEqual(before.turns)
       expect(afterFirst.events).toEqual(before.events)
 
       const firstMarkers = new Map(afterFirst.sessions.map(row => [row.id, row.marker?.toISOString() ?? null]))
@@ -342,7 +362,9 @@ describeWithPostgres("session-control recovery on disposable PostgreSQL", () => 
 
       const afterSecond = await readSnapshots(ids)
       expect(markedIds(afterSecond.sessions)).toEqual(ids)
+      expect(afterSecond.sessions.every(row => row.claimToken === null && row.claimExpiresAt === null)).toBe(true)
       expect(sessionActivity(afterSecond.sessions)).toEqual(sessionActivity(before.sessions))
+      expect(afterSecond.turns).toEqual(before.turns)
       expect(afterSecond.events).toEqual(before.events)
       const retriedIds = new Set(ids.slice(0, 25))
       for (const row of afterSecond.sessions) {
@@ -357,6 +379,83 @@ describeWithPostgres("session-control recovery on disposable PostgreSQL", () => 
       log.mockRestore()
     }
   })
+
+  it("keeps a committed claim exclusive while its coordinator runs, then permits expired-token takeover", async () => {
+    const [candidate] = makeCandidates("claim-lease", 1)
+    if (!candidate) throw new Error("Single session-control recovery candidate is missing")
+    await insertCandidates([candidate])
+    const before = await readSnapshots([candidate.sessionId])
+    const firstEntered = deferred(), releaseFirst = deferred(), takeoverEntered = deferred(), releaseTakeover = deferred()
+    let firstScanReleasedAfterCommit = false, holdTakeover = false, firstToken = "", takeoverToken = ""
+    let firstPool!: LeasePool, takeoverPool!: LeasePool
+    firstPool = scannerPool(undefined, undefined, committed => { firstScanReleasedAfterCommit = committed })
+    takeoverPool = scannerPool()
+    coordinators.pause.mockImplementation(async (scanner, identity) => {
+      coordinators.calls.push({ sessionId: identity.sessionId, claimToken: identity.recoveryClaimToken, pool: scanner })
+      if (scanner === firstPool) {
+        expect(firstScanReleasedAfterCommit).toBe(true)
+        firstToken = identity.recoveryClaimToken
+        firstEntered.resolve()
+        await releaseFirst.promise
+      } else if (scanner === takeoverPool && holdTakeover) {
+        takeoverToken = identity.recoveryClaimToken
+        takeoverEntered.resolve()
+        await releaseTakeover.promise
+      }
+      return { state: "paused" }
+    })
+
+    const firstPromise = settle(reconcilePendingSessionControls(firstPool))
+    let takeoverPromise: Promise<Outcome<Awaited<ReturnType<typeof reconcilePendingSessionControls>>>> | undefined
+    try {
+      await withinFiveSeconds(firstEntered.promise, "First scanner did not reach its coordinator after commit and release")
+      expect(firstScanReleasedAfterCommit).toBe(true)
+      const claimedByFirst = await readSnapshots([candidate.sessionId])
+      expect(claimedByFirst.sessions[0]?.claimToken).toBe(firstToken)
+      expect(firstToken).toMatch(/^[0-9a-f-]{36}$/i)
+
+      const whileFirstRuns = await withinFiveSeconds(reconcilePendingSessionControls(takeoverPool), "Second scanner could not finish while the first coordinator was held")
+      expect(whileFirstRuns).toEqual({ scanned: 0, reconciled: 0, failed: 0 })
+      expect(coordinators.calls.filter(call => call.pool === takeoverPool)).toHaveLength(0)
+      const stillOwned = await readSnapshots([candidate.sessionId])
+      expect(stillOwned.sessions[0]?.claimToken).toBe(firstToken)
+
+      await withSchemaClient(client => client.query(
+        `UPDATE "agent_sessions" SET "sessionControlRecoveryClaimExpiresAt" = NOW() - INTERVAL '1 millisecond' WHERE "id" = $1`,
+        [candidate.sessionId],
+      ))
+      holdTakeover = true
+      takeoverPromise = settle(reconcilePendingSessionControls(takeoverPool))
+      await withinFiveSeconds(takeoverEntered.promise, "Expired claim was not taken over by the second scanner")
+      expect(takeoverToken).not.toBe(firstToken)
+      const claimedByTakeover = await readSnapshots([candidate.sessionId])
+      expect(claimedByTakeover.sessions[0]?.claimToken).toBe(takeoverToken)
+
+      releaseFirst.resolve()
+      const firstResult = await withinFiveSeconds(firstPromise, "First scanner did not finish after becoming stale")
+      expect(firstResult).toEqual({ status: "fulfilled", value: { scanned: 1, reconciled: 1, failed: 0 } })
+      const afterStaleCleanup = await readSnapshots([candidate.sessionId])
+      expect(afterStaleCleanup.sessions[0]?.claimToken).toBe(takeoverToken)
+      expect(sessionActivity(afterStaleCleanup.sessions)).toEqual(sessionActivity(before.sessions))
+      expect(afterStaleCleanup.turns).toEqual(before.turns)
+      expect(afterStaleCleanup.events).toEqual(before.events)
+
+      releaseTakeover.resolve()
+      const takeoverResult = await withinFiveSeconds(takeoverPromise, "Takeover scanner did not finish after its coordinator was released")
+      expect(takeoverResult).toEqual({ status: "fulfilled", value: { scanned: 1, reconciled: 1, failed: 0 } })
+      const afterTakeover = await readSnapshots([candidate.sessionId])
+      expect(afterTakeover.sessions[0]?.claimToken).toBeNull()
+      expect(afterTakeover.sessions[0]?.claimExpiresAt).toBeNull()
+      expect(sessionActivity(afterTakeover.sessions)).toEqual(sessionActivity(before.sessions))
+      expect(afterTakeover.turns).toEqual(before.turns)
+      expect(afterTakeover.events).toEqual(before.events)
+    } finally {
+      releaseFirst.resolve()
+      releaseTakeover.resolve()
+      await firstPromise
+      if (takeoverPromise) await takeoverPromise
+    }
+  }, 15_000)
 
   it("lets concurrent scanners claim two disjoint 50-row batches through separate locked connections", async () => {
     const candidates = makeCandidates("concurrent", 100)

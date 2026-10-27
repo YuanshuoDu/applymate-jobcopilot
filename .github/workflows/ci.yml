@@ -152,7 +152,7 @@ jobs:
         env:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
         run: pnpm --filter @jobcopilot/web exec prisma migrate deploy --schema prisma/schema.prisma
-      - name: Verify session-control recovery rotation on disposable PostgreSQL
+      - name: Verify session-control recovery claims and rotation on disposable PostgreSQL
         env:
           CI: "true"
           AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci

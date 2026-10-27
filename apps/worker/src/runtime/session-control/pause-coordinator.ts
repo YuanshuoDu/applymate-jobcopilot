@@ -7,7 +7,7 @@ import { recoverExpired as recoverExpiredTasks } from "../subagents/pg-store-exp
 type Pool = Pick<pg.Pool, "connect">
 type Client = Pick<pg.PoolClient, "query" | "release">
 type Row = Record<string, unknown>
-type Input = { readonly userId: string; readonly sessionId: string; readonly turnId: string; readonly now?: Date }
+type Input = { readonly userId: string; readonly sessionId: string; readonly turnId: string; readonly recoveryClaimToken: string; readonly now?: Date }
 type Locked = { status: string; turnStatus: string; turnRevision: number; rootTaskId: string | null; leaseOwnerId: string | null; leaseExpiresAt: unknown }
 type ControlEvent = { id: string; sequence: number; idempotencyKey: string; payload: Record<string, unknown> }
 type OutboxPayload = { eventId: string; sessionId: string; turnId: string; taskId: string | null; itemId: null; sequence: string; type: string; actor: string; correlationId: string; causationId: string | null; idempotencyKey: string; payload: unknown }
@@ -51,6 +51,13 @@ async function transaction<T>(pool: Pool, userId: string, work: (client: Client)
   try { await client.query("BEGIN"); await client.query("SELECT set_config('app.user_id', $1, true)", [userId]); const result = await work(client); await client.query("COMMIT"); committed = true; return result }
   catch (error: unknown) { if (!committed) await client.query("ROLLBACK").catch(() => undefined); throw error }
   finally { client.release() }
+}
+
+async function renewRecoveryClaim(client: Client, input: Input): Promise<void> {
+  const claim = await client.query(`UPDATE "agent_sessions" SET "sessionControlRecoveryClaimExpiresAt" = clock_timestamp() + INTERVAL '2 minutes'
+    WHERE "id" = $1 AND "userId" = $2 AND "sessionControlRecoveryClaimToken" = $3 AND "sessionControlRecoveryClaimExpiresAt" > clock_timestamp()`,
+  [input.sessionId, input.userId, input.recoveryClaimToken])
+  if (claim.rowCount !== 1) throw new Error("session_control_recovery_claim_lost")
 }
 
 async function lockControl(client: Client, input: Input): Promise<Locked> {
@@ -131,10 +138,12 @@ function terminalSessionStatus(value: TerminalTurnStatus): "completed" | "failed
 
 /** Reconciles the API-authored pause request after root, Turn, child and external work is quiescent. */
 export async function reconcileSessionPause(pool: Pool, raw: Input): Promise<{ readonly state: "pausing" | "paused"; readonly blockers: readonly string[]; readonly preservedWaitCount: number; readonly recoveredExpiredLeases: number }> {
-  const input = { ...raw, userId: required(raw.userId, "userId"), sessionId: required(raw.sessionId, "sessionId"), turnId: required(raw.turnId, "turnId") }
+  const input = { ...raw, userId: required(raw.userId, "userId"), sessionId: required(raw.sessionId, "sessionId"), turnId: required(raw.turnId, "turnId"), recoveryClaimToken: required(raw.recoveryClaimToken, "recoveryClaimToken") }
+  await transaction(pool, input.userId, client => renewRecoveryClaim(client, input))
   const recoveredTasks = await recoverExpiredTasks(pool, { now: input.now ?? new Date(), limit: PAUSE_RECOVERY_LEASE_BATCH, sessionId: input.sessionId, turnId: input.turnId })
   return transaction(pool, input.userId, async client => {
     const state = await lockControl(client, input)
+    await renewRecoveryClaim(client, input)
     const waits = await client.query<Row>(`SELECT "id" FROM "agent_wait_conditions" WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "consumedAt" IS NULL ORDER BY "createdAt" ASC, "id" ASC FOR UPDATE`, [input.userId, input.sessionId, input.turnId])
     const steps = await client.query<Row>(`SELECT "id", "status" FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 AND "status" = 'streaming' ORDER BY "id" FOR UPDATE`, [input.sessionId, input.turnId])
     const pause = await readActivePause(client, input)
@@ -186,9 +195,10 @@ export async function reconcileSessionPause(pool: Pool, raw: Input): Promise<{ r
 
 /** Consumes the API-authored resume event; an unresolved durable wait remains authoritative and is never dispatched here. */
 export async function resumeSession(pool: Pool, raw: Input): Promise<ResumeResult> {
-  const input = { ...raw, userId: required(raw.userId, "userId"), sessionId: required(raw.sessionId, "sessionId"), turnId: required(raw.turnId, "turnId") }
+  const input = { ...raw, userId: required(raw.userId, "userId"), sessionId: required(raw.sessionId, "sessionId"), turnId: required(raw.turnId, "turnId"), recoveryClaimToken: required(raw.recoveryClaimToken, "recoveryClaimToken") }
   return transaction(pool, input.userId, async client => {
     const state = await lockControl(client, input)
+    await renewRecoveryClaim(client, input)
     if (state.status !== "resuming") throw new Error("session_control_not_resuming")
     const waits = await client.query<Row>(`SELECT "id", "status" FROM "agent_wait_conditions" WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "consumedAt" IS NULL ORDER BY "createdAt" ASC, "id" ASC FOR UPDATE`, [input.userId, input.sessionId, input.turnId])
     const approvals = await client.query<Row>(`SELECT "id" FROM "agent_approvals" WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "status" = 'pending' ORDER BY "id" FOR UPDATE`, [input.userId, input.sessionId, input.turnId])
