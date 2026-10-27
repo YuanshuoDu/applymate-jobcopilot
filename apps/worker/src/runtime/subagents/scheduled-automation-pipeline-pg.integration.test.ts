@@ -1666,13 +1666,13 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
     }, emptyDiscoveryOutput(value, emptyCallSuffix), 1)
     await persistToolReceipt(pool!, value, populatedScout.taskId, "scout-step", "jobs.discover", "discover-call", {
       query: "Software Engineer Dublin",
-    }, discoveryOutput(value), 1)
+    }, discoveryOutput(value), 2)
     await persistToolReceipt(pool!, value, populatedScout.taskId, "scout-step", "jobs.get", "union-scout-read", {
       jobId: value.jobId,
-    }, { job: { id: value.jobId, source: "fixture" } }, 2)
+    }, { job: { id: value.jobId, source: "fixture" } }, 3)
     await persistToolReceipt(pool!, value, analyst.taskId, "analyst-step", "jobs.get", "union-analyst-read", {
       jobId: value.jobId,
-    }, { job: { id: value.jobId, source: "fixture" } }, 1)
+    }, { job: { id: value.jobId, source: "fixture" } }, 4)
 
     const emptyProof = await verifyCompletedTaskGraphNodeEvidence(pool!, {
       scope: { ...scope, taskId: emptyScout.taskId, attemptCount: 1 }, snapshot, node: emptyScout, structuredResult: emptyRoleResult("scout"),
@@ -1744,10 +1744,10 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
     if (!firstScout || !secondScout || !analyst) throw new Error("All-empty union fixture omitted a typed graph node")
     const scope = { userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
       rootTaskId: value.rootTaskId, parentTaskId: value.rootTaskId }
-    for (const [node, suffix] of [[firstScout, "union-empty-first"], [secondScout, "union-empty-second"]] as const) {
+    for (const [node, suffix, ordinal] of [[firstScout, "union-empty-first", 1], [secondScout, "union-empty-second", 2]] as const) {
       await persistToolReceipt(pool!, value, node.taskId, "scout-step", "jobs.discover", suffix, {
         targetRoles: ["Software Engineer"], targetLocations: ["Dublin"],
-      }, emptyDiscoveryOutput(value, suffix), 1)
+      }, emptyDiscoveryOutput(value, suffix), ordinal)
       const proof = await verifyCompletedTaskGraphNodeEvidence(pool!, {
         scope: { ...scope, taskId: node.taskId, attemptCount: 1 }, snapshot, node, structuredResult: emptyRoleResult("scout"),
       })
@@ -1774,7 +1774,7 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       WHERE "id" = $1 AND "sessionId" = $3`, [analyst.taskId, JSON.stringify(outOfUnionResult), value.sessionId])
     await persistToolReceipt(pool!, value, analyst.taskId, "analyst-step", "jobs.get", "all-empty-analyst-read", {
       jobId: value.jobId,
-    }, { job: { id: value.jobId, source: "fixture" } }, 1)
+    }, { job: { id: value.jobId, source: "fixture" } }, 3)
     const allEmptyProof = await verifyCompletedTaskGraphNodeEvidence(pool!, {
       scope: { ...scope, taskId: analyst.taskId, attemptCount: 1 }, snapshot, node: analyst,
       structuredResult: outOfUnionResult, dependencies: dependencies!.projections,
