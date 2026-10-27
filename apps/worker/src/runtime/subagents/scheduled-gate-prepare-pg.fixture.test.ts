@@ -1,8 +1,21 @@
 import type { Pool } from "pg"
 import { describe, expect, it, vi } from "vitest"
-import { seedScheduledGatePrepareFixture } from "./scheduled-gate-prepare-pg.fixture.js"
+import { scheduledAnalyzePrefixGraphRevision, seedScheduledGatePrepareFixture } from "./scheduled-gate-prepare-pg.fixture.js"
 
 describe("scheduled Gate Prepare PG seed options", () => {
+  it.each([[1, 2], [2, 3], [3, 4], [4, 5]] as const)(
+    "sets Analyze graph revision to source count plus Analyst for %i Scouts",
+    (scoutCount, expectedRevision) => {
+      expect(scheduledAnalyzePrefixGraphRevision(scoutCount)).toBe(expectedRevision)
+    },
+  )
+
+  it.each([0, 5, 1.5])("rejects invalid Analyze source count %s", scoutCount => {
+    expect(() => scheduledAnalyzePrefixGraphRevision(scoutCount)).toThrow(
+      "scheduled_gate_prepare_fixture_scout_count_invalid",
+    )
+  })
+
   it.each([
     ["zero jobs", { jobCount: 0 }],
     ["more jobs than the fixture schedule cap", { jobCount: 11 }],

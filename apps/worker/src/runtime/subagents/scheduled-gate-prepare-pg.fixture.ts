@@ -73,10 +73,11 @@ export async function seedScheduledGatePrepareFixture(
     await seedReceipts(client, ids, snapshot, multiPlan, scheduleSnapshot, selectedJobIds)
     await verifyAndPersistPrefix(client, ids, graphScopeV1, snapshot, multiPlan, selectedJobIds,
       sourceByJobId, Math.max(82, minScore))
-    await client.query(`UPDATE "agent_items" SET "revision" = 2 WHERE "id" = $1`, [taskGraphItemId(ids.rootTaskId)])
+    const analyzeGraphRevision = scheduledAnalyzePrefixGraphRevision(scoutCount)
+    await client.query(`UPDATE "agent_items" SET "revision" = $2 WHERE "id" = $1`, [taskGraphItemId(ids.rootTaskId), analyzeGraphRevision])
     const loaded = await loadTaskGraph(client, graphScopeV1, false)
     const graph = currentTaskGraph(loaded)
-    if (loaded.item?.revision !== 2 || graph.nodes.length !== scoutCount + 1
+    if (loaded.item?.revision !== analyzeGraphRevision || graph.nodes.length !== scoutCount + 1
       || graph.nodes.some(node => node.status !== "completed" || node.verificationReport?.status !== "passed")) {
       throw new Error("scheduled_gate_prepare_analyze_prefix_invalid")
     }
@@ -106,6 +107,14 @@ export async function seedScheduledGatePrepareFixture(
     client.release()
   }
 }
+
+export function scheduledAnalyzePrefixGraphRevision(scoutCount: number): number {
+  if (!Number.isSafeInteger(scoutCount) || scoutCount < 1 || scoutCount > 4) {
+    throw new RangeError("scheduled_gate_prepare_fixture_scout_count_invalid")
+  }
+  return scoutCount + 1
+}
+
 function seedOptions(value: Readonly<{ minScore?: number; jobCount?: number; scoutCount?: number; selectedJobCount?: number }>):
   { minScore: number; jobCount: number; scoutCount: number; selectedJobCount: number } {
   if (!value || typeof value !== "object" || Reflect.ownKeys(value).some(key => !["minScore", "jobCount", "scoutCount", "selectedJobCount"].includes(String(key)))) {

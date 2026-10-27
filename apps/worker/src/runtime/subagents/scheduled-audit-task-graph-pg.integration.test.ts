@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto"
 import { createRequire } from "node:module"
 import { Queue, Worker, type Job } from "bullmq"
 import Redis from "ioredis"
-import { Pool } from "pg"
+import { Pool, type PoolClient } from "pg"
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
@@ -27,11 +27,18 @@ import { createScheduledAutomationPrepareContinuation } from "./scheduled-automa
 import { createScheduledGateChildExecutor } from "./scheduled-gate-child-runtime.js"
 import { createScheduledAuditChildExecutor } from "./scheduled-audit-child-runtime.js"
 import { createScheduledGatePrepareFixture } from "./scheduled-gate-prepare-pg-runner.fixture.js"
+import { readScheduledAuditInvocationProof, readScheduledAuditRegistration, scheduledAuditGateCheckpointEvidence,
+  verifyRegisteredScheduledAuditGate } from "./scheduled-audit-invocation.js"
+import { readScheduledGateRegistrationReceipt } from "./scheduled-gate-registration-receipt.js"
+import { loadPersistedScheduledPrepareProof } from "./scheduled-gate-wait-match.js"
+import { verifyPersistedScheduledPreparePrefix } from "./pg-scheduled-task-graph-gate-verification.js"
+import { projectScheduledPipelineGraph } from "./scheduled-pipeline-graph-shape.js"
+import { scheduledTaskGraphContinuationKeyVersion } from "./scheduled-taskgraph-continuation-receipt.js"
 import { scheduledGateRootActions } from "./scheduled-gate-prepare-pg-resume.fixture.js"
 import { parseScheduledAuditReport, SCHEDULED_AUDIT_NODE_CRITERIA, SCHEDULED_AUDIT_NODE_GOAL, SCHEDULED_AUDIT_TASK_TYPE,
   SCHEDULED_AUDIT_TEMPLATE_ID } from "./scheduled-audit-contract.js"
 import { verifyCompletedTaskGraphNodeEvidence } from "./task-graph-pg-verification.js"
-import { currentTaskGraph, loadTaskGraph } from "./task-graph-pg-state.js"
+import { currentTaskGraph, loadTaskGraph, type GraphIdentityScope } from "./task-graph-pg-state.js"
 import { canonicalTaskGraphJson, parseTaskGraphSnapshot, taskGraphItemId, taskGraphProposalKey,
   TASK_GRAPH_ITEM_TYPE } from "./task-graph-snapshot.js"
 import { verifyScheduledPrepareTaskGraphEvidence } from "./scheduled-prepare-task-graph-verification.js"
@@ -49,6 +56,11 @@ const redisUrl = dedicatedDisposableRedisUrl()
 const describeWithServices = databaseUrl && redisUrl ? describe : describe.skip
 type Fixture = Awaited<ReturnType<typeof createScheduledGatePrepareFixture>>
 type Runner = Readonly<{ worker: Worker<SubagentJobPayload, unknown>; redis: Redis; queue: Queue<SubagentJobPayload> }>
+type AuditProofProbe = Readonly<{ completed: boolean; registrationPresent: boolean; gateRegistrationPresent: boolean;
+  prepareProofPresent: boolean; preparePrefixValid: boolean; gateCurrentWithoutAttestation: boolean;
+  gateCurrentWithAttestation: boolean; invocationProofPresent: boolean }>
+type MutableAuditProofProbe = { -readonly [Key in keyof AuditProofProbe]: AuditProofProbe[Key] }
+type BeforeAuditExecutor = (lease: Parameters<SubagentExecutor>[0]["lease"]) => Promise<void>
 type ScheduledPipelineRoute = Readonly<{ POST(request: Request): Promise<Response> }>
 type ExecuteHttpResponse = Readonly<{ status: number; body: Record<string, unknown> }>
 type FixtureWebDatabase = Readonly<{ db: {
@@ -229,6 +241,7 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
   ])("replays one Audit child across a Worker restart for $label and releases root only with its private current-attempt proof", async options => {
     const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!, options)
     fixtureUsers.push(fixture.ids.userId)
+    let auditProofProbe: AuditProofProbe | null = null
     if (options.scoutCount === 1) {
       if ("scouts" in fixture.attestation) throw new Error("scheduled legacy Analyze attestation must remain v1")
       expect(fixture.attestation.scout.candidateJobIds).toEqual(fixture.jobIds)
@@ -286,7 +299,9 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(initialGateWait.status).toBe("waiting_for_dependency")
     if (initialGateWait.status !== "waiting_for_dependency") throw new Error("scheduled Audit Gate wait missing")
     const gateTaskId = await findTaskId("scheduled_taskgraph_gate", fixture.ids.rootTaskId)
-    runner = startRunner(fixture, response.fetcher)
+    runner = startRunner(fixture, response.fetcher, async lease => {
+      auditProofProbe = await captureAuditProofProbe(fixture, lease)
+    })
     const gateOutcome = await dispatchAndWait(runner, gateTaskId, fixture.ids.sessionId)
     if (!gateOutcome || typeof gateOutcome !== "object" || !("status" in gateOutcome) || gateOutcome.status !== "completed") {
       const rawOutcomeStatus = debugRecord(gateOutcome)?.status
@@ -357,6 +372,7 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
         ? failedTask.failureReason : "other"
       throw new Error(`Scheduled Audit first attempt did not retry: ${JSON.stringify({
         status: failedTask.status, failureReason, executeCalls: response.executeCalls(), executeHttpFailures: response.executeHttpFailures(),
+        ...(auditProofProbe ? { proofProbe: auditProofProbe } : {}),
       })}`)
     }
     expect(firstTaskOutcome).toMatchObject({ status: "retrying" })
@@ -829,7 +845,66 @@ async function waitForAuditRetryDue(taskId: string, timeoutMs = 20_000): Promise
   throw new Error("scheduled Audit retry did not become due according to the PostgreSQL clock")
 }
 
-function startRunner(fixture: Fixture, fetcher: typeof fetch): Runner {
+async function captureAuditProofProbe(fixture: Fixture, lease: Parameters<SubagentExecutor>[0]["lease"]): Promise<AuditProofProbe> {
+  const probe: MutableAuditProofProbe = { completed: false, registrationPresent: false, gateRegistrationPresent: false,
+    prepareProofPresent: false, preparePrefixValid: false, gateCurrentWithoutAttestation: false,
+    gateCurrentWithAttestation: false, invocationProofPresent: false }
+  let client: PoolClient | undefined, transactionOpen = false
+  try {
+    client = await pool!.connect()
+    await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ")
+    transactionOpen = true
+    const scope: GraphIdentityScope = { userId: fixture.ids.userId, sessionId: fixture.ids.sessionId,
+      turnId: fixture.ids.turnId, rootTaskId: fixture.ids.rootTaskId, parentTaskId: fixture.ids.rootTaskId }
+    await client.query("SELECT set_config('app.user_id', $1, true)", [scope.userId])
+    const loaded = await loadTaskGraph(client as never, scope, false)
+    const registration = await readScheduledAuditRegistration(client as never, scope, lease.id)
+    probe.registrationPresent = Boolean(registration)
+    if (registration) {
+      const gateRegistration = await readScheduledGateRegistrationReceipt(client as never, { userId: scope.userId,
+        sessionId: scope.sessionId, turnId: scope.turnId, owner: registration.owner, gateTaskId: registration.gateTaskId })
+      probe.gateRegistrationPresent = Boolean(gateRegistration)
+      const executionRows = await client.query<{ status: string; state: unknown }>(`SELECT "status", "state" FROM "agent_executions"
+        WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3`,
+      [registration.owner.executionId, scope.userId, scope.sessionId])
+      const execution = executionRows.rows.length === 1 ? executionRows.rows[0] : undefined
+      const evidence = execution && scheduledAuditGateCheckpointEvidence(execution.state, execution.status)
+      const prepareNode = loaded.snapshot?.nodes.find(node => node.key === "prepare")
+      const prepareTask = prepareNode && loaded.tasks.get(prepareNode.taskId)
+      const prepareProof = evidence && gateRegistration && prepareTask
+        ? await loadPersistedScheduledPrepareProof(client as never, scope, prepareTask.id, prepareTask.result,
+          evidence.prepareWaitContinuationKey, gateRegistration.prepareWaitId) : null
+      probe.prepareProofPresent = Boolean(prepareProof)
+      const version = scheduledTaskGraphContinuationKeyVersion(registration.continuationKey)
+      const shape = loaded.snapshot && version && projectScheduledPipelineGraph(loaded.snapshot.nodes, version, "audit")
+      const preparePrefix = shape && loaded.snapshot && loaded.state ? { ...loaded,
+        snapshot: { ...loaded.snapshot, nodes: loaded.snapshot.nodes.slice(0, shape.scouts.length + 2) },
+        state: { ...loaded.state, nodes: loaded.state.nodes.slice(0, shape.scouts.length + 2) },
+      } : null
+      if (prepareProof && execution && preparePrefix) {
+        probe.preparePrefixValid = await verifyPersistedScheduledPreparePrefix(client as never, scope, preparePrefix, prepareProof,
+          execution.status === "completed" ? "audit_completed_report" : "gate")
+      }
+      probe.gateCurrentWithoutAttestation = Boolean(await verifyRegisteredScheduledAuditGate(client as never, scope, loaded, registration))
+      probe.gateCurrentWithAttestation = Boolean(await verifyRegisteredScheduledAuditGate(client as never, scope, loaded,
+        registration, undefined, fixture.attestation))
+      probe.invocationProofPresent = Boolean(await readScheduledAuditInvocationProof(client as never, {
+        scope, auditTaskId: lease.id, attemptCount: lease.attemptCount, attestation: fixture.attestation,
+      }))
+    }
+    probe.completed = true
+  } catch {
+    // The probe is diagnostic only and must never replace the real Audit execution failure.
+  } finally {
+    if (client) {
+      if (transactionOpen) await client.query("ROLLBACK").catch(() => undefined)
+      try { client.release() } catch { /* diagnostic cleanup only */ }
+    }
+  }
+  return probe
+}
+
+function startRunner(fixture: Fixture, fetcher: typeof fetch, beforeAuditExecutor?: BeforeAuditExecutor): Runner {
   const redis = new Redis(redisUrl!, { maxRetriesPerRequest: null, connectTimeout: 2_000, retryStrategy: attempt => attempt > 3 ? null : 100 })
   const queueName = `scheduled-audit-${randomUUID()}`
   const queue = new Queue<SubagentJobPayload>(queueName, { connection: redis.duplicate(), skipVersionCheck: true })
@@ -838,8 +913,15 @@ function startRunner(fixture: Fixture, fetcher: typeof fetch): Runner {
     loadInvocation: async () => ({ owner: fixture.owner, attestation: fixture.attestation, prepareProof: fixture.prepareProof,
       scheduledWaitId: fixture.prepareChoiceWaitId }), loadChoices: async () => ({ validatedChoice: null, priorChoices: [] }) })
   const audit = createScheduledAuditChildExecutor({ pool: pool as never, fetcher })
-  const execute: SubagentExecutor = input => input.lease.taskType === SCHEDULED_AUDIT_TASK_TYPE
-    ? audit({ lease: input.lease }) : gate({ lease: input.lease })
+  let beforeAuditExecuted = false
+  const execute: SubagentExecutor = async input => {
+    if (input.lease.taskType !== SCHEDULED_AUDIT_TASK_TYPE) return gate({ lease: input.lease })
+    if (beforeAuditExecutor && !beforeAuditExecuted) {
+      beforeAuditExecuted = true
+      try { await beforeAuditExecutor(input.lease) } catch { /* diagnostics must not alter the real executor outcome */ }
+    }
+    return audit({ lease: input.lease })
+  }
   const worker = new Worker<SubagentJobPayload, unknown>(queueName, async job => {
     const identity = parseSubagentDispatchJobId(job.id, job.data.taskId)
     if (!identity) throw new Error("scheduled Audit dispatch identity invalid")
