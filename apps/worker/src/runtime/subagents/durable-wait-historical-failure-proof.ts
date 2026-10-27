@@ -1,5 +1,6 @@
 import type pg from "pg"
 import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
+import { TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON } from "./task-graph-child-deadline.js"
 import { isTaskGraphOperationalNoResultEnvelope } from "./task-graph-pg-operational-failure-evidence.js"
 import { parseTaskGraphVerificationReport, taskGraphVerificationReportMatchesStatus, type TaskGraphVerificationReport } from "./task-graph-command-port.js"
 import type { GraphIdentityScope } from "./task-graph-pg-state.js"
@@ -11,7 +12,10 @@ type HistoricalFailureTask = Readonly<Record<string, unknown>>
 type Input = Readonly<{ scope: GraphIdentityScope; task: HistoricalFailureTask; archivedReport: unknown }>
 export type ConsumedTaskGraphFailureReport = Readonly<{ criterionIds: readonly string[]; report: TaskGraphVerificationReport }>
 
-const RESUME_REASONS = new Set(["child_resume_unavailable", "child_resume_evidence_unavailable"])
+// These reasons are only for re-reading a report already archived in a consumed wait.
+const HISTORICAL_FAILURE_REASONS = new Set([
+  "child_resume_unavailable", "child_resume_evidence_unavailable", TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON,
+])
 const EVENT_LIMIT = 2
 const MAX_SEQUENCE = 9_223_372_036_854_775_807n
 
@@ -80,7 +84,7 @@ function receiptMatches(row: Row, scope: GraphIdentityScope, taskId: string, att
   return report && archived && same(report, archived) ? { criterionIds, report } : null
 }
 
-/** Revalidates only the typed report in an already-consumed wait using its immutable failure receipt. */
+/** Revalidates only an already-consumed wait's typed failure report; this grants no replacement authority. */
 export async function readConsumedTaskGraphFailureReport(client: Client, input: Input): Promise<ConsumedTaskGraphFailureReport | null> {
   const { scope, task } = input
   const taskId = task.id, attemptCount = task.attemptCount, role = task.role
@@ -91,7 +95,7 @@ export async function readConsumedTaskGraphFailureReport(client: Client, input: 
     || typeof taskId !== "string" || taskId.trim() !== taskId || !taskId
     || task.status !== "failed" || typeof attemptCount !== "number" || !Number.isSafeInteger(attemptCount) || attemptCount < 1 || !rolePair
     || role !== "scout" && role !== "analyst"
-    || typeof task.failureReason !== "string" || !RESUME_REASONS.has(task.failureReason)
+    || typeof task.failureReason !== "string" || !HISTORICAL_FAILURE_REASONS.has(task.failureReason)
     || !isTaskGraphOperationalNoResultEnvelope(task.result) || !authoritativeReport) return null
 
   const rows = await client.query<Row>(`SELECT event."id", event."sessionId", event."turnId", event."itemId", event."taskId", event."sequence"::text AS "sequence",

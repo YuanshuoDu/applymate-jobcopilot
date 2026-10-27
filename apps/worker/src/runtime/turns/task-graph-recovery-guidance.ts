@@ -15,7 +15,7 @@ const MAX_DETAILS = 4
 const TASK_STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
 const READINESS = new Set(["ready", "waiting_for_dependencies", "blocked_dependency", "active", "terminal"])
 const ACTIVE_REPAIR = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user"])
-const EXECUTION_FAILURE_CATEGORIES = new Set(["execution_setup_unavailable", "resume_state_unavailable", "structured_output_invalid"])
+const EXECUTION_FAILURE_CATEGORIES = new Set(["execution_setup_unavailable", "resume_state_unavailable", "structured_output_invalid", "execution_deadline_exceeded"])
 
 type Row = Record<string, unknown>
 type CurrentGraph = Readonly<{ revision: number; nodes: readonly TaskGraphCurrentNode[]; mayPlan: boolean }>
@@ -97,7 +97,9 @@ function parseNode(value: unknown, rootTaskId: string): TaskGraphCurrentNode | u
     || Object.hasOwn(row, "native") || Object.hasOwn(row, "nativeResult")
     || (row.executionFailureCategory === "resume_state_unavailable"
       ? !Object.hasOwn(row, "verificationReport") || !canonicalResumeFailureReport(row.templateId, verification)
-      : Object.hasOwn(row, "verificationReport")))) return undefined
+      : row.executionFailureCategory === "execution_deadline_exceeded"
+        ? Object.hasOwn(row, "verificationReport") && verification.verificationReport?.status !== "unverified"
+        : Object.hasOwn(row, "verificationReport")))) return undefined
   return {
     key: row.key, taskId: row.taskId, templateId: row.templateId, goal: row.goal, successCriteria, dependsOn,
     status: row.status as TaskGraphCurrentNode["status"], readiness: row.readiness as TaskGraphCurrentNode["readiness"],

@@ -5,22 +5,21 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useApi } from '@/lib/hooks'
 import { useI18n } from '@/lib/i18n'
 
-import { flattenTaskTree, taskInterruptEventVersion, TaskInterruptControl, TaskTreePanel } from './TaskTreePanel'
-import { AgentTurnRetryControl } from './AgentTurnRetryControl'
+import { flattenTaskTree, TaskTreePanel } from './TaskTreePanel'
 import { CognitiveAgendaCard, type CognitiveAgendaTaskLabel } from './cognitive-agenda-card'
 import { AgentApprovalLedgerCard } from './AgentApprovalLedgerCard'
 import { AgentQuestionInputCard } from './AgentQuestionInputCard'
-import { projectSelectedTaskInterrupt, projectSupervisorTree, type SupervisorTaskSummary, type SupervisorTurnSummary } from './task-tree-projection'
+import { projectSupervisorTree, type SupervisorTurnSummary } from './task-tree-projection'
 import { AgentSupervisorPlanView, supervisorPlanSelectionControls } from './AgentSupervisorPlanView'
 import { buildTaskGraphTaskLookupUrl, selectedJobIdForTurn, selectedJobPreparationTurnId, selectedTaskGraphIdentity } from './task-graph-plan-query'
 import type { AgentTimelineSnapshot } from './use-agent-timeline'
-import { EvidenceSummary, statusLabel } from './agent-supervisor-evidence'
 import { SelectedJobPreparationCard } from './SelectedJobPreparationCard'
 import { SelectedJobDraftArtifact } from './SelectedJobDraftArtifact'
 import { latestWriterArtifact } from './draft-artifact-projection'
-import { ChildWorkerAttachView, type ChildWorkerTask } from './ChildWorkerAttachView'
+import type { ChildWorkerTask } from './ChildWorkerAttachView'
 import { includeCurrentQuestionTurn } from './question-turn-lookup'
 import type { TaskTreeNode } from './types'
+import { SelectedTaskDetailsPanel } from './SelectedTaskDetailsPanel'
 
 export { EvidenceSummary, projectSelectedEvidence } from './agent-supervisor-evidence'
 export type { SelectedEvidenceProjection } from './agent-supervisor-evidence'
@@ -142,8 +141,6 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
   }])), [tasks])
   const selectedNode = useMemo(() => flattenTaskTree(nodes).find(node => node.id === selectedId), [nodes, selectedId])
   const selectedWorker = selectedWorkerForNode(selectedNode, tasks)
-  const selectedTaskInterrupt = projectSelectedTaskInterrupt(tasks, turns, selectedNode, timeline.items)
-  const selectedTaskInterruptVersion = selectedTaskInterrupt ? taskInterruptEventVersion(timeline.items, selectedTaskInterrupt.task.id) : null
   const selectedTurn = useMemo(() => selectedNode?.kind === 'turn' && selectedNode.id.startsWith('turn:')
     ? turns.find(turn => `turn:${turn.id}` === selectedNode.id) ?? null
     : null, [selectedNode, turns])
@@ -218,21 +215,12 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
         {loadingMore ? t('agent.loadingMoreSupervisorRecords') : t('agent.loadMoreSupervisorRecords')}
       </button>}
       {loadMoreError && <p role="alert" style={{ ...messageStyle, color: 'var(--c-danger)' }}>{t('agent.loadMoreFailed')}</p>}
-      {selectedNode && (
-        <section className="agent-supervisor-selection" aria-label={selectedNode.label} data-agent-supervisor-selection="true">
-          <div style={{ display: 'grid', gap: 4 }}>
-            <strong style={{ fontSize: 12, overflowWrap: 'anywhere' }}>{selectedNode.label}</strong>
-            <span style={{ color: 'var(--text-muted)', fontSize: 10 }}>{t('agent.status')}: {statusLabel(selectedNode.status, t)}</span>
-            {selectedNode.detail && <span style={{ color: 'var(--c-danger)', fontSize: 10, overflowWrap: 'anywhere' }}>{selectedNode.detail}</span>}
-            {selectedNode.resultAvailable && <span style={{ color: 'var(--text-muted)', fontSize: 10 }}>{t('agent.toolResult')}</span>}
-          </div>
-          {selectedWorker?.parentTaskId && selectedWorker.id !== selectedWorker.rootTaskId
-            ? <ChildWorkerAttachView key={selectedWorker.id} sessionId={sessionId} task={selectedWorker} items={timeline.items} onClose={selectionControls.onReturnToCurrent} onConflict={refetchTasks} />
-            : selectedItem && <EvidenceSummary item={selectedItem} t={t} />}
-          <AgentTurnRetryControl sessionId={sessionId} turn={selectedTurn} onAccepted={refetchSupervisorRecords} />
-          {selectedTaskInterrupt && <TaskInterruptControl sessionId={sessionId} taskId={selectedTaskInterrupt.task.id} taskLabel={selectedNode.label} eligible={selectedTaskInterrupt.eligible} status={selectedTaskInterrupt.status} statusVersion={selectedTaskInterruptVersion} onAccepted={refetchSupervisorRecords} />}
-        </section>
-      )}
+      <SelectedTaskDetailsPanel
+        sessionId={sessionId} selectedNode={selectedNode} selectedWorker={selectedWorker} selectedTurn={selectedTurn}
+        selectedItem={selectedItem} tasks={tasks} turns={turns} items={timeline.items} treeNodes={nodes}
+        lifecycleRevision={timeline.lifecycleRevision} onSelectNode={selectionControls.onSelect}
+        onReturnToCurrent={selectionControls.onReturnToCurrent} onAccepted={refetchSupervisorRecords} onConflict={refetchTasks}
+      />
     </aside>
   )
 }

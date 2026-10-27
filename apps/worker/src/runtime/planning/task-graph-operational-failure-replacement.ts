@@ -6,6 +6,7 @@ import {
   validateTaskGraphVerificationDependencySelectors,
   type TaskGraphVerificationContract,
 } from "./task-graph-verification.js"
+import { remapTaskGraphVerificationCheckDependencies } from "./task-graph-verification-scout-union.js"
 import type { TaskGraphVerificationDependencyGraphNode } from "./task-graph-verification-cross-node.js"
 import { canonicalTaskGraphJson, parseTaskGraphSnapshot, type StoredTaskGraphNode, type TaskGraphSnapshot } from "../subagents/task-graph-snapshot.js"
 
@@ -124,12 +125,8 @@ export function parseTaskGraphOperationalFailureReplacement(
 function remapVerification(contract: TaskGraphVerificationContract, mapping: ReadonlyMap<string, string>): TaskGraphVerificationContract {
   return {
     ...contract,
-    criteria: contract.criteria.map(criterion => {
-      const check = criterion.check
-      if (check.kind !== "findings_from_scout_dependency" && check.kind !== "findings_cover_scout_candidates_gte") return criterion
-      const dependencyNodeKey = mapping.get(check.dependencyNodeKey) ?? check.dependencyNodeKey
-      return dependencyNodeKey === check.dependencyNodeKey ? criterion : { ...criterion, check: { ...check, dependencyNodeKey } }
-    }),
+    criteria: contract.criteria.map(criterion => ({ ...criterion,
+      check: remapTaskGraphVerificationCheckDependencies(criterion.check, mapping) })),
   }
 }
 function hasLegacyDependencyAncestor(nodes: readonly TaskGraphVerificationDependencyGraphNode[], roots: readonly string[]): boolean {

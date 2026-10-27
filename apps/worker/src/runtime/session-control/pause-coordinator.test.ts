@@ -6,19 +6,21 @@ vi.mock("../subagents/pg-store-expiry-recovery.js", () => ({ recoverExpired: exp
 
 import { reconcileSessionPause, resumeSession } from "./pause-coordinator.js"
 
-const input = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", now: new Date("2026-10-06T10:00:00.000Z") }
+const input = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", recoveryClaimToken: "recovery-claim-1", now: new Date("2026-10-06T10:00:00.000Z") }
 type Event = Record<string, unknown>
 const pauseEvent: Event = { id: "pause-event", sessionId: input.sessionId, turnId: input.turnId, sequence: 3, type: "session.pause_requested", actor: "user", taskId: null, itemId: null, correlationId: input.turnId, causationId: null, idempotencyKey: "agent-session-control:pause-1", payload: { turnId: input.turnId, expectedRevision: 4, requestedAt: "2026-10-06T09:59:00.000Z" } }
 const resumeEvent: Event = { id: "resume-event", sessionId: input.sessionId, turnId: input.turnId, sequence: 5, type: "session.resume_requested", actor: "user", taskId: null, itemId: null, correlationId: input.turnId, causationId: null, idempotencyKey: "agent-session-control:resume-1", payload: { turnId: input.turnId, expectedRevision: 6, requestedAt: "2026-10-06T10:00:00.000Z" } }
 
-function fixture(options: { sessionStatus?: string; turnStatus?: string; turnRevision?: number; rootTaskId?: string | null; waits?: Event[]; approvals?: Event[]; questions?: Event[]; steps?: Event[]; calls?: Event[]; tasks?: Event[]; turnLease?: Event; withResume?: boolean; existingDispatch?: boolean } = {}) {
+function fixture(options: { sessionStatus?: string; turnStatus?: string; turnRevision?: number; rootTaskId?: string | null; waits?: Event[]; approvals?: Event[]; questions?: Event[]; steps?: Event[]; calls?: Event[]; tasks?: Event[]; turnLease?: Event; withResume?: boolean; existingDispatch?: boolean; claimRowCounts?: number[] } = {}) {
   const calls: Array<{ sql: string; values?: readonly unknown[] }> = [], events = [pauseEvent, ...(options.withResume ? [resumeEvent] : [])], outboxes: Event[] = options.existingDispatch ? [{ topic: "agent.turn.dispatch", aggregateId: input.sessionId, idempotencyKey: `turn-dispatch:${input.turnId}`, payload: { turnId: input.turnId, sessionId: input.sessionId, ownerId: "stale" }, publishedAt: new Date() }] : []
   let sessionStatus = options.sessionStatus ?? (options.withResume ? "resuming" : "pausing"), turnStatus = options.turnStatus ?? "queued", revision = options.turnRevision ?? 6, eventSequence = 10
+  const claimRowCounts = [...(options.claimRowCounts ?? [])]
   const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
     calls.push({ sql, values })
     if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
     if (sql.includes('SELECT session."id", session."status"')) return { rows: [{ id: input.sessionId, status: sessionStatus }], rowCount: 1 }
     if (sql.includes('SELECT turn."id", turn."status", turn."revision"')) return { rows: [{ id: input.turnId, status: turnStatus, revision, rootTaskId: options.rootTaskId ?? null, leaseOwnerId: options.turnLease?.leaseOwnerId ?? null, leaseExpiresAt: options.turnLease?.leaseExpiresAt ?? null }], rowCount: 1 }
+    if (sql.includes('UPDATE "agent_sessions" SET "sessionControlRecoveryClaimExpiresAt"')) return { rows: [], rowCount: claimRowCounts.shift() ?? 1 }
     if (sql.includes("FROM \"agent_events\" AS pause")) return { rows: [pauseEvent], rowCount: 1 }
     if (sql.includes("FROM \"agent_events\" AS event") && sql.includes("session.resume_requested")) return { rows: options.withResume ? [resumeEvent] : [], rowCount: options.withResume ? 1 : 0 }
     if (sql.includes("FROM \"agent_events\" AS event") && sql.includes('"sequence" < $3')) return { rows: [pauseEvent], rowCount: 1 }
@@ -97,6 +99,53 @@ describe("session pause coordinator", () => {
     expect(fake.events.some(event => event.type === "session.paused" && event.actor === "orchestrator")).toBe(true)
     expect(fake.outboxes[0]).toMatchObject({ topic: "agent.session.event", payload: { taskId: null, type: "session.paused", actor: "orchestrator" } })
     expect(fake.getSessionStatus()).toBe("paused")
+  })
+
+  it("renews before pause preflight and revalidates after Session then Turn locks", async () => {
+    const fake = fixture()
+    await expect(reconcileSessionPause(fake.pool, input)).resolves.toMatchObject({ state: "paused" })
+    const claimIndexes = fake.client.query.mock.calls.flatMap(([sql], index) => sql.includes('UPDATE "agent_sessions" SET "sessionControlRecoveryClaimExpiresAt"') ? [index] : [])
+    const sessionLock = fake.client.query.mock.calls.findIndex(([sql]) => sql.includes('SELECT session."id", session."status"'))
+    const turnLock = fake.client.query.mock.calls.findIndex(([sql]) => sql.includes('SELECT turn."id", turn."status", turn."revision"'))
+    const waitLock = fake.client.query.mock.calls.findIndex(([sql]) => sql.includes('FROM "agent_wait_conditions"'))
+    expect(claimIndexes).toHaveLength(2)
+    expect(fake.client.query.mock.calls[claimIndexes[0]!]![1]).toEqual([input.sessionId, input.userId, input.recoveryClaimToken])
+    expect(fake.client.query.mock.calls[claimIndexes[1]!]![1]).toEqual([input.sessionId, input.userId, input.recoveryClaimToken])
+    expect(fake.client.query.mock.invocationCallOrder[claimIndexes[0]!]!).toBeLessThan(expiryRecovery.recoverExpired.mock.invocationCallOrder[0]!)
+    expect(sessionLock).toBeLessThan(claimIndexes[1]!)
+    expect(turnLock).toBeLessThan(claimIndexes[1]!)
+    expect(claimIndexes[1]).toBeLessThan(waitLock)
+  })
+
+  it("rejects a stale pause claim after child recovery without writing session status or events", async () => {
+    const fake = fixture({ claimRowCounts: [1, 0] })
+    await expect(reconcileSessionPause(fake.pool, input)).rejects.toThrow("session_control_recovery_claim_lost")
+    expect(expiryRecovery.recoverExpired).toHaveBeenCalledOnce()
+    const claimUpdates = fake.calls.filter(call => call.sql.includes('UPDATE "agent_sessions" SET "sessionControlRecoveryClaimExpiresAt"'))
+    expect(claimUpdates).toHaveLength(2)
+    expect(claimUpdates.every(call => call.sql.includes("clock_timestamp() + INTERVAL '2 minutes'") && call.sql.includes('"sessionControlRecoveryClaimExpiresAt" > clock_timestamp()'))).toBe(true)
+    expect(fake.getSessionStatus()).toBe("pausing")
+    expect(fake.events.some(event => event.type === "session.paused" || event.type === "session.pause_blocked")).toBe(false)
+    expect(fake.calls.some(call => call.sql.includes('INSERT INTO "agent_events"'))).toBe(false)
+    expect(fake.calls.some(call => call.sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
+    expect(fake.calls.some(call => call.sql.includes('UPDATE "agent_sessions" SET "status"'))).toBe(false)
+  })
+
+  it("rejects a stale resume claim under Session and Turn locks before any state or event write", async () => {
+    const fake = fixture({ sessionStatus: "resuming", withResume: true, claimRowCounts: [0] })
+    await expect(resumeSession(fake.pool, input)).rejects.toThrow("session_control_recovery_claim_lost")
+    const sessionLock = fake.client.query.mock.calls.findIndex(([sql]) => sql.includes('SELECT session."id", session."status"'))
+    const turnLock = fake.client.query.mock.calls.findIndex(([sql]) => sql.includes('SELECT turn."id", turn."status", turn."revision"'))
+    const claimValidation = fake.client.query.mock.calls.findIndex(([sql]) => sql.includes('UPDATE "agent_sessions" SET "sessionControlRecoveryClaimExpiresAt"'))
+    expect(sessionLock).toBeLessThan(turnLock)
+    expect(turnLock).toBeLessThan(claimValidation)
+    expect(fake.client.query.mock.calls[claimValidation]?.[1]).toEqual([input.sessionId, input.userId, input.recoveryClaimToken])
+    expect(fake.getSessionStatus()).toBe("resuming")
+    expect(fake.getTurnStatus()).toBe("queued")
+    expect(fake.events.some(event => event.type === "session.resumed")).toBe(false)
+    expect(fake.calls.some(call => call.sql.includes('INSERT INTO "agent_events"'))).toBe(false)
+    expect(fake.calls.some(call => call.sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
+    expect(fake.calls.some(call => call.sql.includes('UPDATE "agent_sessions" SET "status"'))).toBe(false)
   })
 
   it("stays pausing while a started call or live Turn lease remains", async () => {

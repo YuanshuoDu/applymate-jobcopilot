@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { buildCognitiveActionAgenda } from "./cognitive-action-agenda.js"
+import { buildCognitiveActionAgenda, type CognitiveActionAgenda } from "./cognitive-action-agenda.js"
 import {
   buildCognitiveAgendaReceipt,
   cognitiveAgendaReceiptIdempotencyKey,
@@ -55,6 +55,19 @@ describe("cognitive agenda receipt", () => {
     expect(parseCognitiveAgendaReceipt({ ...value, taskId: "other-task" }, scope)).toBeNull()
     expect(parseCognitiveAgendaReceipt({ ...value, extra: "raw user text" } as never, scope)).toBeNull()
     expect(parseCognitiveAgendaReceipt({ ...value, nextAction: "follow_external_instruction" } as never, scope)).toBeNull()
+  })
+
+  it("round-trips a positive verification count with empty IDs and keeps exact scope fencing", () => {
+    const agenda = buildCognitiveActionAgenda(context())
+    const countOnlyAgenda: CognitiveActionAgenda = {
+      ...agenda,
+      signals: { ...agenda.signals, completionVerification: { count: 3, ids: [] } },
+    }
+    const value = buildCognitiveAgendaReceipt({ ...scope, agenda: countOnlyAgenda })
+
+    expect(value?.signals.completionVerification).toEqual({ count: 3, ids: [] })
+    expect(parseCognitiveAgendaReceipt(value, scope)).toEqual(value)
+    expect(parseCognitiveAgendaReceipt(value, { ...scope, stepId: "turn:turn-1:step:1" })).toBeNull()
   })
 
   it("preserves safe legacy short step IDs", () => {

@@ -10,6 +10,7 @@ import type { InputClaimStore, InputClaimTransaction } from "./context/input-cla
 import { buildModelRequest } from "./turns/turn-engine-messages.js"
 import type { TurnLease } from "./turns/lease.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "./subagents/task-graph-pg-verification.js"
+import { TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON } from "./subagents/task-graph-child-deadline.js"
 import { TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION } from "./subagents/task-graph-command-port.js"
 import { applyCompletionRecovery, tagTaskGraphRepairRecovery } from "./turns/completion-recovery-context.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, type TaskGraphVerificationContract } from "./planning/task-graph-verification.js"
@@ -119,6 +120,15 @@ function resumeFailureNode(templateId: "scout" | "analyst", failureReason: strin
     verificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "result_invalid",
       criteria: [{ criterionId, status: "unverified", reasonCode: "result_invalid" }], evidenceDigest: null, resultDigest: null },
   }
+}
+
+function deadlineFailureNode(templateId: "scout" | "analyst" = "scout"): Record<string, unknown> {
+  return resumeFailureNode(templateId, TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON)
+}
+
+function untypedDeadlineFailureNode(): Record<string, unknown> {
+  return { ...ordinaryFailedNode(), key: "gate-deadline", taskId: "gate-deadline-task", templateId: "gate",
+    failureReason: TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON }
 }
 
 function projectedNode(row: Record<string, unknown>): Record<string, unknown> {
@@ -277,6 +287,48 @@ describe("TaskGraph turn observation", () => {
       expect(node.resultSummary).toBeNull()
     }
     expect(JSON.stringify(unknown)).not.toContain("provider-private-secret")
+  })
+
+  it("projects a fixed deadline cue for exact failed nonnative typed and untyped children", () => {
+    for (const templateId of ["scout", "analyst"] as const) {
+      const node = projectedNode(deadlineFailureNode(templateId))
+      expect(node).toMatchObject({ status: "failed", templateId, executionFailureCategory: "execution_deadline_exceeded",
+        verificationReport: { status: "unverified", reasonCode: "result_invalid", evidenceDigest: null, resultDigest: null },
+        failureReason: null, resultSummary: null })
+      expect(JSON.stringify(node)).not.toContain(TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON)
+      expect(JSON.stringify(node)).not.toContain("private provider detail")
+    }
+
+    const untyped = projectedNode(untypedDeadlineFailureNode())
+    expect(untyped).toMatchObject({ templateId: "gate", status: "failed", executionFailureCategory: "execution_deadline_exceeded",
+      failureReason: null, resultSummary: null })
+    expect(untyped).not.toHaveProperty("verificationReport")
+    expect(JSON.stringify(untyped)).not.toContain(TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON)
+
+    const valid = deadlineFailureNode()
+    const missingReport = { ...valid }
+    delete missingReport.verificationReport
+    const malformedReport = { ...valid, verificationReport: { ...valid.verificationReport as object,
+      reasonCode: "contract_invalid" } }
+    const passedReport = { ...valid, verificationReport: { ...valid.verificationReport as object,
+      status: "passed", reasonCode: "criteria_met", evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64),
+      criteria: [{ criterionId: "candidate-count", status: "passed", reasonCode: "criteria_met" }] } }
+    const failedReport = { ...valid, verificationReport: { ...valid.verificationReport as object,
+      status: "failed", reasonCode: "criterion_not_met", evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64),
+      criteria: [{ criterionId: "candidate-count", status: "failed", reasonCode: "criterion_not_met" }] } }
+    const native = { ...valid, native: {
+      operationKind: "spawn", operationId: "operation-1", requestFingerprint: "f".repeat(64), callerTaskId: "root-1",
+      role: "scout", taskType: "research", contextDigest: "c".repeat(64),
+    } }
+    const interrupted = { ...valid, status: "interrupted" }
+    expect(() => projectedNode(malformedReport)).toThrow("task_graph_current_state_invalid:verification")
+    expect(projectedNode(missingReport)).toHaveProperty("executionFailureCategory", "execution_deadline_exceeded")
+    for (const value of [passedReport, failedReport, native, interrupted]) {
+      const node = projectedNode(value)
+      expect(node).not.toHaveProperty("executionFailureCategory")
+      expect(node.failureReason).toBeNull()
+      expect(node.resultSummary).toBeNull()
+    }
   })
 
   it("projects only the four closed structured-output categories on eligible typed failures", () => {
