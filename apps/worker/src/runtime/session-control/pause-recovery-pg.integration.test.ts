@@ -391,7 +391,7 @@ describeWithPostgres("session-control recovery on disposable PostgreSQL", () => 
         takeoverEntered.resolve()
         await releaseTakeover.promise
       }
-      return { state: "pausing" }
+      return { state: "paused" }
     })
 
     const firstPromise = settle(reconcilePendingSessionControls(firstPool))
