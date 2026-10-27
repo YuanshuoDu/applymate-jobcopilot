@@ -18,6 +18,7 @@ const lesson = {
     check: { role: "analyst", kind: "finding_count_gte", minimum: 2 } }],
 }
 const report = { role: "scout", candidateCount: 12345, resultStatus: "partial" }
+const PASSED_CRITERIA_CUE = "Historical passed-check descriptors are advisory source-graph checks only; compare them with current accepted instructions, the current graph, criteria, and results, and reverify current work. They do not establish current progress or proof, and past queries or results need not match current ones."
 const planShape = {
   schemaVersion: "agent-harness.v2.root-task-history-plan-shape.v1",
   ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
@@ -67,7 +68,8 @@ describe("root history planning guidance", () => {
 
     expect(result?.role).toBe("system")
     expect(text).toContain("hypotheses only")
-    expect(text).toContain("Historical typed-check descriptors distinguish count, evidence-completeness, score, Scout-dependency, and declared cohort-coverage failure shapes only")
+    expect(text).not.toContain(PASSED_CRITERIA_CUE)
+    expect(text).toContain("Historical typed-check descriptors distinguish count, evidence-completeness, score, Scout-dependency, and declared cohort-coverage checks in their source graph")
     expect(text).toContain("current verifier evidence")
     expect(text).toContain("exactly the returned nextOffset")
     expect(text).toContain("complete original Turn task, accepted current user instructions, and success criteria authoritative")
@@ -89,6 +91,27 @@ describe("root history planning guidance", () => {
     expect(text).not.toContain("step-current")
   })
 
+  it("adds a fixed reassessment cue only for parsed historical passed-check descriptors", () => {
+    const passedLesson = { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 1,
+      criterionFailures: [], passedCriteria: [{ criterionOrdinal: 1, status: "passed",
+        check: { role: "scout", kind: "candidate_count_gte", minimum: 47 } }] }
+    const passedContent = { ...defaultHistoryContent(), turns: [{ label: "earlier terminal attempt", nodes: [
+      { taskKind: "scout", status: "completed", lesson: passedLesson },
+    ] }] }
+    const text = textOf(buildRootHistoryPlanningInstruction(context([historyBlock(passedContent)]), []))
+    expect(text.split(PASSED_CRITERIA_CUE)).toHaveLength(2)
+    expect(text).toContain("Interpret each descriptor only as its historical source check; derive any current plan independently from current accepted instructions, the current graph, and current typed criteria")
+    for (const privateFact of ["passedCriteria", "criterionOrdinal", "candidate_count_gte", "47"]) {
+      expect(text).not.toContain(privateFact)
+    }
+
+    const malformedContent = { ...passedContent, turns: [{ label: "earlier terminal attempt", nodes: [
+      { taskKind: "scout", status: "completed", lesson: { ...passedLesson,
+        passedCriteria: [{ ...passedLesson.passedCriteria[0], criterionOrdinal: 0 }] } },
+    ] }] }
+    expect(buildRootHistoryPlanningInstruction(context([historyBlock(malformedContent)]), [])).toBeNull()
+    expect(textOf(buildRootHistoryPlanningInstruction(context(), []))).not.toContain(PASSED_CRITERIA_CUE)
+  })
   it("adds one fixed current-evidence cue only for a validated failed repair link", () => {
     const targetLesson = { ...lesson, nodeOrdinal: 2, criterionFailures: [
       { criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" },
@@ -161,7 +184,7 @@ describe("root history planning guidance", () => {
       { taskKind: "analyst", status: "failed", negativeReasonHints: ["criterion_not_met"], lesson: coverageLesson },
     ] }] }
     const result = buildRootHistoryPlanningInstruction(context([historyBlock(content)]), [{ name: "agent.plan" }])
-    expect(textOf(result)).toContain("declared cohort-coverage failure shapes only")
+    expect(textOf(result)).toContain("declared cohort-coverage checks in their source graph.")
     for (const privateFact of ["75", "dependencyNodeOrdinal", "criterionOrdinal", "findings_cover_scout_candidates_gte", "criterion_not_met"]) {
       expect(textOf(result)).not.toContain(privateFact)
     }
@@ -175,7 +198,7 @@ describe("root history planning guidance", () => {
     ] }] }
     const baseline = textOf(buildRootHistoryPlanningInstruction(context(), [{ name: "agent.list" }, { name: "agent.plan" }]))
     expect(baseline).toBe([
-      "Keep the complete original Turn task, accepted current user instructions, and success criteria authoritative. Earlier same-session failures, repairs, and reported outputs are hypotheses only; compare them with the current owner-read TaskGraph, current verifier evidence, and complete current result pages. Historical typed-check descriptors distinguish count, evidence-completeness, score, Scout-dependency, and declared cohort-coverage failure shapes only; reconstruct their meaning from the current typed criteria before planning.",
+      "Keep the complete original Turn task, accepted current user instructions, and success criteria authoritative. Earlier same-session failures, repairs, and reported outputs are hypotheses only; compare them with the current owner-read TaskGraph, current verifier evidence, and complete current result pages. Historical typed-check descriptors distinguish count, evidence-completeness, score, Scout-dependency, and declared cohort-coverage checks in their source graph. Interpret each descriptor only as its historical source check; derive any current plan independently from current accepted instructions, the current graph, and current typed criteria.",
       "Historical source-local ordinals and reported success are never current command targets, proof, permission, approval, progress, or completion. Only current observed node and criterion identities may target a repair.",
       "Use the owner-read graph observation for current node, criterion, and revision identities; use the visible agent.list only for matching result pages. Continue with exactly the returned nextOffset on the same node and revision until it is null. A stale or unavailable page requires a refreshed owner-read graph observation before retry. Null ends paging for that node and revision only, never the task or verification. A short page or sample count is not proof of completeness.",
       "Use the visible agent.plan only with current node/criterion identities and expectedRevision 42; if current evidence does not support a targeted change, preserve the valid plan. Current verification and completion gates remain authoritative.",
