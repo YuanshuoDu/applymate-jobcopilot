@@ -323,6 +323,10 @@ function installRouteTransactionObserver(): () => void {
 }
 
 async function getTasks(sessionId: string, token?: string): Promise<Response> {
+  const tenantStore = await import("@/lib/db/tenant-store")
+  if (tenantStore.currentTenantUserId() !== null) {
+    throw new Error("A task-list request must start without an ambient tenant context")
+  }
   const { GET } = await import("./route")
   if ((globalThis as typeof globalThis & { prisma?: PrismaClient }).prisma !== routeBaseClient) {
     throw new Error("Task-list route did not reuse the observed Prisma singleton")
@@ -523,7 +527,6 @@ describeWithCandidateRls("authenticated task-list tenant RLS on disposable Postg
     const parallelObservations = routeTransactionObservations.slice(parallelStart)
     assertObservedRouteScope(ownerA, parallelObservations)
     assertObservedRouteScope(ownerB, parallelObservations)
-    expect(tenantStore.currentTenantUserId()).toBeNull()
 
     const foreignStart = routeTransactionObservations.length
     const foreignResponse = await runInIsolatedTenantContext(() => getTasks(ownerA.sessionId, tokenB))
@@ -556,6 +559,5 @@ describeWithCandidateRls("authenticated task-list tenant RLS on disposable Postg
     expect(noContext.userRows).toEqual([])
     expect(noContext.sessionRows).toEqual([])
     expect(noContext.taskRows).toEqual([])
-    expect(tenantStore.currentTenantUserId()).toBeNull()
   }, 30_000)
 })
