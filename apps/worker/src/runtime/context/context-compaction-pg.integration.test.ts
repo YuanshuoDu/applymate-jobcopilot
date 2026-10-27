@@ -94,7 +94,7 @@ function occurrenceCount(value: string, marker: string): number {
   return value.split(marker).length - 1
 }
 
-function testSnapshot(fixture: OwnerFixture, id: string, throughSequence: bigint, observation: string): AgentContextSnapshot {
+function testSnapshot(fixture: OwnerFixture, id: string, throughSequence: bigint, observation: string, version = 1): AgentContextSnapshot {
   const content: ContextSnapshotContent = {
     schemaVersion: CONTEXT_SNAPSHOT_SCHEMA_VERSION,
     ownerId: fixture.userId,
@@ -114,7 +114,7 @@ function testSnapshot(fixture: OwnerFixture, id: string, throughSequence: bigint
     context: { system: [], profile: [], steerHistory: [], toolObservations: [{ id: "persisted-summary", content: observation }] },
     tokenAccounting: { profiles: [], totalInputTokens: 0, totalOutputTokens: 0, totalCostUsd: 0 },
   }
-  const base = { sessionId: fixture.sessionId, throughSequence, version: 1, content }
+  const base = { sessionId: fixture.sessionId, throughSequence, version, content }
   return {
     id,
     ...base,
@@ -215,7 +215,7 @@ describeWithPostgres("PostgreSQL context compaction atomic publisher", () => {
       fixtures.push(latestFixture)
       const fallback = testSnapshot(latestFixture, `snapshot-fallback-${randomUUID()}`, 0n, "POSTGRES_FALLBACK_SUMMARY")
       await createPgContextSnapshotStore(pool!).save(fallback, latestFixture.scope)
-      const corruptOriginal = testSnapshot(latestFixture, `snapshot-corrupt-${randomUUID()}`, 1n, "ORIGINAL_SUMMARY")
+      const corruptOriginal = testSnapshot(latestFixture, `snapshot-corrupt-${randomUUID()}`, 1n, "ORIGINAL_SUMMARY", 2)
       const corruptContent: ContextSnapshotContent = {
         ...corruptOriginal.content,
         context: { ...corruptOriginal.content.context, toolObservations: [{ id: "persisted-summary", content: "CORRUPTED_SUMMARY api_key=sk-private-fixture" }] },
