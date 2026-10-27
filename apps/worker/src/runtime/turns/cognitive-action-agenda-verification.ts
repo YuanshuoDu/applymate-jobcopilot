@@ -114,6 +114,7 @@ export function countCurrentTypedVerificationCriteria(context: StepContext): num
     for (const node of nodes) {
       if (node.status !== "failed" || node.templateId !== "scout" && node.templateId !== "analyst"
         || node.native || node.nativeResult || !node.verification || !node.verificationReport) continue
+      if (node.readiness !== "terminal") return 0
       if (!taskGraphVerificationReportMatchesStatus(node.verificationReport, node.status)) return 0
       count += node.verificationReport.criteria.filter(item => item.status === "failed" || item.status === "unverified").length
     }

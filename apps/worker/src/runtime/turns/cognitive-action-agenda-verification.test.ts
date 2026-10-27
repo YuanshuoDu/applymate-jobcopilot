@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest"
 import { mergeTaskGraphCurrentObservation } from "../canonical-turn-task-graph-context.js"
 import type { StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import type { TaskGraphReadiness } from "../planning/task-graph.js"
 import type { TaskGraphCurrentNode, TaskGraphVerificationReport } from "../subagents/task-graph-command-port.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-verification-report.js"
 import { countCurrentTypedVerificationCriteria } from "./cognitive-action-agenda-verification.js"
@@ -27,6 +28,7 @@ function node(input: Readonly<{
   key: string
   mode?: ReportMode
   status?: TaskGraphCurrentNode["status"]
+  readiness?: TaskGraphReadiness
   templateId?: string
   ids?: readonly string[]
   goal?: string
@@ -39,7 +41,7 @@ function node(input: Readonly<{
   return {
     key: input.key, taskId: `${input.key}-task`, templateId: input.templateId ?? "scout",
     goal: input.goal ?? "PRIVATE_NODE_GOAL", successCriteria: input.successCriteria ?? ["PRIVATE_SUCCESS_CRITERION"], dependsOn: [],
-    status, readiness: status === "failed" || status === "completed" || status === "cancelled" ? "terminal" : "active",
+    status, readiness: input.readiness ?? (status === "failed" || status === "completed" || status === "cancelled" ? "terminal" : "active"),
     resultSummary: "PRIVATE_RESULT_SUMMARY", failureReason: "PRIVATE_FAILURE_REASON",
     ...(input.typed === false ? { verificationCriterionIds: [...ids] } : {
       verificationCriterionIds: [...ids],
@@ -110,6 +112,15 @@ describe("cognitive agenda current verification projection", () => {
     const mismatch = node({ key: "mismatch", mode: "passed" })
     expect(countCurrentTypedVerificationCriteria(context([mismatch]))).toBe(0)
   })
+
+  it.each(["active", "ready", "waiting_for_dependencies", "blocked_dependency"] as const)(
+    "fails closed when an eligible failed typed node has nonterminal readiness %s", readiness => {
+      expect(countCurrentTypedVerificationCriteria(context([
+        node({ key: "valid-before-malformed", mode: "failed" }),
+        node({ key: "readiness-mismatch", mode: "failed", readiness }),
+      ]))).toBe(0)
+    },
+  )
 
   it("requires the unique exact current block and matching StepContext revision", () => {
     const valid = context([node({ key: "current", mode: "failed" })])
