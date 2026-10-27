@@ -5,6 +5,7 @@ import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-v
 import type { TaskGraphVerificationContract } from "../planning/task-graph-verification.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "./task-graph-verification-report.js"
 import { readConsumedTaskGraphFailureReport } from "./durable-wait-historical-failure-proof.js"
+import { TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON } from "./task-graph-child-deadline.js"
 import { taskGraphItemId, taskGraphLifecycleKey, TASK_GRAPH_SNAPSHOT_VERSION, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import type { GraphIdentityScope } from "./task-graph-pg-state.js"
 
@@ -70,6 +71,35 @@ describe("readConsumedTaskGraphFailureReport", () => {
     const reportOnly = fixture(), explicitNull = fixture({ role: "analyst", result: { workerResult: null, taskGraphVerificationReport: report("finding-count") } })
     await expect(readConsumedTaskGraphFailureReport(reportOnly.client, { scope, task: reportOnly.task, archivedReport: reportOnly.taskReport })).resolves.toMatchObject({ criterionIds: ["candidate-count"] })
     await expect(readConsumedTaskGraphFailureReport(explicitNull.client, { scope, task: explicitNull.task, archivedReport: explicitNull.taskReport })).resolves.toMatchObject({ criterionIds: ["finding-count"] })
+  })
+
+  it("reads back a typed deadline failure from a consumed wait without granting replacement authority", async () => {
+    const deadlineReport = report("candidate-count"), f = fixture({ reason: TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON,
+      report: deadlineReport, result: { workerResult: null, taskGraphVerificationReport: deadlineReport } })
+    await expect(readConsumedTaskGraphFailureReport(f.client, { scope, task: f.task, archivedReport: f.taskReport }))
+      .resolves.toEqual({ criterionIds: ["candidate-count"], report: deadlineReport })
+    expect(f.query).toHaveBeenCalledTimes(1)
+  })
+
+  it("rejects an unknown failure reason and extant misbound deadline receipt", async () => {
+    const deadlineReport = report("candidate-count"), unknown = fixture({ reason: "task_graph_child_deadline_other",
+      report: deadlineReport, result: { workerResult: null, taskGraphVerificationReport: deadlineReport } })
+    await expect(readConsumedTaskGraphFailureReport(unknown.client, { scope, task: unknown.task, archivedReport: unknown.taskReport }))
+      .resolves.toBeNull()
+    expect(unknown.query).not.toHaveBeenCalled()
+
+    const deadline = fixture({ reason: TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON,
+      report: deadlineReport, result: { workerResult: null, taskGraphVerificationReport: deadlineReport } })
+    const payload = { ...deadline.event.payload as Row,
+      event: { ...((deadline.event.payload as Row).event as Row), failureReason: "child_resume_unavailable" } }
+    const wrongReasonEvent = { ...deadline.event, payload,
+      outboxPayload: { ...(deadline.event.outboxPayload as Row), payload } }
+    await expect(readConsumedTaskGraphFailureReport(withRows([wrongReasonEvent]).client,
+      { scope, task: deadline.task, archivedReport: deadline.taskReport })).resolves.toBeNull()
+    const misboundTaskEvent = { ...deadline.event, taskId: "foreign-task",
+      outboxPayload: { ...(deadline.event.outboxPayload as Row), taskId: "foreign-task" } }
+    await expect(readConsumedTaskGraphFailureReport(withRows([misboundTaskEvent]).client,
+      { scope, task: deadline.task, archivedReport: deadline.taskReport })).resolves.toBeNull()
   })
 
   it("selects the current-attempt receipt when an earlier failed attempt is also present", async () => {

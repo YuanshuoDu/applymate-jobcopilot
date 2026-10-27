@@ -7220,6 +7220,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   const resumeFailureOwner = fixture()
   const failureOwner = fixture()
   const operationalFailureOwner = fixture()
+  const operationalDeadlineOwner = fixture()
   const operationalAppendOwner = fixture()
   const stopOwner = fixture()
   const restartOwner = fixture()
@@ -7268,6 +7269,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await seed(pool, resumeFailureOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
     await seed(pool, failureOwner, "waiting_for_user")
     await seed(pool, operationalFailureOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
+    await seed(pool, operationalDeadlineOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
     await seed(pool, operationalAppendOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
     await seed(pool, stopOwner, "waiting_for_user")
     await seed(pool, restartOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
@@ -7311,7 +7313,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         cleanupFailures.push("bootstrap close: " + (error instanceof Error ? error.stack ?? error.message : String(error)))
       }
     }
-    const fixtureOwners = [owner, resumeFailureOwner, failureOwner, operationalFailureOwner, operationalAppendOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner,
+    const fixtureOwners = [owner, resumeFailureOwner, failureOwner, operationalFailureOwner, operationalDeadlineOwner, operationalAppendOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner,
       discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, lateRepairOwner, leaseRecoveryOwner,
       coverageRepairOwner, scoutUnionOwner, rootRecoveryScanOwner, archivedWaitOwner]
     const allFixtureWorkersExited = [...fixtureProcessChildren].every(processFixtureExited)
@@ -9947,7 +9949,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(descendantDispatch.rowCount).toBe(0)
   }, 90_000)
 
-  it.each(["unrelated completion", "independent append"] as const)(
+  it.each(["unrelated completion", "independent append", "deadline expiry"] as const)(
     "replans an operational Scout failure after an %s changes the observed graph",
     async interleaving => {
     const [{ createProductionWorkerBootstrap }, { createTurnQueue, enqueueTurn, TURN_QUEUE_NAME },
@@ -9956,9 +9958,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       import("../../queue/subagent-queue.js"), import("../canonical-turn-runtime.js"),
       import("./pg-task-graph-command-port.js"),
     ])
-    const value = interleaving === "independent append" ? operationalAppendOwner : operationalFailureOwner
+    const deadlineExpiry = interleaving === "deadline expiry"
+    const value = interleaving === "independent append" ? operationalAppendOwner
+      : deadlineExpiry ? operationalDeadlineOwner : operationalFailureOwner
     const appendIndependent = interleaving === "independent append"
     const initialIndependent = !appendIndependent
+    const expectedFailureReason = deadlineExpiry ? "task_graph_child_deadline_exceeded" : "child_resume_unavailable"
+    const expectedFailureCategory = deadlineExpiry ? "execution_deadline_exceeded" : "resume_state_unavailable"
     const sourceGoal = `Recover Scout after its persisted execution state is unavailable ${value.suffix}`
     const dependentGoal = `Keep the Analyst behind the failed Scout ${value.suffix}`
     const independentGoal = `Complete unrelated Analyst work after the Scout failure ${value.suffix}`
@@ -10003,6 +10009,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let replacementPlanResultDiagnostic = "not_observed"
     let replacementPlanCommandDiagnostic = "not_called"
     let canonicalExecutionDiagnostic = "not_observed"
+    let modelCallbackStageDiagnostic = "not_entered"
+    let modelCallbackStatusDiagnostic = "not_observed"
+    let modelCallbackFailureDiagnostic = "none"
     let finalGraphVerified = false
     let replacementWaitResumePath: "same_adapter" | "fresh_adapter" | null = null
     const flags: ProductionAgentFlags = {
@@ -10019,6 +10028,14 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const appendWithReconciliation = commandPort.appendAndScheduleWithReconciliation
     if (typeof appendWithReconciliation !== "function") throw new Error("Operational failure fixture requires reconciliation planning")
     const safeLabel = (value: unknown): string => typeof value === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(value) ? value : "unknown"
+    const safeModelFailure = (error: unknown): string => {
+      const className = error instanceof Error && ["AssertionError", "Error", "TypeError", "RangeError"].includes(error.name)
+        ? error.name : "OtherError"
+      const frame = error instanceof Error ? error.stack?.split(/\r?\n/).map(line =>
+        /task-graph-resume-pg\.integration\.test\.(?:ts|js):(\d+):(\d+)/.exec(line),
+      ).find(Boolean) : undefined
+      return `${className}@${frame?.[1] ?? "frame_unavailable"}:${frame?.[2] ?? "0"}`
+    }
     const safeOperationalStackSites = (stack: unknown): string => {
       if (typeof stack !== "string") return "none"
       const allowed = new Set([
@@ -10078,7 +10095,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         || row.itemId !== taskGraphItemId(rootTaskId) || row.correlationId !== value.turnId
         || row.idempotencyKey !== failureKey || envelope?.kind !== "lifecycle"
         || lifecycle?.type !== "task.failed" || lifecycle.nodeKey !== "scout"
-        || lifecycle.failureReason !== "child_resume_unavailable" || row.outboxTopic !== "agent.session.event"
+        || lifecycle.failureReason !== expectedFailureReason || row.outboxTopic !== "agent.session.event"
         || row.outboxAggregateId !== value.sessionId || row.outboxIdempotencyKey !== `agent-event:${row.id}`
         ) {
         throw new Error("Operational failure fixture did not find the exact current-attempt system task.failed event/outbox")
@@ -10141,7 +10158,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         const adapter: ModelAdapter = {
           id: "p3-operational-failure-replan-root-fixture", profile,
           async *stream(request) {
+            try {
             round += 1
+            modelCallbackStageDiagnostic = `execution_${execution}_round_${round}`
             if (execution === 1 && round === 1) {
               yield { type: "tool_call_completed", callId: planCallId, name: "agent.plan", arguments: {
                 expectedRevision: 0,
@@ -10172,14 +10191,25 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               return
             }
             if (execution === 2 && round === 1) {
+              modelCallbackStageDiagnostic = "failure_context_graph"
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+              modelCallbackStatusDiagnostic = nodes.map(node => safeLabel(node?.status)).join(",")
               expect(nodes.slice(0, 2).map(node => [node?.key, node?.status])).toEqual([["scout", "failed"], ["analyst", "cancelled"]])
               expect(nodes.map(node => node?.key)).toEqual(initialIndependent ? ["scout", "analyst", "independent"] : ["scout", "analyst"])
-              expect(nodes.find(node => node?.key === "scout")?.executionFailureCategory).toBe("resume_state_unavailable")
+              modelCallbackStageDiagnostic = "failure_context_graph_ok"
+              expect(nodes.find(node => node?.key === "scout")?.executionFailureCategory).toBe(expectedFailureCategory)
+              modelCallbackStageDiagnostic = "failure_context_category_ok"
               const planTool = request.tools.map(record).find(tool => tool?.name === "agent.plan")
               const planProperties = record(record(planTool?.inputSchema)?.properties)
               expect(planProperties).toHaveProperty("replaceOperationalFailure")
+              if (deadlineExpiry) {
+                expect(planTool?.description).toContain("For a server-reported execution_deadline_exceeded cue for an eligible started typed Scout or Analyst, you may make the same explicit replaceOperationalFailure proposal")
+                expect(planTool?.description).toContain("The cue is advisory only and grants no authority")
+                expect(planTool?.description).toContain("the server independently verifies the current owner, attempt, lifecycle, durable receipt, persisted deadline, and budget before accepting it")
+                expect(planTool?.description).toContain("The cue itself is not proof")
+                expect(planTool?.description).toContain("Never supply a failure reason, status, or proof")
+              }
               const outcome = repairWaitOutcomeFromRequest(request, initialWaitCallId, initialTaskIds)
               expect(outcome.status).toBe("ready")
               const waitTasks = new Map<string, unknown>()
@@ -10189,12 +10219,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               }
               expect(waitTasks.get(initialTaskIds[0]!)).toBe("failed")
               expect(waitTasks.get(initialTaskIds[1]!)).toBe("cancelled")
+              modelCallbackStageDiagnostic = "failure_context_wait_outcome_ok"
               const source = await pool!.query<{ status: string; failureReason: string | null; result: unknown }>(
                 `SELECT "status", "failureReason", "result" FROM "sub_agent_tasks"
                  WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4 AND "parentTaskId" = $4`,
                 [initialTaskIds[0], value.sessionId, value.turnId, rootTaskId],
               )
-              expect(source.rows[0]).toMatchObject({ status: "failed", failureReason: "child_resume_unavailable" })
+              expect(source.rows[0]).toMatchObject({ status: "failed", failureReason: expectedFailureReason })
               const failureReceipt = await readExactFailureReceipt()
               if (!failureReceipt) throw new Error("Root observed the failed child before its exact event/outbox receipt was persisted")
               failedEventId = failureReceipt.id
@@ -10205,9 +10236,13 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               }
               failedEventRevision = failureRevision
               const sourceResult = record(source.rows[0]?.result)
-              expect(Object.keys(sourceResult ?? {}).sort()).toEqual(["taskGraphVerificationReport"])
-              expect(Object.hasOwn(sourceResult ?? {}, "workerResult")).toBe(false)
+              expect(Object.keys(sourceResult ?? {}).sort()).toEqual(
+                ["taskGraphVerificationReport", ...(deadlineExpiry ? ["workerResult"] : [])].sort(),
+              )
+              if (deadlineExpiry) expect(sourceResult?.workerResult).toBeNull()
+              else expect(Object.hasOwn(sourceResult ?? {}, "workerResult")).toBe(false)
               expectUnverifiedVerificationReport(sourceResult?.taskGraphVerificationReport, "candidate-count")
+              modelCallbackStageDiagnostic = "failure_context_source_proof_ok"
               originalOperationalFailureResult = source.rows[0]?.result
               originalFailureEnvelopeObserved = true
               const descendant = await pool!.query<{ status: string; failureReason: string | null; result: unknown }>(
@@ -10239,6 +10274,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               }
               expect(persistedTaskStatuses.get(initialTaskIds[0]!)).toBe("failed")
               expect(persistedTaskStatuses.get(initialTaskIds[1]!)).toBe("cancelled")
+              modelCallbackStageDiagnostic = "failure_context_persisted_wait_ok"
               consumedFailureWaitObserved = true
               consumedFailureWaitSnapshot = JSON.stringify({
                 id: waitRow.rows[0]?.id,
@@ -10251,8 +10287,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 consumedAt: waitRow.rows[0]?.consumedAt?.toISOString() ?? null,
               })
               if (initialIndependent) {
+                modelCallbackStageDiagnostic = "failure_context_release_independent"
                 releaseIndependentCompletion()
                 await waitForTaskStatus(independentTaskId, "completed")
+                modelCallbackStageDiagnostic = "failure_context_independent_completed"
               }
               expect(request.tools.map(tool => record(tool)?.name)).toContain("agent.wait")
               if (appendIndependent) {
@@ -10322,12 +10360,15 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               return
             }
             if (execution === 2 && round === inlineWaitObserveRound) {
+              modelCallbackStageDiagnostic = "inline_wait_graph"
               const graph = currentGraphFromRequest(request)
               const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+              modelCallbackStatusDiagnostic = nodes.map(node => safeLabel(node?.status)).join(",")
               expect(nodes.map(node => [node?.key, node?.status])).toEqual([
                 ["scout", "failed"], ["analyst", "cancelled"], ["independent", "completed"],
               ])
-              expect(nodes.find(node => node?.key === "scout")?.executionFailureCategory).toBe("resume_state_unavailable")
+              modelCallbackStageDiagnostic = "inline_wait_graph_ok"
+              expect(nodes.find(node => node?.key === "scout")?.executionFailureCategory).toBe(expectedFailureCategory)
               const inlineOutcome = repairWaitOutcomeFromRequest(request, inlineWaitCallId, initialTaskIds)
               expect(inlineOutcome.status).toBe("ready")
               const inlineTaskStatuses = new Map<string, unknown>()
@@ -10460,6 +10501,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               return
             }
             throw new Error(`Unexpected operational failure Root execution ${execution}/${round}`)
+            } catch (error) {
+              if (modelCallbackFailureDiagnostic === "none") modelCallbackFailureDiagnostic = safeModelFailure(error)
+              throw error
+            }
           },
         }
         return { adapter, registry: {} as never, candidates: [] }
@@ -10492,6 +10537,21 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           }
           if (lease.goal === sourceGoal) {
             expect(lease.role).toBe("scout")
+            if (deadlineExpiry) {
+              const expired = await pool!.query(`UPDATE "sub_agent_tasks" SET "absoluteDeadlineAt" = clock_timestamp() - INTERVAL '1 second'
+                WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4 AND "parentTaskId" = $4
+                  AND "status" = 'running' AND "attemptCount" = $5 AND "leaseOwner" = $6 AND "absoluteDeadlineAt" IS NOT NULL`,
+              [lease.id, value.sessionId, value.turnId, rootTaskId, lease.attemptCount, lease.leaseOwner])
+              expect(expired.rowCount).toBe(1)
+              const { recoverExpiredTaskGraphChildren } = await import("./pg-store-task-graph-deadline-recovery.js")
+              const recovered = await recoverExpiredTaskGraphChildren(pool!, 1)
+              const current = await pool!.query<{ status: string; failureReason: string | null }>(
+                `SELECT "status", "failureReason" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`,
+                [lease.id, value.sessionId, value.turnId])
+              expect(current.rows[0]).toMatchObject({ status: "failed", failureReason: expectedFailureReason })
+              expect(recovered.length === 0 || recovered.some(task => task.id === lease.id)).toBe(true)
+              return { status: "completed", result: structuredChildResult("scout", sourceGoal) }
+            }
             return { status: "failed", failureReason: "child_resume_unavailable", retryDisposition: "terminal" }
           }
           if (lease.goal === dependentGoal) throw new Error("The waiting Analyst descendant was dispatched before source failure")
@@ -10516,7 +10576,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       await waitForTurnStatus(pool!, value.turnId, "completed", 90_000, replacementWaitCallId)
     } catch (error) {
       const reason = error instanceof Error ? error.message : "Turn status wait failed"
-      throw new Error(reason + "; replacementPlanCommand=" + replacementPlanCommandDiagnostic + "; replacementPlanResult=" + replacementPlanResultDiagnostic + "; canonicalExecution=" + canonicalExecutionDiagnostic + "; rootExecutions=" + rootExecutions)
+      throw new Error(reason + "; replacementPlanCommand=" + replacementPlanCommandDiagnostic + "; replacementPlanResult=" + replacementPlanResultDiagnostic + "; canonicalExecution=" + canonicalExecutionDiagnostic + "; rootExecutions=" + rootExecutions + "; modelCallbackStage=" + modelCallbackStageDiagnostic + "; modelCallbackStatuses=" + modelCallbackStatusDiagnostic + "; modelCallbackFailure=" + modelCallbackFailureDiagnostic)
     }
     const turn = await pool!.query<{ rootTaskId: string | null; finalResponse: string | null; status: string }>(
       `SELECT "rootTaskId", "finalResponse", "status" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`,
@@ -10539,8 +10599,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(inlineFailureWaitObserved).toBe(true)
     expect(replacementPlanAccepted).toBe(true)
     expect(finalGraphVerified).toBe(true)
-    const tasks = await pool!.query<{ id: string; goal: string; status: string; failureReason: string | null; result: unknown }>(
-      `SELECT task."id", task."goal", task."status", task."failureReason", task."result"
+    const tasks = await pool!.query<{ id: string; goal: string; status: string; failureReason: string | null; result: unknown; absoluteDeadlineAt: Date | null }>(
+      `SELECT task."id", task."goal", task."status", task."failureReason", task."result", task."absoluteDeadlineAt"
        FROM "sub_agent_tasks" AS task
        JOIN "agent_sessions" AS session ON session."id" = task."sessionId" AND session."userId" = $1
        JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
@@ -10551,7 +10611,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(tasks.rows).toHaveLength(5)
     const byGoal = new Map(tasks.rows.map(task => [task.goal, task] as const))
     const failedSource = byGoal.get(sourceGoal)
-    expect(failedSource).toMatchObject({ id: initialTaskIds[0], status: "failed", failureReason: "child_resume_unavailable" })
+    expect(failedSource).toMatchObject({ id: initialTaskIds[0], status: "failed", failureReason: expectedFailureReason })
     expect(originalFailureEnvelopeObserved).toBe(true)
     expect(failedSource?.result).toEqual(originalOperationalFailureResult)
     expectUnverifiedVerificationReport(record(failedSource?.result)?.taskGraphVerificationReport, "candidate-count")
@@ -10559,8 +10619,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     expect(byGoal.get(independentGoal)).toMatchObject({ id: independentTaskId, status: "completed", failureReason: null })
     expectPassedVerificationReport(record(byGoal.get(independentGoal)?.result)?.taskGraphVerificationReport, "finding-count")
     expect(byGoal.get(replacementScoutGoal)).toMatchObject({ id: replacementTaskIds[0], status: "completed", failureReason: null })
+    expect(byGoal.get(replacementScoutGoal)?.absoluteDeadlineAt).toBeInstanceOf(Date)
+    expect(byGoal.get(replacementScoutGoal)!.absoluteDeadlineAt!.getTime()).toBeGreaterThan(Date.now())
     expectPassedVerificationReport(record(byGoal.get(replacementScoutGoal)?.result)?.taskGraphVerificationReport, "candidate-count")
     expect(byGoal.get(replacementAnalystGoal)).toMatchObject({ id: replacementTaskIds[1], status: "completed", failureReason: null })
+    expect(byGoal.get(replacementAnalystGoal)?.absoluteDeadlineAt).toBeInstanceOf(Date)
+    expect(byGoal.get(replacementAnalystGoal)!.absoluteDeadlineAt!.getTime()).toBeGreaterThan(Date.now())
     expectPassedVerificationReport(record(byGoal.get(replacementAnalystGoal)?.result)?.taskGraphVerificationReport, "finding-count")
     const waits = await pool!.query<{ id: string; idempotencyKey: string; status: string; targetTaskIds: string[]; matchedTaskIds: string[];
       suspendedAt: Date | null; resolvedAt: Date | null; consumedAt: Date | null; result: unknown }>(
@@ -10699,7 +10763,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       [value.sessionId, value.turnId, taskGraphItemId(rootTaskId!)],
     )
     expect(graphEvents.rows.some(event => event.idempotencyKey === taskGraphLifecycleKey(rootTaskId!, "scout", 1, "task.failed")
-      && record(record(event.payload)?.event)?.failureReason === "child_resume_unavailable")).toBe(true)
+      && record(record(event.payload)?.event)?.failureReason === expectedFailureReason)).toBe(true)
     expect(graphEvents.rows.some(event => event.idempotencyKey === taskGraphLifecycleKey(rootTaskId!, "analyst", 0, "task.cancelled"))).toBe(true)
   }, 120_000)
 

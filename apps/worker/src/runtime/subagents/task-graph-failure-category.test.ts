@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest"
 
+import { TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON } from "./task-graph-child-deadline.js"
 import { classifyCurrentTaskGraphExecutionFailure } from "./task-graph-failure-category.js"
 
 const eligible = { hasVerifiedReport: false, isNative: false } as const
 
 describe("current TaskGraph execution failure categories", () => {
-  it("maps only the nine exact ordinary-child literals into three coarse categories", () => {
+  it("maps exact ordinary-child literals into four coarse categories", () => {
     const setup = [
       "child_turn_missing",
       "subagent_role_unknown",
@@ -24,13 +25,15 @@ describe("current TaskGraph execution failure categories", () => {
     }
     expect(classifyCurrentTaskGraphExecutionFailure({ status: "failed", failureReason: "invalid_structured_result" }, eligible))
       .toBe("structured_output_invalid")
+    expect(classifyCurrentTaskGraphExecutionFailure({ status: "failed", failureReason: TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON }, eligible))
+      .toBe("execution_deadline_exceeded")
   })
 
   it("omits categories for free text, near matches, other statuses and verifier/native cases", () => {
     for (const failureReason of [
       "provider_timeout", "Task setup unavailable", " selected_job_context_unavailable", "selected_job_context_unavailable:private",
       "native_verification_packet_invalid", "task_graph_verification_failed", "task_graph_verification_unverified",
-      "child_resume_wait_step_lineage", "",
+      "child_resume_wait_step_lineage", "task_graph_child_deadline_exceeded:late", "",
     ]) {
       expect(classifyCurrentTaskGraphExecutionFailure({ status: "failed", failureReason }, eligible)).toBeUndefined()
     }
@@ -42,6 +45,16 @@ describe("current TaskGraph execution failure categories", () => {
     }
     expect(classifyCurrentTaskGraphExecutionFailure({ status: "failed", failureReason: "invalid_structured_result" }, { ...eligible, hasVerifiedReport: true })).toBeUndefined()
     expect(classifyCurrentTaskGraphExecutionFailure({ status: "failed", failureReason: "invalid_structured_result" }, { ...eligible, isNative: true })).toBeUndefined()
+  })
+
+  it("uses the existing failed, verified-report, and native exclusions for deadline cues", () => {
+    const failure = { status: "failed", failureReason: TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON }
+    expect(classifyCurrentTaskGraphExecutionFailure(failure, eligible)).toBe("execution_deadline_exceeded")
+    expect(classifyCurrentTaskGraphExecutionFailure(failure, { ...eligible, hasVerifiedReport: true })).toBeUndefined()
+    expect(classifyCurrentTaskGraphExecutionFailure(failure, { ...eligible, isNative: true })).toBeUndefined()
+    expect(classifyCurrentTaskGraphExecutionFailure({ ...failure, status: "interrupted" }, {
+      ...eligible,
+    })).toBeUndefined()
   })
 
   it("requires own plain data status/reason and boolean eligibility without invoking getters", () => {
