@@ -675,7 +675,9 @@ async function prepareTypedSupersession(pool: PgPool, commandPool: PgPool, roleN
   await seed(pool, value, rootSuccessCriteria ? { goal: "Find roles", successCriteria: [] } : undefined)
   if (rootSuccessCriteria) await pool.query(`UPDATE "sub_agent_tasks" SET "goal" = 'Find roles' WHERE "id" = $1`, [value.rootTaskId])
   const analystTemplate = TASK_GRAPH_TEMPLATES.analyst
-  const rootActions = ["agent.plan", ...analystTemplate.allowedActions]
+  const rootActions = options.initialScheduledScoutCount !== undefined
+    ? Array.from(new Set(["agent.plan", ...analystTemplate.allowedActions, ...TASK_GRAPH_TEMPLATES.scout.allowedActions]))
+    : ["agent.plan", ...analystTemplate.allowedActions]
   await pool.query(`UPDATE "sub_agent_tasks" SET "allowedActions" = $2::jsonb WHERE "id" = $1`, [value.rootTaskId, JSON.stringify(rootActions)])
 
   const originalSequence = await nextEventSequence(pool, value)
