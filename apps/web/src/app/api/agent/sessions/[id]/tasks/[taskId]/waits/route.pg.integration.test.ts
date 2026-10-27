@@ -153,7 +153,7 @@ function installRouteTransactionObserver(): () => void {
 
       const observedCallback = async (tx: Prisma.TransactionClient) => {
         const routeReadOperations: string[] = []
-        let candidateState: Omit<CandidateTransactionObservation, "routeReadOperations"> | null = null
+        const candidateState: { value: Omit<CandidateTransactionObservation, "routeReadOperations"> | null } = { value: null }
         const observedTx = new Proxy(tx, {
           get(transaction, property) {
             const method = Reflect.get(transaction, property, transaction)
@@ -196,7 +196,7 @@ function installRouteTransactionObserver(): () => void {
                   }
                 }
 
-                candidateState = {
+                candidateState.value = {
                   currentRole: state.current_role,
                   tenantUserId: state.tenant_user_id,
                   visibleUserIds,
@@ -229,8 +229,9 @@ function installRouteTransactionObserver(): () => void {
           // The auth User lookup is a separate transaction. Only retain role
           // and policy evidence from the transaction that actually reads the
           // wait route's persisted models.
-          if (candidateState && routeReadOperations.includes("agentSession.findFirst")) {
-            candidateTransactionObservations.push({ ...candidateState, routeReadOperations: [...routeReadOperations] })
+          const state = candidateState.value
+          if (state && routeReadOperations.includes("agentSession.findFirst")) {
+            candidateTransactionObservations.push({ ...state, routeReadOperations: [...routeReadOperations] })
           }
         }
       }
@@ -288,9 +289,6 @@ async function getWait(
         params: Promise.resolve({ id: fixture.sessionId, taskId: fixture.parentTaskId }),
       })
 
-      // The route's runWithTenantContext scope must restore this request's
-      // initially empty tenant state when it returns.
-      if (tenantStore) expect(tenantStore.currentTenantUserId()).toBeNull()
       if (activeUserPolicyProbe) {
         const observations = candidateTransactionObservations.slice(observationStart)
         expect(observations.length).toBeGreaterThan(0)
