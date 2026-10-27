@@ -1,8 +1,9 @@
-import { Buffer } from 'node:buffer'
 import { Prisma } from '@prisma/client'
 import { scheduledTaskGraphAuditGateQuestionId, scheduledTaskGraphAuditGateWaitKey, scheduledTaskGraphAuditRecoveryEventIsActivity,
   scheduledTaskGraphAuditRecoveryItems, scheduledTaskGraphAuditWaitKey } from './scheduled-taskgraph-audit-recovery-graph-item'
 import type { ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
+import { parseScheduledGateChoiceBinding, scheduledGateChoiceState,
+  type ScheduledTaskGraphGateChoiceBinding as GateBinding } from './scheduled-taskgraph-gate-choice-evidence'
 
 const MARKER_SCHEMA = 'agent-harness.v2.scheduled-pipeline-recovery-step.v1'
 const MARKER_KEY = 'scheduledPipelineRecoveryStep'
@@ -15,9 +16,6 @@ type Source = Readonly<{ sourceEventId: string; stepId: string; ordinal: number 
 type RecoveryMarker = Readonly<{ schemaVersion: typeof MARKER_SCHEMA; kind: 'scheduled_pipeline_recovery'; owner: OwnerIdentity; rootAttemptCount: number; sourceEventId: string; sourceStepId: string;
   sourceStepOrdinal: number; sourceInputThroughSequence: string; recoveryStepId: string; recoveryCursor: number;
   predecessorStepId: string; inputThroughSequence: string }>
-type GateBinding = Readonly<{ schemaVersion: 'agent-harness.v2.scheduled-gate-choice-wait.v1'; owner: Row; continuationKey: string;
-  snapshotDigest: string; evidenceDigest: string; checkpointDigest: string; analyzeGraphRevision: number; graphRevision: number;
-  gateTaskId: string; gateAttempt: number; kind: 'borderline_match' | 'weak_cover_letter'; jobIds: readonly string[]; allowedChoiceIds: readonly string[] }>
 
 /** Validates the operational recovery tail against the exact persisted Worker receipts. */
 export async function validateScheduledTaskGraphAuditRecoveryEvidence(input: Readonly<{
@@ -58,7 +56,7 @@ export async function validateScheduledTaskGraphAuditRecoveryEvidence(input: Rea
     const targetIds = new Set<string>()
     for (const wait of waits) for (const id of idsFrom(wait.targetTaskIds) ?? []) targetIds.add(id)
     for (const item of items) {
-      const gateId = parseGateBinding(record(parse(item.content))?.scheduledGateChoiceBinding)?.gateTaskId
+      const gateId = parseScheduledGateChoiceBinding(record(parse(item.content))?.scheduledGateChoiceBinding)?.gateTaskId
       if (gateId) targetIds.add(gateId)
     }
     const tasks = targetIds.size ? await reader.subAgentTask.findMany({ where: { id: { in: [...targetIds] },
@@ -152,46 +150,15 @@ function startMatches(eventValue: unknown, step: Row, marker: Row, rootTaskId: s
 function gateChoiceItem(items: Row[], step: Row, owner: OwnerIdentity, pipelineOwner: ScheduledTaskGraphPipelineOwner,
   attempt: number, tasks: Map<string, Row>): boolean {
   if (items.length !== 1) return false
-  const item = items[0]!, content = record(parse(item.content)), binding = parseGateBinding(content?.scheduledGateChoiceBinding)
+  const item = items[0]!, content = record(parse(item.content)), binding = parseScheduledGateChoiceBinding(content?.scheduledGateChoiceBinding)
   if (!binding) return false
-  const waitId = scheduledTaskGraphAuditGateQuestionId(binding), state = gateChoiceState(content, item.status, binding, waitId)
+  const waitId = scheduledTaskGraphAuditGateQuestionId(binding), state = scheduledGateChoiceState(content, item.status, binding, waitId)
   const task = binding && tasks.get(binding.gateTaskId)
   return !!state && item.id === `agent-wait:question:${waitId}` && item.type === 'question'
     && item.stepId === step.id && item.taskId === owner.rootTaskId && sameOwner(binding.owner, pipelineOwner, attempt)
     && !!task && taskMatches(task, owner, binding.gateTaskId, 'gate')
 }
 
-function parseGateBinding(value: unknown): GateBinding | null {
-  const row = record(value), owner = record(row?.owner)
-  const keys = ['schemaVersion', 'owner', 'continuationKey', 'snapshotDigest', 'evidenceDigest', 'checkpointDigest',
-    'analyzeGraphRevision', 'graphRevision', 'gateTaskId', 'gateAttempt', 'kind', 'jobIds', 'allowedChoiceIds']
-  const ownerKeys = ['userId', 'sessionId', 'turnId', 'rootTaskId', 'rootAttemptCount', 'executionId', 'executionAttemptCount']
-  if (!row || !owner || !exactKeys(row, keys) || !exactKeys(owner, ownerKeys)
-    || row.schemaVersion !== 'agent-harness.v2.scheduled-gate-choice-wait.v1' || !validGateOwner(owner)
-    || !/^scheduled-taskgraph:sha256:[a-f0-9]{64}$/.test(String(row.continuationKey))
-    || !/^sha256:[a-f0-9]{64}$/.test(String(row.snapshotDigest)) || !isHex(row.evidenceDigest) || !isHex(row.checkpointDigest)
-    || !positive(row.analyzeGraphRevision) || !positive(row.graphRevision) || !validId(row.gateTaskId) || !positive(row.gateAttempt)
-    || row.kind !== 'borderline_match' && row.kind !== 'weak_cover_letter' || !jobIds(row.jobIds, row.kind)
-    || !choiceIds(row.allowedChoiceIds, row.kind)) return null
-  return { schemaVersion: 'agent-harness.v2.scheduled-gate-choice-wait.v1', owner: stableOwner(owner),
-    continuationKey: row.continuationKey as string, snapshotDigest: row.snapshotDigest as string, evidenceDigest: row.evidenceDigest as string,
-    checkpointDigest: row.checkpointDigest as string, analyzeGraphRevision: Number(row.analyzeGraphRevision),
-    graphRevision: Number(row.graphRevision), gateTaskId: row.gateTaskId, gateAttempt: Number(row.gateAttempt), kind: row.kind,
-    jobIds: [...row.jobIds as string[]].sort(), allowedChoiceIds: choices(row.kind) }
-}
-function gateChoiceState(content: Row | null, status: unknown, binding: GateBinding, waitId: string): boolean {
-  const fields = ['waitKind', 'questionId', 'toolCallId', 'stage', 'question', 'options', 'answer', 'answerAvailable', 'scheduledGateChoiceBinding']
-  const hasAck = !!content && Object.hasOwn(content, 'scheduledGateChoiceResumeAcknowledgement')
-  if (!content || !exactKeys(content, status === 'completed' ? [...fields, 'answeredAt', ...(hasAck ? ['scheduledGateChoiceResumeAcknowledgement'] : [])] : fields)
-    || content.waitKind !== 'question' || content.questionId !== waitId || content.toolCallId !== null || content.stage !== 'scheduled_gate'
-    || typeof content.question !== 'string' || !content.question.trim() || content.question !== content.question.trim()
-    || Buffer.byteLength(content.question, 'utf8') > 2_000 || !same(content.options, choiceOptions(binding.kind))
-    || !same(parseGateBinding(content.scheduledGateChoiceBinding), binding)) return false
-  if (hasAck && !validAck(content.scheduledGateChoiceResumeAcknowledgement, binding, waitId)) return false
-  if (status === 'started') return !hasAck && content.answer === null && content.answerAvailable === false
-  return status === 'completed' && validIso(content.answeredAt) && content.answerAvailable === true
-    && binding.allowedChoiceIds.includes(String(content.answer))
-}
 function awaitsValid(waits: Row[], owner: OwnerIdentity, stepId: string, tasks: Map<string, Row>): boolean {
   return waits.every(wait => {
     const ids = idsFrom(wait.targetTaskIds), result = record(parse(wait.result)), request = record(result?.request)
@@ -247,19 +214,6 @@ function parseMarker(value: unknown): RecoveryMarker | null {
     inputThroughSequence: row.inputThroughSequence }
 }
 
-function validAck(value: unknown, binding: GateBinding, waitId: string): boolean {
-  const row = record(value), itemId = `agent-wait:question:${waitId}`
-  return !!row && exactKeys(row, ['gateTaskId', 'requestAttemptCount', 'waitId', 'itemId', 'resumedAttemptCount'])
-    && row.gateTaskId === binding.gateTaskId && row.requestAttemptCount === binding.gateAttempt && row.waitId === waitId
-    && row.itemId === itemId && row.resumedAttemptCount === binding.gateAttempt + 1
-}
-function jobIds(value: unknown, kind: string): value is string[] { return Array.isArray(value) && value.length >= 1 && value.length <= 50
-  && (kind !== 'weak_cover_letter' || value.length === 1) && value.every(validId) && new Set(value).size === value.length }
-function choices(kind: string): readonly string[] { return kind === 'weak_cover_letter' ? ['continue', 'review', 'skip'] : ['add_to_pending', 'skip', 'lower_threshold'] }
-function choiceIds(value: unknown, kind: string): boolean { return same(value, choices(kind)) }
-function choiceOptions(kind: string): readonly Row[] { return kind === 'weak_cover_letter'
-  ? [{ label: 'Continue with current materials', value: 'continue' }, { label: 'Place for review', value: 'review' }, { label: 'Skip', value: 'skip' }]
-  : [{ label: 'Include for review', value: 'add_to_pending' }, { label: 'Skip', value: 'skip' }, { label: 'Lower threshold 5%', value: 'lower_threshold' }] }
 function sameOwner(left: Row, right: ScheduledTaskGraphPipelineOwner, attempt: number): boolean {
   return left.userId === right.userId && left.sessionId === right.sessionId && left.turnId === right.turnId
     && left.rootTaskId === right.rootTaskId && left.rootAttemptCount === attempt && left.rootAttemptCount === right.rootAttemptCount
@@ -270,11 +224,6 @@ function validOwner(owner: ScheduledTaskGraphPipelineOwner): boolean {
     && positive(owner.rootAttemptCount) && nonNegative(owner.turnLeaseVersion) && nonNegative(owner.executionAttemptCount)
 }
 function validOwnerRecord(value: Row): value is Row & OwnerIdentity { return [value.userId, value.sessionId, value.turnId, value.rootTaskId].every(validId) }
-function validGateOwner(value: Row): boolean { return validOwnerRecord(value) && positive(value.rootAttemptCount)
-  && validId(value.executionId) && nonNegative(value.executionAttemptCount) }
-function stableOwner(value: Row): Row { return { userId: value.userId, sessionId: value.sessionId, turnId: value.turnId, rootTaskId: value.rootTaskId,
-  ...(value.rootAttemptCount !== undefined ? { rootAttemptCount: value.rootAttemptCount } : {}), ...(value.executionId !== undefined ? { executionId: value.executionId } : {}),
-  ...(value.executionAttemptCount !== undefined ? { executionAttemptCount: value.executionAttemptCount } : {}) } }
 function record(value: unknown): Row | null { value = parse(value); if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   try { const prototype = Object.getPrototypeOf(value); return prototype === Object.prototype || prototype === null ? value as Row : null } catch { return null } }
 function exactKeys(value: Row, keys: readonly string[]): boolean { return Object.keys(value).sort().join(',') === [...keys].sort().join(',') }
@@ -287,8 +236,6 @@ function positive(value: unknown): value is number { return Number.isSafeInteger
 function nonNegative(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) >= 0 }
 function zero(value: unknown): boolean { return value === 0 || value === '0' }
 function zeroCost(value: unknown): boolean { return value === 0 || typeof value === 'string' && /^0(?:\.0+)?$/.test(value) || value instanceof Prisma.Decimal && value.isZero() }
-function isHex(value: unknown): boolean { return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value) }
-function validIso(value: unknown): boolean { return typeof value === 'string' && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value }
 function same(left: unknown, right: unknown): boolean {
   if (Object.is(left, right)) return true
   if (Array.isArray(left) || Array.isArray(right)) return Array.isArray(left) && Array.isArray(right)

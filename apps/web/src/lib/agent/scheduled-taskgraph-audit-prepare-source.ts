@@ -1,13 +1,12 @@
-import { createHash } from 'node:crypto'
 import { Prisma } from '@prisma/client'
 import { db } from '@/lib/db'
 import { parseScheduledAutomationSnapshot } from './scheduled-automation-snapshot'
 import { scheduledAutomationSnapshotDigest, type ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 import { validateScheduledTaskGraphAuditRecoveryEvidence } from './scheduled-taskgraph-audit-recovery-evidence'
+import { isScheduledPrepareChoiceWaitId, parseScheduledPrepareChoiceReceipt, scheduledPrepareChoiceBinding, scheduledPrepareChoiceId } from './scheduled-taskgraph-run-receipt'
 
 const RECEIPT_EVENT = 'agent.plan.scheduled_prepare_binding'
 const CANDIDATE_EVENT = 'native_verification.scheduled_candidate_staged'
-const CHOICE_SCHEMA = 'agent-harness.v2.scheduled-prepare-choice-wait.v1'
 const CHOICE_CONTENT = { waitKind: 'question', toolCallId: null, stage: 'scheduled_prepare',
   question: 'How should ApplyMate tailor your resume for this role?',
   options: [{ label: 'Apply AI changes', value: 'apply_ai_changes' }, { label: 'Keep my current resume', value: 'keep_resume' }] }
@@ -22,8 +21,8 @@ export async function validateScheduledTaskGraphAuditPrepareSource(input: Readon
   try {
     const reader = input.reader ?? db
     const snapshot = parseScheduledAutomationSnapshot(input.snapshot), receipt = exactRecord(input.proof, ['receipt', 'completion', 'result'])?.receipt
-    const parsedReceipt = parseReceipt(receipt, input.owner, scheduledAutomationSnapshotDigest(snapshot))
-    if (!parsedReceipt || (snapshot.requireApproval ? !validChoiceId(input.owner.turnId, input.scheduledWaitId)
+    const parsedReceipt = parseScheduledPrepareChoiceReceipt(receipt, input.owner, scheduledAutomationSnapshotDigest(snapshot))
+    if (!parsedReceipt || (snapshot.requireApproval ? !isScheduledPrepareChoiceWaitId(input.owner.turnId, input.scheduledWaitId)
       : input.scheduledWaitId !== undefined)) return false
     const [receipts, candidates] = await Promise.all([
       reader.agentEvent.findMany({ where: { sessionId: input.owner.sessionId, turnId: input.owner.turnId, type: RECEIPT_EVENT,
@@ -38,7 +37,7 @@ export async function validateScheduledTaskGraphAuditPrepareSource(input: Readon
     for (const event of candidates) {
       const candidate = parseCandidate(event, input.owner)
       if (!candidate) continue
-      const waitId = choiceId(parsedReceipt, candidate.stepId, candidate.ordinal)
+      const waitId = scheduledPrepareChoiceId(parsedReceipt, candidate.stepId, candidate.ordinal)
       if (snapshot.requireApproval && waitId !== input.scheduledWaitId) continue
       if (await candidateSourceCurrent(reader, input.owner, parsedReceipt, candidate, waitId, snapshot.requireApproval)) valid.push(candidate)
     }
@@ -55,7 +54,7 @@ async function candidateSourceCurrent(reader: Prisma.TransactionClient, owner: S
     || await rejectedStepEvent(reader, owner, source.id)) return false
   const sourceCursor = cursorValue(source.inputThroughSequence)
   if (!sourceCursor) return false
-  const binding = choiceBinding(receipt, candidate.stepId, candidate.ordinal)
+  const binding = scheduledPrepareChoiceBinding(receipt, candidate.stepId, candidate.ordinal)
   const item = await reader.agentItem.findFirst({ where: { id: `agent-wait:question:${waitId}`, sessionId: owner.sessionId, turnId: owner.turnId },
     select: { id: true, stepId: true, taskId: true, type: true, status: true, content: true } })
   if (requireChoice ? !validChoiceItem(item, owner, candidate, receipt, waitId, binding) : item !== null) return false
@@ -67,16 +66,6 @@ async function rejectedStepEvent(reader: Prisma.TransactionClient, owner: Schedu
   const rows = await reader.agentEvent.findMany({ where: { sessionId: owner.sessionId, turnId: owner.turnId,
     taskId: owner.rootTaskId, correlationId: stepId, type: 'final.rejected' }, select: { id: true }, take: 1 })
   return rows.length !== 0
-}
-function parseReceipt(value: unknown, owner: ScheduledTaskGraphPipelineOwner, digest: string): Row | null {
-  const row = exactRecord(value, ['schemaVersion', 'owner', 'continuationKey', 'snapshotDigest', 'evidenceDigest', 'checkpointDigest',
-    'analyzeGraphRevision', 'prepareScheduleRevision'])
-  const stable = exactRecord(row?.owner, ['userId', 'sessionId', 'turnId', 'rootTaskId', 'rootAttemptCount', 'turnLeaseOwnerId',
-    'turnLeaseVersion', 'executionId', 'executionAttemptCount'])
-  return row && stable && row.schemaVersion === 'agent-harness.v2.scheduled-taskgraph-continuation-receipt.v1'
-    && sameStableOwner(stable, owner) && typeof row.continuationKey === 'string' && /^scheduled-taskgraph:sha256:[a-f0-9]{64}$/.test(row.continuationKey)
-    && row.snapshotDigest === digest && isHex(row.evidenceDigest) && isHex(row.checkpointDigest) && positive(row.analyzeGraphRevision)
-    && positive(row.prepareScheduleRevision) && row.prepareScheduleRevision === Number(row.analyzeGraphRevision) + 1 ? row : null
 }
 function parseCandidate(event: Row, owner: ScheduledTaskGraphPipelineOwner): CandidateSource | null {
   const row = exactRecord(event.payload, ['schemaVersion', 'sessionId', 'turnId', 'rootTaskId', 'rootAttemptCount', 'finalStepId',
@@ -100,30 +89,6 @@ function validChoiceItem(item: unknown, owner: ScheduledTaskGraphPipelineOwner, 
     && sameJson(content.scheduledPrepareChoiceBinding, binding) && content.answerAvailable === true
     && ['apply_ai_changes', 'keep_resume'].includes(String(content.answer)) && validIso(content.answeredAt))
 }
-function choiceBinding(receipt: Row, stepId: string, ordinal: number): Row {
-  const owner = receipt.owner as Row
-  return { schemaVersion: CHOICE_SCHEMA, owner: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
-    rootTaskId: owner.rootTaskId, rootAttemptCount: owner.rootAttemptCount, executionId: owner.executionId,
-    executionAttemptCount: owner.executionAttemptCount }, continuationKey: receipt.continuationKey,
-    snapshotDigest: receipt.snapshotDigest, evidenceDigest: receipt.evidenceDigest, checkpointDigest: receipt.checkpointDigest,
-    analyzeGraphRevision: receipt.analyzeGraphRevision, prepareScheduleRevision: receipt.prepareScheduleRevision,
-    finalStepId: stepId, finalStepOrdinal: ordinal, finalStepAttempt: 1 }
-}
-function choiceId(receipt: Row, stepId: string, ordinal: number): string {
-  const binding = choiceBinding(receipt, stepId, ordinal), owner = binding.owner as Row
-  const values = [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.rootAttemptCount, owner.executionId,
-    owner.executionAttemptCount, binding.continuationKey, binding.snapshotDigest, binding.evidenceDigest, binding.checkpointDigest,
-    binding.analyzeGraphRevision, binding.prepareScheduleRevision, stepId, ordinal, 1]
-  return `agent-question:${String(owner.turnId)}:canonical:${createHash('sha256').update(JSON.stringify(values), 'utf8').digest('hex')}`
-}
-function validChoiceId(turnId: string, value: unknown): value is string {
-  const prefix = `agent-question:${turnId}:canonical:`
-  return typeof value === 'string' && value.startsWith(prefix) && /^[a-f0-9]{64}$/.test(value.slice(prefix.length))
-}
-function sameStableOwner(value: Row, owner: ScheduledTaskGraphPipelineOwner): boolean {
-  return ['userId', 'sessionId', 'turnId', 'rootTaskId', 'rootAttemptCount', 'executionId', 'executionAttemptCount']
-    .every(key => value[key] === owner[key as keyof ScheduledTaskGraphPipelineOwner])
-}
 function sameJson(left: unknown, right: unknown): boolean { try { return canonical(left) === canonical(right) } catch { return false } }
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`
@@ -141,5 +106,4 @@ function validCursor(value: unknown): value is string { return typeof value === 
 function validId(value: unknown): value is string { return typeof value === 'string' && value.length > 0 && value.length <= 256 && value.trim() === value }
 function positive(value: unknown): boolean { return Number.isSafeInteger(value) && Number(value) > 0 }
 function nonNegative(value: unknown): boolean { return Number.isSafeInteger(value) && Number(value) >= 0 }
-function isHex(value: unknown): boolean { return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value) }
 function validIso(value: unknown): boolean { return typeof value === 'string' && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value }

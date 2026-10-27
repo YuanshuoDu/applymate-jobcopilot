@@ -223,9 +223,52 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     restoreEnv("AGENT_WORKER_SECRET", priorWorkerSecret)
   })
 
-  it("replays one Audit child across a Worker restart and releases root only with its private current-attempt proof", async () => {
-    const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!, { jobCount: 1 })
+  it.each([
+    { label: "legacy V1", jobCount: 1, scoutCount: 1, selectedJobCount: 1 },
+    { label: "four-Scout V2", jobCount: 4, scoutCount: 4, selectedJobCount: 2 },
+  ])("replays one Audit child across a Worker restart for $label and releases root only with its private current-attempt proof", async options => {
+    const fixture = await createScheduledGatePrepareFixture(pool!, redisUrl!, options)
     fixtureUsers.push(fixture.ids.userId)
+    if (options.scoutCount === 1) {
+      if ("scouts" in fixture.attestation) throw new Error("scheduled legacy Analyze attestation must remain v1")
+      expect(fixture.attestation.scout.candidateJobIds).toEqual(fixture.jobIds)
+      expect(fixture.attestation.analyst.jobIds).toEqual(fixture.jobIds)
+      expect(fixture.preparedJobIds).toEqual(fixture.jobIds)
+    } else {
+      if (!("scouts" in fixture.attestation)) throw new Error("scheduled multi-Scout Analyze attestation missing")
+      expect(fixture.attestation.scouts).toHaveLength(4)
+      expect(fixture.attestation.candidateUnionJobIds).toHaveLength(4)
+      expect([...fixture.attestation.candidateUnionJobIds].sort()).toEqual([...fixture.jobIds].sort())
+      expect(fixture.attestation.analyst.jobIds).toEqual(fixture.selectedJobIds)
+      expect(fixture.attestation.analyst.dependsOnTaskIds).toEqual([...fixture.ids.scoutTaskIds].sort())
+      expect(fixture.preparedJobIds).toEqual(fixture.selectedJobIds)
+      expect(fixture.preparedJobIds).toHaveLength(2)
+      const discoveryInputs = await pool!.query<{ taskId: string; input: unknown }>(`SELECT "taskId", "content"->'input' AS "input"
+        FROM "agent_items" WHERE "sessionId"=$1 AND "turnId"=$2 AND "taskId" = ANY($3::text[])
+          AND "type"='tool_call' AND "content"->>'toolName'='jobs.discover' ORDER BY "taskId"`,
+      [fixture.ids.sessionId, fixture.ids.turnId, fixture.ids.scoutTaskIds])
+      expect(discoveryInputs.rows).toHaveLength(4)
+      const inputs = discoveryInputs.rows.map(row => debugRecord(row.input))
+      expect(inputs.every(input => JSON.stringify(input?.targetRoles) === JSON.stringify(fixture.scheduleSnapshot.targetRoles)
+        && JSON.stringify(input?.targetLocations) === JSON.stringify(fixture.scheduleSnapshot.targetLocations))).toBe(true)
+      expect(inputs.map(input => input?.source).sort()).toEqual(["greenhouse", "lever", "smartrecruiters", "workday"])
+    }
+    const ordinals = await pool!.query<{ total: string; distinct: string }>(`SELECT COUNT(*)::text AS "total",
+      COUNT(DISTINCT "ordinal")::text AS "distinct" FROM "agent_steps" WHERE "sessionId"=$1 AND "turnId"=$2`,
+    [fixture.ids.sessionId, fixture.ids.turnId])
+    expect(ordinals.rows[0]?.total).toBe(ordinals.rows[0]?.distinct)
+    const tamperTaskId = fixture.ids.scoutTaskIds[0]!
+    const originalScout = (await pool!.query<{ result: unknown }>(`SELECT "result" FROM "sub_agent_tasks" WHERE "id"=$1`, [tamperTaskId])).rows[0]?.result
+    const originalEnvelope = debugRecord(originalScout), originalStructuredResult = debugRecord(originalEnvelope?.structuredResult)
+    if (!originalEnvelope || !originalStructuredResult) throw new Error("scheduled source result missing")
+    try {
+      await pool!.query(`UPDATE "sub_agent_tasks" SET "result"=$2::jsonb WHERE "id"=$1`, [tamperTaskId,
+        JSON.stringify({ ...originalEnvelope, structuredResult: { ...originalStructuredResult, summary: "tampered source result" } })])
+      await expect(fixture.reattestCurrentTurn(fixture.turnLease)).rejects.toThrow("scheduled_gate_prepare_reattest_")
+    } finally {
+      await pool!.query(`UPDATE "sub_agent_tasks" SET "result"=$2::jsonb WHERE "id"=$1`, [tamperTaskId, JSON.stringify(originalScout)])
+    }
+    await expect(fixture.reattestCurrentTurn(fixture.turnLease)).resolves.toEqual(fixture.attestation)
     await seedScheduledAuditAgentConfig(fixture)
     const command = createPgTaskGraphCommandPort(pool as never), waitPort = createPgDurableWaitPort(pool!)
     const turnOwner = fixture.turnExecutionOwner as TurnExecutionOwnerFence
@@ -300,7 +343,8 @@ describeWithServices("scheduled Audit child on disposable PostgreSQL and Redis",
     expect(auditReplayCaptures).toHaveLength(1)
     expect(auditReplayCaptures[0]).toMatchObject({ mode: "append_audit", recoveryStepId: pendingTrace.steps[0]?.id,
       receipt: { status: "duplicate", auditTaskId, expectedAttemptCount: 1 } })
-    expect((await graphCount(fixture)).auditNodes).toBe(1)
+    expect(await graphCount(fixture)).toEqual({ totalNodes: options.scoutCount + 4, scoutNodes: options.scoutCount, analystNodes: 1,
+      prepareNodes: 1, gateNodes: 1, auditNodes: 1, analystDependsOnAllScouts: true, suffixIsChained: true })
     const auditDispatchOutbox = await pool!.query<{ id: string }>(`SELECT "id" FROM "agent_outbox"
       WHERE "topic" = 'agent.subagent.dispatch' AND "aggregateId" = $1 AND "idempotencyKey" = $2`,
     [fixture.ids.sessionId, `subagent-dispatch:${auditTaskId}`])
@@ -2518,9 +2562,20 @@ async function taskState(taskId: string): Promise<{ status: string; attemptCount
   if (!row) throw new Error("scheduled Audit task missing")
   return row
 }
-async function graphCount(fixture: Fixture): Promise<{ auditNodes: number }> {
+async function graphCount(fixture: Fixture): Promise<{ totalNodes: number; scoutNodes: number; analystNodes: number;
+  prepareNodes: number; gateNodes: number; auditNodes: number; analystDependsOnAllScouts: boolean; suffixIsChained: boolean }> {
   const loaded = await loadTaskGraph(pool as never, fixture.graphScope, false)
-  return { auditNodes: loaded.snapshot?.nodes.filter(node => node.key === SCHEDULED_AUDIT_TEMPLATE_ID).length ?? 0 }
+  const nodes = loaded.snapshot?.nodes ?? [], scouts = nodes.filter(node => node.templateId === "scout")
+  const analyst = nodes.find(node => node.key === "scheduled-analyst")
+  const prepare = nodes.find(node => node.key === "prepare"), gate = nodes.find(node => node.key === "gate")
+  const audit = nodes.find(node => node.key === SCHEDULED_AUDIT_TEMPLATE_ID)
+  return { totalNodes: nodes.length, scoutNodes: scouts.length, analystNodes: nodes.filter(node => node.templateId === "analyst").length,
+    prepareNodes: nodes.filter(node => node.templateId === "prepare").length, gateNodes: nodes.filter(node => node.templateId === "gate").length,
+    auditNodes: nodes.filter(node => node.key === SCHEDULED_AUDIT_TEMPLATE_ID).length,
+    analystDependsOnAllScouts: Boolean(analyst && analyst.dependsOn.length === scouts.length
+      && scouts.every(node => analyst.dependsOn.includes(node.key))),
+    suffixIsChained: Boolean(prepare && gate && audit && prepare.dependsOn.length === 1 && prepare.dependsOn[0] === analyst?.key
+      && gate.dependsOn.length === 1 && gate.dependsOn[0] === prepare.key && audit.dependsOn.length === 1 && audit.dependsOn[0] === gate.key) }
 }
 function restoreEnv(name: string, value: string | undefined): void { if (value === undefined) delete process.env[name]; else process.env[name] = value }
 function dedicatedDisposableUrl(): string | null {

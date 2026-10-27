@@ -38,10 +38,10 @@ const LETTER = "Fixture cover letter prepared for the scheduled Gate integration
 const DB_PATH = "@/lib/db"
 const GATE_SERVICE_PATH = "@/lib/agent/scheduled-taskgraph-run-service"
 
-export type ScheduledGatePrepareFixtureOptions = Readonly<{ jobCount?: number }>
+export type ScheduledGatePrepareFixtureOptions = Readonly<{ jobCount?: number; scoutCount?: number; selectedJobCount?: number }>
 export type ScheduledGatePrepareFixture = Readonly<{
   ids: ScheduledGatePrepareSeedFixture["ids"] & { prepareTaskId: string; gateTaskId?: string }
-  jobIds: readonly string[]; jobRecords: ScheduledGatePrepareSeedFixture["jobRecords"]
+  jobIds: readonly string[]; selectedJobIds: readonly string[]; jobRecords: ScheduledGatePrepareSeedFixture["jobRecords"]
   snapshot: ScheduledGatePrepareSeedFixture["snapshot"]; scheduleSnapshot: ScheduledGatePrepareSeedFixture["scheduleSnapshot"]
   graphScope: ScheduledGatePrepareSeedFixture["graphScopeV1"]
   owner: ScheduledGatePrepareOwner; turnLease: TurnLease; turnExecutionOwner: {
@@ -62,7 +62,9 @@ export async function createScheduledGatePrepareFixture(pool: Pool, redisUrl: st
   if (options.jobCount !== undefined && (!Number.isSafeInteger(options.jobCount) || options.jobCount < 1 || options.jobCount > 10)) {
     throw new RangeError("scheduled_gate_prepare_job_count_invalid")
   }
-  const seed = await seedScheduledGatePrepareFixture(pool, { jobCount: options.jobCount ?? 1 })
+  const seed = await seedScheduledGatePrepareFixture(pool, { jobCount: options.jobCount ?? 1,
+    ...(options.scoutCount === undefined ? {} : { scoutCount: options.scoutCount }),
+    ...(options.selectedJobCount === undefined ? {} : { selectedJobCount: options.selectedJobCount }) })
   const bridge = createBridge(pool, seed)
   const analyze = await bridge(seed.ownerV1)
   if (analyze.status !== "ready") throw new Error(`scheduled_gate_prepare_analyze_${analyze.reasonCode}`)
@@ -109,7 +111,8 @@ export async function createScheduledGatePrepareFixture(pool: Pool, redisUrl: st
     resumed.handoff, resumed.claimToken, ready.prepareProof, prepare.choiceWaitId)
   const preparedIds = scheduledGatePreparedJobIds(ready.prepareProof)
   if (!preparedIds) throw new Error("scheduled_gate_prepare_prepared_job_ids_invalid")
-  return { ids: { ...seed.ids, prepareTaskId: ready.prepareTaskId }, jobIds: seed.jobIds, jobRecords: seed.jobRecords,
+  return { ids: { ...seed.ids, prepareTaskId: ready.prepareTaskId }, jobIds: seed.jobIds, selectedJobIds: seed.selectedJobIds,
+    jobRecords: seed.jobRecords,
     snapshot: seed.snapshot, scheduleSnapshot: seed.scheduleSnapshot, graphScope: currentScope, owner: currentOwner,
     turnLease: resumed.turnLease, turnExecutionOwner: resumed.turnExecutionOwner, executionOwner,
     attestation: analyzeAgain.attestation, prepareProof: ready.prepareProof, prepareWaitId: ready.prepareWaitId,
@@ -285,8 +288,8 @@ async function buildAndPersistGateCheckpoint(pool: Pool, seed: ScheduledGatePrep
   try {
     const checkpoint = (await pool.query<{ state: unknown }>(`SELECT "state" FROM "agent_executions" WHERE "id"=$1`, [seed.executionOwner.executionId])).rows[0]
     if (!checkpoint) throw new Error("scheduled Gate execution checkpoint missing")
-    const jobs = await web.db.job.findMany({ where: { id: { in: seed.jobIds }, userId: seed.ids.userId } })
-    if (jobs.length !== seed.jobIds.length) throw new Error("scheduled Gate owned jobs missing")
+    const jobs = await web.db.job.findMany({ where: { id: { in: seed.selectedJobIds }, userId: seed.ids.userId } })
+    if (jobs.length !== seed.selectedJobIds.length) throw new Error("scheduled Gate owned jobs missing")
     const state = await service.buildScheduledTaskGraphGateResumeState({ owner: { ...owner, ...seed.executionOwner },
       snapshot: seed.scheduleSnapshot, attestation, continuationKey, claimToken, ownedJobs: jobs,
       persistedCheckpoint: checkpoint.state, prepareProof, scheduledWaitId })

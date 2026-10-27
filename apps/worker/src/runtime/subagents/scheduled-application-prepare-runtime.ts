@@ -5,12 +5,14 @@ import type { ExecutionOwnerFence } from "../execution-owner.js"
 import type { SubagentLease, SubagentTaskRecord } from "./types.js"
 import type { ToolExecutionContext } from "../tools/types.js"
 import { loadSelectedJobArtifactContext } from "./selected-job-artifact-context.js"
-import { createScheduledAutomationPipelineBridge, type ScheduledAutomationPipelineAttestation, type ScheduledAutomationPersistedTask } from "./scheduled-automation-pipeline-bridge.js"
+import { type ScheduledAutomationPipelineAttestation } from "./scheduled-automation-pipeline-bridge.js"
+import { revalidateScheduledPipelineGraphAttestation } from "./scheduled-pipeline-current-attestation.js"
+import { projectScheduledPipelineGraph } from "./scheduled-pipeline-graph-shape.js"
+import { scheduledPrepareCheckpointDigest, scheduledPrepareCohortJobIds, scheduledPrepareLiveCheckpointBinding } from "./scheduled-prepare-runtime-context.js"
 import { scheduledAnalyzeGraphMatches, scheduledSnapshotMatches, scheduledTaskGraphClaimMatches, scheduledTaskGraphStableContinuationKey,
-  SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_EVENT,
+  scheduledTaskGraphContinuationKeyVersion, SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_EVENT,
   parseScheduledTaskGraphContinuationReceipt } from "./scheduled-taskgraph-continuation-receipt.js"
 import type { ScheduledTaskGraphContinuationBinding } from "./scheduled-taskgraph-continuation-receipt.js"
-import { scheduledTaskGraphContinuationKey } from "./scheduled-pipeline-handoff.js"
 import { loadTaskGraph, currentTaskGraph, type GraphIdentityScope, type GraphTaskRow } from "./task-graph-pg-state.js"
 import { verifyCompletedTaskGraphNodeEvidence } from "./task-graph-pg-verification.js"
 import { parseScheduledAutomationSnapshot } from "./scheduled-automation-snapshot.js"
@@ -54,25 +56,29 @@ async function loadInvocation(options: Options, context: ToolExecutionContext): 
     const persisted = await readPersistedOwner(client, lease, owner)
     const scope: GraphIdentityScope = { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId!, rootTaskId: lease.rootTaskId, parentTaskId: lease.rootTaskId }
     const loaded = await loadTaskGraph(client, scope, false), snapshot = loaded.snapshot
-    if (!snapshot || !loaded.state || snapshot.nodes.length !== 3 || snapshot.nodes[2]?.taskId !== lease.id) throw new Error("scheduled_prepare_graph_invalid")
-    const current = currentTaskGraph(loaded), taskRow = loaded.tasks.get(lease.id), node = snapshot.nodes[2]!
-    if (!taskRow || !prepareTaskMatches(taskRow, node, lease) || current.nodes.find(value => value.key === "prepare")?.status !== "running") throw new Error("scheduled_prepare_task_invalid")
+    if (!snapshot || !loaded.state) throw new Error("scheduled_prepare_graph_invalid")
+    const current = currentTaskGraph(loaded)
+    if (current.nodes.length !== snapshot.nodes.length) throw new Error("scheduled_prepare_graph_invalid")
     const receipt = await readPrivateReceipt(client, scope, persisted.owner)
-    if (!receipt) throw new Error("scheduled_prepare_receipt_invalid")
-    const bridge = createScheduledAutomationPipelineBridge({
-      load: async () => ({ turn: persisted.turn, root: persisted.root,
-        snapshot: scheduledPrepareAnalyzeSnapshot(snapshot),
-        current: { revision: receipt.analyzeGraphRevision, nodes: current.nodes.slice(0, 2) },
-        tasks: snapshot.nodes.slice(0, 2).map(value => loaded.tasks.get(value.taskId)!).filter(Boolean).map(value => persistedTask(value, lease)) }),
-      verifyCompletedNode: input => verifyCompletedTaskGraphNodeEvidence(client, input),
-    })
-    const bridged = await bridge(persisted.owner)
+    const version = receipt && scheduledTaskGraphContinuationKeyVersion(receipt.continuationKey)
+    if (!receipt || !version || scheduledTaskGraphStableContinuationKey(receipt) !== receipt.continuationKey) throw new Error("scheduled_prepare_receipt_invalid")
+    const shape = projectScheduledPipelineGraph(snapshot.nodes, version, "prepare")
+    if (!shape || shape.prepare.taskId !== lease.id) throw new Error("scheduled_prepare_graph_invalid")
+    const taskRow = loaded.tasks.get(lease.id), node = shape.prepare
+    if (!taskRow || !prepareTaskMatches(taskRow, node, lease) || current.nodes.find(value => value.key === "prepare")?.status !== "running") throw new Error("scheduled_prepare_task_invalid")
+    const automation = parseScheduledAutomationSnapshot(record(persisted.turn.input)?.scheduledAutomationSnapshot)
+    if (!automation) throw new Error("scheduled_prepare_snapshot_invalid")
+    const bridged = await revalidateScheduledPipelineGraphAttestation({ scope: persisted.owner, schedule: automation,
+      snapshot, current, tasks: loaded.tasks, receipt,
+      verifyCompletedNode: input => verifyCompletedTaskGraphNodeEvidence(client, input) })
     if (bridged.status !== "ready" || bridged.attestation.evidenceDigest !== receipt.evidenceDigest
       || bridged.attestation.snapshotDigest !== receipt.snapshotDigest) throw new Error("scheduled_prepare_analyze_unverified")
     const liveBinding = scheduledPrepareLiveCheckpointBinding(receipt, persisted.owner, bridged.attestation)
     if (!liveBinding) throw new Error("scheduled_prepare_receipt_invalid")
     const handoffKey = liveBinding.continuationKey
-    const checkpoint = await readExecutionCheckpoint(client, receipt, persisted.turn, persisted.owner, handoffKey, options.now?.() ?? new Date())
+    const prepareCohort = scheduledPrepareCohortJobIds(bridged.attestation)
+    const checkpoint = await readExecutionCheckpoint(client, receipt, persisted.turn, persisted.owner, handoffKey,
+      [...prepareCohort], options.now?.() ?? new Date())
     const proposal = { expectedRevision: receipt.analyzeGraphRevision, nodes: [{ key: node.key, templateId: node.templateId,
       goal: node.goal, successCriteria: node.successCriteria, dependsOn: node.dependsOn }] }
     const handoff = { status: "analyze_checkpointed" as const, continuationKey: handoffKey,
@@ -81,9 +87,8 @@ async function loadInvocation(options: Options, context: ToolExecutionContext): 
     const graphInput = { scope: persisted.executionScope, executionOwner: { executionId: receipt.owner.executionId, executionAttemptCount: receipt.owner.executionAttemptCount },
       handoff, attestation: bridged.attestation, proposal }
     if (!scheduledAnalyzeGraphMatches(graphInput, snapshot, current, loaded.tasks, true)) throw new Error("scheduled_prepare_graph_binding_invalid")
-    const automation = parseScheduledAutomationSnapshot(record(persisted.turn.input)?.scheduledAutomationSnapshot)
-    const analystEnvelope = record(loaded.tasks.get(snapshot.nodes[1]!.taskId)?.result)
-    if (!automation || !analystEnvelope) throw new Error("scheduled_prepare_checkpoint_invalid")
+    const analystEnvelope = record(loaded.tasks.get(shape.analyst.taskId)?.result)
+    if (!analystEnvelope) throw new Error("scheduled_prepare_checkpoint_invalid")
     const analyst = validateRoleResult(analystEnvelope.structuredResult, "analyst") as AnalystResult
     const scored = record(checkpoint.state)?.scoredJobs
     if (!Array.isArray(scored) || scored.length > 500) throw new Error("scheduled_prepare_checkpoint_invalid")
@@ -105,11 +110,6 @@ async function loadInvocation(options: Options, context: ToolExecutionContext): 
       snapshot: automation, receipt, checkpointJobs }, details }
   } catch (error: unknown) { await client.query("ROLLBACK").catch(() => undefined); throw error }
   finally { client.release() }
-}
-
-export function scheduledPrepareAnalyzeSnapshot(snapshot: TaskGraphSnapshot): TaskGraphSnapshot {
-  return { schemaVersion: snapshot.schemaVersion, nodes: snapshot.nodes.slice(0, 2),
-    ...(snapshot.rootSuccessCriteria ? { rootSuccessCriteria: snapshot.rootSuccessCriteria } : {}) }
 }
 
 async function readPersistedOwner(client: Queryable, lease: SubagentLease, owner: ExecutionOwnerFence) {
@@ -157,21 +157,10 @@ async function readPrivateReceipt(client: Queryable, scope: GraphIdentityScope, 
     ? receipt : null
 }
 
-export function scheduledPrepareLiveCheckpointBinding(
-  receipt: NonNullable<ReturnType<typeof parseScheduledTaskGraphContinuationReceipt>>,
-  currentOwner: ScheduledPrepareOwner,
-  attestation: ScheduledAutomationPipelineAttestation,
-): ScheduledTaskGraphContinuationBinding | null {
-  const stableKey = scheduledTaskGraphStableContinuationKey(receipt)
-  if (receipt.continuationKey !== stableKey || !sameTurnLineage(receipt.owner, currentOwner)
-    || !sameTurnLineage(receipt.owner, attestation.owner) || receipt.snapshotDigest !== attestation.snapshotDigest
-    || receipt.evidenceDigest !== attestation.evidenceDigest || receipt.analyzeGraphRevision !== attestation.graphRevision) return null
-  const continuationKey = scheduledTaskGraphContinuationKey(currentOwner, attestation, receipt.owner.executionId, receipt.owner.executionAttemptCount)
-  return { ...receipt, continuationKey, owner: { ...receipt.owner, turnLeaseOwnerId: currentOwner.turnLeaseOwnerId, turnLeaseVersion: currentOwner.turnLeaseVersion } }
-}
+export { scheduledPrepareAnalyzeSnapshot, scheduledPrepareLiveCheckpointBinding } from "./scheduled-prepare-runtime-context.js"
 
 async function readExecutionCheckpoint(client: Queryable, receipt: NonNullable<ReturnType<typeof parseScheduledTaskGraphContinuationReceipt>>, turn: Row,
-  currentOwner: ScheduledPrepareOwner, handoffKey: string, now: Date) {
+  currentOwner: ScheduledPrepareOwner, handoffKey: string, expectedJobIds: readonly string[], now: Date) {
   const rows = await client.query<Row>("SELECT \"status\",\"attemptCount\",\"checkpoint\",\"state\" FROM \"agent_executions\" WHERE \"id\"=$1 AND \"userId\"=$2 AND \"sessionId\"=$3",
     [receipt.owner.executionId, receipt.owner.userId, receipt.owner.sessionId])
   const execution = record(rows.rows[0]), state = record(execution?.state), marker = record(state?.scheduledTaskGraphContinuation), claim = record(state?.scheduledTaskGraphClaim)
@@ -185,42 +174,11 @@ async function readExecutionCheckpoint(client: Queryable, receipt: NonNullable<R
   }
   const claimTokenDigest = "sha256:" + createHash("sha256").update(claim.claimToken, "utf8").digest("hex")
   if (!scheduledTaskGraphClaimMatches(state, liveBinding, claimTokenDigest, now)) throw new Error("scheduled_prepare_claim_invalid")
-  const digest = analyzeCheckpointDigest(state, receipt, handoffKey)
+    const digest = scheduledPrepareCheckpointDigest(state, receipt, handoffKey, expectedJobIds)
   if (!digest || digest !== receipt.checkpointDigest) throw new Error("scheduled_prepare_checkpoint_invalid")
   return { state, claimTokenDigest }
 }
 
-function analyzeCheckpointDigest(state: Row, receipt: NonNullable<ReturnType<typeof parseScheduledTaskGraphContinuationReceipt>>, handoffKey: string): string | null {
-  const marker = record(state.scheduledTaskGraphContinuation), markerOwner = record(marker?.owner), scouted = state.scoutedJobs, scored = state.scoredJobs, owner = receipt.owner
-  if (state.nextStage !== "prepare" || !marker || !Array.isArray(scouted) || !Array.isArray(scored) || !Number.isSafeInteger(state.analysisFailed)
-    || Number(state.analysisFailed) < 0 || marker.key !== handoffKey || marker.snapshotDigest !== receipt.snapshotDigest
-    || marker.graphRevision !== receipt.analyzeGraphRevision || marker.evidenceDigest !== receipt.evidenceDigest || !markerOwner || !sameOwnerLineage(markerOwner, owner)) return null
-  const ids = new Set<string>()
-  for (const value of scouted) { const job = record(value); if (!job || !validId(job.id) || job.userId !== owner.userId || ids.has(job.id)) return null; ids.add(job.id) }
-  if (Number(state.analysisFailed) + scored.length !== ids.size) return null
-  const rows: Row[] = [], seen = new Set<string>()
-  for (const value of scored) {
-    const row = record(value), job = record(row?.job)
-    if (!row || !job || !validId(job.id) || job.userId !== owner.userId || !ids.has(job.id) || seen.has(job.id)
-      || !Number.isSafeInteger(row.score) || Number(row.score) < 0 || Number(row.score) > 100 || !stringArray(row.matchedKeywords)
-      || !stringArray(row.missingKeywords) || typeof row.recommendation !== "string" || row.recommendation.length > 8192) return null
-    const required = ["job", "score", "matchedKeywords", "missingKeywords", "recommendation"], allowed = [...required, "analysisFenceAt"]
-    if (Object.keys(row).some(key => !allowed.includes(key)) || required.some(key => !Object.hasOwn(row, key))
-      || Object.hasOwn(row, "analysisFenceAt") && (typeof row.analysisFenceAt !== "string" || !Number.isFinite(Date.parse(row.analysisFenceAt)))) return null
-    seen.add(job.id); rows.push({ jobId: job.id, score: row.score, matchedKeywords: [...row.matchedKeywords], missingKeywords: [...row.missingKeywords],
-      recommendation: row.recommendation, ...(Object.hasOwn(row, "analysisFenceAt") ? { analysisFenceAt: row.analysisFenceAt } : {}) })
-  }
-  const projection = { owner: [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.rootAttemptCount, owner.executionId, owner.executionAttemptCount],
-    snapshotDigest: receipt.snapshotDigest, evidenceDigest: receipt.evidenceDigest, analyzeGraphRevision: receipt.analyzeGraphRevision,
-    analysisFailed: state.analysisFailed, scoredJobs: rows }
-  return createHash("sha256").update(JSON.stringify(projection), "utf8").digest("hex")
-}
-
-function sameOwnerLineage(left: Row | ScheduledPrepareOwner, right: Row | ScheduledPrepareOwner): boolean {
-  return left.userId === right.userId && left.sessionId === right.sessionId && left.turnId === right.turnId
-    && left.rootTaskId === right.rootTaskId && left.rootAttemptCount === right.rootAttemptCount
-    && left.executionId === right.executionId && left.executionAttemptCount === right.executionAttemptCount
-}
 function sameTurnLineage(left: ScheduledPrepareOwner | ScheduledAutomationPipelineAttestation["owner"], right: ScheduledPrepareOwner | ScheduledAutomationPipelineAttestation["owner"]): boolean {
   return left.userId === right.userId && left.sessionId === right.sessionId && left.turnId === right.turnId
     && left.rootTaskId === right.rootTaskId && left.rootAttemptCount === right.rootAttemptCount
@@ -233,12 +191,6 @@ function prepareTaskMatches(task: GraphTaskRow, node: TaskGraphSnapshot["nodes"]
   return node.templateId === "prepare" && task.id === node.taskId && task.status === "running" && task.attemptCount === lease.attemptCount
     && task.role === template.role && task.taskType === template.taskType && same(task.expectedOutputSchema, template.expectedOutputSchema)
     && same(task.allowedActions, template.allowedActions)
-}
-function persistedTask(task: GraphTaskRow, lease: SubagentLease): ScheduledAutomationPersistedTask {
-  return { id: task.id, userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId!, rootTaskId: lease.rootTaskId,
-    parentTaskId: lease.rootTaskId, role: task.role, taskType: task.taskType ?? "", status: task.status,
-    attemptCount: task.attemptCount ?? 0, failureReason: task.failureReason, expectedOutputSchema: task.expectedOutputSchema,
-    allowedActions: task.allowedActions, result: task.result }
 }
 function future(value: unknown, now: number): boolean {
   const timestamp = value instanceof Date ? value.getTime() : typeof value === "string" ? Date.parse(value) : Number.NaN
@@ -253,10 +205,4 @@ function snapshotDigest(value: unknown): string {
 }
 function same(left: unknown, right: unknown): boolean {
   try { return canonicalTaskGraphJson(left) === canonicalTaskGraphJson(right) } catch { return false }
-}
-function validId(value: unknown): value is string {
-  return typeof value === "string" && value.trim().length > 0 && value.length <= 256 && !/[\u0000-\u001f\u007f]/.test(value)
-}
-function stringArray(value: unknown): value is string[] {
-  return Array.isArray(value) && value.length <= 200 && value.every(item => typeof item === "string" && item.length <= 256)
 }

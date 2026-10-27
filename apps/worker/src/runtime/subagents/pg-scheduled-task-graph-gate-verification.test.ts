@@ -46,9 +46,12 @@ const receipt = { schemaVersion: "agent-harness.v2.scheduled-taskgraph-prepare-r
   continuationKey, snapshotDigest, evidenceDigest: evidence.evidenceDigest, checkpointDigest: evidence.checkpointDigest,
   analyzeGraphRevision: evidence.analyzeGraphRevision, prepareScheduleRevision: 8 }
 const proof = { receipt, completion: { schemaVersion: SCHEDULED_PREPARE_COMPLETION_SCHEMA, graphRevision: 8,
-  nodes: [{ key: "scout", taskId: "scout-task", role: "scout", attemptCount: 1 },
-    { key: "analyst", taskId: "analyst-task", role: "analyst", attemptCount: 1 },
-    { key: "prepare", taskId: "prepare-task", role: "prepare", attemptCount: 2 }], wait: { waitId: "prepare-wait" } },
+  nodes: [{ taskId: "scout-task", role: "scout", taskType: "job_discovery", attemptCount: 1,
+    status: "completed", verification: "passed", dependsOnTaskIds: [] },
+    { taskId: "analyst-task", role: "analyst", taskType: "job_analysis", attemptCount: 1,
+      status: "completed", verification: "passed", dependsOnTaskIds: ["scout-task"] },
+    { taskId: "prepare-task", role: "prepare", taskType: "scheduled_application_prepare", attemptCount: 2,
+      status: "completed", verification: "passed", dependsOnTaskIds: ["analyst-task"] }], wait: { waitId: "prepare-wait" } },
   result: { jobs: [{ jobId: "job-1", status: "prepared" }] } }
 const proofFacts = { schemaVersion: SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA, receipt,
   completion: { schemaVersion: proof.completion.schemaVersion, graphRevision: proof.completion.graphRevision, nodes: proof.completion.nodes },
@@ -69,9 +72,9 @@ const state = { revision: 20, nodes: currentNodes, appliedEvents: [{ nodeKey: "g
 const loaded = { rootTaskId: owner.rootTaskId, item: { id: "graph", revision: 20, content: {} },
   snapshot: { schemaVersion: "agent-harness.v2.task-graph.v1", rootSuccessCriteria: [], nodes }, state,
   tasks: new Map<string, Record<string, unknown>>([
-    ["scout-task", { id: "scout-task", status: "completed", role: "scout", attemptCount: 1, failureReason: null, result: {} }],
-    ["analyst-task", { id: "analyst-task", status: "completed", role: "analyst", attemptCount: 1, failureReason: null, result: {} }],
-    ["prepare-task", { id: "prepare-task", status: "completed", role: "prepare", attemptCount: 2, failureReason: null,
+    ["scout-task", { id: "scout-task", status: "completed", role: "scout", taskType: "job_discovery", attemptCount: 1, failureReason: null, result: {} }],
+    ["analyst-task", { id: "analyst-task", status: "completed", role: "analyst", taskType: "job_analysis", attemptCount: 1, failureReason: null, result: {} }],
+    ["prepare-task", { id: "prepare-task", status: "completed", role: "prepare", taskType: "scheduled_application_prepare", attemptCount: 2, failureReason: null,
       result: { structuredResult: {}, taskGraphScheduledPrepareProofFacts: proofFacts } }],
     ["gate-task", { id: "gate-task", status: "completed", attemptCount: 1, failureReason: null, result: gateResult }],
   ]) }

@@ -2,6 +2,7 @@ import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { SCHEDULED_AUDIT_NODE_CRITERIA, SCHEDULED_AUDIT_NODE_GOAL, SCHEDULED_AUDIT_TEMPLATE_ID } from "./scheduled-audit-contract.js"
 import type { ScheduledPipelineRecoveryOwner } from "./scheduled-pipeline-recovery-step.js"
 import { canonicalTaskGraphJson, parseTaskGraphSnapshot, taskGraphItemId, taskGraphProposalKey, TASK_GRAPH_ITEM_TYPE } from "./task-graph-snapshot.js"
+import { projectScheduledPipelineGraph, type ScheduledPipelineGraphVersion } from "./scheduled-pipeline-graph-shape.js"
 
 type Row = Record<string, unknown>
 type RecoveryItem = Readonly<{ id?: unknown; sessionId?: unknown; turnId?: unknown; stepId?: unknown; taskId?: unknown;
@@ -48,16 +49,13 @@ export function classifyScheduledPipelineRecoveryGraphItem(input: Readonly<{
   try {
     const snapshot = parseTaskGraphSnapshot(payload.content)
     const nodes = snapshot.nodes
-    const templateOrder = ["scout", "analyst", "prepare", "gate", SCHEDULED_AUDIT_TEMPLATE_ID]
-    if (!sameCanonical(payload.content, snapshot) || nodes.length !== 5
-      || !same(nodes.map(node => node.templateId), templateOrder)
-      || nodes[2]?.key !== "prepare" || nodes[3]?.key !== "gate" || nodes[4]?.key !== SCHEDULED_AUDIT_TEMPLATE_ID
-      || nodes.some((node, index) => node.depth !== index + 1
-        || !same(node.dependsOn, index === 0 ? [] : [nodes[index - 1]?.key]))
+    const version: ScheduledPipelineGraphVersion = nodes[0]?.templateId === "scout" && nodes[1]?.templateId === "analyst" ? "v1" : "v2"
+    const projection = projectScheduledPipelineGraph(nodes, version, "audit")
+    if (!sameCanonical(payload.content, snapshot) || !projection
       || nodes.some(node => !validId(node.taskId) || node.taskId === input.owner.rootTaskId)
-      || new Set(nodes.map(node => node.taskId)).size !== 5) return "invalid"
+      || new Set(nodes.map(node => node.taskId)).size !== nodes.length) return "invalid"
     const audits = nodes.filter(node => node.key === SCHEDULED_AUDIT_TEMPLATE_ID)
-    const audit = nodes[4]
+    const audit = projection.audit
     if (audits.length !== 1 || !audit || audit.key !== SCHEDULED_AUDIT_TEMPLATE_ID
       || audit.templateId !== SCHEDULED_AUDIT_TEMPLATE_ID || audit.taskId !== taskId || audit.depth !== 5
       || audit.goal !== SCHEDULED_AUDIT_NODE_GOAL || !same(audit.successCriteria, SCHEDULED_AUDIT_NODE_CRITERIA)

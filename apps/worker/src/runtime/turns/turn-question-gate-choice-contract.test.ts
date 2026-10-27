@@ -35,6 +35,15 @@ describe("scheduled Gate fixed-choice contract", () => {
     expect(parseTurnQuestionGateChoiceBinding({ ...binding, allowedChoiceIds: ["add_to_pending", "skip", "review"] })).toBeNull()
   })
 
+  it("accepts exact v2 continuation keys without changing the fixed choice binding", () => {
+    const v2 = { ...binding, continuationKey: `scheduled-taskgraph:v2:sha256:${"e".repeat(64)}` }
+    expect(parseTurnQuestionGateChoiceBinding(v2)).toEqual(v2)
+    for (const invalid of [`${v2.continuationKey}\n`, `${v2.continuationKey}\r`, `${v2.continuationKey}\u2028`, `${v2.continuationKey}\u2029`,
+      `scheduled-taskgraph:v3:sha256:${"e".repeat(64)}`]) {
+      expect(parseTurnQuestionGateChoiceBinding({ ...v2, continuationKey: invalid })).toBeNull()
+    }
+  })
+
   it("accepts only the exact single-job weak-letter choice contract", () => {
     const weak = { ...binding, kind: "weak_cover_letter", jobIds: ["job-weak"],
       allowedChoiceIds: ["continue", "review", "skip"] }

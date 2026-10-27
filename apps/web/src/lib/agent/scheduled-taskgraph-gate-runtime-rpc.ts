@@ -11,11 +11,14 @@ import { isActiveAccount } from './run-service-helpers'
 import { AgentExecutionCancelledError } from './execution-control'
 import { buildScheduledTaskGraphGateCheckpoint } from './scheduled-taskgraph-gate-checkpoint'
 import { isScheduledTaskGraphAuditChildGateProofCurrent, isScheduledTaskGraphGateProofCurrent, loadScheduledTaskGraphGateInput, scheduledTaskGraphAnalyzeCheckpointForGate } from './scheduled-taskgraph-gate-input'
+import { parseScheduledTaskGraphAttestation, scheduledTaskGraphAttestationCandidates } from './scheduled-taskgraph-attestation-candidates'
 import { parseScheduledAutomationSnapshot } from './scheduled-automation-snapshot'
 import { scheduledAutomationSnapshotDigest, scheduledTaskGraphContinuationKey,
   type ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 import { scheduledTaskGraphClaimMatches } from './scheduled-taskgraph-pipeline-fence'
 import { replayCompletedScheduledTaskGraphAuditReport, replayCompletedScheduledTaskGraphReport } from './scheduled-taskgraph-completed-report-replay'
+import { blocked, gateFailureDiagnostic, matchingTurnSnapshot, scheduledTaskGraphClaimIsValid, scheduledTaskGraphLineageOwnerIsSame, scheduledTaskGraphRootLeaseIsLive } from './scheduled-taskgraph-pipeline-request'
+import { sameScheduledTaskGraphJson as sameJson } from './scheduled-taskgraph-canonical-prefix'
 import { runScheduledGate } from './stages/gate'
 import { executeScheduledTaskGraphGate } from './scheduled-taskgraph-gate-service'
 import { scheduledTaskGraphAuditExecutionOwner, scheduledTaskGraphExecuteGateCompletionProof, scheduledTaskGraphGateTaskLeaseIsCurrent, scheduledTaskGraphGateTurnIsCurrent, type ScheduledTaskGraphAuditExecuteRpcRequest, type ScheduledTaskGraphExecuteRpcRequest, type ScheduledTaskGraphGateRpcRequest } from './scheduled-taskgraph-gate-rpc'
@@ -25,14 +28,9 @@ import type { PipelineCtx } from './pipeline-context'
 type GateAction = ScheduledTaskGraphGateRpcRequest | ScheduledTaskGraphExecuteRpcRequest | ScheduledTaskGraphAuditExecuteRpcRequest
 type ExecuteContinuation = Readonly<{ kind: 'execute'; request: ScheduledTaskGraphExecuteRpcRequest }>
 type AuditExecuteContinuation = Readonly<{ kind: 'scheduled_audit_execute'; request: ScheduledTaskGraphAuditExecuteRpcRequest }>
-type GateFailurePhase = 'owner_assertion' | 'gate_execution'
-type GateFailureErrorClass = 'prisma_known_request_error' | 'agent_execution_cancelled' | 'type_error' | 'range_error' | 'syntax_error' | 'error' | 'non_error'
-type GateFailureDiagnostic = Readonly<{ phase: GateFailurePhase; errorClass: GateFailureErrorClass; prismaCode?: string; safeErrorCode?: string }>
 type TurnRow = { id: string; userId: string; sessionId: string; rootTaskId: string | null; source: string; executionMode: string | null; input: unknown; status: string; leaseOwnerId: string | null; leaseVersion: number; leaseExpiresAt: Date | null }
 type OwnerState = { owner: ScheduledTaskGraphPipelineOwner; key: string; snapshot: ReturnType<typeof parseScheduledAutomationSnapshot>; state: Record<string, unknown>; claimToken: string; jobs: Job[]; waitId?: string }
-const CLAIM_SCHEMA = 'agent-harness.v2.scheduled-pipeline-claim.v1'
 const CLAIM_TTL_MS = 600_000
-const GATE_SAFE_ERROR_CODES = ['scheduled_taskgraph_gate_result_invalid', 'application_review_session_scope_required'] as const
 
 /** Runs the private Gate action or returns an Execute request after persisted proof validation. */
 export async function runScheduledTaskGraphActionRpc(request: GateAction, signal?: AbortSignal): Promise<Response | ExecuteContinuation | AuditExecuteContinuation> {
@@ -43,7 +41,7 @@ export async function runScheduledTaskGraphActionRpc(request: GateAction, signal
 async function runGateAction(request: ScheduledTaskGraphGateRpcRequest, signal?: AbortSignal): Promise<Response> {
   const turn = await db.agentTurn.findFirst({ where: { id: request.owner.turnId, userId: request.owner.userId,
     sessionId: request.owner.sessionId, rootTaskId: request.owner.rootTaskId }, select: { input: true } })
-  const snapshot = scheduledSnapshot(turn?.input)
+  const snapshot = matchingTurnSnapshot(turn?.input)
   if (!snapshot) return blocked(409, 'scheduled_pipeline_mode_mismatch')
   const denied = await admission(request.owner.userId, snapshot)
   if (denied) return denied
@@ -93,7 +91,7 @@ async function runGateAction(request: ScheduledTaskGraphGateRpcRequest, signal?:
     assertExecutionCurrent: assertFreshCurrent,
     autonomous: snapshot.autoApply, emit: () => undefined, signal,
   }
-  let failurePhase: GateFailurePhase = 'owner_assertion'
+  let failurePhase: 'owner_assertion' | 'gate_execution' = 'owner_assertion'
   try {
     if (!await context.assertExecutionCurrent?.()) throw new AgentExecutionCancelledError()
     failurePhase = 'gate_execution'
@@ -144,7 +142,7 @@ async function lockOwner(tx: Prisma.TransactionClient, request: GateAction, sign
   if (!turn || turn.rootTaskId !== request.owner.rootTaskId || turn.source !== 'automation'
     || turn.executionMode !== 'canonical_task_graph' || request.action !== 'scheduled_audit_execute'
       && !scheduledTaskGraphGateTurnIsCurrent(turn, { owner: request.owner, mode: request.action === 'gate' ? 'gate_child' : 'root_execute' })) return null
-  const snapshot = scheduledSnapshot(turn.input)
+  const snapshot = matchingTurnSnapshot(turn.input)
   if (!snapshot) return null
   const roots = await tx.$queryRaw<Array<{ id: string; sessionId: string; turnId: string; rootTaskId: string;
     parentTaskId: string | null; status: string; attemptCount: number; interruptRequestedAt: Date | null; closedAt: Date | null }>>(Prisma.sql`
@@ -172,7 +170,7 @@ async function lockOwner(tx: Prisma.TransactionClient, request: GateAction, sign
   `)
   const execution = executions[0]
   if (signal?.aborted || !execution || execution.status !== 'running' || !Number.isSafeInteger(execution.attemptCount)) return null
-  if (request.action === 'execute' && !liveRootLease(turn, request.owner)) return null
+  if (request.action === 'execute' && !scheduledTaskGraphRootLeaseIsLive(turn, request.owner)) return null
   const requestOwner: ScheduledTaskGraphPipelineOwner = { ...request.owner, executionId: execution.id, executionAttemptCount: execution.attemptCount }
   let key: string
   try { key = scheduledTaskGraphContinuationKey(requestOwner, request.attestation) } catch { return null }
@@ -187,11 +185,12 @@ async function lockOwner(tx: Prisma.TransactionClient, request: GateAction, sign
   }
   const waitId = scheduledTaskGraphPrepareWaitId(request, state, snapshot.requireApproval)
   if (waitId === null) return null
-  if (!state || !['gate', 'execute', 'audit'].includes(String(state.nextStage)) || !validClaim(claim, owner, key, claimToken)
+  if (!state || !['gate', 'execute', 'audit'].includes(String(state.nextStage))
+    || !scheduledTaskGraphClaimIsValid(claim, owner, key, claimToken)
     || !scheduledTaskGraphClaimMatches(state, key, owner, claimToken as string)
     || request.action === 'gate' && state.nextStage !== 'gate') return null
   const continuation = record(state.scheduledTaskGraphContinuation)
-  if (!continuation || continuation.key !== key || !sameLineageOwner(continuation.owner, owner)) return null
+  if (!continuation || continuation.key !== key || !scheduledTaskGraphLineageOwnerIsSame(continuation.owner, owner)) return null
   const gate = request.action === 'gate'
     ? { taskId: request.gateTaskId, attemptCount: request.gateAttemptCount, phase: 'running' as const }
     : { taskId: gateCompletion!.taskId, attemptCount: gateCompletion!.attemptCount, phase: 'completed' as const, completionProof: gateCompletion!.completionProof }
@@ -203,7 +202,8 @@ async function lockOwner(tx: Prisma.TransactionClient, request: GateAction, sign
     ? validateScheduledTaskGraphAuditPrepareSource : validateScheduledPrepareWaitIdentity
   const prepareIsCurrent = await validatePrepare({ owner, snapshot, proof: request.prepareProof, ...(waitId ? { scheduledWaitId: waitId } : {}) }).catch(() => false)
   if (!proofCurrent || !prepareIsCurrent) return null
-  const ids = candidateIds(request.attestation)
+  const parsedAttestation = parseScheduledTaskGraphAttestation(request.attestation)
+  const ids = parsedAttestation ? [...scheduledTaskGraphAttestationCandidates(parsedAttestation).selectedJobIds] : null
   if (!ids) return null
   const jobs = await tx.job.findMany({ where: { userId: owner.userId, id: { in: ids } } }) as Job[]
   if (jobs.length !== ids.length || new Set(jobs.map(job => job.id)).size !== ids.length) return null
@@ -242,59 +242,9 @@ async function admission(userId: string, snapshot: ReturnType<typeof parseSchedu
   if (snapshot.autoApply && !await hasEffectiveEntitlement(userId, 'auto_apply')) return blocked(403, 'scheduled_pipeline_entitlement_required')
   return null
 }
-function scheduledSnapshot(value: unknown) {
-  const input = record(value)
-  if (input?.automationRunMode !== 'scheduled') return null
-  try { return parseScheduledAutomationSnapshot(input.scheduledAutomationSnapshot) } catch { return null }
-}
-function candidateIds(attestation: unknown): string[] | null {
-  const scout = record(record(attestation)?.scout), ids = scout?.candidateJobIds
-  return Array.isArray(ids) && ids.length <= 100 && ids.every(validId) && new Set(ids).size === ids.length ? [...ids] : null
-}
-function validClaim(claim: Record<string, unknown> | null, owner: ScheduledTaskGraphPipelineOwner, key: string, token: unknown): boolean {
-  return Boolean(claim && Object.keys(claim).length === 6 && claim.schemaVersion === CLAIM_SCHEMA && claim.key === key
-    && validId(token) && claim.claimToken === token && sameLineageOwner(claim.owner, owner)
-    && typeof claim.claimedAt === 'string' && Number.isFinite(Date.parse(claim.claimedAt))
-    && typeof claim.leaseExpiresAt === 'string' && Number.isFinite(Date.parse(claim.leaseExpiresAt)))
-}
-function liveRootLease(turn: TurnRow, owner: ScheduledTaskGraphGateRpcRequest['owner']): boolean {
-  return turn.status === 'in_progress' && turn.leaseOwnerId === owner.turnLeaseOwnerId && turn.leaseVersion === owner.turnLeaseVersion
-    && turn.leaseExpiresAt instanceof Date && turn.leaseExpiresAt.getTime() > Date.now()
-}
-function sameLineageOwner(value: unknown, owner: ScheduledTaskGraphPipelineOwner): boolean {
-  const row = record(value)
-  return Boolean(row && ['userId', 'sessionId', 'turnId', 'rootTaskId', 'rootAttemptCount', 'executionId', 'executionAttemptCount']
-    .every(key => row[key] === owner[key as keyof ScheduledTaskGraphPipelineOwner]))
-}
-function materialRefs(rows: readonly { jobId: string; kind: string; artifactRef: unknown }[]) {
-  return rows.map(row => [row.jobId, row.kind, row.artifactRef]).sort((a, b) => String(a[0]).localeCompare(String(b[0])) || String(a[1]).localeCompare(String(b[1])))
-}
-function sameJson(left: unknown, right: unknown): boolean { try { return JSON.stringify(canonical(left)) === JSON.stringify(canonical(right)) } catch { return false } }
-function canonical(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonical)
-  const row = record(value)
-  return row ? Object.fromEntries(Object.keys(row).sort().map(key => [key, canonical(row[key])])) : value
-}
+function materialRefs(rows: readonly { jobId: string; kind: string; artifactRef: unknown }[]) { return rows.map(row => [row.jobId, row.kind, row.artifactRef]).sort((a, b) => String(a[0]).localeCompare(String(b[0])) || String(a[1]).localeCompare(String(b[1]))) }
 function record(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const prototype = Object.getPrototypeOf(value)
   return prototype === Object.prototype || prototype === null ? value as Record<string, unknown> : null
-}
-function validId(value: unknown): value is string { return typeof value === 'string' && value.length > 0 && value.length <= 256 && value.trim() === value }
-function gateFailureDiagnostic(phase: GateFailurePhase, error: unknown): GateFailureDiagnostic {
-  const safeErrorCode = error instanceof Error && GATE_SAFE_ERROR_CODES.includes(error.message as typeof GATE_SAFE_ERROR_CODES[number])
-    ? error.message as typeof GATE_SAFE_ERROR_CODES[number] : undefined
-  if (error instanceof Prisma.PrismaClientKnownRequestError) {
-    const prismaCode = /^P\d{4}$/.test(error.code) ? error.code : undefined
-    return { phase, errorClass: 'prisma_known_request_error', ...(prismaCode ? { prismaCode } : {}),
-      ...(safeErrorCode ? { safeErrorCode } : {}) }
-  }
-  const errorClass: GateFailureErrorClass = error instanceof AgentExecutionCancelledError ? 'agent_execution_cancelled'
-    : error instanceof TypeError ? 'type_error' : error instanceof RangeError ? 'range_error'
-      : error instanceof SyntaxError ? 'syntax_error' : error instanceof Error ? 'error' : 'non_error'
-  return { phase, errorClass, ...(safeErrorCode ? { safeErrorCode } : {}) }
-}
-function blocked(status: number, errorCode: string, testDiagnostic?: GateFailureDiagnostic): Response {
-  return Response.json({ status: 'blocked', errorCode,
-    ...(process.env.NODE_ENV === 'test' && testDiagnostic ? { testDiagnostic } : {}) }, { status })
 }

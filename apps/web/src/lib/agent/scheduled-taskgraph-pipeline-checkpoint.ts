@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto"
 import { types as nodeTypes } from "node:util"
 import type { Job } from "@prisma/client"
+import { parseScheduledPipelineAttestation, scheduledPipelineContinuationKeyMaterial,
+  type ScheduledPipelineAttestation, type ScheduledPipelineAttestationOwner, type ScheduledPipelineScoutAttestationV1,
+  type ScheduledPipelineScoutProofV2 } from "@jobcopilot/agent-protocol"
 import { parseScheduledAutomationSnapshot } from "./scheduled-automation-snapshot"
 import type { AnalyzeOutput, PipelineCheckpointState, ScoredJob, StageResult } from "./types"
-
-const ATTESTATION_SCHEMA = "agent-harness.v2.scheduled-pipeline-attestation.v1"
+import { scheduledTaskGraphAttestationCandidates } from "./scheduled-taskgraph-attestation-candidates"
 const CONTINUATION_SCHEMA = "agent-harness.v2.scheduled-pipeline-continuation.v1"
 const HEX_DIGEST = /^[a-f0-9]{64}$/
 const SNAPSHOT_DIGEST = /^sha256:[a-f0-9]{64}$/
@@ -13,14 +15,6 @@ const PIPELINE_STAGES = new Set(["scout", "analyze", "prepare", "gate", "execute
 export interface ScheduledTaskGraphPipelineOwner {
   userId: string; sessionId: string; turnId: string; rootTaskId: string;
   rootAttemptCount: number; turnLeaseOwnerId: string; turnLeaseVersion: number; executionId: string; executionAttemptCount: number
-}
-interface AttestationOwner { userId: string; sessionId: string; turnId: string; rootTaskId: string; rootAttemptCount: number; turnLeaseOwnerId: string; turnLeaseVersion: number }
-interface DiscoveryReceipt { status: "complete"; taskId: string; attemptCount: number; completedCalls: number; candidateCount: number; providerFailures: number; materializationFailures: number; hasMore: boolean; receiptDigest: string }
-
-interface ScheduledPipelineAttestation {
-  schemaVersion: typeof ATTESTATION_SCHEMA; owner: AttestationOwner; snapshotDigest: string; graphRevision: number;
-  scout: { taskId: string; attemptCount: number; status: "completed"; verification: "passed"; resultDigest: string; candidateJobIds: string[]; discoveryReceipt: DiscoveryReceipt };
-  analyst: { taskId: string; attemptCount: number; status: "completed"; verification: "passed"; resultDigest: string; dependsOnTaskIds: string[]; jobIds: string[] }; evidenceDigest: string
 }
 export interface ScheduledTaskGraphPipelineCheckpoint extends PipelineCheckpointState { scheduledTaskGraphContinuation: { schemaVersion: typeof CONTINUATION_SCHEMA; key: string; owner: ScheduledTaskGraphPipelineOwner; snapshotDigest: string; graphRevision: number; evidenceDigest: string } }
 export interface BuildScheduledTaskGraphCheckpointInput {
@@ -31,17 +25,14 @@ export interface BuildScheduledTaskGraphCheckpointResult { checkpoint: Scheduled
 export type ScheduledTaskGraphCheckpointReason = "invalid_owner" | "invalid_snapshot" | "invalid_attestation" | "owner_mismatch" | "snapshot_mismatch" | "discovery_incomplete" | "checkpoint_conflict" | "jobs_mismatch" | "analysis_invalid"
 export class ScheduledTaskGraphCheckpointError extends Error {
   readonly code = "scheduled_taskgraph_checkpoint_blocked"
-  constructor(readonly reason: ScheduledTaskGraphCheckpointReason) {
-    super("Scheduled TaskGraph evidence cannot continue to Prepare."); this.name = "ScheduledTaskGraphCheckpointError"
-  }
+  constructor(readonly reason: ScheduledTaskGraphCheckpointReason) { super("Scheduled TaskGraph evidence cannot continue to Prepare."); this.name = "ScheduledTaskGraphCheckpointError" }
 }
 
 export function scheduledAutomationSnapshotDigest(value: unknown): string {
   let snapshot: ReturnType<typeof parseScheduledAutomationSnapshot>
   try { snapshot = parseScheduledAutomationSnapshot(value) }
   catch { throw new ScheduledTaskGraphCheckpointError("invalid_snapshot") }
-  const projection = [snapshot.schemaVersion, snapshot.targetRoles, snapshot.targetLocations, snapshot.minScore,
-    snapshot.dailyCap, snapshot.requireApproval, snapshot.autoApply]
+  const projection = [snapshot.schemaVersion, snapshot.targetRoles, snapshot.targetLocations, snapshot.minScore, snapshot.dailyCap, snapshot.requireApproval, snapshot.autoApply]
   return "sha256:" + createHash("sha256").update(JSON.stringify(projection), "utf8").digest("hex")
 }
 
@@ -49,7 +40,7 @@ export function scheduledTaskGraphContinuationKey(owner: ScheduledTaskGraphPipel
   validateOwner(owner)
   const attestation = parseAttestation(value)
   assertAttestationOwner(attestation.owner, owner)
-  assertDiscoveryReceipt(attestation.scout)
+  assertDiscoveryReceipts(attestation)
   return createContinuationKey(owner, attestation)
 }
 
@@ -61,10 +52,10 @@ export function buildScheduledTaskGraphPrepareCheckpoint(
   const attestation = parseAttestation(input.attestation)
   assertAttestationOwner(attestation.owner, input.owner)
   if (attestation.snapshotDigest !== snapshotDigest) fail("snapshot_mismatch")
-  assertDiscoveryReceipt(attestation.scout)
+  assertDiscoveryReceipts(attestation)
   const continuationKey = scheduledTaskGraphContinuationKey(input.owner, input.attestation)
   const existing = parseExistingCheckpoint(input.existingCheckpoint)
-  const candidateIds = attestation.scout.candidateJobIds
+  const candidateIds = [...scheduledTaskGraphAttestationCandidates(attestation).selectedJobIds]
   const ownedJobs = validateOwnedJobs(input.ownedJobs, candidateIds, input.owner.userId)
   if (existing?.marker) {
     if (existing.marker.key !== continuationKey || !sameOwner(existing.marker.owner, input.owner)
@@ -107,57 +98,25 @@ function validateOwner(owner: ScheduledTaskGraphPipelineOwner): void {
     || !positiveInteger(owner.rootAttemptCount) || !positiveInteger(owner.turnLeaseVersion) || !safeCount(owner.executionAttemptCount)) fail("invalid_owner")
 }
 function parseAttestation(value: unknown): ScheduledPipelineAttestation {
-  if (!safeJsonData(value) || !exactRecord(value, ["schemaVersion", "owner", "snapshotDigest", "graphRevision", "scout", "analyst", "evidenceDigest"])) fail("invalid_attestation")
-  const row = value as Record<string, unknown>
-  const owner = parseOwner(row.owner)
-  if (row.schemaVersion !== ATTESTATION_SCHEMA || !isSnapshotDigest(row.snapshotDigest)
-    || !positiveInteger(row.graphRevision) || !isDigest(row.evidenceDigest)) fail("invalid_attestation")
-  const scoutRow = exactRecord(row.scout, ["taskId", "attemptCount", "status", "verification", "resultDigest", "candidateJobIds", "discoveryReceipt"])
-  const analystRow = exactRecord(row.analyst, ["taskId", "attemptCount", "status", "verification", "resultDigest", "dependsOnTaskIds", "jobIds"])
-  if (!scoutRow || !analystRow || !owner) fail("invalid_attestation")
-  const scout = parseScout(scoutRow)
-  const analyst = parseAnalyst(analystRow)
-  if (!scout || !analyst || analyst.dependsOnTaskIds.length !== 1 || analyst.dependsOnTaskIds[0] !== scout.taskId
-    || analyst.jobIds.some(id => !scout.candidateJobIds.includes(id))) fail("invalid_attestation")
-  return { schemaVersion: ATTESTATION_SCHEMA, owner, snapshotDigest: row.snapshotDigest, graphRevision: row.graphRevision as number, scout, analyst, evidenceDigest: row.evidenceDigest }
+  if (!safeJsonData(value)) fail("invalid_attestation")
+  const parsed = parseScheduledPipelineAttestation(value)
+  if (!parsed) fail("invalid_attestation")
+  return parsed
 }
-function parseOwner(value: unknown): AttestationOwner | null {
-  if (!exactRecord(value, ["userId", "sessionId", "turnId", "rootTaskId", "rootAttemptCount", "turnLeaseOwnerId", "turnLeaseVersion"])) return null
-  const row = value as Record<string, unknown>
-  return [row.userId, row.sessionId, row.turnId, row.rootTaskId, row.turnLeaseOwnerId].every(validId)
-    && positiveInteger(row.rootAttemptCount) && positiveInteger(row.turnLeaseVersion)
-    ? { userId: row.userId as string, sessionId: row.sessionId as string, turnId: row.turnId as string, rootTaskId: row.rootTaskId as string, rootAttemptCount: row.rootAttemptCount as number, turnLeaseOwnerId: row.turnLeaseOwnerId as string, turnLeaseVersion: row.turnLeaseVersion as number }
-    : null
+function assertDiscoveryReceipts(attestation: ScheduledPipelineAttestation): void {
+  if (attestation.schemaVersion === "agent-harness.v2.scheduled-pipeline-attestation.v1") {
+    assertDiscoveryReceipt(attestation.scout)
+  } else {
+    for (const scout of attestation.scouts) assertDiscoveryReceipt(scout)
+  }
 }
-function parseScout(row: Record<string, unknown>): ScheduledPipelineAttestation["scout"] | null {
-  const candidateJobIds = uniqueIds(row.candidateJobIds)
-  const receipt = parseDiscoveryReceipt(row.discoveryReceipt)
-  if (!validId(row.taskId) || !positiveInteger(row.attemptCount) || row.status !== "completed" || row.verification !== "passed"
-    || !isDigest(row.resultDigest) || !candidateJobIds || !receipt) return null
-  return { taskId: row.taskId, attemptCount: row.attemptCount as number, status: "completed", verification: "passed", resultDigest: row.resultDigest, candidateJobIds, discoveryReceipt: receipt }
-}
-function parseAnalyst(row: Record<string, unknown>): ScheduledPipelineAttestation["analyst"] | null {
-  const dependsOnTaskIds = uniqueIds(row.dependsOnTaskIds)
-  const jobIds = uniqueIds(row.jobIds)
-  if (!validId(row.taskId) || !positiveInteger(row.attemptCount) || row.status !== "completed" || row.verification !== "passed"
-    || !isDigest(row.resultDigest) || !dependsOnTaskIds || !jobIds) return null
-  return { taskId: row.taskId, attemptCount: row.attemptCount as number, status: "completed", verification: "passed", resultDigest: row.resultDigest, dependsOnTaskIds, jobIds }
-}
-function parseDiscoveryReceipt(value: unknown): DiscoveryReceipt | null {
-  if (!exactRecord(value, ["status", "taskId", "attemptCount", "completedCalls", "candidateCount", "providerFailures", "materializationFailures", "hasMore", "receiptDigest"])) return null
-  const row = value as Record<string, unknown>
-  if (row.status !== "complete" || !validId(row.taskId) || !positiveInteger(row.attemptCount)
-    || !safeCount(row.completedCalls) || !safeCount(row.candidateCount) || !safeCount(row.providerFailures)
-    || !safeCount(row.materializationFailures) || typeof row.hasMore !== "boolean" || !isDigest(row.receiptDigest)) return null
-  return { status: "complete", taskId: row.taskId, attemptCount: row.attemptCount as number, completedCalls: row.completedCalls as number, candidateCount: row.candidateCount as number, providerFailures: row.providerFailures as number, materializationFailures: row.materializationFailures as number, hasMore: row.hasMore, receiptDigest: row.receiptDigest }
-}
-function assertDiscoveryReceipt(scout: ScheduledPipelineAttestation["scout"]): void {
+function assertDiscoveryReceipt(scout: ScheduledPipelineScoutAttestationV1 | ScheduledPipelineScoutProofV2): void {
   const receipt = scout.discoveryReceipt
   if (receipt.taskId !== scout.taskId || receipt.attemptCount !== scout.attemptCount || receipt.completedCalls < 1
     || receipt.candidateCount !== scout.candidateJobIds.length || receipt.providerFailures !== 0
     || receipt.materializationFailures !== 0 || receipt.hasMore) fail("discovery_incomplete")
 }
-function assertAttestationOwner(actual: AttestationOwner, expected: ScheduledTaskGraphPipelineOwner): void {
+function assertAttestationOwner(actual: ScheduledPipelineAttestationOwner, expected: ScheduledTaskGraphPipelineOwner): void {
   if (actual.userId !== expected.userId || actual.sessionId !== expected.sessionId || actual.turnId !== expected.turnId
     || actual.rootTaskId !== expected.rootTaskId || actual.rootAttemptCount !== expected.rootAttemptCount) fail("owner_mismatch")
 }
@@ -243,13 +202,10 @@ function parseExecutionOwner(value: unknown): ScheduledTaskGraphPipelineOwner | 
     executionId: row.executionId as string, executionAttemptCount: row.executionAttemptCount as number }
 }
 function createContinuationKey(owner: ScheduledTaskGraphPipelineOwner, attestation: ScheduledPipelineAttestation): string {
-  const receipt = attestation.scout.discoveryReceipt
-  const evidence = [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.rootAttemptCount,
-    owner.executionId, owner.executionAttemptCount, attestation.snapshotDigest, attestation.graphRevision,
-    attestation.scout.taskId, attestation.scout.attemptCount, attestation.scout.resultDigest,
-    attestation.analyst.taskId, attestation.analyst.attemptCount, attestation.analyst.resultDigest,
-    attestation.evidenceDigest, receipt.receiptDigest]
-  return "scheduled-taskgraph:sha256:" + createHash("sha256").update(JSON.stringify(evidence), "utf8").digest("hex")
+  const material = scheduledPipelineContinuationKeyMaterial(attestation, {
+    executionId: owner.executionId, executionAttemptCount: owner.executionAttemptCount,
+  })
+  return material.keyPrefix + createHash("sha256").update(material.serializedPreimage, "utf8").digest("hex")
 }
 function sameOwner(left: ScheduledTaskGraphPipelineOwner, right: ScheduledTaskGraphPipelineOwner): boolean {
   return left.userId === right.userId && left.sessionId === right.sessionId && left.turnId === right.turnId
@@ -281,10 +237,6 @@ function safeJsonData(value: unknown, seen = new Set<object>()): boolean {
     })())
   } catch { return false }
   finally { seen.delete(value) }
-}
-function uniqueIds(value: unknown): string[] | null {
-  if (!Array.isArray(value) || !value.every(validId) || new Set(value).size !== value.length) return null
-  return [...value]
 }
 function stringList(value: unknown): value is string[] { return Array.isArray(value) && value.every(item => typeof item === "string") }
 function validId(value: unknown): value is string { return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value }

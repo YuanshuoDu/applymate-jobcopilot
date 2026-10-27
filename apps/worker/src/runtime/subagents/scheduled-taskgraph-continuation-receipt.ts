@@ -2,15 +2,13 @@ import { createHash } from "node:crypto"
 import { parseScheduledAutomationSnapshot } from "./scheduled-automation-snapshot.js"
 import { TaskGraphCommandError, parseScheduledPrepareProposal, type TaskGraphScheduledPrepareInput, type TaskGraphCurrentState, type TaskGraphScheduleReceipt } from "./task-graph-command-port.js"
 import { scheduledTaskGraphContinuationKey } from "./scheduled-pipeline-handoff.js"
-import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
-import { canonicalTaskGraphJson, taskGraphFingerprint, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
-import type { GraphTaskRow } from "./task-graph-pg-state.js"
-import { parseDiscoveryAttemptSidecar } from "./child-discovery-attempt.js"
-import { validateRoleResult } from "./role-results.js"
-import { parseStoredTaskGraphVerificationReport, publicTaskGraphVerificationReport } from "./task-graph-verification-report.js"
-import type { ScheduledAutomationPipelineAttestation } from "./scheduled-automation-pipeline-bridge.js"
-import { taskGraphVerificationDependencyNodeKeys } from "../planning/task-graph-verification.js"
+import { taskGraphFingerprint, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
+import { parseScheduledPipelineAttestation } from "@jobcopilot/agent-protocol"
+import { scheduledTaskGraphContinuationBindingDigestProjection, scheduledTaskGraphContinuationKeyVersion, scheduledTaskGraphStableKey } from "./scheduled-pipeline-continuation-key.js"
 import type { Queryable } from "./pg-store-persistence.js"
+import { scheduledAnalyzeGraphMatches as verifyScheduledAnalyzeGraph } from "./scheduled-analyze-graph-proof.js"
+import type { GraphTaskRow } from "./task-graph-pg-state.js"
+import { projectScheduledPipelineGraph } from "./scheduled-pipeline-graph-shape.js"
 
 export const SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_SCHEMA = "agent-harness.v2.scheduled-taskgraph-continuation-receipt.v1" as const
 export const SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_EVENT = "agent.plan.scheduled_prepare_binding" as const
@@ -21,7 +19,7 @@ const BINDING_KEYS = RECEIPT_KEYS.filter((key) => key !== "schemaVersion")
 const OWNER_KEYS = ["userId", "sessionId", "turnId", "rootTaskId", "rootAttemptCount", "turnLeaseOwnerId",
   "turnLeaseVersion", "executionId", "executionAttemptCount"] as const
 const ID = /^[^\u0000-\u001f\u007f]+$/
-const CONTINUATION_KEY = /^scheduled-taskgraph:sha256:[a-f0-9]{64}$/
+const CONTINUATION_KEY = /^scheduled-taskgraph:(?:v2:)?sha256:[a-f0-9]{64}$/
 const SNAPSHOT_DIGEST = /^sha256:[a-f0-9]{64}$/
 const HEX_DIGEST = /^[a-f0-9]{64}$/
 const CLAIM_SCHEMA = "agent-harness.v2.scheduled-pipeline-claim.v1"
@@ -35,21 +33,26 @@ export type ScheduledTaskGraphContinuationReceipt = ScheduledTaskGraphContinuati
 export type ScheduledTaskGraphContinuationContract = Readonly<{ binding: ScheduledTaskGraphContinuationBinding; receipt: ScheduledTaskGraphContinuationReceipt; bindingDigest: string; proposalFingerprint: string; claimTokenDigest: string }>
 /** The claim digest is transient proof material and is intentionally absent from the receipt/fingerprint. */
 export function createScheduledTaskGraphContinuationContract(input: TaskGraphScheduledPrepareInput): ScheduledTaskGraphContinuationContract | null {
-  const { scope, executionOwner, handoff, attestation } = input, owner = attestation?.owner
-  if (!owner || attestation.schemaVersion !== "agent-harness.v2.scheduled-pipeline-attestation.v1"
+  const { scope, executionOwner, handoff } = input
+  const attestation = parseScheduledPipelineAttestation(input.attestation), owner = attestation?.owner
+  const version = attestation?.schemaVersion === 'agent-harness.v2.scheduled-pipeline-attestation.v2' ? 'v2' : 'v1'
+  const sourceTaskIds = !attestation ? [] : attestation.schemaVersion === 'agent-harness.v2.scheduled-pipeline-attestation.v2'
+    ? attestation.scouts.map(source => source.taskId) : [attestation.scout.taskId]
+  const dependencyTaskIds = [...sourceTaskIds].sort()
+  if (!attestation || !owner || scheduledTaskGraphContinuationKeyVersion(handoff?.continuationKey) !== version
     || !PREPARE_CLAIM_DIGEST.test(handoff?.claimTokenDigest ?? "") || handoff.status !== "analyze_checkpointed"
     || scope.parentTaskId !== scope.rootTaskId || owner.userId !== scope.userId || owner.sessionId !== scope.sessionId
     || owner.turnId !== scope.turnId || owner.rootTaskId !== scope.rootTaskId || owner.rootAttemptCount !== scope.parentAttemptCount
     || owner.turnLeaseOwnerId !== scope.turnLeaseOwner || owner.turnLeaseVersion !== scope.turnLeaseVersion
     || handoff.executionId !== executionOwner.executionId || handoff.executionAttemptCount !== executionOwner.executionAttemptCount
-    || attestation.scout.status !== "completed" || attestation.scout.verification !== "passed"
-    || attestation.analyst.status !== "completed" || attestation.analyst.verification !== "passed"
-    || attestation.analyst.dependsOnTaskIds.length !== 1 || attestation.analyst.dependsOnTaskIds[0] !== attestation.scout.taskId
+    || attestation.analyst.dependsOnTaskIds.length !== dependencyTaskIds.length
+    || attestation.analyst.dependsOnTaskIds.some((taskId, index) => taskId !== dependencyTaskIds[index])
     || handoff.continuationKey !== scheduledTaskGraphContinuationKey(owner, attestation, executionOwner.executionId, executionOwner.executionAttemptCount)) return null
   const binding: ScheduledTaskGraphContinuationBinding = { owner: { ...owner, ...executionOwner }, continuationKey: handoff.continuationKey,
     snapshotDigest: attestation.snapshotDigest, evidenceDigest: attestation.evidenceDigest, checkpointDigest: handoff.checkpointDigest,
     analyzeGraphRevision: attestation.graphRevision, prepareScheduleRevision: attestation.graphRevision + 1 }
-  const receipt = buildScheduledTaskGraphContinuationReceipt({ ...binding, continuationKey: stableContinuationKey(binding) })
+  const stableKey = scheduledTaskGraphStableKey(binding)
+  const receipt = stableKey && buildScheduledTaskGraphContinuationReceipt({ ...binding, continuationKey: stableKey })
   const bindingDigest = receipt && scheduledTaskGraphContinuationBindingDigest(receipt)
   if (!receipt || !bindingDigest) return null
   return { binding, receipt, bindingDigest,
@@ -81,107 +84,32 @@ export function scheduledSnapshotMatches(turnValue: unknown, digest: string): bo
 /** Validates the persisted Analyze DAG, typed results, verification receipts, and bridge attestation. */
 export function scheduledAnalyzeGraphMatches(input: TaskGraphScheduledPrepareInput, snapshot: TaskGraphSnapshot, current: TaskGraphCurrentState,
   tasks: ReadonlyMap<string, GraphTaskRow>, hasPrepare: boolean): string | null {
-  try {
-    const a = input.attestation, baseNodes = snapshot.nodes.slice(0, 2), expectedRevision = a.graphRevision + (hasPrepare ? 1 : 0)
-    if (!Number.isSafeInteger(expectedRevision) || !Number.isSafeInteger(current.revision) || current.revision < expectedRevision
-      || (current.revision > expectedRevision && (!hasPrepare || current.nodes.find(value => value.key === "prepare")?.status === "queued"))
-      || snapshot.nodes.length !== 2 + Number(hasPrepare) || current.nodes.length !== snapshot.nodes.length || baseNodes.length !== 2) return null
-    const scoutNode = baseNodes.find(node => node.templateId === "scout"), analystNode = baseNodes.find(node => node.templateId === "analyst")
-    if (!scoutNode || !analystNode || baseNodes.some(node => node !== scoutNode && node !== analystNode)
-      || scoutNode.dependsOn.length !== 0 || analystNode.dependsOn.length !== 1 || analystNode.dependsOn[0] !== scoutNode.key
-      || scoutNode.verificationDisposition !== "typed" || scoutNode.verification?.role !== "scout"
-      || analystNode.verificationDisposition !== "typed" || analystNode.verification?.role !== "analyst") return null
-    const scout = readVerifiedNode(scoutNode, current, tasks, "scout", []), analyst = readVerifiedNode(analystNode, current, tasks, "analyst", [scoutNode.key])
-    if (!scout || !analyst || scout.task.attemptCount !== a.scout.attemptCount || scout.task.id !== a.scout.taskId
-      || analyst.task.attemptCount !== a.analyst.attemptCount || analyst.task.id !== a.analyst.taskId) return null
-    if (scout.result.role !== "scout" || analyst.result.role !== "analyst") return null
-    const scoutResult = scout.result, analystResult = analyst.result
-    const candidateJobIds = scoutResult.candidates.map(value => value.jobId), jobIds = analystResult.findings.map(value => value.jobId)
-    if (new Set(candidateJobIds).size !== candidateJobIds.length || new Set(jobIds).size !== jobIds.length
-      || jobIds.some(id => !candidateJobIds.includes(id))) return null
-    const health = parseDiscoveryAttemptSidecar(scout.envelope.discoveryAttempt, scout.task.attemptCount ?? 0)
-    if (!health || health.attemptedCalls < 1 || health.completedCalls !== health.attemptedCalls || health.failedCalls !== 0
-      || health.unresolvedCalls !== 0 || health.candidateCount !== candidateJobIds.length || health.providerFailures !== 0
-      || health.materializationFailures !== 0 || health.hasMore !== false) return null
-    const receiptBase = { status: "complete" as const, taskId: scout.task.id, attemptCount: scout.task.attemptCount!,
-      completedCalls: health.completedCalls, candidateCount: health.candidateCount!, providerFailures: 0 as const,
-      materializationFailures: 0 as const, hasMore: false as const }
-    const receipt = { ...receiptBase, receiptDigest: taskGraphFingerprint(receiptBase) }
-    const analyzeSnapshot = { schemaVersion: snapshot.schemaVersion, nodes: baseNodes,
-      ...(snapshot.rootSuccessCriteria ? { rootSuccessCriteria: snapshot.rootSuccessCriteria } : {}) }
-    const stableOwner = { userId: a.owner.userId, sessionId: a.owner.sessionId, turnId: a.owner.turnId,
-      rootTaskId: a.owner.rootTaskId, rootAttemptCount: a.owner.rootAttemptCount }
-    const evidenceDigest = taskGraphFingerprint({ owner: stableOwner, snapshotDigest: a.snapshotDigest,
-      graphDigest: taskGraphFingerprint(analyzeSnapshot), graphRevision: a.graphRevision, receipt: receipt.receiptDigest,
-      scout: { taskId: scout.task.id, attemptCount: scout.task.attemptCount, report: scout.reportPublic },
-      analyst: { taskId: analyst.task.id, attemptCount: analyst.task.attemptCount, report: analyst.reportPublic,
-        bindings: analyst.report.dependencyBindings } })
-    const expectedAttestation: ScheduledAutomationPipelineAttestation = {
-      schemaVersion: a.schemaVersion, owner: { ...a.owner }, snapshotDigest: a.snapshotDigest, graphRevision: a.graphRevision,
-      scout: { taskId: scout.task.id, attemptCount: scout.task.attemptCount!, status: "completed", verification: "passed",
-        resultDigest: scout.report.resultDigest!, candidateJobIds, discoveryReceipt: receipt },
-      analyst: { taskId: analyst.task.id, attemptCount: analyst.task.attemptCount!, status: "completed", verification: "passed",
-        resultDigest: analyst.report.resultDigest!, dependsOnTaskIds: [scout.task.id], jobIds }, evidenceDigest,
-    }
-    if (canonicalTaskGraphJson(a) !== canonicalTaskGraphJson(expectedAttestation)) return null
-    if (hasPrepare) {
-      const proposal = parseScheduledPrepareProposal(input.proposal, analystNode.key, a.graphRevision), node = snapshot.nodes[2]!
-      const task = tasks.get(node.taskId), currentNode = current.nodes.find(value => value.key === node.key)
-      if (!proposal || !task || !currentNode || node.key !== "prepare" || node.templateId !== "prepare"
-        || node.depth !== analystNode.depth + 1 || node.verificationDisposition !== "specialized"
-        || node.goal !== proposal.nodes[0]!.goal || !same(node.successCriteria, proposal.nodes[0]!.successCriteria)
-        || !same(node.dependsOn, proposal.nodes[0]!.dependsOn) || !templateTaskMatches(task, "prepare")) return null
-    }
-    return analystNode.key
-  } catch { return null }
+  return verifyScheduledAnalyzeGraph(input, snapshot, current, tasks, hasPrepare)
 }
 
 export function scheduledPrepareReplayReceipt(snapshot: TaskGraphSnapshot, current: TaskGraphCurrentState, revision: number): TaskGraphScheduleReceipt | null {
-  const node = snapshot.nodes[2], state = node && current.nodes.find(value => value.key === node.key), ready = state?.status === "queued" && state.readiness === "ready"
+  const scoutCount = snapshot.nodes.findIndex(value => value.templateId !== "scout")
+  const count = scoutCount < 0 ? snapshot.nodes.length : scoutCount
+  const suffixCount = snapshot.nodes.length - count - 1
+  const version = count === 1 ? "v1" : "v2"
+  const stage = suffixCount === 1 ? "prepare" : suffixCount === 2 ? "gate" : suffixCount === 3 ? "audit" : null
+  if (!stage || !projectScheduledPipelineGraph(snapshot.nodes, version, stage)) return null
+  const prepareNodes = snapshot.nodes.filter(value => value.key === "prepare" && value.templateId === "prepare")
+  const node = prepareNodes.length === 1 ? prepareNodes[0] : undefined
+  const state = node && current.nodes.find(value => value.key === node.key), ready = state?.status === "queued" && state.readiness === "ready"
   if (!Number.isSafeInteger(current.revision) || !node || node.key !== "prepare" || !state || state.taskId !== node.taskId
     || !["queued", "waiting", "running", "retrying", "waiting_for_user", "completed"].includes(state.status)
     || current.revision < revision || (current.revision > revision && state.status === "queued")) return null
   return { status: "duplicate", revision: current.revision, nodes: [{ key: node.key, taskId: node.taskId, status: ready ? "queued" : "waiting" }], readyTaskIds: ready ? [node.taskId] : [] }
 }
 
-function readVerifiedNode(node: TaskGraphSnapshot["nodes"][number], current: TaskGraphCurrentState, tasks: ReadonlyMap<string, GraphTaskRow>, role: "scout" | "analyst", dependencies: readonly string[]) {
-  const state = current.nodes.find(value => value.key === node.key), task = tasks.get(node.taskId), envelope = parseEnvelope(task?.result, role === "scout")
-  if (!state || !task || state.taskId !== node.taskId || state.templateId !== node.templateId || state.status !== "completed"
-    || state.failureReason !== null || task.status !== "completed" || task.failureReason !== null || !Number.isSafeInteger(task.attemptCount)
-    || task.attemptCount! < 1 || !envelope || !templateTaskMatches(task, role)) return null
-  const result = validateRoleResult(envelope.structuredResult, role)
-  if (result.status !== "completed" || !node.verification) return null
-  const keys = taskGraphVerificationDependencyNodeKeys(node.verification)
-  if (!same(keys, dependencies)) return null
-  const report = parseStoredTaskGraphVerificationReport(envelope.taskGraphVerificationReport,
-    node.verification.criteria.map(item => item.id), dependencies)
-  if (!report || report.status !== "passed" || report.resultDigest !== taskGraphFingerprint(result)
-    || !same(state.verificationReport, publicTaskGraphVerificationReport(report))) return null
-  return { task, result, envelope, report, reportPublic: publicTaskGraphVerificationReport(report) }
-}
-
-function templateTaskMatches(task: GraphTaskRow, id: "scout" | "analyst" | "prepare"): boolean {
-  const template = TASK_GRAPH_TEMPLATES[id]
-  return task.role === template.role && task.taskType === template.taskType
-    && same(task.expectedOutputSchema, template.expectedOutputSchema) && same(task.allowedActions, template.allowedActions)
-}
-function parseEnvelope(value: unknown, discovery: boolean): Row | null {
-  const row = objectRecord(value), keys = ["finalItemId", "finalText", "status", "stepCount", "structuredResult", "taskGraphVerificationReport", "toolCallCount", ...(discovery ? ["discoveryAttempt"] : [])]
-  return row && Reflect.ownKeys(row).length === keys.length && Reflect.ownKeys(row).every(key => typeof key === "string" && keys.includes(key))
-    && row.status === "completed" && (row.finalItemId === null || typeof row.finalItemId === "string")
-    && typeof row.finalText === "string" && Number.isSafeInteger(row.stepCount) && Number(row.stepCount) >= 0
-    && Number.isSafeInteger(row.toolCallCount) && Number(row.toolCallCount) >= 0 && Object.hasOwn(row, "structuredResult") ? row : null
-}
+function validTimestamp(value: unknown): value is string { return typeof value === "string" && Number.isFinite(Date.parse(value)) }
 function objectRecord(value: unknown): Row | null {
   const row = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
   if (!row || typeof row !== "object" || Array.isArray(row)) return null
   const prototype = Object.getPrototypeOf(row)
   return prototype === Object.prototype || prototype === null ? row as Row : null
 }
-function same(left: unknown, right: unknown): boolean {
-  try { return canonicalTaskGraphJson(left) === canonicalTaskGraphJson(right) } catch { return false }
-}
-function validTimestamp(value: unknown): value is string { return typeof value === "string" && Number.isFinite(Date.parse(value)) }
 
 /** Reads only an exact itemless, no-outbox private receipt for this scoped Turn. */
 export async function readScheduledPrepareReceipt(client: Queryable, scope: TaskGraphScheduledPrepareInput["scope"], key: string): Promise<unknown | null> {
@@ -218,16 +146,17 @@ export function buildScheduledTaskGraphContinuationReceipt(value: unknown): Sche
 export function scheduledTaskGraphContinuationBindingDigest(value: unknown): string | null {
   const receipt = parseScheduledTaskGraphContinuationReceipt(value)
   if (!receipt) return null
-  const projection = [receipt.schemaVersion, ...stableOwnerValues(receipt.owner), receipt.continuationKey, receipt.snapshotDigest,
-    receipt.evidenceDigest, receipt.checkpointDigest, receipt.analyzeGraphRevision, receipt.prepareScheduleRevision]
+  const projection = scheduledTaskGraphContinuationBindingDigestProjection(receipt)
   return createHash("sha256").update(JSON.stringify(projection), "utf8").digest("hex")
 }
+
+export { scheduledTaskGraphContinuationKeyVersion }
 
 /** Derives the persisted continuation receipt key from its immutable binding, excluding the transient handoff key. */
 export function scheduledTaskGraphStableContinuationKey(value: unknown): string | null {
   const receipt = parseScheduledTaskGraphContinuationReceipt(value)
     ?? parseBinding(exactRecord(value, BINDING_KEYS) ?? {})
-  return receipt ? stableContinuationKey(receipt) : null
+  return receipt ? scheduledTaskGraphStableKey(receipt) : null
 }
 
 /** A replay matches immutable owner lineage and proof fields; current leases are checked separately against the live claim. */
@@ -241,15 +170,6 @@ export function scheduledTaskGraphContinuationReceiptMatches(value: unknown, exp
     && receipt.evidenceDigest === binding.evidenceDigest && receipt.checkpointDigest === binding.checkpointDigest
     && receipt.analyzeGraphRevision === binding.analyzeGraphRevision && receipt.prepareScheduleRevision === binding.prepareScheduleRevision
     && stableOwnerValuesEqual(receipt.owner, binding.owner)
-}
-
-/** Derives the durable idempotency key from immutable Analyze lineage, excluding the short-lived Turn lease. */
-function stableContinuationKey(binding: ScheduledTaskGraphContinuationBinding): string {
-  const owner = binding.owner
-  const projection = [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.rootAttemptCount, owner.executionId,
-    owner.executionAttemptCount, binding.snapshotDigest, binding.evidenceDigest, binding.checkpointDigest,
-    binding.analyzeGraphRevision, binding.prepareScheduleRevision]
-  return `scheduled-taskgraph:sha256:${createHash("sha256").update(JSON.stringify(projection), "utf8").digest("hex")}`
 }
 
 function parseBinding(row: Record<string, unknown>): ScheduledTaskGraphContinuationBinding | null {

@@ -10,6 +10,7 @@ import { scheduledAutomationSnapshotDigest, scheduledTaskGraphContinuationKey,
   type ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 import { priorScheduledTaskGraphContinuation } from './scheduled-taskgraph-pipeline-fence'
 import { validateScheduledPrepareWaitIdentity } from './scheduled-taskgraph-run-service'
+import { parseScheduledTaskGraphAttestation, scheduledTaskGraphAttestationCandidates } from './scheduled-taskgraph-attestation-candidates'
 
 type GateCompletion = Readonly<{ taskId: string; attemptCount: number }>
 const completedReportKeys = ['processed', 'applied', 'queued', 'pending', 'skipped', 'failed', 'durationMs'] as const
@@ -195,8 +196,8 @@ function reportLeaseCurrent(value: unknown, owner: ScheduledTaskGraphPipelineOwn
     : ['waiting_for_user', 'completed'].includes(String(turn.status)) && turn.leaseOwnerId === null && turn.leaseExpiresAt === null))
 }
 function candidateIds(attestation: unknown): string[] | null {
-  const ids = record(record(attestation)?.scout)?.candidateJobIds
-  return Array.isArray(ids) && ids.length <= 100 && ids.every(validId) && new Set(ids).size === ids.length ? [...ids] : null
+  const parsed = parseScheduledTaskGraphAttestation(attestation)
+  return parsed ? [...scheduledTaskGraphAttestationCandidates(parsed).selectedJobIds] : null
 }
 function record(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null

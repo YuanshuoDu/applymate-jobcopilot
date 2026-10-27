@@ -34,11 +34,11 @@ const response = (status: number, body: unknown) => new Response(JSON.stringify(
 const analyzeAttestation: ScheduledAutomationPipelineAttestation = {
   schemaVersion: "agent-harness.v2.scheduled-pipeline-attestation.v1", owner,
   snapshotDigest: `sha256:${"1".repeat(64)}`, graphRevision: 3,
-  scout: { taskId: "scout-1", attemptCount: 1, status: "completed", verification: "passed", resultDigest: `sha256:${"2".repeat(64)}`,
+  scout: { taskId: "scout-1", attemptCount: 1, status: "completed", verification: "passed", resultDigest: "2".repeat(64),
     candidateJobIds: ["job-1"], discoveryReceipt: { status: "complete", taskId: "scout-1", attemptCount: 1,
-      completedCalls: 1, candidateCount: 1, providerFailures: 0, materializationFailures: 0, hasMore: false, receiptDigest: `sha256:${"3".repeat(64)}` } },
+      completedCalls: 1, candidateCount: 1, providerFailures: 0, materializationFailures: 0, hasMore: false, receiptDigest: "3".repeat(64) } },
   analyst: { taskId: "analyst-1", attemptCount: 1, status: "completed", verification: "passed",
-    resultDigest: `sha256:${"4".repeat(64)}`, dependsOnTaskIds: ["scout-1"], jobIds: ["job-1"] },
+    resultDigest: "4".repeat(64), dependsOnTaskIds: ["scout-1"], jobIds: ["job-1"] },
   evidenceDigest: "5".repeat(64),
 }
 const analyzeProof = (): ScheduledPipelineAnalyzeCheckpointProof => {

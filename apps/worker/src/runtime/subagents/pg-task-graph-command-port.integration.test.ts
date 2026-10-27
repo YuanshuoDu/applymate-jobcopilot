@@ -609,6 +609,7 @@ type TypedSupersessionOptions = Readonly<{
   includeWaitingLegacyDependency?: boolean
   includeTypedWaitingAncestor?: boolean
   replacementDependsOn?: readonly string[]
+  initialScheduledScoutCount?: number
 }>
 
 async function seedHistoricalLegacyNode(pool: PgPool, value: Fixture, nodeKey: string,
@@ -686,24 +687,36 @@ async function prepareTypedSupersession(pool: PgPool, commandPool: PgPool, roleN
     sequence: originalSequence, consumedByStepId: value.originStepId,
     text: "Complete original user task reference", disposition: "submitted",
   })
-  await pool.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1`, [value.turnId, JSON.stringify({
-    input: { goal: "Find roles", clientMessageId: value.originalClientMessageId },
-  })])
+  const turnInput = { input: { goal: "Find roles", clientMessageId: value.originalClientMessageId } }
+  if (options.initialScheduledScoutCount !== undefined) {
+    const scheduledAutomationSnapshot = { schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1",
+      targetRoles: ["Software Engineer"], targetLocations: ["Dublin"], minScore: 70, dailyCap: 10, requireApproval: true, autoApply: false }
+    await pool.query(`UPDATE "agent_turns" SET "source" = 'automation', "executionMode" = 'canonical_task_graph', "input" = $2::jsonb WHERE "id" = $1`,
+      [value.turnId, JSON.stringify({ ...turnInput, automationRunMode: "scheduled", scheduledAutomationSnapshot })])
+  } else {
+    await pool.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1`, [value.turnId, JSON.stringify(turnInput)])
+  }
   await seedReconciliationAgenda(pool, value, {
     id: value.originStepId, sequence: await nextEventSequence(pool, value), cursor: originalSequence, planRevision: 0,
     consumedInputIds: [value.originalInputId],
   })
 
   const legacyFixtureNodeCount = options.includeWaitingLegacyDependency ? (options.includeTypedWaitingAncestor ? 4 : 3) : 0
-  const scheduledInput = scheduleInput(value, legacyFixtureNodeCount || (options.includeIndependentPrerequisite ? 2 : 1), true)
-  const initialNodes = options.includeWaitingLegacyDependency
-    ? scheduledInput.proposal.nodes.map((node, index) => ({ ...node, dependsOn: index === 2 ? ["task-2"] : index === 3 ? ["task-3"] : [] }))
-    : options.includeIndependentPrerequisite
-      ? scheduledInput.proposal.nodes.map(node => ({ ...node, dependsOn: [] }))
-      : scheduledInput.proposal.nodes
+  const scheduledInput = scheduleInput(value, options.initialScheduledScoutCount
+    ?? (legacyFixtureNodeCount || (options.includeIndependentPrerequisite ? 2 : 1)), true)
+  const initialNodes = options.initialScheduledScoutCount !== undefined
+    ? Array.from({ length: options.initialScheduledScoutCount }, (_, index) => ({ key: `task-${index + 1}`, templateId: "scout",
+      goal: `Discover scheduled candidates ${index + 1}`, successCriteria: ["Return candidates for the frozen schedule"],
+      verification: SCHEDULED_DRAFT_SCOUT_VERIFICATION, dependsOn: [] }))
+    : options.includeWaitingLegacyDependency
+      ? scheduledInput.proposal.nodes.map((node, index) => ({ ...node, dependsOn: index === 2 ? ["task-2"] : index === 3 ? ["task-3"] : [] }))
+      : options.includeIndependentPrerequisite
+        ? scheduledInput.proposal.nodes.map(node => ({ ...node, dependsOn: [] }))
+        : scheduledInput.proposal.nodes
   const initialInput: TaskGraphScheduleInput = { ...scheduledInput, proposal: { ...scheduledInput.proposal, nodes: initialNodes },
     ...(rootSuccessCriteria ? { rootSuccessCriteria } : {}), templates: {
     ...scheduledInput.templates, analyst: analystTemplate,
+    ...(options.initialScheduledScoutCount !== undefined ? { scout: { ...TASK_GRAPH_TEMPLATES.scout, allowedActions: [] } } : {}),
   } }
   const initialPlanInput: TaskGraphScheduleInput = { ...initialInput, scope: { ...initialInput.scope, stepId: value.originStepId } }
   const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool, roleName, value.userId))
@@ -718,9 +731,11 @@ async function prepareTypedSupersession(pool: PgPool, commandPool: PgPool, roleN
     `SELECT "role", "taskType", "allowedActions", "constraints", "expectedOutputSchema" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`,
     [source.taskId, value.sessionId],
   )
+  const sourceTemplate = initialInput.templates[originalNode.templateId]
+  if (!sourceTemplate) throw new Error("TaskGraph supersession fixture lost its source template")
   expect(persistedSource.rows).toEqual([{
-    role: analystTemplate.role, taskType: analystTemplate.taskType, allowedActions: analystTemplate.allowedActions,
-    constraints: analystTemplate.constraints ?? [], expectedOutputSchema: analystTemplate.expectedOutputSchema ?? {},
+    role: sourceTemplate.role, taskType: sourceTemplate.taskType, allowedActions: sourceTemplate.allowedActions,
+    constraints: sourceTemplate.constraints ?? [], expectedOutputSchema: sourceTemplate.expectedOutputSchema ?? {},
   }])
   const replacement = { ...originalNode, key: "replacement-1", goal: "Complete the revised graph task", successCriteria: ["Revised task completed"],
     ...(options.replacementDependsOn === undefined ? {} : { dependsOn: [...options.replacementDependsOn] }) }
@@ -1938,6 +1953,75 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     }
     await expect(command.appendAndSchedule(ordinaryAppend)).rejects.toMatchObject({ code: "node_limit" })
     expect(await graphRows(adminPool!, value)).toEqual(sevenRows)
+  }, 60_000)
+
+  it("caps scheduled source snapshots at four Scouts without changing ordinary TaskGraph capacity", async () => {
+    const value = fixture()
+    additionalFixtures.push(value)
+    await seed(adminPool!, value)
+    const scheduledSnapshot = { schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1", targetRoles: ["Software Engineer"],
+      targetLocations: ["Dublin"], minScore: 70, dailyCap: 10, requireApproval: true, autoApply: false }
+    await adminPool!.query(`UPDATE "agent_turns" SET "source" = 'automation', "executionMode" = 'canonical_task_graph', "input" = $2::jsonb WHERE "id" = $1`,
+      [value.turnId, JSON.stringify({ automationRunMode: "scheduled", scheduledAutomationSnapshot: scheduledSnapshot })])
+    const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, value.userId))
+    const scope = scheduleInput(value, 1, true).scope
+    const templates = { scout: { ...TASK_GRAPH_TEMPLATES.scout, allowedActions: [] }, analyst: TASK_GRAPH_TEMPLATES.analyst }
+    const plan = (expectedRevision: number, first: number, count: number): TaskGraphScheduleInput => ({ scope, templates,
+      proposal: { expectedRevision, nodes: Array.from({ length: count }, (_, index) => ({ key: `scout-${first + index}`,
+        templateId: "scout", goal: "Discover candidates for the schedule", successCriteria: ["Return candidates"], dependsOn: [] })) } })
+    const accepted = await command.appendAndSchedule(plan(0, 1, 4))
+    expect(accepted).toMatchObject({ status: "accepted", revision: 1 })
+    expect(accepted.nodes).toHaveLength(4)
+    const beforeFifth = await durableGraphRows(adminPool!, value)
+    await expect(command.appendAndSchedule(plan(accepted.revision, 5, 1))).rejects.toMatchObject({ code: "node_limit" })
+    expect(await durableGraphRows(adminPool!, value)).toEqual(beforeFifth)
+    expect(await command.readCurrent(readScope(value))).toMatchObject({ revision: 1, nodes: expect.arrayContaining([
+      expect.objectContaining({ key: "scout-1" }), expect.objectContaining({ key: "scout-2" }),
+      expect.objectContaining({ key: "scout-3" }), expect.objectContaining({ key: "scout-4" }),
+    ]) })
+
+    const scoutKeys = ["scout-1", "scout-2", "scout-3", "scout-4"]
+    const advanced = await command.appendAndSchedule({ scope, templates, proposal: { expectedRevision: accepted.revision, nodes: [{
+      key: "analyst-after-scouts", templateId: "analyst", goal: "Analyze the scheduled Scout union",
+      successCriteria: ["Return findings from the selected Scouts"], verification: scheduledDraftAnalystVerification(true, scoutKeys, "membership"),
+      dependsOn: scoutKeys,
+    }] } })
+    expect(advanced).toMatchObject({ status: "accepted", revision: 2, nodes: [{ key: "analyst-after-scouts", status: "waiting" }] })
+    const beforeReplay = await durableGraphRows(adminPool!, value)
+    await expect(command.appendAndSchedule(plan(0, 1, 4))).resolves.toEqual({ ...accepted, status: "duplicate" })
+    expect(await durableGraphRows(adminPool!, value)).toEqual(beforeReplay)
+
+    const ordinary = fixture()
+    additionalFixtures.push(ordinary)
+    await seed(adminPool!, ordinary)
+    const ordinaryCommand = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool!, roleName, ordinary.userId))
+    const ordinaryScope = scheduleInput(ordinary, 1, true).scope
+    const ordinaryReceipt = await ordinaryCommand.appendAndSchedule({ scope: ordinaryScope, templates,
+      proposal: { expectedRevision: 0, nodes: Array.from({ length: 5 }, (_, index) => ({ key: `ordinary-scout-${index + 1}`,
+        templateId: "scout", goal: "Discover candidates", successCriteria: ["Return candidates"], dependsOn: [] })) } })
+    expect(ordinaryReceipt).toMatchObject({ status: "accepted", revision: 1 })
+    expect(ordinaryReceipt.nodes).toHaveLength(5)
+
+    const superseded = fixture()
+    additionalFixtures.push(superseded)
+    const prepared = await prepareTypedSupersession(adminPool!, commandPool!, roleName, superseded, undefined, { initialScheduledScoutCount: 4 })
+    const beforeSupersession = await prepared.command.readCurrent(readScope(superseded))
+    expect(beforeSupersession.nodes).toHaveLength(4)
+    expect(beforeSupersession.nodes.every(node => node.templateId === "scout")).toBe(true)
+    const oldSourceTaskId = prepared.source.taskId
+    const replacement = await prepared.command.appendAndScheduleWithReconciliation!(prepared.input, prepared.operation)
+    expect(replacement).toMatchObject({ status: "accepted", revision: 3, nodes: [{ key: "replacement-1", status: "queued" }] })
+    const current = await prepared.command.readCurrent(readScope(superseded))
+    expect(current.revision).toBe(3)
+    expect(current.nodes).toHaveLength(4)
+    expect(current.nodes.every(node => node.templateId === "scout")).toBe(true)
+    expect(current.nodes.some(node => node.taskId === oldSourceTaskId || node.key === prepared.source.key)).toBe(false)
+    expect(current.nodes.map(node => node.key)).toEqual(expect.arrayContaining(["task-2", "task-3", "task-4", "replacement-1"]))
+    const persistedSources = await adminPool!.query<{ id: string; status: string; attemptCount: number }>(
+      `SELECT "id", "status", "attemptCount" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "parentTaskId" = $2 ORDER BY "id"`,
+      [superseded.sessionId, superseded.rootTaskId])
+    expect(persistedSources.rows).toHaveLength(5)
+    expect(persistedSources.rows.find(row => row.id === oldSourceTaskId)).toMatchObject({ status: "cancelled", attemptCount: 0 })
   }, 60_000)
 
   it("rejects same-batch and active overlapping repairs before durable writes", async () => {

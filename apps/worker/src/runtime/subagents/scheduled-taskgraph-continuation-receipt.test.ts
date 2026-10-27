@@ -230,7 +230,11 @@ describe("scheduled TaskGraph continuation receipt", () => {
   })
 
   it("preserves the exact Prepare task on replay and requeues only while it is ready", () => {
-    const snapshot = { nodes: [{}, {}, { key: "prepare", taskId: "prepare-1" }] } as unknown as TaskGraphSnapshot
+    const snapshot = { nodes: [
+      { key: "scout-1", templateId: "scout", taskId: "scout-task", depth: 1, dependsOn: [] },
+      { key: "analyst", templateId: "analyst", taskId: "analyst-task", depth: 2, dependsOn: ["scout-1"] },
+      { key: "prepare", templateId: "prepare", taskId: "prepare-1", depth: 3, dependsOn: ["analyst"] },
+    ] } as unknown as TaskGraphSnapshot
     const current = (status: string, revision = 13, readiness = status === "queued" ? "ready" : status === "completed" ? "terminal" : "active") =>
       ({ revision, nodes: [{ key: "prepare", taskId: "prepare-1", status, readiness }] }) as unknown as TaskGraphCurrentState
     expect(scheduledPrepareReplayReceipt(snapshot, current("queued"), 13)).toEqual({ status: "duplicate", revision: 13,

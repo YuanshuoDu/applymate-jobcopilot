@@ -187,6 +187,7 @@ function appendVerifiedPrepareAndGate(fixture: ReturnType<typeof makeFixture>, w
 }
 
 function legacyEvidenceDigest(fixture: ReturnType<typeof makeFixture>, attestation: ScheduledAutomationPipelineAttestation): string {
+  if (attestation.schemaVersion !== SCHEDULED_PIPELINE_ATTESTATION_SCHEMA) throw new Error("expected_legacy_v1_attestation")
   const stableOwner = { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
     rootTaskId: scope.rootTaskId, rootAttemptCount: scope.rootAttemptCount }
   const digest = (value: unknown) => createHash("sha256").update(canonicalTaskGraphJson(value)).digest("hex")
@@ -248,6 +249,7 @@ describe("scheduled automation TaskGraph pipeline bridge", () => {
     const result = await createScheduledAutomationPipelineBridge(fixture.dependencies)(scope)
     expect(result.status).toBe("ready")
     if (result.status !== "ready") return
+    if (result.attestation.schemaVersion !== SCHEDULED_PIPELINE_ATTESTATION_SCHEMA) throw new Error("expected_legacy_v1_attestation")
     expect(result.attestation).toMatchObject({
       schemaVersion: SCHEDULED_PIPELINE_ATTESTATION_SCHEMA,
       owner: scope,
@@ -323,7 +325,10 @@ describe("scheduled automation TaskGraph pipeline bridge", () => {
     const fixture = makeFixture({ candidateIds: [], findingIds: [], health: { candidateCount: 0 } })
     const result = await createScheduledAutomationPipelineBridge(fixture.dependencies)(scope)
     expect(result.status).toBe("ready")
-    if (result.status === "ready") expect(result.attestation.scout.discoveryReceipt.candidateCount).toBe(0)
+    if (result.status === "ready") {
+      if (result.attestation.schemaVersion !== SCHEDULED_PIPELINE_ATTESTATION_SCHEMA) throw new Error("expected_legacy_v1_attestation")
+      expect(result.attestation.scout.discoveryReceipt.candidateCount).toBe(0)
+    }
   })
 
   it.each([

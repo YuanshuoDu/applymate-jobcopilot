@@ -6,16 +6,15 @@ import { scheduledGatePreparedJobIds, SCHEDULED_GATE_OUTPUT_SCHEMA,
 import { loadScheduledGateChoiceHistory, type ScheduledGateChoiceHistory } from "./pg-scheduled-task-graph-gate-choices.js"
 import { readScheduledGateRegistrationReceipt, type ScheduledGateRegistrationReceipt } from "./scheduled-gate-registration-receipt.js"
 import { loadPersistedScheduledPrepareProof } from "./scheduled-gate-wait-match.js"
-import { scheduledSnapshotMatches } from "./scheduled-taskgraph-continuation-receipt.js"
-import { scheduledAnalyzeGraphMatches } from "./scheduled-taskgraph-continuation-receipt.js"
+import { scheduledAnalyzeGraphMatches, scheduledSnapshotMatches, scheduledTaskGraphContinuationKeyVersion } from "./scheduled-taskgraph-continuation-receipt.js"
 import { scheduledGateCheckpointEvidence } from "./scheduled-gate-contract.js"
 import { currentTaskGraph, loadTaskGraph, type GraphIdentityScope, type GraphTaskRow } from "./task-graph-pg-state.js"
-import { taskGraphFingerprint, canonicalTaskGraphJson, type StoredTaskGraphNode } from "./task-graph-snapshot.js"
-import { parseDiscoveryAttemptSidecar } from "./child-discovery-attempt.js"
-import { validateRoleResult, type AnalystResult, type ScoutResult } from "./role-results.js"
-import { parseStoredTaskGraphVerificationReport } from "./task-graph-verification-report.js"
+import { canonicalTaskGraphJson } from "./task-graph-snapshot.js"
+import { verifyCompletedTaskGraphNodeEvidence } from "./task-graph-pg-verification.js"
 import { postScheduledPipelineGate, type ScheduledPipelineGateInput } from "./scheduled-pipeline-handoff.js"
 import type { ScheduledAutomationPipelineAttestation, ScheduledAutomationPipelineBridgeScope } from "./scheduled-automation-pipeline-bridge.js"
+import { buildScheduledPipelineGraphAttestation } from "./scheduled-pipeline-current-attestation.js"
+import { projectScheduledPipelineGraph } from "./scheduled-pipeline-graph-shape.js"
 import type { ScheduledPrepareTaskGraphProof } from "./scheduled-prepare-task-graph-verification.js"
 import type { ScheduledGateResult, ScheduledGateTaskEnvelope } from "./scheduled-gate-contract.js"
 import { parseScheduledAutomationSnapshot } from "./scheduled-automation-snapshot.js"
@@ -36,7 +35,6 @@ type GateRuntimeOptions = Readonly<{
   loadInvocation?: (lease: SubagentLease) => Promise<GateInvocation>
   loadChoices?: (lease: SubagentLease) => Promise<ScheduledGateChoiceHistory>
 }>
-
 /** Runs the fixed, model-free child against persisted lineage and the authenticated Web Gate action. */
 export function createScheduledGateChildExecutor(options: GateRuntimeOptions): SubagentExecutor {
   return async ({ lease }) => {
@@ -74,7 +72,6 @@ export function createScheduledGateChildExecutor(options: GateRuntimeOptions): S
     }
   }
 }
-
 export function isScheduledGateTask(task: Pick<SubagentLease, "role" | "taskType">): boolean {
   return task.role === SCHEDULED_GATE_ROLE && task.taskType === SCHEDULED_GATE_TASK_TYPE
 }
@@ -86,26 +83,21 @@ function isGateLease(lease: SubagentLease): boolean {
     && sameJson(lease.expectedOutputSchema, SCHEDULED_GATE_OUTPUT_SCHEMA)
     && Array.isArray(lease.allowedActions) && lease.allowedActions.length === 0
 }
-
 function scheduledGateEnvelope(result: ScheduledGateResult): ScheduledGateTaskEnvelope {
   const status = result.status === "completed" ? "completed" : "waiting_for_user"
   return { finalItemId: null, finalText: "", status, stepCount: 0, toolCallCount: 0,
     taskGraphVerificationReport: null, structuredResult: result }
 }
-
 function terminal(code: string): SubagentExecutionResult {
   return { status: "failed", failureReason: code, retryDisposition: "terminal" }
 }
-
 function retryableGateError(code: string): boolean {
   return code === "scheduled_pipeline_handoff_unavailable" || code === "scheduled_pipeline_handoff_in_progress"
     || code === "scheduled_pipeline_handoff_retryable"
 }
-
 class ScheduledGateRuntimeError extends Error {
   constructor(readonly code: string) { super(code); this.name = "ScheduledGateRuntimeError" }
 }
-
 async function loadInvocation(pool: Pick<pg.Pool, "connect">, lease: SubagentLease, now: Date): Promise<GateInvocation> {
   const client = await pool.connect()
   try {
@@ -123,10 +115,11 @@ async function loadInvocation(pool: Pick<pg.Pool, "connect">, lease: SubagentLea
     }
     const scope: GraphIdentityScope = { userId: lease.userId, sessionId: lease.sessionId,
       turnId: lease.turnId!, rootTaskId: lease.rootTaskId, parentTaskId: lease.rootTaskId }
-    const graph = await loadTaskGraph(client, scope, false), gateNode = graph.snapshot?.nodes.find(node => node.key === "gate")
-    const prepareNode = graph.snapshot?.nodes.find(node => node.key === "prepare"), gateState = graph.state?.nodes.find(node => node.key === "gate")
+    const graph = await loadTaskGraph(client, scope, false), version = scheduledTaskGraphContinuationKeyVersion(evidence.continuationKey)
+    const shape = graph.snapshot && version && projectScheduledPipelineGraph(graph.snapshot.nodes, version, "gate")
+    const gateNode = shape?.gate, prepareNode = shape?.prepare, gateState = graph.state?.nodes.find(node => node.key === "gate")
     const gateTask = gateNode && graph.tasks.get(gateNode.taskId), prepareTask = prepareNode && graph.tasks.get(prepareNode.taskId)
-    if (!graph.snapshot || !graph.state || graph.snapshot.nodes.length !== 4 || !gateNode || gateNode.taskId !== lease.id
+    if (!graph.snapshot || !graph.state || !shape || !gateNode || gateNode.taskId !== lease.id
       || gateNode.templateId !== "gate" || gateNode.depth !== 4 || gateNode.verificationDisposition !== "specialized"
       || !sameJson(gateNode.dependsOn, ["prepare"]) || !gateState || gateState.status !== "running"
       || !gateTask || gateTask.status !== "running" || gateTask.attemptCount !== lease.attemptCount
@@ -149,8 +142,14 @@ async function loadInvocation(pool: Pick<pg.Pool, "connect">, lease: SubagentLea
       || !sameJson(prepareProof.receipt.owner, record(record(row.state)?.scheduledTaskGraphContinuation)?.owner)) {
       throw new ScheduledGateRuntimeError("scheduled_gate_prepare_proof_invalid")
     }
-    const attestation = buildAttestation(pipelineOwner(prepareProof.receipt.owner), evidence.snapshotDigest, evidence.evidenceDigest,
-      evidence.analyzeGraphRevision, graph.snapshot.nodes, graph.tasks)
+    const current = currentTaskGraph(graph)
+    const pipelineScope = pipelineOwner(prepareProof.receipt.owner)
+    const proof = await buildScheduledPipelineGraphAttestation({ scope: pipelineScope,
+      schedule: record(row.turnInput)?.scheduledAutomationSnapshot, snapshot: graph.snapshot,
+      current, tasks: graph.tasks, verifyCompletedNode: input => verifyCompletedTaskGraphNodeEvidence(client, input) })
+    const attestation = proof.status === "ready" ? proof.attestation : null
+    if (attestation && (attestation.evidenceDigest !== evidence.evidenceDigest || attestation.snapshotDigest !== evidence.snapshotDigest
+      || attestation.graphRevision !== evidence.analyzeGraphRevision)) throw new ScheduledGateRuntimeError("scheduled_gate_analyze_proof_invalid")
     const verified = attestation && await validateAnalyzePrefix(client, lease, row, graph, attestation, prepareProof, evidence)
     if (!attestation || !verified) throw new ScheduledGateRuntimeError("scheduled_gate_analyze_proof_invalid")
     await client.query("COMMIT")
@@ -161,7 +160,6 @@ async function loadInvocation(pool: Pick<pg.Pool, "connect">, lease: SubagentLea
     throw error
   } finally { client.release() }
 }
-
 async function readLiveScope(client: Queryable, lease: SubagentLease, now: Date): Promise<Row> {
   const rows = await client.query<Row>(`SELECT gate."id", gate."role", gate."taskType", gate."status", gate."attemptCount", gate."leaseOwner",
       gate."leaseExpiresAt", gate."interruptRequestedAt", gate."expectedOutputSchema", gate."allowedActions",
@@ -190,46 +188,14 @@ async function readLiveScope(client: Queryable, lease: SubagentLease, now: Date)
   }
   return row
 }
-
-function buildAttestation(owner: ScheduledAutomationPipelineAttestation["owner"], snapshotDigest: string, evidenceDigest: string,
-  analyzeGraphRevision: number, nodes: readonly StoredTaskGraphNode[], tasks: ReadonlyMap<string, GraphTaskRow>): ScheduledAutomationPipelineAttestation | null {
-  const scoutNode = nodes.find(node => node.templateId === "scout"), analystNode = nodes.find(node => node.templateId === "analyst")
-  const scoutTask = scoutNode && tasks.get(scoutNode.taskId), analystTask = analystNode && tasks.get(analystNode.taskId)
-  const scoutEnvelope = scoutTask && outputEnvelope(scoutTask.result, true), analystEnvelope = analystTask && outputEnvelope(analystTask.result, false)
-  if (!scoutNode?.verification || !analystNode?.verification || !scoutTask || !analystTask || !scoutEnvelope || !analystEnvelope) return null
-  let scout: ScoutResult, analyst: AnalystResult
-  try {
-    scout = validateRoleResult(scoutEnvelope.structuredResult, "scout") as ScoutResult
-    analyst = validateRoleResult(analystEnvelope.structuredResult, "analyst") as AnalystResult
-  } catch { return null }
-  const scoutReport = parseStoredTaskGraphVerificationReport(scoutEnvelope.taskGraphVerificationReport,
-    scoutNode.verification.criteria.map(item => item.id), [])
-  const analystReport = parseStoredTaskGraphVerificationReport(analystEnvelope.taskGraphVerificationReport,
-    analystNode.verification.criteria.map(item => item.id), [scoutNode.key])
-  const health = parseDiscoveryAttemptSidecar(scoutEnvelope.discoveryAttempt, scoutTask.attemptCount ?? 0)
-  if (scout.status !== "completed" || analyst.status !== "completed" || scoutTask.status !== "completed" || analystTask.status !== "completed"
-    || !scoutReport || scoutReport.status !== "passed" || !scoutReport.resultDigest
-    || !analystReport || analystReport.status !== "passed" || !analystReport.resultDigest
-    || !health || health.attemptedCalls < 1 || health.completedCalls !== health.attemptedCalls || health.failedCalls !== 0
-    || health.unresolvedCalls !== 0 || health.candidateCount !== scout.candidates.length || health.providerFailures !== 0
-    || health.materializationFailures !== 0 || health.hasMore !== false) return null
-  const receiptBase = { status: "complete" as const, taskId: scoutTask.id, attemptCount: scoutTask.attemptCount!,
-    completedCalls: health.completedCalls, candidateCount: health.candidateCount!, providerFailures: 0 as const,
-    materializationFailures: 0 as const, hasMore: false as const }
-  return { schemaVersion: "agent-harness.v2.scheduled-pipeline-attestation.v1", owner, snapshotDigest, graphRevision: analyzeGraphRevision,
-    scout: { taskId: scoutTask.id, attemptCount: scoutTask.attemptCount!, status: "completed", verification: "passed",
-      resultDigest: scoutReport.resultDigest, candidateJobIds: scout.candidates.map(item => item.jobId),
-      discoveryReceipt: { ...receiptBase, receiptDigest: taskGraphFingerprint(receiptBase) } },
-    analyst: { taskId: analystTask.id, attemptCount: analystTask.attemptCount!, status: "completed", verification: "passed",
-      resultDigest: analystReport.resultDigest, dependsOnTaskIds: [scoutTask.id], jobIds: analyst.findings.map(item => item.jobId) }, evidenceDigest }
-}
-
 async function validateAnalyzePrefix(client: Queryable, lease: SubagentLease, row: Row,
   graph: Awaited<ReturnType<typeof loadTaskGraph>>, attestation: ScheduledAutomationPipelineAttestation,
   prepareProof: ScheduledPrepareTaskGraphProof, evidence: NonNullable<ReturnType<typeof scheduledGateCheckpointEvidence>>): Promise<boolean> {
-  const nodes = graph.snapshot?.nodes.slice(0, 3), current = currentTaskGraph(graph)
-  const prepare = nodes?.[2]
-  if (!graph.snapshot || !graph.state || !nodes || !prepare || current.nodes.length !== 4) return false
+  const version = "scouts" in attestation ? "v2" : "v1"
+  const shape = graph.snapshot && projectScheduledPipelineGraph(graph.snapshot.nodes, version, "gate")
+  const nodes = shape && graph.snapshot?.nodes.slice(0, shape.scouts.length + 2), current = currentTaskGraph(graph)
+  const prepare = nodes?.at(-1), analyst = nodes?.at(-2)
+  if (!graph.snapshot || !graph.state || !shape || !nodes || !prepare || !analyst || current.nodes.length !== graph.snapshot.nodes.length) return false
   const proposal = { expectedRevision: evidence.analyzeGraphRevision, nodes: [{ key: prepare.key, templateId: prepare.templateId,
     goal: prepare.goal, successCriteria: prepare.successCriteria, dependsOn: prepare.dependsOn }] }
   const waitRows = await client.query<Row>(`SELECT "stepId" FROM "agent_wait_conditions"
@@ -251,29 +217,19 @@ async function validateAnalyzePrefix(client: Queryable, lease: SubagentLease, ro
     attestation, proposal,
   }
   const analyzeSnapshot = { ...graph.snapshot, nodes }
-  const analyzeCurrent = { ...current, nodes: current.nodes.slice(0, 3) }
+  const analyzeCurrent = { ...current, nodes: current.nodes.slice(0, nodes.length) }
   const analystKey = scheduledAnalyzeGraphMatches(input, analyzeSnapshot, analyzeCurrent, graph.tasks, true)
-  return analystKey !== null && analystKey === nodes[1]?.key && prepare.taskId === prepareProof.completion.nodes[2].taskId
+  return analystKey !== null && analystKey === shape.analyst.key && prepare.taskId === prepareProof.completion.nodes.at(-1)?.taskId
 }
-
 function samePreparedLineage(proof: ScheduledPrepareTaskGraphProof, registration: ScheduledGateRegistrationReceipt): boolean {
   return proof.receipt.continuationKey === registration.continuationKey && proof.receipt.snapshotDigest === registration.snapshotDigest
     && proof.receipt.evidenceDigest === registration.evidenceDigest && proof.receipt.checkpointDigest === registration.checkpointDigest
     && proof.receipt.analyzeGraphRevision === registration.analyzeGraphRevision
     && proof.receipt.prepareScheduleRevision === registration.prepareScheduleRevision
 }
-
-function pipelineOwner(owner: ScheduledPrepareTaskGraphProof["receipt"]["owner"]): ScheduledAutomationPipelineAttestation["owner"] {
+function pipelineOwner(owner: ScheduledPrepareTaskGraphProof["receipt"]["owner"]): ScheduledAutomationPipelineBridgeScope {
   return { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
     rootAttemptCount: owner.rootAttemptCount, turnLeaseOwnerId: owner.turnLeaseOwnerId, turnLeaseVersion: owner.turnLeaseVersion }
-}
-
-function outputEnvelope(value: unknown, discovery: boolean): Row | null {
-  const row = record(value), keys = ["finalItemId", "finalText", "status", "stepCount", "toolCallCount", "taskGraphVerificationReport", "structuredResult",
-    ...(discovery ? ["discoveryAttempt"] : [])]
-  return row && Reflect.ownKeys(row).length === keys.length && Reflect.ownKeys(row).every(key => typeof key === "string" && keys.includes(key))
-    && row.status === "completed" && row.finalItemId === null && typeof row.finalText === "string"
-    && nonNegative(row.stepCount) && nonNegative(row.toolCallCount) && Object.hasOwn(row, "structuredResult") ? row : null
 }
 function sameLiveLease(row: Row, lease: SubagentLease, now: Date): boolean {
   const expiry = row.leaseExpiresAt instanceof Date ? row.leaseExpiresAt : new Date(String(row.leaseExpiresAt))
@@ -290,6 +246,5 @@ export function scheduledQuestionWaitId(turnInput: unknown, checkpoint: unknown,
   return typeof waitId === "string" && waitId.startsWith(`agent-question:${turnId}:canonical:`) ? waitId : null
 }
 function validId(value: unknown): value is string { return typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= 256 && !/[\u0000-\u001f\u007f]/.test(value) }
-function nonNegative(value: unknown): boolean { return Number.isSafeInteger(value) && Number(value) >= 0 }
 function record(value: unknown): Row | null { const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value; if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null; const proto = Object.getPrototypeOf(parsed); return proto === Object.prototype || proto === null ? parsed as Row : null }
 function sameJson(left: unknown, right: unknown): boolean { try { return canonicalTaskGraphJson(left) === canonicalTaskGraphJson(right) } catch { return false } }
