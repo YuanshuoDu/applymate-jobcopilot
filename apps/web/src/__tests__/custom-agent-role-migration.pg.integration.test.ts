@@ -346,7 +346,7 @@ async function readCatalogShape(client: CatalogQueryClient): Promise<CatalogShap
 
   const constraintsSql = [
     "SELECT constraint_info.conname AS name, constraint_info.contype::text AS constraint_type,",
-    "  pg_get_constraintdef(constraint_info.oid) AS definition,",
+    "  replace(pg_catalog.pg_get_constraintdef(constraint_info.oid), 'REFERENCES public.', 'REFERENCES ') AS definition,",
     "  constraint_info.convalidated AS is_validated,",
     "  constraint_info.condeferrable AS is_deferrable, constraint_info.condeferred AS is_deferred,",
     "  constraint_info.confdeltype::text AS delete_action,",
@@ -806,22 +806,54 @@ integrationDescribe("CustomAgentRole PostgreSQL migration and candidate RLS", ()
         bypasses_rls: false,
       }])
       const privileges = await transaction.$queryRawUnsafe<Array<{
+        connection_user: string
+        active_role: string
+        search_path: string
         can_select: boolean
         can_insert: boolean
         can_update: boolean
         can_delete: boolean
+        has_select_acl: boolean
+        has_insert_acl: boolean
+        has_update_acl: boolean
+        has_delete_acl: boolean
       }>([
         "SELECT",
-        "  has_table_privilege('applymate_candidate', 'public.\"CustomAgentRole\"', 'SELECT') AS can_select,",
-        "  has_table_privilege('applymate_candidate', 'public.\"CustomAgentRole\"', 'INSERT') AS can_insert,",
-        "  has_table_privilege('applymate_candidate', 'public.\"CustomAgentRole\"', 'UPDATE') AS can_update,",
-        "  has_table_privilege('applymate_candidate', 'public.\"CustomAgentRole\"', 'DELETE') AS can_delete",
+        "  current_user::text AS connection_user, current_role::text AS active_role,",
+        "  current_setting('search_path') AS search_path,",
+        "  pg_catalog.has_table_privilege(candidate.oid, custom_role.oid, 'SELECT') AS can_select,",
+        "  pg_catalog.has_table_privilege(candidate.oid, custom_role.oid, 'INSERT') AS can_insert,",
+        "  pg_catalog.has_table_privilege(candidate.oid, custom_role.oid, 'UPDATE') AS can_update,",
+        "  pg_catalog.has_table_privilege(candidate.oid, custom_role.oid, 'DELETE') AS can_delete,",
+        "  EXISTS (SELECT 1 FROM pg_catalog.aclexplode(COALESCE(custom_role.relacl,",
+        "    pg_catalog.acldefault('r', custom_role.relowner))) AS acl",
+        "    WHERE acl.grantee = candidate.oid AND acl.privilege_type = 'SELECT') AS has_select_acl,",
+        "  EXISTS (SELECT 1 FROM pg_catalog.aclexplode(COALESCE(custom_role.relacl,",
+        "    pg_catalog.acldefault('r', custom_role.relowner))) AS acl",
+        "    WHERE acl.grantee = candidate.oid AND acl.privilege_type = 'INSERT') AS has_insert_acl,",
+        "  EXISTS (SELECT 1 FROM pg_catalog.aclexplode(COALESCE(custom_role.relacl,",
+        "    pg_catalog.acldefault('r', custom_role.relowner))) AS acl",
+        "    WHERE acl.grantee = candidate.oid AND acl.privilege_type = 'UPDATE') AS has_update_acl,",
+        "  EXISTS (SELECT 1 FROM pg_catalog.aclexplode(COALESCE(custom_role.relacl,",
+        "    pg_catalog.acldefault('r', custom_role.relowner))) AS acl",
+        "    WHERE acl.grantee = candidate.oid AND acl.privilege_type = 'DELETE') AS has_delete_acl",
+        "FROM pg_catalog.pg_roles AS candidate",
+        "JOIN pg_catalog.pg_class AS custom_role",
+        "  ON custom_role.oid = 'public.\"CustomAgentRole\"'::pg_catalog.regclass",
+        "WHERE candidate.rolname = 'applymate_candidate'",
       ].join("\n"))
       expect(privileges).toEqual([{
+        connection_user: "postgres",
+        active_role: "postgres",
+        search_path: '"$user", public',
         can_select: true,
         can_insert: true,
         can_update: true,
         can_delete: true,
+        has_select_acl: true,
+        has_insert_acl: true,
+        has_update_acl: true,
+        has_delete_acl: true,
       }])
 
       await transaction.$executeRawUnsafe("SET LOCAL ROLE applymate_candidate")
