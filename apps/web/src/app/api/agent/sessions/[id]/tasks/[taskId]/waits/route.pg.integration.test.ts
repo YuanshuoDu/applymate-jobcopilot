@@ -1,4 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto"
+import { AsyncResource } from "node:async_hooks"
+import { createRequire } from "node:module"
 
 import { Prisma, PrismaClient } from "@prisma/client"
 import { SignJWT } from "jose"
@@ -6,6 +8,8 @@ import { NextRequest } from "next/server"
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest"
 
 import { EXTENSION_TOKEN_AUDIENCE, EXTENSION_TOKEN_ISSUER, getAuthJwtSecret } from "@/lib/auth-secret"
+
+const nodeRequire = createRequire(import.meta.url)
 
 // Keep the real signed Bearer path while avoiding NextAuth's framework-only
 // cookie/session integration in Vitest's Node runtime.
@@ -101,6 +105,8 @@ type CandidateTransactionObservation = Readonly<{
 }>
 let routeBaseClient: PrismaClient | undefined
 let restoreRouteTransactionObserver: (() => void) | undefined
+let tenantContextRoot: AsyncResource | undefined
+let requireStubbed = false
 let activeUserPolicyProbe: UserPolicyProbe | null = null
 const candidateTransactionObservations: CandidateTransactionObservation[] = []
 const previousAuthSecret = process.env.AUTH_SECRET
@@ -215,6 +221,20 @@ function installRouteTransactionObserver(): () => void {
   }
 }
 
+async function runInIsolatedTenantContext<T>(callback: () => Promise<T>): Promise<T> {
+  if (!tenantContextRoot) throw new Error("The isolated tenant context root is not initialized")
+  let requestResource: AsyncResource | undefined
+  tenantContextRoot.runInAsyncScope(() => {
+    requestResource = new AsyncResource("agent-wait-test-request")
+  })
+  if (!requestResource) throw new Error("Could not create an isolated tenant request context")
+  try {
+    return await requestResource.runInAsyncScope(callback)
+  } finally {
+    requestResource.emitDestroy()
+  }
+}
+
 async function getWait(
   fixture: Fixture,
   token?: string,
@@ -222,13 +242,7 @@ async function getWait(
   options: Readonly<{ authenticatedUserId?: string; assertCandidateRole?: boolean }> = {},
 ): Promise<Response> {
   const expectedUserId = token ? options.authenticatedUserId ?? fixture.ownerId : null
-  // Reset only the route module graph so its module-level tenant fallback is
-  // empty for each request. db.ts still reuses and is checked against the one
-  // global Prisma singleton initialized by beforeAll; the safe-auth mock stays
-  // registered while the real Bearer verification path remains active.
-  if (databaseConfig?.rlsEnabled) vi.resetModules()
   const tenantStore = databaseConfig?.rlsEnabled ? await import("@/lib/db/tenant-store") : null
-  if (tenantStore) expect(tenantStore.currentTenantUserId()).toBeNull()
 
   const observationStart = candidateTransactionObservations.length
   activeUserPolicyProbe = databaseConfig?.rlsEnabled && token && options.assertCandidateRole
@@ -236,26 +250,31 @@ async function getWait(
     : null
   try {
     const { GET } = await import("./route")
-    if (databaseConfig?.rlsEnabled && (globalThis as typeof globalThis & { prisma?: PrismaClient }).prisma !== routeBaseClient) {
-      throw new Error("Resetting route modules must reuse the existing Prisma singleton")
+    if (tenantStore && (globalThis as typeof globalThis & { prisma?: PrismaClient }).prisma !== routeBaseClient) {
+      throw new Error("The isolated request must reuse the initialized Prisma singleton")
     }
-    const response = await GET(waitRequest(fixture.sessionId, fixture.parentTaskId, token, search), {
-      params: Promise.resolve({ id: fixture.sessionId, taskId: fixture.parentTaskId }),
-    })
+    const invoke = async () => {
+      if (tenantStore) expect(tenantStore.currentTenantUserId()).toBeNull()
+      const response = await GET(waitRequest(fixture.sessionId, fixture.parentTaskId, token, search), {
+        params: Promise.resolve({ id: fixture.sessionId, taskId: fixture.parentTaskId }),
+      })
 
-    if (activeUserPolicyProbe) {
-      const observations = candidateTransactionObservations.slice(observationStart)
-      expect(observations.length).toBeGreaterThan(0)
-      for (const observation of observations) {
-        expect(observation.currentRole).toBe("applymate_candidate")
-        // This GUC is configured from requireAuth's activated tenant context
-        // inside the route transaction and must match the signed Bearer subject.
-        expect(observation.tenantUserId).toBe(activeUserPolicyProbe.expectedUserId)
-        expect(observation.visibleUserIds).toEqual([activeUserPolicyProbe.expectedUserId])
-        expect(observation.emptyContextVisibleUserIds).toEqual([])
+      if (tenantStore) expect(tenantStore.currentTenantUserId()).toBe(expectedUserId)
+      if (activeUserPolicyProbe) {
+        const observations = candidateTransactionObservations.slice(observationStart)
+        expect(observations.length).toBeGreaterThan(0)
+        for (const observation of observations) {
+          expect(observation.currentRole).toBe("applymate_candidate")
+          // The route transaction GUC must match the signed Bearer subject.
+          expect(observation.tenantUserId).toBe(activeUserPolicyProbe.expectedUserId)
+          expect(observation.visibleUserIds).toEqual([activeUserPolicyProbe.expectedUserId])
+          expect(observation.emptyContextVisibleUserIds).toEqual([])
+        }
       }
+      return response
     }
-    return response
+
+    return tenantStore ? await runInIsolatedTenantContext(invoke) : await invoke()
   } finally {
     activeUserPolicyProbe = null
   }
@@ -546,11 +565,20 @@ describeWithDatabase("authenticated task wait projection on disposable PostgreSQ
     process.env.RLS_RUNTIME_MODE = databaseConfig!.rlsEnabled ? "on" : "off"
     if (databaseConfig!.rlsEnabled) process.env.RLS_CANDIDATE_ROLE = "applymate_candidate"
     else delete process.env.RLS_CANDIDATE_ROLE
+    if (databaseConfig!.rlsEnabled) {
+      // tenant-store's Node ESM fallback resolves this test-only require to
+      // AsyncLocalStorage; restore the original global after this suite.
+      vi.stubGlobal("require", nodeRequire)
+      requireStubbed = true
+    }
     adminDb = new PrismaClient({ datasources: { db: { url: databaseConfig!.adminUrl } } })
     await adminDb.$connect()
     routeDb = (await import("@/lib/db")).db
     await routeDb.$connect()
-    if (databaseConfig!.rlsEnabled) restoreRouteTransactionObserver = installRouteTransactionObserver()
+    if (databaseConfig!.rlsEnabled) {
+      tenantContextRoot = new AsyncResource("agent-wait-test-root")
+      restoreRouteTransactionObserver = installRouteTransactionObserver()
+    }
   })
 
   afterEach(async () => {
@@ -567,6 +595,12 @@ describeWithDatabase("authenticated task wait projection on disposable PostgreSQ
       await routeDb?.$disconnect()
       await adminDb?.$disconnect()
     } finally {
+      tenantContextRoot?.emitDestroy()
+      tenantContextRoot = undefined
+      if (requireStubbed) {
+        vi.unstubAllGlobals()
+        requireStubbed = false
+      }
       if (previousAuthSecret === undefined) delete process.env.AUTH_SECRET
       else process.env.AUTH_SECRET = previousAuthSecret
       if (previousDatabaseUrl === undefined) delete process.env.DATABASE_URL
@@ -701,8 +735,8 @@ describeWithDatabase("authenticated task wait projection on disposable PostgreSQ
   })
 
   itWithRls("runs the authenticated route as the candidate role and scopes wait reads to tenant context", async () => {
-    const fixture = await createFixture()
-    const response = await getWait(fixture, await signedBearer(fixture.ownerId))
+    const fixture = await createFixture({ targetCount: 1 })
+    const response = await getWait(fixture, await signedBearer(fixture.ownerId), "", { assertCandidateRole: true })
     expect(response.status).toBe(200)
     expect(await response.json()).toMatchObject({ wait: { status: "waiting", targets: [{ taskId: fixture.targetIds[0] }] } })
 
