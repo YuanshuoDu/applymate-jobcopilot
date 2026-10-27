@@ -95,6 +95,8 @@ type EventSnapshot = {
   payload: { turnId: string }
 }
 
+type TurnSnapshot = { id: string; sessionId: string; status: string; revision: number }
+
 type Deferred = { promise: Promise<void>; resolve: () => void }
 type Outcome<T> = { status: "fulfilled"; value: T } | { status: "rejected"; reason: unknown }
 
@@ -191,12 +193,17 @@ async function insertCandidates(candidates: Candidate[]): Promise<void> {
   })
 }
 
-async function readSnapshots(sessionIds: string[]): Promise<{ sessions: SessionSnapshot[]; events: EventSnapshot[] }> {
+async function readSnapshots(sessionIds: string[]): Promise<{ sessions: SessionSnapshot[]; turns: TurnSnapshot[]; events: EventSnapshot[] }> {
   return withSchemaClient(async client => {
     const sessions = await client.query<SessionSnapshot>(
       `SELECT "id", "status", "createdAt", "updatedAt", "sessionControlRecoveryAttemptedAt" AS "marker",
               "sessionControlRecoveryClaimToken" AS "claimToken", "sessionControlRecoveryClaimExpiresAt" AS "claimExpiresAt"
        FROM "agent_sessions" WHERE "id" = ANY($1::text[]) ORDER BY "id"`,
+      [sessionIds],
+    )
+    const turns = await client.query<TurnSnapshot>(
+      `SELECT "id", "sessionId", "status", "revision" FROM "agent_turns"
+       WHERE "sessionId" = ANY($1::text[]) ORDER BY "id"`,
       [sessionIds],
     )
     const events = await client.query<EventSnapshot>(
@@ -205,7 +212,7 @@ async function readSnapshots(sessionIds: string[]): Promise<{ sessions: SessionS
        FROM "agent_events" WHERE "sessionId" = ANY($1::text[]) ORDER BY "sessionId", "sequence", "id"`,
       [sessionIds],
     )
-    return { sessions: sessions.rows, events: events.rows }
+    return { sessions: sessions.rows, turns: turns.rows, events: events.rows }
   })
 }
 
@@ -277,7 +284,9 @@ describeWithPostgres("session-control recovery on disposable PostgreSQL", () => 
       await client.query(`CREATE TABLE "agent_turns" (
         "id" text PRIMARY KEY,
         "sessionId" text NOT NULL,
-        "userId" text NOT NULL
+        "userId" text NOT NULL,
+        "status" text NOT NULL DEFAULT 'queued',
+        "revision" integer NOT NULL DEFAULT 0
       )`)
       await client.query(`CREATE TABLE "agent_events" (
         "id" text PRIMARY KEY,
@@ -340,6 +349,7 @@ describeWithPostgres("session-control recovery on disposable PostgreSQL", () => 
       expect(markedIds(afterFirst.sessions)).toEqual(firstClaimIds)
       expect(afterFirst.sessions.every(row => row.claimToken === null && row.claimExpiresAt === null)).toBe(true)
       expect(sessionActivity(afterFirst.sessions)).toEqual(sessionActivity(before.sessions))
+      expect(afterFirst.turns).toEqual(before.turns)
       expect(afterFirst.events).toEqual(before.events)
 
       const firstMarkers = new Map(afterFirst.sessions.map(row => [row.id, row.marker?.toISOString() ?? null]))
@@ -354,6 +364,7 @@ describeWithPostgres("session-control recovery on disposable PostgreSQL", () => 
       expect(markedIds(afterSecond.sessions)).toEqual(ids)
       expect(afterSecond.sessions.every(row => row.claimToken === null && row.claimExpiresAt === null)).toBe(true)
       expect(sessionActivity(afterSecond.sessions)).toEqual(sessionActivity(before.sessions))
+      expect(afterSecond.turns).toEqual(before.turns)
       expect(afterSecond.events).toEqual(before.events)
       const retriedIds = new Set(ids.slice(0, 25))
       for (const row of afterSecond.sessions) {
@@ -426,6 +437,7 @@ describeWithPostgres("session-control recovery on disposable PostgreSQL", () => 
       const afterStaleCleanup = await readSnapshots([candidate.sessionId])
       expect(afterStaleCleanup.sessions[0]?.claimToken).toBe(takeoverToken)
       expect(sessionActivity(afterStaleCleanup.sessions)).toEqual(sessionActivity(before.sessions))
+      expect(afterStaleCleanup.turns).toEqual(before.turns)
       expect(afterStaleCleanup.events).toEqual(before.events)
 
       releaseTakeover.resolve()
@@ -435,6 +447,7 @@ describeWithPostgres("session-control recovery on disposable PostgreSQL", () => 
       expect(afterTakeover.sessions[0]?.claimToken).toBeNull()
       expect(afterTakeover.sessions[0]?.claimExpiresAt).toBeNull()
       expect(sessionActivity(afterTakeover.sessions)).toEqual(sessionActivity(before.sessions))
+      expect(afterTakeover.turns).toEqual(before.turns)
       expect(afterTakeover.events).toEqual(before.events)
     } finally {
       releaseFirst.resolve()
