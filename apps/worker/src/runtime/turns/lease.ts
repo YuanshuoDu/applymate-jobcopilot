@@ -33,7 +33,7 @@ export class TurnLeaseError extends Error {
   constructor(readonly code: LeaseErrorCode, message: string) { super(message); this.name = "TurnLeaseError" }
 }
 
-type LeaseRow = { id: string; sessionId: string; userId: string; leaseOwnerId: string; leaseVersion: number; leaseStartedAt: Date | string; leaseExpiresAt: Date | string }
+type LeaseRow = { id: string; sessionId: string; userId: string; leaseOwnerId: string; leaseVersion: number; leaseStartedAt: Date | string; leaseExpiresAt: Date | string; rootTaskId?: string | null }
 
 function date(value: Date | string): Date { return value instanceof Date ? value : new Date(value) }
 
@@ -116,11 +116,33 @@ export async function renewTurnLease(
          AND "leaseExpiresAt" > $6
          AND "leaseStartedAt" + ($7 * INTERVAL '1 millisecond') > $6
        RETURNING "id", "sessionId", "userId", "leaseOwnerId", "leaseVersion",
-                 "leaseStartedAt", "leaseExpiresAt"`,
+                 "leaseStartedAt", "leaseExpiresAt", "rootTaskId"`,
       [current.turnId, current.sessionId, current.ownerId, current.leaseVersion, leaseMs, now, TURN_MAX_LEASE_MS],
     )
-    if (!result.rows[0]) throw new LeaseUnavailable("Turn lease is no longer renewable")
-    return lease(result.rows[0])
+    const renewedRow = result.rows[0]
+    if (!renewedRow) throw new LeaseUnavailable("Turn lease is no longer renewable")
+    const renewed = lease(renewedRow)
+    if (renewedRow.rootTaskId !== null && renewedRow.rootTaskId !== undefined) {
+      const root = await client.query<{ id: string }>(
+        `UPDATE "sub_agent_tasks" AS root
+         SET "leaseExpiresAt" = turn."leaseExpiresAt", "updatedAt" = $7
+         FROM "agent_turns" AS turn
+         WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3
+           AND turn."leaseOwnerId" = $4 AND turn."leaseVersion" = $5 AND turn."status" = 'in_progress'
+           AND turn."rootTaskId" = $6
+           AND root."id" = turn."rootTaskId" AND root."sessionId" = $2 AND root."turnId" = $1
+           AND root."rootTaskId" = root."id" AND root."parentTaskId" IS NULL
+           AND root."role" = 'orchestrator' AND root."taskType" = 'root' AND root."status" = 'running'
+           AND root."leaseOwner" = $4 AND root."attemptCount" = 1 AND root."leaseExpiresAt" IS NOT NULL
+           AND root."interruptRequestedAt" IS NULL AND root."failureReason" IS NULL
+           AND root."completedAt" IS NULL AND root."closedAt" IS NULL AND root."nextAttemptAt" IS NULL
+         RETURNING root."id"`,
+        [current.turnId, current.sessionId, current.userId, current.ownerId, current.leaseVersion,
+          renewedRow.rootTaskId, now],
+      )
+      if (root.rowCount !== 1) throw new LeaseUnavailable("Linked Root task lease is no longer renewable")
+    }
+    return renewed
   })
 }
 

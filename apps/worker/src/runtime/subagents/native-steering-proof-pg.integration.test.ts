@@ -8,8 +8,9 @@ import {
 import { parseNativeVerificationPacket } from "./native-verification-packet.js"
 import { attachNativeVerificationReport } from "./native-verification-report.js"
 import { readNativeVerificationTerminalProofWithClient } from "./native-verification-pg-readback.js"
-import type { NativeVerificationRootGoalWitness } from "./native-verification-port.js"
+import { renewTurnLease, TURN_LEASE_WINDOW_MS, TURN_MAX_LEASE_MS, type TurnLease } from "../turns/lease.js"
 import { createPgNativeVerificationPort } from "./pg-native-verification-port.js"
+import type { NativeVerificationRootGoalWitness } from "./native-verification-port.js"
 import { isNativeSteeringEvidence, NATIVE_VERIFICATION_USER_STEERING_SCHEMA,
   NATIVE_VERIFICATION_USER_STEERING_STAGE } from "./native-verification-steering-contract.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "./task-graph-snapshot.js"
@@ -191,6 +192,154 @@ describePg("native steering proof PostgreSQL identity and checkpoint", () => {
       finally { await pool.end() }
     }
   })
+
+  it("renews the linked Root after the native freshness gate rejects its expired copied lease", async () => {
+    const original = await pool!.query<{
+      turnLeaseStartedAt: Date; turnLeaseExpiresAt: Date; turnUpdatedAt: Date
+      rootLeaseOwner: string; rootLeaseExpiresAt: Date; rootStatus: string
+      rootCompletedAt: Date | null; rootInterruptRequestedAt: Date | null; rootUpdatedAt: Date
+      sessionEventSequence: string | bigint
+    }>(`SELECT turn."leaseStartedAt" AS "turnLeaseStartedAt", turn."leaseExpiresAt" AS "turnLeaseExpiresAt",
+        turn."updatedAt" AS "turnUpdatedAt", root."leaseOwner" AS "rootLeaseOwner",
+        root."leaseExpiresAt" AS "rootLeaseExpiresAt", root."status" AS "rootStatus",
+        root."completedAt" AS "rootCompletedAt", root."interruptRequestedAt" AS "rootInterruptRequestedAt",
+        root."updatedAt" AS "rootUpdatedAt", session."eventSequence" AS "sessionEventSequence"
+      FROM "agent_turns" AS turn JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId"
+        AND root."sessionId" = turn."sessionId" AND root."turnId" = turn."id"
+      JOIN "agent_sessions" AS session ON session."id" = turn."sessionId"
+      WHERE turn."id" = $1 AND turn."sessionId" = $2 AND root."id" = $3`, [ids.turn, ids.session, ids.root])
+    const originalState = original.rows[0]
+    if (!originalState) throw new Error("native_steering_fixture_lease_snapshot_missing")
+    const preexistingControls = await pool!.query<{ id: string }>(`SELECT "id" FROM "sub_agent_tasks"
+      WHERE "sessionId" = $1 AND "turnId" = $2 AND "rootTaskId" = $3 AND "parentTaskId" = $3
+        AND "role" = 'auditor' AND "taskType" = 'native_verification'`, [ids.session, ids.turn, ids.root])
+    const preexistingControlIds = new Set(preexistingControls.rows.map(row => row.id))
+    let createdControlTaskIds: string[] = []
+
+    try {
+      const clock = await pool!.query<{ at: Date }>(`SELECT clock_timestamp() AS "at"`)
+      const controlledNow = clock.rows[0]?.at
+      if (!(controlledNow instanceof Date) || !Number.isFinite(controlledNow.getTime())) {
+        throw new Error("native_steering_fixture_database_clock_missing")
+      }
+      const alignedTurn = await pool!.query(`UPDATE "agent_turns"
+        SET "leaseStartedAt" = $2::timestamptz - INTERVAL '30 seconds',
+            "leaseExpiresAt" = $2::timestamptz + INTERVAL '30 seconds', "updatedAt" = $2
+        WHERE "id" = $1 AND "sessionId" = $3 AND "leaseOwnerId" = $4 AND "leaseVersion" = 1
+          AND "status" = 'in_progress' RETURNING "id"`, [ids.turn, controlledNow, ids.session, ids.turnOwner])
+      if (alignedTurn.rowCount !== 1) throw new Error("native_steering_fixture_turn_alignment_failed")
+      const alignedRoot = await pool!.query(`UPDATE "sub_agent_tasks"
+        SET "leaseOwner" = $2, "leaseExpiresAt" = $3::timestamptz - INTERVAL '1 second',
+            "status" = 'running', "completedAt" = NULL, "interruptRequestedAt" = NULL, "updatedAt" = $3
+        WHERE "id" = $1 AND "sessionId" = $4 AND "turnId" = $5 AND "rootTaskId" = $1
+          AND "status" = 'running' RETURNING "id"`, [ids.root, ids.turnOwner, controlledNow, ids.session, ids.turn])
+      if (alignedRoot.rowCount !== 1) throw new Error("native_steering_fixture_root_owner_alignment_failed")
+
+      const scope = { ...executionScope(ids.firstStep), parentLeaseOwner: ids.turnOwner }
+      const port = createPgNativeVerificationPort(pool as unknown as PgSubagentPool)
+      const before = await pool!.query<{
+        turnId: string; rootId: string; turnLeaseLive: boolean; rootLeaseLive: boolean
+      }>(`WITH wall_clock AS MATERIALIZED (SELECT clock_timestamp() AS "at")
+        SELECT turn."id" AS "turnId", root."id" AS "rootId",
+          turn."leaseExpiresAt" > wall_clock."at" AS "turnLeaseLive",
+          root."leaseExpiresAt" > wall_clock."at" AS "rootLeaseLive"
+        FROM wall_clock JOIN "agent_turns" AS turn ON turn."id" = $1 AND turn."sessionId" = $2
+        JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."id" = $3
+          AND root."sessionId" = turn."sessionId" AND root."turnId" = turn."id"`, [ids.turn, ids.session, ids.root])
+      expect(before.rows[0]).toEqual({ turnId: ids.turn, rootId: ids.root, turnLeaseLive: true, rootLeaseLive: false })
+
+      // ensureRootGoal reaches lockAndLoad -> lockTaskGraphScope, the production native Root freshness gate.
+      await expect(port.ensureRootGoal({ scope, candidateText })).rejects.toThrow("task_graph_parent_fenced")
+
+      const turnRow = await pool!.query<{
+        id: string; sessionId: string; userId: string; leaseOwnerId: string; leaseVersion: number
+        leaseStartedAt: Date; leaseExpiresAt: Date
+      }>(`SELECT "id", "sessionId", "userId", "leaseOwnerId", "leaseVersion", "leaseStartedAt", "leaseExpiresAt"
+        FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`, [ids.turn, ids.session])
+      const row = turnRow.rows[0]
+      if (!row) throw new Error("native_steering_fixture_turn_snapshot_missing")
+      const current: TurnLease = {
+        turnId: row.id, sessionId: row.sessionId, userId: row.userId, ownerId: row.leaseOwnerId,
+        leaseVersion: row.leaseVersion, leaseStartedAt: row.leaseStartedAt, leaseExpiresAt: row.leaseExpiresAt,
+      }
+      const renewed = await renewTurnLease(pool!, current, controlledNow)
+      if (!renewed) throw new Error("native_steering_fixture_turn_renewal_missing")
+      expect(renewed.leaseExpiresAt.getTime()).toBeGreaterThan(current.leaseExpiresAt.getTime())
+      expect(renewed.leaseExpiresAt.getTime()).toBeLessThanOrEqual(controlledNow.getTime() + TURN_LEASE_WINDOW_MS)
+      expect(renewed.leaseExpiresAt.getTime()).toBeLessThanOrEqual(renewed.leaseStartedAt.getTime() + TURN_MAX_LEASE_MS)
+
+      const after = await pool!.query<{
+        turnId: string; turnRootTaskId: string; turnExpiresAt: Date; rootId: string; rootOwner: string; rootExpiresAt: Date
+      }>(`SELECT turn."id" AS "turnId", turn."rootTaskId" AS "turnRootTaskId", turn."leaseExpiresAt" AS "turnExpiresAt",
+          root."id" AS "rootId", root."leaseOwner" AS "rootOwner", root."leaseExpiresAt" AS "rootExpiresAt"
+        FROM "agent_turns" AS turn JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId"
+          AND root."sessionId" = turn."sessionId" AND root."turnId" = turn."id"
+        WHERE turn."id" = $1 AND turn."sessionId" = $2 AND root."id" = $3`, [ids.turn, ids.session, ids.root])
+      expect(after.rows[0]).toMatchObject({ turnId: ids.turn, turnRootTaskId: ids.root, rootId: ids.root, rootOwner: ids.turnOwner })
+      expect(after.rows[0]?.turnExpiresAt).toEqual(renewed.leaseExpiresAt)
+      expect(after.rows[0]?.rootExpiresAt).toEqual(renewed.leaseExpiresAt)
+      const afterGate = await port.ensureRootGoal({ scope, candidateText })
+      createdControlTaskIds = afterGate.controlTaskIds.filter(id => !preexistingControlIds.has(id))
+      expect(afterGate.status).toBe("pending")
+      expect(afterGate.controlTaskIds).toHaveLength(1)
+
+      const stoppedAt = await pool!.query<{ at: Date }>(`SELECT clock_timestamp() AS "at"`)
+      const interruptTime = stoppedAt.rows[0]?.at
+      if (!(interruptTime instanceof Date) || !Number.isFinite(interruptTime.getTime())) {
+        throw new Error("native_steering_fixture_database_clock_missing")
+      }
+      const interrupted = await pool!.query(`UPDATE "sub_agent_tasks"
+        SET "status" = 'interrupted', "leaseOwner" = NULL, "leaseExpiresAt" = NULL,
+            "interruptRequestedAt" = $2, "completedAt" = $2, "updatedAt" = $2
+        WHERE "id" = $1 AND "sessionId" = $3 AND "turnId" = $4 AND "status" = 'running'
+        RETURNING "id"`, [ids.root, interruptTime, ids.session, ids.turn])
+      if (interrupted.rowCount !== 1) throw new Error("native_steering_fixture_root_interrupt_failed")
+      const retryNow = new Date(Math.min(interruptTime.getTime() + 5_000, renewed.leaseExpiresAt.getTime() - 1_000))
+      expect(retryNow.getTime()).toBeLessThan(renewed.leaseExpiresAt.getTime())
+      expect(retryNow.getTime() + TURN_LEASE_WINDOW_MS).toBeGreaterThan(renewed.leaseExpiresAt.getTime())
+      await expect(renewTurnLease(pool!, renewed, retryNow)).resolves.toBeNull()
+      const rolledBack = await pool!.query<{
+        turnExpiresAt: Date; rootExpiresAt: Date | null; rootOwner: string | null; rootStatus: string
+      }>(`SELECT turn."leaseExpiresAt" AS "turnExpiresAt", root."leaseExpiresAt" AS "rootExpiresAt",
+          root."leaseOwner" AS "rootOwner", root."status" AS "rootStatus"
+        FROM "agent_turns" AS turn JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId"
+          AND root."sessionId" = turn."sessionId" AND root."turnId" = turn."id"
+        WHERE turn."id" = $1 AND turn."sessionId" = $2 AND root."id" = $3`, [ids.turn, ids.session, ids.root])
+      expect(rolledBack.rows[0]).toMatchObject({ rootStatus: "interrupted", rootOwner: null, rootExpiresAt: null })
+      expect(rolledBack.rows[0]?.turnExpiresAt).toEqual(renewed.leaseExpiresAt)
+    } finally {
+      try {
+        if (createdControlTaskIds.length) {
+          const dispatchKeys = createdControlTaskIds.map(id => `subagent-dispatch:${id}`)
+          await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1
+            AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = ANY($2::text[])`, [ids.session, dispatchKeys])
+          await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1
+            AND "topic" = 'agent.session.event' AND "payload"->>'taskId' = ANY($2::text[])`, [ids.session, createdControlTaskIds])
+          await pool!.query(`DELETE FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
+            AND "type" = 'native_verification.requested' AND "taskId" = ANY($3::text[])`,
+          [ids.session, ids.turn, createdControlTaskIds])
+          await pool!.query(`DELETE FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2
+            AND "rootTaskId" = $3 AND "parentTaskId" = $3 AND "role" = 'auditor'
+            AND "taskType" = 'native_verification' AND "id" = ANY($4::text[])`,
+          [ids.session, ids.turn, ids.root, createdControlTaskIds])
+          await pool!.query(`UPDATE "agent_sessions" SET "eventSequence" = $2
+            WHERE "id" = $1 AND "userId" = $3`, [ids.session, originalState.sessionEventSequence, ids.user])
+        }
+      } finally {
+        try {
+          await pool!.query(`UPDATE "agent_turns" SET "leaseStartedAt" = $2, "leaseExpiresAt" = $3, "updatedAt" = $4
+            WHERE "id" = $1 AND "sessionId" = $5`, [ids.turn, originalState.turnLeaseStartedAt, originalState.turnLeaseExpiresAt,
+            originalState.turnUpdatedAt, ids.session])
+        } finally {
+          await pool!.query(`UPDATE "sub_agent_tasks" SET "leaseOwner" = $2, "leaseExpiresAt" = $3, "status" = $4,
+              "completedAt" = $5, "interruptRequestedAt" = $6, "updatedAt" = $7
+            WHERE "id" = $1 AND "sessionId" = $8 AND "turnId" = $9 AND "rootTaskId" = $1`,
+          [ids.root, originalState.rootLeaseOwner, originalState.rootLeaseExpiresAt, originalState.rootStatus,
+            originalState.rootCompletedAt, originalState.rootInterruptRequestedAt, originalState.rootUpdatedAt, ids.session, ids.turn])
+        }
+      }
+    }
+  }, 15_000)
 
   it("reuses an unchanged owned steering proof and rejects it after a new consumed steer", async () => {
     const port = createPgNativeVerificationPort(pool as unknown as PgSubagentPool)
