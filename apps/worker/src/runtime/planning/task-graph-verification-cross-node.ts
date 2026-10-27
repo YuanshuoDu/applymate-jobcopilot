@@ -1,9 +1,11 @@
 import type {
   TaskGraphVerificationCheck,
   TaskGraphVerificationContract,
+  TaskGraphVerificationReasonCode,
   TaskGraphVerificationRole,
   TaskGraphVerificationValidationError,
-} from "./task-graph-verification.js"
+} from "./task-graph-verification-contract.js"
+import { taskGraphVerificationCheckDependencyNodeKeys } from "./task-graph-verification-scout-union.js"
 
 export const TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION = "agent-harness.v2.task-graph-verification-evidence.v1" as const
 export const TASK_GRAPH_VERIFICATION_LIMITS = Object.freeze({
@@ -25,7 +27,7 @@ type ParsedItem = Readonly<{ jobId: string; evidenceIds: readonly string[]; scor
 export type TaskGraphVerificationParsedProjection = Readonly<{ role: TaskGraphVerificationRole; items: readonly ParsedItem[]; evidenceIds: readonly string[]; emptyDiscoveryDigest?: string }>
 export type TaskGraphVerificationProjectionParse =
   | Readonly<{ ok: true; value: TaskGraphVerificationParsedProjection }>
-  | Readonly<{ ok: false; reasonCode: Exclude<import("./task-graph-verification.js").TaskGraphVerificationReasonCode, "criteria_met" | "criterion_not_met" | "reported_score_below_minimum" | "contract_invalid"> }>
+  | Readonly<{ ok: false; reasonCode: Exclude<TaskGraphVerificationReasonCode, "criteria_met" | "criterion_not_met" | "reported_score_below_minimum" | "contract_invalid"> }>
 
 export type TaskGraphVerificationDependencyGraphNode = Readonly<{
   key: string
@@ -146,9 +148,7 @@ export function parseFindingsCoverScoutCandidatesCheck(
 }
 
 export function taskGraphVerificationDependencyNodeKeys(contract: TaskGraphVerificationContract): string[] {
-  return [...new Set(contract.criteria
-    .filter(item => item.check.kind === "findings_from_scout_dependency" || item.check.kind === "findings_cover_scout_candidates_gte")
-    .map(item => item.check.kind === "findings_from_scout_dependency" || item.check.kind === "findings_cover_scout_candidates_gte" ? item.check.dependencyNodeKey : ""))].sort()
+  return [...new Set(contract.criteria.flatMap(item => taskGraphVerificationCheckDependencyNodeKeys(item.check)))].sort()
 }
 
 /** Call with nodes normalized by the strict snapshot parser and from one graph only. */
@@ -161,10 +161,11 @@ export function validateTaskGraphVerificationDependencySelectors(nodes: readonly
   for (const node of nodes) {
     if (node.templateId !== "analyst" || node.verificationDisposition !== "typed" || node.verification?.role !== "analyst") continue
     for (const criterion of node.verification.criteria) {
-      if (criterion.check.kind !== "findings_from_scout_dependency" && criterion.check.kind !== "findings_cover_scout_candidates_gte") continue
-      const source = byKey.get(criterion.check.dependencyNodeKey)
-      if (!source || !node.dependsOn.includes(source.key) || source.templateId !== "scout"
-        || source.verificationDisposition !== "typed" || source.verification?.role !== "scout") return false
+      for (const key of taskGraphVerificationCheckDependencyNodeKeys(criterion.check)) {
+        const source = byKey.get(key)
+        if (!source || !node.dependsOn.includes(source.key) || source.templateId !== "scout"
+          || source.verificationDisposition !== "typed" || source.verification?.role !== "scout") return false
+      }
     }
   }
   return true
