@@ -218,6 +218,12 @@ jobs:
           const currentUserFunction = extractUnique(enableSql,
             /^CREATE OR REPLACE FUNCTION app_current_user_id\(\)\r?\n[\s\S]*?\$\$;/gm,
             "app_current_user_id function in enable.sql")
+          const userRls = extractUnique(enableSql,
+            /^ALTER TABLE "User" ENABLE ROW LEVEL SECURITY;$/gm,
+            "User RLS activation in enable.sql")
+          const userPolicy = extractUnique(enableSql,
+            /^DROP POLICY IF EXISTS candidate_user_isolation ON "User";\r?\nCREATE POLICY candidate_user_isolation ON "User"[\s\S]*?;/gm,
+            "candidate_user_isolation policy in enable.sql")
           const tableRls = routeTables.map(table => extractUnique(enableSql,
             new RegExp(`^ALTER TABLE \"${table}\" ENABLE ROW LEVEL SECURITY;$`, "gm"),
             `${table} RLS activation in enable.sql`))
@@ -246,6 +252,7 @@ jobs:
           for (const table of routeTables) {
             if (!broadGrant.includes(`\"${table}\"`)) throw new Error(`role-grants.sql broad grant must include ${table}`)
           }
+          if (!broadGrant.includes("\"User\"")) throw new Error("role-grants.sql broad grant must include User for authenticated route lookup")
           if (broadGrant.includes("\"agent_wait_conditions\"")) throw new Error("Wait table must remain outside the candidate broad grant")
           const client = new Client({ connectionString: process.env.DATABASE_URL })
           async function main() {
@@ -254,13 +261,16 @@ jobs:
               await client.query("BEGIN")
               await client.query("SELECT set_config('app.applymate_enable_rls', 'on', true)")
               await client.query(currentUserFunction)
+              await client.query(userRls)
               for (const statement of tableRls) await client.query(statement)
+              await client.query(userPolicy)
               for (const policy of policies) await client.query(policy)
               await client.query("COMMIT")
               await client.query(roleDefinition)
               await client.query(roleMembership)
               await client.query(schemaUsage)
               await client.query(functionExecute)
+              await client.query('GRANT SELECT ON TABLE "User" TO applymate_candidate')
               for (const table of routeTables) await client.query(`GRANT SELECT ON TABLE \"${table}\" TO applymate_candidate`)
               await client.query(waitSelect)
 
@@ -268,14 +278,24 @@ jobs:
               if (role.rowCount !== 1 || role.rows[0].rolcanlogin || role.rows[0].rolsuper || role.rows[0].rolbypassrls) {
                 throw new Error("Expected a real NOLOGIN, NOSUPERUSER, NOBYPASSRLS candidate role")
               }
-              const rlsTables = [...routeTables, "agent_wait_conditions"]
+              const rlsTables = ["User", ...routeTables, "agent_wait_conditions"]
               const rlsState = await client.query(`
                 SELECT c.relname, c.relrowsecurity
                 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
                 WHERE n.nspname = 'public' AND c.relname = ANY($1::text[])
               `, [rlsTables])
               if (rlsState.rowCount !== rlsTables.length || rlsState.rows.some(row => !row.relrowsecurity)) {
-                throw new Error("Expected RLS enabled on the four route tables and the migration-owned wait table")
+                throw new Error("Expected RLS enabled on the User auth table, four route tables, and migration-owned wait table")
+              }
+              const userPolicyState = await client.query(`
+                SELECT policyname, qual, with_check FROM pg_policies
+                WHERE schemaname = 'public' AND tablename = 'User'
+                  AND policyname = 'candidate_user_isolation'
+              `)
+              if (userPolicyState.rowCount !== 1
+                || !userPolicyState.rows[0].qual.includes("app_current_user_id")
+                || !userPolicyState.rows[0].with_check.includes("app_current_user_id")) {
+                throw new Error("Expected the actual tenant-isolation policy on the User auth table")
               }
               const waitPolicy = await client.query(`
                 SELECT policyname, qual, with_check FROM pg_policies
@@ -294,7 +314,7 @@ jobs:
               `, [rlsTables])
               if (privileges.rowCount !== rlsTables.length || privileges.rows.some(row =>
                 !row.can_select || row.can_insert || row.can_update || row.can_delete)) {
-                throw new Error("Scoped route fixture requires SELECT-only candidate privileges on its five read tables")
+                throw new Error("Scoped route fixture requires SELECT-only candidate privileges on its six read/auth tables")
               }
               console.log("Installed scoped authenticated task-wait route RLS fixture; this does not validate the complete enable.sql or role-grants.sql rollout.")
             } catch (error) {

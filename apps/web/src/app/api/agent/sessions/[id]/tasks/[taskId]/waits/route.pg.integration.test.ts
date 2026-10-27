@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto"
 
-import { PrismaClient } from "@prisma/client"
+import { Prisma, PrismaClient } from "@prisma/client"
 import { SignJWT } from "jose"
 import { NextRequest } from "next/server"
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest"
@@ -92,6 +92,17 @@ const itWithRls = databaseConfig?.rlsEnabled ? it : it.skip
 let adminDb: PrismaClient | undefined
 let routeDb: typeof import("@/lib/db").db | undefined
 const cleanupUserIds = new Set<string>()
+type UserPolicyProbe = Readonly<{ expectedUserId: string; fixtureUserIds: readonly string[] }>
+type CandidateTransactionObservation = Readonly<{
+  currentRole: string
+  tenantUserId: string | null
+  visibleUserIds: readonly string[]
+  emptyContextVisibleUserIds: readonly string[]
+}>
+let routeBaseClient: PrismaClient | undefined
+let restoreRouteTransactionObserver: (() => void) | undefined
+let activeUserPolicyProbe: UserPolicyProbe | null = null
+const candidateTransactionObservations: CandidateTransactionObservation[] = []
 const previousAuthSecret = process.env.AUTH_SECRET
 const previousDatabaseUrl = process.env.DATABASE_URL
 const previousRlsRuntimeMode = process.env.RLS_RUNTIME_MODE
@@ -118,11 +129,136 @@ function waitRequest(sessionId: string, taskId: string, token?: string, search =
   return new NextRequest(`http://localhost/api/agent/sessions/${sessionId}/tasks/${taskId}/waits${search}`, { headers })
 }
 
-async function getWait(fixture: Fixture, token?: string, search = ""): Promise<Response> {
-  const { GET } = await import("./route")
-  return GET(waitRequest(fixture.sessionId, fixture.parentTaskId, token, search), {
-    params: Promise.resolve({ id: fixture.sessionId, taskId: fixture.parentTaskId }),
+function installRouteTransactionObserver(): () => void {
+  const baseClient = (globalThis as typeof globalThis & { prisma?: PrismaClient }).prisma
+  if (!baseClient) throw new Error("The route Prisma singleton is not initialized")
+  routeBaseClient = baseClient
+
+  const previousDescriptor = Object.getOwnPropertyDescriptor(baseClient, "$transaction")
+  const originalTransaction = Reflect.get(baseClient, "$transaction", baseClient)
+  if (typeof originalTransaction !== "function") throw new Error("The route Prisma transaction method is unavailable")
+
+  const observedTransaction = new Proxy(originalTransaction, {
+    apply(target, thisArg, args) {
+      const callback = args[0]
+      if (typeof callback !== "function") return Reflect.apply(target, thisArg, args)
+
+      const observedCallback = (tx: Prisma.TransactionClient) => {
+        const observedTx = new Proxy(tx, {
+          get(transaction, property) {
+            const method = Reflect.get(transaction, property, transaction)
+            if (property !== "$executeRawUnsafe" || typeof method !== "function") return method
+
+            return async (...sqlArgs: unknown[]) => {
+              const result = await Reflect.apply(method, transaction, sqlArgs)
+              if (sqlArgs[0] !== 'SET LOCAL ROLE "applymate_candidate"') return result
+
+              const queryRaw = Reflect.get(transaction, "$queryRawUnsafe", transaction)
+              if (typeof queryRaw !== "function") throw new Error("The candidate transaction cannot inspect its current role")
+              const query = async <T>(sql: string, ...values: unknown[]) =>
+                await Reflect.apply(queryRaw, transaction, [sql, ...values]) as T
+              const stateRows = await query<Array<{ current_role: string; tenant_user_id: string | null }>>(
+                "SELECT current_user::text AS current_role, current_setting('app.user_id', true) AS tenant_user_id",
+              )
+              const state = stateRows[0]
+              if (!state) throw new Error("The candidate transaction returned no role state")
+
+              const probe = activeUserPolicyProbe
+              let visibleUserIds: string[] = []
+              let emptyContextVisibleUserIds: string[] = []
+              if (probe) {
+                const readVisibleUserIds = async () => {
+                  const visible: string[] = []
+                  for (const userId of probe.fixtureUserIds) {
+                    const rows = await query<Array<{ id: string }>>('SELECT "id" FROM "User" WHERE "id" = $1', userId)
+                    if (rows[0]) visible.push(rows[0].id)
+                  }
+                  return visible
+                }
+
+                visibleUserIds = await readVisibleUserIds()
+                await query("SELECT set_config('app.user_id', '', true)")
+                try {
+                  emptyContextVisibleUserIds = await readVisibleUserIds()
+                } finally {
+                  // Restore the authenticated tenant before the route callback
+                  // starts so the probe cannot change route query visibility.
+                  await query("SELECT set_config('app.user_id', $1, true)", state.tenant_user_id ?? "")
+                }
+              }
+
+              candidateTransactionObservations.push({
+                currentRole: state.current_role,
+                tenantUserId: state.tenant_user_id,
+                visibleUserIds,
+                emptyContextVisibleUserIds,
+              })
+              return result
+            }
+          },
+        }) as Prisma.TransactionClient
+        return Reflect.apply(callback, undefined, [observedTx])
+      }
+
+      return Reflect.apply(target, thisArg, [observedCallback, ...args.slice(1)])
+    },
   })
+
+  Object.defineProperty(baseClient, "$transaction", {
+    configurable: true,
+    writable: true,
+    value: observedTransaction,
+  })
+  return () => {
+    if (previousDescriptor) Object.defineProperty(baseClient, "$transaction", previousDescriptor)
+    else Reflect.deleteProperty(baseClient, "$transaction")
+  }
+}
+
+async function getWait(
+  fixture: Fixture,
+  token?: string,
+  search = "",
+  options: Readonly<{ authenticatedUserId?: string; assertCandidateRole?: boolean }> = {},
+): Promise<Response> {
+  const expectedUserId = token ? options.authenticatedUserId ?? fixture.ownerId : null
+  // Reset only the route module graph so its module-level tenant fallback is
+  // empty for each request. db.ts still reuses and is checked against the one
+  // global Prisma singleton initialized by beforeAll; the safe-auth mock stays
+  // registered while the real Bearer verification path remains active.
+  if (databaseConfig?.rlsEnabled) vi.resetModules()
+  const tenantStore = databaseConfig?.rlsEnabled ? await import("@/lib/db/tenant-store") : null
+  if (tenantStore) expect(tenantStore.currentTenantUserId()).toBeNull()
+
+  const observationStart = candidateTransactionObservations.length
+  activeUserPolicyProbe = databaseConfig?.rlsEnabled && token && options.assertCandidateRole
+    ? { expectedUserId: expectedUserId!, fixtureUserIds: [fixture.ownerId, fixture.otherUserId] }
+    : null
+  try {
+    const { GET } = await import("./route")
+    if (databaseConfig?.rlsEnabled && (globalThis as typeof globalThis & { prisma?: PrismaClient }).prisma !== routeBaseClient) {
+      throw new Error("Resetting route modules must reuse the existing Prisma singleton")
+    }
+    const response = await GET(waitRequest(fixture.sessionId, fixture.parentTaskId, token, search), {
+      params: Promise.resolve({ id: fixture.sessionId, taskId: fixture.parentTaskId }),
+    })
+
+    if (activeUserPolicyProbe) {
+      const observations = candidateTransactionObservations.slice(observationStart)
+      expect(observations.length).toBeGreaterThan(0)
+      for (const observation of observations) {
+        expect(observation.currentRole).toBe("applymate_candidate")
+        // This GUC is configured from requireAuth's activated tenant context
+        // inside the route transaction and must match the signed Bearer subject.
+        expect(observation.tenantUserId).toBe(activeUserPolicyProbe.expectedUserId)
+        expect(observation.visibleUserIds).toEqual([activeUserPolicyProbe.expectedUserId])
+        expect(observation.emptyContextVisibleUserIds).toEqual([])
+      }
+    }
+    return response
+  } finally {
+    activeUserPolicyProbe = null
+  }
 }
 
 async function createTask(input: {
@@ -414,6 +550,7 @@ describeWithDatabase("authenticated task wait projection on disposable PostgreSQ
     await adminDb.$connect()
     routeDb = (await import("@/lib/db")).db
     await routeDb.$connect()
+    if (databaseConfig!.rlsEnabled) restoreRouteTransactionObserver = installRouteTransactionObserver()
   })
 
   afterEach(async () => {
@@ -426,6 +563,7 @@ describeWithDatabase("authenticated task wait projection on disposable PostgreSQ
 
   afterAll(async () => {
     try {
+      restoreRouteTransactionObserver?.()
       await routeDb?.$disconnect()
       await adminDb?.$disconnect()
     } finally {
@@ -446,7 +584,7 @@ describeWithDatabase("authenticated task wait projection on disposable PostgreSQ
     const before = await db().agentWaitCondition.findUnique({ where: { id: fixture.waitId }, select: {
       status: true, matchedTaskIds: true, result: true, consumedAt: true,
     } })
-    const response = await getWait(fixture, token)
+    const response = await getWait(fixture, token, "", { assertCandidateRole: true })
     const text = await response.text()
     const body: unknown = JSON.parse(text)
 
@@ -516,7 +654,10 @@ describeWithDatabase("authenticated task wait projection on disposable PostgreSQ
     const unauthenticated = await getWait(fixture)
     expect(unauthenticated.status).toBe(401)
 
-    const foreignOwner = await getWait(fixture, await signedBearer(fixture.otherUserId))
+    const foreignOwner = await getWait(fixture, await signedBearer(fixture.otherUserId), "", {
+      authenticatedUserId: fixture.otherUserId,
+      assertCandidateRole: true,
+    })
     expect(foreignOwner.status).toBe(404)
     expect(await foreignOwner.text()).not.toContain(fixture.secret)
 
