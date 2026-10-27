@@ -357,7 +357,8 @@ const invalidWaitCases: readonly InvalidCase[] = [
     const turnId = `other-turn-${randomUUID()}`
     const stepId = `other-turn-step-${randomUUID()}`
     await db().agentTurn.create({ data: { id: turnId, userId: fixture.ownerId, sessionId: fixture.sessionId,
-      status: "in_progress", source: "user", input: {}, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} } })
+      status: "completed", source: "user", input: {}, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {},
+      completedAt: new Date() } })
     await createStep({ id: stepId, sessionId: fixture.sessionId, turnId, taskId: fixture.parentTaskId,
       attempt: 1, ordinal: 9, secret: fixture.secret })
     await db().agentWaitCondition.update({ where: { id: fixture.waitId }, data: { turnId, stepId } })
