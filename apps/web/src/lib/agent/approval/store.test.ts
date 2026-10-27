@@ -185,18 +185,44 @@ function gateReplayInput(
   }
 }
 
-function serializeMockTransactions(db: PrismaClient, tx: ReturnType<typeof mockDb>["tx"]) {
+function deferredSignal() {
+  let resolve!: () => void
+  const promise = new Promise<void>(done => { resolve = done })
+  return { promise, resolve }
+}
+
+function waitForSignalOrFailure(signal: Promise<void>, request: Promise<unknown>, message: string): Promise<void> {
+  return Promise.race([signal, request.then(() => { throw new Error(message) }, error => { throw error })])
+}
+
+function serializeMockTransactions(
+  db: PrismaClient,
+  tx: ReturnType<typeof mockDb>["tx"],
+  barriers?: Readonly<{
+    holdFirstUntil: Promise<void>
+    onFirstWorkComplete: () => void
+    onSecondQueued: () => void
+  }>,
+) {
   let queue = Promise.resolve()
+  let transactionCount = 0
   const transaction = db.$transaction as unknown as {
     mockImplementation: (implementation: (work: (transaction: typeof tx) => Promise<unknown>) => Promise<unknown>) => void
   }
   transaction.mockImplementation(async work => {
+    const requestOrder = ++transactionCount
     const previous = queue
     let release!: () => void
     queue = new Promise<void>(resolve => { release = resolve })
+    if (requestOrder === 2) barriers?.onSecondQueued()
     await previous
     try {
-      return await work(tx)
+      const result = await work(tx)
+      if (requestOrder === 1 && barriers) {
+        barriers.onFirstWorkComplete()
+        await barriers.holdFirstUntil
+      }
+      return result
     } finally {
       release()
     }
@@ -217,6 +243,9 @@ describe("Web approval receipt store", () => {
     const originalScope = gateReplayScope()
     const rowTemplate = await gateReplayRow(originalScope)
     const { db, tx } = mockDb(rowTemplate)
+    const originalWorkComplete = deferredSignal()
+    const replayQueued = deferredSignal()
+    const releaseOriginal = deferredSignal()
     let stored: Prisma.AgentApprovalGetPayload<{}> | null = null
     mockApprovalLookup(tx, async () => stored)
     tx.applicationTask.findFirst.mockResolvedValue({ id: "review_task_1" })
@@ -226,7 +255,11 @@ describe("Web approval receipt store", () => {
       stored = created
       return created
     })
-    serializeMockTransactions(db, tx)
+    serializeMockTransactions(db, tx, {
+      holdFirstUntil: releaseOriginal.promise,
+      onFirstWorkComplete: originalWorkComplete.resolve,
+      onSecondQueued: replayQueued.resolve,
+    })
 
     const ownerCheck = vi.fn(async () => true)
     const ownerFence = { ...gateReplayInput(originalScope).scheduledOwnerFence, assertCurrent: ownerCheck }
@@ -239,8 +272,14 @@ describe("Web approval receipt store", () => {
       }
     })
     const first = issueApprovalReceipt(db, gateReplayInput(originalScope, prepare, ownerFence))
+    await waitForSignalOrFailure(originalWorkComplete.promise, first, "Original Gate receipt finished before its held transaction was reached")
     const replayScope = { ...originalScope, revision: 9, expiresAt: timeAt(90) }
     const second = issueApprovalReceipt(db, gateReplayInput(replayScope, prepare, ownerFence))
+    try {
+      await waitForSignalOrFailure(replayQueued.promise, second, "Gate replay finished before it queued behind the original transaction")
+    } finally {
+      releaseOriginal.resolve()
+    }
     const [issued, replayed] = await Promise.all([first, second])
 
     expect(issued.approval.id).toBe(gateReplayId)
