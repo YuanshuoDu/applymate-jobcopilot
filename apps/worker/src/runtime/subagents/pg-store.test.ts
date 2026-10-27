@@ -98,8 +98,11 @@ function fakePool(
         }
         if (result.rows === undefined) return { rows: [{ scanHorizon: now }], rowCount: 1, ...result }
       }
-      if (sql.startsWith('SELECT "leaseExpiresAt" FROM "sub_agent_tasks"') && result.rows === undefined) {
-        return { rows: [{ leaseExpiresAt: new Date(now.getTime() + 60_000) }], rowCount: 1, ...result }
+      if (sql.startsWith('SELECT "leaseExpiresAt", "absoluteDeadlineAt" FROM "sub_agent_tasks"') && result.rows === undefined) {
+        return { rows: [{ leaseExpiresAt: new Date(now.getTime() + 60_000), absoluteDeadlineAt: null }], rowCount: 1, ...result }
+      }
+      if (sql.startsWith('SELECT 1 FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2') && result.rows === undefined) {
+        return { rows: [{}], rowCount: 1, ...result }
       }
       if (sql.includes('JOIN "agent_wait_conditions" AS wait') && result.rows === undefined) {
         return { rows: [], rowCount: 0, ...result }
@@ -612,8 +615,8 @@ describe("PgSubagentTaskStore", () => {
     expect(sessionQuery).toContain("FOR UPDATE")
     const insert = fake.calls.find(([sql]) => sql.startsWith("INSERT INTO"))
     expect(insert?.[1]).toContain(JSON.stringify({ subagentPolicy: policy }))
-    expect(insert?.[0]).toContain('"maxAttempts", "updatedAt")')
-    expect(insert?.[0]).toContain("$19, CURRENT_TIMESTAMP)")
+    expect(insert?.[0]).toContain('"absoluteDeadlineAt", "leaseSegmentStartedAt")')
+    expect(insert?.[0]).toContain("$19, CURRENT_TIMESTAMP,")
   })
 
   it("atomically creates a child with its spawn operation and dispatch outbox", async () => {
@@ -637,8 +640,8 @@ describe("PgSubagentTaskStore", () => {
     expect(sessionIndex).toBeLessThan(taskIndex)
     expect(operationIndex).toBeGreaterThan(taskIndex)
     const taskInsert = fake.calls[taskIndex]?.[0] ?? ""
-    expect(taskInsert).toContain('"maxAttempts", "updatedAt")')
-    expect(taskInsert).toContain("$19, CURRENT_TIMESTAMP)")
+    expect(taskInsert).toContain('"absoluteDeadlineAt", "leaseSegmentStartedAt")')
+    expect(taskInsert).toContain("$19, CURRENT_TIMESTAMP,")
     expect(fake.calls.map(([sql]) => sql)).toContain("COMMIT")
   })
 
@@ -731,7 +734,9 @@ describe("PgSubagentTaskStore", () => {
     const update = fake.calls.find(([sql]) => sql.startsWith("UPDATE"))?.[0] ?? ""
     expect(update).toContain("attemptCount")
     expect(update).toContain('"interruptRequestedAt" IS NULL')
-    expect(update).toContain('"leaseExpiresAt" = clock_timestamp()')
+    expect(update).toContain('"leaseExpiresAt" = LEAST(clock_timestamp()')
+    expect(update).toContain('"leaseSegmentStartedAt" = CASE WHEN task."absoluteDeadlineAt" IS NULL')
+    expect(update).toContain('task."absoluteDeadlineAt" > clock_timestamp()')
     expect(update).toContain('"nextAttemptAt" <= clock_timestamp()')
     expect(fake.calls.find(([sql]) => sql.includes('FROM "agent_sessions"'))?.[0]).not.toContain("controlGate")
     expect(update).not.toContain("controlGate")
@@ -1099,6 +1104,21 @@ describe("PgSubagentTaskStore", () => {
     expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
   })
 
+  it("rejects finish at the absolute deadline even while the lease remains live", async () => {
+    const fake = fakePool(sql => {
+      if (sql.startsWith("SELECT task.*, session.")) return { rows: [taskRow({ status: "running", leaseOwner: "worker-1", attemptCount: 1,
+        leaseExpiresAt: new Date(now.getTime() + 60_000), absoluteDeadlineAt: now })], rowCount: 1 }
+      if (sql.startsWith('SELECT clock_timestamp() AS "checkedAt"')) return { rows: [{ checkedAt: now }], rowCount: 1 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.finish({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1,
+      status: "completed", now, mailboxMessageIds: ["message-1"] })).resolves.toBeNull()
+    expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
+    expect(fake.calls.some(([sql]) => sql.includes('UPDATE "agent_mailbox_messages"'))).toBe(false)
+  })
+
   it("rolls back when the task update loses its fence", async () => {
     const fake = fakePool(sql => {
       if (sql.includes('FROM "sub_agent_tasks" task')) return { rows: [taskRow({ status: "running", leaseOwner: "worker-1", attemptCount: 1, leaseExpiresAt: new Date(now.getTime() + 60_000) })], rowCount: 1 }
@@ -1110,6 +1130,25 @@ describe("PgSubagentTaskStore", () => {
     await expect(store.finish({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, status: "completed", now, mailboxMessageIds: ["message-1"] })).resolves.toBeNull()
     expect(fake.calls.map(([sql]) => sql)).toContain("ROLLBACK")
     expect(fake.calls.some(([sql]) => sql.includes('UPDATE "agent_mailbox_messages"'))).toBe(false)
+  })
+
+  it("rolls back task completion and mailbox consumption when the deadline crosses after the task write", async () => {
+    const fake = fakePool(sql => {
+      if (sql.startsWith("SELECT task.*, session.")) return { rows: [taskRow({ status: "running", leaseOwner: "worker-1", attemptCount: 1,
+        leaseExpiresAt: new Date(now.getTime() + 60_000), absoluteDeadlineAt: new Date(now.getTime() + 1_000) })], rowCount: 1 }
+      if (sql.startsWith('UPDATE "sub_agent_tasks"')) return { rowCount: 1 }
+      if (sql.includes('UPDATE "agent_mailbox_messages"')) return { rowCount: 1 }
+      if (sql.startsWith('SELECT 1 FROM "sub_agent_tasks"')) return { rows: [], rowCount: 0 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.finish({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1,
+      status: "completed", now, mailboxMessageIds: ["message-1"] })).resolves.toBeNull()
+    expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(true)
+    expect(fake.calls.some(([sql]) => sql.includes('UPDATE "agent_mailbox_messages"'))).toBe(true)
+    expect(fake.calls.map(([sql]) => sql)).toContain("ROLLBACK")
+    expect(fake.calls.map(([sql]) => sql)).not.toContain("COMMIT")
   })
 
   it("rolls back both writes when mailbox confirmation fails", async () => {
@@ -1187,7 +1226,7 @@ describe("PgSubagentTaskStore", () => {
     const leaseExpiresAt = new Date(now.getTime() + 1_000)
     const checkedAt = new Date(leaseExpiresAt.getTime() + 1)
     const fake = fakePool(sql => {
-      if (sql.startsWith('SELECT "leaseExpiresAt" FROM "sub_agent_tasks"')) return { rows: [{ leaseExpiresAt }], rowCount: 1 }
+      if (sql.startsWith('SELECT "leaseExpiresAt", "absoluteDeadlineAt" FROM "sub_agent_tasks"')) return { rows: [{ leaseExpiresAt, absoluteDeadlineAt: null }], rowCount: 1 }
       if (sql.startsWith("SELECT clock_timestamp()")) return { rows: [{ checkedAt }], rowCount: 1 }
       return {}
     })
@@ -1197,6 +1236,42 @@ describe("PgSubagentTaskStore", () => {
     await expect(store.release({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, now })).resolves.toBe(false)
     expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
     expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "agent_outbox"'))).toBe(false)
+  })
+
+  it("rejects release at the absolute deadline even when its lease has time remaining", async () => {
+    const leaseExpiresAt = new Date(now.getTime() + 60_000)
+    const fake = fakePool(sql => {
+      if (sql.startsWith('SELECT "leaseExpiresAt", "absoluteDeadlineAt" FROM "sub_agent_tasks"')) {
+        return { rows: [{ leaseExpiresAt, absoluteDeadlineAt: now }], rowCount: 1 }
+      }
+      if (sql.startsWith('SELECT clock_timestamp() AS "checkedAt"')) return { rows: [{ checkedAt: now }], rowCount: 1 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.release({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, now })).resolves.toBe(false)
+    expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(false)
+    expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "agent_outbox"'))).toBe(false)
+  })
+
+  it("rolls back a retry release and its outbox when the deadline crosses during release", async () => {
+    const fake = fakePool(sql => {
+      if (sql.startsWith('SELECT "leaseExpiresAt", "absoluteDeadlineAt" FROM "sub_agent_tasks"')) {
+        return { rows: [{ leaseExpiresAt: new Date(now.getTime() + 60_000), absoluteDeadlineAt: new Date(now.getTime() + 1_000) }], rowCount: 1 }
+      }
+      if (sql.startsWith('SELECT clock_timestamp() AS "checkedAt"')) return { rows: [{ checkedAt: now }], rowCount: 1 }
+      if (sql.startsWith('UPDATE "sub_agent_tasks"')) return { rowCount: 1 }
+      if (sql.startsWith('UPDATE "agent_outbox"')) return { rowCount: 1 }
+      if (sql.startsWith('SELECT 1 FROM "sub_agent_tasks"')) return { rows: [], rowCount: 0 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.release({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, now })).resolves.toBe(false)
+    expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks"'))).toBe(true)
+    expect(fake.calls.some(([sql]) => sql.startsWith('UPDATE "agent_outbox"'))).toBe(true)
+    expect(fake.calls.map(([sql]) => sql)).toContain("ROLLBACK")
+    expect(fake.calls.map(([sql]) => sql)).not.toContain("COMMIT")
   })
 
   it.each(["aborted", "archived"] as const)("does not release a child in a %s session", async status => {
@@ -1221,6 +1296,11 @@ describe("PgSubagentTaskStore", () => {
     expect(update).toContain('"attemptCount" = $5')
     expect(update).toContain('"leaseExpiresAt" > clock_timestamp()')
     expect(update).toContain('LEAST(clock_timestamp()')
+    expect(update).toContain('"leaseSegmentStartedAt" + (300000 * INTERVAL \'1 millisecond\')')
+    expect(update).toContain('COALESCE("absoluteDeadlineAt", \'infinity\'::timestamptz)')
+    expect(update).toContain('CASE WHEN "absoluteDeadlineAt" IS NULL THEN COALESCE("startedAt", clock_timestamp()) + (300000 * INTERVAL \'1 millisecond\')')
+    expect(update).toContain('"absoluteDeadlineAt" > clock_timestamp() AND "leaseSegmentStartedAt" IS NOT NULL')
+    expect(update).toContain('"leaseSegmentStartedAt" + (300000 * INTERVAL \'1 millisecond\') > clock_timestamp()')
     expect(update).toContain('session."status" NOT IN (\'aborted\', \'archived\')')
   })
 
@@ -1228,7 +1308,7 @@ describe("PgSubagentTaskStore", () => {
     const leaseExpiresAt = new Date(now.getTime() + 1_000)
     const checkedAt = new Date(leaseExpiresAt.getTime() + 1)
     const fake = fakePool(sql => {
-      if (sql.startsWith('SELECT "leaseExpiresAt" FROM "sub_agent_tasks"')) return { rows: [{ leaseExpiresAt }], rowCount: 1 }
+      if (sql.startsWith('SELECT "leaseExpiresAt", "absoluteDeadlineAt" FROM "sub_agent_tasks"')) return { rows: [{ leaseExpiresAt, absoluteDeadlineAt: null }], rowCount: 1 }
       if (sql.startsWith("SELECT clock_timestamp()")) return { rows: [{ checkedAt }], rowCount: 1 }
       return {}
     })
@@ -1236,10 +1316,60 @@ describe("PgSubagentTaskStore", () => {
 
     expect(now.getTime()).toBeLessThan(leaseExpiresAt.getTime())
     await expect(store.heartbeat({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, now })).resolves.toBe("lost")
-    const taskLock = fake.calls.findIndex(([sql]) => sql.startsWith('SELECT "leaseExpiresAt" FROM "sub_agent_tasks"'))
+    const taskLock = fake.calls.findIndex(([sql]) => sql.startsWith('SELECT "leaseExpiresAt", "absoluteDeadlineAt" FROM "sub_agent_tasks"'))
     const leaseClock = fake.calls.findIndex(([sql]) => sql.startsWith("SELECT clock_timestamp()"))
     expect(leaseClock).toBeGreaterThan(taskLock)
     expect(fake.calls.some(([sql]) => sql.startsWith("UPDATE"))).toBe(false)
+  })
+
+  it("caps a Graph heartbeat to its current running segment and absolute deadline", async () => {
+    const fake = fakePool(sql => {
+      if (sql.startsWith('SELECT "leaseExpiresAt", "absoluteDeadlineAt" FROM "sub_agent_tasks"')) {
+        return { rows: [{ leaseExpiresAt: new Date(now.getTime() + 60_000), absoluteDeadlineAt: new Date(now.getTime() + 900_000) }], rowCount: 1 }
+      }
+      if (sql.startsWith('SELECT clock_timestamp() AS "checkedAt"')) return { rows: [{ checkedAt: now }], rowCount: 1 }
+      if (sql.startsWith("UPDATE")) return { rows: [{ interruptRequestedAt: null }], rowCount: 1 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.heartbeat({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, now })).resolves.toBe("renewed")
+    const update = fake.calls.find(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks"'))?.[0] ?? ""
+    expect(update).toContain('"leaseSegmentStartedAt" + (300000 * INTERVAL \'1 millisecond\')')
+    expect(update).toContain('COALESCE("absoluteDeadlineAt", \'infinity\'::timestamptz)')
+    expect(update).toContain('"absoluteDeadlineAt" > clock_timestamp() AND "leaseSegmentStartedAt" IS NOT NULL')
+    expect(update).toContain('"leaseSegmentStartedAt" + (300000 * INTERVAL \'1 millisecond\') > clock_timestamp()')
+    expect(update).not.toContain('SET "leaseSegmentStartedAt"')
+  })
+
+  it("rejects heartbeat when the database clock equals the absolute deadline", async () => {
+    const fake = fakePool(sql => {
+      if (sql.startsWith('SELECT "leaseExpiresAt", "absoluteDeadlineAt" FROM "sub_agent_tasks"')) {
+        return { rows: [{ leaseExpiresAt: new Date(now.getTime() + 60_000), absoluteDeadlineAt: now }], rowCount: 1 }
+      }
+      if (sql.startsWith('SELECT clock_timestamp() AS "checkedAt"')) return { rows: [{ checkedAt: now }], rowCount: 1 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.heartbeat({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, now })).resolves.toBe("lost")
+    expect(fake.calls.some(([sql]) => sql.startsWith("UPDATE"))).toBe(false)
+  })
+
+  it("loses a Graph lease instead of renewing beyond its five-minute execution segment", async () => {
+    const fake = fakePool(sql => {
+      if (sql.startsWith('SELECT "leaseExpiresAt", "absoluteDeadlineAt" FROM "sub_agent_tasks"')) {
+        return { rows: [{ leaseExpiresAt: new Date(now.getTime() + 60_000), absoluteDeadlineAt: new Date(now.getTime() + 900_000) }], rowCount: 1 }
+      }
+      if (sql.startsWith('SELECT clock_timestamp() AS "checkedAt"')) return { rows: [{ checkedAt: now }], rowCount: 1 }
+      if (sql.startsWith('UPDATE "sub_agent_tasks"')) return { rows: [], rowCount: 0 }
+      return {}
+    })
+    const store = new PgSubagentTaskStore(fake.pool)
+
+    await expect(store.heartbeat({ taskId: "task-1", sessionId: "session-1", ownerId: "worker-1", attemptCount: 1, now })).resolves.toBe("lost")
+    const update = fake.calls.find(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks"'))?.[0] ?? ""
+    expect(update).toContain('"leaseSegmentStartedAt" + (300000 * INTERVAL \'1 millisecond\') > clock_timestamp()')
   })
 
   it("finishes a marker-backed interrupted Turn through canonical TaskGraph receipts", async () => {

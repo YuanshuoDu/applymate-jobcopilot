@@ -255,7 +255,7 @@ describeWithPostgres("application submit recovery fence commit orders on disposa
       await client.query(`CREATE TABLE "sub_agent_tasks" (
         "id" text PRIMARY KEY, "sessionId" text NOT NULL, "turnId" text NOT NULL, "role" text NOT NULL,
         "taskType" text NOT NULL, "status" text NOT NULL, "leaseOwner" text, "leaseExpiresAt" timestamptz,
-        "interruptRequestedAt" timestamptz
+        "interruptRequestedAt" timestamptz, "absoluteDeadlineAt" TIMESTAMP(3), "leaseSegmentStartedAt" TIMESTAMP(3)
       )`)
       await client.query(`CREATE TABLE "application_tasks" (
         "id" text PRIMARY KEY, "userId" text NOT NULL, "jobId" text NOT NULL, "sessionId" text NOT NULL,

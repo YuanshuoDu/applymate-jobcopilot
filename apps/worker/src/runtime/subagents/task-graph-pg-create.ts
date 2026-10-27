@@ -172,7 +172,10 @@ export async function createGraphTasks(
       goal: node.goal, constraints: template.constraints ?? [], successCriteria: node.successCriteria,
       allowedActions: template.allowedActions, context,
       expectedOutputSchema: template.expectedOutputSchema ?? {}, policy: childPolicy,
-    }, true, { preserveEmptyAllowedActions: isApplicationFillerTemplate(node.templateId, template.role, template.taskType) })
+    }, true, {
+      preserveEmptyAllowedActions: isApplicationFillerTemplate(node.templateId, template.role, template.taskType),
+      taskGraphChildDeadline: true,
+    })
     if (status === "waiting") {
       const updated = await client.query(`UPDATE "sub_agent_tasks" SET "status" = 'waiting', "updatedAt" = CURRENT_TIMESTAMP
         WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4 AND "parentTaskId" = $5 AND "status" = 'queued'`,

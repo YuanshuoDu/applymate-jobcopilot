@@ -1,9 +1,7 @@
-import { materializeTaskGraphDependencyContext, isTaskGraphDependencyContextError } from "./task-graph-dependency-context.js"
 import { assertPlanningRootHasNoUnresolvedSteering, createSubagentTask } from "./pg-store-create.js"
 import { json, type Queryable } from "./pg-store-persistence.js"
 import { getSubagentRolePolicy, isHarnessSubagentRole } from "./role-policy.js"
 import { appendTaskGraphNativeNode, TASK_GRAPH_NATIVE_METADATA_VERSION } from "./task-graph-native-state.js"
-import { loadTaskGraphDependencyResults } from "./task-graph-pg-dependency-context-loader.js"
 import { enqueueGraphTask } from "./task-graph-pg-create.js"
 import type { GraphParent, LoadedGraph } from "./task-graph-pg-state.js"
 import { TASK_GRAPH_LIMITS, type TaskGraphState } from "../planning/task-graph.js"
@@ -11,13 +9,11 @@ import { parseTaskGraphSnapshot, TASK_GRAPH_ITEM_TYPE, taskGraphItemId, taskGrap
 import { appendTaskGraphReceipt, writeTaskGraphSnapshot } from "./task-graph-pg-events.js"
 import { policyFromTask } from "./manager-task-scope.js"
 import { inheritSubagentPolicy, type SubagentTaskRecord, type SubagentTaskStatus } from "./types.js"
-import { TaskGraphCommandError, type TaskGraphNativeCommandInput, type TaskGraphNativeCommandReceipt, type TaskGraphNativeSourceProvenance } from "./task-graph-command-port.js"
+import { TaskGraphCommandError, type TaskGraphNativeCommandInput, type TaskGraphNativeCommandReceipt } from "./task-graph-command-port.js"
 import { nativeContextMetrics, type NormalizedNativeCommand } from "./task-graph-native-request.js"
 import { taskGraphResultDigest } from "./task-graph-pg-verification.js"
 import { parsePersistedTaskGraphNativeReceipt } from "./task-graph-native-command.js"
 import { taskGraphNativeResultReceipt } from "./task-graph-native-result.js"
-import { waitResult } from "../tools/coordination-executor-support.js"
-import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import {
   parseSteeringReconciliationReceipt, steeringReconciliationId, steeringReconciliationSequence,
   STEERING_RECONCILIATION_EVENT_TYPE, STEERING_RECONCILIATION_SUPERSESSION_SCHEMA_VERSION,
@@ -26,9 +22,12 @@ import {
 } from "./steering-reconciliation-contract.js"
 import { assertTaskGraphBranchRepairHistory } from "./steering-reconciliation-branch-repair-history.js"
 import { assertTaskGraphFailedBranchRepairHistory } from "./steering-reconciliation-failed-branch-history.js"
+import {
+  followupContext, graphItem, intersectTaskActions, nativePgObject, taskActions, withVerifiedDependencyContext,
+  type TaskGraphNativeSource,
+} from "./task-graph-native-pg-context.js"
 
 type Row = Record<string, unknown>
-type Source = Row & { provenance: TaskGraphNativeSourceProvenance }
 const TERMINAL = new Set<SubagentTaskStatus>(["completed", "failed", "interrupted", "cancelled", "closed"])
 
 export async function findNativeCommandReplay(
@@ -43,7 +42,7 @@ export async function findNativeCommandReplay(
   [input.scope.sessionId, input.scope.turnId, itemId, command.eventIdempotencyKey, input.scope.userId])
   if (result.rows.length === 0) return null
   if (result.rows.length !== 1) throw new Error("task_graph_native_receipt_invalid")
-  const event = result.rows[0] as Row, payload = object(event.payload)
+  const event = result.rows[0] as Row, payload = nativePgObject(event.payload)
   if (!payload || payload.kind !== "native_command" || payload.requestFingerprint !== command.requestFingerprint) throw commandError("idempotency_conflict")
   const revision = Number(payload.revision), snapshot = parseTaskGraphSnapshot(payload.content)
   const receipt = parsePersistedTaskGraphNativeReceipt(payload, {
@@ -78,7 +77,7 @@ export async function appendNativeGraphCommand(
   const policy = sourcePolicy ? inheritSubagentPolicy(parentPolicy, sourcePolicy) : parentPolicy
   const expectedOutputSchema = source ? source.expectedOutputSchema ?? {} : command.outputSchemaMarker ?? {}
   const allowedActions = source
-    ? intersect(taskActions(source.allowedActions), taskActions(parent.allowedActions))
+    ? intersectTaskActions(taskActions(source.allowedActions), taskActions(parent.allowedActions))
     : [...(operation.kind === "spawn" ? operation.allowedActions ?? [] : [])]
   if (input.scope.parentTaskId === input.scope.rootTaskId) {
     await assertPlanningRootHasNoUnresolvedSteering(client, parent.allowedActions, input.scope)
@@ -88,7 +87,7 @@ export async function appendNativeGraphCommand(
     parentTaskId: input.scope.parentTaskId, role, taskType, goal: operation.goal,
     constraints: operation.constraints, successCriteria: operation.successCriteria,
     allowedActions, context, expectedOutputSchema, policy,
-  }, true, { preserveEmptyAllowedActions: Boolean(source) })
+  }, true, { preserveEmptyAllowedActions: Boolean(source), taskGraphChildDeadline: true })
   if (child.status === "queued") await enqueueGraphTask(client, input.scope.sessionId, child)
   const graphState: TaskGraphState = loaded.state ?? { revision: 0, nodes: [], appliedEvents: [] }
   const dependencyKeys = enriched.verifiedNodeKey ? [enriched.verifiedNodeKey] : []
@@ -142,7 +141,7 @@ export async function appendNativeGraphCommand(
   return receipt
 }
 
-async function followupSource(client: Queryable, input: TaskGraphNativeCommandInput, taskId: string, loaded: LoadedGraph): Promise<Source> {
+async function followupSource(client: Queryable, input: TaskGraphNativeCommandInput, taskId: string, loaded: LoadedGraph): Promise<TaskGraphNativeSource> {
   const result = await client.query(`SELECT task."id", task."rootTaskId", task."parentTaskId", task."turnId", task."role", task."taskType",
       task."status", task."attemptCount", task."result", task."context", task."expectedOutputSchema", task."allowedActions", task."budgetSnapshot"
     FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
@@ -169,7 +168,7 @@ async function followupSource(client: Queryable, input: TaskGraphNativeCommandIn
       taskId, rootTaskId: input.scope.rootTaskId,
       parentTaskId: typeof row.parentTaskId === "string" ? row.parentTaskId : null,
       turnId: input.scope.turnId, role: row.role, taskType: row.taskType,
-      status: row.status as TaskGraphNativeSourceProvenance["status"], attemptCount: Number(row.attemptCount),
+      status: row.status as TaskGraphNativeSource["provenance"]["status"], attemptCount: Number(row.attemptCount),
       resultDigest: taskGraphResultDigest(row.result ?? null), graphNodeKey: graphNode?.key ?? null,
       origin: graphNode ? "task_graph" : "native_legacy",
     },
@@ -246,55 +245,4 @@ async function assertNoTaskGraphHistory(client: Queryable, input: TaskGraphNativ
   if (result.rows.length !== 1 || result.rows[0]?.hasMembership !== false) throw commandError("native_source_unavailable")
 }
 
-async function withVerifiedDependencyContext(
-  client: Queryable, input: TaskGraphNativeCommandInput, loaded: LoadedGraph,
-  source: Source | undefined, context: unknown,
-): Promise<{ context: unknown; verifiedNodeKey?: string }> {
-  const node = source?.provenance.origin === "task_graph" && source.provenance.status === "completed"
-    ? loaded.snapshot?.nodes.find(candidate => candidate.key === source.provenance.graphNodeKey) : undefined
-  if (!node || node.verificationDisposition !== "typed") return { context }
-  const dependencies = await loadTaskGraphDependencyResults(client, input.scope, [node.key], loaded.snapshot!.nodes)
-  try { return { context: materializeTaskGraphDependencyContext(context, input.scope, [node.key], dependencies), verifiedNodeKey: node.key } }
-  catch (error) {
-    if (isTaskGraphDependencyContextError(error)) return { context }
-    throw error
-  }
-}
-
-function followupContext(callerContext: unknown, source: Source): unknown {
-  return {
-    callerContext: callerContext ?? null,
-    sourceContext: source.context ?? {},
-    provenance: {
-      kind: "agent.followup", sourceTaskId: source.provenance.taskId,
-      sourceStatus: source.provenance.status, sourceAttemptCount: source.provenance.attemptCount,
-      priorResult: waitResult(source.result), source: source.provenance,
-    },
-  }
-}
-
-function taskActions(value: unknown): string[] {
-  const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
-  if (!Array.isArray(parsed) || parsed.some(item => typeof item !== "string" || !item.trim())) throw commandError("native_policy_invalid")
-  return parsed as string[]
-}
-function intersect(left: readonly string[], right: readonly string[]): string[] { return [...new Set(left.filter(item => right.includes(item)))] }
-
-function graphItem(input: TaskGraphNativeCommandInput, itemId: string, content: unknown, revision: number, now: Date) {
-  const timestamp = now.toISOString()
-  return {
-    schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: itemId, sessionId: input.scope.sessionId, turnId: input.scope.turnId,
-    stepId: input.scope.stepId ?? null, taskId: input.scope.parentTaskId, type: "task_graph",
-    status: "streaming", phase: null, revision, content,
-    startedAt: timestamp, completedAt: null, createdAt: timestamp, updatedAt: timestamp,
-  }
-}
-
 function commandError(code: string): TaskGraphCommandError { return new TaskGraphCommandError(code, code) }
-
-function object(value: unknown): Row | null {
-  const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null
-  try { return Object.getPrototypeOf(parsed) === Object.prototype ? parsed as Row : null } catch { return null }
-}
-

@@ -13,6 +13,7 @@ import { SCHEDULED_GATE_NODE_CRITERIA, SCHEDULED_GATE_NODE_GOAL, SCHEDULED_GATE_
 import { TaskGraphCommandError, type TaskGraphScheduledGateResumeInput,
   type TaskGraphScheduledGateResumeReceipt } from "./task-graph-command-port.js"
 import type { Queryable } from "./pg-store-persistence.js"
+import { taskGraphDeadlineLive } from "./pg-store-claim.js"
 
 type Row = Record<string, unknown>
 type GateQuestionCandidate = NonNullable<Awaited<ReturnType<typeof readScheduledGateQuestionCandidate>>>
@@ -26,7 +27,7 @@ export async function resumeScheduledGateChoice(client: Queryable,
   const { scope, gateTaskId, requestAttemptCount, waitId, now } = input
   await client.query(`SELECT set_config('app.user_id', $1, true)`, [scope.userId])
   const turn = await lockResumeOwner(client, scope)
-  const gateResult = await client.query<Row>(`SELECT task."id", task."status", task."attemptCount", task."maxAttempts", task."role",
+  const gateResult = await client.query<Row>(`SELECT task."id", task."absoluteDeadlineAt", task."status", task."attemptCount", task."maxAttempts", task."role",
       task."taskType", task."expectedOutputSchema", task."allowedActions", task."result", task."failureReason", task."leaseOwner",
       task."leaseExpiresAt", task."interruptRequestedAt", task."rootTaskId", task."parentTaskId", task."turnId", task."sessionId"
     FROM "sub_agent_tasks" AS task WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3
@@ -52,6 +53,7 @@ export async function resumeScheduledGateChoice(client: Queryable,
       requestAttemptCount: requestAttemptCount - 1 })
     if (!candidate || !sameCandidate(candidate, rowBinding, gate.result)) throw invalid("question")
     if (rowBinding.stepStatus !== "waiting_for_user") throw invalid("question_step")
+    if (!await taskGraphDeadlineLive(client, gateTaskId, scope.sessionId)) throw invalid("deadline")
     const owner = executionOwner(scope, turn)
     const choice = await acknowledgeScheduledGateChoiceResume(client as Parameters<typeof acknowledgeScheduledGateChoiceResume>[0], {
       owner, binding, gateTaskId, requestAttemptCount, waitId, itemId: rowBinding.id,
@@ -65,11 +67,12 @@ export async function resumeScheduledGateChoice(client: Queryable,
       "leaseOwner" = NULL, "leaseExpiresAt" = NULL, "nextAttemptAt" = NULL, "completedAt" = NULL, "updatedAt" = $5
       WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4 AND "parentTaskId" = $4
         AND "role" = $6 AND "taskType" = $7 AND "status" = 'waiting_for_user' AND "attemptCount" = $8
-        AND "interruptRequestedAt" IS NULL`,
+        AND "interruptRequestedAt" IS NULL AND ("absoluteDeadlineAt" IS NULL OR "absoluteDeadlineAt" > clock_timestamp())`,
     [gateTaskId, scope.sessionId, scope.turnId, scope.rootTaskId, now, SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE, requestAttemptCount])
     if (updated.rowCount !== 1) throw invalid("task_update")
     const state = await persistGraphTransition(client, transition, now)
     await enqueueReadyGraphTask(client, GATE_GRAPH_SCOPE(scope), gateTaskId)
+    if (!await taskGraphDeadlineLive(client, gateTaskId, scope.sessionId)) throw invalid("deadline")
     return { status: "accepted", taskId: gateTaskId, requestAttemptCount, resumedAttemptCount: requestAttemptCount + 1,
       revision: state.revision, readyTaskIds: [gateTaskId] }
   }
@@ -83,7 +86,8 @@ export async function resumeScheduledGateChoice(client: Queryable,
     owner: executionOwner(scope, turn), binding, gateTaskId, requestAttemptCount, waitId, itemId: rowBinding.id,
     resumedAttemptCount: requestAttemptCount + 1, now,
   })
-  if (!acknowledgement || !scheduledGateAttemptLineageMatches({ rootTaskId: scope.rootTaskId, gateTaskId,
+  if (!acknowledgement || acknowledgement.kind !== binding.kind || !same(acknowledgement.jobIds, binding.jobIds)
+    || acknowledgement.choiceId !== rowBinding.state.answer || !scheduledGateAttemptLineageMatches({ rootTaskId: scope.rootTaskId, gateTaskId,
     maxAttempts: Number(gate.maxAttempts), requestAttemptCount, currentAttemptCount: Number(gate.attemptCount),
     currentStatus: String(gate.status), events: graph.state!.appliedEvents })) throw invalid("stale_resume")
   return { status: "duplicate", taskId: gateTaskId, requestAttemptCount, resumedAttemptCount: requestAttemptCount + 1,

@@ -1,15 +1,30 @@
-import type { PoolClient } from "pg"
 import { RUNNABLE_SESSION, assertSessionWorkAdmission } from "../session-gate.js"
 import { lockSubagentTurnForWork, readSubagentTask, SubagentTurnUnavailableError } from "./pg-store-create.js"
-import { transaction } from "./pg-store-persistence.js"
+import { transaction, type Queryable } from "./pg-store-persistence.js"
 import { persistGraphTransition, prepareGraphTransition } from "./task-graph-pg-lifecycle.js"
 import { PAUSE_DEFERRED_MARKER, parseSubagentJobPayload, type PgSubagentPool, type SubagentJobPayload, type SubagentPolicy, type SubagentTaskRecord } from "./types.js"
 import { parseSubagentDispatchIdentity, SubagentDispatchIdentityMismatchError, type SubagentDispatchIdentity } from "./dispatch-identity.js"
 import { SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
 import { SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE } from "./scheduled-audit-contract.js"
 import { hasScheduledGateResumeAcknowledgement } from "./scheduled-gate-resume-admission.js"
+import { TASK_GRAPH_CHILD_RUNNING_SEGMENT_MS } from "./task-graph-child-deadline.js"
 
 type ClaimInput = { taskId: string; sessionId: string; ownerId: string; rootTaskId?: string; policy: SubagentPolicy; now: Date; dispatchIdentity?: SubagentDispatchIdentity }
+export async function leaseTimeAfterLock(client: Queryable, input: { taskId: string; sessionId: string; ownerId: string; attemptCount: number }): Promise<Date | null> {
+  const lease = await client.query<{ leaseExpiresAt: Date; absoluteDeadlineAt?: Date | null }>(`SELECT "leaseExpiresAt", "absoluteDeadlineAt" FROM "sub_agent_tasks"
+    WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $3 AND "attemptCount" = $4 AND "status" = 'running' FOR UPDATE`,
+  [input.taskId, input.sessionId, input.ownerId, input.attemptCount])
+  const checkedAt = (await client.query<{ checkedAt: Date }>(`SELECT clock_timestamp() AS "checkedAt"`)).rows[0]?.checkedAt
+  const deadline = lease.rows[0]?.absoluteDeadlineAt
+  return lease.rows[0]?.leaseExpiresAt && checkedAt && lease.rows[0].leaseExpiresAt > checkedAt
+    && (!deadline || deadline > checkedAt) ? checkedAt : null
+}
+
+export async function taskGraphDeadlineLive(client: Queryable, taskId: string, sessionId: string): Promise<boolean> {
+  const result = await client.query(`SELECT 1 FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2
+    AND ("absoluteDeadlineAt" IS NULL OR "absoluteDeadlineAt" > clock_timestamp()) FOR UPDATE`, [taskId, sessionId])
+  return result.rowCount === 1
+}
 
 const CHILD_WAIT_RESUMABLE_SQL = `(SELECT COUNT(*) = 1
   FROM "agent_wait_conditions" AS wait
@@ -79,6 +94,42 @@ export async function matchesPublishedSubagentDispatch(pool: PgSubagentPool, inp
   })
 }
 
+export async function heartbeatSubagentTask(pool: PgSubagentPool, input: {
+  taskId: string; sessionId: string; ownerId: string; attemptCount: number; now: Date
+}, leaseMs: number): Promise<"renewed" | "interrupted" | "lost"> {
+  return transaction(pool, async client => {
+    const session = await client.query(`SELECT "status" FROM "agent_sessions" WHERE "id" = $1 FOR UPDATE`, [input.sessionId])
+    const sessionStatus = String(session.rows[0]?.status ?? "")
+    if (!session.rows[0]) return "lost"
+    if (sessionStatus === "aborted" || sessionStatus === "archived") return "interrupted"
+    if (!await leaseTimeAfterLock(client, input)) return "lost"
+    const result = await client.query(`UPDATE "sub_agent_tasks"
+      SET "leaseExpiresAt" = LEAST(clock_timestamp() + ($4 * INTERVAL '1 millisecond'),
+        CASE WHEN "absoluteDeadlineAt" IS NULL THEN COALESCE("startedAt", clock_timestamp()) + (${TASK_GRAPH_CHILD_RUNNING_SEGMENT_MS} * INTERVAL '1 millisecond')
+          ELSE "leaseSegmentStartedAt" + (${TASK_GRAPH_CHILD_RUNNING_SEGMENT_MS} * INTERVAL '1 millisecond') END,
+        COALESCE("absoluteDeadlineAt", 'infinity'::timestamptz)), "updatedAt" = clock_timestamp()
+      WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwner" = $3 AND "attemptCount" = $5 AND "status" = 'running'
+        AND ("absoluteDeadlineAt" IS NULL OR ("absoluteDeadlineAt" > clock_timestamp() AND "leaseSegmentStartedAt" IS NOT NULL))
+        AND ("absoluteDeadlineAt" IS NULL OR "leaseSegmentStartedAt" + (${TASK_GRAPH_CHILD_RUNNING_SEGMENT_MS} * INTERVAL '1 millisecond') > clock_timestamp())
+        AND "leaseExpiresAt" > clock_timestamp() AND EXISTS (SELECT 1 FROM "sub_agent_tasks" AS root JOIN "agent_turns" AS turn ON turn."id" = root."turnId"
+          WHERE root."id" = "sub_agent_tasks"."rootTaskId" AND root."sessionId" = "sub_agent_tasks"."sessionId"
+            AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed')
+            AND turn."id" = "sub_agent_tasks"."turnId" AND turn."sessionId" = "sub_agent_tasks"."sessionId"
+            AND turn."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled'))
+        AND EXISTS (SELECT 1 FROM "agent_sessions" AS session
+          WHERE session."id" = "sub_agent_tasks"."sessionId"
+            AND session."status" NOT IN ('aborted', 'archived')) RETURNING "interruptRequestedAt"`,
+    [input.taskId, input.sessionId, input.ownerId, leaseMs, input.attemptCount])
+    if (result.rowCount === 1) return result.rows[0].interruptRequestedAt ? "interrupted" : "renewed"
+    const state = await client.query(`SELECT task."interruptRequestedAt", turn."status" AS "turnStatus" FROM "sub_agent_tasks" AS task
+      JOIN "agent_sessions" AS session ON session."id" = task."sessionId" JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
+      JOIN "sub_agent_tasks" AS root ON root."id" = task."rootTaskId" AND root."sessionId" = task."sessionId" AND root."turnId" = task."turnId"
+      WHERE task."id" = $1 AND task."sessionId" = $2 AND task."leaseOwner" = $3 AND task."attemptCount" = $4
+        AND task."status" = 'running' AND task."leaseExpiresAt" > clock_timestamp() AND session."status" NOT IN ('aborted', 'archived')`,
+    [input.taskId, input.sessionId, input.ownerId, input.attemptCount])
+    return state.rows[0]?.interruptRequestedAt && state.rows[0]?.turnStatus === "interrupted" ? "interrupted" : "lost"
+  })
+}
 /** Claims a queued child only after the owning Session, Turn, root, and child are fenced. */
 export async function claimSubagentTask(pool: PgSubagentPool, input: ClaimInput, leaseMs: number): Promise<SubagentTaskRecord | null> {
   return transaction(pool, async client => {
@@ -148,7 +199,12 @@ export async function claimSubagentTask(pool: PgSubagentPool, input: ClaimInput,
     const graph = await prepareGraphTransition(client, { taskId: input.taskId, sessionId: input.sessionId, type: "task.started" })
     if (graph && "blocked" in graph) return null
     const updated = await client.query(`UPDATE "sub_agent_tasks" AS task
-      SET "status" = 'running', "leaseOwner" = $3, "leaseExpiresAt" = clock_timestamp() + ($4 * INTERVAL '1 millisecond'),
+      SET "status" = 'running', "leaseOwner" = $3,
+        "leaseSegmentStartedAt" = CASE WHEN task."absoluteDeadlineAt" IS NULL THEN task."leaseSegmentStartedAt" ELSE clock_timestamp() END,
+        "leaseExpiresAt" = LEAST(clock_timestamp() + ($4 * INTERVAL '1 millisecond'),
+          COALESCE(task."absoluteDeadlineAt", 'infinity'::timestamptz),
+          CASE WHEN task."absoluteDeadlineAt" IS NULL THEN clock_timestamp() + ($4 * INTERVAL '1 millisecond')
+            ELSE clock_timestamp() + (LEAST($4, ${TASK_GRAPH_CHILD_RUNNING_SEGMENT_MS}) * INTERVAL '1 millisecond') END),
         "attemptCount" = CASE WHEN $8::boolean AND ${CHILD_WAIT_RESUMABLE_SQL} THEN "attemptCount" ELSE "attemptCount" + 1 END,
         "failureReason" = CASE WHEN $10::boolean AND NOT ($8::boolean AND ${CHILD_WAIT_RESUMABLE_SQL}) THEN NULL ELSE "failureReason" END,
         "startedAt" = COALESCE("startedAt", clock_timestamp()), "updatedAt" = clock_timestamp()
@@ -158,10 +214,12 @@ export async function claimSubagentTask(pool: PgSubagentPool, input: ClaimInput,
         AND (NOT (${CHILD_WAIT_RESUMABLE_SQL} OR $9::boolean) OR $8::boolean)
         AND ("leaseOwner" IS NULL OR "leaseExpiresAt" <= clock_timestamp())
         AND ("nextAttemptAt" IS NULL OR "nextAttemptAt" <= clock_timestamp())
+        AND (task."absoluteDeadlineAt" IS NULL OR task."absoluteDeadlineAt" > clock_timestamp())
         AND EXISTS (SELECT 1 FROM "sub_agent_tasks" root WHERE root."id" = $6 AND root."sessionId" = $2
           AND root."turnId" = $5 AND root."interruptRequestedAt" IS NULL
           AND root."status" NOT IN ('completed', 'failed', 'interrupted', 'cancelled', 'closed'))`,
-    [input.taskId, input.sessionId, input.ownerId, leaseMs, turnId, rootTaskId, userId, currentDispatchIdentity, scheduledGateResume, scheduledAudit])
+    [input.taskId, input.sessionId, input.ownerId, leaseMs, turnId, rootTaskId, userId,
+      currentDispatchIdentity, scheduledGateResume, scheduledAudit])
     if (updated.rowCount !== 1) return null
     if (graph) await persistGraphTransition(client, graph, input.now)
     return readSubagentTask(client, input.taskId, input.sessionId)

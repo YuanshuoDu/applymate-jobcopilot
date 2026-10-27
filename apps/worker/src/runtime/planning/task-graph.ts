@@ -1,6 +1,7 @@
 import type { SubagentTaskStatus } from "../subagents/types.js"
 import type { TaskGraphNativeDelegationMetadata } from "../subagents/task-graph-native-state.js"
 import { taskGraphVerificationRole, validateTaskGraphVerificationContract, type TaskGraphVerificationContract } from "./task-graph-verification.js"
+import { isTaskGraphBlocking, isTaskGraphEventType, isTaskGraphTerminal, sameTaskGraphEvent, taskGraphEventAllowed, taskGraphNextStatus } from "./task-graph-transition-rules.js"
 export type TaskGraphNodeStatus = SubagentTaskStatus
 export type TaskGraphVerificationDisposition = "typed" | "legacy_unverified" | "specialized"
 export type TaskGraphRepairOf = Readonly<{ graphRootTaskId: string; nodeKey: string; taskId: string; criterionIds: string[] }>
@@ -48,23 +49,6 @@ export type TaskGraphReadNode = TaskGraphNode & Readonly<{ readiness: TaskGraphR
 const NODE_KEYS = "dependsOn,goal,key,successCriteria,templateId"
 const NODE_KEYS_WITH_VERIFICATION = `${NODE_KEYS},verification`
 const NODE_KEYS_WITH_REPAIR = "dependsOn,goal,key,repairOf,successCriteria,templateId,verification"
-const TERMINAL = new Set<TaskGraphNodeStatus>(["completed", "failed", "interrupted", "cancelled", "closed"])
-const BLOCKING = new Set<TaskGraphNodeStatus>(["failed", "interrupted", "cancelled", "closed"])
-const ACTIVE_FROM: Readonly<Record<TaskGraphEventType, readonly TaskGraphNodeStatus[]>> = {
-  "task.started": ["queued", "retrying", "waiting", "waiting_for_user"],
-  "task.queued": ["waiting"], "task.gate_choice_resumed": ["waiting_for_user"],
-  "task.waiting": ["running"], "task.waiting_for_user": ["running"], "task.retrying": ["running"],
-  "task.completed": ["running"], "task.failed": ["running"],
-  "task.interrupted": ["queued", "running", "retrying", "waiting", "waiting_for_user"],
-  "task.cancelled": ["queued", "running", "retrying", "waiting", "waiting_for_user"],
-  "task.closed": ["queued", "running", "retrying", "waiting", "waiting_for_user"],
-}
-const NEXT_STATUS: Readonly<Record<TaskGraphEventType, TaskGraphNodeStatus>> = {
-  "task.started": "running", "task.queued": "queued", "task.gate_choice_resumed": "queued", "task.waiting": "waiting", "task.waiting_for_user": "waiting_for_user",
-  "task.retrying": "queued", "task.completed": "completed", "task.failed": "failed",
-  "task.interrupted": "interrupted", "task.cancelled": "cancelled", "task.closed": "closed",
-}
-
 function fail(code: TaskGraphErrorCode, path: string, message: string): TaskGraphFailure {
   return { ok: false, error: { code, path, message } }
 }
@@ -197,7 +181,7 @@ function blockedByDependency(node: TaskGraphNode, byKey: ReadonlyMap<string, Tas
   if (known !== undefined) return known
   const blocked = node.dependsOn.some(key => {
     const dependency = byKey.get(key)
-    return !dependency || ((BLOCKING.has(dependency.status) && !repaired.has(key) && !pending.has(key))
+    return !dependency || ((isTaskGraphBlocking(dependency.status) && !repaired.has(key) && !pending.has(key))
       || blockedByDependency(dependency, byKey, memo, repaired, pending))
   })
   memo.set(node.key, blocked); return blocked
@@ -210,7 +194,7 @@ export function deriveTaskGraphReadModel(state: TaskGraphState): readonly TaskGr
       if (blockedByDependency(node, byKey, blocked, repaired, pending)) readiness = "blocked_dependency"
       else readiness = node.dependsOn.every(key => byKey.get(key)?.status === "completed" || repaired.has(key)) ? "ready" : "waiting_for_dependencies"
     }
-    else readiness = TERMINAL.has(node.status) ? "terminal" : "active"
+    else readiness = isTaskGraphTerminal(node.status) ? "terminal" : "active"
     return { ...node, readiness }
   })
 }
@@ -222,7 +206,7 @@ function parseEvent(value: unknown): TaskGraphEvent | TaskGraphFailure {
   const row = value as Record<string, unknown>
   if (!text(row.type) || !text(row.idempotencyKey) || !text(row.nodeKey) || !integer(row.expectedRevision, 0)) return fail("invalid_shape", "event", "Event identity, node key, and revision are required")
   const type = row.type as TaskGraphEventType
-  if (!Object.hasOwn(ACTIVE_FROM, type)) return fail("invalid_shape", "event.type", "Unsupported task event")
+  if (!isTaskGraphEventType(type)) return fail("invalid_shape", "event.type", "Unsupported task event")
   const keys = type === "task.failed" ? "expectedRevision,failureReason,idempotencyKey,nodeKey,type"
     : type === "task.gate_choice_resumed" ? "expectedRevision,gateTaskId,idempotencyKey,nodeKey,requestAttemptCount,resumedAttemptCount,type"
       : "expectedRevision,idempotencyKey,nodeKey,type"
@@ -238,22 +222,15 @@ function parseEvent(value: unknown): TaskGraphEvent | TaskGraphFailure {
         gateTaskId: row.gateTaskId as string, requestAttemptCount: row.requestAttemptCount as number, resumedAttemptCount: row.resumedAttemptCount as number }
     : { type, idempotencyKey: row.idempotencyKey as string, expectedRevision: row.expectedRevision as number, nodeKey: row.nodeKey as string }
 }
-function sameEvent(left: TaskGraphEvent, right: TaskGraphEvent): boolean {
-  return left.type === right.type && left.idempotencyKey === right.idempotencyKey && left.expectedRevision === right.expectedRevision
-    && left.nodeKey === right.nodeKey
-    && (left.type !== "task.failed" || (right.type === "task.failed" && left.failureReason === right.failureReason))
-    && (left.type !== "task.gate_choice_resumed" || (right.type === "task.gate_choice_resumed"
-      && left.gateTaskId === right.gateTaskId && left.requestAttemptCount === right.requestAttemptCount && left.resumedAttemptCount === right.resumedAttemptCount))
-}
 export function reduceTaskGraphEvent(state: TaskGraphState, value: unknown): TaskGraphTransitionResult {
   const event = parseEvent(value)
   if ("ok" in event) return event
   const previous = state.appliedEvents.find(applied => applied.idempotencyKey === event.idempotencyKey)
-  if (previous) return sameEvent(previous, event) ? { ok: true, state, duplicate: true } : fail("idempotency_conflict", "event.idempotencyKey", "Idempotency key was already used for a different event")
+  if (previous) return sameTaskGraphEvent(previous, event) ? { ok: true, state, duplicate: true } : fail("idempotency_conflict", "event.idempotencyKey", "Idempotency key was already used for a different event")
   if (event.expectedRevision !== state.revision) return fail("revision_mismatch", "event.expectedRevision", "Event revision is stale")
   const node = state.nodes.find(item => item.key === event.nodeKey)
   if (!node) return fail("node_not_found", "event.nodeKey", "TaskGraph node does not exist")
-  if (!ACTIVE_FROM[event.type].includes(node.status)) return fail("invalid_transition", "event.type", `Cannot apply ${event.type} to ${node.status}`)
+  if (!taskGraphEventAllowed(node.status, event.type, event.type === "task.failed" ? event.failureReason : undefined)) return fail("invalid_transition", "event.type", `Cannot apply ${event.type} to ${node.status}`)
   if (event.type === "task.gate_choice_resumed" && (node.key !== "gate" || node.templateId !== "gate"
     || node.taskId !== event.gateTaskId || node.depth !== 4 || node.dependsOn.length !== 1 || node.dependsOn[0] !== "prepare"
     || node.verificationDisposition !== "specialized")) {
@@ -265,7 +242,7 @@ export function reduceTaskGraphEvent(state: TaskGraphState, value: unknown): Tas
     if (!node.dependsOn.every(key => byKey.get(key)?.status === "completed" || repaired.has(key))) return fail("dependencies_incomplete", "event.nodeKey", "All dependencies must be completed before a node can be queued or started")
   }
   const updated = state.nodes.map(item => item.key !== node.key ? item : {
-    ...item, status: NEXT_STATUS[event.type], ...(event.type === "task.failed" ? { failureReason: event.failureReason } : {}),
+    ...item, status: taskGraphNextStatus(event.type), ...(event.type === "task.failed" ? { failureReason: event.failureReason } : {}),
   })
   return { ok: true, state: { revision: state.revision + 1, nodes: updated, appliedEvents: [...state.appliedEvents, event], repairSatisfiedNodeKeys: state.repairSatisfiedNodeKeys, repairPendingNodeKeys: state.repairPendingNodeKeys }, duplicate: false }
 }

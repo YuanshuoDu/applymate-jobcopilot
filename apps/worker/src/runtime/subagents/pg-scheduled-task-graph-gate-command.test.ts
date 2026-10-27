@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
   contract: vi.fn(), snapshot: vi.fn(), receiptMatches: vi.fn(), lock: vi.fn(), load: vi.fn(),
   current: vi.fn(), prepareProof: vi.fn(), registration: vi.fn(), prefix: vi.fn(),
 }))
+const creation = vi.hoisted(() => ({ child: vi.fn(), enqueue: vi.fn(), plan: vi.fn(), event: vi.fn() }))
 vi.mock("./scheduled-taskgraph-continuation-receipt.js", async importOriginal => {
   const actual = await importOriginal<typeof import("./scheduled-taskgraph-continuation-receipt.js")>()
   return { ...actual, createScheduledTaskGraphContinuationContract: mocks.contract,
@@ -25,6 +26,19 @@ vi.mock("./scheduled-gate-registration-receipt.js", async importOriginal => {
   return { ...actual, readScheduledGateRegistrationReceipt: mocks.registration }
 })
 vi.mock("./pg-scheduled-task-graph-gate-verification.js", () => ({ verifyPersistedScheduledPreparePrefix: mocks.prefix }))
+vi.mock("./pg-store-create.js", async importOriginal => ({
+  ...await importOriginal<typeof import("./pg-store-create.js")>(),
+  createSubagentTask: creation.child,
+}))
+vi.mock("./task-graph-pg-create.js", async importOriginal => ({
+  ...await importOriginal<typeof import("./task-graph-pg-create.js")>(),
+  enqueueGraphTask: creation.enqueue,
+}))
+vi.mock("./task-graph-pg-events.js", async importOriginal => ({
+  ...await importOriginal<typeof import("./task-graph-pg-events.js")>(),
+  writePlanReceipt: creation.plan,
+  appendTaskGraphReceipt: creation.event,
+}))
 
 const owner = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", rootAttemptCount: 2,
   turnLeaseOwnerId: "turn-owner", turnLeaseVersion: 4, executionId: "execution-1", executionAttemptCount: 3 }
@@ -85,14 +99,14 @@ const registration = { schemaVersion: SCHEDULED_GATE_REGISTRATION_RECEIPT_SCHEMA
   continuationKey: stableReceiptKey, snapshotDigest: binding.snapshotDigest, evidenceDigest: binding.evidenceDigest, checkpointDigest: binding.checkpointDigest,
   analyzeGraphRevision: 7, prepareScheduleRevision: 8, prepareWaitId: "prepare-wait", gateTaskId: "gate-task", gateAppendRevision: 11 }
 
-function database(graph: typeof loadedGate | ReturnType<typeof baseGraph>, allowedActions: unknown = []) {
+function database(graph: typeof loadedGate | ReturnType<typeof baseGraph>, allowedActions: unknown = [], persistedClaim = claim) {
   const calls: string[] = []
   const query = vi.fn(async (sql: string) => {
     calls.push(sql)
     if (sql.includes('FROM "agent_turns"')) return { rows: [{ source: "automation", executionMode: "canonical_task_graph", input: {} }], rowCount: 1 }
     if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ context: {}, allowedActions, status: "waiting_for_user", attemptCount: 1 }], rowCount: 1 }
     if (sql.includes('FROM "agent_executions"')) return { rows: [{ id: owner.executionId, status: "running", attemptCount: owner.executionAttemptCount,
-      state: { scheduledTaskGraphClaim: claim }, now: currentTime }], rowCount: 1 }
+      state: { scheduledTaskGraphClaim: persistedClaim }, now: currentTime }], rowCount: 1 }
     if (sql.includes('FROM "agent_events"')) return { rows: [], rowCount: 0 }
     return { rows: [], rowCount: 0 }
   })
@@ -101,8 +115,9 @@ function database(graph: typeof loadedGate | ReturnType<typeof baseGraph>, allow
   return { query, calls, client: { query } }
 }
 function baseGraph() {
+  const rootSuccessCriteria: string[] = []
   return { rootTaskId: owner.rootTaskId, item: { id: "graph", revision: 7, content: {} },
-    snapshot: { schemaVersion: "agent-harness.v2.task-graph.v1", rootSuccessCriteria: [], nodes: nodes.slice(0, 3) },
+    snapshot: { schemaVersion: "agent-harness.v2.task-graph.v1", rootSuccessCriteria, nodes: nodes.slice(0, 3) },
     state: { revision: 7, appliedEvents: [] }, tasks: new Map([["prepare-task", preparedTask]]) }
 }
 
@@ -116,6 +131,13 @@ describe("scheduled Gate append claim replay", () => {
     mocks.prepareProof.mockResolvedValue(proof)
     mocks.registration.mockResolvedValue(registration)
     mocks.prefix.mockResolvedValue(true)
+    creation.child.mockResolvedValue({
+      id: "gate-task", rootTaskId: scope.rootTaskId, parentTaskId: scope.rootTaskId, path: "/root-1/gate",
+      depth: 4, role: SCHEDULED_GATE_ROLE, taskType: SCHEDULED_GATE_TASK_TYPE, status: "queued",
+    })
+    creation.enqueue.mockResolvedValue(undefined)
+    creation.plan.mockResolvedValue(undefined)
+    creation.event.mockResolvedValue(undefined)
   })
 
   it("allows only an exact duplicate replay after the Web claim expires, locking Gate before execution", async () => {
@@ -160,6 +182,33 @@ describe("scheduled Gate append claim replay", () => {
     expect(db.calls.some(sql => sql.includes('FROM "agent_events"'))).toBe(true)
     expect(db.calls.some(sql => sql.includes('FROM "agent_executions"'))).toBe(true)
     expect(mocks.registration).not.toHaveBeenCalled()
+  })
+
+  it("opts the canonical scheduled Gate into its server-owned deadline at creation", async () => {
+    const prefix = [
+      { key: "scout", templateId: "scout", taskId: "scout-task", goal: "Find roles", successCriteria: ["Found roles"],
+        dependsOn: [], depth: 1, status: "completed", verificationDisposition: "legacy_unverified" },
+      { key: "analyst", templateId: "analyst", taskId: "analyst-task", goal: "Review roles", successCriteria: ["Reviewed roles"],
+        dependsOn: ["scout"], depth: 2, status: "completed", verificationDisposition: "legacy_unverified" },
+      { key: "prepare", templateId: "prepare", taskId: "prepare-task", goal: "Prepare applications", successCriteria: ["Prepared"],
+        dependsOn: ["analyst"], depth: 3, status: "completed", verificationDisposition: "specialized" },
+    ]
+    const snapshotPrefix = prefix.map(({ status: _status, ...node }) => node)
+    const base = baseGraph()
+    const graph = {
+      ...base,
+      snapshot: { ...base.snapshot, rootSuccessCriteria: ["Finish the scheduled objective"], nodes: snapshotPrefix },
+      state: { revision: 7, nodes: prefix, appliedEvents: [] },
+    }
+    const db = database(graph, [], { ...claim, leaseExpiresAt: "2026-10-22T10:12:00.000Z" })
+    mocks.current.mockReturnValue({ revision: 7, nodes: prefix })
+
+    await expect(appendScheduledGate(db.client as never, input)).resolves.toMatchObject({
+      status: "accepted", nodes: [{ key: "gate", taskId: "gate-task", status: "queued" }],
+    })
+    expect(creation.child).toHaveBeenCalledWith(db.client, expect.objectContaining({
+      role: SCHEDULED_GATE_ROLE, taskType: SCHEDULED_GATE_TASK_TYPE,
+    }), true, { preserveEmptyAllowedActions: true, taskGraphChildDeadline: true })
   })
 
   it("loads the Prepare wait with the handoff key while replaying the stable receipt identity", async () => {

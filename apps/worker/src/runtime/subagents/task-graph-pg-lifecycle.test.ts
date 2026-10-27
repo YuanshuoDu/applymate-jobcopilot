@@ -223,6 +223,8 @@ describe("reconcileGraphDependents", () => {
     await expect(reconcileGraphDependents({ query } as unknown as Pick<pg.PoolClient, "query">, scope, new Date("2026-09-02T00:00:00.000Z"))).resolves.toBeUndefined()
 
     expect(taskRows.get("analyst-1")?.status).toBe("queued")
+    const promotedTaskUpdate = query.mock.calls.find(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "context"'))
+    expect(promotedTaskUpdate?.[0]).toContain('AND ("absoluteDeadlineAt" IS NULL OR "absoluteDeadlineAt" > clock_timestamp())')
     expect(promotedContext).toMatchObject({ taskGraphDependencyResults: { items: [{ dependencyKey: "writer", sourceIntent: {
       goal: "Draft a letter", successCriteria: ["Ground it in the selected job"], inputRelation: "unknown",
     } }] } })

@@ -16,6 +16,16 @@ describe("subagent PostgreSQL persistence helpers", () => {
     expect(dateValue(1)).toBeNull()
   })
 
+  it("maps the deadline clocks explicitly and leaves grandfathered rows null", () => {
+    const absoluteDeadlineAt = "2026-10-26T12:00:00.000Z"
+    const leaseSegmentStartedAt = new Date("2026-10-26T11:05:00.000Z")
+    expect(rowToTask({ id: "task-2", userId: "user-1", sessionId: "session-1", status: "running",
+      absoluteDeadlineAt, leaseSegmentStartedAt }))
+      .toMatchObject({ absoluteDeadlineAt: new Date(absoluteDeadlineAt), leaseSegmentStartedAt })
+    expect(rowToTask({ id: "legacy", userId: "user-1", sessionId: "session-1", status: "queued" }))
+      .toMatchObject({ absoluteDeadlineAt: null, leaseSegmentStartedAt: null })
+  })
+
   it("normalizes allowlists and idempotent message identities deterministically", () => {
     expect(actionList(["read", " ", 1, "write"])).toEqual(["read", "write"])
     expect(uniqueMessageIds(["m1", "m1", "", "m2"])).toEqual(["m1", "m2"])

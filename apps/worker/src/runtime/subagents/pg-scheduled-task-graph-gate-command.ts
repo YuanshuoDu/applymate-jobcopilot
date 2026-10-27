@@ -63,7 +63,8 @@ export async function appendScheduledGate(client: Queryable, input: TaskGraphSch
   const child = await createSubagentTask(client, { userId: input.scope.userId, sessionId: input.scope.sessionId,
     turnId: input.scope.turnId, parentTaskId: input.scope.rootTaskId, role: GATE_TEMPLATE.role, taskType: GATE_TEMPLATE.taskType,
     goal: node.goal, constraints: [], successCriteria: node.successCriteria, allowedActions: [], context: {},
-    expectedOutputSchema: GATE_TEMPLATE.expectedOutputSchema, policy: inheritSubagentPolicy(policy) }, true, { preserveEmptyAllowedActions: true })
+    expectedOutputSchema: GATE_TEMPLATE.expectedOutputSchema, policy: inheritSubagentPolicy(policy) }, true,
+  { preserveEmptyAllowedActions: true, taskGraphChildDeadline: true })
   const nodes = append.state.nodes.map(value => value.key === "gate" ? { ...value, taskId: child.id } : value)
   const state = { ...append.state, nodes }, taskIds = new Map(loaded.snapshot.nodes.map(value => [value.key, value.taskId] as const))
   taskIds.set("gate", child.id)

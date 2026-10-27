@@ -4,6 +4,7 @@ import type pg from "pg"
 import { dateValue, DurableSubagentWaitError, object, parseIds, projectDurableSubagentWait, safeSubagentWaitJson } from "./durable-subagent-wait-store.js"
 import { persistGraphTransition, prepareGraphTransition } from "./task-graph-pg-lifecycle.js"
 import { parseSubagentJobPayload } from "./types.js"
+import { taskGraphDeadlineLive } from "./pg-store-claim.js"
 
 type Queryable = Pick<pg.PoolClient, "query">
 type Pool = Pick<pg.Pool, "connect">
@@ -110,6 +111,7 @@ async function reconcileOne(client: Queryable, wait: Row, now: Date, ownerId: st
       AND "suspendedAt" IS NOT NULL AND "consumedAt" IS NULL
       AND EXISTS (SELECT 1 FROM "sub_agent_tasks" AS parent JOIN "agent_steps" AS step ON step."id" = "agent_wait_conditions"."stepId"
         WHERE parent."id" = $8 AND parent."sessionId" = $7 AND parent."turnId" = "agent_wait_conditions"."turnId"
+          AND (parent."absoluteDeadlineAt" IS NULL OR parent."absoluteDeadlineAt" > clock_timestamp())
           AND step."sessionId" = $7 AND step."turnId" = "agent_wait_conditions"."turnId" AND step."taskId" = $8
           AND step."attempt" = parent."attemptCount" AND step."status" = 'waiting_for_tool'
           AND step."ordinal" = (SELECT MAX(current."ordinal") FROM "agent_steps" AS current WHERE current."sessionId" = step."sessionId" AND current."turnId" = step."turnId" AND current."taskId" = step."taskId" AND current."attempt" = step."attempt"))
@@ -118,12 +120,17 @@ async function reconcileOne(client: Queryable, wait: Row, now: Date, ownerId: st
   if (changed.rowCount !== 1) return "ignored"
   if (graphQueued && "blocked" in graphQueued) {
     await fenceBlockedDispatch(client, wait)
+    if (!await taskGraphDeadlineLive(client, parentTaskId, String(wait.sessionId))) {
+      throw new DurableSubagentWaitError("wait_scope_error", "Child wait deadline elapsed during resolution")
+    }
     return "resolved"
   }
   const queued = await client.query(`UPDATE "sub_agent_tasks" SET "status" = 'queued', "leaseOwner" = NULL, "leaseExpiresAt" = NULL,
+      "leaseSegmentStartedAt" = CASE WHEN "absoluteDeadlineAt" IS NOT NULL THEN NULL ELSE "leaseSegmentStartedAt" END,
       "nextAttemptAt" = NULL, "completedAt" = NULL, "updatedAt" = $1
     WHERE "id" = $2 AND "sessionId" = $3 AND "turnId" = $4 AND "rootTaskId" = $5 AND "attemptCount" = $6
       AND "status" = 'waiting' AND "leaseOwner" IS NULL AND "leaseExpiresAt" IS NULL AND "interruptRequestedAt" IS NULL
+      AND ("absoluteDeadlineAt" IS NULL OR "absoluteDeadlineAt" > clock_timestamp())
       AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "sub_agent_tasks"."sessionId" AND ${OPEN_SESSION})
       AND EXISTS (SELECT 1 FROM "agent_turns" AS turn WHERE turn."id" = "sub_agent_tasks"."turnId" AND turn."sessionId" = $3 AND ${ACTIVE_TURN})
       AND EXISTS (SELECT 1 FROM "sub_agent_tasks" AS root WHERE root."id" = "sub_agent_tasks"."rootTaskId" AND root."sessionId" = $3 AND ${ACTIVE_ROOT})`,
@@ -131,6 +138,9 @@ async function reconcileOne(client: Queryable, wait: Row, now: Date, ownerId: st
   if (queued.rowCount !== 1) throw new DurableSubagentWaitError("wait_scope_error", "Child wait parent changed before resume")
   await dispatch(client, wait, ownerId)
   if (graphQueued) await persistGraphTransition(client, graphQueued, now)
+  if (!await taskGraphDeadlineLive(client, parentTaskId, String(wait.sessionId))) {
+    throw new DurableSubagentWaitError("wait_scope_error", "Child wait deadline elapsed during resume")
+  }
   return "woken"
 }
 
@@ -150,6 +160,7 @@ export async function reconcileDurableSubagentWaits(pool: Pool, options: Durable
         JOIN "agent_steps" AS step ON step."id" = wait."stepId" AND step."sessionId" = wait."sessionId" AND step."turnId" = wait."turnId" AND step."taskId" = parent."id"
         WHERE wait."sessionId" = session."id" AND wait."userId" = session."userId" AND wait."status" = 'waiting'
           AND wait."suspendedAt" IS NOT NULL AND wait."consumedAt" IS NULL AND parent."parentTaskId" IS NOT NULL AND parent."status" = 'waiting'
+          AND (parent."absoluteDeadlineAt" IS NULL OR parent."absoluteDeadlineAt" > clock_timestamp())
           AND parent."leaseOwner" IS NULL AND parent."leaseExpiresAt" IS NULL AND step."attempt" = parent."attemptCount"
           AND step."status" = 'waiting_for_tool' AND step."ordinal" = (SELECT MAX(current."ordinal") FROM "agent_steps" AS current
             WHERE current."sessionId" = step."sessionId" AND current."turnId" = step."turnId" AND current."taskId" = step."taskId" AND current."attempt" = step."attempt")
@@ -167,6 +178,7 @@ export async function reconcileDurableSubagentWaits(pool: Pool, options: Durable
         JOIN "agent_steps" AS step ON step."id" = wait."stepId" AND step."sessionId" = wait."sessionId" AND step."turnId" = wait."turnId" AND step."taskId" = parent."id"
         WHERE wait."sessionId" = $1 AND wait."userId" = $2 AND wait."status" = 'waiting' AND wait."suspendedAt" IS NOT NULL
           AND wait."consumedAt" IS NULL AND parent."parentTaskId" IS NOT NULL AND parent."status" = 'waiting' AND parent."leaseOwner" IS NULL AND parent."leaseExpiresAt" IS NULL
+          AND (parent."absoluteDeadlineAt" IS NULL OR parent."absoluteDeadlineAt" > clock_timestamp())
           AND step."attempt" = parent."attemptCount" AND step."status" = 'waiting_for_tool'
           AND step."ordinal" = (SELECT MAX(current."ordinal") FROM "agent_steps" AS current WHERE current."sessionId" = step."sessionId"
             AND current."turnId" = step."turnId" AND current."taskId" = step."taskId" AND current."attempt" = step."attempt")
