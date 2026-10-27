@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest"
-import { projectScheduledTaskGraphCanonicalPrefix, sameScheduledTaskGraphCanonicalPrefix } from "./scheduled-taskgraph-canonical-prefix"
+import { createHash } from "node:crypto"
+import { projectScheduledTaskGraphCanonicalPrefix, sameScheduledTaskGraphCanonicalPrefix,
+  scheduledTaskGraphVerificationReportMatches } from "./scheduled-taskgraph-canonical-prefix"
 
 const digest = (char: string) => char.repeat(64)
 const owner = { userId: "u", sessionId: "s", turnId: "t", rootTaskId: "r", rootAttemptCount: 1,
@@ -44,6 +46,22 @@ function legacyGraph() {
   ] }
 }
 
+function canonical(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonical)
+  if (value && typeof value === "object") return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical((value as Record<string, unknown>)[key])]))
+  return value
+}
+
+function reportDigest(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(canonical(value)), "utf8").digest("hex")
+}
+
+function publicReport() {
+  return { verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status: "passed", reasonCode: "criteria_met",
+    criteria: [{ criterionId: "source-match", status: "passed", reasonCode: "criteria_met" }],
+    evidenceDigest: digest("1"), resultDigest: digest("2") }
+}
+
 describe("scheduled TaskGraph canonical prefix projection", () => {
   it("projects authored-order Scouts, all-source Analyst and typed stage suffixes", () => {
     const projected = projectScheduledTaskGraphCanonicalPrefix(graph(), multiAttestation(), "audit")
@@ -77,5 +95,24 @@ describe("scheduled TaskGraph canonical prefix projection", () => {
     const full = graph(), prepared = { ...full, nodes: full.nodes.slice(0, 4) }
     expect(sameScheduledTaskGraphCanonicalPrefix(prepared, full, 4)).toBe(true)
     expect(sameScheduledTaskGraphCanonicalPrefix({ ...prepared, revision: 2 }, full, 4)).toBe(false)
+  })
+
+  it("checks a V2 report digest over the six public fields while accepting the stored evidence envelope", () => {
+    const report = publicReport(), attestation = { ...report, reportDigest: reportDigest(report) }
+    const stored = { ...report, dependencyBindings: ["a", "b", "c", "d"].map((suffix, index) => ({ nodeKey: `source-${suffix}`,
+      taskId: `scout-task-${suffix}`, attemptCount: 1, nodeDigest: digest(String(index + 3)), resultDigest: digest("2"),
+      evidenceDigest: digest("1"), reportDigest: digest("4") })) }
+    const verificationNode = { templateId: "analyst", verification: { role: "analyst", criteria: [{ id: "source-match" }] } }
+
+    expect(scheduledTaskGraphVerificationReportMatches(stored, verificationNode, attestation)).toBe(true)
+    const tamperedPublic = { ...stored, evidenceDigest: digest("5") }
+    expect(scheduledTaskGraphVerificationReportMatches(tamperedPublic, verificationNode,
+      { ...attestation, evidenceDigest: tamperedPublic.evidenceDigest })).toBe(false)
+  })
+
+  it("keeps the V1 report path compatible when no report digest is declared", () => {
+    const report = publicReport(), verificationNode = { templateId: "analyst", verification: { role: "analyst", criteria: [{ id: "source-match" }] } }
+    expect(scheduledTaskGraphVerificationReportMatches(report, verificationNode,
+      { resultDigest: report.resultDigest, evidenceDigest: report.evidenceDigest })).toBe(true)
   })
 })

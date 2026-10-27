@@ -9,12 +9,13 @@ import { verifyCompletedTaskGraphNodeEvidence } from "./task-graph-pg-verificati
 import { buildScheduledPipelineGraphAttestation } from "./scheduled-pipeline-current-attestation.js"
 import { projectScheduledPipelineGraph } from "./scheduled-pipeline-graph-shape.js"
 import { scheduledPrepareAnalyzeSnapshot } from "./scheduled-prepare-runtime-context.js"
-import type { ScheduledAutomationPersistedRoot, ScheduledAutomationPersistedTurn } from "./scheduled-automation-pipeline-bridge.js"
+import type { ScheduledAutomationPersistedTurn } from "./scheduled-automation-pipeline-bridge.js"
 import { parseScheduledAutomationSnapshot } from "./scheduled-automation-snapshot.js"
 import { readScheduledPrepareCheckpoint, type ScheduledPrepareCheckpointStage } from "./scheduled-prepare-checkpoint.js"
 import { parseScheduledTaskGraphContinuationReceipt, scheduledSnapshotMatches, SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_EVENT,
   scheduledTaskGraphContinuationKeyVersion, scheduledTaskGraphStableContinuationKey, type ScheduledTaskGraphContinuationReceipt } from "./scheduled-taskgraph-continuation-receipt.js"
 import { scheduledTaskGraphContinuationKey } from "./scheduled-pipeline-handoff.js"
+import { scheduledPrepareReceiptOwnerRootMatches } from "./scheduled-prepare-owner-root.js"
 import { validateRoleResult, type PrepareResult } from "./role-results.js"
 import { TASK_GRAPH_TEMPLATES as TEMPLATES } from "./task-graph-templates.js"
 import { verifyScheduledPrepareToolResultReference, type ScheduledPrepareToolResultVerificationMode } from "./scheduled-prepare-tool-result-verification.js"
@@ -44,7 +45,8 @@ export async function verifyScheduledPrepareTaskGraphEvidence(client: Queryable,
     if (!shape || !prepare || !prepareTask || prepare.taskId !== scope.taskId
       || !prepareGraphMatches(snapshot, current, scope, prepareTask, input.completionGraphRevision, prepare)) return rejected("scheduled_prepare_graph_invalid")
     const receipt = await readPrivateReceipt(client, scope)
-    const root = receipt && await receiptOwnerMatchesCurrentRoot(client, scope, receipt)
+    const root = receipt && await scheduledPrepareReceiptOwnerRootMatches(client, scope, receipt.owner,
+      input.referenceVerificationMode.phase, input.tasks)
     if (!receipt || !root) return rejected("scheduled_prepare_receipt_invalid")
     const version = scheduledTaskGraphContinuationKeyVersion(receipt.continuationKey)
     if (!version || version !== graphVersion) return rejected("scheduled_prepare_receipt_invalid")
@@ -142,20 +144,6 @@ async function readPrivateReceipt(client: Queryable, scope: ScheduledPrepareVeri
     || row.actor !== "system" || row.hasOutbox !== false || typeof row.idempotencyKey !== "string"
     || !row.idempotencyKey.startsWith("scheduled-prepare:") || !receipt || !sameOwnerScope(receipt, scope)) return null
   return receipt
-}
-async function receiptOwnerMatchesCurrentRoot(client: Queryable, scope: ScheduledPrepareVerificationScope, receipt: ScheduledTaskGraphContinuationReceipt): Promise<ScheduledAutomationPersistedRoot | null> {
-  if (!sameOwnerScope(receipt, scope)) return null
-  const owner = receipt.owner, rows = await client.query(`SELECT task."id", session."userId" AS "userId", task."sessionId", task."turnId", task."status", task."attemptCount"
-    FROM "sub_agent_tasks" AS task
-    JOIN "agent_sessions" AS session ON session."id" = task."sessionId" JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
-    WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $1 AND task."parentTaskId" IS NULL
-      AND task."taskType" = 'root' AND turn."rootTaskId" = $1 AND session."userId" = $4 AND turn."userId" = $4`,
-  [owner.rootTaskId, scope.sessionId, scope.turnId, scope.userId])
-  const row = record(rows.rows[0])
-  return rows.rows.length === 1 && row?.id === owner.rootTaskId && row.userId === scope.userId && row.sessionId === scope.sessionId
-    && row.turnId === scope.turnId && row.status === "running" && Number(row.attemptCount) === owner.rootAttemptCount
-    ? { id: owner.rootTaskId, userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
-      status: "running", attemptCount: owner.rootAttemptCount } : null
 }
 async function verifyPrepareToolReceipt(client: Queryable, scope: TaskGraphVerificationScope, mode: ScheduledPrepareToolResultVerificationMode, rawResult: unknown, result: PrepareResult): Promise<PrepareResult | null> {
   const receipts = await loadTaskGraphVerificationReceipts(client, scope)

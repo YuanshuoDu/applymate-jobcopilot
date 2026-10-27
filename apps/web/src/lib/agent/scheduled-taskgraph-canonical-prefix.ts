@@ -117,7 +117,11 @@ export function scheduledTaskGraphAuditNodeMatches(node: Record<string, unknown>
     && node.goal === goal && sameScheduledTaskGraphJson(node.successCriteria, criteria)
 }
 function reportDigest(value: unknown): string {
-  return createHash("sha256").update(JSON.stringify(canonical(value)), "utf8").digest("hex")
+  const report = record(value)
+  if (!report) return ""
+  const publicReport = { verifierVersion: report.verifierVersion, status: report.status, reasonCode: report.reasonCode,
+    criteria: report.criteria, evidenceDigest: report.evidenceDigest, resultDigest: report.resultDigest }
+  return createHash("sha256").update(JSON.stringify(canonical(publicReport)), "utf8").digest("hex")
 }
 function canonical(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonical)
