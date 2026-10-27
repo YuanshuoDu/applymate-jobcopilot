@@ -44,6 +44,12 @@ export function activateTenantContext(userId: string) {
   else browserFallbackUserId = userId
 }
 
+export function runWithTenantContext<T>(userId: string, callback: () => T): T {
+  validateTenantUserId(userId)
+  if (!storage) throw new Error('Tenant request context is unavailable')
+  return storage.run({ userId, inTransaction: false }, callback)
+}
+
 export function runTenantTransaction<T>(userId: string, callback: () => Promise<T>) {
   validateTenantUserId(userId)
   if (storage) return storage.run({ userId, inTransaction: true }, callback)

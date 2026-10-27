@@ -168,6 +168,201 @@ jobs:
         env:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
         run: pnpm --filter @jobcopilot/web exec prisma generate --schema prisma/schema.prisma
+      - name: Build Worker workspace before focused test
+        run: pnpm turbo build --filter=@jobcopilot/worker
+      - name: Create isolated disposable database for task wait RLS verification
+        env:
+          WAIT_RLS_ADMIN_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+        run: |
+          test "$WAIT_RLS_ADMIN_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
+          pnpm --filter @jobcopilot/worker exec node - <<'NODE'
+          const { Client } = require("pg")
+          const admin = new Client({ connectionString: process.env.WAIT_RLS_ADMIN_URL })
+          async function main() {
+            await admin.connect()
+            try {
+              const existing = await admin.query("SELECT 1 FROM pg_database WHERE datname = $1", ["applymate_wait_rls_ci"])
+              if (existing.rowCount !== 0) throw new Error("Expected a fresh task wait RLS disposable database")
+              await admin.query('CREATE DATABASE "applymate_wait_rls_ci"')
+            } finally {
+              await admin.end()
+            }
+          }
+          main().catch(error => { console.error(error); process.exitCode = 1 })
+          NODE
+      - name: Migrate the isolated task wait RLS database
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_wait_rls_ci
+        run: pnpm --filter @jobcopilot/web exec prisma migrate deploy --schema prisma/schema.prisma
+      - name: Install scoped candidate RLS fixture for the task wait route
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_wait_rls_ci
+        run: |
+          test "$DATABASE_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_wait_rls_ci"
+          pnpm --filter @jobcopilot/worker exec node - <<'NODE'
+          const { readFileSync } = require("node:fs")
+          const { Client } = require("pg")
+          const { resolve } = require("node:path")
+          const root = process.env.GITHUB_WORKSPACE
+          const enableSql = readFileSync(resolve(root, "apps/web/prisma/rls/enable.sql"), "utf8")
+          const grantsSql = readFileSync(resolve(root, "apps/web/prisma/rls/role-grants.sql"), "utf8")
+          const routeTables = ["agent_sessions", "agent_turns", "agent_steps", "sub_agent_tasks"]
+          function extractUnique(source, pattern, description) {
+            const matches = [...source.matchAll(pattern)]
+            if (matches.length !== 1) throw new Error(`Expected exactly one ${description}; found ${matches.length}`)
+            return matches[0][0]
+          }
+          function escapeRegex(value) {
+            return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+          }
+          const currentUserFunction = extractUnique(enableSql,
+            /^CREATE OR REPLACE FUNCTION app_current_user_id\(\)\r?\n[\s\S]*?\$\$;/gm,
+            "app_current_user_id function in enable.sql")
+          const userRls = extractUnique(enableSql,
+            /^ALTER TABLE "User" ENABLE ROW LEVEL SECURITY;$/gm,
+            "User RLS activation in enable.sql")
+          const userPolicy = extractUnique(enableSql,
+            /^DROP POLICY IF EXISTS candidate_user_isolation ON "User";\r?\nCREATE POLICY candidate_user_isolation ON "User"[\s\S]*?;/gm,
+            "candidate_user_isolation policy in enable.sql")
+          const tableRls = routeTables.map(table => extractUnique(enableSql,
+            new RegExp(`^ALTER TABLE \"${table}\" ENABLE ROW LEVEL SECURITY;$`, "gm"),
+            `${table} RLS activation in enable.sql`))
+          const policies = routeTables.map((table, index) => {
+            const policyName = ["candidate_agent_session_isolation", "candidate_agent_turn_isolation", "candidate_agent_step_isolation", "candidate_sub_agent_task_isolation"][index]
+            return extractUnique(enableSql,
+              new RegExp(`^DROP POLICY IF EXISTS ${policyName} ON \"${table}\";\\r?\\nCREATE POLICY ${policyName} ON \"${table}\"[\\s\\S]*?;`, "gm"),
+              `${policyName} policy in enable.sql`)
+          })
+          const roleDefinition = extractUnique(grantsSql,
+            /^DO \$\$\r?\nBEGIN\r?\n  IF NOT EXISTS \(SELECT 1 FROM pg_roles WHERE rolname = 'applymate_candidate'\) THEN[\s\S]*?^END \$\$;/gm,
+            "applymate_candidate role definition in role-grants.sql")
+          if (!roleDefinition.includes("CREATE ROLE applymate_candidate NOLOGIN NOSUPERUSER") || !roleDefinition.includes("NOBYPASSRLS")) {
+            throw new Error("Candidate role definition must remain NOLOGIN, NOSUPERUSER, and NOBYPASSRLS")
+          }
+          function extractGrantLine(grant, description) {
+            return extractUnique(grantsSql, new RegExp(`^${escapeRegex(grant)}$`, "gm"), `${description} in role-grants.sql`)
+          }
+          const roleMembership = extractGrantLine("GRANT applymate_candidate TO CURRENT_USER;", "candidate role membership grant")
+          const schemaUsage = extractGrantLine("GRANT USAGE ON SCHEMA public TO applymate_candidate;", "candidate schema usage grant")
+          const functionExecute = extractGrantLine("GRANT EXECUTE ON FUNCTION app_current_user_id() TO applymate_candidate;", "candidate function execute grant")
+          const waitSelect = extractGrantLine("GRANT SELECT ON TABLE \"agent_wait_conditions\" TO applymate_candidate;", "wait table SELECT grant")
+          const broadGrant = extractUnique(grantsSql,
+            /^GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE[\s\S]*?^TO applymate_candidate;$/gm,
+            "candidate broad table grant in role-grants.sql")
+          for (const table of routeTables) {
+            if (!broadGrant.includes(`\"${table}\"`)) throw new Error(`role-grants.sql broad grant must include ${table}`)
+          }
+          if (!broadGrant.includes("\"User\"")) throw new Error("role-grants.sql broad grant must include User for authenticated route lookup")
+          if (broadGrant.includes("\"agent_wait_conditions\"")) throw new Error("Wait table must remain outside the candidate broad grant")
+          const client = new Client({ connectionString: process.env.DATABASE_URL })
+          async function main() {
+            await client.connect()
+            try {
+              await client.query("BEGIN")
+              await client.query("SELECT set_config('app.applymate_enable_rls', 'on', true)")
+              await client.query(currentUserFunction)
+              await client.query(userRls)
+              for (const statement of tableRls) await client.query(statement)
+              await client.query(userPolicy)
+              for (const policy of policies) await client.query(policy)
+              await client.query("COMMIT")
+              await client.query(roleDefinition)
+              await client.query(roleMembership)
+              await client.query(schemaUsage)
+              await client.query(functionExecute)
+              await client.query('GRANT SELECT ON TABLE "User" TO applymate_candidate')
+              for (const table of routeTables) await client.query(`GRANT SELECT ON TABLE \"${table}\" TO applymate_candidate`)
+              await client.query(waitSelect)
+
+              const role = await client.query("SELECT rolcanlogin, rolsuper, rolbypassrls FROM pg_roles WHERE rolname = 'applymate_candidate'")
+              if (role.rowCount !== 1 || role.rows[0].rolcanlogin || role.rows[0].rolsuper || role.rows[0].rolbypassrls) {
+                throw new Error("Expected a real NOLOGIN, NOSUPERUSER, NOBYPASSRLS candidate role")
+              }
+              const rlsTables = ["User", ...routeTables, "agent_wait_conditions"]
+              const rlsState = await client.query(`
+                SELECT c.relname, c.relrowsecurity
+                FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = 'public' AND c.relname = ANY($1::text[])
+              `, [rlsTables])
+              if (rlsState.rowCount !== rlsTables.length || rlsState.rows.some(row => !row.relrowsecurity)) {
+                throw new Error("Expected RLS enabled on the User auth table, four route tables, and migration-owned wait table")
+              }
+              const userPolicyState = await client.query(`
+                SELECT policyname, qual, with_check FROM pg_policies
+                WHERE schemaname = 'public' AND tablename = 'User'
+                  AND policyname = 'candidate_user_isolation'
+              `)
+              if (userPolicyState.rowCount !== 1
+                || !userPolicyState.rows[0].qual.includes("app_current_user_id")
+                || !userPolicyState.rows[0].with_check.includes("app_current_user_id")) {
+                throw new Error("Expected the actual tenant-isolation policy on the User auth table")
+              }
+              const waitPolicy = await client.query(`
+                SELECT policyname, qual, with_check FROM pg_policies
+                WHERE schemaname = 'public' AND tablename = 'agent_wait_conditions'
+                  AND policyname = 'agent_wait_condition_user_isolation'
+              `)
+              if (waitPolicy.rowCount !== 1 || !waitPolicy.rows[0].qual.includes("app.user_id") || !waitPolicy.rows[0].with_check.includes("app.user_id")) {
+                throw new Error("Expected the migration-owned tenant policy on agent_wait_conditions")
+              }
+              const privileges = await client.query(`
+                SELECT name, has_table_privilege('applymate_candidate', format('public.%I', name), 'SELECT') AS can_select,
+                  has_table_privilege('applymate_candidate', format('public.%I', name), 'INSERT') AS can_insert,
+                  has_table_privilege('applymate_candidate', format('public.%I', name), 'UPDATE') AS can_update,
+                  has_table_privilege('applymate_candidate', format('public.%I', name), 'DELETE') AS can_delete
+                FROM unnest($1::text[]) AS name
+              `, [rlsTables])
+              if (privileges.rowCount !== rlsTables.length || privileges.rows.some(row =>
+                !row.can_select || row.can_insert || row.can_update || row.can_delete)) {
+                throw new Error("Scoped route fixture requires SELECT-only candidate privileges on its six read/auth tables")
+              }
+              console.log("Installed scoped authenticated task-wait route RLS fixture; this does not validate the complete enable.sql or role-grants.sql rollout.")
+            } catch (error) {
+              await client.query("ROLLBACK").catch(() => undefined)
+              throw error
+            } finally {
+              await client.end()
+            }
+          }
+          main().catch(error => { console.error(error); process.exitCode = 1 })
+          NODE
+      - name: Verify authenticated task wait projection on disposable PostgreSQL
+        env:
+          CI: "true"
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+          RLS_RUNTIME_MODE: "off"
+        run: |
+          test "$CI" = "true"
+          test "$DATABASE_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "$DATABASE_URL"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          pnpm --filter @jobcopilot/web exec vitest run --no-file-parallelism "src/app/api/agent/sessions/[id]/tasks/[taskId]/waits/route.pg.integration.test.ts"
+      - name: Verify authenticated task wait projection under scoped candidate RLS fixture
+        env:
+          CI: "true"
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_wait_rls_ci
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+          AGENT_WAIT_RLS_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_wait_rls_ci
+          AGENT_WAIT_RLS_ADMIN_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_wait_rls_ci
+          RLS_RUNTIME_MODE: "on"
+          RLS_CANDIDATE_ROLE: applymate_candidate
+        run: |
+          test "$CI" = "true"
+          test "$DATABASE_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_wait_rls_ci"
+          test "$AGENT_WAIT_RLS_DATABASE_URL" = "$DATABASE_URL"
+          test "$AGENT_WAIT_RLS_ADMIN_URL" = "$DATABASE_URL"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          test "$RLS_RUNTIME_MODE" = "on"
+          test "$RLS_CANDIDATE_ROLE" = "applymate_candidate"
+          pnpm --filter @jobcopilot/web exec vitest run --no-file-parallelism "src/app/api/agent/sessions/[id]/tasks/[taskId]/waits/route.pg.integration.test.ts"
       - name: Verify PersonaFact Web consent writes on disposable PostgreSQL
         env:
           CI: "true"
@@ -182,8 +377,6 @@ jobs:
           test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
           test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
           pnpm --filter @jobcopilot/web exec vitest run src/lib/persona-facts.pg.integration.test.ts
-      - name: Build Worker workspace before focused test
-        run: pnpm turbo build --filter=@jobcopilot/worker
       - name: Verify TaskGraph child deadline terminalization on disposable PostgreSQL and Redis
         env:
           CI: "true"
@@ -547,6 +740,8 @@ jobs:
           AGENT_PLAN_LEDGER_TRACE_ARTIFACT_PATH: ${{ runner.temp }}/task-graph-plan-ledger.json
           AGENT_INTERACTIVE_DISCOVERY_TRACE_ARTIFACT_PATH: ${{ runner.temp }}/interactive-discovery-trace.json
         run: pnpm exec playwright test e2e/agent-task-graph-plan.spec.ts
+      - name: Verify durable child wait details in the mounted Workbench
+        run: pnpm exec playwright test e2e/agent-supervisor.spec.ts --grep "durable child wait details"
       - name: Verify production Turn dispatch on disposable Redis/BullMQ
         env:
           RUN_AGENT_TURN_REDIS_INTEGRATION: "1"
