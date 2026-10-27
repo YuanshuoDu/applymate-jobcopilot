@@ -16,11 +16,13 @@ export type SessionControlRecoveryReport = {
   failed: number
 }
 
-/** Finds bounded, event-backed pause/resume transitions without holding locks during reconciliation. */
+/** Finds bounded, event-backed pause/resume transitions and claims them without holding locks during reconciliation. */
 export async function reconcilePendingSessionControls(pool: LeasePool): Promise<SessionControlRecoveryReport> {
   const client = await pool.connect()
-  let candidates: Candidate[]
+  let candidates: Candidate[] = []
+  let claimCommitted = false
   try {
+    await client.query("BEGIN")
     const result = await client.query<Candidate>(
       `SELECT session."userId", session."id" AS "sessionId", control."turnId", session."status"
        FROM "agent_sessions" AS session
@@ -46,11 +48,30 @@ export async function reconcilePendingSessionControls(pool: LeasePool): Promise<
          LIMIT 1
        ) AS control ON TRUE
        WHERE session."status" IN ('pausing', 'resuming')
-       ORDER BY session."updatedAt" ASC, session."id" ASC
-       LIMIT $1`,
+       ORDER BY COALESCE(session."sessionControlRecoveryAttemptedAt", session."createdAt"), session."id"
+       LIMIT $1
+       FOR UPDATE OF session SKIP LOCKED`,
       [SESSION_CONTROL_RECOVERY_MAX_BATCH],
     )
     candidates = result.rows
+
+    if (candidates.length > 0) {
+      const claimed = await client.query(
+        `UPDATE "agent_sessions"
+         SET "sessionControlRecoveryAttemptedAt" = NOW()
+         WHERE "id" = ANY($1::text[])`,
+        [candidates.map(candidate => candidate.sessionId)],
+      )
+      if ((claimed.rowCount ?? 0) !== candidates.length) {
+        throw new Error("session_control_recovery_claim_conflict")
+      }
+    }
+
+    await client.query("COMMIT")
+    claimCommitted = true
+  } catch (error: unknown) {
+    if (!claimCommitted) await client.query("ROLLBACK").catch(() => undefined)
+    throw error
   } finally {
     client.release()
   }
