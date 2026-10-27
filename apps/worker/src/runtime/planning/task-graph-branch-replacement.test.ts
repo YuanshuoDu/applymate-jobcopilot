@@ -22,6 +22,14 @@ const analystVerification = {
     { id: "finding-count", check: { kind: "finding_count_gte" as const, minimum: 1 } },
   ],
 }
+const analystUnionVerification = (dependencyNodeKeys: readonly string[]) => ({
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
+  role: "analyst" as const,
+  criteria: [
+    { id: "from-scout-union", check: { kind: "findings_from_scout_union" as const, dependencyNodeKeys: [...dependencyNodeKeys] } },
+    { id: "finding-count", check: { kind: "finding_count_gte" as const, minimum: 1 } },
+  ],
+})
 
 function node(input: Readonly<{
   key: string; taskId?: string; templateId?: string; dependsOn?: readonly string[]
@@ -137,6 +145,21 @@ describe("TaskGraph branch replacement contract", () => {
     const changedEdge = proposal({ nodes: [candidate.nodes[0]!, { ...candidate.nodes[1]!, dependsOn: ["scout-new"] }] })
     expect(validateTaskGraphBranchReplacement({ snapshot: current, replaceBranch: branch(), proposal: changedEdge }))
       .toEqual({ ok: false, code: "task_graph_branch_replacement_contract_mismatch" })
+  })
+
+  it("remaps only internal keys in a union selector and preserves external keys and order", () => {
+    const original = baseSnapshot()
+    const current = { ...original, nodes: original.nodes.map(node => node.key === "analyst-old"
+      ? { ...node, verification: analystUnionVerification(["scout-old", "foundation"]) } : node) }
+    const base = proposal()
+    const candidate = proposal({ nodes: [base.nodes[0]!, { ...base.nodes[1]!,
+      verification: analystUnionVerification(["scout-new", "foundation"]) }] })
+    const result = validateTaskGraphBranchReplacement({ snapshot: current, replaceBranch: branch(), proposal: candidate })
+    expect(result).toMatchObject({ ok: true })
+    if (!result.ok) return
+    expect(result.value.replacementNodes[1]?.verification?.criteria[0]?.check).toEqual({
+      kind: "findings_from_scout_union", dependencyNodeKeys: ["scout-new", "foundation"],
+    })
   })
 
   it("rejects all repair lineage touching the replaced closure", () => {

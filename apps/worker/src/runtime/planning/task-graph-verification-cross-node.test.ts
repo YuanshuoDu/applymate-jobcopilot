@@ -48,6 +48,28 @@ describe("TaskGraph cross-node verification selectors", () => {
       .toBe(true)
   })
 
+  it("requires every selected union key to be a direct typed Scout and collects the sorted complete proof set", () => {
+    const unionContract: TaskGraphVerificationContract = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [
+        { id: "membership", check: { kind: "findings_from_scout_union", dependencyNodeKeys: ["scout-b", "scout-a"] } },
+        { id: "coverage", check: { kind: "findings_cover_scout_candidate_union_gte", dependencyNodeKeys: ["scout-c", "scout-a"], minimumPercent: 70 } },
+      ],
+    }
+    const unionAnalyst = (dependsOn: readonly string[]): TaskGraphVerificationDependencyGraphNode => ({
+      key: "analyst", templateId: "analyst", dependsOn, verificationDisposition: "typed", verification: unionContract,
+    })
+    expect(taskGraphVerificationDependencyNodeKeys(unionContract)).toEqual(["scout-a", "scout-b", "scout-c"])
+    expect(validateTaskGraphVerificationDependencySelectors([
+      scout("scout-a"), scout("scout-b"), scout("scout-c"), unionAnalyst(["scout-a", "scout-b", "scout-c"]),
+    ])).toBe(true)
+    expect(validateTaskGraphVerificationDependencySelectors([
+      scout("scout-a"), scout("scout-b"), scout("scout-c"), unionAnalyst(["scout-a", "scout-b"]),
+    ])).toBe(false)
+    expect(validateTaskGraphVerificationDependencySelectors([
+      scout("scout-a"), scout("scout-b"), { ...scout("scout-c"), verificationDisposition: "legacy_unverified", verification: undefined },
+      unionAnalyst(["scout-a", "scout-b", "scout-c"]),
+    ])).toBe(false)
+  })
   it("accepts zero Scout and Analyst results only when both bind the verified empty-search receipt", () => {
     const digest = "a".repeat(64)
     const scoutProjection = parseTaskGraphVerificationEvidenceProjection({
