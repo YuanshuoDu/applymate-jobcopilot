@@ -64,7 +64,14 @@ describe("agent.plan tool executor", () => {
     } as const
     const { commandPort } = setup(templates)
     const registry = new ToolRegistry([])
-    registerTaskGraphPlanningTool(registry, true, { commandPort, templates })
+    registerTaskGraphPlanningTool(registry, true, {
+      commandPort,
+      templates,
+      turnLeaseOwner: "server-worker",
+      turnLeaseVersion: 9,
+      parentLeaseOwner: "server-worker",
+      parentAttemptCount: () => 1,
+    })
     const tool = registry.list(["coordination", "canManageChildren"]).find(item => item.name === "agent.plan")
 
     expect(tool).toBeDefined()
