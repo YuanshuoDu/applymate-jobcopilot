@@ -152,6 +152,17 @@ function recordStringField(value: unknown, key: string): string | null {
   return typeof field === "string" ? field : null
 }
 
+function responseTasks(body: unknown): Array<{ id: string; status: string }> {
+  const tasks = recordField(body, "tasks")
+  if (!Array.isArray(tasks)) throw new Error("Task-list response did not contain a task array")
+  return tasks.map(task => {
+    const id = recordStringField(task, "id")
+    const status = recordStringField(task, "status")
+    if (!id || !status) throw new Error("Task-list response contained a task without an ID or status")
+    return { id, status }
+  })
+}
+
 function createParallelReadBarrier(expectations: readonly ParallelReadExpectation[], timeoutMs: number): ParallelReadBarrier {
   const expectedBySession = new Map(expectations.map(expectation => [expectation.sessionId, expectation.userId]))
   const arrived = new Set<string>()
@@ -347,7 +358,6 @@ async function createTask(input: {
     allowedActions: [],
     context: {},
     expectedOutputSchema: {},
-    result: null,
     failureReason: null,
     attemptCount: 1,
     maxAttempts: 3,
@@ -493,12 +503,18 @@ describeWithCandidateRls("authenticated task-list tenant RLS on disposable Postg
     expect(responseB.status).toBe(200)
     const bodyA = await responseA.json()
     const bodyB = await responseB.json()
-    expect(bodyA).toMatchObject({ tasks: expect.arrayContaining([
-      { id: ownerA.rootTaskId }, { id: ownerA.childTaskId },
-    ]) })
-    expect(bodyB).toMatchObject({ tasks: expect.arrayContaining([
-      { id: ownerB.rootTaskId }, { id: ownerB.childTaskId },
-    ]) })
+    const expectedTasksA = [
+      { id: ownerA.rootTaskId, status: "running" },
+      { id: ownerA.childTaskId, status: "queued" },
+    ]
+    const expectedTasksB = [
+      { id: ownerB.rootTaskId, status: "running" },
+      { id: ownerB.childTaskId, status: "queued" },
+    ]
+    expect(responseTasks(bodyA).sort((left, right) => left.id.localeCompare(right.id)))
+      .toEqual(expectedTasksA.sort((left, right) => left.id.localeCompare(right.id)))
+    expect(responseTasks(bodyB).sort((left, right) => left.id.localeCompare(right.id)))
+      .toEqual(expectedTasksB.sort((left, right) => left.id.localeCompare(right.id)))
     expect(JSON.stringify(bodyA)).not.toContain(ownerB.sessionId)
     expect(JSON.stringify(bodyA)).not.toContain(ownerB.childTaskId)
     expect(JSON.stringify(bodyB)).not.toContain(ownerA.sessionId)
