@@ -2,6 +2,7 @@ import { isDeepStrictEqual } from "node:util"
 import type pg from "pg"
 import type { SubagentLease } from "./types.js"
 import { dateValue, object, projectDurableSubagentWait, safeSubagentWaitJson } from "./durable-subagent-wait-store.js"
+import { markCanonicalSubagentWaitTargetIds } from "./subagent-wait-structural-ids.js"
 
 type Client = Pick<pg.PoolClient, "query">
 type Lease = Pick<SubagentLease, "id" | "userId" | "sessionId" | "turnId" | "rootTaskId" | "ownerId" | "attemptCount" | "leaseExpiresAt">
@@ -130,7 +131,9 @@ export async function repairStaleWaitProjection(client: Client, lease: Lease, no
     || Object.keys(input).sort().join(",") !== "idempotencyKey,mode,taskIds,timeoutMs" || input.idempotencyKey !== wait.idempotencyKey
     || input.mode !== wait.mode || input.timeoutMs !== timeoutMs || !callIds || !sameIds(callIds, ids)) return rejected("call_contract_validation")
   if (projectionMatches) return { status: "already_current" }
-  const canonical = { request, outcome }, persisted = safeSubagentWaitJson(canonical, 16_384)
+  const canonical = { request, outcome }
+  if (!markCanonicalSubagentWaitTargetIds(request, outcome, ids)) return rejected("safe_serialization_validation")
+  const persisted = safeSubagentWaitJson(canonical, 16_384)
   if (!isDeepStrictEqual(persisted, canonical)) return rejected("safe_serialization_validation")
   const updated = await client.query(`UPDATE "agent_wait_conditions" AS wait SET "result" = $1::jsonb
     WHERE wait."id" = $2 AND wait."userId" = $3 AND wait."sessionId" = $4 AND wait."turnId" = $5 AND wait."parentTaskId" = $6 AND wait."stepId" = $7

@@ -1,0 +1,104 @@
+import { Buffer } from "node:buffer"
+import { redactSensitiveText } from "@jobcopilot/shared"
+
+const MAX_RESULT_BYTES = 512
+const WAIT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const objectIds = new WeakMap<object, Map<string, string>>()
+const arrayIds = new WeakMap<object, Map<number, string>>()
+
+type WaitRequest = Readonly<{ targetTaskIds: readonly string[] }>
+type WaitOutcome = Readonly<{
+  taskIds: readonly string[]
+  matchedTaskIds: readonly string[]
+  tasks: readonly Readonly<{ taskId: string }>[]
+}>
+
+function validId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value
+}
+function validUniqueIds(values: readonly unknown[], min: number, max: number): values is readonly string[] {
+  return values.length >= min && values.length <= max && values.every(validId) && new Set(values).size === values.length
+}
+function equalAtPositions(actual: readonly string[], expected: readonly string[]): boolean {
+  return actual.length === expected.length && actual.every((value, index) => value === expected[index])
+}
+function markObjectId(owner: object, key: string, value: string): void {
+  const marked = objectIds.get(owner) ?? new Map<string, string>()
+  marked.set(key, value)
+  objectIds.set(owner, marked)
+}
+function markArrayIds(owner: object, values: readonly string[]): void {
+  arrayIds.set(owner, new Map(values.map((value, index) => [index, value])))
+}
+
+/** Preserve only a valid DB-backed wait identifier at its marked structural field. */
+export function markCanonicalSubagentWaitId(projection: object, waitId: string): boolean {
+  if (!WAIT_ID.test(waitId)) return false
+  markObjectId(projection, "waitId", waitId)
+  return true
+}
+
+/** Mark target IDs only after the caller has validated the wait, call, and scoped target rows. */
+export function markCanonicalSubagentWaitTargetIds(
+  request: WaitRequest,
+  outcome: WaitOutcome,
+  validatedTargetIds: readonly string[],
+): boolean {
+  if (!validUniqueIds(validatedTargetIds, 1, 8)
+    || !equalAtPositions(request.targetTaskIds, validatedTargetIds)
+    || !equalAtPositions(outcome.taskIds, validatedTargetIds)
+    || outcome.tasks.length !== validatedTargetIds.length
+    || !validUniqueIds(outcome.matchedTaskIds, 0, validatedTargetIds.length)
+    || outcome.matchedTaskIds.some(id => !validatedTargetIds.includes(id))) return false
+  for (let index = 0; index < validatedTargetIds.length; index += 1) {
+    const task = outcome.tasks[index]
+    if (!task || typeof task !== "object" || task.taskId !== validatedTargetIds[index]) return false
+  }
+  markArrayIds(request.targetTaskIds, validatedTargetIds)
+  markArrayIds(outcome.taskIds, validatedTargetIds)
+  markArrayIds(outcome.matchedTaskIds, outcome.matchedTaskIds)
+  outcome.tasks.forEach((task, index) => markObjectId(task, "taskId", validatedTargetIds[index]!))
+  return true
+}
+
+function isCanonicalSubagentWaitStructuralId(owner: object, key: string, value: string): boolean {
+  return objectIds.get(owner)?.get(key) === value
+}
+function isCanonicalSubagentWaitStructuralArrayId(owner: object, index: number, value: string): boolean {
+  return arrayIds.get(owner)?.get(index) === value
+}
+
+/** Redact ordinary strings while preserving only exact DB-backed IDs tagged at canonical wait positions. */
+export function safeSubagentWaitJson(value: unknown, maxBytes = MAX_RESULT_BYTES): unknown {
+  const clean = (item: unknown, seen = new Set<object>(), depth = 0, preserveStructuralId = false): unknown => {
+    if (item === null || typeof item === "boolean") return item
+    if (typeof item === "string") return preserveStructuralId ? item : redactSensitiveText(item).slice(0, 2_000)
+    if (typeof item === "number") return Number.isFinite(item) ? item : null
+    if (!item || typeof item !== "object" || depth > 12 || seen.has(item)) return "[TRUNCATED]"
+    seen.add(item)
+    try {
+      if (Array.isArray(item)) return item.slice(0, 64).map((child, index) => clean(
+        child, seen, depth + 1, typeof child === "string" && isCanonicalSubagentWaitStructuralArrayId(item, index, child),
+      ))
+      const output: Record<string, unknown> = {}
+      for (const key of Object.keys(item).sort().slice(0, 64)) {
+        if (/api.?key|secret|password|(?:access|refresh).?token|authorization/i.test(key)) continue
+        const child = (item as Record<string, unknown>)[key]
+        output[key] = clean(child, seen, depth + 1,
+          typeof child === "string" && isCanonicalSubagentWaitStructuralId(item, key, child))
+      }
+      return output
+    } finally { seen.delete(item) }
+  }
+  const normalized = clean(value)
+  const encoded = JSON.stringify(normalized)
+  if (Buffer.byteLength(encoded, "utf8") <= maxBytes) return normalized
+  const marker = { truncated: true, byteLength: Buffer.byteLength(encoded, "utf8"), preview: "" }
+  let budget = Math.max(0, maxBytes - Buffer.byteLength(JSON.stringify(marker), "utf8") - 1)
+  while (budget >= 0) {
+    marker.preview = Array.from(encoded).reduce((result, character) => Buffer.byteLength(result + character, "utf8") <= budget ? result + character : result, "")
+    if (Buffer.byteLength(JSON.stringify(marker), "utf8") <= maxBytes) return marker
+    budget -= 32
+  }
+  return { truncated: true, byteLength: marker.byteLength, preview: "" }
+}
