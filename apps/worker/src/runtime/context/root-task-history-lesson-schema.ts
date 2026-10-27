@@ -1,6 +1,7 @@
 import { TASK_GRAPH_VERIFICATION_LIMITS, type TaskGraphVerificationReasonCode } from "../planning/task-graph-verification.js"
 import { parseTaskGraphSnapshot } from "../subagents/task-graph-snapshot.js"
 import type { TaskGraphExecutionFailureCategory } from "../subagents/task-graph-failure-category.js"
+import { filterRootTaskHistoryPassedCriteriaForEmittedNodes, parseRootTaskHistoryPassedCriteria, type RootTaskHistoryPassedCriterion } from "./root-task-history-passed-criteria.js"
 
 export type RootTaskHistoryCheckDescriptor =
   | Readonly<{ role: "scout"; kind: "candidate_count_gte"; minimum: number }>
@@ -27,6 +28,7 @@ export type RootTaskHistoryNodeLesson = Readonly<{
   notCurrentEvidence: true
   nodeOrdinal: number
   criterionFailures: readonly CriterionFailure[]
+  passedCriteria?: readonly RootTaskHistoryPassedCriterion[]
   successfulRepairs?: readonly SuccessfulRepair[]
   failedRepairOf?: FailedRepairOf
   executionFailureCategory?: TaskGraphExecutionFailureCategory
@@ -146,9 +148,10 @@ export function parseRootTaskHistoryNodeLesson(value: unknown, expectedRole?: st
   const categoryShape = exactDataRecord(value, "advisoryOnly,criterionFailures,executionFailureCategory,nodeOrdinal,notCurrentEvidence,ordinalScope")
   const hasRepairs = exactDataRecord(value, "advisoryOnly,criterionFailures,nodeOrdinal,notCurrentEvidence,ordinalScope,successfulRepairs")
   const failedRepairShape = exactDataRecord(value, "advisoryOnly,criterionFailures,failedRepairOf,nodeOrdinal,notCurrentEvidence,ordinalScope")
-  const row = categoryShape ?? hasRepairs ?? failedRepairShape ?? exactDataRecord(value, "advisoryOnly,criterionFailures,nodeOrdinal,notCurrentEvidence,ordinalScope")
+  const passedShape = exactDataRecord(value, "advisoryOnly,criterionFailures,nodeOrdinal,notCurrentEvidence,ordinalScope,passedCriteria")
+  const row = categoryShape ?? hasRepairs ?? failedRepairShape ?? passedShape ?? exactDataRecord(value, "advisoryOnly,criterionFailures,nodeOrdinal,notCurrentEvidence,ordinalScope")
   if (!row || row.ordinalScope !== "source_graph_local" || row.advisoryOnly !== true || row.notCurrentEvidence !== true || !ordinal(row.nodeOrdinal)) return undefined
-  const hasExecutionFailureCategory = categoryShape !== undefined
+  const hasExecutionFailureCategory = categoryShape !== undefined, hasPassedCriteria = passedShape !== undefined
   const category = hasExecutionFailureCategory && executionFailureCategory(row.executionFailureCategory)
     ? row.executionFailureCategory : undefined
   if (hasExecutionFailureCategory && (!category || (expectedStatus !== undefined && expectedStatus !== "failed"))) return undefined
@@ -169,6 +172,9 @@ export function parseRootTaskHistoryNodeLesson(value: unknown, expectedRole?: st
     criterionFailures.push({ criterionOrdinal: item.criterionOrdinal, status: item.status,
       reasonCode: item.reasonCode as TaskGraphVerificationReasonCode, ...(check ? { check } : {}) })
   }
+  const passedCriteria = hasPassedCriteria
+    ? parseRootTaskHistoryPassedCriteria(row.passedCriteria, expectedRole, parseRootTaskHistoryCheckDescriptor) : undefined
+  if (hasPassedCriteria && (expectedStatus !== undefined && expectedStatus !== "completed" || failures.length !== 0 || !passedCriteria)) return undefined
   const successfulRepairs: SuccessfulRepair[] = []
   if (hasRepairs) {
     const repairs = safeArray(row.successfulRepairs, 1, false)
@@ -190,9 +196,9 @@ export function parseRootTaskHistoryNodeLesson(value: unknown, expectedRole?: st
       || !targets || targets.some((target, index) => !ordinal(target) || (index > 0 && Number(target) <= Number(targets[index - 1])))) return undefined
     failedRepairOf = { targetNodeOrdinal: item.targetNodeOrdinal, targetCriterionOrdinals: targets as number[], outcome: "verified_failed" }
   }
-  if (!criterionFailures.length && !successfulRepairs.length && !failedRepairOf && !category) return undefined
+  if (!criterionFailures.length && !successfulRepairs.length && !failedRepairOf && !category && !passedCriteria?.length) return undefined
   return { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: row.nodeOrdinal,
-    criterionFailures, ...(successfulRepairs.length ? { successfulRepairs } : {}),
+    criterionFailures, ...(passedCriteria?.length ? { passedCriteria } : {}), ...(successfulRepairs.length ? { successfulRepairs } : {}),
     ...(failedRepairOf ? { failedRepairOf } : {}),
     ...(category ? { executionFailureCategory: category } : {}) }
 }
@@ -220,6 +226,7 @@ export function filterRootTaskHistoryLessonsForEmittedNodes(
         || emittedNodes.has(failure.check.dependencyNodeOrdinal)) return failure
       return { criterionOrdinal: failure.criterionOrdinal, status: failure.status, reasonCode: failure.reasonCode }
     })
+    const passedCriteria = filterRootTaskHistoryPassedCriteriaForEmittedNodes(lesson.passedCriteria, emittedNodes)
     const links = lesson.successfulRepairs?.filter(link => selected.has(link.targetNodeOrdinal)
       && parsed[link.targetNodeOrdinal - 1]?.criterionFailures && link.targetCriterionOrdinals.every(target =>
         parsed[link.targetNodeOrdinal - 1]!.criterionFailures.some(failure => failure.criterionOrdinal === target))) ?? []
@@ -227,9 +234,9 @@ export function filterRootTaskHistoryLessonsForEmittedNodes(
       && lesson.failedRepairOf.targetCriterionOrdinals.every(target =>
         parsed[lesson.failedRepairOf!.targetNodeOrdinal - 1]?.criterionFailures.some(failure => failure.criterionOrdinal === target && failure.status === "failed"))
       ? { ...lesson.failedRepairOf, targetCriterionOrdinals: [...lesson.failedRepairOf.targetCriterionOrdinals] } : undefined
-    if (!criterionFailures.length && !links.length && !failedRepairOf && !lesson.executionFailureCategory) return undefined
+    if (!criterionFailures.length && !passedCriteria?.length && !links.length && !failedRepairOf && !lesson.executionFailureCategory) return undefined
     return { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
-      nodeOrdinal: lesson.nodeOrdinal, criterionFailures, ...(links.length ? { successfulRepairs: links } : {}),
+      nodeOrdinal: lesson.nodeOrdinal, criterionFailures, ...(passedCriteria?.length ? { passedCriteria } : {}), ...(links.length ? { successfulRepairs: links } : {}),
       ...(failedRepairOf ? { failedRepairOf } : {}),
       ...(lesson.executionFailureCategory ? { executionFailureCategory: lesson.executionFailureCategory } : {}) }
   })

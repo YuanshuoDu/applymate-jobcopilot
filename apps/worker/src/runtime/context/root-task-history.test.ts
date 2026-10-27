@@ -214,6 +214,28 @@ describe("root task history projection", () => {
     expect(prunedRepair?.lesson).not.toHaveProperty("failedRepairOf")
   })
 
+  it("drops a dependency pass when global node selection omits its source node", () => {
+    const newerNodes = Array.from({ length: 5 }, (_, index) => node({ key: `new-${index}`, taskId: `new-task-${index}`,
+      templateId: "unmodeled", status: "completed", failureReason: null }))
+    const scout = node({ key: "old-scout", taskId: "old-scout-task", templateId: "scout", status: "completed", failureReason: null })
+    const analysts = Array.from({ length: 3 }, (_, index) => node({ key: `old-analyst-${index}`, taskId: `old-analyst-task-${index}`,
+      templateId: "analyst", status: "completed", failureReason: null }))
+    const newer = { ...outcome("newer-node-cap", 80n, newerNodes), sourceNodeOrdinals: [1, 2, 3, 4, 5] }
+    const olderNodes = [scout, ...analysts]
+    const dependencyPass = (nodeOrdinal: number) => ({ ordinalScope: "source_graph_local" as const, advisoryOnly: true as const,
+      notCurrentEvidence: true as const, nodeOrdinal, criterionFailures: [], passedCriteria: [{ criterionOrdinal: 1,
+        status: "passed" as const, check: { role: "analyst" as const, kind: "findings_cover_scout_candidates_gte" as const,
+          dependencyNodeOrdinal: 1, minimumPercent: 75 } }] })
+    const older = { ...outcome("older-node-cap", 70n, olderNodes), sourceNodeOrdinals: [1, 2, 3, 4],
+      nodeLessons: [undefined, dependencyPass(2), dependencyPass(3), dependencyPass(4)] as const }
+    const projected = projectRootTaskHistory([older, newer])
+    const turns = (projected?.content as { turns?: Array<{ nodes: Array<{ taskKind: string; lesson?: Record<string, unknown> }> }> } | undefined)?.turns
+    expect(turns).toHaveLength(2)
+    expect(turns?.[0]?.nodes).toHaveLength(5)
+    expect(turns?.[1]?.nodes).toHaveLength(3)
+    expect(turns?.[1]?.nodes.every(item => item.taskKind === "analyst" && item.lesson === undefined)).toBe(true)
+  })
+
   it("rejects changing locality accessors before they can leak historical private fields", () => {
     const resultProjection = { schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted",
       availability: "available", role: "scout", status: "partial", candidateCount: 1, evidenceCount: 1,
@@ -372,6 +394,34 @@ describe("root task history projection", () => {
     expect(turns?.[0]?.nodes.every(item => item.lesson?.criterionFailures.length === 8)).toBe(true)
     expect(Buffer.byteLength(JSON.stringify(projected), "utf8")).toBeLessThanOrEqual(8 * 1024)
     expect(JSON.stringify(projected)).not.toContain("\"check\"")
+  })
+
+  it("prunes oversized passed-check lessons under the final cross-session byte cap", () => {
+    const criterionIds = Array.from({ length: 8 }, (_, index) => "criterion-" + (index + 1))
+    const passedReport = { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed" as const, reasonCode: "criteria_met" as const,
+      criteria: criterionIds.map(criterionId => ({ criterionId, status: "passed" as const, reasonCode: "criteria_met" as const })),
+      evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64) }
+    const nodes = Array.from({ length: 8 }, (_, index) => node({ key: "bounded-" + index, taskId: "bounded-task-" + index,
+      templateId: "analyst", status: "completed", failureReason: null, verificationCriterionIds: criterionIds, verificationReport: passedReport }))
+    const lessons = nodes.map((_, index) => ({ ordinalScope: "source_graph_local" as const, advisoryOnly: true as const,
+      notCurrentEvidence: true as const, nodeOrdinal: index + 1, criterionFailures: [], passedCriteria: criterionIds.map((__, criterionIndex) => ({
+        criterionOrdinal: criterionIndex + 1, status: "passed" as const,
+        check: { role: "analyst" as const, kind: "reported_score_gte" as const, minimumScore: 10, minimumFindings: 8, aggregation: "all" as const },
+      })) }))
+    const source = { ...outcome("large-cross-session", 19n, nodes), terminalAt: new Date("2026-10-07T11:00:00.000Z"), sourceSessionDiffers: true,
+      sourceNodeOrdinals: nodes.map((_, index) => index + 1), nodeLessons: lessons }
+    const projected = projectRootTaskHistory([source], true)
+    const turns = (projected?.content as { turns?: Array<{ nodes: Array<{ lesson?: { nodeOrdinal: number; passedCriteria: unknown[] } }> }> } | undefined)?.turns
+    const retained = turns?.[0]?.nodes.flatMap(item => item.lesson ? [item.lesson] : []) ?? []
+
+    expect(turns?.[0]?.nodes).toHaveLength(8)
+    expect(retained.length).toBeGreaterThan(0)
+    expect(retained.length).toBeLessThan(8)
+    expect(retained.every(lesson => lesson.passedCriteria.length > 0)).toBe(true)
+    expect(Buffer.byteLength(JSON.stringify(projected), "utf8")).toBeLessThanOrEqual(8 * 1024)
+    expect(JSON.stringify(projected)).not.toContain("criterion-")
+    expect(JSON.stringify(projected)).not.toContain("evidenceDigest")
+    expect(JSON.stringify(projected)).not.toContain("resultDigest")
   })
 
   it("keeps repair ordinals local to each emitted historical outcome", () => {

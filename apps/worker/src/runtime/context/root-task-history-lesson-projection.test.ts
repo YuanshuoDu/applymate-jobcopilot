@@ -158,8 +158,9 @@ function reportedOutputFixture(): LoadedGraph {
     summary: "private summary" }
   const task = loaded.tasks.get(node.taskId)!, taskReport = report("passed")
   const result = { finalItemId: "private-final-id", finalText: "private text", status: "completed", stepCount: 1,
-    structuredResult, toolCallCount: 1, taskGraphVerificationReport: taskReport }
-  const tasks = new Map(loaded.tasks).set(node.taskId, { ...task, status: "completed", failureReason: null, result })
+    structuredResult, toolCallCount: 1, taskGraphVerificationReport: { ...taskReport,
+      resultDigest: taskGraphResultDigest(validateRoleResult(structuredResult, "scout")) } }
+  const tasks = new Map(loaded.tasks).set(node.taskId, { ...task, status: "completed", failureReason: null, attemptCount: 1, result })
   const statuses = new Map([...tasks].map(([id, row]) => [id, { status: row.status, failureReason: row.failureReason }] as const))
   const state = taskGraphState(loaded.snapshot!, 7, statuses, [])
   return { ...loaded, tasks, state: { ...state, repairSatisfiedNodeKeys: [], repairPendingNodeKeys: [] } }
@@ -315,7 +316,7 @@ describe("root history ordinal lessons", () => {
     expect(projectLoadedRootTaskHistoryGraph({ ...loaded, item: null })).toBeUndefined()
   })
 
-  it("keeps same-session details by default and limits historical-only projections to failures and repairs", () => {
+  it("keeps same-session details by default and sanitizes cross-session history", () => {
     const { loaded } = fixture(), standard = projectLoadedRootTaskHistoryGraph(loaded)
     const historical = projectLoadedRootTaskHistoryGraph(loaded, true)
     expect(standard?.nodeLessons?.[0]?.criterionFailures[0]?.check).toEqual({ role: "scout", kind: "candidate_count_gte", minimum: 2 })
@@ -332,6 +333,12 @@ describe("root history ordinal lessons", () => {
 
     const reported = reportedOutputFixture()
     expect(projectLoadedRootTaskHistoryGraph(reported)?.reportedOutputs).toEqual([{ role: "scout", candidateCount: 5, resultStatus: "partial" }])
+    expect(projectLoadedRootTaskHistoryGraph(reported)?.nodeLessons?.[0]?.passedCriteria).toEqual([
+      { criterionOrdinal: 1, status: "passed", check: { role: "scout", kind: "candidate_count_gte", minimum: 2 } },
+      { criterionOrdinal: 2, status: "passed", check: { role: "scout", kind: "candidate_count_gte", minimum: 3 } },
+    ])
+    expect(projectLoadedRootTaskHistoryGraph(reported, true)?.nodeLessons?.[0]?.passedCriteria)
+      .toEqual(projectLoadedRootTaskHistoryGraph(reported)?.nodeLessons?.[0]?.passedCriteria)
     expect(projectLoadedRootTaskHistoryGraph(reported, true)?.reportedOutputs).toBeUndefined()
 
     const categorized = executionFailureFixture("child_turn_missing")
@@ -342,7 +349,7 @@ describe("root history ordinal lessons", () => {
     const loaded = reportedOutputFixture(), projection = projectLoadedRootTaskHistoryGraph(loaded)
     expect(projection?.sourceNodeOrdinals).toEqual([1])
     expect(projection?.reportedOutputs).toEqual([{ role: "scout", candidateCount: 5, resultStatus: "partial" }])
-    expect(projection?.nodeLessons).toBeUndefined()
+    expect(projection?.nodeLessons?.[0]?.passedCriteria?.map(({ criterionOrdinal }) => criterionOrdinal)).toEqual([1, 2])
     expect(JSON.stringify(projection?.reportedOutputs)).not.toContain("job-")
     expect(JSON.stringify(projection?.reportedOutputs)).not.toContain("private text")
   })
@@ -377,6 +384,18 @@ describe("root history ordinal lessons", () => {
       notCurrentEvidence: true, nodeOrdinal: 1, criterionFailures: [], executionFailureCategory: "execution_setup_unavailable" })).toBeUndefined()
   })
 
+  it("reconstructs only closed passed criteria for cross-session history", () => {
+    const check = { role: "analyst", kind: "findings_cover_scout_candidates_gte", dependencyNodeOrdinal: 1, minimumPercent: 75 } as const
+    const lesson = { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 2,
+      criterionFailures: [], passedCriteria: [{ criterionOrdinal: 1, status: "passed", check }] }
+    expect(sanitizeRootTaskHistoryNodeLessonForCrossSession(lesson)).toEqual(lesson)
+    expect(sanitizeRootTaskHistoryNodeLessonForCrossSession({ ...lesson, passedCriteria: [{ ...lesson.passedCriteria[0]!, privateId: "secret" }] }))
+      .toBeUndefined()
+    expect(sanitizeRootTaskHistoryNodeLessonForCrossSession({ ...lesson, criterionFailures: [
+      { criterionOrdinal: 2, status: "failed", reasonCode: "criterion_not_met" },
+    ] })).toBeUndefined()
+  })
+
   it("retains source ordinals through selection and drops links when target evidence is absent", () => {
     const { loaded, graph } = fixture(), facts = deriveRootTaskHistoryLessonFacts(loaded, graph)
     expect(filterRootTaskHistoryLessonsForEmittedNodes(facts, [1, 2])).toEqual(facts)
@@ -384,6 +403,13 @@ describe("root history ordinal lessons", () => {
     const targetWithoutCriterion = [{ ...facts[0]!, criterionFailures: facts[0]!.criterionFailures.filter(item => item.criterionOrdinal === 1) }, facts[1]]
     const pruned = filterRootTaskHistoryLessonsForEmittedNodes(targetWithoutCriterion, [1, 2])
     expect(pruned[1]?.successfulRepairs).toBeUndefined()
+    const dependentPass = { ordinalScope: "source_graph_local" as const, advisoryOnly: true as const,
+      notCurrentEvidence: true as const, nodeOrdinal: 2, criterionFailures: [], passedCriteria: [{ criterionOrdinal: 1,
+        status: "passed" as const, check: { role: "analyst" as const, kind: "findings_cover_scout_candidates_gte" as const,
+          dependencyNodeOrdinal: 1, minimumPercent: 75 } }] }
+    expect(filterRootTaskHistoryLessonsForEmittedNodes([undefined, dependentPass], [2], [2]))
+      .toEqual([undefined, undefined])
+    expect(filterRootTaskHistoryLessonsForEmittedNodes([undefined, dependentPass], [2], [1, 2])[1]).toEqual(dependentPass)
     expect(filterRootTaskHistoryLessonsForEmittedNodes(facts, [1, 1])).toEqual([undefined, undefined])
   })
 
