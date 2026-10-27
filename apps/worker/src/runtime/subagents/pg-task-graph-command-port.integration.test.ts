@@ -716,6 +716,7 @@ async function prepareTypedSupersession(pool: PgPool, commandPool: PgPool, roleN
   const initialInput: TaskGraphScheduleInput = { ...scheduledInput, proposal: { ...scheduledInput.proposal, nodes: initialNodes },
     ...(rootSuccessCriteria ? { rootSuccessCriteria } : {}), templates: {
     ...scheduledInput.templates, analyst: analystTemplate,
+    ...(options.initialScheduledScoutCount !== undefined ? { scout: TASK_GRAPH_TEMPLATES.scout } : {}),
   } }
   const initialPlanInput: TaskGraphScheduleInput = { ...initialInput, scope: { ...initialInput.scope, stepId: value.originStepId } }
   const command = createPgTaskGraphCommandPort(restrictedTransactionPool(commandPool, roleName, value.userId))
