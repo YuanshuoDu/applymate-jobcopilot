@@ -995,7 +995,9 @@ test('durable child wait details revalidate in the mounted mocked supervisor fix
   expect(fixture.maxActiveWaitRequests).toBe(1)
 
   const clockNow = await page.evaluate(() => Date.now())
-  await page.clock.pauseAt(clockNow)
+  // pauseAt advances to its target asynchronously; give the live page clock a
+  // small lead so the target is still in the future when Playwright applies it.
+  await page.clock.pauseAt(clockNow + 1_000)
   const beforeDeadline = fixture.waitQueryCount
   await page.clock.fastForward(5_000)
   await expect(waitCard).toContainText(copy.due)
