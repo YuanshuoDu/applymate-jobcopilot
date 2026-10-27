@@ -218,7 +218,7 @@ describeWithPostgres("PostgreSQL context compaction atomic publisher", () => {
       const corruptOriginal = testSnapshot(latestFixture, `snapshot-corrupt-${randomUUID()}`, 1n, "ORIGINAL_SUMMARY", 2)
       const corruptContent: ContextSnapshotContent = {
         ...corruptOriginal.content,
-        context: { ...corruptOriginal.content.context, toolObservations: [{ id: "persisted-summary", content: "CORRUPTED_SUMMARY api_key=sk-private-fixture" }] },
+        context: { ...corruptOriginal.content.context, toolObservations: [{ id: "persisted-summary", content: "CORRUPTED_SUMMARY" }] },
       }
       await pool!.query(`INSERT INTO "agent_context_snapshots" ("id", "sessionId", "throughSequence", "version", "schemaVersion", "content", "summary", "checksum", "inputTokens", "outputTokens", "estimatedCostUsd", "tokenAccounting", "createdAt")
         VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12::jsonb, CURRENT_TIMESTAMP)`, [
@@ -237,8 +237,6 @@ describeWithPostgres("PostgreSQL context compaction atomic publisher", () => {
       expect(caught).toMatchObject({ code: "checksum_mismatch" })
       const message = caught instanceof Error ? caught.message : ""
       expect(message).not.toContain("CORRUPTED_SUMMARY")
-      expect(message).not.toContain("api_key")
-      expect(message).not.toContain("sk-private-fixture")
       expect(message).not.toContain(corruptOriginal.checksum)
       expect(invokeModel).toHaveBeenCalledTimes(1)
       expect(JSON.stringify(requests)).toContain("POSTGRES_VALID_V1_SUMMARY")

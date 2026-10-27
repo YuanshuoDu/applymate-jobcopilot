@@ -233,39 +233,46 @@ describe("loadCanonicalTurnState", () => {
       context: { system: [], profile: [], steerHistory: [], toolObservations: [{ id: "observation-1", content: "Original summary" }] },
       tokenAccounting: { profiles: [], totalInputTokens: 0, totalOutputTokens: 0, totalCostUsd: 0 },
     }
-    const validRow = persistedSnapshotRow("snapshot-corrupt", originalContent)
-    const corruptContent = {
-      ...(validRow.content as Record<string, unknown>),
-      context: { system: [], profile: [], steerHistory: [], toolObservations: [{ id: "observation-1", content: "CORRUPTED_SUMMARY api_key=sk-snapshot-private" }] },
-    }
-    const corruptRow = { ...validRow, content: corruptContent }
+    const originalRow = persistedSnapshotRow("snapshot-corrupt", originalContent)
+    const corruptions = [
+      { observation: "CORRUPTED_SUMMARY", code: "checksum_mismatch" },
+      { observation: "CORRUPTED_SUMMARY api_key=sk-snapshot-private", code: "invalid_input" },
+    ] as const
 
     for (const pinned of [true, false]) {
-      const alternate = persistedSnapshotRow(pinned ? "snapshot-newer-valid" : "snapshot-older-valid", {
-        ...originalContent,
-        throughSequence: pinned ? "9" : "7",
-        context: { ...originalContent.context, toolObservations: [{ id: "alternate", content: "Valid fallback must not be used" }] },
-      })
-      const snapshots = pinned ? [corruptRow, alternate] : [alternate, corruptRow]
-      const fake = pool({
-        turn: { input: { goal: "Continue" }, rootTaskId: null, contextSnapshotId: pinned ? "snapshot-corrupt" : null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
-        snapshots,
-      })
-      let caught: unknown
-      try {
-        await loadCanonicalTurnState(fake, lease)
-      } catch (error: unknown) {
-        caught = error
-      }
+      for (const corruption of corruptions) {
+        const corruptContent = {
+          ...(originalRow.content as Record<string, unknown>),
+          context: { system: [], profile: [], steerHistory: [], toolObservations: [{ id: "observation-1", content: corruption.observation }] },
+        }
+        const corruptRow = { ...originalRow, content: corruptContent }
+        const alternate = persistedSnapshotRow(pinned ? "snapshot-newer-valid" : "snapshot-older-valid", {
+          ...originalContent,
+          throughSequence: pinned ? "9" : "7",
+          context: { ...originalContent.context, toolObservations: [{ id: "alternate", content: "Valid fallback must not be used" }] },
+        })
+        const snapshots = pinned ? [corruptRow, alternate] : [alternate, corruptRow]
+        const fake = pool({
+          turn: { input: { goal: "Continue" }, rootTaskId: null, contextSnapshotId: pinned ? "snapshot-corrupt" : null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+          snapshots,
+        })
+        let caught: unknown
+        try {
+          await loadCanonicalTurnState(fake, lease)
+        } catch (error: unknown) {
+          caught = error
+        }
 
-      expect(caught).toBeInstanceOf(ContextSnapshotError)
-      expect(caught).toMatchObject({ code: "checksum_mismatch" })
-      const message = caught instanceof Error ? caught.message : ""
-      expect(message).not.toContain("CORRUPTED_SUMMARY")
-      expect(message).not.toContain("sk-snapshot-private")
-      expect(message).not.toContain(validRow.checksum)
-      expect(fake.client.query.mock.calls.filter(([sql]) => typeof sql === "string" && sql.includes('FROM "agent_context_snapshots"'))).toHaveLength(1)
-      expect(fake.client.query.mock.calls.at(-1)?.[0]).toBe("ROLLBACK")
+        expect(caught).toBeInstanceOf(ContextSnapshotError)
+        expect(caught).toMatchObject({ code: corruption.code })
+        const message = caught instanceof Error ? caught.message : ""
+        expect(message).not.toContain("CORRUPTED_SUMMARY")
+        expect(message).not.toContain("api_key")
+        expect(message).not.toContain("sk-snapshot-private")
+        expect(message).not.toContain(originalRow.checksum)
+        expect(fake.client.query.mock.calls.filter(([sql]) => typeof sql === "string" && sql.includes('FROM "agent_context_snapshots"'))).toHaveLength(1)
+        expect(fake.client.query.mock.calls.at(-1)?.[0]).toBe("ROLLBACK")
+      }
     }
   })
 
