@@ -682,13 +682,21 @@ async function taskGraphRootSurface(
   taskGraphPlanningEnabled = true,
   emitToolCall = true,
   scheduledAutomation = false,
-  boundaryOptions: Readonly<{
+  objectiveProgressOrBoundaryOptions?: Readonly<{
+    graph: TaskGraphCurrentState
+    templates: Readonly<Record<string, TaskGraphTaskTemplate>>
+  }> | Readonly<{
     enabled?: boolean
     runner?: NonNullable<CanonicalTurnRuntimeOptions["turnBoundaryCompactionRunner"]>
     stateLoader?: NonNullable<CanonicalTurnRuntimeOptions["stateLoader"]>
     modelRuntimeFactory?: NonNullable<CanonicalTurnRuntimeOptions["modelRuntimeFactory"]>
-  }> = {},
+  }>,
+  requestCapture?: HarnessModelRequest[],
 ) {
+  const objectiveProgressFixture = objectiveProgressOrBoundaryOptions && "graph" in objectiveProgressOrBoundaryOptions
+    ? objectiveProgressOrBoundaryOptions : undefined
+  const boundaryOptions = objectiveProgressOrBoundaryOptions && "graph" in objectiveProgressOrBoundaryOptions
+    ? {} : objectiveProgressOrBoundaryOptions ?? {}
   const requests: HarnessModelRequest[] = []
   const events: RuntimeEvent[] = []
   const contexts: StepContext[] = []
@@ -711,7 +719,7 @@ async function taskGraphRootSurface(
   const taskGraphCommandPort = {
     appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
     appendAndScheduleWithReconciliation: vi.fn(async (_input: TaskGraphScheduleInput) => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
-    readCurrent: vi.fn(async () => ({ revision: 0, nodes: [] })),
+    readCurrent: vi.fn(async () => objectiveProgressFixture?.graph ?? ({ revision: 0, nodes: [] })),
   }
   const persistedTurnInput = scheduledAutomation ? {
     automationRunMode: "scheduled",
@@ -729,12 +737,12 @@ async function taskGraphRootSurface(
       ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
     }),
     taskGraphCommandPort: taskGraphCommandPort as never,
-    taskGraphTemplates: interactiveDiscovery || scheduledAutomation ? {
+    taskGraphTemplates: objectiveProgressFixture?.templates ?? (interactiveDiscovery || scheduledAutomation ? {
       scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
       analyst: { role: "analyst", taskType: "job_analysis", allowedActions: ["jobs.get"] },
       writer: { role: "writer", taskType: "cover_letter_draft", allowedActions: ["cover_letter.draft"] },
       reviewer: { role: "reviewer", taskType: "cover_letter_review", allowedActions: ["artifact.review"] },
-    } : { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search", "jobs.get", "jobs.discover", "tool_results.read"] } },
+    } : { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search", "jobs.get", "jobs.discover", "tool_results.read"] } }),
     selectedJobPreparationLoader: async () => selectedJob ? { jobId: "job-1" } : undefined,
     stateLoader: boundaryOptions.stateLoader ?? (async () => ({
       ...state(scheduledAutomation ? { source: "automation", automationRunMode: "scheduled", contextSnapshotPinned: false }
@@ -775,6 +783,7 @@ async function taskGraphRootSurface(
       ...model(() => []),
       async *stream(request: HarnessModelRequest) {
         requests.push(request)
+        requestCapture?.push(request)
         if (requests.length === 1 && !recoverHiddenMutation && emitToolCall) {
           yield { type: "tool_call_completed", callId: "forged-call", name: forgedToolName, arguments: { jobId: "job-other" } }
           yield { type: "completed", finishReason: "tool_calls" }
@@ -2864,6 +2873,59 @@ describe("createCanonicalTurnRuntime", () => {
         expect(plan).toBeUndefined()
       }
     }
+  })
+
+  it("includes the advisory progress packet in the actual Root request for a valid structured objective", async () => {
+    const turnInput = { input: { goal: "Find jobs", verificationRequirements: {
+      schemaVersion: "agent-harness.v2.objective-requirements.v1",
+      requirements: [{ id: "candidate-total", check: { kind: "candidate_count_gte", minimum: 2 } }],
+    } } }
+    const graph: TaskGraphCurrentState = { revision: 3, nodes: [{
+      key: "scout", taskId: "scout-task", templateId: "scout", goal: "Find roles", successCriteria: ["Find relevant roles"],
+      dependsOn: [], status: "completed", readiness: "terminal", resultSummary: null, failureReason: null,
+      verificationCriterionIds: ["candidate-total"], verification: {
+        schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+        criteria: [{ id: "candidate-total", check: { kind: "candidate_count_gte", minimum: 2 } }],
+      }, verificationReport: {
+        verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
+        criteria: [{ criterionId: "candidate-total", status: "passed", reasonCode: "criteria_met" }],
+        evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64),
+      },
+    }] }
+    const surface = await taskGraphRootSurface(false, false, "", "agent.interrupt", false, turnInput, true, false, false, {
+      graph, templates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+    })
+    const requestText = surface.requests[0]?.messages.flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n") ?? ""
+
+    expect(requestText).toContain('"kind":"canonical_objective_verification_requirements"')
+    expect(requestText).toContain(`"schemaVersion":"agent-harness.v2.objective-progress.v1"`)
+    expect(requestText).toContain('"id":"candidate-total","kind":"candidate_count_gte","minimum":2,"status":"reported_passed"')
+    expect(surface.taskGraphCommandPort.appendAndScheduleWithReconciliation).not.toHaveBeenCalled()
+  })
+
+  it("rejects an active built-in role mismatch before creating a Root model request", async () => {
+    const turnInput = { input: { goal: "Find jobs", verificationRequirements: {
+      schemaVersion: "agent-harness.v2.objective-requirements.v1",
+      requirements: [{ id: "candidate-total", check: { kind: "candidate_count_gte", minimum: 2 } }],
+    } } }
+    const graph: TaskGraphCurrentState = { revision: 3, nodes: [{
+      key: "scout", taskId: "scout-task", templateId: "scout", goal: "Find roles", successCriteria: ["Find relevant roles"],
+      dependsOn: [], status: "completed", readiness: "terminal", resultSummary: null, failureReason: null,
+      verificationCriterionIds: ["candidate-total"], verification: {
+        schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+        criteria: [{ id: "candidate-total", check: { kind: "candidate_count_gte", minimum: 2 } }],
+      }, verificationReport: {
+        verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
+        criteria: [{ criterionId: "candidate-total", status: "passed", reasonCode: "criteria_met" }],
+        evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64),
+      },
+    }] }
+    const requests: HarnessModelRequest[] = []
+    await expect(taskGraphRootSurface(false, false, "", "agent.interrupt", false, turnInput, true, false, false, {
+      graph, templates: { scout: { role: "analyst", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+    }, requests)).rejects.toThrow("task_graph_verification_template_role_mismatch")
+    expect(requests).toHaveLength(0)
   })
 
   it("preserves the prose-only root surface for absent or invalid requirements", async () => {
