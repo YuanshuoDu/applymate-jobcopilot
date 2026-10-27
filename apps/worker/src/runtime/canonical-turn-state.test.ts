@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest"
 
 import { loadCanonicalTurnState } from "./canonical-turn-state.js"
 import { sha256Hex } from "./context/context-compaction-canonical.js"
+import { snapshotChecksum } from "./context/context-snapshot-canonical.js"
+import { CONTEXT_SNAPSHOT_SCHEMA_VERSION, ContextSnapshotError, type ContextSnapshotContent } from "./context/context-snapshot-types.js"
 import { projectSelectedJobMemory } from "./context/selected-job-memory.js"
 import { contextToModelMessages } from "./turns/turn-engine-messages.js"
 import { STEERING_MARKER_EVENT_TYPE, steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "./context/steering-marker.js"
@@ -24,6 +26,27 @@ import { TURN_QUESTION_PLANNING_EVENT_TYPE, TURN_QUESTION_PLANNING_SCHEMA_VERSIO
 const lease = {
   turnId: "turn-1", sessionId: "session-1", ownerId: "worker-1", userId: "user-1", leaseVersion: 1,
   leaseStartedAt: new Date("2026-09-09T00:00:00.000Z"), leaseExpiresAt: new Date("2026-09-10T00:01:00.000Z"),
+}
+
+function persistedSnapshotRow(id: string, value: unknown, version = 1, cursor?: string) {
+  const content = value as ContextSnapshotContent
+  const throughSequence = cursor ?? content.throughSequence
+  const base = { sessionId: content.sessionId, throughSequence: BigInt(throughSequence), version, content }
+  return {
+    id,
+    sessionId: base.sessionId,
+    throughSequence,
+    version,
+    schemaVersion: CONTEXT_SNAPSHOT_SCHEMA_VERSION,
+    content,
+    summary: "Test snapshot summary",
+    checksum: snapshotChecksum(base),
+    inputTokens: content.tokenAccounting.totalInputTokens,
+    outputTokens: content.tokenAccounting.totalOutputTokens,
+    estimatedCostUsd: content.tokenAccounting.totalCostUsd.toFixed(8),
+    tokenAccounting: content.tokenAccounting,
+    createdAt: new Date("2026-10-27T00:00:00.000Z"),
+  }
 }
 
 const markerPayload = (kind: "observed" | "applied" = "observed"): SteeringMarkerPayload => ({
@@ -96,7 +119,11 @@ function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unk
       const snapshots = rows.snapshots ?? []
       const selected = sql.includes('WHERE snapshot."id" = $1')
         ? snapshots.filter(snapshot => snapshot.id === values?.[0])
-        : snapshots
+        : [...snapshots].sort((left, right) => {
+          const leftSequence = BigInt(String(left.throughSequence))
+          const rightSequence = BigInt(String(right.throughSequence))
+          return leftSequence > rightSequence ? -1 : leftSequence < rightSequence ? 1 : Number(right.version ?? 0) - Number(left.version ?? 0)
+        }).slice(0, 1)
       return { rows: selected, rowCount: selected.length }
     }
     if (sql.includes('FROM "agent_inputs"')) {
@@ -172,6 +199,76 @@ describe("loadCanonicalTurnState", () => {
     }
   })
 
+  it("restores complete pinned and latest legacy v1 rows without compaction metadata", async () => {
+    for (const pinned of [true, false]) {
+      const content = {
+        schemaVersion: CONTEXT_SNAPSHOT_SCHEMA_VERSION, ownerId: "user-1", sessionId: "session-1", throughSequence: "4", goal: "Continue",
+        userConstraints: [], confirmedDecisions: [], completedWork: [], openWork: [], pendingApprovals: [], artifacts: [], facts: [], failedAttempts: [],
+        references: [], consumedInputIds: [],
+        context: { system: [], profile: [], steerHistory: [], toolObservations: [{ id: "legacy-observation", content: "LEGACY_V1_SUMMARY" }] },
+        tokenAccounting: { profiles: [], totalInputTokens: 0, totalOutputTokens: 0, totalCostUsd: 0 },
+      }
+      const fake = pool({
+        turn: { input: { goal: "Continue" }, rootTaskId: null, contextSnapshotId: pinned ? "snapshot-v1" : null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+        snapshots: [persistedSnapshotRow("snapshot-v1", content)],
+      })
+
+      const restored = await loadCanonicalTurnState(fake, lease)
+
+      expect(restored.contextSnapshotPinned).toBe(pinned)
+      expect(restored.snapshot.toolObservations).toEqual([{ id: "legacy-observation", content: "LEGACY_V1_SUMMARY" }])
+      const snapshotQuery = fake.client.query.mock.calls.find(([sql]) => typeof sql === "string" && sql.includes('FROM "agent_context_snapshots"'))?.[0]
+      expect(snapshotQuery).toContain('snapshot."checksum" AS "checksum"')
+      expect(snapshotQuery).toContain('snapshot."tokenAccounting" AS "tokenAccounting"')
+      if (pinned) expect(snapshotQuery).toContain('WHERE snapshot."id" = $1')
+      else expect(snapshotQuery).toContain('ORDER BY snapshot."throughSequence" DESC, snapshot."version" DESC LIMIT 1')
+    }
+  })
+
+  it("fails closed on the selected corrupt pinned or latest full row without fallback or leaking row data", async () => {
+    const originalContent = {
+      schemaVersion: CONTEXT_SNAPSHOT_SCHEMA_VERSION, ownerId: "user-1", sessionId: "session-1", throughSequence: "8", goal: "Continue",
+      userConstraints: [], confirmedDecisions: [], completedWork: [], openWork: [], pendingApprovals: [], artifacts: [], facts: [], failedAttempts: [],
+      references: [], consumedInputIds: [],
+      context: { system: [], profile: [], steerHistory: [], toolObservations: [{ id: "observation-1", content: "Original summary" }] },
+      tokenAccounting: { profiles: [], totalInputTokens: 0, totalOutputTokens: 0, totalCostUsd: 0 },
+    }
+    const validRow = persistedSnapshotRow("snapshot-corrupt", originalContent)
+    const corruptContent = {
+      ...(validRow.content as Record<string, unknown>),
+      context: { system: [], profile: [], steerHistory: [], toolObservations: [{ id: "observation-1", content: "CORRUPTED_SUMMARY api_key=sk-snapshot-private" }] },
+    }
+    const corruptRow = { ...validRow, content: corruptContent }
+
+    for (const pinned of [true, false]) {
+      const alternate = persistedSnapshotRow(pinned ? "snapshot-newer-valid" : "snapshot-older-valid", {
+        ...originalContent,
+        throughSequence: pinned ? "9" : "7",
+        context: { ...originalContent.context, toolObservations: [{ id: "alternate", content: "Valid fallback must not be used" }] },
+      })
+      const snapshots = pinned ? [corruptRow, alternate] : [alternate, corruptRow]
+      const fake = pool({
+        turn: { input: { goal: "Continue" }, rootTaskId: null, contextSnapshotId: pinned ? "snapshot-corrupt" : null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
+        snapshots,
+      })
+      let caught: unknown
+      try {
+        await loadCanonicalTurnState(fake, lease)
+      } catch (error: unknown) {
+        caught = error
+      }
+
+      expect(caught).toBeInstanceOf(ContextSnapshotError)
+      expect(caught).toMatchObject({ code: "checksum_mismatch" })
+      const message = caught instanceof Error ? caught.message : ""
+      expect(message).not.toContain("CORRUPTED_SUMMARY")
+      expect(message).not.toContain("sk-snapshot-private")
+      expect(message).not.toContain(validRow.checksum)
+      expect(fake.client.query.mock.calls.filter(([sql]) => typeof sql === "string" && sql.includes('FROM "agent_context_snapshots"'))).toHaveLength(1)
+      expect(fake.client.query.mock.calls.at(-1)?.[0]).toBe("ROLLBACK")
+    }
+  })
+
   it("keeps answered Q/A beside exact-goal historical verifier advice across reload", async () => {
     const control = nativeHistoryControl()
     const content: InputContentPart[] = [{ type: "text", text: "Find jobs" }]
@@ -203,7 +300,7 @@ describe("loadCanonicalTurnState", () => {
           type: "question.answered", actor: "user", sequence: "11", correlationId: "current-wait", causationId: "current-question",
           payload: { waitKind: "question", waitId: "current-wait", itemId: "current-question", turnId: "turn-1", toolCallId: "current-call", status: "answered" } },
       ],
-      snapshots: [{ id: "snapshot-1", throughSequence: "4", version: 1, content: snapshot }],
+      snapshots: [persistedSnapshotRow("snapshot-1", snapshot)],
       nativeRoots: [{ goal: "Find jobs", successCriteria: ["Use verified job facts"] }],
       historyTurns: [{ id: "history-turn", rootTaskId: "history-root", startedSequence: "3", currentStartedSequence: "5", createdAt: new Date("2026-10-06T09:00:00.000Z") }], nativeControls: [control],
     }
@@ -220,7 +317,7 @@ describe("loadCanonicalTurnState", () => {
     ])
     const advice = first.snapshot.steerHistory.find(item => item.id.startsWith("native-verification-advisory:"))!
     const persisted = { ...snapshot, context: { ...snapshot.context, steerHistory: [...first.snapshot.steerHistory, { ...advice, id: "native-verification-advisory:1" }].sort((left, right) => left.id.localeCompare(right.id)) } }
-    const reloaded = await loadCanonicalTurnState(pool({ ...options, snapshots: [{ id: "snapshot-1", throughSequence: "4", version: 2, content: persisted }] }), lease)
+    const reloaded = await loadCanonicalTurnState(pool({ ...options, snapshots: [persistedSnapshotRow("snapshot-1", persisted, 2)] }), lease)
     expect(reloaded.snapshot.steerHistory.filter(item => item.id.startsWith("native-verification-advisory:"))).toHaveLength(1)
     expect(reloaded.snapshot.steerHistory).toEqual([
       ordinary,
@@ -236,7 +333,7 @@ describe("loadCanonicalTurnState", () => {
       const steerHistory: ContextHistoryEntry[] = persisted.context.steerHistory.map(entry =>
         entry.id === collision.id ? { ...entry, content: collision.content } : entry)
       const changedSnapshot = { ...persisted, context: { ...persisted.context, steerHistory } }
-      await expect(loadCanonicalTurnState(pool({ ...options, snapshots: [{ id: "snapshot-1", throughSequence: "4", version: 2, content: changedSnapshot }] }), lease))
+      await expect(loadCanonicalTurnState(pool({ ...options, snapshots: [persistedSnapshotRow("snapshot-1", changedSnapshot, 2)] }), lease))
         .rejects.toThrow("question_recovery_history_collision")
     }
     const claimStore: InputClaimStore = {
@@ -257,7 +354,7 @@ describe("loadCanonicalTurnState", () => {
 
     const changed = await loadCanonicalTurnState(pool({
       ...options, turn: { ...options.turn, input: { goal: "Different goal", content: [{ type: "text", text: "Different goal" }], clientMessageId: "command-2" } },
-      snapshots: [{ id: "snapshot-1", throughSequence: "4", version: 3, content: persisted }],
+      snapshots: [persistedSnapshotRow("snapshot-1", persisted, 3)],
     }), lease)
     expect(changed.snapshot.steerHistory.filter(item => item.id.startsWith("native-verification-advisory:"))).toEqual([])
 
@@ -300,7 +397,7 @@ describe("loadCanonicalTurnState", () => {
     }
     const fake = pool({
       turn: { input: { goal: "Continue search" }, rootTaskId: null, contextSnapshotId: "snapshot-1", modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
-      snapshots: [{ id: "snapshot-1", throughSequence: "7", version: 1, content: snapshot }],
+      snapshots: [persistedSnapshotRow("snapshot-1", snapshot)],
     })
 
     const restored = await loadCanonicalTurnState(fake, lease)
@@ -348,9 +445,9 @@ describe("loadCanonicalTurnState", () => {
     for (const pinned of [true, false]) {
       const fake = pool({
         turn: { input: { goal: "Continue" }, rootTaskId: null, contextSnapshotId: pinned ? "snapshot-1" : null, modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
-        snapshots: [{ id: "snapshot-1", throughSequence: "6", version: 1, content }],
+        snapshots: [persistedSnapshotRow("snapshot-1", content, 1, "6")],
       })
-      await expect(loadCanonicalTurnState(fake, lease)).rejects.toThrow("context_snapshot_sequence_mismatch")
+      await expect(loadCanonicalTurnState(fake, lease)).rejects.toMatchObject({ code: "checksum_mismatch" })
     }
   })
 
@@ -489,7 +586,7 @@ describe("loadCanonicalTurnState", () => {
         ...scenario.includedPairs.flatMap(pair => pair.history),
       ].sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0)
       const snapshotContent = { ...content, context: { ...content.context, steerHistory: snapshotHistory } }
-      const fake = pool({ ...rows, snapshots: [{ id: "snapshot-pinned", throughSequence: "20", version: 1, content: snapshotContent }] })
+      const fake = pool({ ...rows, snapshots: [persistedSnapshotRow("snapshot-pinned", snapshotContent)] })
       const value = await loadCanonicalTurnState(fake, lease)
       const pairHistory = value.snapshot.steerHistory.filter(entry => entry.id.startsWith("agent-question:"))
       const expectedAnswerOrder = answerEventOrder.flatMap(pair => pair.history)
@@ -564,7 +661,7 @@ describe("loadCanonicalTurnState", () => {
     const fake = pool({
       turn: { input: { goal: "Find roles matching my current profile" }, rootTaskId: "root-current", contextSnapshotId: "snapshot-pinned",
         modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
-      snapshots: [{ id: "snapshot-pinned", throughSequence: "7", version: 1, content: snapshot }],
+      snapshots: [persistedSnapshotRow("snapshot-pinned", snapshot)],
       priorTurns: [priorTurn], priorQuestions: [priorQuestion], priorCalls: [priorCall], priorSteps: [{ id: "prior-step", taskId: "prior-root" }],
       priorQuestionEvents: priorEvents,
     })
@@ -612,7 +709,7 @@ describe("loadCanonicalTurnState", () => {
     }
     const fake = pool({
       turn: { input: { goal: "Continue" }, rootTaskId: "root-1", contextSnapshotId: "snapshot-1", modelProfileSnapshot: {}, toolPolicySnapshot: {}, budgetSnapshot: {} },
-      questionItems: [pending], questionEvents: [], snapshots: [{ id: "snapshot-1", throughSequence: "4", content: snapshot }],
+      questionItems: [pending], questionEvents: [], snapshots: [persistedSnapshotRow("snapshot-1", snapshot)],
     })
     const value = await loadCanonicalTurnState(fake, lease)
     expect(value.snapshot.steerHistory).toEqual(history)
@@ -889,12 +986,12 @@ describe("loadCanonicalTurnState", () => {
         { id: "old-agent", turnId: "old-turn", type: "agent_message", status: "completed", content: { content: "Earlier reply" }, historyRole: "assistant", historySequence: "2" },
         { id: "new-agent", turnId: "old-turn", type: "agent_message", status: "completed", content: { text: "Current reply" }, historyRole: "assistant", historySequence: "6" },
       ],
-      snapshots: [{ throughSequence: "4", version: 2, content: {
+      snapshots: [persistedSnapshotRow("snapshot-latest", {
         schemaVersion: "agent-harness.context.v1", ownerId: "user-1", sessionId: "session-1", throughSequence: "4", goal: "Continue",
         userConstraints: [], confirmedDecisions: [], completedWork: [], openWork: [], pendingApprovals: [], artifacts: [], facts: [], failedAttempts: [], references: [], consumedInputIds: [],
         context: { system: [], profile: [], steerHistory: [{ id: "snapshot-history", content: "Compacted history" }], toolObservations: [] },
         tokenAccounting: { profiles: [], totalInputTokens: 0, totalOutputTokens: 0, totalCostUsd: 0 },
-      } }],
+      }, 2)],
     })
     const value = await loadCanonicalTurnState(fake, lease)
     expect(value.contextSnapshotPinned).toBe(false)
@@ -956,8 +1053,8 @@ describe("loadCanonicalTurnState", () => {
         { id: "after-cursor", targetTurnId: "old-turn", content: [{ type: "text", text: "Keep this" }], acceptedSequence: "5", delivery: "steer", status: "consumed", consumedByStepId: "step-after", consumedAt: new Date("2026-09-09T00:00:00.000Z"), cancelledAt: null },
       ],
       snapshots: [
-        { id: "snapshot-pinned", throughSequence: "4", version: 1, content: pinnedContent },
-        { id: "snapshot-latest", throughSequence: "8", version: 2, content: latestContent },
+        persistedSnapshotRow("snapshot-pinned", pinnedContent),
+        persistedSnapshotRow("snapshot-latest", latestContent, 2),
       ],
     })
 

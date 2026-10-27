@@ -4069,6 +4069,10 @@ describe("createCanonicalTurnRuntime", () => {
     }
     const enabledCalls = await run(resolveProductionAgentFlags({ ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1" }))
     expect(enabledCalls.some(sql => sql.includes('FROM "agent_wait_conditions"'))).toBe(true)
+    const snapshotQuery = enabledCalls.find(sql => sql.includes('FROM "agent_context_snapshots"'))
+    expect(snapshotQuery).toContain('snapshot."checksum" AS "checksum"')
+    expect(snapshotQuery).toContain('snapshot."tokenAccounting" AS "tokenAccounting"')
+    expect(snapshotQuery).toContain('ORDER BY snapshot."throughSequence" DESC, snapshot."version" DESC LIMIT 1')
     const disabledCalls = await run(resolveProductionAgentFlags())
     expect(disabledCalls.some(sql => sql.includes('FROM "agent_wait_conditions"'))).toBe(false)
   })

@@ -309,7 +309,7 @@ jobs:
           test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
           pnpm --filter @jobcopilot/web exec vitest run --no-file-parallelism src/lib/agent/control-plane/commands/task-message-service.pg.integration.test.ts
           pnpm --filter @jobcopilot/worker exec vitest run src/runtime/mailbox/attempt-bound-message-pg.integration.test.ts
-      - name: Verify context compaction snapshot publication on disposable PostgreSQL
+      - name: Verify context compaction and canonical snapshot recovery on disposable PostgreSQL
         env:
           CI: "true"
           AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
