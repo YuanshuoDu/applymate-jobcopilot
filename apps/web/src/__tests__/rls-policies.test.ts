@@ -16,8 +16,10 @@ describe('candidate RLS rollout SQL', () => {
     expect(sql).toContain('candidate_ai_usage_event_isolation')
     expect(sql).toContain('candidate_job_api_usage_event_isolation')
     expect(sql).toContain('candidate_discovery_optimization_event_isolation')
+    expect(sql).toContain('candidate_agent_session_isolation')
     expect(sql).toContain('candidate_agent_turn_isolation')
     expect(sql).toContain('candidate_agent_step_isolation')
+    expect(sql).toContain('candidate_sub_agent_task_isolation')
     expect(sql).toContain('candidate_agent_input_isolation')
     expect(sql).toContain('candidate_agent_item_isolation')
     expect(sql).toContain('candidate_agent_event_isolation')
@@ -27,7 +29,7 @@ describe('candidate RLS rollout SQL', () => {
     expect(sql).toContain('candidate_support_case_message_isolation')
   })
 
-  it('defines a non-login, non-bypass candidate role with no broad table grant', () => {
+  it('defines a non-login, non-bypass candidate role and keeps waits out of broad table grants', () => {
     const sql = readFileSync(`${rlsRoot}role-grants.sql`, 'utf8')
     expect(sql).toContain('CREATE ROLE applymate_candidate NOLOGIN NOSUPERUSER')
     expect(sql).toContain('NOBYPASSRLS')
@@ -36,7 +38,7 @@ describe('candidate RLS rollout SQL', () => {
     expect(sql).toContain('"ai_usage_events"')
     expect(sql).toContain('"job_api_usage_events"')
     expect(sql).toContain('"discovery_optimization_events"')
-    for (const table of ['"agent_turns"', '"agent_steps"', '"agent_inputs"', '"agent_items"', '"agent_events"', '"agent_outbox"', '"agent_action_reservations"']) {
+    for (const table of ['"agent_sessions"', '"agent_turns"', '"agent_steps"', '"sub_agent_tasks"', '"agent_inputs"', '"agent_items"', '"agent_events"', '"agent_outbox"', '"agent_action_reservations"']) {
       expect(sql).toContain(table)
     }
     expect(sql).toContain('GRANT SELECT ON TABLE "agent_wait_conditions" TO applymate_candidate')
@@ -45,6 +47,9 @@ describe('candidate RLS rollout SQL', () => {
     expect(broadGrantStart).toBeGreaterThanOrEqual(0)
     expect(broadGrantEnd).toBeGreaterThan(broadGrantStart)
     expect(sql.slice(broadGrantStart, broadGrantEnd)).not.toContain('"agent_wait_conditions"')
+    expect(sql.split(/\r?\n/).filter(line => line.includes('"agent_wait_conditions"'))).toEqual([
+      'GRANT SELECT ON TABLE "agent_wait_conditions" TO applymate_candidate;',
+    ])
     expect(sql).not.toContain('GRANT ALL PRIVILEGES ON ALL TABLES')
   })
 

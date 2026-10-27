@@ -4,6 +4,7 @@ const mocks = vi.hoisted(() => ({
   requireAuth: vi.fn(), transaction: vi.fn(), sessionFindFirst: vi.fn(), parentFindFirst: vi.fn(), clock: vi.fn(),
   turnFindFirst: vi.fn(), rootFindFirst: vi.fn(), stepFindFirst: vi.fn(), waitFindMany: vi.fn(), targetFindMany: vi.fn(),
 }))
+let rootTaskStatus = "running"
 
 vi.mock("@/lib/api-helpers", () => ({
   requireAuth: mocks.requireAuth,
@@ -15,7 +16,19 @@ vi.mock("@/lib/db", () => ({ db: { $transaction: mocks.transaction } }))
 const transactionClient = {
   $queryRaw: mocks.clock,
   agentSession: { findFirst: mocks.sessionFindFirst },
-  subAgentTask: { findFirst: mocks.parentFindFirst, findMany: mocks.targetFindMany },
+  subAgentTask: {
+    findFirst: async (args: { where?: { id?: unknown; status?: unknown } }) => {
+      if (args.where?.id !== "root_1") return mocks.parentFindFirst(args)
+      const root = await mocks.rootFindFirst(args)
+      const statusFilter = args.where.status
+      if (typeof statusFilter === "object" && statusFilter !== null && "notIn" in statusFilter) {
+        const excluded = (statusFilter as { notIn?: unknown }).notIn
+        if (Array.isArray(excluded) && (excluded as unknown[]).some((status: unknown) => status === rootTaskStatus)) return null
+      }
+      return root
+    },
+    findMany: mocks.targetFindMany,
+  },
   agentTurn: { findFirst: mocks.turnFindFirst },
   agentStep: { findFirst: mocks.stepFindFirst },
   agentWaitCondition: { findMany: mocks.waitFindMany },
@@ -46,6 +59,7 @@ describe("authenticated current child-wait route", () => {
   beforeEach(() => {
     vi.resetModules()
     for (const mock of Object.values(mocks)) mock.mockReset()
+    rootTaskStatus = "running"
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
     mocks.transaction.mockImplementation(async (callback: unknown) => {
       if (typeof callback !== "function") throw new Error("expected interactive transaction")
@@ -182,11 +196,17 @@ describe("authenticated current child-wait route", () => {
     if (reason === "aborted session") mocks.sessionFindFirst.mockResolvedValueOnce({ id: "session_1", status: "aborted" })
     if (reason === "archived session") mocks.sessionFindFirst.mockResolvedValueOnce({ id: "session_1", status: "archived" })
     if (reason === "terminal turn") mocks.turnFindFirst.mockResolvedValueOnce(null)
-    if (reason === "terminal root") mocks.rootFindFirst.mockResolvedValueOnce(null)
+    if (reason === "terminal root") rootTaskStatus = "completed"
     const { GET } = await import("./route")
     const response = await GET(request(), params)
     expect((await response.json()).wait).toBeNull()
     expect(mocks.waitFindMany).not.toHaveBeenCalled()
+    if (reason === "terminal root") {
+      expect(mocks.rootFindFirst).toHaveBeenCalledWith({
+        where: { id: "root_1", sessionId: "session_1", turnId: "turn_1", status: { notIn: ["completed", "failed", "interrupted", "cancelled", "closed"] } },
+        select: { id: true },
+      })
+    }
   })
 
   it("fails closed on malformed, oversized, or incomplete target sets", async () => {

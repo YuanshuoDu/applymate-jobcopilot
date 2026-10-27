@@ -181,7 +181,7 @@ async function createStep(input: {
     attempt: input.attempt,
     ordinal: input.ordinal,
     status: "waiting_for_tool",
-    inputThroughSequence: 0n,
+    inputThroughSequence: BigInt(0),
     consumedInputIds: [],
     modelProfileSnapshot: { privateSnapshot: input.secret },
   } })
