@@ -817,7 +817,7 @@ integrationDescribe("CustomAgentRole PostgreSQL migration and candidate RLS", ()
         has_insert_acl: boolean
         has_update_acl: boolean
         has_delete_acl: boolean
-      }>([
+      }>>([
         "SELECT",
         "  current_user::text AS connection_user, current_role::text AS active_role,",
         "  current_setting('search_path') AS search_path,",
