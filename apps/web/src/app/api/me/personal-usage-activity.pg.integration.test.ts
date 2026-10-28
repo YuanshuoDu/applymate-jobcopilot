@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { PrismaClient } from '@prisma/client'
 import { NextRequest, NextResponse } from 'next/server'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+import { AUDIT_ACTIVITY_PREFIX } from '@/lib/application-audit'
 
 const auth = vi.hoisted(() => ({ requireAuth: vi.fn(), pinnedFetch: vi.fn() }))
 vi.mock('@/lib/api-helpers', () => ({
@@ -38,6 +39,7 @@ const userWriter = 'owner-writer-' + suffix
 const userShared = 'owner-shared-' + suffix
 const activityIds = Array.from({ length: 14 }, (_, i) => 'activity-' + suffix + '-' + String(i).padStart(2, '0'))
 const foreignActivity = 'foreign-' + suffix
+const auditActivityIds = Array.from({ length: 14 }, (_, i) => 'audit-' + suffix + '-' + i)
 const usageIds = ['success', 'error', 'reserved', 'released', 'admin', 'probe', 'old', 'foreign'].map(name => name + '-' + suffix)
 const cache = globalThis as unknown as { prisma?: PrismaClient }
 const oldPrisma = cache.prisma
@@ -93,6 +95,9 @@ describePg('personal usage and activity handlers with disposable PostgreSQL', ()
     for (const id of activityIds) {
       await fixture.$executeRawUnsafe('INSERT INTO "Activity" (id, "userId", text, "createdAt") VALUES ($1,$2,$3,$4)', id, userA, 'same <original> text', recordedAt)
     }
+    for (const id of auditActivityIds) {
+      await fixture.$executeRawUnsafe('INSERT INTO "Activity" (id, "userId", text, "createdAt") VALUES ($1,$2,$3,$4)', id, userA, `${AUDIT_ACTIVITY_PREFIX}{"secret":"PRIVATE AUDIT"}`, new Date(recordedAt.getTime() + 1000))
+    }
     await fixture.$executeRawUnsafe('INSERT INTO "Activity" (id, "userId", text, "createdAt") VALUES ($1,$2,$3,$4)', foreignActivity, userB, 'FOREIGN PRIVATE TEXT', recordedAt)
     await fixture.$executeRawUnsafe('ALTER TABLE ai_usage_events ENABLE ROW LEVEL SECURITY')
     await fixture.$executeRawUnsafe("CREATE POLICY usage_owner ON ai_usage_events USING (user_id = current_setting('app.user_id', true))")
@@ -120,7 +125,7 @@ describePg('personal usage and activity handlers with disposable PostgreSQL', ()
     try {
       await realDb?.$disconnect()
       if (fixture && activityTableCreated) {
-        await fixture.activity.deleteMany({ where: { id: { in: [...activityIds, foreignActivity] } } })
+        await fixture.activity.deleteMany({ where: { id: { in: [...activityIds, ...auditActivityIds, foreignActivity] } } })
       }
       if (fixture && usageTableCreated) {
         await fixture.aiUsageEvent.deleteMany({ where: { OR: [{ id: { in: usageIds } }, { userId: { in: [userWriter, userShared] } }] } })
@@ -213,6 +218,8 @@ describePg('personal usage and activity handlers with disposable PostgreSQL', ()
     expect(body.ownerId).toBe(userA)
     const rows = body.items
     expect(rows.map(row => row.id)).toEqual([...activityIds].reverse().slice(0, 12))
+    expect(JSON.stringify(body)).not.toContain('PRIVATE AUDIT')
+    expect(await fixture!.activity.count({ where: { id: { in: auditActivityIds } } })).toBe(14)
     for (const row of rows) {
       expect(Object.keys(row).sort()).toEqual(['createdAt', 'id', 'text'])
       expect(row.text).toBe('same <original> text')

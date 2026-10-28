@@ -26,16 +26,20 @@ const databaseUrl = disposableUrl()
 const describePg = databaseUrl ? describe : describe.skip
 const role = 'usage_reader_' + randomUUID().replaceAll('-', '')
 let db: PrismaClient
+let candidateCreated = false
 
 describePg('personal usage with disposable PostgreSQL', () => {
   beforeAll(async () => {
     db = new PrismaClient({ datasources: { db: { url: databaseUrl! } } })
     await db.$connect()
     await db.$executeRawUnsafe('CREATE ROLE "' + role + '" NOLOGIN')
+    const candidate = await db.$queryRawUnsafe<Array<{ exists: boolean }>>("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'applymate_candidate') AS exists")
+    if (!candidate[0].exists) { await db.$executeRawUnsafe('CREATE ROLE applymate_candidate NOLOGIN'); candidateCreated = true }
   })
   afterAll(async () => {
     if (!db) return
     await db.$executeRawUnsafe('DROP ROLE IF EXISTS "' + role + '"')
+    if (candidateCreated) await db.$executeRawUnsafe('DROP ROLE applymate_candidate')
     await db.$disconnect()
   })
 
@@ -76,6 +80,44 @@ describePg('personal usage with disposable PostgreSQL', () => {
       expect(month.summary).toEqual({ calls: 4, inputTokens: 160, outputTokens: 28, totalTokens: 188 })
     }, { timeout: 30_000 })
   })
+  it('applies the actual tenant migration without exposing or modifying another owner', async () => {
+    const migration = readFileSync(join(process.cwd(), 'prisma/migrations/20261028220000_secure_personal_ai_usage/migration.sql'), 'utf8')
+    await db.$transaction(async tx => {
+      await tx.$executeRawUnsafe(`CREATE TEMP TABLE ai_usage_events (
+        id text primary key, user_id text, feature_key text not null, provider text not null, model text not null,
+        runtime text not null, status text not null, input_tokens integer not null, output_tokens integer not null,
+        created_at timestamp(3) not null
+      ) ON COMMIT DROP`)
+      await tx.$executeRawUnsafe('ALTER TABLE ai_usage_events ADD COLUMN estimated_cost_usd double precision NOT NULL DEFAULT 0, ADD COLUMN error_code text')
+      await tx.$executeRawUnsafe(migration)
+      await tx.$executeRawUnsafe(`INSERT INTO ai_usage_events VALUES
+        ('a','owner-a','agent','x','m','web','success',1,2,CURRENT_TIMESTAMP),
+        ('b','owner-b','agent','x','m','worker','success',3,4,CURRENT_TIMESTAMP),
+        ('system',NULL,'agent','x','m','admin','success',0,0,CURRENT_TIMESTAMP)`)
+      // Owner bypass remains available to trusted workers and admin operations.
+      expect((await tx.$queryRawUnsafe<Array<{count: bigint}>>('SELECT count(*) AS count FROM ai_usage_events'))[0].count).toBe(3n)
+      await tx.$executeRawUnsafe('SET LOCAL ROLE applymate_candidate')
+      expect((await tx.$queryRawUnsafe<Array<{count: bigint}>>('SELECT count(*) AS count FROM ai_usage_events'))[0].count).toBe(0n)
+      await tx.$executeRawUnsafe("SELECT set_config('app.user_id','owner-a',true)")
+      expect((await tx.$queryRawUnsafe<Array<{id: string}>>('SELECT id FROM ai_usage_events')).map(row => row.id)).toEqual(['a'])
+      await tx.$executeRawUnsafe("INSERT INTO ai_usage_events VALUES ('a2','owner-a','agent','x','m','web','success',1,2,CURRENT_TIMESTAMP)")
+      expect(await tx.$executeRawUnsafe("UPDATE ai_usage_events SET status='error' WHERE id='a2'")).toBe(1)
+      expect(await tx.$executeRawUnsafe("UPDATE ai_usage_events SET status='error' WHERE id='b'")).toBe(0)
+      for (const sql of [
+        "INSERT INTO ai_usage_events VALUES ('b2','owner-b','agent','x','m','web','success',0,0,CURRENT_TIMESTAMP)",
+        "INSERT INTO ai_usage_events VALUES ('null2',NULL,'agent','x','m','web','success',0,0,CURRENT_TIMESTAMP)",
+        "UPDATE ai_usage_events SET user_id='owner-b' WHERE id='a2'",
+        "DELETE FROM ai_usage_events WHERE id='a2'",
+      ]) {
+        await tx.$executeRawUnsafe('SAVEPOINT rejected')
+        await expect(tx.$executeRawUnsafe(sql)).rejects.toThrow()
+        await tx.$executeRawUnsafe('ROLLBACK TO SAVEPOINT rejected')
+      }
+      await tx.$executeRawUnsafe('RESET ROLE')
+      expect((await tx.$queryRawUnsafe<Array<{status:string}>>("SELECT status FROM ai_usage_events WHERE id='b'"))[0].status).toBe('success')
+    }, { timeout: 30_000 })
+  }, 40_000)
+
   it('uses UTC for future default and explicit writer timestamps in a non-UTC database session', async () => {
     const migration = readFileSync(join(process.cwd(), 'prisma/migrations/20261028143000_ai_usage_created_at_utc/migration.sql'), 'utf8')
     await db.$transaction(async tx => {
@@ -117,6 +159,10 @@ describePg('personal usage with disposable PostgreSQL', () => {
       await tx.$executeRawUnsafe(`INSERT INTO agent_steps VALUES
         ('step-1', 'turn-1', 'session-1', NULL, 1, 'streaming')`)
 
+      const migration = readFileSync(join(process.cwd(), 'prisma/migrations/20261028220000_secure_personal_ai_usage/migration.sql'), 'utf8')
+      await tx.$executeRawUnsafe(migration)
+      await tx.$executeRawUnsafe('GRANT SELECT, UPDATE ON agent_turns, agent_steps, sub_agent_tasks TO applymate_candidate')
+      await tx.$executeRawUnsafe('SET LOCAL ROLE applymate_candidate')
       // Execute broker SQL on the real transaction; this adapter does not claim independent/concurrent transactions.
       const broker: UsageBrokerDatabase = { $transaction: async <T,>(work: (query: UsageBrokerQuery) => Promise<T>) => work(tx) }
       const input: UsageAdmissionInput = {
