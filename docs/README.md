@@ -1,26 +1,34 @@
 # ApplyMate Documentation
 
-This directory keeps the maintained project documentation for ApplyMate AI.
+Use this index to get started, understand the system, operate it, or contribute.
 
-## Product and Architecture
+## Start here
 
-- [Agent Harness 2.0 Technical Design](agent-harness-v2-technical-design.md) — Codex-inspired, provider-neutral runtime design for turns, tools, subagents, context, approvals, recovery, and the job-application safety loop.
-- [Agent Harness 2.0 Development Roadmap](agent-harness-v2-development-roadmap.md) — 11 gated phases and 52 issue-ready implementation specifications with dependencies, acceptance criteria, verification, rollout, and rollback guidance.
-- [Scraping & Auto-Apply Design](scraping-autoapply-design.md) — high-level architecture for job discovery, enrichment, and auto-apply.
-- [Scraping & Auto-Apply Developer Guide](scraping-autoapply-dev-guide.md) — implementation notes for worker flows, harnesses, and ATS integrations.
-- [Scraping & Auto-Apply Roadmap](scraping-autoapply-roadmap.md) — delivery plan and remaining work for the auto-apply system.
+- [Repository overview and local quick start](../README.md#quick-start)
+- [API reference](api-reference.md) — routes, authentication, payloads, and examples.
 
-## Operations
+## Understand the system
 
-- [Auto-Apply On-Call Runbook](runbook.md) — incident response for queues, workers, CAPTCHA, rate limits, and production debugging.
-- [API Reference](api-reference.md) — API route catalogue with auth notes, payloads, responses, and curl examples.
+- [Agent Harness V2 technical design](agent-harness-v2-technical-design.md) — runtime contracts, tools, approvals, and recovery.
+- [Agent Harness V2 development roadmap](agent-harness-v2-development-roadmap.md) — implementation gates, verification, rollout, and rollback.
+- [Agent Harness 2.0 GA checklist](ga/agent-harness-2.0-checklist.md) — separates repository evidence from staging and production sign-off; pending or waived items are not approval.
+- [Discovery and auto-apply design](scraping-autoapply-design.md) — job discovery, enrichment, and ATS workflow architecture.
 
-## GitHub Workflow
+## Deploy and troubleshoot
 
-- [GitHub Collaboration](github-collaboration.md) — Claude/Codex issue and PR operating model.
-- [GitHub Labels and Protection](github-labels-and-protection.md) — label taxonomy and branch protection notes.
+- [Auto-apply deployment guide](auto-apply-deployment.md) — Web and Worker configuration and rollout checks.
+- [Auto-apply on-call runbook](runbook.md) — queue, Worker, and application incidents.
+- [Agent Harness observability runbook](observability/harness-runbook.md) — read-only investigation of Harness SLOs and traces.
+- [Agent Harness emergency runbook](runbook/agent-harness-2.0-emergency.md) — fail-closed rollback and recovery procedure.
 
-## Historical Specs
+## Contribute and get help
 
-- [Superpowers Specs](superpowers/specs) — implementation specs used during feature delivery.
-- [Superpowers Plans](superpowers/plans) — saved execution plans for larger changes.
+- [Scraping and auto-apply developer guide](scraping-autoapply-dev-guide.md) — implementation and verification notes for ATS and Worker work.
+- [GitHub collaboration guide](github-collaboration.md) — issue, branch, and pull request workflow.
+- [Contributing](../.github/CONTRIBUTING.md) — focused change and verification guidance.
+- [Support](../.github/SUPPORT.md) — public issue templates and safe report details.
+
+## Historical material
+
+- [Superpowers specs](superpowers/specs) — implementation specifications used during feature delivery.
+- [Superpowers plans](superpowers/plans) — saved plans for larger changes.
