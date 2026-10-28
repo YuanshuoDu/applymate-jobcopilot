@@ -37,6 +37,30 @@ const resolver = mode.startsWith("worker-b") ? startDurableWaitResolver(pool, { 
 let stopped = false
 
 function say(value) { process.stdout.write(`${value}\n`) }
+function boundedIds(value) {
+  return Array.isArray(value) && value.length <= 8
+    ? value.map(id => typeof id === "string" ? id.slice(0, 256) : null)
+    : null
+}
+
+function restoredWaitObservationSummary(restored, wait, pendingWait) {
+  const matches = restored.observations.filter(item => item?.content?.toolCallId === wait.toolCallId
+    && item.content.toolName === "wait_subagents")
+  if (matches.length !== 1) throw new Error("durable_child_wait_restored_observation_missing")
+  const content = matches[0].content
+  const output = content.output
+  const tasks = Array.isArray(output?.tasks) && output.tasks.length <= 8 ? output.tasks : null
+  const targetTask = tasks?.find(task => task?.taskId === ids.targetTaskId)
+  const targetFinalText = typeof targetTask?.result?.finalText === "string" ? targetTask.result.finalText.slice(0, 512) : null
+  return {
+    state: pendingWait ? "unconsumed" : "consumed",
+    inputTaskIds: boundedIds(content.input?.taskIds),
+    outputTaskIds: boundedIds(output?.taskIds),
+    matchedTaskIds: boundedIds(output?.matchedTaskIds),
+    outputTaskIdsFromTasks: tasks ? tasks.map(task => typeof task?.taskId === "string" ? task.taskId.slice(0, 256) : null) : null,
+    targetFinalText,
+  }
+}
 
 async function recoveryStateSnapshot() {
   try {
@@ -183,6 +207,7 @@ async function resumeChild(lease, crashBeforeWaitAck = false, crashAfterWaitAck 
     || restored.resume.nextOrdinal !== wait.ordinal + 1 || wait.attempt !== lease.attemptCount) {
     throw new Error("durable_child_wait_resume_projection_invalid")
   }
+  say(`WORKER_B_RESTORED_WAIT_OBSERVATION ${JSON.stringify(restoredWaitObservationSummary(restored, wait, pendingWait))}`)
   if (!pendingWait) say(`WORKER_B_CONSUMED_WAIT_RECOVERED ${JSON.stringify({ waitId: wait.waitId, stepId: wait.stepId, attempt: wait.attempt, ordinal: wait.ordinal })}`)
   const owner = executionOwnerFence({ kind: "task", lease })
   const stepId = `child-resume-step:${lease.id}:attempt:${lease.attemptCount}`

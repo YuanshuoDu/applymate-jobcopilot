@@ -7,30 +7,34 @@ const lease = {
   id: "parent-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
   ownerId: "worker-1", attemptCount: 3, leaseExpiresAt: new Date(now.getTime() + 60_000),
 }
-function fixture(options: { consumed?: boolean; nextStep?: boolean; laterOrdinals?: number[]; sourceOrdinal?: number; ownerId?: string; receiptWaitId?: string; missingResult?: boolean; callStatus?: string; callIdempotencyKey?: string; lateTerminal?: boolean; waitStatus?: "ready" | "timed_out"; mode?: string } = {}) {
+function fixture(options: { consumed?: boolean; nextStep?: boolean; laterOrdinals?: number[]; sourceOrdinal?: number; ownerId?: string; receiptWaitId?: string; missingResult?: boolean; callStatus?: string; callIdempotencyKey?: string; lateTerminal?: boolean; waitStatus?: "ready" | "timed_out"; mode?: string; targetId?: string; taskResultNote?: string; waitTargetTaskIds?: unknown; inputTaskIds?: unknown; outcomeTaskIds?: unknown; outcomeTaskId?: unknown; receiptTaskIds?: unknown; receiptTaskId?: unknown; misboundTarget?: boolean } = {}) {
   const calls: { sql: string; params: unknown[] }[] = []
   const state = { consumedAt: options.consumed ? now : null, acknowledgements: 0 }
   const waitStatus = options.waitStatus ?? "ready"
   const mode = options.mode ?? "any"
-  const targetTaskIds = options.lateTerminal ? ["child-1", "child-2"] : ["child-1"]
+  const targetId = options.targetId ?? "child-1"
+  const targetTaskIds: unknown = options.waitTargetTaskIds ?? (options.lateTerminal ? [targetId, "child-2"] : [targetId])
   const deadlineAt = new Date(now.getTime() + (waitStatus === "timed_out" ? -5_000 : 5_000))
-  const matchedTaskIds = ["child-1"]
+  const matchedTaskIds = [targetId]
+  const taskResult = options.taskResultNote ? { answer: 42, note: options.taskResultNote } : { answer: 42 }
   const snapshotTasks = [
-    { taskId: "child-1", status: "completed", role: "writer", result: { answer: 42 }, failureReason: null },
+    { taskId: options.outcomeTaskId ?? targetId, status: "completed", role: "writer", result: taskResult, failureReason: null },
     ...(options.lateTerminal ? [{ taskId: "child-2", status: "running", role: "analyst", result: null, failureReason: null }] : []),
   ]
-  const outcome = { waitId: "wait-1", status: waitStatus, taskIds: targetTaskIds, deadlineAt: deadlineAt.toISOString(), matchedTaskIds,
+  const outcome = { waitId: "wait-1", status: waitStatus, taskIds: options.outcomeTaskIds ?? targetTaskIds, deadlineAt: deadlineAt.toISOString(), matchedTaskIds,
     tasks: snapshotTasks }
   const wait = { id: "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "parent-1", stepId: "step-1",
     idempotencyKey: "wait-key", targetTaskIds, mode: "any", status: waitStatus, deadlineAt, matchedTaskIds,
     result: { request: { targetTaskIds, mode, timeoutMs: 5_000 }, outcome }, suspendedAt: now, consumedAt: state.consumedAt }
   wait.mode = mode
   const currentTargets = [
-    { id: "child-1", parentTaskId: "parent-1", rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1", status: "completed", role: "writer", result: { answer: 42 }, failureReason: null },
+    { id: targetId, parentTaskId: options.misboundTarget ? "other-parent" : "parent-1", rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1", status: "completed", role: "writer", result: taskResult, failureReason: null },
     ...(options.lateTerminal ? [{ id: "child-2", parentTaskId: "parent-1", rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1", status: "completed", role: "analyst", result: { answer: 7 }, failureReason: null }] : []),
   ]
-  const callContent = { toolCallId: "call-1", toolName: "wait_subagents", input: { idempotencyKey: options.callIdempotencyKey ?? "wait-key", taskIds: targetTaskIds, mode, timeoutMs: 5_000 } }
-  const resultContent = { toolCallId: "call-1", output: { ...outcome, status: "waiting", waitId: options.receiptWaitId ?? "wait-1", matchedTaskIds: [] }, errorCode: null }
+  const callContent = { toolCallId: "call-1", toolName: "wait_subagents", input: { idempotencyKey: options.callIdempotencyKey ?? "wait-key", taskIds: options.inputTaskIds ?? targetTaskIds, mode, timeoutMs: 5_000 } }
+  const resultContent = { toolCallId: "call-1", output: { ...outcome, taskIds: options.receiptTaskIds ?? outcome.taskIds,
+    tasks: options.receiptTaskId === undefined ? outcome.tasks : [{ ...snapshotTasks[0], taskId: options.receiptTaskId }],
+    status: "waiting", waitId: options.receiptWaitId ?? "wait-1", matchedTaskIds: [] }, errorCode: null }
   const client = {
     async query(sql: string, params: unknown[] = []) {
       calls.push({ sql, params })
@@ -73,6 +77,55 @@ describe("durable child wait resume", () => {
     })
     expect(fake.state.consumedAt).toBeNull()
     expect(fake.calls.some(call => call.sql.includes('UPDATE "agent_wait_conditions"'))).toBe(false)
+  })
+
+  it("preserves the validated phone-shaped target through unconsumed and consumed acknowledgements", async () => {
+    const targetId = "subagent-00000000-0000-4000-8000-000000000001"
+    const fake = fixture({ targetId, taskResultNote: "Contact +353 87 123 4567" })
+    const resumed = await loadDurableSubagentWaitResume(fake.pool as never, lease, now)
+
+    expect(resumed?.input).toMatchObject({ taskIds: [targetId] })
+    expect(resumed?.output).toMatchObject({ taskIds: [targetId], tasks: [{ taskId: targetId }] })
+    expect(JSON.stringify({ input: resumed?.input, output: resumed?.output })).toContain(targetId)
+    expect(JSON.stringify(resumed?.output)).not.toContain("+353 87 123 4567")
+    await expect(commitDurableSubagentWaitResume(fake.pool as never, lease,
+      { waitId: "wait-1", stepId: "step-1", nextStepOrdinal: 5, now })).resolves.toBe(true)
+
+    const alreadyConsumed = fixture({ consumed: true, targetId })
+    await expect(commitDurableSubagentWaitResume(alreadyConsumed.pool as never, lease,
+      { waitId: "wait-1", stepId: "step-1", nextStepOrdinal: 5, now })).resolves.toBe(true)
+    expect(alreadyConsumed.state.acknowledgements).toBe(0)
+  })
+
+  it("preserves permitted reordering while rejecting malformed, foreign, and misbound target IDs", async () => {
+    const reordered = fixture({ lateTerminal: true, inputTaskIds: ["child-2", "child-1"], receiptTaskIds: ["child-2", "child-1"] })
+    const resumed = await loadDurableSubagentWaitResume(reordered.pool as never, lease, now)
+    expect(resumed?.input).toMatchObject({ taskIds: ["child-2", "child-1"] })
+    expect(resumed?.output).toMatchObject({ taskIds: ["child-1", "child-2"] })
+
+    for (const waitTargetTaskIds of [[], ["child-1", "child-1"], ["child-1", 7], ["foreign-child"], ["child-1", "extra-child"]]) {
+      const invalid = fixture({ waitTargetTaskIds })
+      await expect(loadDurableSubagentWaitResume(invalid.pool as never, lease, now)).rejects.toMatchObject({ code: "wait_scope_error" })
+    }
+    const misbound = fixture({ misboundTarget: true })
+    await expect(loadDurableSubagentWaitResume(misbound.pool as never, lease, now)).rejects.toMatchObject({ code: "wait_scope_error" })
+  })
+
+  it("rejects malformed or foreign IDs in the persisted call, outcome, and receipt", async () => {
+    for (const inputTaskIds of [[], ["child-1", "child-1"], ["child-1", 9], ["foreign-child"]]) {
+      const invalid = fixture({ inputTaskIds })
+      await expect(loadDurableSubagentWaitResume(invalid.pool as never, lease, now)).rejects.toMatchObject({ code: "wait_scope_error" })
+    }
+    for (const outcomeTaskIds of [[], ["child-1", "child-1"], ["child-1", false], ["foreign-child"]]) {
+      const invalid = fixture({ outcomeTaskIds })
+      await expect(loadDurableSubagentWaitResume(invalid.pool as never, lease, now)).rejects.toMatchObject({ code: "wait_scope_error" })
+    }
+    for (const receiptTaskIds of [[], ["child-1", "child-1"], ["child-1", null], ["foreign-child"]]) {
+      const invalid = fixture({ receiptTaskIds })
+      await expect(loadDurableSubagentWaitResume(invalid.pool as never, lease, now)).rejects.toMatchObject({ code: "wait_scope_error" })
+    }
+    const malformedReceiptTask = fixture({ receiptTaskId: 12 })
+    await expect(loadDurableSubagentWaitResume(malformedReceiptTask.pool as never, lease, now)).rejects.toMatchObject({ code: "wait_scope_error" })
   })
 
   it.each(["ready", "timed_out"] as const)("keeps the persisted %s snapshot when another target becomes terminal later", async waitStatus => {

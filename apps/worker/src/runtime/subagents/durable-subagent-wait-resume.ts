@@ -1,7 +1,8 @@
 import type pg from "pg"
 
 import type { SubagentLease } from "./types.js"
-import { assertLease, dateValue, DurableSubagentWaitError, object, parseIds, safeSubagentWaitJson, type DurableSubagentWaitResult } from "./durable-subagent-wait-store.js"
+import { assertLease, dateValue, DurableSubagentWaitError, object, safeSubagentWaitJson, type DurableSubagentWaitResult } from "./durable-subagent-wait-store.js"
+import { markCanonicalSubagentWaitTargetIds } from "./subagent-wait-structural-ids.js"
 import { resolveDurableWaitOutcome } from "./child-resume-observations.js"
 
 type Queryable = Pick<pg.PoolClient, "query">
@@ -35,27 +36,34 @@ function exactTargets(ids: readonly string[], rows: readonly Row[], lease: Resum
     && rows.length === ids.length && rows.every(row => ids.includes(String(row.id)) && String(row.parentTaskId) === lease.id
       && String(row.rootTaskId) === lease.rootTaskId && String(row.turnId) === lease.turnId && String(row.sessionId) === lease.sessionId)
 }
-function sameIds(left: readonly string[], right: readonly string[]): boolean {
-  return [...left].sort().join("\u0000") === [...right].sort().join("\u0000")
+function sameIds(left: readonly string[], right: readonly string[]): boolean { return [...left].sort().join("\u0000") === [...right].sort().join("\u0000") }
+function strictIds(value: unknown, min = 1): string[] | undefined { return Array.isArray(value) && value.length >= min && value.length <= 8
+  && value.every((id: unknown): id is string => typeof id === "string" && !!id.trim() && id === id.trim() && id.length <= 256) && new Set(value).size === value.length ? value as string[] : undefined }
+function validOutcomeTargets(value: unknown, ids: readonly string[]): boolean {
+  const result = object(value), taskIds = strictIds(result.taskIds), matched = strictIds(result.matchedTaskIds, 0), tasks = Array.isArray(result.tasks) ? result.tasks : [], listed = tasks.map(task => object(task).taskId)
+  return !!taskIds && !!matched && sameIds(taskIds, ids) && matched.every(id => ids.includes(id)) && tasks.length === ids.length && listed.every((id): id is string => typeof id === "string") && sameIds(listed as string[], ids)
+}
+function markValidatedInputIds(input: Record<string, unknown>, ids: readonly string[]): void {
+  const inputIds = strictIds(input.taskIds), outcome = inputIds && { taskIds: inputIds, matchedTaskIds: [], tasks: inputIds.map(taskId => ({ taskId })) }
+  if (!inputIds || !outcome || !sameIds(inputIds, ids) || !markCanonicalSubagentWaitTargetIds({ targetTaskIds: inputIds }, outcome, inputIds)) throw new DurableSubagentWaitError("wait_scope_error", "Child wait input target IDs changed scope")
 }
 function validReceipt(content: unknown, wait: Row, ids: readonly string[], toolCallId: string): boolean {
-  const result = object(content), receipt = object(result.output)
+  const result = object(content), receipt = object(result.output), taskIds = strictIds(receipt.taskIds), matched = strictIds(receipt.matchedTaskIds, 0)
+  const tasks = Array.isArray(receipt.tasks) ? receipt.tasks : [], listed = tasks.map(task => object(task).taskId)
   if (!receipt || result.toolCallId !== toolCallId || result.errorCode !== null && result.errorCode !== undefined
-    || receipt.waitId !== wait.id || receipt.status !== "waiting"
-    || !Array.isArray(receipt.tasks) || receipt.tasks.length !== ids.length || !sameIds(parseIds(receipt.taskIds), ids)
-    || parseIds(receipt.matchedTaskIds).length !== 0) return false
-  const tasks = receipt.tasks.filter((task): task is Record<string, unknown> => !!task && typeof task === "object" && !Array.isArray(task))
-  if (tasks.length !== ids.length || !sameIds(tasks.map(task => String(task.taskId)), ids)) return false
+    || receipt.waitId !== wait.id || receipt.status !== "waiting" || !taskIds || !matched
+    || !sameIds(taskIds, ids) || matched.length !== 0 || tasks.length !== ids.length
+    || !listed.every((id): id is string => typeof id === "string") || !sameIds(listed as string[], ids)) return false
   try { return dateValue(receipt.deadlineAt, "receipt.deadlineAt").getTime() === dateValue(wait.deadlineAt, "deadlineAt").getTime() }
   catch { return false }
 }
 
 function matchingWaitCall(value: unknown, wait: Row, ids: readonly string[]): string | undefined {
-  const call = object(value), input = object(call.input), request = object(object(wait.result).request)
+  const call = object(value), input = object(call.input), request = object(object(wait.result).request), inputIds = strictIds(input.taskIds), requestIds = strictIds(request.targetTaskIds)
   const toolCallId = typeof call.toolCallId === "string" ? call.toolCallId : ""
   if (!toolCallId || call.toolName !== "wait_subagents" || input.idempotencyKey !== wait.idempotencyKey
     || input.mode !== wait.mode || request.mode !== wait.mode || Number(input.timeoutMs) !== Number(request.timeoutMs)
-    || !sameIds(parseIds(input.taskIds), ids) || !sameIds(parseIds(request.targetTaskIds), ids)) return undefined
+    || !inputIds || !requestIds || !sameIds(inputIds, ids) || !sameIds(requestIds, ids)) return undefined
   return toolCallId
 }
 
@@ -114,7 +122,8 @@ export async function loadDurableSubagentWaitResume(pool: Pool, lease: ResumeLea
     if (!(wait.mode === "any" || wait.mode === "all") || !["ready", "timed_out"].includes(String(wait.status))) {
       throw new DurableSubagentWaitError("wait_scope_error", "Child wait is unresolved or invalid")
     }
-    const ids = parseIds(wait.targetTaskIds)
+    const ids = strictIds(wait.targetTaskIds)
+    if (!ids || !validOutcomeTargets(object(object(wait.result).outcome), ids)) throw new DurableSubagentWaitError("wait_scope_error", "Child wait result target IDs changed scope")
     const targets = (await client.query<Row>(`SELECT task."id", task."parentTaskId", task."rootTaskId", task."turnId", task."sessionId", task."status", task."role", task."result", task."failureReason"
       FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
       WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4
@@ -139,6 +148,11 @@ export async function loadDurableSubagentWaitResume(pool: Pool, lease: ResumeLea
     if (!toolCallId || resultRows.length > 1 || resultRows.length === 1 && (callRows[0].callStatus !== "completed"
       || resultRows[0].status !== "completed" || !validReceipt(resultRows[0].content, wait, ids, toolCallId))) {
       throw new DurableSubagentWaitError("wait_scope_error", "Child wait tool call does not match the durable wait")
+    }
+    markValidatedInputIds(input, ids)
+    const outputIds = strictIds(outcome.taskIds)
+    if (!outputIds || !markCanonicalSubagentWaitTargetIds({ targetTaskIds: outputIds }, outcome, outputIds)) {
+      throw new DurableSubagentWaitError("wait_scope_error", "Child wait result target IDs changed scope")
     }
     const ordinal = Number(step.ordinal)
     if (!Number.isSafeInteger(ordinal) || ordinal < 0) throw new DurableSubagentWaitError("wait_scope_error", "Child wait step ordinal is invalid")
@@ -182,7 +196,8 @@ export async function commitDurableSubagentWaitResume(pool: Pool, lease: ResumeL
         AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_wait_conditions"."sessionId" AND ${OPEN_SESSION}) FOR UPDATE`,
     [input.waitId, lease.userId, lease.sessionId, lease.turnId, lease.id, input.stepId])).rows[0]
     if (!wait) throw new DurableSubagentWaitError("wait_scope_error", "Resolved child wait is unavailable")
-    const ids = parseIds(wait.targetTaskIds)
+    const ids = strictIds(wait.targetTaskIds)
+    if (!ids || !validOutcomeTargets(object(object(wait.result).outcome), ids)) throw new DurableSubagentWaitError("wait_scope_error", "Child wait result target IDs changed scope")
     const targets = (await client.query<Row>(`SELECT task."id", task."parentTaskId", task."rootTaskId", task."turnId", task."sessionId", task."status", task."role", task."result", task."failureReason"
       FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
       WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4
