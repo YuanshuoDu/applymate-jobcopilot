@@ -436,6 +436,26 @@ describe('V2 timeline stream client', () => {
     expect(JSON.stringify(live.state.itemsById[FINAL_ITEM_ID]?.content)).not.toContain('PRIVATE_TOOL_CALL_ID')
   })
 
+  it('preserves safe final text when invalid answer evidence is stripped during replay', async () => {
+    const safeText = 'Safe text. [[source:S1]]'
+    const invalidItem = finalMessageDto({
+      content: {
+        text: safeText,
+        answerEvidence: {
+          schemaVersion: 1,
+          sources: [{ key: 'S1', kind: 'job', label: 'Job', excerpt: 'Safe', raw: 'PRIVATE' }],
+        },
+      },
+    })
+    const live = await runFinalItemStream([invalidItem])
+    const finalItem = live.state.itemsById[FINAL_ITEM_ID]
+
+    expect(live.finalReplayCount).toBe(1)
+    expect(finalItem?.source).toBe('replay')
+    expect(finalItem?.content).toEqual({ text: 'Safe text. ' })
+    expect(JSON.stringify(finalItem?.content)).not.toContain('PRIVATE')
+  })
+
   it.each([
     ['id', finalMessageDto({ id: 'other-item' })],
     ['session', finalMessageDto({ sessionId: 'session-2' })],
@@ -446,7 +466,6 @@ describe('V2 timeline stream client', () => {
     ['status', finalMessageDto({ status: 'started' })],
     ['purpose', finalMessageDto({ phase: 'commentary' })],
     ['private content', finalMessageDto({ content: { text: 'Safe text', summary: 'Safe summary', rawFinal: 'PRIVATE_FINAL_RESPONSE' } })],
-    ['invalid answer evidence', finalMessageDto({ content: { text: 'Safe text', answerEvidence: { schemaVersion: 1, sources: [{ key: 'S1', kind: 'job', label: 'Job', excerpt: 'Safe', raw: 'PRIVATE' }] } } })],
     ['private envelope', finalMessageDto({ rawFinalResponse: 'PRIVATE_FINAL_RESPONSE' })],
     ['oversized summary', finalMessageDto({ content: { text: 'Safe text', summary: 'x'.repeat(1001) } })],
   ])('ignores a final-item response with invalid %s without paging', async (_reason, invalidItem) => {
