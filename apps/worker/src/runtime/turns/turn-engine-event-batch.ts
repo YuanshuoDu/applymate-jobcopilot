@@ -26,15 +26,16 @@ async function repairOutbox(client: QueryClient, expected: AgentOutboxIdentity):
     WHERE "idempotencyKey" = $1 FOR UPDATE`, [expected.idempotencyKey])
   if (!matchesAgentOutboxIdentity(existing.rows[0], expected)) throw conflict(`event outbox ${expected.idempotencyKey} identity`)
 }
-function startBoundary(input: TurnEngineEventInput): { boundary: RootTaskHistoryChronologyBoundary; boundaryEventId: string } | undefined {
+function startBoundary(input: TurnEngineEventInput): RootTaskHistoryChronologyBoundary | undefined {
   const owner = input.owner
   if (owner.kind !== "turn" || owner.taskId !== owner.rootTaskId || input.type !== "turn.started"
     || input.idempotencyKey !== `turn:${owner.turnId}:event:turn-started`) return undefined
   const payload = input.payload
-  if (input.id !== input.idempotencyKey || input.itemId !== null || input.correlationId !== owner.turnId
+  if (typeof input.id !== "string" || !input.id.trim() || input.id.trim() !== input.id
+    || input.itemId !== null || input.correlationId !== owner.turnId
     || !payload || typeof payload !== "object" || Array.isArray(payload)
     || payload.taskId !== owner.rootTaskId || payload.rootTaskId !== owner.rootTaskId) throw conflict("root turn-start boundary")
-  return { boundary: "turn_start", boundaryEventId: input.id }
+  return "turn_start"
 }
 function chronologyInput(owner: Extract<ExecutionOwnerFence, { kind: "turn" }>, boundary: RootTaskHistoryChronologyBoundary, boundaryEventId: string) {
   return { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId, boundary, boundaryEventId }
@@ -91,7 +92,7 @@ export async function appendTurnEngineEventBatch(pool: TurnEnginePool, inputs: r
             type: input.type, actor, correlationId: input.correlationId, causationId, idempotencyKey: input.idempotencyKey, payload: input.payload }))])
       }
       if (start?.input === input && owner.kind === "turn" && start.boundary) {
-        const witnessInput = chronologyInput(owner, start.boundary.boundary, start.boundary.boundaryEventId)
+        const witnessInput = chronologyInput(owner, start.boundary, eventId)
         if (created) {
           if (!chronologyLock) throw conflict("root turn-start chronology lock")
           await appendRootTaskHistoryChronologyWitness(client, witnessInput, chronologyLock)

@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import { appendTurnEngineEventBatch } from "./turn-engine-event-batch.js"
+import { TurnExecutionEventWriter } from "./turn-execution-events.js"
+import type { TurnExecutionOptions } from "./turn-execution-types.js"
 import type { TurnEngineEventInput } from "./turn-engine-types.js"
 
 const owner = { kind: "turn" as const, userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "root-1",
@@ -61,7 +63,73 @@ function fixture() {
   return { calls, client, pool, events, outboxes }
 }
 
+function defaultEventWriter(fake: ReturnType<typeof fixture>, submitted: TurnEngineEventInput[]) {
+  const appendEvent: TurnExecutionOptions["store"]["appendEvent"] = async event => {
+    const persistedInput: TurnEngineEventInput = {
+      owner: event.identity, id: event.id, itemId: event.itemId, type: event.type,
+      correlationId: event.correlationId, causationId: event.causationId,
+      idempotencyKey: event.idempotencyKey, payload: event.payload,
+    }
+    submitted.push(persistedInput)
+    const persisted = await appendTurnEngineEventBatch(fake.pool, [persistedInput])
+    const result = persisted[0]
+    if (!result) throw new Error("event batch omitted the persisted event")
+    return result
+  }
+  return new TurnExecutionEventWriter({ identity: owner, store: { appendEvent } } as unknown as TurnExecutionOptions)
+}
+
 describe("TurnEngine event batch chronology", () => {
+  it("binds a random writer start ID across first write, idempotent replay, and strict identity rejection", async () => {
+    const fake = fixture(), submitted: TurnEngineEventInput[] = []
+    const startKey = `turn:${owner.turnId}:event:turn-started`
+    const appendStart = (goal = "Find a role") => defaultEventWriter(fake, submitted).append("turn.started", owner.turnId, null,
+      { goal, taskId: owner.rootTaskId, rootTaskId: owner.rootTaskId }, "turn-started")
+
+    const firstId = await appendStart()
+    expect(submitted[0]?.id).toMatch(/^turn:turn-1:event:turn-started:[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/)
+    expect(submitted[0]?.idempotencyKey).toBe(startKey)
+    expect(firstId).toBe(submitted[0]?.id)
+    const parent = fake.events.get(startKey)
+    const witnessKey = `root-task-history-chronology-witness:turn_start:${firstId}:v1`
+    const witness = fake.events.get(witnessKey)
+    expect(parent).toMatchObject({ id: firstId, type: "turn.started", idempotencyKey: startKey })
+    expect(witness).toMatchObject({ idempotencyKey: witnessKey, causationId: firstId,
+      payload: { boundary: "turn_start", boundaryEventId: firstId } })
+    expect(fake.outboxes.get(`agent-event:${firstId}`)).toMatchObject({ payload: { eventId: firstId, idempotencyKey: startKey } })
+    expect(fake.outboxes.get(`agent-event:${String(witness?.id)}`)).toMatchObject({
+      id: `agent-outbox-${String(witness?.id)}`, payload: { eventId: witness?.id, causationId: firstId },
+    })
+    const eventInsertCount = () => fake.calls.filter(call => call.sql.includes('INSERT INTO "agent_events"')).length
+    const writesBeforeReplay = eventInsertCount()
+
+    const replayId = await appendStart()
+    expect(submitted[1]?.id).not.toBe(submitted[0]?.id)
+    expect(submitted[1]?.idempotencyKey).toBe(startKey)
+    expect(replayId).toBe(firstId)
+    expect(eventInsertCount()).toBe(writesBeforeReplay)
+    expect(fake.events.size).toBe(2)
+
+    await expect(appendStart("Changed objective")).rejects.toThrow(`event ${startKey} identity`)
+    expect(submitted[2]?.idempotencyKey).toBe(startKey)
+    expect(eventInsertCount()).toBe(writesBeforeReplay)
+    expect(fake.events.get(startKey)).toMatchObject({ id: firstId, payload: { goal: "Find a role" } })
+  })
+
+  it("rejects an empty persisted ID for the reserved root start boundary", async () => {
+    const fake = fixture()
+    await expect(appendTurnEngineEventBatch(fake.pool, [{ ...input, id: "" }])).rejects.toThrow("root turn-start boundary")
+    expect(fake.calls).toHaveLength(0)
+  })
+
+  it("rejects the canonical start key when its payload names a different Root", async () => {
+    const fake = fixture()
+    await expect(appendTurnEngineEventBatch(fake.pool, [{
+      ...input, id: `${input.id}:random-id`, payload: { goal: "Find a role", taskId: "foreign-root", rootTaskId: "foreign-root" },
+    }])).rejects.toThrow("root turn-start boundary")
+    expect(fake.calls).toHaveLength(0)
+  })
+
   it("serializes root start, writes a paired private witness, and validates replay without backfill", async () => {
     const fake = fixture()
     await expect(appendTurnEngineEventBatch(fake.pool, [input])).resolves.toEqual([{ id: input.id }])
