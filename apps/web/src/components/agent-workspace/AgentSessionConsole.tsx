@@ -9,6 +9,8 @@ import { HealthStrip } from './HealthStrip'
 import { AutomationList } from './AutomationList'
 import { SessionFocusPanel } from './SessionFocusPanel'
 import { useI18n } from '@/lib/i18n'
+import { AgentTaskHistoryMemoryConsent } from './AgentTaskHistoryMemoryConsent'
+import { EmptyText, Metric } from './AgentSessionConsoleParts'
 
 function statusColor(status: string): string {
   if (status === 'running') return 'var(--primary)'
@@ -142,6 +144,7 @@ export function AgentSessionConsole({
             {t('agent.viewAll')}
           </button>
         </div>
+        <AgentTaskHistoryMemoryConsent />
 
         <div style={{ padding: '0 10px 12px', display: 'flex', flexDirection: 'column', gap: 7 }}>
           {loading && <EmptyText>{t('agent.loadingSessions')}</EmptyText>}
@@ -239,22 +242,5 @@ export function AgentSessionConsole({
         <HealthStrip />
       </div>
     </aside>
-  )
-}
-
-function Metric({ label, value, alert = false }: { label: string; value: string; alert?: boolean }) {
-  return (
-    <div style={{ border: '1px solid var(--border)', borderRadius: 8, padding: '8px 9px', background: 'var(--bg)' }}>
-      <div style={{ fontSize: 16, lineHeight: 1, fontWeight: 750, color: alert ? '#d97706' : 'var(--text)' }}>{value}</div>
-      <div style={{ fontSize: 9, color: 'var(--text-muted)', marginTop: 4 }}>{label}</div>
-    </div>
-  )
-}
-
-function EmptyText({ children, tone = 'muted', title }: { children: React.ReactNode; tone?: 'muted' | 'error'; title?: string }) {
-  return (
-    <div title={title} style={{ padding: 12, fontSize: 11, color: tone === 'error' ? 'var(--c-danger)' : 'var(--text-muted)', lineHeight: 1.5 }}>
-      {children}
-    </div>
   )
 }

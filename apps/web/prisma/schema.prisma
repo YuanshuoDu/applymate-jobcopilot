@@ -75,6 +75,8 @@ model User {
   linkedin         String?
   github           String?
   preferences      Json? // { targetRoles, targetLocations, salaryExpectation, workAuthorization, openToRelocation, aiSettings }
+  agentTaskHistoryMemoryEnabled        Boolean @default(false)
+  agentTaskHistoryMemoryConsentVersion Int     @default(0)
   personaFields    Json? // PersonaField[] �?learned answers from form fills
   createdAt        DateTime          @default(now())
   updatedAt        DateTime          @updatedAt
