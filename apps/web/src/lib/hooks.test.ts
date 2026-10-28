@@ -44,7 +44,7 @@ function readApi<T>(url: string, options: Parameters<typeof useApi>[1] = {}) {
 function mountApi<T>(url: string, options: Parameters<typeof useApi>[1] = {}) {
   const api = readApi<T>(url, options)
   const cleanup = lifecycle.effect?.()
-  return { api, read: () => readApi<T>(url, options), cleanup: () => cleanup?.() }
+  return { api, read: () => readApi<T>(url, options), cleanup: () => { if (cleanup) cleanup() } }
 }
 
 describe('useApi response decoding', () => {
