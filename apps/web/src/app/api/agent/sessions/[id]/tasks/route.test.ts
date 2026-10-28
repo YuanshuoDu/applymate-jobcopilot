@@ -1,6 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
-const mocks = vi.hoisted(() => ({ requireAuth: vi.fn(), sessionFindFirst: vi.fn(), taskFindMany: vi.fn(), graphFindFirst: vi.fn(), graphFindMany: vi.fn() }))
+const mocks = vi.hoisted(() => {
+  const tenantContext = { userId: null as string | null }
+  return {
+    tenantContext,
+    runWithTenantContext: vi.fn(async (userId: string, callback: () => Promise<unknown>) => {
+      tenantContext.userId = userId
+      try { return await callback() } finally { tenantContext.userId = null }
+    }),
+    requireAuth: vi.fn(), sessionFindFirst: vi.fn(), taskFindMany: vi.fn(), graphFindFirst: vi.fn(), graphFindMany: vi.fn(),
+  }
+})
 
 vi.mock("@/lib/api-helpers", () => ({
   requireAuth: mocks.requireAuth,
@@ -12,6 +22,8 @@ vi.mock("@/lib/db", () => ({ db: {
   agentSession: { findFirst: mocks.sessionFindFirst }, subAgentTask: { findMany: mocks.taskFindMany }, agentItem: { findFirst: mocks.graphFindFirst, findMany: mocks.graphFindMany },
 } }))
 
+vi.mock("@/lib/db/tenant-store", () => ({ runWithTenantContext: mocks.runWithTenantContext }))
+
 const params = { params: Promise.resolve({ id: "session_1" }) }
 
 function request(path = "") {
@@ -22,6 +34,7 @@ describe("agent task query API", () => {
   beforeEach(() => {
     vi.resetModules()
     mocks.requireAuth.mockReset(); mocks.sessionFindFirst.mockReset(); mocks.taskFindMany.mockReset(); mocks.graphFindFirst.mockReset(); mocks.graphFindMany.mockReset()
+    mocks.runWithTenantContext.mockClear(); mocks.tenantContext.userId = null
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
     mocks.sessionFindFirst.mockResolvedValue({ id: "session_1" })
     mocks.graphFindFirst.mockResolvedValue(null)
@@ -57,9 +70,20 @@ describe("agent task query API", () => {
   })
 
   it("uses the authenticated owner guard and supports bounded pagination", async () => {
+    const observedTenantIds: Array<string | null> = []
+    mocks.sessionFindFirst.mockImplementationOnce(async () => {
+      observedTenantIds.push(mocks.tenantContext.userId)
+      return { id: "session_1" }
+    })
+    mocks.taskFindMany.mockImplementationOnce(async () => {
+      observedTenantIds.push(mocks.tenantContext.userId)
+      return []
+    })
     const { GET } = await import("./route")
     const response = await GET(request("?limit=10") as never, params)
     expect(response.status).toBe(200)
+    expect(mocks.runWithTenantContext).toHaveBeenCalledWith("user_1", expect.any(Function))
+    expect(observedTenantIds).toEqual(["user_1", "user_1"])
     expect(mocks.sessionFindFirst).toHaveBeenCalledWith({ where: { id: "session_1", userId: "user_1" }, select: { id: true } })
     expect(mocks.taskFindMany).toHaveBeenCalledWith(expect.objectContaining({ take: 11 }))
   })
@@ -432,15 +456,23 @@ describe("agent task query API", () => {
     const response = await GET(request(`?${ids}`) as never, params)
 
     expect(response.status).toBe(400)
+    expect(mocks.runWithTenantContext).toHaveBeenCalledWith("user_1", expect.any(Function))
+    expect(mocks.sessionFindFirst).not.toHaveBeenCalled()
     expect(mocks.taskFindMany).not.toHaveBeenCalled()
   })
 
   it("does not look up referenced rows when the session belongs to another tenant", async () => {
-    mocks.sessionFindFirst.mockResolvedValueOnce(null)
+    let sessionLookupTenantId: string | null = null
+    mocks.sessionFindFirst.mockImplementationOnce(async () => {
+      sessionLookupTenantId = mocks.tenantContext.userId
+      return null
+    })
     const { GET } = await import("./route")
     const response = await GET(request("?taskId=other_session_task") as never, params)
 
     expect(response.status).toBe(404)
+    expect(mocks.runWithTenantContext).toHaveBeenCalledWith("user_1", expect.any(Function))
+    expect(sessionLookupTenantId).toBe("user_1")
     expect(mocks.sessionFindFirst).toHaveBeenCalledWith({ where: { id: "session_1", userId: "user_1" }, select: { id: true } })
     expect(mocks.taskFindMany).not.toHaveBeenCalled()
   })
@@ -450,6 +482,8 @@ describe("agent task query API", () => {
     const { GET } = await import("./route")
     const response = await GET(request() as never, params)
     expect(response.status).toBe(401)
+    expect(mocks.runWithTenantContext).not.toHaveBeenCalled()
+    expect(mocks.sessionFindFirst).not.toHaveBeenCalled()
     expect(mocks.taskFindMany).not.toHaveBeenCalled()
   })
 })

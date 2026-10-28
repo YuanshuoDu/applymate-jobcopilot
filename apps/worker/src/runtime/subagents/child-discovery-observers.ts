@@ -1,6 +1,7 @@
 import { createChildDiscoveryAttemptCollector, type DiscoveryAttemptCollectorFence } from "./child-discovery-attempt.js"
 import type { DiscoveryAttemptLifecycleEvent } from "../tools/lifecycle.js"
 import type { JobDiscoveryExecutionFence } from "../tools/job-discover-tool.js"
+import type { ToolExecutionContext } from "../tools/types.js"
 import { turnEngineTenantTransaction, type TurnEnginePool } from "../turns/turn-engine-owner-sql.js"
 import { createChildDiscoveryRecoveryCollector } from "./child-discovery-recovery.js"
 import { parseTaskGraphSnapshot, taskGraphItemId } from "./task-graph-snapshot.js"
@@ -8,6 +9,7 @@ import type { Queryable } from "./pg-store-persistence.js"
 import type { SubagentLease, SubagentTaskRecord } from "./types.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import type { DiscoveryAttemptSidecar } from "./child-discovery-attempt.js"
+import type { DiscoveryQueryCapture } from "./child-discovery-query-footprint.js"
 import type { DiscoveryRecoverySnapshot } from "./task-graph-discovery-recovery-contract.js"
 
 const MAX_ATTEMPT_COUNT = 1_000_000
@@ -133,6 +135,7 @@ export function composeDiscoveryAttemptObservers(
 
 export async function createChildDiscoveryObservers(pool: TurnEnginePool, lease: SubagentLease, fence: DiscoveryAttemptCollectorFence): Promise<{
   observeLifecycleEvent: (event: DiscoveryAttemptLifecycleEvent) => void
+  observeEffectiveCriteria: (context: ToolExecutionContext, capture: DiscoveryQueryCapture) => void
   discoveryAttemptSidecar: () => DiscoveryAttemptSidecar | undefined
   discoveryRecoverySidecar: () => DiscoveryRecoverySnapshot | undefined
 }> {
@@ -145,6 +148,7 @@ export async function createChildDiscoveryObservers(pool: TurnEnginePool, lease:
   const observeLifecycleEvent = composeDiscoveryAttemptObservers(health.observeLifecycleEvent, recovery?.observeLifecycleEvent)
   return {
     observeLifecycleEvent,
+    observeEffectiveCriteria: health.observeEffectiveCriteria,
     discoveryAttemptSidecar: health.sidecar,
     discoveryRecoverySidecar: () => recovery?.recovery(),
   }

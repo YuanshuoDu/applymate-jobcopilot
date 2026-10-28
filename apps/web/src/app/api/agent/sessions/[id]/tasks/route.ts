@@ -3,6 +3,7 @@ import { NextRequest } from "next/server"
 import { parseTaskGraphSnapshot, projectPlanLedger, projectTaskGraphVerificationSummary } from "@jobcopilot/agent-protocol"
 
 import { db } from "@/lib/db"
+import { runWithTenantContext } from "@/lib/db/tenant-store"
 import { isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { decoratePlanLedgerRepairTargets } from "@/lib/task-graph-repair-display"
 
@@ -113,6 +114,10 @@ interface RouteContext {
 export async function GET(request: NextRequest, context: RouteContext) {
   const auth = await requireAuth(request)
   if (isErrorResponse(auth)) return auth
+  return runWithTenantContext(auth.userId, () => getTaskList(request, context, auth.userId))
+}
+
+async function getTaskList(request: NextRequest, context: RouteContext, userId: string) {
   const { id: sessionId } = await context.params
   const page = parsePageRequest(request, "tasks", sessionId)
   if (page instanceof Response) return page
@@ -124,7 +129,7 @@ export async function GET(request: NextRequest, context: RouteContext) {
     return Response.json({ error: { code: "task_graph_ids_required", message: "TaskGraph lookup requires referenced task IDs", details: {} } }, { status: 400 })
   }
 
-  const session = await db.agentSession.findFirst({ where: { id: sessionId, userId: auth.userId }, select: { id: true } })
+  const session = await db.agentSession.findFirst({ where: { id: sessionId, userId }, select: { id: true } })
   if (!session) return sessionNotFound()
 
   if (taskIds) {
