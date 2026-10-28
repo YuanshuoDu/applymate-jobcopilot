@@ -1,5 +1,5 @@
 import { schemaVersion } from "@jobcopilot/agent-protocol"
-import { projectCompletedAnswerEvidence, redactFinalAnswerText } from "@/lib/agent/session/final-answer-evidence-projection"
+import { projectCompletedAnswerEvidence, projectFinalAnswerText, redactFinalAnswerText } from "@/lib/agent/session/final-answer-evidence-projection"
 import { projectFinalSummary } from "@/lib/agent/session/final-summary-projection"
 import { projectLegacySubAgentTask } from "@/lib/agent/session/subagent-task-compat"
 import { redactTaskGraphTimelineContent } from "@/lib/task-graph-repair-display"
@@ -75,7 +75,8 @@ export function itemDto(row: ItemQueryRow) {
   else if (row.type === "agent_message") {
     const summary = projectFinalSummary(row.type, row.phase, row.status, row.content)
     const answerEvidence = projectCompletedAnswerEvidence(row.content, row.phase, row.status)
-    content = { text: displayText(row.content), ...(summary ? { summary } : {}), ...(answerEvidence ? { answerEvidence } : {}) }
+    const answerText = projectFinalAnswerText(row.content, { answerEvidence }) ?? displayText(row.content)
+    content = { text: answerText, ...(summary ? { summary } : {}), ...(answerEvidence ? { answerEvidence } : {}) }
   }
   else if (row.type === "approval_request") content = {
     waitKind: "approval",

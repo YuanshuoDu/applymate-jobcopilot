@@ -99,13 +99,14 @@ export function resolveFinalAnswerEvidenceMarkers(text: string, map: FinalAnswer
   text: string; answerEvidence?: AnswerEvidence
 } {
   const available = validatedBindings(map), selected = new Map<string, FinalAnswerEvidenceBinding>()
-  let output = text.replace(/\[\[source:([^\]]*)(?:\]\]?|$)/g, (_marker, key: string) => {
-    if (!MODEL_KEY.test(key) || !available.has(key)) return ""
-    const binding = available.get(key)!
-    if (!selected.has(key) && selected.size < ANSWER_EVIDENCE_MAX_SOURCES) selected.set(key, binding)
-    const index = [...selected.keys()].indexOf(key) + 1
-    return index ? `[[source:S${index}]]` : ""
-  })
+  let output = text.replace(/\[\[source:([^\s\]]*?)(\]\]|](?!])|(?=\s|$))/g,
+    (_marker, key: string, close: string | undefined) => {
+      if (close !== "]]" || !MODEL_KEY.test(key) || !available.has(key)) return ""
+      const binding = available.get(key)!
+      if (!selected.has(key) && selected.size < ANSWER_EVIDENCE_MAX_SOURCES) selected.set(key, binding)
+      const index = [...selected.keys()].indexOf(key) + 1
+      return index ? `[[source:S${index}]]` : ""
+    })
   const sources: AnswerEvidenceSource[] = []
   for (const binding of selected.values()) sources.push({ key: `S${sources.length + 1}`, kind: binding.kind, label: binding.label, excerpt: binding.excerpt })
   const answerEvidence = sources.length ? parseAnswerEvidence({ schemaVersion: ANSWER_EVIDENCE_SCHEMA_VERSION, sources }) : null

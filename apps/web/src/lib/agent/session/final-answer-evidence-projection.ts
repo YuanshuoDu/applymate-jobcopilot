@@ -14,6 +14,8 @@ const PRIVATE_LOCATORS = [
   /\b[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\b|\b[0-9a-f]{32,64}\b/i,
   /\bE-[a-z0-9_-]+\b|\b(?:tool[_ -]?call[_ -]?id|call[_ -]?id|source[_ -]?digest|sha256:|E[1-8])\b/i,
 ]
+const SOURCE_MARKER_START = /\[\[[ \t]*source\b[ \t]*:?/ig
+const COMPLETE_SOURCE_MARKER = /^\[\[source:(S[1-8])\]\]$/
 
 export interface FinalAnswerDisplayContent {
   text: string
@@ -59,17 +61,37 @@ export function projectFinalAnswerDisplayContent(value: unknown): FinalAnswerDis
   }
   let answerEvidence: AnswerEvidence | undefined
   if (hasEvidence) {
-    const projected = projectAnswerEvidence(content.answerEvidence)
-    if (!projected) return null
-    answerEvidence = projected
+    answerEvidence = projectAnswerEvidence(content.answerEvidence) ?? undefined
   }
-  return { text: content.text, ...(summary === undefined ? {} : { summary }), ...(answerEvidence ? { answerEvidence } : {}) }
+  const text = hasEvidence ? stripUnprojectedSourceMarkers(content.text, sourceKeys(answerEvidence)) : content.text
+  return { text, ...(summary === undefined ? {} : { summary }), ...(answerEvidence ? { answerEvidence } : {}) }
 }
 
 /** Returns citations only for a completed final-answer timeline item. */
 export function projectCompletedAnswerEvidence(value: unknown, phase: unknown, status: unknown): AnswerEvidence | undefined {
   if (phase !== 'final_answer' || status !== 'completed') return undefined
   return projectFinalAnswerContent(value)?.answerEvidence
+}
+
+/** Keeps old answer text intact unless its stored wrapper opted into source metadata. */
+export function projectFinalAnswerText(
+  value: unknown,
+  projected?: { answerEvidence?: AnswerEvidence },
+): string | undefined {
+  const wrapper = ownRecord(value)
+  const text = ownValue(wrapper, 'text')
+  if (typeof text !== 'string') return undefined
+
+  const finalValue = ownValue(wrapper, 'final')
+  const final = ownRecord(finalValue)
+  if (!hasOwnField(final, 'answerEvidence')) return redactFinalAnswerText(text)
+
+  const evidence = projected === undefined
+    ? exactOwnRecord(value, ['text', 'final']) && ownValue(final, 'response') === text
+      ? projectAnswerEvidence(ownValue(final, 'answerEvidence')) ?? undefined
+      : undefined
+    : projected.answerEvidence
+  return stripUnprojectedSourceMarkers(redactFinalAnswerText(text), sourceKeys(evidence))
 }
 
 /** Converts a persisted final wrapper to the same small display DTO used by query and SSE. */
@@ -81,11 +103,62 @@ export function projectFinalAnswerContent(value: unknown): FinalAnswerDisplayCon
 
   const summary = projectFinalSummary('agent_message', 'final_answer', 'completed', content)
   const answerEvidence = projectAnswerEvidence(ownValue(final, 'answerEvidence'))
+  const textProjection = projectFinalAnswerText(value, { answerEvidence: answerEvidence ?? undefined })
+  if (textProjection === undefined) return null
   return {
-    text: redactFinalAnswerText(text),
+    text: textProjection,
     ...(summary ? { summary } : {}),
     ...(answerEvidence ? { answerEvidence } : {}),
   }
+}
+
+function sourceKeys(evidence: AnswerEvidence | undefined): ReadonlySet<string> {
+  return new Set(evidence?.sources.map((source) => source.key) ?? [])
+}
+
+function hasOwnField(value: Record<string, unknown> | null, key: string): boolean {
+  if (!value) return false
+  try {
+    return Object.getOwnPropertyDescriptor(value, key) !== undefined
+  } catch {
+    return true
+  }
+}
+
+function stripUnprojectedSourceMarkers(text: string, allowedKeys: ReadonlySet<string>): string {
+  const output: string[] = []
+  let cursor = 0
+  let match: RegExpExecArray | null
+  SOURCE_MARKER_START.lastIndex = 0
+  while ((match = SOURCE_MARKER_START.exec(text)) !== null) {
+    const start = match.index
+    const contentStart = SOURCE_MARKER_START.lastIndex
+    output.push(text.slice(cursor, start))
+    const nextOpen = SOURCE_MARKER_START.exec(text)?.index ?? text.length
+    const lineBreak = /[\r\n]/g
+    lineBreak.lastIndex = start
+    const lineBoundary = lineBreak.exec(text)?.index ?? text.length
+    const boundary = Math.min(nextOpen, lineBoundary)
+    const close = text.indexOf(']]', contentStart)
+    if (close >= contentStart && close < boundary) {
+      const marker = text.slice(start, close + 2)
+      const canonical = COMPLETE_SOURCE_MARKER.exec(marker)
+      if (canonical && allowedKeys.has(canonical[1]!)) output.push(marker)
+      cursor = close + 2
+    } else {
+      const remainder = text.slice(contentStart, boundary)
+      const whitespace = remainder.search(/[ \t\r\n]/)
+      let end = whitespace < 0 ? boundary : contentStart + whitespace
+      const singleClose = text.indexOf(']', contentStart)
+      if (singleClose >= contentStart && singleClose < boundary && text[singleClose + 1] !== ']' && singleClose < end) {
+        end = singleClose + 1
+      }
+      cursor = Math.max(end, contentStart)
+    }
+    SOURCE_MARKER_START.lastIndex = cursor
+  }
+  output.push(text.slice(cursor))
+  return output.join('')
 }
 
 function ownRecord(value: unknown): Record<string, unknown> | null {

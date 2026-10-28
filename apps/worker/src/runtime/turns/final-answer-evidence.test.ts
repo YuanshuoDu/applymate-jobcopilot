@@ -41,6 +41,11 @@ describe("final answer evidence binding", () => {
     expect(map?.promptInstruction).not.toContain("Acme")
 
     const key = map!.bindings[0]!.key
+    const withUnrelatedObservation = buildFinalAnswerEvidenceBindingMap(
+      request([{ callId: "call-a", input: { target: "engineer" }, output: outputA }]),
+      snapshot([...snapshotValue.toolObservations, observation("unrelated-call", outputB)]), scope,
+    )
+    expect(withUnrelatedObservation?.bindings.map(item => item.key)).toEqual([key])
     const resolved = resolveFinalAnswerEvidenceMarkers(`Acme is hiring. [[source:${key}]]`, map)
     expect(resolved).toEqual({ text: "Acme is hiring. [[source:S1]]", answerEvidence: {
       schemaVersion: 1, sources: [{ key: "S1", kind: "job", label: "Job listing", excerpt: "Role: Software Engineer · Company: Acme · Location: Dublin" }],
@@ -114,13 +119,42 @@ describe("final answer evidence binding", () => {
   it("removes unknown markers and rejects a copied or hand-built binding map", () => {
     const map = buildFinalAnswerEvidenceBindingMap(request([{ callId: "call-a", input: { target: "engineer" }, output: outputA }]), snapshot([observation("call-a", outputA)]), scope)
     const key = map!.bindings[0]!.key
+    expect(resolveFinalAnswerEvidenceMarkers(`Bound [[source:${key}]] remains text.`, map)).toMatchObject({
+      text: "Bound [[source:S1]] remains text.", answerEvidence: { sources: [{ key: "S1" }] },
+    })
     expect(resolveFinalAnswerEvidenceMarkers(`No source [[source:E-${"0".repeat(64)}]] and malformed [[source:bad]]`, map))
       .toEqual({ text: "No source  and malformed " })
-    expect(resolveFinalAnswerEvidenceMarkers(`Malformed [[source:E-${"a".repeat(64)}] ordinary text stays.`, null))
-      .toEqual({ text: "Malformed  ordinary text stays." })
+    expect(resolveFinalAnswerEvidenceMarkers(`Single close [[source:${key}] ordinary text stays.`, map))
+      .toEqual({ text: "Single close  ordinary text stays." })
+    expect(resolveFinalAnswerEvidenceMarkers(`Claim [[source:bad]however this remains`, map))
+      .toEqual({ text: "Claim however this remains" })
+    expect(resolveFinalAnswerEvidenceMarkers(`Single close [[source:${key}]however ordinary text stays.`, map))
+      .toEqual({ text: "Single close however ordinary text stays." })
+    expect(resolveFinalAnswerEvidenceMarkers(`No close [[source:${key} ordinary text stays.`, map))
+      .toEqual({ text: "No close  ordinary text stays." })
+    expect(resolveFinalAnswerEvidenceMarkers(`Suffix [[source:${key}x]] after ordinary text.`, map))
+      .toEqual({ text: "Suffix  after ordinary text." })
+    expect(resolveFinalAnswerEvidenceMarkers(`Forged [[source:S1]] remains text.`, map))
+      .toEqual({ text: "Forged  remains text." })
     expect(resolveFinalAnswerEvidenceMarkers("Forged [[source:S1]]", map)).toEqual({ text: "Forged " })
     expect(resolveFinalAnswerEvidenceMarkers("Forged [[source:S1]]", null)).toEqual({ text: "Forged " })
     const copied = { ...map!, bindings: [...map!.bindings] }
     expect(resolveFinalAnswerEvidenceMarkers(`Claim [[source:${key}]]`, copied)).toEqual({ text: "Claim " })
+  })
+
+  it("maps only complete keys, preserves following prose, and deduplicates repeated sources", () => {
+    const map = buildFinalAnswerEvidenceBindingMap(request([
+      { callId: "call-a", input: { target: "engineer" }, output: outputA },
+      { callId: "call-b", input: { target: "engineer" }, output: outputB },
+    ]), snapshot([observation("call-a", outputA), observation("call-b", outputB)]), scope)
+    const keyA = map!.bindings.find(item => item.toolCallId === "call-a")!.key
+    const keyB = map!.bindings.find(item => item.toolCallId === "call-b")!.key
+    expect(resolveFinalAnswerEvidenceMarkers(`Beta [[source:${keyB}]], bad [[source:${keyA}x]] after; again [[source:${keyB}]]; Acme [[source:${keyA}]].`, map))
+      .toEqual({ text: "Beta [[source:S1]], bad  after; again [[source:S1]]; Acme [[source:S2]].", answerEvidence: {
+        schemaVersion: 1, sources: [
+          { key: "S1", kind: "job", label: "Job listing", excerpt: "Role: Software Engineer · Company: Beta · Location: Dublin" },
+          { key: "S2", kind: "job", label: "Job listing", excerpt: "Role: Software Engineer · Company: Acme · Location: Dublin" },
+        ],
+      } })
   })
 })

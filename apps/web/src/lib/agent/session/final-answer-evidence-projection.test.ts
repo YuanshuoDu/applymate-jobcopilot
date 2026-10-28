@@ -83,6 +83,80 @@ describe('final answer evidence projection', () => {
     expect(JSON.stringify(projected)).not.toMatch(/PRIVATE_TOOL_CALL|PRIVATE_GOAL|alex@example\.test|871234567/)
   })
 
+  it('preserves old answer text when the stored wrapper has no evidence field', () => {
+    const text = 'Legacy answer [[source:E-private-key]] and [[source:S9]] stays as saved.'
+    expect(projectFinalAnswerContent({ text, final: { response: text, summary: 'Old summary' } }))
+      .toEqual({ text, summary: 'Old summary' })
+  })
+
+  it('keeps only complete markers whose sources survive safety projection', () => {
+    const text = 'A [[source:S1]] B [[source:S2]] C [[source:E-private-key]] D [[source:S9]] E [[source:S1] F [[Source:S1]] G [[source S1]]'
+    const projected = projectFinalAnswerContent({
+      text,
+      final: {
+        response: text,
+        answerEvidence: {
+          schemaVersion: 1,
+          sources: [
+            { key: 'S1', kind: 'job', label: 'Engineer role', excerpt: 'Dublin role' },
+            { key: 'S2', kind: 'job', label: 'Private listing', excerpt: 'https://private.example/job' },
+          ],
+        },
+      },
+    })
+
+    expect(projected).toEqual({
+      text: 'A [[source:S1]] B  C  D  E  F  G ',
+      answerEvidence: {
+        schemaVersion: 1,
+        sources: [{ key: 'S1', kind: 'job', label: 'Engineer role', excerpt: 'Dublin role' }],
+      },
+    })
+    expect(projected?.text).not.toContain('E-private-key')
+  })
+
+  it('preserves prose immediately after a malformed marker single-bracket boundary', () => {
+    const text = 'Keep [[source:S1]Hello there.'
+    const projected = projectFinalAnswerContent({
+      text,
+      final: {
+        response: text,
+        answerEvidence: {
+          schemaVersion: 1,
+          sources: [{ key: 'S1', kind: 'job', label: 'Engineer role', excerpt: 'Dublin role' }],
+        },
+      },
+    })
+
+    expect(projected).toEqual({
+      text: 'Keep Hello there.',
+      answerEvidence: {
+        schemaVersion: 1,
+        sources: [{ key: 'S1', kind: 'job', label: 'Engineer role', excerpt: 'Dublin role' }],
+      },
+    })
+  })
+
+  it('removes every marker when an existing manifest is invalid or all sources are filtered', () => {
+    const text = 'Keep prose [[source:S1]] and [[source:S2]] and [[source:E-private-key]].'
+    const invalid = projectFinalAnswerContent({
+      text, final: { response: text, answerEvidence: { ...evidence, extra: 'PRIVATE_ID' } },
+    })
+    const filtered = projectFinalAnswerContent({
+      text,
+      final: {
+        response: text,
+        answerEvidence: {
+          schemaVersion: 1,
+          sources: [{ key: 'S1', kind: 'job', label: 'Private listing', excerpt: 'https://private.example/job' }],
+        },
+      },
+    })
+
+    expect(invalid).toEqual({ text: 'Keep prose  and  and .' })
+    expect(filtered).toEqual({ text: 'Keep prose  and  and .' })
+  })
+
   it('shares strict final evidence projection between query and replay content', () => {
     const text = 'A match. [[source:S1]]'
     const projected = projectFinalAnswerDisplayContent({ text, summary: 'Good fit.', answerEvidence: evidence })
@@ -96,7 +170,8 @@ describe('final answer evidence projection', () => {
     expect(projectFinalAnswerDisplayContent({ text: 'Legacy answer', summary: 'Legacy summary' }))
       .toEqual({ text: 'Legacy answer', summary: 'Legacy summary' })
     expect(projectFinalAnswerDisplayContent({ text, summary: 'x'.repeat(1001) })).toBeNull()
-    expect(projectFinalAnswerDisplayContent({ text, answerEvidence: { ...evidence, extra: 'PRIVATE' } })).toBeNull()
+    expect(projectFinalAnswerDisplayContent({ text, answerEvidence: { ...evidence, extra: 'PRIVATE' } }))
+      .toEqual({ text: 'A match. ' })
 
     const persisted = { text, final: { response: text, answerEvidence: evidence } }
     expect(projectCompletedAnswerEvidence(persisted, 'final_answer', 'completed')).toEqual(projected?.answerEvidence)
