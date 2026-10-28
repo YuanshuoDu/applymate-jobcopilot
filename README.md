@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>An AI job-search copilot for the European market.</strong><br />
-  Discover relevant roles, tailor your application, and follow every opportunity in one workspace.
+  Discover roles, prepare application materials, and keep track of every opportunity in one workspace.
 </p>
 
 <p align="center">
@@ -25,88 +25,127 @@
 
 <p align="center">
   <a href="#the-application-loop">Workflow</a> ·
-  <a href="#what-you-can-do">Capabilities</a> ·
+  <a href="#capabilities">Capabilities</a> ·
+  <a href="#agent-harness">Agent Harness</a> ·
+  <a href="#safety-and-availability">Safety</a> ·
   <a href="#architecture">Architecture</a> ·
   <a href="#quick-start">Quick start</a> ·
-  <a href="#documentation">Developer docs</a>
+  <a href="#documentation-and-contributing">Docs and contributing</a>
 </p>
 
 ---
 
 ## Why ApplyMate
 
-Job searching spreads your work across job boards, career portals, document
-editors, and email. ApplyMate connects discovery, application preparation, and
-follow-up so you can keep the role, your materials, and the next step together.
-
-Built for candidates applying across European markets, where location, language,
-and application requirements vary. **You review the materials and approve each
-job before final submission.**
+Job searching spans job boards, career portals, document editors, and email.
+ApplyMate brings role discovery, application preparation, and follow-up into
+one workspace for candidates applying across European markets.
 
 ## The application loop
 
 ![Three connected stages: discover and match roles; prepare materials and approve each job; apply through supported ATS workflows and track replies. Login, MFA, CAPTCHA, and missing answers pause for the candidate.](docs/assets/readme/workflow.svg)
 
-1. **Discover and match** — search roles, compare them with your profile, and build a shortlist.
-2. **Prepare and approve** — tailor your resume and cover letter, review the application pack, and approve the specific job.
-3. **Apply and track** — use assisted filling or a supported ATS workflow, then follow replies in Gmail.
+1. **Discover and shortlist** — search job sources and compare roles with your profile.
+2. **Prepare and review** — tailor a resume and cover letter, then review the application pack.
+3. **Apply and follow up** — use assisted filling or a supported ATS workflow, then track job-related replies.
 
-## What you can do
+## Capabilities
 
-| Capability | In the workspace | Availability |
+| Capability | What it does | Availability and limits |
 | --- | --- | --- |
-| **Discover & shortlist** | Search job sources and ATS portals; compare normalized descriptions, locations, fit scores, and keywords. | Source-dependent coverage |
-| **Manage your resume** | Parse PDF or DOCX files, maintain a reusable profile, and keep tailored versions with history. | Web app |
-| **Tailor your application** | Create role-specific resumes and cover letters; review and download application packs. | AI provider configuration required |
-| **Use the Chrome Extension** | Capture career-page jobs, synchronize saved jobs, preview materials, and assist with form fields. | Candidate present in the browser |
-| **Run supported ATS workflows** | Queue application tasks with checkpoints, approvals, and explicit human handoffs. | Coverage varies by form and account |
-| **Follow replies** | Track job-related messages and status signals; prepare follow-up drafts for review. | Gmail connection required |
+| **Discover roles** | Search job sources and ATS portals; compare normalized descriptions, locations, fit scores, and keywords. | Source and employer coverage varies. |
+| **Manage your profile** | Parse PDF or DOCX resumes and maintain reusable profile details and tailored versions. | Web app; supported formats and fields apply. |
+| **Prepare applications** | Create role-specific resumes and cover letters, then review and download application packs. | Requires an AI provider configured for the feature. |
+| **Use the Chrome Extension** | Capture career-page jobs, sync saved jobs, preview materials, and assist with form fields. | Candidate must be present in the browser. |
+| **Run ATS workflows** | Queue application tasks with checkpoints and candidate handoffs. | Worker includes Workday, Greenhouse, Lever, SmartRecruiters, and Personio flows; coverage varies by form, account, and available profile data. |
+| **Follow replies** | Track job-related messages and prepare follow-up drafts for review. | Requires a Gmail connection. |
 
-### ATS workflow coverage
+An application can pause for a missing answer, login, MFA, CAPTCHA, or another
+candidate-only step. **Final submission requires approval for the specific job.**
 
-The Worker includes flow modules for **Workday · Greenhouse · Lever ·
-SmartRecruiters · Personio**. These are supported integrations, with coverage
-depending on the employer's form, account access, and available profile data.
+## Agent Harness
 
-A workflow can pause for a missing answer, login, MFA, or CAPTCHA. Final
-submission always remains subject to approval for the specific job.
+The repository includes an Agent Harness V2 implementation for typed sessions,
+turns, task planning, worker coordination, tools, and evidence-based completion.
+It uses a provider-neutral model contract, durable state, and explicit policy and
+approval boundaries.
 
-## Your control, throughout
+```mermaid
+flowchart LR
+  goal[User goal or input] --> plan[Root plans a TaskGraph]
+  plan --> workers[Worker-managed tasks]
+  workers --> gate{Policy and approval gate}
+  gate -->|Allowed| tools[Approved tools]
+  gate -->|Approval needed| candidate[Candidate approves this job]
+  candidate --> gate
+  tools --> verify[Verify recorded evidence]
+  verify -->|Incomplete or failed| plan
+  verify -->|Ready| result[Result or review checkpoint]
+
+  state[(Durable Session, Turn, Task, and Event state)]
+  plan <--> state
+  workers <--> state
+  gate --> state
+  tools <--> state
+  verify --> state
+```
+
+| Runtime capability | What is implemented | Source |
+| --- | --- | --- |
+| **Durable continuity** | Typed Sessions and Turns record inputs, steps, items, events, and execution state for continuation and replay. | [Agent protocol](packages/agent-protocol/src/) · [Prisma models](apps/web/prisma/schema.prisma) |
+| **Task planning and workers** | TaskGraphs plan bounded child work; Worker tasks coordinate through persisted state and typed tools. | [TaskGraph runtime](apps/worker/src/runtime/subagents/) · [Worker startup](apps/worker/src/index.ts) |
+| **Pause, resume, and retry** | User input, approval, interruption, and retry commands operate on owned sessions and turns with revision, lease, and budget controls. | [Session controls](apps/web/src/app/api/agent/sessions/) · [Turn recovery](apps/worker/src/runtime/turns/) |
+| **Bounded context and history** | Typed snapshots, selected-job facts, and task outcomes carry relevant context into later steps; compaction and cross-session history have separate runtime gates. | [Context and history](apps/worker/src/runtime/context/) |
+| **Evidence-based completion** | TaskGraph completion checks required evidence and criteria; failed or unverified work can return to planning. | [Completion gate](apps/worker/src/runtime/turns/turn-execution-completion-gate.ts) · [TaskGraph verification](apps/worker/src/runtime/subagents/task-graph-pg-verification.ts) |
+| **Scheduled workflows** | Scheduled automations use persisted Turns; scheduled discovery supports multi-Scout cohorts through Audit. | [Automation scheduler](apps/web/src/app/api/agent/automations/due/route.ts) · [Scheduled pipeline](apps/worker/src/runtime/canonical-turn-scheduled-pipeline.ts) |
+
+These capabilities are implemented in the repository, but not all are enabled
+in every environment. Some runtime capabilities remain feature-flagged or
+environment-gated. Legacy agent and automation paths remain in source during
+migration and use their existing policy controls. Source code does not establish
+deployment, current production flag state, staging acceptance, or general
+availability. See the [V2 technical
+design](docs/agent-harness-v2-technical-design.md), [development
+roadmap](docs/agent-harness-v2-development-roadmap.md), [Phase 4 exit
+report](docs/agent-harness-v2/gates/phase-4/exit-report.md), and [GA
+checklist](docs/ga/agent-harness-2.0-checklist.md) for implementation and
+release evidence.
+
+### AI providers and your own API key
+
+The Web app's ModelRouter supports user-supplied API keys for configured
+providers and features. When no user key is set, it can use a platform key if
+one is configured. The Agent Harness has provider-neutral contracts and a set of
+adapters; available models and capabilities depend on the feature and adapter.
+The repository does not promise that every model works with every agent path.
+
+## Safety and availability
 
 | Boundary | How ApplyMate handles it |
 | --- | --- |
-| **Application approval** | Requires explicit approval for the specific job before final submission. |
+| **Application approval** | Final submission requires an explicit approval bound to the specific job and application materials. |
 | **Candidate-only steps** | Login, MFA, CAPTCHA, and missing answers remain visible handoffs. |
 | **Account ownership** | Connected accounts and application data are scoped to the owning candidate. |
-| **Credentials** | Production OAuth credentials use an Azure Key Vault RSA key; secrets stay outside source control. |
+| **Credentials** | Production OAuth credential persistence uses Azure Key Vault; secrets stay outside source control. |
 
 ## Architecture
 
-Three product surfaces share one application workflow:
+Three product surfaces share the application workflow:
 
 | Surface | Responsibility | Code |
 | --- | --- | --- |
 | **Web app** | Discovery, profiles, tailoring, approvals, Gmail tracking, and run history. | [apps/web](apps/web) |
 | **Chrome Extension** | In-page job capture, saved-job sync, material preview, and assisted filling. | [apps/extension](apps/extension) |
-| **Worker** | Queue-backed tasks, browser workflows, checkpoints, and pacing. | [apps/worker](apps/worker) |
-
-**Agent Harness V2 is the canonical production agent path.** New agent features
-use typed session, turn, event, and tool contracts. Legacy paths remain read-only
-or fail-closed emergency compatibility until the documented GA gate and rollback
-evidence are complete. See the [V2 technical design](docs/agent-harness-v2-technical-design.md)
-and [development roadmap](docs/agent-harness-v2-development-roadmap.md).
-
-### Technology
+| **Worker** | Queue-backed tasks, browser workflows, checkpoints, and pacing. It runs as a separate process. | [apps/worker](apps/worker) |
 
 | Layer | Stack |
 | --- | --- |
 | Web | Next.js App Router · React · TypeScript · Tailwind CSS |
 | Extension | Vite · React · Chrome Manifest V3 |
-| Data & queues | PostgreSQL · Prisma · BullMQ · Redis |
+| Data and queues | PostgreSQL · Prisma · BullMQ · Redis |
 | Browser workflows | Playwright-compatible automation · ATS-specific flow modules |
-| Identity & credentials | Auth.js / NextAuth · Google OAuth · Azure Key Vault |
-| AI | ModelRouter with configurable provider adapters |
-| Deployment | Vercel web app · separate Worker service |
+| Identity and credentials | Auth.js / NextAuth · Google OAuth · Azure Key Vault |
+| AI | ModelRouter and provider-neutral Agent Harness model contracts |
 
 <details>
 <summary><strong>Explore the repository</strong></summary>
@@ -118,8 +157,8 @@ applymate-jobcopilot/
 │   ├── extension/        # Chrome Extension
 │   └── worker/           # Queue workers and ATS workflows
 ├── packages/
-│   ├── agent-model/      # Shared model integration
-│   ├── agent-policy/     # Shared agent policy
+│   ├── agent-model/      # Model contracts and provider adapters
+│   ├── agent-policy/     # Agent policy contracts
 │   ├── agent-protocol/   # Typed runtime contracts
 │   └── shared/           # Shared types and utilities
 ├── docs/                 # Architecture, API, and runbooks
@@ -130,10 +169,13 @@ applymate-jobcopilot/
 
 ## Quick start
 
-### 1. Install
+### Requirements
 
-Use **Node.js 20+**, **pnpm 10.33.2** (the version pinned by this repository),
-and a local development **PostgreSQL** database.
+- Node.js 20 or newer
+- pnpm 10.33.2 (the version pinned by this repository)
+- A local PostgreSQL database for development
+
+### Install and configure
 
 ```bash
 git clone https://github.com/YuanshuoDu/applymate-jobcopilot.git
@@ -141,33 +183,52 @@ cd applymate-jobcopilot
 pnpm install --frozen-lockfile
 ```
 
-### 2. Configure
+Use [apps/web/.env.example](apps/web/.env.example) as a reference for Web
+settings. Next.js loads local Web values from `apps/web/.env.local`; keep that
+file out of Git. Configure only the provider credentials and connected services
+you intend to use.
 
-Copy [apps/web/.env.example](apps/web/.env.example) to
-`apps/web/.env.local` and fill in the values for your local environment.
+### Build and run the Web app
 
-| Configuration | Used for |
-| --- | --- |
-| `DATABASE_URL`, `AUTH_SECRET` | Database access and authentication |
-| Google OAuth credentials | Google sign-in and connected Gmail features |
-| AI provider configuration | Scoring, parsing, and document generation |
-| `REDIS_URL` | Queue-backed features |
-| [Worker environment template](apps/worker/.env.example) | Running the separate Worker service |
+Use a **local development database only** with `db:push`. In PowerShell, set
+`DATABASE_URL` in the same terminal before running the Prisma commands. For
+Bash or zsh, use the `export` form below.
 
-Keep local environment files and provider credentials outside Git.
+```powershell
+$env:DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/applymate"
+```
 
-### 3. Prepare the database and run
+```sh
+export DATABASE_URL="postgresql://postgres:postgres@localhost:5432/applymate"
+```
 
-Use a local development database for these commands:
+Prisma CLI reads `DATABASE_URL` from the process environment; setting it in
+`.env.local` alone is not sufficient for these commands.
 
-```bash
+```sh
+pnpm --filter './packages/*' build
 pnpm --filter @jobcopilot/web db:generate
 pnpm --filter @jobcopilot/web db:push
-pnpm --filter './packages/*' build
 pnpm --filter @jobcopilot/web dev
 ```
 
-Open [localhost:3000](http://localhost:3000).
+The commands build the shared packages, generate the Prisma client, update the
+local schema, and start the Web app at [localhost:3000](http://localhost:3000).
+The `DATABASE_URL` above is an example; use the connection string for your own
+local database. **Never point `db:push` at production.**
+
+The Web command starts only the Web app. The Worker is a separate process. To
+run it locally, provide its required environment variables to the process, then
+start it in another terminal:
+
+```sh
+pnpm --filter @jobcopilot/worker dev
+```
+
+The [Worker environment template](apps/worker/.env.example) documents its
+PostgreSQL, Redis, and shared-secret settings; it does not load them for you.
+See the [auto-apply deployment guide](docs/auto-apply-deployment.md) and
+[operations runbook](docs/runbook.md) for separate Worker setup and operations.
 
 <details>
 <summary><strong>Build and load the Chrome Extension</strong></summary>
@@ -191,54 +252,30 @@ pnpm test
 pnpm build
 ```
 
-For Worker, Extension, or browser changes, also run the relevant targeted and
-integration checks described in the developer documentation.
+For Worker, Extension, or browser changes, use the relevant focused and
+integration checks in the developer documentation.
 
 </details>
 
-<details>
-<summary><strong>Production OAuth credential protection</strong></summary>
+## Documentation and contributing
 
-Production OAuth persistence requires Azure Key Vault configuration:
-
-```env
-AZURE_KEY_VAULT_URL=
-AZURE_KEY_NAME=applymate-credential-key
-AZURE_TENANT_ID=
-AZURE_CLIENT_ID=
-AZURE_CLIENT_SECRET=
-```
-
-The Azure application needs the appropriate crypto role on the Key Vault.
-`CREDENTIAL_ENCRYPTION_KEY` is a local development/test fallback; production uses
-Key Vault protection. See the [environment template](apps/web/.env.example).
-
-</details>
-
-## Documentation
-
-| Start here | What you will find |
+| Resource | Description |
 | --- | --- |
-| [Documentation index](docs/README.md) | The maintained documentation map |
-| [Agent Harness V2 design](docs/agent-harness-v2-technical-design.md) | Runtime contracts, tools, approvals, and recovery |
-| [Agent Harness V2 roadmap](docs/agent-harness-v2-development-roadmap.md) | Implementation gates, verification, rollout, and rollback |
-| [Discovery & auto-apply design](docs/scraping-autoapply-design.md) | Source discovery, enrichment, and ATS workflow architecture |
-| [Developer guide](docs/scraping-autoapply-dev-guide.md) | Coding standards and integration guidance |
-| [API reference](docs/api-reference.md) | Routes, authentication, and payloads |
-| [Operations runbook](docs/runbook.md) | Queues, Worker incidents, and production diagnostics |
+| [Documentation index](docs/README.md) | Maintained documentation map. |
+| [Agent Harness V2 design](docs/agent-harness-v2-technical-design.md) | Runtime contracts, tools, approvals, and recovery. |
+| [Agent Harness V2 roadmap](docs/agent-harness-v2-development-roadmap.md) | Implementation gates, verification, rollout, and rollback. |
+| [Discovery and auto-apply design](docs/scraping-autoapply-design.md) | Source discovery, enrichment, and ATS workflow architecture. |
+| [Developer guide](docs/scraping-autoapply-dev-guide.md) | Coding standards and integration guidance. |
+| [API reference](docs/api-reference.md) | Routes, authentication, and payloads. |
+| [Auto-apply deployment guide](docs/auto-apply-deployment.md) | Separate Worker deployment and configuration. |
+| [Operations runbook](docs/runbook.md) | Queue, Worker, and production operations. |
+| [Contributing](.github/CONTRIBUTING.md) | How to propose and review changes. |
+| [Support](.github/SUPPORT.md) | Where to ask questions and report problems. |
 
-## Direction & contributing
-
-Development focuses on broader source coverage, stronger Extension-to-Worker
-handoffs, resilient approvals and recovery, and better handling of forms or job
-descriptions that require screenshot or OCR-assisted inputs. The linked roadmaps
-contain the delivery gates and current implementation detail.
-
-To contribute, create a focused branch, add tests for new behavior, run the
-relevant checks, and describe the user-visible result and known limitations in
-your PR. Read the [developer guide](docs/scraping-autoapply-dev-guide.md) and
-[GitHub collaboration guide](docs/github-collaboration.md) before changing agent
-or application workflow code.
+To contribute, create a focused branch, add coverage for changed behavior, run
+the relevant checks, and describe user-visible changes and limitations. Read
+the [GitHub collaboration guide](docs/github-collaboration.md) before changing
+agent or application workflow code.
 
 ---
 
