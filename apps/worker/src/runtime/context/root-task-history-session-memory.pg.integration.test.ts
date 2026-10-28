@@ -196,6 +196,7 @@ type PgGate = {
   point: "after_begin" | "before_commit"
   reached: ReturnType<typeof deferred<void>>
   resume: ReturnType<typeof deferred<void>>
+  backendIdentity?: ReturnType<typeof deferred<{ pid: number; applicationName: string }>>
   rollbackOnCommit?: boolean
   inspection?: ReturnType<typeof deferred<{ events: string; outboxes: string; eventSequence: string } | undefined>>
 }
@@ -231,6 +232,10 @@ function testPool(applicationName: string, gate?: PgGate): Pick<Pool, "connect">
             gate.reached.resolve()
             throw new Error("intentional chronology transaction rollback")
           }
+          const backendResult = await client.query<{ pid: number; applicationName: string }>(`SELECT pg_backend_pid()::int AS pid,
+            current_setting('application_name') AS "applicationName"`)
+          const backend = backendResult.rows[0]
+          gate.backendIdentity?.resolve({ pid: Number(backend?.pid), applicationName: String(backend?.applicationName ?? "") })
           gate.reached.resolve()
           await gate.resume.promise
           return client.query(...args)
@@ -626,17 +631,18 @@ describePg("root task history Session authorization PostgreSQL serialization", (
     [JSON.stringify({ status: "failed", stepCount: 1, toolCallCount: 0, finalItemId: null, waitId: null }), new Date(),
       source.rootTaskId, source.sessionId, source.turnId])
 
-    const releaseApp = `history-chrono-same-session-release-${suffix}`
-    const gate: PgGate = { sessionId, point: "before_commit", reached: deferred<void>(), resume: deferred<void>() }
+    const releaseApp = `history-release-${suffix}`
+    const backendIdentity = deferred<{ pid: number; applicationName: string }>()
+    const gate: PgGate = { sessionId, point: "before_commit", reached: deferred<void>(), resume: deferred<void>(), backendIdentity }
     const release = releaseTurnLease(testPool(releaseApp, gate) as never, source.lease, "failed", new Date())
     let current: Fixture | undefined
     let currentCreation: Promise<Fixture> | undefined
     try {
       await gate.reached.promise
-      const pidResult = await pool!.query<{ pid: number }>(`SELECT pid FROM pg_stat_activity
-        WHERE application_name=$1 ORDER BY backend_start DESC LIMIT 1`, [releaseApp])
-      const releasePid = Number(pidResult.rows[0]?.pid)
-      if (!Number.isSafeInteger(releasePid) || releasePid < 1) throw new Error("Could not find gated release transaction")
+      const releaseBackend = await backendIdentity.promise
+      const releasePid = releaseBackend.pid
+      if (!Number.isSafeInteger(releasePid) || releasePid < 1) throw new Error("Could not identify gated release transaction connection")
+      expect(releaseBackend.applicationName).toBe(releaseApp)
       currentCreation = createTurn(userId, sessionId)
       await waitForBlockedBy(workerApplication, releasePid)
       gate.resume.resolve()
