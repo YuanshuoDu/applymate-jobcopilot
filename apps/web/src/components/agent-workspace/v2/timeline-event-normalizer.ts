@@ -1,5 +1,7 @@
 import { AGENT_STREAM_SCHEMA_VERSION } from '@jobcopilot/agent-protocol'
 
+import { isApprovalLedgerEventType, parseApprovalLedgerEvent } from './approval-ledger-parser'
+import { parseQuestionTerminalEvent } from './question-input-parser'
 import { STEERING_MARKER_EVENT_TYPE } from './timeline-steering-markers'
 import { integer, isRecord, numberOrUndefined, sequence, stringOrNull, timestamp } from './timeline-reducer-utils'
 import type { TimelineEvent, TimelineItem, TimelineItemSource } from './timeline-reducer'
@@ -24,6 +26,10 @@ export function normalizeTimelineEvent(value: unknown): TimelineEvent | null {
   if (!isRecord(value) || typeof value.id !== 'string' || typeof value.sessionId !== 'string' ||
     typeof value.turnId !== 'string' || typeof value.type !== 'string' ||
     value.schemaVersion !== AGENT_STREAM_SCHEMA_VERSION) return null
+  // Validate authoritative wait facts before normalization can discard unknown
+  // keys or coerce malformed identity/metadata fields into valid placeholders.
+  if ((value.type === 'question.answered' || value.type === 'question.cancelled') && !parseQuestionTerminalEvent(value, value.sessionId)) return null
+  if (isApprovalLedgerEventType(value.type) && !parseApprovalLedgerEvent(value, value.sessionId)) return null
   if (value.type === STEERING_MARKER_EVENT_TYPE && (value.actor !== 'system' || value.itemId !== null)) return null
   if (value.type === STEERING_MARKER_EVENT_TYPE && Object.keys(value).some(key => !['schemaVersion', 'id', 'sessionId', 'turnId', 'itemId', 'taskId', 'type', 'actor', 'correlationId', 'causationId', 'idempotencyKey', 'sequence', 'payload', 'createdAt', 'kind', 'baseRevision', 'revision'].includes(key))) return null
   const rawKind = value.kind

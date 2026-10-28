@@ -31,7 +31,24 @@ const requestOwner = { userId: 'user-1', sessionId: 'session-1', turnId: 'turn-1
   turnLeaseOwnerId: 'worker-1', turnLeaseVersion: 4 }
 const owner = { ...requestOwner, executionId: 'execution-1', executionAttemptCount: 5 }
 const snapshot = { schemaVersion: 'agent-harness.v2.scheduled-automation-snapshot.v1', requireApproval: false, autoApply: true }
-const attestation = { snapshotDigest: 'sha256:snapshot', scout: { candidateJobIds: ['job-1'] } }
+const attestation = { schemaVersion: 'agent-harness.v2.scheduled-pipeline-attestation.v1', owner: requestOwner,
+  snapshotDigest: `sha256:${'a'.repeat(64)}`, graphRevision: 15, scout: { taskId: 'scout-task', attemptCount: 1,
+    status: 'completed', verification: 'passed', resultDigest: 'c'.repeat(64), candidateJobIds: ['job-1'],
+    discoveryReceipt: { status: 'complete', taskId: 'scout-task', attemptCount: 1, completedCalls: 1,
+      candidateCount: 1, providerFailures: 0, materializationFailures: 0, hasMore: false, receiptDigest: 'a'.repeat(64) } },
+  analyst: { taskId: 'analyst-task', attemptCount: 1, status: 'completed', verification: 'passed', resultDigest: 'd'.repeat(64),
+    dependsOnTaskIds: ['scout-task'], jobIds: ['job-1'] }, evidenceDigest: 'b'.repeat(64) }
+const multiScoutAttestation = { schemaVersion: 'agent-harness.v2.scheduled-pipeline-attestation.v2', owner: requestOwner,
+  snapshotDigest: `sha256:${'a'.repeat(64)}`, graphRevision: 16, scouts: ['a', 'b'].map((suffix, index) => ({ nodeKey: `scout-${suffix}`,
+    taskId: `scout-task-${suffix}`, attemptCount: 1, status: 'completed', verification: 'passed', resultDigest: `${index + 1}`.repeat(64),
+    nodeDigest: `${index + 3}`.repeat(64), evidenceDigest: `${index + 5}`.repeat(64), reportDigest: `${index + 7}`.repeat(64),
+    candidateJobIds: index === 0 ? ['job-1', 'unselected-job'] : ['unselected-job'],
+    discoveryReceipt: { status: 'complete', taskId: `scout-task-${suffix}`, attemptCount: 1, completedCalls: 1,
+      candidateCount: index === 0 ? 2 : 1, providerFailures: 0, materializationFailures: 0, hasMore: false,
+      receiptDigest: (index === 0 ? '9' : 'a').repeat(64) } })), candidateUnionJobIds: ['job-1', 'unselected-job'],
+  analyst: { nodeKey: 'analysis', taskId: 'analyst-task-multi', attemptCount: 1, status: 'completed', verification: 'passed',
+    resultDigest: 'c'.repeat(64), nodeDigest: 'd'.repeat(64), evidenceDigest: 'e'.repeat(64), reportDigest: 'f'.repeat(64),
+    dependsOnTaskIds: ['scout-task-a', 'scout-task-b'], jobIds: ['job-1'] }, evidenceDigest: 'a'.repeat(64) }
 const prepareProof = { receipt: 'prepare' }
 const gateCompletionProof = { schemaVersion: 'agent-harness.v2.scheduled-taskgraph-gate-completion.v1', prepareProof,
   gate: { taskId: 'gate-1', attemptCount: 2 } }
@@ -169,6 +186,12 @@ describe('completed scheduled TaskGraph report replay', () => {
 
     expect(mocks.completedReport).not.toHaveBeenCalled()
     expect(mocks.auditCompletedFence).not.toHaveBeenCalled()
+  })
+
+  it('queries only the Analyst cohort for v2 completed-report replay', async () => {
+    const response = await replayCompletedScheduledTaskGraphReport({ ...request, attestation: multiScoutAttestation }, gate)
+    expect(response?.status).toBe(200)
+    expect(mocks.jobs).toHaveBeenCalledWith({ where: { userId: owner.userId, id: { in: ['job-1'] } } })
   })
 
   it('requires current Prepare and Gate proofs for a completed Audit report', async () => {

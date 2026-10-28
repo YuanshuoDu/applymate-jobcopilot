@@ -8,6 +8,7 @@ import { policyFromTask } from "./manager-task-scope.js"
 import { inheritSubagentPolicy, type SubagentTaskRecord } from "./types.js"
 import { currentTaskGraph, loadTaskGraph, lockTaskGraphScope, type LoadedGraph } from "./task-graph-pg-state.js"
 import { enqueueGraphTask } from "./task-graph-pg-create.js"
+import { projectScheduledPipelineGraphAtCurrentStage } from "./scheduled-pipeline-graph-shape.js"
 import { type Queryable } from "./pg-store-persistence.js"
 import { scheduledGatePreparedJobIds, scheduledGateProposal, SCHEDULED_GATE_OUTPUT_SCHEMA,
   SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
@@ -37,9 +38,12 @@ export async function appendScheduledGate(client: Queryable, input: TaskGraphSch
   if (turn.rows.length !== 1 || !scheduledSnapshotMatches(turn.rows[0], contract.binding.snapshotDigest)) throw invalid("snapshot")
   const loaded = await loadTaskGraph(client, input.scope, true)
   if (!loaded.snapshot || !loaded.state || !loaded.item) throw invalid("graph_missing")
+  const graphStage = projectScheduledPipelineGraphAtCurrentStage(loaded.snapshot.nodes)
+  if (!graphStage) throw invalid("graph")
   const prep = await requirePrepareProof(client, input, contract.binding.continuationKey, loaded)
   const gateNode = loaded.snapshot.nodes.find(node => node.key === "gate")
   if (gateNode) {
+    if (graphStage.projection.stage !== "gate" && graphStage.projection.stage !== "audit") throw invalid("receipt_conflict")
     const prior = await readScheduledGateRegistrationReceipt(client, { userId: input.scope.userId,
       sessionId: input.scope.sessionId, turnId: input.scope.turnId, owner: stableOwner(owner), gateTaskId: gateNode.taskId })
     if (!prior || !sameRegistration(prior, input, contract.binding, contract.receipt.continuationKey, prep.proof)
@@ -49,7 +53,7 @@ export async function appendScheduledGate(client: Queryable, input: TaskGraphSch
     return replay(loaded, gateNode.taskId)
   }
   if (await hasOrphanRegistration(client, input.scope, contract.receipt.continuationKey)) throw invalid("receipt_conflict")
-  if (loaded.snapshot.nodes.length !== 3 || loaded.state.revision !== proofRevision
+  if (graphStage.projection.stage !== "prepare" || loaded.state.revision !== proofRevision
     || !(await verifyPersistedScheduledPreparePrefix(client, input.scope, loaded, prep.proof))) throw invalid("prepare_mismatch")
   await requireClaim(client, input, contract.binding, contract.claimTokenDigest)
   const current = currentTaskGraph(loaded)

@@ -32,25 +32,28 @@ const candidatePayload = { schemaVersion: 'agent-harness.v2.scheduled-pipeline-c
     ] } }
 const candidateEvent = { id: 'candidate-event', type: 'native_verification.scheduled_candidate_staged', taskId: owner.rootTaskId,
   correlationId: sourceStepId, payload: candidatePayload }
-const binding = choiceBinding(), scheduledWaitId = choiceId()
-const choiceItem = { id: `agent-wait:question:${scheduledWaitId}`, stepId: sourceStepId, taskId: owner.rootTaskId,
-  type: 'question', status: 'completed', content: { waitKind: 'question', questionId: scheduledWaitId, toolCallId: null,
-    stage: 'scheduled_prepare', question: 'How should ApplyMate tailor your resume for this role?',
-    options: [{ label: 'Apply AI changes', value: 'apply_ai_changes' }, { label: 'Keep my current resume', value: 'keep_resume' }],
-    answer: 'apply_ai_changes', answerAvailable: true, scheduledPrepareChoiceBinding: binding, answeredAt: '2026-10-25T12:00:00.000Z' } }
+const binding = choiceBinding(receipt), scheduledWaitId = choiceId(receipt)
+const choiceItem = choiceItemFor(receipt, binding, scheduledWaitId)
 const request = { owner, snapshot, proof: { receipt, completion: {}, result: {} }, scheduledWaitId }
 
-function choiceBinding() {
-  return { schemaVersion: 'agent-harness.v2.scheduled-prepare-choice-wait.v1', owner: stableOwner, continuationKey: receipt.continuationKey,
-    snapshotDigest: receipt.snapshotDigest, evidenceDigest: receipt.evidenceDigest, checkpointDigest: receipt.checkpointDigest,
-    analyzeGraphRevision: receipt.analyzeGraphRevision, prepareScheduleRevision: receipt.prepareScheduleRevision,
+function choiceBinding(value: typeof receipt) {
+  return { schemaVersion: 'agent-harness.v2.scheduled-prepare-choice-wait.v1', owner: stableOwner, continuationKey: value.continuationKey,
+    snapshotDigest: value.snapshotDigest, evidenceDigest: value.evidenceDigest, checkpointDigest: value.checkpointDigest,
+    analyzeGraphRevision: value.analyzeGraphRevision, prepareScheduleRevision: value.prepareScheduleRevision,
     finalStepId: sourceStepId, finalStepOrdinal: sourceStepOrdinal, finalStepAttempt: 1 }
 }
-function choiceId() {
+function choiceId(value: typeof receipt) {
   const values = [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.rootAttemptCount, owner.executionId,
-    owner.executionAttemptCount, receipt.continuationKey, receipt.snapshotDigest, receipt.evidenceDigest, receipt.checkpointDigest,
-    receipt.analyzeGraphRevision, receipt.prepareScheduleRevision, sourceStepId, sourceStepOrdinal, 1]
+    owner.executionAttemptCount, value.continuationKey, value.snapshotDigest, value.evidenceDigest, value.checkpointDigest,
+    value.analyzeGraphRevision, value.prepareScheduleRevision, sourceStepId, sourceStepOrdinal, 1]
   return `agent-question:${owner.turnId}:canonical:${createHash('sha256').update(JSON.stringify(values), 'utf8').digest('hex')}`
+}
+function choiceItemFor(value: typeof receipt, binding: ReturnType<typeof choiceBinding>, waitId: string) {
+  return { id: `agent-wait:question:${waitId}`, stepId: sourceStepId, taskId: owner.rootTaskId,
+    type: 'question', status: 'completed', content: { waitKind: 'question', questionId: waitId, toolCallId: null,
+      stage: 'scheduled_prepare', question: 'How should ApplyMate tailor your resume for this role?',
+      options: [{ label: 'Apply AI changes', value: 'apply_ai_changes' }, { label: 'Keep my current resume', value: 'keep_resume' }],
+      answer: 'apply_ai_changes', answerAvailable: true, scheduledPrepareChoiceBinding: binding, answeredAt: '2026-10-25T12:00:00.000Z' } }
 }
 function setup() {
   for (const mock of Object.values(mocks)) mock.mockReset()
@@ -102,6 +105,23 @@ describe('Audit-only historical Prepare source validation', () => {
     await expect(validateScheduledTaskGraphAuditPrepareSource(request)).resolves.toBe(false)
     withPayload({ ...candidatePayload, internalDigest: 'must-not-be-accepted' })
     await expect(validateScheduledTaskGraphAuditPrepareSource(request)).resolves.toBe(false)
+  })
+
+  it('accepts the exact v2 Prepare choice receipt and rejects a trailing continuation key', async () => {
+    const v2Receipt = { ...receipt, continuationKey: `scheduled-taskgraph:v2:sha256:${'e'.repeat(64)}` }
+    const v2Binding = choiceBinding(v2Receipt), v2WaitId = choiceId(v2Receipt)
+    mocks.events.mockImplementation((query: { where: Record<string, unknown> }) => {
+      if (query.where.type === 'agent.plan.scheduled_prepare_binding') return Promise.resolve([{ payload: v2Receipt }])
+      if (query.where.type === 'native_verification.scheduled_candidate_staged') return Promise.resolve([candidateEvent])
+      return Promise.resolve([])
+    })
+    mocks.choice.mockResolvedValue(choiceItemFor(v2Receipt, v2Binding, v2WaitId))
+    await expect(validateScheduledTaskGraphAuditPrepareSource({ ...request,
+      proof: { receipt: v2Receipt, completion: {}, result: {} }, scheduledWaitId: v2WaitId })).resolves.toBe(true)
+
+    const malformed = { ...v2Receipt, continuationKey: `${v2Receipt.continuationKey}\n` }
+    await expect(validateScheduledTaskGraphAuditPrepareSource({ ...request,
+      proof: { receipt: malformed, completion: {}, result: {} }, scheduledWaitId: v2WaitId })).resolves.toBe(false)
   })
 
   it('rejects an invalid recovery tail or source replan receipt', async () => {

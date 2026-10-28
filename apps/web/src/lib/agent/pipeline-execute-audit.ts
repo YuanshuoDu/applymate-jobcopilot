@@ -4,10 +4,10 @@ import { summarizeCustomAgentResults } from './stages/custom'
 import { emptyReport } from './types'
 import type { PipelineExecuteAuditInput, PipelineExecuteAuditResult, PipelineStageRuntimeContext } from './pipeline-context'
 import type { ExecuteOutput, RunReport } from './types'
+import { isScheduledTaskGraphContinuationKey } from './scheduled-taskgraph-continuation-contract'
 
 const SCHEDULED_CONTINUATION_SCHEMA = 'agent-harness.v2.scheduled-pipeline-continuation.v1'
 const SCHEDULED_CLAIM_SCHEMA = 'agent-harness.v2.scheduled-pipeline-claim.v1'
-const SCHEDULED_KEY = /^scheduled-taskgraph:sha256:[a-f0-9]{64}$/
 const SNAPSHOT_DIGEST = /^sha256:[a-f0-9]{64}$/
 const HEX_DIGEST = /^[a-f0-9]{64}$/
 const OWNER_KEYS = ['userId', 'sessionId', 'turnId', 'rootTaskId', 'rootAttemptCount', 'turnLeaseOwnerId', 'turnLeaseVersion', 'executionId', 'executionAttemptCount']
@@ -48,7 +48,7 @@ function scheduledTaskGraphOwnerIsValidated(runtime: PipelineStageRuntimeContext
     || !Number.isSafeInteger(owner.executionAttemptCount) || Number(owner.executionAttemptCount) < 0
     || !exactKeys(continuation, ['schemaVersion', 'key', 'owner', 'snapshotDigest', 'graphRevision', 'evidenceDigest'])
     || continuation.schemaVersion !== SCHEDULED_CONTINUATION_SCHEMA || continuation.key !== fence.key
-    || typeof continuation.key !== 'string' || !SCHEDULED_KEY.test(continuation.key)
+    || typeof continuation.key !== 'string' || !isScheduledTaskGraphContinuationKey(continuation.key)
     || typeof continuation.snapshotDigest !== 'string' || !SNAPSHOT_DIGEST.test(continuation.snapshotDigest)
     || !positiveSafeInteger(continuation.graphRevision)
     || typeof continuation.evidenceDigest !== 'string' || !HEX_DIGEST.test(continuation.evidenceDigest)

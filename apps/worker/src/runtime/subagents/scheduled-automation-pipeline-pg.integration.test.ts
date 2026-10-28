@@ -27,7 +27,8 @@ import { verifyCompletedScoutDependencies } from "./task-graph-pg-completed-depe
 import { verifyCompletedTaskGraphNodeEvidence } from "./task-graph-pg-verification.js"
 import { createScheduledAutomationPrepareContinuation } from "./scheduled-automation-prepare-bridge.js"
 import { verifyScheduledPrepareTaskGraphEvidence } from "./scheduled-prepare-task-graph-verification.js"
-import { createScheduledAutomationPipelineBridge, type ScheduledAutomationPipelineBridgeScope, type ScheduledAutomationPipelineBridgeState } from "./scheduled-automation-pipeline-bridge.js"
+import { createScheduledAutomationPipelineBridge, SCHEDULED_PIPELINE_ATTESTATION_SCHEMA,
+  type ScheduledAutomationPipelineBridgeScope, type ScheduledAutomationPipelineBridgeState } from "./scheduled-automation-pipeline-bridge.js"
 import { postScheduledPipelineContinuation, scheduledTaskGraphContinuationKey } from "./scheduled-pipeline-handoff.js"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
 import { createPgDurableWaitPort } from "./durable-wait-store.js"
@@ -913,6 +914,7 @@ describeWithServices("scheduled automation TaskGraph continuation on disposable 
       expect(deliveries).toHaveLength(2)
       expect(deliveries[0]).toEqual(deliveries[1])
       if (result.status !== "ready") throw new Error("Scheduled pipeline fixture did not return Analyze evidence")
+      if (result.attestation.schemaVersion !== SCHEDULED_PIPELINE_ATTESTATION_SCHEMA) throw new Error("Scheduled pipeline fixture must be v1")
       expect(result.attestation.owner).toEqual(owner)
       expect(result.attestation.scout.candidateJobIds).toEqual([value.jobId])
       expect(result.attestation.scout.discoveryReceipt).toMatchObject({

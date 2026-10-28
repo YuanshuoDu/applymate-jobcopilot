@@ -3,6 +3,7 @@ import { Prisma } from '@prisma/client'
 import { parseScheduledTaskGraphGateResult } from './scheduled-taskgraph-gate-service'
 import type { ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
 import type { ParsedScheduledTaskGraphPrepareProof } from './scheduled-taskgraph-gate-checkpoint'
+export { scheduledTaskGraphGateBindingIsCurrent } from './scheduled-taskgraph-prepare-proof'
 
 const MAX_EVENTS = 256
 const GRAPH_SCHEMA = 'agent-harness.v2.task-graph'
@@ -29,64 +30,6 @@ export type ScheduledTaskGraphGateHistoryInput = Readonly<{
   expectedJobIds: readonly string[]
 }>
 
-type GatePhase = Readonly<{ taskId: string; attemptCount: number; phase: 'running' | 'completed'; completionProof?: unknown }>
-
-/** Binds the one registered Gate to its exact private, ready Prepare dependency wait. */
-export async function scheduledTaskGraphGateBindingIsCurrent(input: Readonly<{
-  reader: Prisma.TransactionClient
-  owner: ScheduledTaskGraphPipelineOwner
-  marker: Record<string, unknown>
-  checkpointDigest: string
-  proof: ParsedScheduledTaskGraphPrepareProof
-  gate: GatePhase
-}>): Promise<boolean> {
-  const { reader, owner, marker, checkpointDigest, proof, gate } = input
-  const eventRows = await reader.$queryRaw<Array<Record<string, unknown>>>(Prisma.sql`
-    SELECT event."itemId", event."taskId", event."actor", event."idempotencyKey", event."payload",
-      EXISTS (SELECT 1 FROM "agent_outbox" AS outbox WHERE outbox."idempotencyKey" = 'agent-event:' || event."id"
-        OR outbox."payload"->>'eventId' = event."id") AS "hasOutbox"
-    FROM "agent_events" AS event JOIN "agent_sessions" AS session ON session."id" = event."sessionId"
-      JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
-    WHERE event."sessionId" = ${owner.sessionId} AND event."turnId" = ${owner.turnId}
-      AND event."type" = 'agent.plan.scheduled_gate_binding' AND session."userId" = ${owner.userId}
-      AND turn."userId" = ${owner.userId} AND turn."rootTaskId" = ${owner.rootTaskId}
-    ORDER BY event."sequence" ASC LIMIT 2 FOR UPDATE OF event
-  `)
-  const event = eventRows[0], receipt = exactRecord(event?.payload, ['schemaVersion', 'owner', 'continuationKey', 'snapshotDigest',
-    'evidenceDigest', 'checkpointDigest', 'analyzeGraphRevision', 'prepareScheduleRevision', 'prepareWaitId', 'gateTaskId', 'gateAppendRevision'])
-  const stableOwner = exactRecord(receipt?.owner, ['userId', 'sessionId', 'turnId', 'rootTaskId', 'rootAttemptCount', 'executionId', 'executionAttemptCount'])
-  const eventKey = receipt && `scheduled-gate-binding:${createHash('sha256').update(JSON.stringify([receipt.continuationKey, gate.taskId]), 'utf8').digest('hex')}`
-  if (eventRows.length !== 1 || !event || event.itemId !== null || event.taskId !== null || event.actor !== 'system' || event.hasOutbox !== false
-    || !receipt || !stableOwner || event.idempotencyKey !== eventKey || receipt.schemaVersion !== 'agent-harness.v2.scheduled-taskgraph-gate-binding.v1'
-    || !['userId', 'sessionId', 'turnId', 'rootTaskId', 'rootAttemptCount', 'executionId', 'executionAttemptCount']
-      .every(key => stableOwner[key] === owner[key as keyof ScheduledTaskGraphPipelineOwner])
-    || receipt.continuationKey !== proof.receipt.continuationKey || receipt.snapshotDigest !== marker.snapshotDigest
-    || receipt.evidenceDigest !== marker.evidenceDigest || receipt.checkpointDigest !== checkpointDigest
-    || receipt.analyzeGraphRevision !== marker.graphRevision || receipt.prepareScheduleRevision !== proof.receipt.prepareScheduleRevision
-    || receipt.prepareWaitId !== record(proof.completion.wait)?.waitId || receipt.gateTaskId !== gate.taskId
-    || receipt.gateAppendRevision !== proof.graphRevision + 1 || !validId(receipt.prepareWaitId)) return false
-  const waits = await reader.$queryRaw<Array<Record<string, unknown>>>(Prisma.sql`
-    SELECT wait."id", wait."userId", wait."sessionId", wait."turnId", wait."parentTaskId", wait."stepId", wait."idempotencyKey",
-      wait."targetTaskIds", wait."mode", wait."status", wait."matchedTaskIds", wait."result",
-      step."taskId" AS "stepTaskId", step."attempt" AS "stepAttempt"
-    FROM "agent_wait_conditions" AS wait JOIN "agent_sessions" AS session ON session."id" = wait."sessionId"
-      JOIN "agent_turns" AS turn ON turn."id" = wait."turnId" AND turn."sessionId" = wait."sessionId"
-      JOIN "agent_steps" AS step ON step."id" = wait."stepId" AND step."sessionId" = wait."sessionId" AND step."turnId" = wait."turnId"
-    WHERE wait."id" = ${receipt.prepareWaitId} AND wait."userId" = ${owner.userId} AND wait."sessionId" = ${owner.sessionId}
-      AND wait."turnId" = ${owner.turnId} AND wait."parentTaskId" = ${owner.rootTaskId}
-      AND session."userId" = ${owner.userId} AND turn."userId" = ${owner.userId}
-    FOR UPDATE OF wait, step
-  `)
-  const wait = waits[0], request = record(record(wait?.result)?.request), stepId = wait?.stepId
-  const waitKey = typeof stepId === 'string' && typeof marker.key === 'string'
-    ? `scheduled-prepare-dependency:${createHash('sha256').update(`${marker.key}\0${stepId}`, 'utf8').digest('hex')}` : ''
-  return waits.length === 1 && wait?.id === receipt.prepareWaitId && validId(stepId) && wait.idempotencyKey === waitKey
-    && (wait.stepTaskId === null || wait.stepTaskId === owner.rootTaskId) && wait.stepAttempt === 1 && wait.mode === 'all'
-    && wait.status === 'ready' && sameStrings(wait.targetTaskIds, [proof.result.taskId]) && sameStrings(wait.matchedTaskIds, [proof.result.taskId])
-    && request !== null && exactKeys(request, ['targetTaskIds', 'mode', 'timeoutMs']) && request.mode === 'all'
-    && request.timeoutMs === 86_400_000 && sameStrings(request.targetTaskIds, [proof.result.taskId])
-}
-
 /** Proves the immutable Prepare prefix, the sole Gate proposal, and every Gate transition from durable receipts. */
 export async function scheduledTaskGraphGateHistoryIsCurrent(input: ScheduledTaskGraphGateHistoryInput): Promise<boolean> {
   try {
@@ -105,7 +48,8 @@ export async function scheduledTaskGraphGateHistoryIsCurrent(input: ScheduledTas
       nodeKey: 'prepare', taskId: input.prepareTaskId, attempt: input.prepareAttemptCount, type: 'task.completed' })
     if (!prepare) return false
     const priorSnapshot = snapshot(prepare.content)
-    if (!priorSnapshot || priorSnapshot.nodes.length !== 3 || taskNodeTaskId(priorSnapshot, 'prepare') !== input.prepareTaskId) return false
+    if (!priorSnapshot || priorSnapshot.nodes.length < 3 || priorSnapshot.nodes.length > 6
+      || taskNodeTaskId(priorSnapshot, 'prepare') !== input.prepareTaskId) return false
     const prepareSequence = BigInt(String(prepare.row.sequence))
     const later = await input.reader.agentEvent.findMany({
       where: { sessionId: input.owner.sessionId, turnId: input.owner.turnId, itemId: graphId,
@@ -120,6 +64,7 @@ export async function scheduledTaskGraphGateHistoryIsCurrent(input: ScheduledTas
 }
 
 async function validateHistory(input: ScheduledTaskGraphGateHistoryInput, graphId: string, prior: Snapshot, rows: readonly unknown[]): Promise<boolean> {
+  const prepareNodeCount = prior.nodes.length
   const proposal = record(rows[0]), proposalPayload = record(proposal?.payload), proposalRevision = input.prepareGraphRevision + 1
   const proposalKey = `${graphId}:proposal:${input.prepareGraphRevision}`
   if (!proposal || proposal.type !== 'item.delta' || proposal.actor !== 'orchestrator' || proposal.idempotencyKey !== proposalKey
@@ -128,16 +73,16 @@ async function validateHistory(input: ScheduledTaskGraphGateHistoryInput, graphI
     || proposalPayload.revision !== proposalRevision || !isHex(proposalPayload.fingerprint)) return false
   const receipt = record(proposalPayload.receipt), receiptNodes = denseArray(receipt?.nodes)
   const proposedSnapshot = snapshot(proposalPayload.content)
-  const currentSnapshot = snapshot(input.graphContent), hasAudit = currentSnapshot?.nodes.length === 5
+  const currentSnapshot = snapshot(input.graphContent), hasAudit = currentSnapshot?.nodes.length === prepareNodeCount + 2
   if (!receipt || receipt.status !== 'accepted' || receipt.revision !== proposalRevision || !receiptNodes || receiptNodes.length !== 1
     || record(receiptNodes[0])?.key !== 'gate' || record(receiptNodes[0])?.taskId !== input.gate.taskId
     || record(receiptNodes[0])?.status !== 'queued' || !sameStrings(receipt?.readyTaskIds, [input.gate.taskId])
-    || !proposedSnapshot || proposedSnapshot.nodes.length !== 4 || !samePrefix(prior, proposedSnapshot)
-    || !currentSnapshot || currentSnapshot.nodes.length !== (hasAudit ? 5 : 4)
+    || !proposedSnapshot || proposedSnapshot.nodes.length !== prepareNodeCount + 1 || !samePrefix(prior, proposedSnapshot, prepareNodeCount)
+    || !currentSnapshot || currentSnapshot.nodes.length !== (hasAudit ? prepareNodeCount + 2 : prepareNodeCount + 1)
     || hasAudit && (input.gate.phase !== 'completed' || !input.auditTask
-      || !validAuditNode(currentSnapshot.nodes[4]!, input.auditTask.id))
+      || !validAuditNode(currentSnapshot.nodes[prepareNodeCount + 1]!, input.auditTask.id))
     || input.graphRevision < proposalRevision) return false
-  const gateNode = proposedSnapshot.nodes[3]!
+  const gateNode = proposedSnapshot.nodes[prepareNodeCount]!
   if (!validGateNode(gateNode, input.gate.taskId)) return false
 
   if (!Number.isSafeInteger(input.gateTask.maxAttempts) || input.gateTask.maxAttempts < 1) return false
@@ -170,13 +115,13 @@ async function validateHistory(input: ScheduledTaskGraphGateHistoryInput, graphI
     if (!nextContent || !sameJson(nextContent, proposedSnapshot)) return false
     currentContent = nextContent
   }
-  const currentPrefix = hasAudit ? { ...currentSnapshot!, nodes: currentSnapshot!.nodes.slice(0, 4) } : currentSnapshot!
+  const currentPrefix = hasAudit ? { ...currentSnapshot!, nodes: currentSnapshot!.nodes.slice(0, prepareNodeCount + 1) } : currentSnapshot!
   if ((hasAudit ? input.graphRevision <= revision : revision !== input.graphRevision)
     || input.gateTask.status !== status || input.gateTask.attemptCount !== input.gate.attemptCount
     || attempt !== input.gate.attemptCount || !sameJson(currentContent, currentPrefix)) return false
   if (input.gate.phase === 'running') return status === 'running' && input.gateTask.status === 'running'
   if (status !== 'completed' || !validCompletedGate(input, revision)) return false
-  return !hasAudit || await validAuditTaskRow(input, currentSnapshot!.nodes[4]!, revision)
+  return !hasAudit || await validAuditTaskRow(input, currentSnapshot!.nodes[prepareNodeCount + 1]!, revision)
 }
 
 function validAuditNode(node: Record<string, unknown>, taskId: string): boolean {
@@ -245,9 +190,9 @@ function taskNodeTaskId(value: Snapshot, key: string): string | null {
   const taskId = matches.length === 1 ? matches[0]?.taskId : null
   return validId(taskId) ? taskId : null
 }
-function samePrefix(prior: Snapshot, proposed: Snapshot): boolean {
-  if (prior.nodes.length !== 3 || proposed.nodes.length !== 4) return false
-  return sameJson({ ...prior, nodes: prior.nodes }, { ...proposed, nodes: proposed.nodes.slice(0, 3) })
+function samePrefix(prior: Snapshot, proposed: Snapshot, prepareNodeCount: number): boolean {
+  if (prior.nodes.length !== prepareNodeCount || proposed.nodes.length !== prepareNodeCount + 1) return false
+  return sameJson({ ...prior, nodes: prior.nodes }, { ...proposed, nodes: proposed.nodes.slice(0, prepareNodeCount) })
 }
 function validGateNode(node: Record<string, unknown>, taskId: string): boolean {
   return node.key === 'gate' && node.templateId === 'gate' && node.taskId === taskId && node.depth === 4

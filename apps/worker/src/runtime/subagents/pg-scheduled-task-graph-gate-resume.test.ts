@@ -58,7 +58,7 @@ const preparedTransition = { scope: { userId: scope.userId, sessionId: scope.ses
   }] }, duplicate: false }
 
 function database(status: "waiting_for_user" | "queued" | "running" = "waiting_for_user", attemptCount = 1,
-  options: { deadlineLive?: boolean; expireAfterChecks?: number } = {}) {
+  options: { deadlineLive?: boolean; expireAfterChecks?: number; waitId?: string; content?: unknown } = {}) {
   const calls: Array<{ sql: string; values: unknown[] }> = []
   const state = { acknowledged: false, requeued: false, enqueued: false }
   let deadlineChecks = 0
@@ -90,8 +90,8 @@ function database(status: "waiting_for_user" | "queued" | "running" = "waiting_f
       attemptCount: scope.parentAttemptCount, interruptRequestedAt: null, leaseValid: true }], rowCount: 1 }
     if (sql.includes('FROM "agent_executions"')) return { rows: [{ id: executionOwner.executionId, status: "running", attemptCount: executionOwner.executionAttemptCount,
       state: {} }], rowCount: 1 }
-    if (sql.includes('FROM "agent_items" AS item')) return { rows: [{ id: `agent-wait:question:${waitId}`, stepId: "question-step", taskId: scope.rootTaskId,
-      type: "question", status: "completed", content: answeredContent, stepStatus: "waiting_for_user" }], rowCount: 1 }
+    if (sql.includes('FROM "agent_items" AS item')) return { rows: [{ id: `agent-wait:question:${options.waitId ?? waitId}`, stepId: "question-step", taskId: scope.rootTaskId,
+      type: "question", status: "completed", content: options.content ?? answeredContent, stepStatus: "waiting_for_user" }], rowCount: 1 }
     if (sql.includes('UPDATE "agent_steps"')) return { rows: [{ id: "question-step" }], rowCount: 1 }
     if (sql.includes('UPDATE "sub_agent_tasks"')) { state.requeued = true; return { rows: [{ id: "gate-task" }], rowCount: 1 } }
     return { rows: [], rowCount: 0 }
@@ -99,8 +99,8 @@ function database(status: "waiting_for_user" | "queued" | "running" = "waiting_f
   return { calls, client: { query, release: vi.fn() }, pool: { connect: vi.fn().mockResolvedValue({ query, release: vi.fn() }) }, state }
 }
 
-function resumeInput(requestAttemptCount = 1) {
-  return { scope, executionOwner, gateTaskId: "gate-task", requestAttemptCount, waitId, now: new Date("2026-10-23T10:00:00Z") }
+function resumeInput(requestAttemptCount = 1, requestedWaitId = waitId) {
+  return { scope, executionOwner, gateTaskId: "gate-task", requestAttemptCount, waitId: requestedWaitId, now: new Date("2026-10-23T10:00:00Z") }
 }
 
 describe("scheduled Gate answer resume command", () => {
@@ -133,6 +133,33 @@ describe("scheduled Gate answer resume command", () => {
     expect(db.calls.filter(call => call.sql.includes('UPDATE "sub_agent_tasks"'))).toHaveLength(1)
     expect(db.calls.some(call => call.sql.includes('UPDATE "agent_steps"'))).toBe(false)
     expect(db.calls.some(call => call.sql.includes("choiceId") || call.sql.includes("answer"))).toBe(false)
+  })
+
+  it("resumes a v2 Gate after multiple Scouts and rejects an answer with a v1 key", async () => {
+    const v2Binding = { ...binding, continuationKey: `scheduled-taskgraph:v2:sha256:${"a".repeat(64)}` }
+    const v2WaitId = turnScheduledGateChoiceWaitId(v2Binding)!
+    const v2Content = createTurnScheduledGateChoiceContent(v2WaitId, v2Binding, "Continue or skip?")!
+    const prefixV2 = [
+      { key: "scout-a", templateId: "scout", taskId: "scout-a-task", depth: 1, dependsOn: [], verificationDisposition: "typed" },
+      { key: "scout-b", templateId: "scout", taskId: "scout-b-task", depth: 1, dependsOn: [], verificationDisposition: "typed" },
+      { key: "analyst", templateId: "analyst", taskId: "analyst-task", depth: 2, dependsOn: ["scout-a", "scout-b"], verificationDisposition: "typed" },
+      { key: "prepare", templateId: "prepare", taskId: "prepare-task", depth: 3, dependsOn: ["analyst"], verificationDisposition: "specialized" },
+    ]
+    const graphV2 = { ...waitingGraph, snapshot: { ...waitingGraph.snapshot, nodes: [...prefixV2, gateNode] },
+      state: { ...graphState, nodes: [...prefixV2.map(node => ({ ...node, status: "completed" })), { key: "gate", taskId: "gate-task", status: "waiting_for_user" }] } }
+    mocks.load.mockResolvedValue(graphV2)
+    mocks.readCandidate.mockResolvedValue({ question, binding: v2Binding })
+    const db = database("waiting_for_user", 1, { waitId: v2WaitId, content: { ...v2Content, answer: "continue", answerAvailable: true,
+      answeredAt: "2026-10-23T10:00:00.000Z" } })
+    await expect(resumeScheduledGateChoice(db.client as never, resumeInput(1, v2WaitId))).resolves.toMatchObject({ status: "accepted" })
+    expect(mocks.acknowledge).toHaveBeenCalledTimes(1)
+
+    mocks.acknowledge.mockClear()
+    mocks.readCandidate.mockResolvedValue({ question, binding })
+    const mismatched = database("waiting_for_user", 1)
+    await expect(resumeScheduledGateChoice(mismatched.client as never, resumeInput())).rejects.toMatchObject({ code: "scheduled_gate_resume_answer" })
+    expect(mocks.acknowledge).not.toHaveBeenCalled()
+    expect(mismatched.calls.some(call => /^\s*UPDATE\b/i.test(call.sql))).toBe(false)
   })
 
   it("replays an exact acknowledgement without another transition or outbox write", async () => {

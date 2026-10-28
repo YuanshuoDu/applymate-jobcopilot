@@ -42,7 +42,10 @@ describe("scheduled Audit fixed contract", () => {
 
   it("parses the exact owner and Gate-to-Audit registration binding", () => {
     expect(parseScheduledAuditRegistrationReceipt(registration)).toMatchObject({ auditTaskId: "audit-task", auditAppendRevision: 13 })
+    expect(parseScheduledAuditRegistrationReceipt({ ...registration, continuationKey: `scheduled-taskgraph:v2:sha256:${"a".repeat(64)}` }))
+      .toMatchObject({ auditTaskId: "audit-task" })
     expect(parseScheduledAuditRegistrationReceipt({ ...registration, auditAppendRevision: 12 })).toBeNull()
+    expect(parseScheduledAuditRegistrationReceipt({ ...registration, continuationKey: `${registration.continuationKey}\n` })).toBeNull()
     expect(parseScheduledAuditRegistrationReceipt({ ...registration, owner: { ...registration.owner, extra: true } })).toBeNull()
     expect(parseScheduledAuditRegistrationReceipt({ ...registration, expectedAttemptCount: 2 })).toBeNull()
   })

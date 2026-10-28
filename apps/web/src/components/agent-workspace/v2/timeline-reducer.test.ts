@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { createTimelineState, selectTimelineItems, timelineReducer, type TimelineEvent, type TimelineItem } from './timeline-reducer'
+import { createTimelineState, normalizeTimelineEvent, selectTimelineItems, timelineReducer, type TimelineEvent, type TimelineItem } from './timeline-reducer'
 
 const baseItem = (id: string, overrides: Partial<TimelineItem> = {}): TimelineItem => ({
   schemaVersion: 'agent-harness.v2', id, sessionId: 'session-1', turnId: 'turn-1', stepId: null,
@@ -201,6 +201,20 @@ describe('timeline reducer', () => {
     expect(state.itemIds).toEqual([])
   })
 
+  it('clears the approval ledger through the normalized live timeline event path', () => {
+    const requested = {
+      schemaVersion: 'agent-harness.v2', id: 'approval-live-requested', sessionId: 'session-1', turnId: 'turn-1', itemId: null, taskId: null,
+      type: 'approval.requested', actor: 'orchestrator', sequence: '1', payload: { approvalId: 'approval-live', action: 'submit_application', revision: 1 },
+    }
+    const pending = timelineReducer(createTimelineState('session-1'), { type: 'event', event: normalizeTimelineEvent(requested) })
+    expect(pending.approvalLedger.projection.pendingCount).toBe(1)
+    const resolved = normalizeTimelineEvent({ ...requested, id: 'approval-live-resolved', type: 'approval.resolved', actor: 'user', sequence: '2', payload: { approvalId: 'approval-live', revision: 2 } })
+    expect(timelineReducer(pending, { type: 'event', event: { ...resolved, unknown: undefined } })).toBe(pending)
+    const settled = timelineReducer(pending, { type: 'event', event: resolved })
+    expect(settled.approvalLedger.projection).toMatchObject({ pendingCount: 0, pendingActions: [], approvals: [{ status: 'resolved' }] })
+    expect(settled.lifecycleRevision).toBe(2)
+  })
+
   it('maps authoritative question answers to completed without allowing terminal regression', () => {
     const question = {
       schemaVersion: 'agent-harness.v2', id: 'question-item', sessionId: 'session-1', turnId: 'turn-1', stepId: null, taskId: null,
@@ -220,6 +234,31 @@ describe('timeline reducer', () => {
     expect(state.lifecycleRevision).toBe(1)
     const regressed = { ...answered, id: 'question-cancelled-late', type: 'question.cancelled', actor: 'system', sequence: '3', payload: { waitKind: 'question', waitId: 'question-1', itemId: 'question-item', toolCallId: null, outcome: 'cancelled', reason: 'interrupt' } }
     expect(timelineReducer(state, { type: 'event', event: regressed })).toBe(state)
+  })
+
+  it.each(['question.answered', 'question.cancelled'])('applies normalized %s to live and later hydrated questions', type => {
+    const question = baseItem('normalized-question', { type: 'question', status: 'started', content: {
+      waitKind: 'question', questionId: 'question-normalized', stage: 'profile', question: 'Choose?', options: [], pending: true, answerAvailable: false,
+    } })
+    const answered = type === 'question.answered'
+    const normalized = normalizeTimelineEvent({
+      schemaVersion: 'agent-harness.v2', id: 'normalized-terminal', sessionId: 'session-1', turnId: 'turn-1',
+      itemId: question.id, taskId: null, type, actor: answered ? 'user' : 'system', sequence: '2',
+      payload: answered
+        ? { waitKind: 'question', waitId: 'question-normalized', itemId: question.id, turnId: 'turn-1', toolCallId: null, status: 'answered', nextTurnRevision: 3, answerAvailable: true }
+        : { waitKind: 'question', waitId: 'question-normalized', itemId: question.id, toolCallId: null, outcome: 'cancelled', reason: 'interrupt' },
+    })
+    const initial = timelineReducer(createTimelineState('session-1'), { type: 'hydrate', items: [question] })
+    expect(timelineReducer(initial, { type: 'event', event: { ...normalized, unknown: undefined } })).toBe(initial)
+    const live = timelineReducer(initial, { type: 'event', event: normalized })
+    const late = timelineReducer(timelineReducer(createTimelineState('session-1'), { type: 'event', event: normalized }), { type: 'hydrate', items: [question] })
+    for (const state of [live, late]) {
+      expect(state.itemsById[question.id]).toMatchObject({ status: answered ? 'completed' : 'interrupted', content: { pending: false, answerAvailable: answered } })
+      expect(state.itemsById[question.id].content).not.toHaveProperty('answer')
+      expect(state.lifecycleRevision).toBe(1)
+      expect(timelineReducer(state, { type: 'replay', items: [question] }).itemsById[question.id].status)
+        .toBe(answered ? 'completed' : 'interrupted')
+    }
   })
 
   it('maps interrupt question cancellation to interrupted and rejects a later answer', () => {

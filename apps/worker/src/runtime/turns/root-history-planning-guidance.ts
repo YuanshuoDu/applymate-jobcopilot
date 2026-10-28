@@ -1,4 +1,5 @@
 import type { ModelMessage } from "@jobcopilot/agent-model"
+import { parseDiscoveryQueryFootprint } from "../subagents/child-discovery-query-footprint.js"
 import { parseRootTaskHistoryNodeLesson } from "../context/root-task-history-lesson-projection.js"
 import { parseRootTaskHistoryPlanShape } from "../context/root-task-history-plan-shape.js"
 import type { StepContext } from "../context/step-context-builder.js"
@@ -17,6 +18,7 @@ const EXECUTION_FAILURE_CATEGORY_ORDER = ["execution_setup_unavailable", "resume
 const HISTORICAL_CATEGORY_INTRO = "Historical execution-category lessons identify earlier prerequisites worth inspecting; they remain hypotheses, so compare them with the current graph, current evidence, and currently available inputs before choosing a next action."
 const FAILED_REPAIR_REASSESSMENT = "A historical repair was verifier-failed; reassess the current graph, verifier evidence, and current result pages before planning."
 const PASSED_CRITERIA_REASSESSMENT = "Historical passed-check descriptors are advisory source-graph checks only; compare them with current accepted instructions, the current graph, criteria, and results, and reverify current work. They do not establish current progress or proof, and past queries or results need not match current ones."
+const SCOUT_QUERY_FOOTPRINT_REASSESSMENT = "Historical Scout query footprints are advisory source-history observations only. Their criteria, cursor presence, and counts are not current instructions, proof of coverage, or current evidence; compare them with the accepted current objective, owner-read graph, and current result pages before planning."
 const REASONS = new Set([
   "criterion_not_met", "reported_score_below_minimum", "contract_invalid", "projection_invalid", "role_mismatch",
   "canonical_evidence_missing", "canonical_evidence_invalid", "canonical_evidence_ambiguous", "result_invalid",
@@ -24,8 +26,8 @@ const REASONS = new Set([
 ])
 
 type Row = Record<string, unknown>
-type SafeHistoryNodeFacts = Readonly<{ hasFact: boolean; hasFailedRepair: boolean; hasPassedCriteria: boolean; executionFailureCategory?: unknown }>
-type SafeHistoryObservation = Readonly<{ executionFailureCategories: ReadonlySet<string>; hasPlanShape: boolean; hasFailedRepair: boolean; hasPassedCriteria: boolean }>
+type SafeHistoryNodeFacts = Readonly<{ hasFact: boolean; hasFailedRepair: boolean; hasPassedCriteria: boolean; hasScoutQueryFootprint: boolean; executionFailureCategory?: unknown }>
+type SafeHistoryObservation = Readonly<{ executionFailureCategories: ReadonlySet<string>; hasPlanShape: boolean; hasFailedRepair: boolean; hasPassedCriteria: boolean; hasScoutQueryFootprint: boolean }>
 
 function exactRecord(value: unknown, keys: readonly string[]): Row | undefined {
   try {
@@ -64,14 +66,14 @@ function safeHistoryNode(value: unknown): SafeHistoryNodeFacts | undefined {
   let keys: string[]
   try { keys = Reflect.ownKeys(candidate).map(key => typeof key === "string" ? key : "") } catch { return undefined }
   if (keys.includes("") || !keys.includes("taskKind") || !keys.includes("status")
-    || keys.some(key => !["taskKind", "status", "negativeReasonHints", "lesson", "reportedOutput"].includes(key))) return undefined
+    || keys.some(key => !["taskKind", "status", "negativeReasonHints", "lesson", "reportedOutput", "priorScoutQueryFootprint"].includes(key))) return undefined
   const node = exactRecord(candidate, keys)
   if (!node || typeof node.taskKind !== "string" || !TASK_KINDS.has(node.taskKind) || typeof node.status !== "string" || !STATUSES.has(node.status)) return undefined
   if (Object.hasOwn(node, "negativeReasonHints")) {
     const hints = safeArray(node.negativeReasonHints, 8, 1)
     if (!hints || hints.some(hint => typeof hint !== "string" || !REASONS.has(hint))) return undefined
   }
-  let hasFact = false, hasFailedRepair = false, hasPassedCriteria = false, executionFailureCategory: unknown
+  let hasFact = false, hasFailedRepair = false, hasPassedCriteria = false, hasScoutQueryFootprint = false, executionFailureCategory: unknown
   if (Object.hasOwn(node, "lesson")) {
     const lesson = parseRootTaskHistoryNodeLesson(node.lesson, node.taskKind, node.status)
     if (!lesson) return undefined
@@ -88,7 +90,13 @@ function safeHistoryNode(value: unknown): SafeHistoryNodeFacts | undefined {
       || !Number.isSafeInteger(output[countKey]) || Number(output[countKey]) < 0) return undefined
     hasFact = true
   }
-  return { hasFact, hasFailedRepair, hasPassedCriteria, ...(executionFailureCategory === undefined ? {} : { executionFailureCategory }) }
+  if (Object.hasOwn(node, "priorScoutQueryFootprint")) {
+    if (node.taskKind !== "scout" || !parseDiscoveryQueryFootprint(node.priorScoutQueryFootprint)) return undefined
+    hasFact = true
+    hasScoutQueryFootprint = true
+  }
+  return { hasFact, hasFailedRepair, hasPassedCriteria, hasScoutQueryFootprint,
+    ...(executionFailureCategory === undefined ? {} : { executionFailureCategory }) }
 }
 
 function safeHistoryTurn(value: unknown): Readonly<{ row: Row; planShape?: unknown }> | undefined {
@@ -118,7 +126,7 @@ function safeHistoryObservation(value: unknown): SafeHistoryObservation | undefi
     || content.notCurrentEvidence !== true || content.label !== HISTORY_LABEL) return undefined
   const turns = safeArray(content.turns, MAX_TURNS, 1)
   if (!turns) return undefined
-  let nodeCount = 0, hasFact = false, hasPlanShape = false, hasFailedRepair = false, hasPassedCriteria = false
+  let nodeCount = 0, hasFact = false, hasPlanShape = false, hasFailedRepair = false, hasPassedCriteria = false, hasScoutQueryFootprint = false
   const executionFailureCategories = new Set<string>()
   for (const value of turns) {
     const candidate = safeHistoryTurn(value), turn = candidate?.row
@@ -131,12 +139,13 @@ function safeHistoryObservation(value: unknown): SafeHistoryObservation | undefi
       hasFact ||= facts.hasFact
       hasFailedRepair ||= facts.hasFailedRepair
       hasPassedCriteria ||= facts.hasPassedCriteria
+      hasScoutQueryFootprint ||= facts.hasScoutQueryFootprint
       if (typeof facts.executionFailureCategory === "string") executionFailureCategories.add(facts.executionFailureCategory)
     }
     const shape = parseRootTaskHistoryPlanShape(candidate.planShape)
     if (shape && shape.nodes.length === nodes.length) hasPlanShape = true
   }
-  return hasFact || hasPlanShape ? { executionFailureCategories, hasPlanShape, hasFailedRepair, hasPassedCriteria } : undefined
+  return hasFact || hasPlanShape ? { executionFailureCategories, hasPlanShape, hasFailedRepair, hasPassedCriteria, hasScoutQueryFootprint } : undefined
 }
 
 function visibleToolNames(tools: readonly unknown[]): ReadonlySet<string> {
@@ -183,6 +192,7 @@ export function buildRootHistoryPlanningInstruction(context: StepContext, tools:
       guidance,
       ...(historical.hasFailedRepair ? [FAILED_REPAIR_REASSESSMENT] : []),
       ...(historical.hasPassedCriteria ? [PASSED_CRITERIA_REASSESSMENT] : []),
+      ...(historical.hasScoutQueryFootprint ? [SCOUT_QUERY_FOOTPRINT_REASSESSMENT] : []),
       ...(categoryAdvice.length ? [`${HISTORICAL_CATEGORY_INTRO} ${categoryAdvice.join(" ")}`] : []),
       ...(historical.hasPlanShape ? ["A prior same-objective plan shape is a comparison hint about source-local roles and dependencies only. Its ordinals and edges are not current graph keys, identities, revision, objective, criteria, evidence, permission, authorization, approval, progress, or completion. Rebuild any plan from the current owner-read graph, current objective and criteria, current evidence, and visible tools; current verification and completion gates remain authoritative."] : []),
     ].join(" ")

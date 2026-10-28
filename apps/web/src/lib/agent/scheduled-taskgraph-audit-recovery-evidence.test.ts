@@ -66,15 +66,15 @@ function gateWait(stepId: string) { const digest = createHash('sha256').update(J
     mode: 'any', status: 'ready', matchedTaskIds: ['gate-1'], result: { request: { targetTaskIds: ['gate-1'], mode: 'any',
       timeoutMs: 86_400_000, scheduledGate: { gateTaskId: 'gate-1', requestAttemptCount: 1 } } } }
 }
-function gateBinding() { return { schemaVersion: 'agent-harness.v2.scheduled-gate-choice-wait.v1', owner: {
+function gateBinding(continuationKey = `scheduled-taskgraph:sha256:${'a'.repeat(64)}`) { return { schemaVersion: 'agent-harness.v2.scheduled-gate-choice-wait.v1', owner: {
     userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
     rootAttemptCount: owner.rootAttemptCount, executionId: owner.executionId, executionAttemptCount: owner.executionAttemptCount },
-  continuationKey: `scheduled-taskgraph:sha256:${'a'.repeat(64)}`, snapshotDigest: `sha256:${'b'.repeat(64)}`,
+  continuationKey, snapshotDigest: `sha256:${'b'.repeat(64)}`,
   evidenceDigest: 'c'.repeat(64), checkpointDigest: 'd'.repeat(64), analyzeGraphRevision: 9, graphRevision: 10,
   gateTaskId: 'gate-1', gateAttempt: 1, kind: 'weak_cover_letter', jobIds: ['job-1'], allowedChoiceIds: ['continue', 'review', 'skip'] }
 }
-function choiceItem(status: 'started' | 'completed' = 'started') {
-  const binding = gateBinding(), waitId = `agent-question:${owner.turnId}:gate:${createHash('sha256').update(JSON.stringify(binding), 'utf8').digest('hex')}`
+function choiceItem(status: 'started' | 'completed' = 'started', binding = gateBinding()) {
+  const waitId = `agent-question:${owner.turnId}:gate:${createHash('sha256').update(JSON.stringify(binding), 'utf8').digest('hex')}`
   return { id: `agent-wait:question:${waitId}`, stepId: 'recovery-step-1', taskId: owner.rootTaskId, type: 'question', status,
     content: { waitKind: 'question', questionId: waitId, toolCallId: null, stage: 'scheduled_gate', question: 'Review this result?',
       options: [{ label: 'Continue with current materials', value: 'continue' }, { label: 'Place for review', value: 'review' },
@@ -211,6 +211,17 @@ describe('scheduled TaskGraph Audit recovery evidence', () => {
     const f = fixture({ steps: [step], events: lifecycle(step, completedPayload(step, 'waiting_for_user')),
       items: [item], tasks: [gateTask()] })
     await expect(validate(f.reader)).resolves.toBe(true)
+  })
+
+  it('accepts v2 Gate bindings and rejects trailing continuation key data', async () => {
+    const step = recoveryStep('waiting_for_user'), binding = gateBinding(`scheduled-taskgraph:v2:sha256:${'e'.repeat(64)}`)
+    const v2 = fixture({ steps: [step], events: lifecycle(step, completedPayload(step, 'waiting_for_user')),
+      items: [choiceItem('started', binding)], tasks: [gateTask()] })
+    await expect(validate(v2.reader)).resolves.toBe(true)
+    const malformed = { ...binding, continuationKey: `${binding.continuationKey}\n` }
+    const rejected = fixture({ steps: [step], events: lifecycle(step, completedPayload(step, 'waiting_for_user')),
+      items: [choiceItem('started', malformed)], tasks: [gateTask()] })
+    await expect(validate(rejected.reader)).resolves.toBe(false)
   })
 
   it('rejects malformed Gate questions and malformed recovery authority', async () => {

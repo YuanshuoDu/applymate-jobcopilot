@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto"
+import { scheduledPipelineContinuationKeyVersion } from "@jobcopilot/agent-protocol"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import type { ScheduledAutomationPipelineAttestation } from "./scheduled-automation-pipeline-bridge.js"
 import type { TaskGraphProposal } from "../planning/task-graph.js"
@@ -154,7 +155,7 @@ export function parseScheduledAuditRegistrationReceipt(value: unknown): Schedule
   if (!row || !owner || row.schemaVersion !== SCHEDULED_AUDIT_REGISTRATION_RECEIPT_SCHEMA
     || !["userId", "sessionId", "turnId", "rootTaskId", "executionId"].every(key => validId(owner[key]))
     || !positive(owner.rootAttemptCount) || !nonNegative(owner.executionAttemptCount)
-    || !validDigest(row.continuationKey, /^scheduled-taskgraph:sha256:[a-f0-9]{64}$/)
+    || !scheduledPipelineContinuationKeyVersion(row.continuationKey)
     || !validDigest(row.snapshotDigest, /^sha256:[a-f0-9]{64}$/) || !validDigest(row.evidenceDigest, /^[a-f0-9]{64}$/)
     || !validDigest(row.checkpointDigest, /^[a-f0-9]{64}$/) || !validDigest(row.gateResultDigest, /^sha256:[a-f0-9]{64}$/)
     || !validDigest(row.gateProofDigest, /^sha256:[a-f0-9]{64}$/)

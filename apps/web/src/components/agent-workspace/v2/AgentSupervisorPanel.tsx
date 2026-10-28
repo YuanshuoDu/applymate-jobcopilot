@@ -17,7 +17,7 @@ import { SelectedJobPreparationCard } from './SelectedJobPreparationCard'
 import { SelectedJobDraftArtifact } from './SelectedJobDraftArtifact'
 import { latestWriterArtifact } from './draft-artifact-projection'
 import type { ChildWorkerTask } from './ChildWorkerAttachView'
-import { includeCurrentQuestionTurn } from './question-turn-lookup'
+import { includeCurrentApprovalTurn, includeCurrentQuestionTurn } from './question-turn-lookup'
 import type { TaskTreeNode } from './types'
 import { SelectedTaskDetailsPanel } from './SelectedTaskDetailsPanel'
 
@@ -34,7 +34,12 @@ export interface AgentSupervisorPanelProps {
 }
 
 /** V2 evidence panel for the live task tree and selected timeline evidence. */
-export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPanelProps) {
+export function AgentSupervisorPanel(props: AgentSupervisorPanelProps) {
+  // Query state must not carry an unscoped active projection across session changes.
+  return <SessionSupervisorPanel key={props.sessionId} {...props} />
+}
+
+function SessionSupervisorPanel({ sessionId, timeline }: AgentSupervisorPanelProps) {
   const { t } = useI18n()
   const [selectedNodeState, setSelectedNodeState] = useState<{ sessionId: string; id: string } | null>(null)
   const selectionControls = supervisorPlanSelectionControls(selectedNodeState, sessionId, setSelectedNodeState)
@@ -70,6 +75,7 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
 
   const turns = useMemo(() => (sessionId ? [...(turnsQuery.data?.turns ?? []), ...extraTurns].filter(turn => turn.sessionId === sessionId) : []), [sessionId, turnsQuery.data, extraTurns])
   const questionTurns = useMemo(() => includeCurrentQuestionTurn(turns, sessionId, turnsQuery.data?.projection), [sessionId, turns, turnsQuery.data?.projection])
+  const approvalTurns = useMemo(() => includeCurrentApprovalTurn(turns, sessionId, turnsQuery.data?.projection), [sessionId, turns, turnsQuery.data?.projection])
   const restoredSelectedJobId = sessionId ? selectedJobIdForTurn(turns, sessionId, selectedPreparationTurnId) : null
   const tasks = useMemo(() => (sessionId ? [...(tasksQuery.data?.tasks ?? []), ...extraTasks].filter(task => task.sessionId === sessionId) : []), [sessionId, tasksQuery.data, extraTasks])
   const lifecycleKey = String(timeline.lifecycleRevision)
@@ -199,7 +205,7 @@ export function AgentSupervisorPanel({ sessionId, timeline }: AgentSupervisorPan
       </div>
       {loading && <p aria-live="polite" style={messageStyle}>{t('agent.loadingTasks')}</p>}
       {error && <p role="alert" style={{ ...messageStyle, color: 'var(--c-danger)' }}>{t('agent.supervisorUnavailable')}</p>}
-      <AgentApprovalLedgerCard ledger={timeline.approvalLedger} sessionId={sessionId} turns={turns} onAccepted={refetchSupervisorRecords} selectionKey={selectedId ?? ''} />
+      <AgentApprovalLedgerCard ledger={timeline.approvalLedger} sessionId={sessionId} turns={approvalTurns} onAccepted={refetchSupervisorRecords} selectionKey={selectedId ?? ''} />
       <AgentQuestionInputCard sessionId={sessionId} items={timeline.items} turns={questionTurns} onAccepted={refetchSupervisorRecords} selectionKey={selectedId ?? ''} />
       <SelectedJobPreparationCard sessionId={sessionId} restoredJobId={restoredSelectedJobId} onAccepted={handlePreparationAccepted} />
       <AgentSupervisorPlanView

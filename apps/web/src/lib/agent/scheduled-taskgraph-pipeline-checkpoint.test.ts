@@ -11,6 +11,7 @@ import type { AnalyzeOutput, ScoredJob, StageResult } from "./types"
 
 const jobAId = "c" + "1".repeat(24)
 const jobBId = "c" + "2".repeat(24)
+const jobCId = "c" + "3".repeat(24)
 
 const owner: ScheduledTaskGraphPipelineOwner = {
   userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
@@ -43,6 +44,28 @@ function attestation(candidateJobIds: string[] = [jobAId, jobBId], evidenceOwner
       taskId: "analyst-task", attemptCount: 1, status: "completed", verification: "passed", resultDigest: "c".repeat(64),
       dependsOnTaskIds: ["scout-task"], jobIds: [...candidateJobIds].reverse(),
     },
+    evidenceDigest: "d".repeat(64),
+  }
+}
+
+function multiScoutAttestation() {
+  const scout = (nodeKey: string, taskId: string, candidateJobIds: string[], digit: string) => ({
+    nodeKey, taskId, attemptCount: 1, status: "completed", verification: "passed", resultDigest: digit.repeat(64),
+    nodeDigest: "a".repeat(64), evidenceDigest: "b".repeat(64), reportDigest: "c".repeat(64), candidateJobIds,
+    discoveryReceipt: { status: "complete", taskId, attemptCount: 1, completedCalls: 1,
+      candidateCount: candidateJobIds.length, providerFailures: 0, materializationFailures: 0, hasMore: false,
+      receiptDigest: "f".repeat(64) },
+  })
+  return {
+    schemaVersion: "agent-harness.v2.scheduled-pipeline-attestation.v2",
+    owner: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+      rootAttemptCount: owner.rootAttemptCount, turnLeaseOwnerId: owner.turnLeaseOwnerId, turnLeaseVersion: owner.turnLeaseVersion },
+    snapshotDigest: scheduledAutomationSnapshotDigest(snapshot), graphRevision: 10,
+    scouts: [scout("scout-a", "scout-task-a", [jobAId, jobCId], "1"), scout("scout-b", "scout-task-b", [jobBId, jobCId], "2")],
+    candidateUnionJobIds: [jobAId, jobBId, jobCId],
+    analyst: { nodeKey: "analyst", taskId: "analyst-task-v2", attemptCount: 1, status: "completed", verification: "passed",
+      resultDigest: "3".repeat(64), nodeDigest: "4".repeat(64), evidenceDigest: "5".repeat(64), reportDigest: "6".repeat(64),
+      dependsOnTaskIds: ["scout-task-a", "scout-task-b"], jobIds: [jobCId, jobAId] },
     evidenceDigest: "d".repeat(64),
   }
 }
@@ -122,6 +145,25 @@ describe("buildScheduledTaskGraphPrepareCheckpoint", () => {
     expect(build({ owner: nextLease, attestation: attestation() }).continuationKey).toBe(first.continuationKey)
     expect(build({ owner: nextLease, attestation: attestation(undefined, nextLease), existingCheckpoint: first.checkpoint }))
       .toMatchObject({ continuationKey: first.continuationKey, alreadyPersisted: true })
+  })
+
+  it("preserves the independently captured v1 continuation key bytes", () => {
+    expect(scheduledTaskGraphContinuationKey(owner, attestation())).toBe(
+      "scheduled-taskgraph:sha256:2f7ff1ce5cb6ab4455153bb6acc247899f300c40af8f346b5606ec461201b855",
+    )
+  })
+
+  it("scopes v2 checkpoint queries and score rows to the Analyst selection while retaining the full union only as proof", () => {
+    const selected = [job(jobCId), job(jobAId)]
+    const result = buildScheduledTaskGraphPrepareCheckpoint({ owner, snapshot, attestation: multiScoutAttestation(),
+      ownedJobs: selected, analyzeResult: analyzeResult(selected) })
+    expect(result.continuationKey).toMatch(/^scheduled-taskgraph:v2:sha256:[a-f0-9]{64}$/)
+    expect(result.checkpoint.scoutedJobs?.map(row => row.id)).toEqual([jobCId, jobAId])
+    expect(result.checkpoint.scoredJobs?.map(row => row.job.id)).toEqual([jobCId, jobAId])
+    expect(JSON.stringify(result.checkpoint)).not.toContain(jobBId)
+    expect(() => buildScheduledTaskGraphPrepareCheckpoint({ owner, snapshot, attestation: multiScoutAttestation(),
+      ownedJobs: [job(jobAId), job(jobBId), job(jobCId)], analyzeResult: analyzeResult([job(jobAId), job(jobBId), job(jobCId)]) }))
+      .toThrowError(expect.objectContaining({ reason: "jobs_mismatch" }))
   })
 
   it("accepts Prisma's initial zero execution attempt and persists that exact owner", () => {
@@ -281,6 +323,10 @@ describe("buildScheduledTaskGraphPrepareCheckpoint", () => {
     const foreignAnalystJob = attestation() as ReturnType<typeof attestation> & { analyst: { jobIds: string[] } }
     foreignAnalystJob.analyst.jobIds = ["c" + "9".repeat(24)]
     expectBlocked(() => build({ attestation: foreignAnalystJob }), "invalid_attestation")
+  })
+
+  it.each([attestation(), multiScoutAttestation()])("preserves rejection of transparent Proxy attestations", value => {
+    expectBlocked(() => build({ attestation: new Proxy(value, {}) }), "invalid_attestation")
   })
 
   it("rejects owner, pinned-snapshot, and checkpoint-stage mismatches", () => {

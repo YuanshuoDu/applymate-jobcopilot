@@ -143,8 +143,11 @@ function setup() {
     owner: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
       rootAttemptCount: owner.rootAttemptCount, turnLeaseOwnerId: owner.turnLeaseOwnerId, turnLeaseVersion: owner.turnLeaseVersion },
     snapshotDigest: scheduledAutomationSnapshotDigest(snapshot), graphRevision: 9,
-    scout: { taskId: 'scout-task', attemptCount: 1, status: 'completed', verification: 'passed', resultDigest: 'a'.repeat(64) },
-    analyst: { taskId: 'analyst-task', attemptCount: 1, status: 'completed', verification: 'passed', resultDigest: 'b'.repeat(64), dependsOnTaskIds: ['scout-task'] },
+    scout: { taskId: 'scout-task', attemptCount: 1, status: 'completed', verification: 'passed', resultDigest: 'a'.repeat(64),
+      candidateJobIds: [jobRow.id], discoveryReceipt: { status: 'complete', taskId: 'scout-task', attemptCount: 1, completedCalls: 1,
+        candidateCount: 1, providerFailures: 0, materializationFailures: 0, hasMore: false, receiptDigest: 'f'.repeat(64) } },
+    analyst: { taskId: 'analyst-task', attemptCount: 1, status: 'completed', verification: 'passed', resultDigest: 'b'.repeat(64),
+      dependsOnTaskIds: ['scout-task'], jobIds: [jobRow.id] },
     evidenceDigest: 'd'.repeat(64) }
   const proof = makeProof(result, analyzeAttestation.evidenceDigest)
   const graph = { id: `task-graph-${createHash('sha256').update(owner.rootTaskId).digest('hex')}`, sessionId: owner.sessionId,
@@ -393,6 +396,17 @@ describe('scheduled TaskGraph Gate input reload', () => {
       ['resume', 'artifact-resume'], ['cover_letter', 'artifact-letter'],
     ])
     expect(mocks.versions).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ userId: owner.userId, sessionId: owner.sessionId }) }))
+  })
+
+  it('accepts historical v1 graph aliases when task IDs and typed dependencies match', async () => {
+    const { input, graph } = setup()
+    const nodes = (graph.content as { nodes: Record<string, unknown>[] }).nodes
+    ;(graph.content as { nodes: Record<string, unknown>[] }).nodes = [
+      { ...nodes[0]!, key: 'scheduled-scout' },
+      { ...nodes[1]!, key: 'scheduled-analyst', dependsOn: ['scheduled-scout'] },
+      { ...nodes[2]!, dependsOn: ['scheduled-analyst'] },
+    ]
+    await expect(loadScheduledTaskGraphGateInput(input)).resolves.toMatchObject({ packages: [{ jobId: jobRow.id }] })
   })
 
   it('rejects a TaskGraph revision that changes after Worker completion proof and before Gate hydration', async () => {

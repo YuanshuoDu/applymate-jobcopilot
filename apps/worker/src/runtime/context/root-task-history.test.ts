@@ -4,6 +4,7 @@ import type { TaskGraphCurrentNode, TaskGraphCurrentState, TaskGraphResultProjec
 import type { ValidatedRootTaskHistoryOutcome } from "./root-task-history.js"
 import { projectRootTaskHistory } from "./root-task-history.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-pg-verification.js"
+import { createDiscoveryQueryFootprint, DISCOVERY_QUERY_FOOTPRINT_SCHEMA_VERSION } from "../subagents/child-discovery-query-footprint.js"
 
 function node(overrides: Partial<TaskGraphCurrentNode> = {}): TaskGraphCurrentNode {
   return {
@@ -23,6 +24,16 @@ function graph(nodes: readonly TaskGraphCurrentNode[]): TaskGraphCurrentState {
 }
 function outcome(id: string, sequence: bigint, nodes: readonly TaskGraphCurrentNode[] = [node()]): ValidatedRootTaskHistoryOutcome {
   return { sourceTurnId: "turn-" + id, sourceRootTaskId: "root-" + id, terminalSequence: sequence, taskGraph: graph(nodes) }
+}
+function queryFootprint(targetRoles: readonly string[] = ["Backend Engineer"]) {
+  return createDiscoveryQueryFootprint([{ criteria: { targetRoles, targetLocations: ["Dublin"],
+    source: "lever", pageSize: 20, hasCursor: false }, outcome: "completed", requestCount: 1, observedCandidateCount: 3,
+    providerFailures: 0, materializationFailures: 0, hasMore: false }])
+}
+function scoutWithFootprint(footprint: unknown, overrides: Partial<TaskGraphCurrentNode> = {}): TaskGraphCurrentNode {
+  return node({ templateId: "scout", verification: { schemaVersion: "agent-harness.v2.task-graph-verification.v1", role: "scout",
+    criteria: [{ id: "scout-count", check: { kind: "candidate_count_gte", minimum: 1 } }] },
+    discoveryQueryFootprint: footprint as TaskGraphCurrentNode["discoveryQueryFootprint"], ...overrides })
 }
 
 describe("root task history projection", () => {
@@ -701,5 +712,101 @@ describe("root task history projection", () => {
     const lesson = { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 1,
       criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" }] } as const
     expect(projectRootTaskHistory([{ ...first, sourceNodeOrdinals: [2], nodeLessons: [lesson] }])).toEqual(projectRootTaskHistory([first]))
+  })
+})
+
+describe("root task history Scout query footprints", () => {
+  it("serializes valid same-session footprints on their exact source ordinal as advisory-only facts", () => {
+    const footprint = queryFootprint(), scout = scoutWithFootprint(footprint), analyst = node({ templateId: "analyst", status: "completed" })
+    const scoutLesson = { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 2,
+      criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" }] } as const
+    const analystLesson = { ...scoutLesson, nodeOrdinal: 1 }
+    const source = { ...outcome("ordinal", 10n, [scout, analyst]), sourceNodeOrdinals: [2, 1], nodeLessons: [scoutLesson, analystLesson],
+      taskGraph: { ...graph([scout, analyst]), discoveryTurnEligibility: "ordinary" as const } }
+    const projected = projectRootTaskHistory([source])
+    const history = projected?.content as { advisoryOnly: boolean; notCurrentEvidence: boolean; turns: Array<{ nodes: Array<Record<string, unknown>> }> }
+
+    expect(history).toMatchObject({ advisoryOnly: true, notCurrentEvidence: true })
+    expect(history.turns[0]?.nodes[0]).toMatchObject({ taskKind: "analyst", lesson: { nodeOrdinal: 1 } })
+    expect(history.turns[0]?.nodes[0]).not.toHaveProperty("priorScoutQueryFootprint")
+    expect(history.turns[0]?.nodes[1]).toMatchObject({ taskKind: "scout", lesson: { nodeOrdinal: 2 }, priorScoutQueryFootprint: footprint })
+    expect(JSON.stringify(projected)).not.toContain("discoveryTurnEligibility")
+    expect(JSON.stringify(projected)).not.toContain("PRIVATE_TASK_ID")
+  })
+
+  it("requires only the exact ordinary marker and ignores a footprint when the marker is missing", () => {
+    const scout = scoutWithFootprint(queryFootprint())
+    const missing = projectRootTaskHistory([outcome("missing-marker", 2n, [scout])])
+    expect(missing?.content).toMatchObject({ turns: [{ nodes: [{ taskKind: "scout" }] }] })
+    expect(JSON.stringify(missing)).not.toContain("priorScoutQueryFootprint")
+
+    const wrongMarker = { ...outcome("wrong-marker", 3n, [scout]),
+      taskGraph: { ...graph([scout]), discoveryTurnEligibility: "scheduled" as unknown as "ordinary" } }
+    expect(projectRootTaskHistory([wrongMarker])).toBeUndefined()
+    const extraGraphField = { ...outcome("extra-graph-field", 4n, [scout]),
+      taskGraph: { ...graph([scout]), discoveryTurnEligibility: "ordinary" as const, privateField: true } as never }
+    expect(projectRootTaskHistory([extraGraphField])).toBeUndefined()
+  })
+
+  it("rechecks cross-session locality in the final serializer while keeping the existing history", () => {
+    const scout = scoutWithFootprint(queryFootprint()), terminalAt = new Date("2026-10-27T00:00:00Z")
+    const crossSession = { ...outcome("cross-session-footprint", 2n, [scout]), terminalAt, sourceSessionDiffers: true,
+      taskGraph: { ...graph([scout]), discoveryTurnEligibility: "ordinary" as const } }
+    const projected = projectRootTaskHistory([crossSession], true)
+    const history = projected?.content as { historical?: boolean; turns: Array<{ nodes: Array<Record<string, unknown>> }> }
+    expect(history.historical).toBe(true)
+    expect(history.turns[0]?.nodes[0]).toMatchObject({ taskKind: "scout", status: "failed" })
+    expect(history.turns[0]?.nodes[0]).not.toHaveProperty("priorScoutQueryFootprint")
+  })
+
+  it("keeps newest-first ordering and existing two-Turn/eight-node caps with footprints", () => {
+    const attempt = (name: string, sequence: bigint) => {
+      const nodes = Array.from({ length: 4 }, () => scoutWithFootprint(queryFootprint([name])))
+      return { ...outcome(name, sequence, nodes), taskGraph: { ...graph(nodes), discoveryTurnEligibility: "ordinary" as const } }
+    }
+    const projected = projectRootTaskHistory([attempt("oldest", 1n), attempt("middle", 2n), attempt("newest", 3n)])
+    type FootprintNode = { priorScoutQueryFootprint?: { calls: Array<{ criteria: { targetRoles: string[] } }> } }
+    const history = projected?.content as { turns: Array<{ nodes: FootprintNode[] }> }
+    expect(history.turns).toHaveLength(2)
+    expect(history.turns.flatMap(turn => turn.nodes)).toHaveLength(8)
+    expect(history.turns[0]?.nodes[0]?.priorScoutQueryFootprint?.calls[0]?.criteria.targetRoles).toEqual(["newest"])
+    expect(history.turns[1]?.nodes[0]?.priorScoutQueryFootprint?.calls[0]?.criteria.targetRoles).toEqual(["middle"])
+    expect(JSON.stringify(projected)).not.toContain("oldest")
+  })
+
+  it("preserves valid unknown and omitted states without claiming zero or complete coverage", () => {
+    const unknown = createDiscoveryQueryFootprint([{ criteria: { targetRoles: ["Backend Engineer"], targetLocations: [],
+      hasCursor: false }, outcome: "unresolved", requestCount: null, observedCandidateCount: null,
+      providerFailures: null, materializationFailures: null, hasMore: null }])
+    const omitted = { schemaVersion: DISCOVERY_QUERY_FOOTPRINT_SCHEMA_VERSION, availability: "omitted" as const, omissionReason: "capture_unavailable" as const }
+    const emit = (value: unknown) => projectRootTaskHistory([{ ...outcome("unknown", 3n, [scoutWithFootprint(value)]),
+      taskGraph: { ...graph([scoutWithFootprint(value)]), discoveryTurnEligibility: "ordinary" as const } }])
+    const unresolved = emit(unknown), unavailable = emit(omitted)
+    expect(JSON.stringify(unresolved)).toContain('"requestCount":null')
+    expect(JSON.stringify(unresolved)).toContain('"observedCandidateCount":null')
+    expect(JSON.stringify(unresolved)).not.toContain('"complete":true')
+    expect(unavailable?.content).toMatchObject({ turns: [{ nodes: [{ priorScoutQueryFootprint: {
+      availability: "omitted", omissionReason: "capture_unavailable",
+    } }] }] })
+  })
+
+  it("drops optional footprints before lessons when the complete observation exceeds 8 KiB", () => {
+    const criteria = { targetRoles: Array.from({ length: 8 }, (_, index) => `Role-${index}-${"x".repeat(140)}`),
+      targetLocations: Array.from({ length: 8 }, (_, index) => `Place-${index}-${"y".repeat(140)}`), hasCursor: false }
+    const large = createDiscoveryQueryFootprint([{ criteria, outcome: "completed", requestCount: 1, observedCandidateCount: 1,
+      providerFailures: 0, materializationFailures: 0, hasMore: false }])
+    expect(JSON.stringify(large).length).toBeGreaterThan(2000)
+    const nodes = Array.from({ length: 4 }, (_, index) => scoutWithFootprint(large, { key: `scout-${index}`, taskId: `task-${index}` }))
+    const lessons = nodes.map((_, index) => ({ ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
+      nodeOrdinal: index + 1, criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" }] } as const))
+    const source = { ...outcome("byte-pressure", 9n, nodes), sourceNodeOrdinals: [1, 2, 3, 4], nodeLessons: lessons,
+      taskGraph: { ...graph(nodes), discoveryTurnEligibility: "ordinary" as const } }
+    const projected = projectRootTaskHistory([source])
+    const history = projected?.content as { turns: Array<{ nodes: Array<Record<string, unknown>> }> }
+    const emitted = history.turns[0]?.nodes ?? []
+
+    expect(Buffer.byteLength(JSON.stringify(projected), "utf8")).toBeLessThanOrEqual(8 * 1024)
+    expect(emitted.filter(item => item.priorScoutQueryFootprint).length).toBeLessThan(4)
+    expect(emitted.every(item => item.lesson !== undefined)).toBe(true)
   })
 })

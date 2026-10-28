@@ -29,8 +29,8 @@ describe('AgentComposerActiveTurn', () => {
     }
     const html = renderToString(<AgentComposerActiveTurn controller={controller} />)
 
-    expect(html).toContain('Steer current Turn')
-    expect(html).toContain('Queue follow-up')
+    expect(html).toContain('Update this run')
+    expect(html).toContain('Send after this run')
     expect(html).toContain('data-testid="interrupt-turn"')
     expect(html).toContain('Sending')
     expect(html).toContain('Accepted')
@@ -48,6 +48,12 @@ describe('AgentComposerActiveTurn', () => {
     }
     expect(renderToString(<AgentComposerActiveTurn controller={controller} />)).not.toContain('open-objective-replacement')
     expect(renderToString(<AgentComposerActiveTurn controller={{ ...controller, sessionStatus: 'running', activeTurn: null }} />)).not.toContain('open-objective-replacement')
+    expect(renderToString(<AgentComposerActiveTurn controller={{ ...controller, activeTurn: null }} />)).toBe('')
+    const receipt = renderToString(<AgentComposerActiveTurn controller={{ ...controller, activeTurn: null,
+      messages: [{ clientMessageId: 'accepted', text: 'Follow up', delivery: 'follow_up', status: 'accepted' }],
+    }} />)
+    expect(receipt).toContain('Accepted')
+    expect(receipt).not.toContain('Turn delivery')
   })
 
   it('detects a stale replacement target when the Turn, revision, or Session status changes', () => {
@@ -120,6 +126,7 @@ describe('AgentComposerActiveTurn', () => {
       ObjectiveReplacementCommandError: class extends Error {},
       replaceAgentObjective,
     }))
+    vi.doMock('@/lib/i18n', () => ({ useI18n: () => ({ t: (key: string) => key }) }))
 
     try {
       const { AgentComposerActiveTurn: renderComposer } = await import('./AgentComposerActiveTurn')
@@ -159,6 +166,7 @@ describe('AgentComposerActiveTurn', () => {
         text: 'New objective from the open form',
       })
     } finally {
+      vi.doUnmock('@/lib/i18n')
       vi.doUnmock('./agent-objective-replacement-command')
       vi.doUnmock('react')
       vi.resetModules()

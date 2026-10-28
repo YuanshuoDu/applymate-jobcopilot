@@ -13,6 +13,7 @@ import { taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 import { SCHEDULED_GATE_REGISTRATION_RECEIPT_EVENT, SCHEDULED_GATE_REGISTRATION_RECEIPT_SCHEMA,
   scheduledGateRegistrationReceiptKey } from "./scheduled-gate-registration-receipt.js"
 import { readScheduledAuditResumeContext, resumeScheduledAudit, scheduledAuditCompletionProofMatches } from "./scheduled-audit-resume.js"
+import { scheduledGatePreparePrefixMatches } from "./scheduled-gate-prepare-prefix-proof.js"
 const resumeContextMocks = vi.hoisted(() => ({ current: vi.fn(), load: vi.fn(), lock: vi.fn(), registration: vi.fn(), verifyGate: vi.fn(),
   prepareProof: vi.fn(), preparePrefix: vi.fn() }))
 vi.mock("./task-graph-pg-state.js", () => ({ currentTaskGraph: resumeContextMocks.current,
@@ -80,7 +81,11 @@ function gateContinuationFixture(options: Readonly<{ requireApproval?: boolean; 
   const prepareProof = { receipt: { schemaVersion: "agent-harness.v2.scheduled-taskgraph-continuation-receipt.v1",
     owner: gateEvidenceOwner, continuationKey: evidence.continuationKey, snapshotDigest: gateSnapshotDigest, evidenceDigest: evidence.evidenceDigest,
     checkpointDigest: evidence.checkpointDigest, analyzeGraphRevision: 4, prepareScheduleRevision: 5 },
-    completion: { graphRevision: 5, wait: { waitId: registration.prepareWaitId }, nodes: [{}, {}, { taskId: "prepare-1" }] },
+    completion: { graphRevision: 5, wait: { waitId: registration.prepareWaitId }, nodes: [
+      { taskId: "scout-1", attemptCount: 1, role: "scout", taskType: "job_discovery", status: "completed", verification: "passed", dependsOnTaskIds: [] },
+      { taskId: "analyst-1", attemptCount: 1, role: "analyst", taskType: "job_analysis", status: "completed", verification: "passed", dependsOnTaskIds: ["scout-1"] },
+      { taskId: "prepare-1", attemptCount: 1, role: "prepare", taskType: "scheduled_application_prepare", status: "completed", verification: "passed", dependsOnTaskIds: ["analyst-1"] },
+    ] },
     result: { jobs: [{ jobId: "job-1", status: "prepared" }] } }
   const nodes = [
     { key: "scout", taskId: "scout-1", templateId: "scout", depth: 1, verificationDisposition: "typed", verification: { role: "scout", criteria: [{ id: "scout" }] }, dependsOn: [] },
@@ -95,9 +100,9 @@ function gateContinuationFixture(options: Readonly<{ requireApproval?: boolean; 
   const gateTask = { id: "gate-1", status: "running", role: SCHEDULED_GATE_ROLE, taskType: SCHEDULED_GATE_TASK_TYPE,
     expectedOutputSchema: SCHEDULED_GATE_OUTPUT_SCHEMA, allowedActions: [], contextIsEmpty: true, attemptCount: 2, failureReason: null }
   const tasks = new Map<string, unknown>([
-    ["scout-1", { id: "scout-1", status: "completed", role: "scout", attemptCount: 1 }],
-    ["analyst-1", { id: "analyst-1", status: "completed", role: "analyst", attemptCount: 1 }],
-    ["prepare-1", { id: "prepare-1", status: "completed", role: "prepare", attemptCount: 1,
+    ["scout-1", { id: "scout-1", status: "completed", role: "scout", taskType: "job_discovery", attemptCount: 1, failureReason: null }],
+    ["analyst-1", { id: "analyst-1", status: "completed", role: "analyst", taskType: "job_analysis", attemptCount: 1, failureReason: null }],
+    ["prepare-1", { id: "prepare-1", status: "completed", role: "prepare", taskType: "scheduled_application_prepare", attemptCount: 1, failureReason: null,
       result: { taskGraphScheduledPrepareProofFacts: { receipt: prepareProof.receipt,
         completion: { graphRevision: prepareProof.completion.graphRevision, nodes: prepareProof.completion.nodes },
         result: prepareProof.result } } }],
@@ -105,7 +110,7 @@ function gateContinuationFixture(options: Readonly<{ requireApproval?: boolean; 
   ])
   const appliedEvents = [{ nodeKey: SCHEDULED_GATE_TEMPLATE_ID, type: "task.started",
     idempotencyKey: taskGraphLifecycleKey(scope.rootTaskId, SCHEDULED_GATE_TEMPLATE_ID, 1, "task.started"), expectedRevision: 6 }]
-  const loaded = { item: { id: "graph-item" }, snapshot: { nodes }, state: { revision: 8, appliedEvents }, tasks }
+  const loaded = { item: { id: "graph-item" }, snapshot: { nodes }, state: { revision: 8, nodes: currentNodes, appliedEvents }, tasks }
   resumeContextMocks.load.mockResolvedValue(loaded as never)
   resumeContextMocks.current.mockReturnValue({ revision: 8, nodes: currentNodes })
   resumeContextMocks.prepareProof.mockResolvedValue(prepareProof)
@@ -122,7 +127,36 @@ function gateContinuationFixture(options: Readonly<{ requireApproval?: boolean; 
       : sql.includes('FROM "agent_events"') && values?.[2] === SCHEDULED_GATE_REGISTRATION_RECEIPT_EVENT
         ? { rows: [gateReceiptRow] } : { rows: [] })
   const readScope = { ...scope, turnLeaseOwner: turnLeaseOwnerId, turnLeaseVersion, parentLeaseOwner: "root-owner" }
-  return { query, readScope, evidence, registration, prepareProof, executionState }
+  return { query, readScope, evidence, registration, prepareProof, executionState, loaded }
+}
+
+function v1AnalyzeNodes() {
+  return [
+    { key: "scout", taskId: "scout-1", templateId: "scout", depth: 1, dependsOn: [], verificationDisposition: "typed" },
+    { key: "analyst", taskId: "analyst-1", templateId: "analyst", depth: 2, dependsOn: ["scout"], verificationDisposition: "typed" },
+  ]
+}
+
+function v1AuditGraph(auditStatus: "queued" | "completed", failureReason: string | null) {
+  const nodes = [
+    ...v1AnalyzeNodes(),
+    { key: "prepare", taskId: "prepare-1", templateId: "prepare", depth: 3, dependsOn: ["analyst"], verificationDisposition: "specialized" },
+    { key: SCHEDULED_GATE_TEMPLATE_ID, taskId: "gate-1", templateId: SCHEDULED_GATE_TEMPLATE_ID, depth: 4,
+      dependsOn: ["prepare"], verificationDisposition: "specialized" },
+    { key: SCHEDULED_AUDIT_TEMPLATE_ID, taskId: "audit-1", templateId: SCHEDULED_AUDIT_TEMPLATE_ID, depth: 5,
+      verificationDisposition: "specialized", goal: SCHEDULED_AUDIT_NODE_GOAL,
+      successCriteria: SCHEDULED_AUDIT_NODE_CRITERIA, dependsOn: [SCHEDULED_GATE_TEMPLATE_ID] },
+  ]
+  const currentNodes = nodes.map(node => ({ key: node.key, taskId: node.taskId,
+    status: node.key === SCHEDULED_AUDIT_TEMPLATE_ID ? auditStatus : "completed",
+    failureReason: node.key === SCHEDULED_AUDIT_TEMPLATE_ID ? failureReason : null }))
+  const tasks = new Map<string, unknown>([
+    ["gate-1", { id: "gate-1", status: "completed", attemptCount: 1, failureReason: null }],
+    ["audit-1", { id: "audit-1", status: auditStatus, failureReason, role: SCHEDULED_AUDIT_ROLE,
+      taskType: SCHEDULED_AUDIT_TASK_TYPE, expectedOutputSchema: SCHEDULED_AUDIT_OUTPUT_SCHEMA,
+      allowedActions: [], contextIsEmpty: true, attemptCount: 1 }],
+  ])
+  return { nodes, currentNodes, tasks }
 }
 
 beforeEach(() => {
@@ -214,18 +248,12 @@ describe("scheduled Audit root resume", () => {
 
   it("accepts retry-queued Audit rows that retain their prior failure reason", async () => {
     const failureReason = "scheduled_audit_handoff_retryable"
-    const auditNode = { key: SCHEDULED_AUDIT_TEMPLATE_ID, templateId: SCHEDULED_AUDIT_TEMPLATE_ID,
-      taskId: "audit-1", depth: 5, verificationDisposition: "specialized", goal: SCHEDULED_AUDIT_NODE_GOAL,
-      successCriteria: SCHEDULED_AUDIT_NODE_CRITERIA, dependsOn: ["gate"] }
-    const tasks = new Map([["audit-1", { id: "audit-1", status: "queued", failureReason, role: SCHEDULED_AUDIT_ROLE,
-      taskType: SCHEDULED_AUDIT_TASK_TYPE, expectedOutputSchema: SCHEDULED_AUDIT_OUTPUT_SCHEMA,
-      allowedActions: [], contextIsEmpty: true, attemptCount: 1 }]])
-    resumeContextMocks.load.mockResolvedValue({ item: { id: "graph-item" }, snapshot: { nodes: [
-      { key: "scout" }, { key: "analyst" }, { key: "prepare" }, { key: "gate" }, auditNode,
-    ] }, state: { revision: 19 }, tasks })
-    resumeContextMocks.current.mockReturnValue({ nodes: [{ key: SCHEDULED_AUDIT_TEMPLATE_ID,
-      taskId: "audit-1", status: "queued", failureReason }] })
+    const graph = v1AuditGraph("queued", failureReason)
+    resumeContextMocks.load.mockResolvedValue({ item: { id: "graph-item" }, snapshot: { nodes: graph.nodes },
+      state: { revision: 19, appliedEvents: [] }, tasks: graph.tasks })
+    resumeContextMocks.current.mockReturnValue({ nodes: graph.currentNodes })
     resumeContextMocks.registration.mockResolvedValue({ auditTaskId: "audit-1", owner,
+      continuationKey: `scheduled-taskgraph:sha256:${"d".repeat(64)}`,
       snapshotDigest, expectedAttemptCount: 1 })
     resumeContextMocks.verifyGate.mockResolvedValue(gateProof)
     const readScope = { ...scope, turnLeaseOwner: "turn-owner", turnLeaseVersion: 4, parentLeaseOwner: "root-owner" }
@@ -242,9 +270,9 @@ describe("scheduled Audit root resume", () => {
       gateResultDigest: `sha256:${"e".repeat(64)}`, gateCompletedEventRevision: 12,
       gateProofDigest: `sha256:${"f".repeat(64)}`, scheduledWaitId: null, auditTaskId: "audit-1",
       gateGraphRevision: 12, auditAppendRevision: 13, expectedAttemptCount: 1 }
-    resumeContextMocks.load.mockResolvedValue({ item: { id: "graph-item" }, snapshot: { nodes: [
-      { key: "scout" }, { key: "analyst" }, { key: "prepare" },
-    ] }, state: { revision: 12 }, tasks: new Map() })
+    const nodes = v1AnalyzeNodes()
+    resumeContextMocks.load.mockResolvedValue({ item: { id: "graph-item" }, snapshot: { nodes },
+      state: { revision: 12, appliedEvents: [] }, tasks: new Map() })
     const readScope = { ...scope, turnLeaseOwner: "turn-owner", turnLeaseVersion: 4, parentLeaseOwner: "root-owner" }
     const noReceiptQuery = vi.fn(async () => ({ rows: [], rowCount: 1 }))
     await expect(readScheduledAuditResumeContext({ query: noReceiptQuery } as never, { scope: readScope } as never))
@@ -261,6 +289,7 @@ describe("scheduled Audit root resume", () => {
 
   it("reconstructs the exact registered four-node Gate continuation and canonical choice wait", async () => {
     const fixture = gateContinuationFixture({ scheduledWaitId: "agent-question:turn-1:canonical:root-wait" })
+    expect(scheduledGatePreparePrefixMatches(fixture.loaded as never, fixture.prepareProof as never)).toBe(true)
     const result = await readScheduledAuditResumeContext({ query: fixture.query } as never, { scope: fixture.readScope } as never)
     expect(result).toEqual({ status: "gate_continuation", handoff: {
       status: "analyze_checkpointed", continuationKey: fixture.evidence.prepareWaitContinuationKey,

@@ -6,10 +6,10 @@ import type { AgentSessionDetail } from './session-view-model'
 import { sessionStatusLabel } from './session-view-model'
 import { formQuestionFields } from '@/lib/agent/application-task-input'
 import { useI18n } from '@/lib/i18n'
-import { projectTaskTree } from './agent-workspace-projection'
+import { budgetViewState } from './agent-workspace-projection'
 import { SessionStatusCards } from './SessionStatusCards'
 import { SubmissionRecoveryControl } from './SubmissionRecoveryControl'
-import { FocusTaskTree, focusQuestionOptions } from './session-focus-parts'
+import { focusQuestionOptions } from './session-focus-parts'
 
 interface DetailResponse { session: AgentSessionDetail }
 function formWaitId(question: unknown): string | null { const waitId = question && typeof question === 'object' && !Array.isArray(question) ? (question as Record<string, unknown>).waitId : null; return typeof waitId === 'string' && waitId.trim() ? waitId : null }
@@ -33,22 +33,15 @@ function isRetryableApplicationFill(task: { status: string; checkpoint: string |
 export function needsApplicationFillRetryPolling(tasks: Array<{ id: string; status: string; checkpoint: string | null }>, readiness: Array<{ id: string; cancelledFillRetryReady: boolean }> | undefined, loading: boolean) {
   return !loading && tasks.some(task => isRetryableApplicationFill(task) && !readiness?.some(row => row.id === task.id && row.cancelledFillRetryReady))
 }
-export function SessionFocusPanel({ sessionId }: { sessionId: string | null }) {
-  const { t } = useI18n()
-  if (!sessionId) {
-    return (
-      <Section title={t('agent.queuedTasks')}>
-        <EmptyText>{t('agent.selectSessionDetails')}</EmptyText>
-      </Section>
-    )
-  }
-  return <SessionFocusPanelInner sessionId={sessionId} key={sessionId} />
+type AttentionCallback = (sessionId: string, needsAttention: boolean) => void
+export function SessionFocusPanel({ sessionId, onAttentionChange }: { sessionId: string | null; onAttentionChange?: AttentionCallback }) {
+  if (!sessionId) return null
+  return <SessionFocusPanelInner sessionId={sessionId} onAttentionChange={onAttentionChange} key={sessionId} />
 }
-function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
+function SessionFocusPanelInner({ sessionId, onAttentionChange }: { sessionId: string; onAttentionChange?: AttentionCallback }) {
   const { t } = useI18n()
   const { data, loading, error, refetch } = useApi<DetailResponse>(`/api/agent/sessions/${sessionId}`)
   const session = data?.session
-  const tasks = session?.tasks ?? []
   const approvals = session?.approvals ?? []
   const applicationTasks = session?.applicationTasks ?? []
   const hasApplicationFillRetryCandidate = applicationTasks.some(isRetryableApplicationFill)
@@ -57,8 +50,19 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
   const needsApplicationFillRetryReadiness = needsApplicationFillRetryPolling(applicationTasks, retryReadiness?.tasks, retryReadinessLoading)
   const execution = session?.execution
   const questions = session?.questions ?? []
-  const taskTree = React.useMemo(() => projectTaskTree(tasks), [tasks])
   const pendingApprovals = approvals.filter(approval => approval.status === 'pending')
+  const budget = session?.budget
+  const budgetState = budgetViewState(budget?.used, budget?.limit)
+  const actionableBudget = budget && (budget.warning?.trim() || budgetState === 'near_limit' || budgetState === 'exhausted') ? budget : undefined
+  const needsAttention = pendingApprovals.length > 0
+    || questions.some(question => !(question.answered === true || (question.answerAvailable === true && question.pending === false)))
+    || applicationTasks.some(task => ['waiting_for_user', 'unknown', 'failed'].includes(task.status) || isRetryableApplicationFill(task))
+    || Boolean(session?.uncertain?.length)
+    || Boolean(actionableBudget)
+  const attentionReady = Boolean(session) && !loading
+  React.useEffect(() => {
+    if (attentionReady) onAttentionChange?.(sessionId, needsAttention)
+  }, [attentionReady, needsAttention, onAttentionChange, sessionId])
   const [answers, setAnswers] = React.useState<Record<string, string>>({})
   React.useEffect(() => {
     const refresh = () => { void refetch(); if (hasCancelledByUserRetryCandidate) void refetchRetryReadiness() }
@@ -100,17 +104,13 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
   }
   return (
     <>
-      <Section title="Session focus"><div style={{ padding: '9px 10px' }}><div style={{ fontSize: 12, fontWeight: 750, color: 'var(--text)' }}>{session?.goal ?? 'Goal unavailable'}</div>{session && <div style={rowMetaStyle}>Session {session.id} · {sessionStatusLabel(session.status)} · updated {new Date(session.updatedAt).toLocaleString('en-GB')}</div>}</div></Section>
-      <Section title={t('agent.queuedTasks')}>
+      {(loading || error) && <Section title={t('agent.sessionDetails')}>
         {loading && <EmptyText>{t('agent.loadingTasks')}</EmptyText>}
         {error && <EmptyText>
           {t('agent.sessionDetailsUnavailable')} <button type="button" onClick={() => { void refetch() }} style={retryButtonStyle}>{t('agent.retry')}</button>
         </EmptyText>}
-        {!loading && !error && taskTree.length === 0 && <EmptyText>{t('agent.noTaskRecords')}</EmptyText>}
-        <FocusTaskTree nodes={taskTree} />
-      </Section>
-      <Section title={t('agent.approvals')}>
-        {!loading && pendingApprovals.length === 0 && <EmptyText>{t('agent.noPendingApprovals')}</EmptyText>}
+      </Section>}
+      {pendingApprovals.length > 0 && <Section title={t('agent.approvals')}>
         {pendingApprovals.slice(0, 3).map(approval => (
           <div key={approval.id} style={rowStyle}>
             <div style={{ minWidth: 0, flex: 1 }}>
@@ -120,10 +120,9 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
             <span style={{ ...badgeStyle, color: '#d97706' }}>{t('agent.waiting')}</span>
           </div>
         ))}
-      </Section>
-      <Section title={t('agent.applicationTasks')}>
-        {!loading && applicationTasks.length === 0 && <EmptyText>{t('agent.noApplicationTasks')}</EmptyText>}
-        {applicationTasks.slice(0, 5).map(task => {
+      </Section>}
+      {applicationTasks.length > 0 && <Section title={t('agent.applicationTasks')}>
+        {applicationTasks.map(task => {
           const fields = task.status === 'waiting_for_user' && task.checkpoint === 'form_answer_required' ? formQuestionFields(task.question) : []
           const waitId = formWaitId(task.question)
           const retryableFill = isRetryableApplicationFill(task)
@@ -147,20 +146,18 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
           </div>
           )
         })}
-      </Section>
-      <Section title={t('agent.executionControl')}>
-        {!loading && !execution && <EmptyText>{t('agent.noExecution')}</EmptyText>}
-        {execution && <div style={rowStyle}>
+      </Section>}
+      {execution && <Section title={t('agent.executionControl')}>
+        <div style={rowStyle}>
           <div style={{ minWidth: 0, flex: 1 }}>
             <div style={rowTitleStyle}>{execution.status} · {execution.checkpoint}</div>
             <div style={rowMetaStyle}>attempt {execution.attemptCount}</div>
             {execution.error && <div style={{ ...rowMetaStyle, color: '#b91c1c' }}>{execution.error}</div>}
           </div>
           {!['completed', 'failed', 'cancelled'].includes(execution.status) && <button onClick={() => { void cancelExecution(execution.id) }} style={{ fontSize: 9, color: '#b91c1c', border: '1px solid var(--border)', background: 'transparent', borderRadius: 5, padding: '3px 5px', cursor: 'pointer' }}>{t('agent.cancelRun')}</button>}
-        </div>}
-      </Section>
-      <Section title={t('agent.questionsWaiting')}>
-        {!loading && questions.length === 0 && <EmptyText>{t('agent.noQuestions')}</EmptyText>}
+        </div>
+      </Section>}
+      {questions.length > 0 && <Section title={t('agent.questionsWaiting')}>
         {questions.map(question => {
           const options = focusQuestionOptions(question.options)
           const answered = question.answered === true || (question.answerAvailable === true && question.pending === false)
@@ -175,16 +172,13 @@ function SessionFocusPanelInner({ sessionId }: { sessionId: string }) {
             </div>
           </div>
         })}
-      </Section>
-      <SessionStatusCards artifacts={session?.artifacts} budget={session?.budget} compaction={session?.compaction} uncertain={session?.uncertain} />
-      <Section title={t('agent.sessionQuality')}>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-          <QualityMetric label={t('agent.quality')} value={session?.qualityScore == null ? '--' : `${Math.round(session.qualityScore)}%`} />
-          <QualityMetric label={t('agent.tasks')} value={tasks.length.toString()} />
-          <QualityMetric label={t('agent.approvals')} value={approvals.length.toString()} warn={pendingApprovals.length > 0} />
-          <QualityMetric label={t('common.status')} value={session ? sessionStatusLabel(session.status) : '--'} />
-        </div>
-      </Section>
+      </Section>}
+      <SessionStatusCards artifacts={session?.artifacts} budget={actionableBudget} />
+      {!!session?.uncertain?.length && <Section title={t('agent.needsAttention')}>
+        {session.uncertain.map(item => <div key={item.id} style={rowStyle}>
+          <div style={{ minWidth: 0, fontSize: 11, color: 'var(--text)', overflowWrap: 'anywhere' }}><strong>{item.label}</strong><div style={{ marginTop: 4 }}>{item.detail}</div></div>
+        </div>)}
+      </Section>}
     </>
   )
 }
@@ -196,16 +190,6 @@ function Section({ title, children }: { title: string; children: React.ReactNode
       <div style={{ border: '1px solid var(--border)', borderRadius: 8, background: 'var(--bg)', overflow: 'hidden' }}>
         {children}
       </div>
-    </div>
-  )
-}
-function QualityMetric({ label, value, warn = false }: { label: string; value: string; warn?: boolean }) {
-  return (
-    <div style={{ padding: '8px 9px', borderRight: '1px solid var(--border)', borderBottom: '1px solid var(--border)' }}>
-      <div style={{ fontSize: 13, lineHeight: 1.1, fontWeight: 750, color: warn ? '#d97706' : 'var(--text)' }}>
-        {value}
-      </div>
-      <div style={{ fontSize: 9, color: 'var(--text-muted)', marginTop: 3 }}>{label}</div>
     </div>
   )
 }
@@ -225,11 +209,8 @@ const rowStyle: React.CSSProperties = {
   borderTop: '1px solid var(--border)',
 }
 const rowTitleStyle: React.CSSProperties = {
-  fontSize: 11, fontWeight: 650,
-  color: 'var(--text)',
-  overflow: 'hidden',
-  textOverflow: 'ellipsis',
-  whiteSpace: 'nowrap',
+  fontSize: 11, fontWeight: 650, color: 'var(--text)',
+  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
 }
 const rowMetaStyle: React.CSSProperties = {
   fontSize: 9,

@@ -9,7 +9,7 @@ import type { SubagentLease } from "./types.js"
 const mocks = vi.hoisted(() => ({
   post: vi.fn(), current: vi.fn(), loadGraph: vi.fn(), evidence: vi.fn(), preparedIds: vi.fn(), registration: vi.fn(),
   prepareProof: vi.fn(), snapshotMatches: vi.fn(), parseSnapshot: vi.fn(), parseHealth: vi.fn(), validateRole: vi.fn(),
-  parseReport: vi.fn(), createCommand: vi.fn(), readInvocation: vi.fn(),
+  parseReport: vi.fn(), createCommand: vi.fn(), readInvocation: vi.fn(), pipelineAttestation: vi.fn(),
 }))
 vi.mock("./scheduled-pipeline-handoff.js", async importOriginal => ({ ...await importOriginal<typeof import("./scheduled-pipeline-handoff.js")>(),
   postScheduledPipelineExecute: mocks.post }))
@@ -18,13 +18,20 @@ vi.mock("./scheduled-gate-contract.js", async importOriginal => ({ ...await impo
   scheduledGateCheckpointEvidence: mocks.evidence, scheduledGatePreparedJobIds: mocks.preparedIds }))
 vi.mock("./scheduled-gate-registration-receipt.js", () => ({ readScheduledGateRegistrationReceipt: mocks.registration }))
 vi.mock("./scheduled-gate-wait-match.js", () => ({ loadPersistedScheduledPrepareProof: mocks.prepareProof }))
-vi.mock("./scheduled-taskgraph-continuation-receipt.js", () => ({ scheduledSnapshotMatches: mocks.snapshotMatches }))
+vi.mock("./scheduled-taskgraph-continuation-receipt.js", async importOriginal => ({
+  ...await importOriginal<typeof import("./scheduled-taskgraph-continuation-receipt.js")>(),
+  scheduledSnapshotMatches: mocks.snapshotMatches,
+}))
 vi.mock("./child-discovery-attempt.js", () => ({ parseDiscoveryAttemptSidecar: mocks.parseHealth }))
 vi.mock("./role-results.js", async importOriginal => ({ ...await importOriginal<typeof import("./role-results.js")>(),
   validateRoleResult: mocks.validateRole }))
 vi.mock("./task-graph-verification-report.js", () => ({ parseStoredTaskGraphVerificationReport: mocks.parseReport }))
 vi.mock("./scheduled-automation-snapshot.js", () => ({ parseScheduledAutomationSnapshot: mocks.parseSnapshot }))
 vi.mock("./pg-task-graph-command-port.js", () => ({ createPgTaskGraphCommandPort: mocks.createCommand }))
+vi.mock("./scheduled-pipeline-current-attestation.js", async importOriginal => ({
+  ...await importOriginal<typeof import("./scheduled-pipeline-current-attestation.js")>(),
+  buildScheduledPipelineGraphAttestation: mocks.pipelineAttestation,
+}))
 
 const digest = `sha256:${"a".repeat(64)}`
 const owner = { userId: "user-audit", sessionId: "session-audit", turnId: "turn-audit", rootTaskId: "root-audit", rootAttemptCount: 1,
@@ -50,10 +57,12 @@ function setup() {
   const envelope = (structuredResult: unknown, discoveryAttempt?: unknown) => ({ finalItemId: null, finalText: "", status: "completed",
     stepCount: 1, toolCallCount: 1, taskGraphVerificationReport: {}, structuredResult, ...(discoveryAttempt ? { discoveryAttempt } : {}) })
   const nodes = [
-    { key: "scout", taskId: "scout-task", templateId: "scout", verification: { role: "scout", criteria: [{ id: "scout" }] } },
-    { key: "analyst", taskId: "analyst-task", templateId: "analyst", verification: { role: "analyst", criteria: [{ id: "analyst" }] } },
-    { key: "prepare", taskId: "prepare-task", templateId: "prepare" },
-    { key: "gate", taskId: "gate-task", templateId: "gate", verificationDisposition: "specialized", dependsOn: ["prepare"] },
+    { key: "scout", taskId: "scout-task", templateId: "scout", depth: 1, dependsOn: [],
+      verificationDisposition: "typed", verification: { role: "scout", criteria: [{ id: "scout" }] } },
+    { key: "analyst", taskId: "analyst-task", templateId: "analyst", depth: 2, dependsOn: ["scout"],
+      verificationDisposition: "typed", verification: { role: "analyst", criteria: [{ id: "analyst" }] } },
+    { key: "prepare", taskId: "prepare-task", templateId: "prepare", depth: 3, dependsOn: ["analyst"], verificationDisposition: "specialized" },
+    { key: "gate", taskId: "gate-task", templateId: "gate", depth: 4, verificationDisposition: "specialized", dependsOn: ["prepare"] },
     { key: SCHEDULED_AUDIT_TEMPLATE_ID, taskId: "audit-task", templateId: SCHEDULED_AUDIT_TEMPLATE_ID, depth: 5,
       verificationDisposition: "specialized", dependsOn: ["gate"] },
   ]
@@ -78,6 +87,8 @@ function setup() {
     candidateCount: 1, providerFailures: 0, materializationFailures: 0, hasMore: false })
   mocks.validateRole.mockImplementation((_value: unknown, role: string) => role === "scout" ? scout : analyst)
   mocks.parseReport.mockReturnValue({ status: "passed", resultDigest: "verified-digest", evidenceDigest: "verified-evidence" })
+  mocks.pipelineAttestation.mockResolvedValue({ status: "ready", attestation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-attestation.v1",
+    owner: pipelineOwner, snapshotDigest: digest, graphRevision: 2, evidenceDigest: evidence.evidenceDigest, scout: {}, analyst: {} } })
   mocks.readInvocation.mockImplementation(async (input: { attestation: unknown }) => ({ schemaVersion: SCHEDULED_AUDIT_INVOCATION_PROOF_SCHEMA,
     owner: stableOwner, snapshotDigest: digest, attestation: input.attestation, prepareProof, gateProof,
     scheduledWaitId: null, auditTaskId: "audit-task", attemptCount: 4, graphRevision: 6 }))
@@ -169,7 +180,7 @@ describe("fixed scheduled Audit child runtime", () => {
     ["scheduled_audit_graph_invalid", () => mocks.loadGraph.mockResolvedValue({ snapshot: null, state: null, tasks: new Map() })],
     ["scheduled_audit_gate_registration_invalid", () => mocks.registration.mockResolvedValue(null)],
     ["scheduled_audit_prepare_proof_invalid", () => mocks.prepareProof.mockResolvedValue(null)],
-    ["scheduled_audit_analyze_proof_invalid", () => mocks.parseReport.mockReturnValue(null)],
+    ["scheduled_audit_analyze_proof_invalid", () => mocks.pipelineAttestation.mockResolvedValue({ status: "invalid" })],
     ["scheduled_audit_invocation_proof_invalid", () => mocks.readInvocation.mockResolvedValue(null)],
   ]
   for (const [failureReason, invalidate] of validationCases) {

@@ -74,12 +74,17 @@ export function AgentQuestionInputCard({ sessionId, items, turns, onAccepted, se
   }, [onAccepted, selectionKey, sessionId])
 
   if (questions.length === 0) return null
+  const pendingQuestions = questions.filter(question => question.status === 'pending')
+  const history = questions.filter(question => question.status !== 'pending')
+  const renderQuestion = (question: QuestionInputProjection) => <QuestionRow key={question.questionId} question={question} sessionId={sessionId} turns={turns} answer={answers[question.questionId] ?? ''} submitting={Boolean(submitting[question.questionId])} feedback={feedback[question.questionId]} onOption={(option: QuestionInputOption) => setAnswers(current => ({ ...current, [question.questionId]: option.value }))} onText={(answer: string) => setAnswers(current => ({ ...current, [question.questionId]: answer }))} onAnswer={handleAnswer} t={t} />
   return (
     <section data-agent-question-card="true" aria-label={t('agent.question.title')} style={cardStyle}>
       <div style={headingStyle}><strong>{t('agent.question.title')}</strong><span style={mutedStyle}>{t('agent.question.serverOwned')}</span></div>
-      <div style={rowsStyle}>
-        {questions.map(question => <QuestionRow key={question.questionId} question={question} sessionId={sessionId} turns={turns} answer={answers[question.questionId] ?? ''} submitting={Boolean(submitting[question.questionId])} feedback={feedback[question.questionId]} onOption={(option: QuestionInputOption) => setAnswers(current => ({ ...current, [question.questionId]: option.value }))} onText={(answer: string) => setAnswers(current => ({ ...current, [question.questionId]: answer }))} onAnswer={handleAnswer} t={t} />)}
-      </div>
+      {pendingQuestions.length > 0 && <div style={rowsStyle}>{pendingQuestions.map(renderQuestion)}</div>}
+      {history.length > 0 && <details data-agent-question-history="true">
+        <summary style={{ ...mutedStyle, cursor: 'pointer' }}>{t('agent.question.status.answered')} / {t('agent.question.status.cancelled')} ({history.length})</summary>
+        <div style={rowsStyle}>{history.map(renderQuestion)}</div>
+      </details>}
     </section>
   )
 }
@@ -120,7 +125,7 @@ function uniqueQuestions(items: readonly TimelineItem[], sessionId: string): Que
     const previous = question ? byQuestionId.get(question.questionId) : undefined
     if (question && (!previous || question.revision >= previous.revision)) byQuestionId.set(question.questionId, question)
   }
-  return [...byQuestionId.values()].slice(0, 8)
+  return [...byQuestionId.values()]
 }
 
 function turnRevision(turns: readonly SupervisorTurnSummary[], sessionId: string, turnId: string): number | null {

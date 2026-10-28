@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { createApprovalLedgerState, reduceApprovalLedger, selectApprovalLedgerPending, selectApprovalLedgerProjection } from './approval-ledger-view'
+import { normalizeTimelineEvent } from './timeline-event-normalizer'
 
 const audit = (type: string, actor: string, sequence: string, approvalId = 'approval-1', payload: Record<string, unknown> = {}) => ({
   schemaVersion: 'agent-harness.v2', id: `${type}-${sequence}-${approvalId}`, sessionId: 'session-1', turnId: 'turn-1', itemId: null, taskId: null,
@@ -68,5 +69,35 @@ describe('approval ledger reducer', () => {
     const foreignLineage = { ...audit('approval.resolved', 'user', '2'), turnId: 'turn-2', taskId: 'task-2' }
     let state = reduceApprovalLedger(createApprovalLedgerState('session-1'), requested)
     expect(reduceApprovalLedger(state, foreignLineage)).toBe(state)
+  })
+
+  it.each(['approved', 'rejected'] as const)('clears pending actions for normalized broker %s and cannot reopen them', status => {
+    const requested = normalizeTimelineEvent(audit('approval.requested', 'orchestrator', '1'))
+    const resolved = normalizeTimelineEvent(brokerResolved('2', status))
+    const pending = reduceApprovalLedger(createApprovalLedgerState('session-1'), requested)
+    expect(pending.projection.pendingCount).toBe(1)
+    for (const invalid of [{ extra: undefined }, { actor: 'system' }, { sessionId: 'foreign-session' }]) {
+      expect(reduceApprovalLedger(pending, { ...resolved, ...invalid })).toBe(pending)
+    }
+    const settled = reduceApprovalLedger(pending, resolved)
+    expect(settled.projection).toMatchObject({ pendingCount: 0, pendingActions: [], approvals: [{ status }] })
+    expect(reduceApprovalLedger(settled, normalizeTimelineEvent(audit('approval.requested', 'orchestrator', '3')))).toBe(settled)
+    expect(reduceApprovalLedger(settled, resolved)).toBe(settled)
+    const consumed = reduceApprovalLedger(settled, normalizeTimelineEvent(audit('approval.consumed', 'system', '4')))
+    if (status === 'rejected') expect(consumed).toBe(settled)
+    else expect(consumed.projection.approvals[0]?.status).toBe('consumed')
+  })
+
+  it('clears pending actions after normalized audit resolution and interrupt cancellation', () => {
+    const requested = normalizeTimelineEvent(audit('approval.requested', 'orchestrator', '1'))
+    const pending = reduceApprovalLedger(createApprovalLedgerState('session-1'), requested)
+    const resolved = reduceApprovalLedger(pending, normalizeTimelineEvent(audit('approval.resolved', 'user', '2')))
+    expect(resolved.projection).toMatchObject({ pendingCount: 0, pendingActions: [], approvals: [{ status: 'resolved' }] })
+    const cancelled = reduceApprovalLedger(pending, normalizeTimelineEvent({
+      ...brokerResolved('2', 'approved'), actor: 'system', payload: {
+        waitKind: 'approval', waitId: 'approval-1', itemId: 'item-approval-1', turnId: 'turn-1', toolCallId: 'call-1', outcome: 'cancelled', reason: 'interrupt',
+      },
+    }))
+    expect(cancelled.projection).toMatchObject({ pendingCount: 0, pendingActions: [], approvals: [{ status: 'cancelled' }] })
   })
 })

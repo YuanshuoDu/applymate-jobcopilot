@@ -3,10 +3,8 @@
 import React from 'react'
 import { useApi } from '@/lib/hooks'
 import type { AgentSessionSummary, AgentSessionsResponse } from './session-view-model'
-import { sessionHeaderSubtitle, sessionStatusLabel, sessionSubtitle } from './session-view-model'
-import { AgentTeamList } from './AgentTeamList'
-import { HealthStrip } from './HealthStrip'
-import { AutomationList } from './AutomationList'
+import { formatSessionClock, sessionHeaderSubtitle, sessionStatusLabel } from './session-view-model'
+import { AgentSessionTools } from './AgentSessionTools'
 import { SessionFocusPanel } from './SessionFocusPanel'
 import { useI18n } from '@/lib/i18n'
 
@@ -24,18 +22,18 @@ export function AgentSessionConsole({
   onRunSession,
   onNewChat,
   onDeletedSession,
-  onAddAgent,
   refreshVersion = 0,
   onSessionsLoaded,
+  onAttentionChange,
 }: {
   selectedSessionId: string | null
   onSelectSession: (id: string, goal?: string, subtitle?: string) => void
   onRunSession?: (id: string, policy: { autoApply: boolean; requireApproval: boolean }) => void
   onNewChat: () => void
   onDeletedSession: (id: string) => void
-  onAddAgent?: () => void
   refreshVersion?: number
   onSessionsLoaded?: (data: AgentSessionsResponse) => void
+  onAttentionChange?: (sessionId: string, needsAttention: boolean) => void
 }) {
   const { t } = useI18n()
   const { data, loading, error, refetch } = useApi<AgentSessionsResponse>('/api/agent/sessions')
@@ -43,12 +41,12 @@ export function AgentSessionConsole({
   const [confirmingDeleteId, setConfirmingDeleteId] = React.useState<string | null>(null)
   const [deletingSessionId, setDeletingSessionId] = React.useState<string | null>(null)
   const sessions = data?.sessions ?? []
-  const visibleSessions = statusFilter === 'all' ? sessions : sessions.filter(session => session.status === statusFilter)
-  const pendingApprovals = sessions.filter(s => s.status === 'waiting_for_user').length
+  const needsAttention = (session: AgentSessionSummary) => ['waiting_for_user', 'failed'].includes(session.status)
+  const visibleSessions = statusFilter === 'all' ? sessions : sessions.filter(session => statusFilter === 'needs_attention' ? needsAttention(session) : session.status === statusFilter)
+  const runningCount = sessions.filter(session => session.status === 'running').length
+  const attentionCount = sessions.filter(needsAttention).length
 
-  React.useEffect(() => {
-    if (refreshVersion > 0) void refetch()
-  }, [refreshVersion, refetch])
+  React.useEffect(() => { if (refreshVersion > 0) void refetch() }, [refreshVersion, refetch])
 
   React.useEffect(() => {
     if (data) onSessionsLoaded?.(data)
@@ -75,20 +73,15 @@ export function AgentSessionConsole({
 
   return (
     <aside className="agent-session-console" style={{
-      width: 292,
-      flexShrink: 0,
-      borderRight: '1px solid var(--border)',
-      background: 'var(--bg-secondary)',
-      display: 'flex',
-      flexDirection: 'column',
-      overflow: 'hidden',
+      width: 272, flexShrink: 0, borderRight: '1px solid var(--border)',
+      background: 'var(--bg-secondary)', display: 'flex', flexDirection: 'column', overflow: 'hidden',
     }}>
       <div style={{ padding: 14, borderBottom: '1px solid var(--border)' }}>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 40px', gap: 9 }}>
+        <div style={{ display: 'grid', gap: 9 }}>
           <button
             onClick={onNewChat}
             style={{
-              height: 38,
+              minHeight: 36,
               borderRadius: 8,
               border: '1px solid rgba(255,255,255,0.20)',
               background: 'linear-gradient(135deg, #4338CA 0%, #5B21B6 100%)',
@@ -113,13 +106,14 @@ export function AgentSessionConsole({
               background: 'var(--bg)',
               color: 'var(--text)',
               cursor: 'pointer',
-              fontSize: 10,
+              fontSize: 12,
               fontWeight: 650,
               fontFamily: 'inherit',
-              padding: '0 4px',
+              padding: '0 10px',
             }}
           >
             <option value="all">{t('agent.all')}</option>
+            <option value="needs_attention">{t('agent.needsAttention')}</option>
             <option value="running">{t('agent.run')}</option>
             <option value="waiting_for_user">{t('agent.ask')}</option>
             <option value="completed">{t('agent.done')}</option>
@@ -128,13 +122,13 @@ export function AgentSessionConsole({
         </div>
       </div>
 
-      <div style={{ padding: '10px 10px 8px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-        <Metric label={t('agent.queuedTasks')} value={sessions.filter(s => s.status === 'running').length.toString()} />
-        <Metric label={t('agent.approvals')} value={pendingApprovals.toString()} alert={pendingApprovals > 0} />
-      </div>
+      {(runningCount > 0 || attentionCount > 0) && <div style={{ padding: '10px 12px 0', display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+        {runningCount > 0 && <button type="button" aria-pressed={statusFilter === 'running'} onClick={() => setStatusFilter('running')} style={countStyle}>{runningCount} {t('agent.runningSessions')}</button>}
+        {attentionCount > 0 && <button type="button" aria-pressed={statusFilter === 'needs_attention'} onClick={() => setStatusFilter('needs_attention')} style={{ ...countStyle, color: '#b45309' }}>{attentionCount} {t('agent.needsAttention')}</button>}
+      </div>}
 
       <div style={{ flex: 1, overflowY: 'auto' }}>
-        <div style={{ padding: '0 10px 8px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <div style={{ padding: '14px 12px 8px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <div style={{ fontSize: 10, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: 0, fontWeight: 700 }}>
             {t('agent.recentSessions')}
           </div>
@@ -163,6 +157,7 @@ export function AgentSessionConsole({
               >
                 <button
                   onClick={() => onSelectSession(session.id, session.goal, sessionHeaderSubtitle(session))}
+                  aria-pressed={selected}
                   style={{
                     width: '100%', padding: 10, paddingRight: confirmingDelete ? 96 : 34, borderRadius: 8,
                     border: selected ? `1px solid ${color}` : '1px solid var(--border)',
@@ -175,19 +170,14 @@ export function AgentSessionConsole({
                   <span style={{ width: 7, height: 7, borderRadius: '50%', background: color, marginTop: 5, flexShrink: 0 }} />
                   <div style={{ minWidth: 0, flex: 1 }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
-                      <div style={{ fontSize: 12, fontWeight: 650, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      <div title={session.goal} style={{ fontSize: 12, fontWeight: 650, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {session.goal}
                       </div>
                       <div style={{ fontSize: 10, color, flexShrink: 0, fontWeight: 650 }}>{sessionStatusLabel(session.status)}</div>
                     </div>
                     <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4, lineHeight: 1.5 }}>
-                      {sessionSubtitle(session)}
+                      {formatSessionClock(session.updatedAt)}
                     </div>
-                    {session.memorySummary && (
-                      <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 5, lineHeight: 1.45, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>
-                        {session.memorySummary}
-                      </div>
-                    )}
                   </div>
                   </div>
                 </button>
@@ -226,9 +216,8 @@ export function AgentSessionConsole({
             )
           })}
         </div>
-        <SessionFocusPanel sessionId={selectedSessionId} />
-        <AgentTeamList onAddAgent={onAddAgent} sessionId={selectedSessionId} />
-        <AutomationList
+        <SessionFocusPanel sessionId={selectedSessionId} onAttentionChange={onAttentionChange} />
+        <AgentSessionTools
           onCreate={onNewChat}
           onSessionStarted={(sessionId, policy) => {
             void refetch()
@@ -236,20 +225,12 @@ export function AgentSessionConsole({
             else onSelectSession(sessionId)
           }}
         />
-        <HealthStrip />
       </div>
     </aside>
   )
 }
 
-function Metric({ label, value, alert = false }: { label: string; value: string; alert?: boolean }) {
-  return (
-    <div style={{ border: '1px solid var(--border)', borderRadius: 8, padding: '8px 9px', background: 'var(--bg)' }}>
-      <div style={{ fontSize: 16, lineHeight: 1, fontWeight: 750, color: alert ? '#d97706' : 'var(--text)' }}>{value}</div>
-      <div style={{ fontSize: 9, color: 'var(--text-muted)', marginTop: 4 }}>{label}</div>
-    </div>
-  )
-}
+const countStyle: React.CSSProperties = { border: '1px solid var(--border)', borderRadius: 7, padding: '5px 7px', background: 'var(--bg)', color: 'var(--primary)', cursor: 'pointer', font: 'inherit', fontSize: 11 }
 
 function EmptyText({ children, tone = 'muted', title }: { children: React.ReactNode; tone?: 'muted' | 'error'; title?: string }) {
   return (

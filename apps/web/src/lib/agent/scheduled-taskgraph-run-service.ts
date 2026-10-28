@@ -1,9 +1,9 @@
-import { createHash } from "node:crypto"
+import { createHash } from 'node:crypto'
 import { Prisma, type Job } from "@prisma/client"
 import { AgentExecutionCancelledError } from "./execution-control"
 import { isScheduledPrepareChoiceWaitId, validateScheduledPrepareWaitIdentity } from "./scheduled-taskgraph-prepare-choice-identity"
 import { runScheduledTaskGraphAnalyze, scheduledTaskGraphScoreOwnerIsCurrent } from "./scheduled-taskgraph-analysis-journal"
-import { buildScheduledTaskGraphGateCheckpoint, scheduledTaskGraphAnalyzeCheckpointDigest, type ScheduledTaskGraphPreparedPackageRow } from "./scheduled-taskgraph-gate-checkpoint"
+import { buildScheduledTaskGraphGateCheckpoint, scheduledTaskGraphAnalyzeCheckpointDigest } from "./scheduled-taskgraph-gate-checkpoint"
 import { scheduledTaskGraphAnalyzeCheckpointForGate } from "./scheduled-taskgraph-gate-input"
 import { buildScheduledTaskGraphPrepareCheckpoint, scheduledTaskGraphContinuationKey, type ScheduledTaskGraphPipelineOwner } from "./scheduled-taskgraph-pipeline-checkpoint"
 import { isScheduledTaskGraphOwnerCurrent, saveScheduledTaskGraphCheckpoint, scheduledTaskGraphClaimMatches } from "./scheduled-taskgraph-pipeline-fence"
@@ -11,8 +11,10 @@ import { parseScheduledAutomationSnapshot } from "./scheduled-automation-snapsho
 import { scheduledTaskGraphExecuteGateCompletionProof } from "./scheduled-taskgraph-gate-rpc"
 import { loadScheduledTaskGraphResumeGateInput, scheduledTaskGraphGateResumeOwnerIsCurrent,
   validateScheduledTaskGraphAuditPrepareSource, type ScheduledTaskGraphGateResumeInput } from "./scheduled-taskgraph-audit-action"
+import { gateDecisionsFromOutput, parseGateDecisions, restoreGateOutput, scheduledTaskGraphPipelineStage as pipelineStage,
+  scheduledTaskGraphPipelineStageOrder as stageOrder, type ScheduledTaskGraphGateDecisions } from "./scheduled-taskgraph-gate-choice-evidence"
 import type { PipelineCtx } from "./pipeline-context"
-import type { GateOutput, PipelineCheckpointState, PipelineStage } from "./types"
+import type { PipelineCheckpointState } from "./types"
 
 export { isScheduledPrepareChoiceWaitId, validateScheduledPrepareWaitIdentity }
 
@@ -92,31 +94,6 @@ export function serializeScheduledTaskGraphCheckpoint(value: PipelineCheckpointS
   } catch { return null }
 }
 
-type ScheduledTaskGraphGateDecisions = NonNullable<PipelineCheckpointState["scheduledTaskGraphGateDecisions"]>
-function gateDecisionsFromOutput(value: GateOutput): ScheduledTaskGraphGateDecisions | null {
-  return parseGateDecisions({ approvedJobIds: value.approved.map(pkg => pkg.job.id),
-    pendingJobIds: value.pending.map(pkg => pkg.job.id), skippedJobIds: value.skipped.map(pkg => pkg.job.id) })
-}
-function parseGateDecisions(value: unknown): ScheduledTaskGraphGateDecisions | null {
-  const row = record(value), keys = ["approvedJobIds", "pendingJobIds", "skippedJobIds"]
-  if (!row || Object.keys(row).length !== keys.length || keys.some(key => !Object.hasOwn(row, key))) return null
-  const lists = keys.map(key => row[key])
-  if (lists.some(list => !Array.isArray(list) || !list.every(id => typeof id === "string" && id.length > 0 && id.trim() === id)
-    || new Set(list as string[]).size !== (list as string[]).length)) return null
-  return { approvedJobIds: [...lists[0] as string[]], pendingJobIds: [...lists[1] as string[]], skippedJobIds: [...lists[2] as string[]] }
-}
-function restoreGateOutput(decisions: ScheduledTaskGraphGateDecisions, packages: readonly ScheduledTaskGraphPreparedPackageRow[]): GateOutput | null {
-  const byId = new Map(packages.map(row => [row.jobId, row.package]))
-  const ids = [...decisions.approvedJobIds, ...decisions.pendingJobIds, ...decisions.skippedJobIds]
-  if (ids.length !== byId.size || new Set(ids).size !== ids.length || ids.some(id => !byId.has(id))) return null
-  return { approved: decisions.approvedJobIds.map(id => byId.get(id)!), pending: decisions.pendingJobIds.map(id => byId.get(id)!),
-    skipped: decisions.skippedJobIds.map(id => byId.get(id)!) }
-}
-function pipelineStage(value: unknown): PipelineStage | null {
-  return typeof value === "string" && ["scout", "analyze", "prepare", "gate", "execute", "audit", "completed"].includes(value)
-    ? value as PipelineStage : null
-}
-function stageOrder(stage: PipelineStage): number { return ["scout", "analyze", "prepare", "gate", "execute", "audit", "completed"].indexOf(stage) }
 
 /** Persists Web's authoritative Analyze checkpoint and returns only its opaque proof. */
 export async function runScheduledTaskGraphAnalyzeOnly(input: ScheduledTaskGraphAnalyzeOnlyInput): Promise<ScheduledTaskGraphAnalyzeCheckpointProof> {

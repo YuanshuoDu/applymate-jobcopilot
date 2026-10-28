@@ -564,6 +564,30 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false, 
   return fixture
 }
 
+async function showTaskDetails(page: Page, isZh: boolean) {
+  const toggle = page.getByRole('button', { name: isZh ? /^任务与结果/ : /^Tasks & results/ })
+  await expect(toggle).toBeVisible({ timeout: 20_000 })
+  if (await toggle.getAttribute('aria-expanded') !== 'true') await toggle.click()
+  await expect(toggle).toHaveAttribute('aria-expanded', 'true')
+  await expect(page.locator('[data-agent-supervisor-panel]')).toBeVisible()
+}
+
+async function showConversation(page: Page, isZh: boolean) {
+  const toggle = page.getByRole('button', { name: isZh ? /^任务与结果/ : /^Tasks & results/ })
+  if (await toggle.getAttribute('aria-expanded') === 'true') {
+    await page.getByRole('button', { name: isZh ? '返回对话' : 'Back to conversation', exact: true }).click()
+  }
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false')
+  await expect(page.locator('.agent-composer textarea')).toBeVisible()
+}
+
+async function selectConversation(page: Page, isZh: boolean, goal: string) {
+  if ((await page.evaluate(() => window.innerWidth)) <= 900) {
+    await page.getByRole('button', { name: isZh ? /^对话(?: ·|$)/ : /^Conversations(?: ·|$)/ }).click()
+  }
+  await page.locator('.agent-session-console').getByRole('button', { name: new RegExp(`^${goal}`) }).click()
+}
+
 test('real page mounts the shared timeline, supervisor tree, and isolated session evidence', async ({ page }, testInfo) => {
   const fixture = await installSupervisorFixture(page)
   const consoleErrors: string[] = []
@@ -580,7 +604,7 @@ test('real page mounts the shared timeline, supervisor tree, and isolated sessio
   await page.goto(`/agent-preview?supervisor=1&applicationReview=1&locale=${isZh ? 'zh' : 'en'}&sessionId=${SESSION_A}`)
 
   const supervisor = page.locator('[data-agent-supervisor-panel]')
-  await expect(supervisor).toBeVisible({ timeout: 20_000 })
+  await expect(supervisor).toBeHidden()
   const liveStream = page.locator('.agent-live-stream-body')
   await expect(liveStream).toContainText(isZh ? '申请队列' : 'Application queue')
   await expect(liveStream).toContainText('Fixture Robotics')
@@ -595,6 +619,7 @@ test('real page mounts the shared timeline, supervisor tree, and isolated sessio
   expect(submissionRequests).toEqual([])
   await expect(page.locator('[data-agent-harness-item="fixture-item-a"]')).toBeVisible()
   await expect(page.locator('[data-agent-harness-item="fixture-item-a"]')).toHaveCount(1)
+  await showTaskDetails(page, isZh)
   const labels = isZh
     ? { queued: /排队任务/, running: /运行中/, waiting: /等待中/, done: /完成/, connection: /实时连接|正在重新连接/ }
     : { queued: /Queued Tasks/, running: /Running/, waiting: /Waiting/, done: /Done/, connection: /Live connection|Reconnecting/ }
@@ -645,6 +670,7 @@ test('real page mounts the shared timeline, supervisor tree, and isolated sessio
   await expect(page.locator('[data-agent-supervisor-selection]')).toBeVisible()
   await expect(toolNode).toHaveAttribute('aria-current', 'true')
   await expect(page.locator('[data-agent-supervisor-selection]')).toContainText('jobs.search')
+  await showConversation(page, isZh)
   await expect(page.locator('[data-agent-harness-item="fixture-tool-a"]')).toBeVisible()
   await expect(page.locator('[data-agent-harness-item="fixture-tool-a"]')).toHaveCount(1)
   await page.evaluate(() => fetch('/__agent_fixture__/replay', { method: 'POST' }))
@@ -652,6 +678,7 @@ test('real page mounts the shared timeline, supervisor tree, and isolated sessio
   expect(fixture.replayDuplicateSent).toBe(true)
   expect(fixture.replaySequence).not.toBeNull()
   expect(fixture.replayRequestsAfterSequence[1]).toBe(fixture.replaySequence)
+  await showTaskDetails(page, isZh)
   await expect(page.locator('[data-agent-supervisor-connection]')).toContainText(labels.connection)
   await expect(childTaskNode).toContainText(labels.done)
   await expect(stepNode).toContainText(labels.running)
@@ -659,19 +686,25 @@ test('real page mounts the shared timeline, supervisor tree, and isolated sessio
   await expect(page.locator('[data-agent-supervisor-selection]')).toContainText('jobs.search')
   await expect(page.locator('[data-agent-harness-item="fixture-tool-a"]')).toHaveCount(1)
   await expect(page.locator('[data-agent-harness-item="fixture-tool-a"]')).toContainText('Selected tool evidence survived the disconnect.')
+  const timelineWidthWithDetails = await liveStream.evaluate(element => element.getBoundingClientRect().width)
+  await showConversation(page, isZh)
+  if ((await page.evaluate(() => window.innerWidth)) > 900) {
+    await expect.poll(() => liveStream.evaluate(element => element.getBoundingClientRect().width)).toBeGreaterThan(timelineWidthWithDetails)
+  }
+  await expect(page.getByRole('button', { name: isZh ? /^任务与结果/ : /^Tasks & results/ })).toBeFocused()
   await expect.poll(async () => page.evaluate(() => {
     const item = document.querySelector<HTMLElement>('[data-agent-harness-item="fixture-tool-a"]')
     const streamBody = document.querySelector<HTMLElement>('.agent-live-stream-body')
     if (!item || !streamBody) return false
     const itemRect = item.getBoundingClientRect()
     const streamRect = streamBody.getBoundingClientRect()
-    return itemRect.top >= streamRect.top && itemRect.bottom <= streamRect.bottom
+    if (itemRect.height <= streamRect.height) return itemRect.top >= streamRect.top && itemRect.bottom <= streamRect.bottom
+    // A result taller than a short mobile pane must still be centered for reading.
+    const itemCenter = (itemRect.top + itemRect.bottom) / 2
+    return itemCenter >= streamRect.top && itemCenter <= streamRect.bottom
   })).toBe(true)
 
-  if ((await page.evaluate(() => window.innerWidth)) <= 900) {
-    await page.getByRole('button', { name: isZh ? '对话' : 'Conversations', exact: true }).click()
-  }
-  await page.getByText('B session evidence', { exact: true }).click()
+  await selectConversation(page, isZh, 'B session evidence')
   await expect(page.locator('[data-agent-harness-item="fixture-item-b"]')).toBeVisible({ timeout: 5_000 })
   await expect(page.locator('[data-agent-harness-item="fixture-item-a"]')).toHaveCount(0)
   await expect(page.locator('.agent-composer textarea')).toBeVisible()
@@ -682,7 +715,18 @@ test('real page mounts the shared timeline, supervisor tree, and isolated sessio
   })
   if ((await page.evaluate(() => window.innerWidth)) <= 900) {
     expect(mobileLayout.composerHeight).toBeGreaterThan(40)
-    expect(mobileLayout.panelHeight).toBeLessThanOrEqual(mobileLayout.viewportHeight * 0.5)
+    expect(mobileLayout.panelHeight).toBe(0)
+    const composer = page.locator('.agent-composer textarea')
+    await composer.fill('Keep this unsent draft when viewing task details.')
+    await showTaskDetails(page, isZh)
+    await expect(composer).toBeHidden()
+    const detailsBox = await page.locator('#agent-workspace-details').boundingBox()
+    expect(detailsBox).not.toBeNull()
+    expect(detailsBox!.height).toBeGreaterThan(40)
+    expect(detailsBox!.y + detailsBox!.height).toBeLessThanOrEqual(mobileLayout.viewportHeight)
+    await showConversation(page, isZh)
+    await expect(composer).toHaveValue('Keep this unsent draft when viewing task details.')
+    await composer.clear()
   }
   await expect(page.locator('body')).not.toContainText('A late old-session event must stay discarded')
   expect(submissionRequests).toEqual([])
@@ -693,10 +737,8 @@ test('real page mounts the shared timeline, supervisor tree, and isolated sessio
   }
 
   await page.evaluate(() => fetch('/__agent_fixture__/retryable', { method: 'POST' }))
-  if ((await page.evaluate(() => window.innerWidth)) <= 900) {
-    await page.getByRole('button', { name: isZh ? '对话' : 'Conversations', exact: true }).click()
-  }
-  await page.getByText('Inspect saved roles', { exact: true }).click()
+  await selectConversation(page, isZh, 'Inspect saved roles')
+  await showTaskDetails(page, isZh)
   const retryableTurn = page.locator(`[data-task-node-id="turn:${TURN_A}"]`)
   await expect(retryableTurn).toBeVisible({ timeout: 20_000 })
   await retryableTurn.click()
@@ -722,6 +764,7 @@ test('selected-job preparation sends typed scope and restores the persisted draf
   const fixture = await installSupervisorFixture(page, true)
   const isZh = testInfo.project.name.includes('zh')
   await page.goto(`/agent-preview?supervisor=1&locale=${isZh ? 'zh' : 'en'}&sessionId=${SESSION_A}`)
+  await showTaskDetails(page, isZh)
 
   const preparation = page.locator('[data-selected-job-preparation="true"]')
   await expect(preparation).toBeVisible({ timeout: 20_000 })
@@ -790,6 +833,7 @@ test('selected-job preparation sends typed scope and restores the persisted draf
   // A full page refresh must rebuild the same Workbench view from persisted
   // session/task/artifact reads, rather than relying on the pre-disconnect UI.
   await page.reload()
+  await showTaskDetails(page, isZh)
   await expect(page.locator('[data-selected-job-draft="true"]')).toBeVisible({ timeout: 20_000 })
   const restoredDraft = page.locator('[data-selected-job-draft="true"]')
   await expect(restoredDraft).toHaveAttribute('aria-label', 'Systems Engineer · Fixture Systems v1')
@@ -808,8 +852,7 @@ test('selected-job preparation sends typed scope and restores the persisted draf
     text: element.textContent?.replace(/\s+/g, ' ').trim() ?? '',
   }))).toEqual(planBeforeReconnect)
 
-  if ((await page.evaluate(() => window.innerWidth)) <= 900) await page.getByRole('button', { name: isZh ? '对话' : 'Conversations', exact: true }).click()
-  await page.getByText('B session evidence', { exact: true }).click()
+  await selectConversation(page, isZh, 'B session evidence')
   await expect(page.locator('[data-selected-job-draft="true"]')).toHaveCount(0, { timeout: 10_000 })
   await expect(page.locator('body')).not.toContainText('Persisted cover-letter fixture body.')
   await expect(page.locator('[data-agent-task-graph-plan="true"]')).toHaveCount(0)
@@ -819,6 +862,7 @@ test('historical selected-job artifact warns, hides source text, and drops its p
   const fixture = await installSupervisorFixture(page, true, false, false, true)
   const isZh = testInfo.project.name.includes('zh')
   await page.goto(`/agent-preview?supervisor=1&locale=${isZh ? 'zh' : 'en'}&sessionId=${SESSION_A}`)
+  await showTaskDetails(page, isZh)
 
   const preparation = page.locator('[data-selected-job-preparation="true"]')
   await expect(preparation).toBeVisible({ timeout: 20_000 })
@@ -846,6 +890,7 @@ test('refresh restores the selected saved job and its graph before the Writer ar
   const fixture = await installSupervisorFixture(page, true, false, true)
   const isZh = testInfo.project.name.includes('zh')
   await page.goto('/agent-preview?supervisor=1&locale=' + (isZh ? 'zh' : 'en') + '&sessionId=' + SESSION_A)
+  await showTaskDetails(page, isZh)
 
   const preparation = page.locator('[data-selected-job-preparation="true"]')
   const savedJob = preparation.getByLabel(isZh ? '已保存的职位' : 'Saved job')
@@ -860,6 +905,7 @@ test('refresh restores the selected saved job and its graph before the Writer ar
   await expect(page.locator('[data-selected-job-draft="true"]')).toHaveCount(0)
 
   await page.reload()
+  await showTaskDetails(page, isZh)
   await expect.poll(() => fixture.selectedJobDetailRequests.length, { timeout: 20_000 }).toBe(1)
   expect(fixture.selectedJobDetailRequests).toEqual(['/api/jobs/fixture-selected-job'])
   await expect.poll(() => fixture.selectedJobListResponses.length).toBeGreaterThan(1)
@@ -873,14 +919,13 @@ test('refresh restores the selected saved job and its graph before the Writer ar
   await expect(restoredPlan).toContainText('Prepare Systems Engineer at Fixture Systems')
   await expect(page.locator('[data-selected-job-draft="true"]')).toHaveCount(0)
 
-  if ((await page.evaluate(() => window.innerWidth)) <= 900) await page.getByRole('button', { name: isZh ? '对话' : 'Conversations', exact: true }).click()
-  await page.getByText('B session evidence', { exact: true }).click()
+  await selectConversation(page, isZh, 'B session evidence')
   await expect(restoredSavedJob).toHaveValue('', { timeout: 10_000 })
   await expect(page.locator('[data-agent-task-graph-plan="true"]')).toHaveCount(0)
   await expect(page.locator('[data-selected-job-draft="true"]')).toHaveCount(0)
 
-  if ((await page.evaluate(() => window.innerWidth)) <= 900) await page.getByRole('button', { name: isZh ? '对话' : 'Conversations', exact: true }).click()
-  await page.getByText('Inspect saved roles', { exact: true }).click()
+  await selectConversation(page, isZh, 'Inspect saved roles')
+  await showTaskDetails(page, isZh)
   await expect(page.locator('[data-selected-job-preparation="true"]').getByLabel(isZh ? '已保存的职位' : 'Saved job')).toHaveValue('fixture-selected-job', { timeout: 10_000 })
   await expect(page.locator('[data-agent-task-graph-plan="true"]')).toContainText('Prepare Systems Engineer at Fixture Systems')
 })
@@ -888,6 +933,7 @@ test('a newer selected-job Turn hides the prior plan and draft until its graph a
   const fixture = await installSupervisorFixture(page, true, true)
   const isZh = testInfo.project.name.includes('zh')
   await page.goto(`/agent-preview?supervisor=1&locale=${isZh ? 'zh' : 'en'}&sessionId=${SESSION_A}`)
+  await showTaskDetails(page, isZh)
 
   const preparation = page.locator('[data-selected-job-preparation="true"]')
   const plan = page.locator('[data-agent-task-graph-plan="true"]')
@@ -927,6 +973,7 @@ test('a newer selected-job Turn hides the prior plan and draft until its graph a
   await expect(draft.locator('[data-source-evidence-item="job:fixture-selected-job-next"]')).toContainText('Build principal robotics systems.')
   await expect(page.locator('body')).not.toContainText('Persisted cover-letter fixture body.')
 
+  await showConversation(page, isZh)
   const composer = page.locator('.agent-composer textarea')
   await expect(composer).toBeVisible()
   await composer.fill('Keep the current draft visible.')
@@ -934,6 +981,7 @@ test('a newer selected-job Turn hides the prior plan and draft until its graph a
   await expect.poll(() => fixture.ordinaryChatRequests.length).toBe(1)
   expect(fixture.ordinaryChatRequests[0]?.content).toEqual([{ type: 'text', text: 'Keep the current draft visible.' }])
   await expect.poll(() => fixture.ordinaryChatEventSent, { timeout: 10_000 }).toBe(true)
+  await showTaskDetails(page, isZh)
   await expect(plan).toBeVisible()
   await expect(plan).toContainText('Prepare Principal Engineer at Northstar Robotics')
   await expect(draft).toBeVisible()
@@ -959,6 +1007,7 @@ test('durable child wait details revalidate in the mounted mocked supervisor fix
     ? { any: '任一子任务', empty: '当前没有等待中的子任务。', matched: '尚未匹配', waitDeadline: '等待截止时间', taskDeadline: '任务总截止时间', due: '任务总截止时间已到', select: '选择analyst' }
     : { any: 'Any child', empty: 'No current child wait.', matched: 'Not matched', waitDeadline: 'Wait deadline', taskDeadline: 'Task deadline', due: 'Task deadline reached', select: 'Select analyst' }
   await page.goto(`/agent-preview?supervisor=1&locale=${isZh ? 'zh' : 'en'}&sessionId=${SESSION_A}`)
+  await showTaskDetails(page, isZh)
 
   const parentNode = page.locator(`[data-task-node-id="task:${CHILD_TASK_A}"]`)
   await expect(parentNode).toBeVisible({ timeout: 20_000 })

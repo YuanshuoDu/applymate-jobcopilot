@@ -1,6 +1,8 @@
-import { createHash } from "node:crypto"
 import { parseScheduledAuditReport, type ScheduledAuditReport } from "./scheduled-audit-contract.js"
 import type { ScheduledAutomationPipelineAttestation, ScheduledAutomationPipelineBridgeScope } from "./scheduled-automation-pipeline-bridge.js"
+import { parseScheduledPipelineAttestation } from "@jobcopilot/agent-protocol"
+import { scheduledTaskGraphContinuationKey, scheduledTaskGraphContinuationKeyVersion } from "./scheduled-pipeline-continuation-key.js"
+export { scheduledTaskGraphContinuationKey } from "./scheduled-pipeline-continuation-key.js"
 import { parseScheduledGateResult, scheduledGatePreparedJobIds, type ScheduledGateChoiceId, type ScheduledGateCompletionProof,
   type ScheduledGateQuestionKind, type ScheduledGateResult } from "./scheduled-gate-contract.js"
 import type { ScheduledPrepareTaskGraphProof } from "./scheduled-prepare-task-graph-verification.js"
@@ -200,7 +202,7 @@ function parseAnalyzeCheckpointProof(value: unknown, input: HandoffInput): Sched
     || !Number.isSafeInteger(proof.executionAttemptCount) || Number(proof.executionAttemptCount) < 0
     || typeof proof.checkpointDigest !== "string" || !/^[a-f0-9]{64}$/.test(proof.checkpointDigest)
     || typeof proof.claimTokenDigest !== "string" || !/^sha256:[a-f0-9]{64}$/.test(proof.claimTokenDigest)
-    || typeof proof.continuationKey !== "string" || !/^scheduled-taskgraph:sha256:[a-f0-9]{64}$/.test(proof.continuationKey)
+    || scheduledTaskGraphContinuationKeyVersion(proof.continuationKey) === null
     || !validAttestationBinding(input)) return null
 
   const expectedKey = scheduledTaskGraphContinuationKey(input.owner, input.attestation, proof.executionId, Number(proof.executionAttemptCount))
@@ -216,37 +218,15 @@ function parseAnalyzeCheckpointProof(value: unknown, input: HandoffInput): Sched
 }
 
 function validAttestationBinding(input: HandoffInput): boolean {
-  const { owner, attestation } = input
-  return attestation.schemaVersion === "agent-harness.v2.scheduled-pipeline-attestation.v1"
-    && sameOwner(owner, attestation.owner)
-    && validId(attestation.scout.taskId) && validId(attestation.analyst.taskId)
-    && Number.isSafeInteger(attestation.scout.attemptCount) && attestation.scout.attemptCount > 0
-    && Number.isSafeInteger(attestation.analyst.attemptCount) && attestation.analyst.attemptCount > 0
-    && Number.isSafeInteger(attestation.graphRevision) && attestation.graphRevision > 0
-    && validId(attestation.scout.discoveryReceipt.taskId)
-    && Number.isSafeInteger(attestation.scout.discoveryReceipt.attemptCount) && attestation.scout.discoveryReceipt.attemptCount > 0
-    && [attestation.snapshotDigest, attestation.scout.resultDigest, attestation.analyst.resultDigest,
-      attestation.evidenceDigest, attestation.scout.discoveryReceipt.receiptDigest].every(value => typeof value === "string" && value.length > 0)
+  const { owner, attestation: value } = input, attestation = parseScheduledPipelineAttestation(value)
+  if (!attestation || !sameOwner(owner, attestation.owner) || !Number.isSafeInteger(attestation.graphRevision) || attestation.graphRevision < 1) return false
+  const sourceTaskIds = "scouts" in attestation ? attestation.scouts.map(source => source.taskId) : [attestation.scout.taskId]
+  return sourceTaskIds.every(validId) && validId(attestation.analyst.taskId)
 }
 
 function sameOwner(left: ScheduledAutomationPipelineBridgeScope, right: ScheduledAutomationPipelineAttestation["owner"]): boolean {
   return left.userId === right.userId && left.sessionId === right.sessionId && left.turnId === right.turnId
     && left.rootTaskId === right.rootTaskId && left.rootAttemptCount === right.rootAttemptCount
-}
-
-export function scheduledTaskGraphContinuationKey(
-  owner: ScheduledAutomationPipelineBridgeScope,
-  attestation: ScheduledAutomationPipelineAttestation,
-  executionId: string,
-  executionAttemptCount: number,
-): string {
-  const receipt = attestation.scout.discoveryReceipt
-  const evidence = [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.rootAttemptCount,
-    executionId, executionAttemptCount, attestation.snapshotDigest, attestation.graphRevision,
-    attestation.scout.taskId, attestation.scout.attemptCount, attestation.scout.resultDigest,
-    attestation.analyst.taskId, attestation.analyst.attemptCount, attestation.analyst.resultDigest,
-    attestation.evidenceDigest, receipt.receiptDigest]
-  return `scheduled-taskgraph:sha256:${createHash("sha256").update(JSON.stringify(evidence), "utf8").digest("hex")}`
 }
 
 function validId(value: unknown): value is string {

@@ -8,6 +8,15 @@ import { SCHEDULED_PREPARE_COMPLETION_SCHEMA, SCHEDULED_PREPARE_PROOF_FACTS_SCHE
 import type { TaskGraphScheduledGateInput } from "./task-graph-command-port.js"
 import { SCHEDULED_GATE_REGISTRATION_RECEIPT_SCHEMA } from "./scheduled-gate-registration-receipt.js"
 import { SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_SCHEMA } from "./scheduled-taskgraph-continuation-receipt.js"
+import type { ScheduledPrepareTaskGraphProof } from "./scheduled-prepare-task-graph-verification.js"
+import type { LoadedGraph } from "./task-graph-pg-state.js"
+
+type GateGraphFixture = Pick<LoadedGraph, "rootTaskId"> & Readonly<{
+  item: Pick<NonNullable<LoadedGraph["item"]>, "id" | "revision" | "content">
+  snapshot: Readonly<{ schemaVersion: string; rootSuccessCriteria: readonly string[]; nodes: readonly Record<string, unknown>[] }>
+  state: Readonly<{ revision: number; appliedEvents: readonly unknown[]; nodes?: readonly Record<string, unknown>[] }>
+  tasks: ReadonlyMap<string, Record<string, unknown>>
+}>
 
 const mocks = vi.hoisted(() => ({
   contract: vi.fn(), snapshot: vi.fn(), receiptMatches: vi.fn(), lock: vi.fn(), load: vi.fn(),
@@ -99,7 +108,7 @@ const registration = { schemaVersion: SCHEDULED_GATE_REGISTRATION_RECEIPT_SCHEMA
   continuationKey: stableReceiptKey, snapshotDigest: binding.snapshotDigest, evidenceDigest: binding.evidenceDigest, checkpointDigest: binding.checkpointDigest,
   analyzeGraphRevision: 7, prepareScheduleRevision: 8, prepareWaitId: "prepare-wait", gateTaskId: "gate-task", gateAppendRevision: 11 }
 
-function database(graph: typeof loadedGate | ReturnType<typeof baseGraph>, allowedActions: unknown = [], persistedClaim = claim) {
+function database(graph: GateGraphFixture, allowedActions: unknown = [], persistedClaim = claim) {
   const calls: string[] = []
   const query = vi.fn(async (sql: string) => {
     calls.push(sql)
@@ -209,6 +218,75 @@ describe("scheduled Gate append claim replay", () => {
     expect(creation.child).toHaveBeenCalledWith(db.client, expect.objectContaining({
       role: SCHEDULED_GATE_ROLE, taskType: SCHEDULED_GATE_TASK_TYPE,
     }), true, { preserveEmptyAllowedActions: true, taskGraphChildDeadline: true })
+  })
+
+  it("appends Gate after a two-Scout v2 Analyze plus Prepare prefix", async () => {
+    const v2Key = "scheduled-taskgraph:v2:sha256:" + "8".repeat(64), v2StableKey = "scheduled-taskgraph:v2:sha256:" + "7".repeat(64)
+    const scouts = [
+      { key: "scout-a", templateId: "scout", taskId: "scout-task-a", goal: "Find roles A", successCriteria: ["Found roles A"],
+        dependsOn: [], depth: 1, status: "completed", verificationDisposition: "legacy_unverified" },
+      { key: "scout-b", templateId: "scout", taskId: "scout-task-b", goal: "Find roles B", successCriteria: ["Found roles B"],
+        dependsOn: [], depth: 1, status: "completed", verificationDisposition: "legacy_unverified" },
+    ]
+    const analyst = { key: "analyst", templateId: "analyst", taskId: "analyst-task", goal: "Review roles", successCriteria: ["Reviewed roles"],
+      dependsOn: ["scout-a", "scout-b"], depth: 2, status: "completed", verificationDisposition: "legacy_unverified" }
+    const prepare = { key: "prepare", templateId: "prepare", taskId: "prepare-task", goal: "Prepare applications", successCriteria: ["Prepared"],
+      dependsOn: ["analyst"], depth: 3, status: "completed", verificationDisposition: "specialized" }
+    const prefix = [...scouts, analyst, prepare], snapshotPrefix = prefix.map(({ status: _status, ...node }) => node)
+    const v2StableReceipt = { ...continuationReceipt, continuationKey: v2StableKey }
+    const v2ProofNodes: ScheduledPrepareTaskGraphProof["completion"]["nodes"] = [
+      ...scouts.map(source => ({ taskId: source.taskId, attemptCount: 1, role: "scout" as const, taskType: "job_discovery",
+        status: "completed" as const, verification: "passed" as const, dependsOnTaskIds: [] })),
+      { taskId: analyst.taskId, attemptCount: 1, role: "analyst", taskType: "job_analysis", status: "completed", verification: "passed",
+        dependsOnTaskIds: scouts.map(source => source.taskId) },
+      { taskId: prepare.taskId, attemptCount: 1, role: "prepare", taskType: "scheduled_application_prepare", status: "completed", verification: "passed",
+        dependsOnTaskIds: [analyst.taskId], tool: "scheduled.application.prepare@1", resultDigest: "a".repeat(64) },
+    ]
+    const v2Proof: ScheduledPrepareTaskGraphProof = { receipt: v2StableReceipt as ScheduledPrepareTaskGraphProof["receipt"],
+      completion: { schemaVersion: SCHEDULED_PREPARE_COMPLETION_SCHEMA, graphRevision: 7, nodes: v2ProofNodes,
+        wait: { waitId: "prepare-wait", status: "ready", mode: "all", targetTaskIds: ["prepare-task"], matchedTaskIds: ["prepare-task"] } },
+      result: proof.result as unknown as ScheduledPrepareTaskGraphProof["result"] }
+    const v2PreparedTask = { ...preparedTask, result: { taskGraphScheduledPrepareProofFacts: { schemaVersion: SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA,
+      receipt: v2Proof.receipt, completion: { schemaVersion: SCHEDULED_PREPARE_COMPLETION_SCHEMA, graphRevision: 7, nodes: v2ProofNodes },
+      result: v2Proof.result } } }
+    const v2Contract = { ...contract, binding: { ...binding, continuationKey: v2Key }, receipt: v2StableReceipt }
+    mocks.contract.mockReturnValue(v2Contract)
+    mocks.prepareProof.mockResolvedValue(v2Proof)
+    const graph = { ...baseGraph(), snapshot: { ...baseGraph().snapshot, rootSuccessCriteria: ["Finish the scheduled objective"], nodes: snapshotPrefix },
+      state: { revision: 7, nodes: prefix, appliedEvents: [] }, tasks: new Map([["prepare-task", v2PreparedTask]]) }
+    const db = database(graph, [], { ...claim, key: v2Key, leaseExpiresAt: "2026-10-22T10:12:00.000Z" })
+    mocks.current.mockReturnValue({ revision: 7, nodes: prefix })
+    const v2Input = { ...input, handoff: { ...input.handoff, continuationKey: v2Key },
+      attestation: { schemaVersion: "agent-harness.v2.scheduled-pipeline-attestation.v2" }, prepareProof: v2Proof }
+
+    await expect(appendScheduledGate(db.client as never, v2Input as unknown as TaskGraphScheduledGateInput)).resolves.toMatchObject({
+      status: "accepted", nodes: [{ key: "gate", taskId: "gate-task", status: "queued" }],
+    })
+    expect(mocks.prepareProof).toHaveBeenCalledWith(db.client, scope, "prepare-task", v2PreparedTask.result, v2Key, "prepare-wait")
+    expect(creation.child).toHaveBeenCalledWith(db.client, expect.objectContaining({ taskType: SCHEDULED_GATE_TASK_TYPE }), true,
+      { preserveEmptyAllowedActions: true, taskGraphChildDeadline: true })
+
+    const gate = { ...gateDefinition, taskId: "gate-task", depth: 4, status: "waiting_for_user", readiness: "blocked",
+      verificationDisposition: "specialized" }
+    const replayState = { revision: 10, nodes: [...prefix, { ...gate, readiness: undefined }], appliedEvents: [
+      { nodeKey: "gate", type: "task.started", idempotencyKey: taskGraphLifecycleKey(owner.rootTaskId, "gate", 1, "task.started"), expectedRevision: 8 },
+      { nodeKey: "gate", type: "task.waiting_for_user", idempotencyKey: taskGraphLifecycleKey(owner.rootTaskId, "gate", 1, "task.waiting_for_user"), expectedRevision: 9 },
+    ] }
+    const replayTasks = new Map<string, Record<string, unknown>>([["prepare-task", v2PreparedTask], ["gate-task", {
+      id: "gate-task", role: SCHEDULED_GATE_ROLE, taskType: SCHEDULED_GATE_TASK_TYPE, status: "waiting_for_user",
+      attemptCount: 1, expectedOutputSchema: SCHEDULED_GATE_OUTPUT_SCHEMA,
+    }]])
+    const replayGraph = { ...graph, snapshot: { ...graph.snapshot, nodes: [...snapshotPrefix, gate] }, state: replayState, tasks: replayTasks }
+    mocks.registration.mockResolvedValue({ ...registration, continuationKey: v2StableKey, gateAppendRevision: 8 })
+    mocks.prepareProof.mockResolvedValue(v2Proof)
+    creation.child.mockClear(); creation.plan.mockClear(); creation.enqueue.mockClear(); creation.event.mockClear()
+    const replayDb = database(replayGraph, [], { ...claim, key: v2Key })
+    mocks.current.mockReturnValue({ revision: 10, nodes: replayState.nodes })
+    await expect(appendScheduledGate(replayDb.client as never, v2Input as unknown as TaskGraphScheduledGateInput)).resolves.toMatchObject({
+      status: "duplicate", revision: 10, nodes: [{ key: "gate", taskId: "gate-task", status: "waiting" }],
+    })
+    expect(creation.child).not.toHaveBeenCalled()
+    expect(replayDb.calls.some(sql => /^\s*(INSERT|UPDATE|DELETE)\b/i.test(sql))).toBe(false)
   })
 
   it("loads the Prepare wait with the handoff key while replaying the stable receipt identity", async () => {

@@ -16,6 +16,7 @@ import { loadTaskGraphDependencyResults } from "./task-graph-pg-dependency-conte
 import { evaluateTaskGraphObjectiveCoverage } from "../planning/task-graph-objective-coverage.js"
 import { isScheduledDraftTemplate, scheduledDraftPair, scheduledDraftTaskContext, selectVerifiedScheduledDraftCandidate, type ScheduledDraftCandidateBinding } from "./scheduled-draft-candidate.js"
 import { sourceIntentForTaskGraphNode } from "./task-graph-source-intent-context.js"
+import { scheduledScoutPlanCapacityAllowed } from "./scheduled-taskgraph-plan-capacity.js"
 
 const EXTERNAL_ACTION = /(?:^|[._-])(submit|send|publish|delete|mutate|execute)(?:$|[._-])/i
 
@@ -73,6 +74,9 @@ export async function createGraphTasks(
   }
   const appended = appendTaskGraphProposal(current, input.proposal, options)
   if (!appended.ok) throw Object.assign(new Error(appended.error.message), { code: appended.error.code })
+  if (!await scheduledScoutPlanCapacityAllowed(client, input.scope, appended.state.nodes)) {
+    throw Object.assign(new Error("TaskGraph node limit exceeded"), { code: "node_limit" })
+  }
   assertWriterReviewPlan([...current.nodes, ...appended.addedNodes])
   const scheduled = isScheduledDraftTemplate(input.templates)
   const draftPair = scheduled ? scheduledDraftPair([...current.nodes, ...appended.addedNodes], new Set(current.nodes.map(node => node.key))) : undefined

@@ -19,26 +19,35 @@ const scoutVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSIO
   { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
   { id: "candidate-evidence", check: { kind: "all_candidates_have_evidence", minimumItems: 1 } },
 ] }
-const analystVerification = (scoutKey: string) => ({ schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [
-  { id: "scout-membership", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: scoutKey } },
+const analystVerification = (scoutKeys: readonly string[]) => ({ schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [
+  { id: "scout-membership", check: scoutKeys.length === 1
+    ? { kind: "findings_from_scout_dependency", dependencyNodeKey: scoutKeys[0]! }
+    : { kind: "findings_from_scout_union", dependencyNodeKeys: [...scoutKeys] } },
   { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
 ] })
 type RecoveryGraphNode = { key: string; templateId: string; goal: string; successCriteria: readonly string[]; dependsOn: string[];
   depth: number; taskId: string; verificationDisposition: string; verification?: unknown }
 type RecoveryGraphContent = { schemaVersion: string; nodes: RecoveryGraphNode[] }
-const contentFor = (auditTaskId = "audit-child-1", scoutKey = "scout", analystKey = "analyst"): RecoveryGraphContent => ({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
-  { key: scoutKey, templateId: "scout", goal: "Find evidence", successCriteria: ["Found evidence"], dependsOn: [], depth: 1,
-    taskId: "scout-child-1", verificationDisposition: "typed", verification: scoutVerification },
-  { key: analystKey, templateId: "analyst", goal: "Review evidence", successCriteria: ["Reviewed evidence"], dependsOn: [scoutKey], depth: 2,
-    taskId: "analyst-child-1", verificationDisposition: "typed", verification: analystVerification(scoutKey) },
-  { key: "prepare", templateId: "prepare", goal: "Prepare the application", successCriteria: ["Preparation is complete"], dependsOn: [analystKey], depth: 3,
-    taskId: "prepare-child-1", verificationDisposition: "specialized" },
-  { key: "gate", templateId: "gate", goal: "Review the application", successCriteria: ["Review is complete"], dependsOn: ["prepare"], depth: 4,
-    taskId: "gate-child-1", verificationDisposition: "specialized" },
-  { key: SCHEDULED_AUDIT_TEMPLATE_ID, templateId: SCHEDULED_AUDIT_TEMPLATE_ID, goal: SCHEDULED_AUDIT_NODE_GOAL,
-    successCriteria: SCHEDULED_AUDIT_NODE_CRITERIA, dependsOn: ["gate"], depth: 5,
-    taskId: auditTaskId, verificationDisposition: "specialized" },
-] })
+const contentForScouts = (scoutKeys: readonly string[], auditTaskId = "audit-child-1"): RecoveryGraphContent => {
+  const scouts = scoutKeys.map((key, index) => ({ key, templateId: "scout", goal: "Find evidence",
+    successCriteria: ["Found evidence"], dependsOn: [], depth: 1, taskId: `scout-child-${index + 1}`,
+    verificationDisposition: "typed", verification: scoutVerification }))
+  const analystKey = "analyst"
+  return { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
+    ...scouts,
+    { key: analystKey, templateId: "analyst", goal: "Review evidence", successCriteria: ["Reviewed evidence"], dependsOn: [...scoutKeys], depth: 2,
+      taskId: "analyst-child-1", verificationDisposition: "typed", verification: analystVerification(scoutKeys) },
+    { key: "prepare", templateId: "prepare", goal: "Prepare the application", successCriteria: ["Preparation is complete"], dependsOn: [analystKey], depth: 3,
+      taskId: "prepare-child-1", verificationDisposition: "specialized" },
+    { key: "gate", templateId: "gate", goal: "Review the application", successCriteria: ["Review is complete"], dependsOn: ["prepare"], depth: 4,
+      taskId: "gate-child-1", verificationDisposition: "specialized" },
+    { key: SCHEDULED_AUDIT_TEMPLATE_ID, templateId: SCHEDULED_AUDIT_TEMPLATE_ID, goal: SCHEDULED_AUDIT_NODE_GOAL,
+      successCriteria: SCHEDULED_AUDIT_NODE_CRITERIA, dependsOn: ["gate"], depth: 5,
+      taskId: auditTaskId, verificationDisposition: "specialized" },
+  ] }
+}
+const contentFor = (auditTaskId = "audit-child-1", scoutKey = "scout", _analystKey = "analyst"): RecoveryGraphContent =>
+  contentForScouts([scoutKey], auditTaskId)
 
 type GraphItem = Readonly<Record<string, unknown>>
 type GraphEvent = Readonly<Record<string, unknown>>
@@ -51,7 +60,7 @@ function planEvent(stepId: string, revision: number, content: unknown, id = `${s
   const dto = { schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: itemId, sessionId: owner.sessionId, turnId: owner.turnId,
     stepId, taskId: rootId, type: TASK_GRAPH_ITEM_TYPE, status: "streaming", phase: null, revision, content,
     startedAt: proposalDate, completedAt: null, createdAt: proposalDate, updatedAt: proposalDate }
-  const auditTaskId = (content as { nodes: readonly { key: string; taskId: string }[] }).nodes[4]!.taskId
+  const auditTaskId = (content as { nodes: readonly { key: string; taskId: string }[] }).nodes.find(node => node.key === SCHEDULED_AUDIT_TEMPLATE_ID)!.taskId
   const payload = { kind: "proposal", fingerprint: "f".repeat(64), revision,
     receipt: { status: "accepted", revision,
       nodes: [{ key: SCHEDULED_AUDIT_TEMPLATE_ID, taskId: auditTaskId, status: "queued" }], readyTaskIds: [auditTaskId] },
@@ -77,6 +86,12 @@ describe("scheduled pipeline recovery graph item classification", () => {
 
   it("accepts the scheduled Scout and Analyst keys while preserving semantic templates", () => {
     const content = contentFor("audit-child-1", "scheduled-scout", "scheduled-analyst"), stepId = "recovery-step-1"
+    expect(classify(stepId, [graphItem(stepId, content)], [planEvent(stepId, proposalRevision, content)])).toBe("verified_plan")
+  })
+
+  it.each([2, 4])("accepts a v2 %i-Scout full continuation topology", count => {
+    const keys = Array.from({ length: count }, (_, index) => `source-${index + 1}`), content = contentForScouts(keys)
+    const stepId = "recovery-step-multi"
     expect(classify(stepId, [graphItem(stepId, content)], [planEvent(stepId, proposalRevision, content)])).toBe("verified_plan")
   })
 

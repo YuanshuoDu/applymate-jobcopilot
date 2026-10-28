@@ -2,17 +2,18 @@ import type pg from "pg"
 import type { SubagentExecutor } from "../../queue/subagent-queue.js"
 import { postScheduledPipelineExecute } from "./scheduled-pipeline-handoff.js"
 import { createPgTaskGraphCommandPort } from "./pg-task-graph-command-port.js"
-import { currentTaskGraph, loadTaskGraph, type GraphIdentityScope, type GraphTaskRow } from "./task-graph-pg-state.js"
-import { canonicalTaskGraphJson, taskGraphFingerprint } from "./task-graph-snapshot.js"
+import { currentTaskGraph, loadTaskGraph, type GraphIdentityScope } from "./task-graph-pg-state.js"
+import { canonicalTaskGraphJson } from "./task-graph-snapshot.js"
 import { scheduledGatePreparedJobIds, SCHEDULED_GATE_OUTPUT_SCHEMA, SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
 import { scheduledAuditGateCheckpointEvidence } from "./scheduled-audit-invocation.js"
 import { readScheduledGateRegistrationReceipt } from "./scheduled-gate-registration-receipt.js"
 import { loadPersistedScheduledPrepareProof } from "./scheduled-gate-wait-match.js"
 import { scheduledSnapshotMatches } from "./scheduled-taskgraph-continuation-receipt.js"
-import { parseDiscoveryAttemptSidecar } from "./child-discovery-attempt.js"
-import { validateRoleResult, type AnalystResult, type ScoutResult } from "./role-results.js"
-import { parseStoredTaskGraphVerificationReport } from "./task-graph-verification-report.js"
 import { parseScheduledAutomationSnapshot } from "./scheduled-automation-snapshot.js"
+import { verifyCompletedTaskGraphNodeEvidence } from "./task-graph-pg-verification.js"
+import { buildScheduledPipelineGraphAttestation } from "./scheduled-pipeline-current-attestation.js"
+import { projectScheduledPipelineGraph } from "./scheduled-pipeline-graph-shape.js"
+import { scheduledTaskGraphContinuationKeyVersion } from "./scheduled-taskgraph-continuation-receipt.js"
 import { parseScheduledAuditReport, parseScheduledAuditTaskEnvelope, SCHEDULED_AUDIT_TEMPLATE_ID,
   SCHEDULED_AUDIT_INVOCATION_PROOF_SCHEMA, SCHEDULED_AUDIT_OUTPUT_SCHEMA, SCHEDULED_AUDIT_ROLE, SCHEDULED_AUDIT_TASK_TYPE,
   type ScheduledAuditInvocationProof } from "./scheduled-audit-contract.js"
@@ -85,10 +86,12 @@ async function loadScheduledAuditInvocation(pool: Pick<pg.Pool, "connect">, leas
     const scope: GraphIdentityScope = { userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId!,
       rootTaskId: lease.rootTaskId, parentTaskId: lease.rootTaskId }
     const graph = await loadTaskGraph(client, scope, false), snapshot = graph.snapshot, state = graph.state, current = currentTaskGraph(graph)
-    const audit = snapshot?.nodes.find(node => node.key === SCHEDULED_AUDIT_TEMPLATE_ID), auditState = state?.nodes.find(node => node.key === SCHEDULED_AUDIT_TEMPLATE_ID)
-    const gate = snapshot?.nodes.find(node => node.key === "gate"), prepare = snapshot?.nodes.find(node => node.key === "prepare")
+    const version = scheduledTaskGraphContinuationKeyVersion(evidence.continuationKey)
+    const shape = snapshot && version && projectScheduledPipelineGraph(snapshot.nodes, version, "audit")
+    const audit = shape?.audit, auditState = state?.nodes.find(node => node.key === SCHEDULED_AUDIT_TEMPLATE_ID)
+    const gate = shape?.gate, prepare = shape?.prepare
     const auditTask = audit && graph.tasks.get(audit.taskId), gateTask = gate && graph.tasks.get(gate.taskId), prepareTask = prepare && graph.tasks.get(prepare.taskId)
-    if (!snapshot || !state || snapshot.nodes.length !== 5 || !audit || audit.taskId !== lease.id || audit.templateId !== "scheduled_audit"
+    if (!snapshot || !state || !shape || !version || !audit || audit.taskId !== lease.id || audit.templateId !== "scheduled_audit"
       || audit.depth !== 5 || audit.verificationDisposition !== "specialized" || !same(audit.dependsOn, ["gate"])
       || !auditState || auditState.status !== "running" || !auditTask || auditTask.status !== "running"
       || auditTask.attemptCount !== lease.attemptCount || auditTask.role !== SCHEDULED_AUDIT_ROLE || auditTask.taskType !== SCHEDULED_AUDIT_TASK_TYPE
@@ -98,7 +101,7 @@ async function loadScheduledAuditInvocation(pool: Pick<pg.Pool, "connect">, leas
       || gateTask.role !== SCHEDULED_GATE_ROLE || gateTask.taskType !== SCHEDULED_GATE_TASK_TYPE
       || !same(gateTask.expectedOutputSchema, SCHEDULED_GATE_OUTPUT_SCHEMA) || !same(gateTask.allowedActions, [])
       || !prepare || !prepareTask || prepareTask.status !== "completed"
-      || current.nodes.length !== 5) throw new Error("scheduled_audit_graph_invalid")
+      || current.nodes.length !== snapshot.nodes.length) throw new Error("scheduled_audit_graph_invalid")
     const owner = stableOwner(evidence.owner), gateRegistration = await readScheduledGateRegistrationReceipt(client, {
       userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId!, owner, gateTaskId: gate.taskId,
     })
@@ -114,10 +117,14 @@ async function loadScheduledAuditInvocation(pool: Pick<pg.Pool, "connect">, leas
     if (!loadedPrepare || !scheduledGatePreparedJobIds(loadedPrepare) || !samePreparedLineage(loadedPrepare, gateRegistration)
       || !same(stableOwner(loadedPrepare.receipt.owner), evidence.owner)) throw new Error("scheduled_audit_prepare_proof_invalid")
     prepareProof = loadedPrepare
-    const built = buildAttestation(pipelineOwner(prepareProof.receipt.owner), evidence.snapshotDigest, evidence.evidenceDigest,
-      evidence.analyzeGraphRevision, snapshot.nodes, graph.tasks)
-    if (!built) throw new Error("scheduled_audit_analyze_proof_invalid")
-    attestation = built
+    const turnInput = record(live.turnInput)
+    const built = await buildScheduledPipelineGraphAttestation({ scope: pipelineOwner(prepareProof.receipt.owner),
+      schedule: turnInput?.scheduledAutomationSnapshot, snapshot, current, tasks: graph.tasks,
+      verifyCompletedNode: input => verifyCompletedTaskGraphNodeEvidence(client, input) })
+    if (built.status !== "ready" || ("scouts" in built.attestation ? "v2" : "v1") !== version
+      || built.attestation.snapshotDigest !== evidence.snapshotDigest || built.attestation.evidenceDigest !== evidence.evidenceDigest
+      || built.attestation.graphRevision !== evidence.analyzeGraphRevision) throw new Error("scheduled_audit_analyze_proof_invalid")
+    attestation = built.attestation
     await client.query("COMMIT")
   } catch (error: unknown) {
     await client.query("ROLLBACK").catch(() => undefined)
@@ -160,39 +167,6 @@ async function readLiveScope(client: Queryable, lease: SubagentLease, now: Date)
     throw new Error("scheduled_audit_owner_stale")
   }
   return row
-}
-function buildAttestation(owner: ScheduledAutomationPipelineAttestation["owner"], snapshotDigest: string, evidenceDigest: string,
-  graphRevision: number, nodes: readonly { key: string; taskId: string; templateId: string; verification?: { role: string; criteria: readonly { id: string }[] } }[],
-  tasks: ReadonlyMap<string, GraphTaskRow>): ScheduledAutomationPipelineAttestation | null {
-  const scoutNode = nodes.find(node => node.templateId === "scout"), analystNode = nodes.find(node => node.templateId === "analyst")
-  const scoutTask = scoutNode && tasks.get(scoutNode.taskId), analystTask = analystNode && tasks.get(analystNode.taskId)
-  const scoutEnvelope = scoutTask && outputEnvelope(scoutTask.result, true), analystEnvelope = analystTask && outputEnvelope(analystTask.result, false)
-  if (!scoutNode?.verification || !analystNode?.verification || !scoutTask || !analystTask || !scoutEnvelope || !analystEnvelope) return null
-  let scout: ScoutResult, analyst: AnalystResult
-  try { scout = validateRoleResult(scoutEnvelope.structuredResult, "scout") as ScoutResult
-    analyst = validateRoleResult(analystEnvelope.structuredResult, "analyst") as AnalystResult } catch { return null }
-  const scoutReport = parseStoredTaskGraphVerificationReport(scoutEnvelope.taskGraphVerificationReport, scoutNode.verification.criteria.map(item => item.id), [])
-  const analystReport = parseStoredTaskGraphVerificationReport(analystEnvelope.taskGraphVerificationReport, analystNode.verification.criteria.map(item => item.id), [scoutNode.key])
-  const health = parseDiscoveryAttemptSidecar(scoutEnvelope.discoveryAttempt, scoutTask.attemptCount ?? 0)
-  if (scout.status !== "completed" || analyst.status !== "completed" || scoutTask.status !== "completed" || analystTask.status !== "completed"
-    || !scoutReport || scoutReport.status !== "passed" || !scoutReport.resultDigest || !analystReport || analystReport.status !== "passed"
-    || !analystReport.resultDigest || !health || health.attemptedCalls < 1 || health.completedCalls !== health.attemptedCalls
-    || health.failedCalls !== 0 || health.unresolvedCalls !== 0 || health.providerFailures !== 0 || health.materializationFailures !== 0
-    || health.hasMore !== false || health.candidateCount !== scout.candidates.length) return null
-  const base = { status: "complete" as const, taskId: scoutTask.id, attemptCount: scoutTask.attemptCount!, completedCalls: health.completedCalls,
-    candidateCount: health.candidateCount!, providerFailures: 0 as const, materializationFailures: 0 as const, hasMore: false as const }
-  return { schemaVersion: "agent-harness.v2.scheduled-pipeline-attestation.v1", owner, snapshotDigest, graphRevision,
-    scout: { taskId: scoutTask.id, attemptCount: scoutTask.attemptCount!, status: "completed", verification: "passed",
-      resultDigest: scoutReport.resultDigest, candidateJobIds: scout.candidates.map(item => item.jobId), discoveryReceipt: { ...base, receiptDigest: taskGraphFingerprint(base) } },
-    analyst: { taskId: analystTask.id, attemptCount: analystTask.attemptCount!, status: "completed", verification: "passed",
-      resultDigest: analystReport.resultDigest, dependsOnTaskIds: [scoutTask.id], jobIds: analyst.findings.map(item => item.jobId) }, evidenceDigest }
-}
-function outputEnvelope(value: unknown, discovery: boolean): Row | null {
-  const row = record(value), keys = ["finalItemId", "finalText", "status", "stepCount", "toolCallCount", "taskGraphVerificationReport", "structuredResult",
-    ...(discovery ? ["discoveryAttempt"] : [])]
-  return row && Reflect.ownKeys(row).length === keys.length && Reflect.ownKeys(row).every(key => typeof key === "string" && keys.includes(key))
-    && row.status === "completed" && (row.finalItemId === null || typeof row.finalItemId === "string") && typeof row.finalText === "string"
-    && nonNegative(row.stepCount) && nonNegative(row.toolCallCount) && Object.hasOwn(row, "structuredResult") ? row : null
 }
 function validInvocationProof(value: ScheduledAuditInvocationProof | null | undefined, lease: SubagentLease,
   gateTaskId: string, attestation: ScheduledAutomationPipelineAttestation,
@@ -248,7 +222,6 @@ function record(value: unknown): Row | null {
   return proto === Object.prototype || proto === null ? parsed as Row : null
 }
 function positive(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) > 0 }
-function nonNegative(value: unknown): boolean { return Number.isSafeInteger(value) && Number(value) >= 0 }
 function validId(value: unknown): value is string { return typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= 256 }
 function exact(row: object, keys: readonly string[]): boolean {
   const actual = Reflect.ownKeys(row)
