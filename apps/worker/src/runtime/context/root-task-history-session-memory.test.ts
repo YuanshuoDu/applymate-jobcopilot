@@ -86,7 +86,10 @@ function retainedOutbox(event: Event): Outbox {
 describe("root task history Session authorization", () => {
   it("pins consent under the shared advisory lock, current owner fence, and same transaction", async () => {
     const fake = fakePool(), work = vi.fn(async () => "history")
-    const result = await withRootTaskHistorySessionAuthorization(fake.pool, input, work)
+    const result = await withRootTaskHistorySessionAuthorization(fake.client, input, async (client, authorization, allowed) => {
+      expect(client).toBe(fake.client); expect(authorization.consentEnabled).toBe(true); expect(allowed).toBe(true)
+      return work()
+    })
     const sql = fake.calls.map(call => call.sql)
     const lock = sql.findIndex(value => value.includes("pg_advisory_xact_lock"))
     const session = sql.findIndex(value => value.includes('FROM "agent_sessions"'))
@@ -96,43 +99,44 @@ describe("root task history Session authorization", () => {
     const consent = sql.findIndex(value => value.includes('FROM "User"'))
     const eventWrite = sql.findIndex(value => value.startsWith('INSERT INTO "agent_events"'))
     const outboxWrite = sql.findIndex(value => value.startsWith('INSERT INTO "agent_outbox"'))
-    expect(sql[0]).toBe("BEGIN ISOLATION LEVEL READ COMMITTED")
-    expect(lock).toBeGreaterThan(0)
+    expect(lock).toBeGreaterThanOrEqual(0)
     expect(sql[lock]).toContain("applymate:agent-task-history-memory:")
     expect(fake.calls[lock]?.values).toEqual([input.lease.userId])
     expect(lock).toBeLessThan(session); expect(session).toBeLessThan(turn); expect(turn).toBeLessThan(root)
     expect(root).toBeLessThan(step); expect(step).toBeLessThan(consent); expect(consent).toBeLessThan(eventWrite)
     expect(eventWrite).toBeLessThan(outboxWrite)
-    expect(result).toMatchObject({ historyReadAllowed: true, historyResult: "history", authorization: {
+    expect(result).toMatchObject({ historyReadAllowed: true, workResult: "history", authorization: {
       sessionId: input.lease.sessionId, userId: input.lease.userId, consentVersion: 3, consentEnabled: true, gateEnabledAtCapture: true,
     } })
     expect(fake.event).toMatchObject({ type: ROOT_TASK_HISTORY_SESSION_AUTHORIZATION_EVENT_TYPE, sequence: "1" })
     expect(fake.outbox).toMatchObject({ id: `agent-outbox-${fake.event?.id}`, idempotencyKey: `agent-event:${fake.event?.id}` })
-    expect(sql.at(-1)).toBe("COMMIT")
     expect(work).toHaveBeenCalledOnce()
-    expect(fake.client.release).toHaveBeenCalledOnce()
+    expect(sql.some(value => ["BEGIN", "COMMIT", "ROLLBACK"].includes(value))).toBe(false)
   })
 
   it.each([
     ["the server gate is off", { enabled: true, gate: false }],
     ["pinned consent is off", { enabled: false, gate: true }],
   ] as const)("writes only the metadata marker when %s", async (_label, options) => {
-    const fake = fakePool(options), work = vi.fn(async () => "must not read")
-    const result = await withRootTaskHistorySessionAuthorization(fake.pool, { ...input, environmentGateEnabled: options.gate ?? true }, work)
+    const fake = fakePool(options), work = vi.fn(async (_client: pg.PoolClient, _authorization: unknown, allowed: boolean) => {
+      expect(allowed).toBe(false)
+      return "ordinary context"
+    })
+    const result = await withRootTaskHistorySessionAuthorization(fake.client, { ...input, environmentGateEnabled: options.gate ?? true }, work)
     expect(result.historyReadAllowed).toBe(false)
-    expect(result).not.toHaveProperty("historyResult")
-    expect(work).not.toHaveBeenCalled()
+    expect(result.workResult).toBe("ordinary context")
+    expect(work).toHaveBeenCalledOnce()
     expect(fake.calls.some(call => call.sql.includes('FROM "User"'))).toBe(true)
     expect(fake.calls.some(call => /root.task.history|historical|prior.outcome/i.test(call.sql))).toBe(false)
     expect(fake.event?.type).toBe(ROOT_TASK_HISTORY_SESSION_AUTHORIZATION_EVENT_TYPE)
-    expect(fake.calls.at(-1)?.sql).toBe("COMMIT")
+    expect(fake.calls.some(call => ["BEGIN", "COMMIT", "ROLLBACK"].includes(call.sql))).toBe(false)
   })
 
   it("replays the immutable enabled decision after user revocation without rereading User", async () => {
     const event = retainedEvent(), fake = fakePool({ enabled: false, version: 4, event, outbox: retainedOutbox(event) })
     const work = vi.fn(async () => "advisory projection")
-    const result = await withRootTaskHistorySessionAuthorization(fake.pool, input, work)
-    expect(result).toMatchObject({ historyReadAllowed: true, historyResult: "advisory projection", authorization: {
+    const result = await withRootTaskHistorySessionAuthorization(fake.client, input, async () => work())
+    expect(result).toMatchObject({ historyReadAllowed: true, workResult: "advisory projection", authorization: {
       eventId: event.id, consentVersion: 3, consentEnabled: true,
     } })
     expect(fake.calls.some(call => call.sql.includes('FROM "User"'))).toBe(false)
@@ -143,37 +147,32 @@ describe("root task history Session authorization", () => {
   it("fails closed on corrupt authorization payload, mismatched outbox, or orphan outbox", async () => {
     const malformed = retainedEvent({ schemaVersion: "wrong" })
     const corrupt = fakePool({ event: malformed, outbox: retainedOutbox(malformed) })
-    await expect(withRootTaskHistorySessionAuthorization(corrupt.pool, input, async () => undefined))
+    await expect(withRootTaskHistorySessionAuthorization(corrupt.client, input, async () => undefined))
       .rejects.toMatchObject({ code: "persistence_conflict" })
-    expect(corrupt.calls.at(-1)?.sql).toBe("ROLLBACK")
 
     const good = retainedEvent(), mismatched = retainedOutbox(good)
     const badOutbox = fakePool({ event: good, outbox: { ...mismatched, topic: "wrong" } })
-    await expect(withRootTaskHistorySessionAuthorization(badOutbox.pool, input, async () => undefined))
+    await expect(withRootTaskHistorySessionAuthorization(badOutbox.client, input, async () => undefined))
       .rejects.toMatchObject({ code: "persistence_conflict" })
-    expect(badOutbox.calls.at(-1)?.sql).toBe("ROLLBACK")
 
     const orphan = fakePool({ orphanOutbox: { ...retainedOutbox(good), idempotencyKey: "agent-event:orphan" } })
-    await expect(withRootTaskHistorySessionAuthorization(orphan.pool, input, async () => undefined))
+    await expect(withRootTaskHistorySessionAuthorization(orphan.client, input, async () => undefined))
       .rejects.toMatchObject({ code: "persistence_conflict" })
     expect(orphan.calls.some(call => call.sql.includes('FROM "User"'))).toBe(false)
-    expect(orphan.calls.at(-1)?.sql).toBe("ROLLBACK")
   })
 
   it("rolls back when the callback fails and rejects an owner-fence loss before consent reads", async () => {
     const failedWork = fakePool()
-    await expect(withRootTaskHistorySessionAuthorization(failedWork.pool, input, async () => { throw new Error("history failed") }))
-      .rejects.toMatchObject({ code: "persistence_conflict" })
-    expect(failedWork.calls.at(-1)?.sql).toBe("ROLLBACK")
+    await expect(withRootTaskHistorySessionAuthorization(failedWork.client, input, async () => { throw new Error("history failed") }))
+      .rejects.toThrow("history failed")
 
     const lost = fakePool({ failOwner: true })
-    await expect(withRootTaskHistorySessionAuthorization(lost.pool, input, async () => undefined))
+    await expect(withRootTaskHistorySessionAuthorization(lost.client, input, async () => undefined))
       .rejects.toMatchObject({ code: "lease_lost" })
     expect(lost.calls.some(call => call.sql.includes('FROM "User"'))).toBe(false)
-    expect(lost.calls.at(-1)?.sql).toBe("ROLLBACK")
 
     const lostStep = fakePool({ failStep: true })
-    await expect(withRootTaskHistorySessionAuthorization(lostStep.pool, input, async () => undefined))
+    await expect(withRootTaskHistorySessionAuthorization(lostStep.client, input, async () => undefined))
       .rejects.toMatchObject({ code: "lease_lost" })
     expect(lostStep.calls.some(call => call.sql.includes('FROM "User"'))).toBe(false)
   })

@@ -118,15 +118,18 @@ function projectNode(value: unknown): Omit<SafeNode, "lesson" | "reportedOutput"
   return { taskKind, status: node.status as SubagentTaskStatus, ...(hints ? { negativeReasonHints: hints } : {}) }
 }
 function candidate(value: unknown, crossSession: boolean): Candidate | null {
-  const item = record(value), locality = item && ownDataProperty(item, "sourceSessionDiffers")
+  const item = record(value), locality = item && ownDataProperty(item, "sourceSessionDiffers"), terminalAt = item && ownDataProperty(item, "terminalAt")
   if (!item || !locality || !boundedText(item.sourceTurnId) || !boundedText(item.sourceRootTaskId)
     || typeof item.terminalSequence !== "bigint" || item.terminalSequence <= 0n
+    || !terminalAt || (terminalAt.present && (!(terminalAt.value instanceof Date) || !Number.isFinite(terminalAt.value.getTime())))
     || (crossSession && ((locality.present && typeof locality.value !== "boolean")
-      || !(item.terminalAt instanceof Date) || !Number.isFinite(item.terminalAt.getTime())))) return null
+      || !terminalAt.present))
+    || (!crossSession && locality.present && locality.value !== false)) return null
   const hasSourceSessionDiffers = locality.present
   const sourceSessionDiffers = crossSession && (!hasSourceSessionDiffers || locality.value !== false)
+  const hasTerminalAt = terminalAt.present
   const hasOrdinals = Object.hasOwn(item, "sourceNodeOrdinals"), hasLessons = Object.hasOwn(item, "nodeLessons"), hasOutputs = Object.hasOwn(item, "reportedOutputs")
-  const keys = ["sourceRootTaskId", "sourceTurnId", "taskGraph", "terminalSequence", ...(crossSession ? [...(hasSourceSessionDiffers ? ["sourceSessionDiffers"] : []), "terminalAt"] : []),
+  const keys = ["sourceRootTaskId", "sourceTurnId", "taskGraph", "terminalSequence", ...(hasSourceSessionDiffers ? ["sourceSessionDiffers"] : []), ...(hasTerminalAt ? ["terminalAt"] : []),
     ...(hasOrdinals ? ["sourceNodeOrdinals"] : []), ...(hasLessons ? ["nodeLessons"] : []), ...(hasOutputs ? ["reportedOutputs"] : [])].sort().join(",")
   if (!exact(item, keys)) return null
   const graph = record(item.taskGraph), graphTurn = graph && ownDataProperty(graph, "discoveryTurnEligibility")

@@ -4,12 +4,12 @@ import type { TurnEngineOptions } from "./turns/turn-engine-types.js"
 import type { TurnLease } from "./turns/lease.js"
 import { executionOwnerFence, type ExecutionOwnerFence } from "./execution-owner.js"
 import { readCurrentRootBudget, type CurrentRootBudgetObservation } from "./turns/turn-engine-root-budget.js"
-import type { InputClaimStore } from "./context/input-claim-store.js"
-import { createPgContextOwnerFence, StepContextBuilder } from "./context/step-context-builder.js"
+import { createPgInputClaimTransaction, type InputClaimStore } from "./context/input-claim-store.js"
+import { createPgContextOwnerFence, StepContextBuilder, type StepContextRequest } from "./context/step-context-builder.js"
 import type { HydrationScope } from "./context/steering-reconciliation-context.js"
 import { injectSelectedJobMemory, type SelectedJobMemoryRecord } from "./context/selected-job-memory.js"
 import { createPgDirectSelectedJobHistoryStore } from "./context/selected-job-history-direct-store.js"
-import { createPgDirectRootTaskHistoryStore } from "./context/root-task-history-direct-store.js"
+import { createPgDirectRootTaskHistoryStore, type DirectRootTaskHistoryLoadInput } from "./context/root-task-history-direct-store.js"
 import { selectedJobSnapshot } from "./canonical-turn-task-graph-context.js"
 import type { StepContextSnapshot } from "./context/step-context-builder.js"
 import {
@@ -22,7 +22,11 @@ import {
   appendCanonicalSelectedJobHistory, appendCanonicalSelectedJobHistoryOutcomes,
   type DirectSelectedJobHistoryReader, type SelectedJobHistoryReader,
 } from "./canonical-turn-selected-job-history.js"
-import { appendCanonicalRootTaskHistory, type DirectRootTaskHistoryReader } from "./canonical-turn-root-task-history.js"
+import { appendCanonicalRootTaskHistory, appendCanonicalRootTaskHistoryOutcomes, type DirectRootTaskHistoryReader } from "./canonical-turn-root-task-history.js"
+import { withRootTaskHistorySessionAuthorization } from "./context/root-task-history-session-memory.js"
+import { withRootTaskHistoryObjectiveSnapshot } from "./context/root-task-history-objective-snapshot.js"
+import { readRootTaskHistorySteerEvidence } from "./context/root-task-history-steer-evidence.js"
+import { readRootTaskHistoryFence } from "./context/root-task-history-fence.js"
 import { canonicalJson } from "./context/context-snapshot-json.js"
 import { loadOrCreateDiscoveryPersonaSnapshot } from "./context/discovery-persona-facts-pg.js"
 import { discoveryPersonaContextBlocks } from "./context/discovery-persona-context-blocks.js"
@@ -30,7 +34,9 @@ import { TurnEngineError } from "./turns/turn-engine-output.js"
 import { TurnLeaseError } from "./turns/lease.js"
 
 type ContextBuilder = TurnEngineOptions["contextBuilder"]
-type BaseBuilder = Pick<ContextBuilder, "build">
+type BaseBuilder = Pick<ContextBuilder, "build"> & {
+  buildInTransaction?: (transaction: import("./context/input-claim-store.js").InputClaimTransaction, request: StepContextRequest) => Promise<import("./context/step-context-builder.js").StepContext>
+}
 
 type Input = Readonly<{
   pool: Pick<pg.Pool, "connect">
@@ -63,6 +69,61 @@ const CURRENT_BUDGET_OBSERVATION_ID = "turn-budget-current"
 function isCurrentBudgetObservation(value: unknown): boolean {
   return !!value && typeof value === "object" && !Array.isArray(value)
     && (value as { kind?: unknown }).kind === "turn_budget_current"
+}
+
+async function buildWithRootTaskHistory(input: Input, base: BaseBuilder, reader: DirectRootTaskHistoryReader,
+  request: StepContextRequest, snapshot: StepContextSnapshot): Promise<import("./context/step-context-builder.js").StepContext> {
+  const now = request.now ?? new Date(), historyRequest: DirectRootTaskHistoryLoadInput = {
+    lease: input.lease, rootTaskId: input.rootTaskId, rootAttemptCount: input.rootAttemptCount, stepId: request.stepId, now,
+  }
+  const client = await input.pool.connect()
+  let committed = false
+  try {
+    await client.query("BEGIN ISOLATION LEVEL READ COMMITTED")
+    const result = await withRootTaskHistorySessionAuthorization(client, {
+      scope: input.scope, lease: input.lease, rootTaskId: input.rootTaskId, rootAttemptCount: input.rootAttemptCount,
+      stepId: request.stepId, environmentGateEnabled: input.crossSessionRootTaskHistoryEnabled === true,
+    }, async (transactionClient, authorization, historyReadAllowed) => {
+      const claimTransaction = createPgInputClaimTransaction(transactionClient, input.scope)
+      const sameSessionOutcomes = await reader.loadWithClient!(transactionClient, historyRequest)
+      const sameSessionSnapshot = appendCanonicalRootTaskHistoryOutcomes({ snapshot,
+        sameSessionOutcomes, crossSessionRootTaskHistoryEnabled: false })
+      const built = await base.buildInTransaction!(claimTransaction, { ...request, snapshot: sameSessionSnapshot, taskId: input.rootTaskId })
+      const steerEvidence = await readRootTaskHistorySteerEvidence(transactionClient, input.scope, {
+        sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId,
+        lease: { ownerId: input.lease.ownerId, leaseVersion: input.lease.leaseVersion, now },
+      })
+      if (!historyReadAllowed || steerEvidence.kind !== "no_accepted_steer") return built
+      const requestWithCross: DirectRootTaskHistoryLoadInput = { ...historyRequest, crossSessionRootTaskHistoryEnabled: true,
+        ...(input.objectiveHistoryIndexEnabled === true ? { objectiveHistoryIndexEnabled: true } : {}) }
+      const fence = await readRootTaskHistoryFence(transactionClient, requestWithCross)
+      if (!fence?.currentOrigin) return built
+      const memory = await withRootTaskHistoryObjectiveSnapshot({ client: transactionClient, lease: input.lease,
+        rootTaskId: input.rootTaskId, authorization, fence, acceptedInputRevision: built.inputThroughSequence, steerEvidence,
+        loadOutcomes: async sameClient => (await reader.loadWithClient!(sameClient as pg.PoolClient, requestWithCross))
+          .filter(outcome => outcome.sourceSessionDiffers === true) })
+      if (!memory) return built
+      const composed = appendCanonicalRootTaskHistoryOutcomes({ snapshot: sameSessionSnapshot, sameSessionOutcomes,
+        crossSessionOutcomes: memory.outcomes, crossSessionRootTaskHistoryEnabled: true })
+      const history = composed.toolObservations.find(observation => observation.id === "root-task-history")
+      const blockId = "observation:root-task-history", previousIndex = built.blocks.findIndex(block => block.id === blockId)
+      const blocks = built.blocks.filter(block => block.id !== blockId)
+      if (history) {
+        const block = { id: blockId, layer: "tool_observation" as const, role: "data" as const,
+          trust: "external_untrusted" as const, source: "tool_or_subagent", content: history.content as import("./context/step-context-builder.js").JsonValue }
+        blocks.splice(previousIndex < 0 ? blocks.length : Math.min(previousIndex, blocks.length), 0, block)
+      }
+      const canonical = canonicalJson({ schemaVersion: built.schemaVersion, sessionId: built.sessionId, turnId: built.turnId,
+        stepId: built.stepId, inputThroughSequence: built.inputThroughSequence.toString(), consumedInputIds: built.consumedInputIds, blocks })
+      return { ...built, blocks, canonicalJson: canonical }
+    })
+    await client.query("COMMIT")
+    committed = true
+    return result.workResult
+  } catch (error: unknown) {
+    if (!committed) await client.query("ROLLBACK").catch(() => undefined)
+    throw error
+  } finally { client.release() }
 }
 
 export function canonicalSteeringHydrationScope(input: Pick<Input, "planningEnabled" | "scope" | "lease" | "rootTaskId" | "rootAttemptCount" | "rootInputId">): HydrationScope | undefined {
@@ -120,14 +181,6 @@ export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder 
           records: input.selectedJobMemories ?? [], now: request.now ?? new Date(),
         })
       }
-      if (rootTaskHistoryReader) snapshot = await appendCanonicalRootTaskHistory({
-        snapshot, reader: rootTaskHistoryReader,
-        request: { lease: input.lease, rootTaskId: input.rootTaskId, rootAttemptCount: input.rootAttemptCount, stepId: request.stepId, now: request.now ?? new Date(),
-          ...(input.crossSessionRootTaskHistoryEnabled === true && input.planningEnabled && !input.selectedJobMode
-            ? { crossSessionRootTaskHistoryEnabled: true } : {}),
-          ...(input.objectiveHistoryIndexEnabled === true && input.planningEnabled && !input.selectedJobMode
-            ? { objectiveHistoryIndexEnabled: true } : {}) },
-      })
       if (input.planningEnabled) {
         const owner = executionOwnerFence({ kind: "turn", taskId: input.rootTaskId, lease: input.lease })
         const budget = input.currentRootBudgetReader
@@ -163,7 +216,15 @@ export function createCanonicalTurnContextBuilder(input: Input): ContextBuilder 
       })
       if (objectiveProgress) toolObservations.push(objectiveProgress)
       snapshot = { ...snapshot, rootTaskGoalCriteria, toolObservations }
-      const built = await base.build({ ...request, snapshot, taskId: input.rootTaskId })
+      let built: import("./context/step-context-builder.js").StepContext
+      if (rootTaskHistoryReader && base.buildInTransaction && rootTaskHistoryReader.loadWithClient) {
+        built = await buildWithRootTaskHistory(input, base, rootTaskHistoryReader, request, snapshot)
+      } else {
+        if (rootTaskHistoryReader) snapshot = await appendCanonicalRootTaskHistory({ snapshot, reader: rootTaskHistoryReader,
+          request: { lease: input.lease, rootTaskId: input.rootTaskId, rootAttemptCount: input.rootAttemptCount, stepId: request.stepId,
+            now: request.now ?? new Date(), crossSessionRootTaskHistoryEnabled: false } })
+        built = await base.build({ ...request, snapshot, taskId: input.rootTaskId })
+      }
       if (!discoveryMemoryEnabled) return built
       const memory = await loadDiscoveryPersonaMemory(request.stepId)
       const blocks = [...built.blocks, ...discoveryPersonaContextBlocks(memory.projection)]

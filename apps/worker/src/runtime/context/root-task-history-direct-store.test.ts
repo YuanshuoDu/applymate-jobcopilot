@@ -23,6 +23,7 @@ type Options = Readonly<{
   sourceSessionStatusAtGraphLoad?: "archived" | "aborted"
   sourceSessionLockedAtGraphLoad?: boolean
   tenantScope?: string | null
+  omitSameSessionTerminalTime?: boolean
 }>
 
 function candidate(index: number, terminalSequence = String(index * 2 + 2), status: "completed" | "failed" | "interrupted" = "completed"): Row {
@@ -83,7 +84,7 @@ function fixture(options: Options = {}) {
       if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql)) return { rows: [], rowCount: 1 }
       if (sql.includes("set_config")) { tenantScope = String(values?.[1]); return { rows: [], rowCount: 1 } }
       if (sql.includes("current_setting('app.user_id'")) return { rows: [{ userId: tenantScope }] }
-      if (sql.includes("FOR SHARE")) return { rows: options.sourceSessionStatusAtGraphLoad || options.sourceSessionLockedAtGraphLoad ? [] : [{ id: values?.[0] }] }
+      if (sql.includes("FOR SHARE") && sql.includes('FROM "agent_sessions"')) return { rows: options.sourceSessionStatusAtGraphLoad || options.sourceSessionLockedAtGraphLoad ? [] : [{ id: values?.[0] }] }
       if (sql.includes('SELECT "id" FROM "agent_sessions"')) return { rows: [{ id: "session-1" }] }
       if (sql.includes('SELECT "id" FROM "agent_turns"')) return { rows: [{ id: "turn-current" }] }
       if (sql.includes("FOR UPDATE OF task")) return { rows: [{
@@ -110,6 +111,18 @@ function fixture(options: Options = {}) {
             ? right.terminalCreatedAt.getTime() - left.terminalCreatedAt.getTime() : 0) || String(right.turnId).localeCompare(String(left.turnId))
           : Number(BigInt(String(right.terminalSequence)) - BigInt(String(left.terminalSequence))))
         return { rows: rows.slice(0, limit) }
+      }
+      if (sql.includes("WITH expected AS MATERIALIZED")) {
+        if (options.omitSameSessionTerminalTime) return { rows: [] }
+        const turnIds = values?.[1] as string[]
+        const roots = values?.[2] as string[]
+        const sequences = values?.[3] as string[]
+        return { rows: turnIds.map((turnId, index) => {
+          const source = sourceRows.find(row => row.turnId === turnId && row.taskRootTaskId === roots[index]
+            && String(row.terminalSequence) === sequences[index])
+          return source ? { sessionId: "session-1", turnId, taskId: roots[index], sequence: sequences[index],
+            type: source.terminalType, createdAt: source.terminalCreatedAt } : undefined
+        }).filter((row): row is NonNullable<typeof row> => row !== undefined) }
       }
       if (sql.includes("event.\"type\" = 'turn.started'")) return { rows: options.startRows ?? [currentStart()] }
       if (sql.includes('FROM "agent_items" AS item')) {
@@ -169,6 +182,7 @@ describe("direct Root-task history PostgreSQL store", () => {
     const outcomes = await test.store.loadWithClient(test.client, test.input)
 
     expect(outcomes.map(value => value.sourceTurnId)).toEqual(["turn-source-1"])
+    expect(outcomes[0]).toMatchObject({ sourceSessionDiffers: false, terminalAt: new Date("2026-10-07T11:01:00.000Z") })
     expect(test.connects).toBe(0)
     expect(test.queries.filter(query => query.sql.includes("current_setting('app.user_id'")).length).toBe(1)
     expect(test.queries.some(query => query.sql.includes("set_config"))).toBe(false)
@@ -203,6 +217,13 @@ describe("direct Root-task history PostgreSQL store", () => {
     expect(legacy.queries[1]?.values).toEqual(["app.user_id", "user-1"])
     expect(legacy.tenantScope).toBe("user-1")
     expect(legacy.queries.at(-1)?.sql).toBe("COMMIT")
+  })
+
+  it("keeps same-session outcomes available when their original terminal timestamp is missing", async () => {
+    const test = fixture({ omitSameSessionTerminalTime: true })
+    const outcomes = await test.store.loadWithClient(test.client, test.input)
+    expect(outcomes).toHaveLength(1)
+    expect(outcomes[0]).not.toHaveProperty("terminalAt")
   })
 
   it("binds exact canonical objectives across distinct source Root IDs and reloads only their scoped graphs", async () => {

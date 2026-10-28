@@ -43,13 +43,14 @@ export type RootTaskHistorySessionAuthorization = Readonly<{
 export type RootTaskHistorySessionAuthorizationResult<T> = Readonly<{
   authorization: RootTaskHistorySessionAuthorization
   historyReadAllowed: boolean
-  historyResult?: T
+  workResult: T
 }>
 
-/** The callback shares the authorization transaction and is never called with either gate closed. */
+/** The callback shares the caller-owned authorization transaction and always builds ordinary context. */
 export type AuthorizedRootTaskHistoryWork<T> = (
   client: pg.PoolClient,
   authorization: RootTaskHistorySessionAuthorization,
+  historyReadAllowed: boolean,
 ) => Promise<T>
 
 function conflict(): TurnEngineError {
@@ -219,17 +220,15 @@ async function pinnedAuthorization(client: pg.PoolClient, input: RootTaskHistory
   return { ...parsed, eventId: created.id }
 }
 
-/** Pins consent once per Session and keeps authorized history work in the same fenced transaction. */
+/** Pins consent and executes context work on the caller-owned checked-out transaction client. */
 export async function withRootTaskHistorySessionAuthorization<T>(
-  pool: Pick<pg.Pool, "connect">,
+  client: pg.PoolClient,
   input: RootTaskHistorySessionAuthorizationInput,
   work: AuthorizedRootTaskHistoryWork<T>,
 ): Promise<RootTaskHistorySessionAuthorizationResult<T>> {
   validateInput(input)
-  const client = await pool.connect()
-  let committed = false
+  let callbackStarted = false
   try {
-    await client.query("BEGIN ISOLATION LEVEL READ COMMITTED")
     await client.query("SELECT pg_advisory_xact_lock(hashtextextended('applymate:agent-task-history-memory:' || $1::text, 0))", [input.lease.userId])
     await client.query("SELECT set_config($1,$2,true)", ["app.user_id", input.lease.userId])
     try { await lockCurrentOwner(client, input) } catch (error: unknown) {
@@ -238,13 +237,11 @@ export async function withRootTaskHistorySessionAuthorization<T>(
     }
     const authorization = await pinnedAuthorization(client, input)
     const historyReadAllowed = input.environmentGateEnabled && authorization.consentEnabled
-    const historyResult = historyReadAllowed ? await work(client, authorization) : undefined
-    await client.query("COMMIT")
-    committed = true
-    return { authorization, historyReadAllowed, ...(historyReadAllowed ? { historyResult: historyResult as T } : {}) }
+    callbackStarted = true
+    const workResult = await work(client, authorization, historyReadAllowed)
+    return { authorization, historyReadAllowed, workResult }
   } catch (error: unknown) {
-    if (!committed) await client.query("ROLLBACK").catch(() => undefined)
-    if (error instanceof TurnLeaseError || error instanceof TurnEngineError) throw error
+    if (callbackStarted || error instanceof TurnLeaseError || error instanceof TurnEngineError) throw error
     throw conflict()
-  } finally { client.release() }
+  }
 }

@@ -4,7 +4,10 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest"
 import { Pool, type PoolClient } from "pg"
 // @ts-expect-error Worker Vitest supplies the Web alias for this cross-workspace race proof.
 import { setAgentTaskHistoryMemoryConsent } from "@/lib/agent-task-history-memory-consent"
-import { withRootTaskHistorySessionAuthorization } from "./root-task-history-session-memory.js"
+import { withRootTaskHistorySessionAuthorization, type AuthorizedRootTaskHistoryWork } from "./root-task-history-session-memory.js"
+import { createPgInputClaimStore, createPgInputClaimTransaction } from "./input-claim-store.js"
+import { StepContextBuilder } from "./step-context-builder.js"
+import { readRootTaskHistorySteerEvidence } from "./root-task-history-steer-evidence.js"
 import type { TurnLease } from "../turns/lease.js"
 
 type WebPrisma = {
@@ -17,6 +20,7 @@ const PrismaClient = (webRequire("@prisma/client") as {
 }).PrismaClient
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const WAIT_TIMEOUT_MS = 8_000
+const ACCEPTANCE_APPLICATION = `history-consent-accept-${randomUUID()}`
 
 function disposableUrl(): string | null {
   const value = process.env.AGENT_RUNTIME_PG_TEST_URL
@@ -40,6 +44,21 @@ type Fixture = { userId: string; sessionId: string; turnId: string; rootTaskId: 
 function workerInput(fixture: Fixture) {
   return { scope: { userId: fixture.userId }, lease: fixture.lease, rootTaskId: fixture.rootTaskId,
     rootAttemptCount: 1, stepId: fixture.stepId, environmentGateEnabled: true }
+}
+
+async function withContextTransaction<T>(fixture: Fixture, work: AuthorizedRootTaskHistoryWork<T>) {
+  const client = await pool!.connect()
+  let committed = false
+  try {
+    await client.query("BEGIN ISOLATION LEVEL READ COMMITTED")
+    const result = await withRootTaskHistorySessionAuthorization(client, workerInput(fixture), work)
+    await client.query("COMMIT")
+    committed = true
+    return result
+  } catch (error: unknown) {
+    if (!committed) await client.query("ROLLBACK").catch(() => undefined)
+    throw error
+  } finally { client.release() }
 }
 
 async function createUser(): Promise<string> {
@@ -95,6 +114,71 @@ async function waitForAdvisoryWait(application: string): Promise<void> {
   throw new Error(`Timed out waiting for ${application} on the history consent advisory lock`)
 }
 
+async function waitForBlockedBy(application: string, blockerPid: number): Promise<void> {
+  const deadline = Date.now() + WAIT_TIMEOUT_MS
+  while (Date.now() < deadline) {
+    const result = await pool!.query<{ blocked: boolean }>(`SELECT EXISTS (
+      SELECT 1 FROM pg_stat_activity AS waiter WHERE waiter.application_name=$1 AND waiter.wait_event_type='Lock'
+        AND $2::int = ANY(pg_blocking_pids(waiter.pid))) AS blocked`, [application, blockerPid])
+    if (result.rows[0]?.blocked) return
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  throw new Error(`Timed out waiting for ${application} behind context transaction ${blockerPid}`)
+}
+
+async function acceptSteer(fixture: Fixture, id: string, text: string): Promise<bigint> {
+  const client = await pool!.connect(), messageId = `${id}-message`
+  try {
+    await client.query("BEGIN")
+    await client.query("SELECT set_config($1,$2,true)", ["application_name", ACCEPTANCE_APPLICATION])
+    await client.query("SELECT set_config($1,$2,true)", ["app.user_id", fixture.userId])
+    await client.query(`SELECT "id" FROM "agent_sessions" WHERE "id"=$1 AND "userId"=$2
+      AND "status" NOT IN ('aborted','archived') FOR UPDATE`, [fixture.sessionId, fixture.userId])
+    const itemId = `${id}-item`, parts = [{ type: "text", text }]
+    const itemContent = { clientMessageId: messageId, disposition: "steered", parts, source: "user" }
+    await client.query(`INSERT INTO "agent_items" ("id","sessionId","turnId","type","status","phase","revision","content","startedAt","completedAt","updatedAt")
+      VALUES ($1,$2,$3,'user_message','completed','commentary',0,$4::jsonb,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`,
+    [itemId, fixture.sessionId, fixture.turnId, JSON.stringify(itemContent)])
+    const sequence = (await client.query<{ eventSequence: string | bigint }>(`UPDATE "agent_sessions" SET "eventSequence"="eventSequence"+1
+      WHERE "id"=$1 AND "userId"=$2 RETURNING "eventSequence"`, [fixture.sessionId, fixture.userId])).rows[0]?.eventSequence
+    if (sequence === undefined) throw new Error("Could not allocate accepted steer sequence")
+    await client.query(`INSERT INTO "agent_events" ("id","sessionId","turnId","itemId","taskId","sequence","type","actor","correlationId","causationId","idempotencyKey","payload")
+      VALUES ($1,$2,$3,$4,NULL,$5,'input.accepted','user',$3,NULL,$6,$7::jsonb)`,
+    [`${id}-accepted-event`, fixture.sessionId, fixture.turnId, itemId, sequence, `input.accepted:${messageId}`,
+      JSON.stringify({ inputId: id, clientMessageId: messageId, delivery: "steer", disposition: "steered", source: "user" })])
+    await client.query(`INSERT INTO "agent_inputs" ("id","sessionId","targetTurnId","userId","clientMessageId","delivery","status","content","acceptedSequence")
+      VALUES ($1,$2,$3,$4,$5,'steer','accepted',$6::jsonb,$7)`,
+    [id, fixture.sessionId, fixture.turnId, fixture.userId, messageId, JSON.stringify(parts), sequence])
+    await client.query("COMMIT")
+    return BigInt(sequence)
+  } catch (error: unknown) {
+    await client.query("ROLLBACK").catch(() => undefined)
+    throw error
+  } finally { client.release() }
+}
+
+async function buildAndClassifyContext(client: PoolClient, fixture: Fixture, historyReadAllowed: boolean) {
+  const scope = { userId: fixture.userId }, now = new Date()
+  const builder = new StepContextBuilder(createPgInputClaimStore(pool!, scope))
+  const context = await builder.buildInTransaction(createPgInputClaimTransaction(client, scope), {
+    scope, sessionId: fixture.sessionId, turnId: fixture.turnId, stepId: fixture.stepId,
+    snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
+    lease: { ownerId: fixture.lease.ownerId, leaseVersion: fixture.lease.leaseVersion, now }, now,
+  })
+  const steerEvidence = await readRootTaskHistorySteerEvidence(client, scope, {
+    sessionId: fixture.sessionId, turnId: fixture.turnId, stepId: fixture.stepId,
+    lease: { ownerId: fixture.lease.ownerId, leaseVersion: fixture.lease.leaseVersion, now },
+  })
+  return { context, steerEvidence, crossSessionReadAllowed: historyReadAllowed && steerEvidence.kind === "no_accepted_steer" }
+}
+
+async function createNextStep(fixture: Fixture): Promise<Fixture> {
+  const stepId = `history-consent-step-${randomUUID()}`
+  await pool!.query(`INSERT INTO "agent_steps" ("id","sessionId","turnId","taskId","ordinal","attempt","status","inputThroughSequence","consumedInputIds","modelProfileSnapshot")
+    VALUES ($1,$2,$3,$4,2,1,'streaming',0,'[]'::jsonb,'{}'::jsonb)`, [stepId, fixture.sessionId, fixture.turnId, fixture.rootTaskId])
+  return { ...fixture, stepId }
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void
   const promise = new Promise<T>(done => { resolve = done })
@@ -134,13 +218,17 @@ describePg("root task history Session authorization PostgreSQL serialization", (
     try {
       revoke = setConsent(userId, false, 1)
       await waitForAdvisoryWait(prismaApplication)
-      const callback = async () => "should remain unused"
-      authorize = withRootTaskHistorySessionAuthorization(pool!, workerInput(fixture), callback)
+      const callback: AuthorizedRootTaskHistoryWork<string> = async (_client, _authorization, allowed) => {
+        expect(allowed).toBe(false)
+        return "ordinary context still built"
+      }
+      authorize = withContextTransaction(fixture, callback)
       await waitForAdvisoryWait(workerApplication)
       await blocker.query("COMMIT")
       const [revoked, result] = await Promise.all([revoke, authorize]) as [unknown, Awaited<typeof authorize>]
       expect(revoked).toMatchObject({ kind: "updated", consent: { enabled: false, version: 2 } })
-      expect(result).toMatchObject({ historyReadAllowed: false, authorization: { consentEnabled: false, consentVersion: 2 } })
+      expect(result).toMatchObject({ historyReadAllowed: false, workResult: "ordinary context still built",
+        authorization: { consentEnabled: false, consentVersion: 2 } })
       expect(await countMarkers(sessionId)).toMatchObject({ events: "1", outboxes: "1", eventSequence: "1" })
     } finally {
       await blocker.query("ROLLBACK").catch(() => undefined)
@@ -150,9 +238,9 @@ describePg("root task history Session authorization PostgreSQL serialization", (
 
     const failedUser = await createUser(), failedSession = await createSession(failedUser), failedFixture = await createTurn(failedUser, failedSession)
     await setConsent(failedUser, true, 0)
-    await expect(withRootTaskHistorySessionAuthorization(pool!, workerInput(failedFixture), async () => {
+    await expect(withContextTransaction(failedFixture, async () => {
       throw new Error("simulate context snapshot failure")
-    })).rejects.toMatchObject({ code: "persistence_conflict" })
+    })).rejects.toThrow("simulate context snapshot failure")
     expect(await countMarkers(failedSession)).toMatchObject({ events: "0", outboxes: "0", eventSequence: "0" })
   })
 
@@ -160,7 +248,8 @@ describePg("root task history Session authorization PostgreSQL serialization", (
     const userId = await createUser(), sessionId = await createSession(userId), first = await createTurn(userId, sessionId)
     await setConsent(userId, true, 0)
     const entered = deferred<void>(), release = deferred<void>()
-    const authorization = withRootTaskHistorySessionAuthorization(pool!, workerInput(first), async () => {
+    const authorization = withContextTransaction(first, async (_client, _authorization, allowed) => {
+      expect(allowed).toBe(true)
       entered.resolve(); await release.promise; return "authorized while lock held"
     })
     await entered.promise
@@ -168,13 +257,74 @@ describePg("root task history Session authorization PostgreSQL serialization", (
     await waitForAdvisoryWait(prismaApplication)
     release.resolve()
     const [result, revoked] = await Promise.all([authorization, revocation])
-    expect(result).toMatchObject({ historyReadAllowed: true, historyResult: "authorized while lock held",
+    expect(result).toMatchObject({ historyReadAllowed: true, workResult: "authorized while lock held",
       authorization: { consentEnabled: true, consentVersion: 1 } })
     expect(revoked).toMatchObject({ kind: "updated", consent: { enabled: false, version: 2 } })
 
     const laterSession = await createSession(userId), later = await createTurn(userId, laterSession)
-    const laterResult = await withRootTaskHistorySessionAuthorization(pool!, workerInput(later), async () => "must not read")
-    expect(laterResult).toMatchObject({ historyReadAllowed: false, authorization: { consentEnabled: false, consentVersion: 2 } })
+    const laterResult = await withContextTransaction(later, async (_client, _authorization, allowed) => {
+      expect(allowed).toBe(false)
+      return "ordinary context"
+    })
+    expect(laterResult).toMatchObject({ historyReadAllowed: false, workResult: "ordinary context",
+      authorization: { consentEnabled: false, consentVersion: 2 } })
     expect(await countMarkers(laterSession)).toMatchObject({ events: "1", outboxes: "1", eventSequence: "1" })
+  })
+
+  it("treats a steer accepted before context claim as a cross-session history barrier", async () => {
+    const userId = await createUser(), sessionId = await createSession(userId), fixture = await createTurn(userId, sessionId)
+    await setConsent(userId, true, 0)
+    const acceptedSequence = await acceptSteer(fixture, `history-consent-before-${randomUUID()}`, "Prefer platform engineering roles.")
+    const result = await withContextTransaction(fixture, async (client, _authorization, allowed) => {
+      expect(allowed).toBe(true)
+      return buildAndClassifyContext(client, fixture, allowed)
+    })
+    expect(result.historyReadAllowed).toBe(true)
+    expect(result.workResult.context.inputThroughSequence).toBe(acceptedSequence)
+    expect(result.workResult.context.consumedInputIds).toHaveLength(1)
+    expect(result.workResult.steerEvidence).toEqual({ kind: "accepted_steer" })
+    expect(result.workResult.crossSessionReadAllowed).toBe(false)
+  })
+
+  it("keeps a steer blocked behind context invisible to this Step and visible to the next", async () => {
+    const userId = await createUser(), sessionId = await createSession(userId), first = await createTurn(userId, sessionId)
+    await setConsent(userId, true, 0)
+    const entered = deferred<{ pid: number; result: Awaited<ReturnType<typeof buildAndClassifyContext>> }>()
+    const release = deferred<void>()
+    let acceptance: Promise<bigint> | undefined
+    const current = withContextTransaction(first, async (client, _authorization, allowed) => {
+      const pid = Number((await client.query<{ pid: number }>("SELECT pg_backend_pid()::int AS pid")).rows[0]?.pid)
+      if (!Number.isSafeInteger(pid) || pid < 1) throw new Error("Could not read context backend id")
+      const result = await buildAndClassifyContext(client, first, allowed)
+      entered.resolve({ pid, result })
+      await release.promise
+      return result
+    })
+    try {
+      const held = await entered.promise
+      expect(held.result).toMatchObject({ crossSessionReadAllowed: true, steerEvidence: { kind: "no_accepted_steer" },
+        context: { inputThroughSequence: 0n, consumedInputIds: [] } })
+      const steerId = `history-consent-blocked-${randomUUID()}`
+      acceptance = acceptSteer(first, steerId, "Prioritise jobs with platform ownership.")
+      await waitForBlockedBy(ACCEPTANCE_APPLICATION, held.pid)
+      release.resolve()
+      const [currentResult, acceptedSequence] = await Promise.all([current, acceptance])
+      expect(currentResult).toMatchObject({ historyReadAllowed: true,
+        workResult: { crossSessionReadAllowed: true, steerEvidence: { kind: "no_accepted_steer" } } })
+
+      const next = await createNextStep(first)
+      const later = await withContextTransaction(next, async (client, _authorization, allowed) => {
+        expect(allowed).toBe(true)
+        return buildAndClassifyContext(client, next, allowed)
+      })
+      expect(later.historyReadAllowed).toBe(true)
+      expect(later.workResult.context.inputThroughSequence).toBe(acceptedSequence)
+      expect(later.workResult.context.consumedInputIds).toContain(steerId)
+      expect(later.workResult.steerEvidence).toEqual({ kind: "accepted_steer" })
+      expect(later.workResult.crossSessionReadAllowed).toBe(false)
+    } finally {
+      release.resolve()
+      await Promise.allSettled([current, ...(acceptance ? [acceptance] : [])])
+    }
   })
 })

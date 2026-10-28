@@ -29,6 +29,38 @@ function graphEvidenceError(value: unknown): boolean {
     && /^task_graph_[a-z0-9_]+$/.test(value.message)
 }
 
+async function retainSameSessionTerminalTimes(
+  client: Client, input: DirectRootTaskHistoryLoadInput, outcomes: readonly ValidatedRootTaskHistoryOutcome[],
+): Promise<readonly ValidatedRootTaskHistoryOutcome[]> {
+  if (!outcomes.length || input.crossSessionRootTaskHistoryEnabled === true) return outcomes
+  const result = await client.query<Record<string, unknown>>(`WITH expected AS MATERIALIZED (
+      SELECT * FROM unnest($2::text[], $3::text[], $4::text[]) AS source("turnId", "rootTaskId", "sequence")
+    )
+    SELECT event."sessionId", event."turnId", event."taskId", event."sequence", event."type", event."createdAt"
+    FROM expected AS source
+    JOIN "agent_events" AS event ON event."sessionId"=$1 AND event."turnId"=source."turnId"
+      AND event."taskId"=source."rootTaskId" AND event."sequence"=source."sequence"::bigint
+      AND event."type" IN ('turn.completed','turn.failed','turn.interrupted')
+    JOIN "agent_turns" AS turn ON turn."id"=event."turnId" AND turn."sessionId"=event."sessionId"
+      AND turn."rootTaskId"=event."taskId" AND turn."userId"=$5
+    JOIN "agent_sessions" AS session ON session."id"=event."sessionId" AND session."userId"=$5
+      AND session."status" NOT IN ('aborted','archived')
+    FOR SHARE OF event`, [input.lease.sessionId,
+    outcomes.map(outcome => outcome.sourceTurnId), outcomes.map(outcome => outcome.sourceRootTaskId),
+    outcomes.map(outcome => outcome.terminalSequence.toString()), input.lease.userId])
+  const byIdentity = new Map<string, Date>()
+  for (const row of result.rows) {
+    const identity = JSON.stringify([row.turnId, row.taskId, String(row.sequence)])
+    if (row.sessionId !== input.lease.sessionId || !(row.createdAt instanceof Date) || !Number.isFinite(row.createdAt.getTime())
+      || byIdentity.has(identity)) return outcomes
+    byIdentity.set(identity, row.createdAt)
+  }
+  return outcomes.map(outcome => {
+    const terminalAt = byIdentity.get(JSON.stringify([outcome.sourceTurnId, outcome.sourceRootTaskId, outcome.terminalSequence.toString()]))
+    return terminalAt ? { ...outcome, sourceSessionDiffers: false, terminalAt } : outcome
+  })
+}
+
 async function lockEligibleSourceSession(client: Client, sessionId: string, userId: string): Promise<boolean> {
   const result = await client.query<{ id: string }>(`SELECT "id" FROM "agent_sessions"
     WHERE "id" = $1 AND "userId" = $2 AND "status" NOT IN ('aborted', 'archived') FOR SHARE SKIP LOCKED`, [sessionId, userId])
@@ -74,7 +106,7 @@ export function createPgDirectRootTaskHistoryStore(pool: Pool) {
         taskGraph: graph.taskGraph, sourceNodeOrdinals: graph.sourceNodeOrdinals,
         ...(graph.nodeLessons ? { nodeLessons: graph.nodeLessons } : {}), ...(graph.reportedOutputs ? { reportedOutputs: graph.reportedOutputs } : {}) })
     }
-    return outcomes
+    return retainSameSessionTerminalTimes(client, input, outcomes)
   }
 
   return {
