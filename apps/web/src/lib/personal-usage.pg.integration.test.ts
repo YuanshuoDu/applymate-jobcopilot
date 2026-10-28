@@ -1,9 +1,12 @@
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { PrismaClient } from '@prisma/client'
 import { readPersonalUsage } from './personal-usage'
+
+vi.mock('@/lib/entitlements', () => ({ getEffectiveEntitlements: vi.fn(async () => ({ limits: { ai_credits: null } })) }))
+import { admitAiUsage, settleAiUsage, type UsageAdmissionInput, type UsageBrokerDatabase, type UsageBrokerQuery } from './agent/control-plane/usage-broker'
 
 function disposableUrl(): string | null {
   const value = process.env.PERSONAL_USAGE_PG_TEST_URL
@@ -86,5 +89,60 @@ describePg('personal usage with disposable PostgreSQL', () => {
       for (const row of rows) expect(row.offset).toBeLessThan(0.01)
     })
   })
+
+  it('runs real broker admit, settlement and both release paths in a non-UTC PostgreSQL session', async () => {
+    await db.$transaction(async tx => {
+      await tx.$executeRawUnsafe("SET LOCAL TIME ZONE 'Asia/Tokyo'")
+      await tx.$executeRawUnsafe(`CREATE TEMP TABLE ai_usage_events (
+        id text primary key, user_id text, feature_key text not null, provider text not null, model text not null,
+        credential_source text not null, runtime text not null, status text not null, error_code text,
+        input_tokens integer not null, output_tokens integer not null, estimated_cost_usd double precision not null,
+        latency_ms integer not null, created_at timestamp(3) not null
+      ) ON COMMIT DROP`)
+      await tx.$executeRawUnsafe(`CREATE TEMP TABLE agent_turns (
+        id text primary key, "sessionId" text not null, "userId" text not null, status text not null,
+        "leaseOwnerId" text not null, "leaseVersion" integer not null, "leaseExpiresAt" timestamptz not null
+      ) ON COMMIT DROP`)
+      await tx.$executeRawUnsafe(`CREATE TEMP TABLE agent_steps (
+        id text primary key, "turnId" text not null, "sessionId" text not null, "taskId" text,
+        attempt integer not null, status text not null
+      ) ON COMMIT DROP`)
+      // SQL planning requires the root-task table even though this root step has taskId NULL.
+      await tx.$executeRawUnsafe(`CREATE TEMP TABLE sub_agent_tasks (
+        id text primary key, "sessionId" text, "turnId" text, "rootTaskId" text, status text,
+        "interruptRequestedAt" timestamptz, "attemptCount" integer
+      ) ON COMMIT DROP`)
+      await tx.$executeRawUnsafe(`INSERT INTO agent_turns VALUES
+        ('turn-1', 'session-1', 'broker-owner', 'in_progress', 'worker-1', 4, CURRENT_TIMESTAMP + INTERVAL '1 hour')`)
+      await tx.$executeRawUnsafe(`INSERT INTO agent_steps VALUES
+        ('step-1', 'turn-1', 'session-1', NULL, 1, 'streaming')`)
+
+      // Execute broker SQL on the real transaction; this adapter does not claim independent/concurrent transactions.
+      const broker: UsageBrokerDatabase = { $transaction: async <T,>(work: (query: UsageBrokerQuery) => Promise<T>) => work(tx) }
+      const input: UsageAdmissionInput = {
+        userId: 'broker-owner', sessionId: 'session-1', turnId: 'turn-1', stepId: 'step-1',
+        leaseOwnerId: 'worker-1', leaseVersion: 4, featureKey: 'agent', provider: 'minimax', model: 'MiniMax-M3',
+        attemptId: 'completed', credentialSource: 'platform',
+      }
+      const completed = await admitAiUsage(broker, input)
+      await settleAiUsage(broker, { operationId: completed.operationId, userId: input.userId,
+        provider: input.provider, model: input.model, status: 'success', inputTokens: 10, outputTokens: 4, estimatedCostUsd: 0 })
+      const released = { ...input, attemptId: 'released' }
+      await admitAiUsage(broker, released)
+      await settleAiUsage(broker, { ...released, status: 'released' })
+      await settleAiUsage(broker, { ...input, attemptId: 'tombstone', status: 'released' })
+      await expect(admitAiUsage(broker, { ...input, attemptId: 'bad-fence', leaseOwnerId: 'other-worker' }))
+        .rejects.toMatchObject({ code: 'usage_fence_rejected' })
+
+      const rows = await tx.$queryRawUnsafe<Array<{ status: string; delta: number }>>(`
+        SELECT status, ABS(EXTRACT(EPOCH FROM (created_at - (CURRENT_TIMESTAMP AT TIME ZONE 'UTC'))))::float8 AS delta
+        FROM ai_usage_events ORDER BY status, id`)
+      expect(rows.map(row => row.status)).toEqual(['released', 'released', 'success'])
+      for (const row of rows) expect(row.delta).toBeLessThan(0.01)
+      const result = await readPersonalUsage(tx, input.userId, 7)
+      expect(result.summary).toEqual({ calls: 1, inputTokens: 10, outputTokens: 4, totalTokens: 14 })
+      expect(result.models).toEqual([expect.objectContaining({ provider: input.provider, model: input.model, calls: 1 })])
+    }, { timeout: 30_000 })
+  }, 40_000)
 
 })

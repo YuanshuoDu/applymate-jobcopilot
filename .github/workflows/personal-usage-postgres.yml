@@ -48,4 +48,4 @@ jobs:
         run: >-
           pnpm --filter @jobcopilot/web exec vitest run
           src/lib/personal-usage.pg.integration.test.ts
-          src/app/api/me/personal-usage-activity.pg.integration.test.ts
+          src/app/api/me/personal-usage-activity.pg.integration.test.ts --no-file-parallelism
