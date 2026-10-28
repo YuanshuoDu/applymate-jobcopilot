@@ -26,6 +26,7 @@ const PrismaClient = (webRequire("@prisma/client") as {
 }).PrismaClient
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const WAIT_TIMEOUT_MS = 8_000
+const BLOCKING_PROOF_TIMEOUT_MS = 3_500
 const ACCEPTANCE_APPLICATION = `history-consent-accept-${randomUUID()}`
 
 function disposableUrl(): string | null {
@@ -82,19 +83,19 @@ async function createSession(userId: string): Promise<string> {
   return id
 }
 
-async function createTurn(userId: string, sessionId: string): Promise<Fixture> {
+async function createTurn(userId: string, sessionId: string, writerPool: Pick<Pool, "query"> = pool!): Promise<Fixture> {
   const now = new Date(), expires = new Date(now.getTime() + 300_000), turnId = `history-consent-turn-${randomUUID()}`
   const rootTaskId = `history-consent-root-${randomUUID()}`, stepId = `history-consent-step-${randomUUID()}`
   const ownerId = `history-consent-owner-${randomUUID()}`
-  await pool!.query(`INSERT INTO "agent_turns" ("id","sessionId","userId","status","source","input","modelProfileSnapshot",
+  await writerPool.query(`INSERT INTO "agent_turns" ("id","sessionId","userId","status","source","input","modelProfileSnapshot",
     "toolPolicySnapshot","budgetSnapshot","rootTaskId","leaseOwnerId","leaseExpiresAt","leaseStartedAt","leaseVersion","updatedAt")
     VALUES ($1,$2,$3,'in_progress','user',$4::jsonb,'{}'::jsonb,'{}'::jsonb,'{}'::jsonb,$5,$6,$7,$8,1,$8)`,
   [turnId, sessionId, userId, JSON.stringify({ goal: "History consent integration" }), rootTaskId, ownerId, expires, now])
-  await pool!.query(`INSERT INTO "sub_agent_tasks" ("id","sessionId","turnId","rootTaskId","parentTaskId","path","depth","role","taskType","status","goal",
+  await writerPool.query(`INSERT INTO "sub_agent_tasks" ("id","sessionId","turnId","rootTaskId","parentTaskId","path","depth","role","taskType","status","goal",
     "constraints","successCriteria","allowedActions","context","expectedOutputSchema","attemptCount","maxAttempts","leaseOwner","leaseExpiresAt","updatedAt")
     VALUES ($1,$2,$3,$1,NULL,$4,0,'orchestrator','root','running','History consent integration','[]'::jsonb,'[]'::jsonb,'[]'::jsonb,'{}'::jsonb,'{}'::jsonb,1,2,$5,$6,$7)`,
   [rootTaskId, sessionId, turnId, `/${rootTaskId}`, ownerId, expires, now])
-  await pool!.query(`INSERT INTO "agent_steps" ("id","sessionId","turnId","taskId","ordinal","attempt","status","inputThroughSequence","consumedInputIds","modelProfileSnapshot")
+  await writerPool.query(`INSERT INTO "agent_steps" ("id","sessionId","turnId","taskId","ordinal","attempt","status","inputThroughSequence","consumedInputIds","modelProfileSnapshot")
     VALUES ($1,$2,$3,$4,1,1,'streaming',0,'[]'::jsonb,'{}'::jsonb)`, [stepId, sessionId, turnId, rootTaskId])
   return { userId, sessionId, turnId, rootTaskId, stepId, lease: {
     userId, sessionId, turnId, ownerId, leaseVersion: 1, leaseStartedAt: now, leaseExpiresAt: expires,
@@ -120,8 +121,8 @@ async function waitForAdvisoryWait(application: string): Promise<void> {
   throw new Error(`Timed out waiting for ${application} on the history consent advisory lock`)
 }
 
-async function waitForBlockedBy(application: string, blockerPid: number): Promise<void> {
-  const deadline = Date.now() + WAIT_TIMEOUT_MS
+async function waitForBlockedBy(application: string, blockerPid: number, timeoutMs = WAIT_TIMEOUT_MS): Promise<void> {
+  const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const result = await pool!.query<{ blocked: boolean }>(`SELECT EXISTS (
       SELECT 1 FROM pg_stat_activity AS waiter WHERE waiter.application_name=$1 AND waiter.wait_event_type='Lock'
@@ -632,6 +633,8 @@ describePg("root task history Session authorization PostgreSQL serialization", (
       source.rootTaskId, source.sessionId, source.turnId])
 
     const releaseApp = `history-release-${suffix}`
+    const nextTurnApp = `history-next-turn-${suffix}`
+    const nextTurnPool = new Pool({ connectionString: databaseUrl!, application_name: nextTurnApp, max: 1 })
     const backendIdentity = deferred<{ pid: number; applicationName: string }>()
     const gate: PgGate = { sessionId, point: "before_commit", reached: deferred<void>(), resume: deferred<void>(), backendIdentity }
     const release = releaseTurnLease(testPool(releaseApp, gate) as never, source.lease, "failed", new Date())
@@ -643,8 +646,8 @@ describePg("root task history Session authorization PostgreSQL serialization", (
       const releasePid = releaseBackend.pid
       if (!Number.isSafeInteger(releasePid) || releasePid < 1) throw new Error("Could not identify gated release transaction connection")
       expect(releaseBackend.applicationName).toBe(releaseApp)
-      currentCreation = createTurn(userId, sessionId)
-      await waitForBlockedBy(workerApplication, releasePid)
+      currentCreation = createTurn(userId, sessionId, nextTurnPool)
+      await waitForBlockedBy(nextTurnApp, releasePid, BLOCKING_PROOF_TIMEOUT_MS)
       gate.resume.resolve()
       const [released, created] = await Promise.all([release, currentCreation])
       expect(released).toBe(true)
@@ -652,6 +655,7 @@ describePg("root task history Session authorization PostgreSQL serialization", (
     } finally {
       gate.resume.resolve()
       await Promise.allSettled([release, ...(currentCreation ? [currentCreation] : [])])
+      await nextTurnPool.end()
     }
     if (!current) throw new Error("Same-session next Turn was not created after release")
     await setMatchingHistoryObjective(current)

@@ -7,6 +7,7 @@ import { NextRequest } from "next/server"
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 
 import { EXTENSION_TOKEN_AUDIENCE, EXTENSION_TOKEN_ISSUER, getAuthJwtSecret } from "@/lib/auth-secret"
+import { isPrivateV2EventType } from "@/lib/agent/session/v2-private-event-filter"
 
 // This suite exercises the real bearer-token auth path. Avoid initializing
 // NextAuth's framework-only cookie/session integration in Vitest's Node runtime.
@@ -15,6 +16,8 @@ vi.mock("@/lib/safe-auth", () => ({ safeAuth: async () => null }))
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const FLAG_ENVIRONMENT = "development"
 const targetEventKey = (turnId: string) => `turn:${turnId}:event:turn-started`
+const chronologyWitnessEventType = "agent.plan.root_task_history_chronology_witness"
+const chronologyWitnessSchemaVersion = "agent-harness.v2.root-task-history-chronology-witness.v1"
 
 function disposableDatabaseUrl(): string | null {
   const value = process.env.AGENT_RUNTIME_PG_TEST_URL
@@ -431,8 +434,41 @@ describeWithServices("agent events route replays a disconnected Worker event", (
     const expectedDurableEvents = await testDatabase.agentEvent.findMany({
       where: { sessionId, sequence: { gt: cursor } },
       orderBy: { sequence: "asc" },
-      select: { sequence: true },
+      select: { id: true, sequence: true, type: true, idempotencyKey: true, causationId: true, payload: true },
     })
+    const chronologyWitnesses = expectedDurableEvents.filter(event => event.type === chronologyWitnessEventType)
+    const privateEvents = expectedDurableEvents.filter(event => isPrivateV2EventType(event.type))
+    const startWitness = chronologyWitnesses.find(event => event.idempotencyKey
+      === `root-task-history-chronology-witness:turn_start:${targetInDatabase[0]!.id}:v1`)
+    const terminalEvent = expectedDurableEvents.find(event => event.type === "turn.completed")
+    const terminalWitness = terminalEvent && chronologyWitnesses.find(event => event.idempotencyKey
+      === `root-task-history-chronology-witness:root_terminal:${terminalEvent.id}:v1`)
+    expect(chronologyWitnesses).toHaveLength(2)
+    expect(privateEvents.map(event => event.type)).toEqual([chronologyWitnessEventType, chronologyWitnessEventType])
+    expect(startWitness).toMatchObject({
+      type: chronologyWitnessEventType,
+      sequence: targetInDatabase[0]!.sequence + BigInt(1),
+      causationId: targetInDatabase[0]!.id,
+      payload: {
+        schemaVersion: chronologyWitnessSchemaVersion,
+        boundary: "turn_start",
+        boundaryEventId: targetInDatabase[0]!.id,
+        xid8: expect.any(String),
+      },
+    })
+    expect(terminalEvent).toBeDefined()
+    expect(terminalWitness).toMatchObject({
+      type: chronologyWitnessEventType,
+      sequence: terminalEvent!.sequence + BigInt(1),
+      causationId: terminalEvent!.id,
+      payload: {
+        schemaVersion: chronologyWitnessSchemaVersion,
+        boundary: "root_terminal",
+        boundaryEventId: terminalEvent!.id,
+        xid8: expect.any(String),
+      },
+    })
+    expect(expectedDurableEvents.at(-1)?.id).toBe(terminalWitness?.id)
 
     const reconnectResponse = await GET(eventRequest(sessionId, cursor.toString(), ownerToken), {
       params: Promise.resolve({ id: sessionId }),
@@ -449,14 +485,33 @@ describeWithServices("agent events route replays a disconnected Worker event", (
 
     const durableFrames = replayedFrames.filter(frame => frame.id !== null)
     const durableSequences = durableFrames.map(frame => BigInt(frame.id!))
-    const expectedSequences = expectedDurableEvents.map(event => event.sequence)
+    const expectedPublicEvents = expectedDurableEvents.filter(event => !isPrivateV2EventType(event.type))
+    const expectedSequences = expectedPublicEvents.map(event => event.sequence)
     const observedSequenceSet = new Set(durableSequences.map(String))
     const duplicateCount = durableSequences.length - observedSequenceSet.size
     const missedDurableEvents = expectedSequences.filter(sequence => !observedSequenceSet.has(sequence.toString())).length
     expect(durableSequences[0]).toBe(cursor + BigInt(1))
     expect(durableSequences.map(String)).toEqual(expectedSequences.map(String))
+    expect(durableFrames.map(frame => ({
+      id: frame.data.id,
+      sequence: frame.id,
+      type: frame.data.type,
+      idempotencyKey: frame.data.idempotencyKey,
+    }))).toEqual(expectedPublicEvents.map(event => ({
+      id: event.id,
+      sequence: event.sequence.toString(),
+      type: event.type,
+      idempotencyKey: event.idempotencyKey,
+    })))
     expect(duplicateCount).toBe(0)
     expect(missedDurableEvents).toBe(0)
+    const serializedReplay = JSON.stringify(replayedFrames)
+    expect(durableFrames.some(frame => frame.data.type === chronologyWitnessEventType)).toBe(false)
+    expect(serializedReplay).not.toContain(chronologyWitnessSchemaVersion)
+    for (const witness of chronologyWitnesses) {
+      expect(serializedReplay).not.toContain(witness.id)
+      expect(serializedReplay).not.toContain(witness.idempotencyKey)
+    }
     const targetFrames = replayedFrames.filter(frame => frame.data.idempotencyKey === targetEventKey(turnId))
     expect(targetFrames).toHaveLength(1)
     expect(targetFrames[0]).toMatchObject({
