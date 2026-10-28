@@ -102,8 +102,8 @@ describe('AgentComposer', () => {
       </AgentTurnComposerProvider>,
     )
 
-    expect(html).toContain('Steer current Turn')
-    expect(html).toContain('Queue follow-up')
+    expect(html).toContain('Update this run')
+    expect(html).toContain('Send after this run')
     expect(html).toContain('data-testid="interrupt-turn"')
     expect(html).toContain('Sending')
     expect(html).toContain('Accepted')

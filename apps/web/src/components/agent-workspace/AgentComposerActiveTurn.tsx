@@ -3,6 +3,7 @@
 import React, { useReducer, useRef, type FormEvent } from 'react'
 import { ObjectiveReplacementCommandError, replaceAgentObjective } from './agent-objective-replacement-command'
 import type { TurnComposerController } from './agent-turn-commands'
+import { useI18n } from '@/lib/i18n'
 
 const composerStatusLabel = {
   sending: 'Sending',
@@ -74,6 +75,7 @@ export function AgentComposerActiveTurn({ controller }: { controller: TurnCompos
 }
 
 function ActiveTurnSession({ controller }: { controller: TurnComposerController }) {
+  const { t } = useI18n()
   const [replacement, dispatch] = useReducer(objectiveReplacementFormReducer, initialReplacementState)
   const pendingRef = useRef(false)
   const canOpenReplacement = controller.sessionStatus === 'running' && controller.activeTurn !== null
@@ -112,30 +114,32 @@ function ActiveTurnSession({ controller }: { controller: TurnComposerController 
     })
   }
 
+  if (!controller.activeTurn && !controller.messages.length && !controller.commandError && !replacement.open) return null
+
   return (
-    <div data-testid="active-turn-composer" style={{ marginBottom: 8, padding: '8px 10px', borderRadius: 8, background: 'rgba(79,70,229,0.05)', border: '1px solid rgba(79,70,229,0.14)', color: 'var(--text)', fontSize: 11 }}>
+    <div data-testid="active-turn-composer" style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginBottom: 8, padding: '8px 10px', borderRadius: 8, background: 'rgba(79,70,229,0.05)', border: '1px solid rgba(79,70,229,0.14)', color: 'var(--text)', fontSize: 11 }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
-        <span>Active Turn: {controller.activeTurn?.status ?? 'ready'}{controller.activeTurn ? ` · revision ${controller.activeTurn.revision}` : ''}</span>
+        <span>{controller.activeTurn ? t(`agent.runStatus.${controller.activeTurn.status}`) : t('agent.messageStatus')}</span>
         {controller.activeTurn && (
           <button type="button" data-testid="interrupt-turn" onClick={controller.interrupt} disabled={controller.interrupting} style={{ minHeight: 28, padding: '0 9px', border: '1px solid rgba(220,38,38,0.28)', borderRadius: 7, background: 'transparent', color: '#b91c1c', cursor: controller.interrupting ? 'wait' : 'pointer', font: 'inherit', fontWeight: 700 }}>
             {controller.interrupting ? 'Stopping…' : 'Stop'}
           </button>
         )}
       </div>
-      <div role="group" aria-label="Turn delivery" style={{ display: 'flex', gap: 6, marginTop: 7, flexWrap: 'wrap' }}>
+      {controller.activeTurn && <div role="group" aria-label="Turn delivery" style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
         {(['steer', 'follow_up'] as const).map(option => (
           <button key={option} type="button" aria-pressed={controller.delivery === option} onClick={() => controller.setDelivery(option)} style={{ minHeight: 28, padding: '0 8px', border: `1px solid ${controller.delivery === option ? 'var(--primary)' : 'var(--border)'}`, borderRadius: 7, background: controller.delivery === option ? 'rgba(79,70,229,0.1)' : 'transparent', color: 'var(--text)', cursor: 'pointer', font: 'inherit', fontSize: 11, fontWeight: 650 }}>
-            {option === 'steer' ? 'Steer current Turn' : 'Queue follow-up'}
+            {t(option === 'steer' ? 'agent.updateRun' : 'agent.queueFollowUp')}
           </button>
         ))}
-      </div>
+      </div>}
       {canOpenReplacement && !replacement.open && (
-        <button type="button" data-testid="open-objective-replacement" onClick={openReplacement} style={{ marginTop: 7, minHeight: 28, padding: '0 9px', border: '1px solid var(--border)', borderRadius: 7, background: 'transparent', color: 'var(--text)', cursor: 'pointer', font: 'inherit', fontWeight: 700 }}>
+        <button type="button" data-testid="open-objective-replacement" onClick={openReplacement} style={{ minHeight: 28, padding: '0 9px', border: '1px solid var(--border)', borderRadius: 7, background: 'transparent', color: 'var(--text)', cursor: 'pointer', font: 'inherit', fontWeight: 700 }}>
           Replace objective
         </button>
       )}
       {replacement.open && replacement.target && (
-        <form aria-label="Replace objective" data-testid="objective-replacement-form" onSubmit={submitReplacement} style={{ display: 'grid', gap: 7, marginTop: 8 }}>
+        <form aria-label="Replace objective" data-testid="objective-replacement-form" onSubmit={submitReplacement} style={{ flexBasis: '100%', display: 'grid', gap: 7, marginTop: 8 }}>
           <p style={{ margin: 0 }}>This stops the current run and starts a fresh plan from your new objective.</p>
           <p style={{ margin: 0 }}>Applies to the run selected when this form was opened.</p>
           {targetChanged && <p role="status" style={{ margin: 0 }}>The run changed after you opened this form. Close and reopen to select the current run.</p>}
@@ -167,12 +171,12 @@ function ActiveTurnSession({ controller }: { controller: TurnComposerController 
         </form>
       )}
       {controller.commandError && (
-        <div role="alert" data-testid="turn-command-error" style={{ marginTop: 7, color: '#b91c1c' }}>
+        <div role="alert" data-testid="turn-command-error" style={{ flexBasis: '100%', marginTop: 7, color: '#b91c1c' }}>
           {controller.commandError.code}: {controller.commandError.message}
         </div>
       )}
       {controller.messages.length > 0 && (
-        <div aria-live="polite" style={{ display: 'grid', gap: 3, marginTop: 7 }}>
+        <div aria-live="polite" style={{ flexBasis: '100%', minWidth: 0, display: 'grid', gap: 3, marginTop: 7 }}>
           {controller.messages.map(message => (
             <div key={message.clientMessageId} data-testid={`turn-message-${message.status}`} style={{ display: 'flex', gap: 6, alignItems: 'baseline' }}>
               <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{message.text}</span>

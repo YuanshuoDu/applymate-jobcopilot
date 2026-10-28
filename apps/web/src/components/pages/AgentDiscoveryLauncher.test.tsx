@@ -13,7 +13,7 @@ describe('AgentDiscoveryLauncher', () => {
 
     const html = renderToStaticMarkup(<AgentDiscoveryLauncher {...props} />)
 
-    expect(html).toContain('agent.runNow')
+    expect(html).toContain('dashboard.findJobs')
     expect(html).not.toContain('common.stop')
   })
 

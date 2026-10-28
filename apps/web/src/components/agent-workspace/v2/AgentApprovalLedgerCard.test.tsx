@@ -68,6 +68,23 @@ describe('AgentApprovalLedgerCard', () => {
     expect(html).toContain(translate('en', 'agent.approvalLedger.turnUnavailable'))
   })
 
+  it('keeps every pending approval actionable, including the ninth request', () => {
+    let state = createApprovalLedgerState('session-1')
+    for (let index = 1; index <= 9; index += 1) {
+      state = reduceApprovalLedger(state, { schemaVersion: 'agent-harness.v2', id: `request-${index}`, sessionId: 'session-1',
+        turnId: 'turn-1', itemId: null, taskId: null, type: 'approval.requested', actor: 'orchestrator', sequence: String(index),
+        payload: { approvalId: `opaque-approval-${index}`, action: `submit_application_${index}`, scopeHash: `sha256:${'a'.repeat(64)}`, revision: 2 } })
+    }
+    const pending = selectApprovalLedgerProjection(state)
+    expect(pending.pendingCount).toBe(9)
+    const html = renderToStaticMarkup(<I18nProvider><AgentApprovalLedgerCard {...cardProps(pending)} /></I18nProvider>)
+    expect(html.match(/<button/g)).toHaveLength(18)
+    expect(html).not.toContain('disabled=""')
+    for (let index = 1; index <= 9; index += 1) expect(html).toContain(`submit_application_${index}`)
+    expect(html).not.toContain('opaque-approval')
+    expect(html).not.toContain('scopeHash')
+  })
+
   it('keeps acknowledged commands fenced until authoritative state changes', () => {
     expect(isApprovalActionDisabled(false, false, 'accepted')).toBe(true)
     expect(isApprovalActionDisabled(false, false, 'duplicate')).toBe(true)

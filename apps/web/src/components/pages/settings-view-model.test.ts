@@ -21,12 +21,14 @@ import {
 describe('settings view model', () => {
   it('accepts every supported deep-link tab and falls back safely', () => {
     expect(parseSettingsTab('privacy')).toBe('privacy')
+    expect(parseSettingsTab('usage')).toBe('usage')
     expect(parseSettingsTab('not-a-tab')).toBe('profile')
     expect(parseSettingsTab(null)).toBe('profile')
   })
 
   it('reads the active tab from browser history URLs', () => {
     expect(settingsTabFromHref('https://applymate.site/?page=settings&tab=privacy')).toBe('privacy')
+    expect(settingsTabFromHref('https://applymate.site/?page=settings&tab=usage')).toBe('usage')
     expect(settingsTabFromHref('https://applymate.site/?page=settings&tab=unknown')).toBe('profile')
   })
 

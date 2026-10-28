@@ -21,12 +21,7 @@ import { AgentTurnComposerProvider, useAgentTurnComposer } from '@/components/ag
 import { useAgentTimeline } from '@/components/agent-workspace/v2/use-agent-timeline'
 import { useI18n } from '@/lib/i18n'
 import { AgentDiscoveryLauncher } from './AgentDiscoveryLauncher'
-
-// ── Role metadata ─────────────────────────────────────────────────────────────
-
-// ── Log entry (per-agent) ─────────────────────────────────────────────────────
-
-// ── Chat types ────────────────────────────────────────────────────────────────
+import { AgentWorkspacePanels } from './AgentWorkspacePanels'
 
 // ── Main Page ─────────────────────────────────────────────────────────────────
 
@@ -53,7 +48,6 @@ export function AgentPlaygroundPage({ seedApplicationReviewQueue = false }: { se
   const { data: jobsData }                               = useApi<{ jobs: Array<{ status: string; workflowState: string }> }>('/api/jobs?pageSize=100')
   const { data: agentConfig } = useApi<AgentConfig>('/api/agent')
 
-  const [showAddModal,  setShowAddModal]  = useState(false)
   const [applyQueue,    setApplyQueue]    = useState<ApplyReadyJob[]>(() => seedApplicationReviewQueue ? [previewApplicationReviewJob] : [])
   const { sessionId, setSessionId } = useAgentSessionUrl()
   const selectedSessionId = sessionId
@@ -182,7 +176,6 @@ export function AgentPlaygroundPage({ seedApplicationReviewQueue = false }: { se
       selectAutomationSession(id, policy)
       setMobileSessionDrawerOpen(false)
     },
-    onAddAgent: () => setShowAddModal(true),
     onNewChat: () => {
       resetLiveWorkspace()
       setMobileSessionDrawerOpen(false)
@@ -194,23 +187,26 @@ export function AgentPlaygroundPage({ seedApplicationReviewQueue = false }: { se
 
   return (
     <AgentPlaygroundWorkspace
-      showAddModal={showAddModal}
-      setShowAddModal={setShowAddModal}
       mobileSessionDrawerOpen={mobileSessionDrawerOpen}
       setMobileSessionDrawerOpen={setMobileSessionDrawerOpen}
       sessionProps={sessionProps}
     >
-        <AgentDiscoveryLauncher
+      <AgentWorkspacePanels sessionId={selectedSessionId}
+        needsAttention={timeline.approvalLedger.pendingCount > 0 || activeTurn?.status === 'waiting_for_user' || activeTurn?.status === 'waiting_for_approval'}
+        details={<AgentSupervisorPanel sessionId={selectedSessionId} timeline={timeline} />}
+        toolbar={<AgentDiscoveryLauncher
           onTaskGraphStarted={result => {
             selectSession(result.sessionId, 'Discover and shortlist relevant jobs using my saved job-search preferences.', 'Interactive discovery shortlist')
             setSessionsRefreshVersion(v => v + 1)
             window.dispatchEvent(new Event('applymate:sessions-changed'))
           }}
           t={t}
-        />
-        <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+        />}>
+        <div className="agent-chat-column" style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+          <div className="agent-context-bar">
           <AgentCurrentObjective goal={activeTurn?.goal} />
           <AgentSessionPauseResumeControl sessionId={selectedSessionId ?? ''} sessionStatus={controlStatus} activeTurn={activeTurn} onPause={command => sendSessionControl('pause', command)} onResume={command => sendSessionControl('resume', command)} />
+          </div>
           <AgentTurnComposerProvider value={turnComposer}>
             <AgentUnifiedStream
               log={runLog}
@@ -239,7 +235,7 @@ export function AgentPlaygroundPage({ seedApplicationReviewQueue = false }: { se
             />
           </AgentTurnComposerProvider>
         </div>
-        <AgentSupervisorPanel sessionId={selectedSessionId} timeline={timeline} />
+      </AgentWorkspacePanels>
     </AgentPlaygroundWorkspace>
   )
 }
