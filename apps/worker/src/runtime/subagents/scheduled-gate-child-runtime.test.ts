@@ -12,7 +12,7 @@ const handoff = vi.hoisted(() => ({ post: vi.fn(async (_input: unknown, _signal:
   status: "blocked", errorCode: "fixture_default",
 })) }))
 const loader = vi.hoisted(() => ({ checkpoint: vi.fn(), graph: vi.fn(), current: vi.fn(), snapshotMatches: vi.fn(), analyzeMatches: vi.fn(),
-  registration: vi.fn(), prepareProof: vi.fn(), discovery: vi.fn(), roleResult: vi.fn(), report: vi.fn() }))
+  registration: vi.fn(), prepareProof: vi.fn(), discovery: vi.fn(), roleResult: vi.fn(), report: vi.fn(), currentAttestation: vi.fn() }))
 vi.mock("./scheduled-pipeline-handoff.js", async importOriginal => ({
   ...await importOriginal<typeof import("./scheduled-pipeline-handoff.js")>(),
   postScheduledPipelineGate: handoff.post,
@@ -41,6 +41,10 @@ vi.mock("./role-results.js", async importOriginal => ({
 }))
 vi.mock("./task-graph-verification-report.js", async importOriginal => ({
   ...await importOriginal<typeof import("./task-graph-verification-report.js")>(), parseStoredTaskGraphVerificationReport: loader.report,
+}))
+vi.mock("./scheduled-pipeline-current-attestation.js", async importOriginal => ({
+  ...await importOriginal<typeof import("./scheduled-pipeline-current-attestation.js")>(),
+  buildScheduledPipelineGraphAttestation: loader.currentAttestation,
 }))
 
 const owner: ScheduledAutomationPipelineBridgeScope = {
@@ -154,6 +158,9 @@ function productionLoaderFixture(waitId: unknown = "agent-question:turn-1:canoni
   loader.analyzeMatches.mockReturnValue("analyst")
   loader.roleResult.mockImplementation((_value: unknown, role: string) => role === "scout" ? scoutResult : analystResult)
   loader.report.mockReturnValue({ status: "passed", resultDigest: "e".repeat(64) })
+  loader.currentAttestation.mockImplementation(async (input: { scope: ScheduledAutomationPipelineBridgeScope }) => ({ status: "ready",
+    attestation: { ...attestation, owner: input.scope, snapshotDigest: evidence.snapshotDigest, evidenceDigest: evidence.evidenceDigest,
+      graphRevision: evidence.analyzeGraphRevision } }))
   loader.discovery.mockReturnValue({ attemptedCalls: 1, completedCalls: 1, failedCalls: 0, unresolvedCalls: 0,
     candidateCount: 1, providerFailures: 0, materializationFailures: 0, hasMore: false })
   const live = { id: "gate-task-1", role: "prepare", taskType: "scheduled_taskgraph_gate", status: "running", attemptCount: 3,

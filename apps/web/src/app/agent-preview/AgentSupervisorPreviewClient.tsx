@@ -4,6 +4,7 @@ import React from 'react'
 import { SessionProvider } from 'next-auth/react'
 
 import { AgentPlaygroundPage } from '@/components/pages/AgentPlaygroundPage'
+import { SettingsPage } from '@/components/pages/SettingsPage'
 import { I18nProvider, useI18n, type Lang } from '@/lib/i18n'
 
 import { AgentPreviewClient } from './AgentPreviewClient'
@@ -19,14 +20,14 @@ const previewSession = {
 }
 
 /** Dev-only browser fixture for the real Agent page and V2 supervisor panel. */
-export function AgentSupervisorPreviewClient({ supervisorMode = false, locale, seedApplicationReviewQueue = false }: { supervisorMode?: boolean; locale?: Lang; seedApplicationReviewQueue?: boolean }) {
-  if (!supervisorMode) return <AgentPreviewClient />
+export function AgentSupervisorPreviewClient({ supervisorMode = false, settingsMode = false, locale, seedApplicationReviewQueue = false }: { supervisorMode?: boolean; settingsMode?: boolean; locale?: Lang; seedApplicationReviewQueue?: boolean }) {
+  if (!supervisorMode && !settingsMode) return <AgentPreviewClient />
 
   return (
     <SessionProvider session={previewSession}>
       <I18nProvider>
         <PreviewLocale locale={locale}>
-          <AgentPlaygroundPage seedApplicationReviewQueue={seedApplicationReviewQueue} />
+          {settingsMode ? <SettingsPage /> : <AgentPlaygroundPage seedApplicationReviewQueue={seedApplicationReviewQueue} />}
         </PreviewLocale>
       </I18nProvider>
     </SessionProvider>
@@ -35,10 +36,13 @@ export function AgentSupervisorPreviewClient({ supervisorMode = false, locale, s
 
 function PreviewLocale({ locale, children }: { locale?: Lang; children: React.ReactNode }) {
   const { setLang } = useI18n()
+  const [ready, setReady] = React.useState(false)
 
   React.useEffect(() => {
-    if (locale) setLang(locale)
+    setLang(locale ?? 'en')
+    setReady(true)
   }, [locale, setLang])
 
-  return <>{children}</>
+  // Fixture locale must be deterministic even when another preview saved a different language.
+  return <div style={{ display: 'flex', height: '100dvh', minWidth: 0, minHeight: 0, overflow: 'hidden' }}>{ready ? children : null}</div>
 }

@@ -45,7 +45,9 @@ vi.mock("@/lib/agent/scheduled-taskgraph-pipeline-checkpoint", () => ({
     const marker = input.existingCheckpoint.scheduledTaskGraphContinuation as Record<string, unknown> | undefined;
     const markerOwner = marker?.owner as Record<string, unknown> | undefined;
     const evidence = input.attestation.evidenceDigest;
-    const candidateIds = (input.attestation.scout as { candidateJobIds: string[] }).candidateJobIds;
+    const candidateIds = input.attestation.schemaVersion === "agent-harness.v2.scheduled-pipeline-attestation.v2"
+      ? (input.attestation.analyst as { jobIds: string[] }).jobIds
+      : (input.attestation.scout as { candidateJobIds: string[] }).candidateJobIds;
     const jobsMatch = input.ownedJobs.length === candidateIds.length && candidateIds.every((id, index) => input.ownedJobs[index]?.id === id);
     const savedJobs = input.existingCheckpoint.scoutedJobs as Array<{ id?: string }> | undefined;
     const savedScores = input.existingCheckpoint.scoredJobs as Array<{ job?: { id?: string }; score?: number; analysisFenceAt?: string }> | undefined;
@@ -74,7 +76,13 @@ const owner = {
 const fullOwner = { ...owner, executionId: "execution-1", executionAttemptCount: 0 };
 const key = "continuation-4";
 const claimToken = "claim-token-4";
-const attestation = { owner, snapshotDigest: "sha256:" + "a".repeat(64), graphRevision: 9, evidenceDigest: "b".repeat(64), scout: { candidateJobIds: ["job-1"] } };
+const attestation = { schemaVersion: "agent-harness.v2.scheduled-pipeline-attestation.v1", owner,
+  snapshotDigest: "sha256:" + "a".repeat(64), graphRevision: 9, evidenceDigest: "b".repeat(64),
+  scout: { taskId: "scout-task", attemptCount: 1, status: "completed", verification: "passed", resultDigest: "c".repeat(64),
+    candidateJobIds: ["job-1"], discoveryReceipt: { status: "complete", taskId: "scout-task", attemptCount: 1,
+      completedCalls: 1, candidateCount: 1, providerFailures: 0, materializationFailures: 0, hasMore: false, receiptDigest: "d".repeat(64) } },
+  analyst: { taskId: "analyst-task", attemptCount: 1, status: "completed", verification: "passed", resultDigest: "e".repeat(64),
+    dependsOnTaskIds: ["scout-task"], jobIds: ["job-1"] } };
 const report = { processed: 1, applied: 0, queued: 0, pending: 0, skipped: 1, failed: 0, durationMs: 9 };
 const scheduledSnapshot = { schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1", targetRoles: ["Engineer"],
   targetLocations: ["Dublin"], minScore: 80, dailyCap: 5, requireApproval: true, autoApply: false };
@@ -82,6 +90,19 @@ const analyzeProof = { status: "analyze_checkpointed", continuationKey: "continu
   executionId: "execution-1", executionAttemptCount: 0 };
 const initialExecution = { id: "execution-1", status: "running", attemptCount: 0, state: { nextStage: "scout" } };
 const analysisFenceAt = new Date().toISOString();
+const multiScoutAttestation = {
+  schemaVersion: "agent-harness.v2.scheduled-pipeline-attestation.v2", owner,
+  snapshotDigest: "sha256:" + "a".repeat(64), graphRevision: 10,
+  scouts: ["a", "b"].map((suffix, index) => ({ nodeKey: `scout-${suffix}`, taskId: `scout-task-${suffix}`, attemptCount: 1,
+    status: "completed", verification: "passed", resultDigest: String(index + 1).repeat(64), nodeDigest: "a".repeat(64),
+    evidenceDigest: "b".repeat(64), reportDigest: "c".repeat(64), candidateJobIds: [`job-${suffix}`],
+    discoveryReceipt: { status: "complete", taskId: `scout-task-${suffix}`, attemptCount: 1, completedCalls: 1,
+      candidateCount: 1, providerFailures: 0, materializationFailures: 0, hasMore: false, receiptDigest: "d".repeat(64) } })),
+  candidateUnionJobIds: ["job-a", "job-b"],
+  analyst: { nodeKey: "analyst", taskId: "analyst-task-v2", attemptCount: 1, status: "completed", verification: "passed",
+    resultDigest: "e".repeat(64), nodeDigest: "f".repeat(64), evidenceDigest: "1".repeat(64), reportDigest: "2".repeat(64),
+    dependsOnTaskIds: ["scout-task-a", "scout-task-b"], jobIds: ["job-b"] }, evidenceDigest: "3".repeat(64),
+};
 
 function scoredJobRow() {
   return { job: { id: "job-1", userId: owner.userId }, score: 82, matchedKeywords: ["TypeScript"],
@@ -191,6 +212,19 @@ describe("scheduled pipeline continuation route", () => {
       scheduledTaskGraph: expect.objectContaining({ owner: fullOwner, continuationKey: key, attestation, ownedJobs: [{ id: "job-1", userId: owner.userId }] }),
     }));
     expect(mocks.jobs).toHaveBeenCalledWith({ where: { userId: owner.userId, id: { in: ["job-1"] } } });
+  });
+
+  it("loads only the verified v2 Analyst selection while the full Scout union stays proof metadata", async () => {
+    const selectedJob = { id: "job-b", userId: owner.userId };
+    mocks.jobs.mockResolvedValueOnce([selectedJob]);
+    mocks.runPipeline.mockResolvedValueOnce(analyzeProof);
+    const { POST } = await import("./route");
+    const response = await POST(request({ owner, attestation: multiScoutAttestation }));
+    expect(response.status).toBe(200);
+    expect(mocks.jobs).toHaveBeenCalledWith({ where: { userId: owner.userId, id: { in: ["job-b"] } } });
+    expect(mocks.runPipeline).toHaveBeenCalledWith(expect.objectContaining({
+      scheduledTaskGraph: expect.objectContaining({ attestation: multiScoutAttestation, ownedJobs: [selectedJob] }),
+    }));
   });
 
   it("passes a Worker-verified Prepare proof through the existing internal route", async () => {

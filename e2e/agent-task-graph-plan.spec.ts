@@ -1032,6 +1032,14 @@ test('persisted Plan Ledger parser validates proposal and lifecycle task attribu
   expect(parsePersistedTrace(unknownLifecycleNode)).toBeNull()
 })
 
+async function showTaskDetails(page: Page, locale: 'en' | 'zh' = 'en') {
+  const toggle = page.getByRole('button', { name: locale === 'zh' ? /^任务与结果/ : /^Tasks & results/ })
+  await expect(toggle).toBeVisible({ timeout: 20_000 })
+  if (await toggle.getAttribute('aria-expanded') !== 'true') await toggle.click()
+  await expect(toggle).toHaveAttribute('aria-expanded', 'true')
+  await expect(page.locator('[data-agent-supervisor-panel]')).toBeVisible()
+}
+
 test('Plan Ledger restores the same persisted trace session after SSE reconnect without leaking across sessions', async ({ page }, testInfo) => {
   const persistedTrace = requireProductionTraceArtifact()
   const persistedLedger = persistedTrace.planLedger
@@ -1049,6 +1057,7 @@ test('Plan Ledger restores the same persisted trace session after SSE reconnect 
   const expectedIdentity = graphIdentity(persistedTrace.graphItem)
   const ledgerResponsePromise = waitForPlanLedgerResponse(page, expectedIdentity, fixture, 'default', 'persisted trace')
   await page.goto(`/agent-preview?supervisor=1&locale=${locale}&sessionId=${sessionA}`)
+  await showTaskDetails(page, locale)
 
   const plan = page.locator('[data-agent-task-graph-plan="true"]')
   const dependentRow = plan.locator('ol > li').nth(persistedLedger.nodes.indexOf(dependentNode))
@@ -1178,6 +1187,7 @@ test('Plan Ledger restores the same persisted trace session after SSE reconnect 
   const viewportWidth = await page.evaluate(() => window.innerWidth)
   if (viewportWidth <= 900) await page.getByRole('button', { name: locale === 'zh' ? '对话' : 'Conversations', exact: true }).click()
   await page.locator('.agent-session-console').getByRole('button').filter({ hasText: GOAL_B }).first().click()
+  await showTaskDetails(page, locale)
 
   const switchedPlan = page.locator('[data-agent-task-graph-plan="true"]')
   await expect.poll(() => fixture.eventRequests.get(SESSION_B)?.length ?? 0, { timeout: 10_000 }).toBeGreaterThan(0)
@@ -1234,6 +1244,7 @@ test('TaskGraph reconnect snapshot plus event tail matches the persisted trace p
   const initialIdentity = graphIdentity(persistedTrace.initialGraphItem)
   const initialResponsePromise = waitForPlanLedgerResponse(page, initialIdentity, fixture, 'live', 'live initial snapshot')
   await page.goto(`/agent-preview?supervisor=1&locale=en&sessionId=${sessionA}`)
+  await showTaskDetails(page)
 
   const plan = page.locator('[data-agent-task-graph-plan="true"]')
   const sourcePreview = plan.locator('ol > li').first().locator('[data-task-graph-evidence="preview"]')
@@ -1264,6 +1275,7 @@ test('TaskGraph reconnect snapshot plus event tail matches the persisted trace p
   fixture.setDeliveryMode('snapshot-tail')
   const snapshotInitialResponsePromise = waitForPlanLedgerResponse(page, initialIdentity, fixture, 'snapshot-tail', 'snapshot initial response')
   await page.reload()
+  await showTaskDetails(page)
   await expect(plan).toBeVisible({ timeout: 20_000 })
   const snapshotInitialResponse = await snapshotInitialResponsePromise
   await expect(sourcePreview).toContainText(persistedLedger.nodes[0]!.evidencePreview!.summary)
@@ -1303,6 +1315,7 @@ test('persisted Plan Ledger and discovery shortlist survive SSE disconnect, reco
   fixture.setDeliveryMode('snapshot-tail')
   const firstLedgerResponse = waitForPlanLedgerResponse(page, identity, fixture, 'snapshot-tail', 'discovery restart trace')
   await page.goto(`/agent-preview?supervisor=1&locale=en&sessionId=${encodeURIComponent(sessionId)}`)
+  await showTaskDetails(page)
 
   const plan = page.locator('[data-agent-task-graph-plan="true"]')
   const shortlist = page.locator('[data-agent-discovery-shortlist="true"]')
@@ -1355,6 +1368,7 @@ test('persisted Plan Ledger and discovery shortlist survive SSE disconnect, reco
 
   const reloadLedgerResponse = waitForPlanLedgerResponse(page, identity, fixture, 'snapshot-tail', 'reloaded discovery trace')
   await page.reload()
+  await showTaskDetails(page)
   await expect(plan).toBeVisible({ timeout: 20_000 })
   expect(await reloadLedgerResponse).toEqual({ identity, projection: persistedTrace.planLedger })
   await expect(plan).toHaveAttribute('data-agent-task-graph-session', identity.sessionId)

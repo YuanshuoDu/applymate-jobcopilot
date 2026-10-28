@@ -11,10 +11,10 @@ const key = `scheduled-taskgraph:sha256:${'a'.repeat(64)}`
 const claimToken = 'claim-token-1'
 const invalidCode = 'scheduled_taskgraph_audit_runtime_invalid'
 
-function context(): PipelineCtx {
-  const claim = { schemaVersion: 'agent-harness.v2.scheduled-pipeline-claim.v1', key, claimToken,
+function context(continuationKey = key): PipelineCtx {
+  const claim = { schemaVersion: 'agent-harness.v2.scheduled-pipeline-claim.v1', key: continuationKey, claimToken,
     owner: { ...owner }, claimedAt: '2026-10-25T10:00:00.000Z', leaseExpiresAt: '2026-10-25T10:05:00.000Z' }
-  const continuation = { schemaVersion: 'agent-harness.v2.scheduled-pipeline-continuation.v1', key,
+  const continuation = { schemaVersion: 'agent-harness.v2.scheduled-pipeline-continuation.v1', key: continuationKey,
     owner: { ...owner }, snapshotDigest: `sha256:${'b'.repeat(64)}`, graphRevision: 8, evidenceDigest: 'c'.repeat(64) }
   const ctx = {
     userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
@@ -23,13 +23,20 @@ function context(): PipelineCtx {
     defaultResume: { id: 'resume-1', name: 'Resume', templateId: null, templateOptions: null, directionId: null, basicsDetached: false },
     aiConfig: { provider: 'minimax', model: 'MiniMax-M3' } as PipelineCtx['aiConfig'],
     autonomous: false, emit: () => undefined, executionAttempt: { id: owner.executionId, attemptCount: owner.executionAttemptCount },
-    scheduledTaskGraphOwnerFence: { owner: { ...owner }, key, claimToken, assertCurrent: async () => true },
+    scheduledTaskGraphOwnerFence: { owner: { ...owner }, key: continuationKey, claimToken, assertCurrent: async () => true },
     resumeState: { nextStage: 'execute' as const, scheduledTaskGraphClaim: claim, scheduledTaskGraphContinuation: continuation },
   }
   return ctx as PipelineCtx
 }
 
 describe('scheduled TaskGraph Audit runtime marker', () => {
+  it('accepts the exact v2 continuation key but rejects a trailing code unit', () => {
+    const valid = context(`scheduled-taskgraph:v2:sha256:${'e'.repeat(64)}`)
+    markScheduledTaskGraphAuditRuntime(valid)
+    expect(isScheduledTaskGraphAuditRuntime(valid)).toBe(true)
+    expect(() => markScheduledTaskGraphAuditRuntime(context(`scheduled-taskgraph:v2:sha256:${'e'.repeat(64)}\n`))).toThrow(invalidCode)
+  })
+
   it('marks only the final context and ignores user-shaped flags and spread copies', () => {
     const unmarked = context()
     const jsonFlag = Object.assign(context(), { scheduledTaskGraphAuditRuntime: true })

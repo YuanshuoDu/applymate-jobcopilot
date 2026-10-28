@@ -39,6 +39,7 @@ describe("TaskTreePanel", () => {
     const onSelect = vi.fn()
     const html = renderToStaticMarkup(<TaskTreePanel nodes={nodes} selectedId="turn-1" onSelect={onSelect} />)
     expect(html).toContain('aria-current="true"')
+    expect(html).toContain('data-task-timeline-item="item-turn"')
     expect(onSelect).not.toHaveBeenCalled()
   })
 

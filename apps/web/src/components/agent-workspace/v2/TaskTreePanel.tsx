@@ -201,7 +201,7 @@ function renderNodes(nodes: readonly TaskTreeNode[], depth: number, selectedId: 
       <button
         type="button"
         data-task-node-id={node.id}
-        data-task-tree-depth={depth}
+        data-task-tree-depth={depth} data-task-timeline-item={node.itemId}
         aria-current={selectedId === node.id ? "true" : undefined}
         onClick={() => onSelect(node)}
         style={{ ...nodeStyle, marginLeft: depth * 16, background: selectedId === node.id ? "var(--bg-secondary)" : "transparent" }}

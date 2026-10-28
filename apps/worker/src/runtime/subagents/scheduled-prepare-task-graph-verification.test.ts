@@ -12,7 +12,7 @@ import { buildScheduledTaskGraphContinuationReceipt, scheduledTaskGraphStableCon
 import { ROLE_RESULT_SCHEMA, type PrepareResult } from "./role-results.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphFingerprint } from "./task-graph-snapshot.js"
-import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { TASK_GRAPH_VERIFIER_VERSION, publicTaskGraphVerificationReport } from "./task-graph-verification-report.js"
 import { DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION } from "./child-discovery-attempt.js"
 import { SCHEDULED_AUTOMATION_SNAPSHOT_SCHEMA_VERSION } from "./scheduled-automation-snapshot.js"
@@ -109,14 +109,17 @@ function checkpointFixture(stage: "prepare" | "gate" | "audit_completed_report")
     { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } },
   ] }
   const analystVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [
-    { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
+    { id: "finding-source", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout" } },
   ] }
   const snapshot = { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
     { key: "scout", templateId: "scout", taskId: "scout-1", goal: "Find jobs", successCriteria: ["Find matching jobs"],
       dependsOn: [], depth: 1, verificationDisposition: "typed", verification: scoutVerification },
     { key: "analyst", templateId: "analyst", taskId: "analyst-1", goal: "Analyze jobs", successCriteria: ["Score jobs"],
       dependsOn: ["scout"], depth: 2, verificationDisposition: "typed", verification: analystVerification },
-    { key: "prepare", templateId: "prepare", taskId: prepareScope.taskId, goal: "Prepare materials", successCriteria: ["Persist materials"],
+    { key: "prepare", templateId: "prepare", taskId: prepareScope.taskId,
+      goal: "Prepare application materials using the persisted scheduled Analyze checkpoint.",
+      successCriteria: ["Prepare only jobs and 0-100 scores from the verified scheduled Analyze checkpoint.",
+        "Persist immutable owner-fenced material references and return no resume or letter bodies."],
       dependsOn: ["analyst"], depth: 3, verificationDisposition: "specialized" },
   ] }
   const evidence = [{ id: "evidence-1", kind: "job", ref: "job-1", source: "test" }]
@@ -126,13 +129,14 @@ function checkpointFixture(stage: "prepare" | "gate" | "audit_completed_report")
   const analystResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed", findings: [
     { jobId: "job-1", score: 8, evidenceIds: ["evidence-1"] },
   ], evidence, summary: "one finding" }
-  const dependencyBinding = { nodeKey: "scout", taskId: "scout-1", attemptCount: 1, nodeDigest: "1".repeat(64),
-    resultDigest: "2".repeat(64), evidenceDigest: "3".repeat(64), reportDigest: "4".repeat(64) }
   const scoutReport = { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
     criteria: [{ criterionId: "candidate-count", status: "passed", reasonCode: "criteria_met" }], evidenceDigest: "5".repeat(64),
     resultDigest: taskGraphFingerprint(scoutResult) } as const
+  const dependencyBinding = { nodeKey: "scout", taskId: "scout-1", attemptCount: 1,
+    nodeDigest: taskGraphFingerprint(snapshot.nodes[0]), resultDigest: scoutReport.resultDigest, evidenceDigest: scoutReport.evidenceDigest,
+    reportDigest: taskGraphFingerprint(publicTaskGraphVerificationReport(scoutReport)) }
   const analystReport = { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
-    criteria: [{ criterionId: "finding-count", status: "passed", reasonCode: "criteria_met" }], evidenceDigest: "6".repeat(64),
+    criteria: [{ criterionId: "finding-source", status: "passed", reasonCode: "criteria_met" }], evidenceDigest: "6".repeat(64),
     resultDigest: taskGraphFingerprint(analystResult), dependencyBindings: [dependencyBinding] } as const
   const scoutEnvelope = { finalItemId: null, finalText: "", status: "completed", stepCount: 0, toolCallCount: 1,
     taskGraphVerificationReport: scoutReport, structuredResult: scoutResult,
@@ -170,7 +174,7 @@ function checkpointFixture(stage: "prepare" | "gate" | "audit_completed_report")
     result: taskResult })
   const tasks = new Map([task("scout-1", "scout", 1, scoutEnvelope), task("analyst-1", "analyst", 2, analystEnvelope),
     task(prepareScope.taskId, "prepare", prepareScope.attemptCount, prepareEnvelope)].map(value => [value.id, value]))
-  const current = { revision: 14, nodes: snapshot.nodes.map(node => ({ key: node.key, taskId: node.taskId, templateId: node.templateId,
+  const current = { revision: 14, nodes: snapshot.nodes.map(node => ({ key: node.key, taskId: node.taskId, templateId: node.templateId, dependsOn: node.dependsOn,
     status: "completed", readiness: "ready", failureReason: null,
     verificationReport: node.key === "scout" ? publicTaskGraphVerificationReport(scoutReport)
       : node.key === "analyst" ? publicTaskGraphVerificationReport(analystReport) : null })) }
@@ -185,15 +189,23 @@ function checkpointFixture(stage: "prepare" | "gate" | "audit_completed_report")
   const query = vi.fn(async (sql: string) => {
     if (sql.includes('FROM "agent_events" AS event')) return { rows: [{ type: SCHEDULED_TASKGRAPH_CONTINUATION_RECEIPT_EVENT,
       itemId: null, taskId: null, actor: "system", payload: privateReceipt, idempotencyKey: "scheduled-prepare:fixture", hasOutbox: false }] }
-    if (sql.includes('FROM "sub_agent_tasks" AS task')) return { rows: [{ attemptCount: owner.rootAttemptCount }] }
-    if (sql.includes('FROM "agent_turns"')) return { rows: [{ source: "automation", executionMode: "canonical_task_graph",
-      input: { automationRunMode: "scheduled", scheduledAutomationSnapshot: automation } }] }
+    if (sql.includes('FROM "sub_agent_tasks" AS task')) return { rows: [{ id: owner.rootTaskId, userId: owner.userId,
+      sessionId: owner.sessionId, turnId: owner.turnId, status: "running", attemptCount: owner.rootAttemptCount }] }
+    if (sql.includes('FROM "agent_turns"')) return { rows: [{ userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
+      rootTaskId: owner.rootTaskId, source: "automation", executionMode: "canonical_task_graph", status: "in_progress",
+      leaseOwnerId: stage === "prepare" ? owner.turnLeaseOwnerId : "turn-owner-2", leaseVersion: stage === "prepare" ? owner.turnLeaseVersion : 5,
+      leaseExpiresAt: new Date("2099-01-01T00:00:00.000Z"), input: { automationRunMode: "scheduled", scheduledAutomationSnapshot: automation } }] }
     if (sql.includes('FROM "agent_executions"')) return { rows: [execution] }
     return { rows: [] }
   })
   const call = { toolCallId: "prepare-call", toolName: "scheduled.application.prepare", toolVersion: "1", input: {}, status: "completed", errorCode: null }
   gateCheckpointMocks.dependencies.mockResolvedValue({ projections: {}, bindings: [dependencyBinding] })
-  gateCheckpointMocks.nodeEvidence.mockResolvedValue({ verified: true, report: publicTaskGraphVerificationReport(analystReport) })
+  gateCheckpointMocks.nodeEvidence.mockImplementation(async (_client: unknown, input: { node: { templateId: string }; structuredResult: unknown }) => {
+    const scout = input.node.templateId === "scout", report = publicTaskGraphVerificationReport(scout ? scoutReport : analystReport)
+    return { verified: true, report, structuredResult: input.structuredResult, projection: scout
+      ? { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "scout", candidates: [{ jobId: "job-1", evidenceIds: ["evidence-1"] }], evidenceIds: ["evidence-1"] }
+      : { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "analyst", findings: [{ jobId: "job-1", score: 8, evidenceIds: ["evidence-1"] }], evidenceIds: ["evidence-1"] } }
+  })
   gateCheckpointMocks.receipts.mockResolvedValue({ items: [
     { type: "tool_call", stepId: "prepare-step", content: call },
     { type: "tool_result", stepId: "prepare-step", content: { errorCode: null, output: prepareResult } },
@@ -258,6 +270,30 @@ describe("scheduled Prepare TaskGraph proof", () => {
     expect(buildScheduledPrepareTaskGraphProof(facts, { ...wait, status: "waiting" })).toBeNull()
     expect(buildScheduledPrepareTaskGraphProof({ ...facts, completion: { ...completion, graphRevision: 13 } }, wait)).toBeNull()
     expect(buildScheduledPrepareTaskGraphProof({ ...facts, result: { ...result, snapshotDigest: `sha256:${"e".repeat(64)}` } }, wait)).toBeNull()
+  })
+
+  it("preserves authored Scout completion order while requiring every v2 source binding", () => {
+    const continuationKey = `scheduled-taskgraph:v2:sha256:${"f".repeat(64)}`
+    gateCheckpointMocks.stableKey = continuationKey
+    const receipt = buildScheduledTaskGraphContinuationReceipt({ ...binding, continuationKey })!
+    const makeFacts = (sourceIds: string[]) => ({ ...facts, receipt, completion: { ...completion, nodes: [
+      ...sourceIds.map(taskId => ({ taskId, attemptCount: 1, role: "scout", taskType: TASK_GRAPH_TEMPLATES.scout.taskType,
+        status: "completed", verification: "passed", dependsOnTaskIds: [] })),
+      { taskId: "analyst-2", attemptCount: 2, role: "analyst", taskType: TASK_GRAPH_TEMPLATES.analyst.taskType,
+        status: "completed", verification: "passed", dependsOnTaskIds: [...sourceIds].sort() },
+      { taskId: result.taskId, attemptCount: result.attemptCount, role: "prepare", taskType: TASK_GRAPH_TEMPLATES.prepare.taskType,
+        status: "completed", verification: "passed", dependsOnTaskIds: ["analyst-2"], tool: "scheduled.application.prepare@1",
+        resultDigest: scheduledPrepareResultDigest(result) },
+    ] } })
+    const authored = ["scout-z", "scout-a", "scout-m", "scout-b"]
+    const proof = buildScheduledPrepareTaskGraphProof(makeFacts(authored), wait)
+    expect(proof?.completion.nodes.map(node => node.taskId)).toEqual([...authored, "analyst-2", result.taskId])
+    expect(buildScheduledPrepareTaskGraphProof(makeFacts(authored.slice(0, 1)), wait)).toBeNull()
+    const invalidDependencies = makeFacts(authored.slice(0, 2))
+    const invalidNodes = invalidDependencies.completion.nodes as Array<Record<string, unknown>>
+    invalidNodes[2] = { ...invalidNodes[2], dependsOnTaskIds: ["scout-z", "scout-a"] }
+    expect(buildScheduledPrepareTaskGraphProof(invalidDependencies, wait)).toBeNull()
+    expect(buildScheduledPrepareTaskGraphProof(makeFacts(["scout-z", "scout-z"]), wait)).toBeNull()
   })
 
   it("fails closed on mismatched Prepare task and attempt identity before database reads", async () => {

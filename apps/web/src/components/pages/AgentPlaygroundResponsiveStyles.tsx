@@ -1,7 +1,19 @@
 export function AgentPlaygroundResponsiveStyles() {
   return (
     <style>{`
+        .agent-desktop-conversations-toggle {
+          position: relative;
+          display: inline-grid; place-items: center; width: 36px; height: 36px;
+          border: 1px solid var(--border); border-radius: 8px;
+          color: var(--text-muted); background: var(--bg); cursor: pointer;
+        }
+        .agent-session-drawer { min-height: 0; }
+        .agent-conversations-attention { position: absolute; top: 3px; right: 3px; width: 8px; height: 8px; border-radius: 50%; background: #d97706; }
         @media (max-width: 900px) {
+          .agent-playground-workspace > .app-topbar { align-items: center !important; flex-wrap: nowrap !important; }
+          .agent-playground-workspace > .app-topbar > div:last-child { width: auto; }
+          .agent-desktop-conversations-toggle { display: none; }
+          .agent-session-drawer-trigger.is-open { visibility: hidden; }
           .agent-workspace-layout {
             position: relative;
             min-height: 0 !important;
@@ -10,6 +22,7 @@ export function AgentPlaygroundResponsiveStyles() {
           }
 
           .agent-session-drawer-trigger {
+            position: relative;
             display: inline-flex !important;
             align-items: center;
             gap: 6px;
@@ -33,12 +46,14 @@ export function AgentPlaygroundResponsiveStyles() {
             background: rgba(15, 23, 42, 0.34);
             opacity: 0;
             pointer-events: none;
+            visibility: hidden;
             transition: opacity 180ms ease;
           }
 
           .agent-session-drawer-scrim.is-open {
             opacity: 1;
             pointer-events: auto;
+            visibility: visible;
           }
 
           .agent-session-drawer {
@@ -50,12 +65,14 @@ export function AgentPlaygroundResponsiveStyles() {
             flex-direction: column;
             transform: translateX(-104%);
             pointer-events: none;
+            visibility: hidden;
             transition: transform 180ms ease;
           }
 
           .agent-session-drawer.is-open {
             transform: translateX(0);
             pointer-events: auto;
+            visibility: visible;
           }
 
           .agent-session-drawer > .agent-session-console {
@@ -140,6 +157,11 @@ export function AgentPlaygroundResponsiveStyles() {
           }
         }
 
+        @media (max-width: 900px) and (max-height: 640px) {
+          .agent-live-stream { overflow-y: auto !important; }
+          .agent-live-stream-body { flex: 1 0 96px !important; }
+        }
+
         @media (min-width: 901px) {
           .agent-session-drawer-scrim,
           .agent-session-drawer-header,
@@ -152,6 +174,7 @@ export function AgentPlaygroundResponsiveStyles() {
           .agent-session-drawer {
             display: contents;
           }
+          .agent-session-drawer.is-desktop-collapsed { display: none; }
         }
       `}</style>
   )

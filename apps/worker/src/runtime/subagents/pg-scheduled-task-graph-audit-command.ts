@@ -9,7 +9,8 @@ import { enqueueGraphTask } from "./task-graph-pg-create.js"
 import type { Queryable } from "./pg-store-persistence.js"
 import { canonicalTaskGraphJson, taskGraphFingerprint, taskGraphLifecycleKey, taskGraphProposalKey, taskGraphSnapshot } from "./task-graph-snapshot.js"
 import { verifyScheduledGateCompletion as verifyPersistedScheduledGateCompletion } from "./pg-scheduled-task-graph-gate-verification.js"
-import { createScheduledTaskGraphContinuationContract, scheduledSnapshotMatches } from "./scheduled-taskgraph-continuation-receipt.js"
+import { createScheduledTaskGraphContinuationContract, scheduledSnapshotMatches, scheduledTaskGraphContinuationKeyVersion } from "./scheduled-taskgraph-continuation-receipt.js"
+import { projectScheduledPipelineGraph, projectScheduledPipelineGraphAtCurrentStage } from "./scheduled-pipeline-graph-shape.js"
 import {
   hasOrphanScheduledAuditRegistration, sameScheduledAuditCompletionRegistration, sameScheduledAuditRegistration,
   scheduledAuditAppendReceipt, scheduledAuditDigest, stableScheduledAuditOwner, stableScheduledAuditOwnerForScope,
@@ -53,10 +54,13 @@ export async function appendScheduledAudit(client: Queryable, input: TaskGraphSc
   if (!turn || !scheduledSnapshotMatches(turn, contract.binding.snapshotDigest)) throw invalid("snapshot")
   let loaded = await loadTaskGraph(client, scope, true)
   if (!loaded.snapshot || !loaded.state || !loaded.item) throw invalid("graph_missing")
+  const version = scheduledTaskGraphContinuationKeyVersion(contract.receipt.continuationKey)
   const existing = loaded.snapshot.nodes.find(node => node.key === SCHEDULED_AUDIT_TEMPLATE_ID)
   if (existing) {
+    const shape = version && projectScheduledPipelineGraph(loaded.snapshot.nodes, version, "audit")
     const receipt = await readScheduledAuditRegistration(client, scope, existing.taskId, stableScheduledAuditOwner(contract.binding.owner))
-    if (!receipt || !sameScheduledAuditRegistration(receipt, input, contract, input.gateProof) || loaded.snapshot.nodes.length !== 5) throw invalid("receipt_conflict")
+    if (!receipt || !shape || shape.audit.taskId !== existing.taskId
+      || !sameScheduledAuditRegistration(receipt, input, contract, input.gateProof)) throw invalid("receipt_conflict")
     const gateProof = await verifyRegisteredScheduledAuditGate(client, scope, loaded, receipt, input.gateProof)
     if (!gateProof || !same(gateProof, input.gateProof)) throw invalid("gate_proof")
     const child = await lockAuditTask(client, scope, existing.taskId)
@@ -66,13 +70,14 @@ export async function appendScheduledAudit(client: Queryable, input: TaskGraphSc
       || !validAuditNode(loaded, task.id) || !validAuditTaskRow(child, task)) throw invalid("task_policy")
     return scheduledAuditAppendReceipt(receipt, "duplicate", expectedAttempt(child))
   }
-  if (loaded.snapshot.nodes.length !== 4 || await hasOrphanScheduledAuditRegistration(client, scope, contract.receipt.continuationKey)) throw invalid("receipt_conflict")
+  const gateShape = version && projectScheduledPipelineGraph(loaded.snapshot.nodes, version, "gate")
+  if (!gateShape || await hasOrphanScheduledAuditRegistration(client, scope, contract.receipt.continuationKey)) throw invalid("receipt_conflict")
   const gateProof = await verifyPersistedScheduledGateCompletion(client, { scope: input.scope,
     executionOwner: input.executionOwner, prepareProof: input.gateProof.prepareProof })
   if (!gateProof || !same(gateProof, input.gateProof) || gateProof.graphRevision !== loaded.state.revision
     || gateProof.gate.completedEventRevision !== loaded.state.revision) throw invalid("gate_proof")
   const current = currentTaskGraph(loaded), gate = current.nodes.find(node => node.key === "gate")
-  if (!gate || gate.status !== "completed" || loaded.snapshot.nodes.length !== 4) throw invalid("gate_incomplete")
+  if (!gate || gate.status !== "completed" || gate.taskId !== gateShape.gate.taskId) throw invalid("gate_incomplete")
   const append = appendTaskGraphProposal(loaded.state, proposal, { registeredTemplateIds: new Set([SCHEDULED_AUDIT_TEMPLATE_ID]),
     maxNodes: TASK_GRAPH_LIMITS.maxNodes, maxDepth: TASK_GRAPH_LIMITS.maxDepth })
   if (!append.ok || append.state.revision !== loaded.state.revision + 1 || append.addedNodes.length !== 1) throw invalid("append")
@@ -162,9 +167,10 @@ export async function verifyScheduledGateCompletionWithAuditReplay(client: Query
   await client.query(`SELECT set_config('app.user_id', $1, true)`, [input.scope.userId])
   await lockTaskGraphScope(client, input.scope)
   const scope = graphScope(input.scope), loaded = await loadTaskGraph(client, scope, true), nodes = loaded.snapshot?.nodes
-  if (nodes?.length === 4) return verifyPersistedScheduledGateCompletion(client, input)
-  if (!loaded.item || !loaded.snapshot || !loaded.state || nodes?.length !== 5 || nodes[4]?.key !== SCHEDULED_AUDIT_TEMPLATE_ID) return null
-  const audits = nodes.filter(node => node.key === SCHEDULED_AUDIT_TEMPLATE_ID), audit = audits.length === 1 ? audits[0] : undefined
+  const projected = nodes && projectScheduledPipelineGraphAtCurrentStage(nodes)
+  if (projected?.projection.stage === "gate") return verifyPersistedScheduledGateCompletion(client, input)
+  if (!loaded.item || !loaded.snapshot || !loaded.state || projected?.projection.stage !== "audit") return null
+  const audits = loaded.snapshot.nodes.filter(node => node.key === SCHEDULED_AUDIT_TEMPLATE_ID), audit = audits.length === 1 ? audits[0] : undefined
   if (!audit || !validAuditNode(loaded, audit.taskId)) return null
   const task = loaded.tasks.get(audit.taskId), current = currentTaskGraph(loaded).nodes.find(node => node.key === SCHEDULED_AUDIT_TEMPLATE_ID)
   if (!task || task.id !== audit.taskId || task.role !== SCHEDULED_AUDIT_ROLE || task.taskType !== SCHEDULED_AUDIT_TASK_TYPE
@@ -173,7 +179,8 @@ export async function verifyScheduledGateCompletionWithAuditReplay(client: Query
     || current.status !== task.status || current.failureReason !== task.failureReason) return null
   const registration = await readScheduledAuditRegistration(client, scope, audit.taskId,
     stableScheduledAuditOwnerForScope(input.scope, input.executionOwner))
-  if (!registration || registration.auditTaskId !== audit.taskId) return null
+  if (!registration || registration.auditTaskId !== audit.taskId
+    || scheduledTaskGraphContinuationKeyVersion(registration.continuationKey) !== projected.version) return null
   const expected: ScheduledGateCompletionProof = { schemaVersion: SCHEDULED_GATE_COMPLETION_PROOF_SCHEMA,
     graphRevision: registration.gateGraphRevision, prepareProof: input.prepareProof,
     gate: { taskId: registration.gateTaskId, attemptCount: registration.gateAttemptCount,

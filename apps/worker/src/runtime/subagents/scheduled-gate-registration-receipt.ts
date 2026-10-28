@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto"
 import type pg from "pg"
+import { scheduledPipelineContinuationKeyVersion } from "@jobcopilot/agent-protocol"
 
 export const SCHEDULED_GATE_REGISTRATION_RECEIPT_SCHEMA = "agent-harness.v2.scheduled-taskgraph-gate-binding.v1" as const
 export const SCHEDULED_GATE_REGISTRATION_RECEIPT_EVENT = "agent.plan.scheduled_gate_binding" as const
@@ -61,13 +62,14 @@ export function buildScheduledGateRegistrationReceipt(value: unknown): Scheduled
 
 export function parseScheduledGateRegistrationReceipt(value: unknown): ScheduledGateRegistrationReceipt | null {
   const row = record(value), owner = parseOwner(row?.owner)
+  const continuationKey = row?.continuationKey
   if (!row || !owner || !exact(row, RECEIPT_KEYS) || row.schemaVersion !== SCHEDULED_GATE_REGISTRATION_RECEIPT_SCHEMA
-    || !id(row.continuationKey, /^scheduled-taskgraph:sha256:[a-f0-9]{64}$/)
+    || !id(continuationKey) || scheduledPipelineContinuationKeyVersion(continuationKey) === null
     || !id(row.snapshotDigest, /^sha256:[a-f0-9]{64}$/) || !id(row.evidenceDigest, /^[a-f0-9]{64}$/)
     || !id(row.checkpointDigest, /^[a-f0-9]{64}$/) || !id(row.prepareWaitId) || !id(row.gateTaskId)
     || !positive(row.analyzeGraphRevision) || row.prepareScheduleRevision !== Number(row.analyzeGraphRevision) + 1
     || !positive(row.gateAppendRevision) || Number(row.gateAppendRevision) <= Number(row.prepareScheduleRevision)) return null
-  return Object.freeze({ schemaVersion: SCHEDULED_GATE_REGISTRATION_RECEIPT_SCHEMA, owner, continuationKey: row.continuationKey,
+  return Object.freeze({ schemaVersion: SCHEDULED_GATE_REGISTRATION_RECEIPT_SCHEMA, owner, continuationKey,
     snapshotDigest: row.snapshotDigest, evidenceDigest: row.evidenceDigest, checkpointDigest: row.checkpointDigest,
     analyzeGraphRevision: Number(row.analyzeGraphRevision), prepareScheduleRevision: Number(row.prepareScheduleRevision),
     prepareWaitId: row.prepareWaitId, gateTaskId: row.gateTaskId, gateAppendRevision: Number(row.gateAppendRevision) })

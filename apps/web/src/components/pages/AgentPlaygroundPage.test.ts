@@ -80,9 +80,10 @@ describe('Agent workspace responsive layout', () => {
     expect(source).toMatch(/function isDurableTurnRunning\(status: ActiveTurnStatus \| undefined\): boolean \{\n\s*return status === 'queued' \|\| status === 'in_progress'/)
     expect(source).toContain('const isRunning = isDurableTurnRunning(activeTurn?.status) ||')
     expect(source).toContain('(runLog.length > 0 && !runDone)')
-    expect(source).not.toContain("status === 'waiting_for_approval' ||")
-    expect(source).not.toContain("status === 'waiting_for_user' ||")
-    expect(source).not.toContain("status === 'waiting_for_dependency' ||")
+    const runningProjection = source.slice(source.indexOf('const isRunning ='), source.indexOf('const visibleWaitingQuestion'))
+    expect(runningProjection).not.toContain('waiting_for_approval')
+    expect(runningProjection).not.toContain('waiting_for_user')
+    expect(runningProjection).not.toContain('waiting_for_dependency')
   })
 
   it('marks only queued and in-progress durable Turns as running', () => {

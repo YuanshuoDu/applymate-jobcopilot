@@ -27,11 +27,16 @@ function eventRow(value: unknown = receipt, overrides: Record<string, unknown> =
 describe("scheduled Gate registration receipt", () => {
   it("builds and parses only the bounded immutable lineage with the original Prepare wait", () => {
     expect(buildScheduledGateRegistrationReceipt(receipt)).toEqual(receipt)
+    expect(parseScheduledGateRegistrationReceipt({ ...receipt, continuationKey: `scheduled-taskgraph:v2:sha256:${"e".repeat(64)}` }))
+      .toMatchObject({ gateTaskId: receipt.gateTaskId })
     expect(parseScheduledGateRegistrationReceipt({ ...receipt, claimToken: "never-persist-this" })).toBeNull()
     expect(parseScheduledGateRegistrationReceipt({ ...receipt, owner: { ...owner, turnLeaseOwnerId: "transient" } })).toBeNull()
     expect(parseScheduledGateRegistrationReceipt({ ...receipt, prepareScheduleRevision: 9 })).toBeNull()
     expect(parseScheduledGateRegistrationReceipt({ ...receipt, gateAppendRevision: 8 })).toBeNull()
     expect(parseScheduledGateRegistrationReceipt({ ...receipt, prepareWaitId: "" })).toBeNull()
+    for (const ending of ["\n", "\r", "\u2028", "\u2029"]) {
+      expect(parseScheduledGateRegistrationReceipt({ ...receipt, continuationKey: receipt.continuationKey + ending })).toBeNull()
+    }
   })
 
   it("uses a stable idempotency key without exposing raw continuation data", () => {
@@ -47,6 +52,11 @@ describe("scheduled Gate registration receipt", () => {
       turnId: owner.turnId, owner, gateTaskId: receipt.gateTaskId })).resolves.toEqual(receipt)
     expect(valid.query.mock.calls[0]?.[0]).toContain('event."type" = $3')
     expect(valid.query.mock.calls[0]?.[1]?.[2]).toBe(SCHEDULED_GATE_REGISTRATION_RECEIPT_EVENT)
+
+    const v2Receipt = { ...receipt, continuationKey: `scheduled-taskgraph:v2:sha256:${"e".repeat(64)}` }
+    const v2 = db(eventRow(v2Receipt, { idempotencyKey: scheduledGateRegistrationReceiptKey(v2Receipt.continuationKey, v2Receipt.gateTaskId) }))
+    await expect(readScheduledGateRegistrationReceipt(v2.client, { userId: owner.userId, sessionId: owner.sessionId,
+      turnId: owner.turnId, owner, gateTaskId: receipt.gateTaskId })).resolves.toEqual(v2Receipt)
 
     for (const row of [
       eventRow(receipt, { itemId: "item-1" }), eventRow(receipt, { taskId: "task-1" }),

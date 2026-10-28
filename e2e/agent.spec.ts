@@ -11,7 +11,7 @@ test("login -> agent page -> run scout -> see results", async ({ app, page }) =>
 
   await app.goTo(/Agent|agent/);
   await page.getByRole("button", { name: "Find matching jobs" }).click();
-  await page.getByPlaceholder(/Message the Orchestrator/).press("Enter");
+  await page.getByPlaceholder(/Message ApplyMate/).press("Enter");
 
   await expect(page.getByText(/Scout found 1 result/)).toBeVisible();
   await expect(page.getByText(/Cloudflare · Systems Engineer/)).toBeVisible();

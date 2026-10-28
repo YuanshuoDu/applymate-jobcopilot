@@ -36,7 +36,6 @@ function scoutWithFootprint(footprint: unknown, overrides: Partial<TaskGraphCurr
     criteria: [{ id: "scout-count", check: { kind: "candidate_count_gte", minimum: 1 } }] },
     discoveryQueryFootprint: footprint as TaskGraphCurrentNode["discoveryQueryFootprint"], ...overrides })
 }
-
 describe("root task history projection", () => {
   it("emits only typed advisory outcomes and negative reason codes", () => {
     const projected = projectRootTaskHistory([outcome("private-source", 12n)])

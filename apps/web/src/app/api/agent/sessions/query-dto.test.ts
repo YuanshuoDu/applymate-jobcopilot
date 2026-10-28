@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest"
+import { projectFinalAnswerContent } from "@/lib/agent/session/final-answer-evidence-projection"
 
 import { itemDto, taskDto, turnDto } from "./query-dto"
 
@@ -206,6 +207,99 @@ describe("agent query DTO redaction", () => {
     expect(JSON.stringify(dto)).not.toContain("871234567")
     expect(JSON.stringify(dto)).not.toContain("private-value")
     expect(JSON.stringify(dto)).not.toContain("tokens\":9")
+  })
+
+  it("projects only a validated safe answer evidence manifest from a completed final item", () => {
+    const text = "A match. [[source:S1]] Filtered [[source:S2]] Unknown [[source:E-private-key]] malformed [[source:S1]"
+    const safeEvidence = {
+      schemaVersion: 1,
+      sources: [
+        { key: "S1", kind: "job", label: "Engineer at Example Co", excerpt: "Dublin role. alex@example.test" },
+        { key: "S2", kind: "job", label: "Private listing", excerpt: "https://private.example/job" },
+      ],
+    }
+    const dto = itemDto({
+      id: "item_final", sessionId: "session_1", turnId: "turn_1", stepId: "step_1", taskId: null,
+      type: "agent_message", status: "completed", phase: "final_answer", revision: 2,
+      content: {
+        text,
+        final: {
+          response: text, summary: "Good fit.", answerEvidence: safeEvidence,
+          evidenceRefs: ["PRIVATE_TOOL_CALL_ID"], usage: { tokens: 9 }, goal: "PRIVATE_GOAL",
+        },
+      },
+      startedAt: null, completedAt: date, createdAt: date, updatedAt: date,
+    })
+
+    expect(dto.content).toEqual({
+      text: "A match. [[source:S1]] Filtered  Unknown  malformed ", summary: "Good fit.",
+      answerEvidence: {
+        schemaVersion: 1,
+        sources: [{ key: "S1", kind: "job", label: "Engineer at Example Co", excerpt: "Dublin role. [REDACTED_EMAIL]" }],
+      },
+    })
+    expect(dto.content).toEqual(projectFinalAnswerContent({
+      text,
+      final: { response: text, summary: "Good fit.", answerEvidence: safeEvidence },
+    }))
+    expect(JSON.stringify(dto)).not.toMatch(/PRIVATE_TOOL_CALL_ID|PRIVATE_GOAL|private\.example|alex@example\.test/)
+  })
+
+  it("omits answer evidence for invalid manifests and non-final messages", () => {
+    const base = {
+      id: "item_final", sessionId: "session_1", turnId: "turn_1", stepId: "step_1", taskId: null,
+      type: "agent_message", status: "completed", phase: "final_answer", revision: 2,
+      content: { text: "Answer", final: { response: "Answer", answerEvidence: { schemaVersion: 1, sources: [{ key: "S1", kind: "job", label: "Job", excerpt: "Safe", sourceId: "PRIVATE_ID" }] } } },
+      startedAt: null, completedAt: date, createdAt: date, updatedAt: date,
+    }
+    expect(itemDto(base).content).toEqual({ text: "Answer" })
+    expect(itemDto({ ...base, phase: "commentary" }).content).toEqual({ text: "Answer" })
+  })
+
+  it("preserves legacy markers without an evidence field and strips markers when all evidence is rejected", () => {
+    const legacyText = "Saved answer [[source:E-old-key]] and [[source:S9]]."
+    const base = {
+      id: "item_final", sessionId: "session_1", turnId: "turn_1", stepId: "step_1", taskId: null,
+      type: "agent_message", status: "completed", phase: "final_answer", revision: 2,
+      startedAt: null, completedAt: date, createdAt: date, updatedAt: date,
+    }
+    const legacy = itemDto({
+      ...base, content: { text: legacyText, final: { response: legacyText, summary: "Old summary" } },
+    })
+    const rejectedText = "Keep prose [[source:S1]] and [[source:E-private-key]]."
+    const rejected = itemDto({
+      ...base,
+      content: {
+        text: rejectedText,
+        final: {
+          response: rejectedText,
+          answerEvidence: {
+            schemaVersion: 1, sources: [{ key: "S1", kind: "job", label: "Private", excerpt: "https://private.example/job" }],
+          },
+        },
+      },
+    })
+
+    expect(legacy.content).toEqual({ text: legacyText, summary: "Old summary" })
+    expect(rejected.content).toEqual({ text: "Keep prose  and ." })
+    expect(JSON.stringify(rejected.content)).not.toContain("E-private-key")
+  })
+
+  it("leaves ordinary final answer prose unchanged by evidence projection", () => {
+    const text = "Role job-123; contact alex@example.test; see https://jobs.example.test/opening"
+    const dto = itemDto({
+      id: "item_final", sessionId: "session_1", turnId: "turn_1", stepId: "step_1", taskId: null,
+      type: "agent_message", status: "completed", phase: "final_answer", revision: 2,
+      content: {
+        text,
+        final: {
+          response: text,
+          answerEvidence: { schemaVersion: 1, sources: [{ key: "S1", kind: "job", label: "Engineer role", excerpt: "Dublin role" }] },
+        },
+      },
+      startedAt: null, completedAt: date, createdAt: date, updatedAt: date,
+    })
+    expect(dto.content).toMatchObject({ text })
   })
 
   it("shows safe discovery-memory overflow recovery text without private snapshot values", () => {

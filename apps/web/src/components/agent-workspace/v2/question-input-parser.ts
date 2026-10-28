@@ -64,7 +64,10 @@ export function parseQuestionInputItem(value: unknown, expectedSessionId: string
 
 /** Validates the two server terminal facts without accepting raw answers. */
 export function parseQuestionTerminalEvent(value: unknown, expectedSessionId: string): QuestionTerminalEvent | null {
-  if (!isRecord(value) || !exact(value, ['schemaVersion', 'id', 'sessionId', 'turnId', 'itemId', 'taskId', 'type', 'actor', 'sequence', 'payload'], ['correlationId', 'causationId', 'idempotencyKey', 'createdAt']) || value.schemaVersion !== AGENT_STREAM_SCHEMA_VERSION || value.sessionId !== expectedSessionId || !safeId(value.id) || !safeId(value.turnId) ||
+  // The normalizer adds undefined timeline placeholders to wire facts. These
+  // terminal facts are not item deltas: reject defined values and unknown keys.
+  if (!isRecord(value) || !exact(value, ['schemaVersion', 'id', 'sessionId', 'turnId', 'itemId', 'taskId', 'type', 'actor', 'sequence', 'payload'], ['correlationId', 'causationId', 'idempotencyKey', 'createdAt', 'kind', 'baseRevision', 'revision']) || value.schemaVersion !== AGENT_STREAM_SCHEMA_VERSION || value.sessionId !== expectedSessionId || !safeId(value.id) || !safeId(value.turnId) ||
+    value.kind !== undefined || value.baseRevision !== undefined || value.revision !== undefined ||
     typeof value.itemId !== 'string' || !safeId(value.itemId) || (value.taskId !== null && !safeId(value.taskId)) || typeof value.sequence !== 'string' || !/^(0|[1-9]\d*)$/.test(value.sequence) || value.sequence.length > 39 ||
     (value.type !== 'question.answered' && value.type !== 'question.cancelled') || (value.type === 'question.answered' ? value.actor !== 'user' : value.actor !== 'system') ||
     !isRecord(value.payload) || !exact(value.payload, value.type === 'question.answered'

@@ -32,6 +32,7 @@ import { loadPersistedScheduledPrepareProof } from "./subagents/scheduled-gate-w
 import { readScheduledGateRegistrationReceipt } from "./subagents/scheduled-gate-registration-receipt.js"
 import { scheduledGateCheckpointEvidence } from "./subagents/scheduled-gate-contract.js"
 import { parseScheduledTaskGraphContinuationReceipt, scheduledSnapshotMatches } from "./subagents/scheduled-taskgraph-continuation-receipt.js"
+import { scheduledPrepareGateVerifierStage } from "./subagents/canonical-turn-scheduled-pipeline-context.js"
 
 type ScheduledPipelineBridge = (scope: ScheduledAutomationPipelineBridgeScope) => Promise<ScheduledAutomationPipelineBridgeResult>
 type ScheduledPipelineStoreFactory = (input: {
@@ -117,7 +118,8 @@ async function verifyPersistedScheduledPrepare(pool: Pick<pg.Pool, "connect">,
       return { verified: false, reasonCode: "scheduled_prepare_graph_invalid" }
     }
     const current = currentTaskGraph(loaded)
-    if (snapshot.nodes.length === 4) {
+    const gateStage = scheduledPrepareGateVerifierStage(snapshot.nodes)
+    if (gateStage) {
       const result = await verifyPersistedGatePrepare(client, scope, prepareTaskId, task, loaded)
       if (signal.aborted) throw signal.reason ?? new Error("scheduled_prepare_verification_cancelled")
       return result
@@ -138,13 +140,17 @@ async function verifyPersistedGatePrepare(client: pg.PoolClient, scope: TaskGrap
   prepareTaskId: string, prepareTask: GraphTaskRow,
   loaded: Awaited<ReturnType<typeof loadTaskGraph>>): Promise<ScheduledPrepareVerification> {
   const snapshot = loaded.snapshot, state = loaded.state
-  if (!snapshot || !state || snapshot.nodes.length !== 4) return { verified: false, reasonCode: "scheduled_prepare_graph_invalid" }
+  const facts = parseJsonRecord(parseJsonRecord(prepareTask.result)?.taskGraphScheduledPrepareProofFacts)
+  const prepareReceipt = parseScheduledTaskGraphContinuationReceipt(facts?.receipt)
+  if (!snapshot || !state || !scheduledPrepareGateVerifierStage(snapshot.nodes)) {
+    return { verified: false, reasonCode: "scheduled_prepare_graph_invalid" }
+  }
   const lineage = await client.query<{ id: string; rootTaskId: string; parentTaskId: string }>(`SELECT task."id", task."rootTaskId", task."parentTaskId"
     FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
     WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4
       AND task."parentTaskId" = $4 AND session."userId" = $5`,
   [snapshot.nodes.map(node => node.taskId), scope.sessionId, scope.turnId, scope.rootTaskId, scope.userId])
-  if (lineage.rows.length !== 4) return { verified: false, reasonCode: "scheduled_prepare_graph_invalid" }
+  if (lineage.rows.length !== snapshot.nodes.length) return { verified: false, reasonCode: "scheduled_prepare_graph_invalid" }
   const tasks = snapshot.nodes.flatMap(node => {
     const task = loaded.tasks.get(node.taskId), identity = lineage.rows.find(row => row.id === node.taskId)
     return task && identity && task.taskType && Number.isSafeInteger(task.attemptCount)
@@ -153,11 +159,9 @@ async function verifyPersistedGatePrepare(client: pg.PoolClient, scope: TaskGrap
         failureReason: task.failureReason, expectedOutputSchema: task.expectedOutputSchema, allowedActions: task.allowedActions,
         result: task.result, rootTaskId: identity.rootTaskId, parentTaskId: identity.parentTaskId }] : []
   })
-  if (tasks.length !== 4 || !projectScheduledAnalyzePrefix(snapshot, currentTaskGraph(loaded), tasks)) {
+  if (tasks.length !== snapshot.nodes.length || !projectScheduledAnalyzePrefix(snapshot, currentTaskGraph(loaded), tasks)) {
     return { verified: false, reasonCode: "scheduled_prepare_graph_invalid" }
   }
-  const facts = parseJsonRecord(parseJsonRecord(prepareTask.result)?.taskGraphScheduledPrepareProofFacts)
-  const prepareReceipt = parseScheduledTaskGraphContinuationReceipt(facts?.receipt)
   const gate = snapshot.nodes.find(node => node.key === "gate")
   if (!facts || !prepareReceipt || !gate || prepareReceipt.owner.userId !== scope.userId
     || prepareReceipt.owner.sessionId !== scope.sessionId || prepareReceipt.owner.turnId !== scope.turnId

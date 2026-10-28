@@ -31,9 +31,12 @@ import { createUsageAwareModelAdapter } from "./usage-aware-model.js"
 import type { HarnessRequestAdmissionDiagnostic } from "../harness-model-admission.js"
 import type { WorkerUsageAuthorization, WorkerUsageAuthorizationInput, WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
 import { createReadOnlyTools, type ReadToolDataSource } from "../tools/read-tools.js"
+import { InMemoryToolLifecycleSink, ToolLifecycle } from "../tools/lifecycle.js"
+import { ToolRouter } from "../tools/router.js"
+import { ToolRegistry } from "../tools/registry.js"
 import { OrphanPauseUsageRecoveredError } from "./turn-question-store-events.js"
 import { SCHEDULED_PIPELINE_COMPLETION } from "./turn-execution-types.js"
-import { createScheduledPipelineCandidateStore, SCHEDULED_PIPELINE_CANDIDATE_EVENT, SCHEDULED_PIPELINE_CANDIDATE_SCHEMA } from "../subagents/scheduled-pipeline-candidate-store.js"
+import { createScheduledPipelineCandidateStore, parseScheduledPipelineCandidatePayload, SCHEDULED_PIPELINE_CANDIDATE_EVENT, SCHEDULED_PIPELINE_CANDIDATE_SCHEMA } from "../subagents/scheduled-pipeline-candidate-store.js"
 import type { SteeringMarkerContext, SteeringMarkerWrite } from "../context/steering-marker-store.js"
 import type { HydrationScope } from "../context/steering-reconciliation-context.js"
 import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } from "../subagents/steering-reconciliation-contract.js"
@@ -44,6 +47,8 @@ import { TurnStateRefreshRetryError } from "./turn-execution-question.js"
 import { TURN_SCHEDULED_GATE_CHOICE_SCHEMA, turnScheduledGateChoiceWaitId } from "./turn-question-gate-choice-contract.js"
 import { SCHEDULED_PIPELINE_RECOVERY_STEP_PROFILE_KEY, scheduledPipelineRecoveryStepMarker,
   withScheduledPipelineRecoveryStepProfile } from "../subagents/scheduled-pipeline-recovery-step.js"
+import { buildFinalAnswerEvidenceBindingMap } from "./final-answer-evidence.js"
+import { stableAnswerEvidenceJson } from "./final-answer-evidence-json.js"
 
 const profile = {
   provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true, continuationCursor: false,
@@ -65,6 +70,40 @@ const nativeSemanticFailure: NativeVerificationFeedback = {
   criteria: [{ criterionId: "private-criterion-id", disposition: "failed", reasonCode: "does_not_meet_criterion", evidenceReferenceIds: ["private-evidence-id"] }],
 }
 const nativeSemanticFailureFeedback = nativeVerificationFeedbackText("failed", [nativeSemanticFailure])
+const citationJob = { id: "c123456789012345678901234", company: "Acme", role: "Software Engineer", location: "Dublin, Ireland", status: "saved",
+  score: 8, url: null, source: "manual", salary: null, description: "Contact +353 87 123 4567 at jobs@example.com", keywords: null }
+const citationToolInput = { location: "Dublin" }
+const citationToolOutput = { jobs: [citationJob], page: 1, hasMore: false }
+const citationSafeToolOutput = { jobs: [{ ...citationJob,
+  description: "Contact [REDACTED_PHONE] at [REDACTED_EMAIL]" }], page: 1, hasMore: false }
+function citationSnapshot() {
+  return { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [{ id: "tool-result:job-search-1",
+    content: { toolCallId: "job-search-1", toolName: "jobs.search", input: citationToolInput, status: "completed", output: citationSafeToolOutput, errorCode: null } }] }
+}
+function citationSourceReceipt() {
+  const evidenceScope = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "root-1", stepId: "step:1" }
+  const request = { messages: [
+    { role: "assistant", content: [{ type: "tool_use", id: "job-search-1", name: "jobs.search", input: citationToolInput }] },
+    { role: "tool", content: [{ type: "tool_result", toolUseId: "job-search-1", content: stableAnswerEvidenceJson(citationSafeToolOutput) }] },
+  ], metadata: evidenceScope } as unknown as HarnessModelRequest
+  const map = buildFinalAnswerEvidenceBindingMap(request, citationSnapshot(), evidenceScope)
+  if (!map) throw new Error("citation_fixture_map_missing")
+  return map.sourceReceipt
+}
+function citationToolRouter() {
+  const source: ReadToolDataSource = {
+    searchJobs: async userId => {
+      if (userId !== "user-1") throw new Error("citation tool received the wrong tenant")
+      return citationToolOutput
+    },
+    getJob: async () => null,
+    retrievePersona: async () => ({ facts: [] }),
+    getBaseResume: async () => ({ resume: null }),
+    getApplicationState: async () => ({ job: null, task: null, approvals: [] }),
+  }
+  const sink = new InMemoryToolLifecycleSink(), definitions = createReadOnlyTools(source)
+  return { sink, definitions, router: new ToolRouter(new ToolRegistry(definitions), new ToolLifecycle({ sink })) }
+}
 
 function identity(kind: TurnExecutionIdentity["kind"], taskId: string, attemptCount = 1): TurnExecutionIdentity {
   const common = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId, rootTaskId: "root-1", ownerId: "worker-1", leaseExpiresAt: new Date("2026-09-08T03:00:00.000Z") }
@@ -156,14 +195,16 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
 function scheduledCandidateReadFixture(input: Readonly<{
   owner: TurnExecutionIdentity
   sourceEventId: string
+  candidateText?: string
+  sourceReceipt?: unknown
   recoveryStep?: { row: Record<string, unknown>; events: readonly Record<string, unknown>[] }
-}>): { store: ReturnType<typeof createScheduledPipelineCandidateStore>; staged: unknown[] } {
+}>): { store: ReturnType<typeof createScheduledPipelineCandidateStore>; staged: unknown[]; payload: unknown } {
   const owner = input.owner
   if (owner.kind !== "turn") throw new Error("Fixture expected a Turn owner")
-  const finalStepId = "step:1", finalStepOrdinal = 1, candidateText = "done:root-1", usage = { inputTokens: 17, outputTokens: 9, estimatedCostUsd: 0.23 }
+  const finalStepId = "step:1", finalStepOrdinal = 1, candidateText = input.candidateText ?? "done:root-1", usage = { inputTokens: 17, outputTokens: 9, estimatedCostUsd: 0.23 }
   const payload = { schemaVersion: SCHEDULED_PIPELINE_CANDIDATE_SCHEMA, sessionId: owner.sessionId, turnId: owner.turnId,
     rootTaskId: owner.rootTaskId, rootAttemptCount: 2, finalStepId, finalStepOrdinal, stepAttempt: 1, candidateText,
-    finishReason: "stop", usage }
+    finishReason: "stop", usage, sourceReceipt: input.sourceReceipt ?? null }
   const event = { sourceEventId: input.sourceEventId, userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
     taskId: owner.rootTaskId, type: SCHEDULED_PIPELINE_CANDIDATE_EVENT, correlationId: finalStepId, payload, stepId: finalStepId,
     stepTaskId: owner.rootTaskId, stepAttempt: 1, stepOrdinal: finalStepOrdinal, stepStatus: "streaming",
@@ -181,7 +222,7 @@ function scheduledCandidateReadFixture(input: Readonly<{
   const staged: unknown[] = []
   const store = createScheduledPipelineCandidateStore({ connect: vi.fn(async () => client) } as never,
     { appendEvent: vi.fn(async (value: unknown) => { staged.push(value); return { id: "staged" } }) } as never)
-  return { store, staged }
+  return { store, staged, payload }
 }
 
 function repeatedSearchModel(root: Fixture): ModelAdapter {
@@ -1087,6 +1128,22 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.requests).toHaveLength(0)
     const saved = JSON.parse(root.finalResponses[0]!.slice("root-1:".length)) as { usage: unknown }
     expect(saved.usage).toEqual(resume.usage)
+  })
+
+  it("removes citation markers from a generic recovered candidate without a durable receipt", async () => {
+    const root = fixture(identity("turn", "root-1"), undefined, [{ id: "resume-observation", content: { toolCallId: "resume-evidence", status: "completed" } }])
+    const resume = { nextOrdinal: 1, stepCount: 1, toolCallCount: 0, inputThroughSequence: 0n, consumedInputIds: [],
+      usage: { inputTokens: 17, outputTokens: 9, estimatedCostUsd: 0.23 } }
+    root.options = { ...root.options, resume, expectedEvidence: ["resume-evidence"],
+      recoveredFinalCandidate: `Recovered answer [[source:S1]] and [[source:E-${"a".repeat(64)}]].` }
+
+    const result = await runTurnExecutionLoop(root.options)
+    const saved = JSON.parse(root.finalResponses[0]!.slice("root-1:".length)) as { response: string; answerEvidence?: unknown }
+
+    expect(result.status).toBe("completed")
+    expect(root.requests).toHaveLength(0)
+    expect(saved.response).not.toContain("[[source:")
+    expect(saved).not.toHaveProperty("answerEvidence")
   })
 
   it("reuses a streaming recovery Step with its actual ordinal and strict start-event receipt", async () => {
@@ -2745,6 +2802,170 @@ describe("owner-agnostic turn execution loop", () => {
     expect(new Set(root.events.filter(event => event.type === "tool_call.completed").map(event => event.id)).size).toBe(1)
     expect(new Set(root.events.filter(event => event.type === "final.rejected").map(event => event.id)).size).toBe(3)
     expect(new Set(root.events.filter(event => event.type === "turn.no_progress").map(event => event.id)).size).toBe(1)
+  })
+
+  it("binds final citations to the exact invoked request and removes a forged display marker", async () => {
+    const root = fixture(identity("turn", "root-1"))
+    const toolLifecycle = citationToolRouter()
+    const sourceKey = citationSourceReceipt().bindings[0]!.key, sourceMarker = `[[source:${sourceKey}]]`
+    const splitAt = Math.floor(sourceMarker.length / 2), malformedMarker = "[[source:S9]]", partialMarker = "[[source:E-incomplete"
+    const expectedReasoning = "Reasoning before;  ; after marker; malformed  ; ordinary text remains. "
+    const expectedCommentary = "Checking  safely."
+    let calls = 0
+    let finalInstruction = ""
+    root.options = { ...root.options, tools: toolLifecycle.definitions, publishReasoningSummary: true,
+      model: { ...root.options.model, async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+        root.requests.push(request)
+        calls += 1
+        if (calls === 1) {
+          yield { type: "reasoning_summary_delta", text: `Reasoning before; ${sourceMarker.slice(0, splitAt)}` }
+          yield { type: "reasoning_summary_delta", text: `${sourceMarker.slice(splitAt)} ; after marker; malformed ${malformedMarker} ; ordinary text remains. ${partialMarker}` }
+          yield { type: "text_delta", text: `Checking ${sourceMarker.slice(0, splitAt)}` }
+          yield { type: "text_delta", text: `${sourceMarker.slice(splitAt)} safely.` }
+          yield { type: "tool_call_completed", callId: "job-search-1", name: "jobs.search", arguments: citationToolInput }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        const instruction = request.messages.filter(message => message.role === "system")
+          .flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : []))
+          .find(text => text.startsWith("For claims based on the visible read-tool results"))
+        finalInstruction = instruction ?? ""
+        const key = instruction?.match(/(E-[a-f0-9]{64}) -> tool=jobs\.search record=jobs\/0/)?.[1]
+        if (!key) throw new Error("request_source_binding_missing")
+        yield { type: "text_delta", text: `Acme has a Dublin role [[source:${key}]][[source:S2]].` }
+        yield { type: "completed", finishReason: "stop" }
+      } },
+      executeTool: async input => toolLifecycle.router.execute({ scope: input.scope, sessionId: input.sessionId, turnId: input.turnId,
+        stepId: input.stepId, taskId: input.taskId, rootTaskId: input.rootTaskId, actorRole: input.actorRole, signal: input.signal,
+        capabilities: input.capabilities, remainingTurnSteps: input.remainingTurnSteps }, input.call),
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+    const saved = JSON.parse(root.finalResponses[0]!.slice("root-1:".length)) as {
+      response: string; answerEvidence?: { schemaVersion: number; sources: Array<{ key: string; label: string; excerpt: string }> }
+    }
+    const finalRequest = root.requests[1]!
+    const hasExactToolResult = finalRequest.messages.some(message => message.role === "tool"
+      && message.content.some(part => part.type === "tool_result" && part.content === stableAnswerEvidenceJson(citationSafeToolOutput)))
+    const lifecycleResult = toolLifecycle.sink.events.find(event => event.phase === "completed"
+      && event.item.type === "tool_result" && event.item.toolCallId === "job-search-1")
+    const reasoningStarted = root.events.find(event => event.type === "item.started"
+      && JSON.stringify(event.payload ?? {}).includes('"type":"reasoning_summary"'))
+    const reasoningEvents = root.events.filter(event => event.itemId === reasoningStarted?.itemId)
+    const commentaryStarted = root.events.find(event => event.type === "item.started"
+      && JSON.stringify(event.payload ?? {}).includes('"phase":"commentary"')
+      && JSON.stringify(event.payload ?? {}).includes('"type":"agent_message"'))
+    const commentaryDelta = root.events.find(event => event.type === "item.delta" && event.itemId === commentaryStarted?.itemId)
+
+    expect(result, JSON.stringify({ finalInstruction, finalResponses: root.finalResponses, result })).toMatchObject({ status: "completed", finalText: "Acme has a Dublin role [[source:S1]]." })
+    expect(root.requests).toHaveLength(2)
+    expect(finalInstruction).toContain("record=jobs/0")
+    expect(finalInstruction).not.toContain("private-job-1")
+    expect(finalInstruction).not.toContain(citationJob.id)
+    expect(finalInstruction).not.toContain("job-search-1")
+    expect(finalInstruction).not.toContain("Acme")
+    expect(finalRequest.messages.some(message => message.role === "assistant"
+      && message.content.some(part => part.type === "tool_use" && part.name === "jobs.search"))).toBe(true)
+    expect(hasExactToolResult).toBe(true)
+    expect(lifecycleResult?.item.type === "tool_result" ? lifecycleResult.item.output : null).toEqual(citationSafeToolOutput)
+    expect(JSON.stringify(finalRequest.messages)).toContain("[REDACTED_PHONE]")
+    expect(JSON.stringify(finalRequest.messages)).toContain("[REDACTED_EMAIL]")
+    expect(JSON.stringify(finalRequest.messages)).not.toContain("jobs@example.com")
+    expect(saved.response).toBe("Acme has a Dublin role [[source:S1]].")
+    expect(saved.response).not.toContain(citationJob.id)
+    expect(JSON.stringify(saved.answerEvidence)).not.toContain(citationJob.id)
+    expect(saved.answerEvidence).toMatchObject({ schemaVersion: 1, sources: [{ key: "S1", label: "Job listing",
+      excerpt: "Role: Software Engineer · Company: Acme · Location: Dublin, Ireland" }] })
+    expect(reasoningEvents.find(event => event.type === "item.delta")?.payload).toMatchObject({ content: { body: expectedReasoning } })
+    expect(JSON.stringify(reasoningEvents)).not.toContain("[[source:")
+    expect(JSON.stringify(reasoningEvents)).not.toContain(sourceKey)
+    expect(commentaryDelta?.payload).toMatchObject({ content: { text: expectedCommentary } })
+    expect(JSON.stringify(commentaryDelta?.payload)).not.toContain("[[source:")
+    expect(JSON.stringify(commentaryDelta?.payload)).not.toContain(sourceKey)
+  })
+
+  it("does not reuse evidence keys across Turns with the same tool-call ID and observation", async () => {
+    const run = async (turnId: string) => {
+      const baseOwner = identity("turn", "root-1")
+      if (baseOwner.kind !== "turn") throw new Error("Fixture expected a Turn owner")
+      const root = fixture({ ...baseOwner, turnId })
+      const toolLifecycle = citationToolRouter()
+      let calls = 0, key = ""
+      root.options = { ...root.options, tools: toolLifecycle.definitions,
+        model: { ...root.options.model, async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+          root.requests.push(request)
+          calls += 1
+          if (calls === 1) {
+            yield { type: "tool_call_completed", callId: "job-search-1", name: "jobs.search", arguments: citationToolInput }
+            yield { type: "completed", finishReason: "tool_calls" }
+            return
+          }
+          const instruction = request.messages.filter(message => message.role === "system")
+            .flatMap(message => message.content.flatMap(part => part.type === "text" ? [part.text] : []))
+            .find(text => text.startsWith("For claims based on the visible read-tool results"))
+          key = instruction?.match(/(E-[a-f0-9]{64}) -> tool=jobs\.search record=jobs\/0/)?.[1] ?? ""
+          if (!key) throw new Error("request_source_binding_missing")
+          yield { type: "text_delta", text: `Acme role [[source:${key}]].` }
+          yield { type: "completed", finishReason: "stop" }
+        } },
+        executeTool: async input => toolLifecycle.router.execute({ scope: input.scope, sessionId: input.sessionId, turnId: input.turnId,
+          stepId: input.stepId, taskId: input.taskId, rootTaskId: input.rootTaskId, actorRole: input.actorRole, signal: input.signal,
+          capabilities: input.capabilities, remainingTurnSteps: input.remainingTurnSteps }, input.call),
+      }
+      const result = await runTurnExecutionLoop(root.options)
+      const saved = JSON.parse(root.finalResponses[0]!.slice("root-1:".length)) as { response: string }
+      expect(result.status).toBe("completed")
+      expect(root.requests[1]?.metadata?.turnId).toBe(turnId)
+      return { key, response: saved.response }
+    }
+
+    const first = await run("turn-1"), second = await run("turn-2")
+    expect(first.key).not.toBe(second.key)
+    expect(first.response).toBe("Acme role [[source:S1]].")
+    expect(second.response).toBe("Acme role [[source:S1]].")
+  })
+
+  it("restores scheduled citations only from the durable receipt and re-stages that receipt", async () => {
+    const receipt = citationSourceReceipt(), key = receipt.bindings[0]!.key
+    const runReplay = async (sourceReceipt: typeof receipt | null, candidateText: string, sourceEventId: string) => {
+      const owner = identity("turn", "root-1")
+      if (owner.kind !== "turn") throw new Error("Fixture expected a Turn owner")
+      const { store: candidateStore, staged, payload } = scheduledCandidateReadFixture({ owner, sourceEventId, candidateText, sourceReceipt })
+      expect(parseScheduledPipelineCandidatePayload(payload)).not.toBeNull()
+      const candidate = await candidateStore.read({ owner, rootAttemptCount: 2 })
+      if (!candidate) throw new Error("scheduled_candidate_fixture_missing")
+      const root = fixture(owner, undefined, citationSnapshot().toolObservations)
+      const completionGate = Object.assign(vi.fn(async () => ({ ok: true as const })), {
+        [SCHEDULED_PIPELINE_COMPLETION]: vi.fn(async input => {
+          if (input.identity.kind !== "turn") throw new Error("Fixture received a non-Turn owner")
+          await candidateStore.stage({ owner: input.identity, rootAttemptCount: 2, finalStepId: candidate.finalStepId,
+            finalStepOrdinal: candidate.finalStepOrdinal, candidateText: input.candidateText })
+          return { status: "completed" as const, candidateText: input.candidateText }
+        }),
+      })
+      root.options = { ...root.options, snapshot: citationSnapshot(),
+        resume: { nextOrdinal: 20, stepCount: 1, toolCallCount: 0, inputThroughSequence: 10n, consumedInputIds: [],
+          usage: { inputTokens: 17, outputTokens: 9, estimatedCostUsd: 0.23 } },
+        expectedEvidence: ["job-search-1"], recoveredFinalCandidate: candidateText,
+        completionGate: completionGate as TurnExecutionOptions["completionGate"] }
+
+      const result = await runTurnExecutionLoop(root.options)
+      const saved = JSON.parse(root.finalResponses[0]!.slice("root-1:".length)) as { response: string; answerEvidence?: unknown }
+      const stagedPayload = (staged[0] as { payload: { candidateText: string; sourceReceipt: unknown } } | undefined)?.payload
+      expect(result.status).toBe("completed")
+      expect(root.requests).toHaveLength(0)
+      expect(stagedPayload?.candidateText).toBe(candidateText)
+      expect(stagedPayload?.sourceReceipt).toEqual(sourceReceipt)
+      return saved
+    }
+
+    const restored = await runReplay(receipt, `Acme role [[source:${key}]][[source:S2]].`, "candidate-event-with-receipt")
+    expect(restored.response).toBe("Acme role [[source:S1]].")
+    expect(restored.answerEvidence).toMatchObject({ sources: [{ key: "S1", label: "Job listing" }] })
+
+    const missing = await runReplay(null, `Legacy role [[source:S1]] [[source:E-${"a".repeat(64)}]].`, "candidate-event-without-receipt")
+    expect(missing.response).not.toContain("[[source:")
+    expect(missing).not.toHaveProperty("answerEvidence")
   })
 
   it("gathers read evidence after one premature final and verifies a fresh final in the same loop", async () => {

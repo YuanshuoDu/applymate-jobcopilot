@@ -18,11 +18,11 @@ type ApplicationTask = {
   job: { company: string; role: string }
 }
 
-function installSession(applicationTasks: ApplicationTask[], retryTasks?: Array<{ id: string; cancelledFillRetryReady: boolean }>, retryLoading = false) {
+function installSession(applicationTasks: ApplicationTask[], retryTasks?: Array<{ id: string; cancelledFillRetryReady: boolean }>, retryLoading = false, overrides: Partial<AgentSessionDetail> = {}) {
   const session = {
     id: 'session_1', goal: 'Fill application', status: 'completed', source: 'user', memorySummary: '',
     qualityScore: null, currentTaskId: null, createdAt: '2026-10-15T10:00:00.000Z', updatedAt: '2026-10-15T10:00:00.000Z', completedAt: null,
-    tasks: [], approvals: [], applicationTasks, execution: null, questions: [],
+    tasks: [], approvals: [], applicationTasks, execution: null, questions: [], ...overrides,
   } as unknown as AgentSessionDetail
   const readiness = retryTasks ?? applicationTasks.map(item => ({ id: item.id, cancelledFillRetryReady: true }))
   mocks.useApi.mockImplementation((url: string) => url.includes('projection=cancelled-fill-retry')
@@ -39,7 +39,7 @@ describe('SessionFocusPanel application fill retry', () => {
     mocks.useApi.mockReset()
     mocks.formQuestionFields.mockReset().mockReturnValue([])
   })
-  afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers() })
+  afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); vi.restoreAllMocks() })
 
   it('polls while any retryable TaskGraph fill checkpoint is not ready', () => {
     expect(needsApplicationFillRetryPolling([task()], [], false)).toBe(true)
@@ -190,5 +190,125 @@ describe('SessionFocusPanel application fill retry', () => {
     expect(html).toContain('Unmapped field')
     expect(html).not.toContain('name="Unmapped field"')
     expect(formAnswerDraftKey('application_1', 'wait_1', validKey)).toBe(`application_1:wait_1:${validKey}`)
+  })
+
+  it('does not show a wall of empty sections or query a session before one is selected', () => {
+    expect(renderToStaticMarkup(<SessionFocusPanel sessionId={null} />)).toBe('')
+    expect(mocks.useApi).not.toHaveBeenCalled()
+    installSession([])
+    const html = renderToStaticMarkup(<SessionFocusPanel sessionId="session_1" />)
+    expect(html).toBe('')
+    expect(html).not.toContain('agent.noTaskRecords')
+    expect(html).not.toContain('agent.noPendingApprovals')
+    expect(html).not.toContain('agent.noApplicationTasks')
+    expect(html).not.toContain('agent.noExecution')
+    expect(html).not.toContain('agent.noQuestions')
+    expect(html).not.toContain('agent.sessionQuality')
+  })
+
+  it('keeps pending answers, approvals, application recovery and execution controls directly visible', () => {
+    installSession([task('waiting_for_user', 'submission_uncertain')], undefined, false, {
+      execution: { id: 'execution_1', status: 'running', checkpoint: 'filling', error: null, attemptCount: 1 },
+      approvals: [{ id: 'approval_1', title: 'Review application', status: 'pending', type: 'submit', createdAt: '2026-10-15T10:00:00.000Z' }],
+      questions: [{ id: 'question_1', stage: 'Prepare', question: 'Can you work in Ireland?', pending: true, options: [{ label: 'Yes, authorised', value: 'yes' }] }],
+    })
+    const html = renderToStaticMarkup(<SessionFocusPanel sessionId="session_1" />)
+    expect(html).toContain('Review application')
+    expect(html).toContain('Yes, authorised')
+    expect(html).toContain('Confirm and start fresh fill for review')
+    expect(html).toContain('agent.cancelRun')
+    expect(html).not.toContain('Session session_1')
+    expect(html).not.toContain('<details')
+  })
+
+  it('does not hide a pending application recovery after five historical applications', () => {
+    installSession([
+      ...Array.from({ length: 5 }, (_, index) => ({ ...task('submitted', null), id: `done_${index}` })),
+      task('waiting_for_user', 'submission_uncertain'),
+    ])
+    const html = renderToStaticMarkup(<SessionFocusPanel sessionId="session_1" />)
+    expect(html).toContain('Confirm and start fresh fill for review')
+  })
+
+  it('removes duplicate task history, session metadata and quality without turning answered questions into actions', () => {
+    installSession([], undefined, false, {
+      tasks: [{ id: 'task_1', role: 'scout', taskType: 'discovery', goal: 'Find roles', status: 'completed', confidence: 0.9, failureReason: null, createdAt: '2026-10-15', updatedAt: '2026-10-15' }],
+      questions: [{ id: 'question_1', stage: 'Prepare', question: 'Previously answered', answered: true, options: [{ label: 'Answer again', value: 'yes' }] }],
+      qualityScore: 98,
+    })
+    const html = renderToStaticMarkup(<SessionFocusPanel sessionId="session_1" />)
+    expect(html).toContain('Answered · read-only')
+    expect(html).not.toContain('Answer again')
+    expect(html).not.toContain('Find roles')
+    expect(html).not.toContain('agent.sessionQuality')
+    expect(html).not.toContain('98%')
+    expect(html).not.toContain('Session session_1')
+    expect(html).not.toContain('2026-10-15')
+    expect(html).not.toContain('data-agent-session-details')
+  })
+
+  it('retains actual artifacts and unknown outcome evidence without nominal budget or compaction summaries', () => {
+    installSession([], undefined, false, {
+      artifacts: [{ id: 'artifact_1', title: 'Draft cover letter', type: 'cover_letter', version: 2, hash: 'verified-hash', stale: true, staleReason: 'Job requirements changed.' }],
+      budget: { used: 20, limit: 100, unit: 'tokens' },
+      compaction: { status: 'completed', beforeTokens: 1000, afterTokens: 500 },
+      uncertain: [{ id: 'evidence_1', label: 'Application receipt', detail: 'Submission outcome is still unknown.' }],
+    })
+    const html = renderToStaticMarkup(<SessionFocusPanel sessionId="session_1" />)
+    expect(html).toContain('Draft cover letter')
+    expect(html).toContain('Job requirements changed.')
+    expect(html).toContain('Application receipt')
+    expect(html).toContain('Submission outcome is still unknown.')
+    expect(html).not.toContain('Cost and confidence')
+    expect(html).not.toContain('Budget')
+    expect(html).not.toContain('Compaction')
+  })
+
+  it.each([
+    [{ used: 80, limit: 100, unit: 'tokens' }, 'Near limit'],
+    [{ used: 100, limit: 100, unit: 'tokens' }, 'Budget exhausted'],
+    [{ used: 20, limit: 100, warning: 'This run needs a higher budget to finish.' }, 'This run needs a higher budget to finish.'],
+  ])('keeps actionable budget feedback visible for %j', (budget, expected) => {
+    installSession([], undefined, false, { budget })
+    expect(renderToStaticMarkup(<SessionFocusPanel sessionId="session_1" />)).toContain(expected)
+  })
+
+  it.each([
+    ['uncertain submission on a completed session', [task('waiting_for_user', 'submission_uncertain')], {}],
+    ['unknown application outcome', [task('unknown', null)], {}],
+    ['failed application', [task('failed', 'worker_failed')], {}],
+    ['retryable cancelled fill', [task()], {}],
+    ['pending approval', [], { approvals: [{ id: 'approval_1', title: 'Review', status: 'pending', type: 'submit', createdAt: '2026-10-15' }] }],
+    ['unanswered question', [], { questions: [{ id: 'question_1', stage: 'Prepare', question: 'Authorised?', options: [], answered: false, pending: true }] }],
+    ['uncertain answer state', [], { questions: [{ id: 'question_1', stage: 'Prepare', question: 'Authorised?', options: [], answered: false, pending: false, answerAvailable: false }] }],
+    ['uncertain evidence', [], { uncertain: [{ id: 'evidence_1', label: 'Submission result', detail: 'No receipt available' }] }],
+    ['near-limit budget', [], { budget: { used: 80, limit: 100 } }],
+    ['exhausted budget', [], { budget: { used: 100, limit: 100 } }],
+    ['explicit budget warning', [], { budget: { used: 20, limit: 100, warning: 'Increase the limit to finish.' } }],
+  ] as Array<[string, ApplicationTask[], Partial<AgentSessionDetail>]>)('reports attention for %s regardless of session completion', (_label, applicationTasks, overrides) => {
+    installSession(applicationTasks, undefined, false, { status: 'completed', ...overrides })
+    const onAttentionChange = vi.fn()
+    const effects: Array<{ effect: React.EffectCallback; dependencies: React.DependencyList | undefined }> = []
+    vi.spyOn(React, 'useEffect').mockImplementation((effect, dependencies) => { effects.push({ effect, dependencies }) })
+    renderToStaticMarkup(<SessionFocusPanel sessionId="session_1" onAttentionChange={onAttentionChange} />)
+    const notification = effects.find(entry => entry.dependencies?.includes(onAttentionChange))
+    expect(notification).toBeDefined()
+    notification!.effect()
+    expect(onAttentionChange).toHaveBeenCalledWith('session_1', true)
+  })
+
+  it('clears attention for answered questions and uses stable effect dependencies across equivalent data refreshes', () => {
+    const onAttentionChange = vi.fn()
+    const effects: Array<{ effect: React.EffectCallback; dependencies: React.DependencyList | undefined }> = []
+    vi.spyOn(React, 'useEffect').mockImplementation((effect, dependencies) => { effects.push({ effect, dependencies }) })
+    for (let refresh = 0; refresh < 2; refresh += 1) {
+      installSession([], undefined, false, { questions: [{ id: 'question_1', stage: 'Prepare', question: 'Authorised?', options: [], answered: false, pending: false, answerAvailable: true }] })
+      renderToStaticMarkup(<SessionFocusPanel sessionId="session_1" onAttentionChange={onAttentionChange} />)
+    }
+    const notifications = effects.filter(entry => entry.dependencies?.includes(onAttentionChange))
+    expect(notifications).toHaveLength(2)
+    expect(notifications[0].dependencies).toEqual(notifications[1].dependencies)
+    notifications[0].effect()
+    expect(onAttentionChange).toHaveBeenCalledWith('session_1', false)
   })
 })

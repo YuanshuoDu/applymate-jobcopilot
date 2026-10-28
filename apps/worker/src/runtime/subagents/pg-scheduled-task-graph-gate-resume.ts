@@ -14,6 +14,8 @@ import { TaskGraphCommandError, type TaskGraphScheduledGateResumeInput,
   type TaskGraphScheduledGateResumeReceipt } from "./task-graph-command-port.js"
 import type { Queryable } from "./pg-store-persistence.js"
 import { taskGraphDeadlineLive } from "./pg-store-claim.js"
+import { scheduledPipelineContinuationKeyVersion } from "@jobcopilot/agent-protocol"
+import { projectScheduledPipelineGraphAtCurrentStage } from "./scheduled-pipeline-graph-shape.js"
 
 type Row = Record<string, unknown>
 type GateQuestionCandidate = NonNullable<Awaited<ReturnType<typeof readScheduledGateQuestionCandidate>>>
@@ -40,11 +42,13 @@ export async function resumeScheduledGateChoice(client: Queryable,
   [input.executionOwner.executionId, scope.userId, scope.sessionId])
   if (executionResult.rows.length !== 1) throw invalid("execution")
   const graph = await loadTaskGraph(client, GATE_GRAPH_SCOPE(scope), true)
-  if (!fixedGate(gate, scope, gateTaskId) || !sameGraphGate(graph, gateTaskId, gate.status)
+  const graphStage = graph.snapshot && projectScheduledPipelineGraphAtCurrentStage(graph.snapshot.nodes)
+  if (!fixedGate(gate, scope, gateTaskId) || graphStage?.projection.stage !== "gate" || !sameGraphGate(graph, gateTaskId, gate.status)
     || Number(gate.maxAttempts) < 1 || !Number.isSafeInteger(Number(gate.attemptCount))) throw invalid("graph")
   const rowBinding = await readQuestion(client, scope, gateTaskId, waitId)
   const binding = rowBinding?.binding
   if (!rowBinding || !binding || binding.gateAttempt !== requestAttemptCount || binding.gateTaskId !== gateTaskId
+    || scheduledPipelineContinuationKeyVersion(binding.continuationKey) !== graphStage.version
     || !sameStableOwner(binding.owner, { ...scopeOwner(scope), executionId: input.executionOwner.executionId,
       executionAttemptCount: input.executionOwner.executionAttemptCount })) throw invalid("answer")
 
@@ -143,9 +147,10 @@ function fixedGate(row: Row, scope: TaskGraphScheduledGateResumeInput["scope"], 
     && row.interruptRequestedAt == null
 }
 function sameGraphGate(graph: Awaited<ReturnType<typeof loadTaskGraph>>, taskId: string, status: unknown): boolean {
-  const node = graph.snapshot?.nodes.find(value => value.key === SCHEDULED_GATE_TEMPLATE_ID)
+  const shape = graph.snapshot && projectScheduledPipelineGraphAtCurrentStage(graph.snapshot.nodes)
+  const node = shape?.projection.stage === "gate" ? shape.projection.gate : undefined
   const current = graph.state?.nodes.find(value => value.key === SCHEDULED_GATE_TEMPLATE_ID)
-  return graph.snapshot?.nodes.length === 4 && graph.state?.nodes.length === 4 && !!node && !!current
+  return shape?.projection.stage === "gate" && graph.state?.nodes.length === graph.snapshot?.nodes.length && !!node && !!current
     && node.taskId === taskId && node.templateId === SCHEDULED_GATE_TEMPLATE_ID && node.depth === 4
     && node.verificationDisposition === "specialized" && node.verification === undefined
     && same(node.dependsOn, ["prepare"]) && node.goal === SCHEDULED_GATE_NODE_GOAL && same(node.successCriteria, SCHEDULED_GATE_NODE_CRITERIA)

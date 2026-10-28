@@ -3,6 +3,8 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react'
 import { useRouter } from 'next/navigation'
 import { signOut } from 'next-auth/react'
+import { ChartNoAxesColumn } from 'lucide-react'
+import { SettingsUsageActivity } from './SettingsUsageActivity'
 import { TopBar } from '@/components/layout/TopBar'
 import { Btn, Card, useToast, useConfirm, UserAvatar } from '@/components/ui'
 import type { NotificationPreferences, PrivacyPreferences, UserProfile, UserPreferences } from '@/lib/types'
@@ -112,11 +114,6 @@ function Toggle({ label, value, onChange, disabled = false }: { label?: string; 
 
 type Tab = SettingsTab
 
-function initialSettingsTab(): Tab {
-  if (typeof window === 'undefined') return 'profile'
-  return settingsTabFromHref(window.location.href)
-}
-
 const THEME_OPTIONS: { mode: ThemeMode; icon: string }[] = [
   { mode: 'light', icon: '☀' },
   { mode: 'system', icon: '💻' },
@@ -177,7 +174,7 @@ export function SettingsPage() {
     }
   }, [user])
 
-  const [activeTab,      setActiveTab     ] = useState<Tab>(initialSettingsTab)
+  const [activeTab,      setActiveTab     ] = useState<Tab>('profile')
   const [notifs,         setNotifs        ] = useState<NotificationPreferences>(DEFAULT_NOTIFICATION_PREFERENCES)
   const [privacy,        setPrivacy       ] = useState<PrivacyPreferences>(DEFAULT_PRIVACY_PREFERENCES)
   const [preferenceSaving, setPreferenceSaving] = useState<'notifications' | 'privacy' | null>(null)
@@ -193,6 +190,7 @@ export function SettingsPage() {
 
   useEffect(() => {
     const handlePopState = () => setActiveTab(settingsTabFromHref(window.location.href))
+    handlePopState()
     window.addEventListener('popstate', handlePopState)
     return () => window.removeEventListener('popstate', handlePopState)
   }, [])
@@ -276,6 +274,7 @@ export function SettingsPage() {
 
   const TABS: { id: Tab; label: string }[] = [
     { id: 'profile',  label: t('settings.profile')  },
+    { id: 'usage', label: t('settings.usage') },
     { id: 'appearance', label: t('settings.appearance') },
     { id: 'accounts', label: t('settings.accounts') },
     { id: 'apiKeys',  label: 'Keys & connections'   },
@@ -472,8 +471,9 @@ export function SettingsPage() {
     window.location.assign(billingSupportHref(address, action))
   }
 
-  const TAB_ICONS: Record<Tab, string> = {
+  const TAB_ICONS: Record<Tab, React.ReactNode> = {
     profile:  '👤',
+    usage: <ChartNoAxesColumn size={16} aria-hidden="true" />,
     appearance: '🎨',
     accounts: '🔗',
     apiKeys:  '🔑',
@@ -535,7 +535,8 @@ export function SettingsPage() {
         </div>
 
         {/* ── Content area ── */}
-        <div className="settings-content" style={{ flex: 1, overflowY: 'auto', padding: '20px 24px', display: 'flex', flexDirection: 'column', gap: 16 }}>
+        <div className="settings-content" style={{ flex: 1, minWidth: 0, overflowY: 'auto', padding: '20px 24px', display: 'flex', flexDirection: 'column', gap: 16 }}>
+          {activeTab === 'usage' && <SettingsUsageActivity />}
 
           {/* ── Profile ── */}
           {activeTab === 'profile' && (

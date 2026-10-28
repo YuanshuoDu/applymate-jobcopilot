@@ -32,12 +32,12 @@ function item(child: SubagentLease, overrides: Row = {}): Row {
     content: { toolCallId: "call-1", toolName: "jobs.search", input: { query: "Dublin" } }, attempt: 1, ordinal: 0, ...overrides }
 }
 
-function consumedWait(child: SubagentLease): Row {
-  const output = { waitId: "wait-1", status: "ready", taskIds: ["grandchild-1"], deadlineAt: "2099-09-14T11:30:00.000Z",
-    matchedTaskIds: ["grandchild-1"], tasks: [{ taskId: "grandchild-1", status: "completed", role: "scout", result: { jobs: [] }, failureReason: null }] }
-  const input = { idempotencyKey: "wait-key", taskIds: ["grandchild-1"], mode: "all", timeoutMs: 5_000 }
-  return { waitId: "wait-1", stepId: "step-1", targetTaskIds: ["grandchild-1"], idempotencyKey: "wait-key", mode: "all", status: "ready",
-    deadlineAt: output.deadlineAt, matchedTaskIds: ["grandchild-1"], waitResult: { request: { targetTaskIds: ["grandchild-1"], mode: "all", timeoutMs: 5_000 }, outcome: output }, attempt: child.attemptCount,
+function consumedWait(child: SubagentLease, targetId = "grandchild-1", note?: string): Row {
+  const output = { waitId: "wait-1", status: "ready", taskIds: [targetId], deadlineAt: "2099-09-14T11:30:00.000Z",
+    matchedTaskIds: [targetId], tasks: [{ taskId: targetId, status: "completed", role: "scout", result: { jobs: [], ...(note ? { note } : {}) }, failureReason: null }] }
+  const input = { idempotencyKey: "wait-key", taskIds: [targetId], mode: "all", timeoutMs: 5_000 }
+  return { waitId: "wait-1", stepId: "step-1", targetTaskIds: [targetId], idempotencyKey: "wait-key", mode: "all", status: "ready",
+    deadlineAt: output.deadlineAt, matchedTaskIds: [targetId], waitResult: { request: { targetTaskIds: [targetId], mode: "all", timeoutMs: 5_000 }, outcome: output }, attempt: child.attemptCount,
     ordinal: 0, continuationStepId: "step-2", continuationOrdinal: 1, continuationLatestOrdinal: 1,
     callContent: { toolCallId: "wait-call", toolName: "wait_subagents", input }, callStatus: "completed",
     resultContent: { toolCallId: "wait-call", output: { ...output, status: "waiting", matchedTaskIds: [] }, errorCode: null }, resultStatus: "completed",
@@ -128,6 +128,29 @@ describe("child attempt durable resume", () => {
     expect(db.calls.find(call => call.sql.includes('WHERE task."id" = ANY($1::text[])'))?.values).toEqual([[
       "grandchild-1",
     ], child.sessionId, child.turnId, child.rootTaskId, child.id, child.userId])
+  })
+
+  it("preserves the validated phone-shaped target through the consumed public resume path", async () => {
+    const targetId = "subagent-00000000-0000-4000-8000-000000000001"
+    const child = lease({ attemptCount: 1 })
+    const wait = consumedWait(child, targetId, "Contact +353 87 123 4567")
+    const db = fakePool(child, [
+      step(child, { id: "step-1", attempt: 1, ordinal: 0, status: "waiting_for_tool" }),
+      step(child, { id: "step-2", attempt: 1, ordinal: 1, status: "queued" }),
+    ], [
+      item(child, { id: "wait-call-item", stepId: "step-1", type: "tool_call", content: { toolCallId: "wait-call", toolName: "wait_subagents",
+        input: { idempotencyKey: "wait-key", taskIds: [targetId], mode: "all", timeoutMs: 5_000 } } }),
+      item(child, { id: "wait-result-id", stepId: "step-1", type: "tool_result", content: { toolCallId: "wait-call", output: { waitId: "wait-1", status: "waiting", taskIds: [targetId], tasks: [] }, errorCode: null } }),
+    ], wait, [{ id: targetId, parentTaskId: child.id, rootTaskId: child.rootTaskId, sessionId: child.sessionId, turnId: child.turnId, userId: child.userId }])
+
+    const restored = await loadChildAttemptResume(db.pool as never, child)
+    expect(restored?.durableWait).toMatchObject({ input: { taskIds: [targetId] }, output: { taskIds: [targetId], tasks: [{ taskId: targetId }] } })
+    expect(JSON.stringify(restored?.durableWait)).toContain(targetId)
+    expect(JSON.stringify(restored?.durableWait)).not.toContain("+353 87 123 4567")
+    const observation = restored?.observations.find(item => item.id === "child-resume:wait-result-id")
+    expect(observation?.content).toMatchObject({ input: { taskIds: [targetId] }, output: { taskIds: [targetId], tasks: [{ taskId: targetId }] } })
+    expect(JSON.stringify(observation)).toContain(targetId)
+    expect(JSON.stringify(observation)).not.toContain("+353 87 123 4567")
   })
 
   it("reconstructs a missing exact receipt from the consumed wait at max attempt and reuses its persisted continuation", async () => {

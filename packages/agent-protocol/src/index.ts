@@ -119,3 +119,53 @@ export type {
   ModelToolUsePart,
   ModelUsage,
 } from './model.js'
+export {
+  ANSWER_EVIDENCE_MAX_EXCERPT_CHARACTERS,
+  ANSWER_EVIDENCE_MAX_LABEL_CHARACTERS,
+  ANSWER_EVIDENCE_MAX_SOURCES,
+  ANSWER_EVIDENCE_MAX_TOTAL_EXCERPT_CHARACTERS,
+  ANSWER_EVIDENCE_MAX_UTF8_BYTES,
+  ANSWER_EVIDENCE_SCHEMA_VERSION,
+  AnswerEvidenceKindSchema,
+  AnswerEvidenceSchema,
+  AnswerEvidenceSourceSchema,
+  parseAnswerEvidence,
+} from './final-answer-evidence.js'
+export type { AnswerEvidence, AnswerEvidenceKind, AnswerEvidenceSource } from './final-answer-evidence.js'
+export {
+  LEGACY_SCHEDULED_PIPELINE_CANDIDATE_SCHEMA,
+  SCHEDULED_PIPELINE_CANDIDATE_SCHEMA,
+  SCHEDULED_PIPELINE_SOURCE_RECEIPT_MAX_BINDINGS,
+  SCHEDULED_PIPELINE_SOURCE_RECEIPT_MAX_BYTES,
+  SCHEDULED_PIPELINE_SOURCE_RECEIPT_SCHEMA_VERSION,
+  parseScheduledPipelineCandidatePayload,
+  parseScheduledPipelineSourceReceipt,
+} from './scheduled-pipeline-candidate.js'
+export type {
+  ScheduledPipelineCandidatePayload,
+  ScheduledPipelineCandidateUsage,
+  ScheduledPipelineSourceReceipt,
+} from './scheduled-pipeline-candidate.js'
+export {
+  SCHEDULED_PIPELINE_ATTESTATION_V1_SCHEMA,
+  SCHEDULED_PIPELINE_ATTESTATION_V2_SCHEMA,
+  parseScheduledPipelineAttestation,
+} from './scheduled-pipeline-attestation.js'
+export type {
+  ScheduledPipelineAnalystAttestationV1,
+  ScheduledPipelineAnalystProofV2,
+  ScheduledPipelineAttestation,
+  ScheduledPipelineAttestationOwner,
+  ScheduledPipelineAttestationV1,
+  ScheduledPipelineAttestationV2,
+  ScheduledPipelineDiscoveryReceipt,
+  ScheduledPipelineScoutAttestationV1,
+  ScheduledPipelineScoutProofV2,
+} from './scheduled-pipeline-attestation.js'
+export { scheduledPipelineContinuationKeyMaterial, scheduledPipelineContinuationKeyVersion,
+  scheduledPipelinePrepareReceiptKeyMaterial } from './scheduled-pipeline-continuation-key-material.js'
+export type {
+  ScheduledPipelineContinuationKeyMaterial,
+  ScheduledPipelineExecutionIdentity,
+  ScheduledPipelinePrepareReceiptKeyBinding,
+} from './scheduled-pipeline-continuation-key-material.js'

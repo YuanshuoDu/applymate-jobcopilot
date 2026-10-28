@@ -79,7 +79,7 @@ export function AgentApprovalLedgerCard({ ledger, sessionId, turns, onAccepted, 
       </div>
       <div style={summaryStyle}><span>{t('agent.approvalLedger.pending')}</span><strong>{ledger.pendingCount}</strong></div>
       <div data-agent-approval-ledger-rows="true" style={rowsStyle}>
-        {ledger.pendingActions.slice(0, 8).map(actionRef => <PendingApprovalRow key={actionRef.approvalId} actionRef={actionRef} sessionId={sessionId} turns={turns} submitting={Boolean(submitting[actionRef.approvalId])} feedback={feedback[actionRef.approvalId]} onDecision={handleDecision} t={t} />)}
+        {ledger.pendingActions.map(actionRef => <PendingApprovalRow key={actionRef.approvalId} actionRef={actionRef} sessionId={sessionId} turns={turns} submitting={Boolean(submitting[actionRef.approvalId])} feedback={feedback[actionRef.approvalId]} onDecision={handleDecision} t={t} />)}
         {terminalApprovals.map((approval, index) => <ApprovalRow key={`${index}-${approval.status}`} approval={approval} t={t} />)}
       </div>
     </section>

@@ -66,4 +66,41 @@ describe('AgentQuestionInputCard', () => {
     expect(unavailableHtml.match(/disabled=""/g)).toHaveLength(2)
     expect(unavailableHtml).toContain(translate('en', 'agent.question.turnUnavailable'))
   })
+
+  it('keeps every pending question before collapsed answered and cancelled history', () => {
+    const answered = Array.from({ length: 8 }, (_, index) => item({ ...pendingContent,
+      questionId: `answered-${index}`, question: `Historical question ${index}`, answerAvailable: true, pending: false,
+    }, { id: `answered-item-${index}`, status: 'completed' }))
+    const cancelled = item({ ...pendingContent, questionId: 'cancelled', question: 'Cancelled question',
+      pending: false, cancelled: true, cancellationReason: 'interrupt',
+    }, { id: 'cancelled-item', status: 'interrupted' })
+    const pending = Array.from({ length: 10 }, (_, index) => item({ ...pendingContent,
+      questionId: `pending-${index}`, question: `Still needs answer ${index}`, options: [],
+    }, { id: `pending-item-${index}` }))
+    const html = renderToStaticMarkup(<I18nProvider><AgentQuestionInputCard {...props([...answered, cancelled, ...pending])} /></I18nProvider>)
+    const historyOffset = html.indexOf('<details data-agent-question-history="true">')
+    expect(historyOffset).toBeGreaterThan(0)
+    expect(html).not.toMatch(/<details[^>]*\sopen(?:=|\s|>)/)
+    for (let index = 0; index < pending.length; index += 1) {
+      expect(html.indexOf(`Still needs answer ${index}`)).toBeLessThan(historyOffset)
+    }
+    expect(html.slice(0, historyOffset).match(/type="text"/g)).toHaveLength(10)
+    expect(html.slice(historyOffset)).toContain('Historical question 0')
+    expect(html.slice(historyOffset)).toContain('Cancelled question')
+    expect(html.slice(historyOffset)).not.toContain('<button')
+    expect(html.slice(historyOffset)).not.toContain('<input')
+  })
+
+  it('uses the latest question revision without admitting foreign or cancelled controls', () => {
+    const previous = item({ ...pendingContent, questionId: 'resolved', question: 'Resolved question' })
+    const resolved = item({ ...pendingContent, questionId: 'resolved', question: 'Resolved question', pending: false, answerAvailable: true }, { status: 'completed', revision: 2 })
+    const foreign = item({ ...pendingContent, questionId: 'foreign', question: 'Foreign question' }, { sessionId: 'other-session' })
+    const current = item({ ...pendingContent, questionId: 'current', question: 'Current question' }, { id: 'current-item' })
+    const html = renderToStaticMarkup(<I18nProvider><AgentQuestionInputCard {...props([resolved, previous, foreign, current])} /></I18nProvider>)
+    const historyOffset = html.indexOf('<details')
+    expect(html.slice(0, historyOffset)).toContain('Current question')
+    expect(html.slice(0, historyOffset)).not.toContain('Resolved question')
+    expect(html.slice(historyOffset)).toContain('Resolved question')
+    expect(html).not.toContain('Foreign question')
+  })
 })

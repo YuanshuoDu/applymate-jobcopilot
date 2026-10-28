@@ -88,15 +88,15 @@ const scheduledOwner = {
 const scheduledKey = `scheduled-taskgraph:sha256:${'a'.repeat(64)}`
 const scheduledClaimToken = 'claim-token-1'
 
-function withScheduledOwnerProof(initial: Partial<PipelineCheckpointState> = {}): Partial<PipelineCheckpointState> {
+function withScheduledOwnerProof(initial: Partial<PipelineCheckpointState> = {}, continuationKey = scheduledKey): Partial<PipelineCheckpointState> {
   return {
     ...initial,
     scheduledTaskGraphContinuation: {
-      schemaVersion: 'agent-harness.v2.scheduled-pipeline-continuation.v1', key: scheduledKey,
+      schemaVersion: 'agent-harness.v2.scheduled-pipeline-continuation.v1', key: continuationKey,
       owner: scheduledOwner, snapshotDigest: `sha256:${'b'.repeat(64)}`, graphRevision: 2, evidenceDigest: 'c'.repeat(64),
     },
     scheduledTaskGraphClaim: {
-      schemaVersion: 'agent-harness.v2.scheduled-pipeline-claim.v1', key: scheduledKey, claimToken: scheduledClaimToken,
+      schemaVersion: 'agent-harness.v2.scheduled-pipeline-claim.v1', key: continuationKey, claimToken: scheduledClaimToken,
       owner: scheduledOwner, claimedAt: '2026-10-25T09:00:00.000Z', leaseExpiresAt: '2026-10-25T10:00:00.000Z',
     },
   } as unknown as Partial<PipelineCheckpointState>
@@ -105,13 +105,14 @@ function withScheduledOwnerProof(initial: Partial<PipelineCheckpointState> = {})
 function attachScheduledOwnerFence(
   runtime: PipelineStageRuntimeContext,
   owner = scheduledOwner,
+  continuationKey = scheduledKey,
 ): void {
   Object.assign(runtime.ctx, {
     sessionId: owner.sessionId,
     turnId: owner.turnId,
     executionAttempt: { id: owner.executionId, attemptCount: owner.executionAttemptCount },
     scheduledTaskGraphOwnerFence: {
-      owner, key: scheduledKey, claimToken: scheduledClaimToken, assertCurrent: vi.fn(async () => true),
+      owner, key: continuationKey, claimToken: scheduledClaimToken, assertCurrent: vi.fn(async () => true),
     },
   })
 }
@@ -162,10 +163,10 @@ describe('runExecuteAuditStages', () => {
     expect(runtime.orchestrator.evaluate).toHaveBeenCalledWith('post-run', expect.any(String), expect.any(Object))
   })
 
-  it('skips post-run model decisions only for a validated scheduled TaskGraph owner', async () => {
+  it.each([scheduledKey, `scheduled-taskgraph:v2:sha256:${'d'.repeat(64)}`])('skips post-run model decisions only for a validated scheduled TaskGraph owner (%s)', async continuationKey => {
     const { initial, input } = prepareAuditCase()
-    const runtime = makeRuntime(withScheduledOwnerProof(initial))
-    attachScheduledOwnerFence(runtime)
+    const runtime = makeRuntime(withScheduledOwnerProof(initial, continuationKey))
+    attachScheduledOwnerFence(runtime, scheduledOwner, continuationKey)
 
     const result = await runExecuteAuditStages(runtime, input)
 
@@ -188,6 +189,15 @@ describe('runExecuteAuditStages', () => {
     await runExecuteAuditStages(runtime, input)
 
     expect(runtime.orchestrator.evaluate).toHaveBeenCalledOnce()
+    expect(runtime.orchestrator.evaluate).toHaveBeenCalledWith('post-run', expect.any(String), expect.any(Object))
+  })
+
+  it('keeps the post-run decision for a malformed v2 continuation key', async () => {
+    const { initial, input } = prepareAuditCase()
+    const malformed = `scheduled-taskgraph:v2:sha256:${'d'.repeat(64)}\n`
+    const runtime = makeRuntime(withScheduledOwnerProof(initial, malformed))
+    attachScheduledOwnerFence(runtime, scheduledOwner, malformed)
+    await runExecuteAuditStages(runtime, input)
     expect(runtime.orchestrator.evaluate).toHaveBeenCalledWith('post-run', expect.any(String), expect.any(Object))
   })
 
