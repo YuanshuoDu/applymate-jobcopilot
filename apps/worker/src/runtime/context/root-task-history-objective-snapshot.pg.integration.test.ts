@@ -299,7 +299,7 @@ describePg("root task history objective snapshot PostgreSQL durability", () => {
     const firstEvents = await snapshotEvent(pool!, fixture.sessionId)
     expect(firstEvents).toHaveLength(1)
     expect(firstContext.blocks.find(block => block.id === "observation:root-task-history")?.content).toMatchObject({
-      historical: true, turns: [{ nodes: [{ templateId: "analyst", status: "completed" }] }],
+      historical: true, turns: [{ nodes: [{ taskKind: "analyst", status: "completed" }] }],
     })
     const storedPayload = firstEvents[0]?.payload as Record<string, unknown>
     expect(storedPayload.outcomes).toMatchObject([{ sourceTurnId: fixture.sourceTurnId, sourceRootTaskId: fixture.sourceRootTaskId,
