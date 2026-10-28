@@ -1,8 +1,14 @@
 import type pg from "pg"
 import { Buffer } from "node:buffer"
 import { createHash } from "node:crypto"
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import { readRootTaskHistoryFence, rootTaskHistoryIndexKeys, rootTaskHistoryObjectiveDigest, rootTaskHistoryOrigin, type RootTaskHistoryFenceInput } from "./root-task-history-fence.js"
+
+const { readWitness } = vi.hoisted(() => ({ readWitness: vi.fn(async () => ({ eventId: "start-marker", xid8: "50" })) }))
+vi.mock("./root-task-history-chronology-witness.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("./root-task-history-chronology-witness.js")>()),
+  readRootTaskHistoryChronologyWitness: readWitness,
+}))
 
 type Row = Record<string, unknown>
 type Options = Readonly<{
@@ -17,6 +23,7 @@ type Options = Readonly<{
 
 function start(sequence = "20"): Row {
   return {
+    id: "start-parent",
     sessionId: "session-1", turnId: "turn-current", taskId: "root-current", itemId: null, sequence,
     type: "turn.started", actor: "orchestrator", correlationId: "turn-current",
     idempotencyKey: "turn:turn-current:event:turn-started", payload: { taskId: "root-current", rootTaskId: "root-current" },
@@ -162,11 +169,11 @@ describe("root task history current fence", () => {
     await expect(readRootTaskHistoryFence(nonrunning.client, nonrunning.input)).rejects.toThrow("root_task_history_current_root_fenced")
   })
 
-  it("derives the cross-session origin and DB cutoff from the persisted current Turn and start receipt", async () => {
+  it("derives the cross-session origin and validated start witness from the persisted Turn and receipt", async () => {
     const test = fixture({ turnInput: { goal: " Plan a role ", intent: { kind: "interactive_discovery_shortlist", version: 1 } } })
 
     await expect(readRootTaskHistoryFence(test.client, { ...test.input, crossSessionRootTaskHistoryEnabled: true })).resolves.toMatchObject({
-      currentStartSequence: 20n, currentStartCreatedAt: new Date("2026-10-07T12:00:00.000Z"),
+      currentStartSequence: 20n, currentStartWitness: { eventId: "start-marker", xid8: "50" },
       currentOrigin: JSON.stringify(["user", "interactive_discovery_shortlist", 1]), objectiveDigest: expect.any(String),
     })
     expect(rootTaskHistoryOrigin("user", { goal: "x" })).toBe(JSON.stringify(["user", "none"]))
@@ -222,12 +229,16 @@ describe("root task history current fence", () => {
     expect(rootTaskHistoryObjectiveDigest(inputFor({ schemaVersion: "bad", requirements: [] }), root)).toBeUndefined()
   })
 
-  it("fails closed on invalid origin or malformed start time and invalid requirements in every mode", async () => {
+  it("keeps same-session fencing when cross-session origin or start witness is unavailable", async () => {
     const unknownIntent = fixture({ turnInput: { goal: " Plan a role ", intent: { kind: "unknown", version: 1 } } })
-    await expect(readRootTaskHistoryFence(unknownIntent.client, { ...unknownIntent.input, crossSessionRootTaskHistoryEnabled: true })).resolves.toBeUndefined()
+    const unknownFence = await readRootTaskHistoryFence(unknownIntent.client, { ...unknownIntent.input, crossSessionRootTaskHistoryEnabled: true })
+    expect(unknownFence).toMatchObject({ currentStartSequence: 20n })
+    expect(unknownFence).not.toHaveProperty("currentStartWitness")
+    expect(unknownFence).not.toHaveProperty("currentOrigin")
 
     const malformedTime = fixture({ startRows: [{ ...start(), createdAt: "not-a-date" }] })
-    await expect(readRootTaskHistoryFence(malformedTime.client, { ...malformedTime.input, crossSessionRootTaskHistoryEnabled: true })).resolves.toBeUndefined()
+    await expect(readRootTaskHistoryFence(malformedTime.client, { ...malformedTime.input, crossSessionRootTaskHistoryEnabled: true }))
+      .resolves.toMatchObject({ currentStartWitness: { xid8: "50" } })
 
     const invalidRequirements = fixture({ turnInput: { goal: " Plan a role ", verificationRequirements: { schemaVersion: "bad", requirements: [] } } })
     await expect(readRootTaskHistoryFence(invalidRequirements.client, { ...invalidRequirements.input, crossSessionRootTaskHistoryEnabled: true })).resolves.toBeUndefined()

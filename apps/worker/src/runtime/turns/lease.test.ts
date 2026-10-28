@@ -23,6 +23,7 @@ function fakePool(rows: unknown[] = [row], sessionStatus = "running", sessionUse
   const client = {
     query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push([sql, params])
+      if (sql.includes("pg_current_xact_id")) return { rows: [{ xid8: "42" }], rowCount: 1 }
       if (sql.includes('SELECT session."userId"')) {
         return ["missing", "aborted", "archived"].includes(sessionStatus) ? { rows: [], rowCount: 0 } : { rows: [{ userId: sessionUserId }], rowCount: 1 }
       }
@@ -55,6 +56,7 @@ function noProgressReceiptPool(overrides: Partial<PersistedFailure> = {}) {
   const client = {
     query: vi.fn(async (sql: string, values?: unknown[]) => {
       calls.push([sql, values])
+      if (sql.includes("pg_current_xact_id")) return { rows: [{ xid8: "42" }], rowCount: 1 }
       if (sql.includes('SELECT session."id" FROM "agent_sessions"')) {
         return values?.[0] === persisted.sessionId && values?.[1] === persisted.userId
           ? { rows: [{ id: persisted.sessionId }], rowCount: 1 }
@@ -67,6 +69,24 @@ function noProgressReceiptPool(overrides: Partial<PersistedFailure> = {}) {
         const exactFailure = persisted.turnStatus === "failed" && persisted.turnError === "no_progress"
           && persisted.rootStatus === "failed" && persisted.rootFailureReason === "no_progress" && persisted.terminalEvents
         return sameIdentity && exactFailure ? { rows: [{ id: persisted.turnId }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      }
+      if (sql.includes('SELECT "rootTaskId" FROM "agent_turns"')) return { rows: [{ rootTaskId: "root-turn-1" }], rowCount: 1 }
+      if (sql.includes('FROM "agent_events"')) {
+        const event = { id: "event-turn-failed", sessionId: persisted.sessionId, turnId: persisted.turnId, taskId: "root-turn-1",
+          itemId: "final-item", sequence: "12", type: "turn.failed", actor: "orchestrator", correlationId: persisted.turnId,
+          causationId: "event-final", idempotencyKey: `turn:${persisted.turnId}:event:turn-failed:no_progress`,
+          payload: { turnId: persisted.turnId, taskId: "root-turn-1", errorCode: "no_progress", finalItemId: "final-item", final: {} } }
+        if (sql.includes('WHERE "id"=$1 AND "sessionId"=$2')) return values?.[0] === event.id ? { rows: [event], rowCount: 1 } : { rows: [], rowCount: 0 }
+        return values?.[2] === event.idempotencyKey ? { rows: [{ id: event.id }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      }
+      if (sql.includes('FROM "agent_outbox"')) {
+        const eventId = "event-turn-failed"
+        const outbox = { id: `agent-outbox-${eventId}`, topic: "agent.events", aggregateId: persisted.sessionId,
+          idempotencyKey: `agent-event:${eventId}`, payload: { eventId, sessionId: persisted.sessionId, turnId: persisted.turnId,
+            taskId: "root-turn-1", itemId: "final-item", sequence: "12", type: "turn.failed", actor: "orchestrator",
+            correlationId: persisted.turnId, causationId: "event-final", idempotencyKey: `turn:${persisted.turnId}:event:turn-failed:no_progress`,
+            payload: { turnId: persisted.turnId, taskId: "root-turn-1", errorCode: "no_progress", finalItemId: "final-item", final: {} } } }
+        return values?.[0] === outbox.idempotencyKey || values?.[1] === outbox.id ? { rows: [outbox], rowCount: 1 } : { rows: [], rowCount: 0 }
       }
       return { rows: [], rowCount: 1 }
     }),

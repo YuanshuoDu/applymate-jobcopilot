@@ -104,6 +104,10 @@ describe("V2 transcript projector", () => {
     ["agent.plan.discovery_persona_overflow", { rawValue: "PRIVATE_OVERFLOW_VALUE", observedFactCount: 33 }],
     ["agent.plan.root_task_history_session_authorization", { consentVersion: 12, enabled: true, snapshotKey: "PRIVATE_HISTORY_AUTHORIZATION_KEY" }],
     ["agent.plan.root_task_history_memory_snapshot", { snapshot: { id: "root-task-history", value: "PRIVATE_ROOT_TASK_HISTORY_VALUE" } }],
+    ["agent.plan.root_task_history_chronology_witness", {
+      schemaVersion: "agent-harness.v2.root-task-history-chronology-witness.v1", boundary: "turn_start",
+      boundaryEventId: "PRIVATE_CHRONOLOGY_BOUNDARY_EVENT", xid8: "90000000000000001",
+    }],
   ])("rejects transcript projection of private automatic-memory event %s", (type, payload) => {
     expect(() => projectV2EventToTranscript({ ...baseEvent, type, itemId: null, payload }))
       .toThrow("private_native_verification_event_not_projectable")
@@ -214,6 +218,12 @@ describe("V2 transcript projector", () => {
       type: "agent.plan.root_task_history_memory_snapshot",
       payload: { snapshot: { id: "root-task-history", value: "PRIVATE_ROOT_TASK_HISTORY_VALUE" } },
     }
+    const rootTaskHistoryChronologyEvent = {
+      ...baseEvent, id: "private-root-task-history-chronology-event", itemId: null,
+      type: "agent.plan.root_task_history_chronology_witness",
+      payload: { schemaVersion: "agent-harness.v2.root-task-history-chronology-witness.v1", boundary: "turn_start",
+        boundaryEventId: "PRIVATE_CHRONOLOGY_BOUNDARY_EVENT", xid8: "90000000000000001" },
+    }
     const finalRejectionEvent = {
       ...baseEvent,
       id: "public-final-rejection-event",
@@ -233,7 +243,7 @@ describe("V2 transcript projector", () => {
       agentEvent: { findMany: vi.fn().mockResolvedValue([
         privateEvent, clarificationEvent, reconciliationEvent, denialCheckpointEvent,
         discoverySnapshotEvent, discoveryOverflowEvent, rootTaskHistoryAuthorizationEvent,
-        rootTaskHistorySnapshotEvent, finalRejectionEvent, ordinaryEvent,
+        rootTaskHistorySnapshotEvent, rootTaskHistoryChronologyEvent, finalRejectionEvent, ordinaryEvent,
       ]) },
       agentTranscriptEvent: {
         findMany: vi.fn().mockResolvedValue([]),
@@ -261,10 +271,13 @@ describe("V2 transcript projector", () => {
     expect(serializedTranscriptRows).not.toContain("agent.plan.discovery_persona_overflow")
     expect(serializedTranscriptRows).not.toContain("agent.plan.root_task_history_session_authorization")
     expect(serializedTranscriptRows).not.toContain("agent.plan.root_task_history_memory_snapshot")
+    expect(serializedTranscriptRows).not.toContain("agent.plan.root_task_history_chronology_witness")
     expect(serializedTranscriptRows).not.toContain("PRIVATE_DISCOVERY_FACT_VALUE")
     expect(serializedTranscriptRows).not.toContain("PRIVATE_OVERFLOW_VALUE")
     expect(serializedTranscriptRows).not.toContain("PRIVATE_HISTORY_AUTHORIZATION_KEY")
     expect(serializedTranscriptRows).not.toContain("PRIVATE_ROOT_TASK_HISTORY_VALUE")
+    expect(serializedTranscriptRows).not.toContain("PRIVATE_CHRONOLOGY_BOUNDARY_EVENT")
+    expect(serializedTranscriptRows).not.toContain("90000000000000001")
     expect(serializedTranscriptRows).not.toContain("task-graph-denial-checkpoint.v1")
     expect(serializedTranscriptRows).not.toContain("private-event")
     expect(serializedTranscriptRows).not.toContain("PRIVATE_SCHEDULED_FINAL_CANDIDATE")
@@ -272,6 +285,7 @@ describe("V2 transcript projector", () => {
     expect(serializedTranscriptRows).not.toContain("private-reconciliation-event")
     expect(serializedTranscriptRows).not.toContain("private-root-task-history-authorization-event")
     expect(serializedTranscriptRows).not.toContain("private-root-task-history-snapshot-event")
+    expect(serializedTranscriptRows).not.toContain("private-root-task-history-chronology-event")
     expect(serializedTranscriptRows).not.toContain("private-steer-id")
     expect(serializedTranscriptRows).not.toContain("private-reconciliation-steer-input-sentinel")
     expect(serializedTranscriptRows).not.toContain("root-task-1")

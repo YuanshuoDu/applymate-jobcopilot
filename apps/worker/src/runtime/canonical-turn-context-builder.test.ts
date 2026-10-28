@@ -731,16 +731,16 @@ describe("canonical Turn context builder", () => {
     const database = checkedOutPool(), events: string[] = []
     const sameSession: ValidatedRootTaskHistoryOutcome = {
       sourceTurnId: "same-session-turn", sourceRootTaskId: "same-session-root", sourceSessionDiffers: false,
-      terminalSequence: 3n, terminalAt: new Date("2026-10-28T09:00:00Z"),
+      terminalSequence: 3n, terminalXid8: "3", terminalWitnessEventId: "same-session-witness",
       taskGraph: { revision: 1, nodes: [{ templateId: "analyst", status: "failed" }] } as unknown as TaskGraphCurrentState,
     }
     const crossSession: ValidatedRootTaskHistoryOutcome = {
       sourceTurnId: "cross-session-turn", sourceRootTaskId: "cross-session-root", sourceSessionDiffers: true,
-      terminalSequence: 2n, terminalAt: new Date("2026-10-28T10:00:00Z"),
+      terminalSequence: 2n, terminalXid8: "2", terminalWitnessEventId: "cross-session-witness",
       taskGraph: { revision: 1, nodes: [{ templateId: "analyst", status: "completed" }] } as unknown as TaskGraphCurrentState,
     }
-    const fence: RootTaskHistoryFence = { currentStartSequence: 20n, objectiveDigest: "a".repeat(64),
-      currentOrigin: JSON.stringify(["user", "none"]), currentStartCreatedAt: new Date("2026-10-28T11:00:00Z") }
+    const fence: RootTaskHistoryFence = { currentStartSequence: 20n, currentStartWitness: { eventId: "current-start", xid8: "20" },
+      objectiveDigest: "a".repeat(64), currentOrigin: JSON.stringify(["user", "none"]) }
     rootHistoryHarness.consentEnabled = true
     rootHistoryHarness.steerEvidence = { kind: "no_accepted_steer" }
     rootHistoryHarness.fence = fence
@@ -822,7 +822,7 @@ describe("canonical Turn context builder", () => {
     expect(rootHistoryHarness.loadedOutcomes).toEqual([crossSession])
     expect(rootHistoryHarness.snapshot).toHaveBeenCalledOnce()
     expect(history.historical).toBe(true)
-    expect(history.turns.map(turn => turn.nodes[0]?.status)).toEqual(["completed", "failed"])
+    expect(history.turns.map(turn => turn.nodes[0]?.status)).toEqual(["failed", "completed"])
     expect(database.calls.at(-1)?.sql).toBe("COMMIT")
     expect(database.client.release).toHaveBeenCalledOnce()
     expect(baseBuilder.buildInTransaction).toHaveBeenCalledOnce()
@@ -1063,7 +1063,7 @@ describe("canonical Turn context builder", () => {
 
     historyOutcomes = [{
       ...outcome, sourceTurnId: "PRIVATE_CROSS_SESSION_SOURCE_TURN", sourceRootTaskId: "PRIVATE_CROSS_SESSION_ROOT_ID",
-      terminalSequence: 18n, sourceSessionDiffers: true, terminalAt: new Date(now.getTime() - 60_000),
+      terminalSequence: 18n, terminalXid8: "18", terminalWitnessEventId: "challenge-terminal-witness", sourceSessionDiffers: true,
       // Challenge the final serializer fence with a footprint-bearing cross-session source.
       taskGraph: source.taskGraph,
     }]

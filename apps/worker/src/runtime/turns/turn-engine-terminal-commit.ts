@@ -12,6 +12,7 @@ import { STEERING_RECONCILIATION_BLOCKER, STEERING_RECONCILIATION_FEEDBACK } fro
 import { assertPlanningRootHasNoUnresolvedSteering } from "../subagents/pg-store-create.js"
 import { updateRootObjectiveHistoryProjection } from "../context/objective-history-projection.js"
 import { STEERING_MARKER_EVENT_TYPE, parseSteeringMarkerPayload, type SteeringMarkerPayload } from "../context/steering-marker.js"
+import { acquireRootTaskHistoryChronologyLock, appendRootTaskHistoryChronologyWitness, readRootTaskHistoryChronologyWitness } from "../context/root-task-history-chronology-witness.js"
 
 type Pool = Pick<pg.Pool, "connect">
 type Client = pg.PoolClient
@@ -145,6 +146,7 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
   const owner = input.owner
   if (owner.taskId !== owner.rootTaskId) throw conflict(`root task ${owner.taskId}`)
   return transaction(pool, owner.userId, async client => {
+    const chronologyLock = await acquireRootTaskHistoryChronologyLock(client, owner.userId)
     const session = await client.query<Row>(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 AND "status" NOT IN ('aborted', 'archived') FOR UPDATE`, [owner.sessionId, owner.userId])
     if (!session.rows[0]) throw conflict(`session ${owner.sessionId}`)
     const turn = await client.query<Row>(`SELECT turn."id", turn."status", turn."finalResponse", turn."source", turn."input" FROM "agent_turns" AS turn
@@ -239,6 +241,10 @@ export async function commitTurnTerminal(pool: Pool, input: TerminalInput, final
     const terminalEvent = saved[saved.length - 1]
     if (!terminalEvent || terminalEvent.type !== "turn.completed" || !(await updateRootObjectiveHistoryProjection(client,
       { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId }, { terminalEventId: terminalEvent.id }))) throw conflict(`terminal objective history ${owner.turnId}`)
+    const chronologyInput = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
+      rootTaskId: owner.rootTaskId, boundary: "root_terminal" as const, boundaryEventId: terminalEvent.id }
+    if (committed) await readRootTaskHistoryChronologyWitness(client, chronologyInput)
+    else await appendRootTaskHistoryChronologyWitness(client, chronologyInput, chronologyLock)
     return { status: "completed", finalItemId: input.finalItemId, events: saved }
   }, Boolean(finalizationGuard))
 }

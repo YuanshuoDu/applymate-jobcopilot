@@ -1,12 +1,22 @@
 import { Buffer } from "node:buffer"
 import type pg from "pg"
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "../subagents/task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-pg-verification.js"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 import { resolveRootTaskObjective } from "./root-task-objective.js"
 import { createPgDirectRootTaskHistoryStore, type DirectRootTaskHistoryLoadInput } from "./root-task-history-direct-store.js"
+
+const { readWitness } = vi.hoisted(() => ({ readWitness: vi.fn(async (_client: unknown, input: { boundary: string; boundaryEventId: string; turnId: string }) => {
+  if (input.boundary === "turn_start") return { eventId: "start-marker", xid8: "1000" }
+  const index = Number(input.turnId.replace("turn-source-", ""))
+  return { eventId: `witness-${input.turnId}`, xid8: String(100 + index) }
+}) }))
+vi.mock("./root-task-history-chronology-witness.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("./root-task-history-chronology-witness.js")>()),
+  readRootTaskHistoryChronologyWitness: readWitness,
+}))
 
 type Row = Record<string, unknown>
 type Options = Readonly<{
@@ -38,6 +48,8 @@ function candidate(index: number, terminalSequence = String(index * 2 + 2), stat
     startActor: "orchestrator", startCorrelationId: turnId, startIdempotencyKey: `turn:${turnId}:event:turn-started`,
     startPayload: { taskId: rootTaskId, rootTaskId }, startEventCount: 1,
     terminalCreatedAt: new Date(`2026-10-07T11:${String(index).padStart(2, "0")}:00.000Z`),
+    terminalEventId: `terminal-parent-turn-source-${index}`,
+    terminalWitnessEventId: `witness-turn-source-${index}`, terminalWitnessXid8: String(100 + index), terminalWitnessCount: 1,
     turnSource: "user", sourceSessionUserId: "user-1", sourceSessionStatus: "running",
   }
   if (status === "completed") return {
@@ -66,6 +78,7 @@ function candidate(index: number, terminalSequence = String(index * 2 + 2), stat
 
 function currentStart(sequence = "1000"): Row {
   return {
+    id: "start-parent",
     sessionId: "session-1", turnId: "turn-current", taskId: "root-current", itemId: null, sequence,
     type: "turn.started", actor: "orchestrator", correlationId: "turn-current",
     idempotencyKey: "turn:turn-current:event:turn-started", payload: { taskId: "root-current", rootTaskId: "root-current" },
@@ -106,9 +119,8 @@ function fixture(options: Options = {}) {
       if (sql.includes("WITH terminal_window AS MATERIALIZED")) {
         if (options.candidateError) throw options.candidateError
         const limit = Number(values?.[values.length - 1] ?? 0)
-        const rows = [...sourceRows].sort((left, right) => sql.includes('ORDER BY terminal."createdAt" DESC')
-          ? (right.terminalCreatedAt instanceof Date && left.terminalCreatedAt instanceof Date
-            ? right.terminalCreatedAt.getTime() - left.terminalCreatedAt.getTime() : 0) || String(right.turnId).localeCompare(String(left.turnId))
+        const rows = [...sourceRows].sort((left, right) => sql.includes('ORDER BY (roots."terminalWitnessXid8")::numeric DESC')
+          ? Number(BigInt(String(right.terminalWitnessXid8)) - BigInt(String(left.terminalWitnessXid8))) || String(right.turnId).localeCompare(String(left.turnId))
           : Number(BigInt(String(right.terminalSequence)) - BigInt(String(left.terminalSequence))))
         return { rows: rows.slice(0, limit) }
       }
@@ -182,7 +194,8 @@ describe("direct Root-task history PostgreSQL store", () => {
     const outcomes = await test.store.loadWithClient(test.client, test.input)
 
     expect(outcomes.map(value => value.sourceTurnId)).toEqual(["turn-source-1"])
-    expect(outcomes[0]).toMatchObject({ sourceSessionDiffers: false, terminalAt: new Date("2026-10-07T11:01:00.000Z") })
+    expect(outcomes[0]).not.toHaveProperty("sourceSessionDiffers")
+    expect(outcomes[0]).not.toHaveProperty("terminalAt")
     expect(test.connects).toBe(0)
     expect(test.queries.filter(query => query.sql.includes("current_setting('app.user_id'")).length).toBe(1)
     expect(test.queries.some(query => query.sql.includes("set_config"))).toBe(false)
@@ -327,7 +340,7 @@ describe("direct Root-task history PostgreSQL store", () => {
     expect(scan?.sql.slice(rootsJoin)).not.toContain("LIMIT $5")
   })
 
-  it("applies the same 64-candidate and 8-graph bounds to cross-session scans", async () => {
+  it("applies the 64-candidate and 8-graph bounds after numeric witness filtering", async () => {
     const candidates = Array.from({ length: 80 }, (_, index) => {
       const source = candidate(index + 1, String(index * 2 + 2))
       const sessionId = `session-cross-${index + 1}`
@@ -341,18 +354,18 @@ describe("direct Root-task history PostgreSQL store", () => {
 
     expect(outcomes).toHaveLength(8)
     expect(test.queries.filter(query => query.sql.includes('FROM "agent_items" AS item'))).toHaveLength(8)
-    const scan = test.queries.find(query => query.sql.includes("WITH terminal_window AS MATERIALIZED"))
-    const windowLimit = scan?.sql.indexOf("LIMIT $6") ?? -1
+    const scan = test.queries.find(query => query.sql.includes("(witness.payload->>'xid8')::numeric < $4::numeric"))
+    const windowLimit = scan?.sql.indexOf("LIMIT $9") ?? -1
     const rootsJoin = scan?.sql.indexOf("), roots AS (") ?? -1
-    expect(scan?.values?.[5]).toBe(64)
-    expect(scan?.sql).toContain('event."createdAt" < $4::timestamptz')
-    expect(scan?.sql).toContain('ORDER BY event."createdAt" DESC, event."turnId" DESC')
+    expect(scan?.values?.[8]).toBe(64)
+    expect(scan?.sql).toContain("(witness.payload->>'xid8')::numeric < $4::numeric")
+    expect(scan?.sql).toContain('ORDER BY (witness.payload->>\'xid8\')::numeric DESC, event."turnId" DESC')
     expect(windowLimit).toBeGreaterThanOrEqual(0)
     expect(windowLimit).toBeLessThan(rootsJoin)
     expect(scan?.sql.slice(rootsJoin)).not.toContain("LIMIT $5")
   })
 
-  it("uses DB-time order and source-session graph scope only under the server opt-in", async () => {
+  it("uses xid8 order and source-session graph scope only under the server opt-in", async () => {
     const newer = { ...candidate(3, "2000"), sessionId: "session-other", terminalStepSessionId: "session-other",
       terminalStepEventSessionId: "session-other", terminalCreatedAt: new Date("2026-10-07T11:50:00.000Z") }
     const older = { ...candidate(4, "3000"), sessionId: "session-third", terminalStepSessionId: "session-third",
@@ -364,15 +377,15 @@ describe("direct Root-task history PostgreSQL store", () => {
 
     const outcomes = await test.store.load(test.input)
 
-    expect(outcomes.map(value => value.sourceTurnId)).toEqual(["turn-source-3", "turn-source-4"])
-    const scan = test.queries.find(query => query.sql.includes("WITH terminal_window AS MATERIALIZED"))
+    expect(outcomes.map(value => value.sourceTurnId)).toEqual(["turn-source-4", "turn-source-3"])
+    const scan = test.queries.find(query => query.sql.includes("(witness.payload->>'xid8')::numeric < $4::numeric"))
     expect(scan?.sql).toContain('source_session."status" NOT IN (\'aborted\', \'archived\')')
-    expect(scan?.sql).toContain('event."createdAt" < $4::timestamptz')
-    expect(scan?.sql).toContain('ORDER BY event."createdAt" DESC, event."turnId" DESC')
+    expect(scan?.sql).toContain("(witness.payload->>'xid8')::numeric < $4::numeric")
+    expect(scan?.sql).toContain('ORDER BY (witness.payload->>\'xid8\')::numeric DESC, event."turnId" DESC')
     const graphReads = test.queries.filter(query => query.sql.includes('FROM "agent_items" AS item'))
-    expect(graphReads.map(query => query.values?.[1])).toEqual(["session-other", "session-third"])
+    expect(graphReads.map(query => query.values?.[1])).toEqual(["session-third", "session-other"])
     expect(test.queries.filter(query => query.sql.includes("FOR SHARE SKIP LOCKED")).map(query => query.values))
-      .toEqual([["session-other", "user-1"], ["session-third", "user-1"]])
+      .toEqual([["session-third", "user-1"], ["session-other", "user-1"]])
   })
 
   it.each(["archived", "aborted"] as const)("skips a source session locked after selection or changed to %s", async status => {

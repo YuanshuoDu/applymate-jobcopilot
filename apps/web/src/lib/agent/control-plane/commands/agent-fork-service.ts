@@ -15,6 +15,7 @@ const NON_INHERITABLE_PRIVATE_EVENTS = new Set([
   "agent.plan.discovery_persona_overflow",
   "agent.plan.root_task_history_session_authorization",
   "agent.plan.root_task_history_memory_snapshot",
+  "agent.plan.root_task_history_chronology_witness",
 ])
 
 function json(value: unknown): Prisma.InputJsonValue {

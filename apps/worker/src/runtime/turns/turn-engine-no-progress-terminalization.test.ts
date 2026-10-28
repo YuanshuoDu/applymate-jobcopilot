@@ -26,25 +26,72 @@ const denial = {
 const response = JSON.stringify({ completed: false, terminalReason: "no_progress", response: "safe stop" })
 const checkpoint: TaskGraphDenialCheckpoint = { schemaVersion: TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA, taskId: owner.rootTaskId, graphRevision: 3, verificationDigest: "a".repeat(64) }
 
-function fixture(input: { pending?: boolean; staleStepFence?: boolean; readCheckpoint?: (client?: TurnEngineQueryClient) => Promise<TaskGraphDenialCheckpoint | null> } = {}) {
+function fixture(input: { pending?: boolean; staleStepFence?: boolean; differentConsumedInputs?: boolean
+  readCheckpoint?: (client?: TurnEngineQueryClient) => Promise<TaskGraphDenialCheckpoint | null> } = {}) {
   const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
+  const events = new Map<string, Record<string, unknown>>()
+  const outboxes = new Map<string, Record<string, unknown>>()
+  const startEvent = { id: "step-start-event", sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.taskId,
+    itemId: null, sequence: "8", type: "step.started", actor: "orchestrator", correlationId: denial.stepId,
+    causationId: null, idempotencyKey: `turn:${owner.turnId}:event:step-started:${denial.stepId}`,
+    payload: { stepId: denial.stepId, taskId: owner.taskId } }
   const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
     calls.push({ sql, values })
     if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
+    if (sql.includes("pg_advisory_xact_lock")) return { rows: [], rowCount: 1 }
+    if (sql.includes("pg_current_xact_id")) return { rows: [{ xid8: "77" }], rowCount: 1 }
     if (sql.includes(SESSION_WORK_ADMISSION)) return { rows: [{ id: owner.sessionId }], rowCount: 1 }
     if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: owner.sessionId }], rowCount: 1 }
     if (sql.includes('SELECT turn."id"')) return { rows: [{ id: owner.turnId }], rowCount: 1 }
     if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ id: owner.taskId, status: "running", leaseOwner: owner.ownerId, attemptCount: 1, interruptRequestedAt: null }], rowCount: 1 }
-    if (sql.includes('FROM "agent_steps"')) return { rows: [{ status: "streaming", inputThroughSequence: input.staleStepFence ? "7" : "8", consumedInputIds: ["input-8"] }], rowCount: 1 }
+    if (sql.includes('FROM "agent_steps"')) return { rows: [{ status: "streaming", inputThroughSequence: input.staleStepFence ? "7" : "8",
+      consumedInputIds: input.differentConsumedInputs ? ["different-input"] : ["input-8"] }], rowCount: 1 }
     if (sql.includes('FROM "agent_inputs"')) return input.pending ? { rows: [{ id: "accepted-9" }], rowCount: 1 } : { rows: [], rowCount: 0 }
-    if (sql.includes('FROM "agent_events"')) return { rows: [{ id: "step-start-event" }], rowCount: 1 }
+    if (sql.includes('FROM "agent_events"')) {
+      if (sql.includes('WHERE "id"=$1 AND "sessionId"=$2')) {
+        const row = [...events.values()].find(event => event.id === values?.[0] && event.sessionId === values?.[1]
+          && event.turnId === values?.[2] && event.taskId === values?.[3])
+        return { rows: row ? [row] : [], rowCount: row ? 1 : 0 }
+      }
+      if (values?.length === 3 && values[2] === startEvent.idempotencyKey) return { rows: [startEvent], rowCount: 1 }
+      const row = [...events.values()].find(event => event.idempotencyKey === values?.[0] || event.id === values?.[1])
+      return { rows: row ? [row] : [], rowCount: row ? 1 : 0 }
+    }
+    if (sql.includes('FROM "agent_outbox"')) {
+      const row = [...outboxes.values()].find(event => event.idempotencyKey === values?.[0] || event.id === values?.[1])
+      return { rows: row ? [row] : [], rowCount: row ? 1 : 0 }
+    }
+    if (sql.includes('UPDATE "agent_sessions"')) return { rows: [{ eventSequence: "20" }], rowCount: 1 }
+    if (sql.includes('INSERT INTO "agent_events"')) {
+      const [id, sessionId, turnId, taskId, sequence, type, causationId, idempotencyKey, payload] = values ?? []
+      events.set(String(idempotencyKey), { id, sessionId, turnId, taskId, itemId: null, sequence, type, actor: "orchestrator",
+        correlationId: taskId, causationId, idempotencyKey, payload: JSON.parse(String(payload)) })
+      return { rows: [], rowCount: 1 }
+    }
+    if (sql.includes('INSERT INTO "agent_outbox"')) {
+      const [id, topic, aggregateId, idempotencyKey, payload] = values ?? []
+      outboxes.set(String(idempotencyKey), { id, topic, aggregateId, idempotencyKey, payload: JSON.parse(String(payload)) })
+      return { rows: [], rowCount: 1 }
+    }
     if (sql.includes('INSERT INTO "agent_items"')) return { rows: [{ id: denial.finalItemId }], rowCount: 1 }
     return { rows: [], rowCount: 1 }
   }), release: vi.fn() }
   const pool = { connect: vi.fn(async () => client) } as unknown as TurnEnginePool
-  const appendEvents = vi.fn(async (_pool: TurnEnginePool, events: readonly TurnEngineEventInput[], _client: TurnEngineQueryClient) => events.map((event, index) => ({ id: `event-${index + 1}` })))
+  const appendEvents = vi.fn(async (_pool: TurnEnginePool, inputs: readonly TurnEngineEventInput[], _client: TurnEngineQueryClient) => inputs.map((event, index) => {
+    const id = `event-${index + 1}`
+    const row = { id, sessionId: event.owner.sessionId, turnId: event.owner.turnId, taskId: event.owner.taskId, itemId: event.itemId,
+      sequence: String(9 + index), type: event.type, actor: "orchestrator", correlationId: event.correlationId,
+      causationId: event.causationId, idempotencyKey: event.idempotencyKey, payload: event.payload }
+    events.set(event.idempotencyKey, row)
+    const key = `agent-event:${id}`
+    outboxes.set(key, { id: `agent-outbox-${id}`, topic: "agent.events", aggregateId: event.owner.sessionId, idempotencyKey: key,
+      payload: { eventId: id, sessionId: event.owner.sessionId, turnId: event.owner.turnId, taskId: event.owner.taskId, itemId: event.itemId,
+        sequence: String(9 + index), type: event.type, actor: "orchestrator", correlationId: event.correlationId,
+        causationId: event.causationId, idempotencyKey: event.idempotencyKey, payload: event.payload } })
+    return { id }
+  }))
   const readCheckpoint = vi.fn(input.readCheckpoint ?? (async () => checkpoint))
-  return { pool, client, calls, appendEvents, readCheckpoint }
+  return { pool, client, calls, events, outboxes, appendEvents, readCheckpoint }
 }
 
 function withCheckpoint(readCheckpoint: (client?: TurnEngineQueryClient) => Promise<TaskGraphDenialCheckpoint | null>): AtomicTurnNoProgressInput {
@@ -86,7 +133,7 @@ describe("atomic no-progress terminalization", () => {
     expect(JSON.stringify({ result, final, finalItemContent, events })).not.toContain(privateValue)
   })
 
-  it.each([{ pending: true }, { staleStepFence: true }])("returns input_changed without terminal writes when the input or Step fence changed", async race => {
+  it.each([{ pending: true }, { staleStepFence: true }, { differentConsumedInputs: true }])("returns input_changed without terminal writes when the input or Step fence changed", async race => {
     const fake = fixture(race)
     await expect(commitTurnNoProgress(fake.pool, owner, response, now, withCheckpoint(fake.readCheckpoint), fake.appendEvents)).resolves.toEqual({ status: "input_changed" })
     expect(fake.appendEvents).not.toHaveBeenCalled()
@@ -111,7 +158,7 @@ describe("atomic no-progress terminalization", () => {
       .rejects.toMatchObject({ name: "TurnEnginePersistenceConflict" })
     expect(fake.pool.connect).not.toHaveBeenCalled()
   })
-  it("fails the owned Turn and exact root, cancels follow-ups, and runs graph cleanup in the same transaction", async () => {
+  it("accepts the matching Step input checkpoint, then fails the owned Turn and root atomically", async () => {
     const fake = fixture()
     const terminal = await commitTurnNoProgress(fake.pool, owner, response, now, withCheckpoint(fake.readCheckpoint), fake.appendEvents)
     if (terminal.status !== "no_progress") throw new Error("Expected a no-progress receipt")
@@ -132,6 +179,16 @@ describe("atomic no-progress terminalization", () => {
     expect(cleanupIndex).toBeGreaterThan(turnUpdateIndex)
     expect(cleanupMock).toHaveBeenCalledWith(fake.client, expect.objectContaining({ id: owner.taskId, rootTaskId: owner.taskId }), { kind: "terminal-failed-turn-recovery" }, now)
     expect(fake.readCheckpoint).toHaveBeenCalledWith(fake.client)
+    const checkpointRead = fake.calls.find(({ sql }) => sql.includes('SELECT "status", "inputThroughSequence", "consumedInputIds"'))
+    expect(checkpointRead?.values).toEqual([denial.stepId, owner.sessionId, owner.turnId, owner.taskId])
+    const chronologyLock = fake.calls.findIndex(({ sql }) => sql.includes("pg_advisory_xact_lock"))
+    const chronologyXid = fake.calls.findIndex(({ sql }) => sql.includes("pg_current_xact_id"))
+    const sessionLock = fake.calls.findIndex(({ sql }) => sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE"))
+    const witness = [...fake.events.values()].find(event => event.type === "agent.plan.root_task_history_chronology_witness")
+    expect(chronologyLock).toBeLessThan(chronologyXid)
+    expect(chronologyXid).toBeLessThan(sessionLock)
+    expect(witness?.payload).toMatchObject({ boundary: "root_terminal", boundaryEventId: "event-5", xid8: "77" })
+    expect(fake.outboxes.size).toBe(6)
     const graphReadOrder = fake.readCheckpoint.mock.invocationCallOrder[0]!
     const rootLockOrder = fake.client.query.mock.invocationCallOrder[fake.calls.findIndex(({ sql }) => sql.includes('SELECT "id","status","leaseOwner"'))]!
     const firstWriteOrder = fake.client.query.mock.invocationCallOrder[fake.calls.findIndex(({ sql }) => sql.includes('INSERT INTO "agent_items"'))]!

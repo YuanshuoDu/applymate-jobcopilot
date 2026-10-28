@@ -6,25 +6,23 @@ import type { ValidatedRootTaskHistoryOutcome } from "./root-task-history.js"
 import type { RootTaskHistoryFence } from "./root-task-history-fence.js"
 import type { RootTaskHistorySessionAuthorization } from "./root-task-history-session-memory.js"
 import { ROOT_TASK_HISTORY_MEMORY_SNAPSHOT_EVENT_TYPE } from "./root-task-history-session-memory.js"
+import { createRootTaskHistoryObjectiveSnapshotIdentity, rootTaskHistoryObjectiveSnapshotKey } from "./root-task-history-objective-snapshot-codec.js"
 import {
   ROOT_TASK_HISTORY_OBJECTIVE_SNAPSHOT_EVENT_TYPE, withRootTaskHistoryObjectiveSnapshot,
   type RootTaskHistoryObjectiveSnapshotInput,
 } from "./root-task-history-objective-snapshot.js"
 
-const fence: RootTaskHistoryFence = { currentStartSequence: 5n, currentStartCreatedAt: new Date("2026-10-28T12:00:00Z"),
+const fence: RootTaskHistoryFence = { currentStartSequence: 5n, currentStartWitness: { eventId: "start-witness", xid8: "100" },
   objectiveDigest: "c".repeat(64), currentOrigin: '["user","none"]' }
 const authorization: RootTaskHistorySessionAuthorization = { eventId: "authorization-event-1", sessionId: "session-1", userId: "user-1",
-  consentVersion: 4, consentEnabled: true, gateEnabledAtCapture: false }
+  consentVersion: 4, consentEnabled: true, gateEnabledAtCapture: true }
 const outcome: ValidatedRootTaskHistoryOutcome = { sourceTurnId: "old-turn", sourceRootTaskId: "old-root", terminalSequence: 30n,
-  terminalAt: new Date("2026-10-27T10:00:00Z"), sourceSessionDiffers: true,
+  terminalXid8: "50", terminalWitnessEventId: "terminal-witness-old", sourceSessionDiffers: true,
   taskGraph: { revision: 1, nodes: [{ templateId: "scout", status: "completed", goal: "PRIVATE GOAL", discoveryQueryFootprint: { location: "PRIVATE LOCATION" } }] } as unknown as ValidatedRootTaskHistoryOutcome["taskGraph"] }
 const key = (input: RootTaskHistoryObjectiveSnapshotInput) => {
-  const id = JSON.stringify({ schemaVersion: "agent-harness.v2.root-task-history-objective-snapshot.v1", sessionId: input.lease.sessionId,
-    userId: input.lease.userId, authorizationEventId: input.authorization.eventId, consentVersion: input.authorization.consentVersion,
-    gateEnabledAtCapture: input.authorization.gateEnabledAtCapture, objectiveDigest: input.fence.objectiveDigest,
-    canonicalOrigin: input.fence.currentOrigin, intentKind: null, intentVersion: null, acceptedInputRevision: input.acceptedInputRevision.toString(),
-    steerEvidence: "no_accepted_steer" })
-  return `root-task-history-objective-snapshot:${input.lease.sessionId}:${createHash("sha256").update(id, "utf8").digest("hex")}:v1`
+  const identity = createRootTaskHistoryObjectiveSnapshotIdentity(input)
+  if (!identity) throw new Error("Expected an eligible objective snapshot identity")
+  return rootTaskHistoryObjectiveSnapshotKey(identity)
 }
 const eventId = (value: string) => `agent-root-task-history-${createHash("sha256").update(value).digest("hex")}`
 
@@ -166,7 +164,7 @@ describe("root task history objective snapshot", () => {
     const orphanKey = key(input(orphanFake.client)), orphanId = eventId(orphanKey)
     orphanFake.outboxes.push({ id: `agent-outbox-${orphanId}`, topic: "agent.events", aggregateId: "session-1",
       idempotencyKey: `agent-event:${orphanId}`, payload: {} })
-    const sourceFuture = { ...outcome, terminalAt: new Date("2026-10-28T12:00:00Z") }
+    const sourceFuture = { ...outcome, terminalXid8: "100", terminalWitnessEventId: "terminal-witness-current" }
     await expect(withRootTaskHistoryObjectiveSnapshot(input(orphanFake.client, vi.fn(async () => [sourceFuture]))))
       .rejects.toMatchObject({ code: "persistence_conflict" })
   })

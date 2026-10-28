@@ -8,7 +8,12 @@ import { withRootTaskHistorySessionAuthorization, type AuthorizedRootTaskHistory
 import { createPgInputClaimStore, createPgInputClaimTransaction } from "./input-claim-store.js"
 import { StepContextBuilder } from "./step-context-builder.js"
 import { readRootTaskHistorySteerEvidence } from "./root-task-history-steer-evidence.js"
-import type { TurnLease } from "../turns/lease.js"
+import { executionOwnerFence, type TurnExecutionOwnerFence } from "../execution-owner.js"
+import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
+import { releaseTurnLease, type TurnLease } from "../turns/lease.js"
+import { readRootTaskHistoryChronologyWitness } from "./root-task-history-chronology-witness.js"
+import { readRootTaskHistoryFence, type RootTaskHistoryFenceInput } from "./root-task-history-fence.js"
+import { readRootTaskHistoryCandidates } from "./root-task-history-source-store.js"
 
 type WebPrisma = {
   $connect(): Promise<void>; $disconnect(): Promise<void>
@@ -185,6 +190,163 @@ function deferred<T>() {
   return { promise, resolve }
 }
 
+type PgGate = {
+  sessionId: string
+  point: "after_begin" | "before_commit"
+  reached: ReturnType<typeof deferred<void>>
+  resume: ReturnType<typeof deferred<void>>
+  rollbackOnCommit?: boolean
+  inspection?: ReturnType<typeof deferred<{ events: string; outboxes: string; eventSequence: string } | undefined>>
+}
+
+function testPool(applicationName: string, gate?: PgGate): Pick<Pool, "connect"> {
+  return {
+    async connect() {
+      const client = await pool!.connect()
+      await client.query("SELECT set_config('application_name',$1,false)", [applicationName])
+      let gated = false
+      const query = (...args: Parameters<PoolClient["query"]>) => {
+        const sql = typeof args[0] === "string" ? args[0] : ""
+        if (!gate || gated || !(gate.point === "after_begin" ? sql.startsWith("BEGIN") : sql === "COMMIT")) {
+          return client.query(...args)
+        }
+        gated = true
+        if (gate.point === "after_begin") return (async () => {
+          const result = await client.query(...args)
+          gate.reached.resolve()
+          await gate.resume.promise
+          return result
+        })()
+        return (async () => {
+          if (gate.rollbackOnCommit) {
+            const state = await client.query<{ events: string; outboxes: string; eventSequence: string }>(`SELECT
+              (SELECT COUNT(*)::text FROM "agent_events" WHERE "sessionId"=$1 AND "type"='agent.plan.root_task_history_chronology_witness'
+                AND "payload"->>'boundary'='root_terminal') AS events,
+              (SELECT COUNT(*)::text FROM "agent_outbox" WHERE "aggregateId"=$1 AND "topic"='agent.events'
+                AND "payload"->'payload'->>'boundary'='root_terminal') AS outboxes,
+              (SELECT "eventSequence"::text FROM "agent_sessions" WHERE "id"=$1) AS "eventSequence"`, [gate.sessionId])
+            gate.inspection?.resolve(state.rows[0])
+            await client.query("ROLLBACK")
+            gate.reached.resolve()
+            throw new Error("intentional chronology transaction rollback")
+          }
+          gate.reached.resolve()
+          await gate.resume.promise
+          return client.query(...args)
+        })()
+      }
+      return new Proxy(client, {
+        get(target, property) {
+          if (property === "query") return query
+          const value: unknown = Reflect.get(target, property, target)
+          return typeof value === "function" ? value.bind(target) : value
+        },
+      })
+    },
+  }
+}
+
+function turnOwner(fixture: Fixture): TurnExecutionOwnerFence {
+  const owner = executionOwnerFence({ kind: "turn", taskId: fixture.rootTaskId, lease: fixture.lease })
+  if (owner.kind !== "turn") throw new Error("Expected a Turn execution owner")
+  return owner
+}
+
+async function appendRootTurnStarted(fixture: Fixture, writerPool = testPool(workerApplication)) {
+  const key = `turn:${fixture.turnId}:event:turn-started`
+  return createPgTurnEngineStore(writerPool as never).appendEvent({
+    owner: turnOwner(fixture), id: key, itemId: null, type: "turn.started", correlationId: fixture.turnId,
+    causationId: null, idempotencyKey: key,
+    payload: { goal: "History consent integration", taskId: fixture.rootTaskId, rootTaskId: fixture.rootTaskId },
+  })
+}
+
+async function prepareCompletedStep(fixture: Fixture, writerPool = testPool(workerApplication)) {
+  const store = createPgTurnEngineStore(writerPool as never), owner = turnOwner(fixture)
+  const started = await appendRootTurnStarted(fixture, writerPool)
+  const stepStartedKey = `turn:${fixture.turnId}:event:step-started:${fixture.stepId}`
+  const stepStarted = await store.appendEvent({
+    owner, id: stepStartedKey, itemId: null, type: "step.started", correlationId: fixture.stepId,
+    causationId: started.id, idempotencyKey: stepStartedKey,
+    payload: { stepId: fixture.stepId, ordinal: 1, taskId: fixture.rootTaskId },
+  })
+  const now = new Date()
+  await store.updateStep({ owner, stepId: fixture.stepId, status: "completed", finishReason: "stop", errorCode: null,
+    inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0, now })
+  const stepCompletedKey = `turn:${fixture.turnId}:event:step-completed:${fixture.stepId}`
+  await store.appendEvent({
+    owner, id: stepCompletedKey, itemId: null, type: "step.completed", correlationId: fixture.stepId,
+    causationId: stepStarted.id, idempotencyKey: stepCompletedKey,
+    payload: { stepId: fixture.stepId, status: "completed", taskId: fixture.rootTaskId },
+  })
+  return { store, owner, now }
+}
+
+async function recordSuccessfulTerminal(fixture: Fixture, store: ReturnType<typeof createPgTurnEngineStore>, owner: ReturnType<typeof turnOwner>, now: Date) {
+  const result = await store.recordFinalResponse({
+    owner, response: JSON.stringify({ response: "Terminal history fixture" }), now,
+    terminal: { stepId: fixture.stepId, finalItemId: `history-final-${fixture.turnId}`,
+      finalContent: { text: "Terminal history fixture" }, stepCount: 1, toolCallCount: 0,
+      usage: { inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0 } },
+  })
+  if (!result || result.status !== "completed") throw new Error("Root TaskGraph terminal writer did not complete")
+  const terminal = result.events.find(event => event.type === "turn.completed")
+  if (!terminal) throw new Error("Root TaskGraph terminal event is missing")
+  return terminal.id
+}
+
+async function completeRootTurn(fixture: Fixture, writerPool = testPool(workerApplication)) {
+  const { store, owner, now } = await prepareCompletedStep(fixture, writerPool)
+  return { eventId: await recordSuccessfulTerminal(fixture, store, owner, now), store, owner, now }
+}
+
+async function readCrossSessionCandidates(fixture: Fixture) {
+  const input: RootTaskHistoryFenceInput = {
+    lease: fixture.lease, rootTaskId: fixture.rootTaskId, rootAttemptCount: 1, stepId: fixture.stepId,
+    now: new Date(), crossSessionRootTaskHistoryEnabled: true,
+  }
+  const result = await withContextTransaction(fixture, async (client, _authorization, allowed) => {
+    if (!allowed) throw new Error("Chronology fixture lacks history consent")
+    const fence = await readRootTaskHistoryFence(client, input)
+    if (!fence) throw new Error("Current Root TaskGraph history fence is missing")
+    return { fence, candidates: await readRootTaskHistoryCandidates(client, input, fence) }
+  })
+  return result.workResult
+}
+
+async function readChronologyWitness(input: {
+  userId: string; sessionId: string; turnId: string; rootTaskId: string
+  boundary: "turn_start" | "root_terminal"; boundaryEventId: string
+}) {
+  const client = await pool!.connect()
+  try {
+    await client.query("BEGIN ISOLATION LEVEL READ COMMITTED")
+    await client.query("SELECT set_config('app.user_id',$1,true)", [input.userId])
+    const result = await readRootTaskHistoryChronologyWitness(client, input)
+    await client.query("COMMIT")
+    return result
+  } catch (error: unknown) {
+    await client.query("ROLLBACK").catch(() => undefined)
+    throw error
+  } finally { client.release() }
+}
+
+async function setMatchingHistoryObjective(fixture: Fixture): Promise<void> {
+  await pool!.query(`UPDATE "sub_agent_tasks" SET "successCriteria"=$2::jsonb
+    WHERE "id"=$1 AND "sessionId"=$3 AND "turnId"=$4`,
+  [fixture.rootTaskId, JSON.stringify(["Find roles matching the candidate's engineering experience"]), fixture.sessionId, fixture.turnId])
+}
+
+async function chronologyState(sessionId: string) {
+  const result = await pool!.query<{ events: string; outboxes: string; eventSequence: string }>(`SELECT
+    (SELECT COUNT(*)::text FROM "agent_events" WHERE "sessionId"=$1 AND "type"='agent.plan.root_task_history_chronology_witness'
+      AND "payload"->>'boundary'='root_terminal') AS events,
+    (SELECT COUNT(*)::text FROM "agent_outbox" WHERE "aggregateId"=$1 AND "topic"='agent.events'
+      AND "payload"->'payload'->>'boundary'='root_terminal') AS outboxes,
+    (SELECT "eventSequence"::text FROM "agent_sessions" WHERE "id"=$1) AS "eventSequence"`, [sessionId])
+  return result.rows[0]
+}
+
 async function countMarkers(sessionId: string) {
   const rows = await pool!.query<{ events: string; outboxes: string; eventSequence: string }>(`SELECT
     (SELECT COUNT(*)::text FROM "agent_events" WHERE "sessionId"=$1 AND "type"='agent.plan.root_task_history_session_authorization') AS events,
@@ -326,5 +488,183 @@ describePg("root task history Session authorization PostgreSQL serialization", (
       release.resolve()
       await Promise.allSettled([current, ...(acceptance ? [acceptance] : [])])
     }
+  })
+
+  it("orders a committed source terminal before a waiting current start and includes the outcome", async () => {
+    const userId = await createUser()
+    const sourceSession = await createSession(userId), currentSession = await createSession(userId)
+    const source = await createTurn(userId, sourceSession), current = await createTurn(userId, currentSession)
+    await Promise.all([setMatchingHistoryObjective(source), setMatchingHistoryObjective(current)])
+    await setConsent(userId, true, 0)
+    const prepared = await prepareCompletedStep(source)
+    const sourceApp = `history-chrono-terminal-${suffix}`, currentApp = `history-chrono-start-${suffix}`
+    const gate: PgGate = { sessionId: source.sessionId, point: "before_commit", reached: deferred<void>(), resume: deferred<void>() }
+    const terminalStore = createPgTurnEngineStore(testPool(sourceApp, gate) as never)
+    const terminal = recordSuccessfulTerminal(source, terminalStore, prepared.owner, new Date())
+    try {
+      await gate.reached.promise
+      const currentStart = appendRootTurnStarted(current, testPool(currentApp))
+      await waitForAdvisoryWait(currentApp)
+      gate.resume.resolve()
+      const [terminalEventId, startEvent] = await Promise.all([terminal, currentStart])
+      const history = await readCrossSessionCandidates(current)
+      expect(history.fence.currentStartWitness).toBeDefined()
+      expect(history.candidates.map(candidate => candidate.turnId)).toContain(source.turnId)
+      const candidate = history.candidates.find(value => value.turnId === source.turnId)
+      expect(BigInt(candidate?.terminalXid8 ?? "0")).toBeLessThan(BigInt(history.fence.currentStartWitness!.xid8))
+      expect(await readChronologyWitness({ userId, sessionId: source.sessionId, turnId: source.turnId,
+        rootTaskId: source.rootTaskId, boundary: "root_terminal", boundaryEventId: terminalEventId })).toMatchObject({ eventId: expect.any(String) })
+      expect(startEvent.id).toBeTruthy()
+    } finally {
+      gate.resume.resolve()
+      await Promise.allSettled([terminal])
+    }
+  })
+
+  it("excludes a late source terminal whose stale transaction timestamp is earlier", async () => {
+    const userId = await createUser()
+    const sourceSession = await createSession(userId), currentSession = await createSession(userId)
+    const source = await createTurn(userId, sourceSession), current = await createTurn(userId, currentSession)
+    await Promise.all([setMatchingHistoryObjective(source), setMatchingHistoryObjective(current)])
+    await setConsent(userId, true, 0)
+    const prepared = await prepareCompletedStep(source)
+    const sourceApp = `history-chrono-late-terminal-${suffix}`, currentApp = `history-chrono-winning-start-${suffix}`
+    const gate: PgGate = { sessionId: source.sessionId, point: "after_begin", reached: deferred<void>(), resume: deferred<void>() }
+    const terminalStore = createPgTurnEngineStore(testPool(sourceApp, gate) as never)
+    const terminal = recordSuccessfulTerminal(source, terminalStore, prepared.owner, new Date())
+    try {
+      await gate.reached.promise
+      await new Promise(resolve => setTimeout(resolve, 25))
+      const currentStart = await appendRootTurnStarted(current, testPool(currentApp))
+      gate.resume.resolve()
+      const terminalEventId = await terminal
+      const history = await readCrossSessionCandidates(current)
+      expect(history.fence.currentStartWitness).toBeDefined()
+      expect(history.candidates.map(candidate => candidate.turnId)).not.toContain(source.turnId)
+      const terminalWitness = await readChronologyWitness({ userId, sessionId: source.sessionId, turnId: source.turnId,
+        rootTaskId: source.rootTaskId, boundary: "root_terminal", boundaryEventId: terminalEventId })
+      expect(terminalWitness).toBeDefined()
+      expect(BigInt(terminalWitness!.xid8)).toBeGreaterThan(BigInt(history.fence.currentStartWitness!.xid8))
+      const times = await pool!.query<{ terminalAt: Date; currentStartAt: Date }>(`SELECT terminal."createdAt" AS "terminalAt",
+        started."createdAt" AS "currentStartAt" FROM "agent_events" AS terminal, "agent_events" AS started
+        WHERE terminal."id"=$1 AND started."id"=$2`, [terminalEventId, currentStart.id])
+      expect(times.rows[0]?.terminalAt.getTime()).toBeLessThan(times.rows[0]?.currentStartAt.getTime() ?? 0)
+    } finally {
+      gate.resume.resolve()
+      await Promise.allSettled([terminal])
+    }
+  })
+
+  it("keeps generic failure history ineligible until release writes its terminal witness", async () => {
+    const userId = await createUser()
+    const sourceSession = await createSession(userId), currentSession = await createSession(userId)
+    const source = await createTurn(userId, sourceSession), current = await createTurn(userId, currentSession)
+    await Promise.all([setMatchingHistoryObjective(source), setMatchingHistoryObjective(current)])
+    await setConsent(userId, true, 0)
+    await appendRootTurnStarted(source)
+    const failureKey = `turn:${source.turnId}:event:turn-failed:provider_error`
+    await createPgTurnEngineStore(testPool(workerApplication) as never).appendEvent({
+      owner: turnOwner(source), id: failureKey, itemId: null, type: "turn.failed", correlationId: source.turnId,
+      causationId: null, idempotencyKey: failureKey,
+      payload: { turnId: source.turnId, taskId: source.rootTaskId, errorCode: "provider_error", finalItemId: null },
+    })
+    const failedAt = new Date()
+    await pool!.query(`UPDATE "sub_agent_tasks" SET "status"='failed',"failureReason"='provider_error',"result"=$1::jsonb,
+      "leaseOwner"=NULL,"leaseExpiresAt"=NULL,"completedAt"=$2,"updatedAt"=$2
+      WHERE "id"=$3 AND "sessionId"=$4 AND "turnId"=$5 AND "rootTaskId"=$3 AND "status"='running'`,
+    [JSON.stringify({ status: "failed", stepCount: 1, toolCallCount: 0, finalItemId: null, waitId: null }), failedAt,
+      source.rootTaskId, source.sessionId, source.turnId])
+    const pending = await pool!.query<{ turnStatus: string; rootStatus: string; failureEvents: string }>(`SELECT turn."status" AS "turnStatus",
+      root."status" AS "rootStatus", (SELECT COUNT(*)::text FROM "agent_events" AS event WHERE event."sessionId"=turn."sessionId"
+        AND event."turnId"=turn."id" AND event."taskId"=root."id" AND event."type"='turn.failed') AS "failureEvents"
+      FROM "agent_turns" AS turn JOIN "sub_agent_tasks" AS root ON root."id"=turn."rootTaskId"
+      WHERE turn."id"=$1 AND turn."sessionId"=$2`, [source.turnId, source.sessionId])
+    expect(pending.rows[0]).toMatchObject({ turnStatus: "in_progress", rootStatus: "failed", failureEvents: "1" })
+    expect(await readChronologyWitness({ userId, sessionId: source.sessionId, turnId: source.turnId,
+      rootTaskId: source.rootTaskId, boundary: "root_terminal", boundaryEventId: failureKey })).toBeUndefined()
+
+    await appendRootTurnStarted(current, testPool(`history-chrono-failure-start-${suffix}`))
+    const beforeRelease = await readCrossSessionCandidates(current)
+    expect(beforeRelease.candidates.map(candidate => candidate.turnId)).not.toContain(source.turnId)
+    expect(await releaseTurnLease(testPool(`history-chrono-failure-release-${suffix}`) as never, source.lease, "failed", new Date())).toBe(true)
+    const releasedWitness = await readChronologyWitness({ userId, sessionId: source.sessionId, turnId: source.turnId,
+      rootTaskId: source.rootTaskId, boundary: "root_terminal", boundaryEventId: failureKey })
+    expect(releasedWitness).toBeDefined()
+    expect(BigInt(releasedWitness!.xid8)).toBeGreaterThan(BigInt(beforeRelease.fence.currentStartWitness!.xid8))
+    const afterRelease = await readCrossSessionCandidates(current)
+    expect(afterRelease.candidates.map(candidate => candidate.turnId)).not.toContain(source.turnId)
+  })
+
+  it("excludes a same-session failure whose final release follows the current start witness", async () => {
+    const userId = await createUser(), sessionId = await createSession(userId)
+    const source = await createTurn(userId, sessionId), current = await createTurn(userId, sessionId)
+    await Promise.all([setMatchingHistoryObjective(source), setMatchingHistoryObjective(current)])
+    await setConsent(userId, true, 0)
+    await appendRootTurnStarted(source)
+    const failureKey = `turn:${source.turnId}:event:turn-failed:provider_error`
+    const failure = await createPgTurnEngineStore(testPool(workerApplication) as never).appendEvent({
+      owner: turnOwner(source), id: failureKey, itemId: null, type: "turn.failed", correlationId: source.turnId,
+      causationId: null, idempotencyKey: failureKey,
+      payload: { turnId: source.turnId, taskId: source.rootTaskId, errorCode: "provider_error", finalItemId: null },
+    })
+    await pool!.query(`UPDATE "sub_agent_tasks" SET "status"='failed',"failureReason"='provider_error',"result"=$1::jsonb,
+      "leaseOwner"=NULL,"leaseExpiresAt"=NULL,"completedAt"=$2,"updatedAt"=$2
+      WHERE "id"=$3 AND "sessionId"=$4 AND "turnId"=$5 AND "rootTaskId"=$3 AND "status"='running'`,
+    [JSON.stringify({ status: "failed", stepCount: 1, toolCallCount: 0, finalItemId: null, waitId: null }), new Date(),
+      source.rootTaskId, source.sessionId, source.turnId])
+
+    const currentStart = await appendRootTurnStarted(current)
+    const beforeRelease = await readCrossSessionCandidates(current)
+    expect(beforeRelease.candidates.map(candidate => candidate.turnId)).not.toContain(source.turnId)
+    expect(await releaseTurnLease(testPool(`history-chrono-same-session-release-${suffix}`) as never, source.lease, "failed", new Date())).toBe(true)
+
+    const terminalWitness = await readChronologyWitness({ userId, sessionId, turnId: source.turnId,
+      rootTaskId: source.rootTaskId, boundary: "root_terminal", boundaryEventId: failure.id })
+    expect(terminalWitness).toBeDefined()
+    expect(BigInt(terminalWitness!.xid8)).toBeGreaterThan(BigInt(beforeRelease.fence.currentStartWitness!.xid8))
+    const sequences = await pool!.query<{ terminal: string; started: string }>(`SELECT
+      (SELECT "sequence"::text FROM "agent_events" WHERE "id"=$1) AS "terminal",
+      (SELECT "sequence"::text FROM "agent_events" WHERE "id"=$2) AS "started"`, [failure.id, currentStart.id])
+    expect(BigInt(sequences.rows[0]?.terminal ?? "0")).toBeLessThan(BigInt(sequences.rows[0]?.started ?? "0"))
+    const afterRelease = await readCrossSessionCandidates(current)
+    expect(afterRelease.candidates.map(candidate => candidate.turnId)).not.toContain(source.turnId)
+  })
+
+  it("rolls back terminal state, witness, outbox, and sequence together", async () => {
+    const userId = await createUser(), sessionId = await createSession(userId), fixture = await createTurn(userId, sessionId)
+    const prepared = await prepareCompletedStep(fixture)
+    const before = await chronologyState(sessionId)
+    const gate: PgGate = { sessionId, point: "before_commit", reached: deferred<void>(), resume: deferred<void>(),
+      rollbackOnCommit: true, inspection: deferred<{ events: string; outboxes: string; eventSequence: string } | undefined>() }
+    const store = createPgTurnEngineStore(testPool(`history-chrono-rollback-${suffix}`, gate) as never)
+    const terminal = recordSuccessfulTerminal(fixture, store, prepared.owner, new Date())
+    await gate.reached.promise
+    await expect(terminal).rejects.toThrow("intentional chronology transaction rollback")
+    expect(await gate.inspection?.promise).toMatchObject({ events: "1", outboxes: "1" })
+    expect(await chronologyState(sessionId)).toMatchObject({ events: "0", outboxes: "0", eventSequence: before?.eventSequence })
+    const statuses = await pool!.query<{ turnStatus: string; rootStatus: string; terminalEvents: string }>(`SELECT turn."status" AS "turnStatus",
+      root."status" AS "rootStatus", (SELECT COUNT(*)::text FROM "agent_events" AS event WHERE event."sessionId"=turn."sessionId"
+        AND event."turnId"=turn."id" AND event."type"='turn.completed') AS "terminalEvents"
+      FROM "agent_turns" AS turn JOIN "sub_agent_tasks" AS root ON root."id"=turn."rootTaskId" WHERE turn."id"=$1`, [fixture.turnId])
+    expect(statuses.rows[0]).toMatchObject({ turnStatus: "in_progress", rootStatus: "running", terminalEvents: "0" })
+  })
+
+  it("does not backfill a missing legacy terminal witness during history replay", async () => {
+    const userId = await createUser()
+    const sourceSession = await createSession(userId), currentSession = await createSession(userId)
+    const source = await createTurn(userId, sourceSession), current = await createTurn(userId, currentSession)
+    await Promise.all([setMatchingHistoryObjective(source), setMatchingHistoryObjective(current)])
+    await setConsent(userId, true, 0)
+    const terminalEventId = (await completeRootTurn(source)).eventId
+    await appendRootTurnStarted(current)
+    const witnessKey = `root-task-history-chronology-witness:root_terminal:${terminalEventId}:v1`
+    await pool!.query(`DELETE FROM "agent_outbox" WHERE "idempotencyKey"=(
+      SELECT 'agent-event:'||"id" FROM "agent_events" WHERE "sessionId"=$1 AND "idempotencyKey"=$2)` , [source.sessionId, witnessKey])
+    await pool!.query(`DELETE FROM "agent_events" WHERE "sessionId"=$1 AND "idempotencyKey"=$2`, [source.sessionId, witnessKey])
+    expect(await readChronologyWitness({ userId, sessionId: source.sessionId, turnId: source.turnId,
+      rootTaskId: source.rootTaskId, boundary: "root_terminal", boundaryEventId: terminalEventId })).toBeUndefined()
+    const history = await readCrossSessionCandidates(current)
+    expect(history.candidates.map(candidate => candidate.turnId)).not.toContain(source.turnId)
+    expect(await chronologyState(source.sessionId)).toMatchObject({ events: "0", outboxes: "0" })
   })
 })

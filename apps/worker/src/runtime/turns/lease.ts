@@ -2,7 +2,8 @@ import type pg from "pg"
 
 import { RUNNABLE_SESSION, assertSessionWorkAdmission, isSessionPauseRequestedError } from "../session-gate.js"
 import { ClaimSessionUnavailable, lockClaimSession } from "./lease-claim-session.js"
-import { hasPersistedNoProgressTerminalReceipt, LeaseUnavailable, transaction, withOpenLease } from "./lease-transaction.js"
+import { LeaseUnavailable, transaction, withOpenLease } from "./lease-transaction.js"
+export { releaseTurnLease } from "./lease-release.js"
 
 /** Normal owner window. A scanner reclaims the Turn after this expires. */
 export const TURN_LEASE_WINDOW_MS = 60_000
@@ -162,42 +163,6 @@ export async function expireTurnLease(
       [current.turnId, current.sessionId, current.ownerId, current.leaseVersion, now],
     )
     if (result.rowCount !== 1) throw new LeaseUnavailable("Turn lease is no longer owned")
-    return true
-  })
-}
-
-export async function releaseTurnLease(
-  pool: LeasePool,
-  current: TurnLease,
-  status: LeaseReleaseStatus,
-  now = new Date(),
-): Promise<boolean> {
-  return withOpenLease(pool, current, false, async client => {
-    const result = await client.query(
-      `UPDATE "agent_turns"
-       SET "status" = $5, "leaseOwnerId" = NULL, "leaseExpiresAt" = NULL,
-           "leaseStartedAt" = NULL, "revision" = "revision" + CASE WHEN "status" = $5 THEN 0 ELSE 1 END,
-           "completedAt" = CASE WHEN $5 IN ('interrupted', 'failed', 'completed') THEN $6 ELSE NULL END,
-           "updatedAt" = $6
-       WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwnerId" = $3
-         AND "leaseVersion" = $4 AND "userId" = $7 AND "leaseExpiresAt" > $6
-         AND ("status" = 'in_progress' OR ("status" = 'waiting_for_user' AND $5 = 'waiting_for_user') OR ("status" = 'waiting_for_approval' AND $5 = 'waiting_for_approval'))`,
-      [current.turnId, current.sessionId, current.ownerId, current.leaseVersion, status, now, current.userId],
-    )
-    if (result.rowCount !== 1) {
-      if (status === "completed") {
-        const receipt = await client.query(`SELECT "id" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3
-          AND "leaseVersion" = $4 AND "status" = 'completed' AND "leaseOwnerId" IS NULL AND "leaseExpiresAt" IS NULL`,
-        [current.turnId, current.sessionId, current.userId, current.leaseVersion])
-        if (receipt.rows[0]) return true
-      }
-      if (status === "failed" && await hasPersistedNoProgressTerminalReceipt(client, current)) return true
-      throw new LeaseUnavailable("Turn lease is no longer owned")
-    }
-    if (status === "failed" || status === "interrupted") await client.query(`UPDATE "agent_inputs" SET "status" = 'cancelled', "cancelledAt" = $4
-      WHERE "sessionId" = $1 AND "userId" = $2 AND "targetTurnId" = $3 AND "delivery" = 'follow_up'
-        AND "status" IN ('accepted', 'queued', 'consumed') AND "cancelledAt" IS NULL`,
-    [current.sessionId, current.userId, current.turnId, now])
     return true
   })
 }

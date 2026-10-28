@@ -130,16 +130,16 @@ export async function withRootTaskHistoryObjectiveSnapshot(
   const key = rootTaskHistoryObjectiveSnapshotKey(identity), prior = await readEvent(input.client, key)
   if (prior) {
     await assertRetainedOwner(input.client, prior, input)
-    const outcomes = readRootTaskHistoryObjectiveSnapshotPayload(prior.payload, identity, input.fence.currentStartCreatedAt!)
+    const outcomes = readRootTaskHistoryObjectiveSnapshotPayload(prior.payload, identity)
     if (!validEvent(prior, key) || !outcomes) throw conflict()
     await verifyOutbox(input.client, expectedOutbox(prior, toRepositoryJson(prior.payload)))
     return { outcomes, reused: true }
   }
   await assertNoOrphanOutbox(input.client, key)
-  const payload = createRootTaskHistoryObjectiveSnapshotPayload(identity, await input.loadOutcomes(input.client), input.fence.currentStartCreatedAt!)
+  const payload = createRootTaskHistoryObjectiveSnapshotPayload(identity, await input.loadOutcomes(input.client))
   if (!payload) throw conflict()
   const event = await appendEvent(input.client, input, key, payload)
-  const outcomes = readRootTaskHistoryObjectiveSnapshotPayload(payload, identity, input.fence.currentStartCreatedAt!)
+  const outcomes = readRootTaskHistoryObjectiveSnapshotPayload(payload, identity)
   if (!validEvent(event, key) || !outcomes) throw conflict()
   return { outcomes, reused: false }
 }

@@ -56,6 +56,8 @@ function makePool(pending: readonly Row[] = [], currentTurnInput?: unknown, opti
     query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
       calls.push({ sql, values })
       if (/^BEGIN(?: ISOLATION LEVEL READ COMMITTED)?$/.test(sql) || ["COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+      if (sql.includes("pg_advisory_xact_lock")) return { rows: [], rowCount: 1 }
+      if (sql.includes("pg_current_xact_id")) return { rows: [{ xid8: "100" }], rowCount: 1 }
       if (sql.includes('SELECT "eventSequence" FROM "agent_sessions"')) return { rows: [{ eventSequence: sequence }], rowCount: 1 }
       if (sql.includes('SELECT session."id" FROM "agent_sessions" AS session')) return options.pause ? { rows: [], rowCount: 0 } : { rows: [{ id: owner.sessionId }], rowCount: 1 }
       if (sql.includes('FROM "agent_sessions"')) return { rows: values?.[0] === owner.sessionId && values?.[1] === owner.userId ? [{ id: owner.sessionId }] : [], rowCount: 1 }
@@ -68,6 +70,27 @@ function makePool(pending: readonly Row[] = [], currentTurnInput?: unknown, opti
       if (sql.includes('FROM "sub_agent_tasks"')) {
         if (values?.[0] !== owner.taskId || values[1] !== owner.sessionId || values[2] !== owner.turnId) return { rows: [], rowCount: 0 }
         return { rows: [{ ...root }], rowCount: 1 }
+      }
+      if (sql.includes('FROM "agent_steps" AS step')) {
+        const [sessionId, turnId, taskId, stepId, itemId, completedEventId, parentSequence] = values ?? []
+        const item = items.get(String(itemId))
+        const completed = [...events.values()].find(event => event.id === completedEventId)
+        const stepMatches = sessionId === owner.sessionId && turnId === owner.turnId && taskId === owner.taskId && stepId === input.stepId
+        const itemMatches = item?.sessionId === owner.sessionId && item.turnId === owner.turnId && item.taskId === owner.taskId
+          && item.stepId === input.stepId && item.type === "agent_message" && item.status === "completed"
+          && item.phase === "final_answer" && item.revision === 1
+        const eventPayload = completed?.payload as Row | undefined
+        if (!completed || !eventPayload) throw new Error("Expected the completed final-item event fixture")
+        expect(completed).toMatchObject({ sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.taskId,
+          type: "item.completed", actor: "orchestrator", itemId, correlationId: itemId,
+          idempotencyKey: `turn:${owner.turnId}:event:final-completed:${String(itemId)}:1` })
+        expect(eventPayload).toMatchObject({ itemId, status: "completed" })
+        expect(eventPayload?.content).toEqual(item?.content)
+        const ordered = completed && BigInt(String(completed.sequence)) < BigInt(String(parentSequence))
+        expect(stepMatches).toBe(true)
+        expect(itemMatches).toBe(true)
+        expect(ordered).toBeTruthy()
+        return completed ? { rows: [{ ...completed }], rowCount: 1 } : { rows: [], rowCount: 0 }
       }
       if (sql.includes('FROM "agent_inputs"')) {
         const found = followUps.filter(row => row.sessionId === values?.[0] && row.userId === values?.[1] && row.targetTurnId !== null
@@ -88,6 +111,15 @@ function makePool(pending: readonly Row[] = [], currentTurnInput?: unknown, opti
         return { rows: [], rowCount: 1 }
       }
       if (sql.includes('FROM "agent_events"')) {
+        if (sql.includes('WHERE "id"=$1 AND "sessionId"=$2')) {
+          const row = [...events.values()].find(event => event.id === values?.[0] && event.sessionId === values?.[1]
+            && event.turnId === values?.[2] && event.taskId === values?.[3])
+          return { rows: row ? [{ ...row }] : [], rowCount: row ? 1 : 0 }
+        }
+        if (sql.includes('"idempotencyKey"=$1 OR "id"=$2')) {
+          const row = [...events.values()].find(event => event.idempotencyKey === values?.[0] || event.id === values?.[1])
+          return { rows: row ? [{ ...row }] : [], rowCount: row ? 1 : 0 }
+        }
         const key = String(values?.length === 3 ? values[2] : values?.[1] ?? "")
         const event = events.get(key)
         if (event) return { rows: [{ ...event }], rowCount: 1 }
@@ -110,12 +142,24 @@ function makePool(pending: readonly Row[] = [], currentTurnInput?: unknown, opti
         return { rows: [{ eventSequence: sequence }], rowCount: 1 }
       }
       if (sql.includes('INSERT INTO "agent_events"')) {
+        if (/VALUES\s*\(\$1,\s*\$2,\s*\$3,\s*NULL,\s*\$4,\s*\$5,\s*\$6,\s*'orchestrator'/.test(sql)) {
+          const [id, sessionId, turnId, taskId, seq, type, causationId, key, payload] = values ?? []
+          const row = { id, sessionId, turnId, itemId: null, taskId, sequence: seq, type, actor: "orchestrator",
+            correlationId: taskId, causationId, idempotencyKey: key, payload: JSON.parse(String(payload)) }
+          events.set(String(key), row)
+          return { rows: [], rowCount: 1 }
+        }
         const [id, sessionId, turnId, itemId, taskId, seq, type, correlationId, causationId, key, payload] = values ?? []
-        const row = { id, sessionId, turnId, itemId, taskId, sequence: seq, type, actor: "orchestrator", correlationId, causationId, payload: JSON.parse(String(payload)) }
+        const row = { id, sessionId, turnId, itemId, taskId, sequence: seq, type, actor: "orchestrator", correlationId, causationId, idempotencyKey: key, payload: JSON.parse(String(payload)) }
         events.set(String(key), row)
         return { rows: [], rowCount: 1 }
       }
       if (sql.includes('INSERT INTO "agent_outbox"')) {
+        if (values?.length === 5) {
+          const [id, topic, aggregateId, key, payload] = values
+          outboxes.set(String(key), { id, topic, aggregateId, idempotencyKey: key, payload: JSON.parse(String(payload)) })
+          return { rows: [], rowCount: 1 }
+        }
         const [id, aggregateId, key, payload] = values ?? []
         if (outboxes.has(String(key))) return { rows: [], rowCount: 0 }
         outboxes.set(String(key), { id, topic: sql.includes("'agent.turn.dispatch'") ? "agent.turn.dispatch" : "agent.events", aggregateId, idempotencyKey: key, payload: JSON.parse(String(payload)) })
@@ -158,7 +202,12 @@ describe("atomic Turn terminal commit", () => {
     expect(updateRootObjectiveHistoryProjectionMock).toHaveBeenNthCalledWith(2, fake.client, {
       userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
     }, { terminalEventId: terminalId })
-    expect(fake.calls.filter(call => call.sql.includes('INSERT INTO "agent_events"'))).toHaveLength(3)
+    const receipt = fake.calls.find(call => call.sql.includes('FROM "agent_steps" AS step'))
+    expect(receipt?.sql).toContain('item."id"=$5')
+    expect(receipt?.sql).toContain('completed."id"=$6')
+    expect(receipt?.values?.slice(3, 6)).toEqual([input.stepId, input.finalItemId,
+      `turn:${owner.turnId}:event:final-completed:${input.finalItemId}:1`])
+    expect(fake.calls.filter(call => call.sql.includes('INSERT INTO "agent_events"'))).toHaveLength(4)
   })
 
   it("rolls back Root and Turn completion when the terminal receipt cannot be projected", async () => {
@@ -230,7 +279,7 @@ describe("atomic Turn terminal commit", () => {
     expect(fake.outboxes.get(`turn-dispatch:${successorId}`)).toMatchObject({ topic: "agent.turn.dispatch", aggregateId: owner.sessionId, payload: { turnId: successorId, sessionId: owner.sessionId, ownerId: `web:${successorId}` } })
     expect([...fake.outboxes.values()].filter(row => row.topic === "agent.turn.dispatch")).toHaveLength(1)
     expect(fake.items.size).toBe(1)
-    expect(fake.events.size).toBe(3)
+    expect(fake.events.size).toBe(4)
     expect(fake.state.turn.status).toBe("completed")
     expect(fake.state.root.status).toBe("completed")
     expect(fake.calls.filter(({ sql }) => sql.includes('INSERT INTO "agent_turns"'))).toHaveLength(1)
@@ -261,11 +310,11 @@ describe("atomic Turn terminal commit", () => {
     expect(first).toMatchObject({ status: "completed", finalItemId: input.finalItemId })
     expect(second).toMatchObject({ status: "completed", finalItemId: input.finalItemId })
     expect(fake.items.size).toBe(1)
-    expect(fake.events.size).toBe(3) // the three terminal events; the prerequisite step receipt is fixture-owned
-    expect(fake.outboxes.size).toBe(3)
+    expect(fake.events.size).toBe(4) // the three terminal events plus the private chronology witness
+    expect(fake.outboxes.size).toBe(4)
     expect(fake.state.turn).toMatchObject({ status: "completed", finalResponse: input.response })
     expect(fake.state.root).toMatchObject({ status: "completed", leaseOwner: null, result: { finalItemId: input.finalItemId, stepCount: 2, toolCallCount: 1 } })
-    expect(fake.calls.filter(({ sql }) => sql.includes('INSERT INTO "agent_events"'))).toHaveLength(3)
+    expect(fake.calls.filter(({ sql }) => sql.includes('INSERT INTO "agent_events"'))).toHaveLength(4)
     expect(fake.calls.filter(({ sql }) => sql.includes('UPDATE "agent_turns"'))).toHaveLength(1)
     expect(fake.calls.filter(({ sql }) => sql.includes('UPDATE "sub_agent_tasks"'))).toHaveLength(1)
     expect(fake.calls.filter(({ sql }) => sql.startsWith("BEGIN"))).toEqual([{ sql: "BEGIN" }, { sql: "BEGIN" }])
@@ -365,8 +414,8 @@ describe("atomic Turn terminal commit", () => {
     await expect(commitTurnTerminal(fake.pool, input, guard)).resolves.toMatchObject({ status: "completed" })
     expect(guard).toHaveBeenCalledTimes(1)
     expect(fake.items.size).toBe(1)
-    expect(fake.events.size).toBe(3)
-    expect(fake.outboxes.size).toBe(3)
+    expect(fake.events.size).toBe(4)
+    expect(fake.outboxes.size).toBe(4)
     const guardIndex = fake.calls.findIndex(({ sql }) => sql === "GUARD")
     const itemIndex = fake.calls.findIndex(({ sql }) => sql.includes('INSERT INTO "agent_items"'))
     expect(guardIndex).toBeLessThan(itemIndex)

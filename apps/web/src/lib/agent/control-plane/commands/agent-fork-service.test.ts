@@ -60,7 +60,14 @@ describe("AgentForkService Turn projection", () => {
           type: "agent.plan.root_task_history_memory_snapshot", actor: "worker", correlationId: "turn-1", causationId: null,
           idempotencyKey: "root-task-history-snapshot:source-session:v1",
           payload: { id: "root-task-history", value: "PRIVATE_ROOT_TASK_HISTORY_EVENT" } },
-        { id: "visible-event", sessionId: "source-session", turnId: "turn-1", itemId: "visible-item", taskId: null, sequence: BigInt(5),
+        { id: "turn-start-event", sessionId: "source-session", turnId: "turn-1", itemId: null, taskId: "root-1", sequence: BigInt(5),
+          type: "turn.started", actor: "orchestrator", correlationId: "turn-1", causationId: null,
+          idempotencyKey: "turn:turn-1:event:turn-started", payload: { taskId: "root-1", rootTaskId: "root-1" } },
+        { id: "history-chronology-event", sessionId: "source-session", turnId: "turn-1", itemId: null, taskId: "root-1", sequence: BigInt(6),
+          type: "agent.plan.root_task_history_chronology_witness", actor: "orchestrator", correlationId: "root-1", causationId: "turn-start-event",
+          idempotencyKey: "root-task-history-chronology-witness:turn_start:turn-start-event:v1",
+          payload: { schemaVersion: "agent-harness.v2.root-task-history-chronology-witness.v1", boundary: "turn_start", boundaryEventId: "turn-start-event", xid8: "90000000000000001" } },
+        { id: "visible-event", sessionId: "source-session", turnId: "turn-1", itemId: "visible-item", taskId: null, sequence: BigInt(7),
           type: "item.completed", actor: "worker", correlationId: "turn-1", causationId: null,
           idempotencyKey: "visible-item:completed", payload: { status: "completed" } },
       ],
@@ -93,7 +100,7 @@ describe("AgentForkService Turn projection", () => {
 
     expect(result.disposition).toBe("forked")
     const copied = copiedEvents.mock.calls[0]?.[0] as unknown as { data: Array<{ type: string; payload: unknown }> }
-    expect(copied.data.map(event => event.type)).toEqual(["item.completed"])
+    expect(copied.data.map(event => event.type)).toEqual(["turn.started", "item.completed"])
     const visible = copiedItems.mock.calls[0]?.[0] as unknown as { data: Array<{ content: unknown }> }
     expect(JSON.stringify(visible.data)).toContain("Visible user history")
     const serialized = JSON.stringify({ copied: copied.data.map(({ type, payload }) => ({ type, payload })), visible: visible.data })
@@ -103,6 +110,9 @@ describe("AgentForkService Turn projection", () => {
     expect(serialized).not.toContain("PRIVATE_ROOT_TASK_HISTORY_EVENT")
     expect(serialized).not.toContain("agent.plan.root_task_history_session_authorization")
     expect(serialized).not.toContain("agent.plan.root_task_history_memory_snapshot")
+    expect(serialized).not.toContain("agent.plan.root_task_history_chronology_witness")
+    expect(serialized).not.toContain("90000000000000001")
+    expect(serialized).not.toContain("history-chronology-event")
 
     expect(copiedSnapshot).toHaveBeenCalledOnce()
     const snapshotContent = copiedSnapshot.mock.calls[0]?.[0].data.content
