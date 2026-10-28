@@ -171,13 +171,22 @@ export class StepContextBuilder {
   ) {}
 
   async build(request: StepContextRequest): Promise<StepContext> {
+    this.validateRequest(request)
+    return this.store.withTransaction(async (transaction) => this.buildWithinTransaction(transaction, request))
+  }
+
+  async buildInTransaction(transaction: InputClaimTransaction, request: StepContextRequest): Promise<StepContext> {
+    this.validateRequest(request)
+    return this.buildWithinTransaction(transaction, request)
+  }
+
+  private validateRequest(request: StepContextRequest): void {
     id(request.sessionId, "sessionId"); id(request.turnId, "turnId"); id(request.stepId, "stepId")
     if (request.rootContextInputId !== undefined) id(request.rootContextInputId, "rootContextInputId")
     if (request.scope.userId !== this.store.scope.userId) throw new ContextOwnershipError("reference_owner_mismatch", "Builder scope does not match the claim store tenant")
-    return this.store.withTransaction(async (transaction) => this.buildInTransaction(transaction, request))
   }
 
-  private async buildInTransaction(transaction: InputClaimTransaction, request: StepContextRequest): Promise<StepContext> {
+  private async buildWithinTransaction(transaction: InputClaimTransaction, request: StepContextRequest): Promise<StepContext> {
     const mode = request.mode ?? (request.rebuild ? "rebuild" : "new")
     const persisted = await transaction.getCheckpoint({ ...request, lease: request.lease })
     const claimed = await transaction.claimInputs({

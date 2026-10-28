@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs"
 import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 
-import { createPgInputClaimStore, type InputClaimTransaction } from "./input-claim-store.js"
+import { createPgInputClaimStore, createPgInputClaimTransaction, type InputClaimTransaction } from "./input-claim-store.js"
 import { buildObservedSteeringMarker } from "./steering-marker-store.js"
 
 const scope = { userId: "user-a" }
@@ -64,6 +64,15 @@ async function transaction(store: ReturnType<typeof createPgInputClaimStore>): P
 }
 
 describe("PostgreSQL AgentInput claim store", () => {
+  it("binds a caller-owned transaction without taking over its lifecycle", async () => {
+    const fake = makeClient()
+    const transaction = createPgInputClaimTransaction(fake.client as never, scope)
+    await transaction.getCheckpoint({ sessionId: "session-a", turnId: "turn-a", stepId: "step-a" })
+    expect(fake.calls.map(call => call.text)).not.toEqual(expect.arrayContaining(["BEGIN", "COMMIT", "ROLLBACK"]))
+    expect(fake.calls.some(call => call.text.includes("set_config"))).toBe(false)
+    expect(fake.client.release).not.toHaveBeenCalled()
+  })
+
   it("keeps claim, observed marker, and checkpoint in one ordered transaction", async () => {
     const fake = makeClient()
     const store = createPgInputClaimStore(fake.pool, scope)
