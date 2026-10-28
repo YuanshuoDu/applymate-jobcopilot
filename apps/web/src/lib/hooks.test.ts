@@ -36,6 +36,8 @@ function deferred<T>() {
 
 function readApi<T>(url: string, options: Parameters<typeof useApi>[1] = {}) {
   lifecycle.cursor = 0
+  // React lifecycle hooks are deliberately mocked by this node-only test harness.
+  // eslint-disable-next-line react-hooks/rules-of-hooks
   return useApi<T>(url, options)
 }
 
