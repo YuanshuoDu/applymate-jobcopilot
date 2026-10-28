@@ -14,6 +14,8 @@ describe("shared AI usage", () => {
     expect(estimateSharedAiCost(input)).toBe(0.0018);
     await recordSharedAiUsage({ query }, input);
     expect(query).toHaveBeenCalledOnce();
+    expect(query.mock.calls[0][0]).toMatch(/INSERT INTO ai_usage_events[\s\S]*created_at[\s\S]*CURRENT_TIMESTAMP AT TIME ZONE 'UTC'\)/);
+    expect(query.mock.calls[0][1]).toEqual(expect.arrayContaining([input.userId, input.provider, input.model]));
     expect(query.mock.calls[0][0]).not.toContain("prompt");
     expect(query.mock.calls[0][1]).toContain("platform");
   });

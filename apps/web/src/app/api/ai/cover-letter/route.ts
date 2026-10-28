@@ -84,6 +84,7 @@ export async function POST(req: NextRequest) {
   // A cover letter is a bounded rewrite; M3's direct mode is faster and keeps
   // the answer focused without exposing or spending on private reasoning.
   const cfg = withMiniMaxThinking(selectedCfg, 'disabled')
+  const fallbackUsage = { userId: prep.userId, featureKey: cfg.usageFeatureKey ?? 'coverLetter', runtime: cfg.usageRuntime ?? 'web', chargeBudget: false } as const
 
   const writerSystemPrompt = writerRole?.systemPrompt
     ?? 'You are a professional cover letter writer. Output ONLY the cover letter text — no preamble, no meta-commentary, no explanation. Start directly with the greeting.'
@@ -127,9 +128,11 @@ Return ONLY the cover letter text.`
       !(f.provider === cfg.provider && f.model === cfg.model)
     )]
     let lastErr: unknown
-    for (const attempt of attempts) {
+    for (const [index, attempt] of attempts.entries()) {
       try {
-        const result = await modelChat(messages, attempt, 4096)
+        // Fallbacks used to have no owner and therefore did not charge credits.
+        // Attribute the recorded usage without copying the primary provider key.
+        const result = index === 0 ? await modelChat(messages, attempt, 4096) : await modelChat(messages, attempt, 4096, fallbackUsage)
         return { text: result.text, model: `${attempt.provider}/${attempt.model}` }
       } catch (e) {
         lastErr = e

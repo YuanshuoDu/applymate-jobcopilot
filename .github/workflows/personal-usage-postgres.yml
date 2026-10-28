@@ -1,0 +1,51 @@
+name: Personal Usage PostgreSQL
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  personal-usage-postgres:
+    name: Personal usage and activity PostgreSQL integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: personal_usage_disposable
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 56372:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d personal_usage_disposable"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql://postgres@127.0.0.1:56372/personal_usage_disposable
+      PERSONAL_USAGE_PG_TEST_URL: postgresql://postgres@127.0.0.1:56372/personal_usage_disposable
+      PERSONAL_USAGE_PG_TEST_DISPOSABLE: 'true'
+      PERSONAL_USAGE_PG_TEST_REQUIRED: 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @jobcopilot/agent-protocol build
+      - run: pnpm --filter @jobcopilot/shared build
+      - run: pnpm --filter @jobcopilot/web exec prisma generate
+      - name: Verify real PostgreSQL aggregation, RLS and account-scoped API handlers
+        run: >-
+          pnpm --filter @jobcopilot/web exec vitest run
+          src/lib/personal-usage.pg.integration.test.ts
+          src/app/api/me/personal-usage-activity.pg.integration.test.ts

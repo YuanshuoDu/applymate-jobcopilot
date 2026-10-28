@@ -270,7 +270,7 @@ export async function modelChat(
   messages:  ChatMessage[],
   config:    AiConfig,
   maxTokens: number = 1024,
-  usageContext?: { userId?: string; featureKey?: string; runtime?: AiConfig['usageRuntime'] },
+  usageContext?: { userId?: string; featureKey?: string; runtime?: AiConfig['usageRuntime']; chargeBudget?: boolean },
 ): Promise<ChatResult> {
   const resolved = resolveConfig(config)
   const effectiveUsage = usageContext ?? { userId: config.usageUserId, featureKey: config.usageFeatureKey, runtime: config.usageRuntime }
@@ -306,13 +306,17 @@ export async function* modelChatStream(
   const resolved = resolveConfig(config)
   const effectiveUsage = usageContext ?? { userId: config.usageUserId, featureKey: config.usageFeatureKey, runtime: config.usageRuntime }
   const startedAt = Date.now()
+  const streamUsage: StreamUsage = {}
+  let started = false
+  let recorded = false
   try {
     assertKey(resolved)
-    const streamUsage: StreamUsage = {}
     const raw = resolved.provider === 'anthropic'
       ? streamAnthropic(messages, resolved, maxTokens, streamUsage)
       : streamOpenAICompat(messages, resolved, maxTokens, streamUsage)
+    started = true
     yield* stripThinkStream(raw)
+    recorded = true
     await recordAiUsage({
       ...effectiveUsage,
       credentialSource: resolved.credentialSource,
@@ -325,8 +329,23 @@ export async function* modelChatStream(
       status: 'success',
     })
   } catch (error) {
-    await recordAiUsage({ ...effectiveUsage, credentialSource: resolved.credentialSource, provider: resolved.provider, model: resolved.model, latencyMs: Date.now() - startedAt, status: 'error', errorCode: aiUsageErrorCode(error) })
+    if (!recorded) {
+      recorded = true
+      await recordAiUsage({ ...effectiveUsage, credentialSource: resolved.credentialSource, provider: resolved.provider, model: resolved.model,
+        inputTokens: streamUsage.inputTokens, outputTokens: streamUsage.outputTokens,
+        latencyMs: Date.now() - startedAt, status: 'error', errorCode: aiUsageErrorCode(error) })
+    }
     throw error
+  } finally {
+    // Iterator.return() skips the success and catch branches. Keep the existing
+    // no-credit behavior for a consumer that closes a live stream early.
+    if (started && !recorded) {
+      try {
+        await recordAiUsage({ ...effectiveUsage, credentialSource: resolved.credentialSource, provider: resolved.provider, model: resolved.model,
+          inputTokens: streamUsage.inputTokens, outputTokens: streamUsage.outputTokens,
+          latencyMs: Date.now() - startedAt, status: 'error', chargeBudget: false })
+      } catch { /* Telemetry must not prevent a consumer from closing the stream. */ }
+    }
   }
 }
 

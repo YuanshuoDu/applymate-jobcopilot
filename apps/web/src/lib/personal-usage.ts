@@ -55,8 +55,10 @@ export async function readPersonalUsage(
       COALESCE(SUM(output_tokens), 0) AS "outputTokens"
     FROM ai_usage_events
     WHERE user_id = ${userId}
-      AND created_at >= ${from} AND created_at < ${to}
+      AND created_at >= (${from}::timestamptz AT TIME ZONE 'UTC')
+      AND created_at < (${to}::timestamptz AT TIME ZONE 'UTC')
       AND status IN ('success', 'error')
+      AND feature_key <> 'providerTest'
     GROUP BY TO_CHAR(created_at, 'YYYY-MM-DD'), provider, model
     ORDER BY date ASC, provider ASC, model ASC
   `)
