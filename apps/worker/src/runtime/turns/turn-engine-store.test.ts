@@ -5,6 +5,7 @@ import { createPgTurnEngineStore } from "./turn-engine-store.js"
 import { steeringMarkerIdempotencyKey, type SteeringMarkerPayload } from "../context/steering-marker.js"
 import { SessionPauseRequestedError, SESSION_WORK_ADMISSION } from "../session-gate.js"
 import { TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA, type TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
+import { ROOT_TASK_HISTORY_CHRONOLOGY_WITNESS_EVENT_TYPE } from "../context/root-task-history-chronology-witness.js"
 
 const { updateRootObjectiveHistoryProjectionMock, cleanupFailedRootTaskGraphMock } = vi.hoisted(() => ({
   updateRootObjectiveHistoryProjectionMock: vi.fn(async () => true), cleanupFailedRootTaskGraphMock: vi.fn(async () => undefined),
@@ -753,6 +754,7 @@ describe("PostgreSQL TurnEngine store", () => {
     const client = { query: vi.fn(async (sql: string) => {
       calls.push(sql)
       if (sql === "BEGIN" || sql.startsWith("BEGIN ISOLATION LEVEL") || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+      if (sql.includes("pg_current_xact_id")) return { rows: [{ xid8: "42" }], rowCount: 1 }
       if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: owner.sessionId }], rowCount: 1 }
       if (sql.includes('FROM "agent_turns" AS turn')) return { rows: [{ id: owner.turnId, status: "in_progress", finalResponse: null }], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ id: owner.taskId, status: "running", leaseOwner: owner.ownerId, attemptCount: 1, result: null, allowedActions: [] }], rowCount: 1 }
@@ -786,10 +788,16 @@ describe("PostgreSQL TurnEngine store", () => {
     const changedCheckpoint: TaskGraphDenialCheckpoint = { ...checkpoint, graphRevision: 4, verificationDigest: "b".repeat(64) }
     async function run(pendingInput: boolean, graphChanged = false) {
       const calls: Array<{ sql: string; values?: readonly unknown[] }> = []
+      const eventsById = new Map<string, Record<string, unknown>>()
+      const eventsByKey = new Map<string, Record<string, unknown>>()
+      const outboxesById = new Map<string, Record<string, unknown>>()
+      const outboxesByKey = new Map<string, Record<string, unknown>>()
+      let eventSequence = 19n
       let stepStatus = "streaming"
       const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
         calls.push({ sql, values })
         if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
+        if (sql.includes("pg_current_xact_id")) return { rows: [{ xid8: "42" }], rowCount: 1 }
         if (sql.includes(SESSION_WORK_ADMISSION)) return { rows: [{ id: owner.sessionId }], rowCount: 1 }
         if (sql.includes('FROM "agent_sessions"')) return { rows: [{ id: owner.sessionId }], rowCount: 1 }
         if (sql.includes('SELECT turn."id"')) return { rows: [{ id: owner.turnId }], rowCount: 1 }
@@ -798,14 +806,40 @@ describe("PostgreSQL TurnEngine store", () => {
         }
         if (sql.includes('FROM "agent_steps"')) return { rows: [{ status: stepStatus, inputThroughSequence: "8", consumedInputIds: ["accepted-8"] }], rowCount: 1 }
         if (sql.includes('FROM "agent_inputs"')) return pendingInput ? { rows: [{ id: "accepted-9" }], rowCount: 1 } : { rows: [], rowCount: 0 }
-        if (sql.includes('FROM "agent_events"')) return values?.[2] === `turn:${owner.turnId}:event:step-started:step-denial-3`
-          ? { rows: [{ id: "step-started-event" }], rowCount: 1 } : { rows: [], rowCount: 0 }
+        if (sql.includes('FROM "agent_events"')) {
+          if (values?.[2] === `turn:${owner.turnId}:event:step-started:step-denial-3`) return { rows: [{ id: "step-started-event" }], rowCount: 1 }
+          const row = eventsById.get(String(values?.[0])) ?? eventsByKey.get(String(values?.[1]))
+          return { rows: row ? [row] : [], rowCount: row ? 1 : 0 }
+        }
+        if (sql.includes('FROM "agent_outbox"')) {
+          const row = outboxesByKey.get(String(values?.[0])) ?? outboxesById.get(String(values?.[0]))
+            ?? outboxesByKey.get(String(values?.[1])) ?? outboxesById.get(String(values?.[1]))
+          return { rows: row ? [row] : [], rowCount: row ? 1 : 0 }
+        }
         if (sql.includes('INSERT INTO "agent_items"')) return { rows: [{ id: "final-item" }], rowCount: 1 }
         if (sql.includes('SELECT "id" FROM "agent_items"')) return { rows: [{ id: "final-item" }], rowCount: 1 }
         if (sql.includes('UPDATE "agent_steps"')) { stepStatus = "failed"; return { rows: [], rowCount: 1 } }
         if (sql.includes('UPDATE "agent_turns"')) return { rows: [], rowCount: 1 }
         if (sql.includes('SELECT item."id"')) return { rows: [{ id: "final-item" }], rowCount: 1 }
-        if (sql.includes('UPDATE "agent_sessions" SET "eventSequence"')) return { rows: [{ eventSequence: 20n }], rowCount: 1 }
+        if (/UPDATE\s+"agent_sessions"\s+SET\s+"eventSequence"/.test(sql)) return { rows: [{ eventSequence: String(++eventSequence) }], rowCount: 1 }
+        if (sql.includes('INSERT INTO "agent_events"')) {
+          const [id, sessionId, turnId, itemId, taskId, sequence, type, actor, correlationId, causationId, idempotencyKey, payload] = values?.length === 9
+            ? [values[0], values[1], values[2], null, values[3], values[4], values[5], "orchestrator", values[3], values[6], values[7], values[8]]
+            : values ?? []
+          const row = { id: String(id), sessionId: String(sessionId), turnId: String(turnId), itemId: itemId === null ? null : String(itemId),
+            taskId: String(taskId), sequence: String(sequence), type: String(type), actor: String(actor), correlationId: String(correlationId),
+            causationId: causationId === null ? null : String(causationId), idempotencyKey: String(idempotencyKey), payload: JSON.parse(String(payload)) as unknown }
+          eventsById.set(row.id, row); eventsByKey.set(row.idempotencyKey, row)
+          return { rows: [], rowCount: 1 }
+        }
+        if (sql.includes('INSERT INTO "agent_outbox"')) {
+          const [id, topic, aggregateId, idempotencyKey, payload] = values?.length === 4
+            ? [values[0], "agent.events", values[1], values[2], values[3]]
+            : values ?? []
+          const row = { id: String(id), topic: String(topic), aggregateId: String(aggregateId), idempotencyKey: String(idempotencyKey), payload: JSON.parse(String(payload)) as unknown }
+          outboxesById.set(row.id, row); outboxesByKey.set(row.idempotencyKey, row)
+          return { rows: [], rowCount: 1 }
+        }
         return { rows: [], rowCount: 1 }
       }), release: vi.fn() }
       const pool = { connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">
@@ -839,8 +873,12 @@ describe("PostgreSQL TurnEngine store", () => {
     expect(indexOf('FROM "agent_inputs"')).toBeLessThan(indexOf('INSERT INTO "agent_items"'))
     expect(terminalWins.calls.find(call => call.sql.includes('UPDATE "agent_turns"'))?.sql).toContain('"revision"="revision"+1')
     expect(terminalWins.calls.find(call => call.sql.includes('UPDATE "agent_steps"'))?.sql).toContain('SET "status"=\'failed\'')
-    const terminalEvents = terminalWins.calls.filter(call => call.sql.includes('INSERT INTO "agent_events"'))
+    const eventInserts = terminalWins.calls.filter(call => call.sql.includes('INSERT INTO "agent_events"'))
+    const chronologyWitness = eventInserts.find(call => call.values?.includes(ROOT_TASK_HISTORY_CHRONOLOGY_WITNESS_EVENT_TYPE))
+    const terminalEvents = eventInserts.filter(call => !call.values?.includes(ROOT_TASK_HISTORY_CHRONOLOGY_WITNESS_EVENT_TYPE))
     expect(terminalEvents.map(call => call.values?.[6])).toEqual(["step.completed", "turn.no_progress", "item.started", "item.completed", "turn.failed"])
+    expect(chronologyWitness?.values?.[7]).toBe(`root-task-history-chronology-witness:root_terminal:${terminalEvents.at(-1)?.values?.[0]}:v1`)
+    expect(JSON.parse(String(chronologyWitness?.values?.[8]))).toMatchObject({ boundary: "root_terminal", xid8: "42" })
     expect(JSON.parse(String(terminalEvents[0]?.values?.[11]))).toMatchObject({ status: "failed", errorCode: "no_progress" })
     expect(terminalEvents[0]?.values?.[9]).toBe("step-started-event")
     for (let index = 1; index < terminalEvents.length; index += 1) expect(terminalEvents[index]?.values?.[9]).toBe(terminalEvents[index - 1]?.values?.[0])
@@ -854,7 +892,8 @@ describe("PostgreSQL TurnEngine store", () => {
     expect(terminalWins.calls.at(-1)?.sql).toBe("COMMIT")
     expect(terminalWins.client.release).toHaveBeenCalledOnce()
     await expect(terminalWins.store.recordFinalResponse(terminalWins.input)).rejects.toThrow(/no-progress Step .* fence/)
-    expect(terminalWins.calls.filter(call => call.sql.includes('INSERT INTO "agent_events"'))).toHaveLength(5)
+    expect(terminalEvents).toHaveLength(5)
+    expect(eventInserts).toHaveLength(6)
     expect(terminalWins.calls.filter(call => call.sql.includes('INSERT INTO "agent_items"'))).toHaveLength(1)
     expect(terminalWins.calls.filter(call => call.sql.includes('UPDATE "agent_steps"'))).toHaveLength(1)
     expect(terminalWins.calls.filter(call => call.sql.includes('UPDATE "agent_turns"'))).toHaveLength(1)

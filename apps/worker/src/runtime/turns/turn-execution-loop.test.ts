@@ -2562,6 +2562,7 @@ describe("owner-agnostic turn execution loop", () => {
       calls.push({ sql, values })
       if (sql === "BEGIN") timeline.push("terminal-transaction-began")
       if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
+      if (sql.includes("pg_current_xact_id")) return { rows: [{ xid8: "42" }], rowCount: 1 }
       if (sql.includes('SELECT "id" FROM "agent_sessions"') || sql.includes('SELECT session."id"')) return { rows: [{ id: "session-1" }], rowCount: 1 }
       if (sql.includes('SELECT turn."id"')) return { rows: [{ id: "turn-1" }], rowCount: 1 }
       if (sql.includes('SELECT "id","status","leaseOwner","attemptCount","interruptRequestedAt"')) return {

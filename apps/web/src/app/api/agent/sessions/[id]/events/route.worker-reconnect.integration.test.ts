@@ -118,6 +118,48 @@ function workerExited(child: FixtureChild): boolean {
     || (child.signalCode !== null && child.signalCode !== undefined)
 }
 
+async function workerFailureDiagnostics(db: NonNullable<typeof testDb>, sessionId: string, turnId: string): Promise<string> {
+  try {
+    const [turns, roots, steps, events, outbox] = await Promise.all([
+      db.$queryRaw<Array<Record<string, unknown>>>`
+        SELECT "id", "status", LEFT("error", 240) AS "error", "rootTaskId", "leaseOwnerId", "leaseVersion",
+               "leaseExpiresAt", "startedAt", "completedAt"
+        FROM "agent_turns" WHERE "id" = ${turnId} AND "sessionId" = ${sessionId}
+      `,
+      db.$queryRaw<Array<Record<string, unknown>>>`
+        SELECT "id", "status", "attemptCount", "leaseOwner", "leaseExpiresAt", "interruptRequestedAt", "updatedAt"
+        FROM "sub_agent_tasks" WHERE "sessionId" = ${sessionId} AND "turnId" = ${turnId} AND "parentTaskId" IS NULL
+      `,
+      db.$queryRaw<Array<Record<string, unknown>>>`
+        SELECT "id", "ordinal", "attempt", "status", "errorCode", "finishReason"
+        FROM "agent_steps" WHERE "sessionId" = ${sessionId} AND "turnId" = ${turnId}
+        ORDER BY "ordinal" DESC LIMIT 8
+      `,
+      db.$queryRaw<Array<Record<string, unknown>>>`
+        SELECT "id", "sequence"::text AS "sequence", "type", "taskId", "actor", "idempotencyKey", "correlationId", "causationId",
+               payload ->> 'boundary' AS "historyBoundary", payload ->> 'boundaryEventId' AS "historyBoundaryEventId",
+               payload ->> 'xid8' AS "historyXid8"
+        FROM "agent_events" WHERE "sessionId" = ${sessionId} AND "turnId" = ${turnId}
+        ORDER BY "sequence" ASC LIMIT 40
+      `,
+      db.$queryRaw<Array<Record<string, unknown>>>`
+        SELECT "topic", "aggregateId", "idempotencyKey", "publishedAt", "attemptCount", LEFT("lastError", 240) AS "lastError"
+        FROM "agent_outbox"
+        WHERE ("aggregateId" = ${sessionId} OR "aggregateId" = ${turnId})
+          AND "topic" IN ('agent.events', 'agent.turn.execute', 'agent.turn.dlq')
+        ORDER BY "createdAt" DESC LIMIT 40
+      `,
+    ])
+    return JSON.stringify({ turns, roots, steps, events, outbox })
+  } catch (error: unknown) {
+    return `diagnostic_query_failed:${error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300)}`
+  }
+}
+
+function recentWorkerLines(lines: readonly string[] | undefined): string {
+  return (lines ?? []).slice(-20).map(line => line.slice(0, 500)).join(" | ") || "missing"
+}
+
 async function waitForWorkerExit(child: FixtureChild, timeoutMs: number): Promise<boolean> {
   if (workerExited(child)) return true
   return new Promise(resolveExit => {
@@ -362,13 +404,15 @@ describeWithServices("agent events route replays a disconnected Worker event", (
         `
         const failure = diagnostics[0]
         const lastStep = steps[0]
+        const runtimeState = await workerFailureDiagnostics(testDatabase, sessionId, turnId)
         throw new Error(
           `Worker turn ${turnStatus}: ${turn?.error ?? "no error"}; `
           + `dlq=${failure ? `${failure.reasonCode ?? "unknown"}/${failure.errorCode ?? "unknown"}/attempt-${failure.attemptsMade ?? "unknown"}` : "missing"}; `
           + `turnError=${failures[0]?.errorCode ?? "missing"}; `
           + `step=${lastStep ? `${lastStep.status}/${lastStep.errorCode ?? "no-error-code"}/${lastStep.finishReason ?? "no-finish-reason"}` : "missing"}; `
-          + `stdout=${worker?.output.filter(line => line === "WORKER_READY" || line === "FIXTURE_MODEL_USED").join("|") ?? "missing"}; `
-          + `stderr=${worker?.errors.join("|") ?? "missing"}`,
+          + `exit=${worker?.exitCode ?? "running"}/${worker?.signalCode ?? "no-signal"}; `
+          + `stdout=${recentWorkerLines(worker?.output)}; stderr=${recentWorkerLines(worker?.errors)}; `
+          + `runtime=${runtimeState}`,
         )
       }
       await new Promise(resolveWait => setTimeout(resolveWait, 50))

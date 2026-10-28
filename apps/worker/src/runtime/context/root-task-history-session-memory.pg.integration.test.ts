@@ -12,6 +12,7 @@ import { executionOwnerFence, type TurnExecutionOwnerFence } from "../execution-
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
 import { releaseTurnLease, type TurnLease } from "../turns/lease.js"
 import { readRootTaskHistoryChronologyWitness } from "./root-task-history-chronology-witness.js"
+import { updateRootObjectiveHistoryProjection } from "./objective-history-projection.js"
 import { readRootTaskHistoryFence, type RootTaskHistoryFenceInput } from "./root-task-history-fence.js"
 import { readRootTaskHistoryCandidates } from "./root-task-history-source-store.js"
 
@@ -332,9 +333,21 @@ async function readChronologyWitness(input: {
 }
 
 async function setMatchingHistoryObjective(fixture: Fixture): Promise<void> {
-  await pool!.query(`UPDATE "sub_agent_tasks" SET "successCriteria"=$2::jsonb
-    WHERE "id"=$1 AND "sessionId"=$3 AND "turnId"=$4`,
-  [fixture.rootTaskId, JSON.stringify(["Find roles matching the candidate's engineering experience"]), fixture.sessionId, fixture.turnId])
+  const client = await pool!.connect()
+  try {
+    await client.query("BEGIN")
+    await client.query("SELECT set_config('app.user_id',$1,true)", [fixture.userId])
+    const updated = await client.query(`UPDATE "sub_agent_tasks" SET "successCriteria"=$2::jsonb
+      WHERE "id"=$1 AND "sessionId"=$3 AND "turnId"=$4`,
+    [fixture.rootTaskId, JSON.stringify(["Find roles matching the candidate's engineering experience"]), fixture.sessionId, fixture.turnId])
+    if (updated.rowCount !== 1 || !await updateRootObjectiveHistoryProjection(client, {
+      userId: fixture.userId, sessionId: fixture.sessionId, turnId: fixture.turnId, rootTaskId: fixture.rootTaskId,
+    })) throw new Error("History fixture objective projection did not persist")
+    await client.query("COMMIT")
+  } catch (error: unknown) {
+    await client.query("ROLLBACK").catch(() => undefined)
+    throw error
+  } finally { client.release() }
 }
 
 async function chronologyState(sessionId: string) {
@@ -388,7 +401,7 @@ describePg("root task history Session authorization PostgreSQL serialization", (
       await waitForAdvisoryWait(workerApplication)
       await blocker.query("COMMIT")
       const [revoked, result] = await Promise.all([revoke, authorize]) as [unknown, Awaited<typeof authorize>]
-      expect(revoked).toMatchObject({ kind: "updated", consent: { enabled: false, version: 2 } })
+      expect(revoked).toEqual({ enabled: false, version: 2 })
       expect(result).toMatchObject({ historyReadAllowed: false, workResult: "ordinary context still built",
         authorization: { consentEnabled: false, consentVersion: 2 } })
       expect(await countMarkers(sessionId)).toMatchObject({ events: "1", outboxes: "1", eventSequence: "1" })
@@ -421,7 +434,7 @@ describePg("root task history Session authorization PostgreSQL serialization", (
     const [result, revoked] = await Promise.all([authorization, revocation])
     expect(result).toMatchObject({ historyReadAllowed: true, workResult: "authorized while lock held",
       authorization: { consentEnabled: true, consentVersion: 1 } })
-    expect(revoked).toMatchObject({ kind: "updated", consent: { enabled: false, version: 2 } })
+    expect(revoked).toEqual({ enabled: false, version: 2 })
 
     const laterSession = await createSession(userId), later = await createTurn(userId, laterSession)
     const laterResult = await withContextTransaction(later, async (_client, _authorization, allowed) => {
@@ -595,10 +608,10 @@ describePg("root task history Session authorization PostgreSQL serialization", (
     expect(afterRelease.candidates.map(candidate => candidate.turnId)).not.toContain(source.turnId)
   })
 
-  it("excludes a same-session failure whose final release follows the current start witness", async () => {
+  it("makes a same-session failed outcome visible only after its release commits before the next Turn", async () => {
     const userId = await createUser(), sessionId = await createSession(userId)
-    const source = await createTurn(userId, sessionId), current = await createTurn(userId, sessionId)
-    await Promise.all([setMatchingHistoryObjective(source), setMatchingHistoryObjective(current)])
+    const source = await createTurn(userId, sessionId)
+    await setMatchingHistoryObjective(source)
     await setConsent(userId, true, 0)
     await appendRootTurnStarted(source)
     const failureKey = `turn:${source.turnId}:event:turn-failed:provider_error`
@@ -613,21 +626,41 @@ describePg("root task history Session authorization PostgreSQL serialization", (
     [JSON.stringify({ status: "failed", stepCount: 1, toolCallCount: 0, finalItemId: null, waitId: null }), new Date(),
       source.rootTaskId, source.sessionId, source.turnId])
 
+    const releaseApp = `history-chrono-same-session-release-${suffix}`
+    const gate: PgGate = { sessionId, point: "before_commit", reached: deferred<void>(), resume: deferred<void>() }
+    const release = releaseTurnLease(testPool(releaseApp, gate) as never, source.lease, "failed", new Date())
+    let current: Fixture | undefined
+    let currentCreation: Promise<Fixture> | undefined
+    try {
+      await gate.reached.promise
+      const pidResult = await pool!.query<{ pid: number }>(`SELECT pid FROM pg_stat_activity
+        WHERE application_name=$1 ORDER BY backend_start DESC LIMIT 1`, [releaseApp])
+      const releasePid = Number(pidResult.rows[0]?.pid)
+      if (!Number.isSafeInteger(releasePid) || releasePid < 1) throw new Error("Could not find gated release transaction")
+      currentCreation = createTurn(userId, sessionId)
+      await waitForBlockedBy(workerApplication, releasePid)
+      gate.resume.resolve()
+      const [released, created] = await Promise.all([release, currentCreation])
+      expect(released).toBe(true)
+      current = created
+    } finally {
+      gate.resume.resolve()
+      await Promise.allSettled([release, ...(currentCreation ? [currentCreation] : [])])
+    }
+    if (!current) throw new Error("Same-session next Turn was not created after release")
+    await setMatchingHistoryObjective(current)
     const currentStart = await appendRootTurnStarted(current)
-    const beforeRelease = await readCrossSessionCandidates(current)
-    expect(beforeRelease.candidates.map(candidate => candidate.turnId)).not.toContain(source.turnId)
-    expect(await releaseTurnLease(testPool(`history-chrono-same-session-release-${suffix}`) as never, source.lease, "failed", new Date())).toBe(true)
 
+    const currentHistory = await readCrossSessionCandidates(current)
     const terminalWitness = await readChronologyWitness({ userId, sessionId, turnId: source.turnId,
       rootTaskId: source.rootTaskId, boundary: "root_terminal", boundaryEventId: failure.id })
     expect(terminalWitness).toBeDefined()
-    expect(BigInt(terminalWitness!.xid8)).toBeGreaterThan(BigInt(beforeRelease.fence.currentStartWitness!.xid8))
+    expect(currentHistory.candidates.map(candidate => candidate.turnId)).toContain(source.turnId)
+    expect(BigInt(terminalWitness!.xid8)).toBeLessThan(BigInt(currentHistory.fence.currentStartWitness!.xid8))
     const sequences = await pool!.query<{ terminal: string; started: string }>(`SELECT
       (SELECT "sequence"::text FROM "agent_events" WHERE "id"=$1) AS "terminal",
       (SELECT "sequence"::text FROM "agent_events" WHERE "id"=$2) AS "started"`, [failure.id, currentStart.id])
     expect(BigInt(sequences.rows[0]?.terminal ?? "0")).toBeLessThan(BigInt(sequences.rows[0]?.started ?? "0"))
-    const afterRelease = await readCrossSessionCandidates(current)
-    expect(afterRelease.candidates.map(candidate => candidate.turnId)).not.toContain(source.turnId)
   })
 
   it("rolls back terminal state, witness, outbox, and sequence together", async () => {

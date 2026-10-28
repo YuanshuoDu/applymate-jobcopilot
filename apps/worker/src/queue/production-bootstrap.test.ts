@@ -395,11 +395,18 @@ function durableCompositionPool(input: {
           state.turn.status = "waiting_for_dependency"; state.turn.leaseOwnerId = null; state.turn.leaseExpiresAt = null; state.turn.leaseStartedAt = null
         } else if (sql.includes("SET \"status\" = 'queued'")) {
           state.turn.status = "queued"; state.turn.leaseOwnerId = null; state.turn.leaseExpiresAt = null; state.turn.leaseStartedAt = null
-        } else if (sql.includes('SET "status" = $5')) {
+        } else if (sql.includes('SET "status"=$5')) {
           const currentNow = params[5] instanceof Date ? params[5] : new Date(String(params[5]))
-          const owned = String(params[0]) === state.turn.id && String(params[1]) === state.turn.sessionId && String(params[2]) === state.turn.leaseOwnerId && Number(params[3]) === state.turn.leaseVersion && state.turn.leaseExpiresAt !== null && state.turn.leaseExpiresAt.getTime() > currentNow.getTime()
+          const requestedStatus = String(params[4])
+          const allowedStatus = state.turn.status === "in_progress"
+            || state.turn.status === "waiting_for_user" && requestedStatus === "waiting_for_user"
+            || state.turn.status === "waiting_for_approval" && requestedStatus === "waiting_for_approval"
+          const owned = String(params[0]) === state.turn.id && String(params[1]) === state.turn.sessionId
+            && String(params[2]) === state.turn.leaseOwnerId && Number(params[3]) === state.turn.leaseVersion
+            && String(params[6]) === state.turn.userId && state.turn.leaseExpiresAt !== null
+            && state.turn.leaseExpiresAt.getTime() > currentNow.getTime() && allowedStatus
           if (!owned) return response<T>([], 0)
-          state.turn.status = String(params[4]); state.turn.leaseOwnerId = null; state.turn.leaseExpiresAt = null; state.turn.leaseStartedAt = null
+          state.turn.status = requestedStatus; state.turn.leaseOwnerId = null; state.turn.leaseExpiresAt = null; state.turn.leaseStartedAt = null
           return response<T>([], 1)
         }
         return response<T>([], 1)
@@ -692,6 +699,7 @@ describe("production Worker bootstrap", () => {
     const client = {
       query: vi.fn(async (sql: string) => {
         queries.push(sql)
+        if (sql.includes("pg_current_xact_id")) return { rows: [{ xid8: "42" }], rowCount: 1 }
         if (sql.includes('SELECT session."id"')) return { rows: [{ id: lease.sessionId }], rowCount: 1 }
         if (sql.includes('UPDATE "agent_turns"')) return { rows: [], rowCount: 1 }
         return { rows: [], rowCount: 1 }
@@ -715,7 +723,7 @@ describe("production Worker bootstrap", () => {
     })).rejects.toBe(failure)
 
     expect(events).toEqual(["turn.pause", "turn.abort", "turn.close", "manager.shutdown", "runtime.close"])
-    expect(queries.some(sql => sql.includes('SET "status" = $5'))).toBe(true)
+    expect(queries.some(sql => sql.replace(/\s+/g, "").includes('SET"status"=$5'))).toBe(true)
     expect(canonical.close).toHaveBeenCalledOnce()
   })
 
