@@ -10,6 +10,10 @@ import { acquireRootTaskHistoryChronologyLock, appendRootTaskHistoryChronologyWi
 import type { TurnLease } from "../turns/lease.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
+const SOURCE_SEQUENCE_STRIDE = 6
+const CURRENT_START_SEQUENCE = 10_000
+const FIXTURE_EVENT_SEQUENCE = 20_000
+const SCHEDULED_FIXTURE_EVENT_SEQUENCE = 30_000
 function disposableUrl(): string | null {
   const required = process.env.AGENT_RUNTIME_PG_TEST_REQUIRED === "true", value = process.env.AGENT_RUNTIME_PG_TEST_URL
   if (process.env.CI !== "true" && !required) return null
@@ -207,18 +211,34 @@ async function insertSession(id: string, owner: string, sequence: number): Promi
     VALUES ($1, $2, $3, 'running', 'test', $4, CURRENT_TIMESTAMP)`, [id, owner, objective, sequence])
 }
 
+function terminalEventKey(source: Source): string {
+  const status = source.status ?? "completed"
+  return status === "completed" ? `turn:${source.turnId}:event:turn-completed`
+    : status === "failed" ? `turn:${source.turnId}:event:turn-failed:task_failed`
+      : `turn:${source.turnId}:event:turn-interrupted`
+}
+
 type EventReceipt = Readonly<{
   id: string; sessionId: string; turnId: string; taskId: string; sequence: number
-  itemId: string | null; type: string; correlationId: string; idempotencyKey: string; payload: unknown
+  itemId: string | null; type: string; correlationId: string; causationId: string | null; idempotencyKey: string; payload: unknown
 }>
 
 async function insertEventOutbox(client: PoolClient, event: EventReceipt): Promise<void> {
   const payload = { eventId: event.id, sessionId: event.sessionId, turnId: event.turnId, taskId: event.taskId,
     itemId: event.itemId, sequence: String(event.sequence), type: event.type, actor: "orchestrator",
-    correlationId: event.correlationId, causationId: null, idempotencyKey: event.idempotencyKey, payload: event.payload }
+    correlationId: event.correlationId, causationId: event.causationId, idempotencyKey: event.idempotencyKey, payload: event.payload }
   await client.query(`INSERT INTO "agent_outbox" ("id","topic","aggregateId","idempotencyKey","payload")
     VALUES ($1,'agent.events',$2,$3,$4::jsonb)`,
   [`agent-outbox-${event.id}`, event.sessionId, `agent-event:${event.id}`, JSON.stringify(payload)])
+}
+
+async function insertBoundaryEvent(client: PoolClient, event: EventReceipt, createdAt: Date): Promise<void> {
+  await client.query(`INSERT INTO "agent_events" ("id","sessionId","turnId","itemId","taskId","sequence","type","actor",
+    "correlationId","causationId","idempotencyKey","payload","createdAt")
+    VALUES ($1,$2,$3,$4,$5,$6,$7,'orchestrator',$8,$9,$10,$11::jsonb,$12)`,
+  [event.id, event.sessionId, event.turnId, event.itemId, event.taskId, event.sequence, event.type, event.correlationId,
+    event.causationId, event.idempotencyKey, JSON.stringify(event.payload), createdAt])
+  await insertEventOutbox(client, event)
 }
 
 async function insertCurrentStartBoundary(): Promise<void> {
@@ -228,8 +248,8 @@ async function insertCurrentStartBoundary(): Promise<void> {
     await client.query("SELECT set_config($1,$2,true)", ["app.user_id", userId])
     const lock = await acquireRootTaskHistoryChronologyLock(client, userId)
     const event: EventReceipt = { id: `root-history-current-start-${suffix}`, sessionId, turnId: currentTurnId,
-      taskId: currentRootTaskId, sequence: 1000, itemId: null, type: "turn.started", correlationId: currentTurnId,
-      idempotencyKey: `turn:${currentTurnId}:event:turn-started`,
+      taskId: currentRootTaskId, sequence: CURRENT_START_SEQUENCE, itemId: null, type: "turn.started", correlationId: currentTurnId,
+      causationId: null, idempotencyKey: `turn:${currentTurnId}:event:turn-started`,
       payload: { goal: objective, taskId: currentRootTaskId, rootTaskId: currentRootTaskId } }
     await client.query(`INSERT INTO "agent_events" ("id","sessionId","turnId","itemId","taskId","sequence","type","actor","correlationId","idempotencyKey","payload","createdAt")
       VALUES ($1,$2,$3,NULL,$4,$5,$6,'orchestrator',$7,$8,$9::jsonb,$10)`,
@@ -248,6 +268,8 @@ async function insertCurrentStartBoundary(): Promise<void> {
 async function insertSourceBoundaryEvents(input: Readonly<{
   source: Source; startSequence: number; terminalSequence: number; terminalItemId: string | null
   terminalType: string; correlationId: string; terminalKey: string; terminalPayload: unknown
+  terminalCausationId: string | null; stepReceipts: readonly EventReceipt[]; completedReceipts: readonly EventReceipt[]
+  writeTerminalWitness: boolean
   startCreatedAt: Date; terminalCreatedAt: Date
 }>): Promise<void> {
   const { source } = input, client = await pool!.connect()
@@ -257,24 +279,22 @@ async function insertSourceBoundaryEvents(input: Readonly<{
     const lock = await acquireRootTaskHistoryChronologyLock(client, source.userId)
     const start: EventReceipt = { id: `root-history-start-${source.turnId}`, sessionId: source.sessionId,
       turnId: source.turnId, taskId: source.rootTaskId, sequence: input.startSequence, itemId: null,
-      type: "turn.started", correlationId: source.turnId, idempotencyKey: `turn:${source.turnId}:event:turn-started`,
+      type: "turn.started", correlationId: source.turnId, causationId: null,
+      idempotencyKey: `turn:${source.turnId}:event:turn-started`,
       payload: { goal: source.goal, taskId: source.rootTaskId, rootTaskId: source.rootTaskId } }
-    const terminal: EventReceipt = { id: `root-history-terminal-${source.turnId}`, sessionId: source.sessionId,
+    const terminal: EventReceipt = { id: input.terminalKey, sessionId: source.sessionId,
       turnId: source.turnId, taskId: source.rootTaskId, sequence: input.terminalSequence, itemId: input.terminalItemId,
-      type: input.terminalType, correlationId: input.correlationId, idempotencyKey: input.terminalKey, payload: input.terminalPayload }
-    await client.query(`INSERT INTO "agent_events" ("id","sessionId","turnId","itemId","taskId","sequence","type","actor","correlationId","idempotencyKey","payload","createdAt")
-      VALUES ($1,$2,$3,$4,$5,$6,$7,'orchestrator',$8,$9,$10::jsonb,$11),
-        ($12,$2,$3,$13,$5,$14,$15,'orchestrator',$16,$17,$18::jsonb,$19)`,
-    [start.id, source.sessionId, source.turnId, start.itemId, source.rootTaskId, start.sequence, start.type,
-      start.correlationId, start.idempotencyKey, JSON.stringify(start.payload), input.startCreatedAt,
-      terminal.id, terminal.itemId, terminal.sequence, terminal.type, terminal.correlationId, terminal.idempotencyKey,
-      JSON.stringify(terminal.payload), input.terminalCreatedAt])
-    await insertEventOutbox(client, start)
-    await insertEventOutbox(client, terminal)
+      type: input.terminalType, correlationId: input.correlationId, causationId: input.terminalCausationId,
+      idempotencyKey: input.terminalKey, payload: input.terminalPayload }
+    await insertBoundaryEvent(client, start, input.startCreatedAt)
+    for (const receipt of input.stepReceipts) await insertBoundaryEvent(client, receipt, input.startCreatedAt)
+    for (const receipt of input.completedReceipts) await insertBoundaryEvent(client, receipt, input.terminalCreatedAt)
+    await insertBoundaryEvent(client, terminal, input.terminalCreatedAt)
     await appendRootTaskHistoryChronologyWitness(client, { userId: source.userId, sessionId: source.sessionId,
       turnId: source.turnId, rootTaskId: source.rootTaskId, boundary: "turn_start", boundaryEventId: start.id }, lock)
-    await appendRootTaskHistoryChronologyWitness(client, { userId: source.userId, sessionId: source.sessionId,
-      turnId: source.turnId, rootTaskId: source.rootTaskId, boundary: "root_terminal", boundaryEventId: terminal.id }, lock)
+    if (input.writeTerminalWitness) await appendRootTaskHistoryChronologyWitness(client, { userId: source.userId,
+      sessionId: source.sessionId, turnId: source.turnId, rootTaskId: source.rootTaskId,
+      boundary: "root_terminal", boundaryEventId: terminal.id }, lock)
     await client.query("COMMIT")
   } catch (error: unknown) {
     await client.query("ROLLBACK").catch(() => undefined)
@@ -323,35 +343,63 @@ async function insertSource(source: Source): Promise<void> {
     VALUES ($1, $2, $3, $4, 'task_graph', 'completed', 1, $5::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
       ($6, $2, $3, $4, 'agent_message', 'completed', 0, '{"text":"done"}'::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
   [taskGraphItemId(source.rootTaskId), source.sessionId, source.turnId, source.rootTaskId, JSON.stringify(graph), source.finalItemId])
-  const terminalSequence = source.startSequence + (status === "completed" ? 3 : 2)
+  const startSequence = source.startSequence * SOURCE_SEQUENCE_STRIDE
+  const duplicateStepReceipt = source.stepReceipt === "duplicate"
+  const itemStartedOffset = duplicateStepReceipt ? 3 : 2
+  const itemCompletedOffset = duplicateStepReceipt ? 4 : 3
+  const terminalOffset = status === "completed" ? (duplicateStepReceipt ? 5 : 4) : 2
+  const terminalSequence = startSequence + terminalOffset
   const terminalType = status === "completed" ? "turn.completed" : status === "failed" ? "turn.failed" : "turn.interrupted"
   const terminalItemId = status === "completed" ? source.finalItemId : null
   const sourceStepId = `source-step-${source.turnId}`
+  const stepReceipts: EventReceipt[] = []
   if (status === "completed") {
     await pool!.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
       VALUES ($1, $2, $3, $4, 1, 1, $5, 0, '[]'::jsonb, '{}'::jsonb)`,
     [sourceStepId, source.sessionId, source.turnId, source.rootTaskId, source.stepStatus ?? "completed"])
+    await pool!.query(`UPDATE "agent_items" SET "stepId"=$1,"phase"='final_answer',"revision"=1
+      WHERE "id"=$2 AND "sessionId"=$3 AND "turnId"=$4 AND "taskId"=$5 AND "type"='agent_message'`,
+    [sourceStepId, source.finalItemId, source.sessionId, source.turnId, source.rootTaskId])
     if (source.stepReceipt !== "missing") {
       const count = source.stepReceipt === "duplicate" ? 2 : 1
       for (let index = 0; index < count; index += 1) {
         const stepPayload = { stepId: sourceStepId, status: source.stepReceipt === "mismatched" ? "failed" : "completed", taskId: source.rootTaskId }
         const key = `turn:${source.turnId}:event:step-completed:${sourceStepId}${index ? `:duplicate-${index}` : ""}`
-        await pool!.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload", "createdAt")
-          VALUES ($1, $2, $3, NULL, $4, $5, 'step.completed', 'orchestrator', $6, $7, $8::jsonb, $9)`,
-        [`root-history-step-completed-${index}-${source.turnId}`, source.sessionId, source.turnId, source.rootTaskId,
-          source.startSequence + 1 + index, sourceStepId, key, JSON.stringify(stepPayload), startCreatedAt])
+        stepReceipts.push({ id: `root-history-step-completed-${index}-${source.turnId}`, sessionId: source.sessionId,
+          turnId: source.turnId, taskId: source.rootTaskId, sequence: startSequence + (duplicateStepReceipt && index === 1 ? 2 : 1 + index),
+          itemId: null, type: "step.completed", correlationId: sourceStepId, causationId: null,
+          idempotencyKey: key, payload: stepPayload })
       }
     }
   }
   const correlationId = status === "completed" ? (source.correlationTargetId ?? sourceStepId) : source.turnId
   const errorCode = status === "failed" ? "task_failed" : status === "interrupted" ? "interrupted" : undefined
-  const terminalKey = status === "completed" ? `turn:${source.turnId}:event:turn-completed`
-    : status === "failed" ? `turn:${source.turnId}:event:turn-failed:${errorCode}` : `turn:${source.turnId}:event:turn-interrupted`
-  const terminalPayload = status === "completed" ? { turnId: source.turnId, taskId: source.rootTaskId, finalItemId: source.finalItemId }
+  const terminalKey = terminalEventKey(source)
+  const terminalPayload = status === "completed" ? { turnId: source.turnId, taskId: source.rootTaskId, finalItemId: source.finalItemId,
+    usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } }
     : status === "failed" ? { turnId: source.turnId, taskId: source.rootTaskId, errorCode, finalItemId: null }
       : { turnId: source.turnId, taskId: source.rootTaskId, errorCode }
-  await insertSourceBoundaryEvents({ source, startSequence: source.startSequence, terminalSequence, terminalItemId,
-    terminalType, correlationId, terminalKey, terminalPayload, startCreatedAt, terminalCreatedAt })
+  const startEventId = `root-history-start-${source.turnId}`
+  const itemStartedId = `turn:${source.turnId}:event:item-started:${source.finalItemId}`
+  const itemCompletedId = `turn:${source.turnId}:event:final-completed:${source.finalItemId}:1`
+  const completedReceipts: EventReceipt[] = status === "completed" ? [
+    { id: itemStartedId, sessionId: source.sessionId, turnId: source.turnId, taskId: source.rootTaskId,
+      sequence: startSequence + itemStartedOffset, itemId: source.finalItemId, type: "item.started",
+      correlationId: sourceStepId, causationId: stepReceipts[0]?.id ?? startEventId, idempotencyKey: itemStartedId,
+      payload: { itemId: source.finalItemId, type: "agent_message", phase: "final_answer" } },
+    { id: itemCompletedId, sessionId: source.sessionId, turnId: source.turnId, taskId: source.rootTaskId,
+      sequence: startSequence + itemCompletedOffset, itemId: source.finalItemId, type: "item.completed",
+      correlationId: source.finalItemId, causationId: itemStartedId, idempotencyKey: itemCompletedId,
+      payload: { itemId: source.finalItemId, status: "completed", content: { text: "done" } } },
+  ] : []
+  const terminalCausationId = completedReceipts[completedReceipts.length - 1]?.id ?? null
+  // Keep malformed completed rows as rejection fixtures without fabricating witnesses for invalid receipts.
+  const writeTerminalWitness = status !== "completed"
+    || ((source.stepStatus === undefined || source.stepStatus === "completed")
+      && (source.correlationTargetId === undefined || source.correlationTargetId === sourceStepId))
+  await insertSourceBoundaryEvents({ source, startSequence, terminalSequence, terminalItemId,
+    terminalType, correlationId, terminalKey, terminalPayload, terminalCausationId, stepReceipts, completedReceipts, writeTerminalWitness,
+    startCreatedAt, terminalCreatedAt })
 }
 
 async function projectSources(sources: readonly Source[]): Promise<void> {
@@ -363,7 +411,7 @@ async function projectSources(sources: readonly Source[]): Promise<void> {
       const objectiveProjected = await updateRootObjectiveHistoryProjection(client, identity)
       if (!objectiveProjected) throw new Error(`Objective-history projection failed for ${source.turnId}`)
       const terminalProjected = await updateRootObjectiveHistoryProjection(client, identity,
-        { terminalEventId: `root-history-terminal-${source.turnId}` })
+        { terminalEventId: terminalEventKey(source) })
       if (!terminalProjected) throw new Error(`Objective-history terminal projection failed for ${source.turnId}`)
     }
     await client.query("COMMIT")
@@ -429,10 +477,10 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       leaseStartedAt: new Date(), leaseExpiresAt: new Date(Date.now() + 5 * 60_000) }
     await insertUser(userId)
     await insertUser(otherUserId)
-    await insertSession(sessionId, userId, 2200)
-    await insertSession(otherSessionId, userId, 500)
-    await insertSession(foreignSessionId, otherUserId, 4)
-    await insertSession(archivedSessionId, userId, 4)
+    await insertSession(sessionId, userId, FIXTURE_EVENT_SEQUENCE)
+    await insertSession(otherSessionId, userId, FIXTURE_EVENT_SEQUENCE)
+    await insertSession(foreignSessionId, otherUserId, FIXTURE_EVENT_SEQUENCE)
+    await insertSession(archivedSessionId, userId, FIXTURE_EVENT_SEQUENCE)
     await pool.query(`UPDATE "agent_sessions" SET "status" = 'archived' WHERE "id" = $1`, [archivedSessionId])
     for (const source of matching) await insertSource(source)
     await insertSource(mismatched)
@@ -490,7 +538,7 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
 
     expect(history.map(item => item.sourceTurnId)).toEqual([matching[1]!.turnId, matching[0]!.turnId])
     expect(history.map(item => item.sourceRootTaskId)).toEqual([matching[1]!.rootTaskId, matching[0]!.rootTaskId])
-    expect(history.map(item => item.terminalSequence)).toEqual([7n, 4n])
+    expect(history.map(item => item.terminalSequence)).toEqual([32n, 10n])
     expect(history.map(item => item.taskGraph.nodes.length)).toEqual([4, 1])
     expect(history[0]?.nodeLessons?.map(lesson => lesson?.executionFailureCategory)).toEqual([
       undefined, "execution_setup_unavailable", "resume_state_unavailable", "structured_output_invalid",
@@ -746,8 +794,8 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
         }
       })
     const mismatchedRoles = mismatchGroup("targetRoles", 800, 2)
-    // Keep each four-event Turn range unique within this session. The earlier
-    // baseline fixture reserves sequences 1101–1104 for its future Turn.
+    // Keep each six-event Turn range unique within this session. The earlier
+    // baseline fixture reserves sequences 12606–12610 for its future Turn.
     const mismatchedLocations = mismatchGroup("targetLocations", 1120, 3)
     const mismatchedMinScores = mismatchGroup("minScore", 1380, 4)
     const hugeExponentMalformed: Source = {
@@ -780,9 +828,8 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     const mismatchedCriteria = [...mismatchedRoles, ...mismatchedLocations, ...mismatchedMinScores]
     const sources = [...malformedSameSession, ...mismatchedCriteria, hugeExponentMalformed,
       matchingSameSession, numericBoundaryMatch, matchingCrossSession]
-    await pool!.query(`UPDATE "agent_events" SET "sequence" = 2000 WHERE "id" = $1`, [`root-history-current-start-${suffix}`])
-    await pool!.query(`UPDATE "agent_sessions" SET "eventSequence" = 3000 WHERE "id" = $1`, [sessionId])
-    await pool!.query(`UPDATE "agent_sessions" SET "eventSequence" = 2000 WHERE "id" = $1`, [otherSessionId])
+    await pool!.query(`UPDATE "agent_sessions" SET "eventSequence" = $2 WHERE "id" = $1`, [sessionId, SCHEDULED_FIXTURE_EVENT_SEQUENCE])
+    await pool!.query(`UPDATE "agent_sessions" SET "eventSequence" = $2 WHERE "id" = $1`, [otherSessionId, SCHEDULED_FIXTURE_EVENT_SEQUENCE])
     for (const source of sources) await insertSource(source)
     const hugeExponentInput = JSON.stringify(hugeExponentMalformed.input).replace('"minScore":70', '"minScore":1e10000')
     const preciseBoundaryInput = JSON.stringify(numericBoundaryMatch.input)
