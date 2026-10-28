@@ -179,9 +179,19 @@ function createSqlFixture(ids: { turnId: string; sessionId: string; userId: stri
           leaseStartedAt: state.turn.leaseStartedAt, leaseExpiresAt: state.turn.leaseExpiresAt,
         }], rowCount: 1 }
       }
-      if (sql.includes('UPDATE "agent_turns"') && sql.includes('SET "status" = $5')) {
-        const [turnId, sessionId, ownerId, leaseVersion, status] = values
-        if (state.turn.id !== turnId || state.turn.sessionId !== sessionId || state.turn.leaseOwnerId !== ownerId || state.turn.leaseVersion !== leaseVersion) return none
+      if (sql.includes('UPDATE "agent_turns"') && /SET\s+"status"\s*=\s*\$5/.test(sql)) {
+        const fencedUpdate = /WHERE\s+"id"\s*=\s*\$1\s+AND\s+"sessionId"\s*=\s*\$2\s+AND\s+"leaseOwnerId"\s*=\s*\$3\s+AND\s+"leaseVersion"\s*=\s*\$4\s+AND\s+"userId"\s*=\s*\$7/i.test(sql)
+          && /AND\s+"leaseExpiresAt"\s*>\s*\$6/i.test(sql)
+          && /AND\s*\(\s*"status"\s*=\s*'in_progress'\s+OR\s*\(\s*"status"\s*=\s*'waiting_for_user'\s+AND\s+\$5\s*=\s*'waiting_for_user'\s*\)\s+OR\s*\(\s*"status"\s*=\s*'waiting_for_approval'\s+AND\s+\$5\s*=\s*'waiting_for_approval'\s*\)\s*\)/i.test(sql)
+        if (!fencedUpdate) throw new Error("Turn lease release fixture expected owner/version/user/expiry/status predicates")
+        const [turnId, sessionId, ownerId, leaseVersion, status, now, userId] = values
+        const hasOpenLease = state.turn.leaseExpiresAt instanceof Date && now instanceof Date
+          && state.turn.leaseExpiresAt.getTime() > now.getTime()
+        const statusMatches = state.turn.status === "in_progress"
+          || (state.turn.status === "waiting_for_user" && status === "waiting_for_user")
+          || (state.turn.status === "waiting_for_approval" && status === "waiting_for_approval")
+        if (state.turn.id !== turnId || state.turn.sessionId !== sessionId || state.turn.userId !== userId
+          || state.turn.leaseOwnerId !== ownerId || state.turn.leaseVersion !== leaseVersion || !hasOpenLease || !statusMatches) return none
         state.turn.status = String(status)
         state.turn.leaseOwnerId = null
         state.turn.leaseStartedAt = null
@@ -319,7 +329,8 @@ describeWithRedis("production Turn dispatch and consumer (real Redis/BullMQ)", (
     await firstBootstrap.turns.worker.waitUntilReady()
 
     const firstJobId = turnJobId(ids.turnId, 0)
-    await waitForCompletedJob(observerQueue!, firstJobId)
+    const firstJob = await waitForCompletedJob(observerQueue!, firstJobId)
+    expect(firstJob.returnvalue).toMatchObject({ status: "completed" })
     expect(executions).toEqual([{ ...ids, ownerId: payload.ownerId, leaseVersion: 1 }])
     expect(fixture.state.turn.status).toBe("completed")
     expect(fixture.state.outbox?.publishedAt).toBeInstanceOf(Date)
