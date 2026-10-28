@@ -12,7 +12,8 @@ import { withTaskGraphCurrentPlanningObservation } from "./canonical-turn-task-g
 import { classifyCurrentTaskGraphExecutionFailure } from "./subagents/task-graph-failure-category.js"
 import { TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON } from "./subagents/task-graph-child-deadline.js"
 import { hasTaskGraphVerificationUnverifiedFailureReason, projectTaskGraphStructuredFailureCategory, taskGraphStructuredFailureCategoryBytes } from "./subagents/task-graph-structured-failure-category.js"
-import { parseTaskGraphCurrentDiscoveryAttemptHealth } from "./subagents/task-graph-discovery-attempt-health.js"
+import { parseTaskGraphCurrentDiscoveryAttemptHealth, parseTaskGraphCurrentDiscoveryQueryFootprint,
+  type TaskGraphDiscoveryTurnEligibility } from "./subagents/task-graph-discovery-attempt-health.js"
 import { withTaskGraphRootSourceIntent } from "./subagents/task-graph-source-intent-context.js"
 import { taskGraphReviewConflictObservation } from "./context/task-graph-review-conflicts.js"
 const SELECTED_JOB_ROOT_TOOLS = new Set(["agent.plan", "agent.wait", "agent.list", "list_subagents", "agent.ask_user", "agent.reconcile"])
@@ -62,7 +63,7 @@ function stringList(value: unknown, maxItems: number, maxLength: number, path: s
   if (!Array.isArray(value) || value.length > maxItems) throw new Error(`task_graph_current_state_invalid:${path}`)
   return value.map((item, index) => text(item, maxLength, `${path}[${index}]`))
 }
-function node(value: unknown): TaskGraphCurrentNode {
+function node(value: unknown, turn: TaskGraphDiscoveryTurnEligibility): TaskGraphCurrentNode {
   const row = record(value)
   if (!row || typeof row.status !== "string" || !STATUSES.has(row.status) || typeof row.readiness !== "string" || !READINESS.has(row.readiness)) throw new Error("task_graph_current_state_invalid:node")
   const key = text(row.key, 128, "key"), taskId = text(row.taskId, 128, "taskId")
@@ -71,6 +72,7 @@ function node(value: unknown): TaskGraphCurrentNode {
   if (!verification) throw new Error("task_graph_current_state_invalid:verification")
   const native = nativeGraphNodeFields(row)
   const discoveryAttemptHealth = parseTaskGraphCurrentDiscoveryAttemptHealth(row, { templateId, status: row.status, verification: verification.verification, repairOf: verification.repairOf, repairReceipt: verification.repairReceipt, native: Boolean(native.native), nativeResult: Boolean(native.nativeResult) })
+  const discoveryQueryFootprint = parseTaskGraphCurrentDiscoveryQueryFootprint(row, { templateId, status: row.status, verification: verification.verification, repairOf: verification.repairOf, repairReceipt: verification.repairReceipt, native: Boolean(native.native), nativeResult: Boolean(native.nativeResult) }, turn)
   const failureReason = ownEnumerableDataValue(row, "failureReason")
   const resumeFailureReason = failureReason === "child_resume_unavailable" || failureReason === "child_resume_evidence_unavailable"
   const report = verification.verificationReport
@@ -96,6 +98,7 @@ function node(value: unknown): TaskGraphCurrentNode {
     status: row.status as TaskGraphCurrentNode["status"], readiness: row.readiness as TaskGraphCurrentNode["readiness"],
     resultSummary: null,
     resultProjection: parseTaskGraphResultProjection(row.resultProjection), ...(discoveryAttemptHealth ? { discoveryAttemptHealth } : {}),
+    ...(discoveryQueryFootprint ? { discoveryQueryFootprint } : {}),
     ...verification, ...native, ...(executionFailureCategory ? { executionFailureCategory } : {}), ...(structuredOutputFailureCategory ? { structuredOutputFailureCategory } : {}),
     failureReason: null,
   }
@@ -109,11 +112,14 @@ export function mergeTaskGraphCurrentObservation(snapshot: StepContextSnapshot, 
   let projectedBytes = 0
   let projectedItems = 0
   let verificationBytes = 0
+  let queryFootprintBytes = 0
+  const turn: TaskGraphDiscoveryTurnEligibility = ownEnumerableDataValue(state, "discoveryTurnEligibility") === "ordinary" ? "ordinary" : "unknown"
   const nodes = state.nodes.map(value => {
-    const item = node(value)
+    const item = node(value, turn)
     const bytes = taskGraphResultProjectionBytes(item.resultProjection!)
     const count = taskGraphResultProjectionItems(item.resultProjection!)
     verificationBytes += taskGraphCurrentVerificationMetadataBytes(item) + Math.max(0, taskGraphStructuredFailureCategoryBytes(item.structuredOutputFailureCategory) - 1) + (item.discoveryAttemptHealth ? Buffer.byteLength(JSON.stringify(item.discoveryAttemptHealth), "utf8") : 0)
+    if (item.discoveryQueryFootprint) queryFootprintBytes += Buffer.byteLength(JSON.stringify(item.discoveryQueryFootprint), "utf8")
     if (verificationBytes > MAX_VERIFICATION_CONTEXT_BYTES) throw new Error("task_graph_current_verification_too_large")
     if (projectedBytes + bytes > MAX_RESULT_PROJECTION_TOTAL_BYTES
       || projectedItems + count > MAX_RESULT_PROJECTION_TOTAL_ITEMS) {
@@ -125,11 +131,13 @@ export function mergeTaskGraphCurrentObservation(snapshot: StepContextSnapshot, 
   })
   const keys = new Set(nodes.map(item => item.key))
   if (keys.size !== nodes.length || !validateTaskGraphCurrentVerificationGraph(nodes)) throw new Error("task_graph_current_state_invalid:dependencies")
+  const contextNodes = verificationBytes + queryFootprintBytes <= MAX_VERIFICATION_CONTEXT_BYTES ? nodes
+    : nodes.map(({ discoveryQueryFootprint: _omitted, ...item }) => item)
   let planningFacts: unknown
   try { planningFacts = Object.getOwnPropertyDescriptor(state, "planningFacts")?.value } catch { planningFacts = undefined }
   const baseContent = withTaskGraphCurrentPlanningObservation({
     kind: "task_graph_current", revision: Number(state.revision),
-    ...(rootSuccessCriteria?.length ? { rootSuccessCriteria } : {}), ...taskGraphReviewConflictObservation(nodes), nodes,
+    ...(rootSuccessCriteria?.length ? { rootSuccessCriteria } : {}), ...taskGraphReviewConflictObservation(contextNodes), nodes: contextNodes,
   }, planningFacts, Number(state.revision), nodes, MAX_TEXT)
   let sourceIntent: unknown
   try { sourceIntent = Object.getOwnPropertyDescriptor(state, "sourceIntent")?.value } catch { sourceIntent = undefined }

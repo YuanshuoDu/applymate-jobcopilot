@@ -5,7 +5,7 @@ import { createJobsDiscoverTool, type JobDiscoveryExecutionFence } from "../tool
 import { JobDiscoveryClientError, type JobDiscoveryClient, type JobDiscoveryUsageSummary } from "../tools/job-discovery-client.js"
 import { ToolRegistry } from "../tools/registry.js"
 import { ToolRouter } from "../tools/router.js"
-import type { RuntimeToolDefinition } from "../tools/types.js"
+import type { RuntimeToolDefinition, ToolExecutionContext } from "../tools/types.js"
 
 import {
   createChildDiscoveryAttemptCollector,
@@ -14,6 +14,7 @@ import {
   parseDiscoveryAttemptSidecar,
 } from "./child-discovery-attempt.js"
 import type { DiscoveryAttemptLifecycleEvent, LifecycleCall } from "../tools/lifecycle.js"
+import { captureDiscoveryQueryCriteria } from "./child-discovery-query-footprint.js"
 
 const fence = { taskId: "task-1", rootTaskId: "root-1", sessionId: "session-1", turnId: "turn-1", attemptCount: 2 }
 const call: LifecycleCall = {
@@ -45,6 +46,14 @@ function observe(collector: ReturnType<typeof createChildDiscoveryAttemptCollect
   collector.observeLifecycleEvent(event)
 }
 
+function executionContext(overrides: Partial<ToolExecutionContext> = {}): ToolExecutionContext {
+  return {
+    scope: { userId: "user-1" }, sessionId: call.sessionId, turnId: call.turnId, stepId: call.stepId,
+    toolCallId: call.id, taskId: call.taskId, rootTaskId: call.rootTaskId, actorRole: "subagent",
+    signal: new AbortController().signal, capabilities: ["read"], reportProgress: async () => undefined, ...overrides,
+  }
+}
+
 describe("child discovery attempt health", () => {
   it("distinguishes a captured empty response from provider failure and does not claim search exhaustion", () => {
     const collector = createChildDiscoveryAttemptCollector(fence)
@@ -58,6 +67,7 @@ describe("child discovery attempt health", () => {
         attemptedCalls: 1, completedCalls: 1, failedCalls: 0, unresolvedCalls: 0,
         candidateCount: 0, providerFailures: 0, materializationFailures: 0, hasMore: false,
       },
+      queryFootprint: { schemaVersion: "agent-harness.v2.task-graph.discovery-query-footprint.v1", availability: "omitted", omissionReason: "capture_unavailable" },
     })
     const failedProviders = createChildDiscoveryAttemptCollector(fence)
     observe(failedProviders, { call, phase: "started" })
@@ -126,6 +136,49 @@ describe("child discovery attempt health", () => {
       attemptedCalls: 1, completedCalls: 0, failedCalls: 0, unresolvedCalls: 1,
       candidateCount: null, providerFailures: null, materializationFailures: null, hasMore: null,
     })
+  })
+
+  it("pairs effective criteria with the exact started call and projects only cursor presence and receipt counters", () => {
+    const collector = createChildDiscoveryAttemptCollector(fence)
+    const captured = captureDiscoveryQueryCriteria({ targetRoles: ["Engineer"], targetLocations: ["Dublin"], source: "greenhouse", pageSize: 20, cursor: "opaque-private-cursor" })
+    observe(collector, { call, phase: "started" })
+    collector.observeEffectiveCriteria(executionContext(), captured)
+    observe(collector, { call, phase: "completed", output: output() })
+
+    expect(collector.sidecar()?.queryFootprint).toEqual({
+      schemaVersion: "agent-harness.v2.task-graph.discovery-query-footprint.v1", availability: "available",
+      calls: [{ criteria: { targetRoles: ["Engineer"], targetLocations: ["Dublin"], source: "greenhouse", pageSize: 20, hasCursor: true },
+        outcome: "completed", requestCount: 1, observedCandidateCount: 0, providerFailures: 0, materializationFailures: 0, hasMore: false }],
+    })
+    expect(JSON.stringify(collector.sidecar())).not.toContain("opaque-private-cursor")
+    expect(JSON.stringify(collector.sidecar())).not.toContain(call.id)
+    expect(JSON.stringify(collector.sidecar())).not.toContain(call.stepId)
+  })
+
+  it("keeps failed and unresolved search counts unknown and fails query capture closed without changing health", () => {
+    const failed = createChildDiscoveryAttemptCollector(fence)
+    observe(failed, { call, phase: "started" })
+    failed.observeEffectiveCriteria(executionContext(), captureDiscoveryQueryCriteria({ targetRoles: ["Engineer"], targetLocations: [] }))
+    observe(failed, { call, phase: "failed", output: { usage: failureUsage() } })
+    expect(failed.sidecar()?.queryFootprint).toMatchObject({ availability: "available", calls: [{
+      outcome: "failed", requestCount: 2, observedCandidateCount: null, providerFailures: 1,
+      materializationFailures: 2, hasMore: null,
+    }] })
+
+    const unresolved = createChildDiscoveryAttemptCollector(fence)
+    observe(unresolved, { call, phase: "started" })
+    unresolved.observeEffectiveCriteria(executionContext(), captureDiscoveryQueryCriteria({ targetRoles: ["Engineer"], targetLocations: [] }))
+    expect(unresolved.sidecar()?.queryFootprint).toMatchObject({ availability: "available", calls: [{
+      outcome: "unresolved", requestCount: null, observedCandidateCount: null, providerFailures: null,
+      materializationFailures: null, hasMore: null,
+    }] })
+
+    const mismatched = createChildDiscoveryAttemptCollector(fence)
+    observe(mismatched, { call, phase: "started" })
+    mismatched.observeEffectiveCriteria(executionContext({ toolCallId: "other-call" }), captureDiscoveryQueryCriteria({ targetRoles: ["Engineer"], targetLocations: [] }))
+    observe(mismatched, { call, phase: "completed", output: output() })
+    expect(mismatched.sidecar()?.health.completedCalls).toBe(1)
+    expect(mismatched.sidecar()?.queryFootprint).toMatchObject({ availability: "omitted", omissionReason: "capture_unavailable" })
   })
 
   it("deduplicates identical lifecycle callbacks and rejects conflicting or terminal-only events", () => {

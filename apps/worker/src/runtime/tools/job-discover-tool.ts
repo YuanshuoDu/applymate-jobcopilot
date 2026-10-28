@@ -3,6 +3,7 @@ import { schemaVersion } from "@jobcopilot/agent-protocol"
 
 import { JobDiscoveryClientError, type JobDiscoveryClient, type JobDiscoveryCriteria, type JobDiscoveryRequest } from "./job-discovery-client.js"
 import { ToolExecutionError, type RuntimeToolDefinition, type ToolExecutionContext } from "./types.js"
+import { captureDiscoveryQueryCriteria, type DiscoveryQueryCapture } from "../subagents/child-discovery-query-footprint.js"
 
 const id = Type.String({ minLength: 1, maxLength: 256 })
 const nonEmptyText = (maxLength: number) => Type.String({ minLength: 1, maxLength })
@@ -39,7 +40,11 @@ export type JobDiscoveryExecutionFence = Readonly<{
   userId: string; sessionId: string; turnId: string; taskId: string; rootTaskId: string
   role: "scout"; leaseOwner: string; attemptCount: number
 }>
-export type JobDiscoverToolOptions = Readonly<{ client: JobDiscoveryClient; fence: JobDiscoveryExecutionFence }>
+export type JobDiscoverToolOptions = Readonly<{
+  client: JobDiscoveryClient
+  fence: JobDiscoveryExecutionFence
+  onEffectiveCriteria?: (context: ToolExecutionContext, capture: DiscoveryQueryCapture) => void
+}>
 
 type TrustedDiscoveryScope = Omit<JobDiscoveryRequest, keyof JobDiscoveryCriteria>
 
@@ -72,6 +77,7 @@ export function createJobsDiscoverTool(options: JobDiscoverToolOptions): Runtime
         ...(input.source === undefined ? {} : { source: input.source }), ...(input.pageSize === undefined ? {} : { pageSize: input.pageSize }),
         ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
       }
+      try { options.onEffectiveCriteria?.(context, captureDiscoveryQueryCriteria(criteria)) } catch { /* Footprint capture cannot change discovery. */ }
       try {
         const output = await options.client.discover({ ...trusted, ...criteria }, context.signal)
         if (context.signal.aborted) throw new JobDiscoveryClientError("cancelled")

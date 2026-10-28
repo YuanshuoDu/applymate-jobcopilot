@@ -624,13 +624,18 @@ describe("production child runtime", () => {
         attemptedCalls: 1, completedCalls: 1, failedCalls: 0, unresolvedCalls: 0,
         candidateCount: 1, providerFailures: 0, materializationFailures: 0, hasMore: false,
       },
+      queryFootprint: {
+        schemaVersion: "agent-harness.v2.task-graph.discovery-query-footprint.v1", availability: "available",
+        calls: [{ criteria: { targetRoles: ["Engineer"], targetLocations: ["Dublin"], pageSize: 2, hasCursor: false },
+          outcome: "completed", requestCount: 1, observedCandidateCount: 1, providerFailures: 0, materializationFailures: 0, hasMore: false }],
+      },
     } })
     expect(provenanceQueries).toEqual([
       "BEGIN", "SELECT set_config($1, $2, true)", expect.stringContaining('FROM "agent_items" AS item'), "COMMIT",
     ])
     expect(provenanceParameters[1]).toEqual(["app.user_id", ownerUserId])
     expect(provenanceConnection.release).toHaveBeenCalledOnce()
-    expect(JSON.stringify(scoutChildResult.discoveryAttempt)).not.toMatch(/provider-private|ledgerKey|toolCallId|sessionId|turnId|stepId|estimatedCost/i)
+    expect(JSON.stringify(scoutChildResult.discoveryAttempt)).not.toMatch(/provider-private|ledgerKey|toolCallId|sessionId|turnId|stepId|estimatedCost|providerUrl|jobId/i)
     const scoutResult = completedResult(scoutChildResult.structuredResult)
     const savedScoutJob = [...savedJobs.values()].find(row => row.userId === ownerUserId && row.url === providerUrl)
     if (!savedScoutJob) throw new Error("the production discovery route did not materialize the owner job")
