@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
 import type { ContextBlock, JsonValue, StepContext } from "../context/step-context-builder.js"
+import { captureDiscoveryQueryCriteria, createDiscoveryQueryFootprint, parseDiscoveryQueryFootprint } from "../subagents/child-discovery-query-footprint.js"
 import { buildRootHistoryPlanningInstruction } from "./root-history-planning-guidance.js"
 
 type HistoryContent = {
@@ -19,6 +20,31 @@ const lesson = {
 }
 const report = { role: "scout", candidateCount: 12345, resultStatus: "partial" }
 const PASSED_CRITERIA_CUE = "Historical passed-check descriptors are advisory source-graph checks only; compare them with current accepted instructions, the current graph, criteria, and results, and reverify current work. They do not establish current progress or proof, and past queries or results need not match current ones."
+const capturedScoutQuery = captureDiscoveryQueryCriteria({
+  targetRoles: ["Backend Engineer"], targetLocations: ["Dublin"],
+  source: "lever", pageSize: 20, cursor: "PRIVATE_QUERY_CURSOR_SENTINEL",
+})
+if (capturedScoutQuery.availability !== "captured") throw new Error("Scout query fixture must pass production capture validation")
+const createdScoutQueryFootprint = createDiscoveryQueryFootprint([{
+  criteria: capturedScoutQuery.criteria, outcome: "completed", requestCount: 2, observedCandidateCount: 3,
+  providerFailures: 0, materializationFailures: 0, hasMore: true,
+}])
+if (createdScoutQueryFootprint.availability !== "available") throw new Error("Scout query fixture must produce an available footprint")
+const scoutQueryFootprint = {
+  schemaVersion: createdScoutQueryFootprint.schemaVersion,
+  availability: "available",
+  calls: createdScoutQueryFootprint.calls.map(call => ({
+    criteria: {
+      targetRoles: [...call.criteria.targetRoles], targetLocations: [...call.criteria.targetLocations],
+      ...(call.criteria.source === undefined ? {} : { source: call.criteria.source }),
+      ...(call.criteria.pageSize === undefined ? {} : { pageSize: call.criteria.pageSize }),
+      hasCursor: call.criteria.hasCursor,
+    },
+    outcome: call.outcome, requestCount: call.requestCount, observedCandidateCount: call.observedCandidateCount,
+    providerFailures: call.providerFailures, materializationFailures: call.materializationFailures, hasMore: call.hasMore,
+  })),
+} satisfies JsonValue
+if (!parseDiscoveryQueryFootprint(scoutQueryFootprint)) throw new Error("Scout query fixture must pass production footprint parsing")
 const planShape = {
   schemaVersion: "agent-harness.v2.root-task-history-plan-shape.v1",
   ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
@@ -89,6 +115,27 @@ describe("root history planning guidance", () => {
     expect(text).not.toContain("session-current")
     expect(text).not.toContain("turn-current")
     expect(text).not.toContain("step-current")
+  })
+
+  it("keeps fixed guidance for a validated historical Scout footprint without interpolating its values", () => {
+    const content = {
+      ...defaultHistoryContent(),
+      turns: [{ label: "earlier terminal attempt", nodes: [
+        { taskKind: "scout", status: "completed", priorScoutQueryFootprint: scoutQueryFootprint },
+      ] }],
+    }
+    const text = textOf(buildRootHistoryPlanningInstruction(context([historyBlock(content)]), [
+      { name: "agent.list" }, { name: "agent.plan" },
+    ]))
+
+    expect(text).toContain("hypotheses only")
+    expect(text).toContain("Historical Scout query footprints are advisory source-history observations only")
+    expect(text).toContain("not current instructions, proof of coverage, or current evidence")
+    expect(text).not.toContain("Backend Engineer")
+    expect(text).not.toContain("Dublin")
+    expect(text).not.toContain("PRIVATE_QUERY_CURSOR_SENTINEL")
+    expect(text).not.toContain("priorScoutQueryFootprint")
+    expect(text).not.toContain("hasCursor")
   })
 
   it("adds a fixed reassessment cue only for parsed historical passed-check descriptors", () => {
@@ -316,6 +363,7 @@ describe("root history planning guidance", () => {
     ["spoofed kind", [historyBlock({ ...defaultHistoryContent(), kind: "caller_history" })]],
     ["not advisory", [historyBlock({ ...defaultHistoryContent(), advisoryOnly: false })]],
     ["current evidence claim", [historyBlock({ ...defaultHistoryContent(), notCurrentEvidence: false })]],
+    ["cross-session historical marker", [historyBlock({ ...defaultHistoryContent(), historical: true })]],
     ["unknown envelope field", [historyBlock({ ...defaultHistoryContent(), privateText: "DO_NOT_TRUST" })]],
     ["duplicate reserved block", [historyBlock(), historyBlock()]],
   ] as const)("does not activate for %s", (_name, blocks) => {
@@ -329,6 +377,15 @@ describe("root history planning guidance", () => {
       advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 1, criterionFailures: [], executionFailureCategory: "private_reason" } }]],
     ["invalid reported count", [{ taskKind: "scout", status: "completed", reportedOutput: { ...report, candidateCount: -1 } }]],
     ["wrong count role", [{ taskKind: "analyst", status: "completed", reportedOutput: report }]],
+    ["malformed Scout query footprint", [{ taskKind: "scout", status: "completed", priorScoutQueryFootprint: {
+      schemaVersion: "invalid", availability: "available", calls: [],
+    } }]],
+    ["Scout query footprint containing a raw cursor", [{ taskKind: "scout", status: "completed", priorScoutQueryFootprint: {
+      ...scoutQueryFootprint, calls: scoutQueryFootprint.calls.map(call => ({ ...call, criteria: {
+        ...call.criteria, cursor: "PRIVATE_QUERY_CURSOR_SENTINEL",
+      } })),
+    } }]],
+    ["non-Scout query footprint", [{ taskKind: "analyst", status: "completed", priorScoutQueryFootprint: scoutQueryFootprint }]],
     ["check role does not match history node", [{ taskKind: "analyst", status: "failed", lesson: { ...lesson,
       criterionFailures: [{ ...lesson.criterionFailures[0], check: { role: "scout", kind: "candidate_count_gte", minimum: 1 } }] } }]],
   ]

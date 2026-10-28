@@ -16,6 +16,7 @@ import { currentTaskGraph } from "../subagents/task-graph-pg-state.js"
 import { validateRoleResult } from "../subagents/role-results.js"
 import { taskGraphResultDigest } from "../subagents/task-graph-pg-verification.js"
 import { parseRootTaskHistoryReportedOutput, type RootTaskHistoryReportedOutput } from "./root-task-history-result-counts.js"
+import { projectRootTaskHistoryGraph } from "./root-task-history-discovery-footprint.js"
 import { describeValidatedRootTaskHistoryChecks, filterRootTaskHistoryLessonsForEmittedNodes,
   parseRootTaskHistoryNodeLesson, type RootTaskHistoryCheckDescriptor, type RootTaskHistoryNodeLesson } from "./root-task-history-lesson-schema.js"
 import { copyRootTaskHistoryPassedCriteria, deriveRootTaskHistoryPassedCriteria } from "./root-task-history-passed-criteria.js"
@@ -217,7 +218,7 @@ export function deriveRootTaskHistoryLessonFacts(loaded: LoadedGraph, currentGra
 export function projectLoadedRootTaskHistoryGraph(loaded: LoadedGraph, historicalOnly = false): LoadedRootTaskHistoryGraphProjection | undefined {
   if (!loaded.item || !loaded.snapshot || !loaded.state || loaded.item.revision !== loaded.state.revision
     || loaded.snapshot.nodes.length < 1 || loaded.snapshot.nodes.length > MAX_NODES) return undefined
-  const taskGraph = currentTaskGraph(loaded), ordinalByKey = new Map(loaded.snapshot.nodes.map((node, index) => [node.key, index + 1] as const))
+  const taskGraph = projectRootTaskHistoryGraph(currentTaskGraph(loaded), historicalOnly), ordinalByKey = new Map(loaded.snapshot.nodes.map((node, index) => [node.key, index + 1] as const))
   if (taskGraph.revision !== loaded.state.revision || taskGraph.nodes.length !== loaded.snapshot.nodes.length) return undefined
   const ordinals: number[] = [], seen = new Set<number>()
   for (const node of taskGraph.nodes) {

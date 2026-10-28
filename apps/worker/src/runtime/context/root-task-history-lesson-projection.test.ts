@@ -8,6 +8,8 @@ import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "../subagents
 import { resolveTaskGraphRepairDependencies } from "../subagents/task-graph-dependency-context.js"
 import { TASK_GRAPH_NATIVE_METADATA_VERSION, TASK_GRAPH_NATIVE_TEMPLATE_ID } from "../subagents/task-graph-native-state.js"
 import { ROLE_RESULT_SCHEMA, validateRoleResult } from "../subagents/role-results.js"
+import { DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION } from "../subagents/child-discovery-attempt.js"
+import { createDiscoveryQueryFootprint } from "../subagents/child-discovery-query-footprint.js"
 
 const ROOT = "private-root-id"
 const CRITERIA = [
@@ -166,7 +168,50 @@ function reportedOutputFixture(): LoadedGraph {
   return { ...loaded, tasks, state: { ...state, repairSatisfiedNodeKeys: [], repairPendingNodeKeys: [] } }
 }
 
+function discoveryFootprintFixture(options: { attemptCount?: number; turn?: "ordinary" | "scheduled" } = {}): LoadedGraph {
+  const envelope = { role: "scout", taskType: "job_discovery", expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
+    allowedActions: ["jobs.discover"] }
+  const snapshot = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [{
+    key: "query-scout-private", templateId: "scout", goal: "private search objective", successCriteria: ["find candidates"],
+    dependsOn: [], depth: 1, taskId: "query-task-private", verificationDisposition: "typed", verification: CONTRACT,
+    registeredScoutEnvelope: envelope,
+  }] })
+  const attemptCount = options.attemptCount ?? 2
+  const query = createDiscoveryQueryFootprint([{ criteria: { targetRoles: ["Backend Engineer"], targetLocations: ["Dublin"],
+    source: "lever", pageSize: 20, hasCursor: false }, outcome: "unresolved", requestCount: null, observedCandidateCount: null,
+    providerFailures: null, materializationFailures: null, hasMore: null }])
+  const health = { schemaVersion: DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION, attemptedCalls: 1, completedCalls: 0, failedCalls: 0,
+    unresolvedCalls: 1, candidateCount: null, providerFailures: null, materializationFailures: null, hasMore: null }
+  const task: GraphTaskRow = { id: "query-task-private", status: "failed", role: "scout", taskType: "job_discovery",
+    expectedOutputSchema: envelope.expectedOutputSchema, allowedActions: envelope.allowedActions, attemptCount,
+    failureReason: "task_graph_verification_failed",
+    result: { taskGraphVerificationReport: report("failed"), discoveryAttempt: { attemptCount: 2, health, queryFootprint: query } } }
+  const tasks = new Map([[task.id, task]])
+  const state = taskGraphState(snapshot, 11, new Map([[task.id, { status: task.status, failureReason: task.failureReason }]]), [])
+  const loaded: LoadedGraph = { rootTaskId: ROOT, snapshot, state, tasks, discoveryTurnEligibility: options.turn ?? "ordinary",
+    item: { id: "query-item-private", revision: 11, content: snapshot, createdAt: new Date(0) } }
+  return loaded
+}
+
 describe("root history ordinal lessons", () => {
+  it("carries only the exact ordinary typed Scout attempt footprint and removes it for cross-session history", () => {
+    const loaded = discoveryFootprintFixture(), ordinary = projectLoadedRootTaskHistoryGraph(loaded)
+    expect(ordinary?.taskGraph.discoveryTurnEligibility).toBe("ordinary")
+    expect(ordinary?.taskGraph.nodes[0]?.discoveryQueryFootprint).toMatchObject({
+      availability: "available", calls: [{ criteria: { targetRoles: ["Backend Engineer"], targetLocations: ["Dublin"], source: "lever",
+        pageSize: 20, hasCursor: false }, outcome: "unresolved", requestCount: null, observedCandidateCount: null, hasMore: null }],
+    })
+    const historical = projectLoadedRootTaskHistoryGraph(loaded, true)
+    expect(historical?.taskGraph).not.toHaveProperty("discoveryTurnEligibility")
+    expect(historical?.taskGraph.nodes[0]).not.toHaveProperty("discoveryQueryFootprint")
+
+    const stale = projectLoadedRootTaskHistoryGraph(discoveryFootprintFixture({ attemptCount: 3 }))
+    expect(stale?.taskGraph).not.toHaveProperty("discoveryTurnEligibility")
+    expect(stale?.taskGraph.nodes[0]).not.toHaveProperty("discoveryQueryFootprint")
+    const scheduled = projectLoadedRootTaskHistoryGraph(discoveryFootprintFixture({ turn: "scheduled" }))
+    expect(scheduled?.taskGraph.nodes[0]).not.toHaveProperty("discoveryQueryFootprint")
+  })
+
   it("projects only a failed coverage check and its source-local Scout ordinal", () => {
     const coverageSnapshot = parseTaskGraphSnapshot({ schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
       { key: "scout-private-key", templateId: "scout", goal: "private source goal", successCriteria: ["find"], dependsOn: [], depth: 1,

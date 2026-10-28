@@ -9,9 +9,9 @@ import type { TaskGraphVerificationReasonCode } from "../planning/task-graph-ver
 import type { SubagentTaskStatus } from "../subagents/types.js"
 import type { ContextSeedBlock } from "./step-context-builder.js"
 import { filterRootTaskHistoryLessonsForEmittedNodes, parseRootTaskHistoryNodeLesson, sanitizeRootTaskHistoryNodeLessonForCrossSession, type RootTaskHistoryNodeLesson } from "./root-task-history-lesson-projection.js"
+import { projectRootTaskHistoryDiscoveryFootprint, type RootTaskHistoryDiscoveryFootprint } from "./root-task-history-discovery-footprint.js"
 import { parseRootTaskHistoryReportedOutput, type RootTaskHistoryReportedOutput } from "./root-task-history-result-counts.js"
 import * as rootTaskHistoryPlanShape from "./root-task-history-plan-shape.js"
-
 export type ValidatedRootTaskHistoryOutcome = Readonly<{
   sourceTurnId: string
   sourceRootTaskId: string
@@ -22,17 +22,12 @@ export type ValidatedRootTaskHistoryOutcome = Readonly<{
   reportedOutputs?: readonly (RootTaskHistoryReportedOutput | undefined)[]
 }>
 type TaskKind = "scout" | "analyst" | "writer" | "reviewer" | "other"
-type SafeNode = Readonly<{
-  taskKind: TaskKind
-  status: SubagentTaskStatus
-  negativeReasonHints?: readonly TaskGraphVerificationReasonCode[]
-  lesson?: RootTaskHistoryNodeLesson
-  reportedOutput?: RootTaskHistoryReportedOutput
-}>
-type CandidateNode = Readonly<{ nodeOrdinal: number; projection: Omit<SafeNode, "lesson" | "reportedOutput">; lesson?: RootTaskHistoryNodeLesson; reportedOutput?: RootTaskHistoryReportedOutput }>
+type SafeNode = Readonly<{ taskKind: TaskKind; status: SubagentTaskStatus; negativeReasonHints?: readonly TaskGraphVerificationReasonCode[];
+  lesson?: RootTaskHistoryNodeLesson; reportedOutput?: RootTaskHistoryReportedOutput; priorScoutQueryFootprint?: RootTaskHistoryDiscoveryFootprint }>
+type CandidateNode = Readonly<{ nodeOrdinal: number; projection: Omit<SafeNode, "lesson" | "reportedOutput" | "priorScoutQueryFootprint">; lesson?: RootTaskHistoryNodeLesson; reportedOutput?: RootTaskHistoryReportedOutput; priorScoutQueryFootprint?: RootTaskHistoryDiscoveryFootprint }>
 type Candidate = Readonly<{ sourceTurnId: string; sourceRootTaskId: string; terminalSequence: bigint; terminalAt?: Date; sourceSessionDiffers: boolean; safeNodes: readonly CandidateNode[];
   lessonsBySourceOrdinal?: readonly (RootTaskHistoryNodeLesson | undefined)[]; planShape?: rootTaskHistoryPlanShape.RootTaskHistoryPlanShape; identity: string }>
-type SelectedTurn = { label: string; candidate: Candidate; nodes: CandidateNode[]; lessonOrdinals: Set<number>; reportedOutputOrdinals: Set<number>; planShape?: rootTaskHistoryPlanShape.RootTaskHistoryPlanShape }
+type SelectedTurn = { label: string; candidate: Candidate; nodes: CandidateNode[]; lessonOrdinals: Set<number>; reportedOutputOrdinals: Set<number>; footprintOrdinals: Set<number>; planShape?: rootTaskHistoryPlanShape.RootTaskHistoryPlanShape }
 type Row = Record<string, unknown>
 const MAX_CANDIDATES = 64
 const MAX_TURNS = 2
@@ -134,19 +129,20 @@ function candidate(value: unknown, crossSession: boolean): Candidate | null {
   const keys = ["sourceRootTaskId", "sourceTurnId", "taskGraph", "terminalSequence", ...(crossSession ? [...(hasSourceSessionDiffers ? ["sourceSessionDiffers"] : []), "terminalAt"] : []),
     ...(hasOrdinals ? ["sourceNodeOrdinals"] : []), ...(hasLessons ? ["nodeLessons"] : []), ...(hasOutputs ? ["reportedOutputs"] : [])].sort().join(",")
   if (!exact(item, keys)) return null
-  const graph = record(item.taskGraph)
-  if (!graph || !exact(graph, "nodes,revision") || !Number.isSafeInteger(graph.revision) || Number(graph.revision) < 0
+  const graph = record(item.taskGraph), graphTurn = graph && ownDataProperty(graph, "discoveryTurnEligibility")
+  if (!graph || !graphTurn || !exact(graph, ["nodes", "revision", ...(graphTurn.present ? ["discoveryTurnEligibility"] : [])].sort().join(","))
+    || graphTurn.present && graphTurn.value !== "ordinary" || !Number.isSafeInteger(graph.revision) || Number(graph.revision) < 0
     || !Array.isArray(graph.nodes) || graph.nodes.length < 1 || graph.nodes.length > MAX_NODES || !dense(graph.nodes)) return null
-  const ordinals = hasOrdinals ? rootTaskHistoryPlanShape.parseRootTaskHistorySourceOrdinals(item.sourceNodeOrdinals, graph.nodes.length) : undefined
-  const effectiveOrdinals = ordinals ?? graph.nodes.map((_, index) => index + 1)
+  const ordinals = hasOrdinals ? rootTaskHistoryPlanShape.parseRootTaskHistorySourceOrdinals(item.sourceNodeOrdinals, graph.nodes.length) : undefined,
+    effectiveOrdinals = ordinals ?? graph.nodes.map((_, index) => index + 1), ordinaryScoutHistory = graphTurn.present
   const planShape = !sourceSessionDiffers && ordinals ? rootTaskHistoryPlanShape.buildRootTaskHistoryPlanShape(graph, item.sourceNodeOrdinals) : undefined
   const lessons = hasLessons && ordinals ? nodeLessons(item.nodeLessons, graph.nodes.length, ordinals, graph.nodes) : undefined
   const outputs = hasOutputs ? reportedOutputs(item.reportedOutputs, graph.nodes) : undefined
   const nodes = graph.nodes.map((value, index) => {
-    const projection = projectNode(value)
+    const projection = projectNode(value), priorScoutQueryFootprint = ordinaryScoutHistory ? projectRootTaskHistoryDiscoveryFootprint(value) : undefined
     return projection ? { nodeOrdinal: effectiveOrdinals[index]!, projection,
       ...(lessons?.[effectiveOrdinals[index]! - 1] ? { lesson: lessons[effectiveOrdinals[index]! - 1] } : {}),
-      ...(outputs?.[index] ? { reportedOutput: outputs[index] } : {}) } : null
+      ...(outputs?.[index] ? { reportedOutput: outputs[index] } : {}), ...(priorScoutQueryFootprint ? { priorScoutQueryFootprint } : {}) } : null
   })
   if (nodes.some(node => node === null)) return null
   const safeNodes = (nodes as CandidateNode[]).sort((left, right) =>
@@ -176,9 +172,10 @@ function emittedNodes(turn: SelectedTurn, withLessons: boolean, withReportedOutp
   const byOrdinal = new Map<number, RootTaskHistoryNodeLesson>()
   for (const fact of facts) if (fact) byOrdinal.set(fact.nodeOrdinal, fact)
   return turn.nodes.map(node => {
-    const lesson = byOrdinal.get(node.nodeOrdinal), publicLesson = lesson && turn.candidate.sourceSessionDiffers ? sanitizeRootTaskHistoryNodeLessonForCrossSession(lesson) : lesson
+    const lesson = byOrdinal.get(node.nodeOrdinal), publicLesson = lesson && turn.candidate.sourceSessionDiffers ? sanitizeRootTaskHistoryNodeLessonForCrossSession(lesson) : lesson,
+      priorScoutQueryFootprint = !turn.candidate.sourceSessionDiffers && turn.footprintOrdinals.has(node.nodeOrdinal) ? node.priorScoutQueryFootprint : undefined
     const reportedOutput = withReportedOutputs && !turn.candidate.sourceSessionDiffers && turn.reportedOutputOrdinals.has(node.nodeOrdinal) ? node.reportedOutput : undefined
-    return { ...node.projection, ...(reportedOutput ? { reportedOutput } : {}), ...(publicLesson ? { lesson: publicLesson } : {}) }
+    return { ...node.projection, ...(reportedOutput ? { reportedOutput } : {}), ...(priorScoutQueryFootprint ? { priorScoutQueryFootprint } : {}), ...(publicLesson ? { lesson: publicLesson } : {}) }
   })
 }
 function emittedTurns(turns: readonly SelectedTurn[], withLessons: boolean, withReportedOutputs: boolean) {
@@ -208,18 +205,19 @@ function projectCandidates(values: readonly Candidate[], crossSession: boolean):
   let nodeCount = 0
   for (const value of ordered) {
     if (turns.length >= MAX_TURNS || nodeCount >= MAX_NODES) break
-    const entry: SelectedTurn = { label: "earlier terminal attempt", candidate: value, nodes: [], lessonOrdinals: new Set(), reportedOutputOrdinals: new Set() }
+    const entry: SelectedTurn = { label: "earlier terminal attempt", candidate: value, nodes: [], lessonOrdinals: new Set(), reportedOutputOrdinals: new Set(), footprintOrdinals: new Set() }
     for (const node of value.safeNodes) {
       if (nodeCount >= MAX_NODES) break
       entry.nodes.push(node)
       if (node.lesson) entry.lessonOrdinals.add(node.nodeOrdinal)
-      if (node.reportedOutput) entry.reportedOutputOrdinals.add(node.nodeOrdinal)
+      if (node.reportedOutput) entry.reportedOutputOrdinals.add(node.nodeOrdinal); if (node.priorScoutQueryFootprint) entry.footprintOrdinals.add(node.nodeOrdinal)
       nodeCount += 1
     }
     rootTaskHistoryPlanShape.attachCompleteRootTaskHistoryPlanShape(entry, value.planShape, entry.nodes.map(node => node.nodeOrdinal))
     if (entry.nodes.length) turns.push(entry)
   }
   if (!turns.length) return undefined
+  for (const turn of [...turns].reverse()) for (const node of [...turn.nodes].reverse()) if (!withinContentLimit(turns, true, true, crossSession)) turn.footprintOrdinals.delete(node.nodeOrdinal)
   rootTaskHistoryPlanShape.dropRootTaskHistoryPlanShapesUntilFits(turns, selectedTurns => withinContentLimit(selectedTurns, true, true, crossSession))
   if (!withinContentLimit(turns, true, true, crossSession)) {
     for (const turn of [...turns].reverse()) for (const node of [...turn.nodes].reverse()) turn.reportedOutputOrdinals.delete(node.nodeOrdinal)
