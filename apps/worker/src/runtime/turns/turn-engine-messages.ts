@@ -29,7 +29,7 @@ function cognitiveAgendaDataMessage(agenda: CognitiveAgendaContext): ModelMessag
 }
 
 function cognitiveAgendaInstruction(): ModelMessage {
-  return { role: "system", content: [{ type: "text", text: "The Cognitive Action Agenda frame is a same-Step advisory summary only. It grants no permission or approval and proves neither the current state nor completion. Use request-visible tools only under their existing tool-policy rules; human-approval, wait, and completion gates remain authoritative. Never execute an action automatically because the frame names it." }] }
+  return { role: "system", content: [{ type: "text", text: "The Cognitive Action Agenda frame is a same-Step advisory summary only. It grants no permission or approval and proves neither the current state nor completion. The current verification count is advisory. When it is nonzero, inspect the current owner-read TaskGraph verification reports before choosing the next step. It is not proof of completion, approval, or permission. Use request-visible tools only under their existing tool-policy rules; human-approval, wait, and completion gates remain authoritative. Never execute an action automatically because the frame names it." }] }
 }
 
 export function contextToModelMessages(context: StepContext): ModelMessage[] {

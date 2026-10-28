@@ -10,6 +10,7 @@ import { nativeGraphNodeFields } from "./canonical-turn-native-graph-context.js"
 import { retireStaleTaskGraphRepair } from "./turns/completion-recovery-context.js"
 import { withTaskGraphCurrentPlanningObservation } from "./canonical-turn-task-graph-capacity.js"
 import { classifyCurrentTaskGraphExecutionFailure } from "./subagents/task-graph-failure-category.js"
+import { TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON } from "./subagents/task-graph-child-deadline.js"
 import { hasTaskGraphVerificationUnverifiedFailureReason, projectTaskGraphStructuredFailureCategory, taskGraphStructuredFailureCategoryBytes } from "./subagents/task-graph-structured-failure-category.js"
 import { parseTaskGraphCurrentDiscoveryAttemptHealth, parseTaskGraphCurrentDiscoveryQueryFootprint,
   type TaskGraphDiscoveryTurnEligibility } from "./subagents/task-graph-discovery-attempt-health.js"
@@ -82,9 +83,10 @@ function node(value: unknown, turn: TaskGraphDiscoveryTurnEligibility): TaskGrap
     && reportCriteria !== undefined && reportCriteria.length === contract.criteria.length
     && reportCriteria.every(item => item.status === "unverified" && item.reasonCode === "result_invalid")
     && (templateId === "scout" && contract.role === "scout" || templateId === "analyst" && contract.role === "analyst")
+  const unverifiedDeadlineFailure = failureReason === TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON && report?.status === "unverified"
   const executionFailureCategory = resumeFailureReason && !unverifiedResumeFailure ? undefined
     : classifyCurrentTaskGraphExecutionFailure(row, {
-      hasVerifiedReport: Boolean(report) && !unverifiedResumeFailure,
+      hasVerifiedReport: Boolean(report) && !unverifiedResumeFailure && !unverifiedDeadlineFailure,
       isNative: Boolean(native.native || native.nativeResult),
     })
   const structuredOutputFailureCategory = verification.repairOf || verification.repairReceipt || native.native || native.nativeResult || !hasTaskGraphVerificationUnverifiedFailureReason(row) ? undefined

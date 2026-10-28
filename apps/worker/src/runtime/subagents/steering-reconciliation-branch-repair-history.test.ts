@@ -41,6 +41,7 @@ const analystVerification = {
   role: "analyst" as const,
   criteria: [
     { id: "from-scout", check: { kind: "findings_from_scout_dependency" as const, dependencyNodeKey: "scout-old" } },
+    { id: "from-scout-union", check: { kind: "findings_from_scout_union" as const, dependencyNodeKeys: ["scout-old", "foundation"] } },
     { id: "finding-count", check: { kind: "finding_count_gte" as const, minimum: 1 } },
   ],
 }
@@ -84,7 +85,10 @@ function proposals(changedScoutMinimum?: number): TaskGraphNodeProposal[] {
   const analyst = {
     ...analystVerification,
     criteria: analystVerification.criteria.map(criterion => criterion.check.kind === "findings_from_scout_dependency"
-      ? { ...criterion, check: { ...criterion.check, dependencyNodeKey: "scout-new" } } : criterion),
+      ? { ...criterion, check: { ...criterion.check, dependencyNodeKey: "scout-new" } }
+      : criterion.check.kind === "findings_from_scout_union" ? { ...criterion,
+        check: { ...criterion.check, dependencyNodeKeys: criterion.check.dependencyNodeKeys.map(key => key === "scout-old" ? "scout-new" : key) } }
+        : criterion),
   }
   return [
     { key: "scout-new", templateId: "scout", goal: "Try a refreshed search approach", successCriteria: ["Find updated roles"],

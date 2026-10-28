@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 import { ToolRegistry } from "./registry.js"
 import type { ToolExecutionContext } from "./types.js"
-import { createTaskGraphPlanningTool } from "./planning-executors.js"
+import { createTaskGraphPlanningTool, registerTaskGraphPlanningTool } from "./planning-executors.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import type { TaskGraphCommandPort, TaskGraphScheduleReceipt, TaskGraphTaskTemplate } from "../subagents/task-graph-command-port.js"
 import { resolveRootTaskVerificationRequirements } from "../context/root-task-objective.js"
@@ -58,6 +58,30 @@ function setup(templates: Readonly<Record<string, TaskGraphTaskTemplate>> = {
 }
 
 describe("agent.plan tool executor", () => {
+  it("publishes advisory deadline replacement guidance on the registered public tool", () => {
+    const templates = {
+      scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] },
+    } as const
+    const { commandPort } = setup(templates)
+    const registry = new ToolRegistry([])
+    registerTaskGraphPlanningTool(registry, true, {
+      commandPort,
+      templates,
+      turnLeaseOwner: "server-worker",
+      turnLeaseVersion: 9,
+      parentLeaseOwner: "server-worker",
+      parentAttemptCount: () => 1,
+    })
+    const tool = registry.list(["coordination", "canManageChildren"]).find(item => item.name === "agent.plan")
+
+    expect(tool).toBeDefined()
+    expect(tool?.description).toContain("For a server-reported resume_state_unavailable failure on a fixed typed read-only Scout or Analyst")
+    expect(tool?.description).toContain("For a server-reported execution_deadline_exceeded cue for an eligible started typed Scout or Analyst, you may make the same explicit replaceOperationalFailure proposal")
+    expect(tool?.description).toContain("The cue is advisory only and grants no authority")
+    expect(tool?.description).toContain("the server independently verifies the current owner, attempt, lifecycle, durable receipt, persisted deadline, and budget before accepting it")
+    expect(tool?.description).toContain("never supply a failure reason, status, proof")
+  })
+
   it("passes server-resolved requirements to the locked scheduler and ignores model-provided requirements", async () => {
     const resolution = resolveRootTaskVerificationRequirements({ input: { verificationRequirements: {
       schemaVersion: "agent-harness.v2.objective-requirements.v1",
@@ -187,6 +211,16 @@ describe("agent.plan tool executor", () => {
     expect(tool.description).toContain("reported_score_gte checks an Analyst-reported number, not its correctness")
     expect(tool.description).toContain("findings_from_scout_dependency")
     expect(tool.description).toContain("findings_cover_scout_candidates_gte is Analyst-only")
+    expect(tool.description).toContain("Allowed checks: candidate_count_gte, finding_count_gte, evidence_count_gte, all_candidates_have_evidence, all_findings_have_evidence, reported_score_gte, findings_from_scout_dependency, findings_cover_scout_candidates_gte, findings_from_scout_union, findings_cover_scout_candidate_union_gte")
+    expect(tool.description).toContain("findings_from_scout_union is Analyst-only and selects 2 to 8 unique direct typed Scout keys")
+    expect(tool.description).toContain("it requires nonempty findings and a nonempty deduplicated candidate union, and every finding must belong to that selected group")
+    expect(tool.description).toContain("findings_cover_scout_candidate_union_gte uses its own selected group")
+    expect(tool.description).toContain("coverage is aggregate across unique candidates")
+    expect(tool.description).toContain("Each union criterion selects its own group")
+    expect(tool.description).toContain("Canonical scheduled Prepare/Gate still supports a single Scout")
+    expect(tool.description).toContain("remap dependsOn edges, scalar dependencyNodeKey selectors, and each mapped key in dependencyNodeKeys arrays. Preserve selector-array order and references outside the source-to-replacement mapping")
+    expect(tool.description).toContain("remap scalar dependencyNodeKey selectors and internal dependencyNodeKeys array entries, preserving authored order and references outside the mapping")
+    expect(tool.description).toContain("At most seven Scout nodes plus one Analyst fit before counting any other retained nodes")
     expect(tool.description).toContain("Omitting it preserves normal top-N selection")
     expect(tool.description).toContain("append exactly one cover_letter_writer directly after that Reviewer")
     expect(tool.description).toContain("the Worker does not schedule it automatically")
@@ -661,7 +695,7 @@ describe("agent.plan tool executor", () => {
     expect(description).toContain("replaceBranch: { root: { nodeKey, taskId }, sources: [{ nodeKey, taskId, replacementKey }, ...] }")
     expect(description).toContain("every node in its transitive dependsOn descendant closure")
     expect(description).toContain("preserve topology, registered roles, exact typed verification IDs/checks")
-    expect(description).toContain("remap only structured dependency selectors")
+    expect(description).toContain("remap scalar dependencyNodeKey selectors and internal dependencyNodeKeys array entries, preserving authored order and references outside the mapping")
     expect(description).toContain("replaceBranch, replaceUnstarted, and replaceOperationalFailure are mutually exclusive")
     expect(description).toContain("replaceOperationalFailure: { root: { nodeKey, taskId }, sources: [{ nodeKey, taskId, replacementKey }, ...] }")
     expect(description).toContain("one source")

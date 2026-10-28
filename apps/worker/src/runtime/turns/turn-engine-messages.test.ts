@@ -29,7 +29,7 @@ function context(): StepContext {
 }
 
 const agendaScope: CognitiveAgendaReceiptScope = { sessionId: "session-1", turnId: "turn-1", taskId: "root-1", stepId: "step-1" }
-function validAgendaReceipt(scope: CognitiveAgendaReceiptScope = agendaScope) {
+function validAgendaReceipt(scope: CognitiveAgendaReceiptScope = agendaScope, completionVerificationCount = 0) {
   const privateSignal = { count: 1, ids: ["PRIVATE_AGENDA_ID"] }
   const emptySignal = { count: 0, ids: [] }
   const receipt = buildCognitiveAgendaReceipt({ ...scope, inputThroughSequence: 7n, consumedInputIds: ["PRIVATE_RESUME_ID"], agenda: {
@@ -39,7 +39,7 @@ function validAgendaReceipt(scope: CognitiveAgendaReceiptScope = agendaScope) {
     goalRevision: 4, planRevision: 12,
     signals: {
       pendingInputs: privateSignal, approvals: privateSignal, activeWaits: emptySignal,
-      unresolved: emptySignal, completionVerification: emptySignal,
+      unresolved: emptySignal, completionVerification: { count: completionVerificationCount, ids: [] },
       steering: { present: true, fresh: false, active: privateSignal, newlyObserved: emptySignal },
     },
   } })
@@ -174,10 +174,15 @@ describe("TurnEngine model message mapping", () => {
 
   it("places a redacted same-Step agenda in untrusted user context with fixed advisory gates", () => {
     const tools = [{ name: "jobs.search", version: "1" }]
+    const currentGraph = {
+      id: "observation:task-graph-current", layer: "tool_observation" as const, role: "data" as const,
+      trust: "external_untrusted" as const, source: "tool_or_subagent",
+      content: { kind: "task_graph_current", revision: 8, nodes: [{ verificationReport: "PRIVATE_VERIFICATION_REPORT" }] },
+    }
     const request = buildModelRequest({
-      context: context(), model: { profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter,
+      context: { ...context(), blocks: [...context().blocks, currentGraph] }, model: { profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter,
       tools, sessionId: agendaScope.sessionId, turnId: agendaScope.turnId, stepId: agendaScope.stepId, userId: "user-1", taskId: agendaScope.taskId,
-      rootTaskId: agendaScope.taskId, cognitiveAgendaReceipt: validAgendaReceipt(), signal: new AbortController().signal,
+      rootTaskId: agendaScope.taskId, cognitiveAgendaReceipt: validAgendaReceipt(agendaScope, 2), signal: new AbortController().signal,
     })
     const frame = agendaFrame(request)
     const frameText = frame?.content.flatMap(part => part.type === "text" ? [part.text] : []).join("\n") ?? ""
@@ -187,7 +192,9 @@ describe("TurnEngine model message mapping", () => {
     expect(frame?.role).toBe("user")
     expect(frameText).toContain("trust=UNTRUSTED_DATA")
     expect(frameText).toContain('"nextAction":"await_approval"')
+    expect(frameText).toContain('"blockedBy":"approval"')
     expect(frameText).toContain('"approvals":1')
+    expect(frameText).toContain('"completionVerification":2')
     expect(frameText).not.toContain("PRIVATE_")
     expect(frameText).not.toContain("resumeFence")
     expect(systemText).toContain("same-Step advisory summary only")
@@ -196,6 +203,10 @@ describe("TurnEngine model message mapping", () => {
     expect(systemText).toContain("human-approval, wait, and completion gates remain authoritative")
     expect(systemText).toContain("Never execute an action automatically")
     expect(systemText).not.toContain("PRIVATE_")
+    const verificationCue = "The current verification count is advisory. When it is nonzero, inspect the current owner-read TaskGraph verification reports before choosing the next step. It is not proof of completion, approval, or permission."
+    expect(systemText.split(verificationCue)).toHaveLength(2)
+    expect(systemText).not.toContain("PRIVATE_VERIFICATION_REPORT")
+    expect(request.messages.flatMap(message => message.content).some(part => part.type === "text" && part.text.includes("PRIVATE_VERIFICATION_REPORT"))).toBe(true)
     expect(request.tools).toEqual(tools)
   })
 

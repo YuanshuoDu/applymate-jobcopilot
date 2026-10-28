@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest"
+import { redactSensitiveText } from "@jobcopilot/shared"
 const projectionMocks = vi.hoisted(() => ({ forceTruncation: false, limits: [] as number[] }))
 vi.mock("./durable-subagent-wait-store.js", async importOriginal => {
   const original = await importOriginal<typeof import("./durable-subagent-wait-store.js")>()
@@ -18,6 +19,7 @@ type Options = {
   wait?: Record<string, unknown>
   call?: Record<string, unknown>
   targets?: Array<Record<string, unknown>>
+  targetId?: string
   noCall?: boolean
   duplicateCalls?: boolean
   missingWait?: boolean
@@ -25,12 +27,13 @@ type Options = {
 }
 function fixture(options: Options = {}) {
   const createdAt = new Date(now.getTime() - 20_000)
+  const targetId = options.targetId ?? "target-1"
   const wait = {
     id: "wait-1", userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, parentTaskId: lease.id,
-    stepId: "step-1", idempotencyKey: "wait-key-1", targetTaskIds: ["target-1"], mode: "any", status: "ready",
-    createdAt, deadlineAt: new Date(createdAt.getTime() + 10_000), resolvedAt: new Date(now.getTime() - 5_000), matchedTaskIds: ["target-1"],
+    stepId: "step-1", idempotencyKey: "wait-key-1", targetTaskIds: [targetId], mode: "any", status: "ready",
+    createdAt, deadlineAt: new Date(createdAt.getTime() + 10_000), resolvedAt: new Date(now.getTime() - 5_000), matchedTaskIds: [targetId],
     suspendedAt: new Date(now.getTime() - 5_000), consumedAt: null,
-    result: { preserved: "keep", request: { targetTaskIds: ["target-1"], mode: "any", timeoutMs: 9_999 }, outcome: { waitId: "wait-1", status: "waiting" } },
+    result: { preserved: "keep", request: { targetTaskIds: [targetId], mode: "any", timeoutMs: 9_999 }, outcome: { waitId: "wait-1", status: "waiting" } },
     repairTaskStatus: "running", repairLeaseOwner: lease.ownerId, repairTaskAttempt: lease.attemptCount,
     repairLeaseExpiresAt: lease.leaseExpiresAt, repairInterruptAt: null, repairNextAttemptAt: null, repairUserId: lease.userId,
     repairSessionStatus: "running", repairTurnStatus: "in_progress", repairRootStatus: "running", repairRootInterruptAt: null,
@@ -39,12 +42,13 @@ function fixture(options: Options = {}) {
   const call = {
     callId: "call-item-1", callSessionId: lease.sessionId, callTurnId: lease.turnId, callTaskId: lease.id, callStepId: "step-1", status: "started",
     content: { toolCallId: "call-1", toolName: "wait_subagents", toolVersion: "1",
-      input: { idempotencyKey: "wait-key-1", mode: "any", taskIds: ["target-1"], timeoutMs: 10_000 } },
+      input: { idempotencyKey: "wait-key-1", mode: "any", taskIds: [targetId], timeoutMs: 10_000 } },
     eventId: "event-1", eventSessionId: lease.sessionId, eventTurnId: lease.turnId, eventTaskId: lease.id,
     eventItemId: "call-item-1", eventCorrelationId: "call-1", eventCreatedAt: new Date(createdAt.getTime() - 1_000),
   }
-  const target = { id: "target-1", parentTaskId: lease.id, rootTaskId: lease.rootTaskId, sessionId: lease.sessionId,
-    turnId: lease.turnId, userId: lease.userId, status: "completed", role: "writer", result: { finalText: "done" }, failureReason: null }
+  const target = { id: targetId, parentTaskId: lease.id, rootTaskId: lease.rootTaskId, sessionId: lease.sessionId,
+    turnId: lease.turnId, userId: lease.userId, status: "completed", role: "writer",
+    result: { finalText: options.targetId ? targetId : "done" }, failureReason: null }
   const calls: Array<{ sql: string; values?: unknown[] }> = []
   const client = { query: vi.fn(async (sql: string, values?: unknown[]) => {
     calls.push({ sql, values })
@@ -71,6 +75,22 @@ function canonicalProjection() {
 }
 
 describe("expired wait projection repair", () => {
+  it("preserves phone-shaped IDs only in exact canonical wait fields", async () => {
+    const targetId = "subagent-00000000-0000-4000-8000-000000000000"
+    expect(redactSensitiveText(targetId)).not.toBe(targetId)
+    const fake = fixture({ targetId })
+    await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toEqual({ status: "repaired" })
+    const update = fake.calls.find(call => call.sql.startsWith('UPDATE "agent_wait_conditions"'))
+    const persisted = JSON.parse(String(update?.values?.[0])) as {
+      request: { targetTaskIds: string[] }; outcome: { taskIds: string[]; matchedTaskIds: string[]; tasks: Array<{ taskId: string; result: { finalText: string } }> }
+    }
+    expect(persisted.request.targetTaskIds).toEqual([targetId])
+    expect(persisted.outcome.taskIds).toEqual([targetId])
+    expect(persisted.outcome.matchedTaskIds).toEqual([targetId])
+    expect(persisted.outcome.tasks[0]?.taskId).toBe(targetId)
+    expect(persisted.outcome.tasks[0]?.result.finalText).toBe("subagent-[REDACTED_PHONE]")
+  })
+
   it("repairs only request/outcome from the exact call, canonical row, and current targets", async () => {
     const fake = fixture()
     await expect(repairStaleWaitProjection(fake.client as never, lease, now)).resolves.toEqual({ status: "repaired" })

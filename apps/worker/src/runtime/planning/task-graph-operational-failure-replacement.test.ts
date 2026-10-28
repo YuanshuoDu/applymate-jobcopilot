@@ -21,6 +21,14 @@ const analystVerification = (dependencyNodeKey: string) => ({
     { id: "finding-count", check: { kind: "finding_count_gte" as const, minimum: 1 } },
   ],
 })
+const analystUnionVerification = (dependencyNodeKeys: readonly string[]) => ({
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
+  role: "analyst" as const,
+  criteria: [
+    { id: "from-scout-union", check: { kind: "findings_from_scout_union" as const, dependencyNodeKeys: [...dependencyNodeKeys] } },
+    { id: "finding-count", check: { kind: "finding_count_gte" as const, minimum: 1 } },
+  ],
+})
 
 function node(input: Readonly<{
   key: string; taskId?: string; templateId?: "scout" | "analyst" | "writer"; dependsOn?: readonly string[]
@@ -118,6 +126,22 @@ describe("operational failure replacement graph validation", () => {
     expect(result.value.replacementNodes).toEqual(candidate.nodes)
     expect(result.value.replacementNodes[1]?.verification).toEqual(analystVerification("scout-new"))
     expect(current.rootSuccessCriteria).toEqual(["Keep the original Root objective"])
+  })
+
+  it("remaps the selected subset of union selectors without moving external keys or reordering them", () => {
+    const original = baseSnapshot()
+    const snapshot = { ...original, nodes: original.nodes.map(node => node.key === "analyst-old"
+      ? { ...node, verification: analystUnionVerification(["foundation", "scout-old"]) } : node) }
+    const base = proposal()
+    const candidate = proposal([base.nodes[0]!, { ...base.nodes[1]!,
+      verification: analystUnionVerification(["foundation", "scout-new"]) }])
+    const result = validateTaskGraphOperationalFailureReplacement({ snapshot,
+      replaceOperationalFailure: replacement(), proposal: candidate })
+    expect(result).toMatchObject({ ok: true })
+    if (!result.ok) return
+    expect(result.value.replacementNodes[1]?.verification?.criteria[0]?.check).toEqual({
+      kind: "findings_from_scout_union", dependencyNodeKeys: ["foundation", "scout-new"],
+    })
   })
 
   it("accepts a failed-analyst leaf only when it is the actual complete closure", () => {

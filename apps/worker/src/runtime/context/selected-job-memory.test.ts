@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { injectSelectedJobMemory, mergeSelectedJobMemories, parseSelectedJobMemories, projectSelectedJobMemory } from "./selected-job-memory.js"
+import { projectSelectedJobHistory } from "./selected-job-history.js"
 import { projectSelectedJobMemoryNodes } from "./selected-job-memory-node-projection.js"
 import { sha256Hex } from "./context-compaction-canonical.js"
 import type { StepContextSnapshot } from "./step-context-builder.js"
@@ -61,7 +62,26 @@ describe("selected-job memory", () => {
     const withoutMarker = repair.nodes.map(({ historicalRepairReasonHint: _hint, ...node }) => node)
     expect(parseSelectedJobMemories([{ ...repair, nodes: withoutMarker }])).toBeUndefined()
     expect(parseSelectedJobMemories([{ ...repair, nodes: repair.nodes.map(node => ({ ...node, historicalRepairReasonHint: "private_reason" })) }])).toBeUndefined()
-    expect(parseSelectedJobMemories([{ ...repair, nodes: repair.nodes.map(node => ({ ...node, verification: { status: "unverified", criteria: [{ status: "passed", reasonCode: "criteria_met" }] } })) }])).toBeUndefined()
+    const wrongMarkerNodes = repair.nodes.map(node => ({ ...node, historicalRepairReasonHint: "private_reason" }))
+    const wrongMarkerIdentity = { schemaVersion: repair.schemaVersion, jobId: repair.jobId, sourceTurnId: repair.sourceTurnId,
+      sourceRootTaskId: repair.sourceRootTaskId, graphRevision: repair.graphRevision, throughSequence: repair.throughSequence, nodes: wrongMarkerNodes }
+    expect(parseSelectedJobMemories([{ ...wrongMarkerIdentity, graphDigest: sha256Hex(wrongMarkerIdentity) }])).toBeUndefined()
+    const forbiddenNodeVariants = [
+      repair.nodes.map(node => ({ ...node, verification: { status: "unverified", criteria: [{ status: "passed", reasonCode: "criteria_met" }] } })),
+      repair.nodes.map(node => ({ ...node, privateField: "must fail the exact node key set" })),
+    ]
+    for (const nodes of forbiddenNodeVariants) {
+      const identity = { schemaVersion: repair.schemaVersion, jobId: repair.jobId, sourceTurnId: repair.sourceTurnId,
+        sourceRootTaskId: repair.sourceRootTaskId, graphRevision: repair.graphRevision, throughSequence: repair.throughSequence, nodes }
+      expect(parseSelectedJobMemories([{ ...identity, graphDigest: sha256Hex(identity) }])).toBeUndefined()
+    }
+    const unmarkedIdentity = { schemaVersion: repair.schemaVersion, jobId: repair.jobId, sourceTurnId: repair.sourceTurnId,
+      sourceRootTaskId: repair.sourceRootTaskId, graphRevision: repair.graphRevision, throughSequence: repair.throughSequence, nodes: withoutMarker }
+    const unmarked = parseSelectedJobMemories([{ ...unmarkedIdentity, graphDigest: sha256Hex(unmarkedIdentity) }])
+    expect(unmarked?.[0]?.nodes[0]?.historicalRepairReasonHint).toBeUndefined()
+    const unmarkedHistory = unmarked?.[0] ? projectSelectedJobHistory([{ record: unmarked[0], terminalSequence: 21n }]) : undefined
+    expect(unmarkedHistory).toMatchObject({ content: { turns: [{ nodes: [{ role: "analyst", status: "failed" }] }] } })
+    expect(JSON.stringify(unmarkedHistory?.content)).not.toContain("repair_target_unresolved")
 
     const ambiguousNodes = projectSelectedJobMemoryNodes({ jobId: "job-a", graph: unresolvedGraph })
     if (!ambiguousNodes) throw new Error("expected the unmarked ambiguous legacy projection")

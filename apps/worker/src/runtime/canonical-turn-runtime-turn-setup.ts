@@ -14,6 +14,7 @@ import { resolveRootTaskVerificationRequirements } from "./context/root-task-obj
 import { failSelectedJobPreparationUnavailable } from "./selected-job-preparation-gate.js"
 import { loadSelectedJobPreparation } from "./selected-job-preparation.js"
 import { TASK_GRAPH_TEMPLATES, taskGraphRuntimeForTurn } from "./subagents/task-graph-templates.js"
+import type { TaskGraphTaskTemplate } from "./subagents/task-graph-command-port.js"
 import { AgentTreeManager } from "./subagents/manager.js"
 import { PgCoordinationStore } from "./mailbox/store.js"
 import { createPgDurableWaitPort } from "./subagents/durable-wait-store.js"
@@ -44,6 +45,7 @@ export type CanonicalTurnSetup = {
   readonly selectedJobMode: boolean
   readonly scheduledDraftMode: boolean
   readonly selectedJobPreparation: TaskGraphRuntimeResult["selectedJobPreparation"]
+  readonly taskGraphTemplateRoles: Readonly<Record<string, string>> | undefined
   readonly turnCoordination: ReturnType<typeof createCanonicalTurnCoordination>
   readonly nativeQuestionWaitEnabled: boolean
   readonly toolCapabilities: string[]
@@ -55,6 +57,32 @@ export type CanonicalTurnSetup = {
 }
 
 export type CanonicalTurnSetupResult = { readonly earlyResult: TurnExecutionResult } | CanonicalTurnSetup
+
+/** Keeps only server-owned active template roles for advisory current-context checks. */
+export function taskGraphTemplateRoleView(
+  templates: Readonly<Record<string, TaskGraphTaskTemplate>> | undefined,
+): Readonly<Record<string, string>> | undefined {
+  try {
+    if (!templates || typeof templates !== "object" || Array.isArray(templates)) return undefined
+    const prototype = Object.getPrototypeOf(templates)
+    if (prototype !== Object.prototype && prototype !== null) return undefined
+    const roles = Object.create(null) as Record<string, string>
+    for (const key of Reflect.ownKeys(templates)) {
+      if (typeof key !== "string") return undefined
+      const templateDescriptor = Object.getOwnPropertyDescriptor(templates, key)
+      if (!templateDescriptor?.enumerable || !Object.hasOwn(templateDescriptor, "value")) continue
+      const template = templateDescriptor.value
+      if (!template || typeof template !== "object" || Array.isArray(template)) continue
+      const roleDescriptor = Object.getOwnPropertyDescriptor(template, "role")
+      if (!roleDescriptor?.enumerable || !Object.hasOwn(roleDescriptor, "value")) continue
+      const role = roleDescriptor.value
+      if (!key || key.trim() !== key || key.length > 128 || typeof role !== "string"
+        || !role || role.trim() !== role || role.length > 128) continue
+      roles[key] = role
+    }
+    return Object.freeze(roles)
+  } catch { return undefined }
+}
 
 export async function prepareCanonicalTurnSetup(input: {
   readonly pool: pg.Pool
@@ -99,6 +127,7 @@ export async function prepareCanonicalTurnSetup(input: {
   const interactiveDiscoveryMode = state.intent?.kind === INTERACTIVE_DISCOVERY_INTENT.kind
     && state.intent.version === INTERACTIVE_DISCOVERY_INTENT.version && !graph.selectedJobMode
   const turnTaskGraphTemplates = interactiveDiscoveryMode ? INTERACTIVE_DISCOVERY_TEMPLATES : graph.templates
+  const taskGraphTemplateRoles = taskGraphTemplateRoleView(turnTaskGraphTemplates)
   if (interactiveDiscoveryMode && !graph.enabled && !signal.aborted) {
     return { earlyResult: await failInteractiveDiscoveryUnavailable({ lease, state, rootTasks, executionProjection, sessionProjection, now }) }
   }
@@ -147,7 +176,7 @@ export async function prepareCanonicalTurnSetup(input: {
   turnCoordination.bindRoot(root)
   return {
     state, interactiveDiscoveryMode, taskGraphPlanningEnabled: graph.enabled, selectedJobMode: graph.selectedJobMode, scheduledDraftMode: graph.scheduledDraftMode,
-    selectedJobPreparation: graph.selectedJobPreparation, turnCoordination, nativeQuestionWaitEnabled, toolCapabilities,
+    selectedJobPreparation: graph.selectedJobPreparation, taskGraphTemplateRoles, turnCoordination, nativeQuestionWaitEnabled, toolCapabilities,
     durableWaitPort, lifecycle, toolRuntime, rootTools, root,
   }
 }

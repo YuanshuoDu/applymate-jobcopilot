@@ -74,6 +74,8 @@ describe("selected-job node projection", () => {
     })
     expect(historical?.[0]).not.toHaveProperty("verification")
     expect(parseSelectedJobHistoryMemoryNodes(historical)).toEqual(historical)
+    expect(projectSelectedJobMemory({ jobId: "job-a", sourceTurnId: "turn-a", sourceRootTaskId: "root-a", throughSequence: "1", graph })?.nodes)
+      .toEqual(historical)
     const serialized = JSON.stringify(historical)
     for (const privateValue of ["private-repair-node", "private-repair-task", "salary-floor", "evidenceDigest", "resultDigest", "criteria_met"]) {
       expect(serialized).not.toContain(privateValue)
@@ -84,6 +86,51 @@ describe("selected-job node projection", () => {
     expect(projectSelectedJobHistoryMemoryNodes({ jobId: "job-a", graph: { revision: 1, nodes: [wrongDigest] } })).toBeNull()
     const nonNullEvidence = { ...unresolved, verificationReport: { ...unresolved.verificationReport, evidenceDigest: "d".repeat(64) } }
     expect(projectSelectedJobHistoryMemoryNodes({ jobId: "job-a", graph: { revision: 1, nodes: [nonNullEvidence] } })).toBeNull()
+  })
+
+  it("rejects non-canonical unresolved-repair report near misses", () => {
+    const criterionId = "salary-floor"
+    const report = {
+      verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "repair_target_unresolved",
+      evidenceDigest: null, resultDigest: "c".repeat(64),
+      criteria: [{ criterionId, status: "passed", reasonCode: "criteria_met" }],
+    }
+    const source = {
+      templateId: "analyst", status: "failed", readiness: "terminal", verificationCriterionIds: [criterionId],
+      verificationReport: report, resultProjection,
+    }
+    const failedCriterion = { criterionId, status: "failed", reasonCode: "criterion_not_met" } as const
+    const unverifiedCriterion = { criterionId, status: "unverified", reasonCode: "canonical_evidence_missing" } as const
+    const acceptedFailed = projectSelectedJobHistoryMemoryNodes({ jobId: "job-a", graph: { revision: 1, nodes: [{
+      ...source, verificationReport: { ...report, status: "failed", reasonCode: "criterion_not_met",
+        evidenceDigest: "d".repeat(64), criteria: [failedCriterion] },
+    }] } })
+    expect(acceptedFailed?.[0]?.verification).toEqual({
+      status: "failed", criteria: [{ status: "failed", reasonCode: "criterion_not_met" }],
+    })
+    expect(acceptedFailed?.[0]).not.toHaveProperty("historicalRepairReasonHint")
+    const acceptedUnverified = projectSelectedJobHistoryMemoryNodes({ jobId: "job-a", graph: { revision: 1, nodes: [{
+      ...source, verificationReport: { ...report, reasonCode: "canonical_evidence_missing", resultDigest: null,
+        criteria: [unverifiedCriterion] },
+    }] } })
+    expect(acceptedUnverified?.[0]?.verification).toEqual({
+      status: "unverified", criteria: [{ status: "unverified", reasonCode: "canonical_evidence_missing" }],
+    })
+    expect(acceptedUnverified?.[0]).not.toHaveProperty("historicalRepairReasonHint")
+    const nearMisses = [
+      { ...report, criteria: [failedCriterion] },
+      { ...report, criteria: [unverifiedCriterion] },
+      { ...report, reasonCode: "canonical_evidence_missing" },
+      { ...report, extra: "must fail the exact report key set" },
+    ]
+    for (const verificationReport of nearMisses) {
+      expect(projectSelectedJobHistoryMemoryNodes({ jobId: "job-a", graph: {
+        revision: 1, nodes: [{ ...source, verificationReport }],
+      } })).toBeNull()
+    }
+    expect(projectSelectedJobHistoryMemoryNodes({ jobId: "job-a", graph: {
+      revision: 1, nodes: [{ ...source, status: "completed" }],
+    } })).toBeNull()
   })
 
   it("strictly parses bounded canonical nodes into independent typed copies", () => {

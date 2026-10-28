@@ -5,9 +5,11 @@ import type { TurnExecutionOptions } from "./turn-execution-types.js"
 import { applyCompletionRecovery, FINAL_EVIDENCE_RECOVERY_FEEDBACK, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
 import { completeTurnCandidate, persistedFinalCandidate, stopForRepeatedTaskGraphDenial } from "./turn-execution-final-candidate.js"
 import type { StepContext } from "../context/step-context-builder.js"
-import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-summary-binding.js"
-import { reduceTaskGraphFinalSummary } from "../subagents/task-graph-final-summary.js"
+import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
+import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-summary-binding.js"
+import type { GraphTaskRow, LoadedGraph } from "../subagents/task-graph-pg-state.js"
 import { formatTaskGraphFinalSummary } from "../subagents/task-graph-final-summary-format.js"
+import type { TaskGraphSnapshot } from "../subagents/task-graph-snapshot.js"
 import { SCHEDULED_PIPELINE_COMPLETION, type TurnEngineCompletionGate } from "./turn-execution-types.js"
 import { TURN_SCHEDULED_GATE_CHOICE_SCHEMA, turnScheduledGateChoiceWaitId } from "./turn-question-gate-choice-contract.js"
 import { TurnStateRefreshRetryError } from "./turn-execution-question.js"
@@ -270,9 +272,32 @@ describe("atomic TaskGraph finalization recovery", () => {
     expect(refreshed.system[0]?.content).toContain("graph revision 41")
   })
 
-  it("carries the private binding while keeping all verified response copies byte-identical", async () => {
-    const summary = reduceTaskGraphFinalSummary({ graphRevision: 1, nodes: [] })
-    const binding = { graphRevision: 1, summary }
+  it("formats current task outcomes in final.summary without changing model response or exposing private task data", async () => {
+    const partialScoutResult = (jobId: string) => ({
+      schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "partial",
+      candidates: [{ jobId, source: "private-source", url: `https://private.test/${jobId}`, evidenceIds: [`private-evidence:${jobId}`] }],
+      evidence: [{ id: `private-evidence:${jobId}`, kind: "job", ref: jobId, source: "private-source" }],
+      summary: "PRIVATE_TASK_PROSE_DO_NOT_RENDER",
+    })
+    const taskRows: GraphTaskRow[] = [
+      { id: "task-private-current-scout", role: "scout", taskType: "research", status: "completed", failureReason: null,
+        result: { status: "completed", structuredResult: partialScoutResult("job-private-current") } },
+      { id: "task-private-repaired-scout-history", role: "scout", taskType: "research", status: "failed", failureReason: "PRIVATE_FAILURE_REASON",
+        result: { status: "failed", structuredResult: partialScoutResult("job-private-history"), failureReason: "PRIVATE_FAILURE_REASON" } },
+      { id: "task-private-missing-analyst", role: "analyst", taskType: "analysis", status: "failed", failureReason: "PRIVATE_FAILURE_REASON",
+        result: { status: "failed", failureReason: "PRIVATE_FAILURE_REASON" } },
+      { id: "task-private-invalid-reviewer", role: "reviewer", taskType: "review", status: "completed", failureReason: null,
+        result: { status: "completed", structuredResult: { summary: "PRIVATE_TASK_PROSE_DO_NOT_RENDER" } } },
+    ]
+    const loadedGraph = {
+      rootTaskId: "root-private-id",
+      item: { id: "task-graph:root-private-id", revision: 41, content: {}, createdAt: new Date(0) },
+      snapshot: { nodes: taskRows.map(({ id }) => ({ taskId: id })) } as unknown as TaskGraphSnapshot,
+      state: { revision: 41 } as LoadedGraph["state"],
+      tasks: new Map(taskRows.map(row => [row.id, row])),
+    } as LoadedGraph
+    const binding = buildTaskGraphFinalSummaryBinding(loadedGraph)
+    if (!binding) throw new Error("Expected a current TaskGraph final-summary binding")
     const saved: unknown[] = []
     const recordFinalResponse = vi.fn(async (input: unknown) => {
       saved.push(input)
@@ -286,7 +311,7 @@ describe("atomic TaskGraph finalization recovery", () => {
       idFactory: (value: string) => value,
     } as unknown as TurnExecutionOptions
     const snapshot = { system: [], profile: [], steerHistory: [], businessRefs: [{ id: "job-1", kind: "job" as const, ownerId: "user-1" }], toolObservations: [] }
-    const candidate = "Verified model candidate"
+    const candidate = "The model's final answer remains exactly as generated."
 
     const outcome = await completeTurnCandidate({
       options, writer: { append: vi.fn(async () => "event-1") } as unknown as TurnExecutionEventWriter,
@@ -300,10 +325,17 @@ describe("atomic TaskGraph finalization recovery", () => {
     const recorded = saved[0] as { response: string; terminal: { finalContent: { text: string; final: { response: string; summary: string } }; [TASK_GRAPH_FINAL_SUMMARY_BINDING]?: typeof binding } }
     const serialized = JSON.parse(recorded.response) as { response: string; summary: string }
     expect(serialized.response).toBe(candidate)
-    expect(serialized.summary).toBe(formatTaskGraphFinalSummary(summary))
+    const expectedOverview = "Recorded task outcomes (earlier attempts may be superseded; not verification): role=analyst, task state=failed, result structure=missing, reported result status=not reported: 1; role=reviewer, task state=completed, result structure=invalid, reported result status=not reported: 1; role=scout, task state=completed, result structure=valid, reported result status=partial: 1; role=scout, task state=failed, result structure=valid, reported result status=partial: 1."
+    expect(serialized.summary).toBe(formatTaskGraphFinalSummary(binding.summary))
+    expect(serialized.summary.slice(serialized.summary.indexOf("Recorded task outcomes"))).toBe(expectedOverview)
+    expect(serialized.summary).toMatch(/^Task-reported results: discovered jobs: 2 observed \(partial\);/)
     expect(recorded.terminal.finalContent.text).toBe(candidate)
     expect(recorded.terminal.finalContent.final.response).toBe(candidate)
+    expect(recorded.terminal.finalContent.final.summary).toBe(serialized.summary)
     expect(recorded.terminal[TASK_GRAPH_FINAL_SUMMARY_BINDING]).toBe(binding)
+    for (const privateValue of ["task-private-", "job-private-", "root-private-id", "PRIVATE_TASK_PROSE_DO_NOT_RENDER", "PRIVATE_FAILURE_REASON", "private.test", "graphRevision"]) {
+      expect(serialized.summary).not.toContain(privateValue)
+    }
     expect(JSON.stringify(recorded)).not.toContain("task_graph_final_summary_binding")
   })
 

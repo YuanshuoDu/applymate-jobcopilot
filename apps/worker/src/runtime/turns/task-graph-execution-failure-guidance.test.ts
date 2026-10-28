@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 import type { StepContext } from "../context/step-context-builder.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-verification-report.js"
+import { TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON } from "../subagents/task-graph-child-deadline.js"
 import {
   buildTaskGraphExecutionFailureInstruction,
   getTaskGraphExecutionFailureInspectionAdvice,
@@ -12,6 +13,7 @@ const categories = [
   ["execution_setup_unavailable", "For execution-setup cues, inspect the existing execution prerequisites for the child."],
   ["resume_state_unavailable", "For resume-state cues, inspect the current resume state and available evidence."],
   ["structured_output_invalid", "For structured-output cues, inspect the existing typed output contract and current available result evidence."],
+  ["execution_deadline_exceeded", "For deadline cues, inspect the current blocker and evidence. They do not prove a child started or authorize replacement. Only the server can admit an explicit replacement for eligible started typed Scout or Analyst work; a new child still needs ordinary independent verification."],
 ] as const
 
 describe("TaskGraph failure-category advice lookup", () => {
@@ -75,6 +77,14 @@ function resumeFailedNode(role: "scout" | "analyst" = "scout") {
   }
 }
 
+function deadlineFailedNode(role: "scout" | "analyst" = "scout") {
+  return { ...resumeFailedNode(role), failureReason: null, executionFailureCategory: "execution_deadline_exceeded" }
+}
+
+function untypedDeadlineNode() {
+  return { ...failedNode("execution_deadline_exceeded"), templateId: "gate" }
+}
+
 function context(nodes: unknown[], options: {
   contextRevision?: unknown
   graphRevision?: unknown
@@ -100,7 +110,8 @@ function text(value: ReturnType<typeof buildTaskGraphExecutionFailureInstruction
 
 describe("TaskGraph execution failure inspection guidance", () => {
   it.each(categories)("uses fixed advisory wording for %s", (category, expected) => {
-    const node = category === "resume_state_unavailable" ? resumeFailedNode() : failedNode(category)
+    const node = category === "resume_state_unavailable" ? resumeFailedNode()
+      : category === "execution_deadline_exceeded" ? deadlineFailedNode() : failedNode(category)
     const message = buildTaskGraphExecutionFailureInstruction(context([node]), [])
     expect(message?.role).toBe("system")
     expect(message?.content).toHaveLength(1)
@@ -113,7 +124,7 @@ describe("TaskGraph execution failure inspection guidance", () => {
   })
 
   it("deduplicates categories in fixed order and keeps one bounded message", () => {
-    const nodes = [failedNode(categories[2][0]), failedNode(categories[0][0]), failedNode(categories[2][0]), resumeFailedNode()]
+    const nodes = [failedNode(categories[2][0]), deadlineFailedNode(), failedNode(categories[0][0]), failedNode(categories[2][0]), resumeFailedNode()]
     const first = buildTaskGraphExecutionFailureInstruction(context(nodes), [{ name: "agent.list" }])
     const second = buildTaskGraphExecutionFailureInstruction(context([...nodes].reverse()), [{ name: "agent.list" }])
     const guidance = text(first)
@@ -122,6 +133,7 @@ describe("TaskGraph execution failure inspection guidance", () => {
     expect(guidance.length).toBeLessThan(1400)
     expect(guidance.indexOf("execution-setup cues")).toBeLessThan(guidance.indexOf("resume-state cues"))
     expect(guidance.indexOf("resume-state cues")).toBeLessThan(guidance.indexOf("structured-output cues"))
+    expect(guidance.indexOf("structured-output cues")).toBeLessThan(guidance.indexOf("deadline cues"))
     expect(guidance.match(/execution-setup cues/g)).toHaveLength(1)
     expect(guidance).toContain("agent.list")
     expect(guidance).toContain("does not refresh the graph")
@@ -170,6 +182,7 @@ describe("TaskGraph execution failure inspection guidance", () => {
   it("ignores categories outside failed ordinary nodes and rejects unknown values", () => {
     const cases = [
       failedNode("not-a-category"), failedNode(7), failedNode(categories[0][0], { status: "completed" }),
+      failedNode("execution_deadline_exceeded"),
       failedNode(categories[0][0], { failureReason: "raw failure" }), failedNode(categories[0][0], { resultSummary: "PRIVATE_RESULT" }),
       failedNode(categories[0][0], { verificationReport: {} }), failedNode(categories[0][0], { native: {} }),
       failedNode(categories[0][0], { nativeResult: {} }),
@@ -199,6 +212,42 @@ describe("TaskGraph execution failure inspection guidance", () => {
       { ...valid, verificationReport: { ...report, criteria: [{ ...criterion, criterionId: "other-criterion" }] } },
       { ...valid, verificationReport: { ...report, evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64) } },
       { ...valid, executionFailureCategory: "structured_output_invalid" },
+      { ...valid, native: {} },
+      { ...valid, nativeResult: {} },
+    ]
+    for (const node of rejected) expect(buildTaskGraphExecutionFailureInstruction(context([node]), [])).toBeNull()
+  })
+
+  it("allows deadline advice for unverified typed and untyped failures but not verified or native nodes", () => {
+    for (const role of ["scout", "analyst"] as const) {
+      expect(text(buildTaskGraphExecutionFailureInstruction(context([deadlineFailedNode(role)]), [])))
+        .toContain("For deadline cues, inspect the current blocker and evidence")
+    }
+    expect(text(buildTaskGraphExecutionFailureInstruction(context([untypedDeadlineNode()]), [])))
+      .toContain("For deadline cues, inspect the current blocker and evidence")
+    const unverifiedWithEvidence = { ...deadlineFailedNode(), verificationReport: {
+      ...deadlineFailedNode().verificationReport, evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64),
+    } }
+    expect(text(buildTaskGraphExecutionFailureInstruction(context([unverifiedWithEvidence]), [])))
+      .toContain("For deadline cues, inspect the current blocker and evidence")
+    const unverifiedOtherReason = { ...deadlineFailedNode(), verificationReport: {
+      ...deadlineFailedNode().verificationReport, reasonCode: "contract_invalid",
+      criteria: [{ ...deadlineFailedNode().verificationReport.criteria[0]!, reasonCode: "contract_invalid" }],
+    } }
+    expect(text(buildTaskGraphExecutionFailureInstruction(context([unverifiedOtherReason]), [])))
+      .toContain("For deadline cues, inspect the current blocker and evidence")
+    const valid = deadlineFailedNode()
+    const report = valid.verificationReport
+    const criterion = report.criteria[0]!
+    const rejected = [
+      { ...valid, templateId: "writer" },
+      { ...valid, verificationReport: { ...report, reasonCode: "contract_invalid",
+        criteria: [{ ...criterion, reasonCode: "result_invalid" }] } },
+      { ...valid, verificationReport: { ...report, status: "passed", reasonCode: "criteria_met",
+        criteria: [{ ...criterion, status: "passed", reasonCode: "criteria_met" }], evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64) } },
+      { ...valid, verificationReport: { ...report, status: "failed", reasonCode: "criterion_not_met",
+        criteria: [{ ...criterion, status: "failed", reasonCode: "criterion_not_met" }], evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64) } },
+      { ...valid, status: "interrupted" },
       { ...valid, native: {} },
       { ...valid, nativeResult: {} },
     ]

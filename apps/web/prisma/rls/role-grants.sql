@@ -24,6 +24,9 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
   "support_case_escalations", "admin_data_deletion_requests"
 TO applymate_candidate;
 
+-- Agent wait details are observational; candidate requests may read waits but never mutate them.
+GRANT SELECT ON TABLE "agent_wait_conditions" TO applymate_candidate;
+
 -- Context snapshots are append-only. Parent-session retention cascades remain
 -- available, but candidate callers must not rewrite or delete snapshot rows.
 REVOKE UPDATE, DELETE ON TABLE "agent_context_snapshots" FROM applymate_candidate;

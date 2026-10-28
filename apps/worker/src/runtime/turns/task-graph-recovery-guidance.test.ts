@@ -6,6 +6,7 @@ import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-v
 import type { TaskGraphCurrentNode, TaskGraphCurrentState } from "../subagents/task-graph-command-port.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "../subagents/task-graph-command-port.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-verification-report.js"
+import { TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON } from "../subagents/task-graph-child-deadline.js"
 import { applyCompletionRecovery, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
 import { buildTaskGraphRecoveryInstruction } from "./task-graph-recovery-guidance.js"
 import { buildModelRequest } from "./turn-engine-messages.js"
@@ -57,6 +58,14 @@ function resumeFailedNode(role: "scout" | "analyst" = "scout"): TaskGraphCurrent
       criteria: [{ criterionId, status: "unverified", reasonCode: "result_invalid" }],
       evidenceDigest: null, resultDigest: null },
   }
+}
+
+function deadlineFailedNode(role: "scout" | "analyst" = "scout"): TaskGraphCurrentNode {
+  return { ...resumeFailedNode(role), failureReason: TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON }
+}
+
+function untypedDeadlineNode(): TaskGraphCurrentNode {
+  return { ...ordinaryFailedNode(TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON), templateId: "gate" }
 }
 
 function structuredFailureNode(
@@ -277,9 +286,11 @@ describe("TaskGraph recovery guidance", () => {
       ["selected_job_context_unavailable", "execution_setup_unavailable"],
       ["child_resume_unavailable", "resume_state_unavailable"],
       ["invalid_structured_result", "structured_output_invalid"],
+      [TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON, "execution_deadline_exceeded"],
     ] as const
     for (const [reason, category] of examples) {
-      const failureNode = reason === "child_resume_unavailable" ? resumeFailedNode() : ordinaryFailedNode(reason)
+      const failureNode = reason === "child_resume_unavailable" ? resumeFailedNode()
+        : reason === TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON ? deadlineFailedNode() : ordinaryFailedNode(reason)
       const context = contextFor({ nodes: [sourceNode(), failureNode] })
       const expectedGuidance = buildTaskGraphRecoveryInstruction(context, tools, ROOT_ID)
       const request = buildModelRequest({ context, model, tools, sessionId: "session", turnId: "turn", stepId: "step-resume",
@@ -334,6 +345,42 @@ describe("TaskGraph recovery guidance", () => {
     for (const row of rejected) {
       expect(buildTaskGraphRecoveryInstruction(replaceGraphNode(context, 1, row), tools, ROOT_ID)).toBeNull()
     }
+  })
+
+  it("allows a canonical deadline category beside typed-denial guidance without treating it as proof", () => {
+    const tools = [{ name: "agent.list" }, { name: "agent.wait" }, { name: "agent.plan" }]
+    const baseline = buildTaskGraphRecoveryInstruction(contextFor({ nodes: [sourceNode(), ordinaryFailedNode()] }), tools, ROOT_ID)
+    const context = contextFor({ nodes: [sourceNode(), deadlineFailedNode()] })
+    const message = buildTaskGraphRecoveryInstruction(context, tools, ROOT_ID)
+    const graph = context.blocks.find(block => block.id === `observation:${CURRENT_GRAPH_ID}`)?.content
+    const systemText = message?.content.flatMap(part => part.type === "text" ? [part.text] : []).join(" ") ?? ""
+
+    expect(JSON.stringify(graph)).toContain('"executionFailureCategory":"execution_deadline_exceeded"')
+    expect(message).toEqual(baseline)
+    expect(systemText).toContain("The current owner-read TaskGraph denial is advisory feedback")
+    expect(systemText).toContain("agent.plan may evaluate one typed repair")
+    expect(systemText).not.toContain("execution_deadline_exceeded")
+    expect(systemText).not.toContain(TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON)
+    expect(systemText).not.toContain("child-private")
+    expect(systemText).not.toContain("private goal text")
+
+    const currentNode = (context.blocks.find(block => block.id === `observation:${CURRENT_GRAPH_ID}`)!.content as unknown as { nodes: TaskGraphCurrentNode[] }).nodes[1]!
+    const malformed = { ...currentNode, verificationReport: { ...currentNode.verificationReport!, reasonCode: "contract_invalid" } }
+    expect(buildTaskGraphRecoveryInstruction(replaceGraphNode(context, 1, malformed), tools, ROOT_ID)).toBeNull()
+
+    const untyped = contextFor({ nodes: [sourceNode(), untypedDeadlineNode()] })
+    const untypedGraph = untyped.blocks.find(block => block.id === `observation:${CURRENT_GRAPH_ID}`)!.content
+    expect(JSON.stringify(untypedGraph)).toContain('\"executionFailureCategory\":\"execution_deadline_exceeded\"')
+    const untypedMessage = buildTaskGraphRecoveryInstruction(untyped, tools, ROOT_ID)
+    expect(untypedMessage).toEqual(baseline)
+    expect(untypedMessage?.content.flatMap(part => part.type === "text" ? [part.text] : []).join(" "))
+      .not.toContain(TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON)
+
+    const missingReport = { ...currentNode }
+    const { verificationReport: _report, ...missingReportNode } = missingReport
+    expect(buildTaskGraphRecoveryInstruction(replaceGraphNode(context, 1, missingReportNode), tools, ROOT_ID)).toEqual(baseline)
+    const verified = { ...currentNode, verificationReport: report("failed") }
+    expect(buildTaskGraphRecoveryInstruction(replaceGraphNode(context, 1, verified), tools, ROOT_ID)).toBeNull()
   })
 
   it("rejects malformed, nonfailed, verified, native, inherited, and accessor category fields", () => {

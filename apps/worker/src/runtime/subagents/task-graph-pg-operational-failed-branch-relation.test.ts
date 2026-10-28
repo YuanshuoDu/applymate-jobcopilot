@@ -48,6 +48,13 @@ describe("TaskGraph operational failed-branch relation", () => {
     expect(taskGraphOperationalFailedBranchFingerprint({ rootTaskId, expectedRevision: 8, replaceOperationalFailure: mode, nodes })).toBe(fingerprint)
   })
 
+  it("accepts the fixed server deadline reason in the existing relation shape", () => {
+    const parsed = parseTaskGraphOperationalFailedBranchRelation({
+      ...relation(), failedSource: { ...relation().failedSource, failureReason: "task_graph_child_deadline_exceeded" },
+    })
+    expect(parsed?.failedSource.failureReason).toBe("task_graph_child_deadline_exceeded")
+  })
+
   it("accepts a full closure whose prior dependency cancellation is the observed graph witness", () => {
     const closureMode: TaskGraphOperationalFailureReplacement = { root: { nodeKey: "scout", taskId: "scout-task" }, sources: [
       { nodeKey: "scout", taskId: "scout-task", replacementKey: "scout-fresh" },
