@@ -168,7 +168,7 @@ function finalMessageDtoWithoutSchemaVersion(): Record<string, unknown> {
   return dto
 }
 
-function finalCompletionFrames(includeOverflow = false) {
+function finalCompletionFrames(includeOverflow = false, finalContent?: unknown) {
   const overflow = includeOverflow ? sseEvent({
     schemaVersion: 'agent-harness.v2', id: 'overflow-before-final', sessionId: 'session-1', turnId: 'turn-1',
     itemId: null, taskId: null, type: 'stream.overflow', actor: 'system', sequence: null, payload: { snapshotRequired: true },
@@ -178,16 +178,18 @@ function finalCompletionFrames(includeOverflow = false) {
     payload: { item: finalMessageDto({ status: 'started', content: { text: 'PRIVATE_FINAL_RESPONSE' } }) } })
   const completed = redactedEnvelope({ schemaVersion: 'agent-harness.v2', id: 'final-completed', sessionId: 'session-1', turnId: 'turn-1', itemId: FINAL_ITEM_ID,
     taskId: 'root-task', type: 'item.completed', actor: 'orchestrator', sequence: '2',
-    payload: { item: finalMessageDto({ content: { text: 'PRIVATE_FINAL_RESPONSE' } }) } })
+    payload: finalContent
+      ? { itemId: FINAL_ITEM_ID, status: 'completed', content: finalContent }
+      : { item: finalMessageDto({ content: { text: 'PRIVATE_FINAL_RESPONSE' } }) } })
   const turnCompleted = redactedEnvelope({ schemaVersion: 'agent-harness.v2', id: 'turn-completed', sessionId: 'session-1', turnId: 'turn-1', itemId: FINAL_ITEM_ID,
     taskId: 'root-task', type: 'turn.completed', actor: 'orchestrator', sequence: '3',
     payload: { turnId: 'turn-1', taskId: 'root-task', finalItemId: FINAL_ITEM_ID, usage: { inputTokens: 3, outputTokens: 2 } } })
-  expect(isRecord(completed.payload) && isRecord(completed.payload.item) ? completed.payload.item.content : null).toBe('[REDACTED]')
+  if (!finalContent) expect(isRecord(completed.payload) && isRecord(completed.payload.item) ? completed.payload.item.content : null).toBe('[REDACTED]')
   expect(isRecord(turnCompleted.payload) ? turnCompleted.payload.finalItemId : null).toBe(FINAL_ITEM_ID)
   return [overflow, sseEvent(started, 'item.started'), sseEvent(completed, 'item.completed'), sseEvent(turnCompleted, 'turn.completed')].join('')
 }
 
-async function runFinalItemStream(items: unknown[], requireSnapshot = false) {
+async function runFinalItemStream(items: unknown[], requireSnapshot = false, finalContent?: unknown) {
   const controller = new AbortController()
   let state: TimelineState = createTimelineState('session-1')
   let redactedContent: unknown
@@ -201,7 +203,7 @@ async function runFinalItemStream(items: unknown[], requireSnapshot = false) {
   }
   const fetcher = vi.fn<typeof fetch>()
     .mockResolvedValueOnce(new Response(JSON.stringify({ items: [], page: { hasMore: false } })))
-    .mockResolvedValueOnce(new Response(streamFrom(finalCompletionFrames(requireSnapshot)), { headers: { 'Content-Type': 'text/event-stream' } }))
+    .mockResolvedValueOnce(new Response(streamFrom(finalCompletionFrames(requireSnapshot, finalContent)), { headers: { 'Content-Type': 'text/event-stream' } }))
     .mockResolvedValueOnce(new Response(JSON.stringify({ items })))
   await streamAgentTimeline({ sessionId: 'session-1', dispatch, fetcher, signal: controller.signal, retryDelayMs: 0 })
   return { state, redactedContent, finalReplayCount, urls: fetcher.mock.calls.map(([url]) => String(url)) }
@@ -416,6 +418,24 @@ describe('V2 timeline stream client', () => {
     expect(JSON.stringify(live.state.itemsById[FINAL_ITEM_ID]?.content)).not.toContain('PRIVATE')
   })
 
+  it('accepts safe answer evidence and keeps live completion identical to timeline replay', async () => {
+    const text = 'A match. [[source:S1]]'
+    const answerEvidence = {
+      schemaVersion: 1,
+      sources: [{ key: 'S1', kind: 'job', label: 'Engineer at Example Co', excerpt: 'Dublin role.' }],
+    }
+    const displayContent = { text, summary: 'Good fit.', answerEvidence }
+    const safeItem = finalMessageDto({ content: displayContent })
+    const live = await runFinalItemStream([safeItem], false, {
+      text, final: { response: text, summary: 'Good fit.', answerEvidence, evidenceRefs: ['PRIVATE_TOOL_CALL_ID'], usage: { tokens: 4 } },
+    })
+    const replay = timelineReducer(createTimelineState('session-1'), { type: 'replay', items: [safeItem] })
+
+    expect(live.redactedContent).toEqual(displayContent)
+    expect(live.state.itemsById[FINAL_ITEM_ID]?.content).toEqual(replay.itemsById[FINAL_ITEM_ID]?.content)
+    expect(JSON.stringify(live.state.itemsById[FINAL_ITEM_ID]?.content)).not.toContain('PRIVATE_TOOL_CALL_ID')
+  })
+
   it.each([
     ['id', finalMessageDto({ id: 'other-item' })],
     ['session', finalMessageDto({ sessionId: 'session-2' })],
@@ -426,6 +446,7 @@ describe('V2 timeline stream client', () => {
     ['status', finalMessageDto({ status: 'started' })],
     ['purpose', finalMessageDto({ phase: 'commentary' })],
     ['private content', finalMessageDto({ content: { text: 'Safe text', summary: 'Safe summary', rawFinal: 'PRIVATE_FINAL_RESPONSE' } })],
+    ['invalid answer evidence', finalMessageDto({ content: { text: 'Safe text', answerEvidence: { schemaVersion: 1, sources: [{ key: 'S1', kind: 'job', label: 'Job', excerpt: 'Safe', raw: 'PRIVATE' }] } } })],
     ['private envelope', finalMessageDto({ rawFinalResponse: 'PRIVATE_FINAL_RESPONSE' })],
     ['oversized summary', finalMessageDto({ content: { text: 'Safe text', summary: 'x'.repeat(1001) } })],
   ])('ignores a final-item response with invalid %s without paging', async (_reason, invalidItem) => {

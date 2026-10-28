@@ -585,7 +585,7 @@ function scheduledPipelineRuntimeFixture(overrides: Partial<CanonicalTurnRuntime
 
 function fixtureRecoveredScheduledCandidate(candidate: Parameters<ScheduledPipelineCandidateStore["stage"]>[0], sourceEventId: string) {
   return { candidateText: candidate.candidateText, finalStepId: candidate.finalStepId, finalStepOrdinal: candidate.finalStepOrdinal,
-    finishReason: "stop", usage: null, recoverySource: { owner: { userId: candidate.owner.userId,
+    finishReason: "stop", usage: null, sourceReceipt: null, recoverySource: { owner: { userId: candidate.owner.userId,
       sessionId: candidate.owner.sessionId, turnId: candidate.owner.turnId, rootTaskId: candidate.owner.rootTaskId },
     sourceEventId, sourceStepId: candidate.finalStepId, sourceStepOrdinal: candidate.finalStepOrdinal,
     rootAttemptCount: candidate.rootAttemptCount, inputThroughSequence: "0", consumedInputIds: [] }, recoveryTail: null }

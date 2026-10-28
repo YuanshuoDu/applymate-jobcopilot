@@ -1,6 +1,7 @@
 /** CANONICAL Phase 9 timeline state root — do not duplicate. See #459. */
 
 import { AGENT_STREAM_SCHEMA_VERSION } from '@jobcopilot/agent-protocol'
+import { projectFinalAnswerDisplayContent } from '@/lib/agent/session/final-answer-evidence-projection'
 import { normalizeTimelineEvent, normalizeTimelineItem, type TimelineAction } from './timeline-reducer'
 import { createQuestionHydrationPump, filterQuestionHydrationValues, type FinalItemHydrationTarget } from './question-hydration'
 import { hasAllTimelineTargetItems, sortTimelineTailEvents } from './timeline-hydration-order'
@@ -169,13 +170,9 @@ function finalItemFromResponse(items: unknown[] | undefined, target: FinalItemHy
   if (!items || items.length !== 1 || !isRecord(items[0]) || items[0].schemaVersion !== AGENT_STREAM_SCHEMA_VERSION || !hasExactKeys(items[0], SAFE_FINAL_ITEM_FIELDS)) return null
   const item = normalizeTimelineItem(items[0]), content = item?.content
   if (!item || !safeId(target.itemId) || !safeId(target.turnId) || item.id !== target.itemId || item.sessionId !== sessionId ||
-    item.turnId !== target.turnId || item.type !== 'agent_message' || item.status !== 'completed' || item.phase !== 'final_answer' || !isRecord(content) || !safeFinalContent(content)) return null
-  return { ...item, content: { text: content.text, ...(content.summary === undefined ? {} : { summary: content.summary }) } }
-}
-
-function safeFinalContent(value: Record<string, unknown>): value is Record<string, unknown> & { text: string; summary?: string } {
-  const keys = Object.keys(value)
-  return keys.length >= 1 && keys.length <= 2 && keys.includes('text') && keys.every(key => key === 'text' || key === 'summary') && typeof value.text === 'string' && (!Object.prototype.hasOwnProperty.call(value, 'summary') || (typeof value.summary === 'string' && value.summary.length <= 1000))
+    item.turnId !== target.turnId || item.type !== 'agent_message' || item.status !== 'completed' || item.phase !== 'final_answer' || !isRecord(content)) return null
+  const projectedContent = projectFinalAnswerDisplayContent(content)
+  return projectedContent ? { ...item, content: projectedContent } : null
 }
 
 function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean { return Object.keys(value).length === keys.length && keys.every(key => Object.prototype.hasOwnProperty.call(value, key)) }

@@ -1,3 +1,4 @@
+import { parseAnswerEvidence, type AnswerEvidence } from "@jobcopilot/agent-protocol"
 import type { FinalVerification } from "./verifier.js"
 import type { TurnUsage } from "./budget.js"
 import { formatTaskGraphFinalSummary } from "./subagents/task-graph-final-summary-format.js"
@@ -15,6 +16,7 @@ export type FinalResponse = {
   readonly next: readonly string[]
   readonly evidenceRefs: readonly string[]
   readonly response: string
+  readonly answerEvidence?: AnswerEvidence
   readonly usage: TurnUsage
   readonly stepCount: number
   readonly toolCallCount: number
@@ -32,6 +34,7 @@ export type FinalizeInput = {
   readonly blocker?: string | null
   readonly next?: readonly string[]
   readonly response?: string
+  readonly answerEvidence?: unknown
   readonly summaryOverride?: string
 }
 
@@ -48,9 +51,11 @@ export function finalizeTurn(input: FinalizeInput): FinalResponse {
   const completedTasks = completed ? ["Turn goal"] : []
   const notCompleted = completed ? [] : [input.goal]
   const summary = input.summaryOverride ?? (completed ? "The Turn goal was completed with verified evidence." : "The Turn did not complete the goal.")
+  const answerEvidence = parseAnswerEvidence(input.answerEvidence)
   return {
     schemaVersion: "agent-harness.v2.final", goal: input.goal, completed, completedTasks, notCompleted,
     blocker: blocker ?? null, next, evidenceRefs: sorted(evidenceRefs), response: input.response ?? summary, usage: { ...input.usage },
+    ...(answerEvidence ? { answerEvidence } : {}),
     stepCount: input.stepCount, toolCallCount: input.toolCallCount, terminalReason: input.terminalReason, summary,
   }
 }

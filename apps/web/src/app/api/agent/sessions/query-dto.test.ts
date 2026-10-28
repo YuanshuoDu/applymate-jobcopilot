@@ -208,6 +208,65 @@ describe("agent query DTO redaction", () => {
     expect(JSON.stringify(dto)).not.toContain("tokens\":9")
   })
 
+  it("projects only a validated safe answer evidence manifest from a completed final item", () => {
+    const safeEvidence = {
+      schemaVersion: 1,
+      sources: [
+        { key: "S1", kind: "job", label: "Engineer at Example Co", excerpt: "Dublin role. alex@example.test" },
+        { key: "S2", kind: "job", label: "Private listing", excerpt: "https://private.example/job" },
+      ],
+    }
+    const dto = itemDto({
+      id: "item_final", sessionId: "session_1", turnId: "turn_1", stepId: "step_1", taskId: null,
+      type: "agent_message", status: "completed", phase: "final_answer", revision: 2,
+      content: {
+        text: "A match. [[source:S1]]",
+        final: {
+          response: "A match. [[source:S1]]", summary: "Good fit.", answerEvidence: safeEvidence,
+          evidenceRefs: ["PRIVATE_TOOL_CALL_ID"], usage: { tokens: 9 }, goal: "PRIVATE_GOAL",
+        },
+      },
+      startedAt: null, completedAt: date, createdAt: date, updatedAt: date,
+    })
+
+    expect(dto.content).toEqual({
+      text: "A match. [[source:S1]]", summary: "Good fit.",
+      answerEvidence: {
+        schemaVersion: 1,
+        sources: [{ key: "S1", kind: "job", label: "Engineer at Example Co", excerpt: "Dublin role. [REDACTED_EMAIL]" }],
+      },
+    })
+    expect(JSON.stringify(dto)).not.toMatch(/PRIVATE_TOOL_CALL_ID|PRIVATE_GOAL|private\.example|alex@example\.test/)
+  })
+
+  it("omits answer evidence for invalid manifests and non-final messages", () => {
+    const base = {
+      id: "item_final", sessionId: "session_1", turnId: "turn_1", stepId: "step_1", taskId: null,
+      type: "agent_message", status: "completed", phase: "final_answer", revision: 2,
+      content: { text: "Answer", final: { response: "Answer", answerEvidence: { schemaVersion: 1, sources: [{ key: "S1", kind: "job", label: "Job", excerpt: "Safe", sourceId: "PRIVATE_ID" }] } } },
+      startedAt: null, completedAt: date, createdAt: date, updatedAt: date,
+    }
+    expect(itemDto(base).content).toEqual({ text: "Answer" })
+    expect(itemDto({ ...base, phase: "commentary" }).content).toEqual({ text: "Answer" })
+  })
+
+  it("leaves ordinary final answer prose unchanged by evidence projection", () => {
+    const text = "Role job-123; contact alex@example.test; see https://jobs.example.test/opening"
+    const dto = itemDto({
+      id: "item_final", sessionId: "session_1", turnId: "turn_1", stepId: "step_1", taskId: null,
+      type: "agent_message", status: "completed", phase: "final_answer", revision: 2,
+      content: {
+        text,
+        final: {
+          response: text,
+          answerEvidence: { schemaVersion: 1, sources: [{ key: "S1", kind: "job", label: "Engineer role", excerpt: "Dublin role" }] },
+        },
+      },
+      startedAt: null, completedAt: date, createdAt: date, updatedAt: date,
+    })
+    expect(dto.content).toMatchObject({ text })
+  })
+
   it("shows safe discovery-memory overflow recovery text without private snapshot values", () => {
     const recovery = "Some saved discovery preferences exceed the memory limit. Narrow your preferences and start a new search."
     const dto = itemDto({

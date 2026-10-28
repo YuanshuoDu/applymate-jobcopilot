@@ -38,6 +38,46 @@ describe("agent stream redaction", () => {
     expect(redactStreamString("Bearer very-secret-token sk-12345678")).toBe("Bearer [REDACTED] [REDACTED]")
   })
 
+  it("projects completed final event content to the same safe DTO as timeline replay", () => {
+    const payload = {
+      itemId: "final-item", status: "completed",
+      content: {
+        text: "A match. [[source:S1]]",
+        final: {
+          response: "A match. [[source:S1]]", summary: "Good fit.",
+          answerEvidence: {
+            schemaVersion: 1,
+            sources: [
+              { key: "S1", kind: "job", label: "Engineer at Example Co", excerpt: "Dublin. alex@example.test" },
+              { key: "S2", kind: "job", label: "Private listing", excerpt: "https://private.example/job" },
+            ],
+          },
+          evidenceRefs: ["PRIVATE_TOOL_CALL_ID"], usage: { tokens: 9 }, goal: "PRIVATE_GOAL",
+        },
+      },
+    }
+    const projected = redactStreamEventPayload("item.completed", payload, { ...identity, itemId: "final-item" })
+    expect(projected).toEqual({
+      itemId: "final-item", status: "completed",
+      content: {
+        text: "A match. [[source:S1]]", summary: "Good fit.",
+        answerEvidence: {
+          schemaVersion: 1,
+          sources: [{ key: "S1", kind: "job", label: "Engineer at Example Co", excerpt: "Dublin. [REDACTED_EMAIL]" }],
+        },
+      },
+    })
+    expect(JSON.stringify(projected)).not.toMatch(/PRIVATE_TOOL_CALL_ID|PRIVATE_GOAL|private\.example|alex@example\.test/)
+  })
+
+  it("uses the existing fail-closed redaction for malformed final completion payloads", () => {
+    const payload = { itemId: "final-item", status: "completed", content: { text: "Safe", final: { response: "Different" } } }
+    expect(redactStreamEventPayload("item.completed", payload, { ...identity, itemId: "final-item" }))
+      .toEqual({ itemId: "final-item", status: "completed", content: "[REDACTED]" })
+    expect(redactStreamEventPayload("item.completed", payload, identity))
+      .toEqual({ itemId: "final-item", status: "completed", content: "[REDACTED]" })
+  })
+
   it("redacts nested credential, resume, and raw payload keys", () => {
     expect(redactStreamValue({ data: { token: "private", resume: "full CV", rawContent: "raw" }, title: "safe" })).toEqual({
       data: { token: "[REDACTED]", resume: "[REDACTED]", rawContent: "[REDACTED]" }, title: "safe",

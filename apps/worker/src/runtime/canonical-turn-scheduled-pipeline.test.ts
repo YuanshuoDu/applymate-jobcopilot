@@ -21,7 +21,7 @@ const pool = { connect: vi.fn() } as unknown as pg.Pool
 describe("canonical Turn scheduled pipeline assembly", () => {
   it("binds only scheduled TaskGraph turns and recovers candidates under the live Turn owner", async () => {
     const recoveredCandidate = {
-      candidateText: "Recovered candidate.", finalStepId: "step-final-4", finalStepOrdinal: 4, finishReason: "stop", usage: null,
+      candidateText: "Recovered candidate.", finalStepId: "step-final-4", finalStepOrdinal: 4, finishReason: "stop", usage: null, sourceReceipt: null,
       recoverySource: { owner: { userId: executionOwner.userId, sessionId: executionOwner.sessionId,
         turnId: executionOwner.turnId, rootTaskId: executionOwner.rootTaskId }, sourceEventId: "candidate-event-4",
         sourceStepId: "step-final-4", sourceStepOrdinal: 4, rootAttemptCount: root.attemptCount,

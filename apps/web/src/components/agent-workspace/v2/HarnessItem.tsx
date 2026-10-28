@@ -1,11 +1,14 @@
 'use client'
 
 import React from 'react'
+import type { AnswerEvidence, AnswerEvidenceSource } from '@jobcopilot/agent-protocol'
 import { redactSensitiveValue } from '@jobcopilot/shared/agent-redaction'
+import { projectAnswerEvidence } from '@/lib/agent/session/final-answer-evidence-projection'
 import { projectFinalSummary } from '@/lib/agent/session/final-summary-projection'
 import { useI18n, type Lang } from '@/lib/i18n'
 import type { TimelineItem } from './timeline-reducer'
 import { contentParts, itemText, type HarnessContentPart, type SuggestedActionCommand } from './harness-item-types'
+import { FinalAnswerEvidenceDisclosure } from './FinalAnswerEvidenceDisclosure'
 import { HarnessMarkdown } from './HarnessMarkdown'
 import { NativeVerificationFeedbackCard } from './NativeVerificationFeedbackCard'
 import { extractNativeVerificationFeedback, safeNativeFeedbackOutput } from './native-verification-feedback'
@@ -76,13 +79,51 @@ function renderItemBody(item: TimelineItem, t: (key: string) => string, lang: La
   if (item.type === 'unknown') return <Fallback label={t('agent.unknownItem')} />
   const summary = projectFinalSummary(item.type, item.phase, item.status, item.content)
   const summaryLabel = lang === 'zh' ? '摘要' : 'Summary'
+  const parts = contentParts(item.content)
+  const answerEvidence = finalAnswerEvidence(item)
   return <div style={{ display: 'grid', gap: 8 }}>
     {summary && <section aria-label={summaryLabel} data-agent-final-summary="true">
       <strong>{summaryLabel}</strong>
       <p>{summary}</p>
     </section>}
-    {contentParts(item.content).map((part, index) => <ContentPart key={index} part={part} t={t} onSuggestedAction={onSuggestedAction} />)}
+    {answerEvidence
+      ? <FinalAnswerContent parts={parts} evidence={answerEvidence} t={t} lang={lang} onSuggestedAction={onSuggestedAction} />
+      : parts.map((part, index) => <ContentPart key={index} part={part} t={t} onSuggestedAction={onSuggestedAction} />)}
   </div>
+}
+
+function finalAnswerEvidence(item: TimelineItem): AnswerEvidence | null {
+  if (item.type !== 'agent_message' || item.phase !== 'final_answer' || item.status !== 'completed' || !isRecord(item.content)) return null
+  const parsed = projectAnswerEvidence(item.content.answerEvidence)
+  if (!parsed) return null
+  const answerText = itemText(item)
+  return projectAnswerEvidence({
+    schemaVersion: parsed.schemaVersion,
+    sources: parsed.sources.filter(source => answerText.includes(`[[source:${source.key}]]`)),
+  })
+}
+
+function FinalAnswerContent({ parts, evidence, t, lang, onSuggestedAction }: {
+  parts: HarnessContentPart[]
+  evidence: AnswerEvidence
+  t: (key: string) => string
+  lang: Lang
+  onSuggestedAction?: HarnessItemProps['onSuggestedAction']
+}) {
+  const [open, setOpen] = React.useState(false)
+  const [selectedKey, setSelectedKey] = React.useState<AnswerEvidenceSource['key'] | null>(null)
+  const disclosureId = `answer-evidence-${React.useId()}`
+  const selectSource = (key: AnswerEvidenceSource['key']) => {
+    setSelectedKey(key)
+    setOpen(true)
+  }
+
+  return <>
+    {parts.map((part, index) => <ContentPart key={index} part={part} t={t} lang={lang} onSuggestedAction={onSuggestedAction}
+      answerEvidence={evidence} sourceDisclosureId={disclosureId} sourceDisclosureOpen={open}
+      onSourceSelect={selectSource} />)}
+    <FinalAnswerEvidenceDisclosure id={disclosureId} evidence={evidence} open={open} selectedKey={selectedKey} lang={lang} onOpenChange={setOpen} />
+  </>
 }
 
 function PlanBody({ item, t }: { item: TimelineItem; t: (key: string) => string }) {
@@ -119,8 +160,17 @@ export function ToolLifecycleCard({ item, t, lang = 'en' }: { item: TimelineItem
   )
 }
 
-function ContentPart({ part, t, onSuggestedAction }: { part: HarnessContentPart; t: (key: string) => string; onSuggestedAction?: HarnessItemProps['onSuggestedAction'] }) {
-  if (part.type === 'text') return <HarnessMarkdown markdown={part.text} />
+function ContentPart({ part, t, lang, onSuggestedAction, answerEvidence, sourceDisclosureId, sourceDisclosureOpen, onSourceSelect }: {
+  part: HarnessContentPart
+  t: (key: string) => string
+  lang?: Lang
+  onSuggestedAction?: HarnessItemProps['onSuggestedAction']
+  answerEvidence?: AnswerEvidence | null
+  sourceDisclosureId?: string
+  sourceDisclosureOpen?: boolean
+  onSourceSelect?: (key: AnswerEvidenceSource['key']) => void
+}) {
+  if (part.type === 'text') return <HarnessMarkdown markdown={part.text} answerEvidence={answerEvidence} sourceDisclosureId={sourceDisclosureId} sourceDisclosureOpen={sourceDisclosureOpen} onSourceSelect={onSourceSelect} lang={lang} />
   if (part.type === 'redacted') return <Fallback label={t('agent.redactedContent')} />
   if (part.type === 'unknown') return <Fallback label={t('agent.unknownContentPart')} />
   if (part.type === 'suggested_action') {

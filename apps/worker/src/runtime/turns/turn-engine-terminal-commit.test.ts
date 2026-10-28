@@ -481,6 +481,7 @@ describe("atomic Turn terminal commit", () => {
     const outcome = await completeTurnCandidate({
       options, writer: writer as unknown as TurnExecutionEventWriter, step: { id: input.stepId, ordinal: 1 },
       output: { text: "candidate answer", reasoningSummary: "", toolCalls: [], provider: "fixture", model: "fixture-model", finishReason: "stop", usage: null, continuation: null },
+      finalResponseText: "candidate answer",
       snapshot,
       stepCount: 2, toolCallCount: 1, usage: { inputTokens: 12, outputTokens: 4, estimatedCostUsd: 0.001 },
       signal: new AbortController().signal, now: () => now, onStepClosed: vi.fn(),
