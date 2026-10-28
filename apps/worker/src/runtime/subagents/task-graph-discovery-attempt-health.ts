@@ -1,6 +1,7 @@
 import {
   parseDiscoveryAttemptHealth, parseDiscoveryAttemptSidecar, type DiscoveryAttemptHealth,
 } from "./child-discovery-attempt.js"
+import { parseDiscoveryQueryFootprint, type DiscoveryQueryFootprint } from "./child-discovery-query-footprint.js"
 import type { TaskGraphVerificationContract } from "../planning/task-graph-verification.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import type { StoredTaskGraphNode } from "./task-graph-snapshot.js"
@@ -23,6 +24,7 @@ type CurrentNodeGate = Readonly<{
   native: boolean
   nativeResult: boolean
 }>
+export type TaskGraphDiscoveryTurnEligibility = "ordinary" | "scheduled" | "unknown"
 
 function dataRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | null {
   try {
@@ -59,15 +61,20 @@ function dataProperty(value: unknown, key: string): unknown {
 export function projectTaskGraphDiscoveryAttemptHealth(
   node: DiscoveryAttemptNode, task: DiscoveryAttemptTask, result: unknown,
 ): DiscoveryAttemptHealth | undefined {
-  const envelope = node.registeredScoutEnvelope
-  if (task.status !== "completed" && task.status !== "failed" || node.templateId !== "scout"
-    || node.verificationDisposition !== "typed" || node.verification?.role !== "scout"
-    || node.repairOf || node.nativeDelegation || !envelope || task.role !== "scout"
-    || task.taskType !== "job_discovery" || envelope.role !== "scout" || envelope.taskType !== task.taskType
-    || !envelope.allowedActions.includes("jobs.discover") || !scoutSchema(envelope.expectedOutputSchema)
-    || !scoutSchema(task.expectedOutputSchema)) return undefined
+  if (!eligibleCurrentScout(node, task)) return undefined
   const sidecar = dataProperty(result, "discoveryAttempt")
   return parseDiscoveryAttemptSidecar(sidecar, task.attemptCount ?? NaN) ?? undefined
+}
+
+/** Projects only the separately versioned, current-attempt query observation for an ordinary turn. */
+export function projectTaskGraphDiscoveryAttemptQueryFootprint(
+  node: DiscoveryAttemptNode, task: DiscoveryAttemptTask, result: unknown, turn: TaskGraphDiscoveryTurnEligibility,
+): DiscoveryQueryFootprint | undefined {
+  if (turn !== "ordinary" || !eligibleCurrentScout(node, task)) return undefined
+  const sidecar = dataRecord(dataProperty(result, "discoveryAttempt"), ["attemptCount", "health", "queryFootprint"])
+  if (!sidecar || sidecar.attemptCount !== task.attemptCount
+    || !parseDiscoveryAttemptSidecar(sidecar, task.attemptCount ?? NaN)) return undefined
+  return parseDiscoveryQueryFootprint(sidecar.queryFootprint) ?? undefined
 }
 
 /** Revalidates bounded health before the current graph is placed in Root context. */
@@ -77,4 +84,25 @@ export function parseTaskGraphCurrentDiscoveryAttemptHealth(
   if (gate.templateId !== "scout" || gate.status !== "completed" && gate.status !== "failed"
     || gate.verification?.role !== "scout" || gate.repairOf || gate.repairReceipt || gate.native || gate.nativeResult) return undefined
   return parseDiscoveryAttemptHealth(dataProperty(row, "discoveryAttemptHealth")) ?? undefined
+}
+
+/** Second strict parse before an ordinary current-turn footprint enters the model context. */
+export function parseTaskGraphCurrentDiscoveryQueryFootprint(
+  row: Record<string, unknown>, gate: CurrentNodeGate, turn: TaskGraphDiscoveryTurnEligibility,
+): DiscoveryQueryFootprint | undefined {
+  if (turn !== "ordinary" || gate.templateId !== "scout"
+    || gate.status !== "completed" && gate.status !== "failed"
+    || gate.verification?.role !== "scout" || gate.repairOf || gate.repairReceipt || gate.native || gate.nativeResult) return undefined
+  return parseDiscoveryQueryFootprint(dataProperty(row, "discoveryQueryFootprint")) ?? undefined
+}
+
+function eligibleCurrentScout(node: DiscoveryAttemptNode, task: DiscoveryAttemptTask): boolean {
+  const envelope = node.registeredScoutEnvelope
+  if ((task.status !== "completed" && task.status !== "failed") || node.templateId !== "scout"
+    || node.verificationDisposition !== "typed" || node.verification?.role !== "scout"
+    || node.repairOf || node.nativeDelegation || !envelope || task.role !== "scout"
+    || task.taskType !== "job_discovery" || envelope.role !== "scout" || envelope.taskType !== task.taskType
+    || !envelope.allowedActions.includes("jobs.discover") || !scoutSchema(envelope.expectedOutputSchema)
+    || !scoutSchema(task.expectedOutputSchema)) return false
+  return true
 }

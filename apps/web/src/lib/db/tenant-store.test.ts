@@ -1,19 +1,49 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { createRequire } from 'node:module'
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({ executeRaw: vi.fn(), executeRawUnsafe: vi.fn() }))
+const nodeRequire = createRequire(import.meta.url)
 
 describe('tenant store', () => {
   beforeEach(() => {
+    vi.resetModules()
     mocks.executeRaw.mockReset()
     mocks.executeRawUnsafe.mockReset()
     vi.unstubAllEnvs()
+    vi.stubGlobal('require', nodeRequire)
   })
 
-  it('activates a tenant for the current async request context', async () => {
-    const { activateTenantContext, currentTenantUserId } = await import('./tenant-store')
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('activates a tenant inside an isolated request scope and restores the caller scope', async () => {
+    const { activateTenantContext, currentTenantUserId, runWithTenantContext } = await import('./tenant-store')
     expect(currentTenantUserId()).toBeNull()
-    activateTenantContext('user_123')
-    expect(currentTenantUserId()).toBe('user_123')
+    await runWithTenantContext('request_user', async () => {
+      expect(currentTenantUserId()).toBe('request_user')
+      activateTenantContext('user_123')
+      await Promise.resolve()
+      expect(currentTenantUserId()).toBe('user_123')
+    })
+    expect(currentTenantUserId()).toBeNull()
+  })
+
+  it('keeps concurrent tenant request scopes isolated across async work', async () => {
+    const { currentTenantUserId, runWithTenantContext } = await import('./tenant-store')
+    const users = await Promise.all([
+      runWithTenantContext('user_alpha', async () => {
+        expect(currentTenantUserId()).toBe('user_alpha')
+        await new Promise(resolve => setTimeout(resolve, 5))
+        return currentTenantUserId()
+      }),
+      runWithTenantContext('user_beta', async () => {
+        expect(currentTenantUserId()).toBe('user_beta')
+        await Promise.resolve()
+        return currentTenantUserId()
+      }),
+    ])
+    expect(users).toEqual(['user_alpha', 'user_beta'])
+    expect(currentTenantUserId()).toBeNull()
   })
 
   it('sets the tenant and candidate role inside an RLS transaction', async () => {

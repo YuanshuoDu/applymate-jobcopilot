@@ -2,36 +2,18 @@ import { randomUUID } from "node:crypto"
 import type pg from "pg"
 import type { TenantScope } from "@jobcopilot/agent-protocol"
 
+import { assertSnapshotIntegrity, canonicalJson } from "./context-snapshot-canonical.js"
 import {
-  assertSnapshotIntegrity,
-  canonicalJson,
-  parseSnapshotContent,
-  snapshotCanonicalJson,
-} from "./context-snapshot-canonical.js"
-import {
-  CONTEXT_SNAPSHOT_SCHEMA_VERSION,
   ContextSnapshotError,
   type AgentContextSnapshot,
   type ContextSnapshotStorePort,
 } from "./context-snapshot-types.js"
-
-type SnapshotRow = {
-  id: string
-  sessionId: string
-  throughSequence: bigint | string
-  version: number | string
-  schemaVersion: string
-  content: unknown
-  summary: string
-  checksum: string
-  inputTokens: number | string
-  outputTokens: number | string
-  estimatedCostUsd: number | string
-  tokenAccounting: unknown
-  createdAt: Date | string
-}
-
-const SNAPSHOT_COLUMNS = `"id", "sessionId", "throughSequence", "version", "schemaVersion", "content", "summary", "checksum", "inputTokens", "outputTokens", "estimatedCostUsd", "tokenAccounting", "createdAt"`
+import {
+  CONTEXT_SNAPSHOT_COLUMNS,
+  CONTEXT_SNAPSHOT_COLUMNS_QUALIFIED,
+  mapContextSnapshotRow,
+  type ContextSnapshotRow,
+} from "./context-snapshot-row.js"
 
 function nonEmpty(value: unknown, field: string): string {
   if (typeof value !== "string" || value.trim().length === 0) throw new ContextSnapshotError("store_conflict", `Invalid ${field}`)
@@ -46,49 +28,6 @@ function assertSnapshotOwner(snapshot: AgentContextSnapshot, userId: string): vo
   if (snapshot.content.ownerId !== userId) {
     throw new ContextSnapshotError("reference_cross_tenant", "Context snapshot content is outside the tenant scope")
   }
-}
-
-function integer(value: number | string | bigint, field: string): number {
-  const result = typeof value === "number" ? value : Number(value)
-  if (!Number.isSafeInteger(result) || result < 0) throw new ContextSnapshotError("store_conflict", `Invalid ${field}`)
-  return result
-}
-
-function decimal(value: number | string, field: string): number {
-  const result = typeof value === "number" ? value : Number(value)
-  if (!Number.isFinite(result) || result < 0) throw new ContextSnapshotError("store_conflict", `Invalid ${field}`)
-  return Number(result.toFixed(8))
-}
-
-function date(value: Date | string, field: string): Date {
-  const result = value instanceof Date ? new Date(value) : new Date(value)
-  if (Number.isNaN(result.getTime())) throw new ContextSnapshotError("store_conflict", `Invalid ${field}`)
-  return result
-}
-
-function mapRow(row: SnapshotRow): AgentContextSnapshot {
-  const sessionId = nonEmpty(row.sessionId, "sessionId")
-  const throughSequence = BigInt(row.throughSequence)
-  if (throughSequence < 0n) throw new ContextSnapshotError("store_conflict", "Invalid throughSequence")
-  if (row.schemaVersion !== CONTEXT_SNAPSHOT_SCHEMA_VERSION) throw new ContextSnapshotError("store_conflict", "Unsupported context snapshot schema version")
-  const content = parseSnapshotContent(row.content)
-  const base = { sessionId, throughSequence, version: integer(row.version, "version"), content }
-  const snapshot: AgentContextSnapshot = {
-    id: nonEmpty(row.id, "id"),
-    ...base,
-    schemaVersion: CONTEXT_SNAPSHOT_SCHEMA_VERSION,
-    summary: nonEmpty(row.summary, "summary"),
-    memorySummary: row.summary,
-    checksum: nonEmpty(row.checksum, "checksum"),
-    inputTokens: integer(row.inputTokens, "inputTokens"),
-    outputTokens: integer(row.outputTokens, "outputTokens"),
-    estimatedCostUsd: decimal(row.estimatedCostUsd, "estimatedCostUsd"),
-    tokenAccounting: row.tokenAccounting as AgentContextSnapshot["tokenAccounting"],
-    canonicalJson: snapshotCanonicalJson(base),
-    createdAt: date(row.createdAt, "createdAt"),
-  }
-  assertSnapshotIntegrity(snapshot)
-  return snapshot
 }
 
 function sameSnapshot(left: AgentContextSnapshot, right: AgentContextSnapshot): boolean {
@@ -151,11 +90,11 @@ export function createPgContextSnapshotStore(pool: Pick<pg.Pool, "connect">): Co
       const id = snapshot.id ?? randomUUID()
       return withTransaction(pool, userId, async (client) => {
         await sessionOwner(client, snapshot, userId)
-        const inserted = await client.query<SnapshotRow>(
-          `INSERT INTO "agent_context_snapshots" (${SNAPSHOT_COLUMNS})
+        const inserted = await client.query<ContextSnapshotRow>(
+          `INSERT INTO "agent_context_snapshots" (${CONTEXT_SNAPSHOT_COLUMNS})
            VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11, $12::jsonb, CURRENT_TIMESTAMP)
            ON CONFLICT DO NOTHING
-           RETURNING ${SNAPSHOT_COLUMNS}`,
+           RETURNING ${CONTEXT_SNAPSHOT_COLUMNS}`,
           [
             id,
             snapshot.sessionId,
@@ -171,13 +110,13 @@ export function createPgContextSnapshotStore(pool: Pick<pg.Pool, "connect">): Co
             JSON.stringify(snapshot.tokenAccounting),
           ],
         )
-        const existing = inserted.rows[0] ?? (await client.query<SnapshotRow>(
-          `SELECT ${SNAPSHOT_COLUMNS} FROM "agent_context_snapshots"
+        const existing = inserted.rows[0] ?? (await client.query<ContextSnapshotRow>(
+          `SELECT ${CONTEXT_SNAPSHOT_COLUMNS} FROM "agent_context_snapshots"
            WHERE "sessionId" = $1 AND "throughSequence" = $2 FOR UPDATE`,
           [snapshot.sessionId, snapshot.throughSequence.toString()],
         )).rows[0]
         if (!existing) throw new ContextSnapshotError("snapshot_conflict", "Snapshot could not be inserted or loaded")
-        const persisted = mapRow(existing)
+        const persisted = mapContextSnapshotRow(existing)
         if (!sameSnapshot(persisted, snapshot)) throw new ContextSnapshotError("snapshot_conflict", "Snapshot identity already has different content")
         await persistProjection(client, persisted, userId)
         return persisted
@@ -189,8 +128,8 @@ export function createPgContextSnapshotStore(pool: Pick<pg.Pool, "connect">): Co
       nonEmpty(input.sessionId, "sessionId")
       if (input.throughSequence < 0n) throw new ContextSnapshotError("invalid_input", "throughSequence must not be negative")
       return withTransaction(pool, userId, async (client) => {
-        const result = await client.query<SnapshotRow>(
-          `SELECT ${SNAPSHOT_COLUMNS}
+        const result = await client.query<ContextSnapshotRow>(
+          `SELECT ${CONTEXT_SNAPSHOT_COLUMNS_QUALIFIED}
            FROM "agent_context_snapshots" AS snapshot
            JOIN "agent_sessions" AS session ON session."id" = snapshot."sessionId"
            WHERE snapshot."sessionId" = $1 AND snapshot."throughSequence" = $2
@@ -198,7 +137,7 @@ export function createPgContextSnapshotStore(pool: Pick<pg.Pool, "connect">): Co
           [input.sessionId, input.throughSequence.toString(), userId],
         )
         if (!result.rows[0]) return null
-        const snapshot = mapRow(result.rows[0])
+        const snapshot = mapContextSnapshotRow(result.rows[0])
         assertSnapshotOwner(snapshot, userId)
         return snapshot
       })

@@ -1,4 +1,7 @@
 import type { DiscoveryAttemptLifecycleEvent, LifecycleCall } from "../tools/lifecycle.js"
+import type { ToolExecutionContext } from "../tools/types.js"
+import { captureDiscoveryQueryCriteria, createDiscoveryQueryFootprintForAttempts,
+  type DiscoveryQueryCapture, type DiscoveryQueryFootprint } from "./child-discovery-query-footprint.js"
 
 export const DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION = "agent-harness.v2.task-graph.discovery-attempt-health.v1" as const
 const MAX_CALLS = 32
@@ -15,16 +18,17 @@ export type DiscoveryAttemptHealth = Readonly<{
   materializationFailures: number | null
   hasMore: boolean | null
 }>
-export type DiscoveryAttemptSidecar = Readonly<{ attemptCount: number; health: DiscoveryAttemptHealth }>
+export type DiscoveryAttemptSidecar = Readonly<{ attemptCount: number; health: DiscoveryAttemptHealth; queryFootprint?: DiscoveryQueryFootprint }>
 
 export type DiscoveryAttemptCollectorFence = Readonly<{ taskId: string; rootTaskId: string; sessionId: string; turnId: string; attemptCount: number }>
 type Receipt = Readonly<{
+  requestCount: number | null
   candidateCount: number | null
   providerFailures: number | null
   materializationFailures: number | null
   hasMore: boolean | null
 }>
-type CallState = { readonly call: string; phase: "started" | "completed" | "failed" | "cancelled"; receipt?: Receipt; fingerprint?: string }
+type CallState = { readonly call: string; phase: "started" | "completed" | "failed" | "cancelled"; receipt?: Receipt; fingerprint?: string; query?: DiscoveryQueryCapture }
 
 function exactRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | null {
   try {
@@ -73,6 +77,7 @@ export function parseDiscoveryAttemptHealth(value: unknown): DiscoveryAttemptHea
 
 export function parseDiscoveryAttemptSidecar(value: unknown, currentAttemptCount: number): DiscoveryAttemptHealth | null {
   const row = exactRecord(value, ["attemptCount", "health"])
+    ?? exactRecord(value, ["attemptCount", "health", "queryFootprint"])
   if (!boundedCount(currentAttemptCount) || currentAttemptCount < 1 || !row
     || row.attemptCount !== currentAttemptCount) return null
   return parseDiscoveryAttemptHealth(row.health)
@@ -102,6 +107,7 @@ function successfulReceipt(value: unknown, call: LifecycleCall): Receipt | null 
   const usage = safeUsage(output.usage, call)
   if (!usage) return null
   return {
+    requestCount: usage.requests as number,
     candidateCount: output.jobs.length,
     providerFailures: Object.hasOwn(usage, "providerFailures") ? usage.providerFailures as number : null,
     materializationFailures: usage.jobsFailed as number,
@@ -128,6 +134,7 @@ function failedReceipt(value: unknown): Receipt | null {
   const usage = output && safeFailureUsage(output.usage)
   if (!usage) return null
   return {
+    requestCount: usage.requests as number,
     candidateCount: null,
     providerFailures: Object.hasOwn(usage, "providerFailures") ? usage.providerFailures as number : null,
     materializationFailures: usage.jobsFailed as number,
@@ -149,10 +156,30 @@ function matchesFence(call: LifecycleCall, fence: DiscoveryAttemptCollectorFence
 
 export function createChildDiscoveryAttemptCollector(fence: DiscoveryAttemptCollectorFence): {
   observeLifecycleEvent(event: DiscoveryAttemptLifecycleEvent): void
+  observeEffectiveCriteria(context: ToolExecutionContext, capture: DiscoveryQueryCapture): void
   sidecar(): DiscoveryAttemptSidecar | undefined
 } {
   const calls = new Map<string, CallState>()
   let failedClosed = !Number.isSafeInteger(fence.attemptCount) || fence.attemptCount < 1
+  let queryFootprintInvalid = false
+
+  const observeEffectiveCriteria = (context: ToolExecutionContext, capture: DiscoveryQueryCapture): void => {
+    try {
+      const call: LifecycleCall = {
+        id: context.toolCallId ?? "", toolName: "jobs.discover", toolVersion: "1", sessionId: context.sessionId,
+        turnId: context.turnId, stepId: context.stepId, taskId: context.taskId, rootTaskId: context.rootTaskId,
+      }
+      const key = identity(call), state = key ? calls.get(key) : undefined
+      if (!key || !matchesFence(call, fence) || !state || state.phase !== "started" || state.query) {
+        queryFootprintInvalid = true
+        return
+      }
+      state.query = capture.availability === "captured"
+        ? captureDiscoveryQueryCriteria(capture.criteria)
+        : capture
+      if (!state.query || state.query.availability !== "captured" && state.query.availability !== "omitted") queryFootprintInvalid = true
+    } catch { queryFootprintInvalid = true }
+  }
 
   const observeLifecycleEvent = (event: DiscoveryAttemptLifecycleEvent): void => {
     try {
@@ -214,7 +241,9 @@ export function createChildDiscoveryAttemptCollector(fence: DiscoveryAttemptColl
       materializationFailures: safeSum(receipt => receipt.materializationFailures),
       hasMore: unresolvedCalls > 0 || invalidReceipt ? null : hasMore,
     })
-    return health ? { attemptCount: fence.attemptCount, health } : undefined
+    if (!health) return undefined
+    const sidecar: DiscoveryAttemptSidecar = { attemptCount: fence.attemptCount, health }
+    return { ...sidecar, queryFootprint: createDiscoveryQueryFootprintForAttempts(values, queryFootprintInvalid) }
   }
-  return { observeLifecycleEvent, sidecar }
+  return { observeLifecycleEvent, observeEffectiveCriteria, sidecar }
 }

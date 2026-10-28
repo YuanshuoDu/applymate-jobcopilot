@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 
 import type { TurnEngineStore } from "./turns/turn-engine-types.js"
-import { addScheduledPrepareActions, taskGraphDenialCheckpointReader, turnStoreForInteractiveDiscovery } from "./canonical-turn-runtime-turn-setup.js"
+import { addScheduledPrepareActions, taskGraphDenialCheckpointReader, taskGraphTemplateRoleView, turnStoreForInteractiveDiscovery } from "./canonical-turn-runtime-turn-setup.js"
 import { TASK_GRAPH_TEMPLATES } from "./subagents/task-graph-templates.js"
 import { TASK_GRAPH_DENIAL_CHECKPOINT_SCHEMA, type TaskGraphDenialCheckpoint } from "./turns/task-graph-terminal-assessment.js"
 import { TASK_GRAPH_DENIAL_CHECKPOINT } from "./turns/turn-execution-types.js"
@@ -73,5 +73,23 @@ describe("canonical interactive discovery store composition", () => {
     await expect(readCheckpoint(client)).resolves.toEqual(checkpoint)
     expect(checkCompletion).toHaveBeenCalledOnce()
     expect(checkCompletion.mock.calls[0]?.[0].client).toBe(client)
+  })
+})
+
+describe("active TaskGraph template role view", () => {
+  it("freezes only valid role values from the active template map", () => {
+    const roles = taskGraphTemplateRoleView({
+      scout: { ...TASK_GRAPH_TEMPLATES.scout, role: "analyst", context: { privateRegistryContext: "PRIVATE_TEMPLATE_CONTEXT" } },
+      analyst: TASK_GRAPH_TEMPLATES.analyst,
+      invalidRole: { ...TASK_GRAPH_TEMPLATES.scout, role: "" },
+    })
+
+    expect(roles?.scout).toBe("analyst")
+    expect(roles?.analyst).toBe("analyst")
+    expect(roles).not.toHaveProperty("invalidRole")
+    expect(Object.isFrozen(roles)).toBe(true)
+    expect(Object.keys(roles ?? {})).toEqual(["scout", "analyst"])
+    expect(JSON.stringify(roles)).not.toMatch(/privateRegistryContext|PRIVATE_TEMPLATE_CONTEXT|allowedActions/)
+    expect(taskGraphTemplateRoleView(undefined)).toBeUndefined()
   })
 })

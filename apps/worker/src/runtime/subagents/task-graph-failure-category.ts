@@ -1,7 +1,10 @@
+import { TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON } from "./task-graph-child-deadline.js"
+
 export type TaskGraphExecutionFailureCategory =
   | "execution_setup_unavailable"
   | "resume_state_unavailable"
   | "structured_output_invalid"
+  | "execution_deadline_exceeded"
 
 function plainRecord(value: unknown): value is Record<string, unknown> {
   try {
@@ -49,6 +52,8 @@ export function classifyCurrentTaskGraphExecutionFailure(
       return "resume_state_unavailable"
     case "invalid_structured_result":
       return "structured_output_invalid"
+    case TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON:
+      return "execution_deadline_exceeded"
     default:
       return undefined
   }
