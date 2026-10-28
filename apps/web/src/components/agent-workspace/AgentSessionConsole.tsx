@@ -31,7 +31,6 @@ export function AgentSessionConsole({
   onRunSession?: (id: string, policy: { autoApply: boolean; requireApproval: boolean }) => void
   onNewChat: () => void
   onDeletedSession: (id: string) => void
-  onAddAgent?: () => void
   refreshVersion?: number
   onSessionsLoaded?: (data: AgentSessionsResponse) => void
   onAttentionChange?: (sessionId: string, needsAttention: boolean) => void

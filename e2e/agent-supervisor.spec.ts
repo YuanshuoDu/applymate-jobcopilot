@@ -686,7 +686,12 @@ test('real page mounts the shared timeline, supervisor tree, and isolated sessio
   await expect(page.locator('[data-agent-supervisor-selection]')).toContainText('jobs.search')
   await expect(page.locator('[data-agent-harness-item="fixture-tool-a"]')).toHaveCount(1)
   await expect(page.locator('[data-agent-harness-item="fixture-tool-a"]')).toContainText('Selected tool evidence survived the disconnect.')
+  const timelineWidthWithDetails = await liveStream.evaluate(element => element.getBoundingClientRect().width)
   await showConversation(page, isZh)
+  if ((await page.evaluate(() => window.innerWidth)) > 900) {
+    await expect.poll(() => liveStream.evaluate(element => element.getBoundingClientRect().width)).toBeGreaterThan(timelineWidthWithDetails)
+  }
+  await expect(page.getByRole('button', { name: isZh ? /^任务与结果/ : /^Tasks & results/ })).toBeFocused()
   await expect.poll(async () => page.evaluate(() => {
     const item = document.querySelector<HTMLElement>('[data-agent-harness-item="fixture-tool-a"]')
     const streamBody = document.querySelector<HTMLElement>('.agent-live-stream-body')

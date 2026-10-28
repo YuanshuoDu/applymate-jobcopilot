@@ -3,7 +3,6 @@
 import React, { useCallback, useEffect, useRef, useState, type Dispatch, type ReactNode, type SetStateAction } from 'react'
 import { Home, PanelLeftClose, PanelLeftOpen } from 'lucide-react'
 import { TopBar } from '@/components/layout/TopBar'
-import { AddAgentModal } from '@/components/agent-workspace/AddAgentModal'
 import { AgentSessionConsole } from '@/components/agent-workspace/AgentSessionConsole'
 import { useNav } from '@/lib/nav-context'
 import { useI18n } from '@/lib/i18n'
@@ -12,8 +11,6 @@ import { AgentPlaygroundResponsiveStyles } from './AgentPlaygroundResponsiveStyl
 type SessionConsoleProps = React.ComponentProps<typeof AgentSessionConsole>
 
 interface AgentPlaygroundWorkspaceProps {
-  showAddModal: boolean
-  setShowAddModal: Dispatch<SetStateAction<boolean>>
   mobileSessionDrawerOpen: boolean
   setMobileSessionDrawerOpen: Dispatch<SetStateAction<boolean>>
   sessionProps: SessionConsoleProps
@@ -21,7 +18,7 @@ interface AgentPlaygroundWorkspaceProps {
 }
 
 export function AgentPlaygroundWorkspace({
-  showAddModal, setShowAddModal, mobileSessionDrawerOpen, setMobileSessionDrawerOpen,
+  mobileSessionDrawerOpen, setMobileSessionDrawerOpen,
   sessionProps, children,
 }: AgentPlaygroundWorkspaceProps) {
   const { navigate } = useNav()
@@ -63,13 +60,6 @@ export function AgentPlaygroundWorkspace({
           {needsAttention && <span className="agent-conversations-attention" aria-hidden="true" />}
         </button>
       </TopBar>
-
-      {showAddModal && (
-        <AddAgentModal
-          onClose={() => setShowAddModal(false)}
-          onCreated={() => window.dispatchEvent(new Event('applymate:agents-changed'))}
-        />
-      )}
 
       <div className="agent-workspace-layout" style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', overflow: 'hidden' }}>
         <button

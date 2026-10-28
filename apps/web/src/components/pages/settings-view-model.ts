@@ -1,7 +1,7 @@
-export type SettingsTab = 'profile' | 'appearance' | 'accounts' | 'apiKeys' | 'billing' | 'notifs' | 'privacy'
+export type SettingsTab = 'profile' | 'usage' | 'appearance' | 'accounts' | 'apiKeys' | 'billing' | 'notifs' | 'privacy'
 
 export const SETTINGS_TABS: readonly SettingsTab[] = [
-  'profile', 'appearance', 'accounts', 'apiKeys', 'billing', 'notifs', 'privacy',
+  'profile', 'usage', 'appearance', 'accounts', 'apiKeys', 'billing', 'notifs', 'privacy',
 ]
 
 export const EXTENSION_SETUP_HREF =

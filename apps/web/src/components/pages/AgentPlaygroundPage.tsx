@@ -48,7 +48,6 @@ export function AgentPlaygroundPage({ seedApplicationReviewQueue = false }: { se
   const { data: jobsData }                               = useApi<{ jobs: Array<{ status: string; workflowState: string }> }>('/api/jobs?pageSize=100')
   const { data: agentConfig } = useApi<AgentConfig>('/api/agent')
 
-  const [showAddModal,  setShowAddModal]  = useState(false)
   const [applyQueue,    setApplyQueue]    = useState<ApplyReadyJob[]>(() => seedApplicationReviewQueue ? [previewApplicationReviewJob] : [])
   const { sessionId, setSessionId } = useAgentSessionUrl()
   const selectedSessionId = sessionId
@@ -177,7 +176,6 @@ export function AgentPlaygroundPage({ seedApplicationReviewQueue = false }: { se
       selectAutomationSession(id, policy)
       setMobileSessionDrawerOpen(false)
     },
-    onAddAgent: () => setShowAddModal(true),
     onNewChat: () => {
       resetLiveWorkspace()
       setMobileSessionDrawerOpen(false)
@@ -189,8 +187,6 @@ export function AgentPlaygroundPage({ seedApplicationReviewQueue = false }: { se
 
   return (
     <AgentPlaygroundWorkspace
-      showAddModal={showAddModal}
-      setShowAddModal={setShowAddModal}
       mobileSessionDrawerOpen={mobileSessionDrawerOpen}
       setMobileSessionDrawerOpen={setMobileSessionDrawerOpen}
       sessionProps={sessionProps}

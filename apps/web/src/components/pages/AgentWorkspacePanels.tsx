@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useRef, useState, type ReactNode } from 'react'
+import React, { type ReactNode } from 'react'
 import { PanelRightClose, PanelRightOpen } from 'lucide-react'
 import { useI18n } from '@/lib/i18n'
 
@@ -13,9 +13,27 @@ export function AgentWorkspacePanels({ sessionId, needsAttention, toolbar, detai
   children: ReactNode
 }) {
   const { t } = useI18n()
-  const [selection, setSelection] = useState<{ sessionId: string; open: boolean } | null>(null)
-  const trigger = useRef<HTMLButtonElement>(null)
+  const [selection, setSelection] = React.useState<{ sessionId: string; open: boolean } | null>(null)
+  const trigger = React.useRef<HTMLButtonElement>(null)
   const open = Boolean(sessionId && selection?.sessionId === sessionId && selection.open)
+  const content = React.useRef<HTMLDivElement>(null)
+  const previousView = React.useRef({ sessionId, open })
+  React.useEffect(() => {
+    const returning = previousView.current.sessionId === sessionId && previousView.current.open && !open
+    previousView.current = { sessionId, open }
+    if (!returning || !sessionId) return
+    // Closing details changes transcript width. Locate the selected evidence after reflow.
+    const frame = requestAnimationFrame(() => {
+      const workspace = content.current
+      if (workspace?.dataset.agentWorkspaceSession !== sessionId) return
+      const itemId = workspace.querySelector<HTMLElement>('[data-task-node-id][aria-current="true"]')?.dataset.taskTimelineItem
+      if (!itemId) return
+      const item = Array.from(workspace.querySelectorAll<HTMLElement>('[data-agent-harness-item]'))
+        .find(candidate => candidate.dataset.agentHarnessItem === itemId)
+      item?.scrollIntoView({ behavior: 'instant', block: 'center' })
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [open, sessionId])
   const close = () => {
     if (sessionId) setSelection({ sessionId, open: false })
     trigger.current?.focus()
@@ -32,7 +50,7 @@ export function AgentWorkspacePanels({ sessionId, needsAttention, toolbar, detai
         {needsAttention && <span role="status" className="agent-attention-label">{t('agent.needsAttention')}</span>}
       </button>}
     </div>
-    <div className="agent-workspace-content">
+    <div ref={content} className="agent-workspace-content" data-agent-workspace-session={sessionId ?? undefined}>
       {children}
       <div id="agent-workspace-details" className="agent-workspace-details" hidden={!open}
         onKeyDown={event => { if (event.key === 'Escape') { event.stopPropagation(); close() } }}>

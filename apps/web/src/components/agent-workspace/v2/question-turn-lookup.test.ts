@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest'
 import { I18nProvider, translate } from '@/lib/i18n'
 
 import { AgentQuestionInputCard } from './AgentQuestionInputCard'
-import { includeCurrentQuestionTurn } from './question-turn-lookup'
+import { includeCurrentApprovalTurn, includeCurrentQuestionTurn } from './question-turn-lookup'
 import type { TimelineItem } from './timeline-reducer'
 import type { SupervisorTurnSummary } from './task-tree-projection'
 
@@ -97,5 +97,43 @@ describe('includeCurrentQuestionTurn', () => {
 
     expect(lookup).toEqual([stalePagedTurn])
     expect(card(lookup)).not.toContain(translate('en', 'agent.question.turnUnavailable'))
+  })
+})
+
+describe('includeCurrentApprovalTurn', () => {
+  const approvalProjection = { activeTurnId: 'turn-current', activeTurn: { id: 'turn-current', status: 'waiting_for_approval', revision: 12 } }
+
+  it('adds the current approval Turn after a full page of historical Turns', () => {
+    const firstPage = Array.from({ length: 100 }, (_, index) => turn(`turn-${index}`, 1, sessionId, 'completed'))
+    expect(includeCurrentApprovalTurn(firstPage, sessionId, approvalProjection)).toEqual([
+      expect.objectContaining({ id: 'turn-current', sessionId, status: 'waiting_for_approval', revision: 12 }),
+    ])
+  })
+
+  it('uses the canonical revision instead of older duplicate pages', () => {
+    const lookup = includeCurrentApprovalTurn([
+      turn('turn-current', 3, sessionId, 'waiting_for_approval'),
+      turn('turn-current', 4, sessionId, 'waiting_for_approval'),
+      turn('turn-current', 99, 'foreign-session', 'waiting_for_approval'),
+    ], sessionId, approvalProjection)
+    expect(lookup).toHaveLength(1)
+    expect(lookup[0]).toMatchObject({ sessionId, revision: 12 })
+  })
+
+  it('does not adopt foreign, mismatched, malformed, or question-only projections', () => {
+    const invalid: unknown[] = [
+      { ...approvalProjection, activeTurnId: 'different-turn' },
+      { ...approvalProjection, activeTurn: { ...approvalProjection.activeTurn, sessionId: 'foreign-session' } },
+      ...[-1, 1.5, '12', 2_147_483_648].map(revision => ({ ...approvalProjection, activeTurn: { ...approvalProjection.activeTurn, revision } })),
+      activeProjection,
+    ]
+    for (const projection of invalid) expect(includeCurrentApprovalTurn([], sessionId, projection)).toEqual([])
+    expect(includeCurrentApprovalTurn([turn('turn-current', 99, 'foreign-session', 'waiting_for_approval')], sessionId, null)).toEqual([])
+  })
+
+  it('removes stale approval eligibility once the current Turn has resumed', () => {
+    const lookup = includeCurrentApprovalTurn([turn('turn-current', 3, sessionId, 'waiting_for_approval')], sessionId,
+      { ...approvalProjection, activeTurn: { ...approvalProjection.activeTurn, status: 'in_progress' } })
+    expect(lookup).toEqual([])
   })
 })
