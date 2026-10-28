@@ -96,7 +96,10 @@ function brokerPayload(value: unknown, envelope: Row): ParsedApprovalLedgerEvent
 /** Strictly validates both legacy audit and broker wait approval facts. */
 export function parseApprovalLedgerEvent(value: unknown, expectedSessionId: string): ParsedApprovalLedgerEvent | null {
   try {
-    if (!plain(value) || !safeId(expectedSessionId) || !exact(value, ['schemaVersion', 'id', 'sessionId', 'turnId', 'itemId', 'taskId', 'type', 'actor', 'sequence', 'payload'], ['correlationId', 'causationId', 'idempotencyKey', 'createdAt']) ||
+    // The normalizer adds undefined timeline placeholders to wire facts. These
+    // ledger facts are not item deltas: reject defined values and unknown keys.
+    if (!plain(value) || !safeId(expectedSessionId) || !exact(value, ['schemaVersion', 'id', 'sessionId', 'turnId', 'itemId', 'taskId', 'type', 'actor', 'sequence', 'payload'], ['correlationId', 'causationId', 'idempotencyKey', 'createdAt', 'kind', 'baseRevision', 'revision']) ||
+      value.kind !== undefined || value.baseRevision !== undefined || value.revision !== undefined ||
       value.schemaVersion !== AGENT_STREAM_SCHEMA_VERSION || !safeId(value.id) || value.sessionId !== expectedSessionId || !safeId(value.turnId) ||
       (value.itemId !== null && !safeId(value.itemId)) || (value.taskId !== null && !safeId(value.taskId)) || !APPROVAL_LEDGER_EVENT_TYPES.includes(value.type as ApprovalLedgerEventType) ||
       (value.type === 'approval.resolved' ? (value.actor !== 'user' && value.actor !== 'system') : value.actor !== ACTORS[value.type as ApprovalLedgerEventType]) || typeof value.sequence !== 'string' || !SAFE_SEQUENCE.test(value.sequence) || value.sequence.length > 39 ||

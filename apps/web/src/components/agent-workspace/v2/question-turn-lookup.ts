@@ -17,24 +17,25 @@ export function includeCurrentApprovalTurn(
   sessionId: string | null,
   projection: unknown,
 ): SupervisorTurnSummary[] {
-  return includeCurrentActionTurn(turns, sessionId, projection, 'waiting_for_approval')
+  // Approval eligibility belongs to the ledger and Broker, not the Turn's display status.
+  return includeCurrentActionTurn(turns, sessionId, projection, null)
 }
 
 function includeCurrentActionTurn(
   turns: readonly SupervisorTurnSummary[],
   sessionId: string | null,
   projection: unknown,
-  waitingStatus: 'waiting_for_user' | 'waiting_for_approval',
+  waitingStatus: 'waiting_for_user' | null,
 ): SupervisorTurnSummary[] {
   if (!safeId(sessionId)) return []
   // An invalid projection is ignored; existing eligible page records remain the fallback.
-  const answerableTurns = turns.filter(turn => turn.sessionId === sessionId && turn.status === waitingStatus)
+  const answerableTurns = turns.filter(turn => turn.sessionId === sessionId && (waitingStatus === null || turn.status === waitingStatus))
   if (!isRecord(projection) || !safeId(projection.activeTurnId) || !isRecord(projection.activeTurn)) return answerableTurns
 
   const active = projection.activeTurn
   if (active.id !== projection.activeTurnId || !safeId(active.id) || (active.sessionId !== undefined && active.sessionId !== sessionId) ||
     typeof active.status !== 'string' || !ACTIVE_TURN_STATUSES.has(active.status)) return answerableTurns
-  if (active.status !== waitingStatus) return answerableTurns.filter(turn => turn.id !== active.id)
+  if (waitingStatus !== null && active.status !== waitingStatus) return answerableTurns.filter(turn => turn.id !== active.id)
   if (!safeRevision(active.revision)) return answerableTurns
 
   const current = answerableTurns.find(turn => turn.id === active.id)

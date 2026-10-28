@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { projectApprovalLedgerRow, parseApprovalLedgerEvent } from './approval-ledger-parser'
+import { normalizeTimelineEvent } from './timeline-event-normalizer'
 
 const legacy = (type: string, actor: string, payload: Record<string, unknown> = {}) => ({
   schemaVersion: 'agent-harness.v2', id: `${type}-1`, sessionId: 'session-1', turnId: 'turn-1', itemId: null, taskId: null,
@@ -39,5 +40,32 @@ describe('approval ledger parser', () => {
     const result = projectApprovalLedgerRow(row, 'session-1', value => value)
     expect(result).toMatchObject({ id: 'approval.requested-1', payload: { approvalId: 'approval-1', action: 'submit_application', revision: 2 } })
     expect(JSON.stringify(result)).not.toContain('scopeHash')
+  })
+
+  it('accepts the actual normalizer placeholders for audit and broker facts', () => {
+    for (const raw of [
+      legacy('approval.requested', 'orchestrator'), legacy('approval.resolved', 'user'),
+      legacy('approval.consumed', 'system'), legacy('approval.expired', 'system'), broker(), cancelledBroker(),
+    ]) {
+      const normalized = normalizeTimelineEvent(raw)
+      expect(normalized).toHaveProperty('kind', undefined)
+      expect(normalized).toHaveProperty('baseRevision', undefined)
+      expect(normalized).toHaveProperty('revision', undefined)
+      expect(parseApprovalLedgerEvent(normalized, 'session-1')?.receipt)
+        .toEqual(parseApprovalLedgerEvent(raw, 'session-1')?.receipt)
+    }
+  })
+
+  it('rejects defined delta metadata, unknown keys, wrong actors and foreign ownership after normalization', () => {
+    const normalized = normalizeTimelineEvent(broker())
+    for (const invalid of [
+      { kind: 'delta' }, { kind: 'snapshot' }, { kind: 'other' }, { kind: null },
+      { revision: 0 }, { revision: -1 }, { revision: 1.5 }, { revision: '3' }, { baseRevision: 0 }, { baseRevision: null },
+      { extra: undefined }, { decision: 'approved' }, { actor: 'orchestrator' }, { actor: 'system' }, { sessionId: 'foreign-session' },
+    ]) {
+      expect(parseApprovalLedgerEvent({ ...normalized, ...invalid }, 'session-1')).toBeNull()
+    }
+    expect(parseApprovalLedgerEvent({ ...broker(), untrusted: 'extra' }, 'session-1')).toBeNull()
+    expect(parseApprovalLedgerEvent({ ...normalized, payload: { ...broker().payload, answer: 'private answer' } }, 'session-1')).toBeNull()
   })
 })

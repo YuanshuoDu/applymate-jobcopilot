@@ -135,6 +135,27 @@ describe('AgentSupervisorPanel selected evidence', () => {
     expect(html).not.toContain('PROJECTION_PRIVATE_GOAL')
   })
 
+  it.each(['waiting_for_user', 'in_progress'])('preserves pending approval controls for %s paged and projected Turns', status => {
+    const current = { id: 'turn-current', sessionId: 'session-1', source: 'user', goal: 'Current goal', status, revision: 7,
+      activeStepId: null, finalItemId: null, createdAt: '', updatedAt: '', completedAt: null }
+    for (const data of [
+      { turns: [current] },
+      { turns: [], projection: { activeTurnId: current.id, activeTurn: { id: current.id, status, revision: 14 } } },
+      { turns: [current], projection: { activeTurnId: current.id, activeTurn: { id: current.id, status, revision: 14 } } },
+    ]) {
+      supervisorApi.responses.set('/api/agent/sessions/session-1/turns?limit=100', {
+        data, loading: false, error: null, refetch: () => undefined,
+      })
+      const html = renderToStaticMarkup(<AgentSupervisorPanel sessionId="session-1" timeline={pendingApprovalTimeline()} />)
+      expect(html).not.toContain(t('agent.approvalLedger.turnUnavailable'))
+      for (const label of [t('agent.approvalLedger.approve'), t('agent.approvalLedger.reject')]) {
+        const button = html.match(new RegExp(`<button[^>]*>${label}</button>`))?.[0]
+        expect(button).toBeDefined()
+        expect(button).not.toContain('disabled=""')
+      }
+    }
+  })
+
   it.each([
     { activeTurnId: 'turn-current', activeTurn: { id: 'turn-current', sessionId: 'foreign-session', status: 'waiting_for_approval', revision: 14 } },
     { activeTurnId: 'different-turn', activeTurn: { id: 'turn-current', status: 'waiting_for_approval', revision: 14 } },

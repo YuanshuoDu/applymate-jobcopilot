@@ -36,10 +36,13 @@ export function AgentSupervisorPreviewClient({ supervisorMode = false, settingsM
 
 function PreviewLocale({ locale, children }: { locale?: Lang; children: React.ReactNode }) {
   const { setLang } = useI18n()
+  const [ready, setReady] = React.useState(false)
 
   React.useEffect(() => {
-    if (locale) setLang(locale)
+    setLang(locale ?? 'en')
+    setReady(true)
   }, [locale, setLang])
 
-  return <div style={{ display: 'flex', height: '100dvh', minWidth: 0, minHeight: 0, overflow: 'hidden' }}>{children}</div>
+  // Fixture locale must be deterministic even when another preview saved a different language.
+  return <div style={{ display: 'flex', height: '100dvh', minWidth: 0, minHeight: 0, overflow: 'hidden' }}>{ready ? children : null}</div>
 }

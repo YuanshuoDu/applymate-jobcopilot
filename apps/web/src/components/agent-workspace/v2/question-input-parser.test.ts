@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { parseQuestionInputItem, parseQuestionTerminalEvent } from './question-input-parser'
+import { normalizeTimelineEvent } from './timeline-event-normalizer'
 
 const item = (overrides: Record<string, unknown> = {}) => ({
   schemaVersion: 'agent-harness.v2', id: 'item-question-1', sessionId: 'session-1', turnId: 'turn-1', taskId: null,
@@ -8,6 +9,12 @@ const item = (overrides: Record<string, unknown> = {}) => ({
   createdAt: '2026-09-15T00:00:00.000Z', updatedAt: '2026-09-15T00:00:00.000Z',
   content: { waitKind: 'question', questionId: 'question-1', stage: 'profile', question: 'Which option?', options: [{ value: 'yes', label: 'Yes' }], answerAvailable: false, pending: true },
   ...overrides,
+})
+
+const answeredEvent = () => ({
+  schemaVersion: 'agent-harness.v2', id: 'answered-1', sessionId: 'session-1', turnId: 'turn-1',
+  itemId: 'item-question-1', taskId: null, type: 'question.answered', actor: 'user', sequence: '9',
+  payload: { waitKind: 'question', waitId: 'question-1', itemId: 'item-question-1', turnId: 'turn-1', toolCallId: null, status: 'answered', nextTurnRevision: 3, answerAvailable: true },
 })
 
 describe('question input parser', () => {
@@ -40,5 +47,27 @@ describe('question input parser', () => {
     const cancelled = { ...answered, id: 'cancelled-1', type: 'question.cancelled', actor: 'system', sequence: '10', payload: { waitKind: 'question', waitId: 'question-1', itemId: 'item-question-1', toolCallId: null, outcome: 'cancelled', reason: 'interrupt' } }
     expect(parseQuestionTerminalEvent(cancelled, 'session-1')).toMatchObject({ questionId: 'question-1', status: 'interrupted' })
     expect(parseQuestionTerminalEvent({ ...answered, payload: { ...answered.payload, answer: 'private answer' } }, 'session-1')).toBeNull()
+  })
+
+  it('accepts a canonical answer after the actual stream normalizer adds optional keys', () => {
+    const normalized = normalizeTimelineEvent(answeredEvent())
+    expect(normalized).toHaveProperty('kind', undefined)
+    expect(normalized).toHaveProperty('baseRevision', undefined)
+    expect(normalized).toHaveProperty('revision', undefined)
+    expect(parseQuestionTerminalEvent(normalized, 'session-1')).toMatchObject({ questionId: 'question-1', status: 'completed' })
+  })
+
+  it('rejects delta metadata, unknown keys and raw answers on terminal facts', () => {
+    const normalized = normalizeTimelineEvent(answeredEvent())
+    for (const invalid of [
+      { kind: 'delta' }, { kind: 'snapshot' }, { kind: 'arbitrary' }, { kind: null }, { revision: 0 }, { baseRevision: 0 },
+      { revision: -1 }, { revision: 1.5 }, { revision: '3' },
+      { revision: 2_147_483_648 }, { revision: Number.NaN }, { baseRevision: -1 }, { baseRevision: null },
+      { extra: undefined }, { answer: 'private answer' }, { actor: 'orchestrator' }, { sessionId: 'foreign-session' },
+    ]) {
+      expect(parseQuestionTerminalEvent({ ...normalized, ...invalid }, 'session-1')).toBeNull()
+    }
+    expect(parseQuestionTerminalEvent({ ...answeredEvent(), untrusted: 'extra' }, 'session-1')).toBeNull()
+    expect(parseQuestionTerminalEvent({ ...normalized, payload: { ...answeredEvent().payload, answer: 'private answer' } }, 'session-1')).toBeNull()
   })
 })
