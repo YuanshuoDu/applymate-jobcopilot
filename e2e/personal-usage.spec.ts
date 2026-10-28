@@ -2,13 +2,13 @@ import { expect, test, type Page, type Route, type TestInfo } from '@playwright/
 
 const labels = {
   en: {
-    title: 'Usage & activity', refresh: 'Refresh usage', period: 'Time range', signInRequired: 'Sign in to view your usage and activity.',
+    keys: 'Keys & connections', title: 'Usage & activity', refresh: 'Refresh usage', period: 'Time range', signInRequired: 'Sign in to view your usage and activity.',
     error: 'Usage is unavailable right now. Try again shortly.', activityError: 'Activity could not be loaded.',
     retry: 'Try again', empty: 'No recorded AI requests in this period.',
     loading: 'Loading your usage…', details: 'View daily numbers', daily: 'Daily requests',
   },
   zh: {
-    title: '使用量与活动', refresh: '刷新使用量', period: '统计时段', signInRequired: '请登录后查看用量与活动。',
+    keys: '密钥与连接', title: '使用量与活动', refresh: '刷新使用量', period: '统计时段', signInRequired: '请登录后查看用量与活动。',
     error: '暂时无法加载使用量，请稍后重试。', activityError: '暂时无法加载活动记录。',
     retry: '重试', empty: '这个时段还没有已记录的 AI 请求。',
     loading: '正在加载使用量…', details: '查看每日明细', daily: '每日请求',
@@ -19,6 +19,7 @@ async function openUsage(page: Page, testInfo: TestInfo) {
   const locale = testInfo.project.metadata.appLocale === 'zh' ? 'zh' : 'en'
   await page.goto(`/agent-preview?surface=settings&tab=usage&locale=${locale}`)
   await expect(page.locator('html')).toHaveAttribute('lang', locale)
+  await expect(page.getByRole('button', { name: labels[locale].keys })).toBeVisible()
   await expect(page.getByRole('region', { name: labels[locale].title, exact: true })).toBeVisible()
   return labels[locale]
 }
