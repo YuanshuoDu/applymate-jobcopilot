@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer"
 import { describe, expect, it } from "vitest"
 import { projectRootTaskHistory, type ValidatedRootTaskHistoryOutcome } from "./root-task-history.js"
+import { rootTaskHistoryOrigin } from "./root-task-history-fence.js"
 import {
   createRootTaskHistoryObjectiveSnapshotIdentity, createRootTaskHistoryObjectiveSnapshotPayload,
   readRootTaskHistoryObjectiveSnapshotPayload, rootTaskHistoryObjectiveSnapshotKey,
@@ -38,6 +39,41 @@ describe("root task history objective snapshot codec", () => {
     expect(createRootTaskHistoryObjectiveSnapshotIdentity({ ...identityInput, fence: { ...fence, objectiveDigest: "bad" } })).toBeNull()
     expect(createRootTaskHistoryObjectiveSnapshotIdentity({ ...identityInput, fence: { ...fence, currentStartWitness: undefined } })).toBeNull()
     expect(rootTaskHistoryObjectiveSnapshotKey(identity!)).not.toBe(rootTaskHistoryObjectiveSnapshotKey({ ...identity!, startWitnessXid8: "101" }))
+  })
+
+  it("keys and replays persisted snapshots only for the exact canonical origin and typed intent", () => {
+    const noIntent = createRootTaskHistoryObjectiveSnapshotIdentity(identityInput)!
+    const intent = { kind: "interactive_discovery_shortlist", version: 1 }
+    const userOrigin = rootTaskHistoryOrigin("user", { intent })!
+    const automationOrigin = rootTaskHistoryOrigin("automation", { intent })!
+    const typedIntent = createRootTaskHistoryObjectiveSnapshotIdentity({ ...identityInput, fence: {
+      ...fence, currentOrigin: userOrigin,
+    } })!
+    const sameIntentDifferentOrigin = createRootTaskHistoryObjectiveSnapshotIdentity({ ...identityInput, fence: {
+      ...fence, currentOrigin: automationOrigin,
+    } })!
+
+    expect(typedIntent).toMatchObject({ canonicalOrigin: '["user","interactive_discovery_shortlist",1]',
+      intentKind: "interactive_discovery_shortlist", intentVersion: 1 })
+    expect(sameIntentDifferentOrigin).toMatchObject({ canonicalOrigin: '["automation","interactive_discovery_shortlist",1]',
+      intentKind: "interactive_discovery_shortlist", intentVersion: 1 })
+    expect(rootTaskHistoryObjectiveSnapshotKey(noIntent)).not.toBe(rootTaskHistoryObjectiveSnapshotKey(typedIntent))
+    expect(rootTaskHistoryObjectiveSnapshotKey(typedIntent)).not.toBe(rootTaskHistoryObjectiveSnapshotKey(sameIntentDifferentOrigin))
+
+    const typedPayload = createRootTaskHistoryObjectiveSnapshotPayload(typedIntent, [])!
+    const otherOriginPayload = createRootTaskHistoryObjectiveSnapshotPayload(sameIntentDifferentOrigin, [])!
+    expect(typedPayload).toMatchObject({ canonicalOrigin: typedIntent.canonicalOrigin,
+      intentKind: typedIntent.intentKind, intentVersion: typedIntent.intentVersion, outcomes: [] })
+    expect(readRootTaskHistoryObjectiveSnapshotPayload(typedPayload, typedIntent)).toEqual([])
+    expect(readRootTaskHistoryObjectiveSnapshotPayload(typedPayload, noIntent)).toBeNull()
+    expect(readRootTaskHistoryObjectiveSnapshotPayload(typedPayload, sameIntentDifferentOrigin)).toBeNull()
+    expect(readRootTaskHistoryObjectiveSnapshotPayload(otherOriginPayload, typedIntent)).toBeNull()
+    expect(createRootTaskHistoryObjectiveSnapshotIdentity({ ...identityInput, fence: {
+      ...fence, currentOrigin: JSON.stringify(["user", "interactive_discovery_shortlist", 2]),
+    } })).toBeNull()
+    expect(createRootTaskHistoryObjectiveSnapshotIdentity({ ...identityInput, fence: {
+      ...fence, currentOrigin: JSON.stringify(["user", "other_intent", 1]),
+    } })).toBeNull()
   })
 
   it("stores only ordered minimal prior-session projections and strips raw graph and Scout query data", () => {
