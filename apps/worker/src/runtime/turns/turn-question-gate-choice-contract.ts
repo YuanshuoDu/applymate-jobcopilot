@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer"
 import { createHash } from "node:crypto"
+import { scheduledPipelineContinuationKeyVersion } from "@jobcopilot/agent-protocol"
 
 export const TURN_SCHEDULED_GATE_CHOICE_SCHEMA = "agent-harness.v2.scheduled-gate-choice-wait.v1" as const
 export const TURN_SCHEDULED_GATE_CHOICE_MAX_JOBS = 50
@@ -63,7 +64,7 @@ export function parseTurnQuestionGateChoiceBinding(value: unknown): TurnQuestion
   if (!row || !owner || !exactKeys(row, ["schemaVersion", "owner", "continuationKey", "snapshotDigest", "evidenceDigest", "checkpointDigest", "analyzeGraphRevision", "graphRevision", "gateTaskId", "gateAttempt", "kind", "jobIds", "allowedChoiceIds"])
     || !exactKeys(owner, ["userId", "sessionId", "turnId", "rootTaskId", "rootAttemptCount", "executionId", "executionAttemptCount"])
     || row.schemaVersion !== TURN_SCHEDULED_GATE_CHOICE_SCHEMA || !validOwner(owner)
-    || !text(row.continuationKey, /^scheduled-taskgraph:sha256:[a-f0-9]{64}$/)
+    || typeof row.continuationKey !== "string" || scheduledPipelineContinuationKeyVersion(row.continuationKey) === null
     || !text(row.snapshotDigest, /^sha256:[a-f0-9]{64}$/) || !text(row.evidenceDigest, /^[a-f0-9]{64}$/)
     || !text(row.checkpointDigest, /^[a-f0-9]{64}$/) || !positive(row.analyzeGraphRevision) || !positive(row.graphRevision)
     || !validId(row.gateTaskId) || !positive(row.gateAttempt)

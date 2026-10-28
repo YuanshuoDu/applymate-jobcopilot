@@ -14,6 +14,7 @@ import {
   type ScheduledTaskGraphPipelineOwner,
 } from './scheduled-taskgraph-pipeline-checkpoint'
 import type { ApplicationPackage, ScoredJob, StageResult, AnalyzeOutput } from './types'
+import { scheduledTaskGraphPrepareReceiptKey } from './scheduled-taskgraph-prepare-proof'
 
 const ids = ['c' + '1'.repeat(24), 'c' + '2'.repeat(24)]
 const owner: ScheduledTaskGraphPipelineOwner = {
@@ -122,6 +123,19 @@ function retainPreparedJobs(value: ReturnType<typeof prepared>, selected: readon
 }
 
 describe('scheduled TaskGraph Prepare to Gate checkpoint', () => {
+  it('pins the historical v1 stable Prepare receipt key', () => {
+    expect(prepared().proof.receipt.continuationKey).toBe('scheduled-taskgraph:sha256:f9a20f940e39838c1453450b8f745fe3d14100575443add46cffdfd156963a39')
+  })
+
+  it('rejects a v2 Prepare receipt key when its Analyze continuation remains v1', () => {
+    const value = prepared()
+    value.proof.receipt.continuationKey = scheduledTaskGraphPrepareReceiptKey(owner, {
+      ...value.proof.receipt, continuationKey: `scheduled-taskgraph:v2:sha256:${'e'.repeat(64)}`,
+    })
+    expect(value.proof.receipt.continuationKey).toMatch(/^scheduled-taskgraph:v2:sha256:/)
+    expect(buildScheduledTaskGraphGateCheckpoint(input({}, value))).toBeNull()
+  })
+
   it('hashes only the validated Analyze projection and builds Gate from trusted packages', () => {
     const value = prepared()
     const digest = scheduledTaskGraphAnalyzeCheckpointDigest(value.persisted)

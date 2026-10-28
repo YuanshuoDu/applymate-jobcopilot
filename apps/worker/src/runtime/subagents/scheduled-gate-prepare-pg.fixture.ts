@@ -11,6 +11,7 @@ import type { ScheduledAutomationPipelineOwner } from "./scheduled-automation-pi
 import { SCHEDULED_AUTOMATION_SNAPSHOT_SCHEMA_VERSION, type ScheduledAutomationSnapshot } from "./scheduled-automation-snapshot.js"
 import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId, type TaskGraphSnapshot } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, type TaskGraphVerificationContract } from "../planning/task-graph-verification.js"
+import { createScheduledMultiScoutPrefixPlan, type ScheduledMultiScoutPrefixPlan } from "./scheduled-multi-scout-prefix-pg.fixture.js"
 
 const SCOUT_VERIFICATION: TaskGraphVerificationContract = {
   schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
@@ -22,49 +23,61 @@ const SCOUT_VERIFICATION: TaskGraphVerificationContract = {
 const JOB_DESCRIPTION = "Build reliable TypeScript services for European customers."
 
 export type ScheduledGatePrepareFixtureJobRecord = Readonly<{ id: string; userId: string; company: string; role: string; location: string;
-  status: "saved"; score: null; url: string; source: "fixture"; salary: null; description: string; keywords: string }>
+  status: "saved"; score: null; url: string; source: string; salary: null; description: string; keywords: string }>
 export type ScheduledGatePrepareFixtureScoredJob = Readonly<{ job: ScheduledGatePrepareFixtureJobRecord & { coverLetter: null };
   score: number; matchedKeywords: string[]; missingKeywords: string[]; recommendation: string; analysisFenceAt: string }>
 export type ScheduledGatePrepareSeedFixture = Readonly<{
-  ids: Readonly<{ userId: string; sessionId: string; turnId: string; rootTaskId: string; scoutTaskId: string; analystTaskId: string;
+  ids: Readonly<{ userId: string; sessionId: string; turnId: string; rootTaskId: string; scoutTaskId: string; scoutTaskIds: readonly string[]; analystTaskId: string;
     leaseOwnerId: string; executionId: string }>
-  jobIds: readonly string[]; jobRecords: readonly ScheduledGatePrepareFixtureJobRecord[]; scoredJobs: readonly ScheduledGatePrepareFixtureScoredJob[]
+  jobIds: readonly string[]; selectedJobIds: readonly string[]; jobRecords: readonly ScheduledGatePrepareFixtureJobRecord[]
+  scoredJobs: readonly ScheduledGatePrepareFixtureScoredJob[]; scoutNodeKeys: readonly string[]
   jobId: string; jobRecord: ScheduledGatePrepareFixtureJobRecord; snapshot: TaskGraphSnapshot; scheduleSnapshot: ScheduledAutomationSnapshot
   graphScopeV1: GraphIdentityScope; ownerV1: ScheduledAutomationPipelineOwner; turnLeaseV1: TurnLease
   executionOwner: Readonly<{ executionId: string; executionAttemptCount: 1 }>
 }>
 
-/** Seeds and verifies only the two-node Scout→Analyst Analyze prefix; Prepare is appended by the runner. */
+/** Seeds and verifies a one-to-four-source Analyze prefix; Prepare is appended by the runner. */
 export async function seedScheduledGatePrepareFixture(
-  pool: Pool, options: Readonly<{ minScore?: number; jobCount?: number }> = {},
+  pool: Pool, options: Readonly<{ minScore?: number; jobCount?: number; scoutCount?: number; selectedJobCount?: number }> = {},
 ): Promise<ScheduledGatePrepareSeedFixture> {
-  const { minScore, jobCount } = seedOptions(options)
+  const { minScore, jobCount, scoutCount, selectedJobCount } = seedOptions(options)
   const suffix = randomUUID()
+  const scoutTaskIds = scoutCount === 1 ? [`scheduled-gate-scout-${suffix}`]
+    : Array.from({ length: scoutCount }, (_, index) => `scheduled-gate-scout-${index + 1}-${suffix}`)
   const ids = {
     userId: `scheduled-gate-user-${suffix}`, sessionId: `scheduled-gate-session-${suffix}`,
     turnId: `scheduled-gate-turn-${suffix}`, rootTaskId: `scheduled-gate-root-${suffix}`,
-    scoutTaskId: `scheduled-gate-scout-${suffix}`, analystTaskId: `scheduled-gate-analyst-${suffix}`,
+    scoutTaskId: scoutTaskIds[0]!, scoutTaskIds, analystTaskId: `scheduled-gate-analyst-${suffix}`,
     leaseOwnerId: `scheduled-gate-turn-owner-${suffix}`, executionId: `scheduled-gate-execution-${suffix}`,
   }
   const jobIds = Array.from({ length: jobCount }, () => `c${randomUUID().replaceAll("-", "").slice(0, 24)}`)
-  const jobRecords = jobIds.map((id, index) => fixtureJob(ids.userId, id, index))
+  const selectedJobIds = jobIds.slice(0, selectedJobCount)
+  const multiPlan = scoutCount > 1 ? createScheduledMultiScoutPrefixPlan({ scoutTaskIds, analystTaskId: ids.analystTaskId,
+    jobIds, selectedJobIds }) : null
+  if (scoutCount > 1 && !multiPlan) throw new Error("scheduled_gate_prepare_multi_scout_plan_invalid")
+  const scoutNodeKeys = multiPlan?.scouts.map(source => source.nodeKey) ?? ["scheduled-scout"]
+  const sourceByJobId = new Map((multiPlan?.scouts.flatMap(source => source.candidateJobIds.map(jobId => [jobId, source.source] as const))
+    ?? jobIds.map(jobId => [jobId, "fixture"] as const)))
+  const jobRecords = jobIds.map((id, index) => fixtureJob(ids.userId, id, index, sourceByJobId.get(id)!))
   const scheduleSnapshot = scheduledSnapshot(minScore)
-  const scoredJobs = analyzeProjection(jobRecords, minScore)
-  const snapshot = graphSnapshot(ids)
+  const scoredJobs = analyzeProjection(jobRecords.filter(job => selectedJobIds.includes(job.id)), minScore)
+  const snapshot = graphSnapshot(ids, multiPlan)
   const graphScopeV1: GraphIdentityScope = {
     userId: ids.userId, sessionId: ids.sessionId, turnId: ids.turnId, rootTaskId: ids.rootTaskId, parentTaskId: ids.rootTaskId,
   }
   const client = await pool.connect()
   try {
     await client.query("BEGIN")
-    await seedOwnerRows(client, ids, snapshot, scheduleSnapshot, jobIds)
+    await seedOwnerRows(client, ids, snapshot, scheduleSnapshot, multiPlan, selectedJobIds, sourceByJobId)
     await seedJobs(client, jobRecords)
-    await seedReceipts(client, ids, jobIds)
-    await verifyAndPersistPrefix(client, ids, graphScopeV1, snapshot, jobIds, Math.max(82, minScore))
-    await client.query(`UPDATE "agent_items" SET "revision" = 2 WHERE "id" = $1`, [taskGraphItemId(ids.rootTaskId)])
+    await seedReceipts(client, ids, snapshot, multiPlan, scheduleSnapshot, selectedJobIds)
+    await verifyAndPersistPrefix(client, ids, graphScopeV1, snapshot, multiPlan, selectedJobIds,
+      sourceByJobId, Math.max(82, minScore))
+    const analyzeGraphRevision = scheduledAnalyzePrefixGraphRevision(scoutCount)
+    await client.query(`UPDATE "agent_items" SET "revision" = $2 WHERE "id" = $1`, [taskGraphItemId(ids.rootTaskId), analyzeGraphRevision])
     const loaded = await loadTaskGraph(client, graphScopeV1, false)
     const graph = currentTaskGraph(loaded)
-    if (loaded.item?.revision !== 2 || graph.nodes.length !== 2
+    if (loaded.item?.revision !== analyzeGraphRevision || graph.nodes.length !== scoutCount + 1
       || graph.nodes.some(node => node.status !== "completed" || node.verificationReport?.status !== "passed")) {
       throw new Error("scheduled_gate_prepare_analyze_prefix_invalid")
     }
@@ -84,7 +97,7 @@ export async function seedScheduledGatePrepareFixture(
     }
     await client.query("COMMIT")
     return {
-      ids, jobIds, jobRecords, scoredJobs, jobId: jobIds[0]!, jobRecord: jobRecords[0]!, snapshot, scheduleSnapshot,
+      ids, jobIds, selectedJobIds, jobRecords, scoredJobs, scoutNodeKeys, jobId: jobIds[0]!, jobRecord: jobRecords[0]!, snapshot, scheduleSnapshot,
       graphScopeV1, ownerV1, turnLeaseV1, executionOwner: { executionId: ids.executionId, executionAttemptCount: 1 },
     }
   } catch (error) {
@@ -94,20 +107,34 @@ export async function seedScheduledGatePrepareFixture(
     client.release()
   }
 }
-function seedOptions(value: Readonly<{ minScore?: number; jobCount?: number }>): { minScore: number; jobCount: number } {
-  if (!value || typeof value !== "object" || Reflect.ownKeys(value).some(key => key !== "minScore" && key !== "jobCount")) {
-    throw new TypeError("scheduled_gate_prepare_fixture_options_invalid")
+
+export function scheduledAnalyzePrefixGraphRevision(scoutCount: number): number {
+  if (!Number.isSafeInteger(scoutCount) || scoutCount < 1 || scoutCount > 4) {
+    throw new RangeError("scheduled_gate_prepare_fixture_scout_count_invalid")
   }
-  const minScore = value.minScore ?? 70, jobCount = value.jobCount ?? 1
-  if (!Number.isSafeInteger(minScore) || minScore < 0 || minScore > 100
-    || !Number.isSafeInteger(jobCount) || jobCount < 1 || jobCount > 10) {
-    throw new TypeError("scheduled_gate_prepare_fixture_options_invalid")
-  }
-  return { minScore, jobCount }
+  return scoutCount + 1
 }
-function fixtureJob(userId: string, id: string, index: number): ScheduledGatePrepareFixtureJobRecord {
+
+function seedOptions(value: Readonly<{ minScore?: number; jobCount?: number; scoutCount?: number; selectedJobCount?: number }>):
+  { minScore: number; jobCount: number; scoutCount: number; selectedJobCount: number } {
+  if (!value || typeof value !== "object" || Reflect.ownKeys(value).some(key => !["minScore", "jobCount", "scoutCount", "selectedJobCount"].includes(String(key)))) {
+    throw new TypeError("scheduled_gate_prepare_fixture_options_invalid")
+  }
+  const minScore = value.minScore ?? 70, jobCount = value.jobCount ?? 1, scoutCount = value.scoutCount ?? 1
+  const selectedJobCount = value.selectedJobCount ?? jobCount
+  if (!Number.isSafeInteger(minScore) || minScore < 0 || minScore > 100
+    || !Number.isSafeInteger(jobCount) || jobCount < 1 || jobCount > 10
+    || !Number.isSafeInteger(scoutCount) || scoutCount < 1 || scoutCount > 4
+    || (scoutCount > 1 && jobCount < scoutCount)
+    || !Number.isSafeInteger(selectedJobCount) || selectedJobCount < 1 || selectedJobCount > Math.min(jobCount, 50)
+    || (scoutCount === 1 && selectedJobCount !== jobCount)) {
+    throw new TypeError("scheduled_gate_prepare_fixture_options_invalid")
+  }
+  return { minScore, jobCount, scoutCount, selectedJobCount }
+}
+function fixtureJob(userId: string, id: string, index: number, source: string): ScheduledGatePrepareFixtureJobRecord {
   return { id, userId, company: `Fixture Systems ${index + 1}`, role: "Software Engineer", location: "Dublin",
-    status: "saved", score: null, url: `https://jobs.example.invalid/${id}`, source: "fixture", salary: null,
+    status: "saved", score: null, url: `https://jobs.example.invalid/${id}`, source, salary: null,
     description: JOB_DESCRIPTION, keywords: "TypeScript, PostgreSQL" }
 }
 
@@ -122,18 +149,20 @@ function scheduledSnapshot(minScore: number): ScheduledAutomationSnapshot {
     targetLocations: ["Dublin"], minScore, dailyCap: 10, requireApproval: true, autoApply: false }
 }
 
-function graphSnapshot(ids: ScheduledGatePrepareSeedFixture["ids"]): TaskGraphSnapshot {
+function graphSnapshot(ids: ScheduledGatePrepareSeedFixture["ids"], plan: ScheduledMultiScoutPrefixPlan | null): TaskGraphSnapshot {
+  const sources = plan?.scouts ?? [{ nodeKey: "scheduled-scout", taskId: ids.scoutTaskId }]
   return parseTaskGraphSnapshot({
     schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
     nodes: [
-      { key: "scheduled-scout", templateId: "scout", goal: "Discover matching roles",
-        successCriteria: ["Return evidenced matching roles"], dependsOn: [], depth: 1, taskId: ids.scoutTaskId,
-        verificationDisposition: "typed", verification: SCOUT_VERIFICATION },
+      ...sources.map(source => ({ key: source.nodeKey, templateId: "scout", goal: "Discover matching roles",
+        successCriteria: ["Return evidenced matching roles"], dependsOn: [], depth: 1, taskId: source.taskId,
+        verificationDisposition: "typed", verification: SCOUT_VERIFICATION })),
       { key: "scheduled-analyst", templateId: "analyst", goal: "Analyze discovered roles",
         successCriteria: ["Return dependency-bound analysis for each discovered role"],
-        dependsOn: ["scheduled-scout"], depth: 2, taskId: ids.analystTaskId, verificationDisposition: "typed",
+        dependsOn: plan?.analystDependencyNodeKeys ?? ["scheduled-scout"], depth: 2, taskId: ids.analystTaskId, verificationDisposition: "typed",
         verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [
-          { id: "scout-membership", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scheduled-scout" } },
+          plan ? { id: "scout-membership", check: { kind: "findings_from_scout_union", dependencyNodeKeys: plan.analystDependencyNodeKeys } }
+            : { id: "scout-membership", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scheduled-scout" } },
           { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
         ] } },
     ],
@@ -141,7 +170,8 @@ function graphSnapshot(ids: ScheduledGatePrepareSeedFixture["ids"]): TaskGraphSn
 }
 
 async function seedOwnerRows(client: PoolClient, ids: ScheduledGatePrepareSeedFixture["ids"],
-  snapshot: TaskGraphSnapshot, schedule: ScheduledAutomationSnapshot, jobIds: readonly string[]): Promise<void> {
+  snapshot: TaskGraphSnapshot, schedule: ScheduledAutomationSnapshot, plan: ScheduledMultiScoutPrefixPlan | null,
+  selectedJobIds: readonly string[], sourceByJobId: ReadonlyMap<string, string>): Promise<void> {
   await client.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`, [ids.userId, `${ids.userId}@example.invalid`])
   await client.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt")
     VALUES ($1, $2, 'Scheduled Gate Prepare integration', 'running', 'automation', CURRENT_TIMESTAMP)`, [ids.sessionId, ids.userId])
@@ -167,10 +197,12 @@ async function seedOwnerRows(client: PoolClient, ids: ScheduledGatePrepareSeedFi
   for (const node of snapshot.nodes) {
     const template = TASK_GRAPH_TEMPLATES[node.templateId as "scout" | "analyst"]
     const role = node.templateId as "scout" | "analyst"
+    const scout = plan?.scouts.find(source => source.nodeKey === node.key)
+    const nodeJobIds = role === "scout" ? scout?.candidateJobIds ?? selectedJobIds : selectedJobIds
     const score = Math.max(82, schedule.minScore)
-    const result = { status: "completed", stepCount: 1, toolCallCount: role === "scout" ? jobIds.length + 1 : jobIds.length,
-      finalItemId: null, finalText: "Verified fixture task completed", structuredResult: roleResult(role, jobIds, score),
-      ...(role === "scout" ? { discoveryAttempt: completeDiscoverySidecar(0) } : {}) }
+    const result = { status: "completed", stepCount: 1, toolCallCount: role === "scout" ? nodeJobIds.length + 1 : selectedJobIds.length,
+      finalItemId: null, finalText: "Verified fixture task completed", structuredResult: roleResult(role, nodeJobIds, score, sourceByJobId),
+      ...(role === "scout" ? { discoveryAttempt: completeDiscoverySidecar(nodeJobIds.length) } : {}) }
     await client.query(`INSERT INTO "sub_agent_tasks"
       ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
         "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot",
@@ -195,13 +227,33 @@ async function seedJobs(client: PoolClient, jobs: readonly ScheduledGatePrepareF
   [job.id, job.userId, job.company, job.role, job.location, job.status, job.url, job.description, job.source, job.keywords])
 }
 
-async function seedReceipts(client: PoolClient, ids: ScheduledGatePrepareSeedFixture["ids"], jobIds: readonly string[]): Promise<void> {
-  await persistToolReceipt(client, ids, ids.scoutTaskId, "scout-step", "jobs.discover", "discover", { query: "Software Engineer Dublin" },
-    discoveryOutput(ids, jobIds), 1)
-  for (const [index, jobId] of jobIds.entries()) {
-    await persistToolReceipt(client, ids, ids.scoutTaskId, "scout-step", "jobs.get", `scout-read-${index}`, { jobId }, { job: { id: jobId, source: "fixture" } }, index + 2)
-    await persistToolReceipt(client, ids, ids.analystTaskId, "analyst-step", "jobs.get", `analyst-read-${index}`, { jobId }, { job: { id: jobId, source: "fixture" } }, jobIds.length + index + 2)
+async function seedReceipts(client: PoolClient, ids: ScheduledGatePrepareSeedFixture["ids"], snapshot: TaskGraphSnapshot,
+  plan: ScheduledMultiScoutPrefixPlan | null, schedule: ScheduledAutomationSnapshot, selectedJobIds: readonly string[]): Promise<void> {
+  const sources = snapshot.nodes.filter(node => node.templateId === "scout")
+  let ordinal = 1
+  for (const [index, node] of sources.entries()) {
+    const multi = plan !== null, source = plan?.scouts[index]
+    const candidateIds = source?.candidateJobIds ?? plan?.candidateUnionJobIds ?? selectedJobIds
+    const provider = source?.source ?? "fixture"
+    const stepSuffix = multi ? `${node.key}-step` : "scout-step"
+    const callSuffix = multi ? `${node.key}-discover` : "discover"
+    const discoveryInput = multi ? { targetRoles: schedule.targetRoles, targetLocations: schedule.targetLocations, source: provider } : { query: "Software Engineer Dublin" }
+    await persistToolReceipt(client, ids, node.taskId, stepSuffix, "jobs.discover", callSuffix, discoveryInput,
+      discoveryOutput(ids, candidateIds, stepSuffix, callSuffix, provider), ordinal++)
+    for (const [candidateIndex, jobId] of candidateIds.entries()) {
+      const readSuffix = multi ? `${node.key}-read-${candidateIndex}` : `scout-read-${candidateIndex}`
+      await persistToolReceipt(client, ids, node.taskId, stepSuffix, "jobs.get", readSuffix, { jobId },
+        { job: { id: jobId, source: sourceByJobId(plan, jobId) } }, ordinal++)
+    }
   }
+  for (const [index, jobId] of selectedJobIds.entries()) {
+    await persistToolReceipt(client, ids, ids.analystTaskId, "analyst-step", `jobs.get`, `analyst-read-${index}`, { jobId },
+      { job: { id: jobId, source: sourceByJobId(plan, jobId) } }, ordinal++)
+  }
+}
+
+function sourceByJobId(plan: ScheduledMultiScoutPrefixPlan | null, jobId: string): string {
+  return plan?.scouts.find(source => source.candidateJobIds.includes(jobId))?.source ?? "fixture"
 }
 
 async function persistToolReceipt(client: PoolClient, ids: ScheduledGatePrepareSeedFixture["ids"], taskId: string,
@@ -238,41 +290,50 @@ async function persistToolEvent(client: PoolClient, ids: ScheduledGatePrepareSee
 }
 
 async function verifyAndPersistPrefix(client: PoolClient, ids: ScheduledGatePrepareSeedFixture["ids"],
-  scope: GraphIdentityScope, snapshot: TaskGraphSnapshot, jobIds: readonly string[], score: number): Promise<void> {
-  const scout = snapshot.nodes.find(node => node.key === "scheduled-scout")!
-  const scoutProof = await verifyCompletedTaskGraphNodeEvidence(client, {
-    scope: { ...scope, taskId: ids.scoutTaskId, attemptCount: 1 }, snapshot, node: scout, structuredResult: roleResult("scout", jobIds, score),
-  })
-  assertVerified(scoutProof, "scout")
-  await persistVerification(client, ids.scoutTaskId, scoutProof, { discoveryAttempt: completeDiscoverySidecar(jobIds.length), toolCallCount: jobIds.length + 1 })
+  scope: GraphIdentityScope, snapshot: TaskGraphSnapshot, plan: ScheduledMultiScoutPrefixPlan | null,
+  selectedJobIds: readonly string[], sourceByJobId: ReadonlyMap<string, string>, score: number): Promise<void> {
+  const scouts = snapshot.nodes.filter(node => node.templateId === "scout")
+  for (const [index, scout] of scouts.entries()) {
+    const taskId = plan?.scouts[index]?.taskId ?? ids.scoutTaskId
+    const scoutJobIds = plan?.scouts[index]?.candidateJobIds ?? selectedJobIds
+    const scoutProof = await verifyCompletedTaskGraphNodeEvidence(client, {
+      scope: { ...scope, taskId, attemptCount: 1 }, snapshot, node: scout,
+      structuredResult: roleResult("scout", scoutJobIds, score, sourceByJobId),
+    })
+    assertVerified(scoutProof, "scout")
+    await persistVerification(client, taskId, scoutProof, { discoveryAttempt: completeDiscoverySidecar(scoutJobIds.length), toolCallCount: scoutJobIds.length + 1 })
+  }
   const analyst = snapshot.nodes.find(node => node.key === "scheduled-analyst")!
   const dependencies = await verifyCompletedScoutDependencies(client, scope, snapshot, analyst)
   if (!dependencies) throw new Error("scheduled_gate_prepare_scout_dependency_unverified")
   const analystProof = await verifyCompletedTaskGraphNodeEvidence(client, {
     scope: { ...scope, taskId: ids.analystTaskId, attemptCount: 1 }, snapshot, node: analyst,
-    structuredResult: roleResult("analyst", jobIds, score), dependencies: dependencies.projections,
+    structuredResult: roleResult("analyst", selectedJobIds, score, sourceByJobId), dependencies: dependencies.projections,
   })
   assertVerified(analystProof, "analyst")
-  await persistVerification(client, ids.analystTaskId, analystProof, { dependencyBindings: dependencies.bindings, toolCallCount: jobIds.length })
+  await persistVerification(client, ids.analystTaskId, analystProof, { dependencyBindings: dependencies.bindings, toolCallCount: selectedJobIds.length })
 }
 
-function roleResult(role: "scout" | "analyst", jobIds: readonly string[], score: number): Record<string, unknown> {
-  const evidence = jobIds.map((jobId, index) => ({ id: `fixture-${role}-job-${index + 1}`, kind: "job", ref: jobId, source: "fixture" }))
+function roleResult(role: "scout" | "analyst", jobIds: readonly string[], score: number,
+  sourceByJobId: ReadonlyMap<string, string>): Record<string, unknown> {
+  const evidence = jobIds.map((jobId, index) => ({ id: `fixture-${role}-job-${index + 1}`, kind: "job", ref: jobId,
+    source: sourceByJobId.get(jobId) ?? "fixture" }))
   return role === "scout"
     ? { schemaVersion: ROLE_RESULT_SCHEMA, role, status: "completed", candidates: jobIds.map((jobId, index) => ({
-      jobId, source: "fixture", url: null, evidenceIds: [evidence[index]!.id],
+      jobId, source: sourceByJobId.get(jobId) ?? "fixture", url: null, evidenceIds: [evidence[index]!.id],
     })), evidence, summary: `Verified ${jobIds.length} discovered jobs` }
     : { schemaVersion: ROLE_RESULT_SCHEMA, role, status: "completed", findings: jobIds.map((jobId, index) => ({
       jobId, score: score / 10, evidenceIds: [evidence[index]!.id],
     })), evidence, summary: `Verified analysis for ${jobIds.length} jobs` }
 }
 
-function discoveryOutput(ids: ScheduledGatePrepareSeedFixture["ids"], jobIds: readonly string[]): Record<string, unknown> {
-  return { jobs: jobIds.map(id => ({ id, source: "fixture" })), evidence: [], nextCursor: null, usage: {
-    ledgerKey: `scheduled-gate-discovery-${ids.turnId}`, toolName: "jobs.discover", toolVersion: "1",
-    toolCallId: `discover-${ids.turnId}`, sessionId: ids.sessionId, turnId: ids.turnId,
-    stepId: `scout-step-discover-${ids.turnId}`, requests: 1, jobsProcessed: jobIds.length,
-    jobsSucceeded: jobIds.length, jobsFailed: 0, providerFailures: 0, aiCalls: 0, providers: ["fixture"], estimatedCostUsd: 0, durationMs: 1,
+function discoveryOutput(ids: ScheduledGatePrepareSeedFixture["ids"], jobIds: readonly string[], stepSuffix: string,
+  callSuffix: string, source: string): Record<string, unknown> {
+  const toolCallId = `${callSuffix}-${ids.turnId}`, stepId = `${stepSuffix}-${callSuffix}-${ids.turnId}`
+  return { jobs: jobIds.map(id => ({ id, source })), evidence: [], nextCursor: null, usage: {
+    ledgerKey: `scheduled-gate-discovery-${callSuffix === "discover" ? ids.turnId : toolCallId}`, toolName: "jobs.discover", toolVersion: "1",
+    toolCallId, sessionId: ids.sessionId, turnId: ids.turnId, stepId, requests: 1, jobsProcessed: jobIds.length,
+    jobsSucceeded: jobIds.length, jobsFailed: 0, providerFailures: 0, aiCalls: 0, providers: [source], estimatedCostUsd: 0, durationMs: 1,
   } }
 }
 

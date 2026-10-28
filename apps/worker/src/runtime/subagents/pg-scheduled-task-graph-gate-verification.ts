@@ -13,6 +13,9 @@ import { SCHEDULED_PREPARE_COMPLETION_SCHEMA, SCHEDULED_PREPARE_PROOF_FACTS_SCHE
   verifyScheduledPrepareTaskGraphEvidence } from "./scheduled-prepare-task-graph-verification.js"
 import { validateScheduledGateTaskFinish } from "./scheduled-gate-task-finish.js"
 import { scheduledGateAttemptLineageMatches } from "./scheduled-gate-attempt-lineage.js"
+import { projectScheduledPipelineGraph } from "./scheduled-pipeline-graph-shape.js"
+import { scheduledGatePreparePrefixMatches } from "./scheduled-gate-prepare-prefix-proof.js"
+import { scheduledTaskGraphContinuationKeyVersion } from "./scheduled-taskgraph-continuation-receipt.js"
 import type { TaskGraphScheduledGateCompletionInput, ScheduledGateTaskEnvelope } from "./scheduled-gate-contract.js"
 import type { PreparedGraphTransition } from "./task-graph-pg-lifecycle.js"
 
@@ -37,7 +40,7 @@ export async function validateScheduledGateTaskGraphFinish(client: Queryable, in
   const task = loaded.tasks.get(taskId), currentNode = current?.nodes.find(value => value.key === "gate")
   if (!loaded.item || !loaded.snapshot || !loaded.state || loaded.state.revision !== graph.expectedRevision
     || canonicalTaskGraphJson(loaded.snapshot) !== canonicalTaskGraphJson(graph.snapshot)
-    || loaded.snapshot.nodes.length !== 4 || !node || !task || !currentNode
+    || !node || !task || !currentNode
     || node.taskId !== taskId || node.templateId !== "gate" || node.depth !== 4
     || node.verificationDisposition !== "specialized" || node.verification !== undefined
     || node.dependsOn.length !== 1 || node.dependsOn[0] !== "prepare"
@@ -69,8 +72,10 @@ export async function validateScheduledGateTaskGraphFinish(client: Queryable, in
     rootTaskId: graph.scope.rootTaskId, rootAttemptCount: evidence.owner.rootAttemptCount,
     executionId: evidence.owner.executionId, executionAttemptCount: evidence.owner.executionAttemptCount }
   const registration = await readScheduledGateRegistrationReceipt(client, { ...graph.scope, owner: registrationOwner, gateTaskId: taskId })
+  const version = registration && scheduledTaskGraphContinuationKeyVersion(registration.continuationKey)
+  const shape = loaded.snapshot && version && projectScheduledPipelineGraph(loaded.snapshot.nodes, version, "gate")
   const prepareNode = loaded.snapshot.nodes.find(value => value.key === "prepare"), prepare = prepareNode && loaded.tasks.get(prepareNode.taskId)
-  if (!registration || !prepareNode || !prepare || prepare.status !== "completed"
+  if (!registration || !shape || shape.gate.taskId !== taskId || !prepareNode || !prepare || prepare.status !== "completed"
     || registration.continuationKey !== evidence.continuationKey || registration.snapshotDigest !== evidence.snapshotDigest
     || registration.evidenceDigest !== evidence.evidenceDigest || registration.checkpointDigest !== evidence.checkpointDigest
     || registration.analyzeGraphRevision !== evidence.analyzeGraphRevision || registration.owner.rootAttemptCount !== evidence.owner.rootAttemptCount
@@ -81,7 +86,7 @@ export async function validateScheduledGateTaskGraphFinish(client: Queryable, in
   const proof = await loadPersistedScheduledPrepareProof(client, graph.scope, prepare.id, prepare.result,
     evidence.prepareWaitContinuationKey, registration.prepareWaitId)
   const expectedJobIds = proof && scheduledGatePreparedJobIds(proof)
-  if (!proof || !expectedJobIds || registration.prepareWaitId !== proof.completion.wait.waitId
+  if (!proof || !expectedJobIds || !scheduledGatePreparePrefixMatches(loaded, proof) || registration.prepareWaitId !== proof.completion.wait.waitId
     || !await verifyPersistedScheduledPreparePrefix(client, graph.scope, loaded, proof)) return null
   if (status === "completed") return validateScheduledGateTaskFinish({ taskId, expectedTaskId: taskId,
     taskStatus: status, attemptCount, expectedAttemptCount: attemptCount, result: input.result, expectedJobIds })
@@ -89,24 +94,24 @@ export async function validateScheduledGateTaskGraphFinish(client: Queryable, in
     ? parseScheduledGateTaskEnvelope(input.result, status, expectedJobIds) : null
 }
 
-/** Re-verifies the immutable three-node prefix from its stored, exact Prepare proof. */
+/** Re-verifies the immutable versioned Analyze+Prepare prefix from its stored proof. */
 export async function verifyPersistedScheduledPreparePrefix(client: Queryable, scope: GraphIdentityScope,
   loaded: LoadedGraph, proof: PreparedProof, checkpointStage: "gate" | "audit_completed_report" = "gate"): Promise<boolean> {
   const snapshot = loaded.snapshot, state = loaded.state
-  if (!snapshot || !state || (snapshot.nodes.length !== 3 && snapshot.nodes.length !== 4)) return false
-  const nodes = snapshot.nodes.slice(0, 3), currentNodes = currentTaskGraph(loaded).nodes.filter(node => nodes.some(prefix => prefix.key === node.key))
-  const expectedRoles = ["scout", "analyst", "prepare"] as const
-  if (nodes.length !== 3 || currentNodes.length !== 3 || nodes.some((node, index) => {
-    const certified = proof.completion.nodes[index], current = currentNodes.find(value => value.key === node.key)
-    return !certified || !current || certified.role !== expectedRoles[index] || node.templateId !== expectedRoles[index]
-      || index === 2 && node.key !== "prepare"
-      || node.taskId !== certified.taskId || node.depth !== index + 1 || current.taskId !== node.taskId
-      || current.status !== "completed" || node.verificationDisposition !== (index === 2 ? "specialized" : "typed")
-      || node.dependsOn.length !== (index === 0 ? 0 : 1) || index > 0 && node.dependsOn[0] !== nodes[index - 1]?.key
+  const version = scheduledTaskGraphContinuationKeyVersion(proof.receipt.continuationKey)
+  const graph = snapshot && version && projectPreparePrefixGraph(snapshot.nodes, version)
+  if (!snapshot || !state || !graph || !scheduledGatePreparePrefixMatches(loaded, proof)) return false
+  const prefixCount = graph.scouts.length + 2, nodes = snapshot.nodes.slice(0, prefixCount)
+  const prefixShape = projectScheduledPipelineGraph(nodes, version, "prepare")
+  const currentNodes = currentTaskGraph(loaded).nodes.filter(node => nodes.some(prefix => prefix.key === node.key))
+  if (!prefixShape || nodes.length !== prefixCount || currentNodes.length !== prefixCount || nodes.some(node => {
+    const current = currentNodes.find(value => value.key === node.key)
+    return !current || current.taskId !== node.taskId || current.status !== "completed"
   })) return false
   const prefix = { ...snapshot, nodes }, prefixCurrent = { revision: proof.completion.graphRevision, nodes: currentNodes }
-  const prepare = nodes[2]!, task = loaded.tasks.get(prepare.taskId)
-  if (!task || task.status !== "completed" || task.attemptCount !== proof.completion.nodes[2].attemptCount) return false
+  const prepare = prefixShape.prepare, task = loaded.tasks.get(prepare.taskId)
+  const certifiedPrepare = proof.completion.nodes.at(-1)
+  if (!task || !certifiedPrepare || task.status !== "completed" || task.attemptCount !== certifiedPrepare.attemptCount) return false
   const verified = await verifyScheduledPrepareTaskGraphEvidence(client, { scope: { ...scope,
     taskId: prepare.taskId, attemptCount: task.attemptCount ?? 0 }, snapshot: prefix, current: prefixCurrent,
     tasks: loaded.tasks, structuredResult: record(task.result)?.structuredResult,
@@ -116,6 +121,12 @@ export async function verifyPersistedScheduledPreparePrefix(client: Queryable, s
     && canonicalTaskGraphJson(verified.facts) === canonicalTaskGraphJson({ schemaVersion: SCHEDULED_PREPARE_PROOF_FACTS_SCHEMA,
       receipt: proof.receipt, completion: { schemaVersion: SCHEDULED_PREPARE_COMPLETION_SCHEMA,
         graphRevision: proof.completion.graphRevision, nodes: proof.completion.nodes }, result: proof.result })
+}
+
+function projectPreparePrefixGraph(nodes: NonNullable<LoadedGraph["snapshot"]>["nodes"], version: "v1" | "v2") {
+  return projectScheduledPipelineGraph(nodes, version, "prepare")
+    ?? projectScheduledPipelineGraph(nodes, version, "gate")
+    ?? projectScheduledPipelineGraph(nodes, version, "audit")
 }
 
 /** Re-loads the full persisted Gate envelope and canonical lifecycle result for Execute admission. */
@@ -150,8 +161,10 @@ export async function verifyScheduledGateCompletion(client: Queryable,
     || !same(row.allowedActions, []) || !same(row.context, {})) return null
   const receipt = await readScheduledGateRegistrationReceipt(client, { userId: input.scope.userId,
     sessionId: input.scope.sessionId, turnId: input.scope.turnId, owner: evidence.owner, gateTaskId: gate.id })
+  const version = receipt && scheduledTaskGraphContinuationKeyVersion(receipt.continuationKey)
+  const shape = version && projectScheduledPipelineGraph(loaded.snapshot.nodes, version, "gate")
   const prepareNode = loaded.snapshot.nodes.find(node => node.key === "prepare"), prepareTask = prepareNode && loaded.tasks.get(prepareNode.taskId)
-  if (!receipt || !prepareNode || !prepareTask || prepareTask.status !== "completed"
+  if (!receipt || !shape || !prepareNode || !prepareTask || prepareTask.status !== "completed"
     || receipt.continuationKey !== evidence.continuationKey || receipt.snapshotDigest !== evidence.snapshotDigest
     || receipt.evidenceDigest !== evidence.evidenceDigest || receipt.checkpointDigest !== evidence.checkpointDigest
     || receipt.analyzeGraphRevision !== evidence.analyzeGraphRevision || receipt.owner.rootAttemptCount !== evidence.owner.rootAttemptCount) return null
@@ -162,7 +175,7 @@ export async function verifyScheduledGateCompletion(client: Queryable,
   const envelope = expectedJobIds && parseScheduledGateTaskEnvelope(gate.result, gate.status, expectedJobIds)
   if (!proof || !expectedJobIds || !envelope || envelope.structuredResult.status !== "completed"
     || receipt.prepareWaitId !== proof.completion.wait.waitId || !await verifyPersistedScheduledPreparePrefix(client, graphScope, loaded, proof)
-    || loaded.snapshot.nodes.length !== 4 || gateNode.depth !== 4 || gateNode.templateId !== "gate"
+    || !shape || shape.gate.taskId !== gate.id || gateNode.depth !== 4 || gateNode.templateId !== "gate"
     || gateNode.verificationDisposition !== "specialized" || gateNode.dependsOn.length !== 1 || gateNode.dependsOn[0] !== "prepare"
     || gateNode.goal !== "Review the exact server-prepared applications and return the fixed pending or skip decisions required by the scheduled Gate policy."
     || !same(gateNode.successCriteria, ["Return only the strict scheduled Gate result for the exact server-prepared job set; never mark a job approved.",

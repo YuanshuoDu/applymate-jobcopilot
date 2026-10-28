@@ -119,3 +119,26 @@ export type {
   ModelToolUsePart,
   ModelUsage,
 } from './model.js'
+export {
+  SCHEDULED_PIPELINE_ATTESTATION_V1_SCHEMA,
+  SCHEDULED_PIPELINE_ATTESTATION_V2_SCHEMA,
+  parseScheduledPipelineAttestation,
+} from './scheduled-pipeline-attestation.js'
+export type {
+  ScheduledPipelineAnalystAttestationV1,
+  ScheduledPipelineAnalystProofV2,
+  ScheduledPipelineAttestation,
+  ScheduledPipelineAttestationOwner,
+  ScheduledPipelineAttestationV1,
+  ScheduledPipelineAttestationV2,
+  ScheduledPipelineDiscoveryReceipt,
+  ScheduledPipelineScoutAttestationV1,
+  ScheduledPipelineScoutProofV2,
+} from './scheduled-pipeline-attestation.js'
+export { scheduledPipelineContinuationKeyMaterial, scheduledPipelineContinuationKeyVersion,
+  scheduledPipelinePrepareReceiptKeyMaterial } from './scheduled-pipeline-continuation-key-material.js'
+export type {
+  ScheduledPipelineContinuationKeyMaterial,
+  ScheduledPipelineExecutionIdentity,
+  ScheduledPipelinePrepareReceiptKeyBinding,
+} from './scheduled-pipeline-continuation-key-material.js'

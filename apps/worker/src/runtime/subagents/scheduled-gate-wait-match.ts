@@ -10,7 +10,7 @@ import { parseScheduledGateTaskEnvelope, scheduledGateCheckpointEvidence, schedu
 import { loadTaskGraph, type GraphIdentityScope } from "./task-graph-pg-state.js"
 import { taskGraphLifecycleKey } from "./task-graph-snapshot.js"
 import { scheduledGateAttemptLineageMatches } from "./scheduled-gate-attempt-lineage.js"
-import { readScheduledGateRegistrationReceipt } from "./scheduled-gate-registration-receipt.js"
+import { readScheduledGatePreparePrefixProof, scheduledGatePreparePrefixMatches } from "./scheduled-gate-prepare-prefix-proof.js"
 
 const OPEN_SESSION = `session."status" NOT IN ('aborted', 'archived')`
 const TERMINAL = new Set(["completed", "failed", "interrupted", "cancelled", "closed", "passed", "skipped"])
@@ -102,52 +102,6 @@ export async function loadPersistedScheduledPrepareProof(client: Queryable, scop
     targetTaskIds: [prepareTaskId], matchedTaskIds: [prepareTaskId] })
 }
 
-async function registeredPrepareProof(client: Queryable, scope: ScheduledPrepareProofReadScope, gateTaskId: string, gateRow: Row,
-  evidence: NonNullable<ReturnType<typeof scheduledGateCheckpointEvidence>>, graph: Awaited<ReturnType<typeof loadTaskGraph>>,
-  prepareTask: Readonly<{ id: string; result: unknown }>): Promise<ScheduledPrepareTaskGraphProof | null> {
-  const owner = { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId, rootTaskId: scope.rootTaskId,
-    rootAttemptCount: Number(gateRow.rootAttemptCount), executionId: String(gateRow.executionId), executionAttemptCount: Number(gateRow.executionAttemptCount) }
-  const receipt = await readScheduledGateRegistrationReceipt(client, { ...scope, owner, gateTaskId })
-  const completion = record(record(record(prepareTask.result)?.taskGraphScheduledPrepareProofFacts)?.completion)
-  if (!receipt || receipt.continuationKey !== evidence.continuationKey || receipt.snapshotDigest !== evidence.snapshotDigest
-    || receipt.evidenceDigest !== evidence.evidenceDigest || receipt.checkpointDigest !== evidence.checkpointDigest
-    || receipt.owner.rootAttemptCount !== evidence.owner.rootAttemptCount || receipt.owner.executionId !== evidence.owner.executionId
-    || receipt.owner.executionAttemptCount !== evidence.owner.executionAttemptCount
-    || receipt.analyzeGraphRevision !== evidence.analyzeGraphRevision || !positive(completion?.graphRevision)
-    || receipt.gateAppendRevision <= completion.graphRevision
-    || receipt.gateAppendRevision > Number(graph.state?.revision)) return null
-  const proof = await loadPersistedScheduledPrepareProof(client, scope, String(prepareTask.id), prepareTask.result,
-    evidence.prepareWaitContinuationKey, receipt.prepareWaitId)
-  return proof && receipt.prepareScheduleRevision === proof.receipt.prepareScheduleRevision
-    && receipt.prepareWaitId === proof.completion.wait.waitId
-    && gateAppendRevisionMatches(graph, gateTaskId, gateRow, receipt.gateAppendRevision, scope.rootTaskId) ? proof : null
-}
-
-function gateAppendRevisionMatches(graph: Awaited<ReturnType<typeof loadTaskGraph>>, gateTaskId: string, row: Row, revision: number, rootTaskId: string): boolean {
-  const events = graph.state?.appliedEvents.filter(event => event.nodeKey === SCHEDULED_GATE_TEMPLATE_ID && event.type === "task.started"
-    && event.idempotencyKey === taskGraphLifecycleKey(rootTaskId, SCHEDULED_GATE_TEMPLATE_ID, 1, "task.started")) ?? []
-  return events.length === 1 ? events[0]?.expectedRevision === revision
-    : events.length === 0 && row.id === gateTaskId && row.status === "queued" && Number(row.attemptCount) === 0
-      && graph.state?.revision === revision
-}
-
-function sameVerifiedPrefix(graph: Awaited<ReturnType<typeof loadTaskGraph>>, proof: ScheduledPrepareTaskGraphProof): boolean {
-  const nodes = graph.snapshot?.nodes, current = graph.state?.nodes
-  if (!nodes || !current || nodes.length !== 4 || current.length !== 4) return false
-  for (let index = 0; index < 3; index += 1) {
-    const node = nodes[index]!, certified = proof.completion.nodes[index]!, state = current.find(value => value.key === node.key)
-    const task = graph.tasks.get(node.taskId)
-    if (node.templateId !== certified.role || node.taskId !== certified.taskId || node.depth !== index + 1
-      || (index === 0 ? node.dependsOn.length !== 0 : node.dependsOn.length !== 1 || node.dependsOn[0] !== nodes[index - 1]?.key)
-      || node.verificationDisposition !== (index === 2 ? "specialized" : "typed")
-      || !state || state.taskId !== node.taskId || state.status !== "completed"
-      || state.failureReason !== null && state.failureReason !== undefined
-      || !task || task.id !== certified.taskId || task.status !== "completed" || task.failureReason !== null
-      || task.role !== certified.role || task.taskType !== certified.taskType || task.attemptCount !== certified.attemptCount) return false
-  }
-  return true
-}
-
 async function hasExactResumeAcknowledgement(client: Queryable, scope: ScheduledGateWaitScope, row: Row,
   evidence: NonNullable<ReturnType<typeof scheduledGateCheckpointEvidence>>, graph: Awaited<ReturnType<typeof loadTaskGraph>>,
   expectedJobIds: readonly string[]): Promise<boolean> {
@@ -223,8 +177,9 @@ export async function matchScheduledGateWaitTarget(client: Queryable, scope: Sch
     || !prepareState || prepareState.taskId !== prepareNode.taskId || prepareState.status !== "completed"
     || !prepareTask || prepareTask.status !== "completed" || prepareTask.role !== "prepare"
     || prepareTask.taskType !== "scheduled_application_prepare") return null
-  const prepareProof = await registeredPrepareProof(client, scope, scope.gateTaskId, row, evidence, graph, prepareTask)
-  if (!prepareProof || !sameVerifiedPrefix(graph, prepareProof)) return null
+  const prepareProof = await readScheduledGatePreparePrefixProof({ client, scope, gateTaskId: scope.gateTaskId,
+    gateRow: row, evidence, graph, prepareTask, loadProof: loadPersistedScheduledPrepareProof })
+  if (!prepareProof || !scheduledGatePreparePrefixMatches(graph, prepareProof)) return null
   const jobs = scheduledGatePreparedJobIds(prepareProof)
   if (!jobs) return null
   const attempt = Number(row.attemptCount), status = String(row.status), maxAttempts = Number(row.maxAttempts)
@@ -277,8 +232,9 @@ export async function readScheduledGateQuestionCandidate(client: Queryable, scop
   const prepareTask = prepareNode && graph.tasks.get(prepareNode.taskId)
   if (!graph.snapshot || !graph.state || !gateNode || gateNode.taskId !== scope.gateTaskId || !prepareNode || !prepareTask
     || prepareTask.status !== "completed") return null
-  const proof = await registeredPrepareProof(client, scope, scope.gateTaskId, row, evidence, graph, prepareTask)
-  if (!proof || !sameVerifiedPrefix(graph, proof)) return null
+  const proof = await readScheduledGatePreparePrefixProof({ client, scope, gateTaskId: scope.gateTaskId,
+    gateRow: row, evidence, graph, prepareTask, loadProof: loadPersistedScheduledPrepareProof })
+  if (!proof || !scheduledGatePreparePrefixMatches(graph, proof)) return null
   const expectedJobIds = proof && scheduledGatePreparedJobIds(proof), envelope = expectedJobIds && parseScheduledGateTaskEnvelope(row.result, row.status, expectedJobIds)
   const start = startRevision(graph, scope.rootTaskId, attempt)
   const question = envelope?.structuredResult.status === "question_required" ? envelope.structuredResult : null

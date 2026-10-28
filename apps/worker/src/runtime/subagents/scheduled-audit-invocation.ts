@@ -3,7 +3,8 @@ import type { ScheduledGateCompletionProof } from "./scheduled-gate-contract.js"
 import { scheduledGateCheckpointEvidence, scheduledGatePreparedJobIds, parseScheduledGateTaskEnvelope,
   SCHEDULED_GATE_OUTPUT_SCHEMA, SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
 import type { ScheduledAutomationPipelineAttestation } from "./scheduled-automation-pipeline-bridge.js"
-import { scheduledAnalyzeGraphMatches, scheduledSnapshotMatches } from "./scheduled-taskgraph-continuation-receipt.js"
+import { scheduledAnalyzeGraphMatches, scheduledSnapshotMatches, scheduledTaskGraphContinuationKeyVersion } from "./scheduled-taskgraph-continuation-receipt.js"
+import { projectScheduledPipelineGraph } from "./scheduled-pipeline-graph-shape.js"
 import { readScheduledGateRegistrationReceipt } from "./scheduled-gate-registration-receipt.js"
 import { loadPersistedScheduledPrepareProof } from "./scheduled-gate-wait-match.js"
 import { scheduledGateResultDigest, verifyPersistedScheduledPreparePrefix } from "./pg-scheduled-task-graph-gate-verification.js"
@@ -40,9 +41,11 @@ export async function readScheduledAuditInvocationProof(client: Queryable,
   await client.query(`SELECT set_config('app.user_id', $1, true)`, [input.scope.userId])
   const scope = graphScope(input.scope), loaded = await loadTaskGraph(client, scope, false)
   const registration = await readScheduledAuditRegistration(client, scope, input.auditTaskId)
+  const version = registration && scheduledTaskGraphContinuationKeyVersion(registration.continuationKey)
+  const shape = loaded.snapshot && version && projectScheduledPipelineGraph(loaded.snapshot.nodes, version, "audit")
   if (!registration || !attestationOwns(input.attestation, registration.owner)
     || input.attestation.snapshotDigest !== registration.snapshotDigest || !loaded.snapshot || !loaded.state
-    || loaded.snapshot.nodes.length !== 5 || !validAuditNode(loaded, input.auditTaskId)) return null
+    || !shape || !validAuditNode(loaded, input.auditTaskId)) return null
   const task = loaded.tasks.get(input.auditTaskId)
   const current = currentTaskGraph(loaded).nodes.find(node => node.key === SCHEDULED_AUDIT_TEMPLATE_ID)
   if (!task || task.status !== "running" || task.attemptCount !== input.attemptCount || !current
@@ -89,7 +92,9 @@ export async function verifyRegisteredScheduledAuditGate(client: Queryable, scop
     WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3`, [registration.owner.executionId, scope.userId, scope.sessionId])
   const execution = record(executionRows.rows[0]), evidence = scheduledAuditGateCheckpointEvidence(execution?.state, execution?.status)
   const turn = await readTurn(client, scope)
-  if (!snapshot || !state || snapshot.nodes.length !== 5 || state.revision < registration.auditAppendRevision
+  const version = scheduledTaskGraphContinuationKeyVersion(registration.continuationKey)
+  const shape = snapshot && version && projectScheduledPipelineGraph(snapshot.nodes, version, "audit")
+  if (!snapshot || !state || !shape || state.revision < registration.auditAppendRevision
     || !gateNode || !gate || !prepareNode || !prepare
     || executionRows.rows.length !== 1 || !execution || !["running", "paused", "completed"].includes(String(execution.status))
     || Number(execution.attemptCount) !== registration.owner.executionAttemptCount || !evidence || !turn
@@ -111,8 +116,9 @@ export async function verifyRegisteredScheduledAuditGate(client: Queryable, scop
     evidence.prepareWaitContinuationKey, registration.prepareWaitId)
   if (!proof || !same(proof, expected?.prepareProof ?? proof) || proof.completion.wait.waitId !== registration.prepareWaitId
     || !same(proof.receipt.owner, expected?.prepareProof.receipt.owner ?? proof.receipt.owner)) return null
-  const prefix = { ...loaded, snapshot: { ...snapshot, nodes: snapshot.nodes.slice(0, 4) },
-    state: { ...state, nodes: state.nodes.slice(0, 4) } }
+  const prepareCount = shape.scouts.length + 2
+  const prefix = { ...loaded, snapshot: { ...snapshot, nodes: snapshot.nodes.slice(0, prepareCount) },
+    state: { ...state, nodes: state.nodes.slice(0, prepareCount) } }
   const checkpointStage = execution.status === "completed" ? "audit_completed_report" : "gate"
   if (!await verifyPersistedScheduledPreparePrefix(client, scope, prefix, proof, checkpointStage)
     || attestation && !verifyAttestation(loaded, attestation)) return null
@@ -141,8 +147,11 @@ export async function verifyRegisteredScheduledAuditGate(client: Queryable, scop
 function verifyAttestation(loaded: LoadedGraph, attestation: ScheduledAutomationPipelineAttestation): boolean {
   const snapshot = loaded.snapshot, state = loaded.state
   if (!snapshot || !state) return false
-  const nodes = snapshot.nodes.slice(0, 3), prepare = nodes[2]
-  const current = currentTaskGraph(loaded).nodes.slice(0, 3)
+  const version = "scouts" in attestation ? "v2" : "v1"
+  const shape = projectScheduledPipelineGraph(snapshot.nodes, version, "audit")
+  if (!shape) return false
+  const prepareCount = shape.scouts.length + 2, nodes = snapshot.nodes.slice(0, prepareCount), prepare = shape.prepare
+  const current = currentTaskGraph(loaded).nodes.slice(0, prepareCount)
   const proposal: TaskGraphProposal = { expectedRevision: attestation.graphRevision,
     nodes: prepare ? [{ key: prepare.key, templateId: prepare.templateId, goal: prepare.goal,
       successCriteria: prepare.successCriteria, dependsOn: prepare.dependsOn }] : [] }

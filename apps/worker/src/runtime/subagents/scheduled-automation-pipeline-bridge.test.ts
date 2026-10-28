@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 import { createHash } from "node:crypto"
+import { parseScheduledPipelineAttestation } from "@jobcopilot/agent-protocol"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, type TaskGraphVerificationEvaluation } from "../planning/task-graph-verification.js"
 import { SCHEDULED_AUTOMATION_SNAPSHOT_SCHEMA_VERSION } from "./scheduled-automation-snapshot.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
@@ -187,6 +188,7 @@ function appendVerifiedPrepareAndGate(fixture: ReturnType<typeof makeFixture>, w
 }
 
 function legacyEvidenceDigest(fixture: ReturnType<typeof makeFixture>, attestation: ScheduledAutomationPipelineAttestation): string {
+  if (attestation.schemaVersion !== SCHEDULED_PIPELINE_ATTESTATION_SCHEMA) throw new Error("expected_legacy_v1_attestation")
   const stableOwner = { userId: scope.userId, sessionId: scope.sessionId, turnId: scope.turnId,
     rootTaskId: scope.rootTaskId, rootAttemptCount: scope.rootAttemptCount }
   const digest = (value: unknown) => createHash("sha256").update(canonicalTaskGraphJson(value)).digest("hex")
@@ -243,11 +245,24 @@ function verificationProof(value: unknown, role: string): TaskGraphPgVerificatio
 }
 
 describe("scheduled automation TaskGraph pipeline bridge", () => {
+  it("projects execution-scoped extras out of the exact V1 attestation owner", async () => {
+    const fixture = makeFixture()
+    const executionScope = { ...scope, executionId: "", executionAttemptCount: 0 }
+    const result = await createScheduledAutomationPipelineBridge(fixture.dependencies)(executionScope)
+    expect(result.status).toBe("ready")
+    if (result.status !== "ready") return
+    const parsed = parseScheduledPipelineAttestation(result.attestation)
+    expect(parsed).not.toBeNull()
+    expect(Object.keys(result.attestation.owner).sort()).toEqual(["rootAttemptCount", "rootTaskId", "sessionId", "turnId", "turnLeaseOwnerId", "turnLeaseVersion", "userId"])
+    expect(parsed?.owner).toEqual(scope)
+  })
+
   it("returns a bounded owner-fenced attestation from verified Scout and Analyst outputs", async () => {
     const fixture = makeFixture()
     const result = await createScheduledAutomationPipelineBridge(fixture.dependencies)(scope)
     expect(result.status).toBe("ready")
     if (result.status !== "ready") return
+    if (result.attestation.schemaVersion !== SCHEDULED_PIPELINE_ATTESTATION_SCHEMA) throw new Error("expected_legacy_v1_attestation")
     expect(result.attestation).toMatchObject({
       schemaVersion: SCHEDULED_PIPELINE_ATTESTATION_SCHEMA,
       owner: scope,
@@ -323,7 +338,10 @@ describe("scheduled automation TaskGraph pipeline bridge", () => {
     const fixture = makeFixture({ candidateIds: [], findingIds: [], health: { candidateCount: 0 } })
     const result = await createScheduledAutomationPipelineBridge(fixture.dependencies)(scope)
     expect(result.status).toBe("ready")
-    if (result.status === "ready") expect(result.attestation.scout.discoveryReceipt.candidateCount).toBe(0)
+    if (result.status === "ready") {
+      if (result.attestation.schemaVersion !== SCHEDULED_PIPELINE_ATTESTATION_SCHEMA) throw new Error("expected_legacy_v1_attestation")
+      expect(result.attestation.scout.discoveryReceipt.candidateCount).toBe(0)
+    }
   })
 
   it.each([

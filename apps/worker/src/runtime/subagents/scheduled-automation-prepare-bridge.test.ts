@@ -235,8 +235,8 @@ describe("scheduled automation Prepare continuation", () => {
 
   it("replays the original Analyze binding after the exact Prepare node advances the graph", async () => {
     const fixture = ports({ revision: 8, receiptStatus: "duplicate", choice: { required: true, status: "answered", waitId: expectedChoiceWaitId }, nodes: [
-      { key: "discovery", templateId: "scout", taskId: "scout-task", status: "completed", failureReason: null },
-      { key: "analysis", templateId: "analyst", taskId: "analyst-task", status: "completed", failureReason: null },
+      { key: "discovery", templateId: "scout", taskId: "scout-task", status: "completed", failureReason: null, dependsOn: [] },
+      { key: "analysis", templateId: "analyst", taskId: "analyst-task", status: "completed", failureReason: null, dependsOn: ["discovery"] },
       { key: "prepare", templateId: "prepare", taskId: "prepare-task", status: "completed", failureReason: null,
         goal: "Prepare application materials using the persisted scheduled Analyze checkpoint.",
         successCriteria: ["Prepare only jobs and 0-100 scores from the verified scheduled Analyze checkpoint.",

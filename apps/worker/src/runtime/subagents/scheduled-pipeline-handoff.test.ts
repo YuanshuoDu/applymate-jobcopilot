@@ -8,9 +8,9 @@ const owner: ScheduledAutomationPipelineBridgeScope = {
   userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", rootAttemptCount: 2,
   turnLeaseOwnerId: "worker-1", turnLeaseVersion: 5,
 }
-const digest = `sha256:${"a".repeat(64)}`
+const digest = "a".repeat(64)
 const attestation: ScheduledAutomationPipelineAttestation = {
-  schemaVersion: "agent-harness.v2.scheduled-pipeline-attestation.v1", owner, snapshotDigest: digest, graphRevision: 3,
+  schemaVersion: "agent-harness.v2.scheduled-pipeline-attestation.v1", owner, snapshotDigest: `sha256:${digest}`, graphRevision: 3,
   scout: { taskId: "scout-1", attemptCount: 1, status: "completed", verification: "passed", resultDigest: digest,
     candidateJobIds: ["job-1"], discoveryReceipt: { status: "complete", taskId: "scout-1", attemptCount: 1, completedCalls: 1,
       candidateCount: 1, providerFailures: 0, materializationFailures: 0, hasMore: false, receiptDigest: digest } },

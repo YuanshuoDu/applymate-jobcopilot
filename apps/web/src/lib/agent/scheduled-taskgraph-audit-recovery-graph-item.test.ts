@@ -19,6 +19,10 @@ const analystVerification = (scoutKey: string) => ({ schemaVersion: VERIFICATION
   { id: 'scout-membership', check: { kind: 'findings_from_scout_dependency', dependencyNodeKey: scoutKey } },
   { id: 'finding-count', check: { kind: 'finding_count_gte', minimum: 1 } },
 ] })
+const analystUnionVerification = { schemaVersion: VERIFICATION_SCHEMA, role: 'analyst', criteria: [
+  { id: 'scout-membership', check: { kind: 'findings_from_scout_union', dependencyNodeKeys: ['scout-a', 'scout-b'] } },
+  { id: 'finding-count', check: { kind: 'finding_count_gte', minimum: 1 } },
+] }
 const owner: ScheduledTaskGraphPipelineOwner = { userId: 'user-1', sessionId: 'session-1', turnId: 'turn-1', rootTaskId: 'root-1',
   rootAttemptCount: 2, turnLeaseOwnerId: 'worker-1', turnLeaseVersion: 3, executionId: 'execution-1', executionAttemptCount: 0 }
 const rootId = owner.rootTaskId
@@ -41,6 +45,21 @@ const snapshot: RecoveryGraphSnapshot = { schemaVersion: 'agent-harness.v2.task-
     successCriteria: SCHEDULED_AUDIT_NODE_CRITERIA, dependsOn: ['gate'], depth: 5,
     taskId: 'audit-child-1', verificationDisposition: 'specialized' },
 ] }
+const multiScoutSnapshot: RecoveryGraphSnapshot = { schemaVersion: 'agent-harness.v2.task-graph', nodes: [
+  { key: 'scout-a', templateId: 'scout', goal: 'Find source A', successCriteria: ['Found A'], dependsOn: [], depth: 1,
+    taskId: 'scout-child-a', verificationDisposition: 'typed', verification: scoutVerification },
+  { key: 'scout-b', templateId: 'scout', goal: 'Find source B', successCriteria: ['Found B'], dependsOn: [], depth: 1,
+    taskId: 'scout-child-b', verificationDisposition: 'typed', verification: scoutVerification },
+  { key: 'analysis', templateId: 'analyst', goal: 'Review both sources', successCriteria: ['Reviewed evidence'], dependsOn: ['scout-b', 'scout-a'], depth: 2,
+    taskId: 'analyst-child-multi', verificationDisposition: 'typed', verification: analystUnionVerification },
+  { key: 'prepare', templateId: 'prepare', goal: 'Prepare the application', successCriteria: ['Preparation is complete'], dependsOn: ['analysis'], depth: 3,
+    taskId: 'prepare-child-multi', verificationDisposition: 'specialized' },
+  { key: 'gate', templateId: 'gate', goal: 'Review the application', successCriteria: ['Review is complete'], dependsOn: ['prepare'], depth: 4,
+    taskId: 'gate-child-multi', verificationDisposition: 'specialized' },
+  { key: SCHEDULED_AUDIT_TEMPLATE_ID, templateId: SCHEDULED_AUDIT_TEMPLATE_ID, goal: SCHEDULED_AUDIT_NODE_GOAL,
+    successCriteria: SCHEDULED_AUDIT_NODE_CRITERIA, dependsOn: ['gate'], depth: 5,
+    taskId: 'audit-child-multi', verificationDisposition: 'specialized' },
+] }
 function snapshotWithAliases(scoutKey = 'scout', analystKey = 'analyst') {
   const nodes = [...snapshot.nodes]
   nodes[0] = { ...nodes[0]!, key: scoutKey }
@@ -55,7 +74,7 @@ function graphItem(overrides: Record<string, unknown> = {}): GraphRow {
     status: 'streaming', phase: null, revision: revision + 1, content: snapshot, ...overrides }
 }
 function proposalEvent(options: Readonly<{ proposalStepId?: string; eventId?: string; proposalRevision?: number;
-  itemContent?: unknown; eventOverrides?: Record<string, unknown>; payloadOverrides?: Record<string, unknown> }> = {}): GraphRow {
+  itemContent?: unknown; auditTaskId?: string; eventOverrides?: Record<string, unknown>; payloadOverrides?: Record<string, unknown> }> = {}): GraphRow {
   const proposalRevision = options.proposalRevision ?? revision
   const proposalStepId = options.proposalStepId ?? stepId
   const content = options.itemContent ?? snapshot
@@ -65,7 +84,8 @@ function proposalEvent(options: Readonly<{ proposalStepId?: string; eventId?: st
     updatedAt: '2026-10-25T12:10:00.000Z' }
   const payload = { kind: 'proposal', fingerprint: 'f'.repeat(64), revision: proposalRevision,
     receipt: { status: 'accepted', revision: proposalRevision,
-      nodes: [{ key: SCHEDULED_AUDIT_TEMPLATE_ID, taskId: 'audit-child-1', status: 'queued' }], readyTaskIds: ['audit-child-1'] },
+      nodes: [{ key: SCHEDULED_AUDIT_TEMPLATE_ID, taskId: options.auditTaskId ?? 'audit-child-1', status: 'queued' }],
+      readyTaskIds: [options.auditTaskId ?? 'audit-child-1'] },
     item: dto, content, ...options.payloadOverrides }
   return { id: options.eventId ?? `${proposalStepId}-proposal`, sessionId: owner.sessionId, turnId: owner.turnId,
     taskId: rootId, itemId, type: 'item.delta', actor: 'orchestrator', correlationId: owner.turnId,
@@ -94,6 +114,16 @@ describe('scheduled TaskGraph Audit recovery graph item', () => {
   it('accepts the scheduled Scout and Analyst keys while preserving semantic templates', async () => {
     const aliased = snapshotWithAliases('scheduled-scout', 'scheduled-analyst')
     await expect(validate(graphItem({ content: aliased }), [proposalEvent({ itemContent: aliased })]).result).resolves.toBe(true)
+  })
+
+  it('accepts a multi-Scout audit suffix with set-bound Analyst dependencies', async () => {
+    const event = proposalEvent({ itemContent: multiScoutSnapshot, auditTaskId: 'audit-child-multi' })
+    await expect(validate(graphItem({ content: multiScoutSnapshot }), [event]).result).resolves.toBe(true)
+    const nodes = [...multiScoutSnapshot.nodes]
+    nodes[2] = { ...nodes[2]!, dependsOn: ['scout-a'] }
+    const broken = { ...multiScoutSnapshot, nodes }
+    await expect(validate(graphItem({ content: broken }), [proposalEvent({ itemContent: broken, auditTaskId: 'audit-child-multi' })]).result)
+      .resolves.toBe(false)
   })
 
   it('requires the moved singleton to have its own current-step proposal receipt', async () => {

@@ -84,6 +84,12 @@ const approvalWaitProjection = [owner.userId, owner.sessionId, owner.turnId, own
   owner.executionId, owner.executionAttemptCount, approvalKey, approvalReceipt.snapshotDigest, approvalReceipt.evidenceDigest,
   approvalReceipt.checkpointDigest, approvalReceipt.analyzeGraphRevision, approvalReceipt.prepareScheduleRevision, finalStepId, finalStepOrdinal, 1]
 const approvalWaitId = `agent-question:${owner.turnId}:canonical:${createHash("sha256").update(JSON.stringify(approvalWaitProjection), "utf8").digest("hex")}`
+const v2ApprovalReceipt = { ...approvalReceipt, continuationKey: `scheduled-taskgraph:v2:sha256:${'f'.repeat(64)}` }
+const v2ApprovalWaitProjection = [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.rootAttemptCount,
+  owner.executionId, owner.executionAttemptCount, v2ApprovalReceipt.continuationKey, v2ApprovalReceipt.snapshotDigest,
+  v2ApprovalReceipt.evidenceDigest, v2ApprovalReceipt.checkpointDigest, v2ApprovalReceipt.analyzeGraphRevision,
+  v2ApprovalReceipt.prepareScheduleRevision, finalStepId, finalStepOrdinal, 1]
+const v2ApprovalWaitId = `agent-question:${owner.turnId}:canonical:${createHash("sha256").update(JSON.stringify(v2ApprovalWaitProjection), "utf8").digest("hex")}`
 const candidatePayload = { schemaVersion: "agent-harness.v2.scheduled-pipeline-candidate.v2", sessionId: owner.sessionId,
   turnId: owner.turnId, rootTaskId: owner.rootTaskId, rootAttemptCount: owner.rootAttemptCount, finalStepId, finalStepOrdinal,
   stepAttempt: 1, candidateText: "candidate", finishReason: "stop", usage: { inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0.01 } }
@@ -328,6 +334,20 @@ describe("runScheduledTaskGraphAnalyzeOnly", () => {
     await expect(validateScheduledPrepareWaitIdentity({ owner, snapshot: approvalSnapshot, proof, scheduledWaitId: approvalWaitId })).resolves.toBe(false)
     mocks.steps.mockResolvedValueOnce({ id: "newer_step" }).mockResolvedValueOnce({ id: finalStepId, status: "streaming" })
     await expect(validateScheduledPrepareWaitIdentity({ owner, snapshot: approvalSnapshot, proof, scheduledWaitId: approvalWaitId })).resolves.toBe(false)
+  })
+
+  it("reads v2 Prepare choice receipts without accepting trailing key data", async () => {
+    const { validateScheduledPrepareWaitIdentity } = await import("./scheduled-taskgraph-run-service")
+    mocks.events.mockImplementation((args: { where: { type: string } }) => Promise.resolve(args.where.type === "agent.plan.scheduled_prepare_binding"
+      ? [{ payload: v2ApprovalReceipt }]
+      : [{ type: "native_verification.scheduled_candidate_staged", taskId: owner.rootTaskId, correlationId: finalStepId, payload: candidatePayload }]))
+    mocks.items.mockResolvedValue(scheduledChoiceItem("apply_ai_changes", v2ApprovalWaitId, v2ApprovalReceipt))
+    await expect(validateScheduledPrepareWaitIdentity({ owner, snapshot: approvalSnapshot,
+      proof: { receipt: v2ApprovalReceipt, completion: {}, result: {} }, scheduledWaitId: v2ApprovalWaitId })).resolves.toBe(true)
+
+    const malformed = { ...v2ApprovalReceipt, continuationKey: `${v2ApprovalReceipt.continuationKey}\n` }
+    await expect(validateScheduledPrepareWaitIdentity({ owner, snapshot: approvalSnapshot,
+      proof: { receipt: malformed, completion: {}, result: {} }, scheduledWaitId: v2ApprovalWaitId })).resolves.toBe(false)
   })
 
   it("requires absence of the Worker choice ID and item when approval is disabled", async () => {

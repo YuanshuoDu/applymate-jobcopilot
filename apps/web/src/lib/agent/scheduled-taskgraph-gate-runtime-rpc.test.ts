@@ -31,7 +31,7 @@ vi.mock('./scheduled-taskgraph-audit-child-fence', async importOriginal => ({
   lockScheduledTaskGraphAuditChildFence: mocks.childFence,
 }))
 vi.mock('./scheduled-taskgraph-audit-prepare-source', () => ({ validateScheduledTaskGraphAuditPrepareSource: mocks.auditPrepareSource }))
-vi.mock('./scheduled-taskgraph-pipeline-checkpoint', () => ({ scheduledAutomationSnapshotDigest: vi.fn(() => 'sha256:snapshot'),
+vi.mock('./scheduled-taskgraph-pipeline-checkpoint', () => ({ scheduledAutomationSnapshotDigest: vi.fn(() => `sha256:${'a'.repeat(64)}`),
   scheduledTaskGraphContinuationKey: vi.fn(() => 'scheduled-taskgraph:key') }))
 vi.mock('./scheduled-taskgraph-run-service', () => ({ validateScheduledPrepareWaitIdentity: mocks.validateWait }))
 vi.mock('./scheduled-taskgraph-completed-report-replay', () => ({ replayCompletedScheduledTaskGraphReport: mocks.completedReplay,
@@ -40,6 +40,7 @@ vi.mock('./stages/gate', () => ({ runScheduledGate: mocks.policy }))
 vi.mock('./scheduled-taskgraph-gate-service', () => ({ executeScheduledTaskGraphGate: mocks.executeGate }))
 
 import { runScheduledTaskGraphActionRpc } from './scheduled-taskgraph-gate-runtime-rpc'
+import { parseScheduledTaskGraphAttestation } from './scheduled-taskgraph-attestation-candidates'
 
 const snapshot = { schemaVersion: 'agent-harness.v2.scheduled-automation-snapshot.v1', targetRoles: ['Engineer'],
   targetLocations: ['Dublin'], minScore: 70, dailyCap: 1, requireApproval: false, autoApply: true }
@@ -56,7 +57,24 @@ function auditStateWithOwners(claimOwner: unknown, continuationOwner: unknown = 
     scheduledTaskGraphContinuation: { schemaVersion: 'agent-harness.v2.scheduled-pipeline-continuation.v1',
       key: claim.key, owner: continuationOwner, snapshotDigest: 'sha256:snapshot', graphRevision: 15, evidenceDigest: 'b'.repeat(64) } }
 }
-const attestation = { snapshotDigest: 'sha256:snapshot', scout: { candidateJobIds: ['job-1'] } }
+const attestation = { schemaVersion: 'agent-harness.v2.scheduled-pipeline-attestation.v1', owner: requestOwner,
+  snapshotDigest: `sha256:${'a'.repeat(64)}`, graphRevision: 15, scout: { taskId: 'scout-task', attemptCount: 1,
+    status: 'completed', verification: 'passed', resultDigest: 'c'.repeat(64), candidateJobIds: ['job-1'],
+    discoveryReceipt: { status: 'complete', taskId: 'scout-task', attemptCount: 1, completedCalls: 1,
+      candidateCount: 1, providerFailures: 0, materializationFailures: 0, hasMore: false, receiptDigest: 'a'.repeat(64) } },
+  analyst: { taskId: 'analyst-task', attemptCount: 1, status: 'completed', verification: 'passed', resultDigest: 'd'.repeat(64),
+    dependsOnTaskIds: ['scout-task'], jobIds: ['job-1'] }, evidenceDigest: 'b'.repeat(64) }
+const multiScoutAttestation = { schemaVersion: 'agent-harness.v2.scheduled-pipeline-attestation.v2', owner: requestOwner,
+  snapshotDigest: `sha256:${'a'.repeat(64)}`, graphRevision: 16, scouts: ['a', 'b'].map((suffix, index) => ({ nodeKey: `scout-${suffix}`,
+    taskId: `scout-task-${suffix}`, attemptCount: 1, status: 'completed', verification: 'passed', resultDigest: `${index + 1}`.repeat(64),
+    nodeDigest: `${index + 3}`.repeat(64), evidenceDigest: `${index + 5}`.repeat(64), reportDigest: `${index + 7}`.repeat(64),
+    candidateJobIds: index === 0 ? ['job-1', 'unselected-job'] : ['unselected-job'],
+    discoveryReceipt: { status: 'complete', taskId: `scout-task-${suffix}`, attemptCount: 1, completedCalls: 1,
+      candidateCount: index === 0 ? 2 : 1, providerFailures: 0, materializationFailures: 0, hasMore: false,
+      receiptDigest: (index === 0 ? '9' : 'a').repeat(64) } })), candidateUnionJobIds: ['job-1', 'unselected-job'],
+  analyst: { nodeKey: 'analysis', taskId: 'analyst-task-multi', attemptCount: 1, status: 'completed', verification: 'passed',
+    resultDigest: 'c'.repeat(64), nodeDigest: 'd'.repeat(64), evidenceDigest: 'e'.repeat(64), reportDigest: 'f'.repeat(64),
+    dependsOnTaskIds: ['scout-task-a', 'scout-task-b'], jobIds: ['job-1'] }, evidenceDigest: 'a'.repeat(64) }
 const proof = { receipt: { proof: true } }
 const job = { id: 'job-1', userId: owner.userId }
 const packageRow = { userId: owner.userId, sessionId: owner.sessionId, jobId: job.id, package: {} }
@@ -184,6 +202,14 @@ describe('scheduled TaskGraph Gate/Execute runtime RPC', () => {
     expect(mocks.executeGate).toHaveBeenCalledOnce()
     expect(mocks.executeGate.mock.calls[0]?.[0]).toMatchObject({ handoff: { checkpoint: { nextStage: 'gate' } }, priorChoices: [] })
     expect(JSON.stringify(responseBody)).not.toContain('private-claim')
+  })
+
+  it('loads only the verified Analyst selection from a multi-Scout union', async () => {
+    expect(parseScheduledTaskGraphAttestation(multiScoutAttestation)).not.toBeNull()
+    const result = await runScheduledTaskGraphActionRpc({ ...gateRequest(), attestation: multiScoutAttestation }) as Response
+    expect(result.status).toBe(200)
+    expect(mocks.jobs).toHaveBeenCalledWith({ where: { userId: owner.userId, id: { in: ['job-1'] } } })
+    expect(mocks.jobs.mock.calls[0]?.[0]).not.toMatchObject({ where: { id: { in: multiScoutAttestation.candidateUnionJobIds } } })
   })
 
   it('reloads Gate materials before a short current-owner transaction', async () => {

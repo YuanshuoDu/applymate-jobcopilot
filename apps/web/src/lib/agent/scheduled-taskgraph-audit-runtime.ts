@@ -1,5 +1,6 @@
 import type { PipelineCtx } from './pipeline-context'
 import type { ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
+import { isScheduledTaskGraphContinuationKey } from './scheduled-taskgraph-continuation-contract'
 
 const AUDIT_RUNTIME = Symbol('scheduled-taskgraph-audit-runtime')
 const INVALID = 'scheduled_taskgraph_audit_runtime_invalid'
@@ -7,7 +8,6 @@ const OWNER_KEYS = ['userId', 'sessionId', 'turnId', 'rootTaskId', 'rootAttemptC
   'turnLeaseVersion', 'executionId', 'executionAttemptCount'] as const
 const CLAIM_SCHEMA = 'agent-harness.v2.scheduled-pipeline-claim.v1'
 const CONTINUATION_SCHEMA = 'agent-harness.v2.scheduled-pipeline-continuation.v1'
-const KEY = /^scheduled-taskgraph:sha256:[a-f0-9]{64}$/
 const DIGEST = /^sha256:[a-f0-9]{64}$/
 const HEX = /^[a-f0-9]{64}$/
 
@@ -59,7 +59,7 @@ function validFence(ctx: PipelineCtx, fence: Fence, expectedOwner: unknown): boo
   const claimOwner = record(claim?.owner), continuation = record(state?.scheduledTaskGraphContinuation)
   const continuationOwner = record(continuation?.owner), expected = record(expectedOwner)
   if (!owner || !expected || !sameOwner(owner, expected) || !validOwner(owner)
-    || !validId(fence.key) || !KEY.test(fence.key) || !validId(fence.claimToken)
+    || !validId(fence.key) || !isScheduledTaskGraphContinuationKey(fence.key) || !validId(fence.claimToken)
     || typeof fence.assertCurrent !== 'function' || !state || !['execute', 'audit'].includes(String(state.nextStage))
     || ctx.userId !== owner.userId || ctx.sessionId !== owner.sessionId || ctx.turnId !== owner.turnId
     || ctx.executionAttempt?.id !== owner.executionId || ctx.executionAttempt?.attemptCount !== owner.executionAttemptCount

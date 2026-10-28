@@ -102,11 +102,12 @@ function receiptMatches(receipt: Row, revision: number, snapshot: Row, rootTaskI
   const nodes = Array.isArray(receipt.nodes) ? receipt.nodes : [], node = row(nodes[0])
   const ready = Array.isArray(receipt.readyTaskIds) ? receipt.readyTaskIds : []
   const graph = Array.isArray(snapshot.nodes) ? snapshot.nodes : []
-  const graphNodes = graph.map(row), taskIds = graphNodes.map(value => value?.taskId)
+  const graphNodes = graph.map(row), taskIds = graphNodes.map(value => value?.taskId), scoutCount = graph.length - 4
   const graphKeys = graphNodes.map(value => value?.key)
   const templates = graphNodes.map(value => value?.templateId)
   const depths = graphNodes.map(value => value?.depth)
-  const [scout, analyst, prepare, gate, audit] = graphNodes
+  const scouts = graphNodes.slice(0, scoutCount), sourceKeys = scouts.map(value => value?.key)
+  const analyst = graphNodes[scoutCount], prepare = graphNodes[scoutCount + 1], gate = graphNodes[scoutCount + 2], audit = graphNodes[scoutCount + 3]
   if (!exactKeys(receipt, ['status', 'revision', 'nodes', 'readyTaskIds']) || receipt.status !== 'accepted'
     || receipt.revision !== revision || nodes.length !== 1 || !node
     || !exactKeys(node, ['key', 'taskId', 'status']) || node.key !== 'scheduled_audit'
@@ -114,19 +115,25 @@ function receiptMatches(receipt: Row, revision: number, snapshot: Row, rootTaskI
     || ready.length !== 1 || ready[0] !== node.taskId || snapshot.schemaVersion !== 'agent-harness.v2.task-graph'
     || !exactKeys(snapshot, Object.hasOwn(snapshot, 'rootSuccessCriteria')
       ? ['nodes', 'rootSuccessCriteria', 'schemaVersion'] : ['nodes', 'schemaVersion'])
-    || graph.length !== 5 || graphNodes.some(value => !value) || taskIds.some(id => !validId(id) || id === rootTaskId)
-    || new Set(taskIds).size !== 5 || graphKeys.some(key => !validNodeKey(key)) || new Set(graphKeys).size !== 5
-    || !same(templates, ['scout', 'analyst', 'prepare', 'gate', 'scheduled_audit'])
-    || !same(graphKeys.slice(2), ['prepare', 'gate', 'scheduled_audit'])
-    || !same(depths, [1, 2, 3, 4, 5])
-    || !scout || !analyst || !prepare || !gate
-    || !same(scout.dependsOn, []) || !same(analyst.dependsOn, [scout.key])
+    || !(scoutCount === 1 || scoutCount >= 2 && scoutCount <= 4) || graphNodes.some(value => !value)
+    || taskIds.some(id => !validId(id) || id === rootTaskId) || new Set(taskIds).size !== graph.length
+    || graphKeys.some(key => !validNodeKey(key)) || new Set(graphKeys).size !== graph.length
+    || !same(templates, [...Array(scoutCount).fill('scout'), 'analyst', 'prepare', 'gate', 'scheduled_audit'])
+    || !same(graphKeys.slice(scoutCount + 1), ['prepare', 'gate', 'scheduled_audit'])
+    || !same(depths, [...Array(scoutCount).fill(1), 2, 3, 4, 5])
+    || scouts.some(scout => !scout || !same(scout.dependsOn, []) || scout.verificationDisposition !== 'typed')
+    || !analyst || !prepare || !gate || !sameSet(analyst.dependsOn, sourceKeys)
     || !same(prepare.dependsOn, [analyst.key]) || !same(gate.dependsOn, [prepare.key])
     || !audit || !exactKeys(audit, ['key', 'templateId', 'goal', 'successCriteria', 'dependsOn', 'depth', 'taskId', 'verificationDisposition'])
     || audit.key !== 'scheduled_audit' || audit.templateId !== 'scheduled_audit' || audit.depth !== 5
     || audit.taskId !== node.taskId || audit.verificationDisposition !== 'specialized'
     || !same(audit.goal, AUDIT_GOAL) || !same(audit.successCriteria, AUDIT_CRITERIA) || !same(audit.dependsOn, ['gate'])) return false
   return true
+}
+
+function sameSet(actual: unknown, expected: readonly unknown[]): boolean {
+  return Array.isArray(actual) && actual.length === expected.length && new Set(actual).size === actual.length
+    && expected.every(value => actual.includes(value))
 }
 
 function validOwner(owner: ScheduledTaskGraphPipelineOwner): boolean {
