@@ -18,6 +18,8 @@ import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphState } f
 import { TASK_GRAPH_VERIFIER_VERSION, taskGraphResultDigest } from "./subagents/task-graph-pg-verification.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "./planning/task-graph-verification.js"
 import { ROLE_RESULT_SCHEMA, validateRoleResult } from "./subagents/role-results.js"
+import { DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION } from "./subagents/child-discovery-attempt.js"
+import { captureDiscoveryQueryCriteria, createDiscoveryQueryFootprint } from "./subagents/child-discovery-query-footprint.js"
 import { discoveryPersonaContextBlocks } from "./context/discovery-persona-context-blocks.js"
 import { projectSelectedJobMemory, type SelectedJobMemoryNode } from "./context/selected-job-memory.js"
 import type { ValidatedSelectedJobHistoryOutcome } from "./context/selected-job-history.js"
@@ -142,8 +144,27 @@ function loadedHistoryGraphFixture(): LoadedGraph {
   const scoutRepairCriteria = [{ id: "private-scout-repair-check", check: { kind: "candidate_count_gte", minimum: 2 } }]
   const scoutOutputCriteria = [{ id: "private-scout-output-check", check: { kind: "candidate_count_gte", minimum: 1 } }]
   const analystOutputCriteria = [{ id: "private-analyst-output-check", check: { kind: "finding_count_gte", minimum: 1 } }]
+  const scoutEnvelope = {
+    role: "scout" as const, taskType: "job_discovery",
+    expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" as const },
+    allowedActions: ["jobs.discover"] as const,
+  }
+  const queryCapture = captureDiscoveryQueryCriteria({
+    targetRoles: ["Backend Engineer"], targetLocations: ["Dublin"], source: "lever", pageSize: 20,
+    cursor: "PRIVATE_QUERY_CURSOR_SENTINEL",
+  })
+  if (queryCapture.availability !== "captured") throw new Error("discovery query fixture invalid")
+  const queryFootprint = createDiscoveryQueryFootprint([{
+    criteria: queryCapture.criteria,
+    outcome: "completed", requestCount: 2, observedCandidateCount: 3, providerFailures: 0, materializationFailures: 0, hasMore: true,
+  }])
+  const attemptHealth = {
+    schemaVersion: DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION,
+    attemptedCalls: 1, completedCalls: 1, failedCalls: 0, unresolvedCalls: 0,
+    candidateCount: 3, providerFailures: 0, materializationFailures: 0, hasMore: true,
+  }
   const nodes = [
-    { key: "PRIVATE_HISTORY_SCOUT_FAILURE", templateId: "scout", goal: "PRIVATE_HISTORY_SCOUT_GOAL", successCriteria: ["PRIVATE_HISTORY_SCOUT_CRITERION"], dependsOn: [], depth: 1, taskId: "PRIVATE_HISTORY_SCOUT_TASK", verificationDisposition: "typed", verification: historyContract("scout", scoutFailures) },
+    { key: "PRIVATE_HISTORY_SCOUT_FAILURE", templateId: "scout", goal: "PRIVATE_HISTORY_SCOUT_GOAL", successCriteria: ["PRIVATE_HISTORY_SCOUT_CRITERION"], dependsOn: [], depth: 1, taskId: "PRIVATE_HISTORY_SCOUT_TASK", verificationDisposition: "typed", verification: historyContract("scout", scoutFailures), registeredScoutEnvelope: scoutEnvelope },
     { key: "PRIVATE_HISTORY_ANALYST_FAILURE", templateId: "analyst", goal: "PRIVATE_HISTORY_ANALYST_GOAL", successCriteria: ["PRIVATE_HISTORY_ANALYST_CRITERION"], dependsOn: [], depth: 1, taskId: "PRIVATE_HISTORY_ANALYST_TASK", verificationDisposition: "typed", verification: historyContract("analyst", analystFailures) },
     { key: "PRIVATE_HISTORY_ANALYST_REPAIR", templateId: "analyst", goal: "PRIVATE_HISTORY_REPAIR_GOAL", successCriteria: ["PRIVATE_HISTORY_REPAIR_CRITERION"], dependsOn: [], depth: 2, taskId: "PRIVATE_HISTORY_REPAIR_TASK", verificationDisposition: "typed", verification: historyContract("analyst", analystFailures), repairOf: { graphRootTaskId: HISTORY_ROOT_ID, nodeKey: "PRIVATE_HISTORY_ANALYST_FAILURE", taskId: "PRIVATE_HISTORY_ANALYST_TASK", criterionIds: analystFailures.map(item => item.id) } },
     { key: "PRIVATE_HISTORY_SCOUT_PARTIAL", templateId: "scout", goal: "PRIVATE_HISTORY_SCOUT_OUTPUT_GOAL", successCriteria: ["PRIVATE_HISTORY_SCOUT_OUTPUT_CRITERION"], dependsOn: [], depth: 1, taskId: "PRIVATE_HISTORY_SCOUT_OUTPUT_TASK", verificationDisposition: "typed", verification: historyContract("scout", scoutOutputCriteria) },
@@ -166,7 +187,13 @@ function loadedHistoryGraphFixture(): LoadedGraph {
     }
     if (report !== undefined) result.taskGraphVerificationReport = report
     if (receipt !== undefined) result.taskGraphRepairReceipt = receipt
-    tasks.set(node.taskId, { id: node.taskId, status, role: node.templateId, attemptCount: 1, failureReason, result })
+    if (index === 0) result.discoveryAttempt = { attemptCount: 1, health: attemptHealth, queryFootprint }
+    tasks.set(node.taskId, {
+      id: node.taskId, status, role: node.templateId,
+      ...(index === 0 ? { taskType: scoutEnvelope.taskType, expectedOutputSchema: scoutEnvelope.expectedOutputSchema,
+        allowedActions: scoutEnvelope.allowedActions } : {}),
+      attemptCount: 1, failureReason, result,
+    })
   }
   const scoutFailureReport = historyReport("failed", scoutFailures.map(item => item.id), "b")
   const analystFailureReport = historyReport("failed", analystFailures.map(item => item.id), "c")
@@ -198,7 +225,7 @@ function loadedHistoryGraphFixture(): LoadedGraph {
   return {
     rootTaskId: HISTORY_ROOT_ID, snapshot, tasks,
     state: { ...baseState, repairSatisfiedNodeKeys: coverage.satisfied, repairPendingNodeKeys: coverage.pending },
-    item: { id: "PRIVATE_HISTORY_GRAPH_ITEM", revision: 7, content: snapshot, createdAt: now },
+    item: { id: "PRIVATE_HISTORY_GRAPH_ITEM", revision: 7, content: snapshot, createdAt: now }, discoveryTurnEligibility: "ordinary",
   }
 }
 
@@ -627,6 +654,14 @@ describe("canonical Turn context builder", () => {
     expect(source.reportedOutputs?.[3]).toEqual({ role: "scout", candidateCount: 5, resultStatus: "partial" })
     expect(source.reportedOutputs?.[4]).toEqual({ role: "analyst", findingCount: 6, resultStatus: "partial" })
     expect(source.reportedOutputs?.[7]).toEqual({ role: "scout", candidateCount: 0, resultStatus: "completed" })
+    expect(source.taskGraph.discoveryTurnEligibility).toBe("ordinary")
+    expect(source.taskGraph.nodes[0]?.discoveryQueryFootprint).toMatchObject({
+      availability: "available", calls: [{ criteria: { targetRoles: ["Backend Engineer"], targetLocations: ["Dublin"],
+        source: "lever", pageSize: 20, hasCursor: true }, outcome: "completed", requestCount: 2, observedCandidateCount: 3 }],
+    })
+    const crossSessionProjection = projectLoadedRootTaskHistoryGraph(loaded, true)
+    expect(crossSessionProjection?.taskGraph).not.toHaveProperty("discoveryTurnEligibility")
+    expect(crossSessionProjection?.taskGraph.nodes[0]).not.toHaveProperty("discoveryQueryFootprint")
 
     const outcome: ValidatedRootTaskHistoryOutcome = {
       sourceTurnId: "PRIVATE_HISTORY_SOURCE_TURN", sourceRootTaskId: HISTORY_ROOT_ID, terminalSequence: 19n,
@@ -634,7 +669,8 @@ describe("canonical Turn context builder", () => {
       ...(source.nodeLessons ? { nodeLessons: source.nodeLessons } : {}),
       ...(source.reportedOutputs ? { reportedOutputs: source.reportedOutputs } : {}),
     }
-    const historyReader: DirectRootTaskHistoryReader = { load: vi.fn(async () => [outcome]) }
+    let historyOutcomes: readonly ValidatedRootTaskHistoryOutcome[] = [outcome]
+    const historyReader: DirectRootTaskHistoryReader = { load: vi.fn(async () => historyOutcomes) }
     const originalText = "FULL_ORIGINAL_ROOT_REFERENCE: Find senior data roles in Amsterdam while preserving the complete initial task."
     const steerText = "CURRENT_ACCEPTED_STEER_SENTINEL: prioritize roles with platform ownership."
     const rootInput: StoredAgentInput = {
@@ -714,6 +750,7 @@ describe("canonical Turn context builder", () => {
     const requestText = requestMessages.map(message => message.text).join("\n")
     const systemText = requestMessages.filter(message => message.role === "system").map(message => message.text).join("\n")
     const historyBlock = context.blocks.find(block => block.id === "observation:root-task-history")
+    expect(historyBlock?.content).not.toHaveProperty("historical")
     const graphBlock = context.blocks.find(block => block.id === "observation:task-graph-current")
     const historyJson = JSON.stringify(historyBlock?.content)
     const historyContent = historyBlock?.content as { turns?: Array<{ nodes?: Array<Record<string, unknown>> }> } | undefined
@@ -725,9 +762,11 @@ describe("canonical Turn context builder", () => {
     const scoutOutput = historyNodes.find(node => (node.reportedOutput as { candidateCount?: number } | undefined)?.candidateCount === 5)
     const analystOutput = historyNodes.find(node => (node.reportedOutput as { findingCount?: number } | undefined)?.findingCount === 6)
     const zeroOutput = historyNodes.find(node => (node.reportedOutput as { candidateCount?: number } | undefined)?.candidateCount === 0)
+    const scoutQueryHistory = historyNodes.find(node => node.priorScoutQueryFootprint !== undefined)
     const clarification = context.blocks.find(block => block.id === "planning-clarification:latest-answered-question")
 
-    expect(historyReader.load).toHaveBeenCalledWith({ lease, rootTaskId: "current-root-task", rootAttemptCount: 2, stepId: "step-history-composition", now })
+    expect(historyReader.load).toHaveBeenCalledWith({ lease, rootTaskId: "current-root-task", rootAttemptCount: 2,
+      stepId: "step-history-composition", now })
     expect(persistedCheckpoint).toEqual({ inputThroughSequence: 5n, consumedInputIds: [steerInput.id] })
     expect(context.inputThroughSequence).toBe(5n)
     expect(context.consumedInputIds).toEqual([steerInput.id])
@@ -755,6 +794,10 @@ describe("canonical Turn context builder", () => {
     expect(analystOutput).toMatchObject({ lesson: { nodeOrdinal: 5, passedCriteria: [{ criterionOrdinal: 1, status: "passed",
       check: { role: "analyst", kind: "finding_count_gte", minimum: 1 } }] } })
     expect(zeroOutput).toMatchObject({ reportedOutput: { role: "scout", candidateCount: 0, resultStatus: "completed" } })
+    expect(scoutQueryHistory).toMatchObject({ taskKind: "scout", lesson: { nodeOrdinal: 1 },
+      priorScoutQueryFootprint: { availability: "available", calls: [{ criteria: {
+        targetRoles: ["Backend Engineer"], targetLocations: ["Dublin"], source: "lever", pageSize: 20, hasCursor: true,
+      }, outcome: "completed", requestCount: 2, observedCandidateCount: 3, hasMore: true }] } })
     expect(historyNodes.find(node => node.taskKind === "scout" && node.status === "failed" && !(node.negativeReasonHints as unknown[] | undefined)?.includes("repair_target_unresolved")))
       .not.toHaveProperty("reportedOutput")
     expect(requestMessages.some(message => message.role === "user" && message.text.includes("root_task_history") && message.text.includes("UNTRUSTED_DATA"))).toBe(true)
@@ -769,6 +812,12 @@ describe("canonical Turn context builder", () => {
     expect(requestText).toContain('"candidateCount":5')
     expect(requestText).toContain('"findingCount":6')
     expect(requestText).toContain('"candidateCount":0')
+    expect(requestText).toContain('"priorScoutQueryFootprint"')
+    expect(requestText).toContain('"targetRoles":["Backend Engineer"]')
+    expect(requestText).toContain('"targetLocations":["Dublin"]')
+    expect(requestText).toContain('"hasCursor":true')
+    expect(requestText).not.toContain("discoveryTurnEligibility")
+    expect(requestText).not.toContain("discoveryAttempt")
     expect(requestText).toContain('"kind":"candidate_count_gte"')
     expect(requestText).toContain('"kind":"evidence_count_gte"')
     expect(requestText).toContain('"passedCriteria"')
@@ -784,14 +833,16 @@ describe("canonical Turn context builder", () => {
     expect(historyGuidance[0]?.text).toContain("preserve the valid plan")
     expect(historyGuidance[0]?.text).toContain("Historical typed-check descriptors distinguish count, evidence-completeness, score, Scout-dependency, and declared cohort-coverage checks in their source graph.")
     expect(historyGuidance[0]?.text).toContain("Historical passed-check descriptors are advisory source-graph checks only")
+    expect(historyGuidance[0]?.text).toContain("Historical Scout query footprints are advisory source-history observations only")
     expect(historyGuidance[0]?.text).toContain("past queries or results need not match current ones")
     expect(historyGuidance[0]?.text).not.toContain("root_task_history")
     for (const historicalFact of ["source_graph_local", "nodeOrdinal", "criterionOrdinal", "targetNodeOrdinal", "candidate_count_gte",
-      '"minimum":8', '"candidateCount":5', '"findingCount":6']) {
+      '"minimum":8', '"candidateCount":5', '"findingCount":6', "priorScoutQueryFootprint", "targetRoles", "Backend Engineer", "Dublin", "hasCursor"]) {
       expect(historyGuidance[0]?.text).not.toContain(historicalFact)
     }
     const privateValues = [
       HISTORY_ROOT_ID, "PRIVATE_HISTORY_SOURCE_TURN", "PRIVATE_HISTORY_GRAPH_ITEM", "PRIVATE_HISTORY_SCOUT_FAILURE", "PRIVATE_HISTORY_ANALYST_FAILURE",
+      "PRIVATE_QUERY_CURSOR_SENTINEL",
       "PRIVATE_HISTORY_ANALYST_REPAIR", "PRIVATE_HISTORY_SCOUT_TASK", "PRIVATE_HISTORY_ANALYST_TASK", "PRIVATE_HISTORY_REPAIR_TASK",
       "private-scout-count", "private-scout-evidence", "private-analyst-count-a", "private-analyst-count-b", "private-scout-repair-check",
       "PRIVATE_HISTORY_SCOUT_GOAL", "PRIVATE_HISTORY_ANALYST_GOAL", "PRIVATE_HISTORY_REPAIR_GOAL", "PRIVATE_SCOUT_JOB_1", "PRIVATE_ANALYST_JOB_1",
@@ -804,9 +855,47 @@ describe("canonical Turn context builder", () => {
       expect(requestText).not.toContain(privateValue)
       expect(historyGuidance[0]?.text).not.toContain(privateValue)
     }
+    expect(historyJson).not.toContain('"cursor"')
+    expect(scoutQueryHistory?.priorScoutQueryFootprint).not.toHaveProperty("cursor")
     const withoutHistory = { ...context, blocks: context.blocks.filter(block => block.id !== historyBlock?.id) }
     expect(buildCognitiveActionAgenda(context)).toEqual(buildCognitiveActionAgenda(withoutHistory))
     expect(progressCheckpointFromStepContext(context)).toEqual(progressCheckpointFromStepContext(withoutHistory))
+
+    historyOutcomes = [{
+      ...outcome, sourceTurnId: "PRIVATE_CROSS_SESSION_SOURCE_TURN", sourceRootTaskId: "PRIVATE_CROSS_SESSION_ROOT_ID",
+      terminalSequence: 18n, sourceSessionDiffers: true, terminalAt: new Date(now.getTime() - 60_000),
+      // Challenge the final serializer fence with a footprint-bearing cross-session source.
+      taskGraph: source.taskGraph,
+    }]
+    const crossSessionStepId = "step-history-cross-session"
+    const crossSessionBuilder = createCanonicalTurnContextBuilder({
+      pool: { connect: async () => { throw new Error("injected history readers and the base builder must avoid a database connection") } } as unknown as Pick<pg.Pool, "connect">,
+      store: claimStore, baseBuilder, scope, lease, rootTaskId: "current-root-task", rootAttemptCount: 2,
+      rootInputId: rootInput.id, planningEnabled: true, selectedJobMode: false, rootTaskHistoryDirectReader: historyReader,
+      crossSessionRootTaskHistoryEnabled: true,
+      currentRootBudgetReader: async () => unavailableBudget,
+    })
+    const crossSessionContext = await crossSessionBuilder.build({
+      scope, sessionId: lease.sessionId, turnId: lease.turnId, stepId: crossSessionStepId, snapshot: requestSnapshot,
+      rootInputId: rootInput.id, rootContextInputId: rootInput.id, mode: "new", now,
+      lease: { ownerId: lease.ownerId, leaseVersion: lease.leaseVersion, now },
+    })
+    const crossSessionRequest = buildModelRequest({
+      context: crossSessionContext, model, tools: [{ name: "agent.list", version: "1" }, { name: "agent.plan", version: "1" }],
+      sessionId: lease.sessionId, turnId: lease.turnId, stepId: crossSessionStepId, userId: scope.userId,
+      taskId: "current-root-task", signal: new AbortController().signal,
+    })
+    const crossSessionRequestText = crossSessionRequest.messages.flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+    const crossSessionHistory = crossSessionContext.blocks.find(block => block.id === "observation:root-task-history")
+    expect(crossSessionHistory?.content).toMatchObject({ historical: true, advisoryOnly: true, notCurrentEvidence: true })
+    expect(crossSessionRequestText).toContain('"taskKind":"scout"')
+    expect(crossSessionRequestText).not.toContain('"priorScoutQueryFootprint"')
+    expect(crossSessionRequestText).not.toContain('"targetRoles":["Backend Engineer"]')
+    expect(crossSessionRequestText).not.toContain("PRIVATE_QUERY_CURSOR_SENTINEL")
+    expect(crossSessionRequestText).not.toContain("discoveryTurnEligibility")
+    expect(historyReader.load).toHaveBeenCalledWith({ lease, rootTaskId: "current-root-task", rootAttemptCount: 2,
+      stepId: crossSessionStepId, now, crossSessionRootTaskHistoryEnabled: true })
   })
 
   it("keeps Root-task history disabled for selected-job turns", async () => {
