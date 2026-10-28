@@ -5,37 +5,13 @@ import { RefreshCw } from 'lucide-react'
 import { useApi } from '@/lib/hooks'
 import { useI18n } from '@/lib/i18n'
 import type { PersonalUsage } from '@/lib/personal-usage'
+import { SETTINGS_USAGE_COPY } from './settings-usage-copy'
 
 interface Activity { id: string; text: string; createdAt: string }
 
-const copy = {
-  en: {
-    title: 'Usage & activity', subtitle: 'Your recorded AI usage across ApplyMate.', period: 'Time range',
-    week: 'Last 7 days', month: 'Last 30 days', requests: 'AI requests', input: 'Input tokens', output: 'Output tokens',
-    daily: 'Daily requests', models: 'Usage by model', model: 'Model', tokens: 'Total tokens', date: 'Date',
-    activity: 'Recent activity', activityHint: 'Your latest 12 activity entries, across all dates.',
-    loading: 'Loading your usage…', loadingActivity: 'Loading activity…', retry: 'Try again', refresh: 'Refresh usage',
-    error: 'Usage is unavailable right now. Try again shortly.', activityError: 'Activity could not be loaded.',
-    empty: 'No recorded AI requests in this period.', noActivity: 'No activity recorded yet.',
-    scope: 'Includes completed and failed AI requests recorded for your account. Requests that have not run are excluded. Tokens measure AI input and output; provider usage records may be incomplete.',
-    dates: 'Dates use UTC. The current day is still in progress.', details: 'View daily numbers',
-  },
-  zh: {
-    title: '使用量与活动', subtitle: '查看你在 ApplyMate 中已记录的 AI 使用情况。', period: '统计时段',
-    week: '最近 7 天', month: '最近 30 天', requests: 'AI 请求次数', input: '输入 Token', output: '输出 Token',
-    daily: '每日请求', models: '按模型查看用量', model: '模型', tokens: 'Token 总量', date: '日期',
-    activity: '最近活动', activityHint: '最近 12 条活动记录，不受上方统计时段限制。',
-    loading: '正在加载使用量…', loadingActivity: '正在加载活动…', retry: '重试', refresh: '刷新使用量',
-    error: '暂时无法加载使用量，请稍后重试。', activityError: '暂时无法加载活动记录。',
-    empty: '这个时段还没有已记录的 AI 请求。', noActivity: '还没有活动记录。',
-    scope: '包含当前账号已记录的成功和失败 AI 请求，尚未执行的请求不计入。Token 用于衡量输入和输出，用量以提供商返回的记录为准，可能不完整。',
-    dates: '日期按 UTC 统计，今天的数据仍在更新。', details: '查看每日明细',
-  },
-}
-
 export function SettingsUsageActivity() {
   const { lang } = useI18n()
-  const c = copy[lang === 'zh' ? 'zh' : 'en']
+  const c = SETTINGS_USAGE_COPY[lang]
   const [days, setDays] = useState(30)
   const usage = useApi<PersonalUsage>(`/api/me/usage?days=${days}`, { cache: false })
   const activity = useApi<Activity[]>('/api/activity?limit=12', { cache: false })

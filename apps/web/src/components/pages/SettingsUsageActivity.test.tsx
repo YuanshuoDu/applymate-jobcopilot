@@ -2,6 +2,7 @@ import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { SettingsUsageActivity } from './SettingsUsageActivity'
+import { SETTINGS_USAGE_COPY } from './settings-usage-copy'
 
 const mocks = vi.hoisted(() => ({ api: vi.fn(), lang: 'en' }))
 vi.mock('@/lib/hooks', () => ({ useApi: mocks.api }))
@@ -20,6 +21,42 @@ beforeEach(() => {
 })
 
 describe('Personal usage in Settings', () => {
+  it.each([
+    ['en', 'Usage & activity'], ['de', 'Nutzung und Aktivitäten'], ['fr', 'Utilisation et activité'],
+    ['es', 'Uso y actividad'], ['nl', 'Gebruik en activiteit'], ['zh', '使用量与活动'],
+  ] as const)('uses the global %s setting for its menu, page, numbers and dates', async (lang, title) => {
+    mocks.lang = lang
+    const { translate } = await vi.importActual<typeof import('@/lib/i18n')>('@/lib/i18n')
+    const html = renderToStaticMarkup(<SettingsUsageActivity />)
+    expect(translate(lang, 'settings.usage')).toBe(title)
+    expect(html).toContain(title.replaceAll('&', '&amp;'))
+    expect(html).toContain(new Intl.NumberFormat(lang).format(1200))
+    expect(html).toContain(new Intl.DateTimeFormat(lang, { month: 'short', day: 'numeric', timeZone: 'UTC' }).format(new Date(recorded.from)))
+    expect(html).toContain('Saved a role for review &lt;script&gt;')
+  })
+
+  it.each(['en', 'de', 'fr', 'es', 'nl', 'zh'] as const)('localizes loading, failure and empty states in %s', (lang) => {
+    mocks.lang = lang
+    const labels = SETTINGS_USAGE_COPY[lang]
+    mocks.api.mockImplementation(() => ({ data: null, loading: true, error: null, refetch: vi.fn() }))
+    let html = renderToStaticMarkup(<SettingsUsageActivity />)
+    expect(html).toContain(labels.loading)
+    expect(html).toContain(labels.loadingActivity)
+
+    mocks.api.mockImplementation(() => ({ data: null, loading: false, error: 'unavailable', refetch: vi.fn() }))
+    html = renderToStaticMarkup(<SettingsUsageActivity />)
+    expect(html).toContain(labels.error)
+    expect(html).toContain(labels.activityError)
+    expect(html).toContain(labels.retry)
+    expect(html.match(/role="alert"/g)).toHaveLength(2)
+
+    mocks.api.mockImplementation((url: string) => ({ data: url.startsWith('/api/me/usage') ? { ...recorded, summary: { calls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 }, daily: [], models: [] } : [], loading: false, error: null, refetch: vi.fn() }))
+    html = renderToStaticMarkup(<SettingsUsageActivity />)
+    expect(html).toContain(labels.empty)
+    expect(html).toContain(labels.noActivity)
+    expect(html).not.toContain('role="img"')
+  })
+
   it('shows recorded usage and recent activity with distinct period definitions and no quality score', () => {
     const html = renderToStaticMarkup(<SettingsUsageActivity />)
     expect(mocks.api).toHaveBeenCalledWith('/api/me/usage?days=30', { cache: false })
