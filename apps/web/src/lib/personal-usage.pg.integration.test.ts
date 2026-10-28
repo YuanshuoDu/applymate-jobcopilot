@@ -95,9 +95,9 @@ describePg('personal usage with disposable PostgreSQL', () => {
         ('b','owner-b','agent','x','m','worker','success',3,4,CURRENT_TIMESTAMP),
         ('system',NULL,'agent','x','m','admin','success',0,0,CURRENT_TIMESTAMP)`)
       // Owner bypass remains available to trusted workers and admin operations.
-      expect((await tx.$queryRawUnsafe<Array<{count: bigint}>>('SELECT count(*) AS count FROM ai_usage_events'))[0].count).toBe(3n)
+      expect((await tx.$queryRawUnsafe<Array<{count: bigint}>>('SELECT count(*) AS count FROM ai_usage_events'))[0].count).toBe(BigInt(3))
       await tx.$executeRawUnsafe('SET LOCAL ROLE applymate_candidate')
-      expect((await tx.$queryRawUnsafe<Array<{count: bigint}>>('SELECT count(*) AS count FROM ai_usage_events'))[0].count).toBe(0n)
+      expect((await tx.$queryRawUnsafe<Array<{count: bigint}>>('SELECT count(*) AS count FROM ai_usage_events'))[0].count).toBe(BigInt(0))
       await tx.$executeRawUnsafe("SELECT set_config('app.user_id','owner-a',true)")
       expect((await tx.$queryRawUnsafe<Array<{id: string}>>('SELECT id FROM ai_usage_events')).map(row => row.id)).toEqual(['a'])
       await tx.$executeRawUnsafe("INSERT INTO ai_usage_events VALUES ('a2','owner-a','agent','x','m','web','success',1,2,CURRENT_TIMESTAMP)")
