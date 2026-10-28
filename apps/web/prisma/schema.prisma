@@ -1467,9 +1467,10 @@ model AiUsageEvent {
   latencyMs        Int      @map("latency_ms")
   status           String
   errorCode        String?  @map("error_code")
-  createdAt        DateTime @default(now()) @map("created_at")
+  createdAt        DateTime @default(dbgenerated("timezone('UTC'::text, CURRENT_TIMESTAMP)")) @map("created_at")
   user             User?    @relation("AiUsageUser", fields: [userId], references: [id], onDelete: SetNull)
 
+  @@index([userId, createdAt])
   @@index([createdAt, status])
   @@index([featureKey, createdAt])
   @@index([provider, model, createdAt])

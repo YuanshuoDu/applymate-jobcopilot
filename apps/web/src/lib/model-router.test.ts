@@ -42,7 +42,24 @@ describe('model catalogue and MiniMax compatibility', () => {
     expect(fetchMock.mock.calls[0][0]).toBe('https://api.minimax.io/v1/chat/completions')
   })
 
+  it.each(['success', 'error'] as const)('preserves an explicit no-credit owner context for a fallback %s', async status => {
+    recordAiUsage.mockClear()
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(status === 'success'
+      ? new Response(JSON.stringify({ choices: [{ message: { content: 'ok' } }], usage: { prompt_tokens: 4, completion_tokens: 2 } }))
+      : new Response('provider unavailable', { status: 503 }))
+    const call = modelChat([{ role: 'user', content: 'Ping' }], {
+      provider: 'minimax', model: 'MiniMax-M3', apiKey: 'test-key',
+    }, 100, { userId: 'owner-1', featureKey: 'coverLetter', runtime: 'web', chargeBudget: false })
+    if (status === 'success') await expect(call).resolves.toMatchObject({ text: 'ok' })
+    else await expect(call).rejects.toThrow('minimax API error 503')
+    expect(recordAiUsage).toHaveBeenCalledTimes(1)
+    expect(recordAiUsage).toHaveBeenCalledWith(expect.objectContaining({
+      userId: 'owner-1', featureKey: 'coverLetter', runtime: 'web', chargeBudget: false, status,
+    }))
+  })
+
   it('requests and records usage for OpenAI-compatible streams', async () => {
+    recordAiUsage.mockClear()
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response([
       'data: {"choices":[{"delta":{"content":"hello"}}]}',
       'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7}}',
@@ -58,7 +75,72 @@ describe('model catalogue and MiniMax compatibility', () => {
     expect(chunks.join('')).toBe('hello')
     const body = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))
     expect(body.stream_options).toEqual({ include_usage: true })
+    expect(recordAiUsage).toHaveBeenCalledTimes(1)
     expect(recordAiUsage).toHaveBeenLastCalledWith(expect.objectContaining({ inputTokens: 11, outputTokens: 7 }))
+    expect(recordAiUsage.mock.calls[0][0]).not.toHaveProperty('chargeBudget')
+  })
+
+  it('records an early consumer return exactly once without charging credits or fabricating tokens', async () => {
+    recordAiUsage.mockClear()
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response([
+      'data: {"choices":[{"delta":{"content":"a sufficiently long first response"}}],"usage":{"prompt_tokens":11}}',
+      'data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":11,"completion_tokens":7}}',
+      'data: [DONE]', '',
+    ].join('\n')))
+    const stream = modelChatStream([{ role: 'user', content: 'Say hello.' }], {
+      provider: 'minimax', model: 'MiniMax-M3', apiKey: 'test-key',
+      usageUserId: 'owner-1', usageFeatureKey: 'scoring', usageRuntime: 'web',
+    })
+    expect((await stream.next()).done).toBe(false)
+    await stream.return(undefined)
+    await stream.return(undefined)
+
+    expect(recordAiUsage).toHaveBeenCalledTimes(1)
+    expect(recordAiUsage).toHaveBeenCalledWith(expect.objectContaining({
+      userId: 'owner-1', featureKey: 'scoring', runtime: 'web', provider: 'minimax', model: 'MiniMax-M3',
+      status: 'error', inputTokens: 11, outputTokens: undefined, chargeBudget: false,
+    }))
+  })
+
+  it('records a failed stream only once with the existing credit behavior', async () => {
+    recordAiUsage.mockClear()
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('provider unavailable', { status: 503 }))
+    const stream = modelChatStream([{ role: 'user', content: 'Say hello.' }], {
+      provider: 'minimax', model: 'MiniMax-M3', apiKey: 'test-key', usageUserId: 'owner-1',
+    })
+    await expect(stream.next()).rejects.toThrow('minimax API error 503')
+    expect(recordAiUsage).toHaveBeenCalledTimes(1)
+    expect(recordAiUsage).toHaveBeenCalledWith(expect.objectContaining({ userId: 'owner-1', status: 'error' }))
+    expect(recordAiUsage.mock.calls[0][0]).not.toHaveProperty('chargeBudget')
+  })
+
+  it('keeps observed partial usage when a running stream throws', async () => {
+    recordAiUsage.mockClear()
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response([
+      'data: {"choices":[{"delta":{"content":"a sufficiently long first response"}}],"usage":{"prompt_tokens":11}}',
+      'data: [DONE]', '',
+    ].join('\n')))
+    const stream = modelChatStream([{ role: 'user', content: 'Say hello.' }], {
+      provider: 'minimax', model: 'MiniMax-M3', apiKey: 'test-key', usageUserId: 'owner-1',
+    })
+    expect((await stream.next()).done).toBe(false)
+    await expect(stream.throw(new Error('interrupted'))).rejects.toThrow('interrupted')
+    expect(recordAiUsage).toHaveBeenCalledTimes(1)
+    expect(recordAiUsage).toHaveBeenCalledWith(expect.objectContaining({
+      userId: 'owner-1', status: 'error', inputTokens: 11, outputTokens: undefined,
+    }))
+    expect(recordAiUsage.mock.calls[0][0]).not.toHaveProperty('chargeBudget')
+  })
+
+  it('does not record or charge a stream closed before it is started', async () => {
+    recordAiUsage.mockClear()
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    const stream = modelChatStream([{ role: 'user', content: 'Say hello.' }], {
+      provider: 'minimax', model: 'MiniMax-M3', apiKey: 'test-key', usageUserId: 'owner-1',
+    })
+    await stream.return(undefined)
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(recordAiUsage).not.toHaveBeenCalled()
   })
 
   it('reports an empty final answer with the provider finish reason', async () => {

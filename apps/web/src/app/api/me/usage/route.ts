@@ -24,7 +24,7 @@ export async function GET(request: NextRequest) {
     const usage = await runWithTenantContext(auth.userId, () => db.$transaction(tx =>
       readPersonalUsage(tx, auth.userId, days),
     ))
-    return NextResponse.json(usage, { headers })
+    return NextResponse.json({ ...usage, ownerId: auth.userId }, { headers })
   } catch {
     return NextResponse.json({ error: 'Usage data is temporarily unavailable' }, { status: 503, headers })
   }

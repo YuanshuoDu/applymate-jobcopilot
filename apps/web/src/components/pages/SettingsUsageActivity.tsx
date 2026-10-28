@@ -1,73 +1,59 @@
 'use client'
 
-import React, { useState } from 'react'
+import React, { useCallback, useEffect, useState } from 'react'
 import { RefreshCw } from 'lucide-react'
+import { useSession } from 'next-auth/react'
 import { useApi } from '@/lib/hooks'
 import { useI18n } from '@/lib/i18n'
-import type { PersonalUsage } from '@/lib/personal-usage'
+import type { PersonalUsageDays } from '@/lib/personal-usage'
 import { SETTINGS_USAGE_COPY } from './settings-usage-copy'
-
-interface Activity { id: string; text: string; createdAt: string }
+import { validPersonalActivity, validPersonalUsage } from './settings-usage-validation'
 
 export function SettingsUsageActivity() {
   const { lang } = useI18n()
+  const { status, data: session } = useSession()
   const c = SETTINGS_USAGE_COPY[lang]
-  const [days, setDays] = useState(30)
-  const usage = useApi<PersonalUsage>(`/api/me/usage?days=${days}`, { cache: false })
-  const activity = useApi<Activity[]>('/api/activity?limit=12', { cache: false })
-  const data = usage.data?.days === days ? usage.data : null
-  const number = (value: number) => new Intl.NumberFormat(lang).format(value)
-  const day = (value: string) => new Intl.DateTimeFormat(lang, { month: 'short', day: 'numeric', timeZone: 'UTC' }).format(new Date(value))
-  const timestamp = (value: string) => new Intl.DateTimeFormat(lang, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value))
-  const refresh = () => { void usage.refetch(); void activity.refetch() }
-  const maxCalls = Math.max(1, ...(data?.daily.map(row => row.calls) ?? []))
+  if (status === 'loading') return <section aria-label={c.title}><p role="status">{c.checkingSession}</p></section>
+  const userId = status === 'authenticated' ? session?.user?.id : null
+  if (typeof userId !== 'string' || !userId.trim()) return <section aria-label={c.title}><p role="status">{c.signInRequired}</p></section>
+  // Unmount all request state immediately when the authenticated owner changes.
+  return <AccountUsage key={userId} ownerId={userId} />
+}
 
+type UsageControl = { days: PersonalUsageDays; loading: boolean; refetch: () => Promise<void> }
+
+function AccountUsage({ ownerId }: { ownerId: string }) {
+  const { lang } = useI18n()
+  const c = SETTINGS_USAGE_COPY[lang]
+  const [days, setDays] = useState<PersonalUsageDays>(30)
+  const [usageControl, setUsageControl] = useState<UsageControl | null>(null)
+  const onUsageControl = useCallback((control: UsageControl) => setUsageControl(control), [])
+  const activity = useApi<unknown>('/api/me/activity', { cache: false })
+  const activities = validPersonalActivity(activity.data, ownerId) ? activity.data.items : null
+  const currentUsage = usageControl?.days === days ? usageControl : null
+  const timestamp = (value: string) => new Intl.DateTimeFormat(lang, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value))
+  const refresh = () => { if (currentUsage) void currentUsage.refetch(); void activity.refetch() }
+  const changePeriod = (value: string) => {
+    const nextDays = value === '7' ? 7 : 30
+    if (nextDays !== days) { setUsageControl(null); setDays(nextDays) }
+  }
   return <section className="settings-usage" aria-label={c.title}>
     <header className="settings-usage-header">
       <div><h2>{c.title}</h2><p>{c.subtitle}</p></div>
       <div className="settings-usage-controls">
-        <label><span className="sr-only">{c.period}</span><select aria-label={c.period} value={days} disabled={usage.loading} onChange={event => setDays(Number(event.target.value))}>
+        <label><span className="sr-only">{c.period}</span><select aria-label={c.period} value={days} onChange={event => changePeriod(event.target.value)}>
           <option value={7}>{c.week}</option><option value={30}>{c.month}</option>
         </select></label>
-        <button type="button" onClick={refresh} aria-label={c.refresh} disabled={usage.loading || activity.loading}><RefreshCw size={16} aria-hidden="true" /></button>
+        <button type="button" onClick={refresh} aria-label={c.refresh} disabled={!currentUsage || currentUsage.loading || activity.loading}><RefreshCw size={16} aria-hidden="true" /></button>
       </div>
     </header>
-    {usage.error ? <div role="alert" className="settings-usage-card"><p>{c.error}</p><button type="button" onClick={() => void usage.refetch()}>{c.retry}</button></div>
-      : usage.loading || !data ? <p role="status">{c.loading}</p> : <>
-        <div className="settings-usage-metrics">
-          {[{ label: c.requests, value: data.summary.calls }, { label: c.input, value: data.summary.inputTokens }, { label: c.output, value: data.summary.outputTokens }].map(metric =>
-            <div className="settings-usage-card" key={metric.label}><span>{metric.label}</span><strong>{number(metric.value)}</strong></div>)}
-        </div>
-        <p className="settings-usage-note">{c.scope}</p>
-        <section className="settings-usage-card">
-          <h3>{c.daily}</h3>
-          <p className="settings-usage-note">{day(data.from)} – {day(data.to)} · {c.dates}</p>
-          {data.summary.calls === 0 ? <p>{c.empty}</p> : <>
-            <div className="settings-usage-chart" role="img" aria-label={`${c.daily}: ${day(data.from)} – ${day(data.to)}. ${c.details}`}>
-              {data.daily.map(row => <div key={row.date} className="settings-usage-bar-column" title={`${day(row.date)}: ${number(row.calls)}`}>
-                <div className="settings-usage-bar" style={{ height: `${row.calls / maxCalls * 100}%` }} />
-              </div>)}
-            </div>
-            <div className="settings-usage-axis"><span>{day(data.from)}</span><span>{day(data.to)}</span></div>
-          </>}
-          <details><summary>{c.details}</summary><div className="settings-usage-table-scroll">
-            <table><caption className="sr-only">{c.daily}</caption><thead><tr><th scope="col">{c.date}</th><th scope="col">{c.requests}</th><th scope="col">{c.tokens}</th></tr></thead>
-              <tbody>{data.daily.map(row => <tr key={row.date}><th scope="row">{day(row.date)}</th><td>{number(row.calls)}</td><td>{number(row.totalTokens)}</td></tr>)}</tbody></table>
-          </div></details>
-        </section>
-        {data.models.length > 0 && <section className="settings-usage-card">
-          <h3>{c.models}</h3><div className="settings-usage-table-scroll">
-            <table><caption className="sr-only">{c.models}</caption><thead><tr><th scope="col">{c.model}</th><th scope="col">{c.requests}</th><th scope="col">{c.tokens}</th></tr></thead>
-              <tbody>{data.models.map(row => <tr key={JSON.stringify([row.provider, row.model])}><th scope="row">{row.model}<small>{row.provider}</small></th><td>{number(row.calls)}</td><td>{number(row.totalTokens)}</td></tr>)}</tbody></table>
-          </div>
-        </section>}
-      </>}
+    <UsageDetails key={days} days={days} ownerId={ownerId} onUsageControl={onUsageControl} />
     <section className="settings-usage-card">
       <h3>{c.activity}</h3><p className="settings-usage-note">{c.activityHint}</p>
-      {activity.error ? <div role="alert"><p>{c.activityError}</p><button type="button" onClick={() => void activity.refetch()}>{c.retry}</button></div>
+      {!activity.loading && (activity.error || !activities) ? <div role="alert"><p>{c.activityError}</p><button type="button" onClick={() => void activity.refetch()}>{c.retry}</button></div>
         : activity.loading ? <p role="status">{c.loadingActivity}</p>
-          : !activity.data?.length ? <p>{c.noActivity}</p> : <ul className="settings-usage-activity">
-            {activity.data.map(row => <li key={row.id}><span>{row.text}</span><time dateTime={row.createdAt}>{timestamp(row.createdAt)}</time></li>)}
+          : !activities?.length ? <p>{c.noActivity}</p> : <ul className="settings-usage-activity">
+            {activities.map(row => <li key={row.id}><span>{row.text}</span><time dateTime={row.createdAt}>{timestamp(row.createdAt)}</time></li>)}
           </ul>}
     </section>
     <style>{`
@@ -98,4 +84,48 @@ export function SettingsUsageActivity() {
       @media(max-width: 600px) { .settings-usage-card { padding: 14px; } .settings-usage-metrics { gap: 8px; } .settings-usage-metrics strong { font-size: 20px; } .settings-usage-activity li { flex-direction: column; gap: 5px; } }
     `}</style>
   </section>
+}
+
+
+function UsageDetails({ days, ownerId, onUsageControl }: { days: PersonalUsageDays; ownerId: string; onUsageControl: (control: UsageControl) => void }) {
+  const { lang } = useI18n()
+  const c = SETTINGS_USAGE_COPY[lang]
+  const usage = useApi<unknown>(`/api/me/usage?days=${days}`, { cache: false })
+  const data = validPersonalUsage(usage.data, days, ownerId) ? usage.data : null
+  const number = (value: number) => new Intl.NumberFormat(lang).format(value)
+  const day = (value: string) => new Intl.DateTimeFormat(lang, { month: 'short', day: 'numeric', timeZone: 'UTC' }).format(new Date(value))
+  const maxCalls = Math.max(1, ...(data?.daily.map(row => row.calls) ?? []))
+  useEffect(() => { onUsageControl({ days, loading: usage.loading, refetch: usage.refetch }) }, [days, usage.loading, usage.refetch, onUsageControl])
+  return <>
+    {!usage.loading && (usage.error || !data) ? <div role="alert" className="settings-usage-card"><p>{c.error}</p><button type="button" onClick={() => void usage.refetch()}>{c.retry}</button></div>
+      : usage.loading || !data ? <p role="status">{c.loading}</p> : <>
+        <div className="settings-usage-metrics">
+          {[{ label: c.requests, value: data.summary.calls }, { label: c.input, value: data.summary.inputTokens }, { label: c.output, value: data.summary.outputTokens }].map(metric =>
+            <div className="settings-usage-card" key={metric.label}><span>{metric.label}</span><strong>{number(metric.value)}</strong></div>)}
+        </div>
+        <p className="settings-usage-note">{c.scope}</p>
+        <section className="settings-usage-card">
+          <h3>{c.daily}</h3>
+          <p className="settings-usage-note">{day(data.from)} – {day(data.to)} · {c.dates}</p>
+          {data.summary.calls === 0 ? <p>{c.empty}</p> : <>
+            <div className="settings-usage-chart" role="img" aria-label={`${c.daily}: ${day(data.from)} – ${day(data.to)}. ${c.details}`}>
+              {data.daily.map(row => <div key={row.date} className="settings-usage-bar-column" title={`${day(row.date)}: ${number(row.calls)}`}>
+                <div className="settings-usage-bar" style={{ height: `${row.calls / maxCalls * 100}%` }} />
+              </div>)}
+            </div>
+            <div className="settings-usage-axis"><span>{day(data.from)}</span><span>{day(data.to)}</span></div>
+          </>}
+          <details><summary>{c.details}</summary><div className="settings-usage-table-scroll">
+            <table><caption className="sr-only">{c.daily}</caption><thead><tr><th scope="col">{c.date}</th><th scope="col">{c.requests}</th><th scope="col">{c.tokens}</th></tr></thead>
+              <tbody>{data.daily.map(row => <tr key={row.date}><th scope="row">{day(row.date)}</th><td>{number(row.calls)}</td><td>{number(row.totalTokens)}</td></tr>)}</tbody></table>
+          </div></details>
+        </section>
+        {data.models.length > 0 && <section className="settings-usage-card">
+          <h3>{c.models}</h3><div className="settings-usage-table-scroll">
+            <table><caption className="sr-only">{c.models}</caption><thead><tr><th scope="col">{c.model}</th><th scope="col">{c.requests}</th><th scope="col">{c.tokens}</th></tr></thead>
+              <tbody>{data.models.map(row => <tr key={JSON.stringify([row.provider, row.model])}><th scope="row">{row.model}<small>{row.provider}</small></th><td>{number(row.calls)}</td><td>{number(row.totalTokens)}</td></tr>)}</tbody></table>
+          </div>
+        </section>}
+      </>}
+  </>
 }

@@ -277,7 +277,7 @@ export function SettingsPage() {
     { id: 'usage', label: t('settings.usage') },
     { id: 'appearance', label: t('settings.appearance') },
     { id: 'accounts', label: t('settings.accounts') },
-    { id: 'apiKeys',  label: 'Keys & connections'   },
+    { id: 'apiKeys',  label: t('settings.keysConnections') },
     { id: 'billing',  label: t('settings.billing')  },
     { id: 'notifs',   label: t('settings.notifs')   },
     { id: 'privacy',  label: t('settings.privacy')  },
