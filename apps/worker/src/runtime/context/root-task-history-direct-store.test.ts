@@ -22,6 +22,7 @@ type Options = Readonly<{
   reportedOutput?: boolean
   sourceSessionStatusAtGraphLoad?: "archived" | "aborted"
   sourceSessionLockedAtGraphLoad?: boolean
+  tenantScope?: string | null
 }>
 
 function candidate(index: number, terminalSequence = String(index * 2 + 2), status: "completed" | "failed" | "interrupted" = "completed"): Row {
@@ -73,11 +74,15 @@ function currentStart(sequence = "1000"): Row {
 
 function fixture(options: Options = {}) {
   const queries: Array<{ sql: string; values?: readonly unknown[] }> = []
+  let connects = 0
+  let tenantScope = options.tenantScope === undefined ? "user-1" : options.tenantScope
   const sourceRows = options.candidates ?? [candidate(1)]
   const client = {
     async query(sql: string, values?: readonly unknown[]) {
       queries.push({ sql, values })
-      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
+      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql)) return { rows: [], rowCount: 1 }
+      if (sql.includes("set_config")) { tenantScope = String(values?.[1]); return { rows: [], rowCount: 1 } }
+      if (sql.includes("current_setting('app.user_id'")) return { rows: [{ userId: tenantScope }] }
       if (sql.includes("FOR SHARE")) return { rows: options.sourceSessionStatusAtGraphLoad || options.sourceSessionLockedAtGraphLoad ? [] : [{ id: values?.[0] }] }
       if (sql.includes('SELECT "id" FROM "agent_sessions"')) return { rows: [{ id: "session-1" }] }
       if (sql.includes('SELECT "id" FROM "agent_turns"')) return { rows: [{ id: "turn-current" }] }
@@ -147,16 +152,59 @@ function fixture(options: Options = {}) {
     },
     release() { /* test client */ },
   }
-  const pool = { connect: async () => client } as unknown as Pick<pg.Pool, "connect">
+  const pool = { connect: async () => { connects += 1; return client } } as unknown as Pick<pg.Pool, "connect">
   const input: DirectRootTaskHistoryLoadInput = {
     lease: { turnId: "turn-current", sessionId: "session-1", ownerId: "worker", userId: "user-1", leaseVersion: 3,
       leaseStartedAt: new Date(1), leaseExpiresAt: new Date(10_000) },
     rootTaskId: "root-current", rootAttemptCount: 2, stepId: "step-current", now: new Date(2_000),
   }
-  return { store: createPgDirectRootTaskHistoryStore(pool), input, queries }
+  return { store: createPgDirectRootTaskHistoryStore(pool), input, queries, client: client as unknown as pg.PoolClient,
+    get tenantScope() { return tenantScope },
+    get connects() { return connects } }
 }
 
 describe("direct Root-task history PostgreSQL store", () => {
+  it("reads only under the caller's matching tenant scope without opening or changing a transaction", async () => {
+    const test = fixture()
+    const outcomes = await test.store.loadWithClient(test.client, test.input)
+
+    expect(outcomes.map(value => value.sourceTurnId)).toEqual(["turn-source-1"])
+    expect(test.connects).toBe(0)
+    expect(test.queries.filter(query => query.sql.includes("current_setting('app.user_id'")).length).toBe(1)
+    expect(test.queries.some(query => query.sql.includes("set_config"))).toBe(false)
+    expect(test.tenantScope).toBe("user-1")
+    expect(test.queries.some(query => ["BEGIN", "COMMIT", "ROLLBACK"].includes(query.sql))).toBe(false)
+  })
+
+  it.each([
+    ["another user's scope", "tenant-a"],
+    ["no scope", null],
+  ] as const)("rejects %s before reading history and never overwrites it", async (_label, tenantScope) => {
+    const test = fixture({ tenantScope })
+    await expect(test.store.loadWithClient(test.client, test.input)).rejects.toThrow("root_task_history_scope_mismatch")
+    expect(test.connects).toBe(0)
+    expect(test.tenantScope).toBe(tenantScope)
+    expect(test.queries.some(query => query.sql.includes("set_config"))).toBe(false)
+    expect(test.queries.some(query => query.sql.includes("WITH terminal_window AS MATERIALIZED"))).toBe(false)
+    expect(test.queries.some(query => query.sql.includes('FROM "agent_items" AS item'))).toBe(false)
+  })
+
+  it("leaves callback transaction rollback to its owner and preserves the legacy load wrapper", async () => {
+    const callback = fixture({ candidateError: Object.assign(new Error("db unavailable"), { code: "42501" }) })
+    await expect(callback.store.loadWithClient(callback.client, callback.input)).rejects.toMatchObject({ code: "42501" })
+    expect(callback.connects).toBe(0)
+    expect(callback.queries.some(query => ["BEGIN", "COMMIT", "ROLLBACK"].includes(query.sql))).toBe(false)
+
+    const legacy = fixture()
+    await expect(legacy.store.load(legacy.input)).resolves.toHaveLength(1)
+    expect(legacy.connects).toBe(1)
+    expect(legacy.queries[0]?.sql).toBe("BEGIN")
+    expect(legacy.queries[1]?.sql).toContain("set_config")
+    expect(legacy.queries[1]?.values).toEqual(["app.user_id", "user-1"])
+    expect(legacy.tenantScope).toBe("user-1")
+    expect(legacy.queries.at(-1)?.sql).toBe("COMMIT")
+  })
+
   it("binds exact canonical objectives across distinct source Root IDs and reloads only their scoped graphs", async () => {
     const first = candidate(1), second = candidate(2, "8", "failed")
     const mismatch = { ...candidate(3), goal: "Different goal" }

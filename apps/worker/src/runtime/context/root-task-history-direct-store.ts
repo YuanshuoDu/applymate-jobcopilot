@@ -52,28 +52,40 @@ async function graphForCandidate(client: Client, input: RootTaskHistoryFenceInpu
   }
 }
 
+async function assertTenantScope(client: Client, userId: string): Promise<void> {
+  const result = await client.query<{ userId: string | null }>(`SELECT current_setting('app.user_id', true) AS "userId"`)
+  if (result.rows.length !== 1 || result.rows[0]?.userId !== userId) throw new Error("root_task_history_scope_mismatch")
+}
+
 export function createPgDirectRootTaskHistoryStore(pool: Pool) {
+  async function readWithClient(client: Client, input: DirectRootTaskHistoryLoadInput): Promise<readonly ValidatedRootTaskHistoryOutcome[]> {
+    const fence = await readRootTaskHistoryFence(client, input)
+    if (!fence) return []
+    const sources = await readRootTaskHistoryCandidates(client, input, fence)
+    const outcomes: ValidatedRootTaskHistoryOutcome[] = []
+    let graphLoads = 0
+    for (const source of sources) {
+      if (graphLoads >= GRAPH_LOAD_LIMIT) break
+      graphLoads += 1
+      const graph = await graphForCandidate(client, input, source)
+      if (graph) outcomes.push({ sourceTurnId: source.turnId, sourceRootTaskId: source.rootTaskId,
+        terminalSequence: source.terminalSequence, ...(source.terminalAt ? { terminalAt: source.terminalAt } : {}),
+        ...(input.crossSessionRootTaskHistoryEnabled === true ? { sourceSessionDiffers: source.sessionId !== input.lease.sessionId } : {}),
+        taskGraph: graph.taskGraph, sourceNodeOrdinals: graph.sourceNodeOrdinals,
+        ...(graph.nodeLessons ? { nodeLessons: graph.nodeLessons } : {}), ...(graph.reportedOutputs ? { reportedOutputs: graph.reportedOutputs } : {}) })
+    }
+    return outcomes
+  }
+
   return {
+    async loadWithClient(client: Client, input: DirectRootTaskHistoryLoadInput): Promise<readonly ValidatedRootTaskHistoryOutcome[]> {
+      validateRootTaskHistoryFenceInput(input)
+      await assertTenantScope(client, input.lease.userId)
+      return readWithClient(client, input)
+    },
     async load(input: DirectRootTaskHistoryLoadInput): Promise<readonly ValidatedRootTaskHistoryOutcome[]> {
       validateRootTaskHistoryFenceInput(input)
-      return withRootTaskHistoryTransaction(pool, input.lease.userId, async client => {
-        const fence = await readRootTaskHistoryFence(client, input)
-        if (!fence) return []
-        const sources = await readRootTaskHistoryCandidates(client, input, fence)
-        const outcomes: ValidatedRootTaskHistoryOutcome[] = []
-        let graphLoads = 0
-        for (const source of sources) {
-          if (graphLoads >= GRAPH_LOAD_LIMIT) break
-          graphLoads += 1
-          const graph = await graphForCandidate(client, input, source)
-          if (graph) outcomes.push({ sourceTurnId: source.turnId, sourceRootTaskId: source.rootTaskId,
-            terminalSequence: source.terminalSequence, ...(source.terminalAt ? { terminalAt: source.terminalAt } : {}),
-            ...(input.crossSessionRootTaskHistoryEnabled === true ? { sourceSessionDiffers: source.sessionId !== input.lease.sessionId } : {}),
-            taskGraph: graph.taskGraph, sourceNodeOrdinals: graph.sourceNodeOrdinals,
-            ...(graph.nodeLessons ? { nodeLessons: graph.nodeLessons } : {}), ...(graph.reportedOutputs ? { reportedOutputs: graph.reportedOutputs } : {}) })
-        }
-        return outcomes
-      })
+      return withRootTaskHistoryTransaction(pool, input.lease.userId, client => readWithClient(client, input))
     },
   }
 }
