@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { TASK_GRAPH_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
+import { projectFinalAnswerContent } from "./final-answer-evidence-projection"
 
 import { isPrivateNativeVerificationEventType, redactStreamEventPayload, redactStreamString, redactStreamValue } from "./stream-redaction"
 
@@ -36,6 +37,74 @@ function content(nodes: unknown[], schemaVersion = graphVersion, extra: Record<s
 describe("agent stream redaction", () => {
   it("redacts credential-shaped strings", () => {
     expect(redactStreamString("Bearer very-secret-token sk-12345678")).toBe("Bearer [REDACTED] [REDACTED]")
+  })
+
+  it("projects completed final event content to the same safe DTO as timeline replay", () => {
+    const text = "A match. [[source:S1]] Filtered [[source:S2]] Unknown [[source:E-private-key]] malformed [[source:S1]"
+    const payload = {
+      itemId: "final-item", status: "completed",
+      content: {
+        text,
+        final: {
+          response: text, summary: "Good fit.",
+          answerEvidence: {
+            schemaVersion: 1,
+            sources: [
+              { key: "S1", kind: "job", label: "Engineer at Example Co", excerpt: "Dublin. alex@example.test" },
+              { key: "S2", kind: "job", label: "Private listing", excerpt: "https://private.example/job" },
+            ],
+          },
+          evidenceRefs: ["PRIVATE_TOOL_CALL_ID"], usage: { tokens: 9 }, goal: "PRIVATE_GOAL",
+        },
+      },
+    }
+    const projected = redactStreamEventPayload("item.completed", payload, { ...identity, itemId: "final-item" })
+    expect(projected).toEqual({
+      itemId: "final-item", status: "completed",
+      content: {
+        text: "A match. [[source:S1]] Filtered  Unknown  malformed ", summary: "Good fit.",
+        answerEvidence: {
+          schemaVersion: 1,
+          sources: [{ key: "S1", kind: "job", label: "Engineer at Example Co", excerpt: "Dublin. [REDACTED_EMAIL]" }],
+        },
+      },
+    })
+    expect((projected as { content: unknown }).content).toEqual(projectFinalAnswerContent(payload.content))
+    expect(JSON.stringify(projected)).not.toMatch(/PRIVATE_TOOL_CALL_ID|PRIVATE_GOAL|private\.example|alex@example\.test/)
+  })
+
+  it("preserves legacy markers without evidence and removes all markers when evidence is rejected", () => {
+    const legacyText = "Saved answer [[source:E-old-key]] and [[source:S9]]."
+    const legacy = redactStreamEventPayload("item.completed", {
+      itemId: "final-item", status: "completed",
+      content: { text: legacyText, final: { response: legacyText } },
+    }, { ...identity, itemId: "final-item" })
+    const rejectedText = "Keep prose [[source:S1]] and [[source:E-private-key]]."
+    const rejected = redactStreamEventPayload("item.completed", {
+      itemId: "final-item", status: "completed",
+      content: {
+        text: rejectedText,
+        final: {
+          response: rejectedText,
+          answerEvidence: {
+            schemaVersion: 1,
+            sources: [{ key: "S1", kind: "job", label: "Private", excerpt: "https://private.example/job" }],
+          },
+        },
+      },
+    }, { ...identity, itemId: "final-item" })
+
+    expect(legacy).toMatchObject({ content: { text: legacyText } })
+    expect(rejected).toMatchObject({ content: { text: "Keep prose  and ." } })
+    expect(JSON.stringify(rejected)).not.toContain("E-private-key")
+  })
+
+  it("uses the existing fail-closed redaction for malformed final completion payloads", () => {
+    const payload = { itemId: "final-item", status: "completed", content: { text: "Safe", final: { response: "Different" } } }
+    expect(redactStreamEventPayload("item.completed", payload, { ...identity, itemId: "final-item" }))
+      .toEqual({ itemId: "final-item", status: "completed", content: "[REDACTED]" })
+    expect(redactStreamEventPayload("item.completed", payload, identity))
+      .toEqual({ itemId: "final-item", status: "completed", content: "[REDACTED]" })
   })
 
   it("redacts nested credential, resume, and raw payload keys", () => {

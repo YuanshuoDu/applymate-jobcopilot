@@ -3,7 +3,7 @@ import type { ModelStepResult } from "./turn-engine-model.js"
 import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
 import type { TurnExecutionOptions } from "./turn-execution-types.js"
 import { applyCompletionRecovery, FINAL_EVIDENCE_RECOVERY_FEEDBACK, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
-import { completeTurnCandidate, persistedFinalCandidate, stopForRepeatedTaskGraphDenial } from "./turn-execution-final-candidate.js"
+import { completeTurnCandidate as runCompleteTurnCandidate, persistedFinalCandidate, stopForRepeatedTaskGraphDenial } from "./turn-execution-final-candidate.js"
 import type { StepContext } from "../context/step-context-builder.js"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-summary-binding.js"
@@ -13,6 +13,11 @@ import type { TaskGraphSnapshot } from "../subagents/task-graph-snapshot.js"
 import { SCHEDULED_PIPELINE_COMPLETION, type TurnEngineCompletionGate } from "./turn-execution-types.js"
 import { TURN_SCHEDULED_GATE_CHOICE_SCHEMA, turnScheduledGateChoiceWaitId } from "./turn-question-gate-choice-contract.js"
 import { TurnStateRefreshRetryError } from "./turn-execution-question.js"
+
+type CandidateTestInput = Omit<Parameters<typeof runCompleteTurnCandidate>[0], "finalResponseText"> & { finalResponseText?: string }
+function completeWithTestDefaults(input: CandidateTestInput) {
+  return runCompleteTurnCandidate({ ...input, finalResponseText: input.finalResponseText ?? input.output.text })
+}
 
 describe("persistedFinalCandidate", () => {
   it("returns only the exact content agreed by the durable item and serialized response", () => {
@@ -43,7 +48,10 @@ describe("atomic TaskGraph finalization recovery", () => {
 
   it("records the exact final response once only after scheduled continuation completes", async () => {
     const order: string[] = []
-    const candidateText = "  The exact scheduled final.  "
+    const candidateText = `  The exact scheduled final [[source:E-${"a".repeat(64)}]].  `
+    const finalResponseText = "  The exact scheduled final [[source:S1]].  "
+    const answerEvidence = { schemaVersion: 1 as const, sources: [{ key: "S1" as const, kind: "job" as const, label: "Senior Engineer", excerpt: "A bounded preview." }] }
+    const gateCandidates: string[] = []
     const recordFinalResponse = vi.fn(async (_input: Parameters<NonNullable<TurnExecutionOptions["store"]["recordFinalResponse"]>>[0]) => {
       order.push("terminal")
       return { status: "completed" as const, finalItemId: "final-1", events: [] }
@@ -51,6 +59,7 @@ describe("atomic TaskGraph finalization recovery", () => {
     const completionGate: TurnEngineCompletionGate = async () => ({ ok: true })
     completionGate[SCHEDULED_PIPELINE_COMPLETION] = async input => {
       order.push("continuation")
+      gateCandidates.push(input.candidateText)
       return { status: "completed", candidateText: input.candidateText }
     }
     const snapshot = { system: [], profile: [], steerHistory: [], businessRefs: [{ id: "job-1", kind: "job" as const, ownerId: "user-1" }], toolObservations: [] }
@@ -60,19 +69,23 @@ describe("atomic TaskGraph finalization recovery", () => {
       store: { updateStep: vi.fn(async () => undefined), recordFinalResponse }, idFactory: (value: string) => value,
     } as unknown as TurnExecutionOptions
 
-    const outcome = await completeTurnCandidate({ options, writer: { append: vi.fn(async () => ({ id: "event-1" })) } as unknown as TurnExecutionEventWriter,
+    const outcome = await completeWithTestDefaults({ options, writer: { append: vi.fn(async () => ({ id: "event-1" })) } as unknown as TurnExecutionEventWriter,
       step: { id: "step-1", ordinal: 0 },
       output: { text: candidateText, reasoningSummary: "", toolCalls: [], provider: "fixture", model: "fixture-model", finishReason: "stop", usage: null, continuation: null } satisfies ModelStepResult,
+      finalResponseText, answerEvidence,
       snapshot, stepCount: 1, toolCallCount: 0, usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
       signal: new AbortController().signal, now: () => new Date(), onStepClosed: vi.fn() })
 
-    expect(outcome).toMatchObject({ kind: "completed", result: { finalText: candidateText } })
+    expect(outcome).toMatchObject({ kind: "completed", result: { finalText: finalResponseText } })
+    expect(gateCandidates).toEqual([candidateText])
     expect(order).toEqual(["continuation", "terminal"])
     expect(recordFinalResponse).toHaveBeenCalledTimes(1)
     const recorded = recordFinalResponse.mock.calls[0]?.[0]
     if (!recorded?.terminal) throw new Error("Expected an atomic final response to be recorded")
-    expect(JSON.parse(recorded.response)).toMatchObject({ response: candidateText })
-    expect(recorded.terminal.finalContent).toEqual(expect.objectContaining({ text: candidateText, final: expect.objectContaining({ response: candidateText }) }))
+    const serializedFinal = JSON.parse(recorded.response) as { response?: string; answerEvidence?: unknown }
+    expect(serializedFinal).toMatchObject({ response: finalResponseText, answerEvidence })
+    expect(recorded.terminal.finalContent).toEqual(expect.objectContaining({ text: finalResponseText,
+      final: expect.objectContaining({ response: finalResponseText, answerEvidence }) }))
   })
 
   it("persists an exact scheduled durable wait without terminal completion", async () => {
@@ -90,7 +103,7 @@ describe("atomic TaskGraph finalization recovery", () => {
     } as unknown as TurnExecutionOptions
     const onStepClosed = vi.fn()
 
-    const outcome = await completeTurnCandidate({ options, writer: { append } as unknown as TurnExecutionEventWriter,
+    const outcome = await completeWithTestDefaults({ options, writer: { append } as unknown as TurnExecutionEventWriter,
       step: { id: "step-1", ordinal: 0 },
       output: { text: candidateText, reasoningSummary: "", toolCalls: [], provider: "fixture", model: "fixture-model", finishReason: "stop", usage: { inputTokens: 7, outputTokens: 3, estimatedCostUsd: 0.02 }, continuation: null } satisfies ModelStepResult,
       snapshot, stepCount: 1, toolCallCount: 0, usage: { inputTokens: 7, outputTokens: 3, estimatedCostUsd: 0.02 },
@@ -125,7 +138,7 @@ describe("atomic TaskGraph finalization recovery", () => {
       snapshot, completionGate, store: { waitForQuestion, updateStep: vi.fn(), recordFinalResponse: vi.fn() } } as unknown as TurnExecutionOptions
     const output = { text: "Exact candidate.", reasoningSummary: "", toolCalls: [], provider: "fixture", model: "fixture-model",
       finishReason: "stop", usage: { inputTokens: 7, outputTokens: 3, estimatedCostUsd: 0.02 }, continuation: null } satisfies ModelStepResult
-    const outcome = await completeTurnCandidate({ options, writer: { append: vi.fn(async () => ({ id: "event-1" })) } as unknown as TurnExecutionEventWriter,
+    const outcome = await completeWithTestDefaults({ options, writer: { append: vi.fn(async () => ({ id: "event-1" })) } as unknown as TurnExecutionEventWriter,
       step: { id: "step-1", ordinal: 0 }, output, snapshot, stepCount: 1, toolCallCount: 0,
       usage: { inputTokens: 7, outputTokens: 3, estimatedCostUsd: 0.02 }, signal: new AbortController().signal,
       now: () => new Date(), onStepClosed: vi.fn() })
@@ -146,7 +159,7 @@ describe("atomic TaskGraph finalization recovery", () => {
       const options = { identity: { kind: "turn" as const, taskId: "root-1", rootTaskId: "root-1", userId: "user-1", sessionId: "session-1",
         turnId: "turn-1", ownerId: "worker-1", leaseVersion: 1, leaseExpiresAt: new Date() }, scope: { userId: "user-1" },
         goal: "Find a role", snapshot, completionGate, store: { updateStep: vi.fn(async (input: unknown) => { updates.push(input) }) } } as unknown as TurnExecutionOptions
-      const outcome = await completeTurnCandidate({ options, writer: { append: vi.fn(async (type: string, eventStepId: string,
+      const outcome = await completeWithTestDefaults({ options, writer: { append: vi.fn(async (type: string, eventStepId: string,
         _itemId: string | null, payload: unknown) => { appended.push({ type, stepId: eventStepId, payload }); return { id: "event-1" } }) } as unknown as TurnExecutionEventWriter,
         step: { id: stepId, ordinal: 8 }, output: { text: "Exact candidate.", reasoningSummary: "", toolCalls: [], provider,
           model: "recovered", finishReason: "stop", usage: null, continuation: null } satisfies ModelStepResult,
@@ -178,7 +191,7 @@ describe("atomic TaskGraph finalization recovery", () => {
       turnId: "turn-1", ownerId: "worker-1", leaseVersion: 1, leaseExpiresAt: new Date() }, scope: { userId: "user-1" }, goal: "Find a role",
       snapshot, completionGate, store: { waitForQuestion: vi.fn(async () => ({ status: "answered" as const, disposition: "replayed" as const,
         waitId, itemId: `agent-wait:question:${waitId}`, turnId: "turn-1", toolCallId: null, nextTurnRevision: 6 })) } } as unknown as TurnExecutionOptions
-    await expect(completeTurnCandidate({ options, writer: { append: vi.fn() } as unknown as TurnExecutionEventWriter,
+    await expect(completeWithTestDefaults({ options, writer: { append: vi.fn() } as unknown as TurnExecutionEventWriter,
       step: { id: "step-1", ordinal: 0 }, output: { text: "Exact candidate.", reasoningSummary: "", toolCalls: [], provider: "fixture",
         model: "fixture-model", finishReason: "stop", usage: null, continuation: null } satisfies ModelStepResult,
       snapshot, stepCount: 1, toolCallCount: 0, usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
@@ -197,7 +210,7 @@ describe("atomic TaskGraph finalization recovery", () => {
       store: { updateStep, waitForQuestion, recordFinalResponse: vi.fn() },
     } as unknown as TurnExecutionOptions
 
-    const outcome = await completeTurnCandidate({ options, writer: { append } as unknown as TurnExecutionEventWriter,
+    const outcome = await completeWithTestDefaults({ options, writer: { append } as unknown as TurnExecutionEventWriter,
       step: { id: "step-1", ordinal: 0 },
       output: { text: "Exact candidate.", reasoningSummary: "", toolCalls: [], provider: "fixture", model: "fixture-model", finishReason: "stop",
         usage: { inputTokens: 7, outputTokens: 3, estimatedCostUsd: 0.02 }, continuation: null } satisfies ModelStepResult,
@@ -223,7 +236,7 @@ describe("atomic TaskGraph finalization recovery", () => {
       store: { updateStep: vi.fn(async () => undefined), waitForUser, recordFinalResponse },
     } as unknown as TurnExecutionOptions
 
-    const outcome = await completeTurnCandidate({ options, writer: { append: vi.fn(async () => ({ id: "event-1" })) } as unknown as TurnExecutionEventWriter,
+    const outcome = await completeWithTestDefaults({ options, writer: { append: vi.fn(async () => ({ id: "event-1" })) } as unknown as TurnExecutionEventWriter,
       step: { id: "step-1", ordinal: 0 },
       output: { text: "An answer.", reasoningSummary: "", toolCalls: [], provider: "fixture", model: "fixture-model", finishReason: "stop", usage: null, continuation: null } satisfies ModelStepResult,
       snapshot, stepCount: 1, toolCallCount: 0, usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
@@ -251,7 +264,7 @@ describe("atomic TaskGraph finalization recovery", () => {
     const appended: Array<{ type: string; payload: unknown }> = []
     const writer = { append: vi.fn(async (type: string, _stepId: string, _itemId: string | null, payload: unknown) => { appended.push({ type, payload }) }) } as unknown as TurnExecutionEventWriter
 
-    const outcome = await completeTurnCandidate({
+    const outcome = await completeWithTestDefaults({
       options, writer, step: { id: "step-1", ordinal: 0 },
       output: { text: "candidate answer", reasoningSummary: "", toolCalls: [], provider: "fixture", model: "fixture-model", finishReason: "stop", usage: null, continuation: null } satisfies ModelStepResult,
       snapshot,
@@ -313,7 +326,7 @@ describe("atomic TaskGraph finalization recovery", () => {
     const snapshot = { system: [], profile: [], steerHistory: [], businessRefs: [{ id: "job-1", kind: "job" as const, ownerId: "user-1" }], toolObservations: [] }
     const candidate = "The model's final answer remains exactly as generated."
 
-    const outcome = await completeTurnCandidate({
+    const outcome = await completeWithTestDefaults({
       options, writer: { append: vi.fn(async () => "event-1") } as unknown as TurnExecutionEventWriter,
       step: { id: "step-1", ordinal: 0 },
       output: { text: candidate, reasoningSummary: "", toolCalls: [], provider: "fixture", model: "fixture-model", finishReason: "stop", usage: null, continuation: null } satisfies ModelStepResult,
@@ -351,7 +364,7 @@ describe("atomic TaskGraph finalization recovery", () => {
       store: { updateStep }, idFactory: (value: string) => value,
     } as unknown as TurnExecutionOptions
     const onStepClosed = vi.fn()
-    const outcome = await completeTurnCandidate({
+    const outcome = await completeWithTestDefaults({
       options, writer: { append } as unknown as TurnExecutionEventWriter,
       step: { id: "step-root-1", ordinal: 0 },
       output: { text: "I found a role.", reasoningSummary: "", toolCalls: [], provider: "fixture", model: "fixture-model", finishReason: "stop",
@@ -391,7 +404,7 @@ describe("atomic TaskGraph finalization recovery", () => {
       ...patch,
     } as unknown as TurnExecutionOptions
     const append = vi.fn(async () => ({ id: "event-1" }))
-    await expect(completeTurnCandidate({
+    await expect(completeWithTestDefaults({
       options, writer: { append } as unknown as TurnExecutionEventWriter,
       step: { id: "step-root-1", ordinal: 0 },
       output: { text: "I found a role.", reasoningSummary: "", toolCalls: [], provider: "fixture", model: "fixture-model", finishReason: "stop", usage: null, continuation: null } satisfies ModelStepResult,

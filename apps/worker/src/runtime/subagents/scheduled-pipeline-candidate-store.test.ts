@@ -2,8 +2,10 @@ import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import type { TurnEngineStore } from "../turns/turn-engine-types.js"
-import { createScheduledPipelineCandidateStore, SCHEDULED_PIPELINE_CANDIDATE_EVENT, SCHEDULED_PIPELINE_CANDIDATE_SCHEMA,
-  takeRecoveredScheduledPipelineCandidate, withScheduledPipelineCandidateModelOutput } from "./scheduled-pipeline-candidate-store.js"
+import { createScheduledPipelineCandidateStore, LEGACY_SCHEDULED_PIPELINE_CANDIDATE_SCHEMA, parseScheduledPipelineCandidatePayload,
+  parseScheduledPipelineSourceReceipt, SCHEDULED_PIPELINE_CANDIDATE_EVENT, SCHEDULED_PIPELINE_CANDIDATE_SCHEMA,
+  SCHEDULED_PIPELINE_SOURCE_RECEIPT_SCHEMA_VERSION, takeRecoveredScheduledPipelineCandidate, withScheduledPipelineCandidateModelOutput,
+  type ScheduledPipelineSourceReceipt } from "./scheduled-pipeline-candidate-store.js"
 
 const oldOwner: TurnExecutionOwnerFence = {
   kind: "turn", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "root-1", rootTaskId: "root-1",
@@ -12,12 +14,20 @@ const oldOwner: TurnExecutionOwnerFence = {
 const newOwner: TurnExecutionOwnerFence = { ...oldOwner, ownerId: "worker-recovered", leaseVersion: 9,
   leaseExpiresAt: new Date("2026-10-20T12:05:00.000Z") }
 const identity = { owner: oldOwner, rootAttemptCount: 2, finalStepId: "step-final-4", finalStepOrdinal: 4 }
+const digest = `sha256:${"a".repeat(64)}`
+const sourceReceipt: ScheduledPipelineSourceReceipt = { schemaVersion: SCHEDULED_PIPELINE_SOURCE_RECEIPT_SCHEMA_VERSION,
+  scope: { userId: oldOwner.userId, sessionId: oldOwner.sessionId, turnId: oldOwner.turnId, taskId: oldOwner.rootTaskId, stepId: identity.finalStepId }, bindings: [
+  { key: "E-job-a", observationId: "tool-result:call-1", toolCallId: "call-1", toolName: "jobs.search", sourceRef: "jobs/0", inputDigest: digest, resultDigest: digest },
+  { key: "E-job-b", observationId: "tool-result:call-1", toolCallId: "call-1", toolName: "jobs.search", sourceRef: "jobs/1", inputDigest: digest, resultDigest: digest },
+] }
 
 function candidateEvent(owner = oldOwner, overrides: Record<string, unknown> = {}) {
-  const payload = { schemaVersion: SCHEDULED_PIPELINE_CANDIDATE_SCHEMA, sessionId: owner.sessionId,
+  const schemaVersion = overrides.schemaVersion ?? SCHEDULED_PIPELINE_CANDIDATE_SCHEMA
+  const payload = { schemaVersion, sessionId: owner.sessionId,
     turnId: owner.turnId, rootTaskId: owner.rootTaskId, rootAttemptCount: 2,
     finalStepId: "step-final-4", finalStepOrdinal: 4, stepAttempt: 1, candidateText: "Exact final answer.", finishReason: "stop",
     usage: { inputTokens: 12, outputTokens: 4, estimatedCostUsd: 0.02 },
+    ...(schemaVersion === LEGACY_SCHEDULED_PIPELINE_CANDIDATE_SCHEMA ? {} : { sourceReceipt }),
     ...overrides }
   return { sourceEventId: "candidate-event-1", userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.rootTaskId,
     type: SCHEDULED_PIPELINE_CANDIDATE_EVENT, correlationId: "step-final-4", payload, stepId: "step-final-4",
@@ -28,7 +38,7 @@ function candidateEvent(owner = oldOwner, overrides: Record<string, unknown> = {
 
 function withModelOutput<T>(owner: TurnExecutionOwnerFence, work: () => Promise<T>): Promise<T> {
   return withScheduledPipelineCandidateModelOutput({ owner, finalStepId: identity.finalStepId, finalStepOrdinal: identity.finalStepOrdinal,
-    candidateText: "Exact final answer.", finishReason: "stop", usage: { inputTokens: 12, outputTokens: 4, estimatedCostUsd: 0.02 } }, work)
+    candidateText: "Exact final answer.", finishReason: "stop", usage: { inputTokens: 12, outputTokens: 4, estimatedCostUsd: 0.02 }, sourceReceipt }, work)
 }
 
 function poolFor(event: Record<string, unknown> | null, options: { rootAttempt?: number; recoverySteps?: Record<string, unknown>[]; unconsumedInput?: boolean } = {}) {
@@ -83,6 +93,7 @@ describe("scheduled pipeline durable candidate", () => {
     await expect(store.read({ owner: newOwner, rootAttemptCount: 2 })).resolves.toEqual({
       candidateText: "Exact final answer.", finalStepId: "step-final-4", finalStepOrdinal: 4, finishReason: "stop",
       usage: { inputTokens: 12, outputTokens: 4, estimatedCostUsd: 0.02 },
+      sourceReceipt,
       recoverySource: { owner: { userId: newOwner.userId, sessionId: newOwner.sessionId, turnId: newOwner.turnId,
         rootTaskId: newOwner.rootTaskId }, sourceEventId: "candidate-event-1", sourceStepId: "step-final-4",
         sourceStepOrdinal: 4, rootAttemptCount: 2, inputThroughSequence: "10", consumedInputIds: [] }, recoveryTail: null,
@@ -93,6 +104,37 @@ describe("scheduled pipeline durable candidate", () => {
     expect(turnLock?.values).toContain("worker-recovered")
     expect(turnLock?.values).toContain(9)
     expect(fixture.calls.some(call => call.sql.includes('FROM "agent_events"') && call.sql.includes('JOIN "agent_steps"'))).toBe(true)
+
+    const conflictingReceipt: ScheduledPipelineSourceReceipt = { ...sourceReceipt, bindings: sourceReceipt.bindings.map((binding, index) =>
+      index === 0 ? { ...binding, sourceRef: "jobs/2" } : binding) }
+    await expect(withScheduledPipelineCandidateModelOutput({ owner: newOwner, finalStepId: identity.finalStepId, finalStepOrdinal: identity.finalStepOrdinal,
+      candidateText: "Exact final answer.", finishReason: "stop", usage: { inputTokens: 12, outputTokens: 4, estimatedCostUsd: 0.02 },
+      sourceReceipt: conflictingReceipt }, () => store.stage({ ...identity, owner: newOwner, candidateText: "Exact final answer." })))
+      .rejects.toThrow(/identity/)
+    const wrongOwnerReceipt = { ...sourceReceipt, scope: { ...sourceReceipt.scope, userId: "user-other" } }
+    await expect(withScheduledPipelineCandidateModelOutput({ owner: newOwner, finalStepId: identity.finalStepId, finalStepOrdinal: identity.finalStepOrdinal,
+      candidateText: "Exact final answer.", finishReason: "stop", usage: { inputTokens: 12, outputTokens: 4, estimatedCostUsd: 0.02 },
+      sourceReceipt: wrongOwnerReceipt }, async () => undefined)).rejects.toThrow("scheduled_candidate_model_receipt_invalid")
+  })
+
+  it("round-trips bounded multi-record source bindings and keeps legacy candidates citation-free", async () => {
+    const stagedEvents: Array<Record<string, unknown>> = []
+    const store = createScheduledPipelineCandidateStore(poolFor(candidateEvent()).pool, {
+      appendEvent: vi.fn(async (input: Parameters<TurnEngineStore["appendEvent"]>[0]) => { stagedEvents.push(input as unknown as Record<string, unknown>); return { id: "event-1" } }),
+    } as unknown as Pick<TurnEngineStore, "appendEvent">)
+    await withModelOutput(oldOwner, () => store.stage({ ...identity, candidateText: "Exact final answer." }))
+    expect((stagedEvents[0]?.payload as Record<string, unknown>)?.sourceReceipt).toEqual(sourceReceipt)
+
+    const legacy = candidateEvent(newOwner, { schemaVersion: LEGACY_SCHEDULED_PIPELINE_CANDIDATE_SCHEMA })
+    const reader = createScheduledPipelineCandidateStore(poolFor(legacy).pool, { appendEvent: vi.fn() } as unknown as Pick<TurnEngineStore, "appendEvent">)
+    await expect(reader.read({ owner: newOwner, rootAttemptCount: 2 })).resolves.toMatchObject({ candidateText: "Exact final answer.", sourceReceipt: null })
+
+    const { scope: _scope, ...legacyReceipt } = sourceReceipt
+    const unscoped = candidateEvent(newOwner, { sourceReceipt: legacyReceipt })
+    const unscopedReader = createScheduledPipelineCandidateStore(poolFor(unscoped).pool, { appendEvent: vi.fn() } as unknown as Pick<TurnEngineStore, "appendEvent">)
+    await expect(unscopedReader.read({ owner: newOwner, rootAttemptCount: 2 })).resolves.toMatchObject({
+      candidateText: "Exact final answer.", sourceReceipt: null,
+    })
   })
 
   it("rejects a candidate written for a different root attempt", async () => {
@@ -106,6 +148,11 @@ describe("scheduled pipeline durable candidate", () => {
     const fixture = poolFor({ ...event, taskId: "root-stale" })
     const store = createScheduledPipelineCandidateStore(fixture.pool, { appendEvent: vi.fn() } as unknown as Pick<TurnEngineStore, "appendEvent">)
     await expect(store.read({ owner: newOwner, rootAttemptCount: 2 })).rejects.toThrow("scheduled_candidate_identity_mismatch")
+
+    const wrongReceipt = { ...sourceReceipt, scope: { ...sourceReceipt.scope, userId: "user-stale" } }
+    const wrongOwner = createScheduledPipelineCandidateStore(poolFor(candidateEvent(newOwner, { sourceReceipt: wrongReceipt })).pool,
+      { appendEvent: vi.fn() } as unknown as Pick<TurnEngineStore, "appendEvent">)
+    await expect(wrongOwner.read({ owner: newOwner, rootAttemptCount: 2 })).rejects.toThrow("scheduled_candidate_identity_mismatch")
 
     const wrongAttempt = poolFor({ ...candidateEvent(newOwner), stepAttempt: 2 })
     const second = createScheduledPipelineCandidateStore(wrongAttempt.pool, { appendEvent: vi.fn() } as unknown as Pick<TurnEngineStore, "appendEvent">)
@@ -125,6 +172,25 @@ describe("scheduled pipeline durable candidate", () => {
     const invalid = poolFor(candidateEvent(newOwner, { usage: { inputTokens: 1, outputTokens: 2, estimatedCostUsd: 0, extra: true } }))
     const reader = createScheduledPipelineCandidateStore(invalid.pool, { appendEvent: vi.fn() } as unknown as Pick<TurnEngineStore, "appendEvent">)
     await expect(reader.read({ owner: newOwner, rootAttemptCount: 2 })).rejects.toThrow("scheduled_candidate_identity_mismatch")
+  })
+
+  it("rejects source receipt key, source, call-identity, and size conflicts", async () => {
+    expect(parseScheduledPipelineSourceReceipt({ ...sourceReceipt, bindings: [sourceReceipt.bindings[0],
+      { ...sourceReceipt.bindings[1]!, key: sourceReceipt.bindings[0]!.key }] })).toBeNull()
+    expect(parseScheduledPipelineSourceReceipt({ ...sourceReceipt, bindings: [sourceReceipt.bindings[0],
+      { ...sourceReceipt.bindings[1]!, resultDigest: `sha256:${"b".repeat(64)}` }] })).toBeNull()
+    expect(parseScheduledPipelineSourceReceipt({ ...sourceReceipt, bindings: [{ ...sourceReceipt.bindings[0]!, toolName: "agent.apply" }] })).toBeNull()
+    expect(parseScheduledPipelineSourceReceipt({ ...sourceReceipt, bindings: Array.from({ length: 9 }, (_, index) => ({
+      ...sourceReceipt.bindings[0]!, key: `E-job-${index}`, sourceRef: `jobs/${index}`,
+    })) })).toBeNull()
+    const longSelector = ["a", "b", "c", "d"].map(segment => segment.repeat(31)).join("/")
+    const oversized: ScheduledPipelineSourceReceipt = { ...sourceReceipt, bindings: Array.from({ length: 8 }, (_, index) => ({
+      ...sourceReceipt.bindings[0]!, key: `E-${String(index).padEnd(126, "k")}`, observationId: `observation-${index}`.padEnd(256, "o"),
+      toolCallId: `call-${index}`.padEnd(256, "c"), sourceRef: longSelector,
+    })) }
+    expect(parseScheduledPipelineSourceReceipt(oversized)).toBeNull()
+    const currentPayload = candidateEvent().payload
+    expect(parseScheduledPipelineCandidatePayload({ ...currentPayload, sourceReceipt: { ...sourceReceipt, extra: true } })).toBeNull()
   })
 
   it("marks a staged candidate invalid after a later root step or new unconsumed input", async () => {

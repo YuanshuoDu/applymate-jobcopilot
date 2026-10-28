@@ -11,7 +11,8 @@ import { publishFinalResponse } from "./turn-execution-events.js"
 import type { StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
 import { nativeSemanticNoProgressError } from "../native-semantic-progress.js"
 import { STEERING_RECONCILIATION_BLOCKER } from "../subagents/steering-reconciliation-contract.js"
-import { FINAL_EVIDENCE_RECOVERY_FEEDBACK, hasFinalEvidenceRecoveryMarker, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
+import { FINAL_EVIDENCE_RECOVERY_FEEDBACK, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
+import { canRecoverMissingEvidence } from "./final-evidence-recovery-eligibility.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING, type TaskGraphFinalSummaryBinding } from "../subagents/task-graph-final-summary-binding.js"
 import { formatTaskGraphFinalSummary } from "../subagents/task-graph-final-summary-format.js"
 import type { TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
@@ -23,31 +24,6 @@ export type FinalCandidateOutcome =
   | Readonly<{ kind: "replan"; feedback: string; taskGraphDenialCheckpoint?: TaskGraphDenialCheckpoint }>
   | Readonly<{ kind: "wait"; result: TurnEngineResult }>
   | Readonly<{ kind: "completed"; result: TurnEngineResult }>
-
-const DEFAULT_MAX_STEPS = 32
-const READ_EVIDENCE_TOOLS = new Set(["jobs.search", "jobs.get", "persona.retrieve", "resume.get_base"])
-function visibleEvidenceReader(tools: readonly unknown[]): boolean {
-  return tools.some(tool => {
-    if (!tool || typeof tool !== "object" || Array.isArray(tool)) return false
-    const name = Reflect.get(tool, "name")
-    return typeof name === "string" && READ_EVIDENCE_TOOLS.has(name)
-  })
-}
-function canRecoverMissingEvidence(input: {
-  options: TurnExecutionOptions; snapshot: StepContextSnapshot; evidenceCount: number
-  evidenceRefs: readonly string[]; blocker: string; stepCount: number
-}): boolean {
-  const { options } = input
-  const maxSteps = options.budget?.maxSteps ?? options.maxSteps ?? DEFAULT_MAX_STEPS
-  return options.identity.kind === "turn" && options.identity.taskId === options.identity.rootTaskId
-    && input.blocker === "No verifiable evidence is attached to the candidate final"
-    && input.evidenceCount === 0 && input.evidenceRefs.length === 0
-    && (!options.expectedEvidence || options.expectedEvidence.length === 0)
-    && (!options.businessChecks || options.businessChecks.every(check => check.ok))
-    && options.resume?.finalEvidenceRecoveryUsed !== true && !hasFinalEvidenceRecoveryMarker(input.snapshot)
-    && visibleEvidenceReader(options.tools) && Number.isSafeInteger(maxSteps) && Number.isSafeInteger(input.stepCount)
-    && maxSteps - input.stepCount >= 2
-}
 
 async function finishStep(options: TurnExecutionOptions, writer: TurnExecutionEventWriter, step: TurnEngineStep, output: ModelStepResult, now: () => Date, onStepClosed: (kind?: "native_semantic_receipt") => void, rejection?: import("./native-semantic-rejection-ledger.js").NativeSemanticRejectionIdentity): Promise<number | undefined> {
   if (rejection) {
@@ -81,6 +57,8 @@ export async function completeTurnCandidate(input: Readonly<{
   writer: TurnExecutionEventWriter
   step: TurnEngineStep
   output: ModelStepResult
+  finalResponseText: string
+  answerEvidence?: unknown
   snapshot: StepContextSnapshot
   stepCount: number
   toolCallCount: number
@@ -184,7 +162,8 @@ export async function completeTurnCandidate(input: Readonly<{
   }
   await finishStep(options, writer, step, output, now, input.onStepClosed)
   const summaryBinding = gate as TaskGraphFinalSummaryBinding | undefined
-  const finalResponse = finalizeTurn({ goal: options.goal, verification, terminalReason: "goal_satisfied", response: output.text,
+  const finalResponse = finalizeTurn({ goal: options.goal, verification, terminalReason: "goal_satisfied", response: input.finalResponseText,
+    answerEvidence: input.answerEvidence,
     ...(summaryBinding ? { summaryOverride: formatTaskGraphFinalSummary(summaryBinding.summary) } : {}),
     usage: totalTurnUsage(options.resume?.usage, input.usage), stepCount: input.stepCount, toolCallCount: input.toolCallCount })
   if (canPersistFinalResponse(options)) {
@@ -216,12 +195,12 @@ export async function completeTurnCandidate(input: Readonly<{
     }
     if (!terminal || terminal.status !== "completed") throw new TurnEngineError("persistence_conflict", "Atomic Turn completion returned an invalid receipt")
     for (const event of terminal.events) await Promise.resolve(options.subscribe?.(event)).catch(() => undefined)
-    return { kind: "completed", result: { status: "completed", stepCount: input.stepCount, toolCallCount: input.toolCallCount, finalItemId: terminal.finalItemId, finalText: output.text } }
+    return { kind: "completed", result: { status: "completed", stepCount: input.stepCount, toolCallCount: input.toolCallCount, finalItemId: terminal.finalItemId, finalText: finalResponse.response } }
   }
   const finalItem = await publishFinalResponse(writer, options, step, finalResponse, now)
   if (canEmitTurnCompleted(options)) await writer.append("turn.completed", step.id, finalItem.id,
     { turnId: options.identity.turnId, taskId: options.identity.taskId, finalItemId: finalItem.id, usage: finalResponse.usage }, "turn-completed")
-  return { kind: "completed", result: { status: "completed", stepCount: input.stepCount, toolCallCount: input.toolCallCount, finalItemId: finalItem.id, finalText: output.text } }
+  return { kind: "completed", result: { status: "completed", stepCount: input.stepCount, toolCallCount: input.toolCallCount, finalItemId: finalItem.id, finalText: finalResponse.response } }
 }
 
 export async function stopForRepeatedTaskGraphDenial(input: Readonly<{

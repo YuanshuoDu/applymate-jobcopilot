@@ -41,6 +41,48 @@ describe('HarnessItem renderers', () => {
     expect(live).not.toContain('<strong>Keep this literal.</strong>')
   })
 
+  it('binds citation controls to the completed answer manifest in live and replay views', () => {
+    const answerEvidence = {
+      schemaVersion: 1 as const,
+      sources: [{ key: 'S1', kind: 'job' as const, label: 'Senior Engineer', excerpt: 'Literal **text** and <b>markup</b>.' }],
+    }
+    const content = { text: 'This role matches [[source:S1]]. Unknown [[source:S2]].', answerEvidence }
+    const live = renderToStaticMarkup(<I18nProvider><HarnessItem item={item({ phase: 'final_answer', source: 'transient', content })} /></I18nProvider>)
+    const replay = renderToStaticMarkup(<I18nProvider><HarnessItem item={item({ phase: 'final_answer', source: 'replay', content })} /></I18nProvider>)
+
+    expect(live).toBe(replay)
+    expect(live).toContain('data-agent-source-marker="S1"')
+    expect(live).not.toContain('[[source:S2]]')
+    expect(live).not.toContain('data-agent-source-marker="S2"')
+    expect(live).toContain('Agent-linked source. This reference was selected by the model; its support for the claim has not been independently verified.')
+    expect(live).toContain('Literal **text** and &lt;b&gt;markup&lt;/b&gt;.')
+    expect(live).not.toContain('<b>markup</b>')
+    const controlId = /<button[^>]*data-agent-source-marker="S1"[^>]*aria-controls="([^"]+)"/.exec(live)?.[1]
+    const disclosureId = /<details id="([^"]+)"[^>]*data-agent-answer-evidence="true"/.exec(live)?.[1]
+    expect(controlId).toBeTruthy()
+    expect(controlId).toBe(disclosureId)
+  })
+
+  it('keeps absent, unmatched, and non-final manifests out of answer citations', () => {
+    const answerEvidence = {
+      schemaVersion: 1 as const,
+      sources: [{ key: 'S1', kind: 'job' as const, label: 'Senior Engineer', excerpt: 'A bounded preview.' }],
+    }
+    const content = { text: 'Answer [[source:S1]].', answerEvidence }
+    const cases = [
+      item({ phase: 'final_answer', content: { text: content.text } }),
+      item({ phase: 'final_answer', content: { text: 'No marker here.', answerEvidence } }),
+      item({ phase: 'commentary', content }),
+      item({ phase: 'final_answer', status: 'running', content }),
+    ]
+
+    for (const candidate of cases) {
+      const html = renderToStaticMarkup(<I18nProvider><HarnessItem item={candidate} /></I18nProvider>)
+      expect(html).not.toContain('data-agent-answer-evidence')
+      expect(html).not.toContain('data-agent-source-marker')
+    }
+  })
+
   it('does not render summaries for non-final, non-message, malformed, or oversized content', () => {
     const invalidItems = [
       item({ phase: 'commentary', content: { text: 'unchanged', final: { summary: 'not final' } } }),

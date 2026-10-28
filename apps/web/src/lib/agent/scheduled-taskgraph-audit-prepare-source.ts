@@ -1,4 +1,5 @@
 import { Prisma } from '@prisma/client'
+import { parseScheduledPipelineCandidatePayload } from '@jobcopilot/agent-protocol'
 import { db } from '@/lib/db'
 import { parseScheduledAutomationSnapshot } from './scheduled-automation-snapshot'
 import { scheduledAutomationSnapshotDigest, type ScheduledTaskGraphPipelineOwner } from './scheduled-taskgraph-pipeline-checkpoint'
@@ -68,16 +69,11 @@ async function rejectedStepEvent(reader: Prisma.TransactionClient, owner: Schedu
   return rows.length !== 0
 }
 function parseCandidate(event: Row, owner: ScheduledTaskGraphPipelineOwner): CandidateSource | null {
-  const row = exactRecord(event.payload, ['schemaVersion', 'sessionId', 'turnId', 'rootTaskId', 'rootAttemptCount', 'finalStepId',
-    'finalStepOrdinal', 'stepAttempt', 'candidateText', 'finishReason', 'usage'])
-  const usage = row?.usage === null ? null : exactRecord(row?.usage, ['inputTokens', 'outputTokens', 'estimatedCostUsd'])
+  const row = parseScheduledPipelineCandidatePayload(event.payload)
   if (!row || !validId(event.id) || event.type !== CANDIDATE_EVENT || event.taskId !== owner.rootTaskId
-    || row.schemaVersion !== 'agent-harness.v2.scheduled-pipeline-candidate.v2' || row.sessionId !== owner.sessionId
-    || row.turnId !== owner.turnId || row.rootTaskId !== owner.rootTaskId || row.rootAttemptCount !== owner.rootAttemptCount
-    || !validId(row.finalStepId) || row.finalStepId !== event.correlationId || !nonNegative(row.finalStepOrdinal) || row.stepAttempt !== 1
-    || typeof row.candidateText !== 'string' || !row.candidateText.trim() || typeof row.finishReason !== 'string' || !row.finishReason.trim()
-    || row.usage !== null && (!usage || !nonNegative(usage.inputTokens) || !nonNegative(usage.outputTokens)
-      || typeof usage.estimatedCostUsd !== 'number' || !Number.isFinite(usage.estimatedCostUsd) || usage.estimatedCostUsd < 0)) return null
+    || row.sessionId !== owner.sessionId || row.turnId !== owner.turnId || row.rootTaskId !== owner.rootTaskId
+    || row.rootAttemptCount !== owner.rootAttemptCount || row.sourceReceipt !== null && row.sourceReceipt.scope.userId !== owner.userId
+    || !validId(row.finalStepId) || row.finalStepId !== event.correlationId) return null
   return { sourceEventId: event.id, stepId: row.finalStepId, ordinal: Number(row.finalStepOrdinal) }
 }
 function validChoiceItem(item: unknown, owner: ScheduledTaskGraphPipelineOwner, candidate: CandidateSource, receipt: Row, waitId: string, binding: Row): boolean {
@@ -104,6 +100,4 @@ function record(value: unknown): Row | null { return value && typeof value === '
 function cursorValue(value: unknown): string { const cursor = typeof value === 'bigint' || typeof value === 'number' ? String(value) : value; return validCursor(cursor) ? cursor : '' }
 function validCursor(value: unknown): value is string { return typeof value === 'string' && /^(0|[1-9]\d{0,18})$/.test(value) && BigInt(value) <= BigInt('9223372036854775807') }
 function validId(value: unknown): value is string { return typeof value === 'string' && value.length > 0 && value.length <= 256 && value.trim() === value }
-function positive(value: unknown): boolean { return Number.isSafeInteger(value) && Number(value) > 0 }
-function nonNegative(value: unknown): boolean { return Number.isSafeInteger(value) && Number(value) >= 0 }
 function validIso(value: unknown): boolean { return typeof value === 'string' && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value }

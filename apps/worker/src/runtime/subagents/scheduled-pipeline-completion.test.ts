@@ -84,7 +84,7 @@ const readyPrepare = (choiceRequired = true): Readonly<{ status: "ready"; choice
 const base = () => ({ executionOwner, rootAttemptCount: owner.rootAttemptCount,
   finalStepId: "step-final", finalStepOrdinal: 3, recoveryStepId: "step-final", stageCandidate: vi.fn(async () => undefined) })
 const recoveredCandidate = (candidateText = "Final candidate"): ScheduledPipelineCandidate => ({
-  candidateText, finalStepId: "step-final", finalStepOrdinal: 3, finishReason: "stop", usage: null,
+  candidateText, finalStepId: "step-final", finalStepOrdinal: 3, finishReason: "stop", usage: null, sourceReceipt: null,
   recoverySource: { owner: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId },
     sourceEventId: "candidate-event-1", sourceStepId: "step-final", sourceStepOrdinal: 3,
     rootAttemptCount: owner.rootAttemptCount, inputThroughSequence: "10" },

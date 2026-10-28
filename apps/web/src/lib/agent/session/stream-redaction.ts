@@ -6,6 +6,7 @@ import {
   type TaskGraphSnapshot,
 } from '@jobcopilot/agent-protocol'
 import { redactSensitiveText, redactSensitiveValue } from '@jobcopilot/shared'
+import { projectFinalAnswerContent } from './final-answer-evidence-projection'
 
 const TASK_GRAPH_PROPOSAL_KEYS = ['kind', 'fingerprint', 'receipt', 'revision', 'item'] as const
 const TASK_GRAPH_PROPOSAL_CONTENT_KEYS = [...TASK_GRAPH_PROPOSAL_KEYS, 'content'] as const
@@ -37,6 +38,8 @@ export function isPrivateNativeVerificationEventType(type: string): boolean {
 
 export function redactStreamEventPayload(eventType: string, payload: unknown, identity: StreamItemIdentity): unknown {
   if (isPrivateNativeVerificationEventType(eventType)) return {}
+  const finalContent = projectCompletedFinalContent(eventType, payload, identity)
+  if (finalContent) return finalContent
   const redacted = redactStreamValue(payload)
   if (eventType !== 'item.started' && eventType !== 'item.delta') return redacted
 
@@ -60,6 +63,14 @@ export function redactStreamEventPayload(eventType: string, payload: unknown, id
       content: redactTaskGraphSnapshot(snapshot, generatedTaskIds),
     },
   }
+}
+
+function projectCompletedFinalContent(eventType: string, payload: unknown, identity: StreamItemIdentity): unknown | null {
+  if (eventType !== 'item.completed' || !identity.itemId || !isExactRecord(payload, ['itemId', 'status', 'content'])
+    || payload.itemId !== identity.itemId || payload.status !== 'completed'
+    || !isExactRecord(payload.content, ['text', 'final'])) return null
+  const content = projectFinalAnswerContent(payload.content)
+  return content ? { itemId: identity.itemId, status: 'completed', content } : null
 }
 
 function taskGraphSnapshotFromEvent(eventType: string, payload: unknown, identity: StreamItemIdentity): TaskGraphSnapshot | null {

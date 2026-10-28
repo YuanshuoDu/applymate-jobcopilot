@@ -23,11 +23,15 @@ const receipt = { schemaVersion: 'agent-harness.v2.scheduled-taskgraph-continuat
   continuationKey: `scheduled-taskgraph:sha256:${'a'.repeat(64)}`, snapshotDigest: scheduledAutomationSnapshotDigest(snapshot),
   evidenceDigest: 'b'.repeat(64), checkpointDigest: 'c'.repeat(64), analyzeGraphRevision: 9, prepareScheduleRevision: 10 }
 const sourceStepId = 'prepare-source-step', sourceStepOrdinal = 5
-const candidateEvent = { id: 'candidate-event', type: 'native_verification.scheduled_candidate_staged', taskId: owner.rootTaskId,
-  correlationId: sourceStepId, payload: { schemaVersion: 'agent-harness.v2.scheduled-pipeline-candidate.v2', sessionId: owner.sessionId,
+const candidatePayload = { schemaVersion: 'agent-harness.v2.scheduled-pipeline-candidate.v3', sessionId: owner.sessionId,
     turnId: owner.turnId, rootTaskId: owner.rootTaskId, rootAttemptCount: owner.rootAttemptCount, finalStepId: sourceStepId,
     finalStepOrdinal: sourceStepOrdinal, stepAttempt: 1, candidateText: 'The tailored application is ready.', finishReason: 'completed',
-    usage: { inputTokens: 37, outputTokens: 9, estimatedCostUsd: 0.018 } } }
+    usage: { inputTokens: 37, outputTokens: 9, estimatedCostUsd: 0.018 }, sourceReceipt: { schemaVersion: 1, bindings: [
+      { key: 'E-job-1', observationId: 'tool-result:call-1', toolCallId: 'call-1', toolName: 'jobs.search', sourceRef: 'jobs/0',
+        inputDigest: `sha256:${'a'.repeat(64)}`, resultDigest: `sha256:${'b'.repeat(64)}` },
+    ] } }
+const candidateEvent = { id: 'candidate-event', type: 'native_verification.scheduled_candidate_staged', taskId: owner.rootTaskId,
+  correlationId: sourceStepId, payload: candidatePayload }
 const binding = choiceBinding(receipt), scheduledWaitId = choiceId(receipt)
 const choiceItem = choiceItemFor(receipt, binding, scheduledWaitId)
 const request = { owner, snapshot, proof: { receipt, completion: {}, result: {} }, scheduledWaitId }
@@ -73,6 +77,34 @@ describe('Audit-only historical Prepare source validation', () => {
     expect(mocks.recoveryEvidence).toHaveBeenCalledWith(expect.objectContaining({ owner, source: {
       sourceEventId: candidateEvent.id, stepId: sourceStepId, ordinal: sourceStepOrdinal,
     }, sourceInputThroughSequence: '9', rootAttemptCount: owner.rootAttemptCount }))
+  })
+
+  it('accepts legacy v2 and receipt-bearing v3 candidates while rejecting malformed or widened payloads', async () => {
+    const withPayload = (payload: unknown) => mocks.events.mockImplementation((query: { where: Record<string, unknown> }) => {
+      if (query.where.type === 'agent.plan.scheduled_prepare_binding') return Promise.resolve([{ payload: receipt }])
+      if (query.where.type === 'native_verification.scheduled_candidate_staged') return Promise.resolve([{ ...candidateEvent, payload }])
+      return Promise.resolve([])
+    })
+    await expect(validateScheduledTaskGraphAuditPrepareSource(request)).resolves.toBe(true)
+
+    const scopedCandidate = (userId: string) => ({ ...candidatePayload, sourceReceipt: { ...candidatePayload.sourceReceipt,
+      scope: { userId, sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.rootTaskId, stepId: sourceStepId } } })
+    withPayload(scopedCandidate(owner.userId))
+    await expect(validateScheduledTaskGraphAuditPrepareSource(request)).resolves.toBe(true)
+    mocks.recoveryEvidence.mockClear()
+    withPayload(scopedCandidate('other-user'))
+    await expect(validateScheduledTaskGraphAuditPrepareSource(request)).resolves.toBe(false)
+    expect(mocks.recoveryEvidence).not.toHaveBeenCalled()
+
+    const { sourceReceipt, ...legacyCandidate } = candidatePayload
+    expect(sourceReceipt).toBeDefined()
+    withPayload({ ...legacyCandidate, schemaVersion: 'agent-harness.v2.scheduled-pipeline-candidate.v2' })
+    await expect(validateScheduledTaskGraphAuditPrepareSource(request)).resolves.toBe(true)
+
+    withPayload({ ...candidatePayload, sourceReceipt: { ...candidatePayload.sourceReceipt, extra: true } })
+    await expect(validateScheduledTaskGraphAuditPrepareSource(request)).resolves.toBe(false)
+    withPayload({ ...candidatePayload, internalDigest: 'must-not-be-accepted' })
+    await expect(validateScheduledTaskGraphAuditPrepareSource(request)).resolves.toBe(false)
   })
 
   it('accepts the exact v2 Prepare choice receipt and rejects a trailing continuation key', async () => {

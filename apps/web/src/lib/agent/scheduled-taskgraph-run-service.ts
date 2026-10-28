@@ -1,74 +1,26 @@
 import { createHash } from 'node:crypto'
 import { Prisma, type Job } from "@prisma/client"
-import { db } from "@/lib/db"
 import { AgentExecutionCancelledError } from "./execution-control"
+import { isScheduledPrepareChoiceWaitId, validateScheduledPrepareWaitIdentity } from "./scheduled-taskgraph-prepare-choice-identity"
 import { runScheduledTaskGraphAnalyze, scheduledTaskGraphScoreOwnerIsCurrent } from "./scheduled-taskgraph-analysis-journal"
 import { buildScheduledTaskGraphGateCheckpoint, scheduledTaskGraphAnalyzeCheckpointDigest } from "./scheduled-taskgraph-gate-checkpoint"
 import { scheduledTaskGraphAnalyzeCheckpointForGate } from "./scheduled-taskgraph-gate-input"
-import { buildScheduledTaskGraphPrepareCheckpoint, scheduledAutomationSnapshotDigest, scheduledTaskGraphContinuationKey, type ScheduledTaskGraphPipelineOwner } from "./scheduled-taskgraph-pipeline-checkpoint"
+import { buildScheduledTaskGraphPrepareCheckpoint, scheduledTaskGraphContinuationKey, type ScheduledTaskGraphPipelineOwner } from "./scheduled-taskgraph-pipeline-checkpoint"
 import { isScheduledTaskGraphOwnerCurrent, saveScheduledTaskGraphCheckpoint, scheduledTaskGraphClaimMatches } from "./scheduled-taskgraph-pipeline-fence"
 import { parseScheduledAutomationSnapshot } from "./scheduled-automation-snapshot"
 import { scheduledTaskGraphExecuteGateCompletionProof } from "./scheduled-taskgraph-gate-rpc"
 import { loadScheduledTaskGraphResumeGateInput, scheduledTaskGraphGateResumeOwnerIsCurrent,
   validateScheduledTaskGraphAuditPrepareSource, type ScheduledTaskGraphGateResumeInput } from "./scheduled-taskgraph-audit-action"
-import { isScheduledPrepareChoiceWaitId, parseScheduledPrepareChoiceCandidate, parseScheduledPrepareChoiceReceipt,
-  scheduledPrepareChoiceBinding, scheduledPrepareChoiceId } from "./scheduled-taskgraph-run-receipt"
 import { gateDecisionsFromOutput, parseGateDecisions, restoreGateOutput, scheduledTaskGraphPipelineStage as pipelineStage,
   scheduledTaskGraphPipelineStageOrder as stageOrder, type ScheduledTaskGraphGateDecisions } from "./scheduled-taskgraph-gate-choice-evidence"
 import type { PipelineCtx } from "./pipeline-context"
 import type { PipelineCheckpointState } from "./types"
 
+export { isScheduledPrepareChoiceWaitId, validateScheduledPrepareWaitIdentity }
+
 export type ScheduledTaskGraphAnalyzeCheckpointProof = Readonly<{ status: "analyze_checkpointed"; continuationKey: string; checkpointDigest: string; claimTokenDigest: string; executionId: string; executionAttemptCount: number }>
 export type ScheduledTaskGraphAnalyzeOnlyInput = Readonly<{ owner: ScheduledTaskGraphPipelineOwner; snapshot: unknown; attestation: unknown; continuationKey: string; claimToken: string; ownedJobs: readonly Job[]; context: PipelineCtx; state: unknown; onStateChange: (state: unknown) => void }>
 
-const RECEIPT_EVENT = "agent.plan.scheduled_prepare_binding"
-const CANDIDATE_EVENT = "native_verification.scheduled_candidate_staged"
-const CHOICE_CONTENT = { waitKind: "question", toolCallId: null, stage: "scheduled_prepare",
-  question: "How should ApplyMate tailor your resume for this role?",
-  options: [{ label: "Apply AI changes", value: "apply_ai_changes" }, { label: "Keep my current resume", value: "keep_resume" }] }
-export { isScheduledPrepareChoiceWaitId } from "./scheduled-taskgraph-run-receipt"
-/** Validates the separate Worker choice wait against its private receipt and persisted final step. */
-export async function validateScheduledPrepareWaitIdentity(input: Readonly<{ owner: ScheduledTaskGraphPipelineOwner; snapshot: unknown; proof: unknown; scheduledWaitId?: string }>): Promise<boolean> {
-  let snapshot: ReturnType<typeof parseScheduledAutomationSnapshot>
-  try { snapshot = parseScheduledAutomationSnapshot(input.snapshot) } catch { return false }
-  const proof = exactRecord(input.proof, ["receipt", "completion", "result"]), receipt = parseScheduledPrepareChoiceReceipt(proof?.receipt, input.owner)
-  if (!receipt || receipt.snapshotDigest !== scheduledAutomationSnapshotDigest(snapshot)
-    || (snapshot.requireApproval ? !isScheduledPrepareChoiceWaitId(input.owner.turnId, input.scheduledWaitId) : input.scheduledWaitId !== undefined)) return false
-  const [receipts, candidates] = await Promise.all([
-    db.agentEvent.findMany({ where: { sessionId: input.owner.sessionId, turnId: input.owner.turnId, type: RECEIPT_EVENT, itemId: null, taskId: null, actor: "system" }, select: { payload: true }, take: 65 }),
-    db.agentEvent.findMany({ where: { sessionId: input.owner.sessionId, turnId: input.owner.turnId, taskId: input.owner.rootTaskId, type: CANDIDATE_EVENT },
-      orderBy: { sequence: "desc" }, select: { type: true, taskId: true, correlationId: true, payload: true }, take: 65 }),
-  ])
-  if (receipts.length >= 65 || candidates.length >= 65 || receipts.filter(row => sameCanonicalJson(row.payload, receipt)).length !== 1) return false
-  const latest = await db.agentStep.findFirst({ where: { sessionId: input.owner.sessionId, turnId: input.owner.turnId, taskId: input.owner.rootTaskId },
-    orderBy: { ordinal: "desc" }, select: { id: true } })
-  const matching = candidates.flatMap(row => {
-    const candidate = parseScheduledPrepareChoiceCandidate(row.payload, row.type, row.taskId, row.correlationId, input.owner)
-    return candidate && (snapshot.requireApproval ? scheduledPrepareChoiceId(receipt, candidate.finalStepId, candidate.finalStepOrdinal) === input.scheduledWaitId
-      : candidate.finalStepId === latest?.id) ? [candidate] : []
-  })
-  if (matching.length !== 1 || !latest) return false
-  const candidate = matching[0]!, waitId = scheduledPrepareChoiceId(receipt, candidate.finalStepId, candidate.finalStepOrdinal)
-  if (snapshot.requireApproval && waitId !== input.scheduledWaitId) return false
-  const itemId = `agent-wait:question:${waitId}`
-  const [step, item] = await Promise.all([
-    db.agentStep.findFirst({ where: { id: candidate.finalStepId, sessionId: input.owner.sessionId, turnId: input.owner.turnId,
-      taskId: input.owner.rootTaskId, attempt: 1, ordinal: candidate.finalStepOrdinal }, select: { id: true, status: true } }),
-    db.agentItem.findFirst({ where: { id: itemId, sessionId: input.owner.sessionId, turnId: input.owner.turnId },
-      select: { id: true, stepId: true, taskId: true, type: true, status: true, content: true } }),
-  ])
-  if (!step || latest.id !== candidate.finalStepId || !["streaming", "waiting_for_user", "waiting_for_tool", "completed"].includes(step.status)) return false
-  if (!snapshot.requireApproval) return item === null
-  if (!item) return false
-  const content = exactRecord(item.content, ["waitKind", "questionId", "toolCallId", "stage", "question", "options", "answer", "answerAvailable", "scheduledPrepareChoiceBinding", "answeredAt"])
-  const binding = scheduledPrepareChoiceBinding(receipt, candidate.finalStepId, candidate.finalStepOrdinal)
-  return Boolean(item.id === itemId && item.stepId === candidate.finalStepId && item.taskId === input.owner.rootTaskId && item.type === "question"
-    && content && content.questionId === input.scheduledWaitId
-    && sameCanonicalJson({ waitKind: content.waitKind, toolCallId: content.toolCallId, stage: content.stage, question: content.question, options: content.options }, CHOICE_CONTENT)
-    && sameCanonicalJson(content.scheduledPrepareChoiceBinding, binding)
-    && item.status === "completed" && validIso(content.answeredAt) && content.answerAvailable === true
-    && ["apply_ai_changes", "keep_resume"].includes(String(content.answer)))
-}
 /** Rebuilds a private Gate/Execute state from a verified Worker proof and owner-scoped artifact rows. */
 export async function buildScheduledTaskGraphGateResumeState(input: ScheduledTaskGraphGateResumeInput): Promise<PipelineCheckpointState> {
   const { owner, continuationKey, claimToken } = input
@@ -219,11 +171,6 @@ export async function runScheduledTaskGraphAnalyzeOnly(input: ScheduledTaskGraph
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null
 }
-function exactRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | null {
-  const row = record(value)
-  return row && Reflect.ownKeys(row).length === keys.length && Reflect.ownKeys(row).every(key => typeof key === 'string' && keys.includes(key)) ? row : null
-}
-function validIso(value: unknown): boolean { return typeof value === 'string' && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value }
 function sameCanonicalJson(left: unknown, right: unknown): boolean { try { return canonicalJson(left) === canonicalJson(right) } catch { return false } }
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`

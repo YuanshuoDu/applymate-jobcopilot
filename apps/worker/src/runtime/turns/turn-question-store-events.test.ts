@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from "vitest"
 
+import type { HarnessModelRequest } from "@jobcopilot/agent-model"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
-import { appendQuestionStartedEvents, recoverPausedOrphanUsage } from "./turn-question-store-events.js"
+import { LEGACY_SCHEDULED_PIPELINE_CANDIDATE_SCHEMA, SCHEDULED_PIPELINE_CANDIDATE_SCHEMA,
+  parseScheduledPipelineCandidatePayload, SCHEDULED_PIPELINE_SOURCE_RECEIPT_SCHEMA_VERSION } from "../subagents/scheduled-pipeline-candidate-store.js"
+import { appendQuestionStartedEvents, loadScheduledChoiceBinding, recoverPausedOrphanUsage } from "./turn-question-store-events.js"
+import { buildFinalAnswerEvidenceBindingMap } from "./final-answer-evidence.js"
+import { stableAnswerEvidenceJson } from "./final-answer-evidence-json.js"
 import type { TurnQuestionQueryClient } from "./turn-question-store-guards.js"
 
 const owner: TurnExecutionOwnerFence = {
@@ -9,6 +14,42 @@ const owner: TurnExecutionOwnerFence = {
   ownerId: "lease-1", leaseVersion: 2, leaseExpiresAt: new Date("2026-09-01T00:01:00Z"),
 }
 const input = { owner, stepId: "step-1", itemId: "agent-wait:question:q1", questionId: "q1", toolCallId: "call-1", toolCallCount: 2 }
+
+function scheduledCandidatePayload(schemaVersion: string, sourceReceipt?: unknown) {
+  return { schemaVersion, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId, rootAttemptCount: 2,
+    finalStepId: "step-final", finalStepOrdinal: 4, stepAttempt: 1, candidateText: "Exact final.", finishReason: "stop",
+    usage: { inputTokens: 7, outputTokens: 3, estimatedCostUsd: 0.02 }, ...(sourceReceipt === undefined ? {} : { sourceReceipt }) }
+}
+
+function candidateSourceReceipt() {
+  const scope = { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.rootTaskId, stepId: "step-final" }
+  const job = { id: "private-job", company: "Acme", role: "Engineer", location: null, status: "saved", score: null,
+    url: null, source: null, salary: null, description: null, keywords: null }
+  const output = { jobs: [job], page: 1, hasMore: false }, input = { location: "Dublin" }
+  const snapshot = { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [{ id: "tool-result:call-1",
+    content: { toolCallId: "call-1", toolName: "jobs.search", input, status: "completed", output, errorCode: null } }] }
+  const request = { metadata: scope, messages: [
+    { role: "assistant", content: [{ type: "tool_use", id: "call-1", name: "jobs.search", input }] },
+    { role: "tool", content: [{ type: "tool_result", toolUseId: "call-1", content: stableAnswerEvidenceJson(output) }] },
+  ] } as unknown as HarnessModelRequest
+  const map = buildFinalAnswerEvidenceBindingMap(request, snapshot, scope)
+  if (!map) throw new Error("candidate_source_receipt_fixture_missing")
+  return map.sourceReceipt
+}
+
+function scheduledCandidateClient(payload: unknown) {
+  const calls: string[] = []
+  const query = vi.fn(async (sql: string) => {
+    calls.push(sql)
+    if (sql.includes('FROM "agent_events" AS event JOIN "agent_sessions" AS session')
+      && sql.includes('JOIN "agent_steps" AS step') && sql.includes('JOIN "sub_agent_tasks" AS root')) return { rows: [{ itemId: null,
+      taskId: owner.rootTaskId, actor: "orchestrator", correlationId: "step-final", idempotencyKey: "scheduled-candidate:root-1:2:step-final",
+      payload, stepTaskId: owner.rootTaskId, ordinal: 4, attempt: 1, stepStatus: "streaming", attemptCount: 2, rootStatus: "running" }], rowCount: 1 }
+    if (sql.includes('FROM "agent_turns" AS turn JOIN "agent_executions" AS execution')) return { rows: [], rowCount: 0 }
+    throw new Error("unexpected_scheduled_candidate_query")
+  })
+  return { query, calls, client: { query, release: vi.fn() } }
+}
 
 function pausedUsageFixture(completionPayload: unknown) {
   const stepId = "step-usage"
@@ -97,5 +138,27 @@ describe("native question events", () => {
     await expect(recoverPausedOrphanUsage(fixture.pool as never, owner, new Date("2026-09-01T00:00:10Z")))
       .rejects.toMatchObject({ code: "question_receipt_malformed" })
     expect(fixture.query.mock.calls.some(([sql]) => String(sql).includes('UPDATE "agent_steps"'))).toBe(false)
+  })
+
+  it("accepts legacy and receipt-bearing candidate shapes while rejecting malformed source receipts", async () => {
+    const sourceReceipt = candidateSourceReceipt()
+    expect(sourceReceipt.schemaVersion).toBe(SCHEDULED_PIPELINE_SOURCE_RECEIPT_SCHEMA_VERSION)
+    const acceptedPayloads = [
+      scheduledCandidatePayload(LEGACY_SCHEDULED_PIPELINE_CANDIDATE_SCHEMA),
+      scheduledCandidatePayload(SCHEDULED_PIPELINE_CANDIDATE_SCHEMA),
+      scheduledCandidatePayload(SCHEDULED_PIPELINE_CANDIDATE_SCHEMA, sourceReceipt),
+    ]
+    for (const payload of acceptedPayloads) {
+      expect(parseScheduledPipelineCandidatePayload(payload)).not.toBeNull()
+      const fixture = scheduledCandidateClient(payload)
+      await expect(loadScheduledChoiceBinding(fixture.client as unknown as TurnQuestionQueryClient, { owner }))
+        .rejects.toThrow("scheduled execution binding")
+      expect(fixture.calls.some(sql => sql.includes('FROM "agent_turns" AS turn JOIN "agent_executions" AS execution'))).toBe(true)
+    }
+    const malformed = scheduledCandidatePayload(SCHEDULED_PIPELINE_CANDIDATE_SCHEMA, { ...sourceReceipt, extra: true })
+    const fixture = scheduledCandidateClient(malformed)
+    await expect(loadScheduledChoiceBinding(fixture.client as unknown as TurnQuestionQueryClient, { owner }))
+      .rejects.toThrow("scheduled candidate binding")
+    expect(fixture.calls.some(sql => sql.includes('FROM "agent_turns" AS turn JOIN "agent_executions" AS execution'))).toBe(false)
   })
 })

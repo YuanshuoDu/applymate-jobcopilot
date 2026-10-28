@@ -90,9 +90,11 @@ const v2ApprovalWaitProjection = [owner.userId, owner.sessionId, owner.turnId, o
   v2ApprovalReceipt.evidenceDigest, v2ApprovalReceipt.checkpointDigest, v2ApprovalReceipt.analyzeGraphRevision,
   v2ApprovalReceipt.prepareScheduleRevision, finalStepId, finalStepOrdinal, 1]
 const v2ApprovalWaitId = `agent-question:${owner.turnId}:canonical:${createHash("sha256").update(JSON.stringify(v2ApprovalWaitProjection), "utf8").digest("hex")}`
-const candidatePayload = { schemaVersion: "agent-harness.v2.scheduled-pipeline-candidate.v2", sessionId: owner.sessionId,
+const candidatePayload = { schemaVersion: "agent-harness.v2.scheduled-pipeline-candidate.v3", sessionId: owner.sessionId,
   turnId: owner.turnId, rootTaskId: owner.rootTaskId, rootAttemptCount: owner.rootAttemptCount, finalStepId, finalStepOrdinal,
-  stepAttempt: 1, candidateText: "candidate", finishReason: "stop", usage: { inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0.01 } }
+  stepAttempt: 1, candidateText: "candidate", finishReason: "stop", usage: { inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0.01 },
+  sourceReceipt: { schemaVersion: 1, bindings: [{ key: "E-job-1", observationId: "tool-result:call-1", toolCallId: "call-1",
+    toolName: "jobs.search", sourceRef: "jobs/0", inputDigest: `sha256:${"a".repeat(64)}`, resultDigest: `sha256:${"b".repeat(64)}` }] } }
 const scheduledWaitProjection = [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId, owner.rootAttemptCount,
   owner.executionId, owner.executionAttemptCount, key, prepareReceipt.snapshotDigest, prepareReceipt.evidenceDigest,
   prepareReceipt.checkpointDigest, prepareReceipt.analyzeGraphRevision, prepareReceipt.prepareScheduleRevision, finalStepId, finalStepOrdinal, 1]
@@ -357,6 +359,34 @@ describe("runScheduledTaskGraphAnalyzeOnly", () => {
     await expect(validateScheduledPrepareWaitIdentity({ owner, snapshot, proof })).resolves.toBe(true)
     await expect(validateScheduledPrepareWaitIdentity({ owner, snapshot, proof, scheduledWaitId })).resolves.toBe(false)
     mocks.items.mockResolvedValue(scheduledChoiceItem("apply_ai_changes"))
+    await expect(validateScheduledPrepareWaitIdentity({ owner, snapshot, proof })).resolves.toBe(false)
+  })
+
+  it("accepts legacy v2 and receipt-bearing v3 candidates but rejects malformed or widened payloads", async () => {
+    const { validateScheduledPrepareWaitIdentity } = await import("./scheduled-taskgraph-run-service")
+    const proof = { receipt: prepareReceipt, completion: {}, result: {} }
+    mocks.items.mockResolvedValue(null)
+    const useCandidate = (payload: unknown) => mocks.events.mockImplementation((args: { where: { type: string } }) => Promise.resolve(
+      args.where.type === "agent.plan.scheduled_prepare_binding" ? [{ payload: prepareReceipt }]
+        : [{ type: "native_verification.scheduled_candidate_staged", taskId: owner.rootTaskId, correlationId: finalStepId, payload }]))
+
+    useCandidate(candidatePayload)
+    await expect(validateScheduledPrepareWaitIdentity({ owner, snapshot, proof })).resolves.toBe(true)
+
+    const scopedCandidate = (userId: string) => ({ ...candidatePayload, sourceReceipt: { ...candidatePayload.sourceReceipt,
+      scope: { userId, sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.rootTaskId, stepId: finalStepId } } })
+    useCandidate(scopedCandidate(owner.userId))
+    await expect(validateScheduledPrepareWaitIdentity({ owner, snapshot, proof })).resolves.toBe(true)
+    useCandidate(scopedCandidate("other_user"))
+    await expect(validateScheduledPrepareWaitIdentity({ owner, snapshot, proof })).resolves.toBe(false)
+
+    const { sourceReceipt: _privateReceipt, ...legacyCandidate } = candidatePayload
+    useCandidate({ ...legacyCandidate, schemaVersion: "agent-harness.v2.scheduled-pipeline-candidate.v2" })
+    await expect(validateScheduledPrepareWaitIdentity({ owner, snapshot, proof })).resolves.toBe(true)
+
+    useCandidate({ ...candidatePayload, sourceReceipt: { ...candidatePayload.sourceReceipt, extra: true } })
+    await expect(validateScheduledPrepareWaitIdentity({ owner, snapshot, proof })).resolves.toBe(false)
+    useCandidate({ ...candidatePayload, internalDigest: "must-not-be-accepted" })
     await expect(validateScheduledPrepareWaitIdentity({ owner, snapshot, proof })).resolves.toBe(false)
   })
 

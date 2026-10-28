@@ -1,4 +1,5 @@
 import { schemaVersion } from "@jobcopilot/agent-protocol"
+import { projectCompletedAnswerEvidence, projectFinalAnswerText, redactFinalAnswerText } from "@/lib/agent/session/final-answer-evidence-projection"
 import { projectFinalSummary } from "@/lib/agent/session/final-summary-projection"
 import { projectLegacySubAgentTask } from "@/lib/agent/session/subagent-task-compat"
 import { redactTaskGraphTimelineContent } from "@/lib/task-graph-repair-display"
@@ -7,11 +8,8 @@ import { toIso, type CursorRow } from "./query-helpers"
 import { projectTaskEvidencePreview } from "./task-evidence-preview"
 
 const SENSITIVE_KEY = /(api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|password|secret|private[_-]?key|credential|token|answer|(?:full[_-]?)?resume(?:[_-]?(text|content|data))?|cv(?:[_-]?(text|content|data))?|raw[_-]?(content|text))/i
-const SENSITIVE_TOKEN = /\bBearer\s+[a-z0-9._~+/=-]{8,}/gi
-const SENSITIVE_KEY_TOKEN = /\b(?:sk-|xox[baprs]-)[a-z0-9._~+/=-]{8,}/gi
-
 function redactString(value: string): string {
-  return value.replace(SENSITIVE_TOKEN, "Bearer [REDACTED]").replace(SENSITIVE_KEY_TOKEN, "[REDACTED]")
+  return redactFinalAnswerText(value)
 }
 
 function redactValue(value: unknown, key: string | null = null, depth = 0): unknown {
@@ -76,7 +74,9 @@ export function itemDto(row: ItemQueryRow) {
   if (row.type === "user_message") content = { parts: displayParts(row.content) }
   else if (row.type === "agent_message") {
     const summary = projectFinalSummary(row.type, row.phase, row.status, row.content)
-    content = { text: displayText(row.content), ...(summary ? { summary } : {}) }
+    const answerEvidence = projectCompletedAnswerEvidence(row.content, row.phase, row.status)
+    const answerText = projectFinalAnswerText(row.content, { answerEvidence }) ?? displayText(row.content)
+    content = { text: answerText, ...(summary ? { summary } : {}), ...(answerEvidence ? { answerEvidence } : {}) }
   }
   else if (row.type === "approval_request") content = {
     waitKind: "approval",
