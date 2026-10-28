@@ -13,7 +13,7 @@ describe('Agent playground workspace shell', () => {
   })
 
   it('keeps session console and page content inside the same workspace layout', () => {
-    expect(source).toContain('<AgentSessionConsole {...sessionProps} />')
+    expect(source).toContain('<AgentSessionConsole {...sessionProps} onAttentionChange={onAttentionChange} />')
     expect(source).toContain('{children}')
     expect(source).toMatch(/agent-workspace-layout" style=\{\{ flex: 1, minWidth: 0, minHeight: 0/)
   })

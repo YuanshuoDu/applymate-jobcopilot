@@ -40,5 +40,5 @@ function PreviewLocale({ locale, children }: { locale?: Lang; children: React.Re
     if (locale) setLang(locale)
   }, [locale, setLang])
 
-  return <>{children}</>
+  return <div style={{ display: 'flex', height: '100dvh', minWidth: 0, minHeight: 0, overflow: 'hidden' }}>{children}</div>
 }

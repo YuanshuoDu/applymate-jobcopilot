@@ -58,9 +58,9 @@ export function AgentDiscoveryLauncher({ onTaskGraphStarted, t }: AgentDiscovery
   }
 
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px' }}>
-      <Btn small variant="primary" disabled={unavailable || starting} onClick={startDiscovery}>
-        {starting ? 'Starting…' : `▶ ${t('agent.runNow')}`}
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', minWidth: 0 }}>
+      <Btn small variant="ghost" disabled={unavailable || starting} onClick={startDiscovery}>
+        {starting ? 'Starting…' : t('dashboard.findJobs')}
       </Btn>
       <AgentDiscoveryStatus status={status} />
     </div>
