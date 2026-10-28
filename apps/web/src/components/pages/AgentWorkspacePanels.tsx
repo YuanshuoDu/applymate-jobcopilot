@@ -57,9 +57,9 @@ export function AgentWorkspacePanels({ sessionId, needsAttention, toolbar, detai
       .agent-details-toggle:focus-visible, .agent-details-close:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
       .agent-attention-label { color: #92400e; background: #fef3c7; border-radius: 5px; padding: 2px 5px; font-size: 11px; }
       @media (max-width: 900px) {
-        .agent-workspace-content { flex-direction: column; }
+        .agent-workspace-content { position: relative; flex-direction: column; }
         .agent-workspace-details { flex: 1; width: auto; max-width: none; border-left: 0; }
-        .agent-workspace-content:has(.agent-workspace-details:not([hidden])) > .agent-chat-column { display: none !important; }
+        .agent-workspace-content:has(.agent-workspace-details:not([hidden])) > .agent-chat-column { position: absolute; inset: 0; visibility: hidden; }
         .agent-workspace-toolbar { padding: 6px 10px; flex-wrap: wrap; }
         .agent-details-toggle, .agent-details-close { min-height: 40px; }
       }
