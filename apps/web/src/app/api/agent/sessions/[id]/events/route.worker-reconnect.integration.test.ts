@@ -8,7 +8,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 
 import { EXTENSION_TOKEN_AUDIENCE, EXTENSION_TOKEN_ISSUER, getAuthJwtSecret } from "@/lib/auth-secret"
 import { isPrivateV2EventType } from "@/lib/agent/session/v2-private-event-filter"
-import { publicIdempotencyKey } from "@/lib/agent/session/public-tool-identity"
+import { publicAgentEventId, publicIdempotencyKey } from "@/lib/agent/session/public-tool-identity"
 
 // This suite exercises the real bearer-token auth path. Avoid initializing
 // NextAuth's framework-only cookie/session integration in Vitest's Node runtime.
@@ -499,10 +499,10 @@ describeWithServices("agent events route replays a disconnected Worker event", (
       type: frame.data.type,
       idempotencyKey: frame.data.idempotencyKey,
     }))).toEqual(expectedPublicEvents.map(event => ({
-      id: event.id,
+      id: publicAgentEventId(sessionId, event.id),
       sequence: event.sequence.toString(),
       type: event.type,
-      idempotencyKey: event.idempotencyKey,
+      idempotencyKey: publicIdempotencyKey(sessionId, event.idempotencyKey),
     })))
     expect(duplicateCount).toBe(0)
     expect(missedDurableEvents).toBe(0)

@@ -388,10 +388,10 @@ async function waitForFixtureLine(child: WorkerFixtureProcess, marker: string, t
     if (marker === "FIXTURE_MODEL_CONTEXT_A_OK" && child.output.includes("FIXTURE_MODEL_CONTEXT_A_INVALID")) {
       throw new Error("Snapshot restart Worker A rejected its model context before the restart boundary")
     }
-    const fixtureFailure = child.errors.find(value => value.startsWith("OBJECTIVE_SNAPSHOT_RESTART_FIXTURE_FAILED"))
-    if (fixtureFailure) throw new Error(`Snapshot restart Worker reported ${fixtureFailure}`)
     const line = child.output.find(value => value.startsWith(marker))
     if (line) return line
+    const fixtureFailure = child.errors.find(value => value.startsWith("OBJECTIVE_SNAPSHOT_RESTART_FIXTURE_FAILED"))
+    if (fixtureFailure) throw new Error(`Snapshot restart Worker reported ${fixtureFailure}`)
     if (child.exitCode !== null || child.signalCode !== null) {
       throw new Error(`Snapshot restart Worker exited before ${marker}: ${child.errors.join(" | ")}`)
     }
@@ -465,6 +465,18 @@ async function waitForTurnStatus(pool: Pool, turnId: string, expected: "complete
   throw new Error(`Snapshot restart Turn did not reach ${expected}`)
 }
 
+async function workerAExecutionDiagnostic(pool: Pool, turnId: string) {
+  const result = await pool.query<{ turnStatus: string; rootStatus: string | null; stepStarted: boolean; modelStarted: boolean; modelFailed: boolean }>(
+    `SELECT turn."status" AS "turnStatus", root."status" AS "rootStatus",
+       EXISTS(SELECT 1 FROM "agent_events" WHERE "turnId"=$1 AND "type"='step.started') AS "stepStarted",
+       EXISTS(SELECT 1 FROM "agent_events" WHERE "turnId"=$1 AND "type"='model.started') AS "modelStarted",
+       EXISTS(SELECT 1 FROM "agent_events" WHERE "turnId"=$1 AND "type"='model.failed') AS "modelFailed"
+     FROM "agent_turns" turn LEFT JOIN "sub_agent_tasks" root ON root."id"=turn."rootTaskId"
+       AND root."sessionId"=turn."sessionId" AND root."turnId"=turn."id"
+     WHERE turn."id"=$1`, [turnId])
+  return result.rows[0] ?? null
+}
+
 async function loadAuthorizedCurrentHistory(pool: Pool, fixture: Scenario, turnId: string) {
   const current = await pool.query<{
     userId: string; sessionId: string; turnId: string; ownerId: string; leaseVersion: number | string;
@@ -525,7 +537,12 @@ async function runObjectiveSnapshotWorkerRestart(pool: Pool, corrupt: boolean): 
     const workerAPid = workerA.pid
     expect(workerAPid).toBeTruthy()
     await waitForFixtureLine(workerA, "FIXTURE_WORKER_READY_A")
-    await waitForFixtureLine(workerA, "FIXTURE_MODEL_CONTEXT_A_OK", 45_000)
+    try { await waitForFixtureLine(workerA, "FIXTURE_MODEL_CONTEXT_A_OK", 45_000) } catch {
+      const markers = ["FIXTURE_MODEL_STREAM_ENTERED_A", "FIXTURE_MODEL_CONTEXT_A_INVALID", "FIXTURE_MODEL_CONTEXT_A_OK"]
+        .filter(marker => workerA!.output.includes(marker))
+      const execution = await workerAExecutionDiagnostic(pool, turnId)
+      throw new Error(`Snapshot restart Worker A did not reach its model context; markers=${markers.join(",") || "none"}; execution=${JSON.stringify(execution)}`)
+    }
     const initialSnapshot = await readSnapshotEnvelope(pool, fixture.sessionId)
     expect(initialSnapshot).toHaveLength(1)
     const initialPayload = initialSnapshot[0]?.payload as Record<string, unknown>

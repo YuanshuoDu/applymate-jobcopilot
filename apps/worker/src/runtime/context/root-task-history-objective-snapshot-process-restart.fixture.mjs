@@ -237,8 +237,8 @@ async function run() {
 
 try {
   await run()
-} catch {
-  process.stderr.write("OBJECTIVE_SNAPSHOT_RESTART_FIXTURE_FAILED\n")
+} catch (error) {
+  process.stderr.write(`OBJECTIVE_SNAPSHOT_RESTART_FIXTURE_FAILED_${error instanceof Error && error.message === "objective_snapshot_restart_boundary_missing" ? "RESTART_BOUNDARY_MISSING" : "UNCLASSIFIED"}\n`)
   process.exitCode = 1
 } finally {
   process.stdin.off("data", onStdinData)
