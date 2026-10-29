@@ -112,7 +112,7 @@ jobs:
         run: pnpm --filter @jobcopilot/worker exec vitest run src/queue/production-bootstrap-subagents-redis.integration.test.ts
   agent-runtime-postgres:
     name: Agent runtime PostgreSQL integration
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # This service exists only for this job; migrations and test writes stay in
     # its throwaway database and never use repository/database secrets.
     services:

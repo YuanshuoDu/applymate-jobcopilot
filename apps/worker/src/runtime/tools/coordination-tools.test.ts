@@ -144,7 +144,7 @@ describe("coordination tool definitions", () => {
     expect(listDescription).toContain("totalCount/evidenceCount describe only this node's source")
     expect(listDescription).toContain("Use those reported counts rather than page length")
     expect(listDescription).toContain("ends paging for this node at this revision only; it does not establish task or verification completion")
-    expect(listDescription).toContain("stale or unavailable, refresh current state")
+    expect(listDescription).toContain("If a current page is stale or unavailable, refresh the owner-scoped current graph and use its current revision before retrying")
     expect(listDescription).toContain("Never invent offsets, silently switch modes")
     expect(listDescription).toContain("verification proof")
     expect(listDescription).toContain("fresh ordinary Scout jobs.get")
