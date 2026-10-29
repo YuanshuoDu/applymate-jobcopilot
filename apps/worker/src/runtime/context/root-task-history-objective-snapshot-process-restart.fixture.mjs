@@ -15,6 +15,7 @@ let stdinBuffer = ""
 let stopping = false
 let modelStreamCalls = 0
 let crossSessionSourceQueries = 0
+let workerBReleasePending = true
 const commandWaiters = new Map()
 const queuedCommands = []
 const noOpProjection = { start: async () => undefined, finish: async () => undefined }
@@ -226,8 +227,11 @@ async function startRuntime(firstWorker) {
         historyProjection(request)
         say("FIXTURE_MODEL_CONTEXT_B_OK")
         say(`FIXTURE_CROSS_SESSION_SOURCE_QUERY_COUNT_B ${crossSessionSourceQueries}`)
-        await waitForCommand("release-model")
-        say("FIXTURE_MODEL_RELEASE_RECEIVED_B")
+        if (workerBReleasePending) {
+          await waitForCommand("release-model")
+          workerBReleasePending = false
+          say("FIXTURE_MODEL_RELEASE_RECEIVED_B")
+        }
         yield { type: "text_delta", text: "objective-snapshot-worker-restart-fixture-complete" }
         say("FIXTURE_MODEL_FINAL_TEXT_EMITTED_B")
         say("FIXTURE_MODEL_COMPLETION_EVENT_B")
