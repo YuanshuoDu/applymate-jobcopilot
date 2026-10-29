@@ -478,6 +478,8 @@ const DLQ_ERROR_DIAGNOSTIC_CODES = new Set([
   "lease_not_available", "lease_lost", "invalid_payload", "cognitive_agenda_resume_fence_invalid", "turn_execution_error",
 ])
 const WAIT_DIAGNOSTIC_STATES = new Set(["waiting", "ready", "consumed", "cancelled", "failed", "expired"])
+const CHILD_DIAGNOSTIC_STATES = new Set(["queued", "retrying", "waiting", "waiting_for_user", "waiting_for_dependency", "running"])
+const CHILD_DIAGNOSTIC_ROLES = new Set(["analyst", "prepare", "reviewer", "scout", "writer", "gate", "audit", "orchestrator"])
 function safeDiagnosticCode(value: unknown, allowed: ReadonlySet<string>): string | null {
   return typeof value === "string" ? allowed.has(value) ? value : "other" : null
 }
@@ -487,6 +489,8 @@ async function workerAExecutionDiagnostic(pool: Pool, turnId: string) {
     turnStatus: string; rootStatus: string | null; stepStarted: boolean; modelStarted: boolean; modelFailed: boolean
     rootTaskLinked: boolean; rootTaskPresent: boolean
     waitCount: number; waitStatus: string | null; waitConsumed: boolean; openChildCount: number
+    waitingWaitCount: number; readyWaitCount: number; unconsumedWaitCount: number
+    openChildStatus: string | null; openChildRole: string | null
     hasTurnFailedEvent: boolean; turnFailureCode: string | null; dlqReasonCode: string | null; dlqErrorCode: string | null
   }>(
     `SELECT turn."status" AS "turnStatus", root."status" AS "rootStatus",
@@ -494,8 +498,15 @@ async function workerAExecutionDiagnostic(pool: Pool, turnId: string) {
        (SELECT COUNT(*)::int FROM "agent_wait_conditions" wait WHERE wait."turnId"=turn."id") AS "waitCount",
        (SELECT wait."status" FROM "agent_wait_conditions" wait WHERE wait."turnId"=turn."id" LIMIT 1) AS "waitStatus",
        COALESCE((SELECT wait."consumedAt" IS NOT NULL FROM "agent_wait_conditions" wait WHERE wait."turnId"=turn."id" LIMIT 1),false) AS "waitConsumed",
+       (SELECT COUNT(*)::int FROM "agent_wait_conditions" wait WHERE wait."turnId"=turn."id" AND wait."status"='waiting') AS "waitingWaitCount",
+       (SELECT COUNT(*)::int FROM "agent_wait_conditions" wait WHERE wait."turnId"=turn."id" AND wait."status"='ready') AS "readyWaitCount",
+       (SELECT COUNT(*)::int FROM "agent_wait_conditions" wait WHERE wait."turnId"=turn."id" AND wait."consumedAt" IS NULL) AS "unconsumedWaitCount",
        (SELECT COUNT(*)::int FROM "sub_agent_tasks" child WHERE child."turnId"=turn."id" AND child."id"<>turn."rootTaskId"
          AND (child."status" IS NULL OR child."status" NOT IN ('completed','failed','interrupted','cancelled','closed'))) AS "openChildCount",
+       (SELECT child."status" FROM "sub_agent_tasks" child WHERE child."turnId"=turn."id" AND child."id"<>turn."rootTaskId"
+         AND (child."status" IS NULL OR child."status" NOT IN ('completed','failed','interrupted','cancelled','closed')) ORDER BY child."id" LIMIT 1) AS "openChildStatus",
+       (SELECT child."role" FROM "sub_agent_tasks" child WHERE child."turnId"=turn."id" AND child."id"<>turn."rootTaskId"
+         AND (child."status" IS NULL OR child."status" NOT IN ('completed','failed','interrupted','cancelled','closed')) ORDER BY child."id" LIMIT 1) AS "openChildRole",
        EXISTS(SELECT 1 FROM "agent_events" WHERE "turnId"=$1 AND "type"='step.started') AS "stepStarted",
        EXISTS(SELECT 1 FROM "agent_events" WHERE "turnId"=$1 AND "type"='model.started') AS "modelStarted",
        EXISTS(SELECT 1 FROM "agent_events" WHERE "turnId"=$1 AND "type"='model.failed') AS "modelFailed",
@@ -513,6 +524,8 @@ async function workerAExecutionDiagnostic(pool: Pool, turnId: string) {
   return {
     ...row,
     waitStatus: typeof row.waitStatus === "string" ? WAIT_DIAGNOSTIC_STATES.has(row.waitStatus) ? row.waitStatus : "other" : null,
+    openChildStatus: typeof row.openChildStatus === "string" ? CHILD_DIAGNOSTIC_STATES.has(row.openChildStatus) ? row.openChildStatus : "other" : null,
+    openChildRole: typeof row.openChildRole === "string" ? CHILD_DIAGNOSTIC_ROLES.has(row.openChildRole) ? row.openChildRole : "other" : null,
     turnFailureCode: safeDiagnosticCode(row.turnFailureCode, TURN_FAILURE_DIAGNOSTIC_CODES),
     dlqReasonCode: safeDiagnosticCode(row.dlqReasonCode, DLQ_DIAGNOSTIC_CODES),
     dlqErrorCode: safeDiagnosticCode(row.dlqErrorCode, DLQ_ERROR_DIAGNOSTIC_CODES),
@@ -678,10 +691,11 @@ async function runObjectiveSnapshotWorkerRestart(pool: Pool, corrupt: boolean): 
       expect(sourceTurnIds).toEqual([fixture.sourceTurnId])
       workerB.stdin?.write("release-model\n")
       try { await waitForTurnStatus(pool, turnId, "completed", 30_000) } catch {
+        const childMarkers = workerA!.output.filter(line => line === "FIXTURE_PARENT_SUSPENDED" || line === "FIXTURE_CHILD_EXECUTOR_RETURNING_COMPLETED")
         const markers = workerB.output.filter(line => /^FIXTURE_(WORKER_READY_B|MODEL_STREAM_ENTERED_B|MODEL_CONTEXT_B_OK|CROSS_SESSION_SOURCE_QUERY_COUNT_B|MODEL_RELEASE_RECEIVED_B|MODEL_FINAL_TEXT_EMITTED_B|MODEL_COMPLETION_EVENT_B)\b/.test(line))
         const fixtureFailure = workerB.errors.find(line => line.startsWith("OBJECTIVE_SNAPSHOT_RESTART_FIXTURE_FAILED")) ?? "none"
         const execution = await workerAExecutionDiagnostic(pool, turnId)
-        throw new Error(`Snapshot restart Turn did not reach completed; workerBMarkers=${markers.join(",") || "none"}; fixtureFailure=${fixtureFailure}; execution=${JSON.stringify(execution)}`)
+        throw new Error(`Snapshot restart Turn did not reach completed; childMarkers=${childMarkers.join(",") || "none"}; workerBMarkers=${markers.join(",") || "none"}; fixtureFailure=${fixtureFailure}; execution=${JSON.stringify(execution)}`)
       }
       await stopFixtureWorker(workerB)
       expect(workerB.exitCode).toBe(0)

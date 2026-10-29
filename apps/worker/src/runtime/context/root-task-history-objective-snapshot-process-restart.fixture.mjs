@@ -139,6 +139,7 @@ async function startRuntime(firstWorker) {
     await waitForHistorySuspension(lease.turnId)
     say("FIXTURE_PARENT_SUSPENDED")
     await waitForCommand("complete-child")
+    say("FIXTURE_CHILD_EXECUTOR_RETURNING_COMPLETED")
     return { status: "completed", result: { proof: "objective-snapshot-child-completed", taskId: lease.id } }
   }
   const runtimeOptions = {
