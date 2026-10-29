@@ -577,7 +577,8 @@ async function runObjectiveSnapshotWorkerRestart(pool: Pool, corrupt: boolean): 
       const execution = await workerAExecutionDiagnostic(pool, turnId)
       const fixtureFailure = ["OBJECTIVE_SNAPSHOT_RESTART_FIXTURE_FAILED_RESTART_BOUNDARY_MISSING", "OBJECTIVE_SNAPSHOT_RESTART_FIXTURE_FAILED_UNCLASSIFIED"]
         .find(marker => workerA!.errors.includes(marker)) ?? "none"
-      throw new Error(`Snapshot restart Worker A did not reach its model context; markers=${markers.join(",") || "none"}; fixtureFailure=${fixtureFailure}; execution=${JSON.stringify(execution)}`)
+      const stages = workerA!.output.filter(value => value.startsWith("FIXTURE_STAGE_")).slice(-32)
+      throw new Error(`Snapshot restart Worker A did not reach its model context; markers=${markers.join(",") || "none"}; stages=${stages.join(",") || "none"}; fixtureFailure=${fixtureFailure}; execution=${JSON.stringify(execution)}`)
     }
     const initialSnapshot = await readSnapshotEnvelope(pool, fixture.sessionId)
     expect(initialSnapshot).toHaveLength(1)

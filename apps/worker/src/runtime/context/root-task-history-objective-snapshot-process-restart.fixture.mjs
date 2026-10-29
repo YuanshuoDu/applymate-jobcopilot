@@ -1,5 +1,7 @@
 import { Pool } from "pg"
 import { createCanonicalTurnRuntime } from "../canonical-turn-runtime.ts"
+import { loadCanonicalTurnState } from "../canonical-turn-state.ts"
+import { createPgRootTaskStore } from "../subagents/root-task-store.ts"
 import { startProductionAgentRuntime as startProductionAgentRuntimeHelper } from "../../queue/production-bootstrap.ts"
 import { startProductionWorkerRuntime } from "../../queue/production-worker-runtime.ts"
 const [, , mode, rawInput] = process.argv
@@ -14,6 +16,10 @@ const commandWaiters = new Map()
 const queuedCommands = []
 const noOpProjection = { start: async () => undefined, finish: async () => undefined }
 function say(line) { process.stdout.write(`${line}\n`) }
+function safeRootSetupError(error) {
+  const allowed = new Set(["root_turn_not_owned", "root_task_missing", "root_task_terminal", "root_turn_fenced", "root_objective_history_projection_failed"])
+  return error instanceof Error && allowed.has(error.message) ? error.message : "other"
+}
 function waitForCommand(command) {
   const queued = queuedCommands.indexOf(command)
   if (queued >= 0) { queuedCommands.splice(queued, 1); return Promise.resolve() }
@@ -137,7 +143,45 @@ async function startRuntime(firstWorker) {
     await waitForCommand("complete-child")
     return { status: "completed", result: { proof: "objective-snapshot-child-completed", taskId: lease.id } }
   }
+  const durableRootTaskStore = createPgRootTaskStore(pool)
+  const tracedRootTaskStore = {
+    ...durableRootTaskStore,
+    async reconcileTerminal(input) {
+      say("FIXTURE_STAGE_RECONCILE_STARTED")
+      try {
+        const result = await durableRootTaskStore.reconcileTerminal(input)
+        say("FIXTURE_STAGE_RECONCILE_COMPLETED")
+        return result
+      } catch (error) {
+        say("FIXTURE_STAGE_RECONCILE_FAILED")
+        throw error
+      }
+    },
+    async ensure(input) {
+      say("FIXTURE_STAGE_ROOT_ENSURE_STARTED")
+      try {
+        const result = await durableRootTaskStore.ensure(input)
+        say("FIXTURE_STAGE_ROOT_ENSURE_COMPLETED")
+        return result
+      } catch (error) {
+        say(`FIXTURE_STAGE_ROOT_ENSURE_FAILED_${safeRootSetupError(error)}`)
+        throw error
+      }
+    },
+  }
   const runtimeOptions = {
+    rootTaskStore: tracedRootTaskStore,
+    async stateLoader(...args) {
+      say("FIXTURE_STAGE_STATE_LOAD_STARTED")
+      try {
+        const state = await loadCanonicalTurnState(...args)
+        say("FIXTURE_STAGE_STATE_LOAD_COMPLETED")
+        return state
+      } catch (error) {
+        say("FIXTURE_STAGE_STATE_LOAD_FAILED")
+        throw error
+      }
+    },
     authorizeUsage: async () => ({ settle() {} }),
     modelRuntimeFactory() {
       let calls = 0
