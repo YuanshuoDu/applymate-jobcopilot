@@ -6,6 +6,7 @@ vi.mock('@/lib/api-helpers', () => ({ requireAuth: mocks.requireAuth, isErrorRes
 vi.mock('@/lib/db', () => ({ db: { $transaction: mocks.transaction } }))
 vi.mock('@/lib/db/tenant-store', () => ({ runWithTenantContext: mocks.tenantContext }))
 import { GET } from './route'
+import { AUDIT_ACTIVITY_PREFIX } from '@/lib/application-audit'
 
 const request = (query = '') => new NextRequest('http://localhost/api/me/activity' + query)
 
@@ -36,7 +37,7 @@ describe('GET /api/me/activity', () => {
     expect(mocks.tenantContext).toHaveBeenCalledWith('signed-in-user', expect.any(Function))
     expect(mocks.transaction).toHaveBeenCalledOnce()
     expect(mocks.findMany).toHaveBeenCalledWith({
-      where: { userId: 'signed-in-user' },
+      where: { userId: 'signed-in-user', NOT: { text: { startsWith: AUDIT_ACTIVITY_PREFIX } } },
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: 12,
       select: { id: true, text: true, createdAt: true },
@@ -55,6 +56,23 @@ describe('GET /api/me/activity', () => {
     const data = await response.json()
     expect(data).toEqual({ ownerId: 'signed-in-user', items: [{ id: 'entry-a', text: 'User-authored <text> [Auditor] content', createdAt: '2026-10-28T10:00:00.000Z' }] })
     expect(JSON.stringify(data)).not.toMatch(/other-user|FOREIGN|PRIVATE ROLE|color|job/)
+  })
+
+  it('excludes internal audit entries before limiting the recent feed', async () => {
+    const createdAt = new Date('2026-10-28T10:00:00Z')
+    const rows = [
+      ...Array.from({ length: 14 }, (_, i) => ({ id: `audit-${i}`, userId: 'signed-in-user', text: `${AUDIT_ACTIVITY_PREFIX}{"private":"SECRET"}`, createdAt })),
+      ...Array.from({ length: 14 }, (_, i) => ({ id: `item-${String(i).padStart(2, '0')}`, userId: 'signed-in-user', text: i === 13 ? 'Note mentions [Auditor] application-audit in ordinary text' : `Saved job ${i}`, createdAt })),
+      { id: 'foreign', userId: 'other-user', text: 'FOREIGN', createdAt },
+    ]
+    mocks.findMany.mockImplementation(async ({ where, take }: { where: { userId: string; NOT: { text: { startsWith: string } } }; take: number }) =>
+      rows.filter(row => row.userId === where.userId && !row.text.startsWith(where.NOT.text.startsWith))
+        .sort((a, b) => b.id.localeCompare(a.id)).slice(0, take))
+    const result = await (await GET(request())).json()
+    expect(result.items).toHaveLength(12)
+    expect(result.items.map((row: { id: string }) => row.id)).toEqual(Array.from({ length: 12 }, (_, i) => `item-${String(13 - i).padStart(2, '0')}`))
+    expect(result.items[0].text).toBe('Note mentions [Auditor] application-audit in ordinary text')
+    expect(JSON.stringify(result)).not.toMatch(/SECRET|FOREIGN|audit-13/)
   })
 
   it('preserves distinct rows even if their user-visible text and timestamps match', async () => {

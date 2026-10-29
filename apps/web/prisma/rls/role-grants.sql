@@ -16,13 +16,20 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
   "User", "Account", "Session", "user_plan_changes", "user_plan_subscriptions", "user_feature_overrides",
   "Job", "application_tasks", "application_task_events", "Resume", "ResumeVersion", "persona_facts",
   "persona_evidence_chunks", "Activity", "user_api_keys", "AgentConfig", "AgentRole", "apply_results",
-  "form_patterns", "ai_budgets", "job_api_usage_events", "discovery_optimization_events", "ai_budget_adjustments", "ai_budget_reset_requests", "ai_usage_events", "external_api_usage_events", "notifications", "gmail_sync_states",
+  "form_patterns", "ai_budgets", "job_api_usage_events", "discovery_optimization_events", "ai_budget_adjustments", "ai_budget_reset_requests", "external_api_usage_events", "notifications", "gmail_sync_states",
   "gmail_messages", "gmail_recommendations", "AgentRunQuestion", "agent_runs", "agent_executions",
   "agent_sessions", "agent_turns", "agent_steps", "agent_inputs", "agent_items", "agent_events", "agent_outbox",
   "sub_agent_tasks", "agent_mailbox_messages", "agent_mailbox_hydration_checkpoints", "agent_transcript_events", "agent_approvals", "agent_action_reservations", "agent_automations", "agent_context_snapshots",
   "CustomAgentRole", "Direction", "CoverLetter", "support_cases", "support_case_messages",
   "support_case_escalations", "admin_data_deletion_requests"
 TO applymate_candidate;
+
+-- Usage events need only tenant-owned reads/inserts and broker settlement columns.
+-- This revokes direct table-wide writes only; inherited and PUBLIC privileges need a separate audit.
+REVOKE UPDATE, DELETE ON TABLE "ai_usage_events" FROM applymate_candidate;
+GRANT SELECT, INSERT ON TABLE "ai_usage_events" TO applymate_candidate;
+GRANT UPDATE (status, input_tokens, output_tokens, estimated_cost_usd, error_code)
+  ON TABLE "ai_usage_events" TO applymate_candidate;
 
 -- Agent wait details are observational; candidate requests may read waits but never mutate them.
 GRANT SELECT ON TABLE "agent_wait_conditions" TO applymate_candidate;

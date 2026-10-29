@@ -60,7 +60,7 @@ describe('Personal usage in Settings', () => {
       mocks.api.mockImplementation((url: string) => ({ data: url.startsWith('/api/me/usage') ? recorded : invalid, loading: false, error: null, refetch: vi.fn() }))
       const html = renderToStaticMarkup(<SettingsUsageActivity />)
       expect(html).toContain('Activity could not be loaded')
-      expect(html).not.toContain('No activity recorded yet')
+      expect(html).not.toContain('No visible activity yet')
       expect(html).not.toContain('private activity')
       expect(html).toContain('example-model')
     }
@@ -139,7 +139,7 @@ describe('Personal usage in Settings', () => {
     mocks.api.mockImplementation((url: string) => ({ data: url.startsWith('/api/me/usage') ? { ...recorded, summary: { calls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 }, daily: recorded.daily.map(row => ({ ...row, calls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 })), models: [] } : noActivities, loading: false, error: null, refetch: vi.fn() }))
     const html = renderToStaticMarkup(<SettingsUsageActivity />)
     expect(html).toContain('No recorded AI requests in this period')
-    expect(html).toContain('No activity recorded yet')
+    expect(html).toContain('No visible activity yet')
     expect(html).not.toContain('role="img"')
   })
 
