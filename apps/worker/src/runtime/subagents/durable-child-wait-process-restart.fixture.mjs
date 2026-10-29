@@ -171,7 +171,8 @@ async function claimExactWaitReissue(lease, owner, wait, continuation, now, opti
   if (!restoredWait || restoredWait.continuationStepId !== continuation.id || restoredWait.continuationOrdinal !== continuation.ordinal) {
     throw new Error("durable_child_wait_claim_continuation_not_restored")
   }
-  const replay = createChildDurableWaitReplay(lease, restoredWait, restored.observations, () => new Date())
+  if (restored.childWaitClaimRecovery) throw new Error("durable_child_wait_claimed_before_reissue")
+  const replay = createChildDurableWaitReplay(lease, restoredWait, restored.observations)
   replay.acknowledgeContinuation({ id: continuation.id, ordinal: continuation.ordinal })
   const call = { id: optionsForCut.crashBeforeClaim
     ? `child-wait-reissue:${lease.id}:attempt:${lease.attemptCount}:orphan`
