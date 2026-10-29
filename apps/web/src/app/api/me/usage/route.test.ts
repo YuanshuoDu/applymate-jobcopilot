@@ -35,9 +35,12 @@ describe('GET /api/me/usage', () => {
     const statement = mocks.queryRaw.mock.calls[0][0]
     expect(statement.values).toEqual(['signed-in-user', new Date('2026-10-22T00:00:00Z'), new Date('2026-10-28T12:00:00Z')])
     expect(statement.text).toMatch(/WHERE user_id = \$1/)
-    expect(statement.text).toMatch(/created_at >= \$2 AND created_at < \$3/)
+    expect(statement.text).toMatch(/created_at >= \(\$2::timestamptz AT TIME ZONE 'UTC'\)/)
+    expect(statement.text).toMatch(/created_at < \(\$3::timestamptz AT TIME ZONE 'UTC'\)/)
+    expect(statement.text).toContain("feature_key <> 'providerTest'")
     expect(statement.text).toContain("status IN ('success', 'error')")
     expect(JSON.stringify(payload)).not.toContain('other-user')
+    expect(payload.ownerId).toBe('signed-in-user')
     expect(payload.daily).toHaveLength(7)
     expect(response.headers.get('Cache-Control')).toBe('no-store')
   })
@@ -49,7 +52,7 @@ describe('GET /api/me/usage', () => {
     expect(payload.days).toBe(30)
     expect(payload.from).toBe('2026-09-29T00:00:00.000Z')
     expect(payload.summary).toEqual({ calls: 2, inputTokens: 90, outputTokens: 10, totalTokens: 100 })
-    expect(Object.keys(payload).sort()).toEqual(['daily', 'days', 'from', 'models', 'summary', 'timezone', 'to'])
+    expect(Object.keys(payload).sort()).toEqual(['daily', 'days', 'from', 'models', 'ownerId', 'summary', 'timezone', 'to'])
     expect(JSON.stringify(payload)).not.toMatch(/cost|quality|successRate|userId|featureKey|errorCode/)
   })
 

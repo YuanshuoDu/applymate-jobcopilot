@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest"
-import { projectTaskGraphPlanningCounts, withTaskGraphPlanningCounts } from "./task-graph-planning-facts-context.js"
+import type { TaskGraphCurrentNode } from "./subagents/task-graph-command-port.js"
+import { withTaskGraphCurrentPlanningObservation } from "./canonical-turn-task-graph-capacity.js"
+import {
+  projectTaskGraphPlanningCounts,
+  projectTaskGraphPlanningScoutOverlap,
+  withTaskGraphPlanningCounts,
+  withTaskGraphPlanningScoutOverlap,
+} from "./task-graph-planning-facts-context.js"
 
 const counts = {
   discoveredJobs: { knownCount: 8, coverage: "complete" },
@@ -9,6 +16,20 @@ const counts = {
   reviewOutcomes: { knownCount: null, coverage: "not_requested" },
 }
 const facts = { graphRevision: 7, counts }
+
+function scoutNode(key: string, status: TaskGraphCurrentNode["status"] = "completed"): TaskGraphCurrentNode {
+  return {
+    key, templateId: "scout", goal: "Find candidates", successCriteria: ["Return candidates"], dependsOn: [],
+    taskId: `private-task-${key}`, status, readiness: "terminal", resultSummary: null, failureReason: null,
+  }
+}
+
+function scoutRow(key: string, overrides: Record<string, unknown> = {}) {
+  return {
+    key, taskStatus: "completed", resultStatus: "completed", resultCoverage: "complete",
+    reportedCount: 2, sharedCount: 1, ...overrides,
+  }
+}
 
 describe("projectTaskGraphPlanningCounts", () => {
   it("returns fresh counts only when the facts revision matches", () => {
@@ -137,5 +158,94 @@ describe("withTaskGraphPlanningCounts", () => {
 
     expect(complete).toEqual({ ...baseContent, taskReportedCounts: projected })
     expect(withTaskGraphPlanningCounts(baseContent, null, 1_000)).toBe(baseContent)
+  })
+})
+
+describe("projectTaskGraphPlanningScoutOverlap", () => {
+  it("projects distinct report overlap by current Scout node key without exposing identifiers", () => {
+    const overlap = {
+      coverage: "complete",
+      scouts: [scoutRow("scout-a"), scoutRow("scout-b", { reportedCount: 3, sharedCount: 2 })],
+    }
+    const projected = projectTaskGraphPlanningScoutOverlap({ ...facts, scoutOverlap: overlap }, 7, [scoutNode("scout-a"), scoutNode("scout-b")])
+
+    expect(projected).toEqual({
+      coverage: "complete",
+      scouts: [
+        { key: "scout-a", taskStatus: "completed", resultCoverage: "complete", reportedCount: 2, sharedCount: 1 },
+        { key: "scout-b", taskStatus: "completed", resultCoverage: "complete", reportedCount: 3, sharedCount: 2 },
+      ],
+    })
+    expect(JSON.stringify(projected)).not.toMatch(/jobId|taskId|private-task/)
+  })
+
+  it("keeps valid completed-empty, partial, unavailable, and no-Scout states distinct", () => {
+    const empty = { coverage: "complete", scouts: [scoutRow("empty", { reportedCount: 0, sharedCount: 0 })] }
+    expect(projectTaskGraphPlanningScoutOverlap({ ...facts, scoutOverlap: empty }, 7, [scoutNode("empty")])?.scouts[0])
+      .toMatchObject({ resultCoverage: "complete", reportedCount: 0, sharedCount: 0 })
+
+    const partial = { coverage: "partial", scouts: [scoutRow("partial", { resultStatus: "partial", resultCoverage: "partial", reportedCount: 2, sharedCount: 0 })] }
+    expect(projectTaskGraphPlanningScoutOverlap({ ...facts, scoutOverlap: partial }, 7, [scoutNode("partial")])?.scouts[0])
+      .toMatchObject({ taskStatus: "completed", resultCoverage: "partial", reportedCount: 2 })
+
+    const unavailable = { coverage: "unavailable", scouts: [scoutRow("failed", {
+      taskStatus: "failed", resultStatus: null, resultCoverage: "unavailable", reportedCount: null, sharedCount: null,
+    })] }
+    expect(projectTaskGraphPlanningScoutOverlap({ ...facts, scoutOverlap: unavailable }, 7, [scoutNode("failed", "failed")]))
+      .toMatchObject({ coverage: "unavailable", scouts: [{ taskStatus: "failed", resultCoverage: "unavailable", reportedCount: null }] })
+
+    const notRequested = { coverage: "not_requested", scouts: [] }
+    expect(projectTaskGraphPlanningScoutOverlap({ ...facts, scoutOverlap: notRequested }, 7, [])).toEqual(notRequested)
+  })
+
+  it("marks nonterminal results unavailable and requires lifecycle and result coverage to agree", () => {
+    const unavailable = { coverage: "unavailable", scouts: [scoutRow("running", {
+      taskStatus: "running", resultStatus: null, resultCoverage: "unavailable", reportedCount: null, sharedCount: null,
+    })] }
+    expect(projectTaskGraphPlanningScoutOverlap({ ...facts, scoutOverlap: unavailable }, 7, [scoutNode("running", "running")]))
+      .toMatchObject({ coverage: "unavailable" })
+    const invented = { coverage: "complete", scouts: [scoutRow("running", { taskStatus: "running" })] }
+    expect(projectTaskGraphPlanningScoutOverlap({ ...facts, scoutOverlap: invented }, 7, [scoutNode("running", "running")])).toBeNull()
+
+    const terminalButFailed = { coverage: "partial", scouts: [scoutRow("failed", { taskStatus: "failed" })] }
+    expect(projectTaskGraphPlanningScoutOverlap({ ...facts, scoutOverlap: terminalButFailed }, 7, [scoutNode("failed", "failed")]))
+      .toMatchObject({ coverage: "partial", scouts: [{ resultCoverage: "complete", reportedCount: 2 }] })
+  })
+
+  it.each([
+    ["stale revision", { ...facts, graphRevision: 6, scoutOverlap: { coverage: "complete", scouts: [scoutRow("scout-a")] } }, [scoutNode("scout-a")]],
+    ["duplicate key", { ...facts, scoutOverlap: { coverage: "complete", scouts: [scoutRow("scout-a"), scoutRow("scout-a")] } }, [scoutNode("scout-a"), scoutNode("scout-b")]],
+    ["unbound key", { ...facts, scoutOverlap: { coverage: "complete", scouts: [scoutRow("private-task-id")] } }, [scoutNode("scout-a")]],
+    ["mismatched task status", { ...facts, scoutOverlap: { coverage: "complete", scouts: [scoutRow("scout-a", { taskStatus: "failed" })] } }, [scoutNode("scout-a")]],
+    ["negative count", { ...facts, scoutOverlap: { coverage: "complete", scouts: [scoutRow("scout-a", { sharedCount: -1 })] } }, [scoutNode("scout-a")]],
+    ["shared exceeds reported", { ...facts, scoutOverlap: { coverage: "complete", scouts: [scoutRow("scout-a", { reportedCount: 1, sharedCount: 2 })] } }, [scoutNode("scout-a")]],
+    ["raw IDs in row", { ...facts, scoutOverlap: { coverage: "complete", scouts: [{ ...scoutRow("scout-a"), jobIds: ["private-job"] }] } }, [scoutNode("scout-a")]],
+    ["invalid outer coverage", { ...facts, scoutOverlap: { coverage: "unavailable", scouts: [scoutRow("scout-a")] } }, [scoutNode("scout-a")]],
+  ])("omits %s overlap", (_label, input, nodes) => {
+    expect(projectTaskGraphPlanningScoutOverlap(input, 7, nodes as TaskGraphCurrentNode[])).toBeNull()
+  })
+
+  it("keeps valid counts when the optional overlap is malformed or stale", () => {
+    const malformed = { ...facts, scoutOverlap: { coverage: "complete", scouts: [] } }
+    expect(projectTaskGraphPlanningCounts(malformed, 7)).toEqual(counts)
+    expect(projectTaskGraphPlanningScoutOverlap(malformed, 7, [scoutNode("scout-a")])).toBeNull()
+  })
+})
+
+describe("withTaskGraphPlanningScoutOverlap", () => {
+  it("omits only overlap on budget overflow, preserving projected counts and capacity", () => {
+    const nodes = [scoutNode("scout-a")]
+    const overlap = { coverage: "complete", scouts: [scoutRow("scout-a")] }
+    const base = { kind: "task_graph_current", revision: 7, nodes: ["x".repeat(1_000)] }
+    const full = withTaskGraphCurrentPlanningObservation(base, { ...facts, scoutOverlap: overlap }, 7, nodes, 10_000)
+    const noOverlap = { ...full }
+    Reflect.deleteProperty(noOverlap, "taskReportedScoutOverlap")
+    const budget = JSON.stringify(full).length - 1
+
+    expect(JSON.stringify(noOverlap).length).toBeLessThanOrEqual(budget)
+    const bounded = withTaskGraphCurrentPlanningObservation(base, { ...facts, scoutOverlap: overlap }, 7, nodes, budget)
+    expect(bounded).toHaveProperty("taskReportedCounts")
+    expect(bounded).toHaveProperty("nodeCapacity")
+    expect(bounded).not.toHaveProperty("taskReportedScoutOverlap")
   })
 })

@@ -24,7 +24,9 @@ describe('personal usage read model', () => {
     const result = await readPersonalUsage({ $queryRaw: query }, 'owner-1', 7, new Date('2026-10-28T12:34:56Z'))
     const statement = query.mock.calls[0][0]
     expect(statement.text).toMatch(/user_id = \$1/)
-    expect(statement.text).toMatch(/created_at >= \$2 AND created_at < \$3/)
+    expect(statement.text).toMatch(/created_at >= \(\$2::timestamptz AT TIME ZONE 'UTC'\)/)
+    expect(statement.text).toMatch(/created_at < \(\$3::timestamptz AT TIME ZONE 'UTC'\)/)
+    expect(statement.text).toContain("feature_key <> 'providerTest'")
     expect(statement.text).toContain("status IN ('success', 'error')")
     expect(statement.values).toEqual(['owner-1', new Date('2026-10-22T00:00:00Z'), new Date('2026-10-28T12:34:56Z')])
     expect(result).toMatchObject({ days: 7, timezone: 'UTC', from: '2026-10-22T00:00:00.000Z', to: '2026-10-28T12:34:56.000Z' })

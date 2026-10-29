@@ -100,4 +100,25 @@ describe('generic cover-letter persistence ownership', () => {
       data: expect.objectContaining({ userId: 'user_1', jobId: 'job_1', resumeId: 'resume_1' }),
     }))
   })
+
+  it('attributes every fallback attempt to the owner without passing the primary credential or changing credits', async () => {
+    mocks.prepareAiRoute.mockResolvedValue({ userId: 'user_1', cfg: {
+      provider: 'openai', model: 'gpt-4o', apiKey: 'primary-provider-secret',
+      usageUserId: 'user_1', usageFeatureKey: 'coverLetter', usageRuntime: 'web',
+    } })
+    mocks.modelChat.mockRejectedValueOnce(new Error('primary failed')).mockRejectedValueOnce(new Error('fallback failed'))
+      .mockResolvedValueOnce({ text: 'Dear Hiring Manager,\n\nThank you.\n\nSincerely,' })
+    const { POST } = await import('./route')
+    const response = await POST(request({ resumeContent: { contact: { name: 'Ada' } }, jobTitle: 'Engineer', jobCompany: 'Acme' }))
+
+    expect(response?.status).toBe(200)
+    expect(mocks.modelChat).toHaveBeenCalledTimes(3)
+    expect(mocks.modelChat.mock.calls[0]).toHaveLength(3)
+    for (const [index, provider] of [[1, 'deepseek'], [2, 'minimax']] as const) {
+      const [, config, , usage] = mocks.modelChat.mock.calls[index]
+      expect(config).toMatchObject({ provider })
+      expect(config).not.toHaveProperty('apiKey')
+      expect(usage).toEqual({ userId: 'user_1', featureKey: 'coverLetter', runtime: 'web', chargeBudget: false })
+    }
+  })
 })

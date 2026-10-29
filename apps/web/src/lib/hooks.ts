@@ -49,11 +49,15 @@ export function useApi<T>(url: string, options: { cache?: boolean; enabled?: boo
     try {
       const res  = await fetch(url, { signal: requestSignal, cache: cacheEnabled ? 'default' : 'no-store' })
       const json = await res.json().catch(() => ({}))
+      // Cleanup can abort after fetch resolves, while the body is still decoding.
+      // Do not publish either a late payload or the JSON fallback from that request.
+      if (requestSignal?.aborted) throw new DOMException('Aborted', 'AbortError')
       if (!res.ok) throw new Error((json as { error?: string }).error ?? 'Request failed')
       const nextData = json as T
       if (cacheEnabled) setCachedApiResponse(url, nextData, userId)
       setData(nextData)
     } catch (e) {
+      if (signal?.aborted) return
       if (timedOut) {
         setError(`Request timed out after ${Math.ceil(timeoutMs / 1000)} seconds. Try refreshing.`)
         return

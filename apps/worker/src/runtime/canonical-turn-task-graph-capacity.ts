@@ -1,28 +1,41 @@
 import { taskGraphNodeCapacity, type TaskGraphNodeCapacity } from "./planning/task-graph-capacity.js"
 import type { TaskGraphCurrentNode } from "./subagents/task-graph-command-port.js"
-import { projectTaskGraphPlanningCounts, withTaskGraphPlanningCounts } from "./task-graph-planning-facts-context.js"
+import {
+  projectTaskGraphPlanningCounts,
+  projectTaskGraphPlanningScoutOverlap,
+  withTaskGraphPlanningCounts,
+  withTaskGraphPlanningScoutOverlap,
+} from "./task-graph-planning-facts-context.js"
 
-/** Adds only the bounded current-capacity and revision-matched count facts to the base observation. */
+type Counts = NonNullable<ReturnType<typeof projectTaskGraphPlanningCounts>>
+type ScoutOverlap = NonNullable<ReturnType<typeof projectTaskGraphPlanningScoutOverlap>>
+type PlanningObservation<T extends Record<string, unknown>> = T & Partial<{
+  taskReportedCounts: Counts
+  taskReportedScoutOverlap: ScoutOverlap
+  nodeCapacity: TaskGraphNodeCapacity
+}>
+
+/** Adds bounded capacity and current revision-bound advisory planning facts to the observation. */
 export function withTaskGraphCurrentPlanningObservation<T extends Record<string, unknown>>(
   base: T,
   planningFacts: unknown,
   revision: number,
   nodes: readonly TaskGraphCurrentNode[],
   maxChars: number,
-): T | (T & { taskReportedCounts: NonNullable<ReturnType<typeof projectTaskGraphPlanningCounts>> })
-  | (T & { nodeCapacity: TaskGraphNodeCapacity })
-  | (T & { taskReportedCounts: NonNullable<ReturnType<typeof projectTaskGraphPlanningCounts>>; nodeCapacity: TaskGraphNodeCapacity }) {
+): PlanningObservation<T> {
   const counts = projectTaskGraphPlanningCounts(planningFacts, revision)
   const withCounts = withTaskGraphPlanningCounts(base, counts, maxChars)
   const capacity = projectCurrentCapacity(nodes)
-  if (!capacity) return withCounts
-  try {
-    const candidate = { ...withCounts, nodeCapacity: capacity }
-    const serialized = JSON.stringify(candidate)
-    return serialized && serialized.length <= maxChars ? candidate : withCounts
-  } catch {
-    return withCounts
+  let withCapacity: Record<string, unknown> = withCounts
+  if (capacity) {
+    try {
+      const candidate = { ...withCounts, nodeCapacity: capacity }
+      const serialized = JSON.stringify(candidate)
+      if (serialized && serialized.length <= maxChars) withCapacity = candidate
+    } catch { /* Capacity is optional; keep the already-projected observation. */ }
   }
+  const overlap = projectTaskGraphPlanningScoutOverlap(planningFacts, revision, nodes)
+  return withTaskGraphPlanningScoutOverlap(withCapacity, overlap, maxChars) as PlanningObservation<T>
 }
 
 function projectCurrentCapacity(nodes: readonly TaskGraphCurrentNode[]): TaskGraphNodeCapacity | undefined {

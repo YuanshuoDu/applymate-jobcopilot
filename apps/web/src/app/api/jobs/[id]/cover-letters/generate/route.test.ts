@@ -107,4 +107,28 @@ describe('cover letter generation after an audit failure', () => {
     expect(mocks.modelChat.mock.calls[0][0][1].content).toContain('EXISTING COVER LETTER')
     expect(mocks.modelChat.mock.calls[0][0][1].content).toContain('preserve all supported wording and structure')
   })
+
+  it('attributes every fallback attempt to the owner without passing the primary credential or changing credits', async () => {
+    mocks.prepareAiRoute.mockResolvedValue({ userId: 'user_1', cfg: {
+      provider: 'openai', model: 'gpt-4o', apiKey: 'primary-provider-secret',
+      usageUserId: 'user_1', usageFeatureKey: 'coverLetter', usageRuntime: 'web',
+    } })
+    mocks.modelChat.mockRejectedValueOnce(new Error('primary failed')).mockRejectedValueOnce(new Error('fallback failed'))
+      .mockResolvedValueOnce({ provider: 'minimax', model: 'MiniMax-M3', text: 'Dear Hiring Manager,\n\nThank you.\n\nSincerely,\nAda' })
+    const { POST } = await import('./route')
+    const response = await POST(new NextRequest('http://localhost/api/jobs/job_1/cover-letters/generate', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ resumeId: 'resume_1', preferProvidedResume: true }),
+    }) as never, { params: Promise.resolve({ id: 'job_1' }) })
+
+    expect(response?.status).toBe(201)
+    expect(mocks.modelChat).toHaveBeenCalledTimes(3)
+    expect(mocks.modelChat.mock.calls[0]).toHaveLength(3)
+    for (const [index, provider] of [[1, 'deepseek'], [2, 'minimax']] as const) {
+      const [, config, , usage] = mocks.modelChat.mock.calls[index]
+      expect(config).toMatchObject({ provider })
+      expect(config).not.toHaveProperty('apiKey')
+      expect(usage).toEqual({ userId: 'user_1', featureKey: 'coverLetter', runtime: 'web', chargeBudget: false })
+    }
+  })
 })

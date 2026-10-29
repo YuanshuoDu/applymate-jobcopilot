@@ -12,10 +12,10 @@ const artifactRef = {
 function scoutResult(jobIds: readonly string[], status: "completed" | "partial" = "completed") {
   return {
     schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status,
-    candidates: jobIds.map(jobId => ({
-      jobId, source: "greenhouse", url: `https://private.example/${jobId}`, evidenceIds: [`evidence:${jobId}`],
+    candidates: jobIds.map((jobId, index) => ({
+      jobId, source: "greenhouse", url: `https://private.example/${jobId}`, evidenceIds: [`evidence:${jobId}:${index}`],
     })),
-    evidence: jobIds.map(jobId => ({ id: `evidence:${jobId}`, kind: "job", ref: jobId, source: "private-source" })),
+    evidence: jobIds.map((jobId, index) => ({ id: `evidence:${jobId}:${index}`, kind: "job", ref: jobId, source: "private-source" })),
     summary: "PRIVATE_ROLE_NARRATIVE",
   }
 }
@@ -50,19 +50,20 @@ function loadedGraph(
   rows: readonly GraphTaskRow[],
   stateRevision = revision,
 ): LoadedGraph {
+  const tasks = new Map(rows.map(task => [task.id, task]))
   return {
     rootTaskId: "root-task",
     item: { id: "task-graph:root-task", revision, content: {}, createdAt: new Date(0) },
-    snapshot: { nodes: currentTaskIds.map(taskId => ({ taskId })) } as unknown as TaskGraphSnapshot,
+    snapshot: { nodes: currentTaskIds.map((taskId, index) => ({ taskId, key: `node-${index}`, templateId: tasks.get(taskId)?.role ?? "unknown" })) } as unknown as TaskGraphSnapshot,
     state: { revision: stateRevision } as LoadedGraph["state"],
-    tasks: new Map(rows.map(task => [task.id, task])),
+    tasks,
   } as LoadedGraph
 }
 
 describe("TaskGraph planning facts producer", () => {
-  it("counts full current-node results, deduplicates provenance, and returns counts only", () => {
+  it("counts full current-node results, deduplicates provenance, and returns advisory facts without identifiers", () => {
     const rows = [
-      row("scout-a", "scout", "research", "completed", scoutResult(["job-1", "job-2", "job-3", "job-4", "job-5"])),
+      row("scout-a", "scout", "research", "completed", scoutResult(["job-1", "job-2", "job-3", "job-4", "job-5", "job-2", "job-4"])),
       row("scout-b", "scout", "research", "completed", scoutResult(["job-4", "job-5", "job-6"])),
       row("analyst-a", "analyst", "research", "completed", analystResult([
         { jobId: "job-1", score: 7 }, { jobId: "job-2", score: 8 }, { jobId: "job-3", score: 6 },
@@ -91,7 +92,7 @@ describe("TaskGraph planning facts producer", () => {
     const facts = buildTaskGraphPlanningFacts(loaded)!
 
     expect(facts.graphRevision).toBe(9)
-    expect(Object.keys(facts)).toEqual(["graphRevision", "counts"])
+    expect(Object.keys(facts)).toEqual(["graphRevision", "scoutOverlap", "counts"])
     expect(Object.keys(facts.counts).sort()).toEqual([
       "analyzedJobs", "artifactReferences", "discoveredJobs", "prepareJobs", "reviewOutcomes",
     ])
@@ -102,8 +103,12 @@ describe("TaskGraph planning facts producer", () => {
       artifactReferences: { knownCount: 1, coverage: "complete" },
       reviewOutcomes: { knownCount: 1, coverage: "complete" },
     })
+    expect(facts.scoutOverlap).toEqual({ coverage: "complete", scouts: [
+      { key: "node-0", taskStatus: "completed", resultStatus: "completed", resultCoverage: "complete", reportedCount: 5, sharedCount: 2 },
+      { key: "node-1", taskStatus: "completed", resultStatus: "completed", resultCoverage: "complete", reportedCount: 3, sharedCount: 2 },
+    ] })
     const encoded = JSON.stringify(facts)
-    for (const privateValue of ["job-1", "control-job", "historical-job", "private-artifact-id", "PRIVATE_ROLE_NARRATIVE", "PRIVATE_FINAL_TEXT", "private.example", "private-source"]) {
+    for (const privateValue of ["job-1", "control-job", "historical-job", "scout-a", "scout-b", "analyst-a", "analyst-b", "writer", "reviewer", "prepare-task", "native-control", "history-only", "private-artifact-id", "PRIVATE_ROLE_NARRATIVE", "PRIVATE_ANALYSIS_NARRATIVE", "PRIVATE_FINAL_TEXT", "private.example", "private-source"]) {
       expect(encoded).not.toContain(privateValue)
     }
 
@@ -125,8 +130,45 @@ describe("TaskGraph planning facts producer", () => {
     const absent = { rootTaskId: "root-task", item: null, snapshot: null, state: null, tasks: new Map() } as LoadedGraph
 
     expect(empty?.counts.discoveredJobs).toEqual({ knownCount: 0, coverage: "complete" })
+    expect(empty?.scoutOverlap).toEqual({ coverage: "complete", scouts: [
+      { key: "node-0", taskStatus: "completed", resultStatus: "completed", resultCoverage: "complete", reportedCount: 0, sharedCount: 0 },
+    ] })
     expect(missing?.counts.discoveredJobs).toEqual({ knownCount: null, coverage: "unavailable" })
+    expect(missing?.scoutOverlap).toEqual({ coverage: "unavailable", scouts: [
+      { key: "node-0", taskStatus: "completed", resultStatus: null, resultCoverage: "unavailable", reportedCount: null, sharedCount: null },
+    ] })
     expect(buildTaskGraphPlanningFacts(absent)).toBeNull()
+  })
+
+  it("keeps result completeness separate from lifecycle and excludes unavailable Scouts from overlap", () => {
+    const facts = buildTaskGraphPlanningFacts(loadedGraph(8, ["partial", "failed-complete", "running", "malformed", "empty"], [
+      row("partial", "scout", "research", "failed", scoutResult(["shared-job", "valid-only"], "partial")),
+      row("failed-complete", "scout", "research", "failed", scoutResult(["shared-job"])),
+      row("running", "scout", "research", "running", scoutResult(["valid-only"])),
+      row("malformed", "scout", "research", "completed", scoutResult(["bad/job-id"])),
+      row("empty", "scout", "research", "completed", scoutResult([])),
+    ]))!
+
+    expect(facts.scoutOverlap).toEqual({ coverage: "partial", scouts: [
+      { key: "node-0", taskStatus: "failed", resultStatus: "partial", resultCoverage: "partial", reportedCount: 2, sharedCount: 1 },
+      { key: "node-1", taskStatus: "failed", resultStatus: "completed", resultCoverage: "complete", reportedCount: 1, sharedCount: 1 },
+      { key: "node-2", taskStatus: "running", resultStatus: null, resultCoverage: "unavailable", reportedCount: null, sharedCount: null },
+      { key: "node-3", taskStatus: "completed", resultStatus: null, resultCoverage: "unavailable", reportedCount: null, sharedCount: null },
+      { key: "node-4", taskStatus: "completed", resultStatus: "completed", resultCoverage: "complete", reportedCount: 0, sharedCount: 0 },
+    ] })
+    expect(facts.counts.discoveredJobs.coverage).toBe("partial")
+    const encoded = JSON.stringify(facts.scoutOverlap)
+    for (const privateValue of ["shared-job", "valid-only", "bad/job-id", "failed-complete", "malformed", "empty"]) {
+      expect(encoded).not.toContain(privateValue)
+    }
+  })
+
+  it("marks overlap not requested when the current graph has no Scouts", () => {
+    const facts = buildTaskGraphPlanningFacts(loadedGraph(3, ["analyst"], [
+      row("analyst", "analyst", "research", "completed", analystResult([{ jobId: "job-1", score: 8 }])),
+    ]))!
+
+    expect(facts.scoutOverlap).toEqual({ coverage: "not_requested", scouts: [] })
   })
 
   it("retains unavailable coverage for malformed role results", () => {

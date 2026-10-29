@@ -168,7 +168,7 @@ export async function admitAiUsage(
         (id, user_id, feature_key, provider, model, input_tokens, output_tokens, estimated_cost_usd,
          latency_ms, status, error_code, credential_source, runtime, created_at)
       VALUES (${id}, ${input.userId}, ${input.featureKey}, ${input.provider}, ${input.model}, 0, 0, 0,
-         0, 'reserved', ${creditMonth ? `credit_reserved_${creditMonth}` : null}, ${input.credentialSource ?? "platform"}, 'worker', CURRENT_TIMESTAMP)
+         0, 'reserved', ${creditMonth ? `credit_reserved_${creditMonth}` : null}, ${input.credentialSource ?? "platform"}, 'worker', CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
       ON CONFLICT (id) DO NOTHING RETURNING id`)
     if (!inserted[0]) {
       const raced = (await tx.$queryRaw<Array<{ id: string; status: string; userId: string | null; provider: string; model: string }>>(Prisma.sql`
@@ -196,7 +196,7 @@ export async function settleAiUsage(db: UsageBrokerDatabase, input: UsageSettlem
             (id, user_id, feature_key, provider, model, input_tokens, output_tokens, estimated_cost_usd,
              latency_ms, status, error_code, credential_source, runtime, created_at)
           VALUES (${id}, ${input.userId}, ${input.featureKey}, ${input.provider}, ${input.model}, 0, 0, 0,
-             0, 'released', 'cancelled_before_provider', ${input.credentialSource ?? "platform"}, 'worker', CURRENT_TIMESTAMP)
+             0, 'released', 'cancelled_before_provider', ${input.credentialSource ?? "platform"}, 'worker', CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
           ON CONFLICT (id) DO NOTHING RETURNING id`)
         if (inserted[0]) return
         row = (await read())[0]

@@ -66,7 +66,7 @@ export async function recordSharedAiUsage(db: Queryable, input: SharedAiUsageInp
       `INSERT INTO ai_usage_events
         (id, user_id, feature_key, provider, model, input_tokens, output_tokens,
          estimated_cost_usd, latency_ms, status, error_code, credential_source, runtime, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CURRENT_TIMESTAMP AT TIME ZONE 'UTC')`,
       [randomUUID(), input.userId ?? null, input.featureKey ?? "autoApply", input.provider, input.model,
        Math.max(0, Math.trunc(input.inputTokens ?? 0)), Math.max(0, Math.trunc(input.outputTokens ?? 0)),
        estimateSharedAiCost(input), Math.max(0, Math.trunc(input.latencyMs)), input.status,

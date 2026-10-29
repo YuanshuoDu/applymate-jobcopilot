@@ -20,6 +20,10 @@ describe('AI settings translations', () => {
     expect(html).not.toContain('settings.ai.saved')
   })
 
+  it('localizes the settings keys and connections entry in every supported language', () => {
+    const expected = ['Keys & connections', 'Schlüssel und Verbindungen', 'Clés et connexions', 'Claves y conexiones', 'Sleutels en verbindingen', '密钥与连接']
+    expect(LANGUAGES.map(({ value }) => translate(value, 'settings.keysConnections'))).toEqual(expected)
+  })
   it('keeps English and Chinese UI translations separate', () => {
     expect(translate('en', 'nav.dashboard')).toBe('Dashboard')
     expect(translate('zh', 'nav.dashboard')).toBe('仪表板')

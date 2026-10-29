@@ -45,6 +45,9 @@ describe("AI usage broker", () => {
     expect(result.operationId).toMatch(/^agent-usage-[a-f0-9]{64}$/)
     expect(tx.$queryRaw).toHaveBeenCalledTimes(6)
     expect(String(tx.$queryRaw.mock.calls[0]?.[0])).toBe("[object Object]")
+    const inserted = tx.$queryRaw.mock.calls[3]?.[0] as { text: string; values: unknown[] }
+    expect(inserted.text).toMatch(/INSERT INTO ai_usage_events[\s\S]*'worker', CURRENT_TIMESTAMP AT TIME ZONE 'UTC'\)/)
+    expect(inserted.values).toEqual(expect.arrayContaining([input.userId, input.featureKey, input.provider, input.model]))
   })
 
   it("rejects a repeated admission for a reserved or already settled attempt", async () => {
@@ -173,6 +176,9 @@ describe("AI usage broker", () => {
     })
 
     await settleAiUsage(db, { ...input, status: "released" })
+    const tombstone = tx.$queryRaw.mock.calls[2]?.[0] as { text: string; values: unknown[] }
+    expect(tombstone.text).toMatch(/INSERT INTO ai_usage_events[\s\S]*'released', 'cancelled_before_provider'[\s\S]*'worker', CURRENT_TIMESTAMP AT TIME ZONE 'UTC'\)/)
+    expect(tombstone.values).toEqual(expect.arrayContaining([input.userId, input.featureKey, input.provider, input.model]))
     await expect(admitAiUsage(db, input)).rejects.toMatchObject({ code: "usage_attempt_released", status: 409 })
     expect(tx.$queryRaw).toHaveBeenCalledTimes(6)
   })

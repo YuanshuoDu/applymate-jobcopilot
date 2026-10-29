@@ -1017,6 +1017,10 @@ describe("createPgTaskGraphCommandPort", () => {
     expect(current.revision).toBe(8)
     expect(current.planningFacts).toEqual({
       graphRevision: 8,
+      scoutOverlap: { coverage: "complete", scouts: [
+        { key: "scout-a", taskStatus: "completed", resultStatus: "completed", resultCoverage: "complete", reportedCount: 5, sharedCount: 2 },
+        { key: "scout-b", taskStatus: "completed", resultStatus: "completed", resultCoverage: "complete", reportedCount: 3, sharedCount: 2 },
+      ] },
       counts: {
         discoveredJobs: { knownCount: 6, coverage: "complete" },
         analyzedJobs: { knownCount: 6, coverage: "complete" },

@@ -23,15 +23,16 @@ const previewSession = {
 export function AgentSupervisorPreviewClient({ supervisorMode = false, settingsMode = false, locale, seedApplicationReviewQueue = false }: { supervisorMode?: boolean; settingsMode?: boolean; locale?: Lang; seedApplicationReviewQueue?: boolean }) {
   if (!supervisorMode && !settingsMode) return <AgentPreviewClient />
 
-  return (
-    <SessionProvider session={previewSession}>
-      <I18nProvider>
-        <PreviewLocale locale={locale}>
-          {settingsMode ? <SettingsPage /> : <AgentPlaygroundPage seedApplicationReviewQueue={seedApplicationReviewQueue} />}
-        </PreviewLocale>
-      </I18nProvider>
-    </SessionProvider>
+  const content = (
+    <I18nProvider>
+      <PreviewLocale locale={locale}>
+        {settingsMode ? <SettingsPage /> : <AgentPlaygroundPage seedApplicationReviewQueue={seedApplicationReviewQueue} />}
+      </PreviewLocale>
+    </I18nProvider>
   )
+
+  // Settings exercises the root provider so browser fixtures can observe session changes.
+  return settingsMode ? content : <SessionProvider session={previewSession}>{content}</SessionProvider>
 }
 
 function PreviewLocale({ locale, children }: { locale?: Lang; children: React.ReactNode }) {

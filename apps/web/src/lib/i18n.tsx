@@ -2651,10 +2651,10 @@ const dict: Record<Lang, Record<string, string>> = {
 
     'lang.switch':       'Language',
   },
-  de: { 'settings.usage': 'Nutzung und Aktivitäten' },
-  fr: { 'settings.usage': 'Utilisation et activité' },
-  es: { 'settings.usage': 'Uso y actividad' },
-  nl: { 'settings.usage': 'Gebruik en activiteit' },
+  de: { 'settings.usage': 'Nutzung und Aktivitäten', 'settings.keysConnections': 'Schlüssel und Verbindungen' },
+  fr: { 'settings.usage': 'Utilisation et activité', 'settings.keysConnections': 'Clés et connexions' },
+  es: { 'settings.usage': 'Uso y actividad', 'settings.keysConnections': 'Claves y conexiones' },
+  nl: { 'settings.usage': 'Gebruik en activiteit', 'settings.keysConnections': 'Sleutels en verbindingen' },
   zh: {
     'agent.sessionDetails': '会话详情', 'agent.runningSessions': '进行中的对话', 'agent.needsAttention': '需要处理',
     'agent.taskDetails': '任务与结果', 'agent.hideDetails': '返回对话', 'agent.messageStatus': '消息状态',

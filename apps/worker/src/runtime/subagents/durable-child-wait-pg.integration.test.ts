@@ -21,6 +21,7 @@ import type { SubagentLease } from "./types.js"
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const FINAL_MARKER = "parent-resumed-from-durable-child-result"
 const FIXED_WAIT_TARGET_TASK_ID = "subagent-00000000-0000-4000-8000-000000000001"
+const PHONE_SHAPED_WAIT_TOOL_CALL_ID = "child-wait-call:415-555-0134"
 const TARGET_RESULT_TEXT = "durable-child-result-after-process-restart; phone +1 (415) 555-0134; email child-wait@example.invalid"
 const REDACTED_TARGET_RESULT_TEXT = "durable-child-result-after-process-restart; phone [REDACTED_PHONE]; email [REDACTED_EMAIL]"
 const RESTORED_WAIT_OBSERVATION_MARKER = "WORKER_B_RESTORED_WAIT_OBSERVATION "
@@ -66,6 +67,11 @@ type WorkerProcess = ChildProcess & {
 }
 type RestoredWaitObservationSummary = {
   state: "unconsumed" | "consumed"
+  canonicalCallIdPreserved: boolean
+  modelContextSafe: boolean
+  modelToolPairBound: boolean
+  deterministicProjection: boolean
+  providerInvoked: boolean
   inputTaskIds: Array<string | null> | null
   outputTaskIds: Array<string | null> | null
   matchedTaskIds: Array<string | null> | null
@@ -108,7 +114,9 @@ function expectRestoredWaitObservation(child: WorkerProcess, state: RestoredWait
   const lines = child.stdoutText.split(/\r?\n/).filter(line => line.startsWith(RESTORED_WAIT_OBSERVATION_MARKER))
   expect(lines).toHaveLength(1)
   const summary = JSON.parse(lines[0]!.slice(RESTORED_WAIT_OBSERVATION_MARKER.length)) as RestoredWaitObservationSummary
-  expect(summary).toEqual({ state, inputTaskIds: [FIXED_WAIT_TARGET_TASK_ID], outputTaskIds: [FIXED_WAIT_TARGET_TASK_ID],
+  expect(summary).toEqual({ state, canonicalCallIdPreserved: true, modelContextSafe: true, modelToolPairBound: true,
+    deterministicProjection: true, providerInvoked: false,
+    inputTaskIds: [FIXED_WAIT_TARGET_TASK_ID], outputTaskIds: [FIXED_WAIT_TARGET_TASK_ID],
     matchedTaskIds: [FIXED_WAIT_TARGET_TASK_ID], outputTaskIdsFromTasks: [FIXED_WAIT_TARGET_TASK_ID],
     targetFinalText: REDACTED_TARGET_RESULT_TEXT })
 }
@@ -803,6 +811,22 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(finalItems.rows).toHaveLength(1)
       expect(finalItems.rows[0]?.content.wait).toMatchObject({ taskIds: [FIXED_WAIT_TARGET_TASK_ID],
         matchedTaskIds: [FIXED_WAIT_TARGET_TASK_ID], tasks: [{ taskId: FIXED_WAIT_TARGET_TASK_ID }] })
+      const persistedWaitCalls = await pool.query<{ id: string; status: string; toolCallId: string }>(
+        `SELECT "id", "status", "content"->>'toolCallId' AS "toolCallId" FROM "agent_items"
+         WHERE "taskId" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "type" = 'tool_call'
+           AND "content"->>'toolName' = 'wait_subagents'`, [waiter.id, ids.sessionId, ids.turnId],
+      )
+      expect(persistedWaitCalls.rows).toHaveLength(1)
+      expect(persistedWaitCalls.rows[0]).toMatchObject({ toolCallId: PHONE_SHAPED_WAIT_TOOL_CALL_ID })
+      const persistedStartEvents = await pool.query<{ correlationId: string; payloadToolCallId: string }>(
+        `SELECT "correlationId", "payload"->>'toolCallId' AS "payloadToolCallId" FROM "agent_events"
+         WHERE "taskId" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "itemId" = $4
+           AND "type" = 'tool_call.started'`, [waiter.id, ids.sessionId, ids.turnId, persistedWaitCalls.rows[0]!.id],
+      )
+      expect(persistedStartEvents.rows).toEqual([{
+        correlationId: PHONE_SHAPED_WAIT_TOOL_CALL_ID,
+        payloadToolCallId: PHONE_SHAPED_WAIT_TOOL_CALL_ID,
+      }])
       expect(finalGeneration).toBeGreaterThan(generation)
       expect(postAckGeneration).toBeGreaterThan(finalGeneration)
       expect(finalDispatch.rows[0]!.attemptCount - 1).toBe(postAckGeneration)
