@@ -83,13 +83,15 @@ function historyProjection(request) {
       }
     }
   }
-  const privateText = JSON.stringify(request.messages)
   const snapshot = matches[0]
-  if (matches.length !== 1 || !Array.isArray(snapshot?.turns) || snapshot.turns.length !== 1
-    || !snapshot.turns[0]?.nodes?.some(node => node.taskKind === "analyst" && node.status === "completed")
-    || ["PRIVATE_SOURCE_NODE_GOAL", "PRIVATE_SOURCE_CRITERION", "PRIVATE_SOURCE_RESULT"].some(value => privateText.includes(value))) {
-    throw new Error("objective_snapshot_context_invalid")
-  }
+  const privateText = JSON.stringify(request.messages)
+  const reason = matches.length !== 1 ? `historical_match_count_${matches.length}`
+    : !Array.isArray(snapshot?.turns) ? "turns_missing"
+      : snapshot.turns.length !== 1 ? `turn_count_${snapshot.turns.length}`
+        : !snapshot.turns[0]?.nodes?.some(node => node.taskKind === "analyst" && node.status === "completed") ? "completed_analyst_missing"
+          : ["PRIVATE_SOURCE_NODE_GOAL", "PRIVATE_SOURCE_CRITERION", "PRIVATE_SOURCE_RESULT"].some(value => privateText.includes(value))
+            ? "private_source_sentinel_present" : null
+  if (reason) throw new Error(`objective_snapshot_context_invalid:${reason}`)
 }
 function spawnedTaskId(request, callId) {
   for (const message of request.messages ?? []) {
@@ -146,7 +148,11 @@ async function startRuntime(firstWorker) {
       return { adapter: { id: "objective-snapshot-fixture-model", profile: modelProfile(), async *stream(request) {
         modelStreamCalls += 1; if (firstWorker) {
           say("FIXTURE_MODEL_STREAM_ENTERED_A")
-          try { historyProjection(request) } catch { say("FIXTURE_MODEL_CONTEXT_A_INVALID"); throw new Error("objective_snapshot_context_invalid") }
+          try { historyProjection(request) } catch (error) {
+            const reason = error instanceof Error && error.message.startsWith("objective_snapshot_context_invalid:")
+              ? error.message.slice("objective_snapshot_context_invalid:".length) : "unclassified"
+            say(`FIXTURE_MODEL_CONTEXT_A_INVALID ${reason}`); throw new Error("objective_snapshot_context_invalid")
+          }
           calls += 1
           if (calls === 1) {
             say("FIXTURE_MODEL_CONTEXT_A_OK"); await waitForCommand("continue-turn")

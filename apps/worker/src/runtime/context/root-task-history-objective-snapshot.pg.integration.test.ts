@@ -574,10 +574,11 @@ async function runObjectiveSnapshotWorkerRestart(pool: Pool, corrupt: boolean): 
     try { await waitForFixtureLine(workerA, "FIXTURE_MODEL_CONTEXT_A_OK", 45_000) } catch {
       const markers = ["FIXTURE_MODEL_STREAM_ENTERED_A", "FIXTURE_MODEL_CONTEXT_A_INVALID", "FIXTURE_MODEL_CONTEXT_A_OK"]
         .filter(marker => workerA!.output.includes(marker))
+      const contextDiagnostic = workerA!.output.find(line => line.startsWith("FIXTURE_MODEL_CONTEXT_A_INVALID")) ?? "none"
       const execution = await workerAExecutionDiagnostic(pool, turnId)
       const fixtureFailure = ["OBJECTIVE_SNAPSHOT_RESTART_FIXTURE_FAILED_RESTART_BOUNDARY_MISSING", "OBJECTIVE_SNAPSHOT_RESTART_FIXTURE_FAILED_UNCLASSIFIED"]
         .find(marker => workerA!.errors.includes(marker)) ?? "none"
-      throw new Error(`Snapshot restart Worker A did not reach its model context; markers=${markers.join(",") || "none"}; fixtureFailure=${fixtureFailure}; execution=${JSON.stringify(execution)}`)
+      throw new Error(`Snapshot restart Worker A did not reach its model context; markers=${markers.join(",") || "none"}; contextDiagnostic=${contextDiagnostic}; fixtureFailure=${fixtureFailure}; execution=${JSON.stringify(execution)}`)
     }
     const initialSnapshot = await readSnapshotEnvelope(pool, fixture.sessionId)
     expect(initialSnapshot).toHaveLength(1)
