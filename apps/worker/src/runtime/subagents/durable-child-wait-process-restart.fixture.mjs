@@ -668,7 +668,7 @@ async function resumeChild(lease, crashBeforeWaitAck = false, crashAfterWaitAck 
   const nextOrdinal = wait.ordinal + 1
   const continuation = await turnStore.startStep({ owner, stepId, ordinal: nextOrdinal, attempt: lease.attemptCount,
     inputThroughSequence: restored.resume.inputThroughSequence, consumedInputIds: restored.resume.consumedInputIds,
-    modelProfileSnapshot: crashAfterWaitAck || reissueOrphan ? loopFixtureModelProfile : {}, now })
+    modelProfileSnapshot: loopFixtureModelProfile, now })
   if (continuation.id !== stepId || continuation.ordinal <= wait.ordinal) throw new Error("durable_child_wait_continuation_identity_invalid")
   if (!pendingWait) say(`WORKER_B_CONSUMED_WAIT_STEP_REUSED ${JSON.stringify({ waitId: wait.waitId, sourceStepId: wait.stepId,
     attempt: wait.attempt, sourceOrdinal: wait.ordinal, stepId: continuation.id, ordinal: continuation.ordinal })}`)

@@ -189,7 +189,7 @@ async function expectCompletedSourceWaitLifecycle(pool: Pool, ids: FixtureIds): 
   const stepId = `task:${ids.waiterTaskId}:step:0:attempt:1`
   const callItemId = `task:${ids.waiterTaskId}:item:tool-call:${PHONE_SHAPED_WAIT_TOOL_CALL_ID}:attempt:1`
   const resultItemId = `task:${ids.waiterTaskId}:item:tool-result:${PHONE_SHAPED_WAIT_TOOL_CALL_ID}:attempt:1`
-  const [items, events] = await Promise.all([
+  const [items, events, waits] = await Promise.all([
     pool.query<{ id: string; status: string; revision: number; content: Record<string, unknown> }>(
       `SELECT "id", "status", "revision", "content" FROM "agent_items"
        WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = ANY($4::text[]) ORDER BY "id"`,
@@ -200,9 +200,64 @@ async function expectCompletedSourceWaitLifecycle(pool: Pool, ids: FixtureIds): 
        WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "itemId" = ANY($4::text[]) ORDER BY "sequence"`,
       [ids.sessionId, ids.turnId, ids.waiterTaskId, [callItemId, resultItemId]],
     ),
+    pool.query<{ id: string; idempotencyKey: string; mode: string; targetTaskIds: unknown; deadlineAt: Date; result: unknown }>(
+      `SELECT "id", "idempotencyKey", "mode", "targetTaskIds", "deadlineAt", "result" FROM "agent_wait_conditions"
+       WHERE "sessionId" = $1 AND "turnId" = $2 AND "parentTaskId" = $3 AND "stepId" = $4`,
+      [ids.sessionId, ids.turnId, ids.waiterTaskId, stepId],
+    ),
   ])
   const call = items.rows.find(item => item.id === callItemId)
   const result = items.rows.find(item => item.id === resultItemId)
+  const sourceWait = waits.rows[0]
+  const callContent = asObject(call?.content)
+  const callInput = asObject(callContent.input)
+  const waitRecord = asObject(sourceWait?.result)
+  const request = asObject(waitRecord.request)
+  const resultContent = asObject(result?.content)
+  const receipt = asObject(resultContent.output)
+  const receiptTaskIds = Array.isArray(receipt.tasks) ? receipt.tasks.map(task => asObject(task).taskId) : null
+  const sameIds = (left: unknown, right: unknown): boolean => {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.some(id => typeof id !== "string")
+      || right.some(id => typeof id !== "string")) return false
+    const leftIds = left as string[], rightIds = right as string[]
+    const sortedLeft = [...leftIds].sort(), sortedRight = [...rightIds].sort()
+    return leftIds.length === rightIds.length && new Set(leftIds).size === leftIds.length
+      && new Set(rightIds).size === rightIds.length
+      && sortedLeft.every((id, index) => id === sortedRight[index])
+  }
+  const timestamp = (value: unknown): number | undefined => {
+    const parsed = value instanceof Date ? value : new Date(String(value))
+    return Number.isFinite(parsed.getTime()) ? parsed.getTime() : undefined
+  }
+  expect({
+    waitCount: waits.rows.length,
+    callToolNameMatches: callContent.toolName === "wait_subagents",
+    callToolCallIdMatches: callContent.toolCallId === PHONE_SHAPED_WAIT_TOOL_CALL_ID,
+    inputIdempotencyKeyMatches: callInput.idempotencyKey === sourceWait?.idempotencyKey,
+    inputModeMatchesWait: callInput.mode === sourceWait?.mode,
+    requestModeMatchesWait: request.mode === sourceWait?.mode,
+    inputTimeoutMatchesRequest: Number(callInput.timeoutMs) === Number(request.timeoutMs),
+    waitTargetsMatchExpected: sameIds(sourceWait?.targetTaskIds, [ids.targetTaskId]),
+    inputTargetsMatchWait: sameIds(callInput.taskIds, sourceWait?.targetTaskIds),
+    requestTargetsMatchWait: sameIds(request.targetTaskIds, sourceWait?.targetTaskIds),
+    receiptToolCallIdMatches: resultContent.toolCallId === PHONE_SHAPED_WAIT_TOOL_CALL_ID,
+    receiptErrorCodeIsClear: resultContent.errorCode === null || resultContent.errorCode === undefined,
+    receiptWaitIdMatches: receipt.waitId === sourceWait?.id,
+    receiptStatusIsWaiting: receipt.status === "waiting",
+    receiptTargetsMatchWait: sameIds(receipt.taskIds, sourceWait?.targetTaskIds),
+    receiptMatchedIdsAreEmpty: Array.isArray(receipt.matchedTaskIds) && receipt.matchedTaskIds.length === 0,
+    receiptTaskCountMatches: receiptTaskIds !== null && receiptTaskIds.length === 1,
+    receiptTaskIdsMatchWait: sameIds(receiptTaskIds, sourceWait?.targetTaskIds),
+    receiptDeadlineMatchesWait: timestamp(receipt.deadlineAt) !== undefined
+      && timestamp(receipt.deadlineAt) === timestamp(sourceWait?.deadlineAt),
+  }).toEqual({
+    waitCount: 1, callToolNameMatches: true, callToolCallIdMatches: true, inputIdempotencyKeyMatches: true, inputModeMatchesWait: true,
+    requestModeMatchesWait: true, inputTimeoutMatchesRequest: true, waitTargetsMatchExpected: true,
+    inputTargetsMatchWait: true, requestTargetsMatchWait: true, receiptToolCallIdMatches: true,
+    receiptErrorCodeIsClear: true, receiptWaitIdMatches: true, receiptStatusIsWaiting: true,
+    receiptTargetsMatchWait: true, receiptMatchedIdsAreEmpty: true, receiptTaskCountMatches: true,
+    receiptTaskIdsMatchWait: true, receiptDeadlineMatchesWait: true,
+  })
   expect(call).toMatchObject({ status: "completed", revision: 1,
     content: { toolCallId: PHONE_SHAPED_WAIT_TOOL_CALL_ID, toolName: "wait_subagents", status: "completed", errorCode: null } })
   expect(result).toMatchObject({ status: "completed", revision: 1,
@@ -851,9 +906,9 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       await waitForMarker(workerC, "WORKER_B_RESUME_STEP_STARTED")
       expectRestoredWaitObservation(workerC, "unconsumed")
       const secondCut = await pool.query<{ taskStatus: string; attemptCount: number; leaseOwner: string | null; leaseExpiresAt: Date | null;
-        stepOrdinal: number; stepStatus: string; consumedAt: Date | null; callStatus: string; settledCount: number }>(
+        stepOrdinal: number; stepStatus: string; consumedAt: Date | null; callStatus: string; settledCount: number; modelProfileSnapshot: Record<string, unknown> }>(
         `SELECT task."status" AS "taskStatus", task."attemptCount", task."leaseOwner", task."leaseExpiresAt", next."ordinal" AS "stepOrdinal",
-          next."status" AS "stepStatus", wait."consumedAt", call."status" AS "callStatus",
+          next."status" AS "stepStatus", next."modelProfileSnapshot", wait."consumedAt", call."status" AS "callStatus",
           (SELECT COUNT(*)::int FROM "agent_events" AS settled WHERE settled."sessionId" = task."sessionId" AND settled."taskId" = task."id"
             AND settled."correlationId" = call."content"->>'toolCallId' AND settled."type" IN ('tool_call.completed', 'tool_call.failed', 'tool_call.interrupted')) AS "settledCount"
          FROM "sub_agent_tasks" AS task JOIN "agent_wait_conditions" AS wait ON wait."parentTaskId" = task."id" AND wait."sessionId" = task."sessionId"
@@ -868,6 +923,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       )
       expect(secondCut.rows[0]).toMatchObject({ taskStatus: "running", attemptCount: 1, stepOrdinal: 2, stepStatus: "streaming",
         consumedAt: null, callStatus: "started", settledCount: 0 })
+      expect(secondCut.rows[0]?.modelProfileSnapshot).toEqual(LOOP_FIXTURE_MODEL_PROFILE_SNAPSHOT)
       expect(secondCut.rows[0]?.leaseOwner).toEqual(expect.any(String))
       expect(secondCut.rows[0]?.leaseExpiresAt).toBeInstanceOf(Date)
       const secondOwner = secondCut.rows[0]!.leaseOwner
