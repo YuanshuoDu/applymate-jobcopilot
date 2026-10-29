@@ -1,5 +1,4 @@
 import type pg from "pg"
-
 import type { SubagentLease } from "./types.js"
 import { markCanonicalSubagentWaitTargetIds } from "./subagent-wait-structural-ids.js"
 import { dateValue, object as waitObject, safeSubagentWaitJson, waitResult } from "./durable-subagent-wait-store.js"
@@ -153,5 +152,5 @@ export async function loadChildConsumedWaitResume(client: QueryClient, lease: Su
   if (output.waitId !== row.waitId || !["ready", "timed_out"].includes(output.status) || !outputIds || !sameIds(outputIds, ids)
     || !markCanonicalSubagentWaitTargetIds({ targetTaskIds: outputIds }, output, outputIds) || !markInputIds(input, ids)) throw new Error("child_resume_invalid_wait_result")
   return { waitId: String(row.waitId), stepId, attempt, ordinal, toolCallId, sourceItemId,
-    input: safeSubagentWaitJson(input, 8_192), output }
+    input: safeSubagentWaitJson(input, 8_192), output, continuationStepId, continuationOrdinal }
 }

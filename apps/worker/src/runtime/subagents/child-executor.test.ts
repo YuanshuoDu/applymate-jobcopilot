@@ -17,6 +17,7 @@ import { ToolRegistry } from "../tools/registry.js"
 import type { RuntimeToolDefinition } from "../tools/types.js"
 import { executionOwnerFence } from "../execution-owner.js"
 import type { CoordinationMailboxMessage } from "../tools/coordination-types.js"
+import { createDurableSubagentWaitTool } from "./durable-subagent-wait-tool.js"
 import type { WorkerUsageAuthorizationInput, WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
 import { NATIVE_VERIFICATION_CONTROL_SCHEMA, NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA, NATIVE_VERIFICATION_PACKET_SCHEMA, canonicalNativeVerificationJson, digestNativeVerificationValue, type NativeVerificationControl, type NativeVerificationPacket } from "./native-verification-contract.js"
 import { createNativeVerificationContext } from "./native-verification-packet.js"
@@ -613,6 +614,86 @@ describe("child executor composition", () => {
     })
     expect(deliveredWaitResults).toEqual([durableWait.output, durableWait.output])
     expect(requests[0]?.metadata).not.toHaveProperty("continuation")
+  })
+
+  it("reuses an acknowledged wait for one fresh call ID through the normal tool lifecycle", async () => {
+    const child = { ...lease(), allowedActions: ["jobs.search", "wait_subagents"] }
+    const requests: HarnessModelRequest[] = [], events: Array<{ type: string; taskId: string }> = []
+    const eventPayloads: unknown[] = [], dispatch = vi.fn()
+    const waitInput = { idempotencyKey: "wait-key", taskIds: ["grandchild-1"], mode: "all", timeoutMs: 5_000 }
+    const waitOutput = {
+      waitId: "wait-1", status: "ready", taskIds: ["grandchild-1"], deadlineAt: "2099-09-14T11:30:00.000Z",
+      matchedTaskIds: ["grandchild-1"],
+      tasks: [{ taskId: "grandchild-1", status: "completed", role: "scout", result: { summary: "done" }, failureReason: null }],
+    }
+    const durableWait = {
+      waitId: "wait-1", stepId: "waiting-step", attempt: child.attemptCount, ordinal: 0, toolCallId: "old-provider-call", sourceItemId: "old-result",
+      input: waitInput, output: waitOutput,
+    } as const
+    const resumeLoader = async () => ({
+      resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 0n, consumedInputIds: [], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
+      observations: [{ id: "child-resume:old-result", content: {
+        toolCallId: durableWait.toolCallId, toolName: "wait_subagents", input: waitInput, status: "completed", output: waitOutput, errorCode: null,
+      } }],
+      durableWait,
+    })
+    let modelCall = 0
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) {
+        requests.push(request)
+        modelCall += 1
+        if (modelCall === 1) {
+          for (const callId of ["fresh-wait-call-1", "fresh-wait-call-2"]) {
+            yield { type: "tool_call_completed", callId, name: "wait_subagents", arguments: { ...waitInput } }
+          }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        yield { type: "text_delta", text: "continued" }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+    const store = executionStore(events, requests, eventPayloads)
+    const writes: Array<{ type: string; status: string; content: unknown }> = []
+    const itemTypes = new Map<string, string>()
+    const createItem = store.createItem
+    const updateItem = store.updateItem
+    vi.spyOn(store, "createItem").mockImplementation(async input => {
+      itemTypes.set(input.itemId, input.type)
+      writes.push({ type: input.type, status: input.status, content: input.content })
+      return createItem(input)
+    })
+    vi.spyOn(store, "updateItem").mockImplementation(async input => {
+      writes.push({ type: itemTypes.get(input.itemId) ?? "unknown", status: input.status, content: input.content })
+      return updateItem(input)
+    })
+    const waitTool = createDurableSubagentWaitTool({ connect: async () => { throw new Error("dispatcher_must_not_connect") } } as never, child)
+    const executor = createChildExecutor({
+      store, treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => model,
+      toolRuntimeFactory: () => childToolRuntime([waitTool], async (_context, request) => {
+        dispatch(request)
+        return { ...request, status: "completed", output: waitOutput, errorCode: null }
+      }),
+      resumeLoader, durableWaitResumeCommitter: async () => true, now: () => new Date("2026-09-09T11:00:00.000Z"),
+    })
+
+    await expect(executor({ lease: child })).resolves.toMatchObject({ status: "completed", result: { finalText: "continued" } })
+
+    expect(dispatch).not.toHaveBeenCalled()
+    expect(events.filter(event => ["tool_call.started", "tool_call.completed", "tool_call.failed"].includes(event.type))).toEqual([
+      { type: "tool_call.started", taskId: child.id }, { type: "tool_call.completed", taskId: child.id },
+      { type: "tool_call.started", taskId: child.id }, { type: "tool_call.failed", taskId: child.id },
+    ])
+    expect(writes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "tool_call", content: expect.objectContaining({ toolCallId: "fresh-wait-call-1", toolName: "wait_subagents" }) }),
+      expect.objectContaining({ type: "tool_result", status: "completed", content: expect.objectContaining({ toolCallId: "fresh-wait-call-1", output: waitOutput, errorCode: null }) }),
+      expect.objectContaining({ type: "tool_call", content: expect.objectContaining({ toolCallId: "fresh-wait-call-2", toolName: "wait_subagents" }) }),
+      expect.objectContaining({ type: "tool_result", status: "completed", content: expect.objectContaining({ toolCallId: "fresh-wait-call-2", errorCode: "wait_conflict" }) }),
+    ]))
+    expect(JSON.stringify(requests.at(-1)?.messages)).toContain("fresh-wait-call-1")
+    expect(JSON.stringify(requests.at(-1)?.messages)).toContain("fresh-wait-call-2")
+    expect(JSON.stringify(requests.at(-1)?.messages)).toContain('"isError":true')
   })
 
   it("recovers an unacknowledged wait after continuation persistence and reuses it at max attempts", async () => {

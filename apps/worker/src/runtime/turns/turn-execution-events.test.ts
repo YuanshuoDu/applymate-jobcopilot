@@ -4,8 +4,9 @@ import { Type } from "@sinclair/typebox"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 
-import { executeToolWithItems, TurnExecutionEventWriter } from "./turn-execution-events.js"
+import { executeToolWithItems, persistChildWaitClaimRecovery, TurnExecutionEventWriter } from "./turn-execution-events.js"
 import type { TurnExecutionIdentity, TurnExecutionOptions, TurnExecutionStore } from "./turn-execution-types.js"
+import type { ChildWaitClaimRecovery } from "../subagents/child-durable-wait-replay.js"
 import { restoreToolCallState } from "./persisted-tool-call-state.js"
 import { findToolObservation, stableJson } from "./turn-engine-replay.js"
 import { executeTools } from "./turn-execution-tools.js"
@@ -16,6 +17,8 @@ import { ToolRegistry } from "../tools/registry.js"
 import { InMemoryToolResultReferenceStore } from "../tools/redaction.js"
 import { ToolRouter } from "../tools/router.js"
 
+function identity(kind: "turn", taskId: string): Extract<TurnExecutionIdentity, { kind: "turn" }>
+function identity(kind: "task", taskId: string): Extract<TurnExecutionIdentity, { kind: "task" }>
 function identity(kind: TurnExecutionIdentity["kind"], taskId: string): TurnExecutionIdentity {
   const common = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId, rootTaskId: "root-1", ownerId: "worker-1", leaseExpiresAt: new Date("2026-09-08T03:00:00.000Z") }
   if (kind === "turn") return { ...common, kind, leaseVersion: 1 }
@@ -86,6 +89,66 @@ describe("TurnExecutionEventWriter", () => {
 
     expect(events.map(event => event.type)).toContain("tool_call.started")
     expect(events.map(event => event.type)).toContain("tool_call.failed")
+  })
+
+  it("uses the child wait claim key for the original started event", async () => {
+    const owner = identity("task", "child-1")
+    const base = options(owner, [])
+    const order: string[] = []
+    const started = vi.fn(async (input: Parameters<TurnExecutionStore["appendEvent"]>[0]) => {
+      if (input.type === "tool_call.started") order.push("started-event-persisted")
+      return { id: input.id }
+    })
+    const executionOptions: TurnExecutionOptions = {
+      ...base,
+      childWaitCallStartKey: (stepId, call) => stepId === "continuation-step" && call.name === "wait_subagents"
+        ? "child-wait-claim:1:continuation-step" : undefined,
+      childWaitCallStarted: (stepId, call, eventId) => {
+        expect(stepId).toBe("continuation-step")
+        expect(call.id).toBe("fresh-wait-call")
+        expect(eventId).toBe(started.mock.calls.find(([event]) => event.type === "tool_call.started")?.[0].id)
+        order.push("claim-acknowledged")
+      },
+      executeTool: async ({ call }) => {
+        order.push("execute")
+        return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, output: { waitId: "wait-1" }, errorCode: null }
+      },
+      store: { ...base.store, appendEvent: started },
+    }
+    const writer = new TurnExecutionEventWriter(executionOptions)
+
+    await executeToolWithItems(executionOptions, writer, { id: "continuation-step", ordinal: 1 }, {
+      id: "fresh-wait-call", name: "wait_subagents", arguments: { idempotencyKey: "key", taskIds: ["leaf"], mode: "all", timeoutMs: 5_000 },
+    }, () => new Date("2026-10-29T10:00:00.000Z"))
+
+    expect(started.mock.calls.find(([event]) => event.type === "tool_call.started")?.[0].idempotencyKey)
+      .toBe("task:child-1:event:child-wait-claim:1:continuation-step")
+    expect(order).toEqual(["started-event-persisted", "claim-acknowledged", "execute"])
+  })
+
+  it("does not acknowledge or execute a child wait when its owner-fenced start write fails", async () => {
+    const base = options(identity("task", "child-1"), [])
+    const denied = new Error("owner_fence_rejected")
+    const acknowledge = vi.fn()
+    const executeTool = vi.fn()
+    const executionOptions: TurnExecutionOptions = {
+      ...base,
+      childWaitCallStartKey: () => "child-wait-claim:2:continuation-step",
+      childWaitCallStarted: acknowledge,
+      executeTool,
+      store: { ...base.store, appendEvent: async input => {
+        if (input.type === "tool_call.started") throw denied
+        return { id: input.id }
+      } },
+    }
+    const writer = new TurnExecutionEventWriter(executionOptions)
+
+    await expect(executeToolWithItems(executionOptions, writer, { id: "continuation-step", ordinal: 1 }, {
+      id: "fresh-wait-call", name: "wait_subagents", arguments: { idempotencyKey: "key", taskIds: ["leaf"], mode: "all", timeoutMs: 5_000 },
+    }, () => new Date())).rejects.toBe(denied)
+
+    expect(acknowledge).not.toHaveBeenCalled()
+    expect(executeTool).not.toHaveBeenCalled()
   })
 
   it("settles Router lifecycle and canonical events before yielding a typed pause", async () => {
@@ -241,5 +304,81 @@ describe("TurnExecutionEventWriter", () => {
     await expect(missing.appendBatch([entry])).rejects.toThrow("plan_observation_batch_unavailable")
     const mismatched = new TurnExecutionEventWriter(options(identity("turn", "root-1"), events, async () => []))
     await expect(mismatched.appendBatch([entry])).rejects.toThrow("plan_observation_batch_result_mismatch")
+  })
+})
+
+describe("persistChildWaitClaimRecovery", () => {
+  it("reconciles the claimed call and a pre-existing result item without dispatch", async () => {
+    const owner = identity("task", "child-1")
+    const base = options(owner, [])
+    const writes: Array<{ kind: string; id?: string; itemId?: string | null; type?: string; correlationId?: string | null; causationId?: string | null; payload?: unknown }> = []
+    const options_: TurnExecutionOptions = {
+      ...base,
+      idFactory: prefix => prefix,
+      executeTool: async () => { throw new Error("dispatcher_must_not_run") },
+      store: {
+        ...base.store,
+        createItem: async input => { writes.push({ kind: "createItem", itemId: input.itemId }); return { id: input.itemId, revision: 0 } },
+        updateItem: async input => { writes.push({ kind: "updateItem", itemId: input.itemId }); return { id: input.itemId, revision: input.expectedRevision + 1 } },
+        appendEvent: async input => {
+          writes.push({ kind: "appendEvent", id: input.id, itemId: input.itemId, type: input.type, correlationId: input.correlationId,
+            causationId: input.causationId, payload: input.payload })
+          return { id: input.id }
+        },
+      },
+    }
+    const claim: ChildWaitClaimRecovery = {
+      owner: { id: owner.taskId, userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
+        rootTaskId: owner.rootTaskId, ownerId: owner.ownerId, attemptCount: owner.attemptCount },
+      stepId: "continuation-step", sourceWaitCallId: "original-wait-call", sourceInput: { idempotencyKey: "key", taskIds: ["leaf-1"], mode: "all", timeoutMs: 5_000 },
+      call: { id: "reissued-wait-call", name: "wait_subagents", arguments: { idempotencyKey: "key", taskIds: ["leaf-1"], mode: "all", timeoutMs: 5_000 } },
+      callItem: { id: "call-item", revision: 0, status: "started" }, callStartedEventId: "call-start-event", claimEventId: "claim-event",
+      output: { waitId: "wait-1", status: "ready" },
+      resultItem: { id: "task:child-1:item:tool-result:reissued-wait-call:attempt:1", revision: 0, status: "started" },
+    }
+    const writer = new TurnExecutionEventWriter(options_)
+
+    await expect(persistChildWaitClaimRecovery(options_, writer, claim, () => new Date("2026-10-29T10:00:00.000Z"))).resolves.toMatchObject({
+      id: claim.call.id, toolName: "wait_subagents", status: "completed", output: claim.output,
+    })
+
+    expect(writes.filter(write => write.kind === "createItem")).toEqual([])
+    expect(writes.filter(write => write.kind === "updateItem").map(write => write.itemId)).toEqual([
+      "call-item", claim.resultItem!.id,
+    ])
+    const events = writes.filter(write => write.kind === "appendEvent")
+    expect(events.map(event => event.type)).toEqual(["item.completed", "tool_call.completed", "item.started", "item.completed"])
+    expect(events.map(event => event.causationId)).toEqual([
+      "claim-event", events[0]!.id, events[1]!.id, events[2]!.id,
+    ])
+    expect(events[2]).toMatchObject({ itemId: claim.resultItem!.id, correlationId: claim.stepId, payload: { itemId: claim.resultItem!.id, type: "tool_result" } })
+  })
+
+  it("rejects a claim from another owner or attempt before any persistence", async () => {
+    const owner = identity("task", "child-1")
+    const base = options(owner, [])
+    const appendEvent = vi.fn(async ({ id }: { id: string }) => ({ id }))
+    const createItem = vi.fn(async ({ itemId }: { itemId: string }) => ({ id: itemId, revision: 0 }))
+    const updateItem = vi.fn(async ({ itemId, expectedRevision }: { itemId: string; expectedRevision: number }) => ({ id: itemId, revision: expectedRevision + 1 }))
+    const options_: TurnExecutionOptions = { ...base, store: { ...base.store, appendEvent, createItem, updateItem } }
+    const claim: ChildWaitClaimRecovery = {
+      owner: { id: owner.taskId, userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
+        rootTaskId: owner.rootTaskId, ownerId: owner.ownerId, attemptCount: owner.attemptCount },
+      stepId: "continuation-step", sourceWaitCallId: "original", sourceInput: {},
+      call: { id: "reissue", name: "wait_subagents", arguments: {} }, callItem: { id: "call-item", revision: 0, status: "started" },
+      callStartedEventId: "start", claimEventId: "claim", output: {},
+    }
+
+    const mismatches = [
+      { ...claim, owner: { ...claim.owner, ownerId: "worker-old" } },
+      { ...claim, owner: { ...claim.owner, attemptCount: claim.owner.attemptCount + 1 } },
+    ]
+    for (const mismatch of mismatches) {
+      await expect(persistChildWaitClaimRecovery(options_, new TurnExecutionEventWriter(options_), mismatch, () => new Date()))
+        .rejects.toThrow("child_wait_claim_recovery_owner_mismatch")
+    }
+    expect(appendEvent).not.toHaveBeenCalled()
+    expect(createItem).not.toHaveBeenCalled()
+    expect(updateItem).not.toHaveBeenCalled()
   })
 })

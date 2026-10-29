@@ -6,6 +6,7 @@ import type { FinalResponse } from "../finalizer.js"
 import { toRepositoryJson, type TurnEngineItemPhase, type TurnEngineItemStatus, type TurnEngineItemType } from "./turn-engine-types.js"
 import { executionId, executionKey, type ExecutionItemHandle, type TurnExecutionOptions } from "./turn-execution-types.js"
 import type { TurnEngineStep, TurnEngineToolCall, TurnEngineToolResult, ToolCallRecovery } from "./turn-engine-types.js"
+import type { ChildWaitClaimRecovery } from "../subagents/child-durable-wait-replay.js"
 import { STEERING_MARKER_EVENT_TYPE } from "../context/steering-marker.js"
 import { isSessionPauseRequestedError } from "../session-gate.js"
 
@@ -21,6 +22,8 @@ export class TurnExecutionEventWriter {
   constructor(private readonly options: TurnExecutionOptions) {
     this.key = executionKey(options.identity)
   }
+
+  seedCausationId(id: string): void { if (!id.trim()) throw new Error("event_causation_id_invalid"); this.causationId = id }
 
   async append(type: string, correlationId: string, itemId: string | null, payload: unknown, key: string): Promise<string> {
     const id = this.id(`event:${key}`)
@@ -109,12 +112,15 @@ export async function executeToolWithItems(
     content: { toolCallId: call.id, toolName: call.name, toolVersion: "1", input: toRepositoryJson(call.arguments) }, now: now(),
   })
   onCallItemPersisted?.()
-  try { await writer.append("tool_call.started", call.id, callItem.id, { toolCallId: call.id, toolName: call.name, taskId: options.identity.taskId }, `tool-started:${call.id}`) }
+  const startKey = options.childWaitCallStartKey?.(step.id, call) ?? `tool-started:${call.id}`
+  let startedEventId: string
+  try { startedEventId = await writer.append("tool_call.started", call.id, callItem.id, { toolCallId: call.id, toolName: call.name, taskId: options.identity.taskId }, startKey) }
   catch (error: unknown) {
     if (!isSessionPauseRequestedError(error)) throw error
     await writer.updateItem(callItem, "interrupted", { toolCallId: call.id, toolName: call.name, status: "interrupted", errorCode: "session_pause_requested" }, now(), "tool-start-denied")
     throw error
   }
+  if (startKey !== `tool-started:${call.id}`) options.childWaitCallStarted?.(step.id, call, startedEventId)
   let result: TurnEngineToolResult
   let pauseError: unknown
   try {
@@ -171,6 +177,40 @@ export async function persistRecoveredToolCall(
     ? { id: recovery.resultItem.id, type: "tool_result", phase: null, revision: recovery.resultItem.revision }
     : await writer.startItem({ id: itemId(options, `item:tool-result:${recovery.call.id}`), stepId: recovery.stepId, type: "tool_result", phase: null, content: resultContent, now: now() })
   await writer.completeItem(resultItem, resultContent, now(), `tool-result-recovered:${recovery.call.id}`)
+}
+
+/** Reconciles a claimed child wait using its validated stored receipt, never the wait dispatcher. */
+export async function persistChildWaitClaimRecovery(
+  options: TurnExecutionOptions, writer: TurnExecutionEventWriter, recovery: ChildWaitClaimRecovery, now: () => Date,
+): Promise<TurnEngineToolResult> {
+  const owner = options.identity
+  if (owner.kind !== "task" || owner.userId !== recovery.owner.userId || owner.sessionId !== recovery.owner.sessionId
+    || owner.turnId !== recovery.owner.turnId || owner.taskId !== recovery.owner.id || owner.rootTaskId !== recovery.owner.rootTaskId
+    || owner.ownerId !== recovery.owner.ownerId || owner.attemptCount !== recovery.owner.attemptCount) throw new Error("child_wait_claim_recovery_owner_mismatch")
+  if (options.signal?.aborted) throw options.signal.reason instanceof Error ? options.signal.reason : new Error("child_wait_claim_recovery_interrupted")
+  const call = recovery.call, callItem = { id: recovery.callItem.id, type: "tool_call" as const, phase: null, revision: recovery.callItem.revision }
+  const callContent = { toolCallId: call.id, toolName: call.name, toolVersion: "1", status: "completed", errorCode: null, input: toRepositoryJson(call.arguments) }
+  writer.seedCausationId(recovery.claimEventId)
+  if (recovery.callItem.status === "started") await writer.completeItem(callItem, callContent, now(), `tool-call-completed:${call.id}`)
+  else await writer.append("item.completed", callItem.id, callItem.id, { itemId: callItem.id, status: "completed", content: callContent },
+    `tool-call-completed:${call.id}:${callItem.id}:${callItem.revision}`)
+  await writer.append("tool_call.completed", call.id, callItem.id,
+    { toolCallId: call.id, toolName: call.name, status: "completed", errorCode: null, taskId: owner.taskId }, `tool-finished:${call.id}`)
+  const resultContent = { toolCallId: call.id, output: toRepositoryJson(recovery.output), errorCode: null }
+  const resultItemId = recovery.resultItem?.id ?? itemId(options, `item:tool-result:${call.id}`)
+  const resultItem = recovery.resultItem
+    ? { id: resultItemId, type: "tool_result" as const, phase: null, revision: recovery.resultItem.revision }
+    : await writer.startItem({ id: resultItemId, stepId: recovery.stepId, type: "tool_result", phase: null, content: resultContent, now: now() })
+  if (recovery.resultItem?.status === "completed") {
+    await writer.append("item.started", recovery.stepId, resultItemId, { itemId: resultItemId, type: "tool_result", phase: null }, `item-started:${resultItemId}`)
+    await writer.append("item.completed", resultItemId, resultItemId, { itemId: resultItemId, status: "completed", content: resultContent },
+      `tool-result-completed:${call.id}:${resultItemId}:${resultItem.revision}`)
+  } else {
+    if (recovery.resultItem) await writer.append("item.started", recovery.stepId, resultItemId,
+      { itemId: resultItemId, type: "tool_result", phase: null }, `item-started:${resultItemId}`)
+    await writer.completeItem(resultItem, resultContent, now(), `tool-result-completed:${call.id}`)
+  }
+  return { id: call.id, toolName: call.name, toolVersion: "1", status: "completed", output: recovery.output, errorCode: null }
 }
 
 export async function publishReasoningSummary(

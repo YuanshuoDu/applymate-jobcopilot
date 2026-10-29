@@ -32,10 +32,26 @@ describe("child wait admission", () => {
       input: {}, output: {} }
     const startStep = vi.fn(async () => ({ id: "continuation-step", ordinal: 9 }))
     const commit = vi.fn(async (_lease: SubagentLease, _wait: DurableWaitResume, ordinal: number) => ordinal === 9)
-    const store = acknowledgeDurableWaitAtContinuationStart({ startStep } as never, task, wait, commit)
+    const acknowledged = vi.fn()
+    const store = acknowledgeDurableWaitAtContinuationStart({ startStep } as never, task, wait, commit, acknowledged)
 
     await expect(store.startStep({ ordinal: 5, attempt: 3, identity } as never)).resolves.toEqual({ id: "continuation-step", ordinal: 9 })
     expect(commit).toHaveBeenCalledWith(task, wait, 9)
+    expect(acknowledged).toHaveBeenCalledWith({ id: "continuation-step", ordinal: 9 })
+  })
+
+  it("does not expose a continuation step until the durable wait commit succeeds", async () => {
+    const task = { ...baseLease, attemptCount: 3 } as SubagentLease
+    const wait: DurableWaitResume = { waitId: "wait-1", stepId: "source-step", attempt: 3, ordinal: 4, toolCallId: "wait-call", sourceItemId: "wait-result",
+      input: {}, output: {} }
+    const identity = { kind: "task", userId: task.userId, sessionId: task.sessionId, turnId: task.turnId, taskId: task.id,
+      rootTaskId: task.rootTaskId, ownerId: task.ownerId, attemptCount: task.attemptCount, leaseExpiresAt: task.leaseExpiresAt }
+    const acknowledged = vi.fn()
+    const store = acknowledgeDurableWaitAtContinuationStart({ startStep: async () => ({ id: "continuation-step", ordinal: 9 }) } as never,
+      task, wait, async () => false, acknowledged)
+
+    await expect(store.startStep({ ordinal: 5, attempt: 3, identity } as never)).rejects.toThrow("child_resume_wait_commit_pending")
+    expect(acknowledged).not.toHaveBeenCalled()
   })
 
   it("requires the server role policy and exact persisted wait action", () => {

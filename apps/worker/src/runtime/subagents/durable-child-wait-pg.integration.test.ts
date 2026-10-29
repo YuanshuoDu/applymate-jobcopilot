@@ -4,7 +4,8 @@ import { fileURLToPath } from "node:url"
 import { Queue } from "bullmq"
 import { Pool } from "pg"
 import { Redis } from "ioredis"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
+import { AgentTreeManager } from "./manager.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
 import { defaultSubagentPolicy } from "./types.js"
 import { subagentDispatchJobId } from "./dispatch-identity.js"
@@ -22,6 +23,7 @@ const DATABASE_NAME = "applymate_agent_brain_ci"
 const FINAL_MARKER = "parent-resumed-from-durable-child-result"
 const FIXED_WAIT_TARGET_TASK_ID = "subagent-00000000-0000-4000-8000-000000000001"
 const PHONE_SHAPED_WAIT_TOOL_CALL_ID = "child-wait-call:415-555-0134"
+const REISSUED_WAIT_TOOL_CALL_PREFIX = "child-wait-reissue:"
 const TARGET_RESULT_TEXT = "durable-child-result-after-process-restart; phone +1 (415) 555-0134; email child-wait@example.invalid"
 const REDACTED_TARGET_RESULT_TEXT = "durable-child-result-after-process-restart; phone [REDACTED_PHONE]; email [REDACTED_EMAIL]"
 const RESTORED_WAIT_OBSERVATION_MARKER = "WORKER_B_RESTORED_WAIT_OBSERVATION "
@@ -79,7 +81,7 @@ type RestoredWaitObservationSummary = {
   targetFinalText: string | null
 }
 
-function launchWorker(mode: "worker-a" | "worker-a-crash" | "worker-b-crash-before-resume" | "worker-b-crash-resume" | "worker-b-crash-after-wait-ack" | "worker-b", queueName: string, ids: FixtureIds): WorkerProcess {
+function launchWorker(mode: "worker-a" | "worker-a-crash" | "worker-b-crash-before-resume" | "worker-b-crash-resume" | "worker-b-crash-after-wait-ack" | "worker-b-crash-before-claim" | "worker-b-crash-after-orphan-reissue" | "worker-b-crash-after-claim-result" | "worker-b", queueName: string, ids: FixtureIds): WorkerProcess {
   const child = spawn(process.execPath, ["--import", "tsx", fixturePath, mode, queueName, JSON.stringify(ids)], {
     cwd: workerCwd,
     env: { ...process.env, DATABASE_URL: databaseUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl!, AGENT_TURN_REDIS_TEST_URL: redisUrl!,
@@ -129,6 +131,102 @@ async function waitFor<T>(read: () => Promise<T | null>, timeoutMs = 20_000): Pr
     await new Promise(resolve => setTimeout(resolve, 40))
   }
   throw new Error("Timed out waiting for durable child-wait state")
+}
+
+async function readWaitClaimState(pool: Pool, ids: FixtureIds, stepId: string, callId: string, attempt: number) {
+  const callResult = await pool.query<{ id: string; status: string; revision: number; content: Record<string, unknown>; stepId: string }>(
+    `SELECT "id", "status", "revision", "content", "stepId" FROM "agent_items"
+     WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = $4 AND "type" = 'tool_call'
+       AND "content"->>'toolName' = 'wait_subagents' AND "content"->>'toolCallId' = $5`,
+    [ids.sessionId, ids.turnId, ids.waiterTaskId, stepId, callId],
+  )
+  const call = callResult.rows[0]
+  if (!call) return { call: undefined, callCount: callResult.rows.length, claim: undefined, claimCount: 0,
+    itemStarted: undefined, itemStartedCount: 0, result: undefined, resultCount: 0, lifecycle: [], claimOutboxCount: 0 }
+  const claimKey = `task:${ids.waiterTaskId}:event:child-wait-claim:${attempt}:${stepId}`
+  const [claimResult, itemStartedResult, resultResult] = await Promise.all([
+    pool.query<{ id: string; type: string; itemId: string | null; actor: string; correlationId: string; causationId: string | null; idempotencyKey: string; payload: Record<string, unknown> }>(
+      `SELECT "id", "type", "itemId", "actor", "correlationId", "causationId", "idempotencyKey", "payload" FROM "agent_events"
+       WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "idempotencyKey" = $4`,
+      [ids.sessionId, ids.turnId, ids.waiterTaskId, claimKey],
+    ),
+    pool.query<{ id: string; type: string; itemId: string | null; correlationId: string; causationId: string | null; idempotencyKey: string }>(
+      `SELECT "id", "type", "itemId", "correlationId", "causationId", "idempotencyKey" FROM "agent_events"
+       WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "itemId" = $4 AND "type" = 'item.started'`,
+      [ids.sessionId, ids.turnId, ids.waiterTaskId, call.id],
+    ),
+    pool.query<{ id: string; status: string; revision: number; content: Record<string, unknown> }>(
+      `SELECT "id", "status", "revision", "content" FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2
+       AND "taskId" = $3 AND "stepId" = $4 AND "type" = 'tool_result' AND "content"->>'toolCallId' = $5`,
+      [ids.sessionId, ids.turnId, ids.waiterTaskId, stepId, callId],
+    ),
+  ])
+  const claim = claimResult.rows[0], itemStarted = itemStartedResult.rows[0], result = resultResult.rows[0]
+  const lifecycleResult = await pool.query<{ id: string; type: string; itemId: string | null; correlationId: string; causationId: string | null; idempotencyKey: string }>(
+    `SELECT "id", "type", "itemId", "correlationId", "causationId", "idempotencyKey" FROM "agent_events"
+     WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND ("itemId" = $4 OR "itemId" = $5)
+     ORDER BY "sequence"`,
+    [ids.sessionId, ids.turnId, ids.waiterTaskId, call.id, result?.id ?? ""],
+  )
+  const claimOutbox = claim ? await pool.query<{ count: number }>(
+    `SELECT COUNT(*)::int AS "count" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.events' AND "idempotencyKey" = $2`,
+    [ids.sessionId, `agent-event:${claim.id}`],
+  ) : { rows: [{ count: 0 }] }
+  return { call, callCount: callResult.rows.length, claim, claimCount: claimResult.rows.length,
+    itemStarted, itemStartedCount: itemStartedResult.rows.length, result, resultCount: resultResult.rows.length,
+    lifecycle: lifecycleResult.rows, claimOutboxCount: claimOutbox.rows[0]?.count ?? 0 }
+}
+
+async function expectMalformedClaimOutcomeRejected(
+  pool: Pool, taskStore: PgSubagentTaskStore, ids: FixtureIds, waitId: string,
+  validResult: Record<string, unknown>, label: string, corrupt: (outcome: Record<string, unknown>) => void,
+): Promise<void> {
+  const malformedResult = structuredClone(validResult)
+  const malformedOutcome = asObject(malformedResult.outcome)
+  corrupt(malformedOutcome)
+  const updated = await pool.query(`UPDATE "agent_wait_conditions" SET "result" = $2::jsonb
+    WHERE "id" = $1 AND "parentTaskId" = $3 AND "sessionId" = $4 AND "consumedAt" IS NOT NULL RETURNING "id"`,
+  [waitId, JSON.stringify(malformedResult), ids.waiterTaskId, ids.sessionId])
+  expect(updated.rowCount, `${label}: malformed wait receipt was not installed`).toBe(1)
+  const beforeTask = await pool.query<{ status: string; attemptCount: number; leaseOwner: string | null; leaseExpired: boolean }>(
+    `SELECT "status", "attemptCount", "leaseOwner", "leaseExpiresAt" <= clock_timestamp() AS "leaseExpired"
+      FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`, [ids.waiterTaskId, ids.sessionId])
+  const beforeDispatch = await pool.query<{ attemptCount: number; publishedAt: Date | null; payload: unknown }>(
+    `SELECT "attemptCount", "publishedAt", "payload" FROM "agent_outbox"
+      WHERE "topic" = 'agent.subagent.dispatch' AND "aggregateId" = $1 AND "idempotencyKey" = $2`,
+    [ids.sessionId, `subagent-dispatch:${ids.waiterTaskId}`])
+  expect(beforeTask.rows, `${label}: expected exactly one persisted waiter`).toHaveLength(1)
+  expect(beforeDispatch.rows, `${label}: expected the dispatch generation row`).toHaveLength(1)
+  const previousTraceTaskId = process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID
+  const traceLog = vi.spyOn(console, "info").mockImplementation(() => undefined)
+  try {
+    process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID = ids.waiterTaskId
+    const recovery = await new AgentTreeManager(taskStore, { heartbeatMs: 2_000 }).recover(50)
+    expect(recovery.rows.some(row => row.id === ids.waiterTaskId), `${label}: manager.recover requeued the malformed wait`).toBe(false)
+    const traceLine = traceLog.mock.calls.map(([value]) => String(value))
+      .find(value => value.startsWith("WORKER_B_RECOVERY_PREDICATE_TRACE "))
+    expect(traceLine, `${label}: expiry recovery did not emit its real predicate trace`).toBeDefined()
+    expect(JSON.parse(traceLine!.slice("WORKER_B_RECOVERY_PREDICATE_TRACE ".length))).toMatchObject({
+      rejectionStage: "unsettled_external_call_rejected", blockingExternalCall: true,
+    })
+    const afterTask = await pool.query<{ status: string; attemptCount: number; leaseOwner: string | null; leaseExpired: boolean }>(
+      `SELECT "status", "attemptCount", "leaseOwner", "leaseExpiresAt" <= clock_timestamp() AS "leaseExpired"
+        FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`, [ids.waiterTaskId, ids.sessionId])
+    const afterDispatch = await pool.query<{ attemptCount: number; publishedAt: Date | null; payload: unknown }>(
+      `SELECT "attemptCount", "publishedAt", "payload" FROM "agent_outbox"
+        WHERE "topic" = 'agent.subagent.dispatch' AND "aggregateId" = $1 AND "idempotencyKey" = $2`,
+      [ids.sessionId, `subagent-dispatch:${ids.waiterTaskId}`])
+    expect(beforeTask.rows[0]).toMatchObject({ status: "running", attemptCount: 1, leaseExpired: true })
+    expect(afterTask.rows).toEqual(beforeTask.rows)
+    expect(afterDispatch.rows).toEqual(beforeDispatch.rows)
+  } finally {
+    if (previousTraceTaskId === undefined) delete process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID
+    else process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID = previousTraceTaskId
+    traceLog.mockRestore()
+    await pool.query(`UPDATE "agent_wait_conditions" SET "result" = $2::jsonb
+      WHERE "id" = $1 AND "parentTaskId" = $3 AND "sessionId" = $4`,
+    [waitId, JSON.stringify(validResult), ids.waiterTaskId, ids.sessionId])
+  }
 }
 
 async function seedFixedWaitTarget(pool: Pool, input: {
@@ -321,6 +419,8 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
     let workerC: WorkerProcess | undefined
     let workerD: WorkerProcess | undefined
     let workerE: WorkerProcess | undefined
+    let workerF: WorkerProcess | undefined
+    let workerG: WorkerProcess | undefined
     let queuePaused = false
     const originalRedisUrl = process.env.REDIS_URL
     let closeSharedRedisConnections: (() => Promise<void>) | undefined
@@ -670,7 +770,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       // Hold a stalled prior generation until recovery and replacement dispatch are asserted.
       queuePaused = true
       await queue.pause()
-      workerD = launchWorker("worker-b-crash-after-wait-ack", queueName, ids)
+      workerD = launchWorker("worker-b-crash-before-claim", queueName, ids)
       await waitForMarker(workerD, "WORKER_B_RECOVERED")
       const continuationRecovery = await pool.query<{ taskStatus: string; attemptCount: number; leaseOwner: string | null;
         stepStatus: string; waitStatus: string; consumedAt: Date | null }>(
@@ -727,6 +827,32 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(acknowledged?.consumedAt).toBeInstanceOf(Date)
       const acknowledgedAt = acknowledged!.consumedAt
       const acknowledgedOwner = acknowledged!.leaseOwner
+      await waitForMarker(workerD, "WORKER_B_PRE_CLAIM_ORPHAN")
+      const orphanCallId = `${REISSUED_WAIT_TOOL_CALL_PREFIX}${waiter.id}:attempt:${acknowledged!.sourceAttempt}:orphan`
+      const preClaimState = await readWaitClaimState(pool, ids, acknowledged!.continuationStepId, orphanCallId, acknowledged!.sourceAttempt)
+      expect(preClaimState.callCount).toBe(1)
+      expect(preClaimState.claimCount).toBe(0)
+      expect(preClaimState.itemStartedCount).toBe(1)
+      expect(preClaimState.resultCount).toBe(0)
+      expect(preClaimState.call).toMatchObject({ status: "started", revision: 0, stepId: acknowledged!.continuationStepId,
+        content: { toolCallId: orphanCallId, toolName: "wait_subagents", toolVersion: "1",
+          input: { taskIds: [FIXED_WAIT_TARGET_TASK_ID], mode: "any", timeoutMs: 30_000,
+            idempotencyKey: `child-wait:${waiter.id}:attempt:${acknowledged!.sourceAttempt}` } } })
+      expect(preClaimState.lifecycle.map(event => event.type)).toEqual(["item.started"])
+      expect(preClaimState.claimOutboxCount).toBe(0)
+      const staleLeaseMarker = workerD.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_STALE_LEASE_SNAPSHOT_ACCEPTED "))
+      const staleLeaseEvidence = JSON.parse(staleLeaseMarker!.slice("WORKER_B_STALE_LEASE_SNAPSHOT_ACCEPTED ".length)) as {
+        snapshotExpiresAt: string; logicalNow: string; liveDbLeaseExpiresAt: string; loaded: boolean
+      }
+      expect(staleLeaseEvidence.loaded).toBe(true)
+      expect(Date.parse(staleLeaseEvidence.logicalNow)).toBeGreaterThan(Date.parse(staleLeaseEvidence.snapshotExpiresAt))
+      expect(Date.parse(staleLeaseEvidence.liveDbLeaseExpiresAt)).toBeGreaterThan(Date.parse(staleLeaseEvidence.logicalNow))
+      const preClaimMarker = workerD.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_PRE_CLAIM_ORPHAN "))
+      expect(JSON.parse(preClaimMarker!.slice("WORKER_B_PRE_CLAIM_ORPHAN ".length))).toMatchObject({
+        callId: orphanCallId, stepId: acknowledged!.continuationStepId, waitId: acknowledged!.waitId,
+        exactInput: true, executorCalls: 0,
+      })
+      const reissuedWaitCallId = `${REISSUED_WAIT_TOOL_CALL_PREFIX}${waiter.id}:attempt:${acknowledged!.sourceAttempt}`
       await stopWorker(workerD)
       const ackCutExit = await workerD.exited
       expect(ackCutExit.code).toBeNull()
@@ -736,7 +862,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       [waiter.id, ids.sessionId, acknowledgedOwner])
       expect(acknowledgedExpiry.rowCount).toBe(1)
 
-      workerE = launchWorker("worker-b", queueName, ids)
+      workerE = launchWorker("worker-b-crash-after-orphan-reissue", queueName, ids)
       await waitForMarker(workerE, "WORKER_B_RECOVERED")
       const acknowledgedRecovery = await pool.query<{ taskStatus: string; attemptCount: number; leaseOwner: string | null;
         sourceStepId: string; sourceAttempt: number; sourceOrdinal: number;
@@ -769,21 +895,188 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       )
       expect(finalDispatch.rows[0]).toMatchObject({ attemptCount: postAckGeneration + 1 })
       expect(finalDispatch.rows[0]?.publishedAt).toBeInstanceOf(Date)
+      await waitForMarker(workerE, "WORKER_B_ORPHAN_RESTORED")
+      const orphanRestoredMarker = workerE.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_ORPHAN_RESTORED "))
+      expect(JSON.parse(orphanRestoredMarker!.slice("WORKER_B_ORPHAN_RESTORED ".length))).toMatchObject({
+        waitId: acknowledged!.waitId, stepId: acknowledged!.continuationStepId, orphanCallIds: [orphanCallId],
+        restoredToolCallCount: 1, orphanObserved: false, claimRecoveryPresent: false,
+      })
       await waitForMarker(workerE, "WORKER_B_CONSUMED_WAIT_STEP_REUSED")
       expectRestoredWaitObservation(workerE, "consumed")
       expect(workerE.stdoutText).toContain(`WORKER_B_CONSUMED_WAIT_STEP_REUSED ${JSON.stringify({ waitId: acknowledged!.waitId,
         sourceStepId: acknowledged!.sourceStepId, attempt: acknowledged!.sourceAttempt, sourceOrdinal: acknowledged!.sourceOrdinal,
         stepId: acknowledged!.continuationStepId, ordinal: acknowledged!.continuationOrdinal })}`)
+      await waitForMarker(workerE, "WORKER_B_REISSUE_CLAIMED")
+      const claimState = await readWaitClaimState(pool, ids, acknowledged!.continuationStepId, reissuedWaitCallId, acknowledged!.sourceAttempt)
+      expect(claimState.callCount).toBe(1)
+      expect(claimState.claimCount).toBe(1)
+      expect(claimState.itemStartedCount).toBe(1)
+      expect(claimState.resultCount).toBe(0)
+      expect(claimState.call).toMatchObject({ status: "started", stepId: acknowledged!.continuationStepId,
+        content: { toolCallId: reissuedWaitCallId, toolName: "wait_subagents", toolVersion: "1",
+          input: { taskIds: [FIXED_WAIT_TARGET_TASK_ID], mode: "any", timeoutMs: 30_000,
+            idempotencyKey: `child-wait:${waiter.id}:attempt:${acknowledged!.sourceAttempt}` } } })
+      expect(claimState.claim).toMatchObject({ type: "tool_call.started", actor: "subagent", itemId: claimState.call!.id,
+        correlationId: reissuedWaitCallId, causationId: claimState.itemStarted!.id,
+        idempotencyKey: `task:${waiter.id}:event:child-wait-claim:${acknowledged!.sourceAttempt}:${acknowledged!.continuationStepId}`,
+        payload: { toolCallId: reissuedWaitCallId, toolName: "wait_subagents", taskId: waiter.id } })
+      expect(claimState.itemStarted).toMatchObject({ type: "item.started", itemId: claimState.call!.id })
+      expect(claimState.result).toBeUndefined()
+      expect(claimState.claimOutboxCount).toBe(1)
+      const orphanAfterReissue = await readWaitClaimState(pool, ids, acknowledged!.continuationStepId, orphanCallId, acknowledged!.sourceAttempt)
+      expect(orphanAfterReissue.callCount).toBe(1)
+      expect(orphanAfterReissue.claimCount).toBe(0)
+      expect(orphanAfterReissue.itemStartedCount).toBe(1)
+      expect(orphanAfterReissue.resultCount).toBe(0)
+      expect(orphanAfterReissue.lifecycle.map(event => event.type)).toEqual(["item.started"])
+      const waitsAtClaim = await pool.query<{ id: string; status: string; consumedAt: Date | null }>(
+        `SELECT "id", "status", "consumedAt" FROM "agent_wait_conditions" WHERE "parentTaskId" = $1 AND "sessionId" = $2`,
+        [waiter.id, ids.sessionId],
+      )
+      expect(waitsAtClaim.rows).toHaveLength(1)
+      expect(waitsAtClaim.rows[0]).toMatchObject({ id: acknowledged!.waitId, status: "ready" })
+      expect(waitsAtClaim.rows[0]?.consumedAt).toEqual(acknowledgedAt)
+      const claimMarker = workerE.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_REISSUE_CLAIMED "))
+      expect(JSON.parse(claimMarker!.slice("WORKER_B_REISSUE_CLAIMED ".length))).toMatchObject({ callId: reissuedWaitCallId,
+        stepId: acknowledged!.continuationStepId, waitId: acknowledged!.waitId, exactInput: true, storedOutputMatched: true,
+        wrongStepRejected: true, repeatedStartKeyRejected: true, competingReplayRejected: true,
+        competingFreshIdRejected: true, competingOrphanRejected: true,
+        orphanCallIds: [orphanCallId], staleOwnerRejected: true, staleAttemptRejected: true,
+        staleRecoveryOwnerRejected: true, staleRecoveryAttemptRejected: true, dispatcherCalls: 0 })
 
-      await waitForMarker(workerE, "WORKER_B_RESUMED")
-      const finalExit = await workerE.exited
+      await stopWorker(workerE)
+      const claimCutExit = await workerE.exited
+      expect(claimCutExit.code).toBeNull()
+      expect(claimCutExit.signal).toBe("SIGKILL")
+      const claimCutLease = await pool.query<{ leaseOwner: string | null }>(`SELECT "leaseOwner" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`,
+        [waiter.id, ids.sessionId])
+      const claimCutOwner = claimCutLease.rows[0]?.leaseOwner
+      expect(claimCutOwner).toEqual(expect.any(String))
+      const claimCutExpiry = await pool.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = CURRENT_TIMESTAMP - interval '1 second'
+        WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running' AND "attemptCount" = 1 AND "leaseOwner" = $3 RETURNING "id"`,
+      [waiter.id, ids.sessionId, claimCutOwner])
+      expect(claimCutExpiry.rowCount).toBe(1)
+
+      const validReceiptRows = await pool.query<{ id: string; result: Record<string, unknown> }>(
+        `SELECT "id", "result" FROM "agent_wait_conditions" WHERE "id" = $1 AND "parentTaskId" = $2
+          AND "sessionId" = $3 AND "consumedAt" IS NOT NULL`, [acknowledged!.waitId, waiter.id, ids.sessionId])
+      expect(validReceiptRows.rows).toHaveLength(1)
+      const validWaitResult = validReceiptRows.rows[0]!.result
+      const validOutcome = asObject(validWaitResult.outcome)
+      expect(validOutcome.deadlineAt).toEqual(expect.any(String))
+      expect(Array.isArray(validOutcome.tasks)).toBe(true)
+      const malformedOutcomeCases: Array<{ label: string; corrupt(outcome: Record<string, unknown>): void }> = [
+        { label: "missing outcome deadlineAt", corrupt: outcome => { delete outcome.deadlineAt } },
+        { label: "missing outcome tasks", corrupt: outcome => { delete outcome.tasks } },
+        { label: "invalid outcome task status", corrupt: outcome => {
+          const tasks = outcome.tasks
+          if (!Array.isArray(tasks) || tasks.length !== 1) throw new Error("valid wait receipt task fixture is unavailable")
+          outcome.tasks = [{ ...asObject(tasks[0]), status: "not-a-task-status" }]
+        } },
+      ]
+      for (const malformed of malformedOutcomeCases) {
+        await expectMalformedClaimOutcomeRejected(pool, taskStore, ids, acknowledged!.waitId,
+          validWaitResult, malformed.label, malformed.corrupt)
+      }
+
+      workerF = launchWorker("worker-b-crash-after-claim-result", queueName, ids)
+      await waitForMarker(workerF, "WORKER_B_RECOVERED")
+      const resultCutDispatch = await pool.query<{ taskStatus: string; attemptCount: number; leaseOwner: string | null }>(
+        `SELECT task."status" AS "taskStatus", task."attemptCount", task."leaseOwner" FROM "sub_agent_tasks" AS task
+         WHERE task."id" = $1 AND task."sessionId" = $2`, [waiter.id, ids.sessionId],
+      )
+      expect(resultCutDispatch.rows[0]).toMatchObject({ taskStatus: "queued", attemptCount: 1, leaseOwner: null })
+      const resultCutOutbox = await pool.query<{ attemptCount: number; publishedAt: Date | null }>(
+        `SELECT "attemptCount", "publishedAt" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch'
+         AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${waiter.id}`],
+      )
+      const resultCutGeneration = resultCutOutbox.rows[0]!.attemptCount
+      expect(resultCutOutbox.rows[0]?.publishedAt).toBeNull()
+      await expect(dispatchPendingSubagentOutbox(pool as never, queue, 50, ids.sessionId)).resolves.toBe(1)
+      const resultCutDispatchPublished = await pool.query<{ attemptCount: number; publishedAt: Date | null }>(
+        `SELECT "attemptCount", "publishedAt" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch'
+         AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${waiter.id}`],
+      )
+      expect(resultCutDispatchPublished.rows[0]).toMatchObject({ attemptCount: resultCutGeneration + 1 })
+      expect(resultCutDispatchPublished.rows[0]?.publishedAt).toBeInstanceOf(Date)
+      await waitForMarker(workerF, "WORKER_B_REISSUE_RESULT_RECOVERED")
+      const resultRecoveryMarker = workerF.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_REISSUE_RESULT_RECOVERED "))
+      expect(JSON.parse(resultRecoveryMarker!.slice("WORKER_B_REISSUE_RESULT_RECOVERED ".length))).toMatchObject({
+        callId: reissuedWaitCallId, stepId: acknowledged!.continuationStepId, waitId: acknowledged!.waitId,
+        outputMatched: true, orphanCallIds: [orphanCallId], executorCalls: 0, sameCallRecovered: true,
+        resultItemStatus: "created",
+      })
+      expectRestoredWaitObservation(workerF, "consumed")
+      const recoveredClaimState = await readWaitClaimState(pool, ids, acknowledged!.continuationStepId, reissuedWaitCallId, acknowledged!.sourceAttempt)
+      expect(recoveredClaimState.claimCount).toBe(1)
+      expect(recoveredClaimState.itemStartedCount).toBe(1)
+      expect(recoveredClaimState.resultCount).toBe(1)
+      expect(recoveredClaimState.claimOutboxCount).toBe(1)
+      expect(recoveredClaimState.call).toMatchObject({ status: "completed", content: { toolCallId: reissuedWaitCallId } })
+      expect(recoveredClaimState.claim).toMatchObject({ type: "tool_call.started", itemId: recoveredClaimState.call!.id,
+        correlationId: reissuedWaitCallId, causationId: recoveredClaimState.itemStarted!.id,
+        idempotencyKey: `task:${waiter.id}:event:child-wait-claim:${acknowledged!.sourceAttempt}:${acknowledged!.continuationStepId}`,
+        payload: { toolCallId: reissuedWaitCallId, toolName: "wait_subagents", taskId: waiter.id } })
+      expect(recoveredClaimState.result).toMatchObject({ status: "completed",
+        content: { toolCallId: reissuedWaitCallId, output: { waitId: acknowledged!.waitId }, errorCode: null } })
+      expect(recoveredClaimState.lifecycle.map(event => event.type)).toEqual([
+        "item.started", "tool_call.started", "item.completed", "tool_call.completed", "item.started", "item.completed",
+      ])
+      expect(recoveredClaimState.lifecycle.filter(event => event.id !== recoveredClaimState.itemStarted!.id
+        && event.id !== recoveredClaimState.claim!.id).every(event => event.causationId === recoveredClaimState.claim!.id)).toBe(true)
+      const orphanAfterRecovery = await readWaitClaimState(pool, ids, acknowledged!.continuationStepId, orphanCallId, acknowledged!.sourceAttempt)
+      expect(orphanAfterRecovery.callCount).toBe(1)
+      expect(orphanAfterRecovery.claimCount).toBe(0)
+      expect(orphanAfterRecovery.resultCount).toBe(0)
+      expect(orphanAfterRecovery.lifecycle.map(event => event.type)).toEqual(["item.started"])
+      await stopWorker(workerF)
+      const resultCutExit = await workerF.exited
+      expect(resultCutExit.code).toBeNull()
+      expect(resultCutExit.signal).toBe("SIGKILL")
+      const resultCutLease = await pool.query<{ leaseOwner: string | null }>(`SELECT "leaseOwner" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`,
+        [waiter.id, ids.sessionId])
+      const resultCutOwner = resultCutLease.rows[0]?.leaseOwner
+      expect(resultCutOwner).toEqual(expect.any(String))
+      const resultExpiry = await pool.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = CURRENT_TIMESTAMP - interval '1 second'
+        WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running' AND "attemptCount" = 1 AND "leaseOwner" = $3 RETURNING "id"`,
+      [waiter.id, ids.sessionId, resultCutOwner])
+      expect(resultExpiry.rowCount).toBe(1)
+
+      workerG = launchWorker("worker-b", queueName, ids)
+      await waitForMarker(workerG, "WORKER_B_RECOVERED")
+      const completedRecoveryDispatch = await pool.query<{ taskStatus: string; attemptCount: number; leaseOwner: string | null }>(
+        `SELECT task."status" AS "taskStatus", task."attemptCount", task."leaseOwner" FROM "sub_agent_tasks" AS task
+         WHERE task."id" = $1 AND task."sessionId" = $2`, [waiter.id, ids.sessionId],
+      )
+      expect(completedRecoveryDispatch.rows[0]).toMatchObject({ taskStatus: "queued", attemptCount: 1, leaseOwner: null })
+      const completedRecoveryOutbox = await pool.query<{ attemptCount: number; publishedAt: Date | null }>(
+        `SELECT "attemptCount", "publishedAt" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch'
+         AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${waiter.id}`],
+      )
+      const completedRecoveryGeneration = completedRecoveryOutbox.rows[0]!.attemptCount
+      expect(completedRecoveryOutbox.rows[0]?.publishedAt).toBeNull()
+      await expect(dispatchPendingSubagentOutbox(pool as never, queue, 50, ids.sessionId)).resolves.toBe(1)
+      const completedRecoveryPublished = await pool.query<{ attemptCount: number; publishedAt: Date | null }>(
+        `SELECT "attemptCount", "publishedAt" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch'
+         AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${waiter.id}`],
+      )
+      expect(completedRecoveryPublished.rows[0]).toMatchObject({ attemptCount: completedRecoveryGeneration + 1 })
+      expect(completedRecoveryPublished.rows[0]?.publishedAt).toBeInstanceOf(Date)
+      await waitForMarker(workerG, "WORKER_B_ORPHAN_ACCOUNTING")
+      const orphanAccountingMarker = workerG.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_ORPHAN_ACCOUNTING "))
+      expect(JSON.parse(orphanAccountingMarker!.slice("WORKER_B_ORPHAN_ACCOUNTING ".length))).toMatchObject({
+        orphanCallIds: [orphanCallId], restoredToolCallCount: 2, orphanObserved: false, claimRecoveryPresent: false,
+      })
+      expectRestoredWaitObservation(workerG, "consumed")
+      await waitForMarker(workerG, "WORKER_B_RESUMED")
+      const finalExit = await workerG.exited
       expect(finalExit.code).toBe(0)
       expect(finalExit.signal).toBeNull()
-      expect(workerE.stdoutText.match(/WORKER_B_RESUMED/g) ?? []).toHaveLength(1)
+      expect(workerG.stdoutText.match(/WORKER_B_RESUMED/g) ?? []).toHaveLength(1)
       const finished = await pool.query<{ status: string; attemptCount: number; leaseOwner: string | null; failureReason: string | null }>(
         `SELECT "status", "attemptCount", "leaseOwner", "failureReason" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`, [waiter.id, ids.sessionId],
       )
-      expect(finished.rows[0], JSON.stringify({ workerOutput: workerE.stdoutText, workerError: workerE.stderrText,
+      expect(finished.rows[0], JSON.stringify({ workerOutput: workerG.stdoutText, workerError: workerG.stderrText,
         failureReason: finished.rows[0]?.failureReason }))
         .toMatchObject({ status: "completed", attemptCount: 1, leaseOwner: null })
       const durable = await pool.query<{ status: string; consumedAt: Date | null; targetTaskIds: string[];
@@ -792,6 +1085,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         `SELECT "status", "consumedAt", "targetTaskIds", "result" FROM "agent_wait_conditions"
          WHERE "parentTaskId" = $1 AND "sessionId" = $2`, [waiter.id, ids.sessionId],
       )
+      expect(durable.rows).toHaveLength(1)
       expect(durable.rows[0]).toMatchObject({ status: "ready", targetTaskIds: [FIXED_WAIT_TARGET_TASK_ID],
         result: { request: { targetTaskIds: [FIXED_WAIT_TARGET_TASK_ID] },
           outcome: { status: "ready", taskIds: [FIXED_WAIT_TARGET_TASK_ID], matchedTaskIds: [FIXED_WAIT_TARGET_TASK_ID] } } })
@@ -816,12 +1110,16 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
          WHERE "taskId" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "type" = 'tool_call'
            AND "content"->>'toolName' = 'wait_subagents'`, [waiter.id, ids.sessionId, ids.turnId],
       )
-      expect(persistedWaitCalls.rows).toHaveLength(1)
-      expect(persistedWaitCalls.rows[0]).toMatchObject({ toolCallId: PHONE_SHAPED_WAIT_TOOL_CALL_ID })
+      expect(persistedWaitCalls.rows).toHaveLength(3)
+      expect(persistedWaitCalls.rows).toEqual(expect.arrayContaining([
+        expect.objectContaining({ toolCallId: PHONE_SHAPED_WAIT_TOOL_CALL_ID, status: "completed" }),
+        expect.objectContaining({ toolCallId: orphanCallId, status: "started" }),
+        expect.objectContaining({ toolCallId: reissuedWaitCallId, status: "completed" }),
+      ]))
       const persistedStartEvents = await pool.query<{ correlationId: string; payloadToolCallId: string }>(
         `SELECT "correlationId", "payload"->>'toolCallId' AS "payloadToolCallId" FROM "agent_events"
-         WHERE "taskId" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "itemId" = $4
-           AND "type" = 'tool_call.started'`, [waiter.id, ids.sessionId, ids.turnId, persistedWaitCalls.rows[0]!.id],
+         WHERE "taskId" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "type" = 'tool_call.started'
+           AND "idempotencyKey" = $4`, [waiter.id, ids.sessionId, ids.turnId, `task:${waiter.id}:event:tool-started:${PHONE_SHAPED_WAIT_TOOL_CALL_ID}`],
       )
       expect(persistedStartEvents.rows).toEqual([{
         correlationId: PHONE_SHAPED_WAIT_TOOL_CALL_ID,
@@ -830,7 +1128,9 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(finalGeneration).toBeGreaterThan(generation)
       expect(postAckGeneration).toBeGreaterThan(finalGeneration)
       expect(finalDispatch.rows[0]!.attemptCount - 1).toBe(postAckGeneration)
-      const finalResumeJob = await queue.getJob(subagentDispatchJobId(waiter.id, postAckGeneration))
+      expect(resultCutDispatchPublished.rows[0]!.attemptCount - 1).toBe(resultCutGeneration)
+      expect(completedRecoveryPublished.rows[0]!.attemptCount - 1).toBe(completedRecoveryGeneration)
+      const finalResumeJob = await queue.getJob(subagentDispatchJobId(waiter.id, completedRecoveryGeneration))
       expect(finalResumeJob).toBeDefined()
       expect(await finalResumeJob!.getState()).toBe("completed")
     } finally {
@@ -839,6 +1139,8 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       await stopWorker(workerC)
       await stopWorker(workerD)
       await stopWorker(workerE)
+      await stopWorker(workerF)
+      await stopWorker(workerG)
       if (queuePaused) await queue.resume().catch(() => undefined)
       await queue.obliterate({ force: true }).catch(() => undefined)
       await queue.close().catch(() => undefined)

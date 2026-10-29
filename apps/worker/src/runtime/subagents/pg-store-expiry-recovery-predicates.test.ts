@@ -55,6 +55,41 @@ describe("expired recovery SQL predicates", () => {
     expect(sql).toContain('$10::text IS NOT NULL')
   })
 
+  it("only allows the exact consumed-wait continuation claim through expiry recovery", async () => {
+    const query = vi.fn().mockResolvedValue({ rows: [] })
+    const client = { query }
+    await expect(hasBlockingExternalCall(client as never, task, undefined, "continuation-1")).resolves.toBe(false)
+    const [sql, values] = query.mock.calls[0] as [string, unknown[]]
+    expect(values).toEqual([task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount,
+      task.leaseExpiresAt, task.userId, null, "continuation-1"])
+    expect(sql).toContain('AND NOT (started."type" = \'tool_call.started\' AND $10::text IS NOT NULL AND EXISTS (')
+    expect(sql).toContain("started.\"idempotencyKey\" = 'task:' || owner.\"id\" || ':event:child-wait-claim:' || $6::text || ':' || continuation.\"id\"")
+    expect(sql).toContain('started."causationId" = itemStarted."id"')
+    expect(sql).toContain('itemStarted."idempotencyKey" = \'task:\' || owner."id" || \':event:item-started:\' || call."id"')
+    expect(sql).toContain('call."stepId" = continuation."id"')
+    expect(sql).toContain('owner."leaseOwner" = $5 AND owner."attemptCount" = $6 AND owner."leaseExpiresAt" = $7')
+    expect(sql).toContain('continuation."ordinal" = (SELECT MAX(current."ordinal")')
+    expect(sql).toContain('(call."content"->\'input\' - \'taskIds\') = jsonb_build_object(\'idempotencyKey\', wait."idempotencyKey"')
+    expect(sql).toContain("jsonb_object_length(wait.\"result\"->'outcome') = 6")
+    expect(sql).toContain("wait.\"result\"->'outcome' ?& ARRAY['waitId', 'status', 'taskIds', 'deadlineAt', 'matchedTaskIds', 'tasks']")
+    expect(sql).toContain("wait.\"result\"->'outcome'->>'deadlineAt' = to_char(wait.\"deadlineAt\"")
+    expect(sql).toContain("jsonb_typeof(wait.\"result\"->'outcome'->'tasks') = 'array'")
+    expect(sql).toContain("jsonb_object_length(saved.value) = 5")
+    expect(sql).toContain("jsonb_typeof(saved.value->'failureReason') IN ('null', 'string')")
+    expect(sql).toContain("wait.\"status\" <> 'timed_out' OR wait.\"deadlineAt\" <= clock_timestamp()")
+    expect(sql).toContain('AND NOT EXISTS (SELECT 1 FROM "agent_items" AS result')
+    expect(sql).toContain('AND NOT EXISTS (SELECT 1 FROM "agent_events" AS extra')
+  })
+
+  it("does not apply the continuation-claim exemption without an exact continuation step", async () => {
+    const query = vi.fn().mockResolvedValue({ rows: [{ id: "unsettled-start" }] })
+    const client = { query }
+    await expect(hasBlockingExternalCall(client as never, task)).resolves.toBe(true)
+    const [sql, values] = query.mock.calls[0] as [string, unknown[]]
+    expect(values[9]).toBeNull()
+    expect(sql).toContain("started.\"type\" = 'tool_call.started' AND $10::text IS NOT NULL")
+  })
+
   it("returns false when no unmatched external-call start is returned", async () => {
     const client = { query: vi.fn().mockResolvedValue({ rows: [] }) }
     await expect(hasBlockingExternalCall(client as never, task)).resolves.toBe(false)

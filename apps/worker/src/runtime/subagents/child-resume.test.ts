@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 
 import { loadChildAttemptResume } from "./child-resume.js"
+import { childWaitClaimEventKey } from "./child-durable-wait-replay.js"
 import type { SubagentLease } from "./types.js"
 
 type Row = Record<string, unknown>
@@ -44,7 +45,26 @@ function consumedWait(child: SubagentLease, targetId = "grandchild-1", note?: st
     sourceItemId: "wait-result-id", consumedAt: future, suspendedAt: future }
 }
 
-function fakePool(child: SubagentLease, steps: Row[], items: Row[] = [], consumedWait?: Row, targets: Row[] = []) {
+function reissuedWaitCall(child: SubagentLease, wait: Row, callId: string, claimed: boolean) {
+  const stepId = String(wait.continuationStepId), input = (wait.callContent as Row).input
+  const id = `task:${child.id}:item:tool-call:${callId}:attempt:${child.attemptCount}`
+  const itemRow = { id, sessionId: child.sessionId, turnId: child.turnId, taskId: child.id, rootTaskId: child.rootTaskId, stepId,
+    type: "tool_call", status: "started", content: { toolCallId: callId, toolName: "wait_subagents", toolVersion: "1", input },
+    attempt: child.attemptCount, ordinal: wait.continuationOrdinal }
+  const callRow = { id, status: "started", revision: 0, content: itemRow.content, stepId,
+    attempt: child.attemptCount, ordinal: wait.continuationOrdinal }
+  const started = { id: `event-${callId}-item-started`, sessionId: child.sessionId, turnId: child.turnId, taskId: child.id, actor: "subagent",
+    type: "item.started", itemId: id, correlationId: stepId, causationId: null,
+    idempotencyKey: `task:${child.id}:event:item-started:${id}`, payload: { itemId: id, type: "tool_call", phase: null } }
+  const claim = { id: `event-${callId}-claim`, sessionId: child.sessionId, turnId: child.turnId, taskId: child.id, actor: "subagent",
+    type: "tool_call.started", itemId: id, correlationId: callId, causationId: started.id,
+    idempotencyKey: `task:${child.id}:event:${childWaitClaimEventKey(child.attemptCount, stepId)}`,
+    payload: { toolCallId: callId, toolName: "wait_subagents", taskId: child.id } }
+  return { itemRow, callRow, started, ...(claimed ? { claim } : {}) }
+}
+
+function fakePool(child: SubagentLease, steps: Row[], items: Row[] = [], consumedWait?: Row, targets: Row[] = [],
+  waitCalls: Row[] = [], waitResults: Row[] = [], waitEvents: Row[] = []) {
   const calls: Array<{ readonly sql: string; readonly values: readonly unknown[] }> = []
   const client = {
     query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
@@ -53,15 +73,20 @@ function fakePool(child: SubagentLease, steps: Row[], items: Row[] = [], consume
       if (sql.includes('WHERE task."id" = $1 AND task."sessionId"')) return { rows: [currentRow(child)], rowCount: 1 }
       if (sql.includes('FROM "agent_wait_conditions" AS wait')) return { rows: consumedWait ? [consumedWait] : [], rowCount: consumedWait ? 1 : 0 }
       if (sql.includes('WHERE task."id" = ANY($1::text[])')) return { rows: targets, rowCount: targets.length }
+      if (sql.includes('FROM "agent_events" AS event')) return { rows: waitEvents, rowCount: waitEvents.length }
+      if (sql.includes('item."content"->>\'toolName\' = \'wait_subagents\'')) return { rows: waitCalls, rowCount: waitCalls.length }
+      if (sql.includes('item."type" = \'tool_result\'')) return { rows: waitResults, rowCount: waitResults.length }
       if (sql.includes('FROM "agent_steps"')) {
         const visible = sql.includes('step."ordinal" <= $7')
-          ? steps.filter(row => Number(row.attempt) === Number(values[5]) && Number(row.ordinal) <= Number(values[6]))
+          ? steps.filter(row => Number(row.attempt) === Number(values[5])
+            && (Number(row.ordinal) <= Number(values[6]) || String(row.id) === String(values[7])))
           : sql.includes('step."attempt" < $6') ? steps.filter(row => Number(row.attempt) < Number(values[5])) : steps
         return { rows: visible, rowCount: visible.length }
       }
       if (sql.includes('FROM "agent_items"')) {
         const visible = sql.includes('step."attempt" < $6 OR')
-          ? items.filter(row => Number(row.attempt) < Number(values[5]) || Number(row.attempt) === Number(values[5]) && Number(row.ordinal) <= Number(values[6]))
+          ? items.filter(row => Number(row.attempt) < Number(values[5]) || Number(row.attempt) === Number(values[5])
+            && (Number(row.ordinal) <= Number(values[6]) || String(row.stepId) === String(values[7])))
           : items.filter(row => Number(row.attempt) < child.attemptCount)
         return { rows: visible, rowCount: visible.length }
       }
@@ -95,6 +120,18 @@ describe("child attempt durable resume", () => {
     expect(db.client.query.mock.calls.map(([sql]) => sql)).toContain("SELECT set_config($1, $2, true)")
   })
 
+  it("trusts the live database lease after heartbeat extends beyond the lease snapshot expiry", async () => {
+    const now = new Date("2026-10-29T16:00:00.000Z")
+    const staleLease = lease({ leaseExpiresAt: new Date("2026-10-29T15:59:00.000Z") })
+    const db = fakePool(staleLease, [step(staleLease)])
+
+    await expect(loadChildAttemptResume(db.pool as never, staleLease, now)).resolves.toMatchObject({
+      resume: { nextOrdinal: 1, stepCount: 1 },
+    })
+    expect(db.calls.find(call => call.sql.includes('WHERE task."id" = $1 AND task."sessionId"'))?.sql)
+      .toContain('task."leaseExpiresAt" > CURRENT_TIMESTAMP')
+  })
+
   it("checks first attempts for an acknowledged durable wait before returning no resume", async () => {
     const child = lease({ attemptCount: 1 }); const db = fakePool(child, [])
     await expect(loadChildAttemptResume(db.pool as never, child)).resolves.toBeUndefined()
@@ -118,7 +155,7 @@ describe("child attempt durable resume", () => {
     const restored = await loadChildAttemptResume(db.pool as never, child)
 
     expect(restored).toMatchObject({
-      resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1 },
+      resume: { nextOrdinal: 1, stepCount: 2, toolCallCount: 1 },
       durableWait: { waitId: "wait-1", stepId: "step-1", attempt: 1, ordinal: 0, toolCallId: "wait-call", sourceItemId: "wait-result-id" },
       observations: [{ id: "child-resume:wait-result-id", content: { toolCallId: "wait-call", toolName: "wait_subagents", status: "completed", output: { waitId: "wait-1", status: "ready" } } }],
     })
@@ -170,7 +207,7 @@ describe("child attempt durable resume", () => {
     const restored = await loadChildAttemptResume(db.pool as never, child)
 
     expect(restored).toMatchObject({
-      resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1 },
+      resume: { nextOrdinal: 1, stepCount: 2, toolCallCount: 1 },
       durableWait: { waitId: "wait-1", attempt: 3, ordinal: 0, toolCallId: "wait-call", sourceItemId: "recovered-wait-result:wait-1" },
       observations: [{ id: "child-resume:recovered-wait-result:wait-1", content: { toolCallId: "wait-call", toolName: "wait_subagents", status: "completed", output: { waitId: "wait-1", status: "ready" } } }],
     })
@@ -180,19 +217,80 @@ describe("child attempt durable resume", () => {
 
   it("uses the first later task ordinal while keeping the deterministic logical resume ordinal", async () => {
     const child = lease({ attemptCount: 3, maxAttempts: 3 })
-    const wait = { ...consumedWait(child), continuationOrdinal: 9, continuationLatestOrdinal: 9 }
+    const sourceStepId = `task:${child.id}:step:0:attempt:${child.attemptCount}`
+    const continuationStepId = `task:${child.id}:step:1:attempt:${child.attemptCount}`
+    const wait: Row = { ...consumedWait(child), stepId: sourceStepId, continuationStepId, continuationOrdinal: 9, continuationLatestOrdinal: 9 }
     const db = fakePool(child, [
-      step(child, { id: "step-1", attempt: 3, ordinal: 0, status: "waiting_for_tool" }),
-      step(child, { id: "step-2", attempt: 3, ordinal: 9, status: "streaming" }),
+      step(child, { id: sourceStepId, attempt: 3, ordinal: 0, status: "waiting_for_tool", inputThroughSequence: "7" }),
+      step(child, { id: continuationStepId, attempt: 3, ordinal: 9, status: "streaming", inputThroughSequence: "7", consumedInputIds: [] }),
     ], [], wait, [{ id: "grandchild-1", parentTaskId: child.id, rootTaskId: child.rootTaskId, sessionId: child.sessionId, turnId: child.turnId, userId: child.userId }])
 
-    await expect(loadChildAttemptResume(db.pool as never, child)).resolves.toMatchObject({
-      resume: { nextOrdinal: 1 },
+    const restored = await loadChildAttemptResume(db.pool as never, child)
+    expect(restored).toMatchObject({
+      resume: { nextOrdinal: 1, stepCount: 2, inputThroughSequence: 7n, consumedInputIds: ["input-1"] },
       durableWait: { ordinal: 0, attempt: 3 },
     })
+    expect(restored?.durableWait?.continuationStepId).toBe(continuationStepId)
+    expect(restored?.durableWait?.continuationOrdinal).toBe(9)
+    expect(db.calls.find(call => call.sql.includes('step."ordinal" <= $7'))?.values[7]).toBe(continuationStepId)
     const lineage = db.calls.find(call => call.sql.includes('FROM "agent_wait_conditions" AS wait'))?.sql ?? ""
     expect(lineage).toContain('later."ordinal" > candidateStep."ordinal"')
     expect(lineage).toContain('next."ordinal" = (SELECT MAX(latest."ordinal")')
+  })
+
+  it("omits a verified preclaim orphan from restored observations and tool-call accounting", async () => {
+    const child = lease({ attemptCount: 3, maxAttempts: 3 })
+    const sourceStepId = `task:${child.id}:step:0:attempt:${child.attemptCount}`
+    const continuationStepId = `task:${child.id}:step:1:attempt:${child.attemptCount}`
+    const wait: Row = { ...consumedWait(child), stepId: sourceStepId, continuationStepId, continuationOrdinal: 9, continuationLatestOrdinal: 9 }
+    const orphan = reissuedWaitCall(child, wait, "orphan-provider-call", false)
+    const sourceCall = item(child, { id: "source-wait-call", stepId: sourceStepId, attempt: 3, ordinal: 0,
+      content: { toolCallId: "wait-call", toolName: "wait_subagents", input: (wait.callContent as Row).input } })
+    const sourceResult = item(child, { id: String(wait.sourceItemId), stepId: sourceStepId, attempt: 3, ordinal: 0, type: "tool_result",
+      content: { toolCallId: "wait-call", output: { waitId: "wait-1", status: "waiting", taskIds: ["grandchild-1"], tasks: [] }, errorCode: null } })
+    const db = fakePool(child, [
+      step(child, { id: sourceStepId, attempt: 3, ordinal: 0, status: "waiting_for_tool" }),
+      step(child, { id: continuationStepId, attempt: 3, ordinal: 9, status: "streaming" }),
+    ], [sourceCall, sourceResult, orphan.itemRow], wait,
+    [{ id: "grandchild-1", parentTaskId: child.id, rootTaskId: child.rootTaskId, sessionId: child.sessionId, turnId: child.turnId, userId: child.userId }],
+    [orphan.callRow], [], [orphan.started])
+
+    const restored = await loadChildAttemptResume(db.pool as never, child)
+    expect(restored).toMatchObject({
+      childWaitOrphanCallIds: ["orphan-provider-call"],
+      resume: { nextOrdinal: 1, stepCount: 2, toolCallCount: 1 },
+      observations: [{ content: { toolCallId: "wait-call", toolName: "wait_subagents", status: "completed" } }],
+    })
+    expect(restored?.observations.some(observation => (observation.content as Row).toolCallId === "orphan-provider-call")).toBe(false)
+    expect(restored).not.toHaveProperty("childWaitClaimRecovery")
+  })
+
+  it("keeps the unique claim while excluding an earlier verified orphan", async () => {
+    const child = lease({ attemptCount: 3, maxAttempts: 3 })
+    const sourceStepId = `task:${child.id}:step:0:attempt:${child.attemptCount}`
+    const continuationStepId = `task:${child.id}:step:1:attempt:${child.attemptCount}`
+    const wait: Row = { ...consumedWait(child), stepId: sourceStepId, continuationStepId, continuationOrdinal: 9, continuationLatestOrdinal: 9 }
+    const claimed = reissuedWaitCall(child, wait, "claimed-provider-call", true)
+    const orphan = reissuedWaitCall(child, wait, "orphan-provider-call", false)
+    const sourceCall = item(child, { id: "source-wait-call", stepId: sourceStepId, attempt: 3, ordinal: 0,
+      content: { toolCallId: "wait-call", toolName: "wait_subagents", input: (wait.callContent as Row).input } })
+    const sourceResult = item(child, { id: String(wait.sourceItemId), stepId: sourceStepId, attempt: 3, ordinal: 0, type: "tool_result",
+      content: { toolCallId: "wait-call", output: { waitId: "wait-1", status: "waiting", taskIds: ["grandchild-1"], tasks: [] }, errorCode: null } })
+    const db = fakePool(child, [
+      step(child, { id: sourceStepId, attempt: 3, ordinal: 0, status: "waiting_for_tool" }),
+      step(child, { id: continuationStepId, attempt: 3, ordinal: 9, status: "streaming" }),
+    ], [sourceCall, sourceResult, claimed.itemRow, orphan.itemRow], wait,
+    [{ id: "grandchild-1", parentTaskId: child.id, rootTaskId: child.rootTaskId, sessionId: child.sessionId, turnId: child.turnId, userId: child.userId }],
+    [claimed.callRow, orphan.callRow], [], [claimed.started, claimed.claim!, orphan.started])
+
+    const restored = await loadChildAttemptResume(db.pool as never, child)
+    expect(restored).toMatchObject({
+      childWaitOrphanCallIds: ["orphan-provider-call"],
+      childWaitClaimRecovery: { call: { id: "claimed-provider-call", name: "wait_subagents" } },
+      resume: { nextOrdinal: 1, stepCount: 2, toolCallCount: 2 },
+      observations: [{ content: { toolCallId: "wait-call", toolName: "wait_subagents", status: "completed" } }],
+    })
+    expect(restored?.observations.some(observation => ["orphan-provider-call", "claimed-provider-call"].includes(String((observation.content as Row).toolCallId)))).toBe(false)
   })
 
   it("fails closed when a same-attempt consumed wait has no exact latest continuation", async () => {

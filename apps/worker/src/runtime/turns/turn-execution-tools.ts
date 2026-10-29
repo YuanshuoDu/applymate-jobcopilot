@@ -2,7 +2,7 @@ import { createHash } from "node:crypto"
 import type { ModelStepResult } from "./turn-engine-model.js"
 import { findToolResultObservation, stableJson } from "./turn-engine-replay.js"
 import { toRepositoryJson, TurnEngineError, type TurnEngineResult, type TurnEngineStep, type ToolCallRecovery } from "./turn-engine-types.js"
-import { executeToolWithItems, persistRecoveredToolCall, TurnExecutionEventWriter } from "./turn-execution-events.js"
+import { executeToolWithItems, persistChildWaitClaimRecovery, persistRecoveredToolCall, TurnExecutionEventWriter } from "./turn-execution-events.js"
 import { executionId, type TurnExecutionOptions } from "./turn-execution-types.js"
 import { assertExecutionAlive } from "./turn-engine-helpers.js"
 import type { StepContext } from "../context/step-context-builder.js"
@@ -50,6 +50,8 @@ async function persistChildResumeReplay(
   const replaySource = { toolCallId: call.id, resultItemId: sourceResultItemId }
   const input = toRepositoryJson(source.input)
   const output = toRepositoryJson(source.output)
+  const replayCall = { id: toolCallId, name: call.name, arguments: call.arguments }
+  const startKey = options.childWaitCallStartKey?.(step.id, replayCall) ?? `tool-started:${toolCallId}`
   const callItem = await writer.startItem({
     id: replayItemId(options, step, "call", toolCallId), stepId: step.id, type: "tool_call", phase: null,
     content: { toolCallId, toolName: call.name, toolVersion, input }, now: now(),
@@ -57,7 +59,7 @@ async function persistChildResumeReplay(
   onCallPersisted()
   await writer.append("tool_call.started", toolCallId, callItem.id, {
     toolCallId, toolName: call.name, toolVersion, taskId: options.identity.taskId, replaySource,
-  }, `tool-started:${toolCallId}`)
+  }, startKey)
   await writer.completeItem(callItem, { toolCallId, toolName: call.name, toolVersion, status: source.status, errorCode, input }, now(), `tool-call-completed:${toolCallId}`)
   await writer.append(source.status === "completed" ? "tool_call.completed" : "tool_call.failed", toolCallId, callItem.id, {
     toolCallId, toolName: call.name, toolVersion, status: source.status, errorCode, taskId: options.identity.taskId, replaySource,
@@ -104,7 +106,15 @@ export async function executeTools(
     if (matchingResumeEntries.length > 0 && (matchingResumeEntries.length !== 1 || replayEntries.length !== 1)) throw new TurnEngineError("invalid_output", "Child resume receipt is ambiguous")
     const sourceResultItemId = replayEntry ? childResumeSourceId(replayEntry.id) : null
     const replayed = findToolResultObservation(snapshot, call.id)
-    if (replayed) {
+    const claim = options.childWaitClaimRecovery
+    const claimedWaitSurface = !!claim && claim.stepId === step.id && call.name === "wait_subagents"
+    const sourceWaitReplay = !!claim && call.id === claim.sourceWaitCallId && stableJson(call.arguments) === stableJson(claim.sourceInput)
+    const claimedCallReplay = !!claim && call.id === claim.call.id && stableJson(call.arguments) === stableJson(claim.call.arguments)
+    if (claimedWaitSurface && (sourceWaitReplay || claimedCallReplay) && replayed) {
+      if (replayed.toolName !== call.name || stableJson(replayed.input) !== stableJson(call.arguments)) throw new TurnEngineError("invalid_output", "Claimed child wait result does not match its input")
+      continue
+    }
+    if (replayed && !claimedWaitSurface) {
       if (replayed.toolName !== call.name || stableJson(replayed.input) !== stableJson(call.arguments)) throw new TurnEngineError("invalid_output", "Tool call does not match its persisted replay record")
       rejectQuestionReplay(call.name)
       if (sourceResultItemId) {
@@ -122,7 +132,7 @@ export async function executeTools(
       if (hasNativeCoordinationReceipt(call.name, replayed.status, replayed.output)) snapshot = await options.refreshTaskGraphAfterPlan?.(snapshot) ?? snapshot
       continue
     }
-    if (sourceResultItemId) throw new TurnEngineError("invalid_output", "Child resume receipt is invalid")
+    if (sourceResultItemId && !claimedWaitSurface) throw new TurnEngineError("invalid_output", "Child resume receipt is invalid")
     const result = call.name === "agent.ask_user"
       ? await executeNativeQuestionTool(options, writer, step, call, output, now, onToolCallPersisted)
       : await executeToolWithItems(options, writer, step, call, now, onToolCallPersisted)
@@ -153,7 +163,14 @@ export async function executeTools(
 }
 export async function recoverPersistedToolCalls(options: TurnExecutionOptions, writer: TurnExecutionEventWriter, now: () => Date): Promise<readonly { id: string; content: ReturnType<typeof toRepositoryJson> }[]> {
   const recovery = await recoverableNativeQuestionCalls(options, options.toolCallRecovery ?? [], now)
-  if (recovery.length === 0) return []
+  const childObservations: Array<{ id: string; content: ReturnType<typeof toRepositoryJson> }> = []
+  if (options.childWaitClaimRecovery) {
+    if (recovery.some(item => item.call.id === options.childWaitClaimRecovery!.call.id)) throw new Error("child_wait_claim_recovery_conflict")
+    const result = await persistChildWaitClaimRecovery(options, writer, options.childWaitClaimRecovery, now)
+    childObservations.push({ id: `tool-result:${result.id}`, content: toRepositoryJson({ toolCallId: result.id, toolName: result.toolName,
+      input: options.childWaitClaimRecovery.call.arguments, status: result.status, output: result.output ?? null, errorCode: result.errorCode }) })
+  }
+  if (recovery.length === 0) return childObservations
   const mustFailTurn = recovery.some(item => item.action === "fail" || item.action === "terminal")
   const replayStepIds = !mustFailTurn
     ? [...new Set(recovery.filter(item => item.action === "replay").map(item => item.stepId))]
@@ -168,7 +185,7 @@ export async function recoverPersistedToolCalls(options: TurnExecutionOptions, w
       throw error
     }
   }
-  const observations: Array<{ id: string; content: ReturnType<typeof toRepositoryJson> }> = []
+  const observations: Array<{ id: string; content: ReturnType<typeof toRepositoryJson> }> = [...childObservations]
   for (const item of recovery) {
     let result = item.durableResult
     if (item.action === "replay" && !mustFailTurn) {

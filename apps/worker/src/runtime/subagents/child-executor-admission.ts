@@ -90,6 +90,7 @@ export function isDeterministicChildResumeError(error: unknown): boolean {
 export function acknowledgeDurableWaitAtContinuationStart(
   store: TurnExecutionStore, lease: SubagentLease, wait: DurableWaitResume | undefined,
   commit?: (lease: SubagentLease, wait: DurableWaitResume, nextStepOrdinal: number) => Promise<boolean | void>,
+  onAcknowledged?: (step: { readonly id: string; readonly ordinal: number }) => void,
 ): TurnExecutionStore {
   if (!wait) return store
   if (!commit || wait.attempt !== lease.attemptCount || !Number.isSafeInteger(wait.ordinal) || wait.ordinal < 0) {
@@ -105,6 +106,7 @@ export function acknowledgeDurableWaitAtContinuationStart(
       throw new Error("child_resume_wait_owner_mismatch")
     }
     if (await commit(lease, wait, step.ordinal) === false) throw new Error("child_resume_wait_commit_pending")
+    onAcknowledged?.(step)
     return step
   } }
 }

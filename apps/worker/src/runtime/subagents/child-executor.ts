@@ -7,12 +7,10 @@ import { childContextSnapshot, createChildContextBuilder, type ChildMailboxReade
 import { type ArtifactVersionReference, type StructuredRole } from "./role-results.js"
 import { expectedStructuredRole } from "./production-child-policy.js"
 import { writerArtifactReferenceFromTaskContext } from "./task-graph-dependency-context.js"
-import { TaskGraphWriterReviewFeedbackError } from "./task-graph-writer-review-feedback.js"
-import type { TaskGraphWriterReviewFeedbackFrame } from "./task-graph-writer-review-feedback.js"
+import { TaskGraphWriterReviewFeedbackError, type TaskGraphWriterReviewFeedbackFrame } from "./task-graph-writer-review-feedback.js"
 import type { ArtifactToolRevisionContext } from "../tools/artifact-tools.js"
 import { createObservedEvidenceIndex, hydrateObservedEvidence, recordReadToolOutput } from "./child-evidence.js"
-import { parseAndBindStructuredResultOutcome } from "./child-structured-result-outcome.js"
-import { structuredResultOutputSchema } from "./child-structured-result-outcome.js"
+import { parseAndBindStructuredResultOutcome, structuredResultOutputSchema } from "./child-structured-result-outcome.js"
 import { parseScheduledPrepareReference, resolveScheduledPrepareResumeEvidence, type ScheduledPrepareReferenceResolver } from "./child-scheduled-prepare-reference.js"
 import { createChildPrivateArtifactDispatcher, createPrivateArtifactSafeStore, selectedJobId, type PrivateArtifactToolContext } from "./child-private-artifact.js"
 import { createSelectedJobReadRouter, hasSelectedJobReadContext, isSelectedJobReadTool, redactSelectedEvidenceResult, withSelectedJobInputRedaction } from "./selected-job-artifact-context.js"
@@ -24,6 +22,7 @@ import type { DiscoveryAttemptSidecar } from "./child-discovery-attempt.js"
 import type { DiscoveryRecoverySnapshot } from "./task-graph-discovery-recovery-contract.js"
 import { SubagentLeaseError, type SubagentExecutionResult, type SubagentLease, type SubagentMailboxContinuation, type SubagentTaskRecord } from "./types.js"
 import type { TurnExecutionStore } from "../turns/turn-execution-types.js"
+import { childWaitReplayExecutionOptions, createChildDurableWaitReplay } from "./child-durable-wait-replay.js"
 import type { TurnResumeState } from "../turns/turn-engine-types.js"
 import { createToolRouterExecutor } from "../turns/turn-engine-helpers.js"
 import { runTurnExecutionLoop } from "../turns/turn-execution-loop.js"
@@ -31,8 +30,7 @@ import { createUsageAwareModelAdapter, type UsageAwareModelOptions } from "../tu
 import type { SelectedJobArtifactContextBundle } from "./selected-job-artifact-context.js"
 import type { TreeBudgetReservationStore } from "./tree-budget-types.js"
 import type { RuntimeToolDefinition, ToolRouterContext, ToolExecutionResult, ToolCallRequest } from "../tools/types.js"
-import { canManageChildrenWithWaitAction, visibleChildDefinitions, isOrdinaryScout, childResultStatus as resultStatus, isDeterministicChildResumeError, acknowledgeDurableWaitAtContinuationStart } from "./child-executor-admission.js"
-import type { ChildPublicDefinition, ChildToolRuntime } from "./child-executor-admission.js"
+import { canManageChildrenWithWaitAction, visibleChildDefinitions, isOrdinaryScout, childResultStatus as resultStatus, isDeterministicChildResumeError, acknowledgeDurableWaitAtContinuationStart, type ChildPublicDefinition, type ChildToolRuntime } from "./child-executor-admission.js"
 import type { DurableWaitResume } from "./child-resume-observations.js"
 export type { ChildPublicDefinition, ChildToolRuntime } from "./child-executor-admission.js"
 
@@ -148,6 +146,7 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
     if (durableWaitResume && (!resume || durableWaitResume.attempt !== lease.attemptCount || resume.nextOrdinal !== durableWaitResume.ordinal + 1)) {
       return { status: "failed", failureReason: "child_resume_wait_step_lineage", retryDisposition: "terminal" }
     }
+    const durableWaitReplay = durableWaitResume ? createChildDurableWaitReplay(executionLease, durableWaitResume, restored?.observations ?? [], restored?.childWaitClaimRecovery) : undefined; if (durableWaitResume?.continuationStepId && Number.isSafeInteger(durableWaitResume.continuationOrdinal)) durableWaitReplay?.acknowledgeContinuation({ id: durableWaitResume.continuationStepId, ordinal: durableWaitResume.continuationOrdinal! })
     const budget = await options.treeBudget.readRootLimits?.({
       userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: lease.rootTaskId,
     })
@@ -175,6 +174,8 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       observedEvidence, privateCallIds,
     })
     const executeTool: typeof routedTool = async input => {
+      const replayedWait = durableWaitReplay?.execute(input)
+      if (replayedWait) return replayedWait
       if (selectedJobPreparation && isSelectedJobReadTool(input.call.toolName)) privateCallIds.add(input.call.id)
       const toolResult = await dispatchTool(input)
       if (toolResult.status === "completed" && toolResult.errorCode === null) {
@@ -200,14 +201,14 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
     )
     const result = await runTurnExecutionLoop({
       identity: owner, scope: { userId: lease.userId }, goal: lease.goal, snapshot,
-      contextBuilder, store: acknowledgeDurableWaitAtContinuationStart(safeStore, lease, durableWaitResume, options.durableWaitResumeCommitter), model, tools: definitions,
+      contextBuilder, store: acknowledgeDurableWaitAtContinuationStart(safeStore, lease, durableWaitResume, options.durableWaitResumeCommitter, step => durableWaitReplay?.acknowledgeContinuation(step)), model, tools: definitions,
       executeTool, actorRole: policy.actorRole, capabilities: policy.capabilities,
       validateToolArguments: runtime.validateArguments, signal: lease.signal, now: options.now, publishReasoningSummary: false,
       budget,
       // A retry is a new durable attempt. Keep IDs deterministic within that
       // attempt while preventing attempt 1 and attempt 2 collisions.
       idFactory: prefix => `${prefix}:attempt:${lease.attemptCount}`,
-      resume,
+      resume, ...childWaitReplayExecutionOptions(durableWaitReplay, restored?.childWaitClaimRecovery),
       isOwnershipLost: (error, signal) => signal.aborted || error instanceof SubagentLeaseError,
       signalError: () => new Error("subagent_lease_lost"),
       ...(adapter.profile.nativeTools && adapter.profile.structuredOutput && structuredRole ? { outputSchema: structuredResultOutputSchema(structuredRole) } : {}),
