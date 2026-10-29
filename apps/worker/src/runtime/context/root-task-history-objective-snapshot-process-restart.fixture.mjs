@@ -148,6 +148,13 @@ async function startRuntime(firstWorker) {
       return { adapter: { id: "objective-snapshot-fixture-model", profile: modelProfile(), async *stream(request) {
         modelStreamCalls += 1; if (firstWorker) {
           say("FIXTURE_MODEL_STREAM_ENTERED_A")
+          const stats = await pool.query(`SELECT COUNT(event."id")::int AS "snapshotEvents",
+            COALESCE(SUM(CASE WHEN jsonb_typeof(event."payload"->'outcomes')='array'
+              THEN jsonb_array_length(event."payload"->'outcomes') ELSE 0 END),0)::int AS "snapshotOutcomes"
+            FROM "agent_turns" turn LEFT JOIN "agent_events" event ON event."sessionId"=turn."sessionId"
+              AND event."turnId"=turn."id" AND event."type"='agent.plan.root_task_history_memory_snapshot'
+            WHERE turn."id"=$1`, [input.turnId])
+          say(`FIXTURE_HISTORY_A snapshots=${stats.rows[0]?.snapshotEvents ?? 0} outcomes=${stats.rows[0]?.snapshotOutcomes ?? 0} sourceQueries=${crossSessionSourceQueries}`)
           try { historyProjection(request) } catch (error) {
             const reason = error instanceof Error && error.message.startsWith("objective_snapshot_context_invalid:")
               ? error.message.slice("objective_snapshot_context_invalid:".length) : "unclassified"
