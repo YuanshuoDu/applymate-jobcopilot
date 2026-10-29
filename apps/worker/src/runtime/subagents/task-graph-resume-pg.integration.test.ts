@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto"
 import { rm, writeFile } from "node:fs/promises"
 import { spawn, type ChildProcess } from "node:child_process"
+import { isDeepStrictEqual } from "node:util"
 import { fileURLToPath } from "node:url"
 import { Queue, QueueEvents } from "bullmq"
 import { Pool, type PoolClient } from "pg"
@@ -8,6 +9,7 @@ import { Redis } from "ioredis"
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest"
 import type { HarnessModelRequest, ModelAdapter } from "@jobcopilot/agent-model"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
+import { redactSensitiveText } from "@jobcopilot/shared"
 import {
   PLAN_LEDGER_SCHEMA_VERSION,
   parsePlanLedger,
@@ -89,6 +91,7 @@ const FAILURE_WAIT_CALL_ID = "p3-failure-wait"
 const FAILURE_GOAL = "Read a source and report a terminal failure"
 const BLOCKED_GOAL = "Summarize only after the source succeeds"
 const FAILURE_FINAL_MARKER = "p3-failed-prerequisite-cancelled-descendant"
+const PHONE_SHAPED_COHORT_SEARCH_CALL_ID = "p3-cohort-coverage-search-call:415-555-0134"
 const SOURCE_DEPENDENCY_PROJECTION_ITEM = {
   dependencyKey: "source", role: "scout", taskStatus: "completed",
   result: {
@@ -2955,6 +2958,71 @@ function latestToolResult(request: HarnessModelRequest, callId: string): unknown
   }
   return null
 }
+
+function latestToolResultForExactToolInput(
+  request: Pick<HarnessModelRequest, "messages">,
+  toolName: string,
+  expectedInput: unknown,
+): { readonly toolUseId: string; readonly resultToolUseId: string; readonly result: unknown } | null {
+  let toolUseId: string | undefined
+  let toolUseCount = 0
+  for (const message of request.messages) {
+    if (message.role !== "assistant") continue
+    for (const part of message.content) {
+      if (part.type === "tool_use" && part.name === toolName && isDeepStrictEqual(part.input, expectedInput)) {
+        toolUseCount += 1
+        toolUseId = part.id
+      }
+    }
+  }
+  if (toolUseCount !== 1 || !toolUseId) return null
+
+  let resultCount = 0
+  let resultToolUseId: string | undefined
+  let resultContent: string | undefined
+  for (const message of request.messages) {
+    for (const part of message.content) {
+      if (part.type !== "tool_result" || part.toolUseId !== toolUseId) continue
+      resultCount += 1
+      resultToolUseId = part.toolUseId
+      resultContent = typeof part.content === "string" ? part.content : undefined
+    }
+  }
+  if (resultCount !== 1 || !resultToolUseId || resultContent === undefined) return null
+  try {
+    return { toolUseId, resultToolUseId, result: JSON.parse(resultContent) as unknown }
+  } catch {
+    return null
+  }
+}
+
+describe("exact child tool result fixture lookup", () => {
+  const searchInput = { target: "Software Engineer", location: "Dublin", limit: 10 }
+  const toolUse = (id: string) => ({
+    role: "assistant" as const,
+    content: [{ type: "tool_use" as const, id, name: "jobs.search", input: searchInput }],
+  })
+  const toolResult = (toolUseId: string) => ({
+    role: "user" as const,
+    content: [{ type: "tool_result" as const, toolUseId, content: JSON.stringify({ jobs: [] }) }],
+  })
+
+  it("returns the uniquely paired result for the exact tool input", () => {
+    const request = { messages: [toolUse("search-call"), toolResult("search-call")] }
+    expect(latestToolResultForExactToolInput(request, "jobs.search", searchInput)).toEqual({
+      toolUseId: "search-call", resultToolUseId: "search-call", result: { jobs: [] },
+    })
+  })
+
+  it("fails closed when matching calls or paired results are ambiguous", () => {
+    const duplicateCalls = { messages: [toolUse("search-call-a"), toolUse("search-call-b"),
+      toolResult("search-call-a"), toolResult("search-call-b")] }
+    expect(latestToolResultForExactToolInput(duplicateCalls, "jobs.search", searchInput)).toBeNull()
+
+    const duplicateResults = { messages: [toolUse("search-call"), toolResult("search-call"), toolResult("search-call")] }
+    expect(latestToolResultForExactToolInput(duplicateResults, "jobs.search", searchInput)).toBeNull()
+  })
+})
 
 function planTaskIds(request: HarnessModelRequest, callId = PLAN_CALL_ID, expectedCount = 2): string[] {
   const output = record(latestToolResult(request, callId))
@@ -13268,11 +13336,14 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               ? `p3-verifier-repair-initial-wait:${value.turnId}`
               : `p3-verifier-repair-wait:${value.turnId}`
             await waitForPersistedTaskWait(pool!, value.turnId, waitKey)
-            const matchingToolResults = request.messages.flatMap(message => message.content)
-              .filter(part => part.type === "tool_result" && callIds.includes(part.toolUseId))
-            const parsedResults = callIds.map(callId => record(latestToolResult(request, callId)))
+            const pairedResults = jobIds.map(expectedJobId =>
+              latestToolResultForExactToolInput(request, "jobs.get", { jobId: expectedJobId }))
+            for (const pair of pairedResults) {
+              if (pair) expect(pair.resultToolUseId).toBe(pair.toolUseId)
+            }
+            const parsedResults = pairedResults.map(pair => record(pair?.result))
             if (task.goal === "Find at least two owner jobs") {
-              initialScoutReadDiagnostic.matchingToolResultCount = matchingToolResults.length
+              initialScoutReadDiagnostic.matchingToolResultCount = pairedResults.filter(pair => pair !== null).length
               initialScoutReadDiagnostic.resultJsonParsed = parsedResults.every(result => result !== null)
               initialScoutReadDiagnostic.returnedJobCount = parsedResults.filter(result => record(result?.job) !== null).length
             }
@@ -13642,18 +13713,50 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       pool: pool!, authorizeUsage: async () => ({ settle: async () => undefined }),
       modelRuntimeFactory: ({ task }) => {
         let round = 0
-        const callId = `p3-cohort-coverage-search:${task.id}:${task.attemptCount}`
+        const callId = task.id === initialTaskIds[0]
+          ? PHONE_SHAPED_COHORT_SEARCH_CALL_ID
+          : `p3-cohort-coverage-search:${task.id}:${task.attemptCount}`
+        const searchInput = { target: "Software Engineer", location: "Dublin", limit: 10 }
         const adapter: ModelAdapter = {
           id: `p3-cohort-coverage-${task.role}-child`, profile,
           async *stream(request) {
             round += 1
             if (round === 1) {
               expect(request.tools.map(tool => record(tool)?.name)).toContain("jobs.search")
-              yield { type: "tool_call_completed", callId, name: "jobs.search", arguments: { target: "Software Engineer", location: "Dublin", limit: 10 } }
+              yield { type: "tool_call_completed", callId, name: "jobs.search", arguments: searchInput }
               yield { type: "completed", finishReason: "tool_calls" }
               return
             }
-            const search = record(latestToolResult(request, callId))
+            const pairedSearch = latestToolResultForExactToolInput(request, "jobs.search", searchInput)
+            if (task.id === initialTaskIds[0]) {
+              expect(redactSensitiveText(callId)).not.toBe(callId)
+              expect(pairedSearch).not.toBeNull()
+              expect(pairedSearch?.toolUseId).not.toBe(callId)
+              expect(pairedSearch?.resultToolUseId).toBe(pairedSearch?.toolUseId)
+              expect(JSON.stringify(request.messages)).not.toContain(callId)
+              const canonicalReceipts = await pool!.query<{
+                type: string; toolCallId: string | null; toolName: string | null
+              }>(`SELECT item."type", item."content"->>'toolCallId' AS "toolCallId",
+                    item."content"->>'toolName' AS "toolName"
+                  FROM "agent_items" AS item
+                  JOIN "agent_turns" AS turn
+                    ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
+                  JOIN "sub_agent_tasks" AS task
+                    ON task."id" = item."taskId" AND task."sessionId" = item."sessionId"
+                      AND task."turnId" = item."turnId"
+                  WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3
+                    AND turn."userId" = $4 AND task."role" = 'scout'
+                    AND task."parentTaskId" = turn."rootTaskId"
+                    AND item."type" IN ('tool_call', 'tool_result')
+                    AND item."content"->>'toolCallId' = $5
+                  ORDER BY item."type"`,
+              [value.sessionId, value.turnId, task.id, value.userId, callId])
+              expect(canonicalReceipts.rows).toHaveLength(2)
+              expect(canonicalReceipts.rows.map(row => row.type).sort()).toEqual(["tool_call", "tool_result"])
+              expect(canonicalReceipts.rows.every(row => row.toolCallId === callId)).toBe(true)
+              expect(canonicalReceipts.rows.find(row => row.type === "tool_call")).toMatchObject({ toolName: "jobs.search" })
+            }
+            const search = record(pairedSearch?.result)
             const jobs = Array.isArray(search?.jobs) ? search.jobs.map(record).filter((job): job is RecordValue => job !== null) : []
             const cohort = ids.map(id => jobs.find(job => job.id === id)).filter((job): job is RecordValue => job !== undefined)
             if (cohort.length !== 4) throw new Error("Coverage child did not observe the full four-job Scout cohort")
@@ -13847,6 +13950,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       modelRuntimeFactory: ({ task }) => {
         let round = 0
         const callId = `p3-scout-union-search:${task.id}:${task.attemptCount}`
+        const searchInput = { target: "Software Engineer", location: "Dublin", limit: 10 }
         const adapter: ModelAdapter = {
           id: `p3-scout-union-${task.role}-child`, profile,
           async *stream(request) {
@@ -13876,11 +13980,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 }
               }
               expect(request.tools.map(tool => record(tool)?.name)).toContain("jobs.search")
-              yield { type: "tool_call_completed", callId, name: "jobs.search", arguments: { target: "Software Engineer", location: "Dublin", limit: 10 } }
+              yield { type: "tool_call_completed", callId, name: "jobs.search", arguments: searchInput }
               yield { type: "completed", finishReason: "tool_calls" }
               return
             }
-            const search = record(latestToolResult(request, callId))
+            const pairedSearch = latestToolResultForExactToolInput(request, "jobs.search", searchInput)
+            const search = record(pairedSearch?.result)
             const jobs = Array.isArray(search?.jobs) ? search.jobs.map(record).filter((job): job is RecordValue => job !== null) : []
             const cohort = ids.map(id => jobs.find(job => job.id === id)).filter((job): job is RecordValue => job !== undefined)
             if (cohort.length !== 4) throw new Error("Multi-Scout union child did not observe all fixture jobs")
@@ -14608,18 +14713,20 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       modelRuntimeFactory: ({ task }) => {
         let round = 0
         const callId = "p3-lease-recovery-search:" + task.id + ":" + task.attemptCount
+        const searchInput = { target: "Software Engineer", location: "Dublin", limit: 10 }
         const adapter: ModelAdapter = {
           id: "p3-lease-recovery-" + task.role + "-child-fixture", profile,
           async *stream(request) {
             round += 1
             if (round === 1) {
               expect(request.tools.map(tool => record(tool)?.name)).toContain("jobs.search")
-              yield { type: "tool_call_completed", callId, name: "jobs.search", arguments: { target: "Software Engineer", location: "Dublin", limit: 10 } }
+              yield { type: "tool_call_completed", callId, name: "jobs.search", arguments: searchInput }
               yield { type: "completed", finishReason: "tool_calls" }
               return
             }
             await waitForPersistedTaskWait(pool!, value.turnId, repairWaitKey)
-            const search = record(latestToolResult(request, callId))
+            const pairedSearch = latestToolResultForExactToolInput(request, "jobs.search", searchInput)
+            const search = record(pairedSearch?.result)
             const jobs = Array.isArray(search?.jobs)
               ? search.jobs.map(record).filter((job): job is RecordValue => job !== null)
               : []
