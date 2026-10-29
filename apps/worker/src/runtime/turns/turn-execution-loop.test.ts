@@ -112,12 +112,14 @@ function identity(kind: TurnExecutionIdentity["kind"], taskId: string, attemptCo
   return { ...common, kind, attemptCount }
 }
 
-type Fixture = { options: TurnExecutionOptions; events: Array<{ id: string; type: string; itemId: string | null; taskId: string; payload?: unknown; idempotencyKey?: string }>; notifications: string[]; items: TurnEngineItem[]; finalResponses: string[]; stepTasks: string[]; stepAttempts: number[]; stepStatuses: string[]; stepInputs: Array<{ inputThroughSequence: bigint; consumedInputIds: string[] }>; requests: HarnessModelRequest[] }
+type PersistedItemInput = Parameters<TurnExecutionStore["createItem"]>[0]
+type Fixture = { options: TurnExecutionOptions; events: Array<{ id: string; type: string; itemId: string | null; taskId: string; payload?: unknown; idempotencyKey?: string }>; notifications: string[]; items: TurnEngineItem[]; createdItems: PersistedItemInput[]; finalResponses: string[]; stepTasks: string[]; stepAttempts: number[]; stepStatuses: string[]; stepInputs: Array<{ inputThroughSequence: bigint; consumedInputIds: string[] }>; requests: HarnessModelRequest[] }
 
 function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult, initialToolObservations: Array<{ id: string; content: unknown }> = [], completionGate?: NonNullable<TurnExecutionOptions["completionGate"]>): Fixture {
   const events: Fixture["events"] = []
   const notifications: string[] = []
   const items: TurnEngineItem[] = []
+  const createdItems: Fixture["createdItems"] = []
   const finalResponses: string[] = []
   const stepTasks: string[] = []
   const stepAttempts: number[] = []
@@ -127,7 +129,7 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
   const store: TurnExecutionStore = {
     startStep: async ({ identity, stepId, attempt, ordinal, inputThroughSequence, consumedInputIds }) => { stepTasks.push(identity.taskId); stepAttempts.push(attempt); stepInputs.push({ inputThroughSequence, consumedInputIds: [...consumedInputIds] }); return { id: stepId, ordinal } },
     updateStep: async ({ status }) => { stepStatuses.push(status) },
-    createItem: async ({ itemId }) => { const item = { id: itemId, revision: 0 }; items.push(item); return item },
+    createItem: async input => { createdItems.push(input); const item = { id: input.itemId, revision: 0 }; items.push(item); return item },
     updateItem: async ({ itemId, expectedRevision }) => ({ id: itemId, revision: expectedRevision + 1 }),
     appendEvent: async ({ identity, id, type, itemId, payload, idempotencyKey }) => { events.push({ id, type, itemId, taskId: identity.taskId, payload, idempotencyKey }); return { id } },
     appendEvents: async inputs => { for (const input of inputs) events.push({ id: input.id, type: input.type, itemId: input.itemId, taskId: input.identity.taskId }); return inputs.map(input => ({ id: input.id })) },
@@ -190,7 +192,7 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
     subscribe: event => { notifications.push(event.type); events.push({ id: event.id, type: event.type, itemId: event.itemId, taskId: owner.taskId }) },
     ...(completionGate ? { completionGate } : {}),
   }
-  return { options, events, notifications, items, finalResponses, stepTasks, stepAttempts, stepStatuses, stepInputs, requests }
+  return { options, events, notifications, items, createdItems, finalResponses, stepTasks, stepAttempts, stepStatuses, stepInputs, requests }
 }
 
 function scheduledCandidateReadFixture(input: Readonly<{
@@ -1994,7 +1996,7 @@ describe("owner-agnostic turn execution loop", () => {
     expect(result.status).toBe("failed")
     expect(executeTool).not.toHaveBeenCalled()
     expect(child.events.some(event => event.type === "tool_call.started" || event.type === "tool_call.completed")).toBe(false)
-    expect(child.items.some(item => item.type === "tool_call" || item.type === "tool_result")).toBe(false)
+    expect(child.createdItems.filter(item => item.type === "tool_call" || item.type === "tool_result")).toEqual([])
     expect(child.options.snapshot.toolObservations).toEqual([observation])
     expect(JSON.stringify(child.requests.map(request => request.messages))).not.toContain(rawCallId)
   })
@@ -2030,7 +2032,7 @@ describe("owner-agnostic turn execution loop", () => {
     expect(JSON.stringify(child.requests.map(request => request.messages))).not.toContain(rawCallId)
     expect(executeTool).not.toHaveBeenCalled()
     expect(child.events.some(event => event.type === "tool_call.started")).toBe(false)
-    expect(child.items.some(item => item.type === "tool_call" || item.type === "tool_result")).toBe(false)
+    expect(child.createdItems.filter(item => item.type === "tool_call" || item.type === "tool_result")).toEqual([])
     expect(child.options.snapshot.toolObservations).toEqual([observation])
   })
 
@@ -2062,7 +2064,7 @@ describe("owner-agnostic turn execution loop", () => {
       expect(result.status).toBe("failed")
       expect(executeTool).not.toHaveBeenCalled()
       expect(child.events.some(event => event.type === "tool_call.started" || event.type === "tool_call.completed")).toBe(false)
-      expect(child.items.some(item => item.type === "tool_call" || item.type === "tool_result")).toBe(false)
+      expect(child.createdItems.filter(item => item.type === "tool_call" || item.type === "tool_result")).toEqual([])
     }
   })
 
