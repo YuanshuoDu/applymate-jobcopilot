@@ -297,6 +297,14 @@ describe("atomic TaskGraph finalization recovery", () => {
         result: { status: "completed", structuredResult: partialScoutResult("job-private-current") } },
       { id: "task-private-repaired-scout-history", role: "scout", taskType: "research", status: "failed", failureReason: "PRIVATE_FAILURE_REASON",
         result: { status: "failed", structuredResult: partialScoutResult("job-private-history"), failureReason: "PRIVATE_FAILURE_REASON" } },
+      { id: "task-private-prepare-partial", role: "prepare", taskType: "scheduled_application_prepare", status: "completed", attemptCount: 1, failureReason: null,
+        result: { status: "completed", structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status: "partial", taskId: "task-private-prepare-partial", attemptCount: 1,
+          snapshotDigest: `sha256:${"a".repeat(64)}`, checkpointDigest: "b".repeat(64),
+          jobs: [{ jobId: "job-private-shared", status: "prepared" }, { jobId: "job-private-failed", status: "failed" }], materials: [] } } },
+      { id: "task-private-prepare-completed", role: "prepare", taskType: "scheduled_application_prepare", status: "completed", attemptCount: 1, failureReason: null,
+        result: { status: "completed", structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status: "completed", taskId: "task-private-prepare-completed", attemptCount: 1,
+          snapshotDigest: `sha256:${"c".repeat(64)}`, checkpointDigest: "d".repeat(64),
+          jobs: [{ jobId: "job-private-shared", status: "skipped" }, { jobId: "job-private-prepared", status: "prepared" }], materials: [] } } },
       { id: "task-private-missing-analyst", role: "analyst", taskType: "analysis", status: "failed", failureReason: "PRIVATE_FAILURE_REASON",
         result: { status: "failed", failureReason: "PRIVATE_FAILURE_REASON" } },
       { id: "task-private-invalid-reviewer", role: "reviewer", taskType: "review", status: "completed", failureReason: null,
@@ -338,10 +346,14 @@ describe("atomic TaskGraph finalization recovery", () => {
     const recorded = saved[0] as { response: string; terminal: { finalContent: { text: string; final: { response: string; summary: string } }; [TASK_GRAPH_FINAL_SUMMARY_BINDING]?: typeof binding } }
     const serialized = JSON.parse(recorded.response) as { response: string; summary: string }
     expect(serialized.response).toBe(candidate)
-    const expectedOverview = "Recorded task outcomes (earlier attempts may be superseded; not verification): role=analyst, task state=failed, result structure=missing, reported result status=not reported: 1; role=reviewer, task state=completed, result structure=invalid, reported result status=not reported: 1; role=scout, task state=completed, result structure=valid, reported result status=partial: 1; role=scout, task state=failed, result structure=valid, reported result status=partial: 1."
+    const expectedOverview = "Recorded task outcomes (earlier attempts may be superseded; not verification): role=analyst, task state=failed, result structure=missing, reported result status=not reported: 1; role=prepare, task state=completed, result structure=valid, reported result status=completed: 1; role=prepare, task state=completed, result structure=valid, reported result status=partial: 1; role=reviewer, task state=completed, result structure=invalid, reported result status=not reported: 1; role=scout, task state=completed, result structure=valid, reported result status=partial: 1; 1 outcome group omitted."
     expect(serialized.summary).toBe(formatTaskGraphFinalSummary(binding.summary))
     expect(serialized.summary.slice(serialized.summary.indexOf("Recorded task outcomes"))).toBe(expectedOverview)
     expect(serialized.summary).toMatch(/^Task-reported results: discovered jobs: 2 observed \(partial\);/)
+    expect(serialized.summary).toContain("Prepare outcome records: 4 observed (partial)")
+    expect(serialized.summary).toContain("Prepare-reported outcome records (observed per task; repeated jobs may count separately; submission not verified): prepared=2, skipped=1, failed=1.")
+    expect(serialized.summary.length).toBeLessThanOrEqual(1_000)
+    expect(new TextEncoder().encode(serialized.summary).byteLength).toBeLessThanOrEqual(1_000)
     expect(recorded.terminal.finalContent.text).toBe(candidate)
     expect(recorded.terminal.finalContent.final.response).toBe(candidate)
     expect(recorded.terminal.finalContent.final.summary).toBe(serialized.summary)
