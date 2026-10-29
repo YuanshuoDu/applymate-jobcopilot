@@ -12,17 +12,18 @@ const now = new Date("2026-10-22T10:00:00.000Z")
 
 type DispatchFixture = { id: string; topic: string; aggregateId: string; idempotencyKey: string; payload: Record<string, unknown>; attemptCount: number; publishedAt: Date | null }
 
-function fixture(input: { targetStatus?: string; deadline?: Date; targetParent?: string; rootOwnedWait?: boolean; includeRootOwnedWaitInCandidateScan?: boolean; batchSize?: number; dispatchRow?: DispatchFixture | null; deadlineCrossesDuringResume?: boolean } = {}) {
+function fixture(input: { targetStatus?: string; targetIds?: string[]; request?: Record<string, unknown>; deadline?: Date; targetParent?: string; rootOwnedWait?: boolean; includeRootOwnedWaitInCandidateScan?: boolean; batchSize?: number; dispatchRow?: DispatchFixture | null; deadlineCrossesDuringResume?: boolean } = {}) {
   const calls: { sql: string; params: unknown[] }[] = []
   const queryRowCounts = { candidateSessions: undefined as number | undefined, lockedWaits: undefined as number | undefined }
   const state = { waitStatus: "waiting", parentStatus: "waiting", matched: [] as string[], outbox: input.dispatchRow ? 1 : 0,
     dispatchRow: input.dispatchRow ? structuredClone(input.dispatchRow) : null as DispatchFixture | null }
   let rollbackSnapshot: typeof state | undefined
   const cloneState = () => ({ ...state, matched: [...state.matched], dispatchRow: state.dispatchRow ? structuredClone(state.dispatchRow) : null })
+  const targetIds = input.targetIds ?? ["child-1", "child-2"]
   const wait = {
     id: "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: input.rootOwnedWait ? "root-1" : "parent-1", rootTaskId: "root-1", parentAttempt: 3,
-    targetTaskIds: ["child-1", "child-2"], mode: "all", status: state.waitStatus, deadlineAt: input.deadline ?? new Date(now.getTime() + 30_000),
-    matchedTaskIds: [], result: { request: { targetTaskIds: ["child-1", "child-2"], mode: "all", timeoutMs: 30_000 } },
+    targetTaskIds: targetIds, mode: "all", status: state.waitStatus, deadlineAt: input.deadline ?? new Date(now.getTime() + 30_000),
+    matchedTaskIds: [], result: { request: input.request ?? { targetTaskIds: targetIds, mode: "all", timeoutMs: 30_000 } },
   }
   const client = {
     async query(sql: string, params: unknown[] = []) {
@@ -48,10 +49,11 @@ function fixture(input: { targetStatus?: string; deadline?: Date; targetParent?:
         queryRowCounts.lockedWaits = rows.length
         return { rows, rowCount: rows.length }
       }
-      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("ANY($1::text[])")) return { rows: [
-        { id: "child-1", parentTaskId: input.targetParent ?? (input.rootOwnedWait ? "root-1" : "parent-1"), rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1", status: "completed", role: "writer", result: { title: "safe" }, failureReason: null },
-        { id: "child-2", parentTaskId: input.rootOwnedWait ? "root-1" : "parent-1", rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1", status: input.targetStatus ?? "completed", role: "reviewer", result: { score: 1 }, failureReason: null },
-      ], rowCount: 2 }
+      if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("ANY($1::text[])")) return { rows: targetIds.map((id, index) => ({
+        id, parentTaskId: input.targetParent ?? (input.rootOwnedWait ? "root-1" : "parent-1"), rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1",
+        status: index === 1 ? input.targetStatus ?? "completed" : "completed", role: index === 0 ? "writer" : "reviewer",
+        result: index === 0 ? { title: "safe" } : { score: 1 }, failureReason: null,
+      })), rowCount: targetIds.length }
       if (sql.includes('UPDATE "agent_wait_conditions"')) { state.waitStatus = String(params[0]); state.matched = JSON.parse(String(params[1])); return { rows: [], rowCount: 1 } }
       if (sql.includes('UPDATE "sub_agent_tasks"')) { state.parentStatus = "queued"; return { rows: [], rowCount: 1 } }
       if (sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes('WHERE dispatch."idempotencyKey" = $1')) {
@@ -109,6 +111,39 @@ describe("reconcileDurableSubagentWaits", () => {
     expect(dispatch?.params[2]).toBe("subagent-dispatch:parent-1")
     expect(dispatch?.sql).toContain("ON CONFLICT (\"idempotencyKey\") DO UPDATE")
     expect(dispatch?.sql).not.toContain('"attemptCount"')
+  })
+
+  it("preserves a phone-shaped owner-scoped target ID while redacting sensitive request prose", async () => {
+    const targetId = "subagent-00000000-0000-4000-8000-000000000001"
+    const fake = fixture({ targetIds: [targetId], request: {
+      targetTaskIds: [targetId], mode: "all", timeoutMs: 30_000,
+      note: "contact +1 (415) 555-0134 or child-wait@example.invalid",
+    } })
+
+    await expect(reconcileDurableSubagentWaits(fake.pool as never, { now })).resolves.toEqual({ scanned: 1, resolved: 1, woken: 1 })
+
+    const update = fake.calls.find(call => call.sql.includes('UPDATE "agent_wait_conditions"'))
+    const saved = JSON.parse(String(update?.params[2])) as { request: { targetTaskIds: string[]; note: string } }
+    expect(saved.request.targetTaskIds).toEqual([targetId])
+    expect(saved.request.note).not.toContain("415")
+    expect(saved.request.note).not.toContain("child-wait@example.invalid")
+    expect(saved.request.note).toContain("[REDACTED_PHONE]")
+    expect(saved.request.note).toContain("[REDACTED_EMAIL]")
+  })
+
+  it.each([
+    ["different targets", { targetTaskIds: ["child-1", "foreign-child"], mode: "all", timeoutMs: 30_000 }],
+    ["missing targets", { mode: "all", timeoutMs: 30_000 }],
+  ])("fails closed when the persisted request has %s", async (_label, request) => {
+    const fake = fixture({ request })
+
+    await expect(reconcileDurableSubagentWaits(fake.pool as never, { now })).resolves.toEqual({ scanned: 1, resolved: 0, woken: 0 })
+
+    expect(fake.state).toMatchObject({ waitStatus: "waiting", parentStatus: "waiting", outbox: 0 })
+    expect(fake.calls.some(call => call.sql.includes('UPDATE "agent_wait_conditions"'))).toBe(false)
+    expect(fake.calls.some(call => call.sql.includes('UPDATE "sub_agent_tasks"'))).toBe(false)
+    expect(fake.calls.some(call => call.sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
+    expect(graphMocks.prepare).not.toHaveBeenCalled()
   })
 
   it("filters root-owned waits out of the candidate session scan", async () => {

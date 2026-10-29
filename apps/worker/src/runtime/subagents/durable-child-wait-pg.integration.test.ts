@@ -1071,7 +1071,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(JSON.parse(orphanRestoredMarker!.slice("WORKER_B_LOOP_RESTORED ".length))).toMatchObject({
         phase: "claim-recovery-cut", waitId: acknowledged!.waitId, recoveryCallId: orphanCallId,
         recoveryStepId: acknowledged!.continuationStepId, logicalStepOrdinal: 1, physicalContinuationOrdinal: 2,
-        resumeNextOrdinal: 2, orphanCallIds: [],
+        resumeNextOrdinal: 2, orphanCallIds: [orphanCallId],
       })
       expectRestoredWaitObservation(workerE, "consumed")
       await waitForMarker(workerE, "WORKER_B_LOOP_CLAIM_BEFORE_RESULT")
