@@ -702,6 +702,7 @@ const PROCESS_RESTART_PLAN_EVENT_STATUSES = new Set(["started", "completed", "fa
 const PROCESS_RESTART_PLAN_OUTPUT_STATUSES = new Set(["accepted", "rejected", "failed", "completed", "other"])
 const PROCESS_RESTART_DISCOVERY_ANALYST_PLAN_CALL_ID = "p3-discovery-plan-analyst"
 const PROCESS_FIXTURE_DISCOVERY_ANALYST_PLAN_CALL_ID = "p3-process-restart-discovery-analyst-plan"
+const PROCESS_RESTART_PHONE_SHAPED_TOOL_CALL_SUFFIX = ":415-555-0134"
 const PROCESS_FIXTURE_CAUSES = new Set([
   "turn_missing", "model_never_ran", "plan_not_called", "plan_failed_or_incomplete", "graph_shape_mismatch",
   "wait_call_missing", "wait_result_missing_or_unknown", "wait_target_ids_unreadable", "requested_ids_not_in_graph",
@@ -2964,31 +2965,41 @@ function latestToolResultForExactToolInput(
   toolName: string,
   expectedInput: unknown,
 ): { readonly toolUseId: string; readonly resultToolUseId: string; readonly result: unknown } | null {
-  let toolUseId: string | undefined
-  let toolUseCount = 0
+  const toolUses: { readonly id: string; readonly name: string; readonly input: unknown; readonly position: number }[] = []
+  let position = 0
   for (const message of request.messages) {
-    if (message.role !== "assistant") continue
     for (const part of message.content) {
-      if (part.type === "tool_use" && part.name === toolName && isDeepStrictEqual(part.input, expectedInput)) {
-        toolUseCount += 1
-        toolUseId = part.id
+      if (message.role === "assistant" && part.type === "tool_use") {
+        toolUses.push({ id: part.id, name: part.name, input: part.input, position })
       }
+      position++
     }
   }
-  if (toolUseCount !== 1 || !toolUseId) return null
+  const matches = toolUses.filter(part => part.name === toolName && isDeepStrictEqual(part.input, expectedInput))
+  if (matches.length !== 1 || !matches[0]?.id) return null
+  const match = matches[0]
+  const toolUseId = match.id
+  if (toolUses.filter(part => part.id === toolUseId).length !== 1) return null
 
   let resultCount = 0
   let resultToolUseId: string | undefined
   let resultContent: string | undefined
+  let resultPosition = -1
+  let isError = false
+  position = 0
   for (const message of request.messages) {
     for (const part of message.content) {
-      if (part.type !== "tool_result" || part.toolUseId !== toolUseId) continue
-      resultCount += 1
-      resultToolUseId = part.toolUseId
-      resultContent = typeof part.content === "string" ? part.content : undefined
+      if (part.type === "tool_result" && part.toolUseId === toolUseId) {
+        resultCount += 1
+        resultToolUseId = part.toolUseId
+        resultContent = typeof part.content === "string" ? part.content : undefined
+        resultPosition = position
+        isError = part.isError === true
+      }
+      position++
     }
   }
-  if (resultCount !== 1 || !resultToolUseId || resultContent === undefined) return null
+  if (resultCount !== 1 || !resultToolUseId || resultContent === undefined || isError || resultPosition <= match.position) return null
   try {
     return { toolUseId, resultToolUseId, result: JSON.parse(resultContent) as unknown }
   } catch {
@@ -2998,13 +3009,13 @@ function latestToolResultForExactToolInput(
 
 describe("exact child tool result fixture lookup", () => {
   const searchInput = { target: "Software Engineer", location: "Dublin", limit: 10 }
-  const toolUse = (id: string) => ({
+  const toolUse = (id: string, name = "jobs.search", input: unknown = searchInput) => ({
     role: "assistant" as const,
-    content: [{ type: "tool_use" as const, id, name: "jobs.search", input: searchInput }],
+    content: [{ type: "tool_use" as const, id, name, input }],
   })
-  const toolResult = (toolUseId: string) => ({
-    role: "user" as const,
-    content: [{ type: "tool_result" as const, toolUseId, content: JSON.stringify({ jobs: [] }) }],
+  const toolResult = (toolUseId: string, isError = false) => ({
+    role: "tool" as const,
+    content: [{ type: "tool_result" as const, toolUseId, content: JSON.stringify({ jobs: [] }), ...(isError ? { isError: true } : {}) }],
   })
 
   it("returns the uniquely paired result for the exact tool input", () => {
@@ -3014,6 +3025,14 @@ describe("exact child tool result fixture lookup", () => {
     })
   })
 
+  it("pairs the model-visible alias after a phone-shaped raw ID has been projected", () => {
+    const rawId = "child-wait-call:415-555-0134", visibleAlias = "toolcall" + "a".repeat(64)
+    const request = { messages: [toolUse(visibleAlias), toolResult(visibleAlias)] }
+    const paired = latestToolResultForExactToolInput(request, "jobs.search", searchInput)
+    expect(paired).toMatchObject({ toolUseId: visibleAlias, resultToolUseId: visibleAlias, result: { jobs: [] } })
+    expect(paired?.toolUseId).not.toBe(rawId)
+  })
+
   it("fails closed when matching calls or paired results are ambiguous", () => {
     const duplicateCalls = { messages: [toolUse("search-call-a"), toolUse("search-call-b"),
       toolResult("search-call-a"), toolResult("search-call-b")] }
@@ -3021,6 +3040,13 @@ describe("exact child tool result fixture lookup", () => {
 
     const duplicateResults = { messages: [toolUse("search-call"), toolResult("search-call"), toolResult("search-call")] }
     expect(latestToolResultForExactToolInput(duplicateResults, "jobs.search", searchInput)).toBeNull()
+
+    const duplicateDisplayedId = { messages: [toolUse("search-call"), toolUse("search-call", "jobs.get", { jobId: "job-1" }),
+      toolResult("search-call")] }
+    expect(latestToolResultForExactToolInput(duplicateDisplayedId, "jobs.search", searchInput)).toBeNull()
+
+    const failedResult = { messages: [toolUse("search-call"), toolResult("search-call", true)] }
+    expect(latestToolResultForExactToolInput(failedResult, "jobs.search", searchInput)).toBeNull()
   })
 })
 
@@ -9336,8 +9362,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(followUpWait).toMatchObject({ status: "ready", consumedAt: expect.any(Date) })
       expect(followUpWait?.id).not.toBe(originalWaitAfterResume?.id)
       assertFollowUpWaitProjection(followUpWait?.result, String(followUpTaskId))
-      const childrenAfterResume = await pool!.query<{ id: string; goal: string; status: string; result: RecordValue | null; context: RecordValue | null; role: string }>(
-        "SELECT \"id\", \"goal\", \"status\", \"result\", \"context\", \"role\" FROM \"sub_agent_tasks\" WHERE \"turnId\" = $1 AND \"parentTaskId\" = $2 ORDER BY \"goal\"",
+      const childrenAfterResume = await pool!.query<{ id: string; goal: string; status: string; attemptCount: number; result: RecordValue | null; context: RecordValue | null; role: string }>(
+        "SELECT \"id\", \"goal\", \"status\", \"attemptCount\", \"result\", \"context\", \"role\" FROM \"sub_agent_tasks\" WHERE \"turnId\" = $1 AND \"parentTaskId\" = $2 ORDER BY \"goal\"",
         [restartOwner.turnId, rootTaskId],
       )
       expect(childrenAfterResume.rows.map(row => [row.goal, row.status])).toEqual([
@@ -9347,6 +9373,30 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       ])
       expectPassedVerificationReport(record(childrenAfterResume.rows.find(row => row.goal === "Read the durable TaskGraph source")?.result)?.taskGraphVerificationReport, "candidate-count")
       expectPassedVerificationReport(record(childrenAfterResume.rows.find(row => row.goal === "Summarize the restored TaskGraph source")?.result)?.taskGraphVerificationReport, "finding-count")
+      const restartSearchReceipts = await pool!.query<{
+        taskId: string; toolName: string; callToolCallId: string; resultToolCallId: string; callStatus: string; resultStatus: string
+      }>(
+        `SELECT tool_result."taskId", tool_call."content"->>'toolName' AS "toolName",
+                tool_call."content"->>'toolCallId' AS "callToolCallId", tool_result."content"->>'toolCallId' AS "resultToolCallId",
+                tool_call."status" AS "callStatus", tool_result."status" AS "resultStatus"
+         FROM "agent_items" AS tool_result
+         JOIN "agent_items" AS tool_call
+           ON tool_call."sessionId" = tool_result."sessionId" AND tool_call."turnId" = tool_result."turnId"
+          AND tool_call."taskId" = tool_result."taskId" AND tool_call."type" = 'tool_call'
+          AND tool_call."content"->>'toolCallId' = tool_result."content"->>'toolCallId'
+         WHERE tool_result."sessionId" = $1 AND tool_result."turnId" = $2 AND tool_result."taskId" = ANY($3::text[])
+           AND tool_result."type" = 'tool_result' AND tool_call."content"->>'toolName' = 'jobs.search'
+         ORDER BY tool_result."taskId"`,
+        [restartOwner.sessionId, restartOwner.turnId, childrenAfterResume.rows.map(row => row.id)],
+      )
+      expect(restartSearchReceipts.rows).toHaveLength(childrenAfterResume.rows.length)
+      for (const child of childrenAfterResume.rows) {
+        const expectedCallId = `p3-process-restart-read:${child.id}:${child.attemptCount}${PROCESS_RESTART_PHONE_SHAPED_TOOL_CALL_SUFFIX}`
+        expect(restartSearchReceipts.rows.find(item => item.taskId === child.id)).toEqual({
+          taskId: child.id, toolName: "jobs.search", callToolCallId: expectedCallId, resultToolCallId: expectedCallId,
+          callStatus: "completed", resultStatus: "completed",
+        })
+      }
       // Match Worker 2's projection query, including its root row and public goal.
       const persistedPlanLedgerTasks = await pool!.query<{
         id: string; sessionId: string; turnId: string | null; rootTaskId: string | null; parentTaskId: string | null
@@ -11498,15 +11548,16 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expect(root.rows).toHaveLength(1)
       expect(root.rows[0]?.status).toBe("completed")
       const persistedShortlist = record(record(root.rows[0]?.result)?.structuredResult)?.interactiveDiscoveryShortlist
-      const children = await pool!.query<{ id: string; role: string; status: string; result: unknown }>(
-        `SELECT "id", "role", "status", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "parentTaskId" = $3 AND "role" = ANY($4::text[]) ORDER BY "role"`,
+      const children = await pool!.query<{ id: string; role: string; status: string; attemptCount: number; result: unknown }>(
+        `SELECT "id", "role", "status", "attemptCount", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "parentTaskId" = $3 AND "role" = ANY($4::text[]) ORDER BY "role"`,
         [value.turnId, value.sessionId, root.rows[0]!.id, ["analyst", "scout"]],
       )
       expect(children.rows.map(child => [child.role, child.status])).toEqual([["analyst", "completed"], ["scout", "completed"]])
       expect(workerTwo.output.filter(line => line.startsWith(`P3_DISCOVERY_CHILD_SETTLED ${source.rows[0]!.id} scout completed`))).toHaveLength(1)
       expect(workerThree.output.filter(line => line.startsWith(`P3_DISCOVERY_CHILD_STARTED ${source.rows[0]!.id} scout`))).toHaveLength(0)
-      const persistedSearchReceipts = await pool!.query<{ taskId: string; toolName: string }>(
-        `SELECT tool_result."taskId", tool_call."content"->>'toolName' AS "toolName"
+      const persistedSearchReceipts = await pool!.query<{ taskId: string; toolName: string; toolCallId: string; callToolCallId: string }>(
+        `SELECT tool_result."taskId", tool_call."content"->>'toolName' AS "toolName",
+                tool_result."content"->>'toolCallId' AS "toolCallId", tool_call."content"->>'toolCallId' AS "callToolCallId"
          FROM "agent_items" AS tool_result
          JOIN "agent_items" AS tool_call
            ON tool_call."sessionId" = tool_result."sessionId" AND tool_call."turnId" = tool_result."turnId"
@@ -11520,6 +11571,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       )
       expect(persistedSearchReceipts.rows).toHaveLength(2)
       expect(persistedSearchReceipts.rows.map(receipt => receipt.taskId).sort()).toEqual(children.rows.map(child => child.id).sort())
+      expect(persistedSearchReceipts.rows.map(receipt => [receipt.taskId, receipt.toolName, receipt.toolCallId, receipt.callToolCallId]).sort())
+        .toEqual(children.rows.map(child => [child.id, "jobs.search",
+          `p3-process-restart-discovery-read:${child.id}:${child.attemptCount}${PROCESS_RESTART_PHONE_SHAPED_TOOL_CALL_SUFFIX}`,
+          `p3-process-restart-discovery-read:${child.id}:${child.attemptCount}${PROCESS_RESTART_PHONE_SHAPED_TOOL_CALL_SUFFIX}`]).sort())
       const dispatches = await pool!.query<{ idempotencyKey: string; publishedAt: Date | null }>(
         `SELECT "idempotencyKey", "publishedAt" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.subagent.dispatch' AND "idempotencyKey" = ANY($2::text[]) ORDER BY "idempotencyKey"`,
         [value.sessionId, children.rows.map(child => `subagent-dispatch:${child.id}`)],
