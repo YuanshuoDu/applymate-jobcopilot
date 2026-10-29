@@ -73,6 +73,7 @@ function clonePauseState(state: FakePauseState): FakePauseState {
 }
 
 function cancellationDatabase(options: { readonly withCallRow?: boolean; readonly withResultRow?: boolean; readonly ambiguousCommit?: boolean; readonly recoverPaused?: boolean;
+  readonly toolCallId?: string; readonly duplicateCallRows?: boolean;
   readonly orphanStarted?: boolean; readonly orphanCompleted?: boolean; readonly orphanUsage?: boolean; readonly orphanPause?: boolean; readonly malformedOrphanUsage?: boolean;
   readonly nullOrphanUsage?: boolean;
   readonly malformedOrphanPause?: boolean; readonly orphanCompletedCausation?: string | null; readonly orphanUsageCausation?: string | null;
@@ -113,8 +114,8 @@ function cancellationDatabase(options: { readonly withCallRow?: boolean; readonl
   let database: FakePauseState = {
     step: { id: "step-1", status: options.stepStatus ?? "streaming", taskId: owner.taskId, attempt: 1, finishReason: null, errorCode: null,
       inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
-    ...(options.withCallRow === false ? {} : { call: { id: "call-item-1", status: "started", type: "tool_call", content: { toolCallId: "call-1", toolName: "agent.ask_user", toolVersion: "1", input: { question: "Which city?" } } } }),
-    ...(options.withResultRow ? { result: { id: "result-item-1", status: "started", type: "tool_result", content: { toolCallId: "call-1", output: { question: "Which city?" }, errorCode: null } } } : {}),
+    ...(options.withCallRow === false ? {} : { call: { id: "call-item-1", status: "started", type: "tool_call", content: { toolCallId: options.toolCallId ?? "call-1", toolName: "agent.ask_user", toolVersion: "1", input: { question: "Which city?" } } } }),
+    ...(options.withResultRow ? { result: { id: "result-item-1", status: "started", type: "tool_result", content: { toolCallId: options.toolCallId ?? "call-1", output: { question: "Which city?" }, errorCode: null } } } : {}),
     events, outboxes: new Map(), eventSequence: options.orphanPause ? 13 : options.recoverPaused ? 12 : 10,
   }
   let connections = 0, commits = 0, rollbacks = 0, stepUpdates = 0, eventSequenceUpdates = 0, eventInserts = 0, outboxInserts = 0
@@ -155,7 +156,7 @@ function cancellationDatabase(options: { readonly withCallRow?: boolean; readonl
             callItemId: state.call.id, callStatus: state.call.status, callContent: state.call.content,
             resultItemId: null, resultStatus: null, resultContent: null, resultCount: 0 }] : [])
           if (sql.startsWith('SELECT "id", "status", "content" FROM "agent_items"')) {
-            if (sql.includes('"type" = \'tool_call\'')) return result(state.call ? [state.call] : [])
+            if (sql.includes('"type" = \'tool_call\'')) return result(state.call ? options.duplicateCallRows ? [state.call, state.call] : [state.call] : [])
             if (sql.includes('"type" = \'tool_result\'')) return result()
           }
           if (sql.startsWith('SELECT "id", "type" FROM "agent_items"')) return result([state.call, state.result].filter((item): item is FakePauseItem => !!item).map(item => ({ id: item.id, type: item.type })))
@@ -262,6 +263,19 @@ describe("native question pause cancellation readback", () => {
     const forged = fixture.rows.map(row => row.type === "tool_call.failed" ? { ...row, payload: { ...row.payload, status: "failed" } } : row)
     await expect(hasQuestionPauseEvents(queryClient(forged), owner, fixture.stepId, fixture.toolCallId, fixture.callItemId, null)).resolves.toBe(false)
   })
+
+  it.each(["+353 87 123 4567", "alex@example.com", "sk_live_sensitive_token_abc"])(
+    "does not expose provider IDs when cancellation finds duplicate ask_user lineage (%s)", async toolCallId => {
+      const database = cancellationDatabase({ toolCallId, duplicateCallRows: true })
+      const input: TurnQuestionPauseInput = { owner, stepId: "step-1", toolCallId, callArguments: { question: "Which city?" },
+        finishReason: "tool_calls", usage: { inputTokens: 10, outputTokens: 4, estimatedCostUsd: 0.02 }, now: new Date("2026-10-06T12:00:00.000Z") }
+
+      await expect(cancelPausedQuestion(database.pool as never, input))
+        .rejects.toMatchObject({ code: "question_conflict", message: "Question persistence conflict: ask_user" })
+      expect(database.metrics()).toMatchObject({ commits: 0, rollbacks: 1, stepUpdates: 0, eventSequenceUpdates: 0, eventInserts: 0, outboxInserts: 0 })
+      expect(database.state().call?.status).toBe("started")
+    },
+  )
 
   it("retries one transient atomic cancellation failure and leaves exact durable pause evidence", async () => {
     const database = cancellationDatabase()

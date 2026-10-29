@@ -12,6 +12,15 @@ describe("agent.list tool contract", () => {
       capabilities: ["read", "coordination"], requiredCapabilities: ["canManageChildren"], timeoutMs: 30_000,
     })
     expect(tool.description).toContain("analysisSummary, which is advisory and never verification evidence")
+    expect(tool.description).toContain("Current graph previews show at most three Scout candidates or Analyst findings")
+    expect(tool.description).toContain("If a selection or analysis decision depends on unseen current results")
+    expect(tool.description).toContain("stop when enough information is available")
+    expect(tool.description).toContain("Do not paginate exhaustively by default")
+    expect(tool.description).toContain("exact returned nextOffset")
+    expect(tool.description).toContain("refresh the owner-scoped current graph")
+    expect(Value.Check(tool.inputSchema, { nodeKey: "scout-node", expectedRevision: 2, offset: 0 })).toBe(true)
+    expect(Value.Check(tool.inputSchema, { nodeKey: "scout-node", expectedRevision: 2, offset: -1 })).toBe(false)
+    expect(Value.Check(tool.inputSchema, { nodeKey: "scout-node", expectedRevision: 2, offset: 0, cursor: 3 })).toBe(false)
     const analystPage = {
       schemaVersion: TASK_GRAPH_RESULT_PAGE_SCHEMA, trust: "untrusted", availability: "available", graphRevision: 2,
       role: "analyst", taskStatus: "completed", resultStatus: "completed", totalCount: 1, evidenceCount: 1,

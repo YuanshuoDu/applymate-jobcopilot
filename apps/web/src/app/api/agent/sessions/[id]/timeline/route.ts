@@ -4,6 +4,7 @@ import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { db } from "@/lib/db"
 import { isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
 import { redactStreamValue } from "@/lib/agent/session/stream-redaction"
+import { openPublicTimelineCursor, publicAgentEventId, publicToolCallId, projectPublicEventEnvelope, sealPublicTimelineCursor } from "@/lib/agent/session/public-tool-identity"
 import { APPROVAL_LEDGER_EVENT_TYPES, APPROVAL_LEDGER_MAX_EVENTS, projectApprovalLedgerRow } from "@/components/agent-workspace/v2/approval-ledger-parser"
 import { parseCognitiveAgendaReceipt, type CognitiveAgendaScope } from "@/components/agent-workspace/v2/cognitive-agenda-view"
 import { parseSteeringMarkerEvent, reduceTimelineSteeringMarkers, type TimelineSteeringMarkerEvent } from "@/components/agent-workspace/v2/timeline-steering-markers"
@@ -65,7 +66,11 @@ export async function GET(request: NextRequest, context: RouteContext) {
     if (!row) return Response.json({ error: { code: "timeline_item_not_found", message: "Timeline item not found", details: {} } }, { status: 404 })
     return ok({ items: [itemDto(row as ItemQueryRow)], page: { hasMore: false, nextCursor: null } })
   }
-  const page = parsePageRequest(request, "timeline", sessionId)
+  const incomingCursor = query.get("cursor")
+  const internalCursor = incomingCursor ? openPublicTimelineCursor(sessionId, incomingCursor) : null
+  if (incomingCursor && !internalCursor) return Response.json({ error: { code: "invalid_cursor", message: "Cursor is invalid or belongs to another query", details: {} } }, { status: 400 })
+  const pageRequest = internalCursor && internalCursor !== incomingCursor ? withCursor(request, internalCursor) : request
+  const page = parsePageRequest(pageRequest, "timeline", sessionId)
   if (page instanceof Response) return page
 
   const session = await db.agentSession.findFirst({ where: { id: sessionId, userId: auth.userId }, select: { id: true } })
@@ -84,7 +89,7 @@ export async function GET(request: NextRequest, context: RouteContext) {
   const approvalEvents = page.cursor === null ? await recentApprovalEvents(sessionId) : []
   return ok({
     items: result.rows.map(itemDto),
-    page: result.page,
+    page: { ...result.page, nextCursor: result.page.nextCursor ? sealPublicTimelineCursor(sessionId, result.page.nextCursor) : null },
     ...(page.cursor === null ? {
       agenda,
       ...(agendas.length > 0 ? { agendas } : {}),
@@ -125,7 +130,14 @@ async function recentApprovalEvents(sessionId: string) {
   }) as AgendaQueryRow[]
   return rows.flatMap(row => {
     const event = projectApprovalLedgerRow(row, sessionId, redactStreamValue)
-    return event ? [event] : []
+    if (!event) return []
+    const payload = isRecord(event.payload) ? event.payload : {}
+    return [{
+      ...event, id: publicAgentEventId(sessionId, event.id),
+      payload: typeof payload.toolCallId === "string"
+        ? { ...payload, toolCallId: publicToolCallId(sessionId, event.turnId, payload.toolCallId) }
+        : event.payload,
+    }]
   }).sort((left, right) => compareDecimalSequence(left.sequence, right.sequence) || left.id.localeCompare(right.id))
 }
 
@@ -141,7 +153,7 @@ function markerEnvelope(row: SteeringMarkerQueryRow, sessionId: string): Timelin
   if (!/^(0|[1-9]\d*)$/.test(sequence) || sequence.length > 20) return null
   return {
     schemaVersion: AGENT_STREAM_SCHEMA_VERSION,
-    id: row.id,
+    id: publicAgentEventId(sessionId, row.id),
     sessionId: row.sessionId,
     turnId: row.turnId,
     itemId: null,
@@ -165,7 +177,7 @@ function agendaEnvelope(row: AgendaQueryRow, sessionId: string) {
   }
   const agenda = parseCognitiveAgendaReceipt(row.payload, scope)
   if (!agenda) return null
-  return {
+  return projectPublicEventEnvelope({
     schemaVersion: AGENT_STREAM_SCHEMA_VERSION,
     id: row.id,
     sessionId: row.sessionId,
@@ -179,7 +191,13 @@ function agendaEnvelope(row: AgendaQueryRow, sessionId: string) {
     idempotencyKey: row.idempotencyKey,
     sequence: row.sequence.toString(),
     payload: redactStreamValue(agenda),
-  }
+  })
+}
+
+function withCursor(request: Request, cursor: string): Request {
+  const url = new URL(request.url)
+  url.searchParams.set("cursor", cursor)
+  return new Request(url, { method: request.method, headers: request.headers, signal: request.signal })
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

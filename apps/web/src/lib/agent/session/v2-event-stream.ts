@@ -1,22 +1,14 @@
 import type { PrismaClient } from "@prisma/client"
 import { Redis } from "ioredis"
-import {
-  AGENT_STREAM_SCHEMA_VERSION,
-  agentDeltaStream,
-  type AgentDeltaEnvelope,
-  type AgentStreamEnvelope,
-} from "@jobcopilot/agent-protocol"
+import { AGENT_STREAM_SCHEMA_VERSION, agentDeltaStream, type AgentDeltaEnvelope, type AgentStreamEnvelope } from "@jobcopilot/agent-protocol"
 
 import { BoundedStreamBuffer, type StreamFrame } from "./stream-buffer"
+import { classifyPublicItemType, preservePublicToolCallId, projectPublicEventEnvelope, readPublicItemTypes, type PublicToolItemKind } from "./public-tool-identity"
 import { redactStreamEventPayload } from "./stream-redaction"
 import { isPrivateV2EventType } from "./v2-private-event-filter"
 import { createDurablePollWakeup, startAgentEventWakeup, waitForDuration, type AgentEventPubSubFactory } from "./event-wakeup"
-const DEFAULT_DB_POLL_MS = 750
-const DEFAULT_HEARTBEAT_MS = 15_000
-const DEFAULT_BUFFER_CAPACITY = 128
-const DURABLE_BATCH_SIZE = 100
-const DELTA_BATCH_SIZE = 64
-const MAX_DELTA_ENTRY_BYTES = 128 * 1024
+const DEFAULT_DB_POLL_MS = 750, DEFAULT_HEARTBEAT_MS = 15_000, DEFAULT_BUFFER_CAPACITY = 128
+const DURABLE_BATCH_SIZE = 100, DELTA_BATCH_SIZE = 64, MAX_DELTA_ENTRY_BYTES = 128 * 1024
 
 type DurableEventRow = {
   id: string
@@ -32,19 +24,13 @@ type DurableEventRow = {
   idempotencyKey: string | null
   payload: unknown
 }
-export interface AgentStreamRedis {
-  xread(...args: string[]): Promise<unknown>
-  disconnect(): void
-}
+export interface AgentStreamRedis { xread(...args: string[]): Promise<unknown>; disconnect(): void }
 export interface V2EventStreamOptions {
   sessionId: string
   afterSequence: bigint
   signal?: AbortSignal
-  dbPollMs?: number
-  heartbeatMs?: number
-  bufferCapacity?: number
-  redisFactory?: () => AgentStreamRedis | null
-  eventRedisFactory?: AgentEventPubSubFactory
+  dbPollMs?: number; heartbeatMs?: number; bufferCapacity?: number
+  redisFactory?: () => AgentStreamRedis | null; eventRedisFactory?: AgentEventPubSubFactory
 }
 
 export function parseAfterSequence(request: Request): bigint | Response {
@@ -58,12 +44,10 @@ export function parseAfterSequence(request: Request): bigint | Response {
   } }, { status: 400 })
   return BigInt(value)
 }
-
 const EVENT_SELECT = {
   id: true, sessionId: true, turnId: true, itemId: true, taskId: true, sequence: true,
   type: true, actor: true, correlationId: true, causationId: true, idempotencyKey: true, payload: true,
 } as const
-
 export function createV2EventStream(db: PrismaClient, options: V2EventStreamOptions): ReadableStream<Uint8Array> {
   const lifetime = new AbortController()
   const signal = lifetime.signal
@@ -84,7 +68,7 @@ export function createV2EventStream(db: PrismaClient, options: V2EventStreamOpti
       const producers = [
         durableEventLoop(db, options, buffer, signal, durableWakeup),
         startAgentEventWakeup(options.sessionId, options.eventRedisFactory, durableWakeup, signal),
-        deltaLoop(options, buffer, signal),
+        deltaLoop(db, options, buffer, signal),
         heartbeatLoop(options, buffer, signal),
       ]
       void pump(controller, buffer, signal, producers, options, onRequestAbort, encoder)
@@ -133,11 +117,17 @@ async function durableEventLoop(
         where: { sessionId: options.sessionId, sequence: { gt: lastSequence } },
         orderBy: { sequence: "asc" }, take: DURABLE_BATCH_SIZE, select: EVENT_SELECT,
       }) as DurableEventRow[]
+      const itemTypes = await readPublicItemTypes(db, options.sessionId, rows.filter(row => row.type.startsWith("item.")).map(row => row.itemId).filter((id): id is string => typeof id === "string"))
+      if (itemTypes === null) {
+        await wakeup.wait(options.dbPollMs ?? DEFAULT_DB_POLL_MS, signal)
+        continue
+      }
       for (const row of rows) {
         const sequence = BigInt(row.sequence)
         if (sequence <= lastSequence) continue
         if (isPrivateV2EventType(row.type)) { lastSequence = sequence; continue }
-        const result = buffer.push({ kind: "durable", body: durableFrame(row) })
+        const itemKind = row.type.startsWith("tool_call.") ? "tool_call" : row.type.startsWith("item.") ? classifyPublicItemType(itemTypes.get(row.itemId ?? "")) : null
+        const result = buffer.push({ kind: "durable", body: durableFrame(row, itemKind) })
         if (!result.accepted) {
           buffer.close()
           return
@@ -152,6 +142,7 @@ async function durableEventLoop(
 }
 
 async function deltaLoop(
+  db: PrismaClient,
   options: V2EventStreamOptions,
   buffer: BoundedStreamBuffer,
   signal: AbortSignal,
@@ -160,22 +151,34 @@ async function deltaLoop(
   if (!redis) return
   try {
     let streamId = "$"
+    let pendingEntries: Array<{ streamId: string; envelope: AgentDeltaEnvelope }> = []
     const revisions = new Map<string, number>()
     while (!signal.aborted) {
-      const result = await redis.xread(
-        "COUNT", String(DELTA_BATCH_SIZE), "BLOCK", String(options.dbPollMs ?? DEFAULT_DB_POLL_MS),
-        "STREAMS", agentDeltaStream(options.sessionId), streamId,
-      )
-      for (const entry of readDeltaEntries(result, options.sessionId)) {
+      if (pendingEntries.length === 0) {
+        const result = await redis.xread(
+          "COUNT", String(DELTA_BATCH_SIZE), "BLOCK", String(options.dbPollMs ?? DEFAULT_DB_POLL_MS),
+          "STREAMS", agentDeltaStream(options.sessionId), streamId,
+        )
+        pendingEntries = readDeltaEntries(result, options.sessionId)
+      }
+      const entries = pendingEntries
+      const itemTypes = await readPublicItemTypes(db, options.sessionId, entries.filter(entry => entry.envelope.type.startsWith("item.")).map(entry => entry.envelope.itemId).filter((id): id is string => typeof id === "string"))
+      if (itemTypes === null) {
+        await waitForDuration(options.dbPollMs ?? DEFAULT_DB_POLL_MS, signal)
+        continue
+      }
+      for (const entry of entries) {
         streamId = entry.streamId
         if (isPrivateV2EventType(entry.envelope.type)) continue
         const itemId = entry.envelope.itemId
         if (!itemId) continue
+        const itemKind = entry.envelope.type.startsWith("tool_call.") ? "tool_call" : entry.envelope.type.startsWith("item.") ? classifyPublicItemType(itemTypes.get(itemId)) : null
         const previousRevision = revisions.get(itemId)
         if (previousRevision !== undefined && entry.envelope.revision <= previousRevision) continue
         revisions.set(itemId, entry.envelope.revision)
-        buffer.push({ kind: "transient", body: deltaFrame(entry.streamId, entry.envelope) })
+        buffer.push({ kind: "transient", body: deltaFrame(entry.streamId, entry.envelope, itemKind) })
       }
+      pendingEntries = []
     }
   } catch {
     // Redis is an acceleration channel. Durable PostgreSQL polling remains authoritative.
@@ -190,25 +193,25 @@ async function heartbeatLoop(options: V2EventStreamOptions, buffer: BoundedStrea
     if (!signal.aborted) buffer.push({ kind: "transient", body: ": heartbeat\n\n" })
   }
 }
-function durableFrame(row: DurableEventRow): string {
-  const payload: AgentStreamEnvelope = {
+function durableFrame(row: DurableEventRow, itemKind: PublicToolItemKind | null): string {
+  const projected = projectPublicEventEnvelope<AgentStreamEnvelope>({
     schemaVersion: AGENT_STREAM_SCHEMA_VERSION, id: row.id, sessionId: row.sessionId, turnId: row.turnId,
     itemId: row.itemId, taskId: row.taskId, type: row.type, actor: row.actor,
     correlationId: row.correlationId, causationId: row.causationId, idempotencyKey: row.idempotencyKey,
-    sequence: row.sequence.toString(), payload: redactStreamEventPayload(row.type, row.payload, {
-      sessionId: row.sessionId, turnId: row.turnId, itemId: row.itemId, taskId: row.taskId,
-    }),
-  }
+    sequence: row.sequence.toString(), payload: row.payload,
+  }, itemKind)
+  const redacted = redactStreamEventPayload(row.type, projected.payload, {
+    sessionId: row.sessionId, turnId: row.turnId, itemId: projected.itemId, taskId: row.taskId,
+  })
+  const payload = { ...projected, payload: preservePublicToolCallId(redacted, projected.payload, itemKind) }
   return sseFrame(row.type, row.sequence.toString(), payload)
 }
-function deltaFrame(streamId: string, envelope: AgentDeltaEnvelope): string {
-  return sseFrame(envelope.type, null, {
-    ...envelope,
-    payload: redactStreamEventPayload(envelope.type, envelope.payload, {
-      sessionId: envelope.sessionId, turnId: envelope.turnId, itemId: envelope.itemId, taskId: envelope.taskId,
-    }),
-    streamId,
+function deltaFrame(streamId: string, envelope: AgentDeltaEnvelope, itemKind: PublicToolItemKind | null): string {
+  const projected = projectPublicEventEnvelope<AgentDeltaEnvelope>(envelope, itemKind)
+  const redacted = redactStreamEventPayload(envelope.type, projected.payload, {
+    sessionId: envelope.sessionId, turnId: envelope.turnId, itemId: projected.itemId, taskId: envelope.taskId,
   })
+  return sseFrame(envelope.type, null, { ...projected, payload: preservePublicToolCallId(redacted, projected.payload, itemKind), streamId })
 }
 function sseFrame(event: string, id: string | null, data: unknown): string {
   return `${event ? `event: ${event}\n` : ""}${id ? `id: ${id}\n` : ""}data: ${JSON.stringify(data)}\n\n`

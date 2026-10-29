@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
 import { createV2EventStream, parseAfterSequence, type AgentStreamRedis } from "./v2-event-stream"
+import { publicAgentEventId, publicIdempotencyKey, publicToolCallId, publicToolItemId } from "./public-tool-identity"
 import type { AgentEventPubSubRedis } from "./event-wakeup"
 
 function event(sequence: bigint) {
@@ -34,7 +35,10 @@ function goalFromFrame(text: string): unknown {
 }
 
 function db(rows: unknown[]) {
-  return { agentEvent: { findMany: vi.fn().mockResolvedValue(rows) } }
+  return {
+    agentEvent: { findMany: vi.fn().mockResolvedValue(rows) },
+    agentItem: { findMany: vi.fn(async ({ where }: { where: { id: { in: string[] } } }) => where.id.in.map(id => ({ id, type: "agent_message" }))) },
+  }
 }
 
 function redis() {
@@ -95,6 +99,131 @@ describe("V2 agent event stream", () => {
     expect(database.agentEvent.findMany).toHaveBeenCalledWith(expect.objectContaining({ where: { sessionId: "session_1", sequence: { gt: BigInt(1) } } }))
     controller.abort()
     await reader.cancel()
+  })
+
+  it("projects raw call, item, event, cause, and idempotency identities on durable SSE", async () => {
+    const rawCallId = "+353851234567"
+    const callItemId = `turn:turn_1:item:tool-call:${rawCallId}:call-suffix`
+    const resultItemId = `turn:turn_1:item:tool-result:${rawCallId}:result-suffix`
+    const eventIds = [
+      `turn:turn_1:event:item-started:${callItemId}`,
+      `turn:turn_1:event:tool-started:${rawCallId}`,
+      `turn:turn_1:event:item-completed:${callItemId}`,
+      `turn:turn_1:event:item-started:${resultItemId}`,
+      `turn:turn_1:event:item-completed:${resultItemId}`,
+    ]
+    const base = (sequence: number, id: string, itemId: string, type: string, correlationId: string, payload: unknown, causationId: string | null = null) => ({
+      id, sessionId: "session_1", turnId: "turn_1", itemId, taskId: "root-task", sequence: BigInt(sequence), type,
+      actor: "orchestrator", correlationId, causationId, idempotencyKey: `idem:${rawCallId}:${sequence}`, payload,
+    })
+    const rows = [
+      base(1, eventIds[0]!, callItemId, "item.started", callItemId, { itemId: callItemId, type: "tool_call", phase: null }),
+      base(2, eventIds[1]!, callItemId, "tool_call.started", rawCallId, { toolCallId: rawCallId, toolName: "jobs.search", taskId: "root-task" }, eventIds[0]!),
+      base(3, eventIds[2]!, callItemId, "item.completed", callItemId, { itemId: callItemId, status: "completed", content: { toolCallId: rawCallId, toolName: "jobs.search", toolVersion: "1", status: "completed", input: { query: "engineer" } } }, eventIds[1]!),
+      base(4, eventIds[3]!, resultItemId, "item.started", resultItemId, { itemId: resultItemId, type: "tool_result", phase: null }, eventIds[2]!),
+      base(5, eventIds[4]!, resultItemId, "item.completed", resultItemId, { itemId: resultItemId, status: "completed", content: { toolCallId: rawCallId, output: { count: 2 }, errorCode: null } }, eventIds[3]!),
+    ]
+    const database = db(rows)
+    database.agentItem.findMany.mockResolvedValue([{ id: callItemId, type: "tool_call" }, { id: resultItemId, type: "tool_result" }])
+    const controller = new AbortController()
+    const stream = createV2EventStream(database as never, { sessionId: "session_1", afterSequence: BigInt(0), signal: controller.signal, redisFactory: () => null, dbPollMs: 1, heartbeatMs: 60_000 })
+    const reader = stream.getReader()
+    let events: Array<{ id: string; itemId: string | null; correlationId: string; causationId: string | null; idempotencyKey: string | null; payload: Record<string, unknown> }> = []
+    try {
+      const frames: string[] = []
+      for (let index = 0; index < rows.length; index += 1) frames.push(new TextDecoder().decode((await reader.read()).value))
+      const text = frames.join("")
+      events = frames.map(frame => JSON.parse(frame.split("data: ")[1]!.split("\n")[0]!) as typeof events[number])
+      const callAlias = publicToolCallId("session_1", "turn_1", rawCallId)
+      const callItemAlias = publicToolItemId("session_1", "turn_1", callItemId)
+      const resultItemAlias = publicToolItemId("session_1", "turn_1", resultItemId)
+      expect(text).not.toContain(rawCallId)
+      expect(text).not.toContain(callItemId)
+      expect(text).not.toContain(resultItemId)
+      expect(events[0]).toMatchObject({ id: publicAgentEventId("session_1", eventIds[0]!), itemId: callItemAlias, correlationId: callItemAlias, payload: { itemId: callItemAlias } })
+      expect(events[1]).toMatchObject({ id: publicAgentEventId("session_1", eventIds[1]!), itemId: callItemAlias, correlationId: callAlias, causationId: events[0]!.id, payload: { toolCallId: callAlias } })
+      expect(events[2]).toMatchObject({ idempotencyKey: publicIdempotencyKey("session_1", `idem:${rawCallId}:3`), payload: { content: { toolCallId: callAlias } } })
+      expect(events[3]).toMatchObject({ itemId: resultItemAlias, correlationId: resultItemAlias, payload: { itemId: resultItemAlias } })
+      expect(events[4]).toMatchObject({ itemId: resultItemAlias, payload: { content: { toolCallId: callAlias } } })
+      expect(frames.map(frame => frame.match(/\nid: (\d+)\n/)?.[1])).toEqual(["1", "2", "3", "4", "5"])
+      expect(database.agentItem.findMany).toHaveBeenCalledTimes(1)
+      expect(database.agentItem.findMany).toHaveBeenCalledWith({ where: { sessionId: "session_1", id: { in: [callItemId, resultItemId] } }, select: { id: true, type: true } })
+    } finally {
+      controller.abort()
+      await reader.cancel()
+    }
+    const reconnectController = new AbortController()
+    const reconnect = createV2EventStream(database as never, { sessionId: "session_1", afterSequence: BigInt(3), signal: reconnectController.signal, redisFactory: () => null, dbPollMs: 1, heartbeatMs: 60_000 })
+    const reconnectReader = reconnect.getReader()
+    try {
+      const resumed = [
+        JSON.parse(new TextDecoder().decode((await reconnectReader.read()).value).split("data: ")[1]!.split("\n")[0]!) as typeof events[number],
+        JSON.parse(new TextDecoder().decode((await reconnectReader.read()).value).split("data: ")[1]!.split("\n")[0]!) as typeof events[number],
+      ]
+      expect(resumed.map(item => item.id)).toEqual([events[3]!.id, events[4]!.id])
+      expect(resumed.map(item => item.itemId)).toEqual([events[3]!.itemId, events[4]!.itemId])
+      expect(resumed.map(item => item.itemId)).toEqual([publicToolItemId("session_1", "turn_1", resultItemId), publicToolItemId("session_1", "turn_1", resultItemId)])
+      expect(database.agentEvent.findMany).toHaveBeenLastCalledWith(expect.objectContaining({ where: { sessionId: "session_1", sequence: { gt: BigInt(3) } } }))
+    } finally {
+      reconnectController.abort()
+      await reconnectReader.cancel()
+    }
+  })
+
+  it("fails closed for an item event whose canonical item type is missing", async () => {
+    const rawItemId = "turn:turn_1:item:tool-call:private.user@example.com:missing"
+    const database = db([{
+      id: `event:${rawItemId}`, sessionId: "session_1", turnId: "turn_1", itemId: rawItemId, taskId: null,
+      sequence: BigInt(9), type: "item.failed", actor: "orchestrator", correlationId: rawItemId,
+      causationId: null, idempotencyKey: `idem:${rawItemId}`, payload: { itemId: rawItemId, errorCode: "tool_execution_failed" },
+    }])
+    database.agentItem.findMany.mockResolvedValueOnce([])
+    const controller = new AbortController()
+    const stream = createV2EventStream(database as never, { sessionId: "session_1", afterSequence: BigInt(8), signal: controller.signal, redisFactory: () => null, dbPollMs: 1, heartbeatMs: 60_000 })
+    const reader = stream.getReader()
+    try {
+      const text = new TextDecoder().decode((await reader.read()).value)
+      const frame = JSON.parse(text.split("data: ")[1]!.split("\n")[0]!) as { id: string; itemId: string | null; payload: unknown }
+      expect(text).not.toContain(rawItemId)
+      expect(text).toContain("id: 9")
+      expect(frame.itemId).toBeNull()
+      expect(frame.payload).toBeNull()
+    } finally {
+      controller.abort()
+      await reader.cancel()
+    }
+  })
+
+  it("retries a durable item event after its item-type lookup fails without consuming the sequence", async () => {
+    const rawItemId = "turn:turn_1:item:tool-call:private-call-id"
+    const row = {
+      id: "event-private-call-id", sessionId: "session_1", turnId: "turn_1", itemId: rawItemId, taskId: null,
+      sequence: BigInt(9), type: "item.failed", actor: "orchestrator", correlationId: rawItemId,
+      causationId: null, idempotencyKey: null, payload: { errorCode: "tool_execution_failed" },
+    }
+    const database = db([row])
+    database.agentItem.findMany
+      .mockRejectedValueOnce(new Error("temporary item lookup failure"))
+      .mockResolvedValueOnce([{ id: rawItemId, type: "tool_call" }])
+    const controller = new AbortController()
+    const stream = createV2EventStream(database as never, {
+      sessionId: "session_1", afterSequence: BigInt(8), signal: controller.signal,
+      redisFactory: () => null, dbPollMs: 1, heartbeatMs: 60_000,
+    })
+    const reader = stream.getReader()
+    try {
+      await waitFor(() => database.agentItem.findMany.mock.calls.length >= 2)
+      const text = new TextDecoder().decode((await reader.read()).value)
+      const frame = JSON.parse(text.split("data: ")[1]!.split("\n")[0]!) as { itemId: string | null }
+      expect(text).toContain("id: 9")
+      expect(text).not.toContain(rawItemId)
+      expect(frame.itemId).toBe(publicToolItemId("session_1", "turn_1", rawItemId))
+      expect(database.agentEvent.findMany.mock.calls.slice(0, 2).map(call => call[0].where.sequence.gt))
+        .toEqual([BigInt(8), BigInt(8)])
+    } finally {
+      controller.abort()
+      await reader.cancel()
+    }
   })
 
   it("omits private durable verification events and advances the database cursor", async () => {
@@ -537,6 +666,102 @@ describe("V2 agent event stream", () => {
     controller.abort()
     await reader.cancel()
     expect(connection.disconnect).toHaveBeenCalled()
+  })
+
+  it("projects nested tool-item snapshots and keeps reconnect identity stable", async () => {
+    const rawCallId = "Bearer sk-secret123456"
+    const rawItemId = `turn:turn_1:item:tool-call:${rawCallId}:snapshot-suffix`
+    const eventId = `delta:${rawCallId}`
+    const envelope = {
+      schemaVersion: "agent-harness.v2", id: eventId, sessionId: "session_1", turnId: "turn_1", itemId: rawItemId,
+      taskId: "root-task", type: "item.snapshot", actor: "orchestrator", correlationId: rawItemId,
+      causationId: "cause:" + rawCallId, idempotencyKey: "idem:" + rawCallId, sequence: null,
+      payload: { item: {
+        schemaVersion: "agent-harness.v2", id: rawItemId, sessionId: "session_1", turnId: "turn_1", stepId: "step_1",
+        taskId: "root-task", type: "tool_call", status: "started", phase: null, revision: 1,
+        content: { toolCallId: rawCallId, toolName: "jobs.search", toolVersion: "1", input: { query: "engineer" } },
+        startedAt: "2026-10-29T00:00:00.000Z", completedAt: null, createdAt: "2026-10-29T00:00:00.000Z", updatedAt: "2026-10-29T00:00:00.000Z",
+      } },
+      kind: "snapshot", baseRevision: 0, revision: 1,
+    }
+    const connection: AgentStreamRedis = {
+      xread: vi.fn().mockResolvedValueOnce([["agent:session:session_1:deltas", [["1-0", ["payload", JSON.stringify(envelope)]]]]]).mockResolvedValue(null),
+      disconnect: vi.fn(),
+    }
+    const database = db([])
+    database.agentItem.findMany.mockResolvedValueOnce([{ id: rawItemId, type: "tool_call" }])
+    const controller = new AbortController()
+    const stream = createV2EventStream(database as never, {
+      sessionId: "session_1", afterSequence: BigInt(0), signal: controller.signal, redisFactory: () => connection, dbPollMs: 1, heartbeatMs: 60_000,
+    })
+    const reader = stream.getReader()
+    try {
+      const text = new TextDecoder().decode((await reader.read()).value)
+      const frame = JSON.parse(text.split("data: ")[1]!.split("\n")[0]!) as {
+        id: string; itemId: string; correlationId: string; causationId: string | null; idempotencyKey: string | null;
+        payload: { item: { id: string; content: { toolCallId: string } } }; streamId: string
+      }
+      const toolCallAlias = publicToolCallId("session_1", "turn_1", rawCallId)
+      const toolItemAlias = publicToolItemId("session_1", "turn_1", rawItemId)
+      expect(text).not.toContain(rawCallId)
+      expect(text).not.toContain(rawItemId)
+      expect(frame).toMatchObject({ id: publicAgentEventId("session_1", eventId), itemId: toolItemAlias, correlationId: toolItemAlias, causationId: publicAgentEventId("session_1", "cause:" + rawCallId), idempotencyKey: publicIdempotencyKey("session_1", "idem:" + rawCallId) })
+      expect(frame.payload.item).toMatchObject({ id: toolItemAlias, content: { toolCallId: toolCallAlias } })
+      expect(frame.streamId).toBe("1-0")
+    } finally {
+      controller.abort()
+      await reader.cancel()
+    }
+    expect(connection.disconnect).toHaveBeenCalled()
+  })
+
+  it("replays a transient delta after its item-type lookup fails without advancing Redis", async () => {
+    const rawCallId = "private-provider-call"
+    const rawItemId = `turn:turn_1:item:tool-call:${rawCallId}`
+    const envelope = {
+      schemaVersion: "agent-harness.v2", id: "delta:private-call", sessionId: "session_1", turnId: "turn_1",
+      itemId: rawItemId, taskId: null, type: "item.snapshot", actor: "orchestrator", correlationId: rawItemId,
+      causationId: null, idempotencyKey: null, sequence: null,
+      payload: { item: {
+        schemaVersion: "agent-harness.v2", id: rawItemId, sessionId: "session_1", turnId: "turn_1",
+        type: "tool_call", status: "started", revision: 1, content: { toolCallId: rawCallId },
+      } }, kind: "snapshot", baseRevision: 0, revision: 1,
+    }
+    const batch = [["agent:session:session_1:deltas", [["1-0", ["payload", JSON.stringify(envelope)]]]]]
+    let delivered = false
+    const xread = vi.fn(async (...args: string[]) => {
+      if (args.at(-1) === "$" && !delivered) {
+        delivered = true
+        return batch
+      }
+      await new Promise(resolve => setTimeout(resolve, 20))
+      return null
+    })
+    const connection: AgentStreamRedis = {
+      xread,
+      disconnect: vi.fn(),
+    }
+    const database = db([])
+    database.agentItem.findMany
+      .mockRejectedValueOnce(new Error("temporary item lookup failure"))
+      .mockResolvedValueOnce([{ id: rawItemId, type: "tool_call" }])
+    const controller = new AbortController()
+    const stream = createV2EventStream(database as never, {
+      sessionId: "session_1", afterSequence: BigInt(0), signal: controller.signal,
+      redisFactory: () => connection, dbPollMs: 1, heartbeatMs: 60_000,
+    })
+    const reader = stream.getReader()
+    try {
+      await waitFor(() => database.agentItem.findMany.mock.calls.length >= 2)
+      const text = new TextDecoder().decode((await reader.read()).value)
+      expect(text).toContain('"streamId":"1-0"')
+      expect(text).not.toContain(rawCallId)
+      expect(text).not.toContain(rawItemId)
+      expect(xread.mock.calls.filter(call => call.at(-1) === "$")).toHaveLength(1)
+    } finally {
+      controller.abort()
+      await reader.cancel()
+    }
   })
 
   it("does not cancel execution when the request stream is aborted", async () => {

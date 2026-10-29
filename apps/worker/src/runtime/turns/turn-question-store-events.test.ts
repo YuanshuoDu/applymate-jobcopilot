@@ -121,7 +121,9 @@ describe("native question events", () => {
       if (sql.includes('FROM "agent_events"') && sql.includes('"idempotencyKey" = $2')) return { rows: [{ id: "foreign", turnId: owner.turnId, itemId: null, taskId: owner.taskId, sequence: "3", type: "step.completed", actor: "orchestrator", correlationId: input.stepId, causationId: "event-prev", idempotencyKey: `turn:${owner.turnId}:event:step-completed:${input.stepId}`, payload: { unrelated: true } }], rowCount: 1 }
       return { rows: [], rowCount: 1 }
     }) }
-    await expect(appendQuestionStartedEvents(client as unknown as TurnQuestionQueryClient, input)).rejects.toThrow(/event turn:/)
+    await expect(appendQuestionStartedEvents(client as unknown as TurnQuestionQueryClient, input)).rejects.toMatchObject({
+      code: "question_conflict", message: "Question persistence conflict: event",
+    })
   })
 
   it.each([
@@ -152,13 +154,13 @@ describe("native question events", () => {
       expect(parseScheduledPipelineCandidatePayload(payload)).not.toBeNull()
       const fixture = scheduledCandidateClient(payload)
       await expect(loadScheduledChoiceBinding(fixture.client as unknown as TurnQuestionQueryClient, { owner }))
-        .rejects.toThrow("scheduled execution binding")
+        .rejects.toMatchObject({ code: "question_conflict", message: "Question persistence conflict: scheduled_execution" })
       expect(fixture.calls.some(sql => sql.includes('FROM "agent_turns" AS turn JOIN "agent_executions" AS execution'))).toBe(true)
     }
     const malformed = scheduledCandidatePayload(SCHEDULED_PIPELINE_CANDIDATE_SCHEMA, { ...sourceReceipt, extra: true })
     const fixture = scheduledCandidateClient(malformed)
     await expect(loadScheduledChoiceBinding(fixture.client as unknown as TurnQuestionQueryClient, { owner }))
-      .rejects.toThrow("scheduled candidate binding")
+      .rejects.toMatchObject({ code: "question_conflict", message: "Question persistence conflict: state" })
     expect(fixture.calls.some(sql => sql.includes('FROM "agent_turns" AS turn JOIN "agent_executions" AS execution'))).toBe(false)
   })
 })

@@ -1,4 +1,5 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest"
+import { publicAgentEventId, publicToolCallId, publicToolItemId } from "@/lib/agent/session/public-tool-identity"
 
 const mocks = vi.hoisted(() => ({ requireAuth: vi.fn(), sessionFindFirst: vi.fn(), itemFindFirst: vi.fn(), itemFindMany: vi.fn(), agendaFindMany: vi.fn() }))
 
@@ -128,6 +129,33 @@ describe("agent timeline query API", () => {
     }))
   })
 
+  it("seals tool-item cursors while keeping public item and call aliases stable across pages", async () => {
+    const rawCallId = "+353851234567"
+    const rawItemId = `turn:turn_1:item:tool-call:${rawCallId}:item-suffix`
+    const toolItem = { ...item(rawItemId, 0), type: "tool_call", content: { toolCallId: rawCallId, toolName: "jobs.search", input: { query: "engineer" } } }
+    const nextItem = item("item_after_tool", 1)
+    mocks.itemFindMany.mockResolvedValueOnce([toolItem, nextItem]).mockResolvedValueOnce([nextItem])
+    const { GET } = await import("./route")
+
+    const first = await GET(request("?limit=1") as never, params)
+    const firstBody = await first.json()
+    expect(firstBody.items[0]).toMatchObject({
+      id: publicToolItemId("session_1", "turn_1", rawItemId),
+      content: { toolCallId: publicToolCallId("session_1", "turn_1", rawCallId), toolName: "jobs.search" },
+    })
+    expect(firstBody.page.hasMore).toBe(true)
+    expect(firstBody.page.nextCursor).toMatch(/^ptc1\./)
+    expect(firstBody.page.nextCursor).not.toContain(rawCallId)
+    expect(firstBody.page.nextCursor).not.toContain(rawItemId)
+
+    const second = await GET(request(`?limit=1&cursor=${encodeURIComponent(firstBody.page.nextCursor)}`) as never, params)
+    const secondBody = await second.json()
+    expect(secondBody.items.map((entry: { id: string }) => entry.id)).toEqual(["item_after_tool"])
+    expect(mocks.itemFindMany.mock.calls[1]?.[0]).toMatchObject({
+      where: { sessionId: "session_1", OR: [{ createdAt: { gt: toolItem.createdAt } }, { createdAt: toolItem.createdAt, id: { gt: rawItemId } }] },
+    })
+  })
+
   it("returns 404 for a cross-tenant session before reading items", async () => {
     mocks.sessionFindFirst.mockResolvedValueOnce(null)
     const { GET } = await import("./route")
@@ -175,6 +203,26 @@ describe("agent timeline query API", () => {
     }))
     expect(mocks.itemFindMany).not.toHaveBeenCalled()
     expect(mocks.agendaFindMany).not.toHaveBeenCalled()
+  })
+
+  it("keeps targeted question hydration IDs stable and aliases only its provider tool call", async () => {
+    const rawCallId = "private.user@example.com"
+    const question = {
+      ...item("agent-wait:question:q1", 1), type: "question",
+      content: { questionId: "q1", toolCallId: rawCallId, stage: "profile", question: "Are you authorised to work?", options: [], answerAvailable: false },
+    }
+    mocks.itemFindFirst.mockResolvedValueOnce(question)
+    const { GET } = await import("./route")
+
+    const response = await GET(request(`?itemId=${encodeURIComponent(question.id)}`) as never, params)
+    const body = await response.json()
+
+    expect(body.items[0]).toMatchObject({
+      id: question.id,
+      content: { questionId: "q1", toolCallId: publicToolCallId("session_1", "turn_1", rawCallId) },
+    })
+    expect(JSON.stringify(body)).not.toContain(rawCallId)
+    expect(mocks.itemFindFirst).toHaveBeenCalledWith(expect.objectContaining({ where: { id: question.id, sessionId: "session_1" } }))
   })
 
   it.each([
@@ -265,12 +313,12 @@ describe("agent timeline query API", () => {
     const response = await GET(request("?limit=1") as never, params)
     const body = await response.json()
 
-    expect(body.agenda).toMatchObject({ id: "agenda_8", sequence: "8", type: "cognitive.agenda", payload: {
+    expect(body.agenda).toMatchObject({ id: publicAgentEventId("session_1", "agenda_8"), sequence: "8", type: "cognitive.agenda", payload: {
       goalRevision: 3, planRevision: 0, signals: { approvals: { count: 1, ids: ["[REDACTED]"] } },
     } })
     expect(body.agenda.payload).not.toHaveProperty("resumeFence")
     expect(JSON.stringify(body.agenda.payload)).not.toContain("input_1")
-    expect(body.agendas.map((entry: { id: string }) => entry.id)).toEqual(["agenda_8"])
+    expect(body.agendas.map((entry: { id: string }) => entry.id)).toEqual([publicAgentEventId("session_1", "agenda_8")])
     expect(mocks.agendaFindMany).toHaveBeenCalledWith({
       where: { sessionId: "session_1", type: "cognitive.agenda" }, orderBy: { sequence: "desc" }, take: 64,
       select: expect.objectContaining({ payload: true, sequence: true }),
@@ -291,7 +339,13 @@ describe("agent timeline query API", () => {
     const response = await GET(request() as never, params)
     const body = await response.json()
 
-    expect(body.approvalEvents.map((event: { id: string }) => event.id)).toEqual(["approval_1", "approval_3"])
+    expect(body.approvalEvents.map((event: { id: string }) => event.id)).toEqual([
+      publicAgentEventId("session_1", "approval_1"), publicAgentEventId("session_1", "approval_3"),
+    ])
+    expect(body.approvalEvents[1].payload).toMatchObject({
+      waitId: "approval-1", itemId: "wait-item-1", turnId: "turn_1", toolCallId: publicToolCallId("session_1", "turn_1", "tool-call-1"),
+    })
+    expect(JSON.stringify(body.approvalEvents)).not.toContain("tool-call-1")
     expect(body.approvalEvents[0].payload).toEqual({ approvalId: "approval-1", action: "submit_application", revision: 2 })
     expect(JSON.stringify(body.approvalEvents)).not.toContain("scopeHash")
     expect(mocks.agendaFindMany).toHaveBeenNthCalledWith(3, {
@@ -314,7 +368,7 @@ describe("agent timeline query API", () => {
     const response = await GET(request() as never, params)
     const body = await response.json()
 
-    expect(body.approvalEvents.map((event: { id: string }) => event.id)).toEqual(["approval_1"])
+    expect(body.approvalEvents.map((event: { id: string }) => event.id)).toEqual([publicAgentEventId("session_1", "approval_1")])
     expect(JSON.stringify(body.approvalEvents)).not.toContain("raw secret")
   })
 
@@ -327,7 +381,9 @@ describe("agent timeline query API", () => {
     const response = await GET(request() as never, params)
     const body = await response.json()
 
-    expect(body.steeringMarkers.map((event: { id: string }) => event.id)).toEqual(["marker_10", "marker_11"])
+    expect(body.steeringMarkers.map((event: { id: string }) => event.id)).toEqual([
+      publicAgentEventId("session_1", "marker_10"), publicAgentEventId("session_1", "marker_11"),
+    ])
     expect(body.steeringMarkers[0].payload.inputId).toBe("input_1")
     expect(mocks.sessionFindFirst).toHaveBeenCalledBefore(mocks.agendaFindMany)
     expect(mocks.agendaFindMany).toHaveBeenNthCalledWith(2, {

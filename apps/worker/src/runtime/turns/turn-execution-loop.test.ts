@@ -35,6 +35,7 @@ import { InMemoryToolLifecycleSink, ToolLifecycle } from "../tools/lifecycle.js"
 import { ToolRouter } from "../tools/router.js"
 import { ToolRegistry } from "../tools/registry.js"
 import { OrphanPauseUsageRecoveredError } from "./turn-question-store-events.js"
+import { questionConflict } from "./turn-question-store-guards.js"
 import { SCHEDULED_PIPELINE_COMPLETION } from "./turn-execution-types.js"
 import { createScheduledPipelineCandidateStore, parseScheduledPipelineCandidatePayload, SCHEDULED_PIPELINE_CANDIDATE_EVENT, SCHEDULED_PIPELINE_CANDIDATE_SCHEMA } from "../subagents/scheduled-pipeline-candidate-store.js"
 import type { SteeringMarkerContext, SteeringMarkerWrite } from "../context/steering-marker-store.js"
@@ -488,6 +489,25 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.events.some(event => event.type === "step.completed" || event.type === "turn.completed")).toBe(false)
     expect(root.finalResponses).toHaveLength(0)
   })
+
+  it.each(["+353 87 123 4567", "alex@example.com", "sk_live_sensitive_token_abc"])(
+    "keeps a root ask_user conflict ID out of terminal output (%s)", async callId => {
+      const root = nativeQuestionFixture({ status: "none" }, callId)
+      root.stageQuestionUsage.mockRejectedValueOnce(questionConflict(`tool call ${callId} lineage`))
+
+      const result = await runTurnExecutionLoop(root.options)
+
+      expect(result).toMatchObject({ status: "failed", errorCode: "question_conflict" })
+      const terminalProjection = JSON.stringify({
+        finalResponses: root.finalResponses,
+        failedEvent: root.events.find(event => event.type === "turn.failed")?.payload,
+        finalItemEvent: root.events.find(event => event.type === "item.completed")?.payload,
+      })
+      expect(terminalProjection).toContain("Question persistence conflict: tool_call")
+      expect(terminalProjection).not.toContain(callId)
+      expect(root.events.find(event => event.type === "turn.failed")?.payload).toMatchObject({ errorCode: "question_conflict" })
+    },
+  )
 
   it("commits a recovered prepared question before another provider call", async () => {
     const root = nativeQuestionFixture({ status: "prepared", stepId: "old-step", toolCallId: "old-call", waitId: "question-old", itemId: "agent-wait:question:question-old" })

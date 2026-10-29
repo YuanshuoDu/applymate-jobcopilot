@@ -4124,6 +4124,269 @@ describe("createCanonicalTurnRuntime", () => {
     expect(requests).toHaveLength(6)
   })
 
+  it("selectively pages only until the unsampled current target is found", async () => {
+    const targetSource = "personio"
+    const scoutKey = "selective-scout"
+    const scoutTaskId = "selective-scout-task"
+    const currentRevision = 7
+    const verification = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout" as const, criteria: [
+        { id: "candidate-floor", check: { kind: "candidate_count_gte" as const, minimum: 1 } },
+      ],
+    }
+    const verificationReport = {
+      verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
+      criteria: [{ criterionId: "candidate-floor", status: "passed", reasonCode: "criteria_met" }],
+      evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64),
+    }
+    const cuid = (value: number) => `c${String(value).padStart(24, "0")}`
+    const candidatesFor = (count: number, personioIndex: number) => Array.from({ length: count }, (_, index) => ({
+      jobId: cuid(index + 1), source: index === personioIndex ? targetSource
+        : (["greenhouse", "lever", "workday", "smartrecruiters"] as const)[index % 4]!,
+    }))
+
+    async function runScenario(candidates: readonly { jobId: string; source: string }[]) {
+      const snapshot = parseTaskGraphSnapshot({
+        schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION,
+        nodes: [{ key: scoutKey, templateId: "scout", goal: "Find the requested source", successCriteria: ["Return a current Scout result"],
+          dependsOn: [], depth: 1, taskId: scoutTaskId, verificationDisposition: "typed", verification }],
+      })
+      if (!snapshot) throw new Error("selective_paging_graph_snapshot_invalid")
+      const structuredResult = {
+        schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+        candidates: candidates.map(({ jobId, source }) => ({
+          jobId, source, url: `https://example.invalid/${jobId}`, evidenceIds: [`evidence:${jobId}`],
+        })),
+        evidence: candidates.map(({ jobId }) => ({ id: `evidence:${jobId}`, kind: "job", ref: jobId, source: "fixture" })),
+        summary: "Current Scout results for selective paging.",
+      }
+      const task: GraphTaskRow = {
+        id: scoutTaskId, role: "scout", taskType: "job_discovery", status: "completed", failureReason: null,
+        expectedOutputSchema: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" },
+        result: {
+          status: "completed", finalItemId: "selective-scout-final", finalText: "Private Scout text", stepCount: 1,
+          toolCallCount: 0, structuredResult, taskGraphVerificationReport: verificationReport,
+        },
+      }
+      const loadedGraph: LoadedGraph = {
+        rootTaskId: "root-1", snapshot,
+        item: { id: "task-graph:root-1", revision: currentRevision, content: snapshot, createdAt: new Date(0) },
+        state: taskGraphState(snapshot, currentRevision, new Map([[scoutTaskId, { status: "completed", failureReason: null }]]), []),
+        tasks: new Map([[scoutTaskId, task]]),
+      }
+      const pageReads: Array<{ scope: TaskGraphReadScope; request: TaskGraphResultPageRequest; page: ReturnType<typeof projectTaskGraphResultPage> }> = []
+      const commandPort: TaskGraphCommandPort = {
+        appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: currentRevision, nodes: [], readyTaskIds: [] })),
+        readCurrent: vi.fn(async () => {
+          const current = currentTaskGraph(loadedGraph)
+          const planningFacts = buildTaskGraphPlanningFacts(loadedGraph)
+          return planningFacts ? { ...current, planningFacts } : current
+        }),
+        readCurrentResultPage: vi.fn(async (scope, request) => {
+          const page = projectTaskGraphResultPage(loadedGraph, request)
+          pageReads.push({ scope, request, page })
+          return page
+        }),
+      }
+      const requests: HarnessModelRequest[] = []
+      const events: RuntimeEvent[] = []
+      let selectedJobId: string | null = null
+      let finalResponse = ""
+      const activityClient = {
+        query: vi.fn(async (sql: string) => {
+          if (sql.includes('SELECT 1 FROM "agent_sessions"')) return { rows: [{ id: lease.sessionId }], rowCount: 1 }
+          if (sql.includes('UPDATE "agent_sessions" SET "eventSequence"')) return { rows: [{ eventSequence: "1" }], rowCount: 1 }
+          return { rows: [], rowCount: 1 }
+        }),
+        release: vi.fn(),
+      }
+      const activityPool = { connect: vi.fn(async () => activityClient), query: vi.fn(async () => ({ rows: [], rowCount: 1 })) }
+      const goal = `Target ATS: ${targetSource}. Find a matching current Scout candidate and stop once found.`
+      const currentPageRequestFields = (request: HarnessModelRequest) => {
+        const listTool = request.tools.map(value => value && typeof value === "object" ? value as Record<string, unknown> : null)
+          .find(value => value?.name === "agent.list")
+        if (!listTool || typeof listTool.description !== "string" || !listTool.description.includes("stop when enough information is available")) {
+          throw new Error("visible_agent_list_guidance_missing")
+        }
+        const schema = listTool.inputSchema && typeof listTool.inputSchema === "object"
+          ? listTool.inputSchema as Record<string, unknown> : null
+        const variants = schema && Array.isArray(schema.anyOf) ? schema.anyOf : schema ? [schema] : []
+        const pageSchema = variants.map(value => value && typeof value === "object" ? value as Record<string, unknown> : null)
+          .find(value => {
+            const properties = value?.properties && typeof value.properties === "object"
+              ? value.properties as Record<string, unknown> : null
+            return properties !== null && ["nodeKey", "expectedRevision", "offset"].every(key => Object.hasOwn(properties, key))
+          })
+        if (!pageSchema || pageSchema.additionalProperties !== false) throw new Error("visible_agent_list_current_page_schema_missing")
+        return { nodeKey: "nodeKey", revision: "expectedRevision", offset: "offset" } as const
+      }
+      const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(activityPool as never), {
+        workerId: lease.ownerId,
+        productionFlags: resolveProductionAgentFlags({
+          ENABLE_AGENT_TASK_GRAPH_PLANNING: "1", ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1",
+        }),
+        taskGraphCommandPort: commandPort,
+        taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
+        selectedJobPreparationLoader: async () => undefined,
+        stateLoader: async () => state({ goal, budgetSnapshot: { limits: { maxSteps: 6 } }, toolPolicySnapshot: {}, snapshot: {
+          ...state().snapshot, goal: { id: "selective-target-goal", content: goal },
+        } }),
+        rootTaskStore: rootStore() as never,
+        nativeVerificationFactory: () => nativeVerificationRuntime(),
+        turnEngineStoreFactory: () => store(events),
+        contextBuilderFactory: () => ({
+          build: async request => {
+            const base = await contextBuilder().build(request)
+            const goalBlock = request.snapshot.goal ? [{
+              id: request.snapshot.goal.id, layer: "goal" as const, role: "data" as const,
+              trust: "user_confirmed" as const, source: "turn_goal", content: request.snapshot.goal.content as never,
+            }] : []
+            return { ...base, blocks: [...goalBlock, ...base.blocks] }
+          },
+        }),
+        modelRuntimeFactory: async () => ({ adapter: {
+          ...model(() => []),
+          async *stream(request: HarnessModelRequest) {
+            requests.push(request)
+            const fields = currentPageRequestFields(request)
+            const promptText = request.messages.flatMap(message => message.content)
+              .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+            const requestedSource = promptText.match(/Target ATS:\s*([a-z]+)/i)?.[1]?.toLowerCase()
+            if (!requestedSource) throw new Error("current_target_source_missing_from_model_request")
+            const graphText = request.messages.flatMap(message => message.content)
+              .find(part => part.type === "text" && part.text.includes('"kind":"task_graph_current"'))
+            if (!graphText || graphText.type !== "text") throw new Error("current_graph_preview_missing_from_model_request")
+            const graph = JSON.parse(graphText.text.slice(graphText.text.indexOf("\n") + 1)) as {
+              kind?: unknown; revision?: unknown; nodes?: Array<Record<string, unknown>>
+            }
+            if (graph.kind !== "task_graph_current" || !Number.isSafeInteger(graph.revision) || !Array.isArray(graph.nodes)) {
+              throw new Error("current_graph_preview_invalid_in_model_request")
+            }
+            const scout = graph.nodes.find(node => node.templateId === "scout")
+            const projection = scout?.resultProjection && typeof scout.resultProjection === "object"
+              ? scout.resultProjection as Record<string, unknown> : null
+            const sample = projection?.candidates
+            const totalCount = projection?.candidateCount
+            if (typeof scout?.key !== "string" || !Array.isArray(sample) || typeof totalCount !== "number" || !Number.isSafeInteger(totalCount)) {
+              throw new Error("current_scout_preview_count_missing")
+            }
+            const calls = request.messages.flatMap(message => message.content)
+              .flatMap(part => part.type === "tool_use" && part.name === "agent.list" ? [part] : [])
+            const lastCall = calls.at(-1)
+            const previousResult = lastCall && request.messages.flatMap(message => message.content)
+              .find(part => part.type === "tool_result" && part.toolUseId === lastCall.id)
+            let pageOffset = 0
+            if (previousResult && previousResult.type === "tool_result") {
+              const page = JSON.parse(previousResult.content) as {
+                availability?: unknown; role?: unknown; nextOffset?: unknown; items?: Array<Record<string, unknown>>
+              }
+              if (page.availability !== "available" || page.role !== "scout" || !Array.isArray(page.items)) {
+                yield { type: "text_delta", text: "The current page was unavailable; refresh the graph before deciding." }
+                yield { type: "completed", finishReason: "stop" }
+                return
+              }
+              const selected = page.items.find(item => item.source === requestedSource)
+              if (selected && typeof selected.jobId === "string") {
+                selectedJobId = selected.jobId
+                finalResponse = `Found a current ${requestedSource} result with job ID ${selectedJobId} in the returned page; stop paging.`
+                yield { type: "text_delta", text: finalResponse }
+                yield { type: "completed", finishReason: "stop" }
+                return
+              }
+              if (typeof page.nextOffset !== "number" || !Number.isSafeInteger(page.nextOffset)) {
+                yield { type: "text_delta", text: `No ${requestedSource} result appeared in the available current page.` }
+                yield { type: "completed", finishReason: "stop" }
+                return
+              }
+              pageOffset = page.nextOffset
+            } else {
+              const sampleHasTarget = sample.some(value => value && typeof value === "object"
+                && (value as Record<string, unknown>).source === requestedSource)
+              if (sampleHasTarget) {
+                const selected = sample.find(value => value && typeof value === "object"
+                  && (value as Record<string, unknown>).source === requestedSource) as Record<string, unknown> | undefined
+                selectedJobId = typeof selected?.jobId === "string" ? selected.jobId : null
+                finalResponse = `The sufficient current sample already contains ${requestedSource}${selectedJobId ? ` with job ID ${selectedJobId}` : ""}; no page is needed.`
+                yield { type: "text_delta", text: finalResponse }
+                yield { type: "completed", finishReason: "stop" }
+                return
+              }
+              if (totalCount <= sample.length) {
+                finalResponse = `The complete visible sample has no ${requestedSource} result.`
+                yield { type: "text_delta", text: finalResponse }
+                yield { type: "completed", finishReason: "stop" }
+                return
+              }
+            }
+            const input: Record<string, unknown> = {}
+            input[fields.nodeKey] = scout.key
+            input[fields.revision] = graph.revision
+            input[fields.offset] = pageOffset
+            yield { type: "tool_call_completed", callId: `selective-page-offset-${pageOffset}`, name: "agent.list", arguments: input }
+            yield { type: "completed", finishReason: "tool_calls" }
+          },
+        }, registry: {} as never, candidates: [] }),
+        authorizeUsage: async () => ({ settle: async () => undefined }),
+      })
+      const execution = await runtime.execute({ lease, signal: new AbortController().signal })
+      return { candidates, commandPort, events, pageReads, requests, selectedJobId, finalResponse, execution }
+    }
+
+    const paged = await runScenario(candidatesFor(7, 3))
+    expect(paged.execution).toMatchObject({ status: "completed" })
+    expect(paged.pageReads.map(read => read.request)).toEqual([
+      { nodeKey: scoutKey, expectedRevision: currentRevision, offset: 0 },
+      { nodeKey: scoutKey, expectedRevision: currentRevision, offset: 3 },
+    ])
+    expect(paged.pageReads.map(read => read.page)).toMatchObject([
+      { availability: "available", graphRevision: currentRevision, totalCount: 7, offset: 0, nextOffset: 3,
+        items: paged.candidates.slice(0, 3).map(({ jobId, source }) => ({ jobId, source })) },
+      { availability: "available", graphRevision: currentRevision, totalCount: 7, offset: 3, nextOffset: 6,
+        items: paged.candidates.slice(3, 6).map(({ jobId, source }) => ({ jobId, source })) },
+    ])
+    expect(paged.pageReads[1]?.page.availability === "available" && paged.pageReads[1].page.role === "scout"
+      ? paged.pageReads[1].page.items.some(item => item.source === targetSource) : false).toBe(true)
+    const visibleTarget = paged.pageReads[1]?.page.availability === "available" && paged.pageReads[1].page.role === "scout"
+      ? paged.pageReads[1].page.items.find(item => item.source === targetSource) : undefined
+    expect(visibleTarget).toBeDefined()
+    expect(paged.selectedJobId).toBe(visibleTarget?.jobId)
+    expect(paged.finalResponse).toContain(`job ID ${visibleTarget?.jobId}`)
+    expect(paged.pageReads).toHaveLength(2)
+    expect(paged.requests).toHaveLength(3)
+    expect(paged.commandPort.appendAndSchedule).not.toHaveBeenCalled()
+    for (const [index, offset] of [0, 3].entries()) {
+      const callId = `selective-page-offset-${offset}`
+      const result = paged.requests[index + 1]?.messages.flatMap(message => message.content)
+        .find(part => part.type === "tool_result" && part.toolUseId === callId)
+      expect(result && result.type === "tool_result" ? JSON.parse(result.content) : null).toEqual(paged.pageReads[index]?.page)
+      const started = paged.events.find(event => event.type === "tool_call.started"
+        && (event.payload as { toolCallId?: string; input?: unknown }).toolCallId === callId
+        && Object.hasOwn(event.payload as object, "input"))
+      expect(started?.payload).toMatchObject({ toolName: "agent.list", status: "started", input: {
+        nodeKey: scoutKey, expectedRevision: currentRevision, offset,
+      } })
+      const completed = paged.events.find(event => event.type === "tool_call.completed"
+        && (event.payload as { toolCallId?: string; output?: unknown }).toolCallId === callId
+        && Object.hasOwn(event.payload as object, "output"))
+      expect(completed?.payload).toMatchObject({ toolName: "agent.list", status: "completed", output: paged.pageReads[index]?.page })
+    }
+
+    const sufficient = await runScenario(candidatesFor(3, 1))
+    expect(sufficient.execution).toMatchObject({ status: "failed", summary: "evidence_missing" })
+    const sufficientTarget = sufficient.candidates.find(candidate => candidate.source === targetSource)
+    expect(sufficientTarget).toBeDefined()
+    expect(sufficient.selectedJobId).toBe(sufficientTarget?.jobId)
+    expect(sufficient.finalResponse).toContain(`job ID ${sufficientTarget?.jobId}`)
+    expect(JSON.stringify(sufficient.requests[0]?.messages)).toContain(sufficientTarget?.jobId)
+    expect(sufficient.pageReads).toEqual([])
+    expect(sufficient.requests.length).toBeGreaterThanOrEqual(1)
+    expect(sufficient.requests.every(request => request.messages.flatMap(message => message.content)
+      .every(part => part.type !== "tool_use" || part.name !== "agent.list"))).toBe(true)
+    expect(sufficient.commandPort.appendAndSchedule).not.toHaveBeenCalled()
+    expect(sufficient.events.some(event => event.type === "tool_call.started"
+      && (event.payload as { toolName?: string }).toolName === "agent.list")).toBe(false)
+  })
+
   it("fails page mode closed without an optional page port while keeping explicit legacy agent.list available", async () => {
     const taskGraphCommandPort: TaskGraphCommandPort = {
       appendAndSchedule: vi.fn(async () => ({ status: "accepted" as const, revision: 1, nodes: [], readyTaskIds: [] })),
