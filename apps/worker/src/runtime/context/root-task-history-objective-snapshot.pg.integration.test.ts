@@ -668,7 +668,12 @@ async function runObjectiveSnapshotWorkerRestart(pool: Pool, corrupt: boolean): 
       const sourceTurnIds = (payload.outcomes as Array<{ sourceTurnId: string }>).map(outcome => outcome.sourceTurnId)
       expect(sourceTurnIds).toEqual([fixture.sourceTurnId])
       workerB.stdin?.write("release-model\n")
-      await waitForTurnStatus(pool, turnId, "completed", 30_000)
+      try { await waitForTurnStatus(pool, turnId, "completed", 30_000) } catch {
+        const markers = workerB.output.filter(line => /^FIXTURE_(WORKER_READY_B|MODEL_STREAM_ENTERED_B|MODEL_CONTEXT_B_OK|CROSS_SESSION_SOURCE_QUERY_COUNT_B)\b/.test(line))
+        const fixtureFailure = workerB.errors.find(line => line.startsWith("OBJECTIVE_SNAPSHOT_RESTART_FIXTURE_FAILED")) ?? "none"
+        const execution = await workerAExecutionDiagnostic(pool, turnId)
+        throw new Error(`Snapshot restart Turn did not reach completed; workerBMarkers=${markers.join(",") || "none"}; fixtureFailure=${fixtureFailure}; execution=${JSON.stringify(execution)}`)
+      }
       await stopFixtureWorker(workerB)
       expect(workerB.exitCode).toBe(0)
     }
