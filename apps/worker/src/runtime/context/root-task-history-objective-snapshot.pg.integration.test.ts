@@ -478,8 +478,15 @@ const DLQ_ERROR_DIAGNOSTIC_CODES = new Set([
   "lease_not_available", "lease_lost", "invalid_payload", "cognitive_agenda_resume_fence_invalid", "turn_execution_error",
 ])
 const WAIT_DIAGNOSTIC_STATES = new Set(["waiting", "ready", "consumed", "cancelled", "failed", "expired"])
+const WAIT_DIAGNOSTIC_KINDS = new Set(["objective_snapshot", "native_verification", "other"])
 const CHILD_DIAGNOSTIC_STATES = new Set(["queued", "retrying", "waiting", "waiting_for_user", "waiting_for_dependency", "running"])
-const CHILD_DIAGNOSTIC_ROLES = new Set(["analyst", "prepare", "reviewer", "scout", "writer", "gate", "audit", "orchestrator"])
+const TASK_DIAGNOSTIC_STATES = new Set([...CHILD_DIAGNOSTIC_STATES, "completed", "failed", "interrupted", "cancelled", "closed"])
+const CHILD_DIAGNOSTIC_ROLES = new Set(["analyst", "auditor", "prepare", "reviewer", "scout", "writer", "gate", "audit", "orchestrator"])
+const TASK_DIAGNOSTIC_TYPES = new Set([
+  "analysis", "application_fill", "application_fill_for_review", "audit", "cover_letter", "cover_letter_draft",
+  "cover_letter_review", "job_analysis", "job_discovery", "native_verification", "ordinary_audit", "research",
+  "root", "root_turn", "scheduled_application_prepare", "scheduled_taskgraph_gate", "selected_job_discovery",
+])
 function safeDiagnosticCode(value: unknown, allowed: ReadonlySet<string>): string | null {
   return typeof value === "string" ? allowed.has(value) ? value : "other" : null
 }
@@ -488,7 +495,12 @@ async function workerAExecutionDiagnostic(pool: Pool, turnId: string) {
   const result = await pool.query<{
     turnStatus: string; rootStatus: string | null; stepStarted: boolean; modelStarted: boolean; modelFailed: boolean
     rootTaskLinked: boolean; rootTaskPresent: boolean
-    waitCount: number; waitStatus: string | null; waitConsumed: boolean; openChildCount: number
+    waitCount: number; openChildCount: number
+    objectiveWaitStatus: string | null; objectiveWaitConsumed: boolean; objectiveWaitTargetCount: number | null
+    objectiveWaitMatchedCount: number | null
+    waitRows: Array<{ kind: string; status: string; consumed: boolean; targetCount: number | null; matchedCount: number | null }>
+    objectiveWaitTargets: Array<{ role: string | null; taskType: string | null; status: string | null }>
+    openChildren: Array<{ role: string | null; taskType: string | null; status: string | null; isObjectiveWaitTarget: boolean }>
     waitingWaitCount: number; readyWaitCount: number; unconsumedWaitCount: number
     openChildStatus: string | null; openChildRole: string | null
     hasTurnFailedEvent: boolean; turnFailureCode: string | null; dlqReasonCode: string | null; dlqErrorCode: string | null
@@ -496,8 +508,36 @@ async function workerAExecutionDiagnostic(pool: Pool, turnId: string) {
     `SELECT turn."status" AS "turnStatus", root."status" AS "rootStatus",
        turn."rootTaskId" IS NOT NULL AS "rootTaskLinked", root."id" IS NOT NULL AS "rootTaskPresent",
        (SELECT COUNT(*)::int FROM "agent_wait_conditions" wait WHERE wait."turnId"=turn."id") AS "waitCount",
-       (SELECT wait."status" FROM "agent_wait_conditions" wait WHERE wait."turnId"=turn."id" LIMIT 1) AS "waitStatus",
-       COALESCE((SELECT wait."consumedAt" IS NOT NULL FROM "agent_wait_conditions" wait WHERE wait."turnId"=turn."id" LIMIT 1),false) AS "waitConsumed",
+       objective_wait."status" AS "objectiveWaitStatus",
+       COALESCE(objective_wait."consumedAt" IS NOT NULL,false) AS "objectiveWaitConsumed",
+       CASE WHEN jsonb_typeof(objective_wait."targetTaskIds")='array' THEN jsonb_array_length(objective_wait."targetTaskIds") ELSE NULL END AS "objectiveWaitTargetCount",
+       CASE WHEN jsonb_typeof(objective_wait."matchedTaskIds")='array' THEN jsonb_array_length(objective_wait."matchedTaskIds") ELSE NULL END AS "objectiveWaitMatchedCount",
+       (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+          'kind', CASE WHEN wait."idempotencyKey"='objective-snapshot-wait:'||turn."id" THEN 'objective_snapshot'
+            WHEN wait."idempotencyKey" LIKE 'native-verification:%' THEN 'native_verification' ELSE 'other' END,
+          'status', CASE WHEN wait."status" IN ('waiting','ready','consumed','cancelled','failed','expired') THEN wait."status" ELSE 'other' END,
+          'consumed', wait."consumedAt" IS NOT NULL,
+          'targetCount', CASE WHEN jsonb_typeof(wait."targetTaskIds")='array' THEN jsonb_array_length(wait."targetTaskIds") ELSE NULL END,
+          'matchedCount', CASE WHEN jsonb_typeof(wait."matchedTaskIds")='array' THEN jsonb_array_length(wait."matchedTaskIds") ELSE NULL END
+        ) ORDER BY wait."createdAt"), '[]'::jsonb)
+        FROM (SELECT * FROM "agent_wait_conditions" WHERE "turnId"=turn."id" ORDER BY "createdAt" LIMIT 8) AS wait) AS "waitRows",
+       (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+          'role', CASE WHEN child."role" IN ('analyst','auditor','prepare','reviewer','scout','writer','gate','audit','orchestrator') THEN child."role" ELSE 'other' END,
+          'taskType', CASE WHEN child."taskType" IN ('analysis','application_fill','application_fill_for_review','audit','cover_letter','cover_letter_draft','cover_letter_review','job_analysis','job_discovery','native_verification','ordinary_audit','research','root','root_turn','scheduled_application_prepare','scheduled_taskgraph_gate','selected_job_discovery') THEN child."taskType" ELSE 'other' END,
+          'status', CASE WHEN child."status" IN ('queued','retrying','waiting','waiting_for_user','waiting_for_dependency','running','completed','failed','interrupted','cancelled','closed') THEN child."status" ELSE 'other' END
+        ) ORDER BY target."taskId"), '[]'::jsonb)
+        FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(objective_wait."targetTaskIds")='array' THEN objective_wait."targetTaskIds" ELSE '[]'::jsonb END) AS target("taskId")
+        LEFT JOIN "sub_agent_tasks" child ON child."id"=target."taskId" AND child."turnId"=turn."id"
+          AND child."sessionId"=turn."sessionId" AND child."rootTaskId"=turn."rootTaskId") AS "objectiveWaitTargets",
+       (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+          'role', CASE WHEN child."role" IN ('analyst','auditor','prepare','reviewer','scout','writer','gate','audit','orchestrator') THEN child."role" ELSE 'other' END,
+          'taskType', CASE WHEN child."taskType" IN ('analysis','application_fill','application_fill_for_review','audit','cover_letter','cover_letter_draft','cover_letter_review','job_analysis','job_discovery','native_verification','ordinary_audit','research','root','root_turn','scheduled_application_prepare','scheduled_taskgraph_gate','selected_job_discovery') THEN child."taskType" ELSE 'other' END,
+          'status', CASE WHEN child."status" IN ('queued','retrying','waiting','waiting_for_user','waiting_for_dependency','running') THEN child."status" ELSE 'other' END,
+          'isObjectiveWaitTarget', EXISTS (SELECT 1 FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(objective_wait."targetTaskIds")='array' THEN objective_wait."targetTaskIds" ELSE '[]'::jsonb END) AS target("taskId") WHERE target."taskId"=child."id")
+        ) ORDER BY child."id"), '[]'::jsonb)
+        FROM "sub_agent_tasks" child WHERE child."turnId"=turn."id" AND child."sessionId"=turn."sessionId"
+          AND child."rootTaskId"=turn."rootTaskId" AND child."id"<>turn."rootTaskId"
+          AND (child."status" IS NULL OR child."status" NOT IN ('completed','failed','interrupted','cancelled','closed'))) AS "openChildren",
        (SELECT COUNT(*)::int FROM "agent_wait_conditions" wait WHERE wait."turnId"=turn."id" AND wait."status"='waiting') AS "waitingWaitCount",
        (SELECT COUNT(*)::int FROM "agent_wait_conditions" wait WHERE wait."turnId"=turn."id" AND wait."status"='ready') AS "readyWaitCount",
        (SELECT COUNT(*)::int FROM "agent_wait_conditions" wait WHERE wait."turnId"=turn."id" AND wait."consumedAt" IS NULL) AS "unconsumedWaitCount",
@@ -518,14 +558,34 @@ async function workerAExecutionDiagnostic(pool: Pool, turnId: string) {
          AND "payload"->>'turnId'=$1 LIMIT 1) AS "dlqErrorCode"
      FROM "agent_turns" turn LEFT JOIN "sub_agent_tasks" root ON root."id"=turn."rootTaskId"
        AND root."sessionId"=turn."sessionId" AND root."turnId"=turn."id"
+       LEFT JOIN "agent_wait_conditions" objective_wait ON objective_wait."turnId"=turn."id"
+         AND objective_wait."idempotencyKey"='objective-snapshot-wait:'||turn."id"
      WHERE turn."id"=$1`, [turnId])
   const row = result.rows[0]
   if (!row) return null
   return {
     ...row,
-    waitStatus: typeof row.waitStatus === "string" ? WAIT_DIAGNOSTIC_STATES.has(row.waitStatus) ? row.waitStatus : "other" : null,
+    objectiveWaitStatus: typeof row.objectiveWaitStatus === "string" ? WAIT_DIAGNOSTIC_STATES.has(row.objectiveWaitStatus) ? row.objectiveWaitStatus : "other" : null,
     openChildStatus: typeof row.openChildStatus === "string" ? CHILD_DIAGNOSTIC_STATES.has(row.openChildStatus) ? row.openChildStatus : "other" : null,
     openChildRole: typeof row.openChildRole === "string" ? CHILD_DIAGNOSTIC_ROLES.has(row.openChildRole) ? row.openChildRole : "other" : null,
+    objectiveWaitTargets: row.objectiveWaitTargets.map(target => ({
+      role: safeDiagnosticCode(target.role, CHILD_DIAGNOSTIC_ROLES),
+      taskType: safeDiagnosticCode(target.taskType, TASK_DIAGNOSTIC_TYPES),
+      status: safeDiagnosticCode(target.status, TASK_DIAGNOSTIC_STATES),
+    })),
+    openChildren: row.openChildren.map(child => ({
+      role: safeDiagnosticCode(child.role, CHILD_DIAGNOSTIC_ROLES),
+      taskType: safeDiagnosticCode(child.taskType, TASK_DIAGNOSTIC_TYPES),
+      status: safeDiagnosticCode(child.status, CHILD_DIAGNOSTIC_STATES),
+      isObjectiveWaitTarget: child.isObjectiveWaitTarget,
+    })),
+    waitRows: row.waitRows.map(wait => ({
+      kind: safeDiagnosticCode(wait.kind, WAIT_DIAGNOSTIC_KINDS) ?? "other",
+      status: safeDiagnosticCode(wait.status, WAIT_DIAGNOSTIC_STATES) ?? "other",
+      consumed: wait.consumed,
+      targetCount: wait.targetCount,
+      matchedCount: wait.matchedCount,
+    })),
     turnFailureCode: safeDiagnosticCode(row.turnFailureCode, TURN_FAILURE_DIAGNOSTIC_CODES),
     dlqReasonCode: safeDiagnosticCode(row.dlqReasonCode, DLQ_DIAGNOSTIC_CODES),
     dlqErrorCode: safeDiagnosticCode(row.dlqErrorCode, DLQ_ERROR_DIAGNOSTIC_CODES),
@@ -692,7 +752,7 @@ async function runObjectiveSnapshotWorkerRestart(pool: Pool, corrupt: boolean): 
       workerB.stdin?.write("release-model\n")
       try { await waitForTurnStatus(pool, turnId, "completed", 30_000) } catch {
         const childMarkers = workerA!.output.filter(line => line === "FIXTURE_PARENT_SUSPENDED" || line === "FIXTURE_CHILD_EXECUTOR_RETURNING_COMPLETED")
-        const markers = workerB.output.filter(line => /^FIXTURE_(WORKER_READY_B|MODEL_STREAM_ENTERED_B|MODEL_CONTEXT_B_OK|CROSS_SESSION_SOURCE_QUERY_COUNT_B|MODEL_RELEASE_RECEIVED_B|MODEL_FINAL_TEXT_EMITTED_B|MODEL_COMPLETION_EVENT_B)\b/.test(line))
+        const markers = workerB.output.filter(line => /^FIXTURE_(WORKER_READY_B|MODEL_STREAM_ENTERED_B|MODEL_CONTEXT_B_OK|CROSS_SESSION_SOURCE_QUERY_COUNT_B|MODEL_RELEASE_RECEIVED_B|MODEL_FINAL_TEXT_EMITTED_B|MODEL_COMPLETION_EVENT_B|NATIVE_VERIFIER_STARTED|NATIVE_VERIFIER_RETURNED)\b/.test(line))
         const fixtureFailure = workerB.errors.find(line => line.startsWith("OBJECTIVE_SNAPSHOT_RESTART_FIXTURE_FAILED")) ?? "none"
         const execution = await workerAExecutionDiagnostic(pool, turnId)
         throw new Error(`Snapshot restart Turn did not reach completed; childMarkers=${childMarkers.join(",") || "none"}; workerBMarkers=${markers.join(",") || "none"}; fixtureFailure=${fixtureFailure}; execution=${JSON.stringify(execution)}`)

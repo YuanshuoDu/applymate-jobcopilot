@@ -2,6 +2,9 @@ import { Pool } from "pg"
 import { createCanonicalTurnRuntime } from "../canonical-turn-runtime.ts"
 import { createPgTaskGraphCommandPort } from "../subagents/pg-task-graph-command-port.ts"
 import { taskGraphRuntimeOptions } from "../subagents/task-graph-templates.ts"
+import { createProductionChildExecutor } from "../subagents/production-child-runtime.ts"
+import { NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA, parseNativeVerificationControl } from "../subagents/native-verification-contract.ts"
+import { parseNativeVerificationPacket } from "../subagents/native-verification-packet.ts"
 import { startProductionAgentRuntime as startProductionAgentRuntimeHelper } from "../../queue/production-bootstrap.ts"
 import { startProductionWorkerRuntime } from "../../queue/production-worker-runtime.ts"
 const [, , mode, rawInput] = process.argv
@@ -69,6 +72,35 @@ function modelProfile() {
     supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: null, costClass: "low",
   }
 }
+const nativeVerifierExecutor = createProductionChildExecutor({
+  pool,
+  authorizeUsage: async () => ({ settle: async () => undefined }),
+  modelRuntimeFactory: async ({ task }) => {
+    const control = parseNativeVerificationControl(task.expectedOutputSchema)
+    const packet = control ? parseNativeVerificationPacket(task.context, control) : null
+    if (task.role !== "auditor" || task.taskType !== "native_verification" || !control || !packet) {
+      throw new Error("objective_snapshot_native_verifier_packet_invalid")
+    }
+    const report = {
+      schemaVersion: NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA,
+      criteria: packet.criteria.map(item => ({
+        criterionId: item.criterionId,
+        disposition: "passed",
+        reasonCode: "meets_criterion",
+        evidenceReferenceIds: item.requirement.includes("self-attestation")
+          ? packet.evidence.filter(evidence => evidence.kind === "user_self_attestation").map(evidence => evidence.referenceId)
+          : [packet.target.referenceId, ...packet.evidence.filter(evidence => evidence.kind === "tool_result").map(evidence => evidence.referenceId)],
+      })),
+    }
+    return {
+      id: "objective-snapshot-fixture-native-verifier", profile: modelProfile(),
+      async *stream() {
+        yield { type: "text_delta", text: JSON.stringify(report) }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+  },
+})
 function historyProjection(request) {
   const matches = []
   for (const message of request.messages ?? []) {
@@ -134,7 +166,14 @@ async function waitForRestartReady(turnId) {
 }
 async function startRuntime(firstWorker) {
   const workerId = `objective-snapshot-${firstWorker ? "worker-a" : "worker-b"}-${process.pid}`
-  const childExecutor = async ({ lease }) => {
+  const childExecutor = async input => {
+    const { lease } = input
+    if (lease.role === "auditor" && lease.taskType === "native_verification") {
+      say("FIXTURE_NATIVE_VERIFIER_STARTED")
+      const outcome = await nativeVerifierExecutor(input)
+      say("FIXTURE_NATIVE_VERIFIER_RETURNED")
+      return outcome
+    }
     say("FIXTURE_CHILD_EXECUTOR_STARTED")
     await waitForHistorySuspension(lease.turnId)
     say("FIXTURE_PARENT_SUSPENDED")
