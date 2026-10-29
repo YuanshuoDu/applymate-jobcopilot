@@ -585,7 +585,7 @@ async function runObjectiveSnapshotWorkerRestart(pool: Pool, corrupt: boolean): 
     expect((initialPayload.outcomes as Array<{ sourceTurnId: string }>).map(outcome => outcome.sourceTurnId))
       .toEqual([fixture.sourceTurnId])
     const eligibleHistory = await loadAuthorizedCurrentHistory(pool, fixture, turnId)
-    expect(eligibleHistory.ownerId).toBe(`objective-snapshot-worker-a-${workerAPid}`)
+    expect(eligibleHistory.ownerId).toBe(`web:${turnId}`)
     expect(eligibleHistory).toMatchObject({ consentEnabled: true, gateEnabledAtCapture: true, historyReadAllowed: true })
     expect(eligibleHistory.sourceTurnIds).toEqual([fixture.sourceTurnId])
     const archived = await pool.query(`UPDATE "agent_sessions" SET "status"='archived'
@@ -593,7 +593,7 @@ async function runObjectiveSnapshotWorkerRestart(pool: Pool, corrupt: boolean): 
     expect(archived.rowCount).toBe(1)
     sourceSessionArchived = true
     const excludedHistory = await loadAuthorizedCurrentHistory(pool, fixture, turnId)
-    expect(excludedHistory.ownerId).toBe(`objective-snapshot-worker-a-${workerAPid}`)
+    expect(excludedHistory.ownerId).toBe(`web:${turnId}`)
     expect(excludedHistory).toMatchObject({ consentEnabled: true, gateEnabledAtCapture: true, historyReadAllowed: true })
     expect(excludedHistory.sourceTurnIds).toEqual([])
     expect((await pool.query<{ enabled: boolean }>(`SELECT "agentTaskHistoryMemoryEnabled" AS "enabled" FROM "User" WHERE "id"=$1`,
