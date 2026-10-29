@@ -465,16 +465,50 @@ async function waitForTurnStatus(pool: Pool, turnId: string, expected: "complete
   throw new Error(`Snapshot restart Turn did not reach ${expected}`)
 }
 
+const TURN_FAILURE_DIAGNOSTIC_CODES = new Set([
+  "final_unverified", "step_limit", "model_incomplete", "persistence_conflict", "invalid_output",
+  "budget_exhausted", "no_progress", "evidence_missing", "evidence_conflict", "business_precondition_failed",
+  "discovery_memory_overflow",
+])
+const DLQ_DIAGNOSTIC_CODES = new Set([
+  "schema_invalid_payload", "max_retries_exhausted", "execution_failed", "lease_lost",
+  "cognitive_agenda_resume_fence_invalid",
+])
+const DLQ_ERROR_DIAGNOSTIC_CODES = new Set([
+  "lease_not_available", "lease_lost", "invalid_payload", "cognitive_agenda_resume_fence_invalid", "turn_execution_error",
+])
+function safeDiagnosticCode(value: unknown, allowed: ReadonlySet<string>): string | null {
+  return typeof value === "string" ? allowed.has(value) ? value : "other" : null
+}
+
 async function workerAExecutionDiagnostic(pool: Pool, turnId: string) {
-  const result = await pool.query<{ turnStatus: string; rootStatus: string | null; stepStarted: boolean; modelStarted: boolean; modelFailed: boolean }>(
+  const result = await pool.query<{
+    turnStatus: string; rootStatus: string | null; stepStarted: boolean; modelStarted: boolean; modelFailed: boolean
+    rootTaskLinked: boolean; rootTaskPresent: boolean
+    hasTurnFailedEvent: boolean; turnFailureCode: string | null; dlqReasonCode: string | null; dlqErrorCode: string | null
+  }>(
     `SELECT turn."status" AS "turnStatus", root."status" AS "rootStatus",
+       turn."rootTaskId" IS NOT NULL AS "rootTaskLinked", root."id" IS NOT NULL AS "rootTaskPresent",
        EXISTS(SELECT 1 FROM "agent_events" WHERE "turnId"=$1 AND "type"='step.started') AS "stepStarted",
        EXISTS(SELECT 1 FROM "agent_events" WHERE "turnId"=$1 AND "type"='model.started') AS "modelStarted",
-       EXISTS(SELECT 1 FROM "agent_events" WHERE "turnId"=$1 AND "type"='model.failed') AS "modelFailed"
+       EXISTS(SELECT 1 FROM "agent_events" WHERE "turnId"=$1 AND "type"='model.failed') AS "modelFailed",
+       EXISTS(SELECT 1 FROM "agent_events" WHERE "turnId"=$1 AND "type"='turn.failed') AS "hasTurnFailedEvent",
+       (SELECT "payload"->>'errorCode' FROM "agent_events" WHERE "turnId"=$1 AND "type"='turn.failed' ORDER BY "sequence" DESC LIMIT 1) AS "turnFailureCode",
+       (SELECT "payload"->>'reason_code' FROM "agent_outbox" WHERE "topic"='agent.turn.dlq' AND "aggregateId"=$1
+         AND "payload"->>'turnId'=$1 LIMIT 1) AS "dlqReasonCode",
+       (SELECT "payload"->>'error_code' FROM "agent_outbox" WHERE "topic"='agent.turn.dlq' AND "aggregateId"=$1
+         AND "payload"->>'turnId'=$1 LIMIT 1) AS "dlqErrorCode"
      FROM "agent_turns" turn LEFT JOIN "sub_agent_tasks" root ON root."id"=turn."rootTaskId"
        AND root."sessionId"=turn."sessionId" AND root."turnId"=turn."id"
      WHERE turn."id"=$1`, [turnId])
-  return result.rows[0] ?? null
+  const row = result.rows[0]
+  if (!row) return null
+  return {
+    ...row,
+    turnFailureCode: safeDiagnosticCode(row.turnFailureCode, TURN_FAILURE_DIAGNOSTIC_CODES),
+    dlqReasonCode: safeDiagnosticCode(row.dlqReasonCode, DLQ_DIAGNOSTIC_CODES),
+    dlqErrorCode: safeDiagnosticCode(row.dlqErrorCode, DLQ_ERROR_DIAGNOSTIC_CODES),
+  }
 }
 
 async function loadAuthorizedCurrentHistory(pool: Pool, fixture: Scenario, turnId: string) {
@@ -541,7 +575,9 @@ async function runObjectiveSnapshotWorkerRestart(pool: Pool, corrupt: boolean): 
       const markers = ["FIXTURE_MODEL_STREAM_ENTERED_A", "FIXTURE_MODEL_CONTEXT_A_INVALID", "FIXTURE_MODEL_CONTEXT_A_OK"]
         .filter(marker => workerA!.output.includes(marker))
       const execution = await workerAExecutionDiagnostic(pool, turnId)
-      throw new Error(`Snapshot restart Worker A did not reach its model context; markers=${markers.join(",") || "none"}; execution=${JSON.stringify(execution)}`)
+      const fixtureFailure = ["OBJECTIVE_SNAPSHOT_RESTART_FIXTURE_FAILED_RESTART_BOUNDARY_MISSING", "OBJECTIVE_SNAPSHOT_RESTART_FIXTURE_FAILED_UNCLASSIFIED"]
+        .find(marker => workerA!.errors.includes(marker)) ?? "none"
+      throw new Error(`Snapshot restart Worker A did not reach its model context; markers=${markers.join(",") || "none"}; fixtureFailure=${fixtureFailure}; execution=${JSON.stringify(execution)}`)
     }
     const initialSnapshot = await readSnapshotEnvelope(pool, fixture.sessionId)
     expect(initialSnapshot).toHaveLength(1)
