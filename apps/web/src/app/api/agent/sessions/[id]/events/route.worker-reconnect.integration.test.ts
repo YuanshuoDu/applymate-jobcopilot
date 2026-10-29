@@ -7,6 +7,7 @@ import { NextRequest } from "next/server"
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 
 import { EXTENSION_TOKEN_AUDIENCE, EXTENSION_TOKEN_ISSUER, getAuthJwtSecret } from "@/lib/auth-secret"
+import { publicIdempotencyKey } from "@/lib/agent/session/public-tool-identity"
 
 // This suite exercises the real bearer-token auth path. Avoid initializing
 // NextAuth's framework-only cookie/session integration in Vitest's Node runtime.
@@ -413,13 +414,19 @@ describeWithServices("agent events route replays a disconnected Worker event", (
     expect(durableSequences.map(String)).toEqual(expectedSequences.map(String))
     expect(duplicateCount).toBe(0)
     expect(missedDurableEvents).toBe(0)
-    const targetFrames = replayedFrames.filter(frame => frame.data.idempotencyKey === targetEventKey(turnId))
+    const targetSequence = (cursor + BigInt(1)).toString()
+    const targetFrames = replayedFrames.filter(frame => frame.event === "turn.started" && frame.id === targetSequence)
+    const targetFrame = targetFrames[0]
+    const targetPublicKey = publicIdempotencyKey(sessionId, targetEventKey(turnId))
     expect(targetFrames).toHaveLength(1)
-    expect(targetFrames[0]).toMatchObject({
+    expect(targetPublicKey).toMatch(/^ik_[a-f0-9]{64}$/)
+    expect(targetPublicKey).not.toBe(publicIdempotencyKey(`another:${sessionId}`, targetEventKey(turnId)))
+    expect(targetFrame).toMatchObject({
       event: "turn.started",
-      id: (cursor + BigInt(1)).toString(),
-      data: { type: "turn.started", sessionId, turnId },
+      id: targetSequence,
+      data: { type: "turn.started", sessionId, turnId, idempotencyKey: targetPublicKey },
     })
+    expect(JSON.stringify(targetFrame)).not.toContain(targetEventKey(turnId))
 
     const unauthenticated = await GET(eventRequest(sessionId, cursor.toString()), {
       params: Promise.resolve({ id: sessionId }),
@@ -437,14 +444,14 @@ describeWithServices("agent events route replays a disconnected Worker event", (
       runSha: process.env.GITHUB_SHA ?? "local",
       cursorBefore: cursor.toString(),
       firstWorkerSequence: (cursor + BigInt(1)).toString(),
-      eventType: targetFrames[0].event,
+      eventType: targetFrame!.event,
       workerEventReplayCount: targetFrames.length,
       durableFrameCount: durableFrames.length,
       uniqueDurableSequenceCount: observedSequenceSet.size,
       duplicateCount,
       missedDurableEvents,
-      sessionLineageMatched: targetFrames[0].data.sessionId === sessionId,
-      turnLineageMatched: targetFrames[0].data.turnId === turnId,
+      sessionLineageMatched: targetFrame!.data.sessionId === sessionId,
+      turnLineageMatched: targetFrame!.data.turnId === turnId,
       unauthenticatedStatus: unauthenticated.status,
       crossOwnerStatus: crossOwner.status,
       disconnectedBeforeWorkerCommit: true,
