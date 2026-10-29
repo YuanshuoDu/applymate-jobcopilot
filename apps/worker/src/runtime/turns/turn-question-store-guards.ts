@@ -20,7 +20,7 @@ export type TurnQuestionStepRow = {
 export type CompletedQuestionResult = { readonly callItemId: string; readonly resultItemId: string; readonly intent: TurnQuestionIntentEnvelope }
 type Row = Record<string, unknown>
 export function questionConflict(resource: string): TurnQuestionStoreError {
-  const category = ["tool call ", "ask_user ", "pause evidence ", "prepared step ", "step ", "prepared Turn ", "Turn ", "model usage event ", "question item ", "question wait ", "answered question ", "question recovery ", "event sequence ", "event ", "outbox ", "orphan model ", "orphan ", "multiple ", "scheduled Gate ", "private planning clarification ", "planning clarification ", "scheduled choice "]
+  const category = ["tool call ", "ask_user ", "pause evidence ", "prepared step ", "step ", "prepared Turn ", "Turn ", "model usage event ", "question item ", "question wait ", "answered question ", "question recovery ", "event sequence ", "event ", "outbox ", "orphan model ", "orphan ", "multiple ", "scheduled Gate ", "scheduled execution ", "private planning clarification ", "planning clarification ", "scheduled choice "]
     .find(prefix => resource.startsWith(prefix))?.trim().replace(/ /g, "_") ?? "state"
   return new TurnQuestionStoreError("question_conflict", `Question persistence conflict: ${category}`)
 }

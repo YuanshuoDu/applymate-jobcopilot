@@ -38,6 +38,14 @@ describe("native question persistence guards", () => {
     expect(error.message).not.toContain("secret arbitrary input")
   })
 
+  it("keeps scheduled execution conflicts in a fixed category without echoing phone-shaped identifiers", () => {
+    const identifier = "+353 87 123 4567"
+    const error = questionConflict(`scheduled execution binding ${identifier}`)
+    expect(error.code).toBe("question_conflict")
+    expect(error.message).toBe("Question persistence conflict: scheduled_execution")
+    expect(error.message).not.toContain(identifier)
+  })
+
   it("derives historical question identity and reads a strict receipt without a live lease", async () => {
     const readIdentity: TurnQuestionReadIdentity = { sessionId: owner.sessionId, turnId: owner.turnId, taskId: owner.taskId }
     const callIntent = { question: "Where should the search focus?", choices: [{ label: "Dublin", value: "dublin" }] }
