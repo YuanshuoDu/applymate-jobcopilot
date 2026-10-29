@@ -11,7 +11,7 @@ import { registerDurableSubagentWait } from "./durable-subagent-wait-store.ts"
 import { startDurableWaitResolver } from "./durable-wait-resolver.ts"
 import { loadDurableSubagentWaitResume, commitDurableSubagentWaitResume } from "./durable-subagent-wait-resume.ts"
 import { loadChildAttemptResume } from "./child-resume.ts"
-import { acknowledgeDurableWaitAtContinuationStart } from "./child-executor-admission.ts"
+import { acknowledgeDurableWaitAtContinuationStart, childResultStatus } from "./child-executor-admission.ts"
 import { createChildDurableWaitReplay } from "./child-durable-wait-replay.ts"
 import { TurnExecutionEventWriter, executeToolWithItems } from "../turns/turn-execution-events.ts"
 import { recoverPersistedToolCalls } from "../turns/turn-execution-tools.ts"
@@ -26,6 +26,10 @@ const [, , mode, queueName, rawIds] = process.argv
 const ids = JSON.parse(rawIds)
 const phoneShapedToolCallId = "child-wait-call:415-555-0134"
 const highPrecisionWaitModelCostUsd = 0.123456789
+const loopFixtureModelProfile = Object.freeze({ provider: "fixture", model: "durable-child-wait-fixture", nativeTools: true,
+  structuredOutput: true, streaming: true, continuationCursor: false, supportsParallelTools: true, supportsStreamingToolArgs: true,
+  supportsReasoningSummary: true, supportsResponseContinuation: false, supportsProviderConversation: false,
+  supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: null, costClass: "low" })
 const readyMarkerByMode = {
   "worker-a": "WORKER_A_READY",
   "worker-a-crash": "WORKER_A_READY",
@@ -179,10 +183,7 @@ function loopFixtureModel(reply) {
   const invocations = []
   const model = {
     id: "durable-child-wait-fixture-model",
-    profile: { provider: "fixture", model: "durable-child-wait-fixture", nativeTools: true, structuredOutput: true,
-      streaming: true, continuationCursor: false, supportsParallelTools: true, supportsStreamingToolArgs: true,
-      supportsReasoningSummary: true, supportsResponseContinuation: false, supportsProviderConversation: false,
-      supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: null, costClass: "low" },
+    profile: loopFixtureModelProfile,
     async *stream(request) {
       const stepId = request.metadata?.stepId
       if (typeof stepId !== "string" || !stepId) throw new Error("fixture_model_step_id_missing")
@@ -447,15 +448,27 @@ async function claimExactWaitReissue(lease, owner, wait, continuation, now, opti
       }
       throw new Error("fixture_orphan_step_model_reinvoked")
     }
+    let preclaimStartObserved = false
+    let preclaimClaimStartMatched = false
     const hooks = optionsForCut.loopPhase === "preclaim" || optionsForCut.loopPhase === "multi-preclaim"
       ? { beforeAppendEvent: async event => {
           const expectedKey = `task:${lease.id}:event:${childWaitClaimEventKey(lease.attemptCount, continuation.id)}`
-          if (event.type === "tool_call.started" && event.itemId === `task:${lease.id}:item:tool-call:${call.id}:attempt:${lease.attemptCount}`
-            && event.idempotencyKey === expectedKey) {
-            say(`WORKER_B_LOOP_PRE_CLAIM_ORPHAN ${JSON.stringify({ phase: optionsForCut.loopPhase, callId: call.id,
-              stepId: continuation.id, waitId: restoredWait.waitId, exactInput: true, modelCalls: 1,
-              executorCalls: 0, dispatcherCalls: 0 })}`)
-            await new Promise(() => {})
+          if (event.type === "tool_call.started") {
+            preclaimStartObserved = true
+            const itemMatches = event.itemId === `task:${lease.id}:item:tool-call:${call.id}:attempt:${lease.attemptCount}`
+            const keyMatches = event.idempotencyKey === expectedKey
+            const correlationMatches = event.correlationId === call.id
+            if (!itemMatches || !keyMatches || !correlationMatches) {
+              say(`WORKER_B_LOOP_PRE_CLAIM_START_MISMATCH ${JSON.stringify({ phase: optionsForCut.loopPhase,
+                itemMatches, keyMatches, correlationMatches })}`)
+            }
+            if (itemMatches && keyMatches && correlationMatches) {
+              preclaimClaimStartMatched = true
+              say(`WORKER_B_LOOP_PRE_CLAIM_ORPHAN ${JSON.stringify({ phase: optionsForCut.loopPhase, callId: call.id,
+                stepId: continuation.id, waitId: restoredWait.waitId, exactInput: true, modelCalls: 1,
+                executorCalls: 0, dispatcherCalls: 0 })}`)
+              await new Promise(() => {})
+            }
           }
         } }
       : { beforeUpdateItem: async input => {
@@ -479,7 +492,19 @@ async function claimExactWaitReissue(lease, owner, wait, continuation, now, opti
             claimCount: state.rows[0].claimCount, resultCount: state.rows[0].resultCount })}`)
           await new Promise(() => {})
         } }
-    return runChildWaitLoop(lease, restored, modelResponse, hooks)
+    const loop = await runChildWaitLoop(lease, restored, modelResponse, hooks)
+    if ((optionsForCut.loopPhase === "preclaim" || optionsForCut.loopPhase === "multi-preclaim") && !preclaimClaimStartMatched) {
+      say(`WORKER_B_LOOP_PRE_CLAIM_BARRIER_MISSED ${JSON.stringify({ phase: optionsForCut.loopPhase, callId: call.id,
+        stepId: continuation.id, loopStatus: loop.result.status, loopErrorCode: loop.result.errorCode ?? null,
+        modelCalls: loop.invocations.length, toolCallStartObserved: preclaimStartObserved,
+        executorCalls: loop.executorCalls, dispatcherCalls: loop.dispatcherCalls })}`)
+      throw new Error("fixture_child_wait_preclaim_barrier_not_reached")
+    }
+    const status = childResultStatus(loop.result.status)
+    const result = loop.result.finalText !== undefined ? { finalText: loop.result.finalText }
+      : loop.result.waitId ? { waitId: loop.result.waitId } : undefined
+    return { status, ...(result ? { result } : {}), ...(loop.result.errorCode ? { failureReason: loop.result.errorCode } : {}),
+      ...(status === "failed" ? { retryDisposition: "terminal" } : {}) }
   }
   const replay = createChildDurableWaitReplay(lease, restoredWait, restored.observations)
   replay.acknowledgeContinuation({ id: continuation.id, ordinal: continuation.ordinal })
@@ -596,24 +621,26 @@ async function waitForChild(lease, crashAfterRegistration = false) {
   if (redactSensitiveText(toolCallId) === toolCallId) throw new Error("fixture_tool_call_id_is_not_phone_shaped")
   const input = { taskIds: [ids.targetTaskId], mode: "any", timeoutMs: 30_000, idempotencyKey: `child-wait:${lease.id}:attempt:${lease.attemptCount}` }
   const now = new Date()
-  await turnStore.startStep({ owner, stepId, ordinal: 0, attempt: lease.attemptCount, inputThroughSequence: 0n,
+  const step = await turnStore.startStep({ owner, stepId, ordinal: 0, attempt: lease.attemptCount, inputThroughSequence: 0n,
     consumedInputIds: [], modelProfileSnapshot: {}, now })
-  const callItemId = `child-wait-call-item:${lease.id}`
-  await turnStore.createItem({ owner, itemId: callItemId, stepId, type: "tool_call", status: "started", phase: null,
-    content: { toolCallId, toolName: "wait_subagents", toolVersion: "1", input }, now })
-  await turnStore.appendEvent({ owner, id: `task:${lease.id}:event:tool-started:${toolCallId}`, itemId: callItemId, type: "tool_call.started",
-    correlationId: toolCallId, causationId: null, idempotencyKey: `task:${lease.id}:event:tool-started:${toolCallId}`,
-    payload: { toolCallId, toolName: "wait_subagents", taskId: lease.id } })
-  const wait = await registerDurableSubagentWait(pool, { lease, stepId, targetTaskIds: input.taskIds, mode: input.mode,
-    timeoutMs: input.timeoutMs, idempotencyKey: input.idempotencyKey, now })
-  if (crashAfterRegistration) {
-    say(`WORKER_A_REGISTERED ${JSON.stringify({ waitId: wait.waitId, stepId })}`)
-    return new Promise(() => {})
+  let wait
+  const options = turnExecutionOptions(lease, owner, async ({ call }) => {
+    wait = await registerDurableSubagentWait(pool, { lease, stepId, targetTaskIds: call.input.taskIds, mode: call.input.mode,
+      timeoutMs: call.input.timeoutMs, idempotencyKey: call.input.idempotencyKey, now })
+    if (crashAfterRegistration) {
+      say(`WORKER_A_REGISTERED ${JSON.stringify({ waitId: wait.waitId, stepId, callStatus: "started", receiptPersisted: false })}`)
+      return new Promise(() => {})
+    }
+    return { id: toolCallId, toolName: "wait_subagents", toolVersion: "1", status: "completed", output: wait, errorCode: null }
+  })
+  const writer = new TurnExecutionEventWriter(options)
+  const sourceCall = { id: toolCallId, name: "wait_subagents", arguments: input }
+  const callResult = await executeToolWithItems(options, writer, step, sourceCall, () => new Date())
+  if (!wait || callResult.status !== "completed" || canonicalJson(callResult.output) !== canonicalJson(wait)) {
+    throw new Error("fixture_source_wait_call_receipt_invalid")
   }
-  await turnStore.createItem({ owner, itemId: `child-wait-result-item:${lease.id}`, stepId, type: "tool_result", status: "completed", phase: null,
-    content: { toolCallId, output: wait, errorCode: null }, now })
   await turnStore.updateStep({ owner, stepId, status: "waiting_for_tool", finishReason: "tool_calls", errorCode: null,
-    inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, now })
+    inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, now: new Date() })
   return { status: "waiting", result: { waitId: wait.waitId } }
 }
 
@@ -641,7 +668,7 @@ async function resumeChild(lease, crashBeforeWaitAck = false, crashAfterWaitAck 
   const nextOrdinal = wait.ordinal + 1
   const continuation = await turnStore.startStep({ owner, stepId, ordinal: nextOrdinal, attempt: lease.attemptCount,
     inputThroughSequence: restored.resume.inputThroughSequence, consumedInputIds: restored.resume.consumedInputIds,
-    modelProfileSnapshot: {}, now })
+    modelProfileSnapshot: crashAfterWaitAck || reissueOrphan ? loopFixtureModelProfile : {}, now })
   if (continuation.id !== stepId || continuation.ordinal <= wait.ordinal) throw new Error("durable_child_wait_continuation_identity_invalid")
   if (!pendingWait) say(`WORKER_B_CONSUMED_WAIT_STEP_REUSED ${JSON.stringify({ waitId: wait.waitId, sourceStepId: wait.stepId,
     attempt: wait.attempt, sourceOrdinal: wait.ordinal, stepId: continuation.id, ordinal: continuation.ordinal })}`)
