@@ -46,14 +46,14 @@ function withTimeout<T>(promise: Promise<T>, message: string): Promise<T> {
   ]).finally(() => { if (timeout) clearTimeout(timeout) })
 }
 
-function observeQueries(pool: PgPool, afterQuery: (sql: string, values?: readonly unknown[]) => Promise<void>): Pick<PgPool, "connect"> {
+function observeQueries(pool: PgPool, afterQuery: (sql: string, values?: readonly unknown[], rows?: readonly unknown[]) => Promise<void>): Pick<PgPool, "connect"> {
   return {
     connect: async () => {
       const client = await pool.connect()
       const originalQuery = client.query.bind(client)
       const query = async (sql: string, values?: readonly unknown[]) => {
         const result = await originalQuery(sql, values ? [...values] : undefined)
-        await afterQuery(sql, values)
+        await afterQuery(sql, values, result.rows)
         return result
       }
       return new Proxy(client, {
@@ -92,7 +92,9 @@ function queryLevelDuplicateWitnessSql(sql: string, witnessIdParameter: number):
         ON shadow_witness."id" = source_witness."id" || ':query-duplicate'
       JOIN public."agent_outbox" AS source_dispatch ON source_dispatch."id" = 'agent-outbox-' || source_witness."id"
     )
-    SELECT * FROM (${sql}) AS "root_task_history_query_level_duplicate"`
+    SELECT "root_task_history_query_level_duplicate".*
+    FROM (${sql}) AS "root_task_history_query_level_duplicate"
+    CROSS JOIN (SELECT $3::text) AS "root_task_history_parameter_type_anchor"`
 }
 
 function queryLevelDuplicateWitnessPool(pool: PgPool, witnessId: string): Pick<PgPool, "connect"> {
@@ -120,6 +122,34 @@ function queryLevelDuplicateWitnessPool(pool: PgPool, witnessId: string): Pick<P
 
 function errorCode(error: unknown): string | undefined {
   return error && typeof error === "object" && "code" in error && typeof error.code === "string" ? error.code : undefined
+}
+
+function queryRecords(rows: readonly unknown[] | undefined): Array<Record<string, unknown>> {
+  const records: Array<Record<string, unknown>> = []
+  for (const row of rows ?? []) {
+    if (row && typeof row === "object" && !Array.isArray(row)) records.push(row as Record<string, unknown>)
+  }
+  return records
+}
+
+type SameSessionPageObservation = Readonly<{
+  rawRowCount: number
+  cursor: Readonly<{ sequence: unknown; turnId: unknown; terminalEventId: unknown }>
+  candidates: readonly Readonly<{ sequence: string; turnId: string; terminalEventId: string }>[]
+}>
+
+function sameSessionPageObservation(rows: readonly unknown[] | undefined): SameSessionPageObservation | undefined {
+  const records = queryRecords(rows)
+  const metadata = records.find(row => typeof row.pageRawRowCount === "number")
+  if (!metadata || typeof metadata.pageRawRowCount !== "number") return undefined
+  const candidates = records.flatMap(row => {
+    const sequence = row.terminalSequence
+    if (row.isPageWatermark !== false || typeof row.turnId !== "string" || typeof row.terminalEventId !== "string"
+      || (typeof sequence !== "string" && typeof sequence !== "number" && typeof sequence !== "bigint")) return []
+    return [{ sequence: String(sequence), turnId: row.turnId, terminalEventId: row.terminalEventId }]
+  })
+  return { rawRowCount: metadata.pageRawRowCount, cursor: { sequence: metadata.pageCursorSequence,
+    turnId: metadata.pageCursorTurnId, terminalEventId: metadata.pageCursorTerminalEventId }, candidates }
 }
 
 type Source = Readonly<{
@@ -673,11 +703,19 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     const invalidSources = strictInvalidStepReceiptSources("page-invalid-first-window", 64, 400)
     try {
       for (const source of invalidSources) await insertSource(source)
-      await projectSources(invalidSources)
 
-      const pageQueries: string[] = [], graphLoads: string[] = []
-      const observed = observeQueries(pool!, async (sql, values) => {
-        if (sql.includes("WITH terminal_window AS MATERIALIZED (")) pageQueries.push(sql)
+      const pageQueries: string[] = [], pageRawCounts: number[] = [], pageTurnIds: string[] = [], pageObservations: SameSessionPageObservation[] = [], graphLoads: string[] = []
+      const observed = observeQueries(pool!, async (sql, values, rows) => {
+        if (sql.includes("WITH terminal_window AS MATERIALIZED (")) {
+          pageQueries.push(sql)
+          const records = queryRecords(rows)
+          const observation = sameSessionPageObservation(rows)
+          if (observation) pageObservations.push(observation)
+          const metadata = records.find(row => typeof row.pageRawRowCount === "number")
+          if (typeof metadata?.pageRawRowCount === "number") pageRawCounts.push(metadata.pageRawRowCount)
+          pageTurnIds.push(...records.filter(row => row.isPageWatermark === false && typeof row.turnId === "string")
+            .map(row => row.turnId as string))
+        }
         if (sql.includes('FROM "agent_items" AS item')) graphLoads.push(String(values?.[2]))
       })
       const input: DirectRootTaskHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
@@ -685,6 +723,15 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       const history = await createPgDirectRootTaskHistoryStore(observed).load(input)
 
       expect(pageQueries).toHaveLength(2)
+      expect(pageRawCounts[0]).toBe(64)
+      expect(pageTurnIds.slice(0, 64)).toEqual([...invalidSources].reverse().map(source => source.turnId))
+      expect(pageObservations).toHaveLength(2)
+      // The first raw page consists entirely of fixture rows that survive every outer join.
+      expect(pageObservations[0]?.rawRowCount).toBe(64)
+      expect(pageObservations[0]?.candidates).toHaveLength(64)
+      expect(pageObservations[0]?.cursor).toEqual(pageObservations[0]?.candidates[63])
+      expect(pageObservations[1]!.rawRowCount).toBeGreaterThan(0)
+      expect(pageObservations[1]!.rawRowCount).toBeLessThanOrEqual(64)
       expect(history.map(item => item.sourceTurnId)).toEqual([matching[1]!.turnId, matching[0]!.turnId])
       expect(graphLoads).toEqual([matching[1]!.turnId, matching[0]!.turnId])
       expect(graphLoads.some(turnId => invalidSources.some(source => source.turnId === turnId))).toBe(false)
@@ -697,14 +744,22 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     const invalidSources = strictInvalidStepReceiptSources("page-invalid-same-lane-budget", 128, 500)
     try {
       for (const source of invalidSources) await insertSource(source)
-      await projectSources(invalidSources)
 
       let sameSessionPages = 0, crossSessionPages = 0
-      const graphLoads: string[] = []
-      const observed = observeQueries(pool!, async (sql, values) => {
+      const sameSessionRawCounts: number[] = [], sameSessionTurnIds: string[] = [], sameSessionObservations: SameSessionPageObservation[] = [], graphLoads: string[] = []
+      const observed = observeQueries(pool!, async (sql, values, rows) => {
         if (sql.includes("WITH terminal_window AS MATERIALIZED (")) {
+          const records = queryRecords(rows)
+          const metadata = records.find(row => typeof row.pageRawRowCount === "number")
           if (sql.includes('event."sessionId" <> $1')) crossSessionPages += 1
-          else sameSessionPages += 1
+          else {
+            sameSessionPages += 1
+            const observation = sameSessionPageObservation(rows)
+            if (observation) sameSessionObservations.push(observation)
+            if (typeof metadata?.pageRawRowCount === "number") sameSessionRawCounts.push(metadata.pageRawRowCount)
+            sameSessionTurnIds.push(...records.filter(row => row.isPageWatermark === false && typeof row.turnId === "string")
+              .map(row => row.turnId as string))
+          }
         }
         if (sql.includes('FROM "agent_items" AS item')) graphLoads.push(String(values?.[2]))
       })
@@ -714,6 +769,15 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
 
       expect(sameSessionPages).toBe(2)
       expect(crossSessionPages).toBe(1)
+      expect(sameSessionRawCounts).toEqual([64, 64])
+      expect(sameSessionTurnIds).toEqual([...invalidSources].reverse().map(source => source.turnId))
+      expect(sameSessionObservations).toHaveLength(2)
+      // Both full pages consist entirely of fixture rows that survive every outer join.
+      for (const page of sameSessionObservations) {
+        expect(page.rawRowCount).toBe(64)
+        expect(page.candidates).toHaveLength(64)
+        expect(page.cursor).toEqual(page.candidates[63])
+      }
       expect(history.map(item => item.sourceTurnId)).toEqual([
         equalCutoff.turnId, crossEqualTimeHigherTurnId.turnId, otherSession.turnId,
       ])
@@ -989,7 +1053,7 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       expect(indexed.map(item => item.sourceTurnId)).toEqual([exactRecent.turnId, exactOld.turnId])
 
       const fallback = await createPgDirectRootTaskHistoryStore(pool!).load({ ...input, objectiveHistoryIndexEnabled: false })
-      expect(fallback.map(item => item.sourceTurnId)).toEqual([exactRecent.turnId])
+      expect(fallback.map(item => item.sourceTurnId)).toEqual([exactRecent.turnId, exactOld.turnId])
       expect(fallback.some(item => changed.some(source => source.turnId === item.sourceTurnId))).toBe(false)
     } finally {
       try { await updateCurrentTurn("user", originalInput) }
