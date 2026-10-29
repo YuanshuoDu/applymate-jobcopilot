@@ -142,9 +142,9 @@ async function startRuntime(firstWorker) {
     modelRuntimeFactory() {
       let calls = 0
       return { adapter: { id: "objective-snapshot-fixture-model", profile: modelProfile(), async *stream(request) {
-        modelStreamCalls += 1
-        if (firstWorker) {
-          historyProjection(request)
+        modelStreamCalls += 1; if (firstWorker) {
+          say("FIXTURE_MODEL_STREAM_ENTERED_A")
+          try { historyProjection(request) } catch { say("FIXTURE_MODEL_CONTEXT_A_INVALID"); throw new Error("objective_snapshot_context_invalid") }
           calls += 1
           if (calls === 1) {
             say("FIXTURE_MODEL_CONTEXT_A_OK"); await waitForCommand("continue-turn")

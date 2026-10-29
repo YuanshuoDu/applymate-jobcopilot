@@ -385,6 +385,11 @@ function startFixtureWorker(mode: string, input: { turnId: string }): WorkerFixt
 async function waitForFixtureLine(child: WorkerFixtureProcess, marker: string, timeoutMs = 30_000): Promise<string> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
+    if (marker === "FIXTURE_MODEL_CONTEXT_A_OK" && child.output.includes("FIXTURE_MODEL_CONTEXT_A_INVALID")) {
+      throw new Error("Snapshot restart Worker A rejected its model context before the restart boundary")
+    }
+    const fixtureFailure = child.errors.find(value => value.startsWith("OBJECTIVE_SNAPSHOT_RESTART_FIXTURE_FAILED"))
+    if (fixtureFailure) throw new Error(`Snapshot restart Worker reported ${fixtureFailure}`)
     const line = child.output.find(value => value.startsWith(marker))
     if (line) return line
     if (child.exitCode !== null || child.signalCode !== null) {
@@ -520,7 +525,7 @@ async function runObjectiveSnapshotWorkerRestart(pool: Pool, corrupt: boolean): 
     const workerAPid = workerA.pid
     expect(workerAPid).toBeTruthy()
     await waitForFixtureLine(workerA, "FIXTURE_WORKER_READY_A")
-    await waitForFixtureLine(workerA, "FIXTURE_MODEL_CONTEXT_A_OK")
+    await waitForFixtureLine(workerA, "FIXTURE_MODEL_CONTEXT_A_OK", 45_000)
     const initialSnapshot = await readSnapshotEnvelope(pool, fixture.sessionId)
     expect(initialSnapshot).toHaveLength(1)
     const initialPayload = initialSnapshot[0]?.payload as Record<string, unknown>
