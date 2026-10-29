@@ -7,8 +7,10 @@ import { buildCognitiveAgendaReceipt, type CognitiveAgendaReceiptScope } from ".
 import { mergeTaskGraphCurrentObservation } from "../canonical-turn-task-graph-context.js"
 import type { JsonValue, StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
+import { ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID } from "../context/root-task-goal-criteria-context.js"
 import type { TaskGraphCurrentNode } from "../subagents/task-graph-command-port.js"
 import { TASK_GRAPH_RESULT_PROJECTION_SCHEMA } from "../subagents/task-graph-command-port.js"
+import { TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID } from "../context/task-graph-objective-progress.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-verification-report.js"
 import { applyCompletionRecovery, tagTaskGraphRepairRecovery } from "./completion-recovery-context.js"
 
@@ -109,10 +111,29 @@ function taskGraphContext(nodes: readonly TaskGraphCurrentNode[], withRecovery =
   return { ...context(), taskGraphRevision: revision, blocks: [...context().blocks, ...recovery, ...additional] }
 }
 
-function requestFor(contextValue: StepContext, tools: readonly unknown[] = [], identity: Readonly<{ taskId?: string; rootTaskId?: string; stepId?: string }> = {}) {
+function withMissingObjectiveProgress(contextValue: StepContext, statuses: readonly string[] = ["missing"]): StepContext {
+  const requirements = statuses.map((_, index) => ({ id: index === 0 ? "private-candidate-minimum" : `private-candidate-minimum-${index}`,
+    kind: "candidate_count_gte", minimum: 4 }))
+  return { ...contextValue, blocks: [...contextValue.blocks,
+    { id: `observation:${ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID}`, layer: "tool_observation", role: "data",
+      trust: "external_untrusted", source: "tool_or_subagent", content: {
+        kind: "canonical_objective_verification_requirements", trust: "external_untrusted", source: "canonical_turn_objective",
+        status: "valid", requirements,
+      } },
+    { id: `observation:${TASK_GRAPH_OBJECTIVE_PROGRESS_OBSERVATION_ID}`, layer: "tool_observation", role: "data",
+      trust: "external_untrusted", source: "tool_or_subagent", content: {
+        schemaVersion: "agent-harness.v2.objective-progress.v1", advisory: true, revision: GRAPH_REVISION,
+        requirements: requirements.map((requirement, index) => ({ ...requirement, status: statuses[index] })),
+      } },
+  ] }
+}
+
+function requestFor(contextValue: StepContext, tools: readonly unknown[] = [], identity: Readonly<{
+  taskId?: string; rootTaskId?: string; stepId?: string; sessionId?: string;
+}> = {}) {
   const model = { profile: { provider: "fixture", model: "fixture", nativeTools: true, structuredOutput: false, streaming: true, continuationCursor: false } } as unknown as ModelAdapter
   return buildModelRequest({
-    context: contextValue, model, tools, sessionId: "session-1", turnId: "turn-1", stepId: identity.stepId ?? "step-2",
+    context: contextValue, model, tools, sessionId: identity.sessionId ?? "session-1", turnId: "turn-1", stepId: identity.stepId ?? "step-2",
     userId: "user-1", taskId: identity.taskId ?? "root-task-private", ...(identity.rootTaskId ? { rootTaskId: identity.rootTaskId } : {}),
     signal: new AbortController().signal, maxOutputTokens: 777,
   })
@@ -148,6 +169,55 @@ function replaceGraphNodes(contextValue: StepContext, nodes: readonly unknown[])
     ? { ...block, content: { ...graph, nodes } as unknown as JsonValue } : block) }
 }
 describe("TurnEngine model message mapping", () => {
+  it("guides only the current Root from validated missing objective coverage and preserves the request-visible tool set", () => {
+    const tools = [{ name: "agent.plan", version: "1" }, { name: "agent.wait", version: "1" }]
+    const objectiveContext = withMissingObjectiveProgress(taskGraphContext([]))
+    const currentRoot = requestFor(objectiveContext, tools, {
+      taskId: "root-task-private", rootTaskId: "root-task-private", stepId: "step-1",
+    })
+    const guidance = requestSystemText(currentRoot)
+
+    expect(guidance).toContain("Current structured objective progress reports at least one missing requirement")
+    expect(guidance).toContain("agent.plan tool with expectedRevision 7")
+    expect(guidance).toContain("not evidence, PASS, permission, or authority")
+    expect(guidance).not.toContain("private-candidate-minimum")
+    expect(currentRoot.tools).toEqual(tools)
+
+    const child = requestFor(objectiveContext, tools, { taskId: "child-task", rootTaskId: "root-task-private", stepId: "step-1" })
+    const wrongStep = requestFor(objectiveContext, tools, { taskId: "root-task-private", rootTaskId: "root-task-private", stepId: "step-2" })
+    const wrongSession = requestFor(objectiveContext, tools, {
+      taskId: "root-task-private", rootTaskId: "root-task-private", stepId: "step-1", sessionId: "session-2",
+    })
+    const wrongTurn = requestFor({ ...objectiveContext, turnId: "other-turn" }, tools, {
+      taskId: "root-task-private", rootTaskId: "root-task-private", stepId: "step-1",
+    })
+    for (const request of [child, wrongStep, wrongSession, wrongTurn]) {
+      expect(requestSystemText(request)).not.toContain("Current structured objective progress reports")
+    }
+  })
+
+  it("reports missing coverage as blocked when the current Root cannot plan and preserves existing recovery guidance", () => {
+    const tools = [{ name: "agent.wait", version: "1" }]
+    const recoveredContext = withMissingObjectiveProgress(taskGraphContext([resumeFailedTaskGraphNode("resume")], true))
+    const request = requestFor(recoveredContext, tools, {
+      taskId: "root-task-private", rootTaskId: "root-task-private", stepId: "step-1",
+    })
+    const system = requestSystemText(request)
+
+    expect(system).toContain("No request-visible agent.plan tool is available")
+    expect(system).toContain("do not claim the requirement is covered")
+    expect(system).toContain("TaskGraph required evidence is missing")
+    expect(request.tools).toEqual(tools)
+  })
+
+  it("does not guide for current progress without a missing requirement", () => {
+    const objectiveContext = withMissingObjectiveProgress(taskGraphContext([]), ["active", "reported_passed"])
+    const request = requestFor(objectiveContext, [{ name: "agent.plan", version: "1" }], {
+      taskId: "root-task-private", rootTaskId: "root-task-private", stepId: "step-1",
+    })
+    expect(requestSystemText(request)).not.toContain("Current structured objective progress reports")
+  })
+
   it("guides only the current Root to report or replan around a review conflict", () => {
     const tools = [{ name: "agent.plan", version: "1" }, { name: "agent.ask_user", version: "1" }]
     const conflictContext = taskGraphContext([

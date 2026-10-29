@@ -7,6 +7,7 @@ import type { CognitiveAgendaReceiptScope } from "./cognitive-agenda-receipt.js"
 import { buildRootHistoryPlanningInstruction } from "./root-history-planning-guidance.js"
 import { buildTaskGraphRecoveryInstruction } from "./task-graph-recovery-guidance.js"
 import { buildTaskGraphExecutionFailureInstruction } from "./task-graph-execution-failure-guidance.js"
+import { buildTaskGraphObjectiveProgressInstruction } from "./task-graph-objective-progress-guidance.js"
 
 const PLANNING_TOOLS = ["agent.plan", "agent.followup"] as const
 const SAFE_TOOL_NAME = /^[a-z][a-z0-9_.-]{0,63}$/i
@@ -183,6 +184,7 @@ function messagesForRequest(context: StepContext, tools: readonly unknown[], fre
     agenda ? cognitiveAgendaInstruction() : null,
     taskGraphReviewConflictInstruction(context, tools, isCurrentRootStep),
     discoveryQueryFootprintInstruction(context, isCurrentRootStep),
+    buildTaskGraphObjectiveProgressInstruction(context, tools, isCurrentRootStep),
     buildTaskGraphRecoveryInstruction(context, tools, rootTaskId),
     buildTaskGraphExecutionFailureInstruction(context, tools),
     buildRootHistoryPlanningInstruction(context, tools), clarificationInstruction(context, tools),
