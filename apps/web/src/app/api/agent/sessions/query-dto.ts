@@ -3,14 +3,13 @@ import { projectCompletedAnswerEvidence, projectFinalAnswerText, redactFinalAnsw
 import { projectFinalSummary } from "@/lib/agent/session/final-summary-projection"
 import { projectLegacySubAgentTask } from "@/lib/agent/session/subagent-task-compat"
 import { redactTaskGraphTimelineContent } from "@/lib/task-graph-repair-display"
+import { publicToolCallIdOrNull, publicToolItemId } from "@/lib/agent/session/public-tool-identity"
 
 import { toIso, type CursorRow } from "./query-helpers"
 import { projectTaskEvidencePreview } from "./task-evidence-preview"
 
 const SENSITIVE_KEY = /(api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|password|secret|private[_-]?key|credential|token|answer|(?:full[_-]?)?resume(?:[_-]?(text|content|data))?|cv(?:[_-]?(text|content|data))?|raw[_-]?(content|text))/i
-function redactString(value: string): string {
-  return redactFinalAnswerText(value)
-}
+function redactString(value: string): string { return redactFinalAnswerText(value) }
 
 function redactValue(value: unknown, key: string | null = null, depth = 0): unknown {
   if (key && SENSITIVE_KEY.test(key)) return "[REDACTED]"
@@ -23,9 +22,7 @@ function redactValue(value: unknown, key: string | null = null, depth = 0): unkn
 }
 
 function record(value: unknown): Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : {}
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {}
 }
 
 function displayText(value: unknown): string {
@@ -81,7 +78,7 @@ export function itemDto(row: ItemQueryRow) {
   else if (row.type === "approval_request") content = {
     waitKind: "approval",
     approvalId: typeof raw.approvalId === "string" ? raw.approvalId : null,
-    toolCallId: typeof raw.toolCallId === "string" ? raw.toolCallId : null,
+    toolCallId: publicToolCallIdOrNull(row.sessionId, row.turnId, raw.toolCallId),
     action: typeof raw.action === "string" ? redactString(raw.action) : null,
     title: typeof raw.title === "string" ? redactString(raw.title) : "Approval required",
     body: typeof raw.body === "string" ? redactString(raw.body) : "",
@@ -93,7 +90,7 @@ export function itemDto(row: ItemQueryRow) {
   else if (row.type === "question") content = {
     waitKind: "question",
     questionId: typeof raw.questionId === "string" ? raw.questionId : null,
-    toolCallId: typeof raw.toolCallId === "string" ? raw.toolCallId : null,
+    toolCallId: publicToolCallIdOrNull(row.sessionId, row.turnId, raw.toolCallId),
     stage: typeof raw.stage === "string" ? redactString(raw.stage) : null,
     question: typeof raw.question === "string" ? redactString(raw.question) : "",
     options: redactValue(raw.options),
@@ -101,19 +98,21 @@ export function itemDto(row: ItemQueryRow) {
     pending: row.status === "started",
   }
   else if (row.type === "tool_call") content = {
-    toolCallId: typeof raw.toolCallId === "string" ? raw.toolCallId : null,
+    toolCallId: publicToolCallIdOrNull(row.sessionId, row.turnId, raw.toolCallId),
     toolName: typeof raw.toolName === "string" ? raw.toolName : null,
     inputAvailable: true,
   }
   else if (row.type === "tool_result") content = {
-    toolCallId: typeof raw.toolCallId === "string" ? raw.toolCallId : null,
+    toolCallId: publicToolCallIdOrNull(row.sessionId, row.turnId, raw.toolCallId),
     errorCode: typeof raw.errorCode === "string" ? raw.errorCode : null,
     outputAvailable: true,
   }
   else content = redactTaskGraphTimelineContent(row.type, row.content, redactValue)
   return {
     schemaVersion,
-    id: row.id,
+    id: row.type === "tool_call" || row.type === "tool_result"
+      ? publicToolItemId(row.sessionId, row.turnId, row.id)
+      : row.id,
     sessionId: row.sessionId,
     turnId: row.turnId,
     stepId: row.stepId,

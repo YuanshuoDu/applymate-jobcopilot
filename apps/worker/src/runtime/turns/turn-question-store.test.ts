@@ -150,7 +150,9 @@ function fixture(options: FixtureOptions = {}): Fixture {
         return { rows: [{ id: questionItemId(id), stepId, taskId: owner.taskId, type: "question", status: options.itemStatus,
           content: options.itemContent ?? { waitKind: "question", questionId: id, toolCallId, stage: "user_input", question: intent.question, options: intent.options, answer: null, answerAvailable: false } }], rowCount: 1 }
       }
-      if (sql.includes('FROM "agent_items"') && sql.includes("'tool_call'")) return { rows: [{ id: "call-item-1", status: options.callRowStatus ?? "completed", content: persistedCallContent }], rowCount: 1 }
+      if (sql.includes('FROM "agent_items"') && sql.includes("'tool_call'")) return values?.[4] === toolCallId
+        ? { rows: [{ id: "call-item-1", status: options.callRowStatus ?? "completed", content: persistedCallContent }], rowCount: 1 }
+        : { rows: [], rowCount: 0 }
       if (sql.includes('FROM "agent_items"') && sql.includes("'tool_result'")) return options.hasResult === false
         ? { rows: [], rowCount: 0 }
         : { rows: [{ id: "result-item-1", status: options.resultStatus ?? "completed", content: { ...resultContent, output: options.resultOutput ?? intent, ...(options.resultContentPatch ?? {}) } }], rowCount: 1 }
@@ -228,6 +230,17 @@ describe("PostgreSQL native question store", () => {
     expect(f.calls.filter(call => call.sql.includes('UPDATE "agent_steps" SET "finishReason"'))).toHaveLength(1)
     await expect(f.store.stageQuestionUsage({ ...input, usage: { ...input.usage, inputTokens: 13 } })).rejects.toMatchObject({ code: "question_conflict" })
   })
+
+  it.each(["+353 87 123 4567", "alex@example.com", "sk_live_sensitive_token_abc"])(
+    "keeps unavailable ask_user lineage diagnostics private for %s", async sensitiveId => {
+      const f = fixture()
+      await expect(f.store.stageQuestionUsage({ owner, stepId, toolCallId: sensitiveId, finishReason: "tool_calls",
+        usage: { inputTokens: 12, outputTokens: 4, estimatedCostUsd: 0.001 }, now }))
+        .rejects.toMatchObject({ code: "question_conflict", message: "Question persistence conflict: tool_call" })
+      expect(f.calls.filter(call => call.sql === "ROLLBACK")).toHaveLength(1)
+      expect(f.calls.filter(call => call.sql === "COMMIT")).toHaveLength(0)
+    },
+  )
 
   it("replays an answered question without recreating or re-waiting it", async () => {
     const id = questionId(owner, stepId, toolCallId)

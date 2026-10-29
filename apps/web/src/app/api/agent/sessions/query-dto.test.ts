@@ -1,9 +1,12 @@
-import { describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 import { projectFinalAnswerContent } from "@/lib/agent/session/final-answer-evidence-projection"
+import { publicToolCallId, publicToolItemId } from "@/lib/agent/session/public-tool-identity"
 
 import { itemDto, taskDto, turnDto } from "./query-dto"
 
 const date = new Date("2026-08-31T00:00:00Z")
+
+afterEach(() => vi.unstubAllEnvs())
 
 describe("agent query DTO redaction", () => {
   it("projects a safe positive task attempt count without exposing lease metadata", () => {
@@ -395,7 +398,52 @@ describe("agent query DTO redaction", () => {
     expect(itemDto({
       id: "tool_1", sessionId: "session_1", turnId: "turn_1", stepId: null, taskId: null, type: "tool_call", status: "completed", phase: "commentary", revision: 0,
       content: { toolCallId: "call_1", toolName: "jobs.search", input: { apiKey: "private" } }, startedAt: null, completedAt: null, createdAt: date, updatedAt: date,
-    }).content).toEqual({ toolCallId: "call_1", toolName: "jobs.search", inputAvailable: true })
+    }).content).toEqual({ toolCallId: publicToolCallId("session_1", "turn_1", "call_1"), toolName: "jobs.search", inputAvailable: true })
+  })
+
+  it("projects the same opaque call identity across tool items while preserving actionable wait IDs", () => {
+    vi.stubEnv("AUTH_SECRET", "query-dto-test-secret")
+    const providerId = "+353 87 123 4567"
+    const callId = "turn:turn_1:item:tool-call:" + providerId + ":attempt-1"
+    const resultId = "turn:turn_1:item:tool-result:" + providerId + ":attempt-1"
+    const call = itemDto({
+      id: callId, sessionId: "session_1", turnId: "turn_1", stepId: "step_1", taskId: null,
+      type: "tool_call", status: "completed", phase: null, revision: 1,
+      content: { toolCallId: providerId, toolName: "agent.ask_user", input: { private: true } },
+      startedAt: date, completedAt: date, createdAt: date, updatedAt: date,
+    })
+    const result = itemDto({
+      id: resultId, sessionId: "session_1", turnId: "turn_1", stepId: "step_1", taskId: null,
+      type: "tool_result", status: "completed", phase: null, revision: 1,
+      content: { toolCallId: providerId, output: { private: true }, errorCode: null },
+      startedAt: date, completedAt: date, createdAt: date, updatedAt: date,
+    })
+    const question = itemDto({
+      id: "question-item", sessionId: "session_1", turnId: "turn_1", stepId: null, taskId: null,
+      type: "question", status: "started", phase: "commentary", revision: 0,
+      content: { questionId: "question_1", toolCallId: providerId, question: "Confirm?" },
+      startedAt: date, completedAt: null, createdAt: date, updatedAt: date,
+    })
+    const approval = itemDto({
+      id: "approval-item", sessionId: "session_1", turnId: "turn_1", stepId: null, taskId: null,
+      type: "approval_request", status: "started", phase: "commentary", revision: 0,
+      content: { approvalId: "approval_1", toolCallId: providerId, action: "submit_application" },
+      startedAt: date, completedAt: null, createdAt: date, updatedAt: date,
+    })
+
+    const safeCallId = publicToolCallId("session_1", "turn_1", providerId)
+    expect(call.id).toBe(publicToolItemId("session_1", "turn_1", callId))
+    expect(result.id).toBe(publicToolItemId("session_1", "turn_1", resultId))
+    expect(call.content).toMatchObject({ toolCallId: safeCallId, toolName: "agent.ask_user" })
+    expect(result.content).toMatchObject({ toolCallId: safeCallId, outputAvailable: true })
+    expect(question.content).toMatchObject({ questionId: "question_1", toolCallId: safeCallId })
+    expect(approval.content).toMatchObject({ approvalId: "approval_1", toolCallId: safeCallId })
+    expect(JSON.stringify([call, result, question, approval])).not.toContain(providerId)
+    expect(itemDto({
+      id: "ordinary-item", sessionId: "session_1", turnId: "turn_1", stepId: null, taskId: null,
+      type: "agent_message", status: "completed", phase: "final_answer", revision: 1,
+      content: { text: "Done" }, startedAt: date, completedAt: date, createdAt: date, updatedAt: date,
+    }).id).toBe("ordinary-item")
   })
 
   it("projects only completed Writer and Reviewer artifact references from persisted results", () => {
@@ -460,7 +508,7 @@ describe("agent query DTO redaction", () => {
       startedAt: date, completedAt: date, createdAt: date, updatedAt: date,
     })
     expect(dto.content).toEqual({
-      waitKind: "question", questionId: "q1", toolCallId: "call_1", stage: "profile", question: "Work authorisation?",
+      waitKind: "question", questionId: "q1", toolCallId: publicToolCallId("session_1", "turn_1", "call_1"), stage: "profile", question: "Work authorisation?",
       options: [{ value: "yes", label: "Yes" }], answerAvailable: true, pending: false,
     })
     expect(JSON.stringify(dto.content)).not.toContain("secret-answer")
