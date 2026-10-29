@@ -4,6 +4,7 @@ import { createTurnBudgetLedger, type TurnBudgetLimits } from "../budget.js"
 import { createProgressDetector, progressCheckpointFromStepContext } from "../progress.js"
 import { buildModelRequest } from "./turn-engine-messages.js"
 import { runAdmittedModelStep } from "./admitted-model-step.js"
+import { normalizeProjectedToolCallIds, projectChildToolCallIdsForModelContext } from "./turn-tool-call-id-projection.js"
 import { runModelStep, type ModelStepResult } from "./turn-engine-model.js"
 import { TurnEngineError, toRepositoryJson, type TurnEngineResult, type TurnEngineStep } from "./turn-engine-types.js"
 import { publishCommentary, publishReasoningSummary, TurnExecutionEventWriter } from "./turn-execution-events.js"
@@ -24,8 +25,7 @@ import { scheduledPipelineRecoveryStepMarker, withScheduledPipelineRecoveryStepP
 import { handleTurnExecutionStepError, matchedTaskGraphDenialCheckpoint, terminalizeTurnExecutionError, withTaskGraphDenialCheckpoint } from "./turn-engine-no-progress-terminalization.js"
 const DEFAULT_MAX_STEPS = 32
 export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promise<TurnEngineResult> {
-  const signal = options.signal ?? new AbortController().signal
-  const now = options.now ?? (() => new Date())
+  const signal = options.signal ?? new AbortController().signal, now = options.now ?? (() => new Date())
   const writer = new TurnExecutionEventWriter({ ...options, signal, now })
   const baseBudget: TurnBudgetLimits = { ...options.budget, maxSteps: options.budget?.maxSteps ?? options.maxSteps ?? DEFAULT_MAX_STEPS }
   const budget = createTurnBudgetLedger(resumedBudgetLimits(baseBudget, options.resume) ?? {})
@@ -121,8 +121,9 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
         }
         await writer.append("step.started", step.id, null, { stepId: step.id, ordinal: step.ordinal, taskId: options.identity.taskId }, `step-started:${step.id}`)
         if (options.identity.kind === "turn" && options.refreshTaskGraphBeforeStep) snapshot = await options.refreshTaskGraphBeforeStep(snapshot)
+        const toolCallProjection = options.identity.kind === "task" && options.identity.taskId !== options.identity.rootTaskId ? projectChildToolCallIdsForModelContext(snapshot, options.identity, step.id) : undefined
         const context = await options.contextBuilder.build({
-          scope: options.scope, identity: options.identity, stepId: step.id, snapshot,
+          scope: options.scope, identity: options.identity, stepId: step.id, snapshot: toolCallProjection?.snapshot ?? snapshot,
           rootInputId: ordinal === 0 ? options.rootInputId : undefined, now: now(),
           rootContextInputId: options.rootContextInputId,
           taskId: options.identity.taskId,
@@ -178,7 +179,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           await writer.append("model.usage", step.id, null,
             { provider: output.provider, model: output.model, usage: output.usage, taskId: options.identity.taskId }, `model-usage:${step.id}`)
         }
-        stepOutput = output; continuation = output.continuation ?? undefined
+        output = toolCallProjection ? { ...output, toolCalls: normalizeProjectedToolCallIds(output.toolCalls, toolCallProjection.aliasToCanonical) } : output; stepOutput = output; continuation = output.continuation ?? undefined
         await publishReasoningSummary(writer, options, step, resolveTurnFinalAnswerMarkers(output.reasoningSummary, null).text, now)
         if (output.toolCalls.length > 0) {
           const questionCallId = nativeQuestionCallId(output, options.identity)

@@ -35,6 +35,9 @@ function object(value: unknown): Record<string, unknown> | null {
 function waitTask(value: Row | null): value is Row & { readonly taskId: string } {
   return !!value && typeof value.taskId === "string"
 }
+function canonicalToolCallId(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0 && value.length <= 256
+}
 function exactKeys(value: Row, keys: readonly string[]): boolean {
   const actual = Object.keys(value).sort()
   return actual.length === keys.length && actual.every((key, index) => key === [...keys].sort()[index])
@@ -101,7 +104,7 @@ export function buildChildResumeObservations(rows: readonly Row[], lease: Subage
     const content = object(row.content)
     if (!content || (row.type !== "tool_call" && row.type !== "tool_result")) continue
     if (typeof row.status !== "string" || !["started", "streaming", "completed", "failed", "interrupted"].includes(row.status)) throw new Error("child_resume_invalid_item_status")
-    const callId = typeof content.toolCallId === "string" && content.toolCallId.trim() ? content.toolCallId : null
+    const callId = canonicalToolCallId(content.toolCallId) ? content.toolCallId : null
     if (!callId) continue
     if (row.type === "tool_call") {
       const toolName = typeof content.toolName === "string" && content.toolName.trim() ? content.toolName : null
@@ -144,7 +147,7 @@ export function countChildResumeToolCalls(rows: readonly Row[], lease: SubagentL
 }
 
 export function mergeDurableWaitObservation(observations: readonly ContextSeedBlock[], wait: DurableWaitResume): readonly ContextSeedBlock[] {
-  if (!wait.waitId.trim() || !wait.stepId.trim() || !wait.toolCallId.trim() || !wait.sourceItemId.trim()
+  if (!wait.waitId.trim() || !wait.stepId.trim() || !canonicalToolCallId(wait.toolCallId) || !wait.sourceItemId.trim()
     || !Number.isSafeInteger(wait.attempt) || !Number.isSafeInteger(wait.ordinal) || wait.attempt < 1 || wait.ordinal < 0) {
     throw new Error("child_resume_wait_lineage")
   }
@@ -176,15 +179,23 @@ export function mergeDurableWaitObservation(observations: readonly ContextSeedBl
   const alignedOutput = { taskIds: rawOutputIds, matchedTaskIds: rawMatchedIds, tasks: rawOutputIds.map(id => taskById.get(id)!) }
   if (!markCanonicalSubagentWaitTargetIds({ targetTaskIds: inputIds }, alignedInput, inputIds)
     || !markCanonicalSubagentWaitTargetIds({ targetTaskIds: rawOutputIds }, alignedOutput, rawOutputIds)) throw new Error("child_resume_invalid_wait_result")
+  const sourceObservationId = `child-resume:${wait.sourceItemId}`
+  const sourceMatches = observations.filter(item => item.id === sourceObservationId)
   const matching = observations.filter(item => object(item.content)?.toolCallId === wait.toolCallId)
-  if (matching.some(item => !item.id.startsWith("child-resume:"))) throw new Error("child_resume_wait_tool_call_conflict")
+  const redactedCallId = redactSensitiveText(wait.toolCallId)
+  const sourceCallId = sourceMatches.length === 1 ? object(sourceMatches[0]?.content)?.toolCallId : undefined
+  if (sourceMatches.length > 1 || matching.length > 1 || matching.some(item => item.id !== sourceObservationId)
+    || sourceMatches.length === 1 && sourceCallId !== wait.toolCallId && sourceCallId !== redactedCallId) {
+    throw new Error("child_resume_wait_tool_call_conflict")
+  }
   const item = {
-    id: `child-resume:${wait.sourceItemId}`,
-    content: { toolCallId: safeJson(wait.toolCallId), toolName: "wait_subagents",
+    id: sourceObservationId,
+    content: { toolCallId: wait.toolCallId, toolName: "wait_subagents",
       input: safeSubagentWaitJson(wait.input, MAX_TOOL_INPUT_BYTES) as RepositoryJsonValue, status: "completed",
       output: safeSubagentWaitJson(wait.output, MAX_TOOL_OUTPUT_BYTES) as RepositoryJsonValue, errorCode: null },
   }
-  return [...observations.filter(observation => object(observation.content)?.toolCallId !== wait.toolCallId), item]
+  return [...observations.filter(observation => observation.id !== sourceObservationId
+    && object(observation.content)?.toolCallId !== wait.toolCallId), item]
 }
 
 function inputIdsOf(value: unknown): string[] {

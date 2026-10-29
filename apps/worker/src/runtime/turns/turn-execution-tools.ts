@@ -93,7 +93,7 @@ export async function executeTools(
   let snapshot = initial
   for (const call of output.toolCalls) {
     assertExecutionAlive(options, signal)
-    if (seen.has(call.id)) throw new TurnEngineError("invalid_output", `Tool call ${call.id} was repeated in the Turn`)
+    if (seen.has(call.id)) throw new TurnEngineError("invalid_output", "Tool call was repeated in the Turn")
     seen.add(call.id)
     const replayEntries = snapshot.toolObservations.filter(observation => {
       if (!observation.content || typeof observation.content !== "object" || Array.isArray(observation.content)) return false
@@ -105,7 +105,7 @@ export async function executeTools(
     const sourceResultItemId = replayEntry ? childResumeSourceId(replayEntry.id) : null
     const replayed = findToolResultObservation(snapshot, call.id)
     if (replayed) {
-      if (replayed.toolName !== call.name || stableJson(replayed.input) !== stableJson(call.arguments)) throw new TurnEngineError("invalid_output", `Tool call ${call.id} does not match its persisted replay record`)
+      if (replayed.toolName !== call.name || stableJson(replayed.input) !== stableJson(call.arguments)) throw new TurnEngineError("invalid_output", "Tool call does not match its persisted replay record")
       rejectQuestionReplay(call.name)
       if (sourceResultItemId) {
         if (!replayEntry || !replayEntry.content || typeof replayEntry.content !== "object" || Array.isArray(replayEntry.content)) {
