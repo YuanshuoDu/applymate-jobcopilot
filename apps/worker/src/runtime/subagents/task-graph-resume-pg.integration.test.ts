@@ -2960,11 +2960,23 @@ function latestToolResult(request: HarnessModelRequest, callId: string): unknown
   return null
 }
 
-function latestToolResultForExactToolInput(
+type ExactToolResultPair = Readonly<{
+  toolUseId: string
+  resultToolUseId: string
+  result: unknown
+}>
+type ExactToolResultPairStatus = "call_missing" | "call_ambiguous" | "duplicate_call_id"
+  | "result_missing" | "result_ambiguous" | "result_content_missing" | "result_error"
+  | "result_out_of_order" | "result_unparseable"
+type ExactToolResultPairInspection =
+  | Readonly<{ status: "paired"; pair: ExactToolResultPair }>
+  | Readonly<{ status: ExactToolResultPairStatus }>
+
+function inspectToolResultForExactToolInput(
   request: Pick<HarnessModelRequest, "messages">,
   toolName: string,
   expectedInput: unknown,
-): { readonly toolUseId: string; readonly resultToolUseId: string; readonly result: unknown } | null {
+): ExactToolResultPairInspection {
   const toolUses: { readonly id: string; readonly name: string; readonly input: unknown; readonly position: number }[] = []
   let position = 0
   for (const message of request.messages) {
@@ -2976,10 +2988,11 @@ function latestToolResultForExactToolInput(
     }
   }
   const matches = toolUses.filter(part => part.name === toolName && isDeepStrictEqual(part.input, expectedInput))
-  if (matches.length !== 1 || !matches[0]?.id) return null
+  if (matches.length === 0) return { status: "call_missing" }
+  if (matches.length !== 1 || !matches[0]?.id) return { status: "call_ambiguous" }
   const match = matches[0]
   const toolUseId = match.id
-  if (toolUses.filter(part => part.id === toolUseId).length !== 1) return null
+  if (toolUses.filter(part => part.id === toolUseId).length !== 1) return { status: "duplicate_call_id" }
 
   let resultCount = 0
   let resultToolUseId: string | undefined
@@ -2999,11 +3012,111 @@ function latestToolResultForExactToolInput(
       position++
     }
   }
-  if (resultCount !== 1 || !resultToolUseId || resultContent === undefined || isError || resultPosition <= match.position) return null
+  if (resultCount === 0) return { status: "result_missing" }
+  if (resultCount !== 1 || !resultToolUseId) return { status: "result_ambiguous" }
+  if (resultContent === undefined) return { status: "result_content_missing" }
+  if (isError) return { status: "result_error" }
+  if (resultPosition <= match.position) return { status: "result_out_of_order" }
   try {
-    return { toolUseId, resultToolUseId, result: JSON.parse(resultContent) as unknown }
+    return { status: "paired", pair: { toolUseId, resultToolUseId, result: JSON.parse(resultContent) as unknown } }
   } catch {
-    return null
+    return { status: "result_unparseable" }
+  }
+}
+
+function latestToolResultForExactToolInput(
+  request: Pick<HarnessModelRequest, "messages">,
+  toolName: string,
+  expectedInput: unknown,
+): ExactToolResultPair | null {
+  const inspection = inspectToolResultForExactToolInput(request, toolName, expectedInput)
+  return inspection.status === "paired" ? inspection.pair : null
+}
+
+const REPAIR_DIAGNOSTIC_ROLES = new Set(["scout", "analyst"])
+const REPAIR_DIAGNOSTIC_OUTCOMES = new Set(["completed", "failed", "waiting", "waiting_for_user", "threw"])
+const REPAIR_DIAGNOSTIC_RETRY_DISPOSITIONS = new Set(["terminal", "retryable"])
+const REPAIR_DIAGNOSTIC_STRUCTURED_FAILURES = new Set([
+  "missing_final_output", "result_too_large", "result_shape_invalid", "evidence_binding_invalid",
+])
+
+function repairChildOutcomeDiagnostic(role: unknown, outcome: unknown, ordinal: number): RecordValue {
+  const value = record(outcome), result = record(value?.result)
+  const failureReason = value?.failureReason
+  return {
+    role: diagnosticEnum(role, REPAIR_DIAGNOSTIC_ROLES) ?? "other",
+    ordinal: diagnosticBoundedCount(ordinal),
+    status: diagnosticEnum(value?.status, REPAIR_DIAGNOSTIC_OUTCOMES) ?? "other",
+    retryDisposition: diagnosticEnum(value?.retryDisposition, REPAIR_DIAGNOSTIC_RETRY_DISPOSITIONS) ?? "none",
+    failureReason: typeof failureReason === "string"
+      ? diagnosticEnum(failureReason, CHILD_OUTCOME_FAILURE_CODES) ?? "other" : "none",
+    structuredOutputFailure: diagnosticEnum(result?.structuredOutputFailureCategory, REPAIR_DIAGNOSTIC_STRUCTURED_FAILURES) ?? "none",
+    resultPresent: result !== null,
+    structuredResultPresent: result !== null && Object.hasOwn(result, "structuredResult"),
+    finalTextPresent: result !== null && typeof result.finalText === "string",
+  }
+}
+
+function repairChildExceptionDiagnostic(role: unknown, ordinal: number): RecordValue {
+  return {
+    role: diagnosticEnum(role, REPAIR_DIAGNOSTIC_ROLES) ?? "other",
+    ordinal: diagnosticBoundedCount(ordinal),
+    status: "threw",
+    retryDisposition: "none",
+    failureReason: "exception",
+    structuredOutputFailure: "none",
+    resultPresent: false,
+    structuredResultPresent: false,
+    finalTextPresent: false,
+  }
+}
+
+function repairToolLookupDiagnostic(
+  role: unknown,
+  taskOrdinal: number,
+  attempt: number,
+  inputOrdinal: number,
+  inspection: ExactToolResultPairInspection,
+  expectedRawId: string,
+  expectedJobId: string,
+): RecordValue {
+  const pair = inspection.status === "paired" ? inspection.pair : null
+  const result = pair ? record(pair.result) : null
+  const job = record(result?.job)
+  return {
+    role: diagnosticEnum(role, REPAIR_DIAGNOSTIC_ROLES) ?? "other",
+    taskOrdinal: diagnosticBoundedCount(taskOrdinal),
+    attempt: diagnosticBoundedCount(attempt),
+    inputOrdinal: diagnosticBoundedCount(inputOrdinal),
+    status: inspection.status,
+    visibleIdChanged: pair ? pair.toolUseId !== expectedRawId : null,
+    resultParsed: pair !== null,
+    expectedJobPresent: pair ? job?.id === expectedJobId : null,
+  }
+}
+
+function repairAnalystProgress(nodes: readonly (RecordValue | null)[], expectedCount: number): Readonly<{
+  expected: number | null
+  present: number | null
+  completed: number | null
+  verified: number | null
+  allVerified: boolean
+}> {
+  const analysts = nodes.filter(node => node?.key === "analyst"
+    || typeof node?.key === "string" && node.key.startsWith("analyst-capacity-"))
+  const completed = analysts.filter(node => node?.status === "completed")
+  const verified = completed.filter(node => {
+    const report = record(node?.verificationReport)
+    return report?.status === "passed" && Array.isArray(report.criteria) && report.criteria.length > 0
+      && report.criteria.every(item => record(item)?.status === "passed")
+  })
+  return {
+    expected: diagnosticBoundedCount(expectedCount),
+    present: diagnosticBoundedCount(analysts.length),
+    completed: diagnosticBoundedCount(completed.length),
+    verified: diagnosticBoundedCount(verified.length),
+    allVerified: analysts.length === expectedCount && completed.length === expectedCount
+      && verified.length === expectedCount,
   }
 }
 
@@ -3033,20 +3146,82 @@ describe("exact child tool result fixture lookup", () => {
     expect(paired?.toolUseId).not.toBe(rawId)
   })
 
+  it("projects safe lookup diagnostics without exposing provider or job IDs", () => {
+    const rawId = "provider-call:415-555-0134"
+    const rawJobId = "48273164-2059-4873-8942-123456789012"
+    const visibleAlias = "toolcall" + "b".repeat(64)
+    const request = {
+      messages: [
+        toolUse(visibleAlias, "jobs.get", { jobId: rawJobId }),
+        { role: "tool" as const, content: [{ type: "tool_result" as const, toolUseId: visibleAlias,
+          content: JSON.stringify({ job: { id: rawJobId } }) }] },
+      ],
+    }
+    const inspection = inspectToolResultForExactToolInput(request, "jobs.get", { jobId: rawJobId })
+    const diagnostic = repairToolLookupDiagnostic("analyst", 2, 1, 1, inspection, rawId, rawJobId)
+    const child = repairChildOutcomeDiagnostic("analyst", {
+      status: "failed", failureReason: "invalid_structured_result", retryDisposition: "terminal",
+      result: { structuredOutputFailureCategory: "evidence_binding_invalid", finalText: rawJobId,
+        structuredResult: { id: rawId } },
+    }, 2)
+    const serialized = JSON.stringify({ diagnostic, child })
+
+    expect(diagnostic).toEqual({
+      role: "analyst", taskOrdinal: 2, attempt: 1, inputOrdinal: 1, status: "paired",
+      visibleIdChanged: true, resultParsed: true, expectedJobPresent: true,
+    })
+    expect(child).toMatchObject({
+      role: "analyst", ordinal: 2, status: "failed", failureReason: "invalid_structured_result",
+      structuredOutputFailure: "evidence_binding_invalid", resultPresent: true,
+      structuredResultPresent: true, finalTextPresent: true,
+    })
+    expect(serialized).not.toContain(rawId)
+    expect(serialized).not.toContain(rawJobId)
+  })
+
   it("fails closed when matching calls or paired results are ambiguous", () => {
     const duplicateCalls = { messages: [toolUse("search-call-a"), toolUse("search-call-b"),
       toolResult("search-call-a"), toolResult("search-call-b")] }
     expect(latestToolResultForExactToolInput(duplicateCalls, "jobs.search", searchInput)).toBeNull()
+    expect(inspectToolResultForExactToolInput(duplicateCalls, "jobs.search", searchInput).status).toBe("call_ambiguous")
 
     const duplicateResults = { messages: [toolUse("search-call"), toolResult("search-call"), toolResult("search-call")] }
     expect(latestToolResultForExactToolInput(duplicateResults, "jobs.search", searchInput)).toBeNull()
+    expect(inspectToolResultForExactToolInput(duplicateResults, "jobs.search", searchInput).status).toBe("result_ambiguous")
 
     const duplicateDisplayedId = { messages: [toolUse("search-call"), toolUse("search-call", "jobs.get", { jobId: "job-1" }),
       toolResult("search-call")] }
     expect(latestToolResultForExactToolInput(duplicateDisplayedId, "jobs.search", searchInput)).toBeNull()
+    expect(inspectToolResultForExactToolInput(duplicateDisplayedId, "jobs.search", searchInput).status).toBe("duplicate_call_id")
 
     const failedResult = { messages: [toolUse("search-call"), toolResult("search-call", true)] }
     expect(latestToolResultForExactToolInput(failedResult, "jobs.search", searchInput)).toBeNull()
+    expect(inspectToolResultForExactToolInput(failedResult, "jobs.search", searchInput).status).toBe("result_error")
+  })
+})
+
+describe("repair fixture Analyst completion guard", () => {
+  const passed = (key: string) => ({ key, status: "completed", verificationReport: {
+    status: "passed", criteria: [{ status: "passed" }],
+  } })
+
+  it("blocks finalization when any required Analyst is failed or unverified", () => {
+    const progress = repairAnalystProgress([
+      passed("analyst"), passed("analyst-capacity-1"), passed("analyst-capacity-2"),
+      passed("analyst-capacity-3"), passed("analyst-capacity-4"),
+      { key: "analyst-capacity-5", status: "failed", verificationReport: { status: "unverified", criteria: [] } },
+    ], 6)
+
+    expect(progress).toMatchObject({ expected: 6, present: 6, completed: 5, verified: 5, allVerified: false })
+  })
+
+  it("allows the fixture final only when every expected Analyst passed verification", () => {
+    const progress = repairAnalystProgress([
+      passed("analyst"), passed("analyst-capacity-1"), passed("analyst-capacity-2"),
+      passed("analyst-capacity-3"), passed("analyst-capacity-4"), passed("analyst-capacity-5"),
+    ], 6)
+
+    expect(progress).toMatchObject({ expected: 6, present: 6, completed: 6, verified: 6, allVerified: true })
   })
 })
 
@@ -13320,7 +13495,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 return
               }
             }
-            if (repair?.status === "completed" && dependent?.status === "completed") {
+            const expectedAnalystCount = hardExecutorFailure ? 1 : 6
+            const analystProgress = repairAnalystProgress(nodes, expectedAnalystCount)
+            const allRequiredAnalystsVerified = analystProgress.allVerified
+            if (repair?.status === "completed" && dependent?.status === "completed" && allRequiredAnalystsVerified) {
               if (!hardExecutorFailure) expect(repairWaitStatuses.at(-1)).toBe("ready")
               expectPassedVerificationReport(repair.verificationReport, "candidate-count")
               expect(record(repair.repairReceipt)).toMatchObject({
@@ -13331,6 +13509,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: "The verified shortlist is ready" }) }
               yield { type: "completed", finishReason: "stop" }
               return
+            }
+            if (!hardExecutorFailure && previousRepairWait?.status === "ready" && !allRequiredAnalystsVerified) {
+              throw new Error(`Ready repair wait had incomplete required Analysts: completed=${analystProgress.completed}/${analystProgress.expected}, verified=${analystProgress.verified}/${analystProgress.expected}`)
             }
             throw new Error(`Unexpected repair root model turn ${execution}/${round}: ${nodes.map(node => `${node?.key}:${node?.status}`).join(",")}`)
           },
@@ -13352,10 +13533,25 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       expectedJobPresent: null as boolean | null,
       returnedJobCount: null as number | null,
     }
+    const repairChildOutcomeDiagnostics: RecordValue[] = []
+    const repairToolLookupDiagnostics: RecordValue[] = []
+    const repairTaskOrdinals = new Map<string, Readonly<{ role: string; ordinal: number }>>()
+    const repairRoleOrdinals = new Map<string, number>()
+    const repairDiagnosticSlotForTask = (taskId: string, roleValue: unknown) => {
+      const existing = repairTaskOrdinals.get(taskId)
+      if (existing) return existing
+      const role = diagnosticEnum(roleValue, REPAIR_DIAGNOSTIC_ROLES) ?? "other"
+      const ordinal = (repairRoleOrdinals.get(role) ?? 0) + 1
+      repairRoleOrdinals.set(role, ordinal)
+      const created = { role, ordinal }
+      repairTaskOrdinals.set(taskId, created)
+      return created
+    }
     const childLeaseByTaskId = new Map<string, SubagentLease>()
     const childExecutor = createProductionChildExecutor({
       pool: pool!, authorizeUsage: async () => ({ settle: async () => undefined }),
       modelRuntimeFactory: ({ task }) => {
+        const diagnosticSlot = repairDiagnosticSlotForTask(task.id, task.role)
         let round = 0
         const leasedTask = childLeaseByTaskId.get(task.id)
         if (task.goal === "Find at least two owner jobs") {
@@ -13391,8 +13587,19 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               ? `p3-verifier-repair-initial-wait:${value.turnId}`
               : `p3-verifier-repair-wait:${value.turnId}`
             await waitForPersistedTaskWait(pool!, value.turnId, waitKey)
-            const pairedResults = jobIds.map(expectedJobId =>
-              latestToolResultForExactToolInput(request, "jobs.get", { jobId: expectedJobId }))
+            const inspections = jobIds.map(expectedJobId =>
+              inspectToolResultForExactToolInput(request, "jobs.get", { jobId: expectedJobId }))
+            const pairedResults = inspections.map(inspection =>
+              inspection.status === "paired" ? inspection.pair : null)
+            if (!hardExecutorFailure) {
+              inspections.forEach((inspection, index) => {
+                repairToolLookupDiagnostics.push(repairToolLookupDiagnostic(
+                  diagnosticSlot.role, diagnosticSlot.ordinal, task.attemptCount, index + 1,
+                  inspection, callIds[index]!, jobIds[index]!,
+                ))
+                if (repairToolLookupDiagnostics.length > 32) repairToolLookupDiagnostics.shift()
+              })
+            }
             for (const pair of pairedResults) {
               if (pair) expect(pair.resultToolUseId).toBe(pair.toolUseId)
             }
@@ -13450,6 +13657,15 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       turnQueueFactory: createTurnQueue, turnRecoveryIntervalMs: 100,
       waitResolver: { intervalMs: 10, batchSize: 10, ownerId: `p3-verifier-repair-wait-resolver-${value.suffix}` },
       subagents: { execute: async ({ lease }) => {
+        const diagnosticSlot = repairDiagnosticSlotForTask(lease.id, lease.role)
+        const recordChildOutcome = (outcome: unknown) => {
+          if (!hardExecutorFailure) {
+            repairChildOutcomeDiagnostics.push(repairChildOutcomeDiagnostic(
+              diagnosticSlot.role, outcome, diagnosticSlot.ordinal,
+            ))
+            if (repairChildOutcomeDiagnostics.length > 16) repairChildOutcomeDiagnostics.shift()
+          }
+        }
         const isInitialScout = lease.goal === "Find at least two owner jobs"
         if (isInitialScout) {
           initialScoutReadDiagnostic.sessionMatchesFixture = lease.sessionId === value.sessionId
@@ -13476,9 +13692,21 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           }
           if (hardExecutorFailure && lease.goal === "Find at least two owner jobs") {
             await waitForSuspendedParent(pool!, value.turnId)
-            return { status: "failed", failureReason: "Fixture hard child failure", retryDisposition: "terminal" }
+            const outcome = { status: "failed" as const, failureReason: "Fixture hard child failure", retryDisposition: "terminal" as const }
+            recordChildOutcome(outcome)
+            return outcome
           }
-          return await childExecutor({ lease })
+          const outcome = await childExecutor({ lease })
+          recordChildOutcome(outcome)
+          return outcome
+        } catch (error: unknown) {
+          if (!hardExecutorFailure) {
+            repairChildOutcomeDiagnostics.push(repairChildExceptionDiagnostic(
+              diagnosticSlot.role, diagnosticSlot.ordinal,
+            ))
+            if (repairChildOutcomeDiagnostics.length > 16) repairChildOutcomeDiagnostics.shift()
+          }
+          throw error
         } finally {
           if (isInitialScout) childLeaseByTaskId.delete(lease.id)
         }
@@ -13515,7 +13743,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         // Keep only the fixed failure class if durable wait diagnostics are unavailable.
       }
       const failureMessage = error instanceof Error ? error.message : ""
-      const failureKind = failureMessage.startsWith("TaskGraph root turn entered failed")
+      const failureKind = failureMessage.startsWith("Ready repair wait had incomplete required Analysts")
+        ? "incomplete_required_analysts"
+        : failureMessage.startsWith("TaskGraph root turn entered failed")
         ? "turn_failed"
         : failureMessage.startsWith("TaskGraph root turn did not reach") ? "turn_timeout" : "other"
       const repairStage = repairWaitSent ? "repair_wait_sent"
@@ -13524,6 +13754,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             : terminalGateLease ? "terminal_gate_preflight" : initialWaitSent ? "initial_wait_sent" : "initial_plan_sent"
       const privateWaitRead = privateWaitDiagnostics.latest()
       throw new Error(combineFailureDiagnostics([
+        { label: "childExecutionEvidence", value: "", safeValue: JSON.stringify({
+          outcomes: repairChildOutcomeDiagnostics.slice(-8),
+          lookups: repairToolLookupDiagnostics.slice(-8),
+        }) },
         { label: "repairStage", value: repairStage, safeValue: repairStage },
         { label: "terminalGateLeaseCaptured", value: "", safeValue: String(Boolean(terminalGateLease)) },
         { label: "optimisticFinalAttempted", value: "", safeValue: String(optimisticFinalAttempted) },
