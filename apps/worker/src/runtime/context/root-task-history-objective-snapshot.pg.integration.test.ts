@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto"
+import { spawn, type ChildProcess } from "node:child_process"
+import { fileURLToPath } from "node:url"
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest"
+import { Queue } from "bullmq"
 import { Pool, type PoolClient } from "pg"
+import { Redis } from "ioredis"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 import type { TenantScope } from "@jobcopilot/agent-protocol"
 import { createCanonicalTurnContextBuilder } from "../canonical-turn-context-builder.js"
@@ -19,6 +23,7 @@ import { updateRootObjectiveHistoryProjection } from "./objective-history-projec
 import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "../subagents/task-graph-snapshot.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
+const REDIS_PATH = "/15"
 const OBJECTIVE = "Plan an engineering search"
 const CRITERIA = ["Keep the search within the saved locations"]
 const EMPTY_SNAPSHOT = { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] } as const
@@ -38,6 +43,25 @@ function disposableUrl(): string | null {
     || url.hostname !== "127.0.0.1" || url.port !== "5432" || url.username !== "postgres" || url.password !== "postgres"
     || url.pathname !== `/${DATABASE_NAME}` || url.search || url.hash) {
     throw new Error("Objective snapshot tests require the dedicated loopback disposable URL")
+  }
+  return value
+}
+
+function disposableRedisUrl(): string | null {
+  const value = process.env.AGENT_TURN_REDIS_TEST_URL
+  if (!value) {
+    if (process.env.AGENT_RUNTIME_PG_TEST_REQUIRED === "true" || process.env.RUN_AGENT_TURN_REDIS_INTEGRATION === "1") {
+      throw new Error("Worker snapshot restart tests require disposable Redis")
+    }
+    return null
+  }
+  const url = new URL(value)
+  if (process.env.CI !== "true" || process.env.AGENT_TURN_REDIS_TEST_DISPOSABLE !== "true"
+    || process.env.RUN_AGENT_TURN_REDIS_INTEGRATION !== "1" || url.protocol !== "redis:"
+    || !["127.0.0.1", "localhost", "::1"].includes(url.hostname) || url.port !== "6379"
+    || url.pathname !== REDIS_PATH || url.username || url.password || url.search || url.hash
+    || process.env.REDIS_URL !== value) {
+    throw new Error("Worker snapshot restart tests accept only disposable Redis DB 15")
   }
   return value
 }
@@ -98,7 +122,7 @@ async function insertSourceHistory(pool: Pool, scenario: Scenario): Promise<void
     "toolPolicySnapshot","budgetSnapshot","attemptCount","maxAttempts","completedAt","updatedAt")
     VALUES ($1,$2,$3,$1,NULL,'/source',0,'orchestrator','root','failed',$4,'[]'::jsonb,$5::jsonb,'[]'::jsonb,
       '{}'::jsonb,'{}'::jsonb,'{}'::jsonb,'{}'::jsonb,'{}'::jsonb,1,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`,
-  [scenario.sourceRootTaskId, scenario.sourceSessionId, scenario.sourceTurnId, OBJECTIVE, JSON.stringify(CRITERIA)])
+  [scenario.sourceRootTaskId, scenario.sourceSessionId, scenario.sourceTurnId, OBJECTIVE, JSON.stringify(scenario.turnInput.successCriteria)])
   await pool.query(`INSERT INTO "sub_agent_tasks" ("id","sessionId","turnId","rootTaskId","parentTaskId","path","depth","role","taskType",
     "status","goal","constraints","successCriteria","allowedActions","context","expectedOutputSchema","result","modelProfileSnapshot",
     "toolPolicySnapshot","budgetSnapshot","attemptCount","maxAttempts","completedAt","updatedAt")
@@ -279,18 +303,365 @@ async function snapshotEvent(pool: Pool, sessionId: string) {
 
 async function cleanup(pool: Pool, scenario: Scenario): Promise<void> {
   const sessionIds = [scenario.sessionId, scenario.foreignSessionId, scenario.sourceSessionId]
-  await pool.query(`DELETE FROM "agent_outbox" WHERE "aggregateId"=ANY($1::text[])`, [sessionIds]).catch(() => undefined)
+  await pool.query(`DELETE FROM "agent_outbox" WHERE "aggregateId"=ANY($1::text[])
+    OR "aggregateId" IN (SELECT "id" FROM "agent_sessions" WHERE "userId"=$2)`, [sessionIds, scenario.userId]).catch(() => undefined)
   await pool.query(`DELETE FROM "User" WHERE "id"=$1`, [scenario.userId]).catch(() => undefined)
 }
 
-const databaseUrl = disposableUrl(), describePg = databaseUrl ? describe : describe.skip
+type WorkerScenario = Readonly<{ fixture: Scenario; turnId: string }>
+async function createWorkerScenario(pool: Pool): Promise<WorkerScenario> {
+  const suffix = randomUUID(), userId = `objective-snapshot-worker-user-${suffix}`
+  const sessionId = `objective-snapshot-worker-session-${suffix}`, sourceSessionId = `objective-snapshot-worker-source-${suffix}`
+  const foreignSessionId = `objective-snapshot-worker-foreign-${suffix}`
+  const sourceTurnId = `objective-snapshot-worker-source-turn-${suffix}`
+  const sourceRootTaskId = `objective-snapshot-worker-source-root-${suffix}`
+  const now = new Date(), expires = new Date(now.getTime() + 300_000)
+  const turnInput = { goal: OBJECTIVE, successCriteria: [] as readonly string[] }
+  const fixture: Scenario = {
+    userId, sessionId, sourceSessionId, foreignSessionId, turnId: `pending-${suffix}`,
+    rootTaskId: `pending-root-${suffix}`, stepId: `pending-step-${suffix}`, sourceTurnId, sourceRootTaskId,
+    scope: { userId }, turnInput,
+    lease: { userId, sessionId, turnId: `pending-${suffix}`, ownerId: `pending-owner-${suffix}`, leaseVersion: 1,
+      leaseStartedAt: now, leaseExpiresAt: expires },
+  }
+  scenarios.push(fixture)
+  await pool.query(`INSERT INTO "User" ("id","email","updatedAt") VALUES ($1,$2,CURRENT_TIMESTAMP)`, [userId, `${userId}@example.invalid`])
+  await pool.query(`UPDATE "User" SET "agentTaskHistoryMemoryEnabled"=TRUE,"agentTaskHistoryMemoryConsentVersion"=1,
+    "updatedAt"=CURRENT_TIMESTAMP WHERE "id"=$1`, [userId])
+  await pool.query(`INSERT INTO "agent_sessions" ("id","userId","goal","status","source","eventSequence","updatedAt")
+    VALUES ($1,$2,$3,'running','user',0,CURRENT_TIMESTAMP),($4,$2,$3,'running','user',0,CURRENT_TIMESTAMP)`,
+  [sessionId, userId, OBJECTIVE, sourceSessionId])
+  await insertSourceHistory(pool, fixture)
+
+  const dbModuleName = "@/lib/db", commandsModuleName = "@/lib/agent/control-plane/commands/agent-command-service"
+  const webDatabase = await import(dbModuleName) as unknown as { db: { $disconnect(): Promise<void> } }
+  const commands = await import(commandsModuleName) as unknown as { AgentCommandService: new(db: unknown) => {
+    start(input: { sessionId: string; userId: string; clientMessageId: string; source: "user";
+      content: { type: "text"; text: string }[] }): Promise<{ turnId: string; disposition: string }>
+  } }
+  try {
+    const accepted = await new commands.AgentCommandService(webDatabase.db).start({
+      sessionId, userId, clientMessageId: `objective-snapshot-start-${suffix}`, source: "user",
+      content: [{ type: "text", text: OBJECTIVE }],
+    })
+    expect(accepted.disposition).toBe("started")
+    return { fixture, turnId: accepted.turnId }
+  } finally { await webDatabase.db.$disconnect() }
+}
+
+function startFixtureWorker(mode: string, input: { turnId: string }): WorkerFixtureProcess {
+  const env: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH, SystemRoot: process.env.SystemRoot, CI: "true", NODE_ENV: "test",
+    DATABASE_URL: databaseUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl!, AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true",
+    AGENT_RUNTIME_PG_TEST_REQUIRED: "true", RUN_AGENT_TURN_REDIS_INTEGRATION: "1",
+    AGENT_TURN_REDIS_TEST_URL: redisUrl!, AGENT_TURN_REDIS_TEST_DISPOSABLE: "true", REDIS_URL: redisUrl!,
+    ENABLE_AGENT_CHILD_EXECUTION: "1", ENABLE_AGENT_WAIT_RESOLVER: "1", ENABLE_AGENT_TASK_GRAPH_PLANNING: "1",
+    ENABLE_AGENT_CROSS_SESSION_ROOT_TASK_HISTORY: "1",
+  }
+  const child = spawn(process.execPath, ["--import", "tsx", restartFixturePath, mode, JSON.stringify(input)], {
+    cwd: workerCwd, env, stdio: ["pipe", "pipe", "pipe"],
+  }) as WorkerFixtureProcess
+  child.output = []
+  child.errors = []
+  let stdout = "", stderr = ""
+  child.stdout?.setEncoding("utf8")
+  child.stderr?.setEncoding("utf8")
+  child.stdout?.on("data", (chunk: string) => {
+    stdout += chunk
+    const lines = stdout.split("\n")
+    stdout = lines.pop() ?? ""
+    child.output.push(...lines.map(line => line.trim()).filter(Boolean))
+  })
+  child.stderr?.on("data", (chunk: string) => {
+    stderr += chunk
+    const lines = stderr.split("\n")
+    stderr = lines.pop() ?? ""
+    child.errors.push(...lines.map(line => line.trim()).filter(Boolean))
+  })
+  workerProcesses.push(child)
+  return child
+}
+
+async function waitForFixtureLine(child: WorkerFixtureProcess, marker: string, timeoutMs = 30_000): Promise<string> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const line = child.output.find(value => value.startsWith(marker))
+    if (line) return line
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`Snapshot restart Worker exited before ${marker}: ${child.errors.join(" | ")}`)
+    }
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  throw new Error(`Snapshot restart Worker timed out at ${marker}; stdout=${child.output.join(" | ")}; stderr=${child.errors.join(" | ")}`)
+}
+
+async function forceWorkerExit(child: WorkerFixtureProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return
+  await new Promise<void>(resolve => {
+    const timer = setTimeout(() => child.kill("SIGKILL"), 3_000)
+    child.once("exit", () => { clearTimeout(timer); resolve() })
+    child.kill("SIGKILL")
+  })
+}
+
+async function stopFixtureWorker(child: WorkerFixtureProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return
+  await new Promise<void>(resolve => {
+    const timer = setTimeout(() => child.kill("SIGKILL"), 5_000)
+    child.once("exit", () => { clearTimeout(timer); resolve() })
+    child.stdin?.write("shutdown\n")
+  })
+}
+
+async function removeFixtureTurnJobs(turnId: string): Promise<void> {
+  if (!turnQueue || !workerRedis || !turnJobId) return
+  for (let generation = 0; generation < 5; generation += 1) {
+    const jobId = turnJobId(turnId, generation)
+    await workerRedis.del(`${turnQueue.toKey(jobId)}:lock`)
+    const job = await turnQueue.getJob(jobId)
+    if (job) await job.remove().catch(() => undefined)
+  }
+}
+
+async function waitForWakeupTurn(pool: Pool, turnId: string, sessionId: string, timeoutMs = 20_000): Promise<number> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const result = await pool.query(`SELECT turn."status", wait."status" AS "waitStatus", wait."consumedAt",
+        dispatch."publishedAt", dispatch."attemptCount"
+      FROM "agent_turns" turn JOIN "agent_wait_conditions" wait ON wait."turnId"=turn."id"
+      JOIN "agent_outbox" dispatch ON dispatch."aggregateId"=turn."sessionId" AND dispatch."topic"='agent.turn.dispatch'
+        AND dispatch."idempotencyKey"='turn-dispatch:'||turn."id"
+      WHERE turn."id"=$1 AND turn."sessionId"=$2 AND wait."idempotencyKey"=$3`,
+    [turnId, sessionId, `objective-snapshot-wait:${turnId}`])
+    const row = result.rows[0], generation = Math.max(0, Number(row?.attemptCount ?? 0) - 1)
+    const job = turnQueue && turnJobId ? await turnQueue.getJob(turnJobId(turnId, generation)) : null
+    if (row?.status === "queued" && row.waitStatus === "ready" && !row.consumedAt && row.publishedAt && job) return generation
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  throw new Error("Snapshot restart did not reach published durable wakeup")
+}
+
+async function readSnapshotEnvelope(pool: Pool, sessionId: string) {
+  const result = await pool.query(`SELECT event."id",event."sequence",event."idempotencyKey",event."payload",
+      outbox."id" AS "outboxId",outbox."topic",outbox."aggregateId",outbox."idempotencyKey" AS "outboxKey",outbox."payload" AS "outboxPayload"
+    FROM "agent_events" event JOIN "agent_outbox" outbox ON outbox."id"='agent-outbox-'||event."id"
+    WHERE event."sessionId"=$1 AND event."type"=$2 ORDER BY event."sequence"`,
+  [sessionId, ROOT_TASK_HISTORY_OBJECTIVE_SNAPSHOT_EVENT_TYPE])
+  return result.rows
+}
+
+async function waitForTurnStatus(pool: Pool, turnId: string, expected: "completed" | "failed", timeoutMs = 20_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const result = await pool.query(`SELECT "status" FROM "agent_turns" WHERE "id"=$1`, [turnId])
+    if (result.rows[0]?.status === expected) return
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  throw new Error(`Snapshot restart Turn did not reach ${expected}`)
+}
+
+async function loadAuthorizedCurrentHistory(pool: Pool, fixture: Scenario, turnId: string) {
+  const current = await pool.query<{
+    userId: string; sessionId: string; turnId: string; ownerId: string; leaseVersion: number | string;
+    leaseStartedAt: Date | string; leaseExpiresAt: Date | string; rootTaskId: string;
+    rootAttemptCount: number | string; stepId: string
+  }>(`SELECT turn."userId", turn."sessionId", turn."id" AS "turnId", turn."leaseOwnerId" AS "ownerId",
+      turn."leaseVersion", turn."leaseStartedAt", turn."leaseExpiresAt", root."id" AS "rootTaskId",
+      root."attemptCount" AS "rootAttemptCount", step."id" AS "stepId"
+    FROM "agent_turns" turn JOIN "sub_agent_tasks" root ON root."id"=turn."rootTaskId"
+      AND root."sessionId"=turn."sessionId" AND root."turnId"=turn."id" AND root."rootTaskId"=root."id"
+    JOIN "agent_steps" step ON step."sessionId"=turn."sessionId" AND step."turnId"=turn."id"
+      AND step."taskId"=root."id" AND step."attempt"=root."attemptCount" AND step."status"='streaming'
+    WHERE turn."id"=$1 AND turn."sessionId"=$2 AND turn."userId"=$3 AND turn."status"='in_progress'
+      AND turn."leaseOwnerId" IS NOT NULL AND turn."leaseExpiresAt">CURRENT_TIMESTAMP
+      AND root."status"='running' AND root."leaseOwner"=turn."leaseOwnerId" AND root."leaseExpiresAt">CURRENT_TIMESTAMP
+    ORDER BY step."ordinal" DESC LIMIT 1`, [turnId, fixture.sessionId, fixture.userId])
+  const owner = current.rows[0]
+  if (!owner) throw new Error("Snapshot restart did not retain its active owner fence")
+  const asDate = (value: Date | string) => value instanceof Date ? value : new Date(value)
+  const lease: TurnLease = {
+    userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, ownerId: owner.ownerId,
+    leaseVersion: Number(owner.leaseVersion), leaseStartedAt: asDate(owner.leaseStartedAt), leaseExpiresAt: asDate(owner.leaseExpiresAt),
+  }
+  const rootTaskId = owner.rootTaskId, rootAttemptCount = Number(owner.rootAttemptCount), stepId = owner.stepId
+  const input: DirectRootTaskHistoryLoadInput = { lease, rootTaskId, rootAttemptCount, stepId, now: new Date(),
+    crossSessionRootTaskHistoryEnabled: true }
+  const reader = createPgDirectRootTaskHistoryStore(pool), client = await pool.connect()
+  try {
+    await client.query("BEGIN ISOLATION LEVEL READ COMMITTED")
+    const result = await withRootTaskHistorySessionAuthorization(client, {
+      scope: { userId: fixture.userId }, lease, rootTaskId, rootAttemptCount, stepId, environmentGateEnabled: true,
+    }, async (authorizedClient, _authorization, allowed) => {
+      if (!allowed) throw new Error("Snapshot restart history authorization was not retained")
+      return (await reader.loadWithClient(authorizedClient, input)).filter(outcome => outcome.sourceSessionDiffers === true)
+    })
+    await client.query("COMMIT")
+    return {
+      ownerId: lease.ownerId,
+      consentEnabled: result.authorization.consentEnabled,
+      gateEnabledAtCapture: result.authorization.gateEnabledAtCapture,
+      historyReadAllowed: result.historyReadAllowed,
+      sourceTurnIds: result.workResult.map(outcome => outcome.sourceTurnId),
+    }
+  } catch (error: unknown) {
+    await client.query("ROLLBACK").catch(() => undefined)
+    throw error
+  } finally { client.release() }
+}
+
+async function runObjectiveSnapshotWorkerRestart(pool: Pool, corrupt: boolean): Promise<void> {
+  const { fixture, turnId } = await createWorkerScenario(pool)
+  let queuePaused = false
+  let sourceSessionArchived = false
+  let workerA: WorkerFixtureProcess | undefined, workerB: WorkerFixtureProcess | undefined
+  try {
+    if (await turnQueue!.isPaused()) await turnQueue!.resume()
+    workerA = startFixtureWorker("worker-a", { turnId })
+    const workerAPid = workerA.pid
+    expect(workerAPid).toBeTruthy()
+    await waitForFixtureLine(workerA, "FIXTURE_WORKER_READY_A")
+    await waitForFixtureLine(workerA, "FIXTURE_MODEL_CONTEXT_A_OK")
+    const initialSnapshot = await readSnapshotEnvelope(pool, fixture.sessionId)
+    expect(initialSnapshot).toHaveLength(1)
+    const initialPayload = initialSnapshot[0]?.payload as Record<string, unknown>
+    expect((initialPayload.outcomes as Array<{ sourceTurnId: string }>).map(outcome => outcome.sourceTurnId))
+      .toEqual([fixture.sourceTurnId])
+    const eligibleHistory = await loadAuthorizedCurrentHistory(pool, fixture, turnId)
+    expect(eligibleHistory.ownerId).toBe(`objective-snapshot-worker-a-${workerAPid}`)
+    expect(eligibleHistory).toMatchObject({ consentEnabled: true, gateEnabledAtCapture: true, historyReadAllowed: true })
+    expect(eligibleHistory.sourceTurnIds).toEqual([fixture.sourceTurnId])
+    const archived = await pool.query(`UPDATE "agent_sessions" SET "status"='archived'
+      WHERE "id"=$1 AND "userId"=$2 AND "status"='running' RETURNING "id"`, [fixture.sourceSessionId, fixture.userId])
+    expect(archived.rowCount).toBe(1)
+    sourceSessionArchived = true
+    const excludedHistory = await loadAuthorizedCurrentHistory(pool, fixture, turnId)
+    expect(excludedHistory.ownerId).toBe(`objective-snapshot-worker-a-${workerAPid}`)
+    expect(excludedHistory).toMatchObject({ consentEnabled: true, gateEnabledAtCapture: true, historyReadAllowed: true })
+    expect(excludedHistory.sourceTurnIds).toEqual([])
+    expect((await pool.query<{ enabled: boolean }>(`SELECT "agentTaskHistoryMemoryEnabled" AS "enabled" FROM "User" WHERE "id"=$1`,
+      [fixture.userId])).rows[0]?.enabled).toBe(true)
+    expect(await readSnapshotEnvelope(pool, fixture.sessionId)).toEqual(initialSnapshot)
+    workerA.stdin?.write("continue-turn\n")
+    await waitForFixtureLine(workerA, "FIXTURE_PARENT_SUSPENDED")
+    const initialOutbox = initialSnapshot[0]?.outboxPayload as Record<string, unknown>
+    expect(initialOutbox.payload).toEqual(initialPayload)
+    expect((initialPayload.outcomes as Array<{ sourceTurnId: string }>).map(outcome => outcome.sourceTurnId))
+      .toEqual([fixture.sourceTurnId])
+
+    await turnQueue!.pause()
+    queuePaused = true
+    expect(await turnQueue!.isPaused()).toBe(true)
+    workerA.stdin?.write("complete-child\n")
+    await waitForFixtureLine(workerA, "FIXTURE_RESTART_BOUNDARY_READY")
+    const sourceReads = await waitForFixtureLine(workerA, "FIXTURE_CROSS_SESSION_SOURCE_QUERY_COUNT_A")
+    expect(Number(sourceReads.split(" ").at(-1))).toBeGreaterThan(0)
+    const wakeupGeneration = await waitForWakeupTurn(pool, turnId, fixture.sessionId)
+    expect(wakeupGeneration).toBeGreaterThan(0)
+
+    if (corrupt) {
+      const snapshotId = String(initialSnapshot[0]?.id)
+      const outboxId = String(initialSnapshot[0]?.outboxId)
+      const changedEvent = await pool.query(`UPDATE "agent_events" SET "payload"=jsonb_set("payload",'{objectiveDigest}','"tampered"'::jsonb)
+        WHERE "id"=$1 AND "sessionId"=$2`, [snapshotId, fixture.sessionId])
+      const changedOutbox = await pool.query(`UPDATE "agent_outbox" SET "payload"=jsonb_set("payload",'{payload,objectiveDigest}','"tampered"'::jsonb)
+        WHERE "id"=$1 AND "aggregateId"=$2`, [outboxId, fixture.sessionId])
+      expect(changedEvent.rowCount).toBe(1)
+      expect(changedOutbox.rowCount).toBe(1)
+    }
+    const retainedBeforeRestart = await readSnapshotEnvelope(pool, fixture.sessionId)
+    expect(retainedBeforeRestart).toHaveLength(1)
+    expect((retainedBeforeRestart[0]?.outboxPayload as Record<string, unknown>).payload)
+      .toEqual(retainedBeforeRestart[0]?.payload)
+    if (corrupt) expect((retainedBeforeRestart[0]?.payload as Record<string, unknown>).objectiveDigest).toBe("tampered")
+    else expect(retainedBeforeRestart).toEqual(initialSnapshot)
+
+    await forceWorkerExit(workerA)
+    expect(workerA.signalCode).toBe("SIGKILL")
+    workerB = startFixtureWorker(corrupt ? "worker-b-corrupt" : "worker-b", { turnId })
+    expect(workerB.pid).not.toBe(workerAPid)
+    await waitForFixtureLine(workerB, "FIXTURE_WORKER_READY_B")
+    await turnQueue!.resume()
+    queuePaused = false
+
+    if (corrupt) {
+      await waitForFixtureLine(workerB, "FIXTURE_CORRUPTION_FAILED_CLOSED")
+      await waitForFixtureLine(workerB, "FIXTURE_MODEL_STREAM_NOT_ENTERED_B")
+      expect(workerB.output).not.toContain("FIXTURE_MODEL_STREAM_ENTERED_B")
+      expect(await pool.query(`SELECT 1 FROM "agent_turns" WHERE "id"=$1 AND "status"='failed'`, [turnId]).then(result => result.rows))
+        .toHaveLength(1)
+      const terminal = await pool.query<{ payload: { errorCode?: string } }>(`SELECT "payload" FROM "agent_events"
+        WHERE "turnId"=$1 AND "type"='turn.failed' ORDER BY "sequence" DESC LIMIT 1`, [turnId])
+      expect(terminal.rows[0]?.payload.errorCode).toBe("persistence_conflict")
+      const finalSnapshot = await readSnapshotEnvelope(pool, fixture.sessionId)
+      expect(finalSnapshot).toEqual(retainedBeforeRestart)
+      const replaySourceReads = await waitForFixtureLine(workerB, "FIXTURE_CROSS_SESSION_SOURCE_QUERY_COUNT_B")
+      expect(Number(replaySourceReads.split(" ").at(-1))).toBe(0)
+      await stopFixtureWorker(workerB)
+      expect(workerB.exitCode).toBe(0)
+    } else {
+      const contextLine = await waitForFixtureLine(workerB, "FIXTURE_MODEL_CONTEXT_B_OK")
+      expect(contextLine).toBe("FIXTURE_MODEL_CONTEXT_B_OK")
+      expect(workerB.output).toContain("FIXTURE_MODEL_STREAM_ENTERED_B")
+      const replaySourceReads = await waitForFixtureLine(workerB, "FIXTURE_CROSS_SESSION_SOURCE_QUERY_COUNT_B")
+      expect(Number(replaySourceReads.split(" ").at(-1))).toBe(0)
+      expect(await readSnapshotEnvelope(pool, fixture.sessionId)).toEqual(initialSnapshot)
+      const payload = (await readSnapshotEnvelope(pool, fixture.sessionId))[0]?.payload as Record<string, unknown>
+      const sourceTurnIds = (payload.outcomes as Array<{ sourceTurnId: string }>).map(outcome => outcome.sourceTurnId)
+      expect(sourceTurnIds).toEqual([fixture.sourceTurnId])
+      workerB.stdin?.write("release-model\n")
+      await waitForTurnStatus(pool, turnId, "completed", 30_000)
+      await stopFixtureWorker(workerB)
+      expect(workerB.exitCode).toBe(0)
+    }
+  } finally {
+    for (const child of [workerA, workerB]) if (child) await forceWorkerExit(child)
+    if (sourceSessionArchived) await pool.query(`UPDATE "agent_sessions" SET "status"='running'
+      WHERE "id"=$1 AND "userId"=$2 AND "status"='archived'`, [fixture.sourceSessionId, fixture.userId])
+    if (!(await turnQueue!.isPaused())) { await turnQueue!.pause(); queuePaused = true }
+    await removeFixtureTurnJobs(turnId)
+    if (queuePaused || await turnQueue!.isPaused()) await turnQueue!.resume()
+  }
+}
+
+const databaseUrl = disposableUrl(), redisUrl = disposableRedisUrl()
+const describePg = databaseUrl ? describe : describe.skip
+const describeWorkerRestart = databaseUrl && redisUrl ? describe : describe.skip
+const restartFixturePath = fileURLToPath(new URL("./root-task-history-objective-snapshot-process-restart.fixture.mjs", import.meta.url))
+const workerCwd = fileURLToPath(new URL("../../..", import.meta.url))
 let pool: Pool | undefined
+let workerRedis: Redis | undefined
+let turnQueue: Queue | undefined
+let turnJobId: ((turnId: string, generation?: number) => string) | undefined
 const scenarios: Scenario[] = []
+type WorkerFixtureProcess = ChildProcess & { output: string[]; errors: string[] }
+const workerProcesses: WorkerFixtureProcess[] = []
 
 describePg("root task history objective snapshot PostgreSQL durability", () => {
-  beforeAll(async () => { pool = new Pool({ connectionString: databaseUrl!, max: 6 }) })
-  afterEach(async () => { while (scenarios.length) await cleanup(pool!, scenarios.pop()!) })
-  afterAll(async () => { await pool?.end() })
+  beforeAll(async () => {
+    process.env.DATABASE_URL = databaseUrl!
+    pool = new Pool({ connectionString: databaseUrl!, max: 8 })
+    if (redisUrl) {
+      process.env.REDIS_URL = redisUrl
+      const [turnModule, queueModule] = await Promise.all([
+        import("../turns/recovery-scanner.js"), import("../turns/turn-queue.js"),
+      ])
+      turnJobId = turnModule.turnJobId
+      workerRedis = new Redis(redisUrl, { maxRetriesPerRequest: null, connectTimeout: 2_000, retryStrategy: attempt => attempt > 3 ? null : 100 })
+      await workerRedis.ping()
+      turnQueue = new Queue(queueModule.TURN_QUEUE_NAME, { connection: workerRedis, skipVersionCheck: true })
+      await turnQueue.waitUntilReady()
+    }
+  })
+  afterEach(async () => {
+    for (const child of workerProcesses.splice(0)) await forceWorkerExit(child)
+    if (turnQueue && await turnQueue.isPaused()) await turnQueue.resume()
+    while (scenarios.length) await cleanup(pool!, scenarios.pop()!)
+  })
+  afterAll(async () => {
+    await turnQueue?.close()
+    await workerRedis?.quit()
+    await pool?.end()
+  })
 
   it("commits a non-empty snapshot and replays it from a new connection without reloading prior outcomes", async () => {
     const fixture = await createScenario(pool!, true); scenarios.push(fixture)
@@ -479,5 +850,15 @@ describePg("root task history objective snapshot PostgreSQL durability", () => {
     const staleRoot = failingClosedEngine(pool!, fixture)
     await expect(staleRoot.run()).rejects.toMatchObject({ code: "lease_lost" })
     expect(staleRoot.stream).not.toHaveBeenCalled()
+  })
+
+  describeWorkerRestart("objective snapshot real Worker process restart with fixture ModelAdapter", () => {
+    it("replays the committed source snapshot in Worker B without requerying or replacing it", async () => {
+      await runObjectiveSnapshotWorkerRestart(pool!, false)
+    }, 120_000)
+
+    it("fails closed on a corrupted snapshot before Worker B enters the fixture model stream", async () => {
+      await runObjectiveSnapshotWorkerRestart(pool!, true)
+    }, 120_000)
   })
 })
