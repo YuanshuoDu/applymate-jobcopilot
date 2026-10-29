@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   findSession: vi.fn(),
   findEvents: vi.fn(),
   findAgentEvents: vi.fn(),
+  findAgentItems: vi.fn(),
 }))
 
 vi.mock("@/lib/api-helpers", () => ({
@@ -22,6 +23,9 @@ vi.mock("@/lib/db", () => ({
     },
     agentEvent: {
       findMany: mocks.findAgentEvents,
+    },
+    agentItem: {
+      findMany: mocks.findAgentItems,
     },
     agentTranscriptEvent: {
       findMany: mocks.findEvents,
@@ -47,6 +51,7 @@ describe("agent session events API", () => {
     mocks.findSession.mockReset()
     mocks.findEvents.mockReset()
     mocks.findAgentEvents.mockReset()
+    mocks.findAgentItems.mockReset()
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
     mocks.featureEnabled.mockResolvedValue(false)
   })
@@ -169,6 +174,7 @@ describe("agent session events API", () => {
       payload: { text: "done", accessToken: "private" },
       createdAt: new Date(),
     }])
+    mocks.findAgentItems.mockResolvedValueOnce([{ id: "item_1", type: "agent_message" }])
     const { GET } = await import("./route")
 
     const res = await GET(getRequest("?afterSequence=1", { signal: controller.signal }) as never, params)
@@ -184,6 +190,10 @@ describe("agent session events API", () => {
     expect(mocks.findAgentEvents).toHaveBeenCalledWith(expect.objectContaining({
       where: { sessionId: "session_1", sequence: { gt: BigInt(1) } },
     }))
+    expect(mocks.findAgentItems).toHaveBeenCalledWith({
+      where: { sessionId: "session_1", id: { in: ["item_1"] } },
+      select: { id: true, type: true },
+    })
 
     controller.abort()
     await reader?.cancel()
@@ -213,6 +223,7 @@ describe("agent session events API", () => {
         causationId: null, idempotencyKey: null, payload: { text: "visible event" },
       },
     ])
+    mocks.findAgentItems.mockResolvedValueOnce([{ id: "item_1", type: "agent_message" }])
     const { GET } = await import("./route")
 
     const response = await GET(getRequest("?afterSequence=1", { signal: controller.signal }) as never, params)
@@ -231,6 +242,10 @@ describe("agent session events API", () => {
     expect(mocks.findAgentEvents).toHaveBeenCalledWith(expect.objectContaining({
       where: { sessionId: "session_1", sequence: { gt: BigInt(1) } },
     }))
+    expect(mocks.findAgentItems).toHaveBeenCalledWith({
+      where: { sessionId: "session_1", id: { in: ["item_1"] } },
+      select: { id: true, type: true },
+    })
 
     controller.abort()
     await reader?.cancel()
