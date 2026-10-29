@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest"
 
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import { assertQuestionOwner, assertQuestionUsage, completedQuestionResult, questionId, questionItemId,
-  recoverIncompleteQuestionCall, type TurnQuestionQueryClient, type TurnQuestionReadIdentity } from "./turn-question-store-guards.js"
+  questionConflict, recoverIncompleteQuestionCall, type TurnQuestionQueryClient, type TurnQuestionReadIdentity } from "./turn-question-store-guards.js"
 import { TurnQuestionStoreError, type TurnQuestionUsageInput } from "./turn-question-contract.js"
 
 const owner: TurnExecutionOwnerFence = {
@@ -22,6 +22,28 @@ describe("native question persistence guards", () => {
     expect(questionId(owner, "step-1", "call-1")).toBe(questionId(owner, "step-1", "call-1"))
     expect(questionId(owner, "step-1", "call-1")).not.toBe(questionId(owner, "step-2", "call-1"))
     expect(questionItemId(questionId(owner, "step-1", "call-1"))).toBe(`agent-wait:question:${questionId(owner, "step-1", "call-1")}`)
+  })
+
+  it.each(["+353 87 123 4567", "alex@example.com", "sk_live_secret_token_abc"])("keeps conflict diagnostics safe for opaque call ID %s", id => {
+    const error = questionConflict(`tool call ${id} lineage`)
+    expect(error).toBeInstanceOf(TurnQuestionStoreError)
+    expect(error.code).toBe("question_conflict")
+    expect(error.message).toBe("Question persistence conflict: tool_call")
+    expect(error.message).not.toContain(id)
+  })
+
+  it("does not echo an arbitrary conflict resource when no safe category matches", () => {
+    const error = questionConflict("secret arbitrary input should never be logged")
+    expect(error.message).toBe("Question persistence conflict: state")
+    expect(error.message).not.toContain("secret arbitrary input")
+  })
+
+  it("keeps scheduled execution conflicts in a fixed category without echoing phone-shaped identifiers", () => {
+    const identifier = "+353 87 123 4567"
+    const error = questionConflict(`scheduled execution binding ${identifier}`)
+    expect(error.code).toBe("question_conflict")
+    expect(error.message).toBe("Question persistence conflict: scheduled_execution")
+    expect(error.message).not.toContain(identifier)
   })
 
   it("derives historical question identity and reads a strict receipt without a live lease", async () => {

@@ -27,7 +27,7 @@ describe("scheduled choice binding store", () => {
     }) }
 
     await expect(loadScheduledChoiceBinding(client as unknown as TurnQuestionQueryClient, { owner }))
-      .rejects.toThrow("scheduled execution binding")
+      .rejects.toMatchObject({ code: "question_conflict", message: "Question persistence conflict: scheduled_execution" })
 
     expect(calls).toHaveLength(2)
     expect(calls[0]?.sql).toContain('event."type" = $4')
