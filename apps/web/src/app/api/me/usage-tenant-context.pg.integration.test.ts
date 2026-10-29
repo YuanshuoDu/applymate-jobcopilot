@@ -95,6 +95,22 @@ pgDescribe('cover letter auth and usage on disposable PostgreSQL', () => {
     }
   }, 40_000)
   it('records a real authenticated route request under the candidate identity and user scope', async () => {
+    const { runWithTenantContext, currentTenantUserId } = await import('@/lib/db/tenant-store')
+    expect(currentTenantUserId()).toBeNull()
+    let release!: () => void
+    const barrier = new Promise<void>(resolve => { release = resolve })
+    const first = runWithTenantContext('scope_probe_a', async () => {
+      await barrier
+      return currentTenantUserId()
+    })
+    const second = runWithTenantContext('scope_probe_b', async () => {
+      await Promise.resolve()
+      const actual = currentTenantUserId()
+      release()
+      return actual
+    })
+    expect(await Promise.all([first, second])).toEqual(['scope_probe_a', 'scope_probe_b'])
+    expect(currentTenantUserId()).toBeNull()
     const request = new NextRequest('http://localhost/api/ai/cover-letter', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ resumeContent: {}, jobTitle: 'Engineer', jobCompany: 'Fixture' }) })
     const response = await handler(request)
     expect(response.status).toBe(200)
