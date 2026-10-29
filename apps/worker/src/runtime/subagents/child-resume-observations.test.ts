@@ -5,6 +5,7 @@ import { mergeDurableWaitObservation, resolveDurableWaitOutcome } from "./child-
 
 const targetId = "subagent-00000000-0000-4000-8000-000000000001"
 const otherId = "child-b"
+const phoneShapedCallId = "child-wait-call:415-555-0134"
 const freeText = `Call +1 (415) 555-0134 about ${targetId}`
 const wait = {
   waitId: "wait-1", stepId: "step-1", attempt: 1, ordinal: 2, toolCallId: "wait-call", sourceItemId: "wait-result",
@@ -26,7 +27,7 @@ describe("durable child wait resume observation", () => {
       .toThrow("Persisted child wait result is invalid")
 
     const observations = [
-      { id: "child-resume:old-wait-result", content: { toolCallId: "wait-call", toolName: "wait_subagents", input: wait.input, status: "completed", output: { status: "waiting" }, errorCode: null } },
+      { id: "child-resume:wait-result", content: { toolCallId: "wait-call", toolName: "wait_subagents", input: wait.input, status: "completed", output: { status: "waiting" }, errorCode: null } },
       { id: "child-resume:other-result", content: { toolCallId: "other-call", toolName: "jobs.search", input: {}, status: "completed", output: { jobs: [] }, errorCode: null } },
     ]
     const restored = mergeDurableWaitObservation(observations, wait)
@@ -44,6 +45,53 @@ describe("durable child wait resume observation", () => {
     expect(tasks.map(task => task.taskId)).toEqual([otherId, targetId])
     expect((tasks[1]?.result as Record<string, unknown>).finalText).toBe(redactSensitiveText(freeText))
     expect((tasks[1]?.result as Record<string, unknown>).finalText).not.toContain(targetId)
+  })
+
+  it("retains the validated canonical call ID internally while redacting ordinary restored text", () => {
+    const phoneWait = { ...wait, toolCallId: phoneShapedCallId }
+    const restored = mergeDurableWaitObservation([], phoneWait)
+    const content = restored[0]?.content as Record<string, unknown>
+    const output = content.output as Record<string, unknown>
+    const tasks = output.tasks as Array<Record<string, unknown>>
+
+    expect(redactSensitiveText(phoneShapedCallId)).not.toBe(phoneShapedCallId)
+    expect(content.toolCallId).toBe(phoneShapedCallId)
+    expect((tasks[1]?.result as Record<string, unknown>).finalText).toBe(redactSensitiveText(freeText))
+    expect(JSON.stringify(content.input)).not.toContain(phoneShapedCallId)
+    expect(JSON.stringify(content.output)).not.toContain(phoneShapedCallId)
+  })
+
+  it("matches wait observations by exact raw ID and fails closed on conflicting or duplicate lineage", () => {
+    const phoneWait = { ...wait, toolCallId: phoneShapedCallId }
+    const redactedIdObservation = { id: "child-resume:unrelated", content: { toolCallId: redactSensitiveText(phoneShapedCallId) } }
+    const restored = mergeDurableWaitObservation([redactedIdObservation], phoneWait)
+    expect(restored).toHaveLength(2)
+    expect((restored[1]?.content as Record<string, unknown>).toolCallId).toBe(phoneShapedCallId)
+
+    const prior = { id: `child-resume:${wait.sourceItemId}`, content: { toolCallId: phoneShapedCallId } }
+    expect(mergeDurableWaitObservation([prior], phoneWait)).toHaveLength(1)
+    const oldRedactedSource = { id: `child-resume:${wait.sourceItemId}`, content: { toolCallId: redactSensitiveText(phoneShapedCallId) } }
+    expect((mergeDurableWaitObservation([oldRedactedSource], phoneWait)[0]?.content as Record<string, unknown>).toolCallId)
+      .toBe(phoneShapedCallId)
+    expect(() => mergeDurableWaitObservation([{ id: "tool-result:phone", content: { toolCallId: phoneShapedCallId } }], phoneWait))
+      .toThrow("child_resume_wait_tool_call_conflict")
+    expect(() => mergeDurableWaitObservation([
+      prior,
+      { id: "child-resume:duplicate", content: { toolCallId: phoneShapedCallId } },
+    ], phoneWait)).toThrow("child_resume_wait_tool_call_conflict")
+    expect(() => mergeDurableWaitObservation([
+      { id: "child-resume:wrong-source", content: { toolCallId: phoneShapedCallId } },
+    ], phoneWait)).toThrow("child_resume_wait_tool_call_conflict")
+    expect(() => mergeDurableWaitObservation([
+      { id: `child-resume:${wait.sourceItemId}`, content: { toolCallId: "misbound-call" } },
+    ], phoneWait)).toThrow("child_resume_wait_tool_call_conflict")
+  })
+
+  it("rejects malformed canonical wait call IDs without normalizing their identity", () => {
+    expect(() => mergeDurableWaitObservation([], { ...wait, toolCallId: " " }))
+      .toThrow("child_resume_wait_lineage")
+    expect(() => mergeDurableWaitObservation([], { ...wait, toolCallId: "x".repeat(257) }))
+      .toThrow("child_resume_wait_lineage")
   })
 
   it("rejects duplicate, missing, forged, malformed, and misbound target IDs", () => {

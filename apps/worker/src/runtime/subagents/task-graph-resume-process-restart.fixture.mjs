@@ -1,4 +1,5 @@
 import { errorMonitor } from "node:events"
+import { isDeepStrictEqual } from "node:util"
 import { Queue, Worker } from "bullmq"
 import { Pool } from "pg"
 import { createCanonicalTurnRuntime } from "../canonical-turn-runtime.ts"
@@ -26,6 +27,7 @@ const discoveryWaitCallId = "p3-process-restart-discovery-wait-call"
 const discoveryAnalystPlanCallId = "p3-process-restart-discovery-analyst-plan"
 const discoveryAnalystWaitCallId = "p3-process-restart-discovery-analyst-wait"
 const discoveryFinalMarker = "p3-process-restart-discovery-shortlist-ready"
+const processRestartSearchInput = Object.freeze({ target: "Software Engineer", location: "Dublin", limit: 10 })
 const TASK_GRAPH_KEY_ALLOWLIST = new Set(["source", "summary", followUpKey])
 const CHILD_FAILURE_DIAGNOSTIC_CODES = new Set(["invalid_structured_result", "model_incomplete", "invalid_output", "tool_execution_failed", "timeout", "cancelled", "step_limit", "budget_exhausted", "no_progress", "evidence_missing", "evidence_conflict", "final_unverified", "child_turn_missing", "child_resume_unavailable", "child_resume_evidence_unavailable", "selected_job_sources_unavailable", "selected_job_context_unavailable", "subagent_role_unknown"])
 const CHILD_EXCEPTION_DIAGNOSTIC_NAMES = new Set(["Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "AbortError", "TimeoutError"])
@@ -515,6 +517,40 @@ function assertSourceProjectionDiagnostic() {
   if (sourceProjectionDiagnostic({ ...valid, candidateCount: Number.MAX_SAFE_INTEGER }).candidateCount !== DIAGNOSTIC_COUNT_LIMIT) {
     throw new Error("p3_source_projection_count_bound_self_test_failed")
   }
+}
+function latestToolResultForExactToolInput(request, toolName, expectedInput) {
+  const messages = Array.isArray(request?.messages) ? request.messages : []
+  const uses = []
+  let position = 0
+  for (const message of messages) {
+    const content = Array.isArray(message?.content) ? message.content : []
+    for (const part of content) {
+      if (message?.role === "assistant" && part?.type === "tool_use" && part.name === toolName
+        && isDeepStrictEqual(part.input, expectedInput)) uses.push({ id: part.id, position })
+      position++
+    }
+  }
+  if (uses.length !== 1 || typeof uses[0]?.id !== "string" || !uses[0].id) return null
+  const toolUseId = uses[0].id
+  let sameIdUseCount = 0, resultCount = 0, result = null, resultPosition = -1
+  position = 0
+  for (const message of messages) {
+    const content = Array.isArray(message?.content) ? message.content : []
+    for (const part of content) {
+      if (message?.role === "assistant" && part?.type === "tool_use" && part.id === toolUseId) sameIdUseCount++
+      if (part?.type === "tool_result" && part.toolUseId === toolUseId) {
+        resultCount++
+        result = part
+        resultPosition = position
+      }
+      position++
+    }
+  }
+  if (sameIdUseCount !== 1 || resultCount !== 1 || result?.isError === true
+    || resultPosition <= uses[0].position || typeof result.content !== "string") return null
+  try {
+    return { toolUseId, resultToolUseId: result.toolUseId, result: JSON.parse(result.content) }
+  } catch { return null }
 }
 function latestToolResult(request, callId) {
   const messages = request.messages
@@ -1711,17 +1747,21 @@ async function runSecondWorker() {
       emitChildRuntimeScopeDiagnostic({ phase: "model", sessionId: task.sessionId, turnId: task.turnId,
         userId: task.userId, taskUserId: task.userId, leaseTaskId: task.id })
       let rounds = 0
-      const callId = `p3-process-restart-read:${task.id}:${task.attemptCount}`
+      const callId = `p3-process-restart-read:${task.id}:${task.attemptCount}:415-555-0134`
       return { id: `p3-process-restart-${task.role}-model`, profile: modelProfile(), async *stream(request) {
         rounds++
         if (rounds === 1) {
           if (!request.tools.some(tool => record(tool)?.name === "jobs.search")) throw new Error("p3_restart_child_search_tool_missing")
-          yield toolCall(callId, "jobs.search", { target: "Software Engineer", location: "Dublin", limit: 10 })
+          yield toolCall(callId, "jobs.search", processRestartSearchInput)
           yield { type: "completed", finishReason: "tool_calls" }; return
         }
-        const search = record(latestToolResult(request, callId)), jobs = Array.isArray(search?.jobs) ? search.jobs.map(record) : []
+        const searchReceipt = latestToolResultForExactToolInput(request, "jobs.search", processRestartSearchInput)
+        if (!searchReceipt || searchReceipt.resultToolUseId !== searchReceipt.toolUseId || searchReceipt.toolUseId === callId) {
+          throw new Error("p3_restart_child_search_receipt_missing")
+        }
+        const search = record(searchReceipt.result), jobs = Array.isArray(search?.jobs) ? search.jobs.map(record) : []
         const job = jobs.find(item => item?.id === ids.jobId)
-        const toolResult = toolResultDiagnostics(request, callId)
+        const toolResult = toolResultDiagnostics(request, searchReceipt.toolUseId)
         emitChildRuntimeScopeDiagnostic({ phase: "search_result", sessionId: task.sessionId, turnId: task.turnId,
           userId: task.userId, taskUserId: task.userId, leaseTaskId: task.id,
           modelTaskId: record(request?.metadata)?.taskId, matchingToolResultCount: toolResult.count,
@@ -1867,15 +1907,21 @@ async function runDiscoverySecondWorker() {
     pool, authorizeUsage: async () => ({ settle: async () => undefined }),
     modelRuntimeFactory({ task }) {
       let rounds = 0
-      const callId = `p3-process-restart-discovery-read:${task.id}:${task.attemptCount}`
+      const callId = `p3-process-restart-discovery-read:${task.id}:${task.attemptCount}:415-555-0134`
       return { id: `p3-process-restart-discovery-${task.role}-model`, profile: modelProfile(), async *stream(request) {
         rounds++
         if (rounds === 1) {
           if (!request.tools.some(tool => record(tool)?.name === "jobs.search")) throw new Error("p3_discovery_child_search_tool_missing")
-          yield toolCall(callId, "jobs.search", { target: "Software Engineer", location: "Dublin", limit: 10 })
+          yield toolCall(callId, "jobs.search", processRestartSearchInput)
           yield { type: "completed", finishReason: "tool_calls" }; return
         }
         if (task.role !== "scout" && task.role !== "analyst") throw new Error("p3_unexpected_discovery_child_role")
+        const searchReceipt = latestToolResultForExactToolInput(request, "jobs.search", processRestartSearchInput)
+        if (!searchReceipt || searchReceipt.resultToolUseId !== searchReceipt.toolUseId || searchReceipt.toolUseId === callId) {
+          throw new Error("p3_discovery_child_search_receipt_missing")
+        }
+        const search = record(searchReceipt.result), jobs = Array.isArray(search?.jobs) ? search.jobs.map(record) : []
+        if (!jobs.some(item => item?.id === ids.jobId)) throw new Error("p3_discovery_child_search_receipt_missing")
         const evidence = [{ id: `read:job:${ids.jobId}`, kind: "job", ref: ids.jobId, source: "greenhouse" }]
         const result = task.role === "scout"
           ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed", candidates: [{ jobId: ids.jobId, source: evidence[0].source, url: null, evidenceIds: [evidence[0].id] }], evidence, summary: "Found the persisted fixture role" }
