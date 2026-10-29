@@ -107,10 +107,13 @@ function boundedErrorDetails(error) {
   return { name: typeof error, message: String(error).slice(0, 1_000), stack: null }
 }
 
-function executionStore(owner) {
+function executionStore(owner, beforeAppendEvent) {
   const bind = method => input => {
     const { identity, ...rest } = input
-    return turnStore[method]({ ...rest, owner: identity })
+    const append = () => turnStore[method]({ ...rest, owner: identity })
+    return method === "appendEvent" && beforeAppendEvent
+      ? Promise.resolve(beforeAppendEvent(input)).then(append)
+      : append()
   }
   return { createItem: bind("createItem"), updateItem: bind("updateItem"), appendEvent: bind("appendEvent") }
 }
@@ -122,7 +125,7 @@ function turnExecutionOptions(lease, owner, executeTool, additions = {}) {
     goal: lease.goal,
     snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: additions.observations ?? [] },
     contextBuilder: { build: async () => { throw new Error("fixture_context_builder_not_used") } },
-    store: executionStore(owner),
+    store: executionStore(owner, additions.beforeAppendEvent),
     model: {},
     tools: [],
     executeTool,
@@ -239,14 +242,19 @@ async function claimExactWaitReissue(lease, owner, wait, continuation, now, opti
   }, {
     observations: restored.observations,
     childWaitCallStartKey: (stepId, candidate) => replay.childWaitCallStartKey(stepId, candidate),
+    ...(optionsForCut.crashBeforeClaim ? { beforeAppendEvent: async event => {
+      const expectedClaimKey = `task:${lease.id}:event:${childWaitClaimEventKey(lease.attemptCount, continuation.id)}`
+      const expectedItemId = `task:${lease.id}:item:tool-call:${call.id}:attempt:${lease.attemptCount}`
+      if (event.type === "tool_call.started" && event.itemId === expectedItemId && event.idempotencyKey === expectedClaimKey) {
+        say(`WORKER_B_PRE_CLAIM_ORPHAN ${JSON.stringify({ callId: call.id, stepId: continuation.id,
+          waitId: restoredWait.waitId, exactInput: true, executorCalls: dispatcherCalls })}`)
+        await new Promise(() => {})
+      }
+    } } : {}),
   })
   const writer = new TurnExecutionEventWriter(options)
   if (optionsForCut.crashBeforeClaim) {
-    await executeToolWithItems(options, writer, continuation, call, () => new Date(), () => {
-      say(`WORKER_B_PRE_CLAIM_ORPHAN ${JSON.stringify({ callId: call.id, stepId: continuation.id, waitId: restoredWait.waitId,
-        exactInput: true, executorCalls: dispatcherCalls })}`)
-      return new Promise(() => {})
-    })
+    await executeToolWithItems(options, writer, continuation, call, () => new Date())
     throw new Error("durable_child_wait_preclaim_barrier_returned")
   }
   await executeToolWithItems(options, writer, continuation, call, () => new Date())
