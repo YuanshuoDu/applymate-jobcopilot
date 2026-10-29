@@ -477,6 +477,7 @@ const DLQ_DIAGNOSTIC_CODES = new Set([
 const DLQ_ERROR_DIAGNOSTIC_CODES = new Set([
   "lease_not_available", "lease_lost", "invalid_payload", "cognitive_agenda_resume_fence_invalid", "turn_execution_error",
 ])
+const WAIT_DIAGNOSTIC_STATES = new Set(["waiting", "ready", "consumed", "cancelled", "failed", "expired"])
 function safeDiagnosticCode(value: unknown, allowed: ReadonlySet<string>): string | null {
   return typeof value === "string" ? allowed.has(value) ? value : "other" : null
 }
@@ -485,10 +486,16 @@ async function workerAExecutionDiagnostic(pool: Pool, turnId: string) {
   const result = await pool.query<{
     turnStatus: string; rootStatus: string | null; stepStarted: boolean; modelStarted: boolean; modelFailed: boolean
     rootTaskLinked: boolean; rootTaskPresent: boolean
+    waitCount: number; waitStatus: string | null; waitConsumed: boolean; openChildCount: number
     hasTurnFailedEvent: boolean; turnFailureCode: string | null; dlqReasonCode: string | null; dlqErrorCode: string | null
   }>(
     `SELECT turn."status" AS "turnStatus", root."status" AS "rootStatus",
        turn."rootTaskId" IS NOT NULL AS "rootTaskLinked", root."id" IS NOT NULL AS "rootTaskPresent",
+       (SELECT COUNT(*)::int FROM "agent_wait_conditions" wait WHERE wait."turnId"=turn."id") AS "waitCount",
+       (SELECT wait."status" FROM "agent_wait_conditions" wait WHERE wait."turnId"=turn."id" LIMIT 1) AS "waitStatus",
+       COALESCE((SELECT wait."consumedAt" IS NOT NULL FROM "agent_wait_conditions" wait WHERE wait."turnId"=turn."id" LIMIT 1),false) AS "waitConsumed",
+       (SELECT COUNT(*)::int FROM "sub_agent_tasks" child WHERE child."turnId"=turn."id" AND child."id"<>turn."rootTaskId"
+         AND (child."status" IS NULL OR child."status" NOT IN ('completed','failed','interrupted','cancelled','closed'))) AS "openChildCount",
        EXISTS(SELECT 1 FROM "agent_events" WHERE "turnId"=$1 AND "type"='step.started') AS "stepStarted",
        EXISTS(SELECT 1 FROM "agent_events" WHERE "turnId"=$1 AND "type"='model.started') AS "modelStarted",
        EXISTS(SELECT 1 FROM "agent_events" WHERE "turnId"=$1 AND "type"='model.failed') AS "modelFailed",
@@ -505,6 +512,7 @@ async function workerAExecutionDiagnostic(pool: Pool, turnId: string) {
   if (!row) return null
   return {
     ...row,
+    waitStatus: typeof row.waitStatus === "string" ? WAIT_DIAGNOSTIC_STATES.has(row.waitStatus) ? row.waitStatus : "other" : null,
     turnFailureCode: safeDiagnosticCode(row.turnFailureCode, TURN_FAILURE_DIAGNOSTIC_CODES),
     dlqReasonCode: safeDiagnosticCode(row.dlqReasonCode, DLQ_DIAGNOSTIC_CODES),
     dlqErrorCode: safeDiagnosticCode(row.dlqErrorCode, DLQ_ERROR_DIAGNOSTIC_CODES),
@@ -670,7 +678,7 @@ async function runObjectiveSnapshotWorkerRestart(pool: Pool, corrupt: boolean): 
       expect(sourceTurnIds).toEqual([fixture.sourceTurnId])
       workerB.stdin?.write("release-model\n")
       try { await waitForTurnStatus(pool, turnId, "completed", 30_000) } catch {
-        const markers = workerB.output.filter(line => /^FIXTURE_(WORKER_READY_B|MODEL_STREAM_ENTERED_B|MODEL_CONTEXT_B_OK|CROSS_SESSION_SOURCE_QUERY_COUNT_B)\b/.test(line))
+        const markers = workerB.output.filter(line => /^FIXTURE_(WORKER_READY_B|MODEL_STREAM_ENTERED_B|MODEL_CONTEXT_B_OK|CROSS_SESSION_SOURCE_QUERY_COUNT_B|MODEL_RELEASE_RECEIVED_B|MODEL_FINAL_TEXT_EMITTED_B|MODEL_COMPLETION_EVENT_B)\b/.test(line))
         const fixtureFailure = workerB.errors.find(line => line.startsWith("OBJECTIVE_SNAPSHOT_RESTART_FIXTURE_FAILED")) ?? "none"
         const execution = await workerAExecutionDiagnostic(pool, turnId)
         throw new Error(`Snapshot restart Turn did not reach completed; workerBMarkers=${markers.join(",") || "none"}; fixtureFailure=${fixtureFailure}; execution=${JSON.stringify(execution)}`)
