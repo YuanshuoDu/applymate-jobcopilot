@@ -3,6 +3,7 @@ import { redactSensitiveText } from "@jobcopilot/shared"
 import type { TaskExecutionOwnerFence } from "../execution-owner.js"
 import type { StepContextSnapshot } from "../context/step-context-builder.js"
 
+// The full prefix is reserved; only exact entries in a request-local alias map are accepted.
 const ALIAS_PREFIX = "toolcall"
 const HEX_NIBBLE_ALPHABET = "abcdefghijklmnop"
 const COUNTER_ALPHABET = "abcdefghijklmnopqrstuvwxyz"
@@ -77,6 +78,7 @@ export function projectChildToolCallIdsForModelContext(
   return { snapshot: { ...snapshot, toolObservations }, aliasToCanonical: aliases }
 }
 
+/** Arbitrary provider IDs in the reserved namespace fail unless exactly mapped for this request. */
 export function normalizeProjectedToolCallIds<TCall extends { readonly id: string }>(
   calls: readonly TCall[],
   aliasToCanonical: ReadonlyMap<string, string>,
@@ -87,7 +89,8 @@ export function normalizeProjectedToolCallIds<TCall extends { readonly id: strin
       throw new Error("child_tool_call_projection_invalid_model_id")
     }
     const canonicalId = aliasToCanonical.get(call.id)
-    if (canonicalId === undefined && isAliasId(call.id)) {
+    if (canonicalId === undefined && isReservedAliasNamespace(call.id)) {
+      // Provider IDs are arbitrary; output IDs alone cannot prove provenance for an unmapped collision.
       throw new Error("child_tool_call_projection_unknown_alias")
     }
     const id = canonicalId ?? call.id
@@ -143,11 +146,11 @@ function alphaCounter(value: number): string {
 }
 
 function isUnsafeModelId(value: string): boolean {
-  return redactSensitiveText(value) !== value || isAliasId(value)
+  return redactSensitiveText(value) !== value || isReservedAliasNamespace(value)
 }
 
-function isAliasId(value: string): boolean {
-  return value.startsWith(ALIAS_PREFIX) && /^[a-p]{64}[a-z]+$/.test(value.slice(ALIAS_PREFIX.length))
+function isReservedAliasNamespace(value: string): boolean {
+  return value.startsWith(ALIAS_PREFIX)
 }
 
 function object(value: unknown): Record<string, unknown> | null {

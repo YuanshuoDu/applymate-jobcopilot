@@ -148,15 +148,57 @@ describe("child model-context tool-call ID projection", () => {
     expect(original.toolObservations).toEqual(source)
   })
 
+  it("projects persisted raw IDs throughout the reserved namespace without changing canonical records", () => {
+    const rawIds = [
+      "toolcall",
+      "toolcalltruncated-provider-id",
+      "toolcallmutated-provider-id!",
+      "toolcall" + "a".repeat(64) + "a",
+    ]
+    const original = snapshot(rawIds.map((id, index) => observation(id, `reserved-${index}`)))
+    const projected = projectChildToolCallIdsForModelContext(original, owner(), STEP_ID)
+    const projectedIds = projected.snapshot.toolObservations.map(item =>
+      (item.content as Record<string, unknown>).toolCallId as string,
+    )
+
+    expect(projectedIds).toHaveLength(rawIds.length)
+    expect(new Set(projectedIds).size).toBe(rawIds.length)
+    expect(projectedIds.every(id => /^toolcall[a-p]{64}[a-z]+$/.test(id))).toBe(true)
+    expect(projectedIds.every(id => redactSensitiveText(id) === id)).toBe(true)
+    expect(new Map(projectedIds.map((id, index) => [id, rawIds[index]!] as const))).toEqual(projected.aliasToCanonical)
+    expect(normalizeProjectedToolCallIds(projectedIds.map(id => ({ id })), projected.aliasToCanonical))
+      .toEqual(rawIds.map(id => ({ id })))
+    for (const rawId of rawIds) expect(projectedIds).not.toContain(rawId)
+    expect(original.toolObservations).toEqual(rawIds.map((id, index) => observation(id, `reserved-${index}`)))
+  })
+
   it("maps returned aliases back once, while rejecting duplicate, unknown, malformed, and root-scoped IDs", () => {
     const projection = projectChildToolCallIdsForModelContext(snapshot([observation(PHONE_ID, "phone-result")]), owner(), STEP_ID)
     const alias = [...projection.aliasToCanonical.keys()][0]!
+    const staleAttempt = projectChildToolCallIdsForModelContext(
+      snapshot([observation(PHONE_ID, "phone-result")]), owner({ attemptCount: 2 }), STEP_ID,
+    )
+    const staleAlias = [...staleAttempt.aliasToCanonical.keys()][0]!
+    expect(staleAlias).not.toBe(alias)
+    expect(() => normalizeProjectedToolCallIds([{ id: alias }], staleAttempt.aliasToCanonical))
+      .toThrow("child_tool_call_projection_unknown_alias")
     expect(normalizeProjectedToolCallIds([{ id: alias, name: "wait_subagents" }], projection.aliasToCanonical))
       .toEqual([{ id: PHONE_ID, name: "wait_subagents" }])
     expect(() => normalizeProjectedToolCallIds([{ id: alias }, { id: PHONE_ID }], projection.aliasToCanonical))
       .toThrow("child_tool_call_projection_duplicate_model_id")
     expect(() => normalizeProjectedToolCallIds([{ id: "toolcall" + "a".repeat(64) + "a" }], new Map()))
       .toThrow("child_tool_call_projection_unknown_alias")
+    for (const id of [
+      alias.slice(0, -1),
+      alias.slice(0, -1) + "!",
+      "toolcallstale-provider-id",
+      "toolcallfresh-provider-id",
+    ]) {
+      expect(() => normalizeProjectedToolCallIds([{ id }], projection.aliasToCanonical))
+        .toThrow("child_tool_call_projection_unknown_alias")
+    }
+    expect(normalizeProjectedToolCallIds([{ id: "provider-call-fresh-42" }], projection.aliasToCanonical))
+      .toEqual([{ id: "provider-call-fresh-42" }])
     expect(() => projectChildToolCallIdsForModelContext(snapshot([observation("", "bad")]), owner(), STEP_ID))
       .toThrow("child_tool_call_projection_invalid_id")
     expect(() => projectChildToolCallIdsForModelContext(snapshot([observation("x".repeat(257), "too-long")]), owner(), STEP_ID))
