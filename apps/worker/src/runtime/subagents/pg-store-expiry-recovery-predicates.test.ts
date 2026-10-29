@@ -53,32 +53,63 @@ describe("expired recovery SQL predicates", () => {
     expect(sql).toContain('call."content"->>\'toolCallId\' = started."correlationId"')
     expect(sql).toContain('AND ($9::text IS NULL OR started."id" <> $9)')
     expect(sql).toContain('$10::text IS NOT NULL')
+    expect(sql).toContain('WITH latest_wait AS MATERIALIZED')
+    expect(sql).toContain('LEFT JOIN LATERAL')
   })
 
   it("only allows the exact consumed-wait continuation claim through expiry recovery", async () => {
-    const query = vi.fn().mockResolvedValue({ rows: [] })
+    const deadline = new Date("2026-10-06T10:00:00.000Z")
+    const query = vi.fn().mockResolvedValue({ rows: [{ id: "claim-start", claimWaitId: "wait-1", waitDeadlineAt: deadline, outcomeDeadlineAt: deadline.toISOString() }] })
     const client = { query }
     await expect(hasBlockingExternalCall(client as never, task, undefined, "continuation-1")).resolves.toBe(false)
+    expect(query).toHaveBeenCalledTimes(1)
     const [sql, values] = query.mock.calls[0] as [string, unknown[]]
     expect(values).toEqual([task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount,
       task.leaseExpiresAt, task.userId, null, "continuation-1"])
-    expect(sql).toContain('AND NOT (started."type" = \'tool_call.started\' AND $10::text IS NOT NULL AND EXISTS (')
-    expect(sql).toContain("started.\"idempotencyKey\" = 'task:' || owner.\"id\" || ':event:child-wait-claim:' || $6::text || ':' || continuation.\"id\"")
+    expect(sql).toContain('LEFT JOIN LATERAL (SELECT latest_wait."id" AS "waitId"')
+    expect(sql).toContain('FROM latest_wait WHERE started."type" = \'tool_call.started\' AND $10::text IS NOT NULL AND EXISTS (')
+    expect(sql).toContain("started.\"idempotencyKey\" = 'task:' || owner.\"id\" || ':event:child-wait-claim:' || owner.\"attemptCount\"::text || ':' || continuation.\"id\"")
     expect(sql).toContain('started."causationId" = itemStarted."id"')
-    expect(sql).toContain('itemStarted."idempotencyKey" = \'task:\' || owner."id" || \':event:item-started:\' || call."id"')
-    expect(sql).toContain('call."stepId" = continuation."id"')
+    expect(sql).toContain('itemStarted."idempotencyKey" = \'task:\' || owner."id" || \':event:item-started:\' || claimedCall."id"')
+    expect(sql).toContain('claimedCall."stepId" = continuation."id"')
     expect(sql).toContain('owner."leaseOwner" = $5 AND owner."attemptCount" = $6 AND owner."leaseExpiresAt" = $7')
     expect(sql).toContain('continuation."ordinal" = (SELECT MAX(current."ordinal")')
-    expect(sql).toContain('(call."content"->\'input\' - \'taskIds\') = jsonb_build_object(\'idempotencyKey\', wait."idempotencyKey"')
-    expect(sql).toContain("jsonb_object_length(wait.\"result\"->'outcome') = 6")
+    expect(sql).toContain("sourceResult.\"status\" = 'completed'")
+    expect(sql).toContain("SELECT COUNT(*) FROM jsonb_object_keys(wait.\"result\"->'outcome')")
     expect(sql).toContain("wait.\"result\"->'outcome' ?& ARRAY['waitId', 'status', 'taskIds', 'deadlineAt', 'matchedTaskIds', 'tasks']")
-    expect(sql).toContain("wait.\"result\"->'outcome'->>'deadlineAt' = to_char(wait.\"deadlineAt\"")
+    expect(sql).toContain("sourceResult.\"content\"->'output'->>'deadlineAt' = wait.\"result\"->'outcome'->>'deadlineAt'")
+    expect(sql).toContain("jsonb_typeof(sourceResult.\"content\"->'output'->'taskIds') = 'array'")
+    expect(sql).toContain('AS receiptTarget(id) ORDER BY id)) = (SELECT ARRAY(SELECT id FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(wait."targetTaskIds")')
+    expect(sql).toContain("wait.\"result\"->'outcome'->>'deadlineAt' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T")
+    expect(sql).toContain("clock_timestamp() AT TIME ZONE 'UTC'")
     expect(sql).toContain("jsonb_typeof(wait.\"result\"->'outcome'->'tasks') = 'array'")
-    expect(sql).toContain("jsonb_object_length(saved.value) = 5")
+    expect(sql).toContain("SELECT COUNT(*) FROM jsonb_object_keys(saved.value)")
     expect(sql).toContain("jsonb_typeof(saved.value->'failureReason') IN ('null', 'string')")
-    expect(sql).toContain("wait.\"status\" <> 'timed_out' OR wait.\"deadlineAt\" <= clock_timestamp()")
+    expect(sql).toContain("CASE WHEN jsonb_typeof(claimedCall.\"content\"->'input') = 'object' THEN (claimedCall.\"content\"->'input') - 'taskIds'::text ELSE '{}'::jsonb END")
+    expect(sql).toContain("CASE WHEN jsonb_typeof(sourceCall.\"content\"->'input') = 'object' THEN (sourceCall.\"content\"->'input') - 'taskIds'::text ELSE '{}'::jsonb END")
+    expect(sql).toContain("CASE WHEN jsonb_typeof(call.\"content\"->'input') = 'object' THEN (call.\"content\"->'input') - 'taskIds'::text ELSE '{}'::jsonb END")
     expect(sql).toContain('AND NOT EXISTS (SELECT 1 FROM "agent_items" AS result')
     expect(sql).toContain('AND NOT EXISTS (SELECT 1 FROM "agent_events" AS extra')
+  })
+
+  it("blocks a valid-looking continuation claim when its receipt deadline differs from the database wait", async () => {
+    const query = vi.fn().mockResolvedValue({ rows: [{ id: "claim-start", claimWaitId: "wait-1",
+      waitDeadlineAt: new Date("2026-10-06T10:00:00.000Z"), outcomeDeadlineAt: "2026-10-06T10:00:01.000Z" }] })
+    await expect(hasBlockingExternalCall({ query } as never, task, undefined, "continuation-1")).resolves.toBe(true)
+    expect(query).toHaveBeenCalledTimes(1)
+  })
+
+  it("fails closed when deadline rows are invalid or multiple claim/blocker rows appear", async () => {
+    for (const rows of [
+      [{ id: "claim-start", claimWaitId: "wait-1", waitDeadlineAt: new Date(Number.NaN), outcomeDeadlineAt: "2026-10-06T10:00:00.000Z" }],
+      [{ id: "claim-start", claimWaitId: "wait-1", waitDeadlineAt: new Date("2026-10-06T10:00:00.000Z"), outcomeDeadlineAt: null }],
+      [
+        { id: "claim-start", claimWaitId: "wait-1", waitDeadlineAt: new Date("2026-10-06T10:00:00.000Z"), outcomeDeadlineAt: "2026-10-06T10:00:00.000Z" },
+        { id: "other-start", claimWaitId: null, waitDeadlineAt: null, outcomeDeadlineAt: null },
+      ],
+    ]) {
+      await expect(hasBlockingExternalCall({ query: vi.fn().mockResolvedValue({ rows }) } as never, task, undefined, "continuation-1")).resolves.toBe(true)
+    }
   })
 
   it("does not apply the continuation-claim exemption without an exact continuation step", async () => {
