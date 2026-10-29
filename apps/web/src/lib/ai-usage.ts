@@ -1,5 +1,6 @@
 import { db } from '@/lib/db'
 import { getEffectiveEntitlements } from './entitlements'
+import { currentTenantUserId, runWithTenantContext, tenantRlsEnabled } from './db/tenant-store'
 
 export type AiUsageStatus = 'success' | 'error'
 export type AiUsageRuntime = 'web' | 'worker' | 'admin' | 'unknown'
@@ -46,7 +47,7 @@ async function recordAiBudgetCredit(userId: string, now = new Date()): Promise<v
   })
 }
 
-export async function recordAiUsage(input: {
+type AiUsageInput = {
   userId?: string
   featureKey?: string
   provider: string
@@ -60,7 +61,23 @@ export async function recordAiUsage(input: {
   credentialSource?: 'platform' | 'user'
   runtime?: AiUsageRuntime
   chargeBudget?: boolean
-}): Promise<void> {
+}
+
+export async function recordAiUsage(input: AiUsageInput): Promise<void> {
+  const userId = input.userId
+  if (userId && tenantRlsEnabled()) {
+    const currentUserId = currentTenantUserId()
+    // Never replace an active tenant with a different identity.
+    if (currentUserId && currentUserId !== userId) return
+    // Callers provide a server-resolved usage owner. Establish the context at
+    // the write boundary even when async authentication did not propagate it.
+    await Promise.resolve().then(() => runWithTenantContext(userId, () => writeAiUsage(input))).catch(() => undefined)
+    return
+  }
+  await writeAiUsage(input)
+}
+
+async function writeAiUsage(input: AiUsageInput): Promise<void> {
   if (typeof db.aiUsageEvent?.create === 'function') {
     await db.aiUsageEvent.create({ data: {
       userId: input.userId,

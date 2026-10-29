@@ -3,12 +3,12 @@ import { PrismaClient } from '@prisma/client'
 import { NextRequest } from 'next/server'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 
-const mocks = vi.hoisted(() => ({ fetch: vi.fn(), userId: '' }))
+const mocks = vi.hoisted(() => ({ fetch: vi.fn(), userId: '', creditLimit: null as number | null }))
 vi.mock('@/lib/safe-auth', () => ({ safeAuth: async () => ({ user: { id: mocks.userId } }) }))
 vi.mock('@/lib/entitlements', () => ({
   isFeatureAllowed: async () => true,
   resolveAiAccess: async () => 'allowed',
-  getEffectiveEntitlements: async () => ({ limits: { ai_credits: null } }),
+  getEffectiveEntitlements: async () => ({ limits: { ai_credits: mocks.creditLimit } }),
 }))
 vi.mock('@/lib/admin/ai-config', () => ({ resolvePlatformRoute: async () => { throw new Error('unexpected platform route') } }))
 vi.mock('@jobcopilot/shared/pinned-outbound', () => ({ pinnedFetch: mocks.fetch }))
@@ -68,6 +68,15 @@ pgDescribe('cover letter auth and usage on disposable PostgreSQL', () => {
     await admin.$executeRawUnsafe(`ALTER TABLE "${schema}".ai_usage_events ENABLE ROW LEVEL SECURITY`)
     await admin.$executeRawUnsafe(`CREATE POLICY owner_isolation ON "${schema}".ai_usage_events USING (user_id = NULLIF(current_setting('app.user_id', true), '')) WITH CHECK (user_id = NULLIF(current_setting('app.user_id', true), ''))`)
     await admin.$executeRawUnsafe(`GRANT SELECT, INSERT ON "${schema}".ai_usage_events TO "${candidate}", "${login}"`)
+    await admin.$executeRawUnsafe(`CREATE TABLE "${schema}".ai_budgets (
+      id text PRIMARY KEY, user_id text NOT NULL, month text NOT NULL, used integer NOT NULL DEFAULT 0,
+      "limit" integer NOT NULL DEFAULT 30, version integer NOT NULL DEFAULT 1,
+      created_at timestamp(3) NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at timestamp(3) NOT NULL,
+      UNIQUE (user_id, month)
+    )`)
+    await admin.$executeRawUnsafe(`ALTER TABLE "${schema}".ai_budgets ENABLE ROW LEVEL SECURITY`)
+    await admin.$executeRawUnsafe(`CREATE POLICY budget_owner_isolation ON "${schema}".ai_budgets USING (user_id = NULLIF(current_setting('app.user_id', true), '')) WITH CHECK (user_id = NULLIF(current_setting('app.user_id', true), ''))`)
+    await admin.$executeRawUnsafe(`GRANT SELECT, INSERT, UPDATE ON "${schema}".ai_budgets TO "${candidate}", "${login}"`)
     const appUrl = new URL(url!)
     appUrl.username = login
     appUrl.password = 'fixture-only-password'
@@ -94,6 +103,56 @@ pgDescribe('cover letter auth and usage on disposable PostgreSQL', () => {
       if (value === undefined) delete process.env[key]; else process.env[key] = value
     }
   }, 40_000)
+  it('isolates concurrent usage writes for different users', async () => {
+    const { recordAiUsage } = await import('@/lib/ai-usage')
+    const users = [`concurrent_a_${suffix}`, `concurrent_b_${suffix}`]
+    await Promise.all(users.map(userId => recordAiUsage({
+      userId, provider: 'fixture', model: 'fixture', latencyMs: 1, status: 'success', chargeBudget: false,
+    })))
+    const rows = await admin.$queryRawUnsafe<Array<{user_id:string; observed_role:string; observed_user:string}>>(
+      `SELECT user_id, observed_role, observed_user FROM "${schema}".ai_usage_events WHERE user_id IN ($1, $2) ORDER BY user_id`, ...users,
+    )
+    expect(rows).toEqual(users.map(userId => ({ user_id: userId, observed_role: candidate, observed_user: userId })))
+  }, 40_000)
+
+  it('charges the scoped budget once for success and failure, but not a no-charge attempt', async () => {
+    const { recordAiUsage } = await import('@/lib/ai-usage')
+    const budgetUser = `budget_${suffix}`
+    mocks.creditLimit = 30
+    try {
+      await recordAiUsage({ userId: budgetUser, provider: 'fixture', model: 'm', latencyMs: 1, status: 'success' })
+      await recordAiUsage({ userId: budgetUser, provider: 'fixture', model: 'm', latencyMs: 1, status: 'error' })
+      await recordAiUsage({ userId: budgetUser, provider: 'fixture', model: 'm', latencyMs: 1, status: 'error', chargeBudget: false })
+      const budgets = await admin.$queryRawUnsafe<Array<{user_id:string; used:number; limit:number}>>(
+        `SELECT user_id, used, "limit" FROM "${schema}".ai_budgets WHERE user_id = $1`, budgetUser,
+      )
+      expect(budgets).toEqual([{ user_id: budgetUser, used: 2, limit: 30 }])
+      const rows = await admin.$queryRawUnsafe<Array<{count:bigint}>>(`SELECT COUNT(*) AS count FROM "${schema}".ai_usage_events WHERE user_id = $1`, budgetUser)
+      expect(Number(rows[0].count)).toBe(3)
+    } finally { mocks.creditLimit = null }
+  }, 40_000)
+
+  it('records an administrative provider test without charging or including it in personal usage', async () => {
+    const { recordAiUsage } = await import('@/lib/ai-usage')
+    const { readPersonalUsage } = await import('@/lib/personal-usage')
+    const { runWithTenantContext } = await import('@/lib/db/tenant-store')
+    const adminUser = `admin_${suffix}`
+    mocks.creditLimit = 30
+    try {
+      await recordAiUsage({ userId: adminUser, featureKey: 'providerTest', provider: 'fixture', model: 'catalog',
+        runtime: 'admin', latencyMs: 1, status: 'success', chargeBudget: false })
+      const rows = await admin.$queryRawUnsafe<Array<{user_id:string; feature_key:string; observed_role:string; observed_user:string}>>(
+        `SELECT user_id, feature_key, observed_role, observed_user FROM "${schema}".ai_usage_events WHERE user_id = $1`, adminUser,
+      )
+      expect(rows).toEqual([{ user_id: adminUser, feature_key: 'providerTest', observed_role: candidate, observed_user: adminUser }])
+      const budget = await admin.$queryRawUnsafe<Array<{count:bigint}>>(`SELECT count(*) AS count FROM "${schema}".ai_budgets WHERE user_id = $1`, adminUser)
+      expect(Number(budget[0].count)).toBe(0)
+      const usage = await runWithTenantContext(adminUser, () => appDb.$transaction(tx => readPersonalUsage(tx, adminUser, 30)))
+      expect(usage.summary).toEqual({ calls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 })
+      expect(usage.models).toEqual([])
+    } finally { mocks.creditLimit = null }
+  }, 40_000)
+
   it('records a real authenticated route request under the candidate identity and user scope', async () => {
     const { runWithTenantContext, currentTenantUserId } = await import('@/lib/db/tenant-store')
     expect(currentTenantUserId()).toBeNull()
@@ -113,9 +172,10 @@ pgDescribe('cover letter auth and usage on disposable PostgreSQL', () => {
     expect(currentTenantUserId()).toBeNull()
     const request = new NextRequest('http://localhost/api/ai/cover-letter', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ resumeContent: {}, jobTitle: 'Engineer', jobCompany: 'Fixture' }) })
     const response = await handler(request)
+    if (!response) throw new Error('Cover-letter route returned no response')
     expect(response.status).toBe(200)
     expect(mocks.fetch).toHaveBeenCalledTimes(1)
-    const rows = await admin.$queryRawUnsafe<Array<{user_id:string; observed_role:string; observed_user:string; input_tokens:number; output_tokens:number}>>(`SELECT user_id, observed_role, observed_user, input_tokens, output_tokens FROM "${schema}".ai_usage_events`)
+    const rows = await admin.$queryRawUnsafe<Array<{user_id:string; observed_role:string; observed_user:string; input_tokens:number; output_tokens:number}>>(`SELECT user_id, observed_role, observed_user, input_tokens, output_tokens FROM "${schema}".ai_usage_events WHERE user_id = $1`, user)
     expect(rows).toEqual([{ user_id: user, observed_role: candidate, observed_user: user, input_tokens: 12, output_tokens: 34 }])
   }, 40_000)
 })

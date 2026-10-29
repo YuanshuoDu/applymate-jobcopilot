@@ -118,6 +118,52 @@ describePg('personal usage with disposable PostgreSQL', () => {
     }, { timeout: 30_000 })
   }, 40_000)
 
+  it.each(['role-first', 'migration-first'] as const)('preserves direct candidate grants in %s rollout order', async order => {
+    const roleName = 'usage_order_' + randomUUID().replaceAll('-', '')
+    const schemaName = 'usage_fn_' + randomUUID().replaceAll('-', '')
+    const readSql = (file: string) => readFileSync(join(process.cwd(), file), 'utf8').replace(/--[^\r\n]*/g, '').replaceAll('applymate_candidate', roleName)
+    const grants = readSql('prisma/rls/role-grants.sql')
+    const migration = readSql('prisma/migrations/20261028220000_secure_personal_ai_usage/migration.sql')
+    const statements = (sql: string) => sql.match(/\s*DO\s+\$\$[\s\S]*?\$\$;|\s*[^;]+;/g) ?? []
+    const names = [...new Set([...grants.matchAll(/"([A-Za-z_][A-Za-z0-9_]*)"/g)].map(match => match[1]))]
+    await db.$transaction(async tx => {
+      await tx.$executeRawUnsafe(`CREATE SCHEMA "${schemaName}"`)
+      await tx.$executeRawUnsafe(`CREATE FUNCTION "${schemaName}".app_current_user_id() RETURNS text LANGUAGE sql STABLE AS $$ SELECT NULLIF(current_setting('app.user_id', true), '') $$`)
+      await tx.$executeRawUnsafe(`SET LOCAL search_path TO pg_temp, "${schemaName}", public`)
+      await tx.$executeRawUnsafe('CREATE TEMP TABLE ai_usage_events (user_id text, status text, input_tokens integer, output_tokens integer, estimated_cost_usd double precision, error_code text) ON COMMIT DROP')
+      for (const name of names.filter(name => name !== 'ai_usage_events')) await tx.$executeRawUnsafe(`CREATE TEMP TABLE "${name}" (id integer) ON COMMIT DROP`)
+      const execute = async (sql: string) => { for (const statement of statements(sql)) await tx.$executeRawUnsafe(statement) }
+      if (order === 'role-first') {
+        await execute(grants)
+        // Simulate a previously applied broad table grant.
+        await tx.$executeRawUnsafe(`GRANT UPDATE, DELETE ON ai_usage_events TO "${roleName}"`)
+        await execute(migration)
+      } else {
+        await execute(migration)
+        await execute(grants)
+      }
+      const check = async () => {
+        const rows = await tx.$queryRawUnsafe<Array<{readable: boolean; insertable: boolean; all_update: boolean; deletable: boolean; owner_update: boolean; columns_ok: boolean}>>(`
+          SELECT has_table_privilege($1, 'pg_temp.ai_usage_events', 'SELECT') AS readable,
+            has_table_privilege($1, 'pg_temp.ai_usage_events', 'INSERT') AS insertable,
+            has_table_privilege($1, 'pg_temp.ai_usage_events', 'UPDATE') AS all_update,
+            has_table_privilege($1, 'pg_temp.ai_usage_events', 'DELETE') AS deletable,
+            has_column_privilege($1, 'pg_temp.ai_usage_events', 'user_id', 'UPDATE') AS owner_update,
+            has_column_privilege($1, 'pg_temp.ai_usage_events', 'status', 'UPDATE') AND
+            has_column_privilege($1, 'pg_temp.ai_usage_events', 'input_tokens', 'UPDATE') AND
+            has_column_privilege($1, 'pg_temp.ai_usage_events', 'output_tokens', 'UPDATE') AND
+            has_column_privilege($1, 'pg_temp.ai_usage_events', 'estimated_cost_usd', 'UPDATE') AND
+            has_column_privilege($1, 'pg_temp.ai_usage_events', 'error_code', 'UPDATE') AS columns_ok`, roleName)
+        expect(rows[0]).toEqual({ readable: true, insertable: true, all_update: false, deletable: false, owner_update: false, columns_ok: true })
+      }
+      await check()
+      // Reapplying the role script must not restore table-wide writes.
+      await execute(grants)
+      await check()
+      // Roll back schema, role, grants and temp objects rather than changing the disposable instance.
+      throw new Error('ROLLBACK_USAGE_ORDER_FIXTURE')
+    }, { timeout: 30_000 }).catch(error => { if (!(error instanceof Error) || error.message !== 'ROLLBACK_USAGE_ORDER_FIXTURE') throw error })
+  }, 40_000)
   it('uses UTC for future default and explicit writer timestamps in a non-UTC database session', async () => {
     const migration = readFileSync(join(process.cwd(), 'prisma/migrations/20261028143000_ai_usage_created_at_utc/migration.sql'), 'utf8')
     await db.$transaction(async tx => {
