@@ -23,7 +23,8 @@ function graph(nodes: readonly TaskGraphCurrentNode[]): TaskGraphCurrentState {
   return { revision: 9, nodes }
 }
 function outcome(id: string, sequence: bigint, nodes: readonly TaskGraphCurrentNode[] = [node()]): ValidatedRootTaskHistoryOutcome {
-  return { sourceTurnId: "turn-" + id, sourceRootTaskId: "root-" + id, terminalSequence: sequence, taskGraph: graph(nodes) }
+  return { sourceTurnId: "turn-" + id, sourceRootTaskId: "root-" + id, terminalSequence: sequence,
+    terminalXid8: (sequence + 1_000n).toString(), terminalWitnessEventId: "witness-" + id, taskGraph: graph(nodes) }
 }
 function queryFootprint(targetRoles: readonly string[] = ["Backend Engineer"]) {
   return createDiscoveryQueryFootprint([{ criteria: { targetRoles, targetLocations: ["Dublin"],
@@ -35,7 +36,6 @@ function scoutWithFootprint(footprint: unknown, overrides: Partial<TaskGraphCurr
     criteria: [{ id: "scout-count", check: { kind: "candidate_count_gte", minimum: 1 } }] },
     discoveryQueryFootprint: footprint as TaskGraphCurrentNode["discoveryQueryFootprint"], ...overrides })
 }
-
 describe("root task history projection", () => {
   it("emits only typed advisory outcomes and negative reason codes", () => {
     const projected = projectRootTaskHistory([outcome("private-source", 12n)])
@@ -154,9 +154,9 @@ describe("root task history projection", () => {
       { taskKind: "scout", lesson: { criterionFailures: [{ check: { kind: "candidate_count_gte", minimum: 2 } }] } },
     ] }] })
 
-    const foreign = { ...facts, terminalAt: new Date("2026-10-07T11:00:00.000Z"), sourceSessionDiffers: true }
+    const foreign = { ...facts, sourceSessionDiffers: true }
     const sameSession = { ...facts, sourceTurnId: "turn-same-session", sourceRootTaskId: "root-same-session",
-      terminalAt: new Date("2026-10-07T11:01:00.000Z"), sourceSessionDiffers: false }
+      sourceSessionDiffers: false }
     const historical = projectRootTaskHistory([foreign, sameSession], true)
     expect(historical?.content).toMatchObject({ historical: true, advisoryOnly: true, notCurrentEvidence: true,
       turns: expect.any(Array) })
@@ -187,8 +187,7 @@ describe("root task history projection", () => {
     expect(foreignFailure?.lesson).not.toHaveProperty("criterionFailures.0.check")
     const serialized = JSON.stringify(historical)
     expect(serialized).not.toContain("sourceSessionDiffers")
-    const unknownLocality = { ...facts, sourceTurnId: "turn-unknown-session", sourceRootTaskId: "root-unknown-session",
-      terminalAt: foreign.terminalAt }
+    const unknownLocality = { ...facts, sourceTurnId: "turn-unknown-session", sourceRootTaskId: "root-unknown-session" }
     expect(projectRootTaskHistory([unknownLocality], true)?.content)
       .toEqual(projectRootTaskHistory([foreign], true)?.content)
   })
@@ -204,7 +203,7 @@ describe("root task history projection", () => {
         check: { role: "scout", kind: "candidate_count_gte", minimum: 3 } }],
       failedRepairOf: { targetNodeOrdinal: 1, targetCriterionOrdinals: [1], outcome: "verified_failed" } } as const
     const source = outcome("failed-repair-history", 40n, [target, repair])
-    const foreign = { ...source, terminalAt: new Date("2026-10-07T11:00:00.000Z"), sourceSessionDiffers: true,
+    const foreign = { ...source, sourceSessionDiffers: true,
       sourceNodeOrdinals: [1, 2], nodeLessons: [targetLesson, repairLesson] as const }
     const projected = projectRootTaskHistory([foreign], true)
     expect(projected?.content).toMatchObject({ historical: true, turns: [{ nodes: expect.arrayContaining([
@@ -253,7 +252,7 @@ describe("root task history projection", () => {
       candidates: [{ jobId: "private-job", source: "greenhouse", evidenceKinds: ["job"] }] } satisfies TaskGraphResultProjection
     const base = { ...outcome("accessor-locality", 31n, [
       node({ status: "completed", failureReason: null, resultProjection }), node(), node({ templateId: "analyst" }),
-    ]), terminalAt: new Date("2026-10-07T11:00:00.000Z"), sourceNodeOrdinals: [1, 2, 3],
+    ]), sourceNodeOrdinals: [1, 2, 3],
     nodeLessons: [undefined, { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true, nodeOrdinal: 2,
       criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met",
         check: { role: "scout", kind: "candidate_count_gte", minimum: 2 } }] },
@@ -293,10 +292,9 @@ describe("root task history projection", () => {
       expect(serialized).not.toContain(privateValue)
     }
 
-    const terminalAt = new Date("2026-10-08T11:00:00.000Z")
-    const explicitLocality = { ...local, terminalAt, sourceSessionDiffers: false }
-    const foreign = { ...local, terminalAt, sourceSessionDiffers: true }
-    const unknownLocality = { ...local, terminalAt }
+    const explicitLocality = { ...local, sourceSessionDiffers: false }
+    const foreign = { ...local, sourceSessionDiffers: true }
+    const unknownLocality = { ...local }
     const localShape = (value: ValidatedRootTaskHistoryOutcome) => {
       const projected = projectRootTaskHistory([value], true)
       return (projected?.content as { turns?: Array<{ planShape?: unknown }> } | undefined)?.turns?.[0]?.planShape
@@ -396,7 +394,7 @@ describe("root task history projection", () => {
         criterionOrdinal: criterionIndex + 1, status: "failed" as const, reasonCode: "criterion_not_met" as const,
         check: { role: "analyst" as const, kind: "finding_count_gte" as const, minimum: 1 },
       })) }))
-    const source = { ...outcome("large-cross-session", 19n, nodes), terminalAt: new Date("2026-10-07T11:00:00.000Z"), sourceSessionDiffers: true,
+    const source = { ...outcome("large-cross-session", 19n, nodes), sourceSessionDiffers: true,
       sourceNodeOrdinals: nodes.map((_, index) => index + 1), nodeLessons: lessons }
     const projected = projectRootTaskHistory([source], true)
     const turns = (projected?.content as { turns?: Array<{ nodes: Array<{ lesson?: { criterionFailures: unknown[] } }> }> } | undefined)?.turns
@@ -419,7 +417,7 @@ describe("root task history projection", () => {
         criterionOrdinal: criterionIndex + 1, status: "passed" as const,
         check: { role: "analyst" as const, kind: "reported_score_gte" as const, minimumScore: 10, minimumFindings: 8, aggregation: "all" as const },
       })) }))
-    const source = { ...outcome("large-cross-session", 19n, nodes), terminalAt: new Date("2026-10-07T11:00:00.000Z"), sourceSessionDiffers: true,
+    const source = { ...outcome("large-cross-session", 19n, nodes), sourceSessionDiffers: true,
       sourceNodeOrdinals: nodes.map((_, index) => index + 1), nodeLessons: lessons }
     const projected = projectRootTaskHistory([source], true)
     const turns = (projected?.content as { turns?: Array<{ nodes: Array<{ lesson?: { nodeOrdinal: number; passedCriteria: unknown[] } }> }> } | undefined)?.turns
@@ -457,11 +455,11 @@ describe("root task history projection", () => {
       criterionFailures: [{ criterionOrdinal, status: "failed" as const, reasonCode }],
     })
     const oldOutcome = { ...outcome("old-local-frame", 10n, [targetA, repairA]),
-      terminalAt: new Date("2026-10-07T10:00:00.000Z"), sourceSessionDiffers: true, sourceNodeOrdinals: [1, 2],
+      sourceSessionDiffers: true, sourceNodeOrdinals: [1, 2],
       nodeLessons: [lesson(1, 1, "criterion_not_met"), { ...lesson(2, 1, "criterion_not_met"), criterionFailures: [],
         successfulRepairs: [{ targetNodeOrdinal: 1, targetCriterionOrdinals: [1], status: "passed" as const }] }] }
     const newOutcome = { ...outcome("new-local-frame", 11n, [targetB, repairB]),
-      terminalAt: new Date("2026-10-07T11:00:00.000Z"), sourceSessionDiffers: true, sourceNodeOrdinals: [1, 2],
+      sourceSessionDiffers: true, sourceNodeOrdinals: [1, 2],
       nodeLessons: [lesson(1, 2, "canonical_evidence_missing"), { ...lesson(2, 2, "canonical_evidence_missing"), criterionFailures: [],
         successfulRepairs: [{ targetNodeOrdinal: 1, targetCriterionOrdinals: [2], status: "passed" as const }] }] }
 
@@ -676,23 +674,25 @@ describe("root task history projection", () => {
     expect(JSON.stringify(projected)).not.toContain("unknown-private-template")
   })
 
-  it("orders cross-session outcomes by DB time and breaks equal-time ties by descending Turn ID", () => {
-    const terminalAt = new Date("2026-10-07T11:00:00.000Z")
-    const highTurnId = { ...outcome("z-source", 1n, [node({ status: "running" })]), terminalAt, sourceSessionDiffers: true }
-    const lowTurnId = { ...outcome("a-source", 90n, [node({ status: "queued" })]), terminalAt, sourceSessionDiffers: true }
-    const olderTime = { ...outcome("older-time", 100n, [node({ status: "interrupted" })]),
-      terminalAt: new Date(terminalAt.getTime() - 1), sourceSessionDiffers: true }
+  it("orders cross-session outcomes by numeric xid8 and breaks equal-xid ties by descending Turn ID", () => {
+    const highTurnId = { ...outcome("z-source", 1n, [node({ status: "running" })]), terminalXid8: "30", sourceSessionDiffers: true }
+    const lowTurnId = { ...outcome("a-source", 90n, [node({ status: "queued" })]), terminalXid8: "30", sourceSessionDiffers: true }
+    const olderXid = { ...outcome("older-xid", 100n, [node({ status: "interrupted" })]),
+      terminalXid8: "20", sourceSessionDiffers: true }
     const projected = projectRootTaskHistory([lowTurnId, highTurnId], true)
     const turns = (projected?.content as { turns: Array<{ nodes: Array<{ status: string }> }> }).turns
 
     expect(turns.map(turn => turn.nodes[0]?.status)).toEqual(["running", "queued"])
-    const byTime = projectRootTaskHistory([olderTime, highTurnId], true)?.content as { turns: Array<{ nodes: Array<{ status: string }> }> }
-    expect(byTime.turns.map(turn => turn.nodes[0]?.status)).toEqual(["running", "interrupted"])
-    expect(projectRootTaskHistory([{ ...outcome("missing-source-session-scope", 3n), terminalAt }], true)?.content)
+    const byXid = projectRootTaskHistory([olderXid, highTurnId], true)?.content as { turns: Array<{ nodes: Array<{ status: string }> }> }
+    expect(byXid.turns.map(turn => turn.nodes[0]?.status)).toEqual(["running", "interrupted"])
+    expect(projectRootTaskHistory([outcome("missing-source-session-scope", 3n)], true)?.content)
       .toMatchObject({ historical: true, advisoryOnly: true })
-    expect(projectRootTaskHistory([{ ...outcome("invalid-source-session-scope", 4n), terminalAt,
+    expect(projectRootTaskHistory([{ ...outcome("invalid-source-session-scope", 4n),
       sourceSessionDiffers: "foreign" as unknown as boolean }], true)).toBeUndefined()
-    expect(projectRootTaskHistory([{ ...outcome("missing-terminal-time", 2n), sourceSessionDiffers: false }], true)).toBeUndefined()
+    const missingWitness = { ...outcome("missing-terminal-witness", 2n), sourceSessionDiffers: false }
+    delete (missingWitness as { terminalXid8?: string }).terminalXid8
+    delete (missingWitness as { terminalWitnessEventId?: string }).terminalWitnessEventId
+    expect(projectRootTaskHistory([missingWitness], true)).toBeUndefined()
   })
 
   it("strips large untrusted node strings before applying the byte bound", () => {
@@ -749,8 +749,8 @@ describe("root task history Scout query footprints", () => {
   })
 
   it("rechecks cross-session locality in the final serializer while keeping the existing history", () => {
-    const scout = scoutWithFootprint(queryFootprint()), terminalAt = new Date("2026-10-27T00:00:00Z")
-    const crossSession = { ...outcome("cross-session-footprint", 2n, [scout]), terminalAt, sourceSessionDiffers: true,
+    const scout = scoutWithFootprint(queryFootprint())
+    const crossSession = { ...outcome("cross-session-footprint", 2n, [scout]), sourceSessionDiffers: true,
       taskGraph: { ...graph([scout]), discoveryTurnEligibility: "ordinary" as const } }
     const projected = projectRootTaskHistory([crossSession], true)
     const history = projected?.content as { historical?: boolean; turns: Array<{ nodes: Array<Record<string, unknown>> }> }

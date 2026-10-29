@@ -1,5 +1,5 @@
 import type pg from "pg"
-import { describe, expect, it, vi } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 import type { TenantScope } from "@jobcopilot/agent-protocol"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 import type { InputClaimStore, InputClaimTransaction } from "./context/input-claim-store.js"
@@ -31,11 +31,63 @@ import { createCanonicalTurnContextBuilder } from "./canonical-turn-context-buil
 import { mergeTaskGraphCurrentObservation } from "./canonical-turn-task-graph-context.js"
 import type { DirectSelectedJobHistoryReader, SelectedJobHistoryReader } from "./canonical-turn-selected-job-history.js"
 import type { DirectRootTaskHistoryReader } from "./canonical-turn-root-task-history.js"
+import type { DirectRootTaskHistoryLoadInput } from "./context/root-task-history-direct-store.js"
 import type { StepContext } from "./context/step-context-builder.js"
 import type { TurnLease } from "./turns/lease.js"
+import type { RootTaskHistorySessionAuthorizationInput, AuthorizedRootTaskHistoryWork } from "./context/root-task-history-session-memory.js"
+import type { RootTaskHistoryFence } from "./context/root-task-history-fence.js"
+import type { RootTaskHistorySteerEvidence } from "./context/root-task-history-steer-evidence.js"
 
 const discoveryPersona = vi.hoisted(() => ({ load: vi.fn() }))
+const rootHistoryHarness = vi.hoisted(() => ({
+  createTransaction: vi.fn(), authorize: vi.fn(), readSteer: vi.fn(), readFence: vi.fn(), snapshot: vi.fn(),
+  inputTransaction: undefined as unknown, consentEnabled: true, steerEvidence: { kind: "unsafe" } as unknown,
+  fence: undefined as unknown, snapshotResult: undefined as unknown, loadSnapshot: false, loadedOutcomes: [] as unknown[],
+}))
 vi.mock("./context/discovery-persona-facts-pg.js", () => ({ loadOrCreateDiscoveryPersonaSnapshot: discoveryPersona.load }))
+vi.mock("./context/input-claim-store.js", async () => ({
+  ...(await vi.importActual<typeof import("./context/input-claim-store.js")>("./context/input-claim-store.js")),
+  createPgInputClaimTransaction: rootHistoryHarness.createTransaction,
+}))
+vi.mock("./context/root-task-history-session-memory.js", () => ({
+  withRootTaskHistorySessionAuthorization: rootHistoryHarness.authorize,
+}))
+vi.mock("./context/root-task-history-steer-evidence.js", () => ({ readRootTaskHistorySteerEvidence: rootHistoryHarness.readSteer }))
+vi.mock("./context/root-task-history-fence.js", async () => ({
+  ...(await vi.importActual<typeof import("./context/root-task-history-fence.js")>("./context/root-task-history-fence.js")),
+  readRootTaskHistoryFence: rootHistoryHarness.readFence,
+}))
+vi.mock("./context/root-task-history-objective-snapshot.js", () => ({
+  withRootTaskHistoryObjectiveSnapshot: rootHistoryHarness.snapshot,
+}))
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  rootHistoryHarness.consentEnabled = true
+  rootHistoryHarness.steerEvidence = { kind: "unsafe" }
+  rootHistoryHarness.fence = undefined
+  rootHistoryHarness.snapshotResult = undefined
+  rootHistoryHarness.loadSnapshot = false
+  rootHistoryHarness.loadedOutcomes = []
+  rootHistoryHarness.inputTransaction = transaction([])
+  rootHistoryHarness.createTransaction.mockImplementation(() => rootHistoryHarness.inputTransaction)
+  rootHistoryHarness.authorize.mockImplementation(async (...args: unknown[]) => {
+    const [client, input, work] = args as [pg.PoolClient, RootTaskHistorySessionAuthorizationInput, AuthorizedRootTaskHistoryWork<unknown>]
+    await client.query("SELECT pg_advisory_xact_lock(history)", [input.lease.userId])
+    await client.query("SELECT set_config(history)", ["app.user_id", input.lease.userId])
+    const authorization = { eventId: "history-auth-event", sessionId: input.lease.sessionId, userId: input.scope.userId,
+      consentVersion: 4, consentEnabled: rootHistoryHarness.consentEnabled, gateEnabledAtCapture: input.environmentGateEnabled }
+    const historyReadAllowed = input.environmentGateEnabled && authorization.consentEnabled
+    return { authorization, historyReadAllowed, workResult: await work(client, authorization, historyReadAllowed) }
+  })
+  rootHistoryHarness.readSteer.mockImplementation(async () => rootHistoryHarness.steerEvidence as RootTaskHistorySteerEvidence)
+  rootHistoryHarness.readFence.mockImplementation(async () => rootHistoryHarness.fence as RootTaskHistoryFence | undefined)
+  rootHistoryHarness.snapshot.mockImplementation(async (...args: unknown[]) => {
+    const [input] = args as [{ client: pg.PoolClient; loadOutcomes(client: pg.PoolClient): Promise<readonly ValidatedRootTaskHistoryOutcome[]> }]
+    if (rootHistoryHarness.loadSnapshot) rootHistoryHarness.loadedOutcomes = [...await input.loadOutcomes(input.client)]
+    return rootHistoryHarness.snapshotResult
+  })
+})
 
 const scope: TenantScope = { userId: "user-a" }
 const now = new Date("2026-10-07T12:00:00.000Z")
@@ -51,6 +103,14 @@ function transaction(calls: unknown[]): InputClaimTransaction {
 
 function store(calls: unknown[]): InputClaimStore {
   return { scope, withTransaction: work => work(transaction(calls)) }
+}
+
+function checkedOutPool() {
+  const calls: { sql: string; values?: readonly unknown[] }[] = []
+  const client = { query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+    calls.push({ sql, values }); return { rows: [], rowCount: 1 }
+  }), release: vi.fn() } as unknown as pg.PoolClient
+  return { pool: { connect: vi.fn(async () => client) } as unknown as Pick<pg.Pool, "connect">, client, calls }
 }
 
 const lease: TurnLease = {
@@ -384,8 +444,8 @@ describe("canonical Turn context builder", () => {
     expect(calls).toEqual([])
   })
 
-  it("passes trusted history gates only through a planning ordinary-root builder", async () => {
-    const load = vi.fn(async () => [])
+  it("refuses cross-session reads through a legacy reader even when caller flags request them", async () => {
+    const load = vi.fn(async (_request: DirectRootTaskHistoryLoadInput) => [])
     const reader: DirectRootTaskHistoryReader = { load }
     const pool = { connect: async () => { throw new Error("injected readers avoid a database connection") } } as unknown as Pick<pg.Pool, "connect">
     const build = (options: { planningEnabled: boolean; selectedJobMode: boolean; objectiveHistoryIndexEnabled?: boolean;
@@ -398,17 +458,45 @@ describe("canonical Turn context builder", () => {
 
     await build({ planningEnabled: true, selectedJobMode: false, objectiveHistoryIndexEnabled: true,
       turnInput: { objectiveHistoryIndexEnabled: false, crossSessionRootTaskHistoryEnabled: false } })
-    expect(load).toHaveBeenCalledWith(expect.objectContaining({ objectiveHistoryIndexEnabled: true }))
-    expect(load).not.toHaveBeenCalledWith(expect.objectContaining({ crossSessionRootTaskHistoryEnabled: true }))
+    expect(load).toHaveBeenCalledWith(expect.objectContaining({ crossSessionRootTaskHistoryEnabled: false }))
     load.mockClear()
     await build({ planningEnabled: true, selectedJobMode: false, crossSessionRootTaskHistoryEnabled: true,
       turnInput: { objectiveHistoryIndexEnabled: true } })
-    expect(load).toHaveBeenCalledWith(expect.objectContaining({ crossSessionRootTaskHistoryEnabled: true }))
-    expect(load).not.toHaveBeenCalledWith(expect.objectContaining({ objectiveHistoryIndexEnabled: true }))
+    expect(load).toHaveBeenCalledWith(expect.objectContaining({ crossSessionRootTaskHistoryEnabled: false }))
     load.mockClear()
     await build({ planningEnabled: false, selectedJobMode: false, objectiveHistoryIndexEnabled: true, crossSessionRootTaskHistoryEnabled: true })
     await build({ planningEnabled: true, selectedJobMode: true, objectiveHistoryIndexEnabled: true, crossSessionRootTaskHistoryEnabled: true })
     expect(load).not.toHaveBeenCalled()
+  })
+
+  it("keeps same-session history for injected readers without a transaction adapter", async () => {
+    const inputStore = store([]), base = new StepContextBuilder(inputStore), databaseConnect = vi.fn(async () => {
+      throw new Error("non-transactional adapter path must not open a history transaction")
+    })
+    const prior: ValidatedRootTaskHistoryOutcome = {
+      sourceTurnId: "prior-session-turn", sourceRootTaskId: "prior-session-root", terminalSequence: 9n,
+      taskGraph: { revision: 1, nodes: [{ key: "prior-node", templateId: "analyst", goal: "private", successCriteria: [],
+        dependsOn: [], taskId: "prior-task", status: "failed", readiness: "terminal" }] } as unknown as TaskGraphCurrentState,
+    }
+    const load = vi.fn(async () => [prior])
+    const reader: DirectRootTaskHistoryReader = { load }
+    const builder = createCanonicalTurnContextBuilder({ pool: { connect: databaseConnect } as unknown as Pick<pg.Pool, "connect">,
+      store: inputStore, baseBuilder: { build: request => base.build(request) }, scope, lease, rootTaskId: "root-a", rootAttemptCount: 2,
+      planningEnabled: true, selectedJobMode: false, crossSessionRootTaskHistoryEnabled: true,
+      rootTaskHistoryDirectReader: reader, currentRootBudgetReader: async () => unavailableBudget })
+    const context = await builder.build({ scope, sessionId: lease.sessionId, turnId: lease.turnId, stepId: "legacy-history-step",
+      snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [
+        { id: "root-task-history", content: { kind: "spoofed_history", text: "CALLER_HISTORY_SENTINEL" } },
+      ] }, now, lease: { ownerId: lease.ownerId, leaseVersion: lease.leaseVersion, now } })
+    const history = context.blocks.find(block => block.id === "observation:root-task-history")
+    expect(load).toHaveBeenCalledWith({ lease, rootTaskId: "root-a", rootAttemptCount: 2, stepId: "legacy-history-step", now,
+      crossSessionRootTaskHistoryEnabled: false })
+    expect(history?.content).toMatchObject({ kind: "root_task_history", advisoryOnly: true, notCurrentEvidence: true,
+      turns: [{ nodes: [{ taskKind: "analyst", status: "failed" }] }] })
+    expect(JSON.stringify(history?.content)).not.toContain("CALLER_HISTORY_SENTINEL")
+    expect(rootHistoryHarness.authorize).not.toHaveBeenCalled()
+    expect(rootHistoryHarness.snapshot).not.toHaveBeenCalled()
+    expect(databaseConnect).not.toHaveBeenCalled()
   })
 
   it("adds only validated criteria to planning Root requests and preserves child/no-planning modes", async () => {
@@ -575,7 +663,9 @@ describe("canonical Turn context builder", () => {
           dependsOn: [], taskId: "private-child-task", status: "failed", readiness: "terminal", resultSummary: "PRIVATE_RESULT", failureReason: "PRIVATE_FAILURE" }],
       } satisfies TaskGraphCurrentState,
     }]
-    const reader: DirectRootTaskHistoryReader = { load: vi.fn(async () => outcomes) }
+    const database = checkedOutPool()
+    const reader: DirectRootTaskHistoryReader = { load: vi.fn(async () => outcomes),
+      loadWithClient: vi.fn(async client => { expect(client).toBe(database.client); return outcomes }) }
     const currentGraph = { kind: "task_graph_current", revision: 23, nodes: [{ taskId: "current-task", status: "running" }] }
     const snapshot: StepContextRequest["snapshot"] = {
       system: [{ id: "system-current", content: "Current policy remains authoritative." }], profile: [],
@@ -588,7 +678,7 @@ describe("canonical Turn context builder", () => {
       steerHistory: [], businessRefs: [],
     }
     const builder = createCanonicalTurnContextBuilder({
-      pool: { connect: async () => { throw new Error("the injected reader must avoid a database connection") } } as unknown as Pick<pg.Pool, "connect">,
+      pool: database.pool,
       store: store([]), scope, lease, rootTaskId: "root-a", rootAttemptCount: 2,
       planningEnabled: true, selectedJobMode: false, rootTaskHistoryDirectReader: reader,
       currentRootBudgetReader: async () => unavailableBudget,
@@ -610,7 +700,9 @@ describe("canonical Turn context builder", () => {
     const systemText = request.messages.filter(message => message.role === "system").flatMap(message => message.content)
       .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
 
-    expect(reader.load).toHaveBeenCalledWith({ lease, rootTaskId: "root-a", rootAttemptCount: 2, stepId: "step-root-history", now })
+    expect(reader.loadWithClient).toHaveBeenCalledWith(database.client, { lease, rootTaskId: "root-a", rootAttemptCount: 2, stepId: "step-root-history", now })
+    expect(rootHistoryHarness.authorize).toHaveBeenCalledOnce()
+    expect(rootHistoryHarness.snapshot).not.toHaveBeenCalled()
     expect(context.taskGraphRevision).toBe(23)
     expect(graphBlock?.content).toEqual(currentGraph)
     expect(historyBlock).toMatchObject({ layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent" })
@@ -633,6 +725,107 @@ describe("canonical Turn context builder", () => {
     const withoutHistory = { ...context, blocks: context.blocks.filter(block => block.id !== historyBlock?.id) }
     expect(buildCognitiveActionAgenda(context)).toEqual(buildCognitiveActionAgenda(withoutHistory))
     expect(progressCheckpointFromStepContext(context)).toEqual(progressCheckpointFromStepContext(withoutHistory))
+  })
+
+  it("keeps consent, Step checkpoint, steer evidence, DB identity, and snapshot on one transaction client", async () => {
+    const database = checkedOutPool(), events: string[] = []
+    const sameSession: ValidatedRootTaskHistoryOutcome = {
+      sourceTurnId: "same-session-turn", sourceRootTaskId: "same-session-root", sourceSessionDiffers: false,
+      terminalSequence: 3n, terminalXid8: "3", terminalWitnessEventId: "same-session-witness",
+      taskGraph: { revision: 1, nodes: [{ templateId: "analyst", status: "failed" }] } as unknown as TaskGraphCurrentState,
+    }
+    const crossSession: ValidatedRootTaskHistoryOutcome = {
+      sourceTurnId: "cross-session-turn", sourceRootTaskId: "cross-session-root", sourceSessionDiffers: true,
+      terminalSequence: 2n, terminalXid8: "2", terminalWitnessEventId: "cross-session-witness",
+      taskGraph: { revision: 1, nodes: [{ templateId: "analyst", status: "completed" }] } as unknown as TaskGraphCurrentState,
+    }
+    const fence: RootTaskHistoryFence = { currentStartSequence: 20n, currentStartWitness: { eventId: "current-start", xid8: "20" },
+      objectiveDigest: "a".repeat(64), currentOrigin: JSON.stringify(["user", "none"]) }
+    rootHistoryHarness.consentEnabled = true
+    rootHistoryHarness.steerEvidence = { kind: "no_accepted_steer" }
+    rootHistoryHarness.fence = fence
+    rootHistoryHarness.loadSnapshot = true
+    rootHistoryHarness.snapshotResult = { outcomes: [crossSession], reused: false }
+    const transactionWithCheckpoint: InputClaimTransaction = {
+      ...transaction([]),
+      persistCheckpoint: async () => { events.push("checkpoint") },
+    }
+    rootHistoryHarness.inputTransaction = transactionWithCheckpoint
+    rootHistoryHarness.createTransaction.mockImplementation(client => {
+      events.push(client === database.client ? "claim-same-client" : "claim-wrong-client")
+      return transactionWithCheckpoint
+    })
+    rootHistoryHarness.authorize.mockImplementation(async (...args: unknown[]) => {
+      const [client, input, work] = args as [pg.PoolClient, RootTaskHistorySessionAuthorizationInput, AuthorizedRootTaskHistoryWork<unknown>]
+      expect(client).toBe(database.client)
+      await client.query("SELECT pg_advisory_xact_lock(history)", [input.lease.userId])
+      await client.query("SELECT set_config(history)", ["app.user_id", input.lease.userId])
+      const authorization = { eventId: "pinned-consent", sessionId: input.lease.sessionId, userId: input.scope.userId,
+        consentVersion: 4, consentEnabled: true, gateEnabledAtCapture: true }
+      return { authorization, historyReadAllowed: true, workResult: await work(client, authorization, true) }
+    })
+    rootHistoryHarness.readSteer.mockImplementation(async client => {
+      expect(client).toBe(database.client); events.push("steer-evidence")
+      return { kind: "no_accepted_steer" }
+    })
+    rootHistoryHarness.readFence.mockImplementation(async client => {
+      expect(client).toBe(database.client); events.push("db-fence")
+      return fence
+    })
+    rootHistoryHarness.snapshot.mockImplementation(async (...args: unknown[]) => {
+      const [input] = args as [{ client: pg.PoolClient; acceptedInputRevision: bigint;
+        steerEvidence: RootTaskHistorySteerEvidence; fence: RootTaskHistoryFence;
+        loadOutcomes(client: pg.PoolClient): Promise<readonly ValidatedRootTaskHistoryOutcome[]> }]
+      expect(input.client).toBe(database.client)
+      expect(input.acceptedInputRevision).toBe(7n)
+      expect(input.steerEvidence).toEqual({ kind: "no_accepted_steer" })
+      expect(input.fence).toBe(fence)
+      events.push("snapshot")
+      rootHistoryHarness.loadedOutcomes = [...await input.loadOutcomes(input.client)]
+      return rootHistoryHarness.snapshotResult
+    })
+    const reader: DirectRootTaskHistoryReader = {
+      load: vi.fn(async () => []),
+      loadWithClient: vi.fn(async (client, request) => {
+        expect(client).toBe(database.client)
+        if (request.crossSessionRootTaskHistoryEnabled) return [sameSession, crossSession]
+        return [sameSession]
+      }),
+    }
+    const baseBuilder = {
+      build: vi.fn(async (request: StepContextRequest) => buildContext(request, 7n)),
+      buildInTransaction: vi.fn(async (claim: InputClaimTransaction, request: StepContextRequest) => {
+        await claim.persistCheckpoint({ sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId,
+          checkpoint: { inputThroughSequence: 7n, consumedInputIds: [] }, lease: request.lease })
+        return buildContext(request, 7n)
+      }),
+    }
+    function buildContext(request: StepContextRequest, inputThroughSequence: bigint): StepContext {
+      return { schemaVersion: "agent-harness.v2", sessionId: request.sessionId, turnId: request.turnId, stepId: request.stepId,
+        inputThroughSequence, consumedInputIds: [], canonicalJson: "{}", blocks: request.snapshot.toolObservations.map(observation => ({
+          id: `observation:${observation.id}`, layer: "tool_observation", role: "data", trust: "external_untrusted",
+          source: "tool_or_subagent", content: observation.content as StepContext["blocks"][number]["content"],
+        })) }
+    }
+    const builder = createCanonicalTurnContextBuilder({ pool: database.pool, store: store([]), baseBuilder, scope, lease,
+      rootTaskId: "current-root", rootAttemptCount: 1, planningEnabled: true, selectedJobMode: false,
+      crossSessionRootTaskHistoryEnabled: true, rootTaskHistoryDirectReader: reader,
+      currentRootBudgetReader: async () => unavailableBudget })
+    const context = await builder.build({ scope, sessionId: lease.sessionId, turnId: lease.turnId, stepId: "same-transaction-step",
+      snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] }, now,
+      lease: { ownerId: lease.ownerId, leaseVersion: lease.leaseVersion, now } })
+    const history = context.blocks.find(block => block.id === "observation:root-task-history")?.content as {
+      historical: boolean; turns: Array<{ nodes: Array<{ status: string }> }>
+    }
+
+    expect(events).toEqual(["claim-same-client", "checkpoint", "steer-evidence", "db-fence", "snapshot"])
+    expect(rootHistoryHarness.loadedOutcomes).toEqual([crossSession])
+    expect(rootHistoryHarness.snapshot).toHaveBeenCalledOnce()
+    expect(history.historical).toBe(true)
+    expect(history.turns.map(turn => turn.nodes[0]?.status)).toEqual(["failed", "completed"])
+    expect(database.calls.at(-1)?.sql).toBe("COMMIT")
+    expect(database.client.release).toHaveBeenCalledOnce()
+    expect(baseBuilder.buildInTransaction).toHaveBeenCalledOnce()
   })
 
   it("composes loaded Root-history lessons and result counts into the actual request without changing current Turn evidence", async () => {
@@ -670,7 +863,15 @@ describe("canonical Turn context builder", () => {
       ...(source.reportedOutputs ? { reportedOutputs: source.reportedOutputs } : {}),
     }
     let historyOutcomes: readonly ValidatedRootTaskHistoryOutcome[] = [outcome]
-    const historyReader: DirectRootTaskHistoryReader = { load: vi.fn(async () => historyOutcomes) }
+    const historyDatabase = checkedOutPool(), historyLoads: DirectRootTaskHistoryLoadInput[] = []
+    const historyReader: DirectRootTaskHistoryReader = {
+      load: vi.fn(async () => historyOutcomes),
+      loadWithClient: vi.fn(async (client, loadInput) => {
+        expect(client).toBe(historyDatabase.client); historyLoads.push(loadInput)
+        return loadInput.crossSessionRootTaskHistoryEnabled === true
+          ? historyOutcomes : historyOutcomes.filter(item => item.sourceSessionDiffers !== true)
+      }),
+    }
     const originalText = "FULL_ORIGINAL_ROOT_REFERENCE: Find senior data roles in Amsterdam while preserving the complete initial task."
     const steerText = "CURRENT_ACCEPTED_STEER_SENTINEL: prioritize roles with platform ownership."
     const rootInput: StoredAgentInput = {
@@ -686,16 +887,15 @@ describe("canonical Turn context builder", () => {
       consumedByStepId: "step-history-composition", consumedAt: now, createdAt: now,
     }
     let persistedCheckpoint: { inputThroughSequence: bigint; consumedInputIds: readonly string[] } | undefined
-    const claimStore: InputClaimStore = {
-      scope,
-      withTransaction: work => work({
+    const claimTransaction: InputClaimTransaction = {
         getCheckpoint: async () => ({ inputThroughSequence: 4n, consumedInputIds: [] }),
         claimInputs: async () => ({ inputs: [steerInput], newlyClaimedInputIds: [steerInput.id] }),
         loadUnresolvedSteeringInputs: async () => [],
         loadRootInputContext: async input => input.inputId === rootInput.id ? rootInput : null,
         persistCheckpoint: async input => { persistedCheckpoint = input.checkpoint },
-      }),
     }
+    rootHistoryHarness.inputTransaction = claimTransaction
+    const claimStore: InputClaimStore = { scope, withTransaction: work => work(claimTransaction) }
     const ownerFence: ContextOwnerFence = {
       assertReferenceOwned: async () => undefined,
       assertAttachmentOwned: async reference => ({ attachmentId: reference.attachmentId }),
@@ -728,7 +928,7 @@ describe("canonical Turn context builder", () => {
       planningFacts: { graphRevision: 23, counts: currentCounts },
     } satisfies TaskGraphCurrentState)
     const builder = createCanonicalTurnContextBuilder({
-      pool: { connect: async () => { throw new Error("injected readers and the base builder must avoid a database connection") } } as unknown as Pick<pg.Pool, "connect">,
+      pool: historyDatabase.pool,
       store: claimStore, baseBuilder, scope, lease, rootTaskId: "current-root-task", rootAttemptCount: 2,
       rootInputId: rootInput.id, planningEnabled: true, selectedJobMode: false, rootTaskHistoryDirectReader: historyReader,
       currentRootBudgetReader: async () => unavailableBudget,
@@ -765,7 +965,7 @@ describe("canonical Turn context builder", () => {
     const scoutQueryHistory = historyNodes.find(node => node.priorScoutQueryFootprint !== undefined)
     const clarification = context.blocks.find(block => block.id === "planning-clarification:latest-answered-question")
 
-    expect(historyReader.load).toHaveBeenCalledWith({ lease, rootTaskId: "current-root-task", rootAttemptCount: 2,
+    expect(historyReader.loadWithClient).toHaveBeenCalledWith(historyDatabase.client, { lease, rootTaskId: "current-root-task", rootAttemptCount: 2,
       stepId: "step-history-composition", now })
     expect(persistedCheckpoint).toEqual({ inputThroughSequence: 5n, consumedInputIds: [steerInput.id] })
     expect(context.inputThroughSequence).toBe(5n)
@@ -863,13 +1063,14 @@ describe("canonical Turn context builder", () => {
 
     historyOutcomes = [{
       ...outcome, sourceTurnId: "PRIVATE_CROSS_SESSION_SOURCE_TURN", sourceRootTaskId: "PRIVATE_CROSS_SESSION_ROOT_ID",
-      terminalSequence: 18n, sourceSessionDiffers: true, terminalAt: new Date(now.getTime() - 60_000),
+      terminalSequence: 18n, terminalXid8: "18", terminalWitnessEventId: "challenge-terminal-witness", sourceSessionDiffers: true,
       // Challenge the final serializer fence with a footprint-bearing cross-session source.
       taskGraph: source.taskGraph,
     }]
+    rootHistoryHarness.steerEvidence = { kind: "accepted_steer" }
     const crossSessionStepId = "step-history-cross-session"
     const crossSessionBuilder = createCanonicalTurnContextBuilder({
-      pool: { connect: async () => { throw new Error("injected history readers and the base builder must avoid a database connection") } } as unknown as Pick<pg.Pool, "connect">,
+      pool: historyDatabase.pool,
       store: claimStore, baseBuilder, scope, lease, rootTaskId: "current-root-task", rootAttemptCount: 2,
       rootInputId: rootInput.id, planningEnabled: true, selectedJobMode: false, rootTaskHistoryDirectReader: historyReader,
       crossSessionRootTaskHistoryEnabled: true,
@@ -888,14 +1089,15 @@ describe("canonical Turn context builder", () => {
     const crossSessionRequestText = crossSessionRequest.messages.flatMap(message => message.content)
       .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
     const crossSessionHistory = crossSessionContext.blocks.find(block => block.id === "observation:root-task-history")
-    expect(crossSessionHistory?.content).toMatchObject({ historical: true, advisoryOnly: true, notCurrentEvidence: true })
-    expect(crossSessionRequestText).toContain('"taskKind":"scout"')
+    expect(crossSessionHistory).toBeUndefined()
+    expect(crossSessionRequestText).not.toContain("PRIVATE_CROSS_SESSION_SOURCE_TURN")
     expect(crossSessionRequestText).not.toContain('"priorScoutQueryFootprint"')
     expect(crossSessionRequestText).not.toContain('"targetRoles":["Backend Engineer"]')
     expect(crossSessionRequestText).not.toContain("PRIVATE_QUERY_CURSOR_SENTINEL")
     expect(crossSessionRequestText).not.toContain("discoveryTurnEligibility")
-    expect(historyReader.load).toHaveBeenCalledWith({ lease, rootTaskId: "current-root-task", rootAttemptCount: 2,
-      stepId: crossSessionStepId, now, crossSessionRootTaskHistoryEnabled: true })
+    expect(historyLoads.at(-1)).toEqual({ lease, rootTaskId: "current-root-task", rootAttemptCount: 2,
+      stepId: crossSessionStepId, now })
+    expect(rootHistoryHarness.snapshot).not.toHaveBeenCalled()
   })
 
   it("keeps Root-task history disabled for selected-job turns", async () => {

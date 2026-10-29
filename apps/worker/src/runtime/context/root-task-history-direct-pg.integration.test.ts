@@ -6,9 +6,14 @@ import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 import { createPgDirectRootTaskHistoryStore, type DirectRootTaskHistoryLoadInput } from "./root-task-history-direct-store.js"
 import { OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, updateRootObjectiveHistoryProjection } from "./objective-history-projection.js"
 import { projectRootTaskHistory, type ValidatedRootTaskHistoryOutcome } from "./root-task-history.js"
+import { acquireRootTaskHistoryChronologyLock, appendRootTaskHistoryChronologyWitness } from "./root-task-history-chronology-witness.js"
 import type { TurnLease } from "../turns/lease.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
+const SOURCE_SEQUENCE_STRIDE = 6
+const CURRENT_START_SEQUENCE = 10_000
+const FIXTURE_EVENT_SEQUENCE = 20_000
+const SCHEDULED_FIXTURE_EVENT_SEQUENCE = 30_000
 function disposableUrl(): string | null {
   const required = process.env.AGENT_RUNTIME_PG_TEST_REQUIRED === "true", value = process.env.AGENT_RUNTIME_PG_TEST_URL
   if (process.env.CI !== "true" && !required) return null
@@ -70,6 +75,9 @@ type Source = Readonly<{
   correlationTargetId?: string; stepStatus?: "completed" | "streaming" | "failed"
   stepReceipt?: "missing" | "mismatched" | "duplicate"
   scoutResult?: unknown
+  completedChildren?: readonly Readonly<{
+    key: string; templateId: string; role: string; taskType: string; goal: string; successCriteria: readonly string[]; result?: unknown
+  }>[]
   failureChildren?: readonly Readonly<{ key: string; templateId: string; role: string; taskType: string; failureReason: string }>[]
   turnSource?: string; terminalCreatedAt?: Date
 }>
@@ -77,10 +85,14 @@ type Source = Readonly<{
 const databaseUrl = disposableUrl(), describePg = databaseUrl ? describe : describe.skip, suffix = randomUUID()
 const userId = `root-history-user-${suffix}`, otherUserId = `root-history-other-user-${suffix}`
 const sessionId = `root-history-session-${suffix}`, otherSessionId = `root-history-other-session-${suffix}`
+const scheduledSessionId = `root-history-scheduled-session-${suffix}`
 const foreignSessionId = `root-history-foreign-session-${suffix}`
 const archivedSessionId = `root-history-archived-session-${suffix}`
 const currentTurnId = `root-history-current-turn-${suffix}`, currentRootTaskId = `root-history-current-root-${suffix}`
 const currentStepId = `root-history-current-step-${suffix}`, workerId = `worker-${suffix}`
+const scheduledCurrentTurnId = `root-history-scheduled-current-turn-${suffix}`
+const scheduledCurrentRootTaskId = `root-history-scheduled-current-root-${suffix}`
+const scheduledCurrentStepId = `root-history-scheduled-current-step-${suffix}`
 const currentStartCreatedAt = new Date("2030-01-01T00:00:00.000Z")
 const objective = "Plan an engineering search"
 const criteria = ["Keep the search within the saved locations"]
@@ -131,7 +143,10 @@ const otherSession: Source = { turnId: `root-history-other-session-turn-${suffix
 const crossEqualTimeHigherTurnId: Source = { turnId: `${otherSession.turnId}-z`, rootTaskId: `root-history-equal-time-root-${suffix}`,
   childId: `root-history-equal-time-child-${suffix}`, finalItemId: `root-history-equal-time-final-${suffix}`,
   sessionId: otherSessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 17,
-  terminalCreatedAt: new Date("2022-01-01T00:00:00.000Z") }
+  terminalCreatedAt: new Date("2022-01-01T00:00:00.000Z"), completedChildren: [
+    { key: "analyst", templateId: "analyst", role: "analyst", taskType: "job_analysis",
+      goal: "Assess a matching role", successCriteria: ["Assess the role"] },
+  ] }
 const crossWrongSource: Source = { turnId: `root-history-cross-source-${suffix}`, rootTaskId: `root-history-cross-source-root-${suffix}`,
   childId: `root-history-cross-source-child-${suffix}`, finalItemId: `root-history-cross-source-final-${suffix}`,
   sessionId: otherSessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria }, startSequence: 5,
@@ -206,6 +221,122 @@ async function insertSession(id: string, owner: string, sequence: number): Promi
     VALUES ($1, $2, $3, 'running', 'test', $4, CURRENT_TIMESTAMP)`, [id, owner, objective, sequence])
 }
 
+function terminalEventKey(source: Source): string {
+  const status = source.status ?? "completed"
+  return status === "completed" ? `turn:${source.turnId}:event:turn-completed`
+    : status === "failed" ? `turn:${source.turnId}:event:turn-failed:task_failed`
+      : `turn:${source.turnId}:event:turn-interrupted`
+}
+
+type EventReceipt = Readonly<{
+  id: string; sessionId: string; turnId: string; taskId: string; sequence: number
+  itemId: string | null; type: string; correlationId: string; causationId: string | null; idempotencyKey: string; payload: unknown
+}>
+
+async function insertEventOutbox(client: PoolClient, event: EventReceipt): Promise<void> {
+  const payload = { eventId: event.id, sessionId: event.sessionId, turnId: event.turnId, taskId: event.taskId,
+    itemId: event.itemId, sequence: String(event.sequence), type: event.type, actor: "orchestrator",
+    correlationId: event.correlationId, causationId: event.causationId, idempotencyKey: event.idempotencyKey, payload: event.payload }
+  await client.query(`INSERT INTO "agent_outbox" ("id","topic","aggregateId","idempotencyKey","payload")
+    VALUES ($1,'agent.events',$2,$3,$4::jsonb)`,
+  [`agent-outbox-${event.id}`, event.sessionId, `agent-event:${event.id}`, JSON.stringify(payload)])
+}
+
+async function insertBoundaryEvent(client: PoolClient, event: EventReceipt, createdAt: Date): Promise<void> {
+  await client.query(`INSERT INTO "agent_events" ("id","sessionId","turnId","itemId","taskId","sequence","type","actor",
+    "correlationId","causationId","idempotencyKey","payload","createdAt")
+    VALUES ($1,$2,$3,$4,$5,$6,$7,'orchestrator',$8,$9,$10,$11::jsonb,$12)`,
+  [event.id, event.sessionId, event.turnId, event.itemId, event.taskId, event.sequence, event.type, event.correlationId,
+    event.causationId, event.idempotencyKey, JSON.stringify(event.payload), createdAt])
+  await insertEventOutbox(client, event)
+}
+
+async function insertCurrentStartBoundary(input: Readonly<{
+  userId: string; sessionId: string; turnId: string; rootTaskId: string; eventId: string; goal: string; sequence: number; createdAt: Date
+}> = { userId, sessionId, turnId: currentTurnId, rootTaskId: currentRootTaskId,
+  eventId: `root-history-current-start-${suffix}`, goal: objective, sequence: CURRENT_START_SEQUENCE, createdAt: currentStartCreatedAt }): Promise<void> {
+  const client = await pool!.connect()
+  try {
+    await client.query("BEGIN")
+    await client.query("SELECT set_config($1,$2,true)", ["app.user_id", input.userId])
+    const lock = await acquireRootTaskHistoryChronologyLock(client, input.userId)
+    const event: EventReceipt = { id: input.eventId, sessionId: input.sessionId, turnId: input.turnId,
+      taskId: input.rootTaskId, sequence: input.sequence, itemId: null, type: "turn.started", correlationId: input.turnId,
+      causationId: null, idempotencyKey: `turn:${input.turnId}:event:turn-started`,
+      payload: { goal: input.goal, taskId: input.rootTaskId, rootTaskId: input.rootTaskId } }
+    await client.query(`INSERT INTO "agent_events" ("id","sessionId","turnId","itemId","taskId","sequence","type","actor","correlationId","idempotencyKey","payload","createdAt")
+      VALUES ($1,$2,$3,NULL,$4,$5,$6,'orchestrator',$7,$8,$9::jsonb,$10)`,
+    [event.id, input.sessionId, input.turnId, input.rootTaskId, event.sequence, event.type, event.correlationId,
+      event.idempotencyKey, JSON.stringify(event.payload), input.createdAt])
+    await insertEventOutbox(client, event)
+    await appendRootTaskHistoryChronologyWitness(client, { userId: input.userId, sessionId: input.sessionId,
+      turnId: input.turnId, rootTaskId: input.rootTaskId, boundary: "turn_start", boundaryEventId: event.id }, lock)
+    await client.query("COMMIT")
+  } catch (error: unknown) {
+    await client.query("ROLLBACK").catch(() => undefined)
+    throw error
+  } finally { client.release() }
+}
+
+async function insertScheduledCurrentTurn(input: unknown): Promise<TurnLease> {
+  const leaseExpiresAt = new Date(Date.now() + 5 * 60_000)
+  await pool!.query(`INSERT INTO "agent_turns" ("id","sessionId","userId","status","source","input","modelProfileSnapshot",
+    "toolPolicySnapshot","budgetSnapshot","rootTaskId","leaseOwnerId","leaseExpiresAt","leaseStartedAt","leaseVersion","updatedAt")
+    VALUES ($1,$2,$3,'in_progress','automation',$4::jsonb,'{}'::jsonb,'{}'::jsonb,'{}'::jsonb,$5,$6,$7,CURRENT_TIMESTAMP,1,CURRENT_TIMESTAMP)`,
+  [scheduledCurrentTurnId, scheduledSessionId, userId, JSON.stringify(input), scheduledCurrentRootTaskId, workerId, leaseExpiresAt])
+  await pool!.query(`INSERT INTO "sub_agent_tasks" ("id","sessionId","turnId","rootTaskId","parentTaskId","path","depth","role","taskType","status","goal",
+    "constraints","successCriteria","allowedActions","context","expectedOutputSchema","modelProfileSnapshot","toolPolicySnapshot","budgetSnapshot",
+    "attemptCount","maxAttempts","leaseOwner","leaseExpiresAt","completedAt","updatedAt")
+    VALUES ($1,$2,$3,$1,NULL,'/scheduled-current',0,'orchestrator','root','running',$4,'[]'::jsonb,$5::jsonb,'[]'::jsonb,
+      '{}'::jsonb,'{}'::jsonb,'{}'::jsonb,'{}'::jsonb,'{}'::jsonb,1,3,$6,$7,NULL,CURRENT_TIMESTAMP)`,
+  [scheduledCurrentRootTaskId, scheduledSessionId, scheduledCurrentTurnId, objective, JSON.stringify(criteria), workerId, leaseExpiresAt])
+  await pool!.query(`INSERT INTO "agent_steps" ("id","sessionId","turnId","taskId","ordinal","attempt","status","inputThroughSequence","consumedInputIds","modelProfileSnapshot")
+    VALUES ($1,$2,$3,$4,1,1,'streaming',0,'[]'::jsonb,'{}'::jsonb)`,
+  [scheduledCurrentStepId, scheduledSessionId, scheduledCurrentTurnId, scheduledCurrentRootTaskId])
+  await insertCurrentStartBoundary({ userId, sessionId: scheduledSessionId, turnId: scheduledCurrentTurnId,
+    rootTaskId: scheduledCurrentRootTaskId, eventId: `root-history-scheduled-current-start-${suffix}`,
+    goal: objective, sequence: CURRENT_START_SEQUENCE, createdAt: currentStartCreatedAt })
+  return { turnId: scheduledCurrentTurnId, sessionId: scheduledSessionId, userId, ownerId: workerId,
+    leaseVersion: 1, leaseStartedAt: new Date(), leaseExpiresAt }
+}
+
+async function insertSourceBoundaryEvents(input: Readonly<{
+  source: Source; startSequence: number; terminalSequence: number; terminalItemId: string | null
+  terminalType: string; correlationId: string; terminalKey: string; terminalPayload: unknown
+  terminalCausationId: string | null; stepReceipts: readonly EventReceipt[]; completedReceipts: readonly EventReceipt[]
+  writeTerminalWitness: boolean
+  startCreatedAt: Date; terminalCreatedAt: Date
+}>): Promise<void> {
+  const { source } = input, client = await pool!.connect()
+  try {
+    await client.query("BEGIN")
+    await client.query("SELECT set_config($1,$2,true)", ["app.user_id", source.userId])
+    const lock = await acquireRootTaskHistoryChronologyLock(client, source.userId)
+    const start: EventReceipt = { id: `root-history-start-${source.turnId}`, sessionId: source.sessionId,
+      turnId: source.turnId, taskId: source.rootTaskId, sequence: input.startSequence, itemId: null,
+      type: "turn.started", correlationId: source.turnId, causationId: null,
+      idempotencyKey: `turn:${source.turnId}:event:turn-started`,
+      payload: { goal: source.goal, taskId: source.rootTaskId, rootTaskId: source.rootTaskId } }
+    const terminal: EventReceipt = { id: input.terminalKey, sessionId: source.sessionId,
+      turnId: source.turnId, taskId: source.rootTaskId, sequence: input.terminalSequence, itemId: input.terminalItemId,
+      type: input.terminalType, correlationId: input.correlationId, causationId: input.terminalCausationId,
+      idempotencyKey: input.terminalKey, payload: input.terminalPayload }
+    await insertBoundaryEvent(client, start, input.startCreatedAt)
+    for (const receipt of input.stepReceipts) await insertBoundaryEvent(client, receipt, input.startCreatedAt)
+    for (const receipt of input.completedReceipts) await insertBoundaryEvent(client, receipt, input.terminalCreatedAt)
+    await insertBoundaryEvent(client, terminal, input.terminalCreatedAt)
+    await appendRootTaskHistoryChronologyWitness(client, { userId: source.userId, sessionId: source.sessionId,
+      turnId: source.turnId, rootTaskId: source.rootTaskId, boundary: "turn_start", boundaryEventId: start.id }, lock)
+    if (input.writeTerminalWitness) await appendRootTaskHistoryChronologyWitness(client, { userId: source.userId,
+      sessionId: source.sessionId, turnId: source.turnId, rootTaskId: source.rootTaskId,
+      boundary: "root_terminal", boundaryEventId: terminal.id }, lock)
+    await client.query("COMMIT")
+  } catch (error: unknown) {
+    await client.query("ROLLBACK").catch(() => undefined)
+    throw error
+  } finally { client.release() }
+}
+
 async function insertSource(source: Source): Promise<void> {
   const status = source.status ?? "completed"
   const rootStatus = source.rootStatus ?? status
@@ -214,6 +345,11 @@ async function insertSource(source: Source): Promise<void> {
   const children = [
     { id: source.childId, key: "scout", templateId: "scout", role: "scout", taskType: "scout", status: "completed" as const,
       failureReason: null, goal: "Find matching roles", successCriteria: ["Find one role"], result: source.scoutResult ?? null },
+    ...(source.completedChildren ?? []).map(child => ({
+      id: `${source.childId}-${child.key}`, key: child.key, templateId: child.templateId, role: child.role,
+      taskType: child.taskType, status: "completed" as const, failureReason: null, goal: child.goal,
+      successCriteria: child.successCriteria, result: child.result ?? null,
+    })),
     ...(source.failureChildren ?? []).map(failure => ({
       id: `${source.childId}-${failure.key}`, key: `failure-${failure.key}`, templateId: failure.templateId,
       role: failure.role, taskType: failure.taskType, status: "failed" as const, failureReason: failure.failureReason,
@@ -247,40 +383,63 @@ async function insertSource(source: Source): Promise<void> {
     VALUES ($1, $2, $3, $4, 'task_graph', 'completed', 1, $5::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
       ($6, $2, $3, $4, 'agent_message', 'completed', 0, '{"text":"done"}'::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
   [taskGraphItemId(source.rootTaskId), source.sessionId, source.turnId, source.rootTaskId, JSON.stringify(graph), source.finalItemId])
-  const terminalSequence = source.startSequence + (status === "completed" ? 3 : 2)
+  const startSequence = source.startSequence * SOURCE_SEQUENCE_STRIDE
+  const duplicateStepReceipt = source.stepReceipt === "duplicate"
+  const itemStartedOffset = duplicateStepReceipt ? 3 : 2
+  const itemCompletedOffset = duplicateStepReceipt ? 4 : 3
+  const terminalOffset = status === "completed" ? (duplicateStepReceipt ? 5 : 4) : 2
+  const terminalSequence = startSequence + terminalOffset
   const terminalType = status === "completed" ? "turn.completed" : status === "failed" ? "turn.failed" : "turn.interrupted"
   const terminalItemId = status === "completed" ? source.finalItemId : null
   const sourceStepId = `source-step-${source.turnId}`
+  const stepReceipts: EventReceipt[] = []
   if (status === "completed") {
     await pool!.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
       VALUES ($1, $2, $3, $4, 1, 1, $5, 0, '[]'::jsonb, '{}'::jsonb)`,
     [sourceStepId, source.sessionId, source.turnId, source.rootTaskId, source.stepStatus ?? "completed"])
+    await pool!.query(`UPDATE "agent_items" SET "stepId"=$1,"phase"='final_answer',"revision"=1
+      WHERE "id"=$2 AND "sessionId"=$3 AND "turnId"=$4 AND "taskId"=$5 AND "type"='agent_message'`,
+    [sourceStepId, source.finalItemId, source.sessionId, source.turnId, source.rootTaskId])
     if (source.stepReceipt !== "missing") {
       const count = source.stepReceipt === "duplicate" ? 2 : 1
       for (let index = 0; index < count; index += 1) {
         const stepPayload = { stepId: sourceStepId, status: source.stepReceipt === "mismatched" ? "failed" : "completed", taskId: source.rootTaskId }
         const key = `turn:${source.turnId}:event:step-completed:${sourceStepId}${index ? `:duplicate-${index}` : ""}`
-        await pool!.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload", "createdAt")
-          VALUES ($1, $2, $3, NULL, $4, $5, 'step.completed', 'orchestrator', $6, $7, $8::jsonb, $9)`,
-        [`root-history-step-completed-${index}-${source.turnId}`, source.sessionId, source.turnId, source.rootTaskId,
-          source.startSequence + 1 + index, sourceStepId, key, JSON.stringify(stepPayload), startCreatedAt])
+        stepReceipts.push({ id: `root-history-step-completed-${index}-${source.turnId}`, sessionId: source.sessionId,
+          turnId: source.turnId, taskId: source.rootTaskId, sequence: startSequence + (duplicateStepReceipt && index === 1 ? 2 : 1 + index),
+          itemId: null, type: "step.completed", correlationId: sourceStepId, causationId: null,
+          idempotencyKey: key, payload: stepPayload })
       }
     }
   }
   const correlationId = status === "completed" ? (source.correlationTargetId ?? sourceStepId) : source.turnId
   const errorCode = status === "failed" ? "task_failed" : status === "interrupted" ? "interrupted" : undefined
-  const terminalKey = status === "completed" ? `turn:${source.turnId}:event:turn-completed`
-    : status === "failed" ? `turn:${source.turnId}:event:turn-failed:${errorCode}` : `turn:${source.turnId}:event:turn-interrupted`
-  const terminalPayload = status === "completed" ? { turnId: source.turnId, taskId: source.rootTaskId, finalItemId: source.finalItemId }
+  const terminalKey = terminalEventKey(source)
+  const terminalPayload = status === "completed" ? { turnId: source.turnId, taskId: source.rootTaskId, finalItemId: source.finalItemId,
+    usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } }
     : status === "failed" ? { turnId: source.turnId, taskId: source.rootTaskId, errorCode, finalItemId: null }
       : { turnId: source.turnId, taskId: source.rootTaskId, errorCode }
-  await pool!.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload", "createdAt")
-    VALUES ($1, $2, $3, NULL, $4, $5, 'turn.started', 'orchestrator', $3, $6, $7::jsonb, $8),
-      ($9, $2, $3, $10, $4, $11, $12, 'orchestrator', $13, $14, $15::jsonb, $16)`,
-  [`root-history-start-${source.turnId}`, source.sessionId, source.turnId, source.rootTaskId, source.startSequence,
-    `turn:${source.turnId}:event:turn-started`, JSON.stringify({ goal: source.goal, taskId: source.rootTaskId, rootTaskId: source.rootTaskId }), startCreatedAt,
-    `root-history-terminal-${source.turnId}`, terminalItemId, terminalSequence, terminalType, correlationId, terminalKey,
-    JSON.stringify(terminalPayload), terminalCreatedAt])
+  const startEventId = `root-history-start-${source.turnId}`
+  const itemStartedId = `turn:${source.turnId}:event:item-started:${source.finalItemId}`
+  const itemCompletedId = `turn:${source.turnId}:event:final-completed:${source.finalItemId}:1`
+  const completedReceipts: EventReceipt[] = status === "completed" ? [
+    { id: itemStartedId, sessionId: source.sessionId, turnId: source.turnId, taskId: source.rootTaskId,
+      sequence: startSequence + itemStartedOffset, itemId: source.finalItemId, type: "item.started",
+      correlationId: sourceStepId, causationId: stepReceipts[0]?.id ?? startEventId, idempotencyKey: itemStartedId,
+      payload: { itemId: source.finalItemId, type: "agent_message", phase: "final_answer" } },
+    { id: itemCompletedId, sessionId: source.sessionId, turnId: source.turnId, taskId: source.rootTaskId,
+      sequence: startSequence + itemCompletedOffset, itemId: source.finalItemId, type: "item.completed",
+      correlationId: source.finalItemId, causationId: itemStartedId, idempotencyKey: itemCompletedId,
+      payload: { itemId: source.finalItemId, status: "completed", content: { text: "done" } } },
+  ] : []
+  const terminalCausationId = completedReceipts[completedReceipts.length - 1]?.id ?? null
+  // Keep malformed completed rows as rejection fixtures without fabricating witnesses for invalid receipts.
+  const writeTerminalWitness = status !== "completed"
+    || ((source.stepStatus === undefined || source.stepStatus === "completed")
+      && (source.correlationTargetId === undefined || source.correlationTargetId === sourceStepId))
+  await insertSourceBoundaryEvents({ source, startSequence, terminalSequence, terminalItemId,
+    terminalType, correlationId, terminalKey, terminalPayload, terminalCausationId, stepReceipts, completedReceipts, writeTerminalWitness,
+    startCreatedAt, terminalCreatedAt })
 }
 
 async function projectSources(sources: readonly Source[]): Promise<void> {
@@ -292,7 +451,7 @@ async function projectSources(sources: readonly Source[]): Promise<void> {
       const objectiveProjected = await updateRootObjectiveHistoryProjection(client, identity)
       if (!objectiveProjected) throw new Error(`Objective-history projection failed for ${source.turnId}`)
       const terminalProjected = await updateRootObjectiveHistoryProjection(client, identity,
-        { terminalEventId: `root-history-terminal-${source.turnId}` })
+        { terminalEventId: terminalEventKey(source) })
       if (!terminalProjected) throw new Error(`Objective-history terminal projection failed for ${source.turnId}`)
     }
     await client.query("COMMIT")
@@ -309,6 +468,7 @@ async function deleteSourceFixtures(sources: readonly Source[]): Promise<void> {
   const client = await pool!.connect(), turnIds = sources.map(source => source.turnId)
   try {
     await client.query("BEGIN")
+    await client.query(`DELETE FROM "agent_outbox" WHERE "aggregateId"=$1 AND "payload"->>'turnId'=ANY($2::text[])`, [sessionId, turnIds])
     await client.query(`DELETE FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])`, [sessionId, turnIds])
     await client.query(`DELETE FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])`, [sessionId, turnIds])
     await client.query(`DELETE FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = ANY($2::text[])`, [sessionId, turnIds])
@@ -337,6 +497,11 @@ async function updateCurrentTurn(source: string, input: unknown): Promise<void> 
     [currentTurnId, source, JSON.stringify(input), sessionId])
 }
 
+async function updateScheduledCurrentTurn(input: unknown): Promise<void> {
+  await pool!.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1 AND "sessionId" = $3`,
+    [scheduledCurrentTurnId, JSON.stringify(input), scheduledSessionId])
+}
+
 async function updateTurnInputJson(turnId: string, inputJson: string): Promise<void> {
   await pool!.query(`UPDATE "agent_turns" SET "input" = $2::jsonb WHERE "id" = $1`, [turnId, inputJson])
 }
@@ -357,10 +522,10 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       leaseStartedAt: new Date(), leaseExpiresAt: new Date(Date.now() + 5 * 60_000) }
     await insertUser(userId)
     await insertUser(otherUserId)
-    await insertSession(sessionId, userId, 2200)
-    await insertSession(otherSessionId, userId, 500)
-    await insertSession(foreignSessionId, otherUserId, 4)
-    await insertSession(archivedSessionId, userId, 4)
+    await insertSession(sessionId, userId, FIXTURE_EVENT_SEQUENCE)
+    await insertSession(otherSessionId, userId, FIXTURE_EVENT_SEQUENCE)
+    await insertSession(foreignSessionId, otherUserId, FIXTURE_EVENT_SEQUENCE)
+    await insertSession(archivedSessionId, userId, FIXTURE_EVENT_SEQUENCE)
     await pool.query(`UPDATE "agent_sessions" SET "status" = 'archived' WHERE "id" = $1`, [archivedSessionId])
     for (const source of matching) await insertSource(source)
     await insertSource(mismatched)
@@ -374,13 +539,13 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     await insertSource(equalCutoff)
     await insertSource(foreignScopeCorrelation)
     await insertSource(otherUser)
-    await insertSource(future)
     await insertSource(inconsistentTerminal)
     await insertSource(streamingTerminalStep)
     await insertSource(failedTerminalStep)
     await insertSource(missingStepReceipt)
     await insertSource(mismatchedStepReceipt)
     await insertSource(duplicateStepReceipt)
+    for (const source of crossSessionWrongOriginFillers) await insertSource(source)
     const input = { goal: objective, successCriteria: criteria }
     await pool.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "status", "source", "input", "modelProfileSnapshot",
       "toolPolicySnapshot", "budgetSnapshot", "rootTaskId", "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
@@ -395,16 +560,17 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     await pool.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
       VALUES ($1, $2, $3, $4, 1, 1, 'streaming', 0, '[]'::jsonb, '{}'::jsonb)`,
     [currentStepId, sessionId, currentTurnId, currentRootTaskId])
-    await pool.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload", "createdAt")
-      VALUES ($1, $2, $3, NULL, $4, 1000, 'turn.started', 'orchestrator', $3, $5, $6::jsonb, $7)`,
-    [`root-history-current-start-${suffix}`, sessionId, currentTurnId, currentRootTaskId,
-      `turn:${currentTurnId}:event:turn-started`, JSON.stringify({ goal: objective, taskId: currentRootTaskId, rootTaskId: currentRootTaskId }), currentStartCreatedAt])
-    await projectSources([...matching, otherSession, crossEqualTimeHigherTurnId, crossWrongOrigin, equalCutoff, future])
+    await insertCurrentStartBoundary()
+    await insertSource(future)
+    await projectSources([...matching, otherSession, crossEqualTimeHigherTurnId, crossWrongOrigin, equalCutoff, future,
+      ...crossSessionWrongOriginFillers])
   })
 
   afterAll(async () => {
     if (pool) {
       await setObjectiveHistoryIndexReady(false).catch(() => undefined)
+      await pool.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = ANY($1::text[])`,
+        [[sessionId, otherSessionId, scheduledSessionId, foreignSessionId, archivedSessionId]]).catch(() => undefined)
       await pool.query(`DELETE FROM "User" WHERE "id" = ANY($1::text[])`, [[userId, otherUserId]]).catch(() => undefined)
       await pool.end()
     }
@@ -417,7 +583,7 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
 
     expect(history.map(item => item.sourceTurnId)).toEqual([matching[1]!.turnId, matching[0]!.turnId])
     expect(history.map(item => item.sourceRootTaskId)).toEqual([matching[1]!.rootTaskId, matching[0]!.rootTaskId])
-    expect(history.map(item => item.terminalSequence)).toEqual([7n, 4n])
+    expect(history.map(item => item.terminalSequence)).toEqual([32n, 10n])
     expect(history.map(item => item.taskGraph.nodes.length)).toEqual([4, 1])
     expect(history[0]?.nodeLessons?.map(lesson => lesson?.executionFailureCategory)).toEqual([
       undefined, "execution_setup_unavailable", "resume_state_unavailable", "structured_output_invalid",
@@ -441,26 +607,28 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       duplicateStepReceipt.turnId].includes(item.sourceTurnId))).toBe(false)
   })
 
-  it("reloads an eligible source graph in its owner session and orders cross-session outcomes by DB time", async () => {
+  it("reloads owner-scoped history and merges only witnessed terminal-before-start outcomes by xid8", async () => {
     const input: DirectRootTaskHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
       rootAttemptCount: 2, stepId: currentStepId, now: new Date(), crossSessionRootTaskHistoryEnabled: true }
     const history = await createPgDirectRootTaskHistoryStore(pool!).load(input)
 
-    expect(crossEqualTimeHigherTurnId.turnId.localeCompare(otherSession.turnId)).toBeGreaterThan(0)
     expect(history.map(item => item.sourceTurnId)).toEqual([
-      crossEqualTimeHigherTurnId.turnId, otherSession.turnId, matching[1]!.turnId, matching[0]!.turnId,
+      equalCutoff.turnId, crossEqualTimeHigherTurnId.turnId, otherSession.turnId, matching[1]!.turnId, matching[0]!.turnId,
     ])
-    expect(history.map(item => item.terminalAt?.toISOString())).toEqual([
-      "2022-01-01T00:00:00.000Z", "2022-01-01T00:00:00.000Z", "2021-01-01T00:00:00.000Z", "2020-01-01T00:00:00.000Z",
-    ])
+    const xids = history.map(item => BigInt(item.terminalXid8!))
+    expect(xids.every((xid, index) => index === 0 || xids[index - 1]! > xid)).toBe(true)
+    expect(history.every(item => typeof item.terminalWitnessEventId === "string")).toBe(true)
     expect(history[1]?.taskGraph.nodes).toHaveLength(2)
     expect(history[1]?.nodeLessons?.[1]?.executionFailureCategory).toBeUndefined()
     expect(history[1]?.reportedOutputs).toBeUndefined()
-    expect(history[2]?.nodeLessons?.[1]?.executionFailureCategory).toBe("execution_setup_unavailable")
-    expect(history[3]?.reportedOutputs).toEqual([{ role: "scout", candidateCount: 1, resultStatus: "partial" }])
-    expect(history.map(item => item.sourceSessionDiffers)).toEqual([true, true, false, false])
+    expect(history[2]?.sourceSessionDiffers).toBe(true)
+    expect(history[2]?.nodeLessons?.[1]?.executionFailureCategory).toBeUndefined()
+    expect(history[3]?.sourceSessionDiffers).toBe(false)
+    expect(history[3]?.nodeLessons?.[1]?.executionFailureCategory).toBe("execution_setup_unavailable")
+    expect(history[4]?.reportedOutputs).toEqual([{ role: "scout", candidateCount: 1, resultStatus: "partial" }])
+    expect(history.map(item => item.sourceSessionDiffers)).toEqual([true, true, true, false, false])
     expect(history.some(item => [crossWrongSource.turnId, crossWrongOrigin.turnId, archivedSource.turnId,
-      equalCutoff.turnId, foreignScopeCorrelation.turnId, otherUser.turnId, future.turnId].includes(item.sourceTurnId))).toBe(false)
+      foreignScopeCorrelation.turnId, otherUser.turnId, future.turnId].includes(item.sourceTurnId))).toBe(false)
     expect(projectRootTaskHistory(history, true)?.content).toMatchObject({ kind: "root_task_history", advisoryOnly: true, notCurrentEvidence: true })
   })
 
@@ -471,7 +639,7 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       const scan = gate(), resume = gate()
       let paused = false
       const observed = observeQueries(pool!, async sql => {
-        if (!paused && sql.includes("WITH terminal_window")) {
+        if (!paused && sql.includes('event."sessionId" <> $1')) {
           paused = true
           scan.open()
           await resume.promise
@@ -626,8 +794,6 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
   })
 
   it("filters more than 64 newer cross-session wrong-origin rows before loading graphs", async () => {
-    for (const source of crossSessionWrongOriginFillers) await insertSource(source)
-    await projectSources(crossSessionWrongOriginFillers)
     await withObjectiveHistoryIndexReady(async () => {
       const graphLoads: string[] = []
       const observed = observeQueries(pool!, async (sql, values) => {
@@ -639,15 +805,14 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       const history = await createPgDirectRootTaskHistoryStore(observed).load(input)
 
       expect(history.map(item => item.sourceTurnId)).toEqual([
-        crossEqualTimeHigherTurnId.turnId, otherSession.turnId, matching[1]!.turnId, matching[0]!.turnId,
+        equalCutoff.turnId, crossEqualTimeHigherTurnId.turnId, otherSession.turnId, matching[1]!.turnId, matching[0]!.turnId,
       ])
-      expect(history.map(item => item.terminalAt?.toISOString())).toEqual([
-        "2022-01-01T00:00:00.000Z", "2022-01-01T00:00:00.000Z", "2021-01-01T00:00:00.000Z", "2020-01-01T00:00:00.000Z",
-      ])
+      const xids = history.map(item => BigInt(item.terminalXid8!))
+      expect(xids.every((xid, index) => index === 0 || xids[index - 1]! > xid)).toBe(true)
       expect(graphLoads).toEqual(history.map(item => item.sourceTurnId))
       const fillerTurnIds = new Set(crossSessionWrongOriginFillers.map(source => source.turnId))
       expect(graphLoads.filter(turnId => fillerTurnIds.has(turnId))).toEqual([])
-      expect(history.some(item => [crossWrongOrigin.turnId, equalCutoff.turnId, future.turnId].includes(item.sourceTurnId))).toBe(false)
+      expect(history.some(item => [crossWrongOrigin.turnId, future.turnId].includes(item.sourceTurnId))).toBe(false)
     })
   })
 
@@ -657,7 +822,7 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     const malformedSameSession: Source[] = Array.from({ length: 65 }, (_, index): Source => ({
       turnId: `root-history-scheduled-malformed-${index}-${suffix}`, rootTaskId: `root-history-scheduled-malformed-root-${index}-${suffix}`,
       childId: `root-history-scheduled-malformed-child-${index}-${suffix}`, finalItemId: `root-history-scheduled-malformed-final-${index}-${suffix}`,
-      sessionId, userId, turnSource: "automation", goal: objective, criteria,
+      sessionId: scheduledSessionId, userId, turnSource: "automation", goal: objective, criteria,
       input: scheduledTurnInput(scheduledSnapshot(targetRoles, { autoApply: "false" })),
       startSequence: 500 + index * 4, terminalCreatedAt: new Date(Date.UTC(2025, 0, 1, 0, 0, index)),
     }))
@@ -671,34 +836,34 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
           rootTaskId: `root-history-scheduled-${dimension}-mismatch-root-${index}-${suffix}`,
           childId: `root-history-scheduled-${dimension}-mismatch-child-${index}-${suffix}`,
           finalItemId: `root-history-scheduled-${dimension}-mismatch-final-${index}-${suffix}`,
-          sessionId, userId, turnSource: "automation", goal: objective, criteria,
+          sessionId: scheduledSessionId, userId, turnSource: "automation", goal: objective, criteria,
           input: scheduledTurnInput(scheduledSnapshot(roles, overrides)),
           startSequence: firstSequence + index * 4, terminalCreatedAt: new Date(Date.UTC(2025, 0, day, 0, 0, index)),
         }
       })
     const mismatchedRoles = mismatchGroup("targetRoles", 800, 2)
-    // Keep each four-event Turn range unique within this session. The earlier
-    // baseline fixture reserves sequences 1101–1104 for its future Turn.
+    // Keep each six-event Turn range unique within this session. The earlier
+    // baseline fixture reserves sequences 12606–12610 for its future Turn.
     const mismatchedLocations = mismatchGroup("targetLocations", 1120, 3)
     const mismatchedMinScores = mismatchGroup("minScore", 1380, 4)
     const hugeExponentMalformed: Source = {
       turnId: `root-history-scheduled-huge-number-${suffix}`, rootTaskId: `root-history-scheduled-huge-number-root-${suffix}`,
       childId: `root-history-scheduled-huge-number-child-${suffix}`, finalItemId: `root-history-scheduled-huge-number-final-${suffix}`,
-      sessionId, userId, turnSource: "automation", goal: objective, criteria,
+      sessionId: scheduledSessionId, userId, turnSource: "automation", goal: objective, criteria,
       input: scheduledTurnInput(scheduledSnapshot(targetRoles)), startSequence: 760,
       terminalCreatedAt: new Date("2025-01-01T00:00:01.000Z"),
     }
     const matchingSameSession: Source = {
       turnId: `root-history-scheduled-match-same-${suffix}`, rootTaskId: `root-history-scheduled-match-same-root-${suffix}`,
       childId: `root-history-scheduled-match-same-child-${suffix}`, finalItemId: `root-history-scheduled-match-same-final-${suffix}`,
-      sessionId, userId, turnSource: "automation", goal: objective, criteria,
+      sessionId: scheduledSessionId, userId, turnSource: "automation", goal: objective, criteria,
       input: scheduledTurnInput(validSnapshot), startSequence: 460, terminalCreatedAt: new Date("2021-01-01T00:00:00.000Z"),
     }
     const numericBoundarySnapshot = scheduledSnapshot(targetRoles, { minScore: 100 })
     const numericBoundaryMatch: Source = {
       turnId: `root-history-scheduled-number-match-${suffix}`, rootTaskId: `root-history-scheduled-number-match-root-${suffix}`,
       childId: `root-history-scheduled-number-match-child-${suffix}`, finalItemId: `root-history-scheduled-number-match-final-${suffix}`,
-      sessionId, userId, turnSource: "automation", goal: objective, criteria,
+      sessionId: scheduledSessionId, userId, turnSource: "automation", goal: objective, criteria,
       input: scheduledTurnInput(numericBoundarySnapshot), startSequence: 470,
       terminalCreatedAt: new Date("2022-01-01T00:00:00.000Z"),
     }
@@ -711,9 +876,8 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     const mismatchedCriteria = [...mismatchedRoles, ...mismatchedLocations, ...mismatchedMinScores]
     const sources = [...malformedSameSession, ...mismatchedCriteria, hugeExponentMalformed,
       matchingSameSession, numericBoundaryMatch, matchingCrossSession]
-    await pool!.query(`UPDATE "agent_events" SET "sequence" = 2000 WHERE "id" = $1`, [`root-history-current-start-${suffix}`])
-    await pool!.query(`UPDATE "agent_sessions" SET "eventSequence" = 3000 WHERE "id" = $1`, [sessionId])
-    await pool!.query(`UPDATE "agent_sessions" SET "eventSequence" = 2000 WHERE "id" = $1`, [otherSessionId])
+    await insertSession(scheduledSessionId, userId, SCHEDULED_FIXTURE_EVENT_SEQUENCE)
+    await pool!.query(`UPDATE "agent_sessions" SET "eventSequence" = $2 WHERE "id" = $1`, [otherSessionId, SCHEDULED_FIXTURE_EVENT_SEQUENCE])
     for (const source of sources) await insertSource(source)
     const hugeExponentInput = JSON.stringify(hugeExponentMalformed.input).replace('"minScore":70', '"minScore":1e10000')
     const preciseBoundaryInput = JSON.stringify(numericBoundaryMatch.input)
@@ -722,7 +886,7 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
     await updateTurnInputJson(hugeExponentMalformed.turnId, hugeExponentInput)
     await updateTurnInputJson(numericBoundaryMatch.turnId, preciseBoundaryInput)
     await projectSources(sources)
-    await updateCurrentTurn("automation", scheduledTurnInput(validSnapshot))
+    const scheduledLease = await insertScheduledCurrentTurn(scheduledTurnInput(validSnapshot))
 
     try {
       for (const crossSession of [false, true]) {
@@ -732,7 +896,7 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
             if (sql.includes('FROM "agent_items" AS item')) graphLoads.push(String(values?.[2]))
           })
           const input: DirectRootTaskHistoryLoadInput = {
-            lease, rootTaskId: currentRootTaskId, rootAttemptCount: 2, stepId: currentStepId, now: new Date(),
+            lease: scheduledLease, rootTaskId: scheduledCurrentRootTaskId, rootAttemptCount: 1, stepId: scheduledCurrentStepId, now: new Date(),
             ...(crossSession ? { crossSessionRootTaskHistoryEnabled: true } : {}),
             ...(indexed ? { objectiveHistoryIndexEnabled: true } : { objectiveHistoryIndexEnabled: false }),
           }
@@ -746,7 +910,7 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
         }
       }
 
-      await updateCurrentTurn("automation", scheduledTurnInput(numericBoundarySnapshot))
+      await updateScheduledCurrentTurn(scheduledTurnInput(numericBoundarySnapshot))
       for (const crossSession of [false, true]) {
         for (const indexed of [false, true]) {
           const graphLoads: string[] = []
@@ -754,7 +918,7 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
             if (sql.includes('FROM "agent_items" AS item')) graphLoads.push(String(values?.[2]))
           })
           const input: DirectRootTaskHistoryLoadInput = {
-            lease, rootTaskId: currentRootTaskId, rootAttemptCount: 2, stepId: currentStepId, now: new Date(),
+            lease: scheduledLease, rootTaskId: scheduledCurrentRootTaskId, rootAttemptCount: 1, stepId: scheduledCurrentStepId, now: new Date(),
             ...(crossSession ? { crossSessionRootTaskHistoryEnabled: true } : {}),
             ...(indexed ? { objectiveHistoryIndexEnabled: true } : { objectiveHistoryIndexEnabled: false }),
           }
@@ -765,7 +929,7 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
         }
       }
     } finally {
-      await updateCurrentTurn("user", { goal: objective, successCriteria: criteria })
+      await updateScheduledCurrentTurn(scheduledTurnInput(validSnapshot))
     }
 
     const manualSource: Source = {

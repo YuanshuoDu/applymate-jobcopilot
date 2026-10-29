@@ -19,6 +19,9 @@ const lease: TurnLease = {
   leaseStartedAt: new Date("2026-09-01T00:00:00.000Z"), leaseExpiresAt: new Date("2026-09-01T00:01:00.000Z"),
 }
 
+function compactSql(sql: string): string { return sql.replace(/\s+/g, " ").replace(/\s*=\s*/g, "=").trim() }
+function containsSql(sql: string, fragment: string): boolean { return compactSql(sql).includes(compactSql(fragment)) }
+
 describe("Turn queue worker polling", () => {
   it("uses the canonical Turn fallback while preserving a valid explicit override", async () => {
     const priorStalledInterval = process.env.BULLMQ_STALLED_INTERVAL_MS
@@ -53,7 +56,11 @@ function pool(mode: { source?: string; executionMode?: string | null } = {}) {
   const calls: string[] = []
   const queries: Array<[string, unknown[] | undefined]> = []
   const client = {
-    query: vi.fn(async (sql: string, params?: unknown[]) => { calls.push(sql); queries.push([sql, params]); return { rows: [{ ...lease, id: lease.turnId, leaseOwnerId: lease.ownerId, source: mode.source ?? "user", executionMode: mode.executionMode ?? null }], rowCount: 1 } }),
+    query: vi.fn(async (sql: string, params?: unknown[]) => {
+      calls.push(sql); queries.push([sql, params])
+      if (sql.includes("pg_current_xact_id")) return { rows: [{ xid8: "42" }], rowCount: 1 }
+      return { rows: [{ ...lease, id: lease.turnId, leaseOwnerId: lease.ownerId, source: mode.source ?? "user", executionMode: mode.executionMode ?? null }], rowCount: 1 }
+    }),
     release: vi.fn(),
   }
   return { pool: { connect: vi.fn().mockResolvedValue(client) }, calls, queries }
@@ -64,9 +71,10 @@ function interruptedAfterHeartbeatPool() {
   const client = {
     query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push([sql, params])
-      if (sql.includes('SET "leaseExpiresAt"')) return { rows: [], rowCount: 0 }
-      if (sql.includes('SET "leaseOwnerId" = NULL, "leaseExpiresAt" = $5')) return { rows: [], rowCount: 0 }
-      if (sql.includes('SET "status" = $5')) return { rows: [], rowCount: 0 }
+      if (sql.includes("pg_current_xact_id")) return { rows: [{ xid8: "42" }], rowCount: 1 }
+      if (containsSql(sql, 'SET "leaseExpiresAt"')) return { rows: [], rowCount: 0 }
+      if (containsSql(sql, 'SET "leaseOwnerId"=NULL,"leaseExpiresAt"=$5')) return { rows: [], rowCount: 0 }
+      if (containsSql(sql, 'SET "status"=$5')) return { rows: [], rowCount: 0 }
       if (sql.includes('SELECT "status" FROM "agent_turns"')) return { rows: [{ status: "interrupted" }], rowCount: 1 }
       return { rows: [{ ...lease, id: lease.turnId, leaseOwnerId: lease.ownerId }], rowCount: 1 }
     }),
@@ -81,14 +89,14 @@ function waitingPool() {
   const client = {
     query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push(sql)
-      if (sql.includes(`SET "status" = 'in_progress'`)) {
+      if (containsSql(sql, `SET "status" = 'in_progress'`)) {
         state.turnStatus = "in_progress"
         state.leaseOwnerId = String(params?.[2])
         state.leaseVersion = 1
         return { rows: [{ ...lease, id: lease.turnId, leaseOwnerId: state.leaseOwnerId, leaseVersion: state.leaseVersion }], rowCount: 1 }
       }
       if (sql.includes('UPDATE "agent_outbox"')) return { rows: [], rowCount: 1 }
-      if (sql.includes('SET "status" = $5')) {
+      if (containsSql(sql, 'SET "status" = $5')) {
         const next = String(params?.[4])
         const allowed = state.turnStatus === "in_progress"
           || (state.turnStatus === "waiting_for_user" && next === "waiting_for_user")
@@ -195,7 +203,7 @@ describe("Turn queue processor", () => {
     expect(result).toEqual({ status: "completed" })
     expect(execute).toHaveBeenCalledWith(expect.objectContaining({ lease, signal: expect.any(AbortSignal) }))
     expect(registry.size).toBe(0)
-    expect(fake.calls.some((sql) => sql.includes('SET "status" = $5'))).toBe(true)
+    expect(fake.calls.some(sql => containsSql(sql, 'SET "status" = $5'))).toBe(true)
   })
 
   it("releases a resolved context-admission failure as failed without requeueing or retrying", async () => {
@@ -208,9 +216,9 @@ describe("Turn queue processor", () => {
     )).resolves.toEqual({ status: "failed", errorCode: "context_estimate_exceeded" })
 
     expect(execute).toHaveBeenCalledTimes(1)
-    const release = fake.queries.find(([sql]) => sql.includes('SET "status" = $5'))
+    const release = fake.queries.find(([sql]) => containsSql(sql, 'SET "status" = $5'))
     expect(release?.[1]?.[4]).toBe("failed")
-    expect(fake.queries.some(([sql, params]) => sql.includes('SET "status" = $5') && params?.[4] === "queued")).toBe(false)
+    expect(fake.queries.some(([sql, params]) => containsSql(sql, 'SET "status" = $5') && params?.[4] === "queued")).toBe(false)
     expect(fake.calls.some(sql => sql.includes("agent.turn.dlq"))).toBe(false)
   })
 
@@ -225,7 +233,7 @@ describe("Turn queue processor", () => {
 
     expect(result).toEqual({ status: "requeued", reasonCode: "session_pause_requested" })
     expect(fake.calls.some(sql => sql.includes("agent.turn.dlq"))).toBe(false)
-    expect(fake.calls.some(sql => sql.includes('SET "status" = \'queued\''))).toBe(true)
+    expect(fake.calls.some(sql => containsSql(sql, 'SET "status" = \'queued\''))).toBe(true)
   })
 
   it("releases the turn after canonical runtime persists a user wait", async () => {
@@ -240,7 +248,7 @@ describe("Turn queue processor", () => {
     )
     expect(result).toEqual({ status: "waiting_for_user" })
     expect(fake.state).toEqual({ turnStatus: "waiting_for_user", leaseOwnerId: null, leaseVersion: 1 })
-    expect(fake.calls.some((sql) => sql.includes('"status" = \'in_progress\' OR ("status" = \'waiting_for_user\' AND $5 = \'waiting_for_user\')'))).toBe(true)
+    expect(fake.calls.some(sql => containsSql(sql, '"status" = \'in_progress\' OR ("status" = \'waiting_for_user\' AND $5 = \'waiting_for_user\')'))).toBe(true)
   })
 
   it("releases the turn after canonical runtime persists an approval wait", async () => {
@@ -255,7 +263,7 @@ describe("Turn queue processor", () => {
     )
     expect(result).toEqual({ status: "waiting_for_approval" })
     expect(fake.state).toEqual({ turnStatus: "waiting_for_approval", leaseOwnerId: null, leaseVersion: 1 })
-    expect(fake.calls.some((sql) => sql.includes('"status" = \'waiting_for_approval\' AND $5 = \'waiting_for_approval\''))).toBe(true)
+    expect(fake.calls.some(sql => containsSql(sql, '"status" = \'waiting_for_approval\' AND $5 = \'waiting_for_approval\''))).toBe(true)
   })
 
   it("fences duplicate concurrent delivery before either executor can run twice", async () => {
@@ -265,7 +273,7 @@ describe("Turn queue processor", () => {
       connect: vi.fn(async () => {
         const client = {
           query: vi.fn(async (sql: string) => {
-            if (sql.includes(`SET "status" = 'in_progress'`)) {
+            if (containsSql(sql, `SET "status" = 'in_progress'`)) {
               if (claimed) return { rows: [], rowCount: 0 }
               claimed = true
               return { rows: [{ ...lease, id: lease.turnId, leaseOwnerId: lease.ownerId }], rowCount: 1 }
@@ -316,7 +324,7 @@ describe("Turn queue processor", () => {
 
     expect(execute).not.toHaveBeenCalled()
     expect(bookkeepingClient.release).toHaveBeenCalledOnce()
-    expect(fake.calls.some((sql) => sql.includes('SET "status" = $5'))).toBe(true)
+    expect(fake.calls.some(sql => containsSql(sql, 'SET "status" = $5'))).toBe(true)
   })
 
   it("uses the atomic wait handoff before ordinary lease release", async () => {
@@ -329,7 +337,7 @@ describe("Turn queue processor", () => {
     )
     expect(result).toEqual({ status: "waiting_for_dependency", waitId: "wait-1" })
     expect(waitHandoff).toHaveBeenCalledWith(expect.objectContaining({ waitId: "wait-1", lease }))
-    expect(fake.calls.some((sql) => sql.includes('SET "status" = $5'))).toBe(false)
+    expect(fake.calls.some(sql => containsSql(sql, 'SET "status" = $5'))).toBe(false)
   })
 
   it("records malformed payloads and never calls the executor", async () => {
@@ -356,7 +364,7 @@ describe("Turn queue processor", () => {
     expect(result).toEqual({ status: "interrupted" })
     expect(execute).toHaveBeenCalledWith(expect.objectContaining({ signal: expect.any(AbortSignal) }))
     expect(interrupts.size).toBe(0)
-    expect(fake.calls.some((sql) => sql.includes('SET "status" = $5'))).toBe(true)
+    expect(fake.calls.some(sql => containsSql(sql, 'SET "status" = $5'))).toBe(true)
   })
 
   it("polls the durable Stop marker and aborts an active Turn across Worker processes", async () => {
@@ -378,7 +386,7 @@ describe("Turn queue processor", () => {
 
     expect(result).toEqual({ status: "interrupted", summary: "Turn stopped by a persisted interrupt" })
     expect(isInterrupted).toHaveBeenCalledTimes(2)
-    expect(fake.calls.some(sql => sql.includes('SET "status" = $5'))).toBe(true)
+    expect(fake.calls.some(sql => containsSql(sql, 'SET "status" = $5'))).toBe(true)
   })
 
   it("preserves execution semantics when the durable Stop probe rejects", async () => {
@@ -447,7 +455,7 @@ describe("Turn queue processor", () => {
       { data: { turnId: "turn_1", sessionId: "session_1", ownerId: "owner_1" }, attemptsMade: 0 },
       { pool: first.pool, execute: vi.fn().mockRejectedValue(error) },
     )).rejects.toBe(error)
-    expect(first.calls.some(sql => sql.includes('SET "status" = $5'))).toBe(true)
+    expect(first.calls.some(sql => containsSql(sql, 'SET "status" = $5'))).toBe(true)
 
     const terminal = pool()
     const result = await runTurnJob(
@@ -478,7 +486,7 @@ describe("Turn queue processor", () => {
       { pool: fake.pool, execute, interruptSubagents },
     )).resolves.toEqual({ status: "requeued", reasonCode: "lease_lost" })
     expect(interruptSubagents).toHaveBeenCalledOnce()
-    expect(fake.calls.some(sql => sql.includes('SET "leaseOwnerId" = NULL, "leaseExpiresAt" = $5'))).toBe(true)
+    expect(fake.calls.some(sql => containsSql(sql, 'SET "leaseOwnerId" = NULL, "leaseExpiresAt" = $5'))).toBe(true)
   })
 
   it("converges a durable interrupted Turn after heartbeat renewal is fenced", async () => {
@@ -496,6 +504,9 @@ describe("Turn queue processor", () => {
     const statusRead = fake.calls.find(([sql]) => sql.includes('SELECT "status" FROM "agent_turns"'))
     expect(statusRead?.[1]).toEqual(["turn_1", "session_1", "user_1"])
     expect(fake.calls.some(([sql, params]) => sql.includes("set_config('app.user_id'") && params?.[0] === "user_1")).toBe(true)
-    expect(fake.calls.some(([sql]) => sql.includes('SET "leaseOwnerId" = NULL, "leaseExpiresAt" = $5'))).toBe(true)
+    const expiryWrite = fake.calls.find(([sql]) => containsSql(sql, 'SET "leaseOwnerId" = NULL, "leaseExpiresAt" = $5'))
+    expect(containsSql(expiryWrite?.[0] ?? "", 'WHERE "id" = $1 AND "sessionId" = $2 AND "leaseOwnerId" = $3 AND "leaseVersion" = $4 AND "status" = \'in_progress\'')).toBe(true)
+    expect(expiryWrite?.[1]).toEqual(["turn_1", "session_1", "owner_1", 1, expect.any(Date)])
+    expect(fake.calls.some(([sql]) => containsSql(sql, 'SET "status" = $5'))).toBe(true)
   })
 })

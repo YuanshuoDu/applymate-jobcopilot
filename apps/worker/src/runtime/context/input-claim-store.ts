@@ -19,7 +19,9 @@ export class InputClaimStoreError extends Error {
   readonly recoverable = false
   constructor(readonly code: "owner_conflict" | "checkpoint_conflict" | "store_conflict", message: string) { super(message); this.name = "InputClaimStoreError" }
 }
-type CheckpointRow = { inputThroughSequence: bigint | string; consumedInputIds: unknown }; type QueryClient = Pick<pg.PoolClient, "query">
+type CheckpointRow = { inputThroughSequence: bigint | string; consumedInputIds: unknown }
+export type InputClaimQueryClient = Pick<pg.PoolClient, "query">
+type QueryClient = InputClaimQueryClient
 type InputRow = RootInputContextRow
 const mapInput = createStoredAgentInputMapper(message => new InputClaimStoreError("store_conflict", message))
 function checkpoint(row: CheckpointRow): StepCheckpoint {
@@ -32,7 +34,7 @@ function checkpoint(row: CheckpointRow): StepCheckpoint {
   if (inputThroughSequence < 0n) throw new InputClaimStoreError("checkpoint_conflict", "Negative input cursor")
   return { inputThroughSequence, consumedInputIds: ids }
 }
-async function assertOwner(client: QueryClient, scope: TenantScope, input: { sessionId: string; turnId: string }, lease?: TurnExecutionFence): Promise<void> {
+export async function assertInputClaimOwnerFence(client: InputClaimQueryClient, scope: TenantScope, input: { sessionId: string; turnId: string }, lease?: TurnExecutionFence): Promise<void> {
   const session = await client.query(
     `SELECT "id"
      FROM "agent_sessions"
@@ -77,7 +79,7 @@ function sortInputs(inputs: StoredAgentInput[]): StoredAgentInput[] {
 function createTransaction(client: QueryClient, scope: TenantScope): InputClaimTransaction {
   return {
     async getCheckpoint(input) {
-      await assertOwner(client, scope, input, input.lease)
+      await assertInputClaimOwnerFence(client, scope, input, input.lease)
       const result = await client.query<CheckpointRow>(
         `SELECT "inputThroughSequence", "consumedInputIds"
          FROM "agent_steps"
@@ -88,7 +90,7 @@ function createTransaction(client: QueryClient, scope: TenantScope): InputClaimT
       return checkpoint(result.rows[0])
     },
     async claimInputs(input) {
-      await assertOwner(client, scope, input, input.lease)
+      await assertInputClaimOwnerFence(client, scope, input, input.lease)
       const existing = await client.query<InputRow>(inputSql(), [input.sessionId, input.turnId, scope.userId, input.stepId, [...input.checkpoint.consumedInputIds]])
       const existingInputs = sortInputs(existing.rows.map(mapInput))
       if (existingInputs.some((item) => item.userId !== scope.userId || item.sessionId !== input.sessionId || item.targetTurnId !== input.turnId)) {
@@ -135,7 +137,7 @@ function createTransaction(client: QueryClient, scope: TenantScope): InputClaimT
       }
     },
     async loadActiveSteeringInputs(input) {
-      await assertOwner(client, scope, input, input.lease)
+      await assertInputClaimOwnerFence(client, scope, input, input.lease)
       if (input.inputIds.length === 0) return []
       if (input.inputIds.length > 128 || input.inputIds.some(id => typeof id !== "string" || id.trim() !== id || id.length === 0) || new Set(input.inputIds).size !== input.inputIds.length) throw new InputClaimStoreError("store_conflict", "Active steering marker input IDs are invalid")
       const result = await client.query<InputRow>(
@@ -157,14 +159,14 @@ function createTransaction(client: QueryClient, scope: TenantScope): InputClaimT
       return inputs
     },
     async loadUnresolvedSteeringInputs(input) {
-      await assertOwner(client, scope, input, input.lease)
+      await assertInputClaimOwnerFence(client, scope, input, input.lease)
       if (input.userId !== scope.userId) throw new InputClaimStoreError("owner_conflict", "Steering read is outside the tenant scope")
       const { lease, ...readScope } = input
       return loadUnresolvedSteeringContext(client, readScope, mapInput, message => new InputClaimStoreError("store_conflict", message))
     },
-    loadRootInputContext: input => readRootInputContext(client, scope, input, () => assertOwner(client, scope, input, input.lease), mapInput),
+    loadRootInputContext: input => readRootInputContext(client, scope, input, () => assertInputClaimOwnerFence(client, scope, input, input.lease), mapInput),
     async persistCheckpoint(input) {
-      await assertOwner(client, scope, input, input.lease)
+      await assertInputClaimOwnerFence(client, scope, input, input.lease)
       const result = await client.query(
         `UPDATE "agent_steps"
          SET "inputThroughSequence" = $1, "consumedInputIds" = $2::jsonb
@@ -174,11 +176,16 @@ function createTransaction(client: QueryClient, scope: TenantScope): InputClaimT
       if (result.rowCount !== 1) throw new InputClaimStoreError("checkpoint_conflict", `Step ${input.stepId} checkpoint was not persisted`)
     },
     async appendObservedSteeringMarker(input) {
-      await assertOwner(client, scope, input, input.lease)
+      await assertInputClaimOwnerFence(client, scope, input, input.lease)
       await persistObservedSteeringMarker(client, { userId: scope.userId, sessionId: input.sessionId, turnId: input.turnId, taskId: input.taskId, lease: input.lease ? { ownerId: input.lease.ownerId, now: input.lease.now } : undefined }, input)
     },
   }
 }
+/** Bind to a caller-owned transaction; the caller begins it and establishes its tenant setting. */
+export function createPgInputClaimTransaction(client: InputClaimQueryClient, scope: TenantScope): InputClaimTransaction {
+  return createTransaction(client, Object.freeze({ userId: scope.userId }))
+}
+
 export function createPgInputClaimStore(pool: Pick<pg.Pool, "connect">, scope: TenantScope): InputClaimStore {
   const boundScope = Object.freeze({ userId: scope.userId })
   return {
@@ -189,7 +196,7 @@ export function createPgInputClaimStore(pool: Pick<pg.Pool, "connect">, scope: T
       try {
         await client.query("BEGIN")
         await client.query("SELECT set_config($1, $2, true)", ["app.user_id", boundScope.userId])
-        const result = await work(createTransaction(client, boundScope))
+        const result = await work(createPgInputClaimTransaction(client, boundScope))
         await client.query("COMMIT")
         committed = true
         return result

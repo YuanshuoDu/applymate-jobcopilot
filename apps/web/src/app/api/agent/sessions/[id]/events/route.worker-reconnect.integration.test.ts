@@ -7,7 +7,8 @@ import { NextRequest } from "next/server"
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 
 import { EXTENSION_TOKEN_AUDIENCE, EXTENSION_TOKEN_ISSUER, getAuthJwtSecret } from "@/lib/auth-secret"
-import { publicIdempotencyKey } from "@/lib/agent/session/public-tool-identity"
+import { isPrivateV2EventType } from "@/lib/agent/session/v2-private-event-filter"
+import { publicAgentEventId, publicIdempotencyKey } from "@/lib/agent/session/public-tool-identity"
 
 // This suite exercises the real bearer-token auth path. Avoid initializing
 // NextAuth's framework-only cookie/session integration in Vitest's Node runtime.
@@ -16,6 +17,8 @@ vi.mock("@/lib/safe-auth", () => ({ safeAuth: async () => null }))
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const FLAG_ENVIRONMENT = "development"
 const targetEventKey = (turnId: string) => `turn:${turnId}:event:turn-started`
+const chronologyWitnessEventType = "agent.plan.root_task_history_chronology_witness"
+const chronologyWitnessSchemaVersion = "agent-harness.v2.root-task-history-chronology-witness.v1"
 
 function disposableDatabaseUrl(): string | null {
   const value = process.env.AGENT_RUNTIME_PG_TEST_URL
@@ -117,6 +120,48 @@ function startWorker(): FixtureChild {
 function workerExited(child: FixtureChild): boolean {
   return (child.exitCode !== null && child.exitCode !== undefined)
     || (child.signalCode !== null && child.signalCode !== undefined)
+}
+
+async function workerFailureDiagnostics(db: NonNullable<typeof testDb>, sessionId: string, turnId: string): Promise<string> {
+  try {
+    const [turns, roots, steps, events, outbox] = await Promise.all([
+      db.$queryRaw<Array<Record<string, unknown>>>`
+        SELECT "id", "status", LEFT("error", 240) AS "error", "rootTaskId", "leaseOwnerId", "leaseVersion",
+               "leaseExpiresAt", "startedAt", "completedAt"
+        FROM "agent_turns" WHERE "id" = ${turnId} AND "sessionId" = ${sessionId}
+      `,
+      db.$queryRaw<Array<Record<string, unknown>>>`
+        SELECT "id", "status", "attemptCount", "leaseOwner", "leaseExpiresAt", "interruptRequestedAt", "updatedAt"
+        FROM "sub_agent_tasks" WHERE "sessionId" = ${sessionId} AND "turnId" = ${turnId} AND "parentTaskId" IS NULL
+      `,
+      db.$queryRaw<Array<Record<string, unknown>>>`
+        SELECT "id", "ordinal", "attempt", "status", "errorCode", "finishReason"
+        FROM "agent_steps" WHERE "sessionId" = ${sessionId} AND "turnId" = ${turnId}
+        ORDER BY "ordinal" DESC LIMIT 8
+      `,
+      db.$queryRaw<Array<Record<string, unknown>>>`
+        SELECT "id", "sequence"::text AS "sequence", "type", "taskId", "actor", "idempotencyKey", "correlationId", "causationId",
+               payload ->> 'boundary' AS "historyBoundary", payload ->> 'boundaryEventId' AS "historyBoundaryEventId",
+               payload ->> 'xid8' AS "historyXid8"
+        FROM "agent_events" WHERE "sessionId" = ${sessionId} AND "turnId" = ${turnId}
+        ORDER BY "sequence" ASC LIMIT 40
+      `,
+      db.$queryRaw<Array<Record<string, unknown>>>`
+        SELECT "topic", "aggregateId", "idempotencyKey", "publishedAt", "attemptCount", LEFT("lastError", 240) AS "lastError"
+        FROM "agent_outbox"
+        WHERE ("aggregateId" = ${sessionId} OR "aggregateId" = ${turnId})
+          AND "topic" IN ('agent.events', 'agent.turn.execute', 'agent.turn.dlq')
+        ORDER BY "createdAt" DESC LIMIT 40
+      `,
+    ])
+    return JSON.stringify({ turns, roots, steps, events, outbox })
+  } catch (error: unknown) {
+    return `diagnostic_query_failed:${error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300)}`
+  }
+}
+
+function recentWorkerLines(lines: readonly string[] | undefined): string {
+  return (lines ?? []).slice(-20).map(line => line.slice(0, 500)).join(" | ") || "missing"
 }
 
 async function waitForWorkerExit(child: FixtureChild, timeoutMs: number): Promise<boolean> {
@@ -363,13 +408,15 @@ describeWithServices("agent events route replays a disconnected Worker event", (
         `
         const failure = diagnostics[0]
         const lastStep = steps[0]
+        const runtimeState = await workerFailureDiagnostics(testDatabase, sessionId, turnId)
         throw new Error(
           `Worker turn ${turnStatus}: ${turn?.error ?? "no error"}; `
           + `dlq=${failure ? `${failure.reasonCode ?? "unknown"}/${failure.errorCode ?? "unknown"}/attempt-${failure.attemptsMade ?? "unknown"}` : "missing"}; `
           + `turnError=${failures[0]?.errorCode ?? "missing"}; `
           + `step=${lastStep ? `${lastStep.status}/${lastStep.errorCode ?? "no-error-code"}/${lastStep.finishReason ?? "no-finish-reason"}` : "missing"}; `
-          + `stdout=${worker?.output.filter(line => line === "WORKER_READY" || line === "FIXTURE_MODEL_USED").join("|") ?? "missing"}; `
-          + `stderr=${worker?.errors.join("|") ?? "missing"}`,
+          + `exit=${worker?.exitCode ?? "running"}/${worker?.signalCode ?? "no-signal"}; `
+          + `stdout=${recentWorkerLines(worker?.output)}; stderr=${recentWorkerLines(worker?.errors)}; `
+          + `runtime=${runtimeState}`,
         )
       }
       await new Promise(resolveWait => setTimeout(resolveWait, 50))
@@ -388,8 +435,41 @@ describeWithServices("agent events route replays a disconnected Worker event", (
     const expectedDurableEvents = await testDatabase.agentEvent.findMany({
       where: { sessionId, sequence: { gt: cursor } },
       orderBy: { sequence: "asc" },
-      select: { sequence: true },
+      select: { id: true, sequence: true, type: true, idempotencyKey: true, causationId: true, payload: true },
     })
+    const chronologyWitnesses = expectedDurableEvents.filter(event => event.type === chronologyWitnessEventType)
+    const privateEvents = expectedDurableEvents.filter(event => isPrivateV2EventType(event.type))
+    const startWitness = chronologyWitnesses.find(event => event.idempotencyKey
+      === `root-task-history-chronology-witness:turn_start:${targetInDatabase[0]!.id}:v1`)
+    const terminalEvent = expectedDurableEvents.find(event => event.type === "turn.completed")
+    const terminalWitness = terminalEvent && chronologyWitnesses.find(event => event.idempotencyKey
+      === `root-task-history-chronology-witness:root_terminal:${terminalEvent.id}:v1`)
+    expect(chronologyWitnesses).toHaveLength(2)
+    expect(privateEvents.map(event => event.type)).toEqual([chronologyWitnessEventType, chronologyWitnessEventType])
+    expect(startWitness).toMatchObject({
+      type: chronologyWitnessEventType,
+      sequence: targetInDatabase[0]!.sequence + BigInt(1),
+      causationId: targetInDatabase[0]!.id,
+      payload: {
+        schemaVersion: chronologyWitnessSchemaVersion,
+        boundary: "turn_start",
+        boundaryEventId: targetInDatabase[0]!.id,
+        xid8: expect.any(String),
+      },
+    })
+    expect(terminalEvent).toBeDefined()
+    expect(terminalWitness).toMatchObject({
+      type: chronologyWitnessEventType,
+      sequence: terminalEvent!.sequence + BigInt(1),
+      causationId: terminalEvent!.id,
+      payload: {
+        schemaVersion: chronologyWitnessSchemaVersion,
+        boundary: "root_terminal",
+        boundaryEventId: terminalEvent!.id,
+        xid8: expect.any(String),
+      },
+    })
+    expect(expectedDurableEvents.at(-1)?.id).toBe(terminalWitness?.id)
 
     const reconnectResponse = await GET(eventRequest(sessionId, cursor.toString(), ownerToken), {
       params: Promise.resolve({ id: sessionId }),
@@ -406,14 +486,33 @@ describeWithServices("agent events route replays a disconnected Worker event", (
 
     const durableFrames = replayedFrames.filter(frame => frame.id !== null)
     const durableSequences = durableFrames.map(frame => BigInt(frame.id!))
-    const expectedSequences = expectedDurableEvents.map(event => event.sequence)
+    const expectedPublicEvents = expectedDurableEvents.filter(event => !isPrivateV2EventType(event.type))
+    const expectedSequences = expectedPublicEvents.map(event => event.sequence)
     const observedSequenceSet = new Set(durableSequences.map(String))
     const duplicateCount = durableSequences.length - observedSequenceSet.size
     const missedDurableEvents = expectedSequences.filter(sequence => !observedSequenceSet.has(sequence.toString())).length
     expect(durableSequences[0]).toBe(cursor + BigInt(1))
     expect(durableSequences.map(String)).toEqual(expectedSequences.map(String))
+    expect(durableFrames.map(frame => ({
+      id: frame.data.id,
+      sequence: frame.id,
+      type: frame.data.type,
+      idempotencyKey: frame.data.idempotencyKey,
+    }))).toEqual(expectedPublicEvents.map(event => ({
+      id: publicAgentEventId(sessionId, event.id),
+      sequence: event.sequence.toString(),
+      type: event.type,
+      idempotencyKey: publicIdempotencyKey(sessionId, event.idempotencyKey),
+    })))
     expect(duplicateCount).toBe(0)
     expect(missedDurableEvents).toBe(0)
+    const serializedReplay = JSON.stringify(replayedFrames)
+    expect(durableFrames.some(frame => frame.data.type === chronologyWitnessEventType)).toBe(false)
+    expect(serializedReplay).not.toContain(chronologyWitnessSchemaVersion)
+    for (const witness of chronologyWitnesses) {
+      expect(serializedReplay).not.toContain(witness.id)
+      expect(serializedReplay).not.toContain(witness.idempotencyKey)
+    }
     const targetSequence = (cursor + BigInt(1)).toString()
     const targetFrames = replayedFrames.filter(frame => frame.event === "turn.started" && frame.id === targetSequence)
     const targetFrame = targetFrames[0]

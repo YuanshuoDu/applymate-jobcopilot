@@ -64,7 +64,8 @@ describe("historical discovery result-page store guards", () => {
 
   it("caps canonical graph reloads at eight even when more bounded roots are returned", async () => {
     const sources: RootTaskHistoryCandidate[] = Array.from({ length: 12 }, (_, index) => ({
-      sessionId: "session", turnId: `source-turn-${index}`, rootTaskId: `source-root-${index}`, terminalSequence: BigInt(90 - index),
+      sessionId: "session", turnId: `source-turn-${index}`, rootTaskId: `source-root-${index}`,
+      terminalEventId: `source-terminal-event-${index}`, terminalSequence: BigInt(90 - index),
     }))
     historyMocks.candidates.mockResolvedValue(sources)
     const store = createPgRootTaskHistoryResultPageStore({ connect: vi.fn() } as unknown as Pick<pg.Pool, "connect">)

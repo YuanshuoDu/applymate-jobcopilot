@@ -251,7 +251,20 @@ class IntegrationPg {
     }
     if (sql.includes('SET "status" = \'waiting_for_dependency\'')) { this.state.turn.status = "waiting_for_dependency"; this.state.turn.leaseOwnerId = null; this.state.turn.leaseExpiresAt = null; this.state.turn.leaseStartedAt = null; this.state.turn.revision += 1; return { rows: [], rowCount: 1 } }
     if (sql.includes('SET "status" = \'queued\'')) { this.state.turn.status = "queued"; this.state.turn.leaseOwnerId = null; this.state.turn.leaseExpiresAt = null; this.state.turn.leaseStartedAt = null; this.state.turn.revision += 1; return { rows: [], rowCount: 1 } }
-    if (sql.includes('SET "status" = $5')) { this.state.turn.status = String(values[4]); this.state.turn.leaseOwnerId = null; this.state.turn.leaseExpiresAt = null; this.state.turn.leaseStartedAt = null; this.state.turn.revision += 1; return { rows: [], rowCount: 1 } }
+    if (sql.includes('SET "status"=$5')) {
+      const status = String(values[4]), now = values[5] instanceof Date ? values[5] : new Date(String(values[5]))
+      const allowedStatus = this.state.turn.status === "in_progress"
+        || this.state.turn.status === "waiting_for_user" && status === "waiting_for_user"
+        || this.state.turn.status === "waiting_for_approval" && status === "waiting_for_approval"
+      const owned = String(values[0]) === this.state.turn.id && String(values[1]) === this.state.turn.sessionId
+        && String(values[2]) === this.state.turn.leaseOwnerId && Number(values[3]) === this.state.turn.leaseVersion
+        && String(values[6]) === this.state.turn.userId && this.state.turn.leaseExpiresAt !== null
+        && this.state.turn.leaseExpiresAt.getTime() > now.getTime() && allowedStatus
+      if (!owned) return { rows: [], rowCount: 0 }
+      this.state.turn.status = status; this.state.turn.leaseOwnerId = null; this.state.turn.leaseExpiresAt = null
+      this.state.turn.leaseStartedAt = null; this.state.turn.revision += 1
+      return { rows: [], rowCount: 1 }
+    }
     if (sql.startsWith('INSERT INTO "agent_events"')) {
       const event = { id: String(values[0]), sessionId: String(values[1]), turnId: String(values[2]), sequence: String(values[3]), type: "turn.resumed", actor: "system", correlationId: String(values[2]), causationId: String(values[4]), idempotencyKey: String(values[5]), payload: JSON.parse(String(values[6])) as Record<string, unknown> }
       if (event.sessionId !== SESSION_ID || event.turnId !== TURN_ID || event.payload.waitId !== this.state.wait.id || event.payload.turnId !== TURN_ID) throw new Error("event fixture scope mismatch")

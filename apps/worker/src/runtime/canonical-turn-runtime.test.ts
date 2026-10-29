@@ -43,6 +43,7 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllEnvs())
 
 import { redactSensitiveValue } from "@jobcopilot/shared"
+import * as canonicalTurnContextBuilderModule from "./canonical-turn-context-builder.js"
 import type { HarnessModelRequest, ModelAdapter, ModelStreamEvent } from "@jobcopilot/agent-model"
 import { createHarnessModelRuntime, type HarnessFetch } from "./harness-model.js"
 import type pg from "pg"
@@ -1131,12 +1132,35 @@ describe("createCanonicalTurnRuntime", () => {
       ENABLE_AGENT_CROSS_SESSION_ROOT_TASK_HISTORY: "1",
       ENABLE_AGENT_OBJECTIVE_HISTORY_INDEX: "1",
     })
-    const crossSessionOutcome = { ...failedRootHistoryOutcome(), sourceNodeOrdinals: [1], sourceSessionDiffers: true,
-      terminalAt: new Date("2026-10-20T12:00:00.000Z") }
-    const sameSessionProbe = projectRootTaskHistory([{ ...crossSessionOutcome, sourceSessionDiffers: false }], true)
+    const priorFootprint = { schemaVersion: DISCOVERY_QUERY_FOOTPRINT_SCHEMA_VERSION, availability: "available", calls: [{
+      criteria: { targetRoles: ["Software Engineer"], targetLocations: ["Dublin"], source: "greenhouse", pageSize: 20, hasCursor: true },
+      outcome: "completed", requestCount: 2, observedCandidateCount: 3, providerFailures: 0, materializationFailures: 0, hasMore: true,
+    }] } as const
+    const sameSessionOutcome = {
+      ...failedRootHistoryOutcome(), sourceNodeOrdinals: [1], sourceSessionDiffers: false,
+      terminalXid8: "42", terminalWitnessEventId: "history-witness",
+      taskGraph: {
+        ...failedRootHistoryOutcome().taskGraph, discoveryTurnEligibility: "ordinary" as const,
+        nodes: failedRootHistoryOutcome().taskGraph.nodes.map(node => ({ ...node,
+          verification: { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout" as const,
+            criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte" as const, minimum: 1 } }] },
+          discoveryQueryFootprint: priorFootprint,
+        })),
+      },
+    }
+    const crossSessionOutcome = { ...sameSessionOutcome, sourceSessionDiffers: true }
+    const sameSessionProbe = projectRootTaskHistory([sameSessionOutcome], true)
     expect((sameSessionProbe?.content as { turns?: Array<{ planShape?: { nodes?: unknown[] } }> } | undefined)?.turns?.[0]?.planShape?.nodes)
       .toEqual([{ ordinal: 1, role: "scout", dependsOnOrdinals: [] }])
-    rootTaskHistory.load.mockReset().mockImplementation(async () => [crossSessionOutcome])
+    expect((sameSessionProbe?.content as { turns?: Array<{ nodes?: Array<{ priorScoutQueryFootprint?: unknown }> }> } | undefined)
+      ?.turns?.[0]?.nodes?.[0]?.priorScoutQueryFootprint).toEqual(priorFootprint)
+    const crossSessionProbe = projectRootTaskHistory([crossSessionOutcome], true)
+    expect(crossSessionProbe?.content).toMatchObject({ historical: true })
+    const crossSessionTurn = (crossSessionProbe?.content as { turns?: Array<{ planShape?: unknown; nodes?: Array<{ priorScoutQueryFootprint?: unknown }> }> } | undefined)?.turns?.[0]
+    expect(crossSessionTurn?.planShape).toBeUndefined()
+    expect(crossSessionTurn?.nodes?.[0]?.priorScoutQueryFootprint).toBeUndefined()
+    rootTaskHistory.load.mockReset().mockImplementation(async () => [sameSessionOutcome])
+    const contextBuilderSpy = vi.spyOn(canonicalTurnContextBuilderModule, "createCanonicalTurnContextBuilder")
     const runtime = await createCanonicalTurnRuntime(emptyPlanningLedgerPool(), {
       workerId: "worker-1", productionFlags: planningFlags, taskGraphCommandPort,
       taskGraphTemplates: { scout: { role: "scout", taskType: "job_discovery", allowedActions: ["jobs.search"] } },
@@ -1162,26 +1186,35 @@ describe("createCanonicalTurnRuntime", () => {
       authorizeUsage: async () => ({ settle: async () => undefined }),
     })
 
-    await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed", summary: "evidence_missing" })
+    try {
+      await expect(runtime.execute({ lease, signal: new AbortController().signal })).resolves.toMatchObject({ status: "failed", summary: "evidence_missing" })
+      expect(contextBuilderSpy).toHaveBeenCalledWith(expect.objectContaining({
+        crossSessionRootTaskHistoryEnabled: true,
+        objectiveHistoryIndexEnabled: true,
+      }))
+    } finally {
+      contextBuilderSpy.mockRestore()
+    }
     expect(requests).toHaveLength(2)
     const capturedHistory = modelSnapshots[0]?.toolObservations.find(observation => observation.id === "root-task-history")
-    expect(capturedHistory?.content).toMatchObject({ kind: "root_task_history", historical: true,
-      turns: [{ nodes: [expect.objectContaining({ taskKind: "scout", status: "failed" })] }] })
-    expect(JSON.stringify(capturedHistory?.content)).not.toContain("planShape")
+    expect(capturedHistory?.content).toMatchObject({ kind: "root_task_history",
+      turns: [{ planShape: { nodes: [{ ordinal: 1, role: "scout", dependsOnOrdinals: [] }] },
+        nodes: [expect.objectContaining({ taskKind: "scout", status: "failed", priorScoutQueryFootprint: priorFootprint })] }] })
+    expect(JSON.stringify(capturedHistory?.content)).not.toContain("PRIVATE_HISTORY")
     const capturedRequestText = requests[0]!.messages.flatMap(message => message.content)
       .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
     expect(capturedRequestText).toContain("root_task_history")
-    expect(capturedRequestText).toContain('"historical":true')
-    expect(capturedRequestText).not.toContain('"planShape"')
+    expect(capturedRequestText).not.toContain('"historical":true')
+    expect(capturedRequestText).toContain('"planShape"')
     for (const request of requests) {
       const names = request.tools.flatMap(tool => tool && typeof tool === "object" && "name" in tool && typeof tool.name === "string" ? [tool.name] : [])
       expect(names).toContain("agent.plan")
     }
     expect(readCurrent).toHaveBeenCalledTimes(3)
+    // Server gates remain enabled, while the injected legacy reader has no transaction adapter and receives only same-session history.
     expect(rootTaskHistory.load).toHaveBeenCalledWith(expect.objectContaining({
       lease, rootTaskId: "root-1", rootAttemptCount: 1, stepId: expect.any(String), now: expect.any(Date),
-      crossSessionRootTaskHistoryEnabled: true,
-      objectiveHistoryIndexEnabled: true,
+      crossSessionRootTaskHistoryEnabled: false,
     }))
     expect(modelSnapshots[0]?.toolObservations).toContainEqual({
       id: "task-graph-current",

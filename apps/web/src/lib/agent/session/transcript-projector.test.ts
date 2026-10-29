@@ -102,6 +102,12 @@ describe("V2 transcript projector", () => {
   it.each([
     ["agent.plan.discovery_persona_snapshot", { projection: { facts: [{ value: "PRIVATE_DISCOVERY_FACT_VALUE" }] } }],
     ["agent.plan.discovery_persona_overflow", { rawValue: "PRIVATE_OVERFLOW_VALUE", observedFactCount: 33 }],
+    ["agent.plan.root_task_history_session_authorization", { consentVersion: 12, enabled: true, snapshotKey: "PRIVATE_HISTORY_AUTHORIZATION_KEY" }],
+    ["agent.plan.root_task_history_memory_snapshot", { snapshot: { id: "root-task-history", value: "PRIVATE_ROOT_TASK_HISTORY_VALUE" } }],
+    ["agent.plan.root_task_history_chronology_witness", {
+      schemaVersion: "agent-harness.v2.root-task-history-chronology-witness.v1", boundary: "turn_start",
+      boundaryEventId: "PRIVATE_CHRONOLOGY_BOUNDARY_EVENT", xid8: "90000000000000001",
+    }],
   ])("rejects transcript projection of private automatic-memory event %s", (type, payload) => {
     expect(() => projectV2EventToTranscript({ ...baseEvent, type, itemId: null, payload }))
       .toThrow("private_native_verification_event_not_projectable")
@@ -147,7 +153,7 @@ describe("V2 transcript projector", () => {
     expect(tx.$queryRaw).toHaveBeenCalledTimes(2)
   })
 
-  it("omits private verification, planning, reconciliation, and automatic-memory events during transcript rebuild", async () => {
+  it("omits private verification, planning, reconciliation, and memory events during transcript rebuild", async () => {
     const privateEvent = {
       ...baseEvent, id: "private-event", itemId: null, taskId: "private-control-task",
       type: "native_verification.scheduled_candidate_staged",
@@ -202,6 +208,22 @@ describe("V2 transcript projector", () => {
       type: "agent.plan.discovery_persona_overflow",
       payload: { observedFactCount: 33, rawValue: "PRIVATE_OVERFLOW_VALUE" },
     }
+    const rootTaskHistoryAuthorizationEvent = {
+      ...baseEvent, id: "private-root-task-history-authorization-event", itemId: null,
+      type: "agent.plan.root_task_history_session_authorization",
+      payload: { consentVersion: 12, enabled: true, snapshotKey: "PRIVATE_HISTORY_AUTHORIZATION_KEY" },
+    }
+    const rootTaskHistorySnapshotEvent = {
+      ...baseEvent, id: "private-root-task-history-snapshot-event", itemId: null,
+      type: "agent.plan.root_task_history_memory_snapshot",
+      payload: { snapshot: { id: "root-task-history", value: "PRIVATE_ROOT_TASK_HISTORY_VALUE" } },
+    }
+    const rootTaskHistoryChronologyEvent = {
+      ...baseEvent, id: "private-root-task-history-chronology-event", itemId: null,
+      type: "agent.plan.root_task_history_chronology_witness",
+      payload: { schemaVersion: "agent-harness.v2.root-task-history-chronology-witness.v1", boundary: "turn_start",
+        boundaryEventId: "PRIVATE_CHRONOLOGY_BOUNDARY_EVENT", xid8: "90000000000000001" },
+    }
     const finalRejectionEvent = {
       ...baseEvent,
       id: "public-final-rejection-event",
@@ -220,7 +242,8 @@ describe("V2 transcript projector", () => {
       $queryRaw: vi.fn().mockResolvedValue([{ id: "session_1" }]),
       agentEvent: { findMany: vi.fn().mockResolvedValue([
         privateEvent, clarificationEvent, reconciliationEvent, denialCheckpointEvent,
-        discoverySnapshotEvent, discoveryOverflowEvent, finalRejectionEvent, ordinaryEvent,
+        discoverySnapshotEvent, discoveryOverflowEvent, rootTaskHistoryAuthorizationEvent,
+        rootTaskHistorySnapshotEvent, rootTaskHistoryChronologyEvent, finalRejectionEvent, ordinaryEvent,
       ]) },
       agentTranscriptEvent: {
         findMany: vi.fn().mockResolvedValue([]),
@@ -246,13 +269,23 @@ describe("V2 transcript projector", () => {
     expect(serializedTranscriptRows).not.toContain("private-denial-digest-sentinel")
     expect(serializedTranscriptRows).not.toContain("agent.plan.discovery_persona_snapshot")
     expect(serializedTranscriptRows).not.toContain("agent.plan.discovery_persona_overflow")
+    expect(serializedTranscriptRows).not.toContain("agent.plan.root_task_history_session_authorization")
+    expect(serializedTranscriptRows).not.toContain("agent.plan.root_task_history_memory_snapshot")
+    expect(serializedTranscriptRows).not.toContain("agent.plan.root_task_history_chronology_witness")
     expect(serializedTranscriptRows).not.toContain("PRIVATE_DISCOVERY_FACT_VALUE")
     expect(serializedTranscriptRows).not.toContain("PRIVATE_OVERFLOW_VALUE")
+    expect(serializedTranscriptRows).not.toContain("PRIVATE_HISTORY_AUTHORIZATION_KEY")
+    expect(serializedTranscriptRows).not.toContain("PRIVATE_ROOT_TASK_HISTORY_VALUE")
+    expect(serializedTranscriptRows).not.toContain("PRIVATE_CHRONOLOGY_BOUNDARY_EVENT")
+    expect(serializedTranscriptRows).not.toContain("90000000000000001")
     expect(serializedTranscriptRows).not.toContain("task-graph-denial-checkpoint.v1")
     expect(serializedTranscriptRows).not.toContain("private-event")
     expect(serializedTranscriptRows).not.toContain("PRIVATE_SCHEDULED_FINAL_CANDIDATE")
     expect(serializedTranscriptRows).not.toContain("private-clarification-event")
     expect(serializedTranscriptRows).not.toContain("private-reconciliation-event")
+    expect(serializedTranscriptRows).not.toContain("private-root-task-history-authorization-event")
+    expect(serializedTranscriptRows).not.toContain("private-root-task-history-snapshot-event")
+    expect(serializedTranscriptRows).not.toContain("private-root-task-history-chronology-event")
     expect(serializedTranscriptRows).not.toContain("private-steer-id")
     expect(serializedTranscriptRows).not.toContain("private-reconciliation-steer-input-sentinel")
     expect(serializedTranscriptRows).not.toContain("root-task-1")

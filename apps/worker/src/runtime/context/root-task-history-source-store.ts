@@ -1,7 +1,9 @@
 import type pg from "pg"
 import { hasSelectedJobPreparation, rootTaskHistoryIndexKeys, rootTaskHistoryObjectiveDigest, rootTaskHistoryOrigin, type RootTaskHistoryFence, type RootTaskHistoryFenceInput } from "./root-task-history-fence.js"
+import { parseRootTaskHistoryChronologyXid8, readRootTaskHistoryChronologyWitness } from "./root-task-history-chronology-witness.js"
 import { OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION } from "./objective-history-projection.js"
 import { isScheduledAutomationTurn, sameScheduledAutomationCriteria, scheduledAutomationCriteria, scheduledAutomationHistoryCompatibilitySql } from "../subagents/scheduled-automation-snapshot.js"
+import { buildRootTaskHistoryCrossSessionWindow } from "./root-task-history-source-window.js"
 import {
   isHistoryReceiptText as text,
   parseHistoryReceiptSequence as sequence,
@@ -17,17 +19,21 @@ export type RootTaskHistoryCandidate = Readonly<{
   sessionId: string
   turnId: string
   rootTaskId: string
+  terminalEventId: string
   terminalSequence: bigint
-  terminalAt?: Date
+  terminalXid8?: string
+  terminalWitnessEventId?: string
 }>
 
 function candidate(row: Row, input: RootTaskHistoryFenceInput, fence: RootTaskHistoryFence, indexed = false): RootTaskHistoryCandidate | undefined {
   const turnId = row.turnId, rootTaskId = row.taskRootTaskId
   const crossSession = input.crossSessionRootTaskHistoryEnabled === true
+  const terminalEventId = text(row.terminalEventId) ? row.terminalEventId : undefined
   const scheduledTurn = isScheduledAutomationTurn(row.turnSource, row.input)
   const scheduledCriteria = scheduledTurn ? scheduledAutomationCriteria(row.input) : undefined
-  if (!text(turnId) || !text(rootTaskId) || !text(row.sessionId) || turnId === input.lease.turnId
+  if (!text(turnId) || !text(rootTaskId) || !text(row.sessionId) || !terminalEventId || turnId === input.lease.turnId
     || (!crossSession && row.sessionId !== input.lease.sessionId) || row.userId !== input.lease.userId
+    || (crossSession && row.sessionId === input.lease.sessionId)
     || row.rootTaskId !== rootTaskId || row.taskId !== rootTaskId || row.taskTurnId !== turnId
     || row.parentTaskId !== null || row.taskRole !== "orchestrator" || row.taskType !== "root"
     || !["completed", "failed", "interrupted"].includes(String(row.turnStatus))
@@ -40,10 +46,14 @@ function candidate(row: Row, input: RootTaskHistoryFenceInput, fence: RootTaskHi
   const start = validStart(row, turnId, rootTaskId)
   const terminal = start === undefined ? undefined : validTerminal(row, turnId, rootTaskId, String(row.turnStatus), start)
   const terminalAt = row.terminalCreatedAt instanceof Date && Number.isFinite(row.terminalCreatedAt.getTime()) ? row.terminalCreatedAt : undefined
+  const terminalXid8 = crossSession ? row.terminalWitnessXid8 : undefined
+  const terminalWitnessEventId = crossSession ? row.terminalWitnessEventId : undefined
+  const terminalOrder = crossSession ? parseRootTaskHistoryChronologyXid8(terminalXid8) : undefined
+  const startOrder = crossSession && fence.currentStartWitness ? parseRootTaskHistoryChronologyXid8(fence.currentStartWitness.xid8) : undefined
   if (start === undefined || terminal === undefined || start >= terminal
     || (!crossSession && terminal >= fence.currentStartSequence)
-    || (crossSession && (!fence.currentStartCreatedAt || !terminalAt
-      || terminalAt.getTime() >= fence.currentStartCreatedAt.getTime()))
+    || (crossSession && (!startOrder || !terminalOrder || terminalOrder >= startOrder
+      || !text(terminalWitnessEventId) || Number(row.terminalWitnessCount) !== 1))
     || rootTaskHistoryObjectiveDigest(row.input, { goal: row.goal, successCriteria: row.successCriteria }) !== fence.objectiveDigest) return undefined
   if (indexed) {
     const keys = rootTaskHistoryIndexKeys(row.turnSource, row.input, { goal: row.goal, successCriteria: row.successCriteria }, crossSession)
@@ -56,8 +66,8 @@ function candidate(row: Row, input: RootTaskHistoryFenceInput, fence: RootTaskHi
       || row.turnCanonicalOriginDigest !== keys.canonicalOriginDigest
       || keys.canonicalOriginDigest !== fence.objectiveHistoryIndexCanonicalOriginDigest)) return undefined
   }
-  return { sessionId: row.sessionId, turnId, rootTaskId, terminalSequence: terminal,
-    ...(crossSession && terminalAt ? { terminalAt } : {}) }
+  return { sessionId: row.sessionId, turnId, rootTaskId, terminalEventId, terminalSequence: terminal,
+    ...(crossSession && terminalOrder ? { terminalXid8: terminalOrder.toString(), terminalWitnessEventId: terminalWitnessEventId as string } : {}) }
 }
 
 async function objectiveHistoryIndexReady(client: Client): Promise<boolean> {
@@ -71,49 +81,31 @@ async function objectiveHistoryIndexReady(client: Client): Promise<boolean> {
     && result.rows[0]?.isReady === true
 }
 
-export async function readRootTaskHistoryCandidates(client: Client, input: RootTaskHistoryFenceInput, fence: RootTaskHistoryFence): Promise<RootTaskHistoryCandidate[]> {
+async function readCandidateWindow(client: Client, input: RootTaskHistoryFenceInput, fence: RootTaskHistoryFence): Promise<RootTaskHistoryCandidate[]> {
   const crossSession = input.crossSessionRootTaskHistoryEnabled === true
-  if (crossSession && (!(fence.currentStartCreatedAt instanceof Date)
-    || !Number.isFinite(fence.currentStartCreatedAt.getTime()) || !fence.currentOrigin)) return []
-  const canUseIndex = input.objectiveHistoryIndexEnabled === true
+  const canUseIndex = !crossSession && input.objectiveHistoryIndexEnabled === true
     && !!fence.objectiveHistoryIndexObjectiveDigest
-    && (!crossSession || !!fence.objectiveHistoryIndexCanonicalOriginDigest)
   const indexed = canUseIndex && await objectiveHistoryIndexReady(client)
-  const compatibilityParameter = indexed ? crossSession ? "$8" : "$7" : "$5"
+  const compatibilityParameter = indexed ? "$7" : "$5"
   const compatibility = scheduledAutomationHistoryCompatibilitySql(compatibilityParameter)
-  const legacyWindow = crossSession
-    ? `SELECT event."sessionId", event."turnId", event."taskId", event."sequence", event."createdAt"
-      FROM "agent_events" AS event
-      JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
-      JOIN "agent_sessions" AS current_session ON current_session."id" = $1 AND current_session."userId" = $2
-        AND current_session."status" NOT IN ('aborted', 'archived')
-      JOIN "agent_sessions" AS source_session ON source_session."id" = event."sessionId"
-        AND source_session."userId" = $2 AND source_session."status" NOT IN ('aborted', 'archived')
-      WHERE event."createdAt" < $4::timestamptz AND event."type" IN ('turn.completed', 'turn.failed', 'turn.interrupted')
-        AND ${compatibility}
-      ORDER BY event."createdAt" DESC, event."turnId" DESC`
-    : `SELECT event."sessionId", event."turnId", event."taskId", event."sequence"
-      FROM "agent_events" AS event
-      JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
-      WHERE event."sessionId" = $1 AND event."sequence" < $4::bigint
-        AND event."type" IN ('turn.completed', 'turn.failed', 'turn.interrupted')
-        AND ${compatibility}
-      ORDER BY event."sequence" DESC`
-  const indexedWindow = crossSession
-    ? `SELECT turn."sessionId", turn."id" AS "turnId", turn."rootTaskId" AS "taskId",
-        turn."terminalEventSequence" AS "sequence", turn."terminalEventAt" AS "createdAt"
-      FROM "agent_turns" AS turn
-      JOIN "agent_sessions" AS current_session ON current_session."id" = $1 AND current_session."userId" = $2
-        AND current_session."status" NOT IN ('aborted', 'archived')
-      JOIN "agent_sessions" AS source_session ON source_session."id" = turn."sessionId"
-        AND source_session."userId" = $2 AND source_session."status" NOT IN ('aborted', 'archived')
-      WHERE turn."userId" = $2 AND turn."id" <> $3 AND turn."terminalEventAt" < $4::timestamptz
-        AND turn."objectiveDigest" = $5 AND turn."canonicalOriginDigest" = $6
-        AND turn."objectiveIndexSemanticsVersion" = $7
-        AND ${compatibility}
-      ORDER BY turn."terminalEventAt" DESC, turn."id" DESC`
-    : `SELECT turn."sessionId", turn."id" AS "turnId", turn."rootTaskId" AS "taskId",
-        turn."terminalEventSequence" AS "sequence", turn."terminalEventAt" AS "createdAt"
+  const crossWindow = crossSession ? buildRootTaskHistoryCrossSessionWindow({
+    currentSessionId: input.lease.sessionId, userId: input.lease.userId, currentTurnId: input.lease.turnId,
+    currentStartXid8: fence.currentStartWitness!.xid8,
+    scheduledCriteria: fence.scheduledAutomationCriteria ? JSON.stringify(fence.scheduledAutomationCriteria) : null,
+    objectiveDigest: fence.objectiveDigest, semanticsVersion: OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION,
+    canonicalOrigin: fence.currentOrigin!, limit: SCAN_LIMIT,
+  }) : undefined
+  const legacyWindow = crossWindow?.sql ?? `SELECT event."id" AS "terminalEventId", event."sessionId", event."turnId", event."taskId", event."sequence",
+      NULL::text AS "terminalWitnessEventId", NULL::text AS "terminalWitnessXid8", 0::bigint AS "terminalWitnessCount"
+    FROM "agent_events" AS event
+    JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
+    WHERE event."sessionId" = $1 AND event."sequence" < $4::bigint
+      AND event."type" IN ('turn.completed', 'turn.failed', 'turn.interrupted') AND ${compatibility}
+    ORDER BY event."sequence" DESC`
+  const indexedWindow = `SELECT turn."sessionId", turn."id" AS "turnId", turn."rootTaskId" AS "taskId",
+        turn."terminalEventSequence" AS "sequence", turn."terminalEventAt" AS "createdAt",
+        NULL::text AS "terminalEventId", NULL::text AS "terminalWitnessEventId",
+        NULL::text AS "terminalWitnessXid8", 0::bigint AS "terminalWitnessCount"
       FROM "agent_turns" AS turn
       WHERE turn."sessionId" = $1 AND turn."userId" = $2 AND turn."id" <> $3
         AND turn."terminalEventSequence" < $4::bigint AND turn."objectiveDigest" = $5
@@ -121,7 +113,7 @@ export async function readRootTaskHistoryCandidates(client: Client, input: RootT
         AND ${compatibility}
       ORDER BY turn."terminalEventSequence" DESC, turn."id" DESC`
   const window = indexed ? indexedWindow : legacyWindow
-  const limit = indexed ? crossSession ? "$9" : "$8" : "$6"
+  const limit = indexed ? "$8" : "$6"
   const projectionColumns = indexed ? `, turn."objectiveDigest" AS "turnObjectiveDigest",
       turn."canonicalOriginDigest" AS "turnCanonicalOriginDigest",
       turn."objectiveIndexSemanticsVersion" AS "turnObjectiveIndexSemanticsVersion",
@@ -129,21 +121,17 @@ export async function readRootTaskHistoryCandidates(client: Client, input: RootT
   const locatorGuard = indexed ? `AND terminal."sequence" = roots."indexedTerminalSequence"
       AND terminal."createdAt" = roots."indexedTerminalAt"` : ""
   const scheduleCriteria = fence.scheduledAutomationCriteria ? JSON.stringify(fence.scheduledAutomationCriteria) : null
-  const values = indexed
-    ? crossSession
-      ? [input.lease.sessionId, input.lease.userId, input.lease.turnId, fence.currentStartCreatedAt,
-        fence.objectiveHistoryIndexObjectiveDigest, fence.objectiveHistoryIndexCanonicalOriginDigest,
-        OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, scheduleCriteria, SCAN_LIMIT]
-      : [input.lease.sessionId, input.lease.userId, input.lease.turnId, String(fence.currentStartSequence),
+  const values: unknown[] = crossWindow ? [...crossWindow.values] : (indexed
+    ? [input.lease.sessionId, input.lease.userId, input.lease.turnId, String(fence.currentStartSequence),
         fence.objectiveHistoryIndexObjectiveDigest, OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, scheduleCriteria, SCAN_LIMIT]
-    : [input.lease.sessionId, input.lease.userId, input.lease.turnId,
-      crossSession ? fence.currentStartCreatedAt : String(fence.currentStartSequence), scheduleCriteria, SCAN_LIMIT]
+    : [input.lease.sessionId, input.lease.userId, input.lease.turnId, String(fence.currentStartSequence), scheduleCriteria, SCAN_LIMIT])
   const result = await client.query<Row>(`WITH terminal_window AS MATERIALIZED (
       ${window}
-      LIMIT ${limit}
+      ${crossWindow ? "" : `LIMIT ${limit}`}
     ), roots AS (
       SELECT turn."id" AS "turnId", turn."sessionId", turn."userId", turn."rootTaskId", turn."status" AS "turnStatus", turn."input",
         turn."source" AS "turnSource"${projectionColumns}, session."userId" AS "sourceSessionUserId", session."status" AS "sourceSessionStatus",
+        terminal_event."terminalEventId", terminal_event."terminalWitnessEventId", terminal_event."terminalWitnessXid8", terminal_event."terminalWitnessCount",
         task."id" AS "taskId", task."turnId" AS "taskTurnId", task."rootTaskId" AS "taskRootTaskId", task."parentTaskId",
         task."role" AS "taskRole", task."taskType", task."status" AS "taskStatus", task."goal", task."successCriteria"
       FROM terminal_window AS terminal_event
@@ -164,7 +152,8 @@ export async function readRootTaskHistoryCandidates(client: Client, input: RootT
       terminal."turnId" AS "terminalTurnId", terminal."taskId" AS "terminalTaskId", terminal."itemId" AS "terminalItemId",
       terminal."sequence" AS "terminalSequence", terminal."type" AS "terminalType", terminal."actor" AS "terminalActor",
       terminal."correlationId" AS "terminalCorrelationId", terminal."idempotencyKey" AS "terminalIdempotencyKey",
-      terminal."payload" AS "terminalPayload", terminal."createdAt" AS "terminalCreatedAt", terminal."terminalEventCount",
+      terminal."payload" AS "terminalPayload", terminal."createdAt" AS "terminalCreatedAt", terminal."id" AS "terminalEventId", terminal."terminalEventCount",
+      roots."terminalWitnessEventId", roots."terminalWitnessXid8", roots."terminalWitnessCount",
       terminal_step."id" AS "terminalStepId", terminal_step."sessionId" AS "terminalStepSessionId",
       terminal_step."turnId" AS "terminalStepTurnId", terminal_step."taskId" AS "terminalStepTaskId",
       terminal_step."status" AS "terminalStepStatus",
@@ -176,7 +165,7 @@ export async function readRootTaskHistoryCandidates(client: Client, input: RootT
       terminal_step_event."stepCompletedEventCount" AS "terminalStepEventCount"
     FROM roots
     JOIN LATERAL (
-      SELECT event."turnId", event."taskId", event."itemId", event."sequence", event."type", event."actor",
+      SELECT event."id", event."turnId", event."taskId", event."itemId", event."sequence", event."type", event."actor",
         event."correlationId", event."idempotencyKey", event."payload", event."createdAt", COUNT(*) OVER () AS "terminalEventCount"
       FROM "agent_events" AS event WHERE event."sessionId" = roots."sessionId" AND event."turnId" = roots."turnId"
         AND event."taskId" = roots."rootTaskId" AND event."type" IN ('turn.completed', 'turn.failed', 'turn.interrupted')
@@ -209,17 +198,47 @@ export async function readRootTaskHistoryCandidates(client: Client, input: RootT
         AND event."taskId" = roots."rootTaskId" AND event."type" = 'turn.started'
       ORDER BY event."sequence" DESC LIMIT 1
     ) AS started ON true
-    WHERE ${crossSession ? 'terminal."createdAt" < $4::timestamptz' : 'terminal."sequence" < $4::bigint'}
+    WHERE ${crossSession ? 'terminal."id" = roots."terminalEventId"' : 'terminal."sequence" < $4::bigint'}
       ${locatorGuard}
       AND (terminal."type" <> 'turn.completed' OR terminal_step."id" = terminal."correlationId")
-    ORDER BY ${crossSession ? 'terminal."createdAt" DESC, roots."turnId" DESC' : 'terminal."sequence" DESC, roots."turnId" DESC'}`,
+    ORDER BY ${crossSession ? '(roots."terminalWitnessXid8")::numeric DESC, roots."turnId" DESC' : 'terminal."sequence" DESC, roots."turnId" DESC'}`,
   values)
   const output: RootTaskHistoryCandidate[] = [], seen = new Set<string>()
   for (const row of result.rows) {
     const value = candidate(row, input, fence, indexed)
     if (!value) continue
+    if (crossSession) {
+      const witness = await readRootTaskHistoryChronologyWitness(client, { boundaryEventId: String(row.terminalEventId),
+        boundary: "root_terminal", userId: input.lease.userId, sessionId: value.sessionId, turnId: value.turnId, rootTaskId: value.rootTaskId })
+      if (!witness || witness.eventId !== value.terminalWitnessEventId || witness.xid8 !== value.terminalXid8) continue
+    }
     const key = JSON.stringify([value.turnId, value.rootTaskId])
     if (!seen.has(key)) { seen.add(key); output.push(value) }
   }
   return output
+}
+
+export async function readRootTaskHistoryCandidates(client: Client, input: RootTaskHistoryFenceInput, fence: RootTaskHistoryFence): Promise<RootTaskHistoryCandidate[]> {
+  if (input.crossSessionRootTaskHistoryEnabled !== true) return readCandidateWindow(client, input, fence)
+  if (!fence.currentStartWitness || !fence.currentOrigin) return readCandidateWindow(client, { ...input, crossSessionRootTaskHistoryEnabled: false }, fence)
+  const sameSession = await readCandidateWindow(client, { ...input, crossSessionRootTaskHistoryEnabled: false }, fence)
+  const startXid8 = parseRootTaskHistoryChronologyXid8(fence.currentStartWitness.xid8)
+  if (!startXid8) return sameSession
+  const orderedSameSession: RootTaskHistoryCandidate[] = []
+  let unverified = false
+  for (const source of sameSession) {
+    const witness = await readRootTaskHistoryChronologyWitness(client, { boundaryEventId: source.terminalEventId,
+      boundary: "root_terminal", userId: input.lease.userId, sessionId: source.sessionId, turnId: source.turnId, rootTaskId: source.rootTaskId })
+    const terminalXid8 = witness && parseRootTaskHistoryChronologyXid8(witness.xid8)
+    if (!witness) { orderedSameSession.push(source); unverified = true; continue }
+    if (!terminalXid8) { unverified = true; continue }
+    if (terminalXid8 >= startXid8) continue
+    orderedSameSession.push({ ...source, terminalXid8: witness.xid8, terminalWitnessEventId: witness.eventId })
+  }
+  if (unverified) return orderedSameSession
+  const combined = [...orderedSameSession, ...await readCandidateWindow(client, input, fence)]
+  return combined.sort((left, right) => {
+    const leftXid = BigInt(left.terminalXid8!), rightXid = BigInt(right.terminalXid8!)
+    return leftXid > rightXid ? -1 : leftXid < rightXid ? 1 : right.turnId < left.turnId ? -1 : right.turnId > left.turnId ? 1 : 0
+  })
 }
