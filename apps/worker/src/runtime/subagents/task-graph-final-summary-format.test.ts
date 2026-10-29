@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { formatTaskGraphFinalSummary } from "./task-graph-final-summary-format.js"
-import { reduceTaskGraphFinalSummary, type TaskGraphFinalSummary } from "./task-graph-final-summary.js"
+import { ROLE_RESULT_SCHEMA } from "./role-results.js"
+import { reduceTaskGraphFinalSummary, type TaskGraphFinalSummary, type TaskGraphFinalSummaryNode } from "./task-graph-final-summary.js"
 
 function summary(): TaskGraphFinalSummary {
   return {
@@ -25,8 +26,23 @@ function withOutcomes(taskOutcomes: unknown): TaskGraphFinalSummary {
   return { ...summary(), taskOutcomes: taskOutcomes as TaskGraphFinalSummary["taskOutcomes"] }
 }
 
-const COUNT_SUMMARY = "Task-reported results: discovered jobs: 0 (complete); analyzed jobs: 2 observed (partial); prepared jobs: not requested; artifact references: unavailable; review outcomes: not requested."
-const EMPTY_COUNT_SUMMARY = "Task-reported results: discovered jobs: not requested; analyzed jobs: not requested; prepared jobs: not requested; artifact references: not requested; review outcomes: not requested."
+type PrepareJobStatus = "prepared" | "skipped" | "failed"
+
+function prepareNode(taskId: string, jobs?: readonly Readonly<{ jobId: string; status: PrepareJobStatus }>[], taskStatus: "completed" | "failed" = "completed"): TaskGraphFinalSummaryNode {
+  const node = { kind: "business" as const, taskId, role: "prepare", taskStatus, attemptCount: 1 }
+  if (!jobs) return node
+  const status = jobs.some(job => job.status === "failed") ? "partial" : "completed"
+  return {
+    ...node,
+    structuredResult: {
+      schemaVersion: ROLE_RESULT_SCHEMA, role: "prepare", status, taskId, attemptCount: 1,
+      snapshotDigest: `sha256:${"a".repeat(64)}`, checkpointDigest: "b".repeat(64), jobs, materials: [],
+    },
+  }
+}
+
+const COUNT_SUMMARY = "Task-reported results: discovered jobs: 0 (complete); analyzed jobs: 2 observed (partial); Prepare outcome records: not requested; artifact references: unavailable; review outcomes: not requested."
+const EMPTY_COUNT_SUMMARY = "Task-reported results: discovered jobs: not requested; analyzed jobs: not requested; Prepare outcome records: not requested; artifact references: not requested; review outcomes: not requested."
 
 describe("TaskGraph final-summary formatter", () => {
   it("preserves count coverage and adds a bounded, non-verifying task history overview", () => {
@@ -38,6 +54,82 @@ describe("TaskGraph final-summary formatter", () => {
     expect(formatted).not.toContain("17")
     expect(formatted).not.toContain("verified")
     expect(formatted).not.toContain("authorized")
+  })
+
+  it("counts observed Prepare status records across tasks without claiming unique jobs", () => {
+    const reduced = reduceTaskGraphFinalSummary({ graphRevision: 1, nodes: [
+      prepareNode("prepare-a", [{ jobId: "job-shared", status: "prepared" }, { jobId: "job-failed", status: "failed" }]),
+      prepareNode("prepare-b", [{ jobId: "job-shared", status: "skipped" }, { jobId: "job-prepared", status: "prepared" }]),
+      prepareNode("prepare-missing", undefined, "failed"),
+    ] })
+    const formatted = formatTaskGraphFinalSummary(reduced)
+
+    expect(reduced.counts.prepareJobs).toEqual({ knownCount: 4, coverage: "partial" })
+    expect(formatted).toContain("Prepare outcome records: 4 observed (partial)")
+    expect(formatted).toContain("Prepare-reported outcome records (observed per task; repeated jobs may count separately; submission not verified): prepared=2, skipped=1, failed=1.")
+    for (const privateValue of ["job-shared", "job-failed", "job-prepared", "prepare-a", "prepare-b", "prepare-missing"]) {
+      expect(formatted).not.toContain(privateValue)
+    }
+    expect(formatted.length).toBeLessThanOrEqual(1_000)
+    expect(new TextEncoder().encode(formatted).byteLength).toBeLessThanOrEqual(1_000)
+  })
+
+  it("does not invent zero Prepare statuses when no result is available or requested", () => {
+    const unavailable = reduceTaskGraphFinalSummary({ graphRevision: 1, nodes: [prepareNode("prepare-missing", undefined, "failed")] })
+    const unavailableText = formatTaskGraphFinalSummary(unavailable)
+    const notRequestedText = formatTaskGraphFinalSummary(reduceTaskGraphFinalSummary({ graphRevision: 0, nodes: [] }))
+
+    expect(unavailableText).toContain("Prepare outcome records: unavailable")
+    expect(unavailableText).not.toContain("Prepare-reported outcome records")
+    expect(unavailableText).not.toContain("prepared=0")
+    expect(notRequestedText).toContain("Prepare outcome records: not requested")
+    expect(notRequestedText).not.toContain("Prepare-reported outcome records")
+    expect(notRequestedText).not.toContain("prepared=0")
+  })
+
+  it("fails closed for malformed Prepare status rows and inconsistent observed totals", () => {
+    const valid = reduceTaskGraphFinalSummary({ graphRevision: 1, nodes: [
+      prepareNode("prepare-valid", [{ jobId: "job-1", status: "prepared" }]),
+    ] })
+    const malformed = {
+      ...valid,
+      prepareResults: [{ ...valid.prepareResults[0]!, jobs: [{ jobId: "PRIVATE_JOB", status: "unknown" }] }],
+    } as unknown as TaskGraphFinalSummary
+    const mismatched = {
+      ...valid,
+      counts: { ...valid.counts, prepareJobs: { knownCount: 2, coverage: "complete" as const } },
+    }
+    const partialResult = reduceTaskGraphFinalSummary({ graphRevision: 1, nodes: [prepareNode("prepare-partial", [
+      { jobId: "job-prepared", status: "prepared" }, { jobId: "job-failed", status: "failed" },
+    ])] })
+    const falselyComplete = {
+      ...partialResult,
+      counts: { ...partialResult.counts, prepareJobs: { knownCount: 2, coverage: "complete" as const } },
+    }
+    const validPrepare = valid.prepareResults[0]!
+    const trailingNewlineJobId = {
+      ...valid,
+      prepareResults: [{
+        ...validPrepare,
+        jobs: [{ ...validPrepare.jobs[0]!, jobId: "PRIVATE_JOB\n" }],
+      }],
+    }
+    const trailingNewlineTaskId = {
+      ...valid,
+      prepareResults: [{ ...validPrepare, taskId: "PRIVATE_TASK\n" }],
+    }
+
+    const malformedText = formatTaskGraphFinalSummary(malformed)
+    const mismatchedText = formatTaskGraphFinalSummary(mismatched)
+    const falselyCompleteText = formatTaskGraphFinalSummary(falselyComplete)
+    const trailingNewlineJobIdText = formatTaskGraphFinalSummary(trailingNewlineJobId)
+    const trailingNewlineTaskIdText = formatTaskGraphFinalSummary(trailingNewlineTaskId)
+    for (const text of [malformedText, mismatchedText, falselyCompleteText, trailingNewlineJobIdText, trailingNewlineTaskIdText]) {
+      expect(text).toContain("Prepare status breakdown unavailable")
+      expect(text).not.toContain("prepared=0")
+      expect(text).not.toContain("PRIVATE_JOB")
+      expect(text).not.toContain("PRIVATE_TASK")
+    }
   })
 
   it("groups repeated tuples deterministically and separates task state from result state", () => {
@@ -120,11 +212,12 @@ describe("TaskGraph final-summary formatter", () => {
   })
 
   it("keeps groups whole and stays within both bounds when many groups do not fit", () => {
-    const outcomes: Record<string, string>[] = []
-    for (const role of ["analyst", "prepare", "reviewer", "scout", "writer"]) {
-      for (const taskStatus of ["completed", "failed", "interrupted"]) {
-        for (const resultState of ["valid", "missing", "invalid"]) {
+    const outcomes: TaskGraphFinalSummary["taskOutcomes"][number][] = []
+    for (const role of ["analyst", "prepare", "reviewer", "scout", "writer"] as const) {
+      for (const taskStatus of ["completed", "failed", "interrupted"] as const) {
+        for (const resultState of ["valid", "missing", "invalid"] as const) {
           outcomes.push({
+            taskId: `task-${role}-${taskStatus}-${resultState}`,
             role,
             taskStatus,
             resultState,
@@ -133,9 +226,16 @@ describe("TaskGraph final-summary formatter", () => {
         }
       }
     }
-    const formatted = formatTaskGraphFinalSummary(withOutcomes(outcomes))
+    const prepared = reduceTaskGraphFinalSummary({ graphRevision: 1, nodes: [prepareNode("prepare-bounded", [
+      { jobId: "job-prepared", status: "prepared" }, { jobId: "job-skipped", status: "skipped" }, { jobId: "job-failed", status: "failed" },
+    ])] })
+    const formatted = formatTaskGraphFinalSummary({
+      ...prepared,
+      taskOutcomes: outcomes,
+    })
     expect(formatted.length).toBeLessThanOrEqual(1_000)
     expect(new TextEncoder().encode(formatted).byteLength).toBeLessThanOrEqual(1_000)
+    expect(formatted).toContain("Prepare-reported outcome records (observed per task; repeated jobs may count separately; submission not verified): prepared=1, skipped=1, failed=1.")
     expect(formatted).toMatch(/; \d+ outcome groups? omitted\.$/)
     const overview = formatted.slice(formatted.indexOf("role="))
     const renderedGroups = overview.replace(/; \d+ outcome groups? omitted\.$/, "").replace(/\.$/, "").split("; ")

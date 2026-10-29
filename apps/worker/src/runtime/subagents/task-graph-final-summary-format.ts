@@ -1,11 +1,13 @@
 import type { TaskGraphFinalSummary, TaskGraphSummaryCount } from "./task-graph-final-summary.js"
+import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
 
 const MAX_SUMMARY_CHARS = 1_000
 const MAX_SUMMARY_BYTES = 1_000
+const MAX_PREPARE_JOBS_PER_RESULT = 50
 const METRICS = [
   ["discovered jobs", "discoveredJobs"],
   ["analyzed jobs", "analyzedJobs"],
-  ["prepared jobs", "prepareJobs"],
+  ["Prepare outcome records", "prepareJobs"],
   ["artifact references", "artifactReferences"],
   ["review outcomes", "reviewOutcomes"],
 ] as const
@@ -14,7 +16,9 @@ const TASK_STATUSES = ["queued", "running", "retrying", "waiting", "waiting_for_
 const RESULT_STATES = ["valid", "missing", "invalid", "unsupported_role", "not_terminal"] as const
 const REPORTED_STATUSES = ["completed", "partial"] as const
 const REPORTED_STATUS_ORDER = ["not reported", ...REPORTED_STATUSES] as const
+const PREPARE_JOB_STATUSES = ["prepared", "skipped", "failed"] as const
 const TERMINAL_STATUSES = new Set(["completed", "failed", "interrupted", "cancelled", "closed"])
+const SAFE_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}(?![\s\S])/
 
 type Outcome = Readonly<{
   role: typeof ROLES[number]
@@ -29,16 +33,76 @@ export function formatTaskGraphFinalSummary(summary: TaskGraphFinalSummary): str
   const record = counts && typeof counts === "object" ? counts as Record<string, unknown> : null
   const metrics = METRICS.map(([label, key]) => `${label}: ${formatCount(record?.[key])}`)
   const countSummary = `Task-reported results: ${metrics.join("; ")}.`
-  return appendTaskOutcomes(countSummary, summary?.taskOutcomes, counts)
+  const prepareBreakdown = prepareOutcomeBreakdown(summary?.prepareResults, record?.prepareJobs)
+  const baseSummary = prepareBreakdown ? appendPrepareBreakdown(countSummary, prepareBreakdown) : countSummary
+  return appendTaskOutcomes(baseSummary, summary?.taskOutcomes, counts)
 }
 
-function appendTaskOutcomes(countSummary: string, taskOutcomes: unknown, counts: unknown): string {
-  if (!Array.isArray(taskOutcomes)) return appendWithinLimit(countSummary, " Task outcome overview unavailable (invalid entries omitted).")
+function appendPrepareBreakdown(base: string, breakdown: string): string {
+  const candidate = `${base} ${breakdown}`
+  if (withinLimits(candidate)) return candidate
+  return appendWithinLimit(base, " Prepare status breakdown omitted to keep the summary within limits.")
+}
+
+function prepareOutcomeBreakdown(results: unknown, countValue: unknown): string | null {
+  const count = asRecord(countValue)
+  if (!count) return "Prepare status breakdown unavailable."
+  const resultsAreEmpty = isDenseArray(results, TASK_GRAPH_LIMITS.maxNodes) && results.length === 0
+  if ((count.coverage === "not_requested" || count.coverage === "unavailable") && count.knownCount === null) {
+    return resultsAreEmpty ? null : "Prepare status breakdown unavailable."
+  }
+  if ((count.coverage !== "complete" && count.coverage !== "partial")
+    || typeof count.knownCount !== "number" || !Number.isSafeInteger(count.knownCount) || count.knownCount < 0) {
+    return "Prepare status breakdown unavailable."
+  }
+
+  const observed = summarizePrepareResults(results)
+  if (!observed || observed.total !== count.knownCount || count.coverage === "complete" && observed.hasPartialResult) {
+    return "Prepare status breakdown unavailable."
+  }
+  return `Prepare-reported outcome records (observed per task; repeated jobs may count separately; submission not verified): prepared=${observed.prepared}, skipped=${observed.skipped}, failed=${observed.failed}.`
+}
+
+function summarizePrepareResults(value: unknown): Readonly<{ prepared: number; skipped: number; failed: number; total: number; hasPartialResult: boolean }> | null {
+  if (!isDenseArray(value, TASK_GRAPH_LIMITS.maxNodes) || value.length === 0) return null
+  const seenTaskIds = new Set<string>()
+  const counts = { prepared: 0, skipped: 0, failed: 0, total: 0, hasPartialResult: false }
+  for (const candidate of value) {
+    const result = asRecord(candidate)
+    if (!result || typeof result.taskId !== "string" || !SAFE_IDENTIFIER.test(result.taskId) || seenTaskIds.has(result.taskId)
+      || !isOneOf(result.resultStatus, REPORTED_STATUSES) || !isDenseArray(result.jobs, MAX_PREPARE_JOBS_PER_RESULT)) return null
+    seenTaskIds.add(result.taskId)
+    const seenJobIds = new Set<string>()
+    let hasFailure = false
+    for (const candidateJob of result.jobs) {
+      const job = asRecord(candidateJob)
+      if (!job || typeof job.jobId !== "string" || !SAFE_IDENTIFIER.test(job.jobId) || seenJobIds.has(job.jobId)
+        || !isOneOf(job.status, PREPARE_JOB_STATUSES)) return null
+      seenJobIds.add(job.jobId)
+      counts[job.status] += 1
+      counts.total += 1
+      if (job.status === "failed") hasFailure = true
+    }
+    if ((result.resultStatus === "partial") !== hasFailure) return null
+    if (result.resultStatus === "partial") counts.hasPartialResult = true
+  }
+  return counts
+}
+
+function isDenseArray(value: unknown, maxItems: number): value is unknown[] {
+  if (!Array.isArray(value) || value.length > maxItems) return false
+  const keys = Reflect.ownKeys(value)
+  return keys.length === value.length + 1
+    && keys.every(key => key === "length" || typeof key === "string" && /^(0|[1-9][0-9]*)$/.test(key) && Number(key) < value.length)
+}
+
+function appendTaskOutcomes(baseSummary: string, taskOutcomes: unknown, counts: unknown): string {
+  if (!Array.isArray(taskOutcomes)) return appendWithinLimit(baseSummary, " Task outcome overview unavailable (invalid entries omitted).")
   if (taskOutcomes.length === 0) {
     const emptyNote = hasOnlyNotRequestedCounts(counts)
       ? " No business task outcomes recorded."
       : " Task outcome overview unavailable (inconsistent summary)."
-    return appendWithinLimit(countSummary, emptyNote)
+    return appendWithinLimit(baseSummary, emptyNote)
   }
 
   const groups = new Map<string, { outcome: Outcome; count: number }>()
@@ -54,7 +118,7 @@ function appendTaskOutcomes(countSummary: string, taskOutcomes: unknown, counts:
     if (group) group.count += 1
     else groups.set(key, { outcome, count: 1 })
   }
-  if (groups.size === 0) return appendWithinLimit(countSummary, " Task outcome overview unavailable (invalid entries omitted).")
+  if (groups.size === 0) return appendWithinLimit(baseSummary, " Task outcome overview unavailable (invalid entries omitted).")
 
   const orderedGroups = [...groups.values()].sort((left, right) => compareOutcomes(left.outcome, right.outcome))
   const invalidNote = invalidEntries > 0 ? "; invalid entries omitted" : ""
@@ -65,14 +129,14 @@ function appendTaskOutcomes(countSummary: string, taskOutcomes: unknown, counts:
   for (let index = 0; index <= renderedGroups.length; index += 1) {
     const omitted = renderedGroups.length - index
     const omissionNote = omitted > 0 ? `; ${omitted} outcome group${omitted === 1 ? "" : "s"} omitted` : ""
-    const candidate = `${countSummary}${prefix}${index > 0 ? ` ${renderedGroups.slice(0, index).join("; ")}` : ""}${omissionNote}.`
+    const candidate = `${baseSummary}${prefix}${index > 0 ? ` ${renderedGroups.slice(0, index).join("; ")}` : ""}${omissionNote}.`
     if (!withinLimits(candidate)) break
     included = index
     result = candidate
   }
   if (included < renderedGroups.length && result) return result
   if (included === renderedGroups.length && result) return result
-  return appendWithinLimit(countSummary, " Task outcome overview omitted to keep the summary within limits.")
+  return appendWithinLimit(baseSummary, " Task outcome overview omitted to keep the summary within limits.")
 }
 
 function hasOnlyNotRequestedCounts(value: unknown): boolean {
