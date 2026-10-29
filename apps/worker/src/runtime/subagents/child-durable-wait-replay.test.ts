@@ -82,7 +82,8 @@ describe("child durable wait reissue", () => {
     options.childWaitCallStarted?.("continuation-step", callInfo, "persisted-start-event")
     expect(replayState.execute(call())).toMatchObject({ status: "completed", id: "fresh-provider-call" })
 
-    const claim = { owner: lease, stepId: "continuation-step", call: { id: "claimed", name: "wait_subagents" as const, arguments: input },
+    const claim = { owner: lease, stepId: "continuation-step", stepOrdinal: 1, stepStatus: "completed" as const,
+      modelUsage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }, call: { id: "claimed", name: "wait_subagents" as const, arguments: input },
       sourceWaitCallId: wait.toolCallId, sourceInput: input, callItem: { id: "item", revision: 1, status: "started" as const },
       callStartedEventId: "started", claimEventId: "claim", output }
     expect(childWaitReplayExecutionOptions(undefined, claim)).toEqual({ childWaitClaimRecovery: claim })

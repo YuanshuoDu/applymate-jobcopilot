@@ -11,18 +11,21 @@ import { registerDurableSubagentWait } from "./durable-subagent-wait-store.ts"
 import { startDurableWaitResolver } from "./durable-wait-resolver.ts"
 import { loadDurableSubagentWaitResume, commitDurableSubagentWaitResume } from "./durable-subagent-wait-resume.ts"
 import { loadChildAttemptResume } from "./child-resume.ts"
+import { acknowledgeDurableWaitAtContinuationStart } from "./child-executor-admission.ts"
 import { createChildDurableWaitReplay } from "./child-durable-wait-replay.ts"
 import { TurnExecutionEventWriter, executeToolWithItems } from "../turns/turn-execution-events.ts"
 import { recoverPersistedToolCalls } from "../turns/turn-execution-tools.ts"
 import { childWaitClaimEventKey } from "./child-durable-wait-replay.ts"
 import { canonicalJson, redactSensitiveText } from "@jobcopilot/shared"
 import { contextToModelMessages } from "../turns/turn-engine-messages.ts"
+import { runTurnExecutionLoop } from "../turns/turn-execution-loop.ts"
 import { projectChildToolCallIdsForModelContext } from "../turns/turn-tool-call-id-projection.ts"
 import { readRecoveryStateSnapshot } from "./durable-child-wait-recovery-diagnostics.fixture.mjs"
 
 const [, , mode, queueName, rawIds] = process.argv
 const ids = JSON.parse(rawIds)
 const phoneShapedToolCallId = "child-wait-call:415-555-0134"
+const highPrecisionWaitModelCostUsd = 0.123456789
 const readyMarkerByMode = {
   "worker-a": "WORKER_A_READY",
   "worker-a-crash": "WORKER_A_READY",
@@ -32,6 +35,14 @@ const readyMarkerByMode = {
   "worker-b-crash-before-claim": "WORKER_B_READY",
   "worker-b-crash-after-orphan-reissue": "WORKER_B_READY",
   "worker-b-crash-after-claim-result": "WORKER_B_READY",
+  "worker-b-loop-preclaim": "WORKER_B_READY",
+  "worker-b-loop-claim-recovery-cut": "WORKER_B_READY",
+  "worker-b-loop-final": "WORKER_B_READY",
+  "worker-b-loop-claim-item-completed-cut": "WORKER_B_READY",
+  "worker-b-loop-usage-lineage-cut": "WORKER_B_READY",
+  "worker-b-loop-usage-lineage-reject": "WORKER_B_READY",
+  "worker-b-loop-multi-preclaim": "WORKER_B_READY",
+  "worker-b-loop-multi-reject": "WORKER_B_READY",
   "worker-b": "WORKER_B_READY",
 }
 const crashCutModes = new Set([
@@ -42,6 +53,11 @@ const crashCutModes = new Set([
   "worker-b-crash-before-claim",
   "worker-b-crash-after-orphan-reissue",
   "worker-b-crash-after-claim-result",
+  "worker-b-loop-preclaim",
+  "worker-b-loop-claim-recovery-cut",
+  "worker-b-loop-claim-item-completed-cut",
+  "worker-b-loop-usage-lineage-cut",
+  "worker-b-loop-multi-preclaim",
 ])
 const pool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 6 })
 const redis = new Redis(process.env.AGENT_TURN_REDIS_TEST_URL, { maxRetriesPerRequest: null })
@@ -107,15 +123,20 @@ function boundedErrorDetails(error) {
   return { name: typeof error, message: String(error).slice(0, 1_000), stack: null }
 }
 
-function executionStore(owner, beforeAppendEvent) {
+function executionStore(owner, hooks = {}) {
   const bind = method => input => {
     const { identity, ...rest } = input
-    const append = () => turnStore[method]({ ...rest, owner: identity })
-    return method === "appendEvent" && beforeAppendEvent
-      ? Promise.resolve(beforeAppendEvent(input)).then(append)
-      : append()
+    const write = () => turnStore[method]({ ...rest, owner: identity })
+    const before = method === "appendEvent" ? hooks.beforeAppendEvent
+      : method === "updateItem" ? hooks.beforeUpdateItem : undefined
+    return before ? Promise.resolve(before(input)).then(write) : write()
   }
-  return { createItem: bind("createItem"), updateItem: bind("updateItem"), appendEvent: bind("appendEvent") }
+  return {
+    startStep: bind("startStep"), updateStep: bind("updateStep"),
+    createItem: bind("createItem"), updateItem: bind("updateItem"), appendEvent: bind("appendEvent"),
+    appendEvents: inputs => turnStore.appendEvents(inputs.map(({ identity, ...rest }) => ({ ...rest, owner: identity }))),
+    recordFinalResponse: bind("recordFinalResponse"),
+  }
 }
 
 function turnExecutionOptions(lease, owner, executeTool, additions = {}) {
@@ -124,15 +145,250 @@ function turnExecutionOptions(lease, owner, executeTool, additions = {}) {
     scope: { userId: lease.userId },
     goal: lease.goal,
     snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: additions.observations ?? [] },
-    contextBuilder: { build: async () => { throw new Error("fixture_context_builder_not_used") } },
-    store: executionStore(owner, additions.beforeAppendEvent),
-    model: {},
-    tools: [],
+    contextBuilder: additions.contextBuilder ?? { build: async () => { throw new Error("fixture_context_builder_not_used") } },
+    store: executionStore(owner, additions),
+    model: additions.model ?? {},
+    tools: additions.tools ?? [],
     executeTool,
     idFactory: prefix => `${prefix}:attempt:${lease.attemptCount}`,
+    validateToolArguments: () => true,
+    publishReasoningSummary: false,
+    ...(additions.resume ? { resume: additions.resume } : {}),
+    ...(additions.budget ? { budget: additions.budget } : {}),
+    ...(additions.lifecycle ? { lifecycle: additions.lifecycle } : {}),
     ...(additions.childWaitCallStartKey ? { childWaitCallStartKey: additions.childWaitCallStartKey } : {}),
+    ...(additions.childWaitCallStarted ? { childWaitCallStarted: additions.childWaitCallStarted } : {}),
     ...(additions.childWaitClaimRecovery ? { childWaitClaimRecovery: additions.childWaitClaimRecovery } : {}),
+    ...(additions.childWaitOrphanRecovery ? { childWaitOrphanRecovery: additions.childWaitOrphanRecovery } : {}),
   }
+}
+
+function loopContextBuilder() {
+  return { build: async ({ identity, stepId, snapshot }) => ({
+    schemaVersion: "agent-harness.v2", sessionId: identity.sessionId, turnId: identity.turnId, stepId,
+    inputThroughSequence: 0n, consumedInputIds: [],
+    blocks: snapshot.toolObservations.map((item, index) => ({
+      id: `fixture-tool-observation:${index}:${item.id}`, layer: "tool_observation", role: "data",
+      trust: "external_untrusted", source: "tool_or_subagent", content: item.content,
+    })),
+    canonicalJson: canonicalJson(snapshot.toolObservations),
+  }) }
+}
+
+function loopFixtureModel(reply) {
+  const invocations = []
+  const model = {
+    id: "durable-child-wait-fixture-model",
+    profile: { provider: "fixture", model: "durable-child-wait-fixture", nativeTools: true, structuredOutput: true,
+      streaming: true, continuationCursor: false, supportsParallelTools: true, supportsStreamingToolArgs: true,
+      supportsReasoningSummary: true, supportsResponseContinuation: false, supportsProviderConversation: false,
+      supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: null, costClass: "low" },
+    async *stream(request) {
+      const stepId = request.metadata?.stepId
+      if (typeof stepId !== "string" || !stepId) throw new Error("fixture_model_step_id_missing")
+      invocations.push(stepId)
+      const response = await reply({ request, stepId, invocation: invocations.length })
+      const usage = response.usage ?? { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }
+      yield { type: "usage", ...usage, provider: "fixture", model: "durable-child-wait-fixture" }
+      for (const call of response.toolCalls ?? []) {
+        yield { type: "tool_call_completed", callId: call.id, name: call.name, arguments: call.arguments }
+      }
+      if (response.text) yield { type: "text_delta", text: response.text }
+      yield { type: "completed", finishReason: response.toolCalls?.length ? "tool_calls" : "stop" }
+    },
+  }
+  return { model, invocations }
+}
+
+async function runChildWaitLoop(lease, restored, responseForStep, hooks = {}) {
+  const owner = executionOwnerFence({ kind: "task", lease })
+  const wait = restored?.durableWait
+  if (!wait) throw new Error("fixture_child_wait_loop_resume_missing")
+  const replay = createChildDurableWaitReplay(lease, wait, restored.observations, restored.childWaitClaimRecovery)
+  let executorCalls = 0, dispatcherCalls = 0
+  const fixtureModel = loopFixtureModel(responseForStep)
+  const options = turnExecutionOptions(lease, owner, async input => {
+    executorCalls += 1
+    const result = replay.execute(input)
+    if (!result) {
+      dispatcherCalls += 1
+      throw new Error("fixture_child_wait_loop_dispatcher_reached")
+    }
+    return { id: result.id, toolName: result.toolName, toolVersion: result.toolVersion,
+      status: result.status, output: result.output, errorCode: result.errorCode }
+  }, {
+    observations: restored.observations, contextBuilder: loopContextBuilder(), model: fixtureModel.model,
+    tools: [{ name: "wait_subagents", version: "1", inputSchema: { type: "object" } }],
+    resume: restored.resume, beforeAppendEvent: hooks.beforeAppendEvent, beforeUpdateItem: hooks.beforeUpdateItem,
+    childWaitCallStartKey: (stepId, call) => replay.childWaitCallStartKey(stepId, call),
+    childWaitCallStarted: (stepId, call, eventId) => replay.childWaitCallStarted(stepId, call, eventId),
+    ...(restored.childWaitClaimRecovery ? { childWaitClaimRecovery: restored.childWaitClaimRecovery } : {}),
+    ...(restored.childWaitOrphanRecovery ? { childWaitOrphanRecovery: restored.childWaitOrphanRecovery } : {}),
+  })
+  options.store = acknowledgeDurableWaitAtContinuationStart(options.store, lease, wait,
+    async (currentLease, durableWait, nextStepOrdinal) => commitDurableSubagentWaitResume(pool, currentLease, {
+      waitId: durableWait.waitId, stepId: durableWait.stepId, nextStepOrdinal, now: new Date(),
+    }), step => replay.acknowledgeContinuation(step))
+  const result = await runTurnExecutionLoop(options)
+  return { result, invocations: fixtureModel.invocations, executorCalls, dispatcherCalls }
+}
+
+async function resumeChildThroughLoop(lease, phase) {
+  const now = new Date()
+  const pendingWait = await loadDurableSubagentWaitResume(pool, lease, now)
+  let restored
+  try { restored = await loadChildAttemptResume(pool, lease, now, pendingWait) }
+  catch (error) {
+    if (phase === "multi-reject") {
+      say(`WORKER_B_LOOP_MULTI_REJECTED ${JSON.stringify({ error: error?.message ?? String(error), modelCalls: 0, executorCalls: 0, dispatcherCalls: 0 })}`)
+      return { status: "failed", failureReason: error?.message ?? "child_resume_wait_tool_call_conflict", retryDisposition: "terminal" }
+    }
+    if (phase === "usage-lineage-reject" && error?.message === "child_resume_wait_step_lineage") {
+      say(`WORKER_B_LOOP_USAGE_LINEAGE_REJECTED ${JSON.stringify({ error: error.message, modelCalls: 0, executorCalls: 0, dispatcherCalls: 0 })}`)
+      return { status: "failed", failureReason: error.message, retryDisposition: "terminal" }
+    }
+    throw error
+  }
+  if (!restored?.durableWait) throw new Error("fixture_child_wait_loop_durable_wait_missing")
+  const wait = restored.durableWait
+  const owner = executionOwnerFence({ kind: "task", lease })
+  const recovery = restored.childWaitOrphanRecovery ?? restored.childWaitClaimRecovery
+  const continuationStepId = recovery?.stepId ?? wait.continuationStepId ?? `task:${lease.id}:step:${restored.resume.nextOrdinal}:attempt:${lease.attemptCount}`
+  const logicalStepOrdinal = recovery?.stepOrdinal ?? restored.resume.nextOrdinal
+  const callId = recovery?.call.id ?? `${ids.loopCallPrefix ?? "child-wait-loop"}:${lease.id}:attempt:${lease.attemptCount}`
+  const callItemId = `task:${lease.id}:item:tool-call:${callId}:attempt:${lease.attemptCount}`
+  say(`WORKER_B_RESTORED_WAIT_OBSERVATION ${JSON.stringify(restoredWaitObservationSummary(restored, wait, pendingWait, owner, continuationStepId))}`)
+  if (phase === "multi-reject" && (restored.childWaitOrphanRecovery || restored.childWaitClaimRecovery)) {
+    throw new Error("fixture_multi_tool_receipt_was_not_rejected")
+  }
+  if (phase === "claim-recovery-cut" && !restored.childWaitOrphanRecovery) throw new Error("fixture_child_wait_orphan_recovery_missing")
+  if (phase === "claim-item-completed-cut" && !restored.childWaitClaimRecovery) throw new Error("fixture_child_wait_claim_recovery_missing")
+  if (phase === "final" && !restored.childWaitClaimRecovery) throw new Error("fixture_child_wait_claim_recovery_missing")
+  if (phase === "claim-recovery-cut" || phase === "claim-item-completed-cut" || phase === "final") {
+    say(`WORKER_B_LOOP_RESTORED ${JSON.stringify({ phase, waitId: wait.waitId, recoveryCallId: recovery?.call.id ?? null,
+      recoveryStepId: recovery?.stepId ?? null, logicalStepOrdinal: recovery?.stepOrdinal ?? null,
+      physicalContinuationOrdinal: wait.continuationOrdinal ?? null, resumeNextOrdinal: restored.resume.nextOrdinal,
+      modelUsage: recovery?.modelUsage ?? null, orphanCallIds: restored.childWaitOrphanCallIds ?? [] })}`)
+  }
+  const expectedClaimKey = `task:${lease.id}:event:child-wait-claim:${lease.attemptCount}:${continuationStepId}`
+  const expectedStepId = `task:${lease.id}:step:${restored.resume.nextOrdinal}:attempt:${lease.attemptCount}`
+  const modelResponse = ({ stepId }) => {
+    if (phase === "preclaim" || phase === "multi-preclaim") {
+      if (stepId !== expectedStepId) throw new Error("fixture_unexpected_preclaim_step_id")
+      const calls = [{ id: callId, name: "wait_subagents", arguments: wait.input }]
+      if (phase === "multi-preclaim") calls.push({ id: `${callId}:second`, name: "fixture_noop", arguments: {} })
+      return { usage: { inputTokens: 37, outputTokens: 13, estimatedCostUsd: highPrecisionWaitModelCostUsd }, toolCalls: calls }
+    }
+    if (stepId === continuationStepId) {
+      throw new Error("fixture_orphan_step_model_reinvoked")
+    }
+    const expectedNextLogicalStepId = `task:${lease.id}:step:${logicalStepOrdinal + 1}:attempt:${lease.attemptCount}`
+    if (stepId !== expectedNextLogicalStepId) throw new Error("fixture_child_wait_loop_next_logical_step_mismatch")
+    return { text: ids.finalText ?? "continued-after-durable-child-wait", usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } }
+  }
+  const beforeAppendEvent = async event => {
+    if ((phase === "preclaim" || phase === "multi-preclaim") && event.type === "tool_call.started"
+      && event.idempotencyKey === expectedClaimKey && event.correlationId === callId) {
+      say(`WORKER_B_LOOP_PRE_CLAIM_ORPHAN ${JSON.stringify({ phase, callId, stepId: continuationStepId,
+        waitId: wait.waitId, exactInput: canonicalJson(event.payload?.toolName) === canonicalJson("wait_subagents"),
+        modelCalls: 1, executorCalls: 0, dispatcherCalls: 0 })}`)
+      await new Promise(() => {})
+    }
+    if (phase === "usage-lineage-cut" && event.type === "model.started"
+      && event.correlationId === `task:${lease.id}:step:${logicalStepOrdinal + 1}:attempt:${lease.attemptCount}`) {
+      const completedStepId = recovery.stepId
+      const nextStepId = event.correlationId
+      const [stepState, usageState, callState] = await Promise.all([
+        pool.query(`SELECT "status", "ordinal", "inputTokens", "outputTokens", "estimatedCostUsd"::text AS "estimatedCostUsd"
+          FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = $4`,
+        [lease.sessionId, lease.turnId, lease.id, completedStepId]),
+        pool.query(`SELECT "payload"->'usage'->>'estimatedCostUsd' AS "receiptCost" FROM "agent_events"
+          WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "correlationId" = $4 AND "type" = 'model.usage'`,
+        [lease.sessionId, lease.turnId, lease.id, completedStepId]),
+        pool.query(`SELECT
+            (SELECT COUNT(*)::int FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+              AND "idempotencyKey" = $4) AS "claimCount",
+            (SELECT COUNT(*)::int FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+              AND "stepId" = $5 AND "type" = 'tool_result' AND "content"->>'toolCallId' = $6) AS "resultCount",
+            (SELECT COUNT(*)::int FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+              AND "correlationId" = $7 AND "type" = 'model.started') AS "nextModelStartCount"`,
+        [lease.sessionId, lease.turnId, lease.id, expectedClaimKey, completedStepId, recovery.call.id, nextStepId]),
+      ])
+      const completed = stepState.rows[0]
+      const receipt = usageState.rows[0]
+      const lifecycle = callState.rows[0]
+      if (!completed || completed.status !== "completed" || completed.inputTokens !== 37 || completed.outputTokens !== 13
+        || completed.estimatedCostUsd !== "0.12345679" || receipt?.receiptCost !== "0.123456789"
+        || lifecycle?.claimCount !== 1 || lifecycle?.resultCount !== 1 || lifecycle?.nextModelStartCount !== 0) {
+        throw new Error("fixture_rounded_usage_lineage_cut_state_invalid")
+      }
+      const nextStep = await pool.query(`SELECT "status", "ordinal" FROM "agent_steps"
+        WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = $4`,
+      [lease.sessionId, lease.turnId, lease.id, nextStepId])
+      if (nextStep.rows[0]?.status !== "streaming" || nextStep.rows[0]?.ordinal !== 3) {
+        throw new Error("fixture_rounded_usage_next_step_not_streaming")
+      }
+      say(`WORKER_B_LOOP_ROUNDED_USAGE_LINEAGE_CUT ${JSON.stringify({ callId: recovery.call.id,
+        completedStepId, completedStepStatus: completed.status, physicalStepOrdinal: completed.ordinal,
+        persistedCostUsd: completed.estimatedCostUsd, receiptCostUsd: receipt.receiptCost,
+        nextStepId, nextStepStatus: nextStep.rows[0].status, nextPhysicalStepOrdinal: nextStep.rows[0].ordinal,
+        claimCount: lifecycle.claimCount, resultCount: lifecycle.resultCount, nextModelStartCount: lifecycle.nextModelStartCount,
+        modelCalls: 0, executorCalls: 0, dispatcherCalls: 0 })}`)
+      await new Promise(() => {})
+    }
+    if (phase === "claim-item-completed-cut" && event.type === "item.completed" && event.itemId === callItemId
+      && event.correlationId === callItemId
+      && event.idempotencyKey === `task:${lease.id}:event:tool-call-completed:${callId}:${callItemId}:1`) {
+      const state = await pool.query(`SELECT item."status", item."revision",
+          (SELECT COUNT(*)::int FROM "agent_events" AS claim WHERE claim."sessionId" = item."sessionId"
+            AND claim."turnId" = item."turnId" AND claim."taskId" = item."taskId" AND claim."idempotencyKey" = $5) AS "claimCount",
+          (SELECT COUNT(*)::int FROM "agent_events" AS completed WHERE completed."sessionId" = item."sessionId"
+            AND completed."turnId" = item."turnId" AND completed."taskId" = item."taskId" AND completed."itemId" = item."id"
+            AND completed."type" = 'item.completed') AS "itemCompletedEventCount",
+          (SELECT COUNT(*)::int FROM "agent_items" AS result WHERE result."sessionId" = item."sessionId"
+            AND result."turnId" = item."turnId" AND result."taskId" = item."taskId" AND result."stepId" = item."stepId"
+            AND result."type" = 'tool_result' AND result."content"->>'toolCallId' = $6) AS "resultCount"
+        FROM "agent_items" AS item WHERE item."id" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4`,
+      [callItemId, lease.sessionId, lease.turnId, lease.id, expectedClaimKey, recovery.call.id])
+      if (state.rows[0]?.status !== "completed" || state.rows[0]?.revision !== 1
+        || state.rows[0]?.claimCount !== 1 || state.rows[0]?.itemCompletedEventCount !== 0 || state.rows[0]?.resultCount !== 0) {
+        throw new Error("fixture_claim_completed_item_cut_state_invalid")
+      }
+      say(`WORKER_B_LOOP_CLAIM_ITEM_COMPLETED_BEFORE_EVENT ${JSON.stringify({ callId: recovery.call.id, stepId: recovery.stepId,
+        waitId: wait.waitId, modelCalls: 0, executorCalls: 0, dispatcherCalls: 0, callStatus: state.rows[0].status,
+        callRevision: state.rows[0].revision, claimCount: state.rows[0].claimCount,
+        itemCompletedEventCount: state.rows[0].itemCompletedEventCount, resultCount: state.rows[0].resultCount })}`)
+      await new Promise(() => {})
+    }
+  }
+  const beforeUpdateItem = async input => {
+    if (phase !== "claim-recovery-cut" || input.itemId !== callItemId || input.status !== "completed") return
+    const state = await pool.query(`SELECT item."status", item."revision",
+        (SELECT COUNT(*)::int FROM "agent_events" AS event WHERE event."sessionId" = item."sessionId"
+          AND event."turnId" = item."turnId" AND event."taskId" = item."taskId" AND event."idempotencyKey" = $5) AS "claimCount",
+        (SELECT COUNT(*)::int FROM "agent_items" AS result WHERE result."sessionId" = item."sessionId"
+          AND result."turnId" = item."turnId" AND result."taskId" = item."taskId" AND result."stepId" = item."stepId"
+          AND result."type" = 'tool_result' AND result."content"->>'toolCallId' = $6) AS "resultCount"
+      FROM "agent_items" AS item WHERE item."id" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4`,
+    [callItemId, lease.sessionId, lease.turnId, lease.id, expectedClaimKey, recovery.call.id])
+    if (state.rows[0]?.claimCount !== 1 || state.rows[0]?.resultCount !== 0 || state.rows[0]?.status !== "started") {
+      throw new Error("fixture_claim_recovery_cut_state_invalid")
+    }
+    say(`WORKER_B_LOOP_CLAIM_BEFORE_RESULT ${JSON.stringify({ callId: recovery.call.id, stepId: recovery.stepId,
+      waitId: wait.waitId, modelCalls: 0, executorCalls: 0, dispatcherCalls: 0,
+      callStatus: state.rows[0].status, callRevision: state.rows[0].revision,
+      claimCount: state.rows[0].claimCount, resultCount: state.rows[0].resultCount })}`)
+    await new Promise(() => {})
+  }
+  const loop = await runChildWaitLoop(lease, restored, modelResponse, { beforeAppendEvent, beforeUpdateItem })
+  say(`WORKER_B_LOOP_RESUMED ${JSON.stringify({ phase, status: loop.result.status, stepCount: loop.result.stepCount,
+    toolCallCount: loop.result.toolCallCount, finalText: loop.result.finalText ?? null,
+    invocations: loop.invocations, executorCalls: loop.executorCalls, dispatcherCalls: loop.dispatcherCalls,
+    continuationStepId, logicalStepOrdinal, physicalContinuationOrdinal: wait.continuationOrdinal ?? null })}`)
+  if (phase !== "final" || loop.result.status !== "completed" || loop.dispatcherCalls !== 0) {
+    throw new Error("fixture_child_wait_loop_unexpected_completion")
+  }
+  return { status: "completed", result: { finalText: loop.result.finalText ?? "continued-after-durable-child-wait" } }
 }
 
 async function claimExactWaitReissue(lease, owner, wait, continuation, now, optionsForCut = {}) {
@@ -174,12 +430,59 @@ async function claimExactWaitReissue(lease, owner, wait, continuation, now, opti
   if (!restoredWait || restoredWait.continuationStepId !== continuation.id || restoredWait.continuationOrdinal !== continuation.ordinal) {
     throw new Error("durable_child_wait_claim_continuation_not_restored")
   }
+  const call = { id: optionsForCut.expectedOrphanCallId ?? (optionsForCut.crashBeforeClaim
+    ? `child-wait-reissue:${lease.id}:attempt:${lease.attemptCount}:orphan`
+    : `child-wait-reissue:${lease.id}:attempt:${lease.attemptCount}`), name: "wait_subagents", arguments: restoredWait.input }
   if (restored.childWaitClaimRecovery) throw new Error("durable_child_wait_claimed_before_reissue")
+  if (optionsForCut.loopPhase) {
+    if (optionsForCut.loopPhase === "claim-recovery-cut" && restored.childWaitOrphanRecovery?.call.id !== call.id) {
+      throw new Error("durable_child_wait_orphan_original_id_not_restored")
+    }
+    const modelResponse = ({ stepId }) => {
+      if (optionsForCut.loopPhase === "preclaim" || optionsForCut.loopPhase === "multi-preclaim") {
+        if (stepId !== continuation.id) throw new Error("fixture_unexpected_preclaim_step_id")
+        const toolCalls = [{ id: call.id, name: "wait_subagents", arguments: restoredWait.input }]
+        if (optionsForCut.loopPhase === "multi-preclaim") toolCalls.push({ id: `${call.id}:second`, name: "fixture_noop", arguments: {} })
+        return { usage: { inputTokens: 37, outputTokens: 13, estimatedCostUsd: highPrecisionWaitModelCostUsd }, toolCalls }
+      }
+      throw new Error("fixture_orphan_step_model_reinvoked")
+    }
+    const hooks = optionsForCut.loopPhase === "preclaim" || optionsForCut.loopPhase === "multi-preclaim"
+      ? { beforeAppendEvent: async event => {
+          const expectedKey = `task:${lease.id}:event:${childWaitClaimEventKey(lease.attemptCount, continuation.id)}`
+          if (event.type === "tool_call.started" && event.itemId === `task:${lease.id}:item:tool-call:${call.id}:attempt:${lease.attemptCount}`
+            && event.idempotencyKey === expectedKey) {
+            say(`WORKER_B_LOOP_PRE_CLAIM_ORPHAN ${JSON.stringify({ phase: optionsForCut.loopPhase, callId: call.id,
+              stepId: continuation.id, waitId: restoredWait.waitId, exactInput: true, modelCalls: 1,
+              executorCalls: 0, dispatcherCalls: 0 })}`)
+            await new Promise(() => {})
+          }
+        } }
+      : { beforeUpdateItem: async input => {
+          const expectedItem = `task:${lease.id}:item:tool-call:${call.id}:attempt:${lease.attemptCount}`
+          const expectedKey = `task:${lease.id}:event:${childWaitClaimEventKey(lease.attemptCount, continuation.id)}`
+          if (input.itemId !== expectedItem || input.status !== "completed") return
+          const state = await pool.query(`SELECT item."status", item."revision",
+              (SELECT COUNT(*)::int FROM "agent_events" AS event WHERE event."sessionId" = item."sessionId"
+                AND event."turnId" = item."turnId" AND event."taskId" = item."taskId" AND event."idempotencyKey" = $5) AS "claimCount",
+              (SELECT COUNT(*)::int FROM "agent_items" AS result WHERE result."sessionId" = item."sessionId"
+                AND result."turnId" = item."turnId" AND result."taskId" = item."taskId" AND result."stepId" = item."stepId"
+                AND result."type" = 'tool_result' AND result."content"->>'toolCallId' = $6) AS "resultCount"
+            FROM "agent_items" AS item WHERE item."id" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4`,
+          [expectedItem, lease.sessionId, lease.turnId, lease.id, expectedKey, call.id])
+          if (state.rows[0]?.claimCount !== 1 || state.rows[0]?.resultCount !== 0 || state.rows[0]?.status !== "started") {
+            throw new Error("fixture_claim_recovery_cut_state_invalid")
+          }
+          say(`WORKER_B_LOOP_CLAIM_BEFORE_RESULT ${JSON.stringify({ callId: call.id, stepId: continuation.id,
+            waitId: restoredWait.waitId, modelCalls: 0, executorCalls: 0, dispatcherCalls: 0,
+            callStatus: state.rows[0].status, callRevision: state.rows[0].revision,
+            claimCount: state.rows[0].claimCount, resultCount: state.rows[0].resultCount })}`)
+          await new Promise(() => {})
+        } }
+    return runChildWaitLoop(lease, restored, modelResponse, hooks)
+  }
   const replay = createChildDurableWaitReplay(lease, restoredWait, restored.observations)
   replay.acknowledgeContinuation({ id: continuation.id, ordinal: continuation.ordinal })
-  const call = { id: optionsForCut.crashBeforeClaim
-    ? `child-wait-reissue:${lease.id}:attempt:${lease.attemptCount}:orphan`
-    : `child-wait-reissue:${lease.id}:attempt:${lease.attemptCount}`, name: "wait_subagents", arguments: restoredWait.input }
   const wrongStepRejected = replay.childWaitCallStartKey(`${continuation.id}:wrong`, call) === undefined
   if (!wrongStepRejected) throw new Error("durable_child_wait_wrong_step_claimed")
   let dispatcherCalls = 0
@@ -288,7 +591,7 @@ async function recoverClaimedWait(lease, owner, restored, crashAfterResult) {
 
 async function waitForChild(lease, crashAfterRegistration = false) {
   const owner = executionOwnerFence({ kind: "task", lease })
-  const stepId = `child-wait-step:${lease.id}:attempt:${lease.attemptCount}`
+  const stepId = `task:${lease.id}:step:0:attempt:${lease.attemptCount}`
   const toolCallId = phoneShapedToolCallId
   if (redactSensitiveText(toolCallId) === toolCallId) throw new Error("fixture_tool_call_id_is_not_phone_shaped")
   const input = { taskIds: [ids.targetTaskId], mode: "any", timeoutMs: 30_000, idempotencyKey: `child-wait:${lease.id}:attempt:${lease.attemptCount}` }
@@ -326,7 +629,7 @@ async function resumeChild(lease, crashBeforeWaitAck = false, crashAfterWaitAck 
     throw new Error("durable_child_wait_resume_projection_invalid")
   }
   const owner = executionOwnerFence({ kind: "task", lease })
-  const stepId = `child-resume-step:${lease.id}:attempt:${lease.attemptCount}`
+  const stepId = `task:${lease.id}:step:${restored.resume.nextOrdinal}:attempt:${lease.attemptCount}`
   say(`WORKER_B_RESTORED_WAIT_OBSERVATION ${JSON.stringify(restoredWaitObservationSummary(restored, wait, pendingWait, owner, stepId))}`)
   if (restored.childWaitOrphanCallIds?.length) say(`WORKER_B_ORPHAN_ACCOUNTING ${JSON.stringify({
     orphanCallIds: restored.childWaitOrphanCallIds,
@@ -352,7 +655,7 @@ async function resumeChild(lease, crashBeforeWaitAck = false, crashAfterWaitAck 
   if (crashAfterWaitAck) {
     say(`WORKER_B_RESUME_ACK_COMMITTED ${JSON.stringify({ waitId: wait.waitId, stepId, ordinal: continuation.ordinal })}`)
     return claimExactWaitReissue(lease, owner, wait, continuation, now,
-      { crashBeforeClaim: true, checkStaleLeaseSnapshot: true })
+      { crashBeforeClaim: true, checkStaleLeaseSnapshot: true, loopPhase: "preclaim" })
   }
   if (reissueOrphan) {
     const orphanCallIds = restored.childWaitOrphanCallIds ?? []
@@ -362,7 +665,7 @@ async function resumeChild(lease, crashBeforeWaitAck = false, crashAfterWaitAck 
       orphanObserved: restored.observations.some(item => item?.content?.toolCallId === orphanCallIds[0]),
       claimRecoveryPresent: Boolean(restored.childWaitClaimRecovery) })}`)
     return claimExactWaitReissue(lease, owner, wait, continuation, now,
-      { restored, expectedOrphanCallId: orphanCallIds[0] })
+      { restored, expectedOrphanCallId: orphanCallIds[0], loopPhase: "claim-recovery-cut" })
   }
   if (restored.childWaitClaimRecovery) await recoverClaimedWait(lease, owner, restored, crashAfterClaimResult)
   await turnStore.createItem({ owner, itemId: `child-resume-final:${wait.sourceItemId}`, stepId, type: "agent_message", status: "completed",
@@ -397,6 +700,14 @@ const worker = new Worker(queueName, async job => {
       : mode === "worker-b-crash-before-claim" ? ({ lease }) => resumeChild(lease, false, true)
         : mode === "worker-b-crash-after-orphan-reissue" ? ({ lease }) => resumeChild(lease, false, false, false, true)
       : mode === "worker-b-crash-after-claim-result" ? ({ lease }) => resumeChild(lease, false, false, true)
+      : mode === "worker-b-loop-preclaim" ? ({ lease }) => resumeChildThroughLoop(lease, "preclaim")
+      : mode === "worker-b-loop-claim-recovery-cut" ? ({ lease }) => resumeChildThroughLoop(lease, "claim-recovery-cut")
+      : mode === "worker-b-loop-claim-item-completed-cut" ? ({ lease }) => resumeChildThroughLoop(lease, "claim-item-completed-cut")
+      : mode === "worker-b-loop-usage-lineage-cut" ? ({ lease }) => resumeChildThroughLoop(lease, "usage-lineage-cut")
+      : mode === "worker-b-loop-usage-lineage-reject" ? ({ lease }) => resumeChildThroughLoop(lease, "usage-lineage-reject")
+      : mode === "worker-b-loop-final" ? ({ lease }) => resumeChildThroughLoop(lease, "final")
+      : mode === "worker-b-loop-multi-preclaim" ? ({ lease }) => resumeChildThroughLoop(lease, "multi-preclaim")
+      : mode === "worker-b-loop-multi-reject" ? ({ lease }) => resumeChildThroughLoop(lease, "multi-reject")
       : mode === "worker-b" ? ({ lease }) => resumeChild(lease) : undefined
   if (!execute) throw new Error("invalid_fixture_mode")
   const executeWithDiagnostics = async input => {

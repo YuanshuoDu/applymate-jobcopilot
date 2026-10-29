@@ -11,6 +11,7 @@ import { mergeTaskGraphCurrentObservation } from "../canonical-turn-task-graph-c
 import { nativeVerificationFeedbackText } from "../canonical-turn-native-verification.js"
 import { buildCanonicalTurnResumeState } from "../canonical-turn-wait-resume-accounting.js"
 import type { NativeVerificationFeedback } from "../subagents/native-verification-port.js"
+import type { ChildWaitOrphanRecovery } from "../subagents/child-durable-wait-replay.js"
 import { runTurnExecutionLoop } from "./turn-execution-loop.js"
 import { TurnExecutionEventWriter } from "./turn-execution-events.js"
 import { createPgTurnEngineStore } from "./turn-engine-store.js"
@@ -1920,6 +1921,54 @@ describe("owner-agnostic turn execution loop", () => {
       { role: "assistant", content: [{ type: "tool_use", id: "call:root-1", name: "jobs.search", input: { location: "Dublin" } }] },
       { role: "tool", content: [{ type: "tool_result", toolUseId: "call:root-1", content: '{"job":"job-1"}' }] },
     ]))
+  })
+
+  it("recovers a child wait orphan before the model and continues at the next logical step", async () => {
+    const attemptCount = 2, owner = identity("task", "child-1", attemptCount)
+    const waitInput = { idempotencyKey: "wait-key", taskIds: ["leaf-1"], mode: "all" as const, timeoutMs: 5_000 }
+    const waitOutput = { waitId: "wait-1", status: "ready", taskIds: ["leaf-1"], matchedTaskIds: ["leaf-1"] }
+    const sourceObservation = { id: "tool-result:old-wait-call", content: { toolCallId: "old-wait-call", toolName: "wait_subagents",
+      input: waitInput, status: "completed", output: waitOutput, errorCode: null } }
+    const child = fixture(owner, undefined, [sourceObservation])
+    const callId = "orphan-provider-call", stepId = "task:child-1:step:1:attempt:2"
+    const orphan: ChildWaitOrphanRecovery = {
+      owner: { id: owner.taskId, userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
+        rootTaskId: owner.rootTaskId, ownerId: owner.ownerId, attemptCount: owner.attemptCount ?? attemptCount },
+      stepId, stepOrdinal: 1, stepStatus: "streaming", sourceWaitCallId: "old-wait-call", sourceInput: waitInput,
+      call: { id: callId, name: "wait_subagents", arguments: waitInput },
+      callItem: { id: `task:child-1:item:tool-call:${callId}:attempt:2`, revision: 0, status: "started" },
+      callStartedEventId: "orphan-item-started-event", modelUsage: { inputTokens: 37, outputTokens: 13, estimatedCostUsd: 0.0042 }, output: waitOutput,
+    }
+    child.options = { ...child.options, childWaitOrphanRecovery: orphan,
+      resume: { nextOrdinal: 2, stepCount: 2, toolCallCount: 2, inputThroughSequence: 0n, consumedInputIds: [],
+        usage: { inputTokens: 47, outputTokens: 18, estimatedCostUsd: 0.2542 } },
+      budget: { maxSteps: 4, maxToolCalls: 3, maxInputTokens: 57, maxOutputTokens: 28, maxCostUsd: 0.3042 },
+    }
+
+    const result = await runTurnExecutionLoop(child.options)
+    const firstParts = child.requests[0]?.messages.flatMap(message => message.content) ?? []
+    const recoveredUse = firstParts.find(part => part.type === "tool_use" && part.id === callId)
+    const recoveredResult = firstParts.find(part => part.type === "tool_result" && part.toolUseId === callId)
+    const startedSteps = child.events.filter(event => event.type === "step.started" && event.payload !== undefined)
+      .map(event => event.payload as { stepId?: string; ordinal?: number })
+    const claimIndex = child.events.findIndex(event => event.type === "tool_call.started" && event.idempotencyKey?.endsWith("child-wait-claim:2:" + stepId))
+    const nextModelIndex = child.events.findIndex(event => event.type === "model.started" && (event.payload as { taskId?: string } | undefined)?.taskId === owner.taskId)
+
+    expect(result).toMatchObject({ status: "completed", stepCount: 4, toolCallCount: 3, finalText: "done:child-1" })
+    expect(child.requests).toHaveLength(2)
+    expect(recoveredUse).toMatchObject({ type: "tool_use", name: "wait_subagents", input: waitInput })
+    expect(recoveredResult).toMatchObject({ type: "tool_result" })
+    expect(recoveredResult?.type).toBe("tool_result")
+    if (recoveredResult?.type === "tool_result") expect(JSON.parse(recoveredResult.content)).toEqual(waitOutput)
+    expect(startedSteps.map(step => [step.stepId, step.ordinal])).toEqual([
+      ["task:child-1:step:2", 2], ["task:child-1:step:3", 3],
+    ])
+    expect(claimIndex).toBeGreaterThanOrEqual(0)
+    expect(nextModelIndex).toBeGreaterThan(claimIndex)
+    expect(child.events.find(event => event.type === "step.completed" && event.idempotencyKey?.endsWith(`step-completed:${stepId}`))?.payload)
+      .toMatchObject({ stepId, status: "completed", toolCallCount: 1, taskId: owner.taskId })
+    expect(child.stepStatuses).toEqual(["completed", "completed", "completed"])
+    expect(child.events.some(event => event.type === "turn.completed")).toBe(false)
   })
 
   it("projects restored unsafe child call IDs as paired aliases and normalizes exact replay before dispatch", async () => {

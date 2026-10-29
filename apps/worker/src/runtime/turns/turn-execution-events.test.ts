@@ -330,7 +330,8 @@ describe("persistChildWaitClaimRecovery", () => {
     const claim: ChildWaitClaimRecovery = {
       owner: { id: owner.taskId, userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
         rootTaskId: owner.rootTaskId, ownerId: owner.ownerId, attemptCount: owner.attemptCount },
-      stepId: "continuation-step", sourceWaitCallId: "original-wait-call", sourceInput: { idempotencyKey: "key", taskIds: ["leaf-1"], mode: "all", timeoutMs: 5_000 },
+      stepId: "continuation-step", stepOrdinal: 1, stepStatus: "streaming", modelUsage: { inputTokens: 37, outputTokens: 13, estimatedCostUsd: 0.0042 },
+      sourceWaitCallId: "original-wait-call", sourceInput: { idempotencyKey: "key", taskIds: ["leaf-1"], mode: "all", timeoutMs: 5_000 },
       call: { id: "reissued-wait-call", name: "wait_subagents", arguments: { idempotencyKey: "key", taskIds: ["leaf-1"], mode: "all", timeoutMs: 5_000 } },
       callItem: { id: "call-item", revision: 0, status: "started" }, callStartedEventId: "call-start-event", claimEventId: "claim-event",
       output: { waitId: "wait-1", status: "ready" },
@@ -364,7 +365,8 @@ describe("persistChildWaitClaimRecovery", () => {
     const claim: ChildWaitClaimRecovery = {
       owner: { id: owner.taskId, userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
         rootTaskId: owner.rootTaskId, ownerId: owner.ownerId, attemptCount: owner.attemptCount },
-      stepId: "continuation-step", sourceWaitCallId: "original", sourceInput: {},
+      stepId: "continuation-step", stepOrdinal: 1, stepStatus: "streaming", modelUsage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 },
+      sourceWaitCallId: "original", sourceInput: {},
       call: { id: "reissue", name: "wait_subagents", arguments: {} }, callItem: { id: "call-item", revision: 0, status: "started" },
       callStartedEventId: "start", claimEventId: "claim", output: {},
     }

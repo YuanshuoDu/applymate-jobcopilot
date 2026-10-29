@@ -24,34 +24,50 @@ function readTool(name = "jobs.search", domain: RuntimeToolDefinition["domain"] 
 }
 
 describe("child wait admission", () => {
-  it("acknowledges the first persisted continuation at its Turn-global ordinal", async () => {
+  it("acknowledges the logical successor using its Turn-global persisted ordinal", async () => {
     const task = { ...baseLease, attemptCount: 3 } as SubagentLease
     const identity = { kind: "task", userId: task.userId, sessionId: task.sessionId, turnId: task.turnId, taskId: task.id,
       rootTaskId: task.rootTaskId, ownerId: task.ownerId, attemptCount: task.attemptCount, leaseExpiresAt: task.leaseExpiresAt }
-    const wait: DurableWaitResume = { waitId: "wait-1", stepId: "source-step", attempt: 3, ordinal: 4, toolCallId: "wait-call", sourceItemId: "wait-result",
+    const wait: DurableWaitResume = { waitId: "wait-1", stepId: "task:child-1:step:4:attempt:3", attempt: 3, ordinal: 18, toolCallId: "wait-call", sourceItemId: "wait-result",
       input: {}, output: {} }
-    const startStep = vi.fn(async () => ({ id: "continuation-step", ordinal: 9 }))
-    const commit = vi.fn(async (_lease: SubagentLease, _wait: DurableWaitResume, ordinal: number) => ordinal === 9)
+    const continuationId = "task:child-1:step:5:attempt:3"
+    const startStep = vi.fn(async () => ({ id: continuationId, ordinal: 39 }))
+    const commit = vi.fn(async (_lease: SubagentLease, _wait: DurableWaitResume, ordinal: number) => ordinal === 39)
     const acknowledged = vi.fn()
     const store = acknowledgeDurableWaitAtContinuationStart({ startStep } as never, task, wait, commit, acknowledged)
 
-    await expect(store.startStep({ ordinal: 5, attempt: 3, identity } as never)).resolves.toEqual({ id: "continuation-step", ordinal: 9 })
-    expect(commit).toHaveBeenCalledWith(task, wait, 9)
-    expect(acknowledged).toHaveBeenCalledWith({ id: "continuation-step", ordinal: 9 })
+    await expect(store.startStep({ ordinal: 5, attempt: 3, identity } as never)).resolves.toEqual({ id: continuationId, ordinal: 39 })
+    expect(commit).toHaveBeenCalledWith(task, wait, 39)
+    expect(acknowledged).toHaveBeenCalledWith({ id: continuationId, ordinal: 39 })
   })
 
   it("does not expose a continuation step until the durable wait commit succeeds", async () => {
     const task = { ...baseLease, attemptCount: 3 } as SubagentLease
-    const wait: DurableWaitResume = { waitId: "wait-1", stepId: "source-step", attempt: 3, ordinal: 4, toolCallId: "wait-call", sourceItemId: "wait-result",
+    const wait: DurableWaitResume = { waitId: "wait-1", stepId: "task:child-1:step:4:attempt:3", attempt: 3, ordinal: 18, toolCallId: "wait-call", sourceItemId: "wait-result",
       input: {}, output: {} }
     const identity = { kind: "task", userId: task.userId, sessionId: task.sessionId, turnId: task.turnId, taskId: task.id,
       rootTaskId: task.rootTaskId, ownerId: task.ownerId, attemptCount: task.attemptCount, leaseExpiresAt: task.leaseExpiresAt }
     const acknowledged = vi.fn()
-    const store = acknowledgeDurableWaitAtContinuationStart({ startStep: async () => ({ id: "continuation-step", ordinal: 9 }) } as never,
+    const store = acknowledgeDurableWaitAtContinuationStart({ startStep: async () => ({ id: "task:child-1:step:5:attempt:3", ordinal: 39 }) } as never,
       task, wait, async () => false, acknowledged)
 
     await expect(store.startStep({ ordinal: 5, attempt: 3, identity } as never)).rejects.toThrow("child_resume_wait_commit_pending")
     expect(acknowledged).not.toHaveBeenCalled()
+  })
+
+  it("rejects a persisted step whose ID is not the source logical successor", async () => {
+    const task = { ...baseLease, attemptCount: 3 } as SubagentLease
+    const identity = { kind: "task", userId: task.userId, sessionId: task.sessionId, turnId: task.turnId, taskId: task.id,
+      rootTaskId: task.rootTaskId, ownerId: task.ownerId, attemptCount: task.attemptCount, leaseExpiresAt: task.leaseExpiresAt }
+    const wait: DurableWaitResume = { waitId: "wait-1", stepId: "task:child-1:step:4:attempt:3", attempt: 3, ordinal: 18,
+      toolCallId: "wait-call", sourceItemId: "wait-result", input: {}, output: {} }
+    const commit = vi.fn(async () => true)
+    const store = acknowledgeDurableWaitAtContinuationStart({
+      startStep: async () => ({ id: "task:child-1:step:6:attempt:3", ordinal: 39 }),
+    } as never, task, wait, commit)
+
+    await expect(store.startStep({ ordinal: 5, attempt: 3, identity } as never)).rejects.toThrow("child_resume_wait_owner_mismatch")
+    expect(commit).not.toHaveBeenCalled()
   })
 
   it("requires the server role policy and exact persisted wait action", () => {

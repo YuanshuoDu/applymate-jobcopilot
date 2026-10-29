@@ -5,7 +5,8 @@ import type { SubagentLease } from "./types.js"
 import { buildChildResumeObservations, countChildResumeToolCalls, integer, mergeDurableWaitObservation, type DurableWaitResume } from "./child-resume-observations.js"
 import { loadChildConsumedWaitResume } from "./child-resume-consumed-wait.js"
 import { loadChildWaitCallRecovery } from "./child-resume-wait-call-recovery.js"
-import type { ChildWaitClaimRecovery } from "./child-durable-wait-replay.js"
+import type { ChildWaitClaimRecovery, ChildWaitOrphanRecovery } from "./child-durable-wait-replay.js"
+import { childWaitLogicalResumeCursor } from "./child-resume-wait-call-contract.js"
 export { loadChildConsumedWaitResume } from "./child-resume-consumed-wait.js"
 type QueryClient = Pick<pg.PoolClient, "query" | "release">
 type ResumePool = Pick<pg.Pool, "connect">
@@ -15,6 +16,7 @@ export type ChildAttemptResume = {
   readonly observations: readonly ContextSeedBlock[]
   readonly durableWait?: DurableWaitResume
   readonly childWaitClaimRecovery?: ChildWaitClaimRecovery
+  readonly childWaitOrphanRecovery?: ChildWaitOrphanRecovery
   readonly childWaitOrphanCallIds?: readonly string[]
 }
 export type ChildResumeLoader = (lease: SubagentLease) => Promise<ChildAttemptResume | undefined>
@@ -66,7 +68,7 @@ function waitResumeStepsSql(): string {
   return `SELECT step."id", step."sessionId", step."turnId", step."taskId", step."ordinal", step."attempt", step."status", step."inputThroughSequence", step."consumedInputIds", step."inputTokens", step."outputTokens", step."estimatedCostUsd", task."rootTaskId" AS "rootTaskId"
     FROM "agent_steps" AS step JOIN "sub_agent_tasks" AS task ON task."id" = step."taskId" AND task."sessionId" = step."sessionId" AND task."turnId" = step."turnId" JOIN "agent_sessions" AS session ON session."id" = step."sessionId" JOIN "agent_turns" AS turn ON turn."id" = step."turnId" AND turn."sessionId" = step."sessionId" JOIN "sub_agent_tasks" AS root ON root."id" = task."rootTaskId" AND root."sessionId" = task."sessionId" AND root."turnId" = task."turnId"
     WHERE step."taskId" = $1 AND step."sessionId" = $2 AND step."turnId" = $3 AND session."userId" = $4 AND task."rootTaskId" = $5
-      AND step."attempt" = $6 AND (step."ordinal" <= $7 OR step."id" = $8) ORDER BY step."ordinal" ASC, step."id" ASC LIMIT ${MAX_PRIOR_STEPS + 1}`
+      AND step."attempt" = $6 ORDER BY step."ordinal" ASC, step."id" ASC LIMIT ${MAX_PRIOR_STEPS + 1}`
 }
 
 function itemsSql(): string {
@@ -79,7 +81,7 @@ function waitResumeItemsSql(): string {
   return `SELECT item."id", item."sessionId", item."turnId", item."taskId", item."stepId", item."type", item."status", item."content", step."attempt", step."ordinal", task."rootTaskId" AS "rootTaskId"
     FROM "agent_items" AS item JOIN "agent_steps" AS step ON step."id" = item."stepId" AND step."sessionId" = item."sessionId" AND step."turnId" = item."turnId" AND step."taskId" = item."taskId" JOIN "sub_agent_tasks" AS task ON task."id" = item."taskId" AND task."sessionId" = item."sessionId" AND task."turnId" = item."turnId" JOIN "agent_sessions" AS session ON session."id" = item."sessionId" JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId"
     WHERE item."taskId" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND session."userId" = $4 AND task."rootTaskId" = $5
-      AND (step."attempt" < $6 OR (step."attempt" = $6 AND (step."ordinal" <= $7 OR step."id" = $8)))
+      AND step."attempt" <= $6
     ORDER BY step."attempt" ASC, step."ordinal" ASC, item."createdAt" ASC, item."id" ASC LIMIT ${MAX_PRIOR_ITEMS + 1}`
 }
 
@@ -146,7 +148,7 @@ export async function loadChildAttemptResume(pool: ResumePool, lease: SubagentLe
     const currentAttemptWait = waitResume?.attempt === lease.attemptCount ? waitResume : undefined
     const prior = await client.query<Row>(stepsSql(), [lease.id, lease.sessionId, lease.turnId, lease.userId, lease.rootTaskId, lease.attemptCount])
     const sameAttempt = currentAttemptWait
-      ? await client.query<Row>(waitResumeStepsSql(), [lease.id, lease.sessionId, lease.turnId, lease.userId, lease.rootTaskId, lease.attemptCount, currentAttemptWait.ordinal, currentAttemptWait.continuationStepId ?? ""])
+      ? await client.query<Row>(waitResumeStepsSql(), [lease.id, lease.sessionId, lease.turnId, lease.userId, lease.rootTaskId, lease.attemptCount])
       : { rows: [] as Row[] }
     const steps = [...prior.rows, ...sameAttempt.rows]
     if (steps.length > MAX_PRIOR_STEPS) throw new Error("child_resume_step_limit")
@@ -188,19 +190,27 @@ export async function loadChildAttemptResume(pool: ResumePool, lease: SubagentLe
       if (!Number.isSafeInteger(inputTokens) || !Number.isSafeInteger(outputTokens) || !Number.isFinite(estimatedCostUsd)) throw new Error("child_resume_usage_overflow")
     }
     // A resumed wait keeps its logical successor ordinal even if the persisted Turn-global continuation is later.
-    const nextOrdinal = currentAttemptWait ? currentAttemptWait.ordinal + 1
+    let nextOrdinal = currentAttemptWait ? currentAttemptWait.ordinal + 1
       : ["completed", "waiting_for_tool", "waiting_for_approval", "waiting_for_user"].includes(lastStatus) ? lastOrdinal + 1 : lastOrdinal
     const itemResult = currentAttemptWait
-      ? await client.query<Row>(waitResumeItemsSql(), [lease.id, lease.sessionId, lease.turnId, lease.userId, lease.rootTaskId, lease.attemptCount, currentAttemptWait.ordinal, currentAttemptWait.continuationStepId ?? ""])
+      ? await client.query<Row>(waitResumeItemsSql(), [lease.id, lease.sessionId, lease.turnId, lease.userId, lease.rootTaskId, lease.attemptCount])
       : await client.query<Row>(itemsSql(), [lease.id, lease.sessionId, lease.turnId, lease.userId, lease.rootTaskId, lease.attemptCount])
     if (itemResult.rows.length > MAX_PRIOR_ITEMS) throw new Error("child_resume_item_limit")
-    const currentAttemptItemOrdinal = currentAttemptWait?.continuationOrdinal ?? currentAttemptWait?.ordinal
+    const currentAttemptItemOrdinal = currentAttemptWait ? Math.max(...sameAttempt.rows.map(row => integer(row, "ordinal"))) : undefined
     let restoredObservations = buildChildResumeObservations(itemResult.rows, lease, currentAttemptItemOrdinal)
     if (waitResume) restoredObservations = mergeDurableWaitObservation(restoredObservations, waitResume)
     const waitCallRecovery = currentAttemptWait?.continuationStepId
       ? await loadChildWaitCallRecovery(client, lease, currentAttemptWait) : undefined
     const childWaitClaimRecovery = waitCallRecovery?.claim
+    const childWaitOrphanRecovery = waitCallRecovery?.orphan
     const childWaitOrphanCallIds = waitCallRecovery?.orphanCallIds ?? []
+    const recoveredCall = childWaitClaimRecovery ?? childWaitOrphanRecovery
+    if (currentAttemptWait) nextOrdinal = childWaitLogicalResumeCursor(sameAttempt.rows, lease, currentAttemptWait, recoveredCall?.stepOrdinal)
+    if (recoveredCall?.stepStatus === "streaming") {
+      inputTokens += recoveredCall.modelUsage.inputTokens; outputTokens += recoveredCall.modelUsage.outputTokens
+      estimatedCostUsd += recoveredCall.modelUsage.estimatedCostUsd
+      if (!Number.isSafeInteger(inputTokens) || !Number.isSafeInteger(outputTokens) || !Number.isFinite(estimatedCostUsd)) throw new Error("child_resume_usage_overflow")
+    }
     const hiddenCallIds = new Set([...childWaitOrphanCallIds, ...(childWaitClaimRecovery ? [childWaitClaimRecovery.call.id] : [])])
     if (hiddenCallIds.size) restoredObservations = restoredObservations.filter(item => {
       const content = item.content && typeof item.content === "object" && !Array.isArray(item.content) ? item.content as Record<string, unknown> : {}
@@ -213,7 +223,7 @@ export async function loadChildAttemptResume(pool: ResumePool, lease: SubagentLe
       if (orphanRows.length !== childWaitOrphanCallIds.length || new Set(childWaitOrphanCallIds).size !== childWaitOrphanCallIds.length) {
         throw new Error("child_resume_wait_tool_call_conflict")
       }
-      toolCallCount -= orphanRows.length
+      toolCallCount -= orphanRows.filter(row => (row.content as Row).toolCallId !== childWaitOrphanRecovery?.call.id).length
     }
     await client.query("COMMIT"); committed = true
     return {
@@ -221,6 +231,7 @@ export async function loadChildAttemptResume(pool: ResumePool, lease: SubagentLe
       observations: restoredObservations,
       ...(currentAttemptWait ? { durableWait: currentAttemptWait } : {}),
       ...(childWaitClaimRecovery ? { childWaitClaimRecovery } : {}),
+      ...(childWaitOrphanRecovery ? { childWaitOrphanRecovery } : {}),
       ...(childWaitOrphanCallIds.length ? { childWaitOrphanCallIds } : {}),
     }
   } catch (error: unknown) {

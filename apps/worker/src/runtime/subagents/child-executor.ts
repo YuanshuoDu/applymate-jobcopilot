@@ -22,7 +22,7 @@ import type { DiscoveryAttemptSidecar } from "./child-discovery-attempt.js"
 import type { DiscoveryRecoverySnapshot } from "./task-graph-discovery-recovery-contract.js"
 import { SubagentLeaseError, type SubagentExecutionResult, type SubagentLease, type SubagentMailboxContinuation, type SubagentTaskRecord } from "./types.js"
 import type { TurnExecutionStore } from "../turns/turn-execution-types.js"
-import { childWaitReplayExecutionOptions, createChildDurableWaitReplay } from "./child-durable-wait-replay.js"
+import { childWaitReplayExecutionOptions, childWaitResumeCursorIsValid, createChildDurableWaitReplay } from "./child-durable-wait-replay.js"
 import type { TurnResumeState } from "../turns/turn-engine-types.js"
 import { createToolRouterExecutor } from "../turns/turn-engine-helpers.js"
 import { runTurnExecutionLoop } from "../turns/turn-execution-loop.js"
@@ -143,7 +143,7 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       }
       resume = restored.resume
     }
-    if (durableWaitResume && (!resume || durableWaitResume.attempt !== lease.attemptCount || resume.nextOrdinal !== durableWaitResume.ordinal + 1)) {
+    if (durableWaitResume && (!resume || !childWaitResumeCursorIsValid(durableWaitResume, lease, resume.nextOrdinal, Boolean(restored?.childWaitOrphanRecovery || restored?.childWaitClaimRecovery || restored?.childWaitOrphanCallIds?.length)))) {
       return { status: "failed", failureReason: "child_resume_wait_step_lineage", retryDisposition: "terminal" }
     }
     const durableWaitReplay = durableWaitResume ? createChildDurableWaitReplay(executionLease, durableWaitResume, restored?.observations ?? [], restored?.childWaitClaimRecovery) : undefined; if (durableWaitResume?.continuationStepId && Number.isSafeInteger(durableWaitResume.continuationOrdinal)) durableWaitReplay?.acknowledgeContinuation({ id: durableWaitResume.continuationStepId, ordinal: durableWaitResume.continuationOrdinal! })
@@ -208,7 +208,7 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       // A retry is a new durable attempt. Keep IDs deterministic within that
       // attempt while preventing attempt 1 and attempt 2 collisions.
       idFactory: prefix => `${prefix}:attempt:${lease.attemptCount}`,
-      resume, ...childWaitReplayExecutionOptions(durableWaitReplay, restored?.childWaitClaimRecovery),
+      resume, ...childWaitReplayExecutionOptions(durableWaitReplay, restored?.childWaitClaimRecovery, restored?.childWaitOrphanRecovery),
       isOwnershipLost: (error, signal) => signal.aborted || error instanceof SubagentLeaseError,
       signalError: () => new Error("subagent_lease_lost"),
       ...(adapter.profile.nativeTools && adapter.profile.structuredOutput && structuredRole ? { outputSchema: structuredResultOutputSchema(structuredRole) } : {}),

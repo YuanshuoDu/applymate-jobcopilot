@@ -18,6 +18,7 @@ import type { RuntimeToolDefinition } from "../tools/types.js"
 import { executionOwnerFence } from "../execution-owner.js"
 import type { CoordinationMailboxMessage } from "../tools/coordination-types.js"
 import { createDurableSubagentWaitTool } from "./durable-subagent-wait-tool.js"
+import type { DurableWaitResume } from "./child-resume-observations.js"
 import type { WorkerUsageAuthorizationInput, WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
 import { NATIVE_VERIFICATION_CONTROL_SCHEMA, NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA, NATIVE_VERIFICATION_PACKET_SCHEMA, canonicalNativeVerificationJson, digestNativeVerificationValue, type NativeVerificationControl, type NativeVerificationPacket } from "./native-verification-contract.js"
 import { createNativeVerificationContext } from "./native-verification-packet.js"
@@ -239,6 +240,37 @@ function budgetStore(failConsumed = false, rootLimits?: TreeBudgetExecutionLimit
 }
 
 describe("child executor composition", () => {
+  it("starts the logical successor of a source-only resolved wait and acknowledges its persisted physical step", async () => {
+    const child = lease(), requests: HarnessModelRequest[] = [], started: Array<{ id: string; ordinal: number }> = []
+    const waitInput = { idempotencyKey: "wait-key", taskIds: ["grandchild-1"], mode: "all", timeoutMs: 5_000 }
+    const waitOutput = { waitId: "wait-1", status: "ready", taskIds: ["grandchild-1"], deadlineAt: "2099-09-14T11:30:00.000Z",
+      matchedTaskIds: ["grandchild-1"], tasks: [{ taskId: "grandchild-1", status: "completed", role: "scout", result: {}, failureReason: null }] }
+    const durableWait = { waitId: "wait-1", stepId: `task:${child.id}:step:4:attempt:${child.attemptCount}`, attempt: child.attemptCount, ordinal: 18,
+      toolCallId: "old-wait-call", sourceItemId: "old-wait-result", input: waitInput, output: waitOutput }
+    const resumeLoader = async () => ({
+      resume: { nextOrdinal: 5, stepCount: 5, toolCallCount: 1, inputThroughSequence: 18n, consumedInputIds: [], usage: { inputTokens: 21, outputTokens: 8, estimatedCostUsd: 0.12 } },
+      observations: [{ id: "child-resume:old-wait-result", content: { toolCallId: "old-wait-call", toolName: "wait_subagents", input: waitInput,
+        status: "completed", output: waitOutput, errorCode: null } }], durableWait,
+    })
+    const baseStore = executionStore([], requests)
+    const store: TurnExecutionStore = { ...baseStore, startStep: async input => {
+      started.push({ id: input.stepId, ordinal: input.ordinal })
+      return { id: input.stepId, ordinal: 39 }
+    } }
+    const committer = vi.fn(async (_lease: SubagentLease, _wait: DurableWaitResume, physicalOrdinal: number) => physicalOrdinal === 39)
+    const executor = createChildExecutor({
+      store, treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      modelRuntimeFactory: () => textOnlyModel("continued after resolved wait", request => requests.push(request)),
+      toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")]), resumeLoader, durableWaitResumeCommitter: committer,
+    })
+
+    await expect(executor({ lease: child })).resolves.toMatchObject({ status: "completed", result: { finalText: "continued after resolved wait" } })
+    expect(started).toEqual([{ id: `task:${child.id}:step:5:attempt:${child.attemptCount}`, ordinal: 5 }])
+    expect(committer).toHaveBeenCalledWith(child, durableWait, 39)
+    expect(requests).toHaveLength(1)
+    expect(JSON.stringify(requests[0]?.messages)).toContain("old-wait-call")
+  })
+
   it("fails closed when a selected-job Writer has no transient source bundle", async () => {
     const child = { ...lease(), role: "writer", context: { selectedJobPreparation: { jobId: "job-1" } } }
     const modelRuntimeFactory = vi.fn(() => textOnlyModel("must not run"))
@@ -557,7 +589,8 @@ describe("child executor composition", () => {
     const startAttempts: number[] = []; const createdSteps = new Map<string, { id: string; ordinal: number }>()
     const deliveryOrder: string[] = []; const routedCalls: string[] = []
     const durableWait = {
-      waitId: "wait-1", stepId: "waiting-step", attempt: child.attemptCount, ordinal: 2, toolCallId: "wait-call", sourceItemId: "wait-result",
+      waitId: "wait-1", stepId: `task:${child.id}:step:2:attempt:${child.attemptCount}`, attempt: child.attemptCount, ordinal: 2,
+      toolCallId: "wait-call", sourceItemId: "wait-result", continuationStepId: `task:${child.id}:step:3:attempt:${child.attemptCount}`, continuationOrdinal: 3,
       input: { idempotencyKey: "wait-key", taskIds: ["grandchild-1"], mode: "all", timeoutMs: 5_000 },
       output: { waitId: "wait-1", status: "ready", taskIds: ["grandchild-1"], deadlineAt: "2099-09-14T11:30:00.000Z",
         matchedTaskIds: ["grandchild-1"], tasks: [{ taskId: "grandchild-1", status: "completed", role: "scout", result: {}, failureReason: null }] },
@@ -627,7 +660,8 @@ describe("child executor composition", () => {
       tasks: [{ taskId: "grandchild-1", status: "completed", role: "scout", result: { summary: "done" }, failureReason: null }],
     }
     const durableWait = {
-      waitId: "wait-1", stepId: "waiting-step", attempt: child.attemptCount, ordinal: 0, toolCallId: "old-provider-call", sourceItemId: "old-result",
+      waitId: "wait-1", stepId: `task:${child.id}:step:0:attempt:${child.attemptCount}`, attempt: child.attemptCount, ordinal: 0,
+      toolCallId: "old-provider-call", sourceItemId: "old-result", continuationStepId: `task:${child.id}:step:1:attempt:${child.attemptCount}`, continuationOrdinal: 1,
       input: waitInput, output: waitOutput,
     } as const
     const resumeLoader = async () => ({
@@ -702,7 +736,8 @@ describe("child executor composition", () => {
     const requests: HarnessModelRequest[] = []; const deliveryOrder: string[] = []; const routedCalls: string[] = []
     const startedAttempts: number[] = []; const persistedSteps = new Map<string, { id: string; ordinal: number }>()
     const durableWait = {
-      waitId: "wait-crash-cut", stepId: "waiting-step", attempt: 3, ordinal: 2, toolCallId: "wait-call", sourceItemId: "recovered-wait-result:wait-crash-cut",
+      waitId: "wait-crash-cut", stepId: `task:${oldOwner.id}:step:2:attempt:3`, attempt: 3, ordinal: 2, toolCallId: "wait-call",
+      sourceItemId: "recovered-wait-result:wait-crash-cut", continuationStepId: `task:${oldOwner.id}:step:3:attempt:3`, continuationOrdinal: 3,
       input: { idempotencyKey: "wait-key", taskIds: ["grandchild-1"], mode: "all", timeoutMs: 5_000 },
       output: { waitId: "wait-crash-cut", status: "ready", taskIds: ["grandchild-1"], deadlineAt: "2099-09-14T11:30:00.000Z",
         matchedTaskIds: ["grandchild-1"], tasks: [{ taskId: "grandchild-1", status: "completed", role: "scout", result: {}, failureReason: null }] },
@@ -765,7 +800,8 @@ describe("child executor composition", () => {
     const requests: HarnessModelRequest[] = []; const deliveryOrder: string[] = []; const routedCalls: string[] = []
     const startedAttempts: number[] = []; const persistedSteps = new Map<string, { id: string; ordinal: number }>()
     const durableWait = {
-      waitId: "wait-post-ack", stepId: "waiting-step", attempt: 3, ordinal: 2, toolCallId: "wait-call", sourceItemId: "recovered-wait-result:wait-post-ack",
+      waitId: "wait-post-ack", stepId: `task:${oldOwner.id}:step:2:attempt:3`, attempt: 3, ordinal: 2, toolCallId: "wait-call",
+      sourceItemId: "recovered-wait-result:wait-post-ack", continuationStepId: `task:${oldOwner.id}:step:3:attempt:3`, continuationOrdinal: 3,
       input: { idempotencyKey: "wait-key", taskIds: ["grandchild-1"], mode: "all", timeoutMs: 5_000 },
       output: { waitId: "wait-post-ack", status: "ready", taskIds: ["grandchild-1"], deadlineAt: "2099-09-14T11:30:00.000Z",
         matchedTaskIds: ["grandchild-1"], tasks: [{ taskId: "grandchild-1", status: "completed", role: "scout", result: {}, failureReason: null }] },
@@ -843,7 +879,8 @@ describe("child executor composition", () => {
   it("does not return child success when durable wait delivery is not acknowledged", async () => {
     const child = lease()
     const durableWait = {
-      waitId: "wait-1", stepId: "waiting-step", attempt: child.attemptCount, ordinal: 0, toolCallId: "wait-call", sourceItemId: "wait-result",
+      waitId: "wait-1", stepId: `task:${child.id}:step:0:attempt:${child.attemptCount}`, attempt: child.attemptCount, ordinal: 0,
+      toolCallId: "wait-call", sourceItemId: "wait-result", continuationStepId: `task:${child.id}:step:1:attempt:${child.attemptCount}`, continuationOrdinal: 1,
       input: { idempotencyKey: "wait-key", taskIds: ["grandchild-1"], mode: "any", timeoutMs: 1_000 },
       output: { waitId: "wait-1", status: "timed_out", taskIds: ["grandchild-1"], deadlineAt: "2026-01-01T00:00:00.000Z",
         matchedTaskIds: [], tasks: [{ taskId: "grandchild-1", status: "running", role: "scout", result: null, failureReason: null }] },
@@ -1209,7 +1246,8 @@ describe("child executor composition", () => {
     })
     const requests: HarnessModelRequest[] = []
     const durableWait = {
-      waitId: "wait-first-attempt", stepId: "waiting-step", attempt: 1, ordinal: 0, toolCallId: "wait-call", sourceItemId: "wait-result",
+      waitId: "wait-first-attempt", stepId: `task:${child.id}:step:0:attempt:1`, attempt: 1, ordinal: 0, toolCallId: "wait-call",
+      sourceItemId: "wait-result", continuationStepId: `task:${child.id}:step:1:attempt:1`, continuationOrdinal: 1,
       input: { idempotencyKey: "wait-key", taskIds: ["grandchild-1"], mode: "any", timeoutMs: 5_000 },
       output: { waitId: "wait-first-attempt", status: "ready", taskIds: ["grandchild-1"], deadlineAt: "2099-09-14T11:30:00.000Z",
         matchedTaskIds: ["grandchild-1"], tasks: [{ taskId: "grandchild-1", status: "completed", role: "scout", result: {}, failureReason: null }] },

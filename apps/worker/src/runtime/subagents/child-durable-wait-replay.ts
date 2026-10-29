@@ -5,23 +5,32 @@ import type { TurnEngineToolCall, TurnEngineToolExecutor } from "../turns/turn-e
 import { safeSubagentWaitJson } from "./durable-subagent-wait-store.js"
 import type { DurableWaitResume } from "./child-resume-observations.js"
 import type { SubagentLease } from "./types.js"
+export { childWaitResumeCursorIsValid } from "./child-resume-wait-call-contract.js"
 
 type WaitInput = Readonly<{ idempotencyKey: string; taskIds: readonly string[]; mode: "any" | "all"; timeoutMs: number }>
 type ContinuationStep = Readonly<{ id: string; ordinal: number }>
 const WAIT_TASK_STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed", "passed", "skipped"])
 
-export type ChildWaitClaimRecovery = Readonly<{
+export type ChildWaitCallRecovery = Readonly<{
   readonly owner: Readonly<Pick<SubagentLease, "id" | "userId" | "sessionId" | "turnId" | "rootTaskId" | "ownerId" | "attemptCount">>
   readonly stepId: string
+  readonly stepOrdinal: number
+  readonly stepStatus: "streaming" | "completed"
   readonly call: Readonly<{ id: string; name: "wait_subagents"; arguments: unknown }>
   readonly sourceWaitCallId: string
   readonly sourceInput: unknown
   readonly callItem: Readonly<{ id: string; revision: number; status: "started" | "completed" }>
   readonly callStartedEventId: string
-  readonly claimEventId: string
+  readonly modelUsage: Readonly<{ inputTokens: number; outputTokens: number; estimatedCostUsd: number }>
   readonly output: unknown
+}>
+
+export type ChildWaitClaimRecovery = ChildWaitCallRecovery & Readonly<{
+  readonly claimEventId: string
   readonly resultItem?: Readonly<{ id: string; revision: number; status: "started" | "completed" }>
 }>
+
+export type ChildWaitOrphanRecovery = ChildWaitCallRecovery
 
 export function childWaitClaimEventKey(attempt: number, stepId: string): string {
   return `child-wait-claim:${attempt}:${stepId}`
@@ -183,10 +192,12 @@ export function createChildDurableWaitReplay(
 export function childWaitReplayExecutionOptions(
   replay: ReturnType<typeof createChildDurableWaitReplay> | undefined,
   claim: ChildWaitClaimRecovery | undefined,
+  orphan?: ChildWaitOrphanRecovery,
 ): {
   childWaitCallStartKey?: (stepId: string, call: TurnEngineToolCall) => string | undefined
   childWaitCallStarted?: (stepId: string, call: TurnEngineToolCall, eventId: string) => void
   childWaitClaimRecovery?: ChildWaitClaimRecovery
+  childWaitOrphanRecovery?: ChildWaitOrphanRecovery
 } {
   return {
     ...(replay ? {
@@ -194,5 +205,6 @@ export function childWaitReplayExecutionOptions(
       childWaitCallStarted: (stepId, call, eventId) => replay.childWaitCallStarted(stepId, call, eventId),
     } : {}),
     ...(claim ? { childWaitClaimRecovery: claim } : {}),
+    ...(orphan ? { childWaitOrphanRecovery: orphan } : {}),
   }
 }

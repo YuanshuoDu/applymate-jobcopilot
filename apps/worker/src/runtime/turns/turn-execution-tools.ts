@@ -2,7 +2,7 @@ import { createHash } from "node:crypto"
 import type { ModelStepResult } from "./turn-engine-model.js"
 import { findToolResultObservation, stableJson } from "./turn-engine-replay.js"
 import { toRepositoryJson, TurnEngineError, type TurnEngineResult, type TurnEngineStep, type ToolCallRecovery } from "./turn-engine-types.js"
-import { executeToolWithItems, persistChildWaitClaimRecovery, persistRecoveredToolCall, TurnExecutionEventWriter } from "./turn-execution-events.js"
+import { executeToolWithItems, persistRecoveredToolCall, TurnExecutionEventWriter } from "./turn-execution-events.js"
 import { executionId, type TurnExecutionOptions } from "./turn-execution-types.js"
 import { assertExecutionAlive } from "./turn-engine-helpers.js"
 import type { StepContext } from "../context/step-context-builder.js"
@@ -13,6 +13,7 @@ import { isSessionPauseRequestedError } from "../session-gate.js"
 import { executeNativeQuestionTool, nativeQuestionResultCall, PreparedQuestionRetryError, questionWaitResult, recoverableNativeQuestionCalls, rejectQuestionReplay } from "./turn-execution-question.js"
 import { hasResolvedWaitOutcome } from "./turn-execution-wait.js"
 import { lookupArchivedWaitControl, parseArchivedWaitReference } from "./durable-wait-control.js"
+import { recoverChildWaitClaim, recoverChildWaitOrphan } from "./turn-execution-child-wait-recovery.js"
 
 type MarkerState = { readonly active: readonly SteeringMarkerPayload[] } | undefined
 type ToolOutcome = { readonly wait: TurnEngineResult | null; readonly snapshot: TurnExecutionOptions["snapshot"]; readonly steeringMarkerState: MarkerState }
@@ -164,12 +165,11 @@ export async function executeTools(
 export async function recoverPersistedToolCalls(options: TurnExecutionOptions, writer: TurnExecutionEventWriter, now: () => Date): Promise<readonly { id: string; content: ReturnType<typeof toRepositoryJson> }[]> {
   const recovery = await recoverableNativeQuestionCalls(options, options.toolCallRecovery ?? [], now)
   const childObservations: Array<{ id: string; content: ReturnType<typeof toRepositoryJson> }> = []
-  if (options.childWaitClaimRecovery) {
-    if (recovery.some(item => item.call.id === options.childWaitClaimRecovery!.call.id)) throw new Error("child_wait_claim_recovery_conflict")
-    const result = await persistChildWaitClaimRecovery(options, writer, options.childWaitClaimRecovery, now)
-    childObservations.push({ id: `tool-result:${result.id}`, content: toRepositoryJson({ toolCallId: result.id, toolName: result.toolName,
-      input: options.childWaitClaimRecovery.call.arguments, status: result.status, output: result.output ?? null, errorCode: result.errorCode }) })
-  }
+  if (options.childWaitClaimRecovery && options.childWaitOrphanRecovery) throw new Error("child_wait_claim_recovery_conflict")
+  const childCall = options.childWaitClaimRecovery?.call ?? options.childWaitOrphanRecovery?.call
+  if (childCall && recovery.some(item => item.call.id === childCall.id)) throw new Error("child_wait_claim_recovery_conflict")
+  if (options.childWaitClaimRecovery) childObservations.push(await recoverChildWaitClaim(options, writer, options.childWaitClaimRecovery, now))
+  else if (options.childWaitOrphanRecovery) childObservations.push(await recoverChildWaitOrphan(options, writer, options.childWaitOrphanRecovery, now))
   if (recovery.length === 0) return childObservations
   const mustFailTurn = recovery.some(item => item.action === "fail" || item.action === "terminal")
   const replayStepIds = !mustFailTurn

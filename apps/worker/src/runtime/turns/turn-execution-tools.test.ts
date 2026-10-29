@@ -41,7 +41,8 @@ describe("recoverPersistedToolCalls", () => {
     const childWaitClaimRecovery: ChildWaitClaimRecovery = {
       owner: { id: identity.taskId, userId: identity.userId, sessionId: identity.sessionId, turnId: identity.turnId,
         rootTaskId: identity.rootTaskId, ownerId: identity.ownerId, attemptCount: identity.attemptCount },
-      stepId: "continuation-step", sourceWaitCallId: "original-call", sourceInput: input,
+      stepId: "continuation-step", stepOrdinal: 1, stepStatus: "streaming", modelUsage: { inputTokens: 37, outputTokens: 13, estimatedCostUsd: 0.0042 },
+      sourceWaitCallId: "original-call", sourceInput: input,
       call: { id: "claimed-call", name: "wait_subagents", arguments: input },
       callItem: { id: "call-item", revision: 0, status: "started" }, callStartedEventId: "call-started-event",
       claimEventId: "claim-event", output,
@@ -81,7 +82,7 @@ describe("recoverPersistedToolCalls", () => {
     expect(creates).toHaveLength(1)
     expect(creates[0]).toMatchObject({ itemId: "task:child-1:item:tool-result:claimed-call:attempt:2", type: "tool_result" })
     expect(updates.map(update => update.itemId)).toEqual(["call-item", "task:child-1:item:tool-result:claimed-call:attempt:2"])
-    expect(events.map(event => event.type)).toEqual(["item.completed", "tool_call.completed", "item.started", "item.completed"])
+    expect(events.map(event => event.type)).toEqual(["item.completed", "tool_call.completed", "item.started", "item.completed", "step.completed"])
   })
 
   it("replays a safe pending call with its original id and step before returning model context", async () => {

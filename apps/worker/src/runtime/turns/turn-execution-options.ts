@@ -10,7 +10,7 @@ import type { RecoveredArchivedWaitControl } from "./turn-execution-wait.js"
 import type { ToolCallRecovery, TurnEngineToolCall, TurnEngineToolExecutor, TurnResumeState } from "./turn-engine-types.js"
 import type { NativeSemanticProgressMode } from "./native-semantic-rejection-ledger.js"
 import type { TurnExecutionIdentity, TurnExecutionContextBuilder, TurnExecutionStore, TurnExecutionLifecycle, TurnEngineCompletionGate } from "./turn-execution-types.js"
-import type { ChildWaitClaimRecovery } from "../subagents/child-durable-wait-replay.js"
+import type { ChildWaitClaimRecovery, ChildWaitOrphanRecovery } from "../subagents/child-durable-wait-replay.js"
 
 export type TurnExecutionOptions = {
   readonly identity: TurnExecutionIdentity
@@ -45,6 +45,7 @@ export type TurnExecutionOptions = {
   readonly childWaitCallStartKey?: (stepId: string, call: TurnEngineToolCall) => string | undefined
   readonly childWaitCallStarted?: (stepId: string, call: TurnEngineToolCall, eventId: string) => void
   readonly childWaitClaimRecovery?: ChildWaitClaimRecovery
+  readonly childWaitOrphanRecovery?: ChildWaitOrphanRecovery
   readonly lifecycle?: TurnExecutionLifecycle
   readonly signalError?: () => Error
   /** Allows a root or child adapter to classify a lost owner without coupling the loop to a lease type. */

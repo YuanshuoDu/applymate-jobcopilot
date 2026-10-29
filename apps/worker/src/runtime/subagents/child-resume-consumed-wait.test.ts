@@ -43,34 +43,50 @@ function fixture(options: { ids?: string[]; targetIds?: unknown; inputIds?: unkn
   }
   const targets = ids.map((id, index) => ({ id, parentTaskId: index === 0 ? options.targetParentId ?? child.id : child.id,
     rootTaskId: child.rootTaskId, sessionId: child.sessionId, turnId: child.turnId, userId: child.userId }))
+  const queries: string[] = []
   const client = { async query(sql: string) {
+    queries.push(sql)
     if (sql.includes("WITH latest_wait AS")) return { rows: [row], rowCount: 1 }
     if (sql.includes('task."id" = ANY($1::text[])')) return { rows: targets, rowCount: targets.length }
     throw new Error(`unexpected query: ${sql}`)
   } }
-  return { client, row }
+  return { client, row, queries }
 }
 
 function claimFixture(options: { orphan?: boolean; resultWithoutStart?: boolean } = {}) {
-  const stepId = "step-2", callId = "fresh-wait-call"
+  const stepId = `task:${child.id}:step:1:attempt:${child.attemptCount}`, callId = "fresh-wait-call"
+  const sourceStepId = `task:${child.id}:step:0:attempt:${child.attemptCount}`
   const callItemId = `task:${child.id}:item:tool-call:${callId}:attempt:${child.attemptCount}`
   const resultItemId = `task:${child.id}:item:tool-result:${callId}:attempt:${child.attemptCount}`
   const claimKey = `task:${child.id}:event:${childWaitClaimEventKey(child.attemptCount, stepId)}`
   const wait: DurableWaitResume = {
-    waitId: "wait-1", stepId: "step-1", attempt: child.attemptCount, ordinal: 0, toolCallId: "call-1", sourceItemId: "item-result-1",
+    waitId: "wait-1", stepId: sourceStepId, attempt: child.attemptCount, ordinal: 0, toolCallId: "call-1", sourceItemId: "item-result-1",
     input: { idempotencyKey: "wait-key", taskIds: [phoneId], mode: "any", timeoutMs: 5_000 },
     output: { waitId: "wait-1", status: "ready", taskIds: [phoneId], matchedTaskIds: [phoneId] },
     continuationStepId: stepId, continuationOrdinal: 1,
   }
   const callContent = { toolCallId: callId, toolName: "wait_subagents", toolVersion: "1", input: wait.input,
     ...(options.resultWithoutStart ? { status: "completed", errorCode: null } : {}) }
-  const itemStarted = { id: "call-item-started", sessionId: child.sessionId, turnId: child.turnId, taskId: child.id, actor: "subagent",
-    type: "item.started", itemId: callItemId, correlationId: stepId, causationId: null,
+  const modelStarted = { id: "model-started", sequence: "1", sessionId: child.sessionId, turnId: child.turnId, taskId: child.id, actor: "subagent",
+    type: "model.started", itemId: null, correlationId: stepId, causationId: null,
+    idempotencyKey: `task:${child.id}:event:model-started:${stepId}`, payload: { taskId: child.id, provider: "fixture", model: "fixture-model" } }
+  const modelCompleted = { id: "model-completed", sequence: "2", sessionId: child.sessionId, turnId: child.turnId, taskId: child.id, actor: "subagent",
+    type: "model.completed", itemId: null, correlationId: stepId, causationId: modelStarted.id,
+    idempotencyKey: `task:${child.id}:event:model-completed:${stepId}`,
+    payload: { taskId: child.id, provider: "fixture", model: "fixture-model", toolCallCount: 1 } }
+  const modelUsage = { id: "model-usage", sequence: "3", sessionId: child.sessionId, turnId: child.turnId, taskId: child.id, actor: "subagent",
+    type: "model.usage", itemId: null, correlationId: stepId, causationId: modelCompleted.id,
+    idempotencyKey: `task:${child.id}:event:model-usage:${stepId}`,
+    payload: { taskId: child.id, provider: "fixture", model: "fixture-model", usage: { inputTokens: 37, outputTokens: 13, estimatedCostUsd: 0.0042 } } }
+  const step = { id: stepId, status: "streaming", attempt: child.attemptCount, ordinal: 1,
+    inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }
+  const itemStarted = { id: "call-item-started", sequence: "4", sessionId: child.sessionId, turnId: child.turnId, taskId: child.id, actor: "subagent",
+    type: "item.started", itemId: callItemId, correlationId: stepId, causationId: modelUsage.id,
     idempotencyKey: `task:${child.id}:event:item-started:${callItemId}`, payload: { itemId: callItemId, type: "tool_call", phase: null } }
-  const claim = { id: "claim-event", sessionId: child.sessionId, turnId: child.turnId, taskId: child.id, actor: "subagent",
+  const claim = { id: "claim-event", sequence: "5", sessionId: child.sessionId, turnId: child.turnId, taskId: child.id, actor: "subagent",
     type: "tool_call.started", itemId: callItemId, correlationId: callId, causationId: itemStarted.id,
     idempotencyKey: claimKey, payload: { toolCallId: callId, toolName: "wait_subagents", taskId: child.id } }
-  const events: Row[] = [itemStarted, ...(!options.orphan ? [claim] : [])]
+  const events: Row[] = [modelStarted, modelCompleted, modelUsage, itemStarted, ...(!options.orphan ? [claim] : [])]
   const callRows: Row[] = [{ id: callItemId, status: options.resultWithoutStart ? "completed" : "started", revision: options.resultWithoutStart ? 1 : 0,
     content: callContent, stepId, attempt: child.attemptCount, ordinal: 1 }]
   const resultRows: Row[] = options.resultWithoutStart ? [{ id: resultItemId, status: "started", revision: 0, stepId,
@@ -86,12 +102,13 @@ function claimFixture(options: { orphan?: boolean; resultWithoutStart?: boolean 
       payload: { toolCallId: callId, toolName: "wait_subagents", status: "completed", errorCode: null, taskId: child.id } })
   }
   const client = { async query(sql: string) {
+    if (sql.includes('FROM "agent_steps" AS step WHERE step."id"')) return { rows: [step], rowCount: 1 }
     if (sql.includes('JOIN "agent_steps" AS step')) return { rows: callRows, rowCount: callRows.length }
     if (sql.includes("item.\"type\" = 'tool_result'")) return { rows: resultRows, rowCount: resultRows.length }
     if (sql.includes('FROM "agent_events" AS event')) return { rows: events, rowCount: events.length }
     throw new Error(`unexpected query: ${sql}`)
   } }
-  return { client, wait, callItemId, claimKey, events, resultItemId }
+  return { client, wait, callItemId, claimKey, events, resultItemId, stepId }
 }
 
 describe("consumed child wait resume", () => {
@@ -112,6 +129,17 @@ describe("consumed child wait resume", () => {
 
     expect(resumed?.input).toMatchObject({ taskIds: ["child-2", phoneId] })
     expect(resumed?.output).toMatchObject({ taskIds: ids, tasks: [{ taskId: phoneId }, { taskId: "child-2" }] })
+  })
+
+  it("retains the consumed wait anchor after later same-attempt steps exist", async () => {
+    const fake = fixture()
+    fake.row.continuationLatestOrdinal = 4
+    await expect(loadChildConsumedWaitResume(fake.client as never, child)).resolves.toMatchObject({
+      waitId: "wait-1", continuationStepId: "step-2", continuationOrdinal: 1,
+    })
+    const lineage = fake.queries[0] ?? ""
+    expect(lineage).not.toContain("continuationLatestOrdinal")
+    expect(lineage).toContain('next."ordinal" = (SELECT MIN(later."ordinal")')
   })
 
   it("recovers an exact consumed wait when its receipt is missing", async () => {
@@ -206,16 +234,18 @@ describe("claimed child wait recovery loader", () => {
     await expect(loadChildWaitCallRecovery(fake.client as never, child, fake.wait)).resolves.toMatchObject({
       claim: {
       owner: { id: child.id, ownerId: child.ownerId, attemptCount: child.attemptCount },
-      stepId: "step-2", sourceWaitCallId: "call-1", call: { id: "fresh-wait-call", name: "wait_subagents" },
+      stepId: fake.stepId, sourceWaitCallId: "call-1", call: { id: "fresh-wait-call", name: "wait_subagents" },
       callItem: { id: fake.callItemId, status: "started", revision: 0 }, claimEventId: "claim-event", output: fake.wait.output,
       }, orphanCallIds: [],
     })
-    expect(fake.events[1]).toMatchObject({ idempotencyKey: fake.claimKey, causationId: fake.events[0]!.id })
+    expect(fake.events[4]).toMatchObject({ idempotencyKey: fake.claimKey, causationId: fake.events[3]!.id })
   })
 
   it("recognizes one complete preclaim orphan without treating it as a claim", async () => {
     const fake = claimFixture({ orphan: true })
-    await expect(loadChildWaitCallRecovery(fake.client as never, child, fake.wait)).resolves.toEqual({ orphanCallIds: ["fresh-wait-call"] })
+    await expect(loadChildWaitCallRecovery(fake.client as never, child, fake.wait)).resolves.toMatchObject({
+      orphanCallIds: ["fresh-wait-call"], orphan: { call: { id: "fresh-wait-call", name: "wait_subagents" } },
+    })
   })
 
   it("rejects an orphan with a result item", async () => {
