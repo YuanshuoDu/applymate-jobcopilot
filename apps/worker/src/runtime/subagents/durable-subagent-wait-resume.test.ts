@@ -160,6 +160,19 @@ describe("durable child wait resume", () => {
     expect(fake.calls.some(call => call.sql.includes('UPDATE "agent_wait_conditions"'))).toBe(false)
   })
 
+  it("returns the validated streaming continuation identity while leaving source-only waits unannotated", async () => {
+    const continuation = fixture({ laterOrdinals: [39], sourceOrdinal: 18 })
+    await expect(loadDurableSubagentWaitResume(continuation.pool as never, lease, now)).resolves.toMatchObject({
+      continuationStepId: "step-next-0", continuationOrdinal: 39,
+    })
+
+    const sourceOnly = fixture({ nextStep: false, sourceOrdinal: 18 })
+    const resumed = await loadDurableSubagentWaitResume(sourceOnly.pool as never, lease, now)
+    expect(resumed).toBeDefined()
+    expect(resumed).not.toHaveProperty("continuationStepId")
+    expect(resumed).not.toHaveProperty("continuationOrdinal")
+  })
+
   it("leaves consumed-wait replay to the child continuation loader", async () => {
     const fake = fixture({ consumed: true })
     await expect(loadDurableSubagentWaitResume(fake.pool as never, lease, now)).resolves.toBeUndefined()

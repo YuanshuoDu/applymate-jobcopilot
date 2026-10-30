@@ -7,6 +7,8 @@ import {
 } from '@jobcopilot/agent-protocol'
 import { redactSensitiveText, redactSensitiveValue } from '@jobcopilot/shared'
 import { projectFinalAnswerContent } from './final-answer-evidence-projection'
+import { isCanonicalTaskGraphSourceManifest } from './final-task-graph-source-detail'
+import { parseFinalTaskGraphSourceManifest } from './final-task-graph-source-manifest'
 
 const TASK_GRAPH_PROPOSAL_KEYS = ['kind', 'fingerprint', 'receipt', 'revision', 'item'] as const
 const TASK_GRAPH_PROPOSAL_CONTENT_KEYS = [...TASK_GRAPH_PROPOSAL_KEYS, 'content'] as const
@@ -67,10 +69,24 @@ export function redactStreamEventPayload(eventType: string, payload: unknown, id
 
 function projectCompletedFinalContent(eventType: string, payload: unknown, identity: StreamItemIdentity): unknown | null {
   if (eventType !== 'item.completed' || !identity.itemId || !isExactRecord(payload, ['itemId', 'status', 'content'])
-    || payload.itemId !== identity.itemId || payload.status !== 'completed'
-    || !isExactRecord(payload.content, ['text', 'final'])) return null
-  const content = projectFinalAnswerContent(payload.content)
-  return content ? { itemId: identity.itemId, status: 'completed', content } : null
+    || payload.itemId !== identity.itemId || payload.status !== 'completed' || !isRecord(payload.content)) return null
+  const rawContent = payload.content
+  const text = ownDataValue(rawContent, 'text'), final = ownDataValue(rawContent, 'final')
+  const content = projectFinalAnswerContent({ text, final })
+  if (!content) {
+    if (!Object.hasOwn(rawContent, 'taskGraphSources')) return null
+    return { itemId: identity.itemId, status: 'completed', content: { text: typeof text === 'string' ? redactSensitiveText(text) : '' } }
+  }
+  const manifest = parseFinalTaskGraphSourceManifest(ownDataValue(rawContent, 'taskGraphSources'))
+  const taskGraphSources = manifest && isCanonicalTaskGraphSourceManifest(identity.itemId, manifest) ? manifest : undefined
+  return { itemId: identity.itemId, status: 'completed', content: { ...content, ...(taskGraphSources ? { taskGraphSources } : {}) } }
+}
+
+function ownDataValue(value: Record<string, unknown>, key: string): unknown {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    return descriptor && Object.hasOwn(descriptor, 'value') ? descriptor.value : undefined
+  } catch { return undefined }
 }
 
 function taskGraphSnapshotFromEvent(eventType: string, payload: unknown, identity: StreamItemIdentity): TaskGraphSnapshot | null {

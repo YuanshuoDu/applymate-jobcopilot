@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto"
 import type pg from "pg"
 
-import { dateValue, DurableSubagentWaitError, object, parseIds, projectDurableSubagentWait, safeSubagentWaitJson } from "./durable-subagent-wait-store.js"
+import { dateValue, DurableSubagentWaitError, object, projectDurableSubagentWait, safeSubagentWaitJson } from "./durable-subagent-wait-store.js"
+import { markCanonicalSubagentWaitTargetIds } from "./subagent-wait-structural-ids.js"
 import { persistGraphTransition, prepareGraphTransition } from "./task-graph-pg-lifecycle.js"
 import { parseSubagentJobPayload } from "./types.js"
 import { taskGraphDeadlineLive } from "./pg-store-claim.js"
@@ -42,6 +43,19 @@ function exactTargets(ids: readonly string[], rows: readonly Row[], parentTaskId
   return ids.length > 0 && ids.length <= MAX_TARGETS && new Set(ids).size === ids.length
     && !ids.includes(parentTaskId) && rows.length === ids.length
     && rows.every(row => ids.includes(String(row.id)) && String(row.parentTaskId) === parentTaskId)
+}
+
+function strictTargetIds(value: unknown): string[] | undefined {
+  let parsed = value
+  if (typeof parsed === "string") { try { parsed = JSON.parse(parsed) as unknown } catch { return undefined } }
+  if (!Array.isArray(parsed) || parsed.length < 1 || parsed.length > MAX_TARGETS
+    || !parsed.every(id => typeof id === "string" && id.length > 0 && id.length <= 256 && id.trim() === id)
+    || new Set(parsed).size !== parsed.length) return undefined
+  return parsed as string[]
+}
+
+function sameIdsInOrder(actual: readonly string[], expected: readonly string[]): boolean {
+  return actual.length === expected.length && actual.every((id, index) => id === expected[index])
 }
 
 async function dispatch(client: Queryable, wait: Row, ownerId: string): Promise<void> {
@@ -87,8 +101,8 @@ async function fenceBlockedDispatch(client: Queryable, wait: Row): Promise<void>
 }
 
 async function reconcileOne(client: Queryable, wait: Row, now: Date, ownerId: string): Promise<"resolved" | "woken" | "waiting" | "ignored"> {
-  const parentTaskId = String(wait.parentTaskId); const ids = parseIds(wait.targetTaskIds)
-  if (!(wait.mode === "any" || wait.mode === "all") || !ids.length || ids.length > MAX_TARGETS || new Set(ids).size !== ids.length || ids.includes(parentTaskId)) return "ignored"
+  const parentTaskId = String(wait.parentTaskId); const ids = strictTargetIds(wait.targetTaskIds)
+  if (!(wait.mode === "any" || wait.mode === "all") || !ids || ids.includes(parentTaskId)) return "ignored"
   const targets = (await client.query<Row>(`SELECT task."id", task."parentTaskId", task."rootTaskId", task."turnId", task."sessionId", task."status", task."role", task."result", task."failureReason"
     FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
     WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4
@@ -99,12 +113,16 @@ async function reconcileOne(client: Queryable, wait: Row, now: Date, ownerId: st
   const deadline = dateValue(wait.deadlineAt, "deadlineAt")
   const status = now >= deadline ? "timed_out" : wait.mode === "any" && matched.length > 0 || wait.mode === "all" && matched.length === ids.length ? "ready" : "waiting"
   if (status === "waiting") return "waiting"
+  const existingResult = object(wait.result); const request = object(existingResult.request)
+  const requestIds = strictTargetIds(request.targetTaskIds)
+  if (!requestIds || !sameIdsInOrder(requestIds, ids)) return "ignored"
+  const safeRequest = { ...request, targetTaskIds: requestIds }
+  const outcome = projectDurableSubagentWait({ ...wait, targetTaskIds: ids, deadlineAt: deadline }, targets, status, matched)
+  if (!markCanonicalSubagentWaitTargetIds(safeRequest, outcome, ids)) return "ignored"
   const graphQueued = await prepareGraphTransition(client, {
     taskId: parentTaskId, sessionId: String(wait.sessionId), type: "task.queued", attemptCount: Number(wait.parentAttempt),
   })
-  const existingResult = object(wait.result); const request = object(existingResult.request)
-  const outcome = projectDurableSubagentWait({ ...wait, targetTaskIds: ids, deadlineAt: deadline }, targets, status, matched)
-  const result = safeSubagentWaitJson({ ...existingResult, request: Object.keys(request).length ? request : { targetTaskIds: ids, mode: wait.mode }, outcome }, 16_384)
+  const result = safeSubagentWaitJson({ ...existingResult, request: safeRequest, outcome }, 16_384)
   const changed = await client.query(`UPDATE "agent_wait_conditions" SET "status" = $1, "matchedTaskIds" = $2::jsonb,
       "result" = $3::jsonb, "resolvedAt" = COALESCE("resolvedAt", $4), "updatedAt" = $4
     WHERE "id" = $5 AND "userId" = $6 AND "sessionId" = $7 AND "parentTaskId" = $8 AND "status" = 'waiting'

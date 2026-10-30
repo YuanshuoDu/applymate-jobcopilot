@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest"
+import { redactSensitiveText } from "@jobcopilot/shared"
 import { executionKey } from "../turns/turn-execution-types.js"
 import type pg from "pg"
 import { buildCognitiveActionAgenda } from "../turns/cognitive-action-agenda.js"
@@ -34,19 +35,23 @@ function agenda() {
   return receipt
 }
 function input(id: string, sequence: string, status: string, consumer: string | null) {
-  return { id, clientMessageId: `${id}-message`, delivery: "steer", status, acceptedSequence: sequence,
+  return { id, clientMessageId: `${id}-message`, content: [{ type: "text", text: id === "original-input" ? "Find jobs" : "Change the target to Dublin roles." }],
+    delivery: "steer", status, acceptedSequence: sequence,
     consumedByStepId: consumer, consumedAt: consumer ? date : null, cancelledAt: null }
 }
 function accepted(row: ReturnType<typeof input>) {
+  const disposition = row.delivery === "follow_up" ? "started" : "steered"
   return { ...row, acceptedType: "input.accepted", acceptedActor: "user", acceptedTaskId: null, acceptedCorrelationId: scope.turnId,
-    acceptedItemId: `${row.id}-item`, acceptedItemType: "user_message", acceptedItemTaskId: null, acceptedItemStatus: "completed",
-    acceptedItemContent: { parts: [{ type: "text", text: "steer" }], clientMessageId: row.clientMessageId, source: "user", disposition: "steered" },
+    acceptedEventCausationId: null, acceptedItemId: `${row.id}-item`, acceptedItemType: "user_message", acceptedItemStepId: null,
+    acceptedItemTaskId: null, acceptedItemStatus: "completed",
+    acceptedItemContent: { parts: row.content, clientMessageId: row.clientMessageId, source: "user", disposition },
     acceptedEventSequence: row.acceptedSequence,
-    acceptedPayload: { inputId: row.id, clientMessageId: row.clientMessageId, delivery: row.delivery, source: "user", disposition: "steered" } }
+    acceptedPayload: { inputId: row.id, clientMessageId: redactSensitiveText(row.clientMessageId), delivery: row.delivery, source: "user", disposition } }
 }
 function clientFixture(options: { pending?: boolean; unconsumed?: boolean; decision?: "keep" | "revise"; replaceUnstartedNodeKey?: string; replaceBranch?: TaskGraphBranchReplacement } = {}) {
   const original = input("original-input", "1", "consumed", "origin-step")
   original.clientMessageId = "root-client-message"
+  original.delivery = "follow_up"
   const steer = input("steer-1", "10", options.unconsumed ? "accepted" : "consumed", options.unconsumed ? null : "origin-step")
   const originStep = { id: "origin-step", taskId: scope.rootTaskId, ordinal: 0, attempt: 1, status: "completed", inputThroughSequence: "10", consumedInputIds: ["original-input", "steer-1"] }
   const decisionStep = { id: scope.stepId, taskId: scope.rootTaskId, ordinal: 2, attempt: 1, status: "streaming", inputThroughSequence: "20", consumedInputIds: [] }
@@ -83,7 +88,7 @@ function clientFixture(options: { pending?: boolean; unconsumed?: boolean; decis
     }
     if (sql.includes('FROM "agent_inputs" AS input')) {
       const ids = values?.[3] as string[]
-      const rows = options.pending === false || !ids.includes(steer.id) ? [] : [accepted(steer)]
+      const rows = [original, ...(options.pending === false ? [] : [steer])].filter(row => ids.includes(row.id)).map(accepted)
       return { rows, rowCount: rows.length }
     }
     if (sql.includes('FROM "agent_steps"') && sql.includes('ANY($4::text[])')) {

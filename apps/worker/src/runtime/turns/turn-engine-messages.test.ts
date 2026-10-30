@@ -2,10 +2,12 @@ import { describe, expect, it } from "vitest"
 
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 import { buildModelRequest, contextToModelMessages } from "./turn-engine-messages.js"
+import { appendCanonicalRootTaskHistoryOutcomes } from "../canonical-turn-root-task-history.js"
 import { COGNITIVE_ACTION_AGENDA_SCHEMA_VERSION } from "./cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, type CognitiveAgendaReceiptScope } from "./cognitive-agenda-receipt.js"
 import { mergeTaskGraphCurrentObservation } from "../canonical-turn-task-graph-context.js"
 import type { JsonValue, StepContext, StepContextSnapshot } from "../context/step-context-builder.js"
+import type { ValidatedRootTaskHistoryOutcome } from "../context/root-task-history.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { ROOT_TASK_VERIFICATION_REQUIREMENTS_OBSERVATION_ID } from "../context/root-task-goal-criteria-context.js"
 import type { TaskGraphCurrentNode } from "../subagents/task-graph-command-port.js"
@@ -539,6 +541,61 @@ describe("TurnEngine model message mapping", () => {
     })
     expect(JSON.stringify(withoutHistory.messages)).not.toContain("Earlier same-session failures")
     expect(withoutHistory.messages).toEqual(contextToModelMessages(context()))
+  })
+
+  it("carries a canonical mixed-session projection through the production model-message builder as advisory only", () => {
+    const sourceOutcome = (turnId: string, sourceSessionDiffers: boolean, sequence: bigint): ValidatedRootTaskHistoryOutcome => ({
+      sourceTurnId: turnId, sourceRootTaskId: `PRIVATE_ROOT_${turnId}`, terminalSequence: sequence,
+      terminalXid8: (sequence + 1_000n).toString(), terminalWitnessEventId: `PRIVATE_WITNESS_${turnId}`, sourceSessionDiffers,
+      sourceNodeOrdinals: [1], nodeLessons: [{ ordinalScope: "source_graph_local", advisoryOnly: true,
+        notCurrentEvidence: true, nodeOrdinal: 1,
+        criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met" }] }],
+      taskGraph: { revision: 1, nodes: [{ key: `PRIVATE_NODE_${turnId}`, templateId: "scout", goal: "PRIVATE_OLD_GOAL",
+        successCriteria: [], dependsOn: [], taskId: `PRIVATE_TASK_${turnId}`, status: "failed", readiness: "terminal",
+        resultSummary: "PRIVATE_OLD_OUTPUT", failureReason: "child_turn_missing" }] },
+    })
+    const same = sourceOutcome("same-session", false, 8n)
+    const cross = sourceOutcome("cross-session", true, 9n)
+    const snapshot: StepContextSnapshot = { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [],
+      taskGraphRevision: GRAPH_REVISION }
+    const projected = appendCanonicalRootTaskHistoryOutcomes({ snapshot, sameSessionOutcomes: [same], crossSessionOutcomes: [cross],
+      crossSessionRootTaskHistoryEnabled: true })
+    const history = projected.toolObservations.find(item => item.id === "root-task-history")
+    expect(history?.content).toMatchObject({ historical: true, advisoryOnly: true, notCurrentEvidence: true })
+    const serializedProjection = JSON.stringify(history)
+    for (const privateValue of ["PRIVATE_ROOT_", "PRIVATE_WITNESS_", "PRIVATE_NODE_", "PRIVATE_TASK_", "PRIVATE_OLD_"]) {
+      expect(serializedProjection).not.toContain(privateValue)
+    }
+    const historyBlock = { id: "observation:root-task-history", layer: "tool_observation" as const, role: "data" as const,
+      trust: "external_untrusted" as const, source: "tool_or_subagent", content: history!.content as JsonValue }
+    const current = taskGraphContext([failedTaskGraphNode("child_turn_missing", "current-node")])
+    const tools = [{ name: "agent.list", version: "1" }, { name: "agent.plan", version: "1" }]
+    const request = requestFor({ ...current, taskGraphRevision: GRAPH_REVISION, blocks: [...current.blocks, historyBlock] }, tools,
+      { rootTaskId: "root-task-private" })
+    const system = requestSystemText(request)
+    const user = request.messages.filter(message => message.role === "user").flatMap(message => message.content)
+      .flatMap(part => part.type === "text" ? [part.text] : []).join("\n")
+
+    expect(system).toContain("Some or all entries in this history aggregate may be from older sessions")
+    expect(system).toContain("does not identify locality for each entry")
+    expect(system).toContain("never reuse historical task IDs, ordinals, plan state, counts, or outputs")
+    expect(system).toContain("Only the current owner-scoped TaskGraph establishes current plans, and only verified current result pages establish current evidence")
+    expect(system).toContain("Current verification and completion gates remain authoritative")
+    expect(system).not.toContain("Earlier same-session failures, repairs, and reported outputs are hypotheses only")
+    expect(system).not.toContain("PRIVATE_ROOT_")
+    expect(system).not.toContain("PRIVATE_TASK_")
+    expect(user).toContain("UNTRUSTED_DATA source=tool_or_subagent")
+    expect(user).toContain('"kind":"root_task_history"')
+    expect(user).toContain('"historical":true')
+    expect(request.tools).toEqual(tools)
+
+    const localProjection = appendCanonicalRootTaskHistoryOutcomes({ snapshot, sameSessionOutcomes: [same] })
+    const localHistory = localProjection.toolObservations.find(item => item.id === "root-task-history")
+    const localBlock = { ...historyBlock, content: localHistory!.content as JsonValue }
+    const localRequest = requestFor({ ...current, taskGraphRevision: GRAPH_REVISION, blocks: [...current.blocks, localBlock] }, tools,
+      { rootTaskId: "root-task-private" })
+    expect(requestSystemText(localRequest)).toContain("Earlier same-session failures, repairs, and reported outputs are hypotheses only")
+    expect(requestSystemText(localRequest)).not.toContain("Some or all entries in this history aggregate may be from older sessions")
   })
 
   it("keeps passed-check history untrusted and adds only fixed reassessment guidance to the actual Root request", () => {

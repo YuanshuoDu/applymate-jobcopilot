@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import type { PoolClient } from "pg"
+import { redactSensitiveText } from "@jobcopilot/shared"
 import { digestNativeVerificationValue } from "./subagents/native-verification-contract.js"
 import type { NativeVerificationEnsureResult, NativeVerificationPort, NativeVerificationRootGoalWitness } from "./subagents/native-verification-port.js"
 import type { TaskGraphExecutionScope, TaskGraphReadScope } from "./subagents/task-graph-command-port.js"
@@ -20,6 +21,8 @@ import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./subagents/task-graph-final-s
 import { reduceTaskGraphFinalSummary } from "./subagents/task-graph-final-summary.js"
 import { ROLE_RESULT_SCHEMA } from "./subagents/role-results.js"
 import { formatTaskGraphFinalSummary } from "./subagents/task-graph-final-summary-format.js"
+import { buildTaskGraphFinalSourceManifest } from "./subagents/task-graph-final-source-manifest.js"
+import { taskGraphItemId } from "./subagents/task-graph-snapshot.js"
 
 const candidate = "A current root answer with verified evidence."
 const owner = { kind: "turn" as const, taskId: "root-1", rootTaskId: "root-1", userId: "user-1", sessionId: "session-1",
@@ -39,7 +42,10 @@ const terminalInput = { stepId: "step-1", finalContent: { text: candidate }, res
 
 function graphSummaryBinding(graphRevision: number, jobId: string) {
   return {
+    rootTaskId: "root-1",
+    graphItemId: taskGraphItemId("root-1"),
     graphRevision,
+    members: [{ nodeIndex: 0, nodeKey: "scout-node", templateId: "research", taskId: "task-scout", role: "scout", taskType: "research", taskStatus: "completed" as const, kind: "business" as const }],
     summary: reduceTaskGraphFinalSummary({ graphRevision, nodes: [{
       kind: "business", taskId: "task-scout", role: "scout", taskStatus: "completed",
       structuredResult: { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
@@ -49,11 +55,21 @@ function graphSummaryBinding(graphRevision: number, jobId: string) {
   }
 }
 
-function finalSummaryTerminal(binding: ReturnType<typeof graphSummaryBinding>) {
+type FinalSummaryTerminal = Readonly<{
+  stepId: string
+  finalItemId: string
+  finalContent: { text: string; final: { schemaVersion: string; response: string; summary: string }; taskGraphSources: NonNullable<ReturnType<typeof buildTaskGraphFinalSourceManifest>> }
+  response: string
+  readonly [TASK_GRAPH_FINAL_SUMMARY_BINDING]: ReturnType<typeof graphSummaryBinding>
+}>
+function finalSummaryTerminal(binding: ReturnType<typeof graphSummaryBinding>): FinalSummaryTerminal {
   const summary = formatTaskGraphFinalSummary(binding.summary)
   const final = { schemaVersion: "agent-harness.v2.final", response: candidate, summary }
-  return { stepId: "step-1", finalContent: { text: candidate, final }, response: JSON.stringify(final),
-    [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding } as unknown as Parameters<TurnEngineTerminalGuard>[1]
+  const finalItemId = "final-item"
+  const taskGraphSources = buildTaskGraphFinalSourceManifest(binding, finalItemId)
+  if (!taskGraphSources) throw new Error("Expected a public source manifest")
+  return { stepId: "step-1", finalItemId, finalContent: { text: candidate, final, taskGraphSources }, response: JSON.stringify(final),
+    [TASK_GRAPH_FINAL_SUMMARY_BINDING]: binding }
 }
 
 function coordination() {
@@ -84,6 +100,20 @@ function configureLegacyProgress(runtime: ReturnType<typeof createCanonicalNativ
 }
 
 function steeringLedgerPool(pendingSteer = false, planningRoot = true): pg.Pool {
+  const inputs = [
+    { id: "root-input", clientMessageId: "original-message", delivery: "follow_up", status: "consumed", content: [{ type: "text", text: "Find jobs" }],
+      acceptedSequence: "1", consumedByStepId: "step-0", consumedAt: new Date(), cancelledAt: null },
+    { id: "steer-1", clientMessageId: "steer-message", delivery: "steer", status: "consumed", content: [{ type: "text", text: "Change the target to Dublin roles." }],
+      acceptedSequence: "2", consumedByStepId: "step-0", consumedAt: new Date(), cancelledAt: null },
+  ]
+  const accepted = (input: typeof inputs[number]) => {
+    const disposition = input.delivery === "follow_up" ? "started" : "steered"
+    return { ...input, acceptedType: "input.accepted", acceptedActor: "user", acceptedTaskId: null, acceptedCorrelationId: scope.turnId,
+      acceptedEventCausationId: null, acceptedItemId: `${input.id}-item`, acceptedEventSequence: input.acceptedSequence,
+      acceptedPayload: { inputId: input.id, clientMessageId: redactSensitiveText(input.clientMessageId), delivery: input.delivery, disposition, source: "user" },
+      acceptedItemType: "user_message", acceptedItemStepId: null, acceptedItemTaskId: null, acceptedItemStatus: "completed",
+      acceptedItemContent: { clientMessageId: input.clientMessageId, disposition, parts: input.content, source: "user" } }
+  }
   const step = (stepId: string, ordinal: number, status: string, consumedInputIds: string[]) => ({
     id: stepId, taskId: "root-1", ordinal, attempt: ordinal === 0 ? 1 : 3, status,
     inputThroughSequence: pendingSteer ? "2" : "0", consumedInputIds,
@@ -110,29 +140,19 @@ function steeringLedgerPool(pendingSteer = false, planningRoot = true): pg.Pool 
     if (sql.includes('SELECT "id" FROM "agent_steps"')) return { rows: [{ id: params[0] }], rowCount: 1 }
     if (sql.includes('SELECT "id" FROM "agent_steps" WHERE "id" = $1 AND "turnId"')) return { rows: [{ id: params[0] }], rowCount: 1 }
     if (sql.includes('SELECT "id", "clientMessageId", "delivery"') && sql.includes('FROM "agent_inputs" WHERE') && sql.includes('"clientMessageId" = $4')) {
-      const rows = pendingSteer && params[3] === "original-message" ? [{ id: "root-input", clientMessageId: "original-message", delivery: "follow_up", status: "consumed",
-        acceptedSequence: "1", consumedByStepId: "step-0", consumedAt: new Date(), cancelledAt: null }] : []
+      const rows = pendingSteer && params[3] === "original-message" ? [inputs[0]] : []
       return { rows, rowCount: rows.length }
     }
     if (sql.includes('FROM "agent_inputs"') && sql.includes('ORDER BY "acceptedSequence", "id"')) {
-      const inputs = pendingSteer ? [
-        { id: "root-input", clientMessageId: "original-message", delivery: "follow_up", status: "consumed", acceptedSequence: "1",
-          consumedByStepId: "step-0", consumedAt: new Date(), cancelledAt: null },
-        { id: "steer-1", clientMessageId: "steer-message", delivery: "steer", status: "consumed", acceptedSequence: "2",
-          consumedByStepId: "step-0", consumedAt: new Date(), cancelledAt: null },
-      ] : []
+      const pageInputs = pendingSteer ? inputs : []
       const after = params[3] == null ? null : BigInt(String(params[3])), afterId = String(params[4] ?? "")
-      const rows = inputs.filter(row => after === null || BigInt(row.acceptedSequence) > after
+      const rows = pageInputs.filter(row => after === null || BigInt(row.acceptedSequence) > after
         || BigInt(row.acceptedSequence) === after && row.id > afterId).slice(0, 64)
       return { rows, rowCount: rows.length }
     }
     if (sql.includes('SELECT input."id"') && sql.includes('LEFT JOIN "agent_events"')) {
-      const event = { id: "steer-1", clientMessageId: "steer-message", delivery: "steer", status: "consumed", acceptedSequence: "2", consumedByStepId: "step-0", consumedAt: new Date(), cancelledAt: null,
-        acceptedType: "input.accepted", acceptedActor: "user", acceptedTaskId: null, acceptedCorrelationId: scope.turnId, acceptedItemId: "accepted-item", acceptedEventSequence: "2",
-        acceptedPayload: { clientMessageId: "steer-message", delivery: "steer", disposition: "accepted", inputId: "steer-1", source: "user" },
-        acceptedItemType: "user_message", acceptedItemTaskId: null, acceptedItemStatus: "completed",
-        acceptedItemContent: { clientMessageId: "steer-message", disposition: "accepted", parts: [{ type: "text", text: "Change the target to Dublin roles." }], source: "user" } }
-      const rows = pendingSteer ? [event] : []
+      const ids = params[3] as string[]
+      const rows = (pendingSteer ? inputs : []).filter(input => ids.includes(input.id)).map(accepted)
       return { rows, rowCount: rows.length }
     }
     if (sql.includes('SELECT "id", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds"')
@@ -733,7 +753,7 @@ describe("canonical native verification runtime composition", () => {
     const terminal = finalSummaryTerminal(expected)
 
     const staleBindings: ReadonlyArray<{
-      terminal: Parameters<TurnEngineTerminalGuard>[1]
+      terminal: unknown
       current?: typeof expected
     }> = [
       { terminal, current: sameCountChangedFacts },
@@ -752,7 +772,7 @@ describe("canonical native verification runtime composition", () => {
         finalizeSelectedJob,
       })
       if (!guard) throw new Error("terminal guard was not enabled")
-      await expect(guard(client, stale.terminal)).resolves.toMatchObject({ ok: false, blocker: "task_graph_verification_unverified" })
+      await expect(guard(client, stale.terminal as unknown as Parameters<TurnEngineTerminalGuard>[1])).resolves.toMatchObject({ ok: false, blocker: "task_graph_verification_unverified" })
       expect(finalizeSelectedJob).not.toHaveBeenCalled()
     }
 
@@ -764,7 +784,7 @@ describe("canonical native verification runtime composition", () => {
       finalizeSelectedJob,
     })
     if (!matchingGuard) throw new Error("terminal guard was not enabled")
-    await expect(matchingGuard(client, terminal)).resolves.toEqual({ ok: true })
+    await expect(matchingGuard(client, terminal as unknown as Parameters<TurnEngineTerminalGuard>[1])).resolves.toEqual({ ok: true })
     expect(finalizeSelectedJob).toHaveBeenCalledOnce()
   })
 
@@ -772,9 +792,16 @@ describe("canonical native verification runtime composition", () => {
     const client = { query: vi.fn() } as unknown as PoolClient
     const binding = graphSummaryBinding(1, "job-1")
     const terminal = finalSummaryTerminal(binding)
+    const terminalContent = terminal.finalContent
     const malformedCopies = [
       { ...terminal, finalContent: { text: candidate, final: { response: candidate, summary: "changed" } } },
       { ...terminal, response: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: candidate, summary: "changed" }) },
+      { ...terminal, finalContent: { ...terminalContent, taskGraphSources: { schemaVersion: "agent-harness.v2.task-graph-sources.v1", graphRevision: 1, sources: [] } } },
+      { ...terminal, finalItemId: "different-final-item" },
+      { ...terminal, finalContent: { ...terminalContent, final: { ...terminalContent.final, taskGraphSources: terminalContent.taskGraphSources } } },
+      { ...terminal, response: JSON.stringify({ ...JSON.parse(terminal.response), taskGraphSources: terminal.finalContent.taskGraphSources }) },
+      { ...terminal, finalContent: { ...terminalContent, final: { ...terminalContent.final, answerEvidence: { taskGraphSources: terminalContent.taskGraphSources } } } },
+      { ...terminal, response: JSON.stringify({ ...JSON.parse(terminal.response), answerEvidence: { taskGraphSources: terminalContent.taskGraphSources } }) },
     ]
     const guard = createCanonicalTurnTerminalGuard({
       enabled: true,
@@ -784,8 +811,22 @@ describe("canonical native verification runtime composition", () => {
     if (!guard) throw new Error("terminal guard was not enabled")
 
     for (const malformed of malformedCopies) {
-      await expect(guard(client, malformed)).resolves.toMatchObject({ ok: false, blocker: "task_graph_verification_unverified" })
+      await expect(guard(client, malformed as unknown as Parameters<TurnEngineTerminalGuard>[1])).resolves.toMatchObject({ ok: false, blocker: "task_graph_verification_unverified" })
     }
+  })
+
+  it("rejects an injected source sidecar when the current gate has no graph binding", async () => {
+    const client = { query: vi.fn() } as unknown as PoolClient
+    const guard = createCanonicalTurnTerminalGuard({
+      enabled: true,
+      nativeVerification: { checkTerminal: vi.fn(async () => ({ nativeVerificationPassed: true })) },
+      checkRootGraph: vi.fn(async () => ({ ok: true as const })),
+    })
+    if (!guard) throw new Error("terminal guard was not enabled")
+    const injected = { ...terminalInput, finalItemId: "final-item", response: JSON.stringify({ response: candidate }),
+      finalContent: { text: candidate, final: { response: candidate }, taskGraphSources: { schemaVersion: "agent-harness.v2.task-graph-sources.v1", graphRevision: 1, sources: [] } } }
+
+    await expect(guard(client, injected)).resolves.toMatchObject({ ok: false, blocker: "task_graph_verification_unverified" })
   })
 
   it("keeps selected-job finalization authoritative after native and root proof", async () => {

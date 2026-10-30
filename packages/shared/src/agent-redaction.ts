@@ -1,5 +1,17 @@
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
-import { knownAgentEventPayloadFields, type AgentEventRoutingContext } from "./agent-event-routing"
+import type { AgentEventRoutingContext } from "./agent-event-routing"
+import {
+  hasExactRootAcceptedEnvelope,
+  isLegacyApprovalReference as isLegacyApprovalReferenceWithGuards,
+  legacyApprovalClientReceipt as legacyApprovalClientReceiptWithGuards,
+  validFollowUpPayload as validFollowUpPayloadWithGuards,
+  validLegacyApprovalRequested as validLegacyApprovalRequestedWithGuards,
+  validLegacyApprovalResponse as validLegacyApprovalResponseWithGuards,
+  validQuestionSourceEnvelope as validQuestionSourceEnvelopeWithGuards,
+  validStoredApprovalRequested as validStoredApprovalRequestedWithGuards,
+  validatedPayloadFields as validatedPayloadFieldsWithGuards,
+  type AgentEventPayloadGuards,
+} from "./agent-redaction-event-payloads"
 export type { AgentEventRoutingContext } from "./agent-event-routing"
 const SENSITIVE_KEY = /(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|cookie|password|secret|private[_-]?key|credential|token|nonce|email|phone|address|linkedin|github|resume|cv|raw[_-]?(?:content|text|data)|content|value|question|answer|draft|sensitive|confirmed[_-]?answers|\bname\b)/i
 const SENSITIVE_TOKEN = /\bBearer\s+[a-z0-9._~+/=-]{8,}/gi
@@ -25,8 +37,7 @@ const CUID_ID = /^c[a-z0-9]{23,31}$/i
 const PHONE_SHAPED_UNDERSCORE_ID_COMPONENT = /_(\+?[\d\s().-]*\d)(?=$|[_:.-])/g
 const SECRET_ID = /(?:^|[:._-])(?:bearer\b|sk[-_]|xox[baprs]-|gh[pousr]_|github_pat_|ghs_|glpat-|AIza|ya29\.|secret[_:-]|password[_:-]|api[_-]?key[_:-]|token[_:-])|(?:password|secret|token|api[_-]?key)=/i
 const STABLE_ID_COMPONENT = /(^|[:._-])([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{32,64})(?=$|[:._-])/gi
-type RoutingTuple = AgentEventRoutingContext
-type JsonRecord = Record<string, unknown>
+type RoutingTuple = AgentEventRoutingContext; type JsonRecord = Record<string, unknown>
 function hasPhoneShapedUnderscoreIdComponent(value: string): boolean {
   return Array.from(value.replace(STABLE_ID_COMPONENT, "$1opaque").matchAll(PHONE_SHAPED_UNDERSCORE_ID_COMPONENT)).some(([, component]) => !!component && component.replace(/\D/g, "").length >= 10)
 }
@@ -98,64 +109,12 @@ function isNestedAgentItem(value: unknown, parentKey: string | undefined, route?
     && row.stepId === null && jsonValue(row.content) && nullableTimestamp(row.startedAt) && nullableTimestamp(row.completedAt)
     && validTimestamp(row.createdAt) && validTimestamp(row.updatedAt)
 }
-function validFollowUpPayload(type: string, value: unknown, route: RoutingTuple): boolean {
-  const row = record(value)
-  const keys = ["messageId", "clientMessageId", "delivery", "source", "disposition", "targetAttemptCount", "item"]
-  return type === "input.accepted" && !!row && Object.keys(row).length === keys.length && Object.keys(row).every(key => keys.includes(key))
-    && route.actor === "user" && route.outboxTopic === "agent.session.event" && route.correlationId === route.turnId && route.causationId === null
-    && route.itemId !== null && route.taskId !== null && typeof row.messageId === "string" && UUID_ID.test(row.messageId) && opaqueId(row.messageId)
-    && typeof row.clientMessageId === "string" && row.clientMessageId.length > 0 && row.clientMessageId.length <= 256
-    && row.delivery === "follow_up" && row.source === "user" && row.disposition === "queued_follow_up"
-    && Number.isSafeInteger(row.targetAttemptCount) && (row.targetAttemptCount as number) > 0 && isNestedAgentItem(row.item, "item", route)
-}
-function exactPayloadKeys(row: JsonRecord, keys: readonly string[]): boolean { const actual = Object.keys(row); return actual.length === keys.length && actual.every(key => keys.includes(key)) }
-function validLegacyApprovalRequested(type: string, payload: unknown): payload is JsonRecord {
-  const row = record(payload); return type === "approval.requested" && !!row && exactPayloadKeys(row, ["approvalId", "action", "scopeHash", "revision"]) && opaqueId(row.approvalId)
-    && typeof row.action === "string" && /^[a-z][a-z0-9_]{0,63}$/i.test(row.action) && typeof row.scopeHash === "string" && row.scopeHash.length > 0 && row.scopeHash.length <= 256
-    && Number.isSafeInteger(row.revision) && (row.revision as number) >= 0
-}
-function validStoredApprovalRequested(type: string, payload: unknown): payload is JsonRecord {
-  const row = record(payload), draft = record(record(payload)?.draft)
-  return type === "approval.requested" && !!row && exactPayloadKeys(row, ["approvalId", "email", "resumeContent", "draft"]) && opaqueId(row.approvalId)
-    && typeof row.email === "string" && typeof row.resumeContent === "string" && !!draft && exactPayloadKeys(draft, ["name", "targetRoles"])
-    && typeof draft.name === "string" && Array.isArray(draft.targetRoles) && draft.targetRoles.every(role => typeof role === "string")
-}
-function validLegacyApprovalResponse(type: string, payload: unknown): payload is JsonRecord {
-  const row = record(payload)
-  return type === "approval_response" && !!row && exactPayloadKeys(row, ["approvalId", "decision"]) && opaqueId(row.approvalId)
-    && ["approved", "rejected", "cancelled", "review"].includes(row.decision as string)
-}
-function validQuestionSourceEnvelope(type: string, payload: JsonRecord, route: RoutingTuple): boolean {
-  const legacy = record(payload.legacy), source = record(payload.sourcePayload)
-  return type === "item.started" && exactPayloadKeys(payload, ["legacy", "sourceEvent", "sourcePayload", "opaque"])
-    && !!legacy && exactPayloadKeys(legacy, ["type", "speaker", "title", "body", "durationMs", "data"])
-    && legacy.type === "approval_request" && payload.sourceEvent === "orchestrator_question" && payload.opaque === false
-    && !!source && exactPayloadKeys(source, ["id", "stage", "question", "options"]) && opaqueId(source.id)
-    && source.id === route.causationId && typeof source.stage === "string" && !!source.stage
-    && typeof source.question === "string" && !!source.question && Array.isArray(source.options)
-    && route.actor === "orchestrator" && route.outboxTopic === "agent.session.event"
-    && route.itemId === `agent-wait:question:${source.id}` && route.correlationId === route.itemId
-    && route.causationId === source.id
-}
-function validatedPayloadFields(type: string, payload: JsonRecord, route: RoutingTuple): string[] | null {
-  const known = knownAgentEventPayloadFields(type, payload, route, opaqueId)
-  if (known) return known
-  if (type === "input.accepted" && validFollowUpPayload(type, payload, route)) return ["messageId"]
-  if ((type === "session.pause_requested" || type === "session.resume_requested")
-    && exactPayloadKeys(payload, ["turnId", "expectedRevision", "requestedAt"])
-    && payload.turnId === route.turnId && Number.isSafeInteger(payload.expectedRevision) && (payload.expectedRevision as number) >= 0
-    && validTimestamp(payload.requestedAt) && route.itemId === null && route.taskId === null && route.actor === "user"
-    && route.correlationId === route.turnId && route.causationId === null && route.outboxTopic === "agent.session.event") return ["turnId"]
-  if (validLegacyApprovalRequested(type, payload) && payload.approvalId === route.correlationId && route.actor === "orchestrator" && route.itemId === null
-    && route.causationId === null && route.outboxTopic === "agent.session.event") return ["approvalId"]
-  if (type === "approval.resolved" && exactPayloadKeys(payload, ["waitKind", "waitId", "itemId", "toolCallId", "outcome", "reason"])
-    && payload.waitKind === "approval" && opaqueId(payload.waitId) && payload.itemId === route.itemId
-    && payload.itemId === `agent-wait:approval:${payload.waitId}` && nullableId(payload.toolCallId)
-    && payload.outcome === "cancelled" && payload.reason === "interrupt" && route.itemId !== null && route.taskId === null
-    && route.actor === "system" && route.outboxTopic === "agent.session.event" && route.correlationId === payload.waitId
-    && route.causationId !== null) return ["waitId", "itemId", "toolCallId"]
-  return null
-}
+const payloadGuards: AgentEventPayloadGuards = { record, opaqueId, nullableId, validTimestamp, jsonValue, isNestedAgentItem }
+const validFollowUpPayload = (type: string, value: unknown, route: RoutingTuple) => validFollowUpPayloadWithGuards(type, value, route, payloadGuards), validLegacyApprovalRequested = (type: string, value: unknown): value is JsonRecord => validLegacyApprovalRequestedWithGuards(type, value, payloadGuards)
+const validStoredApprovalRequested = (type: string, value: unknown) => validStoredApprovalRequestedWithGuards(type, value, payloadGuards)
+const validLegacyApprovalResponse = (type: string, value: unknown) => validLegacyApprovalResponseWithGuards(type, value, payloadGuards), validQuestionSourceEnvelope = (type: string, payload: JsonRecord, route: RoutingTuple) => validQuestionSourceEnvelopeWithGuards(type, payload, route, payloadGuards)
+const validatedPayloadFields = (type: string, payload: JsonRecord, route: RoutingTuple) => validatedPayloadFieldsWithGuards(type, payload, route, payloadGuards), isLegacyApprovalReference = (value: unknown, key: string) => isLegacyApprovalReferenceWithGuards(value, key, payloadGuards)
+const legacyApprovalClientReceipt = (value: unknown) => legacyApprovalClientReceiptWithGuards(value, payloadGuards)
 function containsAgentEventEnvelopeShape(value: unknown, depth = 0, parentKey?: string, route?: RoutingTuple, legacyApprovalReceipt?: unknown): boolean {
   if (depth >= EVENT_REDACTION_MAX_DEPTH || value === null || typeof value !== "object") return false
   if (Array.isArray(value)) return value.some(entry => containsAgentEventEnvelopeShape(entry, depth + 1, parentKey, route, legacyApprovalReceipt))
@@ -188,7 +147,7 @@ function containsDuplicateSchemaVersion(value: unknown, depth = 0): boolean {
   return count > 1 || entries.some(([, entry]) => containsDuplicateSchemaVersion(entry, depth + 1))
 }
 function fullEnvelope(type: string, value: unknown): { row: JsonRecord; routing: RoutingTuple } | null {
-  const row = record(value)
+  const row = record(value); if (type === "input.accepted" && !hasExactRootAcceptedEnvelope(value, payloadGuards)) return null
   if (!row || containsDuplicateSchemaVersion(row) || row.schemaVersion !== AGENT_EVENT_SCHEMA_VERSION || row.type !== type || !opaqueId(row.id) || !opaqueId(row.sessionId) || !opaqueId(row.turnId)
     || !nullableId(row.itemId) || !nullableId(row.taskId) || !opaqueId(row.correlationId)
     || !nullableId(row.causationId) || !validIdempotencyKey(row.idempotencyKey) || !record(row.payload)) return null
@@ -235,15 +194,6 @@ function preserveEnvelope(type: string, raw: JsonRecord, safe: RepositoryJsonVal
   if (result && typeof raw.sequence === "string" && validSequence(raw.sequence)) result.sequence = raw.sequence
   if (result && validTimestamp(raw.createdAt)) result.createdAt = raw.createdAt
   return envelope
-}
-function isLegacyApprovalReference(value: unknown, key: string): boolean {
-  const row = record(value); return key === "approval" && !!row && exactPayloadKeys(row, ["id", "receiptNonce", "scopeHash"]) && opaqueId(row.id) && opaqueId(row.receiptNonce) && typeof row.scopeHash === "string" && row.scopeHash.length > 0 && row.scopeHash.length <= 256
-}
-function legacyApprovalClientReceipt(value: unknown): JsonRecord | null {
-  const approval = record(record(value)?.approval)
-  return approval && exactPayloadKeys(approval, ["id", "type", "title", "body", "impact", "payload", "status", "receiptNonce", "scopeHash"])
-    && opaqueId(approval.id) && opaqueId(approval.receiptNonce) && ["type", "title", "body", "status"].every(key => typeof approval[key] === "string")
-    && jsonValue(approval) && typeof approval.scopeHash === "string" && approval.scopeHash.length > 0 && approval.scopeHash.length <= 256 ? approval : null
 }
 function preserveLegacyApprovalId(safe: unknown, receipt: JsonRecord): RepositoryJsonValue { const output = record(safe), approval = record(output?.approval); return output && approval ? { ...output, approval: preserveFields(approval, receipt, ["id"]) } : safe as RepositoryJsonValue }
 export function redactSensitiveText(value: string): string {

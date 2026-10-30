@@ -325,6 +325,22 @@ describe("atomic Turn terminal commit", () => {
     expect(turnUpdate).not.toContain("clock_timestamp")
   })
 
+  it("persists the same source manifest on the final item, completion event, and event outbox", async () => {
+    const fake = makePool()
+    const manifest = { schemaVersion: "agent-harness.v2.task-graph-sources.v1", graphRevision: 3,
+      sources: [{ sourceKey: `src_${"a".repeat(43)}`, nodeIndex: 0, role: "scout", taskStatus: "completed", resultState: "valid", roleResultStatus: "completed" }] }
+    const boundInput = { ...input, finalContent: { ...input.finalContent, taskGraphSources: manifest } }
+
+    await commitTurnTerminal(fake.pool, boundInput)
+
+    const item = fake.items.get(input.finalItemId)!
+    const completed = [...fake.events.values()].find(event => event.type === "item.completed")!
+    const eventOutbox = [...fake.outboxes.values()].find(row => (row.payload as Row).eventId === completed.id)!
+    expect((item.content as Row).taskGraphSources).toEqual(manifest)
+    expect((completed.payload as Row).content).toEqual(item.content)
+    expect(((eventOutbox.payload as Row).payload as Row).content).toEqual(item.content)
+  })
+
   it("does not promote malformed or unknown server intent fields", async () => {
     for (const intent of [
       { kind: "interactive_discovery_shortlist", version: 2 },

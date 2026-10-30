@@ -17,6 +17,51 @@ function route(type: string, payload: Record<string, unknown>): AgentEventRoutin
 }
 
 describe("agent event redaction", () => {
+  it("preserves only the server UUID in a validated root accepted-input payload", () => {
+    const inputId = "12345678-1234-4abc-8abc-123456789012"
+    const clientMessageIds = [
+      ["message-415-555-0100", "message-[REDACTED_PHONE]"],
+      ["client@example.test", "[REDACTED_EMAIL]"],
+      ["request-sk_0123456789abcdef", "request-[REDACTED]"],
+    ] as const
+    const routing: AgentEventRoutingContext = {
+      sessionId, turnId, itemId: "45678901-4567-4def-8def-456789012345", taskId: null,
+      actor: "user", correlationId: turnId, causationId: null, outboxTopic: "agent.session.event",
+    }
+
+    for (const [clientMessageId, projectedClientMessageId] of clientMessageIds) {
+      const safe = redactAgentEvent({ type: "input.accepted", body: "", routing, data: {
+        inputId, clientMessageId, delivery: "steer", source: "user", disposition: "steered",
+      } })
+      expect(safe.data).toEqual({ inputId, clientMessageId: projectedClientMessageId, delivery: "steer", source: "user", disposition: "steered" })
+      expect(JSON.stringify(safe.data)).not.toContain(clientMessageId)
+    }
+
+    const malformed = redactAgentEvent({ type: "input.accepted", body: "", routing, data: {
+      inputId, clientMessageId: clientMessageIds[0][0], delivery: "steer", source: "user", disposition: "steered", unexpected: true,
+    } })
+    expect((malformed.data as { inputId: string }).inputId).not.toBe(inputId)
+    expect((malformed.data as { inputId: string }).inputId).toContain("[REDACTED_PHONE]")
+
+    const taskScoped = redactAgentEvent({ type: "input.accepted", body: "", routing: { ...routing, taskId: "task_1" }, data: {
+      inputId, clientMessageId: clientMessageIds[0][0], delivery: "steer", source: "user", disposition: "steered",
+    } })
+    expect((taskScoped.data as { inputId: string }).inputId).not.toBe(inputId)
+    expect((taskScoped.data as { inputId: string }).inputId).toContain("[REDACTED_PHONE]")
+
+    const fullEnvelope = {
+      schemaVersion: "agent-harness.v2", id: "event_1", sessionId, turnId, itemId: routing.itemId, taskId: null, sequence: 1,
+      type: "input.accepted", actor: "user", correlationId: turnId, causationId: null, idempotencyKey: "agent-command:opaque",
+      payload: { inputId, clientMessageId: clientMessageIds[0][0], delivery: "steer", source: "user", disposition: "steered" },
+      createdAt: "2026-10-30T12:00:00.000Z",
+    }
+    const safeEnvelope = redactAgentEvent({ type: "input.accepted", body: "", data: fullEnvelope }).data as typeof fullEnvelope
+    expect(safeEnvelope.payload.inputId).toBe(inputId)
+    const nonExactEnvelope = redactAgentEvent({ type: "input.accepted", body: "", data: { ...fullEnvelope, extra: true } }).data as typeof fullEnvelope
+    expect(nonExactEnvelope.payload.inputId).not.toBe(inputId)
+    expect(nonExactEnvelope.payload.inputId).toContain("[REDACTED_PHONE]")
+  })
+
   it("removes credentials and direct PII while preserving opaque receipt references", () => {
     const safe = redactAgentEvent({
       type: "tool_call.completed",

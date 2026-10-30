@@ -14,7 +14,8 @@ const lease = {
   ownerId: "worker-1", attemptCount: 3, leaseExpiresAt: new Date(now.getTime() + 60_000),
 }
 
-function fixture(options: { wait?: boolean; waitStatus?: string; stepStatus?: string; targetStatus?: string; taskStatus?: string; suspended?: boolean; expireAtTaskUpdate?: boolean; callMatches?: boolean } = {}) {
+function fixture(options: { wait?: boolean; waitStatus?: string; stepStatus?: string; targetStatus?: string; taskStatus?: string; suspended?: boolean; expireAtTaskUpdate?: boolean; callMatches?: boolean; targetId?: string; waitTargetTaskIds?: unknown } = {}) {
+  const targetId = options.targetId ?? "child-1"
   const calls: { sql: string; params: unknown[] }[] = []
   const state = { taskStatus: options.taskStatus ?? "running", waitStatus: options.waitStatus ?? "waiting", outboxWrites: 0, waitWrites: 0, taskWrites: 0, taskUpdateAttempts: 0 }
   const client = {
@@ -34,16 +35,16 @@ function fixture(options: { wait?: boolean; waitStatus?: string; stepStatus?: st
       }], rowCount: 1 }
       if (sql.includes('FROM "agent_wait_conditions" AS wait')) return options.wait === false ? { rows: [], rowCount: 0 } : { rows: [{
         id: "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "parent-1", stepId: "step-1", idempotencyKey: "wait-key-1",
-        targetTaskIds: ["child-1"], mode: "any", status: state.waitStatus, deadlineAt: new Date(now.getTime() + 10_000),
-        matchedTaskIds: [], result: { request: { targetTaskIds: ["child-1"], mode: "any", timeoutMs: 10_000 } }, suspendedAt: options.suspended ? now : null, consumedAt: null, attempt: 3, ordinal: 4, latestOrdinal: 4,
+        targetTaskIds: options.waitTargetTaskIds ?? [targetId], mode: "any", status: state.waitStatus, deadlineAt: new Date(now.getTime() + 10_000),
+        matchedTaskIds: [], result: { request: { targetTaskIds: [targetId], mode: "any", timeoutMs: 10_000 }, note: "Call +353 87 123 4567 or email private@example.test." }, suspendedAt: options.suspended ? now : null, consumedAt: null, attempt: 3, ordinal: 4, latestOrdinal: 4,
         stepStatus: options.stepStatus ?? "waiting_for_tool",
       }], rowCount: 1 }
       if (sql.includes('FROM "agent_items" AS call')) return { rows: [{ status: "started", content: {
         toolCallId: "wait-call-1", toolName: "wait_subagents", toolVersion: "1",
-        input: { idempotencyKey: options.callMatches === false ? "wrong-key" : "wait-key-1", mode: "any", taskIds: ["child-1"], timeoutMs: 10_000 },
+        input: { idempotencyKey: options.callMatches === false ? "wrong-key" : "wait-key-1", mode: "any", taskIds: [targetId], timeoutMs: 10_000 },
       } }], rowCount: 1 }
       if (sql.includes('FROM "sub_agent_tasks" AS task') && sql.includes("ANY($1::text[])")) return { rows: [{
-        id: "child-1", parentTaskId: "parent-1", rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1",
+        id: targetId, parentTaskId: "parent-1", rootTaskId: "root-1", turnId: "turn-1", sessionId: "session-1",
         status: options.targetStatus ?? "running", role: "writer", result: { summary: "done" }, failureReason: null,
       }], rowCount: 1 }
       if (sql.includes('UPDATE "agent_wait_conditions"')) { state.waitWrites += 1; state.waitStatus = String(params[0]); return { rows: [], rowCount: 1 } }
@@ -121,12 +122,32 @@ describe("handoffDurableSubagentWait", () => {
     expect(fake.calls.some(call => call.sql === "BEGIN" || call.sql === "COMMIT")).toBe(false)
   })
 
+  it("preserves only the validated target ID through ordinary handoff sanitization", async () => {
+    const targetId = "subagent-00000000-0000-4000-8000-000000000000"
+    const fake = fixture({ targetId, targetStatus: "completed" })
+    await handoffDurableSubagentWait(fake.client as never, { lease, now })
+    const update = fake.calls.find(call => call.sql.includes('UPDATE "agent_wait_conditions"'))
+    const saved = JSON.parse(String(update?.params[2])) as { request: { targetTaskIds: string[] }; note: string }
+    expect(saved.request.targetTaskIds).toEqual([targetId])
+    expect(saved.note).toContain("[REDACTED_PHONE]")
+    expect(saved.note).toContain("[REDACTED_EMAIL]")
+    expect(saved.note).not.toContain("+353 87 123 4567")
+    expect(saved.note).not.toContain("private@example.test")
+  })
+
   it("throws when a matching persisted wait points at a stale step", async () => {
     const fake = fixture({ stepStatus: "completed" })
     await expect(handoffDurableSubagentWait(fake.client as never, { lease, now })).rejects.toMatchObject({ code: "wait_scope_error" })
     expect(fake.state.waitWrites).toBe(0)
     expect(fake.state.taskWrites).toBe(0)
     expect(fake.state.outboxWrites).toBe(0)
+  })
+
+  it("rejects mixed-type registered target IDs before normal handoff writes", async () => {
+    const fake = fixture({ waitTargetTaskIds: ["child-1", 17], targetStatus: "completed" })
+    await expect(handoffDurableSubagentWait(fake.client as never, { lease, now })).rejects.toMatchObject({ code: "wait_scope_error" })
+    expect(fake.state).toMatchObject({ waitWrites: 0, taskWrites: 0, outboxWrites: 0 })
+    expect(fake.calls.some(call => /^(UPDATE|INSERT)/.test(call.sql))).toBe(false)
   })
 
   it("promotes the exact latest streaming step before recovering its committed wait", async () => {
@@ -142,10 +163,42 @@ describe("handoffDurableSubagentWait", () => {
     expect(promote?.params).toEqual([now, "step-1", lease.sessionId, lease.turnId, lease.id, lease.attemptCount, 4, lease.rootTaskId, lease.ownerId, expiredLease.leaseExpiresAt])
   })
 
+  it("preserves only the validated target ID through expired-wait recovery sanitization", async () => {
+    const targetId = "subagent-00000000-0000-4000-8000-000000000000"
+    const fake = fixture({ targetId, stepStatus: "streaming" })
+    const expiredLease = { ...lease, leaseExpiresAt: new Date(now.getTime() - 1) }
+    await recoverExpiredDurableSubagentWaitWithGraph(fake.client as never, { lease: expiredLease, now })
+    const update = fake.calls.find(call => call.sql.includes('UPDATE "agent_wait_conditions"'))
+    const saved = JSON.parse(String(update?.params[2])) as { request: { targetTaskIds: string[] }; note: string }
+    expect(saved.request.targetTaskIds).toEqual([targetId])
+    expect(saved.note).toContain("[REDACTED_PHONE]")
+    expect(saved.note).toContain("[REDACTED_EMAIL]")
+    expect(saved.note).not.toContain("+353 87 123 4567")
+    expect(saved.note).not.toContain("private@example.test")
+  })
+
   it("rejects recovery when the persisted wait call does not identify the exact registered request", async () => {
     const fake = fixture({ callMatches: false })
     await expect(handoffDurableSubagentWait(fake.client as never, { lease, now })).rejects.toMatchObject({ code: "wait_scope_error" })
     expect(fake.state).toMatchObject({ waitWrites: 0, taskWrites: 0, outboxWrites: 0 })
+  })
+
+  it("does not recover an expired wait when its persisted call is outside the registered scope", async () => {
+    const fake = fixture({ callMatches: false, stepStatus: "streaming" })
+    const expiredLease = { ...lease, leaseExpiresAt: new Date(now.getTime() - 1) }
+    await expect(recoverExpiredDurableSubagentWaitWithGraph(fake.client as never, { lease: expiredLease, now })).resolves.toBeUndefined()
+    expect(fake.state).toMatchObject({ waitWrites: 0, taskWrites: 0, outboxWrites: 0 })
+    expect(fake.calls.some(call => call.sql.includes('UPDATE "agent_steps"'))).toBe(false)
+  })
+
+  it("rejects mixed-type expired target IDs before step promotion or handoff writes", async () => {
+    const fake = fixture({ waitTargetTaskIds: ["child-1", 17], stepStatus: "streaming" })
+    const expiredLease = { ...lease, leaseExpiresAt: new Date(now.getTime() - 1) }
+    await expect(recoverExpiredDurableSubagentWaitWithGraph(fake.client as never, { lease: expiredLease, now }))
+      .rejects.toMatchObject({ code: "wait_scope_error" })
+    expect(fake.state).toMatchObject({ waitWrites: 0, taskWrites: 0, outboxWrites: 0 })
+    expect(fake.calls.some(call => call.sql.includes('UPDATE "agent_steps"'))).toBe(false)
+    expect(fake.calls.some(call => /^(UPDATE|INSERT)/.test(call.sql))).toBe(false)
   })
 
   it("rolls back when PostgreSQL sees the lease expire after the initial check", async () => {

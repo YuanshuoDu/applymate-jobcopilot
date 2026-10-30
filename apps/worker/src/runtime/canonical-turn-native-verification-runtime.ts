@@ -92,7 +92,7 @@ export function createCanonicalTurnTerminalGuard(input: Readonly<{
     const graph = input.checkRootGraph ? await input.checkRootGraph(client, native.nativeVerificationPassed) : undefined
     if (input.checkRootGraph && !graph) return { ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: "TaskGraph completion verification is unavailable." }
     if (graph && !graph.ok) return graph
-    if (!taskGraphFinalSummaryCopiesMatch(terminal[TASK_GRAPH_FINAL_SUMMARY_BINDING], graph?.[TASK_GRAPH_FINAL_SUMMARY_BINDING], terminal.finalContent, terminal.response)) return {
+    if (!taskGraphFinalSummaryCopiesMatch(terminal[TASK_GRAPH_FINAL_SUMMARY_BINDING], graph?.[TASK_GRAPH_FINAL_SUMMARY_BINDING], terminal.finalContent, terminal.response, terminal.finalItemId)) return {
       ok: false, blocker: TASK_GRAPH_VERIFICATION_BLOCKER, feedback: "TaskGraph final summary is stale or unavailable. Re-read the current graph before completing.",
     }
     return input.finalizeSelectedJob ? input.finalizeSelectedJob(client) : { ok: true }

@@ -2,6 +2,7 @@ import {
   AgentEventEnvelopeSchema, AgentInputSchema, AgentItemSchema, schemaVersion, validate,
   type TenantScope,
 } from "@jobcopilot/agent-protocol"
+import { redactSensitiveText } from "@jobcopilot/shared"
 import { assertInputClaimOwnerFence, type InputClaimQueryClient, type TurnExecutionFence } from "./input-claim-store.js"
 
 export type RootTaskHistorySteerEvidence = Readonly<{ kind: "no_accepted_steer" | "accepted_steer" | "unsafe" }>
@@ -10,6 +11,7 @@ type Row = Record<string, unknown>
 type InputEvidence = Readonly<{ id: string; clientMessageId: string; delivery: string; sequence: bigint; content: unknown }>
 const MAX_INPUT_EVIDENCE = 64
 const UNSAFE: RootTaskHistorySteerEvidence = Object.freeze({ kind: "unsafe" })
+const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i
 
 function record(value: unknown): Row | null {
   const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
@@ -39,6 +41,9 @@ function canonical(value: unknown): unknown {
 function equalJson(left: unknown, right: unknown): boolean {
   try { return JSON.stringify(canonical(left)) === JSON.stringify(canonical(right)) } catch { return false }
 }
+function inputIdMatches(value: unknown, id: string): boolean {
+  return value === id || UUID.test(id) && value === redactSensitiveText(id)
+}
 function parseInput(row: Row, scope: TenantScope, request: RootTaskHistorySteerEvidenceRequest): InputEvidence | null {
   const createdAt = timestamp(row.createdAt), consumedAt = row.consumedAt === null ? null : timestamp(row.consumedAt)
   const cancelledAt = row.cancelledAt === null ? null : timestamp(row.cancelledAt)
@@ -57,24 +62,26 @@ function parseInput(row: Row, scope: TenantScope, request: RootTaskHistorySteerE
   if (!validate(AgentInputSchema, input) || typeof row.id !== "string" || typeof row.clientMessageId !== "string") return null
   return { id: row.id, clientMessageId: row.clientMessageId, delivery: String(row.delivery), sequence: acceptedSequence, content: row.content }
 }
-function parseEvent(row: Row, sessionId: string, turnId: string): { id: string; inputId: string; clientMessageId: string; delivery: string; sequence: bigint; parts: unknown } | null {
+function parseEvent(row: Row, input: InputEvidence, sessionId: string, turnId: string): { id: string; inputId: string; clientMessageId: string; delivery: string; sequence: bigint; parts: unknown } | null {
   const payload = record(row.acceptedPayload), item = record(row.acceptedItemContent)
   const payloadKeys = payload && Object.keys(payload).sort().join(",")
   const itemKeys = item && Object.keys(item).sort().join(",")
   const acceptedSequence = sequence(row.acceptedEventSequence), createdAt = timestamp(row.acceptedEventCreatedAt)
   if (!payload || !item || acceptedSequence === null || createdAt === null
     || payloadKeys !== "clientMessageId,delivery,disposition,inputId,source"
-    || typeof payload.inputId !== "string" || typeof payload.clientMessageId !== "string"
+    || !inputIdMatches(payload.inputId, input.id) || payload.clientMessageId !== redactSensitiveText(input.clientMessageId)
     || (payload.delivery !== "steer" && payload.delivery !== "follow_up")
     || typeof payload.disposition !== "string" || !payload.disposition.trim()
     || (payload.source !== "user" && payload.source !== "automation" && payload.source !== "system")
     || row.acceptedType !== "input.accepted" || row.acceptedActor !== (payload.source === "user" ? "user" : "system")
     || row.acceptedTaskId !== null || row.acceptedCorrelationId !== turnId
+    || row.acceptedEventCausationId !== null
     || row.acceptedEventSessionId !== sessionId || row.acceptedEventTurnId !== turnId
     || row.acceptedItemId !== row.acceptedEventItemId || typeof row.acceptedItemId !== "string"
     || row.acceptedItemType !== "user_message" || row.acceptedItemTaskId !== null || row.acceptedItemStatus !== "completed"
     || itemKeys !== "clientMessageId,disposition,parts,source" || !Array.isArray(item.parts)
-    || item.clientMessageId !== payload.clientMessageId || item.disposition !== payload.disposition || item.source !== payload.source) return null
+    || row.acceptedItemStepId !== null || item.clientMessageId !== input.clientMessageId
+    || item.disposition !== payload.disposition || item.source !== payload.source || !equalJson(item.parts, input.content)) return null
   const envelope = { schemaVersion, id: row.acceptedEventId, sessionId: row.acceptedEventSessionId, turnId: row.acceptedEventTurnId,
     itemId: row.acceptedEventItemId, taskId: row.acceptedTaskId, sequence: Number(acceptedSequence), type: row.acceptedType,
     actor: row.acceptedActor, correlationId: row.acceptedCorrelationId, causationId: row.acceptedEventCausationId,
@@ -84,8 +91,8 @@ function parseEvent(row: Row, sessionId: string, turnId: string): { id: string; 
     updatedAt: timestamp(row.acceptedItemUpdatedAt), type: row.acceptedItemType, data: row.acceptedItemContent }
   if (!validate(AgentEventEnvelopeSchema, envelope) || !validate(AgentItemSchema, itemEnvelope)
     || row.acceptedEventSessionId !== row.acceptedItemSessionId || row.acceptedEventTurnId !== row.acceptedItemTurnId
-    || typeof payload.inputId !== "string") return null
-  return { id: String(row.acceptedEventId), inputId: payload.inputId, clientMessageId: payload.clientMessageId,
+    || typeof row.acceptedEventId !== "string") return null
+  return { id: String(row.acceptedEventId), inputId: input.id, clientMessageId: input.clientMessageId,
     delivery: payload.delivery, sequence: acceptedSequence, parts: item.parts }
 }
 
@@ -120,23 +127,25 @@ export async function readRootTaskHistorySteerEvidence(
       item."taskId" AS "acceptedItemTaskId", item."type" AS "acceptedItemType", item."status" AS "acceptedItemStatus", item."content" AS "acceptedItemContent",
       item."createdAt" AS "acceptedItemCreatedAt", item."updatedAt" AS "acceptedItemUpdatedAt"
     FROM "agent_events" AS event LEFT JOIN "agent_items" AS item ON item."id" = event."itemId" AND item."sessionId" = event."sessionId" AND item."turnId" = event."turnId"
-    WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."type" = 'input.accepted'
+    WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."taskId" IS NULL AND event."type" = 'input.accepted'
     ORDER BY event."sequence" ASC, event."id" ASC LIMIT ${MAX_INPUT_EVIDENCE + 1} FOR SHARE OF event`, [request.sessionId, request.turnId])
   if (events.rows.length > MAX_INPUT_EVIDENCE || inputs.rows.length !== events.rows.length) return UNSAFE
-  const byId = new Map<string, InputEvidence>(), inputSequences = new Set<bigint>(), clientMessages = new Set<string>()
+  const bySequence = new Map<bigint, InputEvidence>(), inputIds = new Set<string>(), inputSequences = new Set<bigint>(), clientMessages = new Set<string>()
   for (const row of inputs.rows) {
     const input = parseInput(row, scope, request)
-    if (!input || byId.has(input.id) || inputSequences.has(input.sequence) || clientMessages.has(input.clientMessageId)) return UNSAFE
-    byId.set(input.id, input); inputSequences.add(input.sequence); clientMessages.add(input.clientMessageId)
+    if (!input || inputIds.has(input.id) || inputSequences.has(input.sequence) || clientMessages.has(input.clientMessageId)) return UNSAFE
+    inputIds.add(input.id)
+    bySequence.set(input.sequence, input); inputSequences.add(input.sequence); clientMessages.add(input.clientMessageId)
   }
   const seenInputs = new Set<string>(), eventIds = new Set<string>(), eventSequences = new Set<bigint>()
   for (const row of events.rows) {
-    const event = parseEvent(row, request.sessionId, request.turnId), input = event ? byId.get(event.inputId) : undefined
+    const eventSequence = sequence(row.acceptedEventSequence), input = eventSequence === null ? undefined : bySequence.get(eventSequence)
+    const event = input ? parseEvent(row, input, request.sessionId, request.turnId) : null
     if (!event || !input || seenInputs.has(event.inputId) || eventIds.has(event.id) || eventSequences.has(event.sequence)
       || event.clientMessageId !== input.clientMessageId || event.delivery !== input.delivery || event.sequence !== input.sequence
       || !equalJson(input.content, event.parts)) return UNSAFE
     seenInputs.add(event.inputId); eventIds.add(event.id); eventSequences.add(event.sequence)
   }
-  if (seenInputs.size !== byId.size) return UNSAFE
-  return [...byId.values()].some(input => input.delivery === "steer") ? { kind: "accepted_steer" } : { kind: "no_accepted_steer" }
+  if (seenInputs.size !== inputIds.size) return UNSAFE
+  return [...bySequence.values()].some(input => input.delivery === "steer") ? { kind: "accepted_steer" } : { kind: "no_accepted_steer" }
 }

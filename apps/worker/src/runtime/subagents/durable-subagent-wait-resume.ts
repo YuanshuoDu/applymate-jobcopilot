@@ -14,7 +14,7 @@ const TERMINAL = new Set(["completed", "failed", "interrupted", "cancelled", "cl
 
 export type DurableSubagentWaitResume = Readonly<{
   waitId: string; stepId: string; attempt: number; ordinal: number; toolCallId: string; sourceItemId: string; input: unknown; output: DurableSubagentWaitResult
-}>
+  continuationStepId?: string; continuationOrdinal?: number }>
 export type DurableSubagentWaitResumeCommitInput = Readonly<{ waitId: string; stepId: string; nextStepOrdinal: number; now?: Date }>
 
 async function transaction<T>(pool: Pool, userId: string, work: (client: Queryable) => Promise<T>): Promise<T> {
@@ -100,9 +100,9 @@ export async function loadDurableSubagentWaitResume(pool: Pool, lease: ResumeLea
       WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "attempt" = $4 AND "ordinal" > $5
       ORDER BY "ordinal" ASC, "id" ASC LIMIT 2 FOR SHARE`,
     [lease.sessionId, lease.turnId, lease.id, lease.attemptCount, sourceOrdinal])).rows
-    if (laterSteps.length > 1 || laterSteps.length === 1 && laterSteps[0]?.status !== "streaming") {
-      throw new DurableSubagentWaitError("wait_conflict", "Child wait has an ambiguous continuation")
-    }
+    const next = laterSteps[0], continuationOrdinal = Number(next?.ordinal)
+    if (laterSteps.length > 1 || next && (next.status !== "streaming" || typeof next.id !== "string" || !next.id.trim()
+      || !Number.isSafeInteger(continuationOrdinal) || continuationOrdinal <= sourceOrdinal)) throw new DurableSubagentWaitError("wait_conflict", "Child wait has an ambiguous continuation")
 
     const waits = (await client.query<Row>(`SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "idempotencyKey", "targetTaskIds", "mode", "status", "deadlineAt", "matchedTaskIds", "result", "suspendedAt", "consumedAt"
       FROM "agent_wait_conditions" WHERE "id" IN (
@@ -158,7 +158,8 @@ export async function loadDurableSubagentWaitResume(pool: Pool, lease: ResumeLea
     if (!Number.isSafeInteger(ordinal) || ordinal < 0) throw new DurableSubagentWaitError("wait_scope_error", "Child wait step ordinal is invalid")
     return { waitId: String(wait.id), stepId: String(step.id), attempt: lease.attemptCount, ordinal, toolCallId,
       sourceItemId: String(resultRows[0]?.id ?? `recovered-wait-result:${String(wait.id)}`),
-      input: safeSubagentWaitJson(input, 16_384), output: safeSubagentWaitJson(outcome, 16_384) as DurableSubagentWaitResult }
+      input: safeSubagentWaitJson(input, 16_384), output: safeSubagentWaitJson(outcome, 16_384) as DurableSubagentWaitResult,
+      ...(next ? { continuationStepId: next.id as string, continuationOrdinal } : {}) }
   })
 }
 

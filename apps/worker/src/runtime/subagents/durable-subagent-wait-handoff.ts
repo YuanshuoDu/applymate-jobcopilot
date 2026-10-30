@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto"
 import type pg from "pg"
 import type { SubagentLease } from "./types.js"
-import { assertLease, dateValue, DurableSubagentWaitError, object, parseIds, projectDurableSubagentWait, safeSubagentWaitJson, type DurableSubagentWaitStatus } from "./durable-subagent-wait-store.js"
+import { assertLease, dateValue, DurableSubagentWaitError, object, parseIds, projectDurableSubagentWait, type DurableSubagentWaitStatus } from "./durable-subagent-wait-store.js"
 import { persistGraphTransition, prepareGraphTransition } from "./task-graph-pg-lifecycle.js"
+import { safeHandoffWaitResult, strictWaitTargetIds } from "./durable-subagent-wait-handoff-projection.js"
 
-type Client = Pick<pg.PoolClient, "query">
-type Row = Record<string, unknown>
+type Client = Pick<pg.PoolClient, "query">; type Row = Record<string, unknown>
 const OPEN_SESSION = `session."status" NOT IN ('aborted', 'archived')`
 const TERMINAL = new Set(["completed", "failed", "interrupted", "cancelled", "closed", "passed", "skipped"])
 export type DurableSubagentWaitHandoffLease = Pick<SubagentLease, "id" | "userId" | "sessionId" | "turnId" | "rootTaskId" | "ownerId" | "attemptCount" | "leaseExpiresAt">
@@ -85,7 +85,7 @@ export async function handoffDurableSubagentWait(client: Client, input: DurableS
     || Number(wait.ordinal) !== Number(wait.latestOrdinal) || wait.stepStatus !== "waiting_for_tool" || !["waiting", "ready", "timed_out"].includes(String(wait.status))) {
     throw new DurableSubagentWaitError("wait_scope_error", "Wait step is stale or outside the current child attempt")
   }
-  const targetIds = parseIds(wait.targetTaskIds)
+  const targetIds = strictWaitTargetIds(wait.targetTaskIds)
   if (!targetIds.length || targetIds.length > 8 || new Set(targetIds).size !== targetIds.length
     || !(wait.mode === "any" || wait.mode === "all")) throw new DurableSubagentWaitError("wait_scope_error", "Wait targets are invalid")
   await validateWaitCall(client, lease, wait, targetIds)
@@ -114,7 +114,7 @@ export async function handoffDurableSubagentWait(client: Client, input: DurableS
   if (status === "ready" && !isReady || status === "timed_out" && now < deadline) throw new DurableSubagentWaitError("wait_scope_error", "Resolved child wait no longer matches its targets")
   const result = object(wait.result)
   const current = projectDurableSubagentWait({ ...wait, targetTaskIds: targetIds, deadlineAt: deadline }, targets, status, matched)
-  const persistedResult = safeSubagentWaitJson({ ...result, outcome: current }, 16_384)
+  const persistedResult = safeHandoffWaitResult(result, current, targetIds)
   const waitUpdated = await client.query(`UPDATE "agent_wait_conditions" SET "status" = $1, "matchedTaskIds" = $2::jsonb, "result" = $3::jsonb,
     "suspendedAt" = COALESCE("suspendedAt", $4), "resolvedAt" = CASE WHEN $1 = 'waiting' THEN "resolvedAt" ELSE COALESCE("resolvedAt", $4) END, "updatedAt" = $4
     WHERE "id" = $5 AND "parentTaskId" = $6 AND "stepId" = $7 AND "consumedAt" IS NULL AND "status" IN ('waiting', 'ready', 'timed_out')
@@ -160,7 +160,7 @@ export async function recoverExpiredDurableSubagentWaitWithGraph(client: pg.Pool
   [lease.id, lease.userId, lease.sessionId, lease.turnId, lease.attemptCount])).rows
   if (!waits.length) return undefined
   if (waits.length !== 1) throw new DurableSubagentWaitError("wait_conflict", "Multiple pending registrations match the expired child attempt")
-  const wait = waits[0], ids = parseIds(wait.targetTaskIds)
+  const wait = waits[0], ids = strictWaitTargetIds(wait.targetTaskIds)
   if (Number(wait.attempt) !== lease.attemptCount || Number(wait.ordinal) !== Number(wait.latestOrdinal) || !String(wait.stepId).trim()
     || !(wait.mode === "any" || wait.mode === "all") || !ids.length || ids.length > 8 || new Set(ids).size !== ids.length) {
     throw new DurableSubagentWaitError("wait_scope_error", "Pending child wait is outside its current attempt")
@@ -169,16 +169,6 @@ export async function recoverExpiredDurableSubagentWaitWithGraph(client: pg.Pool
   catch (error: unknown) {
     if (error instanceof DurableSubagentWaitError && error.code === "wait_scope_error") return undefined
     throw error
-  }
-  if (wait.stepStatus === "streaming") {
-    // This crash precedes durable tool/model completion; step.completed would invent output the writer never committed.
-    const promoted = await client.query(`UPDATE "agent_steps" SET "status" = 'waiting_for_tool', "finishReason" = 'tool_calls', "errorCode" = NULL, "completedAt" = $1
-      WHERE "id" = $2 AND "sessionId" = $3 AND "turnId" = $4 AND "taskId" = $5 AND "attempt" = $6 AND "ordinal" = $7 AND "status" = 'streaming'
-        AND "ordinal" = (SELECT MAX(current."ordinal") FROM "agent_steps" AS current WHERE current."sessionId" = $3 AND current."turnId" = $4 AND current."taskId" = $5 AND current."attempt" = $6)
-        AND EXISTS (SELECT 1 FROM "sub_agent_tasks" AS task WHERE task."id" = $5 AND task."sessionId" = $3 AND task."turnId" = $4
-          AND task."rootTaskId" = $8 AND task."status" = 'running' AND task."leaseOwner" = $9 AND task."attemptCount" = $6 AND task."leaseExpiresAt" = $10 AND task."leaseExpiresAt" <= clock_timestamp() AND task."interruptRequestedAt" IS NULL)`,
-    [now, wait.stepId, lease.sessionId, lease.turnId, lease.id, lease.attemptCount, wait.ordinal, lease.rootTaskId, lease.ownerId, lease.leaseExpiresAt])
-    if (promoted.rowCount !== 1) throw new DurableSubagentWaitError("wait_scope_error", "Expired wait source step changed during recovery")
   }
   const targets = (await client.query<Row>(`SELECT task."id", task."parentTaskId", task."rootTaskId", task."turnId", task."sessionId", task."status", task."role", task."result", task."failureReason"
     FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
@@ -190,7 +180,17 @@ export async function recoverExpiredDurableSubagentWaitWithGraph(client: pg.Pool
   const deadline = dateValue(wait.deadlineAt, "deadlineAt"), ready = wait.mode === "any" ? matched.length > 0 : matched.length === ids.length
   const status: DurableSubagentWaitStatus = now >= deadline ? "timed_out" : ready ? "ready" : "waiting"
   const result = object(wait.result), outcome = projectDurableSubagentWait({ ...wait, targetTaskIds: ids, deadlineAt: deadline }, targets, status, matched)
-  const persisted = safeSubagentWaitJson({ ...result, outcome }, 16_384)
+  const persisted = safeHandoffWaitResult(result, outcome, ids)
+  if (wait.stepStatus === "streaming") {
+    // This crash precedes durable tool/model completion; step.completed would invent output the writer never committed.
+    const promoted = await client.query(`UPDATE "agent_steps" SET "status" = 'waiting_for_tool', "finishReason" = 'tool_calls', "errorCode" = NULL, "completedAt" = $1
+      WHERE "id" = $2 AND "sessionId" = $3 AND "turnId" = $4 AND "taskId" = $5 AND "attempt" = $6 AND "ordinal" = $7 AND "status" = 'streaming'
+        AND "ordinal" = (SELECT MAX(current."ordinal") FROM "agent_steps" AS current WHERE current."sessionId" = $3 AND current."turnId" = $4 AND current."taskId" = $5 AND current."attempt" = $6)
+        AND EXISTS (SELECT 1 FROM "sub_agent_tasks" AS task WHERE task."id" = $5 AND task."sessionId" = $3 AND task."turnId" = $4
+          AND task."rootTaskId" = $8 AND task."status" = 'running' AND task."leaseOwner" = $9 AND task."attemptCount" = $6 AND task."leaseExpiresAt" = $10 AND task."leaseExpiresAt" <= clock_timestamp() AND task."interruptRequestedAt" IS NULL)`,
+    [now, wait.stepId, lease.sessionId, lease.turnId, lease.id, lease.attemptCount, wait.ordinal, lease.rootTaskId, lease.ownerId, lease.leaseExpiresAt])
+    if (promoted.rowCount !== 1) throw new DurableSubagentWaitError("wait_scope_error", "Expired wait source step changed during recovery")
+  }
   const graphWaiting = await prepareGraphTransition(client, { taskId: lease.id, sessionId: lease.sessionId, type: "task.waiting", attemptCount: lease.attemptCount })
   if (graphWaiting && "blocked" in graphWaiting) return { blocked: true }
   const updatedWait = await client.query(`UPDATE "agent_wait_conditions" SET "status" = $1, "matchedTaskIds" = $2::jsonb, "result" = $3::jsonb,

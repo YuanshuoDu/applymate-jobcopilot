@@ -1,6 +1,7 @@
 import { schemaVersion } from "@jobcopilot/agent-protocol"
 import { projectCompletedAnswerEvidence, projectFinalAnswerText, redactFinalAnswerText } from "@/lib/agent/session/final-answer-evidence-projection"
 import { projectFinalSummary } from "@/lib/agent/session/final-summary-projection"
+import { projectFinalAnswerTaskGraphSourceContent } from "@/lib/agent/session/final-task-graph-source-detail"
 import { projectLegacySubAgentTask } from "@/lib/agent/session/subagent-task-compat"
 import { redactTaskGraphTimelineContent } from "@/lib/task-graph-repair-display"
 import { publicToolCallIdOrNull, publicToolItemId } from "@/lib/agent/session/public-tool-identity"
@@ -73,7 +74,7 @@ export function itemDto(row: ItemQueryRow) {
     const summary = projectFinalSummary(row.type, row.phase, row.status, row.content)
     const answerEvidence = projectCompletedAnswerEvidence(row.content, row.phase, row.status)
     const answerText = projectFinalAnswerText(row.content, { answerEvidence }) ?? displayText(row.content)
-    content = { text: answerText, ...(summary ? { summary } : {}), ...(answerEvidence ? { answerEvidence } : {}) }
+    content = projectFinalAnswerTaskGraphSourceContent(row.id, row.phase, row.status, answerText, summary, answerEvidence, raw)
   }
   else if (row.type === "approval_request") content = {
     waitKind: "approval",

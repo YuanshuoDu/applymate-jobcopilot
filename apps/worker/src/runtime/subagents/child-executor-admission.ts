@@ -12,6 +12,7 @@ import { getSubagentRolePolicy, visibleToolPolicy } from "./role-policy.js"
 import { selectedJobToolAllowed } from "./selected-job-artifact-context.js"
 import type { SubagentRolePolicy } from "./role-policy.js"
 import type { SubagentExecutionResult, SubagentTaskRecord, SubagentLease } from "./types.js"
+import { childWaitRecoveryLogicalStepOrdinal } from "./child-resume-wait-call-contract.js"
 
 export type ChildPublicDefinition = Omit<RuntimeToolDefinition, "execute">
 export type ChildRolePolicyTask = Pick<SubagentTaskRecord, "role" | "allowedActions">
@@ -90,21 +91,27 @@ export function isDeterministicChildResumeError(error: unknown): boolean {
 export function acknowledgeDurableWaitAtContinuationStart(
   store: TurnExecutionStore, lease: SubagentLease, wait: DurableWaitResume | undefined,
   commit?: (lease: SubagentLease, wait: DurableWaitResume, nextStepOrdinal: number) => Promise<boolean | void>,
+  onAcknowledged?: (step: { readonly id: string; readonly ordinal: number }) => void,
 ): TurnExecutionStore {
   if (!wait) return store
-  if (!commit || wait.attempt !== lease.attemptCount || !Number.isSafeInteger(wait.ordinal) || wait.ordinal < 0) {
+  if (!commit || wait.attempt !== lease.attemptCount || !Number.isSafeInteger(wait.ordinal) || wait.ordinal < 0
+    || (wait.continuationStepId === undefined) !== (wait.continuationOrdinal === undefined)) {
     throw new Error("child_resume_wait_commit_unavailable")
   }
   return { ...store, startStep: async input => {
     const step = await store.startStep(input)
-    if (input.ordinal !== wait.ordinal + 1) return step
+    const sourceOrdinal = childWaitRecoveryLogicalStepOrdinal(wait.stepId, lease)
+    if (sourceOrdinal === undefined || input.ordinal !== sourceOrdinal + 1) return step
     const owner = input.identity
     if (owner.kind !== "task" || owner.userId !== lease.userId || owner.sessionId !== lease.sessionId || owner.turnId !== lease.turnId
       || owner.taskId !== lease.id || owner.rootTaskId !== lease.rootTaskId || owner.ownerId !== lease.ownerId
-      || owner.attemptCount !== wait.attempt || input.attempt !== wait.attempt || step.ordinal <= wait.ordinal) {
+      || owner.attemptCount !== wait.attempt || input.attempt !== wait.attempt
+      || childWaitRecoveryLogicalStepOrdinal(step.id, lease) !== sourceOrdinal + 1 || !Number.isSafeInteger(step.ordinal) || step.ordinal <= wait.ordinal
+      || wait.continuationStepId !== undefined && (step.id !== wait.continuationStepId || step.ordinal !== wait.continuationOrdinal)) {
       throw new Error("child_resume_wait_owner_mismatch")
     }
     if (await commit(lease, wait, step.ordinal) === false) throw new Error("child_resume_wait_commit_pending")
+    onAcknowledged?.(step)
     return step
   } }
 }

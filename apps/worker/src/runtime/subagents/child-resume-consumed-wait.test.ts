@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest"
 
 import { loadChildConsumedWaitResume } from "./child-resume-consumed-wait.js"
+import { loadChildWaitCallRecovery } from "./child-resume-wait-call-recovery.js"
+import { childWaitClaimEventKey } from "./child-durable-wait-replay.js"
+import type { DurableWaitResume } from "./child-resume-observations.js"
 import type { SubagentLease } from "./types.js"
 
 type Row = Record<string, unknown>
@@ -16,15 +19,16 @@ function fixture(options: { ids?: string[]; targetIds?: unknown; inputIds?: unkn
   outcomeTaskId?: unknown; outcomeTaskIds?: string[]; receiptIds?: unknown; receiptWaitId?: unknown; receiptTaskIds?: unknown; targetParentId?: string;
   mode?: unknown; inputMode?: unknown; requestMode?: unknown; status?: unknown; outcomeStatus?: unknown;
   matchedIds?: unknown; outcomeMatchedIds?: unknown; taskStatuses?: unknown[]; inputTimeoutMs?: unknown; requestTimeoutMs?: unknown;
-  deadlineAt?: string; missingReceipt?: boolean; note?: string } = {}) {
+  deadlineAt?: string | Date; receiptDeadlineAt?: string; missingReceipt?: boolean; note?: string } = {}) {
   const ids = options.ids ?? [phoneId], targetIds = options.targetIds ?? ids
   const deadlineAt = options.deadlineAt ?? "2026-10-22T10:05:00.000Z"
+  const deadlineIso = deadlineAt instanceof Date ? deadlineAt.toISOString() : deadlineAt
   const mode = options.mode ?? "any", status = options.status ?? "ready", matchedIds = options.matchedIds ?? [ids[0]]
   const taskStatuses = options.taskStatuses ?? ids.map((_, index) => index === 0 ? "completed" : "running")
   const outcomeTaskIds = options.outcomeTaskIds ?? ids
   const outcomeTasks = outcomeTaskIds.map((taskId, index) => ({ taskId: index === 0 ? options.outcomeTaskId ?? taskId : taskId,
     status: taskStatuses[ids.indexOf(taskId)], role: "writer", result: { answer: 42, ...(taskId === ids[0] && options.note ? { note: options.note } : {}) }, failureReason: null }))
-  const outcome = { waitId: "wait-1", status: options.outcomeStatus ?? status, taskIds: options.outcomeIds ?? ids, deadlineAt,
+  const outcome = { waitId: "wait-1", status: options.outcomeStatus ?? status, taskIds: options.outcomeIds ?? ids, deadlineAt: deadlineIso,
     matchedTaskIds: options.outcomeMatchedIds ?? matchedIds, tasks: outcomeTasks }
   const input = { idempotencyKey: "wait-key", taskIds: options.inputIds ?? ids, mode: options.inputMode ?? mode, timeoutMs: options.inputTimeoutMs ?? 5_000 }
   const row: Row = {
@@ -35,17 +39,77 @@ function fixture(options: { ids?: string[]; targetIds?: unknown; inputIds?: unkn
     callContent: { toolCallId: "call-1", toolName: "wait_subagents", input }, callStatus: options.missingReceipt ? "started" : "completed",
     sourceItemId: options.missingReceipt ? null : "item-result-1", resultContent: options.missingReceipt ? null : {
       toolCallId: "call-1", output: { waitId: options.receiptWaitId ?? "wait-1", status: "waiting", taskIds: options.receiptIds ?? ids,
-        deadlineAt, matchedTaskIds: [], tasks: options.receiptTaskIds ?? [] }, errorCode: null,
+        deadlineAt: options.receiptDeadlineAt ?? deadlineIso, matchedTaskIds: [], tasks: options.receiptTaskIds ?? [] }, errorCode: null,
     }, resultStatus: options.missingReceipt ? null : "completed",
   }
   const targets = ids.map((id, index) => ({ id, parentTaskId: index === 0 ? options.targetParentId ?? child.id : child.id,
     rootTaskId: child.rootTaskId, sessionId: child.sessionId, turnId: child.turnId, userId: child.userId }))
+  const queries: string[] = []
   const client = { async query(sql: string) {
+    queries.push(sql)
     if (sql.includes("WITH latest_wait AS")) return { rows: [row], rowCount: 1 }
     if (sql.includes('task."id" = ANY($1::text[])')) return { rows: targets, rowCount: targets.length }
     throw new Error(`unexpected query: ${sql}`)
   } }
-  return { client, row }
+  return { client, row, queries }
+}
+
+function claimFixture(options: { orphan?: boolean; resultWithoutStart?: boolean } = {}) {
+  const stepId = `task:${child.id}:step:1:attempt:${child.attemptCount}`, callId = "fresh-wait-call"
+  const sourceStepId = `task:${child.id}:step:0:attempt:${child.attemptCount}`
+  const callItemId = `task:${child.id}:item:tool-call:${callId}:attempt:${child.attemptCount}`
+  const resultItemId = `task:${child.id}:item:tool-result:${callId}:attempt:${child.attemptCount}`
+  const claimKey = `task:${child.id}:event:${childWaitClaimEventKey(child.attemptCount, stepId)}`
+  const wait: DurableWaitResume = {
+    waitId: "wait-1", stepId: sourceStepId, attempt: child.attemptCount, ordinal: 0, toolCallId: "call-1", sourceItemId: "item-result-1",
+    input: { idempotencyKey: "wait-key", taskIds: [phoneId], mode: "any", timeoutMs: 5_000 },
+    output: { waitId: "wait-1", status: "ready", taskIds: [phoneId], matchedTaskIds: [phoneId] },
+    continuationStepId: stepId, continuationOrdinal: 1,
+  }
+  const callContent = { toolCallId: callId, toolName: "wait_subagents", toolVersion: "1", input: wait.input,
+    ...(options.resultWithoutStart ? { status: "completed", errorCode: null } : {}) }
+  const modelStarted = { id: "model-started", sequence: "1", sessionId: child.sessionId, turnId: child.turnId, taskId: child.id, actor: "subagent",
+    type: "model.started", itemId: null, correlationId: stepId, causationId: null,
+    idempotencyKey: `task:${child.id}:event:model-started:${stepId}`, payload: { taskId: child.id, provider: "fixture", model: "fixture-model" } }
+  const modelCompleted = { id: "model-completed", sequence: "2", sessionId: child.sessionId, turnId: child.turnId, taskId: child.id, actor: "subagent",
+    type: "model.completed", itemId: null, correlationId: stepId, causationId: modelStarted.id,
+    idempotencyKey: `task:${child.id}:event:model-completed:${stepId}`,
+    payload: { taskId: child.id, provider: "fixture", model: "fixture-model", toolCallCount: 1 } }
+  const modelUsage = { id: "model-usage", sequence: "3", sessionId: child.sessionId, turnId: child.turnId, taskId: child.id, actor: "subagent",
+    type: "model.usage", itemId: null, correlationId: stepId, causationId: modelCompleted.id,
+    idempotencyKey: `task:${child.id}:event:model-usage:${stepId}`,
+    payload: { taskId: child.id, provider: "fixture", model: "fixture-model", usage: { inputTokens: 37, outputTokens: 13, estimatedCostUsd: 0.0042 } } }
+  const step = { id: stepId, status: "streaming", attempt: child.attemptCount, ordinal: 1,
+    inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }
+  const itemStarted = { id: "call-item-started", sequence: "4", sessionId: child.sessionId, turnId: child.turnId, taskId: child.id, actor: "subagent",
+    type: "item.started", itemId: callItemId, correlationId: stepId, causationId: modelUsage.id,
+    idempotencyKey: `task:${child.id}:event:item-started:${callItemId}`, payload: { itemId: callItemId, type: "tool_call", phase: null } }
+  const claim = { id: "claim-event", sequence: "5", sessionId: child.sessionId, turnId: child.turnId, taskId: child.id, actor: "subagent",
+    type: "tool_call.started", itemId: callItemId, correlationId: callId, causationId: itemStarted.id,
+    idempotencyKey: claimKey, payload: { toolCallId: callId, toolName: "wait_subagents", taskId: child.id } }
+  const events: Row[] = [modelStarted, modelCompleted, modelUsage, itemStarted, ...(!options.orphan ? [claim] : [])]
+  const callRows: Row[] = [{ id: callItemId, status: options.resultWithoutStart ? "completed" : "started", revision: options.resultWithoutStart ? 1 : 0,
+    content: callContent, stepId, attempt: child.attemptCount, ordinal: 1 }]
+  const resultRows: Row[] = options.resultWithoutStart ? [{ id: resultItemId, status: "started", revision: 0, stepId,
+    content: { toolCallId: callId, output: wait.output, errorCode: null } }] : []
+  if (options.resultWithoutStart) {
+    const itemCompleted = { id: "call-item-completed", sessionId: child.sessionId, turnId: child.turnId, taskId: child.id, actor: "subagent",
+      type: "item.completed", itemId: callItemId, correlationId: callItemId, causationId: claim.id,
+      idempotencyKey: `task:${child.id}:event:tool-call-completed:${callId}:${callItemId}:1`,
+      payload: { itemId: callItemId, status: "completed", content: callContent } }
+    events.push(itemCompleted, { id: "call-tool-completed", sessionId: child.sessionId, turnId: child.turnId, taskId: child.id, actor: "subagent",
+      type: "tool_call.completed", itemId: callItemId, correlationId: callId, causationId: itemCompleted.id,
+      idempotencyKey: `task:${child.id}:event:tool-finished:${callId}`,
+      payload: { toolCallId: callId, toolName: "wait_subagents", status: "completed", errorCode: null, taskId: child.id } })
+  }
+  const client = { async query(sql: string) {
+    if (sql.includes('FROM "agent_steps" AS step WHERE step."id"')) return { rows: [step], rowCount: 1 }
+    if (sql.includes('JOIN "agent_steps" AS step')) return { rows: callRows, rowCount: callRows.length }
+    if (sql.includes("item.\"type\" = 'tool_result'")) return { rows: resultRows, rowCount: resultRows.length }
+    if (sql.includes('FROM "agent_events" AS event')) return { rows: events, rowCount: events.length }
+    throw new Error(`unexpected query: ${sql}`)
+  } }
+  return { client, wait, callItemId, claimKey, events, resultItemId, stepId }
 }
 
 describe("consumed child wait resume", () => {
@@ -58,6 +122,18 @@ describe("consumed child wait resume", () => {
     expect(JSON.stringify(resumed)).not.toContain("+353 87 123 4567")
   })
 
+  it("compares a PostgreSQL Date deadline at millisecond precision", async () => {
+    const fake = fixture({ deadlineAt: new Date("2026-10-22T10:05:00.789Z") })
+    await expect(loadChildConsumedWaitResume(fake.client as never, child)).resolves.toMatchObject({ waitId: "wait-1" })
+  })
+
+  it("rejects receipt deadlines with a different millisecond or invalid timestamp", async () => {
+    const mismatch = fixture({ deadlineAt: new Date("2026-10-22T10:05:00.789Z"), receiptDeadlineAt: "2026-10-22T10:05:00.788Z" })
+    await expect(loadChildConsumedWaitResume(mismatch.client as never, child)).rejects.toThrow("child_resume_wait_tool_call_conflict")
+    const invalid = fixture({ receiptDeadlineAt: "not-a-deadline" })
+    await expect(loadChildConsumedWaitResume(invalid.client as never, child)).rejects.toThrow("child_resume_wait_tool_call_conflict")
+  })
+
   it("preserves allowed input and receipt reordering without changing canonical output order", async () => {
     const ids = [phoneId, "child-2"]
     const fake = fixture({ ids, inputIds: ["child-2", phoneId], requestIds: ["child-2", phoneId], receiptIds: ["child-2", phoneId],
@@ -66,6 +142,17 @@ describe("consumed child wait resume", () => {
 
     expect(resumed?.input).toMatchObject({ taskIds: ["child-2", phoneId] })
     expect(resumed?.output).toMatchObject({ taskIds: ids, tasks: [{ taskId: phoneId }, { taskId: "child-2" }] })
+  })
+
+  it("retains the consumed wait anchor after later same-attempt steps exist", async () => {
+    const fake = fixture()
+    fake.row.continuationLatestOrdinal = 4
+    await expect(loadChildConsumedWaitResume(fake.client as never, child)).resolves.toMatchObject({
+      waitId: "wait-1", continuationStepId: "step-2", continuationOrdinal: 1,
+    })
+    const lineage = fake.queries[0] ?? ""
+    expect(lineage).not.toContain("continuationLatestOrdinal")
+    expect(lineage).toContain('next."ordinal" = (SELECT MIN(later."ordinal")')
   })
 
   it("recovers an exact consumed wait when its receipt is missing", async () => {
@@ -150,5 +237,40 @@ describe("consumed child wait resume", () => {
     await expect(loadChildConsumedWaitResume(forgedReceiptTask.client as never, child)).rejects.toThrow("child_resume_wait_tool_call_conflict")
     const partialReceiptTasks = fixture({ ids: [phoneId, "child-2"], receiptTaskIds: [{ taskId: phoneId }] })
     await expect(loadChildConsumedWaitResume(partialReceiptTasks.client as never, child)).rejects.toThrow("child_resume_wait_tool_call_conflict")
+  })
+})
+
+describe("claimed child wait recovery loader", () => {
+  it("loads only a fixed-key claimed call tied to the acknowledged continuation", async () => {
+    const fake = claimFixture()
+
+    await expect(loadChildWaitCallRecovery(fake.client as never, child, fake.wait)).resolves.toMatchObject({
+      claim: {
+      owner: { id: child.id, ownerId: child.ownerId, attemptCount: child.attemptCount },
+      stepId: fake.stepId, sourceWaitCallId: "call-1", call: { id: "fresh-wait-call", name: "wait_subagents" },
+      callItem: { id: fake.callItemId, status: "started", revision: 0 }, claimEventId: "claim-event", output: fake.wait.output,
+      }, orphanCallIds: [],
+    })
+    expect(fake.events[4]).toMatchObject({ idempotencyKey: fake.claimKey, causationId: fake.events[3]!.id })
+  })
+
+  it("recognizes one complete preclaim orphan without treating it as a claim", async () => {
+    const fake = claimFixture({ orphan: true })
+    await expect(loadChildWaitCallRecovery(fake.client as never, child, fake.wait)).resolves.toMatchObject({
+      orphanCallIds: ["fresh-wait-call"], orphan: { call: { id: "fresh-wait-call", name: "wait_subagents" } },
+    })
+  })
+
+  it("rejects an orphan with a result item", async () => {
+    const fake = claimFixture({ orphan: true, resultWithoutStart: true })
+    await expect(loadChildWaitCallRecovery(fake.client as never, child, fake.wait)).rejects.toThrow("child_resume_wait_tool_call_conflict")
+  })
+
+  it("recognizes a persisted result item whose start event needs idempotent repair", async () => {
+    const fake = claimFixture({ resultWithoutStart: true })
+    await expect(loadChildWaitCallRecovery(fake.client as never, child, fake.wait)).resolves.toMatchObject({
+      claim: { callItem: { status: "completed", revision: 1 }, resultItem: { id: fake.resultItemId, status: "started", revision: 0 } },
+      orphanCallIds: [],
+    })
   })
 })

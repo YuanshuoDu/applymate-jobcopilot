@@ -4,7 +4,14 @@ export type RootTaskHistoryCrossSessionWindowInput = Readonly<{
   currentSessionId: string; userId: string; currentTurnId: string; currentStartXid8: string
   scheduledCriteria: string | null; objectiveDigest: string; semanticsVersion: number; canonicalOrigin: string
   limit: number
+  afterCursor?: RootTaskHistoryCrossSessionCursor
 }>
+
+export type RootTaskHistoryCrossSessionCursor = Readonly<{
+  xid8: string; turnId: string; terminalEventId: string; witnessEventId: string
+}>
+
+const MAX_PAGE_SIZE = 64
 
 function validIntent(json: string): string {
   return `(jsonb_typeof(${json}) = 'object' AND ${json} ?& ARRAY['kind','version']
@@ -27,14 +34,22 @@ function canonicalOriginMatches(parameter: string): string {
   END`
 }
 
-/** Builds the bounded cross-session candidate window. All DB-derived identity filters precede LIMIT. */
+/** Builds a total-order page; complete witness counts precede the cursor and the sentinel is metadata only. */
 export function buildRootTaskHistoryCrossSessionWindow(input: RootTaskHistoryCrossSessionWindowInput): Readonly<{
   sql: string; values: readonly unknown[]
 }> {
   const compatibility = scheduledAutomationHistoryCompatibilitySql("$5")
   const origin = canonicalOriginMatches("$8")
+  const limit = Number.isFinite(input.limit) ? Math.min(MAX_PAGE_SIZE, Math.max(0, Math.floor(input.limit))) : 0
+  const cursorFilter = input.afterCursor ? `WHERE ((candidate."terminalWitnessXid8")::numeric,
+        candidate."turnId" COLLATE "C", candidate."terminalEventId" COLLATE "C",
+        candidate."terminalWitnessEventId" COLLATE "C")
+        < ($10::numeric, $11::text COLLATE "C", $12::text COLLATE "C", $13::text COLLATE "C")` : ""
+  const cursorValues = input.afterCursor ? [input.afterCursor.xid8, input.afterCursor.turnId,
+    input.afterCursor.terminalEventId, input.afterCursor.witnessEventId] : []
   return {
-    sql: `SELECT event."id" AS "terminalEventId", event."sessionId", event."turnId", event."taskId", event."sequence",
+    sql: `WITH eligible_candidates AS (
+      SELECT event."id" AS "terminalEventId", event."sessionId", event."turnId", event."taskId", event."sequence",
         witness."id" AS "terminalWitnessEventId", witness.payload->>'xid8' AS "terminalWitnessXid8",
         COUNT(*) OVER (PARTITION BY event."id") AS "terminalWitnessCount"
       FROM "agent_events" AS event
@@ -81,9 +96,41 @@ export function buildRootTaskHistoryCrossSessionWindow(input: RootTaskHistoryCro
         AND (witness.payload->>'xid8')::numeric < $4::numeric
         AND turn."objectiveDigest" = $6 AND turn."objectiveIndexSemanticsVersion" = $7
         AND ${origin} AND ${compatibility}
-      ORDER BY (witness.payload->>'xid8')::numeric DESC, event."turnId" DESC
-      LIMIT $9`,
+    ), page AS MATERIALIZED (
+      -- Keep pagination outside the count window so a split witness set stays ambiguous.
+      SELECT candidate.* FROM eligible_candidates AS candidate
+      ${cursorFilter}
+      ORDER BY (candidate."terminalWitnessXid8")::numeric DESC, candidate."turnId" COLLATE "C" DESC,
+        candidate."terminalEventId" COLLATE "C" DESC, candidate."terminalWitnessEventId" COLLATE "C" DESC
+      LIMIT $9
+    ), watermark AS (
+      SELECT page."terminalWitnessXid8", page."turnId", page."terminalEventId", page."terminalWitnessEventId"
+      FROM page
+      ORDER BY (page."terminalWitnessXid8")::numeric ASC, page."turnId" COLLATE "C" ASC,
+        page."terminalEventId" COLLATE "C" ASC, page."terminalWitnessEventId" COLLATE "C" ASC
+      LIMIT 1
+    ), window_rows AS (
+      SELECT page.*, FALSE AS "isPageWatermark", NULL::text AS "pageCursorXid8",
+        NULL::text AS "pageCursorTurnId", NULL::text AS "pageCursorTerminalEventId",
+        NULL::text AS "pageCursorWitnessEventId", NULL::integer AS "pageRawRowCount"
+      FROM page
+      UNION ALL
+      SELECT NULL::text AS "terminalEventId", NULL::text AS "sessionId", NULL::text AS "turnId",
+        NULL::text AS "taskId", NULL::bigint AS "sequence", NULL::text AS "terminalWitnessEventId",
+        NULL::text AS "terminalWitnessXid8", NULL::bigint AS "terminalWitnessCount",
+        TRUE AS "isPageWatermark",
+        (SELECT "terminalWitnessXid8" FROM watermark) AS "pageCursorXid8",
+        (SELECT "turnId" FROM watermark) AS "pageCursorTurnId",
+        (SELECT "terminalEventId" FROM watermark) AS "pageCursorTerminalEventId",
+        (SELECT "terminalWitnessEventId" FROM watermark) AS "pageCursorWitnessEventId",
+        (SELECT COUNT(*)::integer FROM page) AS "pageRawRowCount"
+    )
+    SELECT * FROM window_rows
+    ORDER BY "isPageWatermark" ASC, ("terminalWitnessXid8")::numeric DESC NULLS LAST,
+      "turnId" COLLATE "C" DESC NULLS LAST, "terminalEventId" COLLATE "C" DESC NULLS LAST,
+      "terminalWitnessEventId" COLLATE "C" DESC NULLS LAST`,
     values: [input.currentSessionId, input.userId, input.currentTurnId, input.currentStartXid8,
-      input.scheduledCriteria, input.objectiveDigest, input.semanticsVersion, input.canonicalOrigin, input.limit],
+      input.scheduledCriteria, input.objectiveDigest, input.semanticsVersion, input.canonicalOrigin, limit,
+      ...cursorValues],
   }
 }
