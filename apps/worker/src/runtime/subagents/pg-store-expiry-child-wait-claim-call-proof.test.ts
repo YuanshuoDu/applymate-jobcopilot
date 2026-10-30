@@ -51,7 +51,11 @@ describe("completed child-wait claim call without item.completed", () => {
 
   it("preserves the original started and exact completed-event lifecycle gates", () => {
     const sql = CHILD_WAIT_CALL_LIFECYCLE_SQL.replace(/\s+/g, " ")
-    expect(sql).toContain(`claimedCall."status" = 'started' AND NOT EXISTS`)
+    expect(sql).toContain(`claimedCall."status" = 'started' AND (SELECT COUNT(*) FROM "agent_items" AS stepCall`)
+    expect(sql).toContain(`stepCall."stepId" = continuation."id" AND stepCall."type" = 'tool_call') = 1`)
+    expect(sql).toContain(`extra."correlationId" = started."correlationId" OR extra."causationId" = itemStarted."id" OR extra."causationId" = started."id"`)
+    expect(sql).toContain(`extra."idempotencyKey" = 'task:' || owner."id" || ':event:tool-call-completed:'`)
+    expect(sql).toContain(`extra."idempotencyKey" = 'task:' || owner."id" || ':event:tool-finished:'`)
     expect(sql).toContain(`claimedCall."status" = 'completed' AND EXISTS`)
     expect(sql).toContain(`itemCompleted."actor" = 'subagent' AND itemCompleted."correlationId" = claimedCall."id"`)
     expect(sql).toContain(`itemCompleted."causationId" = started."id"`)

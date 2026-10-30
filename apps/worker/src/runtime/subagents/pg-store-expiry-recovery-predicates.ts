@@ -183,19 +183,20 @@ export const CHILD_WAIT_CLAIM_RECOVERY_SQL = `started."type" = 'tool_call.starte
     AND ${CHILD_WAIT_CALL_LIFECYCLE_SQL}
     AND NOT EXISTS (SELECT 1 FROM "agent_events" AS extra WHERE extra."sessionId" = claimedCall."sessionId" AND extra."turnId" = claimedCall."turnId"
       AND extra."taskId" = claimedCall."taskId" AND (extra."itemId" = claimedCall."id" OR extra."correlationId" = claimedCall."id"
-        OR (claimedCall."status" = 'completed' AND extra."correlationId" = started."correlationId"))
+        OR extra."correlationId" = started."correlationId" OR extra."causationId" = itemStarted."id" OR extra."causationId" = started."id"
+        OR extra."idempotencyKey" = 'task:' || owner."id" || ':event:tool-call-completed:' || started."correlationId" || ':' || claimedCall."id" || ':1' OR extra."idempotencyKey" = 'task:' || owner."id" || ':event:tool-finished:' || started."correlationId")
       AND extra."id" <> itemStarted."id" AND extra."id" <> started."id"
       AND NOT (claimedCall."status" = 'completed' AND extra."type" = 'item.completed' AND extra."itemId" = claimedCall."id" AND extra."actor" = 'subagent'
         AND extra."correlationId" = claimedCall."id" AND extra."causationId" = started."id"
         AND extra."idempotencyKey" = 'task:' || owner."id" || ':event:tool-call-completed:' || started."correlationId" || ':' || claimedCall."id" || ':1'
         AND extra."payload" = jsonb_build_object('itemId', claimedCall."id", 'status', 'completed', 'content', claimedCall."content")))
     AND NOT EXISTS (SELECT 1 FROM "agent_items" AS result WHERE result."sessionId" = claimedCall."sessionId" AND result."turnId" = claimedCall."turnId"
-      AND result."taskId" = claimedCall."taskId" AND result."stepId" = claimedCall."stepId" AND result."type" = 'tool_result'
-      AND result."content"->>'toolCallId' = started."correlationId")
+      AND result."taskId" = claimedCall."taskId" AND (result."id" = 'task:' || owner."id" || ':item:tool-result:' || started."correlationId" || ':attempt:' || owner."attemptCount"::text
+        OR (result."stepId" = continuation."id" AND result."type" = 'tool_result' AND result."content"->>'toolCallId' = started."correlationId")))
     AND NOT EXISTS (SELECT 1 FROM "agent_events" AS resultEvent WHERE resultEvent."sessionId" = claimedCall."sessionId"
-      AND resultEvent."turnId" = claimedCall."turnId" AND resultEvent."taskId" = claimedCall."taskId"
-      AND (resultEvent."itemId" = 'task:' || owner."id" || ':item:tool-result:' || started."correlationId" || ':attempt:' || owner."attemptCount"::text
-        OR resultEvent."correlationId" = 'task:' || owner."id" || ':item:tool-result:' || started."correlationId" || ':attempt:' || owner."attemptCount"::text))
+      AND resultEvent."turnId" = claimedCall."turnId" AND resultEvent."taskId" = claimedCall."taskId" AND (resultEvent."itemId" = 'task:' || owner."id" || ':item:tool-result:' || started."correlationId" || ':attempt:' || owner."attemptCount"::text
+        OR resultEvent."correlationId" = 'task:' || owner."id" || ':item:tool-result:' || started."correlationId" || ':attempt:' || owner."attemptCount"::text OR resultEvent."idempotencyKey" = 'task:' || owner."id" || ':event:item-started:task:' || owner."id" || ':item:tool-result:' || started."correlationId" || ':attempt:' || owner."attemptCount"::text
+        OR resultEvent."idempotencyKey" = 'task:' || owner."id" || ':event:tool-result-completed:' || started."correlationId" || ':task:' || owner."id" || ':item:tool-result:' || started."correlationId" || ':attempt:' || owner."attemptCount"::text || ':1'))
 )`
 
 export async function hasBlockingExternalCall(client: pg.PoolClient, task: Record<string, unknown>, ignoredEventId?: string, continuationId?: string): Promise<boolean> {

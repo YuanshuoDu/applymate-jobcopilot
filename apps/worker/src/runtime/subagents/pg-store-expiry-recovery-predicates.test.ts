@@ -93,7 +93,9 @@ describe("expired recovery SQL predicates", () => {
     expect(sql).toContain(`stepCall."stepId" = continuation."id" AND stepCall."type" = 'tool_call') = 1`)
     expect(sql).toContain(`(itemCompleted."itemId" = claimedCall."id" OR itemCompleted."correlationId" = claimedCall."id")`)
     expect(sql).toContain(`extra."itemId" = claimedCall."id" OR extra."correlationId" = claimedCall."id"`)
-    expect(sql).toContain(`claimedCall."status" = 'completed' AND extra."correlationId" = started."correlationId"`)
+    expect(sql).toContain(`extra."correlationId" = started."correlationId" OR extra."causationId" = itemStarted."id" OR extra."causationId" = started."id"`)
+    expect(sql).toContain(`extra."idempotencyKey" = 'task:' || owner."id" || ':event:tool-call-completed:'`)
+    expect(sql).toContain(`extra."idempotencyKey" = 'task:' || owner."id" || ':event:tool-finished:'`)
     expect(sql).toContain(`extra."type" = 'item.completed' AND extra."itemId" = claimedCall."id" AND extra."actor" = 'subagent'`)
     expect(sql).toContain("jsonb_typeof(sourceResult.\"content\"->'output'->'taskIds') = 'array'")
     expect(sql).toContain('AS receiptTarget(id) ORDER BY id)) = (SELECT ARRAY(SELECT id FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(wait."targetTaskIds")')
@@ -106,7 +108,10 @@ describe("expired recovery SQL predicates", () => {
     expect(sql).toContain("CASE WHEN jsonb_typeof(sourceCall.\"content\"->'input') = 'object' THEN ((sourceCall.\"content\"->'input') - 'taskIds'::text) - 'idempotencyKey'::text ELSE '{}'::jsonb END")
     expect(sql).toContain("CASE WHEN jsonb_typeof(call.\"content\"->'input') = 'object' THEN (call.\"content\"->'input') - 'taskIds'::text ELSE '{}'::jsonb END")
     expect(sql).toContain('AND NOT EXISTS (SELECT 1 FROM "agent_items" AS result')
+    expect(sql).toContain(`result."id" = 'task:' || owner."id" || ':item:tool-result:' || started."correlationId" || ':attempt:' || owner."attemptCount"::text`)
     expect(sql).toContain('AND NOT EXISTS (SELECT 1 FROM "agent_events" AS extra')
+    expect(sql).toContain(`resultEvent."idempotencyKey" = 'task:' || owner."id" || ':event:item-started:task:'`)
+    expect(sql).toContain(`resultEvent."idempotencyKey" = 'task:' || owner."id" || ':event:tool-result-completed:'`)
   })
 
   it("blocks a valid-looking continuation claim when its receipt deadline differs from the database wait", async () => {

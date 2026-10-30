@@ -345,6 +345,22 @@ async function expectAbsentSourceResultClaimSafety(pool: Pool, ids: FixtureIds, 
     )
     expect(waitRows.rows).toHaveLength(1)
     expect(continuationCalls.rows).toHaveLength(1)
+    const claimItemResult = await client.query<{ id: string; content: Record<string, unknown> }>(
+      `SELECT "id", "content" FROM "agent_items" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 AND "stepId" = $5 AND "type" = 'tool_call'`,
+      [continuationCalls.rows[0]!.id, ids.sessionId, ids.turnId, ids.waiterTaskId, continuationStepId],
+    )
+    expect(claimItemResult.rows).toHaveLength(1)
+    const claimItem = claimItemResult.rows[0]
+    const claimCallId = claimItem?.content.toolCallId
+    if (!claimItem || typeof claimCallId !== "string" || !claimCallId) throw new Error("fixture_claim_call_identity_missing")
+    const claimEventsResult = await client.query<{ id: string; type: string; itemId: string | null; correlationId: string; causationId: string | null }>(
+      `SELECT "id", "type", "itemId", "correlationId", "causationId" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
+       AND "taskId" = $3 AND ("itemId" = $4 OR "correlationId" = $5) ORDER BY "sequence"`,
+      [ids.sessionId, ids.turnId, ids.waiterTaskId, claimItem.id, claimCallId],
+    )
+    expect(claimEventsResult.rows.map(event => event.type)).toEqual(["item.started", "tool_call.started"])
+    const claimItemStarted = claimEventsResult.rows[0]!
+    const claimStarted = claimEventsResult.rows[1]!
     const phoneWaitKey = `child-wait:415-555-0134:${ids.waiterTaskId}:attempt:1`
     const projectedPhoneWaitKey = safeProjectedWaitKey({ taskIds: [FIXED_WAIT_TARGET_TASK_ID], mode: "any", timeoutMs: 30_000,
       idempotencyKey: phoneWaitKey })
@@ -395,9 +411,43 @@ async function expectAbsentSourceResultClaimSafety(pool: Pool, ids: FixtureIds, 
         await client.query(`RELEASE SAVEPOINT ${name}`)
       }
     }
+    const insertClaimEvent = async (input: { type: string; itemId: string | null; correlationId: string; causationId: string | null;
+      idempotencyKey: string; payload: Record<string, unknown> }): Promise<void> => {
+      const sequence = await client.query<{ eventSequence: string }>(
+        `UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1 WHERE "id" = $1 RETURNING "eventSequence"::text AS "eventSequence"`,
+        [ids.sessionId],
+      )
+      await client.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor",
+          "correlationId", "causationId", "idempotencyKey", "payload")
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'subagent', $8, $9, $10, $11::jsonb)`, [
+        `fixture-claim-extra-${randomUUID()}`, ids.sessionId, ids.turnId, input.itemId, ids.waiterTaskId, sequence.rows[0]!.eventSequence,
+        input.type, input.correlationId, input.causationId, input.idempotencyKey, JSON.stringify(input.payload),
+      ])
+    }
     await remainsBlocked("stale lease owner", async () => {}, { ...task, leaseOwner: `${task.leaseOwner}:stale` })
     await remainsBlocked("stale attempt", async () => {}, { ...task, attemptCount: task.attemptCount + 1 })
     await remainsBlocked("stale lease expiry", async () => {}, { ...task, leaseExpiresAt: new Date(task.leaseExpiresAt.getTime() + 1_000) })
+    await remainsBlocked("malformed terminal with provider call ID but wrong item, causation, and payload", () => insertClaimEvent({
+      type: "tool_call.completed", itemId: null, correlationId: claimCallId, causationId: null,
+      idempotencyKey: `fixture-claim-malformed-terminal:${randomUUID()}`,
+      payload: { toolCallId: claimCallId, toolName: "jobs.search", status: "completed", errorCode: null, taskId: ids.waiterTaskId },
+    }))
+    await remainsBlocked("item.failed event associated by the claim item correlation", () => insertClaimEvent({
+      type: "item.failed", itemId: null, correlationId: claimItem.id, causationId: null,
+      idempotencyKey: `fixture-claim-item-failed:${randomUUID()}`, payload: { itemId: claimItem.id, errorCode: "fixture" },
+    }))
+    await remainsBlocked("extra event causally attached to item.started", () => insertClaimEvent({
+      type: "item.delta", itemId: null, correlationId: `fixture-correlation-${randomUUID()}`, causationId: claimItemStarted.id,
+      idempotencyKey: `fixture-claim-item-start-cause:${randomUUID()}`, payload: { text: "fixture" },
+    }))
+    await remainsBlocked("extra event causally attached to tool_call.started", () => insertClaimEvent({
+      type: "item.delta", itemId: null, correlationId: `fixture-correlation-${randomUUID()}`, causationId: claimStarted.id,
+      idempotencyKey: `fixture-claim-call-start-cause:${randomUUID()}`, payload: { text: "fixture" },
+    }))
+    await remainsBlocked("completion idempotency key without its lifecycle event", () => insertClaimEvent({
+      type: "item.delta", itemId: null, correlationId: `fixture-correlation-${randomUUID()}`, causationId: null,
+      idempotencyKey: `task:${ids.waiterTaskId}:event:tool-call-completed:${claimCallId}:${claimItem.id}:1`, payload: { text: "fixture" },
+    }))
     await remainsBlocked("source call start with wrong item.started causation", async () => {
       if (!callStarted) throw new Error("fixture_source_call_start_event_missing")
       await client.query(`UPDATE "agent_events" SET "causationId" = $2 WHERE "id" = $1`, [callStarted.id, "wrong-source-item-start"])
@@ -426,6 +476,39 @@ async function expectAbsentSourceResultClaimSafety(pool: Pool, ids: FixtureIds, 
         JSON.stringify({ ...originalContent, toolCallId: duplicateCallId }),
       ])
     })
+    await remainsBlocked("competing tool call in the claimed continuation step", async () => {
+      const duplicateCallId = `fixture-competing-claim:${randomUUID()}`
+      await client.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "revision", "content", "startedAt", "updatedAt")
+        VALUES ($1, $2, $3, $4, $5, 'tool_call', 'started', NULL, 0, $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, [
+        `task:${ids.waiterTaskId}:item:tool-call:${duplicateCallId}:attempt:${task.attemptCount}`, ids.sessionId, ids.turnId,
+        continuationStepId, ids.waiterTaskId, JSON.stringify({ toolCallId: duplicateCallId, toolName: "jobs.search", toolVersion: "1", input: {} }),
+      ])
+    })
+    const expectedResultItemId = `task:${ids.waiterTaskId}:item:tool-result:${claimCallId}:attempt:${task.attemptCount}`
+    await remainsBlocked("deterministic result item ID is blocking even with a changed toolCallId", async () => {
+      await client.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "revision", "content", "startedAt", "completedAt", "updatedAt")
+        VALUES ($1, $2, $3, $4, $5, 'tool_result', 'completed', 1, $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, [
+        expectedResultItemId, ids.sessionId, ids.turnId, continuationStepId, ids.waiterTaskId,
+        JSON.stringify({ toolCallId: `tampered-${claimCallId}`, output: null, errorCode: null }),
+      ])
+    })
+    await remainsBlocked("tool result row matching the provider call ID", async () => {
+      await client.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "revision", "content", "startedAt", "completedAt", "updatedAt")
+        VALUES ($1, $2, $3, $4, $5, 'tool_result', 'completed', 1, $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, [
+        `fixture-result-row-${randomUUID()}`, ids.sessionId, ids.turnId, continuationStepId, ids.waiterTaskId,
+        JSON.stringify({ toolCallId: claimCallId, output: null, errorCode: null }),
+      ])
+    })
+    await remainsBlocked("result item-start idempotency key blocks a misidentified event", () => insertClaimEvent({
+      type: "item.started", itemId: null, correlationId: `fixture-result-correlation-${randomUUID()}`, causationId: null,
+      idempotencyKey: `task:${ids.waiterTaskId}:event:item-started:${expectedResultItemId}`,
+      payload: { itemId: expectedResultItemId, type: "tool_result", phase: null },
+    }))
+    await remainsBlocked("result item-completion idempotency key blocks a misidentified event", () => insertClaimEvent({
+      type: "item.completed", itemId: null, correlationId: `fixture-result-correlation-${randomUUID()}`, causationId: null,
+      idempotencyKey: `task:${ids.waiterTaskId}:event:tool-result-completed:${claimCallId}:${expectedResultItemId}:1`,
+      payload: { itemId: expectedResultItemId, status: "completed", content: { toolCallId: claimCallId } },
+    }))
     await remainsBlocked("duplicate result items for source call", async () => {
       const duplicateA = `fixture-source-result-a-${randomUUID()}`
       const duplicateB = `fixture-source-result-b-${randomUUID()}`

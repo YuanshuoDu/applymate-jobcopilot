@@ -36,7 +36,10 @@ export const CHILD_WAIT_CALL_ITEM_COMPLETED_NO_EVENT_SQL = `(
     AND itemCompleted."type" = 'item.completed')
   AND NOT EXISTS (SELECT 1 FROM "agent_events" AS extra WHERE extra."sessionId" = claimedCall."sessionId"
     AND extra."turnId" = claimedCall."turnId" AND extra."taskId" = claimedCall."taskId"
-    AND (extra."itemId" = claimedCall."id" OR extra."correlationId" = claimedCall."id" OR extra."correlationId" = started."correlationId")
+    AND (extra."itemId" = claimedCall."id" OR extra."correlationId" = claimedCall."id" OR extra."correlationId" = started."correlationId"
+      OR extra."causationId" = itemStarted."id" OR extra."causationId" = started."id"
+      OR extra."idempotencyKey" = 'task:' || owner."id" || ':event:tool-call-completed:' || started."correlationId" || ':' || claimedCall."id" || ':1'
+      OR extra."idempotencyKey" = 'task:' || owner."id" || ':event:tool-finished:' || started."correlationId")
     AND extra."id" <> itemStarted."id" AND extra."id" <> started."id")
   AND NOT EXISTS (SELECT 1 FROM "agent_events" AS terminal WHERE terminal."sessionId" = claimedCall."sessionId"
     AND terminal."turnId" = claimedCall."turnId" AND terminal."taskId" = claimedCall."taskId"
@@ -52,10 +55,21 @@ export const CHILD_WAIT_CALL_ITEM_COMPLETED_NO_EVENT_SQL = `(
 )`
 
 export const CHILD_WAIT_CALL_LIFECYCLE_SQL = `(
-  (claimedCall."status" = 'started' AND NOT EXISTS (SELECT 1 FROM "agent_events" AS itemCompleted
-    WHERE itemCompleted."sessionId" = claimedCall."sessionId" AND itemCompleted."turnId" = claimedCall."turnId"
-      AND itemCompleted."taskId" = claimedCall."taskId"
-      AND (itemCompleted."itemId" = claimedCall."id" OR itemCompleted."correlationId" = claimedCall."id") AND itemCompleted."type" = 'item.completed'))
+  (claimedCall."status" = 'started'
+    AND (SELECT COUNT(*) FROM "agent_items" AS stepCall WHERE stepCall."sessionId" = claimedCall."sessionId"
+      AND stepCall."turnId" = claimedCall."turnId" AND stepCall."taskId" = claimedCall."taskId"
+      AND stepCall."stepId" = continuation."id" AND stepCall."type" = 'tool_call') = 1
+    AND NOT EXISTS (SELECT 1 FROM "agent_events" AS itemCompleted
+      WHERE itemCompleted."sessionId" = claimedCall."sessionId" AND itemCompleted."turnId" = claimedCall."turnId"
+        AND itemCompleted."taskId" = claimedCall."taskId"
+        AND (itemCompleted."itemId" = claimedCall."id" OR itemCompleted."correlationId" = claimedCall."id") AND itemCompleted."type" = 'item.completed')
+    AND NOT EXISTS (SELECT 1 FROM "agent_events" AS extra WHERE extra."sessionId" = claimedCall."sessionId"
+      AND extra."turnId" = claimedCall."turnId" AND extra."taskId" = claimedCall."taskId"
+      AND (extra."itemId" = claimedCall."id" OR extra."correlationId" = claimedCall."id" OR extra."correlationId" = started."correlationId"
+        OR extra."causationId" = itemStarted."id" OR extra."causationId" = started."id"
+        OR extra."idempotencyKey" = 'task:' || owner."id" || ':event:tool-call-completed:' || started."correlationId" || ':' || claimedCall."id" || ':1'
+        OR extra."idempotencyKey" = 'task:' || owner."id" || ':event:tool-finished:' || started."correlationId")
+      AND extra."id" <> itemStarted."id" AND extra."id" <> started."id"))
   OR (claimedCall."status" = 'completed' AND EXISTS (SELECT 1 FROM "agent_events" AS itemCompleted
     WHERE itemCompleted."sessionId" = claimedCall."sessionId" AND itemCompleted."turnId" = claimedCall."turnId"
       AND itemCompleted."taskId" = claimedCall."taskId" AND itemCompleted."itemId" = claimedCall."id" AND itemCompleted."type" = 'item.completed'
