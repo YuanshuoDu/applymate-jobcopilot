@@ -561,7 +561,7 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
       .resolves.toBeNull()
     const statuses = await admin!.query<{ id: string; status: string; consumedByStepId: string | null }>(
       `SELECT "id", "status", "consumedByStepId" FROM "agent_inputs" WHERE "sessionId" = $1 AND "id" = ANY($2::text[]) ORDER BY "id"`,
-      [fixture.sessionId, [fixture.consumedSteerId, fixture.acceptedSteerId, `planning-later-steer-${fixture.turnId}`]])
+      [fixture.sessionId, [fixture.consumedSteerId, fixture.acceptedSteerId, laterSteerId]])
     expect(statuses.rows.find(input => input.id === fixture.consumedSteerId)).toMatchObject({ status: "consumed", consumedByStepId: fixture.stepId })
     expect(statuses.rows.find(input => input.id === fixture.acceptedSteerId)).toMatchObject({ status: "accepted", consumedByStepId: null })
     expect(statuses.rows.find(input => input.id === laterSteerId)).toMatchObject({ status: "consumed", consumedByStepId: fixture.stepId })
@@ -654,11 +654,12 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
     const beforeLock = await beginSessionBlocker(beforeFixture)
     const acceptFirstName = `clarify_accept_first_${beforeFixture.turnId.slice(-8)}`
     const waitAfterName = `clarify_wait_after_accept_${beforeFixture.turnId.slice(-8)}`
+    const beforeSteerId = randomUUID()
     let acceptBefore: Promise<number> | undefined
     let waitAfterAccept: Promise<unknown> | undefined
     let releasedBefore = false
     try {
-      acceptBefore = acceptSteer(beforeFixture, acceptFirstName, randomUUID())
+      acceptBefore = acceptSteer(beforeFixture, acceptFirstName, beforeSteerId)
       await waitForLockWait(acceptFirstName, beforeLock.pid)
       waitAfterAccept = createPgTurnQuestionStore(runtimePool(writer!, waitAfterName))
         .waitForQuestion({ owner: beforeFixture.owner, stepId: beforeFixture.stepId, toolCallId: beforeFixture.callId, now: new Date() })
@@ -668,7 +669,7 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
       await Promise.all([acceptBefore, waitAfterAccept])
       const beforeReceipt = await planningEvent(admin!, beforeFixture, questionId(beforeFixture.owner, beforeFixture.stepId, beforeFixture.callId))
       expect(beforeReceipt.payload.pendingSteers).toEqual(expect.arrayContaining([
-        expect.objectContaining({ id: `planning-before-${beforeFixture.turnId}`, status: "accepted" }),
+        expect.objectContaining({ id: beforeSteerId, status: "accepted" }),
       ]))
     } finally {
       if (!releasedBefore) await beforeLock.client.query("ROLLBACK").catch(() => undefined)
@@ -682,6 +683,7 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
     const afterLock = await beginSessionBlocker(afterFixture)
     const waitBeforeName = `clarify_wait_before_accept_${afterFixture.turnId.slice(-8)}`
     const acceptSecondName = `clarify_accept_second_${afterFixture.turnId.slice(-8)}`
+    const afterSteerId = randomUUID()
     let waitBeforeAccept: Promise<unknown> | undefined
     let acceptAfter: Promise<number> | undefined
     let releasedAfter = false
@@ -689,14 +691,14 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
       waitBeforeAccept = createPgTurnQuestionStore(runtimePool(writer!, waitBeforeName))
         .waitForQuestion({ owner: afterFixture.owner, stepId: afterFixture.stepId, toolCallId: afterFixture.callId, now: new Date() })
       await waitForLockWait(waitBeforeName, afterLock.pid)
-      acceptAfter = acceptSteer(afterFixture, acceptSecondName, randomUUID())
+      acceptAfter = acceptSteer(afterFixture, acceptSecondName, afterSteerId)
       await waitForLockWait(acceptSecondName)
       await afterLock.client.query("COMMIT")
       releasedAfter = true
       await Promise.all([waitBeforeAccept, acceptAfter])
       const afterReceipt = await planningEvent(admin!, afterFixture, questionId(afterFixture.owner, afterFixture.stepId, afterFixture.callId))
       expect(afterReceipt.payload.pendingSteers).toEqual([])
-      const later = await admin!.query<{ status: string }>(`SELECT "status" FROM "agent_inputs" WHERE "id" = $1`, [`planning-after-${afterFixture.turnId}`])
+      const later = await admin!.query<{ status: string }>(`SELECT "status" FROM "agent_inputs" WHERE "id" = $1`, [afterSteerId])
       expect(later.rows).toEqual([{ status: "accepted" }])
     } finally {
       if (!releasedAfter) await afterLock.client.query("ROLLBACK").catch(() => undefined)
