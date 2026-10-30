@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool, type PoolClient } from "pg"
+import { redactAgentEvent } from "@jobcopilot/shared"
 import { executionKey } from "../turns/turn-execution-types.js"
 import { buildCognitiveActionAgenda } from "../turns/cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt } from "../turns/cognitive-agenda-receipt.js"
@@ -42,14 +43,14 @@ const suffix = randomUUID(), ids = {
   turnOwner: `steering-reconcile-turn-owner-${suffix}`, taskOwner: `steering-reconcile-task-owner-${suffix}`,
   originStep: `steering-reconcile-origin-${suffix}`, keepStep: `steering-reconcile-keep-${suffix}`,
   consumeStep: `steering-reconcile-consume-${suffix}`, currentStep: `steering-reconcile-current-${suffix}`,
-  originalInput: `steering-reconcile-original-${suffix}`, firstSteer: `steering-reconcile-steer-1-${suffix}`,
-  laterSteer: `steering-reconcile-steer-2-${suffix}`, questionItem: `steering-reconcile-question-${suffix}`,
+  originalInput: randomUUID(), firstSteer: randomUUID(), laterSteer: randomUUID(), questionItem: `steering-reconcile-question-${suffix}`,
   keepCall: `steering-reconcile-keep-call-${suffix}`, reviseCall: `steering-reconcile-revise-call-${suffix}`,
 }
 const runtimeRole = `steering_reconcile_runtime_${suffix.replaceAll("-", "")}`
 const acceptanceApplicationName = `steer_accept_${suffix}`
 const decisionApplicationName = `steer_decide_${suffix}`
 const future = new Date(Date.now() + 10 * 60_000)
+const clientMessageId = (inputId: string) => `steering-${inputId}-415-555-0100`
 const executionIdentity = { kind: "turn" as const, userId: ids.user, sessionId: ids.session, turnId: ids.turn, taskId: ids.root,
   rootTaskId: ids.root, ownerId: ids.turnOwner, leaseVersion: 1, leaseExpiresAt: future }
 const scope: TaskGraphExecutionScope = { userId: ids.user, sessionId: ids.session, turnId: ids.turn, rootTaskId: ids.root,
@@ -81,20 +82,31 @@ async function insertEvent(input: { id: string; sequence: number; type: string; 
   [input.id, ids.session, ids.turn, input.itemId, input.taskId, input.sequence, input.type, input.actor, input.correlationId,
     input.causationId ?? null, input.idempotencyKey, JSON.stringify(input.payload)])
 }
-async function insertMessage(id: string, clientMessageId: string, sequence: number, delivery: "steer" | "follow_up",
+function acceptedEventPayload(input: { inputId: string; itemId: string; clientMessageId: string; delivery: "steer" | "follow_up";
+  disposition: "started" | "steered" | "queued_follow_up" | "duplicate" | "interrupted" }): unknown {
+  const safe = redactAgentEvent({ type: "input.accepted", body: "", routing: { sessionId: ids.session, turnId: ids.turn, itemId: input.itemId,
+    taskId: null, actor: "user", correlationId: ids.turn, causationId: null, outboxTopic: "agent.session.event" }, data: {
+    inputId: input.inputId, clientMessageId: input.clientMessageId, delivery: input.delivery, source: "user", disposition: input.disposition,
+  } }).data
+  if (!safe || typeof safe !== "object" || Array.isArray(safe)) throw new Error("steering reconciliation fixture accepted event was not safe")
+  return safe
+}
+async function insertMessage(id: string, clientMessageId: string, sequence: number, delivery: "steer",
   consumedByStepId = id === ids.originalInput ? ids.originStep : sequence === 2 ? ids.keepStep : ids.consumeStep,
-  parts: readonly { type: "text"; text: string }[] = [{ type: "text", text: `User steer ${id}` }]): Promise<void> {
+  parts: readonly { type: "text"; text: string }[] = [{ type: "text", text: `User steer ${id}` }]): Promise<{ itemId: string; eventId: string }> {
+  const itemId = randomUUID(), eventId = randomUUID()
   const content = { parts, clientMessageId, source: "user", disposition: "steered" }
-  await adminPool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "revision", "content", "createdAt", "updatedAt")
-    VALUES ($1, $2, $3, $4, NULL, 'user_message', 'completed', NULL, 0, $5::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-  [`${id}-item`, ids.session, ids.turn, ids.originStep, JSON.stringify(content)])
+  await adminPool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "revision", "content", "startedAt", "completedAt", "createdAt", "updatedAt")
+    VALUES ($1, $2, $3, NULL, NULL, 'user_message', 'completed', 'commentary', 0, $4::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+  [itemId, ids.session, ids.turn, JSON.stringify(content)])
   await adminPool!.query(`INSERT INTO "agent_inputs" ("id", "sessionId", "targetTurnId", "userId", "clientMessageId", "delivery", "status", "content", "acceptedSequence", "consumedByStepId", "consumedAt")
     VALUES ($1, $2, $3, $4, $5, $6, 'consumed', $7::jsonb, $8, $9, CURRENT_TIMESTAMP)`,
   [id, ids.session, ids.turn, ids.user, clientMessageId, delivery, JSON.stringify(parts), sequence,
     consumedByStepId])
-  await insertEvent({ id: `${id}-accepted-event`, sequence, type: "input.accepted", actor: "user", itemId: `${id}-item`, taskId: null,
-    correlationId: ids.turn, idempotencyKey: `input.accepted:${clientMessageId}`,
-    payload: { inputId: id, clientMessageId, delivery, source: "user", disposition: "steered" } })
+  await insertEvent({ id: eventId, sequence, type: "input.accepted", actor: "user", itemId, taskId: null,
+    correlationId: ids.turn, idempotencyKey: `agent-command:${clientMessageId}`,
+    payload: acceptedEventPayload({ inputId: id, itemId, clientMessageId, delivery, disposition: "steered" }) })
+  return { itemId, eventId }
 }
 function restrictedCommandPool(base: Pool): PgSubagentPool {
   return { async connect() {
@@ -138,7 +150,7 @@ async function waitForAnyLockWait(applicationName: string): Promise<void> {
 }
 async function acceptSteer(client: PoolClient, id: string, messageId: string, text: string): Promise<number> {
   // Mirrors the Web producer's accepted item/event/input facts; this fixture does not call its HTTP service.
-  const itemId = `${id}-item`, content = { parts: [{ type: "text", text }], clientMessageId: messageId, source: "user", disposition: "steered" }
+  const itemId = randomUUID(), eventId = randomUUID(), content = { parts: [{ type: "text", text }], clientMessageId: messageId, source: "user", disposition: "steered" }
   await client.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "type", "status", "phase", "revision", "content", "startedAt", "completedAt", "updatedAt")
     VALUES ($1, $2, $3, 'user_message', 'completed', 'commentary', 0, $4::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
   [itemId, ids.session, ids.turn, JSON.stringify(content)])
@@ -147,8 +159,8 @@ async function acceptSteer(client: PoolClient, id: string, messageId: string, te
   if (sequence === undefined) throw new Error("could not allocate user acceptance sequence")
   await client.query(`INSERT INTO "agent_events" (${EVENT_COLUMNS})
     VALUES ($1, $2, $3, $4, NULL, $5, 'input.accepted', 'user', $3, NULL, $6, $7::jsonb)`,
-  [`${id}-accepted-event`, ids.session, ids.turn, itemId, sequence, `agent-command:${messageId}`,
-    JSON.stringify({ inputId: id, clientMessageId: messageId, delivery: "steer", source: "user", disposition: "steered" })])
+  [eventId, ids.session, ids.turn, itemId, sequence, `agent-command:${messageId}`,
+    acceptedEventPayload({ inputId: id, itemId, clientMessageId: messageId, delivery: "steer", disposition: "steered" })])
   await client.query(`INSERT INTO "agent_inputs" ("id", "sessionId", "targetTurnId", "userId", "clientMessageId", "delivery", "status", "content", "acceptedSequence")
     VALUES ($1, $2, $3, $4, $5, 'steer', 'accepted', $6::jsonb, $7)`,
   [id, ids.session, ids.turn, ids.user, messageId, JSON.stringify([{ type: "text", text }]), sequence])
@@ -228,7 +240,7 @@ async function seedBase(): Promise<void> {
   await adminPool!.query(`INSERT INTO "agent_turns" ("id", "sessionId", "userId", "rootTaskId", "status", "source", "input", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot",
     "leaseOwnerId", "leaseExpiresAt", "leaseStartedAt", "leaseVersion", "updatedAt")
     VALUES ($1, $2, $3, NULL, 'in_progress', 'user', $4::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $5, $6, CURRENT_TIMESTAMP, 1, CURRENT_TIMESTAMP)`,
-  [ids.turn, ids.session, ids.user, JSON.stringify({ goal: "Keep the user objective", clientMessageId: `${ids.originalInput}-message` }), ids.turnOwner, future])
+  [ids.turn, ids.session, ids.user, JSON.stringify({ goal: "Keep the user objective", clientMessageId: clientMessageId(ids.originalInput) }), ids.turnOwner, future])
   await adminPool!.query(`INSERT INTO "sub_agent_tasks" ("id", "sessionId", "turnId", "rootTaskId", "parentTaskId", "path", "depth", "role", "taskType", "status", "goal",
     "constraints", "successCriteria", "allowedActions", "context", "expectedOutputSchema", "modelProfileSnapshot", "toolPolicySnapshot", "budgetSnapshot", "attemptCount", "maxAttempts", "leaseOwner", "leaseExpiresAt", "updatedAt")
     VALUES ($1, $2, $3, NULL, NULL, '/root', 0, 'orchestrator', 'root', 'running', 'Keep the user objective', '[]'::jsonb, '[]'::jsonb, '[]'::jsonb,
@@ -243,8 +255,8 @@ async function seedBase(): Promise<void> {
   await adminPool!.query(`UPDATE "agent_turns" SET "rootTaskId" = $1 WHERE "id" = $2`, [ids.root, ids.turn])
   await seedStep(ids.originStep, 0, "completed", 1, [ids.originalInput])
   await seedStep(ids.keepStep, 1, "streaming", 2, [ids.firstSteer])
-  await insertMessage(ids.originalInput, `${ids.originalInput}-message`, 1, "steer")
-  await insertMessage(ids.firstSteer, `${ids.firstSteer}-message`, 2, "steer", ids.keepStep,
+  await insertMessage(ids.originalInput, clientMessageId(ids.originalInput), 1, "steer")
+  await insertMessage(ids.firstSteer, clientMessageId(ids.firstSteer), 2, "steer", ids.keepStep,
     [{ type: "text", text: "Compare staff engineer roles" }, { type: "text", text: "Keep Berlin as the location" }])
   await adminPool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "revision", "content", "createdAt", "updatedAt")
     VALUES ($1, $2, $3, $4, $5, 'task_graph', 'streaming', NULL, 1, $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
@@ -311,7 +323,7 @@ describePg("durable steering reconciliation PostgreSQL acceptance", () => {
       correlationId: ids.questionItem, idempotencyKey: `question.answered:${ids.questionItem}`, payload: { questionId: ids.questionItem, answer: "Continue" } })
     await runtimeTransaction(async client => expect(await loadSteeringContext(client)).toEqual([]))
     await seedStep(ids.consumeStep, 2, "completed", 7, [ids.laterSteer])
-    await insertMessage(ids.laterSteer, `${ids.laterSteer}-message`, 7, "steer")
+    const laterSteerFacts = await insertMessage(ids.laterSteer, clientMessageId(ids.laterSteer), 7, "steer")
     await seedStep(ids.currentStep, 3, "streaming", 7, [])
     await insertEvent({ id: `${ids.currentStep}-agenda`, sequence: 8, type: "cognitive.agenda", actor: "orchestrator", itemId: null, taskId: ids.root,
       correlationId: ids.currentStep, idempotencyKey: `cognitive.agenda:${ids.currentStep}`, payload: agenda(ids.currentStep, 7n, 1) })
@@ -327,19 +339,19 @@ describePg("durable steering reconciliation PostgreSQL acceptance", () => {
     })
 
     const laterContent = { parts: [{ type: "text", text: `User steer ${ids.laterSteer}` }],
-      clientMessageId: `${ids.laterSteer}-message`, source: "user", disposition: "steered" }
-    await adminPool!.query(`UPDATE "agent_events" SET "itemId" = NULL WHERE "id" = $1`, [`${ids.laterSteer}-accepted-event`])
+      clientMessageId: clientMessageId(ids.laterSteer), source: "user", disposition: "steered" }
+    await adminPool!.query(`UPDATE "agent_events" SET "itemId" = NULL WHERE "id" = $1`, [laterSteerFacts.eventId])
     try {
       await expect(runtimeTransaction(client => loadSteeringContext(client))).rejects.toThrow("steering_reconciliation_acceptance_invalid")
     } finally {
-      await adminPool!.query(`UPDATE "agent_events" SET "itemId" = $2 WHERE "id" = $1`, [`${ids.laterSteer}-accepted-event`, `${ids.laterSteer}-item`])
+      await adminPool!.query(`UPDATE "agent_events" SET "itemId" = $2 WHERE "id" = $1`, [laterSteerFacts.eventId, laterSteerFacts.itemId])
     }
     await adminPool!.query(`UPDATE "agent_items" SET "content" = jsonb_set("content", '{parts,0,text}', to_jsonb('changed steering text'::text)) WHERE "id" = $1`,
-      [`${ids.laterSteer}-item`])
+      [laterSteerFacts.itemId])
     try {
       await expect(runtimeTransaction(client => loadSteeringContext(client))).rejects.toThrow("Accepted user steering content changed")
     } finally {
-      await adminPool!.query(`UPDATE "agent_items" SET "content" = $2::jsonb WHERE "id" = $1`, [`${ids.laterSteer}-item`, JSON.stringify(laterContent)])
+      await adminPool!.query(`UPDATE "agent_items" SET "content" = $2::jsonb WHERE "id" = $1`, [laterSteerFacts.itemId, JSON.stringify(laterContent)])
     }
 
     await adminPool!.query(`REVOKE INSERT (${EVENT_COLUMNS}) ON "agent_events" FROM "${runtimeRole}"`)
@@ -380,18 +392,18 @@ describePg("durable steering reconciliation PostgreSQL acceptance", () => {
     const commandPort = createPgTaskGraphCommandPort(restrictedCommandPool(runtimePool!))
     const planCommandPort = createPgTaskGraphCommandPort(restrictedCommandPool(planPool!))
     const decisionStep = `steering-race-decision-${suffix}`, decisionCall = `steering-race-call-${suffix}`
-    const priorSteer = `steering-race-prior-${suffix}`, afterDecisionSteer = `steering-race-after-${suffix}`
+    const priorSteer = randomUUID(), afterDecisionSteer = randomUUID()
     const afterKeepSteer = `steering-race-keep-after-${suffix}`, afterKeepCall = `steering-race-keep-call-${suffix}`
     const lastStep = `steering-race-last-step-${suffix}`, lastCall = `steering-race-last-call-${suffix}`
     const lastPlanCall = `steering-race-last-plan-call-${suffix}`
-    const lastSteer = `steering-race-last-${suffix}`, dispatchStep = `steering-race-dispatch-${suffix}`
+    const lastSteer = randomUUID(), dispatchStep = `steering-race-dispatch-${suffix}`
     await adminPool!.query(`UPDATE "agent_steps" SET "status" = 'completed', "completedAt" = CURRENT_TIMESTAMP WHERE "id" = $1`, [ids.currentStep])
     await adminPool!.query(`UPDATE "sub_agent_tasks" SET "allowedActions" = $2::jsonb WHERE "id" = $1`,
       [ids.root, JSON.stringify(["agent.plan", "jobs.search", "jobs.get"])])
 
     const decisionSequence = 11
     await seedStep(decisionStep, 4, "streaming", decisionSequence, [ids.originalInput, ids.firstSteer, ids.laterSteer, priorSteer])
-    await insertMessage(priorSteer, `${priorSteer}-message`, decisionSequence, "steer", decisionStep)
+    await insertMessage(priorSteer, clientMessageId(priorSteer), decisionSequence, "steer", decisionStep)
     await insertEvent({ id: `${decisionStep}-agenda`, sequence: 12, type: "cognitive.agenda", actor: "orchestrator", itemId: null, taskId: ids.root,
       correlationId: decisionStep, idempotencyKey: `cognitive.agenda:${decisionStep}`, payload: agenda(decisionStep, BigInt(decisionSequence), 2) })
     await seedToolCall(decisionStep, decisionCall, "agent.reconcile", { decision: "keep", expectedRevision: 2 }, 13)
@@ -406,7 +418,7 @@ describePg("durable steering reconciliation PostgreSQL acceptance", () => {
       await lockTaskGraphScope(decisionClient, decision.scope, true)
       let resolveAcceptancePid!: (pid: number) => void
       const acceptancePid = new Promise<number>(resolve => { resolveAcceptancePid = resolve })
-      const laterAcceptance = acceptanceTransaction({ id: afterDecisionSteer, messageId: `${afterDecisionSteer}-message`,
+      const laterAcceptance = acceptanceTransaction({ id: afterDecisionSteer, messageId: clientMessageId(afterDecisionSteer),
         text: "Preserve this newly accepted constraint", pidReady: resolveAcceptancePid })
       await waitForBlockedBy(acceptanceApplicationName, decisionPid)
       const prepared = await prepareSteeringReconciliation(decisionClient, decision)
@@ -492,7 +504,7 @@ describePg("durable steering reconciliation PostgreSQL acceptance", () => {
         operation(lastStep, lastPlanCall, "revise", 2))
       await waitForBlockedBy(decisionApplicationName, acceptancePid)
       await waitForAnyLockWait(`steer_plan_${suffix}`)
-      const acceptedSequence = await acceptSteer(acceptanceClient, lastSteer, `${lastSteer}-message`, "A steer arriving during keep")
+      const acceptedSequence = await acceptSteer(acceptanceClient, lastSteer, clientMessageId(lastSteer), "A steer arriving during keep")
       await acceptanceClient.query("COMMIT")
       acceptanceOpen = false
       expect(acceptedSequence).toBeGreaterThan(staleCursor + 3)
