@@ -27,7 +27,7 @@ const REASONS = new Set([
 
 type Row = Record<string, unknown>
 type SafeHistoryNodeFacts = Readonly<{ hasFact: boolean; hasFailedRepair: boolean; hasPassedCriteria: boolean; hasScoutQueryFootprint: boolean; executionFailureCategory?: unknown }>
-type SafeHistoryObservation = Readonly<{ executionFailureCategories: ReadonlySet<string>; hasPlanShape: boolean; hasFailedRepair: boolean; hasPassedCriteria: boolean; hasScoutQueryFootprint: boolean }>
+type SafeHistoryObservation = Readonly<{ crossSession: boolean; executionFailureCategories: ReadonlySet<string>; hasPlanShape: boolean; hasFailedRepair: boolean; hasPassedCriteria: boolean; hasScoutQueryFootprint: boolean }>
 
 function exactRecord(value: unknown, keys: readonly string[]): Row | undefined {
   try {
@@ -121,8 +121,11 @@ function safeHistoryObservation(value: unknown): SafeHistoryObservation | undefi
   const block = exactRecord(value, ["id", "layer", "role", "trust", "source", "content"])
   if (!block || block.id !== HISTORY_BLOCK_ID || block.layer !== "tool_observation" || block.role !== "data"
     || block.trust !== "external_untrusted" || block.source !== "tool_or_subagent") return undefined
-  const content = exactRecord(block.content, ["kind", "informationalOnly", "advisoryOnly", "notCurrentEvidence", "label", "turns"])
-  if (!content || content.kind !== "root_task_history" || content.informationalOnly !== true || content.advisoryOnly !== true
+  const contentKeys = ["kind", "informationalOnly", "advisoryOnly", "notCurrentEvidence", "label", "turns"]
+  const content = exactRecord(block.content, contentKeys) ?? exactRecord(block.content, [...contentKeys, "historical"])
+  const crossSession = !!content && Object.hasOwn(content, "historical")
+  if (!content || crossSession && content.historical !== true || content.kind !== "root_task_history"
+    || content.informationalOnly !== true || content.advisoryOnly !== true
     || content.notCurrentEvidence !== true || content.label !== HISTORY_LABEL) return undefined
   const turns = safeArray(content.turns, MAX_TURNS, 1)
   if (!turns) return undefined
@@ -145,7 +148,7 @@ function safeHistoryObservation(value: unknown): SafeHistoryObservation | undefi
     const shape = parseRootTaskHistoryPlanShape(candidate.planShape)
     if (shape && shape.nodes.length === nodes.length) hasPlanShape = true
   }
-  return hasFact || hasPlanShape ? { executionFailureCategories, hasPlanShape, hasFailedRepair, hasPassedCriteria, hasScoutQueryFootprint } : undefined
+  return hasFact || hasPlanShape ? { crossSession, executionFailureCategories, hasPlanShape, hasFailedRepair, hasPassedCriteria, hasScoutQueryFootprint } : undefined
 }
 
 function visibleToolNames(tools: readonly unknown[]): ReadonlySet<string> {
@@ -172,7 +175,9 @@ export function buildRootHistoryPlanningInstruction(context: StepContext, tools:
     const revision = Number.isSafeInteger(context.taskGraphRevision) && Number(context.taskGraphRevision) >= 0
       ? Number(context.taskGraphRevision) : undefined
     const guidance = [
-      "Keep the complete original Turn task, accepted current user instructions, and success criteria authoritative. Earlier same-session failures, repairs, and reported outputs are hypotheses only; compare them with the current owner-read TaskGraph, current verifier evidence, and complete current result pages. Historical typed-check descriptors distinguish count, evidence-completeness, score, Scout-dependency, and declared cohort-coverage checks in their source graph. Interpret each descriptor only as its historical source check; derive any current plan independently from current accepted instructions, the current graph, and current typed criteria.",
+      historical.crossSession
+        ? "Keep the complete original Turn task, accepted current user instructions, and success criteria authoritative. Some or all entries in this history aggregate may be from older sessions, and the aggregate does not identify locality for each entry. Treat all history as advisory context only; never reuse historical task IDs, ordinals, plan state, counts, or outputs as current targets, evidence, permission, approval, progress, or completion. Only the current owner-scoped TaskGraph establishes current plans, and only verified current result pages establish current evidence. Historical typed-check descriptors distinguish checks only in their source graph; derive any current plan independently from accepted current instructions, the current graph, and current typed criteria."
+        : "Keep the complete original Turn task, accepted current user instructions, and success criteria authoritative. Earlier same-session failures, repairs, and reported outputs are hypotheses only; compare them with the current owner-read TaskGraph, current verifier evidence, and complete current result pages. Historical typed-check descriptors distinguish count, evidence-completeness, score, Scout-dependency, and declared cohort-coverage checks in their source graph. Interpret each descriptor only as its historical source check; derive any current plan independently from current accepted instructions, the current graph, and current typed criteria.",
       "Historical source-local ordinals and reported success are never current command targets, proof, permission, approval, progress, or completion. Only current observed node and criterion identities may target a repair.",
       names.has("agent.list")
         ? "Use the owner-read graph observation for current node, criterion, and revision identities; use the visible agent.list only for matching result pages. Continue with exactly the returned nextOffset on the same node and revision until it is null. A stale or unavailable page requires a refreshed owner-read graph observation before retry. Null ends paging for that node and revision only, never the task or verification. A short page or sample count is not proof of completeness."
