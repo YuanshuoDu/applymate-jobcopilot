@@ -377,7 +377,7 @@ describe("expired subagent recovery fence", () => {
     await expect(recoverExpired(fake.pool as PgSubagentPool, { now: checkedAt, limit: 10 })).resolves.toMatchObject([{ id: "child-1", status: "queued" }])
     const pending = fake.calls.find(sql => sql.includes('FROM "agent_events" AS started')) ?? ""
     expect(pending).toContain('started."itemId" = call."id"')
-    expect(pending).toContain("(call.\"content\"->'input') - 'taskIds'::text = jsonb_build_object")
+    expect(pending).toContain(`(CASE WHEN jsonb_typeof(call."content"->'input') = 'object' THEN (call."content"->'input') - 'taskIds'::text ELSE '{}'::jsonb END) = jsonb_build_object('idempotencyKey', wait."idempotencyKey", 'mode', wait."mode", 'timeoutMs', wait."result"->'request'->'timeoutMs')`)
     expect(pending).toContain('wait."consumedAt" IS NOT NULL')
     expect(pending).toContain('owner."leaseOwner" = $5')
     expect(fake.calls.some(sql => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))).toBe(true)

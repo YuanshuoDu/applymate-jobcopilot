@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto"
 import { Pool } from "pg"
+import { AgentEventEnvelopeSchema, AgentInputSchema, AgentItemSchema, schemaVersion, validate } from "@jobcopilot/agent-protocol"
 import { createCanonicalTurnRuntime } from "../canonical-turn-runtime.ts"
 import { createPgTaskGraphCommandPort } from "../subagents/pg-task-graph-command-port.ts"
 import { taskGraphRuntimeOptions } from "../subagents/task-graph-templates.ts"
@@ -136,8 +137,132 @@ function record(value) {
   if (typeof value === "string") { try { value = JSON.parse(value) } catch { return null } }
   return value && typeof value === "object" && !Array.isArray(value) ? value : null
 }
+function timestamp(value) {
+  const date = value instanceof Date ? new Date(value) : typeof value === "string" ? new Date(value) : null
+  return date && Number.isFinite(date.getTime()) ? date.toISOString() : null
+}
+function evidenceSequence(value) {
+  try {
+    const parsed = typeof value === "bigint" ? value : typeof value === "string" && /^(0|[1-9]\d*)$/.test(value)
+      ? BigInt(value) : typeof value === "number" && Number.isSafeInteger(value) ? BigInt(value) : null
+    return parsed !== null && parsed >= 0n && parsed <= BigInt(Number.MAX_SAFE_INTEGER) ? parsed : null
+  } catch { return null }
+}
+function exactKeys(value, keys) {
+  return value && Object.keys(value).sort().join(",") === [...keys].sort().join(",")
+}
+function canonical(value) {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value
+  if (typeof value === "number" && Number.isFinite(value)) return value
+  if (Array.isArray(value)) return value.map(canonical)
+  const object = record(value)
+  if (!object || Object.getOwnPropertySymbols(value).length) throw new TypeError("invalid-json")
+  return Object.fromEntries(Object.keys(object).sort().map(key => [key, canonical(object[key])]))
+}
+function sameJson(left, right) {
+  try { return JSON.stringify(canonical(left)) === JSON.stringify(canonical(right)) } catch { return false }
+}
+function inputUnsafeReason(row, scope, request) {
+  if (row.sessionId !== request.sessionId || row.targetTurnId !== request.turnId || row.userId !== scope.userId) return "input_scope"
+  const createdAt = timestamp(row.createdAt), consumedAt = row.consumedAt === null ? null : timestamp(row.consumedAt)
+  const cancelledAt = row.cancelledAt === null ? null : timestamp(row.cancelledAt)
+  const acceptedSequence = evidenceSequence(row.acceptedSequence)
+  const status = row.status, consumedByStepId = row.consumedByStepId
+  const hasConsumer = typeof consumedByStepId === "string" && consumedByStepId.length > 0
+  const hasConsumedAt = consumedAt !== null
+  if (acceptedSequence === null || createdAt === null || !(consumedByStepId === null || hasConsumer)
+    || hasConsumer !== hasConsumedAt || status === "consumed" && (!hasConsumer || cancelledAt !== null)
+    || status === "cancelled" && cancelledAt === null || status !== "cancelled" && cancelledAt !== null
+    || status !== "consumed" && status !== "cancelled" && hasConsumer) return "input_lifecycle"
+  const value = { schemaVersion, id: row.id, clientMessageId: row.clientMessageId, sessionId: row.sessionId,
+    turnId: row.targetTurnId, delivery: row.delivery, state: status, content: row.content, createdAt, consumedAt }
+  return validate(AgentInputSchema, value) && typeof row.id === "string" && typeof row.clientMessageId === "string"
+    ? null : "input_schema"
+}
+function eventUnsafeReason(row, sessionId, turnId) {
+  const payload = record(row.acceptedPayload), item = record(row.acceptedItemContent)
+  if (row.acceptedEventSessionId !== sessionId || row.acceptedEventTurnId !== turnId || row.acceptedTaskId !== null
+    || row.acceptedCorrelationId !== turnId || row.acceptedItemSessionId !== sessionId || row.acceptedItemTurnId !== turnId
+    || row.acceptedItemTaskId !== null || row.acceptedEventItemId !== row.acceptedItemId
+    || typeof row.acceptedItemId !== "string") return "event_scope"
+  if (!payload || !item || !exactKeys(payload, ["clientMessageId", "delivery", "disposition", "inputId", "source"])
+    || !exactKeys(item, ["clientMessageId", "disposition", "parts", "source"])
+    || typeof payload.inputId !== "string" || typeof payload.clientMessageId !== "string"
+    || (payload.delivery !== "steer" && payload.delivery !== "follow_up")
+    || typeof payload.disposition !== "string" || !payload.disposition.trim()
+    || (payload.source !== "user" && payload.source !== "automation" && payload.source !== "system")
+    || row.acceptedType !== "input.accepted" || row.acceptedActor !== (payload.source === "user" ? "user" : "system")
+    || row.acceptedItemType !== "user_message" || row.acceptedItemStatus !== "completed"
+    || !Array.isArray(item.parts) || item.clientMessageId !== payload.clientMessageId
+    || item.disposition !== payload.disposition || item.source !== payload.source) return "event_schema"
+  const sequence = evidenceSequence(row.acceptedEventSequence), createdAt = timestamp(row.acceptedEventCreatedAt)
+  if (sequence === null || createdAt === null) return "event_schema"
+  const envelope = { schemaVersion, id: row.acceptedEventId, sessionId: row.acceptedEventSessionId,
+    turnId: row.acceptedEventTurnId, itemId: row.acceptedEventItemId, taskId: row.acceptedTaskId,
+    sequence: Number(sequence), type: row.acceptedType, actor: row.acceptedActor,
+    correlationId: row.acceptedCorrelationId, causationId: row.acceptedEventCausationId,
+    idempotencyKey: row.acceptedEventIdempotencyKey, payload: row.acceptedPayload, createdAt }
+  const itemEnvelope = { schemaVersion, id: row.acceptedItemId, sessionId: row.acceptedItemSessionId,
+    turnId: row.acceptedItemTurnId, stepId: row.acceptedItemStepId, status: row.acceptedItemStatus,
+    createdAt: timestamp(row.acceptedItemCreatedAt), updatedAt: timestamp(row.acceptedItemUpdatedAt),
+    type: row.acceptedItemType, data: row.acceptedItemContent }
+  return validate(AgentEventEnvelopeSchema, envelope) && validate(AgentItemSchema, itemEnvelope)
+    ? null : "event_schema"
+}
+function classifyUnsafeSteer(trace, scope, request) {
+  if (!trace.rootValid) return "root_fence"
+  if (trace.stepRows !== 1) return "step_fence"
+  if (!Array.isArray(trace.inputs)) return "probe_unclassified"
+  if (trace.inputs.length > 64) return "input_overflow"
+  const byId = new Map(), sequences = new Set(), clientMessages = new Set()
+  for (const row of trace.inputs) {
+    const invalid = inputUnsafeReason(row, scope, request)
+    if (invalid) return invalid
+    const sequence = evidenceSequence(row.acceptedSequence)
+    if (byId.has(row.id) || sequences.has(sequence) || clientMessages.has(row.clientMessageId)) return "input_duplicate_identity"
+    byId.set(row.id, { row, sequence }); sequences.add(sequence); clientMessages.add(row.clientMessageId)
+  }
+  if (!Array.isArray(trace.events)) return "probe_unclassified"
+  if (trace.events.length > 64) return "event_overflow"
+  if (trace.inputs.length !== trace.events.length) return "input_event_count"
+  const seenInputs = new Set(), eventIds = new Set(), eventSequences = new Set()
+  for (const row of trace.events) {
+    const invalid = eventUnsafeReason(row, request.sessionId, request.turnId)
+    if (invalid) return invalid
+    const payload = record(row.acceptedPayload), item = record(row.acceptedItemContent)
+    const input = byId.get(payload.inputId)
+    const eventSequence = evidenceSequence(row.acceptedEventSequence)
+    if (seenInputs.has(payload.inputId) || eventIds.has(row.acceptedEventId) || eventSequences.has(eventSequence)) return "event_duplicate_identity"
+    if (!input || row.acceptedItemId !== row.acceptedEventItemId
+      || payload.clientMessageId !== input.row.clientMessageId || payload.delivery !== input.row.delivery
+      || eventSequence !== input.sequence || !sameJson(input.row.content, item.parts)) return "event_input_binding"
+    seenInputs.add(payload.inputId); eventIds.add(row.acceptedEventId); eventSequences.add(eventSequence)
+  }
+  return seenInputs.size !== byId.size ? "input_event_missing" : "unsafe_unclassified"
+}
+function instrumentSteerQueries(client) {
+  const trace = { rootRows: null, rootValid: false, stepRows: null, inputs: null, events: null }
+  return {
+    trace,
+    client: { query: async (statement, ...args) => {
+      const result = await client.query(statement, ...args)
+      const sql = typeof statement === "string" ? statement : statement?.text
+      if (typeof sql === "string") {
+        if (sql.includes('JOIN "sub_agent_tasks" AS root')) {
+          trace.rootRows = result.rows.length
+          trace.rootValid = result.rows.length === 1 && typeof result.rows[0]?.id === "string"
+        }
+        else if (sql.includes('FROM "agent_steps"') && sql.includes("FOR UPDATE")) trace.stepRows = result.rows.length
+        else if (sql.includes('FROM "agent_inputs"')) trace.inputs = result.rows
+        else if (sql.includes('FROM "agent_events" AS event') && sql.includes("input.accepted")) trace.events = result.rows
+      }
+      return result
+    } },
+  }
+}
 function flag(value) { return value === true ? "enabled" : value === false ? "disabled" : "unknown" }
 function smallCount(value) { return value === 0 ? "0" : value === 1 ? "1" : "2+" }
+function evidenceCount(rows) { return !Array.isArray(rows) ? "unknown" : rows.length > 64 ? "over64" : smallCount(rows.length) }
 function historyDiagnosisLine(facts) {
   return Object.entries(facts).map(([key, value]) => `${key}=${value}`).join(" ")
 }
@@ -165,6 +290,7 @@ async function diagnoseHistoryEligibility(runtimeGateEnabled) {
     sample: "after_context", consistency: "read_committed", clock: "postgres_sample",
     liveOwner: "unknown", authRows: "unknown", authState: "unknown", authPayload: "unknown", consent: "unknown",
     capturedGate: "unknown", runtimeGate: flag(runtimeGateEnabled), observedReadGate: "unknown", observedSteer: "not_reached",
+    observedSteerReason: "not_reached",
     observedTurnOrigin: "not_reached", observedRootFence: "not_reached", observedFenceOrigin: "not_reached",
     observedObjective: "not_reached", observedStartWitness: "not_reached", observedIdentity: "not_reached", probe: "complete",
   }
@@ -272,13 +398,22 @@ async function diagnoseHistoryEligibility(runtimeGateEnabled) {
         leaseVersion: Number(owner.leaseVersion), leaseStartedAt: owner.leaseStartedAt, leaseExpiresAt: owner.leaseExpiresAt,
       }
       const scope = { userId: owner.userId }
+      const steerTrace = instrumentSteerQueries(client)
       const steerProbe = await runLockingProbe(client, "history_steer_probe", facts, () =>
-        readRootTaskHistorySteerEvidence(client, scope, {
+        readRootTaskHistorySteerEvidence(steerTrace.client, scope, {
           sessionId: owner.sessionId, turnId: owner.turnId, stepId: owner.stepId,
           lease: { ownerId: owner.ownerId, leaseVersion: Number(owner.leaseVersion), now: sampledAt },
         }))
       const steerEvidence = steerProbe.ok ? steerProbe.value : undefined
       facts.observedSteer = steerProbe.ok ? steerEvidence.kind : "error"
+      facts.observedSteerRootRows = steerTrace.trace.rootRows === null ? "unknown" : smallCount(steerTrace.trace.rootRows)
+      facts.observedSteerStepRows = steerTrace.trace.stepRows === null ? "unknown" : smallCount(steerTrace.trace.stepRows)
+      facts.observedSteerInputRows = evidenceCount(steerTrace.trace.inputs)
+      facts.observedSteerEventRows = evidenceCount(steerTrace.trace.events)
+      facts.observedSteerReason = !steerProbe.ok ? "probe_inconclusive"
+        : steerEvidence.kind === "unsafe" ? classifyUnsafeSteer(steerTrace.trace, scope,
+          { sessionId: owner.sessionId, turnId: owner.turnId })
+          : steerEvidence.kind
 
       let fence
       if (facts.observedReadGate === "enabled" && steerEvidence?.kind === "no_accepted_steer") {

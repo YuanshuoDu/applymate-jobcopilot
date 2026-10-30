@@ -1,5 +1,4 @@
 import type pg from "pg"
-
 import type { SubagentLease } from "./types.js"
 import { markCanonicalSubagentWaitTargetIds } from "./subagent-wait-structural-ids.js"
 import { dateValue, object as waitObject, safeSubagentWaitJson, waitResult } from "./durable-subagent-wait-store.js"
@@ -57,21 +56,21 @@ function validReceipt(row: Row, ids: readonly string[], toolCallId: string): boo
   const receiptIds = strictIds(projection.taskIds), matched = strictIds(projection.matchedTaskIds, 0)
   const tasks = Array.isArray(projection.tasks) ? projection.tasks : undefined
   const taskIds = tasks && strictIds(tasks.map(task => waitObject(task).taskId), 0)
-  const receiptDeadline = Date.parse(String(projection.deadlineAt)), waitDeadline = Date.parse(String(row.deadlineAt))
+  let deadlinesMatch = false
+  try {
+    deadlinesMatch = dateValue(projection.deadlineAt, "receipt.deadlineAt").getTime()
+      === dateValue(row.deadlineAt, "deadlineAt").getTime()
+  } catch { return false }
   return receipt.toolCallId === toolCallId && (receipt.errorCode === null || receipt.errorCode === undefined)
     && projection.waitId === row.waitId && projection.status === "waiting" && !!receiptIds && sameIds(receiptIds, ids)
     && !!matched && matched.length === 0 && !!tasks && !!taskIds && taskIds.every(id => ids.includes(id))
-    && (!taskIds.length || sameIds(taskIds, ids)) && Number.isFinite(receiptDeadline) && receiptDeadline === waitDeadline
+    && (!taskIds.length || sameIds(taskIds, ids)) && deadlinesMatch
 }
 
 /** Loads an already-consumed child wait through its exact persisted continuation. */
 export async function loadChildConsumedWaitResume(client: QueryClient, lease: SubagentLease, waitId?: string): Promise<DurableWaitResume | undefined> {
   if (waitId !== undefined && (!waitId.trim() || waitId !== waitId.trim())) throw new Error("child_resume_wait_lineage")
   const waitIdParam = waitId === undefined ? "" : 'AND candidateWait."id" = $7'
-  const latestContinuationGuard = waitId === undefined
-    ? `AND (candidateStep."attempt" < $6 OR next."ordinal" = (SELECT MAX(latest."ordinal") FROM "agent_steps" AS latest
-          WHERE latest."sessionId" = candidateStep."sessionId" AND latest."turnId" = candidateStep."turnId" AND latest."taskId" = candidateStep."taskId" AND latest."attempt" = candidateStep."attempt"))`
-    : ""
   const exactWaitId = waitId === undefined ? "" : 'AND wait."id" = $7'
   const values: unknown[] = [lease.userId, lease.sessionId, lease.turnId, lease.id, lease.rootTaskId, lease.attemptCount]
   if (waitId !== undefined) values.push(waitId)
@@ -86,11 +85,11 @@ export async function loadChildConsumedWaitResume(client: QueryClient, lease: Su
         AND next."ordinal" = (SELECT MIN(later."ordinal") FROM "agent_steps" AS later WHERE later."sessionId" = candidateStep."sessionId"
           AND later."turnId" = candidateStep."turnId" AND later."taskId" = candidateStep."taskId" AND later."attempt" = candidateStep."attempt"
           AND later."ordinal" > candidateStep."ordinal")
-        ${latestContinuationGuard})
+        )
       ${waitIdParam}
     ORDER BY candidateStep."attempt" DESC, candidateStep."ordinal" DESC, candidateWait."createdAt" DESC, candidateWait."id" DESC LIMIT 1
   )
-    SELECT wait."id" AS "waitId", wait."stepId", wait."targetTaskIds", wait."idempotencyKey", wait."mode", wait."status", wait."deadlineAt", wait."matchedTaskIds", wait."result" AS "waitResult", step."attempt", step."ordinal", next."id" AS "continuationStepId", next."ordinal" AS "continuationOrdinal", (SELECT MAX(latest."ordinal") FROM "agent_steps" AS latest WHERE latest."sessionId" = step."sessionId" AND latest."turnId" = step."turnId" AND latest."taskId" = step."taskId" AND latest."attempt" = step."attempt") AS "continuationLatestOrdinal", call."content" AS "callContent", call."status" AS "callStatus", result."id" AS "sourceItemId", result."content" AS "resultContent", result."status" AS "resultStatus"
+    SELECT wait."id" AS "waitId", wait."stepId", wait."targetTaskIds", wait."idempotencyKey", wait."mode", wait."status", wait."deadlineAt", wait."matchedTaskIds", wait."result" AS "waitResult", step."attempt", step."ordinal", next."id" AS "continuationStepId", next."ordinal" AS "continuationOrdinal", call."content" AS "callContent", call."status" AS "callStatus", result."id" AS "sourceItemId", result."content" AS "resultContent", result."status" AS "resultStatus"
     FROM "agent_wait_conditions" AS wait
     JOIN latest_wait ON latest_wait."id" = wait."id"
     JOIN "agent_steps" AS step ON step."id" = wait."stepId" AND step."sessionId" = wait."sessionId" AND step."turnId" = wait."turnId" AND step."taskId" = wait."parentTaskId"
@@ -145,13 +144,12 @@ export async function loadChildConsumedWaitResume(client: QueryClient, lease: Su
   const stepId = typeof row.stepId === "string" ? row.stepId : ""
   const sourceItemId = typeof row.sourceItemId === "string" ? row.sourceItemId : `recovered-wait-result:${String(row.waitId)}`
   const attempt = Number(row.attempt), ordinal = Number(row.ordinal), continuationStepId = typeof row.continuationStepId === "string" ? row.continuationStepId : ""
-  const continuationOrdinal = Number(row.continuationOrdinal), continuationLatestOrdinal = Number(row.continuationLatestOrdinal)
+  const continuationOrdinal = Number(row.continuationOrdinal)
   if (!stepId.trim() || !sourceItemId.trim() || !Number.isSafeInteger(attempt) || attempt < 1 || attempt > lease.attemptCount
-    || !Number.isSafeInteger(ordinal) || ordinal < 0 || !continuationStepId.trim() || !Number.isSafeInteger(continuationOrdinal) || continuationOrdinal <= ordinal
-    || waitId === undefined && attempt === lease.attemptCount && continuationLatestOrdinal !== continuationOrdinal) throw new Error("child_resume_wait_lineage")
+    || !Number.isSafeInteger(ordinal) || ordinal < 0 || !continuationStepId.trim() || !Number.isSafeInteger(continuationOrdinal) || continuationOrdinal <= ordinal) throw new Error("child_resume_wait_lineage")
   const output = waitResult(waitRow), outputIds = strictIds(output.taskIds)
   if (output.waitId !== row.waitId || !["ready", "timed_out"].includes(output.status) || !outputIds || !sameIds(outputIds, ids)
     || !markCanonicalSubagentWaitTargetIds({ targetTaskIds: outputIds }, output, outputIds) || !markInputIds(input, ids)) throw new Error("child_resume_invalid_wait_result")
   return { waitId: String(row.waitId), stepId, attempt, ordinal, toolCallId, sourceItemId,
-    input: safeSubagentWaitJson(input, 8_192), output }
+    input: safeSubagentWaitJson(input, 8_192), output, continuationStepId, continuationOrdinal }
 }

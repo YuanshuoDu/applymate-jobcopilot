@@ -3,8 +3,9 @@ import { describe, expect, it, vi } from "vitest"
 
 import { executeTools, recoverPersistedToolCalls } from "./turn-execution-tools.js"
 import { TurnExecutionEventWriter } from "./turn-execution-events.js"
-import type { TurnExecutionOptions } from "./turn-execution-types.js"
+import type { TurnExecutionOptions, TurnExecutionStore } from "./turn-execution-types.js"
 import type { ToolCallRecovery } from "./turn-engine-types.js"
+import type { ChildWaitClaimRecovery } from "../subagents/child-durable-wait-replay.js"
 
 function execution(recovery: ToolCallRecovery, executeTool: TurnExecutionOptions["executeTool"], validateToolArguments?: TurnExecutionOptions["validateToolArguments"], additionalRecovery: readonly ToolCallRecovery[] = []) {
   const updates: Array<{ itemId: string; status: string; content: unknown }> = []
@@ -32,6 +33,58 @@ const pending: ToolCallRecovery = {
 }
 
 describe("recoverPersistedToolCalls", () => {
+  it("completes the durable child wait claim without dispatch and returns its ordinary result observation", async () => {
+    const identity = { kind: "task" as const, userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "child-1",
+      rootTaskId: "root-1", ownerId: "worker-2", attemptCount: 2, leaseExpiresAt: new Date("2026-09-10T00:00:00.000Z") }
+    const input = { idempotencyKey: "wait-key", taskIds: ["leaf-1"], mode: "all", timeoutMs: 5_000 }
+    const output = { waitId: "wait-1", status: "ready", taskIds: ["leaf-1"], matchedTaskIds: ["leaf-1"] }
+    const childWaitClaimRecovery: ChildWaitClaimRecovery = {
+      owner: { id: identity.taskId, userId: identity.userId, sessionId: identity.sessionId, turnId: identity.turnId,
+        rootTaskId: identity.rootTaskId, ownerId: identity.ownerId, attemptCount: identity.attemptCount },
+      stepId: "continuation-step", stepOrdinal: 1, stepStatus: "streaming", modelUsage: { inputTokens: 37, outputTokens: 13, estimatedCostUsd: 0.0042 },
+      sourceWaitCallId: "original-call", sourceInput: input,
+      call: { id: "claimed-call", name: "wait_subagents", arguments: input },
+      callItem: { id: "call-item", revision: 0, status: "started" }, callStartedEventId: "call-started-event",
+      claimEventId: "claim-event", output,
+    }
+    const executeTool = vi.fn()
+    const updates: Array<{ itemId: string; status: string; content: unknown }> = []
+    const creates: Array<{ itemId: string; type: string; content: unknown }> = []
+    const events: Array<{ type: string; idempotencyKey: string }> = []
+    const store = {
+      startStep: async (input: Parameters<TurnExecutionStore["startStep"]>[0]) => ({ id: "step", ordinal: input.ordinal }), updateStep: async () => undefined,
+      createItem: async (input: Parameters<TurnExecutionStore["createItem"]>[0]) => {
+        creates.push({ itemId: input.itemId, type: input.type, content: input.content }); return { id: input.itemId, revision: 0 }
+      },
+      updateItem: async (input: Parameters<TurnExecutionStore["updateItem"]>[0]) => {
+        updates.push({ itemId: input.itemId, status: input.status, content: input.content }); return { id: input.itemId, revision: input.expectedRevision + 1 }
+      },
+      appendEvent: async (input: Parameters<TurnExecutionStore["appendEvent"]>[0]) => {
+        events.push({ type: input.type, idempotencyKey: input.idempotencyKey }); return { id: input.id }
+      },
+    } as unknown as TurnExecutionStore
+    const options = {
+      identity, scope: { userId: identity.userId }, goal: "Resume child wait",
+      snapshot: { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [] },
+      store, model: {} as never, tools: [], executeTool, childWaitClaimRecovery,
+      idFactory: (prefix: string) => `${prefix}:attempt:${identity.attemptCount}`,
+      signal: new AbortController().signal,
+    } as unknown as TurnExecutionOptions
+    const writer = new TurnExecutionEventWriter(options)
+
+    await expect(recoverPersistedToolCalls(options, writer, () => new Date("2026-09-09T00:00:00.000Z"))).resolves.toEqual([{
+      id: "tool-result:claimed-call", content: expect.objectContaining({
+        toolCallId: "claimed-call", toolName: "wait_subagents", input, status: "completed", output, errorCode: null,
+      }),
+    }])
+
+    expect(executeTool).not.toHaveBeenCalled()
+    expect(creates).toHaveLength(1)
+    expect(creates[0]).toMatchObject({ itemId: "task:child-1:item:tool-result:claimed-call:attempt:2", type: "tool_result" })
+    expect(updates.map(update => update.itemId)).toEqual(["call-item", "task:child-1:item:tool-result:claimed-call:attempt:2"])
+    expect(events.map(event => event.type)).toEqual(["item.completed", "tool_call.completed", "item.started", "item.completed", "step.completed"])
+  })
+
   it("replays a safe pending call with its original id and step before returning model context", async () => {
     const execute = vi.fn(async ({ call }: { call: { id: string; toolName: string; input: unknown } }) => ({ id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, output: { jobs: ["one"] }, errorCode: null }))
     const preflight = vi.fn(async (_stepIds: readonly string[]) => undefined)

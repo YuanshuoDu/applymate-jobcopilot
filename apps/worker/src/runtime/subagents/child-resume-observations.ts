@@ -16,7 +16,7 @@ const TERMINAL_WAIT_TASK_STATUSES = new Set(["completed", "failed", "interrupted
 const VALID_WAIT_TASK_STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", ...TERMINAL_WAIT_TASK_STATUSES])
 
 export type DurableWaitResume = Readonly<{
-  waitId: string; stepId: string; attempt: number; ordinal: number; toolCallId: string; sourceItemId: string; input: unknown; output: unknown
+  waitId: string; stepId: string; attempt: number; ordinal: number; toolCallId: string; sourceItemId: string; input: unknown; output: unknown; continuationStepId?: string; continuationOrdinal?: number
 }>
 
 function text(row: Row, key: string): string {
