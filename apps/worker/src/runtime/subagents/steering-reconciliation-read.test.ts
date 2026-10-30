@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
+import { redactSensitiveText } from "@jobcopilot/shared"
 import { executionKey } from "../turns/turn-execution-types.js"
 import type pg from "pg"
 import { buildCognitiveActionAgenda } from "../turns/cognitive-action-agenda.js"
@@ -51,27 +52,31 @@ function agendaPayload(stepId = scope.stepId, planRevision = 1) {
 }
 function input(id: string, delivery: string, status: string, sequence: string, consumedByStepId: string | null) {
   return { id, clientMessageId: `${id}-message`, delivery, status, acceptedSequence: sequence, consumedByStepId,
-    consumedAt: consumedByStepId ? date : null, cancelledAt: null }
+    content: [{ type: "text", text: "steer" }], consumedAt: consumedByStepId ? date : null, cancelledAt: null }
 }
 function accepted(row: ReturnType<typeof input>, patch: Record<string, unknown> = {}) {
   return { ...row, acceptedType: "input.accepted", acceptedActor: "user", acceptedTaskId: null, acceptedCorrelationId: scope.turnId,
     acceptedItemId: `${row.id}-item`, acceptedItemType: "user_message", acceptedItemTaskId: null, acceptedItemStatus: "completed",
-    acceptedItemContent: { parts: [{ type: "text", text: "steer" }], clientMessageId: row.clientMessageId, source: "user", disposition: "steered" },
+    acceptedEventCausationId: null, acceptedItemStepId: null,
+    acceptedItemContent: { parts: row.content, clientMessageId: row.clientMessageId, source: "user", disposition: "steered" },
     acceptedEventSequence: row.acceptedSequence,
-    acceptedPayload: { inputId: row.id, clientMessageId: row.clientMessageId, delivery: row.delivery, source: "user", disposition: "steered" }, ...patch }
+    acceptedPayload: { inputId: row.id, clientMessageId: redactSensitiveText(row.clientMessageId), delivery: row.delivery, source: "user", disposition: "steered" }, ...patch }
 }
 function fixture(options: { steerStatus?: string; steerConsumer?: string | null; source?: string; actor?: string; checkpointIds?: string[];
   cursor?: string; rootHint?: string | null; badItem?: boolean; badCorrelation?: boolean; laterDecision?: boolean; freshSteer?: boolean;
-  goalOnlyWithoutOriginal?: boolean } = {}) {
+  goalOnlyWithoutOriginal?: boolean; originalInputId?: string; originalClientMessageId?: string; originalPayloadInputId?: unknown } = {}) {
   const currentScope = options.laterDecision ? { ...scope, stepId: "later-step" } : scope
-  const root = input("original-input", "steer", "consumed", "1", "origin-step")
-  root.clientMessageId = "root-client-message"
+  const originalClientMessageId = options.originalClientMessageId ?? "root-client-message"
+  const root = input(options.originalInputId ?? "original-input", "steer", "consumed", "1", "origin-step")
+  root.clientMessageId = originalClientMessageId
   const steer = input("steer-1", "steer", options.steerStatus ?? "consumed", "10", options.steerConsumer === undefined ? "origin-step" : options.steerConsumer)
   const event = accepted(steer, { acceptedActor: options.actor ?? "user", acceptedCorrelationId: options.badCorrelation ? "other-turn" : scope.turnId,
     acceptedItemContent: options.badItem ? { parts: [], clientMessageId: "other-message", source: "user", disposition: "steered" }
       : { parts: [{ type: "text", text: "steer" }], clientMessageId: steer.clientMessageId, source: options.source ?? "user", disposition: "steered" },
-    acceptedPayload: { inputId: steer.id, clientMessageId: steer.clientMessageId, delivery: "steer", source: options.source ?? "user", disposition: "steered" } })
-  const originalEvent = accepted(root)
+    acceptedPayload: { inputId: steer.id, clientMessageId: redactSensitiveText(steer.clientMessageId), delivery: "steer", source: options.source ?? "user", disposition: "steered" } })
+  const originalEvent = accepted(root, options.originalPayloadInputId === undefined ? {} : { acceptedPayload: {
+    inputId: options.originalPayloadInputId, clientMessageId: redactSensitiveText(root.clientMessageId), delivery: root.delivery, source: "user", disposition: "steered",
+  } })
   const freshSteer = input("steer-2", "steer", "consumed", "15", "origin-step")
   const freshEvent = accepted(freshSteer)
   const sourceStep = { id: "origin-step", taskId: scope.rootTaskId, ordinal: 0, attempt: 1, status: "completed",
@@ -104,7 +109,7 @@ function fixture(options: { steerStatus?: string; steerConsumer?: string | null;
     if (sql.includes('FROM "agent_turns"') && sql.includes("FOR UPDATE")) return { rows: [{ id: scope.turnId }], rowCount: 1 }
     if (sql.includes('FROM "sub_agent_tasks" AS task')) return { rows: [{ id: scope.rootTaskId }], rowCount: 1 }
     if (sql.includes("WITH wall_clock")) return { rows: [{ turnLeaseValid: true, parentLeaseValid: true }], rowCount: 1 }
-    if (sql.includes('SELECT turn."input"')) return { rows: [{ input: options.goalOnlyWithoutOriginal ? { goal: "Find jobs" } : { goal: "Find jobs", clientMessageId: "root-client-message" } }], rowCount: 1 }
+    if (sql.includes('SELECT turn."input"')) return { rows: [{ input: options.goalOnlyWithoutOriginal ? { goal: "Find jobs" } : { goal: "Find jobs", clientMessageId: originalClientMessageId } }], rowCount: 1 }
     if (sql.includes('FROM "agent_inputs"') && sql.includes('"clientMessageId" = $4')) {
       const inputs = options.goalOnlyWithoutOriginal ? [] : [root]
       return { rows: inputs, rowCount: inputs.length }
@@ -245,9 +250,10 @@ function cursorFixture(options: Readonly<{
   currentRevision?: number
   inputs?: ReturnType<typeof input>[]
   consumers?: readonly Record<string, unknown>[]
+  acceptedPatch?: Record<string, unknown>
 }>) {
   const allInputs = options.inputs ?? []
-  const acceptedRows = allInputs.map(row => accepted(row))
+  const acceptedRows = allInputs.map(row => accepted(row, options.acceptedPatch))
   const currentStep = { id: options.currentStepId, taskId: scope.rootTaskId, ordinal: options.currentOrdinal, attempt: 1,
     status: "streaming", inputThroughSequence: options.currentCursor, consumedInputIds: [] as string[] }
   const currentAgenda = agendaPayload(options.currentStepId)
@@ -286,7 +292,7 @@ function longReadFixture(count: number, malformedIndex = -1, reverseDetails = fa
     const suffix = String(index).padStart(4, "0"), sequence = String(index * 4 + 2)
     return input(`steer-${suffix}`, "steer", "consumed", sequence, `consumer-step-${suffix}`)
   })
-  const acceptedRows = steers.map(row => accepted(row))
+  const acceptedRows = [accepted(root), ...steers.map(row => accepted(row))]
   const consumers = steers.map((row, index) => ({ id: row.consumedByStepId!, taskId: scope.rootTaskId, ordinal: index, attempt: 1,
     status: "completed", inputThroughSequence: row.acceptedSequence, consumedInputIds: [row.id] }))
   const decisionSteps = steers.map((row, index) => ({ id: `decision-step-${String(index).padStart(4, "0")}`, taskId: scope.rootTaskId,
@@ -455,6 +461,19 @@ describe("durable steering reconciliation reader", () => {
     expect(f.calls.some(call => call.sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
   })
 
+  it("validates a historical redacted UUID input ID only through its exact root input sequence and item", async () => {
+    const id = "00004912-9422-5000-8000-000000000001"
+    const f = fixture({ originalInputId: id, originalClientMessageId: "4912-9422-1234", originalPayloadInputId: redactSensitiveText(id) })
+    const state = await readSteeringReconciliationState(f.client, { ...scope, rootInputId: null })
+    expect(state.originalInputId).toBe(id)
+    expect(state.unresolvedInputs).toEqual([{ id: "steer-1", acceptedSequence: 10n, status: "consumed", consumedByStepId: "origin-step", consumingOrdinal: 0 }])
+  })
+
+  it("fails closed when the root input event ID does not match its exact accepted input", async () => {
+    const f = fixture({ originalInputId: "00004912-9422-5000-8000-000000000001", originalPayloadInputId: "different-id" })
+    await expect(readSteeringReconciliationState(f.client, { ...scope, rootInputId: null })).rejects.toThrow("steering_reconciliation_acceptance_invalid")
+  })
+
   it("keeps the first steer pending when a goal-only Turn has no original input and the caller hint points at that steer", async () => {
     const pending = fixture({ goalOnlyWithoutOriginal: true, rootHint: "steer-1", steerStatus: "accepted", steerConsumer: null })
     const unboundScope = { ...scope, rootInputId: pending.rootHint }
@@ -515,7 +534,7 @@ describe("durable steering reconciliation reader", () => {
   it("keeps accepted-sequence order when a page detail query returns rows in reverse order", async () => {
     const f = longReadFixture(3, -1, true)
     const state = await readSteeringReconciliationState(f.client, scope)
-    expect(f.detailPageIds[0]).toEqual(["steer-0002", "steer-0001", "steer-0000"])
+    expect(f.detailPageIds[0]).toEqual(["steer-0002", "steer-0001", "steer-0000", "original-input"])
     expect(state.unresolvedInputs).toEqual([])
   })
 
@@ -524,6 +543,50 @@ describe("durable steering reconciliation reader", () => {
     const state = await readSteeringReconciliationState(f.client, scope)
     expect(state.unresolvedInputs).toHaveLength(128)
     expect(state.unresolvedInputs.every(row => row.consumedByStepId === null && ["accepted", "queued"].includes(row.status))).toBe(true)
+  })
+
+  it("accepts raw or exactly redacted UUID input IDs with the same safe caller-ID projection", async () => {
+    const stored = input("00004912-9422-5000-8000-000000000001", "steer", "accepted", "2", null)
+    stored.clientMessageId = "4912-9422-1234"
+    for (const inputId of [stored.id, redactSensitiveText(stored.id)]) {
+      const f = cursorFixture({ entries: [], currentStepId: scope.stepId, currentOrdinal: 1, currentCursor: "2", inputs: [stored],
+        acceptedPatch: { acceptedPayload: { inputId, clientMessageId: redactSensitiveText(stored.clientMessageId),
+          delivery: "steer", source: "user", disposition: "steered" } } })
+      const state = await readSteeringReconciliationState(f.client, scope)
+      expect(state.unresolvedInputs.map(row => row.id)).toEqual([stored.id])
+    }
+  })
+
+  it("matches distinct raw caller IDs with one safe projection by their own sequence and item", async () => {
+    const first = input("steer-a", "steer", "accepted", "2", null)
+    first.clientMessageId = "request-415-555-0100"
+    const second = input("steer-b", "steer", "accepted", "3", null)
+    second.clientMessageId = "request-415 555 0100"
+    expect(first.clientMessageId).not.toBe(second.clientMessageId)
+    expect(redactSensitiveText(first.clientMessageId)).toBe(redactSensitiveText(second.clientMessageId))
+
+    const f = cursorFixture({ entries: [], currentStepId: scope.stepId, currentOrdinal: 1, currentCursor: "3", inputs: [first, second] })
+    const state = await readSteeringReconciliationState(f.client, scope)
+    expect(state.unresolvedInputs.map(row => [row.id, row.acceptedSequence])).toEqual([["steer-a", 2n], ["steer-b", 3n]])
+  })
+
+  it.each([
+    ["a wrong safe caller-ID projection", { acceptedPayload: { inputId: "steer-a", clientMessageId: "different", delivery: "steer", source: "user", disposition: "steered" } }],
+    ["a redacted non-UUID input ID", { acceptedPayload: { inputId: "[REDACTED_PHONE]", clientMessageId: "steer-a-message", delivery: "steer", source: "user", disposition: "steered" } }],
+    ["non-null event causation", { acceptedEventCausationId: "other-event" }],
+    ["a Step-bound accepted item", { acceptedItemStepId: "step-a" }],
+    ["changed immutable item parts", { acceptedItemContent: { parts: [{ type: "text", text: "changed" }], clientMessageId: "steer-a-message", source: "user", disposition: "steered" } }],
+  ])("fails closed on %s", async (_label, acceptedPatch) => {
+    const stored = input("steer-a", "steer", "accepted", "2", null)
+    const f = cursorFixture({ entries: [], currentStepId: scope.stepId, currentOrdinal: 1, currentCursor: "2", inputs: [stored], acceptedPatch })
+    await expect(readSteeringReconciliationState(f.client, scope)).rejects.toThrow("steering_reconciliation_acceptance_invalid")
+  })
+
+  it("fails closed when stored inputs share an accepted sequence", async () => {
+    const first = input("steer-a", "steer", "accepted", "2", null)
+    const second = input("steer-b", "steer", "accepted", "2", null)
+    const f = cursorFixture({ entries: [], currentStepId: scope.stepId, currentOrdinal: 1, currentCursor: "2", inputs: [first, second] })
+    await expect(readSteeringReconciliationState(f.client, scope)).rejects.toThrow("steering_reconciliation_input_sequence_ambiguous")
   })
 
   it("fails closed on the 129th unresolved accepted or queued steer", async () => {

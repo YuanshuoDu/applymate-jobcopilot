@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 import type { PoolClient } from "pg"
+import { redactSensitiveText } from "@jobcopilot/shared"
 import { digestNativeVerificationValue } from "./subagents/native-verification-contract.js"
 import type { NativeVerificationEnsureResult, NativeVerificationPort, NativeVerificationRootGoalWitness } from "./subagents/native-verification-port.js"
 import type { TaskGraphExecutionScope, TaskGraphReadScope } from "./subagents/task-graph-command-port.js"
@@ -84,6 +85,20 @@ function configureLegacyProgress(runtime: ReturnType<typeof createCanonicalNativ
 }
 
 function steeringLedgerPool(pendingSteer = false, planningRoot = true): pg.Pool {
+  const inputs = [
+    { id: "root-input", clientMessageId: "original-message", delivery: "follow_up", status: "consumed", content: [{ type: "text", text: "Find jobs" }],
+      acceptedSequence: "1", consumedByStepId: "step-0", consumedAt: new Date(), cancelledAt: null },
+    { id: "steer-1", clientMessageId: "steer-message", delivery: "steer", status: "consumed", content: [{ type: "text", text: "Change the target to Dublin roles." }],
+      acceptedSequence: "2", consumedByStepId: "step-0", consumedAt: new Date(), cancelledAt: null },
+  ]
+  const accepted = (input: typeof inputs[number]) => {
+    const disposition = input.delivery === "follow_up" ? "started" : "steered"
+    return { ...input, acceptedType: "input.accepted", acceptedActor: "user", acceptedTaskId: null, acceptedCorrelationId: scope.turnId,
+      acceptedEventCausationId: null, acceptedItemId: `${input.id}-item`, acceptedEventSequence: input.acceptedSequence,
+      acceptedPayload: { inputId: input.id, clientMessageId: redactSensitiveText(input.clientMessageId), delivery: input.delivery, disposition, source: "user" },
+      acceptedItemType: "user_message", acceptedItemStepId: null, acceptedItemTaskId: null, acceptedItemStatus: "completed",
+      acceptedItemContent: { clientMessageId: input.clientMessageId, disposition, parts: input.content, source: "user" } }
+  }
   const step = (stepId: string, ordinal: number, status: string, consumedInputIds: string[]) => ({
     id: stepId, taskId: "root-1", ordinal, attempt: ordinal === 0 ? 1 : 3, status,
     inputThroughSequence: pendingSteer ? "2" : "0", consumedInputIds,
@@ -110,29 +125,19 @@ function steeringLedgerPool(pendingSteer = false, planningRoot = true): pg.Pool 
     if (sql.includes('SELECT "id" FROM "agent_steps"')) return { rows: [{ id: params[0] }], rowCount: 1 }
     if (sql.includes('SELECT "id" FROM "agent_steps" WHERE "id" = $1 AND "turnId"')) return { rows: [{ id: params[0] }], rowCount: 1 }
     if (sql.includes('SELECT "id", "clientMessageId", "delivery"') && sql.includes('FROM "agent_inputs" WHERE') && sql.includes('"clientMessageId" = $4')) {
-      const rows = pendingSteer && params[3] === "original-message" ? [{ id: "root-input", clientMessageId: "original-message", delivery: "follow_up", status: "consumed",
-        acceptedSequence: "1", consumedByStepId: "step-0", consumedAt: new Date(), cancelledAt: null }] : []
+      const rows = pendingSteer && params[3] === "original-message" ? [inputs[0]] : []
       return { rows, rowCount: rows.length }
     }
     if (sql.includes('FROM "agent_inputs"') && sql.includes('ORDER BY "acceptedSequence", "id"')) {
-      const inputs = pendingSteer ? [
-        { id: "root-input", clientMessageId: "original-message", delivery: "follow_up", status: "consumed", acceptedSequence: "1",
-          consumedByStepId: "step-0", consumedAt: new Date(), cancelledAt: null },
-        { id: "steer-1", clientMessageId: "steer-message", delivery: "steer", status: "consumed", acceptedSequence: "2",
-          consumedByStepId: "step-0", consumedAt: new Date(), cancelledAt: null },
-      ] : []
+      const pageInputs = pendingSteer ? inputs : []
       const after = params[3] == null ? null : BigInt(String(params[3])), afterId = String(params[4] ?? "")
-      const rows = inputs.filter(row => after === null || BigInt(row.acceptedSequence) > after
+      const rows = pageInputs.filter(row => after === null || BigInt(row.acceptedSequence) > after
         || BigInt(row.acceptedSequence) === after && row.id > afterId).slice(0, 64)
       return { rows, rowCount: rows.length }
     }
     if (sql.includes('SELECT input."id"') && sql.includes('LEFT JOIN "agent_events"')) {
-      const event = { id: "steer-1", clientMessageId: "steer-message", delivery: "steer", status: "consumed", acceptedSequence: "2", consumedByStepId: "step-0", consumedAt: new Date(), cancelledAt: null,
-        acceptedType: "input.accepted", acceptedActor: "user", acceptedTaskId: null, acceptedCorrelationId: scope.turnId, acceptedItemId: "accepted-item", acceptedEventSequence: "2",
-        acceptedPayload: { clientMessageId: "steer-message", delivery: "steer", disposition: "accepted", inputId: "steer-1", source: "user" },
-        acceptedItemType: "user_message", acceptedItemTaskId: null, acceptedItemStatus: "completed",
-        acceptedItemContent: { clientMessageId: "steer-message", disposition: "accepted", parts: [{ type: "text", text: "Change the target to Dublin roles." }], source: "user" } }
-      const rows = pendingSteer ? [event] : []
+      const ids = params[3] as string[]
+      const rows = (pendingSteer ? inputs : []).filter(input => ids.includes(input.id)).map(accepted)
       return { rows, rowCount: rows.length }
     }
     if (sql.includes('SELECT "id", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds"')

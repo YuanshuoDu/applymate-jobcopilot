@@ -1,12 +1,44 @@
 import { describe, expect, it, vi } from "vitest"
 
-import { assertExpectedTurn, commandEventKey, createRootTurn, fallbackDisposition, lockOpenSession, type CommandTransaction } from "./transaction"
+import { acceptInputFacts, assertExpectedTurn, commandEventKey, createRootTurn, fallbackDisposition, lockOpenSession, type CommandTransaction } from "./transaction"
 import { activeTurnChanged } from "./errors"
 
 describe("Agent command transaction helpers", () => {
   it("uses stable command event keys and original delivery for fallback idempotency", () => {
     expect(commandEventKey("client-1")).toBe("agent-command:client-1")
     expect(fallbackDisposition({ id: "input", targetTurnId: "turn", delivery: "follow_up", acceptedSequence: BigInt(1) }, "follow_up")).toBe("queued_follow_up")
+  })
+
+  it("writes root accepted input identity from the server-generated UUID", async () => {
+    const eventCreate = vi.fn(async (args: { data: Record<string, unknown> }) => ({ ...args.data, sequence: BigInt(12) }))
+    const itemCreate = vi.fn(async (args: { data: Record<string, unknown> }) => args.data)
+    const inputCreate = vi.fn(async (args: { data: Record<string, unknown> }) => args.data)
+    const outboxCreate = vi.fn(async (args: { data: Record<string, unknown> }) => args.data)
+    const tx = {
+      $queryRaw: vi.fn(async () => [{ eventSequence: BigInt(12) }]),
+      agentItem: { create: itemCreate },
+      agentInput: { create: inputCreate },
+      agentEvent: { findFirst: vi.fn(async () => null), create: eventCreate },
+      agentOutbox: { create: outboxCreate },
+    } as unknown as CommandTransaction
+    const clientMessageId = "request-415-555-0100"
+    const turn = { id: "23456789-2345-4bcd-9bcd-234567890123", source: "user", status: "in_progress", revision: 1 }
+
+    const result = await acceptInputFacts(tx,
+      { sessionId: "34567890-3456-4cde-acde-345678901234", userId: "user_1", clientMessageId, source: "user" },
+      [{ type: "text", text: "Find engineering jobs" }], turn, "steer", "steered", false)
+
+    const item = itemCreate.mock.calls[0]?.[0]?.data
+    const event = eventCreate.mock.calls[0]?.[0]?.data
+    const storedInput = inputCreate.mock.calls[0]?.[0]?.data
+    expect(result.inputId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
+    expect(storedInput?.id).toBe(result.inputId)
+    expect(event?.type).toBe("input.accepted")
+    expect(event?.itemId).toBe(item?.id)
+    expect(event?.payload).toEqual({ inputId: result.inputId, clientMessageId: "request-[REDACTED_PHONE]", delivery: "steer", source: "user", disposition: "steered" })
+    expect((item?.content as { clientMessageId?: string }).clientMessageId).toBe(clientMessageId)
+    expect((storedInput?.content as Array<{ text: string }>)[0]?.text).toBe("Find engineering jobs")
+    expect((outboxCreate.mock.calls[0]?.[0]?.data.payload as { payload?: unknown }).payload).toEqual(event?.payload)
   })
 
   it("guards expected turn and revision together", async () => {
