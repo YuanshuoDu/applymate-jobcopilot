@@ -338,9 +338,13 @@ task coverage, uncertain outcomes and read-only task links. Mounted browser
 fixtures exercise real components with synthetic sessions and mocked requests.
 An isolated CI fixture also signs in with real synthetic credentials against a
 disposable database, saves a synthetic search result, opens and reloads its exact
-application, and checks that another account cannot read it. Search is mocked and
-database RLS is disabled; this does not establish production permissions or a
-complete authenticated application journey.
+application, and checks that another account cannot read it. The fixture creates
+and links a synthetic resume through the real API, edits it in the UI, confirms
+materials using a seeded synthetic audit, checks the downloaded PDF text, opens
+a mocked employer page and explicitly records a synthetic manual application.
+Database assertions distinguish the state before and after that record. Search,
+the audit and employer page are simulated, and database RLS is disabled; this
+does not establish production permissions, a real AI audit or employer receipt.
 One fixture opens the original Agent session from an application, answers a mock
 question, reviews a mock approval and displays a simulated unverified outcome;
 its state changes are injected by the fixture and page reloads. These checks prove
