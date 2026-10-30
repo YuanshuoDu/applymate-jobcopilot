@@ -5,7 +5,7 @@ const taskGraphPlanLabelKeys = Object.keys(TASK_GRAPH_PLAN_LABELS.en) as TaskGra
 
 describe('TaskGraph plan labels', () => {
   it('keeps the English and Chinese label sets aligned', () => {
-    expect(taskGraphPlanLabelKeys).toHaveLength(48)
+    expect(taskGraphPlanLabelKeys).toHaveLength(67)
     expect(Object.keys(TASK_GRAPH_PLAN_LABELS.zh)).toEqual(taskGraphPlanLabelKeys)
   })
 
@@ -29,6 +29,15 @@ describe('TaskGraph plan labels', () => {
   it('labels repair lineage without implying a verdict', () => {
     expect(taskGraphPlanLabel('en', 'agent.taskGraph.repairAttemptFor')).toBe('Repair attempt for')
     expect(taskGraphPlanLabel('zh', 'agent.taskGraph.repairAttemptFor')).toBe('修复尝试：')
+  })
+
+  it('labels related task records as context rather than citations', () => {
+    expect(taskGraphPlanLabel('en', 'agent.taskGraph.sources.title')).toBe('Related task records')
+    expect(taskGraphPlanLabel('en', 'agent.taskGraph.sources.disclaimer')).toContain('not sentence-level citations or independent verification')
+    expect(taskGraphPlanLabel('zh', 'agent.taskGraph.sources.title')).toBe('相关任务记录')
+    expect(taskGraphPlanLabel('zh', 'agent.taskGraph.sources.disclaimer')).toContain('不是逐句引用')
+    expect(taskGraphPlanLabel('en', 'agent.taskGraph.sources.resultState.not_terminal')).toBe('Still in progress')
+    expect(taskGraphPlanLabel('zh', 'agent.taskGraph.sources.resultStatus.partial')).toBe('部分结果')
   })
 
   it('labels selected historical inspection and safe return in English and Chinese', () => {

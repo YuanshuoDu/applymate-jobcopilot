@@ -82,14 +82,37 @@ function scheduledTurnInput(snapshot = scheduledSnapshot()) {
   return { goal: "Find roles", successCriteria: ["Use saved filters"], automationRunMode: "scheduled", scheduledAutomationSnapshot: snapshot }
 }
 
+function pageRows(rows: readonly Row[], sql: string): readonly Row[] {
+  if (!sql.includes("WITH terminal_window AS MATERIALIZED")) return rows
+  const crossSession = sql.includes('event."sessionId" <> $1')
+  const last = rows.at(-1)
+  const pageRawRowCount = rows.length
+  const metadata = crossSession ? {
+    pageCursorSequence: null, pageCursorXid8: last ? String(last.terminalWitnessXid8 ?? "8") : null,
+    pageCursorTurnId: last ? String(last.turnId ?? "source-turn") : null,
+    pageCursorTerminalEventId: last ? String(last.terminalEventId ?? "source-parent") : null,
+    pageCursorWitnessEventId: last ? String(last.terminalWitnessEventId ?? "source-witness") : null,
+  } : {
+    pageCursorSequence: last ? String(last.sequence ?? last.terminalSequence ?? "200") : null, pageCursorXid8: null,
+    pageCursorTurnId: last ? String(last.turnId ?? "source-turn") : null,
+    pageCursorTerminalEventId: last ? String(last.terminalEventId ?? last.turnId ?? "source-parent") : null,
+    pageCursorWitnessEventId: null,
+  }
+  const pageMetadata = { ...metadata, pageRawRowCount, pageSentinelCount: 1, pageServerEncoding: "UTF8" }
+  if (!rows.length) return [{ ...pageMetadata, isPageWatermark: true }]
+  return rows.map(row => ({ ...row, ...pageMetadata, isPageWatermark: false }))
+}
+
 function client(rows: readonly Row[], queries: Array<{ sql: string; values?: readonly unknown[] }>) {
-  return { query: async (sql: string, values?: readonly unknown[]) => { queries.push({ sql, values }); return { rows } } }
+  return { query: async (sql: string, values?: readonly unknown[]) => {
+    queries.push({ sql, values }); return { rows: pageRows(rows, sql) }
+  } }
 }
 
 function indexedClient(readiness: readonly Row[], rows: readonly Row[], queries: Array<{ sql: string; values?: readonly unknown[] }>) {
   return { query: async (sql: string, values?: readonly unknown[]) => {
     queries.push({ sql, values })
-    return { rows: sql.includes('FROM "agent_objective_history_index_readiness"') ? readiness : rows }
+    return { rows: sql.includes('FROM "agent_objective_history_index_readiness"') ? readiness : pageRows(rows, sql) }
   } }
 }
 
@@ -106,6 +129,61 @@ function indexedRow(overrides: Row = {}): Row {
 const readyRow = { indexName: "agent_turns_objective_history", semanticsVersion: OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, isReady: true }
 
 describe("Root history source scan", () => {
+  it("uses the raw-page watermark after an all-filtered same-session page", async () => {
+    const queries: Array<{ sql: string; values?: readonly unknown[] }> = []
+    const local = row({ sessionId: input.lease.sessionId, terminalStepSessionId: input.lease.sessionId,
+      terminalStepEventSessionId: input.lease.sessionId, sequence: "50" })
+    const source = { query: async (sql: string, values?: readonly unknown[]) => {
+      queries.push({ sql, values })
+      if (!sql.includes("WITH terminal_window AS MATERIALIZED")) return { rows: [] }
+      if ((values?.length ?? 0) > 6) return { rows: pageRows([local], sql) }
+      return { rows: [{ isPageWatermark: true, pageRawRowCount: 64, pageSentinelCount: 1, pageServerEncoding: "UTF8",
+        pageCursorSequence: "100", pageCursorXid8: null, pageCursorTurnId: "turn-100",
+        pageCursorTerminalEventId: "event-100", pageCursorWitnessEventId: null }] }
+    } }
+
+    const sameInput = { ...input, crossSessionRootTaskHistoryEnabled: undefined }
+    const sameFence = { ...fence, currentStartSequence: 300n }
+    const results = await readRootTaskHistoryCandidates(source as unknown as pg.PoolClient, sameInput, sameFence)
+
+    expect(results.map(result => result.turnId)).toEqual(["source-turn"])
+    expect(queries).toHaveLength(2)
+    expect(queries[1]?.values).toEqual(["current-session", "user-a", "current-turn", "300", null, 64,
+      "100", "turn-100", "event-100"])
+    expect(queries[1]?.sql).toContain('AND (event."sequence", event."turnId"::text')
+    expect(queries[1]?.sql).toContain('($7::bigint, $8::text COLLATE "C", $9::text COLLATE "C")')
+  })
+
+  it("does not issue cross-session SQL after same-session page metadata fails closed", async () => {
+    const queries: Array<{ sql: string; values?: readonly unknown[] }> = []
+    const source = { query: async (sql: string, values?: readonly unknown[]) => {
+      queries.push({ sql, values })
+      if (!sql.includes("WITH terminal_window AS MATERIALIZED")) return { rows: [] }
+      return { rows: [{ isPageWatermark: true, pageRawRowCount: 0, pageSentinelCount: 2, pageServerEncoding: "UTF8",
+        pageCursorSequence: null, pageCursorXid8: null, pageCursorTurnId: null,
+        pageCursorTerminalEventId: null, pageCursorWitnessEventId: null }] }
+    } }
+
+    await expect(readRootTaskHistoryCandidates(source as unknown as pg.PoolClient, input, fence))
+      .rejects.toThrow("Root task history page metadata is invalid")
+    expect(queries).toHaveLength(1)
+    expect(queries.some(query => query.sql.includes('event."sessionId" <> $1'))).toBe(false)
+  })
+
+  it("does not issue cross-session SQL when the same-session page read rejects", async () => {
+    const queries: Array<{ sql: string; values?: readonly unknown[] }> = []
+    const source = { query: async (sql: string, values?: readonly unknown[]) => {
+      queries.push({ sql, values })
+      if (sql.includes("WITH terminal_window AS MATERIALIZED")) throw new Error("same page read failed")
+      return { rows: [] }
+    } }
+
+    await expect(readRootTaskHistoryCandidates(source as unknown as pg.PoolClient, input, fence))
+      .rejects.toThrow("same page read failed")
+    expect(queries).toHaveLength(1)
+    expect(queries.some(query => query.sql.includes('event."sessionId" <> $1'))).toBe(false)
+  })
+
   it("filters witnessed terminals by numeric xid8 before the bounded scan, then validates source receipts", async () => {
     const queries: Array<{ sql: string; values?: readonly unknown[] }> = []
     const valid = row()
@@ -136,7 +214,12 @@ describe("Root history source scan", () => {
     expect(queries[1]?.sql).toContain('current_session."id" = $1 AND current_session."userId" = $2')
     expect(queries[1]?.sql).toContain("witness.payload->>'xid8'")
     expect(queries[1]?.sql).toContain("(witness.payload->>'xid8')::numeric < $4::numeric")
-    expect(queries[1]?.sql).toContain('ORDER BY (witness.payload->>\'xid8\')::numeric DESC, event."turnId" DESC')
+    expect(queries[1]?.sql).toContain('ORDER BY (candidate."terminalWitnessXid8")::numeric DESC, candidate."turnId" COLLATE "C" DESC,')
+    expect(queries[1]?.sql).toContain('candidate."terminalEventId" COLLATE "C" DESC, candidate."terminalWitnessEventId" COLLATE "C" DESC')
+    expect(queries[1]?.sql).toContain('terminal_event."terminalEventId" AS "windowTerminalEventId"')
+    expect(queries[1]?.sql).toContain('terminal."id" = roots."windowTerminalEventId"')
+    const candidatesSql = queries[1]!.sql.slice(queries[1]!.sql.indexOf("), candidates AS ("), queries[1]!.sql.indexOf(")\n    SELECT candidates.*"))
+    expect(candidatesSql.match(/AS "terminalEventId"/g)).toHaveLength(1)
     expect(queries[1]?.sql).toContain('JOIN "agent_outbox" AS dispatch')
     expect(queries[1]?.sql).not.toContain('event."sequence" < $4::bigint')
     const terminalWindow = queries[1]!.sql.slice(queries[1]!.sql.indexOf("WITH terminal_window"), queries[1]!.sql.indexOf("), roots"))
@@ -227,7 +310,8 @@ describe("Root history source scan", () => {
     expect(terminalWindow).toContain("jsonb_build_array(turn.\"source\", 'none') = $8::jsonb")
     expect(terminalWindow.indexOf('turn."objectiveDigest" = $6')).toBeLessThan(terminalWindow.indexOf("LIMIT $9"))
     expect(terminalWindow.indexOf("jsonb_build_array(turn.\"source\", 'none') = $8::jsonb")).toBeLessThan(terminalWindow.indexOf("LIMIT $9"))
-    expect(terminalWindow).toContain('ORDER BY (witness.payload->>\'xid8\')::numeric DESC, event."turnId" DESC')
+    expect(terminalWindow).toContain('ORDER BY (candidate."terminalWitnessXid8")::numeric DESC, candidate."turnId" COLLATE "C" DESC,')
+    expect(terminalWindow).toContain('candidate."terminalEventId" COLLATE "C" DESC, candidate."terminalWitnessEventId" COLLATE "C" DESC')
     expect(queries[1]?.sql).toContain('terminal."createdAt" = roots."indexedTerminalAt"')
   })
 
@@ -282,7 +366,8 @@ describe("Root history source scan", () => {
 
     expect(results).toHaveLength(1)
     expect(queries[0]?.sql).toContain('event."sessionId" = $1 AND event."sequence" < $4::bigint')
-    expect(queries[0]?.sql).toContain('ORDER BY terminal."sequence" DESC, roots."turnId" DESC')
+    expect(queries[0]?.sql).toContain('ORDER BY CASE WHEN candidates."turnId" IS NULL THEN 1 ELSE 0 END,')
+    expect(queries[0]?.sql).toContain('candidates."terminalSequence" DESC NULLS LAST, candidates."turnId"::text COLLATE "C" DESC NULLS LAST, candidates."terminalEventId"::text COLLATE "C" DESC NULLS LAST')
     expect(queries[0]?.values).toEqual(["current-session", "user-a", "current-turn", "300", null, 64])
     const terminalWindow = queries[0]!.sql.slice(queries[0]!.sql.indexOf("WITH terminal_window"), queries[0]!.sql.indexOf("), roots"))
     expect(terminalWindow).toContain("CASE WHEN $5::jsonb IS NULL THEN NOT")

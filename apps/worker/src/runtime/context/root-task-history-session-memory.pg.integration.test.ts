@@ -2,8 +2,11 @@ import { randomUUID } from "node:crypto"
 import { createRequire } from "node:module"
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest"
 import { Pool, type PoolClient } from "pg"
+import { redactAgentEvent, redactSensitiveText } from "@jobcopilot/shared"
 // @ts-expect-error Worker Vitest supplies the Web alias for this cross-workspace race proof.
 import { setAgentTaskHistoryMemoryConsent } from "@/lib/agent-task-history-memory-consent"
+// @ts-expect-error Worker Vitest supplies the Web alias for the real event fact-store writer.
+import { appendAgentEventWithOutboxInTransaction } from "@/lib/agent/session/fact-store"
 import { withRootTaskHistorySessionAuthorization, type AuthorizedRootTaskHistoryWork } from "./root-task-history-session-memory.js"
 import { createPgInputClaimStore, createPgInputClaimTransaction } from "./input-claim-store.js"
 import { StepContextBuilder } from "./step-context-builder.js"
@@ -18,6 +21,7 @@ import { readRootTaskHistoryCandidates } from "./root-task-history-source-store.
 
 type WebPrisma = {
   $connect(): Promise<void>; $disconnect(): Promise<void>
+  $transaction<T>(work: (tx: unknown) => Promise<T>): Promise<T>
   user: { create(args: { data: { id: string; email: string } }): Promise<unknown> }
 }
 const webRequire = createRequire(new URL("../../../../web/package.json", import.meta.url))
@@ -141,8 +145,14 @@ async function acceptSteer(fixture: Fixture, id: string, text: string): Promise<
     await client.query("SELECT set_config($1,$2,true)", ["app.user_id", fixture.userId])
     await client.query(`SELECT "id" FROM "agent_sessions" WHERE "id"=$1 AND "userId"=$2
       AND "status" NOT IN ('aborted','archived') FOR UPDATE`, [fixture.sessionId, fixture.userId])
-    const itemId = `${id}-item`, parts = [{ type: "text", text }]
-    const itemContent = { clientMessageId: messageId, disposition: "steered", parts, source: "user" }
+    const itemId = randomUUID(), eventId = randomUUID(), parts = [{ type: "text", text }]
+    const disposition = "steered", source = "user"
+    const payload = { inputId: id, clientMessageId: messageId, delivery: "steer", disposition, source }
+    const routing = { sessionId: fixture.sessionId, turnId: fixture.turnId, itemId, taskId: null,
+      actor: "user" as const, correlationId: fixture.turnId, causationId: null, outboxTopic: "agent.session.event" as const }
+    const safePayload = redactAgentEvent({ type: "input.accepted", body: "", data: payload, routing }).data
+    if (!safePayload || Array.isArray(safePayload) || typeof safePayload !== "object") throw new Error("Accepted steer sanitizer rejected its canonical fixture")
+    const itemContent = { clientMessageId: messageId, disposition, parts, source: "user" }
     await client.query(`INSERT INTO "agent_items" ("id","sessionId","turnId","type","status","phase","revision","content","startedAt","completedAt","updatedAt")
       VALUES ($1,$2,$3,'user_message','completed','commentary',0,$4::jsonb,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`,
     [itemId, fixture.sessionId, fixture.turnId, JSON.stringify(itemContent)])
@@ -151,8 +161,7 @@ async function acceptSteer(fixture: Fixture, id: string, text: string): Promise<
     if (sequence === undefined) throw new Error("Could not allocate accepted steer sequence")
     await client.query(`INSERT INTO "agent_events" ("id","sessionId","turnId","itemId","taskId","sequence","type","actor","correlationId","causationId","idempotencyKey","payload")
       VALUES ($1,$2,$3,$4,NULL,$5,'input.accepted','user',$3,NULL,$6,$7::jsonb)`,
-    [`${id}-accepted-event`, fixture.sessionId, fixture.turnId, itemId, sequence, `input.accepted:${messageId}`,
-      JSON.stringify({ inputId: id, clientMessageId: messageId, delivery: "steer", disposition: "steered", source: "user" })])
+    [eventId, fixture.sessionId, fixture.turnId, itemId, sequence, `agent-command:${messageId}`, JSON.stringify(safePayload)])
     await client.query(`INSERT INTO "agent_inputs" ("id","sessionId","targetTurnId","userId","clientMessageId","delivery","status","content","acceptedSequence")
       VALUES ($1,$2,$3,$4,$5,'steer','accepted',$6::jsonb,$7)`,
     [id, fixture.sessionId, fixture.turnId, fixture.userId, messageId, JSON.stringify(parts), sequence])
@@ -162,6 +171,59 @@ async function acceptSteer(fixture: Fixture, id: string, text: string): Promise<
     await client.query("ROLLBACK").catch(() => undefined)
     throw error
   } finally { client.release() }
+}
+
+type SanitizedSteer = { inputId: string; itemId: string; eventId: string; sequence: bigint; expectedPayload: unknown; clientMessageId: string }
+type ProducerTransaction = {
+  agentItem: { create(args: { data: unknown }): Promise<unknown> }
+  agentInput: { create(args: { data: unknown }): Promise<unknown> }
+}
+
+async function acceptSteerThroughEventProducer(fixture: Fixture, inputId: string, clientMessageId: string, text: string): Promise<SanitizedSteer> {
+  const itemId = randomUUID(), parts = [{ type: "text", text }]
+  const disposition = "steered", source = "user", payload = { inputId, clientMessageId, delivery: "steer", source, disposition }
+  const routing = { sessionId: fixture.sessionId, turnId: fixture.turnId, itemId, taskId: null,
+    actor: "user" as const, correlationId: fixture.turnId, causationId: null, outboxTopic: "agent.session.event" as const }
+  const expectedPayload = redactAgentEvent({ type: "input.accepted", body: "", data: payload, routing }).data
+  if (!expectedPayload || Array.isArray(expectedPayload) || typeof expectedPayload !== "object") throw new Error("Accepted steer sanitizer rejected its canonical fixture")
+  const itemContent = { parts, clientMessageId, source, disposition }
+  return prisma!.$transaction(async rawTransaction => {
+    const tx = rawTransaction as ProducerTransaction
+    await tx.agentItem.create({ data: { id: itemId, sessionId: fixture.sessionId, turnId: fixture.turnId, type: "user_message",
+      status: "completed", phase: "commentary", revision: 0, content: itemContent, startedAt: new Date(), completedAt: new Date() } })
+    const written = await appendAgentEventWithOutboxInTransaction(
+      rawTransaction as Parameters<typeof appendAgentEventWithOutboxInTransaction>[0],
+      { ...routing, type: "input.accepted", idempotencyKey: `agent-command:${clientMessageId}`,
+        payload: payload as Parameters<typeof appendAgentEventWithOutboxInTransaction>[1]["payload"] },
+    )
+    if (written.duplicate) throw new Error("Accepted steer producer unexpectedly replayed a fixture event")
+    await tx.agentInput.create({ data: { id: inputId, sessionId: fixture.sessionId, targetTurnId: fixture.turnId,
+      userId: fixture.userId, clientMessageId, delivery: "steer", status: "accepted", content: parts, acceptedSequence: written.event.sequence } })
+    return { inputId, itemId, eventId: written.event.id, sequence: written.event.sequence, expectedPayload, clientMessageId }
+  })
+}
+
+async function readSteerEvidence(fixture: Fixture) {
+  const client = await pool!.connect()
+  try {
+    await client.query("BEGIN")
+    const evidence = await readRootTaskHistorySteerEvidence(client, { userId: fixture.userId }, {
+      sessionId: fixture.sessionId, turnId: fixture.turnId, stepId: fixture.stepId,
+      lease: { ownerId: fixture.lease.ownerId, leaseVersion: fixture.lease.leaseVersion, now: new Date() },
+    })
+    await client.query("COMMIT")
+    return evidence
+  } catch (error: unknown) {
+    await client.query("ROLLBACK").catch(() => undefined)
+    throw error
+  } finally { client.release() }
+}
+
+async function setAcceptedEventInputId(eventId: string, inputId: string): Promise<void> {
+  await pool!.query(`UPDATE "agent_events" SET "payload"=jsonb_set("payload",'{inputId}',to_jsonb($1::text)) WHERE "id"=$2`, [inputId, eventId])
+  const outbox = await pool!.query(`UPDATE "agent_outbox" SET "payload"=jsonb_set("payload",'{payload,inputId}',to_jsonb($1::text))
+    WHERE "idempotencyKey"='agent-event:' || $2`, [inputId, eventId])
+  if (outbox.rowCount !== 1) throw new Error("Accepted event outbox projection was not unique")
 }
 
 async function buildAndClassifyContext(client: PoolClient, fixture: Fixture, historyReadAllowed: boolean) {
@@ -452,10 +514,83 @@ describePg("root task history Session authorization PostgreSQL serialization", (
     expect(await countMarkers(laterSession)).toMatchObject({ events: "1", outboxes: "1", eventSequence: "1" })
   })
 
+  it("binds sanitized accepted-steer identity to its input, item, and allocated sequence", async () => {
+    const userId = await createUser(), sessionId = await createSession(userId), fixture = await createTurn(userId, sessionId)
+    await setConsent(userId, true, 0)
+    const first = await acceptSteerThroughEventProducer(fixture, "49129422-9422-4922-8922-491294229422", "415-555-0100", "Prefer platform engineering roles.")
+    const second = await acceptSteerThroughEventProducer(fixture, "49129422-9422-4922-8922-491294229423", "candidate+491234567890@example.test", "Keep the search focused on backend roles.")
+    const accepted = [first, second]
+    for (const record of accepted) {
+      expect(redactSensitiveText(record.inputId)).not.toBe(record.inputId)
+      const rows = await pool!.query<{ inputId: string; inputSequence: string; eventSequence: string; eventItemId: string; taskId: string | null; payload: unknown; itemId: string; itemContent: unknown }>(
+        `SELECT input."id" AS "inputId", input."acceptedSequence"::text AS "inputSequence", event."sequence"::text AS "eventSequence",
+          event."itemId" AS "eventItemId", event."taskId", event."payload", item."id" AS "itemId", item."content" AS "itemContent"
+        FROM "agent_inputs" AS input JOIN "agent_events" AS event ON event."sessionId"=input."sessionId"
+          AND event."turnId"=input."targetTurnId" AND event."sequence"=input."acceptedSequence" AND event."type"='input.accepted'
+        JOIN "agent_items" AS item ON item."id"=event."itemId" AND item."sessionId"=event."sessionId" AND item."turnId"=event."turnId"
+        WHERE input."id"=$1 AND event."id"=$2`, [record.inputId, record.eventId])
+      expect(rows.rows).toHaveLength(1)
+      const row = rows.rows[0]!
+      expect(row).toMatchObject({ inputId: record.inputId, inputSequence: record.sequence.toString(),
+        eventSequence: record.sequence.toString(), eventItemId: record.itemId, taskId: null, itemId: record.itemId,
+        payload: record.expectedPayload })
+      expect(row.payload).toMatchObject({ inputId: record.inputId, clientMessageId: redactSensitiveText(record.clientMessageId),
+        delivery: "steer", source: "user", disposition: "steered" })
+      expect(JSON.stringify(row.payload)).not.toContain(record.clientMessageId)
+      expect(row.itemContent).toMatchObject({ clientMessageId: record.clientMessageId, source: "user", disposition: "steered" })
+    }
+
+    const redactedCollisionId = redactSensitiveText(first.inputId)
+    expect(redactedCollisionId).toBe(redactSensitiveText(second.inputId))
+    expect(redactedCollisionId).not.toBe(first.inputId)
+    expect(redactedCollisionId).not.toBe(second.inputId)
+    await setAcceptedEventInputId(first.eventId, redactedCollisionId)
+    await setAcceptedEventInputId(second.eventId, redactedCollisionId)
+    const collisionBindings = await pool!.query<{ inputId: string; inputSequence: string; eventSequence: string; eventItemId: string; projectedInputId: string }>(
+      `SELECT input."id" AS "inputId", input."acceptedSequence"::text AS "inputSequence", event."sequence"::text AS "eventSequence",
+        event."itemId" AS "eventItemId", event."payload"->>'inputId' AS "projectedInputId"
+      FROM "agent_inputs" AS input JOIN "agent_events" AS event ON event."sessionId"=input."sessionId"
+        AND event."turnId"=input."targetTurnId" AND event."sequence"=input."acceptedSequence" AND event."type"='input.accepted'
+      WHERE input."id"=ANY($1::text[]) AND event."id"=ANY($2::text[]) ORDER BY input."acceptedSequence" ASC`,
+      [[first.inputId, second.inputId], [first.eventId, second.eventId]])
+    expect(collisionBindings.rows).toEqual(accepted.map(record => ({ inputId: record.inputId,
+      inputSequence: record.sequence.toString(), eventSequence: record.sequence.toString(), eventItemId: record.itemId,
+      projectedInputId: redactedCollisionId })))
+    expect(await readSteerEvidence(fixture)).toEqual({ kind: "accepted_steer" })
+    await setAcceptedEventInputId(first.eventId, first.inputId)
+    await setAcceptedEventInputId(second.eventId, second.inputId)
+
+    await pool!.query(`UPDATE "agent_events" SET "taskId"=$1 WHERE "id"=$2`, [fixture.rootTaskId, first.eventId])
+    expect(await readSteerEvidence(fixture)).toEqual({ kind: "unsafe" })
+    await pool!.query(`UPDATE "agent_events" SET "taskId"=NULL WHERE "id"=$1`, [first.eventId])
+
+    await pool!.query(`UPDATE "agent_events" SET "itemId"=$1 WHERE "id"=$2`, [second.itemId, first.eventId])
+    expect(await readSteerEvidence(fixture)).toEqual({ kind: "unsafe" })
+    await pool!.query(`UPDATE "agent_events" SET "itemId"=$1 WHERE "id"=$2`, [first.itemId, first.eventId])
+
+    await pool!.query(`UPDATE "agent_events" SET "sequence"=$1 WHERE "id"=$2`, [first.sequence + 10_000n, first.eventId])
+    expect(await readSteerEvidence(fixture)).toEqual({ kind: "unsafe" })
+    await pool!.query(`UPDATE "agent_events" SET "sequence"=$1 WHERE "id"=$2`, [first.sequence, first.eventId])
+
+    await pool!.query(`UPDATE "agent_events" SET "payload"=jsonb_set("payload",'{inputId}',to_jsonb($1::text)) WHERE "id"=$2`, [second.inputId, first.eventId])
+    expect(await readSteerEvidence(fixture)).toEqual({ kind: "unsafe" })
+    await pool!.query(`UPDATE "agent_events" SET "payload"=$1::jsonb WHERE "id"=$2`, [JSON.stringify(first.expectedPayload), first.eventId])
+    expect(await readSteerEvidence(fixture)).toEqual({ kind: "accepted_steer" })
+
+    const context = await withContextTransaction(fixture, async (client, _authorization, allowed) => {
+      expect(allowed).toBe(true)
+      return buildAndClassifyContext(client, fixture, allowed)
+    })
+    expect(context.workResult.context.inputThroughSequence).toBe(second.sequence)
+    expect(context.workResult.context.consumedInputIds).toEqual(expect.arrayContaining([first.inputId, second.inputId]))
+    expect(context.workResult.steerEvidence).toEqual({ kind: "accepted_steer" })
+    expect(context.workResult.crossSessionReadAllowed).toBe(false)
+  })
+
   it("treats a steer accepted before context claim as a cross-session history barrier", async () => {
     const userId = await createUser(), sessionId = await createSession(userId), fixture = await createTurn(userId, sessionId)
     await setConsent(userId, true, 0)
-    const acceptedSequence = await acceptSteer(fixture, `history-consent-before-${randomUUID()}`, "Prefer platform engineering roles.")
+    const acceptedSequence = await acceptSteer(fixture, randomUUID(), "Prefer platform engineering roles.")
     const result = await withContextTransaction(fixture, async (client, _authorization, allowed) => {
       expect(allowed).toBe(true)
       return buildAndClassifyContext(client, fixture, allowed)
@@ -485,7 +620,7 @@ describePg("root task history Session authorization PostgreSQL serialization", (
       const held = await entered.promise
       expect(held.result).toMatchObject({ crossSessionReadAllowed: true, steerEvidence: { kind: "no_accepted_steer" },
         context: { inputThroughSequence: 0n, consumedInputIds: [] } })
-      const steerId = `history-consent-blocked-${randomUUID()}`
+      const steerId = randomUUID()
       acceptance = acceptSteer(first, steerId, "Prioritise jobs with platform ownership.")
       await waitForBlockedBy(ACCEPTANCE_APPLICATION, held.pid)
       release.resolve()

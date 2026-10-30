@@ -1,5 +1,6 @@
 import type pg from "pg"
 import type { InputContentPart } from "@jobcopilot/agent-protocol"
+import { redactSensitiveText } from "@jobcopilot/shared"
 import type { StoredAgentInput } from "./input-claim-store.js"
 import type { RootInputContextRow } from "./root-input-context-reader.js"
 import type { SteeringReconciliationScope } from "../subagents/steering-reconciliation-contract.js"
@@ -9,11 +10,12 @@ type Client = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
 type HydrationRow = RootInputContextRow & Readonly<{
   acceptedType: unknown; acceptedActor: unknown; acceptedTaskId: unknown; acceptedCorrelationId: unknown
-  acceptedEventSequence: unknown; acceptedPayload: unknown; acceptedItemId: unknown; acceptedItemType: unknown
-  acceptedItemTaskId: unknown; acceptedItemStatus: unknown; acceptedItemContent: unknown; cancelledAt: unknown
+  acceptedEventSequence: unknown; acceptedEventCausationId: unknown; acceptedPayload: unknown; acceptedItemId: unknown; acceptedItemType: unknown
+  acceptedItemStepId: unknown; acceptedItemTaskId: unknown; acceptedItemStatus: unknown; acceptedItemContent: unknown; cancelledAt: unknown
 }>
 export type HydrationScope = Omit<SteeringReconciliationScope, "stepId">
 type ErrorFactory = (message: string) => Error
+const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i
 
 function object(value: unknown): Row | null {
   const parsed = typeof value === "string" ? (() => { try { return JSON.parse(value) as unknown } catch { return null } })() : value
@@ -38,21 +40,25 @@ function canonical(value: unknown): unknown {
 function jsonEqual(left: unknown, right: unknown): boolean {
   return JSON.stringify(canonical(left)) === JSON.stringify(canonical(right))
 }
+function inputIdMatches(value: unknown, id: string): boolean {
+  return value === id || UUID.test(id) && value === redactSensitiveText(id)
+}
 
 function assertAcceptedUserParts(row: HydrationRow, input: StoredAgentInput, turnId: string, fail: ErrorFactory): void {
   const payload = object(row.acceptedPayload)
   const item = object(row.acceptedItemContent)
+  if (!payload || !item) throw fail("Accepted user steering provenance is invalid")
   const payloadKeys = payload && Object.keys(payload).sort().join(",")
   const itemKeys = item && Object.keys(item).sort().join(",")
   const sequence = typeof row.acceptedEventSequence === "bigint" || typeof row.acceptedEventSequence === "number" || typeof row.acceptedEventSequence === "string"
     ? BigInt(row.acceptedEventSequence) : -1n
-  if (row.acceptedType !== "input.accepted" || row.acceptedActor !== "user" || row.acceptedTaskId !== null
+  if (row.acceptedType !== "input.accepted" || row.acceptedActor !== "user" || row.acceptedTaskId !== null || row.acceptedEventCausationId !== null
     || row.acceptedCorrelationId !== turnId || sequence !== input.acceptedSequence || typeof row.acceptedItemId !== "string"
-    || row.acceptedItemType !== "user_message" || row.acceptedItemTaskId !== null || row.acceptedItemStatus !== "completed"
-    || payloadKeys !== "clientMessageId,delivery,disposition,inputId,source" || payload?.inputId !== input.id
-    || payload.clientMessageId !== input.clientMessageId || payload.delivery !== "steer" || payload.source !== "user"
+    || row.acceptedItemType !== "user_message" || row.acceptedItemStepId !== null || row.acceptedItemTaskId !== null || row.acceptedItemStatus !== "completed"
+    || payloadKeys !== "clientMessageId,delivery,disposition,inputId,source" || !inputIdMatches(payload.inputId, input.id)
+    || payload.clientMessageId !== redactSensitiveText(input.clientMessageId) || payload.delivery !== "steer" || payload.source !== "user"
     || typeof payload.disposition !== "string" || !payload.disposition.trim()
-    || itemKeys !== "clientMessageId,disposition,parts,source" || item?.clientMessageId !== input.clientMessageId
+    || itemKeys !== "clientMessageId,disposition,parts,source" || item.clientMessageId !== input.clientMessageId
     || item.disposition !== payload.disposition || item.source !== "user" || !Array.isArray(item.parts)) throw fail("Accepted user steering provenance is invalid")
   try {
     if (!jsonEqual(input.content, item.parts)) throw fail("Accepted user steering content changed")
@@ -112,8 +118,8 @@ export async function loadUnresolvedSteeringContext(
   if (!expectedIds.length) return []
   const result = await client.query<HydrationRow>(
     `SELECT input."id", input."sessionId", input."targetTurnId", input."userId", input."clientMessageId", input."delivery", input."status", input."content", input."acceptedSequence", input."consumedByStepId", input."consumedAt", input."createdAt", input."cancelledAt",
-            event."type" AS "acceptedType", event."actor" AS "acceptedActor", event."taskId" AS "acceptedTaskId", event."correlationId" AS "acceptedCorrelationId", event."sequence" AS "acceptedEventSequence", event."payload" AS "acceptedPayload", event."itemId" AS "acceptedItemId",
-            accepted_item."type" AS "acceptedItemType", accepted_item."taskId" AS "acceptedItemTaskId", accepted_item."status" AS "acceptedItemStatus", accepted_item."content" AS "acceptedItemContent"
+            event."type" AS "acceptedType", event."actor" AS "acceptedActor", event."taskId" AS "acceptedTaskId", event."correlationId" AS "acceptedCorrelationId", event."causationId" AS "acceptedEventCausationId", event."sequence" AS "acceptedEventSequence", event."payload" AS "acceptedPayload", event."itemId" AS "acceptedItemId",
+            accepted_item."type" AS "acceptedItemType", accepted_item."stepId" AS "acceptedItemStepId", accepted_item."taskId" AS "acceptedItemTaskId", accepted_item."status" AS "acceptedItemStatus", accepted_item."content" AS "acceptedItemContent"
      FROM "agent_inputs" AS input
      JOIN "agent_events" AS event ON event."sessionId" = input."sessionId" AND event."turnId" = input."targetTurnId" AND event."sequence" = input."acceptedSequence"
      JOIN "agent_items" AS accepted_item ON accepted_item."id" = event."itemId" AND accepted_item."sessionId" = input."sessionId" AND accepted_item."turnId" = input."targetTurnId"
@@ -122,12 +128,14 @@ export async function loadUnresolvedSteeringContext(
     [scope.sessionId, scope.turnId, scope.userId, expectedIds],
   )
   if (result.rows.length !== expectedIds.length) throw fail("Unresolved steering input is missing its accepted user item")
-  const expected = new Set(expectedIds), seen = new Set<string>()
+  const expected = new Set(expectedIds), seen = new Set<string>(), sequences = new Set<bigint>()
   const inputs = result.rows.map(row => {
     const input = mapInput(row)
     if (!expected.has(input.id) || seen.has(input.id) || input.sessionId !== scope.sessionId || input.targetTurnId !== scope.turnId
       || input.userId !== scope.userId || input.delivery !== "steer" || !["accepted", "queued", "consumed"].includes(input.status)
       || row.cancelledAt !== null) throw fail("Unresolved steering input is outside its accepted owner scope")
+    if (sequences.has(input.acceptedSequence)) throw fail("Unresolved steering input sequence is ambiguous")
+    sequences.add(input.acceptedSequence)
     seen.add(input.id)
     assertAcceptedUserParts(row, input, scope.turnId, fail)
     return input

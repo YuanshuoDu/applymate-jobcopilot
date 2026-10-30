@@ -9,7 +9,7 @@ import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 import { buildTaskGraphFinalSummaryBinding, TASK_GRAPH_FINAL_SUMMARY_BINDING } from "../subagents/task-graph-final-summary-binding.js"
 import type { GraphTaskRow, LoadedGraph } from "../subagents/task-graph-pg-state.js"
 import { formatTaskGraphFinalSummary } from "../subagents/task-graph-final-summary-format.js"
-import type { TaskGraphSnapshot } from "../subagents/task-graph-snapshot.js"
+import { taskGraphItemId, type TaskGraphSnapshot } from "../subagents/task-graph-snapshot.js"
 import { SCHEDULED_PIPELINE_COMPLETION, type TurnEngineCompletionGate } from "./turn-execution-types.js"
 import { TURN_SCHEDULED_GATE_CHOICE_SCHEMA, turnScheduledGateChoiceWaitId } from "./turn-question-gate-choice-contract.js"
 import { TurnStateRefreshRetryError } from "./turn-execution-question.js"
@@ -309,11 +309,13 @@ describe("atomic TaskGraph finalization recovery", () => {
         result: { status: "failed", failureReason: "PRIVATE_FAILURE_REASON" } },
       { id: "task-private-invalid-reviewer", role: "reviewer", taskType: "review", status: "completed", failureReason: null,
         result: { status: "completed", structuredResult: { summary: "PRIVATE_TASK_PROSE_DO_NOT_RENDER" } } },
+      { id: "task-private-control", role: "auditor", taskType: "native_verification", status: "completed", failureReason: null,
+        result: { status: "completed" } },
     ]
     const loadedGraph = {
-      rootTaskId: "root-private-id",
-      item: { id: "task-graph:root-private-id", revision: 41, content: {}, createdAt: new Date(0) },
-      snapshot: { nodes: taskRows.map(({ id }) => ({ taskId: id })) } as unknown as TaskGraphSnapshot,
+      rootTaskId: "root-1",
+      item: { id: taskGraphItemId("root-1"), revision: 41, content: {}, createdAt: new Date(0) },
+      snapshot: { nodes: taskRows.map(({ id, taskType }, nodeIndex) => ({ taskId: id, key: `node-${nodeIndex}`, templateId: taskType })) } as unknown as TaskGraphSnapshot,
       state: { revision: 41 } as LoadedGraph["state"],
       tasks: new Map(taskRows.map(row => [row.id, row])),
     } as LoadedGraph
@@ -343,7 +345,7 @@ describe("atomic TaskGraph finalization recovery", () => {
     })
 
     expect(outcome).toMatchObject({ kind: "completed", result: { finalText: candidate } })
-    const recorded = saved[0] as { response: string; terminal: { finalContent: { text: string; final: { response: string; summary: string } }; [TASK_GRAPH_FINAL_SUMMARY_BINDING]?: typeof binding } }
+    const recorded = saved[0] as { response: string; terminal: { finalItemId: string; finalContent: { text: string; final: { response: string; summary: string; taskGraphSources?: unknown }; taskGraphSources?: { schemaVersion: string; graphRevision: number; sources: readonly { sourceKey: string; nodeIndex: number; role: string; taskStatus: string; resultState: string }[] } }; [TASK_GRAPH_FINAL_SUMMARY_BINDING]?: typeof binding } }
     const serialized = JSON.parse(recorded.response) as { response: string; summary: string }
     expect(serialized.response).toBe(candidate)
     const expectedOverview = "Recorded task outcomes (earlier attempts may be superseded; not verification): role=analyst, task state=failed, result structure=missing, reported result status=not reported: 1; role=prepare, task state=completed, result structure=valid, reported result status=completed: 1; role=prepare, task state=completed, result structure=valid, reported result status=partial: 1; role=reviewer, task state=completed, result structure=invalid, reported result status=not reported: 1; role=scout, task state=completed, result structure=valid, reported result status=partial: 1; 1 outcome group omitted."
@@ -357,6 +359,14 @@ describe("atomic TaskGraph finalization recovery", () => {
     expect(recorded.terminal.finalContent.text).toBe(candidate)
     expect(recorded.terminal.finalContent.final.response).toBe(candidate)
     expect(recorded.terminal.finalContent.final.summary).toBe(serialized.summary)
+    expect(recorded.terminal.finalContent.taskGraphSources).toMatchObject({
+      schemaVersion: "agent-harness.v2.task-graph-sources.v1", graphRevision: 41,
+      sources: [{ nodeIndex: 0 }, { nodeIndex: 1 }, { nodeIndex: 2 }, { nodeIndex: 3 }, { nodeIndex: 4 }, { nodeIndex: 5 }],
+    })
+    expect(recorded.terminal.finalContent.taskGraphSources?.sources).toHaveLength(6)
+    expect(recorded.terminal.finalContent.final).not.toHaveProperty("taskGraphSources")
+    expect(JSON.parse(recorded.response)).not.toHaveProperty("taskGraphSources")
+    expect(recorded.terminal.finalContent.taskGraphSources?.sources.some(source => source.nodeIndex === 6)).toBe(false)
     expect(recorded.terminal[TASK_GRAPH_FINAL_SUMMARY_BINDING]).toBe(binding)
     for (const privateValue of ["task-private-", "job-private-", "root-private-id", "PRIVATE_TASK_PROSE_DO_NOT_RENDER", "PRIVATE_FAILURE_REASON", "private.test", "graphRevision"]) {
       expect(serialized.summary).not.toContain(privateValue)

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool, type PoolClient } from "pg"
+import { redactAgentEvent } from "@jobcopilot/shared"
 import { createPgRootTaskStore } from "./root-task-store.js"
 import type { TurnLease } from "../turns/lease.js"
 import type { PgSubagentPool } from "./types.js"
@@ -24,10 +25,11 @@ const databaseUrl = disposableUrl(), describePg = databaseUrl ? describe : descr
 const suffix = randomUUID(), ids = {
   user: `root-finish-steering-user-${suffix}`, session: `root-finish-steering-session-${suffix}`,
   turn: `root-finish-steering-turn-${suffix}`, root: `root-finish-steering-task-${suffix}`,
-  step: `root-finish-steering-step-${suffix}`, original: `root-finish-steering-original-${suffix}`,
-  steer: `root-finish-steering-input-${suffix}`, owner: `root-finish-steering-owner-${suffix}`,
+  step: `root-finish-steering-step-${suffix}`, original: randomUUID(),
+  steer: randomUUID(), owner: `root-finish-steering-owner-${suffix}`,
 }
 const runtimeRole = `root_finish_runtime_${suffix.replaceAll("-", "")}`
+const phoneShapedClientMessageId = "steer-415-555-0100-message"
 const future = new Date(Date.now() + 10 * 60_000)
 const lease: TurnLease = { turnId: ids.turn, sessionId: ids.session, ownerId: ids.owner, userId: ids.user,
   leaseVersion: 1, leaseStartedAt: new Date(), leaseExpiresAt: future }
@@ -53,6 +55,14 @@ function restrictedPool(pool: Pool): PgSubagentPool {
   } }
 }
 
+function acceptedEventPayload(input: { inputId: string; itemId: string; clientMessageId: string; delivery: "follow_up" | "steer"; disposition: string }): unknown {
+  const result = redactAgentEvent({ type: "input.accepted", body: "", routing: { sessionId: ids.session, turnId: ids.turn,
+    itemId: input.itemId, taskId: null, actor: "user", correlationId: ids.turn, causationId: null, outboxTopic: "agent.session.event" },
+    data: { inputId: input.inputId, clientMessageId: input.clientMessageId, delivery: input.delivery, source: "user", disposition: input.disposition } }).data
+  if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error("Root TaskStore fixture accepted event was not safely projected")
+  return result
+}
+
 async function seed(): Promise<void> {
   await admin!.query(`INSERT INTO "User" ("id", "email", "updatedAt") VALUES ($1, $2, CURRENT_TIMESTAMP)`, [ids.user, `${ids.user}@example.invalid`])
   await admin!.query(`INSERT INTO "agent_sessions" ("id", "userId", "goal", "status", "source", "updatedAt", "eventSequence")
@@ -74,8 +84,8 @@ async function seed(): Promise<void> {
   [ids.step, ids.session, ids.turn, ids.root, JSON.stringify([ids.original, ids.steer])])
   for (const input of [
     { id: ids.original, clientMessageId: messageId, delivery: "follow_up", text: "Complete the original task", disposition: "submitted", sequence: 1 },
-    { id: ids.steer, clientMessageId: `${ids.steer}-message`, delivery: "steer", text: "Also preserve the location constraint", disposition: "steered", sequence: 2 },
-  ]) {
+    { id: ids.steer, clientMessageId: phoneShapedClientMessageId, delivery: "steer", text: "Also preserve the location constraint", disposition: "steered", sequence: 2 },
+  ] as const) {
     const itemId = `${input.id}-item`, content = { parts: [{ type: "text", text: input.text }], clientMessageId: input.clientMessageId,
       source: "user", disposition: input.disposition }
     await admin!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "type", "status", "phase", "revision", "content", "startedAt", "completedAt", "updatedAt")
@@ -84,7 +94,7 @@ async function seed(): Promise<void> {
     await admin!.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload")
       VALUES ($1, $2, $3, $4, NULL, $5, 'input.accepted', 'user', $3, $6, $7::jsonb)`,
     [`${input.id}-accepted`, ids.session, ids.turn, itemId, input.sequence, `agent-command:${input.clientMessageId}`,
-      JSON.stringify({ inputId: input.id, clientMessageId: input.clientMessageId, delivery: input.delivery, source: "user", disposition: input.disposition })])
+      JSON.stringify(acceptedEventPayload({ inputId: input.id, itemId, clientMessageId: input.clientMessageId, delivery: input.delivery, disposition: input.disposition }))])
     await admin!.query(`INSERT INTO "agent_inputs" ("id", "sessionId", "targetTurnId", "userId", "clientMessageId", "delivery", "status", "content", "acceptedSequence", "consumedByStepId", "consumedAt")
       VALUES ($1, $2, $3, $4, $5, $6, 'consumed', $7::jsonb, $8, $9, CURRENT_TIMESTAMP)`,
     [input.id, ids.session, ids.turn, ids.user, input.clientMessageId, input.delivery, JSON.stringify([{ type: "text", text: input.text }]), input.sequence, ids.step])
@@ -115,6 +125,20 @@ describePg("Root TaskStore steering finalization on disposable PostgreSQL", () =
   })
 
   it("rolls back Root finish when consumed steering has no persisted decision receipt", async () => {
+    const projectedSteer = await admin!.query<{ inputClientMessageId: string; acceptedClientMessageId: string; itemClientMessageId: string }>(
+      `SELECT input."clientMessageId" AS "inputClientMessageId", event."payload"->>'clientMessageId' AS "acceptedClientMessageId",
+        item."content"->>'clientMessageId' AS "itemClientMessageId"
+       FROM "agent_inputs" AS input
+       JOIN "agent_events" AS event ON event."sessionId" = input."sessionId" AND event."turnId" = input."targetTurnId"
+         AND event."sequence" = input."acceptedSequence" AND event."type" = 'input.accepted'
+       JOIN "agent_items" AS item ON item."id" = event."itemId" AND item."sessionId" = input."sessionId" AND item."turnId" = input."targetTurnId"
+       WHERE input."id" = $1`,
+      [ids.steer])
+    expect(projectedSteer.rows).toEqual([{
+      inputClientMessageId: phoneShapedClientMessageId,
+      acceptedClientMessageId: "steer-[REDACTED_PHONE]-message",
+      itemClientMessageId: phoneShapedClientMessageId,
+    }])
     const before = await admin!.query(`SELECT turn."status" AS "turnStatus", turn."finalResponse", root."status" AS "rootStatus", root."result",
       root."failureReason", root."leaseOwner", root."leaseExpiresAt", root."completedAt"
       FROM "agent_turns" AS turn JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId"

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool as PgPool, type PoolClient } from "pg"
+import { redactAgentEvent, redactSensitiveText } from "@jobcopilot/shared"
 
 import { createAgentArtifactRepository } from "../../db/agent-artifact-repo.js"
 import { createCanonicalScheduledDraftRuntime } from "../scheduled-draft-runtime.js"
@@ -114,7 +115,7 @@ function fixture(): Fixture {
     foreignItemId: `p3-task-graph-foreign-item-${suffix}`,
     foreignEventId: `p3-task-graph-foreign-event-${suffix}`,
     foreignOutboxId: `p3-task-graph-foreign-outbox-${suffix}`,
-    foreignInputId: `p3-task-graph-foreign-input-${suffix}`,
+    foreignInputId: randomUUID(),
     sessionId: `p3-task-graph-session-${suffix}`,
     turnId: `p3-task-graph-turn-${suffix}`,
     rootTaskId: `p3-task-graph-root-${suffix}`,
@@ -123,11 +124,11 @@ function fixture(): Fixture {
     keepStepId: `p3-task-graph-keep-step-${suffix}`,
     branchStepId: `p3-task-graph-branch-step-${suffix}`,
     laterStepId: `p3-task-graph-later-step-${suffix}`,
-    originalInputId: `p3-task-graph-original-input-${suffix}`,
+    originalInputId: randomUUID(),
     originalClientMessageId: `p3-task-graph-original-client-${suffix}`,
-    firstSteerInputId: `p3-task-graph-first-steer-${suffix}`,
+    firstSteerInputId: randomUUID(),
     firstSteerClientMessageId: `p3-task-graph-first-steer-client-${suffix}`,
-    secondSteerInputId: `p3-task-graph-second-steer-${suffix}`,
+    secondSteerInputId: randomUUID(),
     secondSteerClientMessageId: `p3-task-graph-second-steer-client-${suffix}`,
     planCallId: `p3-task-graph-plan-call-${suffix}`,
     keepCallId: `p3-task-graph-keep-call-${suffix}`,
@@ -687,7 +688,7 @@ async function prepareTypedSupersession(pool: PgPool, commandPool: PgPool, roleN
   await seedReconciliationInput(pool, value, {
     id: value.originalInputId, clientMessageId: value.originalClientMessageId, delivery: "follow_up",
     sequence: originalSequence, consumedByStepId: value.originStepId,
-    text: "Complete original user task reference", disposition: "submitted",
+    text: "Complete original user task reference", disposition: "started",
   })
   const turnInput = { input: { goal: "Find roles", clientMessageId: value.originalClientMessageId } }
   if (options.initialScheduledScoutCount !== undefined) {
@@ -1259,6 +1260,22 @@ async function insertReconciliationEvent(pool: PgPool, value: Fixture, event: {
   ])
 }
 
+function sanitizedAcceptedInputPayload(value: Fixture, itemId: string, input: {
+  readonly id: string; readonly clientMessageId: string; readonly delivery: "follow_up" | "steer"
+  readonly disposition: string
+}): unknown {
+  const result = redactAgentEvent({ type: "input.accepted", body: "", data: {
+    inputId: input.id, clientMessageId: input.clientMessageId, delivery: input.delivery, source: "user", disposition: input.disposition,
+  }, routing: { sessionId: value.sessionId, turnId: value.turnId, itemId, taskId: null, actor: "user",
+    correlationId: value.turnId, causationId: null, outboxTopic: "agent.session.event" } }).data
+  if (!result || Array.isArray(result) || typeof result !== "object") throw new Error("Accepted input fixture payload was rejected by the event redactor")
+  const payload = result as Record<string, unknown>
+  if (payload.inputId !== input.id || payload.clientMessageId !== redactSensitiveText(input.clientMessageId)) {
+    throw new Error("Accepted input fixture did not match the trusted event redaction contract")
+  }
+  return payload
+}
+
 async function seedReconciliationStep(pool: PgPool, value: Fixture, step: {
   readonly id: string; readonly ordinal: number; readonly status: "streaming" | "completed"
   readonly cursor: bigint; readonly consumedInputIds: readonly string[]
@@ -1275,7 +1292,7 @@ async function seedReconciliationInput(pool: PgPool, value: Fixture, input: {
   readonly sequence: bigint; readonly consumedByStepId: string; readonly text: string; readonly disposition: string
 }): Promise<void> {
   const content = { parts: [{ type: "text", text: input.text }], clientMessageId: input.clientMessageId, source: "user", disposition: input.disposition }
-  const itemId = `${input.id}-message`
+  const itemId = randomUUID()
   await pool.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "content", "createdAt", "updatedAt")
     VALUES ($1, $2, $3, NULL, NULL, 'user_message', 'completed', $4::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, [
     itemId, value.sessionId, value.turnId, JSON.stringify(content),
@@ -1289,14 +1306,14 @@ async function seedReconciliationInput(pool: PgPool, value: Fixture, input: {
   await insertReconciliationEvent(pool, value, {
     id: `${input.id}-accepted`, sequence: input.sequence, type: "input.accepted", actor: "user", itemId, taskId: null,
     correlationId: value.turnId, idempotencyKey: `input.accepted:${input.clientMessageId}`,
-    payload: { inputId: input.id, clientMessageId: input.clientMessageId, delivery: input.delivery, source: "user", disposition: input.disposition },
+    payload: sanitizedAcceptedInputPayload(value, itemId, input),
   })
 }
 
 async function seedAcceptedReconciliationSteer(pool: PgPool, value: Fixture, input: {
   readonly id: string; readonly clientMessageId: string; readonly sequence: bigint; readonly text: string
 }): Promise<void> {
-  const disposition = "steered", itemId = `${input.id}-message`
+  const disposition = "steered", itemId = randomUUID()
   const content = { parts: [{ type: "text", text: input.text }], clientMessageId: input.clientMessageId, source: "user", disposition }
   await pool.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "content", "createdAt", "updatedAt")
     VALUES ($1, $2, $3, NULL, NULL, 'user_message', 'completed', $4::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, [
@@ -1310,7 +1327,7 @@ async function seedAcceptedReconciliationSteer(pool: PgPool, value: Fixture, inp
   await insertReconciliationEvent(pool, value, {
     id: `${input.id}-accepted`, sequence: input.sequence, type: "input.accepted", actor: "user", itemId, taskId: null,
     correlationId: value.turnId, idempotencyKey: `input.accepted:${input.clientMessageId}`,
-    payload: { inputId: input.id, clientMessageId: input.clientMessageId, delivery: "steer", source: "user", disposition },
+    payload: sanitizedAcceptedInputPayload(value, itemId, { ...input, delivery: "steer", disposition }),
   })
 }
 
@@ -1744,7 +1761,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     expect(accepted.revision).toBe(1)
 
     await adminPool!.query(`UPDATE "agent_steps" SET "status" = 'completed', "completedAt" = CURRENT_TIMESTAMP WHERE "id" = $1`, [value.stepId])
-    const priorFollowUpInputId = `p3-task-graph-follow-up-${value.turnId}`
+    const priorFollowUpInputId = randomUUID()
     const priorFollowUpStepId = `${value.originStepId}-prior`
     const priorFollowUpSequence = await nextEventSequence(adminPool!, value)
     await seedReconciliationStep(adminPool!, value, {
@@ -1753,7 +1770,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     })
     await seedReconciliationInput(adminPool!, value, {
       id: priorFollowUpInputId, clientMessageId: `${priorFollowUpInputId}-client`, delivery: "follow_up",
-      sequence: priorFollowUpSequence, consumedByStepId: priorFollowUpStepId, text: "Keep the original user direction", disposition: "submitted",
+      sequence: priorFollowUpSequence, consumedByStepId: priorFollowUpStepId, text: "Keep the original user direction", disposition: "queued_follow_up",
     })
     await seedReconciliationAgenda(adminPool!, value, {
       id: priorFollowUpStepId, sequence: await nextEventSequence(adminPool!, value), cursor: priorFollowUpSequence,
@@ -2236,7 +2253,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     const originalSequence = await nextEventSequence(adminPool!, value)
     await seedReconciliationInput(adminPool!, value, {
       id: value.originalInputId, clientMessageId: value.originalClientMessageId, delivery: "follow_up",
-      sequence: originalSequence, consumedByStepId: value.originStepId, text: "Complete original user task reference", disposition: "submitted",
+      sequence: originalSequence, consumedByStepId: value.originStepId, text: "Complete original user task reference", disposition: "started",
     })
     await adminPool!.query(`UPDATE "agent_steps" SET "inputThroughSequence" = $2, "consumedInputIds" = $3::jsonb WHERE "id" = $1`, [
       value.stepId, originalSequence.toString(), JSON.stringify([value.originalInputId]),
@@ -2292,7 +2309,7 @@ describeWithPostgres("PostgreSQL TaskGraph command port (P3 acceptance slice)", 
     expect(originalSequence).toBe(1n)
     await seedReconciliationInput(adminPool!, value, {
       id: value.originalInputId, clientMessageId: value.originalClientMessageId, delivery: "follow_up",
-      sequence: originalSequence, consumedByStepId: value.originStepId, text: "Complete original user task reference", disposition: "submitted",
+      sequence: originalSequence, consumedByStepId: value.originStepId, text: "Complete original user task reference", disposition: "started",
     })
     const firstSteerSequence = await nextEventSequence(adminPool!, value)
     await adminPool!.query(`UPDATE "agent_steps" SET "inputThroughSequence" = $2, "consumedInputIds" = $3::jsonb WHERE "id" = $1`, [

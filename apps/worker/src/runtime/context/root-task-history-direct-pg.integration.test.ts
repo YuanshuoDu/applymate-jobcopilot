@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto"
+import { Buffer } from "node:buffer"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool as PgPool, type PoolClient } from "pg"
 import { parseTaskGraphSnapshot, TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "../subagents/task-graph-snapshot.js"
@@ -7,6 +8,8 @@ import { createPgDirectRootTaskHistoryStore, type DirectRootTaskHistoryLoadInput
 import { OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, updateRootObjectiveHistoryProjection } from "./objective-history-projection.js"
 import { projectRootTaskHistory, type ValidatedRootTaskHistoryOutcome } from "./root-task-history.js"
 import { acquireRootTaskHistoryChronologyLock, appendRootTaskHistoryChronologyWitness } from "./root-task-history-chronology-witness.js"
+import { readRootTaskHistoryFence } from "./root-task-history-fence.js"
+import { buildRootTaskHistoryCrossSessionWindow, type RootTaskHistoryCrossSessionWindowInput } from "./root-task-history-source-window.js"
 import type { TurnLease } from "../turns/lease.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
@@ -43,15 +46,68 @@ function withTimeout<T>(promise: Promise<T>, message: string): Promise<T> {
   ]).finally(() => { if (timeout) clearTimeout(timeout) })
 }
 
-function observeQueries(pool: PgPool, afterQuery: (sql: string, values?: readonly unknown[]) => Promise<void>): Pick<PgPool, "connect"> {
+function observeQueries(pool: PgPool, afterQuery: (sql: string, values?: readonly unknown[], rows?: readonly unknown[]) => Promise<void>): Pick<PgPool, "connect"> {
   return {
     connect: async () => {
       const client = await pool.connect()
       const originalQuery = client.query.bind(client)
       const query = async (sql: string, values?: readonly unknown[]) => {
         const result = await originalQuery(sql, values ? [...values] : undefined)
-        await afterQuery(sql, values)
+        await afterQuery(sql, values, result.rows)
         return result
+      }
+      return new Proxy(client, {
+        get(target, property) {
+          if (property === "query") return query
+          const value = Reflect.get(target, property, target)
+          return typeof value === "function" ? value.bind(target) : value
+        },
+      })
+    },
+  }
+}
+
+function queryLevelDuplicateWitnessSql(sql: string, witnessIdParameter: number): string {
+  const witnessId = `$${witnessIdParameter}`
+  return `WITH "agent_events" AS MATERIALIZED (
+      SELECT * FROM public."agent_events"
+      UNION ALL
+      SELECT (jsonb_populate_record(NULL::public.agent_events,
+        to_jsonb(source_witness) || jsonb_build_object('id', source_witness."id" || ':query-duplicate'))).*
+      FROM public."agent_events" AS source_witness WHERE source_witness."id" = ${witnessId}
+    ), "agent_outbox" AS MATERIALIZED (
+      SELECT * FROM public."agent_outbox"
+      UNION ALL
+      SELECT (jsonb_populate_record(NULL::public.agent_outbox,
+        to_jsonb(source_dispatch) || jsonb_build_object(
+          'id', 'agent-outbox-' || shadow_witness."id",
+          'idempotencyKey', 'agent-event:' || shadow_witness."id",
+          'payload', jsonb_build_object('eventId', shadow_witness."id", 'sessionId', shadow_witness."sessionId",
+            'turnId', shadow_witness."turnId", 'taskId', shadow_witness."taskId", 'itemId', shadow_witness."itemId",
+            'sequence', shadow_witness."sequence"::text, 'type', shadow_witness."type", 'actor', shadow_witness."actor",
+            'correlationId', shadow_witness."correlationId", 'causationId', shadow_witness."causationId",
+            'idempotencyKey', shadow_witness."idempotencyKey", 'payload', shadow_witness.payload)))).*
+      FROM "agent_events" AS shadow_witness
+      JOIN public."agent_events" AS source_witness
+        ON shadow_witness."id" = source_witness."id" || ':query-duplicate'
+      JOIN public."agent_outbox" AS source_dispatch ON source_dispatch."id" = 'agent-outbox-' || source_witness."id"
+    )
+    SELECT "root_task_history_query_level_duplicate".*
+    FROM (${sql}) AS "root_task_history_query_level_duplicate"
+    CROSS JOIN (SELECT $3::text) AS "root_task_history_parameter_type_anchor"`
+}
+
+function queryLevelDuplicateWitnessPool(pool: PgPool, witnessId: string): Pick<PgPool, "connect"> {
+  return {
+    connect: async () => {
+      const client = await pool.connect()
+      const originalQuery = client.query.bind(client)
+      const query = async (sql: string, values?: readonly unknown[]) => {
+        if (!sql.includes("WITH terminal_window AS MATERIALIZED (") || !sql.includes('event."sessionId" <> $1')) {
+          return originalQuery(sql, values ? [...values] : undefined)
+        }
+        const witnessIdParameter = (values?.length ?? 0) + 1
+        return originalQuery(queryLevelDuplicateWitnessSql(sql, witnessIdParameter), [...(values ?? []), witnessId])
       }
       return new Proxy(client, {
         get(target, property) {
@@ -66,6 +122,34 @@ function observeQueries(pool: PgPool, afterQuery: (sql: string, values?: readonl
 
 function errorCode(error: unknown): string | undefined {
   return error && typeof error === "object" && "code" in error && typeof error.code === "string" ? error.code : undefined
+}
+
+function queryRecords(rows: readonly unknown[] | undefined): Array<Record<string, unknown>> {
+  const records: Array<Record<string, unknown>> = []
+  for (const row of rows ?? []) {
+    if (row && typeof row === "object" && !Array.isArray(row)) records.push(row as Record<string, unknown>)
+  }
+  return records
+}
+
+type SameSessionPageObservation = Readonly<{
+  rawRowCount: number
+  cursor: Readonly<{ sequence: unknown; turnId: unknown; terminalEventId: unknown }>
+  candidates: readonly Readonly<{ sequence: string; turnId: string; terminalEventId: string }>[]
+}>
+
+function sameSessionPageObservation(rows: readonly unknown[] | undefined): SameSessionPageObservation | undefined {
+  const records = queryRecords(rows)
+  const metadata = records.find(row => typeof row.pageRawRowCount === "number")
+  if (!metadata || typeof metadata.pageRawRowCount !== "number") return undefined
+  const candidates = records.flatMap(row => {
+    const sequence = row.terminalSequence
+    if (row.isPageWatermark !== false || typeof row.turnId !== "string" || typeof row.terminalEventId !== "string"
+      || (typeof sequence !== "string" && typeof sequence !== "number" && typeof sequence !== "bigint")) return []
+    return [{ sequence: String(sequence), turnId: row.turnId, terminalEventId: row.terminalEventId }]
+  })
+  return { rawRowCount: metadata.pageRawRowCount, cursor: { sequence: metadata.pageCursorSequence,
+    turnId: metadata.pageCursorTurnId, terminalEventId: metadata.pageCursorTerminalEventId }, candidates }
 }
 
 type Source = Readonly<{
@@ -163,6 +247,14 @@ const sameSessionUnrelated: Source[] = Array.from({ length: 65 }, (_, index): So
     sessionId, userId, goal: unrelatedObjective, criteria, input: { goal: unrelatedObjective, successCriteria: criteria },
     startSequence: 200 + index * 4, terminalCreatedAt: new Date(Date.UTC(2025, 0, 1, 0, 0, index)) }
 })
+function strictInvalidStepReceiptSources(prefix: string, count: number, firstStartSequence: number): Source[] {
+  return Array.from({ length: count }, (_, index): Source => ({
+    turnId: `root-history-${prefix}-turn-${index}-${suffix}`, rootTaskId: `root-history-${prefix}-root-${index}-${suffix}`,
+    childId: `root-history-${prefix}-child-${index}-${suffix}`, finalItemId: `root-history-${prefix}-final-${index}-${suffix}`,
+    sessionId, userId, goal: objective, criteria, input: { goal: objective, successCriteria: criteria },
+    startSequence: firstStartSequence + index * 8, stepReceipt: "duplicate",
+  }))
+}
 const crossSessionWrongOriginFillers: Source[] = Array.from({ length: 65 }, (_, index): Source => ({
   turnId: `root-history-cross-filler-${index}-${suffix}`, rootTaskId: `root-history-cross-filler-root-${index}-${suffix}`,
   childId: `root-history-cross-filler-child-${index}-${suffix}`, finalItemId: `root-history-cross-filler-final-${index}-${suffix}`,
@@ -607,6 +699,237 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       duplicateStepReceipt.turnId].includes(item.sourceTurnId))).toBe(false)
   })
 
+  it("advances an empty strict-validation page and finds valid same-session history after 64 raw rows", async () => {
+    const invalidSources = strictInvalidStepReceiptSources("page-invalid-first-window", 64, 400)
+    try {
+      for (const source of invalidSources) await insertSource(source)
+
+      const pageQueries: string[] = [], pageRawCounts: number[] = [], pageTurnIds: string[] = [], pageObservations: SameSessionPageObservation[] = [], graphLoads: string[] = []
+      const observed = observeQueries(pool!, async (sql, values, rows) => {
+        if (sql.includes("WITH terminal_window AS MATERIALIZED (")) {
+          pageQueries.push(sql)
+          const records = queryRecords(rows)
+          const observation = sameSessionPageObservation(rows)
+          if (observation) pageObservations.push(observation)
+          const metadata = records.find(row => typeof row.pageRawRowCount === "number")
+          if (typeof metadata?.pageRawRowCount === "number") pageRawCounts.push(metadata.pageRawRowCount)
+          pageTurnIds.push(...records.filter(row => row.isPageWatermark === false && typeof row.turnId === "string")
+            .map(row => row.turnId as string))
+        }
+        if (sql.includes('FROM "agent_items" AS item')) graphLoads.push(String(values?.[2]))
+      })
+      const input: DirectRootTaskHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
+        rootAttemptCount: 2, stepId: currentStepId, now: new Date() }
+      const history = await createPgDirectRootTaskHistoryStore(observed).load(input)
+
+      expect(pageQueries).toHaveLength(2)
+      expect(pageRawCounts[0]).toBe(64)
+      expect(pageTurnIds.slice(0, 64)).toEqual([...invalidSources].reverse().map(source => source.turnId))
+      expect(pageObservations).toHaveLength(2)
+      // The first raw page consists entirely of fixture rows that survive every outer join.
+      expect(pageObservations[0]?.rawRowCount).toBe(64)
+      expect(pageObservations[0]?.candidates).toHaveLength(64)
+      expect(pageObservations[0]?.cursor).toEqual(pageObservations[0]?.candidates[63])
+      expect(pageObservations[1]!.rawRowCount).toBeGreaterThan(0)
+      expect(pageObservations[1]!.rawRowCount).toBeLessThanOrEqual(64)
+      expect(history.map(item => item.sourceTurnId)).toEqual([matching[1]!.turnId, matching[0]!.turnId])
+      expect(graphLoads).toEqual([matching[1]!.turnId, matching[0]!.turnId])
+      expect(graphLoads.some(turnId => invalidSources.some(source => source.turnId === turnId))).toBe(false)
+    } finally {
+      await deleteSourceFixtures(invalidSources)
+    }
+  }, 60_000)
+
+  it("exhausts the same-session raw budget without starving the independent cross-session lane", async () => {
+    const invalidSources = strictInvalidStepReceiptSources("page-invalid-same-lane-budget", 128, 500)
+    try {
+      for (const source of invalidSources) await insertSource(source)
+
+      let sameSessionPages = 0, crossSessionPages = 0
+      const sameSessionRawCounts: number[] = [], sameSessionTurnIds: string[] = [], sameSessionObservations: SameSessionPageObservation[] = [], graphLoads: string[] = []
+      const observed = observeQueries(pool!, async (sql, values, rows) => {
+        if (sql.includes("WITH terminal_window AS MATERIALIZED (")) {
+          const records = queryRecords(rows)
+          const metadata = records.find(row => typeof row.pageRawRowCount === "number")
+          if (sql.includes('event."sessionId" <> $1')) crossSessionPages += 1
+          else {
+            sameSessionPages += 1
+            const observation = sameSessionPageObservation(rows)
+            if (observation) sameSessionObservations.push(observation)
+            if (typeof metadata?.pageRawRowCount === "number") sameSessionRawCounts.push(metadata.pageRawRowCount)
+            sameSessionTurnIds.push(...records.filter(row => row.isPageWatermark === false && typeof row.turnId === "string")
+              .map(row => row.turnId as string))
+          }
+        }
+        if (sql.includes('FROM "agent_items" AS item')) graphLoads.push(String(values?.[2]))
+      })
+      const input: DirectRootTaskHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
+        rootAttemptCount: 2, stepId: currentStepId, now: new Date(), crossSessionRootTaskHistoryEnabled: true }
+      const history = await createPgDirectRootTaskHistoryStore(observed).load(input)
+
+      expect(sameSessionPages).toBe(2)
+      expect(crossSessionPages).toBe(1)
+      expect(sameSessionRawCounts).toEqual([64, 64])
+      expect(sameSessionTurnIds).toEqual([...invalidSources].reverse().map(source => source.turnId))
+      expect(sameSessionObservations).toHaveLength(2)
+      // Both full pages consist entirely of fixture rows that survive every outer join.
+      for (const page of sameSessionObservations) {
+        expect(page.rawRowCount).toBe(64)
+        expect(page.candidates).toHaveLength(64)
+        expect(page.cursor).toEqual(page.candidates[63])
+      }
+      expect(history.map(item => item.sourceTurnId)).toEqual([
+        equalCutoff.turnId, crossEqualTimeHigherTurnId.turnId, otherSession.turnId,
+      ])
+      expect(graphLoads).toEqual(history.map(item => item.sourceTurnId))
+      expect(graphLoads.some(turnId => invalidSources.some(source => source.turnId === turnId))).toBe(false)
+    } finally {
+      await deleteSourceFixtures(invalidSources)
+    }
+  }, 60_000)
+
+  it("uses UTF-8 C-collation order for same-xid cross-session cursor pages", async () => {
+    const client = await pool!.connect()
+    try {
+      const encoding = await client.query<{ server_encoding: string }>("SHOW server_encoding")
+      expect(encoding.rows[0]?.server_encoding).toBe("UTF8")
+
+      const astralId = "\u{10000}", bmpId = "\uFFFF"
+      expect(astralId < bmpId).toBe(true)
+      expect(Buffer.compare(Buffer.from(astralId, "utf8"), Buffer.from(bmpId, "utf8"))).toBeGreaterThan(0)
+      const input: RootTaskHistoryCrossSessionWindowInput = {
+        currentSessionId: "unicode-current-session", userId: "unicode-owner", currentTurnId: "unicode-current-turn",
+        currentStartXid8: "99", scheduledCriteria: null, objectiveDigest: "unicode-objective",
+        semanticsVersion: OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, canonicalOrigin: '["user","none"]', limit: 1,
+      }
+      // Keep the builder's page/watermark CTEs intact and feed them synthetic rows through a query-level source CTE.
+      const synthetic = `SELECT 'event-astral'::text AS "terminalEventId", 'unicode-session'::text AS "sessionId",
+          U&'\\+010000'::text AS "turnId", 'root-astral'::text AS "taskId", 1::bigint AS "sequence",
+          'witness-astral'::text AS "terminalWitnessEventId", '8'::text AS "terminalWitnessXid8", 1::bigint AS "terminalWitnessCount"
+        UNION ALL
+        SELECT 'event-bmp'::text, 'unicode-session'::text, U&'\\FFFF'::text, 'root-bmp'::text, 1::bigint,
+          'witness-bmp'::text, '8'::text, 1::bigint`
+      const readPage = async (afterCursor?: RootTaskHistoryCrossSessionWindowInput["afterCursor"]) => {
+        const query = buildRootTaskHistoryCrossSessionWindow({ ...input, ...(afterCursor ? { afterCursor } : {}) })
+        const pageStart = query.sql.indexOf("), page AS MATERIALIZED (")
+        expect(pageStart).toBeGreaterThan(0)
+        // The synthetic eligible source omits the builder's eight eligibility parameters; rebase the remaining page slots.
+        const pageCtes = query.sql.slice(pageStart + 2).replace(/\$(\d+)/g, (_placeholder, slot: string) => `$${Number(slot) - 8}`)
+        const sql = `WITH eligible_candidates AS MATERIALIZED (${synthetic}),${pageCtes}`
+        const result = await client.query<Record<string, unknown>>(sql, [...query.values.slice(8)])
+        const pageRows = result.rows.filter(row => row.isPageWatermark !== true)
+        const watermarks = result.rows.filter(row => row.isPageWatermark === true)
+        expect(watermarks).toHaveLength(1)
+        return { pageRows, watermark: watermarks[0] }
+      }
+
+      const first = await readPage()
+      expect(first.pageRows.map(row => row.turnId)).toEqual([astralId])
+      expect(first.watermark?.pageRawRowCount).toBe(1)
+      const firstCursor = {
+        xid8: String(first.watermark?.pageCursorXid8), turnId: String(first.watermark?.pageCursorTurnId),
+        terminalEventId: String(first.watermark?.pageCursorTerminalEventId),
+        witnessEventId: String(first.watermark?.pageCursorWitnessEventId),
+      }
+      const second = await readPage(firstCursor)
+      expect(second.pageRows.map(row => row.turnId)).toEqual([bmpId])
+      expect(second.watermark?.pageRawRowCount).toBe(1)
+      const exhausted = await readPage({
+        xid8: String(second.watermark?.pageCursorXid8), turnId: String(second.watermark?.pageCursorTurnId),
+        terminalEventId: String(second.watermark?.pageCursorTerminalEventId),
+        witnessEventId: String(second.watermark?.pageCursorWitnessEventId),
+      })
+      expect(exhausted.pageRows).toEqual([])
+      expect(exhausted.watermark?.pageRawRowCount).toBe(0)
+      expect(exhausted.watermark?.pageCursorXid8).toBeNull()
+    } finally {
+      client.release()
+    }
+  }, 60_000)
+
+  it("keeps full cross-session witness multiplicity across keyset pages without weakening table constraints", async () => {
+    const input: DirectRootTaskHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
+      rootAttemptCount: 2, stepId: currentStepId, now: new Date(), crossSessionRootTaskHistoryEnabled: true }
+    const client = await pool!.connect()
+    let baseWitnessId: string | undefined
+    try {
+      await client.query("BEGIN")
+      await client.query("SELECT set_config($1,$2,true)", ["app.user_id", userId])
+      const fence = await readRootTaskHistoryFence(client, input)
+      expect(fence?.currentStartWitness?.xid8).toBeTruthy()
+      expect(fence?.currentOrigin).toBeTruthy()
+      if (!fence?.currentStartWitness || !fence.currentOrigin) throw new Error("Cross-session fence is unavailable")
+      const witness = await client.query<{ id: string }>(`SELECT "id" FROM "agent_events"
+        WHERE "sessionId" = $1 AND "turnId" = $2 AND "causationId" = $3
+          AND "type" = 'agent.plan.root_task_history_chronology_witness'`,
+      [otherSessionId, equalCutoff.turnId, terminalEventKey(equalCutoff)])
+      expect(witness.rows).toHaveLength(1)
+      baseWitnessId = witness.rows[0]?.id
+      expect(baseWitnessId).toBeTruthy()
+      if (!baseWitnessId) throw new Error("Cross-session terminal witness is unavailable")
+
+      const window: RootTaskHistoryCrossSessionWindowInput = {
+        currentSessionId: input.lease.sessionId, userId: input.lease.userId, currentTurnId: input.lease.turnId,
+        currentStartXid8: fence.currentStartWitness.xid8,
+        scheduledCriteria: fence.scheduledAutomationCriteria ? JSON.stringify(fence.scheduledAutomationCriteria) : null,
+        objectiveDigest: fence.objectiveDigest, semanticsVersion: OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION,
+        canonicalOrigin: fence.currentOrigin, limit: 1,
+      }
+      const readPage = async (afterCursor?: RootTaskHistoryCrossSessionWindowInput["afterCursor"]) => {
+        const query = buildRootTaskHistoryCrossSessionWindow({ ...window, ...(afterCursor ? { afterCursor } : {}) })
+        const result = await client.query<Record<string, unknown>>(
+          queryLevelDuplicateWitnessSql(query.sql, query.values.length + 1), [...query.values, baseWitnessId])
+        const pageRows = result.rows.filter(row => row.isPageWatermark !== true)
+        const watermarks = result.rows.filter(row => row.isPageWatermark === true)
+        expect(watermarks).toHaveLength(1)
+        return { pageRows, watermark: watermarks[0] }
+      }
+
+      const first = await readPage()
+      expect(first.pageRows).toHaveLength(1)
+      expect(first.pageRows[0]?.terminalEventId).toBe(terminalEventKey(equalCutoff))
+      expect(Number(first.pageRows[0]?.terminalWitnessCount)).toBe(2)
+      expect(first.pageRows[0]?.terminalWitnessEventId).toBe(`${baseWitnessId}:query-duplicate`)
+      expect(first.watermark?.pageRawRowCount).toBe(1)
+      expect(first.watermark?.pageCursorXid8).toBe(first.pageRows[0]?.terminalWitnessXid8)
+      expect(first.watermark?.pageCursorTurnId).toBe(first.pageRows[0]?.turnId)
+      expect(first.watermark?.pageCursorTerminalEventId).toBe(first.pageRows[0]?.terminalEventId)
+      expect(first.watermark?.pageCursorWitnessEventId).toBe(first.pageRows[0]?.terminalWitnessEventId)
+      const cursor = {
+        xid8: String(first.watermark?.pageCursorXid8), turnId: String(first.watermark?.pageCursorTurnId),
+        terminalEventId: String(first.watermark?.pageCursorTerminalEventId),
+        witnessEventId: String(first.watermark?.pageCursorWitnessEventId),
+      }
+      const second = await readPage(cursor)
+      expect(second.pageRows).toHaveLength(1)
+      expect(second.pageRows[0]?.terminalEventId).toBe(terminalEventKey(equalCutoff))
+      expect(second.pageRows[0]?.terminalWitnessEventId).toBe(baseWitnessId)
+      expect(Number(second.pageRows[0]?.terminalWitnessCount)).toBe(2)
+      expect(second.watermark?.pageRawRowCount).toBe(1)
+
+      const empty = await readPage({ xid8: "1", turnId: "", terminalEventId: "", witnessEventId: "" })
+      expect(empty.pageRows).toHaveLength(0)
+      expect(empty.watermark?.pageRawRowCount).toBe(0)
+      expect(empty.watermark?.pageCursorXid8).toBeNull()
+      expect(empty.watermark?.pageCursorTurnId).toBeNull()
+      expect(empty.watermark?.pageCursorTerminalEventId).toBeNull()
+      expect(empty.watermark?.pageCursorWitnessEventId).toBeNull()
+      const persistedWitnesses = await client.query<{ count: string }>(`SELECT COUNT(*)::text AS "count" FROM "agent_events"
+        WHERE "sessionId" = $1 AND "turnId" = $2 AND "causationId" = $3
+          AND "type" = 'agent.plan.root_task_history_chronology_witness'`,
+      [otherSessionId, equalCutoff.turnId, terminalEventKey(equalCutoff)])
+      expect(persistedWitnesses.rows[0]?.count).toBe("1")
+    } finally {
+      await client.query("ROLLBACK").catch(() => undefined)
+      client.release()
+    }
+
+    const historyWithShadowWitness = await createPgDirectRootTaskHistoryStore(
+      queryLevelDuplicateWitnessPool(pool!, baseWitnessId!)).load(input)
+    expect(historyWithShadowWitness.some(item => item.sourceTurnId === equalCutoff.turnId)).toBe(false)
+    expect(historyWithShadowWitness.map(item => item.sourceTurnId)).toContain(otherSession.turnId)
+  }, 60_000)
+
   it("reloads owner-scoped history and merges only witnessed terminal-before-start outcomes by xid8", async () => {
     const input: DirectRootTaskHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
       rootAttemptCount: 2, stepId: currentStepId, now: new Date(), crossSessionRootTaskHistoryEnabled: true }
@@ -730,7 +1053,7 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
       expect(indexed.map(item => item.sourceTurnId)).toEqual([exactRecent.turnId, exactOld.turnId])
 
       const fallback = await createPgDirectRootTaskHistoryStore(pool!).load({ ...input, objectiveHistoryIndexEnabled: false })
-      expect(fallback.map(item => item.sourceTurnId)).toEqual([exactRecent.turnId])
+      expect(fallback.map(item => item.sourceTurnId)).toEqual([exactRecent.turnId, exactOld.turnId])
       expect(fallback.some(item => changed.some(source => source.turnId === item.sourceTurnId))).toBe(false)
     } finally {
       try { await updateCurrentTurn("user", originalInput) }

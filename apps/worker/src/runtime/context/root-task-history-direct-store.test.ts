@@ -86,6 +86,10 @@ function currentStart(sequence = "1000"): Row {
   }
 }
 
+function descendingUtf8(left: unknown, right: unknown): number {
+  return Buffer.compare(Buffer.from(String(right), "utf8"), Buffer.from(String(left), "utf8"))
+}
+
 function fixture(options: Options = {}) {
   const queries: Array<{ sql: string; values?: readonly unknown[] }> = []
   let connects = 0
@@ -118,11 +122,47 @@ function fixture(options: Options = {}) {
       }] }
       if (sql.includes("WITH terminal_window AS MATERIALIZED")) {
         if (options.candidateError) throw options.candidateError
-        const limit = Number(values?.[values.length - 1] ?? 0)
-        const rows = [...sourceRows].sort((left, right) => sql.includes('ORDER BY (roots."terminalWitnessXid8")::numeric DESC')
-          ? Number(BigInt(String(right.terminalWitnessXid8)) - BigInt(String(left.terminalWitnessXid8))) || String(right.turnId).localeCompare(String(left.turnId))
-          : Number(BigInt(String(right.terminalSequence)) - BigInt(String(left.terminalSequence))))
-        return { rows: rows.slice(0, limit) }
+        const limitSlot = Number(/LIMIT \$(\d+)/.exec(sql)?.[1] ?? 0)
+        if (!limitSlot) throw new Error("history page query is missing its parameterized limit")
+        const limit = Math.min(64, Number(values?.[limitSlot - 1] ?? 0))
+        const crossSession = sql.includes('event."sessionId" <> $1')
+        const indexed = !crossSession && sql.includes('turn."terminalEventSequence" AS "sequence"')
+        const cursorValues = values?.slice(limitSlot) ?? []
+        const cursor = cursorValues.length === 0 ? undefined : crossSession ? {
+          terminalWitnessXid8: cursorValues[0], turnId: cursorValues[1], terminalEventId: cursorValues[2],
+          terminalWitnessEventId: cursorValues[3],
+        } : indexed ? { terminalSequence: cursorValues[0], turnId: cursorValues[1] } : {
+          terminalSequence: cursorValues[0], turnId: cursorValues[1], terminalEventId: cursorValues[2],
+        }
+        const compareRows = (left: Row, right: Row) => {
+          if (crossSession) {
+            const leftXid = BigInt(String(left.terminalWitnessXid8)), rightXid = BigInt(String(right.terminalWitnessXid8))
+            if (leftXid !== rightXid) return leftXid > rightXid ? -1 : 1
+            return descendingUtf8(left.turnId, right.turnId) || descendingUtf8(left.terminalEventId, right.terminalEventId)
+              || descendingUtf8(left.terminalWitnessEventId, right.terminalWitnessEventId)
+          }
+          const leftSequence = BigInt(String(left.terminalSequence)), rightSequence = BigInt(String(right.terminalSequence))
+          if (leftSequence !== rightSequence) return leftSequence > rightSequence ? -1 : 1
+          return descendingUtf8(left.turnId, right.turnId)
+            || (indexed ? 0 : descendingUtf8(left.terminalEventId, right.terminalEventId))
+        }
+        const currentSessionId = String(values?.[0])
+        const laneRows = sourceRows.filter(row => crossSession
+          ? String(row.sessionId) !== currentSessionId : String(row.sessionId) === currentSessionId)
+        const rows = laneRows.sort(compareRows).filter(row => !cursor || compareRows(row, cursor) > 0).slice(0, limit)
+        const last = rows.at(-1)
+        const metadata = {
+          pageCursorSequence: !last || crossSession ? null : String(last.terminalSequence),
+          pageCursorXid8: !last || !crossSession ? null : String(last.terminalWitnessXid8),
+          pageCursorTurnId: last ? String(last.turnId) : null,
+          pageCursorTerminalEventId: !last ? null : crossSession || !indexed
+            ? String(last.terminalEventId) : String(last.turnId),
+          pageCursorWitnessEventId: !last || !crossSession ? null : String(last.terminalWitnessEventId),
+          pageRawRowCount: rows.length, pageSentinelCount: 1, pageServerEncoding: "UTF8",
+        }
+        return { rows: last ? rows.map(row => ({ ...row, isPageWatermark: false, ...metadata })) : [{
+          turnId: null, isPageWatermark: true, ...metadata,
+        }] }
       }
       if (sql.includes("WITH expected AS MATERIALIZED")) {
         if (options.omitSameSessionTerminalTime) return { rows: [] }
@@ -359,7 +399,7 @@ describe("direct Root-task history PostgreSQL store", () => {
     const rootsJoin = scan?.sql.indexOf("), roots AS (") ?? -1
     expect(scan?.values?.[8]).toBe(64)
     expect(scan?.sql).toContain("(witness.payload->>'xid8')::numeric < $4::numeric")
-    expect(scan?.sql).toContain('ORDER BY (witness.payload->>\'xid8\')::numeric DESC, event."turnId" DESC')
+    expect(scan?.sql.replace(/\s+/g, " ")).toContain('ORDER BY (candidate."terminalWitnessXid8")::numeric DESC, candidate."turnId" COLLATE "C" DESC, candidate."terminalEventId" COLLATE "C" DESC, candidate."terminalWitnessEventId" COLLATE "C" DESC')
     expect(windowLimit).toBeGreaterThanOrEqual(0)
     expect(windowLimit).toBeLessThan(rootsJoin)
     expect(scan?.sql.slice(rootsJoin)).not.toContain("LIMIT $5")
@@ -381,7 +421,7 @@ describe("direct Root-task history PostgreSQL store", () => {
     const scan = test.queries.find(query => query.sql.includes("(witness.payload->>'xid8')::numeric < $4::numeric"))
     expect(scan?.sql).toContain('source_session."status" NOT IN (\'aborted\', \'archived\')')
     expect(scan?.sql).toContain("(witness.payload->>'xid8')::numeric < $4::numeric")
-    expect(scan?.sql).toContain('ORDER BY (witness.payload->>\'xid8\')::numeric DESC, event."turnId" DESC')
+    expect(scan?.sql.replace(/\s+/g, " ")).toContain('ORDER BY (candidate."terminalWitnessXid8")::numeric DESC, candidate."turnId" COLLATE "C" DESC, candidate."terminalEventId" COLLATE "C" DESC, candidate."terminalWitnessEventId" COLLATE "C" DESC')
     const graphReads = test.queries.filter(query => query.sql.includes('FROM "agent_items" AS item'))
     expect(graphReads.map(query => query.values?.[1])).toEqual(["session-third", "session-other"])
     expect(test.queries.filter(query => query.sql.includes("FOR SHARE SKIP LOCKED")).map(query => query.values))

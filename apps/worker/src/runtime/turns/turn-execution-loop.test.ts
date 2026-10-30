@@ -113,7 +113,7 @@ function identity(kind: TurnExecutionIdentity["kind"], taskId: string, attemptCo
   return { ...common, kind, attemptCount }
 }
 
-type Fixture = { options: TurnExecutionOptions; events: Array<{ id: string; type: string; itemId: string | null; taskId: string; payload?: unknown; idempotencyKey?: string }>; notifications: string[]; items: TurnEngineItem[]; finalResponses: string[]; stepTasks: string[]; stepAttempts: number[]; stepStatuses: string[]; stepInputs: Array<{ inputThroughSequence: bigint; consumedInputIds: string[] }>; requests: HarnessModelRequest[] }
+type Fixture = { options: TurnExecutionOptions; events: Array<{ id: string; type: string; itemId: string | null; taskId: string; payload?: unknown; idempotencyKey?: string }>; notifications: string[]; items: TurnEngineItem[]; finalResponses: string[]; stepTasks: string[]; stepAttempts: number[]; stepStatuses: string[]; stepUpdates: Array<{ status: string; finishReason: string | null; inputTokens: number; outputTokens: number; estimatedCostUsd: number }>; stepInputs: Array<{ inputThroughSequence: bigint; consumedInputIds: string[] }>; requests: HarnessModelRequest[] }
 
 function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult, initialToolObservations: Array<{ id: string; content: unknown }> = [], completionGate?: NonNullable<TurnExecutionOptions["completionGate"]>): Fixture {
   const events: Fixture["events"] = []
@@ -123,11 +123,12 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
   const stepTasks: string[] = []
   const stepAttempts: number[] = []
   const stepStatuses: string[] = []
+  const stepUpdates: Fixture["stepUpdates"] = []
   const stepInputs: Fixture["stepInputs"] = []
   const requests: HarnessModelRequest[] = []
   const store: TurnExecutionStore = {
     startStep: async ({ identity, stepId, attempt, ordinal, inputThroughSequence, consumedInputIds }) => { stepTasks.push(identity.taskId); stepAttempts.push(attempt); stepInputs.push({ inputThroughSequence, consumedInputIds: [...consumedInputIds] }); return { id: stepId, ordinal } },
-    updateStep: async ({ status }) => { stepStatuses.push(status) },
+    updateStep: async ({ status, finishReason, inputTokens, outputTokens, estimatedCostUsd }) => { stepStatuses.push(status); stepUpdates.push({ status, finishReason, inputTokens, outputTokens, estimatedCostUsd }) },
     createItem: async ({ itemId }) => { const item = { id: itemId, revision: 0 }; items.push(item); return item },
     updateItem: async ({ itemId, expectedRevision }) => ({ id: itemId, revision: expectedRevision + 1 }),
     appendEvent: async ({ identity, id, type, itemId, payload, idempotencyKey }) => { events.push({ id, type, itemId, taskId: identity.taskId, payload, idempotencyKey }); return { id } },
@@ -191,7 +192,7 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
     subscribe: event => { notifications.push(event.type); events.push({ id: event.id, type: event.type, itemId: event.itemId, taskId: owner.taskId }) },
     ...(completionGate ? { completionGate } : {}),
   }
-  return { options, events, notifications, items, finalResponses, stepTasks, stepAttempts, stepStatuses, stepInputs, requests }
+  return { options, events, notifications, items, finalResponses, stepTasks, stepAttempts, stepStatuses, stepUpdates, stepInputs, requests }
 }
 
 function scheduledCandidateReadFixture(input: Readonly<{
@@ -587,6 +588,90 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.requests).toHaveLength(0)
     const failure = root.events.find(event => event.type === "turn.failed")
     expect(failure?.payload).toMatchObject({ final: { completed: false, terminalReason: "budget_exhausted", usage: recoveredUsage } })
+    expect(root.events.some(event => event.type === "turn.completed")).toBe(false)
+  })
+
+  it("persists over-budget provider usage once before failing without executing returned tools", async () => {
+    const root = fixture(identity("turn", "root-1")), usage = { inputTokens: 2, outputTokens: 1, estimatedCostUsd: 0.02 }
+    const executeTool = vi.fn(root.options.executeTool)
+    root.options = {
+      ...root.options,
+      budget: { maxInputTokens: 1 },
+      executeTool,
+      model: { ...root.options.model, async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+        root.requests.push(request)
+        yield { type: "tool_call_completed", callId: "over-budget-call", name: "jobs.search", arguments: { location: "Dublin" } }
+        yield { type: "usage", ...usage }
+        yield { type: "completed", finishReason: "tool_calls" }
+      } },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "failed", errorCode: "budget_exhausted", stepCount: 1 })
+    expect(root.requests).toHaveLength(1)
+    expect(executeTool).not.toHaveBeenCalled()
+    expect(root.stepUpdates).toEqual([{ status: "failed", finishReason: "tool_calls", ...usage }])
+    expect(root.events.filter(event => event.type === "model.usage" && event.payload !== undefined)).toHaveLength(1)
+    expect(root.events.find(event => event.type === "model.usage" && event.payload !== undefined)?.payload).toMatchObject({ usage })
+    expect(root.events.filter(event => event.type === "model.completed" && event.payload !== undefined)).toHaveLength(1)
+    expect(root.events.find(event => event.type === "turn.failed" && event.payload !== undefined)?.payload).toMatchObject({
+      errorCode: "budget_exhausted", final: { terminalReason: "budget_exhausted", usage },
+    })
+  })
+
+  it("does not invent or persist malformed provider usage", async () => {
+    const root = fixture(identity("turn", "root-1")), executeTool = vi.fn(root.options.executeTool)
+    root.options = {
+      ...root.options,
+      budget: { maxInputTokens: 1 },
+      executeTool,
+      model: { ...root.options.model, async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+        root.requests.push(request)
+        yield { type: "usage", inputTokens: -1, outputTokens: 0, estimatedCostUsd: 0 }
+        yield { type: "completed", finishReason: "stop" }
+      } },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "failed", errorCode: "turn_execution_failed", stepCount: 1 })
+    expect(root.requests).toHaveLength(1)
+    expect(executeTool).not.toHaveBeenCalled()
+    expect(root.stepUpdates).toEqual([{ status: "failed", finishReason: null, inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }])
+    expect(root.events.some(event => event.type === "model.usage" && event.payload !== undefined)).toBe(false)
+    expect(root.events.find(event => event.type === "turn.failed" && event.payload !== undefined)?.payload).toMatchObject({
+      errorCode: "turn_execution_failed", final: { usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
+    })
+  })
+
+  it("fails closed when an over-budget usage receipt cannot be persisted", async () => {
+    const root = fixture(identity("turn", "root-1")), usage = { inputTokens: 2, outputTokens: 1, estimatedCostUsd: 0.02 }
+    const executeTool = vi.fn(root.options.executeTool), persistError = new Error("usage_receipt_write_failed")
+    const store = root.options.store, appendEvent = store.appendEvent
+    root.options = {
+      ...root.options,
+      budget: { maxInputTokens: 1 },
+      executeTool,
+      store: { ...store, appendEvent: async input => {
+        if (input.type === "model.usage") throw persistError
+        return appendEvent(input)
+      } },
+      model: { ...root.options.model, async *stream(request: HarnessModelRequest): AsyncGenerator<ModelStreamEvent> {
+        root.requests.push(request)
+        yield { type: "tool_call_completed", callId: "over-budget-call", name: "jobs.search", arguments: { location: "Dublin" } }
+        yield { type: "usage", ...usage }
+        yield { type: "completed", finishReason: "tool_calls" }
+      } },
+    }
+
+    const result = await runTurnExecutionLoop(root.options)
+
+    expect(result).toMatchObject({ status: "failed", errorCode: "turn_execution_failed", stepCount: 1 })
+    expect(root.requests).toHaveLength(1)
+    expect(executeTool).not.toHaveBeenCalled()
+    expect(root.stepUpdates).toEqual([{ status: "failed", finishReason: "tool_calls", ...usage }])
+    expect(root.events.some(event => event.type === "model.usage" && event.payload !== undefined)).toBe(false)
     expect(root.events.some(event => event.type === "turn.completed")).toBe(false)
   })
 
@@ -1149,6 +1234,27 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.requests).toHaveLength(0)
     const saved = JSON.parse(root.finalResponses[0]!.slice("root-1:".length)) as { usage: unknown }
     expect(saved.usage).toEqual(resume.usage)
+  })
+
+  it("closes a recovered candidate with its finish reason when later completion work pauses", async () => {
+    const root = fixture(identity("turn", "root-1"), undefined, [{ id: "resume-observation", content: { toolCallId: "resume-evidence", status: "completed" } }])
+    const pause = new SessionPauseRequestedError(), resume = {
+      nextOrdinal: 1, stepCount: 1, toolCallCount: 0, inputThroughSequence: 0n, consumedInputIds: [],
+      usage: { inputTokens: 17, outputTokens: 9, estimatedCostUsd: 0.23 },
+    }
+    const completionGate = vi.fn(async () => { throw pause })
+    root.options = { ...root.options, resume, budget: { maxSteps: 2 }, expectedEvidence: ["resume-evidence"],
+      recoveredFinalCandidate: "done:root-1", completionGate }
+
+    await expect(runTurnExecutionLoop(root.options)).rejects.toBe(pause)
+
+    expect(root.requests).toHaveLength(0)
+    expect(completionGate).toHaveBeenCalledTimes(1)
+    expect(root.stepUpdates).toEqual([{ status: "interrupted", finishReason: "stop", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }])
+    expect(root.events.find(event => event.type === "step.completed" && event.payload !== undefined)?.payload).toMatchObject({
+      status: "interrupted", errorCode: "session_pause_requested",
+    })
+    expect(root.events.some(event => event.type === "turn.failed" && event.payload !== undefined)).toBe(false)
   })
 
   it("removes citation markers from a generic recovered candidate without a durable receipt", async () => {
