@@ -499,7 +499,7 @@ async function pdfText(bytes: Buffer): Promise<string> {
   const webRequire = createRequire(path.resolve(__dirname, '../apps/web/package.json'))
   const parser = webRequire.resolve('pdf-parse')
   return new Promise((resolve, reject) => {
-    const script = `const parse=require(process.argv[1]);const chunks=[];process.stdin.on('data',b=>chunks.push(b));process.stdin.on('end',()=>parse(Buffer.concat(chunks)).then(result=>process.stdout.write(result.text)).catch(error=>{console.error(error);process.exitCode=1}))`
+    const script = `const parse=require(process.argv[1]);const chunks=[];process.stdin.on('data',b=>chunks.push(b));process.stdin.on('end',()=>{const raw=Buffer.concat(chunks);const exact=Buffer.alloc(raw.length);raw.copy(exact);parse(exact).then(result=>process.stdout.write(result.text)).catch(error=>{console.error(error);process.exitCode=1})})`
     const child = spawn(process.execPath, ['-e', script, parser], { stdio: ['pipe', 'pipe', 'pipe'] })
     let output = '', errorOutput = ''
     child.stdout.on('data', chunk => { output += chunk.toString() })

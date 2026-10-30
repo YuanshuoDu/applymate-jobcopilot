@@ -13,6 +13,14 @@ import { assertApplicationPdfTextSupported, isApplicationPdfCharacterSupported, 
 import { isApplicationPdfUnsupportedCharactersError } from './application-pdf-errors'
 import type { Resume } from './types'
 
+// PDF.js in pdf-parse can misread pooled Buffers with nonzero byte offsets.
+async function pdfText(doc: React.ReactElement): Promise<string> {
+  const bytes = await renderToBuffer(doc as never)
+  const exact = Buffer.alloc(bytes.length)
+  bytes.copy(exact)
+  return (await pdfParse(exact, { version: 'v2.0.550' })).text
+}
+
 const multilingual = '测试姓名 多语言经历 — Résumé Łódź Česko Ελληνικά Україна'
 const resume = {
   name: 'Fixture', templateId: 'clean', templateOptions: { fontFamily: 'serif' },
@@ -58,8 +66,8 @@ describe('offline multilingual PDF fonts', () => {
   it('renders resume and cover-letter PDF text in multiple scripts', async () => {
     const docs = [await renderResumeDoc(resume), await renderCoverLetterDoc(multilingual, 'clean', {}, { name: multilingual }, { company: 'Łódź', role: '工程师' })]
     for (const doc of docs) {
-      const data = await pdfParse(await renderToBuffer(doc as never), { version: 'v2.0.550' })
-      for (const word of ['测试姓名', '多语言经历', 'Résumé', 'Łódź', 'Česko', 'Ελληνικά', 'Україна']) expect(data.text).toContain(word)
+      const text = await pdfText(doc)
+      for (const word of ['测试姓名', '多语言经历', 'Résumé', 'Łódź', 'Česko', 'Ελληνικά', 'Україна']) expect(text).toContain(word)
     }
   }, 30000)
 
@@ -67,18 +75,18 @@ describe('offline multilingual PDF fonts', () => {
     const input = 'Cafe\u0301\r\nfirst\tsecond\u00a0third\rfourth'
     const docs = [await renderResumeDoc({ ...resume, content: { ...resume.content, summary: input } }), await renderCoverLetterDoc(input, 'clean', {}, { name: 'Jane 测试' })]
     for (const doc of docs) {
-      const data = await pdfParse(await renderToBuffer(doc as never), { version: 'v2.0.550' })
-      expect(data.text).toContain('Café')
-      for (const word of ['first', 'second', 'third', 'fourth']) expect(data.text).toContain(word)
-      expect(data.text).not.toMatch(/[\r\t\u00a0\u0301]/u)
+      const text = await pdfText(doc)
+      expect(text).toContain('Café')
+      for (const word of ['first', 'second', 'third', 'fourth']) expect(text).toContain(word)
+      expect(text).not.toMatch(/[\r\t\u00a0\u0301]/u)
     }
   }, 30000)
 
   it('preserves the saved cover-letter closing without adding a second one', async () => {
     const doc = await renderCoverLetterDoc('Dear hiring team,\nThank you.\nSincerely,\nJane Doe', 'clean', {}, { name: 'Jane Doe' })
-    const data = await pdfParse(await renderToBuffer(doc as never), { version: 'v2.0.550' })
-    expect(data.text.match(/Sincerely,/g)).toHaveLength(1)
-    expect(data.text.match(/Jane Doe/g)).toHaveLength(2) // header plus saved body
+    const text = await pdfText(doc)
+    expect(text.match(/Sincerely,/g)).toHaveLength(1)
+    expect(text.match(/Jane Doe/g)).toHaveLength(2) // header plus saved body
   }, 30000)
 
   it('rejects unsupported text before either document renders, including hidden resume sections only when visible', async () => {
