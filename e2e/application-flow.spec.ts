@@ -124,7 +124,7 @@ function audit(resumeUpdatedAt = time) {
     audit: { verdict: 'pass', summary: 'Fixture materials checked.', findings: [], matchScore: 82, source: 'independent', auditedAt: time } }
 }
 
-async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unknown' | 'waiting_for_user' | 'waiting_for_authorization' | 'cancelled' | 'failed' | 'filling'; recordedInitially?: boolean; evidenceCase?: 'bound' | 'unbound' | 'unavailable'; previewMismatch?: 'owner' | 'id' | 'job'; malformedPreview?: 'content' | 'contact'; letterRaceProbe?: boolean; letterInvalid?: 'null' | 'owner' | 'job' | 'duplicate' | 'content'; letterAfterInitial?: 'changed' | 'failure' | 'hold' | 'manual-change' | 'audit-same' | 'audit-failure' | 'audit-hold'; auditVersion?: 'same' | 'resume-changed' | 'letter-changed' | 'resume-missing' | 'letter-missing'; holdAudit?: boolean; holdAssign?: boolean; selectLetterOnNotes?: boolean; failTailoredRead?: boolean; taskFailure?: boolean; missing?: boolean; holdSelectedLetter?: boolean; selectedLetter?: boolean; firstPreparation?: boolean; failFirstAudit?: boolean; flowSave?: boolean; manualOutcome?: 'get-fails' | 'unknown'; search?: boolean; saveMode?: 'fail' | 'hold-success' | 'hold-fail'; twoResumes?: boolean; holdResumeContent?: boolean; snapshotResumeContent?: boolean; resumeRevalidationFails?: boolean; versionedScore?: boolean; holdOldAnalysis?: boolean; holdFirstAnalysisOnly?: boolean; auditCorrection?: boolean; holdAuditCorrection?: boolean; versions?: boolean; holdVersionRestore?: boolean; versionRestoreFails?: boolean; realAgent?: boolean; expiredApproval?: boolean; twoJobQuestions?: boolean; holdFirstTaskRead?: boolean; holdReturnOwnerA?: boolean; taskPerUser?: boolean; dashboardFourTasks?: boolean; agentJourney?: boolean } = {}) {
+async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unknown' | 'waiting_for_user' | 'waiting_for_authorization' | 'cancelled' | 'failed' | 'filling'; recordedInitially?: boolean; evidenceCase?: 'bound' | 'unbound' | 'unavailable'; previewMismatch?: 'owner' | 'id' | 'job'; malformedPreview?: 'content' | 'contact'; letterRaceProbe?: boolean; letterInvalid?: 'null' | 'owner' | 'job' | 'duplicate' | 'content'; letterAfterInitial?: 'changed' | 'failure' | 'hold' | 'manual-change' | 'audit-same' | 'audit-failure' | 'audit-hold'; auditVersion?: 'same' | 'resume-changed' | 'letter-changed' | 'resume-missing' | 'letter-missing'; holdAudit?: boolean; holdAssign?: boolean; selectLetterOnNotes?: boolean; failTailoredRead?: boolean; taskFailure?: boolean; missing?: boolean; holdSelectedLetter?: boolean; selectedLetter?: boolean; firstPreparation?: boolean; holdBaseSave?: boolean; failBaseSave?: boolean; baseList?: 'empty' | 'fail-once' | 'fail-once-hold' | 'hold-empty' | 'multiple' | 'single' | 'default'; failFirstAudit?: boolean; flowSave?: boolean; manualOutcome?: 'get-fails' | 'unknown'; search?: boolean; saveMode?: 'fail' | 'hold-success' | 'hold-fail'; twoResumes?: boolean; holdResumeContent?: boolean; snapshotResumeContent?: boolean; resumeRevalidationFails?: boolean; versionedScore?: boolean; holdOldAnalysis?: boolean; holdFirstAnalysisOnly?: boolean; auditCorrection?: boolean; holdAuditCorrection?: boolean; versions?: boolean; holdVersionRestore?: boolean; versionRestoreFails?: boolean; realAgent?: boolean; expiredApproval?: boolean; twoJobQuestions?: boolean; holdFirstTaskRead?: boolean; holdReturnOwnerA?: boolean; taskPerUser?: boolean; dashboardFourTasks?: boolean; agentJourney?: boolean } = {}) {
   let releaseReturnOwnerA = () => {}
   const returnOwnerAGate = new Promise<void>(resolve => { releaseReturnOwnerA = resolve })
   let releaseStaleJob = () => {}
@@ -155,11 +155,15 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
   let releaseProbeLetter = () => {}
   const probeLetterGate = new Promise<void>(resolve => { releaseProbeLetter = resolve })
   if (options.letterRaceProbe || options.letterAfterInitial === 'hold' || options.letterAfterInitial === 'audit-hold') await page.addInitScript(() => { const original = window.fetch.bind(window); window.fetch = (input, init) => typeof input === 'string' && input.endsWith('/cover-letters') ? original(input, { ...init, signal: undefined }) : original(input, init) })
+  let releaseBaseSave = () => {}
+  const baseSaveGate = new Promise<void>(resolve => { releaseBaseSave = resolve })
+  let releaseBaseList = () => {}
+  const baseListGate = new Promise<void>(resolve => { releaseBaseList = resolve })
   let releaseLetters = () => {}
   const lettersGate = new Promise<void>(resolve => { releaseLetters = resolve })
   const state = { job: { ...job(), finalCoverLetterId: options.holdSelectedLetter || options.selectedLetter ? 'selected-letter' : null, finalResumeId: options.firstPreparation ? null : 'resume-1' }, resume: resume(), audit: options.auditCorrection ? { ...audit(), audit: { ...audit().audit, verdict: 'revise', findings: [{ area: 'resume', target: 'summary', severity: 'warning', title: 'Fix summary', evidence: 'Outdated wording', action: 'Apply correction', proposedValue: 'Audited v2 summary' }] } } : audit(options.stale ? '2026-10-29T10:00:00.000Z' : time),
     secondResume: { ...resume(), id: 'resume-2', name: 'Second fixture resume', targetJobId: null as string | null, content: { ...resume().content, summary: 'Second resume content.' } },
-    answeredJobA: false, saveResponses: 0, armReturnOwnerA: false, returnOwnerAEntered: false, releaseReturnOwnerA, manualPosted: false, manualReadAvailable: false, hideResumeOnExport: false, malformedPreview: options.malformedPreview ?? null, selectedLetterAvailable: false, invalidLetter: options.letterInvalid ?? null, probeLetterReads: 0, selectedLetterReads: 0, changeLetterOnRead: false, auditStarted: false, assignStarted: false, releaseAudit, releaseAssign, releaseProbeLetter, fontRequests: [] as string[], activeUserId: 'fixture-user', agentStage: 'question' as 'question' | 'approval' | 'running' | 'unknown', requestOwners: [] as Array<{ path: string; method: string; userId: string }>, agentRequests: [] as Array<{ path: string; method: string; body?: unknown }>, writes: [] as Array<{ path: string; body: unknown }>, analysisRequests: [] as string[], analysisBodies: [] as unknown[], analysisCalls: [] as Array<{ path: string; body: unknown }>, unexpected: [] as string[], taskReads: 0, staleJobRequested: false, staleJobReturned: false, releaseStaleJob, taskStatusOverride: null as 'waiting_for_authorization' | null, firstTaskReadFinished: false, releaseFirstTaskRead, letterRequested: false, resumeContentRequested: false, releaseLetters, releaseSave, releaseResumeContent, releaseOldAnalysis, releaseAuditCorrection, releaseVersionRestore }
+    answeredJobA: false, saveResponses: 0, armReturnOwnerA: false, returnOwnerAEntered: false, releaseReturnOwnerA, manualPosted: false, manualReadAvailable: false, hideResumeOnExport: false, malformedPreview: options.malformedPreview ?? null, selectedLetterAvailable: false, savedBase: null as (Omit<ReturnType<typeof resume>, 'targetJobId'> & { targetJobId: string | null }) | null, baseSaveStarted: false, releaseBaseSave, baseListReads: 0, releaseBaseList, invalidLetter: options.letterInvalid ?? null, probeLetterReads: 0, selectedLetterReads: 0, changeLetterOnRead: false, auditStarted: false, assignStarted: false, releaseAudit, releaseAssign, releaseProbeLetter, fontRequests: [] as string[], activeUserId: 'fixture-user', agentStage: 'question' as 'question' | 'approval' | 'running' | 'unknown', requestOwners: [] as Array<{ path: string; method: string; userId: string }>, agentRequests: [] as Array<{ path: string; method: string; body?: unknown }>, writes: [] as Array<{ path: string; body: unknown }>, analysisRequests: [] as string[], analysisBodies: [] as unknown[], analysisCalls: [] as Array<{ path: string; body: unknown }>, unexpected: [] as string[], taskReads: 0, staleJobRequested: false, staleJobReturned: false, releaseStaleJob, taskStatusOverride: null as 'waiting_for_authorization' | null, firstTaskReadFinished: false, releaseFirstTaskRead, letterRequested: false, resumeContentRequested: false, releaseLetters, releaseSave, releaseResumeContent, releaseOldAnalysis, releaseAuditCorrection, releaseVersionRestore }
   if (options.evidenceCase === 'unbound') state.job.finalResumeId = null
   if (options.previewMismatch === 'job') state.job.finalResumeId = null
   if (options.evidenceCase === 'unavailable') state.hideResumeOnExport = true
@@ -243,6 +247,7 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
     }
     if (options.realAgent && pathname === '/api/me/agent-task-history-memory' && request.method() === 'GET') return json(route, { enabled: false, version: 0 })
     if (options.realAgent && pathname === '/api/agent') return json(route, { autoApply: false, requireApproval: true, isRunning: false })
+    if (pathname === '/api/resume/intake' && request.method() === 'POST') return json(route, { parsed: resume().content })
     if (request.method() !== 'GET') {
       const body: unknown = request.postDataJSON()
       // Account for explicit analysis separately from application and submit writes.
@@ -277,6 +282,7 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
         return json(route, { audit: { ...state.audit.audit, findings: [] }, target: 'summary', appliedContent: 'Audited v2 summary', resume: { ...state.resume, updatedAt, content: { ...state.resume.content, summary: 'Audited v2 summary' } }, coverLetter: null, resumeUpdatedAt: updatedAt })
       }
       if (pathname.endsWith('/tailor-resume')) return json(route, { adaptedResumeId: 'resume-1' })
+      if (pathname === '/api/resume' && options.baseList === 'empty') { state.baseSaveStarted = true; if (options.holdBaseSave) await baseSaveGate; if (options.failBaseSave) return route.abort('failed'); const saved = body as { name: string; content: ReturnType<typeof resume>['content'] }; state.savedBase = { ...state.resume, id: 'base-created', kind: 'base', targetJobId: null, name: saved.name, content: saved.content }; return json(route, state.savedBase) }
       if (pathname === '/api/jobs/outside-page' && request.method() === 'PATCH' && options.selectLetterOnNotes) { Object.assign(state.job, body, { finalCoverLetterId: 'selected-letter' }); return json(route, state.job) }
       if (pathname.endsWith('/audit-application')) { state.auditStarted = true; if (options.holdAudit) await auditGate; if (options.failFirstAudit && state.writes.filter(write => write.path.endsWith('/audit-application')).length === 1) return json(route, { error: 'Fixture audit unavailable' }, 500); const letterId = (body as { coverLetterId: string | null }).coverLetterId; state.audit = { ...audit(state.resume.updatedAt), coverLetterId: letterId, ...(letterId ? { coverLetterUpdatedAt: time } : {}) }; return json(route, { ...state.audit.audit, ...(options.auditVersion === 'resume-missing' ? {} : { resumeUpdatedAt: options.auditVersion === 'resume-changed' ? '2026-10-30T11:00:00.000Z' : state.resume.updatedAt }), ...(letterId && options.auditVersion !== 'letter-missing' ? { coverLetterUpdatedAt: options.auditVersion === 'letter-changed' ? '2026-10-30T11:00:00.000Z' : time } : {}) }) }
       if (pathname.endsWith('/assign')) { state.assignStarted = true; if (options.holdAssign) await assignGate; Object.assign(state.job, body); return json(route, state.job) }
@@ -317,8 +323,18 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
     }
     if (pathname.endsWith('/audit-application') && options.evidenceCase) return json(route, { ...audit(), audit: { ...audit().audit, verdict: 'needs_review', findings: [{ area: 'resume', severity: 'warning', resolution: 'evidence_needed', target: 'summary', title: 'Fixture evidence', evidence: 'No independent support', action: 'Review the claim' }] } })
     if (pathname.endsWith('/audit-application')) return json(route, options.firstPreparation && !state.writes.some(write => write.path.endsWith('/audit-application')) ? null : state.audit)
+    if (pathname === '/api/resume' && options.baseList) {
+      const read = ++state.baseListReads
+      if (options.baseList === 'hold-empty' || options.baseList === 'fail-once-hold' && read > 1) await baseListGate
+      if ((options.baseList === 'fail-once' || options.baseList === 'fail-once-hold') && read === 1) return json(route, { error: 'Fixture list unavailable' }, 500)
+      if (options.baseList === 'empty' && state.savedBase) return json(route, [state.savedBase])
+      if (options.baseList === 'empty' || options.baseList === 'hold-empty' || options.baseList === 'fail-once' || options.baseList === 'fail-once-hold') return json(route, [])
+      const first = { ...state.resume, id: 'base-1', name: 'First base', kind: 'base', targetJobId: null, isDefault: options.baseList === 'default' }
+      return json(route, options.baseList === 'single' ? [first] : [first, { ...first, id: 'base-2', name: 'Second base', isDefault: false }])
+    }
     if (pathname === '/api/resume' && options.firstPreparation) return json(route, [{ ...state.resume, id: 'base-1', kind: 'base', targetJobId: null, isDefault: true }])
     if (pathname === '/api/resume') return json(route, state.activeUserId === 'fixture-b' ? [{ ...state.resume, id: 'resume-b', userId: 'fixture-b', name: 'Account B resume', targetJobId: null, content: { ...state.resume.content, summary: 'Account B only' } }] : options.twoResumes ? [state.resume, state.secondResume] : [state.resume])
+    if (pathname === '/api/resume/base-created' && state.savedBase) return json(route, state.savedBase)
     if (pathname === '/api/resume/resume-b') return json(route, { ...state.resume, id: 'resume-b', userId: 'fixture-b', name: 'Account B resume', targetJobId: null, content: { ...state.resume.content, summary: 'Account B only' } })
     if (pathname === '/api/resume/resume-1' && state.activeUserId === 'fixture-b') return json(route, { error: 'Not found' }, 404)
     if (pathname === '/api/resume/resume-2') return json(route, state.secondResume)
@@ -745,6 +761,228 @@ for (const malformedPreview of ['content', 'contact'] as const) test(`resume pre
   expect(state.writes).toEqual([])
   expect(state.unexpected).toEqual([])
 })
+
+test('empty base resume list opens the resume library and returns to the same application', async ({ page }) => {
+  const state = await install(page, { firstPreparation: true, baseList: 'empty' })
+  await open(page, '&jobsSearch=fixture')
+  await expect(page.getByText(/Create or import a base resume|请先创建或导入基础简历/)).toBeVisible()
+  await expect(page.getByRole('button', { name: /Prepare application materials|准备申请材料/, exact: true })).toBeDisabled()
+  await page.evaluate(() => {
+    const remove = Storage.prototype.removeItem
+    Storage.prototype.removeItem = function (key: string) {
+      if (this === sessionStorage && key === 'applymate:resume-return') throw new Error('Storage unavailable')
+      return remove.call(this, key)
+    }
+  })
+  await page.getByRole('button', { name: /Open resume library|打开简历库/ }).click()
+  await expect(page.getByRole('button', { name: /Back to this application|返回此申请/ })).toBeVisible()
+  const url = new URL(page.url())
+  expect(url.searchParams.get('returnJobId')).toBe('outside-page')
+  expect(url.searchParams.get('jobsSearch')).toBe('fixture')
+  expect(url.searchParams.has('resumeId')).toBe(false)
+  await page.getByRole('button', { name: /New Resume|新建简历/, exact: true }).click()
+  await expect(page.getByPlaceholder(/Resume name|简历名称/)).toBeVisible()
+  await page.getByRole('button', { name: /Cancel|取消/, exact: true }).click()
+  await page.getByRole('button', { name: /Import & parse|导入并解析/ }).click()
+  const intakeTitle = page.getByText(/Add your resume|添加你的简历/, { exact: true })
+  await expect(intakeTitle).toBeVisible()
+  await intakeTitle.locator('..').getByRole('button').click()
+  await page.getByRole('button', { name: /Back to this application|返回此申请/ }).click()
+  await expect(page.getByRole('dialog')).toContainText('Application flow engineer')
+  expect(new URL(page.url()).searchParams.get('jobsSearch')).toBe('fixture')
+  expect(new URL(page.url()).searchParams.has('resumeStartEmpty')).toBe(false)
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+for (const method of ['create', 'import'] as const) {
+  test(`application resume ${method} saves before returning to the same application`, async ({ page }) => {
+    const state = await install(page, { firstPreparation: true, baseList: 'empty', holdBaseSave: true })
+    try {
+      await open(page, '&jobsSearch=fixture')
+      await page.getByRole('button', { name: /Open resume library|打开简历库/ }).click()
+      const back = page.getByRole('button', { name: /Back to this application|返回此申请/ })
+      if (method === 'create') {
+        await page.getByRole('button', { name: /New Resume|新建简历/, exact: true }).click()
+        await expect(page.getByPlaceholder(/Resume name|简历名称/)).toBeVisible()
+        expect(state.writes).toEqual([])
+        await page.getByRole('button', { name: /Create|创建/, exact: true }).evaluate(button => { (button as HTMLButtonElement).click(); (button as HTMLButtonElement).click() })
+      } else {
+        await page.getByRole('button', { name: /Import & parse|导入并解析/ }).click()
+        await page.getByRole('button', { name: /Paste text|粘贴文本/ }).click()
+        await page.getByPlaceholder(/Paste your resume text|在这里粘贴简历文本/).fill('Fixture candidate with extensive software engineering and TypeScript experience for this test.')
+        await page.getByRole('button', { name: /Parse resume|解析简历/ }).click()
+        await page.getByRole('button', { name: /Save resume|保存简历/, exact: true }).evaluate(button => { (button as HTMLButtonElement).click(); (button as HTMLButtonElement).click() })
+      }
+      await expect.poll(() => state.baseSaveStarted).toBe(true)
+      await expect(back).toBeDisabled()
+      await back.evaluate(button => (button as HTMLButtonElement).click())
+      expect(new URL(page.url()).searchParams.get('page')).toBe('resume')
+      expect(state.writes.filter(write => write.path === '/api/resume')).toHaveLength(1)
+      state.releaseBaseSave()
+      await expect(back).toBeEnabled()
+      expect(state.savedBase?.id).toBe('base-created')
+      expect(state.savedBase?.content.summary).toBe(method === 'import' ? 'Software engineer.' : '')
+      await back.click()
+      await expect(page.getByRole('dialog')).toContainText('Application flow engineer')
+      await expect(page.getByRole('button', { name: /Prepare application materials|准备申请材料/, exact: true })).toBeEnabled()
+      await expect(page.getByText(/Create or import a base resume|请先创建或导入基础简历/)).toHaveCount(0)
+      expect(new URL(page.url()).searchParams.get('jobsSearch')).toBe('fixture')
+      expect(state.writes.filter(write => write.path === '/api/resume')).toHaveLength(1)
+      expect(state.unexpected).toEqual([])
+    } finally { state.releaseBaseSave() }
+  })
+}
+
+test('an unconfirmed base resume save is not retried automatically', async ({ page }) => {
+  const state = await install(page, { firstPreparation: true, baseList: 'empty', failBaseSave: true })
+  await open(page)
+  await page.getByRole('button', { name: /Open resume library|打开简历库/ }).click()
+  await page.getByRole('button', { name: /New Resume|新建简历/, exact: true }).click()
+  await page.getByRole('button', { name: /Create|创建/, exact: true }).click()
+  await expect(page.getByText(/save result is unknown|保存结果未知/).first()).toBeVisible()
+  await expect(page.getByText(/Save result unconfirmed|保存结果待核实/)).toBeVisible()
+  await expect(page.getByText(/Save failed|保存失败/)).toHaveCount(0)
+  await expect(page.getByRole('button', { name: /New Resume|新建简历/, exact: true })).toBeDisabled()
+  await page.getByRole('button', { name: /Back to this application|返回此申请/ }).click()
+  await expect(page.getByRole('dialog')).toContainText('Application flow engineer')
+  expect(state.writes.filter(write => write.path === '/api/resume')).toHaveLength(1)
+})
+
+for (const method of ['create', 'import'] as const) {
+  test(`application resume ${method} deadline ignores a late save response`, async ({ page }) => {
+    await page.clock.install()
+    const state = await install(page, { firstPreparation: true, baseList: 'empty', holdBaseSave: true })
+    try {
+      await open(page)
+      await page.getByRole('button', { name: /Open resume library|打开简历库/ }).click()
+      if (method === 'create') {
+        await page.getByRole('button', { name: /New Resume|新建简历/, exact: true }).click()
+        await page.getByRole('button', { name: /Create|创建/, exact: true }).click()
+      } else {
+        await page.getByRole('button', { name: /Import & parse|导入并解析/ }).click()
+        await page.getByRole('button', { name: /Paste text|粘贴文本/ }).click()
+        await page.getByPlaceholder(/Paste your resume text|在这里粘贴简历文本/).fill('Fixture candidate with extensive software engineering and TypeScript experience for this test.')
+        await page.getByRole('button', { name: /Parse resume|解析简历/ }).click()
+        await page.getByRole('button', { name: /Save resume|保存简历/, exact: true }).click()
+      }
+      await expect.poll(() => state.baseSaveStarted).toBe(true)
+      await page.clock.fastForward(30_001)
+      await expect(page.getByText(/save result is unknown|保存结果未知/).first()).toBeVisible()
+      await expect(page.getByText(/Save result unconfirmed|保存结果待核实/)).toBeVisible()
+      await expect(page.getByText(/Save failed|保存失败/)).toHaveCount(0)
+      const back = page.getByRole('button', { name: /Back to this application|返回此申请/ })
+      await expect(back).toBeEnabled()
+      if (method === 'import') await expect(page.getByRole('button', { name: /Save resume|保存简历/, exact: true })).toBeDisabled()
+      else await expect(page.getByRole('button', { name: /New Resume|新建简历/, exact: true })).toBeDisabled()
+      // The mocked server intentionally ignores cancellation and returns the successful response late.
+      const lateResponse = page.waitForResponse(response => response.url().endsWith('/api/resume') && response.request().method() === 'POST' && response.status() === 200)
+      state.releaseBaseSave()
+      await (await lateResponse).finished()
+      await page.waitForTimeout(200)
+      await expect(page.getByText(/save result is unknown|保存结果未知/).first()).toBeVisible()
+      await expect(page.locator('[data-resume-editor]')).toHaveCount(0)
+      expect(state.savedBase?.id).toBe('base-created')
+      expect(state.writes.filter(write => write.path === '/api/resume')).toHaveLength(1)
+      if (method === 'import') await page.getByRole('button', { name: /Cancel|取消/, exact: true }).click()
+      await back.click()
+      await expect(page.getByRole('dialog')).toContainText('Application flow engineer')
+      expect(state.writes.filter(write => write.path === '/api/resume')).toHaveLength(1)
+    } finally { state.releaseBaseSave() }
+  })
+}
+
+test('the shell blocks browser back while a base resume creation is pending', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises the real desktop shell navigation guard')
+  const state = await install(page, { firstPreparation: true, baseList: 'empty', holdBaseSave: true })
+  try {
+    await page.goto(`${origin}/?shell=1&page=jobs&highlight=outside-page`)
+    await page.getByRole('button', { name: 'Open resume library' }).click()
+    await page.getByRole('button', { name: 'New Resume', exact: true }).click()
+    await page.getByRole('button', { name: 'Create', exact: true }).click()
+    await expect.poll(() => state.baseSaveStarted).toBe(true)
+    await page.getByRole('button', { name: 'Applications', exact: true }).click()
+    await expect(page).toHaveURL(/page=resume/)
+    await page.evaluate(() => history.back())
+    await page.waitForTimeout(300)
+    await expect(page.getByRole('button', { name: /Back to this application/ })).toBeDisabled()
+    await expect(page).toHaveURL(/page=resume/)
+    expect(state.writes.filter(write => write.path === '/api/resume')).toHaveLength(1)
+    state.releaseBaseSave()
+    await expect(page.getByRole('button', { name: /Back to this application/ })).toBeEnabled()
+    await page.getByRole('button', { name: /Back to this application/ }).click()
+    await expect(page.getByRole('dialog')).toContainText('Application flow engineer')
+  } finally { state.releaseBaseSave() }
+})
+
+test('direct resume entry retains its existing empty-library initialization', async ({ page }) => {
+  const state = await install(page, { baseList: 'empty' })
+  await page.goto(`${origin}/?page=resume`)
+  await expect.poll(() => state.writes.filter(write => write.path === '/api/resume')).toHaveLength(1)
+})
+
+test('base resume loading and failure never claim an empty list and retry only reads', async ({ page }) => {
+  const state = await install(page, { firstPreparation: true, baseList: 'hold-empty' })
+  try {
+    await open(page)
+    await expect(page.getByText(/Loading your resumes|正在加载你的简历/)).toBeVisible()
+    await expect(page.getByRole('button', { name: /Open resume library|打开简历库/ })).toHaveCount(0)
+    expect(state.writes).toEqual([])
+    state.releaseBaseList()
+    await expect(page.getByText(/Create or import a base resume|请先创建或导入基础简历/)).toBeVisible()
+  } finally { state.releaseBaseList() }
+})
+
+test('failed base resume list can be retried without a write', async ({ page }) => {
+  const state = await install(page, { firstPreparation: true, baseList: 'fail-once' })
+  await open(page)
+  const unavailable = page.getByRole('status').filter({ hasText: /Your resumes could not be loaded|无法加载简历，请刷新状态/ })
+  await expect(unavailable).toBeVisible()
+  await expect(page.getByRole('button', { name: /Open resume library|打开简历库/ })).toHaveCount(0)
+  await unavailable.getByRole('button', { name: /Refresh status|刷新状态/ }).click()
+  await expect(page.getByText(/Create or import a base resume|请先创建或导入基础简历/)).toBeVisible()
+  expect(state.baseListReads).toBe(2)
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+test('double retry of a failed base resume read shares one request', async ({ page }) => {
+  const state = await install(page, { firstPreparation: true, baseList: 'fail-once-hold' })
+  try {
+    await open(page)
+    const unavailable = page.getByRole('status').filter({ hasText: /Your resumes could not be loaded|无法加载简历，请刷新状态/ })
+    await expect(unavailable).toBeVisible()
+    await unavailable.getByRole('button', { name: /Refresh status|刷新状态/ }).evaluate(button => {
+      ;(button as HTMLButtonElement).click()
+      ;(button as HTMLButtonElement).click()
+    })
+    await expect.poll(() => state.baseListReads).toBe(2)
+    await page.waitForTimeout(200)
+    expect(state.baseListReads).toBe(2)
+    expect(state.writes).toEqual([])
+    state.releaseBaseList()
+    await expect(page.getByText(/Create or import a base resume|请先创建或导入基础简历/)).toBeVisible()
+    expect(state.unexpected).toEqual([])
+  } finally { state.releaseBaseList() }
+})
+
+for (const mode of ['multiple', 'single', 'default'] as const) {
+  test(`base resume ${mode} selection controls preparation`, async ({ page }) => {
+    const state = await install(page, { firstPreparation: true, baseList: mode })
+    await open(page)
+    const prepare = page.getByRole('button', { name: /Prepare application materials|准备申请材料/, exact: true })
+    if (mode === 'multiple') {
+      const select = page.getByLabel(/Base resume|基础简历/)
+      await expect(select).toHaveValue('')
+      await expect(prepare).toBeDisabled()
+      await select.selectOption('base-2')
+    } else if (mode === 'default') await expect(page.getByLabel(/Base resume|基础简历/)).toHaveValue('base-1')
+    await expect(prepare).toBeEnabled()
+    await prepare.click()
+    await expect.poll(() => state.writes.find(write => write.path.endsWith('/tailor-resume'))).toMatchObject({ body: { resumeId: mode === 'multiple' ? 'base-2' : 'base-1' } })
+    expect(state.unexpected).toEqual([])
+  })
+}
 
 test('first preparation stops after a generated resume cannot be read and reuses it after refresh', async ({ page }) => {
   const state = await install(page, { firstPreparation: true, failTailoredRead: true })

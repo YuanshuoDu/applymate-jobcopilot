@@ -522,7 +522,15 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   } | null>(null)
   const [loadingPrep, setLoadingPrep] = useState(false)
   const [descExpanded, setDescExpanded] = useState(false)
-  const { data: resumeList } = useApi<ResumeListItem[]>('/api/resume')
+  const { data: resumeList, loading: resumeListLoading, error: resumeListError, refetch: refetchResumeList } = useApi<ResumeListItem[]>('/api/resume', { cache: false })
+  const resumeListRefreshRef = useRef<Promise<void> | null>(null)
+  function refreshResumeList() {
+    if (resumeListRefreshRef.current) return resumeListRefreshRef.current
+    const pending = refetchResumeList()
+    resumeListRefreshRef.current = pending
+    void pending.finally(() => { if (resumeListRefreshRef.current === pending) resumeListRefreshRef.current = null })
+    return pending
+  }
   const [selectedResumeId, setSelectedResumeId] = useState('')
   const [downloadingPack, setDownloadingPack] = useState(false)
   const downloadingPackRef = useRef(false)
@@ -632,17 +640,18 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   // Sync local state when parent job changes
   useEffect(() => { setNotes(job.notes ?? '') }, [job.notes])
   useEffect(() => { setFollowUpAt(job.followUpAt ? job.followUpAt.slice(0, 10) : '') }, [job.followUpAt])
-  const baseResumes = useMemo(() => resumeList?.filter(r => r.kind === 'base') ?? [], [resumeList])
+  const resumeListReady = !resumeListLoading && !resumeListError && Array.isArray(resumeList)
+  const baseResumes = useMemo(() => Array.isArray(resumeList) ? resumeList.filter(r => r.kind === 'base') : [], [resumeList])
   const existingTailoredResume = useMemo(
-    () => resumeList?.find(r => r.kind === 'adapted' && r.targetJobId === job.id) ?? null,
+    () => Array.isArray(resumeList) ? resumeList.find(r => r.kind === 'adapted' && r.targetJobId === job.id) ?? null : null,
     [job.id, resumeList],
   )
 
   useEffect(() => {
-    if (!baseResumes.length) return
-    const preferred = baseResumes.find(r => r.isDefault) ?? baseResumes[0]
-    setSelectedResumeId(prev => prev && baseResumes.some(r => r.id === prev) ? prev : preferred.id)
-  }, [baseResumes, resumeList])
+    if (!resumeListReady) return
+    const preferred = baseResumes.find(r => r.isDefault) ?? (baseResumes.length === 1 ? baseResumes[0] : null)
+    setSelectedResumeId(prev => prev && baseResumes.some(r => r.id === prev) ? prev : preferred?.id ?? '')
+  }, [baseResumes, resumeListReady])
   useEffect(() => {
     setLatestAuditRecord(null)
     setOpenPackItem(null)
@@ -795,7 +804,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
       toast.info(t('application.selectedLetterLoading'))
       return
     }
-    if (!selectedResumeId && !existingTailoredResume && !createdTailoredResumeId && !job.finalResumeId) {
+    if ((!resumeListReady || !baseResumes.some(resume => resume.id === selectedResumeId)) && !existingTailoredResume && !createdTailoredResumeId && !job.finalResumeId) {
       toast.error('No base resume selected', 'Create or import a resume first.')
       return
     }
@@ -1055,7 +1064,8 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
 
   // Drawer uses a slightly more compact variant of the shared INPUT_STYLE
   const drawerInputSt: React.CSSProperties = { ...INPUT_STYLE, fontSize: 11, padding: '5px 8px', borderRadius: 5 }
-  const canTailorResume = Boolean(applicationPreflight.canPrepare && job.description && (baseResumes.length || existingTailoredResume || job.finalResumeId))
+  const canTailorResume = Boolean(applicationPreflight.canPrepare && job.description && (existingTailoredResume || createdTailoredResumeId || job.finalResumeId || (resumeListReady && baseResumes.some(resume => resume.id === selectedResumeId))))
+  const needsBaseResume = !previewResumeId
   const currentRecord = latestAuditRecord ?? storedAudit
   const currentPackAudited = !preparationReviewRequired && currentRecord?.audit.verdict === 'pass' && auditMatchesCurrentMaterials(
     currentRecord, job.finalResumeId, job.finalCoverLetterId,
@@ -1110,8 +1120,19 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
 
             {task && <ApplicationTaskCard task={task} onOpenSession={id => openApplicationSession(id, navigate)} />}
             {!manualWorkAllowed ? null : applicationRecorded ? <p>{t('application.recordedHint')}</p> : taskReadState !== 'ready' ? <div role="status"><p>{t(taskReadState === 'limited' ? 'application.taskCoverage' : 'application.taskReadUnavailable')}</p><Btn variant="ghost" onClick={onRefreshTasks}>{t('application.refreshStatus')}</Btn></div> : <>
-              {!currentPackAudited && !existingTailoredResume && baseResumes.length > 1 && <label style={{ fontSize: 12 }}>{t('application.baseResume')}
-                <select value={selectedResumeId} onChange={event => setSelectedResumeId(event.target.value)} style={{ ...drawerInputSt, width: '100%', margin: '6px 0 12px' }}>{baseResumes.map(resume => <option key={resume.id} value={resume.id}>{resume.isDefault ? `${t('jobs.defaultResume')} — ` : ''}{resume.name}</option>)}</select>
+              {needsBaseResume && !resumeListReady && <div role="status"><p>{t(resumeListLoading ? 'application.baseResumeLoading' : 'application.baseResumeUnavailable')}</p>{!resumeListLoading && <Btn variant="ghost" onClick={() => void refreshResumeList()}>{t('application.refreshStatus')}</Btn>}</div>}
+              {needsBaseResume && resumeListReady && baseResumes.length === 0 && <div role="status"><p>{t('application.baseResumeEmpty')}</p><Btn variant="ghost" onClick={() => {
+                try { sessionStorage.removeItem('applymate:resume-return') } catch { /* The resume page can open without stored context. */ }
+                const url = new URL(window.location.href)
+                url.searchParams.delete('resumeId')
+                url.searchParams.set('returnToJobs', '1')
+                url.searchParams.set('returnJobId', job.id)
+                url.searchParams.set('resumeStartEmpty', '1')
+                window.history.replaceState({}, '', url.toString())
+                navigate('resume')
+              }}>{t('application.openResumeLibrary')}</Btn></div>}
+              {needsBaseResume && resumeListReady && baseResumes.length > 1 && <label style={{ fontSize: 12 }}>{t('application.baseResume')}
+                <select value={selectedResumeId} onChange={event => setSelectedResumeId(event.target.value)} style={{ ...drawerInputSt, width: '100%', margin: '6px 0 12px' }}><option value="">{t('application.chooseBaseResume')}</option>{baseResumes.map(resume => <option key={resume.id} value={resume.id}>{resume.isDefault ? `${t('jobs.defaultResume')} — ` : ''}{resume.name}</option>)}</select>
               </label>}
               <Btn variant="primary" disabled={autoPreparing || (!canReviewExistingIssues && (Boolean(previewResumeId && !evidenceResumeId) || (!currentPackAudited && !canTailorResume)))} onClick={() => {
                 if (currentPackAudited) {
@@ -2041,6 +2062,7 @@ export function JobsPage() {
           onOpenTailoredResume={resumeId => {
             sessionStorage.setItem('applymate:resume-return', JSON.stringify({ resumeId, jobId: selectedJob.id }))
             const url = new URL(window.location.href)
+            url.searchParams.delete('resumeStartEmpty')
             url.searchParams.set('resumeId', resumeId)
             url.searchParams.set('returnToJobs', '1')
             url.searchParams.set('returnJobId', selectedJob.id)

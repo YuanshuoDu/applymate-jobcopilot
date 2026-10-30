@@ -594,6 +594,42 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   const [returnToJobs] = useState(() => new URLSearchParams(window.location.search).get('returnToJobs') === '1')
   const [returnJobId] = useState(() => new URLSearchParams(window.location.search).get('returnJobId'))
   const [returnResumeId] = useState(() => new URLSearchParams(window.location.search).get('resumeId'))
+  const [resumeStartEmpty] = useState(() => returnToJobs && !!returnJobId && !returnResumeId && new URLSearchParams(window.location.search).get('resumeStartEmpty') === '1')
+  const resumeEntryWriteRef = useRef(false)
+  const resumeEntryUncertainRef = useRef(false)
+  const [resumeEntryWritePending, setResumeEntryWritePending] = useState(false)
+  const [resumeEntryUncertain, setResumeEntryUncertain] = useState(false)
+  function beginResumeEntryWrite() {
+    if (!resumeStartEmpty) return true
+    if (resumeEntryWriteRef.current || resumeEntryUncertainRef.current) return false
+    resumeEntryWriteRef.current = true
+    setResumeEntryWritePending(true)
+    return true
+  }
+  function endResumeEntryWrite(succeeded: boolean) {
+    if (!resumeStartEmpty) return
+    if (!succeeded) { resumeEntryUncertainRef.current = true; setResumeEntryUncertain(true) }
+    resumeEntryWriteRef.current = false
+    setResumeEntryWritePending(false)
+  }
+  async function settleResumeEntryWrite<T>(operation: Promise<{ data: T | null; error: string | null }>) {
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await Promise.race([
+        operation,
+        new Promise<{ data: T | null; error: string | null }>(resolve => {
+          timeout = setTimeout(() => resolve({ data: null, error: 'Save result unknown' }), 30_000)
+        }),
+      ])
+    } finally { if (timeout) clearTimeout(timeout) }
+  }
+  useEffect(() => () => {
+    const url = new URL(window.location.href)
+    if (url.searchParams.get('page') !== 'resume' && url.searchParams.has('resumeStartEmpty')) {
+      url.searchParams.delete('resumeStartEmpty')
+      window.history.replaceState(window.history.state, '', url.toString())
+    }
+  }, [])
   // Capture only the original application's allowlisted list context. Never read it from a later account's URL.
   const [recoveryListContext] = useState(() => ({
     list: readApplicationListState(typeof window === 'undefined' ? '/' : window.location.href),
@@ -961,10 +997,11 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   const requestedResumeIdRef = useRef<string | null>(null)
 
   useEffect(() => {
+    if (resumeStartEmpty) return
     let returnContext: { resumeId?: string } | null = null
     try { returnContext = JSON.parse(sessionStorage.getItem('applymate:resume-return') ?? 'null') as { resumeId?: string } | null } catch { /* ignore malformed return context */ }
     requestedResumeIdRef.current = new URLSearchParams(window.location.search).get('resumeId') ?? returnContext?.resumeId ?? null
-  }, [])
+  }, [resumeStartEmpty])
 
   useEffect(() => {
     if (!resumeList) return
@@ -994,7 +1031,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     if (loadingList || initDone.current) return
     if (!resumeList) return
     initDone.current = true
-    if (resumeList.length === 0) {
+    if (resumeList.length === 0 && !resumeStartEmpty) {
       apiMutate<Resume>('/api/resume', 'POST', {
         name: 'My Resume', content: EMPTY_CONTENT, isDefault: true,
       }).then(({ data, error }) => {
@@ -1007,7 +1044,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
         } else toast.error('Error', error ?? 'Could not create resume')
       })
     }
-  }, [resumeList, loadingList])
+  }, [resumeList, loadingList, resumeStartEmpty])
 
   useEffect(() => {
     if (!selectedResumeId || !resumeUserId) return
@@ -1475,8 +1512,12 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   const saveForNavigationRef = useRef(handleSave)
   saveForNavigationRef.current = handleSave
   useEffect(() => registerNavigationGuard?.({
-    needsSave: () => dirtyRef.current || isSavingRef.current || applyingAuditRef.current || versionRestoreIntentRef.current,
+    needsSave: () => dirtyRef.current || isSavingRef.current || applyingAuditRef.current || versionRestoreIntentRef.current || resumeEntryWriteRef.current,
     save: async () => {
+      if (resumeEntryWriteRef.current) {
+        toast.info(t('resume.toastSaving'), t('resume.toastSavingDetail'))
+        return false
+      }
       if (versionRestoreIntentRef.current) {
         toast.info(t('resume.toastSaving'), t('resume.toastSavingDetail'))
         return false
@@ -1488,7 +1529,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   }), [registerNavigationGuard])
   useEffect(() => {
     const onBeforeUnload = (event: BeforeUnloadEvent) => {
-      guardApplicationUnload(event, dirtyRef.current || isSavingRef.current)
+      guardApplicationUnload(event, dirtyRef.current || isSavingRef.current || resumeEntryWriteRef.current)
     }
     window.addEventListener('beforeunload', onBeforeUnload)
     return () => window.removeEventListener('beforeunload', onBeforeUnload)
@@ -1528,14 +1569,18 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   }
 
   async function handleCreateResume(name: string) {
+    if (!beginResumeEntryWrite()) return
     setCreatingResume(true); setShowNewResume(false)
-    const { data, error } = await apiMutate<Resume>('/api/resume', 'POST', { name, content: EMPTY_CONTENT, isDefault: false })
-    setCreatingResume(false)
+    const request = apiMutate<Resume>('/api/resume', 'POST', { name, content: EMPTY_CONTENT, isDefault: false })
+    const { data, error } = await (resumeStartEmpty ? settleResumeEntryWrite(request) : request)
     if (data) {
       const item: ResumeListItem = { id: data.id, name: data.name, isDefault: data.isDefault, directionId: null, kind: 'base' as const, parentResumeId: null, targetJobId: null, origin: 'manual' as const, basicsDetached: false, createdAt: data.createdAt, updatedAt: data.updatedAt }
       setResumes(prev => [...prev, item]); await selectResume(data.id, item)
       toast.success('Resume created', `"${name}" is ready to edit`)
-    } else toast.error('Error', error ?? 'Could not create resume')
+    } else if (resumeStartEmpty) toast.warning(t('resume.entryWriteUncertainTitle'), t('resume.entryWriteUncertain'))
+    else toast.error('Error', error ?? 'Could not create resume')
+    setCreatingResume(false)
+    endResumeEntryWrite(Boolean(data))
   }
 
   async function fetchVersions() {
@@ -1810,6 +1855,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   }, [linkedJobId, jobs, selectedResume?.targetJobId, selectedResumeId])
 
   async function returnToApplication(jobId: string) {
+    if (resumeEntryWriteRef.current) { toast.info(t('resume.toastSaving'), t('resume.toastSavingDetail')); return }
     // Record the user's navigation intent immediately. The shell guard waits
     // for the shared save chain and resolves competing requests in click order.
     const opened = await openApplication(jobId, navigate)
@@ -2329,7 +2375,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       <header className="resume-library-heading">
         <div>
           <h1>{t('resume.library')}</h1>
-          {returnToJobs && (returnJobId || linkedJobId) && <button disabled={saving} onClick={() => void returnToApplication(returnJobId || linkedJobId!)} style={{ marginTop: 4, padding: 0, border: 'none', background: 'none', color: 'var(--primary)', cursor: 'pointer', fontSize: 12 }}>← {t('resume.backToApplication')}</button>}
+          {returnToJobs && (returnJobId || linkedJobId) && <button disabled={saving || resumeEntryWritePending} onClick={() => void returnToApplication(returnJobId || linkedJobId!)} style={{ marginTop: 4, padding: 0, border: 'none', background: 'none', color: 'var(--primary)', cursor: 'pointer', fontSize: 12 }}>← {t('resume.backToApplication')}</button>}
         </div>
       <div className="resume-library-toolbar">
         <div className="resume-library-toolbar-actions">
@@ -2358,7 +2404,11 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
         </div>
       ) : !content ? (
         <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-tertiary)' }}>
-          <div style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>{t('resume.selectOrCreate')}</div>
+          <div style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
+            <p>{t('resume.selectOrCreate')}</p>
+            {resumeStartEmpty && <Btn variant="primary" disabled={creatingResume || resumeEntryUncertain} onClick={() => setShowNewResume(true)}>{t('resume.newTitle')}</Btn>}
+            {resumeEntryUncertain && <p role="status">{t('resume.entryWriteUncertain')}</p>}
+          </div>
         </div>
       ) : (
         <div
@@ -2748,6 +2798,10 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       )}
       {showIntakeDialog && (
         <ResumeIntakeDialog
+          onBeginSave={resumeStartEmpty ? beginResumeEntryWrite : undefined}
+          onEndSave={resumeStartEmpty ? endResumeEntryWrite : undefined}
+          saveBlocked={resumeStartEmpty && resumeEntryUncertain}
+          settleSave={resumeStartEmpty ? settleResumeEntryWrite : undefined}
           onClose={() => { setShowIntakeDialog(false); setIntakeFile(null) }}
           onSaved={(resume) => {
             const item: ResumeListItem = {
