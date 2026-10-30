@@ -1205,6 +1205,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     setManualRecordRefreshing(true)
     setManualVisibleRecord(false)
     setActivityRetry(value => value + 1)
+    onRefreshTasks()
     try {
       const result = await readManualRecord(job.id)
       const updated = parseScopedManualRecordJob(result, userId, job.id)

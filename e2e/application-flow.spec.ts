@@ -3840,6 +3840,46 @@ test('a stalled record-status read returns control without accepting a late resp
   } finally { release() }
 })
 
+for (const previousTaskState of ['unavailable', 'limited'] as const) {
+  test(`refreshing an unknown manual record also recovers ${previousTaskState} task state`, async ({ page }) => {
+    const state = await install(page, { manualOutcome: 'unknown' })
+    let phase = 0
+    let taskReads = 0
+    await page.route('**/api/agent/application-tasks**', async route => {
+      taskReads += 1
+      if (phase === 0) return route.fulfill({ status: 200, json: { tasks: [] } })
+      if (phase === 1 && previousTaskState === 'unavailable') return route.fulfill({ status: 500, json: { error: 'unavailable' } })
+      if (phase === 1) return route.fulfill({ status: 200, json: { tasks: Array.from({ length: 100 }, (_, index) => ({
+        id: `other-task-${index}`, userId: 'fixture-user', jobId: `other-job-${index}`, sessionId: `other-session-${index}`,
+        status: 'filling', checkpoint: null, updatedAt: time, job: { company: 'Other employer', role: 'Other role' },
+      })) } })
+      return route.fulfill({ status: 200, json: { tasks: [{ id: 'task-1', userId: 'fixture-user', jobId: 'outside-page',
+        sessionId: 'original-session', status: 'waiting_for_user', checkpoint: 'form_answer_required', updatedAt: time,
+        job: { company: 'Fixture Employer', role: 'Application flow engineer' } }] } })
+    })
+    await open(page)
+    await page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ }).click()
+    await expect.poll(() => state.writes.filter(write => write.path.endsWith('/apply')).length).toBe(1)
+    await expect.poll(() => page.evaluate(() => sessionStorage.getItem('applymate:manual-record:fixture-user:outside-page'))).toBe('unknown')
+    phase = 1
+    const failureRead = page.waitForResponse(response => response.url().includes('/api/agent/application-tasks'))
+    await open(page)
+    await failureRead
+    expect(taskReads).toBeGreaterThanOrEqual(2)
+    phase = 2
+    const recoveredRead = page.waitForResponse(response => response.url().includes('/api/agent/application-tasks'))
+    await page.getByRole('button', { name: /Refresh record status|刷新记录状态/ }).click()
+    await recoveredRead
+    const task = page.getByRole('region', { name: 'Fixture Employer · Application flow engineer' })
+    await expect(task).toBeVisible()
+    await expect(task.locator('a')).toHaveAttribute('href', /original-session/)
+    await expect(page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ })).toHaveCount(0)
+    expect(await page.evaluate(() => sessionStorage.getItem('applymate:manual-record:fixture-user:outside-page'))).toBe('unknown')
+    expect(state.writes.filter(write => write.path.endsWith('/apply'))).toHaveLength(1)
+    expect(state.unexpected).toEqual([])
+  })
+}
+
 for (const result of ['confirmed', 'rejected'] as const) {
   test(`a malformed ${result} record-status response preserves the application context`, async ({ page }) => {
     const state = await install(page)
