@@ -737,11 +737,11 @@ async function expectCompletedClaimBeforeItemEventSafety(
       await client.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor",
           "correlationId", "causationId", "idempotencyKey", "payload")
         VALUES ($1, $2, $3, $4, $5, $6, 'item.completed', 'subagent', $7, $8, $9, $10::jsonb),
-          ($11, $2, $3, $12, $5, $13, $14, 'subagent', $7, $15, $16, $17::jsonb)`, [
+          ($11, $2, $3, $12, $5, $13, $14, 'subagent', $18, $15, $16, $17::jsonb)`, [
         itemCompletedId, ids.sessionId, ids.turnId, callItemId, ids.waiterTaskId, itemCompletedSequence,
         callItemId, itemCompletedCausation, itemCompletedKey, JSON.stringify({ itemId: callItemId, status: "completed", content }),
         terminalId, terminalItemId, terminalSequence, status === "completed" ? "tool_call.completed" : "tool_call.failed",
-        terminalCausation, terminalKey, JSON.stringify(payload),
+        terminalCausation, terminalKey, JSON.stringify(payload), callId,
       ])
     }
     const allowsSettlement = async (label: string, mutate: () => Promise<void>): Promise<void> => {
