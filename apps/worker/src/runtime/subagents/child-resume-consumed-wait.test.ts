@@ -1,4 +1,7 @@
-import { describe, expect, it } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
+
+const sourceLifecycle = vi.hoisted(() => ({ inspect: vi.fn() }))
+vi.mock("./child-resume-source-wait-lifecycle.js", () => ({ inspectChildWaitSourceLifecycle: sourceLifecycle.inspect }))
 
 import { loadChildConsumedWaitResume } from "./child-resume-consumed-wait.js"
 import { loadChildWaitCallRecovery } from "./child-resume-wait-call-recovery.js"
@@ -17,9 +20,9 @@ const child = { id: "parent-1", userId: "user-1", sessionId: "session-1", turnId
 
 function fixture(options: { ids?: string[]; targetIds?: unknown; inputIds?: unknown; requestIds?: unknown; outcomeIds?: unknown;
   outcomeTaskId?: unknown; outcomeTaskIds?: string[]; receiptIds?: unknown; receiptWaitId?: unknown; receiptTaskIds?: unknown; targetParentId?: string;
-  mode?: unknown; inputMode?: unknown; requestMode?: unknown; status?: unknown; outcomeStatus?: unknown;
+  mode?: unknown; inputMode?: unknown; requestMode?: unknown; status?: unknown; outcomeStatus?: unknown; sourceAttempt?: number;
   matchedIds?: unknown; outcomeMatchedIds?: unknown; taskStatuses?: unknown[]; inputTimeoutMs?: unknown; requestTimeoutMs?: unknown;
-  deadlineAt?: string | Date; receiptDeadlineAt?: string; missingReceipt?: boolean; note?: string } = {}) {
+  deadlineAt?: string | Date; receiptDeadlineAt?: string; missingReceipt?: boolean; sourceLifecycleMarker?: boolean; note?: string } = {}) {
   const ids = options.ids ?? [phoneId], targetIds = options.targetIds ?? ids
   const deadlineAt = options.deadlineAt ?? "2026-10-22T10:05:00.000Z"
   const deadlineIso = deadlineAt instanceof Date ? deadlineAt.toISOString() : deadlineAt
@@ -34,8 +37,8 @@ function fixture(options: { ids?: string[]; targetIds?: unknown; inputIds?: unkn
   const row: Row = {
     waitId: "wait-1", stepId: "step-1", targetTaskIds: targetIds, idempotencyKey: "wait-key", mode, status, deadlineAt,
     matchedTaskIds: matchedIds, waitResult: { request: { targetTaskIds: options.requestIds ?? ids, mode: options.requestMode ?? mode,
-      timeoutMs: options.requestTimeoutMs ?? 5_000 }, outcome },
-    attempt: 1, ordinal: 0, continuationStepId: "step-2", continuationOrdinal: 1, continuationLatestOrdinal: 1,
+      timeoutMs: options.requestTimeoutMs ?? 5_000 }, outcome, ...(options.sourceLifecycleMarker ? { sourceLifecycleRecovery: { ownerId: "private-marker" } } : {}) },
+    attempt: options.sourceAttempt ?? 1, ordinal: 0, continuationStepId: "step-2", continuationOrdinal: 1, continuationLatestOrdinal: 1,
     callContent: { toolCallId: "call-1", toolName: "wait_subagents", input }, callStatus: options.missingReceipt ? "started" : "completed",
     sourceItemId: options.missingReceipt ? null : "item-result-1", resultContent: options.missingReceipt ? null : {
       toolCallId: "call-1", output: { waitId: options.receiptWaitId ?? "wait-1", status: "waiting", taskIds: options.receiptIds ?? ids,
@@ -113,6 +116,12 @@ function claimFixture(options: { orphan?: boolean; resultWithoutStart?: boolean 
 }
 
 describe("consumed child wait resume", () => {
+  beforeEach(() => {
+    sourceLifecycle.inspect.mockImplementation(async (_client: unknown, _lease: unknown, wait: unknown) => {
+      const value = wait as Row, hasMarker = Object.hasOwn(value.result as object, "sourceLifecycleRecovery")
+      return { state: hasMarker ? "recovered" : "waiting", toolCallId: "call-1", callItemId: "source-call-1", resultItemId: "item-result-1" }
+    })
+  })
   it("preserves validated phone-shaped IDs through the consumed loader and keeps free text redacted", async () => {
     const fake = fixture({ note: "Contact +353 87 123 4567" })
     const resumed = await loadChildConsumedWaitResume(fake.client as never, child)
@@ -155,11 +164,31 @@ describe("consumed child wait resume", () => {
     expect(lineage).toContain('next."ordinal" = (SELECT MIN(later."ordinal")')
   })
 
-  it("recovers an exact consumed wait when its receipt is missing", async () => {
-    const fake = fixture({ missingReceipt: true })
-    await expect(loadChildConsumedWaitResume(fake.client as never, child)).resolves.toMatchObject({
-      sourceItemId: "recovered-wait-result:wait-1", input: { taskIds: [phoneId] }, output: { taskIds: [phoneId] },
+  it("accepts a source wait from an earlier attempt and rejects a future source attempt", async () => {
+    const currentLease = { ...child, attemptCount: 2 }
+    const earlier = fixture({ sourceAttempt: 1 })
+    await expect(loadChildConsumedWaitResume(earlier.client as never, currentLease)).resolves.toMatchObject({
+      waitId: "wait-1", attempt: 1, stepId: "step-1",
     })
+    expect(sourceLifecycle.inspect).toHaveBeenCalledWith(earlier.client, currentLease, expect.objectContaining({ stepId: "step-1" }), "step-1", expect.any(Object))
+
+    const future = fixture({ sourceAttempt: 3 })
+    await expect(loadChildConsumedWaitResume(future.client as never, currentLease)).rejects.toThrow("child_resume_wait_lineage")
+    expect(sourceLifecycle.inspect).not.toHaveBeenCalledWith(future.client, currentLease, expect.anything(), expect.anything(), expect.anything())
+  })
+
+  it("rejects a consumed wait whose source result is still missing", async () => {
+    const fake = fixture({ missingReceipt: true })
+    sourceLifecycle.inspect.mockResolvedValue({ state: "unreconciled", toolCallId: "call-1", callItemId: "source-call-1" })
+    await expect(loadChildConsumedWaitResume(fake.client as never, child)).rejects.toThrow("child_resume_wait_tool_call_conflict")
+  })
+
+  it("keeps the internal lifecycle marker out of the model-facing resume", async () => {
+    const fake = fixture({ sourceLifecycleMarker: true })
+    const resumed = await loadChildConsumedWaitResume(fake.client as never, child)
+    expect(resumed).toMatchObject({ waitId: "wait-1", output: { status: "ready" } })
+    expect(JSON.stringify(resumed)).not.toContain("sourceLifecycleRecovery")
+    expect(JSON.stringify(resumed)).not.toContain("private-marker")
   })
 
   it("accepts any-ready with a terminal match while another target is still running", async () => {

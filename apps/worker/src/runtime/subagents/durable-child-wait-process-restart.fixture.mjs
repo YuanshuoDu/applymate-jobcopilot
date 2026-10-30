@@ -36,6 +36,7 @@ const readyMarkerByMode = {
   "worker-a-crash": "WORKER_A_READY",
   "worker-b-crash-before-resume": "WORKER_B_READY",
   "worker-b-crash-resume": "WORKER_B_READY",
+  "worker-b-crash-source-lifecycle": "WORKER_B_READY",
   "worker-b-crash-after-wait-ack": "WORKER_B_READY",
   "worker-b-crash-before-claim": "WORKER_B_READY",
   "worker-b-crash-after-orphan-reissue": "WORKER_B_READY",
@@ -55,6 +56,7 @@ const crashCutModes = new Set([
   "worker-a-crash",
   "worker-b-crash-before-resume",
   "worker-b-crash-resume",
+  "worker-b-crash-source-lifecycle",
   "worker-b-crash-after-wait-ack",
   "worker-b-crash-before-claim",
   "worker-b-crash-after-orphan-reissue",
@@ -72,6 +74,27 @@ const manager = new AgentTreeManager(store, { heartbeatMs: 2_000 })
 const turnStore = createPgTurnEngineStore(pool)
 const resolver = mode.startsWith("worker-b") ? startDurableWaitResolver(pool, { intervalMs: 100, ownerId: "restart-fixture-worker-b" }) : undefined
 let stopped = false
+
+function poolWithSourceLifecycleCrashBarrier(stage) {
+  if (stage !== "after-consumed-update") throw new Error("invalid_source_lifecycle_crash_stage")
+  return {
+    connect: async () => {
+      const client = await pool.connect()
+      return {
+        query: async (...args) => {
+          const result = await client.query(...args)
+          const statement = typeof args[0] === "string" ? args[0].replace(/\s+/g, " ").trim() : ""
+          if (statement.startsWith('UPDATE "agent_wait_conditions" SET "consumedAt"')) {
+            say(`WORKER_B_SOURCE_LIFECYCLE_CRASH_CUT ${JSON.stringify({ stage, writeApplied: result.rowCount === 1 })}`)
+            return new Promise(() => {})
+          }
+          return result
+        },
+        release: () => client.release(),
+      }
+    },
+  }
+}
 
 function say(value) { process.stdout.write(`${value}\n`) }
 function boundedIds(value) {
@@ -644,11 +667,14 @@ async function waitForChild(lease, crashAfterRegistration = false) {
   const stepId = `task:${lease.id}:step:0:attempt:${lease.attemptCount}`
   const toolCallId = phoneShapedToolCallId
   if (redactSensitiveText(toolCallId) === toolCallId) throw new Error("fixture_tool_call_id_is_not_phone_shaped")
-  const input = { taskIds: [ids.targetTaskId], mode: "any", timeoutMs: 30_000, idempotencyKey: `child-wait:${lease.id}:attempt:${lease.attemptCount}` }
+  const input = { taskIds: [ids.targetTaskId], mode: "any", timeoutMs: 30_000, idempotencyKey: `api_key=source-wait-secret-${lease.id}-attempt-${lease.attemptCount}` }
   const now = new Date()
-  const step = await turnStore.startStep({ owner, stepId, ordinal: 0, attempt: lease.attemptCount, inputThroughSequence: 0n,
-    consumedInputIds: [], modelProfileSnapshot: {}, now })
   let wait
+  const fixtureModel = loopFixtureModel(async ({ stepId: actualStepId }) => {
+    if (actualStepId !== stepId) throw new Error("fixture_source_wait_step_id_mismatch")
+    return { toolCalls: [{ id: toolCallId, name: "wait_subagents", arguments: input }],
+      usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } }
+  })
   const options = turnExecutionOptions(lease, owner, async ({ call }) => {
     wait = await registerDurableSubagentWait(pool, { lease, stepId, targetTaskIds: call.input.taskIds, mode: call.input.mode,
       timeoutMs: call.input.timeoutMs, idempotencyKey: call.input.idempotencyKey, now })
@@ -657,19 +683,20 @@ async function waitForChild(lease, crashAfterRegistration = false) {
       return new Promise(() => {})
     }
     return { id: toolCallId, toolName: "wait_subagents", toolVersion: "1", status: "completed", output: wait, errorCode: null }
+  }, {
+    contextBuilder: loopContextBuilder(),
+    model: fixtureModel.model,
+    tools: [{ name: "wait_subagents", version: "1", inputSchema: { type: "object" } }],
   })
-  const writer = new TurnExecutionEventWriter(options)
-  const sourceCall = { id: toolCallId, name: "wait_subagents", arguments: input }
-  const callResult = await executeToolWithItems(options, writer, step, sourceCall, () => new Date())
-  if (!wait || callResult.status !== "completed" || canonicalJson(callResult.output) !== canonicalJson(wait)) {
+  const result = await runTurnExecutionLoop(options)
+  if (!wait || result.status !== "waiting_for_dependency" || result.waitId !== wait.waitId || fixtureModel.invocations.length !== 1) {
     throw new Error("fixture_source_wait_call_receipt_invalid")
   }
-  await turnStore.updateStep({ owner, stepId, status: "waiting_for_tool", finishReason: "tool_calls", errorCode: null,
-    inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, now: new Date() })
   return { status: "waiting", result: { waitId: wait.waitId } }
 }
 
-async function resumeChild(lease, crashBeforeWaitAck = false, crashAfterWaitAck = false, crashAfterClaimResult = false, reissueOrphan = false) {
+async function resumeChild(lease, crashBeforeWaitAck = false, crashAfterWaitAck = false, crashAfterClaimResult = false,
+  reissueOrphan = false, sourceLifecycleCrashStage) {
   const now = new Date()
   const pendingWait = await loadDurableSubagentWaitResume(pool, lease, now)
   const restored = await loadChildAttemptResume(pool, lease, now, pendingWait)
@@ -701,7 +728,8 @@ async function resumeChild(lease, crashBeforeWaitAck = false, crashAfterWaitAck 
     say(`WORKER_B_RESUME_STEP_STARTED ${JSON.stringify({ waitId: wait.waitId, stepId, ordinal: continuation.ordinal })}`)
     return new Promise(() => {})
   }
-  if (!await commitDurableSubagentWaitResume(pool, lease, { waitId: wait.waitId, stepId: wait.stepId, nextStepOrdinal: continuation.ordinal, now })) {
+  const commitPool = sourceLifecycleCrashStage ? poolWithSourceLifecycleCrashBarrier(sourceLifecycleCrashStage) : pool
+  if (!await commitDurableSubagentWaitResume(commitPool, lease, { waitId: wait.waitId, stepId: wait.stepId, nextStepOrdinal: continuation.ordinal, now })) {
     throw new Error("durable_child_wait_ack_pending")
   }
   if (crashAfterWaitAck) {
@@ -748,6 +776,8 @@ const worker = new Worker(queueName, async job => {
         return new Promise(() => {})
       }
       : mode === "worker-b-crash-resume" ? ({ lease }) => resumeChild(lease, true)
+      : mode === "worker-b-crash-source-lifecycle" ? ({ lease }) => resumeChild(lease, false, false, false, false,
+        ids.sourceLifecycleCrashStage ?? "after-consumed-update")
       : mode === "worker-b-crash-after-wait-ack" ? ({ lease }) => resumeChild(lease, false, true)
       : mode === "worker-b-crash-before-claim" ? ({ lease }) => resumeChild(lease, false, true)
         : mode === "worker-b-crash-after-orphan-reissue" ? ({ lease }) => resumeChild(lease, false, false, false, true)

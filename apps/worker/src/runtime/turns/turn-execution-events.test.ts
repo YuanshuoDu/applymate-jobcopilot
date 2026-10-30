@@ -4,8 +4,9 @@ import { Type } from "@sinclair/typebox"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 
-import { executeToolWithItems, persistChildWaitClaimRecovery, TurnExecutionEventWriter } from "./turn-execution-events.js"
+import { executeToolWithItems, persistChildWaitClaimRecovery, persistRecoveredToolCall, TurnExecutionEventWriter } from "./turn-execution-events.js"
 import type { TurnExecutionIdentity, TurnExecutionOptions, TurnExecutionStore } from "./turn-execution-types.js"
+import type { ToolCallRecovery } from "./turn-engine-types.js"
 import type { ChildWaitClaimRecovery } from "../subagents/child-durable-wait-replay.js"
 import { restoreToolCallState } from "./persisted-tool-call-state.js"
 import { findToolObservation, stableJson } from "./turn-engine-replay.js"
@@ -126,6 +127,76 @@ describe("TurnExecutionEventWriter", () => {
     expect(order).toEqual(["started-event-persisted", "claim-acknowledged", "execute"])
   })
 
+  it.each(["wait_subagents", "agent.wait"] as const)("redacts %s target IDs in completion events while retaining private raw item input", async toolName => {
+    const owner = identity("task", "child-1")
+    const base = options(owner, [])
+    const savedItemContent: unknown[] = []
+    const appended: Array<{ type: string; payload: unknown }> = []
+    const rawTargets = ["+353 87 123 4567", "subagent-123e4567-e89b-42d3-a456-426614174000"]
+    const call = {
+      id: "wait-call-1", name: toolName, arguments: {
+        idempotencyKey: "opaque-wait-key-001", taskIds: rawTargets, mode: "all", timeoutMs: 5_000, goal: "private extra",
+      },
+    }
+    const executionOptions: TurnExecutionOptions = {
+      ...base,
+      lifecycle: { mapEventType: type => type === "item.completed" ? "mapped.item.completed" : type },
+      executeTool: async ({ call: request }) => ({
+        id: request.id, toolName: request.toolName, toolVersion: request.toolVersion,
+        status: "completed", output: { status: "ready" }, errorCode: null,
+      }),
+      store: {
+        ...base.store,
+        createItem: async input => { savedItemContent.push(input.content); return { id: input.itemId, revision: 0 } },
+        updateItem: async input => { savedItemContent.push(input.content); return { id: input.itemId, revision: input.expectedRevision + 1 } },
+        appendEvent: async input => { appended.push({ type: input.type, payload: input.payload }); return { id: input.id } },
+      },
+    }
+    const writer = new TurnExecutionEventWriter(executionOptions)
+
+    await executeToolWithItems(executionOptions, writer, { id: "step-1", ordinal: 0 }, call, () => new Date())
+
+    const privateCall = savedItemContent.find(value => !!value && typeof value === "object" && "toolCallId" in value && (value as { toolCallId?: unknown }).toolCallId === call.id)
+    expect(privateCall).toMatchObject({ input: call.arguments })
+    const completion = appended.find(entry => entry.type === "mapped.item.completed" && JSON.stringify(entry.payload).includes(`"toolName":"${toolName}"`))
+    expect(completion?.payload).toMatchObject({ content: { input: {
+      idempotencyKey: "[REDACTED]", taskIds: ["[REDACTED]", "[REDACTED]"], mode: "all", timeoutMs: 5_000,
+    } } })
+    expect(JSON.stringify(completion?.payload)).not.toContain("opaque-wait-key-001")
+    expect(JSON.stringify(completion?.payload)).not.toContain("subagent-123e4567-e89b-42d3-a456-426614174000")
+    expect(completion?.payload).not.toHaveProperty("content.input.goal")
+  })
+
+  it.each(["wait_subagents", "agent.wait"] as const)("projects failed %s calls from the schema allowlist", async toolName => {
+    const base = options(identity("turn", "root-1"), [])
+    const appended: Array<{ type: string; payload: unknown }> = []
+    const rawInput = { idempotencyKey: "opaque-error-key", taskIds: ["leaf-1"], mode: "sometimes", timeoutMs: "unknown", extra: "private" }
+    const executionOptions: TurnExecutionOptions = {
+      ...base,
+      executeTool: async ({ call }) => ({
+        id: call.id, toolName: call.toolName, toolVersion: call.toolVersion, status: "failed", errorCode: "wait_invalid",
+      }),
+      store: {
+        ...base.store,
+        appendEvent: async input => { appended.push({ type: input.type, payload: input.payload }); return { id: input.id } },
+      },
+    }
+
+    await executeToolWithItems(executionOptions, new TurnExecutionEventWriter(executionOptions), { id: "step-1", ordinal: 0 }, {
+      id: "failed-wait-call", name: toolName, arguments: rawInput,
+    }, () => new Date())
+
+    const completion = appended.find(entry => entry.type === "item.completed" && JSON.stringify(entry.payload).includes(`"toolName":"${toolName}"`))
+    expect(completion?.payload).toMatchObject({ content: { status: "failed", input: {
+      idempotencyKey: "[REDACTED]", taskIds: ["[REDACTED]"],
+    } } })
+    expect(completion?.payload).not.toHaveProperty("content.input.mode")
+    expect(completion?.payload).not.toHaveProperty("content.input.timeoutMs")
+    expect(completion?.payload).not.toHaveProperty("content.input.extra")
+    expect(JSON.stringify(completion?.payload)).not.toContain("opaque-error-key")
+    expect(JSON.stringify(completion?.payload)).not.toContain("private")
+  })
+
   it("does not acknowledge or execute a child wait when its owner-fenced start write fails", async () => {
     const base = options(identity("task", "child-1"), [])
     const denied = new Error("owner_fence_rejected")
@@ -244,6 +315,35 @@ describe("TurnExecutionEventWriter", () => {
     expect(events[0]?.id).toContain("task:child-1:event:started")
   })
 
+  it("projects batched wait completions using the original type before lifecycle mapping", async () => {
+    const saved: Array<{ type: string; payload: unknown }> = []
+    const appendEvents: NonNullable<TurnExecutionStore["appendEvents"]> = vi.fn(async (inputs: Parameters<NonNullable<TurnExecutionStore["appendEvents"]>>[0]) => {
+      saved.push(...inputs.map(input => ({ type: input.type, payload: input.payload })))
+      return inputs.map(input => ({ id: input.id }))
+    })
+    const base = options(identity("turn", "root-1"), [], appendEvents)
+    const writer = new TurnExecutionEventWriter({
+      ...base, lifecycle: { mapEventType: type => type === "item.completed" ? "mapped.item.completed" : type },
+    })
+
+    await writer.appendBatch([{
+      type: "item.completed", correlationId: "call-item", itemId: "call-item", key: "wait-completed",
+      payload: { itemId: "call-item", status: "completed", content: {
+        toolCallId: "wait-call", toolName: "agent.wait", toolVersion: "1", status: "completed", errorCode: null,
+        input: { idempotencyKey: "opaque-batch-key", taskIds: ["child-1"], mode: "all", timeoutMs: 5_000, extra: "private" },
+      } },
+    }])
+
+    expect(saved[0]?.type).toBe("mapped.item.completed")
+    expect(saved[0]?.payload).toMatchObject({
+      itemId: "call-item", status: "completed", content: { input: {
+        idempotencyKey: "[REDACTED]", taskIds: ["[REDACTED]"], mode: "all", timeoutMs: 5_000,
+      } },
+    })
+    expect(JSON.stringify(saved[0]?.payload)).not.toContain("opaque-batch-key")
+    expect(JSON.stringify(saved[0]?.payload)).not.toContain("private")
+  })
+
   it("persists a plan observation batch before notifying subscribers and chains causation", async () => {
     const events: Array<{ id: string; type: string; itemId: string | null; identity: TurnExecutionIdentity }> = []
     const saved: Array<{ id: string; causationId: string | null }> = []
@@ -311,7 +411,7 @@ describe("persistChildWaitClaimRecovery", () => {
   it("reconciles the claimed call and a pre-existing result item without dispatch", async () => {
     const owner = identity("task", "child-1")
     const base = options(owner, [])
-    const writes: Array<{ kind: string; id?: string; itemId?: string | null; type?: string; correlationId?: string | null; causationId?: string | null; payload?: unknown }> = []
+    const writes: Array<{ kind: string; id?: string; itemId?: string | null; type?: string; correlationId?: string | null; causationId?: string | null; payload?: unknown; content?: unknown }> = []
     const options_: TurnExecutionOptions = {
       ...base,
       idFactory: prefix => prefix,
@@ -319,7 +419,7 @@ describe("persistChildWaitClaimRecovery", () => {
       store: {
         ...base.store,
         createItem: async input => { writes.push({ kind: "createItem", itemId: input.itemId }); return { id: input.itemId, revision: 0 } },
-        updateItem: async input => { writes.push({ kind: "updateItem", itemId: input.itemId }); return { id: input.itemId, revision: input.expectedRevision + 1 } },
+        updateItem: async input => { writes.push({ kind: "updateItem", itemId: input.itemId, content: input.content }); return { id: input.itemId, revision: input.expectedRevision + 1 } },
         appendEvent: async input => {
           writes.push({ kind: "appendEvent", id: input.id, itemId: input.itemId, type: input.type, correlationId: input.correlationId,
             causationId: input.causationId, payload: input.payload })
@@ -353,6 +453,9 @@ describe("persistChildWaitClaimRecovery", () => {
       "claim-event", events[0]!.id, events[1]!.id, events[2]!.id,
     ])
     expect(events[2]).toMatchObject({ itemId: claim.resultItem!.id, correlationId: claim.stepId, payload: { itemId: claim.resultItem!.id, type: "tool_result" } })
+    expect(writes.find(write => write.kind === "updateItem" && write.itemId === "call-item")?.content)
+      .toMatchObject({ input: claim.call.arguments })
+    expect(events[0]?.payload).toMatchObject({ content: { input: { taskIds: ["[REDACTED]"] } } })
   })
 
   it("rejects a claim from another owner or attempt before any persistence", async () => {
@@ -382,5 +485,36 @@ describe("persistChildWaitClaimRecovery", () => {
     expect(appendEvent).not.toHaveBeenCalled()
     expect(createItem).not.toHaveBeenCalled()
     expect(updateItem).not.toHaveBeenCalled()
+  })
+})
+
+describe("persistRecoveredToolCall", () => {
+  it("projects the recovered agent.wait event while keeping its private call item intact", async () => {
+    const base = options(identity("turn", "root-1"), [])
+    const updates: Array<{ itemId: string; content: unknown }> = []
+    const events: Array<{ type: string; payload: unknown }> = []
+    const rawInput = { idempotencyKey: "opaque-wait-key-001", taskIds: ["+353 87 123 4567"], mode: "all", timeoutMs: 5_000, goal: "private extra" }
+    const recovery: ToolCallRecovery = {
+      action: "reconcile", call: { id: "root-wait-call", name: "agent.wait", arguments: rawInput },
+      toolVersion: "1", stepId: "wait-step", callItem: { id: "wait-call-item", revision: 0 },
+    }
+    const result = { id: recovery.call.id, toolName: recovery.call.name, toolVersion: "1", status: "completed" as const, output: {}, errorCode: null }
+    const executionOptions: TurnExecutionOptions = {
+      ...base,
+      store: {
+        ...base.store,
+        createItem: async input => ({ id: input.itemId, revision: 0 }),
+        updateItem: async input => { updates.push({ itemId: input.itemId, content: input.content }); return { id: input.itemId, revision: input.expectedRevision + 1 } },
+        appendEvent: async input => { events.push({ type: input.type, payload: input.payload }); return { id: input.id } },
+      },
+    }
+
+    await persistRecoveredToolCall(executionOptions, new TurnExecutionEventWriter(executionOptions), recovery, result, () => new Date())
+
+    expect(updates.find(item => item.itemId === recovery.callItem.id)?.content).toMatchObject({ input: rawInput })
+    expect(events.find(item => item.type === "item.completed")?.payload).toMatchObject({
+      content: { input: { idempotencyKey: "[REDACTED]", taskIds: ["[REDACTED]"] } },
+    })
+    expect(JSON.stringify(events.find(item => item.type === "item.completed")?.payload)).not.toContain("opaque-wait-key-001")
   })
 })
