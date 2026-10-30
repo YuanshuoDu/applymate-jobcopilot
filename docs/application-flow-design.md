@@ -58,6 +58,12 @@ Agent 负责原任务的执行和审批，招聘消息负责查看回复。
 4. 登录、验证码或 MFA 按原会话的交接说明处理；仅在现有系统允许时恢复。
 5. 结果待核实时先查看原会话和回执，不再次提交。
 
+隔离测试发现：新建会话可能在会话已创建后显示失败；如果遇到类似情况，
+先查看会话列表，确认是否已有对应会话，避免反复新建。测试中还发现，
+原生问题可能无法显示并使任务失败；此时查看原任务状态，必要时使用上面的
+手动申请流程。上述问题记录在本次 PR 中，实际线上状态尚未验证，修复需要在
+Agent 维护范围内单独处理。
+
 ### 常见提示
 
 | 提示 | 应如何处理 |
@@ -349,6 +355,12 @@ One fixture opens the original Agent session from an application, answers a mock
 question, reviews a mock approval and displays a simulated unverified outcome;
 its state changes are injected by the fixture and page reloads. These checks prove
 UI wiring, not Worker execution, authenticated database, live ATS or production behavior.
+An additional isolated real-authentication test found that session creation returned
+500 after persisting a session. Continuing with that unique test session reached
+the real usage authorization and synthetic model, but the native question failed:
+the stored tool result had its question redacted and the turn ended `invalid_output`.
+The real question, approval and execution journey remains unverified. These are
+disposable test observations, not verification of the deployed environment.
 
 Worker runtime, Agent-owned layout, protocol, policies, mutation APIs, schema and
 roadmap remain under their existing owners. No new state machine, persistent
