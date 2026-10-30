@@ -145,8 +145,14 @@ async function acceptSteer(fixture: Fixture, id: string, text: string): Promise<
     await client.query("SELECT set_config($1,$2,true)", ["app.user_id", fixture.userId])
     await client.query(`SELECT "id" FROM "agent_sessions" WHERE "id"=$1 AND "userId"=$2
       AND "status" NOT IN ('aborted','archived') FOR UPDATE`, [fixture.sessionId, fixture.userId])
-    const itemId = `${id}-item`, parts = [{ type: "text", text }]
-    const itemContent = { clientMessageId: messageId, disposition: "steered", parts, source: "user" }
+    const itemId = randomUUID(), eventId = randomUUID(), parts = [{ type: "text", text }]
+    const disposition = "steered", source = "user"
+    const payload = { inputId: id, clientMessageId: messageId, delivery: "steer", disposition, source }
+    const routing = { sessionId: fixture.sessionId, turnId: fixture.turnId, itemId, taskId: null,
+      actor: "user" as const, correlationId: fixture.turnId, causationId: null, outboxTopic: "agent.session.event" as const }
+    const safePayload = redactAgentEvent({ type: "input.accepted", body: "", data: payload, routing }).data
+    if (!safePayload || Array.isArray(safePayload) || typeof safePayload !== "object") throw new Error("Accepted steer sanitizer rejected its canonical fixture")
+    const itemContent = { clientMessageId: messageId, disposition, parts, source: "user" }
     await client.query(`INSERT INTO "agent_items" ("id","sessionId","turnId","type","status","phase","revision","content","startedAt","completedAt","updatedAt")
       VALUES ($1,$2,$3,'user_message','completed','commentary',0,$4::jsonb,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`,
     [itemId, fixture.sessionId, fixture.turnId, JSON.stringify(itemContent)])
@@ -155,8 +161,7 @@ async function acceptSteer(fixture: Fixture, id: string, text: string): Promise<
     if (sequence === undefined) throw new Error("Could not allocate accepted steer sequence")
     await client.query(`INSERT INTO "agent_events" ("id","sessionId","turnId","itemId","taskId","sequence","type","actor","correlationId","causationId","idempotencyKey","payload")
       VALUES ($1,$2,$3,$4,NULL,$5,'input.accepted','user',$3,NULL,$6,$7::jsonb)`,
-    [`${id}-accepted-event`, fixture.sessionId, fixture.turnId, itemId, sequence, `input.accepted:${messageId}`,
-      JSON.stringify({ inputId: id, clientMessageId: messageId, delivery: "steer", disposition: "steered", source: "user" })])
+    [eventId, fixture.sessionId, fixture.turnId, itemId, sequence, `agent-command:${messageId}`, JSON.stringify(safePayload)])
     await client.query(`INSERT INTO "agent_inputs" ("id","sessionId","targetTurnId","userId","clientMessageId","delivery","status","content","acceptedSequence")
       VALUES ($1,$2,$3,$4,$5,'steer','accepted',$6::jsonb,$7)`,
     [id, fixture.sessionId, fixture.turnId, fixture.userId, messageId, JSON.stringify(parts), sequence])
@@ -585,7 +590,7 @@ describePg("root task history Session authorization PostgreSQL serialization", (
   it("treats a steer accepted before context claim as a cross-session history barrier", async () => {
     const userId = await createUser(), sessionId = await createSession(userId), fixture = await createTurn(userId, sessionId)
     await setConsent(userId, true, 0)
-    const acceptedSequence = await acceptSteer(fixture, `history-consent-before-${randomUUID()}`, "Prefer platform engineering roles.")
+    const acceptedSequence = await acceptSteer(fixture, randomUUID(), "Prefer platform engineering roles.")
     const result = await withContextTransaction(fixture, async (client, _authorization, allowed) => {
       expect(allowed).toBe(true)
       return buildAndClassifyContext(client, fixture, allowed)
@@ -615,7 +620,7 @@ describePg("root task history Session authorization PostgreSQL serialization", (
       const held = await entered.promise
       expect(held.result).toMatchObject({ crossSessionReadAllowed: true, steerEvidence: { kind: "no_accepted_steer" },
         context: { inputThroughSequence: 0n, consumedInputIds: [] } })
-      const steerId = `history-consent-blocked-${randomUUID()}`
+      const steerId = randomUUID()
       acceptance = acceptSteer(first, steerId, "Prioritise jobs with platform ownership.")
       await waitForBlockedBy(ACCEPTANCE_APPLICATION, held.pid)
       release.resolve()
