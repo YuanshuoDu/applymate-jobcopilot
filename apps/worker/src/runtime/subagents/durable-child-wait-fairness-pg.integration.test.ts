@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto"
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest"
 import { Pool, type PoolClient } from "pg"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
+import { executionId, executionKey } from "../turns/turn-execution-types.js"
 import { executionOwnerFence } from "../execution-owner.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
 import { defaultSubagentPolicy, type SubagentLease, type SubagentTaskRecord } from "./types.js"
@@ -54,6 +55,28 @@ async function startWaitingStep(pool: Pool, lease: SubagentLease, suffix: string
   return step.id
 }
 
+async function persistWaitCall(pool: Pool, lease: SubagentLease, stepId: string, targetTaskId: string, suffix: string): Promise<void> {
+  const store = createPgTurnEngineStore(pool)
+  const owner = executionOwnerFence({ kind: "task", lease })
+  const toolCallId = `fair-wait-call:${suffix}`
+  const itemId = `${executionId(owner, `item:tool-call:${toolCallId}`)}:${randomUUID()}`
+  const eventId = (key: string) => `${executionId(owner, `event:${key}`)}:${randomUUID()}`
+  const key = executionKey(owner)
+  const now = new Date()
+  await store.createItem({
+    owner, itemId, stepId, type: "tool_call", status: "started", phase: null,
+    content: { toolCallId, toolName: "wait_subagents", toolVersion: "1", input: {
+      idempotencyKey: `fair-wait:${suffix}`, taskIds: [targetTaskId], mode: "any", timeoutMs: 60 * 60 * 1000,
+    } }, now,
+  })
+  const itemStartedId = eventId(`item-started:${itemId}`)
+  await store.appendEvent({ owner, id: itemStartedId, type: "item.started", itemId, correlationId: stepId, causationId: null,
+    idempotencyKey: `${key}:event:item-started:${itemId}`, payload: { itemId, type: "tool_call", phase: null } })
+  await store.appendEvent({ owner, id: eventId(`tool-started:${toolCallId}`), type: "tool_call.started", itemId,
+    correlationId: toolCallId, causationId: itemStartedId, idempotencyKey: `${key}:event:tool-started:${toolCallId}`,
+    payload: { toolCallId, toolName: "wait_subagents", taskId: lease.id } })
+}
+
 async function completeTarget(pool: Pool, store: PgSubagentTaskStore, fixture: Pick<Fixture, "sessionId" | "targetTaskId">,
   policy: ReturnType<typeof defaultSubagentPolicy>, suffix: string): Promise<void> {
   const ownerId = `fair-target-${suffix}`
@@ -97,6 +120,7 @@ async function seedWait(pool: Pool, userId: string, suffix: string, ready: boole
   if (!parentRecord) throw new Error("Fixture wait parent could not be claimed")
   const parentLease = leaseFor(parentRecord, parentOwnerId)
   const stepId = await startWaitingStep(pool, parentLease, suffix)
+  await persistWaitCall(pool, parentLease, stepId, target.id, suffix)
   const wait = await registerDurableSubagentWait(pool, {
     lease: parentLease, stepId, idempotencyKey: `fair-wait:${suffix}`, targetTaskIds: [target.id],
     mode: "any", timeoutMs: 60 * 60 * 1000, now: new Date(),
