@@ -118,7 +118,7 @@ function audit(resumeUpdatedAt = time) {
     audit: { verdict: 'pass', summary: 'Fixture materials checked.', findings: [], matchScore: 82, source: 'independent', auditedAt: time } }
 }
 
-async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unknown' | 'waiting_for_user' | 'waiting_for_authorization' | 'cancelled' | 'failed' | 'filling'; recordedInitially?: boolean; evidenceCase?: 'bound' | 'unbound' | 'unavailable'; taskFailure?: boolean; missing?: boolean; holdSelectedLetter?: boolean; selectedLetter?: boolean; firstPreparation?: boolean; failFirstAudit?: boolean; flowSave?: boolean; manualOutcome?: 'get-fails' | 'unknown'; search?: boolean; saveMode?: 'fail' | 'hold-success' | 'hold-fail'; twoResumes?: boolean; holdResumeContent?: boolean; snapshotResumeContent?: boolean; resumeRevalidationFails?: boolean; versionedScore?: boolean; holdOldAnalysis?: boolean; holdFirstAnalysisOnly?: boolean; auditCorrection?: boolean; holdAuditCorrection?: boolean; versions?: boolean; holdVersionRestore?: boolean; versionRestoreFails?: boolean; realAgent?: boolean; expiredApproval?: boolean; holdFirstTaskRead?: boolean; holdReturnOwnerA?: boolean; taskPerUser?: boolean; dashboardFourTasks?: boolean; agentJourney?: boolean } = {}) {
+async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unknown' | 'waiting_for_user' | 'waiting_for_authorization' | 'cancelled' | 'failed' | 'filling'; recordedInitially?: boolean; evidenceCase?: 'bound' | 'unbound' | 'unavailable'; taskFailure?: boolean; missing?: boolean; holdSelectedLetter?: boolean; selectedLetter?: boolean; firstPreparation?: boolean; failFirstAudit?: boolean; flowSave?: boolean; manualOutcome?: 'get-fails' | 'unknown'; search?: boolean; saveMode?: 'fail' | 'hold-success' | 'hold-fail'; twoResumes?: boolean; holdResumeContent?: boolean; snapshotResumeContent?: boolean; resumeRevalidationFails?: boolean; versionedScore?: boolean; holdOldAnalysis?: boolean; holdFirstAnalysisOnly?: boolean; auditCorrection?: boolean; holdAuditCorrection?: boolean; versions?: boolean; holdVersionRestore?: boolean; versionRestoreFails?: boolean; realAgent?: boolean; expiredApproval?: boolean; twoJobQuestions?: boolean; holdFirstTaskRead?: boolean; holdReturnOwnerA?: boolean; taskPerUser?: boolean; dashboardFourTasks?: boolean; agentJourney?: boolean } = {}) {
   let releaseReturnOwnerA = () => {}
   const returnOwnerAGate = new Promise<void>(resolve => { releaseReturnOwnerA = resolve })
   let releaseStaleJob = () => {}
@@ -146,7 +146,7 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
   const lettersGate = new Promise<void>(resolve => { releaseLetters = resolve })
   const state = { job: { ...job(), finalCoverLetterId: options.holdSelectedLetter || options.selectedLetter ? 'selected-letter' : null, finalResumeId: options.firstPreparation ? null : 'resume-1' }, resume: resume(), audit: options.auditCorrection ? { ...audit(), audit: { ...audit().audit, verdict: 'revise', findings: [{ area: 'resume', target: 'summary', severity: 'warning', title: 'Fix summary', evidence: 'Outdated wording', action: 'Apply correction', proposedValue: 'Audited v2 summary' }] } } : audit(options.stale ? '2026-10-29T10:00:00.000Z' : time),
     secondResume: { ...resume(), id: 'resume-2', name: 'Second fixture resume', targetJobId: null as string | null, content: { ...resume().content, summary: 'Second resume content.' } },
-    saveResponses: 0, armReturnOwnerA: false, returnOwnerAEntered: false, releaseReturnOwnerA, manualPosted: false, manualReadAvailable: false, hideResumeOnExport: false, fontRequests: [] as string[], activeUserId: 'fixture-user', agentStage: 'question' as 'question' | 'approval' | 'running' | 'unknown', requestOwners: [] as Array<{ path: string; method: string; userId: string }>, agentRequests: [] as Array<{ path: string; method: string; body?: unknown }>, writes: [] as Array<{ path: string; body: unknown }>, analysisRequests: [] as string[], analysisBodies: [] as unknown[], analysisCalls: [] as Array<{ path: string; body: unknown }>, unexpected: [] as string[], taskReads: 0, staleJobRequested: false, staleJobReturned: false, releaseStaleJob, taskStatusOverride: null as 'waiting_for_authorization' | null, firstTaskReadFinished: false, releaseFirstTaskRead, letterRequested: false, resumeContentRequested: false, releaseLetters, releaseSave, releaseResumeContent, releaseOldAnalysis, releaseAuditCorrection, releaseVersionRestore }
+    answeredJobA: false, saveResponses: 0, armReturnOwnerA: false, returnOwnerAEntered: false, releaseReturnOwnerA, manualPosted: false, manualReadAvailable: false, hideResumeOnExport: false, fontRequests: [] as string[], activeUserId: 'fixture-user', agentStage: 'question' as 'question' | 'approval' | 'running' | 'unknown', requestOwners: [] as Array<{ path: string; method: string; userId: string }>, agentRequests: [] as Array<{ path: string; method: string; body?: unknown }>, writes: [] as Array<{ path: string; body: unknown }>, analysisRequests: [] as string[], analysisBodies: [] as unknown[], analysisCalls: [] as Array<{ path: string; body: unknown }>, unexpected: [] as string[], taskReads: 0, staleJobRequested: false, staleJobReturned: false, releaseStaleJob, taskStatusOverride: null as 'waiting_for_authorization' | null, firstTaskReadFinished: false, releaseFirstTaskRead, letterRequested: false, resumeContentRequested: false, releaseLetters, releaseSave, releaseResumeContent, releaseOldAnalysis, releaseAuditCorrection, releaseVersionRestore }
   if (options.evidenceCase === 'unbound') state.job.finalResumeId = null
   if (options.evidenceCase === 'unavailable') state.hideResumeOnExport = true
   if (options.recordedInitially) state.job = { ...state.job, status: 'applied', workflowState: 'submitted' }
@@ -166,7 +166,27 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
       if (pathname === '/api/agent/roles' || pathname === '/api/agent/roles/custom') return json(route, [])
       if (pathname === '/api/agent/automations') return json(route, { automations: [] })
       if (pathname === '/api/agent/health') return json(route, { successRate: 100, captchaRate: 0, avgDurationMs: 1000, patternCacheRate: 100, last24hRuns: 1 })
-      if (pathname === '/api/agent/sessions') return json(route, { sessions: [{ id: 'original-session', goal: 'Fixture application task', status: 'waiting_for_approval', updatedAt: time }], lastOpenedSessionId: 'original-session' })
+      if (pathname === '/api/agent/sessions') return json(route, options.twoJobQuestions ? { sessions: ['session-a', 'session-b'].map(id => ({ id, goal: 'Fixture application task', status: 'waiting_for_user', updatedAt: time })), lastOpenedSessionId: 'session-a' } : { sessions: [{ id: 'original-session', goal: 'Fixture application task', status: 'waiting_for_approval', updatedAt: time }], lastOpenedSessionId: 'original-session' })
+      if (options.twoJobQuestions && /^\/api\/agent\/sessions\/session-[ab](?:\/|$)/.test(pathname)) {
+        const id = pathname.split('/')[4], prefix = `/api/agent/sessions/${id}`
+        const questionId = id === 'session-a' ? 'question-a' : 'question-b'
+        const turnId = id === 'session-a' ? 'turn-a' : 'turn-b'
+        const answered = id === 'session-a' && state.answeredJobA
+        const status = answered ? 'in_progress' : 'waiting_for_user'
+        if (pathname === `${prefix}/turns` && method === 'GET') {
+          const turn = { id: turnId, sessionId: id, source: 'automation', goal: 'Fixture application task', status, revision: 1, activeStepId: null, finalItemId: null, createdAt: time, updatedAt: time, completedAt: null }
+          return json(route, { turns: [turn], projection: { activeTurnId: turnId, activeTurn: { id: turnId, status, revision: 1, goal: turn.goal }, queuedInputCount: 0 } })
+        }
+        if (pathname === `${prefix}/tasks` && method === 'GET') return json(route, { tasks: [] })
+        if (pathname === `${prefix}/timeline` && method === 'GET') {
+          const question = { schemaVersion: 'agent-harness.v2', id: `item-${questionId}`, sessionId: id, turnId, stepId: null, taskId: null, type: 'question', status: 'started', phase: 'commentary', revision: 0, startedAt: null, completedAt: null, createdAt: time, updatedAt: time, sequence: '1', content: { waitKind: 'question', questionId, stage: 'profile', question: 'Confirm the same fixture fact?', options: [{ value: 'yes', label: 'Yes' }], answerAvailable: false, pending: true } }
+          return json(route, { items: answered ? [] : [question], approvalEvents: [] })
+        }
+        if (pathname === `${prefix}/events` && method === 'GET') return route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': fixture waiting\n\n' })
+        if (pathname === `${prefix}/questions/question-a` && method === 'POST' && id === 'session-a' && !state.answeredJobA) { state.answeredJobA = true; return json(route, { disposition: 'resolved' }, 202) }
+        if (pathname === prefix && (method === 'GET' || method === 'PATCH')) return json(route, { session: { id, goal: 'Fixture application task', status, updatedAt: time, tasks: [], approvals: [], applicationTasks: [], questions: [], artifacts: [], qualityScore: 100 } })
+        state.unexpected.push(`${method} ${pathname}`); return json(route, { error: 'Unexpected two-job request' }, 404)
+      }
       const prefix = '/api/agent/sessions/original-session'
       if (options.agentJourney && pathname.startsWith(prefix)) {
         const stage = state.agentStage
@@ -251,6 +271,7 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
     if (pathname === '/api/agent/application-tasks') {
       state.taskReads++
       if (options.taskFailure) return json(route, { error: 'Fixture unavailable' }, 500)
+      if (options.twoJobQuestions) return json(route, { tasks: [{ id: 'task-a', userId: 'fixture-user', jobId: 'outside-page', sessionId: 'session-a', status: state.answeredJobA ? 'filling' : 'waiting_for_user', checkpoint: state.answeredJobA ? null : 'form_answer_required', updatedAt: time, job: { company: 'Fixture Employer', role: 'Application flow engineer' } }, { id: 'task-b', userId: 'fixture-user', jobId: 'job-2', sessionId: 'session-b', status: 'waiting_for_user', checkpoint: 'form_answer_required', updatedAt: time, job: { company: 'Employer B', role: 'Role B' } }] })
       if (options.dashboardFourTasks) return json(route, { tasks: [1, 2, 3, 4].map(n => ({ id: `task-${n}`, userId: 'fixture-user', jobId: `job-${n}`, sessionId: `session-${n}`, status: 'waiting_for_user', checkpoint: 'form_answer_required', updatedAt: `2026-10-30T1${4 - n}:00:00.000Z`, job: { company: `Employer ${n}`, role: `Role ${n}` } })) })
       if (options.taskPerUser && state.activeUserId === 'fixture-b') return json(route, { tasks: [{ id: 'task-b', userId: 'fixture-b', jobId: 'job-b', sessionId: 'session-b', status: 'waiting_for_authorization', checkpoint: 'form_filled', updatedAt: time, job: { company: 'Fixture B', role: 'Engineer B' } }] })
       if (options.holdReturnOwnerA && state.activeUserId === 'fixture-user' && state.armReturnOwnerA) { state.returnOwnerAEntered = true; await returnOwnerAGate }
@@ -266,6 +287,7 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
     }
     if (pathname === '/api/dashboard') return json(route, { stats: { total: 0, saved: 0, applied: 0, inProgress: 0, interviews: 0, offers: 0, rejected: 0, thisWeek: 0 }, savedJobs: options.dashboardFourTasks ? [{ id: 'job-4', company: 'Employer 4', role: 'Role 4', score: 60, createdAt: time, url: null }] : [], followUpsDue: options.dashboardFourTasks ? [{ id: 'job-4', company: 'Employer 4', role: 'Role 4', status: 'applied', followUpAt: time }] : [], activity: [], applicationDays: [], interviewsScheduled: [], todayRecommendations: [], agentConfig: null, hasResume: true })
     if (pathname === '/api/jobs') return json(route, { jobs: url.searchParams.has('finalResumeId') || url.searchParams.get('pageSize') === '30' ? [state.job] : [], total: 80, statusCounts: { saved: 80, applied: 0, interview: 0, offer: 0, rejected: 0 } })
+    if (options.twoJobQuestions && pathname === '/api/jobs/job-2') return json(route, { ...state.job, id: 'job-2', company: 'Employer B', role: 'Role B' })
     if (options.dashboardFourTasks && pathname === '/api/jobs/stale-job') { state.staleJobRequested = true; await staleJobGate; await json(route, { ...state.job, id: 'stale-job', company: 'Stale Employer', role: 'Stale Role' }); state.staleJobReturned = true; return }
     if (pathname === `/api/jobs/${state.job.id}` && state.manualPosted && options.manualOutcome === 'get-fails' && !state.manualReadAvailable) return json(route, { error: 'Fixture read unavailable' }, 500)
     if (pathname === `/api/jobs/${state.job.id}` && state.manualPosted && options.manualOutcome === 'get-fails' && state.manualReadAvailable) return json(route, { ...state.job, status: 'saved' })
@@ -1845,6 +1867,36 @@ test('an uncertain version restore remains guarded against automatic save or ret
     expect(state.writes.filter(write => write.path.endsWith('/versions'))).toHaveLength(1)
     await expect(page.locator('[data-resume-editor]').getByText('Local edit after uncertain restore', { exact: false }).first()).toBeVisible()
   } finally { state.releaseSave() }
+})
+
+
+test('identical questions on two applications remain scoped to their original sessions', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises the real desktop Agent shell')
+  const state = await install(page, { realAgent: true, twoJobQuestions: true })
+  await page.goto(`${origin}/?shell=1&page=jobs&highlight=outside-page`)
+  await expect(page.getByRole('dialog')).toContainText('Application flow engineer')
+  await page.getByRole('link', { name: 'Answer in the original task' }).click()
+  await expect(page).toHaveURL(/sessionId=session-a/)
+  await page.getByRole('button', { name: /^Tasks & results/ }).click()
+  const first = page.locator('[data-agent-question-card="true"]')
+  await expect(first).toContainText('Confirm the same fixture fact?')
+  await first.getByRole('button', { name: 'Yes', exact: true }).click()
+  await first.getByRole('button', { name: 'Send answer', exact: true }).click()
+  await expect.poll(() => state.answeredJobA).toBe(true)
+  await page.goto(`${origin}/?shell=1&page=jobs&highlight=job-2`)
+  await expect(page.getByRole('dialog')).toContainText('Employer B')
+  await page.getByRole('link', { name: 'Answer in the original task' }).click()
+  await expect(page).toHaveURL(/sessionId=session-b/)
+  await page.getByRole('button', { name: /^Tasks & results/ }).click()
+  const second = page.locator('[data-agent-question-card="true"]')
+  await expect(second).toContainText('Confirm the same fixture fact?')
+  await expect(second.getByRole('button', { name: 'Yes', exact: true })).toBeEnabled()
+  await expect(second.getByRole('button', { name: 'Send answer', exact: true })).toBeVisible()
+  const posts = state.agentRequests.filter(item => item.method === 'POST')
+  expect(posts).toHaveLength(1)
+  expect(posts[0]).toMatchObject({ path: '/api/agent/sessions/session-a/questions/question-a', body: { expectedTurnId: 'turn-a', expectedRevision: 1, answer: 'yes' } })
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
 })
 
 
