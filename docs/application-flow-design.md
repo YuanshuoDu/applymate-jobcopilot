@@ -15,15 +15,25 @@ Agent 负责原任务的执行和审批，招聘消息负责查看回复。
 ### 手动申请
 
 1. 在“发现职位”搜索，保存后点击“查看此申请”。保存不会提交申请。
-2. 在申请详情选择基础简历并“准备申请材料”。已有材料继续复用。
-3. 遇到“补充信息”时，进入具体问题；只填写真实情况，不确认没有依据的经历。
-4. 需要手动修改时，展开简历卡并“编辑此简历”。完成保存后“返回此申请”，
-   系统恢复原职位和列表条件。
-5. “确认申请材料”表示选择此职位使用的版本，不会授权向雇主提交。
-6. 求职信可选；明确未选择的求职信不会被其他草稿自动替代。
-7. 材料检查有效后，下载此申请材料并“前往雇主网站”，在网站完成提交。
+2. 在申请详情选择基础简历并“准备申请材料”。已有材料继续复用。准备过程中，
+   如果需要事实补充或内容修正，先查看具体问题，只填写真实情况。
+3. 需要手动修改时，展开简历卡并“编辑此简历”。完成保存后“返回此申请”，
+   系统恢复原职位和列表条件。查看、返回或刷新不会启动 AI 匹配分析；需要时在
+   简历页主动点击“分析匹配度”，简历加载或刷新时请等待完成后再操作。
+4. 求职信可选。没有选择时不会自动生成或绑定其他草稿；如需使用，展开求职信
+   卡，选择“选择或创建求职信（可选）”，在简历页创建或选择，再返回申请确认。
+   已选求职信尚未加载时，刷新并保留原选择。需要修正求职信但尚未选择时，先选择。
+5. “确认申请材料”表示选择此职位使用的版本，不会授权向雇主提交。材料内容或
+   选择变化后，检查当前版本；旧检查结果不代表新版本已通过。
+6. 材料检查通过且仍适用于当前版本后，点击下载申请材料 ZIP。浏览器在生成前读取
+   并核对所选材料和已通过的检查，生成后再次读取并比较；变化或读取失败时不会保存
+   ZIP，请刷新、核对并重新检查。此复核不是原子操作，下载后仍需自行检查文件。
+7. 打开 ZIP，逐页核对简历和所选求职信的文字、分页、字体和排版，再“前往雇主网站”
+   完成申请。PDF 排版可能与网页预览不同，字体覆盖有限，遇到不支持的字符时会阻止导出并提示；常见换行、制表符、
+   不间断空格和可组合音标会在 PDF 中规范化，原材料不变。
 8. 只有实际提交完成后，点击“记录我已在雇主网站提交”。这是用户报告的手动记录，
-   不能替代雇主回执。
+   不能替代雇主回执。若显示记录已接收但状态待刷新，或结果未知，点击“刷新记录状态”
+   只读取状态；若仍未确认，先核对申请历史及雇主回执，不重复记录。
 9. 在申请历史与招聘消息查看后续。材料编辑、下载和打开网站都不会记作已提交。
 
 ### Agent 协助申请
@@ -43,11 +53,15 @@ Agent 负责原任务的执行和审批，招聘消息负责查看回复。
 | 状态待刷新 | 当前任务信息不足，刷新或打开原 Agent 查看 |
 | 等待审核 | 在原任务查看本次内容；页面跳转不会代替授权 |
 | 提交结果待核实 | 查看记录和回执，保持结果未知，不自动重试 |
+| 手动记录状态待刷新 | 点击“刷新记录状态”；若仍未确认，先核对记录和雇主回执 |
 
 如果登录状态变化时简历还有未保存的编辑，请保留当前标签页，按提示在新标签页
 登录原账号并刷新登录状态。恢复界面提供可复制的内存草稿；请先复制，再打开最新
 简历逐项核对，系统不会自动覆盖已保存版本。确认关闭或刷新当前页后草稿会消失。
 恢复历史版本会立即修改已保存的简历；若结果无法确认，先重新加载核对，不要重复恢复。
+草稿恢复到最新简历后，只有原来进入编辑器时存在可信的职位与返回列表上下文，才会
+恢复该职位和筛选条件；否则不会从当前其他账号的地址猜测关联。
+查看、返回或刷新简历不会自动启动 AI 分析；需要时请点击“分析匹配度”。
 
 首页和“申请管理 → 需要我处理”展示最近最多 100 个申请任务中的待处理事项，
 不能当作全部申请总数。每条可进入原申请或原任务；处理后刷新状态。
@@ -116,7 +130,11 @@ The detail drawer follows this order:
 
 Preparation actions use the existing endpoints. They reuse selected documents
 and target only existing flagged corrections. A confirmed resume-only package
-does not silently acquire a draft cover letter.
+does not silently acquire a draft cover letter. First preparation does not create
+or bind an unselected optional letter. A user who wants one can open the cover
+letter section, choose or create it in Resume, and confirm that selection for the
+application. An already selected letter remains selected; a selected letter that
+has not loaded is not treated as absent.
 
 ## 5. Material checks and selection
 
@@ -161,6 +179,29 @@ Opening links and downloading files never call the manual-record endpoint. The
 manual action records the candidate's report; it is not independent employer
 receipt verification. The existing activity entry preserves that distinction.
 
+The browser ZIP download reads the account-owned job, selected saved documents
+and existing passing audit before rendering. It then reads them again and compares
+the snapshot before saving; missing, changed or unreadable material prevents that
+download. These are read-only checks of an existing audit, not a new AI audit.
+The client-side checks and file save are not atomic with concurrent server changes;
+review each downloaded PDF before use. A ZIP contains the selected resume PDF,
+the selected cover letter PDF if present, and metadata. PDF pagination, layout
+and font rendering can differ from the web preview. Character and font coverage
+is limited to what is verified in the actual downloaded files. Unsupported glyphs,
+format controls and uncomposable combining marks block export. PDF rendering
+normalizes line endings, tabs, non-breaking spaces and NFC without changing the
+saved source; a non-breaking space becomes an ordinary breakable space.
+
+For manual recording, the current tab stores a minimal account/job status marker
+before sending the request. An accepted request with a failed read, or an unknown
+request outcome, keeps the record action unavailable. The user can refresh the
+record status using a read-only request; a saved status or failed read does not
+prove the recording failed and does not trigger another request. If tab storage is
+unavailable, the action is withheld. This marker is scoped to the browser tab: it
+does not provide cross-tab, cross-device or server-side idempotency, and clearing
+or losing tab storage removes that protection. Check application history and the
+employer receipt before deciding what to do next.
+
 Resume waits for its current save chain before application-return and shell
 navigation, and keeps the editor open when saving fails. Switching resumes also
 waits for that chain. A browser refresh or close uses the browser’s unsaved-change
@@ -168,16 +209,23 @@ prompt. Same-document history navigation is guarded where supported; the fallbac
 can retain the editor without preserving forward history. If authentication changes
 while editing, an account-bound draft remains in this page's memory. After the
 original account signs in again, the user can copy and compare it with the latest
-saved resume; it is never automatically written into an account. The browser asks
-before closing or refreshing a page holding a draft, but a confirmed close or reload
+saved resume; it is never automatically written into an account. When the initial
+editor entry had a reliable application return context for that resume, the draft
+also retains that original job and sanitized list filters, page, view, sort and
+attention state. Recovery does not use another account's current URL or invent a
+job link when that context is absent. The browser asks before closing or refreshing
+a page holding a draft, but a confirmed close or reload
 removes that in-memory copy. Real authentication and cross-device recovery have not
 been verified by the mocked browser tests.
 
 If an audit correction and a new local edit overlap, automatic saving is paused.
 The user is asked to copy the local edits, reload and compare the latest saved
 content. There is no automatic merge or complete draft recovery for this conflict.
-Analysis waits for the resume refresh and binds cached results to the actual
-resume version; on refresh failure it identifies the cached version instead.
+Resume analysis starts only when the user selects Analyze match or re-analyze.
+Viewing, returning or refreshing never starts analysis or an audit. Analysis waits
+for the resume refresh and binds cached results to the actual resume version;
+on refresh failure it identifies the cached version instead. An unchanged version
+may reuse its existing result; opening the page does not request a new analysis.
 Restoring a historical version is a server-side change: existing edits are saved
 first, and an uncertain result requires checking the latest saved resume before
 trying again. New edits made during restoration are retained for manual comparison.
@@ -237,7 +285,10 @@ Adding that association remains a separately scoped data requirement.
 | Area | Modules |
 | --- | --- |
 | Navigation and list restoration | `application-navigation`, `application-list-state` |
-| Material identity and freshness | `application-material-selection`, `application-materials` |
+| Material identity and freshness | `application-material-selection`, `application-materials`, `application-analysis-cache` |
+| Browser ZIP verification and rendering | `application-export-snapshot`, `bundle`, `resume-pdf`, `cover-letter-pdf` |
+| Manual record status | `application-manual-record` |
+| Account-bound in-memory recovery | `application-recovery-draft`, `application-recovery-navigation` |
 | Saved-search identity and cancellation | `application-search-state`, `application-search-save` |
 | Existing task projection | `application-task-model`, `useApplicationTasks`, `application-task-card` |
 | Progress and Dashboard guidance | `application-progress`, `application-dashboard-guidance` |

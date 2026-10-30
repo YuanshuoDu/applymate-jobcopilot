@@ -280,6 +280,9 @@
   .resume-top-save { margin-left: 0; }
   .resume-library-layout { display: flex !important; flex-direction: column; }
   .resume-library-layout.is-library-collapsed { min-width: 0; }
+  /* Stacked sections must keep their natural height inside the shared scroll area. */
+  .resume-library-sidebar, .resume-workspace, .resume-ai-column { flex: 0 0 auto !important; }
+  .resume-ai-panel { flex: 0 0 auto; }
   .resume-library-sidebar { width: auto; flex-basis: auto; border-right: 0; border-bottom: 1px solid #ebeaf6; }
   .resume-library-list { grid-template-columns: minmax(0, 1fr); }
   .resume-workspace { padding: 16px 12px !important; }

@@ -38,8 +38,7 @@ function renderDialog(initialAudit: ApplicationAudit | null, coverLetterContent:
       onLinkJob={vi.fn()}
       onReviewAudit={vi.fn()}
       onConfirm={vi.fn().mockResolvedValue(true)}
-      onDownload={vi.fn().mockResolvedValue(undefined)}
-      exportedPackFolder={null}
+      onOpenApplication={vi.fn()}
       {...overrides}
     />,
   )

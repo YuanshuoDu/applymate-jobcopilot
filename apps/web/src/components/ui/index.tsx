@@ -2,7 +2,7 @@
 
 import React, { createContext, useCallback, useContext, useMemo, useState } from 'react'
 import type { JobStatus } from '@/lib/types'
-import { useI18n } from '@/lib/i18n'
+import { TRANSLATION_KEYS, translate, useI18n, type Lang } from '@/lib/i18n'
 
 export { UserAvatar } from './UserAvatar'
 
@@ -106,14 +106,33 @@ const TOAST_TRANSLATION_KEYS: Record<string, string> = {
   'Deleted': 'toast.deleted', 'Cover letter version removed': 'toast.coverLetterDeleted', 'New version created': 'toast.newVersionCreated', 'Cover letter saved as PDF': 'toast.coverLetterPdfDownloaded', 'Could not render cover letter PDF': 'toast.coverLetterPdfError', 'Scanning for new matches': 'toast.scanningMatches', 'Agent paused': 'toast.agentPaused', 'No more auto-actions until resumed': 'toast.agentPausedDetail', 'Agent will use updated configuration': 'toast.agentSettingsSaved', 'Profile photo updated': 'toast.profilePhotoUpdated', 'Enter current and new password': 'toast.passwordRequired', 'New password and confirmation do not match': 'toast.passwordMismatch', 'Sign in again to continue': 'toast.signInAgain', 'Reload the page to restart the setup wizard': 'toast.reloadOnboarding', 'Email template copied to clipboard': 'toast.emailCopied', 'Please try again': 'toast.tryAgain', 'Create or import a resume first': 'toast.createResumeFirst', 'Select a resume first': 'toast.selectResumeFirst', 'Choose a saved job first': 'toast.selectSavedJob', 'Go to Settings → Profile to restart onboarding': 'toast.restartOnboarding', 'Choose the opportunity this resume should be used for': 'toast.chooseOpportunity', 'Choose a job in the Linked opportunity panel': 'toast.chooseLinkedJob', 'Create another version before deleting this resume.': 'toast.createResumeVersion', 'The resume is no longer marked as Final for that job': 'toast.jobLinkRemovedDetail',
 }
 
+// For non-English locales, only bundled strings may bypass the generic
+// message. This retains translated t(key) values without exposing arbitrary
+// server errors, which can contain private details.
+const trustedToastTexts = new Map<Lang, Set<string>>()
+const TRUSTED_TOAST_PREFIXES = ['application.', 'resume.', 'jobs.', 'toast.', 'common.']
+export function localizeToastText(lang: Lang, text?: string): string | undefined {
+  // Preserve the existing English behavior; English callers already provide
+  // display text directly. Other locales fail closed for unknown content.
+  if (!text || lang === 'en') return text
+  const key = Object.prototype.hasOwnProperty.call(TOAST_TRANSLATION_KEYS, text) ? TOAST_TRANSLATION_KEYS[text] : undefined
+  if (key) return translate(lang, key)
+  let trusted = trustedToastTexts.get(lang)
+  if (!trusted) {
+    trusted = new Set(TRANSLATION_KEYS
+      .filter(translationKey => TRUSTED_TOAST_PREFIXES.some(prefix => translationKey.startsWith(prefix)))
+      .map(translationKey => translate(lang, translationKey)))
+    trustedToastTexts.set(lang, trusted)
+  }
+  return trusted.has(text) ? text : translate(lang, 'toast.genericDetail')
+}
+
 export function ToastProvider({ children }: { children: React.ReactNode }) {
-  const { lang, t } = useI18n()
+  const { lang } = useI18n()
   const [toasts, setToasts] = useState<ToastItem[]>([])
   const localize = useCallback((text?: string) => {
-    if (!text || lang === 'en') return text
-    const key = TOAST_TRANSLATION_KEYS[text]
-    return key ? t(key) : t(text === 'Error' ? 'toast.error' : 'toast.genericDetail')
-  }, [lang, t])
+    return localizeToastText(lang, text)
+  }, [lang])
   const add = useCallback((variant: ToastItem['variant'], title: string, description?: string) => {
     const id = Date.now()
     setToasts(items => [...items, { id, variant, title: localize(title) ?? title, description: localize(description) }])

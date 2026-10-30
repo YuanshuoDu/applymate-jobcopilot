@@ -1,15 +1,18 @@
 'use client'
 
+import { isApplicationPdfUnsupportedCharactersError } from '@/lib/application-pdf-errors'
 import React, { useState, useEffect, useLayoutEffect, useRef } from 'react'
 import { useSession } from 'next-auth/react'
 import { useI18n } from '@/lib/i18n'
 import { useNav } from '@/lib/nav-context'
 import { openApplication } from '@/lib/application-navigation'
+import { readApplicationListState } from '@/lib/application-list-state'
 import { auditMatchesCurrentMaterials } from '@/lib/application-materials'
 import { applicationMaterialAssignment, selectApplicationCoverLetter } from '@/lib/application-material-selection'
 import { sameApplicationAudit, type ApplicationAuditIdentity } from '@/lib/application-audit-identity'
 import { guardApplicationUnload } from '@/lib/application-unload-guard'
 import { createApplicationAnalysisRequestPool } from '@/lib/application-analysis-request'
+import { mayUpdateAnalysisCache } from '@/lib/application-analysis-cache'
 import { mayApplyResumeRevalidation } from '@/lib/application-resume-revalidation'
 import { versionRestoreDisposition } from '@/lib/application-version-restore'
 import { mayApplyApplicationAnalysis } from '@/lib/application-analysis-guard'
@@ -115,9 +118,8 @@ import { UploadResumeModal } from '@/components/resume/UploadResumeModal'
 import { ResumeIntakeDialog } from '@/components/resume/ResumeIntakeDialog'
 import type { DragHandleProps } from '@/components/resume/SectionHeader'
 import type { AiFieldContext } from '@/components/resume/AiFieldSuggestion'
-import { exportApplicationPackLocally } from '@/lib/bundle'
 import { downloadResumePdf } from '@/lib/resume-export'
-import { analysisTargetKey, replaceSectionSuggestions, shouldPreserveAnalysis, shouldStartAutomaticAnalysis } from '@/lib/resume-analysis-state'
+import { analysisTargetKey, replaceSectionSuggestions, shouldPreserveAnalysis } from '@/lib/resume-analysis-state'
 import { formatResumeChangeValue, type ResumeChange, type ResumeChangeSection, type ResumeChangeSource } from '@/lib/resume-change-diff'
 import { targetForAuditFinding } from '@/lib/application-audit'
 
@@ -592,6 +594,11 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   const [returnToJobs] = useState(() => new URLSearchParams(window.location.search).get('returnToJobs') === '1')
   const [returnJobId] = useState(() => new URLSearchParams(window.location.search).get('returnJobId'))
   const [returnResumeId] = useState(() => new URLSearchParams(window.location.search).get('resumeId'))
+  // Capture only the original application's allowlisted list context. Never read it from a later account's URL.
+  const [recoveryListContext] = useState(() => ({
+    list: readApplicationListState(typeof window === 'undefined' ? '/' : window.location.href),
+    attention: typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('jobsAttention') === '1',
+  }))
   const toast = useToast()
   const [confirm, ConfirmDialog] = useConfirm()
   const { t } = useI18n()
@@ -702,12 +709,12 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   const analysisTargetRef = useRef<string | null>(null)
   const analysisRevisionRef = useRef<string | null>(null)
   const analysisSelectionRef = useRef<string | null>(null)
-  const automaticAnalysisAttemptRef = useRef<string | null>(null)
+  const analysisRequestSerialRef = useRef(0)
+  const latestAnalysisRequestRef = useRef(new Map<string, number>())
   const analysisRequestPool = useRef(createApplicationAnalysisRequestPool<[
     PromiseSettledResult<{ data: ScoreResult | null; error: string | null }>,
     PromiseSettledResult<{ data: { suggestions: Suggestion[] } | null; error: string | null }>,
-  ]>(result => result[0].status === 'fulfilled' && Boolean(result[0].value.data)
-    && result[1].status === 'fulfilled' && Boolean(result[1].value.data)))
+  ]>())
   // True only on the very first resume load (initial mount / tab-remount).
   // Prevents the selectedResumeId effect from wiping cached analysis on remount.
   const isFirstResumeLoad = useRef(true)
@@ -733,7 +740,6 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   const [showTemplates,   setShowTemplates]   = useState(false)
   const [showCoverLetter, setShowCoverLetter] = useState(false)
   const [showFinalConfirm, setShowFinalConfirm] = useState(false)
-  const [exportedPackFolder, setExportedPackFolder] = useState<string | null>(null)
   const [showNewResume,   setShowNewResume]   = useState(false)
   const [renamingResume,  setRenamingResume]  = useState<ResumeListItem | null>(null)
   const [showUploadModal,   setShowUploadModal]   = useState(false)
@@ -1098,7 +1104,6 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     const targetKey = analysisTargetKey(selectedResumeId, selectedJobId)
     if (analysisSelectionRef.current !== targetKey) {
       analysisSelectionRef.current = targetKey
-      automaticAnalysisAttemptRef.current = null
       analysisRevisionRef.current = null
       analysisEpochRef.current += 1
       setScoring(false)
@@ -1120,39 +1125,6 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     setSuggestions([])
     analysisTargetRef.current = null
   }, [selectedJobId, selectedResumeId, contentRevision, contentResumeId, contentValidated])
-
-  useEffect(() => {
-    if (!selectedJobId || !content || !contentValidated || contentResumeId !== selectedResumeId || jobs.length === 0) return
-    // Skip if we already have analysis results for this exact job (e.g. restored from
-    // cache after tab navigation). The user can still force a re-run via the ↻ button.
-    const cached = getAnalysisCache(selectedResumeId, selectedJobId, contentRevision)
-    if (cached) {
-      const targetKey = analysisTargetKey(selectedResumeId, selectedJobId)
-      if (analysisTargetRef.current !== targetKey) {
-        setScoreResult(cached.score)
-        setSuggestions(cached.suggs)
-        analysisTargetRef.current = targetKey
-        analysisRevisionRef.current = contentRevision
-      }
-      return
-    }
-    // Edits intentionally leave the existing suggestions visible. The stale
-    // banner offers the user an explicit re-analysis action, avoiding a
-    // save -> analyze -> replace-the-panel loop and unnecessary token usage.
-    const targetKey = analysisTargetKey(selectedResumeId, selectedJobId)
-    if (!targetKey || regeneratingSection || automaticAnalysisAttemptRef.current === targetKey || !jobs.some(job => job.id === selectedJobId)) return
-    if (!shouldStartAutomaticAnalysis({
-      targetKey,
-      activeTargetKey: analysisTargetRef.current,
-      hasScore: Boolean(scoreResult),
-      hasContent: Boolean(content),
-      hasJobs: jobs.length > 0,
-      contentChangedSinceAnalysis,
-    })) return
-    automaticAnalysisAttemptRef.current = targetKey
-    void runAnalysis(content, selectedJobId, true)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedJobId, selectedResumeId, contentRevision, contentResumeId, contentValidated, jobs, content, contentChangedSinceAnalysis, regeneratingSection])
 
   const [flashField, setFlashField] = useState('')
 
@@ -1247,8 +1219,12 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     el.focus(); setDirty(true)
   }
 
-  async function runAnalysis(c: ResumeContent, jobId: string, automatic = false) {
-    if (regeneratingSection || !contentValidated || contentResumeId !== selectedResumeId) return
+  async function runAnalysis(c: ResumeContent, jobId: string) {
+    if (!contentValidated || contentResumeId !== selectedResumeId) {
+      toast.info(t('resume.analysisLoadingTitle'), t('resume.analysisLoadingDetail'))
+      return
+    }
+    if (regeneratingSection) return
     const requestUserId = resumeUserIdRef.current
     if (!requestUserId || !selectedResumeId) return
     const job = jobs.find(j => j.id === jobId); if (!job) return
@@ -1257,14 +1233,32 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     const editRevision = editRevisionRef.current
     const analyzedRevision = contentRevision
     const wasDirty = dirtyRef.current
+    const targetKey = JSON.stringify([requestUserId, selectedResumeId, jobId])
+    const requestSerial = ++analysisRequestSerialRef.current
+    latestAnalysisRequestRef.current.set(targetKey, requestSerial)
     setScoring(true); setSuggesting(true)
     const start = () => Promise.allSettled([
       apiMutate<ScoreResult>('/api/ai/score', 'POST', { resumeContent: c, jobTitle: job.role, jobCompany: job.company, jobDescription: job.description ?? undefined }),
       apiMutate<{ suggestions: Suggestion[] }>('/api/ai/suggest', 'POST', { resumeContent: c, jobTitle: job.role, jobCompany: job.company, jobDescription: job.description ?? undefined }),
     ])
-    const requestKey = JSON.stringify([requestUserId, selectedResumeId, jobId, analyzedRevision])
-    if (!automatic && analyzedRevision) analysisRequestPool.current.forget(requestKey)
-    const [scoreRes, suggestRes] = await (automatic && analyzedRevision && !wasDirty ? analysisRequestPool.current(requestKey, start) : start())
+    // Repeated clicks for the same unchanged content share only the in-flight request.
+    // A later deliberate re-analysis starts a fresh request.
+    const requestKey = JSON.stringify([requestUserId, selectedResumeId, jobId, analyzedRevision, editRevision])
+    const [scoreRes, suggestRes] = await analysisRequestPool.current(requestKey, start)
+    // Cache the result for its original material even if the user is now viewing
+    // another job. A changed saved version cannot reuse this versioned entry.
+    const isLatestRequest = latestAnalysisRequestRef.current.get(targetKey) === requestSerial
+    if (isLatestRequest) latestAnalysisRequestRef.current.delete(targetKey)
+    const existingRevision = loadAnalysisCache()?.[cacheKey(selectedResumeId, jobId)]?.resumeUpdatedAt
+    if (isLatestRequest && mountedRef.current && requestUserId === resumeUserIdRef.current && !wasDirty && analyzedRevision
+      && mayUpdateAnalysisCache(existingRevision, analyzedRevision)
+      && scoreRes.status === 'fulfilled' && scoreRes.value.data) {
+      saveCache({
+        resumeId: selectedResumeId, jobId, resumeUpdatedAt: analyzedRevision,
+        jobTitle: job.role, jobCompany: job.company, score: scoreRes.value.data,
+        suggs: suggestRes.status === 'fulfilled' ? (suggestRes.value.data?.suggestions ?? []) : [],
+      })
+    }
     if (!mayApplyApplicationAnalysis({
       mounted: mountedRef.current,
       userId: requestUserId,
@@ -1296,21 +1290,6 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     } else { const msg = scoreRes.status === 'fulfilled' ? (scoreRes.value.error ?? 'Unknown') : scoreRes.reason; toast.error('Analysis failed', typeof msg === 'string' ? msg : 'Check ANTHROPIC_API_KEY') }
     if (suggestRes.status === 'fulfilled' && suggestRes.value.data?.suggestions) {
       setSuggestions(suggestRes.value.data.suggestions)
-    }
-    // Persist to localStorage — include resumeId so cache is resume-scoped
-    if (scoreRes.status === 'fulfilled' && scoreRes.value.data && analyzedRevision && !wasDirty) {
-      try {
-        const latestJob = jobs.find(j => j.id === selectedJobId)
-        saveCache({
-          resumeId: selectedResumeId,
-          jobId: selectedJobId,
-          resumeUpdatedAt: analyzedRevision,
-          jobTitle: latestJob?.role ?? '',
-          jobCompany: latestJob?.company ?? '',
-          score: scoreRes.value.data,
-          suggs: suggestRes.status === 'fulfilled' ? (suggestRes.value.data?.suggestions ?? []) : [],
-        })
-      } catch {}
     }
   }
 
@@ -1393,6 +1372,8 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       userId: owner, resumeId: selectedResumeIdRef.current, name: latestResumeName.current,
       content: structuredClone(currentContent), sectionOrder: [...latestSectionOrder.current],
       templateId: latestTemplateId.current, templateOptions: structuredClone(latestTemplateOptions.current),
+      ...(returnToJobs && returnJobId && returnResumeId === selectedResumeIdRef.current
+        ? { applicationContext: { jobId: returnJobId, ...recoveryListContext } } : {}),
     })
   }
   useLayoutEffect(() => {
@@ -1407,8 +1388,10 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       userId: owner, resumeId: selectedResumeId, name: resumeName,
       content: structuredClone(content), sectionOrder: [...sectionOrder],
       templateId, templateOptions: structuredClone(templateOptions),
+      ...(returnToJobs && returnJobId && returnResumeId === selectedResumeId
+        ? { applicationContext: { jobId: returnJobId, ...recoveryListContext } } : {}),
     })
-  }, [resumeUserId, selectedResumeId, content, sectionOrder, templateId, templateOptions, resumeName, dirty, saving, publishRecoveryDraft])
+  }, [resumeUserId, selectedResumeId, content, sectionOrder, templateId, templateOptions, resumeName, dirty, saving, publishRecoveryDraft, returnToJobs, returnJobId, returnResumeId, recoveryListContext])
 
   function handleSave(): Promise<boolean> {
     if (correctionConflictRef.current) {
@@ -1804,7 +1787,6 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   const resumeLinkedJob = jobs.find(j => j.id === selectedResume?.targetJobId)
     ?? jobs.find(j => j.finalResumeId === selectedResumeId)
     ?? null
-  const confirmedJob = jobs.find(j => j.finalResumeId === selectedResumeId) ?? null
   // The sidebar must only describe an actual resume ↔ job link. Falling back to
   // a previously selected job kept stale opportunity details visible after a
   // resume switch or after cancelling a link.
@@ -2113,17 +2095,6 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     return true
   }
 
-  async function downloadApplicationPack() {
-    if (!confirmedJob) return
-    try {
-      const result = await exportApplicationPackLocally(confirmedJob.id, Boolean(exportedPackFolder))
-      setExportedPackFolder(result.folderPath)
-      toast.success(exportedPackFolder ? 'Job folder opened' : 'Application PDFs saved', result.folderPath)
-    } catch (error) {
-      toast.error('Could not create application pack', error instanceof Error ? error.message : 'Please try again')
-    }
-  }
-
   async function exportCurrentResumePdf() {
     if (!selectedResumeId || !content || !selectedResume) { toast.info(t('resume.selectFirst')); return }
     if (exportingPdf) return
@@ -2140,7 +2111,8 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       toast.success(t('resume.exportSuccess'))
     } catch (error) {
       console.error('[resume] PDF export failed', error)
-      toast.error(t('resume.exportError'), t('resume.exportErrorFallback'))
+      if (isApplicationPdfUnsupportedCharactersError(error)) toast.error(t('application.downloadUnsupportedTitle'), t('application.downloadUnsupportedDetail'))
+      else toast.error(t('resume.exportError'), t('resume.exportErrorFallback'))
     } finally {
       setExportingPdf(false)
     }
@@ -2643,7 +2615,13 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
             suggesting={suggesting}
             noJobSelected={!selectedJobId}
             onApplySuggestion={applySuggestion}
-            onAnalyze={() => content && selectedJobId && runAnalysis(content, selectedJobId)}
+            onAnalyze={() => {
+              if (!content || !selectedJobId) {
+                toast.info(t('resume.analysisLoadingTitle'), t('resume.analysisLoadingDetail'))
+                return
+              }
+              void runAnalysis(content, selectedJobId)
+            }}
             onAddKeyword={kw => patch(p => ({ ...p, skills: [...(p.skills ?? []), kw] }), 'skills')}
             onApplyTargeted={applyTargeted}
             onEditSection={sec => setEditSection(sec)}
@@ -2761,8 +2739,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
             window.setTimeout(() => document.querySelector<HTMLElement>('[data-resume-audit-card]')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 0)
           }}
           onConfirm={confirmApplicationPack}
-          onDownload={downloadApplicationPack}
-          exportedPackFolder={exportedPackFolder}
+          onOpenApplication={() => { if (resumeLinkedJob) void returnToApplication(resumeLinkedJob.id) }}
         />
       )}
       {renamingResume && <RenameResumeModal resume={renamingResume} onClose={() => setRenamingResume(null)} onRename={name => handleRenameResume(renamingResume, name)} />}

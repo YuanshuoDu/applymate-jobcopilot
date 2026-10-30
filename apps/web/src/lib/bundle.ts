@@ -1,6 +1,8 @@
+import { isApplicationPdfUnsupportedCharactersError } from '@/lib/application-pdf-errors'
 // apps/web/src/lib/bundle.ts
 // M9: Client-side ZIP bundle download — resume + cover letter + meta.json
 import type { Resume, CoverLetter, Job } from '@/lib/types'
+import { readApplicationExportSnapshot, sameApplicationExportSnapshot, type ApplicationExportSnapshot } from './application-export-snapshot'
 
 export class BundleError extends Error {}
 
@@ -18,7 +20,9 @@ export async function exportApplicationPackLocally(jobId: string, openFolder = f
 }
 
 function safe(s: string): string {
-  return (s.replace(/[<>:"/\\|?*\x00-\x1f]/g, '-').trim().slice(0, 80)) || 'Untitled'
+  const name = s.replace(/[<>:"/\\|?*\x00-\x1f]/g, '-').trim().slice(0, 80)
+  // Dot-only ZIP path components can escape the destination on extraction.
+  return name && !/^[.\s]+$/.test(name) ? name : 'Untitled'
 }
 
 function buildMeta(job: Job, resume: Resume, coverLetter: CoverLetter | null): object {
@@ -35,35 +39,19 @@ function buildMeta(job: Job, resume: Resume, coverLetter: CoverLetter | null): o
   }
 }
 
-export async function downloadJobBundle(jobId: string): Promise<void> {
-  // 1. Fetch job with final assets
-  const jobRes = await fetch(`/api/jobs/${jobId}`)
-  if (!jobRes.ok) throw new BundleError('Could not load job')
-  const job: Job = await jobRes.json()
+/** Capture and check the selected audited documents before saving to the browser. */
+export async function downloadAuditedApplicationBundle(jobId: string, userId: string, isCurrent: () => boolean): Promise<void> {
+  if (!isCurrent()) throw new BundleError('Application session changed. Please try again.')
+  const snapshot = await readApplicationExportSnapshot(jobId, userId)
+  if (!isCurrent()) throw new BundleError('Application session changed. Please try again.')
+  const { blob, filename, save } = await renderJobBundle(snapshot)
+  if (!isCurrent()) throw new BundleError('Application session changed. Please try again.')
+  const latest = await readApplicationExportSnapshot(jobId, userId)
+  if (!isCurrent() || !sameApplicationExportSnapshot(snapshot, latest)) throw new BundleError('Application materials changed. Check them again before downloading.')
+  save(blob, filename)
+}
 
-  if (!job.finalResumeId) throw new BundleError('No final resume selected')
-
-  // 2. Fetch final resume
-  const resumeRes = await fetch(`/api/resume/${job.finalResumeId}`)
-  if (!resumeRes.ok) throw new BundleError('Could not load resume')
-  const resume: Resume = await resumeRes.json()
-
-  // 3. Fetch final cover letter (if any)
-  let coverLetter: CoverLetter | null = null
-  if (job.finalCoverLetterId) {
-    try {
-      const clRes = await fetch(`/api/jobs/${jobId}/cover-letters`)
-      if (!clRes.ok) {
-        console.warn('[bundle] Could not fetch cover letters:', clRes.status)
-      } else {
-        const cls: CoverLetter[] = await clRes.json()
-        coverLetter = cls.find(c => c.id === job.finalCoverLetterId) ?? null
-      }
-    } catch (e) {
-      console.warn('[bundle] Network error fetching cover letters:', e)
-    }
-  }
-
+async function renderJobBundle({ job, resume, coverLetter }: ApplicationExportSnapshot): Promise<{ blob: Blob; filename: string; save: (blob: Blob, filename: string) => void }> {
   // 4. Lazy-load heavy deps
   const [{ pdf }, { default: JSZip }, { saveAs }] = await Promise.all([
     import('@react-pdf/renderer'),
@@ -78,6 +66,7 @@ export async function downloadJobBundle(jobId: string): Promise<void> {
     const ResumeDoc = await renderResumeDoc(resume)
     resumeBlob = await pdf(ResumeDoc as never).toBlob()
   } catch (e) {
+    if (isApplicationPdfUnsupportedCharactersError(e)) throw e
     throw new BundleError(`Couldn't render Resume PDF — open the editor and save again (${(e as Error).message ?? 'unknown error'})`)
   }
 
@@ -102,6 +91,7 @@ export async function downloadJobBundle(jobId: string): Promise<void> {
       )
       coverBlob = await pdf(CLDoc as never).toBlob()
     } catch (e) {
+      if (isApplicationPdfUnsupportedCharactersError(e)) throw e
       throw new BundleError(`Couldn't render CoverLetter PDF — open the editor and save again (${(e as Error).message ?? 'unknown error'})`)
     }
   }
@@ -116,5 +106,5 @@ export async function downloadJobBundle(jobId: string): Promise<void> {
   // 8. Save
   const dateStr = new Date().toISOString().slice(0, 10)
   const blob    = await zip.generateAsync({ type: 'blob' })
-  saveAs(blob, `${safe(job.company)}_${safe(job.role)}_${dateStr}.zip`)
+  return { blob, filename: `${safe(job.company)}_${safe(job.role)}_${dateStr}.zip`, save: saveAs }
 }

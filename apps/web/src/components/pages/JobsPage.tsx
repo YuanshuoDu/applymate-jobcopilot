@@ -1,5 +1,6 @@
 'use client'
 
+import { isApplicationPdfUnsupportedCharactersError } from '@/lib/application-pdf-errors'
 import React, { useMemo, useState, useEffect, useRef, useCallback } from 'react'
 import { useSession } from 'next-auth/react'
 import { AlertCircle, Bookmark, Check, ChevronDown, ChevronRight, FileText, Info, LayoutGrid, Link2, List, LoaderCircle, Lock, Search, Sparkles, Trash2, UsersRound, X } from 'lucide-react'
@@ -10,7 +11,7 @@ import type { ApplicationAudit, ApplicationAuditFinding, CoverLetter, Job, JobSt
 import { apiMutate, fmtDate, fmtRelative, useApi } from '@/lib/hooks'
 import { setCachedApiResponse } from '@/lib/api-cache'
 import { useNav } from '@/lib/nav-context'
-import { exportApplicationPackLocally } from '@/lib/bundle'
+import { downloadAuditedApplicationBundle } from '@/lib/bundle'
 import { assessApplicationPreflight } from '@/lib/agent/application-preflight'
 import { useI18n } from '@/lib/i18n'
 import { auditMatchesCurrentMaterials } from '@/lib/application-materials'
@@ -23,6 +24,7 @@ import { ApplicationAttentionView, ApplicationTaskSummary } from '@/components/j
 import type { ApplicationTaskView } from '@/components/jobs/application-task-model'
 import { forgetSavedApplication } from '@/components/jobs/application-search-state'
 import { applicationTaskAllowsManualWork } from '@/components/jobs/application-attention-safety'
+import { clearManualRecordLock, readManualRecordLock, writeManualRecordLock, type ManualRecordLock } from '@/components/jobs/application-manual-record'
 import { openApplication, openApplicationSession } from '@/lib/application-navigation'
 
 const KANBAN_COLS: JobStatus[] = ['saved', 'applied', 'interview', 'offer', 'rejected']
@@ -459,6 +461,15 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
 }) {
   const { t } = useI18n()
   const { navigate } = useNav()
+  const { data: drawerSession, status: drawerSessionStatus } = useSession()
+  const drawerUserId = drawerSessionStatus === 'authenticated' ? drawerSession?.user?.id ?? null : null
+  const drawerUserIdRef = useRef(drawerUserId)
+  drawerUserIdRef.current = drawerUserId
+  const drawerJobIdRef = useRef(job.id)
+  drawerJobIdRef.current = job.id
+  const drawerMountedRef = useRef(true)
+  useEffect(() => { drawerMountedRef.current = true; return () => { drawerMountedRef.current = false } }, [])
+  const isCurrentDrawer = (userId: string) => drawerMountedRef.current && drawerUserIdRef.current === userId
   const auditSectionRef = useRef<HTMLDivElement>(null)
   const drawerRef = useRef<HTMLDivElement>(null)
   const drawerCloseRef = useRef<HTMLButtonElement>(null)
@@ -482,9 +493,32 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   const { data: resumeList } = useApi<ResumeListItem[]>('/api/resume')
   const [selectedResumeId, setSelectedResumeId] = useState('')
   const [downloadingPack, setDownloadingPack] = useState(false)
+  const downloadingPackRef = useRef(false)
   const [recordingSubmission, setRecordingSubmission] = useState(false)
   const recordingSubmissionRef = useRef(false)
-  const [exportedPackFolder, setExportedPackFolder] = useState<string | null>(null)
+  const [manualRecordLock, setManualRecordLock] = useState<ManualRecordLock | null>(() => {
+    try { return drawerUserId && job.userId === drawerUserId ? readManualRecordLock(window.sessionStorage, drawerUserId, job.id) : 'unknown' } catch { return 'unknown' }
+  })
+  const manualRecordRef = useRef(manualRecordLock)
+  const [manualRecordRefreshing, setManualRecordRefreshing] = useState(false)
+  const [manualRecordNotice, setManualRecordNotice] = useState(false)
+  const [manualStorageUnavailable, setManualStorageUnavailable] = useState(false)
+  const setRecordLock = (value: ManualRecordLock | null) => { manualRecordRef.current = value; setManualRecordLock(value) }
+  useEffect(() => {
+    let value: ManualRecordLock | null = 'unknown'
+    try {
+      if (drawerUserId && job.userId === drawerUserId) {
+        if (job.status !== 'saved' || job.workflowState === 'submitted') {
+          clearManualRecordLock(window.sessionStorage, drawerUserId, job.id)
+          value = null
+        } else value = readManualRecordLock(window.sessionStorage, drawerUserId, job.id)
+      }
+    } catch { /* unavailable storage is unknown */ }
+    manualRecordRef.current = value
+    setManualRecordLock(value)
+    setManualRecordNotice(false)
+    setManualStorageUnavailable(false)
+  }, [drawerUserId, job.id, job.userId, job.status, job.workflowState])
   const [autoPreparing, setAutoPreparing] = useState(false)
   const preparationInFlight = useRef(false)
   const [preparationStartedAt, setPreparationStartedAt] = useState<number | null>(null)
@@ -493,7 +527,8 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   const [latestAuditRecord, setLatestAuditRecord] = useState<StoredApplicationAudit | null>(null)
   const [openPackItem, setOpenPackItem] = useState<'resume' | 'coverLetter' | 'audit' | null>(null)
   const [resumePreview, setResumePreview] = useState<Resume | null>(null)
-  const [generatedCoverLetter, setGeneratedCoverLetter] = useState<CoverLetter | null>(null)
+  const [createdTailoredResumeId, setCreatedTailoredResumeId] = useState<string | null>(null)
+  const [coverLetterSelectionNeeded, setCoverLetterSelectionNeeded] = useState(false)
   const [latestAudit, setLatestAudit] = useState<ApplicationAudit | null>(null)
   const [documentPreview, setDocumentPreview] = useState<'resume' | 'coverLetter' | null>(null)
   const [evidenceFinding, setEvidenceFinding] = useState<ApplicationAuditFinding | null>(null)
@@ -579,15 +614,14 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     setSelectedResumeId(prev => prev && baseResumes.some(r => r.id === prev) ? prev : preferred.id)
   }, [baseResumes, resumeList])
   useEffect(() => {
-    const exportKey = `applymate:exported-pack:${job.id}`
     setLatestAuditRecord(null)
     setOpenPackItem(null)
     setResumePreview(null)
-    setGeneratedCoverLetter(null)
+    setCreatedTailoredResumeId(null)
+    setCoverLetterSelectionNeeded(false)
     setLatestAudit(null)
     setDocumentPreview(null)
     setPackStage('idle')
-    try { setExportedPackFolder(window.sessionStorage.getItem(exportKey)) } catch { setExportedPackFolder(null) }
   }, [job.id])
   useEffect(() => {
     if (!preparationStartedAt) { setPreparationElapsed(0); return }
@@ -597,7 +631,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     return () => window.clearInterval(timer)
   }, [preparationStartedAt])
 
-  const previewResumeId = job.finalResumeId ?? existingTailoredResume?.id ?? null
+  const previewResumeId = job.finalResumeId ?? existingTailoredResume?.id ?? createdTailoredResumeId ?? null
   useEffect(() => {
     if (!previewResumeId) return
     const controller = new AbortController()
@@ -613,8 +647,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   // replace the confirmed version in the Application Pack preview.
   const selectedCoverLetter = job.finalCoverLetterId
     ? coverLetters?.find(letter => letter.id === job.finalCoverLetterId)
-    : job.finalResumeId ? null : generatedCoverLetter
-      ?? coverLetters?.find(letter => letter.resumeId === previewResumeId)
+    : null
   const persistedAudit = useMemo(() => findLatestApplicationAudit(activity), [activity])
   const storedAudit = canonicalAudit ?? persistedAudit
   const displayedAudit = latestAudit ?? storedAudit?.audit ?? null
@@ -685,30 +718,35 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   }
 
   async function downloadFinalPack() {
+    const owner = drawerUserIdRef.current
+    const jobId = job.id
+    if (!owner || owner !== job.userId || downloadingPackRef.current || !isCurrentDrawer(owner)) return
+    const isCurrent = () => isCurrentDrawer(owner) && drawerJobIdRef.current === jobId
+    downloadingPackRef.current = true
     setDownloadingPack(true)
     try {
-      const result = await exportApplicationPackLocally(job.id, Boolean(exportedPackFolder))
-      setExportedPackFolder(result.folderPath)
-      try { window.sessionStorage.setItem(`applymate:exported-pack:${job.id}`, result.folderPath) } catch { /* browser storage is optional */ }
-      toast.success(exportedPackFolder ? 'Folder opened' : 'Application PDFs saved', result.folderPath)
+      await downloadAuditedApplicationBundle(jobId, owner, isCurrent)
+      if (isCurrent()) toast.success(t('application.downloadReady'))
     } catch (error) {
-      if (exportedPackFolder) {
-        setExportedPackFolder(null)
-        try { window.sessionStorage.removeItem(`applymate:exported-pack:${job.id}`) } catch { /* browser storage is optional */ }
+      if (isCurrent()) {
+        if (isApplicationPdfUnsupportedCharactersError(error)) toast.error(t('application.downloadUnsupportedTitle'), t('application.downloadUnsupportedDetail'))
+        else toast.error(t('application.downloadFailed'), t('application.downloadRetry'))
       }
-      toast.error('Could not download application pack', error instanceof Error ? error.message : 'Please try again')
     } finally {
-      setDownloadingPack(false)
+      downloadingPackRef.current = false
+      if (isCurrent()) setDownloadingPack(false)
     }
   }
 
   async function autoTailorAndAudit(evidenceRepairs: ApplicationAuditFinding[] = []) {
+    const owner = drawerUserIdRef.current
+    if (!owner || !isCurrentDrawer(owner) || job.userId !== owner) return
     if (preparationInFlight.current || !manualWorkAllowed || taskReadState !== 'ready') return
     if (job.finalCoverLetterId && !coverLetters?.some(letter => letter.id === job.finalCoverLetterId)) {
       toast.info(t('application.selectedLetterLoading'))
       return
     }
-    if (!selectedResumeId && !existingTailoredResume && !job.finalResumeId) {
+    if (!selectedResumeId && !existingTailoredResume && !createdTailoredResumeId && !job.finalResumeId) {
       toast.error('No base resume selected', 'Create or import a resume first.')
       return
     }
@@ -720,39 +758,51 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
       ...(auditNeedsRepair ? factualAuditFindings.filter(finding => finding.area === 'cover_letter') : []),
       ...evidenceRepairs.filter(finding => finding.area === 'cover_letter'),
     ]
+    if (coverLetterRepairs.length && !job.finalCoverLetterId) {
+      setCoverLetterSelectionNeeded(true)
+      setOpenPackItem('coverLetter')
+      return
+    }
+    setCoverLetterSelectionNeeded(false)
     preparationInFlight.current = true
     setAutoPreparing(true)
     setPreparationStartedAt(Date.now())
     try {
       // Existing job documents are reused. A retry changes only the document
       // area explicitly flagged by the independent audit.
-      let adaptedResumeId = job.finalResumeId ?? existingTailoredResume?.id
+      let adaptedResumeId = job.finalResumeId ?? existingTailoredResume?.id ?? createdTailoredResumeId
       if (!adaptedResumeId) {
         setPackStage('resume')
         const { data, error } = await apiMutate<{ adaptedResumeId: string }>(`/api/jobs/${job.id}/tailor-resume`, 'POST', { resumeId: selectedResumeId })
+        if (!isCurrentDrawer(owner)) return
         if (!data || error) throw new Error(error ?? 'Could not tailor the resume')
         adaptedResumeId = data.adaptedResumeId
+        setCreatedTailoredResumeId(adaptedResumeId)
       } else if (resumeRepairs.length) {
         setPackStage('resume')
         const { data, error } = await apiMutate<{ adaptedResumeId: string }>(
           `/api/jobs/${job.id}/tailor-resume`, 'POST',
           { resumeId: adaptedResumeId, forceRetailor: true, auditFindings: resumeRepairs },
         )
+        if (!isCurrentDrawer(owner)) return
         if (!data || error) throw new Error(error ?? 'Could not repair the flagged resume section')
         adaptedResumeId = data.adaptedResumeId
       }
       const response = await fetch(`/api/resume/${adaptedResumeId}`)
+      if (!isCurrentDrawer(owner)) return
       if (response.ok) {
-        const tailored = await response.json() as Resume
+        const tailored = await response.json() as Resume & { userId?: unknown }
+        if (!isCurrentDrawer(owner)) return
+        if (tailored.id !== adaptedResumeId || tailored.userId !== owner) throw new Error('Resume unavailable')
         setResumePreview(tailored)
-        setCachedApiResponse(`/api/resume/${adaptedResumeId}`, tailored)
+        setCachedApiResponse(`/api/resume/${adaptedResumeId}`, tailored, owner)
       }
 
       let coverLetter = job.finalCoverLetterId
         ? coverLetters?.find(letter => letter.id === job.finalCoverLetterId)
-        : job.finalResumeId ? undefined : generatedCoverLetter ?? coverLetters?.find(letter => letter.resumeId === adaptedResumeId)
+        : undefined
       if (job.finalCoverLetterId && !coverLetter) throw new Error(t('application.selectedLetterLoading'))
-      if ((!coverLetter && !job.finalResumeId) || coverLetterRepairs.length) {
+      if (coverLetterRepairs.length) {
         setPackStage('coverLetter')
         const result = await apiMutate<CoverLetter>(
           `/api/jobs/${job.id}/cover-letters/generate`, 'POST',
@@ -763,23 +813,26 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
             ...(coverLetter && coverLetterRepairs.length ? { repairCoverLetterId: coverLetter.id } : {}),
           },
         )
+        if (!isCurrentDrawer(owner)) return
         if (!result.data || result.error) throw new Error(result.error ?? 'Could not prepare the cover letter')
         coverLetter = result.data
       }
-      setGeneratedCoverLetter(coverLetter ?? null)
       if (coverLetter && job.finalCoverLetterId !== coverLetter.id) {
         const { data: assigned, error: assignError } = await apiMutate<Job>(
           `/api/jobs/${job.id}/assign`, 'PATCH', { finalCoverLetterId: coverLetter.id },
         )
+        if (!isCurrentDrawer(owner)) return
         if (!assigned || assignError) throw new Error(assignError ?? 'Could not select the cover letter')
         onUpdate(assigned)
       }
       await refetchCoverLetters()
+      if (!isCurrentDrawer(owner)) return
 
       setPackStage('audit')
       const { data: audit, error: auditError } = await apiMutate<ApplicationAudit & Pick<StoredApplicationAudit, 'resumeUpdatedAt' | 'coverLetterUpdatedAt'>>(
         `/api/jobs/${job.id}/audit-application`, 'POST', { resumeId: adaptedResumeId, coverLetterId: coverLetter?.id ?? null },
       )
+      if (!isCurrentDrawer(owner)) return
       if (!audit || auditError) throw new Error(auditError ?? 'Independent audit could not run')
       setLatestAudit(audit)
       setLatestAuditRecord({ resumeId: adaptedResumeId, coverLetterId: coverLetter?.id ?? null,
@@ -795,16 +848,18 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
       const { data: confirmed, error: confirmError } = await apiMutate<Job>(
         `/api/jobs/${job.id}/assign`, 'PATCH', { finalResumeId: adaptedResumeId },
       )
+      if (!isCurrentDrawer(owner)) return
       if (!confirmed || confirmError) throw new Error(confirmError ?? 'Could not confirm the audited package')
       onUpdate(confirmed)
-      toast.success('Audited application pack ready', 'The final resume and cover letter are now available in this job.')
+      toast.success(t('application.materialsReadyTitle'), t(coverLetter ? 'application.materialsReadyWithLetter' : 'application.materialsReadyResumeOnly'))
     } catch (error) {
-      setPackStage('idle')
-      toast.error('Preparation could not finish', error instanceof Error ? error.message : 'Please try again')
+      if (isCurrentDrawer(owner)) {
+        setPackStage('idle')
+        toast.error('Preparation could not finish', error instanceof Error ? error.message : 'Please try again')
+      }
     } finally {
       preparationInFlight.current = false
-      setAutoPreparing(false)
-      setPreparationStartedAt(null)
+      if (isCurrentDrawer(owner)) { setAutoPreparing(false); setPreparationStartedAt(null) }
     }
   }
 
@@ -829,22 +884,52 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     }
   }
 
+  async function refreshManualRecord(userId: string) {
+    if (!isCurrentDrawer(userId)) return
+    setManualRecordRefreshing(true)
+    try {
+      const response = await fetch(`/api/jobs/${encodeURIComponent(job.id)}`)
+      if (!response.ok) throw new Error('unavailable')
+      const updated = await response.json() as Job
+      if (!isCurrentDrawer(userId)) return
+      if (updated.id !== job.id || updated.userId !== userId) throw new Error('unavailable')
+      if (updated.status !== 'saved' || updated.workflowState === 'submitted') {
+        try { clearManualRecordLock(window.sessionStorage, userId, job.id) } catch { /* retain conservative lock */ }
+        setRecordLock(null)
+        setManualRecordNotice(false)
+        onUpdate(updated)
+      } else {
+        // A read showing saved is not proof that an earlier POST did not commit.
+        setManualRecordNotice(true)
+      }
+    } catch {
+      if (isCurrentDrawer(userId)) setManualRecordNotice(true)
+    } finally {
+      if (isCurrentDrawer(userId)) setManualRecordRefreshing(false)
+    }
+  }
+
   async function recordManualSubmission() {
-    if (recordingSubmissionRef.current || !manualWorkAllowed || job.status !== 'saved' || job.workflowState === 'submitted' || taskReadState !== 'ready') return
+    const userId = drawerUserIdRef.current
+    if (!userId || !isCurrentDrawer(userId) || recordingSubmissionRef.current || manualRecordRef.current
+      || !manualWorkAllowed || job.status !== 'saved' || job.workflowState === 'submitted' || taskReadState !== 'ready') return
+    try {
+      if (!writeManualRecordLock(window.sessionStorage, userId, job.id, 'pending')) { setManualStorageUnavailable(true); return }
+    } catch { setManualStorageUnavailable(true); return }
+    setManualStorageUnavailable(false)
+    setRecordLock('pending')
     recordingSubmissionRef.current = true
     setRecordingSubmission(true)
     try {
       const { error } = await apiMutate(`/api/jobs/${job.id}/apply`, 'POST', {})
-      if (error) throw new Error(error)
-      const response = await fetch(`/api/jobs/${encodeURIComponent(job.id)}`)
-      if (!response.ok) throw new Error(t('application.refreshStatus'))
-      onUpdate(await response.json() as Job)
-      toast.success(t('application.manualRecorded'))
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : t('common.error'))
+      const outcome: ManualRecordLock = error ? 'unknown' : 'confirmed'
+      try { writeManualRecordLock(window.sessionStorage, userId, job.id, outcome) } catch { /* pending remains conservative */ }
+      if (!isCurrentDrawer(userId)) return
+      setRecordLock(outcome)
+      if (!error) await refreshManualRecord(userId)
     } finally {
       recordingSubmissionRef.current = false
-      setRecordingSubmission(false)
+      if (isCurrentDrawer(userId)) setRecordingSubmission(false)
     }
   }
 
@@ -927,17 +1012,25 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
             </PackRow>
             <PackRow number="2" title={t('jobs.pack.coverLetter')} detail={packStage === 'coverLetter' ? t('jobs.pack.writingCoverLetter') : selectedCoverLetter ? t('jobs.pack.generatedJob') : t('application.coverLetterOptional')} done={Boolean(selectedCoverLetter)} active={packStage === 'coverLetter'} open={openPackItem === 'coverLetter'} onToggle={() => setOpenPackItem(current => current === 'coverLetter' ? null : 'coverLetter')}>
               <CoverLetterPackPreview coverLetter={selectedCoverLetter ?? null} applicant={resumePreview?.content.contact} fallbackName={resumePreview?.name ?? 'Applicant'} company={job.company} role={job.role} templateId={resumePreview?.templateId ?? undefined} templateOptions={resumePreview?.templateOptions ?? undefined} onReview={() => { rememberNestedOrigin(); setDocumentPreview('coverLetter') }} />
+              {coverLetterSelectionNeeded && <p role="status">{t('application.coverLetterSelectFirst')}</p>}
+              {!job.finalCoverLetterId && previewResumeId && <Btn variant="ghost" small onClick={() => onOpenTailoredResume(previewResumeId)}>{t('application.coverLetterSelect')}</Btn>}
             </PackRow>
             <div ref={auditSectionRef}><PackRow last number="3" title={t('jobs.pack.audit')} detail={packStage === 'audit' ? t('jobs.pack.checkingChanges') : auditRetryOnly ? t('jobs.pack.retryResponse') : auditNeedsEvidence ? `${evidenceGapFindings.length} ${t('jobs.auditFactsCount')}` : auditNeedsRepair ? `${factualAuditFindings.length} ${t('jobs.auditIssuesCount')}` : displayedAudit ? t('jobs.pack.verifiedFacts') : t('jobs.pack.readyRun')} done={currentPackAudited} failed={auditNeedsRepair || auditNeedsEvidence || auditRetryOnly} active={packStage === 'audit'} open={openPackItem === 'audit'} onToggle={() => setOpenPackItem(current => current === 'audit' ? null : 'audit')}>
               <AuditPackPreview audit={displayedAudit} onRepair={() => void autoTailorAndAudit()} onAddEvidence={finding => { rememberNestedOrigin(); setEvidenceFinding(finding); setEvidenceText('') }} repairing={autoPreparing || !manualWorkAllowed || taskReadState !== 'ready'} />
             </PackRow></div>
-            {currentPackAudited && <button onClick={() => void downloadFinalPack()} disabled={downloadingPack} style={{ width: '100%', minHeight: 46, border: 0, borderRadius: 9, background: '#2563eb', color: '#fff', fontWeight: 700, cursor: 'pointer' }}>{downloadingPack ? (exportedPackFolder ? t('jobs.pack.openingFolder') : t('jobs.pack.savingPdfs')) : exportedPackFolder ? t('jobs.pack.openFolder') : t('jobs.pack.savePdfs')}</button>}
+            {currentPackAudited && <button onClick={() => void downloadFinalPack()} disabled={downloadingPack} style={{ width: '100%', minHeight: 46, border: 0, borderRadius: 9, background: '#2563eb', color: '#fff', fontWeight: 700, cursor: 'pointer' }}>{downloadingPack ? t('application.downloadingZip') : t('application.downloadZip')}</button>}
             <div style={{ borderTop: '1px solid var(--border)', paddingTop: 16 }}>
               <strong style={{ fontSize: 13 }}>{t('application.method')}</strong>
               <p style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{applicationPreflight.canAutomate ? t('application.agentMethodHint') : t('application.manualMethodHint')}</p>
               {(!currentPackAudited || task || applicationRecorded) && job.url && /^https?:\/\//i.test(job.url) && <a href={job.url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--primary)', fontSize: 12 }}>{t('application.openEmployer')}</a>}
               {!task && <Btn variant="ghost" small onClick={() => navigate('agent')}>{t('application.openAgent')}</Btn>}
-              {manualWorkAllowed && taskReadState === 'ready' && !applicationRecorded && <Btn variant="ghost" small disabled={recordingSubmission} onClick={() => void recordManualSubmission()}>{t('application.recordManual')}</Btn>}
+              {manualWorkAllowed && taskReadState === 'ready' && !applicationRecorded && !manualRecordLock && <Btn variant="ghost" small disabled={recordingSubmission} onClick={() => void recordManualSubmission()}>{t('application.recordManual')}</Btn>}
+              {manualStorageUnavailable && <p role="status">{t('application.manualStorageUnavailable')}</p>}
+              {manualRecordLock && !applicationRecorded && <div role="status">
+                <p>{t(manualRecordLock === 'confirmed' ? 'application.manualStatusConfirmed' : 'application.manualStatusPending')}</p>
+                {manualRecordNotice && <p>{t('application.manualStatusStillUnknown')}</p>}
+                <Btn variant="ghost" small disabled={recordingSubmission || manualRecordRefreshing} onClick={() => { if (drawerUserId) void refreshManualRecord(drawerUserId) }}>{t('application.manualRefresh')}</Btn>
+              </div>}
             </div>
             <div style={{ borderTop: '1px solid var(--border)', marginTop: 28, paddingTop: 22 }}>
               <div style={{ fontSize: 12, fontWeight: 700, color: '#64748b', marginBottom: 16 }}>{t('jobs.drawer.jobDetails')}</div>

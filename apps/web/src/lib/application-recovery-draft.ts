@@ -1,4 +1,5 @@
 import type { ResumeContent, TemplateOptions } from './types'
+import type { ApplicationListState } from './application-list-state'
 
 export type RecoveryDraft = {
   userId: string
@@ -8,6 +9,7 @@ export type RecoveryDraft = {
   sectionOrder: string[]
   templateId: string
   templateOptions: TemplateOptions
+  applicationContext?: { jobId: string; list: ApplicationListState; attention: boolean }
 }
 
 /** In-memory only. Detached drafts remain private to their original owner. */

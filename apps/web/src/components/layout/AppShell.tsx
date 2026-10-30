@@ -12,6 +12,7 @@ import { isApplicationNavigationEvent } from '@/lib/application-navigation'
 import { applicationHistoryIndex } from '@/lib/application-history-position'
 import { guardApplicationTraversal } from '@/lib/application-traversal-guard'
 import { createRecoveryDraftStore, type RecoveryDraft } from '@/lib/application-recovery-draft'
+import { replaceWithRecoveryResume } from '@/lib/application-recovery-navigation'
 import { ApplicationRecoveryView } from '@/components/jobs/application-recovery-view'
 import { useI18n } from '@/lib/i18n'
 import { OnboardingFlow } from '@/components/onboarding/OnboardingFlow'
@@ -563,6 +564,9 @@ export function AppShell() {
 
   const recoveryDraft = status === 'authenticated' ? recoveryStore.current.getDetached(activeUserId) : null
   if (recoveryDraft) return <ApplicationRecoveryView draft={recoveryDraft} onContinue={() => {
+    if (activeUserRef.current !== recoveryDraft.userId) return
+    if (!replaceWithRecoveryResume(window, recoveryDraft.resumeId, recoveryDraft.applicationContext)) return
+    setPage('resume')
     recoveryStore.current.discard(recoveryDraft.userId)
     setRecoveryGeneration(value => value + 1)
   }} />
