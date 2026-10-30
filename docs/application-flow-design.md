@@ -86,6 +86,8 @@ Agent 维护范围内单独处理。
 | 状态待刷新 | 当前任务信息不足，刷新或打开原 Agent 查看 |
 | 申请历史无法加载 | 刷新历史；读取失败不代表没有记录 |
 | 等待审核 | 在原任务查看本次内容；页面跳转不会代替授权 |
+| 授权已过期或内容已变化 | 返回原任务，检查本次材料和申请内容后重新审核授权 |
+| 已请求停止 | 在原任务等待系统确认最终状态；请求停止本身不代表已经停止 |
 | 提交结果待核实 | 查看记录和回执，保持结果未知，不自动重试 |
 | 手动记录状态待刷新 | 点击“刷新记录状态”；若仍未确认，先核对记录和雇主回执 |
 | 手动记录受到额度或套餐限制 | 处理限制后刷新状态并核对，再决定是否记录；跨标签页仍需自行核对 |
@@ -186,7 +188,7 @@ has not loaded is not treated as absent.
 | Condition | User guidance | Effect |
 | --- | --- | --- |
 | No materials yet | Prepare application materials | Use the selected base resume and existing preparation flow |
-| Facts need confirmation | Provide missing information | Open the existing issue details and input |
+| Facts need confirmation | Review the issue and edit the selected resume | Add only reusable facts to the shared profile; job-specific evidence is not stored here |
 | Content needs correction | Review material issues | Open the one repair/check interface |
 | Selected material is not loaded | Refresh before checking | Preserve its ID; never clear or replace it |
 | Audit belongs to another document/version | Check current materials | Do not present the previous result as valid |
@@ -313,12 +315,13 @@ is a snapshot and does not by itself prevent concurrent changes in another tab.
 
 | Situation | Next action | Boundary |
 | --- | --- | --- |
-| Unknown experience | Open the existing fact/question interface | Do not invent a claim or reinterpret unknown as no |
+| Unknown experience | Review the original question if available, or edit the unsupported material | Do not invent a claim or reinterpret unknown as no |
 | Login, MFA or CAPTCHA | Follow the original session's handoff instructions | No bypass or automatic retry; no promise of unsupported takeover UI |
 | Materials changed | Check the current versions | Old checks and approvals are not authority for new content |
 | Task query fails | Refresh status | Do not interpret failure as no task |
 | Preparation fails | Inspect/retry the existing specific step | No generic submission retry |
 | Approval expires | Review in the original session | Existing receipt/version/expiry checks remain authoritative |
+| Stop requested | Wait for the original task to confirm its state | A stop request alone does not mean execution has stopped |
 | Submission started | View original progress | Do not enqueue another application |
 | Submission uncertain | Check original records and receipt | Keep unknown distinct from failed or submitted |
 | Task cancelled | Read the last recorded state | Navigation does not resume it |
