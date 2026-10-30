@@ -1,4 +1,5 @@
 import type pg from "pg"
+import { canonicalJson, redactSensitiveText } from "@jobcopilot/shared"
 import { parseCognitiveAgendaReceipt } from "../turns/cognitive-agenda-receipt.js"
 import { steeringReconciliationId, steeringReconciliationRevision, steeringReconciliationSequence, validSteeringReconciliationScope, STEERING_RECONCILIATION_MAX_UNRESOLVED_INPUTS,
   STEERING_RECONCILIATION_BRANCH_REPAIR_SCHEMA_VERSION, STEERING_RECONCILIATION_FAILED_BRANCH_REPAIR_SCHEMA_VERSION,
@@ -11,12 +12,13 @@ import { readSteeringReconciliationHistory } from "./steering-reconciliation-his
 
 type Client = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
-type StoredInput = Readonly<{ id: string; clientMessageId: string; delivery: string; status: string; acceptedSequence: bigint;
+type StoredInput = Readonly<{ id: string; clientMessageId: string; content: unknown; delivery: string; status: string; acceptedSequence: bigint;
   consumedByStepId: string | null; consumedAt: Date | null; cancelledAt: Date | null }>
 type Input = SteeringReconciliationPendingInput & Readonly<{ clientMessageId: string; cancelledAt: Date | null }>
 type Step = Readonly<{ id: string; ordinal: number; attempt: number; status: string; cursor: bigint; ids: readonly string[] }>
 type Candidate = Input & Readonly<{ consumer: Step | null }>
 const INPUT_PAGE_SIZE = 64
+const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i
 const STEP_STATUSES = new Set(["streaming", "waiting_for_tool", "waiting_for_approval", "waiting_for_user", "completed", "failed", "interrupted"])
 
 function object(value: unknown): Row | null {
@@ -32,7 +34,7 @@ function storedInput(row: Row | undefined): StoredInput {
     || !["steer", "follow_up"].includes(String(row.delivery)) || !["accepted", "queued", "consumed", "cancelled", "rejected"].includes(String(row.status))
     || !(row.consumedByStepId === null || steeringReconciliationId(row.consumedByStepId))
     || !(row.consumedAt === null || date(row.consumedAt)) || !(row.cancelledAt === null || date(row.cancelledAt))) throw new Error("steering_reconciliation_input_invalid")
-  return { id: row.id as string, clientMessageId: row.clientMessageId as string, delivery: String(row.delivery), status: String(row.status), acceptedSequence,
+  return { id: row.id as string, clientMessageId: row.clientMessageId as string, content: row.content, delivery: String(row.delivery), status: String(row.status), acceptedSequence,
     consumedByStepId: row.consumedByStepId as string | null, consumedAt: row.consumedAt as Date | null, cancelledAt: row.cancelledAt as Date | null }
 }
 function ids(value: unknown): string[] | null {
@@ -53,18 +55,20 @@ function originalClientMessageId(turnInput: unknown): string | null | undefined 
   if (!source || !Object.hasOwn(source, "clientMessageId")) return undefined
   return steeringReconciliationId(source.clientMessageId) ? source.clientMessageId : null
 }
-function acceptedEvent(row: Row, turnId: string): { readonly source: "user" | "automation" | "system" } | null {
-  const payload = object(row.acceptedPayload)
+function inputIdMatches(value: unknown, id: string): boolean { return value === id || UUID.test(id) && value === redactSensitiveText(id) }
+function acceptedEvent(row: Row, turnId: string, input: StoredInput): { readonly source: "user" | "automation" | "system" } | null {
+  const payload = object(row.acceptedPayload), item = object(row.acceptedItemContent)
   if (!payload || Object.keys(payload).sort().join(",") !== "clientMessageId,delivery,disposition,inputId,source"
     || row.acceptedType !== "input.accepted" || row.acceptedTaskId !== null || row.acceptedEventSequence === null
-    || row.acceptedCorrelationId !== turnId || !steeringReconciliationId(row.acceptedItemId)
+    || row.acceptedEventCausationId !== null || row.acceptedCorrelationId !== turnId || !steeringReconciliationId(row.acceptedItemId)
     || row.acceptedItemType !== "user_message" || row.acceptedItemTaskId !== null || row.acceptedItemStatus !== "completed"
-    || payload.inputId !== row.id || payload.clientMessageId !== row.clientMessageId || payload.delivery !== row.delivery
+    || row.acceptedItemStepId !== null || !inputIdMatches(payload.inputId, input.id)
+    || payload.clientMessageId !== redactSensitiveText(input.clientMessageId) || payload.delivery !== input.delivery
     || typeof payload.disposition !== "string" || !payload.disposition.trim()
     || payload.source !== "user" && payload.source !== "automation" && payload.source !== "system") return null
-  const item = object(row.acceptedItemContent)
   if (!item || Object.keys(item).sort().join(",") !== "clientMessageId,disposition,parts,source" || !Array.isArray(item.parts)
-    || item.clientMessageId !== payload.clientMessageId || item.source !== payload.source || item.disposition !== payload.disposition) return null
+    || item.clientMessageId !== input.clientMessageId || item.source !== payload.source || item.disposition !== payload.disposition) return null
+  try { if (canonicalJson(item.parts) !== canonicalJson(input.content)) return null } catch { return null }
   const source = payload.source as "user" | "automation" | "system"
   if (row.acceptedActor !== (source === "user" ? "user" : "system")) return null
   return { source }
@@ -90,26 +94,37 @@ async function readOriginalInputId(client: Client, scope: SteeringReconciliation
 }
 
 async function* readInputCandidates(client: Client, scope: SteeringReconciliationScope, rootId: string | null): AsyncGenerator<Candidate> {
-  let afterSequence: bigint | null = null, afterId: string | null = null
+  let afterSequence: bigint | null = null, afterId: string | null = null, rootValidated = false
+  const seenSequences = new Set<bigint>()
   while (true) {
-    const result: { rows: Row[] } = await client.query<Row>(`SELECT "id", "clientMessageId", "delivery", "status", "acceptedSequence", "consumedByStepId", "consumedAt", "cancelledAt"
+    const result: { rows: Row[] } = await client.query<Row>(`SELECT "id", "clientMessageId", "content", "delivery", "status", "acceptedSequence", "consumedByStepId", "consumedAt", "cancelledAt"
       FROM "agent_inputs" WHERE "sessionId" = $1 AND "targetTurnId" = $2 AND "userId" = $3
         AND ($4::bigint IS NULL OR "acceptedSequence" > $4::bigint OR ("acceptedSequence" = $4::bigint AND "id" > $5::text))
       ORDER BY "acceptedSequence", "id" LIMIT ${INPUT_PAGE_SIZE}`,
     [scope.sessionId, scope.turnId, scope.userId, afterSequence?.toString() ?? null, afterId])
-    if (!result.rows.length) return
+    if (!result.rows.length) {
+      if (rootId && !rootValidated) throw new Error("steering_reconciliation_original_input_invalid")
+      return
+    }
     const page: StoredInput[] = result.rows.map((row: Row) => storedInput(row)), last: StoredInput = page.at(-1)!
+    for (const input of page) {
+      if (seenSequences.has(input.acceptedSequence)) throw new Error("steering_reconciliation_input_sequence_ambiguous")
+      seenSequences.add(input.acceptedSequence)
+      if (input.id === rootId && (!(["accepted", "queued", "consumed"].includes(input.status)) || input.cancelledAt !== null)) {
+        throw new Error("steering_reconciliation_original_input_invalid")
+      }
+    }
     afterSequence = last.acceptedSequence
     afterId = last.id
-    const active: StoredInput[] = page.filter((input: StoredInput) => input.id !== rootId && input.delivery === "steer" && ["accepted", "queued", "consumed"].includes(input.status))
+    const active: StoredInput[] = page.filter((input: StoredInput) => input.id === rootId
+      || input.delivery === "steer" && ["accepted", "queued", "consumed"].includes(input.status))
     if (!active.length) continue
     const details: { rows: Row[] } = await client.query<Row>(`SELECT input."id", input."clientMessageId", input."delivery", input."status", input."acceptedSequence", input."consumedByStepId", input."consumedAt", input."cancelledAt",
-        event."type" AS "acceptedType", event."actor" AS "acceptedActor", event."taskId" AS "acceptedTaskId", event."correlationId" AS "acceptedCorrelationId", event."itemId" AS "acceptedItemId", event."sequence" AS "acceptedEventSequence", event."payload" AS "acceptedPayload",
-        accepted_item."type" AS "acceptedItemType", accepted_item."taskId" AS "acceptedItemTaskId", accepted_item."status" AS "acceptedItemStatus", accepted_item."content" AS "acceptedItemContent"
+        event."type" AS "acceptedType", event."actor" AS "acceptedActor", event."taskId" AS "acceptedTaskId", event."correlationId" AS "acceptedCorrelationId", event."causationId" AS "acceptedEventCausationId", event."itemId" AS "acceptedItemId", event."sequence" AS "acceptedEventSequence", event."payload" AS "acceptedPayload",
+        accepted_item."type" AS "acceptedItemType", accepted_item."stepId" AS "acceptedItemStepId", accepted_item."taskId" AS "acceptedItemTaskId", accepted_item."status" AS "acceptedItemStatus", accepted_item."content" AS "acceptedItemContent"
       FROM "agent_inputs" AS input LEFT JOIN "agent_events" AS event ON event."sessionId" = input."sessionId" AND event."turnId" = input."targetTurnId" AND event."sequence" = input."acceptedSequence"
       LEFT JOIN "agent_items" AS accepted_item ON accepted_item."id" = event."itemId" AND accepted_item."sessionId" = input."sessionId" AND accepted_item."turnId" = input."targetTurnId"
-      WHERE input."sessionId" = $1 AND input."targetTurnId" = $2 AND input."userId" = $3 AND input."id" = ANY($4::text[])
-        AND input."delivery" = 'steer' AND input."status" IN ('accepted', 'queued', 'consumed')`,
+      WHERE input."sessionId" = $1 AND input."targetTurnId" = $2 AND input."userId" = $3 AND input."id" = ANY($4::text[])`,
     [scope.sessionId, scope.turnId, scope.userId, active.map(input => input.id)])
     if (details.rows.length !== active.length) throw new Error("steering_reconciliation_input_invalid")
     const pageInputs = new Map<string, StoredInput>(active.map(input => [input.id, input])), acceptedById = new Map<string, { input: Input; consumerId: string | null }>()
@@ -119,11 +134,12 @@ async function* readInputCandidates(client: Client, scope: SteeringReconciliatio
       if (!stored || detailIds.has(stored.id) || stored.clientMessageId !== row.clientMessageId || stored.delivery !== row.delivery || stored.status !== row.status
         || stored.acceptedSequence.toString() !== String(row.acceptedSequence) || stored.consumedByStepId !== row.consumedByStepId) throw new Error("steering_reconciliation_input_invalid")
       detailIds.add(stored.id)
-      const event = acceptedEvent(row, scope.turnId)
+      const event = acceptedEvent(row, scope.turnId, stored)
       if (!event || row.acceptedActor === null || row.acceptedEventSequence === null || String(row.acceptedEventSequence) !== stored.acceptedSequence.toString()) throw new Error("steering_reconciliation_acceptance_invalid")
       if (stored.status === "consumed") {
         if (!stored.consumedByStepId || !stored.consumedAt || !date(stored.consumedAt) || stored.cancelledAt !== null) throw new Error("steering_reconciliation_consumption_invalid")
       } else if (stored.consumedByStepId !== null || stored.consumedAt !== null || stored.cancelledAt !== null) throw new Error("steering_reconciliation_consumption_invalid")
+      if (stored.id === rootId) { rootValidated = true; continue }
       if (event.source === "user") acceptedById.set(stored.id, { input: { id: stored.id, clientMessageId: stored.clientMessageId, acceptedSequence: stored.acceptedSequence,
         status: stored.status as Input["status"], consumedByStepId: stored.consumedByStepId, consumingOrdinal: null, cancelledAt: stored.cancelledAt }, consumerId: stored.consumedByStepId })
     }

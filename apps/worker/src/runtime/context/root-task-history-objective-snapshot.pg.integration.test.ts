@@ -349,7 +349,7 @@ async function createWorkerScenario(pool: Pool): Promise<WorkerScenario> {
   } finally { await webDatabase.db.$disconnect() }
 }
 
-function startFixtureWorker(mode: string, input: { turnId: string }): WorkerFixtureProcess {
+function startFixtureWorker(mode: string, input: { turnId: string; forceContextFailureForDiagnostic?: boolean }): WorkerFixtureProcess {
   const env: NodeJS.ProcessEnv = {
     PATH: process.env.PATH, SystemRoot: process.env.SystemRoot, CI: "true", NODE_ENV: "test",
     DATABASE_URL: databaseUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl!, AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true",
@@ -1000,6 +1000,65 @@ describePg("root task history objective snapshot PostgreSQL durability", () => {
   })
 
   describeWorkerRestart("objective snapshot real Worker process restart with fixture ModelAdapter", () => {
+    it("emits bounded history diagnostics for an opt-in fixture-only Worker A context failure", async () => {
+      const { fixture, turnId } = await createWorkerScenario(pool!); scenarios.push(fixture)
+      let worker: WorkerFixtureProcess | undefined
+      let queuePaused = false
+      try {
+        if (await turnQueue!.isPaused()) await turnQueue!.resume()
+        worker = startFixtureWorker("worker-a-diagnostic", { turnId, forceContextFailureForDiagnostic: true })
+        await waitForFixtureLine(worker, "FIXTURE_WORKER_READY_A")
+        expect(await waitForFixtureLine(worker, "FIXTURE_MODEL_CONTEXT_A_INVALID"))
+          .toBe("FIXTURE_MODEL_CONTEXT_A_INVALID fixture_forced")
+        expect(await waitForFixtureLine(worker, "FIXTURE_MODEL_CONTEXT_A_PROJECTION_"))
+          .toMatch(/^FIXTURE_MODEL_CONTEXT_A_PROJECTION_(VALID|INVALID)$/)
+        const diagnostic = await waitForFixtureLine(worker, "FIXTURE_HISTORY_A ")
+        const diagnosticFields = diagnostic.slice("FIXTURE_HISTORY_A ".length).split(" ")
+        const values = Object.fromEntries(diagnosticFields.map(field => {
+          const [key, value] = field.split("=")
+          return [key, value]
+        })) as Record<string, string>
+        const allowedFields: Record<string, RegExp> = {
+          snapshots: /^\d+$/, outcomes: /^\d+$/, sourceQueries: /^\d+$/,
+          sample: /^after_context$/, consistency: /^read_committed$/, clock: /^postgres_sample$/,
+          liveOwner: /^(present|ambiguous|missing|unknown)$/,
+          authRows: /^(0|1|2\+)$/, authState: /^(identity_conflict|valid|invalid|multiple_identity|orphan_outbox|missing|unknown)$/,
+          authPayload: /^(valid|invalid|multiple|orphan_outbox|missing|unknown)$/,
+          consent: /^(enabled|disabled|unknown)$/, capturedGate: /^(enabled|disabled|unknown)$/,
+          runtimeGate: /^(enabled|disabled|unknown)$/, observedReadGate: /^(enabled|disabled|unknown)$/,
+          observedSteer: /^(no_accepted_steer|accepted_steer|unsafe|error|not_reached)$/,
+          observedSteerRootRows: /^(0|1|2\+|unknown)$/,
+          observedSteerStepRows: /^(0|1|2\+|unknown)$/,
+          observedSteerInputRows: /^(0|1|2\+|over64|unknown)$/,
+          observedSteerEventRows: /^(0|1|2\+|over64|unknown)$/,
+          observedSteerReason: /^(not_reached|probe_inconclusive|no_accepted_steer|accepted_steer|unsafe_unclassified|root_fence|step_fence|probe_unclassified|input_overflow|input_scope|input_lifecycle|input_schema|input_duplicate_identity|event_overflow|input_event_count|event_scope|event_schema|event_duplicate_identity|event_input_binding|input_event_missing)$/,
+          observedTurnOrigin: /^(present|missing|not_reached)$/,
+          observedRootFence: /^(present|missing|error|not_reached)$/,
+          observedFenceOrigin: /^(present|missing|not_available|error|not_reached)$/,
+          observedObjective: /^(present|missing|not_available|error|not_reached)$/,
+          observedStartWitness: /^(present|missing|ambiguous|not_available|error|not_reached)$/,
+          observedIdentity: /^(eligible|ineligible|not_reached)$/,
+          probe: /^(complete|incomplete|timeout_inconclusive)$/,
+        }
+        expect(diagnosticFields).toHaveLength(Object.keys(allowedFields).length)
+        expect(new Set(diagnosticFields.map(field => field.split("=")[0])).size).toBe(diagnosticFields.length)
+        expect(Object.keys(values).sort()).toEqual(Object.keys(allowedFields).sort())
+        for (const [key, pattern] of Object.entries(allowedFields)) expect(values[key]).toMatch(pattern)
+        await waitForTurnStatus(pool!, turnId, "failed")
+        expect((await pool!.query(`SELECT 1 FROM "agent_events" WHERE "turnId"=$1 AND "type"='turn.failed'`, [turnId])).rows)
+          .toHaveLength(1)
+        expect(worker.output).not.toContain("FIXTURE_RESTART_BOUNDARY_READY")
+        await stopFixtureWorker(worker)
+        expect(worker.exitCode).toBe(0)
+      } finally {
+        if (worker) await forceWorkerExit(worker)
+        if (!(await turnQueue!.isPaused())) { await turnQueue!.pause(); queuePaused = true }
+        try { await removeFixtureTurnJobs(turnId) } finally {
+          if (queuePaused || await turnQueue!.isPaused()) await turnQueue!.resume()
+        }
+      }
+    }, 45_000)
+
     it("replays the committed source snapshot in Worker B without requerying or replacing it", async () => {
       await runObjectiveSnapshotWorkerRestart(pool!, false)
     }, 120_000)

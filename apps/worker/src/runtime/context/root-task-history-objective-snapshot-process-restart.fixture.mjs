@@ -533,7 +533,12 @@ async function startRuntime(firstWorker) {
               AND event."turnId"=turn."id" AND event."type"='agent.plan.root_task_history_memory_snapshot'
             WHERE turn."id"=$1`, [input.turnId])
           let contextFailure
-          try { historyProjection(request) } catch (error) { contextFailure = error }
+          let contextProjectionValid = false
+          try { historyProjection(request); contextProjectionValid = true } catch (error) { contextFailure = error }
+          if (mode === "worker-a-diagnostic" && input.forceContextFailureForDiagnostic === true) {
+            say(`FIXTURE_MODEL_CONTEXT_A_PROJECTION_${contextProjectionValid ? "VALID" : "INVALID"}`)
+            contextFailure = new Error("objective_snapshot_context_invalid:fixture_forced")
+          }
           let eligibility = ""
           if (contextFailure) {
             try { eligibility = await diagnoseHistoryEligibility(flags.crossSessionRootTaskHistoryEnabled) } catch { eligibility = "probe=incomplete" }
@@ -614,12 +619,17 @@ async function waitForStop() {
 async function run() {
   if (!process.env.AGENT_RUNTIME_PG_TEST_URL || !process.env.AGENT_TURN_REDIS_TEST_URL) throw new Error("fixture_services_missing")
   instrumentCandidateWindowQueries()
-  if (mode === "worker-a") {
+  if (mode === "worker-a" || mode === "worker-a-diagnostic") {
+    if (mode === "worker-a-diagnostic" && input.forceContextFailureForDiagnostic !== true) {
+      throw new Error("objective_snapshot_diagnostic_flag_required")
+    }
     await startRuntime(true)
     say("FIXTURE_WORKER_READY_A")
-    await waitForRestartReady(input.turnId)
-    say(`FIXTURE_CROSS_SESSION_SOURCE_QUERY_COUNT_A ${crossSessionSourceQueries}`)
-    say("FIXTURE_RESTART_BOUNDARY_READY")
+    if (mode === "worker-a") {
+      await waitForRestartReady(input.turnId)
+      say(`FIXTURE_CROSS_SESSION_SOURCE_QUERY_COUNT_A ${crossSessionSourceQueries}`)
+      say("FIXTURE_RESTART_BOUNDARY_READY")
+    }
   } else {
     await startRuntime(false)
     say("FIXTURE_WORKER_READY_B")

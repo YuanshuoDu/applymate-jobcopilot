@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 
 import { I18nProvider, translate } from '@/lib/i18n'
+import { TASK_GRAPH_SOURCES_SCHEMA_VERSION } from '@/lib/agent/session/final-task-graph-source-manifest'
 import { HarnessItem, ToolLifecycleCard, reducePlanSteps } from './HarnessItem'
 import type { TimelineItem } from './timeline-reducer'
 
@@ -81,6 +82,27 @@ describe('HarnessItem renderers', () => {
       expect(html).not.toContain('data-agent-answer-evidence')
       expect(html).not.toContain('data-agent-source-marker')
     }
+  })
+
+  it('shows related task disclosure only on a completed final answer and never prints its selector', () => {
+    const sourceKey = `src_${'B'.repeat(43)}`
+    const content = {
+      text: 'Answer remains unchanged.',
+      taskGraphSources: { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION, graphRevision: 2, sources: [
+        { sourceKey, nodeIndex: 0, role: 'analyst', taskStatus: 'completed', resultState: 'valid', roleResultStatus: 'partial' },
+      ] },
+    }
+    const final = renderToStaticMarkup(<I18nProvider><HarnessItem item={item({ phase: 'final_answer', content })} /></I18nProvider>)
+    const running = renderToStaticMarkup(<I18nProvider><HarnessItem item={item({ phase: 'final_answer', status: 'running', content })} /></I18nProvider>)
+    const commentary = renderToStaticMarkup(<I18nProvider><HarnessItem item={item({ phase: 'commentary', content })} /></I18nProvider>)
+
+    expect(final).toContain('Related task records')
+    expect(final).toContain('These tasks are related to this answer')
+    expect(final).toContain('Answer remains unchanged.')
+    expect(final).not.toContain(sourceKey)
+    expect(final).not.toContain('graphRevision')
+    expect(running).not.toContain('data-agent-related-task-sources')
+    expect(commentary).not.toContain('data-agent-related-task-sources')
   })
 
   it('does not render summaries for non-final, non-message, malformed, or oversized content', () => {

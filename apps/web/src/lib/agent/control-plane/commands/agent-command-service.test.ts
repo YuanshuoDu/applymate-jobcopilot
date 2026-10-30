@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest"
+import { redactSensitiveText } from "@jobcopilot/shared"
 
 import type { PrismaClient } from "@prisma/client"
 
@@ -266,14 +267,21 @@ function startCommand(clientMessageId: string, source: "user" | "automation" = "
 
 function acceptedSteeringRows(count: number): Row[] {
   return Array.from({ length: count }, (_, index) => {
-    const id = `steer-${index}`, clientMessageId = `client-${index}`, acceptedSequence = BigInt(index + 1)
+    const id = `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`
+    const clientMessageId = `client-${index}`, acceptedSequence = BigInt(index + 1)
+    const parts = [{ type: "text", text: "private" }]
+    const disposition = "steered"
     return {
+      inputSessionId: "session_1", inputTargetTurnId: "turn_1", inputUserId: "user_1", inputContent: parts,
       id, clientMessageId, delivery: "steer", status: index % 2 ? "queued" : "accepted", acceptedSequence,
       consumedByStepId: null, consumedAt: null, cancelledAt: null, acceptedType: "input.accepted", acceptedActor: "user",
-      acceptedTaskId: null, acceptedCorrelationId: "turn_1", acceptedItemId: `${id}-item`, acceptedEventSequence: acceptedSequence,
-      acceptedPayload: { inputId: id, clientMessageId, delivery: "steer", source: "user", disposition: "steered" },
+      acceptedEventId: `event-${index}`, acceptedEventSessionId: "session_1", acceptedEventTurnId: "turn_1",
+      acceptedEventTaskId: null, acceptedEventCausationId: null, acceptedEventCorrelationId: "turn_1",
+      acceptedItemId: `${id}-item`, acceptedEventSequence: acceptedSequence,
+      acceptedPayload: { inputId: id, clientMessageId: redactSensitiveText(clientMessageId), delivery: "steer", source: "user", disposition },
+      acceptedItemRowId: `${id}-item`, acceptedItemSessionId: "session_1", acceptedItemTurnId: "turn_1", acceptedItemStepId: null,
       acceptedItemType: "user_message", acceptedItemTaskId: null, acceptedItemStatus: "completed",
-      acceptedItemContent: { parts: [{ type: "text", text: "private" }], clientMessageId, source: "user", disposition: "steered" },
+      acceptedItemContent: { parts, clientMessageId, source: "user", disposition },
     }
   })
 }

@@ -1,7 +1,7 @@
 /** CANONICAL Phase 9 timeline state root — do not duplicate. See #459. */
 
 import { AGENT_STREAM_SCHEMA_VERSION } from '@jobcopilot/agent-protocol'
-import { projectFinalAnswerDisplayContent } from '@/lib/agent/session/final-answer-evidence-projection'
+import { isCanonicalTaskGraphSourceManifestWeb, projectFinalAnswerWithTaskGraphSources } from '@/lib/agent/session/final-task-graph-source-manifest'
 import { normalizeTimelineEvent, normalizeTimelineItem, type TimelineAction } from './timeline-reducer'
 import { createQuestionHydrationPump, filterQuestionHydrationValues, type FinalItemHydrationTarget } from './question-hydration'
 import { hasAllTimelineTargetItems, sortTimelineTailEvents } from './timeline-hydration-order'
@@ -43,7 +43,7 @@ export async function hydrateTimeline(options: TimelineHydrationOptions): Promis
     if (!response.ok) throw new Error(`Timeline restore failed (${response.status})`)
     const page = await response.json() as TimelinePageResponse
     if (options.signal?.aborted) return
-    const item = finalItemFromResponse(page.items, options.finalItemTarget, options.sessionId)
+    const item = await finalItemFromResponse(page.items, options.finalItemTarget, options.sessionId)
     if (item) options.dispatch({ type: 'replay', items: [item] })
     return
   }
@@ -166,13 +166,17 @@ export async function streamAgentTimeline(options: TimelineStreamClientOptions):
   }
 }
 
-function finalItemFromResponse(items: unknown[] | undefined, target: FinalItemHydrationTarget, sessionId: string) {
+async function finalItemFromResponse(items: unknown[] | undefined, target: FinalItemHydrationTarget, sessionId: string) {
   if (!items || items.length !== 1 || !isRecord(items[0]) || items[0].schemaVersion !== AGENT_STREAM_SCHEMA_VERSION || !hasExactKeys(items[0], SAFE_FINAL_ITEM_FIELDS)) return null
   const item = normalizeTimelineItem(items[0]), content = item?.content
   if (!item || !safeId(target.itemId) || !safeId(target.turnId) || item.id !== target.itemId || item.sessionId !== sessionId ||
     item.turnId !== target.turnId || item.type !== 'agent_message' || item.status !== 'completed' || item.phase !== 'final_answer' || !isRecord(content)) return null
-  const projectedContent = projectFinalAnswerDisplayContent(content)
-  return projectedContent ? { ...item, content: projectedContent } : null
+  const projectedContent = projectFinalAnswerWithTaskGraphSources(content)
+  if (!projectedContent) return null
+  const { taskGraphSources, ...answerContent } = projectedContent
+  const safeContent = taskGraphSources && await isCanonicalTaskGraphSourceManifestWeb(item.id, taskGraphSources)
+    ? { ...answerContent, taskGraphSources } : answerContent
+  return { ...item, content: safeContent }
 }
 
 function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean { return Object.keys(value).length === keys.length && keys.every(key => Object.prototype.hasOwnProperty.call(value, key)) }

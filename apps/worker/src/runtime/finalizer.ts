@@ -3,6 +3,7 @@ import type { FinalVerification } from "./verifier.js"
 import type { TurnUsage } from "./budget.js"
 import { formatTaskGraphFinalSummary } from "./subagents/task-graph-final-summary-format.js"
 import { sameTaskGraphFinalSummaryBinding, type TaskGraphFinalSummaryBinding } from "./subagents/task-graph-final-summary-binding.js"
+import { buildTaskGraphFinalSourceManifest } from "./subagents/task-graph-final-source-manifest.js"
 
 export type FinalTerminalReason = "goal_satisfied" | "partial_result" | "budget_exhausted" | "no_progress" | "unrecoverable_error" | "final_unverified"
 
@@ -61,13 +62,49 @@ export function finalizeTurn(input: FinalizeInput): FinalResponse {
 }
 
 function record(value: unknown): Record<string, unknown> { return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {} }
-export function taskGraphFinalSummaryCopiesMatch(expected: TaskGraphFinalSummaryBinding | undefined, current: TaskGraphFinalSummaryBinding | undefined, finalContent: unknown, response: string): boolean {
+export function taskGraphFinalSummaryCopiesMatch(expected: TaskGraphFinalSummaryBinding | undefined, current: TaskGraphFinalSummaryBinding | undefined,
+  finalContent: unknown, response: string, finalItemId: string): boolean {
+  const content = record(finalContent)
   if (!expected || !current) return expected === undefined && current === undefined
+    && !Object.hasOwn(content, "taskGraphSources") && !hasResponseSourceField(content.final) && !hasSerializedSources(response)
   if (!sameTaskGraphFinalSummaryBinding(expected, current)) return false
   let saved: unknown
   try { saved = JSON.parse(response) as unknown } catch { return false }
+  let manifest: ReturnType<typeof buildTaskGraphFinalSourceManifest>
+  try { manifest = buildTaskGraphFinalSourceManifest(expected, finalItemId) } catch { return false }
+  if (hasSerializedSources(response) || hasResponseSourceField(content.final)) return false
+  if (manifest ? !sameJson(content.taskGraphSources, manifest) : Object.hasOwn(content, "taskGraphSources")) return false
   const summary = formatTaskGraphFinalSummary(expected.summary)
-  return record(saved).summary === summary && record(record(finalContent).final).summary === summary
+  return record(saved).summary === summary && record(content.final).summary === summary
+}
+
+function hasSerializedSources(response: string): boolean {
+  try { return hasResponseSourceField(JSON.parse(response) as unknown) } catch { return false }
+}
+function hasResponseSourceField(value: unknown): boolean {
+  const response = record(value)
+  return Object.hasOwn(response, "taskGraphSources") || Object.hasOwn(record(response.answerEvidence), "taskGraphSources")
+    || (Array.isArray(response.evidenceRefs) && response.evidenceRefs.some(item => Object.hasOwn(record(item), "taskGraphSources")))
+}
+function sameJson(left: unknown, right: unknown): boolean {
+  try {
+    const leftJson = stableJson(left), rightJson = stableJson(right)
+    return leftJson !== null && rightJson !== null && leftJson === rightJson
+  } catch { return false }
+}
+function stableJson(value: unknown): string | null {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return JSON.stringify(value)
+  if (typeof value === "number") return Number.isFinite(value) ? JSON.stringify(value) : null
+  if (Array.isArray(value)) {
+    const items = value.map(item => stableJson(item))
+    return items.every((item): item is string => item !== null) ? `[${items.join(",")}]` : null
+  }
+  if (!value || typeof value !== "object" || Object.getOwnPropertySymbols(value).length) return null
+  const prototype = Object.getPrototypeOf(value)
+  if (prototype !== Object.prototype && prototype !== null) return null
+  const keys = Object.keys(value).sort()
+  if (keys.some(key => (value as Record<string, unknown>)[key] === undefined)) return null
+  return `{${keys.map(key => `${JSON.stringify(key)}:${stableJson((value as Record<string, unknown>)[key]) ?? "null"}`).join(",")}}`
 }
 
 export function serializeFinalResponse(response: FinalResponse): string {

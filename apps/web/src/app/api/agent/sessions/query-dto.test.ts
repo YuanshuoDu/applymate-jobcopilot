@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { projectFinalAnswerContent } from "@/lib/agent/session/final-answer-evidence-projection"
+import { canonicalTaskGraphSourceKey } from "@/lib/agent/session/final-task-graph-source-detail"
+import { TASK_GRAPH_SOURCES_SCHEMA_VERSION } from "@/lib/agent/session/final-task-graph-source-manifest"
 import { publicToolCallId, publicToolItemId } from "@/lib/agent/session/public-tool-identity"
 
 import { itemDto, taskDto, turnDto } from "./query-dto"
@@ -257,6 +259,29 @@ describe("agent query DTO redaction", () => {
     }
     expect(itemDto(base).content).toEqual({ text: "Answer" })
     expect(itemDto({ ...base, phase: "commentary" }).content).toEqual({ text: "Answer" })
+  })
+
+  it("preserves only a canonical safe TaskGraph sibling on a completed final item", () => {
+    const source = {
+      sourceKey: canonicalTaskGraphSourceKey("item_final", 3, 0), nodeIndex: 0,
+      role: "scout", taskStatus: "completed", resultState: "missing",
+    }
+    const manifest = { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION, graphRevision: 3, sources: [source] }
+    const base = {
+      id: "item_final", sessionId: "session_1", turnId: "turn_1", stepId: "step_1", taskId: null,
+      type: "agent_message", status: "completed", phase: "final_answer", revision: 2,
+      content: { text: "Answer stays intact.", final: { response: "Answer stays intact." }, taskGraphSources: manifest,
+        privateFinalField: "PRIVATE_RAW_RESULT" },
+      startedAt: null, completedAt: date, createdAt: date, updatedAt: date,
+    }
+    const projected = itemDto(base).content as Record<string, unknown>
+    expect(projected).toEqual({ text: "Answer stays intact.", taskGraphSources: manifest })
+    expect(JSON.stringify(projected)).not.toMatch(/taskId|graphItemId|sessionId|userId|jobId|artifactId|PRIVATE_RAW_RESULT/)
+    expect(itemDto({ ...base, status: "running" }).content).toEqual({ text: "Answer stays intact." })
+    expect(itemDto({ ...base, content: { ...base.content, taskGraphSources: { ...manifest, taskId: "PRIVATE_TASK" } } }).content)
+      .toEqual({ text: "Answer stays intact." })
+    expect(itemDto({ ...base, content: { ...base.content, taskGraphSources: { ...manifest, sources: [{ ...source, sourceKey: "src_" + "A".repeat(43) }] } } }).content)
+      .toEqual({ text: "Answer stays intact." })
   })
 
   it("preserves legacy markers without an evidence field and strips markers when all evidence is rejected", () => {

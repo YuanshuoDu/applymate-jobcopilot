@@ -1,4 +1,5 @@
 import type pg from "pg"
+import { redactSensitiveText } from "@jobcopilot/shared"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
 const { readState } = vi.hoisted(() => ({ readState: vi.fn() }))
@@ -21,8 +22,10 @@ function acceptedRow(overrides: Record<string, unknown> = {}) {
     delivery: "steer", status: "consumed", content: parts, acceptedSequence: "8", consumedByStepId: "step-zero",
     consumedAt: new Date("2026-10-01T10:00:00.000Z"), createdAt: new Date("2026-10-01T09:59:00.000Z"), cancelledAt: null,
     acceptedType: "input.accepted", acceptedActor: "user", acceptedTaskId: null, acceptedCorrelationId: "turn-a",
-    acceptedEventSequence: "8", acceptedPayload: { inputId: "steer-a", clientMessageId: "client-a", delivery: "steer", source: "user", disposition: "user_statement" },
+    acceptedEventSequence: "8", acceptedEventCausationId: null,
+    acceptedPayload: { inputId: "steer-a", clientMessageId: redactSensitiveText("client-a"), delivery: "steer", source: "user", disposition: "user_statement" },
     acceptedItemId: "message-a", acceptedItemType: "user_message", acceptedItemTaskId: null, acceptedItemStatus: "completed",
+    acceptedItemStepId: null,
     acceptedItemContent: { clientMessageId: "client-a", disposition: "user_statement", source: "user", parts },
     ...overrides,
   }
@@ -75,5 +78,45 @@ describe("unresolved steering context hydration", () => {
     const fake = fakeClient()
 
     await expect(loadUnresolvedSteeringContext(fake.client, scope, mapInput, message => new Error(message))).rejects.toThrow("Unresolved steering input is missing its accepted user item")
+  })
+
+  it("accepts an exact redacted UUID and phone-shaped client ID projection while preserving the raw item ID", async () => {
+    const id = "00004912-9422-5000-8000-000000000001", clientMessageId = "4912-9422-1234"
+    readState.mockResolvedValue({ unresolvedInputs: [{ id }], resolvedInputIds: [] })
+    for (const inputId of [id, redactSensitiveText(id)]) {
+      const fake = fakeClient([acceptedRow({
+        id, clientMessageId,
+        acceptedPayload: { inputId, clientMessageId: redactSensitiveText(clientMessageId), delivery: "steer", source: "user", disposition: "user_statement" },
+        acceptedItemContent: { clientMessageId, disposition: "user_statement", source: "user", parts },
+      })])
+
+      await expect(loadUnresolvedSteeringContext(fake.client, scope, mapInput, message => new Error(message)))
+        .resolves.toMatchObject([{ id, clientMessageId }])
+    }
+  })
+
+  it.each([
+    ["caller projection", { acceptedPayload: { inputId: "steer-a", clientMessageId: "different", delivery: "steer", source: "user", disposition: "user_statement" } }],
+    ["redacted non-UUID input ID", { acceptedPayload: { inputId: "[REDACTED_PHONE]", clientMessageId: redactSensitiveText("client-a"), delivery: "steer", source: "user", disposition: "user_statement" } }],
+    ["event causation", { acceptedEventCausationId: "other-event" }],
+    ["event task scope", { acceptedTaskId: "root-a" }],
+    ["accepted item task scope", { acceptedItemTaskId: "child-a" }],
+    ["item Step scope", { acceptedItemStepId: "step-a" }],
+  ])("fails closed when accepted provenance has a mismatched %s", async (_label, patch) => {
+    readState.mockResolvedValue({ unresolvedInputs: [{ id: "steer-a" }], resolvedInputIds: [] })
+    const fake = fakeClient([acceptedRow(patch)])
+
+    await expect(loadUnresolvedSteeringContext(fake.client, scope, mapInput, message => new Error(message)))
+      .rejects.toThrow("Accepted user steering provenance is invalid")
+  })
+
+  it("fails closed when accepted input sequences are duplicated", async () => {
+    readState.mockResolvedValue({ unresolvedInputs: [{ id: "steer-a" }, { id: "steer-b" }], resolvedInputIds: [] })
+    const fake = fakeClient([acceptedRow(), acceptedRow({ id: "steer-b", clientMessageId: "client-b", acceptedPayload: {
+      inputId: "steer-b", clientMessageId: "client-b", delivery: "steer", source: "user", disposition: "user_statement",
+    }, acceptedItemContent: { clientMessageId: "client-b", disposition: "user_statement", source: "user", parts } })])
+
+    await expect(loadUnresolvedSteeringContext(fake.client, scope, mapInput, message => new Error(message)))
+      .rejects.toThrow("Unresolved steering input sequence is ambiguous")
   })
 })
