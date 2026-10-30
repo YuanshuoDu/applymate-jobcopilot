@@ -37,15 +37,15 @@ describe('Dashboard application guidance', () => {
     expect(input.onDiscover).not.toHaveBeenCalled()
   })
 
-  it('reuses only the actionable tasks and passes their original session handler', () => {
+  it('shows attention before ongoing tasks and passes their original session handler', () => {
     const input = { ...props(), tasks: [task('1', 'submitted'), task('2', 'waiting_for_user'), task('3', 'unknown'), task('4', 'filling')] }
     const cards = elements(ApplicationDashboardGuidance(input)).filter(element => element.type === ApplicationTaskCard)
-    expect(cards.map(card => (card.props.task as ApplicationTaskView).id)).toEqual(['2', '3'])
+    expect(cards.map(card => (card.props.task as ApplicationTaskView).id)).toEqual(['2', '3', '4'])
     expect(cards.every(card => card.props.onOpenSession === input.onOpenSession)).toBe(true)
     const html = renderToStaticMarkup(<ApplicationDashboardGuidance {...input} />)
     expect(html).toContain('application.taskCoverage')
     expect(html).not.toContain('Role 1')
-    expect(html).not.toContain('Role 4')
+    expect(html).toContain('Role 4')
   })
 
   it('does not repeat the same job as both saved and due for follow-up', () => {
@@ -119,6 +119,47 @@ describe('Dashboard application guidance', () => {
     const tree = ApplicationDashboardGuidance(input)
     expect(elements(tree).filter(element => element.type === ApplicationTaskCard)).toHaveLength(1)
     expect(renderToStaticMarkup(tree)).toContain('application.viewRecentAttention')
+  })
+
+  it('shows ongoing tasks after attention, bounded to three cards and linked to the original session', () => {
+    const input = { ...props(), tasks: [task('1', 'filling'), task('2', 'waiting_for_user'), task('3', 'analyzing'), task('4', 'waiting_for_authorization'), task('5', 'submitted')] }
+    const cards = elements(ApplicationDashboardGuidance(input)).filter(element => element.type === ApplicationTaskCard)
+    expect(cards.map(card => (card.props.task as ApplicationTaskView).id)).toEqual(['2', '4', '1'])
+    expect(cards.every(card => card.props.onOpenSession === input.onOpenSession)).toBe(true)
+    expect((cards[2].props.task as ApplicationTaskView).sessionId).toBe('session-1')
+  })
+
+  it('does not suggest discovery or repeat ongoing jobs as saved and follow-up shortcuts', () => {
+    const input = { ...props(), tasks: [task('1', 'filling'), task('2', 'generating_materials'), { ...task('3', 'filling'), checkpoint: 'submission_request_started' }] }
+    input.savedJobs[0].id = 'job-2'
+    input.followUps[0].id = 'job-3'
+    const tree = ApplicationDashboardGuidance(input)
+    const cards = elements(tree).filter(element => element.type === ApplicationTaskCard)
+    expect(cards.map(card => (card.props.task as ApplicationTaskView).id)).toEqual(['1', '2', '3'])
+    const html = renderToStaticMarkup(tree)
+    expect(html).not.toContain('application.savedContinue')
+    expect(html).not.toContain('application.followUp')
+    expect(html).not.toContain('dashboard.momentum.savePromising')
+  })
+
+  it('keeps known ongoing tasks visible with explicitly limited coverage', () => {
+    const input = { ...props(), limited: true, tasks: [task('1', 'filling')] }
+    const tree = ApplicationDashboardGuidance(input)
+    expect(elements(tree).filter(element => element.type === ApplicationTaskCard)).toHaveLength(1)
+    const html = renderToStaticMarkup(tree)
+    expect(html).toContain('application.partialSuggestions')
+    expect(html).not.toContain('application.savedContinue')
+  })
+
+  it('deduplicates ongoing jobs beyond the three visible cards', () => {
+    const input = { ...props(), tasks: [task('1', 'waiting_for_user'), task('2', 'unknown'), task('3', 'failed'), task('4', 'filling')] }
+    input.savedJobs[0].id = 'job-4'
+    input.followUps[0].id = 'job-4'
+    const tree = ApplicationDashboardGuidance(input)
+    expect(elements(tree).filter(element => element.type === ApplicationTaskCard)).toHaveLength(3)
+    const html = renderToStaticMarkup(tree)
+    expect(html).not.toContain('application.savedContinue')
+    expect(html).not.toContain('application.followUp')
   })
 
   it('does not suggest discovery for an empty limited snapshot', () => {

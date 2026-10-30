@@ -22,11 +22,13 @@ type Props = {
 }
 
 export function ApplicationDashboardGuidance({ tasks, loading, error, limited, savedJobs, followUps, onOpenApplication, onOpenSession, onOpenAttention, onRefresh, onDiscover, t }: Props) {
-  const allAttention = tasks.filter(task => getApplicationTaskState(task).needsAttention)
-  const attention = allAttention.slice(0, 3)
-  const attentionIds = new Set(allAttention.map(task => task.jobId))
-  const followUp = followUps.find(job => !attentionIds.has(job.id))
-  const savedJob = savedJobs.find(job => job.id !== followUp?.id && !attentionIds.has(job.id))
+  const knownTasks = loading || error ? [] : tasks
+  const allAttention = knownTasks.filter(task => getApplicationTaskState(task).needsAttention)
+  const ongoing = knownTasks.filter(task => ['preparing', 'filling', 'submitting'].includes(getApplicationTaskState(task).kind))
+  const cards = [...allAttention, ...ongoing].slice(0, 3)
+  const displayedOrOngoingIds = new Set([...allAttention, ...ongoing].map(task => task.jobId))
+  const followUp = followUps.find(job => !displayedOrOngoingIds.has(job.id))
+  const savedJob = savedJobs.find(job => job.id !== followUp?.id && !displayedOrOngoingIds.has(job.id))
   const suggestionsAvailable = !loading && !error && !limited
   return <section className="application-dashboard-guidance" aria-labelledby="application-next-steps">
     <div className="application-dashboard-guidance-heading">
@@ -36,8 +38,8 @@ export function ApplicationDashboardGuidance({ tasks, loading, error, limited, s
     {loading && <p role="status">{t('dashboard.momentum.loading')}</p>}
     {error && <div role="status"><p>{t('dashboard.momentum.loadErrorDetail')}</p><button type="button" onClick={onRefresh}>{t('dashboard.momentum.tryAgain')}</button></div>}
     {limited && !loading && !error && <div role="status"><p>{t('application.partialSuggestions')}</p><button type="button" onClick={onRefresh}>{t('application.refreshStatus')}</button></div>}
-    {attention.length > 0 && <div className="application-dashboard-task-list">{attention.map(task => <ApplicationTaskCard key={task.id} task={task} onOpenSession={onOpenSession} />)}</div>}
-    {attention.length > 0 && <button type="button" onClick={onOpenAttention} style={{ minHeight: 36, marginTop: 8, padding: '4px 0', border: 0, background: 'transparent', color: 'var(--primary)', fontWeight: 600, cursor: 'pointer' }}>{t('application.viewRecentAttention')}</button>}
+    {cards.length > 0 && <div className="application-dashboard-task-list">{cards.map(task => <ApplicationTaskCard key={task.id} task={task} onOpenSession={onOpenSession} />)}</div>}
+    {allAttention.length > 0 && <button type="button" onClick={onOpenAttention} style={{ minHeight: 36, marginTop: 8, padding: '4px 0', border: 0, background: 'transparent', color: 'var(--primary)', fontWeight: 600, cursor: 'pointer' }}>{t('application.viewRecentAttention')}</button>}
     <div className="application-dashboard-links">
       {suggestionsAvailable && followUp && <button type="button" onClick={() => onOpenApplication(followUp.id)}>
         <span><small>{t('application.followUp')}</small><strong>{followUp.company} · {followUp.role}</strong></span><ArrowRight size={17} aria-hidden="true" />
@@ -45,7 +47,7 @@ export function ApplicationDashboardGuidance({ tasks, loading, error, limited, s
       {suggestionsAvailable && savedJob && <button type="button" onClick={() => onOpenApplication(savedJob.id)}>
         <span><small>{t('application.savedContinue')}</small><strong>{savedJob.company} · {savedJob.role}</strong></span><ArrowRight size={17} aria-hidden="true" />
       </button>}
-      {suggestionsAvailable && !savedJob && !followUp && attention.length === 0 && <button type="button" onClick={onDiscover}><span>{t('dashboard.momentum.savePromising')}</span><ArrowRight size={17} aria-hidden="true" /></button>}
+      {suggestionsAvailable && !savedJob && !followUp && cards.length === 0 && <button type="button" onClick={onDiscover}><span>{t('dashboard.momentum.savePromising')}</span><ArrowRight size={17} aria-hidden="true" /></button>}
     </div>
   </section>
 }

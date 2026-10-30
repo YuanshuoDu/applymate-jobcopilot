@@ -1,6 +1,7 @@
 import { expect, test, type Page, type Route } from '@playwright/test'
 import { createRequire } from 'node:module'
 import { createServer, type Server } from 'node:http'
+import { randomInt } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -91,14 +92,27 @@ test.beforeAll(async () => {
       } else { response.statusCode = 404; response.end('Unexpected fixture request') }
     })().catch(error => { response.statusCode = 500; response.end(String(error)) })
   })
-  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
-  const address = server.address()
-  if (!address || typeof address === 'string') throw new Error('Fixture server has no TCP port')
-  origin = `http://127.0.0.1:${address.port}`
+  // Bind directly within a browser-safe range; some Windows ephemeral ranges
+  // include Chromium's blocked ports (e.g. 6669).
+  for (let attempt = 0; attempt < 64; attempt++) {
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once('error', reject)
+        server.listen(randomInt(20000, 60000), '127.0.0.1', () => { server.removeListener('error', reject); resolve() })
+      })
+      const address = server.address()
+      if (!address || typeof address === 'string') throw new Error('Fixture server has no TCP port')
+      origin = `http://127.0.0.1:${address.port}`
+      break
+    } catch (error) {
+      if (!(error instanceof Error) || !('code' in error) || error.code !== 'EADDRINUSE') throw error
+    }
+  }
+  if (!origin) throw new Error('Fixture server could not obtain a browser-safe port')
 })
 
 test.afterAll(async () => {
-  if (server) await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+  if (server?.listening) await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
   if (temporaryDirectory) {
     const target = await realpath(temporaryDirectory)
     if (path.dirname(target) !== await realpath(tmpdir()) || !path.basename(target).startsWith('applymate-application-flow-')) throw new Error('Unexpected fixture cleanup path')
@@ -425,6 +439,50 @@ test('a failed jobs refresh shows an error and retry restores the list', async (
   expect(state.unexpected).toEqual([])
 })
 
+test('opens the exact application from a keyboard-accessible Kanban card and retains the board', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name.startsWith('mobile-'), 'Kanban desktop interaction')
+  const state = await install(page, { descriptionMode: 'two' })
+  await page.goto(`${origin}/?page=jobs&jobsView=kanban`)
+  const card = page.locator('[data-col="saved"] [draggable="true"]').filter({ hasText: 'Second fixture role' })
+  await expect(card).toBeVisible()
+  const openApplication = card.getByRole('button', { name: /View this application|查看此申请/ })
+  await expect(openApplication).toBeVisible()
+  await expect(openApplication).toHaveAccessibleName(/Second Employer.*Second fixture role/)
+  expect(await openApplication.evaluate(element => (element as HTMLButtonElement).tabIndex)).toBeGreaterThanOrEqual(0)
+  await openApplication.focus()
+  await page.keyboard.press('Enter')
+  const drawer = page.getByRole('dialog')
+  await expect(drawer).toContainText('Second fixture role')
+  await expect(drawer).toContainText('Second Employer')
+  await expect(page).toHaveURL(/highlight=job-2/)
+  await page.keyboard.press('Escape')
+  await expect(drawer).toHaveCount(0)
+  await expect(page).toHaveURL(/jobsView=kanban/)
+  await expect(card).toBeVisible()
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+test('Kanban cards retain drag-to-status after adding the application entry', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name.startsWith('mobile-'), 'Kanban desktop interaction')
+  const state = await install(page, { descriptionMode: 'two' })
+  const changes: unknown[] = []
+  await page.route('**/api/jobs/job-2', async route => {
+    if (route.request().method() !== 'PATCH') return route.fallback()
+    changes.push(route.request().postDataJSON())
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ id: 'job-2', status: 'interview' }) })
+  })
+  await page.goto(`${origin}/?page=jobs&jobsView=kanban`)
+  const card = page.locator('[data-col="saved"] [draggable="true"]').filter({ hasText: 'Second fixture role' })
+  await expect(card.getByRole('button', { name: /View this application|查看此申请/ })).toBeVisible()
+  const destination = page.locator('[data-col="interview"]')
+  await card.dragTo(destination)
+  await expect.poll(() => changes).toEqual([{ status: 'interview' }])
+  await expect(destination.locator('[draggable="true"]').filter({ hasText: 'Second fixture role' })).toBeVisible()
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
 test('restores a highlighted job outside the current page and retains list context through the real Resume page', async ({ page }) => {
   const state = await install(page)
   await open(page, '&jobsPage=3&jobsSize=50&jobsSearch=Acme&jobsStatus=saved&jobsSort=score&jobsDirection=asc')
@@ -459,6 +517,341 @@ test('restores a highlighted job outside the current page and retains list conte
   expect(state.unexpected).toEqual([])
 })
 
+
+for (const change of ['account', 'leave'] as const) {
+  test(`late Resume material confirmation after ${change} does not update the new context`, async ({ page }) => {
+    const state = await install(page, { holdAssign: true })
+    state.job.finalResumeId = null
+    try {
+      await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+      await page.getByRole('button', { name: /Confirm application materials|确认申请材料/, exact: true }).click()
+      const dialog = page.getByRole('dialog', { name: /Confirm application materials|确认申请材料/ })
+      await dialog.getByRole('button', { name: /Confirm application package|确认申请包/, exact: true }).click()
+      await expect.poll(() => state.assignStarted).toBe(true)
+      if (change === 'account') {
+        state.activeUserId = 'fixture-b'
+        await page.evaluate(() => (globalThis as typeof globalThis & { __fixtureSetSession: (status: string, id: string) => void }).__fixtureSetSession('authenticated', 'fixture-b'))
+      } else {
+        await dialog.getByRole('button', { name: /Close final confirmation|关闭最终确认/ }).click()
+        await page.getByRole('button', { name: 'Fixture jobs' }).click()
+        await expect(page).toHaveURL(/page=jobs/)
+      }
+      const late = page.waitForResponse(response => response.url().endsWith('/assign') && response.status() === 200)
+      state.releaseAssign()
+      await (await late).finished()
+      await expect(page.getByText(/Application pack confirmed|申请包已确认/)).toHaveCount(0)
+      if (change === 'leave') await expect(page).toHaveURL(/page=jobs/)
+      expect(state.writes.filter(write => write.path.endsWith('/assign'))).toHaveLength(1)
+      expect(state.unexpected).toEqual([])
+    } finally { state.releaseAssign() }
+  })
+}
+
+for (const mismatch of ['owner', 'job'] as const) {
+  test(`Resume confirmation rejects an assignment response for the wrong ${mismatch}`, async ({ page }) => {
+    const state = await install(page)
+    state.job.finalResumeId = null
+    await page.route('**/api/jobs/outside-page/assign', async route => {
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...state.job, finalResumeId: 'resume-1', ...(mismatch === 'owner' ? { userId: 'fixture-b' } : { id: 'job-2' }) }) })
+    })
+    await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    await page.getByRole('button', { name: /Confirm application materials|确认申请材料/, exact: true }).click()
+    const dialog = page.getByRole('dialog', { name: /Confirm application materials|确认申请材料/ })
+    await dialog.getByRole('button', { name: /Confirm application package|确认申请包/, exact: true }).click()
+    await expect(page.getByText(/Could not confirm application pack|无法确认申请包/)).toBeVisible()
+    await expect(dialog.getByText(/Application pack confirmed|申请包已确认/)).toHaveCount(0)
+    await expect(page).toHaveURL(/page=resume/)
+    expect(state.unexpected).toEqual([])
+  })
+}
+
+for (const auditTiming of ['loaded', 'late'] as const) {
+  test(`Resume audit stays with its job when its ${auditTiming} result is followed by a relink`, async ({ page }) => {
+    const state = await install(page, { descriptionMode: 'two' })
+    state.job.finalResumeId = null
+    if (auditTiming === 'late') await page.addInitScript(() => {
+      const original = window.fetch.bind(window)
+      window.fetch = (input, init) => typeof input === 'string' && input.endsWith('/audit-application') && (!init?.method || init.method === 'GET') ? original(input, { ...init, signal: undefined }) : original(input, init)
+    })
+    let releaseAudit = () => {}
+    const gate = new Promise<void>(resolve => { releaseAudit = resolve })
+    let auditAReads = 0
+    let auditBReads = 0
+    const writes: unknown[] = []
+    await page.route('**/api/jobs?*', route => route.fulfill({ json: { jobs: [state.job, { ...state.job, id: 'job-2', company: 'Second Employer', role: 'Second fixture role' }], total: 2 } }))
+    await page.route('**/api/jobs/*/audit-application', async route => {
+      const id = new URL(route.request().url()).pathname.split('/')[3]
+      if (id === 'outside-page') {
+        auditAReads++
+        if (auditTiming === 'late') await gate
+        return route.fulfill({ json: { ...audit(), audit: { ...audit().audit, summary: 'Audit belongs to first job only' } } })
+      }
+      auditBReads++
+      return route.fulfill({ json: null })
+    })
+    await page.route('**/api/resume/resume-1', async route => {
+      if (route.request().method() !== 'PATCH') return route.fallback()
+      const body = route.request().postDataJSON() as { unlinkJob?: boolean; targetJobId?: string }
+      writes.push(body)
+      return route.fulfill({ json: { ...state.resume, targetJobId: body.unlinkJob ? null : body.targetJobId } })
+    })
+    try {
+      await page.goto(`${origin}/?page=resume&resumeId=resume-1`)
+      await expect.poll(() => auditAReads).toBeGreaterThan(0)
+      if (auditTiming === 'loaded') {
+        await page.getByRole('button', { name: /Confirm application materials|确认申请材料/, exact: true }).click()
+        await expect(page.getByRole('dialog', { name: /Confirm application materials|确认申请材料/ })).toContainText('Audit belongs to first job only')
+        await page.getByRole('button', { name: /Close final confirmation|关闭最终确认/ }).click()
+      }
+      await page.getByRole('button', { name: 'More actions for Fixture role resume' }).click()
+      await page.getByRole('menu').getByRole('button', { name: /Cancel link|取消关联/ }).click()
+      await expect(page.getByText('Cancel job link?')).toBeVisible()
+      await page.getByRole('button', { name: 'Cancel link', exact: true }).click()
+      const chooseJob = page.locator('.resume-opportunity-card select')
+      await chooseJob.selectOption('job-2')
+      await page.locator('.resume-opportunity-card').getByRole('button', { name: /Link resume|关联简历/ }).click()
+      await expect(page.locator('.resume-opportunity-card')).toContainText('Second fixture role')
+      await expect.poll(() => auditBReads).toBeGreaterThan(0)
+      if (auditTiming === 'late') {
+        const late = page.waitForResponse(response => response.url().includes('/outside-page/audit-application') && response.status() === 200)
+        releaseAudit()
+        await (await late).finished()
+        await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+      }
+      await page.getByRole('button', { name: /Confirm application materials|确认申请材料/, exact: true }).click()
+      const dialog = page.getByRole('dialog', { name: /Confirm application materials|确认申请材料/ })
+      await expect(dialog).toContainText('Second fixture role')
+      await expect(dialog).not.toContainText('Audit belongs to first job only')
+      await expect(dialog.getByRole('button', { name: /Confirm application package|确认申请包/, exact: true })).toBeDisabled()
+      await dialog.getByRole('button', { name: /Close final confirmation|关闭最终确认/ }).click()
+      await page.getByRole('button', { name: 'More actions for Fixture role resume' }).click()
+      await page.getByRole('menu').getByRole('button', { name: /Cancel link|取消关联/ }).click()
+      await page.getByRole('button', { name: 'Cancel link', exact: true }).click()
+      await chooseJob.selectOption('outside-page')
+      await page.locator('.resume-opportunity-card').getByRole('button', { name: /Link resume|关联简历/ }).click()
+      await expect(page.locator('.resume-opportunity-card')).toContainText('Application flow engineer')
+      await expect.poll(() => auditAReads).toBeGreaterThan(1)
+      await page.getByRole('button', { name: /Confirm application materials|确认申请材料/, exact: true }).click()
+      await expect(page.getByRole('dialog', { name: /Confirm application materials|确认申请材料/ })).toContainText('Audit belongs to first job only')
+      expect(writes).toHaveLength(4)
+      expect(state.unexpected).toEqual([])
+    } finally { releaseAudit() }
+  })
+}
+
+test('failed fresh resume read hides the previous content until retry succeeds', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name.startsWith('mobile-'), 'Exercises desktop resume library')
+  const state = await install(page, { twoResumes: true })
+  let reads = 0
+  await page.route('**/api/resume/resume-2', async route => {
+    if (route.request().method() !== 'GET') return route.fallback()
+    reads++
+    return reads === 1 ? route.fulfill({ status: 500, json: { error: 'Fixture unavailable' } }) : route.fulfill({ json: state.secondResume })
+  })
+  await page.goto(`${origin}/?page=resume&resumeId=resume-1`)
+  await expect(page.locator('[data-resume-editor]').getByText('Software engineer.', { exact: false }).first()).toBeVisible()
+  await page.locator('.resume-library-item').filter({ hasText: 'Second fixture resume' }).click()
+  const error = page.getByRole('alert').filter({ hasText: /Could not load the selected resume|无法加载所选简历/ })
+  await expect(error).toBeVisible()
+  await expect(page.locator('[data-resume-editor]')).toHaveCount(0)
+  expect(state.writes).toEqual([])
+  await error.getByRole('button', { name: /Retry|重试/ }).click()
+  await expect(page.locator('[data-resume-editor]').getByText('Second resume content.', { exact: false }).first()).toBeVisible()
+  expect(reads).toBe(2)
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+test('edited resume is saved before an audit of its current version', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name.startsWith('mobile-'), 'Exercises desktop resume editor')
+  const state = await install(page, { flowSave: true })
+  await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+  const editor = page.locator('[data-resume-editor]')
+  await editor.getByText('Software engineer.', { exact: false }).first().click()
+  await editor.locator('textarea').first().fill('Edited verified summary')
+  await page.getByRole('button', { name: /Run independent audit|Run audit again|运行独立审核|重新运行审核/ }).click()
+  await expect.poll(() => state.writes.map(write => write.path)).toEqual(['/api/resume/resume-1', '/api/jobs/outside-page/audit-application'])
+  const saved = state.writes[0].body as { content?: { summary?: string } }
+  expect(saved.content?.summary).toBe('Edited verified summary')
+  expect(state.writes[1].body).toEqual({ resumeId: 'resume-1' })
+  await expect(page.getByText(/Fixture materials checked/).first()).toBeVisible()
+  expect(state.unexpected).toEqual([])
+})
+
+test('unconfirmed material assignment blocks another assignment and application navigation', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name.startsWith('mobile-'), 'Exercises desktop resume controls')
+  const state = await install(page)
+  state.job.finalResumeId = null
+  let attempts = 0
+  await page.route('**/api/jobs/outside-page/assign', async route => { attempts++; await route.abort('failed') })
+  await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+  await page.getByRole('button', { name: /Confirm application materials|确认申请材料/, exact: true }).click()
+  await page.getByRole('dialog', { name: /Confirm application materials|确认申请材料/ }).getByRole('button', { name: /Confirm application package|确认申请包/, exact: true }).click()
+  await expect(page.getByText(/Material confirmation is unconfirmed|材料确认结果待核实/)).toBeVisible()
+  await expect(page.getByRole('button', { name: /Confirm application materials|确认申请材料/, exact: true })).toBeDisabled()
+  await expect(page.getByRole('button', { name: /Back to this application|返回此申请/ })).toBeDisabled()
+  await expect(page).toHaveURL(/page=resume/)
+  expect(attempts).toBe(1)
+  expect(state.unexpected).toEqual([])
+})
+
+test('unconfirmed audit correction retains later edits without saving over the uncertain result', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop audit controls')
+  const state = await install(page, { auditCorrection: true })
+  let attempts = 0
+  await page.route('**/api/jobs/outside-page/audit-application/apply', async route => { attempts++; await route.abort('failed') })
+  await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+  const editor = page.locator('[data-resume-editor]')
+  await editor.getByText('Software engineer.', { exact: false }).first().click()
+  await page.getByRole('button', { name: 'Apply generated fix', exact: true }).click()
+  await expect(page.getByText(/The correction result is unconfirmed|材料修正结果待核实/)).toBeVisible()
+  await editor.getByText('Software engineer.', { exact: false }).first().click()
+  await editor.locator('textarea').first().fill('Local edit after uncertain correction')
+  await page.waitForTimeout(2300)
+  await expect(editor.locator('textarea').first()).toHaveValue('Local edit after uncertain correction')
+  expect(state.writes.filter(write => write.path === '/api/resume/resume-1')).toEqual([])
+  expect(attempts).toBe(1)
+  expect(state.unexpected).toEqual([])
+})
+
+test('pending and unconfirmed job link blocks another link, review and return', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name.startsWith('mobile-'), 'Exercises desktop resume controls')
+  const state = await install(page, { descriptionMode: 'two' })
+  state.job.finalResumeId = null
+  let release = () => {}
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const requests: unknown[] = []
+  await page.route('**/api/resume', route => route.fulfill({ json: [{ ...state.resume, targetJobId: null }] }))
+  await page.route('**/api/resume/resume-1', async route => {
+    if (route.request().method() === 'GET') return route.fulfill({ json: { ...state.resume, targetJobId: null } })
+    requests.push(route.request().postDataJSON())
+    await gate
+    return route.abort('failed')
+  })
+  try {
+    await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    const card = page.locator('.resume-opportunity-card')
+    const select = card.locator('select')
+    await select.selectOption('outside-page')
+    const link = card.getByRole('button', { name: /Link resume|关联简历/ })
+    await link.click()
+    await expect.poll(() => requests).toEqual([{ targetJobId: 'outside-page' }])
+    await expect(page.getByText(/Saving the job link|正在保存职位关联/)).toBeVisible()
+    await select.selectOption('job-2')
+    await expect(link).toBeDisabled()
+    await expect(page.getByRole('button', { name: /Confirm application materials|确认申请材料/, exact: true })).toBeDisabled()
+    await expect(page.getByRole('button', { name: /Back to this application|返回此申请/ })).toBeDisabled()
+    release()
+    await expect(page.getByText(/The job link is unconfirmed|职位关联结果待核实/)).toBeVisible()
+    await expect(link).toBeDisabled()
+    await expect(page.getByRole('button', { name: /Confirm application materials|确认申请材料/, exact: true })).toBeDisabled()
+    await expect(page.getByRole('button', { name: /Back to this application|返回此申请/ })).toBeDisabled()
+    expect(requests).toEqual([{ targetJobId: 'outside-page' }])
+    expect(state.writes).toEqual([])
+    expect(state.unexpected).toEqual([])
+  } finally { release() }
+})
+
+test('late audit correction after unlink keeps local edits without automatic save', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop audit controls')
+  const state = await install(page, { auditCorrection: true, holdAuditCorrection: true })
+  state.job.finalResumeId = null
+  let unlinkWrites = 0
+  await page.route('**/api/resume/resume-1', async route => {
+    if (route.request().method() !== 'PATCH') return route.fallback()
+    const body = route.request().postDataJSON() as { unlinkJob?: boolean }
+    if (!body.unlinkJob) return route.fallback()
+    unlinkWrites++
+    return route.fulfill({ json: { ...state.resume, targetJobId: null } })
+  })
+  try {
+    await page.goto(`${origin}/?page=resume&resumeId=resume-1`)
+    await page.getByRole('button', { name: 'Apply generated fix', exact: true }).click()
+    await expect.poll(() => state.writes.some(write => write.path.endsWith('/audit-application/apply'))).toBe(true)
+    const editor = page.locator('[data-resume-editor]')
+    await editor.getByText('Software engineer.', { exact: false }).first().click()
+    await editor.locator('textarea').first().fill('Local edit during first job correction')
+    await page.getByRole('button', { name: 'More actions for Fixture role resume' }).click()
+    await page.getByRole('menu').getByRole('button', { name: /Cancel link|取消关联/ }).click()
+    await page.getByRole('button', { name: 'Cancel link', exact: true }).click()
+    await expect(page.locator('.resume-opportunity-card select')).toBeVisible()
+    expect(unlinkWrites).toBe(1)
+    const late = page.waitForResponse(response => response.url().endsWith('/audit-application/apply') && response.status() === 200)
+    state.releaseAuditCorrection()
+    await (await late).finished()
+    await expect(page.getByText(/Copy them, then reload and review|请先复制/).first()).toBeVisible()
+    await expect(editor.getByText('Local edit during first job correction', { exact: false }).first()).toBeVisible()
+    await page.waitForTimeout(2300)
+    expect(state.writes.filter(write => write.path === '/api/resume/resume-1')).toEqual([])
+    expect(state.unexpected).toEqual([])
+  } finally { state.releaseAuditCorrection() }
+})
+
+for (const responseKind of ['empty', 'wrong-resume', 'wrong-owner', 'missing-date', 'invalid-date', 'network'] as const) {
+  test(`resume save ${responseKind} result preserves the draft without retry or navigation`, async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop resume save controls')
+    const state = await install(page)
+    let attempts = 0
+    await page.route('**/api/resume/resume-1', async route => {
+      if (route.request().method() !== 'PATCH') return route.fallback()
+      attempts++
+      if (responseKind === 'network') return route.abort('failed')
+      const data = responseKind === 'empty' ? {} : { ...state.resume,
+        ...(responseKind === 'wrong-resume' ? { id: 'resume-2' } : {}),
+        ...(responseKind === 'wrong-owner' ? { userId: 'fixture-b' } : {}),
+        ...(responseKind === 'missing-date' ? { updatedAt: undefined } : {}),
+        ...(responseKind === 'invalid-date' ? { updatedAt: 'invalid' } : {}) }
+      return route.fulfill({ status: 200, json: data })
+    })
+    await page.goto(`${origin}/?shell=1&page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    const editor = page.locator('[data-resume-editor]')
+    await editor.getByText('Software engineer.', { exact: false }).first().click()
+    await editor.locator('textarea').first().fill('Draft remains after uncertain save')
+    await expect(page.locator('.resume-top-save')).toContainText(/Saving soon|即将保存/)
+    await page.getByRole('button', { name: /Back to this application|返回此申请/ }).click()
+    await expect.poll(() => attempts).toBe(1)
+    await expect(page.getByText(/The resume save is unconfirmed|简历保存结果待核实/)).toBeVisible()
+    await expect(editor.getByText('Draft remains after uncertain save', { exact: false }).first()).toBeVisible()
+    await expect(page).toHaveURL(/page=resume/)
+    await page.waitForTimeout(2300)
+    expect(attempts).toBe(1)
+    expect(state.writes).toEqual([])
+    expect(state.unexpected).toEqual([])
+  })
+}
+
+test('resume save waits for subsequent edits and confirms both valid responses', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop resume save controls')
+  const state = await install(page)
+  let release = () => {}
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const saves: Array<{ content: { summary: string } }> = []
+  await page.route('**/api/resume/resume-1', async route => {
+    if (route.request().method() !== 'PATCH') return route.fallback()
+    const body = route.request().postDataJSON() as { content: { summary: string } }
+    saves.push(body)
+    const first = saves.length === 1
+    if (first) await gate
+    return route.fulfill({ json: { ...state.resume, ...body, updatedAt: first ? '2026-10-30T11:00:00.000Z' : '2026-10-30T12:00:00.000Z' } })
+  })
+  try {
+    await page.goto(`${origin}/?shell=1&page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    const editor = page.locator('[data-resume-editor]')
+    await editor.getByText('Software engineer.', { exact: false }).first().click()
+    const input = editor.locator('textarea').first()
+    await input.fill('First edit')
+    await expect.poll(() => saves.length).toBe(1)
+    await input.fill('Later edit')
+    release()
+    await expect.poll(() => saves.length).toBe(2)
+    expect(saves.map(save => save.content.summary)).toEqual(['First edit', 'Later edit'])
+    await expect(page.getByText(/The resume save is unconfirmed|简历保存结果待核实/)).toHaveCount(0)
+    await page.getByRole('button', { name: /Back to this application|返回此申请/ }).click()
+    await expect(page).toHaveURL(/page=jobs/)
+    await expect(page).toHaveURL(/highlight=outside-page/)
+    expect(state.unexpected).toEqual([])
+  } finally { release() }
+})
 
 test('confirmed resume opens the same application without local export', async ({ page }) => {
   const state = await install(page)
@@ -1983,14 +2376,14 @@ test('a failed delayed save keeps the original resume selected', async ({ page }
     await page.getByText('Second fixture resume', { exact: true }).click()
     await expect.poll(() => state.writes.filter(item => item.path === '/api/resume/resume-1').length).toBeGreaterThan(0)
     state.releaseSave()
-    await expect(page.getByText('Save failed', { exact: false }).first()).toBeVisible()
+    await expect(page.getByText(/resume save is unconfirmed|简历保存结果待核实/i).first()).toBeVisible()
     await expect(page.getByText('Edited fixture summary', { exact: false }).first()).toBeVisible()
     await expect(page.getByText('Second resume content.', { exact: false })).toHaveCount(0)
     expect(state.writes.every(item => item.path === '/api/resume/resume-1')).toBe(true)
     expect(state.unexpected).toEqual([])
-    // The editor is still dirty. Drain its already-scheduled two-second
-    // autosave through the mock while preserving the real unload guard.
-    await expect.poll(() => state.saveResponses, { timeout: 10_000 }).toBeGreaterThanOrEqual(2)
+    // A failed response does not prove that the write did not commit.
+    await page.waitForTimeout(2300)
+    expect(state.saveResponses).toBe(1)
     await expect(page.getByText('Edited fixture summary', { exact: false }).first()).toBeVisible()
     expect(await page.evaluate(() => { const event = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(event); return event.defaultPrevented })).toBe(true)
     expect(state.writes.every(item => item.path === '/api/resume/resume-1')).toBe(true)
@@ -2359,7 +2752,7 @@ test('A analysis finishing during B is reused when returning to A', async ({ pag
 
 
 for (const pending of ['resume GET', 'analysis'] as const) {
-  test(`audit correction survives an older ${pending} response`, async ({ page }, testInfo) => {
+  test(pending === 'resume GET' ? 'audit correction waits for current resume verification' : 'audit correction survives an older analysis response', async ({ page }, testInfo) => {
     test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop audit controls')
     const state = await install(page, { holdResumeContent: pending === 'resume GET', snapshotResumeContent: true, holdOldAnalysis: pending === 'analysis', versionedScore: true, auditCorrection: true })
     await page.addInitScript(cached => sessionStorage.setItem('fixture_cached_resume', JSON.stringify(cached)), resume())
@@ -2373,17 +2766,20 @@ for (const pending of ['resume GET', 'analysis'] as const) {
       }
       await expect(page.locator('[data-resume-editor]').getByText('Software engineer.', { exact: false }).first()).toBeVisible()
       await page.getByRole('button', { name: 'Apply generated fix', exact: true }).click()
+      if (pending === 'resume GET') {
+        expect(state.writes.map(write => write.path)).not.toContain('/api/jobs/outside-page/audit-application/apply')
+        const currentRead = page.waitForResponse(response => response.url().endsWith('/api/resume/resume-1') && response.request().method() === 'GET')
+        state.releaseResumeContent()
+        await (await currentRead).finished()
+        await page.getByRole('button', { name: 'Apply generated fix', exact: true }).click()
+      }
       await expect.poll(() => state.writes.map(write => write.path)).toContain('/api/jobs/outside-page/audit-application/apply')
       await expect(page.locator('[data-resume-editor]').getByText('Audited v2 summary', { exact: false }).first()).toBeVisible()
       await expect.poll(() => page.evaluate(() => {
         const read = (window as unknown as { __fixtureGetCachedResume: () => { updatedAt?: string; content?: { summary?: string } } | null }).__fixtureGetCachedResume
         return read()
       })).toMatchObject({ updatedAt: newTime, content: { summary: 'Audited v2 summary' } })
-      if (pending === 'resume GET') {
-        const oldGet = page.waitForResponse(response => response.url().endsWith('/api/resume/resume-1') && response.request().method() === 'GET')
-        state.releaseResumeContent()
-        await (await oldGet).finished()
-      } else {
+      if (pending === 'analysis') {
         const oldAnalysis = ['/api/ai/score', '/api/ai/suggest'].map(endpoint => page.waitForResponse(response => response.url().endsWith(endpoint)))
         state.releaseOldAnalysis()
         await Promise.all((await Promise.all(oldAnalysis)).map(response => response.finished()))

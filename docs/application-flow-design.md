@@ -45,7 +45,8 @@ Agent 负责原任务的执行和审批，招聘消息负责查看回复。
 
 看板还保留手动拖动职位到不同进展栏的功能；拖到“已申请”会直接修改申请状态，
 并写入普通状态变更记录，不会产生上述手动提交记录的来源标记。请只在实际情况
-明确时调整状态，并以雇主回执核对；看板状态本身不是回执。
+明确时调整状态，并以雇主回执核对；看板状态本身不是回执。点击卡片上的“查看此申请”
+可打开对应职位，关闭后仍回到看板。
 
 ### Agent 协助申请
 
@@ -75,6 +76,9 @@ Agent 负责原任务的执行和审批，招聘消息负责查看回复。
 登录原账号并刷新登录状态。恢复界面提供可复制的内存草稿；请先复制，再打开最新
 简历逐项核对，系统不会自动覆盖已保存版本。确认关闭或刷新当前页后草稿会消失。
 恢复历史版本会立即修改已保存的简历；若结果无法确认，先重新加载核对，不要重复恢复。
+职位关联、材料确认或审核修正结果待核实时，先复制未保存的编辑，再重新加载并核对；
+页面会阻止相关重复操作。一次读取不能证明仍在处理的写入没有发生，页面内保护也不跨
+标签页或重载。切换简历后如读取失败，重试并确认所选版本，旧内容不会被作为新简历使用。
 草稿恢复到最新简历后，只有原来进入编辑器时存在可信的职位与返回列表上下文，才会
 恢复该职位和筛选条件；否则不会从当前其他账号的地址猜测关联。
 查看、返回或刷新简历不会自动启动 AI 分析；需要时请点击“分析匹配度”。
@@ -305,8 +309,8 @@ is a snapshot and does not by itself prevent concurrent changes in another tab.
 ## 9. Dashboard and Inbox
 
 Dashboard puts recent task attention before Momentum. It shows at most three
-recent attention cards and existing saved/follow-up continuations, excluding a
-second card for a job already shown as requiring attention and without claiming
+recent attention or in-progress task cards and existing saved/follow-up continuations, excluding
+jobs with known attention or in-progress tasks and without claiming
 a full global pending count. Job cards and timeline entries navigate to
 their real job when one is present; entries without job identity do not guess.
 
@@ -332,6 +336,11 @@ Focused tests cover saved identities, cancellation after unmount/account change,
 history navigation, save-before-return, optional letters, stale versions, bounded
 task coverage, uncertain outcomes and read-only task links. Mounted browser
 fixtures exercise real components with synthetic sessions and mocked requests.
+An isolated CI fixture also signs in with real synthetic credentials against a
+disposable database, saves a synthetic search result, opens and reloads its exact
+application, and checks that another account cannot read it. Search is mocked and
+database RLS is disabled; this does not establish production permissions or a
+complete authenticated application journey.
 One fixture opens the original Agent session from an application, answers a mock
 question, reviews a mock approval and displays a simulated unverified outcome;
 its state changes are injected by the fixture and page reloads. These checks prove

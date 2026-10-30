@@ -26,7 +26,7 @@ import type { ApplicationTaskView } from '@/components/jobs/application-task-mod
 import { forgetSavedApplication } from '@/components/jobs/application-search-state'
 import { applicationTaskAllowsManualWork } from '@/components/jobs/application-attention-safety'
 import { clearManualRecordLock, readManualRecordLock, writeManualRecordLock, type ManualRecordLock } from '@/components/jobs/application-manual-record'
-import { openApplication, openApplicationSession } from '@/lib/application-navigation'
+import { openApplication, openApplicationSession, replaceApplicationHistory } from '@/lib/application-navigation'
 
 const KANBAN_COLS: JobStatus[] = ['saved', 'applied', 'interview', 'offer', 'rejected']
 type DescriptionDraft = { text: string; revision: number; uncertain: boolean }
@@ -337,10 +337,11 @@ function MobileListView({ jobs, taskByJobId, onOpenSession, onRowClick, selected
 }
 
 // ── KanbanView ────────────────────────────────────────────────────────────────
-function KanbanView({ jobs, onStatusChange, onAddClick }: {
+function KanbanView({ jobs, onStatusChange, onAddClick, onRowClick }: {
   jobs: Job[]
   onStatusChange: (id: string, status: JobStatus) => void
   onAddClick: (status: JobStatus) => void
+  onRowClick: (job: Job) => void
 }) {
   const { t } = useI18n()
   const toast  = useToast()
@@ -420,6 +421,10 @@ function KanbanView({ jobs, onStatusChange, onAddClick }: {
                 ) : null
               })() : null}
               <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{fmtDate(job.appliedAt ?? job.createdAt)}</div>
+              <button type="button" aria-label={`${t('application.viewApplication')}: ${job.company} · ${job.role}`}
+                onClick={() => onRowClick(job)} style={{ minHeight: 36, marginTop: 8, border: 0, background: 'transparent', color: 'var(--primary)', cursor: 'pointer', padding: '4px 0' }}>
+                {t('application.viewApplication')}
+              </button>
             </div>
           ))}
           <button
@@ -1897,7 +1902,7 @@ export function JobsPage() {
     const url = new URL(window.location.href)
     if (attentionView) url.searchParams.set('jobsAttention', '1')
     else url.searchParams.delete('jobsAttention')
-    window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`)
+    replaceApplicationHistory(`${url.pathname}${url.search}${url.hash}`)
   }, [attentionView])
 
   useEffect(() => {
@@ -2147,7 +2152,7 @@ export function JobsPage() {
                 </div>
                 <MobileListView onOpenSession={id => openApplicationSession(id, navigate)} taskByJobId={applicationTasks.byJobId} jobs={jobs} onRowClick={selectApplication} selectedIds={selectedIds} onToggle={toggleSelected} />
               </>
-              : <KanbanView jobs={jobs} onStatusChange={handleStatusChange} onAddClick={col => { setPrefillStatus(col); setShowAdd(true) }} />}
+              : <KanbanView jobs={jobs} onStatusChange={handleStatusChange} onAddClick={col => { setPrefillStatus(col); setShowAdd(true) }} onRowClick={selectApplication} />}
 
             {/* ── Pagination bar ── */}
             {total > pageSize && (
