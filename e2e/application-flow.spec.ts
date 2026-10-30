@@ -12,6 +12,7 @@ let server: Server
 let origin: string
 
 test.beforeAll(async () => {
+  test.setTimeout(120_000)
   temporaryDirectory = await mkdtemp(path.join(tmpdir(), 'applymate-application-flow-'))
   const webRoot = path.resolve(__dirname, '../apps/web')
   const webRequire = createRequire(path.join(webRoot, 'package.json'))
@@ -19,11 +20,19 @@ test.beforeAll(async () => {
   const viteRequire = createRequire(vitestRequire.resolve('vite'))
   const { build } = viteRequire('esbuild') as { build(options: object): Promise<unknown> }
   const authPath = path.join(temporaryDirectory, 'auth.js')
-  await writeFile(authPath, `export function useSession(){return {status:'authenticated',data:{user:{id:'fixture-user',name:'Fixture Candidate'}}}}`)
+  await writeFile(authPath, `export function useSession(){return {status:'authenticated',data:{user:{id:'fixture-user',name:'Fixture Candidate'}}}}; export function signOut(){}`)
+  const dynamicPath = path.join(temporaryDirectory, 'dynamic.js')
+  await writeFile(dynamicPath, `import React from ${JSON.stringify(webRequire.resolve('react'))}; export default function dynamic(loader){const Component=React.lazy(()=>loader().then(value=>({default:value}))); return function Dynamic(){return React.createElement(React.Suspense,{fallback:null},React.createElement(Component))}}`)
+  const navigationPath = path.join(temporaryDirectory, 'navigation.js')
+  await writeFile(navigationPath, `export function useRouter(){return {push(){},replace(){},refresh(){},prefetch(){}}}`)
+  const unusedPagePath = path.join(temporaryDirectory, 'unused-page.js')
+  await writeFile(unusedPagePath, `export const GmailPage=()=>null,JobRecommendationsPage=()=>null,AgentPlaygroundPage=()=>null,AgentHistoryPage=()=>null,SettingsPage=()=>null,ObservabilityPage=()=>null,ContactUsPage=()=>null`)
+
   await build({
     stdin: { contents: `
-      import React, {useEffect, useState} from 'react';
+      import React, {useEffect, useState, useSyncExternalStore} from 'react';
       import {createRoot} from 'react-dom/client';
+      import {AppShell} from '@/components/layout/AppShell';
       import {JobsPage} from '@/components/pages/JobsPage';
       import {ResumePage} from '@/components/pages/ResumePage';
       import {SearchPage} from '@/components/pages/SearchPage';
@@ -31,6 +40,8 @@ test.beforeAll(async () => {
       import {I18nProvider} from '@/lib/i18n';
       import {ToastProvider} from '@/components/ui';
       import {NavContext} from '@/lib/nav-context';
+      const subscribeLocation=(cb)=>{addEventListener('popstate',cb);return()=>removeEventListener('popstate',cb)};
+      function AgentDestination(){const sessionId=useSyncExternalStore(subscribeLocation,()=>new URL(location.href).searchParams.get('sessionId'),()=>null);return <div data-testid="agent-destination">{sessionId}</div>}
       function Harness(){
         const [page,setPage]=useState(new URL(location.href).searchParams.get('page')||'jobs');
         const navigate=(next)=>{const url=new URL(location.href);url.searchParams.set('page',next);history.pushState({},'',url);setPage(next)};
@@ -38,13 +49,14 @@ test.beforeAll(async () => {
         return <I18nProvider><ToastProvider><NavContext.Provider value={{navigate}}>
           <nav aria-label="Fixture navigation">{['jobs','resume','search','dashboard'].map(name=><button key={name} onClick={()=>navigate(name)}>Fixture {name}</button>)}</nav>
           <main style={{display:'flex',height:'calc(100vh - 32px)',minWidth:0}}>
-          {page==='jobs'?<JobsPage/>:page==='resume'?<ResumePage/>:page==='search'?<SearchPage/>:page==='dashboard'?<DashboardPage/>:<div data-testid="agent-destination">{new URL(location.href).searchParams.get('sessionId')}</div>}
+          {page==='jobs'?<JobsPage/>:page==='resume'?<ResumePage/>:page==='search'?<SearchPage/>:page==='dashboard'?<DashboardPage/>:<AgentDestination/>}
           </main></NavContext.Provider></ToastProvider></I18nProvider>
       }
-      createRoot(document.getElementById('root')).render(<Harness/>);
+      createRoot(document.getElementById('root')).render(new URL(location.href).searchParams.has('shell') ? <I18nProvider><ToastProvider><AppShell/></ToastProvider></I18nProvider> : <Harness/>);
     `, loader: 'tsx', resolveDir: webRoot },
     absWorkingDir: webRoot, outfile: path.join(temporaryDirectory, 'fixture.js'), bundle: true, platform: 'browser',
-    format: 'iife', jsx: 'automatic', target: 'es2022', alias: { '@': path.join(webRoot, 'src'), 'next-auth/react': authPath },
+    format: 'iife', jsx: 'automatic', target: 'es2022', alias: { '@': path.join(webRoot, 'src'), 'next-auth/react': authPath, 'next/dynamic': dynamicPath, 'next/navigation': navigationPath },
+    plugins: [{ name: 'fixture-unused-pages', setup(build: { onResolve: (options: object, callback: () => object) => void }) { build.onResolve({ filter: /^@\/components\/pages\/(GmailPage|JobRecommendationsPage|AgentPlaygroundPage|AgentHistoryPage|SettingsPage|ObservabilityPage|ContactUsPage)$/ }, () => ({ path: unusedPagePath })) } }],
     define: { 'process.env.NODE_ENV': '"production"' }, loader: { '.svg': 'dataurl', '.png': 'dataurl' }, logLevel: 'silent',
   })
   server = createServer((request, response) => {
@@ -92,11 +104,14 @@ function audit(resumeUpdatedAt = time) {
     audit: { verdict: 'pass', summary: 'Fixture materials checked.', findings: [], matchScore: 82, source: 'independent', auditedAt: time } }
 }
 
-async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unknown' | 'waiting_for_user'; taskFailure?: boolean; missing?: boolean; holdSelectedLetter?: boolean } = {}) {
+async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unknown' | 'waiting_for_user'; taskFailure?: boolean; missing?: boolean; holdSelectedLetter?: boolean; search?: boolean; saveMode?: 'fail' | 'hold-success' | 'hold-fail'; twoResumes?: boolean } = {}) {
+  let releaseSave = () => {}
+  const saveGate = new Promise<void>(resolve => { releaseSave = resolve })
   let releaseLetters = () => {}
   const lettersGate = new Promise<void>(resolve => { releaseLetters = resolve })
   const state = { job: { ...job(), finalCoverLetterId: options.holdSelectedLetter ? 'selected-letter' : null }, resume: resume(), audit: audit(options.stale ? '2026-10-29T10:00:00.000Z' : time),
-    writes: [] as Array<{ path: string; body: unknown }>, analysisRequests: [] as string[], unexpected: [] as string[], taskReads: 0, letterRequested: false, releaseLetters }
+    secondResume: { ...resume(), id: 'resume-2', name: 'Second fixture resume', targetJobId: null, content: { ...resume().content, summary: 'Second resume content.' } },
+    writes: [] as Array<{ path: string; body: unknown }>, analysisRequests: [] as string[], unexpected: [] as string[], taskReads: 0, letterRequested: false, releaseLetters, releaseSave }
   const json = (route: Route, value: unknown, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(value) })
   await page.context().route('**/*', async route => {
     const request = route.request(), url = new URL(request.url()), pathname = url.pathname
@@ -112,11 +127,17 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
         return json(route, pathname.endsWith('/suggest') ? { suggestions: [] } : { score: 82, matchedKeywords: ['TypeScript'], missingItems: [], sectionMatches: [], sectionScores: {}, sectionTips: {}, strengthSummary: 'Fixture match', skillsGap: [] })
       }
       state.writes.push({ path: pathname, body })
+      if (pathname === '/api/resume/resume-1' && request.method() === 'PATCH' && options.saveMode) {
+        if (options.saveMode === 'hold-success' || options.saveMode === 'hold-fail') { await saveGate; if (options.saveMode === 'hold-success') return json(route, { ...state.resume, ...(body as object) }) }
+        return json(route, { error: 'Fixture save failed' }, 500)
+      }
+      if (options.search && pathname === '/api/jobs' && request.method() === 'POST') return json(route, state.job)
       if (pathname.endsWith('/audit-application')) { state.audit = audit(); return json(route, { ...state.audit.audit, resumeUpdatedAt: time }) }
       if (pathname.endsWith('/assign')) return json(route, state.job)
       if (pathname === '/api/jobs/outside-page/apply') { state.job.status = 'applied'; return json(route, state.job) }
       return json(route, { error: 'Unexpected mutation' }, 500)
     }
+    if (options.search && pathname === '/api/search/unified') return json(route, { jobs: [{ id: 'search-result-1', title: state.job.role, company: state.job.company, location: state.job.location, url: state.job.url, description: '', source: 'manual', score: 82 }], meta: null })
     if (pathname === '/api/agent/application-tasks') {
       state.taskReads++
       if (options.taskFailure) return json(route, { error: 'Fixture unavailable' }, 500)
@@ -130,8 +151,12 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
       return json(route, [])
     }
     if (pathname.endsWith('/audit-application')) return json(route, state.audit)
-    if (pathname === '/api/resume') return json(route, [state.resume])
+    if (pathname === '/api/resume') return json(route, options.twoResumes ? [state.resume, state.secondResume] : [state.resume])
+    if (pathname === '/api/resume/resume-2') return json(route, state.secondResume)
     if (pathname === '/api/resume/resume-1' || pathname === '/api/resume/default') return json(route, state.resume)
+    if (pathname === '/api/me') return json(route, { onboardedAt: time })
+    if (pathname === '/api/gmail/unread') return json(route, { count: 0 })
+    if (pathname === '/api/notifications') return json(route, { notifications: [], unreadCount: 0 })
     if (pathname === '/api/directions' || pathname === '/api/activity' || pathname.endsWith('/versions')) return json(route, [])
     state.unexpected.push(pathname)
     return json(route, { error: 'Unhandled fixture API' }, 500)
@@ -227,6 +252,19 @@ test('unavailable task state does not expose a new preparation action', async ({
   expect(state.unexpected).toEqual([])
 })
 
+test('attention view opens a recent task application outside the current jobs page', async ({ page }) => {
+  const state = await install(page, { taskStatus: 'waiting_for_user' })
+  await page.goto(`${origin}/?page=jobs&jobsPage=3`)
+  await page.getByRole('button', { name: /Needs your attention|需要我处理/ }).click()
+  const attention = page.getByRole('region', { name: /Needs your attention|需要我处理/ })
+  await expect(attention.getByText('Fixture Employer · Application flow engineer')).toBeVisible()
+  await attention.getByRole('link', { name: /View this application|查看此申请/ }).click()
+  await expect(page).toHaveURL(/highlight=outside-page/)
+  await expect(page.getByRole('dialog')).toContainText('Application flow engineer')
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
 test('uncertain outcomes link to the original session without retry or submission', async ({ page }) => {
   const state = await install(page, { taskStatus: 'unknown' })
   await open(page)
@@ -271,4 +309,220 @@ test('records a manual submission only after the explicit recording action', asy
   expect(state.job.status).toBe('applied')
   await expect(record).toHaveCount(0)
   expect(state.unexpected).toEqual([])
+})
+
+
+test('Discover saves once and opens the exact saved application', async ({ page }) => {
+  const state = await install(page, { search: true })
+  await page.goto(`${origin}/?page=search`)
+  const search = page.getByRole('textbox', { name: /Search jobs|搜索职位/ })
+  await search.fill('Fixture Engineer')
+  await search.press('Enter')
+  await expect(page.getByText('Application flow engineer', { exact: true }).first()).toBeVisible()
+  await page.getByTitle(/Save to My Jobs|保存到我的职位/).click()
+  await expect.poll(() => state.writes.filter(item => item.path === '/api/jobs').length).toBe(1)
+  const view = page.getByRole('button', { name: /View this application|查看此申请/ }).first()
+  await expect(view).toBeVisible()
+  await view.click()
+  await expect(page).toHaveURL(/page=jobs/)
+  await expect(page).toHaveURL(/highlight=outside-page/)
+  await expect(page.getByText('Application flow engineer', { exact: true }).first()).toBeVisible()
+  expect(state.writes.map(item => item.path)).toEqual(['/api/jobs'])
+  expect(state.unexpected).toEqual([])
+})
+
+test('opening an existing Resume analysis cache does not repeat AI requests', async ({ page }) => {
+  const state = await install(page)
+  await page.addInitScript(({ timestamp }) => {
+    localStorage.setItem('applymate_last_analysis', JSON.stringify({
+      'resume-1:outside-page': { resumeId: 'resume-1', jobId: 'outside-page', resumeUpdatedAt: timestamp,
+        score: { score: 82, matchedKeywords: ['TypeScript'], missingItems: [], sectionMatches: [], sectionScores: {}, sectionTips: {}, strengthSummary: 'Fixture match', skillsGap: [] }, suggs: [] },
+    }))
+  }, { timestamp: time })
+  await open(page)
+  await page.getByRole('button').filter({ has: page.getByText(/^(Resume|简历)$/) }).click()
+  await page.getByRole('button', { name: /Edit this resume|编辑此简历/ }).click()
+  await expect(page).toHaveURL(/page=resume/)
+  await expect(page.getByRole('button', { name: /Back to this application|返回此申请/ })).toBeVisible()
+  await page.waitForLoadState('networkidle')
+  expect(state.analysisRequests).toEqual([])
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+
+test('real AppShell mounts the selected application', async ({ page }) => {
+  const state = await install(page)
+  await page.goto(`${origin}/?shell=1&page=jobs&highlight=outside-page`)
+  await expect(page.getByText('Application flow engineer', { exact: true }).first()).toBeVisible()
+  expect(state.unexpected).toEqual([])
+})
+
+
+async function openDirtyShellResume(page: Page) {
+  await page.goto(`${origin}/?shell=1&page=jobs&highlight=outside-page`)
+  await expect(page.getByText('Application flow engineer', { exact: true }).first()).toBeVisible()
+  await page.getByRole('dialog').getByRole('button').filter({ has: page.getByText(/^(Resume|简历)$/) }).click()
+  await page.getByRole('button', { name: /Edit this resume|编辑此简历/ }).click()
+  await expect(page).toHaveURL(/page=resume/)
+  await page.getByText('Software engineer.', { exact: false }).first().click()
+  await page.locator('textarea').filter({ hasText: '' }).first().fill('Edited fixture summary')
+}
+
+test('real AppShell keeps the editor after a sidebar save fails', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop sidebar')
+  const state = await install(page, { saveMode: 'fail' })
+  await openDirtyShellResume(page)
+  await page.getByRole('button', { name: 'Applications', exact: true }).click()
+  await expect.poll(() => state.writes.filter(item => item.path === '/api/resume/resume-1').length).toBeGreaterThan(0)
+  await expect(page).toHaveURL(/page=resume/)
+  await expect(page.getByText('Edited fixture summary', { exact: false }).first()).toBeVisible()
+  expect(state.unexpected).toEqual([])
+})
+
+test('real AppShell protects browser back when saving fails', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop shell')
+  const state = await install(page, { saveMode: 'fail' })
+  await openDirtyShellResume(page)
+  await page.evaluate(() => history.back())
+  await expect.poll(() => state.writes.filter(item => item.path === '/api/resume/resume-1').length).toBeGreaterThan(0)
+  await expect(page).toHaveURL(/page=resume/)
+  await expect(page.getByText('Edited fixture summary', { exact: false }).first()).toBeVisible()
+  expect(state.unexpected).toEqual([])
+})
+
+test('real Resume warns before browser reload with unsaved changes', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop shell')
+  const state = await install(page, { saveMode: 'hold-success' })
+  try {
+    await openDirtyShellResume(page)
+    const dialogPromise = page.waitForEvent('dialog')
+    const reload = page.reload({ waitUntil: 'commit', timeout: 2000 }).catch(() => null)
+    const dialog = await dialogPromise
+    expect(dialog.type()).toBe('beforeunload')
+    await dialog.dismiss()
+    await reload
+    await expect(page).toHaveURL(/page=resume/)
+    await expect(page.getByText('Edited fixture summary', { exact: false }).first()).toBeVisible()
+    expect(state.unexpected).toEqual([])
+  } finally { state.releaseSave() }
+})
+
+test('real AppShell resolves two rapid navigation attempts to the latest destination', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop sidebar')
+  const state = await install(page, { saveMode: 'hold-success' })
+  try {
+    await openDirtyShellResume(page)
+    await page.getByRole('button', { name: 'Applications', exact: true }).click()
+    await expect.poll(() => state.writes.filter(item => item.path === '/api/resume/resume-1').length).toBeGreaterThan(0)
+    await page.locator('#desktop-sidebar').getByRole('button', { name: 'Discover', exact: true }).click()
+    state.releaseSave()
+    await expect(page).toHaveURL(/page=search/)
+    expect(state.unexpected).toEqual([])
+  } finally { state.releaseSave() }
+})
+
+
+test('a delayed save stays bound to the original resume before switching', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop resume library')
+  const state = await install(page, { saveMode: 'hold-success', twoResumes: true })
+  try {
+    await openDirtyShellResume(page)
+    await page.getByText('Second fixture resume', { exact: true }).click()
+    await expect.poll(() => state.writes.filter(item => item.path === '/api/resume/resume-1').length).toBeGreaterThan(0)
+    await expect(page.getByText('Second resume content.', { exact: false })).toHaveCount(0)
+    state.releaseSave()
+    await expect(page.getByText('Second resume content.', { exact: false }).first()).toBeVisible()
+    const saves = state.writes.filter(item => item.path.startsWith('/api/resume/'))
+    expect(saves.map(item => item.path)).toEqual(['/api/resume/resume-1'])
+    expect(JSON.stringify(saves[0].body)).toContain('Edited fixture summary')
+    expect(state.unexpected).toEqual([])
+  } finally { state.releaseSave() }
+})
+
+test('a failed delayed save keeps the original resume selected', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop resume library')
+  const state = await install(page, { saveMode: 'hold-fail', twoResumes: true })
+  try {
+    await openDirtyShellResume(page)
+    await page.getByText('Second fixture resume', { exact: true }).click()
+    await expect.poll(() => state.writes.filter(item => item.path === '/api/resume/resume-1').length).toBeGreaterThan(0)
+    state.releaseSave()
+    await expect(page.getByText('Save failed', { exact: false }).first()).toBeVisible()
+    await expect(page.getByText('Edited fixture summary', { exact: false }).first()).toBeVisible()
+    await expect(page.getByText('Second resume content.', { exact: false })).toHaveCount(0)
+    expect(state.writes.every(item => item.path === '/api/resume/resume-1')).toBe(true)
+    expect(state.unexpected).toEqual([])
+  } finally { state.releaseSave() }
+})
+
+
+test('application drawer traps keyboard focus and closes with Escape', async ({ page }) => {
+  const state = await install(page)
+  await open(page)
+  const drawer = page.getByRole('dialog')
+  const close = drawer.getByRole('button', { name: /Close application details|关闭申请详情/ })
+  await expect(close).toBeFocused()
+  await page.keyboard.press('Shift+Tab')
+  expect(await drawer.evaluate(element => element.contains(document.activeElement))).toBe(true)
+  await page.keyboard.press('Escape')
+  await expect(drawer).toHaveCount(0)
+  expect(state.unexpected).toEqual([])
+})
+
+test('successful guarded browser back and forward restore the correct pages', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop shell')
+  const state = await install(page, { saveMode: 'hold-success' })
+  try {
+    await openDirtyShellResume(page)
+    await page.evaluate(() => history.back())
+    await expect.poll(() => state.writes.filter(item => item.path === '/api/resume/resume-1').length).toBeGreaterThan(0)
+    await expect(page).toHaveURL(/page=resume/)
+    state.releaseSave()
+    await expect(page).toHaveURL(/page=jobs/)
+    await expect(page.getByText('Application flow engineer', { exact: true }).first()).toBeVisible()
+    await page.evaluate(() => history.forward())
+    await expect(page).toHaveURL(/page=resume/)
+    await expect(page.getByRole('button', { name: /Back to this application|返回此申请/ })).toBeVisible()
+    expect(state.unexpected).toEqual([])
+  } finally { state.releaseSave() }
+})
+
+test('cancelled unload after repeated back keeps the editor until a new navigation', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop shell')
+  const state = await install(page, { saveMode: 'hold-success' })
+  try {
+    await openDirtyShellResume(page)
+    const dialogPromise = page.waitForEvent('dialog')
+    await page.evaluate(() => { history.back(); history.back() })
+    const dialog = await dialogPromise
+    expect(dialog.type()).toBe('beforeunload')
+    await dialog.dismiss()
+    await expect.poll(() => state.writes.filter(item => item.path === '/api/resume/resume-1').length).toBeGreaterThan(0)
+    await expect(page).toHaveURL(/page=resume/)
+    await expect(page.getByText('Edited fixture summary', { exact: false }).first()).toBeVisible()
+    const saveResponse = page.waitForResponse(response => response.url().endsWith('/api/resume/resume-1') && response.request().method() === 'PATCH')
+    state.releaseSave()
+    await saveResponse
+    await expect(page).toHaveURL(/page=resume/)
+    await expect(page.getByText('Edited fixture summary', { exact: false }).first()).toBeVisible()
+    await page.locator('#desktop-sidebar').getByRole('button', { name: 'Discover', exact: true }).click()
+    await expect(page).toHaveURL(/page=search/)
+    await expect(page.getByRole('textbox', { name: /Search jobs|搜索职位/ })).toBeVisible()
+    expect(state.unexpected).toEqual([])
+  } finally { state.releaseSave() }
+})
+
+test('accepting the browser unload warning allows the user to leave unsaved edits', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop shell')
+  const state = await install(page, { saveMode: 'hold-success' })
+  try {
+    await openDirtyShellResume(page)
+    const dialogPromise = page.waitForEvent('dialog')
+    await page.evaluate(() => { history.back(); history.back() })
+    const dialog = await dialogPromise
+    expect(dialog.type()).toBe('beforeunload')
+    await dialog.accept()
+    await expect(page).toHaveURL('about:blank')
+  } finally { state.releaseSave() }
 })

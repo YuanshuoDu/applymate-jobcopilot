@@ -12,10 +12,10 @@ function task(overrides: Partial<ApplicationTaskView> = {}): ApplicationTaskView
 }
 
 describe('application task display data', () => {
-  it('joins by job ID and selects the newest actual record regardless of response order', () => {
-    const parsed = parseApplicationTasks({ tasks: [row(), row({ id: 'task_new', updatedAt: '2026-10-30T11:00:00Z', status: 'submitted' }),
-      row({ id: 'task_other', jobId: 'job_other', job: { company: 'Example', role: 'Engineer' } })] }, 'user_1')
-    expect(parsed?.tasks.map(item => [item.jobId, item.id])).toEqual([['job_1', 'task_new'], ['job_other', 'task_other']])
+  it('sorts the unique task for each job by its actual update time', () => {
+    const parsed = parseApplicationTasks({ tasks: [row(),
+      row({ id: 'task_other', jobId: 'job_other', updatedAt: '2026-10-30T11:00:00Z', job: { company: 'Example', role: 'Engineer' } })] }, 'user_1')
+    expect(parsed?.tasks.map(item => [item.jobId, item.id])).toEqual([['job_other', 'task_other'], ['job_1', 'task_1']])
   })
 
   it('discards sensitive fields and untrusted server summaries', () => {
@@ -30,6 +30,8 @@ describe('application task display data', () => {
       expect(parseApplicationTasks({ tasks: [row(), invalid] }, 'user_1')).toBeNull()
     }
     expect(parseApplicationTasks({ tasks: [row(), row({ id: 'task_ambiguous', status: 'submitted' })] }, 'user_1')).toBeNull()
+    expect(parseApplicationTasks({ tasks: [row({ status: 'waiting_for_user', checkpoint: 'submission_uncertain' }),
+      row({ id: 'later', updatedAt: '2026-10-30T11:00:00Z', status: 'cancelled', checkpoint: 'turn_stopped_before_submit' })] }, 'user_1')).toBeNull()
     expect(parseApplicationTasks({ tasks: {} }, 'user_1')).toBeNull()
   })
 

@@ -44,7 +44,8 @@ Agent 负责原任务的执行和审批，招聘消息负责查看回复。
 | 等待审核 | 在原任务查看本次内容；页面跳转不会代替授权 |
 | 提交结果待核实 | 查看记录和回执，保持结果未知，不自动重试 |
 
-首页展示最近最多 100 个申请任务中的待处理事项，不能当作全部申请总数。
+首页和“申请管理 → 需要我处理”展示最近最多 100 个申请任务中的待处理事项，
+不能当作全部申请总数。每条可进入原申请或原任务；处理后刷新状态。
 招聘邮件没有可靠职位关联时，保留邮件本身，不猜测它属于哪个申请。
 
 ## 1. Product responsibilities
@@ -95,8 +96,10 @@ career facts.
 ## 4. Applications list and detail
 
 The list keeps the user's existing lifecycle status. When a related recent Agent
-task is known, its execution label appears alongside that status. Opening the row
-shows its exact application; details outside the current page/filter load by ID.
+task is known, its execution label, explanation and original-session action appear
+alongside that status. The “Needs your attention” view reads the bounded recent
+task projection independently of the current list page. Opening a result shows
+its exact application; details outside the current page/filter load by ID.
 
 The detail drawer follows this order:
 
@@ -153,10 +156,13 @@ Opening links and downloading files never call the manual-record endpoint. The
 manual action records the candidate's report; it is not independent employer
 receipt verification. The existing activity entry preserves that distinction.
 
-Resume keeps unsaved edits when a save fails. Its explicit application-return
-buttons await the current save chain before leaving; other shell navigation
-continues to follow existing behavior and should not be represented as a new
-site-wide unsaved-edit guard.
+Resume waits for its current save chain before application-return and shell
+navigation, and keeps the editor open when saving fails. Switching resumes also
+waits for that chain. A browser refresh or close uses the browser’s unsaved-change
+prompt. Same-document history navigation is guarded where supported; the fallback
+can retain the editor without preserving forward history. Authentication loss or
+an account change may still unmount the editor, so this is not a guarantee across
+session changes.
 
 ## 7. Agent-assisted journey
 
@@ -174,8 +180,11 @@ It does not infer a session from job ID or send a task prompt.
 The task query returns at most 100 recent records. Dashboard labels this scope.
 Missing records at that boundary do not prove a task is absent. Loading, failures
 and partial coverage show refresh guidance instead of a new preparation action.
-Refocusing Applications refreshes the task projection so resolved questions do
-not remain indefinitely visible.
+Refocusing Applications or Dashboard refreshes the task projection so resolved
+questions do not remain indefinitely visible. Manual work is available after a
+failed or cancelled task only when its checkpoint explicitly says it stopped
+before submission; uncertain and active execution remain guarded. The projection
+is a snapshot and does not by itself prevent concurrent changes in another tab.
 
 ## 8. Exceptions and outcomes
 
@@ -195,8 +204,9 @@ not remain indefinitely visible.
 ## 9. Dashboard and Inbox
 
 Dashboard puts recent task attention before Momentum. It shows at most three
-recent attention cards and existing saved/follow-up continuations, without
-claiming a full global pending count. Job cards and timeline entries navigate to
+recent attention cards and existing saved/follow-up continuations, excluding a
+second card for a job already shown as requiring attention and without claiming
+a full global pending count. Job cards and timeline entries navigate to
 their real job when one is present; entries without job identity do not guess.
 
 Inbox retains existing classifications and behavior. Its current email DTO does

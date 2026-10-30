@@ -7,7 +7,10 @@ import { useRouter } from 'next/navigation'
 import { Bell } from 'lucide-react'
 import { Sidebar } from './Sidebar'
 import type { Page } from '@/lib/types'
-import { NavContext } from '@/lib/nav-context'
+import { NavContext, type NavigationGuard } from '@/lib/nav-context'
+import { isApplicationNavigationEvent } from '@/lib/application-navigation'
+import { applicationHistoryIndex } from '@/lib/application-history-position'
+import { guardApplicationTraversal } from '@/lib/application-traversal-guard'
 import { useI18n } from '@/lib/i18n'
 import { OnboardingFlow } from '@/components/onboarding/OnboardingFlow'
 import { clearCachedApiResponses } from '@/lib/api-cache'
@@ -206,14 +209,41 @@ export function AppShell() {
     void PAGE_PRELOADERS[nextPage]().catch(() => undefined)
   }, [])
 
-  const navigatePage = useCallback((nextPage: Page, mode: 'push' | 'replace' = 'push') => {
-    prefetchPage(nextPage)
-    setSidebarPopover(null)
-    setMobileMoreOpen(false)
-    setPage(nextPage)
-    writePageToUrl(nextPage, mode)
+  const navigationGuard = useRef<NavigationGuard | null>(null)
+  const navigationAttempt = useRef(0)
+  const historyIndex = useRef<number | null>(null)
+  const restoringHistory = useRef<{ origin: number; target: number; attempt: number; restored: boolean; saved: boolean; resolve: () => void; wait: Promise<void> } | null>(null)
+  const registerNavigationGuard = useCallback((guard: NavigationGuard) => {
+    navigationGuard.current = guard
+    return () => {
+      if (navigationGuard.current === guard) {
+        navigationGuard.current = null
+        navigationAttempt.current += 1
+      }
+    }
+  }, [])
+  const navigatePage = useCallback((nextPage: Page, mode: 'push' | 'replace' = 'push'): boolean | Promise<boolean> => {
+    const attempt = ++navigationAttempt.current
+    const finish = () => {
+      prefetchPage(nextPage)
+      setSidebarPopover(null)
+      setMobileMoreOpen(false)
+      setPage(nextPage)
+      writePageToUrl(nextPage, mode)
+      historyIndex.current = applicationHistoryIndex(window)
+      return true
+    }
+    const guard = navigationGuard.current
+    const restoration = restoringHistory.current
+    if (!restoration && (!guard?.needsSave() || nextPage === 'resume')) return finish()
+    return (async () => {
+      if (restoration) await restoration.wait
+      if (attempt !== navigationAttempt.current) return false
+      if (guard?.needsSave() && nextPage !== 'resume' && !(await guard.save())) return false
+      return !guard?.needsSave() && attempt === navigationAttempt.current ? finish() : false
+    })().catch(() => false)
   }, [prefetchPage])
-  const navContextValue = useMemo(() => ({ navigate: navigatePage }), [navigatePage])
+  const navContextValue = useMemo(() => ({ navigate: navigatePage, registerNavigationGuard }), [navigatePage, registerNavigationGuard])
 
   useEffect(() => {
     if (status !== 'authenticated') { setCheckingOnboard(false); return }
@@ -228,13 +258,81 @@ export function AppShell() {
     initialPageRef.current = locationPage
     setPage(locationPage)
     writePageToUrl(locationPage, 'replace')
+    historyIndex.current = applicationHistoryIndex(window)
 
-    function handlePopState() {
-      setPage(pageFromSearch(window.location.search))
+    // Cancel same-document traversals before the URL changes when the browser
+    // supports the Navigation API. No compensating history operation is then
+    // needed, even when the user makes several choices while saving.
+    const navigation = (window as Window & { navigation?: EventTarget & {
+      traverseTo: (key: string) => { committed: Promise<unknown>; finished: Promise<unknown> }
+    } }).navigation
+    const onNavigate: EventListener = rawEvent => {
+      const event = rawEvent as Event & {
+        navigationType: string
+        destination: { sameDocument: boolean; key: string }
+      }
+      if (!navigation) return
+      guardApplicationTraversal(event, navigationGuard.current, navigation,
+        () => ++navigationAttempt.current,
+        attempt => attempt === navigationAttempt.current)
+    }
+    navigation?.addEventListener('navigate', onNavigate)
+
+    // A later cross-document navigation or reload presents the browser's own
+    // prompt. If it is canceled, do not replay an earlier pending traversal.
+    const onBeforeUnload = () => {
+      if (navigationGuard.current?.needsSave()) navigationAttempt.current += 1
+    }
+    window.addEventListener('beforeunload', onBeforeUnload)
+
+    function handlePopState(event: PopStateEvent) {
+      const guard = navigationGuard.current
+      const index = applicationHistoryIndex(window)
+      const restoration = restoringHistory.current
+      if (restoration && index === restoration.origin) {
+        restoration.restored = true
+        historyIndex.current = index
+        restoration.resolve()
+        restoringHistory.current = null
+        if (restoration.saved && !guard?.needsSave() && restoration.attempt === navigationAttempt.current) {
+          window.history.go(restoration.target - restoration.origin)
+        }
+        return
+      }
+      if (isApplicationNavigationEvent(event) || !guard?.needsSave()) {
+        historyIndex.current = index
+        setPage(pageFromSearch(window.location.search))
+        return
+      }
+      const origin = restoration?.origin ?? historyIndex.current
+      const attempt = ++navigationAttempt.current
+      if (origin !== null && index !== null && origin !== index) {
+        let resolve!: () => void
+        const wait = new Promise<void>(done => { resolve = done })
+        const pending = { origin, target: index, attempt, restored: false, saved: false, resolve, wait }
+        if (restoration) restoration.resolve()
+        restoringHistory.current = pending
+        window.history.go(origin - index)
+        void guard.save().then(saved => {
+          pending.saved = saved
+          if (saved && pending.restored && !guard.needsSave() && attempt === navigationAttempt.current) {
+            window.history.go(index - origin)
+          }
+        }).catch(() => undefined)
+        return
+      }
+      // The direction is unknown when indices are unavailable. Keep the editor
+      // open after saving; replaying an assumed direction could leave the app.
+      window.history.pushState(window.history.state, '', guard.currentHref())
+      void guard.save().catch(() => undefined)
     }
 
     window.addEventListener('popstate', handlePopState)
-    return () => window.removeEventListener('popstate', handlePopState)
+    return () => {
+      navigation?.removeEventListener('navigate', onNavigate)
+      window.removeEventListener('beforeunload', onBeforeUnload)
+      window.removeEventListener('popstate', handlePopState)
+    }
   }, [])
 
   // Safety timeout

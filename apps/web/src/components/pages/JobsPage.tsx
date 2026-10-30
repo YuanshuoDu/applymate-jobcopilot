@@ -19,10 +19,11 @@ import type { StoredApplicationAudit } from '@/lib/application-audit'
 import { useApplicationTasks } from '@/components/jobs/useApplicationTasks'
 import { ApplicationProgress } from '@/components/jobs/application-progress'
 import { ApplicationTaskCard } from '@/components/jobs/application-task-card'
+import { ApplicationAttentionView, ApplicationTaskSummary } from '@/components/jobs/application-attention-view'
 import type { ApplicationTaskView } from '@/components/jobs/application-task-model'
 import { forgetSavedApplication } from '@/components/jobs/application-search-state'
-import { getApplicationTaskState } from '@/components/jobs/application-task-model'
-import { openApplicationSession } from '@/lib/application-navigation'
+import { applicationTaskAllowsManualWork } from '@/components/jobs/application-attention-safety'
+import { openApplication, openApplicationSession } from '@/lib/application-navigation'
 
 const KANBAN_COLS: JobStatus[] = ['saved', 'applied', 'interview', 'offer', 'rejected']
 const COL_LABELS: Record<JobStatus, string> = {
@@ -105,9 +106,10 @@ export function toMobileJobCard(job: Job): MobileJobCardData {
 }
 
 // ── ListView ──────────────────────────────────────────────────────────────────
-function ListView({ jobs, taskByJobId, onRowClick, selectedIds, onToggle, onToggleAll }: {
+function ListView({ jobs, taskByJobId, onOpenSession, onRowClick, selectedIds, onToggle, onToggleAll }: {
   jobs: Job[]
   taskByJobId: ReadonlyMap<string, ApplicationTaskView>
+  onOpenSession: (sessionId: string) => void
   onRowClick: (job: Job) => void
   selectedIds: Set<string>
   onToggle: (id: string) => void
@@ -192,7 +194,7 @@ function ListView({ jobs, taskByJobId, onRowClick, selectedIds, onToggle, onTogg
                   ) : null
                 })() : null}
               </td>
-              <td style={{ padding: '10px 16px' }}><StatusBadge status={j.status} />{taskByJobId.get(j.id) && <div style={{ fontSize: 11, marginTop: 5, color: 'var(--text-muted)' }}>{t(getApplicationTaskState(taskByJobId.get(j.id)!).labelKey)}</div>}</td>
+              <td style={{ padding: '10px 16px' }}><StatusBadge status={j.status} />{taskByJobId.get(j.id) && <ApplicationTaskSummary task={taskByJobId.get(j.id)!} onOpenSession={onOpenSession} />}</td>
               <td style={{ padding: '10px 16px' }}><ScorePill score={j.score} /></td>
               <td style={{ padding: '10px 16px', fontSize: 11, color: 'var(--text-muted)' }}>
                 {fmtDate(j.appliedAt ?? j.createdAt)}
@@ -211,9 +213,10 @@ function ListView({ jobs, taskByJobId, onRowClick, selectedIds, onToggle, onTogg
   )
 }
 
-function MobileListView({ jobs, taskByJobId, onRowClick, selectedIds, onToggle }: {
+function MobileListView({ jobs, taskByJobId, onOpenSession, onRowClick, selectedIds, onToggle }: {
   jobs: Job[]
   taskByJobId: ReadonlyMap<string, ApplicationTaskView>
+  onOpenSession: (sessionId: string) => void
   onRowClick: (job: Job) => void
   selectedIds: Set<string>
   onToggle: (id: string) => void
@@ -231,6 +234,7 @@ function MobileListView({ jobs, taskByJobId, onRowClick, selectedIds, onToggle }
               checked={selectedIds.has(card.id)}
               onChange={() => onToggle(card.id)}
             />
+            <div style={{ flex: 1, minWidth: 0 }}>
             <button
               type="button"
               className="jobs-mobile-card-main"
@@ -247,10 +251,12 @@ function MobileListView({ jobs, taskByJobId, onRowClick, selectedIds, onToggle }
               </div>
               <div className="jobs-mobile-card-role">{card.role}</div>
               <div className="jobs-mobile-card-meta">
-                <StatusBadge status={card.status} />{taskByJobId.get(job.id) && <span style={{ fontSize: 11 }}>{t(getApplicationTaskState(taskByJobId.get(job.id)!).labelKey)}</span>}
+                <StatusBadge status={card.status} />
                 <span>{fmtDate(card.date)}</span>
               </div>
             </button>
+            {taskByJobId.get(job.id) && <ApplicationTaskSummary task={taskByJobId.get(job.id)!} onOpenSession={onOpenSession} />}
+            </div>
           </article>
         )
       })}
@@ -454,6 +460,10 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   const { t } = useI18n()
   const { navigate } = useNav()
   const auditSectionRef = useRef<HTMLDivElement>(null)
+  const drawerRef = useRef<HTMLDivElement>(null)
+  const drawerCloseRef = useRef<HTMLButtonElement>(null)
+  const confirmHostRef = useRef<HTMLDivElement>(null)
+  const nestedOriginRef = useRef<HTMLElement | null>(null)
   const toast = useToast()
   const [confirm, ConfirmDialog] = useConfirm()
   const [notes,        setNotes]        = useState(job.notes ?? '')
@@ -489,10 +499,59 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   const [evidenceFinding, setEvidenceFinding] = useState<ApplicationAuditFinding | null>(null)
   const [evidenceText, setEvidenceText] = useState('')
   const [savingEvidence, setSavingEvidence] = useState(false)
+  const manualWorkAllowed = applicationTaskAllowsManualWork(task)
   const { data: coverLetters, refetch: refetchCoverLetters } = useApi<CoverLetter[]>(`/api/jobs/${job.id}/cover-letters`)
   // The audit route is the canonical source because the activity feed is
   // paginated and can omit an older audit after other job events are added.
   const { data: canonicalAudit } = useApi<StoredApplicationAudit | null>(`/api/jobs/${job.id}/audit-application`)
+
+  useEffect(() => {
+    const origin = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    drawerCloseRef.current?.focus()
+    return () => { if (origin?.isConnected) origin.focus() }
+  }, [])
+
+  useEffect(() => {
+    const host = confirmHostRef.current
+    if (!host) return
+    const observer = new MutationObserver(() => {
+      const dialog = host.firstElementChild as HTMLElement | null
+      dialog?.querySelector<HTMLButtonElement>('button')?.focus()
+    })
+    observer.observe(host, { childList: true, subtree: true })
+    return () => observer.disconnect()
+  }, [])
+
+  const restoreNestedFocus = () => window.requestAnimationFrame(() => {
+    if (nestedOriginRef.current?.isConnected) nestedOriginRef.current.focus()
+  })
+  const closePreview = () => { setDocumentPreview(null); restoreNestedFocus() }
+  const closeEvidence = () => { if (!savingEvidence) { setEvidenceFinding(null); restoreNestedFocus() } }
+  const rememberNestedOrigin = () => { nestedOriginRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null }
+
+  useEffect(() => {
+    const handleKey = (event: KeyboardEvent) => {
+      const confirmDialog = confirmHostRef.current?.firstElementChild as HTMLElement | null
+      const nested = drawerRef.current?.querySelector<HTMLElement>('[data-application-nested]')
+      const activeDialog = confirmDialog ?? nested ?? drawerRef.current
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        event.stopPropagation()
+        if (confirmDialog) { confirmDialog.querySelector<HTMLButtonElement>('button')?.click(); restoreNestedFocus() }
+        else if (evidenceFinding) closeEvidence()
+        else if (documentPreview) closePreview()
+        else onClose()
+      } else if (event.key === 'Tab' && activeDialog) {
+        const focusable = [...activeDialog.querySelectorAll<HTMLElement>('button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')].filter(el => el.getClientRects().length > 0)
+        const first = focusable[0], last = focusable[focusable.length - 1]
+        if (!first) { event.preventDefault(); activeDialog.focus() }
+        else if (!activeDialog.contains(document.activeElement) || (event.shiftKey && document.activeElement === first)) { event.preventDefault(); (event.shiftKey ? last : first).focus() }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus() }
+      }
+    }
+    document.addEventListener('keydown', handleKey, true)
+    return () => document.removeEventListener('keydown', handleKey, true)
+  }, [documentPreview, evidenceFinding, savingEvidence, onClose])
 
   // Load per-job activity on mount; reset interview prep when job changes
   useEffect(() => {
@@ -588,13 +647,14 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   }
 
   async function handleDelete() {
+    rememberNestedOrigin()
     const ok = await confirm({
       title:        'Delete job?',
       message:      `"${job.role} at ${job.company}" will be permanently removed. This cannot be undone.`,
       danger:       true,
       confirmLabel: 'Delete',
     })
-    if (!ok) return
+    if (!ok) { restoreNestedFocus(); return }
     setDeleting(true)
     const { error } = await apiMutate(`/api/jobs/${job.id}`, 'DELETE')
     setDeleting(false)
@@ -643,7 +703,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   }
 
   async function autoTailorAndAudit(evidenceRepairs: ApplicationAuditFinding[] = []) {
-    if (preparationInFlight.current || task || taskReadState !== 'ready') return
+    if (preparationInFlight.current || !manualWorkAllowed || taskReadState !== 'ready') return
     if (job.finalCoverLetterId && !coverLetters?.some(letter => letter.id === job.finalCoverLetterId)) {
       toast.info(t('application.selectedLetterLoading'))
       return
@@ -749,7 +809,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   }
 
   async function saveEvidenceAndRewrite() {
-    if (!evidenceFinding || !evidenceText.trim() || task || taskReadState !== 'ready') return
+    if (!evidenceFinding || !evidenceText.trim() || !manualWorkAllowed || taskReadState !== 'ready') return
     setSavingEvidence(true)
     try {
       const key = `audit_evidence_${Date.now()}`
@@ -770,7 +830,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   }
 
   async function recordManualSubmission() {
-    if (recordingSubmissionRef.current || task || taskReadState !== 'ready') return
+    if (recordingSubmissionRef.current || !manualWorkAllowed || job.status !== 'saved' || job.workflowState === 'submitted' || taskReadState !== 'ready') return
     recordingSubmissionRef.current = true
     setRecordingSubmission(true)
     try {
@@ -806,12 +866,12 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
 
   return (
     <>
-      <ConfirmDialog />
+      <div ref={confirmHostRef}><ConfirmDialog /></div>
       {/* Overlay */}
       <div style={{ position: 'fixed', inset: 0, zIndex: 90 }} onClick={onClose} />
 
       {/* Drawer panel */}
-      <div style={{
+      <div ref={drawerRef} role="dialog" aria-modal="true" aria-labelledby="application-detail-title" tabIndex={-1} style={{
         position: 'fixed', top: 0, right: 0, bottom: 0, width: 460, maxWidth: '100vw', zIndex: 91,
         background: 'var(--bg)', borderLeft: '0.5px solid var(--border)',
         display: 'flex', flexDirection: 'column', overflowY: 'auto', overflowX: 'hidden', overscrollBehaviorX: 'contain',
@@ -820,10 +880,10 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
         {/* Header */}
         <div style={{ padding: '24px 28px 20px', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'flex-start', gap: 12 }}>
           <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 24, fontWeight: 700, lineHeight: 1.2, letterSpacing: '-0.03em' }}>{job.role}</div>
-            <div style={{ fontSize: 15, color: 'var(--text-muted)', marginTop: 7 }}>{job.source ? `${job.source} job` : job.company}{job.createdAt ? ` · Added ${fmtDate(job.createdAt)}` : ''}</div>
+            <div id="application-detail-title" style={{ fontSize: 24, fontWeight: 700, lineHeight: 1.2, letterSpacing: '-0.03em' }}>{job.role}</div>
+            <div style={{ fontSize: 15, color: 'var(--text-muted)', marginTop: 7 }}>{job.company}{job.source ? ` · ${job.source}` : ''}{job.createdAt ? ` · ${fmtDate(job.createdAt)}` : ''}</div>
           </div>
-          <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 16, color: 'var(--text-muted)', lineHeight: 1, padding: 0, marginTop: 2 }}>✕</button>
+          <button ref={drawerCloseRef} aria-label={t('application.closeDetails')} onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 16, color: 'var(--text-muted)', lineHeight: 1, padding: 0, marginTop: 2 }}>✕</button>
         </div>
 
         <ApplicationProgress hasMaterials={Boolean(previewResumeId)} checked={Boolean(currentPackAudited)} recorded={applicationRecorded} task={task} />
@@ -839,10 +899,11 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
 
           <section style={{ borderBottom: '1px solid var(--border)', padding: '18px 0 22px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 9, fontSize: 11, fontWeight: 700, letterSpacing: '0.03em', color: '#64748b', marginBottom: 18 }}><Sparkles size={16} strokeWidth={2.4} style={{ color: '#2563eb', flexShrink: 0 }} />{t('jobs.drawer.nextAction')}</div>
-            <div style={{ fontSize: 20, lineHeight: 1.25, fontWeight: 700, letterSpacing: '-0.025em' }}>{task ? t('application.taskProgress') : applicationRecorded ? t('application.recorded') : auditStale ? t('application.checkMaterials') : currentPackAudited ? t('jobs.drawer.packReady') : auditRetryOnly ? t('jobs.drawer.retryAudit') : auditNeedsEvidence ? t('jobs.drawer.confirmEvidence') : auditNeedsRepair ? t('jobs.drawer.correctFacts') : existingTailoredResume ? t('jobs.drawer.tailored') : t('jobs.drawer.tailor')}</div>
-            <div style={{ fontSize: 14, lineHeight: 1.5, color: 'var(--text-muted)', margin: '7px 0 16px' }}>{task ? t('application.taskProgressHint') : applicationRecorded ? t('application.recordedHint') : auditStale ? t('application.auditStale') : currentPackAudited ? t('jobs.pack.sameAudited') : auditRetryOnly ? t('jobs.pack.auditPending') : auditNeedsEvidence ? t('jobs.pack.evidencePrompt') : auditNeedsRepair ? t('jobs.pack.repairPrompt') : existingTailoredResume ? t('jobs.pack.reviewTailored') : t('jobs.pack.createRole')}</div>
+            <div style={{ fontSize: 20, lineHeight: 1.25, fontWeight: 700, letterSpacing: '-0.025em' }}>{!manualWorkAllowed ? t('application.taskProgress') : applicationRecorded ? t('application.recorded') : auditStale ? t('application.checkMaterials') : currentPackAudited ? t('jobs.drawer.packReady') : auditRetryOnly ? t('jobs.drawer.retryAudit') : auditNeedsEvidence ? t('jobs.drawer.confirmEvidence') : auditNeedsRepair ? t('jobs.drawer.correctFacts') : existingTailoredResume ? t('jobs.drawer.tailored') : t('jobs.drawer.tailor')}</div>
+            <div style={{ fontSize: 14, lineHeight: 1.5, color: 'var(--text-muted)', margin: '7px 0 16px' }}>{!manualWorkAllowed ? t('application.taskProgressHint') : applicationRecorded ? t('application.recordedHint') : auditStale ? t('application.auditStale') : currentPackAudited ? t('jobs.pack.sameAudited') : auditRetryOnly ? t('jobs.pack.auditPending') : auditNeedsEvidence ? t('jobs.pack.evidencePrompt') : auditNeedsRepair ? t('jobs.pack.repairPrompt') : existingTailoredResume ? t('jobs.pack.reviewTailored') : t('jobs.pack.createRole')}</div>
 
-            {task ? <ApplicationTaskCard task={task} onOpenSession={id => openApplicationSession(id, navigate)} /> : applicationRecorded ? <p>{t('application.recordedHint')}</p> : taskReadState !== 'ready' ? <div role="status"><p>{t(taskReadState === 'limited' ? 'application.taskCoverage' : 'application.taskReadUnavailable')}</p><Btn variant="ghost" onClick={onRefreshTasks}>{t('application.refreshStatus')}</Btn></div> : <>
+            {task && <ApplicationTaskCard task={task} onOpenSession={id => openApplicationSession(id, navigate)} />}
+            {!manualWorkAllowed ? null : applicationRecorded ? <p>{t('application.recordedHint')}</p> : taskReadState !== 'ready' ? <div role="status"><p>{t(taskReadState === 'limited' ? 'application.taskCoverage' : 'application.taskReadUnavailable')}</p><Btn variant="ghost" onClick={onRefreshTasks}>{t('application.refreshStatus')}</Btn></div> : <>
               {!currentPackAudited && !existingTailoredResume && baseResumes.length > 1 && <label style={{ fontSize: 12 }}>{t('application.baseResume')}
                 <select value={selectedResumeId} onChange={event => setSelectedResumeId(event.target.value)} style={{ ...drawerInputSt, width: '100%', margin: '6px 0 12px' }}>{baseResumes.map(resume => <option key={resume.id} value={resume.id}>{resume.isDefault ? `${t('jobs.defaultResume')} — ` : ''}{resume.name}</option>)}</select>
               </label>}
@@ -861,14 +922,14 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
             <div style={{ borderTop: '1px solid var(--border)', paddingTop: 22, fontSize: 12, fontWeight: 700, color: 'var(--text-muted)' }}>{t('jobs.drawer.applicationPack')}</div>
             <style>{`@keyframes pack-line-grow { from { transform: scaleY(0) } to { transform: scaleY(1) } } @keyframes pack-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(37,99,235,.35) } 50% { box-shadow: 0 0 0 7px rgba(37,99,235,0) } }`}</style>
             <PackRow number="1" title={t('jobs.pack.resume')} detail={packStage === 'resume' ? t('jobs.pack.tailoring') : t('jobs.pack.tailoredRole')} done={Boolean(previewResumeId)} active={packStage === 'resume'} open={openPackItem === 'resume'} onToggle={() => setOpenPackItem(current => current === 'resume' ? null : 'resume')}>
-              <ResumePackPreview resume={resumePreview} onReview={() => setDocumentPreview('resume')} />
+              <ResumePackPreview resume={resumePreview} onReview={() => { rememberNestedOrigin(); setDocumentPreview('resume') }} />
               {previewResumeId && <Btn variant="ghost" small onClick={() => onOpenTailoredResume(previewResumeId)}>{t('application.editResume')}</Btn>}
             </PackRow>
             <PackRow number="2" title={t('jobs.pack.coverLetter')} detail={packStage === 'coverLetter' ? t('jobs.pack.writingCoverLetter') : selectedCoverLetter ? t('jobs.pack.generatedJob') : t('application.coverLetterOptional')} done={Boolean(selectedCoverLetter)} active={packStage === 'coverLetter'} open={openPackItem === 'coverLetter'} onToggle={() => setOpenPackItem(current => current === 'coverLetter' ? null : 'coverLetter')}>
-              <CoverLetterPackPreview coverLetter={selectedCoverLetter ?? null} applicant={resumePreview?.content.contact} fallbackName={resumePreview?.name ?? 'Applicant'} company={job.company} role={job.role} templateId={resumePreview?.templateId ?? undefined} templateOptions={resumePreview?.templateOptions ?? undefined} onReview={() => setDocumentPreview('coverLetter')} />
+              <CoverLetterPackPreview coverLetter={selectedCoverLetter ?? null} applicant={resumePreview?.content.contact} fallbackName={resumePreview?.name ?? 'Applicant'} company={job.company} role={job.role} templateId={resumePreview?.templateId ?? undefined} templateOptions={resumePreview?.templateOptions ?? undefined} onReview={() => { rememberNestedOrigin(); setDocumentPreview('coverLetter') }} />
             </PackRow>
             <div ref={auditSectionRef}><PackRow last number="3" title={t('jobs.pack.audit')} detail={packStage === 'audit' ? t('jobs.pack.checkingChanges') : auditRetryOnly ? t('jobs.pack.retryResponse') : auditNeedsEvidence ? `${evidenceGapFindings.length} ${t('jobs.auditFactsCount')}` : auditNeedsRepair ? `${factualAuditFindings.length} ${t('jobs.auditIssuesCount')}` : displayedAudit ? t('jobs.pack.verifiedFacts') : t('jobs.pack.readyRun')} done={currentPackAudited} failed={auditNeedsRepair || auditNeedsEvidence || auditRetryOnly} active={packStage === 'audit'} open={openPackItem === 'audit'} onToggle={() => setOpenPackItem(current => current === 'audit' ? null : 'audit')}>
-              <AuditPackPreview audit={displayedAudit} onRepair={() => void autoTailorAndAudit()} onAddEvidence={finding => { setEvidenceFinding(finding); setEvidenceText('') }} repairing={autoPreparing || Boolean(task) || taskReadState !== 'ready'} />
+              <AuditPackPreview audit={displayedAudit} onRepair={() => void autoTailorAndAudit()} onAddEvidence={finding => { rememberNestedOrigin(); setEvidenceFinding(finding); setEvidenceText('') }} repairing={autoPreparing || !manualWorkAllowed || taskReadState !== 'ready'} />
             </PackRow></div>
             {currentPackAudited && <button onClick={() => void downloadFinalPack()} disabled={downloadingPack} style={{ width: '100%', minHeight: 46, border: 0, borderRadius: 9, background: '#2563eb', color: '#fff', fontWeight: 700, cursor: 'pointer' }}>{downloadingPack ? (exportedPackFolder ? t('jobs.pack.openingFolder') : t('jobs.pack.savingPdfs')) : exportedPackFolder ? t('jobs.pack.openFolder') : t('jobs.pack.savePdfs')}</button>}
             <div style={{ borderTop: '1px solid var(--border)', paddingTop: 16 }}>
@@ -876,7 +937,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
               <p style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{applicationPreflight.canAutomate ? t('application.agentMethodHint') : t('application.manualMethodHint')}</p>
               {(!currentPackAudited || task || applicationRecorded) && job.url && /^https?:\/\//i.test(job.url) && <a href={job.url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--primary)', fontSize: 12 }}>{t('application.openEmployer')}</a>}
               {!task && <Btn variant="ghost" small onClick={() => navigate('agent')}>{t('application.openAgent')}</Btn>}
-              {!task && taskReadState === 'ready' && !applicationRecorded && <Btn variant="ghost" small disabled={recordingSubmission} onClick={() => void recordManualSubmission()}>{t('application.recordManual')}</Btn>}
+              {manualWorkAllowed && taskReadState === 'ready' && !applicationRecorded && <Btn variant="ghost" small disabled={recordingSubmission} onClick={() => void recordManualSubmission()}>{t('application.recordManual')}</Btn>}
             </div>
             <div style={{ borderTop: '1px solid var(--border)', marginTop: 28, paddingTop: 22 }}>
               <div style={{ fontSize: 12, fontWeight: 700, color: '#64748b', marginBottom: 16 }}>{t('jobs.drawer.jobDetails')}</div>
@@ -1070,9 +1131,9 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
           )}
         </div>
 
-        {documentPreview === 'resume' && resumePreview && <DocumentPreviewModal title={resumePreview.name} onClose={() => setDocumentPreview(null)}><ResumeRenderer content={resumePreview.content} templateId={resumePreview.templateId} templateOptions={resumePreview.templateOptions} /></DocumentPreviewModal>}
-        {documentPreview === 'coverLetter' && selectedCoverLetter && <DocumentPreviewModal title={t('jobs.coverLetterPreview')} onClose={() => setDocumentPreview(null)}><CoverLetterPreview content={selectedCoverLetter.content} applicant={resumePreview?.content.contact} fallbackName={resumePreview?.name ?? 'Applicant'} company={job.company} role={job.role} templateId={resumePreview?.templateId ?? selectedCoverLetter.templateId ?? 'clean'} templateOptions={resumePreview?.templateOptions ?? selectedCoverLetter.templateOptions ?? {}} /></DocumentPreviewModal>}
-        {evidenceFinding && <EvidenceCaptureModal finding={evidenceFinding} value={evidenceText} saving={savingEvidence} onChange={setEvidenceText} onClose={() => !savingEvidence && setEvidenceFinding(null)} onSave={() => void saveEvidenceAndRewrite()} />}
+        {documentPreview === 'resume' && resumePreview && <DocumentPreviewModal title={resumePreview.name} onClose={closePreview}><ResumeRenderer content={resumePreview.content} templateId={resumePreview.templateId} templateOptions={resumePreview.templateOptions} /></DocumentPreviewModal>}
+        {documentPreview === 'coverLetter' && selectedCoverLetter && <DocumentPreviewModal title={t('jobs.coverLetterPreview')} onClose={closePreview}><CoverLetterPreview content={selectedCoverLetter.content} applicant={resumePreview?.content.contact} fallbackName={resumePreview?.name ?? 'Applicant'} company={job.company} role={job.role} templateId={resumePreview?.templateId ?? selectedCoverLetter.templateId ?? 'clean'} templateOptions={resumePreview?.templateOptions ?? selectedCoverLetter.templateOptions ?? {}} /></DocumentPreviewModal>}
+        {evidenceFinding && <EvidenceCaptureModal finding={evidenceFinding} value={evidenceText} saving={savingEvidence} onChange={setEvidenceText} onClose={closeEvidence} onSave={() => void saveEvidenceAndRewrite()} />}
 
         {/* Footer */}
         <div style={{ padding: '12px 18px', borderTop: '0.5px solid var(--border)', display: 'flex', gap: 8 }}>
@@ -1169,9 +1230,11 @@ function CoverLetterPackPreview({ coverLetter, applicant, fallbackName, company,
 
 function DocumentPreviewModal({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
   const { t } = useI18n()
-  return <div role="dialog" aria-modal="true" aria-label={title} style={{ position: 'fixed', inset: 0, zIndex: 130, display: 'grid', placeItems: 'center', padding: 24, background: 'rgba(15,23,42,.62)' }} onMouseDown={onClose}>
+  const closeRef = useRef<HTMLButtonElement>(null)
+  useEffect(() => { closeRef.current?.focus() }, [])
+  return <div data-application-nested role="dialog" aria-modal="true" aria-label={title} style={{ position: 'fixed', inset: 0, zIndex: 130, display: 'grid', placeItems: 'center', padding: 24, background: 'rgba(15,23,42,.62)' }} onMouseDown={onClose}>
     <div style={{ width: 'min(920px, calc(100vw - 48px))', maxHeight: 'calc(100vh - 48px)', display: 'flex', flexDirection: 'column', overflow: 'hidden', background: '#f1f5f9', borderRadius: 14, boxShadow: '0 24px 80px rgba(15,23,42,.42)' }} onMouseDown={event => event.stopPropagation()}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, padding: '15px 20px', background: '#fff', borderBottom: '1px solid #dbe1ea' }}><div><div style={{ fontSize: 15, fontWeight: 700, color: '#0f172a' }}>{title}</div><div style={{ marginTop: 2, fontSize: 12, color: '#64748b' }}>{t('jobs.documentPreview')}</div></div><button onClick={onClose} aria-label={t('jobs.closePreview')} style={{ display: 'grid', placeItems: 'center', width: 32, height: 32, border: 'none', borderRadius: 8, color: '#475569', background: '#f1f5f9', cursor: 'pointer' }}><X size={18} /></button></div>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, padding: '15px 20px', background: '#fff', borderBottom: '1px solid #dbe1ea' }}><div><div style={{ fontSize: 15, fontWeight: 700, color: '#0f172a' }}>{title}</div><div style={{ marginTop: 2, fontSize: 12, color: '#64748b' }}>{t('jobs.documentPreview')}</div></div><button ref={closeRef} onClick={onClose} aria-label={t('jobs.closePreview')} style={{ display: 'grid', placeItems: 'center', width: 32, height: 32, border: 'none', borderRadius: 8, color: '#475569', background: '#f1f5f9', cursor: 'pointer' }}><X size={18} /></button></div>
       <div style={{ flex: 1, overflow: 'auto', padding: 24 }}>{children}</div>
     </div>
   </div>
@@ -1179,7 +1242,7 @@ function DocumentPreviewModal({ title, onClose, children }: { title: string; onC
 
 function EvidenceCaptureModal({ finding, value, saving, onChange, onClose, onSave }: { finding: ApplicationAuditFinding; value: string; saving: boolean; onChange: (value: string) => void; onClose: () => void; onSave: () => void }) {
   const { t } = useI18n()
-  return <div role="dialog" aria-modal="true" aria-label={t('jobs.evidence.title')} style={{ position: 'fixed', inset: 0, zIndex: 140, display: 'grid', placeItems: 'center', padding: 24, background: 'rgba(15,23,42,.62)' }} onMouseDown={onClose}>
+  return <div data-application-nested role="dialog" aria-modal="true" aria-label={t('jobs.evidence.title')} style={{ position: 'fixed', inset: 0, zIndex: 140, display: 'grid', placeItems: 'center', padding: 24, background: 'rgba(15,23,42,.62)' }} onMouseDown={onClose}>
     <div style={{ width: 'min(560px, calc(100vw - 40px))', padding: 22, borderRadius: 14, background: '#fff', boxShadow: '0 24px 80px rgba(15,23,42,.42)' }} onMouseDown={event => event.stopPropagation()}>
       <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16 }}><div><div style={{ fontSize: 17, fontWeight: 750, color: '#0f172a' }}>{t('jobs.evidence.title')}</div><div style={{ marginTop: 5, fontSize: 13, lineHeight: 1.5, color: '#64748b' }}>{t('jobs.evidence.description')}</div></div><button onClick={onClose} disabled={saving} aria-label={t('jobs.evidence.close')} style={{ alignSelf: 'start', border: 0, background: 'transparent', color: '#475569', cursor: 'pointer' }}><X size={20} /></button></div>
       <div style={{ marginTop: 16, padding: '10px 12px', borderLeft: '3px solid #d97706', background: '#fffbeb', fontSize: 12, lineHeight: 1.5, color: '#475569' }}><strong style={{ color: '#92400e' }}>{finding.title}</strong><br />{finding.evidence}</div>
@@ -1369,6 +1432,7 @@ export function JobsPage() {
   const [confirm, ConfirmDialog] = useConfirm()
   const [initialList] = useState(() => readApplicationListState(typeof window === 'undefined' ? '/' : window.location.href))
   const applicationTasks = useApplicationTasks()
+  const [attentionView, setAttentionView] = useState(() => typeof window !== 'undefined' && new URL(window.location.href).searchParams.get('jobsAttention') === '1')
   const listRef = useRef<HTMLDivElement>(null)
   const [highlightId, setHighlightId] = useState(() => typeof window === 'undefined' ? null : new URL(window.location.href).searchParams.get('highlight'))
   const [view,         setView        ] = useState<'list' | 'kanban'>(initialList.view)
@@ -1455,6 +1519,13 @@ export function JobsPage() {
   }, [applicationTasks.refetch])
 
   useEffect(() => {
+    const url = new URL(window.location.href)
+    if (attentionView) url.searchParams.set('jobsAttention', '1')
+    else url.searchParams.delete('jobsAttention')
+    window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`)
+  }, [attentionView])
+
+  useEffect(() => {
     const href = applicationListUrl(window.location.href, { search, status: filterStatus, page, pageSize, sortBy, sortDir, view })
     window.history.replaceState({}, '', href)
   }, [search, filterStatus, page, pageSize, sortBy, sortDir, view])
@@ -1466,6 +1537,7 @@ export function JobsPage() {
       setSortBy(state.sortBy); setSortDir(state.sortDir); setView(state.view)
       const id = new URL(window.location.href).searchParams.get('highlight')
       setHighlightId(id)
+      setAttentionView(new URL(window.location.href).searchParams.get('jobsAttention') === '1')
       if (!id) setSelectedJob(null)
     }
     window.addEventListener('popstate', restore)
@@ -1634,7 +1706,11 @@ export function JobsPage() {
       </header>
 
       <div className="jobs-page-content" style={{ padding: '16px 30px 30px', flex: 1 }}>
-        <div className="jobs-page-toolbar" style={{ padding: 14, marginBottom: 0, background: 'var(--bg)', border: '0.5px solid var(--border)', borderBottom: 'none', borderRadius: '12px 12px 0 0', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+        <div role="group" aria-label={t('application.attentionViews')} style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
+          <button type="button" aria-pressed={!attentionView} onClick={() => setAttentionView(false)}>{t('application.allApplications')}</button>
+          <button type="button" aria-pressed={attentionView} onClick={() => setAttentionView(true)}>{t('application.attentionView')}</button>
+        </div>
+        {!attentionView && <div className="jobs-page-toolbar" style={{ padding: 14, marginBottom: 0, background: 'var(--bg)', border: '0.5px solid var(--border)', borderBottom: 'none', borderRadius: '12px 12px 0 0', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
           <div className="jobs-page-search" style={{ width: 420, maxWidth: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '0 12px', border: '0.5px solid var(--border)', borderRadius: 8, background: 'var(--bg)' }}>
             <Search size={17} color="var(--text-muted)" />
             <input value={search} onChange={e => doSearch(e.target.value)} placeholder={t('jobs.search')}
@@ -1653,8 +1729,8 @@ export function JobsPage() {
           <div style={{ display: 'flex', border: '0.5px solid var(--border)', borderRadius: 8, overflow: 'hidden' }}>
             {([['list', List, 'jobs.listView'], ['kanban', LayoutGrid, 'jobs.kanbanView']] as const).map(([v, Icon, labelKey]) => <button key={v} onClick={() => setView(v)} aria-label={t(labelKey)} style={{ padding: '8px 12px', background: view === v ? 'var(--primary)' : 'var(--bg)', color: view === v ? '#fff' : 'var(--text-muted)', border: 'none', cursor: 'pointer', display: 'inline-flex' }}><Icon size={17} /></button>)}
           </div>
-        </div>
-{loading ? (
+        </div>}
+{attentionView ? <ApplicationAttentionView tasks={applicationTasks.tasks} loading={applicationTasks.loading} error={applicationTasks.error} onOpenJob={id => openApplication(id, navigate)} onOpenSession={id => openApplicationSession(id, navigate)} onRefresh={() => void applicationTasks.refetch()} /> : loading ? (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 60 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: 'var(--text-muted)', fontSize: 12 }}>
               <div style={{ width: 20, height: 20, border: '2px solid rgba(79,70,229,0.2)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
@@ -1684,9 +1760,9 @@ export function JobsPage() {
             {view === 'list'
               ? <>
                 <div className="jobs-desktop-list">
-                  <ListView taskByJobId={applicationTasks.byJobId} jobs={jobs} onRowClick={selectApplication} selectedIds={selectedIds} onToggle={toggleSelected} onToggleAll={toggleAllVisible} />
+                  <ListView onOpenSession={id => openApplicationSession(id, navigate)} taskByJobId={applicationTasks.byJobId} jobs={jobs} onRowClick={selectApplication} selectedIds={selectedIds} onToggle={toggleSelected} onToggleAll={toggleAllVisible} />
                 </div>
-                <MobileListView taskByJobId={applicationTasks.byJobId} jobs={jobs} onRowClick={selectApplication} selectedIds={selectedIds} onToggle={toggleSelected} />
+                <MobileListView onOpenSession={id => openApplicationSession(id, navigate)} taskByJobId={applicationTasks.byJobId} jobs={jobs} onRowClick={selectApplication} selectedIds={selectedIds} onToggle={toggleSelected} />
               </>
               : <KanbanView jobs={jobs} onStatusChange={handleStatusChange} onAddClick={col => { setPrefillStatus(col); setShowAdd(true) }} />}
 

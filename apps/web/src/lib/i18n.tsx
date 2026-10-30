@@ -6,6 +6,13 @@ export type Lang = 'en' | 'de' | 'fr' | 'es' | 'nl' | 'zh'
 // ── Translations dictionary ──────────────────────────────────────────────────
 const dict: Record<Lang, Record<string, string>> = {
   en: {
+    'application.attentionViews': 'Application views',
+    'application.allApplications': 'All applications',
+    'application.attentionView': 'Needs your attention',
+    'application.attentionLoading': 'Loading recent application tasks…',
+    'application.attentionUnavailable': 'Recent application tasks could not be loaded.',
+    'application.recentAttentionEmpty': 'No recent tasks need your attention.',
+    'application.closeDetails': 'Close application details',
     'application.locked': 'Not available yet',
     'application.inProgress': 'In progress',
     'application.needsCorrection': 'Needs attention',
@@ -2737,6 +2744,13 @@ const dict: Record<Lang, Record<string, string>> = {
   es: { 'settings.usage': 'Uso y actividad', 'settings.keysConnections': 'Claves y conexiones' },
   nl: { 'settings.usage': 'Gebruik en activiteit', 'settings.keysConnections': 'Sleutels en verbindingen' },
   zh: {
+    'application.attentionViews': '申请视图',
+    'application.allApplications': '全部申请',
+    'application.attentionView': '需要我处理',
+    'application.attentionLoading': '正在加载近期申请任务…',
+    'application.attentionUnavailable': '无法加载近期申请任务。',
+    'application.recentAttentionEmpty': '最近的申请任务没有待处理事项。',
+    'application.closeDetails': '关闭申请详情',
     'application.locked': '暂不可用',
     'application.inProgress': '进行中',
     'application.needsCorrection': '需要处理',

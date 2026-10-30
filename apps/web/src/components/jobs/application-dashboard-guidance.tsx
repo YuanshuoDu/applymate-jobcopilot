@@ -21,8 +21,9 @@ type Props = {
 
 export function ApplicationDashboardGuidance({ tasks, loading, error, savedJobs, followUps, onOpenApplication, onOpenSession, onRefresh, onDiscover, t }: Props) {
   const attention = tasks.filter(task => getApplicationTaskState(task).needsAttention).slice(0, 3)
-  const followUp = followUps[0]
-  const savedJob = savedJobs.find(job => job.id !== followUp?.id)
+  const attentionIds = new Set(attention.map(task => task.jobId))
+  const followUp = followUps.find(job => !attentionIds.has(job.id))
+  const savedJob = savedJobs.find(job => job.id !== followUp?.id && !attentionIds.has(job.id))
   return <section className="application-dashboard-guidance" aria-labelledby="application-next-steps">
     <div className="application-dashboard-guidance-heading">
       <h2 id="application-next-steps">{t('application.nextSteps')}</h2>

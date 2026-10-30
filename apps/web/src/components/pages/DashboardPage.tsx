@@ -286,6 +286,16 @@ export function DashboardPage() {
     return () => clearInterval(id)
   }, [refetch])
 
+  useEffect(() => {
+    const refreshTasks = () => { void applicationTasks.refetch() }
+    window.addEventListener('focus', refreshTasks)
+    window.addEventListener('applymate:sessions-changed', refreshTasks)
+    return () => {
+      window.removeEventListener('focus', refreshTasks)
+      window.removeEventListener('applymate:sessions-changed', refreshTasks)
+    }
+  }, [applicationTasks.refetch])
+
   if (loading) return <div className="momentum-loading">{t('dashboard.momentum.loading')}</div>
   if (error) return <div className="momentum-loading"><div className="momentum-error-state"><span><AlertCircle size={21} /></span><strong>{t('dashboard.momentum.loadError')}</strong><p>{t('dashboard.momentum.loadErrorDetail')}</p><Btn variant="primary" onClick={refetch}>{t('dashboard.momentum.tryAgain')}</Btn></div></div>
 

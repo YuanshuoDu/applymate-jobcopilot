@@ -48,9 +48,10 @@ export function parseApplicationTasks(value: unknown, userId: string): { tasks: 
       company: job.company, role: job.role, updatedAt: row.updatedAt,
     }
     const previous = byJobId.get(task.jobId)
-    if (previous && Date.parse(previous.updatedAt) === Date.parse(task.updatedAt)
-      && (previous.id !== task.id || previous.status !== task.status || previous.sessionId !== task.sessionId || previous.checkpoint !== task.checkpoint)) return null
-    if (!previous || Date.parse(task.updatedAt) > Date.parse(previous.updatedAt)) byJobId.set(task.jobId, task)
+    // The canonical model enforces one record per user/job. An inconsistent
+    // response must not hide a conflicting pending or uncertain execution.
+    if (previous) return null
+    byJobId.set(task.jobId, task)
   }
   return { tasks: [...byJobId.values()].sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)), limited: payload.tasks.length === 100 }
 }

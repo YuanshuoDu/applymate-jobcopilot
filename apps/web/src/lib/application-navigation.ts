@@ -1,6 +1,17 @@
 import type { Page } from '@/lib/types'
 
-type Navigate = (page: Page) => void
+type Navigate = (page: Page) => void | boolean | Promise<boolean>
+const applicationNavigationEvent = Symbol('application-navigation')
+
+export function isApplicationNavigationEvent(event: Event): boolean {
+  return applicationNavigationEvent in event
+}
+
+function notifyApplicationNavigation() {
+  const event = new Event('popstate')
+  Object.defineProperty(event, applicationNavigationEvent, { value: true })
+  window.dispatchEvent(event)
+}
 
 function clearResumeContext(url: URL) {
   for (const key of ['resumeId', 'returnToJobs', 'returnJobId']) url.searchParams.delete(key)
@@ -14,23 +25,25 @@ export function applicationUrl(currentHref: string, jobId: string): string {
   return url.toString()
 }
 
-export function openApplication(jobId: string, navigate: Navigate): void {
-  if (!jobId.trim()) return
-  navigate('jobs')
+export async function openApplication(jobId: string, navigate: Navigate): Promise<boolean> {
+  if (!jobId.trim()) return false
+  if ((await navigate('jobs')) === false) return false
   window.history.replaceState(window.history.state, '', applicationUrl(window.location.href, jobId))
-  window.dispatchEvent(new Event('popstate'))
+  notifyApplicationNavigation()
+  return true
 }
 
 /** Attach the existing Agent page to a real session; never create a new run. */
-export function openApplicationSession(sessionId: string, navigate: Navigate): void {
-  if (!sessionId.trim()) return
-  navigate('agent')
+export async function openApplicationSession(sessionId: string, navigate: Navigate): Promise<boolean> {
+  if (!sessionId.trim()) return false
+  if ((await navigate('agent')) === false) return false
   const url = new URL(window.location.href)
   clearResumeContext(url)
   url.searchParams.delete('highlight')
   url.searchParams.set('sessionId', sessionId)
   window.history.replaceState(window.history.state, '', url.toString())
-  window.dispatchEvent(new Event('popstate'))
+  notifyApplicationNavigation()
+  return true
 }
 
 export async function openApplicationWhenSaved(jobId: string, navigate: Navigate, edits: {
@@ -38,9 +51,8 @@ export async function openApplicationWhenSaved(jobId: string, navigate: Navigate
   hasChanges: () => boolean
   save: () => Promise<boolean>
 }): Promise<boolean> {
-  if (!jobId.trim() || edits.isSaving()) return false
-  if (edits.hasChanges() && !(await edits.save())) return false
+  if (!jobId.trim()) return false
+  if ((edits.isSaving() || edits.hasChanges()) && !(await edits.save())) return false
   if (edits.isSaving() || edits.hasChanges()) return false
-  openApplication(jobId, navigate)
-  return true
+  return openApplication(jobId, navigate)
 }

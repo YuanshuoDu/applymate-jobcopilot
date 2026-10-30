@@ -55,6 +55,15 @@ describe('Dashboard application guidance', () => {
     expect(buttons).toHaveLength(1)
   })
 
+  it('does not show a second saved or follow-up shortcut for a job needing attention', () => {
+    const input = { ...props(), tasks: [task('1', 'waiting_for_user')] }
+    input.savedJobs[0].id = 'job-1'
+    input.followUps[0].id = 'job-1'
+    const tree = ApplicationDashboardGuidance(input)
+    expect(elements(tree).filter(element => element.type === ApplicationTaskCard)).toHaveLength(1)
+    expect(elements(tree).filter(element => element.type === 'button')).toHaveLength(0)
+  })
+
   it('offers refresh after a query error, without claiming there are no tasks', () => {
     const input = { ...props(), tasks: [], savedJobs: [], followUps: [], error: 'unavailable' as const }
     const tree = ApplicationDashboardGuidance(input)
