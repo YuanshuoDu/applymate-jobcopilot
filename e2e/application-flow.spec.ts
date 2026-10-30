@@ -679,6 +679,25 @@ test('edited resume is saved before an audit of its current version', async ({ p
   expect(state.unexpected).toEqual([])
 })
 
+test('reopening confirmed materials reuses the current binding and audit without a write', async ({ page }) => {
+  const state = await install(page)
+  await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+  await expect(page.locator('[data-resume-editor]').getByText('Software engineer.', { exact: false }).first()).toBeVisible()
+  await expect(page.locator('.resume-opportunity-card')).toContainText('Application flow engineer')
+  const openConfirmation = page.getByRole('button', { name: /Confirm application materials|确认申请材料/, exact: true })
+  const dialog = page.getByRole('dialog', { name: /Confirm application materials|确认申请材料/ })
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await openConfirmation.click()
+    await expect(dialog).toContainText(/Application pack confirmed|申请包已确认/)
+    await expect(dialog.getByRole('button', { name: /Confirm application package|确认申请包/, exact: true })).toHaveCount(0)
+    await expect(dialog.getByRole('button', { name: /View this application|查看此申请/, exact: true })).toBeVisible()
+    await dialog.getByRole('button', { name: /Close final confirmation|关闭最终确认/ }).click()
+  }
+  expect(state.writes).toEqual([])
+  expect(state.analysisRequests).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
 test('unconfirmed material assignment blocks another assignment and application navigation', async ({ page }, testInfo) => {
   test.skip(testInfo.project.name.startsWith('mobile-'), 'Exercises desktop resume controls')
   const state = await install(page)
