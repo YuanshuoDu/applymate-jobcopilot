@@ -74,6 +74,10 @@ jobs:
           cache: pnpm
       - name: Install frozen dependencies
         run: pnpm install --frozen-lockfile
+      - name: Build shared browser dependencies
+        run: |
+          pnpm --filter @jobcopilot/agent-protocol build
+          pnpm --filter @jobcopilot/shared build
       - name: Install Chromium
         run: pnpm exec playwright install --with-deps chromium
       - name: Verify description flow with isolated fixtures
