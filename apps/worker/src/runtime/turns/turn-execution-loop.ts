@@ -4,6 +4,7 @@ import { createTurnBudgetLedger, type TurnBudgetLimits } from "../budget.js"
 import { createProgressDetector, progressCheckpointFromStepContext } from "../progress.js"
 import { buildModelRequest } from "./turn-engine-messages.js"
 import { runAdmittedModelStep } from "./admitted-model-step.js"
+import { settleAndPersistModelUsage } from "./turn-execution-budget-overrun.js"
 import { normalizeProjectedToolCallIds, projectChildToolCallIdsForModelContext } from "./turn-tool-call-id-projection.js"
 import { runModelStep, type ModelStepResult } from "./turn-engine-model.js"
 import { TurnEngineError, toRepositoryJson, type TurnEngineResult, type TurnEngineStep } from "./turn-engine-types.js"
@@ -175,9 +176,7 @@ export async function runTurnExecutionLoop(options: TurnExecutionOptions): Promi
           request = preparedRequest.request; answerEvidenceBindingMap = preparedRequest.bindingMap
           const reservation = budget.reserveModel()
           output = await runAdmittedModelStep({ writer, stepId: step.id, taskId: options.identity.taskId, provider: request.provider, model: request.model, invoke: () => runModelStep(options.model, request, options.validateToolArguments), onStartDenied: () => reservation.settle({ inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }) })
-          reservation.settle(output.usage ?? { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 })
-          await writer.append("model.usage", step.id, null,
-            { provider: output.provider, model: output.model, usage: output.usage, taskId: options.identity.taskId }, `model-usage:${step.id}`)
+          await settleAndPersistModelUsage({ reservation, output, stepId: step.id, taskId: options.identity.taskId, writer, onUsageAccepted: () => { stepOutput = output } })
         }
         output = toolCallProjection ? { ...output, toolCalls: normalizeProjectedToolCallIds(output.toolCalls, toolCallProjection.aliasToCanonical) } : output; stepOutput = output; continuation = output.continuation ?? undefined
         await publishReasoningSummary(writer, options, step, resolveTurnFinalAnswerMarkers(output.reasoningSummary, null).text, now)
