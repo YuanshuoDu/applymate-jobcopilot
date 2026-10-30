@@ -44,12 +44,18 @@ test.beforeAll(async () => {
       import {ResumePage} from '@/components/pages/ResumePage';
       import {SearchPage} from '@/components/pages/SearchPage';
       import {DashboardPage} from '@/components/pages/DashboardPage';
+      import {useApplicationCoverLetters} from '@/components/jobs/useApplicationCoverLetters';
       import {I18nProvider} from '@/lib/i18n';
       import {ToastProvider} from '@/components/ui';
       import {NavContext} from '@/lib/nav-context';
       import {getCachedApiResponse, setCachedApiResponse} from '@/lib/api-cache';
       const subscribeLocation=(cb)=>{addEventListener('popstate',cb);return()=>removeEventListener('popstate',cb)};
       function AgentDestination(){const sessionId=useSyncExternalStore(subscribeLocation,()=>new URL(location.href).searchParams.get('sessionId'),()=>null);return <div data-testid="agent-destination">{sessionId}</div>}
+      function LetterProbe(){
+        const [owner,setOwner]=useState('fixture-user');const [job,setJob]=useState('outside-page');
+        const value=useApplicationCoverLetters(owner,job,owner,'selected-letter');
+        return <div><button onClick={()=>void value.refetch().then(result=>(globalThis.__fixtureLetterOutcomes ||= []).push(result.kind))}>Probe refresh</button><button onClick={()=>setOwner(v=>v==='fixture-user'?'fixture-b':'fixture-user')}>Probe owner</button><button onClick={()=>setJob(v=>v==='outside-page'?'other-job':'outside-page')}>Probe job</button><p data-testid="letter-probe">{value.loading?'loading':value.letter?.content||'unavailable'}</p></div>
+      }
       function Harness(){
         const [page,setPage]=useState(new URL(location.href).searchParams.get('page')||'jobs');
         const navigate=(next)=>{const url=new URL(location.href);url.searchParams.set('page',next);history.pushState({},'',url);setPage(next)};
@@ -57,7 +63,7 @@ test.beforeAll(async () => {
         return <I18nProvider><ToastProvider><NavContext.Provider value={{navigate}}>
           <nav aria-label="Fixture navigation">{['jobs','resume','search','dashboard'].map(name=><button key={name} onClick={()=>navigate(name)}>Fixture {name}</button>)}</nav>
           <main style={{display:'flex',height:'calc(100vh - 32px)',minWidth:0}}>
-          {page==='jobs'?<JobsPage/>:page==='resume'?<ResumePage/>:page==='search'?<SearchPage/>:page==='dashboard'?<DashboardPage/>:<AgentDestination/>}
+          {page==='jobs'?<JobsPage/>:page==='resume'?<ResumePage/>:page==='search'?<SearchPage/>:page==='dashboard'?<DashboardPage/>:page==='letter-probe'?<LetterProbe/>:<AgentDestination/>}
           </main></NavContext.Provider></ToastProvider></I18nProvider>
       }
       globalThis.__fixtureGetCachedResume = () => getCachedApiResponse('/api/resume/resume-1', 'fixture-user');
@@ -118,7 +124,7 @@ function audit(resumeUpdatedAt = time) {
     audit: { verdict: 'pass', summary: 'Fixture materials checked.', findings: [], matchScore: 82, source: 'independent', auditedAt: time } }
 }
 
-async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unknown' | 'waiting_for_user' | 'waiting_for_authorization' | 'cancelled' | 'failed' | 'filling'; recordedInitially?: boolean; evidenceCase?: 'bound' | 'unbound' | 'unavailable'; previewMismatch?: 'owner' | 'id' | 'job'; malformedPreview?: 'content' | 'contact'; failTailoredRead?: boolean; taskFailure?: boolean; missing?: boolean; holdSelectedLetter?: boolean; selectedLetter?: boolean; firstPreparation?: boolean; failFirstAudit?: boolean; flowSave?: boolean; manualOutcome?: 'get-fails' | 'unknown'; search?: boolean; saveMode?: 'fail' | 'hold-success' | 'hold-fail'; twoResumes?: boolean; holdResumeContent?: boolean; snapshotResumeContent?: boolean; resumeRevalidationFails?: boolean; versionedScore?: boolean; holdOldAnalysis?: boolean; holdFirstAnalysisOnly?: boolean; auditCorrection?: boolean; holdAuditCorrection?: boolean; versions?: boolean; holdVersionRestore?: boolean; versionRestoreFails?: boolean; realAgent?: boolean; expiredApproval?: boolean; twoJobQuestions?: boolean; holdFirstTaskRead?: boolean; holdReturnOwnerA?: boolean; taskPerUser?: boolean; dashboardFourTasks?: boolean; agentJourney?: boolean } = {}) {
+async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unknown' | 'waiting_for_user' | 'waiting_for_authorization' | 'cancelled' | 'failed' | 'filling'; recordedInitially?: boolean; evidenceCase?: 'bound' | 'unbound' | 'unavailable'; previewMismatch?: 'owner' | 'id' | 'job'; malformedPreview?: 'content' | 'contact'; letterRaceProbe?: boolean; letterInvalid?: 'null' | 'owner' | 'job' | 'duplicate' | 'content'; letterAfterInitial?: 'changed' | 'failure' | 'hold' | 'manual-change' | 'audit-same' | 'audit-failure' | 'audit-hold'; auditVersion?: 'same' | 'resume-changed' | 'letter-changed' | 'resume-missing' | 'letter-missing'; holdAudit?: boolean; holdAssign?: boolean; selectLetterOnNotes?: boolean; failTailoredRead?: boolean; taskFailure?: boolean; missing?: boolean; holdSelectedLetter?: boolean; selectedLetter?: boolean; firstPreparation?: boolean; failFirstAudit?: boolean; flowSave?: boolean; manualOutcome?: 'get-fails' | 'unknown'; search?: boolean; saveMode?: 'fail' | 'hold-success' | 'hold-fail'; twoResumes?: boolean; holdResumeContent?: boolean; snapshotResumeContent?: boolean; resumeRevalidationFails?: boolean; versionedScore?: boolean; holdOldAnalysis?: boolean; holdFirstAnalysisOnly?: boolean; auditCorrection?: boolean; holdAuditCorrection?: boolean; versions?: boolean; holdVersionRestore?: boolean; versionRestoreFails?: boolean; realAgent?: boolean; expiredApproval?: boolean; twoJobQuestions?: boolean; holdFirstTaskRead?: boolean; holdReturnOwnerA?: boolean; taskPerUser?: boolean; dashboardFourTasks?: boolean; agentJourney?: boolean } = {}) {
   let releaseReturnOwnerA = () => {}
   const returnOwnerAGate = new Promise<void>(resolve => { releaseReturnOwnerA = resolve })
   let releaseStaleJob = () => {}
@@ -142,11 +148,18 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
   const resumeContentGate = new Promise<void>(resolve => { releaseResumeContent = resolve })
   let releaseSave = () => {}
   const saveGate = new Promise<void>(resolve => { releaseSave = resolve })
+  let releaseAudit = () => {}
+  const auditGate = new Promise<void>(resolve => { releaseAudit = resolve })
+  let releaseAssign = () => {}
+  const assignGate = new Promise<void>(resolve => { releaseAssign = resolve })
+  let releaseProbeLetter = () => {}
+  const probeLetterGate = new Promise<void>(resolve => { releaseProbeLetter = resolve })
+  if (options.letterRaceProbe || options.letterAfterInitial === 'hold' || options.letterAfterInitial === 'audit-hold') await page.addInitScript(() => { const original = window.fetch.bind(window); window.fetch = (input, init) => typeof input === 'string' && input.endsWith('/cover-letters') ? original(input, { ...init, signal: undefined }) : original(input, init) })
   let releaseLetters = () => {}
   const lettersGate = new Promise<void>(resolve => { releaseLetters = resolve })
   const state = { job: { ...job(), finalCoverLetterId: options.holdSelectedLetter || options.selectedLetter ? 'selected-letter' : null, finalResumeId: options.firstPreparation ? null : 'resume-1' }, resume: resume(), audit: options.auditCorrection ? { ...audit(), audit: { ...audit().audit, verdict: 'revise', findings: [{ area: 'resume', target: 'summary', severity: 'warning', title: 'Fix summary', evidence: 'Outdated wording', action: 'Apply correction', proposedValue: 'Audited v2 summary' }] } } : audit(options.stale ? '2026-10-29T10:00:00.000Z' : time),
     secondResume: { ...resume(), id: 'resume-2', name: 'Second fixture resume', targetJobId: null as string | null, content: { ...resume().content, summary: 'Second resume content.' } },
-    answeredJobA: false, saveResponses: 0, armReturnOwnerA: false, returnOwnerAEntered: false, releaseReturnOwnerA, manualPosted: false, manualReadAvailable: false, hideResumeOnExport: false, malformedPreview: options.malformedPreview ?? null, fontRequests: [] as string[], activeUserId: 'fixture-user', agentStage: 'question' as 'question' | 'approval' | 'running' | 'unknown', requestOwners: [] as Array<{ path: string; method: string; userId: string }>, agentRequests: [] as Array<{ path: string; method: string; body?: unknown }>, writes: [] as Array<{ path: string; body: unknown }>, analysisRequests: [] as string[], analysisBodies: [] as unknown[], analysisCalls: [] as Array<{ path: string; body: unknown }>, unexpected: [] as string[], taskReads: 0, staleJobRequested: false, staleJobReturned: false, releaseStaleJob, taskStatusOverride: null as 'waiting_for_authorization' | null, firstTaskReadFinished: false, releaseFirstTaskRead, letterRequested: false, resumeContentRequested: false, releaseLetters, releaseSave, releaseResumeContent, releaseOldAnalysis, releaseAuditCorrection, releaseVersionRestore }
+    answeredJobA: false, saveResponses: 0, armReturnOwnerA: false, returnOwnerAEntered: false, releaseReturnOwnerA, manualPosted: false, manualReadAvailable: false, hideResumeOnExport: false, malformedPreview: options.malformedPreview ?? null, selectedLetterAvailable: false, invalidLetter: options.letterInvalid ?? null, probeLetterReads: 0, selectedLetterReads: 0, changeLetterOnRead: false, auditStarted: false, assignStarted: false, releaseAudit, releaseAssign, releaseProbeLetter, fontRequests: [] as string[], activeUserId: 'fixture-user', agentStage: 'question' as 'question' | 'approval' | 'running' | 'unknown', requestOwners: [] as Array<{ path: string; method: string; userId: string }>, agentRequests: [] as Array<{ path: string; method: string; body?: unknown }>, writes: [] as Array<{ path: string; body: unknown }>, analysisRequests: [] as string[], analysisBodies: [] as unknown[], analysisCalls: [] as Array<{ path: string; body: unknown }>, unexpected: [] as string[], taskReads: 0, staleJobRequested: false, staleJobReturned: false, releaseStaleJob, taskStatusOverride: null as 'waiting_for_authorization' | null, firstTaskReadFinished: false, releaseFirstTaskRead, letterRequested: false, resumeContentRequested: false, releaseLetters, releaseSave, releaseResumeContent, releaseOldAnalysis, releaseAuditCorrection, releaseVersionRestore }
   if (options.evidenceCase === 'unbound') state.job.finalResumeId = null
   if (options.previewMismatch === 'job') state.job.finalResumeId = null
   if (options.evidenceCase === 'unavailable') state.hideResumeOnExport = true
@@ -264,8 +277,9 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
         return json(route, { audit: { ...state.audit.audit, findings: [] }, target: 'summary', appliedContent: 'Audited v2 summary', resume: { ...state.resume, updatedAt, content: { ...state.resume.content, summary: 'Audited v2 summary' } }, coverLetter: null, resumeUpdatedAt: updatedAt })
       }
       if (pathname.endsWith('/tailor-resume')) return json(route, { adaptedResumeId: 'resume-1' })
-      if (pathname.endsWith('/audit-application')) { if (options.failFirstAudit && state.writes.filter(write => write.path.endsWith('/audit-application')).length === 1) return json(route, { error: 'Fixture audit unavailable' }, 500); const letterId = (body as { coverLetterId: string | null }).coverLetterId; state.audit = { ...audit(state.resume.updatedAt), coverLetterId: letterId, ...(letterId ? { coverLetterUpdatedAt: time } : {}) }; return json(route, { ...state.audit.audit, resumeUpdatedAt: state.resume.updatedAt, ...(letterId ? { coverLetterUpdatedAt: time } : {}) }) }
-      if (pathname.endsWith('/assign')) { Object.assign(state.job, body); return json(route, state.job) }
+      if (pathname === '/api/jobs/outside-page' && request.method() === 'PATCH' && options.selectLetterOnNotes) { Object.assign(state.job, body, { finalCoverLetterId: 'selected-letter' }); return json(route, state.job) }
+      if (pathname.endsWith('/audit-application')) { state.auditStarted = true; if (options.holdAudit) await auditGate; if (options.failFirstAudit && state.writes.filter(write => write.path.endsWith('/audit-application')).length === 1) return json(route, { error: 'Fixture audit unavailable' }, 500); const letterId = (body as { coverLetterId: string | null }).coverLetterId; state.audit = { ...audit(state.resume.updatedAt), coverLetterId: letterId, ...(letterId ? { coverLetterUpdatedAt: time } : {}) }; return json(route, { ...state.audit.audit, ...(options.auditVersion === 'resume-missing' ? {} : { resumeUpdatedAt: options.auditVersion === 'resume-changed' ? '2026-10-30T11:00:00.000Z' : state.resume.updatedAt }), ...(letterId && options.auditVersion !== 'letter-missing' ? { coverLetterUpdatedAt: options.auditVersion === 'letter-changed' ? '2026-10-30T11:00:00.000Z' : time } : {}) }) }
+      if (pathname.endsWith('/assign')) { state.assignStarted = true; if (options.holdAssign) await assignGate; Object.assign(state.job, body); return json(route, state.job) }
       if (pathname === '/api/jobs/outside-page/apply') { state.manualPosted = true; if (options.manualOutcome === 'unknown') return route.abort('failed'); state.job.status = 'applied'; return json(route, state.job) }
       return json(route, { error: 'Unexpected mutation' }, 500)
     }
@@ -295,8 +309,11 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
     if (pathname === `/api/jobs/${state.job.id}` && state.manualPosted && options.manualOutcome === 'get-fails' && state.manualReadAvailable) return json(route, { ...state.job, status: 'saved' })
     if (pathname === `/api/jobs/${state.job.id}`) return options.missing ? json(route, { error: 'Not found' }, 404) : json(route, state.job)
     if (pathname.endsWith('/cover-letters')) {
-      if (options.holdSelectedLetter) { state.letterRequested = true; await lettersGate; return json(route, { error: 'Fixture letter unavailable' }, 500) }
-      return json(route, options.selectedLetter ? [{ id: 'selected-letter', userId: 'fixture-user', jobId: 'outside-page', content: 'I am excited to contribute my TypeScript experience.', tone: 'professional', createdAt: time, updatedAt: time }] : [])
+      if (options.letterRaceProbe) { const read = ++state.probeLetterReads; const item = { id: 'selected-letter', userId: state.activeUserId, jobId: pathname.split('/')[3], content: read <= 2 ? `Old fixture letter ${read}` : `Current fixture letter ${read}`, updatedAt: time }; if (read <= 2) await probeLetterGate; return json(route, [item]) }
+      if (state.invalidLetter) { const item = { id: 'selected-letter', userId: state.invalidLetter === 'owner' ? 'other-user' : 'fixture-user', jobId: state.invalidLetter === 'job' ? 'other-job' : 'outside-page', content: state.invalidLetter === 'content' ? null : 'Fixture selected cover letter.', updatedAt: time }; return json(route, state.invalidLetter === 'null' ? [null] : state.invalidLetter === 'duplicate' ? [item, item] : [item]) }
+      if (options.letterAfterInitial) { const read = ++state.selectedLetterReads; if (read > 1 && options.letterAfterInitial === 'failure' || read > 2 && options.letterAfterInitial === 'audit-failure') return json(route, { error: 'Fixture refresh failed' }, 500); if (read > 1 && options.letterAfterInitial === 'hold' || read > 2 && options.letterAfterInitial === 'audit-hold') await probeLetterGate; const changed = read > 1 && (options.letterAfterInitial === 'changed' || (options.letterAfterInitial === 'manual-change' && state.changeLetterOnRead)); return json(route, [{ id: 'selected-letter', userId: 'fixture-user', jobId: 'outside-page', content: changed ? 'Changed cover letter.' : 'Original cover letter.', tone: 'professional', createdAt: time, updatedAt: changed ? '2026-10-30T11:00:00.000Z' : time }]) }
+      if (options.holdSelectedLetter) { state.letterRequested = true; await lettersGate; return state.selectedLetterAvailable ? json(route, [{ id: 'selected-letter', userId: 'fixture-user', jobId: 'outside-page', content: 'Fixture selected cover letter.', tone: 'professional', createdAt: time, updatedAt: time }]) : json(route, { error: 'Fixture letter unavailable' }, 500) }
+      return json(route, options.selectedLetter || options.selectLetterOnNotes && state.job.finalCoverLetterId ? [{ id: 'selected-letter', userId: 'fixture-user', jobId: 'outside-page', content: 'I am excited to contribute my TypeScript experience.', tone: 'professional', createdAt: time, updatedAt: time }] : [])
     }
     if (pathname.endsWith('/audit-application') && options.evidenceCase) return json(route, { ...audit(), audit: { ...audit().audit, verdict: 'needs_review', findings: [{ area: 'resume', severity: 'warning', resolution: 'evidence_needed', target: 'summary', title: 'Fixture evidence', evidence: 'No independent support', action: 'Review the claim' }] } })
     if (pathname.endsWith('/audit-application')) return json(route, options.firstPreparation && !state.writes.some(write => write.path.endsWith('/audit-application')) ? null : state.audit)
@@ -803,6 +820,239 @@ test('first preparation audits only the resume without generating or binding a c
   expect(state.unexpected).toEqual([])
 })
 
+test('selected cover letter distinguishes loading and unavailable and refreshes without writes', async ({ page }) => {
+  const state = await install(page, { holdSelectedLetter: true })
+  await open(page)
+  await expect.poll(() => state.letterRequested).toBe(true)
+  const letterRow = page.getByRole('button').filter({ has: page.getByText(/^(Cover letter|求职信)$/) })
+  await expect(letterRow).toContainText(/Loading cover letters|正在加载求职信/)
+  await expect(letterRow).not.toContainText(/Not selected|未选择/)
+  await letterRow.click()
+  await expect(page.getByRole('status').filter({ hasText: /Loading cover letters|正在加载求职信/ })).toBeVisible()
+  state.releaseLetters()
+  const unavailable = page.getByRole('status').filter({ hasText: /selected cover letter could not be loaded.*selection is retained|无法加载已选求职信，原选择仍然保留/i })
+  await expect(unavailable).toBeVisible()
+  await expect(letterRow).not.toContainText(/Not selected|未选择/)
+  expect(state.job.finalCoverLetterId).toBe('selected-letter')
+  expect(state.writes).toEqual([])
+  const reads = state.requestOwners.filter(request => request.path.endsWith('/cover-letters')).length
+  await unavailable.getByRole('button', { name: /Refresh status|刷新状态/ }).click()
+  await expect.poll(() => state.requestOwners.filter(request => request.path.endsWith('/cover-letters')).length).toBeGreaterThan(reads)
+  await expect(unavailable).toBeVisible()
+  expect(state.writes).toEqual([])
+  state.selectedLetterAvailable = true
+  await unavailable.getByRole('button', { name: /Refresh status|刷新状态/ }).click()
+  await expect(page.getByRole('button', { name: /Open the full generated cover letter|打开完整生成求职信/ })).toBeVisible()
+  expect(state.job.finalCoverLetterId).toBe('selected-letter')
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+for (const letterInvalid of ['null', 'owner', 'job', 'duplicate', 'content'] as const) {
+  test(`invalid selected letter is unavailable and recovers: ${letterInvalid}`, async ({ page }) => {
+    const state = await install(page, { selectedLetter: true, letterInvalid })
+    await open(page)
+    const row = page.getByRole('button').filter({ has: page.getByText(/^(Cover letter|求职信)$/) })
+    await row.click()
+    const unavailable = page.getByRole('status').filter({ hasText: /selected cover letter could not be loaded.*selection is retained|无法加载已选求职信，原选择仍然保留/i })
+    await expect(unavailable).toBeVisible()
+    await expect(page.getByRole('button', { name: /Download application materials|下载申请材料/ })).toHaveCount(0)
+    expect(state.job.finalCoverLetterId).toBe('selected-letter')
+    expect(state.writes).toEqual([])
+    state.invalidLetter = null
+    await unavailable.getByRole('button', { name: /Refresh status|刷新状态/ }).click()
+    await expect(page.getByRole('button', { name: /Open the full generated cover letter|打开完整生成求职信/ })).toBeVisible()
+    expect(state.writes).toEqual([])
+    expect(state.unexpected).toEqual([])
+  })
+}
+
+test('cover letter scope rejects superseded reads across refreshes, accounts, and jobs', async ({ page }) => {
+  const state = await install(page, { letterRaceProbe: true })
+  try {
+    await page.goto(`${origin}/?page=letter-probe`)
+    await expect.poll(() => state.probeLetterReads).toBe(1)
+    await page.getByRole('button', { name: 'Probe refresh' }).click()
+    await expect.poll(() => state.probeLetterReads).toBe(2)
+    await page.getByRole('button', { name: 'Probe refresh' }).click()
+    await expect.poll(async () => page.evaluate(() => (globalThis as typeof globalThis & { __fixtureLetterOutcomes?: string[] }).__fixtureLetterOutcomes ?? [])).toContain('superseded')
+    await expect(page.getByTestId('letter-probe')).toHaveText('Current fixture letter 3')
+    state.activeUserId = 'fixture-b'
+    await page.getByRole('button', { name: 'Probe owner' }).click()
+    await expect(page.getByTestId('letter-probe')).toHaveText('Current fixture letter 4')
+    state.activeUserId = 'fixture-user'
+    await page.getByRole('button', { name: 'Probe owner' }).click()
+    await expect(page.getByTestId('letter-probe')).toHaveText('Current fixture letter 5')
+    await page.getByRole('button', { name: 'Probe job' }).click()
+    await expect(page.getByTestId('letter-probe')).toHaveText('Current fixture letter 6')
+    await page.getByRole('button', { name: 'Probe job' }).click()
+    await expect(page.getByTestId('letter-probe')).toHaveText('Current fixture letter 7')
+    const oldResponse = page.waitForResponse(response => response.url().endsWith('/cover-letters') && response.status() === 200)
+    state.releaseProbeLetter()
+    await oldResponse
+    await expect(page.getByTestId('letter-probe')).toHaveText('Current fixture letter 7')
+    expect(state.writes).toEqual([])
+    expect(state.unexpected).toEqual([])
+  } finally { state.releaseProbeLetter() }
+})
+
+test('an unselected cover letter remains optional and offers the selection path', async ({ page }) => {
+  const state = await install(page)
+  await open(page)
+  const letterRow = page.getByRole('button').filter({ has: page.getByText(/^(Cover letter|求职信)$/) })
+  await expect(letterRow).toContainText(/Not selected|未选择/)
+  await letterRow.click()
+  await expect(page.getByRole('button', { name: /Select or create a cover letter|选择或创建求职信/ })).toBeVisible()
+  expect(state.job.finalCoverLetterId).toBeNull()
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+for (const letterAfterInitial of ['changed', 'failure'] as const) {
+  test(`preparation stops if the selected cover letter refresh ${letterAfterInitial}`, async ({ page }) => {
+    const state = await install(page, { selectedLetter: true, stale: true, letterAfterInitial })
+    await open(page)
+    await expect.poll(() => state.selectedLetterReads).toBe(1)
+    const check = page.getByRole('button', { name: /Check current materials|检查当前材料/, exact: true })
+    await expect(check).toBeEnabled()
+    await check.click()
+    await expect(page.getByText(/Preparation could not finish|准备未完成/)).toBeVisible()
+    expect(state.selectedLetterReads).toBe(2)
+    expect(state.job.finalCoverLetterId).toBe('selected-letter')
+    expect(state.writes).toEqual([])
+    expect(state.unexpected).toEqual([])
+  })
+}
+
+test('switching accounts cancels an outstanding preparation read without auditing', async ({ page }) => {
+  const state = await install(page, { selectedLetter: true, stale: true, letterAfterInitial: 'hold' })
+  try {
+    await open(page)
+    await expect.poll(() => state.selectedLetterReads).toBe(1)
+    await page.getByRole('button', { name: /Check current materials|检查当前材料/, exact: true }).click()
+    await expect.poll(() => state.selectedLetterReads).toBe(2)
+    state.activeUserId = 'fixture-b'
+    await page.evaluate(() => (globalThis as typeof globalThis & { __fixtureSetSession: (status: string, id: string) => void }).__fixtureSetSession('authenticated', 'fixture-b'))
+    await expect(page.getByRole('dialog', { name: 'Application flow engineer' })).toHaveCount(0)
+    const oldResponse = page.waitForResponse(response => response.url().endsWith('/cover-letters') && response.status() === 200)
+    state.releaseProbeLetter()
+    await oldResponse
+    expect(state.writes).toEqual([])
+    expect(state.unexpected).toEqual([])
+  } finally { state.releaseProbeLetter() }
+})
+
+for (const phase of ['audit', 'assign'] as const) {
+  test(`selected letter refresh during ${phase} prevents a stale ready result`, async ({ page }) => {
+    const state = await install(page, { selectedLetter: true, stale: true, letterAfterInitial: 'manual-change', holdAudit: phase === 'audit', holdAssign: phase === 'assign' })
+    try {
+      await open(page)
+      await expect.poll(() => state.selectedLetterReads).toBe(1)
+      await page.getByRole('button', { name: /Check current materials|检查当前材料/, exact: true }).click()
+      await expect.poll(() => phase === 'audit' ? state.auditStarted : state.assignStarted).toBe(true)
+      const row = page.getByRole('button').filter({ has: page.getByText(/^(Cover letter|求职信)$/) })
+      await row.click()
+      state.changeLetterOnRead = true
+      await page.getByRole('button', { name: /Refresh status|刷新状态/, exact: true }).click()
+      await expect.poll(() => state.selectedLetterReads).toBe(3)
+      await expect(page.getByRole('button', { name: /Open the full generated cover letter|打开完整生成求职信/ })).toBeVisible()
+      if (phase === 'audit') state.releaseAudit(); else state.releaseAssign()
+      await expect(page.getByText(/selected cover letter changed during preparation|所选求职信在准备期间发生变化/i)).toBeVisible()
+      await expect(page.getByText(/Application materials are ready|申请材料已准备好/, { exact: true })).toHaveCount(0)
+      if (phase === 'audit') expect(state.writes.some(write => write.path.endsWith('/assign'))).toBe(false)
+      else expect(state.writes.filter(write => write.path.endsWith('/assign'))).toHaveLength(1)
+      expect(state.unexpected).toEqual([])
+    } finally { state.releaseAudit(); state.releaseAssign() }
+  })
+}
+
+for (const mode of ['audit-same', 'audit-failure', 'audit-hold'] as const) {
+  test(`audit and selected-letter ${mode} refresh preserve safe preparation`, async ({ page }) => {
+    const state = await install(page, { selectedLetter: true, stale: true, letterAfterInitial: mode, holdAudit: true })
+    try {
+      await open(page)
+      await expect.poll(() => state.selectedLetterReads).toBe(1)
+      await page.getByRole('button', { name: /Check current materials|检查当前材料/, exact: true }).click()
+      await expect.poll(() => state.auditStarted).toBe(true)
+      const row = page.getByRole('button').filter({ has: page.getByText(/^(Cover letter|求职信)$/) })
+      await row.click()
+      await page.getByRole('button', { name: /Refresh status|刷新状态/, exact: true }).click()
+      await expect.poll(() => state.selectedLetterReads).toBe(3)
+      if (mode === 'audit-same') {
+        await expect(page.getByRole('button', { name: /Open the full generated cover letter|打开完整生成求职信/ })).toBeVisible()
+      } else if (mode === 'audit-failure') {
+        await expect(page.getByText(/selected cover letter could not be loaded.*selection is retained|无法加载已选求职信，原选择仍然保留/i).first()).toBeVisible()
+      }
+      const auditResponse = page.waitForResponse(response => response.url().endsWith('/audit-application') && response.request().method() === 'POST')
+      state.releaseAudit()
+      await auditResponse
+      if (mode === 'audit-hold') {
+        // Give the completed audit continuation an opportunity to run while the letter read remains gated.
+        await page.waitForTimeout(400)
+        expect(state.writes.filter(write => write.path.endsWith('/assign'))).toHaveLength(0)
+        state.releaseProbeLetter()
+      }
+      if (mode === 'audit-failure') {
+        await expect(page.getByText(/Preparation could not finish|准备未完成/)).toBeVisible()
+        expect(state.writes.filter(write => write.path.endsWith('/assign'))).toHaveLength(0)
+        await expect(page.getByText(/Application materials are ready|申请材料已准备好/, { exact: true })).toHaveCount(0)
+      } else {
+        await expect(page.getByText(/Application materials are ready|申请材料已准备好/, { exact: true })).toBeVisible()
+        expect(state.writes.filter(write => write.path.endsWith('/assign'))).toHaveLength(1)
+      }
+      expect(state.writes.filter(write => write.path.endsWith('/audit-application'))).toHaveLength(1)
+      expect(state.unexpected).toEqual([])
+    } finally { state.releaseAudit(); state.releaseProbeLetter() }
+  })
+}
+
+test('audit waits at most 30 seconds for a pending selected-letter refresh', async ({ page }) => {
+  await page.clock.install()
+  const state = await install(page, { selectedLetter: true, stale: true, letterAfterInitial: 'audit-hold', holdAudit: true })
+  try {
+    await open(page)
+    await expect.poll(() => state.selectedLetterReads).toBe(1)
+    await page.getByRole('button', { name: /Check current materials|检查当前材料/, exact: true }).click()
+    await expect.poll(() => state.auditStarted).toBe(true)
+    await page.getByRole('button').filter({ has: page.getByText(/^(Cover letter|求职信)$/) }).click()
+    await page.getByRole('button', { name: /Refresh status|刷新状态/, exact: true }).click()
+    await expect.poll(() => state.selectedLetterReads).toBe(3)
+    const auditResponse = page.waitForResponse(response => response.url().endsWith('/audit-application') && response.request().method() === 'POST')
+    state.releaseAudit()
+    await auditResponse
+    await page.clock.fastForward(30_001)
+    await expect(page.getByText(/Preparation could not finish|准备未完成/)).toBeVisible()
+    expect(state.writes.filter(write => write.path.endsWith('/assign'))).toHaveLength(0)
+    await expect(page.getByText(/Application materials are ready|申请材料已准备好/, { exact: true })).toHaveCount(0)
+    const lateResponse = page.waitForResponse(response => response.url().endsWith('/cover-letters') && response.status() === 200)
+    state.releaseProbeLetter()
+    await lateResponse
+    await expect(page.getByText(/selected cover letter could not be loaded.*selection is retained|无法加载已选求职信，原选择仍然保留/i).first()).toBeVisible()
+    expect(state.writes.filter(write => write.path.endsWith('/audit-application'))).toHaveLength(1)
+    expect(state.writes.filter(write => write.path.endsWith('/assign'))).toHaveLength(0)
+    await expect(page.getByText(/Application materials are ready|申请材料已准备好/, { exact: true })).toHaveCount(0)
+    expect(state.unexpected).toEqual([])
+  } finally { state.releaseAudit(); state.releaseProbeLetter() }
+})
+
+test('selecting a letter while a resume-only audit is pending stops the old preparation', async ({ page }) => {
+  const state = await install(page, { stale: true, holdAudit: true, selectLetterOnNotes: true })
+  try {
+    await open(page)
+    await page.getByRole('button', { name: /Check current materials|检查当前材料/, exact: true }).click()
+    await expect.poll(() => state.auditStarted).toBe(true)
+    const notes = page.getByPlaceholder(/Add notes|添加备注/)
+    await notes.fill('Fixture note')
+    await notes.blur()
+    await expect.poll(() => state.job.finalCoverLetterId).toBe('selected-letter')
+    state.releaseAudit()
+    await expect(page.getByText(/selected cover letter changed during preparation|所选求职信在准备期间发生变化/i)).toBeVisible()
+    expect(state.writes.some(write => write.path.endsWith('/assign'))).toBe(false)
+    await expect(page.getByText(/Application materials are ready|申请材料已准备好/, { exact: true })).toHaveCount(0)
+    expect(state.unexpected).toEqual([])
+  } finally { state.releaseAudit() }
+})
+
 
 test('retrying preparation after the first audit fails reuses the generated resume', async ({ page }) => {
   const state = await install(page, { firstPreparation: true, failFirstAudit: true })
@@ -837,6 +1087,36 @@ test('checking an already selected letter preserves its binding', async ({ page 
   expect(state.job.finalCoverLetterId).toBe('selected-letter')
   expect(state.unexpected).toEqual([])
 })
+
+for (const scenario of [
+  { name: 'resume version changed', version: 'resume-changed', letter: true, accepted: false },
+  { name: 'cover letter version changed', version: 'letter-changed', letter: true, accepted: false },
+  { name: 'resume version missing with a letter', version: 'resume-missing', letter: true, accepted: false },
+  { name: 'cover letter version missing', version: 'letter-missing', letter: true, accepted: false },
+  { name: 'resume version missing without a letter', version: 'resume-missing', letter: false, accepted: false },
+  { name: 'both material versions match', version: 'same', letter: true, accepted: true },
+] as const) {
+  test(`audit response ${scenario.name} governs binding`, async ({ page }) => {
+    const state = await install(page, { selectedLetter: scenario.letter, stale: true, auditVersion: scenario.version, holdAudit: true })
+    try {
+      await open(page)
+      await page.getByRole('button', { name: /Check current materials|检查当前材料/, exact: true }).click()
+      await expect.poll(() => state.auditStarted).toBe(true)
+      expect(state.writes.filter(write => write.path.endsWith('/assign'))).toHaveLength(0)
+      state.releaseAudit()
+      if (scenario.accepted) {
+        await expect(page.getByText(/Application materials are ready|申请材料已准备好/, { exact: true })).toBeVisible()
+        expect(state.writes.filter(write => write.path.endsWith('/assign'))).toHaveLength(1)
+      } else {
+        await expect(page.getByText(/audit could not be matched to the prepared material versions|无法确认审核所用版本与准备的材料一致/i)).toBeVisible()
+        expect(state.writes.filter(write => write.path.endsWith('/assign'))).toHaveLength(0)
+        await expect(page.getByText(/Application materials are ready|申请材料已准备好/, { exact: true })).toHaveCount(0)
+      }
+      expect(state.writes.filter(write => write.path.endsWith('/audit-application'))).toHaveLength(1)
+      expect(state.unexpected).toEqual([])
+    } finally { state.releaseAudit() }
+  })
+}
 
 for (const outcome of ['get-fails', 'unknown'] as const) {
   test(`manual recording ${outcome} remains locked across status checks and reload`, async ({ page }) => {

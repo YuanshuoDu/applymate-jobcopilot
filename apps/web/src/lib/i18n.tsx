@@ -64,6 +64,9 @@ const dict: Record<Lang, Record<string, string>> = {
 
     'application.viewMaterials': 'View application materials',
     'application.selectedLetterLoading': 'The selected cover letter is still loading. Refresh before checking these materials.',
+    'application.selectedLetterUnavailable': 'The selected cover letter could not be loaded. Your selection is retained; refresh to try again.',
+    'application.selectedLetterChanged': 'The selected cover letter changed during preparation. Refresh the application and review the current version before checking it again.',
+    'application.auditVersionMismatch': 'The audit could not be matched to the prepared material versions. Refresh the application, review the materials and check them again.',
     'application.taskProgress': 'Application progress',
     'application.taskProgressHint': 'Continue the existing task to review questions, authorization and results.',
     'application.recorded': 'Application record',
@@ -2847,6 +2850,9 @@ const dict: Record<Lang, Record<string, string>> = {
 
     'application.viewMaterials': '查看申请材料',
     'application.selectedLetterLoading': '所选求职信尚未加载，请刷新后再检查材料。',
+    'application.selectedLetterUnavailable': '无法加载已选求职信，原选择仍然保留；请刷新后重试。',
+    'application.selectedLetterChanged': '所选求职信在准备期间发生变化，请刷新申请并查看当前版本后再重新检查。',
+    'application.auditVersionMismatch': '无法确认审核所用版本与准备的材料一致。请刷新申请、核对材料并重新检查。',
     'application.taskProgress': '申请进展',
     'application.taskProgressHint': '进入原任务处理问题、审核授权和查看结果。',
     'application.recorded': '申请记录',

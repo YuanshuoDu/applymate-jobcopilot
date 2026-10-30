@@ -18,6 +18,7 @@ import { auditMatchesCurrentMaterials } from '@/lib/application-materials'
 import { applicationListUrl, loadLinkedApplication, readApplicationListState } from '@/lib/application-list-state'
 import type { StoredApplicationAudit } from '@/lib/application-audit'
 import { useApplicationTasks } from '@/components/jobs/useApplicationTasks'
+import { useApplicationCoverLetters } from '@/components/jobs/useApplicationCoverLetters'
 import { ApplicationProgress } from '@/components/jobs/application-progress'
 import { ApplicationTaskCard } from '@/components/jobs/application-task-card'
 import { ApplicationAttentionView, ApplicationTaskSummary } from '@/components/jobs/application-attention-view'
@@ -556,6 +557,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   const [preparationElapsed, setPreparationElapsed] = useState(0)
   const [packStage, setPackStage] = useState<'idle' | 'resume' | 'coverLetter' | 'audit' | 'review'>('idle')
   const [latestAuditRecord, setLatestAuditRecord] = useState<StoredApplicationAudit | null>(null)
+  const [preparationReviewRequired, setPreparationReviewRequired] = useState(false)
   const [openPackItem, setOpenPackItem] = useState<'resume' | 'coverLetter' | 'audit' | null>(null)
   const [resumePreview, setResumePreview] = useState<Resume | null>(null)
   const [resumePreviewState, setResumePreviewState] = useState<{ id: string; status: 'loading' | 'unavailable' | 'ready' } | null>(null)
@@ -565,7 +567,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   const [latestAudit, setLatestAudit] = useState<ApplicationAudit | null>(null)
   const [documentPreview, setDocumentPreview] = useState<'resume' | 'coverLetter' | null>(null)
   const manualWorkAllowed = applicationTaskAllowsManualWork(task)
-  const { data: coverLetters, refetch: refetchCoverLetters } = useApi<CoverLetter[]>(`/api/jobs/${job.id}/cover-letters`)
+  const { letter: selectedCoverLetter, loading: coverLettersLoading, refetch: refetchCoverLetters, waitForLatest: waitForLatestCoverLetter, captureScope: captureLetterScope } = useApplicationCoverLetters(drawerUserId, job.id, job.userId, job.finalCoverLetterId)
   // The audit route is the canonical source because the activity feed is
   // paginated and can omit an older audit after other job events are added.
   const { data: canonicalAudit } = useApi<StoredApplicationAudit | null>(`/api/jobs/${job.id}/audit-application`)
@@ -693,9 +695,8 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   // Once a package has been confirmed, every surface must show the exact
   // resume/letter pair that is exported. Do not let an in-memory draft letter
   // replace the confirmed version in the Application Pack preview.
-  const selectedCoverLetter = job.finalCoverLetterId
-    ? coverLetters?.find(letter => letter.id === job.finalCoverLetterId)
-    : null
+  const selectedLetterUnavailable = Boolean(job.finalCoverLetterId && !selectedCoverLetter)
+  const selectedLetterStatus = t(coverLettersLoading ? 'coverLetter.panel.loading' : 'application.selectedLetterUnavailable')
   const persistedAudit = useMemo(() => findLatestApplicationAudit(activity), [activity])
   const storedAudit = canonicalAudit ?? persistedAudit
   const displayedAudit = latestAudit ?? storedAudit?.audit ?? null
@@ -790,13 +791,22 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     const owner = drawerUserIdRef.current
     if (!owner || !isCurrentDrawer(owner) || job.userId !== owner) return
     if (preparationInFlight.current || !manualWorkAllowed || taskReadState !== 'ready' || (previewResumeId && !evidenceResumeId)) return
-    if (job.finalCoverLetterId && !coverLetters?.some(letter => letter.id === job.finalCoverLetterId)) {
+    if (job.finalCoverLetterId && !selectedCoverLetter) {
       toast.info(t('application.selectedLetterLoading'))
       return
     }
     if (!selectedResumeId && !existingTailoredResume && !createdTailoredResumeId && !job.finalResumeId) {
       toast.error('No base resume selected', 'Create or import a resume first.')
       return
+    }
+    const letterScopeCurrent = captureLetterScope()
+    if (!letterScopeCurrent()) return
+    const requireLetterScope = () => {
+      if (!letterScopeCurrent()) {
+        setPreparationReviewRequired(true)
+        setOpenPackItem('coverLetter')
+        throw new Error(t('application.selectedLetterChanged'))
+      }
     }
     const resumeRepairs = [
       ...(auditNeedsRepair ? factualAuditFindings.filter(finding => finding.area === 'resume') : []),
@@ -824,6 +834,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
         if (!data || error) throw new Error(error ?? 'Could not tailor the resume')
         adaptedResumeId = data.adaptedResumeId
         setCreatedTailoredResumeId(adaptedResumeId)
+        requireLetterScope()
       } else if (resumeRepairs.length) {
         setPackStage('resume')
         const { data, error } = await apiMutate<{ adaptedResumeId: string }>(
@@ -831,6 +842,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
           { resumeId: adaptedResumeId, forceRetailor: true, auditFindings: resumeRepairs },
         )
         if (!isCurrentDrawer(owner)) return
+        requireLetterScope()
         if (!data || error) throw new Error(error ?? 'Could not repair the flagged resume section')
         adaptedResumeId = data.adaptedResumeId
       }
@@ -848,15 +860,56 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
         }
         throw error
       }
+      requireLetterScope()
       if (!isUsableResumePayload(tailored)) throw new Error('Resume unavailable')
+      if (typeof tailored.updatedAt !== 'string' || !Number.isFinite(Date.parse(tailored.updatedAt))) {
+        setPreparationReviewRequired(true)
+        throw new Error(t('application.auditVersionMismatch'))
+      }
       setResumePreview(tailored)
       setCachedApiResponse(`/api/resume/${adaptedResumeId}`, tailored, owner)
 
-      let coverLetter = job.finalCoverLetterId
-        ? coverLetters?.find(letter => letter.id === job.finalCoverLetterId)
-        : undefined
+      let coverLetter = selectedCoverLetter ?? undefined
       if (job.finalCoverLetterId && !coverLetter) throw new Error(t('application.selectedLetterLoading'))
+      let checkedLetter = job.finalCoverLetterId ? await refetchCoverLetters() : null
+      if (!isCurrentDrawer(owner)) return
+      requireLetterScope()
+      const verifyLatestLetter = async (deadline: number) => {
+        const remaining = deadline - Date.now()
+        if (remaining <= 0) {
+          setPreparationReviewRequired(true)
+          setOpenPackItem('coverLetter')
+          throw new Error(t('application.selectedLetterUnavailable'))
+        }
+        const latest = await waitForLatestCoverLetter(remaining)
+        if (!isCurrentDrawer(owner)) return null
+        requireLetterScope()
+        if (latest.kind !== 'ready') {
+          setPreparationReviewRequired(true)
+          setOpenPackItem('coverLetter')
+          throw new Error(t('application.selectedLetterUnavailable'))
+        }
+        if (!coverLetter || latest.letter.id !== coverLetter.id || latest.letter.updatedAt !== coverLetter.updatedAt
+          || latest.letter.content !== coverLetter.content) {
+          setPreparationReviewRequired(true)
+          setOpenPackItem('coverLetter')
+          throw new Error(t('application.selectedLetterChanged'))
+        }
+        return latest
+      }
+      if (checkedLetter && (checkedLetter.kind !== 'ready' || !checkedLetter.current())) {
+        setPreparationReviewRequired(true)
+        setOpenPackItem('coverLetter')
+        throw new Error(t('application.selectedLetterUnavailable'))
+      }
+      if (checkedLetter?.kind === 'ready' && (!coverLetter || checkedLetter.letter.id !== coverLetter.id
+        || checkedLetter.letter.updatedAt !== coverLetter.updatedAt || checkedLetter.letter.content !== coverLetter.content)) {
+        setPreparationReviewRequired(true)
+        setOpenPackItem('coverLetter')
+        throw new Error(t('application.selectedLetterChanged'))
+      }
       if (coverLetterRepairs.length) {
+        if (!checkedLetter || checkedLetter.kind !== 'ready' || !checkedLetter.current()) throw new Error(t('application.selectedLetterUnavailable'))
         setPackStage('coverLetter')
         const result = await apiMutate<CoverLetter>(
           `/api/jobs/${job.id}/cover-letters/generate`, 'POST',
@@ -868,26 +921,53 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
           },
         )
         if (!isCurrentDrawer(owner)) return
+        requireLetterScope()
         if (!result.data || result.error) throw new Error(result.error ?? 'Could not prepare the cover letter')
         coverLetter = result.data
-      }
-      if (coverLetter && job.finalCoverLetterId !== coverLetter.id) {
-        const { data: assigned, error: assignError } = await apiMutate<Job>(
-          `/api/jobs/${job.id}/assign`, 'PATCH', { finalCoverLetterId: coverLetter.id },
-        )
+        if (coverLetter.id !== job.finalCoverLetterId || coverLetter.userId !== owner || coverLetter.jobId !== job.id
+          || typeof coverLetter.content !== 'string' || typeof coverLetter.updatedAt !== 'string') throw new Error(t('application.selectedLetterUnavailable'))
+        checkedLetter = await refetchCoverLetters()
         if (!isCurrentDrawer(owner)) return
-        if (!assigned || assignError) throw new Error(assignError ?? 'Could not select the cover letter')
-        onUpdate(assigned)
+        requireLetterScope()
+        if (checkedLetter.kind !== 'ready' || !checkedLetter.current()) {
+          setPreparationReviewRequired(true)
+          setOpenPackItem('coverLetter')
+          throw new Error(t('application.selectedLetterUnavailable'))
+        }
+        if (checkedLetter.letter.id !== coverLetter.id || checkedLetter.letter.updatedAt !== coverLetter.updatedAt
+          || checkedLetter.letter.content !== coverLetter.content) {
+          setPreparationReviewRequired(true)
+          setOpenPackItem('coverLetter')
+          throw new Error(t('application.selectedLetterChanged'))
+        }
       }
-      await refetchCoverLetters()
       if (!isCurrentDrawer(owner)) return
+      requireLetterScope()
+      if (checkedLetter && (checkedLetter.kind !== 'ready' || !checkedLetter.current())) {
+        setPreparationReviewRequired(true)
+        throw new Error(t('application.selectedLetterUnavailable'))
+      }
 
       setPackStage('audit')
       const { data: audit, error: auditError } = await apiMutate<ApplicationAudit & Pick<StoredApplicationAudit, 'resumeUpdatedAt' | 'coverLetterUpdatedAt'>>(
         `/api/jobs/${job.id}/audit-application`, 'POST', { resumeId: adaptedResumeId, coverLetterId: coverLetter?.id ?? null },
       )
       if (!isCurrentDrawer(owner)) return
+      requireLetterScope()
+      const auditWaitDeadline = Date.now() + 30_000
+      while (checkedLetter && (checkedLetter.kind !== 'ready' || !checkedLetter.current())) {
+        checkedLetter = await verifyLatestLetter(auditWaitDeadline)
+        if (!isCurrentDrawer(owner)) return
+        if (!checkedLetter) return
+      }
       if (!audit || auditError) throw new Error(auditError ?? 'Independent audit could not run')
+      if (audit.resumeUpdatedAt !== tailored.updatedAt || (coverLetter
+        ? audit.coverLetterUpdatedAt !== coverLetter.updatedAt
+        : audit.coverLetterUpdatedAt != null)) {
+        setPreparationReviewRequired(true)
+        throw new Error(t('application.auditVersionMismatch'))
+      }
+      setPreparationReviewRequired(false)
       setLatestAudit(audit)
       setLatestAuditRecord({ resumeId: adaptedResumeId, coverLetterId: coverLetter?.id ?? null,
         resumeUpdatedAt: audit.resumeUpdatedAt, coverLetterUpdatedAt: audit.coverLetterUpdatedAt, audit })
@@ -903,6 +983,13 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
         `/api/jobs/${job.id}/assign`, 'PATCH', { finalResumeId: adaptedResumeId },
       )
       if (!isCurrentDrawer(owner)) return
+      requireLetterScope()
+      const assignWaitDeadline = Date.now() + 30_000
+      while (checkedLetter && (checkedLetter.kind !== 'ready' || !checkedLetter.current())) {
+        checkedLetter = await verifyLatestLetter(assignWaitDeadline)
+        if (!isCurrentDrawer(owner)) return
+        if (!checkedLetter) return
+      }
       if (!confirmed || confirmError) throw new Error(confirmError ?? 'Could not confirm the audited package')
       onUpdate(confirmed)
       toast.success(t('application.materialsReadyTitle'), t(coverLetter ? 'application.materialsReadyWithLetter' : 'application.materialsReadyResumeOnly'))
@@ -970,7 +1057,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   const drawerInputSt: React.CSSProperties = { ...INPUT_STYLE, fontSize: 11, padding: '5px 8px', borderRadius: 5 }
   const canTailorResume = Boolean(applicationPreflight.canPrepare && job.description && (baseResumes.length || existingTailoredResume || job.finalResumeId))
   const currentRecord = latestAuditRecord ?? storedAudit
-  const currentPackAudited = currentRecord?.audit.verdict === 'pass' && auditMatchesCurrentMaterials(
+  const currentPackAudited = !preparationReviewRequired && currentRecord?.audit.verdict === 'pass' && auditMatchesCurrentMaterials(
     currentRecord, job.finalResumeId, job.finalCoverLetterId,
     resumePreview?.id === job.finalResumeId ? resumePreview.updatedAt : null,
     selectedCoverLetter?.updatedAt ?? null, false,
@@ -1044,8 +1131,8 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
               {previewResumeId && !evidenceResumeId ? <div role="status"><p>{t(resumePreviewState?.id === previewResumeId && resumePreviewState.status === 'unavailable' ? 'print.loadError' : 'resume.loading')}</p>{resumePreviewState?.id === previewResumeId && resumePreviewState.status === 'unavailable' && <Btn variant="ghost" small onClick={() => setResumePreviewRetry(current => current + 1)}>{t('application.refreshStatus')}</Btn>}</div> : <ResumePackPreview resume={evidenceResumeId ? resumePreview : null} onReview={() => { rememberNestedOrigin(); setDocumentPreview('resume') }} />}
               {previewResumeId && <Btn variant="ghost" small disabled={!evidenceResumeId} onClick={() => { if (evidenceResumeId) onOpenTailoredResume(evidenceResumeId) }}>{t('application.editResume')}</Btn>}
             </PackRow>
-            <PackRow number="2" title={t('jobs.pack.coverLetter')} detail={packStage === 'coverLetter' ? t('jobs.pack.writingCoverLetter') : selectedCoverLetter ? t('jobs.pack.generatedJob') : t('application.coverLetterOptional')} done={Boolean(selectedCoverLetter)} active={packStage === 'coverLetter'} open={openPackItem === 'coverLetter'} onToggle={() => setOpenPackItem(current => current === 'coverLetter' ? null : 'coverLetter')}>
-              <CoverLetterPackPreview coverLetter={selectedCoverLetter ?? null} applicant={resumePreview?.content.contact} fallbackName={resumePreview?.name ?? 'Applicant'} company={job.company} role={job.role} templateId={resumePreview?.templateId ?? undefined} templateOptions={resumePreview?.templateOptions ?? undefined} onReview={() => { rememberNestedOrigin(); setDocumentPreview('coverLetter') }} />
+            <PackRow number="2" title={t('jobs.pack.coverLetter')} detail={packStage === 'coverLetter' ? t('jobs.pack.writingCoverLetter') : selectedLetterUnavailable ? selectedLetterStatus : selectedCoverLetter ? t('jobs.pack.generatedJob') : t('application.coverLetterOptional')} statusOverride={selectedLetterUnavailable ? selectedLetterStatus : undefined} done={Boolean(selectedCoverLetter)} active={packStage === 'coverLetter'} open={openPackItem === 'coverLetter'} onToggle={() => setOpenPackItem(current => current === 'coverLetter' ? null : 'coverLetter')}>
+              {selectedLetterUnavailable ? <div role="status"><p>{selectedLetterStatus}</p>{!coverLettersLoading && <Btn variant="ghost" small onClick={() => void refetchCoverLetters()}>{t('application.refreshStatus')}</Btn>}</div> : selectedCoverLetter ? <><CoverLetterPackPreview coverLetter={selectedCoverLetter} applicant={resumePreview?.content.contact} fallbackName={resumePreview?.name ?? 'Applicant'} company={job.company} role={job.role} templateId={resumePreview?.templateId ?? undefined} templateOptions={resumePreview?.templateOptions ?? undefined} onReview={() => { rememberNestedOrigin(); setDocumentPreview('coverLetter') }} /><Btn variant="ghost" small onClick={() => void refetchCoverLetters()}>{t('application.refreshStatus')}</Btn></> : <p>{t('application.coverLetterOptional')}</p>}
               {coverLetterSelectionNeeded && <p role="status">{t('application.coverLetterSelectFirst')}</p>}
               {!job.finalCoverLetterId && previewResumeId && <Btn variant="ghost" small disabled={!evidenceResumeId} onClick={() => { if (evidenceResumeId) onOpenTailoredResume(evidenceResumeId) }}>{t('application.coverLetterSelect')}</Btn>}
             </PackRow>
@@ -1294,12 +1381,12 @@ function findLatestApplicationAudit(activity: Activity[]): StoredApplicationAudi
   return null
 }
 
-function PackRow({ number, title, detail, done, failed = false, active = false, locked, onClick, onToggle, open, children, last = false }: {
-  number: string; title: string; detail: string; done: boolean; failed?: boolean; locked?: boolean; onClick?: () => void
+function PackRow({ number, title, detail, done, failed = false, active = false, locked, onClick, onToggle, open, children, last = false, statusOverride }: {
+  number: string; title: string; detail: string; done: boolean; failed?: boolean; locked?: boolean; onClick?: () => void; statusOverride?: string
   active?: boolean; onToggle?: () => void; open?: boolean; children?: React.ReactNode; last?: boolean
 }) {
   const { t } = useI18n()
-  const status = t(locked ? 'application.locked' : active ? 'application.inProgress' : failed ? 'application.needsCorrection'
+  const status = statusOverride ?? t(locked ? 'application.locked' : active ? 'application.inProgress' : failed ? 'application.needsCorrection'
     : done ? number === '3' ? 'application.checkPassed' : 'application.materialAvailable' : number === '2' ? 'application.notSelected' : 'application.notComplete')
   return <div style={{ display: 'grid', gridTemplateColumns: '42px 1fr', gap: 12, position: 'relative' }}>
     <div style={{ position: 'relative', display: 'flex', justifyContent: 'center' }}>
