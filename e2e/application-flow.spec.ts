@@ -1117,6 +1117,44 @@ test('records a manual submission only after the explicit recording action', asy
   expect(state.unexpected).toEqual([])
 })
 
+test('a saved job changed to rejected without an applied date does not acquire a submission record', async ({ page }) => {
+  const state = await install(page)
+  await open(page)
+  const submission = page.getByRole('list', { name: /Application progress|申请进度/ }).locator('li').filter({ hasText: /Submission record|提交记录/ })
+  await expect(submission).toContainText(/Not confirmed|尚未确认/)
+  expect(state.job.status).toBe('saved')
+  expect(state.job.appliedAt).toBeNull()
+
+  // Mirror the existing status PATCH: rejected sets workflowState to submitted,
+  // even when there was never an appliedAt timestamp.
+  state.job.status = 'rejected'
+  state.job.workflowState = 'submitted'
+  await page.reload()
+  await expect(page.getByRole('dialog')).toBeVisible()
+  await expect(page.getByRole('dialog')).toContainText('Application flow engineer')
+  await expect(submission).toContainText(/Not confirmed|尚未确认/)
+  await expect(page.getByText(/This application has a recorded result|此申请已有结果记录/)).toHaveCount(0)
+  const history = page.getByRole('button', { name: /^(View application history|查看申请历史)$/ })
+  await history.focus()
+  await page.keyboard.press('Enter')
+  await expect(page.getByRole('region', { name: /^(Activity|活动记录)$/i })).toBeFocused()
+  expect(state.job.appliedAt).toBeNull()
+  expect(state.writes.filter(write => write.path.endsWith('/apply'))).toHaveLength(0)
+  expect(state.unexpected).toEqual([])
+})
+
+test('a saved job with a historical applied date cannot be recorded again', async ({ page }) => {
+  const state = await install(page)
+  state.job.appliedAt = time
+  await open(page)
+  const submission = page.getByRole('list', { name: /Application progress|申请进度/ }).locator('li').filter({ hasText: /Submission record|提交记录/ })
+  await expect(submission).toContainText(/Recorded|已有记录/)
+  await expect(page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ })).toHaveCount(0)
+  expect(state.job.status).toBe('saved')
+  expect(state.writes.filter(write => write.path.endsWith('/apply'))).toHaveLength(0)
+  expect(state.unexpected).toEqual([])
+})
+
 
 
 for (const status of ['cancelled', 'failed'] as const) {
@@ -2094,6 +2132,304 @@ for (const outcome of ['get-fails', 'unknown'] as const) {
     expect(state.unexpected).toEqual([])
   })
 }
+
+test('unknown manual record stays locked when refresh sees rejected then saved', async ({ page }) => {
+  const state = await install(page, { manualOutcome: 'unknown' })
+  await open(page)
+  await page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ }).click()
+  await expect.poll(() => state.writes.filter(write => write.path.endsWith('/apply')).length).toBe(1)
+  const refresh = page.getByRole('button', { name: /Refresh record status|刷新记录状态/ })
+  await expect(refresh).toBeVisible()
+
+  // The first POST has an unknown outcome. A different writer then changes
+  // the status to rejected, and the status PATCH also sets workflowState.
+  state.job.status = 'rejected'
+  state.job.workflowState = 'submitted'
+  const rejectedRead = page.waitForResponse(response => response.url().endsWith('/api/jobs/outside-page') && response.request().method() === 'GET')
+  await refresh.click()
+  const rejectedResponse = await rejectedRead
+  expect(rejectedResponse.status()).toBe(200)
+  expect(await rejectedResponse.json()).toMatchObject({ status: 'rejected', workflowState: 'submitted', appliedAt: null })
+  await expect(page.getByText(/still unconfirmed|仍无法确认记录状态/)).toBeVisible()
+  await expect(refresh).toBeVisible()
+  await expect(page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ })).toHaveCount(0)
+
+  // A later status change back to saved cannot resolve the original POST.
+  state.job.status = 'saved'
+  state.job.workflowState = 'draft'
+  const savedRead = page.waitForResponse(response => response.url().endsWith('/api/jobs/outside-page') && response.request().method() === 'GET')
+  await refresh.click()
+  const savedResponse = await savedRead
+  expect(savedResponse.status()).toBe(200)
+  expect(await savedResponse.json()).toMatchObject({ status: 'saved', workflowState: 'draft', appliedAt: null })
+  await expect(page.getByText(/still unconfirmed|仍无法确认记录状态/)).toBeVisible()
+  await expect(refresh).toBeVisible()
+  await expect(page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ })).toHaveCount(0)
+  expect(state.job.appliedAt).toBeNull()
+  expect(state.writes.filter(write => write.path.endsWith('/apply'))).toHaveLength(1)
+  expect(state.unexpected).toEqual([])
+})
+
+test('a failed application history read can be retried without any write', async ({ page }) => {
+  const state = await install(page)
+  const reads: { jobId: string | null; limit: string | null }[] = []
+  await page.route('**/api/activity?*', async route => {
+    if (route.request().method() !== 'GET') return route.fallback()
+    const url = new URL(route.request().url())
+    reads.push({ jobId: url.searchParams.get('jobId'), limit: url.searchParams.get('limit') })
+    if (reads.length === 1) return route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'Fixture history unavailable' }) })
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify([{
+      id: 'fixture-history-1', userId: 'fixture-user', jobId: 'outside-page', type: 'status_changed',
+      text: 'Fixture application history entry', color: null, createdAt: time,
+      job: { company: 'Fixture Employer', role: 'Application flow engineer' },
+    }]) })
+  })
+  await open(page)
+  const failure = page.getByRole('status').filter({ hasText: /Application history could not be loaded|无法加载申请历史/ })
+  await expect(failure).toBeVisible()
+  await expect(page.getByText(/^(No activity yet|暂无活动记录)$/)).toHaveCount(0)
+  expect(reads).toEqual([{ jobId: 'outside-page', limit: '20' }])
+  const retry = failure.getByRole('button', { name: /^(Refresh status|刷新状态)$/ })
+  await retry.focus()
+  await page.keyboard.press('Enter')
+  await expect(page.getByRole('region', { name: /^(Activity|活动记录)$/i })).toBeFocused()
+  await expect(page.getByText('Fixture application history entry', { exact: true })).toBeVisible()
+  await expect(failure).toHaveCount(0)
+  expect(reads).toEqual([{ jobId: 'outside-page', limit: '20' }, { jobId: 'outside-page', limit: '20' }])
+  expect(state.writes).toEqual([])
+  expect(state.analysisRequests).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+for (const malformed of ['null', 'foreign-user', 'foreign-job', 'invalid-date'] as const) {
+  test(`application history rejects ${malformed} data and can recover`, async ({ page }) => {
+    const state = await install(page)
+    const valid = { id: 'fixture-history-valid', userId: 'fixture-user', jobId: 'outside-page', type: 'status_changed',
+      text: 'Valid fixture history', color: null, createdAt: time,
+      job: { company: 'Fixture Employer', role: 'Application flow engineer' } }
+    const invalid = malformed === 'null' ? null : { ...valid, text: 'Invalid fixture history',
+      ...(malformed === 'foreign-user' ? { userId: 'other-user' } : {}),
+      ...(malformed === 'foreign-job' ? { jobId: 'other-job' } : {}),
+      ...(malformed === 'invalid-date' ? { createdAt: 'not-a-date' } : {}) }
+    const reads: { jobId: string | null; limit: string | null }[] = []
+    await page.route('**/api/activity?*', async route => {
+      if (route.request().method() !== 'GET') return route.fallback()
+      const url = new URL(route.request().url())
+      reads.push({ jobId: url.searchParams.get('jobId'), limit: url.searchParams.get('limit') })
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify([reads.length === 1 ? invalid : valid]) })
+    })
+    await open(page)
+    const failure = page.getByRole('status').filter({ hasText: /Application history could not be loaded|无法加载申请历史/ })
+    await expect(failure).toBeVisible()
+    await expect(page.getByText(/^(No activity yet|暂无活动记录)$/)).toHaveCount(0)
+    await expect(page.getByText('Invalid fixture history', { exact: true })).toHaveCount(0)
+    await failure.getByRole('button', { name: /^(Refresh status|刷新状态)$/ }).click()
+    await expect(page.getByText('Valid fixture history', { exact: true })).toBeVisible()
+    await expect(failure).toHaveCount(0)
+    expect(reads).toEqual([{ jobId: 'outside-page', limit: '20' }, { jobId: 'outside-page', limit: '20' }])
+    expect(state.writes).toEqual([])
+    expect(state.analysisRequests).toEqual([])
+    expect(state.unexpected).toEqual([])
+  })
+}
+
+test('successful manual record refreshes the current application history', async ({ page }) => {
+  const state = await install(page)
+  const reads: { jobId: string | null; limit: string | null; afterRecord: boolean }[] = []
+  await page.route('**/api/activity?*', async route => {
+    if (route.request().method() !== 'GET') return route.fallback()
+    const url = new URL(route.request().url())
+    reads.push({ jobId: url.searchParams.get('jobId'), limit: url.searchParams.get('limit'), afterRecord: state.manualPosted })
+    const records = state.manualPosted ? [{ id: 'fixture-manual-history', userId: 'fixture-user', jobId: 'outside-page',
+      type: 'applied', text: 'Fixture manual application recorded', color: null, createdAt: time,
+      job: { company: 'Fixture Employer', role: 'Application flow engineer' } }] : []
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(records) })
+  })
+  await open(page)
+  await expect(page.getByText(/^(No activity yet|暂无活动记录)$/)).toBeVisible()
+  await page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ }).click()
+  await expect(page.getByText('Fixture manual application recorded', { exact: true })).toBeVisible()
+  expect(reads).toEqual([{ jobId: 'outside-page', limit: '20', afterRecord: false }, { jobId: 'outside-page', limit: '20', afterRecord: true }])
+  expect(state.writes.filter(write => write.path.endsWith('/apply'))).toHaveLength(1)
+  expect(state.writes).toHaveLength(1)
+  expect(state.analysisRequests).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+test('retrying application history preserves interview preparation for the same job', async ({ page }) => {
+  const state = await install(page)
+  state.job.status = 'interview'
+  state.job.workflowState = 'submitted'
+  let historyReads = 0
+  const prepCalls: unknown[] = []
+  await page.route('**/api/activity?*', async route => {
+    if (route.request().method() !== 'GET') return route.fallback()
+    const url = new URL(route.request().url())
+    expect(url.searchParams.get('jobId')).toBe('outside-page')
+    historyReads += 1
+    if (historyReads === 1) return route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'Fixture history unavailable' }) })
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify([{
+      id: 'fixture-interview-history', userId: 'fixture-user', jobId: 'outside-page', type: 'interview_scheduled',
+      text: 'Fixture interview scheduled', color: null, createdAt: time,
+      job: { company: 'Fixture Employer', role: 'Application flow engineer' },
+    }]) })
+  })
+  await page.route('**/api/ai/interview-prep', async route => {
+    expect(route.request().method()).toBe('POST')
+    prepCalls.push(route.request().postDataJSON())
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+      questions: [{ question: 'Fixture interview question?', framework: 'Fixture interview answer framework.' }],
+      companyResearch: 'Fixture company research.', followUpEmail: 'Fixture follow-up email.',
+    }) })
+  })
+  await open(page)
+  const failure = page.getByRole('status').filter({ hasText: /Application history could not be loaded|无法加载申请历史/ })
+  await expect(failure).toBeVisible()
+  await page.getByRole('button', { name: /^(Generate Interview Prep|生成面试准备)$/ }).click()
+  await expect(page.getByText('Fixture interview question?', { exact: false })).toBeVisible()
+  await expect(page.getByText('Fixture company research.', { exact: true })).toBeVisible()
+  expect(prepCalls).toEqual([{ jobTitle: state.job.role, jobCompany: state.job.company, jobDescription: state.job.description }])
+
+  await failure.getByRole('button', { name: /^(Refresh status|刷新状态)$/ }).click()
+  await expect(page.getByText('Fixture interview scheduled', { exact: true })).toBeVisible()
+  await expect(page.getByText('Fixture interview question?', { exact: false })).toBeVisible()
+  await expect(page.getByText('Fixture company research.', { exact: true })).toBeVisible()
+  expect(historyReads).toBe(2)
+  expect(prepCalls).toHaveLength(1)
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+test('a visible submission record does not resolve an unknown manual recording request', async ({ page }) => {
+  const state = await install(page, { manualOutcome: 'unknown' })
+  await open(page)
+  await page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ }).click()
+  await expect.poll(() => state.writes.filter(write => write.path.endsWith('/apply')).length).toBe(1)
+  const refresh = page.getByRole('button', { name: /Refresh record status|刷新记录状态/ })
+  await expect(refresh).toBeVisible()
+  await expect.poll(() => page.evaluate(() => sessionStorage.getItem('applymate:manual-record:fixture-user:outside-page'))).toBe('unknown')
+
+  // A later read can find a record, but cannot establish whether this
+  // particular request or a concurrent writer created it.
+  Object.assign(state.job, { status: 'applied', workflowState: 'submitted', appliedAt: time })
+  const responsePromise = page.waitForResponse(response => response.url().endsWith('/api/jobs/outside-page') && response.request().method() === 'GET')
+  await refresh.click()
+  const response = await responsePromise
+  expect(response.status()).toBe(200)
+  expect(await response.json()).toMatchObject({ status: 'applied', workflowState: 'submitted', appliedAt: time })
+  await expect(page.getByText(/A submission record exists, but this request is still unconfirmed|已有提交记录，但仍无法确认是否由本次请求产生/)).toBeVisible()
+  const submission = page.getByRole('list', { name: /Application progress|申请进度/ }).locator('li').filter({ hasText: /Submission record|提交记录/ })
+  await expect(submission).toContainText(/Recorded|已有记录/)
+  await expect(refresh).toBeVisible()
+  await expect(page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ })).toHaveCount(0)
+  expect(await page.evaluate(() => sessionStorage.getItem('applymate:manual-record:fixture-user:outside-page'))).toBe('unknown')
+  expect(state.writes.filter(write => write.path.endsWith('/apply'))).toHaveLength(1)
+  expect(state.unexpected).toEqual([])
+})
+
+test('late manual record status read cannot overwrite a newer description or unlock an unknown outcome', async ({ page }) => {
+  const state = await install(page, { firstPreparation: true, descriptionMode: 'success', manualOutcome: 'unknown' })
+  let releaseManualRead = () => {}
+  const manualReadGate = new Promise<void>(resolve => { releaseManualRead = resolve })
+  let manualReadEntered = false
+  let heldSnapshot: typeof state.job | null = null
+  try {
+    await open(page)
+    await page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ }).click()
+    await expect.poll(() => state.writes.filter(write => write.path.endsWith('/apply')).length).toBe(1)
+    const refresh = page.getByRole('button', { name: /Refresh record status|刷新记录状态/ })
+    await expect(refresh).toBeVisible()
+
+    // The POST response was lost, but the mocked server later reflects that
+    // it committed. Capture this older Job before the description update.
+    Object.assign(state.job, { status: 'applied', workflowState: 'submitted', appliedAt: time })
+    await page.route('**/api/jobs/outside-page', async route => {
+      if (route.request().method() === 'GET' && !manualReadEntered) {
+        heldSnapshot = { ...state.job }
+        manualReadEntered = true
+        await manualReadGate
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(heldSnapshot) })
+      }
+      return route.fallback()
+    })
+    await refresh.click()
+    await expect.poll(() => manualReadEntered).toBe(true)
+    expect(heldSnapshot).toMatchObject({ status: 'applied', workflowState: 'submitted', appliedAt: time, description: '' })
+
+    // A newer user action finishes while the earlier read remains in flight.
+    await page.getByRole('button', { name: /Add job description|补充职位描述/, exact: true }).click()
+    await page.getByLabel(/^(Job description|职位描述)$/).fill('Newer description after the status read began.')
+    const savedDescription = page.waitForResponse(response => response.url().endsWith('/api/jobs/outside-page') && response.request().method() === 'PATCH')
+    await page.getByRole('button', { name: /Save description|保存描述/, exact: true }).click()
+    expect((await savedDescription).status()).toBe(200)
+    await expect(page.getByLabel(/^(Job description|职位描述)$/)).toHaveCount(0)
+    await expect(page.getByText('Newer description after the status read began.', { exact: true })).toBeVisible()
+    expect(state.job.description).toBe('Newer description after the status read began.')
+
+    const oldResponse = page.waitForResponse(response => response.url().endsWith('/api/jobs/outside-page') && response.request().method() === 'GET')
+    releaseManualRead()
+    expect(await (await oldResponse).json()).toMatchObject({ status: 'applied', appliedAt: time, description: '' })
+    await expect(page.getByText('Newer description after the status read began.', { exact: true })).toBeVisible()
+    await expect(refresh).toBeEnabled()
+    await expect(page.getByText(/A submission record exists, but this request is still unconfirmed|已有提交记录，但仍无法确认是否由本次请求产生/)).toHaveCount(0)
+    await expect(refresh).toBeVisible()
+    await expect(page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ })).toHaveCount(0)
+    expect(state.writes.filter(write => write.path.endsWith('/apply'))).toHaveLength(1)
+    expect(state.writes.filter(write => write.path === '/api/jobs/outside-page')).toHaveLength(1)
+    expect(state.unexpected).toEqual([])
+  } finally { releaseManualRead() }
+})
+
+test('late automatic status read after a successful manual record preserves a newer description', async ({ page }) => {
+  const state = await install(page, { firstPreparation: true, descriptionMode: 'success' })
+  let releaseManualRead = () => {}
+  const manualReadGate = new Promise<void>(resolve => { releaseManualRead = resolve })
+  let manualReadEntered = false
+  let heldSnapshot: typeof state.job | null = null
+  try {
+    await open(page)
+    // Only the first post-submit read is delayed; later reads for the
+    // description preflight and an explicit refresh use the current Job.
+    await page.route('**/api/jobs/outside-page', async route => {
+      if (route.request().method() === 'GET' && state.manualPosted && !manualReadEntered) {
+        heldSnapshot = { ...state.job }
+        manualReadEntered = true
+        await manualReadGate
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(heldSnapshot) })
+      }
+      return route.fallback()
+    })
+    await page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ }).click()
+    await expect.poll(() => manualReadEntered).toBe(true)
+    expect(heldSnapshot).toMatchObject({ status: 'applied', workflowState: 'submitted', appliedAt: time, description: '' })
+
+    await page.getByRole('button', { name: /Add job description|补充职位描述/, exact: true }).click()
+    await page.getByLabel(/^(Job description|职位描述)$/).fill('Description saved after the automatic read began.')
+    const savedDescription = page.waitForResponse(response => response.url().endsWith('/api/jobs/outside-page') && response.request().method() === 'PATCH')
+    await page.getByRole('button', { name: /Save description|保存描述/, exact: true }).click()
+    expect((await savedDescription).status()).toBe(200)
+    await expect(page.getByLabel(/^(Job description|职位描述)$/)).toHaveCount(0)
+    await expect(page.getByText('Description saved after the automatic read began.', { exact: true })).toBeVisible()
+
+    const oldResponse = page.waitForResponse(response => response.url().endsWith('/api/jobs/outside-page') && response.request().method() === 'GET')
+    releaseManualRead()
+    expect(await (await oldResponse).json()).toMatchObject({ status: 'applied', appliedAt: time, description: '' })
+    await expect(page.getByText('Description saved after the automatic read began.', { exact: true })).toBeVisible()
+
+    const refresh = page.getByRole('button', { name: /Refresh record status|刷新记录状态/ })
+    await expect(refresh).toBeEnabled()
+    const currentResponse = page.waitForResponse(response => response.url().endsWith('/api/jobs/outside-page') && response.request().method() === 'GET')
+    await refresh.click()
+    expect(await (await currentResponse).json()).toMatchObject({ status: 'applied', description: 'Description saved after the automatic read began.' })
+    await expect(page.getByText('Description saved after the automatic read began.', { exact: true })).toBeVisible()
+    const submission = page.getByRole('list', { name: /Application progress|申请进度/ }).locator('li').filter({ hasText: /Submission record|提交记录/ })
+    await expect(submission).toContainText(/Recorded|已有记录/)
+    await expect(refresh).toHaveCount(0)
+    expect(state.writes.filter(write => write.path.endsWith('/apply'))).toHaveLength(1)
+    expect(state.writes.filter(write => write.path === '/api/jobs/outside-page')).toHaveLength(1)
+    expect(state.unexpected).toEqual([])
+  } finally { releaseManualRead() }
+})
 
 
 async function pdfText(bytes: Buffer): Promise<string> {

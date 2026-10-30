@@ -1,4 +1,19 @@
+import type { Job } from '@/lib/types'
+
 export type ManualRecordLock = 'pending' | 'confirmed' | 'unknown'
+
+type ManualRecordEvidence = Pick<Job, 'status' | 'workflowState' | 'appliedAt'>
+
+/** A user-reported or system-recorded application, not an employer receipt. */
+export function hasVisibleSubmissionRecord(job: ManualRecordEvidence): boolean {
+  return job.status === 'applied' || (typeof job.appliedAt === 'string'
+    && job.appliedAt.trim().length > 0 && Number.isFinite(Date.parse(job.appliedAt)))
+}
+
+/** Preserve the duplicate guard when historical status or timestamp is uncertain. */
+export function blocksManualRecord(job: ManualRecordEvidence): boolean {
+  return job.status !== 'saved' || !['draft', 'ready_to_apply'].includes(job.workflowState) || job.appliedAt !== null
+}
 
 function key(userId: string, jobId: string): string {
   return `applymate:manual-record:${encodeURIComponent(userId)}:${encodeURIComponent(jobId)}`
@@ -21,8 +36,4 @@ export function writeManualRecordLock(storage: Storage, userId: string, jobId: s
     storage.setItem(key(userId, jobId), state)
     return storage.getItem(key(userId, jobId)) === state
   } catch { return false }
-}
-
-export function clearManualRecordLock(storage: Storage, userId: string, jobId: string): void {
-  try { storage.removeItem(key(userId, jobId)) } catch { /* keep a conservative lock on storage failure */ }
 }

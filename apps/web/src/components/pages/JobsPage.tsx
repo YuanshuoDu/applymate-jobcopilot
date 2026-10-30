@@ -25,10 +25,18 @@ import { ApplicationAttentionView, ApplicationTaskSummary } from '@/components/j
 import type { ApplicationTaskView } from '@/components/jobs/application-task-model'
 import { forgetSavedApplication } from '@/components/jobs/application-search-state'
 import { applicationTaskAllowsManualWork } from '@/components/jobs/application-attention-safety'
-import { clearManualRecordLock, readManualRecordLock, writeManualRecordLock, type ManualRecordLock } from '@/components/jobs/application-manual-record'
+import { blocksManualRecord, hasVisibleSubmissionRecord, readManualRecordLock, writeManualRecordLock, type ManualRecordLock } from '@/components/jobs/application-manual-record'
 import { openApplication, openApplicationSession, replaceApplicationHistory } from '@/lib/application-navigation'
 
 const KANBAN_COLS: JobStatus[] = ['saved', 'applied', 'interview', 'offer', 'rejected']
+function isScopedActivity(value: unknown, userId: string, jobId: string): value is Activity {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const row = value as Record<string, unknown>
+  return typeof row.id === 'string' && row.id.length > 0 && row.userId === userId && row.jobId === jobId
+    && typeof row.type === 'string' && typeof row.text === 'string'
+    && (row.color === null || typeof row.color === 'string')
+    && typeof row.createdAt === 'string' && Number.isFinite(Date.parse(row.createdAt))
+}
 type DescriptionDraft = { text: string; revision: number; uncertain: boolean }
 const descriptionDrafts = new Map<string, DescriptionDraft>()
 let descriptionUnloadAttached = false
@@ -558,6 +566,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   const descriptionJobRef = useRef(job)
   descriptionJobRef.current = job
   const auditSectionRef = useRef<HTMLDivElement>(null)
+  const activitySectionRef = useRef<HTMLDivElement>(null)
   const drawerRef = useRef<HTMLDivElement>(null)
   const drawerCloseRef = useRef<HTMLButtonElement>(null)
   const confirmHostRef = useRef<HTMLDivElement>(null)
@@ -570,6 +579,9 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   const [deleting,     setDeleting]     = useState(false)
   const [activity,     setActivity]     = useState<Activity[]>([])
   const [loadingAct,   setLoadingAct]   = useState(true)
+  const [activityError, setActivityError] = useState(false)
+  const [activityRetry, setActivityRetry] = useState(0)
+  const activityScopeRef = useRef('')
   const [interviewPrep, setInterviewPrep] = useState<{
     questions: Array<{ question: string; framework: string }>
     companyResearch: string
@@ -596,24 +608,35 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   })
   const manualRecordRef = useRef(manualRecordLock)
   const [manualRecordRefreshing, setManualRecordRefreshing] = useState(false)
+  const manualRecordRefreshEpoch = useRef(0)
+  const manualRecordJobRef = useRef(job)
+  manualRecordJobRef.current = job
+  const manualRecordMutationEpoch = useRef(0)
+  const publishJobUpdate = (updated: Job) => { manualRecordMutationEpoch.current += 1; onUpdate(updated) }
+  const publishDescriptionUpdate = (owner: string, id: string, description: string) => {
+    manualRecordMutationEpoch.current += 1; onDescriptionUpdate(owner, id, description)
+  }
+  const publishJobFieldsUpdate = (owner: string, id: string, fields: { notes: string | null } | { followUpAt: string | null }) => {
+    manualRecordMutationEpoch.current += 1; onJobFieldsUpdate(owner, id, fields)
+  }
   const [manualRecordNotice, setManualRecordNotice] = useState(false)
+  const [manualVisibleRecord, setManualVisibleRecord] = useState(false)
   const [manualStorageUnavailable, setManualStorageUnavailable] = useState(false)
   const setRecordLock = (value: ManualRecordLock | null) => { manualRecordRef.current = value; setManualRecordLock(value) }
   useEffect(() => {
     let value: ManualRecordLock | null = 'unknown'
     try {
       if (drawerUserId && job.userId === drawerUserId) {
-        if (job.status !== 'saved' || job.workflowState === 'submitted') {
-          clearManualRecordLock(window.sessionStorage, drawerUserId, job.id)
-          value = null
-        } else value = readManualRecordLock(window.sessionStorage, drawerUserId, job.id)
+        value = readManualRecordLock(window.sessionStorage, drawerUserId, job.id)
       }
     } catch { /* unavailable storage is unknown */ }
     manualRecordRef.current = value
     setManualRecordLock(value)
     setManualRecordNotice(false)
+    setManualVisibleRecord(false)
     setManualStorageUnavailable(false)
-  }, [drawerUserId, job.id, job.userId, job.status, job.workflowState])
+  }, [drawerUserId, job.id, job.userId])
+  useEffect(() => { setManualVisibleRecord(false) }, [job.status, job.workflowState, job.appliedAt, job.updatedAt])
   const [autoPreparing, setAutoPreparing] = useState(false)
   const preparationInFlight = useRef(false)
   const [preparationStartedAt, setPreparationStartedAt] = useState<number | null>(null)
@@ -683,14 +706,30 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
 
   // Load per-job activity on mount; reset interview prep when job changes
   useEffect(() => {
+    const controller = new AbortController()
     setLoadingAct(true)
-    setInterviewPrep(null)
-    fetch(`/api/activity?jobId=${job.id}&limit=20`)
-      .then(r => r.json())
-      .then((data: Activity[]) => setActivity(Array.isArray(data) ? data : []))
-      .catch(() => setActivity([]))
-      .finally(() => setLoadingAct(false))
-  }, [job.id])
+    setActivityError(false)
+    const scope = JSON.stringify([drawerUserId, job.id])
+    if (activityScopeRef.current !== scope) {
+      activityScopeRef.current = scope
+      setActivity([])
+      setInterviewPrep(null)
+    }
+    if (!drawerUserId || job.userId !== drawerUserId) {
+      setActivityError(true)
+      setLoadingAct(false)
+      return () => controller.abort()
+    }
+    fetch(`/api/activity?jobId=${encodeURIComponent(job.id)}&limit=20`, { signal: controller.signal })
+      .then(response => { if (!response.ok) throw new Error('unavailable'); return response.json() })
+      .then((data: unknown) => {
+        if (!Array.isArray(data) || data.length > 20 || !data.every(row => isScopedActivity(row, drawerUserId, job.id))) throw new Error('unavailable')
+        if (!controller.signal.aborted) setActivity(data)
+      })
+      .catch(() => { if (!controller.signal.aborted) setActivityError(true) })
+      .finally(() => { if (!controller.signal.aborted) setLoadingAct(false) })
+    return () => controller.abort()
+  }, [job.id, job.userId, drawerUserId, activityRetry])
 
   // Sync local state when parent job changes
   useEffect(() => { setNotes(job.notes ?? '') }, [job.notes])
@@ -797,7 +836,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
       if (!current()) return
       const latest = result.data as Job | null
       if (!result.ok || !latest || latest.id !== job.id || latest.userId !== owner) { setDescriptionNotice('application.descriptionCheckFailed'); return }
-      if (latest.description?.trim()) { onDescriptionUpdate(owner, job.id, latest.description); setDescriptionNotice('application.descriptionExisting'); return }
+      if (latest.description?.trim()) { publishDescriptionUpdate(owner, job.id, latest.description); setDescriptionNotice('application.descriptionExisting'); return }
       if (latest.description !== null && typeof latest.description !== 'string') { setDescriptionNotice('application.descriptionCheckFailed'); return }
       if (!descriptionTaskRef.current.allowed || descriptionJobRef.current.description?.trim()) { setDescriptionNotice('application.descriptionCheckFailed'); return }
       if (descriptionDrafts.get(descriptionKey)?.revision !== draft.revision) return
@@ -816,7 +855,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
       if (existing?.revision === draft.revision) updateDescriptionDraft(descriptionKey, null)
       setDescriptionDraft(descriptionDrafts.get(descriptionKey) ?? null)
       setDescriptionEditorOpen(false)
-      onDescriptionUpdate(owner, job.id, draft.text)
+      publishDescriptionUpdate(owner, job.id, draft.text)
     } finally {
       descriptionSavingRef.current = false
       if (current()) setDescriptionSaving(false)
@@ -839,9 +878,9 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
         setDescriptionDraft(descriptionDrafts.get(descriptionKey) ?? null)
         setDescriptionNotice(null)
         setDescriptionEditorOpen(false)
-        onDescriptionUpdate(owner, job.id, latest.description)
+        publishDescriptionUpdate(owner, job.id, latest.description)
       } else {
-        if (latest.description?.trim()) onDescriptionUpdate(owner, job.id, latest.description)
+        if (latest.description?.trim()) publishDescriptionUpdate(owner, job.id, latest.description)
         setDescriptionNotice(latest.description?.trim() ? 'application.descriptionExisting' : 'application.descriptionUnconfirmed')
       }
     } finally {
@@ -860,7 +899,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     setSavingNotes(false)
     if (error) { toast.error('Save failed', error); return }
     if (data && data.id === job.id && data.userId === owner && (data.notes === null || typeof data.notes === 'string')) {
-      onJobFieldsUpdate(owner, job.id, { notes: data.notes }); toast.success(t('jobs.notesSaved'))
+      publishJobFieldsUpdate(owner, job.id, { notes: data.notes }); toast.success(t('jobs.notesSaved'))
     }
   }
 
@@ -877,7 +916,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     if (!isCurrentDrawer(owner) || drawerJobIdRef.current !== job.id) return
     if (error) { toast.error('Save failed', error); return }
     if (data && data.id === job.id && data.userId === owner && (data.followUpAt === null || typeof data.followUpAt === 'string')) {
-      onJobFieldsUpdate(owner, job.id, { followUpAt: data.followUpAt }); toast.success(t(value ? 'jobs.followUpDateSet' : 'jobs.followUpDateCleared'))
+      publishJobFieldsUpdate(owner, job.id, { followUpAt: data.followUpAt }); toast.success(t(value ? 'jobs.followUpDateSet' : 'jobs.followUpDateCleared'))
     }
   }
 
@@ -1144,7 +1183,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
         if (!checkedLetter) return
       }
       if (!confirmed || confirmError) throw new Error(confirmError ?? 'Could not confirm the audited package')
-      onUpdate(confirmed)
+      publishJobUpdate(confirmed)
       toast.success(t('application.materialsReadyTitle'), t(coverLetter ? 'application.materialsReadyWithLetter' : 'application.materialsReadyResumeOnly'))
     } catch (error) {
       if (isCurrentDrawer(owner)) {
@@ -1159,33 +1198,42 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
 
   async function refreshManualRecord(userId: string) {
     if (!isCurrentDrawer(userId)) return
+    const epoch = ++manualRecordRefreshEpoch.current
+    const requestedJob = manualRecordJobRef.current
+    const mutationEpoch = manualRecordMutationEpoch.current
     setManualRecordRefreshing(true)
+    setManualVisibleRecord(false)
+    setActivityRetry(value => value + 1)
     try {
       const response = await fetch(`/api/jobs/${encodeURIComponent(job.id)}`)
       if (!response.ok) throw new Error('unavailable')
       const updated = await response.json() as Job
-      if (!isCurrentDrawer(userId)) return
+      if (!isCurrentDrawer(userId) || epoch !== manualRecordRefreshEpoch.current) return
       if (updated.id !== job.id || updated.userId !== userId) throw new Error('unavailable')
-      if (updated.status !== 'saved' || updated.workflowState === 'submitted') {
-        try { clearManualRecordLock(window.sessionStorage, userId, job.id) } catch { /* retain conservative lock */ }
-        setRecordLock(null)
+      // A later read or lifecycle change cannot prove which request wrote it.
+      // Keep any uncertain write lock even when a separate record is visible.
+      const receivedAt = Date.parse(updated.updatedAt)
+      const currentAt = Date.parse(requestedJob.updatedAt)
+      const currentRead = manualRecordMutationEpoch.current === mutationEpoch && manualRecordJobRef.current === requestedJob
+        && Number.isFinite(receivedAt) && Number.isFinite(currentAt) && receivedAt >= currentAt
+      if (manualRecordRef.current === 'confirmed' && currentRead && hasVisibleSubmissionRecord(updated)) {
+        publishJobUpdate(updated)
         setManualRecordNotice(false)
-        onUpdate(updated)
       } else {
-        // A read showing saved is not proof that an earlier POST did not commit.
+        setManualVisibleRecord(currentRead && hasVisibleSubmissionRecord(updated))
         setManualRecordNotice(true)
       }
     } catch {
-      if (isCurrentDrawer(userId)) setManualRecordNotice(true)
+      if (isCurrentDrawer(userId) && epoch === manualRecordRefreshEpoch.current) setManualRecordNotice(true)
     } finally {
-      if (isCurrentDrawer(userId)) setManualRecordRefreshing(false)
+      if (isCurrentDrawer(userId) && epoch === manualRecordRefreshEpoch.current) setManualRecordRefreshing(false)
     }
   }
 
   async function recordManualSubmission() {
     const userId = drawerUserIdRef.current
     if (!userId || !isCurrentDrawer(userId) || recordingSubmissionRef.current || manualRecordRef.current
-      || !manualWorkAllowed || job.status !== 'saved' || job.workflowState === 'submitted' || taskReadState !== 'ready') return
+      || !manualWorkAllowed || blocksManualRecord(job) || taskReadState !== 'ready') return
     try {
       if (!writeManualRecordLock(window.sessionStorage, userId, job.id, 'pending')) { setManualStorageUnavailable(true); return }
     } catch { setManualStorageUnavailable(true); return }
@@ -1216,7 +1264,8 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     resumePreview?.id === job.finalResumeId ? resumePreview.updatedAt : null,
     selectedCoverLetter?.updatedAt ?? null, false,
   )
-  const applicationRecorded = job.status !== 'saved' || job.workflowState === 'submitted'
+  const applicationRecorded = hasVisibleSubmissionRecord(job) || manualVisibleRecord
+  const applicationRecordBlocked = blocksManualRecord(job) || manualVisibleRecord
   const auditStale = Boolean(currentRecord && !currentPackAudited && currentRecord.audit.verdict === 'pass')
   const canReviewExistingIssues = !currentPackAudited && (auditNeedsEvidence || auditNeedsRepair || auditRetryOnly)
   const openAudit = () => {
@@ -1273,11 +1322,11 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
 
           <section style={{ borderBottom: '1px solid var(--border)', padding: '18px 0 22px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 9, fontSize: 11, fontWeight: 700, letterSpacing: '0.03em', color: '#64748b', marginBottom: 18 }}><Sparkles size={16} strokeWidth={2.4} style={{ color: '#2563eb', flexShrink: 0 }} />{t('jobs.drawer.nextAction')}</div>
-            <div style={{ fontSize: 20, lineHeight: 1.25, fontWeight: 700, letterSpacing: '-0.025em' }}>{!manualWorkAllowed ? t('application.taskProgress') : applicationRecorded ? t('application.recorded') : auditStale ? t('application.checkMaterials') : currentPackAudited ? t('jobs.drawer.packReady') : auditRetryOnly ? t('jobs.drawer.retryAudit') : auditNeedsEvidence ? t('jobs.drawer.confirmEvidence') : auditNeedsRepair ? t('jobs.drawer.correctFacts') : existingTailoredResume ? t('jobs.drawer.tailored') : t('jobs.drawer.tailor')}</div>
-            <div style={{ fontSize: 14, lineHeight: 1.5, color: 'var(--text-muted)', margin: '7px 0 16px' }}>{!manualWorkAllowed ? t('application.taskProgressHint') : applicationRecorded ? t('application.recordedHint') : auditStale ? t('application.auditStale') : currentPackAudited ? t('jobs.pack.sameAudited') : auditRetryOnly ? t('jobs.pack.auditPending') : auditNeedsEvidence ? t('jobs.pack.evidencePrompt') : auditNeedsRepair ? t('jobs.pack.repairPrompt') : existingTailoredResume ? t('jobs.pack.reviewTailored') : t('jobs.pack.createRole')}</div>
+            <div style={{ fontSize: 20, lineHeight: 1.25, fontWeight: 700, letterSpacing: '-0.025em' }}>{!manualWorkAllowed ? t('application.taskProgress') : applicationRecorded ? t('application.recorded') : applicationRecordBlocked ? t('application.statusReview') : auditStale ? t('application.checkMaterials') : currentPackAudited ? t('jobs.drawer.packReady') : auditRetryOnly ? t('jobs.drawer.retryAudit') : auditNeedsEvidence ? t('jobs.drawer.confirmEvidence') : auditNeedsRepair ? t('jobs.drawer.correctFacts') : existingTailoredResume ? t('jobs.drawer.tailored') : t('jobs.drawer.tailor')}</div>
+            <div style={{ fontSize: 14, lineHeight: 1.5, color: 'var(--text-muted)', margin: '7px 0 16px' }}>{!manualWorkAllowed ? t('application.taskProgressHint') : applicationRecorded ? t('application.recordedHint') : applicationRecordBlocked ? t('application.statusReviewHint') : auditStale ? t('application.auditStale') : currentPackAudited ? t('jobs.pack.sameAudited') : auditRetryOnly ? t('jobs.pack.auditPending') : auditNeedsEvidence ? t('jobs.pack.evidencePrompt') : auditNeedsRepair ? t('jobs.pack.repairPrompt') : existingTailoredResume ? t('jobs.pack.reviewTailored') : t('jobs.pack.createRole')}</div>
 
             {task && <ApplicationTaskCard task={task} onOpenSession={id => openApplicationSession(id, navigate)} />}
-            {!manualWorkAllowed ? null : applicationRecorded ? <p>{t('application.recordedHint')}</p> : taskReadState !== 'ready' ? <div role="status"><p>{t(taskReadState === 'limited' ? 'application.taskCoverage' : 'application.taskReadUnavailable')}</p><Btn variant="ghost" onClick={onRefreshTasks}>{t('application.refreshStatus')}</Btn></div> : <>
+            {!manualWorkAllowed || applicationRecorded ? null : applicationRecordBlocked ? <Btn variant="ghost" onClick={() => { activitySectionRef.current?.focus(); activitySectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }}>{t('application.viewHistory')}</Btn> : taskReadState !== 'ready' ? <div role="status"><p>{t(taskReadState === 'limited' ? 'application.taskCoverage' : 'application.taskReadUnavailable')}</p><Btn variant="ghost" onClick={onRefreshTasks}>{t('application.refreshStatus')}</Btn></div> : <>
               {needsBaseResume && !resumeListReady && <div role="status"><p>{t(resumeListLoading ? 'application.baseResumeLoading' : 'application.baseResumeUnavailable')}</p>{!resumeListLoading && <Btn variant="ghost" onClick={() => void refreshResumeList()}>{t('application.refreshStatus')}</Btn>}</div>}
               {needsBaseResume && resumeListReady && baseResumes.length === 0 && <div role="status"><p>{t('application.baseResumeEmpty')}</p><Btn variant="ghost" onClick={() => {
                 try { sessionStorage.removeItem('applymate:resume-return') } catch { /* The resume page can open without stored context. */ }
@@ -1322,12 +1371,13 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
             <div style={{ borderTop: '1px solid var(--border)', paddingTop: 16 }}>
               <strong style={{ fontSize: 13 }}>{t('application.method')}</strong>
               <p style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{applicationPreflight.canAutomate ? t('application.agentMethodHint') : t('application.manualMethodHint')}</p>
-              {(!currentPackAudited || task || applicationRecorded) && job.url && /^https?:\/\//i.test(job.url) && <a href={job.url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--primary)', fontSize: 12 }}>{t('application.openEmployer')}</a>}
+              {(!currentPackAudited || task || applicationRecordBlocked) && job.url && /^https?:\/\//i.test(job.url) && <a href={job.url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--primary)', fontSize: 12 }}>{t('application.openEmployer')}</a>}
               {!task && <><p style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{t(taskReadState === 'ready' ? 'application.noLinkedTaskHint' : 'application.taskLinkUnknownHint')}</p><Btn variant="ghost" small onClick={() => navigate('agent')}>{t('application.openAgent')}</Btn></>}
-              {manualWorkAllowed && taskReadState === 'ready' && !applicationRecorded && !manualRecordLock && <Btn variant="ghost" small disabled={recordingSubmission} onClick={() => void recordManualSubmission()}>{t('application.recordManual')}</Btn>}
+              {manualWorkAllowed && taskReadState === 'ready' && !applicationRecordBlocked && !manualRecordLock && <Btn variant="ghost" small disabled={recordingSubmission} onClick={() => void recordManualSubmission()}>{t('application.recordManual')}</Btn>}
               {manualStorageUnavailable && <p role="status">{t('application.manualStorageUnavailable')}</p>}
-              {manualRecordLock && !applicationRecorded && <div role="status">
+              {manualRecordLock && (manualRecordLock !== 'confirmed' || !applicationRecorded) && <div role="status">
                 <p>{t(manualRecordLock === 'confirmed' ? 'application.manualStatusConfirmed' : 'application.manualStatusPending')}</p>
+                {manualVisibleRecord && <p>{t('application.manualVisibleRecord')}</p>}
                 {manualRecordNotice && <p>{t('application.manualStatusStillUnknown')}</p>}
                 <Btn variant="ghost" small disabled={recordingSubmission || manualRecordRefreshing} onClick={() => { if (drawerUserId) void refreshManualRecord(drawerUserId) }}>{t('application.manualRefresh')}</Btn>
               </div>}
@@ -1437,10 +1487,12 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
           </div>
 
           {/* Activity log */}
-          <div>
+          <div ref={activitySectionRef} role="region" tabIndex={-1} aria-label={t('jobs.drawer.activity')}>
             <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 8 }}>{t('jobs.drawer.activity')}</div>
             {loadingAct ? (
-              <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('jobs.loadingDetail')}</div>
+              <div role="status" aria-live="polite" style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('jobs.loadingDetail')}</div>
+            ) : activityError ? (
+              <div role="status"><p>{t('application.historyUnavailable')}</p><Btn variant="ghost" small onClick={() => { activitySectionRef.current?.focus(); setActivityRetry(value => value + 1) }}>{t('application.refreshStatus')}</Btn></div>
             ) : activity.length === 0 ? (
               <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('jobs.drawer.noActivity')}</div>
             ) : (
