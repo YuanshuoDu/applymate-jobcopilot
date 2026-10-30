@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useState, useEffect, useRef } from 'react'
+import React, { useState, useEffect, useLayoutEffect, useRef } from 'react'
 import { useSession } from 'next-auth/react'
 import { useI18n } from '@/lib/i18n'
 import { useNav } from '@/lib/nav-context'
@@ -11,6 +11,7 @@ import { sameApplicationAudit, type ApplicationAuditIdentity } from '@/lib/appli
 import { guardApplicationUnload } from '@/lib/application-unload-guard'
 import { createApplicationAnalysisRequestPool } from '@/lib/application-analysis-request'
 import { mayApplyResumeRevalidation } from '@/lib/application-resume-revalidation'
+import { versionRestoreDisposition } from '@/lib/application-version-restore'
 import { mayApplyApplicationAnalysis } from '@/lib/application-analysis-guard'
 import { Eye, FileDown, FileText, History, LayoutTemplate, Plus, ShieldCheck, Type, Upload } from 'lucide-react'
 import './ResumePage.css'
@@ -583,7 +584,7 @@ interface ResumePageProps {
 }
 
 export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: ResumePageProps) {
-  const { navigate, registerNavigationGuard } = useNav()
+  const { navigate, registerNavigationGuard, publishRecoveryDraft } = useNav()
   const { data: resumeSession, status: resumeSessionStatus } = useSession()
   const resumeUserIdRef = useRef<string | null>(null)
   const resumeUserId = resumeSessionStatus === 'authenticated' ? resumeSession?.user?.id ?? null : null
@@ -675,6 +676,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   const setDirty = (value: boolean) => {
     dirtyRef.current = value
     if (value) editRevisionRef.current += 1
+    if (value) publishCurrentRecovery()
     setDirtyState(value)
   }
   const [editSection, setEditSection] = useState<string | null>(null)
@@ -724,6 +726,8 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   const auditRunRef = useRef(false)
   const applyingAuditRef = useRef(false)
   const correctionConflictRef = useRef(false)
+  const versionRestoreIntentRef = useRef(false)
+  const versionRestoreUnknownRef = useRef(false)
   const [latestSavedCoverLetter, setLatestSavedCoverLetter] = useState<CoverLetter | null>(null)
 
   const [showTemplates,   setShowTemplates]   = useState(false)
@@ -1192,11 +1196,12 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   }
 
   function patch(updater: (prev: ResumeContent) => ResumeContent, fieldKey?: string) {
-    setContent(prev => {
-      if (!prev) return prev
-      setDirty(true)
-      return updater(prev)
-    })
+    const prev = latestContent.current
+    if (!prev) return
+    const next = updater(prev)
+    latestContent.current = next
+    setContent(next)
+    setDirty(true)
     setContentChangedSinceAnalysis(true)
     if (fieldKey) triggerFlash(fieldKey)
   }
@@ -1207,6 +1212,9 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       toast.info('Click into a text field first', 'Select text in any section to format it'); return
     }
     const start = el.selectionStart ?? 0; const end = el.selectionEnd ?? 0
+    let nextValue = el.value
+    let nextStart = start
+    let nextEnd = end
     if (start === end) {
       if (prefix === '# ' || prefix === '## ' || prefix === '• ') {
         const before = el.value.substring(0, start)
@@ -1214,26 +1222,28 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
         const lineEnd = el.value.indexOf('\n', start)
         const lineContent = el.value.substring(lineStart, lineEnd === -1 ? el.value.length : lineEnd)
         if (lineContent.startsWith(prefix)) {
-          el.value = el.value.substring(0, lineStart) + lineContent.slice(prefix.length) + el.value.substring(lineEnd === -1 ? el.value.length : lineEnd)
-          el.selectionStart = el.selectionEnd = start - prefix.length
+          nextValue = el.value.substring(0, lineStart) + lineContent.slice(prefix.length) + el.value.substring(lineEnd === -1 ? el.value.length : lineEnd)
+          nextStart = nextEnd = start - prefix.length
         } else {
-          el.value = el.value.substring(0, lineStart) + prefix + lineContent + el.value.substring(lineEnd === -1 ? el.value.length : lineEnd)
-          el.selectionStart = el.selectionEnd = start + prefix.length
+          nextValue = el.value.substring(0, lineStart) + prefix + lineContent + el.value.substring(lineEnd === -1 ? el.value.length : lineEnd)
+          nextStart = nextEnd = start + prefix.length
         }
       } else {
         const wrapped = prefix + suffix
-        el.value = el.value.substring(0, start) + wrapped + el.value.substring(end)
-        el.selectionStart = el.selectionEnd = start + wrapped.length
+        nextValue = el.value.substring(0, start) + wrapped + el.value.substring(end)
+        nextStart = nextEnd = start + wrapped.length
       }
     } else {
       const selected = el.value.substring(start, end)
       const wrapped = prefix + selected + suffix
-      el.value = el.value.substring(0, start) + wrapped + el.value.substring(end)
-      el.selectionStart = start; el.selectionEnd = start + wrapped.length
+      nextValue = el.value.substring(0, start) + wrapped + el.value.substring(end)
+      nextStart = start; nextEnd = start + wrapped.length
     }
-    const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype,'value')?.set ??
-                   Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value')?.set
-    if (setter) { setter.call(el, el.value); el.dispatchEvent(new Event('input', { bubbles: true })) }
+    const prototype = el instanceof HTMLTextAreaElement ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype
+    const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set
+    if (setter) { setter.call(el, nextValue); el.dispatchEvent(new Event('input', { bubbles: true })) }
+    else el.value = nextValue
+    el.selectionStart = nextStart; el.selectionEnd = nextEnd
     el.focus(); setDirty(true)
   }
 
@@ -1364,16 +1374,46 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     return () => { mountedRef.current = false }
   }, [])
 
-  useEffect(() => { latestContent.current         = content },         [content])
-  useEffect(() => { latestSectionOrder.current    = sectionOrder },    [sectionOrder])
-  useEffect(() => { latestTemplateId.current      = templateId },      [templateId])
-  useEffect(() => { latestTemplateOptions.current = templateOptions }, [templateOptions])
-  useEffect(() => { latestResumeName.current      = resumeName },      [resumeName])
-  useEffect(() => { latestSelectedJobId.current   = selectedJobId },   [selectedJobId])
+  useLayoutEffect(() => { latestContent.current         = content },         [content])
+  useLayoutEffect(() => { latestSectionOrder.current    = sectionOrder },    [sectionOrder])
+  useLayoutEffect(() => { latestTemplateId.current      = templateId },      [templateId])
+  useLayoutEffect(() => { latestTemplateOptions.current = templateOptions }, [templateOptions])
+  useLayoutEffect(() => { latestResumeName.current      = resumeName },      [resumeName])
+  useLayoutEffect(() => { latestSelectedJobId.current   = selectedJobId },   [selectedJobId])
+
+  // The shell keeps this snapshot in memory if a session transition unmounts
+  // the editor. Never publish the old editor's content under another account.
+  const recoveryOwnerRef = useRef(resumeUserId)
+  if (!recoveryOwnerRef.current && resumeUserId) recoveryOwnerRef.current = resumeUserId
+  function publishCurrentRecovery() {
+    const owner = recoveryOwnerRef.current
+    const currentContent = latestContent.current
+    if (!owner || owner !== resumeUserIdRef.current || !publishRecoveryDraft || !selectedResumeIdRef.current || !currentContent) return
+    publishRecoveryDraft(owner, {
+      userId: owner, resumeId: selectedResumeIdRef.current, name: latestResumeName.current,
+      content: structuredClone(currentContent), sectionOrder: [...latestSectionOrder.current],
+      templateId: latestTemplateId.current, templateOptions: structuredClone(latestTemplateOptions.current),
+    })
+  }
+  useLayoutEffect(() => {
+    const owner = recoveryOwnerRef.current
+    if (!owner || owner !== resumeUserId || !publishRecoveryDraft) return
+    if (!dirtyRef.current && !isSavingRef.current) {
+      publishRecoveryDraft(owner, null)
+      return
+    }
+    if (!selectedResumeId || !content) return
+    publishRecoveryDraft(owner, {
+      userId: owner, resumeId: selectedResumeId, name: resumeName,
+      content: structuredClone(content), sectionOrder: [...sectionOrder],
+      templateId, templateOptions: structuredClone(templateOptions),
+    })
+  }, [resumeUserId, selectedResumeId, content, sectionOrder, templateId, templateOptions, resumeName, dirty, saving, publishRecoveryDraft])
 
   function handleSave(): Promise<boolean> {
     if (correctionConflictRef.current) {
-      toast.warning(t('resume.correctionChangedTitle'), t('resume.correctionChangedDetail'))
+      toast.warning(t(versionRestoreUnknownRef.current ? 'resume.restoreUnknownTitle' : 'resume.correctionChangedTitle'),
+        t(versionRestoreUnknownRef.current ? 'resume.restoreUnknownDetail' : 'resume.correctionChangedDetail'))
       return Promise.resolve(false)
     }
     if (applyingAuditRef.current) {
@@ -1452,8 +1492,12 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   const saveForNavigationRef = useRef(handleSave)
   saveForNavigationRef.current = handleSave
   useEffect(() => registerNavigationGuard?.({
-    needsSave: () => dirtyRef.current || isSavingRef.current,
+    needsSave: () => dirtyRef.current || isSavingRef.current || applyingAuditRef.current || versionRestoreIntentRef.current,
     save: async () => {
+      if (versionRestoreIntentRef.current) {
+        toast.info(t('resume.toastSaving'), t('resume.toastSavingDetail'))
+        return false
+      }
       const success = await saveForNavigationRef.current()
       return success && !dirtyRef.current && !isSavingRef.current
     },
@@ -1478,6 +1522,8 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
 
   async function handleImportResume(imported: ResumeContent, mode: 'replace' | 'new') {
     if (mode === 'replace' && selectedResumeId) {
+      latestContent.current = imported
+      latestSectionOrder.current = imported.sectionOrder ?? DEFAULT_ORDER
       setContent(imported)
       setSectionOrder(imported.sectionOrder ?? DEFAULT_ORDER)
       setDirty(true)
@@ -1521,19 +1567,71 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   }
 
   async function restoreVersion(versionId: string) {
-    if (!selectedResumeId) return
+    const requestResumeId = selectedResumeIdRef.current
+    const requestUserId = resumeUserIdRef.current
+    if (!requestResumeId || !requestUserId || versionRestoreIntentRef.current || applyingAuditRef.current) return
+    if (correctionConflictRef.current) {
+      toast.warning(t(versionRestoreUnknownRef.current ? 'resume.restoreUnknownTitle' : 'resume.correctionChangedTitle'),
+        t(versionRestoreUnknownRef.current ? 'resume.restoreUnknownDetail' : 'resume.correctionChangedDetail'))
+      return
+    }
+    versionRestoreIntentRef.current = true
     setRestoring(true)
-    const { data, error } = await apiMutate<Resume>(`/api/resume/${selectedResumeId}/versions`, 'POST', { versionId })
-    setRestoring(false)
-    if (error || !data) { toast.error('Restore failed', error ?? 'Could not restore version'); return }
-    setContent(data.content as ResumeContent)
-    setResumeName(data.name)
-    setTemplateId(data.templateId ?? 'clean')
-    setTemplateOptions((data.templateOptions as TemplateOptions) ?? {})
-    setShowVersions(false)
-    setDirty(true)
-    setContentChangedSinceAnalysis(true)
-    toast.success('Version restored', 'Previous version loaded. Save to keep it.')
+    let mutationStarted = false
+    try {
+      if ((dirtyRef.current || isSavingRef.current) && !(await handleSave())) return
+      if (!mountedRef.current || requestUserId !== resumeUserIdRef.current || requestResumeId !== selectedResumeIdRef.current
+        || dirtyRef.current || isSavingRef.current || applyingAuditRef.current) return
+      const requestEditRevision = editRevisionRef.current
+      saveGenerationRef.current += 1
+      analysisEpochRef.current += 1
+      setScoring(false); setSuggesting(false)
+      applyingAuditRef.current = true
+      mutationStarted = true
+      const { data, error } = await apiMutate<Resume>(`/api/resume/${requestResumeId}/versions`, 'POST', { versionId })
+      const disposition = versionRestoreDisposition({
+        mounted: mountedRef.current, requestUserId, currentUserId: resumeUserIdRef.current,
+        requestResumeId, currentResumeId: selectedResumeIdRef.current,
+        requestEditRevision, currentEditRevision: editRevisionRef.current,
+        validResponse: !error && !!data && data.id === requestResumeId && !!data.content && typeof data.content === 'object',
+      })
+      if (disposition === 'ignore') return
+      if (disposition === 'unknown') {
+        correctionConflictRef.current = true
+        versionRestoreUnknownRef.current = true
+        toast.warning(t('resume.restoreUnknownTitle'), t('resume.restoreUnknownDetail'))
+        return
+      }
+      if (disposition === 'conflict') {
+        correctionConflictRef.current = true
+        setContentChangedSinceAnalysis(true)
+        toast.warning(t('resume.correctionChangedTitle'), t('resume.correctionChangedDetail'))
+        return
+      }
+      if (!data) return
+      latestContent.current = data.content as ResumeContent
+      latestSectionOrder.current = data.content.sectionOrder ?? DEFAULT_ORDER
+      latestResumeName.current = data.name
+      latestTemplateId.current = data.templateId ?? 'clean'
+      latestTemplateOptions.current = (data.templateOptions as TemplateOptions) ?? {}
+      setContent(data.content as ResumeContent)
+      setSectionOrder(data.content.sectionOrder ?? DEFAULT_ORDER)
+      setResumeName(data.name)
+      setTemplateId(data.templateId ?? 'clean')
+      setTemplateOptions((data.templateOptions as TemplateOptions) ?? {})
+      setCachedApiResponse(`/api/resume/${requestResumeId}`, data, requestUserId)
+      setContentRevision(data.updatedAt ?? null)
+      setResumes(previous => previous.map(resume => resume.id === requestResumeId ? { ...resume, name: data.name, updatedAt: data.updatedAt } : resume))
+      setShowVersions(false)
+      setDirty(false)
+      setLastSavedAt(new Date())
+      setContentChangedSinceAnalysis(true)
+      toast.success(t('resume.restoreSuccessTitle'), t('resume.restoreSuccessDetail'))
+    } finally {
+      if (mutationStarted) applyingAuditRef.current = false
+      versionRestoreIntentRef.current = false
+      if (mountedRef.current) setRestoring(false)
+    }
   }
 
   // Apply a keyword/item to the correct section (not just skills)
@@ -1660,22 +1758,30 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   function handleSectionDrop(targetIdx: number) {
     const from = sectionDragRef.current
     if (from === null || from === targetIdx) { setSectionDragOver(null); return }
-    const next = [...sectionOrder]; const [item] = next.splice(from, 1); next.splice(targetIdx, 0, item)
+    const next = [...latestSectionOrder.current]; const [item] = next.splice(from, 1); next.splice(targetIdx, 0, item)
+    latestSectionOrder.current = next
     setSectionOrder(next); sectionDragRef.current = null; setSectionDragOver(null); setDirty(true)
   }
 
   function removeSection(id: string) {
-    setSectionOrder(prev => prev.filter(s => s !== id)); setDirty(true)
+    const next = latestSectionOrder.current.filter(s => s !== id)
+    latestSectionOrder.current = next
+    setSectionOrder(next); setDirty(true)
   }
 
   function addSection(id: string) {
-    setSectionOrder(prev => [...prev, id]); setDirty(true)
+    const next = [...latestSectionOrder.current, id]
+    latestSectionOrder.current = next
+    setSectionOrder(next); setDirty(true)
   }
 
   function addCustomSection() {
     const id = `custom_${Date.now()}`
     patch(p => ({ ...p, custom: [...(p.custom ?? []), { id, title: 'CUSTOM SECTION', items: [] }] }))
-    setSectionOrder(prev => [...prev, id])
+    const next = [...latestSectionOrder.current, id]
+    latestSectionOrder.current = next
+    setSectionOrder(next)
+    setDirty(true)
   }
 
   function getDragHandleProps(i: number): DragHandleProps {
@@ -1879,7 +1985,8 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       return
     }
     if (correctionConflictRef.current) {
-      toast.warning(t('resume.correctionChangedTitle'), t('resume.correctionChangedDetail'))
+      toast.warning(t(versionRestoreUnknownRef.current ? 'resume.restoreUnknownTitle' : 'resume.correctionChangedTitle'),
+        t(versionRestoreUnknownRef.current ? 'resume.restoreUnknownDetail' : 'resume.correctionChangedDetail'))
       return
     }
     if (dirtyRef.current && !isSavingRef.current) {
@@ -2203,6 +2310,10 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   async function selectResume(id: string, suppliedTarget?: ResumeListItem): Promise<boolean> {
     const attempt = ++resumeSelectionAttempt.current
     if (id === selectedResumeIdRef.current) return true
+    if (applyingAuditRef.current || versionRestoreIntentRef.current) {
+      toast.info(t('resume.toastSaving'), t('resume.toastSavingDetail'))
+      return false
+    }
     if (dirtyRef.current || isSavingRef.current) {
       if (!(await handleSave()) || dirtyRef.current || isSavingRef.current) return false
     }
@@ -2230,6 +2341,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     <button
       key={tool.key}
       className={`resume-format-button resume-format-button-${tool.key === '•' ? 'bullet' : tool.key.toLowerCase()}`}
+      onMouseDown={event => event.preventDefault()}
       onClick={() => applyFormat(tool.wrap)}
       title={tool.title}
       aria-label={tool.title}
@@ -2561,6 +2673,8 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
           current={templateId}
           currentOptions={templateOptions}
           onSelect={(id, opts) => {
+            latestTemplateId.current = id
+            latestTemplateOptions.current = opts
             setTemplateId(id)
             setTemplateOptions(opts)
             setDirty(true)

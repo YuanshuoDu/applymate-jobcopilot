@@ -20,11 +20,17 @@ test.beforeAll(async () => {
   const viteRequire = createRequire(vitestRequire.resolve('vite'))
   const { build } = viteRequire('esbuild') as { build(options: object): Promise<unknown> }
   const authPath = path.join(temporaryDirectory, 'auth.js')
-  await writeFile(authPath, `export function useSession(){return {status:'authenticated',data:{user:{id:'fixture-user',name:'Fixture Candidate'}}}}; export function signOut(){}`)
+  await writeFile(authPath, `import React from ${JSON.stringify(webRequire.resolve('react'))};
+    const listeners=new Set();
+    const update=async()=>{globalThis.__fixtureUpdateCalls=(globalThis.__fixtureUpdateCalls||0)+1;return current.data};
+    let current={status:'authenticated',data:{user:{id:'fixture-user',name:'Fixture Candidate'}},update};
+    globalThis.__fixtureSetSession=(status,id)=>{current={status,data:status==='authenticated'?{user:{id,name:'Fixture Candidate'}}:null,update};for(const fn of listeners)fn()};
+    export function useSession(){return React.useSyncExternalStore(fn=>{listeners.add(fn);return()=>listeners.delete(fn)},()=>current,()=>current)};
+    export async function signOut(options){(globalThis.__fixtureSignOutCalls ||= []).push(options);return {url:'/login'}}`)
   const dynamicPath = path.join(temporaryDirectory, 'dynamic.js')
   await writeFile(dynamicPath, `import React from ${JSON.stringify(webRequire.resolve('react'))}; export default function dynamic(loader){const Component=React.lazy(()=>loader().then(value=>({default:value}))); return function Dynamic(){return React.createElement(React.Suspense,{fallback:null},React.createElement(Component))}}`)
   const navigationPath = path.join(temporaryDirectory, 'navigation.js')
-  await writeFile(navigationPath, `export function useRouter(){return {push(){},replace(){},refresh(){},prefetch(){}}}`)
+  await writeFile(navigationPath, `export function useRouter(){return {push(url){(globalThis.__fixtureRouterPushes ||= []).push(url)},replace(){},refresh(){},prefetch(){}}}`)
   const unusedPagePath = path.join(temporaryDirectory, 'unused-page.js')
   await writeFile(unusedPagePath, `export const GmailPage=()=>null,JobRecommendationsPage=()=>null,AgentPlaygroundPage=()=>null,AgentHistoryPage=()=>null,SettingsPage=()=>null,ObservabilityPage=()=>null,ContactUsPage=()=>null`)
 
@@ -60,7 +66,7 @@ test.beforeAll(async () => {
     `, loader: 'tsx', resolveDir: webRoot },
     absWorkingDir: webRoot, outfile: path.join(temporaryDirectory, 'fixture.js'), bundle: true, platform: 'browser',
     format: 'iife', jsx: 'automatic', target: 'es2022', alias: { '@': path.join(webRoot, 'src'), 'next-auth/react': authPath, 'next/dynamic': dynamicPath, 'next/navigation': navigationPath },
-    plugins: [{ name: 'fixture-unused-pages', setup(build: { onResolve: (options: object, callback: () => object) => void }) { build.onResolve({ filter: /^@\/components\/pages\/(GmailPage|JobRecommendationsPage|AgentPlaygroundPage|AgentHistoryPage|SettingsPage|ObservabilityPage|ContactUsPage)$/ }, () => ({ path: unusedPagePath })) } }],
+    plugins: [{ name: 'fixture-unused-pages', setup(build: { onResolve: (options: object, callback: () => object) => void }) { build.onResolve({ filter: /^@\/components\/pages\/(GmailPage|JobRecommendationsPage|AgentHistoryPage|SettingsPage|ObservabilityPage|ContactUsPage)$/ }, () => ({ path: unusedPagePath })) } }],
     define: { 'process.env.NODE_ENV': '"production"' }, loader: { '.svg': 'dataurl', '.png': 'dataurl' }, logLevel: 'silent',
   })
   server = createServer((request, response) => {
@@ -108,7 +114,9 @@ function audit(resumeUpdatedAt = time) {
     audit: { verdict: 'pass', summary: 'Fixture materials checked.', findings: [], matchScore: 82, source: 'independent', auditedAt: time } }
 }
 
-async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unknown' | 'waiting_for_user'; taskFailure?: boolean; missing?: boolean; holdSelectedLetter?: boolean; search?: boolean; saveMode?: 'fail' | 'hold-success' | 'hold-fail'; twoResumes?: boolean; holdResumeContent?: boolean; snapshotResumeContent?: boolean; resumeRevalidationFails?: boolean; versionedScore?: boolean; holdOldAnalysis?: boolean; auditCorrection?: boolean; holdAuditCorrection?: boolean } = {}) {
+async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unknown' | 'waiting_for_user' | 'waiting_for_authorization'; taskFailure?: boolean; missing?: boolean; holdSelectedLetter?: boolean; search?: boolean; saveMode?: 'fail' | 'hold-success' | 'hold-fail'; twoResumes?: boolean; holdResumeContent?: boolean; snapshotResumeContent?: boolean; resumeRevalidationFails?: boolean; versionedScore?: boolean; holdOldAnalysis?: boolean; auditCorrection?: boolean; holdAuditCorrection?: boolean; versions?: boolean; holdVersionRestore?: boolean; versionRestoreFails?: boolean; realAgent?: boolean } = {}) {
+  let releaseVersionRestore = () => {}
+  const versionRestoreGate = new Promise<void>(resolve => { releaseVersionRestore = resolve })
   let releaseAuditCorrection = () => {}
   const auditCorrectionGate = new Promise<void>(resolve => { releaseAuditCorrection = resolve })
   let releaseOldAnalysis = () => {}
@@ -121,13 +129,37 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
   const lettersGate = new Promise<void>(resolve => { releaseLetters = resolve })
   const state = { job: { ...job(), finalCoverLetterId: options.holdSelectedLetter ? 'selected-letter' : null }, resume: resume(), audit: options.auditCorrection ? { ...audit(), audit: { ...audit().audit, verdict: 'revise', findings: [{ area: 'resume', target: 'summary', severity: 'warning', title: 'Fix summary', evidence: 'Outdated wording', action: 'Apply correction', proposedValue: 'Audited v2 summary' }] } } : audit(options.stale ? '2026-10-29T10:00:00.000Z' : time),
     secondResume: { ...resume(), id: 'resume-2', name: 'Second fixture resume', targetJobId: null as string | null, content: { ...resume().content, summary: 'Second resume content.' } },
-    writes: [] as Array<{ path: string; body: unknown }>, analysisRequests: [] as string[], analysisBodies: [] as unknown[], analysisCalls: [] as Array<{ path: string; body: unknown }>, unexpected: [] as string[], taskReads: 0, letterRequested: false, resumeContentRequested: false, releaseLetters, releaseSave, releaseResumeContent, releaseOldAnalysis, releaseAuditCorrection }
+    activeUserId: 'fixture-user', requestOwners: [] as Array<{ path: string; method: string; userId: string }>, agentRequests: [] as Array<{ path: string; method: string; body?: unknown }>, writes: [] as Array<{ path: string; body: unknown }>, analysisRequests: [] as string[], analysisBodies: [] as unknown[], analysisCalls: [] as Array<{ path: string; body: unknown }>, unexpected: [] as string[], taskReads: 0, letterRequested: false, resumeContentRequested: false, releaseLetters, releaseSave, releaseResumeContent, releaseOldAnalysis, releaseAuditCorrection, releaseVersionRestore }
   const json = (route: Route, value: unknown, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(value) })
   await page.context().route('**/*', async route => {
     const request = route.request(), url = new URL(request.url()), pathname = url.pathname
+    if (pathname.startsWith('/api/')) state.requestOwners.push({ path: pathname, method: request.method(), userId: state.activeUserId })
     if (url.origin === origin && !pathname.startsWith('/api/')) return route.continue()
     if (url.hostname === 'employer.invalid') return route.fulfill({ contentType: 'text/html', body: '<h1>Mock employer application</h1>' })
     if (url.origin !== origin) { state.unexpected.push(request.url()); return route.abort() }
+    if (options.realAgent && pathname.startsWith('/api/agent/') && pathname !== '/api/agent/application-tasks') {
+      const method = request.method()
+      const body: unknown = method === 'POST' ? request.postDataJSON() : undefined
+      state.agentRequests.push({ path: pathname, method, body })
+      if (pathname === '/api/agent/roles' || pathname === '/api/agent/roles/custom') return json(route, [])
+      if (pathname === '/api/agent/automations') return json(route, { automations: [] })
+      if (pathname === '/api/agent/health') return json(route, { successRate: 100, captchaRate: 0, avgDurationMs: 1000, patternCacheRate: 100, last24hRuns: 1 })
+      if (pathname === '/api/agent/sessions') return json(route, { sessions: [{ id: 'original-session', goal: 'Fixture application task', status: 'waiting_for_approval', updatedAt: time }], lastOpenedSessionId: 'original-session' })
+      const prefix = '/api/agent/sessions/original-session'
+      if (!pathname.startsWith(prefix)) { state.unexpected.push(pathname); return json(route, { error: 'Unexpected agent session' }, 404) }
+      if (pathname === `${prefix}/turns`) {
+        const turn = { id: 'fixture-turn', sessionId: 'original-session', source: 'automation', goal: 'Fixture application task', status: 'waiting_for_approval', revision: 1, activeStepId: null, finalItemId: null, createdAt: time, updatedAt: time, completedAt: null }
+        return json(route, { turns: [turn], projection: { activeTurnId: turn.id, activeTurn: { id: turn.id, status: turn.status, revision: 1 }, queuedInputCount: 0 } })
+      }
+      if (pathname === `${prefix}/tasks`) return json(route, { tasks: [] })
+      if (pathname === `${prefix}/timeline`) return json(route, { items: [], approvalEvents: [{ schemaVersion: 'agent-harness.v2', id: 'fixture-approval-event', sessionId: 'original-session', turnId: 'fixture-turn', itemId: null, taskId: null, type: 'approval.requested', actor: 'orchestrator', sequence: '1', payload: { approvalId: 'fixture-approval', action: 'submit_application', scopeHash: `sha256:${'a'.repeat(64)}`, revision: 1 } }] })
+      if (pathname === `${prefix}/events`) return route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': fixture waiting\n\n' })
+      if (pathname === `${prefix}/approvals/fixture-approval` && method === 'POST') return json(route, { disposition: 'resolved' }, 202)
+      if (pathname === prefix && (method === 'GET' || method === 'PATCH')) return json(route, { session: { id: 'original-session', goal: 'Fixture application task', status: 'waiting_for_approval', updatedAt: time, tasks: [], approvals: [], applicationTasks: [], questions: [], artifacts: [], qualityScore: 100 } })
+      state.unexpected.push(pathname); return json(route, { error: 'Unexpected agent request' }, 404)
+    }
+    if (options.realAgent && pathname === '/api/me/agent-task-history-memory' && request.method() === 'GET') return json(route, { enabled: false, version: 0 })
+    if (options.realAgent && pathname === '/api/agent') return json(route, { autoApply: false, requireApproval: true, isRunning: false })
     if (request.method() !== 'GET') {
       const body: unknown = request.postDataJSON()
       // Resume already runs automatic analysis on entry. Mock and account for it
@@ -146,6 +178,11 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
         if (options.saveMode === 'hold-success' || options.saveMode === 'hold-fail') { await saveGate; if (options.saveMode === 'hold-success') return json(route, { ...state.resume, ...(body as object) }) }
         return json(route, { error: 'Fixture save failed' }, 500)
       }
+      if (options.versions && pathname === '/api/resume/resume-1/versions' && request.method() === 'POST') {
+        if (options.holdVersionRestore) await versionRestoreGate
+        state.resume = { ...state.resume, updatedAt: '2026-10-30T12:00:00.000Z', content: { ...state.resume.content, summary: 'Restored historical summary' } }
+        return options.versionRestoreFails ? json(route, { error: 'Fixture uncertain restore' }, 500) : json(route, state.resume)
+      }
       if (options.search && pathname === '/api/jobs' && request.method() === 'POST') return json(route, state.job)
       if (options.auditCorrection && pathname.endsWith('/audit-application/apply')) {
         if (options.holdAuditCorrection) await auditCorrectionGate
@@ -162,7 +199,7 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
       state.taskReads++
       if (options.taskFailure) return json(route, { error: 'Fixture unavailable' }, 500)
       return json(route, { tasks: options.taskStatus ? [{ id: 'task-1', userId: 'fixture-user', jobId: state.job.id, sessionId: 'original-session', status: options.taskStatus,
-        checkpoint: options.taskStatus === 'unknown' ? 'submission_uncertain' : 'form_answer_required', updatedAt: time, job: { company: state.job.company, role: state.job.role } }] : [] })
+        checkpoint: options.taskStatus === 'unknown' ? 'submission_uncertain' : options.taskStatus === 'waiting_for_authorization' ? 'waiting_for_authorization' : 'form_answer_required', updatedAt: time, job: { company: state.job.company, role: state.job.role } }] : [] })
     }
     if (pathname === '/api/jobs') return json(route, { jobs: url.searchParams.has('finalResumeId') || url.searchParams.get('pageSize') === '30' ? [state.job] : [], total: 80, statusCounts: { saved: 80, applied: 0, interview: 0, offer: 0, rejected: 0 } })
     if (pathname === `/api/jobs/${state.job.id}`) return options.missing ? json(route, { error: 'Not found' }, 404) : json(route, state.job)
@@ -171,13 +208,16 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
       return json(route, [])
     }
     if (pathname.endsWith('/audit-application')) return json(route, state.audit)
-    if (pathname === '/api/resume') return json(route, options.twoResumes ? [state.resume, state.secondResume] : [state.resume])
+    if (pathname === '/api/resume') return json(route, state.activeUserId === 'fixture-b' ? [{ ...state.resume, id: 'resume-b', userId: 'fixture-b', name: 'Account B resume', targetJobId: null, content: { ...state.resume.content, summary: 'Account B only' } }] : options.twoResumes ? [state.resume, state.secondResume] : [state.resume])
+    if (pathname === '/api/resume/resume-b') return json(route, { ...state.resume, id: 'resume-b', userId: 'fixture-b', name: 'Account B resume', targetJobId: null, content: { ...state.resume.content, summary: 'Account B only' } })
+    if (pathname === '/api/resume/resume-1' && state.activeUserId === 'fixture-b') return json(route, { error: 'Not found' }, 404)
     if (pathname === '/api/resume/resume-2') return json(route, state.secondResume)
     if (pathname === '/api/resume/resume-1' && options.holdResumeContent) { const snapshot = structuredClone(state.resume); state.resumeContentRequested = true; await resumeContentGate; return options.resumeRevalidationFails ? json(route, { error: 'Fixture revalidation failed' }, 500) : json(route, options.snapshotResumeContent ? snapshot : state.resume) }
     if (pathname === '/api/resume/resume-1' || pathname === '/api/resume/default') return json(route, state.resume)
     if (pathname === '/api/me') return json(route, { onboardedAt: time })
     if (pathname === '/api/gmail/unread') return json(route, { count: 0 })
     if (pathname === '/api/notifications') return json(route, { notifications: [], unreadCount: 0 })
+    if (options.versions && pathname === '/api/resume/resume-1/versions') return json(route, [{ id: 'version-old', name: 'Historical version', createdAt: time }])
     if (pathname === '/api/directions' || pathname === '/api/activity' || pathname.endsWith('/versions')) return json(route, [])
     state.unexpected.push(pathname)
     return json(route, { error: 'Unhandled fixture API' }, 500)
@@ -806,4 +846,334 @@ test('editing during audit correction is kept without overwriting the server cor
     expect(state.writes.filter(write => write.path === '/api/resume/resume-1')).toEqual([])
     expect(state.unexpected).toEqual([])
   } finally { state.releaseAuditCorrection() }
+})
+
+
+test('application review opens the original real Agent session without submitting', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises the real desktop Agent shell')
+  const state = await install(page, { taskStatus: 'waiting_for_authorization', realAgent: true })
+  await page.goto(`${origin}/?shell=1&page=jobs&highlight=outside-page`)
+  await expect(page.getByRole('dialog')).toContainText('Application flow engineer')
+  await page.getByRole('link', { name: 'Review in Agent' }).click()
+  await expect(page).toHaveURL(/page=agent/)
+  await expect(page).toHaveURL(/sessionId=original-session/)
+  await page.getByRole('button', { name: /^Tasks & results/ }).click()
+  await expect(page.locator('[data-agent-approval-ledger="true"]')).toBeVisible()
+  await expect(page.locator('[data-agent-approval-ledger="true"] button').first()).toBeEnabled()
+  expect(state.agentRequests.some(item => item.path === '/api/agent/sessions/original-session/timeline')).toBe(true)
+  expect(state.agentRequests.filter(item => item.method === 'POST')).toEqual([])
+  await page.locator('[data-agent-approval-ledger="true"] button').first().click()
+  await expect.poll(() => state.agentRequests.filter(item => item.method === 'POST').length).toBe(1)
+  expect(state.agentRequests.find(item => item.method === 'POST')).toMatchObject({ path: '/api/agent/sessions/original-session/approvals/fixture-approval', body: { expectedTurnId: 'fixture-turn', expectedRevision: 1, decision: 'approved' } })
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+
+async function fixtureSession(page: Page, status: 'loading' | 'unauthenticated' | 'authenticated', userId = 'fixture-user') {
+  await page.evaluate(({ status, userId }) => {
+    (window as unknown as { __fixtureSetSession: (status: string, userId: string) => void }).__fixtureSetSession(status, userId)
+  }, { status, userId })
+}
+
+test('a same-task edit and auth loading preserves the latest draft for its owner', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop shell')
+  const state = await install(page, { saveMode: 'hold-success' })
+  try {
+    await openDirtyShellResume(page)
+    await page.evaluate(() => {
+      const input = document.querySelector('textarea') as HTMLTextAreaElement
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(input, 'Last synchronous private edit')
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+      ;(window as unknown as { __fixtureSetSession: (status: string, userId: string) => void }).__fixtureSetSession('loading', '')
+    })
+    await expect(page.locator('textarea')).toHaveCount(0)
+    await fixtureSession(page, 'authenticated')
+    await expect(page.locator('#recovery-draft')).toHaveValue(/Last synchronous private edit/)
+    const draft = JSON.parse(await page.locator('#recovery-draft').inputValue())
+    expect(draft.name).toBe('Fixture role resume')
+    expect(draft.content.summary).toBe('Last synchronous private edit')
+    expect(draft.sectionOrder).toEqual(expect.any(Array))
+    expect(draft.templateId).toBe('clean')
+    expect(draft.templateOptions).toEqual(expect.any(Object))
+    expect(state.writes.filter(write => write.path === '/api/resume/resume-1')).toEqual([])
+  } finally { state.releaseSave() }
+})
+
+test('expired session keeps a private draft in memory and restores it only to its owner', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop shell')
+  const state = await install(page, { saveMode: 'hold-success' })
+  try {
+    await openDirtyShellResume(page)
+    await fixtureSession(page, 'unauthenticated')
+    await expect(page.getByRole('link', { name: /Sign in in a new tab|在新标签登录/ })).toBeVisible()
+    expect(await page.evaluate(() => (window as unknown as { __fixtureRouterPushes?: string[] }).__fixtureRouterPushes ?? [])).toEqual([])
+    await expect(page.getByText('Edited fixture summary', { exact: false })).toHaveCount(0)
+    const dialogPromise = page.waitForEvent('dialog')
+    const reload = page.reload({ waitUntil: 'commit', timeout: 2000 }).catch(() => null)
+    const dialog = await dialogPromise
+    expect(dialog.type()).toBe('beforeunload')
+    await dialog.dismiss(); await reload
+    await fixtureSession(page, 'authenticated')
+    await expect(page.locator('#recovery-draft')).toHaveValue(/Edited fixture summary/)
+    const storage = await page.evaluate(() => [...Object.values(localStorage), ...Object.values(sessionStorage)].join('\n'))
+    expect(storage).not.toContain('Edited fixture summary')
+    expect(state.writes.filter(write => write.path === '/api/resume/resume-1')).toEqual([])
+  } finally { state.releaseSave() }
+})
+
+test('switching accounts hides the previous owner draft until that owner returns', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop shell')
+  const state = await install(page, { saveMode: 'hold-success' })
+  try {
+    await openDirtyShellResume(page)
+    state.activeUserId = 'fixture-b'
+    await fixtureSession(page, 'authenticated', 'fixture-b')
+    await expect(page.locator('#recovery-draft')).toHaveCount(0)
+    await expect(page.getByText('Edited fixture summary', { exact: false })).toHaveCount(0)
+    await page.waitForTimeout(300)
+    expect(state.writes.filter(write => write.path.startsWith('/api/resume/'))).toEqual([])
+    state.activeUserId = 'fixture-user'
+    await fixtureSession(page, 'authenticated')
+    await expect(page.locator('#recovery-draft')).toHaveValue(/Edited fixture summary/)
+  } finally { state.releaseSave() }
+})
+
+test('a save failure prevents desktop sign out and keeps the edited resume', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop sidebar')
+  const state = await install(page, { saveMode: 'fail' })
+  await openDirtyShellResume(page)
+  await page.getByTitle(/Account menu|账户菜单/).click()
+  await page.getByRole('menuitem', { name: /Sign Out|退出登录/ }).click()
+  await expect.poll(() => state.writes.filter(write => write.path === '/api/resume/resume-1').length).toBeGreaterThan(0)
+  await expect(page.getByText('Edited fixture summary', { exact: false }).first()).toBeVisible()
+  expect(await page.evaluate(() => (window as unknown as { __fixtureSignOutCalls?: unknown[] }).__fixtureSignOutCalls ?? [])).toEqual([])
+})
+
+test('an in-flight save returning after account switch does not erase the original draft', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop shell')
+  const state = await install(page, { saveMode: 'hold-success' })
+  try {
+    await openDirtyShellResume(page)
+    await page.locator('#desktop-sidebar').getByRole('button', { name: /^Applications(?:\s+\d+)?$/ }).click()
+    await expect.poll(() => state.writes.filter(write => write.path === '/api/resume/resume-1').length).toBeGreaterThan(0)
+    state.activeUserId = 'fixture-b'
+    await fixtureSession(page, 'authenticated', 'fixture-b')
+    state.releaseSave()
+    await expect(page.getByText('Edited fixture summary', { exact: false })).toHaveCount(0)
+    state.activeUserId = 'fixture-user'
+    await fixtureSession(page, 'authenticated')
+    await expect(page.locator('#recovery-draft')).toHaveValue(/Edited fixture summary/)
+    expect(state.requestOwners.filter(request => request.path === '/api/resume/resume-1' && request.method === 'PATCH').map(request => request.userId)).toEqual(['fixture-user'])
+  } finally { state.releaseSave() }
+})
+
+
+test('a second account can sign out while the first account draft stays private', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop sidebar')
+  const state = await install(page, { saveMode: 'hold-success' })
+  try {
+    await openDirtyShellResume(page)
+    state.activeUserId = 'fixture-b'
+    await fixtureSession(page, 'authenticated', 'fixture-b')
+    await expect(page.getByTitle(/Account menu|账户菜单/)).toBeVisible()
+    await expect(page.getByText('Edited fixture summary', { exact: false })).toHaveCount(0)
+    await page.getByTitle(/Account menu|账户菜单/).click()
+    await page.getByRole('menuitem', { name: /Sign Out|退出登录/ }).click()
+    await expect.poll(() => page.evaluate(() => (window as unknown as { __fixtureSignOutCalls?: unknown[] }).__fixtureSignOutCalls ?? [])).toEqual([{ redirect: false }])
+    await fixtureSession(page, 'unauthenticated')
+    state.activeUserId = 'fixture-user'
+    await fixtureSession(page, 'authenticated')
+    await expect(page.locator('#recovery-draft')).toHaveValue(/Edited fixture summary/)
+  } finally { state.releaseSave() }
+})
+
+test('an audit correction returning after session loss does not discard local edits', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop audit controls')
+  const state = await install(page, { auditCorrection: true, holdAuditCorrection: true })
+  try {
+    await page.goto(`${origin}/?shell=1&page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    await expect(page.locator('[data-resume-editor]').getByText('Software engineer.', { exact: false }).first()).toBeVisible()
+    await page.getByRole('button', { name: 'Apply generated fix', exact: true }).click()
+    await expect.poll(() => state.writes.map(write => write.path)).toContain('/api/jobs/outside-page/audit-application/apply')
+    await page.locator('[data-resume-editor]').getByText('Software engineer.', { exact: false }).first().click()
+    await page.locator('[data-resume-editor] textarea').first().fill('Private edit during correction')
+    await fixtureSession(page, 'unauthenticated')
+    state.releaseAuditCorrection()
+    await fixtureSession(page, 'authenticated')
+    await expect(page.locator('#recovery-draft')).toHaveValue(/Private edit during correction/)
+    expect(state.writes.filter(write => write.path === '/api/resume/resume-1')).toEqual([])
+  } finally { state.releaseAuditCorrection() }
+})
+
+test('a save failure prevents mobile sign out', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'mobile-zh', 'Exercises mobile navigation')
+  const state = await install(page, { saveMode: 'fail' })
+  await page.goto(`${origin}/?shell=1&page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+  await expect(page.locator('[data-resume-editor]').getByText('Software engineer.', { exact: false }).first()).toBeVisible()
+  await page.locator('[data-resume-editor]').getByText('Software engineer.', { exact: false }).first().click()
+  await page.locator('[data-resume-editor] textarea').first().fill('Edited on mobile')
+  await page.locator('[data-mobile-more-button]').click()
+  await page.getByRole('menuitem', { name: /Sign Out|退出登录/ }).click()
+  await expect.poll(() => state.writes.filter(write => write.path === '/api/resume/resume-1').length).toBeGreaterThan(0)
+  await expect(page.locator('[data-resume-editor]').getByText('Edited on mobile', { exact: false }).first()).toBeVisible()
+  expect(await page.evaluate(() => (window as unknown as { __fixtureSignOutCalls?: unknown[] }).__fixtureSignOutCalls ?? [])).toEqual([])
+})
+
+
+test('template application in the same task as auth loading is retained in the owner draft', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop template picker')
+  const state = await install(page, { saveMode: 'hold-success' })
+  try {
+    await page.goto(`${origin}/?shell=1&page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    await expect(page.locator('[data-resume-editor]').getByText('Software engineer.', { exact: false }).first()).toBeVisible()
+    await page.getByRole('button', { name: /^Templates$/ }).click()
+    await page.getByText('Executive', { exact: true }).click()
+    await page.getByRole('button', { name: 'Apply Template' }).evaluate(button => {
+      ;(button as HTMLButtonElement).click()
+      ;(window as unknown as { __fixtureSetSession: (status: string, userId: string) => void }).__fixtureSetSession('loading', '')
+    })
+    await expect(page.locator('[data-resume-editor]')).toHaveCount(0)
+    await fixtureSession(page, 'authenticated')
+    const value = page.locator('#recovery-draft')
+    await expect(value).toBeVisible()
+    const draft = JSON.parse(await value.inputValue())
+    expect(draft.templateId).toBe('executive')
+    expect(draft.templateOptions).toEqual(expect.objectContaining({ fontFamily: 'sans', density: 'comfortable' }))
+    expect(state.writes.filter(write => write.path === '/api/resume/resume-1')).toEqual([])
+    const storage = await page.evaluate(() => [...Object.values(localStorage), ...Object.values(sessionStorage)].join('\n'))
+    expect(storage).not.toContain('Fixture Candidate')
+  } finally { state.releaseSave() }
+})
+
+test('section removal in the same task as auth loading is retained in the owner draft', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop resume sections')
+  const state = await install(page, { saveMode: 'hold-success' })
+  try {
+    await page.goto(`${origin}/?shell=1&page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    await expect(page.locator('[data-resume-editor]').getByText('Software engineer.', { exact: false }).first()).toBeVisible()
+    await page.locator('[data-resume-editor]').getByTitle('Remove section').first().evaluate(button => {
+      ;(button as HTMLButtonElement).click()
+      ;(window as unknown as { __fixtureSetSession: (status: string, userId: string) => void }).__fixtureSetSession('loading', '')
+    })
+    await expect(page.locator('[data-resume-editor]')).toHaveCount(0)
+    await fixtureSession(page, 'authenticated')
+    const value = page.locator('#recovery-draft')
+    await expect(value).toBeVisible()
+    const draft = JSON.parse(await value.inputValue())
+    expect(draft.sectionOrder).not.toContain('summary')
+    expect(draft.sectionOrder).toContain('experience')
+    expect(state.writes.filter(write => write.path === '/api/resume/resume-1')).toEqual([])
+    const storage = await page.evaluate(() => [...Object.values(localStorage), ...Object.values(sessionStorage)].join('\n'))
+    expect(storage).not.toContain('Fixture Candidate')
+  } finally { state.releaseSave() }
+})
+
+
+test('formatting text in the same task as auth loading preserves the formatted draft', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop formatting toolbar')
+  const state = await install(page, { saveMode: 'hold-success' })
+  try {
+    await page.goto(`${origin}/?shell=1&page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    await page.locator('[data-resume-editor]').getByText('Software engineer.', { exact: false }).first().click()
+    const input = page.locator('[data-resume-editor] textarea').first()
+    await expect(input).toHaveValue('Software engineer.')
+    await input.evaluate((element: HTMLTextAreaElement) => { element.focus(); element.setSelectionRange(0, 8) })
+    await page.getByRole('button', { name: 'Bold', exact: true }).evaluate(button => {
+      ;(button as HTMLButtonElement).click()
+      ;(window as unknown as { __fixtureSetSession: (status: string, userId: string) => void }).__fixtureSetSession('loading', '')
+    })
+    await expect(page.locator('[data-resume-editor]')).toHaveCount(0)
+    await fixtureSession(page, 'authenticated')
+    const draft = page.locator('#recovery-draft')
+    await expect(draft).toBeVisible()
+    expect(JSON.parse(await draft.inputValue()).content.summary).toBe('**Software** engineer.')
+    expect(state.writes.filter(write => write.path === '/api/resume/resume-1')).toEqual([])
+    const storage = await page.evaluate(() => [...Object.values(localStorage), ...Object.values(sessionStorage)].join('\n'))
+    expect(storage).not.toContain('**Software** engineer.')
+  } finally { state.releaseSave() }
+})
+
+
+test('version restore does not start when saving dirty edits fails', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop version restore')
+  const state = await install(page, { versions: true, saveMode: 'fail' })
+  await openDirtyShellResume(page)
+  await page.getByRole('button', { name: 'History', exact: true }).click()
+  await page.getByRole('button', { name: 'Restore', exact: true }).click()
+  await expect.poll(() => state.writes.filter(write => write.path === '/api/resume/resume-1').length).toBeGreaterThan(0)
+  await expect(page.getByText(/Save failed|保存失败/).first()).toBeVisible()
+  expect(state.writes.filter(write => write.path.endsWith('/versions'))).toEqual([])
+  await expect(page.locator('[data-resume-editor]').getByText('Edited fixture summary', { exact: false }).first()).toBeVisible()
+})
+
+test('editing while version restore is pending keeps the edit without overwriting server result', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop version restore')
+  const state = await install(page, { versions: true, holdVersionRestore: true, saveMode: 'hold-success' })
+  try {
+    await page.goto(`${origin}/?shell=1&page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    await expect(page.locator('[data-resume-editor]').getByText('Software engineer.', { exact: false }).first()).toBeVisible()
+    await page.getByRole('button', { name: 'History', exact: true }).click()
+    await page.getByRole('button', { name: 'Restore', exact: true }).click()
+    await expect.poll(() => state.writes.filter(write => write.path.endsWith('/versions')).length).toBe(1)
+    const modal = page.getByText('Version History', { exact: true }).locator('..').locator('..')
+    await modal.getByRole('button', { name: '✕', exact: true }).click()
+    await page.locator('[data-resume-editor]').getByText('Software engineer.', { exact: false }).first().click()
+    await page.locator('[data-resume-editor] textarea').first().fill('Local edit while restore is pending')
+    await page.waitForTimeout(2300)
+    expect(state.writes.filter(write => write.path === '/api/resume/resume-1')).toEqual([])
+    state.releaseVersionRestore()
+    await expect(page.getByText(/Copy them, then reload and review|请先复制/).first()).toBeVisible()
+    await expect(page.locator('[data-resume-editor] textarea').first()).toHaveValue('Local edit while restore is pending')
+    await page.waitForTimeout(2300)
+    expect(state.writes.filter(write => write.path === '/api/resume/resume-1')).toEqual([])
+    expect(state.resume.content.summary).toBe('Restored historical summary')
+  } finally { state.releaseVersionRestore(); state.releaseSave() }
+})
+
+
+test('version restore intent blocks sidebar navigation while the current edit saves', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop version restore')
+  const state = await install(page, { versions: true, holdVersionRestore: true, saveMode: 'hold-success' })
+  try {
+    await openDirtyShellResume(page)
+    await page.getByRole('button', { name: 'History', exact: true }).click()
+    await page.getByRole('button', { name: 'Restore', exact: true }).click()
+    await expect.poll(() => state.writes.filter(write => write.path === '/api/resume/resume-1').length).toBeGreaterThan(0)
+    const modal = page.getByText('Version History', { exact: true }).locator('..').locator('..')
+    await modal.getByRole('button', { name: '✕', exact: true }).click()
+    await page.locator('#desktop-sidebar').getByRole('button', { name: 'Discover', exact: true }).click()
+    await expect(page).toHaveURL(/page=resume/)
+    state.releaseSave()
+    await expect.poll(() => state.writes.filter(write => write.path.endsWith('/versions')).length).toBe(1)
+    await expect(page).toHaveURL(/page=resume/)
+    state.releaseVersionRestore()
+    await expect(page.locator('[data-resume-editor]').getByText('Restored historical summary', { exact: false }).first()).toBeVisible()
+    await expect(page).toHaveURL(/page=resume/)
+  } finally { state.releaseVersionRestore(); state.releaseSave() }
+})
+
+
+test('an uncertain version restore remains guarded against automatic save or retry', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop version restore')
+  const state = await install(page, { versions: true, versionRestoreFails: true, saveMode: 'hold-success' })
+  try {
+    await page.goto(`${origin}/?shell=1&page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    await expect(page.locator('[data-resume-editor]').getByText('Software engineer.', { exact: false }).first()).toBeVisible()
+    await page.getByRole('button', { name: 'History', exact: true }).click()
+    await page.getByRole('button', { name: 'Restore', exact: true }).click()
+    await expect.poll(() => state.writes.filter(write => write.path.endsWith('/versions')).length).toBe(1)
+    await expect(page.getByText(/Could not confirm the version was restored|无法确认版本是否已恢复/).first()).toBeVisible()
+    const modal = page.getByText('Version History', { exact: true }).locator('..').locator('..')
+    await modal.getByRole('button', { name: '✕', exact: true }).click()
+    await page.locator('[data-resume-editor]').getByText('Software engineer.', { exact: false }).first().click()
+    await page.locator('[data-resume-editor] textarea').first().fill('Local edit after uncertain restore')
+    await page.waitForTimeout(2300)
+    expect(state.writes.filter(write => write.path === '/api/resume/resume-1')).toEqual([])
+    await page.getByRole('button', { name: 'History', exact: true }).click()
+    await page.getByRole('button', { name: 'Restore', exact: true }).click()
+    await page.waitForTimeout(300)
+    expect(state.writes.filter(write => write.path.endsWith('/versions'))).toHaveLength(1)
+    await expect(page.locator('[data-resume-editor]').getByText('Local edit after uncertain restore', { exact: false }).first()).toBeVisible()
+  } finally { state.releaseSave() }
 })

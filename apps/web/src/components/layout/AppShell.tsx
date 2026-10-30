@@ -11,6 +11,8 @@ import { NavContext, type NavigationGuard } from '@/lib/nav-context'
 import { isApplicationNavigationEvent } from '@/lib/application-navigation'
 import { applicationHistoryIndex } from '@/lib/application-history-position'
 import { guardApplicationTraversal } from '@/lib/application-traversal-guard'
+import { createRecoveryDraftStore, type RecoveryDraft } from '@/lib/application-recovery-draft'
+import { ApplicationRecoveryView } from '@/components/jobs/application-recovery-view'
 import { useI18n } from '@/lib/i18n'
 import { OnboardingFlow } from '@/components/onboarding/OnboardingFlow'
 import { clearCachedApiResponses } from '@/lib/api-cache'
@@ -180,13 +182,17 @@ export function AppShell() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [timedOut, setTimedOut] = useState(false)
   const [jobCount, setJobCount] = useState(0)
-  const { data: session, status } = useSession()
+  const { data: session, status, update: updateSession } = useSession()
   const { t } = useI18n()
   const router = useRouter()
   const initialPageRef = useRef(page)
   const previousUserIdRef = useRef<string | null>(null)
   const PageComp = PAGES[page]
   const activeUserId = session?.user?.id ?? null
+  const activeUserRef = useRef<string | null>(null)
+  activeUserRef.current = status === 'authenticated' ? activeUserId : null
+  const shellMounted = useRef(true)
+  useEffect(() => { shellMounted.current = true; return () => { shellMounted.current = false } }, [])
 
   useEffect(() => {
     try { setSidebarCollapsed(window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === '1') } catch { /* ignore storage failures */ }
@@ -210,18 +216,31 @@ export function AppShell() {
   }, [])
 
   const navigationGuard = useRef<NavigationGuard | null>(null)
+  const recoveryStore = useRef(createRecoveryDraftStore())
+  const [, setRecoveryGeneration] = useState(0)
+  const publishRecoveryDraft = useCallback((userId: string, draft: RecoveryDraft | null) => {
+    if (draft && draft.userId === userId) recoveryStore.current.publish(draft)
+    else if (!draft) recoveryStore.current.clearActive(userId)
+  }, [])
   const navigationAttempt = useRef(0)
   const historyIndex = useRef<number | null>(null)
   const restoringHistory = useRef<{ origin: number; target: number; attempt: number; restored: boolean; saved: boolean; resolve: () => void; wait: Promise<void> } | null>(null)
   const registerNavigationGuard = useCallback((guard: NavigationGuard) => {
+    const owner = activeUserId
+    if (owner && guard.needsSave()) recoveryStore.current.reattach(owner)
     navigationGuard.current = guard
     return () => {
       if (navigationGuard.current === guard) {
         navigationGuard.current = null
         navigationAttempt.current += 1
+        if (owner) {
+          if (guard.needsSave()) recoveryStore.current.detach(owner)
+          else recoveryStore.current.clearActive(owner)
+          setRecoveryGeneration(value => value + 1)
+        }
       }
     }
-  }, [])
+  }, [activeUserId])
   const navigatePage = useCallback((nextPage: Page, mode: 'push' | 'replace' = 'push'): boolean | Promise<boolean> => {
     const attempt = ++navigationAttempt.current
     const finish = () => {
@@ -243,7 +262,24 @@ export function AppShell() {
       return !guard?.needsSave() && attempt === navigationAttempt.current ? finish() : false
     })().catch(() => false)
   }, [prefetchPage])
-  const navContextValue = useMemo(() => ({ navigate: navigatePage, registerNavigationGuard }), [navigatePage, registerNavigationGuard])
+  const prepareToLeave = useCallback(async () => {
+    const attempt = ++navigationAttempt.current
+    const guard = navigationGuard.current
+    const owner = activeUserId
+    try {
+      const saved = !guard?.needsSave() || (await guard.save() && !guard.needsSave())
+      if (!shellMounted.current || owner !== activeUserRef.current || attempt !== navigationAttempt.current) return false
+      if (saved && activeUserId) recoveryStore.current.clearActive(activeUserId)
+      return saved
+    } catch { return false }
+  }, [activeUserId])
+  const signOutSafely = useCallback(async () => {
+    if (!await prepareToLeave()) return false
+    if (recoveryStore.current.hasAny()) await signOut({ redirect: false })
+    else await signOut({ callbackUrl: '/login' })
+    return true
+  }, [prepareToLeave])
+  const navContextValue = useMemo(() => ({ navigate: navigatePage, registerNavigationGuard, prepareToLeave, signOutSafely, publishRecoveryDraft }), [navigatePage, registerNavigationGuard, prepareToLeave, signOutSafely, publishRecoveryDraft])
 
   useEffect(() => {
     if (status !== 'authenticated') { setCheckingOnboard(false); return }
@@ -341,6 +377,7 @@ export function AppShell() {
     const t = setTimeout(() => setTimedOut(true), 10000)
     return () => clearTimeout(t)
   }, [status])
+  useEffect(() => { if (status !== 'loading') setTimedOut(false) }, [status])
 
   // ── Auth sync: Dashboard ↔ Extension ────────────────────
 
@@ -478,13 +515,22 @@ export function AppShell() {
   }
 
   useEffect(() => {
-    if (status === 'unauthenticated' || timedOut) {
+    if ((status === 'unauthenticated' || timedOut) && !recoveryStore.current.hasAny()) {
       router.push('/login?callbackUrl=/')
     }
   }, [router, status, timedOut])
 
+  useEffect(() => {
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (recoveryStore.current.hasAny()) { event.preventDefault(); event.returnValue = '' }
+    }
+    window.addEventListener('beforeunload', onBeforeUnload)
+    return () => window.removeEventListener('beforeunload', onBeforeUnload)
+  }, [])
+
   // Redirect to login if unauthenticated or timed out
   if (status === 'unauthenticated' || timedOut) {
+    if (recoveryStore.current.hasAny()) return <ApplicationRecoveryView draft={null} onRefreshSession={() => { void updateSession().catch(() => undefined) }} />
     return null
   }
 
@@ -514,6 +560,12 @@ export function AppShell() {
       </div>
     )
   }
+
+  const recoveryDraft = status === 'authenticated' ? recoveryStore.current.getDetached(activeUserId) : null
+  if (recoveryDraft) return <ApplicationRecoveryView draft={recoveryDraft} onContinue={() => {
+    recoveryStore.current.discard(recoveryDraft.userId)
+    setRecoveryGeneration(value => value + 1)
+  }} />
 
   return (
     <>
@@ -581,7 +633,7 @@ export function AppShell() {
               <div className="mobile-more-menu" data-mobile-more-menu role="menu" aria-label={t('nav.moreNavigation')}>
                 {getMobileMoreItems(t('nav.signout'), t).map(item => (
                   <button key={item.id} role="menuitem" data-danger={item.id === 'signout'} onClick={() => {
-                    if (item.id === 'signout') void signOut({ callbackUrl: '/login' })
+                    if (item.id === 'signout') void signOutSafely()
                     else navigatePage(item.id)
                   }}>
                     {item.label}

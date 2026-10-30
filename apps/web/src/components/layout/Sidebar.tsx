@@ -7,6 +7,7 @@ import { ChevronDown, CreditCard, LogOut, MessageCircle, PanelLeftClose, PanelLe
 import type { Page } from '@/lib/types'
 import { UserAvatar } from '@/components/ui'
 import { useI18n } from '@/lib/i18n'
+import { useNav } from '@/lib/nav-context'
 
 interface SidebarProps {
   active:  Page
@@ -57,6 +58,7 @@ export function getSidebarNavItems(t: (key: string) => string): SidebarNavItem[]
 export function Sidebar({ active, onNav, onNavIntent, session, jobCount: jobCountProp, notificationControl, notificationPanel, accountMenuOpen = false, onAccountMenuToggle = () => {}, onDismissSidebarPopovers = () => {}, collapsed = false, onToggleCollapsed = () => {} }: SidebarProps) {
   const user = session?.user
   const { t } = useI18n()
+  const { signOutSafely } = useNav()
 
   const [gmailUnread, setGmailUnread] = useState<number | null>(null)
   const [jobCount,    setJobCount]    = useState<number | null>(null)
@@ -186,7 +188,7 @@ export function Sidebar({ active, onNav, onNavIntent, session, jobCount: jobCoun
             <AccountMenuItem icon={<CreditCard size={14} />} label={t('account.plan')} badge={planLabel} onClick={() => { window.location.assign('/?page=settings&tab=billing') }} />
             <AccountMenuItem icon={<Settings size={14} />} label={t('nav.settings')} onClick={() => { onNav('settings'); onDismissSidebarPopovers() }} />
             <div style={{ height: 1, background: 'var(--border)', margin: '5px 3px' }} />
-            <AccountMenuItem icon={<LogOut size={14} />} label={t('nav.signout')} danger onClick={() => signOut({ callbackUrl: '/login' })} />
+            <AccountMenuItem icon={<LogOut size={14} />} label={t('nav.signout')} danger onClick={() => { if (signOutSafely) void signOutSafely(); else void signOut({ callbackUrl: '/login' }) }} />
           </div>}
 
           {/* User row */}

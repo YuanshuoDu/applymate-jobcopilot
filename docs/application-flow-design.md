@@ -44,6 +44,11 @@ Agent 负责原任务的执行和审批，招聘消息负责查看回复。
 | 等待审核 | 在原任务查看本次内容；页面跳转不会代替授权 |
 | 提交结果待核实 | 查看记录和回执，保持结果未知，不自动重试 |
 
+如果登录状态变化时简历还有未保存的编辑，请保留当前标签页，按提示在新标签页
+登录原账号并刷新登录状态。恢复界面提供可复制的内存草稿；请先复制，再打开最新
+简历逐项核对，系统不会自动覆盖已保存版本。确认关闭或刷新当前页后草稿会消失。
+恢复历史版本会立即修改已保存的简历；若结果无法确认，先重新加载核对，不要重复恢复。
+
 首页和“申请管理 → 需要我处理”展示最近最多 100 个申请任务中的待处理事项，
 不能当作全部申请总数。每条可进入原申请或原任务；处理后刷新状态。
 招聘邮件没有可靠职位关联时，保留邮件本身，不猜测它属于哪个申请。
@@ -160,15 +165,22 @@ Resume waits for its current save chain before application-return and shell
 navigation, and keeps the editor open when saving fails. Switching resumes also
 waits for that chain. A browser refresh or close uses the browser’s unsaved-change
 prompt. Same-document history navigation is guarded where supported; the fallback
-can retain the editor without preserving forward history. Authentication loss or
-an account change may still unmount the editor, so this is not a guarantee across
-session changes.
+can retain the editor without preserving forward history. If authentication changes
+while editing, an account-bound draft remains in this page's memory. After the
+original account signs in again, the user can copy and compare it with the latest
+saved resume; it is never automatically written into an account. The browser asks
+before closing or refreshing a page holding a draft, but a confirmed close or reload
+removes that in-memory copy. Real authentication and cross-device recovery have not
+been verified by the mocked browser tests.
 
 If an audit correction and a new local edit overlap, automatic saving is paused.
 The user is asked to copy the local edits, reload and compare the latest saved
 content. There is no automatic merge or complete draft recovery for this conflict.
 Analysis waits for the resume refresh and binds cached results to the actual
 resume version; on refresh failure it identifies the cached version instead.
+Restoring a historical version is a server-side change: existing edits are saved
+first, and an uncertain result requires checking the latest saved resume before
+trying again. New edits made during restoration are retained for manual comparison.
 
 ## 7. Agent-assisted journey
 
