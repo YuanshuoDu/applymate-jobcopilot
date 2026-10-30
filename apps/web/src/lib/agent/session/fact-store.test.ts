@@ -172,6 +172,29 @@ describe("agent fact store", () => {
     expect(eventPayload.note).toBe("Call [REDACTED_PHONE] or [REDACTED_EMAIL]")
   })
 
+  it("persists the canonical root input UUID but redacts caller IDs in both event and outbox payloads", async () => {
+    const { db, tx } = mockDb()
+    const inputId = "12345678-1234-4abc-8abc-123456789012"
+    const clientMessageId = "request-415-555-0100"
+    const turnId = "23456789-2345-4bcd-9bcd-234567890123"
+    const acceptedInput = {
+      sessionId: "34567890-3456-4cde-acde-345678901234", turnId,
+      itemId: "45678901-4567-4def-8def-456789012345", taskId: null,
+      type: "input.accepted", actor: "user" as const, correlationId: turnId, causationId: null,
+      idempotencyKey: `agent-command:${clientMessageId}`, outboxTopic: "agent.session.event",
+      payload: { inputId, clientMessageId, delivery: "steer", source: "user", disposition: "steered" },
+    } satisfies Parameters<typeof appendAgentEventWithOutbox>[1]
+
+    await appendAgentEventWithOutbox(db, acceptedInput)
+
+    const eventPayload = tx.agentEvent.create.mock.calls[0]?.[0]?.data.payload
+    const outboxPayload = tx.agentOutbox.create.mock.calls[0]?.[0]?.data.payload as { payload?: unknown }
+    expect(eventPayload).toEqual({ inputId, clientMessageId: "request-[REDACTED_PHONE]", delivery: "steer", source: "user", disposition: "steered" })
+    expect(outboxPayload.payload).toEqual(eventPayload)
+    expect(JSON.stringify(eventPayload)).not.toContain(clientMessageId)
+    expect(JSON.stringify(outboxPayload.payload)).not.toContain(clientMessageId)
+  })
+
   it("persists the server-typed task interrupt references in its event and outbox payload", async () => {
     const { db, tx } = mockDb()
     const sessionId = "70463535-1444-4bba-ae3b-b80578d2dd0b"

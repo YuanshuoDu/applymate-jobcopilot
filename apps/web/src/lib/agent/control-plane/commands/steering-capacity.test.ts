@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto"
 import { resolve } from "node:path"
 import { describe, expect, it, vi } from "vitest"
+import { redactSensitiveText } from "@jobcopilot/shared"
 
 import { assertSteeringCapacity, MAX_UNRESOLVED_STEERING_INPUTS, readUnresolvedSteeringCount } from "./steering-capacity"
 import { lockOpenSession, type CommandTransaction } from "./transaction"
@@ -12,21 +13,26 @@ const scope = {
 }
 const timestamp = new Date("2026-10-09T00:00:00.000Z")
 
-function acceptedRow(index: number, state: "accepted" | "queued" | "consumed" = "accepted", consumer: string | null = null) {
-  const id = `steer-${index}`, clientMessageId = `client-${index}`, delivery = "steer", source = "user", disposition = "steered"
-  const acceptedSequence = BigInt(index + 2)
+function acceptedRow(index: number, state: "accepted" | "queued" | "consumed" = "accepted", consumer: string | null = null,
+  options: { delivery?: "steer" | "follow_up"; clientMessageId?: string; acceptedSequence?: bigint; disposition?: string } = {}) {
+  const id = `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`, clientMessageId = options.clientMessageId ?? `client-${index}`
+  const delivery = options.delivery ?? "steer", source = "user", disposition = options.disposition ?? (delivery === "follow_up" ? "started" : "steered")
+  const acceptedSequence = options.acceptedSequence ?? BigInt(index + 2), parts = [{ type: "text", text: "private steer text" }]
   return {
-    id, clientMessageId, delivery, status: state, acceptedSequence, consumedByStepId: consumer,
+    id, inputSessionId: scope.sessionId, inputTargetTurnId: scope.turnId, inputUserId: scope.userId, inputContent: parts,
+    clientMessageId, delivery, status: state, acceptedSequence, consumedByStepId: consumer,
     consumedAt: consumer ? timestamp : null, cancelledAt: null, acceptedType: "input.accepted", acceptedActor: "user",
-    acceptedTaskId: null, acceptedCorrelationId: scope.turnId, acceptedItemId: `${id}-item`, acceptedEventSequence: acceptedSequence,
-    acceptedPayload: { inputId: id, clientMessageId, delivery, source, disposition }, acceptedItemType: "user_message", acceptedItemTaskId: null,
-    acceptedItemStatus: "completed", acceptedItemContent: { parts: [{ type: "text", text: "private steer text" }], clientMessageId, source, disposition },
+    acceptedEventId: `event-${index}`, acceptedEventSessionId: scope.sessionId, acceptedEventTurnId: scope.turnId, acceptedEventTaskId: null,
+    acceptedEventCausationId: null, acceptedEventCorrelationId: scope.turnId, acceptedItemId: `item-${index}`, acceptedEventSequence: acceptedSequence,
+    acceptedPayload: { inputId: id, clientMessageId: redactSensitiveText(clientMessageId), delivery, source, disposition },
+    acceptedItemRowId: `item-${index}`, acceptedItemSessionId: scope.sessionId, acceptedItemTurnId: scope.turnId, acceptedItemStepId: null,
+    acceptedItemType: "user_message", acceptedItemTaskId: null, acceptedItemStatus: "completed",
+    acceptedItemContent: { parts, clientMessageId, source, disposition },
   }
 }
 
 function rootInput() {
-  return { id: "original", clientMessageId: "root-client", delivery: "follow_up", status: "accepted", acceptedSequence: BigInt(1),
-    consumedByStepId: null, consumedAt: null, cancelledAt: null }
+  return acceptedRow(900, "accepted", null, { delivery: "follow_up", clientMessageId: "root-client", acceptedSequence: BigInt(1) })
 }
 
 function queryData(query: unknown) {
@@ -278,13 +284,15 @@ async function invokeWorkerReader(fixture: ReturnType<typeof facts>): Promise<nu
             const a = BigInt(String(left.acceptedSequence)), b = BigInt(String(right.acceptedSequence))
             return a === b ? String(left.id).localeCompare(String(right.id)) : a < b ? -1 : 1
           }).slice(0, 64)
-          return { rows: rows.map(({ id, clientMessageId, delivery, status, acceptedSequence, consumedByStepId, consumedAt, cancelledAt }) =>
-            ({ id, clientMessageId, delivery, status, acceptedSequence, consumedByStepId, consumedAt, cancelledAt })) }
+          return { rows: rows.map(row => ({ id: row.id, clientMessageId: row.clientMessageId, content: row.inputContent,
+            delivery: row.delivery, status: row.status, acceptedSequence: row.acceptedSequence, consumedByStepId: row.consumedByStepId,
+            consumedAt: row.consumedAt, cancelledAt: row.cancelledAt })) }
         }
         if (sql.includes('LEFT JOIN "agent_events"')) {
           const acceptedIds = values?.[3] as string[] | undefined
-          return { rows: (fixture.inputs as Row[]).filter(row => acceptedIds?.includes(String(row.id))
-            && row.delivery === "steer" && ["accepted", "queued", "consumed"].includes(String(row.status))) }
+          return { rows: (fixture.inputs as Row[]).filter(row => acceptedIds?.includes(String(row.id))).map(row => ({
+            ...row, acceptedTaskId: row.acceptedEventTaskId, acceptedCorrelationId: row.acceptedEventCorrelationId,
+          })) }
         }
         if (sql.includes('SELECT item."revision"')) return { rows: [{ revision: 1 }] }
         if (sql.includes('FROM "agent_events" AS event WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."type" = $3')) {
@@ -384,6 +392,30 @@ describe("steer acceptance capacity", () => {
 
     const below = facts(MAX_UNRESOLVED_STEERING_INPUTS - 1)
     await expect(assertSteeringCapacity(below.tx, { sessionId: scope.sessionId, userId: scope.userId, turnId: scope.turnId })).resolves.toBeUndefined()
+  })
+
+  it("validates the redacted caller ID against its raw input and rejects ambiguous event lineage", async () => {
+    const projected = facts(1), input = projected.inputs[1]!, rawClientId = "request-415-555-0100"
+    input.clientMessageId = rawClientId
+    ;(input.acceptedPayload as Row).clientMessageId = redactSensitiveText(rawClientId)
+    ;(input.acceptedItemContent as Row).clientMessageId = rawClientId
+    await expect(readUnresolvedSteeringCount(projected.tx, { sessionId: scope.sessionId, userId: scope.userId, turnId: scope.turnId })).resolves.toBe(1)
+
+    const wrongProjection = facts(1)
+    ;(wrongProjection.inputs[1]!.acceptedPayload as Row).clientMessageId = rawClientId
+    await expect(readUnresolvedSteeringCount(wrongProjection.tx, { sessionId: scope.sessionId, userId: scope.userId, turnId: scope.turnId }))
+      .rejects.toMatchObject({ code: "invalid_command", status: 409 })
+
+    const missingEvent = facts(1)
+    delete missingEvent.inputs[1]!.acceptedEventId
+    await expect(readUnresolvedSteeringCount(missingEvent.tx, { sessionId: scope.sessionId, userId: scope.userId, turnId: scope.turnId }))
+      .rejects.toMatchObject({ code: "invalid_command", status: 409 })
+
+    const duplicateSequence = facts(3), duplicate = duplicateSequence.inputs[2]!
+    duplicate.acceptedSequence = duplicateSequence.inputs[1]!.acceptedSequence
+    duplicate.acceptedEventSequence = duplicate.acceptedSequence
+    await expect(readUnresolvedSteeringCount(duplicateSequence.tx, { sessionId: scope.sessionId, userId: scope.userId, turnId: scope.turnId }))
+      .rejects.toMatchObject({ code: "invalid_command", status: 409 })
   })
 
   it("preserves v1 capacity reclamation for a complete validated receipt and agrees with the Worker reader", async () => {
@@ -494,7 +526,7 @@ describe("steer acceptance capacity", () => {
     const receipt = fixture.receiptEvents[0]!
     const unconsumed = fixture.inputs[2]!
     const through = String(unconsumed.acceptedSequence)
-    receipt.payload = { ...receipt.payload, steerInputIds: ["steer-0", "steer-1"], inputCheckpoint: { throughSequence: through } }
+    receipt.payload = { ...receipt.payload, steerInputIds: [fixture.inputs[1]!.id, unconsumed.id], inputCheckpoint: { throughSequence: through } }
     fixture.decisionStep.inputThroughSequence = unconsumed.acceptedSequence
     await expect(readUnresolvedSteeringCount(fixture.tx, { sessionId: scope.sessionId, userId: scope.userId, turnId: scope.turnId }))
       .rejects.toMatchObject({ code: "invalid_command", status: 409 })
