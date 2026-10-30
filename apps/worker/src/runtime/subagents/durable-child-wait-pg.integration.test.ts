@@ -995,11 +995,9 @@ async function expectCompletedSourceWaitLifecycle(pool: Pool, ids: FixtureIds): 
   expect(events.rows[4]).toMatchObject({ itemId: resultItemId, correlationId: stepId, causationId: events.rows[3]!.id })
   expect(events.rows[5]).toMatchObject({ itemId: resultItemId, correlationId: resultItemId, causationId: events.rows[4]!.id })
   const completedInput = asObject(asObject(events.rows[2]?.payload).content)
-  const ordinarySafeCall = asObject(safeSubagentWaitJson(callContent, 1_024))
-  const ordinarySafeInput = asObject(ordinarySafeCall.input)
   expect(asObject(completedInput.input)).toMatchObject({
-    idempotencyKey: ordinarySafeInput.idempotencyKey,
-    taskIds: ordinarySafeInput.taskIds,
+    idempotencyKey: "[REDACTED]",
+    taskIds: ["[REDACTED]"],
   })
   expect(asObject(completedInput.input).idempotencyKey).toBe("[REDACTED]")
   expect(asObject(completedInput.input).taskIds).not.toEqual([FIXED_WAIT_TARGET_TASK_ID])
@@ -1968,7 +1966,57 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(reentryLease.rows[0]?.attemptCount).toBe(acknowledged!.attemptCount)
       const reenteredSourceLifecycle = await readSourceWaitLifecycle(pool, ids)
       expectReconciledSourceWait(reenteredSourceLifecycle, ids, acknowledgedOwner)
-      expect(reenteredSourceLifecycle).toEqual(committedSourceLifecycle)
+      // eventSequence is session-wide. The continuation model/claim advances it while
+      // the source wait's own rows and outboxes must remain byte-for-byte unchanged.
+      const firstNewSequence = BigInt(committedSourceLifecycle.eventSequence!)
+      const latestSequence = BigInt(reenteredSourceLifecycle.eventSequence!)
+      expect(latestSequence - firstNewSequence).toBe(7n)
+      const resumedEvents = await pool.query<{ id: string; sequence: string; type: string; itemId: string | null;
+        correlationId: string; causationId: string | null; idempotencyKey: string }>(
+        `SELECT "id", "sequence"::text AS "sequence", "type", "itemId", "correlationId", "causationId", "idempotencyKey"
+         FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+           AND "sequence" > $4::bigint AND "sequence" <= $5::bigint ORDER BY "sequence"`,
+        [ids.sessionId, ids.turnId, waiter.id, firstNewSequence.toString(), latestSequence.toString()],
+      )
+      const continuationItemId = `task:${waiter.id}:item:tool-call:${orphanCallId}:attempt:${acknowledged!.sourceAttempt}`
+      const resumedTypes = ["step.started", "cognitive.agenda", "model.started", "model.completed", "model.usage", "item.started", "tool_call.started"]
+      expect(resumedEvents.rows.map(event => event.type)).toEqual(resumedTypes)
+      expect(resumedEvents.rows.map(event => BigInt(event.sequence))).toEqual(
+        resumedTypes.map((_type, index) => firstNewSequence + BigInt(index + 1)),
+      )
+      expect(resumedEvents.rows.map(({ type, itemId, correlationId, idempotencyKey }) => ({ type, itemId, correlationId, idempotencyKey }))).toEqual([
+        { type: "step.started", itemId: null, correlationId: acknowledged!.continuationStepId,
+          idempotencyKey: `task:${waiter.id}:event:step-started:${acknowledged!.continuationStepId}` },
+        { type: "cognitive.agenda", itemId: null, correlationId: acknowledged!.continuationStepId,
+          idempotencyKey: `task:${waiter.id}:event:cognitive.agenda:${acknowledged!.continuationStepId}` },
+        { type: "model.started", itemId: null, correlationId: acknowledged!.continuationStepId,
+          idempotencyKey: `task:${waiter.id}:event:model-started:${acknowledged!.continuationStepId}` },
+        { type: "model.completed", itemId: null, correlationId: acknowledged!.continuationStepId,
+          idempotencyKey: `task:${waiter.id}:event:model-completed:${acknowledged!.continuationStepId}` },
+        { type: "model.usage", itemId: null, correlationId: acknowledged!.continuationStepId,
+          idempotencyKey: `task:${waiter.id}:event:model-usage:${acknowledged!.continuationStepId}` },
+        { type: "item.started", itemId: continuationItemId, correlationId: acknowledged!.continuationStepId,
+          idempotencyKey: `task:${waiter.id}:event:item-started:${continuationItemId}` },
+        { type: "tool_call.started", itemId: continuationItemId, correlationId: orphanCallId,
+          idempotencyKey: `task:${waiter.id}:event:child-wait-claim:${acknowledged!.sourceAttempt}:${acknowledged!.continuationStepId}` },
+      ])
+      const turnStarted = await pool.query<{ id: string; sequence: string }>(
+        `SELECT "id", "sequence"::text AS "sequence" FROM "agent_events"
+         WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "type" = 'task.started'
+           AND "itemId" IS NULL AND "correlationId" = $2 AND "idempotencyKey" = $4`,
+        [ids.sessionId, ids.turnId, waiter.id, `task:${waiter.id}:event:turn-started`],
+      )
+      expect(turnStarted.rows).toHaveLength(1)
+      expect(BigInt(turnStarted.rows[0]!.sequence)).toBeLessThan(BigInt(resumedEvents.rows[0]!.sequence))
+      expect(resumedEvents.rows[0]?.causationId).toBe(turnStarted.rows[0]!.id)
+      for (let index = 1; index < resumedEvents.rows.length; index += 1) {
+        expect(resumedEvents.rows[index]?.causationId).toBe(resumedEvents.rows[index - 1]?.id)
+      }
+      expect({ wait: reenteredSourceLifecycle.wait, call: reenteredSourceLifecycle.call,
+        results: reenteredSourceLifecycle.results, events: reenteredSourceLifecycle.events,
+        outboxes: reenteredSourceLifecycle.outboxes }).toEqual({ wait: committedSourceLifecycle.wait,
+        call: committedSourceLifecycle.call, results: committedSourceLifecycle.results,
+        events: committedSourceLifecycle.events, outboxes: committedSourceLifecycle.outboxes })
       let replacedOwnerWriteAccepted = false
       try {
         replacedOwnerWriteAccepted = await commitDurableSubagentWaitResume(pool, staleOwnerLease, {
@@ -2198,7 +2246,12 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(sourceResultItems.rows).toHaveLength(1)
       const finalSourceLifecycle = await readSourceWaitLifecycle(pool, ids)
       expectReconciledSourceWait(finalSourceLifecycle, ids, acknowledgedOwner)
-      expect(finalSourceLifecycle).toEqual(committedSourceLifecycle)
+      expect(BigInt(finalSourceLifecycle.eventSequence!)).toBeGreaterThan(BigInt(reenteredSourceLifecycle.eventSequence!))
+      expect({ wait: finalSourceLifecycle.wait, call: finalSourceLifecycle.call,
+        results: finalSourceLifecycle.results, events: finalSourceLifecycle.events,
+        outboxes: finalSourceLifecycle.outboxes }).toEqual({ wait: committedSourceLifecycle.wait,
+        call: committedSourceLifecycle.call, results: committedSourceLifecycle.results,
+        events: committedSourceLifecycle.events, outboxes: committedSourceLifecycle.outboxes })
       const recoveredClaimState = await readWaitClaimState(pool, ids, acknowledged!.continuationStepId, orphanCallId, acknowledged!.sourceAttempt)
       expect(recoveredClaimState.callCount).toBe(1)
       expect(recoveredClaimState.claimCount).toBe(1)
@@ -2469,7 +2522,11 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(finished.rows[0]).toMatchObject({ status: "completed", attemptCount: 1, leaseOwner: null })
       const finalSource = await readSourceWaitLifecycle(pool, ids)
       expectReconciledSourceWait(finalSource, ids)
-      expect(finalSource).toEqual(repairedLifecycle)
+      expect(BigInt(finalSource.eventSequence!)).toBeGreaterThan(BigInt(repairedLifecycle.eventSequence!))
+      expect({ wait: finalSource.wait, call: finalSource.call, results: finalSource.results,
+        events: finalSource.events, outboxes: finalSource.outboxes }).toEqual({ wait: repairedLifecycle.wait,
+        call: repairedLifecycle.call, results: repairedLifecycle.results, events: repairedLifecycle.events,
+        outboxes: repairedLifecycle.outboxes })
       const finalClaim = await readWaitClaimState(pool, ids, legacy.continuationStepId, legacy.callId, 1)
       expect(finalClaim).toMatchObject({ callCount: 1, claimCount: 1, itemStartedCount: 1, resultCount: 1, claimOutboxCount: 1 })
       const loopSummary = workerD.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_LOOP_RESUMED "))
@@ -2582,11 +2639,21 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       if (!sourceOnlyLine) throw new Error("synthetic source-only marker missing")
       const sourceOnly = JSON.parse(sourceOnlyLine.slice("WORKER_B_LEGACY_CONSUMED_SOURCE_ONLY ".length)) as {
         waitId: string; sourceStepId: string; sourceAttempt: number; continuationStepId: string;
-        continuationOrdinal: number; attemptCount: number; sourceLifecycleRepaired: boolean; continuationCallCreated: boolean
+        requestedOrdinal: number; continuationOrdinal: number; attemptCount: number;
+        sourceLifecycleRepaired: boolean; continuationCallCreated: boolean
       }
       expect(sourceOnly).toMatchObject({ waitId: preRepair.wait?.id, sourceStepId: `task:${ids.waiterTaskId}:step:0:attempt:1`,
         sourceAttempt: 1, continuationStepId: `task:${ids.waiterTaskId}:step:1:attempt:1`, attemptCount: 1,
         sourceLifecycleRepaired: false, continuationCallCreated: false })
+      expect(sourceOnly.continuationOrdinal).toBe(sourceOnly.requestedOrdinal)
+      const persistedContinuation = await pool.query<{ id: string; ordinal: number | string; attempt: number; status: string }>(
+        `SELECT "id", "ordinal", "attempt", "status" FROM "agent_steps"
+         WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 AND "attempt" = $5`,
+        [sourceOnly.continuationStepId, ids.sessionId, ids.turnId, ids.waiterTaskId, sourceOnly.sourceAttempt],
+      )
+      expect(persistedContinuation.rows).toHaveLength(1)
+      expect(Number(persistedContinuation.rows[0]!.ordinal)).toBe(sourceOnly.requestedOrdinal)
+      expect(persistedContinuation.rows[0]).toMatchObject({ id: sourceOnly.continuationStepId, attempt: sourceOnly.sourceAttempt, status: "streaming" })
       const oldLeaseRecord = await taskStore.get(ids.waiterTaskId, ids.sessionId)
       if (!oldLeaseRecord?.leaseOwner || !(oldLeaseRecord.leaseExpiresAt instanceof Date)) throw new Error("attempt-1 lease snapshot unavailable")
       const staleAttemptLease: SubagentLease = { ...oldLeaseRecord, ownerId: oldLeaseRecord.leaseOwner,
@@ -2634,7 +2701,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(resumed?.resume).toMatchObject({ stepCount: 2, toolCallCount: 1 })
       const sourceObservation = resumed?.observations.find(block => asObject(block.content).toolCallId === PHONE_SHAPED_WAIT_TOOL_CALL_ID)
       expect(asObject(sourceObservation?.content)).toMatchObject({ toolCallId: PHONE_SHAPED_WAIT_TOOL_CALL_ID,
-        toolName: "wait_subagents", status: "completed", input: { idempotencyKey: "[REDACTED]" },
+        toolName: "wait_subagents", status: "completed", input: { idempotencyKey: "api_key=[REDACTED]" },
         output: { waitId: sourceOnly.waitId, taskIds: [FIXED_WAIT_TARGET_TASK_ID] } })
       expect(await repairConsumedChildWaitSources(pool, currentLease, new Date())).toBe(0)
       const repaired = await readSourceWaitLifecycle(pool, ids)

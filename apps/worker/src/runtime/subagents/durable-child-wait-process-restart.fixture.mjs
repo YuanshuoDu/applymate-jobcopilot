@@ -322,8 +322,9 @@ async function seedLegacyConsumedWait(lease, stopBeforeModel = false) {
     throw new Error("fixture_legacy_consumed_wait_seed_missing")
   }
   const owner = executionOwnerFence({ kind: "task", lease })
-  const stepId = `task:${lease.id}:step:${restored.resume.nextOrdinal}:attempt:${lease.attemptCount}`
-  const continuation = await turnStore.startStep({ owner, stepId, ordinal: restored.resume.nextOrdinal, attempt: lease.attemptCount,
+  const requestedOrdinal = restored.resume.nextOrdinal
+  const stepId = `task:${lease.id}:step:${requestedOrdinal}:attempt:${lease.attemptCount}`
+  const continuation = await turnStore.startStep({ owner, stepId, ordinal: requestedOrdinal, attempt: lease.attemptCount,
     inputThroughSequence: restored.resume.inputThroughSequence, consumedInputIds: restored.resume.consumedInputIds,
     modelProfileSnapshot: loopFixtureModelProfile, now })
   const client = await pool.connect()
@@ -348,10 +349,19 @@ async function seedLegacyConsumedWait(lease, stopBeforeModel = false) {
     await client.query("ROLLBACK").catch(() => undefined)
     throw error
   } finally { client.release() }
-  if (continuation.id !== stepId || continuation.status !== "streaming") throw new Error("fixture_legacy_ack_step_identity_invalid")
+  const persistedContinuation = await pool.query(`SELECT "id", "ordinal", "attempt", "status" FROM "agent_steps"
+    WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 AND "attempt" = $5`,
+  [stepId, lease.sessionId, lease.turnId, lease.id, lease.attemptCount])
+  if (continuation.id !== stepId || persistedContinuation.rowCount !== 1
+    || persistedContinuation.rows[0]?.id !== stepId || continuation.ordinal !== requestedOrdinal
+    || Number(persistedContinuation.rows[0]?.ordinal) !== requestedOrdinal
+    || Number(persistedContinuation.rows[0]?.ordinal) !== continuation.ordinal
+    || Number(persistedContinuation.rows[0]?.attempt) !== lease.attemptCount || persistedContinuation.rows[0]?.status !== "streaming") {
+    throw new Error("fixture_legacy_ack_step_identity_invalid")
+  }
   if (stopBeforeModel) {
     say(`WORKER_B_LEGACY_CONSUMED_SOURCE_ONLY ${JSON.stringify({ waitId: wait.waitId, sourceStepId: wait.stepId,
-      sourceAttempt: wait.attempt, continuationStepId: continuation.id, continuationOrdinal: continuation.ordinal,
+      sourceAttempt: wait.attempt, continuationStepId: continuation.id, requestedOrdinal, continuationOrdinal: continuation.ordinal,
       attemptCount: lease.attemptCount, sourceLifecycleRepaired: false, continuationCallCreated: false })}`)
     return new Promise(() => {})
   }
