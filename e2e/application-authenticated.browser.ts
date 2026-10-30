@@ -32,6 +32,9 @@ test('real credentials carry a synthetic application through manual recording', 
   const page = await first.newPage()
   const requests: string[] = []
   const jobReads: { path: string; status: number }[] = []
+  const browserErrors: string[] = []
+  page.on('pageerror', error => browserErrors.push(error.message))
+  page.on('console', message => { if (message.type() === 'error') browserErrors.push(message.text()) })
   page.on('request', request => requests.push(`${request.method()} ${new URL(request.url()).pathname}`))
   page.on('response', response => {
     const url = new URL(response.url())
@@ -124,9 +127,15 @@ test('real credentials carry a synthetic application through manual recording', 
     await expect(drawer).toContainText(fixture.title)
     await assertManualState(job.id, syntheticResume.id, 'saved')
 
-    const download = page.waitForEvent('download')
-    await drawer.getByRole('button', { name: /Download application materials|下载申请材料/ }).click()
-    const file = await download
+    let file
+    try {
+      const download = page.waitForEvent('download', { timeout: 30_000 })
+      await drawer.getByRole('button', { name: /Download application materials|下载申请材料/ }).click()
+      file = await download
+    } catch (error) {
+      console.error('Fixture download diagnostics:', JSON.stringify({ browserErrors, text: await page.locator('body').innerText() }))
+      throw error
+    }
     const archivePath = await file.path()
     if (!archivePath) throw new Error('Browser did not provide the ZIP file')
     const requireWeb = createRequire(path.resolve('apps/web/package.json'))
