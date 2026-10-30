@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto"
 import { spawn, type ChildProcess } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { Queue } from "bullmq"
-import { Pool } from "pg"
+import { Pool, type PoolClient } from "pg"
 import { Redis } from "ioredis"
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 import { AgentTreeManager } from "./manager.js"
@@ -100,6 +100,14 @@ type WorkerProcess = ChildProcess & {
 }
 const WORKER_RESULT_STATUSES = ["completed", "failed", "interrupted", "lease_lost", "retrying", "skipped", "waiting", "waiting_for_user"] as const
 type WorkerResultStatus = typeof WORKER_RESULT_STATUSES[number]
+const WORKER_FAILURE_REASON_CATEGORIES = [
+  "wait_checkpoint_invalid", "wait_scope_error", "wait_invalid", "wait_conflict",
+  "child_resume_wait_tool_call_conflict", "child_resume_wait_step_lineage", "child_resume_wait_lineage",
+  "child_resume_wait_owner_mismatch", "child_resume_wait_commit_unavailable", "child_resume_wait_commit_pending",
+  "unsettled_external_call_rejected", "durable_wait_graph_blocked", "task_graph_transition_blocked",
+  "turn_execution_failed", "fixture_source_wait_call_receipt_invalid", "missing", "other",
+] as const
+type WorkerFailureReasonCategory = typeof WORKER_FAILURE_REASON_CATEGORIES[number]
 const DIAGNOSTIC_TASK_STATUSES = new Set(["queued", "running", "waiting", "waiting_for_user", "retrying",
   "completed", "failed", "interrupted", "cancelled", "closed"])
 type RestoredWaitObservationSummary = {
@@ -164,6 +172,25 @@ function workerResultStatus(child: WorkerProcess, marker: "WORKER_A_WAITING"): W
   } catch { return null }
 }
 
+function workerFailureReasonCategory(child: WorkerProcess, marker: "WORKER_A_WAITING"): WorkerFailureReasonCategory | null {
+  const prefix = `${marker} `
+  const line = child.stdoutText.split(/\r?\n/).find(value => value.startsWith(prefix))
+  if (!line) return null
+  try {
+    const envelope = asObject(JSON.parse(line.slice(prefix.length)) as unknown)
+    const result = asObject(envelope.result)
+    const category = result.failureReasonCategory
+    return typeof category === "string" && WORKER_FAILURE_REASON_CATEGORIES.includes(category as WorkerFailureReasonCategory)
+      ? category as WorkerFailureReasonCategory : null
+  } catch { return null }
+}
+
+function workerFailureDiagnostic(child: WorkerProcess): string {
+  const status = workerResultStatus(child, "WORKER_A_WAITING")
+  return JSON.stringify({ status, failureReasonCategory: status === "failed"
+    ? workerFailureReasonCategory(child, "WORKER_A_WAITING") : null })
+}
+
 function diagnosticTaskStatus(value: unknown): string | null {
   if (typeof value !== "string") return null
   return DIAGNOSTIC_TASK_STATUSES.has(value) ? value : "other"
@@ -202,6 +229,64 @@ function boundedRecoveryTrace(child: WorkerProcess): Record<string, unknown> | n
     waitRegistrationRejected: typeof trace.waitRegistrationRejected === "boolean" ? trace.waitRegistrationRejected : null,
     blockingExternalCall: typeof trace.blockingExternalCall === "boolean" ? trace.blockingExternalCall : null,
     dispatch: flags,
+  }
+}
+
+async function diagnoseWorkerFBlocker(
+  pool: Pool, ids: FixtureIds, continuationStepId: string, sourceCallId: string, claimCallId: string,
+): Promise<Record<string, unknown>> {
+  let client: PoolClient | undefined
+  let transactionStarted = false
+  try {
+    client = await pool.connect()
+    await client.query("BEGIN ISOLATION LEVEL READ COMMITTED")
+    transactionStarted = true
+    await client.query("SELECT set_config('app.user_id', $1, true)", [ids.userId])
+    const taskResult = await client.query<{ status: string; attemptCount: number; leaseOwner: string | null;
+      leaseExpiresAt: Date | null; userId: string }>(
+      `SELECT task."status", task."attemptCount", task."leaseOwner", task."leaseExpiresAt", session."userId"
+       FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+       WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4`,
+      [ids.waiterTaskId, ids.sessionId, ids.turnId, ids.rootTaskId],
+    )
+    const row = taskResult.rows[0]
+    if (!row || !row.leaseOwner || !(row.leaseExpiresAt instanceof Date)) {
+      return { snapshot: "post_recovery_attempt_read_committed", taskRowCount: taskResult.rows.length,
+        taskStatus: row ? diagnosticTaskStatus(row.status) : null, predicateProbe: "unavailable" }
+    }
+    const task: BlockingTaskSnapshot = { id: ids.waiterTaskId, userId: row.userId, sessionId: ids.sessionId,
+      turnId: ids.turnId, rootTaskId: ids.rootTaskId, leaseOwner: row.leaseOwner,
+      attemptCount: row.attemptCount, leaseExpiresAt: row.leaseExpiresAt }
+    const blocker = await hasBlockingExternalCall(client, task as unknown as Record<string, unknown>, undefined, continuationStepId)
+    const starts = await client.query<{ id: string; type: string; correlationId: string }>(
+      `SELECT "id", "type", "correlationId" FROM "agent_events"
+       WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+         AND "type" IN ('tool_call.started', 'model.started')
+         AND ("correlationId" = $4 OR "correlationId" = $5 OR "correlationId" = $6)
+       ORDER BY "sequence" DESC LIMIT 16`,
+      [ids.sessionId, ids.turnId, ids.waiterTaskId, sourceCallId, claimCallId, continuationStepId],
+    )
+    const classified = []
+    for (const start of starts.rows) {
+      const blockedWhenOmitted = await hasBlockingExternalCall(client,
+        task as unknown as Record<string, unknown>, start.id, continuationStepId)
+      const lane = start.correlationId === sourceCallId ? "source_wait"
+        : start.correlationId === claimCallId ? "continuation_claim"
+          : start.correlationId === continuationStepId ? "continuation_model" : "other"
+      classified.push({ lane, kind: start.type === "tool_call.started" ? "tool_call" : "model_call",
+        blockedWhenOmitted })
+    }
+    return { snapshot: "post_recovery_attempt_read_committed", taskRowCount: taskResult.rows.length,
+      taskStatus: diagnosticTaskStatus(row.status), attemptCount: row.attemptCount,
+      leaseOwnerPresent: true, leaseExpired: row.leaseExpiresAt.getTime() <= Date.now(),
+      blocker, examinedStartCount: starts.rows.length, starts: classified }
+  } catch {
+    return { snapshot: "post_recovery_attempt_read_committed", predicateProbe: "unavailable" }
+  } finally {
+    if (client) {
+      if (transactionStarted) await client.query("ROLLBACK").catch(() => undefined)
+      client.release()
+    }
   }
 }
 
@@ -2216,9 +2301,12 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         ? workerFWaiter.status === "queued" ? null : "waiter_reclaimed_with_nonqueued_status"
         : typeof workerFTrace?.rejectionStage === "string" ? workerFTrace.rejectionStage
           : workerFRecovery.rows ? "waiter_not_in_reclaimed_rows" : "reclaimed_rows_missing_or_unparseable"
+      const workerFBlockerDiagnostic = workerFWaiter?.status === "queued" ? null
+        : await diagnoseWorkerFBlocker(pool, ids, acknowledged!.continuationStepId, PHONE_SHAPED_WAIT_TOOL_CALL_ID, orphanCallId)
       expect(workerFWaiter?.status, `WorkerF did not reclaim the waiter: ${JSON.stringify({
         targetReclaimed: Boolean(workerFWaiter), targetStatus: workerFWaiter?.status ?? null,
         reason: workerFRecoveryReason, reclaimedRowCount: workerFRecovery.rows?.length ?? null, trace: workerFTrace,
+        blockerDiagnostic: workerFBlockerDiagnostic,
       })}`).toBe("queued")
       const resultCutDispatch = await pool.query<{ taskStatus: string; attemptCount: number; leaseOwner: string | null }>(
         `SELECT task."status" AS "taskStatus", task."attemptCount", task."leaseOwner" FROM "sub_agent_tasks" AS task
@@ -2628,7 +2716,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         orphanCallId: string | null; claimCallId: string | null; repeatedRepairCount: number; executorCalls: number; dispatcherCalls: number
       }
       expect(repaired).toMatchObject({ waitId: legacy.waitId, sourceStepId: legacy.sourceStepId, sourceAttempt: 1,
-        currentAttempt: 1, continuationStepId: legacy.continuationStepId, orphanCallId: legacy.callId, claimCallId: null,
+        currentAttempt: 1, continuationStepId: legacy.continuationStepId, orphanCallId: null, claimCallId: legacy.callId,
         repeatedRepairCount: 0, executorCalls: 0, dispatcherCalls: 0 })
       const repairedLifecycle = await readSourceWaitLifecycle(pool, ids)
       expectReconciledSourceWait(repairedLifecycle, ids)
@@ -2931,7 +3019,8 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       await waitForMarker(workerA, "WORKER_A_READY")
       await expect(dispatchPendingSubagentOutbox(pool as never, queue, 50, ids.sessionId)).resolves.toBe(1)
       await waitForMarker(workerA, "WORKER_A_WAITING")
-      expect(workerResultStatus(workerA, "WORKER_A_WAITING")).toBe("waiting")
+      expect(workerResultStatus(workerA, "WORKER_A_WAITING"),
+        `WorkerA result was not waiting: ${workerFailureDiagnostic(workerA)}`).toBe("waiting")
       await expectCompletedSourceWaitLifecycle(pool, ids)
       const sourceExit = await workerA.exited
       expect(sourceExit.code).toBe(0)
@@ -3070,7 +3159,8 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       await waitForMarker(workerA, "WORKER_A_READY")
       await expect(dispatchPendingSubagentOutbox(pool as never, queue, 50, ids.sessionId)).resolves.toBe(1)
       await waitForMarker(workerA, "WORKER_A_WAITING")
-      expect(workerResultStatus(workerA, "WORKER_A_WAITING")).toBe("waiting")
+      expect(workerResultStatus(workerA, "WORKER_A_WAITING"),
+        `WorkerA result was not waiting: ${workerFailureDiagnostic(workerA)}`).toBe("waiting")
       await expectCompletedSourceWaitLifecycle(pool, ids)
       const sourceExit = await workerA.exited
       expect(sourceExit.code).toBe(0)

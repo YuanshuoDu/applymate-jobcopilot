@@ -30,6 +30,13 @@ const [, , mode, queueName, rawIds] = process.argv
 const ids = JSON.parse(rawIds)
 const phoneShapedToolCallId = "child-wait-call:415-555-0134"
 const workerResultStatuses = new Set(["completed", "failed", "interrupted", "lease_lost", "retrying", "skipped", "waiting", "waiting_for_user"])
+const workerFailureReasonCategories = new Set([
+  "wait_checkpoint_invalid", "wait_scope_error", "wait_invalid", "wait_conflict",
+  "child_resume_wait_tool_call_conflict", "child_resume_wait_step_lineage", "child_resume_wait_lineage",
+  "child_resume_wait_owner_mismatch", "child_resume_wait_commit_unavailable", "child_resume_wait_commit_pending",
+  "unsettled_external_call_rejected", "durable_wait_graph_blocked", "task_graph_transition_blocked",
+  "turn_execution_failed", "fixture_source_wait_call_receipt_invalid",
+])
 const highPrecisionWaitModelCostUsd = 0.123456789
 const loopFixtureModelProfile = Object.freeze({ provider: "fixture", model: "durable-child-wait-fixture", nativeTools: true,
   structuredOutput: true, streaming: true, continuationCursor: false, supportsParallelTools: true, supportsStreamingToolArgs: true,
@@ -1013,8 +1020,13 @@ worker.on("completed", (job, result) => {
       return
     }
     const marker = mode === "worker-a" ? "WORKER_A_WAITING" : "WORKER_B_RESUMED"
+    const markerResult = { status: workerResultStatuses.has(result?.status) ? result.status : "invalid" }
+    if (markerResult.status === "failed") {
+      markerResult.failureReasonCategory = typeof result?.failureReason !== "string" ? "missing"
+        : workerFailureReasonCategories.has(result.failureReason) ? result.failureReason : "other"
+    }
     const markerPayload = mode === "worker-a"
-      ? { result: { status: workerResultStatuses.has(result?.status) ? result.status : "invalid" } }
+      ? { result: markerResult }
       : { result, taskId: ids.waiterTaskId, dispatchGeneration }
     say(`${marker} ${JSON.stringify(markerPayload)}`)
     await stop(0)
