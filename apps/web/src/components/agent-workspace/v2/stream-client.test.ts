@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from 'vitest'
 import { createTimelineState, selectTimelineItems, timelineReducer, type TimelineAction, type TimelineState } from './timeline-reducer'
 import { hydrateTimeline, streamAgentTimeline } from './stream-client'
 import { redactStreamEventPayload } from '../../../lib/agent/session/stream-redaction'
+import { TASK_GRAPH_SOURCES_SCHEMA_VERSION } from '../../../lib/agent/session/final-task-graph-source-manifest'
+import { canonicalTaskGraphSourceKey } from '../../../lib/agent/session/final-task-graph-source-detail'
 
 function item(id: string, revision = 0) {
   return {
@@ -480,6 +482,28 @@ describe('V2 timeline stream client', () => {
     expect(live.state.itemsById[FINAL_ITEM_ID]).toMatchObject({ type: 'agent_message', status: 'completed', source: 'durable' })
     expect(live.state.itemsById[FINAL_ITEM_ID]?.content).not.toHaveProperty('text')
     expect(live.state.itemsById[FINAL_ITEM_ID]?.content).not.toHaveProperty('summary')
+  })
+
+  it('retains only source manifests with keys bound to the hydrated final item', async () => {
+    const source = { sourceKey: canonicalTaskGraphSourceKey(FINAL_ITEM_ID, 3, 0), nodeIndex: 0, role: 'scout', taskStatus: 'completed', resultState: 'missing' }
+    const manifest = { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION, graphRevision: 3, sources: [source] }
+    const wrongKey = { ...manifest, sources: [{ ...source, sourceKey: `src_${'A'.repeat(43)}` }] }
+    const wrongFinalItemKey = { ...manifest, sources: [{ ...source, sourceKey: canonicalTaskGraphSourceKey('other-final-item', 3, 0) }] }
+    for (const [sidecar, expected] of [[manifest, manifest], [wrongKey, undefined], [wrongFinalItemKey, undefined],
+      [{ ...manifest, taskId: 'PRIVATE_TASK_ID' }, undefined]] as const) {
+      const dispatch = vi.fn()
+      const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(JSON.stringify({ items: [finalMessageDto({
+        content: { text: 'Answer remains exact.', summary: 'Safe summary.', taskGraphSources: sidecar },
+      })] })))
+      await hydrateTimeline({ sessionId: 'session-1', dispatch, fetcher, finalItemTarget: { itemId: FINAL_ITEM_ID, turnId: 'turn-1' } })
+      const action = dispatch.mock.calls[0]?.[0]
+      expect(action?.type).toBe('replay')
+      if (action?.type !== 'replay') continue
+      const restored = action.items[0] as { content: Record<string, unknown> }
+      expect(restored.content.text).toBe('Answer remains exact.')
+      expect(restored.content.taskGraphSources).toEqual(expected)
+      expect(JSON.stringify(restored.content)).not.toMatch(/PRIVATE_TASK_ID/)
+    }
   })
 
   it('coalesces question stubs received in one stream turn into one hydration', async () => {

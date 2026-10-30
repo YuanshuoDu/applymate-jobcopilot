@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest"
 import { TASK_GRAPH_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 import { projectFinalAnswerContent } from "./final-answer-evidence-projection"
+import { canonicalTaskGraphSourceKey } from "./final-task-graph-source-detail"
+import { TASK_GRAPH_SOURCES_SCHEMA_VERSION } from "./final-task-graph-source-manifest"
 
 import { isPrivateNativeVerificationEventType, redactStreamEventPayload, redactStreamString, redactStreamValue } from "./stream-redaction"
 
@@ -105,6 +107,24 @@ describe("agent stream redaction", () => {
       .toEqual({ itemId: "final-item", status: "completed", content: "[REDACTED]" })
     expect(redactStreamEventPayload("item.completed", payload, identity))
       .toEqual({ itemId: "final-item", status: "completed", content: "[REDACTED]" })
+  })
+
+  it("streams only a canonical TaskGraph source manifest beside the ordinary final answer", () => {
+    const source = { sourceKey: canonicalTaskGraphSourceKey("final-item", 3, 0), nodeIndex: 0,
+      role: "scout", taskStatus: "completed", resultState: "missing" }
+    const manifest = { schemaVersion: TASK_GRAPH_SOURCES_SCHEMA_VERSION, graphRevision: 3, sources: [source] }
+    const payload = { itemId: "final-item", status: "completed", content: {
+      text: "Safe answer", final: { response: "Safe answer" }, taskGraphSources: manifest,
+      taskId: "PRIVATE_TASK_ID", rawResult: "PRIVATE_RAW_RESULT",
+    } }
+    const projected = redactStreamEventPayload("item.completed", payload, { ...identity, itemId: "final-item" })
+    expect(projected).toEqual({ itemId: "final-item", status: "completed", content: { text: "Safe answer", taskGraphSources: manifest } })
+    expect(JSON.stringify(projected)).not.toMatch(/PRIVATE_TASK_ID|PRIVATE_RAW_RESULT|sessionId|graphItemId/)
+
+    const malformed = redactStreamEventPayload("item.completed", { ...payload, content: {
+      ...payload.content, taskGraphSources: { ...manifest, sources: [{ ...source, sourceKey: `src_${"A".repeat(43)}` }] },
+    } }, { ...identity, itemId: "final-item" })
+    expect(malformed).toEqual({ itemId: "final-item", status: "completed", content: { text: "Safe answer" } })
   })
 
   it("redacts nested credential, resume, and raw payload keys", () => {

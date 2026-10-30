@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 import { Pool as PgPool } from "pg"
 import type { HarnessModelRequest, ModelAdapter } from "@jobcopilot/agent-model"
@@ -329,6 +329,109 @@ describeWithPostgres("PostgreSQL context compaction atomic publisher", () => {
       expect((restored.items[1]?.content as { text?: string } | undefined)?.text).toBe("Post-compaction tail")
     } finally {
       await restartedPool.end()
+    }
+  })
+
+  it("preserves the completed final source manifest while publishing a separate compaction item and snapshot", async () => {
+    const fixture = await seedOwnerFixture(pool!)
+    try {
+      const finalItemId = `${fixture.sessionId}-final-${randomUUID()}`
+      const stepId = `${fixture.sessionId}-final-step`
+      const graphRevision = 7
+      const nodeIndex = 0
+      const sourceKey = `src_${createHash("sha256").update(`taskGraphSource:v1\0${finalItemId}\0${graphRevision}\0${nodeIndex}`).digest("base64url")}`
+      const taskGraphSources = {
+        schemaVersion: "agent-harness.v2.task-graph-sources.v1",
+        graphRevision,
+        sources: [{ sourceKey, nodeIndex, role: "scout", taskStatus: "completed", resultState: "valid", roleResultStatus: "completed" }],
+      }
+      const finalText = `The final response remains unchanged. ${"Verified outcome detail. ".repeat(160)}`
+      const finalContent = {
+        text: finalText,
+        final: { schemaVersion: "agent-harness.v2.final", response: finalText, summary: "Task-reported outcomes are preserved." },
+        taskGraphSources,
+      }
+      const stepCompletedEventId = `${stepId}:completed`
+      const itemStartedEventId = `${finalItemId}:started`
+      await pool!.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot", "startedAt", "completedAt")
+        VALUES ($1, $2, $3, $4, 0, 1, 'completed', 0, '[]'::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+      [stepId, fixture.sessionId, fixture.turnId, fixture.taskId])
+      await pool!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "revision", "content", "startedAt", "completedAt", "updatedAt")
+        VALUES ($1, $2, $3, $4, $5, 'agent_message', 'completed', 'final_answer', 1, $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+      [finalItemId, fixture.sessionId, fixture.turnId, stepId, fixture.taskId, JSON.stringify(finalContent)])
+
+      const allocateSequence = async (): Promise<bigint> => {
+        const row = await pool!.query<{ eventSequence: string | number }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1
+          WHERE "id" = $1 AND "userId" = $2 RETURNING "eventSequence"`, [fixture.sessionId, fixture.userId])
+        return BigInt(row.rows[0]?.eventSequence ?? 0)
+      }
+      const stepSequence = await allocateSequence()
+      await pool!.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "idempotencyKey", "payload")
+        VALUES ($1, $2, $3, NULL, $4, $5, 'step.completed', 'orchestrator', $6, $7, $8::jsonb)`,
+      [stepCompletedEventId, fixture.sessionId, fixture.turnId, fixture.taskId, stepSequence.toString(), stepId,
+        `turn:${fixture.turnId}:event:step-completed:${stepId}`, JSON.stringify({ stepId, status: "completed", taskId: fixture.taskId })])
+      const startedSequence = await allocateSequence()
+      await pool!.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload")
+        VALUES ($1, $2, $3, $4, $5, $6, 'item.started', 'orchestrator', $7, $8, $9, $10::jsonb)`,
+      [itemStartedEventId, fixture.sessionId, fixture.turnId, finalItemId, fixture.taskId, startedSequence.toString(), stepId,
+        stepCompletedEventId, itemStartedEventId, JSON.stringify({ itemId: finalItemId, type: "agent_message", phase: "final_answer" })])
+      const completedSequence = await allocateSequence()
+      await pool!.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload")
+        VALUES ($1, $2, $3, $4, $5, $6, 'item.completed', 'orchestrator', $4, $7, $8, $9::jsonb)`,
+      [`${finalItemId}:completed`, fixture.sessionId, fixture.turnId, finalItemId, fixture.taskId, completedSequence.toString(),
+        itemStartedEventId, `${finalItemId}:completed`, JSON.stringify({ itemId: finalItemId, status: "completed", content: finalContent })])
+
+      const before = await pool!.query<{ sessionId: string; turnId: string; taskId: string; status: string; phase: string; revision: number; content: unknown }>(
+        `SELECT "sessionId", "turnId", "taskId", "status", "phase", "revision", "content" FROM "agent_items"
+          WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 AND "type" = 'agent_message'`,
+        [finalItemId, fixture.sessionId, fixture.turnId, fixture.taskId])
+      expect(before.rows).toEqual([{ sessionId: fixture.sessionId, turnId: fixture.turnId, taskId: fixture.taskId,
+        status: "completed", phase: "final_answer", revision: 1, content: finalContent }])
+
+      const source = await createPgCompactionSource(pool!).load({ scope: fixture.scope, owner: fixture.owner })
+      if (!source) throw new Error("Expected the owner-scoped final item source")
+      expect(source.state.sessionId).toBe(fixture.sessionId)
+      expect(source.items).toHaveLength(1)
+      expect(source.items[0]).toMatchObject({ id: finalItemId, sessionId: fixture.sessionId, turnId: fixture.turnId,
+        sequence: completedSequence, type: "agent_message", status: "completed", content: finalContent })
+
+      const compactor = new ContextCompactor(createPgContextSnapshotCompactionPort(pool!, fixture.owner), () => "Compacted narrative summary",
+        () => `${fixture.sessionId}-compaction-item`)
+      const result = await compactor.compact({
+        scope: fixture.scope, turnId: fixture.turnId, source,
+        policy: { inputTokenThreshold: 1, itemCountThreshold: 1, compactAtTurnBoundary: true },
+        atTurnBoundary: true, requested: true,
+      })
+      if (result.status !== "compacted" || !result.item || !result.snapshot) throw new Error("Expected the final item compaction to publish")
+
+      const after = await pool!.query<{ id: string; sessionId: string; turnId: string; taskId: string; type: string; status: string; phase: string; revision: number; content: unknown }>(
+        `SELECT "id", "sessionId", "turnId", "taskId", "type", "status", "phase", "revision", "content" FROM "agent_items"
+          WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4`,
+        [finalItemId, fixture.sessionId, fixture.turnId, fixture.taskId])
+      expect(after.rows).toEqual([{ id: finalItemId, sessionId: fixture.sessionId, turnId: fixture.turnId, taskId: fixture.taskId,
+        type: "agent_message", status: "completed", phase: "final_answer", revision: 1, content: before.rows[0]?.content }])
+      expect(after.rows[0]?.content).toEqual(finalContent)
+      expect((after.rows[0]?.content as typeof finalContent).taskGraphSources).toEqual(taskGraphSources)
+
+      const compactionRows = await pool!.query<{ itemId: string; itemSessionId: string; itemTurnId: string; itemTaskId: string; itemType: string; itemStatus: string; snapshotId: string; snapshotSessionId: string; snapshotOwnerId: string; snapshotContentSessionId: string; compactionOwnerId: string; compactionSessionId: string; throughSequence: string; version: number; sourceItemIds: string[] }>(
+        `SELECT item."id" AS "itemId", item."sessionId" AS "itemSessionId", item."turnId" AS "itemTurnId", item."taskId" AS "itemTaskId",
+            item."type" AS "itemType", item."status" AS "itemStatus", snapshot."id" AS "snapshotId", snapshot."sessionId" AS "snapshotSessionId",
+            snapshot."content"->>'ownerId' AS "snapshotOwnerId", snapshot."content"->>'sessionId' AS "snapshotContentSessionId",
+            snapshot."content" #>> '{compaction,state,ownerId}' AS "compactionOwnerId", snapshot."content" #>> '{compaction,state,sessionId}' AS "compactionSessionId",
+            snapshot."throughSequence"::text AS "throughSequence", snapshot."version", snapshot."content"->'compaction'->'sourceItemIds' AS "sourceItemIds"
+          FROM "agent_items" AS item JOIN "agent_context_snapshots" AS snapshot ON snapshot."id" = $1 AND snapshot."sessionId" = item."sessionId"
+          WHERE item."id" = $2 AND item."sessionId" = $3 AND item."turnId" = $4 AND item."taskId" = $5 AND item."type" = 'context_compaction' AND item."status" = 'completed'`,
+        [result.snapshot.id, result.item.id, fixture.sessionId, fixture.turnId, fixture.taskId])
+      expect(compactionRows.rows).toEqual([{ itemId: result.item.id, itemSessionId: fixture.sessionId, itemTurnId: fixture.turnId,
+        itemTaskId: fixture.taskId, itemType: "context_compaction", itemStatus: "completed", snapshotId: result.snapshot.id,
+        snapshotSessionId: fixture.sessionId, snapshotOwnerId: fixture.userId, snapshotContentSessionId: fixture.sessionId,
+        compactionOwnerId: fixture.userId, compactionSessionId: fixture.sessionId,
+        throughSequence: completedSequence.toString(), version: 1, sourceItemIds: [finalItemId] }])
+      expect(result.item.id).not.toBe(finalItemId)
+      expect(result.snapshot.id).not.toBe(finalItemId)
+    } finally {
+      await pool!.query(`DELETE FROM "agent_outbox" WHERE "aggregateId" = $1`, [fixture.sessionId])
+      await pool!.query(`DELETE FROM "User" WHERE "id" = $1`, [fixture.userId])
     }
   })
 
