@@ -281,6 +281,7 @@ async function runChildWaitLoop(lease, restored, responseForStep, hooks = {}) {
   const fixtureModel = loopFixtureModel(responseForStep)
   const options = turnExecutionOptions(lease, owner, async input => {
     executorCalls += 1
+    if (hooks.beforeReplayExecution) await hooks.beforeReplayExecution(input)
     const result = replay.execute(input)
     if (!result) {
       dispatcherCalls += 1
@@ -293,7 +294,10 @@ async function runChildWaitLoop(lease, restored, responseForStep, hooks = {}) {
     tools: [{ name: "wait_subagents", version: "1", inputSchema: { type: "object" } }],
     resume: restored.resume, beforeAppendEvent: hooks.beforeAppendEvent, beforeUpdateItem: hooks.beforeUpdateItem,
     childWaitCallStartKey: (stepId, call) => replay.childWaitCallStartKey(stepId, call),
-    childWaitCallStarted: (stepId, call, eventId) => replay.childWaitCallStarted(stepId, call, eventId),
+    childWaitCallStarted: (stepId, call, eventId) => {
+      replay.childWaitCallStarted(stepId, call, eventId)
+      hooks.childWaitCallStarted?.(stepId, call, eventId)
+    },
     ...(restored.childWaitClaimRecovery ? { childWaitClaimRecovery: restored.childWaitClaimRecovery } : {}),
     ...(restored.childWaitOrphanRecovery ? { childWaitOrphanRecovery: restored.childWaitOrphanRecovery } : {}),
   })
@@ -322,9 +326,9 @@ async function seedLegacyConsumedWait(lease, stopBeforeModel = false) {
     throw new Error("fixture_legacy_consumed_wait_seed_missing")
   }
   const owner = executionOwnerFence({ kind: "task", lease })
-  const requestedOrdinal = restored.resume.nextOrdinal
-  const stepId = `task:${lease.id}:step:${requestedOrdinal}:attempt:${lease.attemptCount}`
-  const continuation = await turnStore.startStep({ owner, stepId, ordinal: requestedOrdinal, attempt: lease.attemptCount,
+  const logicalNextOrdinal = restored.resume.nextOrdinal
+  const stepId = `task:${lease.id}:step:${logicalNextOrdinal}:attempt:${lease.attemptCount}`
+  const continuation = await turnStore.startStep({ owner, stepId, ordinal: logicalNextOrdinal, attempt: lease.attemptCount,
     inputThroughSequence: restored.resume.inputThroughSequence, consumedInputIds: restored.resume.consumedInputIds,
     modelProfileSnapshot: loopFixtureModelProfile, now })
   const client = await pool.connect()
@@ -353,32 +357,45 @@ async function seedLegacyConsumedWait(lease, stopBeforeModel = false) {
     WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 AND "attempt" = $5`,
   [stepId, lease.sessionId, lease.turnId, lease.id, lease.attemptCount])
   if (continuation.id !== stepId || persistedContinuation.rowCount !== 1
-    || persistedContinuation.rows[0]?.id !== stepId || continuation.ordinal !== requestedOrdinal
-    || Number(persistedContinuation.rows[0]?.ordinal) !== requestedOrdinal
-    || Number(persistedContinuation.rows[0]?.ordinal) !== continuation.ordinal
+    || persistedContinuation.rows[0]?.id !== stepId || Number(persistedContinuation.rows[0]?.ordinal) !== continuation.ordinal
+    || !Number.isSafeInteger(wait.ordinal) || !Number.isSafeInteger(continuation.ordinal) || continuation.ordinal <= wait.ordinal
     || Number(persistedContinuation.rows[0]?.attempt) !== lease.attemptCount || persistedContinuation.rows[0]?.status !== "streaming") {
     throw new Error("fixture_legacy_ack_step_identity_invalid")
   }
   if (stopBeforeModel) {
     say(`WORKER_B_LEGACY_CONSUMED_SOURCE_ONLY ${JSON.stringify({ waitId: wait.waitId, sourceStepId: wait.stepId,
-      sourceAttempt: wait.attempt, continuationStepId: continuation.id, requestedOrdinal, continuationOrdinal: continuation.ordinal,
+      sourceAttempt: wait.attempt, continuationStepId: continuation.id, logicalNextOrdinal, sourcePhysicalOrdinal: wait.ordinal,
+      continuationOrdinal: continuation.ordinal,
       attemptCount: lease.attemptCount, sourceLifecycleRepaired: false, continuationCallCreated: false })}`)
     return new Promise(() => {})
   }
   const callId = `legacy-consumed-reissue:${lease.id}:attempt:${lease.attemptCount}`
+  let claimedCall
   const modelResponse = ({ stepId: actualStepId }) => {
     if (actualStepId !== stepId) throw new Error("fixture_legacy_reissue_wrong_step")
     return { usage: { inputTokens: 37, outputTokens: 13, estimatedCostUsd: highPrecisionWaitModelCostUsd },
       toolCalls: [{ id: callId, name: "wait_subagents", arguments: wait.input }] }
   }
-  const beforeAppendEvent = async event => {
-    if (event.type !== "tool_call.started" || event.correlationId !== callId) return
-    say(`WORKER_B_LEGACY_CONSUMED_ACK ${JSON.stringify({ waitId: wait.waitId, sourceStepId: wait.stepId, sourceAttempt: wait.attempt,
-      continuationStepId: stepId, continuationOrdinal: continuation.ordinal, attemptCount: lease.attemptCount,
-      callId, sourceLifecycleRepaired: false, claimPresent: false })}`)
+  const childWaitCallStarted = (actualStepId, call, eventId) => {
+    if (actualStepId !== stepId || call.id !== callId || !eventId) return
+    claimedCall = { stepId: actualStepId, callId: call.id, eventId }
+  }
+  const beforeReplayExecution = async input => {
+    if (input.stepId !== stepId || input.call.id !== callId || input.call.toolName !== "wait_subagents"
+      || JSON.stringify(input.call.input) !== JSON.stringify(wait.input)
+      || claimedCall?.stepId !== stepId || claimedCall.callId !== callId || !claimedCall.eventId) {
+      throw new Error("fixture_legacy_claim_adapter_mismatch")
+    }
+    const marker = `WORKER_B_LEGACY_CONSUMED_CLAIMED ${JSON.stringify({ waitId: wait.waitId, sourceStepId: wait.stepId,
+      sourceAttempt: wait.attempt, continuationStepId: stepId, logicalNextOrdinal, sourcePhysicalOrdinal: wait.ordinal,
+      continuationOrdinal: continuation.ordinal, attemptCount: lease.attemptCount, callId,
+      sourceLifecycleRepaired: false, claimPresent: true })}`
+    say(marker)
     await new Promise(() => {})
   }
-  const loop = await runChildWaitLoop(lease, restored, modelResponse, { beforeAppendEvent, legacyConsumedSeed: true })
+  const loop = await runChildWaitLoop(lease, restored, modelResponse, {
+    childWaitCallStarted, beforeReplayExecution, legacyConsumedSeed: true,
+  })
   throw new Error(`fixture_legacy_preclaim_barrier_returned:${loop.result.status}`)
 }
 
