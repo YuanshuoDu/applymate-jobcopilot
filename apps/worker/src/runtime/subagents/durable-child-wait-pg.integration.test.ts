@@ -390,6 +390,273 @@ async function expectAbsentSourceResultClaimSafety(pool: Pool, ids: FixtureIds, 
   }
 }
 
+async function expectCompletedClaimBeforeItemEventSafety(
+  pool: Pool, ids: FixtureIds, continuationStepId: string, callId: string, attempt: number,
+): Promise<void> {
+  const client = await pool.connect()
+  try {
+    await client.query("BEGIN")
+    await client.query("SELECT set_config('app.user_id', $1, true)", [ids.userId])
+    const session = await client.query<{ userId: string }>(
+      `SELECT "userId" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 FOR UPDATE`, [ids.sessionId, ids.userId],
+    )
+    expect(session.rows).toHaveLength(1)
+    const taskResult = await client.query<BlockingTaskRow>(
+      `SELECT "id", "sessionId", "turnId", "rootTaskId", "leaseOwner", "attemptCount", "leaseExpiresAt"
+       FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4 FOR UPDATE`,
+      [ids.waiterTaskId, ids.sessionId, ids.turnId, ids.rootTaskId],
+    )
+    expect(taskResult.rows).toHaveLength(1)
+    const row = taskResult.rows[0]
+    if (!row || !row.leaseOwner || !row.leaseExpiresAt) throw new Error("completed_claim_live_task_missing")
+    const task: BlockingTaskSnapshot = { ...row, userId: session.rows[0]!.userId }
+    const callItemId = `task:${ids.waiterTaskId}:item:tool-call:${callId}:attempt:${attempt}`
+    const sourceCallItemId = `task:${ids.waiterTaskId}:item:tool-call:${PHONE_SHAPED_WAIT_TOOL_CALL_ID}:attempt:1`
+    const callResult = await client.query<{ id: string; status: string; revision: number; content: Record<string, unknown> }>(
+      `SELECT "id", "status", "revision", "content" FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2
+       AND "taskId" = $3 AND "stepId" = $4 AND "id" = $5 AND "type" = 'tool_call'`,
+      [ids.sessionId, ids.turnId, ids.waiterTaskId, continuationStepId, callItemId],
+    )
+    expect(callResult.rows).toHaveLength(1)
+    expect(callResult.rows[0]).toMatchObject({ status: "completed", revision: 1,
+      content: { toolCallId: callId, toolName: "wait_subagents", toolVersion: "1", status: "completed", errorCode: null } })
+    const lifecycle = await client.query<{ id: string; type: string; itemId: string | null; correlationId: string; causationId: string | null }>(
+      `SELECT "id", "type", "itemId", "correlationId", "causationId" FROM "agent_events" WHERE "sessionId" = $1
+       AND "turnId" = $2 AND "taskId" = $3 AND ("itemId" = $4 OR "correlationId" = $5) ORDER BY "sequence"`,
+      [ids.sessionId, ids.turnId, ids.waiterTaskId, callItemId, callId],
+    )
+    expect(lifecycle.rows.map(event => event.type)).toEqual(["item.started", "tool_call.started"])
+    const itemStarted = lifecycle.rows[0]
+    const callStarted = lifecycle.rows[1]
+    const itemStartedAnchor = await client.query<{ id: string }>(
+      `SELECT prior."id" FROM "agent_events" AS prior
+       JOIN "agent_events" AS itemStart ON itemStart."id" = $4 AND itemStart."causationId" = prior."id"
+       WHERE prior."sessionId" = $1 AND prior."turnId" = $2 AND prior."taskId" = $3
+         AND prior."sequence" < itemStart."sequence"`,
+      [ids.sessionId, ids.turnId, ids.waiterTaskId, itemStarted?.id ?? ""],
+    )
+    expect(itemStartedAnchor.rows, "real item.started causation must resolve to a preceding same-owner event").toHaveLength(1)
+    expect(callStarted).toMatchObject({ itemId: callItemId, correlationId: callId, causationId: itemStarted?.id })
+
+    const blocking = (snapshot: BlockingTaskSnapshot) => hasBlockingExternalCall(
+      client, snapshot as unknown as Record<string, unknown>, undefined, continuationStepId,
+    )
+    expect(await blocking(task), "exact completed/rev1 claim with its sole causal start and no item.completed should be recoverable").toBe(false)
+
+    let savepoint = 0
+    const remainsBlocked = async (label: string, mutate: () => Promise<void>, snapshot: BlockingTaskSnapshot = task): Promise<void> => {
+      const name = `completed_claim_case_${savepoint++}`
+      await client.query(`SAVEPOINT ${name}`)
+      try {
+        await mutate()
+        expect(await blocking(snapshot), label).toBe(true)
+      } finally {
+        await client.query(`ROLLBACK TO SAVEPOINT ${name}`)
+        await client.query(`RELEASE SAVEPOINT ${name}`)
+      }
+    }
+    await remainsBlocked("completed claim with non-null errorCode", async () => {
+      await client.query(`UPDATE "agent_items" SET "content" = "content" || '{"errorCode":"invalid"}'::jsonb WHERE "id" = $1`, [callItemId])
+    })
+    await remainsBlocked("completed claim with wrong revision", async () => {
+      await client.query(`UPDATE "agent_items" SET "revision" = 2 WHERE "id" = $1`, [callItemId])
+    })
+    await remainsBlocked("wrong causal item.started", async () => {
+      if (!callStarted) throw new Error("completed_claim_start_event_missing")
+      await client.query(`UPDATE "agent_events" SET "causationId" = $2 WHERE "id" = $1`, [callStarted.id, "wrong-item-start"])
+    })
+    await remainsBlocked("claim tool_call.started must follow its exact item.started event", async () => {
+      if (!itemStarted) throw new Error("completed_claim_item_start_event_missing")
+      const sequence = await client.query<{ eventSequence: string }>(
+        `UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1 WHERE "id" = $1 RETURNING "eventSequence"::text AS "eventSequence"`,
+        [ids.sessionId],
+      )
+      await client.query(`UPDATE "agent_events" SET "sequence" = $2 WHERE "id" = $1 AND "sessionId" = $3`,
+        [itemStarted.id, sequence.rows[0]!.eventSequence, ids.sessionId])
+    })
+    await remainsBlocked("completed claim item.completed must follow its tool_call.started event", async () => {
+      if (!callStarted) throw new Error("completed_claim_start_event_missing")
+      const completeSequence = await client.query<{ eventSequence: string }>(
+        `UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1 WHERE "id" = $1 RETURNING "eventSequence"::text AS "eventSequence"`,
+        [ids.sessionId],
+      )
+      const eventId = `fixture-claim-item-completed-before-start-${randomUUID()}`
+      const eventKey = `task:${ids.waiterTaskId}:event:tool-call-completed:${callId}:${callItemId}:1`
+      await client.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor",
+          "correlationId", "causationId", "idempotencyKey", "payload")
+        VALUES ($1, $2, $3, $4, $5, $6, 'item.completed', 'subagent', $4, $7, $8, $9::jsonb)`, [
+        eventId, ids.sessionId, ids.turnId, callItemId, ids.waiterTaskId, completeSequence.rows[0]!.eventSequence, callStarted.id,
+        eventKey, JSON.stringify({ itemId: callItemId, status: "completed", content: callResult.rows[0]!.content }),
+      ])
+      const startSequence = await client.query<{ eventSequence: string }>(
+        `UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1 WHERE "id" = $1 RETURNING "eventSequence"::text AS "eventSequence"`,
+        [ids.sessionId],
+      )
+      await client.query(`UPDATE "agent_events" SET "sequence" = $2 WHERE "id" = $1 AND "sessionId" = $3`,
+        [callStarted.id, startSequence.rows[0]!.eventSequence, ids.sessionId])
+    })
+    const insertValidAndMalformedCompletion = async (malformedItemId: string, malformedCorrelationId: string): Promise<void> => {
+      const sequence = await client.query<{ firstSequence: string; eventSequence: string }>(
+        `UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 2 WHERE "id" = $1
+         RETURNING ("eventSequence" - 1)::text AS "firstSequence", "eventSequence"::text AS "eventSequence"`, [ids.sessionId],
+      )
+      if (!callStarted) throw new Error("completed_claim_start_event_missing")
+      const exactEventKey = `task:${ids.waiterTaskId}:event:tool-call-completed:${callId}:${callItemId}:1`
+      await client.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor",
+          "correlationId", "causationId", "idempotencyKey", "payload")
+        VALUES ($1, $2, $3, $4, $5, $6, 'item.completed', 'subagent', $7, $8, $9, $10::jsonb),
+          ($11, $2, $3, $16, $5, $12, 'item.completed', 'subagent', $17, $13, $14, $15::jsonb)`, [
+        `fixture-claim-item-completed-exact-${randomUUID()}`, ids.sessionId, ids.turnId, callItemId, ids.waiterTaskId,
+        sequence.rows[0]!.firstSequence, callItemId, callStarted.id, exactEventKey,
+        JSON.stringify({ itemId: callItemId, status: "completed", content: callResult.rows[0]!.content }),
+        `fixture-claim-item-completed-malformed-${randomUUID()}`, sequence.rows[0]!.eventSequence, callStarted.id,
+        `fixture-claim-item-completed-malformed:${randomUUID()}`,
+        JSON.stringify({ itemId: callItemId, status: "failed", content: { errorCode: "wrong" } }),
+        malformedItemId, malformedCorrelationId,
+      ])
+    }
+    await remainsBlocked("valid completion plus malformed event correlated to the claim item", () =>
+      insertValidAndMalformedCompletion(sourceCallItemId, callItemId))
+    await remainsBlocked("valid completion plus malformed event correlated to the provider call", () =>
+      insertValidAndMalformedCompletion(sourceCallItemId, callId))
+    await remainsBlocked("unrelated terminal item event on the claimed call", async () => {
+      const sequence = await client.query<{ eventSequence: string }>(
+        `UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1 WHERE "id" = $1 RETURNING "eventSequence"`, [ids.sessionId],
+      )
+      await client.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor",
+          "correlationId", "causationId", "idempotencyKey", "payload")
+        VALUES ($1, $2, $3, $4, $5, $6, 'item.failed', 'subagent', $7, $8, $9, $10::jsonb)`, [
+        `fixture-claim-item-failed-${randomUUID()}`, ids.sessionId, ids.turnId, callItemId, ids.waiterTaskId,
+        sequence.rows[0]!.eventSequence, callItemId, callStarted?.id ?? null, `fixture-claim-item-failed:${randomUUID()}`,
+        JSON.stringify({ itemId: callItemId, status: "failed", errorCode: "fixture" }),
+      ])
+    })
+    await remainsBlocked("competing tool call in the continuation step", async () => {
+      const competitorId = `fixture-competing-call:${randomUUID()}`
+      await client.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "revision", "content", "startedAt", "updatedAt")
+        VALUES ($1, $2, $3, $4, $5, 'tool_call', 'started', NULL, 0, $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, [
+        `task:${ids.waiterTaskId}:item:tool-call:${competitorId}:attempt:${attempt}`, ids.sessionId, ids.turnId, continuationStepId,
+        ids.waiterTaskId, JSON.stringify({ toolCallId: competitorId, toolName: "wait_subagents", toolVersion: "1", input: {} }),
+      ])
+    })
+    await remainsBlocked("tool result row on the continuation", async () => {
+      await client.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "revision", "content", "startedAt", "completedAt", "updatedAt")
+        VALUES ($1, $2, $3, $4, $5, 'tool_result', 'completed', 1, $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, [
+        `task:${ids.waiterTaskId}:item:tool-result:${callId}:attempt:${attempt}`, ids.sessionId, ids.turnId, continuationStepId,
+        ids.waiterTaskId, JSON.stringify({ toolCallId: callId, output: null, errorCode: null }),
+      ])
+    })
+    await remainsBlocked("result lifecycle event without a result row", async () => {
+      const resultItemId = `task:${ids.waiterTaskId}:item:tool-result:${callId}:attempt:${attempt}`
+      const sequence = await client.query<{ eventSequence: string }>(
+        `UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1 WHERE "id" = $1 RETURNING "eventSequence"`, [ids.sessionId],
+      )
+      await client.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor",
+          "correlationId", "causationId", "idempotencyKey", "payload")
+        VALUES ($1, $2, $3, $4, $5, $6, 'item.completed', 'subagent', $7, $8, $9, $10::jsonb)`, [
+        `fixture-claim-result-event-${randomUUID()}`, ids.sessionId, ids.turnId, resultItemId, ids.waiterTaskId,
+        sequence.rows[0]!.eventSequence, resultItemId, callStarted?.id ?? null, `fixture-claim-result-event:${randomUUID()}`,
+        JSON.stringify({ itemId: resultItemId, status: "completed", content: { toolCallId: callId } }),
+      ])
+    })
+    const insertSettledLifecycle = async (
+      status: "completed" | "failed",
+      malformed?: "item_id" | "causation" | "payload" | "sequence",
+    ): Promise<void> => {
+      if (!callStarted) throw new Error("completed_claim_start_event_missing")
+      if (status === "failed") await client.query(
+        `UPDATE "agent_items" SET "content" = "content" || '{"status":"failed","errorCode":"fixture_failure"}'::jsonb WHERE "id" = $1`,
+        [callItemId],
+      )
+      const savedCall = await client.query<{ content: Record<string, unknown> }>(
+        `SELECT "content" FROM "agent_items" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4`,
+        [callItemId, ids.sessionId, ids.turnId, ids.waiterTaskId],
+      )
+      const content = savedCall.rows[0]?.content
+      if (!content) throw new Error("completed_claim_call_content_missing")
+      const itemCompletedId = `fixture-claim-terminal-item-completed-${randomUUID()}`
+      const terminalId = `fixture-claim-terminal-${randomUUID()}`
+      const itemCompletedKey = `task:${ids.waiterTaskId}:event:tool-call-completed:${callId}:${callItemId}:1`
+      const itemCompletedCausation = callStarted.id
+      const terminalKey = `task:${ids.waiterTaskId}:event:tool-finished:${callId}`
+      const terminalPayload = {
+        toolCallId: callId, toolName: "wait_subagents",
+        status, errorCode: status === "completed" ? null : "fixture_failure", taskId: ids.waiterTaskId,
+      }
+      const sequence = await client.query<{ firstSequence: string; eventSequence: string }>(
+        `UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 2 WHERE "id" = $1
+         RETURNING ("eventSequence" - 1)::text AS "firstSequence", "eventSequence"::text AS "eventSequence"`, [ids.sessionId],
+      )
+      const terminalItemId = malformed === "item_id" ? sourceCallItemId : callItemId
+      const terminalCausation = malformed === "causation" ? "wrong-terminal-cause" : itemCompletedId
+      const payload = malformed === "payload" ? { ...terminalPayload, toolName: "jobs.search" } : terminalPayload
+      const itemCompletedSequence = malformed === "sequence" ? sequence.rows[0]!.eventSequence : sequence.rows[0]!.firstSequence
+      const terminalSequence = malformed === "sequence" ? sequence.rows[0]!.firstSequence : sequence.rows[0]!.eventSequence
+      await client.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor",
+          "correlationId", "causationId", "idempotencyKey", "payload")
+        VALUES ($1, $2, $3, $4, $5, $6, 'item.completed', 'subagent', $7, $8, $9, $10::jsonb),
+          ($11, $2, $3, $12, $5, $13, $14, 'subagent', $7, $15, $16, $17::jsonb)`, [
+        itemCompletedId, ids.sessionId, ids.turnId, callItemId, ids.waiterTaskId, itemCompletedSequence,
+        callItemId, itemCompletedCausation, itemCompletedKey, JSON.stringify({ itemId: callItemId, status: "completed", content }),
+        terminalId, terminalItemId, terminalSequence, status === "completed" ? "tool_call.completed" : "tool_call.failed",
+        terminalCausation, terminalKey, JSON.stringify(payload),
+      ])
+    }
+    const allowsSettlement = async (label: string, mutate: () => Promise<void>): Promise<void> => {
+      const name = `claim_terminal_positive_${savepoint++}`
+      await client.query(`SAVEPOINT ${name}`)
+      try {
+        await mutate()
+        expect(await blocking(task), label).toBe(false)
+      } finally {
+        await client.query(`ROLLBACK TO SAVEPOINT ${name}`)
+        await client.query(`RELEASE SAVEPOINT ${name}`)
+      }
+    }
+    await allowsSettlement("exact child claim recovery lifecycle settles its start", () =>
+      insertSettledLifecycle("completed"))
+    await allowsSettlement("exact failed child claim lifecycle settles its start", () =>
+      insertSettledLifecycle("failed"))
+    await remainsBlocked("terminal with correct provider call ID but wrong item ID", () =>
+      insertSettledLifecycle("completed", "item_id"))
+    await remainsBlocked("terminal with correct provider call ID but wrong causation", () =>
+      insertSettledLifecycle("completed", "causation"))
+    await remainsBlocked("terminal with correct provider call ID but wrong payload", () =>
+      insertSettledLifecycle("completed", "payload"))
+    await remainsBlocked("terminal sequence before its item.completed cause", () =>
+      insertSettledLifecycle("completed", "sequence"))
+    await remainsBlocked("wait call item references a foreign-scope step", async () => {
+      await insertSettledLifecycle("completed")
+      const foreignStepId = `fixture-foreign-step:${randomUUID()}`
+      await client.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status",
+          "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot")
+        VALUES ($1, $2, $3, $4, 999, 1, 'completed', 0, '[]'::jsonb, '{}'::jsonb)`,
+        [foreignStepId, ids.sessionId, ids.turnId, ids.rootTaskId],
+      )
+      await client.query(`UPDATE "agent_items" SET "stepId" = $2 WHERE "id" = $1`, [callItemId, foreignStepId])
+    })
+    await remainsBlocked("extra failed terminal with wrong item ID but call-item correlation", async () => {
+      await insertSettledLifecycle("completed")
+      const sequence = await client.query<{ eventSequence: string }>(
+        `UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1 WHERE "id" = $1 RETURNING "eventSequence"`,
+        [ids.sessionId],
+      )
+      await client.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor",
+          "correlationId", "causationId", "idempotencyKey", "payload")
+        VALUES ($1, $2, $3, $4, $5, $6, 'tool_call.failed', 'subagent', $7, $8, $9, $10::jsonb)`, [
+        `fixture-claim-item-correlation-terminal-${randomUUID()}`, ids.sessionId, ids.turnId, sourceCallItemId, ids.waiterTaskId,
+        sequence.rows[0]!.eventSequence, callItemId, callStarted?.id ?? null,
+        `fixture-claim-item-correlation-terminal:${randomUUID()}`,
+        JSON.stringify({ toolCallId: callId, toolName: "wait_subagents", status: "failed", errorCode: "forged", taskId: ids.waiterTaskId }),
+      ])
+    })
+    await remainsBlocked("stale lease owner", async () => {}, { ...task, leaseOwner: `${task.leaseOwner}:stale` })
+  } finally {
+    await client.query("ROLLBACK").catch(() => undefined)
+    client.release()
+  }
+}
+
 async function expectCompletedSourceWaitLifecycle(pool: Pool, ids: FixtureIds): Promise<void> {
   const stepId = `task:${ids.waiterTaskId}:step:0:attempt:1`
   const callItemId = `task:${ids.waiterTaskId}:item:tool-call:${PHONE_SHAPED_WAIT_TOOL_CALL_ID}:attempt:1`
@@ -1389,6 +1656,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         modelCalls: 0, executorCalls: 0, dispatcherCalls: 0, callStatus: "completed", callRevision: 1,
         claimCount: 1, itemCompletedEventCount: 0, resultCount: 0,
       })
+      await expectCompletedClaimBeforeItemEventSafety(pool, ids, acknowledged!.continuationStepId, orphanCallId, acknowledged!.sourceAttempt)
       await stopWorker(workerF)
       const resultCutExit = await workerF.exited
       expect(resultCutExit.code).toBeNull()
@@ -1524,7 +1792,9 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         "item.started", "tool_call.started", "item.completed", "tool_call.completed", "item.started", "item.completed",
       ])
       const [callCompleted, toolCompleted, resultStarted, resultCompleted] = recoveredClaimState.lifecycle.slice(2)
+      expect(callCompleted?.idempotencyKey).toBe(`task:${waiter.id}:event:tool-call-completed:${orphanCallId}:${recoveredClaimState.call!.id}:1`)
       expect(callCompleted?.causationId).toBe(recoveredClaimState.claim!.id)
+      expect(toolCompleted?.idempotencyKey).toBe(`task:${waiter.id}:event:tool-finished:${orphanCallId}`)
       expect(toolCompleted?.causationId).toBe(callCompleted?.id)
       expect(resultStarted?.causationId).toBe(toolCompleted?.id)
       expect(resultCompleted?.causationId).toBe(resultStarted?.id)
