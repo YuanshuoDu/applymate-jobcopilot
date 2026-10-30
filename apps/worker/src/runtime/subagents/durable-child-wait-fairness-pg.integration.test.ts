@@ -293,11 +293,14 @@ describePg("fair durable child-wait reconciliation on disposable PostgreSQL", ()
         "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "idempotencyKey", "targetTaskIds", "mode", "status",
         "deadlineAt", "matchedTaskIds", "result", "createdAt", "updatedAt", "suspendedAt", "nextReconcileAt")
         SELECT $2, source."userId", source."sessionId", source."turnId", source."parentTaskId", source."stepId", $3,
-          jsonb_build_array($4::text), source."mode", 'waiting', source."deadlineAt", '[]'::jsonb, source."result",
-          timezone('UTC', clock_timestamp()) - ($5::int * INTERVAL '1 day'),
-          timezone('UTC', clock_timestamp()) - ($5::int * INTERVAL '1 day'),
-          timezone('UTC', clock_timestamp()) - ($5::int * INTERVAL '1 day'), NULL
-        FROM "agent_wait_conditions" AS source WHERE source."id" = $1`,
+          jsonb_build_array($4::text), source."mode", 'waiting',
+          clock."now" - ($5::int * INTERVAL '1 day') + INTERVAL '12 hours', '[]'::jsonb, source."result",
+          clock."now" - ($5::int * INTERVAL '1 day'),
+          clock."now" - ($5::int * INTERVAL '1 day'),
+          clock."now" - ($5::int * INTERVAL '1 day'), NULL
+        FROM "agent_wait_conditions" AS source
+        CROSS JOIN (SELECT timezone('UTC', clock_timestamp()) AS "now") AS clock
+        WHERE source."id" = $1`,
       [crowded.waitId, `${crowded.waitId}-poison-${index}`, `fair-poison:${crowded.waitId}:${index}`, crowded.rootTaskId, 2 + index])
     }
     const statuses: Array<{ scanned: number; woken: number }> = []
