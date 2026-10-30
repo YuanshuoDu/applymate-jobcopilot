@@ -15,39 +15,18 @@ import { canPersistFinalResponse, totalTurnUsage, turnErrorCode, updateExecution
 import { executionId, type TurnExecutionOptions } from "./turn-execution-types.js"
 import { publishFinalResponse, type TurnExecutionEventWriter } from "./turn-execution-events.js"
 import { READ_TASK_GRAPH_DENIAL_CHECKPOINT } from "./turn-execution-types.js"
-import { parseTaskGraphDenialCheckpoint, type TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
+import { parseTaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment.js"
+import { isTaskGraphTerminalDenial, matchedTaskGraphDenialCheckpoint, sameCheckpoint, terminalEntries, validDenial, withTaskGraphDenialCheckpoint } from "./turn-engine-no-progress-terminal-contract.js"
+import { acquireRootTaskHistoryChronologyLock, appendRootTaskHistoryChronologyWitness } from "../context/root-task-history-chronology-witness.js"
 
+export { isTaskGraphTerminalDenial, matchedTaskGraphDenialCheckpoint, withTaskGraphDenialCheckpoint } from "./turn-engine-no-progress-terminal-contract.js"
+
+const json = (value: unknown) => JSON.stringify(toRepositoryJson(value))
 type AppendEvents = (pool: TurnEnginePool, inputs: readonly TurnEngineEventInput[], client: TurnEngineQueryClient) => Promise<readonly { id: string }[]>
-type CheckpointReader = NonNullable<AtomicTurnNoProgressInput["readTaskGraphDenialCheckpoint"]>
-const json = (value: unknown) => JSON.stringify(value)
-const sameJson = (left: unknown, right: unknown) => json(toRepositoryJson(left)) === json(toRepositoryJson(right))
-
-export async function matchedTaskGraphDenialCheckpoint<TContext>(
-  shouldStop: (context: TContext, expectedTaskId: string, read?: CheckpointReader) => Promise<boolean>,
-  context: TContext,
-  expectedTaskId: string,
-  read?: CheckpointReader,
-): Promise<TaskGraphDenialCheckpoint | null> {
-  if (!read) return null
-  let latest: TaskGraphDenialCheckpoint | null = null
-  const matched = await shouldStop(context, expectedTaskId, async () => { latest = await read(); return latest })
-  return matched ? latest : null
+function sameInputIds(value: unknown, expected: readonly string[]): boolean {
+  return Array.isArray(value) && value.length === expected.length
+    && value.every((candidate: unknown, index: number) => candidate === expected[index])
 }
-
-export function withTaskGraphDenialCheckpoint(
-  options: TurnExecutionOptions,
-  checkpoint: TaskGraphDenialCheckpoint,
-  read?: CheckpointReader,
-): TurnExecutionOptions {
-  const store = options.store, recordFinalResponse = store.recordFinalResponse
-  if (!read || !recordFinalResponse) return options
-  return { ...options, store: { ...store, recordFinalResponse(input) {
-    if (!input.noProgress) return recordFinalResponse.call(store, input)
-    const noProgress: AtomicTurnNoProgressInput = { ...input.noProgress, taskGraphDenialCheckpoint: checkpoint, readTaskGraphDenialCheckpoint: read }
-    return recordFinalResponse.call(store, { ...input, noProgress })
-  } } }
-}
-
 export async function terminalizeNoProgressFailure(input: Readonly<{
   error: NoProgressError; options: TurnExecutionOptions; writer: TurnExecutionEventWriter; step: TurnEngineStep | null; stepOpen: boolean
   stepCount: number; toolCallCount: number; usage: import("../budget.js").TurnUsage; now: () => Date
@@ -97,6 +76,7 @@ export async function commitTurnNoProgress(
   const result = { status: "failed", stepCount: denial.stepCount, toolCallCount: denial.toolCallCount, finalItemId: denial.finalItemId, waitId: null }
 
   return turnEngineTenantTransaction(pool, owner.userId, async client => {
+    const chronologyLock = await acquireRootTaskHistoryChronologyLock(client, owner.userId)
     if (!await lockTurnEngineOpenSession(client, owner) || !await lockTurnEngineOwnedTurn(client, owner)) throw conflict(`turn ${owner.turnId}`)
     await lockRootTask(client, owner)
     await assertSessionWorkAdmission(client, owner)
@@ -107,7 +87,7 @@ export async function commitTurnNoProgress(
     const stepRow = step.rows[0]
     if (!stepRow || stepRow.status !== "streaming") throw conflict(`no-progress Step ${denial.stepId} fence`)
     if (String(stepRow.inputThroughSequence) !== denial.inputThroughSequence.toString()
-      || !sameJson(stepRow.consumedInputIds, denial.consumedInputIds)) return { status: "input_changed" }
+      || !sameInputIds(stepRow.consumedInputIds, denial.consumedInputIds)) return { status: "input_changed" }
 
     const pending = await client.query<TurnEngineRow>(`SELECT "id" FROM "agent_inputs" WHERE "sessionId"=$1 AND "userId"=$2 AND "targetTurnId"=$3
       AND "delivery"='steer' AND "status" IN ('accepted','queued','consumed') AND "cancelledAt" IS NULL
@@ -162,6 +142,10 @@ export async function commitTurnNoProgress(
     [owner.sessionId, owner.userId, owner.turnId, now])
     await cleanupFailedRootTaskGraph(client, { id: owner.taskId, userId: owner.userId, sessionId: owner.sessionId,
       turnId: owner.turnId, rootTaskId: owner.taskId, parentTaskId: null, taskType: "root" }, { kind: "terminal-failed-turn-recovery" }, now)
+    const terminalEvent = saved[entries.length - 1]
+    if (!terminalEvent || entries[entries.length - 1]?.type !== "turn.failed") throw conflict(`no-progress root terminal event ${owner.turnId}`)
+    await appendRootTaskHistoryChronologyWitness(client, { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId,
+      rootTaskId: owner.rootTaskId, boundary: "root_terminal", boundaryEventId: terminalEvent.id }, chronologyLock)
     return { status: "no_progress", finalItemId: denial.finalItemId, events: entries.map((entry, index) => ({
       id: saved[index]!.id, type: entry.type, itemId: entry.itemId, correlationId: entry.correlationId,
       causationId: index ? saved[index - 1]!.id : String(start.rows[0]!.id), payload: toRepositoryJson(entry.payload),
@@ -255,42 +239,4 @@ async function lockRootTask(client: TurnEngineQueryClient, owner: Extract<Execut
   if (!row || row.status !== "running" || row.leaseOwner !== owner.ownerId || Number(row.attemptCount) !== 1 || row.interruptRequestedAt != null) {
     throw conflict(`no-progress root task ${owner.taskId} fence`)
   }
-}
-
-function isTaskGraphTerminalDenial(error: NoProgressError): boolean {
-  return error.reasonCode === "repeated_signature" && error.observation.signature === "task_graph_terminal_denial"
-    && error.observation.stateFingerprint === error.observation.signature
-}
-
-function validDenial(value: AtomicTurnNoProgressInput): boolean {
-  return !!value && typeof value === "object" && typeof value.stepId === "string" && value.stepId.length > 0
-    && typeof value.finalItemId === "string" && value.finalItemId.length > 0 && typeof value.inputThroughSequence === "bigint"
-    && value.inputThroughSequence >= 0n && Array.isArray(value.consumedInputIds)
-    && value.consumedInputIds.every(id => typeof id === "string" && id.length > 0)
-    && new Set(value.consumedInputIds).size === value.consumedInputIds.length
-    && Number.isSafeInteger(value.stepCount) && value.stepCount >= 0 && Number.isSafeInteger(value.toolCallCount) && value.toolCallCount >= 0
-    && value.reasonCode === "repeated_signature" && value.signature === "task_graph_terminal_denial"
-    && value.stateFingerprint === value.signature && value.signature.length <= 256
-    && typeof value.stateFingerprint === "string" && value.stateFingerprint.length > 0 && value.stateFingerprint.length <= 256
-}
-
-function sameCheckpoint(left: TaskGraphDenialCheckpoint, right: TaskGraphDenialCheckpoint | null): boolean {
-  return !!right && left.taskId === right.taskId && left.graphRevision === right.graphRevision
-    && left.verificationDigest === right.verificationDigest
-}
-
-function terminalEntries(owner: ExecutionOwnerFence, denial: AtomicTurnNoProgressInput, final: RepositoryJsonValue) {
-  const prefix = `turn:${owner.turnId}:event:`
-  return [
-    { suffix: `step-failed:${denial.stepId}`, type: "step.completed", itemId: null, correlationId: denial.stepId, causationId: null,
-      payload: { stepId: denial.stepId, status: "failed", errorCode: "no_progress", taskId: owner.taskId } },
-    { suffix: "turn-no-progress", type: "turn.no_progress", itemId: null, correlationId: owner.turnId, causationId: null,
-      payload: { reasonCode: denial.reasonCode, signature: denial.signature, stateFingerprint: denial.stateFingerprint, taskId: owner.taskId } },
-    { suffix: `item-started:${denial.finalItemId}`, type: "item.started", itemId: denial.finalItemId, correlationId: denial.stepId, causationId: null,
-      payload: { itemId: denial.finalItemId, type: "agent_message", phase: "final_answer" } },
-    { suffix: `final-completed:${denial.finalItemId}:1`, type: "item.completed", itemId: denial.finalItemId, correlationId: denial.finalItemId, causationId: null,
-      payload: { itemId: denial.finalItemId, status: "completed", content: denial.finalContent } },
-    { suffix: "turn-failed:no_progress", type: "turn.failed", itemId: denial.finalItemId, correlationId: owner.turnId, causationId: null,
-      payload: { turnId: owner.turnId, taskId: owner.taskId, errorCode: "no_progress", finalItemId: denial.finalItemId, final } },
-  ] as const
 }

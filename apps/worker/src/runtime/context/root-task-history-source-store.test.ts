@@ -1,13 +1,18 @@
 import type pg from "pg"
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import { readRootTaskHistoryCandidates } from "./root-task-history-source-store.js"
 import { rootTaskHistoryIndexKeys, rootTaskHistoryObjectiveDigest, type RootTaskHistoryFence, type RootTaskHistoryFenceInput } from "./root-task-history-fence.js"
 import { OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION } from "./objective-history-projection.js"
 
+const { readWitness } = vi.hoisted(() => ({ readWitness: vi.fn(async (_client: unknown, _input: { boundaryEventId: string }): Promise<{ eventId: string; xid8: string } | undefined> => ({ eventId: "source-witness", xid8: "8" })) }))
+vi.mock("./root-task-history-chronology-witness.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("./root-task-history-chronology-witness.js")>()),
+  readRootTaskHistoryChronologyWitness: readWitness,
+}))
+
 type Row = Record<string, unknown>
 const DISCOVERY_GOAL = "Discover and shortlist relevant jobs from my saved job inventory, using target roles and locations when configured."
 const sourceTime = new Date("2026-10-07T11:00:00.000Z")
-const currentTime = new Date("2026-10-07T12:00:00.000Z")
 const verificationRequirements = { schemaVersion: "agent-harness.v2.objective-requirements.v1", requirements: [
   { id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 3 } },
 ] }
@@ -26,7 +31,7 @@ const input: RootTaskHistoryFenceInput = {
 const indexKeys = rootTaskHistoryIndexKeys("user", { goal: "Find roles", successCriteria: ["Use saved filters"] },
   { goal: "Find roles", successCriteria: ["Use saved filters"] }, true)!
 const fence: RootTaskHistoryFence = {
-  currentStartSequence: 2n, currentStartCreatedAt: currentTime,
+  currentStartSequence: 2n, currentStartWitness: { eventId: "start-witness", xid8: "10" },
   currentOrigin: JSON.stringify(["user", "none"]),
   objectiveDigest: rootTaskHistoryObjectiveDigest({ goal: "Find roles", successCriteria: ["Use saved filters"] },
     { goal: "Find roles", successCriteria: ["Use saved filters"] })!,
@@ -35,25 +40,30 @@ const fence: RootTaskHistoryFence = {
 }
 
 function row(overrides: Row = {}): Row {
-  const turnId = "source-turn", rootTaskId = "source-root", sessionId = "source-session", stepId = "source-step"
+  const turnId = typeof overrides.turnId === "string" ? overrides.turnId : "source-turn"
+  const rootTaskId = typeof overrides.rootTaskId === "string" ? overrides.rootTaskId : "source-root"
+  const sessionId = typeof overrides.sessionId === "string" ? overrides.sessionId : "source-session"
+  const stepId = typeof overrides.terminalStepId === "string" ? overrides.terminalStepId : turnId === "source-turn" ? "source-step" : `${turnId}-step`
+  const finalItemId = typeof overrides.terminalItemId === "string" ? overrides.terminalItemId : turnId === "source-turn" ? "source-final" : `${turnId}-final`
   return {
     turnId, sessionId, userId: "user-a", turnSource: "user", sourceSessionUserId: "user-a", sourceSessionStatus: "completed",
     rootTaskId, turnStatus: "completed", input: { goal: "Find roles", successCriteria: ["Use saved filters"] },
     taskId: rootTaskId, taskTurnId: turnId, taskRootTaskId: rootTaskId, parentTaskId: null,
     taskRole: "orchestrator", taskType: "root", taskStatus: "completed", goal: "Find roles", successCriteria: ["Use saved filters"],
     startTurnId: turnId, startTaskId: rootTaskId, startItemId: null, startSequence: "90", startType: "turn.started",
-    startActor: "orchestrator", startCorrelationId: turnId, startIdempotencyKey: "turn:source-turn:event:turn-started",
+    startActor: "orchestrator", startCorrelationId: turnId, startIdempotencyKey: `turn:${turnId}:event:turn-started`,
     startPayload: { taskId: rootTaskId, rootTaskId }, startEventCount: 1,
-    terminalTurnId: turnId, terminalTaskId: rootTaskId, terminalItemId: "source-final", terminalSequence: "200",
+    terminalTurnId: turnId, terminalTaskId: rootTaskId, terminalItemId: finalItemId, terminalSequence: "200",
     terminalType: "turn.completed", terminalActor: "orchestrator", terminalCorrelationId: stepId,
     terminalStepId: stepId, terminalStepSessionId: sessionId, terminalStepTurnId: turnId, terminalStepTaskId: rootTaskId,
     terminalStepStatus: "completed", terminalStepEventSessionId: sessionId, terminalStepEventTurnId: turnId,
     terminalStepEventTaskId: rootTaskId, terminalStepEventItemId: null, terminalStepEventSequence: "100",
     terminalStepEventType: "step.completed", terminalStepEventActor: "orchestrator", terminalStepEventCorrelationId: stepId,
-    terminalStepEventIdempotencyKey: "turn:source-turn:event:step-completed:source-step",
+    terminalStepEventIdempotencyKey: `turn:${turnId}:event:step-completed:${stepId}`,
     terminalStepEventPayload: { stepId, status: "completed", taskId: rootTaskId }, terminalStepEventCount: 1,
-    terminalIdempotencyKey: "turn:source-turn:event:turn-completed",
-    terminalPayload: { turnId, taskId: rootTaskId, finalItemId: "source-final" }, terminalCreatedAt: sourceTime, terminalEventCount: 1,
+    terminalIdempotencyKey: `turn:${turnId}:event:turn-completed`,
+    terminalPayload: { turnId, taskId: rootTaskId, finalItemId }, terminalCreatedAt: sourceTime, terminalEventCount: 1,
+    terminalEventId: "source-parent", terminalWitnessEventId: "source-witness", terminalWitnessXid8: "8", terminalWitnessCount: 1,
     ...overrides,
   }
 }
@@ -96,7 +106,7 @@ function indexedRow(overrides: Row = {}): Row {
 const readyRow = { indexName: "agent_turns_objective_history", semanticsVersion: OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, isReady: true }
 
 describe("Root history source scan", () => {
-  it("scans same-user sessions by strict DB time, then validates origin and source terminal receipts", async () => {
+  it("filters witnessed terminals by numeric xid8 before the bounded scan, then validates source receipts", async () => {
     const queries: Array<{ sql: string; values?: readonly unknown[] }> = []
     const valid = row()
     const invalid = [
@@ -105,57 +115,101 @@ describe("Root history source scan", () => {
       row({ sourceSessionStatus: "archived" }),
       row({ input: { goal: "Find roles", successCriteria: ["Use saved filters"], intent: { kind: "unknown", version: 1 } } }),
       row({ input: { goal: "Find roles", successCriteria: ["Use saved filters"], selectedJobPreparation: null } }),
-      row({ terminalCreatedAt: new Date(Number.NaN) }),
-      row({ terminalCreatedAt: currentTime }),
-      row({ terminalCreatedAt: new Date(currentTime.getTime() + 1) }),
+      row({ terminalWitnessXid8: "bad" }),
+      row({ terminalWitnessXid8: "10" }),
+      row({ terminalWitnessXid8: "11" }),
+      row({ terminalWitnessCount: 2 }),
       row({ successCriteria: ["Changed filters"] }),
     ]
 
     const results = await readRootTaskHistoryCandidates(client([valid, ...invalid], queries) as unknown as pg.PoolClient, input, fence)
 
     expect(results).toHaveLength(1)
-    expect(results[0]).toMatchObject({ sessionId: "source-session", turnId: "source-turn", terminalSequence: 200n, terminalAt: sourceTime })
-    expect(queries).toHaveLength(1)
-    expect(queries[0]?.values).toEqual(["current-session", "user-a", "current-turn", currentTime, null, 64])
-    expect(queries[0]?.sql).toContain('source_session."userId" = $2')
-    expect(queries[0]?.sql).toContain('source_session."status" NOT IN (\'aborted\', \'archived\')')
-    expect(queries[0]?.sql).toContain('current_session."id" = $1 AND current_session."userId" = $2')
-    expect(queries[0]?.sql).toContain('event."createdAt" < $4::timestamptz')
-    expect(queries[0]?.sql).toContain('ORDER BY event."createdAt" DESC, event."turnId" DESC')
-    expect(queries[0]?.sql).not.toContain('event."sequence" < $4::bigint')
-    const terminalWindow = queries[0]!.sql.slice(queries[0]!.sql.indexOf("WITH terminal_window"), queries[0]!.sql.indexOf("), roots"))
+    expect(results[0]).toMatchObject({ sessionId: "source-session", turnId: "source-turn", terminalSequence: 200n,
+      terminalXid8: "8", terminalWitnessEventId: "source-witness" })
+    expect(queries).toHaveLength(2)
+    expect(queries[0]?.values).toEqual(["current-session", "user-a", "current-turn", "2", null, 64])
+    expect(queries[1]?.values).toEqual(["current-session", "user-a", "current-turn", "10", null,
+      fence.objectiveDigest, OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, fence.currentOrigin, 64])
+    expect(queries[1]?.sql).toContain('source_session."userId" = $2')
+    expect(queries[1]?.sql).toContain('source_session."status" NOT IN (\'aborted\', \'archived\')')
+    expect(queries[1]?.sql).toContain('current_session."id" = $1 AND current_session."userId" = $2')
+    expect(queries[1]?.sql).toContain("witness.payload->>'xid8'")
+    expect(queries[1]?.sql).toContain("(witness.payload->>'xid8')::numeric < $4::numeric")
+    expect(queries[1]?.sql).toContain('ORDER BY (witness.payload->>\'xid8\')::numeric DESC, event."turnId" DESC')
+    expect(queries[1]?.sql).toContain('JOIN "agent_outbox" AS dispatch')
+    expect(queries[1]?.sql).not.toContain('event."sequence" < $4::bigint')
+    const terminalWindow = queries[1]!.sql.slice(queries[1]!.sql.indexOf("WITH terminal_window"), queries[1]!.sql.indexOf("), roots"))
     expect(terminalWindow).toContain("CASE WHEN $5::jsonb IS NULL THEN NOT")
-    expect(terminalWindow.indexOf("CASE WHEN $5::jsonb IS NULL")).toBeLessThan(terminalWindow.indexOf("LIMIT $6"))
+    expect(terminalWindow.indexOf("CASE WHEN $5::jsonb IS NULL")).toBeLessThan(terminalWindow.indexOf("LIMIT $9"))
   })
 
-  it("keeps the legacy bounded scan when readiness is missing, false, unknown, or version-mismatched", async () => {
-    const readinessRows: readonly (readonly Row[])[] = [
-      [],
-      [{ ...readyRow, isReady: false }],
-      [{ ...readyRow, indexName: "unknown_index" }],
-      [{ ...readyRow, semanticsVersion: OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION + 1 }],
-      [{ ...readyRow, isReady: "true" }],
-    ]
-    for (const readiness of readinessRows) {
-      const queries: Array<{ sql: string; values?: readonly unknown[] }> = []
-      const results = await readRootTaskHistoryCandidates(
-        indexedClient(readiness, [row()], queries) as unknown as pg.PoolClient,
-        { ...input, objectiveHistoryIndexEnabled: true }, fence,
-      )
-      expect(results).toHaveLength(1)
-      expect(queries).toHaveLength(2)
-      expect(queries[0]?.sql).toContain('FROM "agent_objective_history_index_readiness"')
-      expect(queries[0]?.sql).toContain('"isReady" = TRUE')
-      expect(queries[0]?.sql).toContain("FOR SHARE")
-      expect(queries[1]?.values).toEqual(["current-session", "user-a", "current-turn", currentTime, null, 64])
-      expect(queries[1]?.sql).toContain('FROM "agent_events" AS event')
-      expect(queries[1]?.sql).toContain('JOIN "agent_turns" AS turn')
-    }
-  })
-
-  it("applies full cross-session keys before LIMIT and re-derives indexed source keys", async () => {
+  it.each(["10", "11"])('excludes a same-session terminal whose release witness xid8 is %s at or after the start boundary', async xid8 => {
     const queries: Array<{ sql: string; values?: readonly unknown[] }> = []
-    const badOrigin = indexedRow({ turnCanonicalOriginDigest: "0".repeat(64) })
+    const local = row({ sessionId: input.lease.sessionId, terminalStepSessionId: input.lease.sessionId,
+      terminalStepEventSessionId: input.lease.sessionId })
+    readWitness.mockResolvedValueOnce({ eventId: "late-release-witness", xid8 })
+
+    const results = await readRootTaskHistoryCandidates(client([local], queries) as unknown as pg.PoolClient, input,
+      { ...fence, currentStartSequence: 300n })
+
+    expect(results).toEqual([])
+  })
+
+  it("keeps legacy same-session history without a witness and suppresses cross-session composition", async () => {
+    const queries: Array<{ sql: string; values?: readonly unknown[] }> = []
+    const local = row({ sessionId: input.lease.sessionId, terminalStepSessionId: input.lease.sessionId,
+      terminalStepEventSessionId: input.lease.sessionId })
+    readWitness.mockResolvedValueOnce(undefined)
+
+    const results = await readRootTaskHistoryCandidates(client([local], queries) as unknown as pg.PoolClient, input,
+      { ...fence, currentStartSequence: 300n })
+
+    expect(results).toHaveLength(1)
+    expect(results[0]).not.toHaveProperty("terminalXid8")
+    expect(queries).toHaveLength(1)
+  })
+
+  it("drops a later release witness beside a missing legacy witness without reading foreign history", async () => {
+    const queries: Array<{ sql: string; values?: readonly unknown[] }> = []
+    const currentSession = input.lease.sessionId
+    const late = row({ turnId: "late-turn", rootTaskId: "late-root", sessionId: currentSession,
+      terminalEventId: "late-parent", terminalSequence: "230", terminalStepSessionId: currentSession,
+      terminalStepEventSessionId: currentSession })
+    const legacy = row({ turnId: "legacy-turn", rootTaskId: "legacy-root", sessionId: currentSession,
+      terminalEventId: "legacy-parent", terminalSequence: "220", terminalStepSessionId: currentSession,
+      terminalStepEventSessionId: currentSession })
+    readWitness.mockResolvedValueOnce({ eventId: "late-release-witness", xid8: "11" })
+    readWitness.mockResolvedValueOnce(undefined)
+
+    const results = await readRootTaskHistoryCandidates(client([late, legacy], queries) as unknown as pg.PoolClient, input,
+      { ...fence, currentStartSequence: 300n })
+
+    expect(results.map(source => source.turnId)).toEqual(["legacy-turn"])
+    expect(queries).toHaveLength(1)
+  })
+
+  it("disables the objective index for cross-session reads even when it is ready", async () => {
+    const queries: Array<{ sql: string; values?: readonly unknown[] }> = []
+    const results = await readRootTaskHistoryCandidates(
+      indexedClient([readyRow], [row()], queries) as unknown as pg.PoolClient,
+      { ...input, objectiveHistoryIndexEnabled: true }, fence,
+    )
+    expect(results).toHaveLength(1)
+    expect(queries).toHaveLength(3)
+    expect(queries[0]?.sql).toContain("agent_objective_history_index_readiness")
+    expect(queries[1]?.sql).toContain('turn."terminalEventAt"')
+    expect(queries[2]?.values).toEqual(["current-session", "user-a", "current-turn", "10", null,
+      fence.objectiveDigest, OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, fence.currentOrigin, 64])
+    expect(queries[2]?.sql).toContain('FROM "agent_events" AS event')
+    expect(queries[2]?.sql).toContain('JOIN "agent_turns" AS turn')
+    expect(queries[2]?.sql).toContain('terminalWitnessXid8')
+    expect(queries[2]?.sql).not.toContain('turn."terminalEventAt"')
+  })
+
+  it("applies cross-session chronology before LIMIT and re-derives the canonical origin", async () => {
+    const queries: Array<{ sql: string; values?: readonly unknown[] }> = []
+    const badOrigin = row({ input: { goal: "Find roles", successCriteria: ["Use saved filters"], intent: { kind: "unknown", version: 1 } } })
     const staleProjection = indexedRow({ input: { goal: "Changed objective", successCriteria: ["Use saved filters"] } })
     const results = await readRootTaskHistoryCandidates(
       indexedClient([readyRow], [indexedRow(), badOrigin, staleProjection], queries) as unknown as pg.PoolClient,
@@ -163,21 +217,17 @@ describe("Root history source scan", () => {
     )
 
     expect(results).toHaveLength(1)
-    expect(queries).toHaveLength(2)
-    expect(queries[1]?.values).toEqual([
-      "current-session", "user-a", "current-turn", currentTime, indexKeys.objectiveDigest,
-      indexKeys.canonicalOriginDigest, OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, null, 64,
-    ])
-    const terminalWindow = queries[1]!.sql.slice(queries[1]!.sql.indexOf("WITH terminal_window"), queries[1]!.sql.indexOf("), roots"))
-    expect(terminalWindow).toContain('FROM "agent_turns" AS turn')
-    expect(terminalWindow).toContain('turn."objectiveDigest" = $5')
-    expect(terminalWindow).toContain('turn."canonicalOriginDigest" = $6')
+    expect(queries).toHaveLength(3)
+    expect(queries[2]?.values).toEqual(["current-session", "user-a", "current-turn", "10", null,
+      fence.objectiveDigest, OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, fence.currentOrigin, 64])
+    const terminalWindow = queries[2]!.sql.slice(queries[2]!.sql.indexOf("WITH terminal_window"), queries[2]!.sql.indexOf("), roots"))
+    expect(terminalWindow).toContain('JOIN "agent_turns" AS turn')
+    expect(terminalWindow).toContain('turn."objectiveDigest" = $6')
     expect(terminalWindow).toContain('turn."objectiveIndexSemanticsVersion" = $7')
-    expect(terminalWindow).toContain('turn."terminalEventAt" < $4::timestamptz')
-    expect(terminalWindow).toContain("CASE WHEN $8::jsonb IS NULL THEN NOT")
-    expect(terminalWindow.indexOf("CASE WHEN $8::jsonb IS NULL")).toBeLessThan(terminalWindow.indexOf("LIMIT $9"))
-    expect(terminalWindow.indexOf('turn."canonicalOriginDigest" = $6')).toBeLessThan(terminalWindow.indexOf("LIMIT $9"))
-    expect(terminalWindow).toContain('ORDER BY turn."terminalEventAt" DESC, turn."id" DESC')
+    expect(terminalWindow).toContain("jsonb_build_array(turn.\"source\", 'none') = $8::jsonb")
+    expect(terminalWindow.indexOf('turn."objectiveDigest" = $6')).toBeLessThan(terminalWindow.indexOf("LIMIT $9"))
+    expect(terminalWindow.indexOf("jsonb_build_array(turn.\"source\", 'none') = $8::jsonb")).toBeLessThan(terminalWindow.indexOf("LIMIT $9"))
+    expect(terminalWindow).toContain('ORDER BY (witness.payload->>\'xid8\')::numeric DESC, event."turnId" DESC')
     expect(queries[1]?.sql).toContain('terminal."createdAt" = roots."indexedTerminalAt"')
   })
 
@@ -188,8 +238,8 @@ describe("Root history source scan", () => {
     )
 
     expect(results).toEqual([])
-    expect(queries[0]?.sql).toMatch(/^\s*(?:INNER\s+)?JOIN "agent_sessions" AS source_session ON source_session\."id" = event\."sessionId"/m)
-    expect(queries[0]?.sql).toContain('source_session."userId" = $2')
+    expect(queries[1]?.sql).toMatch(/^\s*(?:INNER\s+)?JOIN "agent_sessions" AS source_session ON source_session\."id" = event\."sessionId"/m)
+    expect(queries[1]?.sql).toContain('source_session."userId" = $2')
   })
 
   it("rejects cross-session outcomes when saved discovery role or location filters differ", async () => {
@@ -255,12 +305,14 @@ describe("Root history source scan", () => {
     const results = await readRootTaskHistoryCandidates(client(rows, queries) as unknown as pg.PoolClient, input, scheduledFence)
 
     expect(results).toHaveLength(1)
-    expect(queries[0]?.values).toEqual(["current-session", "user-a", "current-turn", currentTime, JSON.stringify(scheduledCriteria), 64])
-    const terminalWindow = queries[0]!.sql.slice(queries[0]!.sql.indexOf("WITH terminal_window"), queries[0]!.sql.indexOf("), roots"))
+    expect(queries[0]?.values).toEqual(["current-session", "user-a", "current-turn", "2", JSON.stringify(scheduledCriteria), 64])
+    expect(queries[1]?.values).toEqual(["current-session", "user-a", "current-turn", "10", JSON.stringify(scheduledCriteria),
+      fence.objectiveDigest, OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, scheduledFence.currentOrigin, 64])
+    const terminalWindow = queries[1]!.sql.slice(queries[1]!.sql.indexOf("WITH terminal_window"), queries[1]!.sql.indexOf("), roots"))
     expect(terminalWindow).toContain("COALESCE((turn.\"source\" = 'automation' AND turn.\"input\"->>'automationRunMode' = 'scheduled'), FALSE)")
     expect(terminalWindow).toContain("turn.\"source\" = 'automation'")
     expect(terminalWindow).toContain("turn.\"input\"->>'automationRunMode' = 'scheduled'")
-    expect(terminalWindow.indexOf("scheduledAutomationSnapshot")).toBeLessThan(terminalWindow.indexOf("LIMIT $6"))
+    expect(terminalWindow.indexOf("scheduledAutomationSnapshot")).toBeLessThan(terminalWindow.indexOf("LIMIT $9"))
   })
 
   it("binds scheduled compatibility before LIMIT in all four candidate windows", async () => {
@@ -289,15 +341,16 @@ describe("Root history source scan", () => {
     const cases: Array<{ label: string; indexed: boolean; row: Row; queryIndex: number; readInput: RootTaskHistoryFenceInput;
       readFence: RootTaskHistoryFence; values: readonly unknown[]; parameter: string; limit: string }> = [
       { label: "legacy cross-session", indexed: false, row: row({ turnSource: "automation", input: scheduledInput }),
-        queryIndex: 0, readInput: input, readFence: crossFence,
-        values: ["current-session", "user-a", "current-turn", currentTime, serializedCriteria, 64], parameter: "$5", limit: "LIMIT $6" },
+        queryIndex: 1, readInput: input, readFence: crossFence,
+        values: ["current-session", "user-a", "current-turn", "10", serializedCriteria,
+          crossFence.objectiveDigest, OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, crossFence.currentOrigin, 64], parameter: "$5", limit: "LIMIT $9" },
       { label: "legacy same-session", indexed: false, row: currentSessionRow, queryIndex: 0,
         readInput: { ...input, crossSessionRootTaskHistoryEnabled: undefined }, readFence: sameFence,
         values: ["current-session", "user-a", "current-turn", "300", serializedCriteria, 64], parameter: "$5", limit: "LIMIT $6" },
-      { label: "indexed cross-session", indexed: true, row: crossIndexedRow, queryIndex: 1,
+      { label: "cross-session index disabled", indexed: false, row: crossIndexedRow, queryIndex: 2,
         readInput: { ...input, objectiveHistoryIndexEnabled: true }, readFence: crossFence,
-        values: ["current-session", "user-a", "current-turn", currentTime, crossKeys.objectiveDigest,
-          crossKeys.canonicalOriginDigest, OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, serializedCriteria, 64], parameter: "$8", limit: "LIMIT $9" },
+        values: ["current-session", "user-a", "current-turn", "10", serializedCriteria,
+          crossFence.objectiveDigest, OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION, crossFence.currentOrigin, 64], parameter: "$5", limit: "LIMIT $9" },
       { label: "indexed same-session", indexed: true, row: sameIndexedRow, queryIndex: 1,
         readInput: { ...input, crossSessionRootTaskHistoryEnabled: undefined, objectiveHistoryIndexEnabled: true }, readFence: sameFence,
         values: ["current-session", "user-a", "current-turn", "300", sameKeys.objectiveDigest,

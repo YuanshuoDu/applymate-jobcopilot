@@ -7,6 +7,8 @@ import { formatSessionClock, sessionHeaderSubtitle, sessionStatusLabel } from '.
 import { AgentSessionTools } from './AgentSessionTools'
 import { SessionFocusPanel } from './SessionFocusPanel'
 import { useI18n } from '@/lib/i18n'
+import { AgentTaskHistoryMemoryConsent } from './AgentTaskHistoryMemoryConsent'
+import { EmptyText } from './AgentSessionConsoleParts'
 
 function statusColor(status: string): string {
   if (status === 'running') return 'var(--primary)'
@@ -136,6 +138,7 @@ export function AgentSessionConsole({
             {t('agent.viewAll')}
           </button>
         </div>
+        <AgentTaskHistoryMemoryConsent />
 
         <div style={{ padding: '0 10px 12px', display: 'flex', flexDirection: 'column', gap: 7 }}>
           {loading && <EmptyText>{t('agent.loadingSessions')}</EmptyText>}
@@ -229,13 +232,4 @@ export function AgentSessionConsole({
     </aside>
   )
 }
-
 const countStyle: React.CSSProperties = { border: '1px solid var(--border)', borderRadius: 7, padding: '5px 7px', background: 'var(--bg)', color: 'var(--primary)', cursor: 'pointer', font: 'inherit', fontSize: 11 }
-
-function EmptyText({ children, tone = 'muted', title }: { children: React.ReactNode; tone?: 'muted' | 'error'; title?: string }) {
-  return (
-    <div title={title} style={{ padding: 12, fontSize: 11, color: tone === 'error' ? 'var(--c-danger)' : 'var(--text-muted)', lineHeight: 1.5 }}>
-      {children}
-    </div>
-  )
-}

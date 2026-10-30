@@ -27,6 +27,16 @@ function json(route: Route, data: unknown, status = 200) {
   return route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(data) })
 }
 
+function parseAgentTaskHistoryMemoryMutation(value: unknown): { enabled: boolean; expectedVersion: number } | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null
+  const record = value as Record<string, unknown>
+  const keys = Object.keys(record).sort()
+  if (keys.length !== 2 || keys[0] !== 'enabled' || keys[1] !== 'expectedVersion') return null
+  if (typeof record.enabled !== 'boolean' || typeof record.expectedVersion !== 'number' ||
+      !Number.isSafeInteger(record.expectedVersion) || record.expectedVersion < 0 || record.expectedVersion > 2_147_483_647) return null
+  return { enabled: record.enabled, expectedVersion: record.expectedVersion }
+}
+
 function item(sessionId: string, turnId: string, id: string, text: string, overrides: Record<string, unknown> = {}) {
   return {
     schemaVersion: SCHEMA,
@@ -136,6 +146,7 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false, 
     waitHoldNextRequest: false,
     waitRequestHeld: false,
     releaseWaitRequest: null as (() => void) | null,
+    historyMemoryConsent: { enabled: false, version: 0 },
   }
   const stageStatus = () => {
     if (fixture.retryTurnStatus) return fixture.retryTurnStatus
@@ -153,6 +164,30 @@ async function installSupervisorFixture(page: Page, selectedJobEnabled = false, 
     expires: '2099-01-01T00:00:00.000Z',
   }))
   await page.route('**/api/me', route => json(route, { id: 'agent-supervisor-fixture', email: 'fixture@applymate.local', name: 'Fixture', plan: 'pro', onboardedAt: times.created }))
+  await page.route('**/api/me/agent-task-history-memory', async route => {
+    if (route.request().method() === 'GET') return json(route, fixture.historyMemoryConsent)
+    if (route.request().method() !== 'POST') return json(route, { error: 'method_not_allowed' }, 405)
+
+    let body: unknown
+    try {
+      body = route.request().postDataJSON() as unknown
+    } catch {
+      return json(route, { error: 'invalid_agent_task_history_memory_consent' }, 400)
+    }
+    const mutation = parseAgentTaskHistoryMemoryMutation(body)
+    if (!mutation) return json(route, { error: 'invalid_agent_task_history_memory_consent' }, 400)
+
+    const current = fixture.historyMemoryConsent
+    if (mutation.expectedVersion !== current.version) {
+      return json(route, { error: 'VERSION_CONFLICT', ...current }, 409)
+    }
+    if (current.version === 2_147_483_647) {
+      return json(route, { error: 'VERSION_EXHAUSTED', ...current }, 409)
+    }
+
+    fixture.historyMemoryConsent = { enabled: mutation.enabled, version: current.version + 1 }
+    return json(route, fixture.historyMemoryConsent)
+  })
   await page.route('**/api/jobs**', route => {
     const url = new URL(route.request().url())
     if (selectedJobPendingWriter && fixture.selectedJobStarted && route.request().method() === 'GET' && url.pathname === '/api/jobs/fixture-selected-job') {

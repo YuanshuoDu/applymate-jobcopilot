@@ -30,7 +30,7 @@ describe("Turn shutdown", () => {
     const controller = new TurnShutdownController({ pool: fake.pool, active, closeQueue })
     await controller.shutdown("SIGTERM")
     expect(abort).toHaveBeenCalledOnce()
-    expect(fake.calls.some((sql) => sql.includes('SET "status" = $5'))).toBe(true)
+    expect(fake.calls.some((sql) => /SET "status"\s*=\s*\$5/.test(sql))).toBe(true)
     expect(fake.calls.some((sql) => sql.includes('SET "status" = \'interrupted\''))).toBe(false)
     expect(closeQueue).toHaveBeenCalledOnce()
   })

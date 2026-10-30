@@ -6,6 +6,7 @@ import { lockTaskGraphScope, type GraphScope } from "../subagents/task-graph-pg-
 import { digestNativeVerificationValue } from "../subagents/native-verification-contract.js"
 import { isScheduledAutomationTurn, scheduledAutomationCriteria, type ScheduledAutomationCriteria } from "../subagents/scheduled-automation-snapshot.js"
 import { resolveRootTaskObjective, resolveRootTaskVerificationRequirements } from "./root-task-objective.js"
+import { readRootTaskHistoryChronologyWitness, type RootTaskHistoryChronologyWitness } from "./root-task-history-chronology-witness.js"
 
 type Client = pg.PoolClient
 type Row = Record<string, unknown>
@@ -22,11 +23,11 @@ export type RootTaskHistoryFenceInput = Readonly<{
 
 export type RootTaskHistoryFence = Readonly<{
   currentStartSequence: bigint
+  currentStartWitness?: RootTaskHistoryChronologyWitness
   objectiveDigest: string
   scheduledAutomationCriteria?: ScheduledAutomationCriteria
   objectiveHistoryIndexObjectiveDigest?: string
   objectiveHistoryIndexCanonicalOriginDigest?: string
-  currentStartCreatedAt?: Date
   currentOrigin?: string
 }>
 
@@ -141,10 +142,10 @@ export function rootTaskHistoryIndexKeys(
   }
 }
 
-async function currentStart(client: Queryable, input: RootTaskHistoryFenceInput): Promise<Readonly<{ sequence: bigint; createdAt?: Date }> | undefined> {
+async function currentStart(client: Queryable, input: RootTaskHistoryFenceInput): Promise<Readonly<{ eventId: string; sequence: bigint }> | undefined> {
   const { lease } = input
-  const result = await client.query<Row>(`SELECT event."sessionId", event."turnId", event."taskId", event."itemId", event."sequence",
-      event."type", event."actor", event."correlationId", event."idempotencyKey", event."payload", event."createdAt",
+  const result = await client.query<Row>(`SELECT event."id", event."sessionId", event."turnId", event."taskId", event."itemId", event."sequence",
+      event."type", event."actor", event."correlationId", event."idempotencyKey", event."payload",
       COUNT(*) OVER () AS "startEventCount"
     FROM "agent_events" AS event
     JOIN "agent_turns" AS turn ON turn."id" = event."turnId" AND turn."sessionId" = event."sessionId"
@@ -155,13 +156,11 @@ async function currentStart(client: Queryable, input: RootTaskHistoryFenceInput)
   [lease.sessionId, lease.turnId, input.rootTaskId, lease.userId])
   if (result.rows.length !== 1 || Number(result.rows[0]?.startEventCount) !== 1) return undefined
   const row = result.rows[0]!, payload = object(row.payload), value = sequence(row.sequence)
-  const createdAt = row.createdAt instanceof Date && Number.isFinite(row.createdAt.getTime()) ? row.createdAt : undefined
-  return row.sessionId === lease.sessionId && row.turnId === lease.turnId && row.taskId === input.rootTaskId
+  return text(row.id) && row.sessionId === lease.sessionId && row.turnId === lease.turnId && row.taskId === input.rootTaskId
     && row.itemId === null && row.type === "turn.started" && row.actor === "orchestrator"
     && row.correlationId === lease.turnId && row.idempotencyKey === `turn:${lease.turnId}:event:turn-started`
     && payload?.taskId === input.rootTaskId && payload.rootTaskId === input.rootTaskId && value
-    && (!input.crossSessionRootTaskHistoryEnabled || createdAt !== undefined)
-    ? { sequence: value, ...(createdAt ? { createdAt } : {}) } : undefined
+    ? { eventId: row.id, sequence: value } : undefined
 }
 
 /** Locks and validates the live ordinary Root, its current Step, Turn lease, objective, and unique start receipt. */
@@ -198,20 +197,25 @@ export async function readRootTaskHistoryFence(
   const scheduledCriteria = scheduledTurn ? scheduledAutomationCriteria(currentTurn.input) : undefined
   if (scheduledTurn && !scheduledCriteria) return undefined
   const currentOrigin = input.crossSessionRootTaskHistoryEnabled ? rootTaskHistoryOrigin(currentTurn.source, currentTurn.input) : undefined
-  if (input.crossSessionRootTaskHistoryEnabled && !currentOrigin) return undefined
   const objectiveDigest = rootTaskHistoryObjectiveDigest(currentTurn.input, root)
   if (!objectiveDigest) return undefined
   const indexKeys = input.objectiveHistoryIndexEnabled === true
-    ? rootTaskHistoryIndexKeys(currentTurn.source, currentTurn.input, root, input.crossSessionRootTaskHistoryEnabled === true)
+    ? rootTaskHistoryIndexKeys(currentTurn.source, currentTurn.input, root,
+      input.crossSessionRootTaskHistoryEnabled === true && currentOrigin !== undefined)
     : undefined
   if (input.objectiveHistoryIndexEnabled === true && !indexKeys) return undefined
   const start = await currentStart(client, input)
-  return start === undefined ? undefined : {
+  if (!start) return undefined
+  const currentStartWitness = input.crossSessionRootTaskHistoryEnabled === true && currentOrigin
+    ? await readRootTaskHistoryChronologyWitness(client, { boundaryEventId: start.eventId, boundary: "turn_start",
+      userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, rootTaskId: input.rootTaskId })
+    : undefined
+  return {
     currentStartSequence: start.sequence, objectiveDigest,
+    ...(currentStartWitness ? { currentStartWitness } : {}),
     ...(scheduledCriteria ? { scheduledAutomationCriteria: scheduledCriteria } : {}),
     ...(indexKeys ? { objectiveHistoryIndexObjectiveDigest: indexKeys.objectiveDigest,
       ...(indexKeys.canonicalOriginDigest ? { objectiveHistoryIndexCanonicalOriginDigest: indexKeys.canonicalOriginDigest } : {}) } : {}),
-    ...(input.crossSessionRootTaskHistoryEnabled && start.createdAt ? { currentStartCreatedAt: start.createdAt } : {}),
     ...(currentOrigin ? { currentOrigin } : {}),
   }
 }

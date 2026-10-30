@@ -17,12 +17,14 @@ const row = {
   id: "turn_1", sessionId: "session_1", userId: "user_1", rootTaskId: null, leaseOwnerId: "owner_1", leaseVersion: 8,
   leaseStartedAt: now, leaseExpiresAt: new Date(now.getTime() + 60_000),
 }
+function normalizedSql(sql: string): string { return sql.replace(/\s+/g, " ").trim() }
 
 function fakePool(rows: unknown[] = [row], sessionStatus = "running", sessionUserId = "user_1", rootRows?: unknown[]) {
   const calls: Array<[string, unknown[]?]> = []
   const client = {
     query: vi.fn(async (sql: string, params?: unknown[]) => {
       calls.push([sql, params])
+      if (sql.includes("pg_current_xact_id")) return { rows: [{ xid8: "42" }], rowCount: 1 }
       if (sql.includes('SELECT session."userId"')) {
         return ["missing", "aborted", "archived"].includes(sessionStatus) ? { rows: [], rowCount: 0 } : { rows: [{ userId: sessionUserId }], rowCount: 1 }
       }
@@ -55,6 +57,7 @@ function noProgressReceiptPool(overrides: Partial<PersistedFailure> = {}) {
   const client = {
     query: vi.fn(async (sql: string, values?: unknown[]) => {
       calls.push([sql, values])
+      if (sql.includes("pg_current_xact_id")) return { rows: [{ xid8: "42" }], rowCount: 1 }
       if (sql.includes('SELECT session."id" FROM "agent_sessions"')) {
         return values?.[0] === persisted.sessionId && values?.[1] === persisted.userId
           ? { rows: [{ id: persisted.sessionId }], rowCount: 1 }
@@ -67,6 +70,24 @@ function noProgressReceiptPool(overrides: Partial<PersistedFailure> = {}) {
         const exactFailure = persisted.turnStatus === "failed" && persisted.turnError === "no_progress"
           && persisted.rootStatus === "failed" && persisted.rootFailureReason === "no_progress" && persisted.terminalEvents
         return sameIdentity && exactFailure ? { rows: [{ id: persisted.turnId }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      }
+      if (sql.includes('SELECT "rootTaskId" FROM "agent_turns"')) return { rows: [{ rootTaskId: "root-turn-1" }], rowCount: 1 }
+      if (sql.includes('FROM "agent_events"')) {
+        const event = { id: "event-turn-failed", sessionId: persisted.sessionId, turnId: persisted.turnId, taskId: "root-turn-1",
+          itemId: "final-item", sequence: "12", type: "turn.failed", actor: "orchestrator", correlationId: persisted.turnId,
+          causationId: "event-final", idempotencyKey: `turn:${persisted.turnId}:event:turn-failed:no_progress`,
+          payload: { turnId: persisted.turnId, taskId: "root-turn-1", errorCode: "no_progress", finalItemId: "final-item", final: {} } }
+        if (sql.includes('WHERE "id"=$1 AND "sessionId"=$2')) return values?.[0] === event.id ? { rows: [event], rowCount: 1 } : { rows: [], rowCount: 0 }
+        return values?.[2] === event.idempotencyKey ? { rows: [{ id: event.id }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      }
+      if (sql.includes('FROM "agent_outbox"')) {
+        const eventId = "event-turn-failed"
+        const outbox = { id: `agent-outbox-${eventId}`, topic: "agent.events", aggregateId: persisted.sessionId,
+          idempotencyKey: `agent-event:${eventId}`, payload: { eventId, sessionId: persisted.sessionId, turnId: persisted.turnId,
+            taskId: "root-turn-1", itemId: "final-item", sequence: "12", type: "turn.failed", actor: "orchestrator",
+            correlationId: persisted.turnId, causationId: "event-final", idempotencyKey: `turn:${persisted.turnId}:event:turn-failed:no_progress`,
+            payload: { turnId: persisted.turnId, taskId: "root-turn-1", errorCode: "no_progress", finalItemId: "final-item", final: {} } } }
+        return values?.[0] === outbox.idempotencyKey || values?.[1] === outbox.id ? { rows: [outbox], rowCount: 1 } : { rows: [], rowCount: 0 }
       }
       return { rows: [], rowCount: 1 }
     }),
@@ -251,11 +272,12 @@ describe("database Turn lease", () => {
     const fake = fakePool()
     const current: TurnLease = { ...payload, userId: row.userId, leaseVersion: row.leaseVersion, leaseStartedAt: now, leaseExpiresAt: row.leaseExpiresAt }
     await expect(releaseTurnLease(fake.pool, current, "waiting_for_user", now)).resolves.toBe(true)
-    const [sql, params] = fake.calls.find(([text]) => text.includes('SET "status" = $5')) ?? ["", []]
-    expect(sql).toContain('"status" = \'in_progress\' OR ("status" = \'waiting_for_user\' AND $5 = \'waiting_for_user\')')
-    expect(sql).toContain('"revision" = "revision" + CASE WHEN "status" = $5 THEN 0 ELSE 1 END')
-    expect(sql).toContain('"userId" = $7')
-    expect(sql).toContain('"leaseExpiresAt" > $6')
+    const [sql, params] = fake.calls.find(([text]) => text.includes('SET "status"=$5')) ?? ["", []]
+    const statement = normalizedSql(sql)
+    expect(statement).toContain('"status"=\'in_progress\' OR ("status"=\'waiting_for_user\' AND $5=\'waiting_for_user\')')
+    expect(statement).toContain('"revision"="revision"+CASE WHEN "status"=$5 THEN 0 ELSE 1 END')
+    expect(statement).toContain('"userId"=$7')
+    expect(statement).toContain('"leaseExpiresAt">$6')
     expect(params).toEqual([current.turnId, current.sessionId, current.ownerId, current.leaseVersion, "waiting_for_user", now, current.userId])
   })
 
@@ -263,12 +285,13 @@ describe("database Turn lease", () => {
     const fake = fakePool()
     const current: TurnLease = { ...payload, userId: row.userId, leaseVersion: row.leaseVersion, leaseStartedAt: now, leaseExpiresAt: row.leaseExpiresAt }
     await expect(releaseTurnLease(fake.pool, current, "waiting_for_approval", now)).resolves.toBe(true)
-    const [sql, params] = fake.calls.find(([text]) => text.includes('SET "status" = $5')) ?? ["", []]
-    expect(sql).toContain('"status" = \'waiting_for_approval\' AND $5 = \'waiting_for_approval\'')
-    expect(sql).toContain('"revision" = "revision" + CASE WHEN "status" = $5 THEN 0 ELSE 1 END')
-    expect(sql).toContain('"leaseOwnerId" = $3')
-    expect(sql).toContain('"leaseVersion" = $4')
-    expect(sql).toContain('"leaseExpiresAt" > $6')
+    const [sql, params] = fake.calls.find(([text]) => text.includes('SET "status"=$5')) ?? ["", []]
+    const statement = normalizedSql(sql)
+    expect(statement).toContain('"status"=\'waiting_for_approval\' AND $5=\'waiting_for_approval\'')
+    expect(statement).toContain('"revision"="revision"+CASE WHEN "status"=$5 THEN 0 ELSE 1 END')
+    expect(statement).toContain('"leaseOwnerId"=$3')
+    expect(statement).toContain('"leaseVersion"=$4')
+    expect(statement).toContain('"leaseExpiresAt">$6')
     expect(params).toEqual([current.turnId, current.sessionId, current.ownerId, current.leaseVersion, "waiting_for_approval", now, current.userId])
   })
 
@@ -282,9 +305,10 @@ describe("database Turn lease", () => {
     const inputWrite = fake.calls.findIndex(([sql]) => sql.includes('UPDATE "agent_inputs"'))
     expect(turnWrite).toBeGreaterThan(-1)
     expect(inputWrite).toBeGreaterThan(turnWrite)
-    expect(fake.calls[inputWrite]?.[0]).toContain('"delivery" = \'follow_up\'')
-    expect(fake.calls[inputWrite]?.[0]).toContain('"status" IN (\'accepted\', \'queued\', \'consumed\')')
-    expect(fake.calls[inputWrite]?.[0]).not.toContain('"consumedByStepId" IS NULL')
+    const statement = normalizedSql(fake.calls[inputWrite]?.[0] ?? "")
+    expect(statement).toContain('"delivery"=\'follow_up\'')
+    expect(statement).toContain('"status" IN (\'accepted\',\'queued\',\'consumed\')')
+    expect(statement).not.toContain('"consumedByStepId" IS NULL')
     expect(fake.calls[inputWrite]?.[1]).toEqual([current.sessionId, current.userId, current.turnId, now])
   })
 
@@ -303,11 +327,15 @@ describe("database Turn lease", () => {
 
   it("treats release as idempotent after an atomic completed Turn receipt", async () => {
     const calls: string[] = []
-    const client = { query: vi.fn(async (sql: string) => {
+    const client = { query: vi.fn(async (sql: string, values?: unknown[]) => {
       calls.push(sql)
       if (sql.includes('SELECT session."id"')) return { rows: [{ id: "session_1" }], rowCount: 1 }
       if (sql.includes('UPDATE "agent_turns"')) return { rows: [], rowCount: 0 }
-      if (sql.includes('SELECT "id" FROM "agent_turns"') && sql.includes(`"status" = 'completed'`)) return { rows: [{ id: "turn_1" }], rowCount: 1 }
+      if (sql.includes('SELECT "id" FROM "agent_turns"') && sql.includes(`"status"='completed'`)
+        && sql.includes('"leaseOwnerId" IS NULL') && sql.includes('"leaseExpiresAt" IS NULL')) {
+        const exactIdentity = values?.[0] === row.id && values[1] === row.sessionId && values[2] === row.userId && values[3] === row.leaseVersion
+        return exactIdentity ? { rows: [{ id: row.id }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      }
       return { rows: [], rowCount: 0 }
     }), release: vi.fn() }
     const pool = { connect: vi.fn(async () => client) } as unknown as LeasePool
@@ -317,6 +345,8 @@ describe("database Turn lease", () => {
 
     expect(calls.filter(sql => sql.includes('UPDATE "agent_turns"'))).toHaveLength(1)
     expect(calls.some(sql => sql.includes('UPDATE "agent_inputs"'))).toBe(false)
+    const receipt = calls.find(sql => sql.includes('SELECT "id" FROM "agent_turns"'))
+    expect(normalizedSql(receipt ?? "")).toContain('"status"=\'completed\' AND "leaseOwnerId" IS NULL AND "leaseExpiresAt" IS NULL')
   })
 
   it("treats a failed release as idempotent only for the exact persisted no-progress terminal receipt", async () => {

@@ -34,7 +34,7 @@ describe("AgentForkService Turn projection", () => {
     expect(Object.keys(agentForkTurnSelect)).not.toContain("nativeSemanticProgressMode")
   })
 
-  it("excludes automatic discovery-memory events while keeping selected visible history", async () => {
+  it("excludes private memory events and root-task-history observations while keeping visible history", async () => {
     const at = new Date("2026-10-01T00:00:00.000Z")
     const source = {
       id: "source-session", userId: "owner", goal: "Goal", source: "user", memorySummary: null,
@@ -52,19 +52,43 @@ describe("AgentForkService Turn projection", () => {
           type: "agent.plan.discovery_persona_overflow", actor: "worker", correlationId: "turn-1", causationId: null,
           idempotencyKey: "discovery-persona-overflow:source-session:turn-1:v1",
           payload: { observedFactCount: 33, rawValue: "PRIVATE_OVERFLOW_VALUE" } },
-        { id: "visible-event", sessionId: "source-session", turnId: "turn-1", itemId: "visible-item", taskId: null, sequence: BigInt(3),
+        { id: "history-authorization-event", sessionId: "source-session", turnId: "turn-1", itemId: null, taskId: "root-1", sequence: BigInt(3),
+          type: "agent.plan.root_task_history_session_authorization", actor: "worker", correlationId: "turn-1", causationId: null,
+          idempotencyKey: "root-task-history-authorization:source-session:v1",
+          payload: { consentVersion: 12, enabled: true, snapshotKey: "PRIVATE_HISTORY_AUTHORIZATION_KEY" } },
+        { id: "history-snapshot-event", sessionId: "source-session", turnId: "turn-1", itemId: null, taskId: "root-1", sequence: BigInt(4),
+          type: "agent.plan.root_task_history_memory_snapshot", actor: "worker", correlationId: "turn-1", causationId: null,
+          idempotencyKey: "root-task-history-snapshot:source-session:v1",
+          payload: { id: "root-task-history", value: "PRIVATE_ROOT_TASK_HISTORY_EVENT" } },
+        { id: "turn-start-event", sessionId: "source-session", turnId: "turn-1", itemId: null, taskId: "root-1", sequence: BigInt(5),
+          type: "turn.started", actor: "orchestrator", correlationId: "turn-1", causationId: null,
+          idempotencyKey: "turn:turn-1:event:turn-started", payload: { taskId: "root-1", rootTaskId: "root-1" } },
+        { id: "history-chronology-event", sessionId: "source-session", turnId: "turn-1", itemId: null, taskId: "root-1", sequence: BigInt(6),
+          type: "agent.plan.root_task_history_chronology_witness", actor: "orchestrator", correlationId: "root-1", causationId: "turn-start-event",
+          idempotencyKey: "root-task-history-chronology-witness:turn_start:turn-start-event:v1",
+          payload: { schemaVersion: "agent-harness.v2.root-task-history-chronology-witness.v1", boundary: "turn_start", boundaryEventId: "turn-start-event", xid8: "90000000000000001" } },
+        { id: "visible-event", sessionId: "source-session", turnId: "turn-1", itemId: "visible-item", taskId: null, sequence: BigInt(7),
           type: "item.completed", actor: "worker", correlationId: "turn-1", causationId: null,
           idempotencyKey: "visible-item:completed", payload: { status: "completed" } },
       ],
-      contextSnapshots: [],
+      contextSnapshots: [{
+        id: "history-context-snapshot", throughSequence: BigInt(5), schemaVersion: "agent-harness.context.v1",
+        content: { context: { toolObservations: [
+          { id: "root-task-history", content: { kind: "root_task_history", value: "PRIVATE_ROOT_TASK_HISTORY_SNAPSHOT" } },
+          { id: "same-session-observation", content: { value: "Visible same-session observation" } },
+        ] } },
+        summary: "Visible fork summary", inputTokens: 4, outputTokens: 2, estimatedCostUsd: 0, tokenAccounting: {},
+      }],
     }
     const findFirst = vi.fn(async (args: { where: { id: string } }) => args.where.id === source.id ? source : null)
     const copiedEvents = vi.fn(async (_input: { data: Array<{ type: string; payload: unknown }> }) => ({ count: 1 }))
     const copiedItems = vi.fn(async (_input: { data: Array<{ content: unknown }> }) => ({ count: 1 }))
+    const copiedSnapshot = vi.fn(async (_input: { data: { content: unknown } }) => ({}))
     const tx = {
       $queryRaw: vi.fn(async () => [{ id: source.id }]),
       agentSession: { findFirst, create: vi.fn(async () => ({})), update: vi.fn(async () => ({})) },
       agentEvent: { findFirst: vi.fn(async () => null), create: vi.fn(async () => ({})), createMany: copiedEvents },
+      agentContextSnapshot: { create: copiedSnapshot },
       agentTurn: { createMany: vi.fn(async () => ({ count: 1 })) },
       agentItem: { createMany: copiedItems },
     }
@@ -76,11 +100,25 @@ describe("AgentForkService Turn projection", () => {
 
     expect(result.disposition).toBe("forked")
     const copied = copiedEvents.mock.calls[0]?.[0] as unknown as { data: Array<{ type: string; payload: unknown }> }
-    expect(copied.data.map(event => event.type)).toEqual(["item.completed"])
+    expect(copied.data.map(event => event.type)).toEqual(["turn.started", "item.completed"])
     const visible = copiedItems.mock.calls[0]?.[0] as unknown as { data: Array<{ content: unknown }> }
     expect(JSON.stringify(visible.data)).toContain("Visible user history")
     const serialized = JSON.stringify({ copied: copied.data.map(({ type, payload }) => ({ type, payload })), visible: visible.data })
     expect(serialized).not.toContain("PRIVATE_DISCOVERY_FACT_VALUE")
     expect(serialized).not.toContain("PRIVATE_OVERFLOW_VALUE")
+    expect(serialized).not.toContain("PRIVATE_HISTORY_AUTHORIZATION_KEY")
+    expect(serialized).not.toContain("PRIVATE_ROOT_TASK_HISTORY_EVENT")
+    expect(serialized).not.toContain("agent.plan.root_task_history_session_authorization")
+    expect(serialized).not.toContain("agent.plan.root_task_history_memory_snapshot")
+    expect(serialized).not.toContain("agent.plan.root_task_history_chronology_witness")
+    expect(serialized).not.toContain("90000000000000001")
+    expect(serialized).not.toContain("history-chronology-event")
+
+    expect(copiedSnapshot).toHaveBeenCalledOnce()
+    const snapshotContent = copiedSnapshot.mock.calls[0]?.[0].data.content
+    const snapshotText = JSON.stringify(snapshotContent)
+    expect(snapshotText).not.toContain("root-task-history")
+    expect(snapshotText).not.toContain("PRIVATE_ROOT_TASK_HISTORY_SNAPSHOT")
+    expect(snapshotText).toContain("Visible same-session observation")
   })
 })

@@ -1,12 +1,22 @@
 import { Buffer } from "node:buffer"
 import type pg from "pg"
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import { TASK_GRAPH_SNAPSHOT_VERSION, taskGraphItemId } from "../subagents/task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-pg-verification.js"
 import { ROLE_RESULT_SCHEMA } from "../subagents/role-results.js"
 import { resolveRootTaskObjective } from "./root-task-objective.js"
 import { createPgDirectRootTaskHistoryStore, type DirectRootTaskHistoryLoadInput } from "./root-task-history-direct-store.js"
+
+const { readWitness } = vi.hoisted(() => ({ readWitness: vi.fn(async (_client: unknown, input: { boundary: string; boundaryEventId: string; turnId: string }) => {
+  if (input.boundary === "turn_start") return { eventId: "start-marker", xid8: "1000" }
+  const index = Number(input.turnId.replace("turn-source-", ""))
+  return { eventId: `witness-${input.turnId}`, xid8: String(100 + index) }
+}) }))
+vi.mock("./root-task-history-chronology-witness.js", async importOriginal => ({
+  ...(await importOriginal<typeof import("./root-task-history-chronology-witness.js")>()),
+  readRootTaskHistoryChronologyWitness: readWitness,
+}))
 
 type Row = Record<string, unknown>
 type Options = Readonly<{
@@ -22,6 +32,8 @@ type Options = Readonly<{
   reportedOutput?: boolean
   sourceSessionStatusAtGraphLoad?: "archived" | "aborted"
   sourceSessionLockedAtGraphLoad?: boolean
+  tenantScope?: string | null
+  omitSameSessionTerminalTime?: boolean
 }>
 
 function candidate(index: number, terminalSequence = String(index * 2 + 2), status: "completed" | "failed" | "interrupted" = "completed"): Row {
@@ -36,6 +48,8 @@ function candidate(index: number, terminalSequence = String(index * 2 + 2), stat
     startActor: "orchestrator", startCorrelationId: turnId, startIdempotencyKey: `turn:${turnId}:event:turn-started`,
     startPayload: { taskId: rootTaskId, rootTaskId }, startEventCount: 1,
     terminalCreatedAt: new Date(`2026-10-07T11:${String(index).padStart(2, "0")}:00.000Z`),
+    terminalEventId: `terminal-parent-turn-source-${index}`,
+    terminalWitnessEventId: `witness-turn-source-${index}`, terminalWitnessXid8: String(100 + index), terminalWitnessCount: 1,
     turnSource: "user", sourceSessionUserId: "user-1", sourceSessionStatus: "running",
   }
   if (status === "completed") return {
@@ -64,6 +78,7 @@ function candidate(index: number, terminalSequence = String(index * 2 + 2), stat
 
 function currentStart(sequence = "1000"): Row {
   return {
+    id: "start-parent",
     sessionId: "session-1", turnId: "turn-current", taskId: "root-current", itemId: null, sequence,
     type: "turn.started", actor: "orchestrator", correlationId: "turn-current",
     idempotencyKey: "turn:turn-current:event:turn-started", payload: { taskId: "root-current", rootTaskId: "root-current" },
@@ -73,12 +88,16 @@ function currentStart(sequence = "1000"): Row {
 
 function fixture(options: Options = {}) {
   const queries: Array<{ sql: string; values?: readonly unknown[] }> = []
+  let connects = 0
+  let tenantScope = options.tenantScope === undefined ? "user-1" : options.tenantScope
   const sourceRows = options.candidates ?? [candidate(1)]
   const client = {
     async query(sql: string, values?: readonly unknown[]) {
       queries.push({ sql, values })
-      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 1 }
-      if (sql.includes("FOR SHARE")) return { rows: options.sourceSessionStatusAtGraphLoad || options.sourceSessionLockedAtGraphLoad ? [] : [{ id: values?.[0] }] }
+      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql)) return { rows: [], rowCount: 1 }
+      if (sql.includes("set_config")) { tenantScope = String(values?.[1]); return { rows: [], rowCount: 1 } }
+      if (sql.includes("current_setting('app.user_id'")) return { rows: [{ userId: tenantScope }] }
+      if (sql.includes("FOR SHARE") && sql.includes('FROM "agent_sessions"')) return { rows: options.sourceSessionStatusAtGraphLoad || options.sourceSessionLockedAtGraphLoad ? [] : [{ id: values?.[0] }] }
       if (sql.includes('SELECT "id" FROM "agent_sessions"')) return { rows: [{ id: "session-1" }] }
       if (sql.includes('SELECT "id" FROM "agent_turns"')) return { rows: [{ id: "turn-current" }] }
       if (sql.includes("FOR UPDATE OF task")) return { rows: [{
@@ -100,11 +119,22 @@ function fixture(options: Options = {}) {
       if (sql.includes("WITH terminal_window AS MATERIALIZED")) {
         if (options.candidateError) throw options.candidateError
         const limit = Number(values?.[values.length - 1] ?? 0)
-        const rows = [...sourceRows].sort((left, right) => sql.includes('ORDER BY terminal."createdAt" DESC')
-          ? (right.terminalCreatedAt instanceof Date && left.terminalCreatedAt instanceof Date
-            ? right.terminalCreatedAt.getTime() - left.terminalCreatedAt.getTime() : 0) || String(right.turnId).localeCompare(String(left.turnId))
+        const rows = [...sourceRows].sort((left, right) => sql.includes('ORDER BY (roots."terminalWitnessXid8")::numeric DESC')
+          ? Number(BigInt(String(right.terminalWitnessXid8)) - BigInt(String(left.terminalWitnessXid8))) || String(right.turnId).localeCompare(String(left.turnId))
           : Number(BigInt(String(right.terminalSequence)) - BigInt(String(left.terminalSequence))))
         return { rows: rows.slice(0, limit) }
+      }
+      if (sql.includes("WITH expected AS MATERIALIZED")) {
+        if (options.omitSameSessionTerminalTime) return { rows: [] }
+        const turnIds = values?.[1] as string[]
+        const roots = values?.[2] as string[]
+        const sequences = values?.[3] as string[]
+        return { rows: turnIds.map((turnId, index) => {
+          const source = sourceRows.find(row => row.turnId === turnId && row.taskRootTaskId === roots[index]
+            && String(row.terminalSequence) === sequences[index])
+          return source ? { sessionId: "session-1", turnId, taskId: roots[index], sequence: sequences[index],
+            type: source.terminalType, createdAt: source.terminalCreatedAt } : undefined
+        }).filter((row): row is NonNullable<typeof row> => row !== undefined) }
       }
       if (sql.includes("event.\"type\" = 'turn.started'")) return { rows: options.startRows ?? [currentStart()] }
       if (sql.includes('FROM "agent_items" AS item')) {
@@ -147,16 +177,68 @@ function fixture(options: Options = {}) {
     },
     release() { /* test client */ },
   }
-  const pool = { connect: async () => client } as unknown as Pick<pg.Pool, "connect">
+  const pool = { connect: async () => { connects += 1; return client } } as unknown as Pick<pg.Pool, "connect">
   const input: DirectRootTaskHistoryLoadInput = {
     lease: { turnId: "turn-current", sessionId: "session-1", ownerId: "worker", userId: "user-1", leaseVersion: 3,
       leaseStartedAt: new Date(1), leaseExpiresAt: new Date(10_000) },
     rootTaskId: "root-current", rootAttemptCount: 2, stepId: "step-current", now: new Date(2_000),
   }
-  return { store: createPgDirectRootTaskHistoryStore(pool), input, queries }
+  return { store: createPgDirectRootTaskHistoryStore(pool), input, queries, client: client as unknown as pg.PoolClient,
+    get tenantScope() { return tenantScope },
+    get connects() { return connects } }
 }
 
 describe("direct Root-task history PostgreSQL store", () => {
+  it("reads only under the caller's matching tenant scope without opening or changing a transaction", async () => {
+    const test = fixture()
+    const outcomes = await test.store.loadWithClient(test.client, test.input)
+
+    expect(outcomes.map(value => value.sourceTurnId)).toEqual(["turn-source-1"])
+    expect(outcomes[0]).not.toHaveProperty("sourceSessionDiffers")
+    expect(outcomes[0]).not.toHaveProperty("terminalAt")
+    expect(test.connects).toBe(0)
+    expect(test.queries.filter(query => query.sql.includes("current_setting('app.user_id'")).length).toBe(1)
+    expect(test.queries.some(query => query.sql.includes("set_config"))).toBe(false)
+    expect(test.tenantScope).toBe("user-1")
+    expect(test.queries.some(query => ["BEGIN", "COMMIT", "ROLLBACK"].includes(query.sql))).toBe(false)
+  })
+
+  it.each([
+    ["another user's scope", "tenant-a"],
+    ["no scope", null],
+  ] as const)("rejects %s before reading history and never overwrites it", async (_label, tenantScope) => {
+    const test = fixture({ tenantScope })
+    await expect(test.store.loadWithClient(test.client, test.input)).rejects.toThrow("root_task_history_scope_mismatch")
+    expect(test.connects).toBe(0)
+    expect(test.tenantScope).toBe(tenantScope)
+    expect(test.queries.some(query => query.sql.includes("set_config"))).toBe(false)
+    expect(test.queries.some(query => query.sql.includes("WITH terminal_window AS MATERIALIZED"))).toBe(false)
+    expect(test.queries.some(query => query.sql.includes('FROM "agent_items" AS item'))).toBe(false)
+  })
+
+  it("leaves callback transaction rollback to its owner and preserves the legacy load wrapper", async () => {
+    const callback = fixture({ candidateError: Object.assign(new Error("db unavailable"), { code: "42501" }) })
+    await expect(callback.store.loadWithClient(callback.client, callback.input)).rejects.toMatchObject({ code: "42501" })
+    expect(callback.connects).toBe(0)
+    expect(callback.queries.some(query => ["BEGIN", "COMMIT", "ROLLBACK"].includes(query.sql))).toBe(false)
+
+    const legacy = fixture()
+    await expect(legacy.store.load(legacy.input)).resolves.toHaveLength(1)
+    expect(legacy.connects).toBe(1)
+    expect(legacy.queries[0]?.sql).toBe("BEGIN")
+    expect(legacy.queries[1]?.sql).toContain("set_config")
+    expect(legacy.queries[1]?.values).toEqual(["app.user_id", "user-1"])
+    expect(legacy.tenantScope).toBe("user-1")
+    expect(legacy.queries.at(-1)?.sql).toBe("COMMIT")
+  })
+
+  it("keeps same-session outcomes available when their original terminal timestamp is missing", async () => {
+    const test = fixture({ omitSameSessionTerminalTime: true })
+    const outcomes = await test.store.loadWithClient(test.client, test.input)
+    expect(outcomes).toHaveLength(1)
+    expect(outcomes[0]).not.toHaveProperty("terminalAt")
+  })
+
   it("binds exact canonical objectives across distinct source Root IDs and reloads only their scoped graphs", async () => {
     const first = candidate(1), second = candidate(2, "8", "failed")
     const mismatch = { ...candidate(3), goal: "Different goal" }
@@ -258,7 +340,7 @@ describe("direct Root-task history PostgreSQL store", () => {
     expect(scan?.sql.slice(rootsJoin)).not.toContain("LIMIT $5")
   })
 
-  it("applies the same 64-candidate and 8-graph bounds to cross-session scans", async () => {
+  it("applies the 64-candidate and 8-graph bounds after numeric witness filtering", async () => {
     const candidates = Array.from({ length: 80 }, (_, index) => {
       const source = candidate(index + 1, String(index * 2 + 2))
       const sessionId = `session-cross-${index + 1}`
@@ -272,18 +354,18 @@ describe("direct Root-task history PostgreSQL store", () => {
 
     expect(outcomes).toHaveLength(8)
     expect(test.queries.filter(query => query.sql.includes('FROM "agent_items" AS item'))).toHaveLength(8)
-    const scan = test.queries.find(query => query.sql.includes("WITH terminal_window AS MATERIALIZED"))
-    const windowLimit = scan?.sql.indexOf("LIMIT $6") ?? -1
+    const scan = test.queries.find(query => query.sql.includes("(witness.payload->>'xid8')::numeric < $4::numeric"))
+    const windowLimit = scan?.sql.indexOf("LIMIT $9") ?? -1
     const rootsJoin = scan?.sql.indexOf("), roots AS (") ?? -1
-    expect(scan?.values?.[5]).toBe(64)
-    expect(scan?.sql).toContain('event."createdAt" < $4::timestamptz')
-    expect(scan?.sql).toContain('ORDER BY event."createdAt" DESC, event."turnId" DESC')
+    expect(scan?.values?.[8]).toBe(64)
+    expect(scan?.sql).toContain("(witness.payload->>'xid8')::numeric < $4::numeric")
+    expect(scan?.sql).toContain('ORDER BY (witness.payload->>\'xid8\')::numeric DESC, event."turnId" DESC')
     expect(windowLimit).toBeGreaterThanOrEqual(0)
     expect(windowLimit).toBeLessThan(rootsJoin)
     expect(scan?.sql.slice(rootsJoin)).not.toContain("LIMIT $5")
   })
 
-  it("uses DB-time order and source-session graph scope only under the server opt-in", async () => {
+  it("uses xid8 order and source-session graph scope only under the server opt-in", async () => {
     const newer = { ...candidate(3, "2000"), sessionId: "session-other", terminalStepSessionId: "session-other",
       terminalStepEventSessionId: "session-other", terminalCreatedAt: new Date("2026-10-07T11:50:00.000Z") }
     const older = { ...candidate(4, "3000"), sessionId: "session-third", terminalStepSessionId: "session-third",
@@ -295,15 +377,15 @@ describe("direct Root-task history PostgreSQL store", () => {
 
     const outcomes = await test.store.load(test.input)
 
-    expect(outcomes.map(value => value.sourceTurnId)).toEqual(["turn-source-3", "turn-source-4"])
-    const scan = test.queries.find(query => query.sql.includes("WITH terminal_window AS MATERIALIZED"))
+    expect(outcomes.map(value => value.sourceTurnId)).toEqual(["turn-source-4", "turn-source-3"])
+    const scan = test.queries.find(query => query.sql.includes("(witness.payload->>'xid8')::numeric < $4::numeric"))
     expect(scan?.sql).toContain('source_session."status" NOT IN (\'aborted\', \'archived\')')
-    expect(scan?.sql).toContain('event."createdAt" < $4::timestamptz')
-    expect(scan?.sql).toContain('ORDER BY event."createdAt" DESC, event."turnId" DESC')
+    expect(scan?.sql).toContain("(witness.payload->>'xid8')::numeric < $4::numeric")
+    expect(scan?.sql).toContain('ORDER BY (witness.payload->>\'xid8\')::numeric DESC, event."turnId" DESC')
     const graphReads = test.queries.filter(query => query.sql.includes('FROM "agent_items" AS item'))
-    expect(graphReads.map(query => query.values?.[1])).toEqual(["session-other", "session-third"])
+    expect(graphReads.map(query => query.values?.[1])).toEqual(["session-third", "session-other"])
     expect(test.queries.filter(query => query.sql.includes("FOR SHARE SKIP LOCKED")).map(query => query.values))
-      .toEqual([["session-other", "user-1"], ["session-third", "user-1"]])
+      .toEqual([["session-third", "user-1"], ["session-other", "user-1"]])
   })
 
   it.each(["archived", "aborted"] as const)("skips a source session locked after selection or changed to %s", async status => {

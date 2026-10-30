@@ -30,6 +30,7 @@ class FakeInputClaimStore implements InputClaimStore {
   readonly checkpoints = new Map<string, StepCheckpoint>()
   readonly writes: string[] = []
   readonly markerWrites: unknown[] = []
+  transactionCalls = 0
   unresolvedSteeringInputs: StoredAgentInput[] = []
   readonly unresolvedSteeringReads: unknown[] = []
   hydrationCheckpointExpectation?: StepCheckpoint
@@ -41,6 +42,7 @@ class FakeInputClaimStore implements InputClaimStore {
   }
 
   async withTransaction<T>(work: (transaction: InputClaimTransaction) => Promise<T>): Promise<T> {
+    this.transactionCalls += 1
     const run = this.tail.then(async () => {
       const inputs = this.inputs.map((item) => ({ ...item, content: [...item.content] }))
       const steps = new Map([...this.checkpoints].map(([key, value]) => [key, { inputThroughSequence: value.inputThroughSequence, consumedInputIds: [...value.consumedInputIds] }]))
@@ -55,6 +57,8 @@ class FakeInputClaimStore implements InputClaimStore {
     this.tail = run.then(() => undefined, () => undefined)
     return run
   }
+
+  transactionForTest(): InputClaimTransaction { return this.transaction() }
 
   private transaction(): InputClaimTransaction {
     return {
@@ -145,6 +149,49 @@ describe("StepContextBuilder", () => {
     expect(context.consumedInputIds).toEqual([steer.id])
     expect(store.checkpoints.get("step-a")).toEqual(checkpoint(2n, [steer.id]))
     expect(store.inputs[0]).toMatchObject({ status: "consumed", consumedByStepId: "step-a" })
+  })
+
+  it("matches build through a caller-owned transaction without opening another transaction", async () => {
+    const makeStore = () => new FakeInputClaimStore([input("first", 1n, [{ type: "text", text: "First steer" }])], {
+      "step-a": checkpoint(), "step-b": checkpoint(1n),
+    })
+    const wrappedStore = makeStore()
+    const callerStore = makeStore()
+    const wrappedBuilder = new StepContextBuilder(wrappedStore)
+    const callerBuilder = new StepContextBuilder(callerStore)
+    const callerStoreTransaction = vi.spyOn(callerStore, "withTransaction")
+    const buildOnCallerTransaction = (stepRequest: StepContextRequest) => callerBuilder.buildInTransaction(callerStore.transactionForTest(), stepRequest)
+
+    const wrappedFirst = await wrappedBuilder.build(request(wrappedStore, emptySnapshot))
+    const callerFirst = await buildOnCallerTransaction(request(callerStore, emptySnapshot))
+    wrappedStore.inputs.push(input("later", 2n, [{ type: "text", text: "Later steer" }]))
+    callerStore.inputs.push(input("later", 2n, [{ type: "text", text: "Later steer" }]))
+    const wrappedRetry = await wrappedBuilder.build(request(wrappedStore, emptySnapshot, "step-a", { mode: "retry" }))
+    const callerRetry = await buildOnCallerTransaction(request(callerStore, emptySnapshot, "step-a", { mode: "retry" }))
+    const wrappedNext = await wrappedBuilder.build(request(wrappedStore, emptySnapshot, "step-b"))
+    const callerNext = await buildOnCallerTransaction(request(callerStore, emptySnapshot, "step-b"))
+
+    expect(callerStoreTransaction).not.toHaveBeenCalled()
+    expect(callerFirst).toEqual(wrappedFirst)
+    expect(callerRetry).toEqual(wrappedRetry)
+    expect(callerNext).toEqual(wrappedNext)
+    expect(callerRetry.consumedInputIds).toEqual(["first"])
+    expect(callerNext.consumedInputIds).toEqual(["later"])
+    expect(callerStore.checkpoints).toEqual(wrappedStore.checkpoints)
+    expect(callerStore.inputs).toEqual(wrappedStore.inputs)
+  })
+
+  it("propagates caller-owned transaction errors for its owner to roll back", async () => {
+    const steer = input("fresh-steer", 2n, [{ type: "text", text: "Keep Dublin." }])
+    const store = new FakeInputClaimStore([steer], undefined, true)
+    const builder = new StepContextBuilder(store)
+
+    await expect(store.withTransaction(transaction => builder.buildInTransaction(transaction, request(store, emptySnapshot))))
+      .rejects.toThrow("checkpoint failure")
+
+    expect(store.transactionCalls).toBe(1)
+    expect(store.checkpoints.get("step-a")).toEqual(checkpoint())
+    expect(store.inputs[0]).toMatchObject({ status: "accepted", consumedByStepId: null, consumedAt: null })
   })
 
   it("rolls back a fresh claim and checkpoint when later steering hydration fails", async () => {
@@ -637,8 +684,13 @@ describe("StepContextBuilder", () => {
 
   it("rejects a request scope that differs from the server-bound store scope", async () => {
     const store = new FakeInputClaimStore([])
-    const build = new StepContextBuilder(store).build(request(store, emptySnapshot, "step-a", { scope: { userId: "user-b" } }))
+    const builder = new StepContextBuilder(store)
+    const invalidRequest = request(store, emptySnapshot, "step-a", { scope: { userId: "user-b" } })
+    const build = builder.build(invalidRequest)
     await expect(build).rejects.toMatchObject({ code: "reference_owner_mismatch" })
+    await expect(store.withTransaction(transaction => builder.buildInTransaction(transaction, invalidRequest)))
+      .rejects.toMatchObject({ code: "reference_owner_mismatch" })
+    expect(store.checkpoints.get("step-a")).toEqual(checkpoint())
   })
 
   it("does not expose or consume a follow-up from another user or session", async () => {
