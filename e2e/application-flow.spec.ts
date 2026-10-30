@@ -2141,6 +2141,12 @@ for (const outcome of ['get-fails', 'unknown'] as const) {
     await expect.poll(() => state.writes.filter(write => write.path.endsWith('/apply')).length).toBe(1)
     const refresh = page.getByRole('button', { name: /Refresh record status|刷新记录状态/ })
     await expect(refresh).toBeVisible()
+    const title = page.getByText(outcome === 'unknown' ? /Check the record status|核实记录状态/ : /Record accepted; status updating|记录已接受，等待状态更新/)
+    await expect(title).toBeVisible()
+    const nextAction = page.locator('section').filter({ has: title })
+    await expect(nextAction.getByRole('button', { name: /Refresh record status|刷新记录状态/ })).toHaveCount(1)
+    await expect(nextAction.getByRole('button', { name: /Open employer website|前往雇主网站/ })).toHaveCount(0)
+    await expect(page.getByRole('link', { name: /Open employer website|前往雇主网站/ })).toBeVisible()
     await expect(page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ })).toHaveCount(0)
     await refresh.click()
     await expect(page.getByText(/still unconfirmed|仍无法确认记录状态/)).toBeVisible()
@@ -2338,6 +2344,7 @@ test('a visible submission record does not resolve an unknown manual recording r
   expect(response.status()).toBe(200)
   expect(await response.json()).toMatchObject({ status: 'applied', workflowState: 'submitted', appliedAt: time })
   await expect(page.getByText(/A submission record exists, but this request is still unconfirmed|已有提交记录，但仍无法确认是否由本次请求产生/)).toBeVisible()
+  await expect(page.getByText(/Check the record status|核实记录状态/)).toBeVisible()
   const submission = page.getByRole('list', { name: /Application progress|申请进度/ }).locator('li').filter({ hasText: /Submission record|提交记录/ })
   await expect(submission).toContainText(/Recorded|已有记录/)
   await expect(refresh).toBeVisible()
@@ -3700,6 +3707,10 @@ for (const denial of ['limit', 'plan'] as const) {
     const record = page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ })
     await record.click()
     await expect(page.getByText(denial === 'limit' ? /record was not saved because your monthly application limit|本次记录未保存，因为本月申请额度已用完/ : /record was not saved because manual applications are unavailable|本次记录未保存，因为当前套餐暂不可使用手动申请/)).toBeVisible()
+    const nextAction = page.locator('section').filter({ has: page.getByText(/Manual record not saved|手动记录未保存/) })
+    await expect(nextAction.getByRole('button', { name: /Refresh status|刷新状态/ })).toHaveCount(1)
+    await expect(nextAction.getByRole('button', { name: /Open employer website|前往雇主网站/ })).toHaveCount(0)
+    await expect(page.getByRole('link', { name: /Open employer website|前往雇主网站/ })).toBeVisible()
     await expect(record).toHaveCount(0)
     expect(posts).toBe(1)
     await open(page)
@@ -3735,6 +3746,17 @@ test('an unverified quota response never releases an uncertain manual record', a
   expect(state.unexpected).toEqual([])
 })
 
+test('an active task remains the primary action while an older manual record is unknown', async ({ page }) => {
+  await page.addInitScript(() => sessionStorage.setItem('applymate:manual-record:fixture-user:outside-page', 'unknown'))
+  const state = await install(page, { taskStatus: 'waiting_for_user' })
+  await open(page)
+  await expect(page.getByText(/Check the record status|核实记录状态/)).toHaveCount(0)
+  await expect(page.getByRole('button', { name: /Refresh record status|刷新记录状态/ })).toHaveCount(1)
+  await expect(page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ })).toHaveCount(0)
+  expect(state.writes.filter(write => write.path.endsWith('/apply'))).toHaveLength(0)
+  expect(state.unexpected).toEqual([])
+})
+
 test('a rejected manual record stays blocked when refresh fails or finds a later record', async ({ page }) => {
   const state = await install(page)
   let posts = 0
@@ -3763,3 +3785,85 @@ test('a rejected manual record stays blocked when refresh fails or finds a later
   expect(posts).toBe(1)
   expect(state.unexpected).toEqual([])
 })
+
+test('a stalled manual recording becomes unknown and can be checked without a second POST', async ({ page }) => {
+  const state = await install(page)
+  let release = () => {}
+  const gate = new Promise<void>(resolve => { release = resolve })
+  let posts = 0
+  await page.route('**/api/jobs/outside-page/apply', async route => {
+    posts += 1
+    await gate
+    await route.fulfill({ status: 200, json: { applied: true } }).catch(() => undefined)
+  })
+  try {
+    await open(page)
+    await page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ }).click()
+    const refresh = page.getByRole('button', { name: /Refresh record status|刷新记录状态/ })
+    await expect(refresh).toBeEnabled({ timeout: 25_000 })
+    expect(await page.evaluate(() => sessionStorage.getItem('applymate:manual-record:fixture-user:outside-page'))).toBe('unknown')
+    await refresh.click()
+    await expect(refresh).toBeEnabled()
+    release()
+    await expect(page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ })).toHaveCount(0)
+    expect(posts).toBe(1)
+    expect(state.unexpected).toEqual([])
+  } finally { release() }
+})
+
+test('a stalled record-status read returns control without accepting a late response', async ({ page }) => {
+  const state = await install(page, { manualOutcome: 'unknown' })
+  let release = () => {}
+  const gate = new Promise<void>(resolve => { release = resolve })
+  let holdRead = false
+  let entered = false
+  await page.route('**/api/jobs/outside-page', async route => {
+    if (route.request().method() !== 'GET' || !holdRead) return route.fallback()
+    entered = true
+    await gate
+    await route.fulfill({ status: 200, json: { ...state.job, status: 'applied', workflowState: 'submitted', appliedAt: time } }).catch(() => undefined)
+  })
+  try {
+    await open(page)
+    await page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ }).click()
+    const refresh = page.getByRole('button', { name: /Refresh record status|刷新记录状态/ })
+    await expect(refresh).toBeEnabled()
+    holdRead = true
+    await refresh.click()
+    await expect.poll(() => entered).toBe(true)
+    await expect(refresh).toBeEnabled({ timeout: 25_000 })
+    release()
+    await expect(page.getByText(/A submission record exists, but this request is still unconfirmed|已有提交记录，但仍无法确认是否由本次请求产生/)).toHaveCount(0)
+    await expect(page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ })).toHaveCount(0)
+    expect(state.writes.filter(write => write.path.endsWith('/apply'))).toHaveLength(1)
+    expect(state.unexpected).toEqual([])
+  } finally { release() }
+})
+
+for (const result of ['confirmed', 'rejected'] as const) {
+  test(`a malformed ${result} record-status response preserves the application context`, async ({ page }) => {
+    const state = await install(page)
+    let posts = 0
+    let malformed = false
+    await page.route('**/api/jobs/outside-page/apply', async route => {
+      posts += 1
+      malformed = true
+      if (result === 'rejected') return route.fulfill({ status: 403, json: { code: 'MANUAL_APPLICATION_LIMIT_REACHED', requestId: route.request().headers()['x-manual-record-request-id'] } })
+      return route.fulfill({ status: 200, json: { applied: true } })
+    })
+    await page.route('**/api/jobs/outside-page', async route => {
+      if (route.request().method() !== 'GET' || !malformed) return route.fallback()
+      return route.fulfill({ status: 200, json: { id: 'outside-page', userId: 'fixture-user', updatedAt: time, status: 'applied' } })
+    })
+    await open(page)
+    await page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ }).click()
+    const refresh = result === 'rejected' ? page.getByRole('button', { name: /Refresh status|刷新状态/ }).first() : page.getByRole('button', { name: /Refresh record status|刷新记录状态/ })
+    await expect(refresh).toBeEnabled()
+    await refresh.click()
+    await expect(page.getByText(result === 'rejected' ? /Could not refresh the application|无法刷新申请/ : /record status is still unconfirmed|仍无法确认记录状态/)).toBeVisible()
+    await expect(page.getByRole('dialog', { name: 'Application flow engineer' })).toContainText('Fixture Employer')
+    await expect(page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ })).toHaveCount(0)
+    expect(posts).toBe(1)
+    expect(state.unexpected).toEqual([])
+  })
+}

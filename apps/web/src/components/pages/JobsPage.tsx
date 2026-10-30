@@ -25,7 +25,7 @@ import { ApplicationAttentionView, ApplicationTaskSummary } from '@/components/j
 import type { ApplicationTaskView } from '@/components/jobs/application-task-model'
 import { forgetSavedApplication } from '@/components/jobs/application-search-state'
 import { applicationTaskAllowsManualWork } from '@/components/jobs/application-attention-safety'
-import { blocksManualRecord, hasVisibleSubmissionRecord, readManualRecordLock, rejectPendingManualRecord, submitManualRecord, writeManualRecordLock, type ManualRecordLock } from '@/components/jobs/application-manual-record'
+import { blocksManualRecord, hasVisibleSubmissionRecord, parseScopedManualRecordJob, readManualRecord, readManualRecordLock, rejectPendingManualRecord, submitManualRecord, writeManualRecordLock, type ManualRecordLock } from '@/components/jobs/application-manual-record'
 import { openApplication, openApplicationSession, replaceApplicationHistory } from '@/lib/application-navigation'
 
 const KANBAN_COLS: JobStatus[] = ['saved', 'applied', 'interview', 'offer', 'rejected']
@@ -1206,9 +1206,9 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     setManualVisibleRecord(false)
     setActivityRetry(value => value + 1)
     try {
-      const response = await fetch(`/api/jobs/${encodeURIComponent(job.id)}`)
-      if (!response.ok) throw new Error('unavailable')
-      const updated = await response.json() as Job
+      const result = await readManualRecord(job.id)
+      const updated = parseScopedManualRecordJob(result, userId, job.id)
+      if (!updated) throw new Error('unavailable')
       if (!isCurrentDrawer(userId) || epoch !== manualRecordRefreshEpoch.current) return
       if (updated.id !== job.id || updated.userId !== userId) throw new Error('unavailable')
       // A later read or lifecycle change cannot prove which request wrote it.
@@ -1239,9 +1239,9 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     setManualRecordRefreshing(true)
     onRefreshTasks()
     try {
-      const response = await fetch(`/api/jobs/${encodeURIComponent(job.id)}`)
-      if (!response.ok) throw new Error('unavailable')
-      const updated = await response.json() as Job
+      const result = await readManualRecord(job.id)
+      const updated = parseScopedManualRecordJob(result, userId, job.id)
+      if (!updated) throw new Error('unavailable')
       const receivedAt = Date.parse(updated.updatedAt)
       const currentAt = Date.parse(requestedJob.updatedAt)
       if (!isCurrentDrawer(userId) || epoch !== manualRecordRefreshEpoch.current) return
@@ -1307,6 +1307,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   )
   const applicationRecorded = hasVisibleSubmissionRecord(job) || manualVisibleRecord
   const applicationRecordBlocked = blocksManualRecord(job) || manualVisibleRecord
+  const manualReviewPrimary = manualWorkAllowed && Boolean(manualRecordLock && (manualRecordLock !== 'confirmed' || !applicationRecorded))
   const auditStale = Boolean(currentRecord && !currentPackAudited && currentRecord.audit.verdict === 'pass')
   const canReviewExistingIssues = !currentPackAudited && (auditNeedsEvidence || auditNeedsRepair || auditRetryOnly)
   const openAudit = () => {
@@ -1363,11 +1364,16 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
 
           <section style={{ borderBottom: '1px solid var(--border)', padding: '18px 0 22px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 9, fontSize: 11, fontWeight: 700, letterSpacing: '0.03em', color: '#64748b', marginBottom: 18 }}><Sparkles size={16} strokeWidth={2.4} style={{ color: '#2563eb', flexShrink: 0 }} />{t('jobs.drawer.nextAction')}</div>
-            <div style={{ fontSize: 20, lineHeight: 1.25, fontWeight: 700, letterSpacing: '-0.025em' }}>{!manualWorkAllowed ? t('application.taskProgress') : applicationRecorded ? t('application.recorded') : applicationRecordBlocked ? t('application.statusReview') : auditStale ? t('application.checkMaterials') : currentPackAudited ? t('jobs.drawer.packReady') : auditRetryOnly ? t('jobs.drawer.retryAudit') : auditNeedsEvidence ? t('jobs.drawer.confirmEvidence') : auditNeedsRepair ? t('jobs.drawer.correctFacts') : existingTailoredResume ? t('jobs.drawer.tailored') : t('jobs.drawer.tailor')}</div>
-            <div style={{ fontSize: 14, lineHeight: 1.5, color: 'var(--text-muted)', margin: '7px 0 16px' }}>{!manualWorkAllowed ? t('application.taskProgressHint') : applicationRecorded ? t('application.recordedHint') : applicationRecordBlocked ? t('application.statusReviewHint') : auditStale ? t('application.auditStale') : currentPackAudited ? t('jobs.pack.sameAudited') : auditRetryOnly ? t('jobs.pack.auditPending') : auditNeedsEvidence ? t('jobs.pack.evidencePrompt') : auditNeedsRepair ? t('jobs.pack.repairPrompt') : existingTailoredResume ? t('jobs.pack.reviewTailored') : t('jobs.pack.createRole')}</div>
+            <div style={{ fontSize: 20, lineHeight: 1.25, fontWeight: 700, letterSpacing: '-0.025em' }}>{!manualWorkAllowed ? t('application.taskProgress') : manualReviewPrimary ? t(manualRejection ? 'application.manualRejectedTitle' : manualRecordLock === 'confirmed' ? 'application.manualAcceptedTitle' : 'application.manualPendingTitle') : applicationRecorded ? t('application.recorded') : applicationRecordBlocked ? t('application.statusReview') : auditStale ? t('application.checkMaterials') : currentPackAudited ? t('jobs.drawer.packReady') : auditRetryOnly ? t('jobs.drawer.retryAudit') : auditNeedsEvidence ? t('jobs.drawer.confirmEvidence') : auditNeedsRepair ? t('jobs.drawer.correctFacts') : existingTailoredResume ? t('jobs.drawer.tailored') : t('jobs.drawer.tailor')}</div>
+            <div style={{ fontSize: 14, lineHeight: 1.5, color: 'var(--text-muted)', margin: '7px 0 16px' }}>{!manualWorkAllowed ? t('application.taskProgressHint') : manualReviewPrimary ? t(manualRejection ? manualRejection === 'limit' ? 'application.manualLimitRejected' : 'application.manualPlanRejected' : manualRecordLock === 'confirmed' ? 'application.manualStatusConfirmed' : 'application.manualStatusPending') : applicationRecorded ? t('application.recordedHint') : applicationRecordBlocked ? t('application.statusReviewHint') : auditStale ? t('application.auditStale') : currentPackAudited ? t('jobs.pack.sameAudited') : auditRetryOnly ? t('jobs.pack.auditPending') : auditNeedsEvidence ? t('jobs.pack.evidencePrompt') : auditNeedsRepair ? t('jobs.pack.repairPrompt') : existingTailoredResume ? t('jobs.pack.reviewTailored') : t('jobs.pack.createRole')}</div>
 
             {task && <ApplicationTaskCard task={task} onOpenSession={id => openApplicationSession(id, navigate)} />}
-            {!manualWorkAllowed || applicationRecorded ? null : applicationRecordBlocked ? <Btn variant="ghost" onClick={() => { activitySectionRef.current?.focus(); activitySectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }}>{t('application.viewHistory')}</Btn> : taskReadState !== 'ready' ? <div role="status"><p>{t(taskReadState === 'limited' ? 'application.taskCoverage' : 'application.taskReadUnavailable')}</p><Btn variant="ghost" onClick={onRefreshTasks}>{t('application.refreshStatus')}</Btn></div> : <>
+            {!manualWorkAllowed ? null : manualReviewPrimary ? <div role="status">
+              {manualRejection && <p>{t('application.manualRejectedRefreshHint')}</p>}
+              {manualVisibleRecord && <p>{t('application.manualVisibleRecord')}</p>}
+              {manualRecordNotice && <p>{t(manualRejection ? 'application.manualRejectedRefreshFailed' : 'application.manualStatusStillUnknown')}</p>}
+              <Btn variant="primary" disabled={recordingSubmission || manualRecordRefreshing} onClick={() => { if (drawerUserId) void (manualRejection ? refreshAfterManualRejection(drawerUserId) : refreshManualRecord(drawerUserId)) }}>{t(manualRejection ? 'application.refreshStatus' : 'application.manualRefresh')}</Btn>
+            </div> : applicationRecorded ? null : applicationRecordBlocked ? <Btn variant="ghost" onClick={() => { activitySectionRef.current?.focus(); activitySectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }}>{t('application.viewHistory')}</Btn> : taskReadState !== 'ready' ? <div role="status"><p>{t(taskReadState === 'limited' ? 'application.taskCoverage' : 'application.taskReadUnavailable')}</p><Btn variant="ghost" onClick={onRefreshTasks}>{t('application.refreshStatus')}</Btn></div> : <>
               {needsBaseResume && !resumeListReady && <div role="status"><p>{t(resumeListLoading ? 'application.baseResumeLoading' : 'application.baseResumeUnavailable')}</p>{!resumeListLoading && <Btn variant="ghost" onClick={() => void refreshResumeList()}>{t('application.refreshStatus')}</Btn>}</div>}
               {needsBaseResume && resumeListReady && baseResumes.length === 0 && <div role="status"><p>{t('application.baseResumeEmpty')}</p><Btn variant="ghost" onClick={() => {
                 try { sessionStorage.removeItem('applymate:resume-return') } catch { /* The resume page can open without stored context. */ }
@@ -1412,15 +1418,15 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
             <div style={{ borderTop: '1px solid var(--border)', paddingTop: 16 }}>
               <strong style={{ fontSize: 13 }}>{t('application.method')}</strong>
               <p style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{applicationPreflight.canAutomate ? t('application.agentMethodHint') : t('application.manualMethodHint')}</p>
-              {(!currentPackAudited || task || applicationRecordBlocked || taskReadState !== 'ready') && job.url && /^https?:\/\//i.test(job.url) && <a href={job.url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--primary)', fontSize: 12 }}>{t('application.openEmployer')}</a>}
+              {(!currentPackAudited || task || applicationRecordBlocked || taskReadState !== 'ready' || manualReviewPrimary) && job.url && /^https?:\/\//i.test(job.url) && <a href={job.url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--primary)', fontSize: 12 }}>{t('application.openEmployer')}</a>}
               {!task && <><p style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{t(taskReadState === 'ready' ? 'application.noLinkedTaskHint' : 'application.taskLinkUnknownHint')}</p><Btn variant="ghost" small onClick={() => navigate('agent')}>{t('application.openAgent')}</Btn></>}
               {manualWorkAllowed && taskReadState === 'ready' && !applicationRecordBlocked && !manualRecordLock && <Btn variant="ghost" small disabled={recordingSubmission} onClick={() => void recordManualSubmission()}>{t('application.recordManual')}</Btn>}
               {manualStorageUnavailable && <p role="status">{t('application.manualStorageUnavailable')}</p>}
-              {manualRejection && <div role="status">
+              {manualRejection && !manualReviewPrimary && <div role="status">
                 <p>{t(manualRejection === 'limit' ? 'application.manualLimitRejected' : 'application.manualPlanRejected')}</p>
                 <p>{t('application.manualRejectedRefreshHint')}</p>{manualRecordNotice && <p>{t('application.manualRejectedRefreshFailed')}</p>}<Btn variant="ghost" small disabled={manualRecordRefreshing} onClick={() => { if (drawerUserId) void refreshAfterManualRejection(drawerUserId) }}>{t('application.refreshStatus')}</Btn>
               </div>}
-              {manualRecordLock && !manualRejection && (manualRecordLock !== 'confirmed' || !applicationRecorded) && <div role="status">
+              {manualRecordLock && !manualRejection && !manualReviewPrimary && (manualRecordLock !== 'confirmed' || !applicationRecorded) && <div role="status">
                 <p>{t(manualRecordLock === 'confirmed' ? 'application.manualStatusConfirmed' : 'application.manualStatusPending')}</p>
                 {manualVisibleRecord && <p>{t('application.manualVisibleRecord')}</p>}
                 {manualRecordNotice && <p>{t('application.manualStatusStillUnknown')}</p>}
