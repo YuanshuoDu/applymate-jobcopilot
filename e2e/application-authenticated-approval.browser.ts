@@ -91,6 +91,13 @@ test('authenticated application opens its original session and decides a synthet
     expect(await response.json()).toMatchObject({ disposition: 'resolved', status: 'approved', turnId })
     expect(await state()).toEqual([{ approval_status: 'approved', turn_status: 'waiting_for_approval', turn_revision: 2,
       item_status: 'completed', job_status: 'saved', task_status: 'waiting_for_authorization', resolved: 1, wakeups: 1, reservations: 0 }])
+    const lineage = await pool.query(`SELECT
+      (SELECT COUNT(*)::int FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
+        AND "correlationId" = $3 AND "type" = 'approval.requested' AND "taskId" = 'fixture-approval-task') AS requested_for_task,
+      (SELECT COUNT(*)::int FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
+        AND "correlationId" = $3 AND "type" = 'approval.resolved' AND "taskId" IS NULL) AS resolved_without_task`,
+      [sessionId, turnId, approvalId])
+    console.info('Synthetic approval event scope', JSON.stringify(lineage.rows[0]))
     // A reload reconstructs the decision from persisted events rather than
     // relying on transient button feedback in the current React tree.
     await page.reload()
