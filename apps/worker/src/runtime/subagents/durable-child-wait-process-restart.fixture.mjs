@@ -857,6 +857,15 @@ async function waitForChild(lease, crashAfterRegistration = false) {
   })
   const result = await runTurnExecutionLoop(options)
   if (!wait || result.status !== "waiting_for_dependency" || result.waitId !== wait.waitId || fixtureModel.invocations.length !== 1) {
+    const loopStatuses = new Set(["waiting_for_dependency", "waiting_for_user", "waiting_for_approval", "completed", "failed", "interrupted"])
+    const invocationCountCategory = fixtureModel.invocations.length === 0 ? "zero"
+      : fixtureModel.invocations.length === 1 ? "one" : "multiple"
+    say(`WORKER_A_WAIT_GUARD_FAILED ${JSON.stringify({
+      waitRegistered: Boolean(wait),
+      loopStatusCategory: loopStatuses.has(result?.status) ? result.status : "other",
+      resultWaitIdMatches: Boolean(wait && result?.waitId === wait.waitId),
+      modelInvocationCountCategory: invocationCountCategory,
+    })}`)
     throw new Error("fixture_source_wait_call_receipt_invalid")
   }
   return { status: "waiting", result: { waitId: wait.waitId } }
@@ -959,7 +968,7 @@ const worker = new Worker(queueName, async job => {
       : mode === "worker-b-loop-multi-reject" ? ({ lease }) => resumeChildThroughLoop(lease, "multi-reject")
       : mode === "worker-b-legacy-consumed-seed" ? ({ lease }) => seedLegacyConsumedWait(lease)
       : mode === "worker-b-legacy-consumed-source-only" ? ({ lease }) => seedLegacyConsumedWait(lease, true)
-      : mode === "worker-b-legacy-consumed-recovery" ? ({ lease }) => resumeLegacyConsumedWait(lease, "claim-recovery-cut")
+      : mode === "worker-b-legacy-consumed-recovery" ? ({ lease }) => resumeLegacyConsumedWait(lease, "claim-item-completed-cut")
       : mode === "worker-b-legacy-consumed-final" ? ({ lease }) => resumeLegacyConsumedWait(lease, "final")
       : mode === "worker-b" ? ({ lease }) => resumeChild(lease) : undefined
   if (!execute) throw new Error("invalid_fixture_mode")

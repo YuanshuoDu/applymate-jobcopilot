@@ -173,6 +173,25 @@ function workerResultStatus(child: WorkerProcess, marker: "WORKER_A_WAITING"): W
   } catch { return null }
 }
 
+function workerWaitGuardDiagnostic(child: WorkerProcess): Record<string, unknown> | null {
+  const prefix = "WORKER_A_WAIT_GUARD_FAILED "
+  const line = child.stdoutText.split(/\r?\n/).find(value => value.startsWith(prefix))
+  if (!line) return null
+  try {
+    const row = asObject(JSON.parse(line.slice(prefix.length)) as unknown)
+    const statusCategories = new Set(["waiting_for_dependency", "waiting_for_user", "waiting_for_approval", "completed", "failed", "interrupted", "other"])
+    const countCategories = new Set(["zero", "one", "multiple"])
+    return {
+      waitRegistered: row.waitRegistered === true,
+      loopStatusCategory: typeof row.loopStatusCategory === "string" && statusCategories.has(row.loopStatusCategory)
+        ? row.loopStatusCategory : "other",
+      resultWaitIdMatches: row.resultWaitIdMatches === true,
+      modelInvocationCountCategory: typeof row.modelInvocationCountCategory === "string" && countCategories.has(row.modelInvocationCountCategory)
+        ? row.modelInvocationCountCategory : "other",
+    }
+  } catch { return { diagnostic: "unparseable" } }
+}
+
 function workerFailureReasonCategory(child: WorkerProcess, marker: "WORKER_A_WAITING"): WorkerFailureReasonCategory | null {
   const prefix = `${marker} `
   const line = child.stdoutText.split(/\r?\n/).find(value => value.startsWith(prefix))
@@ -189,7 +208,8 @@ function workerFailureReasonCategory(child: WorkerProcess, marker: "WORKER_A_WAI
 async function workerFailureDiagnostic(pool: Pool, child: WorkerProcess, ids: FixtureIds): Promise<string> {
   const status = workerResultStatus(child, "WORKER_A_WAITING")
   const diagnostic: Record<string, unknown> = { sample: "post_commit_read_committed_task_scope", status,
-    markerFailureReasonCategory: status === "failed" ? workerFailureReasonCategory(child, "WORKER_A_WAITING") : null }
+    markerFailureReasonCategory: status === "failed" ? workerFailureReasonCategory(child, "WORKER_A_WAITING") : null,
+    waitGuard: status === "failed" ? workerWaitGuardDiagnostic(child) : null }
   if (status !== "failed") return JSON.stringify(diagnostic)
   let client: PoolClient | undefined
   let transactionStarted = false
@@ -329,7 +349,7 @@ async function diagnoseWorkerFClaimProof(
        COUNT(*) FILTER (WHERE ${CHILD_WAIT_CLAIM_RECOVERY_SQL})::int AS "matchedCount"
      FROM (SELECT started.* FROM "agent_events" AS started
        WHERE started."sessionId" = $1 AND started."turnId" = $3 AND started."taskId" = $2
-         AND started."type" = 'tool_call.started' AND started."correlationId" = $11
+         AND started."type" = 'tool_call.started' AND started."correlationId" = $11 AND $9::text IS NULL
        ORDER BY started."sequence" DESC LIMIT 2) AS started`,
     [task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount,
       task.leaseExpiresAt, task.userId, null, continuationStepId, claimCallId],
@@ -2877,12 +2897,20 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expectReconciledSourceWait(repairedLifecycle, ids)
       expect(repairedLifecycle.wait?.consumedAt).toEqual(preRepair.wait?.consumedAt)
       expect(workerC.stdoutText + workerC.stderrText).not.toContain(SOURCE_WAIT_SECRET_IDEMPOTENCY_KEY(ids.waiterTaskId))
-      await waitForMarker(workerC, "WORKER_B_LOOP_CLAIM_BEFORE_RESULT")
+      await waitForMarker(workerC, "WORKER_B_LOOP_CLAIM_ITEM_COMPLETED_BEFORE_EVENT")
       const claimed = await readWaitClaimState(pool, ids, legacy.continuationStepId, legacy.callId, 1)
-      expect(claimed).toMatchObject({ callCount: 1, claimCount: 1, itemStartedCount: 1, resultCount: 0, claimOutboxCount: 1 })
+      expect(claimed).toMatchObject({ callCount: 1, claimCount: 1, itemStartedCount: 1, resultCount: 0, claimOutboxCount: 1,
+        call: { status: "completed", revision: 1 } })
       expect(claimed.claim).toMatchObject({ type: "tool_call.started", correlationId: legacy.callId,
         causationId: claimed.itemStarted?.id,
         idempotencyKey: `task:${ids.waiterTaskId}:event:child-wait-claim:1:${legacy.continuationStepId}` })
+      expect(claimed.lifecycle.map(event => event.type)).toEqual(["item.started", "tool_call.started"])
+      const claimCutMarker = workerC.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_LOOP_CLAIM_ITEM_COMPLETED_BEFORE_EVENT "))
+      expect(JSON.parse(claimCutMarker!.slice("WORKER_B_LOOP_CLAIM_ITEM_COMPLETED_BEFORE_EVENT ".length))).toMatchObject({
+        callId: legacy.callId, stepId: legacy.continuationStepId, waitId: legacy.waitId,
+        modelCalls: 0, executorCalls: 0, dispatcherCalls: 0, callStatus: "completed", callRevision: 1,
+        claimCount: 1, itemCompletedEventCount: 0, resultCount: 0,
+      })
       const currentTask = await taskStore.get(ids.waiterTaskId, ids.sessionId)
       expect(currentTask?.leaseOwner).toEqual(expect.any(String))
       expect(currentTask?.leaseOwner).not.toBe(oldOwner)
