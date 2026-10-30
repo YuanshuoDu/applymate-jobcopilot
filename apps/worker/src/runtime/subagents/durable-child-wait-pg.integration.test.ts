@@ -19,6 +19,7 @@ import { loadChildAttemptResume } from "./child-resume.js"
 import { actionList, asObject, INSERT_TASK, json } from "./pg-store-persistence.js"
 import type { SubagentLease } from "./types.js"
 import { hasBlockingExternalCall } from "./pg-store-expiry-recovery-predicates.js"
+import { safeSubagentWaitJson } from "./subagent-wait-structural-ids.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const FINAL_MARKER = "parent-resumed-from-durable-child-result"
@@ -37,6 +38,12 @@ const REDACTED_TARGET_RESULT_TEXT = "durable-child-result-after-process-restart;
 const RESTORED_WAIT_OBSERVATION_MARKER = "WORKER_B_RESTORED_WAIT_OBSERVATION "
 const fixturePath = fileURLToPath(new URL("./durable-child-wait-process-restart.fixture.mjs", import.meta.url))
 const workerCwd = fileURLToPath(new URL("../../..", import.meta.url))
+
+function safeProjectedWaitKey(input: { taskIds: readonly string[]; mode: "any" | "all"; timeoutMs: number; idempotencyKey: string }): string {
+  const projected = asObject(safeSubagentWaitJson(input, 1_024))
+  if (typeof projected.idempotencyKey !== "string") throw new Error("fixture_wait_key_projection_invalid")
+  return projected.idempotencyKey
+}
 
 function disposableDatabaseUrl(): string | null {
   const value = process.env.AGENT_RUNTIME_PG_TEST_URL
@@ -327,6 +334,51 @@ async function expectAbsentSourceResultClaimSafety(pool: Pool, ids: FixtureIds, 
     const blocking = (snapshot: BlockingTaskSnapshot) => hasBlockingExternalCall(
       client, snapshot as unknown as Record<string, unknown>, undefined, continuationStepId,
     )
+    const waitRows = await client.query<{ id: string }>(
+      `SELECT "id" FROM "agent_wait_conditions" WHERE "parentTaskId" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "stepId" = $4`,
+      [ids.waiterTaskId, ids.sessionId, ids.turnId, sourceStepId],
+    )
+    const continuationCalls = await client.query<{ id: string }>(
+      `SELECT "id" FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = $4
+        AND "type" = 'tool_call' AND "content"->>'toolName' = 'wait_subagents' ORDER BY "id" LIMIT 2`,
+      [ids.sessionId, ids.turnId, ids.waiterTaskId, continuationStepId],
+    )
+    expect(waitRows.rows).toHaveLength(1)
+    expect(continuationCalls.rows).toHaveLength(1)
+    const phoneWaitKey = `child-wait:415-555-0134:${ids.waiterTaskId}:attempt:1`
+    const projectedPhoneWaitKey = safeProjectedWaitKey({ taskIds: [FIXED_WAIT_TARGET_TASK_ID], mode: "any", timeoutMs: 30_000,
+      idempotencyKey: phoneWaitKey })
+    expect(projectedPhoneWaitKey.includes("[REDACTED_PHONE]")).toBe(true)
+    await client.query("SAVEPOINT fixed_phone_wait_key_projection")
+    try {
+      const changedWait = await client.query(`UPDATE "agent_wait_conditions" SET "idempotencyKey" = $2
+        WHERE "id" = $1 AND "parentTaskId" = $3 AND "sessionId" = $4 AND "turnId" = $5`,
+      [waitRows.rows[0]!.id, phoneWaitKey, ids.waiterTaskId, ids.sessionId, ids.turnId])
+      const changedSource = await client.query(`UPDATE "agent_items" SET "content" = jsonb_set("content", '{input,idempotencyKey}', to_jsonb($5::text), true)
+        WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4`,
+      [sourceCallItemId, ids.sessionId, ids.turnId, ids.waiterTaskId, phoneWaitKey])
+      const changedContinuation = await client.query(`UPDATE "agent_items" SET "content" = jsonb_set("content", '{input,idempotencyKey}', to_jsonb($5::text), true)
+        WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4`,
+      [continuationCalls.rows[0]!.id, ids.sessionId, ids.turnId, ids.waiterTaskId, projectedPhoneWaitKey])
+      expect([changedWait.rowCount, changedSource.rowCount, changedContinuation.rowCount]).toEqual([1, 1, 1])
+      const rawSourceIdentity = await client.query<{ matches: boolean }>(
+        `SELECT sourceCall."content"->'input'->>'idempotencyKey' = wait."idempotencyKey" AS "matches"
+          FROM "agent_items" AS sourceCall JOIN "agent_wait_conditions" AS wait ON wait."stepId" = sourceCall."stepId"
+            AND wait."parentTaskId" = sourceCall."taskId" AND wait."sessionId" = sourceCall."sessionId" AND wait."turnId" = sourceCall."turnId"
+          WHERE sourceCall."id" = $1 AND wait."id" = $2 AND sourceCall."sessionId" = $3 AND sourceCall."turnId" = $4 AND sourceCall."taskId" = $5`,
+        [sourceCallItemId, waitRows.rows[0]!.id, ids.sessionId, ids.turnId, ids.waiterTaskId],
+      )
+      expect(rawSourceIdentity.rows).toEqual([{ matches: true }])
+      expect(await blocking(task), "phone-shaped source key and its safe continuation projection should be accepted by PostgreSQL recovery").toBe(false)
+      const changedWrongKey = await client.query(`UPDATE "agent_items" SET "content" = jsonb_set("content", '{input,idempotencyKey}', to_jsonb($2::text), true)
+        WHERE "id" = $1 AND "sessionId" = $3 AND "turnId" = $4 AND "taskId" = $5`,
+      [continuationCalls.rows[0]!.id, `${projectedPhoneWaitKey}:wrong`, ids.sessionId, ids.turnId, ids.waiterTaskId])
+      expect(changedWrongKey.rowCount).toBe(1)
+      expect(await blocking(task), "a mismatched continuation projection must remain blocked").toBe(true)
+    } finally {
+      await client.query("ROLLBACK TO SAVEPOINT fixed_phone_wait_key_projection").catch(() => undefined)
+      await client.query("RELEASE SAVEPOINT fixed_phone_wait_key_projection").catch(() => undefined)
+    }
     expect(await blocking(task), "valid continuation claim with started/rev0 source and no source result should be recoverable").toBe(false)
 
     let savepoint = 0
@@ -1472,6 +1524,8 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       const acknowledgedOwner = acknowledged!.leaseOwner
       await waitForMarker(workerD, "WORKER_B_LOOP_PRE_CLAIM_ORPHAN")
       const orphanCallId = `${REISSUED_WAIT_TOOL_CALL_PREFIX}${waiter.id}:attempt:${acknowledged!.sourceAttempt}:orphan`
+      const projectedWaitKey = safeProjectedWaitKey({ taskIds: [FIXED_WAIT_TARGET_TASK_ID], mode: "any", timeoutMs: 30_000,
+        idempotencyKey: `child-wait:${waiter.id}:attempt:${acknowledged!.sourceAttempt}` })
       const preClaimState = await readWaitClaimState(pool, ids, acknowledged!.continuationStepId, orphanCallId, acknowledged!.sourceAttempt)
       expect(preClaimState.callCount).toBe(1)
       expect(preClaimState.claimCount).toBe(0)
@@ -1480,7 +1534,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(preClaimState.call).toMatchObject({ status: "started", revision: 0, stepId: acknowledged!.continuationStepId,
         content: { toolCallId: orphanCallId, toolName: "wait_subagents", toolVersion: "1",
           input: { taskIds: [FIXED_WAIT_TARGET_TASK_ID], mode: "any", timeoutMs: 30_000,
-            idempotencyKey: `child-wait:${waiter.id}:attempt:${acknowledged!.sourceAttempt}` } } })
+            idempotencyKey: projectedWaitKey } } })
       expect(preClaimState.lifecycle.map(event => event.type)).toEqual(["item.started"])
       expect(preClaimState.claimOutboxCount).toBe(0)
       const staleLeaseMarker = workerD.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_STALE_LEASE_SNAPSHOT_ACCEPTED "))
@@ -1555,7 +1609,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(claimState.call).toMatchObject({ status: "started", stepId: acknowledged!.continuationStepId,
         content: { toolCallId: claimedWaitCallId, toolName: "wait_subagents", toolVersion: "1",
           input: { taskIds: [FIXED_WAIT_TARGET_TASK_ID], mode: "any", timeoutMs: 30_000,
-            idempotencyKey: `child-wait:${waiter.id}:attempt:${acknowledged!.sourceAttempt}` } } })
+            idempotencyKey: projectedWaitKey } } })
       expect(claimState.claim).toMatchObject({ type: "tool_call.started", actor: "subagent", itemId: claimState.call!.id,
         correlationId: claimedWaitCallId, causationId: claimState.itemStarted!.id,
         idempotencyKey: `task:${waiter.id}:event:child-wait-claim:${acknowledged!.sourceAttempt}:${acknowledged!.continuationStepId}`,

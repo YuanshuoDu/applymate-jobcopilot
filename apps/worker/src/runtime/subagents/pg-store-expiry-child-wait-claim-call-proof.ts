@@ -1,3 +1,26 @@
+import { safeSubagentWaitJson } from "./subagent-wait-structural-ids.js"
+
+/** Match a persisted continuation key only to the redacted projection of its exact source key. */
+export function childWaitContinuationKeyMatchesSafeProjection(sourceKey: unknown, continuationKey: unknown): boolean {
+  if (typeof sourceKey !== "string" || typeof continuationKey !== "string"
+    || sourceKey.length < 1 || sourceKey.length > 256 || sourceKey.trim() !== sourceKey
+    || continuationKey.length < 1 || continuationKey.length > 256 || continuationKey.trim() !== continuationKey) return false
+  const projected = safeSubagentWaitJson(sourceKey, 16_384)
+  return typeof projected === "string" && projected === continuationKey
+}
+
+/** Internal projection-query columns for the one SQL-validated child-wait claim. */
+export const CHILD_WAIT_CLAIM_KEY_COLUMNS_SQL = `
+  (SELECT CASE WHEN COUNT(*) = 1 THEN MAX(sourceCall."content"->'input'->>'idempotencyKey') END
+    FROM "agent_items" AS sourceCall WHERE sourceCall."sessionId" = $1 AND sourceCall."turnId" = $3
+      AND sourceCall."taskId" = $2 AND sourceCall."stepId" = latest_wait."stepId"
+      AND sourceCall."type" = 'tool_call' AND sourceCall."content"->>'toolName' = 'wait_subagents') AS "sourceWaitKey",
+  (SELECT CASE WHEN COUNT(*) = 1 THEN MAX(claimedCall."content"->'input'->>'idempotencyKey') END
+    FROM "agent_items" AS claimedCall WHERE claimedCall."sessionId" = $1 AND claimedCall."turnId" = $3
+      AND claimedCall."taskId" = $2 AND claimedCall."stepId" = $10
+      AND claimedCall."id" = 'task:' || $2 || ':item:tool-call:' || started."correlationId" || ':attempt:' || latest_wait."attempt"::text
+      AND claimedCall."type" = 'tool_call') AS "continuationWaitKey"`
+
 /** Exact continuation-claim cut after the call row is completed but before item.completed is appended. */
 export const CHILD_WAIT_CALL_ITEM_COMPLETED_NO_EVENT_SQL = `(
   claimedCall."status" = 'completed'

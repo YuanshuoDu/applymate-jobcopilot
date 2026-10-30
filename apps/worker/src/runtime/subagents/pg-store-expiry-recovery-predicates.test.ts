@@ -59,7 +59,8 @@ describe("expired recovery SQL predicates", () => {
 
   it("only allows the exact consumed-wait continuation claim through expiry recovery", async () => {
     const deadline = new Date("2026-10-06T10:00:00.000Z")
-    const query = vi.fn().mockResolvedValue({ rows: [{ id: "claim-start", claimWaitId: "wait-1", waitDeadlineAt: deadline, outcomeDeadlineAt: deadline.toISOString() }] })
+    const query = vi.fn().mockResolvedValue({ rows: [{ id: "claim-start", claimWaitId: "wait-1", waitDeadlineAt: deadline, outcomeDeadlineAt: deadline.toISOString(),
+      sourceWaitKey: "child-wait:415-555-0134:attempt:1", continuationWaitKey: "child-wait:[REDACTED_PHONE]:attempt:1" }] })
     const client = { query }
     await expect(hasBlockingExternalCall(client as never, task, undefined, "continuation-1")).resolves.toBe(false)
     expect(query).toHaveBeenCalledTimes(1)
@@ -74,6 +75,11 @@ describe("expired recovery SQL predicates", () => {
     expect(sql).toContain('itemStarted."idempotencyKey" = \'task:\' || owner."id" || \':event:item-started:\' || claimedCall."id"')
     expect(sql).toContain('LEFT JOIN "agent_items" AS sourceResult')
     expect(sql).toContain('claimedCall."stepId" = continuation."id"')
+    expect(sql).toContain('sourceCall."content"->\'input\'->>\'idempotencyKey\' = wait."idempotencyKey"')
+    expect(sql).toContain('"sourceWaitKey"')
+    expect(sql).toContain('"continuationWaitKey"')
+    expect(sql).toContain('claimedCall."content"->\'input\'->\'idempotencyKey\'')
+    expect(sql).not.toContain("claimedCall.\"content\"->'input') - 'taskIds'::text ELSE '{}'::jsonb END) = jsonb_build_object('idempotencyKey'")
     expect(sql).toContain('owner."leaseOwner" = $5 AND owner."attemptCount" = $6 AND owner."leaseExpiresAt" = $7')
     expect(sql).toContain('continuation."ordinal" = (SELECT MAX(current."ordinal")')
     expect(sql).toContain("sourceResult.\"status\" = 'completed'")
@@ -96,8 +102,8 @@ describe("expired recovery SQL predicates", () => {
     expect(sql).toContain("jsonb_typeof(wait.\"result\"->'outcome'->'tasks') = 'array'")
     expect(sql).toContain("SELECT COUNT(*) FROM jsonb_object_keys(saved.value)")
     expect(sql).toContain("jsonb_typeof(saved.value->'failureReason') IN ('null', 'string')")
-    expect(sql).toContain("CASE WHEN jsonb_typeof(claimedCall.\"content\"->'input') = 'object' THEN (claimedCall.\"content\"->'input') - 'taskIds'::text ELSE '{}'::jsonb END")
-    expect(sql).toContain("CASE WHEN jsonb_typeof(sourceCall.\"content\"->'input') = 'object' THEN (sourceCall.\"content\"->'input') - 'taskIds'::text ELSE '{}'::jsonb END")
+    expect(sql).toContain("CASE WHEN jsonb_typeof(claimedCall.\"content\"->'input') = 'object' THEN ((claimedCall.\"content\"->'input') - 'taskIds'::text) - 'idempotencyKey'::text ELSE '{}'::jsonb END")
+    expect(sql).toContain("CASE WHEN jsonb_typeof(sourceCall.\"content\"->'input') = 'object' THEN ((sourceCall.\"content\"->'input') - 'taskIds'::text) - 'idempotencyKey'::text ELSE '{}'::jsonb END")
     expect(sql).toContain("CASE WHEN jsonb_typeof(call.\"content\"->'input') = 'object' THEN (call.\"content\"->'input') - 'taskIds'::text ELSE '{}'::jsonb END")
     expect(sql).toContain('AND NOT EXISTS (SELECT 1 FROM "agent_items" AS result')
     expect(sql).toContain('AND NOT EXISTS (SELECT 1 FROM "agent_events" AS extra')
@@ -108,6 +114,19 @@ describe("expired recovery SQL predicates", () => {
       waitDeadlineAt: new Date("2026-10-06T10:00:00.000Z"), outcomeDeadlineAt: "2026-10-06T10:00:01.000Z" }] })
     await expect(hasBlockingExternalCall({ query } as never, task, undefined, "continuation-1")).resolves.toBe(true)
     expect(query).toHaveBeenCalledTimes(1)
+  })
+
+  it("blocks a scoped claim when its continuation key is not the exact safe source-key projection", async () => {
+    const deadline = new Date("2026-10-06T10:00:00.000Z")
+    const base = { id: "claim-start", claimWaitId: "wait-1", waitDeadlineAt: deadline, outcomeDeadlineAt: deadline.toISOString(),
+      sourceWaitKey: "child-wait:415-555-0134:attempt:1", continuationWaitKey: "child-wait:[REDACTED_PHONE]:attempt:1" }
+    for (const row of [
+      { ...base, continuationWaitKey: "child-wait:wrong-key:attempt:1" },
+      { ...base, sourceWaitKey: null },
+      { ...base, continuationWaitKey: null },
+    ]) {
+      await expect(hasBlockingExternalCall({ query: vi.fn().mockResolvedValue({ rows: [row] }) } as never, task, undefined, "continuation-1")).resolves.toBe(true)
+    }
   })
 
   it("fails closed when deadline rows are invalid or multiple claim/blocker rows appear", async () => {

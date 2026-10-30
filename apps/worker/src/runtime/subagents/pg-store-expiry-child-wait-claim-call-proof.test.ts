@@ -1,7 +1,39 @@
 import { describe, expect, it } from "vitest"
 import {
+  childWaitContinuationKeyMatchesSafeProjection,
+  CHILD_WAIT_CLAIM_KEY_COLUMNS_SQL,
   CHILD_WAIT_CALL_ITEM_COMPLETED_NO_EVENT_SQL, CHILD_WAIT_CALL_LIFECYCLE_SQL, CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL,
 } from "./pg-store-expiry-child-wait-claim-call-proof.js"
+
+describe("child-wait continuation key projection", () => {
+  it.each([
+    ["phone-shaped key", "child-wait:415-555-0134:attempt:1", "child-wait:[REDACTED_PHONE]:attempt:1"],
+    ["bearer key", "child-wait:Bearer abcdefghijklmnop:attempt:1", "child-wait:Bearer [REDACTED]:attempt:1"],
+    ["API key assignment", "child-wait:api_key=abcdefghijk123456:attempt:1", "child-wait:api_key=[REDACTED]"],
+    ["ordinary key", "child-wait:opaque-key:attempt:1", "child-wait:opaque-key:attempt:1"],
+  ])("matches only the safe projection for %s", (_label, source, projected) => {
+    expect(childWaitContinuationKeyMatchesSafeProjection(source, projected)).toBe(true)
+    expect(childWaitContinuationKeyMatchesSafeProjection(source, `${projected}:wrong`)).toBe(false)
+  })
+
+  it("fails closed for absent, malformed, or out-of-scope key values", () => {
+    expect(childWaitContinuationKeyMatchesSafeProjection(null, "child-wait:key")).toBe(false)
+    expect(childWaitContinuationKeyMatchesSafeProjection(" child-wait:key", "child-wait:key")).toBe(false)
+    expect(childWaitContinuationKeyMatchesSafeProjection("child-wait:key", "other-wait:key")).toBe(false)
+  })
+
+  it("selects metadata only for the one owner-scoped source step and exact continuation item", () => {
+    const sql = CHILD_WAIT_CLAIM_KEY_COLUMNS_SQL.replace(/\s+/g, " ")
+    expect(sql).toContain('sourceCall."stepId" = latest_wait."stepId"')
+    expect(sql).toContain('sourceCall."taskId" = $2')
+    expect(sql).toContain('sourceCall."sessionId" = $1 AND sourceCall."turnId" = $3')
+    expect(sql).toContain('claimedCall."stepId" = $10')
+    expect(sql).toContain('claimedCall."sessionId" = $1 AND claimedCall."turnId" = $3')
+    expect(sql).toContain('claimedCall."taskId" = $2')
+    expect(sql).toContain("':attempt:' || latest_wait.\"attempt\"::text")
+    expect(sql).toContain('CASE WHEN COUNT(*) = 1 THEN MAX(')
+  })
+})
 
 describe("completed child-wait claim call without item.completed", () => {
   it("accepts only the exact completed row cut with unique call, claim lifecycle, and no result/terminal event", () => {
