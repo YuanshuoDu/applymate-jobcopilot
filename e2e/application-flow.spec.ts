@@ -40,6 +40,7 @@ test.beforeAll(async () => {
       import {I18nProvider} from '@/lib/i18n';
       import {ToastProvider} from '@/components/ui';
       import {NavContext} from '@/lib/nav-context';
+      import {getCachedApiResponse, setCachedApiResponse} from '@/lib/api-cache';
       const subscribeLocation=(cb)=>{addEventListener('popstate',cb);return()=>removeEventListener('popstate',cb)};
       function AgentDestination(){const sessionId=useSyncExternalStore(subscribeLocation,()=>new URL(location.href).searchParams.get('sessionId'),()=>null);return <div data-testid="agent-destination">{sessionId}</div>}
       function Harness(){
@@ -52,6 +53,9 @@ test.beforeAll(async () => {
           {page==='jobs'?<JobsPage/>:page==='resume'?<ResumePage/>:page==='search'?<SearchPage/>:page==='dashboard'?<DashboardPage/>:<AgentDestination/>}
           </main></NavContext.Provider></ToastProvider></I18nProvider>
       }
+      globalThis.__fixtureGetCachedResume = () => getCachedApiResponse('/api/resume/resume-1', 'fixture-user');
+      const fixtureCachedResume = sessionStorage.getItem('fixture_cached_resume');
+      if (fixtureCachedResume) setCachedApiResponse('/api/resume/resume-1', JSON.parse(fixtureCachedResume), 'fixture-user');
       createRoot(document.getElementById('root')).render(new URL(location.href).searchParams.has('shell') ? <I18nProvider><ToastProvider><AppShell/></ToastProvider></I18nProvider> : <Harness/>);
     `, loader: 'tsx', resolveDir: webRoot },
     absWorkingDir: webRoot, outfile: path.join(temporaryDirectory, 'fixture.js'), bundle: true, platform: 'browser',
@@ -104,14 +108,20 @@ function audit(resumeUpdatedAt = time) {
     audit: { verdict: 'pass', summary: 'Fixture materials checked.', findings: [], matchScore: 82, source: 'independent', auditedAt: time } }
 }
 
-async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unknown' | 'waiting_for_user'; taskFailure?: boolean; missing?: boolean; holdSelectedLetter?: boolean; search?: boolean; saveMode?: 'fail' | 'hold-success' | 'hold-fail'; twoResumes?: boolean } = {}) {
+async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unknown' | 'waiting_for_user'; taskFailure?: boolean; missing?: boolean; holdSelectedLetter?: boolean; search?: boolean; saveMode?: 'fail' | 'hold-success' | 'hold-fail'; twoResumes?: boolean; holdResumeContent?: boolean; snapshotResumeContent?: boolean; resumeRevalidationFails?: boolean; versionedScore?: boolean; holdOldAnalysis?: boolean; auditCorrection?: boolean; holdAuditCorrection?: boolean } = {}) {
+  let releaseAuditCorrection = () => {}
+  const auditCorrectionGate = new Promise<void>(resolve => { releaseAuditCorrection = resolve })
+  let releaseOldAnalysis = () => {}
+  const oldAnalysisGate = new Promise<void>(resolve => { releaseOldAnalysis = resolve })
+  let releaseResumeContent = () => {}
+  const resumeContentGate = new Promise<void>(resolve => { releaseResumeContent = resolve })
   let releaseSave = () => {}
   const saveGate = new Promise<void>(resolve => { releaseSave = resolve })
   let releaseLetters = () => {}
   const lettersGate = new Promise<void>(resolve => { releaseLetters = resolve })
-  const state = { job: { ...job(), finalCoverLetterId: options.holdSelectedLetter ? 'selected-letter' : null }, resume: resume(), audit: audit(options.stale ? '2026-10-29T10:00:00.000Z' : time),
-    secondResume: { ...resume(), id: 'resume-2', name: 'Second fixture resume', targetJobId: null, content: { ...resume().content, summary: 'Second resume content.' } },
-    writes: [] as Array<{ path: string; body: unknown }>, analysisRequests: [] as string[], unexpected: [] as string[], taskReads: 0, letterRequested: false, releaseLetters, releaseSave }
+  const state = { job: { ...job(), finalCoverLetterId: options.holdSelectedLetter ? 'selected-letter' : null }, resume: resume(), audit: options.auditCorrection ? { ...audit(), audit: { ...audit().audit, verdict: 'revise', findings: [{ area: 'resume', target: 'summary', severity: 'warning', title: 'Fix summary', evidence: 'Outdated wording', action: 'Apply correction', proposedValue: 'Audited v2 summary' }] } } : audit(options.stale ? '2026-10-29T10:00:00.000Z' : time),
+    secondResume: { ...resume(), id: 'resume-2', name: 'Second fixture resume', targetJobId: null as string | null, content: { ...resume().content, summary: 'Second resume content.' } },
+    writes: [] as Array<{ path: string; body: unknown }>, analysisRequests: [] as string[], analysisBodies: [] as unknown[], analysisCalls: [] as Array<{ path: string; body: unknown }>, unexpected: [] as string[], taskReads: 0, letterRequested: false, resumeContentRequested: false, releaseLetters, releaseSave, releaseResumeContent, releaseOldAnalysis, releaseAuditCorrection }
   const json = (route: Route, value: unknown, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(value) })
   await page.context().route('**/*', async route => {
     const request = route.request(), url = new URL(request.url()), pathname = url.pathname
@@ -124,7 +134,12 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
       // separately; this assertion concerns material, application and submit writes.
       if (pathname === '/api/ai/score' || pathname === '/api/ai/suggest') {
         state.analysisRequests.push(pathname)
-        return json(route, pathname.endsWith('/suggest') ? { suggestions: [] } : { score: 82, matchedKeywords: ['TypeScript'], missingItems: [], sectionMatches: [], sectionScores: {}, sectionTips: {}, strengthSummary: 'Fixture match', skillsGap: [] })
+        state.analysisBodies.push(body)
+        state.analysisCalls.push({ path: pathname, body })
+        const summary = (body as { resumeContent?: { summary?: string } })?.resumeContent?.summary
+        if (options.holdOldAnalysis && summary === 'Software engineer.') await oldAnalysisGate
+        const fixtureScore = options.versionedScore && summary === 'Software engineer.' ? 21 : 82
+        return json(route, pathname.endsWith('/suggest') ? { suggestions: [] } : { score: fixtureScore, matchedKeywords: ['TypeScript'], missingItems: [], sectionMatches: [], sectionScores: {}, sectionTips: {}, strengthSummary: 'Fixture match', skillsGap: [] })
       }
       state.writes.push({ path: pathname, body })
       if (pathname === '/api/resume/resume-1' && request.method() === 'PATCH' && options.saveMode) {
@@ -132,6 +147,11 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
         return json(route, { error: 'Fixture save failed' }, 500)
       }
       if (options.search && pathname === '/api/jobs' && request.method() === 'POST') return json(route, state.job)
+      if (options.auditCorrection && pathname.endsWith('/audit-application/apply')) {
+        if (options.holdAuditCorrection) await auditCorrectionGate
+        const updatedAt = '2026-10-30T12:00:00.000Z'
+        return json(route, { audit: { ...state.audit.audit, findings: [] }, target: 'summary', appliedContent: 'Audited v2 summary', resume: { ...state.resume, updatedAt, content: { ...state.resume.content, summary: 'Audited v2 summary' } }, coverLetter: null, resumeUpdatedAt: updatedAt })
+      }
       if (pathname.endsWith('/audit-application')) { state.audit = audit(); return json(route, { ...state.audit.audit, resumeUpdatedAt: time }) }
       if (pathname.endsWith('/assign')) return json(route, state.job)
       if (pathname === '/api/jobs/outside-page/apply') { state.job.status = 'applied'; return json(route, state.job) }
@@ -153,6 +173,7 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
     if (pathname.endsWith('/audit-application')) return json(route, state.audit)
     if (pathname === '/api/resume') return json(route, options.twoResumes ? [state.resume, state.secondResume] : [state.resume])
     if (pathname === '/api/resume/resume-2') return json(route, state.secondResume)
+    if (pathname === '/api/resume/resume-1' && options.holdResumeContent) { const snapshot = structuredClone(state.resume); state.resumeContentRequested = true; await resumeContentGate; return options.resumeRevalidationFails ? json(route, { error: 'Fixture revalidation failed' }, 500) : json(route, options.snapshotResumeContent ? snapshot : state.resume) }
     if (pathname === '/api/resume/resume-1' || pathname === '/api/resume/default') return json(route, state.resume)
     if (pathname === '/api/me') return json(route, { onboardedAt: time })
     if (pathname === '/api/gmail/unread') return json(route, { count: 0 })
@@ -373,7 +394,7 @@ test('real AppShell keeps the editor after a sidebar save fails', async ({ page 
   test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop sidebar')
   const state = await install(page, { saveMode: 'fail' })
   await openDirtyShellResume(page)
-  await page.getByRole('button', { name: 'Applications', exact: true }).click()
+  await page.locator('#desktop-sidebar').getByRole('button', { name: /^Applications(?:\s+\d+)?$/ }).click()
   await expect.poll(() => state.writes.filter(item => item.path === '/api/resume/resume-1').length).toBeGreaterThan(0)
   await expect(page).toHaveURL(/page=resume/)
   await expect(page.getByText('Edited fixture summary', { exact: false }).first()).toBeVisible()
@@ -413,7 +434,7 @@ test('real AppShell resolves two rapid navigation attempts to the latest destina
   const state = await install(page, { saveMode: 'hold-success' })
   try {
     await openDirtyShellResume(page)
-    await page.getByRole('button', { name: 'Applications', exact: true }).click()
+    await page.locator('#desktop-sidebar').getByRole('button', { name: /^Applications(?:\s+\d+)?$/ }).click()
     await expect.poll(() => state.writes.filter(item => item.path === '/api/resume/resume-1').length).toBeGreaterThan(0)
     await page.locator('#desktop-sidebar').getByRole('button', { name: 'Discover', exact: true }).click()
     state.releaseSave()
@@ -525,4 +546,264 @@ test('accepting the browser unload warning allows the user to leave unsaved edit
     await dialog.accept()
     await expect(page).toHaveURL('about:blank')
   } finally { state.releaseSave() }
+})
+
+
+test('late resume content starts analysis and its cache prevents a repeat on reopening', async ({ page }) => {
+  const state = await install(page, { holdResumeContent: true })
+  try {
+    const jobsLoaded = page.waitForResponse(response => response.url().includes('/api/jobs?pageSize=30') && response.status() === 200)
+    await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    await jobsLoaded
+    await expect.poll(() => state.resumeContentRequested).toBe(true)
+    // Allow React to consume the completed jobs response while content remains gated.
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+    expect(state.analysisRequests).toEqual([])
+    state.releaseResumeContent()
+    await expect.poll(() => state.analysisRequests.slice().sort()).toEqual(['/api/ai/score', '/api/ai/suggest'])
+    await expect.poll(() => page.evaluate(() => {
+      const entries = JSON.parse(localStorage.getItem('applymate_last_analysis') ?? '{}')
+      return entries['resume-1:outside-page']?.score?.score
+    })).toBe(82)
+    await page.getByRole('button', { name: 'Fixture jobs' }).click()
+    await page.getByRole('button', { name: 'Fixture resume' }).click()
+    await expect(page).toHaveURL(/page=resume/)
+    await expect(page.getByRole('button', { name: /Back to this application|返回此申请/ })).toBeVisible()
+    await page.waitForLoadState('networkidle')
+    expect(state.analysisRequests.slice().sort()).toEqual(['/api/ai/score', '/api/ai/suggest'])
+    expect(state.writes).toEqual([])
+    expect(state.unexpected).toEqual([])
+  } finally { state.releaseResumeContent() }
+})
+
+
+test('editing a cached resume does not automatically repeat analysis', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop shell')
+  const state = await install(page, { saveMode: 'hold-success' })
+  await page.addInitScript(({ timestamp }) => {
+    localStorage.setItem('applymate_last_analysis', JSON.stringify({
+      'resume-1:outside-page': { resumeId: 'resume-1', jobId: 'outside-page', resumeUpdatedAt: timestamp,
+        score: { score: 82, matchedKeywords: ['TypeScript'], missingItems: [], sectionMatches: [], sectionScores: {}, sectionTips: {}, strengthSummary: 'Fixture match', skillsGap: [] }, suggs: [] },
+    }))
+  }, { timestamp: time })
+  try {
+    await openDirtyShellResume(page)
+    expect(state.analysisRequests).toEqual([])
+    await page.locator('#desktop-sidebar').getByRole('button', { name: /^Applications(?:\s+\d+)?$/ }).click()
+    await expect.poll(() => state.writes.filter(item => item.path === '/api/resume/resume-1').length).toBeGreaterThan(0)
+    state.releaseSave()
+    await expect(page).toHaveURL(/page=jobs/)
+    await page.waitForLoadState('networkidle')
+    expect(state.analysisRequests).toEqual([])
+    expect(state.unexpected).toEqual([])
+  } finally { state.releaseSave() }
+})
+
+
+test('cached old resume revalidation never labels its analysis as the new version', async ({ page }) => {
+  const state = await install(page, { holdResumeContent: true, versionedScore: true })
+  const oldResume = resume()
+  const newTime = '2026-10-30T12:00:00.000Z'
+  state.resume.updatedAt = newTime
+  state.resume.content.summary = 'Updated server resume content.'
+  await page.addInitScript(cached => sessionStorage.setItem('fixture_cached_resume', JSON.stringify(cached)), oldResume)
+  try {
+    const jobsLoaded = page.waitForResponse(response => response.url().includes('/api/jobs?pageSize=30') && response.status() === 200)
+    await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    await jobsLoaded
+    await expect.poll(() => state.resumeContentRequested).toBe(true)
+    await expect(page.getByText('Software engineer.', { exact: false }).first()).toBeVisible()
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+    // The cached content remains usable, but its stale version cannot become the new-version analysis.
+    state.releaseResumeContent()
+    await expect(page.getByText('Updated server resume content.', { exact: false }).first()).toBeVisible()
+    await expect.poll(() => page.evaluate(() => {
+      const entries = JSON.parse(localStorage.getItem('applymate_last_analysis') ?? '{}')
+      return entries['resume-1:outside-page']
+    })).toMatchObject({ resumeUpdatedAt: newTime, score: { score: 82 } })
+    const scoreBody = state.analysisBodies.find(body => (body as { resumeContent?: { summary?: string } }).resumeContent?.summary === 'Updated server resume content.')
+    expect(scoreBody).toBeDefined()
+    expect(state.unexpected).toEqual([])
+  } finally { state.releaseResumeContent() }
+})
+
+
+test('failed resume revalidation keeps cached analysis bound to the old version', async ({ page }) => {
+  const state = await install(page, { holdResumeContent: true, resumeRevalidationFails: true, versionedScore: true })
+  const oldResume = resume()
+  state.resume.updatedAt = '2026-10-30T12:00:00.000Z'
+  state.resume.content.summary = 'Updated server resume content.'
+  await page.addInitScript(cached => sessionStorage.setItem('fixture_cached_resume', JSON.stringify(cached)), oldResume)
+  try {
+    await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    await expect.poll(() => state.resumeContentRequested).toBe(true)
+    await expect(page.getByText('Software engineer.', { exact: false }).first()).toBeVisible()
+    state.releaseResumeContent()
+    await expect.poll(() => page.evaluate(() => {
+      const entries = JSON.parse(localStorage.getItem('applymate_last_analysis') ?? '{}')
+      return entries['resume-1:outside-page']
+    })).toMatchObject({ resumeUpdatedAt: time, score: { score: 21 } })
+    expect(state.unexpected).toEqual([])
+  } finally { state.releaseResumeContent() }
+})
+
+test('A to B to A reuses in-flight analysis without misbinding results', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop resume library')
+  const state = await install(page, { twoResumes: true, versionedScore: true, holdOldAnalysis: true })
+  state.secondResume.targetJobId = 'outside-page'
+  const summaryOf = (body: unknown) => (body as { resumeContent?: { summary?: string } })?.resumeContent?.summary
+  try {
+    await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    await expect.poll(() => state.analysisCalls.filter(call => summaryOf(call.body) === 'Software engineer.').length).toBe(2)
+    await page.getByText('Second fixture resume', { exact: true }).click()
+    await expect(page.getByText('Second resume content.', { exact: false }).first()).toBeVisible()
+    await expect.poll(() => page.evaluate(() => {
+      const entries = JSON.parse(localStorage.getItem('applymate_last_analysis') ?? '{}')
+      return entries['resume-2:outside-page']?.score?.score
+    })).toBe(82)
+    await page.locator('.resume-library-item').filter({ hasText: 'Fixture role resume' }).click()
+    await expect(page.getByText('Software engineer.', { exact: false }).first()).toBeVisible()
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+    expect(state.analysisCalls.filter(call => summaryOf(call.body) === 'Software engineer.').length).toBe(2)
+    state.releaseOldAnalysis()
+    await expect.poll(() => page.evaluate(() => {
+      const entries = JSON.parse(localStorage.getItem('applymate_last_analysis') ?? '{}')
+      return entries['resume-1:outside-page']?.score?.score
+    })).toBe(21)
+    expect(state.analysisCalls.filter(call => summaryOf(call.body) === 'Second resume content.').map(call => call.path).sort()).toEqual(['/api/ai/score', '/api/ai/suggest'])
+    expect(state.unexpected).toEqual([])
+  } finally { state.releaseOldAnalysis() }
+})
+
+
+test('a delayed old resume GET cannot overwrite an edit already saved', async ({ page }) => {
+  const state = await install(page, { holdResumeContent: true, snapshotResumeContent: true, saveMode: 'hold-success' })
+  await page.addInitScript(cached => sessionStorage.setItem('fixture_cached_resume', JSON.stringify(cached)), resume())
+  const newTime = '2026-10-30T12:00:00.000Z'
+  try {
+    await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    await expect.poll(() => state.resumeContentRequested).toBe(true)
+    await page.getByText('Software engineer.', { exact: false }).first().click()
+    await page.locator('textarea').first().fill('Saved while GET was pending')
+    await expect.poll(() => state.writes.filter(item => item.path === '/api/resume/resume-1').length).toBeGreaterThan(0)
+    state.resume.updatedAt = newTime
+    const saveResponse = page.waitForResponse(response => response.url().endsWith('/api/resume/resume-1') && response.request().method() === 'PATCH')
+    state.releaseSave()
+    await saveResponse
+    await expect.poll(() => page.evaluate(() => {
+      const read = (window as unknown as { __fixtureGetCachedResume: () => { updatedAt?: string; content?: { summary?: string } } | null }).__fixtureGetCachedResume
+      return read()
+    })).toMatchObject({ updatedAt: newTime, content: { summary: 'Saved while GET was pending' } })
+    const oldGet = page.waitForResponse(response => response.url().endsWith('/api/resume/resume-1') && response.request().method() === 'GET')
+    state.releaseResumeContent()
+    await (await oldGet).finished()
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+    await expect(page.locator('textarea').first()).toHaveValue('Saved while GET was pending')
+    await expect.poll(() => page.evaluate(() => {
+      const read = (window as unknown as { __fixtureGetCachedResume: () => { updatedAt?: string; content?: { summary?: string } } | null }).__fixtureGetCachedResume
+      return read()
+    })).toMatchObject({ updatedAt: newTime, content: { summary: 'Saved while GET was pending' } })
+    expect(state.unexpected).toEqual([])
+  } finally { state.releaseSave(); state.releaseResumeContent() }
+})
+
+
+test('A analysis finishing during B is reused when returning to A', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop resume library')
+  const state = await install(page, { twoResumes: true, versionedScore: true, holdOldAnalysis: true })
+  state.secondResume.targetJobId = 'outside-page'
+  const summaryOf = (body: unknown) => (body as { resumeContent?: { summary?: string } })?.resumeContent?.summary
+  try {
+    await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    await expect.poll(() => state.analysisCalls.filter(call => summaryOf(call.body) === 'Software engineer.').length).toBe(2)
+    await page.getByText('Second fixture resume', { exact: true }).click()
+    await expect(page.getByText('Second resume content.', { exact: false }).first()).toBeVisible()
+    await expect.poll(() => page.evaluate(() => {
+      const entries = JSON.parse(localStorage.getItem('applymate_last_analysis') ?? '{}')
+      return entries['resume-2:outside-page']?.score?.score
+    })).toBe(82)
+    const aResponses = ['/api/ai/score', '/api/ai/suggest'].map(endpoint => page.waitForResponse(response => response.url().endsWith(endpoint) && summaryOf(response.request().postDataJSON()) === 'Software engineer.'))
+    state.releaseOldAnalysis()
+    await Promise.all((await Promise.all(aResponses)).map(response => response.finished()))
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+    await expect(page.getByText('Second resume content.', { exact: false }).first()).toBeVisible()
+    await expect.poll(() => page.evaluate(() => {
+      const entries = JSON.parse(localStorage.getItem('applymate_last_analysis') ?? '{}')
+      return entries['resume-2:outside-page']?.score?.score
+    })).toBe(82)
+    await page.locator('.resume-library-item').filter({ hasText: 'Fixture role resume' }).click()
+    await expect(page.getByText('Software engineer.', { exact: false }).first()).toBeVisible()
+    await expect.poll(() => page.evaluate(() => {
+      const entries = JSON.parse(localStorage.getItem('applymate_last_analysis') ?? '{}')
+      return entries['resume-1:outside-page']?.score?.score
+    })).toBe(21)
+    expect(state.analysisCalls.filter(call => summaryOf(call.body) === 'Software engineer.').length).toBe(2)
+    expect(state.unexpected).toEqual([])
+  } finally { state.releaseOldAnalysis() }
+})
+
+
+for (const pending of ['resume GET', 'analysis'] as const) {
+  test(`audit correction survives an older ${pending} response`, async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop audit controls')
+    const state = await install(page, { holdResumeContent: pending === 'resume GET', snapshotResumeContent: true, holdOldAnalysis: pending === 'analysis', versionedScore: true, auditCorrection: true })
+    await page.addInitScript(cached => sessionStorage.setItem('fixture_cached_resume', JSON.stringify(cached)), resume())
+    const newTime = '2026-10-30T12:00:00.000Z'
+    try {
+      await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+      if (pending === 'resume GET') await expect.poll(() => state.resumeContentRequested).toBe(true)
+      else await expect.poll(() => state.analysisCalls.filter(call => (call.body as { resumeContent?: { summary?: string } }).resumeContent?.summary === 'Software engineer.').length).toBe(2)
+      await expect(page.locator('[data-resume-editor]').getByText('Software engineer.', { exact: false }).first()).toBeVisible()
+      await page.getByRole('button', { name: 'Apply generated fix', exact: true }).click()
+      await expect.poll(() => state.writes.map(write => write.path)).toContain('/api/jobs/outside-page/audit-application/apply')
+      await expect(page.locator('[data-resume-editor]').getByText('Audited v2 summary', { exact: false }).first()).toBeVisible()
+      await expect.poll(() => page.evaluate(() => {
+        const read = (window as unknown as { __fixtureGetCachedResume: () => { updatedAt?: string; content?: { summary?: string } } | null }).__fixtureGetCachedResume
+        return read()
+      })).toMatchObject({ updatedAt: newTime, content: { summary: 'Audited v2 summary' } })
+      if (pending === 'resume GET') {
+        const oldGet = page.waitForResponse(response => response.url().endsWith('/api/resume/resume-1') && response.request().method() === 'GET')
+        state.releaseResumeContent()
+        await (await oldGet).finished()
+      } else {
+        const oldAnalysis = ['/api/ai/score', '/api/ai/suggest'].map(endpoint => page.waitForResponse(response => response.url().endsWith(endpoint)))
+        state.releaseOldAnalysis()
+        await Promise.all((await Promise.all(oldAnalysis)).map(response => response.finished()))
+      }
+      await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+      await expect(page.locator('[data-resume-editor]').getByText('Audited v2 summary', { exact: false }).first()).toBeVisible()
+      await expect.poll(() => page.evaluate(() => {
+        const read = (window as unknown as { __fixtureGetCachedResume: () => { updatedAt?: string; content?: { summary?: string } } | null }).__fixtureGetCachedResume
+        return read()
+      })).toMatchObject({ updatedAt: newTime, content: { summary: 'Audited v2 summary' } })
+      const cache = await page.evaluate(() => JSON.parse(localStorage.getItem('applymate_last_analysis') ?? '{}')['resume-1:outside-page'])
+      expect(cache?.resumeUpdatedAt === newTime && cache?.score?.score === 21).toBe(false)
+      await expect(page.getByText('21%', { exact: false })).toHaveCount(0)
+      expect(state.unexpected).toEqual([])
+    } finally { state.releaseResumeContent(); state.releaseOldAnalysis() }
+  })
+}
+
+
+test('editing during audit correction is kept without overwriting the server correction', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop audit controls')
+  const state = await install(page, { auditCorrection: true, holdAuditCorrection: true })
+  try {
+    await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    await expect(page.locator('[data-resume-editor]').getByText('Software engineer.', { exact: false }).first()).toBeVisible()
+    await page.getByRole('button', { name: 'Apply generated fix', exact: true }).click()
+    await expect.poll(() => state.writes.map(write => write.path)).toContain('/api/jobs/outside-page/audit-application/apply')
+    await page.locator('[data-resume-editor]').getByText('Software engineer.', { exact: false }).first().click()
+    await page.locator('[data-resume-editor] textarea').first().fill('My edit during correction')
+    // The autosave debounce is two seconds; hold the correction beyond that window.
+    await page.waitForTimeout(2300)
+    expect(state.writes.filter(write => write.path === '/api/resume/resume-1')).toEqual([])
+    state.releaseAuditCorrection()
+    await expect(page.getByText('Resume changed during correction', { exact: true })).toBeVisible()
+    await expect(page.getByText('Your local edits were kept. Copy them, then reload and review the latest saved content before continuing.', { exact: true })).toBeVisible()
+    await expect(page.locator('[data-resume-editor] textarea').first()).toHaveValue('My edit during correction')
+    await page.waitForTimeout(2300)
+    expect(state.writes.filter(write => write.path === '/api/resume/resume-1')).toEqual([])
+    expect(state.unexpected).toEqual([])
+  } finally { state.releaseAuditCorrection() }
 })

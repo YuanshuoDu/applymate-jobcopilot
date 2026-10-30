@@ -164,6 +164,12 @@ can retain the editor without preserving forward history. Authentication loss or
 an account change may still unmount the editor, so this is not a guarantee across
 session changes.
 
+If an audit correction and a new local edit overlap, automatic saving is paused.
+The user is asked to copy the local edits, reload and compare the latest saved
+content. There is no automatic merge or complete draft recovery for this conflict.
+Analysis waits for the resume refresh and binds cached results to the actual
+resume version; on refresh failure it identifies the cached version instead.
+
 ## 7. Agent-assisted journey
 
 1. Open the task related to the selected job. Use its actual `sessionId`.

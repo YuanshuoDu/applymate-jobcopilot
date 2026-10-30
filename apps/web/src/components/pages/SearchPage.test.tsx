@@ -20,7 +20,7 @@ function elements(value: React.ReactNode): React.ReactElement<Record<string, unk
 afterEach(() => { vi.unstubAllGlobals(); vi.clearAllMocks() })
 
 describe('Discover application navigation', () => {
-  it('uses the saved database job ID and retains existing list context', () => {
+  it('uses the saved database job ID and retains existing list context', async () => {
     const replaceState = vi.fn()
     const postMessage = vi.fn()
     vi.stubGlobal('window', {
@@ -31,7 +31,7 @@ describe('Discover application navigation', () => {
     ;(search.props.onJobSaved as (jobId: string) => void)('database-job-81')
     expect(postMessage).toHaveBeenCalledWith({ type: 'job-saved' }, 'https://applymate.example')
     expect(mocks.navigate).not.toHaveBeenCalled()
-    ;(search.props.onOpenApplication as (jobId: string) => void)('database-job-81')
+    await (search.props.onOpenApplication as (jobId: string) => Promise<boolean>)('database-job-81')
     const destination = new URL(replaceState.mock.calls[0][2])
     expect(destination.searchParams.get('highlight')).toBe('database-job-81')
     expect(destination.searchParams.get('jobsPage')).toBe('3')

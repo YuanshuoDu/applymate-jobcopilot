@@ -6,6 +6,12 @@ export type Lang = 'en' | 'de' | 'fr' | 'es' | 'nl' | 'zh'
 // ── Translations dictionary ──────────────────────────────────────────────────
 const dict: Record<Lang, Record<string, string>> = {
   en: {
+    'resume.correctionSaveFirstTitle': 'Save your resume first',
+    'resume.correctionSaveFirstDetail': 'Save your edits and run the audit again before applying a correction.',
+    'resume.correctionChangedTitle': 'Resume changed during correction',
+    'resume.correctionChangedDetail': 'Your local edits were kept. Copy them, then reload and review the latest saved content before continuing.',
+    'resume.cachedVersionTitle': 'Showing cached resume',
+    'resume.cachedVersionDetail': 'Could not refresh this resume. Analysis uses the cached version.',
     'application.attentionViews': 'Application views',
     'application.allApplications': 'All applications',
     'application.attentionView': 'Needs your attention',
@@ -2744,6 +2750,12 @@ const dict: Record<Lang, Record<string, string>> = {
   es: { 'settings.usage': 'Uso y actividad', 'settings.keysConnections': 'Claves y conexiones' },
   nl: { 'settings.usage': 'Gebruik en activiteit', 'settings.keysConnections': 'Sleutels en verbindingen' },
   zh: {
+    'resume.correctionSaveFirstTitle': '请先保存简历',
+    'resume.correctionSaveFirstDetail': '保存编辑后重新运行审核，再应用修正。',
+    'resume.correctionChangedTitle': '修正期间简历发生了更改',
+    'resume.correctionChangedDetail': '已保留本地编辑，请先复制这些内容，再重新加载并核对最新保存的内容。',
+    'resume.cachedVersionTitle': '当前显示缓存的简历',
+    'resume.cachedVersionDetail': '无法刷新简历，分析使用的是缓存版本。',
     'application.attentionViews': '申请视图',
     'application.allApplications': '全部申请',
     'application.attentionView': '需要我处理',
