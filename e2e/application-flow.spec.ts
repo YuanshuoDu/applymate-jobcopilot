@@ -114,7 +114,7 @@ function audit(resumeUpdatedAt = time) {
     audit: { verdict: 'pass', summary: 'Fixture materials checked.', findings: [], matchScore: 82, source: 'independent', auditedAt: time } }
 }
 
-async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unknown' | 'waiting_for_user' | 'waiting_for_authorization'; taskFailure?: boolean; missing?: boolean; holdSelectedLetter?: boolean; search?: boolean; saveMode?: 'fail' | 'hold-success' | 'hold-fail'; twoResumes?: boolean; holdResumeContent?: boolean; snapshotResumeContent?: boolean; resumeRevalidationFails?: boolean; versionedScore?: boolean; holdOldAnalysis?: boolean; auditCorrection?: boolean; holdAuditCorrection?: boolean; versions?: boolean; holdVersionRestore?: boolean; versionRestoreFails?: boolean; realAgent?: boolean } = {}) {
+async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unknown' | 'waiting_for_user' | 'waiting_for_authorization'; taskFailure?: boolean; missing?: boolean; holdSelectedLetter?: boolean; search?: boolean; saveMode?: 'fail' | 'hold-success' | 'hold-fail'; twoResumes?: boolean; holdResumeContent?: boolean; snapshotResumeContent?: boolean; resumeRevalidationFails?: boolean; versionedScore?: boolean; holdOldAnalysis?: boolean; auditCorrection?: boolean; holdAuditCorrection?: boolean; versions?: boolean; holdVersionRestore?: boolean; versionRestoreFails?: boolean; realAgent?: boolean; agentJourney?: boolean } = {}) {
   let releaseVersionRestore = () => {}
   const versionRestoreGate = new Promise<void>(resolve => { releaseVersionRestore = resolve })
   let releaseAuditCorrection = () => {}
@@ -129,7 +129,7 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
   const lettersGate = new Promise<void>(resolve => { releaseLetters = resolve })
   const state = { job: { ...job(), finalCoverLetterId: options.holdSelectedLetter ? 'selected-letter' : null }, resume: resume(), audit: options.auditCorrection ? { ...audit(), audit: { ...audit().audit, verdict: 'revise', findings: [{ area: 'resume', target: 'summary', severity: 'warning', title: 'Fix summary', evidence: 'Outdated wording', action: 'Apply correction', proposedValue: 'Audited v2 summary' }] } } : audit(options.stale ? '2026-10-29T10:00:00.000Z' : time),
     secondResume: { ...resume(), id: 'resume-2', name: 'Second fixture resume', targetJobId: null as string | null, content: { ...resume().content, summary: 'Second resume content.' } },
-    activeUserId: 'fixture-user', requestOwners: [] as Array<{ path: string; method: string; userId: string }>, agentRequests: [] as Array<{ path: string; method: string; body?: unknown }>, writes: [] as Array<{ path: string; body: unknown }>, analysisRequests: [] as string[], analysisBodies: [] as unknown[], analysisCalls: [] as Array<{ path: string; body: unknown }>, unexpected: [] as string[], taskReads: 0, letterRequested: false, resumeContentRequested: false, releaseLetters, releaseSave, releaseResumeContent, releaseOldAnalysis, releaseAuditCorrection, releaseVersionRestore }
+    activeUserId: 'fixture-user', agentStage: 'question' as 'question' | 'approval' | 'running' | 'unknown', requestOwners: [] as Array<{ path: string; method: string; userId: string }>, agentRequests: [] as Array<{ path: string; method: string; body?: unknown }>, writes: [] as Array<{ path: string; body: unknown }>, analysisRequests: [] as string[], analysisBodies: [] as unknown[], analysisCalls: [] as Array<{ path: string; body: unknown }>, unexpected: [] as string[], taskReads: 0, letterRequested: false, resumeContentRequested: false, releaseLetters, releaseSave, releaseResumeContent, releaseOldAnalysis, releaseAuditCorrection, releaseVersionRestore }
   const json = (route: Route, value: unknown, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(value) })
   await page.context().route('**/*', async route => {
     const request = route.request(), url = new URL(request.url()), pathname = url.pathname
@@ -146,6 +146,28 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
       if (pathname === '/api/agent/health') return json(route, { successRate: 100, captchaRate: 0, avgDurationMs: 1000, patternCacheRate: 100, last24hRuns: 1 })
       if (pathname === '/api/agent/sessions') return json(route, { sessions: [{ id: 'original-session', goal: 'Fixture application task', status: 'waiting_for_approval', updatedAt: time }], lastOpenedSessionId: 'original-session' })
       const prefix = '/api/agent/sessions/original-session'
+      if (options.agentJourney && pathname.startsWith(prefix)) {
+        const stage = state.agentStage
+        const statuses = { question: 'waiting_for_user', approval: 'waiting_for_approval', running: 'in_progress', unknown: 'completed' } as const
+        const revisions = { question: 1, approval: 2, running: 3, unknown: 4 } as const
+        const status = statuses[stage], revision = revisions[stage]
+        if (pathname === `${prefix}/turns` && method === 'GET') {
+          const turn = { id: 'fixture-turn', sessionId: 'original-session', source: 'automation', goal: 'Fixture application task', status, revision, activeStepId: null, finalItemId: null, createdAt: time, updatedAt: time, completedAt: null }
+          return json(route, { turns: [turn], projection: { activeTurnId: stage === 'unknown' ? null : turn.id, activeTurn: stage === 'unknown' ? null : { id: turn.id, status, revision, goal: turn.goal }, queuedInputCount: 0 } })
+        }
+        if (pathname === `${prefix}/tasks` && method === 'GET') return json(route, { tasks: [] })
+        if (pathname === `${prefix}/timeline` && method === 'GET') {
+          const question = { schemaVersion: 'agent-harness.v2', id: 'fixture-question-item', sessionId: 'original-session', turnId: 'fixture-turn', stepId: null, taskId: null, type: 'question', status: 'started', phase: 'commentary', revision: 0, startedAt: null, completedAt: null, createdAt: time, updatedAt: time, sequence: '1', content: { waitKind: 'question', questionId: 'fixture-question', stage: 'profile', question: 'Confirm the fixture fact?', options: [{ value: 'yes', label: 'Yes' }], answerAvailable: false, pending: true } }
+          const approval = { schemaVersion: 'agent-harness.v2', id: 'fixture-approval-event', sessionId: 'original-session', turnId: 'fixture-turn', itemId: null, taskId: null, type: 'approval.requested', actor: 'orchestrator', sequence: '2', payload: { approvalId: 'fixture-approval', action: 'submit_application', scopeHash: `sha256:${'a'.repeat(64)}`, revision: 1 } }
+          const result = { schemaVersion: 'agent-harness.v2', id: 'fixture-result', sessionId: 'original-session', turnId: 'fixture-turn', stepId: null, taskId: null, type: 'agent_message', status: 'completed', phase: 'final_answer', revision: 1, startedAt: time, completedAt: time, createdAt: time, updatedAt: time, sequence: '3', content: { text: 'Fixture outcome is unverified. Check the original records.' } }
+          return json(route, { items: stage === 'question' ? [question] : stage === 'unknown' ? [result] : [], approvalEvents: stage === 'approval' ? [approval] : [] })
+        }
+        if (pathname === `${prefix}/events` && method === 'GET') return route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': fixture waiting\n\n' })
+        if (pathname === `${prefix}/questions/fixture-question` && method === 'POST' && stage === 'question') { state.agentStage = 'approval'; return json(route, { disposition: 'resolved' }, 202) }
+        if (pathname === `${prefix}/approvals/fixture-approval` && method === 'POST' && stage === 'approval') { state.agentStage = 'running'; return json(route, { disposition: 'resolved' }, 202) }
+        if (pathname === prefix && (method === 'GET' || method === 'PATCH')) return json(route, { session: { id: 'original-session', goal: 'Fixture application task', status, updatedAt: time, tasks: [], approvals: [], applicationTasks: [], questions: [], artifacts: [], qualityScore: 100 } })
+        state.unexpected.push(`${method} ${pathname}`); return json(route, { error: 'Unexpected agent journey request' }, 404)
+      }
       if (!pathname.startsWith(prefix)) { state.unexpected.push(pathname); return json(route, { error: 'Unexpected agent session' }, 404) }
       if (pathname === `${prefix}/turns`) {
         const turn = { id: 'fixture-turn', sessionId: 'original-session', source: 'automation', goal: 'Fixture application task', status: 'waiting_for_approval', revision: 1, activeStepId: null, finalItemId: null, createdAt: time, updatedAt: time, completedAt: null }
@@ -198,8 +220,9 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
     if (pathname === '/api/agent/application-tasks') {
       state.taskReads++
       if (options.taskFailure) return json(route, { error: 'Fixture unavailable' }, 500)
-      return json(route, { tasks: options.taskStatus ? [{ id: 'task-1', userId: 'fixture-user', jobId: state.job.id, sessionId: 'original-session', status: options.taskStatus,
-        checkpoint: options.taskStatus === 'unknown' ? 'submission_uncertain' : options.taskStatus === 'waiting_for_authorization' ? 'waiting_for_authorization' : 'form_answer_required', updatedAt: time, job: { company: state.job.company, role: state.job.role } }] : [] })
+      const currentTaskStatus = options.agentJourney ? ({ question: 'waiting_for_user', approval: 'waiting_for_authorization', running: 'filling', unknown: 'unknown' } as const)[state.agentStage] : options.taskStatus
+      return json(route, { tasks: currentTaskStatus ? [{ id: 'task-1', userId: 'fixture-user', jobId: state.job.id, sessionId: 'original-session', status: currentTaskStatus,
+        checkpoint: currentTaskStatus === 'unknown' ? 'submission_uncertain' : currentTaskStatus === 'waiting_for_user' ? 'form_answer_required' : null, updatedAt: time, job: { company: state.job.company, role: state.job.role } }] : [] })
     }
     if (pathname === '/api/jobs') return json(route, { jobs: url.searchParams.has('finalResumeId') || url.searchParams.get('pageSize') === '30' ? [state.job] : [], total: 80, statusCounts: { saved: 80, applied: 0, interview: 0, offer: 0, rejected: 0 } })
     if (pathname === `/api/jobs/${state.job.id}`) return options.missing ? json(route, { error: 'Not found' }, 404) : json(route, state.job)
@@ -1176,4 +1199,43 @@ test('an uncertain version restore remains guarded against automatic save or ret
     expect(state.writes.filter(write => write.path.endsWith('/versions'))).toHaveLength(1)
     await expect(page.locator('[data-resume-editor]').getByText('Local edit after uncertain restore', { exact: false }).first()).toBeVisible()
   } finally { state.releaseSave() }
+})
+
+
+test('application follows original Agent question, review and an unverified outcome', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises the real desktop Agent shell')
+  const state = await install(page, { taskStatus: 'waiting_for_user', realAgent: true, agentJourney: true })
+  await page.goto(`${origin}/?shell=1&page=jobs&highlight=outside-page`)
+  await expect(page.getByRole('dialog')).toContainText('Application flow engineer')
+  await page.getByRole('link', { name: 'Answer in the original task' }).click()
+  await expect(page).toHaveURL(/sessionId=original-session/)
+  await page.getByRole('button', { name: /^Tasks & results/ }).click()
+  const question = page.locator('[data-agent-question-card="true"]')
+  await expect(question).toContainText('Confirm the fixture fact?')
+  await question.getByRole('button', { name: 'Yes', exact: true }).click()
+  await question.getByRole('button', { name: 'Send answer', exact: true }).click()
+  await expect.poll(() => state.agentStage).toBe('approval')
+  expect(state.agentRequests.find(item => item.method === 'POST')).toMatchObject({ path: '/api/agent/sessions/original-session/questions/fixture-question', body: { expectedTurnId: 'fixture-turn', expectedRevision: 1, answer: 'yes' } })
+  // The server state changes are simulated; reload hydrates the same durable session.
+  await page.reload()
+  await expect(page).toHaveURL(/sessionId=original-session/)
+  await page.getByRole('button', { name: /^Tasks & results/ }).click()
+  const approval = page.locator('[data-agent-approval-ledger="true"]')
+  await expect(approval).toBeVisible()
+  await approval.getByRole('button', { name: 'Approve', exact: true }).click()
+  await expect.poll(() => state.agentStage).toBe('running')
+  expect(state.agentRequests.filter(item => item.method === 'POST')[1]).toMatchObject({ path: '/api/agent/sessions/original-session/approvals/fixture-approval', body: { expectedTurnId: 'fixture-turn', expectedRevision: 2, decision: 'approved' } })
+  await page.reload()
+  await expect(page).toHaveURL(/sessionId=original-session/)
+  await expect(page.locator('.agent-context-bar')).toContainText('Fixture application task')
+  // Outcome is deliberately unknown; the fixture never performs an external submission.
+  state.agentStage = 'unknown'
+  await page.reload()
+  await expect(page.locator('[data-agent-harness-item="fixture-result"]')).toContainText('Fixture outcome is unverified')
+  await page.goto(`${origin}/?shell=1&page=jobs&highlight=outside-page`)
+  await expect(page.getByRole('dialog')).toContainText('Submission outcome unverified')
+  await expect(page.getByRole('button', { name: /Record that I submitted/ })).toHaveCount(0)
+  expect(state.agentRequests.filter(item => item.method === 'POST')).toHaveLength(2)
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
 })

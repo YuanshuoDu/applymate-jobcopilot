@@ -245,8 +245,11 @@ Adding that association remains a separately scoped data requirement.
 Focused tests cover saved identities, cancellation after unmount/account change,
 history navigation, save-before-return, optional letters, stale versions, bounded
 task coverage, uncertain outcomes and read-only task links. Mounted browser
-fixtures exercise real components with synthetic sessions and mocked requests;
-they prove UI wiring, not authenticated database, live ATS or production behavior.
+fixtures exercise real components with synthetic sessions and mocked requests.
+One fixture opens the original Agent session from an application, answers a mock
+question, reviews a mock approval and displays a simulated unverified outcome;
+its state changes are injected by the fixture and page reloads. These checks prove
+UI wiring, not Worker execution, authenticated database, live ATS or production behavior.
 
 Worker runtime, Agent-owned layout, protocol, policies, mutation APIs, schema and
 roadmap remain under their existing owners. No new state machine, persistent
