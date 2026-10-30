@@ -681,15 +681,22 @@ async function expectCompletedClaimBeforeItemEventSafety(
         ids.waiterTaskId, JSON.stringify({ toolCallId: callId, output: null, errorCode: null }),
       ])
     })
-    await remainsBlocked("result lifecycle event without a result row", async () => {
+    await remainsBlocked("result lifecycle event without its result row uses an unrelated existing itemId", async () => {
       const resultItemId = `task:${ids.waiterTaskId}:item:tool-result:${callId}:attempt:${attempt}`
+      const unrelatedItem = await client.query<{ id: string; stepId: string; type: string }>(
+        `SELECT "id", "stepId", "type" FROM "agent_items" WHERE "id" = $1 AND "sessionId" = $2
+         AND "turnId" = $3 AND "taskId" = $4 AND "type" = 'tool_call' AND "stepId" <> $5`,
+        [sourceCallItemId, ids.sessionId, ids.turnId, ids.waiterTaskId, continuationStepId],
+      )
+      expect(unrelatedItem.rows).toHaveLength(1)
+      expect(unrelatedItem.rows[0]).toMatchObject({ id: sourceCallItemId, type: "tool_call" })
       const sequence = await client.query<{ eventSequence: string }>(
         `UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1 WHERE "id" = $1 RETURNING "eventSequence"`, [ids.sessionId],
       )
       await client.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor",
           "correlationId", "causationId", "idempotencyKey", "payload")
         VALUES ($1, $2, $3, $4, $5, $6, 'item.completed', 'subagent', $7, $8, $9, $10::jsonb)`, [
-        `fixture-claim-result-event-${randomUUID()}`, ids.sessionId, ids.turnId, resultItemId, ids.waiterTaskId,
+        `fixture-claim-result-event-${randomUUID()}`, ids.sessionId, ids.turnId, sourceCallItemId, ids.waiterTaskId,
         sequence.rows[0]!.eventSequence, resultItemId, callStarted?.id ?? null, `fixture-claim-result-event:${randomUUID()}`,
         JSON.stringify({ itemId: resultItemId, status: "completed", content: { toolCallId: callId } }),
       ])
