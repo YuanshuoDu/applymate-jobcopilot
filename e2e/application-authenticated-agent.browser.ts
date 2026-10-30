@@ -41,8 +41,22 @@ test('synthetic native question resumes the actual authenticated turn', async ({
     expect((await authenticated.json()).user.email).toBe('candidate-a@example.invalid')
 
     const created = await page.request.post('/api/agent/sessions', { data: { goal } })
-    expect(created.status()).toBe(201)
-    const sessionId = (await created.json()).session.id as string
+    // Keep a creation failure visible, but inspect the single already-persisted
+    // session to independently exercise the downstream question path. Never
+    // repeat this POST: a 500 can occur after the database write.
+    expect.soft(created.status(), 'Session creation must return 201; a 500 may already have persisted it').toBe(201)
+    let sessionId: string
+    if (created.status() === 201) {
+      sessionId = (await created.json()).session.id as string
+    } else {
+      expect(created.status()).toBe(500)
+      const listed = await page.request.get('/api/agent/sessions')
+      expect(listed.status()).toBe(200)
+      const sessions = (await listed.json()).sessions as { id: string; goal: string; source: string; status: string }[]
+      expect(sessions).toHaveLength(1)
+      expect(sessions[0]).toMatchObject({ goal, source: 'chat', status: 'running' })
+      sessionId = sessions[0].id
+    }
     expect(sessionId).toBeTruthy()
     const sent = await page.request.post(`/api/agent/sessions/${encodeURIComponent(sessionId)}/messages`, { data: {
       clientMessageId: `fixture-question-${randomUUID()}`, content: [{ type: 'text', text: goal }],
