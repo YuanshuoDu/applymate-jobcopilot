@@ -1,0 +1,86 @@
+name: Application description CAS
+
+on:
+  pull_request:
+    branches: [master, 'feat/**', 'fix/**', 'refactor/**', 'chore/**', 'codex/**']
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  description-cas-postgres:
+    name: Description CAS on disposable PostgreSQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: applymate_description_cas_test
+          POSTGRES_USER: description_fixture
+          POSTGRES_PASSWORD: description_fixture_only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U description_fixture -d applymate_description_cas_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - name: Install frozen dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Generate Prisma client
+        env:
+          DATABASE_URL: postgresql://description_fixture:description_fixture_only@127.0.0.1:5432/applymate_description_cas_test
+        run: pnpm --filter @jobcopilot/web exec prisma generate --schema prisma/schema.prisma
+      - name: Verify description CAS on the disposable database
+        env:
+          DATABASE_URL: postgresql://description_fixture:description_fixture_only@127.0.0.1:5432/applymate_description_cas_test
+          DESCRIPTION_CAS_PG_TEST_URL: postgresql://description_fixture:description_fixture_only@127.0.0.1:5432/applymate_description_cas_test
+          DESCRIPTION_CAS_PG_TEST_DISPOSABLE: 'true'
+          RLS_RUNTIME_MODE: 'off'
+        run: |
+          test "$CI" = "true"
+          test "$DESCRIPTION_CAS_PG_TEST_DISPOSABLE" = "true"
+          test "$DESCRIPTION_CAS_PG_TEST_URL" = "postgresql://description_fixture:description_fixture_only@127.0.0.1:5432/applymate_description_cas_test"
+          test "$DATABASE_URL" = "$DESCRIPTION_CAS_PG_TEST_URL"
+          test "$RLS_RUNTIME_MODE" = "off"
+          pnpm --filter @jobcopilot/web exec vitest run --no-file-parallelism \
+            'src/app/api/jobs/[id]/route.pg.integration.test.ts'
+
+  description-browser-mobile-zh:
+    name: Description flow in simulated Chinese mobile browser
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - name: Install frozen dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Install Chromium
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Verify description flow with isolated fixtures
+        env:
+          E2E_BASE_URL: http://fixture.invalid
+        run: |
+          test "$E2E_BASE_URL" = "http://fixture.invalid"
+          pnpm exec playwright test e2e/application-flow.spec.ts \
+            --project=mobile-zh --workers=1 \
+            --grep 'a missing job description|description save preserves|description conflict|late description response|late notes response preserves the newly saved description|late followUp response preserves the newly saved description|unconfirmed description save|an existing audit prevents|a failed audit check|existing job descriptions|description draft protects|job description drafts|new job form does not offer|Discover saves once and opens the exact saved application|a selected letter and manual record arriving during a resume-only audit stop the old preparation'

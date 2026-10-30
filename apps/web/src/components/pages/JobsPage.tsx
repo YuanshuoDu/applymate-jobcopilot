@@ -855,7 +855,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     setSavingNotes(false)
     if (error) { toast.error('Save failed', error); return }
     if (data && data.id === job.id && data.userId === owner && (data.notes === null || typeof data.notes === 'string')) {
-      onJobFieldsUpdate(owner, job.id, { notes: data.notes }); toast.success('Notes saved')
+      onJobFieldsUpdate(owner, job.id, { notes: data.notes }); toast.success(t('jobs.notesSaved'))
     }
   }
 
@@ -872,7 +872,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     if (!isCurrentDrawer(owner) || drawerJobIdRef.current !== job.id) return
     if (error) { toast.error('Save failed', error); return }
     if (data && data.id === job.id && data.userId === owner && (data.followUpAt === null || typeof data.followUpAt === 'string')) {
-      onJobFieldsUpdate(owner, job.id, { followUpAt: data.followUpAt }); toast.success(value ? 'Follow-up date set' : 'Follow-up date cleared')
+      onJobFieldsUpdate(owner, job.id, { followUpAt: data.followUpAt }); toast.success(t(value ? 'jobs.followUpDateSet' : 'jobs.followUpDateCleared'))
     }
   }
 

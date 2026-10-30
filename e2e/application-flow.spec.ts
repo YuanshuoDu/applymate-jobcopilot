@@ -120,11 +120,12 @@ function resume() {
       experience: [], education: [], skills: ['TypeScript'], languages: [], projects: [], certifications: [] } }
 }
 function audit(resumeUpdatedAt = time) {
-  return { resumeId: 'resume-1', coverLetterId: null, resumeUpdatedAt,
+  const record = { resumeId: 'resume-1', coverLetterId: null, resumeUpdatedAt,
     audit: { verdict: 'pass', summary: 'Fixture materials checked.', findings: [], matchScore: 82, source: 'independent', auditedAt: time } }
+  return record as typeof record & { coverLetterUpdatedAt?: string }
 }
 
-async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unknown' | 'waiting_for_user' | 'waiting_for_authorization' | 'cancelled' | 'failed' | 'filling'; recordedInitially?: boolean; evidenceCase?: 'bound' | 'unbound' | 'unavailable'; previewMismatch?: 'owner' | 'id' | 'job'; malformedPreview?: 'content' | 'contact'; letterRaceProbe?: boolean; letterInvalid?: 'null' | 'owner' | 'job' | 'duplicate' | 'content'; letterAfterInitial?: 'changed' | 'failure' | 'hold' | 'manual-change' | 'audit-same' | 'audit-failure' | 'audit-hold'; auditVersion?: 'same' | 'resume-changed' | 'letter-changed' | 'resume-missing' | 'letter-missing'; holdAudit?: boolean; holdAssign?: boolean; selectLetterOnNotes?: boolean; failTailoredRead?: boolean; taskFailure?: boolean; missing?: boolean; holdSelectedLetter?: boolean; selectedLetter?: boolean; firstPreparation?: boolean; descriptionMode?: 'success' | 'unknown' | 'audit' | 'two' | 'conflict' | 'hold-response' | 'hold-other'; initialDescription?: string | null; holdBaseSave?: boolean; failBaseSave?: boolean; baseList?: 'empty' | 'fail-once' | 'fail-once-hold' | 'hold-empty' | 'multiple' | 'single' | 'default'; failFirstAudit?: boolean; flowSave?: boolean; manualOutcome?: 'get-fails' | 'unknown'; search?: boolean; saveMode?: 'fail' | 'hold-success' | 'hold-fail'; twoResumes?: boolean; holdResumeContent?: boolean; snapshotResumeContent?: boolean; resumeRevalidationFails?: boolean; versionedScore?: boolean; holdOldAnalysis?: boolean; holdFirstAnalysisOnly?: boolean; auditCorrection?: boolean; holdAuditCorrection?: boolean; versions?: boolean; holdVersionRestore?: boolean; versionRestoreFails?: boolean; realAgent?: boolean; expiredApproval?: boolean; twoJobQuestions?: boolean; holdFirstTaskRead?: boolean; holdReturnOwnerA?: boolean; taskPerUser?: boolean; dashboardFourTasks?: boolean; agentJourney?: boolean } = {}) {
+async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unknown' | 'waiting_for_user' | 'waiting_for_authorization' | 'cancelled' | 'failed' | 'filling'; recordedInitially?: boolean; evidenceCase?: 'bound' | 'unbound' | 'unavailable'; previewMismatch?: 'owner' | 'id' | 'job'; malformedPreview?: 'content' | 'contact'; letterRaceProbe?: boolean; letterInvalid?: 'null' | 'owner' | 'job' | 'duplicate' | 'content'; letterAfterInitial?: 'changed' | 'failure' | 'hold' | 'manual-change' | 'audit-same' | 'audit-failure' | 'audit-hold'; auditVersion?: 'same' | 'resume-changed' | 'letter-changed' | 'resume-missing' | 'letter-missing'; holdAudit?: boolean; holdAssign?: boolean; externalLetterSelection?: boolean; failTailoredRead?: boolean; taskFailure?: boolean; missing?: boolean; holdSelectedLetter?: boolean; selectedLetter?: boolean; firstPreparation?: boolean; descriptionMode?: 'success' | 'unknown' | 'audit' | 'two' | 'conflict' | 'hold-response' | 'hold-other'; initialDescription?: string | null; holdBaseSave?: boolean; failBaseSave?: boolean; baseList?: 'empty' | 'fail-once' | 'fail-once-hold' | 'hold-empty' | 'multiple' | 'single' | 'default'; failFirstAudit?: boolean; flowSave?: boolean; manualOutcome?: 'get-fails' | 'unknown'; search?: boolean; saveMode?: 'fail' | 'hold-success' | 'hold-fail'; twoResumes?: boolean; holdResumeContent?: boolean; snapshotResumeContent?: boolean; resumeRevalidationFails?: boolean; versionedScore?: boolean; holdOldAnalysis?: boolean; holdFirstAnalysisOnly?: boolean; auditCorrection?: boolean; holdAuditCorrection?: boolean; versions?: boolean; holdVersionRestore?: boolean; versionRestoreFails?: boolean; realAgent?: boolean; expiredApproval?: boolean; twoJobQuestions?: boolean; holdFirstTaskRead?: boolean; holdReturnOwnerA?: boolean; taskPerUser?: boolean; dashboardFourTasks?: boolean; agentJourney?: boolean } = {}) {
   let releaseReturnOwnerA = () => {}
   const returnOwnerAGate = new Promise<void>(resolve => { releaseReturnOwnerA = resolve })
   let releaseStaleJob = () => {}
@@ -165,7 +166,7 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
   const baseListGate = new Promise<void>(resolve => { releaseBaseList = resolve })
   let releaseLetters = () => {}
   const lettersGate = new Promise<void>(resolve => { releaseLetters = resolve })
-  const state = { job: { ...job(), description: job().description as string | null, followUpAt: null as string | null, finalCoverLetterId: options.holdSelectedLetter || options.selectedLetter ? 'selected-letter' : null, finalResumeId: options.firstPreparation ? null : 'resume-1' }, resume: resume(), audit: options.auditCorrection ? { ...audit(), audit: { ...audit().audit, verdict: 'revise', findings: [{ area: 'resume', target: 'summary', severity: 'warning', title: 'Fix summary', evidence: 'Outdated wording', action: 'Apply correction', proposedValue: 'Audited v2 summary' }] } } : audit(options.stale ? '2026-10-29T10:00:00.000Z' : time),
+  const state = { job: { ...job(), description: job().description as string | null, followUpAt: null as string | null, appliedAt: null as string | null, finalCoverLetterId: options.holdSelectedLetter || options.selectedLetter ? 'selected-letter' : null, finalResumeId: options.firstPreparation ? null : 'resume-1' }, resume: resume(), audit: options.auditCorrection ? { ...audit(), audit: { ...audit().audit, verdict: 'revise', findings: [{ area: 'resume', target: 'summary', severity: 'warning', title: 'Fix summary', evidence: 'Outdated wording', action: 'Apply correction', proposedValue: 'Audited v2 summary' }] } } : audit(options.stale ? '2026-10-29T10:00:00.000Z' : time),
     secondResume: { ...resume(), id: 'resume-2', name: 'Second fixture resume', targetJobId: null as string | null, content: { ...resume().content, summary: 'Second resume content.' } },
     answeredJobA: false, saveResponses: 0, armReturnOwnerA: false, returnOwnerAEntered: false, releaseReturnOwnerA, manualPosted: false, manualReadAvailable: false, hideResumeOnExport: false, malformedPreview: options.malformedPreview ?? null, selectedLetterAvailable: false, failNextDescriptionAudit: false, descriptionWriteStarted: false, otherJobUpdateStarted: false, releaseDescription, releaseOtherJobUpdate, savedBase: null as (Omit<ReturnType<typeof resume>, 'targetJobId'> & { targetJobId: string | null }) | null, baseSaveStarted: false, releaseBaseSave, baseListReads: 0, releaseBaseList, invalidLetter: options.letterInvalid ?? null, probeLetterReads: 0, selectedLetterReads: 0, changeLetterOnRead: false, auditStarted: false, assignStarted: false, releaseAudit, releaseAssign, releaseProbeLetter, fontRequests: [] as string[], activeUserId: 'fixture-user', agentStage: 'question' as 'question' | 'approval' | 'running' | 'unknown', requestOwners: [] as Array<{ path: string; method: string; userId: string }>, agentRequests: [] as Array<{ path: string; method: string; body?: unknown }>, writes: [] as Array<{ path: string; body: unknown }>, analysisRequests: [] as string[], analysisBodies: [] as unknown[], analysisCalls: [] as Array<{ path: string; body: unknown }>, unexpected: [] as string[], taskReads: 0, staleJobRequested: false, staleJobReturned: false, releaseStaleJob, taskStatusOverride: null as 'waiting_for_authorization' | null, firstTaskReadFinished: false, releaseFirstTaskRead, letterRequested: false, resumeContentRequested: false, releaseLetters, releaseSave, releaseResumeContent, releaseOldAnalysis, releaseAuditCorrection, releaseVersionRestore }
   if (options.descriptionMode) state.job.description = options.initialDescription === undefined ? '' : options.initialDescription
@@ -280,7 +281,8 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
         state.resume = { ...state.resume, updatedAt: '2026-10-30T12:00:00.000Z', content: { ...state.resume.content, summary: 'Restored historical summary' } }
         return options.versionRestoreFails ? json(route, { error: 'Fixture uncertain restore' }, 500) : json(route, state.resume)
       }
-      if ((options.search || options.descriptionMode) && pathname === '/api/jobs' && request.method() === 'POST') return json(route, { ...state.job, ...(body as object), id: 'created-job' })
+      if (options.search && pathname === '/api/jobs' && request.method() === 'POST') return json(route, state.job)
+      if (options.descriptionMode && pathname === '/api/jobs' && request.method() === 'POST') return json(route, { ...state.job, ...(body as object), id: 'created-job' })
       if (options.descriptionMode && pathname === '/api/jobs/outside-page' && request.method() === 'PATCH') {
         const patch = body as { description?: unknown; expectedEmptyDescription?: unknown; notes?: unknown; followUpAt?: unknown }
         if (typeof patch.description === 'string') {
@@ -291,12 +293,10 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
           state.job.description = patch.description
           const saved = { ...state.job }
           if (options.descriptionMode === 'hold-response') await descriptionGate
-          return json(route, saved)
+          return json(route, options.descriptionMode === 'hold-response' ? { id: saved.id, userId: saved.userId, description: saved.description } : saved)
         }
         if (options.descriptionMode === 'hold-response' && typeof patch.notes === 'string') {
           state.job.notes = patch.notes
-          state.job.status = 'applied'
-          state.job.workflowState = 'submitted'
           return json(route, state.job)
         }
         if (options.descriptionMode === 'hold-other' && (typeof patch.notes === 'string' || typeof patch.followUpAt === 'string')) {
@@ -315,10 +315,9 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
       }
       if (pathname.endsWith('/tailor-resume')) return json(route, { adaptedResumeId: 'resume-1' })
       if (pathname === '/api/resume' && options.baseList === 'empty') { state.baseSaveStarted = true; if (options.holdBaseSave) await baseSaveGate; if (options.failBaseSave) return route.abort('failed'); const saved = body as { name: string; content: ReturnType<typeof resume>['content'] }; state.savedBase = { ...state.resume, id: 'base-created', kind: 'base', targetJobId: null, name: saved.name, content: saved.content }; return json(route, state.savedBase) }
-      if (pathname === '/api/jobs/outside-page' && request.method() === 'PATCH' && options.selectLetterOnNotes) { Object.assign(state.job, body, { finalCoverLetterId: 'selected-letter' }); return json(route, state.job) }
       if (pathname.endsWith('/audit-application')) { state.auditStarted = true; if (options.holdAudit) await auditGate; if (options.failFirstAudit && state.writes.filter(write => write.path.endsWith('/audit-application')).length === 1) return json(route, { error: 'Fixture audit unavailable' }, 500); const letterId = (body as { coverLetterId: string | null }).coverLetterId; state.audit = { ...audit(state.resume.updatedAt), coverLetterId: letterId, ...(letterId ? { coverLetterUpdatedAt: time } : {}) }; return json(route, { ...state.audit.audit, ...(options.auditVersion === 'resume-missing' ? {} : { resumeUpdatedAt: options.auditVersion === 'resume-changed' ? '2026-10-30T11:00:00.000Z' : state.resume.updatedAt }), ...(letterId && options.auditVersion !== 'letter-missing' ? { coverLetterUpdatedAt: options.auditVersion === 'letter-changed' ? '2026-10-30T11:00:00.000Z' : time } : {}) }) }
       if (pathname.endsWith('/assign')) { state.assignStarted = true; if (options.holdAssign) await assignGate; Object.assign(state.job, body); return json(route, state.job) }
-      if (pathname === '/api/jobs/outside-page/apply') { state.manualPosted = true; if (options.manualOutcome === 'unknown') return route.abort('failed'); state.job.status = 'applied'; return json(route, state.job) }
+      if (pathname === '/api/jobs/outside-page/apply') { state.manualPosted = true; if (options.manualOutcome === 'unknown') return route.abort('failed'); Object.assign(state.job, { status: 'applied', workflowState: 'submitted', appliedAt: time }); return json(route, { applied: true }) }
       return json(route, { error: 'Unexpected mutation' }, 500)
     }
     if (options.search && pathname === '/api/search/unified') return json(route, { jobs: [{ id: 'search-result-1', title: state.job.role, company: state.job.company, location: state.job.location, url: state.job.url, description: '', source: 'manual', score: 82 }], meta: null })
@@ -344,14 +343,14 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
     if ((options.twoJobQuestions || options.descriptionMode === 'two') && pathname === '/api/jobs/job-2') return json(route, { ...state.job, id: 'job-2', company: 'Employer B', role: 'Role B' })
     if (options.dashboardFourTasks && pathname === '/api/jobs/stale-job') { state.staleJobRequested = true; await staleJobGate; await json(route, { ...state.job, id: 'stale-job', company: 'Stale Employer', role: 'Stale Role' }); state.staleJobReturned = true; return }
     if (pathname === `/api/jobs/${state.job.id}` && state.manualPosted && options.manualOutcome === 'get-fails' && !state.manualReadAvailable) return json(route, { error: 'Fixture read unavailable' }, 500)
-    if (pathname === `/api/jobs/${state.job.id}` && state.manualPosted && options.manualOutcome === 'get-fails' && state.manualReadAvailable) return json(route, { ...state.job, status: 'saved' })
+    if (pathname === `/api/jobs/${state.job.id}` && state.manualPosted && options.manualOutcome === 'get-fails' && state.manualReadAvailable) return json(route, { ...state.job, status: 'saved', workflowState: 'draft', appliedAt: null })
     if (pathname === `/api/jobs/${state.job.id}`) return options.missing ? json(route, { error: 'Not found' }, 404) : json(route, state.job)
     if (pathname.endsWith('/cover-letters')) {
       if (options.letterRaceProbe) { const read = ++state.probeLetterReads; const item = { id: 'selected-letter', userId: state.activeUserId, jobId: pathname.split('/')[3], content: read <= 2 ? `Old fixture letter ${read}` : `Current fixture letter ${read}`, updatedAt: time }; if (read <= 2) await probeLetterGate; return json(route, [item]) }
       if (state.invalidLetter) { const item = { id: 'selected-letter', userId: state.invalidLetter === 'owner' ? 'other-user' : 'fixture-user', jobId: state.invalidLetter === 'job' ? 'other-job' : 'outside-page', content: state.invalidLetter === 'content' ? null : 'Fixture selected cover letter.', updatedAt: time }; return json(route, state.invalidLetter === 'null' ? [null] : state.invalidLetter === 'duplicate' ? [item, item] : [item]) }
       if (options.letterAfterInitial) { const read = ++state.selectedLetterReads; if (read > 1 && options.letterAfterInitial === 'failure' || read > 2 && options.letterAfterInitial === 'audit-failure') return json(route, { error: 'Fixture refresh failed' }, 500); if (read > 1 && options.letterAfterInitial === 'hold' || read > 2 && options.letterAfterInitial === 'audit-hold') await probeLetterGate; const changed = read > 1 && (options.letterAfterInitial === 'changed' || (options.letterAfterInitial === 'manual-change' && state.changeLetterOnRead)); return json(route, [{ id: 'selected-letter', userId: 'fixture-user', jobId: 'outside-page', content: changed ? 'Changed cover letter.' : 'Original cover letter.', tone: 'professional', createdAt: time, updatedAt: changed ? '2026-10-30T11:00:00.000Z' : time }]) }
       if (options.holdSelectedLetter) { state.letterRequested = true; await lettersGate; return state.selectedLetterAvailable ? json(route, [{ id: 'selected-letter', userId: 'fixture-user', jobId: 'outside-page', content: 'Fixture selected cover letter.', tone: 'professional', createdAt: time, updatedAt: time }]) : json(route, { error: 'Fixture letter unavailable' }, 500) }
-      return json(route, options.selectedLetter || options.selectLetterOnNotes && state.job.finalCoverLetterId ? [{ id: 'selected-letter', userId: 'fixture-user', jobId: 'outside-page', content: 'I am excited to contribute my TypeScript experience.', tone: 'professional', createdAt: time, updatedAt: time }] : [])
+      return json(route, options.selectedLetter || options.externalLetterSelection && state.job.finalCoverLetterId ? [{ id: 'selected-letter', userId: 'fixture-user', jobId: 'outside-page', content: 'I am excited to contribute my TypeScript experience.', tone: 'professional', createdAt: time, updatedAt: time }] : [])
     }
     if (pathname.endsWith('/audit-application') && state.failNextDescriptionAudit) { state.failNextDescriptionAudit = false; return json(route, { error: 'Fixture audit check unavailable' }, 500) }
     if (pathname.endsWith('/audit-application') && options.evidenceCase) return json(route, { ...audit(), audit: { ...audit().audit, verdict: 'needs_review', findings: [{ area: 'resume', severity: 'warning', resolution: 'evidence_needed', target: 'summary', title: 'Fixture evidence', evidence: 'No independent support', action: 'Review the claim' }] } })
@@ -863,14 +862,24 @@ test('late description response preserves a newer job status and notes', async (
     await expect.poll(() => state.descriptionWriteStarted).toBe(true)
     const notes = page.getByPlaceholder(/Add notes, contacts|添加备注、联系人/)
     await notes.fill('More recent notes.')
+    const notesResponse = page.waitForResponse(response => response.url().endsWith('/api/jobs/outside-page') && response.request().method() === 'PATCH' && response.request().postDataJSON()?.notes === 'More recent notes.')
     await notes.press('Tab')
-    await expect.poll(() => state.writes.some(write => (write.body as { notes?: string }).notes === 'More recent notes.')).toBe(true)
+    expect((await (await notesResponse).json()).notes).toBe('More recent notes.')
+    const recordResponse = page.waitForResponse(response => response.url().endsWith('/api/jobs/outside-page/apply') && response.request().method() === 'POST')
+    const refreshedJob = page.waitForResponse(response => response.url().endsWith('/api/jobs/outside-page') && response.request().method() === 'GET' && state.manualPosted)
+    await page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ }).click()
+    expect(await (await recordResponse).json()).toEqual({ applied: true })
+    expect(await (await refreshedJob).json()).toMatchObject({ id: 'outside-page', status: 'applied', workflowState: 'submitted', notes: 'More recent notes.' })
     await expect(page.getByText(/Application record|申请记录/, { exact: true })).toBeVisible()
+    const descriptionResponse = page.waitForResponse(response => response.url().endsWith('/api/jobs/outside-page') && response.request().method() === 'PATCH' && response.request().postDataJSON()?.description === 'Description saved before a later status change.')
     state.releaseDescription()
+    const descriptionReply = await descriptionResponse
+    expect(await descriptionReply.json()).toEqual({ id: 'outside-page', userId: 'fixture-user', description: 'Description saved before a later status change.' })
     await expect(page.getByLabel(/^(Job description|职位描述)$/)).toHaveCount(0)
     await expect(page.getByText('Description saved before a later status change.', { exact: true })).toBeVisible()
     await expect(page.getByText(/Application record|申请记录/, { exact: true })).toBeVisible()
     await expect(notes).toHaveValue('More recent notes.')
+    expect(state.job).toMatchObject({ status: 'applied', workflowState: 'submitted', notes: 'More recent notes.', description: 'Description saved before a later status change.' })
     expect(state.unexpected).toEqual([])
   } finally { state.releaseDescription() }
 })
@@ -894,13 +903,21 @@ for (const field of ['notes', 'followUp'] as const) {
       await page.getByLabel(/^(Job description|职位描述)$/).fill('New description after another save.')
       await page.getByRole('button', { name: /Save description|保存描述/, exact: true }).click()
       await expect(page.getByRole('button', { name: /Prepare application materials|准备申请材料/, exact: true })).toBeEnabled()
+      const otherResponse = page.waitForResponse(response => response.url().endsWith('/api/jobs/outside-page') && response.request().method() === 'PATCH' && (field === 'notes' ? typeof response.request().postDataJSON()?.notes === 'string' : typeof response.request().postDataJSON()?.followUpAt === 'string'))
       state.releaseOtherJobUpdate()
-      if (field === 'notes') await expect(page.getByText('Notes saved', { exact: true })).toBeVisible()
-      else await expect(page.getByText('Follow-up date set', { exact: true })).toBeVisible()
+      const earlierReply = await otherResponse
+      const earlierBody = await earlierReply.json()
+      expect(earlierBody.description).toBe('')
+      if (field === 'notes') expect(earlierBody.notes).toBe('Notes saved before description.')
+      else expect(earlierBody.followUpAt).toContain('2026-11-15')
+      await expect(page.getByText(field === 'notes' ? /^(Notes saved|备注已保存)$/ : /^(Follow-up date set|跟进日期已设置)$/)).toBeVisible()
       await expect(page.getByText('New description after another save.', { exact: true })).toBeVisible()
       await expect(page.getByRole('button', { name: /Prepare application materials|准备申请材料/, exact: true })).toBeEnabled()
       if (field === 'notes') await expect(notes).toHaveValue('Notes saved before description.')
       else await expect(date).toHaveValue('2026-11-15')
+      expect(state.job.description).toBe('New description after another save.')
+      if (field === 'notes') expect(state.job.notes).toBe('Notes saved before description.')
+      else expect(state.job.followUpAt).toContain('2026-11-15')
       expect(state.unexpected).toEqual([])
     } finally { state.releaseOtherJobUpdate() }
   })
@@ -1544,19 +1561,33 @@ test('audit waits at most 30 seconds for a pending selected-letter refresh', asy
   } finally { state.releaseAudit(); state.releaseProbeLetter() }
 })
 
-test('selecting a letter while a resume-only audit is pending stops the old preparation', async ({ page }) => {
-  const state = await install(page, { stale: true, holdAudit: true, selectLetterOnNotes: true })
+test('a selected letter and manual record arriving during a resume-only audit stop the old preparation', async ({ page }) => {
+  const state = await install(page, { stale: true, holdAudit: true, externalLetterSelection: true })
   try {
     await open(page)
     await page.getByRole('button', { name: /Check current materials|检查当前材料/, exact: true }).click()
     await expect.poll(() => state.auditStarted).toBe(true)
-    const notes = page.getByPlaceholder(/Add notes|添加备注/)
-    await notes.fill('Fixture note')
-    await notes.blur()
-    await expect.poll(() => state.job.finalCoverLetterId).toBe('selected-letter')
+    // A separate simulated actor selects the letter on the server while the audit is pending.
+    const actorAssignment = await page.evaluate(async () => {
+      const response = await fetch('/api/jobs/outside-page/assign', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ finalCoverLetterId: 'selected-letter' }) })
+      return { status: response.status, body: await response.json() }
+    })
+    expect(actorAssignment.status).toBe(200)
+    expect(actorAssignment.body.finalCoverLetterId).toBe('selected-letter')
+    expect(state.job.finalCoverLetterId).toBe('selected-letter')
+    const recordResponse = page.waitForResponse(response => response.url().endsWith('/api/jobs/outside-page/apply') && response.request().method() === 'POST')
+    const refreshedJob = page.waitForResponse(response => response.url().endsWith('/api/jobs/outside-page') && response.request().method() === 'GET' && state.manualPosted)
+    await page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ }).click()
+    expect(await (await recordResponse).json()).toEqual({ applied: true })
+    expect(await (await refreshedJob).json()).toMatchObject({ id: 'outside-page', userId: 'fixture-user', status: 'applied', finalCoverLetterId: 'selected-letter' })
+    await expect(page.getByText(/Application record|申请记录/, { exact: true })).toBeVisible()
+    await page.getByRole('button').filter({ has: page.getByText(/^(Cover letter|求职信)$/) }).click()
+    await expect(page.getByRole('button', { name: /Open the full generated cover letter|打开完整生成求职信/ })).toBeVisible()
+    const auditResponse = page.waitForResponse(response => response.url().endsWith('/audit-application') && response.request().method() === 'POST')
     state.releaseAudit()
+    await (await auditResponse).finished()
     await expect(page.getByText(/selected cover letter changed during preparation|所选求职信在准备期间发生变化/i)).toBeVisible()
-    expect(state.writes.some(write => write.path.endsWith('/assign'))).toBe(false)
+    expect(state.writes.filter(write => write.path.endsWith('/assign'))).toEqual([{ path: '/api/jobs/outside-page/assign', body: { finalCoverLetterId: 'selected-letter' } }])
     await expect(page.getByText(/Application materials are ready|申请材料已准备好/, { exact: true })).toHaveCount(0)
     expect(state.unexpected).toEqual([])
   } finally { state.releaseAudit() }
@@ -1794,11 +1825,16 @@ test('Discover saves once and opens the exact saved application', async ({ page 
   await search.fill('Fixture Engineer')
   await search.press('Enter')
   await expect(page.getByText('Application flow engineer', { exact: true }).first()).toBeVisible()
+  const saveResponse = page.waitForResponse(response => response.url().endsWith('/api/jobs') && response.request().method() === 'POST')
   await page.getByTitle(/Save to My Jobs|保存到我的职位/).click()
+  const savedJob = await (await saveResponse).json()
+  expect(savedJob.id).toBe(state.job.id)
   await expect.poll(() => state.writes.filter(item => item.path === '/api/jobs').length).toBe(1)
   const view = page.getByRole('button', { name: /View this application|查看此申请/ }).first()
   await expect(view).toBeVisible()
+  const readResponse = page.waitForResponse(response => response.url().endsWith(`/api/jobs/${savedJob.id}`) && response.request().method() === 'GET')
   await view.click()
+  expect((await (await readResponse).json()).id).toBe(savedJob.id)
   await expect(page).toHaveURL(/page=jobs/)
   await expect(page).toHaveURL(/highlight=outside-page/)
   await expect(page.getByText('Application flow engineer', { exact: true }).first()).toBeVisible()
