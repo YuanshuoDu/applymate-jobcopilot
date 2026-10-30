@@ -1909,16 +1909,27 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       )
       expect(finalItems.rows).toHaveLength(1)
       expect(finalItems.rows[0]?.content).toMatchObject({ text: FINAL_MARKER })
-      const persistedWaitCalls = await pool.query<{ id: string; status: string; toolCallId: string }>(
-        `SELECT "id", "status", "content"->>'toolCallId' AS "toolCallId" FROM "agent_items"
+      const persistedWaitCalls = await pool.query<{ id: string; status: string; revision: number; toolCallId: string }>(
+        `SELECT "id", "status", "revision", "content"->>'toolCallId' AS "toolCallId" FROM "agent_items"
          WHERE "taskId" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "type" = 'tool_call'
            AND "content"->>'toolName' = 'wait_subagents'`, [waiter.id, ids.sessionId, ids.turnId],
       )
       expect(persistedWaitCalls.rows).toHaveLength(2)
       expect(persistedWaitCalls.rows).toEqual(expect.arrayContaining([
-        expect.objectContaining({ toolCallId: PHONE_SHAPED_WAIT_TOOL_CALL_ID, status: "completed" }),
-        expect.objectContaining({ toolCallId: orphanCallId, status: "completed" }),
+        expect.objectContaining({ id: sourceCallItemId, toolCallId: PHONE_SHAPED_WAIT_TOOL_CALL_ID, status: "started", revision: 0 }),
+        expect.objectContaining({ toolCallId: orphanCallId, status: "completed", revision: 1 }),
       ]))
+      const [sourceTerminalEvents, sourceResultItems] = await Promise.all([
+        pool.query(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+          AND ("itemId" = $4 OR "correlationId" = $5)
+          AND "type" IN ('tool_call.completed', 'tool_call.failed', 'tool_call.interrupted')`,
+        [ids.sessionId, ids.turnId, waiter.id, sourceCallItemId, PHONE_SHAPED_WAIT_TOOL_CALL_ID]),
+        pool.query(`SELECT "id" FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+          AND "stepId" = $4 AND "type" = 'tool_result' AND "content"->>'toolCallId' = $5`,
+        [ids.sessionId, ids.turnId, waiter.id, `task:${waiter.id}:step:0:attempt:1`, PHONE_SHAPED_WAIT_TOOL_CALL_ID]),
+      ])
+      expect(sourceTerminalEvents.rows).toHaveLength(0)
+      expect(sourceResultItems.rows).toHaveLength(0)
       const recoveredClaimState = await readWaitClaimState(pool, ids, acknowledged!.continuationStepId, orphanCallId, acknowledged!.sourceAttempt)
       expect(recoveredClaimState.callCount).toBe(1)
       expect(recoveredClaimState.claimCount).toBe(1)
