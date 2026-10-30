@@ -14,9 +14,8 @@ import { durableLifecycleSink } from "../canonical-turn-runtime.js"
 import { createPgTreeBudgetReservationStore } from "./tree-budget-store.js"
 import type { TreeBudgetReservationStore } from "./tree-budget-types.js"
 import { createChildExecutor, type ChildExecutorOptions, type ChildToolRuntime } from "./child-executor.js"
-import { loadChildSameAttemptContinuation } from "./child-mailbox-continuation.js"
-import { loadChildAttemptResume } from "./child-resume.js"
-import { commitDurableSubagentWaitResume, loadDurableSubagentWaitResume } from "./durable-subagent-wait-resume.js"
+import { commitDurableSubagentWaitResume } from "./durable-subagent-wait-resume.js"
+import { createProductionChildResumeLoaders } from "./production-child-resume-loaders.js"
 import { loadSelectedJobArtifactContext, readSelectedJobSourceDigestWithClient, resolveCoverLetterBase } from "./selected-job-artifact-context.js"
 import { assertPersistedWriterReviewDependency, createTaskGraphWriterReviewFeedbackFrame, TaskGraphWriterReviewFeedbackError, writerReviewDependencyFromTaskContext, type TaskGraphWriterReviewDependency, type TaskGraphWriterReviewFeedbackFrame } from "./task-graph-writer-review-feedback.js"
 import { PgCoordinationStore } from "../mailbox/store.js"
@@ -197,19 +196,6 @@ function defaultMailboxReader(pool: pg.Pool): ChildExecutorOptions["mailboxReade
   if (typeof candidate.connect !== "function" || typeof candidate.query !== "function") return undefined
   return new PgCoordinationStore(pool)
 }
-function defaultResumeLoader(pool: pg.Pool): ChildExecutorOptions["resumeLoader"] | undefined {
-  const candidate = pool as unknown as { readonly connect?: unknown }
-  if (typeof candidate.connect !== "function") return undefined
-  return async lease => {
-    const wait = await loadDurableSubagentWaitResume(pool, lease)
-    return loadChildAttemptResume(pool, lease, new Date(), wait)
-  }
-}
-function defaultSameAttemptContinuationLoader(pool: pg.Pool): ChildExecutorOptions["sameAttemptContinuationLoader"] | undefined {
-  const candidate = pool as unknown as { readonly connect?: unknown }
-  if (typeof candidate.connect !== "function") return undefined
-  return lease => loadChildSameAttemptContinuation(pool, lease)
-}
 /** Build the production child seam only when the explicit feature flag is on. */
 export function createProductionChildExecutor(options: ProductionChildRuntimeOptions): SubagentExecutor {
   let genericExecutor: SubagentExecutor | undefined, gateExecutor: SubagentExecutor | undefined
@@ -229,17 +215,18 @@ export function createProductionChildExecutor(options: ProductionChildRuntimeOpt
       const engineStore = options.turnStore ?? createPgTurnEngineStore(options.pool)
       const treeBudget = options.treeBudget ?? createPgTreeBudgetReservationStore(options.pool)
       const authorizeUsage = options.authorizeUsage ?? createWorkerUsageAuthorizer()
+      const resumeLoaders = createProductionChildResumeLoaders(options.pool)
       genericExecutor = createChildExecutor({
         store: bindStore(engineStore), treeBudget, authorizeUsage,
         modelRuntimeFactory: options.modelRuntimeFactory,
         toolRuntimeFactory: options.toolRuntimeFactory ?? (({ task, lease: childLease, owner }) => defaultTools(options.pool, engineStore, task, childLease, owner, options.jobDiscoveryClient, {
           authorizeUsage, treeBudget, modelRuntimeFactory: options.modelRuntimeFactory,
         })),
-        mailboxReader: options.mailboxReader ?? defaultMailboxReader(options.pool), resumeLoader: options.resumeLoader ?? defaultResumeLoader(options.pool),
+        mailboxReader: options.mailboxReader ?? defaultMailboxReader(options.pool), resumeLoader: options.resumeLoader ?? resumeLoaders.resumeLoader,
         durableWaitResumeCommitter: (lease, wait, nextStepOrdinal) => commitDurableSubagentWaitResume(options.pool, lease, {
           waitId: wait.waitId, stepId: wait.stepId, nextStepOrdinal,
         }),
-        sameAttemptContinuationLoader: options.sameAttemptContinuationLoader ?? defaultSameAttemptContinuationLoader(options.pool),
+        sameAttemptContinuationLoader: options.sameAttemptContinuationLoader ?? resumeLoaders.sameAttemptContinuationLoader,
       })
     }
     return genericExecutor({ lease, ...(continuation ? { continuation } : {}) })

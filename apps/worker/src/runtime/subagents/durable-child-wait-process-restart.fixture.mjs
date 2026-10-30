@@ -11,7 +11,9 @@ import { registerDurableSubagentWait } from "./durable-subagent-wait-store.ts"
 import { startDurableWaitResolver } from "./durable-wait-resolver.ts"
 import { loadDurableSubagentWaitResume, commitDurableSubagentWaitResume } from "./durable-subagent-wait-resume.ts"
 import { loadChildAttemptResume } from "./child-resume.ts"
+import { repairConsumedChildWaitSources } from "./child-resume-consumed-wait-repair.ts"
 import { loadChildWaitCallRecovery } from "./child-resume-wait-call-recovery.ts"
+import { createProductionChildResumeLoaders } from "./production-child-resume-loaders.ts"
 import { acknowledgeDurableWaitAtContinuationStart, childResultStatus } from "./child-executor-admission.ts"
 import { createChildDurableWaitReplay } from "./child-durable-wait-replay.ts"
 import { TurnExecutionEventWriter, executeToolWithItems } from "../turns/turn-execution-events.ts"
@@ -49,6 +51,10 @@ const readyMarkerByMode = {
   "worker-b-loop-usage-lineage-reject": "WORKER_B_READY",
   "worker-b-loop-multi-preclaim": "WORKER_B_READY",
   "worker-b-loop-multi-reject": "WORKER_B_READY",
+  "worker-b-legacy-consumed-seed": "WORKER_B_READY",
+  "worker-b-legacy-consumed-source-only": "WORKER_B_READY",
+  "worker-b-legacy-consumed-recovery": "WORKER_B_READY",
+  "worker-b-legacy-consumed-final": "WORKER_B_READY",
   "worker-b": "WORKER_B_READY",
 }
 const workerStartGateKey = `fixture:durable-child-wait:start:${ids.waiterTaskId}`
@@ -66,6 +72,20 @@ const crashCutModes = new Set([
   "worker-b-loop-claim-item-completed-cut",
   "worker-b-loop-usage-lineage-cut",
   "worker-b-loop-multi-preclaim",
+  "worker-b-legacy-consumed-seed",
+  "worker-b-legacy-consumed-source-only",
+  "worker-b-legacy-consumed-recovery",
+])
+const sourceLifecycleCrashStages = new Set([
+  "after-call-item-update",
+  "after-result-item-insert",
+  "after-result-item-update",
+  "after-event-sequence-1", "after-event-insert-1", "after-event-outbox-1",
+  "after-event-sequence-2", "after-event-insert-2", "after-event-outbox-2",
+  "after-event-sequence-3", "after-event-insert-3", "after-event-outbox-3",
+  "after-event-sequence-4", "after-event-insert-4", "after-event-outbox-4",
+  "after-provenance-update",
+  "after-consumed-update",
 ])
 const pool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 6 })
 const redis = new Redis(process.env.AGENT_TURN_REDIS_TEST_URL, { maxRetriesPerRequest: null })
@@ -76,7 +96,11 @@ const resolver = mode.startsWith("worker-b") ? startDurableWaitResolver(pool, { 
 let stopped = false
 
 function poolWithSourceLifecycleCrashBarrier(stage) {
-  if (stage !== "after-consumed-update") throw new Error("invalid_source_lifecycle_crash_stage")
+  if (!sourceLifecycleCrashStages.has(stage)) throw new Error("invalid_source_lifecycle_crash_stage")
+  let completedItemUpdates = 0
+  let sequenceWrites = 0
+  let eventWrites = 0
+  let eventOutboxWrites = 0
   return {
     connect: async () => {
       const client = await pool.connect()
@@ -84,8 +108,30 @@ function poolWithSourceLifecycleCrashBarrier(stage) {
         query: async (...args) => {
           const result = await client.query(...args)
           const statement = typeof args[0] === "string" ? args[0].replace(/\s+/g, " ").trim() : ""
-          if (statement.startsWith('UPDATE "agent_wait_conditions" SET "consumedAt"')) {
-            say(`WORKER_B_SOURCE_LIFECYCLE_CRASH_CUT ${JSON.stringify({ stage, writeApplied: result.rowCount === 1 })}`)
+          const values = Array.isArray(args[1]) ? args[1] : []
+          let reachedStage
+          if (statement.startsWith('UPDATE "agent_items" SET "status" = \'completed\'')) {
+            completedItemUpdates += 1
+            reachedStage = completedItemUpdates === 1 ? "after-call-item-update"
+              : completedItemUpdates === 2 ? "after-result-item-update" : undefined
+          } else if (statement.startsWith('INSERT INTO "agent_items"')) {
+            reachedStage = "after-result-item-insert"
+          } else if (statement.startsWith('UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1')) {
+            sequenceWrites += 1
+            reachedStage = `after-event-sequence-${sequenceWrites}`
+          } else if (statement.startsWith('INSERT INTO "agent_events"')) {
+            eventWrites += 1
+            reachedStage = `after-event-insert-${eventWrites}`
+          } else if (statement.startsWith('INSERT INTO "agent_outbox"') && String(values[2]).startsWith("agent-event:")) {
+            eventOutboxWrites += 1
+            reachedStage = `after-event-outbox-${eventOutboxWrites}`
+          } else if (statement.startsWith('UPDATE "agent_wait_conditions" SET "result"')) {
+            reachedStage = "after-provenance-update"
+          } else if (statement.startsWith('UPDATE "agent_wait_conditions" SET "consumedAt"')) {
+            reachedStage = "after-consumed-update"
+          }
+          if (reachedStage === stage && result.rowCount === 1) {
+            say(`WORKER_B_SOURCE_LIFECYCLE_CRASH_CUT ${JSON.stringify({ stage, writeApplied: true })}`)
             return new Promise(() => {})
           }
           return result
@@ -251,19 +297,86 @@ async function runChildWaitLoop(lease, restored, responseForStep, hooks = {}) {
     ...(restored.childWaitClaimRecovery ? { childWaitClaimRecovery: restored.childWaitClaimRecovery } : {}),
     ...(restored.childWaitOrphanRecovery ? { childWaitOrphanRecovery: restored.childWaitOrphanRecovery } : {}),
   })
-  options.store = acknowledgeDurableWaitAtContinuationStart(options.store, lease, wait,
-    async (currentLease, durableWait, nextStepOrdinal) => commitDurableSubagentWaitResume(pool, currentLease, {
-      waitId: durableWait.waitId, stepId: durableWait.stepId, nextStepOrdinal, now: new Date(),
-    }), step => replay.acknowledgeContinuation(step))
+  if (hooks.legacyConsumedSeed) {
+    const store = options.store
+    options.store = { ...store, startStep: async input => {
+      const step = await store.startStep(input)
+      if (step.id === `task:${lease.id}:step:${wait.ordinal + 1}:attempt:${lease.attemptCount}`) replay.acknowledgeContinuation(step)
+      return step
+    } }
+  } else {
+    options.store = acknowledgeDurableWaitAtContinuationStart(options.store, lease, wait,
+      async (currentLease, durableWait, nextStepOrdinal) => commitDurableSubagentWaitResume(pool, currentLease, {
+        waitId: durableWait.waitId, stepId: durableWait.stepId, nextStepOrdinal, now: new Date(),
+      }), step => replay.acknowledgeContinuation(step))
+  }
   const result = await runTurnExecutionLoop(options)
   return { result, invocations: fixtureModel.invocations, executorCalls, dispatcherCalls }
 }
 
-async function resumeChildThroughLoop(lease, phase) {
+async function seedLegacyConsumedWait(lease, stopBeforeModel = false) {
   const now = new Date()
-  const pendingWait = await loadDurableSubagentWaitResume(pool, lease, now)
+  const wait = await loadDurableSubagentWaitResume(pool, lease, now)
+  const restored = await loadChildAttemptResume(pool, lease, now, wait)
+  if (!wait || !restored?.durableWait || restored.durableWait.waitId !== wait.waitId || wait.attempt !== lease.attemptCount) {
+    throw new Error("fixture_legacy_consumed_wait_seed_missing")
+  }
+  const owner = executionOwnerFence({ kind: "task", lease })
+  const stepId = `task:${lease.id}:step:${restored.resume.nextOrdinal}:attempt:${lease.attemptCount}`
+  const continuation = await turnStore.startStep({ owner, stepId, ordinal: restored.resume.nextOrdinal, attempt: lease.attemptCount,
+    inputThroughSequence: restored.resume.inputThroughSequence, consumedInputIds: restored.resume.consumedInputIds,
+    modelProfileSnapshot: loopFixtureModelProfile, now })
+  const client = await pool.connect()
+  try {
+    await client.query("BEGIN")
+    await client.query("SELECT set_config('app.user_id', $1, true)", [lease.userId])
+    const session = await client.query(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2
+      AND "status" NOT IN ('aborted', 'archived') FOR UPDATE`, [lease.sessionId, lease.userId])
+    if (session.rowCount !== 1) throw new Error("fixture_legacy_ack_session_fence_failed")
+    const current = await client.query(`SELECT "id" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3
+      AND "rootTaskId" = $4 AND "status" = 'running' AND "leaseOwner" = $5 AND "attemptCount" = $6
+      AND "leaseExpiresAt" > clock_timestamp() AND "interruptRequestedAt" IS NULL FOR UPDATE`,
+    [lease.id, lease.sessionId, lease.turnId, lease.rootTaskId, lease.ownerId, lease.attemptCount])
+    if (current.rowCount !== 1) throw new Error("fixture_legacy_ack_owner_fence_failed")
+    const changed = await client.query(`UPDATE "agent_wait_conditions" SET "consumedAt" = $1, "updatedAt" = $1
+      WHERE "id" = $2 AND "userId" = $3 AND "sessionId" = $4 AND "turnId" = $5 AND "parentTaskId" = $6
+        AND "stepId" = $7 AND "status" IN ('ready', 'timed_out') AND "suspendedAt" IS NOT NULL AND "consumedAt" IS NULL`,
+    [now, wait.waitId, lease.userId, lease.sessionId, lease.turnId, lease.id, wait.stepId])
+    if (changed.rowCount !== 1) throw new Error("fixture_legacy_ack_wait_update_failed")
+    await client.query("COMMIT")
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined)
+    throw error
+  } finally { client.release() }
+  if (continuation.id !== stepId || continuation.status !== "streaming") throw new Error("fixture_legacy_ack_step_identity_invalid")
+  if (stopBeforeModel) {
+    say(`WORKER_B_LEGACY_CONSUMED_SOURCE_ONLY ${JSON.stringify({ waitId: wait.waitId, sourceStepId: wait.stepId,
+      sourceAttempt: wait.attempt, continuationStepId: continuation.id, continuationOrdinal: continuation.ordinal,
+      attemptCount: lease.attemptCount, sourceLifecycleRepaired: false, continuationCallCreated: false })}`)
+    return new Promise(() => {})
+  }
+  const callId = `legacy-consumed-reissue:${lease.id}:attempt:${lease.attemptCount}`
+  const modelResponse = ({ stepId: actualStepId }) => {
+    if (actualStepId !== stepId) throw new Error("fixture_legacy_reissue_wrong_step")
+    return { usage: { inputTokens: 37, outputTokens: 13, estimatedCostUsd: highPrecisionWaitModelCostUsd },
+      toolCalls: [{ id: callId, name: "wait_subagents", arguments: wait.input }] }
+  }
+  const beforeAppendEvent = async event => {
+    if (event.type !== "tool_call.started" || event.correlationId !== callId) return
+    say(`WORKER_B_LEGACY_CONSUMED_ACK ${JSON.stringify({ waitId: wait.waitId, sourceStepId: wait.stepId, sourceAttempt: wait.attempt,
+      continuationStepId: stepId, continuationOrdinal: continuation.ordinal, attemptCount: lease.attemptCount,
+      callId, sourceLifecycleRepaired: false, claimPresent: false })}`)
+    await new Promise(() => {})
+  }
+  const loop = await runChildWaitLoop(lease, restored, modelResponse, { beforeAppendEvent, legacyConsumedSeed: true })
+  throw new Error(`fixture_legacy_preclaim_barrier_returned:${loop.result.status}`)
+}
+
+async function resumeChildThroughLoop(lease, phase, preloadedRestored) {
+  const now = new Date()
+  const pendingWait = preloadedRestored ? undefined : await loadDurableSubagentWaitResume(pool, lease, now)
   let restored
-  try { restored = await loadChildAttemptResume(pool, lease, now, pendingWait) }
+  try { restored = preloadedRestored ?? await loadChildAttemptResume(pool, lease, now, pendingWait) }
   catch (error) {
     if (phase === "multi-reject") {
       say(`WORKER_B_LOOP_MULTI_REJECTED ${JSON.stringify({ error: error?.message ?? String(error), modelCalls: 0, executorCalls: 0, dispatcherCalls: 0 })}`)
@@ -438,6 +551,24 @@ async function resumeChildThroughLoop(lease, phase) {
     throw new Error("fixture_child_wait_loop_unexpected_completion")
   }
   return { status: "completed", result: { finalText: loop.result.finalText ?? "continued-after-durable-child-wait" } }
+}
+
+async function resumeLegacyConsumedWait(lease, phase) {
+  const loaders = createProductionChildResumeLoaders(pool)
+  if (!loaders.resumeLoader) throw new Error("fixture_production_resume_loader_unavailable")
+  const restored = await loaders.resumeLoader(lease)
+  if (!restored?.durableWait || !(restored.childWaitOrphanRecovery || restored.childWaitClaimRecovery)) {
+    throw new Error("fixture_legacy_consumed_wait_repair_resume_missing")
+  }
+  const repeatRepairCount = await repairConsumedChildWaitSources(pool, lease, new Date())
+  if (repeatRepairCount !== 0) throw new Error("fixture_legacy_consumed_wait_repair_not_idempotent")
+  say(`WORKER_B_LEGACY_SOURCE_REPAIRED ${JSON.stringify({ waitId: restored.durableWait.waitId,
+    sourceStepId: restored.durableWait.stepId, sourceAttempt: restored.durableWait.attempt,
+    currentAttempt: lease.attemptCount, continuationStepId: restored.durableWait.continuationStepId ?? null,
+    orphanCallId: restored.childWaitOrphanRecovery?.call.id ?? null,
+    claimCallId: restored.childWaitClaimRecovery?.call.id ?? null, repeatedRepairCount,
+    executorCalls: 0, dispatcherCalls: 0 })}`)
+  return resumeChildThroughLoop(lease, phase, restored)
 }
 
 async function claimExactWaitReissue(lease, owner, wait, continuation, now, optionsForCut = {}) {
@@ -790,6 +921,10 @@ const worker = new Worker(queueName, async job => {
       : mode === "worker-b-loop-final" ? ({ lease }) => resumeChildThroughLoop(lease, "final")
       : mode === "worker-b-loop-multi-preclaim" ? ({ lease }) => resumeChildThroughLoop(lease, "multi-preclaim")
       : mode === "worker-b-loop-multi-reject" ? ({ lease }) => resumeChildThroughLoop(lease, "multi-reject")
+      : mode === "worker-b-legacy-consumed-seed" ? ({ lease }) => seedLegacyConsumedWait(lease)
+      : mode === "worker-b-legacy-consumed-source-only" ? ({ lease }) => seedLegacyConsumedWait(lease, true)
+      : mode === "worker-b-legacy-consumed-recovery" ? ({ lease }) => resumeLegacyConsumedWait(lease, "claim-recovery-cut")
+      : mode === "worker-b-legacy-consumed-final" ? ({ lease }) => resumeLegacyConsumedWait(lease, "final")
       : mode === "worker-b" ? ({ lease }) => resumeChild(lease) : undefined
   if (!execute) throw new Error("invalid_fixture_mode")
   const executeWithDiagnostics = async input => {
@@ -806,8 +941,7 @@ const worker = new Worker(queueName, async job => {
 worker.on("completed", (job, result) => {
   if (job.data.taskId !== ids.waiterTaskId) return
   const dispatchGeneration = parseSubagentDispatchJobId(job.id, ids.waiterTaskId)?.generation ?? null
-  if (mode === "worker-b-loop-final" && result?.status === "skipped"
-    && result?.reason === "dispatch_identity_mismatch") {
+  if (result?.status === "skipped" && result?.reason === "dispatch_identity_mismatch") {
     say(`WORKER_B_STALE_DISPATCH_SKIPPED ${JSON.stringify({ dispatchGeneration })}`)
     return
   }

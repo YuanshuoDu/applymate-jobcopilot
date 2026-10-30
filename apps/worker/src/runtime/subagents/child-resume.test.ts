@@ -2,11 +2,13 @@ import { describe, expect, it, vi } from "vitest"
 
 import { loadChildAttemptResume } from "./child-resume.js"
 import { childWaitClaimEventKey } from "./child-durable-wait-replay.js"
+import { projectWaitCallEventContent } from "../turns/turn-execution-wait-event-projection.js"
 import type { SubagentLease } from "./types.js"
 
 type Row = Record<string, unknown>
 
 const future = new Date("2099-09-14T12:00:00.000Z")
+const WAIT_ID = "00000000-0000-4000-8000-000000000001"
 
 function lease(overrides: Partial<SubagentLease> = {}): SubagentLease {
   return {
@@ -34,13 +36,13 @@ function item(child: SubagentLease, overrides: Row = {}): Row {
 }
 
 function consumedWait(child: SubagentLease, targetId = "grandchild-1", note?: string): Row {
-  const output = { waitId: "wait-1", status: "ready", taskIds: [targetId], deadlineAt: "2099-09-14T11:30:00.000Z",
+  const output = { waitId: WAIT_ID, status: "ready", taskIds: [targetId], deadlineAt: "2099-09-14T11:30:00.000Z",
     matchedTaskIds: [targetId], tasks: [{ taskId: targetId, status: "completed", role: "scout", result: { jobs: [], ...(note ? { note } : {}) }, failureReason: null }] }
   const input = { idempotencyKey: "wait-key", taskIds: [targetId], mode: "all", timeoutMs: 5_000 }
-  return { waitId: "wait-1", stepId: `task:${child.id}:step:0:attempt:${child.attemptCount}`, targetTaskIds: [targetId], idempotencyKey: "wait-key", mode: "all", status: "ready",
+  return { waitId: WAIT_ID, stepId: `task:${child.id}:step:0:attempt:${child.attemptCount}`, targetTaskIds: [targetId], idempotencyKey: "wait-key", mode: "all", status: "ready",
     deadlineAt: output.deadlineAt, matchedTaskIds: [targetId], waitResult: { request: { targetTaskIds: [targetId], mode: "all", timeoutMs: 5_000 }, outcome: output }, attempt: child.attemptCount,
     ordinal: 0, continuationStepId: `task:${child.id}:step:1:attempt:${child.attemptCount}`, continuationOrdinal: 1, continuationLatestOrdinal: 1,
-    callContent: { toolCallId: "wait-call", toolName: "wait_subagents", input }, callStatus: "completed",
+    callContent: { toolCallId: "wait-call", toolName: "wait_subagents", toolVersion: "1", input }, callStatus: "completed",
     resultContent: { toolCallId: "wait-call", output: { ...output, status: "waiting", matchedTaskIds: [] }, errorCode: null }, resultStatus: "completed",
     sourceItemId: "wait-result-id", consumedAt: future, suspendedAt: future }
 }
@@ -78,8 +80,57 @@ function modelUsageEvents(child: SubagentLease, stepId: string): Row[] {
   ]
 }
 
+function sourceWaitEvidence(child: SubagentLease, wait: Row | undefined, items: Row[]): { items: Row[]; events: Row[] } {
+  if (!wait) return { items, events: [] }
+  const stepId = String(wait.stepId), call = wait.callContent as Row, callId = String(call.toolCallId)
+  const attempt = Number(wait.attempt ?? child.attemptCount), isInitial = wait.callStatus === "started"
+  const callItem = items.find(row => row.type === "tool_call" && (row.content as Row | undefined)?.toolCallId === callId)
+  const callItemId = String(callItem?.id ?? "wait-call-item")
+  const callContent = { ...call, toolVersion: "1", ...(isInitial ? {} : { status: "completed", errorCode: null }) }
+  const sourceCall: Row = { ...item(child), ...callItem, id: callItemId, stepId, taskId: child.id, attempt, type: "tool_call", phase: null,
+    status: isInitial ? "started" : "completed", revision: isInitial ? 0 : 1, content: callContent }
+  const resultItems = items.filter(row => row.type === "tool_result" && (row.content as Row | undefined)?.toolCallId === callId)
+  const sourceResultId = String(wait.sourceItemId ?? resultItems[0]?.id ?? "wait-result-id")
+  const waitingResult = wait.resultContent as Row | null
+  const sourceResult: Row = { ...item(child), ...resultItems[0], id: sourceResultId, stepId, taskId: child.id, attempt, type: "tool_result", phase: null,
+    status: "completed", revision: 1, content: waitingResult }
+  const nextItems = items.filter(row => !((row.content as Row | undefined)?.toolCallId === callId && ["tool_call", "tool_result"].includes(String(row.type))))
+  nextItems.push(sourceCall)
+  if (!isInitial) nextItems.push(sourceResult)
+  const prior = modelUsageEvents(child, stepId).at(-1)!
+  const itemStarted = { id: `source-${callId}-item-started`, sequence: "4", sessionId: child.sessionId, turnId: child.turnId, taskId: child.id,
+    actor: "subagent", type: "item.started", itemId: callItemId, correlationId: stepId, causationId: prior.id,
+    idempotencyKey: `task:${child.id}:event:item-started:${callItemId}`, payload: { itemId: callItemId, type: "tool_call", phase: null } }
+  const toolStarted = { id: `source-${callId}-tool-started`, sequence: "5", sessionId: child.sessionId, turnId: child.turnId, taskId: child.id,
+    actor: "subagent", type: "tool_call.started", itemId: callItemId, correlationId: callId, causationId: itemStarted.id,
+    idempotencyKey: `task:${child.id}:event:tool-started:${callId}`, payload: { toolCallId: callId, toolName: "wait_subagents", taskId: child.id } }
+  const events: Row[] = [...modelUsageEvents(child, stepId), itemStarted, toolStarted]
+  if (isInitial) return { items: nextItems, events }
+  const resultPayload = sourceResult.content as Row
+  const callCompleted = { id: `source-${callId}-item-completed`, sequence: "6", sessionId: child.sessionId, turnId: child.turnId, taskId: child.id,
+    actor: "subagent", type: "item.completed", itemId: callItemId, correlationId: callItemId, causationId: toolStarted.id,
+    idempotencyKey: `task:${child.id}:event:tool-call-completed:${callId}:${callItemId}:1`,
+    payload: { itemId: callItemId, status: "completed", content: projectWaitCallEventContent(callContent) } }
+  const toolCompleted = { id: `source-${callId}-tool-completed`, sequence: "7", sessionId: child.sessionId, turnId: child.turnId, taskId: child.id,
+    actor: "subagent", type: "tool_call.completed", itemId: callItemId, correlationId: callId, causationId: callCompleted.id,
+    idempotencyKey: `task:${child.id}:event:tool-finished:${callId}`,
+    payload: { toolCallId: callId, toolName: "wait_subagents", status: "completed", errorCode: null, taskId: child.id } }
+  const resultStarted = { id: `source-${callId}-result-started`, sequence: "8", sessionId: child.sessionId, turnId: child.turnId, taskId: child.id,
+    actor: "subagent", type: "item.started", itemId: sourceResultId, correlationId: stepId, causationId: toolCompleted.id,
+    idempotencyKey: `task:${child.id}:event:item-started:${sourceResultId}`, payload: { itemId: sourceResultId, type: "tool_result", phase: null } }
+  const resultCompleted = { id: `source-${callId}-result-completed`, sequence: "9", sessionId: child.sessionId, turnId: child.turnId, taskId: child.id,
+    actor: "subagent", type: "item.completed", itemId: sourceResultId, correlationId: sourceResultId, causationId: resultStarted.id,
+    idempotencyKey: `task:${child.id}:event:tool-result-completed:${callId}:${sourceResultId}:1`,
+    payload: { itemId: sourceResultId, status: "completed", content: resultPayload } }
+  events.push(callCompleted, toolCompleted, resultStarted, resultCompleted)
+  return { items: nextItems, events }
+}
+
 function fakePool(child: SubagentLease, steps: Row[], items: Row[] = [], consumedWait?: Row, targets: Row[] = [],
   waitCalls: Row[] = [], waitResults: Row[] = [], waitEvents: Row[] = []) {
+  const source = sourceWaitEvidence(child, consumedWait, items)
+  const persistedItems = source.items
+  const persistedEvents = [...source.events, ...waitEvents]
   const calls: Array<{ readonly sql: string; readonly values: readonly unknown[] }> = []
   const client = {
     query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
@@ -88,6 +139,36 @@ function fakePool(child: SubagentLease, steps: Row[], items: Row[] = [], consume
       if (sql.includes('WHERE task."id" = $1 AND task."sessionId"')) return { rows: [currentRow(child)], rowCount: 1 }
       if (sql.includes('FROM "agent_wait_conditions" AS wait')) return { rows: consumedWait ? [consumedWait] : [], rowCount: consumedWait ? 1 : 0 }
       if (sql.includes('WHERE task."id" = ANY($1::text[])')) return { rows: targets, rowCount: targets.length }
+      if (sql.startsWith('SELECT "attempt" FROM "agent_steps" WHERE')) {
+        const rows = steps.filter(row => row.id === values[0] && row.sessionId === values[1] && row.turnId === values[2] && row.taskId === values[3])
+        return { rows, rowCount: rows.length }
+      }
+      if (sql.startsWith('SELECT "id", "revision", "stepId", "taskId", "type", "phase", "content", "status" FROM "agent_items" WHERE')
+        && sql.includes('"stepId" = $4') && sql.includes("'wait_subagents'")) {
+        const rows = persistedItems.filter(row => row.stepId === values[3] && row.type === "tool_call" && (row.content as Row).toolName === "wait_subagents")
+        return { rows, rowCount: rows.length }
+      }
+      if (sql.startsWith('SELECT "id", "revision", "stepId", "taskId", "type", "phase", "content", "status" FROM "agent_items" WHERE')
+        && sql.includes('"content"->>\'toolCallId\' = $4')) {
+        const rows = persistedItems.filter(row => (row.content as Row).toolCallId === values[3])
+        return { rows, rowCount: rows.length }
+      }
+      if (sql.startsWith('SELECT "id", "itemId", "type", "actor", "correlationId", "causationId", "sequence",') && sql.includes('FROM "agent_events" WHERE')) {
+        const keys = Array.isArray(values[6]) ? values[6] as string[] : []
+        const rows = persistedEvents.filter(row => row.itemId === values[3] || row.correlationId === values[4]
+          || row.itemId === values[5] || row.correlationId === values[5] || keys.includes(String(row.idempotencyKey)))
+        return { rows, rowCount: rows.length }
+      }
+      if (sql.startsWith('SELECT event."id", event."sequence" FROM "agent_events" AS event')) {
+        const rows = persistedEvents.filter(row => row.id === values[3] && row.sessionId === values[0] && row.turnId === values[1] && row.taskId === values[2])
+        return { rows, rowCount: rows.length }
+      }
+      if (sql.startsWith('SELECT "id" FROM "agent_events" WHERE') && sql.includes('"causationId" = ANY')) {
+        const causes = Array.isArray(values[3]) ? values[3] as string[] : []
+        const rows = persistedEvents.filter(row => causes.includes(String(row.causationId))
+          && row.sessionId === values[0] && row.turnId === values[1] && row.taskId === values[2])
+        return { rows, rowCount: rows.length }
+      }
       if (sql.includes('FROM "agent_events" AS event')) {
         const stepId = String(values[6] ?? ""), itemIds = Array.isArray(values[4]) ? values[4] as string[] : [], callIds = Array.isArray(values[5]) ? values[5] as string[] : []
         const visible = waitEvents.filter(row => row.correlationId === stepId || itemIds.includes(String(row.itemId))
@@ -105,8 +186,8 @@ function fakePool(child: SubagentLease, steps: Row[], items: Row[] = [], consume
       }
       if (sql.includes('FROM "agent_items"')) {
         const visible = sql.includes('step."attempt" <= $6')
-          ? items.filter(row => Number(row.attempt) <= Number(values[5]))
-          : items.filter(row => Number(row.attempt) < child.attemptCount)
+          ? persistedItems.filter(row => Number(row.attempt) <= Number(values[5]))
+          : persistedItems.filter(row => Number(row.attempt) < child.attemptCount)
         return { rows: visible, rowCount: visible.length }
       }
       throw new Error(`unexpected query: ${sql}`)
@@ -169,15 +250,15 @@ describe("child attempt durable resume", () => {
       step(child, { id: continuationStepId, attempt: 1, ordinal: 1, status: "queued" }),
     ], [
       item(child, { id: "wait-call-item", stepId: sourceStepId, type: "tool_call", content: { toolCallId: "wait-call", toolName: "wait_subagents", input: waitInput } }),
-      item(child, { id: "wait-result-id", stepId: sourceStepId, type: "tool_result", content: { toolCallId: "wait-call", output: { waitId: "wait-1", status: "waiting", taskIds: ["grandchild-1"], tasks: [] }, errorCode: null } }),
+      item(child, { id: "wait-result-id", stepId: sourceStepId, type: "tool_result", content: { toolCallId: "wait-call", output: { waitId: WAIT_ID, status: "waiting", taskIds: ["grandchild-1"], tasks: [] }, errorCode: null } }),
     ], wait, [{ id: "grandchild-1", parentTaskId: child.id, rootTaskId: child.rootTaskId, sessionId: child.sessionId, turnId: child.turnId, userId: child.userId }])
 
     const restored = await loadChildAttemptResume(db.pool as never, child)
 
     expect(restored).toMatchObject({
       resume: { nextOrdinal: 1, stepCount: 2, toolCallCount: 1 },
-      durableWait: { waitId: "wait-1", stepId: sourceStepId, attempt: 1, ordinal: 0, toolCallId: "wait-call", sourceItemId: "wait-result-id" },
-      observations: [{ id: "child-resume:wait-result-id", content: { toolCallId: "wait-call", toolName: "wait_subagents", status: "completed", output: { waitId: "wait-1", status: "ready" } } }],
+      durableWait: { waitId: WAIT_ID, stepId: sourceStepId, attempt: 1, ordinal: 0, toolCallId: "wait-call", sourceItemId: "wait-result-id" },
+      observations: [{ id: "child-resume:wait-result-id", content: { toolCallId: "wait-call", toolName: "wait_subagents", status: "completed", output: { waitId: WAIT_ID, status: "ready" } } }],
     })
     expect(db.calls.find(call => call.sql.includes('FROM "agent_wait_conditions" AS wait'))?.sql).toContain('wait."consumedAt" IS NOT NULL')
     expect(db.calls.find(call => call.sql.includes('FROM "agent_wait_conditions" AS wait'))?.sql).toContain('next."ordinal" = (SELECT MIN(later."ordinal")')
@@ -193,7 +274,7 @@ describe("child attempt durable resume", () => {
     const wait = consumedWait(child)
     const input = { idempotencyKey: "wait-key", taskIds: ["grandchild-1"], mode: "all", timeoutMs: 5_000 }
     const output = (wait.waitResult as Row).outcome
-    const durableWait = { waitId: "wait-1", stepId: sourceStepId, attempt: 3, ordinal: 18, toolCallId: "wait-call", sourceItemId: "wait-result-id", input, output }
+    const durableWait = { waitId: WAIT_ID, stepId: sourceStepId, attempt: 3, ordinal: 18, toolCallId: "wait-call", sourceItemId: "wait-result-id", input, output }
     const db = fakePool(child, [
       step(child, { id: `task:${child.id}:step:3:attempt:3`, attempt: 3, ordinal: 17, status: "completed" }),
       step(child, { id: sourceStepId, attempt: 3, ordinal: 18, status: "waiting_for_tool" }),
@@ -208,8 +289,8 @@ describe("child attempt durable resume", () => {
 
     expect(restored).toMatchObject({
       resume: { nextOrdinal: 5, stepCount: 2, toolCallCount: 1 },
-      durableWait: { waitId: "wait-1", stepId: sourceStepId, ordinal: 18, toolCallId: "wait-call" },
-      observations: [{ id: "child-resume:wait-result-id", content: { toolCallId: "wait-call", toolName: "wait_subagents", output: { waitId: "wait-1", status: "ready" } } }],
+      durableWait: { waitId: WAIT_ID, stepId: sourceStepId, ordinal: 18, toolCallId: "wait-call" },
+      observations: [{ id: "child-resume:wait-result-id", content: { toolCallId: "wait-call", toolName: "wait_subagents", output: { waitId: "[REDACTED_PHONE]", status: "ready" } } }],
     })
     expect(restored?.durableWait).not.toHaveProperty("continuationStepId")
     expect(restored).not.toHaveProperty("childWaitClaimRecovery")
@@ -227,7 +308,7 @@ describe("child attempt durable resume", () => {
     ], [
       item(child, { id: "wait-call-item", stepId: sourceStepId, type: "tool_call", content: { toolCallId: "wait-call", toolName: "wait_subagents",
         input: { idempotencyKey: "wait-key", taskIds: [targetId], mode: "all", timeoutMs: 5_000 } } }),
-      item(child, { id: "wait-result-id", stepId: sourceStepId, type: "tool_result", content: { toolCallId: "wait-call", output: { waitId: "wait-1", status: "waiting", taskIds: [targetId], tasks: [] }, errorCode: null } }),
+      item(child, { id: "wait-result-id", stepId: sourceStepId, type: "tool_result", content: { toolCallId: "wait-call", output: { waitId: WAIT_ID, status: "waiting", taskIds: [targetId], tasks: [] }, errorCode: null } }),
     ], wait, [{ id: targetId, parentTaskId: child.id, rootTaskId: child.rootTaskId, sessionId: child.sessionId, turnId: child.turnId, userId: child.userId }])
 
     const restored = await loadChildAttemptResume(db.pool as never, child)
@@ -240,14 +321,10 @@ describe("child attempt durable resume", () => {
     expect(JSON.stringify(observation)).not.toContain("+353 87 123 4567")
   })
 
-  it("reconstructs a missing exact receipt from the consumed wait at max attempt and reuses its persisted continuation", async () => {
+  it("accepts the completed source result without a private marker at max attempt and reuses its persisted continuation", async () => {
     const child = lease({ attemptCount: 3, maxAttempts: 3 })
     const wait = consumedWait(child)
     const sourceStepId = String(wait.stepId), continuationStepId = String(wait.continuationStepId)
-    wait.sourceItemId = null
-    wait.callStatus = "started"
-    wait.resultContent = null
-    wait.resultStatus = null
     const waitInput = { idempotencyKey: "wait-key", taskIds: ["grandchild-1"], mode: "all", timeoutMs: 5_000 }
     const db = fakePool(child, [
       step(child, { id: sourceStepId, attempt: 3, ordinal: 0, status: "waiting_for_tool" }),
@@ -259,8 +336,8 @@ describe("child attempt durable resume", () => {
 
     expect(restored).toMatchObject({
       resume: { nextOrdinal: 1, stepCount: 2, toolCallCount: 1 },
-      durableWait: { waitId: "wait-1", attempt: 3, ordinal: 0, toolCallId: "wait-call", sourceItemId: "recovered-wait-result:wait-1" },
-      observations: [{ id: "child-resume:recovered-wait-result:wait-1", content: { toolCallId: "wait-call", toolName: "wait_subagents", status: "completed", output: { waitId: "wait-1", status: "ready" } } }],
+      durableWait: { waitId: WAIT_ID, attempt: 3, ordinal: 0, toolCallId: "wait-call", sourceItemId: "wait-result-id" },
+      observations: [{ id: "child-resume:wait-result-id", content: { toolCallId: "wait-call", toolName: "wait_subagents", status: "completed", output: { waitId: WAIT_ID, status: "ready" } } }],
     })
     expect(restored?.resume.nextOrdinal).toBe(1)
     expect(db.calls.find(call => call.sql.includes('FROM "agent_wait_conditions" AS wait'))?.sql).toContain('LEFT JOIN "agent_items" AS result')
@@ -301,7 +378,7 @@ describe("child attempt durable resume", () => {
     const sourceCall = item(child, { id: "source-wait-call", stepId: sourceStepId, attempt: 3, ordinal: 0,
       content: { toolCallId: "wait-call", toolName: "wait_subagents", input: (wait.callContent as Row).input } })
     const sourceResult = item(child, { id: String(wait.sourceItemId), stepId: sourceStepId, attempt: 3, ordinal: 0, type: "tool_result",
-      content: { toolCallId: "wait-call", output: { waitId: "wait-1", status: "waiting", taskIds: ["grandchild-1"], tasks: [] }, errorCode: null } })
+      content: { toolCallId: "wait-call", output: { waitId: WAIT_ID, status: "waiting", taskIds: ["grandchild-1"], tasks: [] }, errorCode: null } })
     const db = fakePool(child, [
       step(child, { id: sourceStepId, attempt: 3, ordinal: 0, status: "waiting_for_tool" }),
       step(child, { id: continuationStepId, attempt: 3, ordinal: 9, status: "streaming", inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }),
@@ -330,7 +407,7 @@ describe("child attempt durable resume", () => {
     const sourceCall = item(child, { id: "source-wait-call", stepId: sourceStepId, attempt: 3, ordinal: 0,
       content: { toolCallId: "wait-call", toolName: "wait_subagents", input: (wait.callContent as Row).input } })
     const sourceResult = item(child, { id: String(wait.sourceItemId), stepId: sourceStepId, attempt: 3, ordinal: 0, type: "tool_result",
-      content: { toolCallId: "wait-call", output: { waitId: "wait-1", status: "waiting", taskIds: ["grandchild-1"], tasks: [] }, errorCode: null } })
+      content: { toolCallId: "wait-call", output: { waitId: WAIT_ID, status: "waiting", taskIds: ["grandchild-1"], tasks: [] }, errorCode: null } })
     const db = fakePool(child, [
       step(child, { id: sourceStepId, attempt: 3, ordinal: 0, status: "waiting_for_tool" }),
       step(child, { id: continuationStepId, attempt: 3, ordinal: 9, status: "streaming" }),
@@ -379,10 +456,6 @@ describe("child attempt durable resume", () => {
     const child = lease({ attemptCount: 3, maxAttempts: 3 })
     const wait = consumedWait(child)
     wait.attempt = 2
-    wait.sourceItemId = null
-    wait.callStatus = "started"
-    wait.resultContent = null
-    wait.resultStatus = null
     const waitInput = { idempotencyKey: "wait-key", taskIds: ["grandchild-1"], mode: "all", timeoutMs: 5_000 }
     const db = fakePool(child, [
       step(child, { id: "wait-step-attempt-2", attempt: 2, ordinal: 0, status: "waiting_for_tool" }),
@@ -396,8 +469,8 @@ describe("child attempt durable resume", () => {
 
     expect(restored).toMatchObject({
       resume: { nextOrdinal: 1, stepCount: 2, toolCallCount: 1 },
-      observations: [{ id: "child-resume:recovered-wait-result:wait-1", content: {
-        toolCallId: "wait-call", toolName: "wait_subagents", status: "completed", output: { waitId: "wait-1", status: "ready" },
+      observations: [{ id: "child-resume:wait-result-id", content: {
+        toolCallId: "wait-call", toolName: "wait_subagents", status: "completed", output: { waitId: WAIT_ID, status: "ready" },
       } }],
     })
     expect(restored).not.toHaveProperty("durableWait")

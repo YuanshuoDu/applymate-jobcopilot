@@ -1,7 +1,7 @@
 import type pg from "pg"
 import type { SubagentLease } from "./types.js"
 import { markCanonicalSubagentWaitTargetIds } from "./subagent-wait-structural-ids.js"
-import { dateValue, DurableSubagentWaitError, object as waitObject, safeSubagentWaitJson, waitResult } from "./durable-subagent-wait-store.js"
+import { dateValue, DurableSubagentWaitError, object as waitObject, safeSubagentWaitJson, waitResult, type DurableSubagentWaitResult } from "./durable-subagent-wait-store.js"
 import { resolveDurableWaitOutcome, sameIds, type DurableWaitResume } from "./child-resume-observations.js"
 import { inspectChildWaitSourceLifecycle } from "./child-resume-source-wait-lifecycle.js"
 
@@ -43,6 +43,18 @@ function validStoredOutcome(row: Row, ids: readonly string[], matched: readonly 
       && !!taskIds && sameIds(taskIds, ids)
       && dateValue(outcome.deadlineAt, "outcome.deadlineAt").getTime() === dateValue(row.deadlineAt, "deadlineAt").getTime()
   } catch { return false }
+}
+
+/** Returns only the already-persisted resolved outcome after the same validation used by resume. */
+export function validatedConsumedWaitOutcome(row: Row): DurableSubagentWaitResult {
+  const waitId = typeof row.waitId === "string" ? row.waitId : typeof row.id === "string" ? row.id : ""
+  const result = row.waitResult ?? row.result
+  const normalized = { ...row, id: waitId, waitId, waitResult: result }
+  const ids = strictIds(row.targetTaskIds), matched = strictIds(row.matchedTaskIds, 0)
+  if (!waitId || !ids || !matched || !validStoredOutcome(normalized, ids, matched)) {
+    throw new Error("child_resume_invalid_wait_result")
+  }
+  return waitResult({ ...normalized, result })
 }
 
 function markInputIds(input: Record<string, unknown>, ids: readonly string[]): boolean {

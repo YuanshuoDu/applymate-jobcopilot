@@ -3,9 +3,8 @@ import { createHash, randomUUID } from "node:crypto"
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import { canonicalJson } from "@jobcopilot/shared"
 import type pg from "pg"
-
-import type { ExecutionOwnerFence } from "../execution-owner.js"
-import { appendTurnEngineEventBatch } from "../turns/turn-engine-event-batch.js"
+import type { ExecutionOwnerFence, TaskExecutionOwnerFence } from "../execution-owner.js"
+import { appendChildWaitSourceLifecycleEventBatch, appendTurnEngineEventBatch } from "../turns/turn-engine-event-batch.js"
 import type { TurnEnginePool, TurnEngineQueryClient } from "../turns/turn-engine-owner-sql.js"
 import type { TurnEngineEventInput } from "../turns/turn-engine-types.js"
 import { projectWaitCallEventContent } from "../turns/turn-execution-wait-event-projection.js"
@@ -13,7 +12,6 @@ import { toRepositoryJson } from "../turns/turn-engine-types.js"
 import { DurableSubagentWaitError, safeSubagentWaitJson, type DurableSubagentWaitResult } from "./durable-subagent-wait-store.js"
 import { markCanonicalSubagentWaitId, markCanonicalSubagentWaitTargetIds } from "./subagent-wait-structural-ids.js"
 import type { SubagentLease } from "./types.js"
-
 type QueryClient = Pick<pg.PoolClient, "query">
 type Client = TurnEngineQueryClient
 type Pool = TurnEnginePool
@@ -23,7 +21,6 @@ type Lifecycle = Readonly<{ state: "unreconciled" | "waiting" | "recovered"; too
 type Provenance = Readonly<{ schemaVersion: "child-wait-source-lifecycle.v1"; userId: string; sessionId: string; turnId: string; rootTaskId: string; taskId: string; ownerId: string; attempt: number; stepId: string; waitId: string; toolCallId: string; callItemId: string; resultItemId: string }>
 const LIMIT = 16_384
 const VERSION = "child-wait-source-lifecycle.v1"
-
 function obj(value: unknown): Row { return value && typeof value === "object" && !Array.isArray(value) ? value as Row : {} }
 function exact(value: Row, keys: readonly string[]): boolean { const a = Object.keys(value).sort(), b = [...keys].sort(); return a.length === b.length && a.every((key, i) => key === b[i]) }
 function text(value: unknown): value is string { return typeof value === "string" && !!value.trim() && value === value.trim() && value.length <= 256 }
@@ -32,7 +29,7 @@ function sameIds(a: readonly string[], b: readonly string[]): boolean { const le
 function sameJson(a: unknown, b: unknown): boolean { try { return canonicalJson(a) === canonicalJson(b) } catch { return false } }
 function reject(): never { throw new DurableSubagentWaitError("wait_scope_error", "Child wait source lifecycle is inconsistent") }
 function required(value: unknown): string { if (!text(value)) return reject(); return value }
-function owner(lease: Lease): ExecutionOwnerFence { return { kind: "task", userId: lease.userId, sessionId: lease.sessionId, turnId: required(lease.turnId), taskId: lease.id, rootTaskId: required(lease.rootTaskId), ownerId: required(lease.ownerId), attemptCount: lease.attemptCount, leaseExpiresAt: lease.leaseExpiresAt } }
+function owner(lease: Lease): TaskExecutionOwnerFence { return { kind: "task", userId: lease.userId, sessionId: lease.sessionId, turnId: required(lease.turnId), taskId: lease.id, rootTaskId: required(lease.rootTaskId), ownerId: required(lease.ownerId), attemptCount: lease.attemptCount, leaseExpiresAt: lease.leaseExpiresAt } }
 function resultId(taskId: string, waitId: string, callId: string): string {
   const hash = createHash("sha256").update("child-wait-source-result:v1\0" + waitId + "\0" + callId).digest("hex")
   return "task:" + taskId + ":item:tool-result:source-wait-recovery:" + hash
@@ -210,14 +207,14 @@ export async function reconcileChildWaitSourceLifecycle(pool: Pool, client: Clie
     const updatedResult = await client.query("UPDATE \"agent_items\" SET \"status\" = 'completed', \"content\" = $1::jsonb, \"revision\" = \"revision\" + 1, \"startedAt\" = $2, \"completedAt\" = $2, \"updatedAt\" = $2 WHERE \"id\" = $3 AND \"sessionId\" = $4 AND \"turnId\" = $5 AND \"taskId\" = $6 AND \"stepId\" = $7 AND \"type\" = 'tool_result' AND \"status\" = 'started' AND \"revision\" = 0", [JSON.stringify(resultContent), now, resultItemId, lease.sessionId, lease.turnId, lease.id, stepId])
     if (updatedResult.rowCount !== 1) return reject()
     const start = await readStartEvent(client, lease, state.callItemId, state.toolCallId)
-    await appendTurnEngineEventBatch(pool, completionEvents(owner(lease), state, stepId, resultItemId, resultContent, callEventContent, required(start.id)), client)
+    await appendCompletionEvents(pool, lease, wait, state, stepId, resultItemId, resultContent, callEventContent, required(start.id), client)
   } else {
     const ids = strictIds(wait.targetTaskIds)
     if (!ids) return reject()
     const call = (await client.query<Row>("SELECT \"content\" FROM \"agent_items\" WHERE \"id\" = $1 AND \"sessionId\" = $2 AND \"turnId\" = $3 AND \"taskId\" = $4 AND \"stepId\" = $5 AND \"type\" = 'tool_call' FOR SHARE", [state.callItemId, lease.sessionId, lease.turnId, lease.id, stepId])).rows[0]
     if (!call) return reject()
-    await appendTurnEngineEventBatch(pool, completionEvents(owner(lease), state, stepId, resultItemId, safeResultContent(state.toolCallId, output),
-      projectWaitCallEventContent(obj(call.content)), required((await readStartEvent(client, lease, state.callItemId, state.toolCallId)).id)), client)
+    await appendCompletionEvents(pool, lease, wait, state, stepId, resultItemId, safeResultContent(state.toolCallId, output),
+      projectWaitCallEventContent(obj(call.content)), required((await readStartEvent(client, lease, state.callItemId, state.toolCallId)).id), client)
   }
   if (state.state === "recovered") return state
   const updated = { ...waitJson, sourceLifecycleRecovery: provenance }
@@ -226,7 +223,14 @@ export async function reconcileChildWaitSourceLifecycle(pool: Pool, client: Clie
   if (changed.rowCount !== 1) return reject()
   return { ...state, state: "recovered", resultItemId }
 }
-
+function appendCompletionEvents(pool: Pool, lease: Lease, wait: Row, state: Lifecycle, stepId: string, resultItemId: string,
+  resultContent: unknown, callContent: unknown, sourceStartEventId: string, client: Client): Promise<void> {
+  const ownerFence = owner(lease), events = completionEvents(ownerFence, state, stepId, resultItemId, resultContent, callContent, sourceStartEventId)
+  return (state.sourceAttempt < lease.attemptCount
+    ? appendChildWaitSourceLifecycleEventBatch(pool, { owner: ownerFence, waitId: required(wait.id), sourceStepId: stepId,
+      sourceAttempt: state.sourceAttempt, callItemId: state.callItemId, resultItemId, toolCallId: state.toolCallId, events }, client)
+    : appendTurnEngineEventBatch(pool, events, client)).then(() => undefined)
+}
 function completionEvents(ownerFence: ExecutionOwnerFence, state: Lifecycle, stepId: string, resultIdValue: string, resultContent: unknown,
   callContent: unknown, cause: string): TurnEngineEventInput[] {
   const callItemId = state.callItemId, callId = state.toolCallId
