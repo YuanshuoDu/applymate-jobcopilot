@@ -401,6 +401,30 @@ test.afterEach(async ({ page }, testInfo) => {
   if (testInfo.status === 'passed') await page.screenshot({ path: testInfo.outputPath('mounted-success.png'), fullPage: true })
 })
 
+test('a failed jobs refresh shows an error and retry restores the list', async ({ page }) => {
+  const state = await install(page, { descriptionMode: 'two' })
+  let failNextList = false
+  await page.route('**/api/jobs?*', async route => {
+    if (route.request().method() === 'GET' && failNextList) {
+      failNextList = false
+      return route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'Fixture list unavailable' }) })
+    }
+    return route.fallback()
+  })
+  await page.goto(`${origin}/?page=jobs`)
+  await expect(page.getByText('Second fixture role', { exact: true }).first()).toBeVisible()
+  failNextList = true
+  const failed = page.waitForResponse(response => response.url().includes('/api/jobs?') && response.status() === 500)
+  await page.evaluate(() => window.postMessage({ type: 'nav-refresh' }, '*'))
+  await failed
+  await expect(page.getByText(/Couldn’t load your jobs|无法加载职位/)).toBeVisible()
+  await expect(page.getByText(/^(No jobs found|暂无职位)$/)).toHaveCount(0)
+  await page.getByRole('button', { name: /^(Retry|重试)$/ }).click()
+  await expect(page.getByText('Second fixture role', { exact: true }).first()).toBeVisible()
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
 test('restores a highlighted job outside the current page and retains list context through the real Resume page', async ({ page }) => {
   const state = await install(page)
   await open(page, '&jobsPage=3&jobsSize=50&jobsSearch=Acme&jobsStatus=saved&jobsSort=score&jobsDirection=asc')

@@ -1851,6 +1851,7 @@ export function JobsPage() {
         if (search)                params.set('q',      search)
         if (filterStatus !== 'all') params.set('status', filterStatus)
         const res  = await fetch(`/api/jobs?${params}`, { signal: controller.signal })
+        if (!res.ok) throw new Error('Could not load jobs')
         const json = await res.json() as JobsListResponse
         if (!cancelled) {
           const rawJobs: Job[] = json.jobs ?? []

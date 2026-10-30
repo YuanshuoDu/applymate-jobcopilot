@@ -43,6 +43,10 @@ Agent 负责原任务的执行和审批，招聘消息负责查看回复。
    状态、后写历史；若历史记录缺失，不能仅凭状态判断记录来源。
 9. 在申请历史与招聘消息查看后续。材料编辑、下载和打开网站都不会记作已提交。
 
+看板还保留手动拖动职位到不同进展栏的功能；拖到“已申请”会直接修改申请状态，
+并写入普通状态变更记录，不会产生上述手动提交记录的来源标记。请只在实际情况
+明确时调整状态，并以雇主回执核对；看板状态本身不是回执。
+
 ### Agent 协助申请
 
 1. 申请详情已有任务时，点击原任务的进度、问题或审核入口。没有关联任务时，
@@ -201,6 +205,11 @@ activity entry, without a shared transaction. A later failure can therefore leav
 the status updated without an activity entry identifying the source; a status alone
 does not prove how the application was recorded. Transactional provenance needs
 a separate backend change.
+
+The existing Kanban also permits a user to drag a job to another status, including
+Applied. That changes the status and records a generic status-change activity;
+it does not use the manual-submission record or add its source marker. A board
+status is user-maintained tracking information, not an employer receipt.
 
 The browser ZIP download reads the account-owned job, selected saved documents
 and existing passing audit before rendering. It then reads them again and compares
