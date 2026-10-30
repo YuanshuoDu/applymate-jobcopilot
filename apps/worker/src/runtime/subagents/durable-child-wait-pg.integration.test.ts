@@ -244,6 +244,7 @@ type BlockingTaskSnapshot = {
   id: string; userId: string; sessionId: string; turnId: string; rootTaskId: string;
   leaseOwner: string | null; attemptCount: number; leaseExpiresAt: Date | null
 }
+type BlockingTaskRow = Omit<BlockingTaskSnapshot, "userId">
 
 async function expectAbsentSourceResultClaimSafety(pool: Pool, ids: FixtureIds, continuationStepId: string): Promise<void> {
   const client = await pool.connect()
@@ -257,13 +258,16 @@ async function expectAbsentSourceResultClaimSafety(pool: Pool, ids: FixtureIds, 
       [ids.sessionId, ids.userId],
     )
     expect(sessionResult.rows).toHaveLength(1)
-    const taskResult = await client.query<BlockingTaskSnapshot>(
-      `SELECT "id", "userId", "sessionId", "turnId", "rootTaskId", "leaseOwner", "attemptCount", "leaseExpiresAt"
+    const session = sessionResult.rows[0]
+    if (!session) throw new Error("fixture_absent_source_session_missing")
+    const taskResult = await client.query<BlockingTaskRow>(
+      `SELECT "id", "sessionId", "turnId", "rootTaskId", "leaseOwner", "attemptCount", "leaseExpiresAt"
        FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4 FOR UPDATE`,
       [ids.waiterTaskId, ids.sessionId, ids.turnId, ids.rootTaskId],
     )
     expect(taskResult.rows).toHaveLength(1)
-    const task = taskResult.rows[0]
+    const taskRow = taskResult.rows[0]
+    const task: BlockingTaskSnapshot | undefined = taskRow ? { ...taskRow, userId: session.userId } : undefined
     expect(task).toBeDefined()
     if (!task || !task.leaseOwner || !task.leaseExpiresAt) throw new Error("fixture_absent_source_live_task_missing")
 
