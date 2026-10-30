@@ -117,6 +117,21 @@ describe("root history planning guidance", () => {
     expect(text).not.toContain("step-current")
   })
 
+  it("accepts the canonical cross-session marker only as a bounded advisory aggregate", () => {
+    const marked = { ...defaultHistoryContent(), historical: true }
+    const text = textOf(buildRootHistoryPlanningInstruction(context([historyBlock(marked)]), [{ name: "agent.plan" }]))
+
+    expect(text).toContain("Some or all entries in this history aggregate may be from older sessions")
+    expect(text).toContain("does not identify locality for each entry")
+    expect(text).toContain("never reuse historical task IDs, ordinals, plan state, counts, or outputs")
+    expect(text).toContain("Only the current owner-scoped TaskGraph establishes current plans, and only verified current result pages establish current evidence")
+    expect(text).toContain("expectedRevision 42")
+    expect(text).toContain("Current verification and completion gates remain authoritative")
+    expect(text).not.toContain("Earlier same-session failures, repairs, and reported outputs are hypotheses only")
+    expect(text).not.toContain("session-current")
+    expect(text).not.toContain("turn-current")
+  })
+
   it("keeps fixed guidance for a validated historical Scout footprint without interpolating its values", () => {
     const content = {
       ...defaultHistoryContent(),
@@ -363,7 +378,10 @@ describe("root history planning guidance", () => {
     ["spoofed kind", [historyBlock({ ...defaultHistoryContent(), kind: "caller_history" })]],
     ["not advisory", [historyBlock({ ...defaultHistoryContent(), advisoryOnly: false })]],
     ["current evidence claim", [historyBlock({ ...defaultHistoryContent(), notCurrentEvidence: false })]],
-    ["cross-session historical marker", [historyBlock({ ...defaultHistoryContent(), historical: true })]],
+    ["false historical marker", [historyBlock({ ...defaultHistoryContent(), historical: false })]],
+    ["non-boolean historical marker", [historyBlock({ ...defaultHistoryContent(), historical: "true" })]],
+    ["null historical marker", [historyBlock({ ...defaultHistoryContent(), historical: null })]],
+    ["unknown field beside historical marker", [historyBlock({ ...defaultHistoryContent(), historical: true, privateText: "DO_NOT_TRUST" })]],
     ["unknown envelope field", [historyBlock({ ...defaultHistoryContent(), privateText: "DO_NOT_TRUST" })]],
     ["duplicate reserved block", [historyBlock(), historyBlock()]],
   ] as const)("does not activate for %s", (_name, blocks) => {

@@ -343,6 +343,26 @@ describe("child attempt durable resume", () => {
     expect(db.calls.find(call => call.sql.includes('FROM "agent_wait_conditions" AS wait'))?.sql).toContain('LEFT JOIN "agent_items" AS result')
   })
 
+  it("fails closed on a missing source receipt until the production repair preflight runs", async () => {
+    const child = lease({ attemptCount: 3, maxAttempts: 3 })
+    const wait = consumedWait(child)
+    const sourceStepId = String(wait.stepId), continuationStepId = String(wait.continuationStepId)
+    wait.sourceItemId = null
+    wait.callStatus = "started"
+    wait.resultContent = null
+    wait.resultStatus = null
+    const waitInput = { idempotencyKey: "wait-key", taskIds: ["grandchild-1"], mode: "all", timeoutMs: 5_000 }
+    const db = fakePool(child, [
+      step(child, { id: sourceStepId, attempt: 3, ordinal: 0, status: "waiting_for_tool" }),
+      step(child, { id: continuationStepId, attempt: 3, ordinal: 1, status: "queued" }),
+    ], [item(child, { id: "wait-call-item", attempt: 3, stepId: sourceStepId, type: "tool_call",
+      content: { toolCallId: "wait-call", toolName: "wait_subagents", input: waitInput } })],
+    wait, [{ id: "grandchild-1", parentTaskId: child.id, rootTaskId: child.rootTaskId,
+      sessionId: child.sessionId, turnId: child.turnId, userId: child.userId }])
+
+    await expect(loadChildAttemptResume(db.pool as never, child)).rejects.toThrow("child_resume_wait_tool_call_conflict")
+  })
+
   it("uses the first later task ordinal while keeping the deterministic logical resume ordinal", async () => {
     const child = lease({ attemptCount: 3, maxAttempts: 3 })
     const sourceStepId = `task:${child.id}:step:0:attempt:${child.attemptCount}`

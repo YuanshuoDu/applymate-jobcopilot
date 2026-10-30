@@ -3,6 +3,7 @@ import { Redis } from "ioredis"
 import { Worker } from "bullmq"
 import { AgentTreeManager } from "./manager.ts"
 import { PgSubagentTaskStore } from "./pg-store.ts"
+import { parseSubagentJobPayload } from "./types.ts"
 import { parseSubagentDispatchJobId } from "./dispatch-identity.ts"
 import { runSubagentQueueJob } from "../../queue/subagent-pause-dispatch.ts"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.ts"
@@ -594,7 +595,7 @@ async function resumeLegacyConsumedWait(lease, phase) {
     sourceStepId: restored.durableWait.stepId, sourceAttempt: restored.durableWait.attempt,
     currentAttempt: lease.attemptCount, continuationStepId: restored.durableWait.continuationStepId ?? null,
     orphanCallId: restored.childWaitOrphanRecovery?.call.id ?? null,
-    claimCallId: restored.childWaitClaimRecovery?.call.id ?? null, repeatedRepairCount,
+    claimCallId: restored.childWaitClaimRecovery?.call.id ?? null, repeatedRepairCount: repeatRepairCount,
     executorCalls: 0, dispatcherCalls: 0 })}`)
   return resumeChildThroughLoop(lease, phase, restored)
 }
@@ -967,23 +968,60 @@ const worker = new Worker(queueName, async job => {
   autorun: mode !== "worker-b-loop-final" })
 
 worker.on("completed", (job, result) => {
-  if (job.data.taskId !== ids.waiterTaskId) return
-  const dispatchGeneration = parseSubagentDispatchJobId(job.id, ids.waiterTaskId)?.generation ?? null
-  if (result?.status === "skipped" && result?.reason === "dispatch_identity_mismatch") {
-    say(`WORKER_B_STALE_DISPATCH_SKIPPED ${JSON.stringify({ dispatchGeneration })}`)
-    return
-  }
-  if (crashCutModes.has(mode)) {
-    process.stderr.write(`UNEXPECTED_CRASH_CUT_COMPLETION ${JSON.stringify({ mode, result, taskId: ids.waiterTaskId })}\n`)
+  void (async () => {
+    if (job.data.taskId !== ids.waiterTaskId) {
+      process.stderr.write(`UNEXPECTED_COMPLETED_SUBAGENT_TASK ${JSON.stringify({ taskId: job.data.taskId })}\n`)
+      await stop(1)
+      return
+    }
+    const identity = parseSubagentDispatchJobId(job.id, ids.waiterTaskId)
+    const dispatchGeneration = identity?.generation ?? null
+    if (result?.status === "skipped" && result?.reason === "dispatch_identity_mismatch") {
+      try {
+        const jobPayload = parseSubagentJobPayload(job.data)
+        const current = await pool.query(`SELECT dispatch."attemptCount", dispatch."publishedAt", dispatch."payload", dispatch."lastError"
+          FROM "agent_outbox" AS dispatch
+          JOIN "sub_agent_tasks" AS task ON task."id" = $3 AND task."sessionId" = dispatch."aggregateId"
+            AND task."rootTaskId" = $4 AND task."turnId" = $5
+          WHERE dispatch."topic" = 'agent.subagent.dispatch' AND dispatch."aggregateId" = $1
+            AND dispatch."idempotencyKey" = $2`,
+        [ids.sessionId, `subagent-dispatch:${ids.waiterTaskId}`, ids.waiterTaskId, ids.rootTaskId, ids.turnId])
+        const row = current.rows.length === 1 ? current.rows[0] : null
+        const currentPayload = parseSubagentJobPayload(row?.payload)
+        const attemptCount = Number(row?.attemptCount)
+        if (identity && jobPayload?.taskId === ids.waiterTaskId && jobPayload.sessionId === ids.sessionId
+          && jobPayload.rootTaskId === ids.rootTaskId && currentPayload?.taskId === ids.waiterTaskId
+          && currentPayload.sessionId === ids.sessionId && currentPayload.rootTaskId === ids.rootTaskId
+          && row?.publishedAt != null && row.lastError === null
+          && Number.isSafeInteger(attemptCount) && attemptCount >= 1
+          && identity.generation < attemptCount - 1) {
+          say(`WORKER_B_STALE_DISPATCH_SKIPPED ${JSON.stringify({ dispatchGeneration, currentPublishedGeneration: attemptCount - 1 })}`)
+          return
+        }
+      } catch (error) {
+        process.stderr.write(`STALE_DISPATCH_LOOKUP_FAILED ${JSON.stringify({ code: typeof error?.code === "string" ? error.code : "unknown" })}\n`)
+        await stop(1)
+        return
+      }
+      process.stderr.write(`UNEXPECTED_DISPATCH_IDENTITY_MISMATCH ${JSON.stringify({ taskId: job.data.taskId, dispatchGeneration })}\n`)
+      await stop(1)
+      return
+    }
+    if (crashCutModes.has(mode)) {
+      process.stderr.write(`UNEXPECTED_CRASH_CUT_COMPLETION ${JSON.stringify({ mode, result, taskId: ids.waiterTaskId })}\n`)
+      await stop(1)
+      return
+    }
+    const marker = mode === "worker-a" ? "WORKER_A_WAITING" : "WORKER_B_RESUMED"
+    const markerPayload = mode === "worker-a"
+      ? { result: { status: workerResultStatuses.has(result?.status) ? result.status : "invalid" } }
+      : { result, taskId: ids.waiterTaskId, dispatchGeneration }
+    say(`${marker} ${JSON.stringify(markerPayload)}`)
+    await stop(0)
+  })().catch(error => {
+    process.stderr.write(`UNEXPECTED_COMPLETION_HANDLER_ERROR ${JSON.stringify({ code: typeof error?.code === "string" ? error.code : "unknown" })}\n`)
     void stop(1)
-    return
-  }
-  const marker = mode === "worker-a" ? "WORKER_A_WAITING" : "WORKER_B_RESUMED"
-  const markerPayload = mode === "worker-a"
-    ? { result: { status: workerResultStatuses.has(result?.status) ? result.status : "invalid" } }
-    : { result, taskId: ids.waiterTaskId, dispatchGeneration }
-  say(`${marker} ${JSON.stringify(markerPayload)}`)
-  void stop(0)
+  })
 })
 worker.on("failed", (job, error) => {
   if (job?.data.taskId !== ids.waiterTaskId) return

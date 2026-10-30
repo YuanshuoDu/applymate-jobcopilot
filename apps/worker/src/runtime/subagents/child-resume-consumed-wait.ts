@@ -70,8 +70,10 @@ function validReceipt(row: Row, ids: readonly string[], toolCallId: string): boo
   const tasks = Array.isArray(projection.tasks) ? projection.tasks : undefined
   const taskIds = tasks && strictIds(tasks.map(task => waitObject(task).taskId), 0)
   let deadlinesMatch = false
-  try { deadlinesMatch = dateValue(projection.deadlineAt, "receipt.deadlineAt").getTime() === dateValue(row.deadlineAt, "deadlineAt").getTime() }
-  catch { return false }
+  try {
+    deadlinesMatch = dateValue(projection.deadlineAt, "receipt.deadlineAt").getTime()
+      === dateValue(row.deadlineAt, "deadlineAt").getTime()
+  } catch { return false }
   return receipt.toolCallId === toolCallId && (receipt.errorCode === null || receipt.errorCode === undefined)
     && projection.waitId === row.waitId && projection.status === "waiting" && !!receiptIds && sameIds(receiptIds, ids)
     && !!matched && matched.length === 0 && !!tasks && !!taskIds && taskIds.every(id => ids.includes(id))
