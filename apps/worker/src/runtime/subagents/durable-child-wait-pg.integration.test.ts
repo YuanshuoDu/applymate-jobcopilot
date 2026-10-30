@@ -1829,7 +1829,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
          AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${waiter.id}`],
       )
       const completedRecoveryGeneration = completedRecoveryOutbox.rows[0]!.attemptCount
-      expect(completedRecoveryGeneration).toBe(resultCutGeneration + 1)
+      expect(completedRecoveryGeneration).toBe(resultCutDispatchPublished.rows[0]!.attemptCount + 1)
       expect(completedRecoveryOutbox.rows[0]?.publishedAt).toBeNull()
       expect(await abandonedBullJob!.getState()).toBe("active")
       await expect(dispatchPendingSubagentOutbox(pool as never, queue, 50, ids.sessionId)).resolves.toBe(1)
