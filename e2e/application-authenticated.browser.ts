@@ -33,11 +33,13 @@ test('real credentials carry a synthetic application through manual recording', 
   const requests: string[] = []
   const jobReads: { path: string; status: number }[] = []
   const browserErrors: string[] = []
+  const failedResources: { path: string; status: number }[] = []
   page.on('pageerror', error => browserErrors.push(error.message))
   page.on('console', message => { if (message.type() === 'error') browserErrors.push(message.text()) })
   page.on('request', request => requests.push(`${request.method()} ${new URL(request.url()).pathname}`))
   page.on('response', response => {
     const url = new URL(response.url())
+    if (response.status() >= 400) failedResources.push({ path: url.pathname, status: response.status() })
     if (response.request().method() === 'GET' && /^\/api\/jobs\/[^/]+$/.test(url.pathname)) {
       jobReads.push({ path: url.pathname, status: response.status() })
     }
@@ -127,13 +129,25 @@ test('real credentials carry a synthetic application through manual recording', 
     await expect(drawer).toContainText(fixture.title)
     await assertManualState(job.id, syntheticResume.id, 'saved')
 
+    await page.evaluate(() => {
+      const fixtureWindow = window as unknown as { downloadNotices: string[] }
+      fixtureWindow.downloadNotices = []
+      new MutationObserver(() => {
+        const text = document.body.innerText
+        for (const notice of ['Could not download application materials', 'Some characters cannot be included in the PDF', 'Application materials download started']) {
+          if (text.includes(notice) && !fixtureWindow.downloadNotices.includes(notice)) fixtureWindow.downloadNotices.push(notice)
+        }
+      }).observe(document.body, { subtree: true, childList: true, characterData: true })
+    })
+    const downloadRequestStart = requests.length
     let file
     try {
       const download = page.waitForEvent('download', { timeout: 30_000 })
       await drawer.getByRole('button', { name: /Download application materials|下载申请材料/ }).click()
       file = await download
     } catch (error) {
-      console.error('Fixture download diagnostics:', JSON.stringify({ browserErrors, text: await page.locator('body').innerText() }))
+      console.error('Fixture download diagnostics:', JSON.stringify({ browserErrors, failedResources,
+        requests: requests.slice(downloadRequestStart), notices: await page.evaluate(() => (window as unknown as { downloadNotices: string[] }).downloadNotices) }))
       throw error
     }
     const archivePath = await file.path()
