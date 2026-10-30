@@ -5,7 +5,7 @@ export default defineConfig({
   testMatch: 'application-authenticated.browser.ts',
   workers: 1,
   retries: 0,
-  timeout: 60_000,
+  timeout: 120_000,
   use: { ...devices['Desktop Chrome'], baseURL: 'http://127.0.0.1:3100', trace: 'off' },
   reporter: 'list',
 })

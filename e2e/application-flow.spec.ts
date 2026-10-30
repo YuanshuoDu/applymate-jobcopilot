@@ -669,7 +669,7 @@ test('edited resume is saved before an audit of its current version', async ({ p
   const editor = page.locator('[data-resume-editor]')
   await editor.getByText('Software engineer.', { exact: false }).first().click()
   await editor.locator('textarea').first().fill('Edited verified summary')
-  await page.getByRole('button', { name: /Run independent audit|Run audit again|运行独立审核|重新运行审核/ }).click()
+  await page.getByRole('button', { name: /Run independent audit|Run audit again|运行独立审核|再次运行审核/ }).click()
   await expect.poll(() => state.writes.map(write => write.path)).toEqual(['/api/resume/resume-1', '/api/jobs/outside-page/audit-application'])
   const saved = state.writes[0].body as { content?: { summary?: string } }
   expect(saved.content?.summary).toBe('Edited verified summary')
@@ -3146,7 +3146,7 @@ test('version restore does not start when saving dirty edits fails', async ({ pa
   await page.getByRole('button', { name: 'History', exact: true }).click()
   await page.getByRole('button', { name: 'Restore', exact: true }).click()
   await expect.poll(() => state.writes.filter(write => write.path === '/api/resume/resume-1').length).toBeGreaterThan(0)
-  await expect(page.getByText(/Save failed|保存失败/).first()).toBeVisible()
+  await expect(page.getByText(/resume save is unconfirmed|简历保存结果待核实/i).first()).toBeVisible()
   expect(state.writes.filter(write => write.path.endsWith('/versions'))).toEqual([])
   await expect(page.locator('[data-resume-editor]').getByText('Edited fixture summary', { exact: false }).first()).toBeVisible()
 })
