@@ -93,7 +93,8 @@ function launchWorker(mode: "worker-a" | "worker-a-crash" | "worker-b-crash-befo
   const child = spawn(process.execPath, ["--import", "tsx", fixturePath, mode, queueName, JSON.stringify(ids)], {
     cwd: workerCwd,
     env: { ...process.env, DATABASE_URL: databaseUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl!, AGENT_TURN_REDIS_TEST_URL: redisUrl!,
-      ...(mode === "worker-b-crash-resume" ? { AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID: ids.waiterTaskId } : {}) },
+      ...(mode === "worker-b-crash-resume" || mode === "worker-b-loop-claim-item-completed-cut"
+        ? { AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID: ids.waiterTaskId } : {}) },
     stdio: ["ignore", "pipe", "pipe"],
   }) as WorkerProcess
   child.stdoutText = ""
@@ -118,6 +119,58 @@ async function waitForMarker(child: WorkerProcess, marker: string, timeoutMs = 2
     await new Promise(resolve => setTimeout(resolve, 25))
   }
   throw new Error(`Timed out waiting for ${marker}; stdout: ${child.stdoutText}; stderr: ${child.stderrText}`)
+}
+
+function boundedRecoveryTrace(child: WorkerProcess): Record<string, unknown> | null {
+  const prefix = "WORKER_B_RECOVERY_PREDICATE_TRACE "
+  const line = [...child.stdoutText.split(/\r?\n/), ...child.stderrText.split(/\r?\n/)]
+    .find(candidate => candidate.startsWith(prefix))
+  if (!line) return null
+  let parsed: unknown
+  try { parsed = JSON.parse(line.slice(prefix.length)) as unknown }
+  catch { return { traceParseFailed: true } }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { traceParseFailed: true }
+  const trace = parsed as Record<string, unknown>
+  const safeInteger = (value: unknown): number | null => typeof value === "number" && Number.isSafeInteger(value) ? value : null
+  const dispatch = trace.dispatch && typeof trace.dispatch === "object" && !Array.isArray(trace.dispatch)
+    ? trace.dispatch as Record<string, unknown> : null
+  const flags = dispatch ? Object.fromEntries(["present", "payloadValid", "task", "session", "root", "owner", "generation", "published"]
+    .filter(key => typeof dispatch[key] === "boolean").map(key => [key, dispatch[key]])) : null
+  return {
+    pageCount: safeInteger(trace.pageCount),
+    pages: Array.isArray(trace.pages) ? trace.pages.slice(0, 16).map(value => {
+      const page = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
+      return { page: safeInteger(page.page),
+        candidates: safeInteger(page.candidates),
+        targetSeen: typeof page.targetSeen === "boolean" ? page.targetSeen : null,
+        cursorUsed: typeof page.cursorUsed === "boolean" ? page.cursorUsed : null }
+    }) : null,
+    pagesTruncated: typeof trace.pagesTruncated === "boolean" ? trace.pagesTruncated : null,
+    rejectionStage: typeof trace.rejectionStage === "string" ? trace.rejectionStage.slice(0, 64) : null,
+    waitProjectionDisposition: typeof trace.waitProjectionDisposition === "string" ? trace.waitProjectionDisposition.slice(0, 32) : null,
+    waitProjectionStage: typeof trace.waitProjectionStage === "string" ? trace.waitProjectionStage.slice(0, 64) : null,
+    childWaitResumable: typeof trace.childWaitResumable === "boolean" ? trace.childWaitResumable : null,
+    waitRegistrationFound: typeof trace.waitRegistrationFound === "boolean" ? trace.waitRegistrationFound : null,
+    waitRegistrationRejected: typeof trace.waitRegistrationRejected === "boolean" ? trace.waitRegistrationRejected : null,
+    blockingExternalCall: typeof trace.blockingExternalCall === "boolean" ? trace.blockingExternalCall : null,
+    dispatch: flags,
+  }
+}
+
+function parseRecoveryMarker(child: WorkerProcess): { rows?: Array<{ id?: unknown; status?: unknown }> } {
+  const prefix = "WORKER_B_RECOVERED "
+  const line = child.stdoutText.split(/\r?\n/).find(candidate => candidate.startsWith(prefix))
+  if (!line) return {}
+  try {
+    const marker = JSON.parse(line.slice(prefix.length)) as { rows?: unknown }
+    if (!Array.isArray(marker.rows)) return {}
+    const rows = marker.rows.slice(0, 50).map(value => {
+      const row = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
+      return { id: typeof row.id === "string" ? row.id.slice(0, 256) : undefined,
+        status: typeof row.status === "string" ? row.status.slice(0, 32) : undefined }
+    })
+    return { rows }
+  } catch { return {} }
 }
 
 function expectRestoredWaitObservation(child: WorkerProcess, state: RestoredWaitObservationSummary["state"]): void {
@@ -1140,6 +1193,17 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
 
       workerF = launchWorker("worker-b-loop-claim-item-completed-cut", queueName, ids)
       await waitForMarker(workerF, "WORKER_B_RECOVERED")
+      const workerFRecovery = parseRecoveryMarker(workerF)
+      const workerFWaiter = workerFRecovery.rows?.find(row => row.id === waiter.id)
+      const workerFTrace = boundedRecoveryTrace(workerF)
+      const workerFRecoveryReason = workerFWaiter
+        ? workerFWaiter.status === "queued" ? null : "waiter_reclaimed_with_nonqueued_status"
+        : typeof workerFTrace?.rejectionStage === "string" ? workerFTrace.rejectionStage
+          : workerFRecovery.rows ? "waiter_not_in_reclaimed_rows" : "reclaimed_rows_missing_or_unparseable"
+      expect(workerFWaiter?.status, `WorkerF did not reclaim the waiter: ${JSON.stringify({
+        targetReclaimed: Boolean(workerFWaiter), targetStatus: workerFWaiter?.status ?? null,
+        reason: workerFRecoveryReason, reclaimedRowCount: workerFRecovery.rows?.length ?? null, trace: workerFTrace,
+      })}`).toBe("queued")
       const resultCutDispatch = await pool.query<{ taskStatus: string; attemptCount: number; leaseOwner: string | null }>(
         `SELECT task."status" AS "taskStatus", task."attemptCount", task."leaseOwner" FROM "sub_agent_tasks" AS task
          WHERE task."id" = $1 AND task."sessionId" = $2`, [waiter.id, ids.sessionId],

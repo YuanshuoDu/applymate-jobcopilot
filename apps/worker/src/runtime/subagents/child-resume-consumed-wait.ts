@@ -56,11 +56,15 @@ function validReceipt(row: Row, ids: readonly string[], toolCallId: string): boo
   const receiptIds = strictIds(projection.taskIds), matched = strictIds(projection.matchedTaskIds, 0)
   const tasks = Array.isArray(projection.tasks) ? projection.tasks : undefined
   const taskIds = tasks && strictIds(tasks.map(task => waitObject(task).taskId), 0)
-  const receiptDeadline = Date.parse(String(projection.deadlineAt)), waitDeadline = Date.parse(String(row.deadlineAt))
+  let deadlinesMatch = false
+  try {
+    deadlinesMatch = dateValue(projection.deadlineAt, "receipt.deadlineAt").getTime()
+      === dateValue(row.deadlineAt, "deadlineAt").getTime()
+  } catch { return false }
   return receipt.toolCallId === toolCallId && (receipt.errorCode === null || receipt.errorCode === undefined)
     && projection.waitId === row.waitId && projection.status === "waiting" && !!receiptIds && sameIds(receiptIds, ids)
     && !!matched && matched.length === 0 && !!tasks && !!taskIds && taskIds.every(id => ids.includes(id))
-    && (!taskIds.length || sameIds(taskIds, ids)) && Number.isFinite(receiptDeadline) && receiptDeadline === waitDeadline
+    && (!taskIds.length || sameIds(taskIds, ids)) && deadlinesMatch
 }
 
 /** Loads an already-consumed child wait through its exact persisted continuation. */

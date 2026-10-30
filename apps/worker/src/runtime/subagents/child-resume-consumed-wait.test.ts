@@ -19,15 +19,16 @@ function fixture(options: { ids?: string[]; targetIds?: unknown; inputIds?: unkn
   outcomeTaskId?: unknown; outcomeTaskIds?: string[]; receiptIds?: unknown; receiptWaitId?: unknown; receiptTaskIds?: unknown; targetParentId?: string;
   mode?: unknown; inputMode?: unknown; requestMode?: unknown; status?: unknown; outcomeStatus?: unknown;
   matchedIds?: unknown; outcomeMatchedIds?: unknown; taskStatuses?: unknown[]; inputTimeoutMs?: unknown; requestTimeoutMs?: unknown;
-  deadlineAt?: string; missingReceipt?: boolean; note?: string } = {}) {
+  deadlineAt?: string | Date; receiptDeadlineAt?: string; missingReceipt?: boolean; note?: string } = {}) {
   const ids = options.ids ?? [phoneId], targetIds = options.targetIds ?? ids
   const deadlineAt = options.deadlineAt ?? "2026-10-22T10:05:00.000Z"
+  const deadlineIso = deadlineAt instanceof Date ? deadlineAt.toISOString() : deadlineAt
   const mode = options.mode ?? "any", status = options.status ?? "ready", matchedIds = options.matchedIds ?? [ids[0]]
   const taskStatuses = options.taskStatuses ?? ids.map((_, index) => index === 0 ? "completed" : "running")
   const outcomeTaskIds = options.outcomeTaskIds ?? ids
   const outcomeTasks = outcomeTaskIds.map((taskId, index) => ({ taskId: index === 0 ? options.outcomeTaskId ?? taskId : taskId,
     status: taskStatuses[ids.indexOf(taskId)], role: "writer", result: { answer: 42, ...(taskId === ids[0] && options.note ? { note: options.note } : {}) }, failureReason: null }))
-  const outcome = { waitId: "wait-1", status: options.outcomeStatus ?? status, taskIds: options.outcomeIds ?? ids, deadlineAt,
+  const outcome = { waitId: "wait-1", status: options.outcomeStatus ?? status, taskIds: options.outcomeIds ?? ids, deadlineAt: deadlineIso,
     matchedTaskIds: options.outcomeMatchedIds ?? matchedIds, tasks: outcomeTasks }
   const input = { idempotencyKey: "wait-key", taskIds: options.inputIds ?? ids, mode: options.inputMode ?? mode, timeoutMs: options.inputTimeoutMs ?? 5_000 }
   const row: Row = {
@@ -38,7 +39,7 @@ function fixture(options: { ids?: string[]; targetIds?: unknown; inputIds?: unkn
     callContent: { toolCallId: "call-1", toolName: "wait_subagents", input }, callStatus: options.missingReceipt ? "started" : "completed",
     sourceItemId: options.missingReceipt ? null : "item-result-1", resultContent: options.missingReceipt ? null : {
       toolCallId: "call-1", output: { waitId: options.receiptWaitId ?? "wait-1", status: "waiting", taskIds: options.receiptIds ?? ids,
-        deadlineAt, matchedTaskIds: [], tasks: options.receiptTaskIds ?? [] }, errorCode: null,
+        deadlineAt: options.receiptDeadlineAt ?? deadlineIso, matchedTaskIds: [], tasks: options.receiptTaskIds ?? [] }, errorCode: null,
     }, resultStatus: options.missingReceipt ? null : "completed",
   }
   const targets = ids.map((id, index) => ({ id, parentTaskId: index === 0 ? options.targetParentId ?? child.id : child.id,
@@ -119,6 +120,18 @@ describe("consumed child wait resume", () => {
     expect(resumed).toMatchObject({ input: { taskIds: [phoneId] }, output: { taskIds: [phoneId], tasks: [{ taskId: phoneId }] } })
     expect(JSON.stringify(resumed)).toContain(phoneId)
     expect(JSON.stringify(resumed)).not.toContain("+353 87 123 4567")
+  })
+
+  it("compares a PostgreSQL Date deadline at millisecond precision", async () => {
+    const fake = fixture({ deadlineAt: new Date("2026-10-22T10:05:00.789Z") })
+    await expect(loadChildConsumedWaitResume(fake.client as never, child)).resolves.toMatchObject({ waitId: "wait-1" })
+  })
+
+  it("rejects receipt deadlines with a different millisecond or invalid timestamp", async () => {
+    const mismatch = fixture({ deadlineAt: new Date("2026-10-22T10:05:00.789Z"), receiptDeadlineAt: "2026-10-22T10:05:00.788Z" })
+    await expect(loadChildConsumedWaitResume(mismatch.client as never, child)).rejects.toThrow("child_resume_wait_tool_call_conflict")
+    const invalid = fixture({ receiptDeadlineAt: "not-a-deadline" })
+    await expect(loadChildConsumedWaitResume(invalid.client as never, child)).rejects.toThrow("child_resume_wait_tool_call_conflict")
   })
 
   it("preserves allowed input and receipt reordering without changing canonical output order", async () => {
