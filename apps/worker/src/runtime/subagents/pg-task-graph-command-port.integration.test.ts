@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool as PgPool, type PoolClient } from "pg"
+import { redactAgentEvent } from "@jobcopilot/shared"
 
 import { createAgentArtifactRepository } from "../../db/agent-artifact-repo.js"
 import { createCanonicalScheduledDraftRuntime } from "../scheduled-draft-runtime.js"
@@ -1259,6 +1260,18 @@ async function insertReconciliationEvent(pool: PgPool, value: Fixture, event: {
   ])
 }
 
+function sanitizedAcceptedInputPayload(value: Fixture, itemId: string, input: {
+  readonly id: string; readonly clientMessageId: string; readonly delivery: "follow_up" | "steer"
+  readonly disposition: string
+}): unknown {
+  const result = redactAgentEvent({ type: "input.accepted", body: "", data: {
+    inputId: input.id, clientMessageId: input.clientMessageId, delivery: input.delivery, source: "user", disposition: input.disposition,
+  }, routing: { sessionId: value.sessionId, turnId: value.turnId, itemId, taskId: null, actor: "user",
+    correlationId: value.turnId, causationId: null, outboxTopic: "agent.session.event" } }).data
+  if (!result || Array.isArray(result) || typeof result !== "object") throw new Error("Accepted input fixture payload was rejected by the event redactor")
+  return result
+}
+
 async function seedReconciliationStep(pool: PgPool, value: Fixture, step: {
   readonly id: string; readonly ordinal: number; readonly status: "streaming" | "completed"
   readonly cursor: bigint; readonly consumedInputIds: readonly string[]
@@ -1289,7 +1302,7 @@ async function seedReconciliationInput(pool: PgPool, value: Fixture, input: {
   await insertReconciliationEvent(pool, value, {
     id: `${input.id}-accepted`, sequence: input.sequence, type: "input.accepted", actor: "user", itemId, taskId: null,
     correlationId: value.turnId, idempotencyKey: `input.accepted:${input.clientMessageId}`,
-    payload: { inputId: input.id, clientMessageId: input.clientMessageId, delivery: input.delivery, source: "user", disposition: input.disposition },
+    payload: sanitizedAcceptedInputPayload(value, itemId, input),
   })
 }
 
@@ -1310,7 +1323,7 @@ async function seedAcceptedReconciliationSteer(pool: PgPool, value: Fixture, inp
   await insertReconciliationEvent(pool, value, {
     id: `${input.id}-accepted`, sequence: input.sequence, type: "input.accepted", actor: "user", itemId, taskId: null,
     correlationId: value.turnId, idempotencyKey: `input.accepted:${input.clientMessageId}`,
-    payload: { inputId: input.id, clientMessageId: input.clientMessageId, delivery: "steer", source: "user", disposition },
+    payload: sanitizedAcceptedInputPayload(value, itemId, { ...input, delivery: "steer", disposition }),
   })
 }
 

@@ -31,6 +31,8 @@ function acceptedRow(index: number, state: "accepted" | "queued" | "consumed" = 
   }
 }
 
+type AcceptedInputFixture = Omit<ReturnType<typeof acceptedRow>, "acceptedEventId"> & { acceptedEventId?: string }
+
 function rootInput() {
   return acceptedRow(900, "accepted", null, { delivery: "follow_up", clientMessageId: "root-client", acceptedSequence: BigInt(1) })
 }
@@ -121,7 +123,7 @@ function agenda(stepId: string) {
 function facts(count: number, withReceipt = false, options: { graphRevision?: number; linkedEvents?: Row[] } = {}) {
   const first = acceptedRow(0, withReceipt ? "consumed" : "accepted", withReceipt ? "origin-step" : null)
   const rest = Array.from({ length: count - 1 }, (_, index) => acceptedRow(index + 1, index % 2 ? "queued" : "accepted"))
-  const inputs = [rootInput(), first, ...rest]
+  const inputs: AcceptedInputFixture[] = [rootInput(), first, ...rest]
   const sourceStep = { id: "origin-step", taskId: scope.rootTaskId, ordinal: 0, attempt: 1, status: "completed",
     inputThroughSequence: first.acceptedSequence, consumedInputIds: [first.id] }
   const decisionStep = { id: "decision-step", taskId: scope.rootTaskId, ordinal: 1, attempt: 1, status: "streaming",
@@ -407,7 +409,9 @@ describe("steer acceptance capacity", () => {
       .rejects.toMatchObject({ code: "invalid_command", status: 409 })
 
     const missingEvent = facts(1)
-    delete missingEvent.inputs[1]!.acceptedEventId
+    const { acceptedEventId: omittedEventId, ...withoutAcceptedEventId } = missingEvent.inputs[1]!
+    expect(omittedEventId).toBe("event-0")
+    missingEvent.inputs[1] = withoutAcceptedEventId
     await expect(readUnresolvedSteeringCount(missingEvent.tx, { sessionId: scope.sessionId, userId: scope.userId, turnId: scope.turnId }))
       .rejects.toMatchObject({ code: "invalid_command", status: 409 })
 
