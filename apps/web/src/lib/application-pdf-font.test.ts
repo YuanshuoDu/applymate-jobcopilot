@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
+import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import React from 'react'
 import { Font, renderToBuffer } from '@react-pdf/renderer'
-import pdfParse from 'pdf-parse'
 import { describe, expect, it } from 'vitest'
 import { CoverLetterDoc } from '@/components/resume/templates/cover-letter/CoverLetterFrame'
 import { renderCoverLetterDoc } from './cover-letter-pdf'
@@ -13,12 +14,13 @@ import { assertApplicationPdfTextSupported, isApplicationPdfCharacterSupported, 
 import { isApplicationPdfUnsupportedCharactersError } from './application-pdf-errors'
 import type { Resume } from './types'
 
-// PDF.js in pdf-parse can misread pooled Buffers with nonzero byte offsets.
+// Isolate the legacy PDF.js parser from the renderer's process state. A failed
+// parse remains a test failure; this deliberately does not retry or skip it.
 async function pdfText(doc: React.ReactElement): Promise<string> {
   const bytes = await renderToBuffer(doc as never)
-  const exact = Buffer.alloc(bytes.length)
-  bytes.copy(exact)
-  return (await pdfParse(exact, { version: 'v2.0.550' })).text
+  const parser = createRequire(resolve('package.json')).resolve('pdf-parse')
+  const script = `const fs=require('node:fs');const parse=require(process.argv[1]);const raw=fs.readFileSync(0);const exact=Buffer.alloc(raw.length);raw.copy(exact);parse(exact,{version:'v2.0.550'}).then(result=>process.stdout.write(result.text)).catch(error=>{console.error(error);process.exitCode=1})`
+  return execFileSync(process.execPath, ['-e', script, parser], { input: bytes, encoding: 'utf8' })
 }
 
 const multilingual = '测试姓名 多语言经历 — Résumé Łódź Česko Ελληνικά Україна'
