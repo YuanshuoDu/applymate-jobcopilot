@@ -16,7 +16,9 @@ Agent 负责原任务的执行和审批，招聘消息负责查看回复。
 
 1. 在“发现职位”搜索，保存后点击“查看此申请”。保存不会提交申请。
 2. 在申请详情选择基础简历并“准备申请材料”。已有材料继续复用。准备过程中，
-   如果需要事实补充或内容修正，先查看具体问题，只填写真实情况。
+   如果审核指出缺少事实依据，先查看具体问题：可进入本职位材料编辑器，
+   移除或弱化无法支持的表述；希望跨职位复用的真实事实，可自行添加到个人资料。
+   本职位专属的新依据目前不能单独保存，编辑后仍需重新检查，不能保证审核通过。
 3. 需要手动修改时，展开简历卡并“编辑此简历”。完成保存后“返回此申请”，
    系统恢复原职位和列表条件。查看、返回或刷新不会启动 AI 匹配分析；需要时在
    简历页主动点击“分析匹配度”，简历加载或刷新时请等待完成后再操作。
@@ -127,6 +129,12 @@ The detail drawer follows this order:
 3. Current next action or the original task's status and session link.
 4. Resume, optional cover letter and check details, with editors as secondary actions.
 5. Application method, manual record action, job information and activity history.
+
+The audit evidence card does not store its answer in the shared Persona or submit
+a job-specific answer. The existing audit accepts only a source resume and shared
+profile facts, not per-job evidence. Users can edit the application materials or
+remove/soften unsupported claims; only facts intended for reuse belong in the
+profile. Job-scoped evidence storage and audit support remain a separate follow-up.
 
 Preparation actions use the existing endpoints. They reuse selected documents
 and target only existing flagged corrections. A confirmed resume-only package

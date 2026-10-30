@@ -531,9 +531,6 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   const [coverLetterSelectionNeeded, setCoverLetterSelectionNeeded] = useState(false)
   const [latestAudit, setLatestAudit] = useState<ApplicationAudit | null>(null)
   const [documentPreview, setDocumentPreview] = useState<'resume' | 'coverLetter' | null>(null)
-  const [evidenceFinding, setEvidenceFinding] = useState<ApplicationAuditFinding | null>(null)
-  const [evidenceText, setEvidenceText] = useState('')
-  const [savingEvidence, setSavingEvidence] = useState(false)
   const manualWorkAllowed = applicationTaskAllowsManualWork(task)
   const { data: coverLetters, refetch: refetchCoverLetters } = useApi<CoverLetter[]>(`/api/jobs/${job.id}/cover-letters`)
   // The audit route is the canonical source because the activity feed is
@@ -561,7 +558,6 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     if (nestedOriginRef.current?.isConnected) nestedOriginRef.current.focus()
   })
   const closePreview = () => { setDocumentPreview(null); restoreNestedFocus() }
-  const closeEvidence = () => { if (!savingEvidence) { setEvidenceFinding(null); restoreNestedFocus() } }
   const rememberNestedOrigin = () => { nestedOriginRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null }
 
   useEffect(() => {
@@ -573,7 +569,6 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
         event.preventDefault()
         event.stopPropagation()
         if (confirmDialog) { confirmDialog.querySelector<HTMLButtonElement>('button')?.click(); restoreNestedFocus() }
-        else if (evidenceFinding) closeEvidence()
         else if (documentPreview) closePreview()
         else onClose()
       } else if (event.key === 'Tab' && activeDialog) {
@@ -586,7 +581,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     }
     document.addEventListener('keydown', handleKey, true)
     return () => document.removeEventListener('keydown', handleKey, true)
-  }, [documentPreview, evidenceFinding, savingEvidence, onClose])
+  }, [documentPreview, onClose])
 
   // Load per-job activity on mount; reset interview prep when job changes
   useEffect(() => {
@@ -641,6 +636,13 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
       .catch(() => { if (!controller.signal.aborted) setResumePreview(null) })
     return () => controller.abort()
   }, [previewResumeId])
+
+  // Only open a resume read for this account and this application. A newly
+  // tailored resume can precede final selection, but must target this job.
+  const evidenceResumeId = resumePreview && previewResumeId === resumePreview.id
+    && drawerUserId && (resumePreview as Resume & { userId?: unknown }).userId === drawerUserId && job.userId === drawerUserId
+    && (job.finalResumeId === resumePreview.id || (!job.finalResumeId && resumePreview.targetJobId === job.id))
+    ? resumePreview.id : null
 
   // Once a package has been confirmed, every surface must show the exact
   // resume/letter pair that is exported. Do not let an in-memory draft letter
@@ -738,7 +740,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     }
   }
 
-  async function autoTailorAndAudit(evidenceRepairs: ApplicationAuditFinding[] = []) {
+  async function autoTailorAndAudit() {
     const owner = drawerUserIdRef.current
     if (!owner || !isCurrentDrawer(owner) || job.userId !== owner) return
     if (preparationInFlight.current || !manualWorkAllowed || taskReadState !== 'ready') return
@@ -752,11 +754,9 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     }
     const resumeRepairs = [
       ...(auditNeedsRepair ? factualAuditFindings.filter(finding => finding.area === 'resume') : []),
-      ...evidenceRepairs.filter(finding => finding.area === 'resume'),
     ]
     const coverLetterRepairs = [
       ...(auditNeedsRepair ? factualAuditFindings.filter(finding => finding.area === 'cover_letter') : []),
-      ...evidenceRepairs.filter(finding => finding.area === 'cover_letter'),
     ]
     if (coverLetterRepairs.length && !job.finalCoverLetterId) {
       setCoverLetterSelectionNeeded(true)
@@ -860,27 +860,6 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     } finally {
       preparationInFlight.current = false
       if (isCurrentDrawer(owner)) { setAutoPreparing(false); setPreparationStartedAt(null) }
-    }
-  }
-
-  async function saveEvidenceAndRewrite() {
-    if (!evidenceFinding || !evidenceText.trim() || !manualWorkAllowed || taskReadState !== 'ready') return
-    setSavingEvidence(true)
-    try {
-      const key = `audit_evidence_${Date.now()}`
-      const { error } = await apiMutate('/api/me/persona/fields', 'POST', {
-        fields: [{ key, category: 'work', label: `Audit evidence: ${evidenceFinding.title}`.slice(0, 120), value: evidenceText.trim(), confidence: 1, source: 'user_confirmed_audit' }],
-      })
-      if (error) throw new Error(error)
-      const finding = evidenceFinding
-      setEvidenceFinding(null)
-      setEvidenceText('')
-      toast.success('Evidence saved to Persona', 'AI is rewriting only the affected application content.')
-      await autoTailorAndAudit([finding])
-    } catch (error) {
-      toast.error('Could not save evidence', error instanceof Error ? error.message : 'Please try again')
-    } finally {
-      setSavingEvidence(false)
     }
   }
 
@@ -1016,7 +995,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
               {!job.finalCoverLetterId && previewResumeId && <Btn variant="ghost" small onClick={() => onOpenTailoredResume(previewResumeId)}>{t('application.coverLetterSelect')}</Btn>}
             </PackRow>
             <div ref={auditSectionRef}><PackRow last number="3" title={t('jobs.pack.audit')} detail={packStage === 'audit' ? t('jobs.pack.checkingChanges') : auditRetryOnly ? t('jobs.pack.retryResponse') : auditNeedsEvidence ? `${evidenceGapFindings.length} ${t('jobs.auditFactsCount')}` : auditNeedsRepair ? `${factualAuditFindings.length} ${t('jobs.auditIssuesCount')}` : displayedAudit ? t('jobs.pack.verifiedFacts') : t('jobs.pack.readyRun')} done={currentPackAudited} failed={auditNeedsRepair || auditNeedsEvidence || auditRetryOnly} active={packStage === 'audit'} open={openPackItem === 'audit'} onToggle={() => setOpenPackItem(current => current === 'audit' ? null : 'audit')}>
-              <AuditPackPreview audit={displayedAudit} onRepair={() => void autoTailorAndAudit()} onAddEvidence={finding => { rememberNestedOrigin(); setEvidenceFinding(finding); setEvidenceText('') }} repairing={autoPreparing || !manualWorkAllowed || taskReadState !== 'ready'} />
+              <AuditPackPreview audit={displayedAudit} onRepair={() => void autoTailorAndAudit()} onReviewEvidence={() => { if (evidenceResumeId) onOpenTailoredResume(evidenceResumeId) }} canReviewEvidence={Boolean(evidenceResumeId)} repairing={autoPreparing || !manualWorkAllowed || taskReadState !== 'ready'} />
             </PackRow></div>
             {currentPackAudited && <button onClick={() => void downloadFinalPack()} disabled={downloadingPack} style={{ width: '100%', minHeight: 46, border: 0, borderRadius: 9, background: '#2563eb', color: '#fff', fontWeight: 700, cursor: 'pointer' }}>{downloadingPack ? t('application.downloadingZip') : t('application.downloadZip')}</button>}
             <div style={{ borderTop: '1px solid var(--border)', paddingTop: 16 }}>
@@ -1226,7 +1205,6 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
 
         {documentPreview === 'resume' && resumePreview && <DocumentPreviewModal title={resumePreview.name} onClose={closePreview}><ResumeRenderer content={resumePreview.content} templateId={resumePreview.templateId} templateOptions={resumePreview.templateOptions} /></DocumentPreviewModal>}
         {documentPreview === 'coverLetter' && selectedCoverLetter && <DocumentPreviewModal title={t('jobs.coverLetterPreview')} onClose={closePreview}><CoverLetterPreview content={selectedCoverLetter.content} applicant={resumePreview?.content.contact} fallbackName={resumePreview?.name ?? 'Applicant'} company={job.company} role={job.role} templateId={resumePreview?.templateId ?? selectedCoverLetter.templateId ?? 'clean'} templateOptions={resumePreview?.templateOptions ?? selectedCoverLetter.templateOptions ?? {}} /></DocumentPreviewModal>}
-        {evidenceFinding && <EvidenceCaptureModal finding={evidenceFinding} value={evidenceText} saving={savingEvidence} onChange={setEvidenceText} onClose={closeEvidence} onSave={() => void saveEvidenceAndRewrite()} />}
 
         {/* Footer */}
         <div style={{ padding: '12px 18px', borderTop: '0.5px solid var(--border)', display: 'flex', gap: 8 }}>
@@ -1333,20 +1311,7 @@ function DocumentPreviewModal({ title, onClose, children }: { title: string; onC
   </div>
 }
 
-function EvidenceCaptureModal({ finding, value, saving, onChange, onClose, onSave }: { finding: ApplicationAuditFinding; value: string; saving: boolean; onChange: (value: string) => void; onClose: () => void; onSave: () => void }) {
-  const { t } = useI18n()
-  return <div data-application-nested role="dialog" aria-modal="true" aria-label={t('jobs.evidence.title')} style={{ position: 'fixed', inset: 0, zIndex: 140, display: 'grid', placeItems: 'center', padding: 24, background: 'rgba(15,23,42,.62)' }} onMouseDown={onClose}>
-    <div style={{ width: 'min(560px, calc(100vw - 40px))', padding: 22, borderRadius: 14, background: '#fff', boxShadow: '0 24px 80px rgba(15,23,42,.42)' }} onMouseDown={event => event.stopPropagation()}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16 }}><div><div style={{ fontSize: 17, fontWeight: 750, color: '#0f172a' }}>{t('jobs.evidence.title')}</div><div style={{ marginTop: 5, fontSize: 13, lineHeight: 1.5, color: '#64748b' }}>{t('jobs.evidence.description')}</div></div><button onClick={onClose} disabled={saving} aria-label={t('jobs.evidence.close')} style={{ alignSelf: 'start', border: 0, background: 'transparent', color: '#475569', cursor: 'pointer' }}><X size={20} /></button></div>
-      <div style={{ marginTop: 16, padding: '10px 12px', borderLeft: '3px solid #d97706', background: '#fffbeb', fontSize: 12, lineHeight: 1.5, color: '#475569' }}><strong style={{ color: '#92400e' }}>{finding.title}</strong><br />{finding.evidence}</div>
-      <label style={{ display: 'block', marginTop: 16, fontSize: 13, fontWeight: 700, color: '#1e293b' }}>{t('jobs.evidence.question')}<textarea value={value} onChange={event => onChange(event.target.value)} placeholder={t('jobs.evidence.example')} autoFocus style={{ display: 'block', width: '100%', minHeight: 116, marginTop: 7, padding: 10, resize: 'vertical', border: '1px solid #cbd5e1', borderRadius: 8, color: '#0f172a', font: 'inherit', fontSize: 13, lineHeight: 1.5 }} /></label>
-      <div style={{ marginTop: 8, fontSize: 11, lineHeight: 1.45, color: '#64748b' }}>{t('jobs.evidence.privacy')}</div>
-      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 18 }}><button onClick={onClose} disabled={saving} style={{ border: '1px solid #cbd5e1', borderRadius: 8, padding: '8px 12px', background: '#fff', color: '#475569', fontWeight: 700, cursor: 'pointer' }}>{t('jobs.evidence.cancel')}</button><button onClick={onSave} disabled={saving || !value.trim()} style={{ border: 0, borderRadius: 8, padding: '8px 12px', background: saving || !value.trim() ? '#93c5fd' : '#2563eb', color: '#fff', fontWeight: 700, cursor: saving || !value.trim() ? 'default' : 'pointer' }}>{saving ? t('jobs.evidence.saving') : t('jobs.evidence.save')}</button></div>
-    </div>
-  </div>
-}
-
-function AuditPackPreview({ audit, onRepair, onAddEvidence, repairing }: { audit: ApplicationAudit | null; onRepair: () => void; onAddEvidence: (finding: ApplicationAuditFinding) => void; repairing: boolean }) {
+function AuditPackPreview({ audit, onRepair, onReviewEvidence, canReviewEvidence, repairing }: { audit: ApplicationAudit | null; onRepair: () => void; onReviewEvidence: () => void; canReviewEvidence: boolean; repairing: boolean }) {
   const { t } = useI18n()
   if (!audit) return <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>{t('jobs.auditNoResult')}</div>
   const retryOnly = audit.findings.some(finding => finding.title === 'Audit response needs retry')
@@ -1354,7 +1319,7 @@ function AuditPackPreview({ audit, onRepair, onAddEvidence, repairing }: { audit
   const issues = audit.findings.filter(finding => finding.area !== 'job_match' && finding.severity !== 'pass' && finding.resolution !== 'evidence_needed')
   const passed = audit.findings.filter(finding => finding.severity === 'pass').length
   const verdict = audit.verdict === 'pass' ? t('jobs.auditPassed') : retryOnly ? t('jobs.auditRetryNeeded') : evidenceGaps.length ? `${evidenceGaps.length} ${t('jobs.auditFactsNeedConfirmation')}` : `${issues.length} ${t('jobs.auditIssuesNeedCorrection')}`
-  return <div><div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, fontSize: 13, fontWeight: 700 }}><span>{verdict}</span><span style={{ color: audit.verdict === 'pass' ? '#3b8c1a' : audit.verdict === 'blocked' ? '#b42318' : '#a16207', whiteSpace: 'nowrap' }}>{t('jobs.roleMatch')} {audit.matchScore}%</span></div>{evidenceGaps.length > 0 && <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>{evidenceGaps.map((finding, index) => <div key={`${finding.title}-${index}`} style={{ padding: '10px', borderLeft: '3px solid #2563eb', background: '#f8fbff', fontSize: 12, lineHeight: 1.45 }}><strong style={{ color: '#1d4ed8' }}>{t('jobs.evidenceNeeded')} · {finding.title}</strong><div style={{ marginTop: 3, color: '#475569' }}>{finding.action}</div><button onClick={() => onAddEvidence(finding)} disabled={repairing} style={{ marginTop: 8, border: '1px solid #2563eb', borderRadius: 7, padding: '6px 8px', background: '#fff', color: '#2563eb', fontWeight: 700, cursor: 'pointer' }}>{t('jobs.addEvidenceRewrite')}</button></div>)}</div>}{issues.length > 0 && <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>{issues.map((finding, index) => <div key={`${finding.title}-${index}`} style={{ padding: '9px 10px', borderLeft: `3px solid ${finding.severity === 'critical' ? '#dc2626' : '#d97706'}`, background: finding.severity === 'critical' ? '#fff7f7' : '#fffbeb', fontSize: 12, lineHeight: 1.45 }}><strong style={{ color: finding.severity === 'critical' ? '#b42318' : '#a16207' }}>{finding.title}</strong><div style={{ color: '#475569', marginTop: 3 }}>{finding.action}</div></div>)}</div>}{retryOnly && <div style={{ marginTop: 10, fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{audit.summary}</div>}{passed > 0 && <div style={{ marginTop: 10, color: '#3b8c1a', fontSize: 12 }}>{passed} {t('jobs.supportedChecks')}</div>}{issues.length > 0 && <button onClick={onRepair} disabled={repairing} style={{ marginTop: 12, border: '1px solid #dc2626', background: '#fff', color: '#b42318', borderRadius: 7, padding: '8px 10px', fontWeight: 700, cursor: 'pointer' }}>{repairing ? t('jobs.correctReaudit') : t('jobs.fixReaudit')}</button>}{retryOnly && <button onClick={onRepair} disabled={repairing} style={{ marginTop: 12, border: '1px solid #2563eb', background: '#fff', color: '#2563eb', borderRadius: 7, padding: '8px 10px', fontWeight: 700, cursor: 'pointer' }}>{repairing ? t('jobs.retryingAudit') : t('jobs.retryAuditButton')}</button>}</div>
+  return <div><div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, fontSize: 13, fontWeight: 700 }}><span>{verdict}</span><span style={{ color: audit.verdict === 'pass' ? '#3b8c1a' : audit.verdict === 'blocked' ? '#b42318' : '#a16207', whiteSpace: 'nowrap' }}>{t('jobs.roleMatch')} {audit.matchScore}%</span></div>{evidenceGaps.length > 0 && <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>{evidenceGaps.map((finding, index) => <div key={`${finding.title}-${index}`} style={{ padding: '10px', borderLeft: '3px solid #2563eb', background: '#f8fbff', fontSize: 12, lineHeight: 1.45 }}><strong style={{ color: '#1d4ed8' }}>{t('jobs.evidenceNeeded')} · {finding.title}</strong><div style={{ marginTop: 3, color: '#475569' }}><strong>{t('resume.auditEvidenceLabel')}: </strong>{finding.evidence}</div><div style={{ marginTop: 3, color: '#475569' }}>{finding.action}</div><p style={{ margin: '6px 0', color: '#475569' }}>{t('application.scopedEvidenceGuidance')}</p>{!canReviewEvidence && <p role="status" style={{ margin: '6px 0', color: '#475569' }}>{t('application.scopedEvidenceNoResume')}</p>}<button onClick={onReviewEvidence} disabled={repairing || !canReviewEvidence} style={{ marginTop: 8, border: '1px solid #2563eb', borderRadius: 7, padding: '6px 8px', background: '#fff', color: '#2563eb', fontWeight: 700, cursor: 'pointer' }}>{t('application.editResume')}</button></div>)}</div>}{issues.length > 0 && <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>{issues.map((finding, index) => <div key={`${finding.title}-${index}`} style={{ padding: '9px 10px', borderLeft: `3px solid ${finding.severity === 'critical' ? '#dc2626' : '#d97706'}`, background: finding.severity === 'critical' ? '#fff7f7' : '#fffbeb', fontSize: 12, lineHeight: 1.45 }}><strong style={{ color: finding.severity === 'critical' ? '#b42318' : '#a16207' }}>{finding.title}</strong><div style={{ color: '#475569', marginTop: 3 }}>{finding.action}</div></div>)}</div>}{retryOnly && <div style={{ marginTop: 10, fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{audit.summary}</div>}{passed > 0 && <div style={{ marginTop: 10, color: '#3b8c1a', fontSize: 12 }}>{passed} {t('jobs.supportedChecks')}</div>}{issues.length > 0 && <button onClick={onRepair} disabled={repairing} style={{ marginTop: 12, border: '1px solid #dc2626', background: '#fff', color: '#b42318', borderRadius: 7, padding: '8px 10px', fontWeight: 700, cursor: 'pointer' }}>{repairing ? t('jobs.correctReaudit') : t('jobs.fixReaudit')}</button>}{retryOnly && <button onClick={onRepair} disabled={repairing} style={{ marginTop: 12, border: '1px solid #2563eb', background: '#fff', color: '#2563eb', borderRadius: 7, padding: '8px 10px', fontWeight: 700, cursor: 'pointer' }}>{repairing ? t('jobs.retryingAudit') : t('jobs.retryAuditButton')}</button>}</div>
 }
 
 function JobDetail({ label, value, href }: { label: string; value: string; href?: string }) {
