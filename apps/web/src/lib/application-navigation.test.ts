@@ -42,6 +42,15 @@ describe('application navigation', () => {
     expect(url.searchParams.get('custom')).toBe('keep')
   })
 
+  it.each(['job', 'attention', 'session'])('notifies the router of %s navigation while retaining application history state', async kind => {
+    Object.defineProperty(window.history, 'state', { value: { __NA: true, _N: true, saved: true }, configurable: true })
+    if (kind === 'job') await openApplication('job-42', navigate)
+    else if (kind === 'attention') await openApplicationAttention(navigate)
+    else await openApplicationSession('session-42', navigate)
+    const written = replaceState.mock.calls.at(-1)?.[0]
+    expect(written).toEqual({ saved: true })
+  })
+
   it('opens an existing session without creating an application or keeping a stale job selection', async () => {
     href += '&unused' // the hash is preserved verbatim too
     const current = new URL(href)

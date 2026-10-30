@@ -21,7 +21,14 @@ test('real credentials save a discovered job to the correct account', async ({ b
   const first = await browser.newContext()
   const page = await first.newPage()
   const requests: string[] = []
+  const jobReads: { path: string; status: number }[] = []
   page.on('request', request => requests.push(`${request.method()} ${new URL(request.url()).pathname}`))
+  page.on('response', response => {
+    const url = new URL(response.url())
+    if (response.request().method() === 'GET' && /^\/api\/jobs\/[^/]+$/.test(url.pathname)) {
+      jobReads.push({ path: url.pathname, status: response.status() })
+    }
+  })
   await page.route('**/*', async route => {
     const url = new URL(route.request().url())
     if (url.origin !== origin) return route.abort()
@@ -46,7 +53,12 @@ test('real credentials save a discovered job to the correct account', async ({ b
   const view = page.getByRole('button', { name: /View this application|查看此申请/ }).first()
   await expect(view).toBeVisible()
   await view.click()
-  await expect(page).toHaveURL(new RegExp(`highlight=${job.id}`))
+  try {
+    await expect(page).toHaveURL(new RegExp(`highlight=${job.id}`))
+  } catch (error) {
+    console.error('Fixture navigation diagnostics:', JSON.stringify({ currentUrl: page.url(), jobReads }))
+    throw error
+  }
   await expect(page.getByRole('dialog')).toContainText(fixture.title)
   await expect(page.getByRole('dialog')).toContainText(fixture.company)
   await page.reload()

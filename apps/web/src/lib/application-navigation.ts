@@ -17,6 +17,15 @@ function clearResumeContext(url: URL) {
   for (const key of ['resumeId', 'returnToJobs', 'returnJobId']) url.searchParams.delete(key)
 }
 
+/** Let Next's history wrapper observe app-owned URL changes while retaining caller state. */
+export function replaceApplicationHistory(url: string): void {
+  const previous: unknown = window.history.state
+  const state: Record<string, unknown> = previous && typeof previous === 'object' ? { ...previous } : {}
+  delete state.__NA
+  delete state._N
+  window.history.replaceState(state, '', url)
+}
+
 /** Keep the Applications list context while selecting one exact job. */
 export function applicationUrl(currentHref: string, jobId: string): string {
   const url = new URL(currentHref)
@@ -28,7 +37,7 @@ export function applicationUrl(currentHref: string, jobId: string): string {
 export async function openApplication(jobId: string, navigate: Navigate): Promise<boolean> {
   if (!jobId.trim()) return false
   if ((await navigate('jobs')) === false) return false
-  window.history.replaceState(window.history.state, '', applicationUrl(window.location.href, jobId))
+  replaceApplicationHistory(applicationUrl(window.location.href, jobId))
   notifyApplicationNavigation()
   return true
 }
@@ -40,7 +49,7 @@ export async function openApplicationAttention(navigate: Navigate): Promise<bool
   clearResumeContext(url)
   url.searchParams.delete('highlight')
   url.searchParams.set('jobsAttention', '1')
-  window.history.replaceState(window.history.state, '', url.toString())
+  replaceApplicationHistory(url.toString())
   notifyApplicationNavigation()
   return true
 }
@@ -53,7 +62,7 @@ export async function openApplicationSession(sessionId: string, navigate: Naviga
   clearResumeContext(url)
   url.searchParams.delete('highlight')
   url.searchParams.set('sessionId', sessionId)
-  window.history.replaceState(window.history.state, '', url.toString())
+  replaceApplicationHistory(url.toString())
   notifyApplicationNavigation()
   return true
 }
