@@ -61,7 +61,12 @@ async function inspectTurn(sessionId, turnId) {
   const events = await pool.query(`SELECT "type" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "sequence"`, [sessionId, turnId])
   const steps = await pool.query(`SELECT "status", "errorCode", "finishReason" FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "ordinal", "attempt"`, [sessionId, turnId])
   const tasks = await pool.query(`SELECT "status", "failureReason" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "createdAt"`, [sessionId, turnId])
-  return { turn: row, questions: items.rows, eventTypes: events.rows.map(event => event.type), steps: steps.rows, tasks: tasks.rows }
+  const toolResults = await pool.query(`SELECT COUNT(*)::int AS count,
+    BOOL_OR("content"->'output'->>'question' = '[REDACTED]') AS "questionRedacted"
+    FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'tool_result'
+      AND "content"->>'toolCallId' = 'fixture-native-question'`, [sessionId, turnId])
+  return { turn: row, questions: items.rows, eventTypes: events.rows.map(event => event.type), steps: steps.rows, tasks: tasks.rows,
+    toolResultCount: toolResults.rows[0].count, toolResultQuestionRedacted: toolResults.rows[0].questionRedacted }
 }
 
 module.exports = { initializeFixtureSse, inspectTurn, closeFixtureDb: () => pool.end() }

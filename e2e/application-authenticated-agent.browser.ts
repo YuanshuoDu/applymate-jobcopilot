@@ -23,7 +23,7 @@ test('synthetic native question resumes the actual authenticated turn', async ({
   const requireFixture = createRequire(path.resolve('e2e/application-authenticated-agent.browser.ts'))
   const { initializeFixtureSse, inspectTurn, closeFixtureDb } = requireFixture('./application-authenticated-agent-db.cjs') as {
     initializeFixtureSse: () => Promise<void>
-    inspectTurn: (sessionId: string, turnId: string) => Promise<{ turn: { status: string; error: string | null; completedEvents: number; answeredEvents: number; finalResponse: string | null }; questions: { id: string; status: string; content: { questionId?: string; question?: string; answer?: string | null; toolCallId?: string } }[]; eventTypes: string[]; steps: { status: string; errorCode: string | null; finishReason: string | null }[]; tasks: { status: string; failureReason: string | null }[] }>
+    inspectTurn: (sessionId: string, turnId: string) => Promise<{ turn: { status: string; error: string | null; completedEvents: number; answeredEvents: number; finalResponse: string | null }; questions: { id: string; status: string; content: { questionId?: string; question?: string; answer?: string | null; toolCallId?: string } }[]; eventTypes: string[]; steps: { status: string; errorCode: string | null; finishReason: string | null }[]; tasks: { status: string; failureReason: string | null }[]; toolResultCount: number; toolResultQuestionRedacted: boolean | null }>
     closeFixtureDb: () => Promise<void>
   }
   try {
@@ -80,6 +80,7 @@ test('synthetic native question resumes the actual authenticated turn', async ({
         ? value : value ? 'present-but-omitted' : null
       console.error('Synthetic turn diagnostic', JSON.stringify({ status: diagnostic.turn.status, errorCode: safeCode(diagnostic.turn.error),
         questionCount: diagnostic.questions.length, eventTypes: diagnostic.eventTypes,
+        toolResultCount: diagnostic.toolResultCount, toolResultQuestionRedacted: diagnostic.toolResultQuestionRedacted,
         steps: diagnostic.steps.map(step => ({ status: step.status, errorCode: safeCode(step.errorCode), finishReason: safeCode(step.finishReason) })),
         tasks: diagnostic.tasks.map(task => ({ status: task.status, failureReason: safeCode(task.failureReason) })) }))
       throw error
