@@ -1,7 +1,7 @@
 'use client'
 
 import { isApplicationPdfUnsupportedCharactersError } from '@/lib/application-pdf-errors'
-import React, { useMemo, useState, useEffect, useRef, useCallback } from 'react'
+import React, { useMemo, useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react'
 import { useSession } from 'next-auth/react'
 import { AlertCircle, Bookmark, Check, ChevronDown, ChevronRight, FileText, Info, LayoutGrid, Link2, List, LoaderCircle, Lock, Search, Sparkles, Trash2, UsersRound, X } from 'lucide-react'
 import { Btn, Card, CompanyLogo, INPUT_STYLE, ScorePill, StatusBadge, useToast, useConfirm } from '@/components/ui'
@@ -29,6 +29,44 @@ import { clearManualRecordLock, readManualRecordLock, writeManualRecordLock, typ
 import { openApplication, openApplicationSession } from '@/lib/application-navigation'
 
 const KANBAN_COLS: JobStatus[] = ['saved', 'applied', 'interview', 'offer', 'rejected']
+type DescriptionDraft = { text: string; revision: number; uncertain: boolean }
+const descriptionDrafts = new Map<string, DescriptionDraft>()
+let descriptionUnloadAttached = false
+function protectDescriptionDrafts(event: BeforeUnloadEvent) { event.preventDefault(); event.returnValue = '' }
+function updateDescriptionDraft(key: string, draft: DescriptionDraft | null) {
+  if (draft) descriptionDrafts.set(key, draft); else descriptionDrafts.delete(key)
+  if (typeof window === 'undefined') return
+  if (descriptionDrafts.size && !descriptionUnloadAttached) { window.addEventListener('beforeunload', protectDescriptionDrafts); descriptionUnloadAttached = true }
+  if (!descriptionDrafts.size && descriptionUnloadAttached) { window.removeEventListener('beforeunload', protectDescriptionDrafts); descriptionUnloadAttached = false }
+}
+
+async function readDescriptionScope(path: string): Promise<{ ok: boolean; data: unknown }> {
+  const controller = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      fetch(path, { signal: controller.signal, cache: 'no-store' }).then(async response => ({ ok: response.ok, data: await response.json() as unknown })).catch(() => ({ ok: false, data: null })),
+      new Promise<{ ok: boolean; data: null }>(resolve => { timer = setTimeout(() => { controller.abort(); resolve({ ok: false, data: null }) }, 30_000) }),
+    ])
+  } finally { if (timer) clearTimeout(timer) }
+}
+
+type DescriptionSaveResult = { kind: 'saved'; data: unknown } | { kind: 'conflict' | 'unconfirmed' }
+async function saveDescriptionRequest(jobId: string, text: string, expectedEmptyDescription: string | null): Promise<DescriptionSaveResult> {
+  const controller = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      fetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
+        method: 'PATCH', signal: controller.signal, headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ description: text, expectedEmptyDescription }),
+      }).then(async response => response.status === 409 ? { kind: 'conflict' as const }
+        : response.ok ? { kind: 'saved' as const, data: await response.json() as unknown }
+        : { kind: 'unconfirmed' as const }).catch(() => ({ kind: 'unconfirmed' as const })),
+      new Promise<DescriptionSaveResult>(resolve => { timer = setTimeout(() => { controller.abort(); resolve({ kind: 'unconfirmed' }) }, 30_000) }),
+    ])
+  } finally { if (timer) clearTimeout(timer) }
+}
 // Validate the fields directly used by this preview; nested section entries
 // still follow the existing resume contract and are not exhaustively checked.
 function isUsableResumePayload(value: unknown): value is Resume & { userId: string } {
@@ -480,7 +518,7 @@ function AddJobModal({ onClose, onAdded, prefillStatus }: {
 }
 
 // ── JobDetailDrawer ───────────────────────────────────────────────────────────
-function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, onStatusChange, onUpdate, onDelete, onOpenTailoredResume }: {
+function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, onStatusChange, onUpdate, onDescriptionUpdate, onJobFieldsUpdate, onDelete, onOpenTailoredResume }: {
   job:            Job
   task?: ApplicationTaskView
   taskReadState: 'loading' | 'unavailable' | 'limited' | 'ready'
@@ -488,6 +526,8 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   onClose:        () => void
   onStatusChange: (id: string, status: JobStatus) => void
   onUpdate:       (updated: Job) => void
+  onDescriptionUpdate: (userId: string, jobId: string, description: string) => void
+  onJobFieldsUpdate: (userId: string, jobId: string, fields: { notes: string | null } | { followUpAt: string | null }) => void
   onDelete:       (id: string) => void
   onOpenTailoredResume: (resumeId: string) => void
 }) {
@@ -500,8 +540,18 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   const drawerJobIdRef = useRef(job.id)
   drawerJobIdRef.current = job.id
   const drawerMountedRef = useRef(true)
-  useEffect(() => { drawerMountedRef.current = true; return () => { drawerMountedRef.current = false } }, [])
+  useLayoutEffect(() => { drawerMountedRef.current = true; return () => { drawerMountedRef.current = false } }, [])
   const isCurrentDrawer = (userId: string) => drawerMountedRef.current && drawerUserIdRef.current === userId
+  const descriptionKey = drawerUserId && job.userId === drawerUserId ? JSON.stringify([drawerUserId, job.id]) : null
+  const [descriptionDraft, setDescriptionDraft] = useState<DescriptionDraft | null>(() => descriptionKey ? descriptionDrafts.get(descriptionKey) ?? null : null)
+  const [descriptionEditorOpen, setDescriptionEditorOpen] = useState(Boolean(descriptionDraft))
+  const [descriptionSaving, setDescriptionSaving] = useState(false)
+  const [descriptionNotice, setDescriptionNotice] = useState<string | null>(null)
+  const descriptionSavingRef = useRef(false)
+  const descriptionTaskRef = useRef({ allowed: false })
+  descriptionTaskRef.current = { allowed: taskReadState === 'ready' && applicationTaskAllowsManualWork(task) }
+  const descriptionJobRef = useRef(job)
+  descriptionJobRef.current = job
   const auditSectionRef = useRef<HTMLDivElement>(null)
   const drawerRef = useRef<HTMLDivElement>(null)
   const drawerCloseRef = useRef<HTMLButtonElement>(null)
@@ -716,25 +766,114 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   const auditNeedsRepair = factualAuditFindings.length > 0 && !auditRetryOnly
   const auditNeedsEvidence = evidenceGapFindings.length > 0 && !auditRetryOnly
 
+  function changeDescriptionDraft(text: string) {
+    if (!descriptionKey || descriptionSavingRef.current || descriptionDraft?.uncertain) return
+    const draft = text ? { text, revision: (descriptionDrafts.get(descriptionKey)?.revision ?? 0) + 1, uncertain: false } : null
+    updateDescriptionDraft(descriptionKey, draft)
+    setDescriptionDraft(draft)
+    setDescriptionNotice(null)
+  }
+
+  async function saveMissingDescription() {
+    const owner = drawerUserIdRef.current
+    const draft = descriptionKey ? descriptionDrafts.get(descriptionKey) : null
+    if (!owner || !descriptionKey || !draft?.text.trim() || draft.uncertain || descriptionSavingRef.current
+      || !isCurrentDrawer(owner) || job.userId !== owner || !descriptionTaskRef.current.allowed || descriptionJobRef.current.description?.trim()) return
+    descriptionSavingRef.current = true
+    setDescriptionSaving(true)
+    setDescriptionNotice(null)
+    const current = () => isCurrentDrawer(owner) && drawerJobIdRef.current === job.id
+    try {
+      const audit = await readDescriptionScope(`/api/jobs/${encodeURIComponent(job.id)}/audit-application`)
+      if (!current()) return
+      if (!audit.ok) { setDescriptionNotice('application.descriptionCheckFailed'); return }
+      if (audit.data !== null) { setDescriptionNotice('application.descriptionAuditBlocked'); return }
+      const result = await readDescriptionScope(`/api/jobs/${encodeURIComponent(job.id)}`)
+      if (!current()) return
+      const latest = result.data as Job | null
+      if (!result.ok || !latest || latest.id !== job.id || latest.userId !== owner) { setDescriptionNotice('application.descriptionCheckFailed'); return }
+      if (latest.description?.trim()) { onDescriptionUpdate(owner, job.id, latest.description); setDescriptionNotice('application.descriptionExisting'); return }
+      if (latest.description !== null && typeof latest.description !== 'string') { setDescriptionNotice('application.descriptionCheckFailed'); return }
+      if (!descriptionTaskRef.current.allowed || descriptionJobRef.current.description?.trim()) { setDescriptionNotice('application.descriptionCheckFailed'); return }
+      if (descriptionDrafts.get(descriptionKey)?.revision !== draft.revision) return
+      updateDescriptionDraft(descriptionKey, { ...draft, uncertain: true })
+      setDescriptionDraft(descriptionDrafts.get(descriptionKey) ?? null)
+      const saved = await saveDescriptionRequest(job.id, draft.text, latest.description)
+      const data = saved.kind === 'saved' && saved.data && typeof saved.data === 'object' ? saved.data as { id?: unknown; userId?: unknown; description?: unknown } : null
+      const accepted = data && data.id === job.id && data.userId === owner && data.description === draft.text
+      const existing = descriptionDrafts.get(descriptionKey)
+      if (!accepted) {
+        if (existing?.revision === draft.revision) updateDescriptionDraft(descriptionKey, { ...existing, uncertain: true })
+        if (current()) { setDescriptionDraft(descriptionDrafts.get(descriptionKey) ?? null); setDescriptionNotice(saved.kind === 'conflict' ? 'application.descriptionConflict' : 'application.descriptionUnconfirmed') }
+        return
+      }
+      if (!current()) return
+      if (existing?.revision === draft.revision) updateDescriptionDraft(descriptionKey, null)
+      setDescriptionDraft(descriptionDrafts.get(descriptionKey) ?? null)
+      setDescriptionEditorOpen(false)
+      onDescriptionUpdate(owner, job.id, draft.text)
+    } finally {
+      descriptionSavingRef.current = false
+      if (current()) setDescriptionSaving(false)
+    }
+  }
+
+  async function refreshDescriptionStatus() {
+    const owner = drawerUserIdRef.current
+    const draft = descriptionKey ? descriptionDrafts.get(descriptionKey) : null
+    if (!owner || !descriptionKey || !draft?.uncertain || descriptionSavingRef.current || !isCurrentDrawer(owner)) return
+    descriptionSavingRef.current = true
+    setDescriptionSaving(true)
+    try {
+      const result = await readDescriptionScope(`/api/jobs/${encodeURIComponent(job.id)}`)
+      if (!isCurrentDrawer(owner)) return
+      const latest = result.data as Job | null
+      if (!result.ok || !latest || latest.id !== job.id || latest.userId !== owner) { setDescriptionNotice('application.descriptionUnconfirmed'); return }
+      if (latest.description === draft.text) {
+        if (descriptionDrafts.get(descriptionKey)?.revision === draft.revision) updateDescriptionDraft(descriptionKey, null)
+        setDescriptionDraft(descriptionDrafts.get(descriptionKey) ?? null)
+        setDescriptionNotice(null)
+        setDescriptionEditorOpen(false)
+        onDescriptionUpdate(owner, job.id, latest.description)
+      } else {
+        if (latest.description?.trim()) onDescriptionUpdate(owner, job.id, latest.description)
+        setDescriptionNotice(latest.description?.trim() ? 'application.descriptionExisting' : 'application.descriptionUnconfirmed')
+      }
+    } finally {
+      descriptionSavingRef.current = false
+      if (isCurrentDrawer(owner)) setDescriptionSaving(false)
+    }
+  }
+
   async function saveNotes() {
     if (notes === (job.notes ?? '')) return
+    const owner = drawerUserIdRef.current
+    if (!owner || job.userId !== owner || !isCurrentDrawer(owner)) return
     setSavingNotes(true)
     const { data, error } = await apiMutate<Job>(`/api/jobs/${job.id}`, 'PATCH', { notes })
+    if (!isCurrentDrawer(owner) || drawerJobIdRef.current !== job.id) return
     setSavingNotes(false)
     if (error) { toast.error('Save failed', error); return }
-    if (data)  { onUpdate(data); toast.success('Notes saved') }
+    if (data && data.id === job.id && data.userId === owner && (data.notes === null || typeof data.notes === 'string')) {
+      onJobFieldsUpdate(owner, job.id, { notes: data.notes }); toast.success('Notes saved')
+    }
   }
 
   async function saveFollowUpAt(value: string) {
     // value is '' (clear) or 'YYYY-MM-DD'
     const prev = job.followUpAt ? job.followUpAt.slice(0, 10) : ''
     if (value === prev) return
+    const owner = drawerUserIdRef.current
+    if (!owner || job.userId !== owner || !isCurrentDrawer(owner)) return
     const { data, error } = await apiMutate<Job>(
       `/api/jobs/${job.id}`, 'PATCH',
       { followUpAt: value ? new Date(value).toISOString() : null },
     )
+    if (!isCurrentDrawer(owner) || drawerJobIdRef.current !== job.id) return
     if (error) { toast.error('Save failed', error); return }
-    if (data)  { onUpdate(data); toast.success(value ? 'Follow-up date set' : 'Follow-up date cleared') }
+    if (data && data.id === job.id && data.userId === owner && (data.followUpAt === null || typeof data.followUpAt === 'string')) {
+      onJobFieldsUpdate(owner, job.id, { followUpAt: data.followUpAt }); toast.success(value ? 'Follow-up date set' : 'Follow-up date cleared')
+    }
   }
 
   async function handleDelete() {
@@ -1108,6 +1247,20 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
           <strong>{applicationPreflight.canPrepare ? t('jobs.drawer.manualOnly') : t('jobs.drawer.dataNeedsCorrection')}</strong>
           <div style={{ marginTop: 4 }}>{applicationPreflight.issues.map(issue => issue.message).join(' ')}</div>
           <div style={{ marginTop: 5, color: '#92400e' }}>{applicationPreflight.canPrepare ? t('jobs.drawer.manualOnlyHint') : t('jobs.drawer.correctionHint')}</div>
+        </div>}
+
+        {descriptionKey && (!job.description?.trim() || descriptionDraft) && <div style={{ margin: '18px 28px 0', padding: 12, border: '1px solid var(--border)', borderRadius: 9 }}>
+          {!descriptionEditorOpen && !job.description?.trim() ? <Btn variant="ghost" onClick={() => setDescriptionEditorOpen(true)}>{t('application.descriptionAdd')}</Btn> : descriptionEditorOpen && <>
+            <label htmlFor="application-description" style={{ display: 'block', fontSize: 12, fontWeight: 700 }}>{t('application.descriptionLabel')}</label>
+            <p style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{t(job.description?.trim() ? 'application.descriptionExisting' : 'application.descriptionHint')}</p>
+            <textarea id="application-description" value={descriptionDraft?.text ?? ''} onChange={event => changeDescriptionDraft(event.target.value)} readOnly={Boolean(job.description?.trim() || descriptionDraft?.uncertain)} disabled={descriptionSaving} style={{ ...INPUT_STYLE, minHeight: 100, resize: 'vertical' }} />
+            {(descriptionNotice || (descriptionDraft?.uncertain && !descriptionSaving)) && <p role="status">{t(descriptionNotice ?? 'application.descriptionUnconfirmed')}</p>}
+            {descriptionSaving && <p role="status">{t('application.descriptionChecking')}</p>}
+            {!descriptionTaskRef.current.allowed && !job.description?.trim() && <p role="status">{t(task && !applicationTaskAllowsManualWork(task) ? 'application.taskProgressHint' : taskReadState === 'limited' ? 'application.taskCoverage' : 'application.taskReadUnavailable')}</p>}
+            {!job.description?.trim() && !descriptionDraft?.uncertain && <Btn variant="primary" disabled={descriptionSaving || !descriptionDraft?.text.trim() || !descriptionTaskRef.current.allowed} onClick={() => void saveMissingDescription()}>{t('application.descriptionSave')}</Btn>}
+            {descriptionDraft?.uncertain && <Btn variant="ghost" disabled={descriptionSaving} onClick={() => void refreshDescriptionStatus()}>{t('application.refreshStatus')}</Btn>}
+            {descriptionDraft && (!descriptionDraft.uncertain || job.description?.trim()) && <Btn variant="ghost" disabled={descriptionSaving} onClick={() => { updateDescriptionDraft(descriptionKey, null); setDescriptionDraft(null); setDescriptionEditorOpen(false); setDescriptionNotice(null) }}>{t('application.descriptionDiscard')}</Btn>}
+          </>}
         </div>}
 
         {/* Body */}
@@ -2038,6 +2191,21 @@ export function JobsPage() {
             setSelectedJob(updated)
             defaultJobsCache = null
             triggerRefresh()
+            window.dispatchEvent(new Event('applymate:jobs-changed'))
+          }}
+          onDescriptionUpdate={(owner, id, description) => {
+            const merge = (current: Job) => current.id === id && current.userId === owner
+              && (!current.description?.trim() || current.description === description) ? { ...current, description } : current
+            setJobs(previous => previous.map(merge))
+            setSelectedJob(previous => previous ? merge(previous) : previous)
+            defaultJobsCache = null
+            window.dispatchEvent(new Event('applymate:jobs-changed'))
+          }}
+          onJobFieldsUpdate={(owner, id, fields) => {
+            const merge = (current: Job) => current.id === id && current.userId === owner ? { ...current, ...fields } : current
+            setJobs(previous => previous.map(merge))
+            setSelectedJob(previous => previous ? merge(previous) : previous)
+            defaultJobsCache = null
             window.dispatchEvent(new Event('applymate:jobs-changed'))
           }}
           onDelete={id => {
