@@ -14,12 +14,12 @@ import { assertApplicationPdfTextSupported, isApplicationPdfCharacterSupported, 
 import { isApplicationPdfUnsupportedCharactersError } from './application-pdf-errors'
 import type { Resume } from './types'
 
-// Isolate the legacy PDF.js parser from the renderer's process state. A failed
-// parse remains a test failure; this deliberately does not retry or skip it.
+// Legacy PDF.js misreads Node Buffers under Node 20. Feed it a plain, exact
+// Uint8Array in an isolated process; parsing errors still fail without retry.
 async function pdfText(doc: React.ReactElement): Promise<string> {
   const bytes = await renderToBuffer(doc as never)
   const parser = createRequire(resolve('package.json')).resolve('pdf-parse')
-  const script = `const fs=require('node:fs');const parse=require(process.argv[1]);const raw=fs.readFileSync(0);const exact=Buffer.alloc(raw.length);raw.copy(exact);parse(exact,{version:'v2.0.550'}).then(result=>process.stdout.write(result.text)).catch(error=>{console.error(error);process.exitCode=1})`
+  const script = `const fs=require('node:fs');const parse=require(process.argv[1]);const raw=fs.readFileSync(0);const exact=Uint8Array.from(raw);parse(exact,{version:'v2.0.550'}).then(result=>process.stdout.write(result.text)).catch(error=>{console.error(error);process.exitCode=1})`
   return execFileSync(process.execPath, ['-e', script, parser], { input: bytes, encoding: 'utf8' })
 }
 
