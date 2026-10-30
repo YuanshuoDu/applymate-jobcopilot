@@ -138,7 +138,7 @@ async function seedWait(pool: Pool, userId: string, suffix: string, ready: boole
 }
 
 async function makeTargetOutOfScope(pool: Pool, fixture: Fixture): Promise<void> {
-  await pool.query(`UPDATE "agent_wait_conditions" SET "targetTaskIds" = jsonb_build_array($1)
+  await pool.query(`UPDATE "agent_wait_conditions" SET "targetTaskIds" = jsonb_build_array($1::text)
     WHERE "id" = $2 AND "sessionId" = $3 AND "parentTaskId" = $4`,
   [fixture.rootTaskId, fixture.waitId, fixture.sessionId, fixture.parentTaskId])
 }
@@ -470,7 +470,8 @@ describePg("fair durable child-wait reconciliation on disposable PostgreSQL", ()
   it("uses the UTC timestamp domain when scanning and expiring under a non-UTC database session zone", async () => {
     const fixture = await seedWait(pool, userId, `non-utc-${randomUUID()}`, false)
     const expectedDeadlineAt = "2026-06-15T12:00:00.000Z"
-    await pool.query(`UPDATE "agent_wait_conditions" AS wait SET "suspendedAt" = TIMESTAMP '2026-06-14 12:00:00.000',
+    await pool.query(`UPDATE "agent_wait_conditions" AS wait SET "createdAt" = TIMESTAMP '2026-06-14 12:00:00.000',
+        "suspendedAt" = TIMESTAMP '2026-06-14 12:00:00.000',
         "deadlineAt" = TIMESTAMP '2026-06-15 12:00:00.000',
         "nextReconcileAt" = NULL,
         "result" = jsonb_set(jsonb_set(wait."result", '{request,timeoutMs}', '86400000'::jsonb), '{outcome,deadlineAt}',
