@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { Pool, type PoolClient } from "pg"
 import type { ModelAdapter } from "@jobcopilot/agent-model"
+import { redactAgentEvent } from "@jobcopilot/shared"
 
 import { mergeCanonicalTurnQuestionContext } from "../canonical-turn-question-context.js"
 import { StepContextBuilder, type StepContext } from "../context/step-context-builder.js"
@@ -80,6 +81,7 @@ type InputSeed = {
   acceptedSequence: number
   delivery: "steer" | "follow_up"
   status: "accepted" | "consumed"
+  disposition?: "started" | "steered"
   text: string
   consumedByStepId?: string | null
 }
@@ -181,9 +183,20 @@ async function insertEvent(client: PoolClient, event: {
 }
 
 async function insertInput(client: PoolClient, fixture: Fixture, input: InputSeed): Promise<void> {
-  const itemId = `${input.id}-item`
+  const itemId = randomUUID()
+  const disposition = input.disposition ?? "steered"
   const parts = [{ type: "text", text: input.text }]
-  const content = { parts, clientMessageId: input.clientMessageId, source: "user", disposition: "steered" }
+  const content = { parts, clientMessageId: input.clientMessageId, source: "user", disposition }
+  const eventPayload = redactAgentEvent({
+    type: "input.accepted",
+    body: "",
+    data: { inputId: input.id, clientMessageId: input.clientMessageId, delivery: input.delivery, source: "user", disposition },
+    routing: { sessionId: fixture.sessionId, turnId: fixture.turnId, itemId, taskId: null, actor: "user",
+      correlationId: fixture.turnId, causationId: null, outboxTopic: "agent.session.event" },
+  }).data
+  if (!eventPayload || typeof eventPayload !== "object" || Array.isArray(eventPayload)) {
+    throw new Error("Planning clarification fixture could not redact its accepted-input event")
+  }
   await client.query(`INSERT INTO "agent_items"
     ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "revision", "content", "startedAt", "completedAt", "updatedAt")
     VALUES ($1, $2, $3, NULL, NULL, 'user_message', 'completed', 'commentary', 0, $4::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
@@ -194,8 +207,7 @@ async function insertInput(client: PoolClient, fixture: Fixture, input: InputSee
   [input.id, fixture.sessionId, fixture.turnId, fixture.userId, input.clientMessageId, input.delivery, input.status,
     JSON.stringify(parts), input.acceptedSequence, input.consumedByStepId ?? null])
   await insertEvent(client, { fixture, sequence: input.acceptedSequence, type: "input.accepted", actor: "user",
-    itemId, taskId: null, correlationId: fixture.turnId, idempotencyKey: `input.accepted:${input.clientMessageId}`,
-    payload: { inputId: input.id, clientMessageId: input.clientMessageId, delivery: input.delivery, source: "user", disposition: "steered" } })
+    itemId, taskId: null, correlationId: fixture.turnId, idempotencyKey: `agent-command:${input.clientMessageId}`, payload: eventPayload })
 }
 
 async function seedFixture(pool: Pool, options: { name: string; planning?: boolean; pendingSteering?: boolean }): Promise<Fixture> {
@@ -204,7 +216,7 @@ async function seedFixture(pool: Pool, options: { name: string; planning?: boole
     userId: `planning-user-${suffix}`, email: `planning-${suffix}@example.invalid`,
     sessionId: `planning-session-${suffix}`, turnId: `planning-turn-${suffix}`, rootTaskId: `planning-root-${suffix}`,
     stepId: `planning-step-${suffix}`, callId: `planning-call-${suffix}`, callItemId: `planning-call-item-${suffix}`,
-    resultItemId: `planning-result-item-${suffix}`, originalInputId: `planning-original-${suffix}`,
+    resultItemId: `planning-result-item-${suffix}`, originalInputId: randomUUID(),
     originalClientMessageId: `planning-original-message-${suffix}`, consumedSteerId: null, acceptedSteerId: null,
     graphItemId: "", agendaEventId: "", owner: undefined as never, inputCursor: 1n, consumedInputIds: [],
     planning: options.planning !== false,
@@ -240,9 +252,9 @@ async function seedFixture(pool: Pool, options: { name: string; planning?: boole
     await client.query(`UPDATE "agent_turns" SET "rootTaskId" = $1 WHERE "id" = $2`, [fixture.rootTaskId, fixture.turnId])
 
     const steering = options.pendingSteering ? [
-      { id: `planning-consumed-${suffix}`, clientMessageId: `planning-consumed-message-${suffix}`, sequence: 2,
+      { id: randomUUID(), clientMessageId: `planning-consumed-message-${suffix}`, sequence: 2,
         delivery: "steer" as const, status: "consumed" as const, text: `Consumed steer ${suffix}`, consumedByStepId: fixture.stepId },
-      { id: `planning-accepted-${suffix}`, clientMessageId: `planning-accepted-message-${suffix}`, sequence: 3,
+      { id: randomUUID(), clientMessageId: `planning-accepted-message-${suffix}`, sequence: 3,
         delivery: "steer" as const, status: "accepted" as const, text: `Accepted steer ${suffix}`, consumedByStepId: null },
     ] : []
     fixture.consumedSteerId = steering[0]?.id ?? null
@@ -255,7 +267,7 @@ async function seedFixture(pool: Pool, options: { name: string; planning?: boole
       VALUES ($1, $2, $3, $4, 1, 1, 'streaming', $5, $6::jsonb, '{}'::jsonb, NULL, 0, 0, 0, CURRENT_TIMESTAMP)`,
     [fixture.stepId, fixture.sessionId, fixture.turnId, fixture.rootTaskId, fixture.inputCursor.toString(), JSON.stringify(fixture.consumedInputIds)])
     await insertInput(client, fixture, { id: fixture.originalInputId, clientMessageId: fixture.originalClientMessageId, acceptedSequence: 1,
-      delivery: "follow_up", status: "consumed", text: options.name, consumedByStepId: fixture.stepId })
+      delivery: "follow_up", status: "consumed", disposition: "started", text: options.name, consumedByStepId: fixture.stepId })
     for (const input of steering) await insertInput(client, fixture, { ...input, acceptedSequence: input.sequence,
       consumedByStepId: input.consumedByStepId ?? undefined })
     const lastInputSequence = steering.at(-1)?.sequence ?? 1
@@ -516,7 +528,7 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
     const outbox = await admin!.query(`SELECT "id" FROM "agent_outbox" WHERE "idempotencyKey" = $1`, [`agent-event:${row.id}`])
     expect(outbox.rows).toHaveLength(0)
 
-    const laterSteerId = `planning-later-steer-${fixture.turnId}`
+    const laterSteerId = randomUUID()
     const laterSteerSequence = await acceptSteer(fixture, `clarification_later_steer_${fixture.turnId}`, laterSteerId)
     await admin!.query(`UPDATE "agent_inputs" SET "status" = 'consumed', "consumedByStepId" = $2, "consumedAt" = CURRENT_TIMESTAMP WHERE "id" = $1`,
       [laterSteerId, fixture.stepId])
@@ -646,7 +658,7 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
     let waitAfterAccept: Promise<unknown> | undefined
     let releasedBefore = false
     try {
-      acceptBefore = acceptSteer(beforeFixture, acceptFirstName, `planning-before-${beforeFixture.turnId}`)
+      acceptBefore = acceptSteer(beforeFixture, acceptFirstName, randomUUID())
       await waitForLockWait(acceptFirstName, beforeLock.pid)
       waitAfterAccept = createPgTurnQuestionStore(runtimePool(writer!, waitAfterName))
         .waitForQuestion({ owner: beforeFixture.owner, stepId: beforeFixture.stepId, toolCallId: beforeFixture.callId, now: new Date() })
@@ -677,7 +689,7 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
       waitBeforeAccept = createPgTurnQuestionStore(runtimePool(writer!, waitBeforeName))
         .waitForQuestion({ owner: afterFixture.owner, stepId: afterFixture.stepId, toolCallId: afterFixture.callId, now: new Date() })
       await waitForLockWait(waitBeforeName, afterLock.pid)
-      acceptAfter = acceptSteer(afterFixture, acceptSecondName, `planning-after-${afterFixture.turnId}`)
+      acceptAfter = acceptSteer(afterFixture, acceptSecondName, randomUUID())
       await waitForLockWait(acceptSecondName)
       await afterLock.client.query("COMMIT")
       releasedAfter = true
@@ -704,7 +716,7 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
     const receiptSummary = await withRuntimeTransaction(pool, fixture.userId, client => readTurnQuestionPlanningWait(client, readOwner(fixture), waitRef(fixture, wait.waitId)))
     expect(receiptSummary).toMatchObject({ observedPlanRevision: 1, graphRevisionAtAsk: 1, pendingSteerCount: 2, unconsumedSteerCount: 1 })
 
-    const currentSteerId = `planning-current-after-answer-${fixture.turnId}`
+    const currentSteerId = randomUUID()
     const currentSteerSequence = await acceptSteer(fixture, `clarification_current_steer_${fixture.turnId}`, currentSteerId)
     const pendingBeforeBuild = await admin!.query<{ status: string; consumedByStepId: string | null }>(`SELECT "status", "consumedByStepId" FROM "agent_inputs" WHERE "id" = $1`, [currentSteerId])
     expect(pendingBeforeBuild.rows).toEqual([{ status: "accepted", consumedByStepId: null }])
