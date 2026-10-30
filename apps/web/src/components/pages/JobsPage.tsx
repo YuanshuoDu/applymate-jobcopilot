@@ -13,6 +13,16 @@ import { useNav } from '@/lib/nav-context'
 import { exportApplicationPackLocally } from '@/lib/bundle'
 import { assessApplicationPreflight } from '@/lib/agent/application-preflight'
 import { useI18n } from '@/lib/i18n'
+import { auditMatchesCurrentMaterials } from '@/lib/application-materials'
+import { applicationListUrl, loadLinkedApplication, readApplicationListState } from '@/lib/application-list-state'
+import type { StoredApplicationAudit } from '@/lib/application-audit'
+import { useApplicationTasks } from '@/components/jobs/useApplicationTasks'
+import { ApplicationProgress } from '@/components/jobs/application-progress'
+import { ApplicationTaskCard } from '@/components/jobs/application-task-card'
+import type { ApplicationTaskView } from '@/components/jobs/application-task-model'
+import { forgetSavedApplication } from '@/components/jobs/application-search-state'
+import { getApplicationTaskState } from '@/components/jobs/application-task-model'
+import { openApplicationSession } from '@/lib/application-navigation'
 
 const KANBAN_COLS: JobStatus[] = ['saved', 'applied', 'interview', 'offer', 'rejected']
 const COL_LABELS: Record<JobStatus, string> = {
@@ -95,8 +105,9 @@ export function toMobileJobCard(job: Job): MobileJobCardData {
 }
 
 // ── ListView ──────────────────────────────────────────────────────────────────
-function ListView({ jobs, onRowClick, selectedIds, onToggle, onToggleAll }: {
+function ListView({ jobs, taskByJobId, onRowClick, selectedIds, onToggle, onToggleAll }: {
   jobs: Job[]
+  taskByJobId: ReadonlyMap<string, ApplicationTaskView>
   onRowClick: (job: Job) => void
   selectedIds: Set<string>
   onToggle: (id: string) => void
@@ -181,7 +192,7 @@ function ListView({ jobs, onRowClick, selectedIds, onToggle, onToggleAll }: {
                   ) : null
                 })() : null}
               </td>
-              <td style={{ padding: '10px 16px' }}><StatusBadge status={j.status} /></td>
+              <td style={{ padding: '10px 16px' }}><StatusBadge status={j.status} />{taskByJobId.get(j.id) && <div style={{ fontSize: 11, marginTop: 5, color: 'var(--text-muted)' }}>{t(getApplicationTaskState(taskByJobId.get(j.id)!).labelKey)}</div>}</td>
               <td style={{ padding: '10px 16px' }}><ScorePill score={j.score} /></td>
               <td style={{ padding: '10px 16px', fontSize: 11, color: 'var(--text-muted)' }}>
                 {fmtDate(j.appliedAt ?? j.createdAt)}
@@ -190,7 +201,7 @@ function ListView({ jobs, onRowClick, selectedIds, onToggle, onToggleAll }: {
                 {fmtDate(j.followUpAt) || '—'}
               </td>
               <td style={{ padding: '10px 16px' }}>
-                <Btn small variant="ghost" onClick={() => onRowClick(j)}>···</Btn>
+                <Btn small variant="ghost" onClick={() => onRowClick(j)}>{t('application.viewApplication')}</Btn>
               </td>
             </tr>
           ))}
@@ -200,8 +211,9 @@ function ListView({ jobs, onRowClick, selectedIds, onToggle, onToggleAll }: {
   )
 }
 
-function MobileListView({ jobs, onRowClick, selectedIds, onToggle }: {
+function MobileListView({ jobs, taskByJobId, onRowClick, selectedIds, onToggle }: {
   jobs: Job[]
+  taskByJobId: ReadonlyMap<string, ApplicationTaskView>
   onRowClick: (job: Job) => void
   selectedIds: Set<string>
   onToggle: (id: string) => void
@@ -235,7 +247,7 @@ function MobileListView({ jobs, onRowClick, selectedIds, onToggle }: {
               </div>
               <div className="jobs-mobile-card-role">{card.role}</div>
               <div className="jobs-mobile-card-meta">
-                <StatusBadge status={card.status} />
+                <StatusBadge status={card.status} />{taskByJobId.get(job.id) && <span style={{ fontSize: 11 }}>{t(getApplicationTaskState(taskByJobId.get(job.id)!).labelKey)}</span>}
                 <span>{fmtDate(card.date)}</span>
               </div>
             </button>
@@ -428,8 +440,11 @@ function AddJobModal({ onClose, onAdded, prefillStatus }: {
 }
 
 // ── JobDetailDrawer ───────────────────────────────────────────────────────────
-function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onOpenTailoredResume }: {
+function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, onStatusChange, onUpdate, onDelete, onOpenTailoredResume }: {
   job:            Job
+  task?: ApplicationTaskView
+  taskReadState: 'loading' | 'unavailable' | 'limited' | 'ready'
+  onRefreshTasks: () => void
   onClose:        () => void
   onStatusChange: (id: string, status: JobStatus) => void
   onUpdate:       (updated: Job) => void
@@ -437,6 +452,8 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
   onOpenTailoredResume: (resumeId: string) => void
 }) {
   const { t } = useI18n()
+  const { navigate } = useNav()
+  const auditSectionRef = useRef<HTMLDivElement>(null)
   const toast = useToast()
   const [confirm, ConfirmDialog] = useConfirm()
   const [notes,        setNotes]        = useState(job.notes ?? '')
@@ -454,14 +471,16 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
   const [descExpanded, setDescExpanded] = useState(false)
   const { data: resumeList } = useApi<ResumeListItem[]>('/api/resume')
   const [selectedResumeId, setSelectedResumeId] = useState('')
-  const [tailoringLoading, setTailoringLoading] = useState(false)
   const [downloadingPack, setDownloadingPack] = useState(false)
+  const [recordingSubmission, setRecordingSubmission] = useState(false)
+  const recordingSubmissionRef = useRef(false)
   const [exportedPackFolder, setExportedPackFolder] = useState<string | null>(null)
   const [autoPreparing, setAutoPreparing] = useState(false)
+  const preparationInFlight = useRef(false)
   const [preparationStartedAt, setPreparationStartedAt] = useState<number | null>(null)
   const [preparationElapsed, setPreparationElapsed] = useState(0)
   const [packStage, setPackStage] = useState<'idle' | 'resume' | 'coverLetter' | 'audit' | 'review'>('idle')
-  const [auditedPackKey, setAuditedPackKey] = useState<string | null>(null)
+  const [latestAuditRecord, setLatestAuditRecord] = useState<StoredApplicationAudit | null>(null)
   const [openPackItem, setOpenPackItem] = useState<'resume' | 'coverLetter' | 'audit' | null>(null)
   const [resumePreview, setResumePreview] = useState<Resume | null>(null)
   const [generatedCoverLetter, setGeneratedCoverLetter] = useState<CoverLetter | null>(null)
@@ -502,7 +521,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
   }, [baseResumes, resumeList])
   useEffect(() => {
     const exportKey = `applymate:exported-pack:${job.id}`
-    setAuditedPackKey(null)
+    setLatestAuditRecord(null)
     setOpenPackItem(null)
     setResumePreview(null)
     setGeneratedCoverLetter(null)
@@ -522,9 +541,12 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
   const previewResumeId = job.finalResumeId ?? existingTailoredResume?.id ?? null
   useEffect(() => {
     if (!previewResumeId) return
-    fetch(`/api/resume/${previewResumeId}`).then(response => response.ok ? response.json() : null)
-      .then((resume: Resume | null) => setResumePreview(resume))
-      .catch(() => setResumePreview(null))
+    const controller = new AbortController()
+    setResumePreview(null)
+    fetch(`/api/resume/${previewResumeId}`, { signal: controller.signal }).then(response => response.ok ? response.json() : null)
+      .then((resume: Resume | null) => { if (!controller.signal.aborted) setResumePreview(resume) })
+      .catch(() => { if (!controller.signal.aborted) setResumePreview(null) })
+    return () => controller.abort()
   }, [previewResumeId])
 
   // Once a package has been confirmed, every surface must show the exact
@@ -532,7 +554,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
   // replace the confirmed version in the Application Pack preview.
   const selectedCoverLetter = job.finalCoverLetterId
     ? coverLetters?.find(letter => letter.id === job.finalCoverLetterId)
-    : generatedCoverLetter
+    : job.finalResumeId ? null : generatedCoverLetter
       ?? coverLetters?.find(letter => letter.resumeId === previewResumeId)
   const persistedAudit = useMemo(() => findLatestApplicationAudit(activity), [activity])
   const storedAudit = canonicalAudit ?? persistedAudit
@@ -602,39 +624,6 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
     }
   }
 
-  async function handleTailorResume() {
-    if (existingTailoredResume) {
-      onOpenTailoredResume(existingTailoredResume.id)
-      return
-    }
-    if (!selectedResumeId) {
-      toast.error('No resume selected', 'Create or import a resume first')
-      return
-    }
-
-    setTailoringLoading(true)
-    const { data, error } = await apiMutate<{ adaptedResumeId: string; reused?: boolean }>(
-      `/api/jobs/${job.id}/tailor-resume`,
-      'POST',
-      { resumeId: selectedResumeId },
-    )
-    setTailoringLoading(false)
-
-    if (error) {
-      toast.error(t('jobs.tailoringFailed'), error)
-      return
-    }
-    if (!data) return
-
-    if (data.reused) {
-      onOpenTailoredResume(data.adaptedResumeId)
-      return
-    }
-
-    toast.success(t('jobs.toastTailored'), t('jobs.toastTailoredDetail'))
-    onOpenTailoredResume(data.adaptedResumeId)
-  }
-
   async function downloadFinalPack() {
     setDownloadingPack(true)
     try {
@@ -654,6 +643,11 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
   }
 
   async function autoTailorAndAudit(evidenceRepairs: ApplicationAuditFinding[] = []) {
+    if (preparationInFlight.current || task || taskReadState !== 'ready') return
+    if (job.finalCoverLetterId && !coverLetters?.some(letter => letter.id === job.finalCoverLetterId)) {
+      toast.info(t('application.selectedLetterLoading'))
+      return
+    }
     if (!selectedResumeId && !existingTailoredResume && !job.finalResumeId) {
       toast.error('No base resume selected', 'Create or import a resume first.')
       return
@@ -666,6 +660,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
       ...(auditNeedsRepair ? factualAuditFindings.filter(finding => finding.area === 'cover_letter') : []),
       ...evidenceRepairs.filter(finding => finding.area === 'cover_letter'),
     ]
+    preparationInFlight.current = true
     setAutoPreparing(true)
     setPreparationStartedAt(Date.now())
     try {
@@ -695,8 +690,9 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
 
       let coverLetter = job.finalCoverLetterId
         ? coverLetters?.find(letter => letter.id === job.finalCoverLetterId)
-        : generatedCoverLetter ?? coverLetters?.find(letter => letter.resumeId === adaptedResumeId)
-      if (!coverLetter || coverLetterRepairs.length) {
+        : job.finalResumeId ? undefined : generatedCoverLetter ?? coverLetters?.find(letter => letter.resumeId === adaptedResumeId)
+      if (job.finalCoverLetterId && !coverLetter) throw new Error(t('application.selectedLetterLoading'))
+      if ((!coverLetter && !job.finalResumeId) || coverLetterRepairs.length) {
         setPackStage('coverLetter')
         const result = await apiMutate<CoverLetter>(
           `/api/jobs/${job.id}/cover-letters/generate`, 'POST',
@@ -710,23 +706,24 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
         if (!result.data || result.error) throw new Error(result.error ?? 'Could not prepare the cover letter')
         coverLetter = result.data
       }
-      setGeneratedCoverLetter(coverLetter)
-      void refetchCoverLetters()
-
-      if (job.finalCoverLetterId !== coverLetter.id) {
+      setGeneratedCoverLetter(coverLetter ?? null)
+      if (coverLetter && job.finalCoverLetterId !== coverLetter.id) {
         const { data: assigned, error: assignError } = await apiMutate<Job>(
           `/api/jobs/${job.id}/assign`, 'PATCH', { finalCoverLetterId: coverLetter.id },
         )
         if (!assigned || assignError) throw new Error(assignError ?? 'Could not select the cover letter')
         onUpdate(assigned)
       }
+      await refetchCoverLetters()
 
       setPackStage('audit')
-      const { data: audit, error: auditError } = await apiMutate<ApplicationAudit>(
-        `/api/jobs/${job.id}/audit-application`, 'POST', { resumeId: adaptedResumeId, coverLetterId: coverLetter.id },
+      const { data: audit, error: auditError } = await apiMutate<ApplicationAudit & Pick<StoredApplicationAudit, 'resumeUpdatedAt' | 'coverLetterUpdatedAt'>>(
+        `/api/jobs/${job.id}/audit-application`, 'POST', { resumeId: adaptedResumeId, coverLetterId: coverLetter?.id ?? null },
       )
       if (!audit || auditError) throw new Error(auditError ?? 'Independent audit could not run')
       setLatestAudit(audit)
+      setLatestAuditRecord({ resumeId: adaptedResumeId, coverLetterId: coverLetter?.id ?? null,
+        resumeUpdatedAt: audit.resumeUpdatedAt, coverLetterUpdatedAt: audit.coverLetterUpdatedAt, audit })
       if (audit.verdict !== 'pass') {
         setPackStage('idle')
         setOpenPackItem('audit')
@@ -736,23 +733,23 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
 
       setPackStage('review')
       const { data: confirmed, error: confirmError } = await apiMutate<Job>(
-        `/api/jobs/${job.id}/assign`, 'PATCH', { finalResumeId: adaptedResumeId, finalCoverLetterId: coverLetter.id },
+        `/api/jobs/${job.id}/assign`, 'PATCH', { finalResumeId: adaptedResumeId },
       )
       if (!confirmed || confirmError) throw new Error(confirmError ?? 'Could not confirm the audited package')
-      setAuditedPackKey(`${adaptedResumeId}:${coverLetter.id}`)
       onUpdate(confirmed)
       toast.success('Audited application pack ready', 'The final resume and cover letter are now available in this job.')
     } catch (error) {
       setPackStage('idle')
       toast.error('Preparation could not finish', error instanceof Error ? error.message : 'Please try again')
     } finally {
+      preparationInFlight.current = false
       setAutoPreparing(false)
       setPreparationStartedAt(null)
     }
   }
 
   async function saveEvidenceAndRewrite() {
-    if (!evidenceFinding || !evidenceText.trim()) return
+    if (!evidenceFinding || !evidenceText.trim() || task || taskReadState !== 'ready') return
     setSavingEvidence(true)
     try {
       const key = `audit_evidence_${Date.now()}`
@@ -772,18 +769,40 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
     }
   }
 
+  async function recordManualSubmission() {
+    if (recordingSubmissionRef.current || task || taskReadState !== 'ready') return
+    recordingSubmissionRef.current = true
+    setRecordingSubmission(true)
+    try {
+      const { error } = await apiMutate(`/api/jobs/${job.id}/apply`, 'POST', {})
+      if (error) throw new Error(error)
+      const response = await fetch(`/api/jobs/${encodeURIComponent(job.id)}`)
+      if (!response.ok) throw new Error(t('application.refreshStatus'))
+      onUpdate(await response.json() as Job)
+      toast.success(t('application.manualRecorded'))
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : t('common.error'))
+    } finally {
+      recordingSubmissionRef.current = false
+      setRecordingSubmission(false)
+    }
+  }
+
   // Drawer uses a slightly more compact variant of the shared INPUT_STYLE
   const drawerInputSt: React.CSSProperties = { ...INPUT_STYLE, fontSize: 11, padding: '5px 8px', borderRadius: 5 }
   const canTailorResume = Boolean(applicationPreflight.canPrepare && job.description && (baseResumes.length || existingTailoredResume || job.finalResumeId))
-  const packActionDisabled = autoPreparing || !canTailorResume
-  // The final document pair is the shared source of truth used by My Jobs and
-  // the extension sidebar. The audit activity is still checked when available,
-  // but must not make a confirmed package look pending on one surface.
-  const hasFinalApplicationPack = Boolean(job.finalResumeId && job.finalCoverLetterId)
-  const currentPackAudited = hasFinalApplicationPack || auditedPackKey === `${job.finalResumeId}:${job.finalCoverLetterId}`
-    || (storedAudit?.audit.verdict === 'pass'
-      && storedAudit.resumeId === job.finalResumeId
-      && storedAudit.coverLetterId === job.finalCoverLetterId)
+  const currentRecord = latestAuditRecord ?? storedAudit
+  const currentPackAudited = currentRecord?.audit.verdict === 'pass' && auditMatchesCurrentMaterials(
+    currentRecord, job.finalResumeId, job.finalCoverLetterId,
+    resumePreview?.id === job.finalResumeId ? resumePreview.updatedAt : null,
+    selectedCoverLetter?.updatedAt ?? null, false,
+  )
+  const applicationRecorded = job.status !== 'saved' || job.workflowState === 'submitted'
+  const auditStale = Boolean(currentRecord && !currentPackAudited && currentRecord.audit.verdict === 'pass')
+  const openAudit = () => {
+    setOpenPackItem('audit')
+    window.setTimeout(() => auditSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 0)
+  }
 
   return (
     <>
@@ -807,9 +826,9 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
           <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 16, color: 'var(--text-muted)', lineHeight: 1, padding: 0, marginTop: 2 }}>✕</button>
         </div>
 
-        <ReferenceProgress ready={currentPackAudited} />
+        <ApplicationProgress hasMaterials={Boolean(previewResumeId)} checked={Boolean(currentPackAudited)} recorded={applicationRecorded} task={task} />
 
-        {applicationPreflight.issues.length > 0 && <div style={{ margin: '18px 28px 0', padding: '12px 14px', borderRadius: 9, border: '1px solid #fbbf24', background: '#fffbeb', color: '#78350f', fontSize: 12, lineHeight: 1.5 }}>
+        {!applicationPreflight.canPrepare && applicationPreflight.issues.length > 0 && <div style={{ margin: '18px 28px 0', padding: '12px 14px', borderRadius: 9, border: '1px solid #fbbf24', background: '#fffbeb', color: '#78350f', fontSize: 12, lineHeight: 1.5 }}>
           <strong>{applicationPreflight.canPrepare ? t('jobs.drawer.manualOnly') : t('jobs.drawer.dataNeedsCorrection')}</strong>
           <div style={{ marginTop: 4 }}>{applicationPreflight.issues.map(issue => issue.message).join(' ')}</div>
           <div style={{ marginTop: 5, color: '#92400e' }}>{applicationPreflight.canPrepare ? t('jobs.drawer.manualOnlyHint') : t('jobs.drawer.correctionHint')}</div>
@@ -820,40 +839,45 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
 
           <section style={{ borderBottom: '1px solid var(--border)', padding: '18px 0 22px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 9, fontSize: 11, fontWeight: 700, letterSpacing: '0.03em', color: '#64748b', marginBottom: 18 }}><Sparkles size={16} strokeWidth={2.4} style={{ color: '#2563eb', flexShrink: 0 }} />{t('jobs.drawer.nextAction')}</div>
-            <div style={{ fontSize: 20, lineHeight: 1.25, fontWeight: 700, letterSpacing: '-0.025em' }}>{currentPackAudited ? t('jobs.drawer.packReady') : auditRetryOnly ? t('jobs.drawer.retryAudit') : auditNeedsEvidence ? t('jobs.drawer.confirmEvidence') : auditNeedsRepair ? t('jobs.drawer.correctFacts') : existingTailoredResume ? t('jobs.drawer.tailored') : t('jobs.drawer.tailor')}</div>
-            <div style={{ fontSize: 14, lineHeight: 1.5, color: 'var(--text-muted)', margin: '7px 0 16px' }}>{currentPackAudited ? t('jobs.pack.sameAudited') : auditRetryOnly ? t('jobs.pack.auditPending') : auditNeedsEvidence ? t('jobs.pack.evidencePrompt') : auditNeedsRepair ? t('jobs.pack.repairPrompt') : existingTailoredResume ? t('jobs.pack.reviewTailored') : t('jobs.pack.createRole')}</div>
+            <div style={{ fontSize: 20, lineHeight: 1.25, fontWeight: 700, letterSpacing: '-0.025em' }}>{task ? t('application.taskProgress') : applicationRecorded ? t('application.recorded') : auditStale ? t('application.checkMaterials') : currentPackAudited ? t('jobs.drawer.packReady') : auditRetryOnly ? t('jobs.drawer.retryAudit') : auditNeedsEvidence ? t('jobs.drawer.confirmEvidence') : auditNeedsRepair ? t('jobs.drawer.correctFacts') : existingTailoredResume ? t('jobs.drawer.tailored') : t('jobs.drawer.tailor')}</div>
+            <div style={{ fontSize: 14, lineHeight: 1.5, color: 'var(--text-muted)', margin: '7px 0 16px' }}>{task ? t('application.taskProgressHint') : applicationRecorded ? t('application.recordedHint') : auditStale ? t('application.auditStale') : currentPackAudited ? t('jobs.pack.sameAudited') : auditRetryOnly ? t('jobs.pack.auditPending') : auditNeedsEvidence ? t('jobs.pack.evidencePrompt') : auditNeedsRepair ? t('jobs.pack.repairPrompt') : existingTailoredResume ? t('jobs.pack.reviewTailored') : t('jobs.pack.createRole')}</div>
 
-            {auditNeedsRepair && <div style={{ marginBottom: 16, padding: '12px 14px', border: '1px solid #fecaca', background: '#fff7f7', borderRadius: 9 }}><div style={{ fontSize: 12, fontWeight: 800, color: '#b42318', marginBottom: 7 }}>{t('jobs.drawer.factualIssues')}</div>{factualAuditFindings.slice(0, 2).map((finding, index) => <div key={`${finding.title}-${index}`} style={{ color: '#7f1d1d', fontSize: 12, lineHeight: 1.45, marginTop: index ? 6 : 0 }}><strong>{finding.title}</strong><br />{finding.action}</div>)}</div>}
-
-            {existingTailoredResume ? (
-              <button onClick={() => onOpenTailoredResume(existingTailoredResume.id)} style={workflowDocumentButton}>
-                <span style={{ width: 48, height: 48, display: 'grid', placeItems: 'center', borderRadius: 10, background: '#eff6ff', color: '#2563eb' }}><FileText size={27} /></span>
-                <span style={{ flex: 1, textAlign: 'left' }}><span style={{ display: 'block', fontSize: 15, fontWeight: 700 }}>{existingTailoredResume.name}</span><span style={{ display: 'block', fontSize: 13, marginTop: 5, color: 'var(--text-muted)', fontWeight: 400 }}>{t('jobs.pack.tailoredReady')}</span></span>
-                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, color: '#2563eb', fontSize: 14, whiteSpace: 'nowrap' }}>{t('jobs.pack.reviewResume')} <ChevronRight size={19} /></span>
-              </button>
-            ) : <div style={{ border: '1px solid #dbe1ea', borderRadius: 12, padding: 18 }}>
-              <div style={{ fontSize: 14, color: 'var(--text-muted)', lineHeight: 1.55, marginBottom: 14 }}>{t('jobs.pack.chooseBase')}</div>
-              {baseResumes.length > 1 && <select value={selectedResumeId} onChange={e => setSelectedResumeId(e.target.value)} style={{ ...drawerInputSt, width: '100%', marginBottom: 12 }}>{baseResumes.map(r => <option key={r.id} value={r.id}>{r.isDefault ? `${t('jobs.defaultResume')} — ` : ''}{r.name}</option>)}</select>}
-              <Btn variant="primary" onClick={handleTailorResume} disabled={tailoringLoading}>{tailoringLoading ? t('jobs.pack.preparing') : t('jobs.pack.tailorInResume')}</Btn>
-            </div>}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12, color: 'var(--text-muted)', margin: '4px 0 20px' }}><span style={{ height: 1, background: 'var(--border)', flex: 1 }} /><span>{t('jobs.or')}</span><span style={{ height: 1, background: 'var(--border)', flex: 1 }} /></div>
-            <button onClick={() => auditNeedsEvidence ? setOpenPackItem('audit') : void autoTailorAndAudit()} disabled={packActionDisabled || currentPackAudited} style={{ width: '100%', minHeight: 56, padding: '14px', border: `2px solid ${packActionDisabled || currentPackAudited ? '#e2e8f0' : auditNeedsRepair ? '#dc2626' : '#2563eb'}`, borderRadius: 9, background: packActionDisabled || currentPackAudited ? '#f8fafc' : auditNeedsRepair ? '#fff7f7' : '#fff', color: packActionDisabled || currentPackAudited ? '#94a3b8' : auditNeedsRepair ? '#b42318' : '#2563eb', fontSize: 15, fontWeight: 700, cursor: packActionDisabled || currentPackAudited ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, textAlign: 'center' }}><Sparkles size={19} style={{ flexShrink: 0 }} />{currentPackAudited ? t('jobs.pack.ready') : autoPreparing ? t('jobs.pack.preparing') : auditNeedsEvidence ? t('jobs.pack.reviewEvidence') : auditRetryOnly ? t('jobs.pack.retryAudit') : auditNeedsRepair ? t('jobs.pack.fixAudit') : t('jobs.pack.prepareAutomatically')}</button>
+            {task ? <ApplicationTaskCard task={task} onOpenSession={id => openApplicationSession(id, navigate)} /> : applicationRecorded ? <p>{t('application.recordedHint')}</p> : taskReadState !== 'ready' ? <div role="status"><p>{t(taskReadState === 'limited' ? 'application.taskCoverage' : 'application.taskReadUnavailable')}</p><Btn variant="ghost" onClick={onRefreshTasks}>{t('application.refreshStatus')}</Btn></div> : <>
+              {!currentPackAudited && !existingTailoredResume && baseResumes.length > 1 && <label style={{ fontSize: 12 }}>{t('application.baseResume')}
+                <select value={selectedResumeId} onChange={event => setSelectedResumeId(event.target.value)} style={{ ...drawerInputSt, width: '100%', margin: '6px 0 12px' }}>{baseResumes.map(resume => <option key={resume.id} value={resume.id}>{resume.isDefault ? `${t('jobs.defaultResume')} — ` : ''}{resume.name}</option>)}</select>
+              </label>}
+              <Btn variant="primary" disabled={autoPreparing || (!currentPackAudited && !canTailorResume)} onClick={() => {
+                if (currentPackAudited) {
+                  if (job.url && /^https?:\/\//i.test(job.url)) window.open(job.url, '_blank', 'noopener,noreferrer')
+                  else setOpenPackItem('resume')
+                } else if (auditNeedsEvidence || auditNeedsRepair || auditRetryOnly) openAudit()
+                else void autoTailorAndAudit()
+              }}>
+                {autoPreparing ? t('jobs.pack.preparing') : currentPackAudited ? t(job.url && /^https?:\/\//i.test(job.url) ? 'application.openEmployer' : 'application.viewMaterials') : auditNeedsEvidence ? t('application.provideInformation') : auditNeedsRepair || auditRetryOnly ? t('application.reviewIssues') : auditStale ? t('application.checkMaterials') : existingTailoredResume ? t('application.checkMaterials') : t('application.prepareMaterials')}
+              </Btn>
+            </>}
             {autoPreparing && <PreparationProgress stage={packStage} elapsed={preparationElapsed} />}
-            <div style={{ textAlign: 'center', fontSize: 13, lineHeight: 1.55, color: 'var(--text-muted)', margin: '12px 28px 28px' }}>{auditRetryOnly ? t('jobs.auditRetryHint') : auditNeedsEvidence ? t('jobs.auditEvidenceHint') : auditNeedsRepair ? t('jobs.auditRepairHint') : t('jobs.auditPrepareHint')}</div>
-            <div style={{ borderTop: '1px solid var(--border)', paddingTop: 22, fontSize: 12, fontWeight: 700, letterSpacing: '0.03em', color: '#64748b' }}>{t('jobs.drawer.applicationPack')}</div>
+            <p style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{currentPackAudited ? t('application.manualHint') : t('application.materialsHint')}</p>
+            <div style={{ borderTop: '1px solid var(--border)', paddingTop: 22, fontSize: 12, fontWeight: 700, color: 'var(--text-muted)' }}>{t('jobs.drawer.applicationPack')}</div>
             <style>{`@keyframes pack-line-grow { from { transform: scaleY(0) } to { transform: scaleY(1) } } @keyframes pack-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(37,99,235,.35) } 50% { box-shadow: 0 0 0 7px rgba(37,99,235,0) } }`}</style>
             <PackRow number="1" title={t('jobs.pack.resume')} detail={packStage === 'resume' ? t('jobs.pack.tailoring') : t('jobs.pack.tailoredRole')} done={Boolean(previewResumeId)} active={packStage === 'resume'} open={openPackItem === 'resume'} onToggle={() => setOpenPackItem(current => current === 'resume' ? null : 'resume')}>
               <ResumePackPreview resume={resumePreview} onReview={() => setDocumentPreview('resume')} />
+              {previewResumeId && <Btn variant="ghost" small onClick={() => onOpenTailoredResume(previewResumeId)}>{t('application.editResume')}</Btn>}
             </PackRow>
-            <PackRow number="2" title={t('jobs.pack.coverLetter')} detail={packStage === 'coverLetter' ? t('jobs.pack.writingCoverLetter') : selectedCoverLetter ? t('jobs.pack.generatedJob') : t('jobs.pack.autoPreparation')} done={Boolean(selectedCoverLetter)} active={packStage === 'coverLetter'} open={openPackItem === 'coverLetter'} onToggle={() => setOpenPackItem(current => current === 'coverLetter' ? null : 'coverLetter')}>
+            <PackRow number="2" title={t('jobs.pack.coverLetter')} detail={packStage === 'coverLetter' ? t('jobs.pack.writingCoverLetter') : selectedCoverLetter ? t('jobs.pack.generatedJob') : t('application.coverLetterOptional')} done={Boolean(selectedCoverLetter)} active={packStage === 'coverLetter'} open={openPackItem === 'coverLetter'} onToggle={() => setOpenPackItem(current => current === 'coverLetter' ? null : 'coverLetter')}>
               <CoverLetterPackPreview coverLetter={selectedCoverLetter ?? null} applicant={resumePreview?.content.contact} fallbackName={resumePreview?.name ?? 'Applicant'} company={job.company} role={job.role} templateId={resumePreview?.templateId ?? undefined} templateOptions={resumePreview?.templateOptions ?? undefined} onReview={() => setDocumentPreview('coverLetter')} />
             </PackRow>
-            <PackRow number="3" title={t('jobs.pack.audit')} detail={packStage === 'audit' ? t('jobs.pack.checkingChanges') : auditRetryOnly ? t('jobs.pack.retryResponse') : auditNeedsEvidence ? `${evidenceGapFindings.length} ${t('jobs.auditFactsCount')}` : auditNeedsRepair ? `${factualAuditFindings.length} ${t('jobs.auditIssuesCount')}` : displayedAudit ? t('jobs.pack.verifiedFacts') : t('jobs.pack.readyRun')} done={currentPackAudited} failed={auditNeedsRepair || auditNeedsEvidence || auditRetryOnly} active={packStage === 'audit'} open={openPackItem === 'audit'} onToggle={() => setOpenPackItem(current => current === 'audit' ? null : 'audit')}>
-              <AuditPackPreview audit={displayedAudit} onRepair={() => void autoTailorAndAudit()} onAddEvidence={finding => { setEvidenceFinding(finding); setEvidenceText('') }} repairing={autoPreparing} />
-            </PackRow>
+            <div ref={auditSectionRef}><PackRow last number="3" title={t('jobs.pack.audit')} detail={packStage === 'audit' ? t('jobs.pack.checkingChanges') : auditRetryOnly ? t('jobs.pack.retryResponse') : auditNeedsEvidence ? `${evidenceGapFindings.length} ${t('jobs.auditFactsCount')}` : auditNeedsRepair ? `${factualAuditFindings.length} ${t('jobs.auditIssuesCount')}` : displayedAudit ? t('jobs.pack.verifiedFacts') : t('jobs.pack.readyRun')} done={currentPackAudited} failed={auditNeedsRepair || auditNeedsEvidence || auditRetryOnly} active={packStage === 'audit'} open={openPackItem === 'audit'} onToggle={() => setOpenPackItem(current => current === 'audit' ? null : 'audit')}>
+              <AuditPackPreview audit={displayedAudit} onRepair={() => void autoTailorAndAudit()} onAddEvidence={finding => { setEvidenceFinding(finding); setEvidenceText('') }} repairing={autoPreparing || Boolean(task) || taskReadState !== 'ready'} />
+            </PackRow></div>
             {currentPackAudited && <button onClick={() => void downloadFinalPack()} disabled={downloadingPack} style={{ width: '100%', minHeight: 46, border: 0, borderRadius: 9, background: '#2563eb', color: '#fff', fontWeight: 700, cursor: 'pointer' }}>{downloadingPack ? (exportedPackFolder ? t('jobs.pack.openingFolder') : t('jobs.pack.savingPdfs')) : exportedPackFolder ? t('jobs.pack.openFolder') : t('jobs.pack.savePdfs')}</button>}
-            <PackRow number="4" title={t('jobs.pack.openFill')} detail={applicationPreflight.canAutomate ? t('jobs.pack.availableComplete') : t('jobs.pack.requiresLink')} done={false} locked={!currentPackAudited || !applicationPreflight.canAutomate} last onClick={currentPackAudited && applicationPreflight.canAutomate && job.url ? () => window.open(job.url!, '_blank', 'noopener,noreferrer') : undefined} />
-            <div style={{ borderTop: '1px solid var(--border)', marginTop: 8, paddingTop: 22 }}><div style={{ fontSize: 12, fontWeight: 700, color: '#64748b', marginBottom: 12 }}>{t('jobs.drawer.reviewSubmit')}</div><div style={{ border: '1px solid #bfdbfe', background: '#f8fbff', borderRadius: 9, padding: '14px 16px', display: 'flex', gap: 12, fontSize: 13, lineHeight: 1.55 }}><Info size={22} color="#2563eb" style={{ flexShrink: 0, marginTop: 1 }} /><span><strong>{t('jobs.pack.submitEmployer')}</strong><br /><span style={{ color: 'var(--text-muted)' }}>{t('jobs.pack.openWhenReady')}</span></span></div></div>
+            <div style={{ borderTop: '1px solid var(--border)', paddingTop: 16 }}>
+              <strong style={{ fontSize: 13 }}>{t('application.method')}</strong>
+              <p style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{applicationPreflight.canAutomate ? t('application.agentMethodHint') : t('application.manualMethodHint')}</p>
+              {(!currentPackAudited || task || applicationRecorded) && job.url && /^https?:\/\//i.test(job.url) && <a href={job.url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--primary)', fontSize: 12 }}>{t('application.openEmployer')}</a>}
+              {!task && <Btn variant="ghost" small onClick={() => navigate('agent')}>{t('application.openAgent')}</Btn>}
+              {!task && taskReadState === 'ready' && !applicationRecorded && <Btn variant="ghost" small disabled={recordingSubmission} onClick={() => void recordManualSubmission()}>{t('application.recordManual')}</Btn>}
+            </div>
             <div style={{ borderTop: '1px solid var(--border)', marginTop: 28, paddingTop: 22 }}>
               <div style={{ fontSize: 12, fontWeight: 700, color: '#64748b', marginBottom: 16 }}>{t('jobs.drawer.jobDetails')}</div>
               <JobDetail label={t('jobs.companyLabel')} value={job.company} />
@@ -1069,12 +1093,6 @@ function renderSalary(salary: unknown): string {
   return String(salary)
 }
 
-type StoredApplicationAudit = {
-  resumeId: string
-  coverLetterId: string | null
-  audit: ApplicationAudit
-}
-
 function findLatestApplicationAudit(activity: Activity[]): StoredApplicationAudit | null {
   for (const item of activity) {
     const prefix = '[Auditor] application-audit '
@@ -1089,23 +1107,13 @@ function findLatestApplicationAudit(activity: Activity[]): StoredApplicationAudi
   return null
 }
 
-const workflowDocumentButton: React.CSSProperties = {
-  width: '100%', display: 'flex', alignItems: 'center', gap: 12, padding: '16px',
-  border: '1px solid #dbe1ea', background: '#fff', borderRadius: 12,
-  color: 'var(--text)', cursor: 'pointer', fontSize: 14,
-}
-
-function ReferenceProgress({ ready }: { ready: boolean }) {
-  const steps = ['Prepare', 'Pack', 'Review', 'Apply']
-  const active = ready ? 3 : 0
-  return <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, padding: '22px 28px 25px', borderBottom: '1px solid var(--border)' }}>{steps.map((label, index) => <div key={label} style={{ textAlign: 'center', position: 'relative' }}>{index < 3 && <span style={{ position: 'absolute', height: 2, background: index < active ? '#2563eb' : '#dbe1ea', top: 18, left: '62%', right: '-38%' }} />}<span style={{ position: 'relative', zIndex: 1, margin: '0 auto 8px', display: 'grid', placeItems: 'center', width: 36, height: 36, borderRadius: '50%', border: `2px solid ${index === active ? '#2563eb' : '#dbe1ea'}`, color: index === active ? '#2563eb' : '#64748b', background: '#fff', fontSize: 15 }}>{index + 1}</span><div style={{ color: index === active ? '#2563eb' : '#64748b', fontSize: 12, fontWeight: index === active ? 700 : 500 }}>{label}</div></div>)}</div>
-}
-
 function PackRow({ number, title, detail, done, failed = false, active = false, locked, onClick, onToggle, open, children, last = false }: {
   number: string; title: string; detail: string; done: boolean; failed?: boolean; locked?: boolean; onClick?: () => void
   active?: boolean; onToggle?: () => void; open?: boolean; children?: React.ReactNode; last?: boolean
 }) {
-  const status = locked ? 'Locked' : active ? 'In progress' : failed ? 'Needs correction' : done ? (title === 'Independent audit' ? 'Passed' : 'Completed') : 'Pending'
+  const { t } = useI18n()
+  const status = t(locked ? 'application.locked' : active ? 'application.inProgress' : failed ? 'application.needsCorrection'
+    : done ? number === '3' ? 'application.checkPassed' : 'application.materialAvailable' : number === '2' ? 'application.notSelected' : 'application.notComplete')
   return <div style={{ display: 'grid', gridTemplateColumns: '42px 1fr', gap: 12, position: 'relative' }}>
     <div style={{ position: 'relative', display: 'flex', justifyContent: 'center' }}>
       {!last && <span style={{ position: 'absolute', top: 32, bottom: 0, width: 2, background: done ? '#75b85a' : active ? '#60a5fa' : '#dbe1ea', transformOrigin: 'top', animation: 'pack-line-grow .42s ease-out both' }} />}
@@ -1359,9 +1367,13 @@ export function JobsPage() {
   const userId = session?.user?.id ?? ''
   const cachedJobs = defaultJobsCache?.userId === userId ? defaultJobsCache : null
   const [confirm, ConfirmDialog] = useConfirm()
-  const [view,         setView        ] = useState<'list' | 'kanban'>('list')
-  const [search,       setSearch      ] = useState('')
-  const [filterStatus, setFilterStatus] = useState<'all' | JobStatus>('all')
+  const [initialList] = useState(() => readApplicationListState(typeof window === 'undefined' ? '/' : window.location.href))
+  const applicationTasks = useApplicationTasks()
+  const listRef = useRef<HTMLDivElement>(null)
+  const [highlightId, setHighlightId] = useState(() => typeof window === 'undefined' ? null : new URL(window.location.href).searchParams.get('highlight'))
+  const [view,         setView        ] = useState<'list' | 'kanban'>(initialList.view)
+  const [search,       setSearch      ] = useState(initialList.search)
+  const [filterStatus, setFilterStatus] = useState<'all' | JobStatus>(initialList.status)
   const [showAdd,      setShowAdd     ] = useState(false)
   const [prefillStatus, setPrefillStatus] = useState<JobStatus | null>(null)
   const [jobs,         setJobs        ] = useState<Job[]>(() => cachedJobs?.jobs ?? [])
@@ -1370,10 +1382,10 @@ export function JobsPage() {
   const [loading,      setLoading     ] = useState(() => cachedJobs === null)
   const [fetchError,   setFetchError  ] = useState<string | null>(null)
   const [selectedJob,  setSelectedJob ] = useState<Job | null>(null)
-  const [page,         setPage        ] = useState(1)
-  const [pageSize,     setPageSize    ] = useState(20)
-  const [sortBy,       setSortBy      ] = useState<'createdAt' | 'score' | 'company' | 'role'>('createdAt')
-  const [sortDir,      setSortDir     ] = useState<'asc' | 'desc'>('desc')
+  const [page,         setPage        ] = useState(initialList.page)
+  const [pageSize,     setPageSize    ] = useState(initialList.pageSize)
+  const [sortBy,       setSortBy      ] = useState<'createdAt' | 'score' | 'company' | 'role'>(initialList.sortBy)
+  const [sortDir,      setSortDir     ] = useState<'asc' | 'desc'>(initialList.sortDir)
   const sortByRef = useRef(sortBy)
   const sortDirRef = useRef(sortDir)
   const [selectedIds,  setSelectedIds ] = useState<Set<string>>(() => new Set())
@@ -1432,30 +1444,71 @@ export function JobsPage() {
 
   // When the component gains focus (user navigates back from Search), refresh
   useEffect(() => {
-    const onFocus = () => triggerRefresh()
+    const onFocus = () => { triggerRefresh(); void applicationTasks.refetch() }
     const onMessage = (e: MessageEvent) => {
       if (e.data?.type === 'job-saved' || e.data?.type === 'nav-refresh') triggerRefresh()
     }
     window.addEventListener('focus', onFocus)
+    window.addEventListener('applymate:sessions-changed', onFocus)
     window.addEventListener('message', onMessage)
-    return () => { window.removeEventListener('focus', onFocus); window.removeEventListener('message', onMessage) }
+    return () => { window.removeEventListener('focus', onFocus); window.removeEventListener('applymate:sessions-changed', onFocus); window.removeEventListener('message', onMessage) }
+  }, [applicationTasks.refetch])
+
+  useEffect(() => {
+    const href = applicationListUrl(window.location.href, { search, status: filterStatus, page, pageSize, sortBy, sortDir, view })
+    window.history.replaceState({}, '', href)
+  }, [search, filterStatus, page, pageSize, sortBy, sortDir, view])
+
+  useEffect(() => {
+    const restore = () => {
+      const state = readApplicationListState(window.location.href)
+      setSearch(state.search); setFilterStatus(state.status); setPage(state.page); setPageSize(state.pageSize)
+      setSortBy(state.sortBy); setSortDir(state.sortDir); setView(state.view)
+      const id = new URL(window.location.href).searchParams.get('highlight')
+      setHighlightId(id)
+      if (!id) setSelectedJob(null)
+    }
+    window.addEventListener('popstate', restore)
+    return () => window.removeEventListener('popstate', restore)
   }, [])
 
-  // Deep-link: ?highlight=<jobId> from extension sidebar/popup — auto-open the job drawer
+  // Read by ID: the linked application may not be on this page or match this filter.
   useEffect(() => {
-    if (loading || jobs.length === 0) return
-    const params = new URLSearchParams(window.location.search)
-    const highlightId = params.get('highlight')
-    if (!highlightId) return
-    const match = jobs.find(j => j.id === highlightId)
-    if (match) {
-      setSelectedJob(match)
-      // Clean up the URL param without triggering a navigation
+    if (!highlightId || !userId) return
+    // Row selection already provides this record. Avoid a second read racing
+    // with notes or material updates made immediately after opening it.
+    if (selectedJob?.id === highlightId && selectedJob.userId === userId) return
+    const controller = new AbortController()
+    void loadLinkedApplication(highlightId, controller.signal).then(value => {
+      if (controller.signal.aborted) return
+      const linked = value as Job
+      if (linked.userId !== userId) throw new Error('Application unavailable')
+      setSelectedJob(previous => previous?.id === linked.id ? previous : linked)
+    }).catch(() => {
+      if (controller.signal.aborted) return
+      setSelectedJob(null)
+      setHighlightId(null)
       const url = new URL(window.location.href)
       url.searchParams.delete('highlight')
-      window.history.replaceState({}, '', url.toString())
-    }
-  }, [loading, jobs])
+      window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`)
+      toast.error(t('application.linkUnavailable'))
+    })
+    return () => controller.abort()
+  }, [highlightId, userId])
+
+  useEffect(() => {
+    if (!userId) return
+    try { listRef.current?.scrollTo({ top: Number(sessionStorage.getItem(`application-list-scroll:${userId}`) ?? 0) }) } catch { /* optional browser storage */ }
+  }, [userId, loading])
+
+  function selectApplication(job: Job | null) {
+    setSelectedJob(job)
+    setHighlightId(job?.id ?? null)
+    const url = new URL(window.location.href)
+    if (job) url.searchParams.set('highlight', job.id)
+    else url.searchParams.delete('highlight')
+    window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`)
+  }
 
   async function handleStatusChange(jobId: string, newStatus: JobStatus) {
     const previousStatus = jobs.find(job => job.id === jobId)?.status
@@ -1520,6 +1573,7 @@ export function JobsPage() {
     setBulkDeleting(false)
     if (error) { toast.error('Delete failed', error); return }
 
+    for (const id of ids) forgetSavedApplication(userId, id)
     const deletedCount = data?.deleted ?? ids.length
     const deleted = new Set(ids)
     const remainingTotal = Math.max(0, total - deletedCount)
@@ -1548,7 +1602,9 @@ export function JobsPage() {
   }
 
   return (
-    <div className="jobs-page" style={{ flex: 1, overflowY: 'auto', background: 'var(--bg-tertiary)', display: 'flex', flexDirection: 'column' }}>
+    <div ref={listRef} onScroll={event => {
+      if (userId) { try { sessionStorage.setItem(`application-list-scroll:${userId}`, String(event.currentTarget.scrollTop)) } catch { /* optional storage */ } }
+    }} className="jobs-page" style={{ flex: 1, overflowY: 'auto', background: 'var(--bg-tertiary)', display: 'flex', flexDirection: 'column' }}>
       <header className="jobs-page-header" style={{ minHeight: 62, flexShrink: 0, padding: '8px 30px', background: 'var(--bg-tertiary)' }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 24, flexWrap: 'wrap' }}>
           <div style={{ flex: '1 1 360px', display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
@@ -1628,9 +1684,9 @@ export function JobsPage() {
             {view === 'list'
               ? <>
                 <div className="jobs-desktop-list">
-                  <ListView jobs={jobs} onRowClick={setSelectedJob} selectedIds={selectedIds} onToggle={toggleSelected} onToggleAll={toggleAllVisible} />
+                  <ListView taskByJobId={applicationTasks.byJobId} jobs={jobs} onRowClick={selectApplication} selectedIds={selectedIds} onToggle={toggleSelected} onToggleAll={toggleAllVisible} />
                 </div>
-                <MobileListView jobs={jobs} onRowClick={setSelectedJob} selectedIds={selectedIds} onToggle={toggleSelected} />
+                <MobileListView taskByJobId={applicationTasks.byJobId} jobs={jobs} onRowClick={selectApplication} selectedIds={selectedIds} onToggle={toggleSelected} />
               </>
               : <KanbanView jobs={jobs} onStatusChange={handleStatusChange} onAddClick={col => { setPrefillStatus(col); setShowAdd(true) }} />}
 
@@ -1662,8 +1718,12 @@ export function JobsPage() {
 
       {selectedJob && (
         <JobDetailDrawer
+          key={selectedJob.id}
           job={selectedJob}
-          onClose={() => setSelectedJob(null)}
+          task={applicationTasks.byJobId.get(selectedJob.id)}
+          taskReadState={applicationTasks.loading ? 'loading' : applicationTasks.error ? 'unavailable' : applicationTasks.limited ? 'limited' : 'ready'}
+          onRefreshTasks={() => void applicationTasks.refetch()}
+          onClose={() => selectApplication(null)}
           onStatusChange={(id, status) => {
             handleStatusChange(id, status)
             setSelectedJob(prev => prev && prev.id === id ? { ...prev, status } : prev)
@@ -1671,8 +1731,12 @@ export function JobsPage() {
           onUpdate={updated => {
             setJobs(prev => prev.map(j => j.id === updated.id ? updated : j))
             setSelectedJob(updated)
+            defaultJobsCache = null
+            triggerRefresh()
+            window.dispatchEvent(new Event('applymate:jobs-changed'))
           }}
           onDelete={id => {
+            forgetSavedApplication(userId, id)
             const deletedJob = jobs.find(job => job.id === id)
             setJobs(prev => prev.filter(j => j.id !== id))
             setTotal(t => t - 1)

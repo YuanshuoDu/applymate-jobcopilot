@@ -3,6 +3,9 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { useI18n } from '@/lib/i18n'
 import { useNav } from '@/lib/nav-context'
+import { openApplication, openApplicationWhenSaved } from '@/lib/application-navigation'
+import { auditMatchesCurrentMaterials } from '@/lib/application-materials'
+import { applicationMaterialAssignment, selectApplicationCoverLetter } from '@/lib/application-material-selection'
 import { Eye, FileDown, FileText, History, LayoutTemplate, Plus, ShieldCheck, Type, Upload } from 'lucide-react'
 import './ResumePage.css'
 
@@ -79,27 +82,6 @@ type AuditApplyResponse = {
   coverLetter: CoverLetter | null
   resumeUpdatedAt?: string
   coverLetterUpdatedAt?: string
-}
-
-function auditMatchesCurrentMaterials(
-  record: StoredApplicationAudit | null,
-  resumeId: string | null,
-  coverLetterId: string | null,
-  resumeUpdatedAt: string | null,
-  coverLetterUpdatedAt: string | null,
-  dirty: boolean,
-) {
-  if (dirty || !record || record.resumeId !== resumeId || record.coverLetterId !== coverLetterId) return false
-  const auditedAt = Date.parse(record.audit.auditedAt)
-  if (!Number.isFinite(auditedAt)) return false
-
-  // New records carry exact document revisions. Legacy activity records only
-  // have auditedAt, so use it as a conservative lower-bound check instead.
-  if (record.resumeUpdatedAt && resumeUpdatedAt && record.resumeUpdatedAt !== resumeUpdatedAt) return false
-  if (record.coverLetterUpdatedAt && coverLetterUpdatedAt && record.coverLetterUpdatedAt !== coverLetterUpdatedAt) return false
-  if (!record.resumeUpdatedAt && resumeUpdatedAt && auditedAt < Date.parse(resumeUpdatedAt)) return false
-  if (!record.coverLetterUpdatedAt && coverLetterUpdatedAt && auditedAt < Date.parse(coverLetterUpdatedAt)) return false
-  return true
 }
 
 import { Btn, useToast, useConfirm } from '@/components/ui'
@@ -598,6 +580,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   const { navigate } = useNav()
   const [returnToJobs] = useState(() => new URLSearchParams(window.location.search).get('returnToJobs') === '1')
   const [returnJobId] = useState(() => new URLSearchParams(window.location.search).get('returnJobId'))
+  const [returnResumeId] = useState(() => new URLSearchParams(window.location.search).get('resumeId'))
   const toast = useToast()
   const [confirm, ConfirmDialog] = useConfirm()
   const { t } = useI18n()
@@ -691,6 +674,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   // Responses from superseded calls are silently discarded (race-condition guard).
   const analysisEpochRef = useRef(0)
   const [latestApplicationAudit, setLatestApplicationAudit] = useState<StoredApplicationAudit | null>(null)
+  const [invalidatedAuditAt, setInvalidatedAuditAt] = useState<string | null>(null)
   const [auditingApplication, setAuditingApplication] = useState(false)
   const [applyingAuditFinding, setApplyingAuditFinding] = useState<number | null>(null)
   const [auditError, setAuditError] = useState<string | null>(null)
@@ -700,15 +684,6 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   const [showTemplates,   setShowTemplates]   = useState(false)
   const [showCoverLetter, setShowCoverLetter] = useState(false)
   const [showFinalConfirm, setShowFinalConfirm] = useState(false)
-  // Confirmation is scoped to a resume. A global boolean made the previously
-  // confirmed resume look ready after the user selected a different version.
-  const [applicationPackReadyResumeId, setApplicationPackReadyResumeId] = useState<string | null>(null)
-  useEffect(() => {
-    if (!dirty || !selectedResumeId) return
-    // Any edit invalidates the previously confirmed copy. The user must run
-    // the independent audit again before the application pack can be confirmed.
-    setApplicationPackReadyResumeId(previous => previous === selectedResumeId ? null : previous)
-  }, [dirty, selectedResumeId])
   const [exportedPackFolder, setExportedPackFolder] = useState<string | null>(null)
   const [showNewResume,   setShowNewResume]   = useState(false)
   const [renamingResume,  setRenamingResume]  = useState<ResumeListItem | null>(null)
@@ -1270,6 +1245,8 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
 
     isSavingRef.current = true
     setSaving(true)
+    const contentSnapshot = latestContent.current
+    const orderSnapshot = latestSectionOrder.current
     const snapshot = {
       name:            latestResumeName.current,
       content:         { ...latestContent.current, sectionOrder: latestSectionOrder.current },
@@ -1280,8 +1257,8 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     isSavingRef.current = false
     setSaving(false)
 
-    if (error) {
-      toast.error('Save failed', error)
+    if (error || !data) {
+      toast.error('Save failed', error ?? 'No saved resume was returned. Please try again.')
       return false
     } else {
       if (data) {
@@ -1290,13 +1267,22 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
           ? { ...resume, name: data.name, updatedAt: data.updatedAt }
           : resume))
       }
+      const changedDuringSave = latestContent.current !== contentSnapshot
+        || latestSectionOrder.current !== orderSnapshot
+        || latestResumeName.current !== snapshot.name
+        || latestTemplateId.current !== snapshot.templateId
+        || latestTemplateOptions.current !== snapshot.templateOptions
+      if (pendingSaveRef.current || changedDuringSave) {
+        pendingSaveRef.current = false
+        // Await later edits too, so leaving the editor cannot cancel their save.
+        return handleSave()
+      }
+      dirtyRef.current = false
       setDirty(false)
       setLastSavedAt(new Date())
       toast.success('Saved', 'Resume updated successfully')
       // Re-analysis is intentionally NOT triggered here — the AiPanel stale indicator
       // prompts the user to re-analyse when ready, avoiding a token burn on every save.
-      // If new edits arrived while we were saving, save again immediately
-      if (pendingSaveRef.current) { pendingSaveRef.current = false; void handleSave() }
       return true
     }
   }
@@ -1537,21 +1523,41 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   // a previously selected job kept stale opportunity details visible after a
   // resume switch or after cancelling a link.
   const linkedJob = resumeLinkedJob
+  const linkedJobId = selectedResume?.targetJobId ?? resumeLinkedJob?.id
+    ?? (selectedResumeId === returnResumeId ? returnJobId : null)
+  useEffect(() => {
+    if (!linkedJobId || jobs.some(job => job.id === linkedJobId)) return
+    let cancelled = false
+    // The linked opportunity may be outside the first page of the job list.
+    void fetch(`/api/jobs/${encodeURIComponent(linkedJobId)}`)
+      .then(response => response.ok ? response.json() as Promise<Job> : null)
+      .then(job => {
+        if (!cancelled && job?.id === linkedJobId
+          && (selectedResume?.targetJobId === job.id || job.finalResumeId === selectedResumeId)) {
+          setJobs(previous => previous.some(item => item.id === job.id) ? previous : [...previous, job])
+        }
+      })
+      .catch(() => undefined)
+    return () => { cancelled = true }
+  }, [linkedJobId, jobs, selectedResume?.targetJobId, selectedResumeId])
+
+  async function returnToApplication(jobId: string) {
+    const opened = await openApplicationWhenSaved(jobId, navigate, {
+      isSaving: () => isSavingRef.current,
+      hasChanges: () => dirtyRef.current,
+      save: handleSave,
+    })
+    if (!opened && isSavingRef.current) toast.info(t('resume.toastSaving'), t('resume.toastSavingDetail'))
+  }
   const templateName = TEMPLATES.find(template => template.id === templateId)?.name ?? templateId
   const pendingSuggestions = suggestions.filter(suggestion => !isAuditSuggestion(suggestion) && !suggestion.applied).length
-  const { data: linkedCoverLetters } = useApi<CoverLetter[]>(`/api/jobs/${resumeLinkedJob?.id ?? '__none__'}/cover-letters`)
-  const matchingCoverLetters = linkedCoverLetters?.filter(letter =>
-    letter.resumeId === selectedResumeId || letter.resumeId === null,
-  ) ?? []
-  const linkedFinalCoverLetter = matchingCoverLetters.find(letter => letter.id === resumeLinkedJob?.finalCoverLetterId)
-    ?? matchingCoverLetters[0]
-    ?? null
-  const savedFinalCoverLetter = latestSavedCoverLetter
-    && latestSavedCoverLetter.jobId === resumeLinkedJob?.id
-    && (latestSavedCoverLetter.resumeId === selectedResumeId || latestSavedCoverLetter.resumeId === null)
-    ? latestSavedCoverLetter
-    : null
-  const finalCoverLetter = savedFinalCoverLetter ?? linkedFinalCoverLetter
+  const { data: linkedCoverLetters, refetch: refetchLinkedCoverLetters } = useApi<CoverLetter[]>(`/api/jobs/${resumeLinkedJob?.id ?? '__none__'}/cover-letters`)
+  const finalCoverLetter = resumeLinkedJob && selectedResumeId ? selectApplicationCoverLetter({
+    jobId: resumeLinkedJob.id,
+    resumeId: selectedResumeId,
+    finalResumeId: resumeLinkedJob.finalResumeId,
+    finalCoverLetterId: resumeLinkedJob.finalCoverLetterId,
+  }, linkedCoverLetters ?? [], latestSavedCoverLetter) : null
   const { data: storedApplicationAudit } = useApi<StoredApplicationAudit | null>(`/api/jobs/${resumeLinkedJob?.id ?? '__none__'}/audit-application`)
   const currentApplicationAuditRecord = auditMatchesCurrentMaterials(
     latestApplicationAudit,
@@ -1572,7 +1578,14 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       )
       ? storedApplicationAudit
       : null
-  const currentApplicationAudit = currentApplicationAuditRecord?.audit ?? null
+  const currentApplicationAudit = currentApplicationAuditRecord?.audit.auditedAt !== invalidatedAuditAt
+    ? currentApplicationAuditRecord?.audit ?? null : null
+  const applicationMaterialsConfirmed = Boolean(
+    currentApplicationAudit?.verdict === 'pass'
+    && !dirty && !saving
+    && resumeLinkedJob?.finalResumeId === selectedResumeId
+    && (resumeLinkedJob?.finalCoverLetterId ?? null) === (finalCoverLetter?.id ?? null),
+  )
   const displayedApplicationAuditRecord = [latestApplicationAudit, storedApplicationAudit].find(record =>
     record
       && record.resumeId === selectedResumeId
@@ -1732,19 +1745,27 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
 
   async function confirmApplicationPack(audit: ApplicationAudit): Promise<boolean> {
     if (!selectedResumeId || !resumeLinkedJob) return false
-    if (audit.verdict !== 'pass') {
+    if (audit.verdict !== 'pass' || currentApplicationAudit?.auditedAt !== audit.auditedAt || dirty || saving) {
       toast.warning('Audit must pass', 'Resolve all Auditor findings before confirming this application package.')
       return false
     }
-    const { data, error } = await apiMutate<Job>(`/api/jobs/${resumeLinkedJob.id}/assign`, 'PATCH', {
-      finalResumeId: selectedResumeId,
-      finalCoverLetterId: finalCoverLetter?.id ?? null,
-    })
+    const assignment = applicationMaterialAssignment(selectedResumeId, finalCoverLetter?.id ?? null, resumeLinkedJob.finalCoverLetterId)
+    const { data, error } = await apiMutate<Job>(`/api/jobs/${resumeLinkedJob.id}/assign`, 'PATCH', assignment)
     if (!data || error) {
       toast.error('Could not confirm application pack', error ?? 'Please try again')
       return false
     }
     setJobs(previous => previous.map(job => job.id === data.id ? data : job))
+    if (assignment.finalCoverLetterId) {
+      setInvalidatedAuditAt(audit.auditedAt)
+      // Selecting a different letter changes its server revision. Reload it
+      // and require an audit of that revision instead of inventing readiness.
+      setLatestSavedCoverLetter(null)
+      setLatestApplicationAudit(null)
+      await refetchLinkedCoverLetters()
+      toast.info(t('resume.materialSelectionChanged'), t('resume.materialSelectionRecheck'))
+      return false
+    }
     setResumes(previous => previous.map(resume => {
       if (resume.id === selectedResumeId) {
         return { ...resume, _count: { finalForJobs: Math.max(1, resume._count?.finalForJobs ?? 0) } }
@@ -1754,17 +1775,11 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       }
       return resume
     }))
-    setApplicationPackReadyResumeId(selectedResumeId)
     toast.success('Application pack confirmed', finalCoverLetter
-      ? 'Audited final resume and cover letter are ready in My Jobs and for PDF export'
-      : 'Audited final resume is ready in My Jobs and for PDF export')
+      ? 'Audited final resume and cover letter are ready in Applications and for PDF export'
+      : 'Audited final resume is ready in Applications and for PDF export')
     if (returnToJobs) {
-      const url = new URL(window.location.href)
-      url.searchParams.delete('returnToJobs')
-      url.searchParams.delete('returnJobId')
-      if (returnJobId) url.searchParams.set('highlight', returnJobId)
-      window.history.replaceState({}, '', url.toString())
-      navigate('jobs')
+      openApplication(data.id, navigate)
     }
     return true
   }
@@ -2002,7 +2017,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       <header className="resume-library-heading">
         <div>
           <h1>{t('resume.library')}</h1>
-          {returnToJobs && <button onClick={() => navigate('jobs')} style={{ marginTop: 4, padding: 0, border: 'none', background: 'none', color: 'var(--primary)', cursor: 'pointer', fontSize: 12 }}>← {t('resume.backToJobs')}</button>}
+          {returnToJobs && (returnJobId || linkedJobId) && <button disabled={saving} onClick={() => void returnToApplication(returnJobId || linkedJobId!)} style={{ marginTop: 4, padding: 0, border: 'none', background: 'none', color: 'var(--primary)', cursor: 'pointer', fontSize: 12 }}>← {t('resume.backToApplication')}</button>}
         </div>
       <div className="resume-library-toolbar">
         <div className="resume-library-toolbar-actions">
@@ -2017,7 +2032,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
         <div className="resume-final-confirm-trigger"><Btn variant="toolbar" onClick={() => {
           if (!selectedResumeId || !content) { toast.info('Select a resume first'); return }
           setShowFinalConfirm(true)
-        }}><ShieldCheck size={15} />{t('resume.finalConfirm')}</Btn></div>
+        }}><ShieldCheck size={15} />{t('resume.confirmMaterials')}</Btn></div>
         <span className={`resume-top-save${dirty ? ' is-unsaved' : ''}`}>{saving ? t('resume.savingStatus') : dirty ? t('resume.savingSoon') : lastSavedAt && Date.now() - lastSavedAt.getTime() >= 5 * 60_000 ? `${t('resume.savedAt')} ${lastSavedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : t('resume.savedJustNow')}</span>
       </div>
       </header>
@@ -2265,7 +2280,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
               <small>{selectedResume?.targetJobId ? 'Tailored version linked' : 'Selected resume linked'}</small>
               <div className="resume-opportunity-actions">
                 <button onClick={() => setShowCoverLetter(true)}>{t('resume.coverLetter')}</button>
-                <button onClick={() => toast.info(t('resume.viewJob'), `${linkedJob.company} · ${linkedJob.role} is linked to this resume`)}>{t('resume.viewJob')}</button>
+                <button disabled={saving} onClick={() => void returnToApplication(linkedJob.id)}>{t('resume.viewApplication')}</button>
               </div>
             </> : <>
               <strong>{t('resume.linkSavedJob')}</strong>
@@ -2385,7 +2400,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
           templateName={templateName}
           pendingSuggestions={pendingSuggestions}
           isDirty={dirty || saving}
-          packReady={applicationPackReadyResumeId === selectedResumeId}
+          packReady={applicationMaterialsConfirmed}
           resumeContent={{ ...(content as ResumeContent), sectionOrder }}
           templateId={templateId}
           templateOptions={templateOptions}

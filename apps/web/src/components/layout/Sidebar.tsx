@@ -45,8 +45,8 @@ const NavIcon = ({ id }: { id: string }) => {
 export function getSidebarNavItems(t: (key: string) => string): SidebarNavItem[] {
   return [
     { id: 'dashboard', label: t('nav.dashboard') },
-    { id: 'jobs',      label: t('nav.jobs')      },
     { id: 'search',    label: t('nav.search')    },
+    { id: 'jobs',      label: t('nav.jobs')      },
     { id: 'resume',    label: t('nav.resume')    },
     { id: 'gmail',     label: t('nav.gmail')     },
     { id: 'agent',     label: t('nav.agent')     },
