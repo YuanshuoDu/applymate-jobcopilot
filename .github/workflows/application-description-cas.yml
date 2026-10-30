@@ -13,7 +13,7 @@ permissions:
 jobs:
   description-cas-postgres:
     name: Description CAS on disposable PostgreSQL
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     services:
       postgres:
@@ -61,7 +61,7 @@ jobs:
 
   description-browser-mobile-zh:
     name: Description flow in simulated Chinese mobile browser
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
