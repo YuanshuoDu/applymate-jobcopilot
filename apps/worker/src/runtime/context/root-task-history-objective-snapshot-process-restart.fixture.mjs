@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { Pool } from "pg"
 import { createCanonicalTurnRuntime } from "../canonical-turn-runtime.ts"
 import { createPgTaskGraphCommandPort } from "../subagents/pg-task-graph-command-port.ts"
@@ -7,6 +8,11 @@ import { NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA, parseNativeVerificationControl
 import { parseNativeVerificationPacket } from "../subagents/native-verification-packet.ts"
 import { startProductionAgentRuntime as startProductionAgentRuntimeHelper } from "../../queue/production-bootstrap.ts"
 import { startProductionWorkerRuntime } from "../../queue/production-worker-runtime.ts"
+import { readRootTaskHistoryChronologyWitness } from "./root-task-history-chronology-witness.ts"
+import { readRootTaskHistoryFence, rootTaskHistoryOrigin } from "./root-task-history-fence.ts"
+import { createRootTaskHistoryObjectiveSnapshotIdentity } from "./root-task-history-objective-snapshot-codec.ts"
+import { readRootTaskHistorySteerEvidence } from "./root-task-history-steer-evidence.ts"
+import { matchesAgentOutboxIdentity } from "../outbox-identity.ts"
 const [, , mode, rawInput] = process.argv
 const input = JSON.parse(rawInput)
 const pool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 5 })
@@ -126,6 +132,202 @@ function historyProjection(request) {
             ? "private_source_sentinel_present" : null
   if (reason) throw new Error(`objective_snapshot_context_invalid:${reason}`)
 }
+function record(value) {
+  if (typeof value === "string") { try { value = JSON.parse(value) } catch { return null } }
+  return value && typeof value === "object" && !Array.isArray(value) ? value : null
+}
+function flag(value) { return value === true ? "enabled" : value === false ? "disabled" : "unknown" }
+function smallCount(value) { return value === 0 ? "0" : value === 1 ? "1" : "2+" }
+function historyDiagnosisLine(facts) {
+  return Object.entries(facts).map(([key, value]) => `${key}=${value}`).join(" ")
+}
+function noteProbeFailure(facts, error) {
+  const code = error && typeof error === "object" ? error.code : undefined
+  const message = error && typeof error === "object" && typeof error.message === "string" ? error.message : ""
+  if (["57014", "55P03", "ETIMEDOUT", "ESOCKETTIMEDOUT", "ETIME"].includes(code) || /timeout/i.test(message)) {
+    facts.probe = "timeout_inconclusive"
+  }
+  else if (facts.probe === "complete") facts.probe = "incomplete"
+}
+async function runLockingProbe(client, name, facts, operation) {
+  // Existing validators lock rows; rolling back this savepoint releases probe locks immediately.
+  await client.query(`SAVEPOINT ${name}`)
+  let value, ok = true
+  try { value = await operation() } catch (error) { ok = false; noteProbeFailure(facts, error) }
+  try {
+    await client.query(`ROLLBACK TO SAVEPOINT ${name}`)
+    await client.query(`RELEASE SAVEPOINT ${name}`)
+  } catch (error) { ok = false; noteProbeFailure(facts, error) }
+  return { ok, value }
+}
+async function diagnoseHistoryEligibility(runtimeGateEnabled) {
+  const facts = {
+    sample: "after_context", consistency: "read_committed", clock: "postgres_sample",
+    liveOwner: "unknown", authRows: "unknown", authState: "unknown", authPayload: "unknown", consent: "unknown",
+    capturedGate: "unknown", runtimeGate: flag(runtimeGateEnabled), observedReadGate: "unknown", observedSteer: "not_reached",
+    observedTurnOrigin: "not_reached", observedRootFence: "not_reached", observedFenceOrigin: "not_reached",
+    observedObjective: "not_reached", observedStartWitness: "not_reached", observedIdentity: "not_reached", probe: "complete",
+  }
+  let client
+  let transactionStarted = false
+  try {
+    client = await pool.connect()
+    await client.query("BEGIN ISOLATION LEVEL READ COMMITTED")
+    transactionStarted = true
+    await client.query("SET LOCAL lock_timeout='250ms'")
+    await client.query("SET LOCAL statement_timeout='2000ms'")
+    const clock = await client.query(`SELECT clock_timestamp() AS "sampledAt"`)
+    const sampledAtValue = clock.rows[0]?.sampledAt
+    const sampledAt = sampledAtValue instanceof Date ? sampledAtValue : new Date(sampledAtValue)
+    if (clock.rows.length !== 1 || !Number.isFinite(sampledAt.getTime())) throw new Error("diagnostic_clock_unavailable")
+    const current = await client.query(`SELECT turn."userId",turn."sessionId",turn."id" AS "turnId",
+        turn."source" AS "turnSource",turn."input" AS "turnInput",turn."leaseOwnerId" AS "ownerId",
+        turn."leaseVersion",turn."leaseStartedAt",turn."leaseExpiresAt",root."id" AS "rootTaskId",
+        root."attemptCount" AS "rootAttemptCount",step."id" AS "stepId",
+        step."inputThroughSequence"::text AS "inputThroughSequence"
+      FROM "agent_turns" turn JOIN "sub_agent_tasks" root ON root."id"=turn."rootTaskId"
+        AND root."sessionId"=turn."sessionId" AND root."turnId"=turn."id" AND root."rootTaskId"=root."id"
+      JOIN "agent_steps" step ON step."sessionId"=turn."sessionId" AND step."turnId"=turn."id"
+        AND step."taskId"=root."id" AND step."attempt"=root."attemptCount" AND step."status"='streaming'
+      WHERE turn."id"=$1 AND turn."status"='in_progress' AND turn."leaseOwnerId" IS NOT NULL
+        AND turn."leaseExpiresAt">$2 AND root."status"='running'
+        AND root."leaseOwner"=turn."leaseOwnerId" AND root."leaseExpiresAt">$2
+      ORDER BY step."ordinal" DESC LIMIT 2`, [input.turnId, sampledAt])
+    facts.liveOwner = current.rows.length === 1 ? "present" : current.rows.length ? "ambiguous" : "missing"
+    if (current.rows.length === 1) {
+      const owner = current.rows[0]
+      const origin = rootTaskHistoryOrigin(owner.turnSource, owner.turnInput)
+      facts.observedTurnOrigin = origin ? "present" : "missing"
+      await client.query("SELECT set_config($1,$2,true)", ["app.user_id", owner.userId])
+      const key = `root-task-history-session-authorization:${owner.sessionId}:v1`
+      const expectedId = `agent-root-task-history-${createHash("sha256").update(key).digest("hex")}`
+      const authRows = await client.query(`SELECT "id","sessionId","turnId","taskId","sequence"::text AS "sequence",
+          "itemId","type","actor","correlationId","causationId","idempotencyKey","payload"
+        FROM "agent_events" WHERE "idempotencyKey"=$1 OR "id"=$2 ORDER BY "sequence" LIMIT 2`, [key, expectedId])
+      facts.authRows = smallCount(authRows.rows.length)
+      let authorization
+      if (authRows.rows.length === 1) {
+        const event = authRows.rows[0], payload = record(event.payload)
+        const exactKeys = payload && Object.keys(payload).sort().join(",")
+          === "consentEnabled,consentVersion,gateEnabledAtCapture,schemaVersion,sessionId,userId"
+        const payloadValid = exactKeys && payload.schemaVersion === "agent-harness.v2.root-task-history-session-authorization.v1"
+          && payload.sessionId === owner.sessionId && payload.userId === owner.userId
+          && typeof payload.consentEnabled === "boolean" && typeof payload.gateEnabledAtCapture === "boolean"
+          && Number.isSafeInteger(payload.consentVersion) && payload.consentVersion >= 0
+        facts.consent = flag(payload?.consentEnabled)
+        facts.capturedGate = flag(payload?.gateEnabledAtCapture)
+        const eventIdentityValid = event.id === expectedId && event.idempotencyKey === key && event.sessionId === owner.sessionId
+        const eventValid = eventIdentityValid && event.type === "agent.plan.root_task_history_session_authorization"
+          && event.actor === "orchestrator" && event.itemId === null && event.causationId === null
+          && typeof event.taskId === "string" && event.taskId.length > 0 && event.taskId.trim() === event.taskId && event.correlationId === event.taskId
+          && /^(0|[1-9][0-9]*)$/.test(event.sequence) && event.sequence !== "0"
+        let retainedOwnerValid = false, outboxValid = false
+        if (payloadValid && eventValid) {
+          const retained = await client.query(`SELECT turn."id" FROM "agent_turns" turn
+            JOIN "sub_agent_tasks" task ON task."id"=$4 AND task."sessionId"=$2 AND task."turnId"=$1
+              AND task."rootTaskId"=task."id" AND task."parentTaskId" IS NULL
+              AND task."role"='orchestrator' AND task."taskType"='root'
+            JOIN "agent_sessions" session ON session."id"=task."sessionId" AND session."userId"=$3
+            WHERE turn."id"=$1 AND turn."sessionId"=$2 AND turn."userId"=$3 AND turn."rootTaskId"=$4 LIMIT 2`,
+          [event.turnId, owner.sessionId, owner.userId, event.taskId])
+          retainedOwnerValid = retained.rows.length === 1
+          const outboxRows = await client.query(`SELECT "id","topic","aggregateId","idempotencyKey","payload"
+            FROM "agent_outbox" WHERE "idempotencyKey"=$1 OR "id"=$2 LIMIT 2`,
+          [`agent-event:${event.id}`, `agent-outbox-${event.id}`])
+          const expectedOutbox = {
+            id: `agent-outbox-${event.id}`, topic: "agent.events", aggregateId: owner.sessionId,
+            idempotencyKey: `agent-event:${event.id}`,
+            payload: { eventId: event.id, sessionId: event.sessionId, turnId: event.turnId, taskId: event.taskId,
+              itemId: null, sequence: BigInt(event.sequence).toString(), type: event.type, actor: event.actor,
+              correlationId: event.correlationId, causationId: null, idempotencyKey: key, payload: event.payload },
+          }
+          outboxValid = outboxRows.rows.length === 1 && matchesAgentOutboxIdentity(outboxRows.rows[0], expectedOutbox)
+        }
+        const authorizationValid = payloadValid && eventValid && retainedOwnerValid && outboxValid
+        facts.authState = !eventIdentityValid ? "identity_conflict" : authorizationValid ? "valid" : "invalid"
+        facts.authPayload = authorizationValid ? "valid" : "invalid"
+        if (authorizationValid) authorization = {
+          eventId: event.id, sessionId: payload.sessionId, userId: payload.userId,
+          consentVersion: payload.consentVersion, consentEnabled: payload.consentEnabled,
+          gateEnabledAtCapture: payload.gateEnabledAtCapture,
+        }
+        facts.observedReadGate = authorizationValid
+          ? runtimeGateEnabled === true && authorization.consentEnabled ? "enabled" : "disabled"
+          : "unknown"
+      } else {
+        if (authRows.rows.length) {
+          facts.authState = "multiple_identity"
+          facts.authPayload = "multiple"
+        } else {
+          const orphanOutbox = await client.query(`SELECT "id" FROM "agent_outbox"
+            WHERE "idempotencyKey"=$1 OR "id"=$2 LIMIT 2`,
+          [`agent-event:${expectedId}`, `agent-outbox-${expectedId}`])
+          facts.authState = orphanOutbox.rows.length ? "orphan_outbox" : "missing"
+          facts.authPayload = facts.authState
+        }
+      }
+
+      const lease = {
+        userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, ownerId: owner.ownerId,
+        leaseVersion: Number(owner.leaseVersion), leaseStartedAt: owner.leaseStartedAt, leaseExpiresAt: owner.leaseExpiresAt,
+      }
+      const scope = { userId: owner.userId }
+      const steerProbe = await runLockingProbe(client, "history_steer_probe", facts, () =>
+        readRootTaskHistorySteerEvidence(client, scope, {
+          sessionId: owner.sessionId, turnId: owner.turnId, stepId: owner.stepId,
+          lease: { ownerId: owner.ownerId, leaseVersion: Number(owner.leaseVersion), now: sampledAt },
+        }))
+      const steerEvidence = steerProbe.ok ? steerProbe.value : undefined
+      facts.observedSteer = steerProbe.ok ? steerEvidence.kind : "error"
+
+      let fence
+      if (facts.observedReadGate === "enabled" && steerEvidence?.kind === "no_accepted_steer") {
+        const fenceProbe = await runLockingProbe(client, "history_fence_probe", facts, () =>
+          readRootTaskHistoryFence(client, {
+            lease, rootTaskId: owner.rootTaskId, rootAttemptCount: Number(owner.rootAttemptCount),
+            stepId: owner.stepId, now: sampledAt, crossSessionRootTaskHistoryEnabled: true,
+          }))
+        fence = fenceProbe.ok ? fenceProbe.value : undefined
+        facts.observedRootFence = fenceProbe.ok ? fence ? "present" : "missing" : "error"
+        facts.observedFenceOrigin = fenceProbe.ok ? fence?.currentOrigin ? "present" : fence ? "missing" : "not_available" : "error"
+        facts.observedObjective = fenceProbe.ok ? fence?.objectiveDigest ? "present" : fence ? "missing" : "not_available" : "error"
+        facts.observedStartWitness = fenceProbe.ok ? fence?.currentStartWitness ? "present"
+          : fence?.currentOrigin ? "missing" : "not_available" : "error"
+      }
+
+      if (facts.observedReadGate === "enabled" && steerEvidence?.kind === "no_accepted_steer"
+        && facts.observedTurnOrigin === "present" && facts.observedStartWitness === "not_available") {
+        const witnessProbe = await runLockingProbe(client, "history_witness_probe", facts, async () => {
+          const starts = await client.query(`SELECT "id" FROM "agent_events"
+            WHERE "sessionId"=$1 AND "turnId"=$2 AND "taskId"=$3 AND "type"='turn.started' LIMIT 2`,
+          [owner.sessionId, owner.turnId, owner.rootTaskId])
+          if (starts.rows.length !== 1) return starts.rows.length ? "ambiguous" : "missing"
+          return (await readRootTaskHistoryChronologyWitness(client, {
+            userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
+            boundary: "turn_start", boundaryEventId: String(starts.rows[0].id),
+          })) ? "present" : "missing"
+        })
+        facts.observedStartWitness = witnessProbe.ok ? witnessProbe.value : "error"
+      }
+
+      const revision = /^(0|[1-9][0-9]*)$/.test(owner.inputThroughSequence ?? "")
+        ? BigInt(owner.inputThroughSequence) : undefined
+      if (authorization && fence && steerEvidence) {
+        facts.observedIdentity = createRootTaskHistoryObjectiveSnapshotIdentity({
+          lease, authorization, fence, acceptedInputRevision: revision, steerEvidence,
+        }) ? "eligible" : "ineligible"
+      }
+    }
+  } catch (error) {
+    noteProbeFailure(facts, error)
+  } finally {
+    if (transactionStarted) {
+      try { await client.query("ROLLBACK") } catch (error) { noteProbeFailure(facts, error) }
+    }
+    client?.release()
+  }
+  return historyDiagnosisLine(facts)
+}
 function spawnedTaskId(request, callId) {
   for (const message of request.messages ?? []) {
     for (const part of message.content ?? []) {
@@ -195,10 +397,16 @@ async function startRuntime(firstWorker) {
             FROM "agent_turns" turn LEFT JOIN "agent_events" event ON event."sessionId"=turn."sessionId"
               AND event."turnId"=turn."id" AND event."type"='agent.plan.root_task_history_memory_snapshot'
             WHERE turn."id"=$1`, [input.turnId])
-          say(`FIXTURE_HISTORY_A snapshots=${stats.rows[0]?.snapshotEvents ?? 0} outcomes=${stats.rows[0]?.snapshotOutcomes ?? 0} sourceQueries=${crossSessionSourceQueries}`)
-          try { historyProjection(request) } catch (error) {
-            const reason = error instanceof Error && error.message.startsWith("objective_snapshot_context_invalid:")
-              ? error.message.slice("objective_snapshot_context_invalid:".length) : "unclassified"
+          let contextFailure
+          try { historyProjection(request) } catch (error) { contextFailure = error }
+          let eligibility = ""
+          if (contextFailure) {
+            try { eligibility = await diagnoseHistoryEligibility(flags.crossSessionRootTaskHistoryEnabled) } catch { eligibility = "probe=incomplete" }
+          }
+          say(`FIXTURE_HISTORY_A snapshots=${stats.rows[0]?.snapshotEvents ?? 0} outcomes=${stats.rows[0]?.snapshotOutcomes ?? 0} sourceQueries=${crossSessionSourceQueries}${eligibility ? ` ${eligibility}` : ""}`)
+          if (contextFailure) {
+            const reason = contextFailure instanceof Error && contextFailure.message.startsWith("objective_snapshot_context_invalid:")
+              ? contextFailure.message.slice("objective_snapshot_context_invalid:".length) : "unclassified"
             say(`FIXTURE_MODEL_CONTEXT_A_INVALID ${reason}`); throw new Error("objective_snapshot_context_invalid")
           }
           calls += 1
