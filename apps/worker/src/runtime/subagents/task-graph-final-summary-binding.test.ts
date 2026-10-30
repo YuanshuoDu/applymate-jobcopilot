@@ -23,10 +23,11 @@ function row(id: string, role: string, taskType: string, result: unknown, attemp
 }
 
 function graph(revision: number, nodeIds: readonly string[], rows: readonly GraphTaskRow[], stateRevision = revision): LoadedGraph {
+  const taskTypes = new Map(rows.map(task => [task.id, task.taskType ?? "task"]))
   return {
     rootTaskId: "root-task",
     item: { id: "task-graph:root-task", revision, content: {}, createdAt: new Date(0) },
-    snapshot: { nodes: nodeIds.map(taskId => ({ taskId })) } as unknown as TaskGraphSnapshot,
+    snapshot: { nodes: nodeIds.map((taskId, nodeIndex) => ({ taskId, key: `node-${nodeIndex}`, templateId: taskTypes.get(taskId) ?? "task" })) } as unknown as TaskGraphSnapshot,
     state: { revision: stateRevision } as LoadedGraph["state"],
     tasks: new Map(rows.map(task => [task.id, task])),
   } as LoadedGraph
@@ -47,6 +48,11 @@ describe("current TaskGraph final-summary binding", () => {
     expect(binding?.summary.discoveredJobs.map(item => item.jobId)).toEqual(["job-current"])
     expect(binding?.summary.taskOutcomes.map(item => item.taskId)).toEqual(["scout-current", "unknown-role"])
     expect(binding?.summary.taskOutcomes[1]?.resultState).toBe("unsupported_role")
+    expect(binding?.members).toEqual([
+      { nodeIndex: 0, nodeKey: "node-0", templateId: "research", taskId: "scout-current", role: "scout", taskType: "research", taskStatus: "completed", kind: "business" },
+      { nodeIndex: 1, nodeKey: "node-1", templateId: "native_verification", taskId: "native-control", role: "auditor", taskType: "native_verification", taskStatus: "completed", kind: "internal_control" },
+      { nodeIndex: 2, nodeKey: "node-2", templateId: "custom", taskId: "unknown-role", role: "unknown_role", taskType: "custom", taskStatus: "completed", kind: "business" },
+    ])
     expect(JSON.stringify(binding)).not.toContain("PRIVATE_ROLE_NARRATIVE")
     expect(JSON.stringify(binding)).not.toContain("PRIVATE_FINAL_TEXT")
     expect(JSON.stringify(binding)).not.toContain("control-job")
@@ -62,6 +68,12 @@ describe("current TaskGraph final-summary binding", () => {
       .toThrow("task_graph_final_summary_task_scope_invalid")
     expect(() => buildTaskGraphFinalSummaryBinding(graph(3, [], [], 2)))
       .toThrow("task_graph_final_summary_graph_invalid")
+  })
+
+  it("preserves the reducer's specific error for duplicate current task identities", () => {
+    const duplicate = graph(3, ["scout", "scout"], [row("scout", "scout", "research", {})])
+    expect(() => buildTaskGraphFinalSummaryBinding(duplicate))
+      .toThrow("task_graph_final_summary_task_identity_conflict")
   })
 
   it("compares revision and full facts, including same-count result changes", () => {
@@ -81,6 +93,26 @@ describe("current TaskGraph final-summary binding", () => {
     expect(sameTaskGraphFinalSummaryBinding(first, sameFacts)).toBe(true)
     expect(sameTaskGraphFinalSummaryBinding(first, sameCountDifferentFact)).toBe(false)
     expect(sameTaskGraphFinalSummaryBinding(first, changedRevision)).toBe(false)
+  })
+
+  it("binds hidden controls and exact graph membership even when the public summary is unchanged", () => {
+    const first = buildTaskGraphFinalSummaryBinding(graph(4, ["scout", "control-a"], [
+      row("scout", "scout", "research", { structuredResult: scoutResult("job-a") }),
+      row("control-a", "auditor", "native_verification", {}),
+    ]))!
+    const changedControl = buildTaskGraphFinalSummaryBinding(graph(4, ["scout", "control-b"], [
+      row("scout", "scout", "research", { structuredResult: scoutResult("job-a") }),
+      row("control-b", "auditor", "native_verification", {}),
+    ]))!
+    const reordered = buildTaskGraphFinalSummaryBinding(graph(4, ["control-a", "scout"], [
+      row("scout", "scout", "research", { structuredResult: scoutResult("job-a") }),
+      row("control-a", "auditor", "native_verification", {}),
+    ]))!
+
+    expect(changedControl.summary).toEqual(first.summary)
+    expect(reordered.summary).toEqual(first.summary)
+    expect(sameTaskGraphFinalSummaryBinding(first, changedControl)).toBe(false)
+    expect(sameTaskGraphFinalSummaryBinding(first, reordered)).toBe(false)
   })
 
   it("binds Prepare results to the persisted task attempt", () => {
