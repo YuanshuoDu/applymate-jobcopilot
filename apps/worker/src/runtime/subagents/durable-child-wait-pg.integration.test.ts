@@ -317,8 +317,8 @@ async function expectAbsentSourceResultClaimSafety(pool: Pool, ids: FixtureIds, 
       correlationId: PHONE_SHAPED_WAIT_TOOL_CALL_ID, causationId: itemStarted?.id,
       idempotencyKey: `task:${ids.waiterTaskId}:event:tool-started:${PHONE_SHAPED_WAIT_TOOL_CALL_ID}`,
       payload: { toolCallId: PHONE_SHAPED_WAIT_TOOL_CALL_ID, toolName: "wait_subagents", taskId: ids.waiterTaskId } })
-    expect(sourceResultItems).toHaveLength(0)
-    expect(sourceResultEvents).toHaveLength(0)
+    expect(sourceResultItems.rows).toHaveLength(0)
+    expect(sourceResultEvents.rows).toHaveLength(0)
 
     const blocking = (snapshot: BlockingTaskSnapshot) => hasBlockingExternalCall(
       client, snapshot as unknown as Record<string, unknown>, undefined, continuationStepId,
