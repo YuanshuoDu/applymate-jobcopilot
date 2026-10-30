@@ -45,7 +45,7 @@ async function initializeFixtureSse() {
 async function inspectTurn(sessionId, turnId) {
   const database = await pool.query('SELECT current_database() AS name')
   if (database.rows[0]?.name !== 'application_flow_fixture') throw new Error('Unexpected database')
-  const result = await pool.query(`SELECT turn."id", turn."status", turn."revision", turn."finalResponse",
+  const result = await pool.query(`SELECT turn."id", turn."status", turn."revision", turn."finalResponse", turn."error",
     session."userId" AS "sessionOwner", turn."userId" AS "turnOwner", candidate."email",
     (SELECT COUNT(*)::int FROM "agent_events" AS event WHERE event."sessionId" = session."id" AND event."turnId" = turn."id" AND event."type" = 'turn.completed') AS "completedEvents",
     (SELECT COUNT(*)::int FROM "agent_events" AS event WHERE event."sessionId" = session."id" AND event."turnId" = turn."id" AND event."type" = 'question.answered') AS "answeredEvents"
@@ -58,7 +58,10 @@ async function inspectTurn(sessionId, turnId) {
   }
   const items = await pool.query(`SELECT "id", "status", "content" FROM "agent_items"
     WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'question'`, [sessionId, turnId])
-  return { turn: row, questions: items.rows }
+  const events = await pool.query(`SELECT "type" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "sequence"`, [sessionId, turnId])
+  const steps = await pool.query(`SELECT "status", "errorCode", "finishReason" FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "ordinal", "attempt"`, [sessionId, turnId])
+  const tasks = await pool.query(`SELECT "status", "failureReason" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "createdAt"`, [sessionId, turnId])
+  return { turn: row, questions: items.rows, eventTypes: events.rows.map(event => event.type), steps: steps.rows, tasks: tasks.rows }
 }
 
 module.exports = { initializeFixtureSse, inspectTurn, closeFixtureDb: () => pool.end() }

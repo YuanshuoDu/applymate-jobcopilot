@@ -23,7 +23,7 @@ test('synthetic native question resumes the actual authenticated turn', async ({
   const requireFixture = createRequire(path.resolve('e2e/application-authenticated-agent.browser.ts'))
   const { initializeFixtureSse, inspectTurn, closeFixtureDb } = requireFixture('./application-authenticated-agent-db.cjs') as {
     initializeFixtureSse: () => Promise<void>
-    inspectTurn: (sessionId: string, turnId: string) => Promise<{ turn: { status: string; completedEvents: number; answeredEvents: number; finalResponse: string | null }; questions: { id: string; status: string; content: { questionId?: string; question?: string; answer?: string | null; toolCallId?: string } }[] }>
+    inspectTurn: (sessionId: string, turnId: string) => Promise<{ turn: { status: string; error: string | null; completedEvents: number; answeredEvents: number; finalResponse: string | null }; questions: { id: string; status: string; content: { questionId?: string; question?: string; answer?: string | null; toolCallId?: string } }[]; eventTypes: string[]; steps: { status: string; errorCode: string | null; finishReason: string | null }[]; tasks: { status: string; failureReason: string | null }[] }>
     closeFixtureDb: () => Promise<void>
   }
   try {
@@ -65,12 +65,25 @@ test('synthetic native question resumes the actual authenticated turn', async ({
     const turnId = (await sent.json()).turnId as string
     expect(turnId).toBeTruthy()
     const turnsUrl = `/api/agent/sessions/${encodeURIComponent(sessionId)}/turns`
-    await expect.poll(async () => {
-      const response = await page.request.get(turnsUrl)
-      if (!response.ok()) return 'unavailable'
-      const body = await response.json()
-      return body.projection.activeTurn?.id === turnId ? body.projection.activeTurn.status : 'other'
-    }, { timeout: 60_000 }).toBe('waiting_for_user')
+    try {
+      await expect.poll(async () => {
+        const response = await page.request.get(turnsUrl)
+        if (!response.ok()) return `http:${response.status()}`
+        const body = await response.json()
+        if (body.projection.activeTurn?.id === turnId) return body.projection.activeTurn.status
+        const target = body.turns.find((turn: { id: string }) => turn.id === turnId)
+        return `not-active:${target?.status ?? 'missing'}`
+      }, { timeout: 60_000 }).toBe('waiting_for_user')
+    } catch (error) {
+      const diagnostic = await inspectTurn(sessionId, turnId)
+      const safeCode = (value: string | null) => value && /^[a-z0-9_.: -]{1,128}$/i.test(value)
+        ? value : value ? 'present-but-omitted' : null
+      console.error('Synthetic turn diagnostic', JSON.stringify({ status: diagnostic.turn.status, errorCode: safeCode(diagnostic.turn.error),
+        questionCount: diagnostic.questions.length, eventTypes: diagnostic.eventTypes,
+        steps: diagnostic.steps.map(step => ({ status: step.status, errorCode: safeCode(step.errorCode), finishReason: safeCode(step.finishReason) })),
+        tasks: diagnostic.tasks.map(task => ({ status: task.status, failureReason: safeCode(task.failureReason) })) }))
+      throw error
+    }
     const waiting = await inspectTurn(sessionId, turnId)
     expect(waiting.turn.status).toBe('waiting_for_user')
     expect(waiting.questions).toHaveLength(1)

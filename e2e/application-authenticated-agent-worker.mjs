@@ -101,11 +101,13 @@ async function main() {
   let capturedSession = null
   let capturedTurn = null
   const modelRuntimeFactory = ({ userId: owner, state }) => {
+    process.stdout.write('SYNTHETIC_MODEL_FACTORY_ENTERED\n')
     if (owner !== userId || state.goal !== goal) throw new Error('Unexpected model owner or goal')
     return {
       adapter: {
         id: 'synthetic-fixture-question-model', profile,
         async *stream(request) {
+          process.stdout.write('SYNTHETIC_MODEL_STREAM_ENTERED\n')
           if (request.metadata.userId !== userId) throw new Error('Unexpected model request owner')
           if (!capturedTurn) { capturedTurn = request.metadata.turnId; capturedSession = request.metadata.sessionId }
           if (capturedTurn !== request.metadata.turnId || capturedSession !== request.metadata.sessionId || completed) {
@@ -143,7 +145,21 @@ async function main() {
     createCanonicalTurnRuntime: (runtimePool, options) => canonical.createCanonicalTurnRuntime(runtimePool, {
       ...options, ...graphTemplates.taskGraphRuntimeOptions(graphPort), modelRuntimeFactory,
     }),
-    createWorkerUsageAuthorizer: usage.createWorkerUsageAuthorizer,
+    createWorkerUsageAuthorizer: (...args) => {
+      const authorize = usage.createWorkerUsageAuthorizer(...args)
+      return async input => {
+        process.stdout.write('SYNTHETIC_USAGE_AUTHORIZATION_STARTED\n')
+        try {
+          const result = await authorize(input)
+          process.stdout.write('SYNTHETIC_USAGE_AUTHORIZATION_PASSED\n')
+          return result
+        } catch (error) {
+          const code = typeof error?.code === 'string' && /^[a-z0-9_.-]{1,64}$/i.test(error.code) ? error.code : 'unavailable'
+          process.stdout.write(`SYNTHETIC_USAGE_AUTHORIZATION_FAILED ${code}\n`)
+          throw error
+        }
+      }
+    },
     createCanonicalExecutionProjection: executionProjection.createCanonicalExecutionProjection,
     createCanonicalSessionProjection: sessionProjection.createCanonicalSessionProjection,
     startProductionAgentRuntime: production.startProductionAgentRuntime,
