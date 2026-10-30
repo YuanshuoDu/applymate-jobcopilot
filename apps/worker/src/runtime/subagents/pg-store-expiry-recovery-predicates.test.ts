@@ -71,10 +71,14 @@ describe("expired recovery SQL predicates", () => {
     expect(sql).toContain("started.\"idempotencyKey\" = 'task:' || owner.\"id\" || ':event:child-wait-claim:' || owner.\"attemptCount\"::text || ':' || continuation.\"id\"")
     expect(sql).toContain('started."causationId" = itemStarted."id"')
     expect(sql).toContain('itemStarted."idempotencyKey" = \'task:\' || owner."id" || \':event:item-started:\' || claimedCall."id"')
+    expect(sql).toContain('LEFT JOIN "agent_items" AS sourceResult')
     expect(sql).toContain('claimedCall."stepId" = continuation."id"')
     expect(sql).toContain('owner."leaseOwner" = $5 AND owner."attemptCount" = $6 AND owner."leaseExpiresAt" = $7')
     expect(sql).toContain('continuation."ordinal" = (SELECT MAX(current."ordinal")')
     expect(sql).toContain("sourceResult.\"status\" = 'completed'")
+    expect(sql).toContain('sourceCall."status" = \'started\'')
+    expect(sql).toContain('sourceCall."revision" = 0')
+    expect(sql).toContain('sourceResult."id" IS NULL')
     expect(sql).toContain("SELECT COUNT(*) FROM jsonb_object_keys(wait.\"result\"->'outcome')")
     expect(sql).toContain("wait.\"result\"->'outcome' ?& ARRAY['waitId', 'status', 'taskIds', 'deadlineAt', 'matchedTaskIds', 'tasks']")
     expect(sql).toContain("sourceResult.\"content\"->'output'->>'deadlineAt' = wait.\"result\"->'outcome'->>'deadlineAt'")
@@ -103,6 +107,7 @@ describe("expired recovery SQL predicates", () => {
     for (const rows of [
       [{ id: "claim-start", claimWaitId: "wait-1", waitDeadlineAt: new Date(Number.NaN), outcomeDeadlineAt: "2026-10-06T10:00:00.000Z" }],
       [{ id: "claim-start", claimWaitId: "wait-1", waitDeadlineAt: new Date("2026-10-06T10:00:00.000Z"), outcomeDeadlineAt: null }],
+      [{ id: "claim-start", claimWaitId: "wait-1", waitDeadlineAt: new Date("2026-03-02T10:00:00.000Z"), outcomeDeadlineAt: "2026-02-30T10:00:00.000Z" }],
       [
         { id: "claim-start", claimWaitId: "wait-1", waitDeadlineAt: new Date("2026-10-06T10:00:00.000Z"), outcomeDeadlineAt: "2026-10-06T10:00:00.000Z" },
         { id: "other-start", claimWaitId: null, waitDeadlineAt: null, outcomeDeadlineAt: null },

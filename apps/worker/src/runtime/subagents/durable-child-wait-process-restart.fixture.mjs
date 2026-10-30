@@ -11,6 +11,7 @@ import { registerDurableSubagentWait } from "./durable-subagent-wait-store.ts"
 import { startDurableWaitResolver } from "./durable-wait-resolver.ts"
 import { loadDurableSubagentWaitResume, commitDurableSubagentWaitResume } from "./durable-subagent-wait-resume.ts"
 import { loadChildAttemptResume } from "./child-resume.ts"
+import { loadChildWaitCallRecovery } from "./child-resume-wait-call-recovery.ts"
 import { acknowledgeDurableWaitAtContinuationStart, childResultStatus } from "./child-executor-admission.ts"
 import { createChildDurableWaitReplay } from "./child-durable-wait-replay.ts"
 import { TurnExecutionEventWriter, executeToolWithItems } from "../turns/turn-execution-events.ts"
@@ -299,6 +300,27 @@ async function resumeChildThroughLoop(lease, phase) {
       && event.correlationId === `task:${lease.id}:step:${logicalStepOrdinal + 1}:attempt:${lease.attemptCount}`) {
       const completedStepId = recovery.stepId
       const nextStepId = event.correlationId
+      const claimClient = await pool.connect()
+      let claimRecovery
+      try {
+        await claimClient.query("BEGIN")
+        await claimClient.query("SELECT set_config($1, $2, true)", ["app.user_id", lease.userId])
+        claimRecovery = await loadChildWaitCallRecovery(claimClient, lease, wait)
+        await claimClient.query("COMMIT")
+      } catch (error) {
+        await claimClient.query("ROLLBACK").catch(() => undefined)
+        throw error
+      } finally { claimClient.release() }
+      if (!claimRecovery?.claim || claimRecovery.claim.stepStatus !== "completed"
+        || claimRecovery.claim.modelUsage.estimatedCostUsd !== highPrecisionWaitModelCostUsd) {
+        throw new Error("fixture_pg_claim_loader_did_not_accept_rounded_usage")
+      }
+      let liveResumeError = null
+      try { await loadChildAttemptResume(pool, lease, new Date(), wait) }
+      catch (error) { liveResumeError = error?.message ?? String(error) }
+      if (liveResumeError !== "child_resume_wait_step_lineage") {
+        throw new Error(`fixture_live_step2_lineage_not_rejected:${liveResumeError ?? "no_error"}`)
+      }
       const [stepState, usageState, callState] = await Promise.all([
         pool.query(`SELECT "status", "ordinal", "inputTokens", "outputTokens", "estimatedCostUsd"::text AS "estimatedCostUsd"
           FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = $4`,
@@ -332,9 +354,11 @@ async function resumeChildThroughLoop(lease, phase) {
       say(`WORKER_B_LOOP_ROUNDED_USAGE_LINEAGE_CUT ${JSON.stringify({ callId: recovery.call.id,
         completedStepId, completedStepStatus: completed.status, physicalStepOrdinal: completed.ordinal,
         persistedCostUsd: completed.estimatedCostUsd, receiptCostUsd: receipt.receiptCost,
+        claimLoaderAccepted: true, claimLoaderStepStatus: claimRecovery.claim.stepStatus,
+        claimLoaderUsageCost: claimRecovery.claim.modelUsage.estimatedCostUsd,
         nextStepId, nextStepStatus: nextStep.rows[0].status, nextPhysicalStepOrdinal: nextStep.rows[0].ordinal,
         claimCount: lifecycle.claimCount, resultCount: lifecycle.resultCount, nextModelStartCount: lifecycle.nextModelStartCount,
-        modelCalls: 0, executorCalls: 0, dispatcherCalls: 0 })}`)
+        liveResumeError, modelCalls: 0, executorCalls: 0, dispatcherCalls: 0 })}`)
       await new Promise(() => {})
     }
     if (phase === "claim-item-completed-cut" && event.type === "item.completed" && event.itemId === callItemId
