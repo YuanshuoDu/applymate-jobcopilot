@@ -20,7 +20,8 @@ import { repairConsumedChildWaitSources } from "./child-resume-consumed-wait-rep
 import { createProductionChildResumeLoaders } from "./production-child-resume-loaders.js"
 import { actionList, asObject, INSERT_TASK, json } from "./pg-store-persistence.js"
 import type { SubagentLease } from "./types.js"
-import { hasBlockingExternalCall } from "./pg-store-expiry-recovery-predicates.js"
+import { CHILD_WAIT_CLAIM_RECOVERY_SQL, hasBlockingExternalCall } from "./pg-store-expiry-recovery-predicates.js"
+import { childWaitContinuationKeyMatchesSafeProjection } from "./pg-store-expiry-child-wait-claim-call-proof.js"
 import { safeSubagentWaitJson } from "./subagent-wait-structural-ids.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
@@ -185,10 +186,39 @@ function workerFailureReasonCategory(child: WorkerProcess, marker: "WORKER_A_WAI
   } catch { return null }
 }
 
-function workerFailureDiagnostic(child: WorkerProcess): string {
+async function workerFailureDiagnostic(pool: Pool, child: WorkerProcess, ids: FixtureIds): Promise<string> {
   const status = workerResultStatus(child, "WORKER_A_WAITING")
-  return JSON.stringify({ status, failureReasonCategory: status === "failed"
-    ? workerFailureReasonCategory(child, "WORKER_A_WAITING") : null })
+  const diagnostic: Record<string, unknown> = { sample: "post_commit_read_committed_task_scope", status,
+    markerFailureReasonCategory: status === "failed" ? workerFailureReasonCategory(child, "WORKER_A_WAITING") : null }
+  if (status !== "failed") return JSON.stringify(diagnostic)
+  let client: PoolClient | undefined
+  let transactionStarted = false
+  try {
+    client = await pool.connect()
+    await client.query("BEGIN ISOLATION LEVEL READ COMMITTED")
+    transactionStarted = true
+    await client.query("SELECT set_config('app.user_id', $1, true)", [ids.userId])
+    const task = await client.query<{ status: string; failureReason: string | null }>(
+      `SELECT task."status", task."failureReason" FROM "sub_agent_tasks" AS task
+       JOIN "agent_sessions" AS session ON session."id" = task."sessionId" AND session."userId" = $5
+       WHERE task."id" = $1 AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4`,
+      [ids.waiterTaskId, ids.sessionId, ids.turnId, ids.rootTaskId, ids.userId],
+    )
+    const row = task.rows[0]
+    diagnostic.taskRowCount = task.rows.length
+    diagnostic.persistedStatus = row ? diagnosticTaskStatus(row.status) : null
+    diagnostic.persistedFailureReasonCategory = !row || typeof row.failureReason !== "string" ? "missing"
+      : WORKER_FAILURE_REASON_CATEGORIES.includes(row.failureReason as WorkerFailureReasonCategory)
+        ? row.failureReason : "other"
+  } catch {
+    diagnostic.taskQuery = "unavailable"
+  } finally {
+    if (client) {
+      if (transactionStarted) await client.query("ROLLBACK").catch(() => undefined)
+      client.release()
+    }
+  }
+  return JSON.stringify(diagnostic)
 }
 
 function diagnosticTaskStatus(value: unknown): string | null {
@@ -258,6 +288,7 @@ async function diagnoseWorkerFBlocker(
       turnId: ids.turnId, rootTaskId: ids.rootTaskId, leaseOwner: row.leaseOwner,
       attemptCount: row.attemptCount, leaseExpiresAt: row.leaseExpiresAt }
     const blocker = await hasBlockingExternalCall(client, task as unknown as Record<string, unknown>, undefined, continuationStepId)
+    const claimProof = await diagnoseWorkerFClaimProof(client, task, continuationStepId, sourceCallId, claimCallId)
     const starts = await client.query<{ id: string; type: string; correlationId: string }>(
       `SELECT "id", "type", "correlationId" FROM "agent_events"
        WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
@@ -278,7 +309,7 @@ async function diagnoseWorkerFBlocker(
     }
     return { snapshot: "post_recovery_attempt_read_committed", taskRowCount: taskResult.rows.length,
       taskStatus: diagnosticTaskStatus(row.status), attemptCount: row.attemptCount,
-      leaseOwnerPresent: true, leaseExpired: row.leaseExpiresAt.getTime() <= Date.now(),
+      leaseOwnerPresent: true, leaseExpired: row.leaseExpiresAt.getTime() <= Date.now(), claimProof,
       blocker, examinedStartCount: starts.rows.length, starts: classified }
   } catch {
     return { snapshot: "post_recovery_attempt_read_committed", predicateProbe: "unavailable" }
@@ -288,6 +319,130 @@ async function diagnoseWorkerFBlocker(
       client.release()
     }
   }
+}
+
+async function diagnoseWorkerFClaimProof(
+  client: PoolClient, task: BlockingTaskSnapshot, continuationStepId: string, sourceCallId: string, claimCallId: string,
+): Promise<Record<string, unknown>> {
+  const proof = await client.query<{ candidateCount: number; matchedCount: number }>(
+    `SELECT COUNT(*)::int AS "candidateCount",
+       COUNT(*) FILTER (WHERE ${CHILD_WAIT_CLAIM_RECOVERY_SQL})::int AS "matchedCount"
+     FROM (SELECT started.* FROM "agent_events" AS started
+       WHERE started."sessionId" = $1 AND started."turnId" = $3 AND started."taskId" = $2
+         AND started."type" = 'tool_call.started' AND started."correlationId" = $11
+       ORDER BY started."sequence" DESC LIMIT 2) AS started`,
+    [task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount,
+      task.leaseExpiresAt, task.userId, null, continuationStepId, claimCallId],
+  )
+  const waits = await client.query<{ id: string; stepId: string; status: string; deadlineAt: Date;
+    idempotencyKey: string; mode: string; targetTaskIds: unknown; matchedTaskIds: unknown; result: unknown }>(
+    `SELECT wait."id", wait."stepId", wait."status", wait."deadlineAt", wait."idempotencyKey", wait."mode",
+        wait."targetTaskIds", wait."matchedTaskIds", wait."result"
+     FROM "sub_agent_tasks" AS owner
+     JOIN "agent_wait_conditions" AS wait ON wait."parentTaskId" = owner."id" AND wait."sessionId" = owner."sessionId"
+       AND wait."turnId" = owner."turnId" AND wait."userId" = $9
+     JOIN "agent_steps" AS source ON source."id" = wait."stepId" AND source."sessionId" = wait."sessionId"
+       AND source."turnId" = wait."turnId" AND source."taskId" = owner."id"
+     JOIN "agent_steps" AS continuation ON continuation."id" = $5 AND continuation."sessionId" = source."sessionId"
+       AND continuation."turnId" = source."turnId" AND continuation."taskId" = source."taskId"
+       AND continuation."attempt" = source."attempt"
+     WHERE owner."id" = $2 AND owner."sessionId" = $1 AND owner."turnId" = $3 AND owner."rootTaskId" = $4
+       AND owner."parentTaskId" IS NOT NULL AND owner."status" = 'running' AND owner."leaseOwner" = $7
+       AND owner."attemptCount" = $6 AND owner."leaseExpiresAt" = $8 AND owner."interruptRequestedAt" IS NULL
+       AND source."attempt" = $6
+       AND wait."id" = (SELECT latest."id" FROM "agent_wait_conditions" AS latest
+         JOIN "agent_steps" AS latestStep ON latestStep."id" = latest."stepId" AND latestStep."sessionId" = latest."sessionId"
+           AND latestStep."turnId" = latest."turnId" AND latestStep."taskId" = owner."id" AND latestStep."attempt" = $6
+         WHERE latest."parentTaskId" = owner."id" AND latest."sessionId" = owner."sessionId" AND latest."turnId" = owner."turnId"
+         ORDER BY latestStep."ordinal" DESC, latest."createdAt" DESC, latest."id" DESC LIMIT 1)
+     LIMIT 2`,
+    [task.sessionId, task.id, task.turnId, task.rootTaskId, continuationStepId, task.attemptCount,
+      task.leaseOwner, task.leaseExpiresAt, task.userId],
+  )
+  const sqlCandidateCount = proof.rows[0]?.candidateCount ?? 0
+  const sqlMatchCount = proof.rows[0]?.matchedCount ?? 0
+  const exactSqlProofMatched = sqlCandidateCount === 1 && sqlMatchCount === 1
+  if (waits.rows.length !== 1) return {
+    sqlCandidateCount, sqlMatchCount, exactSqlProofMatched,
+    waitRowCount: waits.rows.length, sourceCallCount: 0, sourceCallFinished: false, sourceReceiptFinished: false,
+    safeKeyProjectionMatched: false, deadlineCanonicalAndMatched: false, claimCallFinishedRevision1: false,
+    claimHasNoItemCompletedEvent: false,
+  }
+  const wait = waits.rows[0]!
+  const sourceCalls = await client.query<{ status: string; revision: number; content: Record<string, unknown> }>(
+    `SELECT "status", "revision", "content" FROM "agent_items"
+     WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = $4
+       AND "type" = 'tool_call' AND "content"->>'toolName' = 'wait_subagents'`,
+    [task.sessionId, task.turnId, task.id, wait.stepId],
+  )
+  const sourceCall = sourceCalls.rows.length === 1 ? sourceCalls.rows[0] : undefined
+  const sourceCallContent = asObject(sourceCall?.content)
+  const sourceInput = asObject(sourceCallContent.input)
+  const sourceResults = typeof sourceCallContent.toolCallId === "string" ? await client.query<{
+    status: string; revision: number; content: Record<string, unknown>
+  }>(
+    `SELECT "status", "revision", "content" FROM "agent_items"
+     WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = $4
+       AND "type" = 'tool_result' AND "content"->>'toolCallId' = $5`,
+    [task.sessionId, task.turnId, task.id, wait.stepId, sourceCallContent.toolCallId],
+  ) : { rows: [] }
+  const sourceResult = sourceResults.rows.length === 1 ? sourceResults.rows[0] : undefined
+  const sourceResultContent = asObject(sourceResult?.content)
+  const sourceReceipt = asObject(sourceResultContent.output)
+  const waitResult = asObject(wait.result)
+  const waitOutcome = asObject(waitResult.outcome)
+  const targetIds = Array.isArray(wait.targetTaskIds) ? wait.targetTaskIds : null
+  const sameStringIds = (left: unknown, right: unknown): boolean => {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.some(value => typeof value !== "string")
+      || right.some(value => typeof value !== "string") || left.length !== right.length) return false
+    const leftIds = [...left as string[]].sort(), rightIds = [...right as string[]].sort()
+    return leftIds.every((value, index) => value === rightIds[index])
+  }
+  const continuationCalls = await client.query<{ status: string; revision: number; content: Record<string, unknown> }>(
+    `SELECT "status", "revision", "content" FROM "agent_items"
+     WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = $4
+       AND "type" = 'tool_call' AND "content"->>'toolName' = 'wait_subagents'`,
+    [task.sessionId, task.turnId, task.id, continuationStepId],
+  )
+  const claimCall = continuationCalls.rows.find(call => call.content.toolCallId === claimCallId)
+  const claimInput = asObject(claimCall?.content.input)
+  const claimEvents = claimCall ? await client.query<{ count: number }>(
+    `SELECT COUNT(*)::int AS "count" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+       AND ("itemId" = $4 OR "correlationId" = $5) AND "type" = 'item.completed'`,
+    [task.sessionId, task.turnId, task.id, `task:${task.id}:item:tool-call:${claimCallId}:attempt:${task.attemptCount}`, claimCallId],
+  ) : { rows: [{ count: 0 }] }
+  const waitDeadline = wait.deadlineAt instanceof Date ? wait.deadlineAt : new Date(String(wait.deadlineAt))
+  const outcomeDeadlineText = waitOutcome.deadlineAt
+  const parsedOutcomeDeadline = typeof outcomeDeadlineText === "string" ? new Date(outcomeDeadlineText) : null
+  const deadlineCanonicalAndMatched = parsedOutcomeDeadline instanceof Date && Number.isFinite(parsedOutcomeDeadline.getTime())
+    && parsedOutcomeDeadline.toISOString() === outcomeDeadlineText && Number.isFinite(waitDeadline.getTime())
+    && parsedOutcomeDeadline.getTime() === waitDeadline.getTime()
+  const sourceCallFinished = sourceCall?.status === "completed" && sourceCall.revision === 1
+    && sourceCallContent.toolCallId === sourceCallId && sourceCallContent.toolName === "wait_subagents"
+    && sourceCallContent.toolVersion === "1" && sourceCallContent.status === "completed" && sourceCallContent.errorCode === null
+    && sourceInput.idempotencyKey === wait.idempotencyKey
+  const sourceReceiptFinished = sourceResult?.status === "completed" && sourceResult.revision === 1
+    && sourceResultContent.toolCallId === sourceCallContent.toolCallId && sourceResultContent.errorCode === null
+    && sourceReceipt.waitId === wait.id && sourceReceipt.status === "waiting"
+    && sameStringIds(sourceReceipt.taskIds, targetIds) && sourceReceiptDeadlineMatches(sourceReceipt.deadlineAt, waitOutcome.deadlineAt)
+  const safeKeyProjectionMatched = sourceCalls.rows.length === 1 && continuationCalls.rows.length === 1
+    && childWaitContinuationKeyMatchesSafeProjection(sourceInput.idempotencyKey, claimInput.idempotencyKey)
+  return {
+    snapshot: "post_recovery_attempt_read_committed",
+    sqlCandidateCount, sqlMatchCount, exactSqlProofMatched,
+    waitRowCount: waits.rows.length, sourceCallCount: sourceCalls.rows.length,
+    sourceCallFinished, sourceReceiptFinished, safeKeyProjectionMatched, deadlineCanonicalAndMatched,
+    claimCallCount: continuationCalls.rows.length,
+    claimCallFinishedRevision1: claimCall?.status === "completed" && claimCall.revision === 1
+      && claimCall.content.toolCallId === claimCallId && claimCall.content.toolName === "wait_subagents",
+    claimHasNoItemCompletedEvent: (claimEvents.rows[0]?.count ?? 0) === 0,
+  }
+}
+
+function sourceReceiptDeadlineMatches(receiptDeadline: unknown, outcomeDeadline: unknown): boolean {
+  if (typeof receiptDeadline !== "string" || typeof outcomeDeadline !== "string" || receiptDeadline !== outcomeDeadline) return false
+  const parsed = new Date(receiptDeadline)
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString() === receiptDeadline
 }
 
 function parseRecoveryMarker(child: WorkerProcess): { reclaimed?: number; terminal?: number; rows?: Array<{ id?: unknown; status?: unknown }> } {
@@ -3020,7 +3175,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       await expect(dispatchPendingSubagentOutbox(pool as never, queue, 50, ids.sessionId)).resolves.toBe(1)
       await waitForMarker(workerA, "WORKER_A_WAITING")
       expect(workerResultStatus(workerA, "WORKER_A_WAITING"),
-        `WorkerA result was not waiting: ${workerFailureDiagnostic(workerA)}`).toBe("waiting")
+        `WorkerA result was not waiting: ${await workerFailureDiagnostic(pool, workerA, ids)}`).toBe("waiting")
       await expectCompletedSourceWaitLifecycle(pool, ids)
       const sourceExit = await workerA.exited
       expect(sourceExit.code).toBe(0)
@@ -3160,7 +3315,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       await expect(dispatchPendingSubagentOutbox(pool as never, queue, 50, ids.sessionId)).resolves.toBe(1)
       await waitForMarker(workerA, "WORKER_A_WAITING")
       expect(workerResultStatus(workerA, "WORKER_A_WAITING"),
-        `WorkerA result was not waiting: ${workerFailureDiagnostic(workerA)}`).toBe("waiting")
+        `WorkerA result was not waiting: ${await workerFailureDiagnostic(pool, workerA, ids)}`).toBe("waiting")
       await expectCompletedSourceWaitLifecycle(pool, ids)
       const sourceExit = await workerA.exited
       expect(sourceExit.code).toBe(0)
