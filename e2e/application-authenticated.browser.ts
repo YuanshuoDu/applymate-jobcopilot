@@ -34,6 +34,7 @@ test('real credentials carry a synthetic application through manual recording', 
   const jobReads: { path: string; status: number }[] = []
   const browserErrors: string[] = []
   const failedResources: { path: string; status: number }[] = []
+  const snapshotReads: { path: string; value: Record<string, unknown> }[] = []
   page.on('pageerror', error => browserErrors.push(error.message))
   page.on('console', message => { if (message.type() === 'error') browserErrors.push(message.text()) })
   page.on('request', request => requests.push(`${request.method()} ${new URL(request.url()).pathname}`))
@@ -42,6 +43,12 @@ test('real credentials carry a synthetic application through manual recording', 
     if (response.status() >= 400) failedResources.push({ path: url.pathname, status: response.status() })
     if (response.request().method() === 'GET' && /^\/api\/jobs\/[^/]+$/.test(url.pathname)) {
       jobReads.push({ path: url.pathname, status: response.status() })
+    }
+    if (response.request().method() === 'GET' && response.ok()
+      && (/^\/api\/jobs\/[^/]+(?:\/audit-application)?$/.test(url.pathname) || /^\/api\/resume\/[^/]+$/.test(url.pathname))) {
+      void response.json().then(value => {
+        if (value && typeof value === 'object' && !Array.isArray(value)) snapshotReads.push({ path: url.pathname, value })
+      }).catch(() => undefined)
     }
   })
   await page.route('**/*', async route => {
@@ -130,8 +137,11 @@ test('real credentials carry a synthetic application through manual recording', 
     await assertManualState(job.id, syntheticResume.id, 'saved')
 
     await page.evaluate(() => {
-      const fixtureWindow = window as unknown as { downloadNotices: string[] }
+      const fixtureWindow = window as unknown as { downloadNotices: string[]; fixtureBlobUrls: number }
       fixtureWindow.downloadNotices = []
+      fixtureWindow.fixtureBlobUrls = 0
+      const originalCreateObjectURL = URL.createObjectURL.bind(URL)
+      URL.createObjectURL = value => { fixtureWindow.fixtureBlobUrls++; return originalCreateObjectURL(value) }
       new MutationObserver(() => {
         const text = document.body.innerText
         for (const notice of ['Could not download application materials', 'Some characters cannot be included in the PDF', 'Application materials download started']) {
@@ -140,14 +150,26 @@ test('real credentials carry a synthetic application through manual recording', 
       }).observe(document.body, { subtree: true, childList: true, characterData: true })
     })
     const downloadRequestStart = requests.length
+    const downloadReadStart = snapshotReads.length
     let file
     try {
       const download = page.waitForEvent('download', { timeout: 30_000 })
       await drawer.getByRole('button', { name: /Download application materials|下载申请材料/ }).click()
       file = await download
     } catch (error) {
+      const reads = snapshotReads.slice(downloadReadStart)
+      const changedFields = [...new Set(reads.map(read => read.path))].map(pathname => {
+        const entries = reads.filter(read => read.path === pathname)
+        const first = entries[0]?.value ?? {}
+        const last = entries[entries.length - 1]?.value ?? {}
+        return { path: pathname, count: entries.length, keys: [...new Set([...Object.keys(first), ...Object.keys(last)])]
+          .filter(key => JSON.stringify(first[key]) !== JSON.stringify(last[key])) }
+      })
       console.error('Fixture download diagnostics:', JSON.stringify({ browserErrors, failedResources,
-        requests: requests.slice(downloadRequestStart), notices: await page.evaluate(() => (window as unknown as { downloadNotices: string[] }).downloadNotices) }))
+        requests: requests.slice(downloadRequestStart), changedFields, browser: await page.evaluate(() => {
+          const fixtureWindow = window as unknown as { downloadNotices: string[]; fixtureBlobUrls: number }
+          return { notices: fixtureWindow.downloadNotices, blobUrls: fixtureWindow.fixtureBlobUrls }
+        }) }))
       throw error
     }
     const archivePath = await file.path()
