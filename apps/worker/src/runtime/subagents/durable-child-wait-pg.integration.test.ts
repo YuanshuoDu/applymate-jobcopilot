@@ -109,6 +109,10 @@ function launchWorker(mode: "worker-a" | "worker-a-crash" | "worker-b-crash-befo
   return child
 }
 
+function workerStartGateKey(ids: FixtureIds): string {
+  return `fixture:durable-child-wait:start:${ids.waiterTaskId}`
+}
+
 async function waitForMarker(child: WorkerProcess, marker: string, timeoutMs = 20_000): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
@@ -1397,6 +1401,9 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running' AND "attemptCount" = 1 AND "leaseOwner" = $3 RETURNING "id"`,
       [waiter.id, ids.sessionId, resultCutOwner])
       expect(resultExpiry.rowCount).toBe(1)
+      const abandonedBullJob = await queue.getJob(subagentDispatchJobId(waiter.id, resultCutGeneration))
+      expect(abandonedBullJob).toBeDefined()
+      expect(await abandonedBullJob!.getState()).toBe("active")
 
       workerG = launchWorker("worker-b-loop-final", queueName, ids)
       await waitForMarker(workerG, "WORKER_B_RECOVERED")
@@ -1410,7 +1417,9 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
          AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${waiter.id}`],
       )
       const completedRecoveryGeneration = completedRecoveryOutbox.rows[0]!.attemptCount
+      expect(completedRecoveryGeneration).toBe(resultCutGeneration + 1)
       expect(completedRecoveryOutbox.rows[0]?.publishedAt).toBeNull()
+      expect(await abandonedBullJob!.getState()).toBe("active")
       await expect(dispatchPendingSubagentOutbox(pool as never, queue, 50, ids.sessionId)).resolves.toBe(1)
       const completedRecoveryPublished = await pool.query<{ attemptCount: number; publishedAt: Date | null }>(
         `SELECT "attemptCount", "publishedAt" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch'
@@ -1418,6 +1427,11 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       )
       expect(completedRecoveryPublished.rows[0]).toMatchObject({ attemptCount: completedRecoveryGeneration + 1 })
       expect(completedRecoveryPublished.rows[0]?.publishedAt).toBeInstanceOf(Date)
+      const currentDispatchJob = await queue.getJob(subagentDispatchJobId(waiter.id, completedRecoveryGeneration))
+      expect(currentDispatchJob).toBeDefined()
+      expect(await currentDispatchJob!.getState()).toBe("waiting")
+      await queueRedis.set(workerStartGateKey(ids), "start", "EX", 60)
+      await waitForMarker(workerG, "WORKER_B_PROCESSING_RELEASED")
       await waitForMarker(workerG, "WORKER_B_LOOP_RESTORED")
       const finalRestoredMarker = workerG.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_LOOP_RESTORED "))
       expect(JSON.parse(finalRestoredMarker!.slice("WORKER_B_LOOP_RESTORED ".length))).toMatchObject({
@@ -1434,6 +1448,14 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         continuationStepId: acknowledged!.continuationStepId, logicalStepOrdinal: 1, physicalContinuationOrdinal: 2,
       })
       await waitForMarker(workerG, "WORKER_B_RESUMED")
+      const resumedLine = workerG.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_RESUMED "))
+      const resumedOutcome = JSON.parse(resumedLine!.slice("WORKER_B_RESUMED ".length)) as { dispatchGeneration?: number }
+      expect(resumedOutcome.dispatchGeneration).toBe(completedRecoveryGeneration)
+      const staleDispatchLines = workerG.stdoutText.split(/\r?\n/).filter(line => line.startsWith("WORKER_B_STALE_DISPATCH_SKIPPED "))
+      for (const line of staleDispatchLines) {
+        const stale = JSON.parse(line.slice("WORKER_B_STALE_DISPATCH_SKIPPED ".length)) as { dispatchGeneration?: number }
+        expect(stale.dispatchGeneration).toBe(resultCutGeneration)
+      }
       const finalExit = await workerG.exited
       expect(finalExit.code).toBe(0)
       expect(finalExit.signal).toBeNull()
@@ -1540,6 +1562,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       await stopWorker(workerE)
       await stopWorker(workerF)
       await stopWorker(workerG)
+      await queueRedis.del(workerStartGateKey(ids)).catch(() => undefined)
       if (queuePaused) await queue.resume().catch(() => undefined)
       await queue.obliterate({ force: true }).catch(() => undefined)
       await queue.close().catch(() => undefined)
@@ -1664,6 +1687,12 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(afterReject.claimCount).toBe(0)
       expect(afterReject.resultCount).toBe(0)
       expect(afterReject.lifecycle.map(event => event.type)).toEqual(["item.started"])
+      await waitForMarker(workerC, "WORKER_B_RESUMED")
+      const rejectedExit = await workerC.exited
+      expect(rejectedExit).toEqual({ code: 0, signal: null })
+      const rejectedCompletionLine = workerC.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_RESUMED "))
+      const rejectedCompletion = JSON.parse(rejectedCompletionLine!.slice("WORKER_B_RESUMED ".length)) as { result?: { status?: string } }
+      expect(rejectedCompletion.result?.status).toBe("failed")
       const failed = await pool.query<{ status: string; failureReason: string | null }>(
         `SELECT "status", "failureReason" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`,
         [ids.waiterTaskId, ids.sessionId],

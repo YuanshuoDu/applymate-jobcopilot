@@ -50,6 +50,7 @@ const readyMarkerByMode = {
   "worker-b-loop-multi-reject": "WORKER_B_READY",
   "worker-b": "WORKER_B_READY",
 }
+const workerStartGateKey = `fixture:durable-child-wait:start:${ids.waiterTaskId}`
 const crashCutModes = new Set([
   "worker-a-crash",
   "worker-b-crash-before-resume",
@@ -769,17 +770,24 @@ const worker = new Worker(queueName, async job => {
     }
   }
   return runSubagentQueueJob(pool, manager, executeWithDiagnostics, job.data, identity)
-}, { connection: redis, concurrency: 1, lockDuration: 15_000, skipVersionCheck: true })
+}, { connection: redis, concurrency: 1, lockDuration: 15_000, skipVersionCheck: true,
+  autorun: mode !== "worker-b-loop-final" })
 
 worker.on("completed", (job, result) => {
   if (job.data.taskId !== ids.waiterTaskId) return
+  const dispatchGeneration = parseSubagentDispatchJobId(job.id, ids.waiterTaskId)?.generation ?? null
+  if (mode === "worker-b-loop-final" && result?.status === "skipped"
+    && result?.reason === "dispatch_identity_mismatch") {
+    say(`WORKER_B_STALE_DISPATCH_SKIPPED ${JSON.stringify({ dispatchGeneration })}`)
+    return
+  }
   if (crashCutModes.has(mode)) {
     process.stderr.write(`UNEXPECTED_CRASH_CUT_COMPLETION ${JSON.stringify({ mode, result, taskId: ids.waiterTaskId })}\n`)
     void stop(1)
     return
   }
   const marker = mode === "worker-a" ? "WORKER_A_WAITING" : "WORKER_B_RESUMED"
-  say(`${marker} ${JSON.stringify({ result, taskId: ids.waiterTaskId })}`)
+  say(`${marker} ${JSON.stringify({ result, taskId: ids.waiterTaskId, dispatchGeneration })}`)
   void stop(0)
 })
 worker.on("failed", (job, error) => {
@@ -813,6 +821,20 @@ try {
   const readyMarker = readyMarkerByMode[mode]
   if (!readyMarker) throw new Error("invalid_fixture_mode")
   say(readyMarker)
+  if (mode === "worker-b-loop-final") {
+    const gateDeadline = Date.now() + 60_000
+    while (Date.now() < gateDeadline && await redis.get(workerStartGateKey) !== "start") {
+      await new Promise(resolve => setTimeout(resolve, 25))
+    }
+    if (await redis.get(workerStartGateKey) !== "start") throw new Error("fixture_worker_start_gate_timeout")
+    await redis.del(workerStartGateKey)
+    const run = worker.run()
+    say("WORKER_B_PROCESSING_RELEASED")
+    void run.catch(error => {
+      process.stderr.write(`WORKER_RUN_FAILED ${String(error)}\n`)
+      void stop(1)
+    })
+  }
 } catch (error) {
   process.stderr.write(`WORKER_START_FAILED ${String(error)}\n`)
   await stop(1)
