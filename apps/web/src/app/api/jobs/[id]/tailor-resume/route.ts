@@ -99,6 +99,10 @@ export async function POST(req: NextRequest, { params }: Params) {
   if (!resume) return err('Resume not found', 404)
   if (!job) return err('Job not found', 404)
   if (!job.description) return err('Job description is required')
+  // Repair must never mutate or create a different resume from the one selected.
+  if (forceRetailor && (!existing || existing.id !== resume.id)) {
+    return err('The selected resume cannot be repaired automatically for this application. Open it to edit or select the current tailored resume.', 409)
+  }
   if (existing && !forceRetailor) return ok({ adaptedResumeId: existing.id, changes: [], reused: true })
 
   const sourceResume = forceRetailor && existing?.parentResumeId

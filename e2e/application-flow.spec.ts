@@ -118,7 +118,7 @@ function audit(resumeUpdatedAt = time) {
     audit: { verdict: 'pass', summary: 'Fixture materials checked.', findings: [], matchScore: 82, source: 'independent', auditedAt: time } }
 }
 
-async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unknown' | 'waiting_for_user' | 'waiting_for_authorization' | 'cancelled' | 'failed' | 'filling'; recordedInitially?: boolean; evidenceCase?: 'bound' | 'unbound' | 'unavailable'; taskFailure?: boolean; missing?: boolean; holdSelectedLetter?: boolean; selectedLetter?: boolean; firstPreparation?: boolean; failFirstAudit?: boolean; flowSave?: boolean; manualOutcome?: 'get-fails' | 'unknown'; search?: boolean; saveMode?: 'fail' | 'hold-success' | 'hold-fail'; twoResumes?: boolean; holdResumeContent?: boolean; snapshotResumeContent?: boolean; resumeRevalidationFails?: boolean; versionedScore?: boolean; holdOldAnalysis?: boolean; holdFirstAnalysisOnly?: boolean; auditCorrection?: boolean; holdAuditCorrection?: boolean; versions?: boolean; holdVersionRestore?: boolean; versionRestoreFails?: boolean; realAgent?: boolean; expiredApproval?: boolean; twoJobQuestions?: boolean; holdFirstTaskRead?: boolean; holdReturnOwnerA?: boolean; taskPerUser?: boolean; dashboardFourTasks?: boolean; agentJourney?: boolean } = {}) {
+async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unknown' | 'waiting_for_user' | 'waiting_for_authorization' | 'cancelled' | 'failed' | 'filling'; recordedInitially?: boolean; evidenceCase?: 'bound' | 'unbound' | 'unavailable'; previewMismatch?: 'owner' | 'id' | 'job'; malformedPreview?: 'content' | 'contact'; failTailoredRead?: boolean; taskFailure?: boolean; missing?: boolean; holdSelectedLetter?: boolean; selectedLetter?: boolean; firstPreparation?: boolean; failFirstAudit?: boolean; flowSave?: boolean; manualOutcome?: 'get-fails' | 'unknown'; search?: boolean; saveMode?: 'fail' | 'hold-success' | 'hold-fail'; twoResumes?: boolean; holdResumeContent?: boolean; snapshotResumeContent?: boolean; resumeRevalidationFails?: boolean; versionedScore?: boolean; holdOldAnalysis?: boolean; holdFirstAnalysisOnly?: boolean; auditCorrection?: boolean; holdAuditCorrection?: boolean; versions?: boolean; holdVersionRestore?: boolean; versionRestoreFails?: boolean; realAgent?: boolean; expiredApproval?: boolean; twoJobQuestions?: boolean; holdFirstTaskRead?: boolean; holdReturnOwnerA?: boolean; taskPerUser?: boolean; dashboardFourTasks?: boolean; agentJourney?: boolean } = {}) {
   let releaseReturnOwnerA = () => {}
   const returnOwnerAGate = new Promise<void>(resolve => { releaseReturnOwnerA = resolve })
   let releaseStaleJob = () => {}
@@ -146,9 +146,11 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
   const lettersGate = new Promise<void>(resolve => { releaseLetters = resolve })
   const state = { job: { ...job(), finalCoverLetterId: options.holdSelectedLetter || options.selectedLetter ? 'selected-letter' : null, finalResumeId: options.firstPreparation ? null : 'resume-1' }, resume: resume(), audit: options.auditCorrection ? { ...audit(), audit: { ...audit().audit, verdict: 'revise', findings: [{ area: 'resume', target: 'summary', severity: 'warning', title: 'Fix summary', evidence: 'Outdated wording', action: 'Apply correction', proposedValue: 'Audited v2 summary' }] } } : audit(options.stale ? '2026-10-29T10:00:00.000Z' : time),
     secondResume: { ...resume(), id: 'resume-2', name: 'Second fixture resume', targetJobId: null as string | null, content: { ...resume().content, summary: 'Second resume content.' } },
-    answeredJobA: false, saveResponses: 0, armReturnOwnerA: false, returnOwnerAEntered: false, releaseReturnOwnerA, manualPosted: false, manualReadAvailable: false, hideResumeOnExport: false, fontRequests: [] as string[], activeUserId: 'fixture-user', agentStage: 'question' as 'question' | 'approval' | 'running' | 'unknown', requestOwners: [] as Array<{ path: string; method: string; userId: string }>, agentRequests: [] as Array<{ path: string; method: string; body?: unknown }>, writes: [] as Array<{ path: string; body: unknown }>, analysisRequests: [] as string[], analysisBodies: [] as unknown[], analysisCalls: [] as Array<{ path: string; body: unknown }>, unexpected: [] as string[], taskReads: 0, staleJobRequested: false, staleJobReturned: false, releaseStaleJob, taskStatusOverride: null as 'waiting_for_authorization' | null, firstTaskReadFinished: false, releaseFirstTaskRead, letterRequested: false, resumeContentRequested: false, releaseLetters, releaseSave, releaseResumeContent, releaseOldAnalysis, releaseAuditCorrection, releaseVersionRestore }
+    answeredJobA: false, saveResponses: 0, armReturnOwnerA: false, returnOwnerAEntered: false, releaseReturnOwnerA, manualPosted: false, manualReadAvailable: false, hideResumeOnExport: false, malformedPreview: options.malformedPreview ?? null, fontRequests: [] as string[], activeUserId: 'fixture-user', agentStage: 'question' as 'question' | 'approval' | 'running' | 'unknown', requestOwners: [] as Array<{ path: string; method: string; userId: string }>, agentRequests: [] as Array<{ path: string; method: string; body?: unknown }>, writes: [] as Array<{ path: string; body: unknown }>, analysisRequests: [] as string[], analysisBodies: [] as unknown[], analysisCalls: [] as Array<{ path: string; body: unknown }>, unexpected: [] as string[], taskReads: 0, staleJobRequested: false, staleJobReturned: false, releaseStaleJob, taskStatusOverride: null as 'waiting_for_authorization' | null, firstTaskReadFinished: false, releaseFirstTaskRead, letterRequested: false, resumeContentRequested: false, releaseLetters, releaseSave, releaseResumeContent, releaseOldAnalysis, releaseAuditCorrection, releaseVersionRestore }
   if (options.evidenceCase === 'unbound') state.job.finalResumeId = null
+  if (options.previewMismatch === 'job') state.job.finalResumeId = null
   if (options.evidenceCase === 'unavailable') state.hideResumeOnExport = true
+  if (options.failTailoredRead) state.hideResumeOnExport = true
   if (options.recordedInitially) state.job = { ...state.job, status: 'applied', workflowState: 'submitted' }
   if (options.selectedLetter) state.audit = { ...state.audit, coverLetterId: 'selected-letter', coverLetterUpdatedAt: time }
   const json = (route: Route, value: unknown, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(value) })
@@ -304,7 +306,10 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
     if (pathname === '/api/resume/resume-1' && state.activeUserId === 'fixture-b') return json(route, { error: 'Not found' }, 404)
     if (pathname === '/api/resume/resume-2') return json(route, state.secondResume)
     if (pathname === '/api/resume/resume-1' && options.holdResumeContent) { const snapshot = structuredClone(state.resume); state.resumeContentRequested = true; await resumeContentGate; return options.resumeRevalidationFails ? json(route, { error: 'Fixture revalidation failed' }, 500) : json(route, options.snapshotResumeContent ? snapshot : state.resume) }
-    if (pathname === '/api/resume/resume-1' && state.hideResumeOnExport) return json(route, { error: 'Fixture material unavailable' }, 404)
+    if (pathname === '/api/resume/resume-1' && state.hideResumeOnExport) return json(route, { error: 'Fixture material unavailable' }, options.failTailoredRead ? 500 : 404)
+    if (pathname === '/api/resume/resume-1' && state.malformedPreview === 'content') { const { content: _content, ...incomplete } = state.resume; return json(route, incomplete) }
+    if (pathname === '/api/resume/resume-1' && state.malformedPreview === 'contact') { const { contact: _contact, ...incomplete } = state.resume.content; return json(route, { ...state.resume, content: incomplete }) }
+    if (pathname === '/api/resume/resume-1' && options.previewMismatch) return json(route, { ...state.resume, ...(options.previewMismatch === 'owner' ? { userId: 'other-user' } : options.previewMismatch === 'id' ? { id: 'other-resume' } : { targetJobId: 'other-job' }) })
     if (pathname === '/api/resume/resume-1' || pathname === '/api/resume/default') return json(route, state.resume)
     if (pathname === '/api/me') return json(route, { onboardedAt: time })
     if (pathname === '/api/gmail/unread') return json(route, { count: 0 })
@@ -658,6 +663,109 @@ for (const status of ['unknown', 'filling'] as const) {
     expect(state.unexpected).toEqual([])
   })
 }
+
+test('resume preview is loading until the selected material is verified', async ({ page }) => {
+  const state = await install(page, { holdResumeContent: true, recordedInitially: true })
+  await open(page)
+  await expect.poll(() => state.resumeContentRequested).toBe(true)
+  const materials = page.getByRole('list', { name: /Application progress|申请进度/ }).locator('li').filter({ hasText: /Materials|申请材料/ })
+  const submission = page.getByRole('list', { name: /Application progress|申请进度/ }).locator('li').filter({ hasText: /Submission record|提交记录/ })
+  await expect(materials).toContainText(/Not confirmed|尚未确认/)
+  await expect(submission).toContainText(/Recorded|已有记录/)
+  await page.getByRole('button').filter({ has: page.getByText(/^(Resume|简历)$/) }).click()
+  await expect(page.getByRole('status').filter({ hasText: /Loading resume|正在加载简历/ })).toBeVisible()
+  const edit = page.getByRole('button', { name: /Edit this resume|编辑此简历/ })
+  await expect(edit).toBeDisabled()
+  state.releaseResumeContent()
+  await expect(materials).toContainText(/Recorded|已有记录/)
+  await expect(edit).toBeEnabled()
+  await edit.click()
+  await expect(page).toHaveURL(/page=resume/)
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+for (const previewCase of ['unavailable', 'owner', 'id', 'job'] as const) {
+  test(`resume preview rejects unavailable or mismatched material: ${previewCase}`, async ({ page }) => {
+    const state = await install(page, previewCase === 'unavailable' ? { evidenceCase: 'unavailable' } : { previewMismatch: previewCase })
+    await open(page)
+    await page.getByRole('button').filter({ has: page.getByText(/^(Resume|简历)$/) }).click()
+    await expect(page.getByRole('status').filter({ hasText: /Could not load resume|无法加载简历/ })).toBeVisible()
+    await expect(page.getByRole('button', { name: /Edit this resume|编辑此简历/ })).toBeDisabled()
+    const materials = page.getByRole('list', { name: /Application progress|申请进度/ }).locator('li').filter({ hasText: /Materials|申请材料/ })
+    await expect(materials).toContainText(/Not confirmed|尚未确认/)
+    if (previewCase === 'unavailable') {
+      const review = page.getByRole('button', { name: /Provide missing information|补充信息/, exact: true })
+      await expect(review).toBeEnabled()
+      await review.click()
+      await expect(page.getByText('Fixture evidence')).toBeVisible()
+      expect(state.writes).toEqual([])
+      await page.getByRole('button').filter({ has: page.getByText(/^(Resume|简历)$/) }).click()
+      state.hideResumeOnExport = false
+      await page.getByRole('status').filter({ hasText: /Could not load resume|无法加载简历/ }).getByRole('button', { name: /Refresh status|刷新状态/ }).click()
+      await expect(page.getByRole('button', { name: /Edit this resume|编辑此简历/ })).toBeEnabled()
+      await expect(materials).toContainText(/Recorded|已有记录/)
+    }
+    expect(state.writes).toEqual([])
+    expect(state.unexpected).toEqual([])
+  })
+}
+
+for (const malformedPreview of ['content', 'contact'] as const) test(`resume preview rejects missing ${malformedPreview} and recovers through a read-only refresh`, async ({ page }) => {
+  const state = await install(page, { malformedPreview })
+  const errors: string[] = []
+  page.on('pageerror', error => errors.push(error.message))
+  await open(page)
+  await page.getByRole('button').filter({ has: page.getByText(/^(Resume|简历)$/) }).click()
+  const unavailable = page.getByRole('status').filter({ hasText: /Could not load resume|无法加载简历/ })
+  await expect(unavailable).toBeVisible()
+  const edit = page.getByRole('button', { name: /Edit this resume|编辑此简历/ })
+  await expect(edit).toBeDisabled()
+  state.malformedPreview = null
+  await unavailable.getByRole('button', { name: /Refresh status|刷新状态/ }).click()
+  await expect(edit).toBeEnabled()
+  expect(errors).toEqual([])
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+test('first preparation stops after a generated resume cannot be read and reuses it after refresh', async ({ page }) => {
+  const state = await install(page, { firstPreparation: true, failTailoredRead: true })
+  await open(page)
+  const prepare = page.getByRole('button', { name: /Prepare application materials|准备申请材料|Check current materials|检查当前材料/, exact: true })
+  await prepare.click()
+  await expect.poll(() => state.writes.map(write => write.path)).toEqual(['/api/jobs/outside-page/tailor-resume'])
+  await expect(page.getByText(/Preparation could not finish|准备未完成/)).toBeVisible()
+  const unavailable = page.getByRole('status').filter({ hasText: /Could not load resume|无法加载简历/ })
+  await expect(unavailable).toBeVisible()
+  await expect(prepare).toBeDisabled()
+  expect(state.job.finalResumeId).toBeNull()
+  state.hideResumeOnExport = false
+  await unavailable.getByRole('button', { name: /Refresh status|刷新状态/ }).click()
+  await expect(page.getByRole('button', { name: /Edit this resume|编辑此简历/ })).toBeEnabled()
+  expect(state.writes.map(write => write.path)).toEqual(['/api/jobs/outside-page/tailor-resume'])
+  await expect(prepare).toBeEnabled()
+  await prepare.click()
+  await expect.poll(() => state.writes.map(write => write.path)).toEqual([
+    '/api/jobs/outside-page/tailor-resume', '/api/jobs/outside-page/audit-application', '/api/jobs/outside-page/assign',
+  ])
+  expect(state.unexpected).toEqual([])
+})
+
+test('a late generated resume read cannot continue preparation after its deadline', async ({ page }) => {
+  await page.clock.install()
+  const state = await install(page, { firstPreparation: true, holdResumeContent: true })
+  await open(page)
+  await page.getByRole('button', { name: /Prepare application materials|准备申请材料/, exact: true }).click()
+  await expect.poll(() => state.resumeContentRequested).toBe(true)
+  await page.clock.fastForward(30_001)
+  await expect(page.getByText(/Preparation could not finish|准备未完成/)).toBeVisible()
+  state.releaseResumeContent()
+  await expect(page.getByRole('button', { name: /Edit this resume|编辑此简历/ })).toBeEnabled()
+  expect(state.writes.map(write => write.path)).toEqual(['/api/jobs/outside-page/tailor-resume'])
+  expect(state.job.finalResumeId).toBeNull()
+  expect(state.unexpected).toEqual([])
+})
 
 for (const evidenceCase of ['bound', 'unbound', 'unavailable'] as const) {
   test(`application evidence guidance uses only the current resume: ${evidenceCase}`, async ({ page }) => {

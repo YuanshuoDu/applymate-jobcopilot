@@ -28,6 +28,37 @@ import { clearManualRecordLock, readManualRecordLock, writeManualRecordLock, typ
 import { openApplication, openApplicationSession } from '@/lib/application-navigation'
 
 const KANBAN_COLS: JobStatus[] = ['saved', 'applied', 'interview', 'offer', 'rejected']
+// Validate the fields directly used by this preview; nested section entries
+// still follow the existing resume contract and are not exhaustively checked.
+function isUsableResumePayload(value: unknown): value is Resume & { userId: string } {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const resume = value as Record<string, unknown>
+  const content = resume.content
+  if (!content || typeof content !== 'object' || Array.isArray(content)) return false
+  const fields = content as Record<string, unknown>
+  const contact = fields.contact
+  if (!contact || typeof contact !== 'object' || Array.isArray(contact)) return false
+  if (typeof resume.name !== 'string' || typeof resume.userId !== 'string') return false
+  const contactFields = contact as Record<string, unknown>
+  if (['name', 'email', 'location', 'linkedin', 'github', 'website', 'phone'].some(key => contactFields[key] != null && typeof contactFields[key] !== 'string')) return false
+  if (fields.summary != null && typeof fields.summary !== 'string') return false
+  if (!['experience', 'education', 'skills'].every(key => Array.isArray(fields[key]))) return false
+  return ['languages', 'projects', 'certifications', 'custom', 'sectionOrder'].every(key => fields[key] == null || Array.isArray(fields[key]))
+}
+
+async function readResumeForPreparation(id: string): Promise<unknown> {
+  const controller = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      fetch(`/api/resume/${encodeURIComponent(id)}`, { signal: controller.signal }).then(response => {
+        if (!response.ok) throw new Error('Resume unavailable')
+        return response.json() as Promise<unknown>
+      }),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error('Resume unavailable')) }, 30_000) }),
+    ])
+  } finally { if (timer) clearTimeout(timer) }
+}
 const COL_LABELS: Record<JobStatus, string> = {
   saved: 'Saved', applied: 'Applied',
   interview: 'Interview', offer: 'Offer', rejected: 'Rejected',
@@ -527,6 +558,8 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   const [latestAuditRecord, setLatestAuditRecord] = useState<StoredApplicationAudit | null>(null)
   const [openPackItem, setOpenPackItem] = useState<'resume' | 'coverLetter' | 'audit' | null>(null)
   const [resumePreview, setResumePreview] = useState<Resume | null>(null)
+  const [resumePreviewState, setResumePreviewState] = useState<{ id: string; status: 'loading' | 'unavailable' | 'ready' } | null>(null)
+  const [resumePreviewRetry, setResumePreviewRetry] = useState(0)
   const [createdTailoredResumeId, setCreatedTailoredResumeId] = useState<string | null>(null)
   const [coverLetterSelectionNeeded, setCoverLetterSelectionNeeded] = useState(false)
   const [latestAudit, setLatestAudit] = useState<ApplicationAudit | null>(null)
@@ -628,14 +661,27 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
 
   const previewResumeId = job.finalResumeId ?? existingTailoredResume?.id ?? createdTailoredResumeId ?? null
   useEffect(() => {
-    if (!previewResumeId) return
+    if (!previewResumeId || preparationInFlight.current) return
     const controller = new AbortController()
     setResumePreview(null)
-    fetch(`/api/resume/${previewResumeId}`, { signal: controller.signal }).then(response => response.ok ? response.json() : null)
-      .then((resume: Resume | null) => { if (!controller.signal.aborted) setResumePreview(resume) })
-      .catch(() => { if (!controller.signal.aborted) setResumePreview(null) })
-    return () => controller.abort()
-  }, [previewResumeId])
+    setResumePreviewState({ id: previewResumeId, status: 'loading' })
+    const timer = window.setTimeout(() => {
+      controller.abort()
+      setResumePreviewState({ id: previewResumeId, status: 'unavailable' })
+    }, 30_000)
+    fetch(`/api/resume/${encodeURIComponent(previewResumeId)}`, { signal: controller.signal })
+      .then(response => { if (!response.ok) throw new Error('Resume unavailable'); return response.json() })
+      .then((resume: unknown) => {
+        if (controller.signal.aborted) return
+        if (!isUsableResumePayload(resume) || !drawerUserId || job.userId !== drawerUserId || resume.userId !== drawerUserId || resume.id !== previewResumeId
+          || (job.finalResumeId !== resume.id && (job.finalResumeId || resume.targetJobId !== job.id))) throw new Error('Resume unavailable')
+        setResumePreview(resume)
+        setResumePreviewState({ id: previewResumeId, status: 'ready' })
+      })
+      .catch(() => { if (!controller.signal.aborted) setResumePreviewState({ id: previewResumeId, status: 'unavailable' }) })
+      .finally(() => window.clearTimeout(timer))
+    return () => { window.clearTimeout(timer); controller.abort() }
+  }, [previewResumeId, drawerUserId, job.userId, job.id, job.finalResumeId, resumePreviewRetry, autoPreparing])
 
   // Only open a resume read for this account and this application. A newly
   // tailored resume can precede final selection, but must target this job.
@@ -743,7 +789,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   async function autoTailorAndAudit() {
     const owner = drawerUserIdRef.current
     if (!owner || !isCurrentDrawer(owner) || job.userId !== owner) return
-    if (preparationInFlight.current || !manualWorkAllowed || taskReadState !== 'ready') return
+    if (preparationInFlight.current || !manualWorkAllowed || taskReadState !== 'ready' || (previewResumeId && !evidenceResumeId)) return
     if (job.finalCoverLetterId && !coverLetters?.some(letter => letter.id === job.finalCoverLetterId)) {
       toast.info(t('application.selectedLetterLoading'))
       return
@@ -788,15 +834,23 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
         if (!data || error) throw new Error(error ?? 'Could not repair the flagged resume section')
         adaptedResumeId = data.adaptedResumeId
       }
-      const response = await fetch(`/api/resume/${adaptedResumeId}`)
-      if (!isCurrentDrawer(owner)) return
-      if (response.ok) {
-        const tailored = await response.json() as Resume & { userId?: unknown }
+      let tailored: unknown
+      try {
+        tailored = await readResumeForPreparation(adaptedResumeId)
         if (!isCurrentDrawer(owner)) return
-        if (tailored.id !== adaptedResumeId || tailored.userId !== owner) throw new Error('Resume unavailable')
-        setResumePreview(tailored)
-        setCachedApiResponse(`/api/resume/${adaptedResumeId}`, tailored, owner)
+        if (!isUsableResumePayload(tailored) || tailored.id !== adaptedResumeId || tailored.userId !== owner
+          || (job.finalResumeId !== tailored.id && (job.finalResumeId || tailored.targetJobId !== job.id))) throw new Error('Resume unavailable')
+      } catch (error) {
+        if (isCurrentDrawer(owner)) {
+          setResumePreview(null)
+          setResumePreviewState({ id: adaptedResumeId, status: 'unavailable' })
+          setOpenPackItem('resume')
+        }
+        throw error
       }
+      if (!isUsableResumePayload(tailored)) throw new Error('Resume unavailable')
+      setResumePreview(tailored)
+      setCachedApiResponse(`/api/resume/${adaptedResumeId}`, tailored, owner)
 
       let coverLetter = job.finalCoverLetterId
         ? coverLetters?.find(letter => letter.id === job.finalCoverLetterId)
@@ -923,6 +977,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   )
   const applicationRecorded = job.status !== 'saved' || job.workflowState === 'submitted'
   const auditStale = Boolean(currentRecord && !currentPackAudited && currentRecord.audit.verdict === 'pass')
+  const canReviewExistingIssues = !currentPackAudited && (auditNeedsEvidence || auditNeedsRepair || auditRetryOnly)
   const openAudit = () => {
     setOpenPackItem('audit')
     window.setTimeout(() => auditSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 0)
@@ -950,7 +1005,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
           <button ref={drawerCloseRef} aria-label={t('application.closeDetails')} onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 16, color: 'var(--text-muted)', lineHeight: 1, padding: 0, marginTop: 2 }}>✕</button>
         </div>
 
-        <ApplicationProgress hasMaterials={Boolean(previewResumeId)} checked={Boolean(currentPackAudited)} recorded={applicationRecorded} task={task} />
+        <ApplicationProgress hasMaterials={Boolean(evidenceResumeId)} checked={Boolean(currentPackAudited)} recorded={applicationRecorded} task={task} />
 
         {!applicationPreflight.canPrepare && applicationPreflight.issues.length > 0 && <div style={{ margin: '18px 28px 0', padding: '12px 14px', borderRadius: 9, border: '1px solid #fbbf24', background: '#fffbeb', color: '#78350f', fontSize: 12, lineHeight: 1.5 }}>
           <strong>{applicationPreflight.canPrepare ? t('jobs.drawer.manualOnly') : t('jobs.drawer.dataNeedsCorrection')}</strong>
@@ -971,7 +1026,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
               {!currentPackAudited && !existingTailoredResume && baseResumes.length > 1 && <label style={{ fontSize: 12 }}>{t('application.baseResume')}
                 <select value={selectedResumeId} onChange={event => setSelectedResumeId(event.target.value)} style={{ ...drawerInputSt, width: '100%', margin: '6px 0 12px' }}>{baseResumes.map(resume => <option key={resume.id} value={resume.id}>{resume.isDefault ? `${t('jobs.defaultResume')} — ` : ''}{resume.name}</option>)}</select>
               </label>}
-              <Btn variant="primary" disabled={autoPreparing || (!currentPackAudited && !canTailorResume)} onClick={() => {
+              <Btn variant="primary" disabled={autoPreparing || (!canReviewExistingIssues && (Boolean(previewResumeId && !evidenceResumeId) || (!currentPackAudited && !canTailorResume)))} onClick={() => {
                 if (currentPackAudited) {
                   if (job.url && /^https?:\/\//i.test(job.url)) window.open(job.url, '_blank', 'noopener,noreferrer')
                   else setOpenPackItem('resume')
@@ -985,17 +1040,17 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
             <p style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{currentPackAudited ? t('application.manualHint') : t('application.materialsHint')}</p>
             <div style={{ borderTop: '1px solid var(--border)', paddingTop: 22, fontSize: 12, fontWeight: 700, color: 'var(--text-muted)' }}>{t('jobs.drawer.applicationPack')}</div>
             <style>{`@keyframes pack-line-grow { from { transform: scaleY(0) } to { transform: scaleY(1) } } @keyframes pack-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(37,99,235,.35) } 50% { box-shadow: 0 0 0 7px rgba(37,99,235,0) } }`}</style>
-            <PackRow number="1" title={t('jobs.pack.resume')} detail={packStage === 'resume' ? t('jobs.pack.tailoring') : t('jobs.pack.tailoredRole')} done={Boolean(previewResumeId)} active={packStage === 'resume'} open={openPackItem === 'resume'} onToggle={() => setOpenPackItem(current => current === 'resume' ? null : 'resume')}>
-              <ResumePackPreview resume={resumePreview} onReview={() => { rememberNestedOrigin(); setDocumentPreview('resume') }} />
-              {previewResumeId && <Btn variant="ghost" small onClick={() => onOpenTailoredResume(previewResumeId)}>{t('application.editResume')}</Btn>}
+            <PackRow number="1" title={t('jobs.pack.resume')} detail={packStage === 'resume' ? t('jobs.pack.tailoring') : evidenceResumeId ? t('jobs.pack.tailoredRole') : previewResumeId ? t(resumePreviewState?.id === previewResumeId && resumePreviewState.status === 'unavailable' ? 'print.loadError' : 'resume.loading') : t('application.notComplete')} done={Boolean(evidenceResumeId)} active={packStage === 'resume'} open={openPackItem === 'resume'} onToggle={() => setOpenPackItem(current => current === 'resume' ? null : 'resume')}>
+              {previewResumeId && !evidenceResumeId ? <div role="status"><p>{t(resumePreviewState?.id === previewResumeId && resumePreviewState.status === 'unavailable' ? 'print.loadError' : 'resume.loading')}</p>{resumePreviewState?.id === previewResumeId && resumePreviewState.status === 'unavailable' && <Btn variant="ghost" small onClick={() => setResumePreviewRetry(current => current + 1)}>{t('application.refreshStatus')}</Btn>}</div> : <ResumePackPreview resume={evidenceResumeId ? resumePreview : null} onReview={() => { rememberNestedOrigin(); setDocumentPreview('resume') }} />}
+              {previewResumeId && <Btn variant="ghost" small disabled={!evidenceResumeId} onClick={() => { if (evidenceResumeId) onOpenTailoredResume(evidenceResumeId) }}>{t('application.editResume')}</Btn>}
             </PackRow>
             <PackRow number="2" title={t('jobs.pack.coverLetter')} detail={packStage === 'coverLetter' ? t('jobs.pack.writingCoverLetter') : selectedCoverLetter ? t('jobs.pack.generatedJob') : t('application.coverLetterOptional')} done={Boolean(selectedCoverLetter)} active={packStage === 'coverLetter'} open={openPackItem === 'coverLetter'} onToggle={() => setOpenPackItem(current => current === 'coverLetter' ? null : 'coverLetter')}>
               <CoverLetterPackPreview coverLetter={selectedCoverLetter ?? null} applicant={resumePreview?.content.contact} fallbackName={resumePreview?.name ?? 'Applicant'} company={job.company} role={job.role} templateId={resumePreview?.templateId ?? undefined} templateOptions={resumePreview?.templateOptions ?? undefined} onReview={() => { rememberNestedOrigin(); setDocumentPreview('coverLetter') }} />
               {coverLetterSelectionNeeded && <p role="status">{t('application.coverLetterSelectFirst')}</p>}
-              {!job.finalCoverLetterId && previewResumeId && <Btn variant="ghost" small onClick={() => onOpenTailoredResume(previewResumeId)}>{t('application.coverLetterSelect')}</Btn>}
+              {!job.finalCoverLetterId && previewResumeId && <Btn variant="ghost" small disabled={!evidenceResumeId} onClick={() => { if (evidenceResumeId) onOpenTailoredResume(evidenceResumeId) }}>{t('application.coverLetterSelect')}</Btn>}
             </PackRow>
             <div ref={auditSectionRef}><PackRow last number="3" title={t('jobs.pack.audit')} detail={packStage === 'audit' ? t('jobs.pack.checkingChanges') : auditRetryOnly ? t('jobs.pack.retryResponse') : auditNeedsEvidence ? `${evidenceGapFindings.length} ${t('jobs.auditFactsCount')}` : auditNeedsRepair ? `${factualAuditFindings.length} ${t('jobs.auditIssuesCount')}` : displayedAudit ? t('jobs.pack.verifiedFacts') : t('jobs.pack.readyRun')} done={currentPackAudited} failed={auditNeedsRepair || auditNeedsEvidence || auditRetryOnly} active={packStage === 'audit'} open={openPackItem === 'audit'} onToggle={() => setOpenPackItem(current => current === 'audit' ? null : 'audit')}>
-              <AuditPackPreview audit={displayedAudit} onRepair={() => void autoTailorAndAudit()} onReviewEvidence={() => { if (evidenceResumeId) onOpenTailoredResume(evidenceResumeId) }} canReviewEvidence={Boolean(evidenceResumeId)} repairing={autoPreparing || !manualWorkAllowed || taskReadState !== 'ready'} />
+              <AuditPackPreview audit={displayedAudit} onRepair={() => void autoTailorAndAudit()} onReviewEvidence={() => { if (evidenceResumeId) onOpenTailoredResume(evidenceResumeId) }} canReviewEvidence={Boolean(evidenceResumeId)} repairing={autoPreparing || !manualWorkAllowed || taskReadState !== 'ready' || Boolean(previewResumeId && !evidenceResumeId)} />
             </PackRow></div>
             {currentPackAudited && <button onClick={() => void downloadFinalPack()} disabled={downloadingPack} style={{ width: '100%', minHeight: 46, border: 0, borderRadius: 9, background: '#2563eb', color: '#fff', fontWeight: 700, cursor: 'pointer' }}>{downloadingPack ? t('application.downloadingZip') : t('application.downloadZip')}</button>}
             <div style={{ borderTop: '1px solid var(--border)', paddingTop: 16 }}>
@@ -1203,7 +1258,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
           )}
         </div>
 
-        {documentPreview === 'resume' && resumePreview && <DocumentPreviewModal title={resumePreview.name} onClose={closePreview}><ResumeRenderer content={resumePreview.content} templateId={resumePreview.templateId} templateOptions={resumePreview.templateOptions} /></DocumentPreviewModal>}
+        {documentPreview === 'resume' && evidenceResumeId && resumePreview && <DocumentPreviewModal title={resumePreview.name} onClose={closePreview}><ResumeRenderer content={resumePreview.content} templateId={resumePreview.templateId} templateOptions={resumePreview.templateOptions} /></DocumentPreviewModal>}
         {documentPreview === 'coverLetter' && selectedCoverLetter && <DocumentPreviewModal title={t('jobs.coverLetterPreview')} onClose={closePreview}><CoverLetterPreview content={selectedCoverLetter.content} applicant={resumePreview?.content.contact} fallbackName={resumePreview?.name ?? 'Applicant'} company={job.company} role={job.role} templateId={resumePreview?.templateId ?? selectedCoverLetter.templateId ?? 'clean'} templateOptions={resumePreview?.templateOptions ?? selectedCoverLetter.templateOptions ?? {}} /></DocumentPreviewModal>}
 
         {/* Footer */}

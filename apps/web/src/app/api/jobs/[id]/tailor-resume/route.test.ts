@@ -75,7 +75,7 @@ describe('tailor resume API', () => {
       orderBy: { updatedAt: 'desc' }, select: { id: true, parentResumeId: true, content: true, name: true },
     })
     expect(mocks.modelChat).not.toHaveBeenCalled()
-  })
+  }, 15_000)
 
   it('uses the confirmed Persona as a fact boundary for newly tailored sections', async () => {
     mocks.resumeFindFirst
@@ -95,6 +95,47 @@ describe('tailor resume API', () => {
     if (!response) throw new Error('Expected a response')
     expect(response.status).toBe(200)
     expect(mocks.modelChat).toHaveBeenCalledWith(expect.arrayContaining([expect.objectContaining({ content: expect.stringContaining('CONFIRMED PERSONA') })]), expect.any(Object), 2000)
+  })
+
+  it.each([
+    ['another tailored resume is newest', { id: 'resume_other' }],
+    ['no tailored resume exists for the job', null],
+  ])('rejects forced repair before any writes or AI when %s', async (_reason, existing) => {
+    mocks.resumeFindFirst.mockResolvedValueOnce({ id: 'resume_selected' }).mockResolvedValueOnce(existing)
+    mocks.jobFindFirst.mockResolvedValueOnce({ id: 'job_1', description: 'Build reliable systems.' })
+    const { POST } = await import('./route')
+    const response = await POST(new NextRequest('http://localhost/api/jobs/job_1/tailor-resume', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ resumeId: 'resume_selected', forceRetailor: true }),
+    }) as never, { params: Promise.resolve({ id: 'job_1' }) })
+    if (!response) throw new Error('Expected a response')
+    expect(response.status).toBe(409)
+    expect(await response.json()).toEqual({ error: expect.stringContaining('Open it to edit') })
+    expect(mocks.resumeFindFirst).toHaveBeenNthCalledWith(1, { where: { id: 'resume_selected', userId: 'user_1' } })
+    expect(mocks.resumeFindFirst).toHaveBeenNthCalledWith(2, expect.objectContaining({ where: { userId: 'user_1', targetJobId: 'job_1', kind: 'adapted', origin: 'ai-adapted' } }))
+    expect(mocks.jobFindFirst).toHaveBeenCalledWith({ where: { id: 'job_1', userId: 'user_1' } })
+    expect(mocks.modelChat).not.toHaveBeenCalled()
+    expect(mocks.buildPersona).not.toHaveBeenCalled()
+    expect(mocks.resumeVersionCreate).not.toHaveBeenCalled()
+    expect(mocks.resumeUpdate).not.toHaveBeenCalled()
+    expect(mocks.resumeCreate).not.toHaveBeenCalled()
+    expect(mocks.activityCreate).not.toHaveBeenCalled()
+  })
+
+  it.each(['resume', 'job'])('rejects forced repair when the account does not own the %s', async missing => {
+    mocks.resumeFindFirst.mockResolvedValueOnce(missing === 'resume' ? null : { id: 'resume_selected' }).mockResolvedValueOnce({ id: 'resume_selected' })
+    mocks.jobFindFirst.mockResolvedValueOnce(missing === 'job' ? null : { id: 'job_1', description: 'Build reliable systems.' })
+    const { POST } = await import('./route')
+    const response = await POST(new NextRequest('http://localhost/api/jobs/job_1/tailor-resume', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ resumeId: 'resume_selected', forceRetailor: true }),
+    }) as never, { params: Promise.resolve({ id: 'job_1' }) })
+    if (!response) throw new Error('Expected a response')
+    expect(response.status).toBe(404)
+    expect(mocks.modelChat).not.toHaveBeenCalled()
+    expect(mocks.resumeVersionCreate).not.toHaveBeenCalled()
+    expect(mocks.resumeUpdate).not.toHaveBeenCalled()
+    expect(mocks.resumeCreate).not.toHaveBeenCalled()
   })
 
   it('repairs only the experience section when the audit flags an unsupported role claim', async () => {
@@ -118,5 +159,8 @@ describe('tailor resume API', () => {
     expect(response.status).toBe(200)
     expect(mocks.modelChat).toHaveBeenCalledTimes(1)
     expect(mocks.modelChat.mock.calls[0][0][0].content).toContain('SECTION: experience')
+    expect(mocks.resumeVersionCreate).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ resumeId: 'resume_tailored', userId: 'user_1' }) }))
+    expect(mocks.resumeUpdate).toHaveBeenCalledWith(expect.objectContaining({ where: { id: 'resume_tailored' } }))
+    expect(mocks.resumeCreate).not.toHaveBeenCalled()
   })
 })

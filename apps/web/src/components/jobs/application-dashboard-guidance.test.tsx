@@ -19,7 +19,7 @@ function elements(value: React.ReactNode): React.ReactElement<Record<string, unk
 
 function props() {
   return {
-    tasks: [] as ApplicationTaskView[], loading: false, error: null,
+    tasks: [] as ApplicationTaskView[], loading: false, error: null, limited: false,
     savedJobs: [{ id: 'saved-27', company: 'Saved Inc', role: 'Engineer' }] as DashboardData['savedJobs'],
     followUps: [{ id: 'follow-19', company: 'Follow Inc', role: 'Developer' }] as DashboardData['followUpsDue'],
     onOpenApplication: vi.fn(), onOpenSession: vi.fn(), onOpenAttention: vi.fn(), onRefresh: vi.fn(), onDiscover: vi.fn(),
@@ -91,6 +91,40 @@ describe('Dashboard application guidance', () => {
     const refresh = elements(tree).find(element => element.type === 'button')!
     ;(refresh.props.onClick as () => void)()
     expect(input.onRefresh).toHaveBeenCalledOnce()
+    expect(input.onDiscover).not.toHaveBeenCalled()
+  })
+
+  it.each(['loading', 'error', 'limited'] as const)('withholds continuation suggestions when task coverage is %s', state => {
+    const input = {
+      ...props(), loading: state === 'loading',
+      error: state === 'error' ? 'unavailable' as const : null,
+      limited: state === 'limited',
+    }
+    const tree = ApplicationDashboardGuidance(input)
+    const html = renderToStaticMarkup(tree)
+    expect(html).not.toContain('application.savedContinue')
+    expect(html).not.toContain('application.followUp')
+    expect(html).not.toContain('dashboard.momentum.savePromising')
+    if (state === 'limited') expect(html).toContain('application.partialSuggestions')
+    expect(input.onOpenApplication).not.toHaveBeenCalled()
+    if (state !== 'loading') {
+      const refresh = elements(tree).find(element => element.type === 'button')!
+      ;(refresh.props.onClick as () => void)()
+      expect(input.onRefresh).toHaveBeenCalledOnce()
+    }
+  })
+
+  it('retains known attention cards when the recent task list is limited', () => {
+    const input = { ...props(), limited: true, tasks: [task('1', 'waiting_for_user')] }
+    const tree = ApplicationDashboardGuidance(input)
+    expect(elements(tree).filter(element => element.type === ApplicationTaskCard)).toHaveLength(1)
+    expect(renderToStaticMarkup(tree)).toContain('application.viewRecentAttention')
+  })
+
+  it('does not suggest discovery for an empty limited snapshot', () => {
+    const input = { ...props(), limited: true, savedJobs: [], followUps: [] }
+    const tree = ApplicationDashboardGuidance(input)
+    expect(renderToStaticMarkup(tree)).not.toContain('dashboard.momentum.savePromising')
     expect(input.onDiscover).not.toHaveBeenCalled()
   })
 
