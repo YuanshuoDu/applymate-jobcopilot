@@ -98,6 +98,10 @@ type WorkerProcess = ChildProcess & {
   exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>
   closed: Promise<{ code: number | null; signal: NodeJS.Signals | null }>
 }
+const WORKER_RESULT_STATUSES = ["completed", "failed", "interrupted", "lease_lost", "retrying", "skipped", "waiting", "waiting_for_user"] as const
+type WorkerResultStatus = typeof WORKER_RESULT_STATUSES[number]
+const DIAGNOSTIC_TASK_STATUSES = new Set(["queued", "running", "waiting", "waiting_for_user", "retrying",
+  "completed", "failed", "interrupted", "cancelled", "closed"])
 type RestoredWaitObservationSummary = {
   state: "unconsumed" | "consumed"
   canonicalCallIdPreserved: boolean
@@ -146,6 +150,23 @@ async function waitForMarker(child: WorkerProcess, marker: string, timeoutMs = 2
     await new Promise(resolve => setTimeout(resolve, 25))
   }
   throw new Error(`Timed out waiting for ${marker}; stdout: ${child.stdoutText}; stderr: ${child.stderrText}`)
+}
+
+function workerResultStatus(child: WorkerProcess, marker: "WORKER_A_WAITING"): WorkerResultStatus | null {
+  const prefix = `${marker} `
+  const line = child.stdoutText.split(/\r?\n/).find(value => value.startsWith(prefix))
+  if (!line) return null
+  try {
+    const envelope = asObject(JSON.parse(line.slice(prefix.length)) as unknown)
+    const status = asObject(envelope.result).status
+    return typeof status === "string" && WORKER_RESULT_STATUSES.includes(status as WorkerResultStatus)
+      ? status as WorkerResultStatus : null
+  } catch { return null }
+}
+
+function diagnosticTaskStatus(value: unknown): string | null {
+  if (typeof value !== "string") return null
+  return DIAGNOSTIC_TASK_STATUSES.has(value) ? value : "other"
 }
 
 function boundedRecoveryTrace(child: WorkerProcess): Record<string, unknown> | null {
@@ -380,15 +401,15 @@ async function expectAbsentSourceResultClaimSafety(pool: Pool, ids: FixtureIds, 
     const sourceStepId = `task:${ids.waiterTaskId}:step:0:attempt:1`
     const sourceCallItemId = `task:${ids.waiterTaskId}:item:tool-call:${PHONE_SHAPED_WAIT_TOOL_CALL_ID}:attempt:1`
     const sourceResultItemId = `task:${ids.waiterTaskId}:item:tool-result:${PHONE_SHAPED_WAIT_TOOL_CALL_ID}:attempt:1`
-    const [sourceCallResult, sourceEventsResult, sourceResultItems, sourceResultEvents] = await Promise.all([
+    const [sourceCallResult, sourceEventsResult, sourceResultItems, sourceResultEvents, sourceUsageResult] = await Promise.all([
       client.query<{ status: string; revision: number; content: Record<string, unknown> }>(
         `SELECT "status", "revision", "content" FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2
          AND "taskId" = $3 AND "stepId" = $4 AND "id" = $5 AND "type" = 'tool_call'`,
         [ids.sessionId, ids.turnId, ids.waiterTaskId, sourceStepId, sourceCallItemId],
       ),
-      client.query<{ id: string; type: string; actor: string; itemId: string | null; correlationId: string;
+      client.query<{ id: string; sequence: string; type: string; actor: string; itemId: string | null; correlationId: string;
         causationId: string | null; idempotencyKey: string; payload: Record<string, unknown> }>(
-        `SELECT "id", "type", "actor", "itemId", "correlationId", "causationId", "idempotencyKey", "payload"
+        `SELECT "id", "sequence"::text AS "sequence", "type", "actor", "itemId", "correlationId", "causationId", "idempotencyKey", "payload"
          FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
            AND ("itemId" = $4 OR "correlationId" = $5) ORDER BY "sequence"`,
         [ids.sessionId, ids.turnId, ids.waiterTaskId, sourceCallItemId, PHONE_SHAPED_WAIT_TOOL_CALL_ID],
@@ -405,8 +426,15 @@ async function expectAbsentSourceResultClaimSafety(pool: Pool, ids: FixtureIds, 
             AND "type" IN ('tool_call.completed', 'tool_call.failed', 'tool_call.interrupted'))) ORDER BY "sequence"`,
         [ids.sessionId, ids.turnId, ids.waiterTaskId, sourceResultItemId, PHONE_SHAPED_WAIT_TOOL_CALL_ID],
       ),
+      client.query<{ id: string; sequence: string; type: string; actor: string; correlationId: string; idempotencyKey: string }>(
+        `SELECT "id", "sequence"::text AS "sequence", "type", "actor", "correlationId", "idempotencyKey"
+         FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+           AND "type" = 'model.usage' AND "correlationId" = $4 AND "idempotencyKey" = $5`,
+        [ids.sessionId, ids.turnId, ids.waiterTaskId, sourceStepId, `task:${ids.waiterTaskId}:event:model-usage:${sourceStepId}`],
+      ),
     ])
     const sourceCall = sourceCallResult.rows[0]
+    const sourceUsage = sourceUsageResult.rows[0]
     const itemStarted = sourceEventsResult.rows.find(event => event.type === "item.started" && event.itemId === sourceCallItemId)
     const callStarted = sourceEventsResult.rows.find(event => event.type === "tool_call.started" && event.itemId === sourceCallItemId)
     expect(sourceCallResult.rows).toHaveLength(1)
@@ -416,9 +444,13 @@ async function expectAbsentSourceResultClaimSafety(pool: Pool, ids: FixtureIds, 
           idempotencyKey: SOURCE_WAIT_SECRET_IDEMPOTENCY_KEY(ids.waiterTaskId) } } })
     expect(sourceEventsResult.rows).toHaveLength(2)
     expect(sourceEventsResult.rows.map(event => event.type)).toEqual(["item.started", "tool_call.started"])
+    expect(sourceUsageResult.rows).toHaveLength(1)
+    expect(sourceUsage).toMatchObject({ type: "model.usage", actor: "subagent", correlationId: sourceStepId,
+      idempotencyKey: `task:${ids.waiterTaskId}:event:model-usage:${sourceStepId}` })
     expect(itemStarted).toMatchObject({ actor: "subagent", itemId: sourceCallItemId, correlationId: sourceStepId,
-      causationId: null, idempotencyKey: `task:${ids.waiterTaskId}:event:item-started:${sourceCallItemId}`,
+      causationId: sourceUsage?.id, idempotencyKey: `task:${ids.waiterTaskId}:event:item-started:${sourceCallItemId}`,
       payload: { itemId: sourceCallItemId, type: "tool_call", phase: null } })
+    expect(BigInt(sourceUsage!.sequence)).toBeLessThan(BigInt(itemStarted!.sequence))
     expect(callStarted).toMatchObject({ actor: "subagent", itemId: sourceCallItemId,
       correlationId: PHONE_SHAPED_WAIT_TOOL_CALL_ID, causationId: itemStarted?.id,
       idempotencyKey: `task:${ids.waiterTaskId}:event:tool-started:${PHONE_SHAPED_WAIT_TOOL_CALL_ID}`,
@@ -1039,8 +1071,15 @@ async function expectMalformedClaimOutcomeRejected(
     `SELECT "attemptCount", "publishedAt", "payload" FROM "agent_outbox"
       WHERE "topic" = 'agent.subagent.dispatch' AND "aggregateId" = $1 AND "idempotencyKey" = $2`,
     [ids.sessionId, `subagent-dispatch:${ids.waiterTaskId}`])
+  const beforeWaitCounts = await pool.query<{ rowCount: string; sourceCount: string; consumedCount: string }>(
+    `SELECT COUNT(*)::text AS "rowCount",
+       COUNT(*) FILTER (WHERE "id" = $4)::text AS "sourceCount",
+       COUNT(*) FILTER (WHERE "consumedAt" IS NOT NULL)::text AS "consumedCount"
+     FROM "agent_wait_conditions" WHERE "sessionId" = $1 AND "turnId" = $2 AND "parentTaskId" = $3`,
+    [ids.sessionId, ids.turnId, ids.waiterTaskId, waitId])
   expect(beforeTask.rows, `${label}: expected exactly one persisted waiter`).toHaveLength(1)
   expect(beforeDispatch.rows, `${label}: expected the dispatch generation row`).toHaveLength(1)
+  expect(beforeWaitCounts.rows).toEqual([{ rowCount: "1", sourceCount: "1", consumedCount: "1" }])
   const previousTraceTaskId = process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID
   const traceLog = vi.spyOn(console, "info").mockImplementation(() => undefined)
   try {
@@ -1051,6 +1090,7 @@ async function expectMalformedClaimOutcomeRejected(
       .find(value => value.startsWith("WORKER_B_RECOVERY_PREDICATE_TRACE "))
     expect(traceLine, `${label}: expiry recovery did not emit its real predicate trace`).toBeDefined()
     expect(JSON.parse(traceLine!.slice("WORKER_B_RECOVERY_PREDICATE_TRACE ".length))).toMatchObject({
+      waitRegistrationFound: false, waitRegistrationRejected: false,
       rejectionStage: "unsettled_external_call_rejected", blockingExternalCall: true,
     })
     const afterTask = await pool.query<{ status: string; attemptCount: number; leaseOwner: string | null; leaseExpired: boolean }>(
@@ -1060,9 +1100,16 @@ async function expectMalformedClaimOutcomeRejected(
       `SELECT "attemptCount", "publishedAt", "payload" FROM "agent_outbox"
         WHERE "topic" = 'agent.subagent.dispatch' AND "aggregateId" = $1 AND "idempotencyKey" = $2`,
       [ids.sessionId, `subagent-dispatch:${ids.waiterTaskId}`])
+    const afterWaitCounts = await pool.query<{ rowCount: string; sourceCount: string; consumedCount: string }>(
+      `SELECT COUNT(*)::text AS "rowCount",
+         COUNT(*) FILTER (WHERE "id" = $4)::text AS "sourceCount",
+         COUNT(*) FILTER (WHERE "consumedAt" IS NOT NULL)::text AS "consumedCount"
+       FROM "agent_wait_conditions" WHERE "sessionId" = $1 AND "turnId" = $2 AND "parentTaskId" = $3`,
+      [ids.sessionId, ids.turnId, ids.waiterTaskId, waitId])
     expect(beforeTask.rows[0]).toMatchObject({ status: "running", attemptCount: 1, leaseExpired: true })
     expect(afterTask.rows).toEqual(beforeTask.rows)
     expect(afterDispatch.rows).toEqual(beforeDispatch.rows)
+    expect(afterWaitCounts.rows).toEqual(beforeWaitCounts.rows)
   } finally {
     if (previousTraceTaskId === undefined) delete process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID
     else process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID = previousTraceTaskId
@@ -1293,7 +1340,8 @@ async function diagnoseZeroWaitWake(pool: Pool, ids: FixtureIds, report: WaitRes
     const result = await pool.query<{ waitRows: string; waitWaiting: string; waitReady: string; waitTimedOut: string;
       waitSuspended: boolean | null; waitConsumed: boolean | null; parentRows: string; parentWaiting: string; parentRunning: string;
       parentLeaseOwnerPresent: boolean | null; parentLeaseExpiryPresent: boolean | null; parentDeadlinePresent: boolean | null;
-      parentDeadlineLive: boolean | null; eligibleSessionCount: string; targetRank: string | null }>(
+      parentDeadlineLive: boolean | null; parentStatus: string | null; waitDeadlineExpired: boolean | null;
+      eligibleSessionCount: string; targetRank: string | null }>(
       `WITH horizon AS MATERIALIZED (SELECT clock_timestamp() AS "at"), eligible AS (
         SELECT session."id", ROW_NUMBER() OVER (ORDER BY session."updatedAt" ASC, session."id" ASC)::text AS "rank"
         FROM "agent_sessions" AS session CROSS JOIN horizon
@@ -1326,9 +1374,12 @@ async function diagnoseZeroWaitWake(pool: Pool, ids: FixtureIds, report: WaitRes
         (SELECT COUNT(*)::text FROM "agent_wait_conditions" WHERE "sessionId" = $1 AND "turnId" = $2 AND "parentTaskId" = $3 AND "status" = 'timed_out') AS "waitTimedOut",
         (SELECT BOOL_OR("suspendedAt" IS NOT NULL) FROM "agent_wait_conditions" WHERE "sessionId" = $1 AND "turnId" = $2 AND "parentTaskId" = $3) AS "waitSuspended",
         (SELECT BOOL_OR("consumedAt" IS NOT NULL) FROM "agent_wait_conditions" WHERE "sessionId" = $1 AND "turnId" = $2 AND "parentTaskId" = $3) AS "waitConsumed",
+        (SELECT BOOL_OR(wait."deadlineAt" <= horizon."at") FROM "agent_wait_conditions" AS wait
+          WHERE wait."sessionId" = $1 AND wait."turnId" = $2 AND wait."parentTaskId" = $3) AS "waitDeadlineExpired",
         (SELECT COUNT(*)::text FROM "sub_agent_tasks" WHERE "id" = $3 AND "sessionId" = $1 AND "turnId" = $2) AS "parentRows",
         (SELECT COUNT(*)::text FROM "sub_agent_tasks" WHERE "id" = $3 AND "sessionId" = $1 AND "turnId" = $2 AND "status" = 'waiting') AS "parentWaiting",
         (SELECT COUNT(*)::text FROM "sub_agent_tasks" WHERE "id" = $3 AND "sessionId" = $1 AND "turnId" = $2 AND "status" = 'running') AS "parentRunning",
+        (SELECT "status" FROM "sub_agent_tasks" WHERE "id" = $3 AND "sessionId" = $1 AND "turnId" = $2) AS "parentStatus",
         (SELECT BOOL_OR("leaseOwner" IS NOT NULL) FROM "sub_agent_tasks" WHERE "id" = $3 AND "sessionId" = $1 AND "turnId" = $2) AS "parentLeaseOwnerPresent",
         (SELECT BOOL_OR("leaseExpiresAt" IS NOT NULL) FROM "sub_agent_tasks" WHERE "id" = $3 AND "sessionId" = $1 AND "turnId" = $2) AS "parentLeaseExpiryPresent",
         (SELECT BOOL_OR("absoluteDeadlineAt" IS NOT NULL) FROM "sub_agent_tasks" WHERE "id" = $3 AND "sessionId" = $1 AND "turnId" = $2) AS "parentDeadlinePresent",
@@ -1351,10 +1402,12 @@ async function diagnoseZeroWaitWake(pool: Pool, ids: FixtureIds, report: WaitRes
       wait: { rows: waitRows, waiting: waitWaiting, ready: waitReady, timedOut: waitTimedOut,
         otherStatus: waitRows === null || waitWaiting === null || waitReady === null || waitTimedOut === null
           ? null : Math.max(0, waitRows - waitWaiting - waitReady - waitTimedOut),
-        suspended: state.waitSuspended === true, consumed: state.waitConsumed === true },
+        suspended: state.waitSuspended === true, consumed: state.waitConsumed === true,
+        deadlineExpired: state.waitDeadlineExpired },
       parent: { rows: parentRows, waiting: parentWaiting, running: parentRunning,
         otherStatus: parentRows === null || parentWaiting === null || parentRunning === null
           ? null : Math.max(0, parentRows - parentWaiting - parentRunning),
+        status: diagnosticTaskStatus(state.parentStatus),
         leaseOwnerPresent: state.parentLeaseOwnerPresent === true, leaseExpiryPresent: state.parentLeaseExpiryPresent === true,
         deadlinePresent: state.parentDeadlinePresent === true, deadlineLive: state.parentDeadlineLive === true },
       eligibleSessions: { count: boundedCount(state.eligibleSessionCount), targetRank,
@@ -2878,6 +2931,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       await waitForMarker(workerA, "WORKER_A_READY")
       await expect(dispatchPendingSubagentOutbox(pool as never, queue, 50, ids.sessionId)).resolves.toBe(1)
       await waitForMarker(workerA, "WORKER_A_WAITING")
+      expect(workerResultStatus(workerA, "WORKER_A_WAITING")).toBe("waiting")
       await expectCompletedSourceWaitLifecycle(pool, ids)
       const sourceExit = await workerA.exited
       expect(sourceExit.code).toBe(0)
@@ -3016,6 +3070,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       await waitForMarker(workerA, "WORKER_A_READY")
       await expect(dispatchPendingSubagentOutbox(pool as never, queue, 50, ids.sessionId)).resolves.toBe(1)
       await waitForMarker(workerA, "WORKER_A_WAITING")
+      expect(workerResultStatus(workerA, "WORKER_A_WAITING")).toBe("waiting")
       await expectCompletedSourceWaitLifecycle(pool, ids)
       const sourceExit = await workerA.exited
       expect(sourceExit.code).toBe(0)

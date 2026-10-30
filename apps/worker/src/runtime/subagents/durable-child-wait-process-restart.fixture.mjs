@@ -28,6 +28,7 @@ import { readRecoveryStateSnapshot } from "./durable-child-wait-recovery-diagnos
 const [, , mode, queueName, rawIds] = process.argv
 const ids = JSON.parse(rawIds)
 const phoneShapedToolCallId = "child-wait-call:415-555-0134"
+const workerResultStatuses = new Set(["completed", "failed", "interrupted", "lease_lost", "retrying", "skipped", "waiting", "waiting_for_user"])
 const highPrecisionWaitModelCostUsd = 0.123456789
 const loopFixtureModelProfile = Object.freeze({ provider: "fixture", model: "durable-child-wait-fixture", nativeTools: true,
   structuredOutput: true, streaming: true, continuationCursor: false, supportsParallelTools: true, supportsStreamingToolArgs: true,
@@ -978,7 +979,10 @@ worker.on("completed", (job, result) => {
     return
   }
   const marker = mode === "worker-a" ? "WORKER_A_WAITING" : "WORKER_B_RESUMED"
-  say(`${marker} ${JSON.stringify({ result, taskId: ids.waiterTaskId, dispatchGeneration })}`)
+  const markerPayload = mode === "worker-a"
+    ? { result: { status: workerResultStatuses.has(result?.status) ? result.status : "invalid" } }
+    : { result, taskId: ids.waiterTaskId, dispatchGeneration }
+  say(`${marker} ${JSON.stringify(markerPayload)}`)
   void stop(0)
 })
 worker.on("failed", (job, error) => {

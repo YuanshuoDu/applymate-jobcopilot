@@ -176,7 +176,7 @@ const sourceOwner = { kind: "task" as const, userId: "user-1", sessionId: "sessi
 const sourceStep = { id: "source-step", attempt: 1 }
 const sourceCallId = "provider-wait-call", sourceCallItemId = "source-call-item", sourceWaitId = "source-wait"
 const sourceTargetIds = ["target-child"]
-const sourceDeadline = new Date("2026-10-30T12:00:30.000Z")
+const sourceDeadline = new Date("2026-10-30T12:00:30.731Z")
 const sourceWait = {
   id: sourceWaitId, userId: sourceOwner.userId, sessionId: sourceOwner.sessionId, turnId: sourceOwner.turnId, parentTaskId: sourceOwner.taskId,
   stepId: sourceStep.id, targetTaskIds: sourceTargetIds, idempotencyKey: "opaque-wait-key", mode: "all", status: "ready",
@@ -206,10 +206,28 @@ const sourceToolStart = { id: "source-tool-start", itemId: sourceCallItemId, typ
   causationId: sourceItemStart.id, sequence: "11", idempotencyKey: `task:${sourceOwner.taskId}:event:tool-started:${sourceCallId}`,
   payload: { toolCallId: sourceCallId, toolName: "wait_subagents", taskId: sourceOwner.taskId } }
 
-function historicalFixture(options: { marker?: boolean; existingCompletion?: boolean } = {}) {
+function historicalFixture(options: { marker?: boolean; existingCompletion?: boolean; status?: "ready" | "timed_out";
+  checkedAt?: Date | string | null; outcomeDeadlineAt?: string; deadlineAt?: Date | string | null; deadlineAsIso?: boolean } = {}) {
   const calls: Array<{ sql: string; values?: unknown[] }> = [], events = new Map<string, Record<string, unknown>>(), outboxes = new Map<string, Record<string, unknown>>()
   const wait = structuredClone(sourceWait) as Record<string, unknown>
-  if (options.marker) wait.result = { ...sourceWait.result, sourceLifecycleRecovery: { schemaVersion: "child-wait-source-lifecycle.v1",
+  const savedResult = wait.result as Record<string, unknown>, outcome = savedResult.outcome as Record<string, unknown>
+  if (options.status === "timed_out") {
+    wait.status = "timed_out"
+    wait.matchedTaskIds = []
+    outcome.status = "timed_out"
+    outcome.matchedTaskIds = []
+    outcome.tasks = [{ ...(outcome.tasks as Array<Record<string, unknown>>)[0], status: "running" }]
+  }
+  if (options.outcomeDeadlineAt) outcome.deadlineAt = options.outcomeDeadlineAt
+  if (Object.hasOwn(options, "deadlineAt")) wait.deadlineAt = options.deadlineAt
+  if (options.deadlineAsIso) wait.deadlineAt = sourceDeadline.toISOString()
+  const items = structuredClone(sourceItems) as Array<Record<string, unknown>>
+  if (options.status === "timed_out") {
+    const safe = safeSubagentWaitJson({ toolCallId: sourceCallId, output: waitResult(wait), errorCode: null }, 16_384) as Record<string, unknown>
+    safe.toolCallId = sourceCallId
+    items[1]!.content = { toolCallId: sourceCallId, output: safe.output, errorCode: null }
+  }
+  if (options.marker) wait.result = { ...savedResult, sourceLifecycleRecovery: { schemaVersion: "child-wait-source-lifecycle.v1",
     userId: sourceOwner.userId, sessionId: sourceOwner.sessionId, turnId: sourceOwner.turnId, rootTaskId: sourceOwner.rootTaskId,
     taskId: sourceOwner.taskId, ownerId: "owner-previous", attempt: sourceStep.attempt, stepId: sourceStep.id, waitId: sourceWaitId,
     toolCallId: sourceCallId, callItemId: sourceCallItemId, resultItemId: sourceResultItemId } }
@@ -217,7 +235,7 @@ function historicalFixture(options: { marker?: boolean; existingCompletion?: boo
   events.set(sourceToolStart.idempotencyKey, { ...sourceToolStart })
   events.set("source-prior-key", { id: "source-prior", sessionId: sourceOwner.sessionId, turnId: sourceOwner.turnId, taskId: sourceOwner.taskId,
     itemId: null, type: "model.usage", actor: "subagent", correlationId: sourceStep.id, causationId: null, sequence: "9", idempotencyKey: "source-prior-key", payload: {} })
-  const expected = sourceCompletionInputs()
+  const expected = sourceCompletionInputs(items[1]!.content as RepositoryJsonValue)
   if (options.existingCompletion) {
     let cause = sourceToolStart.id
     expected.forEach((input, index) => {
@@ -235,13 +253,13 @@ function historicalFixture(options: { marker?: boolean; existingCompletion?: boo
     if (sql.includes('SELECT turn."id"')) return values?.[5] === sourceOwner.ownerId && values?.[6] === sourceOwner.attemptCount
       ? { rows: [{ id: sourceOwner.turnId }], rowCount: 1 } : { rows: [], rowCount: 0 }
     if (sql.includes('FROM "agent_wait_conditions"')) return values?.[0] === sourceWaitId && values?.[5] === sourceStep.id && wait.consumedAt
-      ? { rows: [{ ...wait }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      ? { rows: [{ ...wait, checkedAt: options.checkedAt === undefined ? new Date(sourceDeadline.getTime() + 1_000) : options.checkedAt }], rowCount: 1 } : { rows: [], rowCount: 0 }
     if (sql.includes('FROM "agent_steps"')) return values?.[0] === sourceStep.id && values?.[4] === sourceStep.attempt
       ? { rows: [{ id: sourceStep.id }], rowCount: 1 } : { rows: [], rowCount: 0 }
     if (sql.includes('FROM "agent_items"') && sql.includes('"content"->>\'toolName\'')) return values?.[3] === sourceStep.id
       ? { rows: [{ id: sourceCallItemId }], rowCount: 1 } : { rows: [], rowCount: 0 }
     if (sql.includes('FROM "agent_items" AS item') && sql.includes('JOIN "agent_steps"')) return values?.[5] === sourceStep.id && values?.[6] === sourceStep.attempt
-      ? { rows: sourceItems.map(item => ({ ...item })), rowCount: 2 } : { rows: [], rowCount: 0 }
+      ? { rows: items.map(item => ({ ...item })), rowCount: 2 } : { rows: [], rowCount: 0 }
     if (sql.includes('SELECT item."id" FROM "agent_items" AS item') && sql.includes('owner_step')) return { rows: [], rowCount: 0 }
     if (sql.includes('FROM "agent_items"') && sql.includes('WHERE "id" = $1')) return sourceItems.some(item => item.id === values?.[0]
       && item.taskId === values?.[3]) ? { rows: [{ id: values?.[0] }], rowCount: 1 } : { rows: [], rowCount: 0 }
@@ -277,9 +295,8 @@ function historicalFixture(options: { marker?: boolean; existingCompletion?: boo
     sourceAttempt: sourceStep.attempt, callItemId: sourceCallItemId, resultItemId: sourceResultItemId, toolCallId: sourceCallId, events: expected } }
 }
 
-function sourceCompletionInputs(): TurnEngineEventInput[] {
+function sourceCompletionInputs(resultContent: RepositoryJsonValue = sourceItems[1]!.content as RepositoryJsonValue): TurnEngineEventInput[] {
   const ownerFence = sourceOwner, callEventContent = projectWaitCallEventContent(sourceCallContent)
-  const resultContent = sourceItems[1]!.content as unknown as RepositoryJsonValue
   return [
     { owner: ownerFence, id: "new-call-complete", itemId: sourceCallItemId, type: "item.completed", correlationId: sourceCallItemId,
       causationId: sourceToolStart.id, idempotencyKey: `task:${sourceOwner.taskId}:event:tool-call-completed:${sourceCallId}:${sourceCallItemId}:1`,
@@ -302,6 +319,7 @@ describe("historical consumed child-wait event batches", () => {
     expect(fake.events.size).toBe(7)
     expect(fake.outboxes.size).toBe(4)
     expect(fake.calls.some(call => call.sql.includes('owner_step."attempt" = $5'))).toBe(false)
+    expect(fake.calls.find(call => call.sql.includes('FROM "agent_wait_conditions"'))?.sql).toContain('clock_timestamp() AS "checkedAt"')
 
     const firstCompletion = fake.proof.events[0]!.idempotencyKey
     const savedEvent = fake.events.get(firstCompletion)
@@ -309,6 +327,49 @@ describe("historical consumed child-wait event batches", () => {
     await expect(appendChildWaitSourceLifecycleEventBatch(fake.pool, fake.proof, fake.client as never)).resolves.toHaveLength(4)
     expect(fake.outboxes.has(`agent-event:${String(savedEvent?.id)}`)).toBe(true)
     expect(fake.calls.filter(call => call.sql.includes('INSERT INTO "agent_events"'))).toHaveLength(4)
+  })
+
+  it("accepts an ISO deadline returned by the database driver without losing milliseconds", async () => {
+    const fake = historicalFixture({ deadlineAsIso: true })
+    await expect(appendChildWaitSourceLifecycleEventBatch(fake.pool, fake.proof, fake.client as never)).resolves.toHaveLength(4)
+  })
+
+  it("rejects a one-millisecond outcome deadline mismatch before event or outbox writes", async () => {
+    const fake = historicalFixture({ outcomeDeadlineAt: new Date(sourceDeadline.getTime() + 1).toISOString() })
+    await expect(appendChildWaitSourceLifecycleEventBatch(fake.pool, fake.proof, fake.client as never)).rejects.toThrow("historical child wait receipt")
+    expect(fake.calls.some(call => call.sql.includes('INSERT INTO "agent_events"') || call.sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
+  })
+
+  it.each(["2026-02-30T12:00:30.731Z", "not-an-iso-timestamp"])("rejects an invalid outcome deadline (%s)", async outcomeDeadlineAt => {
+    const fake = historicalFixture({ outcomeDeadlineAt })
+    await expect(appendChildWaitSourceLifecycleEventBatch(fake.pool, fake.proof, fake.client as never)).rejects.toThrow("historical child wait receipt")
+    expect(fake.calls.some(call => call.sql.includes('INSERT INTO "agent_events"') || call.sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
+  })
+
+  it("rejects an invalid database deadline before event or outbox writes", async () => {
+    const fake = historicalFixture({ deadlineAt: "2026-02-30T12:00:30.731Z" })
+    await expect(appendChildWaitSourceLifecycleEventBatch(fake.pool, fake.proof, fake.client as never)).rejects.toThrow("historical child wait receipt")
+    expect(fake.calls.some(call => call.sql.includes('INSERT INTO "agent_events"') || call.sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
+  })
+
+  it.each([
+    ["before", new Date(sourceDeadline.getTime() - 1), false],
+    ["at", new Date(sourceDeadline.getTime()), true],
+    ["after", new Date(sourceDeadline.getTime() + 1), true],
+  ])("uses the locked database clock for timed-out receipts %s the deadline", async (_label, checkedAt, accepted) => {
+    const fake = historicalFixture({ status: "timed_out", checkedAt })
+    const append = appendChildWaitSourceLifecycleEventBatch(fake.pool, fake.proof, fake.client as never)
+    if (accepted) await expect(append).resolves.toHaveLength(4)
+    else {
+      await expect(append).rejects.toThrow("historical child wait receipt")
+      expect(fake.calls.some(call => call.sql.includes('INSERT INTO "agent_events"') || call.sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
+    }
+  })
+
+  it.each([null, "invalid-clock"])("fails closed when the locked database clock is missing or invalid (%s)", async checkedAt => {
+    const fake = historicalFixture({ checkedAt })
+    await expect(appendChildWaitSourceLifecycleEventBatch(fake.pool, fake.proof, fake.client as never)).rejects.toThrow("historical child wait receipt")
+    expect(fake.calls.some(call => call.sql.includes('INSERT INTO "agent_events"') || call.sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
   })
 
   it("replays an exact lifecycle under a new owner after validating the old marker and current attempt", async () => {

@@ -145,6 +145,16 @@ function ids(value: unknown, minimum = 1): string[] | undefined {
 function sameIds(left: readonly string[], right: readonly string[]): boolean { return [...left].sort().join("\0") === [...right].sort().join("\0") }
 function sameJson(left: unknown, right: unknown): boolean { try { return canonicalJson(left) === canonicalJson(right) } catch { return false } }
 function itemKey(value: unknown): value is string { return typeof value === "string" && value.length > 0 && value.trim() === value }
+function dateMillis(value: unknown): number | undefined {
+  if (value instanceof Date) return Number.isFinite(value.getTime()) ? value.getTime() : undefined
+  if (typeof value !== "string") return undefined
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,3})?(Z|[+-](\d{2}):(\d{2}))$/i.exec(value)
+  if (!match) return undefined
+  const year = Number(match[1]), month = Number(match[2]), day = Number(match[3]), hour = Number(match[4]), minute = Number(match[5]), second = Number(match[6])
+  const daysInMonth = month === 2 ? year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28 : [4, 6, 9, 11].includes(month) ? 30 : 31
+  if (month < 1 || month > 12 || day < 1 || day > daysInMonth || hour > 23 || minute > 59 || second > 59 || Number(match[8] ?? 0) > 23 || Number(match[9] ?? 0) > 59) return undefined
+  const parsed = Date.parse(value); return Number.isFinite(parsed) ? parsed : undefined
+}
 function expectedResult(callId: string, output: unknown): RepositoryJsonValue {
   const safe = record(safeSubagentWaitJson({ toolCallId: callId, output, errorCode: null }, 16_384))
   safe.toolCallId = callId
@@ -163,13 +173,12 @@ function sourceResultId(taskId: string, waitId: string, callId: string): string 
 const TERMINAL_WAIT_TASK = new Set(["completed", "failed", "interrupted", "cancelled", "closed", "passed", "skipped"])
 const VALID_WAIT_TASK = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", ...TERMINAL_WAIT_TASK])
 
-async function assertHistoricalChildWaitEvents(client: QueryClient, ownerFence: ExecutionOwnerFence, proof: ChildWaitSourceLifecycleEventBatch,
-  inputs: readonly TurnEngineEventInput[]): Promise<ReadonlySet<string>> {
+async function assertHistoricalChildWaitEvents(client: QueryClient, ownerFence: ExecutionOwnerFence, proof: ChildWaitSourceLifecycleEventBatch, inputs: readonly TurnEngineEventInput[]): Promise<ReadonlySet<string>> {
   const { owner, waitId, sourceStepId, sourceAttempt, callItemId, resultItemId, toolCallId } = proof
   if (ownerFence.kind !== "task" || !sameOwner(owner, ownerFence) || !Number.isSafeInteger(sourceAttempt)
     || sourceAttempt < 1 || sourceAttempt >= owner.attemptCount || ![waitId, sourceStepId, callItemId, resultItemId, toolCallId].every(itemKey)
     || resultItemId !== sourceResultId(owner.taskId, waitId, toolCallId) || inputs.length !== 4) throw conflict("historical child wait event scope")
-  const wait = (await client.query<Row>(`SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "targetTaskIds", "idempotencyKey", "mode", "status", "deadlineAt", "matchedTaskIds", "suspendedAt", "consumedAt", "result"
+  const wait = (await client.query<Row>(`SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "targetTaskIds", "idempotencyKey", "mode", "status", "deadlineAt", clock_timestamp() AS "checkedAt", "matchedTaskIds", "suspendedAt", "consumedAt", "result"
     FROM "agent_wait_conditions" WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "turnId" = $4 AND "parentTaskId" = $5
       AND "stepId" = $6 AND "status" IN ('ready', 'timed_out') AND "suspendedAt" IS NOT NULL AND "consumedAt" IS NOT NULL FOR SHARE`,
   [waitId, owner.userId, owner.sessionId, owner.turnId, owner.taskId, sourceStepId])).rows[0]
@@ -185,7 +194,9 @@ async function assertHistoricalChildWaitEvents(client: QueryClient, ownerFence: 
   const matched = ids(wait.matchedTaskIds, 0), savedMatched = ids(outcome.matchedTaskIds, 0)
   const outcomeTasks = Array.isArray(outcome.tasks) ? outcome.tasks.map(record) : []
   const terminal = outcomeTasks.filter(task => TERMINAL_WAIT_TASK.has(String(task.status))).map(task => String(task.taskId))
-  if (!targetIds || !exactKeys(request, ["targetTaskIds", "mode", "timeoutMs"]) || !sameIds(ids(request.targetTaskIds) ?? [], targetIds)
+  const deadlineAt = dateMillis(wait.deadlineAt), outcomeDeadlineAt = dateMillis(outcome.deadlineAt), checkedAt = dateMillis(wait.checkedAt)
+  if (deadlineAt === undefined || outcomeDeadlineAt === undefined || checkedAt === undefined
+    || outcomeDeadlineAt !== deadlineAt || !targetIds || !exactKeys(request, ["targetTaskIds", "mode", "timeoutMs"]) || !sameIds(ids(request.targetTaskIds) ?? [], targetIds)
     || !exactKeys(saved, savedKeys) || !matched || matched.some(id => !targetIds.includes(id)) || !savedMatched || !sameIds(savedMatched, matched)
     || !(request.mode === "any" || request.mode === "all") || request.mode !== wait.mode || !Number.isSafeInteger(request.timeoutMs) || Number(request.timeoutMs) < 1 || Number(request.timeoutMs) > 30_000
     || !exactKeys(outcome, ["waitId", "status", "taskIds", "deadlineAt", "matchedTaskIds", "tasks"]) || outcome.waitId !== waitId
@@ -193,12 +204,10 @@ async function assertHistoricalChildWaitEvents(client: QueryClient, ownerFence: 
     || outcomeTasks.length !== targetIds.length || outcomeTasks.some(task => typeof task.taskId !== "string")
     || !sameIds(outcomeTasks.map(task => String(task.taskId)), targetIds) || !sameIds(terminal, matched)
     || outcome.status === "ready" && (request.mode === "any" ? matched.length === 0 : matched.length !== targetIds.length)
-    || outcome.status === "timed_out" && Date.now() < new Date(String(wait.deadlineAt)).getTime()
+    || outcome.status === "timed_out" && checkedAt < deadlineAt
     || !outcomeTasks.every(row => exactKeys(row, ["taskId", "status", "role", "result", "failureReason"])
       && typeof row.status === "string" && VALID_WAIT_TASK.has(row.status) && typeof row.role === "string" && !!row.role.trim()
-      && (row.failureReason === null || typeof row.failureReason === "string"))
-    || Number.isNaN(new Date(String(outcome.deadlineAt)).getTime()) || Number.isNaN(new Date(String(wait.deadlineAt)).getTime())
-    || new Date(String(outcome.deadlineAt)).getTime() !== new Date(String(wait.deadlineAt)).getTime()) throw conflict("historical child wait receipt")
+      && (row.failureReason === null || typeof row.failureReason === "string"))) throw conflict("historical child wait receipt")
   const marker = record(saved.sourceLifecycleRecovery)
   if (Object.hasOwn(saved, "sourceLifecycleRecovery") && (!exactKeys(marker, ["schemaVersion", "userId", "sessionId", "turnId", "rootTaskId", "taskId", "ownerId", "attempt", "stepId", "waitId", "toolCallId", "callItemId", "resultItemId"])
     || marker.schemaVersion !== "child-wait-source-lifecycle.v1" || marker.userId !== owner.userId || marker.sessionId !== owner.sessionId
