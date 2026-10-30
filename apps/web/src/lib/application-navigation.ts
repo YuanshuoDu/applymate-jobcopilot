@@ -33,6 +33,18 @@ export async function openApplication(jobId: string, navigate: Navigate): Promis
   return true
 }
 
+/** Open the bounded recent-task view without carrying a stale selected job. */
+export async function openApplicationAttention(navigate: Navigate): Promise<boolean> {
+  if ((await navigate('jobs')) === false) return false
+  const url = new URL(window.location.href)
+  clearResumeContext(url)
+  url.searchParams.delete('highlight')
+  url.searchParams.set('jobsAttention', '1')
+  window.history.replaceState(window.history.state, '', url.toString())
+  notifyApplicationNavigation()
+  return true
+}
+
 /** Attach the existing Agent page to a real session; never create a new run. */
 export async function openApplicationSession(sessionId: string, navigate: Navigate): Promise<boolean> {
   if (!sessionId.trim()) return false

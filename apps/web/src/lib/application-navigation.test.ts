@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { applicationUrl, isApplicationNavigationEvent, openApplication, openApplicationSession, openApplicationWhenSaved } from './application-navigation'
+import { applicationUrl, isApplicationNavigationEvent, openApplication, openApplicationAttention, openApplicationSession, openApplicationWhenSaved } from './application-navigation'
 
 let href: string
 const replaceState = vi.fn((_state: unknown, _title: string, next: string) => { href = next })
@@ -80,6 +80,35 @@ describe('application navigation', () => {
     expect(entries[0]).toBe(original)
     expect(new URL(entries[1]).searchParams.get('page')).toBe('jobs')
     expect(new URL(entries[1]).searchParams.get('highlight')).toBe('job-42')
+  })
+
+  it('opens recent attention without stale selection while retaining list context', async () => {
+    const url = new URL(href)
+    url.searchParams.set('highlight', 'old-job')
+    href = url.toString()
+    expect(await openApplicationAttention(navigate)).toBe(true)
+    const next = new URL(href)
+    expect(next.searchParams.get('jobsAttention')).toBe('1')
+    expect(next.searchParams.has('highlight')).toBe(false)
+    expect(next.searchParams.get('jobsPage')).toBe('3')
+    expect(next.searchParams.get('jobsStatus')).toBe('saved')
+    expect(next.searchParams.get('jobsQuery')).toBe('backend')
+    expect(next.hash).toBe('#details')
+    expect(next.searchParams.has('resumeId')).toBe(false)
+    expect(navigate).toHaveBeenCalledExactlyOnceWith('jobs')
+    expect(isApplicationNavigationEvent(dispatchEvent.mock.calls[0][0])).toBe(true)
+  })
+
+  it('does not modify the URL for a pending or rejected attention navigation', async () => {
+    const original = href
+    let finish!: (allowed: boolean) => void
+    const result = openApplicationAttention(() => new Promise<boolean>(resolve => { finish = resolve }))
+    expect(replaceState).not.toHaveBeenCalled()
+    finish(false)
+    expect(await result).toBe(false)
+    expect(href).toBe(original)
+    expect(replaceState).not.toHaveBeenCalled()
+    expect(dispatchEvent).not.toHaveBeenCalled()
   })
 
   it('notifies the mounted job list when opening another job on the same page', async () => {

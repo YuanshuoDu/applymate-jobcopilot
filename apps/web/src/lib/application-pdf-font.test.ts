@@ -20,7 +20,7 @@ async function pdfText(doc: React.ReactElement): Promise<string> {
   const bytes = await renderToBuffer(doc as never)
   const parser = createRequire(resolve('package.json')).resolve('pdf-parse')
   const script = `const fs=require('node:fs');const parse=require(process.argv[1]);const raw=fs.readFileSync(0);const exact=Uint8Array.from(raw);parse(exact,{version:'v2.0.550'}).then(result=>process.stdout.write(result.text)).catch(error=>{console.error(error);process.exitCode=1})`
-  return execFileSync(process.execPath, ['-e', script, parser], { input: bytes, encoding: 'utf8' })
+  return execFileSync(process.execPath, ['-e', script, parser], { input: bytes, encoding: 'utf8', timeout: 30_000 })
 }
 
 const multilingual = '测试姓名 多语言经历 — Résumé Łódź Česko Ελληνικά Україна'

@@ -118,7 +118,20 @@ function audit(resumeUpdatedAt = time) {
     audit: { verdict: 'pass', summary: 'Fixture materials checked.', findings: [], matchScore: 82, source: 'independent', auditedAt: time } }
 }
 
-async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unknown' | 'waiting_for_user' | 'waiting_for_authorization' | 'cancelled' | 'failed' | 'filling'; recordedInitially?: boolean; evidenceCase?: 'bound' | 'unbound' | 'unavailable'; taskFailure?: boolean; missing?: boolean; holdSelectedLetter?: boolean; selectedLetter?: boolean; firstPreparation?: boolean; failFirstAudit?: boolean; flowSave?: boolean; manualOutcome?: 'get-fails' | 'unknown'; search?: boolean; saveMode?: 'fail' | 'hold-success' | 'hold-fail'; twoResumes?: boolean; holdResumeContent?: boolean; snapshotResumeContent?: boolean; resumeRevalidationFails?: boolean; versionedScore?: boolean; holdOldAnalysis?: boolean; holdFirstAnalysisOnly?: boolean; auditCorrection?: boolean; holdAuditCorrection?: boolean; versions?: boolean; holdVersionRestore?: boolean; versionRestoreFails?: boolean; realAgent?: boolean; agentJourney?: boolean } = {}) {
+async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unknown' | 'waiting_for_user' | 'waiting_for_authorization' | 'cancelled' | 'failed' | 'filling'; recordedInitially?: boolean; evidenceCase?: 'bound' | 'unbound' | 'unavailable'; taskFailure?: boolean; missing?: boolean; holdSelectedLetter?: boolean; selectedLetter?: boolean; firstPreparation?: boolean; failFirstAudit?: boolean; flowSave?: boolean; manualOutcome?: 'get-fails' | 'unknown'; search?: boolean; saveMode?: 'fail' | 'hold-success' | 'hold-fail'; twoResumes?: boolean; holdResumeContent?: boolean; snapshotResumeContent?: boolean; resumeRevalidationFails?: boolean; versionedScore?: boolean; holdOldAnalysis?: boolean; holdFirstAnalysisOnly?: boolean; auditCorrection?: boolean; holdAuditCorrection?: boolean; versions?: boolean; holdVersionRestore?: boolean; versionRestoreFails?: boolean; realAgent?: boolean; expiredApproval?: boolean; holdFirstTaskRead?: boolean; holdReturnOwnerA?: boolean; taskPerUser?: boolean; dashboardFourTasks?: boolean; agentJourney?: boolean } = {}) {
+  let releaseReturnOwnerA = () => {}
+  const returnOwnerAGate = new Promise<void>(resolve => { releaseReturnOwnerA = resolve })
+  let releaseStaleJob = () => {}
+  const staleJobGate = new Promise<void>(resolve => { releaseStaleJob = resolve })
+  let releaseFirstTaskRead = () => {}
+  const firstTaskReadGate = new Promise<void>(resolve => { releaseFirstTaskRead = resolve })
+  if (options.holdFirstTaskRead) await page.addInitScript(() => {
+    const original = window.fetch.bind(window)
+    window.fetch = (input, init) => {
+      if (typeof input === 'string' && input.startsWith('/api/agent/application-tasks')) return original(input, { ...init, signal: undefined })
+      return original(input, init)
+    }
+  })
   let releaseVersionRestore = () => {}
   const versionRestoreGate = new Promise<void>(resolve => { releaseVersionRestore = resolve })
   let releaseAuditCorrection = () => {}
@@ -133,7 +146,7 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
   const lettersGate = new Promise<void>(resolve => { releaseLetters = resolve })
   const state = { job: { ...job(), finalCoverLetterId: options.holdSelectedLetter || options.selectedLetter ? 'selected-letter' : null, finalResumeId: options.firstPreparation ? null : 'resume-1' }, resume: resume(), audit: options.auditCorrection ? { ...audit(), audit: { ...audit().audit, verdict: 'revise', findings: [{ area: 'resume', target: 'summary', severity: 'warning', title: 'Fix summary', evidence: 'Outdated wording', action: 'Apply correction', proposedValue: 'Audited v2 summary' }] } } : audit(options.stale ? '2026-10-29T10:00:00.000Z' : time),
     secondResume: { ...resume(), id: 'resume-2', name: 'Second fixture resume', targetJobId: null as string | null, content: { ...resume().content, summary: 'Second resume content.' } },
-    manualPosted: false, manualReadAvailable: false, hideResumeOnExport: false, fontRequests: [] as string[], activeUserId: 'fixture-user', agentStage: 'question' as 'question' | 'approval' | 'running' | 'unknown', requestOwners: [] as Array<{ path: string; method: string; userId: string }>, agentRequests: [] as Array<{ path: string; method: string; body?: unknown }>, writes: [] as Array<{ path: string; body: unknown }>, analysisRequests: [] as string[], analysisBodies: [] as unknown[], analysisCalls: [] as Array<{ path: string; body: unknown }>, unexpected: [] as string[], taskReads: 0, letterRequested: false, resumeContentRequested: false, releaseLetters, releaseSave, releaseResumeContent, releaseOldAnalysis, releaseAuditCorrection, releaseVersionRestore }
+    saveResponses: 0, armReturnOwnerA: false, returnOwnerAEntered: false, releaseReturnOwnerA, manualPosted: false, manualReadAvailable: false, hideResumeOnExport: false, fontRequests: [] as string[], activeUserId: 'fixture-user', agentStage: 'question' as 'question' | 'approval' | 'running' | 'unknown', requestOwners: [] as Array<{ path: string; method: string; userId: string }>, agentRequests: [] as Array<{ path: string; method: string; body?: unknown }>, writes: [] as Array<{ path: string; body: unknown }>, analysisRequests: [] as string[], analysisBodies: [] as unknown[], analysisCalls: [] as Array<{ path: string; body: unknown }>, unexpected: [] as string[], taskReads: 0, staleJobRequested: false, staleJobReturned: false, releaseStaleJob, taskStatusOverride: null as 'waiting_for_authorization' | null, firstTaskReadFinished: false, releaseFirstTaskRead, letterRequested: false, resumeContentRequested: false, releaseLetters, releaseSave, releaseResumeContent, releaseOldAnalysis, releaseAuditCorrection, releaseVersionRestore }
   if (options.evidenceCase === 'unbound') state.job.finalResumeId = null
   if (options.evidenceCase === 'unavailable') state.hideResumeOnExport = true
   if (options.recordedInitially) state.job = { ...state.job, status: 'applied', workflowState: 'submitted' }
@@ -183,7 +196,11 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
         return json(route, { turns: [turn], projection: { activeTurnId: turn.id, activeTurn: { id: turn.id, status: turn.status, revision: 1 }, queuedInputCount: 0 } })
       }
       if (pathname === `${prefix}/tasks`) return json(route, { tasks: [] })
-      if (pathname === `${prefix}/timeline`) return json(route, { items: [], approvalEvents: [{ schemaVersion: 'agent-harness.v2', id: 'fixture-approval-event', sessionId: 'original-session', turnId: 'fixture-turn', itemId: null, taskId: null, type: 'approval.requested', actor: 'orchestrator', sequence: '1', payload: { approvalId: 'fixture-approval', action: 'submit_application', scopeHash: `sha256:${'a'.repeat(64)}`, revision: 1 } }] })
+      if (pathname === `${prefix}/timeline`) {
+        const requested = { schemaVersion: 'agent-harness.v2', id: 'fixture-approval-event', sessionId: 'original-session', turnId: 'fixture-turn', itemId: null, taskId: null, type: 'approval.requested', actor: 'orchestrator', sequence: '1', payload: { approvalId: 'fixture-approval', action: 'submit_application', scopeHash: `sha256:${'a'.repeat(64)}`, revision: 1 } }
+        const expired = { ...requested, id: 'fixture-approval-expired', type: 'approval.expired', actor: 'system', sequence: '2' }
+        return json(route, { items: [], approvalEvents: options.expiredApproval ? [requested, expired] : [requested] })
+      }
       if (pathname === `${prefix}/events`) return route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': fixture waiting\n\n' })
       if (pathname === `${prefix}/approvals/fixture-approval` && method === 'POST') return json(route, { disposition: 'resolved' }, 202)
       if (pathname === prefix && (method === 'GET' || method === 'PATCH')) return json(route, { session: { id: 'original-session', goal: 'Fixture application task', status: 'waiting_for_approval', updatedAt: time, tasks: [], approvals: [], applicationTasks: [], questions: [], artifacts: [], qualityScore: 100 } })
@@ -208,7 +225,9 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
       if (pathname === '/api/resume/resume-1' && request.method() === 'PATCH' && options.flowSave) { state.resume = { ...state.resume, ...(body as object), updatedAt: '2026-10-30T12:00:00.000Z' }; return json(route, state.resume) }
       if (pathname === '/api/resume/resume-1' && request.method() === 'PATCH' && options.saveMode) {
         if (options.saveMode === 'hold-success' || options.saveMode === 'hold-fail') { await saveGate; if (options.saveMode === 'hold-success') return json(route, { ...state.resume, ...(body as object) }) }
-        return json(route, { error: 'Fixture save failed' }, 500)
+        await json(route, { error: 'Fixture save failed' }, 500)
+        state.saveResponses++
+        return
       }
       if (pathname === '/api/resume/resume-2' && request.method() === 'PATCH' && options.saveMode === 'hold-success') { await saveGate; return json(route, { ...state.secondResume, ...(body as object) }) }
       if (options.versions && pathname === '/api/resume/resume-1/versions' && request.method() === 'POST') {
@@ -232,11 +251,22 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
     if (pathname === '/api/agent/application-tasks') {
       state.taskReads++
       if (options.taskFailure) return json(route, { error: 'Fixture unavailable' }, 500)
-      const currentTaskStatus = options.agentJourney ? ({ question: 'waiting_for_user', approval: 'waiting_for_authorization', running: 'filling', unknown: 'unknown' } as const)[state.agentStage] : options.taskStatus
+      if (options.dashboardFourTasks) return json(route, { tasks: [1, 2, 3, 4].map(n => ({ id: `task-${n}`, userId: 'fixture-user', jobId: `job-${n}`, sessionId: `session-${n}`, status: 'waiting_for_user', checkpoint: 'form_answer_required', updatedAt: `2026-10-30T1${4 - n}:00:00.000Z`, job: { company: `Employer ${n}`, role: `Role ${n}` } })) })
+      if (options.taskPerUser && state.activeUserId === 'fixture-b') return json(route, { tasks: [{ id: 'task-b', userId: 'fixture-b', jobId: 'job-b', sessionId: 'session-b', status: 'waiting_for_authorization', checkpoint: 'form_filled', updatedAt: time, job: { company: 'Fixture B', role: 'Engineer B' } }] })
+      if (options.holdReturnOwnerA && state.activeUserId === 'fixture-user' && state.armReturnOwnerA) { state.returnOwnerAEntered = true; await returnOwnerAGate }
+      const currentTaskStatus = options.agentJourney ? ({ question: 'waiting_for_user', approval: 'waiting_for_authorization', running: 'filling', unknown: 'unknown' } as const)[state.agentStage] : state.taskStatusOverride ?? options.taskStatus
+      if (options.holdFirstTaskRead && state.taskReads === 1) {
+        await firstTaskReadGate
+        await json(route, { tasks: [{ id: 'task-1', userId: 'fixture-user', jobId: state.job.id, sessionId: 'original-session', status: currentTaskStatus, checkpoint: 'form_answer_required', updatedAt: time, job: { company: state.job.company, role: state.job.role } }] })
+        state.firstTaskReadFinished = true
+        return
+      }
       return json(route, { tasks: currentTaskStatus ? [{ id: 'task-1', userId: 'fixture-user', jobId: state.job.id, sessionId: 'original-session', status: currentTaskStatus,
         checkpoint: currentTaskStatus === 'unknown' ? 'submission_uncertain' : currentTaskStatus === 'waiting_for_user' ? 'form_answer_required' : currentTaskStatus === 'cancelled' || currentTaskStatus === 'failed' ? 'turn_stopped_before_submit' : null, updatedAt: time, job: { company: state.job.company, role: state.job.role } }] : [] })
     }
+    if (pathname === '/api/dashboard') return json(route, { stats: { total: 0, saved: 0, applied: 0, inProgress: 0, interviews: 0, offers: 0, rejected: 0, thisWeek: 0 }, savedJobs: options.dashboardFourTasks ? [{ id: 'job-4', company: 'Employer 4', role: 'Role 4', score: 60, createdAt: time, url: null }] : [], followUpsDue: options.dashboardFourTasks ? [{ id: 'job-4', company: 'Employer 4', role: 'Role 4', status: 'applied', followUpAt: time }] : [], activity: [], applicationDays: [], interviewsScheduled: [], todayRecommendations: [], agentConfig: null, hasResume: true })
     if (pathname === '/api/jobs') return json(route, { jobs: url.searchParams.has('finalResumeId') || url.searchParams.get('pageSize') === '30' ? [state.job] : [], total: 80, statusCounts: { saved: 80, applied: 0, interview: 0, offer: 0, rejected: 0 } })
+    if (options.dashboardFourTasks && pathname === '/api/jobs/stale-job') { state.staleJobRequested = true; await staleJobGate; await json(route, { ...state.job, id: 'stale-job', company: 'Stale Employer', role: 'Stale Role' }); state.staleJobReturned = true; return }
     if (pathname === `/api/jobs/${state.job.id}` && state.manualPosted && options.manualOutcome === 'get-fails' && !state.manualReadAvailable) return json(route, { error: 'Fixture read unavailable' }, 500)
     if (pathname === `/api/jobs/${state.job.id}` && state.manualPosted && options.manualOutcome === 'get-fails' && state.manualReadAvailable) return json(route, { ...state.job, status: 'saved' })
     if (pathname === `/api/jobs/${state.job.id}`) return options.missing ? json(route, { error: 'Not found' }, 404) : json(route, state.job)
@@ -359,12 +389,162 @@ test('does not show a stale audit as ready and checks the existing resume withou
   expect(state.unexpected).toEqual([])
 })
 
+test('unlinked application explains that the Agent workspace may reopen an older session', async ({ page }) => {
+  const state = await install(page)
+  await open(page, '&sessionId=old-session')
+  const drawer = page.getByRole('dialog')
+  await expect(drawer).toContainText(/No Agent task is linked to this job|此职位没有关联的 Agent 任务/)
+  await expect(drawer).toContainText(/may reopen a recent conversation|工作区可能打开最近的对话/)
+  await expect(drawer).toContainText(/does not create a task or authorize submission|不会创建任务或授权提交/)
+  await drawer.getByRole('button', { name: /Open Agent workspace|打开 Agent 工作区/ }).click()
+  await expect(page).toHaveURL(/page=agent/)
+  await expect(page.getByTestId('agent-destination')).toHaveText('old-session')
+  expect(state.writes).toEqual([])
+  expect(state.agentRequests.filter(item => item.method === 'POST')).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+test('unavailable task status explains uncertainty and offers a read-only refresh', async ({ page }) => {
+  const state = await install(page, { taskFailure: true })
+  await open(page, '&sessionId=old-session')
+  const drawer = page.getByRole('dialog')
+  await expect(drawer).toContainText(/The Agent task status cannot be confirmed|无法确认此职位的 Agent 任务状态/)
+  await expect(drawer).not.toContainText(/No Agent task is linked to this job|此职位没有关联的 Agent 任务/)
+  const readsBefore = state.taskReads
+  await drawer.getByRole('button', { name: /Refresh status|刷新状态/ }).click()
+  await expect.poll(() => state.taskReads).toBeGreaterThan(readsBefore)
+  await expect(drawer).toContainText(/The Agent task status cannot be confirmed|无法确认此职位的 Agent 任务状态/)
+  expect(state.writes).toEqual([])
+  expect(state.agentRequests.filter(item => item.method === 'POST')).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
 test('unavailable task state does not expose a new preparation action', async ({ page }) => {
   const state = await install(page, { taskFailure: true })
   await open(page)
   await expect(page.getByText(/The latest task status is not available yet|暂时无法确认最新任务状态/)).toBeVisible()
   await expect(page.getByRole('button', { name: /Prepare application materials|准备申请材料|Check current materials|检查当前材料/, exact: true })).toHaveCount(0)
   await expect(page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ })).toHaveCount(0)
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+for (const surface of ['jobs', 'dashboard'] as const) {
+  test(`${surface} keeps the newer task status when an older read finishes last`, async ({ page }) => {
+    const state = await install(page, { taskStatus: 'waiting_for_user', holdFirstTaskRead: true })
+    try {
+      await page.goto(`${origin}/?page=${surface}`)
+      await expect.poll(() => state.taskReads).toBe(1)
+      if (surface === 'jobs') await page.getByRole('button', { name: /Needs your attention|需要我处理/ }).click()
+      state.taskStatusOverride = 'waiting_for_authorization'
+      await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+      await expect.poll(() => state.taskReads).toBeGreaterThanOrEqual(2)
+      const card = page.getByRole('region', { name: 'Fixture Employer · Application flow engineer' })
+      await expect(card).toContainText(/Review needed|等待审核/)
+      await expect(card).not.toContainText(/Your input is needed|需要你补充信息/)
+      const oldResponse = page.waitForResponse(response => response.url().endsWith('/api/agent/application-tasks') && response.request().method() === 'GET')
+      state.releaseFirstTaskRead()
+      await oldResponse
+      await expect.poll(() => state.firstTaskReadFinished).toBe(true)
+      await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+      await expect(card).toContainText(/Review needed|等待审核/)
+      await expect(card).not.toContainText(/Your input is needed|需要你补充信息/)
+      expect(state.writes).toEqual([])
+      expect(state.unexpected).toEqual([])
+    } finally { state.releaseFirstTaskRead() }
+  })
+}
+
+for (const surface of ['jobs', 'dashboard'] as const) {
+  test(`${surface} keeps account B tasks after a delayed account A response`, async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop-en', 'Exercises account switching')
+    const state = await install(page, { taskStatus: 'waiting_for_user', holdFirstTaskRead: true, taskPerUser: true })
+    try {
+      await page.goto(`${origin}/?page=${surface}`)
+      await expect.poll(() => state.taskReads).toBe(1)
+      if (surface === 'jobs') await page.getByRole('button', { name: 'Needs your attention' }).click()
+      state.activeUserId = 'fixture-b'
+      await fixtureSession(page, 'authenticated', 'fixture-b')
+      const card = page.getByRole('region', { name: 'Fixture B · Engineer B' })
+      await expect(card).toContainText('Review needed')
+      await expect.poll(() => state.taskReads).toBeGreaterThanOrEqual(2)
+      const oldResponse = page.waitForResponse(response => response.url().endsWith('/api/agent/application-tasks') && response.request().method() === 'GET')
+      state.releaseFirstTaskRead()
+      await oldResponse
+      await expect.poll(() => state.firstTaskReadFinished).toBe(true)
+      await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+      await expect(card).toContainText('Review needed')
+      await expect(page.getByRole('region', { name: 'Fixture Employer · Application flow engineer' })).toHaveCount(0)
+      expect(state.writes).toEqual([])
+      expect(state.unexpected).toEqual([])
+    } finally { state.releaseFirstTaskRead() }
+  })
+}
+
+for (const surface of ['jobs', 'dashboard'] as const) {
+  test(`${surface} does not restore stale account A tasks while A reloads after B`, async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop-en', 'Exercises account switching')
+    const state = await install(page, { taskStatus: 'waiting_for_user', taskPerUser: true, holdReturnOwnerA: true })
+    try {
+      await page.goto(`${origin}/?page=${surface}`)
+      if (surface === 'jobs') await page.getByRole('button', { name: 'Needs your attention' }).click()
+      const firstCard = page.getByRole('region', { name: 'Fixture Employer · Application flow engineer' })
+      await expect(firstCard).toContainText('Your input is needed')
+      state.activeUserId = 'fixture-b'
+      await fixtureSession(page, 'authenticated', 'fixture-b')
+      await expect(page.getByRole('region', { name: 'Fixture B · Engineer B' })).toContainText('Review needed')
+      await expect(firstCard).toHaveCount(0)
+      await page.evaluate(() => {
+        const values: string[] = []
+        ;(window as unknown as { __taskLeak: string[] }).__taskLeak = values
+        const observer = new MutationObserver(records => {
+          for (const record of records) for (const node of record.addedNodes) {
+            if (node.textContent?.includes('Your input is needed')) values.push(node.textContent)
+          }
+          if (document.body.textContent?.includes('Your input is needed')) values.push('visible')
+        })
+        observer.observe(document.body, { subtree: true, childList: true, characterData: true })
+      })
+      state.taskStatusOverride = 'waiting_for_authorization'
+      state.armReturnOwnerA = true
+      state.activeUserId = 'fixture-user'
+      await fixtureSession(page, 'authenticated', 'fixture-user')
+      await expect.poll(() => state.returnOwnerAEntered).toBe(true)
+      await expect(firstCard).toHaveCount(0)
+      await expect(page.getByRole('region', { name: 'Fixture B · Engineer B' })).toHaveCount(0)
+      const leaks = await page.evaluate(() => (window as unknown as { __taskLeak: string[] }).__taskLeak)
+      expect(leaks).toEqual([])
+      state.releaseReturnOwnerA()
+      await expect(firstCard).toContainText('Review needed')
+      await expect(firstCard).not.toContainText('Your input is needed')
+      expect(await page.evaluate(() => (window as unknown as { __taskLeak: string[] }).__taskLeak)).toEqual([])
+      expect(state.writes).toEqual([])
+      expect(state.unexpected).toEqual([])
+    } finally { state.releaseReturnOwnerA() }
+  })
+}
+
+test('dashboard opens all recent attention tasks without a duplicate continuation', async ({ page }) => {
+  const state = await install(page, { dashboardFourTasks: true })
+  await page.goto(`${origin}/?page=dashboard&highlight=stale-job`)
+  const guidance = page.locator('.application-dashboard-guidance')
+  await expect(guidance).toContainText(/Showing recent application tasks, up to 100.*not a complete application count|显示最近最多100个申请任务，不代表全部申请/)
+  for (const n of [1, 2, 3]) await expect(guidance.getByRole('region', { name: `Employer ${n} · Role ${n}` })).toBeVisible()
+  await expect(guidance).not.toContainText('Employer 4 · Role 4')
+  await expect(guidance).not.toContainText(/Continue preparing this application|继续准备此申请|Follow-up due|待跟进/)
+  await guidance.getByRole('button', { name: /View recent tasks needing attention|查看近期需要我处理的任务/ }).click()
+  await expect(page).toHaveURL(/page=jobs/)
+  await expect(page).toHaveURL(/jobsAttention=1/)
+  expect(new URL(page.url()).searchParams.has('highlight')).toBe(false)
+  const attention = page.getByRole('region', { name: /Needs your attention|需要我处理/ })
+  await expect(attention).toContainText(/Showing recent application tasks, up to 100.*not a complete application count|显示最近最多100个申请任务，不代表全部申请/)
+  for (const n of [1, 2, 3, 4]) await expect(attention.getByRole('region', { name: `Employer ${n} · Role ${n}` })).toBeVisible()
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+  const staleRequested = state.staleJobRequested
+  state.releaseStaleJob()
+  if (staleRequested) await expect.poll(() => state.staleJobReturned).toBe(true)
+  await expect(page.getByRole('dialog')).toHaveCount(0)
+  expect(staleRequested).toBe(false)
   expect(state.writes).toEqual([])
   expect(state.unexpected).toEqual([])
 })
@@ -829,6 +1009,12 @@ test('a failed delayed save keeps the original resume selected', async ({ page }
     await expect(page.getByText('Second resume content.', { exact: false })).toHaveCount(0)
     expect(state.writes.every(item => item.path === '/api/resume/resume-1')).toBe(true)
     expect(state.unexpected).toEqual([])
+    // The editor is still dirty. Drain its already-scheduled two-second
+    // autosave through the mock while preserving the real unload guard.
+    await expect.poll(() => state.saveResponses, { timeout: 10_000 }).toBeGreaterThanOrEqual(2)
+    await expect(page.getByText('Edited fixture summary', { exact: false }).first()).toBeVisible()
+    expect(await page.evaluate(() => { const event = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(event); return event.defaultPrevented })).toBe(true)
+    expect(state.writes.every(item => item.path === '/api/resume/resume-1')).toBe(true)
   } finally { state.releaseSave() }
 })
 
@@ -1262,6 +1448,23 @@ test('editing during audit correction is kept without overwriting the server cor
 })
 
 
+test('opening the related Agent session does not read a stale session from the URL', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises the real desktop Agent shell')
+  const state = await install(page, { taskStatus: 'waiting_for_authorization', realAgent: true })
+  await page.goto(`${origin}/?shell=1&page=jobs&highlight=outside-page&sessionId=stale-session`)
+  await expect(page.getByRole('dialog')).toContainText('Application flow engineer')
+  await page.getByRole('link', { name: 'Review in Agent' }).click()
+  await expect(page).toHaveURL(/sessionId=original-session/)
+  await page.getByRole('button', { name: /^Tasks & results/ }).click()
+  await expect(page.locator('[data-agent-approval-ledger="true"]')).toBeVisible()
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+  expect(state.agentRequests.some(item => item.path.startsWith('/api/agent/sessions/stale-session'))).toBe(false)
+  expect(state.agentRequests.filter(item => item.method === 'POST')).toEqual([])
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+
 test('application review opens the original real Agent session without submitting', async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== 'desktop-en', 'Exercises the real desktop Agent shell')
   const state = await install(page, { taskStatus: 'waiting_for_authorization', realAgent: true })
@@ -1278,6 +1481,25 @@ test('application review opens the original real Agent session without submittin
   await page.locator('[data-agent-approval-ledger="true"] button').first().click()
   await expect.poll(() => state.agentRequests.filter(item => item.method === 'POST').length).toBe(1)
   expect(state.agentRequests.find(item => item.method === 'POST')).toMatchObject({ path: '/api/agent/sessions/original-session/approvals/fixture-approval', body: { expectedTurnId: 'fixture-turn', expectedRevision: 1, decision: 'approved' } })
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+
+test('expired approval remains in the original session without a decision or submission', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises the real desktop Agent shell')
+  const state = await install(page, { taskStatus: 'waiting_for_authorization', realAgent: true, expiredApproval: true })
+  await page.goto(`${origin}/?shell=1&page=jobs&highlight=outside-page`)
+  await expect(page.getByRole('dialog')).toContainText('Application flow engineer')
+  await page.getByRole('link', { name: 'Review in Agent' }).click()
+  await expect(page).toHaveURL(/sessionId=original-session/)
+  await page.getByRole('button', { name: /^Tasks & results/ }).click()
+  const ledger = page.locator('[data-agent-approval-ledger="true"]')
+  await expect(ledger).toContainText('Expired')
+  await expect(ledger).toContainText('Pending decisions')
+  await expect(ledger).toContainText('0')
+  await expect(ledger.getByRole('button', { name: /^(Approve|Reject)$/ })).toHaveCount(0)
+  expect(state.agentRequests.filter(item => item.method === 'POST')).toEqual([])
   expect(state.writes).toEqual([])
   expect(state.unexpected).toEqual([])
 })
@@ -1640,8 +1862,14 @@ test('application follows original Agent question, review and an unverified outc
   await question.getByRole('button', { name: 'Send answer', exact: true }).click()
   await expect.poll(() => state.agentStage).toBe('approval')
   expect(state.agentRequests.find(item => item.method === 'POST')).toMatchObject({ path: '/api/agent/sessions/original-session/questions/fixture-question', body: { expectedTurnId: 'fixture-turn', expectedRevision: 1, answer: 'yes' } })
-  // The server state changes are simulated; reload hydrates the same durable session.
-  await page.reload()
+  // The fixture changes the same task's state. Return through the real UI to
+  // verify the previous question is replaced by the next actionable review.
+  await page.locator('#desktop-sidebar').getByRole('button', { name: 'Dashboard', exact: true }).click()
+  const guidance = page.locator('.application-dashboard-guidance')
+  const taskCard = guidance.getByRole('region', { name: 'Fixture Employer · Application flow engineer' })
+  await expect(taskCard).toContainText('Review needed')
+  await expect(taskCard).not.toContainText('Your input is needed')
+  await taskCard.getByRole('link', { name: 'Review in Agent' }).click()
   await expect(page).toHaveURL(/sessionId=original-session/)
   await page.getByRole('button', { name: /^Tasks & results/ }).click()
   const approval = page.locator('[data-agent-approval-ledger="true"]')
@@ -1649,7 +1877,14 @@ test('application follows original Agent question, review and an unverified outc
   await approval.getByRole('button', { name: 'Approve', exact: true }).click()
   await expect.poll(() => state.agentStage).toBe('running')
   expect(state.agentRequests.filter(item => item.method === 'POST')[1]).toMatchObject({ path: '/api/agent/sessions/original-session/approvals/fixture-approval', body: { expectedTurnId: 'fixture-turn', expectedRevision: 2, decision: 'approved' } })
-  await page.reload()
+  // After approval the same task is running, so neither the old question nor
+  // approval should remain in the bounded attention view.
+  await page.locator('#desktop-sidebar').getByRole('button', { name: /^Applications(?:\s+\d+)?$/ }).click()
+  await page.getByRole('button', { name: 'Needs your attention', exact: true }).click()
+  const attention = page.getByRole('region', { name: 'Needs your attention' })
+  await expect(attention).toContainText('No recent tasks need your attention.')
+  await expect(attention).not.toContainText('Fixture Employer · Application flow engineer')
+  await page.locator('#desktop-sidebar').getByRole('button', { name: 'Agent', exact: true }).click()
   await expect(page).toHaveURL(/sessionId=original-session/)
   await expect(page.locator('.agent-context-bar')).toContainText('Fixture application task')
   // Outcome is deliberately unknown; the fixture never performs an external submission.

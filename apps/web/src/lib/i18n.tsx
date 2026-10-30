@@ -6,6 +6,7 @@ export type Lang = 'en' | 'de' | 'fr' | 'es' | 'nl' | 'zh'
 // ── Translations dictionary ──────────────────────────────────────────────────
 const dict: Record<Lang, Record<string, string>> = {
   en: {
+    'application.viewRecentAttention': 'View recent tasks needing attention',
     'application.scopedEvidenceGuidance': 'Evidence for this application cannot yet be saved separately. Review and edit the materials, or remove or soften claims you cannot support. Add a fact to your profile only if you want it available across applications. Changes may require another audit.',
     'application.scopedEvidenceNoResume': 'The application resume is unavailable or still loading. Check your selected materials before editing.',
     'application.downloadZip': 'Download application materials (.zip)',
@@ -100,7 +101,9 @@ const dict: Record<Lang, Record<string, string>> = {
     'application.method': 'Application method',
     'application.agentMethodHint': 'This destination supports Agent assistance. Continue in the original task for review and authorization.',
     'application.manualMethodHint': 'Submit on the employer website. ApplyMate can still prepare your materials.',
-    'application.openAgent': 'Open Agent',
+    'application.openAgent': 'Open Agent workspace',
+    'application.noLinkedTaskHint': 'No Agent task is linked to this job. The workspace may reopen a recent conversation; start a new one and identify this job. Opening it does not create a task or authorize submission.',
+    'application.taskLinkUnknownHint': 'The Agent task status cannot be confirmed. Refresh it first; the workspace may show a different conversation.',
     'application.auditStale': 'The current materials have changed or are still loading. Check their latest versions before continuing.',
     'application.linkUnavailable': 'This application is unavailable or you no longer have access.',
     'resume.backToApplication': 'Back to this application',
@@ -2785,6 +2788,7 @@ const dict: Record<Lang, Record<string, string>> = {
   es: { 'settings.usage': 'Uso y actividad', 'settings.keysConnections': 'Claves y conexiones' },
   nl: { 'settings.usage': 'Gebruik en activiteit', 'settings.keysConnections': 'Sleutels en verbindingen' },
   zh: {
+    'application.viewRecentAttention': '查看近期需要我处理的任务',
     'application.scopedEvidenceGuidance': '目前无法单独保存此申请的新增证据。请核对并编辑材料，或移除、弱化无法支持的表述。只有希望其他申请也使用的事实，才请自行添加到个人资料。修改后可能需要重新审核。',
     'application.scopedEvidenceNoResume': '申请简历不可用或仍在加载，请先检查所选材料。',
     'application.downloadZip': '下载申请材料（.zip）',
@@ -2879,7 +2883,9 @@ const dict: Record<Lang, Record<string, string>> = {
     'application.method': '申请方式',
     'application.agentMethodHint': '此网站支持 Agent 协助，请在原任务中审核并授权。',
     'application.manualMethodHint': '请在雇主网站提交，ApplyMate 仍可协助准备材料。',
-    'application.openAgent': '打开 Agent',
+    'application.openAgent': '打开 Agent 工作区',
+    'application.noLinkedTaskHint': '此职位没有关联的 Agent 任务。工作区可能打开最近的对话；请新建对话并说明当前职位。打开工作区不会创建任务或授权提交。',
+    'application.taskLinkUnknownHint': '无法确认此职位的 Agent 任务状态，请先刷新；工作区可能显示其他对话。',
     'application.auditStale': '材料已变更或仍在加载，请核对最新版本后继续。',
     'application.linkUnavailable': '此申请不存在或你已无权访问。',
     'resume.backToApplication': '返回此申请',

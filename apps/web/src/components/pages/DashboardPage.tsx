@@ -10,7 +10,7 @@ import type { Activity, DashboardApplicationDay, DashboardData, DashboardIntervi
 import { apiMutate, fmtDate, useApi } from '@/lib/hooks'
 import { useNav } from '@/lib/nav-context'
 import { useI18n } from '@/lib/i18n'
-import { openApplication, openApplicationSession } from '@/lib/application-navigation'
+import { openApplication, openApplicationAttention, openApplicationSession } from '@/lib/application-navigation'
 import { ApplicationDashboardGuidance } from '@/components/jobs/application-dashboard-guidance'
 import { useApplicationTasks } from '@/components/jobs/useApplicationTasks'
 import './DashboardPage.css'
@@ -328,7 +328,7 @@ export function DashboardPage() {
             </div>}
           </div>
         </header>
-        <ApplicationDashboardGuidance tasks={applicationTasks.tasks} loading={applicationTasks.loading} error={applicationTasks.error} savedJobs={savedJobs} followUps={data?.followUpsDue ?? []} onOpenApplication={openJob} onOpenSession={sessionId => openApplicationSession(sessionId, navigate)} onRefresh={() => { void applicationTasks.refetch(); refetch() }} onDiscover={() => navigate('search')} t={t} />
+        <ApplicationDashboardGuidance tasks={applicationTasks.tasks} loading={applicationTasks.loading} error={applicationTasks.error} savedJobs={savedJobs} followUps={data?.followUpsDue ?? []} onOpenApplication={openJob} onOpenSession={sessionId => openApplicationSession(sessionId, navigate)} onOpenAttention={() => void openApplicationAttention(navigate)} onRefresh={() => { void applicationTasks.refetch(); refetch() }} onDiscover={() => navigate('search')} t={t} />
         <div className="momentum-layout">
           <div className="momentum-primary-column"><WeekGoal completed={stats.thisWeek} applicationDays={data?.applicationDays ?? []} interviews={data?.interviewsScheduled ?? []} range={selectedRange} t={t} /><CoachCard hasResume={data?.hasResume ?? false} savedJobs={savedJobs.length} onAction={() => navigate(data?.hasResume ? 'jobs' : 'resume')} t={t} /><Timeline activities={activities} onJobs={openJob} t={t} /></div>
           <aside className="momentum-secondary-column"><MatchList jobs={savedJobs} threshold={data?.minMatchScore ?? 75} onReview={openJob} t={t} /><JobNotifications recommendations={todayRecommendations} onReview={() => navigate('gmail-recommendations')} t={t} /><WeekAtAGlance stats={stats} onJobs={() => navigate('jobs')} t={t} /><ActionCard agentConfig={data?.agentConfig ?? null} onSettings={() => navigate('settings')} onUpdated={refetch} t={t} /></aside>

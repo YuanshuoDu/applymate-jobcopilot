@@ -1002,7 +1002,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
               <strong style={{ fontSize: 13 }}>{t('application.method')}</strong>
               <p style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{applicationPreflight.canAutomate ? t('application.agentMethodHint') : t('application.manualMethodHint')}</p>
               {(!currentPackAudited || task || applicationRecorded) && job.url && /^https?:\/\//i.test(job.url) && <a href={job.url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--primary)', fontSize: 12 }}>{t('application.openEmployer')}</a>}
-              {!task && <Btn variant="ghost" small onClick={() => navigate('agent')}>{t('application.openAgent')}</Btn>}
+              {!task && <><p style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{t(taskReadState === 'ready' ? 'application.noLinkedTaskHint' : 'application.taskLinkUnknownHint')}</p><Btn variant="ghost" small onClick={() => navigate('agent')}>{t('application.openAgent')}</Btn></>}
               {manualWorkAllowed && taskReadState === 'ready' && !applicationRecorded && !manualRecordLock && <Btn variant="ghost" small disabled={recordingSubmission} onClick={() => void recordManualSubmission()}>{t('application.recordManual')}</Btn>}
               {manualStorageUnavailable && <p role="status">{t('application.manualStorageUnavailable')}</p>}
               {manualRecordLock && !applicationRecorded && <div role="status">
@@ -1609,21 +1609,29 @@ export function JobsPage() {
     // with notes or material updates made immediately after opening it.
     if (selectedJob?.id === highlightId && selectedJob.userId === userId) return
     const controller = new AbortController()
-    void loadLinkedApplication(highlightId, controller.signal).then(value => {
-      if (controller.signal.aborted) return
-      const linked = value as Job
-      if (linked.userId !== userId) throw new Error('Application unavailable')
-      setSelectedJob(previous => previous?.id === linked.id ? previous : linked)
-    }).catch(() => {
-      if (controller.signal.aborted) return
-      setSelectedJob(null)
-      setHighlightId(null)
-      const url = new URL(window.location.href)
-      url.searchParams.delete('highlight')
-      window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`)
-      toast.error(t('application.linkUnavailable'))
-    })
-    return () => controller.abort()
+    // A cross-page navigation can render this page before its guarded helper
+    // commits the final selection. Wait for that commit, then verify the URL
+    // both before issuing the read and before publishing its result.
+    const isCurrent = () => !controller.signal.aborted
+      && new URL(window.location.href).searchParams.get('highlight') === highlightId
+    const timer = window.setTimeout(() => {
+      if (!isCurrent()) return
+      void loadLinkedApplication(highlightId, controller.signal).then(value => {
+        if (!isCurrent()) return
+        const linked = value as Job
+        if (linked.userId !== userId) throw new Error('Application unavailable')
+        setSelectedJob(previous => previous?.id === linked.id && previous.userId === userId ? previous : linked)
+      }).catch(() => {
+        if (!isCurrent()) return
+        setSelectedJob(null)
+        setHighlightId(null)
+        const url = new URL(window.location.href)
+        url.searchParams.delete('highlight')
+        window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`)
+        toast.error(t('application.linkUnavailable'))
+      })
+    }, 0)
+    return () => { window.clearTimeout(timer); controller.abort() }
   }, [highlightId, userId])
 
   useEffect(() => {
@@ -1850,7 +1858,7 @@ export function JobsPage() {
         />
       )}
 
-      {selectedJob && (
+      {selectedJob && selectedJob.id === highlightId && selectedJob.userId === userId && (
         <JobDetailDrawer
           key={selectedJob.id}
           job={selectedJob}

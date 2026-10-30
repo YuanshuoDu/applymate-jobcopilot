@@ -35,12 +35,15 @@ Agent 负责原任务的执行和审批，招聘消息负责查看回复。
    不间断空格和可组合音标会在 PDF 中规范化，原材料不变。
 8. 只有实际提交完成后，点击“记录我已在雇主网站提交”。这是用户报告的手动记录，
    不能替代雇主回执。若显示记录已接收但状态待刷新，或结果未知，点击“刷新记录状态”
-   只读取状态；若仍未确认，先核对申请历史及雇主回执，不重复记录。
+   只读取状态；若仍未确认，先核对申请历史及雇主回执，不重复记录。现有服务可能先更新
+   状态、后写历史；若历史记录缺失，不能仅凭状态判断记录来源。
 9. 在申请历史与招聘消息查看后续。材料编辑、下载和打开网站都不会记作已提交。
 
 ### Agent 协助申请
 
-1. 申请详情已有任务时，点击原任务的进度、问题或审核入口。
+1. 申请详情已有任务时，点击原任务的进度、问题或审核入口。没有关联任务时，
+   “打开 Agent 工作区”可能恢复最近的其他对话；请新建对话并说明此职位。
+   如果任务状态无法确认，先刷新；打开工作区不会创建任务或授权提交。
 2. 在同一个 Agent 会话中补充信息和授权，避免另开任务重复处理。
 3. 等待授权、正在填写、正在提交和提交结果待核实分别显示，不合并成“已完成”。
 4. 登录、验证码或 MFA 按原会话的交接说明处理；仅在现有系统允许时恢复。
@@ -185,7 +188,11 @@ reviewed rule change; this UI change does not quietly waive them.
 
 Opening links and downloading files never call the manual-record endpoint. The
 manual action records the candidate's report; it is not independent employer
-receipt verification. The existing activity entry preserves that distinction.
+receipt verification. The existing endpoint writes the job status before its manual
+activity entry, without a shared transaction. A later failure can therefore leave
+the status updated without an activity entry identifying the source; a status alone
+does not prove how the application was recorded. Transactional provenance needs
+a separate backend change.
 
 The browser ZIP download reads the account-owned job, selected saved documents
 and existing passing audit before rendering. It then reads them again and compares
@@ -248,14 +255,17 @@ trying again. New edits made during restoration are retained for manual comparis
 
 The Applications card is a read-only task projection. It never creates a task,
 answers a question, issues an approval nonce, grants consent, or retries execution.
-Without an associated task, Open Agent navigates to the existing Agent entry.
-It does not infer a session from job ID or send a task prompt.
+Without an associated task, Open Agent navigates to the generic workspace. It may
+restore the most recent unrelated conversation, so the user is told to start a new
+conversation and identify the job. It does not infer a session from job ID or send
+a task prompt. If the task list is unavailable or limited, absence is not asserted.
 
-The task query returns at most 100 recent records. Dashboard labels this scope.
+The task query returns at most 100 recent records. Dashboard labels this scope,
+shows up to three attention cards and links to the existing recent attention view.
 Missing records at that boundary do not prove a task is absent. Loading, failures
 and partial coverage show refresh guidance instead of a new preparation action.
-Refocusing Applications or Dashboard refreshes the task projection so resolved
-questions do not remain indefinitely visible. Manual work is available after a
+Refocusing Applications or Dashboard refreshes the task projection; an older read
+cannot replace a newer response. Cross-window changes still need focus or refresh. Manual work is available after a
 failed or cancelled task only when its checkpoint explicitly says it stopped
 before submission; uncertain and active execution remain guarded. The projection
 is a snapshot and does not by itself prevent concurrent changes in another tab.

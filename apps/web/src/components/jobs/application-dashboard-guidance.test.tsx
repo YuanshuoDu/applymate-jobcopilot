@@ -22,7 +22,7 @@ function props() {
     tasks: [] as ApplicationTaskView[], loading: false, error: null,
     savedJobs: [{ id: 'saved-27', company: 'Saved Inc', role: 'Engineer' }] as DashboardData['savedJobs'],
     followUps: [{ id: 'follow-19', company: 'Follow Inc', role: 'Developer' }] as DashboardData['followUpsDue'],
-    onOpenApplication: vi.fn(), onOpenSession: vi.fn(), onRefresh: vi.fn(), onDiscover: vi.fn(),
+    onOpenApplication: vi.fn(), onOpenSession: vi.fn(), onOpenAttention: vi.fn(), onRefresh: vi.fn(), onDiscover: vi.fn(),
     t: (key: string) => key,
   }
 }
@@ -61,7 +61,25 @@ describe('Dashboard application guidance', () => {
     input.followUps[0].id = 'job-1'
     const tree = ApplicationDashboardGuidance(input)
     expect(elements(tree).filter(element => element.type === ApplicationTaskCard)).toHaveLength(1)
-    expect(elements(tree).filter(element => element.type === 'button')).toHaveLength(0)
+    const buttons = elements(tree).filter(element => element.type === 'button')
+    expect(buttons).toHaveLength(1)
+    ;(buttons[0].props.onClick as () => void)()
+    expect(input.onOpenAttention).toHaveBeenCalledOnce()
+    expect(input.onOpenApplication).not.toHaveBeenCalled()
+  })
+
+  it('excludes every recent attention job from continuation shortcuts, not only the three displayed cards', () => {
+    const input = { ...props(), tasks: [task('1', 'waiting_for_user'), task('2', 'unknown'), task('3', 'failed'), task('4', 'waiting_for_authorization')] }
+    input.savedJobs[0].id = 'job-4'
+    input.followUps[0].id = 'job-4'
+    const tree = ApplicationDashboardGuidance(input)
+    expect(elements(tree).filter(element => element.type === ApplicationTaskCard)).toHaveLength(3)
+    const buttons = elements(tree).filter(element => element.type === 'button')
+    expect(buttons).toHaveLength(1)
+    expect(renderToStaticMarkup(tree)).toContain('application.viewRecentAttention')
+    ;(buttons[0].props.onClick as () => void)()
+    expect(input.onOpenAttention).toHaveBeenCalledOnce()
+    expect(input.onOpenApplication).not.toHaveBeenCalled()
   })
 
   it('offers refresh after a query error, without claiming there are no tasks', () => {
