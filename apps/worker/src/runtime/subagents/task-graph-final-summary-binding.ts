@@ -40,9 +40,10 @@ export function buildTaskGraphFinalSummaryBinding(loaded: LoadedGraph): TaskGrap
   const members = loaded.snapshot.nodes.map((snapshotNode, nodeIndex): TaskGraphFinalSummaryMember => {
     const task = loaded.tasks.get(snapshotNode.taskId)
     if (!task || task.id !== snapshotNode.taskId || !nonEmpty(snapshotNode.key) || !nonEmpty(snapshotNode.templateId)
-      || !nonEmpty(task.taskType) || !nonEmpty(task.role) || !TASK_STATUSES.has(task.status) || seenTasks.has(task.id)) {
+      || !nonEmpty(task.taskType) || !nonEmpty(task.role) || !TASK_STATUSES.has(task.status)) {
       throw new Error("task_graph_final_summary_task_scope_invalid")
     }
+    if (seenTasks.has(task.id)) throw new Error("task_graph_final_summary_task_identity_conflict")
     seenTasks.add(task.id)
     return { nodeIndex, nodeKey: snapshotNode.key, templateId: snapshotNode.templateId, taskId: task.id, role: task.role,
       taskType: task.taskType, taskStatus: task.status,

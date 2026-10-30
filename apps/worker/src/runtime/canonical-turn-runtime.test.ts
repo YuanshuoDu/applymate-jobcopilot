@@ -103,7 +103,7 @@ import { ROLE_RESULT_SCHEMA } from "./subagents/role-results.js"
 import { DISCOVERY_ATTEMPT_HEALTH_SCHEMA_VERSION } from "./subagents/child-discovery-attempt.js"
 import { DISCOVERY_QUERY_FOOTPRINT_SCHEMA_VERSION } from "./subagents/child-discovery-query-footprint.js"
 import { currentTaskGraph, type GraphTaskRow, type LoadedGraph } from "./subagents/task-graph-pg-state.js"
-import { parseTaskGraphSnapshot, taskGraphState, TASK_GRAPH_SNAPSHOT_VERSION, type TaskGraphSnapshot } from "./subagents/task-graph-snapshot.js"
+import { parseTaskGraphSnapshot, taskGraphItemId, taskGraphState, TASK_GRAPH_SNAPSHOT_VERSION, type TaskGraphSnapshot } from "./subagents/task-graph-snapshot.js"
 import { projectTaskGraphResultPage } from "./subagents/task-graph-result-page.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "./planning/task-graph-verification.js"
 import { evaluateTaskGraphObjectiveCoverage } from "./planning/task-graph-objective-coverage.js"
@@ -391,8 +391,8 @@ function scoutGraphRow(id: string, jobIds: readonly string[]): GraphTaskRow {
 function loadedScoutGraph(revision: number, currentRows: readonly GraphTaskRow[], nonCurrentRows: readonly GraphTaskRow[] = []): LoadedGraph {
   return {
     rootTaskId: "root-1",
-    item: { id: "task-graph:root-1", revision, content: {}, createdAt: new Date(0) },
-    snapshot: { nodes: currentRows.map(task => ({ taskId: task.id })) } as unknown as TaskGraphSnapshot,
+    item: { id: taskGraphItemId("root-1"), revision, content: {}, createdAt: new Date(0) },
+    snapshot: { nodes: currentRows.map(task => ({ taskId: task.id, key: task.id, templateId: task.role })) } as unknown as TaskGraphSnapshot,
     state: { revision } as LoadedGraph["state"],
     tasks: new Map([...currentRows, ...nonCurrentRows].map(task => [task.id, task])),
   }

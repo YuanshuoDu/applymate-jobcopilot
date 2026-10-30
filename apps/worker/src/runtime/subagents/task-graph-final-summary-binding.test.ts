@@ -70,6 +70,12 @@ describe("current TaskGraph final-summary binding", () => {
       .toThrow("task_graph_final_summary_graph_invalid")
   })
 
+  it("preserves the reducer's specific error for duplicate current task identities", () => {
+    const duplicate = graph(3, ["scout", "scout"], [row("scout", "scout", "research", {})])
+    expect(() => buildTaskGraphFinalSummaryBinding(duplicate))
+      .toThrow("task_graph_final_summary_task_identity_conflict")
+  })
+
   it("compares revision and full facts, including same-count result changes", () => {
     const first = buildTaskGraphFinalSummaryBinding(graph(4, ["scout"], [
       row("scout", "scout", "research", { structuredResult: scoutResult("job-a") }),
