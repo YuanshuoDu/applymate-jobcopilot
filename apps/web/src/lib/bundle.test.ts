@@ -4,7 +4,9 @@ const mocks = vi.hoisted(() => ({ read: vi.fn(), same: vi.fn(), save: vi.fn(), t
 vi.mock('./application-export-snapshot', () => ({ readApplicationExportSnapshot: mocks.read, sameApplicationExportSnapshot: mocks.same }))
 vi.mock('@react-pdf/renderer', () => ({ pdf: () => ({ toBlob: mocks.toBlob }) }))
 vi.mock('@/lib/resume-pdf', () => ({ renderResumeDoc: mocks.render }))
-vi.mock('file-saver', () => ({ saveAs: mocks.save }))
+// The package's CommonJS export is a function. Next's production webpack
+// namespace exposes it as default rather than a named saveAs export.
+vi.mock('file-saver', () => ({ default: mocks.save }))
 vi.mock('jszip', () => ({ default: class { folder(name: string) { mocks.folder(name); return this } file() { return this } async generateAsync() { return new Blob(['zip']) } } }))
 
 import { downloadAuditedApplicationBundle } from './bundle'

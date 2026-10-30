@@ -53,7 +53,7 @@ export async function downloadAuditedApplicationBundle(jobId: string, userId: st
 
 async function renderJobBundle({ job, resume, coverLetter }: ApplicationExportSnapshot): Promise<{ blob: Blob; filename: string; save: (blob: Blob, filename: string) => void }> {
   // 4. Lazy-load heavy deps
-  const [{ pdf }, { default: JSZip }, { saveAs }] = await Promise.all([
+  const [{ pdf }, { default: JSZip }, { default: saveAs }] = await Promise.all([
     import('@react-pdf/renderer'),
     import('jszip'),
     import('file-saver'),
