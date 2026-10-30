@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest'
-import { blocksManualRecord, hasVisibleSubmissionRecord, readManualRecordLock, writeManualRecordLock } from './application-manual-record'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { blocksManualRecord, hasVisibleSubmissionRecord, readManualRecordLock, rejectPendingManualRecord, submitManualRecord, writeManualRecordLock } from './application-manual-record'
 
 function memoryStorage(): Storage {
   const entries = new Map<string, string>()
@@ -24,6 +24,61 @@ describe('manual record lock', () => {
     const malformed = memoryStorage()
     malformed.setItem('applymate:manual-record:a:j', 'unrecognized')
     expect(readManualRecordLock(malformed, 'a', 'j')).toBe('unknown')
+  })
+  it('releases only the pending lock after a verified rejection', () => {
+    const store = memoryStorage()
+    expect(rejectPendingManualRecord(store, 'a', 'j', 'limit')).toBe(false)
+    writeManualRecordLock(store, 'a', 'j', 'unknown')
+    expect(rejectPendingManualRecord(store, 'a', 'j', 'limit')).toBe(false)
+    expect(readManualRecordLock(store, 'a', 'j')).toBe('unknown')
+    writeManualRecordLock(store, 'a', 'j', 'pending')
+    expect(rejectPendingManualRecord(store, 'a', 'j', 'limit')).toBe(true)
+    expect(readManualRecordLock(store, 'a', 'j')).toBe('rejected-limit')
+    // The next explicit record attempt replaces the verified rejection.
+    expect(writeManualRecordLock(store, 'a', 'j', 'pending')).toBe(true)
+    expect(readManualRecordLock(store, 'a', 'j')).toBe('pending')
+    expect(readManualRecordLock(store, 'a', 'other')).toBeNull()
+  })
+  it('does not release a lock when storage cannot verify the update', () => {
+    const store = memoryStorage()
+    writeManualRecordLock(store, 'a', 'j', 'pending')
+    vi.spyOn(store, 'setItem').mockImplementation(() => { throw Error('denied') })
+    expect(rejectPendingManualRecord(store, 'a', 'j', 'limit')).toBe(false)
+    expect(readManualRecordLock(store, 'a', 'j')).toBe('pending')
+  })
+})
+
+describe('manual record response', () => {
+  const requestId = 'c24888e7-55f4-43c5-b1a4-73e77c4ce800'
+  afterEach(() => vi.unstubAllGlobals())
+  it.each([
+    ['MANUAL_APPLICATION_LIMIT_REACHED', 'limit'],
+    ['MANUAL_APPLICATION_PLAN_RESTRICTED', 'plan'],
+  ] as const)('recognizes only a matching pre-write %s rejection', async (code, outcome) => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ code, requestId }), { status: 403 }))
+    vi.stubGlobal('fetch', fetchMock)
+    expect(await submitManualRecord('job/1', requestId)).toBe(outcome)
+    expect(fetchMock).toHaveBeenCalledWith('/api/jobs/job%2F1/apply', expect.objectContaining({
+      method: 'POST', headers: expect.objectContaining({ 'X-Manual-Record-Request-Id': requestId }),
+    }))
+  })
+  it.each([
+    [403, { code: 'MANUAL_APPLICATION_LIMIT_REACHED', requestId: 'different' }],
+    [403, { error: 'Forbidden' }],
+    [500, { code: 'MANUAL_APPLICATION_LIMIT_REACHED', requestId }],
+    [200, { applied: false }],
+  ])('keeps status %s with unproven response unknown', async (status, body) => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(body), { status })))
+    expect(await submitManualRecord('j', requestId)).toBe('unknown')
+  })
+  it('keeps network failures and malformed responses unknown', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValueOnce(Error('offline')).mockResolvedValueOnce(new Response('invalid')))
+    expect(await submitManualRecord('j', requestId)).toBe('unknown')
+    expect(await submitManualRecord('j', requestId)).toBe('unknown')
+  })
+  it('confirms an explicitly accepted record', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ applied: true }))))
+    expect(await submitManualRecord('j', requestId)).toBe('confirmed')
   })
 })
 

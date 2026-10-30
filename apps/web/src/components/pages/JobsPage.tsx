@@ -25,7 +25,7 @@ import { ApplicationAttentionView, ApplicationTaskSummary } from '@/components/j
 import type { ApplicationTaskView } from '@/components/jobs/application-task-model'
 import { forgetSavedApplication } from '@/components/jobs/application-search-state'
 import { applicationTaskAllowsManualWork } from '@/components/jobs/application-attention-safety'
-import { blocksManualRecord, hasVisibleSubmissionRecord, readManualRecordLock, writeManualRecordLock, type ManualRecordLock } from '@/components/jobs/application-manual-record'
+import { blocksManualRecord, hasVisibleSubmissionRecord, readManualRecordLock, rejectPendingManualRecord, submitManualRecord, writeManualRecordLock, type ManualRecordLock } from '@/components/jobs/application-manual-record'
 import { openApplication, openApplicationSession, replaceApplicationHistory } from '@/lib/application-navigation'
 
 const KANBAN_COLS: JobStatus[] = ['saved', 'applied', 'interview', 'offer', 'rejected']
@@ -622,6 +622,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   const [manualRecordNotice, setManualRecordNotice] = useState(false)
   const [manualVisibleRecord, setManualVisibleRecord] = useState(false)
   const [manualStorageUnavailable, setManualStorageUnavailable] = useState(false)
+  const manualRejection = manualRecordLock === 'rejected-limit' ? 'limit' : manualRecordLock === 'rejected-plan' ? 'plan' : null
   const setRecordLock = (value: ManualRecordLock | null) => { manualRecordRef.current = value; setManualRecordLock(value) }
   useEffect(() => {
     let value: ManualRecordLock | null = 'unknown'
@@ -1230,10 +1231,40 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     }
   }
 
+  async function refreshAfterManualRejection(userId: string) {
+    if (!isCurrentDrawer(userId)) return
+    const epoch = ++manualRecordRefreshEpoch.current
+    const requestedJob = manualRecordJobRef.current
+    const mutationEpoch = manualRecordMutationEpoch.current
+    setManualRecordRefreshing(true)
+    onRefreshTasks()
+    try {
+      const response = await fetch(`/api/jobs/${encodeURIComponent(job.id)}`)
+      if (!response.ok) throw new Error('unavailable')
+      const updated = await response.json() as Job
+      const receivedAt = Date.parse(updated.updatedAt)
+      const currentAt = Date.parse(requestedJob.updatedAt)
+      if (!isCurrentDrawer(userId) || epoch !== manualRecordRefreshEpoch.current) return
+      if (updated.id !== job.id || updated.userId !== userId || manualRecordMutationEpoch.current !== mutationEpoch
+        || manualRecordJobRef.current !== requestedJob || !Number.isFinite(receivedAt) || !Number.isFinite(currentAt) || receivedAt < currentAt) throw new Error('unavailable')
+      publishJobUpdate(updated)
+      // Retain the persisted rejection until the next explicit record request.
+      // Reopening the drawer therefore requires another scoped refresh.
+      setRecordLock(null)
+      setManualRecordNotice(false)
+    } catch {
+      if (isCurrentDrawer(userId) && epoch === manualRecordRefreshEpoch.current) setManualRecordNotice(true)
+    } finally {
+      if (isCurrentDrawer(userId) && epoch === manualRecordRefreshEpoch.current) setManualRecordRefreshing(false)
+    }
+  }
+
   async function recordManualSubmission() {
     const userId = drawerUserIdRef.current
     if (!userId || !isCurrentDrawer(userId) || recordingSubmissionRef.current || manualRecordRef.current
       || !manualWorkAllowed || blocksManualRecord(job) || taskReadState !== 'ready') return
+    let requestId: string
+    try { requestId = crypto.randomUUID() } catch { setManualStorageUnavailable(true); return }
     try {
       if (!writeManualRecordLock(window.sessionStorage, userId, job.id, 'pending')) { setManualStorageUnavailable(true); return }
     } catch { setManualStorageUnavailable(true); return }
@@ -1241,13 +1272,23 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     setRecordLock('pending')
     recordingSubmissionRef.current = true
     setRecordingSubmission(true)
+    setManualRecordNotice(false)
     try {
-      const { error } = await apiMutate(`/api/jobs/${job.id}/apply`, 'POST', {})
-      const outcome: ManualRecordLock = error ? 'unknown' : 'confirmed'
+      const result = await submitManualRecord(job.id, requestId)
+      let released = false
+      try {
+        released = (result === 'limit' || result === 'plan') && isCurrentDrawer(userId)
+          && rejectPendingManualRecord(window.sessionStorage, userId, job.id, result)
+      } catch { /* Keep the pending lock when storage cannot be checked. */ }
+      if (released && (result === 'limit' || result === 'plan')) {
+        setRecordLock(result === 'limit' ? 'rejected-limit' : 'rejected-plan')
+        return
+      }
+      const outcome: ManualRecordLock = result === 'confirmed' ? 'confirmed' : 'unknown'
       try { writeManualRecordLock(window.sessionStorage, userId, job.id, outcome) } catch { /* pending remains conservative */ }
       if (!isCurrentDrawer(userId)) return
       setRecordLock(outcome)
-      if (!error) await refreshManualRecord(userId)
+      if (outcome === 'confirmed') await refreshManualRecord(userId)
     } finally {
       recordingSubmissionRef.current = false
       if (isCurrentDrawer(userId)) setRecordingSubmission(false)
@@ -1371,11 +1412,15 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
             <div style={{ borderTop: '1px solid var(--border)', paddingTop: 16 }}>
               <strong style={{ fontSize: 13 }}>{t('application.method')}</strong>
               <p style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{applicationPreflight.canAutomate ? t('application.agentMethodHint') : t('application.manualMethodHint')}</p>
-              {(!currentPackAudited || task || applicationRecordBlocked) && job.url && /^https?:\/\//i.test(job.url) && <a href={job.url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--primary)', fontSize: 12 }}>{t('application.openEmployer')}</a>}
+              {(!currentPackAudited || task || applicationRecordBlocked || taskReadState !== 'ready') && job.url && /^https?:\/\//i.test(job.url) && <a href={job.url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--primary)', fontSize: 12 }}>{t('application.openEmployer')}</a>}
               {!task && <><p style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{t(taskReadState === 'ready' ? 'application.noLinkedTaskHint' : 'application.taskLinkUnknownHint')}</p><Btn variant="ghost" small onClick={() => navigate('agent')}>{t('application.openAgent')}</Btn></>}
               {manualWorkAllowed && taskReadState === 'ready' && !applicationRecordBlocked && !manualRecordLock && <Btn variant="ghost" small disabled={recordingSubmission} onClick={() => void recordManualSubmission()}>{t('application.recordManual')}</Btn>}
               {manualStorageUnavailable && <p role="status">{t('application.manualStorageUnavailable')}</p>}
-              {manualRecordLock && (manualRecordLock !== 'confirmed' || !applicationRecorded) && <div role="status">
+              {manualRejection && <div role="status">
+                <p>{t(manualRejection === 'limit' ? 'application.manualLimitRejected' : 'application.manualPlanRejected')}</p>
+                <p>{t('application.manualRejectedRefreshHint')}</p>{manualRecordNotice && <p>{t('application.manualRejectedRefreshFailed')}</p>}<Btn variant="ghost" small disabled={manualRecordRefreshing} onClick={() => { if (drawerUserId) void refreshAfterManualRejection(drawerUserId) }}>{t('application.refreshStatus')}</Btn>
+              </div>}
+              {manualRecordLock && !manualRejection && (manualRecordLock !== 'confirmed' || !applicationRecorded) && <div role="status">
                 <p>{t(manualRecordLock === 'confirmed' ? 'application.manualStatusConfirmed' : 'application.manualStatusPending')}</p>
                 {manualVisibleRecord && <p>{t('application.manualVisibleRecord')}</p>}
                 {manualRecordNotice && <p>{t('application.manualStatusStillUnknown')}</p>}

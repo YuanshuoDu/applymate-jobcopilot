@@ -139,7 +139,7 @@ function audit(resumeUpdatedAt = time) {
   return record as typeof record & { coverLetterUpdatedAt?: string }
 }
 
-async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unknown' | 'waiting_for_user' | 'waiting_for_authorization' | 'cancelled' | 'failed' | 'filling'; recordedInitially?: boolean; evidenceCase?: 'bound' | 'unbound' | 'unavailable'; previewMismatch?: 'owner' | 'id' | 'job'; malformedPreview?: 'content' | 'contact'; letterRaceProbe?: boolean; letterInvalid?: 'null' | 'owner' | 'job' | 'duplicate' | 'content'; letterAfterInitial?: 'changed' | 'failure' | 'hold' | 'manual-change' | 'audit-same' | 'audit-failure' | 'audit-hold'; auditVersion?: 'same' | 'resume-changed' | 'letter-changed' | 'resume-missing' | 'letter-missing'; holdAudit?: boolean; holdAssign?: boolean; externalLetterSelection?: boolean; failTailoredRead?: boolean; taskFailure?: boolean; missing?: boolean; holdSelectedLetter?: boolean; selectedLetter?: boolean; firstPreparation?: boolean; descriptionMode?: 'success' | 'unknown' | 'audit' | 'two' | 'conflict' | 'hold-response' | 'hold-other'; initialDescription?: string | null; holdBaseSave?: boolean; failBaseSave?: boolean; baseList?: 'empty' | 'fail-once' | 'fail-once-hold' | 'hold-empty' | 'multiple' | 'single' | 'default'; failFirstAudit?: boolean; flowSave?: boolean; manualOutcome?: 'get-fails' | 'unknown'; search?: boolean; saveMode?: 'fail' | 'hold-success' | 'hold-fail'; twoResumes?: boolean; holdResumeContent?: boolean; snapshotResumeContent?: boolean; resumeRevalidationFails?: boolean; versionedScore?: boolean; holdOldAnalysis?: boolean; holdFirstAnalysisOnly?: boolean; auditCorrection?: boolean; holdAuditCorrection?: boolean; versions?: boolean; holdVersionRestore?: boolean; versionRestoreFails?: boolean; realAgent?: boolean; expiredApproval?: boolean; twoJobQuestions?: boolean; holdFirstTaskRead?: boolean; holdReturnOwnerA?: boolean; taskPerUser?: boolean; dashboardFourTasks?: boolean; agentJourney?: boolean } = {}) {
+async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unknown' | 'waiting_for_user' | 'waiting_for_authorization' | 'cancelled' | 'failed' | 'filling'; recordedInitially?: boolean; evidenceCase?: 'bound' | 'unbound' | 'unavailable'; previewMismatch?: 'owner' | 'id' | 'job'; malformedPreview?: 'content' | 'contact'; letterRaceProbe?: boolean; letterInvalid?: 'null' | 'owner' | 'job' | 'duplicate' | 'content'; letterAfterInitial?: 'changed' | 'failure' | 'hold' | 'manual-change' | 'audit-same' | 'audit-failure' | 'audit-hold'; auditVersion?: 'same' | 'resume-changed' | 'letter-changed' | 'resume-missing' | 'letter-missing'; holdAudit?: boolean; holdAssign?: boolean; externalLetterSelection?: boolean; failTailoredRead?: boolean; taskFailure?: boolean; taskLimited?: boolean; missing?: boolean; holdSelectedLetter?: boolean; selectedLetter?: boolean; firstPreparation?: boolean; descriptionMode?: 'success' | 'unknown' | 'audit' | 'two' | 'conflict' | 'hold-response' | 'hold-other'; initialDescription?: string | null; holdBaseSave?: boolean; failBaseSave?: boolean; baseList?: 'empty' | 'fail-once' | 'fail-once-hold' | 'hold-empty' | 'multiple' | 'single' | 'default'; failFirstAudit?: boolean; flowSave?: boolean; manualOutcome?: 'get-fails' | 'unknown'; search?: boolean; saveMode?: 'fail' | 'hold-success' | 'hold-fail'; twoResumes?: boolean; holdResumeContent?: boolean; snapshotResumeContent?: boolean; resumeRevalidationFails?: boolean; versionedScore?: boolean; holdOldAnalysis?: boolean; holdFirstAnalysisOnly?: boolean; auditCorrection?: boolean; holdAuditCorrection?: boolean; versions?: boolean; holdVersionRestore?: boolean; versionRestoreFails?: boolean; realAgent?: boolean; expiredApproval?: boolean; twoJobQuestions?: boolean; holdFirstTaskRead?: boolean; holdReturnOwnerA?: boolean; taskPerUser?: boolean; dashboardFourTasks?: boolean; agentJourney?: boolean } = {}) {
   let releaseReturnOwnerA = () => {}
   const returnOwnerAGate = new Promise<void>(resolve => { releaseReturnOwnerA = resolve })
   let releaseStaleJob = () => {}
@@ -338,6 +338,7 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
     if (pathname === '/api/agent/application-tasks') {
       state.taskReads++
       if (options.taskFailure) return json(route, { error: 'Fixture unavailable' }, 500)
+      if (options.taskLimited) return json(route, { tasks: Array.from({ length: 100 }, (_, i) => ({ id: `task-${i}`, userId: 'fixture-user', jobId: `other-job-${i}`, sessionId: `session-${i}`, status: 'filling', checkpoint: null, updatedAt: time, job: { company: 'Other employer', role: 'Other role' } })) })
       if (options.twoJobQuestions) return json(route, { tasks: [{ id: 'task-a', userId: 'fixture-user', jobId: 'outside-page', sessionId: 'session-a', status: state.answeredJobA ? 'filling' : 'waiting_for_user', checkpoint: state.answeredJobA ? null : 'form_answer_required', updatedAt: time, job: { company: 'Fixture Employer', role: 'Application flow engineer' } }, { id: 'task-b', userId: 'fixture-user', jobId: 'job-2', sessionId: 'session-b', status: 'waiting_for_user', checkpoint: 'form_answer_required', updatedAt: time, job: { company: 'Employer B', role: 'Role B' } }] })
       if (options.dashboardFourTasks) return json(route, { tasks: [1, 2, 3, 4].map(n => ({ id: `task-${n}`, userId: 'fixture-user', jobId: `job-${n}`, sessionId: `session-${n}`, status: 'waiting_for_user', checkpoint: 'form_answer_required', updatedAt: `2026-10-30T1${4 - n}:00:00.000Z`, job: { company: `Employer ${n}`, role: `Role ${n}` } })) })
       if (options.taskPerUser && state.activeUserId === 'fixture-b') return json(route, { tasks: [{ id: 'task-b', userId: 'fixture-b', jobId: 'job-b', sessionId: 'session-b', status: 'waiting_for_authorization', checkpoint: 'form_filled', updatedAt: time, job: { company: 'Fixture B', role: 'Engineer B' } }] })
@@ -927,6 +928,25 @@ test('unavailable task status explains uncertainty and offers a read-only refres
   expect(state.agentRequests.filter(item => item.method === 'POST')).toEqual([])
   expect(state.unexpected).toEqual([])
 })
+
+for (const taskStatus of ['unavailable', 'limited'] as const) {
+  test(`audited manual application keeps employer link when task status is ${taskStatus}`, async ({ page }) => {
+    const state = await install(page, taskStatus === 'unavailable' ? { taskFailure: true } : { taskLimited: true })
+    await open(page)
+    const drawer = page.getByRole('dialog')
+    await expect(drawer.getByRole('button', { name: /Download application materials|下载申请材料/ })).toBeVisible()
+    await expect(drawer.getByText(taskStatus === 'unavailable' ? /The latest task status is not available yet|暂时无法确认最新任务状态/ : /Showing recent application tasks, up to 100|显示最近最多100个申请任务/).first()).toBeVisible()
+    const employer = drawer.getByRole('link', { name: /Open employer website|前往雇主网站/, exact: true })
+    await expect(employer).toHaveAttribute('href', 'https://employer.invalid/apply')
+    const popupPromise = page.waitForEvent('popup')
+    await employer.click()
+    await expect((await popupPromise).getByRole('heading', { name: 'Mock employer application' })).toBeVisible()
+    await expect(drawer.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ })).toHaveCount(0)
+    expect(state.writes).toEqual([])
+    expect(state.agentRequests.filter(item => item.method === 'POST')).toEqual([])
+    expect(state.unexpected).toEqual([])
+  })
+}
 
 test('unavailable task state does not expose a new preparation action', async ({ page }) => {
   const state = await install(page, { taskFailure: true })
@@ -3660,5 +3680,86 @@ test('mobile keyboard can reach and activate explicit resume analysis', async ({
   await page.keyboard.press('Enter')
   await expect.poll(() => state.analysisRequests.slice().sort()).toEqual(['/api/ai/score', '/api/ai/suggest'])
   expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+for (const denial of ['limit', 'plan'] as const) {
+  test(`manual record ${denial} rejection explains the limit and requires a fresh check`, async ({ page }) => {
+    const state = await install(page)
+    let posts = 0
+    await page.route('**/api/jobs/outside-page/apply', async route => {
+      posts += 1
+      if (posts === 1) return route.fulfill({ status: 403, json: {
+        code: denial === 'limit' ? 'MANUAL_APPLICATION_LIMIT_REACHED' : 'MANUAL_APPLICATION_PLAN_RESTRICTED',
+        requestId: route.request().headers()['x-manual-record-request-id'],
+      } })
+      Object.assign(state.job, { status: 'applied', workflowState: 'submitted', appliedAt: time })
+      return route.fulfill({ status: 200, json: { applied: true } })
+    })
+    await open(page)
+    const record = page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ })
+    await record.click()
+    await expect(page.getByText(denial === 'limit' ? /record was not saved because your monthly application limit|本次记录未保存，因为本月申请额度已用完/ : /record was not saved because manual applications are unavailable|本次记录未保存，因为当前套餐暂不可使用手动申请/)).toBeVisible()
+    await expect(record).toHaveCount(0)
+    expect(posts).toBe(1)
+    await open(page)
+    await expect(page.getByText(denial === 'limit' ? /record was not saved because your monthly application limit|本次记录未保存，因为本月申请额度已用完/ : /record was not saved because manual applications are unavailable|本次记录未保存，因为当前套餐暂不可使用手动申请/)).toBeVisible()
+    await expect(record).toHaveCount(0)
+    await page.getByRole('button', { name: /Refresh status|刷新状态/ }).last().click()
+    await expect(record).toBeVisible()
+    expect(posts).toBe(1)
+    await open(page)
+    await expect(record).toHaveCount(0)
+    await page.getByRole('button', { name: /Refresh status|刷新状态/ }).last().click()
+    await expect(record).toBeVisible()
+    await record.click()
+    await expect.poll(() => posts).toBe(2)
+    await expect(page.getByRole('list', { name: /Application progress|申请进度/ }).locator('li').filter({ hasText: /Submission record|提交记录/ })).toContainText(/Recorded|已有记录/)
+    expect(state.unexpected).toEqual([])
+  })
+}
+
+test('an unverified quota response never releases an uncertain manual record', async ({ page }) => {
+  const state = await install(page)
+  let posts = 0
+  await page.route('**/api/jobs/outside-page/apply', async route => {
+    posts += 1
+    return route.fulfill({ status: 403, json: { code: 'MANUAL_APPLICATION_LIMIT_REACHED', requestId: 'other-request' } })
+  })
+  await open(page)
+  await page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ }).click()
+  await expect(page.getByRole('button', { name: /Refresh record status|刷新记录状态/ })).toBeVisible()
+  await expect(page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ })).toHaveCount(0)
+  expect(await page.evaluate(() => sessionStorage.getItem('applymate:manual-record:fixture-user:outside-page'))).toBe('unknown')
+  expect(posts).toBe(1)
+  expect(state.unexpected).toEqual([])
+})
+
+test('a rejected manual record stays blocked when refresh fails or finds a later record', async ({ page }) => {
+  const state = await install(page)
+  let posts = 0
+  let failRead = false
+  await page.route('**/api/jobs/outside-page/apply', async route => {
+    posts += 1
+    return route.fulfill({ status: 403, json: { code: 'MANUAL_APPLICATION_LIMIT_REACHED', requestId: route.request().headers()['x-manual-record-request-id'] } })
+  })
+  await page.route('**/api/jobs/outside-page', async route => {
+    if (route.request().method() === 'GET' && failRead) return route.fulfill({ status: 500, json: { error: 'unavailable' } })
+    return route.fallback()
+  })
+  await open(page)
+  const record = page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ })
+  await record.click()
+  await expect(record).toHaveCount(0)
+  failRead = true
+  await page.getByRole('button', { name: /Refresh status|刷新状态/ }).last().click()
+  await expect(page.getByText(/Could not refresh the application|无法刷新申请/)).toBeVisible()
+  await expect(record).toHaveCount(0)
+  failRead = false
+  Object.assign(state.job, { status: 'applied', workflowState: 'submitted', appliedAt: time })
+  await page.getByRole('button', { name: /Refresh status|刷新状态/ }).last().click()
+  await expect(page.getByRole('list', { name: /Application progress|申请进度/ }).locator('li').filter({ hasText: /Submission record|提交记录/ })).toContainText(/Recorded|已有记录/)
+  await expect(record).toHaveCount(0)
+  expect(posts).toBe(1)
   expect(state.unexpected).toEqual([])
 })

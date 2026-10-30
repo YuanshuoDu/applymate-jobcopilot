@@ -1,6 +1,6 @@
 import type { Job } from '@/lib/types'
 
-export type ManualRecordLock = 'pending' | 'confirmed' | 'unknown'
+export type ManualRecordLock = 'pending' | 'confirmed' | 'unknown' | 'rejected-limit' | 'rejected-plan'
 
 type ManualRecordEvidence = Pick<Job, 'status' | 'workflowState' | 'appliedAt'>
 
@@ -23,9 +23,42 @@ function key(userId: string, jobId: string): string {
 export function readManualRecordLock(storage: Storage, userId: string, jobId: string): ManualRecordLock | null {
   try {
     const value = storage.getItem(key(userId, jobId))
-    if (value === 'pending' || value === 'confirmed' || value === 'unknown') return value
+    if (value === 'pending' || value === 'confirmed' || value === 'unknown' || value === 'rejected-limit' || value === 'rejected-plan') return value
     // Unexpected persisted state cannot prove that a previous write was absent.
     return value === null ? null : 'unknown'
+  } catch { return 'unknown' }
+}
+
+/** Only a verified rejection of the currently pending request can release it. */
+export function rejectPendingManualRecord(storage: Storage, userId: string, jobId: string, reason: 'limit' | 'plan'): boolean {
+  if (!userId || !jobId) return false
+  try {
+    const recordKey = key(userId, jobId)
+    if (storage.getItem(recordKey) !== 'pending') return false
+    storage.setItem(recordKey, `rejected-${reason}`)
+    return storage.getItem(recordKey) === `rejected-${reason}`
+  } catch { return false }
+}
+
+export type ManualRecordOutcome = 'confirmed' | 'unknown' | 'limit' | 'plan'
+
+/** A rejection is definitive only when the endpoint echoes this request's ID. */
+export async function submitManualRecord(jobId: string, requestId: string): Promise<ManualRecordOutcome> {
+  try {
+    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/apply`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': requestId, 'X-Manual-Record-Request-Id': requestId },
+      body: '{}',
+    })
+    const body: unknown = await response.json()
+    if (!body || typeof body !== 'object') return 'unknown'
+    const result = body as { applied?: unknown; code?: unknown; requestId?: unknown }
+    if (response.ok && result.applied === true) return 'confirmed'
+    if (response.status === 403 && result.requestId === requestId) {
+      if (result.code === 'MANUAL_APPLICATION_LIMIT_REACHED') return 'limit'
+      if (result.code === 'MANUAL_APPLICATION_PLAN_RESTRICTED') return 'plan'
+    }
+    return 'unknown'
   } catch { return 'unknown' }
 }
 
