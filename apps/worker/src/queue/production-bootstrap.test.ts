@@ -241,6 +241,11 @@ function durableCompositionPool(input: {
       state.calls.push(sql)
       const statement = sql.trim()
       if (statement === "BEGIN" || statement === "COMMIT" || statement === "ROLLBACK" || sql.includes("set_config")) return response<T>([], 1)
+      if (sql.includes('SELECT clock_timestamp() AS "checkedAt"')) return response<T>([{ checkedAt: input.now }], 1)
+      if (sql.includes('MIN(COALESCE(wait."nextReconcileAt", wait."suspendedAt"))')) {
+        // The durable composition fixture owns a root wait; it has no nested child wait for this scanner.
+        return response<T>([])
+      }
 
       if (sql.includes('SELECT session."userId"')) {
         const owned = String(params[0]) === state.session.id && String(params[1]) === state.turn.id
