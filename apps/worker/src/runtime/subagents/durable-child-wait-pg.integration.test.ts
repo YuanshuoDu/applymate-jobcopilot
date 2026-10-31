@@ -11,6 +11,7 @@ import { defaultSubagentPolicy } from "./types.js"
 import { subagentDispatchJobId } from "./dispatch-identity.js"
 import { CHILD_WAIT_RESUMABLE_SQL } from "../../queue/subagent-dispatch-eligibility.js"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
+import { projectWaitCallEventContent } from "../turns/turn-execution-wait-event-projection.js"
 import { executionOwnerFence } from "../execution-owner.js"
 import { registerDurableSubagentWait } from "./durable-subagent-wait-store.js"
 import { reconcileDurableSubagentWaits } from "./durable-subagent-wait-resolver.js"
@@ -53,6 +54,12 @@ const SOURCE_LIFECYCLE_CRASH_STAGES = [
 ] as const
 const fixturePath = fileURLToPath(new URL("./durable-child-wait-process-restart.fixture.mjs", import.meta.url))
 const workerCwd = fileURLToPath(new URL("../../..", import.meta.url))
+const WORKER_F_CLAIM_PROOF_SQL = `SELECT COUNT(*)::int AS "candidateCount",
+       COUNT(*) FILTER (WHERE ${CHILD_WAIT_CLAIM_RECOVERY_SQL})::int AS "matchedCount"
+     FROM (SELECT started.* FROM "agent_events" AS started
+       WHERE started."sessionId" = $1 AND started."turnId" = $3 AND started."taskId" = $2
+         AND started."type" = 'tool_call.started' AND started."correlationId" = $13 AND $9::text IS NULL
+       ORDER BY started."sequence" DESC LIMIT 2) AS started`
 
 function safeProjectedWaitKey(input: { taskIds: readonly string[]; mode: "any" | "all"; timeoutMs: number; idempotencyKey: string }): string {
   const projected = asObject(safeSubagentWaitJson(input, 1_024))
@@ -85,6 +92,17 @@ function disposableRedisUrl(): string | null {
 const databaseUrl = disposableDatabaseUrl()
 const redisUrl = disposableRedisUrl()
 const withServices = databaseUrl && redisUrl && process.env.RUN_AGENT_TURN_REDIS_INTEGRATION === "1" ? describe : describe.skip
+
+describe("worker restart blocker proof diagnostic bindings", () => {
+  it("binds the recovered-source predicate and exact call identity through $13", () => {
+    expectSqlBindings(WORKER_F_CLAIM_PROOF_SQL, 13)
+  })
+})
+
+function expectSqlBindings(sql: string, parameterCount: number): void {
+  const indices = [...new Set(Array.from(sql.matchAll(/\$(\d+)/g), match => Number(match[1])))].sort((a, b) => a - b)
+  expect(indices).toEqual(Array.from({ length: parameterCount }, (_, index) => index + 1))
+}
 type FixtureIds = { userId: string; sessionId: string; turnId: string; rootTaskId: string; waiterTaskId: string; targetTaskId: string;
   finalText?: string; loopCallPrefix?: string; recoveryTargetPageRank?: number; recoveryCandidateCount?: number;
   recoveryFixtureBlockerCount?: number; recoveryCandidateObservedAt?: string;
@@ -344,15 +362,13 @@ async function diagnoseWorkerFBlocker(
 async function diagnoseWorkerFClaimProof(
   client: PoolClient, task: BlockingTaskSnapshot, continuationStepId: string, sourceCallId: string, claimCallId: string,
 ): Promise<Record<string, unknown>> {
-  const proof = await client.query<{ candidateCount: number; matchedCount: number }>(
-    `SELECT COUNT(*)::int AS "candidateCount",
-       COUNT(*) FILTER (WHERE ${CHILD_WAIT_CLAIM_RECOVERY_SQL})::int AS "matchedCount"
-     FROM (SELECT started.* FROM "agent_events" AS started
-       WHERE started."sessionId" = $1 AND started."turnId" = $3 AND started."taskId" = $2
-         AND started."type" = 'tool_call.started' AND started."correlationId" = $11 AND $9::text IS NULL
-       ORDER BY started."sequence" DESC LIMIT 2) AS started`,
+  const projectedSourceContent = projectWaitCallEventContent({ toolName: "wait_subagents", toolCallId: sourceCallId })
+  const projectedSourceCallId = projectedSourceContent && typeof projectedSourceContent === "object" && !Array.isArray(projectedSourceContent)
+    ? (projectedSourceContent as Record<string, unknown>).toolCallId : null
+  const proof = await client.query<{ candidateCount: number; matchedCount: number }>(WORKER_F_CLAIM_PROOF_SQL,
     [task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount,
-      task.leaseExpiresAt, task.userId, null, continuationStepId, claimCallId],
+      task.leaseExpiresAt, task.userId, null, continuationStepId, sourceCallId,
+      typeof projectedSourceCallId === "string" ? projectedSourceCallId : null, claimCallId],
   )
   const waits = await client.query<{ id: string; stepId: string; sourceAttempt: number; continuationAttempt: number;
     status: string; deadlineAt: Date; idempotencyKey: string; mode: string; targetTaskIds: unknown; matchedTaskIds: unknown; result: unknown }>(
@@ -1066,6 +1082,15 @@ async function expectCompletedClaimBeforeItemEventSafety(
       client, snapshot as unknown as Record<string, unknown>, undefined, continuationStepId,
     )
     expect(await blocking(task), "exact completed/rev1 claim with its sole causal start and no item.completed should be recoverable").toBe(false)
+    const canonicalSourceContent = projectWaitCallEventContent({ toolName: "wait_subagents", toolCallId: PHONE_SHAPED_WAIT_TOOL_CALL_ID }) as Record<string, unknown>
+    const sourceCompletionEvent = await client.query<{ toolCallId: string }>(
+      `SELECT "payload"->'content'->>'toolCallId' AS "toolCallId" FROM "agent_events"
+       WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "itemId" = $4
+         AND "type" = 'item.completed' AND "idempotencyKey" = $5`,
+      [ids.sessionId, ids.turnId, ids.waiterTaskId, sourceCallItemId,
+        `task:${ids.waiterTaskId}:event:tool-call-completed:${PHONE_SHAPED_WAIT_TOOL_CALL_ID}:${sourceCallItemId}:1`],
+    )
+    expect(sourceCompletionEvent.rows).toEqual([{ toolCallId: canonicalSourceContent.toolCallId }])
 
     let savepoint = 0
     const remainsBlocked = async (label: string, mutate: () => Promise<void>, snapshot: BlockingTaskSnapshot = task): Promise<void> => {
@@ -1115,11 +1140,11 @@ async function expectCompletedClaimBeforeItemEventSafety(
         [sourceCallItemId, sourceTimeout === 1 ? 2 : sourceTimeout - 1, ids.sessionId, ids.turnId, ids.waiterTaskId])
       expect(changed.rowCount).toBe(1)
     })
-    await remainsBlocked("recovered source completion event toolCallId must equal the source call", async () => {
+    await remainsBlocked("recovered source completion event must equal the canonical safe source-call ID", async () => {
       const changed = await client.query(`UPDATE "agent_events" SET "payload" = jsonb_set("payload", '{content,toolCallId}', to_jsonb($2::text), false)
         WHERE "sessionId" = $3 AND "turnId" = $4 AND "taskId" = $5 AND "itemId" = $1
           AND "type" = 'item.completed' AND "idempotencyKey" = $6`,
-        [sourceCallItemId, `${PHONE_SHAPED_WAIT_TOOL_CALL_ID}:tampered`, ids.sessionId, ids.turnId, ids.waiterTaskId,
+        [sourceCallItemId, PHONE_SHAPED_WAIT_TOOL_CALL_ID, ids.sessionId, ids.turnId, ids.waiterTaskId,
           `task:${ids.waiterTaskId}:event:tool-call-completed:${PHONE_SHAPED_WAIT_TOOL_CALL_ID}:${sourceCallItemId}:1`])
       expect(changed.rowCount).toBe(1)
     })

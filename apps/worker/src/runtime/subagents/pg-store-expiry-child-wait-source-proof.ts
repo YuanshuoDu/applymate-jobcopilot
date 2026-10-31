@@ -1,3 +1,39 @@
+import type pg from "pg"
+import { projectWaitCallEventContent } from "../turns/turn-execution-wait-event-projection.js"
+
+/** Reads only the latest, current-owner continuation's one completed source wait call. */
+export const CHILD_WAIT_SOURCE_CALL_PROJECTION_SQL = `WITH latest_wait AS MATERIALIZED (SELECT wait."id", wait."stepId", wait."status", wait."suspendedAt", wait."consumedAt", wait."result" FROM "agent_wait_conditions" AS wait
+  JOIN "agent_steps" AS latestStep ON latestStep."id" = wait."stepId" AND latestStep."sessionId" = wait."sessionId" AND latestStep."turnId" = wait."turnId" AND latestStep."taskId" = wait."parentTaskId"
+  WHERE wait."parentTaskId" = $2 AND wait."sessionId" = $1 AND wait."turnId" = $3 AND latestStep."attempt" BETWEEN 1 AND $6
+  ORDER BY latestStep."attempt" DESC, latestStep."ordinal" DESC, wait."createdAt" DESC, wait."id" DESC LIMIT 1
+)
+SELECT sourceCall."content"->>'toolCallId' AS "toolCallId" FROM "sub_agent_tasks" AS owner
+JOIN "agent_sessions" AS session ON session."id" = owner."sessionId" AND session."userId" = $8 JOIN "agent_turns" AS turn ON turn."id" = owner."turnId" AND turn."sessionId" = owner."sessionId" AND turn."userId" = session."userId" AND turn."rootTaskId" = owner."rootTaskId"
+JOIN latest_wait AS wait ON TRUE JOIN "agent_steps" AS source ON source."id" = wait."stepId" AND source."sessionId" = wait."sessionId" AND source."turnId" = wait."turnId" AND source."taskId" = owner."id"
+JOIN "agent_steps" AS continuation ON continuation."id" = $9 AND continuation."sessionId" = source."sessionId" AND continuation."turnId" = source."turnId" AND continuation."taskId" = source."taskId" AND continuation."attempt" = $6
+JOIN "agent_items" AS sourceCall ON sourceCall."sessionId" = source."sessionId" AND sourceCall."turnId" = source."turnId" AND sourceCall."taskId" = source."taskId" AND sourceCall."stepId" = source."id" AND sourceCall."type" = 'tool_call'
+WHERE owner."id" = $2 AND owner."sessionId" = $1 AND owner."turnId" = $3 AND owner."rootTaskId" = $4 AND owner."status" = 'running' AND owner."parentTaskId" IS NOT NULL AND owner."leaseOwner" = $5 AND owner."attemptCount" = $6 AND owner."leaseExpiresAt" = $7 AND owner."interruptRequestedAt" IS NULL
+  AND wait."status" IN ('ready', 'timed_out') AND wait."suspendedAt" IS NOT NULL AND wait."consumedAt" IS NOT NULL AND jsonb_typeof(wait."result"->'sourceLifecycleRecovery') = 'object' AND source."attempt" BETWEEN 1 AND $6 AND source."status" IN ('waiting_for_tool', 'completed') AND continuation."status" = 'streaming'
+  AND continuation."ordinal" = (SELECT MIN(later."ordinal") FROM "agent_steps" AS later WHERE later."sessionId" = source."sessionId" AND later."turnId" = source."turnId" AND later."taskId" = source."taskId" AND later."attempt" = $6 AND later."ordinal" > source."ordinal") AND continuation."ordinal" = (SELECT MAX(current."ordinal") FROM "agent_steps" AS current WHERE current."sessionId" = owner."sessionId" AND current."turnId" = owner."turnId" AND current."taskId" = owner."id" AND current."attempt" = $6)
+  AND sourceCall."status" = 'completed' AND sourceCall."revision" = 1 AND sourceCall."content"->>'toolName' = 'wait_subagents' AND sourceCall."content"->>'toolVersion' = '1' AND char_length(sourceCall."content"->>'toolCallId') BETWEEN 1 AND 256 AND btrim(sourceCall."content"->>'toolCallId') = sourceCall."content"->>'toolCallId'
+  AND (SELECT COUNT(*) FROM "agent_items" AS sourceCallCandidate WHERE sourceCallCandidate."sessionId" = source."sessionId" AND sourceCallCandidate."turnId" = source."turnId" AND sourceCallCandidate."taskId" = source."taskId" AND sourceCallCandidate."stepId" = source."id" AND sourceCallCandidate."type" = 'tool_call' AND sourceCallCandidate."content"->>'toolName' = 'wait_subagents') = 1
+LIMIT 2`
+
+export type ChildWaitSourceCallProjection = Readonly<{ rawCallId: string; projectedCallId: string }>
+
+export async function readChildWaitSourceCallProjection(client: pg.PoolClient, task: Record<string, unknown>, continuationId: string): Promise<ChildWaitSourceCallProjection | null> {
+  const rows = await client.query<{ toolCallId: string | null }>(CHILD_WAIT_SOURCE_CALL_PROJECTION_SQL, [
+    task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount,
+    task.leaseExpiresAt, task.userId, continuationId,
+  ])
+  const rawCallId = rows.rows.length === 1 ? rows.rows[0]?.toolCallId : null
+  if (typeof rawCallId !== "string" || rawCallId.length < 1 || rawCallId.length > 256 || rawCallId.trim() !== rawCallId) return null
+  const projected = projectWaitCallEventContent({ toolName: "wait_subagents", toolCallId: rawCallId })
+  if (projected === null || typeof projected !== "object" || Array.isArray(projected)) return null
+  const projectedCallId = (projected as Record<string, unknown>).toolCallId
+  return typeof projectedCallId === "string" ? { rawCallId, projectedCallId } : null
+}
+
 /** Exact crash cut for a registered source wait whose executor never returned. */
 export const CHILD_WAIT_SOURCE_STARTED_NO_RESULT_SQL = `(
   sourceCall."status" = 'started'
@@ -80,6 +116,7 @@ export const CHILD_WAIT_SOURCE_STARTED_NO_RESULT_SQL = `(
 export const CHILD_WAIT_SOURCE_RECOVERED_RESULT_SQL = `(
   sourceCall."status" = 'completed' AND sourceCall."revision" = 1 AND sourceCall."phase" IS NULL
   AND sourceResult."status" = 'completed' AND sourceResult."revision" = 1 AND sourceResult."phase" IS NULL
+  AND $11::text IS NOT NULL AND $12::text IS NOT NULL AND sourceCall."content"->>'toolCallId' = $11::text
   AND sourceCall."id" = 'task:' || owner."id" || ':item:tool-call:' || (sourceCall."content"->>'toolCallId') || ':attempt:' || source."attempt"::text
   AND char_length(sourceCall."content"->>'toolCallId') BETWEEN 1 AND 256
   AND btrim(sourceCall."content"->>'toolCallId') = sourceCall."content"->>'toolCallId'
@@ -177,8 +214,7 @@ export const CHILD_WAIT_SOURCE_RECOVERED_RESULT_SQL = `(
           AND sourceCallCompleted."payload"->'content'->>'toolName' = 'wait_subagents'
           AND sourceCallCompleted."payload"->'content'->>'toolVersion' = '1'
           AND sourceCallCompleted."payload"->'content'->>'status' = 'completed'
-          AND jsonb_typeof(sourceCallCompleted."payload"->'content'->'toolCallId') = 'string'
-          AND sourceCallCompleted."payload"->'content'->>'toolCallId' = sourceCall."content"->>'toolCallId'
+          AND jsonb_typeof(sourceCallCompleted."payload"->'content'->'toolCallId') = 'string' AND sourceCallCompleted."payload"->'content'->>'toolCallId' = $12::text
           AND sourceCallCompleted."payload"->'content'->'errorCode' = 'null'::jsonb
           AND sourceCallCompleted."payload"->'content'->'input' = jsonb_build_object('idempotencyKey', '[REDACTED]',
             'taskIds', (SELECT jsonb_agg(to_jsonb('[REDACTED]'::text) ORDER BY ordinal)

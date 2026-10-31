@@ -74,10 +74,12 @@ describe("expired recovery SQL predicates", () => {
     const query = vi.fn().mockResolvedValue({ rows: [{ id: "unsettled-start" }] })
     const client = { query }
     await expect(hasBlockingExternalCall(client as never, task, "ignored-event", "continuation-1")).resolves.toBe(true)
-    expect(query).toHaveBeenCalledTimes(1)
-    const [sql, values] = query.mock.calls[0] as [string, unknown[]]
+    expect(query).toHaveBeenCalledTimes(2)
+    const [sql, values] = query.mock.calls[1] as [string, unknown[]]
     expect(values).toEqual([task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount,
-      task.leaseExpiresAt, task.userId, "ignored-event", "continuation-1"])
+      task.leaseExpiresAt, task.userId, "ignored-event", "continuation-1", null, null])
+    expectSqlBindings(sql, values)
+    expectSqlBindings(query.mock.calls[0]![0] as string, query.mock.calls[0]![1] as unknown[])
     expect(sql).toContain('started."sessionId" = $1 AND started."taskId" = $2')
     expect(sql).toContain('settled."correlationId" = started."correlationId"')
     expect(sql).toContain('settled."type" IN (\'tool_call.completed\', \'tool_call.failed\', \'tool_call.interrupted\')')
@@ -92,14 +94,19 @@ describe("expired recovery SQL predicates", () => {
 
   it("only allows the exact consumed-wait continuation claim through expiry recovery", async () => {
     const deadline = new Date("2026-10-06T10:00:00.000Z")
-    const query = vi.fn().mockResolvedValue({ rows: [{ id: "claim-start", claimWaitId: "wait-1", waitDeadlineAt: deadline, outcomeDeadlineAt: deadline.toISOString(),
-      sourceWaitKey: "child-wait:415-555-0134:attempt:1", continuationWaitKey: "child-wait:[REDACTED_PHONE]:attempt:1" }] })
+    const query = vi.fn()
+      .mockResolvedValueOnce({ rows: [{ toolCallId: "child-wait-call:415-555-0134" }] })
+      .mockResolvedValueOnce({ rows: [{ id: "claim-start", claimWaitId: "wait-1", waitDeadlineAt: deadline, outcomeDeadlineAt: deadline.toISOString(),
+        sourceWaitKey: "child-wait:415-555-0134:attempt:1", continuationWaitKey: "child-wait:[REDACTED_PHONE]:attempt:1" }] })
     const client = { query }
     await expect(hasBlockingExternalCall(client as never, task, undefined, "continuation-1")).resolves.toBe(false)
-    expect(query).toHaveBeenCalledTimes(1)
-    const [sql, values] = query.mock.calls[0] as [string, unknown[]]
+    expect(query).toHaveBeenCalledTimes(2)
+    const [sql, values] = query.mock.calls[1] as [string, unknown[]]
     expect(values).toEqual([task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount,
-      task.leaseExpiresAt, task.userId, null, "continuation-1"])
+      task.leaseExpiresAt, task.userId, null, "continuation-1", "child-wait-call:415-555-0134", "child-wait-call:[REDACTED_PHONE]"])
+    expectSqlBindings(sql, values)
+    expectSqlBindings(query.mock.calls[0]![0] as string, query.mock.calls[0]![1] as unknown[])
+    expect(CHILD_WAIT_CLAIM_RECOVERY_SQL).toContain("$11::text IS NOT NULL AND $12::text IS NOT NULL")
     expect(sql).toContain('LEFT JOIN LATERAL (SELECT latest_wait."id" AS "waitId"')
     expect(sql).toContain('FROM latest_wait WHERE started."type" = \'tool_call.started\' AND $10::text IS NOT NULL AND EXISTS (')
     expect(sql).toContain("started.\"idempotencyKey\" = 'task:' || owner.\"id\" || ':event:child-wait-claim:' || owner.\"attemptCount\"::text || ':' || continuation.\"id\"")
@@ -165,7 +172,7 @@ describe("expired recovery SQL predicates", () => {
     const query = vi.fn().mockResolvedValue({ rows: [{ id: "claim-start", claimWaitId: "wait-1",
       waitDeadlineAt: new Date("2026-10-06T10:00:00.000Z"), outcomeDeadlineAt: "2026-10-06T10:00:01.000Z" }] })
     await expect(hasBlockingExternalCall({ query } as never, task, undefined, "continuation-1")).resolves.toBe(true)
-    expect(query).toHaveBeenCalledTimes(1)
+    expect(query).toHaveBeenCalledTimes(2)
   })
 
   it("blocks a scoped claim when its continuation key is not the exact safe source-key projection", async () => {
@@ -209,3 +216,8 @@ describe("expired recovery SQL predicates", () => {
     await expect(hasBlockingExternalCall(client as never, task)).resolves.toBe(false)
   })
 })
+
+function expectSqlBindings(sql: string, values: readonly unknown[]): void {
+  const indices = [...new Set(Array.from(sql.matchAll(/\$(\d+)/g), match => Number(match[1])))].sort((a, b) => a - b)
+  expect(indices).toEqual(Array.from({ length: values.length }, (_, index) => index + 1))
+}

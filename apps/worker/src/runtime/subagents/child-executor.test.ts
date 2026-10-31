@@ -18,6 +18,7 @@ import type { RuntimeToolDefinition } from "../tools/types.js"
 import { executionOwnerFence } from "../execution-owner.js"
 import type { CoordinationMailboxMessage } from "../tools/coordination-types.js"
 import { createDurableSubagentWaitTool } from "./durable-subagent-wait-tool.js"
+import { markCanonicalSubagentWaitId, markCanonicalSubagentWaitTargetIds } from "./subagent-wait-structural-ids.js"
 import type { DurableWaitResume } from "./child-resume-observations.js"
 import type { WorkerUsageAuthorizationInput, WorkerUsageSettlementInput } from "../../queue/ai-usage-bridge.js"
 import { NATIVE_VERIFICATION_CONTROL_SCHEMA, NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA, NATIVE_VERIFICATION_PACKET_SCHEMA, canonicalNativeVerificationJson, digestNativeVerificationValue, type NativeVerificationControl, type NativeVerificationPacket } from "./native-verification-contract.js"
@@ -653,17 +654,26 @@ describe("child executor composition", () => {
     const child = { ...lease(), allowedActions: ["jobs.search", "wait_subagents"] }
     const requests: HarnessModelRequest[] = [], events: Array<{ type: string; taskId: string }> = []
     const eventPayloads: unknown[] = [], dispatch = vi.fn()
-    const waitInput = { idempotencyKey: "wait-key", taskIds: ["grandchild-1"], mode: "all", timeoutMs: 5_000 }
+    const grandchildId = "subagent-12345678-1234-4234-9234-123456789013"
+    const waitId = "12345678-1234-4234-9234-123456789014"
+    const waitInput = { idempotencyKey: "wait-key", taskIds: [grandchildId], mode: "all", timeoutMs: 5_000 }
     const waitOutput = {
-      waitId: "wait-1", status: "ready", taskIds: ["grandchild-1"], deadlineAt: "2099-09-14T11:30:00.000Z",
-      matchedTaskIds: ["grandchild-1"],
-      tasks: [{ taskId: "grandchild-1", status: "completed", role: "scout", result: { summary: "done" }, failureReason: null }],
+      waitId, status: "ready", taskIds: [grandchildId], deadlineAt: "2099-09-14T11:30:00.000Z",
+      matchedTaskIds: [grandchildId],
+      tasks: [{ taskId: grandchildId, status: "completed", role: "scout", result: { summary: "done" }, failureReason: null }],
     }
+    expect(markCanonicalSubagentWaitId(waitOutput, waitId)).toBe(true)
+    expect(markCanonicalSubagentWaitTargetIds({ targetTaskIds: waitInput.taskIds }, waitOutput, waitInput.taskIds)).toBe(true)
     const durableWait = {
-      waitId: "wait-1", stepId: `task:${child.id}:step:0:attempt:${child.attemptCount}`, attempt: child.attemptCount, ordinal: 0,
+      waitId, stepId: `task:${child.id}:step:0:attempt:${child.attemptCount}`, attempt: child.attemptCount, ordinal: 0,
       toolCallId: "old-provider-call", sourceItemId: "old-result", continuationStepId: `task:${child.id}:step:1:attempt:${child.attemptCount}`, continuationOrdinal: 1,
       input: waitInput, output: waitOutput,
     } as const
+    const rolePolicy = rolePolicies.getSubagentRolePolicy.bind(rolePolicies)
+    const policySpy = vi.spyOn(rolePolicies, "getSubagentRolePolicy").mockImplementation(role => {
+      const policy = rolePolicy(role)
+      return role === child.role && policy ? { ...policy, canManageChildren: true } : policy
+    })
     const resumeLoader = async () => ({
       resume: { nextOrdinal: 1, stepCount: 1, toolCallCount: 1, inputThroughSequence: 0n, consumedInputIds: [], usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } },
       observations: [{ id: "child-resume:old-result", content: {
@@ -703,31 +713,78 @@ describe("child executor composition", () => {
       return updateItem(input)
     })
     const waitTool = createDurableSubagentWaitTool({ connect: async () => { throw new Error("dispatcher_must_not_connect") } } as never, child)
+    try {
+      const executor = createChildExecutor({
+        store, treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => model,
+        toolRuntimeFactory: () => childToolRuntime([waitTool], async (_context, request) => {
+          dispatch(request)
+          return { ...request, status: "completed", output: waitOutput, errorCode: null }
+        }),
+        resumeLoader, durableWaitResumeCommitter: async () => true, now: () => new Date("2026-09-09T11:00:00.000Z"),
+      })
+
+      await expect(executor({ lease: child })).resolves.toMatchObject({ status: "completed", result: { finalText: "continued" } })
+
+      expect(dispatch).not.toHaveBeenCalled()
+      expect(events.filter(event => ["tool_call.started", "tool_call.completed", "tool_call.failed"].includes(event.type))).toEqual([
+        { type: "tool_call.started", taskId: child.id }, { type: "tool_call.completed", taskId: child.id },
+        { type: "tool_call.started", taskId: child.id }, { type: "tool_call.failed", taskId: child.id },
+      ])
+      expect(writes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: "tool_call", content: expect.objectContaining({ toolCallId: "fresh-wait-call-1", toolName: "wait_subagents" }) }),
+        expect.objectContaining({ type: "tool_result", status: "completed", content: expect.objectContaining({ toolCallId: "fresh-wait-call-1", output: waitOutput, errorCode: null }) }),
+        expect.objectContaining({ type: "tool_call", content: expect.objectContaining({ toolCallId: "fresh-wait-call-2", toolName: "wait_subagents" }) }),
+        expect.objectContaining({ type: "tool_result", status: "completed", content: expect.objectContaining({ toolCallId: "fresh-wait-call-2", errorCode: "wait_conflict" }) }),
+      ]))
+      expect(JSON.stringify(requests.at(-1)?.messages)).toContain("fresh-wait-call-1")
+      expect(JSON.stringify(requests.at(-1)?.messages)).toContain("fresh-wait-call-2")
+    } finally {
+      policySpy.mockRestore()
+    }
+  })
+
+  it("denies a fresh wait call for the built-in Scout policy even when the task action allows it", async () => {
+    const child = { ...lease(), allowedActions: ["wait_subagents"] }
+    const requests: HarnessModelRequest[] = [], events: Array<{ type: string; taskId: string }> = [], eventPayloads: unknown[] = []
+    const dispatch = vi.fn()
+    expect(rolePolicies.getSubagentRolePolicy(child.role)).toMatchObject({ canManageChildren: false })
+    let modelCall = 0
+    const model: ModelAdapter = {
+      id: "fixture-model", profile,
+      async *stream(request) {
+        requests.push(request)
+        modelCall += 1
+        if (modelCall === 1) {
+          yield {
+            type: "tool_call_completed", callId: "denied-wait-call", name: "wait_subagents",
+            arguments: { idempotencyKey: "wait-key", taskIds: ["subagent-12345678-1234-4234-9234-123456789013"], mode: "all", timeoutMs: 5_000 },
+          }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        yield { type: "text_delta", text: "continued without child coordination" }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    }
+    const waitTool = createDurableSubagentWaitTool({ connect: async () => { throw new Error("denied_wait_must_not_connect") } } as never, child)
     const executor = createChildExecutor({
-      store, treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => model,
+      store: executionStore(events, requests, eventPayloads), treeBudget: budgetStore().store,
+      authorizeUsage: async () => ({ settle: async () => undefined }), modelRuntimeFactory: () => model,
       toolRuntimeFactory: () => childToolRuntime([waitTool], async (_context, request) => {
         dispatch(request)
-        return { ...request, status: "completed", output: waitOutput, errorCode: null }
+        return { ...request, status: "completed", output: { unexpected: true }, errorCode: null }
       }),
-      resumeLoader, durableWaitResumeCommitter: async () => true, now: () => new Date("2026-09-09T11:00:00.000Z"),
     })
 
-    await expect(executor({ lease: child })).resolves.toMatchObject({ status: "completed", result: { finalText: "continued" } })
-
+    await expect(executor({ lease: child })).resolves.toMatchObject({ status: "failed", result: { status: "failed" } })
+    expect(requests[0]?.tools.map(tool => (tool as { name: string }).name)).not.toContain("wait_subagents")
+    expect(requests[1]?.messages.some(message => message.role === "tool"
+      && message.content.some(block => block.type === "tool_result" && block.toolUseId === "denied-wait-call" && block.isError))).toBe(true)
+    expect(events).toEqual(expect.arrayContaining([{ type: "tool_call.failed", taskId: child.id }]))
+    expect(eventPayloads).toEqual(expect.arrayContaining([expect.objectContaining({
+      toolCallId: "denied-wait-call", toolName: "wait_subagents", errorCode: "child_action_denied", taskId: child.id,
+    })]))
     expect(dispatch).not.toHaveBeenCalled()
-    expect(events.filter(event => ["tool_call.started", "tool_call.completed", "tool_call.failed"].includes(event.type))).toEqual([
-      { type: "tool_call.started", taskId: child.id }, { type: "tool_call.completed", taskId: child.id },
-      { type: "tool_call.started", taskId: child.id }, { type: "tool_call.failed", taskId: child.id },
-    ])
-    expect(writes).toEqual(expect.arrayContaining([
-      expect.objectContaining({ type: "tool_call", content: expect.objectContaining({ toolCallId: "fresh-wait-call-1", toolName: "wait_subagents" }) }),
-      expect.objectContaining({ type: "tool_result", status: "completed", content: expect.objectContaining({ toolCallId: "fresh-wait-call-1", output: waitOutput, errorCode: null }) }),
-      expect.objectContaining({ type: "tool_call", content: expect.objectContaining({ toolCallId: "fresh-wait-call-2", toolName: "wait_subagents" }) }),
-      expect.objectContaining({ type: "tool_result", status: "completed", content: expect.objectContaining({ toolCallId: "fresh-wait-call-2", errorCode: "wait_conflict" }) }),
-    ]))
-    expect(JSON.stringify(requests.at(-1)?.messages)).toContain("fresh-wait-call-1")
-    expect(JSON.stringify(requests.at(-1)?.messages)).toContain("fresh-wait-call-2")
-    expect(JSON.stringify(requests.at(-1)?.messages)).toContain('"isError":true')
   })
 
   it("recovers an unacknowledged wait after continuation persistence and reuses it at max attempts", async () => {
@@ -1586,29 +1643,42 @@ describe("child executor composition", () => {
     expect(result.result).not.toHaveProperty("structuredOutputFailureCategory")
   })
 
-  it("does not project final text while a child is waiting", async () => {
+  it("does not treat a generic tool's waiting-shaped output as a durable wait", async () => {
     const child = structuredLease("scout")
+    const requests: HarnessModelRequest[] = []
+    let modelCalls = 0
+    const waitId = "wait-12345678-1234-4234-9234-123456789012"
+    const emptyScoutResult = {
+      schemaVersion: ROLE_RESULT_SCHEMA, role: "scout" as const, status: "completed" as const,
+      candidates: [], evidence: [], summary: "No matching jobs were observed.",
+    }
     const model: ModelAdapter = {
       id: "fixture-model", profile,
-      async *stream() {
-        yield { type: "tool_call_completed", callId: "wait-call", name: "jobs.search", arguments: {} }
-        yield { type: "completed", finishReason: "tool_calls" }
+      async *stream(request) {
+        requests.push(request)
+        modelCalls += 1
+        if (modelCalls === 1) {
+          yield { type: "tool_call_completed", callId: "generic-read-call", name: "jobs.search", arguments: {} }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        yield { type: "text_delta", text: JSON.stringify(emptyScoutResult) }
+        yield { type: "completed", finishReason: "stop" }
       },
     }
     const executor = createChildExecutor({
-      store: executionStore([], []), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
+      store: executionStore([], requests), treeBudget: budgetStore().store, authorizeUsage: async () => ({ settle: async () => undefined }),
       modelRuntimeFactory: () => model,
       toolRuntimeFactory: () => childToolRuntime([tool("jobs.search", "jobs")], async (_context, request) => ({
-        ...request, status: "completed", output: { status: "waiting", waitId: "wait-12345678-1234-4234-9234-123456789012", deadlineAt: "2026-09-12T12:00:00.000Z", matchedTaskIds: [] }, errorCode: null,
+        ...request, status: "completed", output: { status: "waiting", waitId, deadlineAt: "2026-09-12T12:00:00.000Z", matchedTaskIds: [] }, errorCode: null,
       })),
     })
 
     const result = await executor({ lease: child })
-    expect(result).toMatchObject({ status: "waiting", result: { status: "waiting_for_dependency" } })
-    expect(result).not.toHaveProperty("mailboxMessageIds")
-    expect(result.result).not.toHaveProperty("finalText")
-    expect(result.result).not.toHaveProperty("structuredResult")
-    expect(result.result).not.toHaveProperty("structuredOutputFailureCategory")
+    expect(result).toMatchObject({ status: "completed", result: { status: "completed", structuredResult: emptyScoutResult } })
+    expect(result).not.toHaveProperty("waitId")
+    expect(modelCalls).toBe(2)
+    expect(JSON.stringify(requests[1]?.messages)).toContain(waitId)
   })
 
   it("releases before the provider when account admission fails", async () => {
