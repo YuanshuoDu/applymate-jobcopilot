@@ -37,6 +37,16 @@ const workerFailureReasonCategories = new Set([
   "unsettled_external_call_rejected", "durable_wait_graph_blocked", "task_graph_transition_blocked",
   "turn_execution_failed", "fixture_source_wait_call_receipt_invalid",
 ])
+const loopErrorCategories = new Set([
+  ...workerFailureReasonCategories,
+  "invalid_output", "persistence_conflict", "unsettled_external_call_rejected", "model_execution_failed",
+  "turn_execution_failed", "no_progress", "budget_exhausted", "step_limit", "final_unverified",
+  "model_incomplete", "evidence_missing", "evidence_conflict", "business_precondition_failed",
+  "discovery_memory_overflow", "tool_result_replay_uncertain",
+])
+function loopErrorCategory(errorCode) {
+  return errorCode == null ? "none" : loopErrorCategories.has(errorCode) ? errorCode : "other"
+}
 const highPrecisionWaitModelCostUsd = 0.123456789
 const loopFixtureModelProfile = Object.freeze({ provider: "fixture", model: "durable-child-wait-fixture", nativeTools: true,
   structuredOutput: true, streaming: true, continuationCursor: false, supportsParallelTools: true, supportsStreamingToolArgs: true,
@@ -582,6 +592,7 @@ async function resumeChildThroughLoop(lease, phase, preloadedRestored) {
   say(`WORKER_B_LOOP_RESUMED ${JSON.stringify({ phase, status: loop.result.status, stepCount: loop.result.stepCount,
     toolCallCount: loop.result.toolCallCount, finalText: loop.result.finalText ?? null,
     invocations: loop.invocations, executorCalls: loop.executorCalls, dispatcherCalls: loop.dispatcherCalls,
+    errorCodeCategory: loopErrorCategory(loop.result.errorCode),
     continuationStepId, logicalStepOrdinal, physicalContinuationOrdinal: wait.continuationOrdinal ?? null })}`)
   if (phase !== "final" || loop.result.status !== "completed" || loop.dispatcherCalls !== 0) {
     throw new Error("fixture_child_wait_loop_unexpected_completion")
@@ -710,7 +721,7 @@ async function claimExactWaitReissue(lease, owner, wait, continuation, now, opti
     const loop = await runChildWaitLoop(lease, restored, modelResponse, hooks)
     if ((optionsForCut.loopPhase === "preclaim" || optionsForCut.loopPhase === "multi-preclaim") && !preclaimClaimStartMatched) {
       say(`WORKER_B_LOOP_PRE_CLAIM_BARRIER_MISSED ${JSON.stringify({ phase: optionsForCut.loopPhase, callId: call.id,
-        stepId: continuation.id, loopStatus: loop.result.status, loopErrorCode: loop.result.errorCode ?? null,
+        stepId: continuation.id, loopStatus: loop.result.status, loopErrorCodeCategory: loopErrorCategory(loop.result.errorCode),
         modelCalls: loop.invocations.length, toolCallStartObserved: preclaimStartObserved,
         executorCalls: loop.executorCalls, dispatcherCalls: loop.dispatcherCalls })}`)
       throw new Error("fixture_child_wait_preclaim_barrier_not_reached")

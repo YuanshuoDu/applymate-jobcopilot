@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { spawn, type ChildProcess } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { Queue } from "bullmq"
@@ -354,9 +354,10 @@ async function diagnoseWorkerFClaimProof(
     [task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount,
       task.leaseExpiresAt, task.userId, null, continuationStepId, claimCallId],
   )
-  const waits = await client.query<{ id: string; stepId: string; status: string; deadlineAt: Date;
-    idempotencyKey: string; mode: string; targetTaskIds: unknown; matchedTaskIds: unknown; result: unknown }>(
+  const waits = await client.query<{ id: string; stepId: string; sourceAttempt: number; continuationAttempt: number;
+    status: string; deadlineAt: Date; idempotencyKey: string; mode: string; targetTaskIds: unknown; matchedTaskIds: unknown; result: unknown }>(
     `SELECT wait."id", wait."stepId", wait."status", wait."deadlineAt", wait."idempotencyKey", wait."mode",
+        source."attempt" AS "sourceAttempt", continuation."attempt" AS "continuationAttempt",
         wait."targetTaskIds", wait."matchedTaskIds", wait."result"
      FROM "sub_agent_tasks" AS owner
      JOIN "agent_wait_conditions" AS wait ON wait."parentTaskId" = owner."id" AND wait."sessionId" = owner."sessionId"
@@ -365,16 +366,16 @@ async function diagnoseWorkerFClaimProof(
        AND source."turnId" = wait."turnId" AND source."taskId" = owner."id"
      JOIN "agent_steps" AS continuation ON continuation."id" = $5 AND continuation."sessionId" = source."sessionId"
        AND continuation."turnId" = source."turnId" AND continuation."taskId" = source."taskId"
-       AND continuation."attempt" = source."attempt"
+       AND continuation."attempt" = $6
      WHERE owner."id" = $2 AND owner."sessionId" = $1 AND owner."turnId" = $3 AND owner."rootTaskId" = $4
        AND owner."parentTaskId" IS NOT NULL AND owner."status" = 'running' AND owner."leaseOwner" = $7
        AND owner."attemptCount" = $6 AND owner."leaseExpiresAt" = $8 AND owner."interruptRequestedAt" IS NULL
-       AND source."attempt" = $6
+       AND source."attempt" BETWEEN 1 AND $6
        AND wait."id" = (SELECT latest."id" FROM "agent_wait_conditions" AS latest
          JOIN "agent_steps" AS latestStep ON latestStep."id" = latest."stepId" AND latestStep."sessionId" = latest."sessionId"
-           AND latestStep."turnId" = latest."turnId" AND latestStep."taskId" = owner."id" AND latestStep."attempt" = $6
+           AND latestStep."turnId" = latest."turnId" AND latestStep."taskId" = owner."id" AND latestStep."attempt" BETWEEN 1 AND $6
          WHERE latest."parentTaskId" = owner."id" AND latest."sessionId" = owner."sessionId" AND latest."turnId" = owner."turnId"
-         ORDER BY latestStep."ordinal" DESC, latest."createdAt" DESC, latest."id" DESC LIMIT 1)
+         ORDER BY latestStep."attempt" DESC, latestStep."ordinal" DESC, latest."createdAt" DESC, latest."id" DESC LIMIT 1)
      LIMIT 2`,
     [task.sessionId, task.id, task.turnId, task.rootTaskId, continuationStepId, task.attemptCount,
       task.leaseOwner, task.leaseExpiresAt, task.userId],
@@ -382,15 +383,20 @@ async function diagnoseWorkerFClaimProof(
   const sqlCandidateCount = proof.rows[0]?.candidateCount ?? 0
   const sqlMatchCount = proof.rows[0]?.matchedCount ?? 0
   const exactSqlProofMatched = sqlCandidateCount === 1 && sqlMatchCount === 1
+  const attemptRelation = (sourceAttempt: number, currentAttempt: number): "same" | "prior" | "future" | "unknown" =>
+    !Number.isSafeInteger(sourceAttempt) || !Number.isSafeInteger(currentAttempt) ? "unknown"
+      : sourceAttempt === currentAttempt ? "same" : sourceAttempt < currentAttempt ? "prior" : "future"
   if (waits.rows.length !== 1) return {
     sqlCandidateCount, sqlMatchCount, exactSqlProofMatched,
-    waitRowCount: waits.rows.length, sourceCallCount: 0, sourceCallFinished: false, sourceReceiptFinished: false,
+    waitRowCount: waits.rows.length, attemptRelation: "unknown", sourceCallCount: 0, sourceCallFinished: false,
+    continuationIsCurrent: false, sourceResultCount: 0, sourceReceiptState: "missing", sourceReceiptFinished: false,
+    recoveryMarkerPresent: false, recoveryMarkerMatchesSource: false, sourceResultDeterministicIdMatches: false,
     safeKeyProjectionMatched: false, deadlineCanonicalAndMatched: false, claimCallFinishedRevision1: false,
     claimHasNoItemCompletedEvent: false,
   }
   const wait = waits.rows[0]!
-  const sourceCalls = await client.query<{ status: string; revision: number; content: Record<string, unknown> }>(
-    `SELECT "status", "revision", "content" FROM "agent_items"
+  const sourceCalls = await client.query<{ id: string; status: string; revision: number; content: Record<string, unknown> }>(
+    `SELECT "id", "status", "revision", "content" FROM "agent_items"
      WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = $4
        AND "type" = 'tool_call' AND "content"->>'toolName' = 'wait_subagents'`,
     [task.sessionId, task.turnId, task.id, wait.stepId],
@@ -399,9 +405,9 @@ async function diagnoseWorkerFClaimProof(
   const sourceCallContent = asObject(sourceCall?.content)
   const sourceInput = asObject(sourceCallContent.input)
   const sourceResults = typeof sourceCallContent.toolCallId === "string" ? await client.query<{
-    status: string; revision: number; content: Record<string, unknown>
+    id: string; status: string; revision: number; content: Record<string, unknown>
   }>(
-    `SELECT "status", "revision", "content" FROM "agent_items"
+    `SELECT "id", "status", "revision", "content" FROM "agent_items"
      WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = $4
        AND "type" = 'tool_result' AND "content"->>'toolCallId' = $5`,
     [task.sessionId, task.turnId, task.id, wait.stepId, sourceCallContent.toolCallId],
@@ -411,10 +417,13 @@ async function diagnoseWorkerFClaimProof(
   const sourceReceipt = asObject(sourceResultContent.output)
   const waitResult = asObject(wait.result)
   const waitOutcome = asObject(waitResult.outcome)
+  const recoveryMarker = asObject(waitResult.sourceLifecycleRecovery)
   const targetIds = Array.isArray(wait.targetTaskIds) ? wait.targetTaskIds : null
+  const matchedIds = Array.isArray(wait.matchedTaskIds) ? wait.matchedTaskIds : null
   const sameStringIds = (left: unknown, right: unknown): boolean => {
     if (!Array.isArray(left) || !Array.isArray(right) || left.some(value => typeof value !== "string")
       || right.some(value => typeof value !== "string") || left.length !== right.length) return false
+    if (new Set(left).size !== left.length || new Set(right).size !== right.length) return false
     const leftIds = [...left as string[]].sort(), rightIds = [...right as string[]].sort()
     return leftIds.every((value, index) => value === rightIds[index])
   }
@@ -441,22 +450,64 @@ async function diagnoseWorkerFClaimProof(
     && sourceCallContent.toolCallId === sourceCallId && sourceCallContent.toolName === "wait_subagents"
     && sourceCallContent.toolVersion === "1" && sourceCallContent.status === "completed" && sourceCallContent.errorCode === null
     && sourceInput.idempotencyKey === wait.idempotencyKey
-  const sourceReceiptFinished = sourceResult?.status === "completed" && sourceResult.revision === 1
-    && sourceResultContent.toolCallId === sourceCallContent.toolCallId && sourceResultContent.errorCode === null
-    && sourceReceipt.waitId === wait.id && sourceReceipt.status === "waiting"
-    && sameStringIds(sourceReceipt.taskIds, targetIds) && sourceReceiptDeadlineMatches(sourceReceipt.deadlineAt, waitOutcome.deadlineAt)
+  const sourceReceiptBaseFinished = sourceResult?.status === "completed" && sourceResult.revision === 1
+    && sourceCallContent.toolCallId === sourceCallId && sourceResultContent.toolCallId === sourceCallId
+    && sourceResultContent.toolCallId === sourceCallContent.toolCallId
+    && sourceResultContent.errorCode === null
+  const sourceReceiptStatus = typeof sourceReceipt.status === "string"
+    && ["waiting", "ready", "timed_out"].includes(sourceReceipt.status) ? sourceReceipt.status : sourceResult ? "other" : "missing"
+  const sourceReceiptNormalMatches = sourceReceiptBaseFinished && sourceReceipt.waitId === wait.id && sourceReceipt.status === "waiting"
+    && sameStringIds(sourceReceipt.taskIds, targetIds) && Array.isArray(sourceReceipt.matchedTaskIds) && sourceReceipt.matchedTaskIds.length === 0
+    && sourceReceiptDeadlineMatches(sourceReceipt.deadlineAt, waitOutcome.deadlineAt)
+  const recoveryMarkerPresent = Object.prototype.hasOwnProperty.call(waitResult, "sourceLifecycleRecovery")
+  const markerAttempt = recoveryMarker.attempt
+  const sourceResultDigest = createHash("sha256")
+    .update(`child-wait-source-result:v1\0${wait.id}\0${sourceCallId}`, "utf8").digest("hex")
+  const sourceResultDeterministicIdMatches = sourceResult?.id
+    === `task:${task.id}:item:tool-result:source-wait-recovery:${sourceResultDigest}`
+  const recoveryMarkerMatchesSource = recoveryMarkerPresent && recoveryMarker.schemaVersion === "child-wait-source-lifecycle.v1"
+    && recoveryMarker.userId === task.userId && recoveryMarker.sessionId === task.sessionId && recoveryMarker.turnId === task.turnId
+    && recoveryMarker.rootTaskId === task.rootTaskId && recoveryMarker.taskId === task.id
+    // ownerId is server-written sidecar data; this probe validates shape, not historical lease ownership.
+    && typeof recoveryMarker.ownerId === "string" && recoveryMarker.ownerId.length >= 1 && recoveryMarker.ownerId.length <= 256
+    && recoveryMarker.ownerId.trim() === recoveryMarker.ownerId
+    && markerAttempt === wait.sourceAttempt && recoveryMarker.stepId === wait.stepId && recoveryMarker.waitId === wait.id
+    && recoveryMarker.toolCallId === sourceCallId && recoveryMarker.toolCallId === sourceCallContent.toolCallId
+    && recoveryMarker.callItemId === sourceCall?.id
+    && recoveryMarker.resultItemId === sourceResult?.id
+  const sourceReceiptRecoveredMatches = sourceReceiptBaseFinished && recoveryMarkerMatchesSource
+    && sourceResultDeterministicIdMatches
+    && sourceReceipt.waitId === wait.id && sourceReceipt.status === wait.status
+    && sameStringIds(sourceReceipt.taskIds, targetIds) && sameStringIds(sourceReceipt.matchedTaskIds, matchedIds)
+    && sourceReceiptDeadlineMatches(sourceReceipt.deadlineAt, waitOutcome.deadlineAt)
+    && sameJsonValue(sourceReceipt, waitOutcome)
+  const sourceReceiptFinished = sourceReceiptNormalMatches || sourceReceiptRecoveredMatches
   const safeKeyProjectionMatched = sourceCalls.rows.length === 1 && continuationCalls.rows.length === 1
     && childWaitContinuationKeyMatchesSafeProjection(sourceInput.idempotencyKey, claimInput.idempotencyKey)
   return {
     snapshot: "post_recovery_attempt_read_committed",
     sqlCandidateCount, sqlMatchCount, exactSqlProofMatched,
-    waitRowCount: waits.rows.length, sourceCallCount: sourceCalls.rows.length,
-    sourceCallFinished, sourceReceiptFinished, safeKeyProjectionMatched, deadlineCanonicalAndMatched,
+    waitRowCount: waits.rows.length, attemptRelation: attemptRelation(wait.sourceAttempt, task.attemptCount),
+    continuationIsCurrent: wait.continuationAttempt === task.attemptCount,
+    sourceCallCount: sourceCalls.rows.length, sourceCallFinished, sourceResultCount: sourceResults.rows.length,
+    sourceReceiptState: sourceReceiptStatus,
+    sourceReceiptNormalMatches, sourceReceiptRecoveredMatches, sourceReceiptFinished,
+    recoveryMarkerPresent, recoveryMarkerMatchesSource, sourceResultDeterministicIdMatches,
+    safeKeyProjectionMatched, deadlineCanonicalAndMatched,
     claimCallCount: continuationCalls.rows.length,
     claimCallFinishedRevision1: claimCall?.status === "completed" && claimCall.revision === 1
       && claimCall.content.toolCallId === claimCallId && claimCall.content.toolName === "wait_subagents",
     claimHasNoItemCompletedEvent: (claimEvents.rows[0]?.count ?? 0) === 0,
   }
+}
+
+function sameJsonValue(left: unknown, right: unknown): boolean {
+  const normalize = (value: unknown): unknown => Array.isArray(value) ? value.map(normalize)
+    : value !== null && typeof value === "object"
+      ? Object.fromEntries(Object.entries(value).sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
+        .map(([key, item]) => [key, normalize(item)]))
+      : value
+  return JSON.stringify(normalize(left)) === JSON.stringify(normalize(right))
 }
 
 function sourceReceiptDeadlineMatches(receiptDeadline: unknown, outcomeDeadline: unknown): boolean {
@@ -2948,6 +2999,12 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
     }
     const publishRecoveryTimeoutSnapshot = async (sample: "post_timeout_read_committed_snapshot" | "post_poll_error_read_committed_snapshot"): Promise<Record<string, unknown>> => {
       let client: PoolClient | undefined
+      let queueState: Record<string, boolean> = { available: false, waiting: false, active: false, delayed: false, failed: false, completed: false }
+      try {
+        const counts = await queue.getJobCounts("waiting", "active", "delayed", "failed", "completed")
+        queueState = { available: true, waiting: counts.waiting > 0, active: counts.active > 0, delayed: counts.delayed > 0,
+          failed: counts.failed > 0, completed: counts.completed > 0 }
+      } catch { /* Fixed booleans only; queue diagnostics must not replace the original timeout. */ }
       try {
         client = await pool.connect()
         await client.query("BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY")
@@ -2997,6 +3054,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
           suspended: waitRow ? waitRow.suspendedAt !== null : null,
           deadline: waitRow ? (waitRow.deadlineElapsed ? "elapsed" : "future") : "invalid",
           hasRecoveryMarker: waitRow?.hasRecoveryMarker ?? false,
+          queue: queueState,
           targets: { count: targetRow?.targetCount ?? 0, terminal: targetRow?.terminalCount ?? 0, waiting: targetRow?.waitingCount ?? 0 },
         }
       } catch {
@@ -3463,7 +3521,10 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         expect(lockedTask.rowCount).toBe(1)
         const blocking = (snapshot: BlockingTaskSnapshot) => hasBlockingExternalCall(
           blockerClient, snapshot as unknown as Record<string, unknown>, undefined, continuationStep.id)
-        expect(await blocking(crossAttemptSnapshot), "a unique attempt-1 recovered source may authorize its exact attempt-2 continuation claim").toBe(false)
+        const crossAttemptProof = await diagnoseWorkerFClaimProof(blockerClient, crossAttemptSnapshot,
+          continuationStep.id, PHONE_SHAPED_WAIT_TOOL_CALL_ID, claimCallId)
+        expect(await blocking(crossAttemptSnapshot),
+          `a unique historical source may authorize its exact current claim: ${JSON.stringify(crossAttemptProof)}`).toBe(false)
         expect(await blocking({ ...crossAttemptSnapshot, leaseOwner: `${syntheticOwner}:stale` }),
           "a stale current lease owner must leave the attempt-2 claim blocking").toBe(true)
         expect(await blocking({ ...crossAttemptSnapshot, attemptCount: 1 }),
