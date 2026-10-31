@@ -3,7 +3,7 @@ import { canonicalJson, redactSensitiveText, redactSensitiveValue } from "@jobco
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import type { ExecutionOwnerFence } from "../execution-owner.js"
 import { validateRoleResult, type PrepareResult } from "../subagents/role-results.js"
-import { redactDurableWaitOutput } from "./durable-wait-output-redaction.js"
+import { redactDurableWaitOutput, type DurableWaitOwnerKind, type DurableWaitToolName } from "./durable-wait-output-redaction.js"
 import { redactJobReadOutput } from "./job-read-output-redaction.js"
 
 export const MAX_TOOL_RESULT_BYTES = 1024 * 1024
@@ -67,9 +67,12 @@ export class ToolResultSanitizationError extends Error {
   constructor(readonly code: "tool_result_invalid_json" | "tool_result_corrupt") { super(code) }
 }
 
-function sanitizeSource(value: unknown, toolName: CanonicalToolSourceName, expectedTaskId?: string, expectedAttemptCount?: number): RepositoryJsonValue {
+function sanitizeSource(value: unknown, toolName: CanonicalToolSourceName, expectedTaskId?: string, expectedAttemptCount?: number, ownerKind?: DurableWaitOwnerKind): RepositoryJsonValue {
   if (toolName === SCHEDULED_PREPARE_TOOL) return projectScheduledPrepareLifecycleOutput(value, expectedTaskId, expectedAttemptCount)
-  if (toolName === "agent.wait" || toolName === "wait_subagents") return redactDurableWaitOutput(value)
+  if (toolName === "agent.wait" || toolName === "wait_subagents") {
+    if (!ownerKind) throw new ToolResultSanitizationError("tool_result_invalid_json")
+    return redactDurableWaitOutput(value, toolName as DurableWaitToolName, ownerKind)
+  }
   if (toolName === "jobs.search" || toolName === "jobs.get" || toolName === "jobs.discover") return redactJobReadOutput(toolName, value)
   return redactSensitiveValue(value)
 }
@@ -81,8 +84,8 @@ function prepareJson(value: RepositoryJsonValue): PreparedToolResult {
   } catch { throw new ToolResultSanitizationError("tool_result_invalid_json") }
 }
 
-export function prepareToolResultJson(value: unknown, toolName: CanonicalToolSourceName, expectedTaskId?: string, expectedAttemptCount?: number): PreparedToolResult {
-  try { return prepareJson(sanitizeSource(value, toolName, expectedTaskId, expectedAttemptCount)) }
+export function prepareToolResultJson(value: unknown, toolName: CanonicalToolSourceName, expectedTaskId?: string, expectedAttemptCount?: number, ownerKind?: DurableWaitOwnerKind): PreparedToolResult {
+  try { return prepareJson(sanitizeSource(value, toolName, expectedTaskId, expectedAttemptCount, ownerKind)) }
   catch { throw new ToolResultSanitizationError("tool_result_invalid_json") }
 }
 
@@ -148,19 +151,20 @@ function matchesStored(value: ToolResultReferenceRecord, safe: PreparedToolResul
   return safe.sha256 === value.sha256 && safe.bytes === value.byteCount && safe.encoded === canonicalJson(value.sanitizedJson)
 }
 
-export function verifyToolResultSanitization(value: ToolResultReferenceRecord, toolName: CanonicalToolSourceName, expectedAttemptCount?: number): RepositoryJsonValue {
+export function verifyToolResultSanitization(value: ToolResultReferenceRecord, toolName: CanonicalToolSourceName, expectedAttemptCount?: number, ownerKind?: DurableWaitOwnerKind): RepositoryJsonValue {
   if (toolName === SCHEDULED_PREPARE_TOOL) {
     try {
       if (typeof value.taskId !== "string") throw new Error("scheduled_prepare_task_fence_missing")
-      const safe = prepareToolResultJson(value.sanitizedJson, toolName, value.taskId, expectedAttemptCount)
+      const safe = prepareToolResultJson(value.sanitizedJson, toolName, value.taskId, expectedAttemptCount, ownerKind)
       if (safe.bytes <= MAX_TOOL_RESULT_BYTES && matchesStored(value, safe)) return safe.value
     } catch { /* Prepare references must be valid under their stored task fence. */ }
     throw new ToolResultSanitizationError("tool_result_corrupt")
   }
   try {
-    const safe = prepareToolResultJson(value.sanitizedJson, toolName)
+    const safe = prepareToolResultJson(value.sanitizedJson, toolName, undefined, undefined, ownerKind)
     if (matchesStored(value, safe)) return safe.value
   } catch { /* Older references may already be generic-redacted. */ }
+  if (toolName === "agent.wait" || toolName === "wait_subagents") throw new ToolResultSanitizationError("tool_result_corrupt")
   try {
     const legacy = prepareJson(redactSensitiveValue(value.sanitizedJson))
     if (matchesStored(value, legacy)) return legacy.value
@@ -174,11 +178,12 @@ export function matchesVerifiedToolResultRetry(
   retryInput: unknown,
   toolName: CanonicalToolSourceName,
   expectedAttemptCount?: number,
+  ownerKind?: DurableWaitOwnerKind,
 ): boolean {
-  try { verifyToolResultSanitization(value, toolName, expectedAttemptCount) } catch { return false }
+  try { verifyToolResultSanitization(value, toolName, expectedAttemptCount, ownerKind) } catch { return false }
   if (matchesStored(value, sourcePrepared)) return true
   if (toolName === SCHEDULED_PREPARE_TOOL) {
-    try { return matchesStored(value, prepareToolResultJson(retryInput, toolName, value.taskId, expectedAttemptCount)) }
+    try { return matchesStored(value, prepareToolResultJson(retryInput, toolName, value.taskId, expectedAttemptCount, ownerKind)) }
     catch { return false }
   }
   try { return matchesStored(value, prepareJson(redactSensitiveValue(retryInput))) }

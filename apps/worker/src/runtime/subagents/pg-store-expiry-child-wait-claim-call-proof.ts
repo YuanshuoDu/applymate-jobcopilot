@@ -18,7 +18,7 @@ export const CHILD_WAIT_CLAIM_KEY_COLUMNS_SQL = `
   (SELECT CASE WHEN COUNT(*) = 1 THEN MAX(claimedCall."content"->'input'->>'idempotencyKey') END
     FROM "agent_items" AS claimedCall WHERE claimedCall."sessionId" = $1 AND claimedCall."turnId" = $3
       AND claimedCall."taskId" = $2 AND claimedCall."stepId" = $10
-      AND claimedCall."id" = 'task:' || $2 || ':item:tool-call:' || started."correlationId" || ':attempt:' || latest_wait."attempt"::text
+      AND claimedCall."id" = 'task:' || $2 || ':item:tool-call:' || started."correlationId" || ':attempt:' || $6::text
       AND claimedCall."type" = 'tool_call') AS "continuationWaitKey"`
 
 /** Exact continuation-claim cut after the call row is completed but before item.completed is appended. */

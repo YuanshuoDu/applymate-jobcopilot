@@ -1,9 +1,13 @@
 import { describe, expect, it, vi } from "vitest"
 import {
+  CHILD_WAIT_CLAIM_RECOVERY_SQL,
   CHILD_WAIT_CONSUMED_SQL,
   CHILD_WAIT_RESUMABLE_SQL,
   hasBlockingExternalCall,
 } from "./pg-store-expiry-recovery-predicates.js"
+import {
+  CHILD_WAIT_SOURCE_RECOVERED_RESULT_SQL,
+} from "./pg-store-expiry-child-wait-source-proof.js"
 
 const task = {
   id: "parent-1",
@@ -112,6 +116,20 @@ describe("expired recovery SQL predicates", () => {
     expect(sql).toContain('AND NOT EXISTS (SELECT 1 FROM "agent_events" AS extra')
     expect(sql).toContain(`resultEvent."idempotencyKey" = 'task:' || owner."id" || ':event:item-started:task:'`)
     expect(sql).toContain(`resultEvent."idempotencyKey" = 'task:' || owner."id" || ':event:tool-result-completed:'`)
+  })
+
+  it("requires recovered source lifecycle provenance to bind the resolved result and event chain", () => {
+    expect(CHILD_WAIT_SOURCE_RECOVERED_RESULT_SQL).toContain("sourceLifecycleRecovery")
+    expect(CHILD_WAIT_SOURCE_RECOVERED_RESULT_SQL).toContain("child-wait-source-lifecycle.v1")
+    expect(CHILD_WAIT_SOURCE_RECOVERED_RESULT_SQL).toContain("sourceResult.\"content\" = jsonb_build_object('toolCallId'")
+    expect(CHILD_WAIT_SOURCE_RECOVERED_RESULT_SQL).toContain("'output', wait.\"result\"->'outcome'")
+    expect(CHILD_WAIT_SOURCE_RECOVERED_RESULT_SQL).toContain("sourceResultCompleted.\"causationId\" = sourceResultStarted.\"id\"")
+    expect(CHILD_WAIT_SOURCE_RECOVERED_RESULT_SQL).toContain("sourceItemStarted.\"sequence\"")
+    expect(CHILD_WAIT_SOURCE_RECOVERED_RESULT_SQL).toContain("= 6")
+    expect(CHILD_WAIT_CLAIM_RECOVERY_SQL).toContain(`OR ${CHILD_WAIT_SOURCE_RECOVERED_RESULT_SQL}`)
+    expect(CHILD_WAIT_CLAIM_RECOVERY_SQL).toContain('source."attempt" BETWEEN 1 AND $6')
+    expect(CHILD_WAIT_CLAIM_RECOVERY_SQL).toContain('continuation."attempt" = $6')
+    expect(CHILD_WAIT_CLAIM_RECOVERY_SQL).toContain('later."attempt" = $6 AND later."ordinal" > source."ordinal"')
   })
 
   it("blocks a valid-looking continuation claim when its receipt deadline differs from the database wait", async () => {

@@ -1,8 +1,9 @@
 import type { RepositoryJsonValue } from "@jobcopilot/agent-protocol"
 import { redactSensitiveValue } from "@jobcopilot/shared"
+import { isCanonicalRawSubagentWaitId } from "../subagents/subagent-wait-structural-ids.js"
 import { projectNativeVerificationResult } from "./native-verification-feedback-projection.js"
 
-const WAIT_ID = /^wait-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+const ROOT_WAIT_ID = /^wait-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const TASK_ID = /^subagent-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const WAIT_FIELDS = ["waitId", "status", "taskIds", "deadlineAt", "matchedTaskIds", "tasks"] as const
 const LEGACY_TASK_FIELDS = ["taskId", "status", "role", "result", "failureReason"] as const
@@ -10,16 +11,18 @@ const TASK_STATE_FIELDS = ["attemptCount", "maxAttempts", "leaseExpiresAt", "int
 const WAIT_STATUSES = new Set(["waiting", "ready", "timed_out", "interrupted", "closed"])
 const TASK_STATUSES = new Set(["queued", "running", "retrying", "waiting", "waiting_for_user", "completed", "failed", "interrupted", "cancelled", "closed"])
 const MAX_WAIT_TARGETS = 50
+export type DurableWaitToolName = "agent.wait" | "wait_subagents"
+export type DurableWaitOwnerKind = "turn" | "task"
 
 /**
  * Preserves only generated identifiers in validated agent.wait / wait_subagents
  * outputs. Every other value still passes through the shared lifecycle redactor.
  */
-export function redactDurableWaitOutput(value: unknown): RepositoryJsonValue {
+export function redactDurableWaitOutput(value: unknown, toolName: DurableWaitToolName, ownerKind: DurableWaitOwnerKind): RepositoryJsonValue {
   try {
     const copied = copyJson(value, new Set<object>())
     const receipt = exactObject(copied, WAIT_FIELDS, ["aggregate"])
-    if (typeof receipt.waitId !== "string" || !WAIT_ID.test(receipt.waitId)
+    if (!validWaitId(receipt.waitId, toolName, ownerKind)
       || typeof receipt.status !== "string" || !WAIT_STATUSES.has(receipt.status)
       || typeof receipt.deadlineAt !== "string") throw invalidReceipt()
 
@@ -66,6 +69,12 @@ export function redactDurableWaitOutput(value: unknown): RepositoryJsonValue {
   } catch {
     throw invalidReceipt()
   }
+}
+
+function validWaitId(value: RepositoryJsonValue | undefined, toolName: DurableWaitToolName, ownerKind: DurableWaitOwnerKind): value is string {
+  if (ownerKind === "turn") return (toolName === "agent.wait" || toolName === "wait_subagents")
+    && typeof value === "string" && ROOT_WAIT_ID.test(value)
+  return ownerKind === "task" && toolName === "wait_subagents" && isCanonicalRawSubagentWaitId(value)
 }
 
 function withoutDiscoveryRecovery(value: RepositoryJsonValue | undefined): RepositoryJsonValue {

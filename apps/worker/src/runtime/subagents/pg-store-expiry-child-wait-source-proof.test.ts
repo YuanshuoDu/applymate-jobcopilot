@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { CHILD_WAIT_SOURCE_STARTED_NO_RESULT_SQL } from "./pg-store-expiry-child-wait-source-proof.js"
+import { CHILD_WAIT_SOURCE_RECOVERED_RESULT_SQL, CHILD_WAIT_SOURCE_STARTED_NO_RESULT_SQL } from "./pg-store-expiry-child-wait-source-proof.js"
 
 describe("registered child-wait source crash proof", () => {
   it("requires the exact started call and its unique causal start events, with no result or extra lifecycle", () => {
@@ -18,5 +18,26 @@ describe("registered child-wait source crash proof", () => {
     expect(sql).toContain(`AND NOT EXISTS (SELECT 1 FROM "agent_items" AS sourceResultAny`)
     expect(sql).toContain(`AND NOT EXISTS (SELECT 1 FROM "agent_events" AS sourceResultEvent`)
     expect(sql).toContain(`wait."status" <> 'timed_out' OR wait."result"->'outcome'->>'deadlineAt' <= to_char(clock_timestamp() AT TIME ZONE 'UTC'`)
+  })
+
+  it("requires private provenance, exact resolved source output, and one ordered completion chain", () => {
+    const sql = CHILD_WAIT_SOURCE_RECOVERED_RESULT_SQL.replace(/\s+/g, " ")
+    expect(sql).toContain("sourceCall.\"status\" = 'completed' AND sourceCall.\"revision\" = 1")
+    expect(sql).toContain(`sourceCall."content"->'input' = jsonb_build_object('idempotencyKey', wait."idempotencyKey"`)
+    expect(sql).toContain(`sourceWaitCallAny."content"->>'toolName' = 'wait_subagents') = 1`)
+    expect(sql).toContain(`sourceCallAny."content"->>'toolCallId' = sourceCall."content"->>'toolCallId') = 1`)
+    expect(sql).toContain(`sourceResultAny."content"->>'toolCallId' = sourceCall."content"->>'toolCallId') = 1`)
+    expect(sql).toContain("sourceResult.\"content\" = jsonb_build_object('toolCallId'")
+    expect(sql).toContain(`sourceResult."id" = 'task:' || owner."id" || ':item:tool-result:source-wait-recovery:' || encode(sha256(`)
+    expect(sql).toContain(`sourceCallCompleted."payload"->'content'->>'toolCallId' = sourceCall."content"->>'toolCallId'`)
+    expect(sql).toContain("'output', wait.\"result\"->'outcome'")
+    expect(sql).toContain("'child-wait-source-lifecycle.v1'")
+    expect(sql).toContain("wait.\"result\"->'sourceLifecycleRecovery'->>'attempt' = source.\"attempt\"::text")
+    expect(sql).toContain("wait.\"result\"->'sourceLifecycleRecovery'->>'stepId' = source.\"id\"")
+    expect(sql).toContain("sourceResultCompleted.\"causationId\" = sourceResultStarted.\"id\"")
+    expect(sql).toContain("sourcePrior.\"id\" = sourceItemStarted.\"causationId\"")
+    expect(sql).toContain("sourcePrior.\"idempotencyKey\" = 'task:' || owner.\"id\" || ':event:model-usage:' || source.\"id\"")
+    expect(sql).toContain("sourcePrior.\"sequence\" < sourceItemStarted.\"sequence\"")
+    expect(sql).toContain("= 6")
   })
 })

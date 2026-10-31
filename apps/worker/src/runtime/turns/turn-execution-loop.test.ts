@@ -165,7 +165,7 @@ function fixture(owner: TurnExecutionIdentity, toolResult?: TurnEngineToolResult
       requests.push(request)
       calls += 1
       if (calls === 1) {
-        yield { type: "tool_call_completed", callId: `call:${owner.taskId}`, name: "jobs.search", arguments: { location: "Dublin" } }
+        yield { type: "tool_call_completed", callId: `call:${owner.taskId}`, name: toolResult?.toolName ?? "jobs.search", arguments: { location: "Dublin" } }
         yield { type: "completed", finishReason: "tool_calls" }
       } else {
         yield { type: "text_delta", text: `done:${owner.taskId}` }
@@ -1778,11 +1778,12 @@ describe("owner-agnostic turn execution loop", () => {
 
   it.each(["accepted", "duplicate"] as const)("refreshes TaskGraph evidence after an inline-ready wait and %s plan", async planStatus => {
     const root = fixture(identity("turn", "root-1"))
+    const childWaitTaskId = "subagent-00000000-0000-4000-8000-000000000011"
     const currentGraph: TaskGraphCurrentState = {
       revision: 4,
       nodes: [{
         key: "child", templateId: "scout", goal: "Find roles", successCriteria: ["Return evidence"], dependsOn: [],
-        taskId: "child-1", status: "completed" as const, readiness: "terminal" as const,
+        taskId: childWaitTaskId, status: "completed" as const, readiness: "terminal" as const,
         resultSummary: "One matching role", failureReason: null,
         resultProjection: {
           schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted" as const,
@@ -1832,7 +1833,7 @@ describe("owner-agnostic turn execution loop", () => {
           root.requests.push(request)
           modelCalls += 1
           if (modelCalls === 1) {
-            yield { type: "tool_call_completed", callId: "wait-call", name: "agent.wait", arguments: { taskIds: ["child-1"], mode: "all", timeoutMs: 5000 } }
+            yield { type: "tool_call_completed", callId: "wait-call", name: "agent.wait", arguments: { taskIds: [childWaitTaskId], mode: "all", timeoutMs: 5000 } }
             yield { type: "completed", finishReason: "tool_calls" }
             return
           }
@@ -1855,7 +1856,10 @@ describe("owner-agnostic turn execution loop", () => {
       },
       executeTool: async input => {
         if (input.call.toolName === "agent.wait") {
-          return { id: input.call.id, toolName: input.call.toolName, toolVersion: "1", status: "completed", output: { waitId: "wait-1", status: "ready", matchedTaskIds: ["child-1"] }, errorCode: null }
+          return { id: input.call.id, toolName: input.call.toolName, toolVersion: "1", status: "completed", output: {
+            waitId: "wait-00000000-0000-4000-8000-000000000011", status: "ready", taskIds: [childWaitTaskId], matchedTaskIds: [childWaitTaskId],
+            deadlineAt: "2026-09-09T13:00:00.000Z", tasks: [{ taskId: childWaitTaskId, status: "completed", role: "scout", result: null, failureReason: null }],
+          }, errorCode: null }
         }
         const context: ToolExecutionContext = {
           scope: input.scope, sessionId: input.sessionId, turnId: input.turnId, stepId: input.stepId,
@@ -3111,9 +3115,11 @@ describe("owner-agnostic turn execution loop", () => {
     const completionGate: NonNullable<TurnExecutionOptions["completionGate"]> = vi.fn(async () => checkpointedTaskGraphDenial(checkpoint))
     Object.defineProperty(completionGate, READ_TASK_GRAPH_DENIAL_CHECKPOINT, { value: read })
     const baseModel = root.options.model
+    const childWaitTaskId = "subagent-00000000-0000-4000-8000-000000000012"
     const waitOutput = {
-      waitId: "wait-ready-between-denials", status: "ready", deadlineAt: "2026-09-09T13:00:00.000Z",
-      matchedTaskIds: ["child-1"], taskIds: ["child-1"],
+      waitId: "wait-00000000-0000-4000-8000-000000000012", status: "ready", deadlineAt: "2026-09-09T13:00:00.000Z",
+      matchedTaskIds: [childWaitTaskId], taskIds: [childWaitTaskId],
+      tasks: [{ taskId: childWaitTaskId, status: "completed", role: "scout", result: null, failureReason: null }],
     }
     let callCount = 0
     root.options = {
@@ -3131,7 +3137,7 @@ describe("owner-agnostic turn execution loop", () => {
         root.requests.push(request)
         callCount += 1
         if (callCount === 2) {
-          yield { type: "tool_call_completed", callId: "intervening-ready-wait", name: "agent.wait", arguments: { taskIds: ["child-1"], mode: "all", timeoutMs: 5_000 } }
+          yield { type: "tool_call_completed", callId: "intervening-ready-wait", name: "agent.wait", arguments: { taskIds: [childWaitTaskId], mode: "all", timeoutMs: 5_000 } }
           yield { type: "completed", finishReason: "tool_calls" }
           return
         }
@@ -3147,7 +3153,7 @@ describe("owner-agnostic turn execution loop", () => {
     expect(root.requests).toHaveLength(4)
     expect(completionGate).toHaveBeenCalledTimes(3)
     expect(read).toHaveBeenCalled()
-    expect(thirdRequest).toContain("wait-ready-between-denials")
+    expect(thirdRequest).toContain("wait-00000000-0000-4000-8000-000000000012")
     expect(thirdRequest).toContain('"status":"ready"')
     expect(new Set(root.events.filter(event => event.type === "agent.plan.denial_checkpoint").map(event => event.id)).size).toBe(3)
     expect(new Set(root.events.filter(event => event.type === "tool_call.completed").map(event => event.id)).size).toBe(1)
@@ -3850,12 +3856,14 @@ describe("owner-agnostic turn execution loop", () => {
   })
 
   it("persists a waiting tool result before returning a dependency wait", async () => {
+    const childTaskId = "subagent-00000000-0000-4000-8000-000000000004"
     const child = fixture(identity("task", "child-wait", 2), {
       id: "wait-call", toolName: "wait_subagents", toolVersion: "1", status: "completed",
-      output: { waitId: "wait-12345678-1234-4234-9234-123456789012", status: "waiting", deadlineAt: "2026-09-09T13:00:00.000Z", matchedTaskIds: [], taskIds: ["child-a"] }, errorCode: null,
+      output: { waitId: "12345678-1234-4234-9234-123456789012", status: "waiting", deadlineAt: "2026-09-09T13:00:00.000Z",
+        matchedTaskIds: [], taskIds: [childTaskId], tasks: [{ taskId: childTaskId, status: "waiting", role: "scout", result: null, failureReason: null }] }, errorCode: null,
     })
     const result = await runTurnExecutionLoop(child.options)
-    expect(result).toMatchObject({ status: "waiting_for_dependency", waitId: "wait-12345678-1234-4234-9234-123456789012", stepCount: 1, toolCallCount: 1 })
+    expect(result).toMatchObject({ status: "waiting_for_dependency", waitId: "12345678-1234-4234-9234-123456789012", stepCount: 1, toolCallCount: 1 })
     expect(result.finalText).toBeUndefined()
     expect(child.requests).toHaveLength(1)
     expect(child.stepStatuses).toContain("waiting_for_tool")
@@ -3864,8 +3872,30 @@ describe("owner-agnostic turn execution loop", () => {
     expect(child.events.some(event => event.type === "turn.completed" || event.type === "turn.failed")).toBe(false)
   })
 
+  it("accepts the root wait_subagents alias only with the root-prefixed receipt ID", async () => {
+    const waitId = "wait-12345678-1234-4234-9234-123456789012"
+    const childTaskId = "subagent-00000000-0000-4000-8000-000000000004"
+    const root = fixture(identity("turn", "root-1"), {
+      id: "root-wait-alias", toolName: "wait_subagents", toolVersion: "1", status: "completed",
+      output: { waitId, status: "waiting", deadlineAt: "2026-09-09T13:00:00.000Z", matchedTaskIds: [], taskIds: [childTaskId],
+        tasks: [{ taskId: childTaskId, status: "waiting", role: "scout", result: null, failureReason: null }] }, errorCode: null,
+    })
+    await expect(runTurnExecutionLoop(root.options)).resolves.toMatchObject({ status: "waiting_for_dependency", waitId })
+  })
+
+  it("rejects a child-only agent.wait alias even when its receipt uses the root ID shape", async () => {
+    const child = fixture(identity("task", "child-wait", 2), {
+      id: "child-agent-wait", toolName: "agent.wait", toolVersion: "1", status: "completed",
+      output: { waitId: "wait-12345678-1234-4234-9234-123456789012", status: "waiting", deadlineAt: "2026-09-09T13:00:00.000Z", matchedTaskIds: [] }, errorCode: null,
+    })
+    await expect(runTurnExecutionLoop(child.options)).resolves.toMatchObject({ status: "failed", errorCode: "invalid_output" })
+  })
+
   it("continues to the next model step for ready wait output", async () => {
-    const output = { waitId: "wait-ready", status: "ready", deadlineAt: "2026-09-09T13:00:00.000Z", matchedTaskIds: ["child-a"] }
+    const childTaskId = "subagent-00000000-0000-4000-8000-000000000004"
+    const output = { waitId: "wait-12345678-1234-4234-9234-123456789012", status: "ready", deadlineAt: "2026-09-09T13:00:00.000Z",
+      taskIds: [childTaskId], matchedTaskIds: [childTaskId],
+      tasks: [{ taskId: childTaskId, status: "completed", role: "scout", result: null, failureReason: null }] }
     const root = fixture(identity("turn", "root-1"), { id: "wait-call", toolName: "wait_subagents", toolVersion: "1", status: "completed", output, errorCode: null })
     const result = await runTurnExecutionLoop(root.options)
     expect(result.status).toBe("completed")
@@ -3875,6 +3905,7 @@ describe("owner-agnostic turn execution loop", () => {
 
   it.each([
     { label: "malformed ID", output: { waitId: "wait-invalid", status: "waiting", deadlineAt: "2026-09-09T13:00:00.000Z", matchedTaskIds: [], taskIds: ["child-a"] } },
+    { label: "child ID on root alias", output: { waitId: "12345678-1234-4234-9234-123456789012", status: "waiting", deadlineAt: "2026-09-09T13:00:00.000Z", matchedTaskIds: [], taskIds: ["child-a"] } },
     { label: "missing ID", output: { status: "waiting", deadlineAt: "2026-09-09T13:00:00.000Z", matchedTaskIds: [], taskIds: ["child-a"] } },
   ])("fails the Turn visibly for a waiting receipt with a $label", async ({ output }) => {
     const root = fixture(identity("turn", "root-1"), { id: "wait-call", toolName: "wait_subagents", toolVersion: "1", status: "completed", output, errorCode: null })

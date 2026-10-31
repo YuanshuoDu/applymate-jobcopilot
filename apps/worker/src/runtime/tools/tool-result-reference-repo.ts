@@ -3,11 +3,12 @@ import type pg from "pg"
 import { canonicalJson, redactSensitiveValue } from "@jobcopilot/shared"
 
 import { executionOwnerFence, type ExecutionOwner, type ExecutionOwnerFence } from "../execution-owner.js"
+import { findCanonicalToolSource, prepareSourceToolResultJson, type CanonicalToolSource } from "./tool-result-reference-source.js"
 import {
   MAX_TOOL_RESULT_BYTES, MAX_TOOL_RESULT_READ_BYTES, type PutToolResultInput,
   type ToolResultChunk, type ToolResultReadInput, type ToolResultReferenceRecord,
-  type ToolResultReferenceRepository, type VerifiedReadProvenance, type CanonicalToolSourceName,
-  matchesVerifiedToolResultRetry, prepareToolResultJson, ToolResultSanitizationError, verifyToolResultSanitization,
+  type ToolResultReferenceRepository, type VerifiedReadProvenance,
+  matchesVerifiedToolResultRetry, verifyToolResultSanitization,
 } from "./tool-result-reference-types.js"
 
 type Client = Pick<pg.PoolClient, "query" | "release">
@@ -16,7 +17,6 @@ type QueryResult<T> = { rows: T[]; rowCount: number | null }
 type ResultRow = Omit<ToolResultReferenceRecord, "sanitizedJson" | "createdAt" | "updatedAt"> & {
   sanitizedJson: unknown; createdAt: Date | string; updatedAt: Date | string
 }
-type CanonicalToolSource = { toolName: CanonicalToolSourceName; taskAttemptCount: number; role: string; taskType: string }
 const OPEN_SESSION = `"status" NOT IN ('aborted', 'archived')`
 const VERIFIED_READS = new WeakMap<object, VerifiedReadProvenance>()
 const SCHEDULED_PREPARE_TOOL = "scheduled.application.prepare"
@@ -116,36 +116,6 @@ async function assertReadFence(client: Client, fence: ExecutionOwnerFence, now: 
   if (!result.rows[0]) throw new ToolResultRepositoryError("tool_result_fence_rejected")
 }
 
-type SourceScope = Pick<ExecutionOwnerFence, "userId" | "sessionId" | "turnId" | "taskId"> & { readonly stepId: string; readonly toolCallId: string }
-
-async function findCanonicalToolSource(client: Client, scope: SourceScope): Promise<CanonicalToolSource> {
-  const result = await client.query<{ toolName: string | null; taskAttemptCount: number; role: string; taskType: string }>(`SELECT item."content"->>'toolName' AS "toolName",
-      task."attemptCount" AS "taskAttemptCount", task."role" AS "role", task."taskType" AS "taskType" FROM "agent_items" AS item
-    JOIN "agent_steps" AS step ON step."id" = item."stepId" AND step."sessionId" = item."sessionId" AND step."turnId" = item."turnId" AND step."taskId" = item."taskId"
-    JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId" JOIN "agent_sessions" AS session ON session."id" = item."sessionId" AND session."userId" = turn."userId"
-    JOIN "sub_agent_tasks" AS task ON task."id" = item."taskId" AND task."sessionId" = item."sessionId" AND task."turnId" = item."turnId"
-    WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3 AND item."stepId" = $4 AND item."type" = 'tool_call' AND item."content"->>'toolCallId' = $5
-      AND turn."userId" = $6 AND session."userId" = $6 ORDER BY item."id" LIMIT 2`,
-  [scope.sessionId, scope.turnId, scope.taskId, scope.stepId, scope.toolCallId, scope.userId])
-  const source = result.rows[0]
-  if (result.rows.length !== 1 || typeof source?.toolName !== "string" || !Number.isSafeInteger(source.taskAttemptCount)
-    || source.taskAttemptCount < 0 || typeof source.role !== "string" || typeof source.taskType !== "string") {
-    throw new ToolResultRepositoryError("tool_result_fence_rejected")
-  }
-  return { toolName: source.toolName as CanonicalToolSourceName, taskAttemptCount: source.taskAttemptCount, role: source.role, taskType: source.taskType }
-}
-
-function safeJson(value: unknown, toolName: CanonicalToolSourceName, expectedTaskId: string, expectedAttemptCount: number): { value: ToolResultReferenceRecord["sanitizedJson"]; encoded: string; bytes: number; sha256: string } {
-  try {
-    const safe = prepareToolResultJson(value, toolName, expectedTaskId, expectedAttemptCount)
-    if (safe.bytes > MAX_TOOL_RESULT_BYTES) throw new ToolResultRepositoryError("tool_result_too_large")
-    return safe
-  } catch (error) {
-    if (error instanceof ToolResultRepositoryError) throw error
-    throw new ToolResultRepositoryError(error instanceof ToolResultSanitizationError ? error.code : "tool_result_invalid_json")
-  }
-}
-
 export function isVerifiedToolResultChunk(value: unknown, owner: ExecutionOwner, toolCallId: string): value is ToolResultChunk {
   if (typeof value !== "object" || value === null || !Object.isFrozen(value)) return false
   let fence: ExecutionOwnerFence
@@ -166,9 +136,9 @@ async function findIdentity(client: Client, stepId: string, toolCallId: string):
   return result.rows[0] ? row(result.rows[0]) : null
 }
 
-function checkRow(value: ToolResultReferenceRecord, safe: ReturnType<typeof safeJson>, retryInput: unknown,
+function checkRow(value: ToolResultReferenceRecord, safe: ReturnType<typeof prepareSourceToolResultJson>, retryInput: unknown,
   source: CanonicalToolSource): ToolResultReferenceRecord {
-  if (!matchesVerifiedToolResultRetry(value, safe, retryInput, source.toolName, source.taskAttemptCount)) throw new ToolResultRepositoryError("tool_result_conflict")
+  if (!matchesVerifiedToolResultRetry(value, safe, retryInput, source.toolName, source.taskAttemptCount, source.ownerKind)) throw new ToolResultRepositoryError("tool_result_conflict")
   return value
 }
 
@@ -207,11 +177,14 @@ export function createToolResultReferenceRepository(pool: Pool): ToolResultRefer
         await assertOpenSession(client, fence)
         await assertWriteFence(client, fence, stepId, now)
         const source = await findCanonicalToolSource(client, { ...fence, stepId, toolCallId })
+        if (!source) throw new ToolResultRepositoryError("tool_result_fence_rejected")
+        if (source.ownerKind !== fence.kind) throw new ToolResultRepositoryError("tool_result_fence_rejected")
         if (source.toolName === SCHEDULED_PREPARE_TOOL && (fence.kind !== "task" || fence.attemptCount !== source.taskAttemptCount
           || source.role !== "prepare" || source.taskType !== "scheduled_application_prepare")) {
           throw new ToolResultRepositoryError("tool_result_fence_rejected")
         }
-        const safe = safeJson(input.value, source.toolName, fence.taskId, source.taskAttemptCount)
+        const safe = prepareSourceToolResultJson(input.value, source, fence.taskId,
+          code => new ToolResultRepositoryError(code))
         const id = `tool-result-${randomUUID()}`
         await client.query(`INSERT INTO "agent_tool_result_references"
           ("id", "userId", "sessionId", "turnId", "stepId", "taskId", "toolCallId", "sanitizedJson", "sha256", "byteCount", "createdAt", "updatedAt")
@@ -242,6 +215,7 @@ export function createToolResultReferenceRepository(pool: Pool): ToolResultRefer
         if (!result.rows[0]) return null
         const stored = row(result.rows[0])
         const source = await findCanonicalToolSource(client, stored)
+        if (!source) throw new ToolResultRepositoryError("tool_result_fence_rejected")
         if (source.toolName === SCHEDULED_PREPARE_TOOL) {
           if (fence.kind !== "task" || fence.taskId !== stored.taskId || fence.attemptCount !== source.taskAttemptCount) {
             throw new ToolResultRepositoryError("tool_result_fence_rejected")
@@ -251,7 +225,7 @@ export function createToolResultReferenceRepository(pool: Pool): ToolResultRefer
           }
         }
         let sanitizedJson: ToolResultReferenceRecord["sanitizedJson"]
-        try { sanitizedJson = verifyToolResultSanitization(stored, source.toolName, source.taskAttemptCount) }
+        try { sanitizedJson = verifyToolResultSanitization(stored, source.toolName, source.taskAttemptCount, source.ownerKind) }
         catch { throw new ToolResultRepositoryError("tool_result_corrupt") }
         const verified = { ...stored, sanitizedJson }
         const output = Object.freeze(chunk(verified, input.cursor))

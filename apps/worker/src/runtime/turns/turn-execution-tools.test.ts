@@ -156,8 +156,10 @@ describe("recoverPersistedToolCalls", () => {
 
 describe("executeTools persisted replay", () => {
   const durableWaitId = "wait-12345678-1234-4234-9234-123456789012"
+  const waitTaskId = "subagent-00000000-0000-4000-8000-000000000001"
   const call = { id: "wait-call", name: "agent.wait", arguments: { idempotencyKey: "wait-1", taskIds: ["child-1"], mode: "all", timeoutMs: 30_000 } }
-  const waitReceipt = { waitId: durableWaitId, status: "waiting", deadlineAt: "2026-09-10T00:00:00.000Z", matchedTaskIds: ["child-1"] }
+  const waitReceipt = { waitId: durableWaitId, status: "waiting", taskIds: [waitTaskId], deadlineAt: "2026-09-10T00:00:00.000Z", matchedTaskIds: [waitTaskId],
+    tasks: [{ taskId: waitTaskId, status: "waiting", role: "scout", result: null, failureReason: null }] }
   const resolvedInput = { taskIds: ["child-1"], mode: "all" }
   const resolvedOutput = { waitId: durableWaitId, status: "ready", matchedTaskIds: ["child-1"], targetTaskIds: ["child-1"], tasks: [{ taskId: "child-1", status: "completed" }] }
   const nativeOutput = {
@@ -167,14 +169,17 @@ describe("executeTools persisted replay", () => {
       child: { taskId: "child-1", rootTaskId: "root-1", parentTaskId: "root-1", path: "/root-1/child-1", depth: 1, role: "scout", taskType: "research", status: "queued" } },
   }
 
-  function projection(output: unknown, input: unknown = resolvedInput, includeInput = true) {
-    return { id: `wait-result:${durableWaitId}`, content: { toolCallId: `wait:${durableWaitId}`, toolName: "agent.wait", ...(includeInput ? { input } : {}), status: "completed", output } }
+  function projection(output: unknown, input: unknown = resolvedInput, includeInput = true, toolName = "agent.wait") {
+    return { id: `wait-result:${durableWaitId}`, content: { toolCallId: `wait:${durableWaitId}`, toolName, ...(includeInput ? { input } : {}), status: "completed", output } }
   }
 
-  function replayFixture(output: unknown, persistedCall: { id: string; name: string; arguments: Record<string, unknown> } = call, additionalToolObservations: readonly { id: string; content: unknown }[] = []) {
+  function replayFixture(output: unknown, persistedCall: { id: string; name: string; arguments: Record<string, unknown> } = call,
+    additionalToolObservations: readonly { id: string; content: unknown }[] = [], ownerKind: "turn" | "task" = "turn") {
     const executeTool = vi.fn()
     const options = {
-      identity: { kind: "turn", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "root-1", rootTaskId: "root-1", ownerId: "worker-2", leaseVersion: 2, leaseExpiresAt: new Date("2026-09-10T00:00:00.000Z") },
+      identity: ownerKind === "turn"
+        ? { kind: "turn", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "root-1", rootTaskId: "root-1", ownerId: "worker-2", leaseVersion: 2, leaseExpiresAt: new Date("2026-09-10T00:00:00.000Z") }
+        : { kind: "task", userId: "user-1", sessionId: "session-1", turnId: "turn-1", taskId: "subagent-00000000-0000-4000-8000-000000000009", rootTaskId: "root-1", ownerId: "worker-2", attemptCount: 1, leaseExpiresAt: new Date("2026-09-10T00:00:00.000Z") },
       scope: { userId: "user-1" },
       snapshot: {
         system: [], profile: [], steerHistory: [], businessRefs: [],
@@ -254,6 +259,42 @@ describe("executeTools persisted replay", () => {
     expect(fixture.executeTool).not.toHaveBeenCalled()
   })
 
+  it("uses the raw UUID namespace for wait_subagents replay receipts", async () => {
+    const childCall = { ...call, name: "wait_subagents" }
+    const childReceipt = { ...waitReceipt, waitId: "12345678-1234-4234-9234-123456789012" }
+    const fixture = replayFixture(childReceipt, childCall, [], "task")
+    const result = await replay(fixture, childCall)
+
+    expect(result.wait).toEqual({ status: "waiting_for_dependency", waitId: childReceipt.waitId, stepCount: 0, toolCallCount: 0 })
+    expect(fixture.executeTool).not.toHaveBeenCalled()
+  })
+
+  it("rejects a root-prefixed wait ID on wait_subagents replay", async () => {
+    const childCall = { ...call, name: "wait_subagents" }
+    const fixture = replayFixture(waitReceipt, childCall, [], "task")
+
+    await expect(replay(fixture, childCall)).rejects.toMatchObject({ code: "invalid_output" })
+    expect(fixture.executeTool).not.toHaveBeenCalled()
+  })
+
+  it("accepts the root wait_subagents alias with its root-owned wait ID", async () => {
+    const rootCall = { ...call, name: "wait_subagents" }
+    const fixture = replayFixture(waitReceipt, rootCall)
+
+    await expect(replay(fixture, rootCall)).resolves.toMatchObject({ wait: { status: "waiting_for_dependency", waitId: durableWaitId } })
+    expect(fixture.executeTool).not.toHaveBeenCalled()
+  })
+
+  it("does not interpret another tool's waiting-shaped output as a durable wait", async () => {
+    const otherCall = { ...call, name: "jobs.search" }
+    const fixture = replayFixture({ status: "waiting", waitId: "not-a-wait-id", deadlineAt: "later", matchedTaskIds: [] }, otherCall)
+
+    const result = await replay(fixture, otherCall)
+
+    expect(result.wait).toBeNull()
+    expect(fixture.executeTool).not.toHaveBeenCalled()
+  })
+
   it.each([
     ["redaction marker", { ...waitReceipt, waitId: "[REDACTED]" }],
     ["missing", { status: "waiting", deadlineAt: "2026-09-10T00:00:00.000Z", matchedTaskIds: [] }],
@@ -321,7 +362,7 @@ describe("executeTools persisted replay", () => {
   it.each(["agent.wait", "wait_subagents"] as const)("fails closed when %s replay has only an archived result reference", async toolName => {
     const reference = { $ref: "tool-result-00000000-0000-4000-8000-000000000002", sizeBytes: 9_000, sha256: "a".repeat(64) }
     const persistedCall = { ...call, name: toolName }
-    const fixture = replayFixture(reference, persistedCall, [projection(resolvedOutput)])
+    const fixture = replayFixture(reference, persistedCall, [projection(resolvedOutput, resolvedInput, true, toolName)])
 
     await expect(replay(fixture, persistedCall)).rejects.toMatchObject({ code: "persistence_conflict" })
     expect(fixture.executeTool).not.toHaveBeenCalled()
@@ -375,7 +416,7 @@ describe("executeTools persisted replay", () => {
       output: { waitId: durableWaitId, status: "timed_out", matchedTaskIds: [], targetTaskIds: ["child-a", "child-b"], tasks: [{ taskId: "child-a", status: "completed" }, { taskId: "child-b", status: "running" }] },
     },
   ])("accepts a valid $label projection", async ({ modelCall, input, output }) => {
-    const fixture = replayFixture({ ...waitReceipt, matchedTaskIds: output.matchedTaskIds }, modelCall, [projection(output, input)])
+    const fixture = replayFixture(waitReceipt, modelCall, [projection(output, input, true, modelCall.name)])
 
     const result = await replay(fixture, modelCall)
 
@@ -402,7 +443,7 @@ describe("executeTools persisted replay", () => {
     { label: "ready all partial match", mode: "all" as const, input: { taskIds: ["child-a", "child-b"], mode: "all" }, output: { ...multiResolvedOutput, matchedTaskIds: ["child-a"] } },
   ])("keeps the durable handoff for a $label projection", async ({ mode, input, includeInput, output }) => {
     const modelCall = { ...call, arguments: { ...call.arguments, taskIds: ["child-b", "child-a"], mode } }
-    const fixture = replayFixture(waitReceipt, modelCall, [projection(output, input, includeInput)])
+    const fixture = replayFixture(waitReceipt, modelCall, [projection(output, input, includeInput, modelCall.name)])
 
     const result = await replay(fixture, modelCall)
 
@@ -411,9 +452,10 @@ describe("executeTools persisted replay", () => {
   })
 
   it("continues unchanged for an ordinary completed tool replay", async () => {
-    const fixture = replayFixture({ jobs: ["one"] })
+    const ordinaryCall = { ...call, name: "jobs.search", arguments: { query: "Berlin" } }
+    const fixture = replayFixture({ jobs: ["one"] }, ordinaryCall)
 
-    const result = await replay(fixture)
+    const result = await replay(fixture, ordinaryCall)
 
     expect(result.wait).toBeNull()
     expect(result.snapshot).toBe(fixture.options.snapshot)
