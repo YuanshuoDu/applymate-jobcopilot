@@ -20,7 +20,36 @@ const task = {
   userId: "user-1",
 }
 
+function sqlParenthesisBalance(sql: string): number {
+  let depth = 0
+  let quote: "'" | '"' | null = null
+  for (let index = 0; index < sql.length; index += 1) {
+    const character = sql[index]
+    if (quote) {
+      if (character === quote) {
+        if (sql[index + 1] === quote) { index += 1; continue }
+        quote = null
+      }
+      continue
+    }
+    if (character === "'" || character === '"') { quote = character; continue }
+    if (character === "(") depth += 1
+    if (character === ")") depth -= 1
+    if (depth < 0) return depth
+  }
+  return quote ? Number.NaN : depth
+}
+
 describe("expired recovery SQL predicates", () => {
+  it("keeps the recovered-source and generated blocker SQL parenthesis-balanced", async () => {
+    let generatedSql = ""
+    const query = vi.fn(async (sql: string) => { generatedSql = sql; return { rows: [] } })
+    await expect(hasBlockingExternalCall({ query } as never, task, undefined, "continuation-1")).resolves.toBe(false)
+    expect(sqlParenthesisBalance(CHILD_WAIT_SOURCE_RECOVERED_RESULT_SQL)).toBe(0)
+    expect(sqlParenthesisBalance(CHILD_WAIT_CLAIM_RECOVERY_SQL)).toBe(0)
+    expect(sqlParenthesisBalance(generatedSql)).toBe(0)
+  })
+
   it("keeps ready child waits scoped to the same Session, Turn, root, attempt, and parent", () => {
     expect(CHILD_WAIT_RESUMABLE_SQL).toContain('waitTurn."sessionId" = wait."sessionId"')
     expect(CHILD_WAIT_RESUMABLE_SQL).toContain('waitTurn."userId" = $3 AND waitTurn."rootTaskId" = task."rootTaskId"')

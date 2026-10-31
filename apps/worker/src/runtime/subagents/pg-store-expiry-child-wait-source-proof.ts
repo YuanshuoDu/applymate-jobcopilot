@@ -209,6 +209,6 @@ export const CHILD_WAIT_SOURCE_RECOVERED_RESULT_SQL = `(
             'task:' || owner."id" || ':event:tool-call-completed:' || (sourceCall."content"->>'toolCallId') || ':' || sourceCall."id" || ':1',
             'task:' || owner."id" || ':event:tool-finished:' || (sourceCall."content"->>'toolCallId'),
             'task:' || owner."id" || ':event:item-started:' || sourceResult."id",
-            'task:' || owner."id" || ':event:tool-result-completed:' || (sourceCall."content"->>'toolCallId') || ':' || sourceResult."id" || ':1'])) = 6
+            'task:' || owner."id" || ':event:tool-result-completed:' || (sourceCall."content"->>'toolCallId') || ':' || sourceResult."id" || ':1']))) = 6
   )
 )`
