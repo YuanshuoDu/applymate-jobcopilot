@@ -1860,6 +1860,25 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
   beforeAll(() => { pool = new Pool({ connectionString: databaseUrl!, max: 8 }) })
   afterAll(async () => { await pool?.end() })
 
+  it("parses the recovered child-wait blocker query on disposable PostgreSQL", async () => {
+    const suffix = randomUUID()
+    const snapshot: BlockingTaskSnapshot = {
+      id: `missing-wait-task-${suffix}`, userId: `missing-wait-user-${suffix}`,
+      sessionId: `missing-wait-session-${suffix}`, turnId: `missing-wait-turn-${suffix}`,
+      rootTaskId: `missing-wait-root-${suffix}`, leaseOwner: "fixture-owner", attemptCount: 2,
+      leaseExpiresAt: new Date("2099-01-01T00:00:00.000Z"),
+    }
+    const client = await pool.connect()
+    try {
+      await client.query("BEGIN")
+      await client.query("SELECT set_config('app.user_id', $1, true)", [snapshot.userId])
+      await expect(hasBlockingExternalCall(client, snapshot)).resolves.toBe(false)
+    } finally {
+      await client.query("ROLLBACK").catch(() => undefined)
+      client.release()
+    }
+  })
+
   it("recovers registered, pre-continuation, and streaming-continuation crash cuts on one attempt", async () => {
     const suffix = randomUUID()
     const ids: FixtureIds = {

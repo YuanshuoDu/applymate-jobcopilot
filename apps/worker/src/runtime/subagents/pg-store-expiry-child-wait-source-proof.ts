@@ -118,9 +118,9 @@ export const CHILD_WAIT_SOURCE_RECOVERED_RESULT_SQL = `(
     ELSE FALSE END
   AND wait."result"->'sourceLifecycleRecovery'->>'schemaVersion' = 'child-wait-source-lifecycle.v1'
   AND wait."result"->'sourceLifecycleRecovery'->>'userId' = session."userId"
-  AND wait."result"->'sourceLifecycleRecovery'->>'sessionId' = owner."sessionId'
-  AND wait."result"->'sourceLifecycleRecovery'->>'turnId' = owner."turnId'
-  AND wait."result"->'sourceLifecycleRecovery'->>'rootTaskId' = owner."rootTaskId'
+  AND wait."result"->'sourceLifecycleRecovery'->>'sessionId' = owner."sessionId"
+  AND wait."result"->'sourceLifecycleRecovery'->>'turnId' = owner."turnId"
+  AND wait."result"->'sourceLifecycleRecovery'->>'rootTaskId' = owner."rootTaskId"
   AND wait."result"->'sourceLifecycleRecovery'->>'taskId' = owner."id"
   AND jsonb_typeof(wait."result"->'sourceLifecycleRecovery'->'ownerId') = 'string'
   AND char_length(wait."result"->'sourceLifecycleRecovery'->>'ownerId') BETWEEN 1 AND 256
