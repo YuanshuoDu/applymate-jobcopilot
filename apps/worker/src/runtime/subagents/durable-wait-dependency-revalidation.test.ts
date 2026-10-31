@@ -12,10 +12,18 @@ import { durableWaitDependencyTaskIds, durableWaitReportMatchesCurrent, revalida
 const scope: GraphIdentityScope = { userId: "user", sessionId: "session", turnId: "turn", rootTaskId: "root", parentTaskId: "root" }
 const scout: TaskGraphVerificationContract = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout", criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }] }
 const analyst: TaskGraphVerificationContract = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [{ id: "source-match", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout" } }] }
-function snapshot(crossNode = false): TaskGraphSnapshot {
+function snapshot(crossNode = false, perScout = false): TaskGraphSnapshot {
+  const sources = perScout ? [
+    { key: "scout-a", taskId: "scout-a-task", templateId: "scout", goal: "Search A", successCriteria: ["Find A"], dependsOn: [], depth: 1, verification: scout, verificationDisposition: "typed" },
+    { key: "scout-b", taskId: "scout-b-task", templateId: "scout", goal: "Search B", successCriteria: ["Find B"], dependsOn: [], depth: 1, verification: scout, verificationDisposition: "typed" },
+  ] : [{ key: "scout", taskId: "scout-task", templateId: "scout", goal: "Search", successCriteria: ["Find"], dependsOn: [], depth: 1, verification: scout, verificationDisposition: "typed" }]
+  const analystContract = perScout ? { ...analyst, criteria: [{ id: "each-source", check: {
+    kind: "findings_cover_each_scout_candidates_gte", dependencyNodeKeys: ["scout-a", "scout-b"], minimumPercent: 50,
+  } }] } : analyst
+  const dependencies = perScout ? ["scout-a", "scout-b"] : ["scout"]
   return { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
-    { key: "scout", taskId: "scout-task", templateId: "scout", goal: "Search", successCriteria: ["Find"], dependsOn: [], depth: 1, verification: scout, verificationDisposition: "typed" },
-    { key: "analyst", taskId: "analyst-task", templateId: "analyst", goal: "Assess", successCriteria: ["Assess"], dependsOn: crossNode ? ["scout"] : [], depth: 1, verification: crossNode ? analyst : { ...analyst, criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }] }, verificationDisposition: "typed" },
+    ...sources,
+    { key: "analyst", taskId: "analyst-task", templateId: "analyst", goal: "Assess", successCriteria: ["Assess"], dependsOn: crossNode ? dependencies : [], depth: 2, verification: crossNode ? analystContract : { ...analyst, criteria: [{ id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } }] }, verificationDisposition: "typed" },
   ] } as TaskGraphSnapshot
 }
 function loaded(graphSnapshot: TaskGraphSnapshot, result: unknown): LoadedGraph {
@@ -40,6 +48,16 @@ describe("durable wait dependency revalidation", () => {
     const taskGraph = loaded(current, { structuredResult: { current: true } })
     loadGraph.mockResolvedValue(taskGraph)
     const result = await revalidateDurableWaitDependencies({ query: vi.fn() } as never, scope, current, [target])
+    expect(loadGraph).toHaveBeenCalledWith(expect.anything(), scope, false)
+    expect(result.dependencyTaskIds).toEqual(new Set(["analyst-task"]))
+    expect(result.targets[0]).toMatchObject({ status: "completed", result: { structuredResult: { current: true } } })
+  })
+
+  it("revalidates every Scout selected by an explicit per-source coverage check", async () => {
+    const current = snapshot(true, true), target = { id: "analyst-task", status: "running", role: "analyst", result: {} }
+    loadGraph.mockResolvedValue(loaded(current, { structuredResult: { current: true } }))
+    const result = await revalidateDurableWaitDependencies({ query: vi.fn() } as never, scope, current, [target])
+    expect(durableWaitDependencyTaskIds(current, [target])).toEqual(new Set(["analyst-task"]))
     expect(loadGraph).toHaveBeenCalledWith(expect.anything(), scope, false)
     expect(result.dependencyTaskIds).toEqual(new Set(["analyst-task"]))
     expect(result.targets[0]).toMatchObject({ status: "completed", result: { structuredResult: { current: true } } })

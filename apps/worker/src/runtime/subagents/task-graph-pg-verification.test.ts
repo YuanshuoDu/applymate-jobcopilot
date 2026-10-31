@@ -317,21 +317,79 @@ describe("TaskGraph PostgreSQL verification evidence", () => {
     expect(changed.verified).toBe(false)
   })
 
-  it("passes owner-scoped Scout dependency evidence through completed Analyst verification", async () => {
+  it("keeps a zero-evidence empty Analyst with multiple Scout dependencies unverified", async () => {
+    const analystScope = { ...scope, taskId: "analyst-empty" }
+    const emptyAnalystResult = {
+      schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
+      findings: [], evidence: [], summary: "No jobs to analyze",
+    }
+    const scoutVerification = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout" as const,
+      criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte" as const, minimum: 1 } }],
+    }
+    const analystVerification = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst" as const,
+      criteria: [
+        { id: "source-coverage", check: { kind: "findings_cover_each_scout_candidates_gte" as const, dependencyNodeKeys: ["scout-a", "scout-b"], minimumPercent: 50 } },
+        { id: "finding-count", check: { kind: "finding_count_gte" as const, minimum: 1 } },
+      ],
+    }
+    const graph = parseTaskGraphSnapshot({ schemaVersion: "agent-harness.v2.task-graph", nodes: [
+      { key: "scout-a", templateId: "scout", goal: "Find jobs A", successCriteria: ["Find candidates A"], dependsOn: [], depth: 1,
+        taskId: "scout-a-task", verificationDisposition: "typed", verification: scoutVerification },
+      { key: "scout-b", templateId: "scout", goal: "Find jobs B", successCriteria: ["Find candidates B"], dependsOn: [], depth: 1,
+        taskId: "scout-b-task", verificationDisposition: "typed", verification: scoutVerification },
+      { key: "analyst", templateId: "analyst", goal: "Analyze jobs", successCriteria: ["Cover each source"], dependsOn: ["scout-a", "scout-b"], depth: 2,
+        taskId: analystScope.taskId, verificationDisposition: "typed", verification: analystVerification },
+    ] })
+    const analystNode = graph.nodes[2]!
+    const analystTask = {
+      id: analystScope.taskId, sessionId: analystScope.sessionId, turnId: analystScope.turnId,
+      rootTaskId: analystScope.rootTaskId, turnRootTaskId: analystScope.rootTaskId, parentTaskId: analystScope.parentTaskId,
+      attemptCount: 1, status: "completed", role: "analyst", userId: analystScope.userId,
+      result: { status: "completed", structuredResult: emptyAnalystResult },
+    }
+    const scoutProjection = (jobId: string): TaskGraphVerificationEvidenceProjection => ({
+      schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "scout",
+      candidates: [{ jobId, evidenceIds: [`read:job:${jobId}`] }], evidenceIds: [`read:job:${jobId}`],
+    })
+    const dependencies = new Map<string, TaskGraphVerificationEvidenceProjection>([
+      ["scout-a", scoutProjection("job-a")], ["scout-b", scoutProjection("job-b")],
+    ])
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes('SELECT task."id"')) return { rows: [analystTask], rowCount: 1 }
+      if (sql.includes('SELECT item."id"') || sql.includes('SELECT event."id"')) return { rows: [], rowCount: 0 }
+      throw new Error("unexpected_empty_multi_scout_query")
+    })
+    const result = await verifyCompletedTaskGraphNodeEvidence({ query } as unknown as Pick<pg.PoolClient, "query">, {
+      scope: analystScope, snapshot: graph, node: analystNode, structuredResult: emptyAnalystResult, dependencies,
+    })
+
+    expect(result).toMatchObject({
+      verified: false,
+      report: { status: "unverified", reasonCode: "canonical_evidence_missing", evidenceDigest: null, resultDigest: null },
+      evaluation: { status: "unverified", reasonCode: "canonical_evidence_missing" },
+    })
+    expect(result.projection).toBeUndefined()
+  })
+
+  it("persists independent candidate coverage over owner-scoped Scout dependencies", async () => {
     const analystScope = { ...scope, taskId: "analyst-task" }
     const analystSnapshot = parseTaskGraphSnapshot({ schemaVersion: "agent-harness.v2.task-graph", nodes: [
-      { key: "scout", templateId: "scout", goal: "Find jobs", successCriteria: ["Find one"], dependsOn: [], depth: 1,
+      { key: "scout-a", templateId: "scout", goal: "Find jobs A", successCriteria: ["Find candidates A"], dependsOn: [], depth: 1,
         taskId: "scout-task", verificationDisposition: "typed", verification },
-      { key: "analyst", templateId: "analyst", goal: "Analyze jobs", successCriteria: ["Analyze one"], dependsOn: ["scout"], depth: 2,
+      { key: "scout-b", templateId: "scout", goal: "Find jobs B", successCriteria: ["Find candidates B"], dependsOn: [], depth: 1,
+        taskId: "scout-b-task", verificationDisposition: "typed", verification },
+      { key: "analyst", templateId: "analyst", goal: "Analyze jobs", successCriteria: ["Analyze one"], dependsOn: ["scout-a", "scout-b"], depth: 2,
         taskId: analystScope.taskId, verificationDisposition: "typed", verification: {
           schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst",
           criteria: [
-            { id: "scout-membership", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout" } },
+            { id: "scout-coverage", check: { kind: "findings_cover_each_scout_candidates_gte", dependencyNodeKeys: ["scout-a", "scout-b"], minimumPercent: 50 } },
             { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
           ],
         } },
     ] })
-    const analystNode = analystSnapshot.nodes[1]!
+    const analystNode = analystSnapshot.nodes[2]!
     const analystResult = {
       schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
       findings: [{ jobId: "job-1", score: 8, evidenceIds: ["analyst-model-ref"] }],
@@ -363,17 +421,21 @@ describe("TaskGraph PostgreSQL verification evidence", () => {
       if (sql.includes('SELECT event."id"')) return { rows: events, rowCount: events.length }
       throw new Error("unexpected_completed_analyst_verification_query")
     })
-    const dependencyEvidence = new Map<string, TaskGraphVerificationEvidenceProjection>([["scout", {
-      schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "scout",
-      candidates: [{ jobId: "job-1", evidenceIds: ["read:job:job-1"] }], evidenceIds: ["read:job:job-1"],
-    }]])
+    const dependencyEvidence = new Map<string, TaskGraphVerificationEvidenceProjection>([
+      ["scout-a", { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "scout",
+        candidates: ["job-1", "job-a"].map(jobId => ({ jobId, evidenceIds: [`read:job:${jobId}`] })),
+        evidenceIds: ["read:job:job-1", "read:job:job-a"] }],
+      ["scout-b", { schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "scout",
+        candidates: ["job-1", "job-b"].map(jobId => ({ jobId, evidenceIds: [`read:job:${jobId}`] })),
+        evidenceIds: ["read:job:job-1", "read:job:job-b"] }],
+    ])
     const result = await verifyCompletedTaskGraphNodeEvidence({ query } as unknown as Pick<pg.PoolClient, "query">, {
       scope: analystScope, snapshot: analystSnapshot, node: analystNode, structuredResult: analystResult, dependencies: dependencyEvidence,
     })
 
     expect(result).toMatchObject({ verified: true, evaluation: { status: "passed", reasonCode: "criteria_met" } })
     expect(result.report.criteria).toEqual([
-      { criterionId: "scout-membership", status: "passed", reasonCode: "criteria_met" },
+      { criterionId: "scout-coverage", status: "passed", reasonCode: "criteria_met" },
       { criterionId: "finding-count", status: "passed", reasonCode: "criteria_met" },
     ])
   })
