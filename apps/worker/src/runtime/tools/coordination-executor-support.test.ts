@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest"
 import { DurableWaitStoreError } from "../subagents/durable-wait-store.js"
 import type { DurableWaitScheduledGateInvocation } from "./coordination-types.js"
 import { digestNativeVerificationValue, NATIVE_VERIFICATION_REPORT_SCHEMA } from "../subagents/native-verification-contract.js"
-import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-verification-report.js"
+import { parseStoredTaskGraphVerificationReport, TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION, TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-verification-report.js"
 import type { CoordinationStore, CoordinationTaskView, DurableWaitPort } from "./coordination-types.js"
 import { createWorkerToolRuntime } from "./index.js"
 import { InMemoryToolLifecycleSink } from "./lifecycle.js"
@@ -131,6 +131,48 @@ describe("coordination executor support", () => {
     for (const digest of ["c", "d", "e", "f"]) expect(JSON.stringify(output)).not.toContain(digest.repeat(64))
     expect(terminalTask.result).toEqual(storedResult)
     expect(storedReport.dependencyBindings).toHaveLength(1)
+  })
+
+  it("omits v2 failed empty-Analyst proofs from direct list and wait projections without graph readback", () => {
+    const scoutBinding = (nodeKey: string, taskId: string, seed: string) => ({ nodeKey, taskId, attemptCount: 1,
+      nodeDigest: seed.repeat(64), resultDigest: "d".repeat(64), evidenceDigest: "e".repeat(64), reportDigest: "f".repeat(64) })
+    const validV2 = {
+      verifierVersion: TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met",
+      criteria: [{ criterionId: "source-coverage", status: "failed", reasonCode: "criterion_not_met" }],
+      evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64),
+      dependencyBindings: [scoutBinding("scout-a", "task-private-source-a", "c"), scoutBinding("scout-b", "task-private-source-b", "9")],
+    }
+    const tamperedV2 = { ...validV2, evidenceDigest: "7".repeat(64), dependencyBindings: [
+      scoutBinding("scout-a", "replaced-source-a", "1"), scoutBinding("scout-b", "replaced-source-b", "2"),
+    ] }
+    for (const candidate of [validV2, tamperedV2]) {
+      expect(parseStoredTaskGraphVerificationReport(candidate, ["source-coverage"], ["scout-a", "scout-b"]))
+        .toMatchObject({ verifierVersion: TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION, status: "failed", dependencyBindings: candidate.dependencyBindings })
+    }
+    const emptyAnalystResult = { role: "analyst", status: "completed", findings: [], evidence: [] }
+    const projectWithoutReport = (report: unknown) => {
+      const storedResult = { structuredResult: emptyAnalystResult, taskGraphVerificationReport: report }
+      const failedTask = { ...task, status: "failed" as const, failureReason: "task_graph_verification_failed", result: storedResult }
+      const listed = taskOutput(failedTask), waited = waitTaskOutput(failedTask)
+      expect(listed.result).not.toHaveProperty("taskGraphVerificationReport")
+      expect(waited.result).not.toHaveProperty("taskGraphVerificationReport")
+      expect(JSON.stringify({ listed, waited })).not.toContain("dependencyBindings")
+      expect(JSON.stringify({ listed, waited })).not.toContain("task-private-source")
+      expect(failedTask.result).toEqual(storedResult)
+      return { listed, waited }
+    }
+    const { listed, waited } = projectWithoutReport(validV2)
+    projectWithoutReport(tamperedV2)
+
+    expect(listed).toMatchObject({ status: "failed", failureReason: "task_graph_verification_failed" })
+    expect(waited).toMatchObject({ status: "failed", failureReason: "task_graph_verification_failed" })
+
+    const legacyV1 = { ...validV2, verifierVersion: TASK_GRAPH_VERIFIER_VERSION }
+    const legacyReport = parseStoredTaskGraphVerificationReport(legacyV1, ["source-coverage"], ["scout-a", "scout-b"])
+    expect(legacyReport).toMatchObject({ verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "failed" })
+    const v1Task = { ...task, status: "failed" as const, result: { structuredResult: emptyAnalystResult, taskGraphVerificationReport: legacyV1 } }
+    expect(taskOutput(v1Task).result).toMatchObject({ taskGraphVerificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "failed" } })
+    expect(waitTaskOutput(v1Task).result).toMatchObject({ taskGraphVerificationReport: { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "failed" } })
   })
 
   it.each([

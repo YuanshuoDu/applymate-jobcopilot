@@ -1,17 +1,19 @@
 import type pg from "pg"
 import {
   evaluateTaskGraphVerification,
+  evaluateTaskGraphVerificationWithReverifiedEmptyAnalyst,
   taskGraphVerificationDependencyNodeKeys,
   TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION,
   type TaskGraphVerificationEvidenceProjection,
 } from "../planning/task-graph-verification.js"
 import type { GraphIdentityScope, LoadedGraph } from "./task-graph-pg-state.js"
-import { parseStoredTaskGraphVerificationReport } from "./task-graph-verification-report.js"
+import { emptyAnalystCoverageDigest, hasNoCurrentAttemptTaskGraphToolReceipts } from "./task-graph-empty-analyst-proof.js"
+import { parseStoredTaskGraphVerificationReport, TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION } from "./task-graph-verification-report.js"
 import { canonicalTaskGraphJson } from "./task-graph-snapshot.js"
 import { verifyCompletedScoutDependencies } from "./task-graph-pg-completed-dependency-verification.js"
 import { loadTaskGraphDependencyResults } from "./task-graph-pg-dependency-context-loader.js"
 import { validateRoleResult } from "./role-results.js"
-import { taskGraphResultDigest } from "./task-graph-pg-verification.js"
+import { taskGraphResultDigest, type TaskGraphVerificationScope } from "./task-graph-pg-verification.js"
 
 type Queryable = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
@@ -36,6 +38,11 @@ export async function revalidateTaskGraphDependencyBindings(client: Queryable, s
       || canonicalTaskGraphJson(report.dependencyBindings) !== canonicalTaskGraphJson(proof.bindings)) {
       throw new Error("task_graph_verification_report_invalid")
     }
+    if (report.verifierVersion === TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION) {
+      if (!task) throw new Error("task_graph_verification_report_invalid")
+      await validateFailedEmptyAnalyst(client, scope, task, result, node, report, proof.projections, proof.bindings)
+      continue
+    }
     if (report.status === "passed") {
       if (!task) throw new Error("task_graph_verification_report_invalid")
       validateCurrentAnalyst(task, result, node, report, proof.projections)
@@ -48,6 +55,45 @@ export async function revalidateTaskGraphDependencyBindings(client: Queryable, s
     if (!composite?.repairComposite) throw new Error("task_graph_verification_report_invalid")
   }
   return loaded
+}
+
+async function validateFailedEmptyAnalyst(
+  client: Queryable,
+  scope: GraphIdentityScope,
+  task: NonNullable<ReturnType<LoadedGraph["tasks"]["get"]>>,
+  result: Row,
+  node: NonNullable<LoadedGraph["snapshot"]>["nodes"][number],
+  report: NonNullable<ReturnType<typeof parseStoredTaskGraphVerificationReport>>,
+  dependencies: ReadonlyMap<string, TaskGraphVerificationEvidenceProjection>,
+  dependencyBindings: Parameters<typeof emptyAnalystCoverageDigest>[0]["dependencyBindings"],
+): Promise<void> {
+  if (report.verifierVersion !== TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION || report.status !== "failed"
+    || !node.verification || node.templateId !== "analyst" || task.role !== "analyst" || task.status !== "failed"
+    || task.failureReason !== "task_graph_verification_failed" || !Number.isSafeInteger(task.attemptCount) || Number(task.attemptCount) < 1) {
+    throw new Error("task_graph_verification_report_invalid")
+  }
+  let analyst: ReturnType<typeof validateRoleResult>
+  try { analyst = validateRoleResult(result.structuredResult, "analyst") } catch { throw new Error("task_graph_verification_report_invalid") }
+  if (analyst.role !== "analyst" || analyst.status !== "completed" || analyst.findings.length !== 0 || analyst.evidence.length !== 0) {
+    throw new Error("task_graph_verification_report_invalid")
+  }
+  const resultDigest = taskGraphResultDigest(analyst)
+  const dependencyNodeKeys = taskGraphVerificationDependencyNodeKeys(node.verification)
+  const verificationScope: TaskGraphVerificationScope = { ...scope, taskId: node.taskId, attemptCount: Number(task.attemptCount) }
+  if (resultDigest !== report.resultDigest || dependencyNodeKeys.length < 2
+    || !await hasNoCurrentAttemptTaskGraphToolReceipts(client, verificationScope)) {
+    throw new Error("task_graph_verification_report_invalid")
+  }
+  const projection: TaskGraphVerificationEvidenceProjection = {
+    schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "analyst", findings: [], evidenceIds: [],
+  }
+  const evaluation = evaluateTaskGraphVerificationWithReverifiedEmptyAnalyst(node.verification, projection, dependencies)
+  if (evaluation.status !== "failed" || canonicalTaskGraphJson({ status: evaluation.status, reasonCode: evaluation.reasonCode, criteria: evaluation.criteria })
+    !== canonicalTaskGraphJson({ status: report.status, reasonCode: report.reasonCode, criteria: report.criteria })) {
+    throw new Error("task_graph_verification_report_invalid")
+  }
+  const digest = emptyAnalystCoverageDigest({ scope: verificationScope, node, resultDigest, dependencyNodeKeys, dependencyBindings })
+  if (!digest || digest !== report.evidenceDigest) throw new Error("task_graph_verification_report_invalid")
 }
 
 function validateCurrentAnalyst(
