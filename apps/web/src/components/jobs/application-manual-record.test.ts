@@ -65,6 +65,7 @@ describe('manual record response', () => {
   it.each([
     [403, { code: 'MANUAL_APPLICATION_LIMIT_REACHED', requestId: 'different' }],
     [403, { error: 'Forbidden' }],
+    [409, { error: 'Application state changed. Refresh the application before recording.' }],
     [500, { code: 'MANUAL_APPLICATION_LIMIT_REACHED', requestId }],
     [200, { applied: false }],
   ])('keeps status %s with unproven response unknown', async (status, body) => {
