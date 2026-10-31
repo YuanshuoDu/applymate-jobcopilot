@@ -258,8 +258,15 @@ function dedicatedRedisUrl(): string | null {
   return value
 }
 
+function assertRequiredIntegrationServices(required: boolean, databaseUrl: string | null, redisUrl: string | null): void {
+  if (required && (!databaseUrl || !redisUrl)) {
+    throw new Error("TaskGraph resume integration requires disposable PostgreSQL and Redis when services are required")
+  }
+}
+
 const databaseUrl = dedicatedDatabaseUrl()
 const redisUrl = dedicatedRedisUrl()
+assertRequiredIntegrationServices(process.env.AGENT_RUNTIME_PG_TEST_REQUIRED === "true", databaseUrl, redisUrl)
 const describeWithServices = databaseUrl && redisUrl ? describe : describe.skip
 
 type Fixture = { userId: string; sessionId: string; turnId: string; ownerId: string; suffix: string }
@@ -7252,6 +7259,14 @@ describe("TaskGraph exact fixture queue cleanup", () => {
 })
 
 describe("TaskGraph restart fixture service boundary", () => {
+  it("fails rather than skipping when required disposable PostgreSQL or Redis is missing", () => {
+    const error = "TaskGraph resume integration requires disposable PostgreSQL and Redis when services are required"
+    expect(() => assertRequiredIntegrationServices(true, null, null)).toThrow(error)
+    expect(() => assertRequiredIntegrationServices(true, "postgresql://disposable", null)).toThrow(error)
+    expect(() => assertRequiredIntegrationServices(true, null, "redis://disposable")).toThrow(error)
+    expect(() => assertRequiredIntegrationServices(false, null, null)).not.toThrow()
+  })
+
   it("rejects unsafe PostgreSQL or Redis endpoints before production startup", async () => {
     const unsafeEnvironmentCases = [
       {
@@ -14379,6 +14394,37 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                       parentTaskId: task.parentTaskId!, taskId: task.id, attemptCount: task.attemptCount,
                     }
                     expect(await hasNoCurrentAttemptTaskGraphToolReceipts(pool!, receiptScope)).toBe(true)
+                    const priorBoundary = await pool!.query<{ startSequence: string; closeSequence: string }>(
+                      `SELECT startedEvent."sequence"::text AS "startSequence", closedEvent."sequence"::text AS "closeSequence"
+                       FROM "agent_events" AS startedEvent JOIN "agent_events" AS closedEvent
+                         ON closedEvent."sessionId" = startedEvent."sessionId" AND closedEvent."turnId" = startedEvent."turnId"
+                           AND closedEvent."taskId" = startedEvent."taskId"
+                       WHERE startedEvent."id" = $1 AND startedEvent."taskId" = $2 AND startedEvent."type" = 'step.started'
+                         AND closedEvent."id" = $3 AND closedEvent."type" = 'step.completed'`,
+                      ["p3-empty-analyst-prior-start:" + value.suffix, task.id, "p3-empty-analyst-prior-close:" + value.suffix])
+                    const boundary = priorBoundary.rows[0]
+                    if (!boundary) throw new Error("Empty Analyst prior Step boundary was unavailable")
+                    const spoofSequence = (BigInt(boundary.startSequence) + 2n).toString()
+                    if (BigInt(spoofSequence) >= BigInt(boundary.closeSequence)) throw new Error("Empty Analyst prefix spoof has no bounded sequence slot")
+                    const realPrefix = "task:" + task.id + ":tool-lifecycle:" + callId + ":"
+                    const sameLengthFakePrefix = "task:" + task.id + ":fool-lifecycle:" + callId + ":"
+                    expect(sameLengthFakePrefix).toHaveLength(realPrefix.length)
+                    const fakeEventId = "p3-empty-analyst-prefix-spoof:" + value.suffix
+                    const fakePayload = { toolCallId: callId, toolName: "jobs.search", toolVersion: "1", status: "started", input: { target: "prior-attempt" } }
+                    await pool!.query(`INSERT INTO "agent_events"
+                      ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload")
+                      VALUES ($1, $2, $3, NULL, $4, $5, 'tool_call.started', 'subagent', $6, NULL, $7, $8::jsonb)`, [
+                      fakeEventId, value.sessionId, value.turnId, task.id, spoofSequence, callId,
+                      sameLengthFakePrefix + "started:" + "a".repeat(24), JSON.stringify(fakePayload),
+                    ])
+                    try {
+                      expect(await hasNoCurrentAttemptTaskGraphToolReceipts(pool!, receiptScope)).toBe(false)
+                    } finally {
+                      const removed = await pool!.query(`DELETE FROM "agent_events" WHERE "id" = $1 AND "sessionId" = $2
+                        AND "turnId" = $3 AND "taskId" = $4 RETURNING "id"`, [fakeEventId, value.sessionId, value.turnId, task.id])
+                      expect(removed.rowCount).toBe(1)
+                    }
+                    expect(await hasNoCurrentAttemptTaskGraphToolReceipts(pool!, receiptScope)).toBe(true)
                     const currentPayload = { toolCallId: callId, toolName: "jobs.search", toolVersion: "1", status: "started", input: { target: "current-attempt" } }
                     const digest = createHash("sha256").update(JSON.stringify(currentPayload)).digest("hex").slice(0, 24)
                     const currentSequence = await pool!.query<{ eventSequence: string }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1
@@ -14469,11 +14515,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       [analystTaskId, value.sessionId, value.turnId])
       expect(advancedAttempt.rowCount).toBe(1)
       const reserved = await pool!.query<{ eventSequence: string }>(`UPDATE "agent_sessions" AS session SET "eventSequence" =
-          GREATEST(session."eventSequence", COALESCE((SELECT MAX(event."sequence") FROM "agent_events" AS event WHERE event."sessionId" = session."id"), 0)) + 4
+          GREATEST(session."eventSequence", COALESCE((SELECT MAX(event."sequence") FROM "agent_events" AS event WHERE event."sessionId" = session."id"), 0)) + 5
         WHERE session."id" = $1 AND session."userId" = $2 RETURNING session."eventSequence"`, [value.sessionId, value.userId])
       const closeSequence = reserved.rows[0]?.eventSequence
       if (!closeSequence) throw new Error("Empty Analyst prior attempt could not reserve event boundary sequences")
-      const closeAt = BigInt(closeSequence), startAt = closeAt - 3n, lifecycleStartAt = closeAt - 2n, lifecycleEndAt = closeAt - 1n
+      const closeAt = BigInt(closeSequence), startAt = closeAt - 4n, lifecycleStartAt = closeAt - 3n, lifecycleEndAt = closeAt - 1n
       const priorOrdinalResult = await pool!.query<{ ordinal: number }>(`SELECT COALESCE(MAX("ordinal"), 0) + 1 AS "ordinal"
         FROM "agent_steps" WHERE "turnId" = $1 AND "sessionId" = $2`, [value.turnId, value.sessionId])
       const priorOrdinal = priorOrdinalResult.rows[0]?.ordinal

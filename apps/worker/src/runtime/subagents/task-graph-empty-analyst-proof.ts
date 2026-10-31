@@ -26,7 +26,7 @@ export async function hasNoCurrentAttemptTaskGraphToolReceipts(client: Queryable
   const misboundItems = await client.query(`SELECT item."id" FROM "agent_items" AS item LEFT JOIN "agent_steps" AS step ON step."id" = item."stepId"
     WHERE item."taskId" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."type" IN ('tool_call', 'tool_result')
       AND (step."id" IS NULL OR step."sessionId" IS DISTINCT FROM item."sessionId" OR step."turnId" IS DISTINCT FROM item."turnId"
-        OR step."taskId" IS DISTINCT FROM item."taskId" OR step."attempt" = $7) LIMIT 1`, values)
+        OR step."taskId" IS DISTINCT FROM item."taskId" OR step."attempt" = $4) LIMIT 1`, [scope.taskId, scope.sessionId, scope.turnId, scope.attemptCount])
   if (misboundItems.rows.length > 0) return false
   const events = await client.query(`WITH task_attempt_steps AS (
       SELECT step."id", step."attempt", step."ordinal", step."status" FROM "agent_steps" AS step
@@ -58,6 +58,7 @@ export async function hasNoCurrentAttemptTaskGraphToolReceipts(client: Queryable
           OR (event."taskId" = $1 AND NOT EXISTS (
             SELECT 1 FROM prior_task_tool_calls AS prior JOIN prior_step_boundaries AS boundary ON boundary."stepId" = prior."stepId"
             WHERE (event."itemId" = prior."id" OR (event."itemId" IS NULL AND event."actor" = 'subagent'
+                AND left(event."idempotencyKey", length('task:' || $1 || ':tool-lifecycle:' || prior."toolCallId" || ':')) = 'task:' || $1 || ':tool-lifecycle:' || prior."toolCallId" || ':'
                 AND substring(event."idempotencyKey" FROM length('task:' || $1 || ':tool-lifecycle:' || prior."toolCallId" || ':') + 1) ~ CASE event."type"
                   WHEN 'tool_call.started' THEN '^started:[0-9a-f]{24}$' WHEN 'tool_call.completed' THEN '^completed:[0-9a-f]{24}$'
                   WHEN 'tool_call.failed' THEN '^(failed|cancelled):[0-9a-f]{24}$' ELSE '$a' END))

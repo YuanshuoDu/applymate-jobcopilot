@@ -10,6 +10,12 @@ const scope: TaskGraphVerificationScope = {
   userId: "user-private", sessionId: "session-private", turnId: "turn-1", rootTaskId: "root-1",
   parentTaskId: "root-1", taskId: "analyst-task-private", attemptCount: 2,
 }
+
+function expectExactSqlParameters(sql: string, values: readonly unknown[] | undefined): void {
+  const indexes = [...new Set((sql.match(/\$(\d+)/g) ?? []).map(value => Number(value.slice(1))))].sort((a, b) => a - b)
+  expect(indexes).toEqual(Array.from({ length: values?.length ?? 0 }, (_, index) => index + 1))
+}
+
 const digest = "a".repeat(64)
 const binding = (nodeKey: string): TaskGraphVerificationDependencyBinding => ({
   nodeKey, taskId: `${nodeKey}-private`, attemptCount: 1,
@@ -48,17 +54,24 @@ describe("empty Analyst coverage proof", () => {
     expect(emptyAnalystCoverageDigest({ ...input, dependencyNodeKeys: ["scout-a", "scout-a"] })).toBeUndefined()
   })
 
-  it("attributes tool events through exact current-attempt item and call IDs without claiming unrelated turn events", async () => {
+  it("uses exact contiguous SQL parameter mappings while attributing current and prior tool events", async () => {
     const query = vi.fn(async (sql: string, values?: unknown[]) => {
-      expect(values?.[0]).toBe(scope.taskId)
-      expect(values?.[6]).toBe(scope.attemptCount)
+      expectExactSqlParameters(sql, values)
       if (sql.startsWith('SELECT item."id" FROM "agent_steps" AS step')) {
+        expect(values).toEqual([scope.taskId, scope.sessionId, scope.turnId, scope.rootTaskId,
+          scope.parentTaskId, scope.userId, scope.attemptCount])
         expect(sql).toContain('step."taskId" = $1')
         expect(sql).toContain('step."attempt" = $7')
         return { rows: [], rowCount: 0 }
       }
-      if (sql.includes('FROM "agent_items" AS item')) return { rows: [], rowCount: 0 }
+      if (sql.includes('FROM "agent_items" AS item')) {
+        expect(values).toEqual([scope.taskId, scope.sessionId, scope.turnId, scope.attemptCount])
+        expect(sql).toContain('step."attempt" = $4')
+        return { rows: [], rowCount: 0 }
+      }
       if (sql.includes('FROM "agent_events" AS event')) {
+        expect(values).toEqual([scope.taskId, scope.sessionId, scope.turnId, scope.rootTaskId,
+          scope.parentTaskId, scope.userId, scope.attemptCount])
         expect(sql).toContain("task_attempt_items AS")
         expect(sql).toContain("WITH task_attempt_steps AS")
         expect(sql).toContain("task_attempt_items AS")
@@ -71,6 +84,7 @@ describe("empty Analyst coverage proof", () => {
         expect(sql).toContain("step-completed:' || step.\"id\"")
         expect(sql).toContain('event."sequence" > boundary."startSequence" AND event."sequence" < boundary."closeSequence"')
         expect(sql).toContain("tool-lifecycle:' || prior.\"toolCallId\"")
+        expect(sql).toMatch(/left\(event\."idempotencyKey", length\('task:' \|\| \$1 \|\| ':tool-lifecycle:' \|\| prior\."toolCallId" \|\| ':'\)\)\s*=\s*'task:' \|\| \$1 \|\| ':tool-lifecycle:' \|\| prior\."toolCallId" \|\| ':'/)
         expect(sql).toContain('event."correlationId" IN')
         expect(sql).toContain('event."payload"->>\'toolCallId\' IN')
         expect(sql).toContain('event."taskId" = $1 AND NOT EXISTS')
