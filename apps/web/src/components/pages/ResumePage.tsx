@@ -1,8 +1,21 @@
 'use client'
 
-import React, { useState, useEffect, useRef } from 'react'
+import { isApplicationPdfUnsupportedCharactersError } from '@/lib/application-pdf-errors'
+import React, { useState, useEffect, useLayoutEffect, useRef } from 'react'
+import { useSession } from 'next-auth/react'
 import { useI18n } from '@/lib/i18n'
 import { useNav } from '@/lib/nav-context'
+import { openApplication, replaceApplicationHistory } from '@/lib/application-navigation'
+import { readApplicationListState } from '@/lib/application-list-state'
+import { auditMatchesCurrentMaterials } from '@/lib/application-materials'
+import { applicationMaterialAssignment, selectApplicationCoverLetter } from '@/lib/application-material-selection'
+import { sameApplicationAudit, type ApplicationAuditIdentity } from '@/lib/application-audit-identity'
+import { guardApplicationUnload } from '@/lib/application-unload-guard'
+import { createApplicationAnalysisRequestPool } from '@/lib/application-analysis-request'
+import { mayUpdateAnalysisCache } from '@/lib/application-analysis-cache'
+import { mayApplyResumeRevalidation } from '@/lib/application-resume-revalidation'
+import { versionRestoreDisposition } from '@/lib/application-version-restore'
+import { mayApplyApplicationAnalysis } from '@/lib/application-analysis-guard'
 import { Eye, FileDown, FileText, History, LayoutTemplate, Plus, ShieldCheck, Type, Upload } from 'lucide-react'
 import './ResumePage.css'
 
@@ -37,7 +50,7 @@ function withoutAuditSuggestions(suggestions: Suggestion[]) {
   return suggestions.filter(suggestion => !isAuditSuggestion(suggestion))
 }
 function getAnalysisCache(resumeId: string | null, jobId: string | null, resumeUpdatedAt: string | null) {
-  if (!resumeId || !jobId) return null
+  if (!resumeId || !jobId || !resumeUpdatedAt) return null
   const cached = loadAnalysisCache()?.[cacheKey(resumeId, jobId)] ?? null
   // A tailored resume is revised in place after a failed audit. Never reuse
   // suggestions scored against its previous content.
@@ -46,7 +59,7 @@ function getAnalysisCache(resumeId: string | null, jobId: string | null, resumeU
     : null
 }
 function saveCache(data: { resumeId: string | null; jobId: string | null; resumeUpdatedAt: string | null; score: ScoreResult | null; suggs: Suggestion[]; [k: string]: unknown }) {
-  if (!data.jobId || !data.resumeId) return
+  if (!data.jobId || !data.resumeId || !data.resumeUpdatedAt) return
   const entries = loadAnalysisCache() ?? {}
   entries[cacheKey(data.resumeId, data.jobId)] = {
     resumeId: data.resumeId,
@@ -81,27 +94,6 @@ type AuditApplyResponse = {
   coverLetterUpdatedAt?: string
 }
 
-function auditMatchesCurrentMaterials(
-  record: StoredApplicationAudit | null,
-  resumeId: string | null,
-  coverLetterId: string | null,
-  resumeUpdatedAt: string | null,
-  coverLetterUpdatedAt: string | null,
-  dirty: boolean,
-) {
-  if (dirty || !record || record.resumeId !== resumeId || record.coverLetterId !== coverLetterId) return false
-  const auditedAt = Date.parse(record.audit.auditedAt)
-  if (!Number.isFinite(auditedAt)) return false
-
-  // New records carry exact document revisions. Legacy activity records only
-  // have auditedAt, so use it as a conservative lower-bound check instead.
-  if (record.resumeUpdatedAt && resumeUpdatedAt && record.resumeUpdatedAt !== resumeUpdatedAt) return false
-  if (record.coverLetterUpdatedAt && coverLetterUpdatedAt && record.coverLetterUpdatedAt !== coverLetterUpdatedAt) return false
-  if (!record.resumeUpdatedAt && resumeUpdatedAt && auditedAt < Date.parse(resumeUpdatedAt)) return false
-  if (!record.coverLetterUpdatedAt && coverLetterUpdatedAt && auditedAt < Date.parse(coverLetterUpdatedAt)) return false
-  return true
-}
-
 import { Btn, useToast, useConfirm } from '@/components/ui'
 import { useApi, apiMutate, fmtDate, fmtRelative } from '@/lib/hooks'
 import { getCachedApiResponse, setCachedApiResponse } from '@/lib/api-cache'
@@ -126,9 +118,8 @@ import { UploadResumeModal } from '@/components/resume/UploadResumeModal'
 import { ResumeIntakeDialog } from '@/components/resume/ResumeIntakeDialog'
 import type { DragHandleProps } from '@/components/resume/SectionHeader'
 import type { AiFieldContext } from '@/components/resume/AiFieldSuggestion'
-import { exportApplicationPackLocally } from '@/lib/bundle'
 import { downloadResumePdf } from '@/lib/resume-export'
-import { analysisTargetKey, replaceSectionSuggestions, shouldPreserveAnalysis, shouldStartAutomaticAnalysis } from '@/lib/resume-analysis-state'
+import { analysisTargetKey, replaceSectionSuggestions, shouldPreserveAnalysis } from '@/lib/resume-analysis-state'
 import { formatResumeChangeValue, type ResumeChange, type ResumeChangeSection, type ResumeChangeSource } from '@/lib/resume-change-diff'
 import { targetForAuditFinding } from '@/lib/application-audit'
 
@@ -595,20 +586,79 @@ interface ResumePageProps {
 }
 
 export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: ResumePageProps) {
-  const { navigate } = useNav()
+  const { navigate, registerNavigationGuard, publishRecoveryDraft } = useNav()
+  const { data: resumeSession, status: resumeSessionStatus } = useSession()
+  const resumeUserIdRef = useRef<string | null>(null)
+  const resumeUserId = resumeSessionStatus === 'authenticated' ? resumeSession?.user?.id ?? null : null
+  resumeUserIdRef.current = resumeUserId
   const [returnToJobs] = useState(() => new URLSearchParams(window.location.search).get('returnToJobs') === '1')
   const [returnJobId] = useState(() => new URLSearchParams(window.location.search).get('returnJobId'))
+  const [returnResumeId] = useState(() => new URLSearchParams(window.location.search).get('resumeId'))
+  const [resumeStartEmpty] = useState(() => returnToJobs && !!returnJobId && !returnResumeId && new URLSearchParams(window.location.search).get('resumeStartEmpty') === '1')
+  const resumeEntryWriteRef = useRef(false)
+  const resumeEntryUncertainRef = useRef(false)
+  const [resumeEntryWritePending, setResumeEntryWritePending] = useState(false)
+  const [resumeEntryUncertain, setResumeEntryUncertain] = useState(false)
+  function beginResumeEntryWrite() {
+    if (!resumeStartEmpty) return true
+    if (resumeEntryWriteRef.current || resumeEntryUncertainRef.current) return false
+    resumeEntryWriteRef.current = true
+    setResumeEntryWritePending(true)
+    return true
+  }
+  function endResumeEntryWrite(succeeded: boolean) {
+    if (!resumeStartEmpty) return
+    if (!succeeded) { resumeEntryUncertainRef.current = true; setResumeEntryUncertain(true) }
+    resumeEntryWriteRef.current = false
+    setResumeEntryWritePending(false)
+  }
+  async function settleResumeEntryWrite<T>(operation: Promise<{ data: T | null; error: string | null }>) {
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await Promise.race([
+        operation,
+        new Promise<{ data: T | null; error: string | null }>(resolve => {
+          timeout = setTimeout(() => resolve({ data: null, error: 'Save result unknown' }), 30_000)
+        }),
+      ])
+    } finally { if (timeout) clearTimeout(timeout) }
+  }
+  useEffect(() => () => {
+    const url = new URL(window.location.href)
+    if (url.searchParams.get('page') !== 'resume' && url.searchParams.has('resumeStartEmpty')) {
+      url.searchParams.delete('resumeStartEmpty')
+      replaceApplicationHistory(url.toString())
+    }
+  }, [])
+  // Capture only the original application's allowlisted list context. Never read it from a later account's URL.
+  const [recoveryListContext] = useState(() => ({
+    list: readApplicationListState(typeof window === 'undefined' ? '/' : window.location.href),
+    attention: typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('jobsAttention') === '1',
+  }))
   const toast = useToast()
   const [confirm, ConfirmDialog] = useConfirm()
-  const { t } = useI18n()
+  const { t, lang } = useI18n()
   const sidebarCollapsedRef = useRef(sidebarCollapsed)
   const sidebarCollapseTimer = useRef<number | null>(null)
 
   const { data: resumeList, loading: loadingList } = useApi<ResumeListItem[]>('/api/resume')
   const [resumes,          setResumes]          = useState<ResumeListItem[]>([])
-  const [selectedResumeId, setSelectedResumeId] = useState<string | null>(() =>
+  const [selectedResumeId, setSelectedResumeIdState] = useState<string | null>(() =>
     typeof window === 'undefined' ? null : new URLSearchParams(window.location.search).get('resumeId'),
   )
+  const selectedResumeIdRef = useRef(selectedResumeId)
+  const resumeSaveScopeRef = useRef({ userId: resumeUserId, resumeId: selectedResumeId, generation: 0 })
+  if (resumeSaveScopeRef.current.userId !== resumeUserId || resumeSaveScopeRef.current.resumeId !== selectedResumeIdRef.current) {
+    resumeSaveScopeRef.current = { userId: resumeUserId, resumeId: selectedResumeIdRef.current, generation: resumeSaveScopeRef.current.generation + 1 }
+  }
+  const resumeSelectionAttempt = useRef(0)
+  function setSelectedResumeId(id: string | null) {
+    if (resumeSaveScopeRef.current.resumeId !== id) {
+      resumeSaveScopeRef.current = { userId: resumeUserIdRef.current, resumeId: id, generation: resumeSaveScopeRef.current.generation + 1 }
+    }
+    selectedResumeIdRef.current = id
+    setSelectedResumeIdState(id)
+  }
   useEffect(() => {
     const requested = new URLSearchParams(window.location.search).get('resumeId')
     if (requested) setSelectedResumeId(requested)
@@ -646,6 +696,33 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   const [editingDirId,     setEditingDirId]     = useState<string | null>(null)
 
   const [content,         setContent]         = useState<ResumeContent | null>(null)
+  const [contentResumeId, setContentResumeIdState] = useState<string | null>(null)
+  const contentIdentityRef = useRef<{ userId: string; resumeId: string } | null>(null)
+  function setContentResumeId(id: string | null) {
+    const userId = resumeUserIdRef.current
+    contentIdentityRef.current = id && userId ? { userId, resumeId: id } : null
+    setContentResumeIdState(id)
+  }
+  const [contentRevision, setContentRevisionState] = useState<string | null>(null)
+  const contentRevisionRef = useRef(contentRevision)
+  const contentRevisionGenerationRef = useRef(0)
+  const setContentRevision = (revision: string | null) => {
+    if (revision !== contentRevisionRef.current) contentRevisionGenerationRef.current += 1
+    contentRevisionRef.current = revision
+    setContentRevisionState(revision)
+  }
+  const [contentValidated, setContentValidated] = useState(false)
+  const [contentVerified, setContentVerifiedState] = useState(false)
+  const contentVerifiedRef = useRef(false)
+  function setContentVerified(value: boolean) {
+    contentVerifiedRef.current = value
+    setContentVerifiedState(value)
+  }
+  function hasValidatedCurrentResume() {
+    const identity = contentIdentityRef.current
+    return contentVerifiedRef.current && !!identity && identity.userId === resumeUserIdRef.current
+      && identity.resumeId === selectedResumeIdRef.current
+  }
   const [resumeChanges,   setResumeChanges] = useState<ResumeChange[]>([])
   const [resumeName,      setResumeName]      = useState('My Resume')
   const [templateId,      setTemplateId]      = useState('clean')
@@ -654,6 +731,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   const [previewMode,     setPreviewMode]     = useState(false)
   const [rightPanel,      setRightPanel]      = useState<'insights' | 'persona'>('insights')
   const [loadingCont,     setLoadingCont]     = useState(false)
+  const [resumeReadAttempt, setResumeReadAttempt] = useState(0)
   const [saving,      setSaving]      = useState(false)
   const [lastSavedAt, setLastSavedAt] = useState<Date | null>(null)
 
@@ -661,16 +739,27 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     const timer = window.setInterval(() => setLastSavedAt(value => value ? new Date(value) : value), 60_000)
     return () => window.clearInterval(timer)
   }, [])
-  const [dirty,       setDirty]       = useState(false)
+  const [dirty,       setDirtyState]  = useState(false)
   const dirtyRef = useRef(dirty)
+  const editRevisionRef = useRef(0)
+  const saveGenerationRef = useRef(0)
+  const setDirty = (value: boolean) => {
+    dirtyRef.current = value
+    if (value) editRevisionRef.current += 1
+    if (value) publishCurrentRecovery()
+    setDirtyState(value)
+  }
   const [editSection, setEditSection] = useState<string | null>(null)
-
-  useEffect(() => { dirtyRef.current = dirty }, [dirty])
 
   const { data: jobData } = useApi<{ jobs: Job[] }>('/api/jobs?pageSize=30')
   const [jobs,          setJobs]          = useState<Job[]>([])
 
-  const [selectedJobId, setSelectedJobId] = useState<string | null>(null)
+  const [selectedJobId, setSelectedJobIdState] = useState<string | null>(null)
+  const selectedJobIdRef = useRef(selectedJobId)
+  const setSelectedJobId = (id: string | null) => {
+    selectedJobIdRef.current = id
+    setSelectedJobIdState(id)
+  }
   const selectedResumeUpdatedAt = resumes.find(resume => resume.id === selectedResumeId)?.updatedAt ?? null
   const [scoreResult, setScoreResult] = useState<ScoreResult | null>(null)
   const [suggestions, setSuggestions] = useState<Suggestion[]>([])
@@ -681,35 +770,52 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   // resume.updatedAt, but it must not discard the visible result or trigger a
   // new model request. Re-analysis is explicit through the AiPanel action.
   const analysisTargetRef = useRef<string | null>(null)
+  const analysisRevisionRef = useRef<string | null>(null)
+  const analysisSelectionRef = useRef<string | null>(null)
+  const analysisRequestSerialRef = useRef(0)
+  const latestAnalysisRequestRef = useRef(new Map<string, number>())
+  const analysisRequestPool = useRef(createApplicationAnalysisRequestPool<[
+    PromiseSettledResult<{ data: ScoreResult | null; error: string | null }>,
+    PromiseSettledResult<{ data: { suggestions: Suggestion[] } | null; error: string | null }>,
+  ]>())
   // True only on the very first resume load (initial mount / tab-remount).
   // Prevents the selectedResumeId effect from wiping cached analysis on remount.
   const isFirstResumeLoad = useRef(true)
+  const loadedResumeContextRef = useRef<{ userId: string; resumeId: string } | null>(null)
   // True when resume content has changed since the last completed analysis.
   // Drives the "Resume updated — re-analyze?" banner in AiPanel.
   const [contentChangedSinceAnalysis, setContentChangedSinceAnalysis] = useState(false)
   // Monotonically increasing counter — incremented on each runAnalysis call.
   // Responses from superseded calls are silently discarded (race-condition guard).
   const analysisEpochRef = useRef(0)
-  const [latestApplicationAudit, setLatestApplicationAudit] = useState<StoredApplicationAudit | null>(null)
+  const [latestApplicationAudit, setLatestApplicationAudit] = useState<(StoredApplicationAudit & { jobId: string; userId: string; scopeGeneration: number }) | null>(null)
+  const [invalidatedAudit, setInvalidatedAudit] = useState<ApplicationAuditIdentity | null>(null)
   const [auditingApplication, setAuditingApplication] = useState(false)
   const [applyingAuditFinding, setApplyingAuditFinding] = useState<number | null>(null)
+  const [correctionOutcomeUnknown, setCorrectionOutcomeUnknown] = useState(false)
   const [auditError, setAuditError] = useState<string | null>(null)
   const auditRunRef = useRef(false)
+  const applyingAuditRef = useRef(false)
+  const correctionConflictRef = useRef(false)
+  const unknownResumeSaveScopesRef = useRef(new Set<string>())
+  const [, setUnknownResumeSaveRevision] = useState(0)
+  const resumeSaveScopeKey = (userId: string, resumeId: string) => JSON.stringify([userId, resumeId])
+  const hasUnknownResumeSave = () => {
+    const userId = resumeUserIdRef.current
+    const resumeId = selectedResumeIdRef.current
+    return Boolean(userId && resumeId && unknownResumeSaveScopesRef.current.has(resumeSaveScopeKey(userId, resumeId)))
+  }
+  const versionRestoreIntentRef = useRef(false)
+  const versionRestoreUnknownRef = useRef(false)
   const [latestSavedCoverLetter, setLatestSavedCoverLetter] = useState<CoverLetter | null>(null)
 
   const [showTemplates,   setShowTemplates]   = useState(false)
   const [showCoverLetter, setShowCoverLetter] = useState(false)
   const [showFinalConfirm, setShowFinalConfirm] = useState(false)
-  // Confirmation is scoped to a resume. A global boolean made the previously
-  // confirmed resume look ready after the user selected a different version.
-  const [applicationPackReadyResumeId, setApplicationPackReadyResumeId] = useState<string | null>(null)
-  useEffect(() => {
-    if (!dirty || !selectedResumeId) return
-    // Any edit invalidates the previously confirmed copy. The user must run
-    // the independent audit again before the application pack can be confirmed.
-    setApplicationPackReadyResumeId(previous => previous === selectedResumeId ? null : previous)
-  }, [dirty, selectedResumeId])
-  const [exportedPackFolder, setExportedPackFolder] = useState<string | null>(null)
+  const linkWriteRef = useRef<'idle' | 'pending' | 'unknown'>('idle')
+  const [linkWriteState, setLinkWriteState] = useState<'idle' | 'pending' | 'unknown'>('idle')
+  const confirmationWriteRef = useRef<'idle' | 'pending' | 'unknown'>('idle')
+  const [confirmationWriteState, setConfirmationWriteState] = useState<'idle' | 'pending' | 'unknown'>('idle')
   const [showNewResume,   setShowNewResume]   = useState(false)
   const [renamingResume,  setRenamingResume]  = useState<ResumeListItem | null>(null)
   const [showUploadModal,   setShowUploadModal]   = useState(false)
@@ -931,10 +1037,11 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   const requestedResumeIdRef = useRef<string | null>(null)
 
   useEffect(() => {
+    if (resumeStartEmpty) return
     let returnContext: { resumeId?: string } | null = null
     try { returnContext = JSON.parse(sessionStorage.getItem('applymate:resume-return') ?? 'null') as { resumeId?: string } | null } catch { /* ignore malformed return context */ }
     requestedResumeIdRef.current = new URLSearchParams(window.location.search).get('resumeId') ?? returnContext?.resumeId ?? null
-  }, [])
+  }, [resumeStartEmpty])
 
   useEffect(() => {
     if (!resumeList) return
@@ -943,9 +1050,12 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       const requestedResumeId = requestedResumeIdRef.current
       const requestedResume = requestedResumeId ? resumeList.find(resume => resume.id === requestedResumeId) : null
       if (requestedResume) {
-        setSelectedResumeId(requestedResume.id)
-        requestedResumeIdRef.current = null
-        sessionStorage.removeItem('applymate:resume-return')
+        void selectResume(requestedResume.id, requestedResume).then(selected => {
+          if (selected) {
+            requestedResumeIdRef.current = null
+            sessionStorage.removeItem('applymate:resume-return')
+          }
+        })
       } else if (!requestedResumeId && !selectedResumeId) {
         const def = resumeList.find(r => r.isDefault) ?? resumeList[0]
         setSelectedResumeId(def.id)
@@ -961,7 +1071,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     if (loadingList || initDone.current) return
     if (!resumeList) return
     initDone.current = true
-    if (resumeList.length === 0) {
+    if (resumeList.length === 0 && !resumeStartEmpty) {
       apiMutate<Resume>('/api/resume', 'POST', {
         name: 'My Resume', content: EMPTY_CONTENT, isDefault: true,
       }).then(({ data, error }) => {
@@ -974,55 +1084,95 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
         } else toast.error('Error', error ?? 'Could not create resume')
       })
     }
-  }, [resumeList, loadingList])
+  }, [resumeList, loadingList, resumeStartEmpty])
 
   useEffect(() => {
-    if (!selectedResumeId) return
+    if (!selectedResumeId || !resumeUserId) return
+    let validated = false
     const controller = new AbortController()
     const resumeUrl = `/api/resume/${selectedResumeId}`
+    const requestUserId = resumeUserIdRef.current
+    const requestEditRevision = editRevisionRef.current
+    const requestSaveGeneration = saveGenerationRef.current
+    const previousContext = loadedResumeContextRef.current
+    const sameContext = previousContext?.userId === resumeUserId && previousContext.resumeId === selectedResumeId
     setResumeChanges([])
     const applyResume = (resume: Resume) => {
       const c = (resume.content ?? EMPTY_CONTENT) as ResumeContent
+      if (sameContext && contentRevisionRef.current && resume.updatedAt !== contentRevisionRef.current) {
+        analysisEpochRef.current += 1
+        setScoring(false)
+        setSuggesting(false)
+        setContentChangedSinceAnalysis(true)
+      }
       setContent(c)
+      setContentResumeId(selectedResumeId)
+      setContentRevision(resume.updatedAt ?? null)
       setResumeName(resume.name)
       setTemplateId(resume.templateId ?? 'clean')
       setTemplateOptions((resume.templateOptions ?? {}) as TemplateOptions)
       setSectionOrder(c.sectionOrder ?? DEFAULT_ORDER)
     }
-    const cachedResume = getCachedApiResponse<Resume>(resumeUrl)
-    setLoadingCont(true); setDirty(false); setContentChangedSinceAnalysis(false)
-    if (!isFirstResumeLoad.current) {
+    const cached = getCachedApiResponse<Resume & { userId?: string }>(resumeUrl, requestUserId)
+    const cachedResume = cached?.id === selectedResumeId && cached.userId === requestUserId
+      && typeof cached.updatedAt === 'string' && Number.isFinite(Date.parse(cached.updatedAt)) ? cached : null
+    const preserveEdits = sameContext && (dirtyRef.current || isSavingRef.current)
+    loadedResumeContextRef.current = { userId: resumeUserId, resumeId: selectedResumeId }
+    if (!preserveEdits) setContentResumeId(null)
+    setContentValidated(false)
+    setContentVerified(false)
+    setLoadingCont(true)
+    if (!preserveEdits) {
+      setDirty(false)
+      if (!sameContext) setContentChangedSinceAnalysis(false)
+    }
+    if (!isFirstResumeLoad.current && !sameContext) {
       // User actively switched to a different resume — clear stale analysis
       setScoreResult(null); setSuggestions([])
       analysisTargetRef.current = null
     }
     isFirstResumeLoad.current = false
-    if (cachedResume) {
+    if (cachedResume && !preserveEdits) {
       applyResume(cachedResume)
       setLoadingCont(false)
     }
     fetch(resumeUrl, { signal: controller.signal })
       .then(async response => {
-        const resume = await response.json() as Resume
+        const resume = await response.json() as Resume & { userId?: string }
         if (!response.ok) throw new Error('Could not load resume')
+        if (resume.id !== selectedResumeId || resume.userId !== requestUserId) throw new Error('Could not verify resume')
         return resume
       })
       .then(resume => {
-        if (controller.signal.aborted) return
-        setCachedApiResponse(resumeUrl, resume)
+        if (!controller.signal.aborted && requestUserId === resumeUserIdRef.current && selectedResumeId === selectedResumeIdRef.current) validated = true
+        if (!mayApplyResumeRevalidation({
+          resumeId: selectedResumeId,
+          currentResumeId: selectedResumeIdRef.current,
+          userId: requestUserId,
+          currentUserId: resumeUserIdRef.current,
+          editRevision: requestEditRevision,
+          currentEditRevision: editRevisionRef.current,
+          saveGeneration: requestSaveGeneration,
+          currentSaveGeneration: saveGenerationRef.current,
+          aborted: controller.signal.aborted || !mountedRef.current,
+        })) return
         // A cached resume becomes editable immediately. Do not let a delayed
         // revalidation response overwrite edits made before it returns.
-        if (dirtyRef.current) return
+        if (dirtyRef.current || isSavingRef.current) return
+        setCachedApiResponse(resumeUrl, resume, requestUserId)
         applyResume(resume)
       })
       .catch(error => {
         if (error instanceof DOMException && error.name === 'AbortError') return
-        if (cachedResume) return
+        if (cachedResume) {
+          toast.warning(t('resume.cachedVersionTitle'), t('resume.cachedVersionDetail'))
+          return
+        }
         toast.error('Error', 'Could not load resume')
       })
-      .finally(() => { if (!controller.signal.aborted) setLoadingCont(false) })
+      .finally(() => { if (!controller.signal.aborted) { setLoadingCont(false); setContentVerified(validated); setContentValidated(true) } })
     return () => controller.abort()
-  }, [selectedResumeId])
+  }, [selectedResumeId, resumeUserId, resumeReadAttempt])
 
   useEffect(() => { if (jobData?.jobs) setJobs(jobData.jobs) }, [jobData])
 
@@ -1035,11 +1185,20 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
 
   useEffect(() => {
     const targetKey = analysisTargetKey(selectedResumeId, selectedJobId)
-    const cached = getAnalysisCache(selectedResumeId, selectedJobId, selectedResumeUpdatedAt)
+    if (analysisSelectionRef.current !== targetKey) {
+      analysisSelectionRef.current = targetKey
+      analysisRevisionRef.current = null
+      analysisEpochRef.current += 1
+      setScoring(false)
+      setSuggesting(false)
+    }
+    if (!contentValidated || contentResumeId !== selectedResumeId) return
+    const cached = getAnalysisCache(selectedResumeId, selectedJobId, contentRevision)
     if (cached) {
       setScoreResult(cached.score)
       setSuggestions(cached.suggs)
       analysisTargetRef.current = targetKey
+      analysisRevisionRef.current = contentRevision
       return
     }
     // Saving an edit changes updatedAt and invalidates the persisted cache, but
@@ -1048,37 +1207,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     setScoreResult(null)
     setSuggestions([])
     analysisTargetRef.current = null
-  }, [selectedJobId, selectedResumeId, selectedResumeUpdatedAt])
-
-  useEffect(() => {
-    if (!selectedJobId || !content || jobs.length === 0) return
-    // Skip if we already have analysis results for this exact job (e.g. restored from
-    // cache after tab navigation). The user can still force a re-run via the ↻ button.
-    const cached = getAnalysisCache(selectedResumeId, selectedJobId, selectedResumeUpdatedAt)
-    if (cached) {
-      const targetKey = analysisTargetKey(selectedResumeId, selectedJobId)
-      if (analysisTargetRef.current !== targetKey) {
-        setScoreResult(cached.score)
-        setSuggestions(cached.suggs)
-        analysisTargetRef.current = targetKey
-      }
-      return
-    }
-    // Edits intentionally leave the existing suggestions visible. The stale
-    // banner offers the user an explicit re-analysis action, avoiding a
-    // save -> analyze -> replace-the-panel loop and unnecessary token usage.
-    const targetKey = analysisTargetKey(selectedResumeId, selectedJobId)
-    if (!shouldStartAutomaticAnalysis({
-      targetKey,
-      activeTargetKey: analysisTargetRef.current,
-      hasScore: Boolean(scoreResult),
-      hasContent: Boolean(content),
-      hasJobs: jobs.length > 0,
-      contentChangedSinceAnalysis,
-    })) return
-    runAnalysis(content, selectedJobId)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedJobId, selectedResumeId, selectedResumeUpdatedAt, jobs, contentChangedSinceAnalysis])
+  }, [selectedJobId, selectedResumeId, contentRevision, contentResumeId, contentValidated])
 
   const [flashField, setFlashField] = useState('')
 
@@ -1122,11 +1251,12 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   }
 
   function patch(updater: (prev: ResumeContent) => ResumeContent, fieldKey?: string) {
-    setContent(prev => {
-      if (!prev) return prev
-      setDirty(true)
-      return updater(prev)
-    })
+    const prev = latestContent.current
+    if (!prev) return
+    const next = updater(prev)
+    latestContent.current = next
+    setContent(next)
+    setDirty(true)
     setContentChangedSinceAnalysis(true)
     if (fieldKey) triggerFlash(fieldKey)
   }
@@ -1137,6 +1267,9 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       toast.info('Click into a text field first', 'Select text in any section to format it'); return
     }
     const start = el.selectionStart ?? 0; const end = el.selectionEnd ?? 0
+    let nextValue = el.value
+    let nextStart = start
+    let nextEnd = end
     if (start === end) {
       if (prefix === '# ' || prefix === '## ' || prefix === '• ') {
         const before = el.value.substring(0, start)
@@ -1144,64 +1277,102 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
         const lineEnd = el.value.indexOf('\n', start)
         const lineContent = el.value.substring(lineStart, lineEnd === -1 ? el.value.length : lineEnd)
         if (lineContent.startsWith(prefix)) {
-          el.value = el.value.substring(0, lineStart) + lineContent.slice(prefix.length) + el.value.substring(lineEnd === -1 ? el.value.length : lineEnd)
-          el.selectionStart = el.selectionEnd = start - prefix.length
+          nextValue = el.value.substring(0, lineStart) + lineContent.slice(prefix.length) + el.value.substring(lineEnd === -1 ? el.value.length : lineEnd)
+          nextStart = nextEnd = start - prefix.length
         } else {
-          el.value = el.value.substring(0, lineStart) + prefix + lineContent + el.value.substring(lineEnd === -1 ? el.value.length : lineEnd)
-          el.selectionStart = el.selectionEnd = start + prefix.length
+          nextValue = el.value.substring(0, lineStart) + prefix + lineContent + el.value.substring(lineEnd === -1 ? el.value.length : lineEnd)
+          nextStart = nextEnd = start + prefix.length
         }
       } else {
         const wrapped = prefix + suffix
-        el.value = el.value.substring(0, start) + wrapped + el.value.substring(end)
-        el.selectionStart = el.selectionEnd = start + wrapped.length
+        nextValue = el.value.substring(0, start) + wrapped + el.value.substring(end)
+        nextStart = nextEnd = start + wrapped.length
       }
     } else {
       const selected = el.value.substring(start, end)
       const wrapped = prefix + selected + suffix
-      el.value = el.value.substring(0, start) + wrapped + el.value.substring(end)
-      el.selectionStart = start; el.selectionEnd = start + wrapped.length
+      nextValue = el.value.substring(0, start) + wrapped + el.value.substring(end)
+      nextStart = start; nextEnd = start + wrapped.length
     }
-    const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype,'value')?.set ??
-                   Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value')?.set
-    if (setter) { setter.call(el, el.value); el.dispatchEvent(new Event('input', { bubbles: true })) }
+    const prototype = el instanceof HTMLTextAreaElement ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype
+    const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set
+    if (setter) { setter.call(el, nextValue); el.dispatchEvent(new Event('input', { bubbles: true })) }
+    else el.value = nextValue
+    el.selectionStart = nextStart; el.selectionEnd = nextEnd
     el.focus(); setDirty(true)
   }
 
   async function runAnalysis(c: ResumeContent, jobId: string) {
+    if (!contentValidated || contentResumeId !== selectedResumeId) {
+      toast.info(t('resume.analysisLoadingTitle'), t('resume.analysisLoadingDetail'))
+      return
+    }
     if (regeneratingSection) return
+    const requestUserId = resumeUserIdRef.current
+    if (!requestUserId || !selectedResumeId) return
     const job = jobs.find(j => j.id === jobId); if (!job) return
     // Epoch guard: if a newer analysis starts before this one finishes, discard this result
     const epoch = ++analysisEpochRef.current
+    const editRevision = editRevisionRef.current
+    const analyzedRevision = contentRevision
+    const wasDirty = dirtyRef.current
+    const targetKey = JSON.stringify([requestUserId, selectedResumeId, jobId])
+    const requestSerial = ++analysisRequestSerialRef.current
+    latestAnalysisRequestRef.current.set(targetKey, requestSerial)
     setScoring(true); setSuggesting(true)
-    const [scoreRes, suggestRes] = await Promise.allSettled([
+    const start = () => Promise.allSettled([
       apiMutate<ScoreResult>('/api/ai/score', 'POST', { resumeContent: c, jobTitle: job.role, jobCompany: job.company, jobDescription: job.description ?? undefined }),
       apiMutate<{ suggestions: Suggestion[] }>('/api/ai/suggest', 'POST', { resumeContent: c, jobTitle: job.role, jobCompany: job.company, jobDescription: job.description ?? undefined }),
     ])
-    // A newer analysis was started — silently drop this (stale) response
-    if (analysisEpochRef.current !== epoch) return
+    // Repeated clicks for the same unchanged content share only the in-flight request.
+    // A later deliberate re-analysis starts a fresh request.
+    const requestKey = JSON.stringify([requestUserId, selectedResumeId, jobId, analyzedRevision, editRevision])
+    const [scoreRes, suggestRes] = await analysisRequestPool.current(requestKey, start)
+    // Cache the result for its original material even if the user is now viewing
+    // another job. A changed saved version cannot reuse this versioned entry.
+    const isLatestRequest = latestAnalysisRequestRef.current.get(targetKey) === requestSerial
+    if (isLatestRequest) latestAnalysisRequestRef.current.delete(targetKey)
+    const existingRevision = loadAnalysisCache()?.[cacheKey(selectedResumeId, jobId)]?.resumeUpdatedAt
+    if (isLatestRequest && mountedRef.current && requestUserId === resumeUserIdRef.current && !wasDirty && analyzedRevision
+      && mayUpdateAnalysisCache(existingRevision, analyzedRevision)
+      && scoreRes.status === 'fulfilled' && scoreRes.value.data) {
+      saveCache({
+        resumeId: selectedResumeId, jobId, resumeUpdatedAt: analyzedRevision,
+        jobTitle: job.role, jobCompany: job.company, score: scoreRes.value.data,
+        suggs: suggestRes.status === 'fulfilled' ? (suggestRes.value.data?.suggestions ?? []) : [],
+      })
+    }
+    if (!mayApplyApplicationAnalysis({
+      mounted: mountedRef.current,
+      userId: requestUserId,
+      currentUserId: resumeUserIdRef.current,
+      resumeId: selectedResumeId,
+      currentResumeId: selectedResumeIdRef.current,
+      jobId,
+      currentJobId: selectedJobIdRef.current,
+      revision: analyzedRevision,
+      currentRevision: contentRevisionRef.current,
+      editRevision,
+      currentEditRevision: editRevisionRef.current,
+      epoch,
+      currentEpoch: analysisEpochRef.current,
+    })) {
+      if (mountedRef.current && requestUserId === resumeUserIdRef.current && analysisEpochRef.current === epoch) {
+        setScoring(false)
+        setSuggesting(false)
+        if (editRevisionRef.current !== editRevision || contentRevisionRef.current !== analyzedRevision) setContentChangedSinceAnalysis(true)
+      }
+      return
+    }
     setScoring(false); setSuggesting(false)
     if (scoreRes.status === 'fulfilled' && scoreRes.value.data) {
       setScoreResult(scoreRes.value.data)
       analysisTargetRef.current = analysisTargetKey(selectedResumeId, jobId)
-      setContentChangedSinceAnalysis(false)  // analysis is now up-to-date
+      analysisRevisionRef.current = !wasDirty ? analyzedRevision : null
+      setContentChangedSinceAnalysis(editRevisionRef.current !== editRevision)
     } else { const msg = scoreRes.status === 'fulfilled' ? (scoreRes.value.error ?? 'Unknown') : scoreRes.reason; toast.error('Analysis failed', typeof msg === 'string' ? msg : 'Check ANTHROPIC_API_KEY') }
     if (suggestRes.status === 'fulfilled' && suggestRes.value.data?.suggestions) {
       setSuggestions(suggestRes.value.data.suggestions)
-    }
-    // Persist to localStorage — include resumeId so cache is resume-scoped
-    if (scoreRes.status === 'fulfilled' && scoreRes.value.data) {
-      try {
-        const latestJob = jobs.find(j => j.id === selectedJobId)
-        saveCache({
-          resumeId: selectedResumeId,
-          jobId: selectedJobId,
-          resumeUpdatedAt: selectedResumeUpdatedAt,
-          jobTitle: latestJob?.role ?? '',
-          jobCompany: latestJob?.company ?? '',
-          score: scoreRes.value.data,
-          suggs: suggestRes.status === 'fulfilled' ? (suggestRes.value.data?.suggestions ?? []) : [],
-        })
-      } catch {}
     }
   }
 
@@ -1237,7 +1408,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       saveCache({
         resumeId: selectedResumeId,
         jobId: selectedJobId,
-        resumeUpdatedAt: selectedResumeUpdatedAt,
+        resumeUpdatedAt: analysisRevisionRef.current,
         score: scoreResult,
         suggs: merged,
       })
@@ -1255,51 +1426,175 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   const latestResumeName      = useRef(resumeName)
   const latestSelectedJobId   = useRef(selectedJobId)
   const isSavingRef           = useRef(false)
+  const mountedRef            = useRef(true)
   const pendingSaveRef        = useRef(false) // new edits arrived while saving
+  const savePromiseRef        = useRef<Promise<boolean> | null>(null)
+  const resumeLocationRef     = useRef(typeof window === 'undefined' ? '' : window.location.href)
+  if (typeof window !== 'undefined') resumeLocationRef.current = window.location.href
+  useEffect(() => {
+    mountedRef.current = true
+    return () => { mountedRef.current = false }
+  }, [])
 
-  useEffect(() => { latestContent.current         = content },         [content])
-  useEffect(() => { latestSectionOrder.current    = sectionOrder },    [sectionOrder])
-  useEffect(() => { latestTemplateId.current      = templateId },      [templateId])
-  useEffect(() => { latestTemplateOptions.current = templateOptions }, [templateOptions])
-  useEffect(() => { latestResumeName.current      = resumeName },      [resumeName])
-  useEffect(() => { latestSelectedJobId.current   = selectedJobId },   [selectedJobId])
+  useLayoutEffect(() => { latestContent.current         = content },         [content])
+  useLayoutEffect(() => { latestSectionOrder.current    = sectionOrder },    [sectionOrder])
+  useLayoutEffect(() => { latestTemplateId.current      = templateId },      [templateId])
+  useLayoutEffect(() => { latestTemplateOptions.current = templateOptions }, [templateOptions])
+  useLayoutEffect(() => { latestResumeName.current      = resumeName },      [resumeName])
+  useLayoutEffect(() => { latestSelectedJobId.current   = selectedJobId },   [selectedJobId])
 
-  async function handleSave(): Promise<boolean> {
-    if (!selectedResumeId || !latestContent.current) return false
+  // The shell keeps this snapshot in memory if a session transition unmounts
+  // the editor. Never publish the old editor's content under another account.
+  const recoveryOwnerRef = useRef(resumeUserId)
+  if (!recoveryOwnerRef.current && resumeUserId) recoveryOwnerRef.current = resumeUserId
+  function publishCurrentRecovery() {
+    const owner = recoveryOwnerRef.current
+    const currentContent = latestContent.current
+    if (!owner || owner !== resumeUserIdRef.current || !publishRecoveryDraft || !selectedResumeIdRef.current || !currentContent) return
+    publishRecoveryDraft(owner, {
+      userId: owner, resumeId: selectedResumeIdRef.current, name: latestResumeName.current,
+      content: structuredClone(currentContent), sectionOrder: [...latestSectionOrder.current],
+      templateId: latestTemplateId.current, templateOptions: structuredClone(latestTemplateOptions.current),
+      ...(returnToJobs && returnJobId && returnResumeId === selectedResumeIdRef.current
+        ? { applicationContext: { jobId: returnJobId, ...recoveryListContext } } : {}),
+    })
+  }
+  useLayoutEffect(() => {
+    const owner = recoveryOwnerRef.current
+    if (!owner || owner !== resumeUserId || !publishRecoveryDraft) return
+    if (!dirtyRef.current && !isSavingRef.current) {
+      publishRecoveryDraft(owner, null)
+      return
+    }
+    if (!selectedResumeId || !content) return
+    publishRecoveryDraft(owner, {
+      userId: owner, resumeId: selectedResumeId, name: resumeName,
+      content: structuredClone(content), sectionOrder: [...sectionOrder],
+      templateId, templateOptions: structuredClone(templateOptions),
+      ...(returnToJobs && returnJobId && returnResumeId === selectedResumeId
+        ? { applicationContext: { jobId: returnJobId, ...recoveryListContext } } : {}),
+    })
+  }, [resumeUserId, selectedResumeId, content, sectionOrder, templateId, templateOptions, resumeName, dirty, saving, publishRecoveryDraft, returnToJobs, returnJobId, returnResumeId, recoveryListContext])
+
+  function handleSave(): Promise<boolean> {
+    if (hasUnknownResumeSave()) return Promise.resolve(false)
+    if (correctionConflictRef.current) {
+      toast.warning(t(versionRestoreUnknownRef.current ? 'resume.restoreUnknownTitle' : 'resume.correctionChangedTitle'),
+        t(versionRestoreUnknownRef.current ? 'resume.restoreUnknownDetail' : 'resume.correctionChangedDetail'))
+      return Promise.resolve(false)
+    }
+    if (applyingAuditRef.current) {
+      toast.info(t('resume.toastSaving'), t('resume.toastSavingDetail'))
+      return Promise.resolve(false)
+    }
+    if (savePromiseRef.current) return savePromiseRef.current
+    const pending = saveResumeChanges(selectedResumeIdRef.current)
+    savePromiseRef.current = pending
+    void pending.then(
+      () => { if (savePromiseRef.current === pending) savePromiseRef.current = null },
+      () => { if (savePromiseRef.current === pending) savePromiseRef.current = null },
+    )
+    return pending
+  }
+
+  async function saveResumeChanges(resumeId: string | null, saveUserId = resumeUserIdRef.current): Promise<boolean> {
+    if (!resumeId || !saveUserId || saveUserId !== resumeUserIdRef.current || resumeId !== selectedResumeIdRef.current || !latestContent.current
+      || contentIdentityRef.current?.userId !== saveUserId || contentIdentityRef.current.resumeId !== resumeId) {
+      toast.error('Save failed', 'The resume could not be saved. Please try again.')
+      return false
+    }
     if (isSavingRef.current) { pendingSaveRef.current = true; return false }
 
     isSavingRef.current = true
     setSaving(true)
+    const contentSnapshot = latestContent.current
+    const requestSaveScope = resumeSaveScopeRef.current.generation
+    const orderSnapshot = latestSectionOrder.current
+    const editRevision = editRevisionRef.current
     const snapshot = {
       name:            latestResumeName.current,
       content:         { ...latestContent.current, sectionOrder: latestSectionOrder.current },
       templateId:      latestTemplateId.current,
       templateOptions: latestTemplateOptions.current,
     }
-    const { data, error } = await apiMutate<Resume>(`/api/resume/${selectedResumeId}`, 'PATCH', snapshot)
+    saveGenerationRef.current += 1
+    let result: { data: (Resume & { userId?: string }) | null; error: string | null }
+    try {
+      result = await apiMutate<Resume & { userId?: string }>(`/api/resume/${resumeId}`, 'PATCH', snapshot)
+    } catch {
+      result = { data: null, error: 'Save result unconfirmed' }
+    }
+    const { data, error } = result
     isSavingRef.current = false
-    setSaving(false)
-
-    if (error) {
-      toast.error('Save failed', error)
+    if (error || !data || data.id !== resumeId || data.userId !== saveUserId
+      || typeof data.updatedAt !== 'string' || !Number.isFinite(Date.parse(data.updatedAt))
+      || !mountedRef.current || resumeId !== selectedResumeIdRef.current || saveUserId !== resumeUserIdRef.current
+      || requestSaveScope !== resumeSaveScopeRef.current.generation) {
+      // An invalid response or abandoned view cannot prove whether the write committed.
+      unknownResumeSaveScopesRef.current.add(resumeSaveScopeKey(saveUserId, resumeId))
+      pendingSaveRef.current = false
+      if (mountedRef.current) { setSaving(false); setUnknownResumeSaveRevision(value => value + 1) }
       return false
     } else {
+      setSaving(false)
       if (data) {
-        setCachedApiResponse(`/api/resume/${selectedResumeId}`, data)
+        setCachedApiResponse(`/api/resume/${resumeId}`, data, saveUserId)
+        setContentRevision(data.updatedAt ?? null)
         setResumes(previous => previous.map(resume => resume.id === data.id
           ? { ...resume, name: data.name, updatedAt: data.updatedAt }
           : resume))
       }
+      const changedDuringSave = editRevisionRef.current !== editRevision
+        || latestContent.current !== contentSnapshot
+        || latestSectionOrder.current !== orderSnapshot
+        || latestResumeName.current !== snapshot.name
+        || latestTemplateId.current !== snapshot.templateId
+        || latestTemplateOptions.current !== snapshot.templateOptions
+      if (pendingSaveRef.current || changedDuringSave) {
+        pendingSaveRef.current = false
+        // Await later edits too, so leaving the editor cannot cancel their save.
+        await new Promise(resolve => setTimeout(resolve, 0))
+        if (!mountedRef.current) return false
+        return saveResumeChanges(resumeId, saveUserId)
+      }
+      dirtyRef.current = false
       setDirty(false)
       setLastSavedAt(new Date())
       toast.success('Saved', 'Resume updated successfully')
       // Re-analysis is intentionally NOT triggered here — the AiPanel stale indicator
       // prompts the user to re-analyse when ready, avoiding a token burn on every save.
-      // If new edits arrived while we were saving, save again immediately
-      if (pendingSaveRef.current) { pendingSaveRef.current = false; void handleSave() }
       return true
     }
   }
+
+  const saveForNavigationRef = useRef(handleSave)
+  saveForNavigationRef.current = handleSave
+  useEffect(() => registerNavigationGuard?.({
+    needsSave: () => dirtyRef.current || isSavingRef.current || hasUnknownResumeSave() || applyingAuditRef.current || correctionConflictRef.current || versionRestoreIntentRef.current || resumeEntryWriteRef.current
+      || linkWriteRef.current !== 'idle' || confirmationWriteRef.current !== 'idle',
+    save: async () => {
+      if (linkWriteRef.current !== 'idle' || confirmationWriteRef.current !== 'idle') return false
+      if (resumeEntryWriteRef.current) {
+        toast.info(t('resume.toastSaving'), t('resume.toastSavingDetail'))
+        return false
+      }
+      if (versionRestoreIntentRef.current) {
+        toast.info(t('resume.toastSaving'), t('resume.toastSavingDetail'))
+        return false
+      }
+      const success = await saveForNavigationRef.current()
+      return success && !dirtyRef.current && !isSavingRef.current
+    },
+    currentHref: () => resumeLocationRef.current,
+  }), [registerNavigationGuard])
+  useEffect(() => {
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      guardApplicationUnload(event, dirtyRef.current || isSavingRef.current || hasUnknownResumeSave() || applyingAuditRef.current || correctionConflictRef.current || resumeEntryWriteRef.current
+        || linkWriteRef.current !== 'idle' || confirmationWriteRef.current !== 'idle')
+    }
+    window.addEventListener('beforeunload', onBeforeUnload)
+    return () => window.removeEventListener('beforeunload', onBeforeUnload)
+  }, [])
 
   // Auto-save: 2 s debounce after any edit
   const autoSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -1312,6 +1607,8 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
 
   async function handleImportResume(imported: ResumeContent, mode: 'replace' | 'new') {
     if (mode === 'replace' && selectedResumeId) {
+      latestContent.current = imported
+      latestSectionOrder.current = imported.sectionOrder ?? DEFAULT_ORDER
       setContent(imported)
       setSectionOrder(imported.sectionOrder ?? DEFAULT_ORDER)
       setDirty(true)
@@ -1326,21 +1623,25 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       if (data) {
         const item: ResumeListItem = { id: data.id, name: data.name, isDefault: data.isDefault, directionId: null, kind: 'base' as const, parentResumeId: null, targetJobId: null, origin: 'manual' as const, basicsDetached: false, createdAt: data.createdAt, updatedAt: data.updatedAt }
         setResumes(prev => [...prev, item])
-        setSelectedResumeId(data.id)
+        await selectResume(data.id, item)
         toast.success(t('resume.toastImported'), `"${name}" ${t('resume.toastCreated')}`)
       } else toast.error('Import failed', error ?? 'Could not create resume')
     }
   }
 
   async function handleCreateResume(name: string) {
+    if (!beginResumeEntryWrite()) return
     setCreatingResume(true); setShowNewResume(false)
-    const { data, error } = await apiMutate<Resume>('/api/resume', 'POST', { name, content: EMPTY_CONTENT, isDefault: false })
-    setCreatingResume(false)
+    const request = apiMutate<Resume>('/api/resume', 'POST', { name, content: EMPTY_CONTENT, isDefault: false })
+    const { data, error } = await (resumeStartEmpty ? settleResumeEntryWrite(request) : request)
     if (data) {
       const item: ResumeListItem = { id: data.id, name: data.name, isDefault: data.isDefault, directionId: null, kind: 'base' as const, parentResumeId: null, targetJobId: null, origin: 'manual' as const, basicsDetached: false, createdAt: data.createdAt, updatedAt: data.updatedAt }
-      setResumes(prev => [...prev, item]); setSelectedResumeId(data.id)
+      setResumes(prev => [...prev, item]); await selectResume(data.id, item)
       toast.success('Resume created', `"${name}" is ready to edit`)
-    } else toast.error('Error', error ?? 'Could not create resume')
+    } else if (resumeStartEmpty) toast.warning(t('resume.entryWriteUncertainTitle'), t('resume.entryWriteUncertain'))
+    else toast.error('Error', error ?? 'Could not create resume')
+    setCreatingResume(false)
+    endResumeEntryWrite(Boolean(data))
   }
 
   async function fetchVersions() {
@@ -1355,19 +1656,71 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   }
 
   async function restoreVersion(versionId: string) {
-    if (!selectedResumeId) return
+    const requestResumeId = selectedResumeIdRef.current
+    const requestUserId = resumeUserIdRef.current
+    if (!requestResumeId || !requestUserId || versionRestoreIntentRef.current || applyingAuditRef.current) return
+    if (correctionConflictRef.current) {
+      toast.warning(t(versionRestoreUnknownRef.current ? 'resume.restoreUnknownTitle' : 'resume.correctionChangedTitle'),
+        t(versionRestoreUnknownRef.current ? 'resume.restoreUnknownDetail' : 'resume.correctionChangedDetail'))
+      return
+    }
+    versionRestoreIntentRef.current = true
     setRestoring(true)
-    const { data, error } = await apiMutate<Resume>(`/api/resume/${selectedResumeId}/versions`, 'POST', { versionId })
-    setRestoring(false)
-    if (error || !data) { toast.error('Restore failed', error ?? 'Could not restore version'); return }
-    setContent(data.content as ResumeContent)
-    setResumeName(data.name)
-    setTemplateId(data.templateId ?? 'clean')
-    setTemplateOptions((data.templateOptions as TemplateOptions) ?? {})
-    setShowVersions(false)
-    setDirty(true)
-    setContentChangedSinceAnalysis(true)
-    toast.success('Version restored', 'Previous version loaded. Save to keep it.')
+    let mutationStarted = false
+    try {
+      if ((dirtyRef.current || isSavingRef.current) && !(await handleSave())) return
+      if (!mountedRef.current || requestUserId !== resumeUserIdRef.current || requestResumeId !== selectedResumeIdRef.current
+        || dirtyRef.current || isSavingRef.current || applyingAuditRef.current) return
+      const requestEditRevision = editRevisionRef.current
+      saveGenerationRef.current += 1
+      analysisEpochRef.current += 1
+      setScoring(false); setSuggesting(false)
+      applyingAuditRef.current = true
+      mutationStarted = true
+      const { data, error } = await apiMutate<Resume>(`/api/resume/${requestResumeId}/versions`, 'POST', { versionId })
+      const disposition = versionRestoreDisposition({
+        mounted: mountedRef.current, requestUserId, currentUserId: resumeUserIdRef.current,
+        requestResumeId, currentResumeId: selectedResumeIdRef.current,
+        requestEditRevision, currentEditRevision: editRevisionRef.current,
+        validResponse: !error && !!data && data.id === requestResumeId && !!data.content && typeof data.content === 'object',
+      })
+      if (disposition === 'ignore') return
+      if (disposition === 'unknown') {
+        correctionConflictRef.current = true
+        versionRestoreUnknownRef.current = true
+        toast.warning(t('resume.restoreUnknownTitle'), t('resume.restoreUnknownDetail'))
+        return
+      }
+      if (disposition === 'conflict') {
+        correctionConflictRef.current = true
+        setContentChangedSinceAnalysis(true)
+        toast.warning(t('resume.correctionChangedTitle'), t('resume.correctionChangedDetail'))
+        return
+      }
+      if (!data) return
+      latestContent.current = data.content as ResumeContent
+      latestSectionOrder.current = data.content.sectionOrder ?? DEFAULT_ORDER
+      latestResumeName.current = data.name
+      latestTemplateId.current = data.templateId ?? 'clean'
+      latestTemplateOptions.current = (data.templateOptions as TemplateOptions) ?? {}
+      setContent(data.content as ResumeContent)
+      setSectionOrder(data.content.sectionOrder ?? DEFAULT_ORDER)
+      setResumeName(data.name)
+      setTemplateId(data.templateId ?? 'clean')
+      setTemplateOptions((data.templateOptions as TemplateOptions) ?? {})
+      setCachedApiResponse(`/api/resume/${requestResumeId}`, data, requestUserId)
+      setContentRevision(data.updatedAt ?? null)
+      setResumes(previous => previous.map(resume => resume.id === requestResumeId ? { ...resume, name: data.name, updatedAt: data.updatedAt } : resume))
+      setShowVersions(false)
+      setDirty(false)
+      setLastSavedAt(new Date())
+      setContentChangedSinceAnalysis(true)
+      toast.success(t('resume.restoreSuccessTitle'), t('resume.restoreSuccessDetail'))
+    } finally {
+      if (mutationStarted) applyingAuditRef.current = false
+      versionRestoreIntentRef.current = false
+      if (mountedRef.current) setRestoring(false)
+    }
   }
 
   // Apply a keyword/item to the correct section (not just skills)
@@ -1480,7 +1833,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       saveCache({
         resumeId: selectedResumeId,
         jobId: selectedJobId,
-        resumeUpdatedAt: selectedResumeUpdatedAt,
+        resumeUpdatedAt: analysisRevisionRef.current,
         jobTitle: job?.role ?? '',
         jobCompany: job?.company ?? '',
         score: scoreResult,
@@ -1494,22 +1847,30 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   function handleSectionDrop(targetIdx: number) {
     const from = sectionDragRef.current
     if (from === null || from === targetIdx) { setSectionDragOver(null); return }
-    const next = [...sectionOrder]; const [item] = next.splice(from, 1); next.splice(targetIdx, 0, item)
+    const next = [...latestSectionOrder.current]; const [item] = next.splice(from, 1); next.splice(targetIdx, 0, item)
+    latestSectionOrder.current = next
     setSectionOrder(next); sectionDragRef.current = null; setSectionDragOver(null); setDirty(true)
   }
 
   function removeSection(id: string) {
-    setSectionOrder(prev => prev.filter(s => s !== id)); setDirty(true)
+    const next = latestSectionOrder.current.filter(s => s !== id)
+    latestSectionOrder.current = next
+    setSectionOrder(next); setDirty(true)
   }
 
   function addSection(id: string) {
-    setSectionOrder(prev => [...prev, id]); setDirty(true)
+    const next = [...latestSectionOrder.current, id]
+    latestSectionOrder.current = next
+    setSectionOrder(next); setDirty(true)
   }
 
   function addCustomSection() {
     const id = `custom_${Date.now()}`
     patch(p => ({ ...p, custom: [...(p.custom ?? []), { id, title: 'CUSTOM SECTION', items: [] }] }))
-    setSectionOrder(prev => [...prev, id])
+    const next = [...latestSectionOrder.current, id]
+    latestSectionOrder.current = next
+    setSectionOrder(next)
+    setDirty(true)
   }
 
   function getDragHandleProps(i: number): DragHandleProps {
@@ -1532,36 +1893,94 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   const resumeLinkedJob = jobs.find(j => j.id === selectedResume?.targetJobId)
     ?? jobs.find(j => j.finalResumeId === selectedResumeId)
     ?? null
-  const confirmedJob = jobs.find(j => j.finalResumeId === selectedResumeId) ?? null
+  const confirmationScopeRef = useRef({ userId: resumeUserId, resumeId: selectedResumeId, jobId: resumeLinkedJob?.id ?? null, selectedJobId, generation: 0 })
+  const confirmationScope = confirmationScopeRef.current
+  if (confirmationScope.userId !== resumeUserId || confirmationScope.resumeId !== selectedResumeId
+    || confirmationScope.jobId !== (resumeLinkedJob?.id ?? null) || confirmationScope.selectedJobId !== selectedJobId) {
+    confirmationScopeRef.current = { userId: resumeUserId, resumeId: selectedResumeId, jobId: resumeLinkedJob?.id ?? null, selectedJobId, generation: confirmationScope.generation + 1 }
+  }
   // The sidebar must only describe an actual resume ↔ job link. Falling back to
   // a previously selected job kept stale opportunity details visible after a
   // resume switch or after cancelling a link.
   const linkedJob = resumeLinkedJob
+  const linkedJobId = selectedResume?.targetJobId ?? resumeLinkedJob?.id
+    ?? (selectedResumeId === returnResumeId ? returnJobId : null)
+  useEffect(() => {
+    if (!linkedJobId || jobs.some(job => job.id === linkedJobId)) return
+    let cancelled = false
+    // The linked opportunity may be outside the first page of the job list.
+    void fetch(`/api/jobs/${encodeURIComponent(linkedJobId)}`)
+      .then(response => response.ok ? response.json() as Promise<Job> : null)
+      .then(job => {
+        if (!cancelled && job?.id === linkedJobId
+          && (selectedResume?.targetJobId === job.id || job.finalResumeId === selectedResumeId)) {
+          setJobs(previous => previous.some(item => item.id === job.id) ? previous : [...previous, job])
+        }
+      })
+      .catch(() => undefined)
+    return () => { cancelled = true }
+  }, [linkedJobId, jobs, selectedResume?.targetJobId, selectedResumeId])
+
+  async function returnToApplication(jobId: string) {
+    if (linkWriteRef.current !== 'idle' || confirmationWriteRef.current !== 'idle') return
+    if (resumeEntryWriteRef.current) { toast.info(t('resume.toastSaving'), t('resume.toastSavingDetail')); return }
+    // Record the user's navigation intent immediately. The shell guard waits
+    // for the shared save chain and resolves competing requests in click order.
+    const opened = await openApplication(jobId, navigate)
+    if (!opened && isSavingRef.current) toast.info(t('resume.toastSaving'), t('resume.toastSavingDetail'))
+  }
   const templateName = TEMPLATES.find(template => template.id === templateId)?.name ?? templateId
   const pendingSuggestions = suggestions.filter(suggestion => !isAuditSuggestion(suggestion) && !suggestion.applied).length
-  const { data: linkedCoverLetters } = useApi<CoverLetter[]>(`/api/jobs/${resumeLinkedJob?.id ?? '__none__'}/cover-letters`)
-  const matchingCoverLetters = linkedCoverLetters?.filter(letter =>
-    letter.resumeId === selectedResumeId || letter.resumeId === null,
-  ) ?? []
-  const linkedFinalCoverLetter = matchingCoverLetters.find(letter => letter.id === resumeLinkedJob?.finalCoverLetterId)
-    ?? matchingCoverLetters[0]
-    ?? null
-  const savedFinalCoverLetter = latestSavedCoverLetter
-    && latestSavedCoverLetter.jobId === resumeLinkedJob?.id
-    && (latestSavedCoverLetter.resumeId === selectedResumeId || latestSavedCoverLetter.resumeId === null)
-    ? latestSavedCoverLetter
-    : null
-  const finalCoverLetter = savedFinalCoverLetter ?? linkedFinalCoverLetter
-  const { data: storedApplicationAudit } = useApi<StoredApplicationAudit | null>(`/api/jobs/${resumeLinkedJob?.id ?? '__none__'}/audit-application`)
+  const { data: linkedCoverLetters, refetch: refetchLinkedCoverLetters } = useApi<CoverLetter[]>(`/api/jobs/${resumeLinkedJob?.id ?? '__none__'}/cover-letters`)
+  const finalCoverLetter = resumeLinkedJob && selectedResumeId ? selectApplicationCoverLetter({
+    jobId: resumeLinkedJob.id,
+    resumeId: selectedResumeId,
+    finalResumeId: resumeLinkedJob.finalResumeId,
+    finalCoverLetterId: resumeLinkedJob.finalCoverLetterId,
+  }, linkedCoverLetters ?? [], latestSavedCoverLetter) : null
+  const auditLetterScopeRef = useRef({ key: '', generation: 0 })
+  const auditLetterScopeKey = JSON.stringify([finalCoverLetter?.id ?? null, finalCoverLetter?.updatedAt ?? null])
+  if (auditLetterScopeRef.current.key !== auditLetterScopeKey) {
+    auditLetterScopeRef.current = { key: auditLetterScopeKey, generation: auditLetterScopeRef.current.generation + 1 }
+  }
+  const auditMaterialScopeRef = useRef({ key: '', generation: 0 })
+  function syncAuditMaterialScope() {
+    const key = JSON.stringify([contentRevisionRef.current, contentRevisionGenerationRef.current, auditLetterScopeRef.current.key])
+    if (auditMaterialScopeRef.current.key !== key) {
+      auditMaterialScopeRef.current = { key, generation: auditMaterialScopeRef.current.generation + 1 }
+    }
+    return auditMaterialScopeRef.current
+  }
+  syncAuditMaterialScope()
+  const [storedAuditScope, setStoredAuditScope] = useState<{ jobId: string; userId: string; generation: number; record: StoredApplicationAudit | null } | null>(null)
+  const auditScopeGeneration = confirmationScopeRef.current.generation
+  useEffect(() => {
+    const jobId = resumeLinkedJob?.id
+    const userId = resumeUserId
+    if (!jobId || !userId || !resumeLinkedJob || resumeLinkedJob.userId !== userId) return
+    const controller = new AbortController()
+    void fetch(`/api/jobs/${encodeURIComponent(jobId)}/audit-application`, { signal: controller.signal })
+      .then(response => { if (!response.ok) throw new Error('Audit unavailable'); return response.json() as Promise<StoredApplicationAudit | null> })
+      .then(record => {
+        if (!controller.signal.aborted && confirmationScopeRef.current.generation === auditScopeGeneration) {
+          setStoredAuditScope({ jobId, userId, generation: auditScopeGeneration, record })
+        }
+      }).catch(() => { /* An unavailable audit is not a passing audit. */ })
+    return () => controller.abort()
+  }, [resumeLinkedJob?.id, resumeUserId, auditScopeGeneration])
+  const storedApplicationAudit = storedAuditScope && resumeLinkedJob && storedAuditScope.jobId === resumeLinkedJob.id && storedAuditScope.userId === resumeUserId
+    && storedAuditScope.generation === auditScopeGeneration ? storedAuditScope.record : null
+  const scopedLatestApplicationAudit = latestApplicationAudit && resumeLinkedJob && latestApplicationAudit.jobId === resumeLinkedJob.id && latestApplicationAudit.userId === resumeUserId
+    && latestApplicationAudit.scopeGeneration === auditScopeGeneration ? latestApplicationAudit : null
   const currentApplicationAuditRecord = auditMatchesCurrentMaterials(
-    latestApplicationAudit,
+    scopedLatestApplicationAudit,
     selectedResumeId,
     finalCoverLetter?.id ?? null,
     selectedResumeUpdatedAt,
     finalCoverLetter?.updatedAt ?? null,
     dirty || saving,
   )
-    ? latestApplicationAudit
+    ? scopedLatestApplicationAudit
     : auditMatchesCurrentMaterials(
         storedApplicationAudit,
         selectedResumeId,
@@ -1572,8 +1991,18 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       )
       ? storedApplicationAudit
       : null
-  const currentApplicationAudit = currentApplicationAuditRecord?.audit ?? null
-  const displayedApplicationAuditRecord = [latestApplicationAudit, storedApplicationAudit].find(record =>
+  const auditIdentity = resumeLinkedJob && currentApplicationAuditRecord
+    ? { jobId: resumeLinkedJob.id, resumeId: currentApplicationAuditRecord.resumeId, auditedAt: currentApplicationAuditRecord.audit.auditedAt }
+    : null
+  const currentApplicationAudit = !sameApplicationAudit(auditIdentity, invalidatedAudit)
+    ? currentApplicationAuditRecord?.audit ?? null : null
+  const applicationMaterialsConfirmed = Boolean(
+    currentApplicationAudit?.verdict === 'pass'
+    && !dirty && !saving
+    && resumeLinkedJob?.finalResumeId === selectedResumeId
+    && (resumeLinkedJob?.finalCoverLetterId ?? null) === (finalCoverLetter?.id ?? null),
+  )
+  const displayedApplicationAuditRecord = [scopedLatestApplicationAudit, storedApplicationAudit].find(record =>
     record
       && record.resumeId === selectedResumeId
       && record.coverLetterId === (finalCoverLetter?.id ?? null),
@@ -1595,15 +2024,34 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
 
   async function linkResumeToJob(jobId: string) {
     if (!selectedResumeId) return
-    const { data, error } = await apiMutate<Resume>(`/api/resume/${selectedResumeId}`, 'PATCH', { targetJobId: jobId })
-    if (!data || error) { toast.error('Could not link resume', error ?? 'Please try again'); return }
-    setResumes(prev => prev.map(resume => resume.id === selectedResumeId ? { ...resume, targetJobId: jobId, updatedAt: data.updatedAt } : resume))
-    setSelectedJobId(jobId)
-    const job = jobs.find(item => item.id === jobId)
-    toast.success('Resume linked', `This version is linked to ${job?.company ?? 'the saved job'} — confirm it when ready`)
+    const owner = resumeUserIdRef.current
+    const scope = confirmationScopeRef.current
+    if (!owner || hasUnknownResumeSave() || linkWriteRef.current !== 'idle' || auditRunRef.current || applyingAuditRef.current || confirmationWriteRef.current !== 'idle'
+      || !jobs.some(job => job.id === jobId && job.userId === owner)) return
+    linkWriteRef.current = 'pending'
+    setLinkWriteState('pending')
+    let verified = false
+    try {
+      const { data, error } = await apiMutate<Resume & { userId?: string }>(`/api/resume/${selectedResumeId}`, 'PATCH', { targetJobId: jobId })
+      if (!mountedRef.current || resumeUserIdRef.current !== owner || selectedResumeIdRef.current !== selectedResumeId
+        || selectedJobIdRef.current !== scope.selectedJobId || confirmationScopeRef.current.generation !== scope.generation) return
+      if (!data || error || data.id !== selectedResumeId || data.userId !== owner || data.targetJobId !== jobId) return
+      verified = true
+      setResumes(prev => prev.map(resume => resume.id === selectedResumeId ? { ...resume, targetJobId: jobId, updatedAt: data.updatedAt } : resume))
+      setSelectedJobId(jobId)
+      const job = jobs.find(item => item.id === jobId)
+      toast.success('Resume linked', `This version is linked to ${job?.company ?? 'the saved job'} — confirm it when ready`)
+    } catch {
+      // A failed request can still have committed; keep the unknown state.
+    } finally {
+      linkWriteRef.current = verified ? 'idle' : 'unknown'
+      if (mountedRef.current) setLinkWriteState(linkWriteRef.current)
+    }
   }
 
   async function auditApplicationPack(): Promise<ApplicationAudit | null> {
+    if (linkWriteRef.current !== 'idle' || confirmationWriteRef.current !== 'idle' || hasUnknownResumeSave()) return null
+    if (!hasValidatedCurrentResume()) { toast.info(t('resume.analysisLoadingTitle'), t('resume.analysisLoadingDetail')); return null }
     setAuditError(null)
     if (!selectedResumeId || !resumeLinkedJob) {
       const message = 'Link a saved job first'
@@ -1611,6 +2059,15 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       toast.info(message, 'Choose an opportunity in My Jobs before running the independent audit')
       return null
     }
+    const owner = resumeUserIdRef.current
+    if (!owner || resumeLinkedJob.userId !== owner) return null
+    const scope = confirmationScopeRef.current
+    const requestLetterScope = auditLetterScopeRef.current
+    const isCurrent = () => mountedRef.current && resumeUserIdRef.current === owner
+      && hasValidatedCurrentResume()
+      && selectedResumeIdRef.current === selectedResumeId && selectedJobIdRef.current === scope.selectedJobId
+      && confirmationScopeRef.current.generation === scope.generation && confirmationScopeRef.current.jobId === resumeLinkedJob.id
+    if (!isCurrent()) return null
     if (saving) {
       const message = t('resume.toastSaving')
       setAuditError(message)
@@ -1619,12 +2076,15 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     }
     if (dirty) {
       const saved = await handleSave()
-      if (!saved) return null
+      if (!saved || !isCurrent() || requestLetterScope !== auditLetterScopeRef.current) return null
     }
+    const requestMaterials = syncAuditMaterialScope()
+    const requestEditRevision = editRevisionRef.current
     const { data, error } = await apiMutate<ApplicationAuditResponse>(`/api/jobs/${resumeLinkedJob.id}/audit-application`, 'POST', {
       resumeId: selectedResumeId,
       ...(finalCoverLetter ? { coverLetterId: finalCoverLetter.id } : {}),
     })
+    if (!isCurrent() || requestEditRevision !== editRevisionRef.current || requestMaterials !== syncAuditMaterialScope() || dirtyRef.current || isSavingRef.current) return null
     if (!data || error) {
       const message = error ?? 'Please try again'
       setAuditError(message)
@@ -1633,6 +2093,9 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     }
     setAuditError(null)
     setLatestApplicationAudit({
+      jobId: resumeLinkedJob.id,
+      userId: owner,
+      scopeGeneration: scope.generation,
       resumeId: selectedResumeId,
       coverLetterId: finalCoverLetter?.id ?? null,
       resumeUpdatedAt: data.resumeUpdatedAt ?? selectedResumeUpdatedAt ?? undefined,
@@ -1647,7 +2110,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     saveCache({
       resumeId: selectedResumeId,
       jobId: resumeLinkedJob.id,
-      resumeUpdatedAt: data.resumeUpdatedAt ?? selectedResumeUpdatedAt,
+      resumeUpdatedAt: analysisRevisionRef.current,
       score: scoreResult,
       suggs: syncedSuggestions,
     })
@@ -1680,8 +2143,23 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   }
 
   async function applyAuditFinding(index: number) {
+    if (linkWriteRef.current !== 'idle' || confirmationWriteRef.current !== 'idle' || hasUnknownResumeSave()) return
+    if (!hasValidatedCurrentResume()) { toast.info(t('resume.analysisLoadingTitle'), t('resume.analysisLoadingDetail')); return }
     if (!selectedResumeId || !resumeLinkedJob || !displayedApplicationAuditRecord || auditStale) {
       toast.info('Run the audit again first', 'The current resume or cover letter changed after this audit.')
+      return
+    }
+    if (correctionConflictRef.current) {
+      toast.warning(t(versionRestoreUnknownRef.current ? 'resume.restoreUnknownTitle' : 'resume.correctionChangedTitle'),
+        t(versionRestoreUnknownRef.current ? 'resume.restoreUnknownDetail' : 'resume.correctionChangedDetail'))
+      return
+    }
+    if (dirtyRef.current && !isSavingRef.current) {
+      toast.info(t('resume.correctionSaveFirstTitle'), t('resume.correctionSaveFirstDetail'))
+      return
+    }
+    if (isSavingRef.current || applyingAuditRef.current) {
+      toast.info(t('resume.toastSaving'), t('resume.toastSavingDetail'))
       return
     }
     const finding = displayedApplicationAuditRecord.audit.findings[index]
@@ -1689,24 +2167,62 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     const beforeChange = expectedTarget === 'cover_letter'
       ? finalCoverLetter?.content
       : expectedTarget ? currentResumeSectionValue(expectedTarget) : undefined
+    const requestUserId = resumeUserIdRef.current
+    const requestResumeId = selectedResumeId
+    const requestEditRevision = editRevisionRef.current
+    if (!requestUserId) return
+    const requestScope = confirmationScopeRef.current
+    // A pending GET must not overwrite a server-side correction even if the
+    // user has not edited the cached resume locally.
+    saveGenerationRef.current += 1
+    applyingAuditRef.current = true
     setApplyingAuditFinding(index)
+    let allowPendingSave = true
     try {
       const { data, error } = await apiMutate<AuditApplyResponse>(`/api/jobs/${resumeLinkedJob.id}/audit-application/apply`, 'POST', {
         resumeId: selectedResumeId,
         coverLetterId: finalCoverLetter?.id ?? null,
         findingIndex: index,
       })
+      if (!mountedRef.current || requestUserId !== resumeUserIdRef.current
+        || requestResumeId !== selectedResumeIdRef.current
+        || !hasValidatedCurrentResume()
+        || confirmationScopeRef.current.generation !== requestScope.generation
+        || confirmationScopeRef.current.jobId !== resumeLinkedJob.id) {
+        allowPendingSave = false
+        if (mountedRef.current && requestUserId === resumeUserIdRef.current && requestResumeId === selectedResumeIdRef.current
+          && (dirtyRef.current || !data || error || data.resume)) {
+          correctionConflictRef.current = true
+          if (!data || error) setCorrectionOutcomeUnknown(true)
+          setContentChangedSinceAnalysis(true)
+          toast.warning(t('resume.correctionChangedTitle'), t('resume.correctionChangedDetail'))
+        }
+        return
+      }
       if (!data || error) {
-        toast.error('Could not apply audit correction', error ?? 'Please run the audit again')
+        correctionConflictRef.current = true
+        setCorrectionOutcomeUnknown(true)
+        setContentChangedSinceAnalysis(true)
+        toast.warning(t('resume.correctionChangedTitle'), t('resume.correctionChangedDetail'))
         return
       }
 
       if (data.resume) {
+        analysisEpochRef.current += 1
+        setScoring(false)
+        setSuggesting(false)
+        if (requestEditRevision !== editRevisionRef.current) {
+          correctionConflictRef.current = true
+          setContentChangedSinceAnalysis(true)
+          toast.warning(t('resume.correctionChangedTitle'), t('resume.correctionChangedDetail'))
+          return
+        }
         setContent(data.resume.content)
         setSectionOrder(data.resume.content.sectionOrder ?? DEFAULT_ORDER)
         setDirty(false)
         setContentChangedSinceAnalysis(true)
-        setCachedApiResponse(`/api/resume/${selectedResumeId}`, data.resume)
+        setCachedApiResponse(`/api/resume/${selectedResumeId}`, data.resume, resumeUserIdRef.current)
+        setContentRevision(data.resume.updatedAt ?? null)
         setResumes(previous => previous.map(resume => resume.id === data.resume?.id
           ? { ...resume, name: data.resume.name, updatedAt: data.resume.updatedAt }
           : resume))
@@ -1720,31 +2236,83 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       }
       setLatestApplicationAudit({
         ...displayedApplicationAuditRecord,
+        jobId: resumeLinkedJob.id,
+        userId: requestUserId,
+        scopeGeneration: requestScope.generation,
         resumeUpdatedAt: data.resumeUpdatedAt ?? displayedApplicationAuditRecord.resumeUpdatedAt,
         coverLetterUpdatedAt: data.coverLetterUpdatedAt ?? displayedApplicationAuditRecord.coverLetterUpdatedAt,
         audit: data.audit,
       })
       toast.success('Audit correction applied', 'The finding stays visible as Applied. Re-run the audit when you are ready to verify the package again.')
+    } catch {
+      allowPendingSave = false
+      if (mountedRef.current && requestUserId === resumeUserIdRef.current && requestResumeId === selectedResumeIdRef.current) {
+        correctionConflictRef.current = true
+        setCorrectionOutcomeUnknown(true)
+        setContentChangedSinceAnalysis(true)
+        toast.warning(t('resume.correctionChangedTitle'), t('resume.correctionChangedDetail'))
+      }
     } finally {
+      applyingAuditRef.current = false
       setApplyingAuditFinding(null)
+      if (allowPendingSave && mountedRef.current && requestUserId === resumeUserIdRef.current && requestResumeId === selectedResumeIdRef.current
+        && dirtyRef.current && !correctionConflictRef.current) void handleSave()
     }
   }
 
   async function confirmApplicationPack(audit: ApplicationAudit): Promise<boolean> {
+    if (linkWriteRef.current !== 'idle' || confirmationWriteRef.current !== 'idle' || hasUnknownResumeSave()) return false
+    if (!hasValidatedCurrentResume()) { toast.info(t('resume.analysisLoadingTitle'), t('resume.analysisLoadingDetail')); return false }
     if (!selectedResumeId || !resumeLinkedJob) return false
-    if (audit.verdict !== 'pass') {
+    const owner = resumeUserIdRef.current
+    if (!owner || resumeLinkedJob.userId !== owner) return false
+    const scope = confirmationScopeRef.current
+    const isCurrent = () => mountedRef.current && resumeUserIdRef.current === owner
+      && hasValidatedCurrentResume()
+      && selectedResumeIdRef.current === selectedResumeId && selectedJobIdRef.current === scope.selectedJobId
+      && confirmationScopeRef.current.generation === scope.generation
+      && confirmationScopeRef.current.jobId === resumeLinkedJob.id
+    if (!isCurrent()) return false
+    if (audit.verdict !== 'pass' || currentApplicationAudit?.auditedAt !== audit.auditedAt || dirty || saving) {
       toast.warning('Audit must pass', 'Resolve all Auditor findings before confirming this application package.')
       return false
     }
-    const { data, error } = await apiMutate<Job>(`/api/jobs/${resumeLinkedJob.id}/assign`, 'PATCH', {
-      finalResumeId: selectedResumeId,
-      finalCoverLetterId: finalCoverLetter?.id ?? null,
-    })
+    const requestMaterials = syncAuditMaterialScope()
+    const requestEditRevision = editRevisionRef.current
+    const expectedCoverLetterId = finalCoverLetter?.id ?? null
+    const materialsStillCurrent = () => requestMaterials === syncAuditMaterialScope()
+      && requestEditRevision === editRevisionRef.current && !dirtyRef.current && !isSavingRef.current
+    if (!materialsStillCurrent()) return false
+    const assignment = applicationMaterialAssignment(selectedResumeId, finalCoverLetter?.id ?? null, resumeLinkedJob.finalCoverLetterId)
+    confirmationWriteRef.current = 'pending'
+    setConfirmationWriteState('pending')
+    let verified = false
+    try {
+    const { data, error } = await apiMutate<Job>(`/api/jobs/${resumeLinkedJob.id}/assign`, 'PATCH', assignment)
+    if (!isCurrent() || !materialsStillCurrent()) return false
     if (!data || error) {
       toast.error('Could not confirm application pack', error ?? 'Please try again')
       return false
     }
+    if (data.id !== resumeLinkedJob.id || data.userId !== owner || data.finalResumeId !== selectedResumeId
+      || data.finalCoverLetterId !== expectedCoverLetterId) {
+      toast.error('Could not confirm application pack', 'Refresh the application and review the selected materials.')
+      return false
+    }
+    verified = true
+    confirmationWriteRef.current = 'idle'
+    setConfirmationWriteState('idle')
     setJobs(previous => previous.map(job => job.id === data.id ? data : job))
+    if (assignment.finalCoverLetterId) {
+      setInvalidatedAudit({ jobId: resumeLinkedJob.id, resumeId: selectedResumeId, auditedAt: audit.auditedAt })
+      // Selecting a different letter changes its server revision. Reload it
+      // and require an audit of that revision instead of inventing readiness.
+      setLatestSavedCoverLetter(null)
+      setLatestApplicationAudit(null)
+      toast.info(t('resume.materialSelectionChanged'), t('resume.materialSelectionRecheck'))
+      await refetchLinkedCoverLetters()
+      return false
+    }
     setResumes(previous => previous.map(resume => {
       if (resume.id === selectedResumeId) {
         return { ...resume, _count: { finalForJobs: Math.max(1, resume._count?.finalForJobs ?? 0) } }
@@ -1754,34 +2322,27 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       }
       return resume
     }))
-    setApplicationPackReadyResumeId(selectedResumeId)
     toast.success('Application pack confirmed', finalCoverLetter
-      ? 'Audited final resume and cover letter are ready in My Jobs and for PDF export'
-      : 'Audited final resume is ready in My Jobs and for PDF export')
+      ? 'Audited final resume and cover letter are ready in Applications and for PDF export'
+      : 'Audited final resume is ready in Applications and for PDF export')
     if (returnToJobs) {
-      const url = new URL(window.location.href)
-      url.searchParams.delete('returnToJobs')
-      url.searchParams.delete('returnJobId')
-      if (returnJobId) url.searchParams.set('highlight', returnJobId)
-      window.history.replaceState({}, '', url.toString())
-      navigate('jobs')
+      openApplication(data.id, navigate)
     }
     return true
-  }
-
-  async function downloadApplicationPack() {
-    if (!confirmedJob) return
-    try {
-      const result = await exportApplicationPackLocally(confirmedJob.id, Boolean(exportedPackFolder))
-      setExportedPackFolder(result.folderPath)
-      toast.success(exportedPackFolder ? 'Job folder opened' : 'Application PDFs saved', result.folderPath)
-    } catch (error) {
-      toast.error('Could not create application pack', error instanceof Error ? error.message : 'Please try again')
+    } catch {
+      return false
+    } finally {
+      confirmationWriteRef.current = verified ? 'idle' : 'unknown'
+      if (mountedRef.current) {
+        setConfirmationWriteState(confirmationWriteRef.current)
+        if (!verified) setShowFinalConfirm(false)
+      }
     }
   }
 
   async function exportCurrentResumePdf() {
     if (!selectedResumeId || !content || !selectedResume) { toast.info(t('resume.selectFirst')); return }
+    if (!hasValidatedCurrentResume()) { toast.info(t('resume.analysisLoadingTitle'), t('resume.analysisLoadingDetail')); return }
     if (exportingPdf) return
     setExportingPdf(true)
     try {
@@ -1796,7 +2357,8 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       toast.success(t('resume.exportSuccess'))
     } catch (error) {
       console.error('[resume] PDF export failed', error)
-      toast.error(t('resume.exportError'), t('resume.exportErrorFallback'))
+      if (isApplicationPdfUnsupportedCharactersError(error)) toast.error(t('application.downloadUnsupportedTitle'), t('application.downloadUnsupportedDetail'))
+      else toast.error(t('resume.exportError'), t('resume.exportErrorFallback'))
     } finally {
       setExportingPdf(false)
     }
@@ -1847,11 +2409,14 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     if (resumes.length <= 1) return toast.error('Keep one resume', 'Create another version before deleting this resume.')
     const approved = await confirm({ title: 'Delete resume?', message: `Delete “${resume.name}”? This cannot be undone.`, danger: true, confirmLabel: 'Delete' })
     if (!approved) return
+    if (resume.id === selectedResumeIdRef.current && (dirtyRef.current || isSavingRef.current)) {
+      if (!(await handleSave()) || dirtyRef.current || isSavingRef.current) return
+    }
     const { error } = await apiMutate(`/api/resume/${resume.id}`, 'DELETE')
     if (error) return toast.error('Delete failed', error)
     const next = resumes.filter(item => item.id !== resume.id)
     setResumes(next)
-    if (resume.id === selectedResumeId) setSelectedResumeId(next[0]?.id ?? null)
+    if (resume.id === selectedResumeIdRef.current) setSelectedResumeId(next[0]?.id ?? null)
     toast.success('Resume deleted', resume.name)
   }
 
@@ -1960,16 +2525,24 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     if (file) openIntake(file)
   }
 
-  async function selectResume(id: string) {
-    if (dirty) {
-      const ok = await confirm({ title: 'Discard changes?', message: 'You have unsaved changes. Switching will discard them.', danger: true, confirmLabel: 'Discard' })
-      if (!ok) return
+  async function selectResume(id: string, suppliedTarget?: ResumeListItem): Promise<boolean> {
+    const attempt = ++resumeSelectionAttempt.current
+    if (id === selectedResumeIdRef.current) return true
+    if (hasUnknownResumeSave()) return false
+    if (applyingAuditRef.current || versionRestoreIntentRef.current) {
+      toast.info(t('resume.toastSaving'), t('resume.toastSavingDetail'))
+      return false
     }
-    const target = resumes.find(r => r.id === id)
+    if (dirtyRef.current || isSavingRef.current) {
+      if (!(await handleSave()) || dirtyRef.current || isSavingRef.current) return false
+    }
+    if (!mountedRef.current || attempt !== resumeSelectionAttempt.current) return false
+    const target = suppliedTarget ?? resumes.find(r => r.id === id)
     setShowFinalConfirm(false)
     if (target) setResumeName(target.name)
     setSelectedResumeId(id)
     setSelectedJobId(target?.targetJobId ?? jobs.find(job => job.finalResumeId === id)?.id ?? null)
+    return true
   }
 
   // ── Render ────────────────────────────────────────────────────────────────
@@ -1987,6 +2560,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     <button
       key={tool.key}
       className={`resume-format-button resume-format-button-${tool.key === '•' ? 'bullet' : tool.key.toLowerCase()}`}
+      onMouseDown={event => event.preventDefault()}
       onClick={() => applyFormat(tool.wrap)}
       title={tool.title}
       aria-label={tool.title}
@@ -2002,7 +2576,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       <header className="resume-library-heading">
         <div>
           <h1>{t('resume.library')}</h1>
-          {returnToJobs && <button onClick={() => navigate('jobs')} style={{ marginTop: 4, padding: 0, border: 'none', background: 'none', color: 'var(--primary)', cursor: 'pointer', fontSize: 12 }}>← {t('resume.backToJobs')}</button>}
+          {returnToJobs && (returnJobId || linkedJobId) && <button disabled={saving || resumeEntryWritePending || linkWriteState !== 'idle' || confirmationWriteState !== 'idle'} onClick={() => void returnToApplication(returnJobId || linkedJobId!)} style={{ marginTop: 4, padding: 0, border: 'none', background: 'none', color: 'var(--primary)', cursor: 'pointer', fontSize: 12 }}>← {t('resume.backToApplication')}</button>}
         </div>
       <div className="resume-library-toolbar">
         <div className="resume-library-toolbar-actions">
@@ -2014,13 +2588,30 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
         <Btn variant="ghost" onClick={() => { if (!selectedResumeId) { toast.info(t('resume.selectFirst')); return }; fetchVersions(); setShowVersions(true) }}><History size={15} />{t('resume.history')}</Btn>
         <span className="resume-toolbar-divider" />
         <Btn variant="ghost" onClick={() => void exportCurrentResumePdf()} disabled={exportingPdf}><FileDown size={15} />{exportingPdf ? t('resume.exportPreparing') : t('resume.exportPdf')}</Btn>
-        <div className="resume-final-confirm-trigger"><Btn variant="toolbar" onClick={() => {
+        <div className="resume-final-confirm-trigger"><Btn variant="toolbar" disabled={linkWriteState !== 'idle' || confirmationWriteState !== 'idle'} onClick={() => {
           if (!selectedResumeId || !content) { toast.info('Select a resume first'); return }
+          if (!hasValidatedCurrentResume()) { toast.info(t('resume.analysisLoadingTitle'), t('resume.analysisLoadingDetail')); return }
           setShowFinalConfirm(true)
-        }}><ShieldCheck size={15} />{t('resume.finalConfirm')}</Btn></div>
+        }}><ShieldCheck size={15} />{t('resume.confirmMaterials')}</Btn></div>
         <span className={`resume-top-save${dirty ? ' is-unsaved' : ''}`}>{saving ? t('resume.savingStatus') : dirty ? t('resume.savingSoon') : lastSavedAt && Date.now() - lastSavedAt.getTime() >= 5 * 60_000 ? `${t('resume.savedAt')} ${lastSavedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : t('resume.savedJustNow')}</span>
       </div>
       </header>
+      {linkWriteState !== 'idle' && <p role="status">{linkWriteState === 'pending'
+        ? (lang === 'zh' ? '正在保存职位关联，请等待结果后再审核或返回申请。' : 'Saving the job link. Wait for the result before reviewing or returning to the application.')
+        : (lang === 'zh' ? '职位关联结果待核实。请先保存或复制未保存的编辑，重新加载简历并检查关联，然后再决定是否重试。' : 'The job link is unconfirmed. Save or copy unsaved edits, reload the resume and check the link before considering another attempt.')}</p>}
+      {confirmationWriteState !== 'idle' && <p role="status">{confirmationWriteState === 'pending'
+        ? (lang === 'zh' ? '正在确认申请材料，请等待结果。' : 'Confirming application materials. Please wait for the result.')
+        : (lang === 'zh' ? '材料确认结果待核实。请先保存或复制未保存的编辑，重新加载并核对申请使用的材料；不要仅凭一次读取判断操作未发生。' : 'Material confirmation is unconfirmed. Save or copy unsaved edits, reload and check the application materials; a single read does not prove the write did not happen.')}</p>}
+      {correctionOutcomeUnknown && <p role="status">{lang === 'zh'
+        ? '材料修正结果待核实。请复制未保存的编辑，重新加载并核对最新材料；暂时不要再次修正或保存覆盖。'
+        : 'The correction result is unconfirmed. Copy unsaved edits, reload and review the latest materials; do not repeat the correction or save over them yet.'}</p>}
+      {hasUnknownResumeSave() && <p role="status">{lang === 'zh'
+        ? '简历保存结果待核实。请复制未保存的编辑，重新加载并核对最新内容；一次读取不能证明之前的保存没有发生。'
+        : 'The resume save is unconfirmed. Copy unsaved edits, reload and review the latest content; one read cannot prove the earlier save did not happen.'}</p>}
+      {!loadingCont && selectedResumeId && contentResumeId === selectedResumeId && !contentVerified && <p role="status">
+        {lang === 'zh' ? '无法确认最新简历；请保留编辑并重新加载，确认后再审核材料。' : 'The latest resume could not be verified. Keep your edits and reload before reviewing materials.'}
+        <button type="button" onClick={() => setResumeReadAttempt(value => value + 1)}>{t('common.retry')}</button>
+      </p>}
 
       {loadingCont ? (
         <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-tertiary)' }}>
@@ -2029,9 +2620,18 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
             <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{t('resume.loading')}</div>
           </div>
         </div>
+      ) : selectedResumeId && contentResumeId !== selectedResumeId ? (
+        <div role="alert" style={{ padding: 24 }}>
+          <p>{lang === 'zh' ? '无法加载所选简历，请重试。原简历内容不会被当作此版本。' : 'Could not load the selected resume. Retry; the previous resume is not used for this version.'}</p>
+          <Btn onClick={() => setResumeReadAttempt(value => value + 1)}>{t('common.retry')}</Btn>
+        </div>
       ) : !content ? (
         <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-tertiary)' }}>
-          <div style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>{t('resume.selectOrCreate')}</div>
+          <div style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
+            <p>{t('resume.selectOrCreate')}</p>
+            {resumeStartEmpty && <Btn variant="primary" disabled={creatingResume || resumeEntryUncertain} onClick={() => setShowNewResume(true)}>{t('resume.newTitle')}</Btn>}
+            {resumeEntryUncertain && <p role="status">{t('resume.entryWriteUncertain')}</p>}
+          </div>
         </div>
       ) : (
         <div
@@ -2265,7 +2865,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
               <small>{selectedResume?.targetJobId ? 'Tailored version linked' : 'Selected resume linked'}</small>
               <div className="resume-opportunity-actions">
                 <button onClick={() => setShowCoverLetter(true)}>{t('resume.coverLetter')}</button>
-                <button onClick={() => toast.info(t('resume.viewJob'), `${linkedJob.company} · ${linkedJob.role} is linked to this resume`)}>{t('resume.viewJob')}</button>
+                <button disabled={saving || linkWriteState !== 'idle' || confirmationWriteState !== 'idle'} onClick={() => void returnToApplication(linkedJob.id)}>{t('resume.viewApplication')}</button>
               </div>
             </> : <>
               <strong>{t('resume.linkSavedJob')}</strong>
@@ -2274,7 +2874,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
                 <option value="">{t('resume.chooseSavedJob')}</option>
                 {jobs.map(job => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}
               </select>
-              <button className="resume-opportunity-link" onClick={() => {
+              <button className="resume-opportunity-link" disabled={linkWriteState !== 'idle' || confirmationWriteState !== 'idle'} onClick={() => {
                 if (!selectedJobId) { toast.info('Select a saved job first', 'Choose the opportunity this resume should be used for'); return }
                 linkResumeToJob(selectedJobId)
               }}>{t('resume.linkResume')}</button>
@@ -2288,7 +2888,13 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
             suggesting={suggesting}
             noJobSelected={!selectedJobId}
             onApplySuggestion={applySuggestion}
-            onAnalyze={() => content && selectedJobId && runAnalysis(content, selectedJobId)}
+            onAnalyze={() => {
+              if (!content || !selectedJobId) {
+                toast.info(t('resume.analysisLoadingTitle'), t('resume.analysisLoadingDetail'))
+                return
+              }
+              void runAnalysis(content, selectedJobId)
+            }}
             onAddKeyword={kw => patch(p => ({ ...p, skills: [...(p.skills ?? []), kw] }), 'skills')}
             onApplyTargeted={applyTargeted}
             onEditSection={sec => setEditSection(sec)}
@@ -2318,6 +2924,8 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
           current={templateId}
           currentOptions={templateOptions}
           onSelect={(id, opts) => {
+            latestTemplateId.current = id
+            latestTemplateOptions.current = opts
             setTemplateId(id)
             setTemplateOptions(opts)
             setDirty(true)
@@ -2385,7 +2993,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
           templateName={templateName}
           pendingSuggestions={pendingSuggestions}
           isDirty={dirty || saving}
-          packReady={applicationPackReadyResumeId === selectedResumeId}
+          packReady={applicationMaterialsConfirmed}
           resumeContent={{ ...(content as ResumeContent), sectionOrder }}
           templateId={templateId}
           templateOptions={templateOptions}
@@ -2404,8 +3012,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
             window.setTimeout(() => document.querySelector<HTMLElement>('[data-resume-audit-card]')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 0)
           }}
           onConfirm={confirmApplicationPack}
-          onDownload={downloadApplicationPack}
-          exportedPackFolder={exportedPackFolder}
+          onOpenApplication={() => { if (resumeLinkedJob) void returnToApplication(resumeLinkedJob.id) }}
         />
       )}
       {renamingResume && <RenameResumeModal resume={renamingResume} onClose={() => setRenamingResume(null)} onRename={name => handleRenameResume(renamingResume, name)} />}
@@ -2414,6 +3021,10 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       )}
       {showIntakeDialog && (
         <ResumeIntakeDialog
+          onBeginSave={resumeStartEmpty ? beginResumeEntryWrite : undefined}
+          onEndSave={resumeStartEmpty ? endResumeEntryWrite : undefined}
+          saveBlocked={resumeStartEmpty && resumeEntryUncertain}
+          settleSave={resumeStartEmpty ? settleResumeEntryWrite : undefined}
           onClose={() => { setShowIntakeDialog(false); setIntakeFile(null) }}
           onSaved={(resume) => {
             const item: ResumeListItem = {
@@ -2424,7 +3035,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
               createdAt: resume.createdAt, updatedAt: resume.updatedAt,
             }
             setResumes(prev => [...prev, item])
-            setSelectedResumeId(resume.id)
+            void selectResume(resume.id, item)
             toast.success('Resume saved', `"${resume.name}" added to your library`)
             setIntakeFile(null)
             setShowIntakeDialog(false)

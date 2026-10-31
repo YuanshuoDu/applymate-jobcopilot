@@ -7,6 +7,8 @@ const mocks = vi.hoisted(() => ({
   toast: { error: vi.fn(), success: vi.fn() },
 }))
 
+vi.mock('next-auth/react', () => ({ useSession: () => ({ data: { user: { id: 'candidate-1' } }, status: 'authenticated' }) }))
+
 vi.mock('@/lib/hooks', () => ({ apiMutate: mocks.apiMutate }))
 vi.mock('@/components/ui', () => ({
   CompanyLogo: () => null,

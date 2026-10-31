@@ -34,8 +34,7 @@ type Props = {
   onLinkJob: () => void
   onReviewAudit: () => void
   onConfirm: (audit: ApplicationAudit) => Promise<boolean>
-  onDownload: () => Promise<void>
-  exportedPackFolder: string | null
+  onOpenApplication: () => void
 }
 
 const icons = {
@@ -50,7 +49,7 @@ const icons = {
 export function FinalConfirmDialog({
   job, resumeName, templateName, pendingSuggestions, isDirty, packReady, resumeContent, templateId, templateOptions, coverLetterContent,
   initialAudit,
-  onClose, onReviewSuggestions, onCreateCoverLetter, onLinkJob, onReviewAudit, onConfirm, onDownload, exportedPackFolder,
+  onClose, onReviewSuggestions, onCreateCoverLetter, onLinkJob, onReviewAudit, onConfirm, onOpenApplication,
 }: Props) {
   const { t } = useI18n()
   const [audit, setAudit] = useState<ApplicationAudit | null>(initialAudit ?? null)
@@ -103,15 +102,8 @@ export function FinalConfirmDialog({
     },
   ], [audit, coverLetterContent, isDirty, job, packReady, pendingSuggestions, templateName, t])
 
-  const [checkedCount, setCheckedCount] = useState(0)
   const [confirming, setConfirming] = useState(false)
   const [confirmed, setConfirmed] = useState(packReady)
-
-  useEffect(() => {
-    setCheckedCount(0)
-    const timers = items.map((_, index) => window.setTimeout(() => setCheckedCount(index + 1), 230 + index * 360))
-    return () => timers.forEach(window.clearTimeout)
-  }, [items.length])
 
   useEffect(() => setConfirmed(packReady), [packReady])
 
@@ -120,7 +112,8 @@ export function FinalConfirmDialog({
   }, [initialAudit])
 
   const unresolvedBlocking = items.filter(item => !item.complete && item.blocking !== false)
-  const ready = checkedCount === items.length && unresolvedBlocking.length === 0
+  const ready = unresolvedBlocking.length === 0
+  const showConfirmed = confirmed && !isDirty && audit?.verdict === 'pass'
 
   async function handleConfirm() {
     if (!audit || audit.verdict !== 'pass' || !ready || confirming) return
@@ -147,28 +140,27 @@ export function FinalConfirmDialog({
         <div className="final-confirm-heading">
           <span className="final-confirm-shield"><Check size={17} /></span>
           <div>
-            <h2 id="final-confirm-title">{t('resume.finalConfirm')}</h2>
-            <p>{t('resume.finalCheckBeforePdf')}</p>
+            <h2 id="final-confirm-title">{t('resume.confirmMaterials')}</h2>
+            <p>{t('resume.materialsOnlyHint')}</p>
           </div>
         </div>
 
         <div className="final-confirm-checks" aria-live="polite">
-          {items.map((item, index) => {
+          {items.map(item => {
             const Icon = icons[item.id]
-            const checked = checkedCount > index
-            const status = !checked ? 'checking' : item.complete ? 'complete' : 'attention'
+            const status = item.complete ? 'complete' : 'attention'
             return (
               <div className={`final-confirm-check is-${status}`} key={item.id}>
                 <span className="final-confirm-step-icon">
-                  {!checked ? <LoaderCircle size={17} /> : item.complete ? <Check size={16} /> : <AlertTriangle size={16} />}
+                  {item.complete ? <Check size={16} /> : <AlertTriangle size={16} />}
                 </span>
                 <span className="final-confirm-check-icon"><Icon size={16} /></span>
                 <div className="final-confirm-check-copy">
                   <strong>{item.label}</strong>
                   <span>{item.detail}</span>
                 </div>
-                {checked && item.action && <button type="button" onClick={() => runAction(item)}>{item.action}</button>}
-                {checked && item.id === 'audit' && !item.complete && (
+                {item.action && <button type="button" onClick={() => runAction(item)}>{item.action}</button>}
+                {item.id === 'audit' && !item.complete && (
                   <button
                     type="button"
                     className="final-confirm-status-action"
@@ -178,7 +170,7 @@ export function FinalConfirmDialog({
                     {t('resume.reviewAudit')}
                   </button>
                 )}
-                {checked && !item.action && !(item.id === 'audit' && !item.complete) && <span className="final-confirm-status">{item.optional ? t('resume.optional') : item.complete ? t('resume.completed') : item.blocking === false ? t('resume.afterConfirm') : t('resume.needsReview')}</span>}
+                {!item.action && !(item.id === 'audit' && !item.complete) && <span className="final-confirm-status">{item.optional ? t('resume.optional') : item.complete ? t('resume.completed') : item.blocking === false ? t('resume.afterConfirm') : t('resume.needsReview')}</span>}
               </div>
             )
           })}
@@ -190,9 +182,9 @@ export function FinalConfirmDialog({
         </div>}
 
         <div className="final-confirm-footer">
-          {confirmed ? <>
+          {showConfirmed ? <>
             <div className="final-confirm-ready"><Check size={15} /> {t('resume.applicationPackConfirmed')}</div>
-            <button className="final-confirm-primary" onClick={() => void onDownload()}><FileCheck2 size={16} /> {exportedPackFolder ? t('resume.openJobFolder') : t('resume.savePdfs')}</button>
+            <button className="final-confirm-primary" onClick={onOpenApplication}><FileCheck2 size={16} /> {t('application.viewApplication')}</button>
           </> : <>
             <button className="final-confirm-secondary" onClick={onClose}>{t('resume.backToEdit')}</button>
             <button className="final-confirm-primary" disabled={!ready || confirming} onClick={() => void handleConfirm()}>
@@ -205,14 +197,13 @@ export function FinalConfirmDialog({
           <div className="final-confirm-audit-results">
             <strong>{audit.verdict === 'blocked' ? t('resume.auditBlocked') : t('resume.auditNeedsReview')}</strong>
             <span>{t('resume.auditDetailsInResume')}</span>
-            <button type="button" className="final-confirm-status-action" onClick={onReviewAudit}>{t('resume.reviewAudit')}</button>
           </div>
         )}
-        {confirmed && <div className="final-material-preview">
+        {showConfirmed && <div className="final-material-preview">
           <div><strong>{t('resume.finalResume')}</strong><div className="final-material-preview-resume"><ResumeRenderer content={resumeContent} templateId={templateId} templateOptions={templateOptions} scale={0.42} /></div></div>
           <div><strong>{t('resume.finalCoverLetter')}</strong><div className="final-material-preview-letter">{coverLetterContent ?? t('resume.noCoverLetter')}</div></div>
         </div>}
-        {!confirmed && <p className="final-confirm-note">{t('resume.confirmedCopyNote')}</p>}
+        {!showConfirmed && <p className="final-confirm-note">{t('resume.confirmedCopyNote')}</p>}
         <span className="final-confirm-resume-name">{resumeName}</span>
       </section>
     </div>

@@ -7,7 +7,13 @@ import { useRouter } from 'next/navigation'
 import { Bell } from 'lucide-react'
 import { Sidebar } from './Sidebar'
 import type { Page } from '@/lib/types'
-import { NavContext } from '@/lib/nav-context'
+import { NavContext, type NavigationGuard } from '@/lib/nav-context'
+import { isApplicationNavigationEvent } from '@/lib/application-navigation'
+import { applicationHistoryIndex } from '@/lib/application-history-position'
+import { guardApplicationTraversal } from '@/lib/application-traversal-guard'
+import { createRecoveryDraftStore, type RecoveryDraft } from '@/lib/application-recovery-draft'
+import { replaceWithRecoveryResume } from '@/lib/application-recovery-navigation'
+import { ApplicationRecoveryView } from '@/components/jobs/application-recovery-view'
 import { useI18n } from '@/lib/i18n'
 import { OnboardingFlow } from '@/components/onboarding/OnboardingFlow'
 import { clearCachedApiResponses } from '@/lib/api-cache'
@@ -177,13 +183,17 @@ export function AppShell() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [timedOut, setTimedOut] = useState(false)
   const [jobCount, setJobCount] = useState(0)
-  const { data: session, status } = useSession()
+  const { data: session, status, update: updateSession } = useSession()
   const { t } = useI18n()
   const router = useRouter()
   const initialPageRef = useRef(page)
   const previousUserIdRef = useRef<string | null>(null)
   const PageComp = PAGES[page]
   const activeUserId = session?.user?.id ?? null
+  const activeUserRef = useRef<string | null>(null)
+  activeUserRef.current = status === 'authenticated' ? activeUserId : null
+  const shellMounted = useRef(true)
+  useEffect(() => { shellMounted.current = true; return () => { shellMounted.current = false } }, [])
 
   useEffect(() => {
     try { setSidebarCollapsed(window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === '1') } catch { /* ignore storage failures */ }
@@ -206,14 +216,71 @@ export function AppShell() {
     void PAGE_PRELOADERS[nextPage]().catch(() => undefined)
   }, [])
 
-  const navigatePage = useCallback((nextPage: Page, mode: 'push' | 'replace' = 'push') => {
-    prefetchPage(nextPage)
-    setSidebarPopover(null)
-    setMobileMoreOpen(false)
-    setPage(nextPage)
-    writePageToUrl(nextPage, mode)
+  const navigationGuard = useRef<NavigationGuard | null>(null)
+  const recoveryStore = useRef(createRecoveryDraftStore())
+  const [, setRecoveryGeneration] = useState(0)
+  const publishRecoveryDraft = useCallback((userId: string, draft: RecoveryDraft | null) => {
+    if (draft && draft.userId === userId) recoveryStore.current.publish(draft)
+    else if (!draft) recoveryStore.current.clearActive(userId)
+  }, [])
+  const navigationAttempt = useRef(0)
+  const historyIndex = useRef<number | null>(null)
+  const restoringHistory = useRef<{ origin: number; target: number; attempt: number; restored: boolean; saved: boolean; resolve: () => void; wait: Promise<void> } | null>(null)
+  const registerNavigationGuard = useCallback((guard: NavigationGuard) => {
+    const owner = activeUserId
+    if (owner && guard.needsSave()) recoveryStore.current.reattach(owner)
+    navigationGuard.current = guard
+    return () => {
+      if (navigationGuard.current === guard) {
+        navigationGuard.current = null
+        navigationAttempt.current += 1
+        if (owner) {
+          if (guard.needsSave()) recoveryStore.current.detach(owner)
+          else recoveryStore.current.clearActive(owner)
+          setRecoveryGeneration(value => value + 1)
+        }
+      }
+    }
+  }, [activeUserId])
+  const navigatePage = useCallback((nextPage: Page, mode: 'push' | 'replace' = 'push'): boolean | Promise<boolean> => {
+    const attempt = ++navigationAttempt.current
+    const finish = () => {
+      prefetchPage(nextPage)
+      setSidebarPopover(null)
+      setMobileMoreOpen(false)
+      setPage(nextPage)
+      writePageToUrl(nextPage, mode)
+      historyIndex.current = applicationHistoryIndex(window)
+      return true
+    }
+    const guard = navigationGuard.current
+    const restoration = restoringHistory.current
+    if (!restoration && (!guard?.needsSave() || nextPage === 'resume')) return finish()
+    return (async () => {
+      if (restoration) await restoration.wait
+      if (attempt !== navigationAttempt.current) return false
+      if (guard?.needsSave() && nextPage !== 'resume' && !(await guard.save())) return false
+      return !guard?.needsSave() && attempt === navigationAttempt.current ? finish() : false
+    })().catch(() => false)
   }, [prefetchPage])
-  const navContextValue = useMemo(() => ({ navigate: navigatePage }), [navigatePage])
+  const prepareToLeave = useCallback(async () => {
+    const attempt = ++navigationAttempt.current
+    const guard = navigationGuard.current
+    const owner = activeUserId
+    try {
+      const saved = !guard?.needsSave() || (await guard.save() && !guard.needsSave())
+      if (!shellMounted.current || owner !== activeUserRef.current || attempt !== navigationAttempt.current) return false
+      if (saved && activeUserId) recoveryStore.current.clearActive(activeUserId)
+      return saved
+    } catch { return false }
+  }, [activeUserId])
+  const signOutSafely = useCallback(async () => {
+    if (!await prepareToLeave()) return false
+    if (recoveryStore.current.hasAny()) await signOut({ redirect: false })
+    else await signOut({ callbackUrl: '/login' })
+    return true
+  }, [prepareToLeave])
+  const navContextValue = useMemo(() => ({ navigate: navigatePage, registerNavigationGuard, prepareToLeave, signOutSafely, publishRecoveryDraft }), [navigatePage, registerNavigationGuard, prepareToLeave, signOutSafely, publishRecoveryDraft])
 
   useEffect(() => {
     if (status !== 'authenticated') { setCheckingOnboard(false); return }
@@ -228,13 +295,81 @@ export function AppShell() {
     initialPageRef.current = locationPage
     setPage(locationPage)
     writePageToUrl(locationPage, 'replace')
+    historyIndex.current = applicationHistoryIndex(window)
 
-    function handlePopState() {
-      setPage(pageFromSearch(window.location.search))
+    // Cancel same-document traversals before the URL changes when the browser
+    // supports the Navigation API. No compensating history operation is then
+    // needed, even when the user makes several choices while saving.
+    const navigation = (window as Window & { navigation?: EventTarget & {
+      traverseTo: (key: string) => { committed: Promise<unknown>; finished: Promise<unknown> }
+    } }).navigation
+    const onNavigate: EventListener = rawEvent => {
+      const event = rawEvent as Event & {
+        navigationType: string
+        destination: { sameDocument: boolean; key: string }
+      }
+      if (!navigation) return
+      guardApplicationTraversal(event, navigationGuard.current, navigation,
+        () => ++navigationAttempt.current,
+        attempt => attempt === navigationAttempt.current)
+    }
+    navigation?.addEventListener('navigate', onNavigate)
+
+    // A later cross-document navigation or reload presents the browser's own
+    // prompt. If it is canceled, do not replay an earlier pending traversal.
+    const onBeforeUnload = () => {
+      if (navigationGuard.current?.needsSave()) navigationAttempt.current += 1
+    }
+    window.addEventListener('beforeunload', onBeforeUnload)
+
+    function handlePopState(event: PopStateEvent) {
+      const guard = navigationGuard.current
+      const index = applicationHistoryIndex(window)
+      const restoration = restoringHistory.current
+      if (restoration && index === restoration.origin) {
+        restoration.restored = true
+        historyIndex.current = index
+        restoration.resolve()
+        restoringHistory.current = null
+        if (restoration.saved && !guard?.needsSave() && restoration.attempt === navigationAttempt.current) {
+          window.history.go(restoration.target - restoration.origin)
+        }
+        return
+      }
+      if (isApplicationNavigationEvent(event) || !guard?.needsSave()) {
+        historyIndex.current = index
+        setPage(pageFromSearch(window.location.search))
+        return
+      }
+      const origin = restoration?.origin ?? historyIndex.current
+      const attempt = ++navigationAttempt.current
+      if (origin !== null && index !== null && origin !== index) {
+        let resolve!: () => void
+        const wait = new Promise<void>(done => { resolve = done })
+        const pending = { origin, target: index, attempt, restored: false, saved: false, resolve, wait }
+        if (restoration) restoration.resolve()
+        restoringHistory.current = pending
+        window.history.go(origin - index)
+        void guard.save().then(saved => {
+          pending.saved = saved
+          if (saved && pending.restored && !guard.needsSave() && attempt === navigationAttempt.current) {
+            window.history.go(index - origin)
+          }
+        }).catch(() => undefined)
+        return
+      }
+      // The direction is unknown when indices are unavailable. Keep the editor
+      // open after saving; replaying an assumed direction could leave the app.
+      window.history.pushState(window.history.state, '', guard.currentHref())
+      void guard.save().catch(() => undefined)
     }
 
     window.addEventListener('popstate', handlePopState)
-    return () => window.removeEventListener('popstate', handlePopState)
+    return () => {
+      navigation?.removeEventListener('navigate', onNavigate)
+      window.removeEventListener('beforeunload', onBeforeUnload)
+      window.removeEventListener('popstate', handlePopState)
+    }
   }, [])
 
   // Safety timeout
@@ -243,6 +378,7 @@ export function AppShell() {
     const t = setTimeout(() => setTimedOut(true), 10000)
     return () => clearTimeout(t)
   }, [status])
+  useEffect(() => { if (status !== 'loading') setTimedOut(false) }, [status])
 
   // ── Auth sync: Dashboard ↔ Extension ────────────────────
 
@@ -380,13 +516,22 @@ export function AppShell() {
   }
 
   useEffect(() => {
-    if (status === 'unauthenticated' || timedOut) {
+    if ((status === 'unauthenticated' || timedOut) && !recoveryStore.current.hasAny()) {
       router.push('/login?callbackUrl=/')
     }
   }, [router, status, timedOut])
 
+  useEffect(() => {
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (recoveryStore.current.hasAny()) { event.preventDefault(); event.returnValue = '' }
+    }
+    window.addEventListener('beforeunload', onBeforeUnload)
+    return () => window.removeEventListener('beforeunload', onBeforeUnload)
+  }, [])
+
   // Redirect to login if unauthenticated or timed out
   if (status === 'unauthenticated' || timedOut) {
+    if (recoveryStore.current.hasAny()) return <ApplicationRecoveryView draft={null} onRefreshSession={() => { void updateSession().catch(() => undefined) }} />
     return null
   }
 
@@ -416,6 +561,15 @@ export function AppShell() {
       </div>
     )
   }
+
+  const recoveryDraft = status === 'authenticated' ? recoveryStore.current.getDetached(activeUserId) : null
+  if (recoveryDraft) return <ApplicationRecoveryView draft={recoveryDraft} onContinue={() => {
+    if (activeUserRef.current !== recoveryDraft.userId) return
+    if (!replaceWithRecoveryResume(window, recoveryDraft.resumeId, recoveryDraft.applicationContext)) return
+    setPage('resume')
+    recoveryStore.current.discard(recoveryDraft.userId)
+    setRecoveryGeneration(value => value + 1)
+  }} />
 
   return (
     <>
@@ -483,7 +637,7 @@ export function AppShell() {
               <div className="mobile-more-menu" data-mobile-more-menu role="menu" aria-label={t('nav.moreNavigation')}>
                 {getMobileMoreItems(t('nav.signout'), t).map(item => (
                   <button key={item.id} role="menuitem" data-danger={item.id === 'signout'} onClick={() => {
-                    if (item.id === 'signout') void signOut({ callbackUrl: '/login' })
+                    if (item.id === 'signout') void signOutSafely()
                     else navigatePage(item.id)
                   }}>
                     {item.label}

@@ -1,6 +1,7 @@
 'use client'
 
-import React, { useMemo, useState, useEffect, useRef, useCallback } from 'react'
+import { isApplicationPdfUnsupportedCharactersError } from '@/lib/application-pdf-errors'
+import React, { useMemo, useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react'
 import { useSession } from 'next-auth/react'
 import { AlertCircle, Bookmark, Check, ChevronDown, ChevronRight, FileText, Info, LayoutGrid, Link2, List, LoaderCircle, Lock, Search, Sparkles, Trash2, UsersRound, X } from 'lucide-react'
 import { Btn, Card, CompanyLogo, INPUT_STYLE, ScorePill, StatusBadge, useToast, useConfirm } from '@/components/ui'
@@ -10,11 +11,101 @@ import type { ApplicationAudit, ApplicationAuditFinding, CoverLetter, Job, JobSt
 import { apiMutate, fmtDate, fmtRelative, useApi } from '@/lib/hooks'
 import { setCachedApiResponse } from '@/lib/api-cache'
 import { useNav } from '@/lib/nav-context'
-import { exportApplicationPackLocally } from '@/lib/bundle'
+import { downloadAuditedApplicationBundle } from '@/lib/bundle'
 import { assessApplicationPreflight } from '@/lib/agent/application-preflight'
 import { useI18n } from '@/lib/i18n'
+import { auditMatchesCurrentMaterials } from '@/lib/application-materials'
+import { applicationListUrl, loadLinkedApplication, readApplicationListState } from '@/lib/application-list-state'
+import type { StoredApplicationAudit } from '@/lib/application-audit'
+import { useApplicationTasks } from '@/components/jobs/useApplicationTasks'
+import { useApplicationCoverLetters } from '@/components/jobs/useApplicationCoverLetters'
+import { ApplicationProgress } from '@/components/jobs/application-progress'
+import { ApplicationTaskCard } from '@/components/jobs/application-task-card'
+import { ApplicationAttentionView, ApplicationTaskSummary } from '@/components/jobs/application-attention-view'
+import type { ApplicationTaskView } from '@/components/jobs/application-task-model'
+import { forgetSavedApplication } from '@/components/jobs/application-search-state'
+import { applicationTaskAllowsManualWork } from '@/components/jobs/application-attention-safety'
+import { blocksManualRecord, hasVisibleSubmissionRecord, parseScopedManualRecordJob, readManualRecord, readManualRecordLock, rejectPendingManualRecord, submitManualRecord, writeManualRecordLock, type ManualRecordLock } from '@/components/jobs/application-manual-record'
+import { openApplication, openApplicationSession, replaceApplicationHistory } from '@/lib/application-navigation'
 
 const KANBAN_COLS: JobStatus[] = ['saved', 'applied', 'interview', 'offer', 'rejected']
+function isScopedActivity(value: unknown, userId: string, jobId: string): value is Activity {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const row = value as Record<string, unknown>
+  return typeof row.id === 'string' && row.id.length > 0 && row.userId === userId && row.jobId === jobId
+    && typeof row.type === 'string' && typeof row.text === 'string'
+    && (row.color === null || typeof row.color === 'string')
+    && typeof row.createdAt === 'string' && Number.isFinite(Date.parse(row.createdAt))
+}
+type DescriptionDraft = { text: string; revision: number; uncertain: boolean }
+const descriptionDrafts = new Map<string, DescriptionDraft>()
+let descriptionUnloadAttached = false
+function protectDescriptionDrafts(event: BeforeUnloadEvent) { event.preventDefault(); event.returnValue = '' }
+function updateDescriptionDraft(key: string, draft: DescriptionDraft | null) {
+  if (draft) descriptionDrafts.set(key, draft); else descriptionDrafts.delete(key)
+  if (typeof window === 'undefined') return
+  if (descriptionDrafts.size && !descriptionUnloadAttached) { window.addEventListener('beforeunload', protectDescriptionDrafts); descriptionUnloadAttached = true }
+  if (!descriptionDrafts.size && descriptionUnloadAttached) { window.removeEventListener('beforeunload', protectDescriptionDrafts); descriptionUnloadAttached = false }
+}
+
+async function readDescriptionScope(path: string): Promise<{ ok: boolean; data: unknown }> {
+  const controller = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      fetch(path, { signal: controller.signal, cache: 'no-store' }).then(async response => ({ ok: response.ok, data: await response.json() as unknown })).catch(() => ({ ok: false, data: null })),
+      new Promise<{ ok: boolean; data: null }>(resolve => { timer = setTimeout(() => { controller.abort(); resolve({ ok: false, data: null }) }, 30_000) }),
+    ])
+  } finally { if (timer) clearTimeout(timer) }
+}
+
+type DescriptionSaveResult = { kind: 'saved'; data: unknown } | { kind: 'conflict' | 'unconfirmed' }
+async function saveDescriptionRequest(jobId: string, text: string, expectedEmptyDescription: string | null): Promise<DescriptionSaveResult> {
+  const controller = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      fetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
+        method: 'PATCH', signal: controller.signal, headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ description: text, expectedEmptyDescription }),
+      }).then(async response => response.status === 409 ? { kind: 'conflict' as const }
+        : response.ok ? { kind: 'saved' as const, data: await response.json() as unknown }
+        : { kind: 'unconfirmed' as const }).catch(() => ({ kind: 'unconfirmed' as const })),
+      new Promise<DescriptionSaveResult>(resolve => { timer = setTimeout(() => { controller.abort(); resolve({ kind: 'unconfirmed' }) }, 30_000) }),
+    ])
+  } finally { if (timer) clearTimeout(timer) }
+}
+// Validate the fields directly used by this preview; nested section entries
+// still follow the existing resume contract and are not exhaustively checked.
+function isUsableResumePayload(value: unknown): value is Resume & { userId: string } {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const resume = value as Record<string, unknown>
+  const content = resume.content
+  if (!content || typeof content !== 'object' || Array.isArray(content)) return false
+  const fields = content as Record<string, unknown>
+  const contact = fields.contact
+  if (!contact || typeof contact !== 'object' || Array.isArray(contact)) return false
+  if (typeof resume.name !== 'string' || typeof resume.userId !== 'string') return false
+  const contactFields = contact as Record<string, unknown>
+  if (['name', 'email', 'location', 'linkedin', 'github', 'website', 'phone'].some(key => contactFields[key] != null && typeof contactFields[key] !== 'string')) return false
+  if (fields.summary != null && typeof fields.summary !== 'string') return false
+  if (!['experience', 'education', 'skills'].every(key => Array.isArray(fields[key]))) return false
+  return ['languages', 'projects', 'certifications', 'custom', 'sectionOrder'].every(key => fields[key] == null || Array.isArray(fields[key]))
+}
+
+async function readResumeForPreparation(id: string): Promise<unknown> {
+  const controller = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      fetch(`/api/resume/${encodeURIComponent(id)}`, { signal: controller.signal }).then(response => {
+        if (!response.ok) throw new Error('Resume unavailable')
+        return response.json() as Promise<unknown>
+      }),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error('Resume unavailable')) }, 30_000) }),
+    ])
+  } finally { if (timer) clearTimeout(timer) }
+}
 const COL_LABELS: Record<JobStatus, string> = {
   saved: 'Saved', applied: 'Applied',
   interview: 'Interview', offer: 'Offer', rejected: 'Rejected',
@@ -95,8 +186,10 @@ export function toMobileJobCard(job: Job): MobileJobCardData {
 }
 
 // ── ListView ──────────────────────────────────────────────────────────────────
-function ListView({ jobs, onRowClick, selectedIds, onToggle, onToggleAll }: {
+function ListView({ jobs, taskByJobId, onOpenSession, onRowClick, selectedIds, onToggle, onToggleAll }: {
   jobs: Job[]
+  taskByJobId: ReadonlyMap<string, ApplicationTaskView>
+  onOpenSession: (sessionId: string) => void
   onRowClick: (job: Job) => void
   selectedIds: Set<string>
   onToggle: (id: string) => void
@@ -181,7 +274,7 @@ function ListView({ jobs, onRowClick, selectedIds, onToggle, onToggleAll }: {
                   ) : null
                 })() : null}
               </td>
-              <td style={{ padding: '10px 16px' }}><StatusBadge status={j.status} /></td>
+              <td style={{ padding: '10px 16px' }}><StatusBadge status={j.status} />{taskByJobId.get(j.id) && <ApplicationTaskSummary task={taskByJobId.get(j.id)!} onOpenSession={onOpenSession} />}</td>
               <td style={{ padding: '10px 16px' }}><ScorePill score={j.score} /></td>
               <td style={{ padding: '10px 16px', fontSize: 11, color: 'var(--text-muted)' }}>
                 {fmtDate(j.appliedAt ?? j.createdAt)}
@@ -190,7 +283,7 @@ function ListView({ jobs, onRowClick, selectedIds, onToggle, onToggleAll }: {
                 {fmtDate(j.followUpAt) || '—'}
               </td>
               <td style={{ padding: '10px 16px' }}>
-                <Btn small variant="ghost" onClick={() => onRowClick(j)}>···</Btn>
+                <Btn small variant="ghost" onClick={() => onRowClick(j)}>{t('application.viewApplication')}</Btn>
               </td>
             </tr>
           ))}
@@ -200,8 +293,10 @@ function ListView({ jobs, onRowClick, selectedIds, onToggle, onToggleAll }: {
   )
 }
 
-function MobileListView({ jobs, onRowClick, selectedIds, onToggle }: {
+function MobileListView({ jobs, taskByJobId, onOpenSession, onRowClick, selectedIds, onToggle }: {
   jobs: Job[]
+  taskByJobId: ReadonlyMap<string, ApplicationTaskView>
+  onOpenSession: (sessionId: string) => void
   onRowClick: (job: Job) => void
   selectedIds: Set<string>
   onToggle: (id: string) => void
@@ -219,6 +314,7 @@ function MobileListView({ jobs, onRowClick, selectedIds, onToggle }: {
               checked={selectedIds.has(card.id)}
               onChange={() => onToggle(card.id)}
             />
+            <div style={{ flex: 1, minWidth: 0 }}>
             <button
               type="button"
               className="jobs-mobile-card-main"
@@ -239,6 +335,8 @@ function MobileListView({ jobs, onRowClick, selectedIds, onToggle }: {
                 <span>{fmtDate(card.date)}</span>
               </div>
             </button>
+            {taskByJobId.get(job.id) && <ApplicationTaskSummary task={taskByJobId.get(job.id)!} onOpenSession={onOpenSession} />}
+            </div>
           </article>
         )
       })}
@@ -247,10 +345,11 @@ function MobileListView({ jobs, onRowClick, selectedIds, onToggle }: {
 }
 
 // ── KanbanView ────────────────────────────────────────────────────────────────
-function KanbanView({ jobs, onStatusChange, onAddClick }: {
+function KanbanView({ jobs, onStatusChange, onAddClick, onRowClick }: {
   jobs: Job[]
   onStatusChange: (id: string, status: JobStatus) => void
   onAddClick: (status: JobStatus) => void
+  onRowClick: (job: Job) => void
 }) {
   const { t } = useI18n()
   const toast  = useToast()
@@ -330,6 +429,10 @@ function KanbanView({ jobs, onStatusChange, onAddClick }: {
                 ) : null
               })() : null}
               <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{fmtDate(job.appliedAt ?? job.createdAt)}</div>
+              <button type="button" aria-label={`${t('application.viewApplication')}: ${job.company} · ${job.role}`}
+                onClick={() => onRowClick(job)} style={{ minHeight: 36, marginTop: 8, border: 0, background: 'transparent', color: 'var(--primary)', cursor: 'pointer', padding: '4px 0' }}>
+                {t('application.viewApplication')}
+              </button>
             </div>
           ))}
           <button
@@ -428,15 +531,46 @@ function AddJobModal({ onClose, onAdded, prefillStatus }: {
 }
 
 // ── JobDetailDrawer ───────────────────────────────────────────────────────────
-function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onOpenTailoredResume }: {
+function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, onStatusChange, onUpdate, onDescriptionUpdate, onJobFieldsUpdate, onDelete, onOpenTailoredResume }: {
   job:            Job
+  task?: ApplicationTaskView
+  taskReadState: 'loading' | 'unavailable' | 'limited' | 'ready'
+  onRefreshTasks: () => void
   onClose:        () => void
   onStatusChange: (id: string, status: JobStatus) => void
   onUpdate:       (updated: Job) => void
+  onDescriptionUpdate: (userId: string, jobId: string, description: string) => void
+  onJobFieldsUpdate: (userId: string, jobId: string, fields: { notes: string | null } | { followUpAt: string | null }) => void
   onDelete:       (id: string) => void
   onOpenTailoredResume: (resumeId: string) => void
 }) {
   const { t } = useI18n()
+  const { navigate } = useNav()
+  const { data: drawerSession, status: drawerSessionStatus } = useSession()
+  const drawerUserId = drawerSessionStatus === 'authenticated' ? drawerSession?.user?.id ?? null : null
+  const drawerUserIdRef = useRef(drawerUserId)
+  drawerUserIdRef.current = drawerUserId
+  const drawerJobIdRef = useRef(job.id)
+  drawerJobIdRef.current = job.id
+  const drawerMountedRef = useRef(true)
+  useLayoutEffect(() => { drawerMountedRef.current = true; return () => { drawerMountedRef.current = false } }, [])
+  const isCurrentDrawer = (userId: string) => drawerMountedRef.current && drawerUserIdRef.current === userId
+  const descriptionKey = drawerUserId && job.userId === drawerUserId ? JSON.stringify([drawerUserId, job.id]) : null
+  const [descriptionDraft, setDescriptionDraft] = useState<DescriptionDraft | null>(() => descriptionKey ? descriptionDrafts.get(descriptionKey) ?? null : null)
+  const [descriptionEditorOpen, setDescriptionEditorOpen] = useState(Boolean(descriptionDraft))
+  const [descriptionSaving, setDescriptionSaving] = useState(false)
+  const [descriptionNotice, setDescriptionNotice] = useState<string | null>(null)
+  const descriptionSavingRef = useRef(false)
+  const descriptionTaskRef = useRef({ allowed: false })
+  descriptionTaskRef.current = { allowed: taskReadState === 'ready' && applicationTaskAllowsManualWork(task) }
+  const descriptionJobRef = useRef(job)
+  descriptionJobRef.current = job
+  const auditSectionRef = useRef<HTMLDivElement>(null)
+  const activitySectionRef = useRef<HTMLDivElement>(null)
+  const drawerRef = useRef<HTMLDivElement>(null)
+  const drawerCloseRef = useRef<HTMLButtonElement>(null)
+  const confirmHostRef = useRef<HTMLDivElement>(null)
+  const nestedOriginRef = useRef<HTMLElement | null>(null)
   const toast = useToast()
   const [confirm, ConfirmDialog] = useConfirm()
   const [notes,        setNotes]        = useState(job.notes ?? '')
@@ -445,6 +579,9 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
   const [deleting,     setDeleting]     = useState(false)
   const [activity,     setActivity]     = useState<Activity[]>([])
   const [loadingAct,   setLoadingAct]   = useState(true)
+  const [activityError, setActivityError] = useState(false)
+  const [activityRetry, setActivityRetry] = useState(0)
+  const activityScopeRef = useRef('')
   const [interviewPrep, setInterviewPrep] = useState<{
     questions: Array<{ question: string; framework: string }>
     companyResearch: string
@@ -452,64 +589,173 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
   } | null>(null)
   const [loadingPrep, setLoadingPrep] = useState(false)
   const [descExpanded, setDescExpanded] = useState(false)
-  const { data: resumeList } = useApi<ResumeListItem[]>('/api/resume')
+  const { data: resumeList, loading: resumeListLoading, error: resumeListError, refetch: refetchResumeList } = useApi<ResumeListItem[]>('/api/resume', { cache: false })
+  const resumeListRefreshRef = useRef<Promise<void> | null>(null)
+  function refreshResumeList() {
+    if (resumeListRefreshRef.current) return resumeListRefreshRef.current
+    const pending = refetchResumeList()
+    resumeListRefreshRef.current = pending
+    void pending.finally(() => { if (resumeListRefreshRef.current === pending) resumeListRefreshRef.current = null })
+    return pending
+  }
   const [selectedResumeId, setSelectedResumeId] = useState('')
-  const [tailoringLoading, setTailoringLoading] = useState(false)
   const [downloadingPack, setDownloadingPack] = useState(false)
-  const [exportedPackFolder, setExportedPackFolder] = useState<string | null>(null)
+  const downloadingPackRef = useRef(false)
+  const [recordingSubmission, setRecordingSubmission] = useState(false)
+  const recordingSubmissionRef = useRef(false)
+  const [manualRecordLock, setManualRecordLock] = useState<ManualRecordLock | null>(() => {
+    try { return drawerUserId && job.userId === drawerUserId ? readManualRecordLock(window.sessionStorage, drawerUserId, job.id) : 'unknown' } catch { return 'unknown' }
+  })
+  const manualRecordRef = useRef(manualRecordLock)
+  const [manualRecordRefreshing, setManualRecordRefreshing] = useState(false)
+  const manualRecordRefreshEpoch = useRef(0)
+  const manualRecordJobRef = useRef(job)
+  manualRecordJobRef.current = job
+  const manualRecordMutationEpoch = useRef(0)
+  const publishJobUpdate = (updated: Job) => { manualRecordMutationEpoch.current += 1; onUpdate(updated) }
+  const publishDescriptionUpdate = (owner: string, id: string, description: string) => {
+    manualRecordMutationEpoch.current += 1; onDescriptionUpdate(owner, id, description)
+  }
+  const publishJobFieldsUpdate = (owner: string, id: string, fields: { notes: string | null } | { followUpAt: string | null }) => {
+    manualRecordMutationEpoch.current += 1; onJobFieldsUpdate(owner, id, fields)
+  }
+  const [manualRecordNotice, setManualRecordNotice] = useState(false)
+  const [manualVisibleRecord, setManualVisibleRecord] = useState(false)
+  const [manualStorageUnavailable, setManualStorageUnavailable] = useState(false)
+  const manualRejection = manualRecordLock === 'rejected-limit' ? 'limit' : manualRecordLock === 'rejected-plan' ? 'plan' : null
+  const setRecordLock = (value: ManualRecordLock | null) => { manualRecordRef.current = value; setManualRecordLock(value) }
+  useEffect(() => {
+    let value: ManualRecordLock | null = 'unknown'
+    try {
+      if (drawerUserId && job.userId === drawerUserId) {
+        value = readManualRecordLock(window.sessionStorage, drawerUserId, job.id)
+      }
+    } catch { /* unavailable storage is unknown */ }
+    manualRecordRef.current = value
+    setManualRecordLock(value)
+    setManualRecordNotice(false)
+    setManualVisibleRecord(false)
+    setManualStorageUnavailable(false)
+  }, [drawerUserId, job.id, job.userId])
+  useEffect(() => { setManualVisibleRecord(false) }, [job.status, job.workflowState, job.appliedAt, job.updatedAt])
   const [autoPreparing, setAutoPreparing] = useState(false)
+  const preparationInFlight = useRef(false)
   const [preparationStartedAt, setPreparationStartedAt] = useState<number | null>(null)
   const [preparationElapsed, setPreparationElapsed] = useState(0)
   const [packStage, setPackStage] = useState<'idle' | 'resume' | 'coverLetter' | 'audit' | 'review'>('idle')
-  const [auditedPackKey, setAuditedPackKey] = useState<string | null>(null)
+  const [latestAuditRecord, setLatestAuditRecord] = useState<StoredApplicationAudit | null>(null)
+  const [preparationReviewRequired, setPreparationReviewRequired] = useState(false)
   const [openPackItem, setOpenPackItem] = useState<'resume' | 'coverLetter' | 'audit' | null>(null)
   const [resumePreview, setResumePreview] = useState<Resume | null>(null)
-  const [generatedCoverLetter, setGeneratedCoverLetter] = useState<CoverLetter | null>(null)
+  const [resumePreviewState, setResumePreviewState] = useState<{ id: string; status: 'loading' | 'unavailable' | 'ready' } | null>(null)
+  const [resumePreviewRetry, setResumePreviewRetry] = useState(0)
+  const [createdTailoredResumeId, setCreatedTailoredResumeId] = useState<string | null>(null)
+  const [coverLetterSelectionNeeded, setCoverLetterSelectionNeeded] = useState(false)
   const [latestAudit, setLatestAudit] = useState<ApplicationAudit | null>(null)
   const [documentPreview, setDocumentPreview] = useState<'resume' | 'coverLetter' | null>(null)
-  const [evidenceFinding, setEvidenceFinding] = useState<ApplicationAuditFinding | null>(null)
-  const [evidenceText, setEvidenceText] = useState('')
-  const [savingEvidence, setSavingEvidence] = useState(false)
-  const { data: coverLetters, refetch: refetchCoverLetters } = useApi<CoverLetter[]>(`/api/jobs/${job.id}/cover-letters`)
+  const manualWorkAllowed = applicationTaskAllowsManualWork(task)
+  const { letter: selectedCoverLetter, loading: coverLettersLoading, refetch: refetchCoverLetters, waitForLatest: waitForLatestCoverLetter, captureScope: captureLetterScope } = useApplicationCoverLetters(drawerUserId, job.id, job.userId, job.finalCoverLetterId)
   // The audit route is the canonical source because the activity feed is
   // paginated and can omit an older audit after other job events are added.
   const { data: canonicalAudit } = useApi<StoredApplicationAudit | null>(`/api/jobs/${job.id}/audit-application`)
 
+  useEffect(() => {
+    const origin = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    drawerCloseRef.current?.focus()
+    return () => { if (origin?.isConnected) origin.focus() }
+  }, [])
+
+  useEffect(() => {
+    const host = confirmHostRef.current
+    if (!host) return
+    const observer = new MutationObserver(() => {
+      const dialog = host.firstElementChild as HTMLElement | null
+      dialog?.querySelector<HTMLButtonElement>('button')?.focus()
+    })
+    observer.observe(host, { childList: true, subtree: true })
+    return () => observer.disconnect()
+  }, [])
+
+  const restoreNestedFocus = () => window.requestAnimationFrame(() => {
+    if (nestedOriginRef.current?.isConnected) nestedOriginRef.current.focus()
+  })
+  const closePreview = () => { setDocumentPreview(null); restoreNestedFocus() }
+  const rememberNestedOrigin = () => { nestedOriginRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null }
+
+  useEffect(() => {
+    const handleKey = (event: KeyboardEvent) => {
+      const confirmDialog = confirmHostRef.current?.firstElementChild as HTMLElement | null
+      const nested = drawerRef.current?.querySelector<HTMLElement>('[data-application-nested]')
+      const activeDialog = confirmDialog ?? nested ?? drawerRef.current
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        event.stopPropagation()
+        if (confirmDialog) { confirmDialog.querySelector<HTMLButtonElement>('button')?.click(); restoreNestedFocus() }
+        else if (documentPreview) closePreview()
+        else onClose()
+      } else if (event.key === 'Tab' && activeDialog) {
+        const focusable = [...activeDialog.querySelectorAll<HTMLElement>('button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')].filter(el => el.getClientRects().length > 0)
+        const first = focusable[0], last = focusable[focusable.length - 1]
+        if (!first) { event.preventDefault(); activeDialog.focus() }
+        else if (!activeDialog.contains(document.activeElement) || (event.shiftKey && document.activeElement === first)) { event.preventDefault(); (event.shiftKey ? last : first).focus() }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus() }
+      }
+    }
+    document.addEventListener('keydown', handleKey, true)
+    return () => document.removeEventListener('keydown', handleKey, true)
+  }, [documentPreview, onClose])
+
   // Load per-job activity on mount; reset interview prep when job changes
   useEffect(() => {
+    const controller = new AbortController()
     setLoadingAct(true)
-    setInterviewPrep(null)
-    fetch(`/api/activity?jobId=${job.id}&limit=20`)
-      .then(r => r.json())
-      .then((data: Activity[]) => setActivity(Array.isArray(data) ? data : []))
-      .catch(() => setActivity([]))
-      .finally(() => setLoadingAct(false))
-  }, [job.id])
+    setActivityError(false)
+    const scope = JSON.stringify([drawerUserId, job.id])
+    if (activityScopeRef.current !== scope) {
+      activityScopeRef.current = scope
+      setActivity([])
+      setInterviewPrep(null)
+    }
+    if (!drawerUserId || job.userId !== drawerUserId) {
+      setActivityError(true)
+      setLoadingAct(false)
+      return () => controller.abort()
+    }
+    fetch(`/api/activity?jobId=${encodeURIComponent(job.id)}&limit=20`, { signal: controller.signal })
+      .then(response => { if (!response.ok) throw new Error('unavailable'); return response.json() })
+      .then((data: unknown) => {
+        if (!Array.isArray(data) || data.length > 20 || !data.every(row => isScopedActivity(row, drawerUserId, job.id))) throw new Error('unavailable')
+        if (!controller.signal.aborted) setActivity(data)
+      })
+      .catch(() => { if (!controller.signal.aborted) setActivityError(true) })
+      .finally(() => { if (!controller.signal.aborted) setLoadingAct(false) })
+    return () => controller.abort()
+  }, [job.id, job.userId, drawerUserId, activityRetry])
 
   // Sync local state when parent job changes
   useEffect(() => { setNotes(job.notes ?? '') }, [job.notes])
   useEffect(() => { setFollowUpAt(job.followUpAt ? job.followUpAt.slice(0, 10) : '') }, [job.followUpAt])
-  const baseResumes = useMemo(() => resumeList?.filter(r => r.kind === 'base') ?? [], [resumeList])
+  const resumeListReady = !resumeListLoading && !resumeListError && Array.isArray(resumeList)
+  const baseResumes = useMemo(() => Array.isArray(resumeList) ? resumeList.filter(r => r.kind === 'base') : [], [resumeList])
   const existingTailoredResume = useMemo(
-    () => resumeList?.find(r => r.kind === 'adapted' && r.targetJobId === job.id) ?? null,
+    () => Array.isArray(resumeList) ? resumeList.find(r => r.kind === 'adapted' && r.targetJobId === job.id) ?? null : null,
     [job.id, resumeList],
   )
 
   useEffect(() => {
-    if (!baseResumes.length) return
-    const preferred = baseResumes.find(r => r.isDefault) ?? baseResumes[0]
-    setSelectedResumeId(prev => prev && baseResumes.some(r => r.id === prev) ? prev : preferred.id)
-  }, [baseResumes, resumeList])
+    if (!resumeListReady) return
+    const preferred = baseResumes.find(r => r.isDefault) ?? (baseResumes.length === 1 ? baseResumes[0] : null)
+    setSelectedResumeId(prev => prev && baseResumes.some(r => r.id === prev) ? prev : preferred?.id ?? '')
+  }, [baseResumes, resumeListReady])
   useEffect(() => {
-    const exportKey = `applymate:exported-pack:${job.id}`
-    setAuditedPackKey(null)
+    setLatestAuditRecord(null)
     setOpenPackItem(null)
     setResumePreview(null)
-    setGeneratedCoverLetter(null)
+    setCreatedTailoredResumeId(null)
+    setCoverLetterSelectionNeeded(false)
     setLatestAudit(null)
     setDocumentPreview(null)
     setPackStage('idle')
-    try { setExportedPackFolder(window.sessionStorage.getItem(exportKey)) } catch { setExportedPackFolder(null) }
   }, [job.id])
   useEffect(() => {
     if (!preparationStartedAt) { setPreparationElapsed(0); return }
@@ -519,21 +765,42 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
     return () => window.clearInterval(timer)
   }, [preparationStartedAt])
 
-  const previewResumeId = job.finalResumeId ?? existingTailoredResume?.id ?? null
+  const previewResumeId = job.finalResumeId ?? existingTailoredResume?.id ?? createdTailoredResumeId ?? null
   useEffect(() => {
-    if (!previewResumeId) return
-    fetch(`/api/resume/${previewResumeId}`).then(response => response.ok ? response.json() : null)
-      .then((resume: Resume | null) => setResumePreview(resume))
-      .catch(() => setResumePreview(null))
-  }, [previewResumeId])
+    if (!previewResumeId || preparationInFlight.current) return
+    const controller = new AbortController()
+    setResumePreview(null)
+    setResumePreviewState({ id: previewResumeId, status: 'loading' })
+    const timer = window.setTimeout(() => {
+      controller.abort()
+      setResumePreviewState({ id: previewResumeId, status: 'unavailable' })
+    }, 30_000)
+    fetch(`/api/resume/${encodeURIComponent(previewResumeId)}`, { signal: controller.signal })
+      .then(response => { if (!response.ok) throw new Error('Resume unavailable'); return response.json() })
+      .then((resume: unknown) => {
+        if (controller.signal.aborted) return
+        if (!isUsableResumePayload(resume) || !drawerUserId || job.userId !== drawerUserId || resume.userId !== drawerUserId || resume.id !== previewResumeId
+          || (job.finalResumeId !== resume.id && (job.finalResumeId || resume.targetJobId !== job.id))) throw new Error('Resume unavailable')
+        setResumePreview(resume)
+        setResumePreviewState({ id: previewResumeId, status: 'ready' })
+      })
+      .catch(() => { if (!controller.signal.aborted) setResumePreviewState({ id: previewResumeId, status: 'unavailable' }) })
+      .finally(() => window.clearTimeout(timer))
+    return () => { window.clearTimeout(timer); controller.abort() }
+  }, [previewResumeId, drawerUserId, job.userId, job.id, job.finalResumeId, resumePreviewRetry, autoPreparing])
+
+  // Only open a resume read for this account and this application. A newly
+  // tailored resume can precede final selection, but must target this job.
+  const evidenceResumeId = resumePreview && previewResumeId === resumePreview.id
+    && drawerUserId && (resumePreview as Resume & { userId?: unknown }).userId === drawerUserId && job.userId === drawerUserId
+    && (job.finalResumeId === resumePreview.id || (!job.finalResumeId && resumePreview.targetJobId === job.id))
+    ? resumePreview.id : null
 
   // Once a package has been confirmed, every surface must show the exact
   // resume/letter pair that is exported. Do not let an in-memory draft letter
   // replace the confirmed version in the Application Pack preview.
-  const selectedCoverLetter = job.finalCoverLetterId
-    ? coverLetters?.find(letter => letter.id === job.finalCoverLetterId)
-    : generatedCoverLetter
-      ?? coverLetters?.find(letter => letter.resumeId === previewResumeId)
+  const selectedLetterUnavailable = Boolean(job.finalCoverLetterId && !selectedCoverLetter)
+  const selectedLetterStatus = t(coverLettersLoading ? 'coverLetter.panel.loading' : 'application.selectedLetterUnavailable')
   const persistedAudit = useMemo(() => findLatestApplicationAudit(activity), [activity])
   const storedAudit = canonicalAudit ?? persistedAudit
   const displayedAudit = latestAudit ?? storedAudit?.audit ?? null
@@ -544,35 +811,125 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
   const auditNeedsRepair = factualAuditFindings.length > 0 && !auditRetryOnly
   const auditNeedsEvidence = evidenceGapFindings.length > 0 && !auditRetryOnly
 
+  function changeDescriptionDraft(text: string) {
+    if (!descriptionKey || descriptionSavingRef.current || descriptionDraft?.uncertain) return
+    const draft = text ? { text, revision: (descriptionDrafts.get(descriptionKey)?.revision ?? 0) + 1, uncertain: false } : null
+    updateDescriptionDraft(descriptionKey, draft)
+    setDescriptionDraft(draft)
+    setDescriptionNotice(null)
+  }
+
+  async function saveMissingDescription() {
+    const owner = drawerUserIdRef.current
+    const draft = descriptionKey ? descriptionDrafts.get(descriptionKey) : null
+    if (!owner || !descriptionKey || !draft?.text.trim() || draft.uncertain || descriptionSavingRef.current
+      || !isCurrentDrawer(owner) || job.userId !== owner || !descriptionTaskRef.current.allowed || descriptionJobRef.current.description?.trim()) return
+    descriptionSavingRef.current = true
+    setDescriptionSaving(true)
+    setDescriptionNotice(null)
+    const current = () => isCurrentDrawer(owner) && drawerJobIdRef.current === job.id
+    try {
+      const audit = await readDescriptionScope(`/api/jobs/${encodeURIComponent(job.id)}/audit-application`)
+      if (!current()) return
+      if (!audit.ok) { setDescriptionNotice('application.descriptionCheckFailed'); return }
+      if (audit.data !== null) { setDescriptionNotice('application.descriptionAuditBlocked'); return }
+      const result = await readDescriptionScope(`/api/jobs/${encodeURIComponent(job.id)}`)
+      if (!current()) return
+      const latest = result.data as Job | null
+      if (!result.ok || !latest || latest.id !== job.id || latest.userId !== owner) { setDescriptionNotice('application.descriptionCheckFailed'); return }
+      if (latest.description?.trim()) { publishDescriptionUpdate(owner, job.id, latest.description); setDescriptionNotice('application.descriptionExisting'); return }
+      if (latest.description !== null && typeof latest.description !== 'string') { setDescriptionNotice('application.descriptionCheckFailed'); return }
+      if (!descriptionTaskRef.current.allowed || descriptionJobRef.current.description?.trim()) { setDescriptionNotice('application.descriptionCheckFailed'); return }
+      if (descriptionDrafts.get(descriptionKey)?.revision !== draft.revision) return
+      updateDescriptionDraft(descriptionKey, { ...draft, uncertain: true })
+      setDescriptionDraft(descriptionDrafts.get(descriptionKey) ?? null)
+      const saved = await saveDescriptionRequest(job.id, draft.text, latest.description)
+      const data = saved.kind === 'saved' && saved.data && typeof saved.data === 'object' ? saved.data as { id?: unknown; userId?: unknown; description?: unknown } : null
+      const accepted = data && data.id === job.id && data.userId === owner && data.description === draft.text
+      const existing = descriptionDrafts.get(descriptionKey)
+      if (!accepted) {
+        if (existing?.revision === draft.revision) updateDescriptionDraft(descriptionKey, { ...existing, uncertain: true })
+        if (current()) { setDescriptionDraft(descriptionDrafts.get(descriptionKey) ?? null); setDescriptionNotice(saved.kind === 'conflict' ? 'application.descriptionConflict' : 'application.descriptionUnconfirmed') }
+        return
+      }
+      if (!current()) return
+      if (existing?.revision === draft.revision) updateDescriptionDraft(descriptionKey, null)
+      setDescriptionDraft(descriptionDrafts.get(descriptionKey) ?? null)
+      setDescriptionEditorOpen(false)
+      publishDescriptionUpdate(owner, job.id, draft.text)
+    } finally {
+      descriptionSavingRef.current = false
+      if (current()) setDescriptionSaving(false)
+    }
+  }
+
+  async function refreshDescriptionStatus() {
+    const owner = drawerUserIdRef.current
+    const draft = descriptionKey ? descriptionDrafts.get(descriptionKey) : null
+    if (!owner || !descriptionKey || !draft?.uncertain || descriptionSavingRef.current || !isCurrentDrawer(owner)) return
+    descriptionSavingRef.current = true
+    setDescriptionSaving(true)
+    try {
+      const result = await readDescriptionScope(`/api/jobs/${encodeURIComponent(job.id)}`)
+      if (!isCurrentDrawer(owner)) return
+      const latest = result.data as Job | null
+      if (!result.ok || !latest || latest.id !== job.id || latest.userId !== owner) { setDescriptionNotice('application.descriptionUnconfirmed'); return }
+      if (latest.description === draft.text) {
+        if (descriptionDrafts.get(descriptionKey)?.revision === draft.revision) updateDescriptionDraft(descriptionKey, null)
+        setDescriptionDraft(descriptionDrafts.get(descriptionKey) ?? null)
+        setDescriptionNotice(null)
+        setDescriptionEditorOpen(false)
+        publishDescriptionUpdate(owner, job.id, latest.description)
+      } else {
+        if (latest.description?.trim()) publishDescriptionUpdate(owner, job.id, latest.description)
+        setDescriptionNotice(latest.description?.trim() ? 'application.descriptionExisting' : 'application.descriptionUnconfirmed')
+      }
+    } finally {
+      descriptionSavingRef.current = false
+      if (isCurrentDrawer(owner)) setDescriptionSaving(false)
+    }
+  }
+
   async function saveNotes() {
     if (notes === (job.notes ?? '')) return
+    const owner = drawerUserIdRef.current
+    if (!owner || job.userId !== owner || !isCurrentDrawer(owner)) return
     setSavingNotes(true)
     const { data, error } = await apiMutate<Job>(`/api/jobs/${job.id}`, 'PATCH', { notes })
+    if (!isCurrentDrawer(owner) || drawerJobIdRef.current !== job.id) return
     setSavingNotes(false)
     if (error) { toast.error('Save failed', error); return }
-    if (data)  { onUpdate(data); toast.success('Notes saved') }
+    if (data && data.id === job.id && data.userId === owner && (data.notes === null || typeof data.notes === 'string')) {
+      publishJobFieldsUpdate(owner, job.id, { notes: data.notes }); toast.success(t('jobs.notesSaved'))
+    }
   }
 
   async function saveFollowUpAt(value: string) {
     // value is '' (clear) or 'YYYY-MM-DD'
     const prev = job.followUpAt ? job.followUpAt.slice(0, 10) : ''
     if (value === prev) return
+    const owner = drawerUserIdRef.current
+    if (!owner || job.userId !== owner || !isCurrentDrawer(owner)) return
     const { data, error } = await apiMutate<Job>(
       `/api/jobs/${job.id}`, 'PATCH',
       { followUpAt: value ? new Date(value).toISOString() : null },
     )
+    if (!isCurrentDrawer(owner) || drawerJobIdRef.current !== job.id) return
     if (error) { toast.error('Save failed', error); return }
-    if (data)  { onUpdate(data); toast.success(value ? 'Follow-up date set' : 'Follow-up date cleared') }
+    if (data && data.id === job.id && data.userId === owner && (data.followUpAt === null || typeof data.followUpAt === 'string')) {
+      publishJobFieldsUpdate(owner, job.id, { followUpAt: data.followUpAt }); toast.success(t(value ? 'jobs.followUpDateSet' : 'jobs.followUpDateCleared'))
+    }
   }
 
   async function handleDelete() {
+    rememberNestedOrigin()
     const ok = await confirm({
       title:        'Delete job?',
       message:      `"${job.role} at ${job.company}" will be permanently removed. This cannot be undone.`,
       danger:       true,
       confirmLabel: 'Delete',
     })
-    if (!ok) return
+    if (!ok) { restoreNestedFocus(); return }
     setDeleting(true)
     const { error } = await apiMutate(`/api/jobs/${job.id}`, 'DELETE')
     setDeleting(false)
@@ -602,101 +959,150 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
     }
   }
 
-  async function handleTailorResume() {
-    if (existingTailoredResume) {
-      onOpenTailoredResume(existingTailoredResume.id)
-      return
-    }
-    if (!selectedResumeId) {
-      toast.error('No resume selected', 'Create or import a resume first')
-      return
-    }
-
-    setTailoringLoading(true)
-    const { data, error } = await apiMutate<{ adaptedResumeId: string; reused?: boolean }>(
-      `/api/jobs/${job.id}/tailor-resume`,
-      'POST',
-      { resumeId: selectedResumeId },
-    )
-    setTailoringLoading(false)
-
-    if (error) {
-      toast.error(t('jobs.tailoringFailed'), error)
-      return
-    }
-    if (!data) return
-
-    if (data.reused) {
-      onOpenTailoredResume(data.adaptedResumeId)
-      return
-    }
-
-    toast.success(t('jobs.toastTailored'), t('jobs.toastTailoredDetail'))
-    onOpenTailoredResume(data.adaptedResumeId)
-  }
-
   async function downloadFinalPack() {
+    const owner = drawerUserIdRef.current
+    const jobId = job.id
+    if (!owner || owner !== job.userId || downloadingPackRef.current || !isCurrentDrawer(owner)) return
+    const isCurrent = () => isCurrentDrawer(owner) && drawerJobIdRef.current === jobId
+    downloadingPackRef.current = true
     setDownloadingPack(true)
     try {
-      const result = await exportApplicationPackLocally(job.id, Boolean(exportedPackFolder))
-      setExportedPackFolder(result.folderPath)
-      try { window.sessionStorage.setItem(`applymate:exported-pack:${job.id}`, result.folderPath) } catch { /* browser storage is optional */ }
-      toast.success(exportedPackFolder ? 'Folder opened' : 'Application PDFs saved', result.folderPath)
+      await downloadAuditedApplicationBundle(jobId, owner, isCurrent)
+      if (isCurrent()) toast.success(t('application.downloadReady'))
     } catch (error) {
-      if (exportedPackFolder) {
-        setExportedPackFolder(null)
-        try { window.sessionStorage.removeItem(`applymate:exported-pack:${job.id}`) } catch { /* browser storage is optional */ }
+      if (isCurrent()) {
+        if (isApplicationPdfUnsupportedCharactersError(error)) toast.error(t('application.downloadUnsupportedTitle'), t('application.downloadUnsupportedDetail'))
+        else toast.error(t('application.downloadFailed'), t('application.downloadRetry'))
       }
-      toast.error('Could not download application pack', error instanceof Error ? error.message : 'Please try again')
     } finally {
-      setDownloadingPack(false)
+      downloadingPackRef.current = false
+      if (isCurrent()) setDownloadingPack(false)
     }
   }
 
-  async function autoTailorAndAudit(evidenceRepairs: ApplicationAuditFinding[] = []) {
-    if (!selectedResumeId && !existingTailoredResume && !job.finalResumeId) {
+  async function autoTailorAndAudit() {
+    const owner = drawerUserIdRef.current
+    if (!owner || !isCurrentDrawer(owner) || job.userId !== owner) return
+    if (preparationInFlight.current || !manualWorkAllowed || taskReadState !== 'ready' || (previewResumeId && !evidenceResumeId)) return
+    if (job.finalCoverLetterId && !selectedCoverLetter) {
+      toast.info(t('application.selectedLetterLoading'))
+      return
+    }
+    if ((!resumeListReady || !baseResumes.some(resume => resume.id === selectedResumeId)) && !existingTailoredResume && !createdTailoredResumeId && !job.finalResumeId) {
       toast.error('No base resume selected', 'Create or import a resume first.')
       return
     }
+    const letterScopeCurrent = captureLetterScope()
+    if (!letterScopeCurrent()) return
+    const requireLetterScope = () => {
+      if (!letterScopeCurrent()) {
+        setPreparationReviewRequired(true)
+        setOpenPackItem('coverLetter')
+        throw new Error(t('application.selectedLetterChanged'))
+      }
+    }
     const resumeRepairs = [
       ...(auditNeedsRepair ? factualAuditFindings.filter(finding => finding.area === 'resume') : []),
-      ...evidenceRepairs.filter(finding => finding.area === 'resume'),
     ]
     const coverLetterRepairs = [
       ...(auditNeedsRepair ? factualAuditFindings.filter(finding => finding.area === 'cover_letter') : []),
-      ...evidenceRepairs.filter(finding => finding.area === 'cover_letter'),
     ]
+    if (coverLetterRepairs.length && !job.finalCoverLetterId) {
+      setCoverLetterSelectionNeeded(true)
+      setOpenPackItem('coverLetter')
+      return
+    }
+    setCoverLetterSelectionNeeded(false)
+    preparationInFlight.current = true
     setAutoPreparing(true)
     setPreparationStartedAt(Date.now())
     try {
       // Existing job documents are reused. A retry changes only the document
       // area explicitly flagged by the independent audit.
-      let adaptedResumeId = job.finalResumeId ?? existingTailoredResume?.id
+      let adaptedResumeId = job.finalResumeId ?? existingTailoredResume?.id ?? createdTailoredResumeId
       if (!adaptedResumeId) {
         setPackStage('resume')
         const { data, error } = await apiMutate<{ adaptedResumeId: string }>(`/api/jobs/${job.id}/tailor-resume`, 'POST', { resumeId: selectedResumeId })
+        if (!isCurrentDrawer(owner)) return
         if (!data || error) throw new Error(error ?? 'Could not tailor the resume')
         adaptedResumeId = data.adaptedResumeId
+        setCreatedTailoredResumeId(adaptedResumeId)
+        requireLetterScope()
       } else if (resumeRepairs.length) {
         setPackStage('resume')
         const { data, error } = await apiMutate<{ adaptedResumeId: string }>(
           `/api/jobs/${job.id}/tailor-resume`, 'POST',
           { resumeId: adaptedResumeId, forceRetailor: true, auditFindings: resumeRepairs },
         )
+        if (!isCurrentDrawer(owner)) return
+        requireLetterScope()
         if (!data || error) throw new Error(error ?? 'Could not repair the flagged resume section')
         adaptedResumeId = data.adaptedResumeId
       }
-      const response = await fetch(`/api/resume/${adaptedResumeId}`)
-      if (response.ok) {
-        const tailored = await response.json() as Resume
-        setResumePreview(tailored)
-        setCachedApiResponse(`/api/resume/${adaptedResumeId}`, tailored)
+      let tailored: unknown
+      try {
+        tailored = await readResumeForPreparation(adaptedResumeId)
+        if (!isCurrentDrawer(owner)) return
+        if (!isUsableResumePayload(tailored) || tailored.id !== adaptedResumeId || tailored.userId !== owner
+          || (job.finalResumeId !== tailored.id && (job.finalResumeId || tailored.targetJobId !== job.id))) throw new Error('Resume unavailable')
+      } catch (error) {
+        if (isCurrentDrawer(owner)) {
+          setResumePreview(null)
+          setResumePreviewState({ id: adaptedResumeId, status: 'unavailable' })
+          setOpenPackItem('resume')
+        }
+        throw error
       }
+      requireLetterScope()
+      if (!isUsableResumePayload(tailored)) throw new Error('Resume unavailable')
+      if (typeof tailored.updatedAt !== 'string' || !Number.isFinite(Date.parse(tailored.updatedAt))) {
+        setPreparationReviewRequired(true)
+        throw new Error(t('application.auditVersionMismatch'))
+      }
+      setResumePreview(tailored)
+      setCachedApiResponse(`/api/resume/${adaptedResumeId}`, tailored, owner)
 
-      let coverLetter = job.finalCoverLetterId
-        ? coverLetters?.find(letter => letter.id === job.finalCoverLetterId)
-        : generatedCoverLetter ?? coverLetters?.find(letter => letter.resumeId === adaptedResumeId)
-      if (!coverLetter || coverLetterRepairs.length) {
+      let coverLetter = selectedCoverLetter ?? undefined
+      if (job.finalCoverLetterId && !coverLetter) throw new Error(t('application.selectedLetterLoading'))
+      let checkedLetter = job.finalCoverLetterId ? await refetchCoverLetters() : null
+      if (!isCurrentDrawer(owner)) return
+      requireLetterScope()
+      const verifyLatestLetter = async (deadline: number) => {
+        const remaining = deadline - Date.now()
+        if (remaining <= 0) {
+          setPreparationReviewRequired(true)
+          setOpenPackItem('coverLetter')
+          throw new Error(t('application.selectedLetterUnavailable'))
+        }
+        const latest = await waitForLatestCoverLetter(remaining)
+        if (!isCurrentDrawer(owner)) return null
+        requireLetterScope()
+        if (latest.kind !== 'ready') {
+          setPreparationReviewRequired(true)
+          setOpenPackItem('coverLetter')
+          throw new Error(t('application.selectedLetterUnavailable'))
+        }
+        if (!coverLetter || latest.letter.id !== coverLetter.id || latest.letter.updatedAt !== coverLetter.updatedAt
+          || latest.letter.content !== coverLetter.content) {
+          setPreparationReviewRequired(true)
+          setOpenPackItem('coverLetter')
+          throw new Error(t('application.selectedLetterChanged'))
+        }
+        return latest
+      }
+      if (checkedLetter && (checkedLetter.kind !== 'ready' || !checkedLetter.current())) {
+        setPreparationReviewRequired(true)
+        setOpenPackItem('coverLetter')
+        throw new Error(t('application.selectedLetterUnavailable'))
+      }
+      if (checkedLetter?.kind === 'ready' && (!coverLetter || checkedLetter.letter.id !== coverLetter.id
+        || checkedLetter.letter.updatedAt !== coverLetter.updatedAt || checkedLetter.letter.content !== coverLetter.content)) {
+        setPreparationReviewRequired(true)
+        setOpenPackItem('coverLetter')
+        throw new Error(t('application.selectedLetterChanged'))
+      }
+      if (coverLetterRepairs.length) {
+        if (!checkedLetter || checkedLetter.kind !== 'ready' || !checkedLetter.current()) throw new Error(t('application.selectedLetterUnavailable'))
         setPackStage('coverLetter')
         const result = await apiMutate<CoverLetter>(
           `/api/jobs/${job.id}/cover-letters/generate`, 'POST',
@@ -707,26 +1113,57 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
             ...(coverLetter && coverLetterRepairs.length ? { repairCoverLetterId: coverLetter.id } : {}),
           },
         )
+        if (!isCurrentDrawer(owner)) return
+        requireLetterScope()
         if (!result.data || result.error) throw new Error(result.error ?? 'Could not prepare the cover letter')
         coverLetter = result.data
+        if (coverLetter.id !== job.finalCoverLetterId || coverLetter.userId !== owner || coverLetter.jobId !== job.id
+          || typeof coverLetter.content !== 'string' || typeof coverLetter.updatedAt !== 'string') throw new Error(t('application.selectedLetterUnavailable'))
+        checkedLetter = await refetchCoverLetters()
+        if (!isCurrentDrawer(owner)) return
+        requireLetterScope()
+        if (checkedLetter.kind !== 'ready' || !checkedLetter.current()) {
+          setPreparationReviewRequired(true)
+          setOpenPackItem('coverLetter')
+          throw new Error(t('application.selectedLetterUnavailable'))
+        }
+        if (checkedLetter.letter.id !== coverLetter.id || checkedLetter.letter.updatedAt !== coverLetter.updatedAt
+          || checkedLetter.letter.content !== coverLetter.content) {
+          setPreparationReviewRequired(true)
+          setOpenPackItem('coverLetter')
+          throw new Error(t('application.selectedLetterChanged'))
+        }
       }
-      setGeneratedCoverLetter(coverLetter)
-      void refetchCoverLetters()
-
-      if (job.finalCoverLetterId !== coverLetter.id) {
-        const { data: assigned, error: assignError } = await apiMutate<Job>(
-          `/api/jobs/${job.id}/assign`, 'PATCH', { finalCoverLetterId: coverLetter.id },
-        )
-        if (!assigned || assignError) throw new Error(assignError ?? 'Could not select the cover letter')
-        onUpdate(assigned)
+      if (!isCurrentDrawer(owner)) return
+      requireLetterScope()
+      if (checkedLetter && (checkedLetter.kind !== 'ready' || !checkedLetter.current())) {
+        setPreparationReviewRequired(true)
+        throw new Error(t('application.selectedLetterUnavailable'))
       }
 
       setPackStage('audit')
-      const { data: audit, error: auditError } = await apiMutate<ApplicationAudit>(
-        `/api/jobs/${job.id}/audit-application`, 'POST', { resumeId: adaptedResumeId, coverLetterId: coverLetter.id },
+      const { data: audit, error: auditError } = await apiMutate<ApplicationAudit & Pick<StoredApplicationAudit, 'resumeUpdatedAt' | 'coverLetterUpdatedAt'>>(
+        `/api/jobs/${job.id}/audit-application`, 'POST', { resumeId: adaptedResumeId, coverLetterId: coverLetter?.id ?? null },
       )
+      if (!isCurrentDrawer(owner)) return
+      requireLetterScope()
+      const auditWaitDeadline = Date.now() + 30_000
+      while (checkedLetter && (checkedLetter.kind !== 'ready' || !checkedLetter.current())) {
+        checkedLetter = await verifyLatestLetter(auditWaitDeadline)
+        if (!isCurrentDrawer(owner)) return
+        if (!checkedLetter) return
+      }
       if (!audit || auditError) throw new Error(auditError ?? 'Independent audit could not run')
+      if (audit.resumeUpdatedAt !== tailored.updatedAt || (coverLetter
+        ? audit.coverLetterUpdatedAt !== coverLetter.updatedAt
+        : audit.coverLetterUpdatedAt != null)) {
+        setPreparationReviewRequired(true)
+        throw new Error(t('application.auditVersionMismatch'))
+      }
+      setPreparationReviewRequired(false)
       setLatestAudit(audit)
+      setLatestAuditRecord({ resumeId: adaptedResumeId, coverLetterId: coverLetter?.id ?? null,
+        resumeUpdatedAt: audit.resumeUpdatedAt, coverLetterUpdatedAt: audit.coverLetterUpdatedAt, audit })
       if (audit.verdict !== 'pass') {
         setPackStage('idle')
         setOpenPackItem('audit')
@@ -736,63 +1173,157 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
 
       setPackStage('review')
       const { data: confirmed, error: confirmError } = await apiMutate<Job>(
-        `/api/jobs/${job.id}/assign`, 'PATCH', { finalResumeId: adaptedResumeId, finalCoverLetterId: coverLetter.id },
+        `/api/jobs/${job.id}/assign`, 'PATCH', { finalResumeId: adaptedResumeId },
       )
+      if (!isCurrentDrawer(owner)) return
+      requireLetterScope()
+      const assignWaitDeadline = Date.now() + 30_000
+      while (checkedLetter && (checkedLetter.kind !== 'ready' || !checkedLetter.current())) {
+        checkedLetter = await verifyLatestLetter(assignWaitDeadline)
+        if (!isCurrentDrawer(owner)) return
+        if (!checkedLetter) return
+      }
       if (!confirmed || confirmError) throw new Error(confirmError ?? 'Could not confirm the audited package')
-      setAuditedPackKey(`${adaptedResumeId}:${coverLetter.id}`)
-      onUpdate(confirmed)
-      toast.success('Audited application pack ready', 'The final resume and cover letter are now available in this job.')
+      publishJobUpdate(confirmed)
+      toast.success(t('application.materialsReadyTitle'), t(coverLetter ? 'application.materialsReadyWithLetter' : 'application.materialsReadyResumeOnly'))
     } catch (error) {
-      setPackStage('idle')
-      toast.error('Preparation could not finish', error instanceof Error ? error.message : 'Please try again')
+      if (isCurrentDrawer(owner)) {
+        setPackStage('idle')
+        toast.error('Preparation could not finish', error instanceof Error ? error.message : 'Please try again')
+      }
     } finally {
-      setAutoPreparing(false)
-      setPreparationStartedAt(null)
+      preparationInFlight.current = false
+      if (isCurrentDrawer(owner)) { setAutoPreparing(false); setPreparationStartedAt(null) }
     }
   }
 
-  async function saveEvidenceAndRewrite() {
-    if (!evidenceFinding || !evidenceText.trim()) return
-    setSavingEvidence(true)
+  async function refreshManualRecord(userId: string) {
+    if (!isCurrentDrawer(userId)) return
+    const epoch = ++manualRecordRefreshEpoch.current
+    const requestedJob = manualRecordJobRef.current
+    const mutationEpoch = manualRecordMutationEpoch.current
+    setManualRecordRefreshing(true)
+    setManualVisibleRecord(false)
+    setActivityRetry(value => value + 1)
+    onRefreshTasks()
     try {
-      const key = `audit_evidence_${Date.now()}`
-      const { error } = await apiMutate('/api/me/persona/fields', 'POST', {
-        fields: [{ key, category: 'work', label: `Audit evidence: ${evidenceFinding.title}`.slice(0, 120), value: evidenceText.trim(), confidence: 1, source: 'user_confirmed_audit' }],
-      })
-      if (error) throw new Error(error)
-      const finding = evidenceFinding
-      setEvidenceFinding(null)
-      setEvidenceText('')
-      toast.success('Evidence saved to Persona', 'AI is rewriting only the affected application content.')
-      await autoTailorAndAudit([finding])
-    } catch (error) {
-      toast.error('Could not save evidence', error instanceof Error ? error.message : 'Please try again')
+      const result = await readManualRecord(job.id)
+      const updated = parseScopedManualRecordJob(result, userId, job.id)
+      if (!updated) throw new Error('unavailable')
+      if (!isCurrentDrawer(userId) || epoch !== manualRecordRefreshEpoch.current) return
+      if (updated.id !== job.id || updated.userId !== userId) throw new Error('unavailable')
+      // A later read or lifecycle change cannot prove which request wrote it.
+      // Keep any uncertain write lock even when a separate record is visible.
+      const receivedAt = Date.parse(updated.updatedAt)
+      const currentAt = Date.parse(requestedJob.updatedAt)
+      const currentRead = manualRecordMutationEpoch.current === mutationEpoch && manualRecordJobRef.current === requestedJob
+        && Number.isFinite(receivedAt) && Number.isFinite(currentAt) && receivedAt >= currentAt
+      if (manualRecordRef.current === 'confirmed' && currentRead && hasVisibleSubmissionRecord(updated)) {
+        publishJobUpdate(updated)
+        setManualRecordNotice(false)
+      } else {
+        setManualVisibleRecord(currentRead && hasVisibleSubmissionRecord(updated))
+        setManualRecordNotice(true)
+      }
+    } catch {
+      if (isCurrentDrawer(userId) && epoch === manualRecordRefreshEpoch.current) setManualRecordNotice(true)
     } finally {
-      setSavingEvidence(false)
+      if (isCurrentDrawer(userId) && epoch === manualRecordRefreshEpoch.current) setManualRecordRefreshing(false)
+    }
+  }
+
+  async function refreshAfterManualRejection(userId: string) {
+    if (!isCurrentDrawer(userId)) return
+    const epoch = ++manualRecordRefreshEpoch.current
+    const requestedJob = manualRecordJobRef.current
+    const mutationEpoch = manualRecordMutationEpoch.current
+    setManualRecordRefreshing(true)
+    onRefreshTasks()
+    try {
+      const result = await readManualRecord(job.id)
+      const updated = parseScopedManualRecordJob(result, userId, job.id)
+      if (!updated) throw new Error('unavailable')
+      const receivedAt = Date.parse(updated.updatedAt)
+      const currentAt = Date.parse(requestedJob.updatedAt)
+      if (!isCurrentDrawer(userId) || epoch !== manualRecordRefreshEpoch.current) return
+      if (updated.id !== job.id || updated.userId !== userId || manualRecordMutationEpoch.current !== mutationEpoch
+        || manualRecordJobRef.current !== requestedJob || !Number.isFinite(receivedAt) || !Number.isFinite(currentAt) || receivedAt < currentAt) throw new Error('unavailable')
+      publishJobUpdate(updated)
+      // Retain the persisted rejection until the next explicit record request.
+      // Reopening the drawer therefore requires another scoped refresh.
+      setRecordLock(null)
+      setManualRecordNotice(false)
+    } catch {
+      if (isCurrentDrawer(userId) && epoch === manualRecordRefreshEpoch.current) setManualRecordNotice(true)
+    } finally {
+      if (isCurrentDrawer(userId) && epoch === manualRecordRefreshEpoch.current) setManualRecordRefreshing(false)
+    }
+  }
+
+  async function recordManualSubmission() {
+    const userId = drawerUserIdRef.current
+    if (!userId || !isCurrentDrawer(userId) || recordingSubmissionRef.current || manualRecordRef.current
+      || !manualWorkAllowed || blocksManualRecord(job) || taskReadState !== 'ready') return
+    let requestId: string
+    try { requestId = crypto.randomUUID() } catch { setManualStorageUnavailable(true); return }
+    try {
+      if (!writeManualRecordLock(window.sessionStorage, userId, job.id, 'pending')) { setManualStorageUnavailable(true); return }
+    } catch { setManualStorageUnavailable(true); return }
+    setManualStorageUnavailable(false)
+    setRecordLock('pending')
+    recordingSubmissionRef.current = true
+    setRecordingSubmission(true)
+    setManualRecordNotice(false)
+    try {
+      const result = await submitManualRecord(job.id, requestId)
+      let released = false
+      try {
+        released = (result === 'limit' || result === 'plan') && isCurrentDrawer(userId)
+          && rejectPendingManualRecord(window.sessionStorage, userId, job.id, result)
+      } catch { /* Keep the pending lock when storage cannot be checked. */ }
+      if (released && (result === 'limit' || result === 'plan')) {
+        setRecordLock(result === 'limit' ? 'rejected-limit' : 'rejected-plan')
+        return
+      }
+      const outcome: ManualRecordLock = result === 'confirmed' ? 'confirmed' : 'unknown'
+      try { writeManualRecordLock(window.sessionStorage, userId, job.id, outcome) } catch { /* pending remains conservative */ }
+      if (!isCurrentDrawer(userId)) return
+      setRecordLock(outcome)
+      if (outcome === 'confirmed') await refreshManualRecord(userId)
+    } finally {
+      recordingSubmissionRef.current = false
+      if (isCurrentDrawer(userId)) setRecordingSubmission(false)
     }
   }
 
   // Drawer uses a slightly more compact variant of the shared INPUT_STYLE
   const drawerInputSt: React.CSSProperties = { ...INPUT_STYLE, fontSize: 11, padding: '5px 8px', borderRadius: 5 }
-  const canTailorResume = Boolean(applicationPreflight.canPrepare && job.description && (baseResumes.length || existingTailoredResume || job.finalResumeId))
-  const packActionDisabled = autoPreparing || !canTailorResume
-  // The final document pair is the shared source of truth used by My Jobs and
-  // the extension sidebar. The audit activity is still checked when available,
-  // but must not make a confirmed package look pending on one surface.
-  const hasFinalApplicationPack = Boolean(job.finalResumeId && job.finalCoverLetterId)
-  const currentPackAudited = hasFinalApplicationPack || auditedPackKey === `${job.finalResumeId}:${job.finalCoverLetterId}`
-    || (storedAudit?.audit.verdict === 'pass'
-      && storedAudit.resumeId === job.finalResumeId
-      && storedAudit.coverLetterId === job.finalCoverLetterId)
+  const canTailorResume = Boolean(applicationPreflight.canPrepare && job.description && (existingTailoredResume || createdTailoredResumeId || job.finalResumeId || (resumeListReady && baseResumes.some(resume => resume.id === selectedResumeId))))
+  const needsBaseResume = !previewResumeId
+  const currentRecord = latestAuditRecord ?? storedAudit
+  const currentPackAudited = !preparationReviewRequired && currentRecord?.audit.verdict === 'pass' && auditMatchesCurrentMaterials(
+    currentRecord, job.finalResumeId, job.finalCoverLetterId,
+    resumePreview?.id === job.finalResumeId ? resumePreview.updatedAt : null,
+    selectedCoverLetter?.updatedAt ?? null, false,
+  )
+  const applicationRecorded = hasVisibleSubmissionRecord(job) || manualVisibleRecord
+  const applicationRecordBlocked = blocksManualRecord(job) || manualVisibleRecord
+  const manualReviewPrimary = manualWorkAllowed && Boolean(manualRecordLock && (manualRecordLock !== 'confirmed' || !applicationRecorded))
+  const auditStale = Boolean(currentRecord && !currentPackAudited && currentRecord.audit.verdict === 'pass')
+  const canReviewExistingIssues = !currentPackAudited && (auditNeedsEvidence || auditNeedsRepair || auditRetryOnly)
+  const openAudit = () => {
+    setOpenPackItem('audit')
+    window.setTimeout(() => auditSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 0)
+  }
 
   return (
     <>
-      <ConfirmDialog />
+      <div ref={confirmHostRef}><ConfirmDialog /></div>
       {/* Overlay */}
       <div style={{ position: 'fixed', inset: 0, zIndex: 90 }} onClick={onClose} />
 
       {/* Drawer panel */}
-      <div style={{
+      <div ref={drawerRef} role="dialog" aria-modal="true" aria-labelledby="application-detail-title" tabIndex={-1} style={{
         position: 'fixed', top: 0, right: 0, bottom: 0, width: 460, maxWidth: '100vw', zIndex: 91,
         background: 'var(--bg)', borderLeft: '0.5px solid var(--border)',
         display: 'flex', flexDirection: 'column', overflowY: 'auto', overflowX: 'hidden', overscrollBehaviorX: 'contain',
@@ -801,18 +1332,32 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
         {/* Header */}
         <div style={{ padding: '24px 28px 20px', borderBottom: '0.5px solid var(--border)', display: 'flex', alignItems: 'flex-start', gap: 12 }}>
           <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 24, fontWeight: 700, lineHeight: 1.2, letterSpacing: '-0.03em' }}>{job.role}</div>
-            <div style={{ fontSize: 15, color: 'var(--text-muted)', marginTop: 7 }}>{job.source ? `${job.source} job` : job.company}{job.createdAt ? ` · Added ${fmtDate(job.createdAt)}` : ''}</div>
+            <div id="application-detail-title" style={{ fontSize: 24, fontWeight: 700, lineHeight: 1.2, letterSpacing: '-0.03em' }}>{job.role}</div>
+            <div style={{ fontSize: 15, color: 'var(--text-muted)', marginTop: 7 }}>{job.company}{job.source ? ` · ${job.source}` : ''}{job.createdAt ? ` · ${fmtDate(job.createdAt)}` : ''}</div>
           </div>
-          <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 16, color: 'var(--text-muted)', lineHeight: 1, padding: 0, marginTop: 2 }}>✕</button>
+          <button ref={drawerCloseRef} aria-label={t('application.closeDetails')} onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 16, color: 'var(--text-muted)', lineHeight: 1, padding: 0, marginTop: 2 }}>✕</button>
         </div>
 
-        <ReferenceProgress ready={currentPackAudited} />
+        <ApplicationProgress hasMaterials={Boolean(evidenceResumeId)} checked={Boolean(currentPackAudited)} recorded={applicationRecorded} task={task} />
 
-        {applicationPreflight.issues.length > 0 && <div style={{ margin: '18px 28px 0', padding: '12px 14px', borderRadius: 9, border: '1px solid #fbbf24', background: '#fffbeb', color: '#78350f', fontSize: 12, lineHeight: 1.5 }}>
+        {!applicationPreflight.canPrepare && applicationPreflight.issues.length > 0 && <div style={{ margin: '18px 28px 0', padding: '12px 14px', borderRadius: 9, border: '1px solid #fbbf24', background: '#fffbeb', color: '#78350f', fontSize: 12, lineHeight: 1.5 }}>
           <strong>{applicationPreflight.canPrepare ? t('jobs.drawer.manualOnly') : t('jobs.drawer.dataNeedsCorrection')}</strong>
           <div style={{ marginTop: 4 }}>{applicationPreflight.issues.map(issue => issue.message).join(' ')}</div>
           <div style={{ marginTop: 5, color: '#92400e' }}>{applicationPreflight.canPrepare ? t('jobs.drawer.manualOnlyHint') : t('jobs.drawer.correctionHint')}</div>
+        </div>}
+
+        {descriptionKey && (!job.description?.trim() || descriptionDraft) && <div style={{ margin: '18px 28px 0', padding: 12, border: '1px solid var(--border)', borderRadius: 9 }}>
+          {!descriptionEditorOpen && !job.description?.trim() ? <Btn variant="ghost" onClick={() => setDescriptionEditorOpen(true)}>{t('application.descriptionAdd')}</Btn> : descriptionEditorOpen && <>
+            <label htmlFor="application-description" style={{ display: 'block', fontSize: 12, fontWeight: 700 }}>{t('application.descriptionLabel')}</label>
+            <p style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{t(job.description?.trim() ? 'application.descriptionExisting' : 'application.descriptionHint')}</p>
+            <textarea id="application-description" value={descriptionDraft?.text ?? ''} onChange={event => changeDescriptionDraft(event.target.value)} readOnly={Boolean(job.description?.trim() || descriptionDraft?.uncertain)} disabled={descriptionSaving} style={{ ...INPUT_STYLE, minHeight: 100, resize: 'vertical' }} />
+            {(descriptionNotice || (descriptionDraft?.uncertain && !descriptionSaving)) && <p role="status">{t(descriptionNotice ?? 'application.descriptionUnconfirmed')}</p>}
+            {descriptionSaving && <p role="status">{t('application.descriptionChecking')}</p>}
+            {!descriptionTaskRef.current.allowed && !job.description?.trim() && <p role="status">{t(task && !applicationTaskAllowsManualWork(task) ? 'application.taskProgressHint' : taskReadState === 'limited' ? 'application.taskCoverage' : 'application.taskReadUnavailable')}</p>}
+            {!job.description?.trim() && !descriptionDraft?.uncertain && <Btn variant="primary" disabled={descriptionSaving || !descriptionDraft?.text.trim() || !descriptionTaskRef.current.allowed} onClick={() => void saveMissingDescription()}>{t('application.descriptionSave')}</Btn>}
+            {descriptionDraft?.uncertain && <Btn variant="ghost" disabled={descriptionSaving} onClick={() => void refreshDescriptionStatus()}>{t('application.refreshStatus')}</Btn>}
+            {descriptionDraft && (!descriptionDraft.uncertain || job.description?.trim()) && <Btn variant="ghost" disabled={descriptionSaving} onClick={() => { updateDescriptionDraft(descriptionKey, null); setDescriptionDraft(null); setDescriptionEditorOpen(false); setDescriptionNotice(null) }}>{t('application.descriptionDiscard')}</Btn>}
+          </>}
         </div>}
 
         {/* Body */}
@@ -820,40 +1365,75 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
 
           <section style={{ borderBottom: '1px solid var(--border)', padding: '18px 0 22px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 9, fontSize: 11, fontWeight: 700, letterSpacing: '0.03em', color: '#64748b', marginBottom: 18 }}><Sparkles size={16} strokeWidth={2.4} style={{ color: '#2563eb', flexShrink: 0 }} />{t('jobs.drawer.nextAction')}</div>
-            <div style={{ fontSize: 20, lineHeight: 1.25, fontWeight: 700, letterSpacing: '-0.025em' }}>{currentPackAudited ? t('jobs.drawer.packReady') : auditRetryOnly ? t('jobs.drawer.retryAudit') : auditNeedsEvidence ? t('jobs.drawer.confirmEvidence') : auditNeedsRepair ? t('jobs.drawer.correctFacts') : existingTailoredResume ? t('jobs.drawer.tailored') : t('jobs.drawer.tailor')}</div>
-            <div style={{ fontSize: 14, lineHeight: 1.5, color: 'var(--text-muted)', margin: '7px 0 16px' }}>{currentPackAudited ? t('jobs.pack.sameAudited') : auditRetryOnly ? t('jobs.pack.auditPending') : auditNeedsEvidence ? t('jobs.pack.evidencePrompt') : auditNeedsRepair ? t('jobs.pack.repairPrompt') : existingTailoredResume ? t('jobs.pack.reviewTailored') : t('jobs.pack.createRole')}</div>
+            <div style={{ fontSize: 20, lineHeight: 1.25, fontWeight: 700, letterSpacing: '-0.025em' }}>{!manualWorkAllowed ? t('application.taskProgress') : manualReviewPrimary ? t(manualRejection ? 'application.manualRejectedTitle' : manualRecordLock === 'confirmed' ? 'application.manualAcceptedTitle' : 'application.manualPendingTitle') : applicationRecorded ? t('application.recorded') : applicationRecordBlocked ? t('application.statusReview') : auditStale ? t('application.checkMaterials') : currentPackAudited ? t('jobs.drawer.packReady') : auditRetryOnly ? t('jobs.drawer.retryAudit') : auditNeedsEvidence ? t('jobs.drawer.confirmEvidence') : auditNeedsRepair ? t('jobs.drawer.correctFacts') : existingTailoredResume ? t('jobs.drawer.tailored') : t('jobs.drawer.tailor')}</div>
+            <div style={{ fontSize: 14, lineHeight: 1.5, color: 'var(--text-muted)', margin: '7px 0 16px' }}>{!manualWorkAllowed ? t('application.taskProgressHint') : manualReviewPrimary ? t(manualRejection ? manualRejection === 'limit' ? 'application.manualLimitRejected' : 'application.manualPlanRejected' : manualRecordLock === 'confirmed' ? 'application.manualStatusConfirmed' : 'application.manualStatusPending') : applicationRecorded ? t('application.recordedHint') : applicationRecordBlocked ? t('application.statusReviewHint') : auditStale ? t('application.auditStale') : currentPackAudited ? t('jobs.pack.sameAudited') : auditRetryOnly ? t('jobs.pack.auditPending') : auditNeedsEvidence ? t('jobs.pack.evidencePrompt') : auditNeedsRepair ? t('jobs.pack.repairPrompt') : existingTailoredResume ? t('jobs.pack.reviewTailored') : t('jobs.pack.createRole')}</div>
 
-            {auditNeedsRepair && <div style={{ marginBottom: 16, padding: '12px 14px', border: '1px solid #fecaca', background: '#fff7f7', borderRadius: 9 }}><div style={{ fontSize: 12, fontWeight: 800, color: '#b42318', marginBottom: 7 }}>{t('jobs.drawer.factualIssues')}</div>{factualAuditFindings.slice(0, 2).map((finding, index) => <div key={`${finding.title}-${index}`} style={{ color: '#7f1d1d', fontSize: 12, lineHeight: 1.45, marginTop: index ? 6 : 0 }}><strong>{finding.title}</strong><br />{finding.action}</div>)}</div>}
-
-            {existingTailoredResume ? (
-              <button onClick={() => onOpenTailoredResume(existingTailoredResume.id)} style={workflowDocumentButton}>
-                <span style={{ width: 48, height: 48, display: 'grid', placeItems: 'center', borderRadius: 10, background: '#eff6ff', color: '#2563eb' }}><FileText size={27} /></span>
-                <span style={{ flex: 1, textAlign: 'left' }}><span style={{ display: 'block', fontSize: 15, fontWeight: 700 }}>{existingTailoredResume.name}</span><span style={{ display: 'block', fontSize: 13, marginTop: 5, color: 'var(--text-muted)', fontWeight: 400 }}>{t('jobs.pack.tailoredReady')}</span></span>
-                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, color: '#2563eb', fontSize: 14, whiteSpace: 'nowrap' }}>{t('jobs.pack.reviewResume')} <ChevronRight size={19} /></span>
-              </button>
-            ) : <div style={{ border: '1px solid #dbe1ea', borderRadius: 12, padding: 18 }}>
-              <div style={{ fontSize: 14, color: 'var(--text-muted)', lineHeight: 1.55, marginBottom: 14 }}>{t('jobs.pack.chooseBase')}</div>
-              {baseResumes.length > 1 && <select value={selectedResumeId} onChange={e => setSelectedResumeId(e.target.value)} style={{ ...drawerInputSt, width: '100%', marginBottom: 12 }}>{baseResumes.map(r => <option key={r.id} value={r.id}>{r.isDefault ? `${t('jobs.defaultResume')} — ` : ''}{r.name}</option>)}</select>}
-              <Btn variant="primary" onClick={handleTailorResume} disabled={tailoringLoading}>{tailoringLoading ? t('jobs.pack.preparing') : t('jobs.pack.tailorInResume')}</Btn>
-            </div>}
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12, color: 'var(--text-muted)', margin: '4px 0 20px' }}><span style={{ height: 1, background: 'var(--border)', flex: 1 }} /><span>{t('jobs.or')}</span><span style={{ height: 1, background: 'var(--border)', flex: 1 }} /></div>
-            <button onClick={() => auditNeedsEvidence ? setOpenPackItem('audit') : void autoTailorAndAudit()} disabled={packActionDisabled || currentPackAudited} style={{ width: '100%', minHeight: 56, padding: '14px', border: `2px solid ${packActionDisabled || currentPackAudited ? '#e2e8f0' : auditNeedsRepair ? '#dc2626' : '#2563eb'}`, borderRadius: 9, background: packActionDisabled || currentPackAudited ? '#f8fafc' : auditNeedsRepair ? '#fff7f7' : '#fff', color: packActionDisabled || currentPackAudited ? '#94a3b8' : auditNeedsRepair ? '#b42318' : '#2563eb', fontSize: 15, fontWeight: 700, cursor: packActionDisabled || currentPackAudited ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, textAlign: 'center' }}><Sparkles size={19} style={{ flexShrink: 0 }} />{currentPackAudited ? t('jobs.pack.ready') : autoPreparing ? t('jobs.pack.preparing') : auditNeedsEvidence ? t('jobs.pack.reviewEvidence') : auditRetryOnly ? t('jobs.pack.retryAudit') : auditNeedsRepair ? t('jobs.pack.fixAudit') : t('jobs.pack.prepareAutomatically')}</button>
+            {task && <ApplicationTaskCard task={task} onOpenSession={id => openApplicationSession(id, navigate)} />}
+            {!manualWorkAllowed ? null : manualReviewPrimary ? <div role="status">
+              {manualRejection && <p>{t('application.manualRejectedRefreshHint')}</p>}
+              {manualVisibleRecord && <p>{t('application.manualVisibleRecord')}</p>}
+              {manualRecordNotice && <p>{t(manualRejection ? 'application.manualRejectedRefreshFailed' : 'application.manualStatusStillUnknown')}</p>}
+              <Btn variant="primary" disabled={recordingSubmission || manualRecordRefreshing} onClick={() => { if (drawerUserId) void (manualRejection ? refreshAfterManualRejection(drawerUserId) : refreshManualRecord(drawerUserId)) }}>{t(manualRejection ? 'application.refreshStatus' : 'application.manualRefresh')}</Btn>
+            </div> : applicationRecorded ? null : applicationRecordBlocked ? <Btn variant="ghost" onClick={() => { activitySectionRef.current?.focus(); activitySectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }}>{t('application.viewHistory')}</Btn> : taskReadState !== 'ready' ? <div role="status"><p>{t(taskReadState === 'limited' ? 'application.taskCoverage' : 'application.taskReadUnavailable')}</p><Btn variant="ghost" onClick={onRefreshTasks}>{t('application.refreshStatus')}</Btn></div> : <>
+              {needsBaseResume && !resumeListReady && <div role="status"><p>{t(resumeListLoading ? 'application.baseResumeLoading' : 'application.baseResumeUnavailable')}</p>{!resumeListLoading && <Btn variant="ghost" onClick={() => void refreshResumeList()}>{t('application.refreshStatus')}</Btn>}</div>}
+              {needsBaseResume && resumeListReady && baseResumes.length === 0 && <div role="status"><p>{t('application.baseResumeEmpty')}</p><Btn variant="ghost" onClick={() => {
+                try { sessionStorage.removeItem('applymate:resume-return') } catch { /* The resume page can open without stored context. */ }
+                const url = new URL(window.location.href)
+                url.searchParams.delete('resumeId')
+                url.searchParams.set('returnToJobs', '1')
+                url.searchParams.set('returnJobId', job.id)
+                url.searchParams.set('resumeStartEmpty', '1')
+                window.history.replaceState({}, '', url.toString())
+                navigate('resume')
+              }}>{t('application.openResumeLibrary')}</Btn></div>}
+              {needsBaseResume && resumeListReady && baseResumes.length > 1 && <label style={{ fontSize: 12 }}>{t('application.baseResume')}
+                <select value={selectedResumeId} onChange={event => setSelectedResumeId(event.target.value)} style={{ ...drawerInputSt, width: '100%', margin: '6px 0 12px' }}><option value="">{t('application.chooseBaseResume')}</option>{baseResumes.map(resume => <option key={resume.id} value={resume.id}>{resume.isDefault ? `${t('jobs.defaultResume')} — ` : ''}{resume.name}</option>)}</select>
+              </label>}
+              <Btn variant="primary" disabled={autoPreparing || (!canReviewExistingIssues && (Boolean(previewResumeId && !evidenceResumeId) || (!currentPackAudited && !canTailorResume)))} onClick={() => {
+                if (currentPackAudited) {
+                  if (job.url && /^https?:\/\//i.test(job.url)) window.open(job.url, '_blank', 'noopener,noreferrer')
+                  else setOpenPackItem('resume')
+                } else if (auditNeedsEvidence || auditNeedsRepair || auditRetryOnly) openAudit()
+                else void autoTailorAndAudit()
+              }}>
+                {autoPreparing ? t('jobs.pack.preparing') : currentPackAudited ? t(job.url && /^https?:\/\//i.test(job.url) ? 'application.openEmployer' : 'application.viewMaterials') : auditNeedsEvidence ? t('application.provideInformation') : auditNeedsRepair || auditRetryOnly ? t('application.reviewIssues') : auditStale ? t('application.checkMaterials') : existingTailoredResume ? t('application.checkMaterials') : t('application.prepareMaterials')}
+              </Btn>
+            </>}
             {autoPreparing && <PreparationProgress stage={packStage} elapsed={preparationElapsed} />}
-            <div style={{ textAlign: 'center', fontSize: 13, lineHeight: 1.55, color: 'var(--text-muted)', margin: '12px 28px 28px' }}>{auditRetryOnly ? t('jobs.auditRetryHint') : auditNeedsEvidence ? t('jobs.auditEvidenceHint') : auditNeedsRepair ? t('jobs.auditRepairHint') : t('jobs.auditPrepareHint')}</div>
-            <div style={{ borderTop: '1px solid var(--border)', paddingTop: 22, fontSize: 12, fontWeight: 700, letterSpacing: '0.03em', color: '#64748b' }}>{t('jobs.drawer.applicationPack')}</div>
+            <p style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{currentPackAudited ? t('application.manualHint') : t('application.materialsHint')}</p>
+            <div style={{ borderTop: '1px solid var(--border)', paddingTop: 22, fontSize: 12, fontWeight: 700, color: 'var(--text-muted)' }}>{t('jobs.drawer.applicationPack')}</div>
             <style>{`@keyframes pack-line-grow { from { transform: scaleY(0) } to { transform: scaleY(1) } } @keyframes pack-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(37,99,235,.35) } 50% { box-shadow: 0 0 0 7px rgba(37,99,235,0) } }`}</style>
-            <PackRow number="1" title={t('jobs.pack.resume')} detail={packStage === 'resume' ? t('jobs.pack.tailoring') : t('jobs.pack.tailoredRole')} done={Boolean(previewResumeId)} active={packStage === 'resume'} open={openPackItem === 'resume'} onToggle={() => setOpenPackItem(current => current === 'resume' ? null : 'resume')}>
-              <ResumePackPreview resume={resumePreview} onReview={() => setDocumentPreview('resume')} />
+            <PackRow number="1" title={t('jobs.pack.resume')} detail={packStage === 'resume' ? t('jobs.pack.tailoring') : evidenceResumeId ? t('jobs.pack.tailoredRole') : previewResumeId ? t(resumePreviewState?.id === previewResumeId && resumePreviewState.status === 'unavailable' ? 'print.loadError' : 'resume.loading') : t('application.notComplete')} done={Boolean(evidenceResumeId)} active={packStage === 'resume'} open={openPackItem === 'resume'} onToggle={() => setOpenPackItem(current => current === 'resume' ? null : 'resume')}>
+              {previewResumeId && !evidenceResumeId ? <div role="status"><p>{t(resumePreviewState?.id === previewResumeId && resumePreviewState.status === 'unavailable' ? 'print.loadError' : 'resume.loading')}</p>{resumePreviewState?.id === previewResumeId && resumePreviewState.status === 'unavailable' && <Btn variant="ghost" small onClick={() => setResumePreviewRetry(current => current + 1)}>{t('application.refreshStatus')}</Btn>}</div> : <ResumePackPreview resume={evidenceResumeId ? resumePreview : null} onReview={() => { rememberNestedOrigin(); setDocumentPreview('resume') }} />}
+              {previewResumeId && <Btn variant="ghost" small disabled={!evidenceResumeId} onClick={() => { if (evidenceResumeId) onOpenTailoredResume(evidenceResumeId) }}>{t('application.editResume')}</Btn>}
             </PackRow>
-            <PackRow number="2" title={t('jobs.pack.coverLetter')} detail={packStage === 'coverLetter' ? t('jobs.pack.writingCoverLetter') : selectedCoverLetter ? t('jobs.pack.generatedJob') : t('jobs.pack.autoPreparation')} done={Boolean(selectedCoverLetter)} active={packStage === 'coverLetter'} open={openPackItem === 'coverLetter'} onToggle={() => setOpenPackItem(current => current === 'coverLetter' ? null : 'coverLetter')}>
-              <CoverLetterPackPreview coverLetter={selectedCoverLetter ?? null} applicant={resumePreview?.content.contact} fallbackName={resumePreview?.name ?? 'Applicant'} company={job.company} role={job.role} templateId={resumePreview?.templateId ?? undefined} templateOptions={resumePreview?.templateOptions ?? undefined} onReview={() => setDocumentPreview('coverLetter')} />
+            <PackRow number="2" title={t('jobs.pack.coverLetter')} detail={packStage === 'coverLetter' ? t('jobs.pack.writingCoverLetter') : selectedLetterUnavailable ? selectedLetterStatus : selectedCoverLetter ? t('jobs.pack.generatedJob') : t('application.coverLetterOptional')} statusOverride={selectedLetterUnavailable ? selectedLetterStatus : undefined} done={Boolean(selectedCoverLetter)} active={packStage === 'coverLetter'} open={openPackItem === 'coverLetter'} onToggle={() => setOpenPackItem(current => current === 'coverLetter' ? null : 'coverLetter')}>
+              {selectedLetterUnavailable ? <div role="status"><p>{selectedLetterStatus}</p>{!coverLettersLoading && <Btn variant="ghost" small onClick={() => void refetchCoverLetters()}>{t('application.refreshStatus')}</Btn>}</div> : selectedCoverLetter ? <><CoverLetterPackPreview coverLetter={selectedCoverLetter} applicant={resumePreview?.content.contact} fallbackName={resumePreview?.name ?? 'Applicant'} company={job.company} role={job.role} templateId={resumePreview?.templateId ?? undefined} templateOptions={resumePreview?.templateOptions ?? undefined} onReview={() => { rememberNestedOrigin(); setDocumentPreview('coverLetter') }} /><Btn variant="ghost" small onClick={() => void refetchCoverLetters()}>{t('application.refreshStatus')}</Btn></> : <p>{t('application.coverLetterOptional')}</p>}
+              {coverLetterSelectionNeeded && <p role="status">{t('application.coverLetterSelectFirst')}</p>}
+              {!job.finalCoverLetterId && previewResumeId && <Btn variant="ghost" small disabled={!evidenceResumeId} onClick={() => { if (evidenceResumeId) onOpenTailoredResume(evidenceResumeId) }}>{t('application.coverLetterSelect')}</Btn>}
             </PackRow>
-            <PackRow number="3" title={t('jobs.pack.audit')} detail={packStage === 'audit' ? t('jobs.pack.checkingChanges') : auditRetryOnly ? t('jobs.pack.retryResponse') : auditNeedsEvidence ? `${evidenceGapFindings.length} ${t('jobs.auditFactsCount')}` : auditNeedsRepair ? `${factualAuditFindings.length} ${t('jobs.auditIssuesCount')}` : displayedAudit ? t('jobs.pack.verifiedFacts') : t('jobs.pack.readyRun')} done={currentPackAudited} failed={auditNeedsRepair || auditNeedsEvidence || auditRetryOnly} active={packStage === 'audit'} open={openPackItem === 'audit'} onToggle={() => setOpenPackItem(current => current === 'audit' ? null : 'audit')}>
-              <AuditPackPreview audit={displayedAudit} onRepair={() => void autoTailorAndAudit()} onAddEvidence={finding => { setEvidenceFinding(finding); setEvidenceText('') }} repairing={autoPreparing} />
-            </PackRow>
-            {currentPackAudited && <button onClick={() => void downloadFinalPack()} disabled={downloadingPack} style={{ width: '100%', minHeight: 46, border: 0, borderRadius: 9, background: '#2563eb', color: '#fff', fontWeight: 700, cursor: 'pointer' }}>{downloadingPack ? (exportedPackFolder ? t('jobs.pack.openingFolder') : t('jobs.pack.savingPdfs')) : exportedPackFolder ? t('jobs.pack.openFolder') : t('jobs.pack.savePdfs')}</button>}
-            <PackRow number="4" title={t('jobs.pack.openFill')} detail={applicationPreflight.canAutomate ? t('jobs.pack.availableComplete') : t('jobs.pack.requiresLink')} done={false} locked={!currentPackAudited || !applicationPreflight.canAutomate} last onClick={currentPackAudited && applicationPreflight.canAutomate && job.url ? () => window.open(job.url!, '_blank', 'noopener,noreferrer') : undefined} />
-            <div style={{ borderTop: '1px solid var(--border)', marginTop: 8, paddingTop: 22 }}><div style={{ fontSize: 12, fontWeight: 700, color: '#64748b', marginBottom: 12 }}>{t('jobs.drawer.reviewSubmit')}</div><div style={{ border: '1px solid #bfdbfe', background: '#f8fbff', borderRadius: 9, padding: '14px 16px', display: 'flex', gap: 12, fontSize: 13, lineHeight: 1.55 }}><Info size={22} color="#2563eb" style={{ flexShrink: 0, marginTop: 1 }} /><span><strong>{t('jobs.pack.submitEmployer')}</strong><br /><span style={{ color: 'var(--text-muted)' }}>{t('jobs.pack.openWhenReady')}</span></span></div></div>
+            <div ref={auditSectionRef}><PackRow last number="3" title={t('jobs.pack.audit')} detail={packStage === 'audit' ? t('jobs.pack.checkingChanges') : auditRetryOnly ? t('jobs.pack.retryResponse') : auditNeedsEvidence ? `${evidenceGapFindings.length} ${t('jobs.auditFactsCount')}` : auditNeedsRepair ? `${factualAuditFindings.length} ${t('jobs.auditIssuesCount')}` : displayedAudit ? t('jobs.pack.verifiedFacts') : t('jobs.pack.readyRun')} done={currentPackAudited} failed={auditNeedsRepair || auditNeedsEvidence || auditRetryOnly} active={packStage === 'audit'} open={openPackItem === 'audit'} onToggle={() => setOpenPackItem(current => current === 'audit' ? null : 'audit')}>
+              <AuditPackPreview audit={displayedAudit} onRepair={() => void autoTailorAndAudit()} onReviewEvidence={() => { if (evidenceResumeId) onOpenTailoredResume(evidenceResumeId) }} canReviewEvidence={Boolean(evidenceResumeId)} repairing={autoPreparing || !manualWorkAllowed || taskReadState !== 'ready' || Boolean(previewResumeId && !evidenceResumeId)} />
+            </PackRow></div>
+            {currentPackAudited && <button onClick={() => void downloadFinalPack()} disabled={downloadingPack} style={{ width: '100%', minHeight: 46, border: 0, borderRadius: 9, background: '#2563eb', color: '#fff', fontWeight: 700, cursor: 'pointer' }}>{downloadingPack ? t('application.downloadingZip') : t('application.downloadZip')}</button>}
+            <div style={{ borderTop: '1px solid var(--border)', paddingTop: 16 }}>
+              <strong style={{ fontSize: 13 }}>{t('application.method')}</strong>
+              <p style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{applicationPreflight.canAutomate ? t('application.agentMethodHint') : t('application.manualMethodHint')}</p>
+              {(!currentPackAudited || task || applicationRecordBlocked || taskReadState !== 'ready' || manualReviewPrimary) && job.url && /^https?:\/\//i.test(job.url) && <a href={job.url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--primary)', fontSize: 12 }}>{t('application.openEmployer')}</a>}
+              {!task && <><p style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{t(taskReadState === 'ready' ? 'application.noLinkedTaskHint' : 'application.taskLinkUnknownHint')}</p><Btn variant="ghost" small onClick={() => navigate('agent')}>{t('application.openAgent')}</Btn></>}
+              {manualWorkAllowed && taskReadState === 'ready' && !applicationRecordBlocked && !manualRecordLock && <Btn variant="ghost" small disabled={recordingSubmission} onClick={() => void recordManualSubmission()}>{t('application.recordManual')}</Btn>}
+              {manualStorageUnavailable && <p role="status">{t('application.manualStorageUnavailable')}</p>}
+              {manualRejection && !manualReviewPrimary && <div role="status">
+                <p>{t(manualRejection === 'limit' ? 'application.manualLimitRejected' : 'application.manualPlanRejected')}</p>
+                <p>{t('application.manualRejectedRefreshHint')}</p>{manualRecordNotice && <p>{t('application.manualRejectedRefreshFailed')}</p>}<Btn variant="ghost" small disabled={manualRecordRefreshing} onClick={() => { if (drawerUserId) void refreshAfterManualRejection(drawerUserId) }}>{t('application.refreshStatus')}</Btn>
+              </div>}
+              {manualRecordLock && !manualRejection && !manualReviewPrimary && (manualRecordLock !== 'confirmed' || !applicationRecorded) && <div role="status">
+                <p>{t(manualRecordLock === 'confirmed' ? 'application.manualStatusConfirmed' : 'application.manualStatusPending')}</p>
+                {manualVisibleRecord && <p>{t('application.manualVisibleRecord')}</p>}
+                {manualRecordNotice && <p>{t('application.manualStatusStillUnknown')}</p>}
+                <Btn variant="ghost" small disabled={recordingSubmission || manualRecordRefreshing} onClick={() => { if (drawerUserId) void refreshManualRecord(drawerUserId) }}>{t('application.manualRefresh')}</Btn>
+              </div>}
+            </div>
             <div style={{ borderTop: '1px solid var(--border)', marginTop: 28, paddingTop: 22 }}>
               <div style={{ fontSize: 12, fontWeight: 700, color: '#64748b', marginBottom: 16 }}>{t('jobs.drawer.jobDetails')}</div>
               <JobDetail label={t('jobs.companyLabel')} value={job.company} />
@@ -959,10 +1539,12 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
           </div>
 
           {/* Activity log */}
-          <div>
+          <div ref={activitySectionRef} role="region" tabIndex={-1} aria-label={t('jobs.drawer.activity')}>
             <div style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, marginBottom: 8 }}>{t('jobs.drawer.activity')}</div>
             {loadingAct ? (
-              <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('jobs.loadingDetail')}</div>
+              <div role="status" aria-live="polite" style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('jobs.loadingDetail')}</div>
+            ) : activityError ? (
+              <div role="status"><p>{t('application.historyUnavailable')}</p><Btn variant="ghost" small onClick={() => { activitySectionRef.current?.focus(); setActivityRetry(value => value + 1) }}>{t('application.refreshStatus')}</Btn></div>
             ) : activity.length === 0 ? (
               <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t('jobs.drawer.noActivity')}</div>
             ) : (
@@ -1046,9 +1628,8 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
           )}
         </div>
 
-        {documentPreview === 'resume' && resumePreview && <DocumentPreviewModal title={resumePreview.name} onClose={() => setDocumentPreview(null)}><ResumeRenderer content={resumePreview.content} templateId={resumePreview.templateId} templateOptions={resumePreview.templateOptions} /></DocumentPreviewModal>}
-        {documentPreview === 'coverLetter' && selectedCoverLetter && <DocumentPreviewModal title={t('jobs.coverLetterPreview')} onClose={() => setDocumentPreview(null)}><CoverLetterPreview content={selectedCoverLetter.content} applicant={resumePreview?.content.contact} fallbackName={resumePreview?.name ?? 'Applicant'} company={job.company} role={job.role} templateId={resumePreview?.templateId ?? selectedCoverLetter.templateId ?? 'clean'} templateOptions={resumePreview?.templateOptions ?? selectedCoverLetter.templateOptions ?? {}} /></DocumentPreviewModal>}
-        {evidenceFinding && <EvidenceCaptureModal finding={evidenceFinding} value={evidenceText} saving={savingEvidence} onChange={setEvidenceText} onClose={() => !savingEvidence && setEvidenceFinding(null)} onSave={() => void saveEvidenceAndRewrite()} />}
+        {documentPreview === 'resume' && evidenceResumeId && resumePreview && <DocumentPreviewModal title={resumePreview.name} onClose={closePreview}><ResumeRenderer content={resumePreview.content} templateId={resumePreview.templateId} templateOptions={resumePreview.templateOptions} /></DocumentPreviewModal>}
+        {documentPreview === 'coverLetter' && selectedCoverLetter && <DocumentPreviewModal title={t('jobs.coverLetterPreview')} onClose={closePreview}><CoverLetterPreview content={selectedCoverLetter.content} applicant={resumePreview?.content.contact} fallbackName={resumePreview?.name ?? 'Applicant'} company={job.company} role={job.role} templateId={resumePreview?.templateId ?? selectedCoverLetter.templateId ?? 'clean'} templateOptions={resumePreview?.templateOptions ?? selectedCoverLetter.templateOptions ?? {}} /></DocumentPreviewModal>}
 
         {/* Footer */}
         <div style={{ padding: '12px 18px', borderTop: '0.5px solid var(--border)', display: 'flex', gap: 8 }}>
@@ -1069,12 +1650,6 @@ function renderSalary(salary: unknown): string {
   return String(salary)
 }
 
-type StoredApplicationAudit = {
-  resumeId: string
-  coverLetterId: string | null
-  audit: ApplicationAudit
-}
-
 function findLatestApplicationAudit(activity: Activity[]): StoredApplicationAudit | null {
   for (const item of activity) {
     const prefix = '[Auditor] application-audit '
@@ -1089,23 +1664,13 @@ function findLatestApplicationAudit(activity: Activity[]): StoredApplicationAudi
   return null
 }
 
-const workflowDocumentButton: React.CSSProperties = {
-  width: '100%', display: 'flex', alignItems: 'center', gap: 12, padding: '16px',
-  border: '1px solid #dbe1ea', background: '#fff', borderRadius: 12,
-  color: 'var(--text)', cursor: 'pointer', fontSize: 14,
-}
-
-function ReferenceProgress({ ready }: { ready: boolean }) {
-  const steps = ['Prepare', 'Pack', 'Review', 'Apply']
-  const active = ready ? 3 : 0
-  return <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, padding: '22px 28px 25px', borderBottom: '1px solid var(--border)' }}>{steps.map((label, index) => <div key={label} style={{ textAlign: 'center', position: 'relative' }}>{index < 3 && <span style={{ position: 'absolute', height: 2, background: index < active ? '#2563eb' : '#dbe1ea', top: 18, left: '62%', right: '-38%' }} />}<span style={{ position: 'relative', zIndex: 1, margin: '0 auto 8px', display: 'grid', placeItems: 'center', width: 36, height: 36, borderRadius: '50%', border: `2px solid ${index === active ? '#2563eb' : '#dbe1ea'}`, color: index === active ? '#2563eb' : '#64748b', background: '#fff', fontSize: 15 }}>{index + 1}</span><div style={{ color: index === active ? '#2563eb' : '#64748b', fontSize: 12, fontWeight: index === active ? 700 : 500 }}>{label}</div></div>)}</div>
-}
-
-function PackRow({ number, title, detail, done, failed = false, active = false, locked, onClick, onToggle, open, children, last = false }: {
-  number: string; title: string; detail: string; done: boolean; failed?: boolean; locked?: boolean; onClick?: () => void
+function PackRow({ number, title, detail, done, failed = false, active = false, locked, onClick, onToggle, open, children, last = false, statusOverride }: {
+  number: string; title: string; detail: string; done: boolean; failed?: boolean; locked?: boolean; onClick?: () => void; statusOverride?: string
   active?: boolean; onToggle?: () => void; open?: boolean; children?: React.ReactNode; last?: boolean
 }) {
-  const status = locked ? 'Locked' : active ? 'In progress' : failed ? 'Needs correction' : done ? (title === 'Independent audit' ? 'Passed' : 'Completed') : 'Pending'
+  const { t } = useI18n()
+  const status = statusOverride ?? t(locked ? 'application.locked' : active ? 'application.inProgress' : failed ? 'application.needsCorrection'
+    : done ? number === '3' ? 'application.checkPassed' : 'application.materialAvailable' : number === '2' ? 'application.notSelected' : 'application.notComplete')
   return <div style={{ display: 'grid', gridTemplateColumns: '42px 1fr', gap: 12, position: 'relative' }}>
     <div style={{ position: 'relative', display: 'flex', justifyContent: 'center' }}>
       {!last && <span style={{ position: 'absolute', top: 32, bottom: 0, width: 2, background: done ? '#75b85a' : active ? '#60a5fa' : '#dbe1ea', transformOrigin: 'top', animation: 'pack-line-grow .42s ease-out both' }} />}
@@ -1161,28 +1726,17 @@ function CoverLetterPackPreview({ coverLetter, applicant, fallbackName, company,
 
 function DocumentPreviewModal({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
   const { t } = useI18n()
-  return <div role="dialog" aria-modal="true" aria-label={title} style={{ position: 'fixed', inset: 0, zIndex: 130, display: 'grid', placeItems: 'center', padding: 24, background: 'rgba(15,23,42,.62)' }} onMouseDown={onClose}>
+  const closeRef = useRef<HTMLButtonElement>(null)
+  useEffect(() => { closeRef.current?.focus() }, [])
+  return <div data-application-nested role="dialog" aria-modal="true" aria-label={title} style={{ position: 'fixed', inset: 0, zIndex: 130, display: 'grid', placeItems: 'center', padding: 24, background: 'rgba(15,23,42,.62)' }} onMouseDown={onClose}>
     <div style={{ width: 'min(920px, calc(100vw - 48px))', maxHeight: 'calc(100vh - 48px)', display: 'flex', flexDirection: 'column', overflow: 'hidden', background: '#f1f5f9', borderRadius: 14, boxShadow: '0 24px 80px rgba(15,23,42,.42)' }} onMouseDown={event => event.stopPropagation()}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, padding: '15px 20px', background: '#fff', borderBottom: '1px solid #dbe1ea' }}><div><div style={{ fontSize: 15, fontWeight: 700, color: '#0f172a' }}>{title}</div><div style={{ marginTop: 2, fontSize: 12, color: '#64748b' }}>{t('jobs.documentPreview')}</div></div><button onClick={onClose} aria-label={t('jobs.closePreview')} style={{ display: 'grid', placeItems: 'center', width: 32, height: 32, border: 'none', borderRadius: 8, color: '#475569', background: '#f1f5f9', cursor: 'pointer' }}><X size={18} /></button></div>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, padding: '15px 20px', background: '#fff', borderBottom: '1px solid #dbe1ea' }}><div><div style={{ fontSize: 15, fontWeight: 700, color: '#0f172a' }}>{title}</div><div style={{ marginTop: 2, fontSize: 12, color: '#64748b' }}>{t('jobs.documentPreview')}</div></div><button ref={closeRef} onClick={onClose} aria-label={t('jobs.closePreview')} style={{ display: 'grid', placeItems: 'center', width: 32, height: 32, border: 'none', borderRadius: 8, color: '#475569', background: '#f1f5f9', cursor: 'pointer' }}><X size={18} /></button></div>
       <div style={{ flex: 1, overflow: 'auto', padding: 24 }}>{children}</div>
     </div>
   </div>
 }
 
-function EvidenceCaptureModal({ finding, value, saving, onChange, onClose, onSave }: { finding: ApplicationAuditFinding; value: string; saving: boolean; onChange: (value: string) => void; onClose: () => void; onSave: () => void }) {
-  const { t } = useI18n()
-  return <div role="dialog" aria-modal="true" aria-label={t('jobs.evidence.title')} style={{ position: 'fixed', inset: 0, zIndex: 140, display: 'grid', placeItems: 'center', padding: 24, background: 'rgba(15,23,42,.62)' }} onMouseDown={onClose}>
-    <div style={{ width: 'min(560px, calc(100vw - 40px))', padding: 22, borderRadius: 14, background: '#fff', boxShadow: '0 24px 80px rgba(15,23,42,.42)' }} onMouseDown={event => event.stopPropagation()}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16 }}><div><div style={{ fontSize: 17, fontWeight: 750, color: '#0f172a' }}>{t('jobs.evidence.title')}</div><div style={{ marginTop: 5, fontSize: 13, lineHeight: 1.5, color: '#64748b' }}>{t('jobs.evidence.description')}</div></div><button onClick={onClose} disabled={saving} aria-label={t('jobs.evidence.close')} style={{ alignSelf: 'start', border: 0, background: 'transparent', color: '#475569', cursor: 'pointer' }}><X size={20} /></button></div>
-      <div style={{ marginTop: 16, padding: '10px 12px', borderLeft: '3px solid #d97706', background: '#fffbeb', fontSize: 12, lineHeight: 1.5, color: '#475569' }}><strong style={{ color: '#92400e' }}>{finding.title}</strong><br />{finding.evidence}</div>
-      <label style={{ display: 'block', marginTop: 16, fontSize: 13, fontWeight: 700, color: '#1e293b' }}>{t('jobs.evidence.question')}<textarea value={value} onChange={event => onChange(event.target.value)} placeholder={t('jobs.evidence.example')} autoFocus style={{ display: 'block', width: '100%', minHeight: 116, marginTop: 7, padding: 10, resize: 'vertical', border: '1px solid #cbd5e1', borderRadius: 8, color: '#0f172a', font: 'inherit', fontSize: 13, lineHeight: 1.5 }} /></label>
-      <div style={{ marginTop: 8, fontSize: 11, lineHeight: 1.45, color: '#64748b' }}>{t('jobs.evidence.privacy')}</div>
-      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 18 }}><button onClick={onClose} disabled={saving} style={{ border: '1px solid #cbd5e1', borderRadius: 8, padding: '8px 12px', background: '#fff', color: '#475569', fontWeight: 700, cursor: 'pointer' }}>{t('jobs.evidence.cancel')}</button><button onClick={onSave} disabled={saving || !value.trim()} style={{ border: 0, borderRadius: 8, padding: '8px 12px', background: saving || !value.trim() ? '#93c5fd' : '#2563eb', color: '#fff', fontWeight: 700, cursor: saving || !value.trim() ? 'default' : 'pointer' }}>{saving ? t('jobs.evidence.saving') : t('jobs.evidence.save')}</button></div>
-    </div>
-  </div>
-}
-
-function AuditPackPreview({ audit, onRepair, onAddEvidence, repairing }: { audit: ApplicationAudit | null; onRepair: () => void; onAddEvidence: (finding: ApplicationAuditFinding) => void; repairing: boolean }) {
+function AuditPackPreview({ audit, onRepair, onReviewEvidence, canReviewEvidence, repairing }: { audit: ApplicationAudit | null; onRepair: () => void; onReviewEvidence: () => void; canReviewEvidence: boolean; repairing: boolean }) {
   const { t } = useI18n()
   if (!audit) return <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>{t('jobs.auditNoResult')}</div>
   const retryOnly = audit.findings.some(finding => finding.title === 'Audit response needs retry')
@@ -1190,7 +1744,7 @@ function AuditPackPreview({ audit, onRepair, onAddEvidence, repairing }: { audit
   const issues = audit.findings.filter(finding => finding.area !== 'job_match' && finding.severity !== 'pass' && finding.resolution !== 'evidence_needed')
   const passed = audit.findings.filter(finding => finding.severity === 'pass').length
   const verdict = audit.verdict === 'pass' ? t('jobs.auditPassed') : retryOnly ? t('jobs.auditRetryNeeded') : evidenceGaps.length ? `${evidenceGaps.length} ${t('jobs.auditFactsNeedConfirmation')}` : `${issues.length} ${t('jobs.auditIssuesNeedCorrection')}`
-  return <div><div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, fontSize: 13, fontWeight: 700 }}><span>{verdict}</span><span style={{ color: audit.verdict === 'pass' ? '#3b8c1a' : audit.verdict === 'blocked' ? '#b42318' : '#a16207', whiteSpace: 'nowrap' }}>{t('jobs.roleMatch')} {audit.matchScore}%</span></div>{evidenceGaps.length > 0 && <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>{evidenceGaps.map((finding, index) => <div key={`${finding.title}-${index}`} style={{ padding: '10px', borderLeft: '3px solid #2563eb', background: '#f8fbff', fontSize: 12, lineHeight: 1.45 }}><strong style={{ color: '#1d4ed8' }}>{t('jobs.evidenceNeeded')} · {finding.title}</strong><div style={{ marginTop: 3, color: '#475569' }}>{finding.action}</div><button onClick={() => onAddEvidence(finding)} disabled={repairing} style={{ marginTop: 8, border: '1px solid #2563eb', borderRadius: 7, padding: '6px 8px', background: '#fff', color: '#2563eb', fontWeight: 700, cursor: 'pointer' }}>{t('jobs.addEvidenceRewrite')}</button></div>)}</div>}{issues.length > 0 && <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>{issues.map((finding, index) => <div key={`${finding.title}-${index}`} style={{ padding: '9px 10px', borderLeft: `3px solid ${finding.severity === 'critical' ? '#dc2626' : '#d97706'}`, background: finding.severity === 'critical' ? '#fff7f7' : '#fffbeb', fontSize: 12, lineHeight: 1.45 }}><strong style={{ color: finding.severity === 'critical' ? '#b42318' : '#a16207' }}>{finding.title}</strong><div style={{ color: '#475569', marginTop: 3 }}>{finding.action}</div></div>)}</div>}{retryOnly && <div style={{ marginTop: 10, fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{audit.summary}</div>}{passed > 0 && <div style={{ marginTop: 10, color: '#3b8c1a', fontSize: 12 }}>{passed} {t('jobs.supportedChecks')}</div>}{issues.length > 0 && <button onClick={onRepair} disabled={repairing} style={{ marginTop: 12, border: '1px solid #dc2626', background: '#fff', color: '#b42318', borderRadius: 7, padding: '8px 10px', fontWeight: 700, cursor: 'pointer' }}>{repairing ? t('jobs.correctReaudit') : t('jobs.fixReaudit')}</button>}{retryOnly && <button onClick={onRepair} disabled={repairing} style={{ marginTop: 12, border: '1px solid #2563eb', background: '#fff', color: '#2563eb', borderRadius: 7, padding: '8px 10px', fontWeight: 700, cursor: 'pointer' }}>{repairing ? t('jobs.retryingAudit') : t('jobs.retryAuditButton')}</button>}</div>
+  return <div><div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, fontSize: 13, fontWeight: 700 }}><span>{verdict}</span><span style={{ color: audit.verdict === 'pass' ? '#3b8c1a' : audit.verdict === 'blocked' ? '#b42318' : '#a16207', whiteSpace: 'nowrap' }}>{t('jobs.roleMatch')} {audit.matchScore}%</span></div>{evidenceGaps.length > 0 && <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>{evidenceGaps.map((finding, index) => <div key={`${finding.title}-${index}`} style={{ padding: '10px', borderLeft: '3px solid #2563eb', background: '#f8fbff', fontSize: 12, lineHeight: 1.45 }}><strong style={{ color: '#1d4ed8' }}>{t('jobs.evidenceNeeded')} · {finding.title}</strong><div style={{ marginTop: 3, color: '#475569' }}><strong>{t('resume.auditEvidenceLabel')}: </strong>{finding.evidence}</div><div style={{ marginTop: 3, color: '#475569' }}>{finding.action}</div><p style={{ margin: '6px 0', color: '#475569' }}>{t('application.scopedEvidenceGuidance')}</p>{!canReviewEvidence && <p role="status" style={{ margin: '6px 0', color: '#475569' }}>{t('application.scopedEvidenceNoResume')}</p>}<button onClick={onReviewEvidence} disabled={repairing || !canReviewEvidence} style={{ marginTop: 8, border: '1px solid #2563eb', borderRadius: 7, padding: '6px 8px', background: '#fff', color: '#2563eb', fontWeight: 700, cursor: 'pointer' }}>{t('application.editResume')}</button></div>)}</div>}{issues.length > 0 && <div style={{ marginTop: 10, display: 'grid', gap: 8 }}>{issues.map((finding, index) => <div key={`${finding.title}-${index}`} style={{ padding: '9px 10px', borderLeft: `3px solid ${finding.severity === 'critical' ? '#dc2626' : '#d97706'}`, background: finding.severity === 'critical' ? '#fff7f7' : '#fffbeb', fontSize: 12, lineHeight: 1.45 }}><strong style={{ color: finding.severity === 'critical' ? '#b42318' : '#a16207' }}>{finding.title}</strong><div style={{ color: '#475569', marginTop: 3 }}>{finding.action}</div></div>)}</div>}{retryOnly && <div style={{ marginTop: 10, fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{audit.summary}</div>}{passed > 0 && <div style={{ marginTop: 10, color: '#3b8c1a', fontSize: 12 }}>{passed} {t('jobs.supportedChecks')}</div>}{issues.length > 0 && <button onClick={onRepair} disabled={repairing} style={{ marginTop: 12, border: '1px solid #dc2626', background: '#fff', color: '#b42318', borderRadius: 7, padding: '8px 10px', fontWeight: 700, cursor: 'pointer' }}>{repairing ? t('jobs.correctReaudit') : t('jobs.fixReaudit')}</button>}{retryOnly && <button onClick={onRepair} disabled={repairing} style={{ marginTop: 12, border: '1px solid #2563eb', background: '#fff', color: '#2563eb', borderRadius: 7, padding: '8px 10px', fontWeight: 700, cursor: 'pointer' }}>{repairing ? t('jobs.retryingAudit') : t('jobs.retryAuditButton')}</button>}</div>
 }
 
 function JobDetail({ label, value, href }: { label: string; value: string; href?: string }) {
@@ -1359,9 +1913,14 @@ export function JobsPage() {
   const userId = session?.user?.id ?? ''
   const cachedJobs = defaultJobsCache?.userId === userId ? defaultJobsCache : null
   const [confirm, ConfirmDialog] = useConfirm()
-  const [view,         setView        ] = useState<'list' | 'kanban'>('list')
-  const [search,       setSearch      ] = useState('')
-  const [filterStatus, setFilterStatus] = useState<'all' | JobStatus>('all')
+  const [initialList] = useState(() => readApplicationListState(typeof window === 'undefined' ? '/' : window.location.href))
+  const applicationTasks = useApplicationTasks()
+  const [attentionView, setAttentionView] = useState(() => typeof window !== 'undefined' && new URL(window.location.href).searchParams.get('jobsAttention') === '1')
+  const listRef = useRef<HTMLDivElement>(null)
+  const [highlightId, setHighlightId] = useState(() => typeof window === 'undefined' ? null : new URL(window.location.href).searchParams.get('highlight'))
+  const [view,         setView        ] = useState<'list' | 'kanban'>(initialList.view)
+  const [search,       setSearch      ] = useState(initialList.search)
+  const [filterStatus, setFilterStatus] = useState<'all' | JobStatus>(initialList.status)
   const [showAdd,      setShowAdd     ] = useState(false)
   const [prefillStatus, setPrefillStatus] = useState<JobStatus | null>(null)
   const [jobs,         setJobs        ] = useState<Job[]>(() => cachedJobs?.jobs ?? [])
@@ -1370,10 +1929,10 @@ export function JobsPage() {
   const [loading,      setLoading     ] = useState(() => cachedJobs === null)
   const [fetchError,   setFetchError  ] = useState<string | null>(null)
   const [selectedJob,  setSelectedJob ] = useState<Job | null>(null)
-  const [page,         setPage        ] = useState(1)
-  const [pageSize,     setPageSize    ] = useState(20)
-  const [sortBy,       setSortBy      ] = useState<'createdAt' | 'score' | 'company' | 'role'>('createdAt')
-  const [sortDir,      setSortDir     ] = useState<'asc' | 'desc'>('desc')
+  const [page,         setPage        ] = useState(initialList.page)
+  const [pageSize,     setPageSize    ] = useState(initialList.pageSize)
+  const [sortBy,       setSortBy      ] = useState<'createdAt' | 'score' | 'company' | 'role'>(initialList.sortBy)
+  const [sortDir,      setSortDir     ] = useState<'asc' | 'desc'>(initialList.sortDir)
   const sortByRef = useRef(sortBy)
   const sortDirRef = useRef(sortDir)
   const [selectedIds,  setSelectedIds ] = useState<Set<string>>(() => new Set())
@@ -1401,6 +1960,7 @@ export function JobsPage() {
         if (search)                params.set('q',      search)
         if (filterStatus !== 'all') params.set('status', filterStatus)
         const res  = await fetch(`/api/jobs?${params}`, { signal: controller.signal })
+        if (!res.ok) throw new Error('Could not load jobs')
         const json = await res.json() as JobsListResponse
         if (!cancelled) {
           const rawJobs: Job[] = json.jobs ?? []
@@ -1432,30 +1992,87 @@ export function JobsPage() {
 
   // When the component gains focus (user navigates back from Search), refresh
   useEffect(() => {
-    const onFocus = () => triggerRefresh()
+    const onFocus = () => { triggerRefresh(); void applicationTasks.refetch() }
     const onMessage = (e: MessageEvent) => {
       if (e.data?.type === 'job-saved' || e.data?.type === 'nav-refresh') triggerRefresh()
     }
     window.addEventListener('focus', onFocus)
+    window.addEventListener('applymate:sessions-changed', onFocus)
     window.addEventListener('message', onMessage)
-    return () => { window.removeEventListener('focus', onFocus); window.removeEventListener('message', onMessage) }
+    return () => { window.removeEventListener('focus', onFocus); window.removeEventListener('applymate:sessions-changed', onFocus); window.removeEventListener('message', onMessage) }
+  }, [applicationTasks.refetch])
+
+  useEffect(() => {
+    const url = new URL(window.location.href)
+    if (attentionView) url.searchParams.set('jobsAttention', '1')
+    else url.searchParams.delete('jobsAttention')
+    replaceApplicationHistory(`${url.pathname}${url.search}${url.hash}`)
+  }, [attentionView])
+
+  useEffect(() => {
+    const href = applicationListUrl(window.location.href, { search, status: filterStatus, page, pageSize, sortBy, sortDir, view })
+    window.history.replaceState({}, '', href)
+  }, [search, filterStatus, page, pageSize, sortBy, sortDir, view])
+
+  useEffect(() => {
+    const restore = () => {
+      const state = readApplicationListState(window.location.href)
+      setSearch(state.search); setFilterStatus(state.status); setPage(state.page); setPageSize(state.pageSize)
+      setSortBy(state.sortBy); setSortDir(state.sortDir); setView(state.view)
+      const id = new URL(window.location.href).searchParams.get('highlight')
+      setHighlightId(id)
+      setAttentionView(new URL(window.location.href).searchParams.get('jobsAttention') === '1')
+      if (!id) setSelectedJob(null)
+    }
+    window.addEventListener('popstate', restore)
+    return () => window.removeEventListener('popstate', restore)
   }, [])
 
-  // Deep-link: ?highlight=<jobId> from extension sidebar/popup — auto-open the job drawer
+  // Read by ID: the linked application may not be on this page or match this filter.
   useEffect(() => {
-    if (loading || jobs.length === 0) return
-    const params = new URLSearchParams(window.location.search)
-    const highlightId = params.get('highlight')
-    if (!highlightId) return
-    const match = jobs.find(j => j.id === highlightId)
-    if (match) {
-      setSelectedJob(match)
-      // Clean up the URL param without triggering a navigation
-      const url = new URL(window.location.href)
-      url.searchParams.delete('highlight')
-      window.history.replaceState({}, '', url.toString())
-    }
-  }, [loading, jobs])
+    if (!highlightId || !userId) return
+    // Row selection already provides this record. Avoid a second read racing
+    // with notes or material updates made immediately after opening it.
+    if (selectedJob?.id === highlightId && selectedJob.userId === userId) return
+    const controller = new AbortController()
+    // A cross-page navigation can render this page before its guarded helper
+    // commits the final selection. Wait for that commit, then verify the URL
+    // both before issuing the read and before publishing its result.
+    const isCurrent = () => !controller.signal.aborted
+      && new URL(window.location.href).searchParams.get('highlight') === highlightId
+    const timer = window.setTimeout(() => {
+      if (!isCurrent()) return
+      void loadLinkedApplication(highlightId, controller.signal).then(value => {
+        if (!isCurrent()) return
+        const linked = value as Job
+        if (linked.userId !== userId) throw new Error('Application unavailable')
+        setSelectedJob(previous => previous?.id === linked.id && previous.userId === userId ? previous : linked)
+      }).catch(() => {
+        if (!isCurrent()) return
+        setSelectedJob(null)
+        setHighlightId(null)
+        const url = new URL(window.location.href)
+        url.searchParams.delete('highlight')
+        window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`)
+        toast.error(t('application.linkUnavailable'))
+      })
+    }, 0)
+    return () => { window.clearTimeout(timer); controller.abort() }
+  }, [highlightId, userId])
+
+  useEffect(() => {
+    if (!userId) return
+    try { listRef.current?.scrollTo({ top: Number(sessionStorage.getItem(`application-list-scroll:${userId}`) ?? 0) }) } catch { /* optional browser storage */ }
+  }, [userId, loading])
+
+  function selectApplication(job: Job | null) {
+    setSelectedJob(job)
+    setHighlightId(job?.id ?? null)
+    const url = new URL(window.location.href)
+    if (job) url.searchParams.set('highlight', job.id)
+    else url.searchParams.delete('highlight')
+    window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`)
+  }
 
   async function handleStatusChange(jobId: string, newStatus: JobStatus) {
     const previousStatus = jobs.find(job => job.id === jobId)?.status
@@ -1520,6 +2137,7 @@ export function JobsPage() {
     setBulkDeleting(false)
     if (error) { toast.error('Delete failed', error); return }
 
+    for (const id of ids) forgetSavedApplication(userId, id)
     const deletedCount = data?.deleted ?? ids.length
     const deleted = new Set(ids)
     const remainingTotal = Math.max(0, total - deletedCount)
@@ -1548,7 +2166,9 @@ export function JobsPage() {
   }
 
   return (
-    <div className="jobs-page" style={{ flex: 1, overflowY: 'auto', background: 'var(--bg-tertiary)', display: 'flex', flexDirection: 'column' }}>
+    <div ref={listRef} onScroll={event => {
+      if (userId) { try { sessionStorage.setItem(`application-list-scroll:${userId}`, String(event.currentTarget.scrollTop)) } catch { /* optional storage */ } }
+    }} className="jobs-page" style={{ flex: 1, overflowY: 'auto', background: 'var(--bg-tertiary)', display: 'flex', flexDirection: 'column' }}>
       <header className="jobs-page-header" style={{ minHeight: 62, flexShrink: 0, padding: '8px 30px', background: 'var(--bg-tertiary)' }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 24, flexWrap: 'wrap' }}>
           <div style={{ flex: '1 1 360px', display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
@@ -1578,7 +2198,11 @@ export function JobsPage() {
       </header>
 
       <div className="jobs-page-content" style={{ padding: '16px 30px 30px', flex: 1 }}>
-        <div className="jobs-page-toolbar" style={{ padding: 14, marginBottom: 0, background: 'var(--bg)', border: '0.5px solid var(--border)', borderBottom: 'none', borderRadius: '12px 12px 0 0', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+        <div role="group" aria-label={t('application.attentionViews')} style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
+          <button type="button" aria-pressed={!attentionView} onClick={() => setAttentionView(false)}>{t('application.allApplications')}</button>
+          <button type="button" aria-pressed={attentionView} onClick={() => setAttentionView(true)}>{t('application.attentionView')}</button>
+        </div>
+        {!attentionView && <div className="jobs-page-toolbar" style={{ padding: 14, marginBottom: 0, background: 'var(--bg)', border: '0.5px solid var(--border)', borderBottom: 'none', borderRadius: '12px 12px 0 0', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
           <div className="jobs-page-search" style={{ width: 420, maxWidth: '100%', display: 'flex', alignItems: 'center', gap: 8, padding: '0 12px', border: '0.5px solid var(--border)', borderRadius: 8, background: 'var(--bg)' }}>
             <Search size={17} color="var(--text-muted)" />
             <input value={search} onChange={e => doSearch(e.target.value)} placeholder={t('jobs.search')}
@@ -1597,8 +2221,8 @@ export function JobsPage() {
           <div style={{ display: 'flex', border: '0.5px solid var(--border)', borderRadius: 8, overflow: 'hidden' }}>
             {([['list', List, 'jobs.listView'], ['kanban', LayoutGrid, 'jobs.kanbanView']] as const).map(([v, Icon, labelKey]) => <button key={v} onClick={() => setView(v)} aria-label={t(labelKey)} style={{ padding: '8px 12px', background: view === v ? 'var(--primary)' : 'var(--bg)', color: view === v ? '#fff' : 'var(--text-muted)', border: 'none', cursor: 'pointer', display: 'inline-flex' }}><Icon size={17} /></button>)}
           </div>
-        </div>
-{loading ? (
+        </div>}
+{attentionView ? <ApplicationAttentionView tasks={applicationTasks.tasks} loading={applicationTasks.loading} error={applicationTasks.error} onOpenJob={id => openApplication(id, navigate)} onOpenSession={id => openApplicationSession(id, navigate)} onRefresh={() => void applicationTasks.refetch()} /> : loading ? (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 60 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: 'var(--text-muted)', fontSize: 12 }}>
               <div style={{ width: 20, height: 20, border: '2px solid rgba(79,70,229,0.2)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
@@ -1628,11 +2252,11 @@ export function JobsPage() {
             {view === 'list'
               ? <>
                 <div className="jobs-desktop-list">
-                  <ListView jobs={jobs} onRowClick={setSelectedJob} selectedIds={selectedIds} onToggle={toggleSelected} onToggleAll={toggleAllVisible} />
+                  <ListView onOpenSession={id => openApplicationSession(id, navigate)} taskByJobId={applicationTasks.byJobId} jobs={jobs} onRowClick={selectApplication} selectedIds={selectedIds} onToggle={toggleSelected} onToggleAll={toggleAllVisible} />
                 </div>
-                <MobileListView jobs={jobs} onRowClick={setSelectedJob} selectedIds={selectedIds} onToggle={toggleSelected} />
+                <MobileListView onOpenSession={id => openApplicationSession(id, navigate)} taskByJobId={applicationTasks.byJobId} jobs={jobs} onRowClick={selectApplication} selectedIds={selectedIds} onToggle={toggleSelected} />
               </>
-              : <KanbanView jobs={jobs} onStatusChange={handleStatusChange} onAddClick={col => { setPrefillStatus(col); setShowAdd(true) }} />}
+              : <KanbanView jobs={jobs} onStatusChange={handleStatusChange} onAddClick={col => { setPrefillStatus(col); setShowAdd(true) }} onRowClick={selectApplication} />}
 
             {/* ── Pagination bar ── */}
             {total > pageSize && (
@@ -1660,10 +2284,14 @@ export function JobsPage() {
         />
       )}
 
-      {selectedJob && (
+      {selectedJob && selectedJob.id === highlightId && selectedJob.userId === userId && (
         <JobDetailDrawer
+          key={selectedJob.id}
           job={selectedJob}
-          onClose={() => setSelectedJob(null)}
+          task={applicationTasks.byJobId.get(selectedJob.id)}
+          taskReadState={applicationTasks.loading ? 'loading' : applicationTasks.error ? 'unavailable' : applicationTasks.limited ? 'limited' : 'ready'}
+          onRefreshTasks={() => void applicationTasks.refetch()}
+          onClose={() => selectApplication(null)}
           onStatusChange={(id, status) => {
             handleStatusChange(id, status)
             setSelectedJob(prev => prev && prev.id === id ? { ...prev, status } : prev)
@@ -1671,8 +2299,27 @@ export function JobsPage() {
           onUpdate={updated => {
             setJobs(prev => prev.map(j => j.id === updated.id ? updated : j))
             setSelectedJob(updated)
+            defaultJobsCache = null
+            triggerRefresh()
+            window.dispatchEvent(new Event('applymate:jobs-changed'))
+          }}
+          onDescriptionUpdate={(owner, id, description) => {
+            const merge = (current: Job) => current.id === id && current.userId === owner
+              && (!current.description?.trim() || current.description === description) ? { ...current, description } : current
+            setJobs(previous => previous.map(merge))
+            setSelectedJob(previous => previous ? merge(previous) : previous)
+            defaultJobsCache = null
+            window.dispatchEvent(new Event('applymate:jobs-changed'))
+          }}
+          onJobFieldsUpdate={(owner, id, fields) => {
+            const merge = (current: Job) => current.id === id && current.userId === owner ? { ...current, ...fields } : current
+            setJobs(previous => previous.map(merge))
+            setSelectedJob(previous => previous ? merge(previous) : previous)
+            defaultJobsCache = null
+            window.dispatchEvent(new Event('applymate:jobs-changed'))
           }}
           onDelete={id => {
+            forgetSavedApplication(userId, id)
             const deletedJob = jobs.find(job => job.id === id)
             setJobs(prev => prev.filter(j => j.id !== id))
             setTotal(t => t - 1)
@@ -1693,6 +2340,7 @@ export function JobsPage() {
           onOpenTailoredResume={resumeId => {
             sessionStorage.setItem('applymate:resume-return', JSON.stringify({ resumeId, jobId: selectedJob.id }))
             const url = new URL(window.location.href)
+            url.searchParams.delete('resumeStartEmpty')
             url.searchParams.set('resumeId', resumeId)
             url.searchParams.set('returnToJobs', '1')
             url.searchParams.set('returnJobId', selectedJob.id)

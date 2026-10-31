@@ -1,0 +1,58 @@
+name: Application manual record concurrency
+
+on:
+  pull_request:
+    branches: [master, 'feat/**', 'fix/**', 'refactor/**', 'chore/**', 'codex/**']
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  manual-record-postgres:
+    name: Manual record on disposable PostgreSQL
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: applymate_manual_record_test
+          POSTGRES_USER: manual_fixture
+          POSTGRES_PASSWORD: manual_fixture_only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U manual_fixture -d applymate_manual_record_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - name: Install frozen dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Generate Prisma client
+        env:
+          DATABASE_URL: postgresql://manual_fixture:manual_fixture_only@127.0.0.1:5432/applymate_manual_record_test
+        run: pnpm --filter @jobcopilot/web exec prisma generate --schema prisma/schema.prisma
+      - name: Verify manual recording against disposable PostgreSQL
+        env:
+          MANUAL_RECORD_PG_TEST_URL: postgresql://manual_fixture:manual_fixture_only@127.0.0.1:5432/applymate_manual_record_test
+          MANUAL_RECORD_PG_TEST_DISPOSABLE: 'true'
+          RLS_RUNTIME_MODE: 'off'
+        run: |
+          test "$CI" = "true"
+          test "$MANUAL_RECORD_PG_TEST_DISPOSABLE" = "true"
+          test "$MANUAL_RECORD_PG_TEST_URL" = "postgresql://manual_fixture:manual_fixture_only@127.0.0.1:5432/applymate_manual_record_test"
+          test "$RLS_RUNTIME_MODE" = "off"
+          pnpm --filter @jobcopilot/web exec vitest run --no-file-parallelism \
+            'src/app/api/jobs/[id]/apply/route.pg.integration.test.ts'

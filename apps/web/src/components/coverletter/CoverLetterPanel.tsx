@@ -1,4 +1,5 @@
 'use client'
+import { isApplicationPdfUnsupportedCharactersError } from '@/lib/application-pdf-errors'
 import React, { useState, useEffect, useRef } from 'react'
 import { Btn, useToast, useConfirm } from '@/components/ui'
 import { apiMutate } from '@/lib/hooks'
@@ -319,7 +320,8 @@ export function CoverLetterPanel({ job, resumeId, resumeContent, resumeName, tem
       toast.success('PDF downloaded', 'Cover letter saved as PDF')
     } catch (error) {
       console.error('[cover-letter] PDF export failed', error)
-      toast.error('PDF error', error instanceof Error ? error.message : 'Could not render cover letter PDF')
+      if (isApplicationPdfUnsupportedCharactersError(error)) toast.error(t('application.downloadUnsupportedTitle'), t('application.downloadUnsupportedDetail'))
+      else toast.error('PDF error', error instanceof Error ? error.message : 'Could not render cover letter PDF')
     } finally {
       setDownloading(false)
     }
