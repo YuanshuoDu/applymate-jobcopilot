@@ -60,7 +60,8 @@ import { subagentDispatchJobId } from "./dispatch-identity.js"
 import { drainTaskGraphStopOutbox, TASK_GRAPH_STOP_OUTBOX_TOPIC } from "./task-graph-stop-outbox.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION, parseTaskGraphSnapshot, taskGraphItemId, taskGraphLifecycleKey, taskGraphProposalKey } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_FINAL_SUMMARY_BINDING } from "./task-graph-final-summary-binding.js"
-import { parseStoredTaskGraphVerificationReport } from "./task-graph-verification-report.js"
+import { parseStoredTaskGraphVerificationReport, TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION } from "./task-graph-verification-report.js"
+import { hasNoCurrentAttemptTaskGraphToolReceipts } from "./task-graph-empty-analyst-proof.js"
 import { rootRecoveryEligibility } from "./task-graph-pg-lifecycle.js"
 import { RUNNABLE_SESSION } from "../session-gate.js"
 
@@ -257,8 +258,15 @@ function dedicatedRedisUrl(): string | null {
   return value
 }
 
+function assertRequiredIntegrationServices(required: boolean, databaseUrl: string | null, redisUrl: string | null): void {
+  if (required && (!databaseUrl || !redisUrl)) {
+    throw new Error("TaskGraph resume integration requires disposable PostgreSQL and Redis when services are required")
+  }
+}
+
 const databaseUrl = dedicatedDatabaseUrl()
 const redisUrl = dedicatedRedisUrl()
+assertRequiredIntegrationServices(process.env.AGENT_RUNTIME_PG_TEST_REQUIRED === "true", databaseUrl, redisUrl)
 const describeWithServices = databaseUrl && redisUrl ? describe : describe.skip
 
 type Fixture = { userId: string; sessionId: string; turnId: string; ownerId: string; suffix: string }
@@ -7251,6 +7259,14 @@ describe("TaskGraph exact fixture queue cleanup", () => {
 })
 
 describe("TaskGraph restart fixture service boundary", () => {
+  it("fails rather than skipping when required disposable PostgreSQL or Redis is missing", () => {
+    const error = "TaskGraph resume integration requires disposable PostgreSQL and Redis when services are required"
+    expect(() => assertRequiredIntegrationServices(true, null, null)).toThrow(error)
+    expect(() => assertRequiredIntegrationServices(true, "postgresql://disposable", null)).toThrow(error)
+    expect(() => assertRequiredIntegrationServices(true, null, "redis://disposable")).toThrow(error)
+    expect(() => assertRequiredIntegrationServices(false, null, null)).not.toThrow()
+  })
+
   it("rejects unsafe PostgreSQL or Redis endpoints before production startup", async () => {
     const unsafeEnvironmentCases = [
       {
@@ -7503,6 +7519,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   const leaseRecoveryOwner = fixture()
   const coverageRepairOwner = fixture()
   const scoutUnionOwner = fixture()
+  const emptyAnalystOwner = fixture()
+  const emptyAnalystOrphanOwner = fixture()
   const archivedWaitOwner = fixture()
   const rootRecoveryScanSeed = fixture()
   const rootRecoveryScanOwner = {
@@ -7558,6 +7576,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await seed(pool, leaseRecoveryOwner, "waiting_for_user", DISCOVERY_FIXTURE_TURN_LIMITS)
     await seed(pool, coverageRepairOwner, "waiting_for_user", { ...TASK_GRAPH_FIXTURE_TURN_LIMITS, maxSteps: 13 })
     await seed(pool, scoutUnionOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
+    await seed(pool, emptyAnalystOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
+    await seed(pool, emptyAnalystOrphanOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
     await seed(pool, archivedWaitOwner, "waiting_for_user", { maxSteps: 4, maxToolCalls: 3 })
     await seed(pool, rootRecoveryScanOwner, "waiting_for_user")
   }, 15_000)
@@ -7584,7 +7604,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     }
     const fixtureOwners = [owner, resumeFailureOwner, failureOwner, operationalFailureOwner, operationalDeadlineOwner, operationalAppendOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner,
       discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, lateRepairOwner, leaseRecoveryOwner,
-      coverageRepairOwner, scoutUnionOwner, rootRecoveryScanOwner, archivedWaitOwner]
+      coverageRepairOwner, scoutUnionOwner, emptyAnalystOwner, emptyAnalystOrphanOwner, rootRecoveryScanOwner, archivedWaitOwner]
     const allFixtureWorkersExited = [...fixtureProcessChildren].every(processFixtureExited)
     if (!allFixtureWorkersExited) cleanupFailures.push("fixture process Workers are not proven exited; queue cleanup was refused")
     let ownerRowsMayBeDeleted = false
@@ -14140,13 +14160,15 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
 
 
 
-  it("revalidates disjoint and overlapping multi-Scout proofs through a durable Analyst wait", async () => {
+  it.each(["verified union", "empty Analyst proof", "prior-attempt callId orphan event"] as const)("revalidates multi-Scout proofs through a durable Analyst wait (%s)", async scenario => {
+    const emptyAnalyst = scenario !== "verified union", taskScopedOrphan = scenario === "prior-attempt callId orphan event"
     const [workerQueue, canonical, commandPortModule, turnQueueModule] = await Promise.all([
       import("../../queue/production-bootstrap.js"), import("../canonical-turn-runtime.js"),
       import("./pg-task-graph-command-port.js"), import("../turns/turn-queue.js"),
     ])
     const { createProductionChildExecutor } = await import("./production-child-runtime.js")
-    const value = scoutUnionOwner, ids = Array.from({ length: 4 }, (_, index) => fixtureJobId(value.suffix, index))
+    const value = scenario === "verified union" ? scoutUnionOwner : taskScopedOrphan ? emptyAnalystOrphanOwner : emptyAnalystOwner
+    const ids = Array.from({ length: 4 }, (_, index) => fixtureJobId(value.suffix, index))
     turnQueueName = turnQueueModule.TURN_QUEUE_NAME
     childQueueName = (await import("../../queue/subagent-queue.js")).SUBAGENT_QUEUE_NAME
     await activateFixtureTurn(pool!, value)
@@ -14162,6 +14184,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       taskGraphPlanningEnabled: true, childExecutionEnabled: true, coordinationEnabled: true,
       consumeWaitOutcomes: true, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false,
     }
+    const taskGraphCommandPort = commandPortModule.createPgTaskGraphCommandPort(pool!)
     const profile = {
       provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true,
       continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: false,
@@ -14173,6 +14196,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       { id: "union-membership", check: { kind: "findings_from_scout_union", dependencyNodeKeys: ["scout-b", "scout-a"] } },
       { id: "union-coverage", check: { kind: "findings_cover_scout_candidate_union_gte", dependencyNodeKeys: ["scout-a", "scout-b"], minimumPercent: 100 } },
     ] } as const
+    const emptyAnalystVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [
+      { id: "source-coverage", check: { kind: "findings_cover_each_scout_candidates_gte", dependencyNodeKeys: ["scout-a", "scout-b"], minimumPercent: 100 } },
+      { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
+    ] } as const
+    const analystVerification = emptyAnalyst ? emptyAnalystVerification : unionVerification
     const scoutVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
       criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }] } as const
     const planCallId = `p3-scout-union-plan:${value.turnId}`, waitCallId = `p3-scout-union-wait:${value.turnId}`
@@ -14181,7 +14209,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let scoutATaskId = "", scoutBTaskId = "", analystTaskId = "", finalWaitReport: RecordValue | null = null
     const runtime = await canonical.createCanonicalTurnRuntime(pool!, {
       workerId: value.ownerId, productionFlags: flags,
-      taskGraphCommandPort: commandPortModule.createPgTaskGraphCommandPort(pool!),
+      taskGraphCommandPort,
       taskGraphTemplates: { ...TASK_GRAPH_TEMPLATES }, authorizeUsage: async () => ({ settle: async () => undefined }),
       modelRuntimeFactory: () => {
         const execution = ++rootExecution
@@ -14195,7 +14223,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 expectedRevision: 0, nodes: [
                   { key: "scout-a", templateId: "scout", goal: scoutAGoal, successCriteria: ["Return two evidence-bound candidates"], dependsOn: [], verification: scoutVerification },
                   { key: "scout-b", templateId: "scout", goal: scoutBGoal, successCriteria: ["Return three candidates with one overlap"], dependsOn: [], verification: scoutVerification },
-                  { key: "analysis", templateId: "analyst", goal: "Verify both Scout result sets as unions", successCriteria: ["Cover every unique union candidate"], dependsOn: ["scout-a", "scout-b"], verification: unionVerification },
+                  { key: "analysis", templateId: "analyst", goal: emptyAnalyst ? "Return no findings without tool calls" : "Verify both Scout result sets as unions",
+                    successCriteria: [emptyAnalyst ? "Report the empty result accurately" : "Cover every unique union candidate"],
+                    dependsOn: ["scout-a", "scout-b"], verification: analystVerification },
                 ],
               } }
               yield { type: "completed", finishReason: "tool_calls" }
@@ -14215,16 +14245,105 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             if (execution === 2 && round === 1) {
               const graph = currentGraphFromRequest(request), nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
               expect(nodes.map(node => node?.key)).toEqual(["scout-a", "scout-b", "analysis"])
-              expect(nodes.map(node => node?.status)).toEqual(["completed", "completed", "completed"])
-              expectPassedVerificationReport(nodes[2]?.verificationReport, "union-membership", "union-coverage")
+              expect(nodes.map(node => node?.status)).toEqual(emptyAnalyst
+                ? ["completed", "completed", "failed"] : ["completed", "completed", "completed"])
+              if (taskScopedOrphan) expect(nodes[2]?.verificationReport).toMatchObject({
+                verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "canonical_evidence_invalid",
+              })
+              else if (emptyAnalyst) expect(nodes[2]?.verificationReport).toMatchObject({
+                  verifierVersion: TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met",
+                  criteria: [
+                    { criterionId: "source-coverage", status: "failed", reasonCode: "criterion_not_met" },
+                    { criterionId: "finding-count", status: "failed", reasonCode: "criterion_not_met" },
+                  ],
+                })
+              else expectPassedVerificationReport(nodes[2]?.verificationReport, "union-membership", "union-coverage")
               const outcome = waitOutcomeFromRequest(request, 1, "analyst")
               expect(outcome.status).toBe("ready")
-              expect(record(outcome.tasks[0])).toMatchObject({ taskId: analystTaskId, status: "completed", role: "analyst" })
+              expect(record(outcome.tasks[0])).toMatchObject({ taskId: analystTaskId, status: emptyAnalyst ? "failed" : "completed", role: "analyst" })
               finalWaitReport = record(record(outcome.tasks[0])?.verificationReport)
-              expectPassedVerificationReport(finalWaitReport, "union-membership", "union-coverage")
+              if (taskScopedOrphan) expect(finalWaitReport).toMatchObject({
+                verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "canonical_evidence_invalid",
+              })
+              else if (emptyAnalyst) expect(finalWaitReport).toMatchObject({
+                  verifierVersion: TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met",
+                })
+              else expectPassedVerificationReport(finalWaitReport, "union-membership", "union-coverage")
               expect(Object.keys(finalWaitReport ?? {}).sort()).toEqual(["criteria", "evidenceDigest", "reasonCode", "resultDigest", "status", "verifierVersion"])
               expect(JSON.stringify(finalWaitReport)).not.toContain("dependencyBindings")
-              yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: "Both Scout sources passed the current union checks" }) }
+              if (emptyAnalyst && !taskScopedOrphan) {
+                const ownerRows = await pool!.query<{
+                  rootTaskId: string; turnLeaseOwner: string; turnLeaseVersion: number; parentLeaseOwner: string
+                  parentAttemptCount: number; stepId: string
+                }>(`SELECT turn."rootTaskId", turn."leaseOwnerId" AS "turnLeaseOwner", turn."leaseVersion" AS "turnLeaseVersion",
+                      root."leaseOwner" AS "parentLeaseOwner", root."attemptCount" AS "parentAttemptCount",
+                      (SELECT step."id" FROM "agent_steps" AS step WHERE step."sessionId" = turn."sessionId"
+                        AND step."turnId" = turn."id" AND step."taskId" = root."id" AND step."status" = 'streaming'
+                        ORDER BY step."ordinal" DESC LIMIT 1) AS "stepId"
+                   FROM "agent_turns" AS turn JOIN "sub_agent_tasks" AS root
+                     ON root."id" = turn."rootTaskId" AND root."sessionId" = turn."sessionId"
+                   WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3 AND root."status" = 'running'`,
+                [value.turnId, value.sessionId, value.userId])
+                const owner = ownerRows.rows[0]
+                if (!owner?.rootTaskId || !owner.stepId) throw new Error("Empty Analyst readback fixture lost the active root lease")
+                const readScope = {
+                  userId: value.userId, sessionId: value.sessionId, turnId: value.turnId,
+                  rootTaskId: owner.rootTaskId, parentTaskId: owner.rootTaskId, stepId: owner.stepId,
+                  turnLeaseOwner: owner.turnLeaseOwner, turnLeaseVersion: owner.turnLeaseVersion,
+                  parentLeaseOwner: owner.parentLeaseOwner, parentAttemptCount: owner.parentAttemptCount,
+                }
+                const currentGraph = await taskGraphCommandPort.readCurrent(readScope)
+                expect(currentGraph.nodes.find(node => node.key === "analysis")?.verificationReport).toMatchObject({
+                  verifierVersion: TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION, status: "failed",
+                })
+                const persisted = await pool!.query<{ id: string; role: string; result: unknown }>(
+                  `SELECT "id", "role", "result" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2
+                    AND "id" = ANY($3::text[])`, [value.sessionId, value.turnId, [analystTaskId, scoutATaskId]],
+                )
+                const analystRow = persisted.rows.find(row => row.id === analystTaskId)
+                const scoutRow = persisted.rows.find(row => row.id === scoutATaskId)
+                const analystResult = record(analystRow?.result), sourceResult = record(scoutRow?.result)
+                const storedReport = record(analystResult?.taskGraphVerificationReport)
+                const parsedReport = parseStoredTaskGraphVerificationReport(storedReport, ["source-coverage", "finding-count"], ["scout-a", "scout-b"])
+                const bindings = Array.isArray(parsedReport?.dependencyBindings) ? parsedReport.dependencyBindings.map(record) : []
+                if (!analystRow || !analystResult || !sourceResult || !storedReport || !parsedReport || bindings.length !== 2) {
+                  throw new Error("Empty Analyst durable v2 report or Scout source was unavailable for readback tampering")
+                }
+                const expectReadbackRejectsMutation = async (taskId: string, original: RecordValue, changed: RecordValue) => {
+                  const update = async (result: RecordValue) => pool!.query(
+                    `UPDATE "sub_agent_tasks" SET "result" = $1::jsonb WHERE "id" = $2 AND "sessionId" = $3 AND "turnId" = $4`,
+                    [JSON.stringify(result), taskId, value.sessionId, value.turnId],
+                  )
+                  expect((await update(changed)).rowCount).toBe(1)
+                  try {
+                    await expect(taskGraphCommandPort.readCurrent(readScope)).rejects.toThrow("task_graph_verification_report_invalid")
+                  } finally {
+                    expect((await update(original)).rowCount).toBe(1)
+                  }
+                }
+                const structuredAnalyst = record(analystResult.structuredResult)
+                if (!structuredAnalyst) throw new Error("Empty Analyst structured result was not an object")
+                await expectReadbackRejectsMutation(analystTaskId, analystResult, {
+                  ...analystResult, structuredResult: { ...structuredAnalyst, summary: "Tampered empty Analyst result" },
+                })
+                const changedBindings = bindings.map((binding, index) => index === 0 && binding
+                  ? { ...binding, taskId: `wrong-tenant-${binding.taskId}` } : binding)
+                await expectReadbackRejectsMutation(analystTaskId, analystResult, {
+                  ...analystResult, taskGraphVerificationReport: { ...storedReport, dependencyBindings: changedBindings },
+                })
+                const sourceStructured = record(sourceResult.structuredResult)
+                const sourceCandidates = Array.isArray(sourceStructured?.candidates) ? sourceStructured.candidates.map(record) : []
+                if (!sourceStructured || sourceCandidates.length < 1) throw new Error("Empty Analyst Scout source did not have candidates to tamper")
+                const changedCandidates = sourceCandidates.map((candidate, index) => index === 0 && candidate
+                  ? { ...candidate, jobId: `stale-${String(candidate.jobId)}` } : candidate)
+                await expectReadbackRejectsMutation(scoutATaskId, sourceResult, {
+                  ...sourceResult, structuredResult: { ...sourceStructured, candidates: changedCandidates },
+                })
+              }
+              yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final",
+                response: taskScopedOrphan ? "The empty Analyst result could not be verified because a task-scoped tool event was unpaired"
+                  : emptyAnalyst ? "The empty Analyst result did not satisfy either Scout coverage or finding minimum"
+                    : "Both Scout sources passed the current union checks" }) }
               yield { type: "completed", finishReason: "stop" }
               return
             }
@@ -14266,6 +14385,65 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                   })
                   expect(verification?.evidenceDigest).toMatch(/^[a-f0-9]{64}$/)
                   expect(verification?.resultDigest).toMatch(/^[a-f0-9]{64}$/)
+                }
+                if (emptyAnalyst) {
+                  if (taskScopedOrphan) {
+                    const callId = `p3-empty-analyst-prior-call:${value.suffix}`
+                    const receiptScope = {
+                      userId: task.userId, sessionId: task.sessionId, turnId: task.turnId!, rootTaskId: task.rootTaskId,
+                      parentTaskId: task.parentTaskId!, taskId: task.id, attemptCount: task.attemptCount,
+                    }
+                    expect(await hasNoCurrentAttemptTaskGraphToolReceipts(pool!, receiptScope)).toBe(true)
+                    const priorBoundary = await pool!.query<{ startSequence: string; closeSequence: string }>(
+                      `SELECT startedEvent."sequence"::text AS "startSequence", closedEvent."sequence"::text AS "closeSequence"
+                       FROM "agent_events" AS startedEvent JOIN "agent_events" AS closedEvent
+                         ON closedEvent."sessionId" = startedEvent."sessionId" AND closedEvent."turnId" = startedEvent."turnId"
+                           AND closedEvent."taskId" = startedEvent."taskId"
+                       WHERE startedEvent."id" = $1 AND startedEvent."taskId" = $2 AND startedEvent."type" = 'step.started'
+                         AND closedEvent."id" = $3 AND closedEvent."type" = 'step.completed'`,
+                      ["p3-empty-analyst-prior-start:" + value.suffix, task.id, "p3-empty-analyst-prior-close:" + value.suffix])
+                    const boundary = priorBoundary.rows[0]
+                    if (!boundary) throw new Error("Empty Analyst prior Step boundary was unavailable")
+                    const spoofSequence = (BigInt(boundary.startSequence) + 2n).toString()
+                    if (BigInt(spoofSequence) >= BigInt(boundary.closeSequence)) throw new Error("Empty Analyst prefix spoof has no bounded sequence slot")
+                    const realPrefix = "task:" + task.id + ":tool-lifecycle:" + callId + ":"
+                    const sameLengthFakePrefix = "task:" + task.id + ":fool-lifecycle:" + callId + ":"
+                    expect(sameLengthFakePrefix).toHaveLength(realPrefix.length)
+                    const fakeEventId = "p3-empty-analyst-prefix-spoof:" + value.suffix
+                    const fakePayload = { toolCallId: callId, toolName: "jobs.search", toolVersion: "1", status: "started", input: { target: "prior-attempt" } }
+                    await pool!.query(`INSERT INTO "agent_events"
+                      ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload")
+                      VALUES ($1, $2, $3, NULL, $4, $5, 'tool_call.started', 'subagent', $6, NULL, $7, $8::jsonb)`, [
+                      fakeEventId, value.sessionId, value.turnId, task.id, spoofSequence, callId,
+                      sameLengthFakePrefix + "started:" + "a".repeat(24), JSON.stringify(fakePayload),
+                    ])
+                    try {
+                      expect(await hasNoCurrentAttemptTaskGraphToolReceipts(pool!, receiptScope)).toBe(false)
+                    } finally {
+                      const removed = await pool!.query(`DELETE FROM "agent_events" WHERE "id" = $1 AND "sessionId" = $2
+                        AND "turnId" = $3 AND "taskId" = $4 RETURNING "id"`, [fakeEventId, value.sessionId, value.turnId, task.id])
+                      expect(removed.rowCount).toBe(1)
+                    }
+                    expect(await hasNoCurrentAttemptTaskGraphToolReceipts(pool!, receiptScope)).toBe(true)
+                    const currentPayload = { toolCallId: callId, toolName: "jobs.search", toolVersion: "1", status: "started", input: { target: "current-attempt" } }
+                    const digest = createHash("sha256").update(JSON.stringify(currentPayload)).digest("hex").slice(0, 24)
+                    const currentSequence = await pool!.query<{ eventSequence: string }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1
+                      WHERE "id" = $1 AND "userId" = $2 RETURNING "eventSequence"`, [value.sessionId, value.userId])
+                    const sequence = currentSequence.rows[0]?.eventSequence
+                    if (!sequence) throw new Error("Empty Analyst current-attempt event could not reserve a sequence")
+                    await pool!.query(`INSERT INTO "agent_events"
+                      ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload")
+                      VALUES ($1, $2, $3, NULL, $4, $5, 'tool_call.started', 'subagent', $6, NULL, $7, $8::jsonb)`, [
+                      `tool-lifecycle:task:${task.id}:${callId}:started:${digest}`, value.sessionId, value.turnId, task.id, sequence, callId,
+                      `task:${task.id}:tool-lifecycle:${callId}:started:${digest}`, JSON.stringify(currentPayload),
+                    ])
+                    expect(await hasNoCurrentAttemptTaskGraphToolReceipts(pool!, receiptScope)).toBe(false)
+                  }
+                  const emptyResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
+                    findings: [], evidence: [], summary: "No candidates were returned for analysis" }
+                  yield { type: "text_delta", text: JSON.stringify(emptyResult) }
+                  yield { type: "completed", finishReason: "stop" }
+                  return
                 }
               }
               expect(request.tools.map(tool => record(tool)?.name)).toContain("jobs.search")
@@ -14328,14 +14506,73 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     }
     await executeChild(scoutATaskId, `p3-scout-union-a-${value.suffix}`)
     await executeChild(scoutBTaskId, `p3-scout-union-b-${value.suffix}`)
+    if (taskScopedOrphan) {
+      const orphanToolCallId = `p3-empty-analyst-prior-call:${value.suffix}`
+      const priorStepId = `p3-empty-analyst-prior-step:${value.suffix}`
+      const priorItemId = `p3-empty-analyst-prior-item:${value.suffix}`
+      const advancedAttempt = await pool!.query(`UPDATE "sub_agent_tasks" SET "attemptCount" = 1
+        WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "status" = 'queued' AND "attemptCount" = 0`,
+      [analystTaskId, value.sessionId, value.turnId])
+      expect(advancedAttempt.rowCount).toBe(1)
+      const reserved = await pool!.query<{ eventSequence: string }>(`UPDATE "agent_sessions" AS session SET "eventSequence" =
+          GREATEST(session."eventSequence", COALESCE((SELECT MAX(event."sequence") FROM "agent_events" AS event WHERE event."sessionId" = session."id"), 0)) + 5
+        WHERE session."id" = $1 AND session."userId" = $2 RETURNING session."eventSequence"`, [value.sessionId, value.userId])
+      const closeSequence = reserved.rows[0]?.eventSequence
+      if (!closeSequence) throw new Error("Empty Analyst prior attempt could not reserve event boundary sequences")
+      const closeAt = BigInt(closeSequence), startAt = closeAt - 4n, lifecycleStartAt = closeAt - 3n, lifecycleEndAt = closeAt - 1n
+      const priorOrdinalResult = await pool!.query<{ ordinal: number }>(`SELECT COALESCE(MAX("ordinal"), 0) + 1 AS "ordinal"
+        FROM "agent_steps" WHERE "turnId" = $1 AND "sessionId" = $2`, [value.turnId, value.sessionId])
+      const priorOrdinal = priorOrdinalResult.rows[0]?.ordinal
+      if (!Number.isSafeInteger(priorOrdinal)) throw new Error("Empty Analyst prior attempt step ordinal was invalid")
+      await pool!.query(`INSERT INTO "agent_steps"
+        ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status", "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot", "startedAt", "completedAt")
+        VALUES ($1, $2, $3, $4, $5, 1, 'completed', 0, '[]'::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+      [priorStepId, value.sessionId, value.turnId, analystTaskId, priorOrdinal])
+      await pool!.query(`INSERT INTO "agent_items"
+        ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "revision", "content", "updatedAt")
+        VALUES ($1, $2, $3, $4, $5, 'tool_call', 'completed', 0, $6::jsonb, CURRENT_TIMESTAMP)`,
+      [priorItemId, value.sessionId, value.turnId, priorStepId, analystTaskId,
+        JSON.stringify({ toolCallId: orphanToolCallId, toolName: "jobs.search", toolVersion: "1", status: "completed", errorCode: null, input: { target: "prior-attempt" } })])
+      const priorResultId = `p3-empty-analyst-prior-result:${value.suffix}`
+      const lifecycleOutput = { jobs: [] }
+      await pool!.query(`INSERT INTO "agent_items"
+        ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "revision", "content", "updatedAt")
+        VALUES ($1, $2, $3, $4, $5, 'tool_result', 'completed', 0, $6::jsonb, CURRENT_TIMESTAMP)`,
+      [priorResultId, value.sessionId, value.turnId, priorStepId, analystTaskId,
+        JSON.stringify({ toolCallId: orphanToolCallId, output: lifecycleOutput, errorCode: null })])
+      const lifecyclePayload = { toolCallId: orphanToolCallId, toolName: "jobs.search", toolVersion: "1", status: "started", input: { target: "prior-attempt" } }
+      const lifecycleDigest = createHash("sha256").update(JSON.stringify(lifecyclePayload)).digest("hex").slice(0, 24)
+      const completedLifecyclePayload = { toolCallId: orphanToolCallId, toolName: "jobs.search", toolVersion: "1", status: "completed", output: lifecycleOutput, errorCode: null }
+      const completedLifecycleDigest = createHash("sha256").update(JSON.stringify(completedLifecyclePayload)).digest("hex").slice(0, 24)
+      const priorEvents = [
+        { id: `p3-empty-analyst-prior-start:${value.suffix}`, sequence: startAt.toString(), type: "step.started",
+          correlationId: priorStepId, key: `task:${analystTaskId}:event:step-started:${priorStepId}`,
+          payload: { stepId: priorStepId, ordinal: priorOrdinal, taskId: analystTaskId } },
+        { id: `tool-lifecycle:task:${analystTaskId}:${orphanToolCallId}:started:${lifecycleDigest}`, sequence: lifecycleStartAt.toString(),
+          type: "tool_call.started", correlationId: orphanToolCallId,
+          key: `task:${analystTaskId}:tool-lifecycle:${orphanToolCallId}:started:${lifecycleDigest}`, payload: lifecyclePayload },
+        { id: `tool-lifecycle:task:${analystTaskId}:${orphanToolCallId}:completed:${completedLifecycleDigest}`, sequence: lifecycleEndAt.toString(),
+          type: "tool_call.completed", correlationId: orphanToolCallId,
+          key: `task:${analystTaskId}:tool-lifecycle:${orphanToolCallId}:completed:${completedLifecycleDigest}`, payload: completedLifecyclePayload },
+        { id: `p3-empty-analyst-prior-close:${value.suffix}`, sequence: closeSequence, type: "step.completed",
+          correlationId: priorStepId, key: `task:${analystTaskId}:event:step-completed:${priorStepId}`,
+          payload: { stepId: priorStepId, status: "completed", toolCallCount: 1, taskId: analystTaskId } },
+      ]
+      for (const event of priorEvents) await pool!.query(`INSERT INTO "agent_events"
+        ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload")
+        VALUES ($1, $2, $3, NULL, $4, $5, $6, 'subagent', $7, NULL, $8, $9::jsonb)`, [
+        event.id, value.sessionId, value.turnId, analystTaskId, event.sequence, event.type, event.correlationId, event.key, JSON.stringify(event.payload),
+      ])
+    }
     await executeChild(analystTaskId, `p3-scout-union-analyst-${value.suffix}`)
-    await waitForTurnStatus(pool!, value.turnId, "completed", 45_000, waitKey)
+    await waitForTurnStatus(pool!, value.turnId, emptyAnalyst ? "failed" : "completed", 45_000, waitKey)
     expect(finalWaitReport).not.toBeNull()
     const turn = await pool!.query<{ status: string; rootTaskId: string | null; finalResponse: string | null }>(
       `SELECT "status", "rootTaskId", "finalResponse" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
       [value.turnId, value.sessionId, value.userId],
     )
-    expect(turn.rows[0]).toMatchObject({ status: "completed", finalResponse: expect.stringContaining("Both Scout sources passed") })
+    expect(turn.rows[0]?.status).toBe(emptyAnalyst ? "failed" : "completed")
+    if (!emptyAnalyst) expect(turn.rows[0]?.finalResponse).toContain("Both Scout sources passed")
     const tasks = await pool!.query<{ id: string; goal: string; status: string; result: unknown }>(
       `SELECT "id", "goal", "status", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "parentTaskId" = $3`,
       [value.turnId, value.sessionId, turn.rows[0]?.rootTaskId],
@@ -14343,14 +14580,21 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const analyst = tasks.rows.find(task => task.id === analystTaskId)
     const report = record(record(analyst?.result)?.taskGraphVerificationReport)
     expect(tasks.rows).toHaveLength(3)
-    expect(analyst).toMatchObject({ status: "completed" })
-    expect(report?.dependencyBindings).toHaveLength(2)
-    const bindings = Array.isArray(report?.dependencyBindings) ? report.dependencyBindings.map(record) : []
-    expect(bindings.map(binding => binding?.nodeKey)).toEqual(["scout-a", "scout-b"])
-    expect(bindings.map(binding => binding?.taskId)).toEqual([scoutATaskId, scoutBTaskId])
-    for (const binding of bindings) {
-      expect(binding).toMatchObject({ attemptCount: 1 })
-      for (const field of ["nodeDigest", "resultDigest", "evidenceDigest", "reportDigest"]) expect(binding?.[field]).toMatch(/^[a-f0-9]{64}$/)
+    expect(analyst).toMatchObject({ status: emptyAnalyst ? "failed" : "completed" })
+    if (taskScopedOrphan) {
+      expect(analyst).toMatchObject({ failureReason: "task_graph_verification_unverified" })
+      expect(report).toMatchObject({ verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "canonical_evidence_invalid" })
+      expect(report).not.toHaveProperty("dependencyBindings")
+    } else {
+      if (emptyAnalyst) expect(report).toMatchObject({ verifierVersion: TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met" })
+      expect(report?.dependencyBindings).toHaveLength(2)
+      const bindings = Array.isArray(report?.dependencyBindings) ? report.dependencyBindings.map(record) : []
+      expect(bindings.map(binding => binding?.nodeKey)).toEqual(["scout-a", "scout-b"])
+      expect(bindings.map(binding => binding?.taskId)).toEqual([scoutATaskId, scoutBTaskId])
+      for (const binding of bindings) {
+        expect(binding).toMatchObject({ attemptCount: 1 })
+        for (const field of ["nodeDigest", "resultDigest", "evidenceDigest", "reportDigest"]) expect(binding?.[field]).toMatch(/^[a-f0-9]{64}$/)
+      }
     }
   }, 120_000)
   it("drains a fenced running TaskGraph child after root failure without changing root or Turn", async () => {

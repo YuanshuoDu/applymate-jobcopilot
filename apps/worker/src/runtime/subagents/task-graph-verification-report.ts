@@ -1,6 +1,7 @@
 import type { TaskGraphVerificationReasonCode } from "../planning/task-graph-verification.js"
 
 export const TASK_GRAPH_VERIFIER_VERSION = "agent-harness.v2.task-graph-verifier.v1" as const
+export const TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION = "agent-harness.v2.task-graph-verifier.v2" as const
 const CRITERION_ID = /^[a-z][a-z0-9._-]{0,63}$/
 const DIGEST = /^[a-f0-9]{64}$/
 const MAX_BINDINGS = 8
@@ -11,13 +12,15 @@ const REPORT_REASONS = new Set<TaskGraphVerificationReasonCode>([
   "result_invalid", "result_ambiguous", "result_evidence_unbound", "repair_target_unresolved",
 ])
 
-export type TaskGraphVerificationReport = Readonly<{
-  verifierVersion: typeof TASK_GRAPH_VERIFIER_VERSION
+type TaskGraphVerificationReportFields = Readonly<{
   status: "passed" | "failed" | "unverified"
   reasonCode: TaskGraphVerificationReasonCode
   criteria: readonly Readonly<{ criterionId: string; status: "passed" | "failed" | "unverified"; reasonCode: TaskGraphVerificationReasonCode }>[]
   evidenceDigest: string | null
   resultDigest: string | null
+}>
+export type TaskGraphVerificationReport = TaskGraphVerificationReportFields & Readonly<{
+  verifierVersion: typeof TASK_GRAPH_VERIFIER_VERSION | typeof TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION
 }>
 
 export type TaskGraphVerificationDependencyBinding = Readonly<{
@@ -88,10 +91,13 @@ export function parseStoredTaskGraphVerificationReport(
 ): TaskGraphStoredVerificationReport | undefined {
   if (!record(value)) return undefined
   const hasBindings = Object.hasOwn(value, "dependencyBindings")
+  const version = value.verifierVersion
+  const isEmptyAnalystV2 = version === TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION
   if (!exact(value, hasBindings
     ? "criteria,dependencyBindings,evidenceDigest,reasonCode,resultDigest,status,verifierVersion"
     : "criteria,evidenceDigest,reasonCode,resultDigest,status,verifierVersion")
-    || value.verifierVersion !== TASK_GRAPH_VERIFIER_VERSION
+    || version !== TASK_GRAPH_VERIFIER_VERSION && !isEmptyAnalystV2
+    || isEmptyAnalystV2 && (!hasBindings || value.status !== "failed")
     || !["passed", "failed", "unverified"].includes(String(value.status))
     || typeof value.reasonCode !== "string" || !REPORT_REASONS.has(value.reasonCode as TaskGraphVerificationReasonCode)
     || !(value.status === "unverified"
@@ -119,13 +125,14 @@ export function parseStoredTaskGraphVerificationReport(
   const coherent = repairUnresolved || (status === "passed" ? reasonCode === "criteria_met" && typeof value.resultDigest === "string" && criteria.every(item => item.status === "passed")
     : status === "failed" ? typeof value.resultDigest === "string" && criteria.some(item => item.status === "failed") && reasonCode === criteria.find(item => item.status === "failed")?.reasonCode && criteria.every(item => item.status !== "unverified")
       : criteria.every(item => item.status === "unverified" && item.reasonCode === reasonCode) && (value.evidenceDigest === null ? value.resultDigest === null : typeof value.resultDigest === "string"))
-  if (!coherent) return undefined
+  if (!coherent || isEmptyAnalystV2 && status !== "failed") return undefined
 
   let dependencyBindings: readonly TaskGraphVerificationDependencyBinding[] | undefined
   if (hasBindings) {
     dependencyBindings = parseBindings(value.dependencyBindings)
     if (!dependencyBindings || status === "unverified") return undefined
   }
+  if (isEmptyAnalystV2 && (!dependencyBindings || dependencyBindings.length < 2)) return undefined
   if (expectedDependencyNodeKeys !== undefined) {
     const expected = [...expectedDependencyNodeKeys].sort(compareKeys)
     if (expected.length > MAX_BINDINGS || new Set(expected).size !== expected.length || expected.some(key => !boundedId(key))) return undefined
@@ -135,7 +142,7 @@ export function parseStoredTaskGraphVerificationReport(
     if (status === "unverified" && dependencyBindings) return undefined
   }
   return {
-    verifierVersion: TASK_GRAPH_VERIFIER_VERSION,
+    verifierVersion: version as TaskGraphVerificationReport["verifierVersion"],
     status,
     reasonCode,
     criteria,
