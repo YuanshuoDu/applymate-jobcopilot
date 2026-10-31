@@ -90,6 +90,7 @@ Agent 维护范围内单独处理。
 | 已请求停止 | 在原任务等待系统确认最终状态；请求停止本身不代表已经停止 |
 | 提交结果待核实 | 查看记录和回执，保持结果未知，不自动重试 |
 | 手动记录状态待刷新 | 点击“刷新记录状态”；若仍未确认，先核对记录和雇主回执 |
+| 其他页面已更改申请状态 | 刷新当前申请并核对已有记录；不要将状态冲突当作雇主回执 |
 | 手动记录受到额度或套餐限制 | 处理限制后刷新状态并核对，再决定是否记录；跨标签页仍需自行核对 |
 
 如果登录状态变化时简历还有未保存的编辑，请保留当前标签页，按提示在新标签页
@@ -224,11 +225,11 @@ reviewed rule change; this UI change does not quietly waive them.
 
 Opening links and downloading files never call the manual-record endpoint. The
 manual action records the candidate's report; it is not independent employer
-receipt verification. The existing endpoint writes the job status before its manual
-activity entry, without a shared transaction. A later failure can therefore leave
-the status updated without an activity entry identifying the source; a status alone
-does not prove how the application was recorded. Transactional provenance needs
-a separate backend change.
+receipt verification. The manual-record endpoint conditionally updates the job and
+creates its source activity in the same database transaction. A competing manual
+record or an ineligible current state receives a conflict response; review the
+current application before proceeding. This protection does not make other Agent,
+Worker or status-update paths mutually exclusive with manual recording.
 
 The existing Kanban also permits a user to drag a job to another status, including
 Applied. That changes the status and records a generic status-change activity;
@@ -253,10 +254,11 @@ before sending the request. An accepted request with a failed read, or an unknow
 request outcome, keeps the record action unavailable. The user can refresh the
 record status using a read-only request; a saved status or failed read does not
 prove the recording failed and does not trigger another request. If tab storage is
-unavailable, the action is withheld. This marker is scoped to the browser tab: it
-does not provide cross-tab, cross-device or server-side idempotency, and clearing
-or losing tab storage removes that protection. Check application history and the
-employer receipt before deciding what to do next.
+unavailable, the action is withheld. This marker is scoped to the browser tab and
+can be lost when that tab's storage is cleared. The server's conditional write
+protects competing manual records for the same job, but does not establish a
+global cross-device or cross-Agent lock. Check application history and the employer
+receipt before deciding what to do next.
 
 Resume waits for its current save chain before application-return and shell
 navigation, and keeps the editor open when saving fails. Switching resumes also

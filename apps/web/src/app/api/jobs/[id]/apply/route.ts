@@ -36,20 +36,25 @@ export async function POST(
     return err(message, 403)
   }
 
-  await db.job.update({
-    where: { id },
-    data:  { status: 'applied', workflowState: 'submitted', appliedAt: new Date() },
+  const recorded = await db.$transaction(async tx => {
+    // This conditional write is the decision point for competing manual records.
+    const result = await tx.job.updateMany({
+      where: { id, userId: auth.userId, status: 'saved', workflowState: { in: ['draft', 'ready_to_apply'] }, appliedAt: null },
+      data: { status: 'applied', workflowState: 'submitted', appliedAt: new Date() },
+    })
+    if (result.count !== 1) return false
+    await tx.activity.create({
+      data: {
+        userId: auth.userId,
+        jobId: id,
+        type: 'applied',
+        text: `You applied manually ${job.company} · ${job.role}`,
+        color: '#059669',
+      },
+    })
+    return true
   })
-
-  await db.activity.create({
-    data: {
-      userId: auth.userId,
-      jobId:  id,
-      type:   'applied',
-      text:   `You applied manually ${job.company} · ${job.role}`,
-      color:  '#059669',
-    },
-  })
+  if (!recorded) return err('Application state changed. Refresh the application before recording.', 409)
   await purgeTemporaryGeneratedCoverLetters(auth.userId, id).catch(() => undefined)
 
   return ok({ applied: true })
