@@ -9,7 +9,8 @@ export function taskGraphVerificationCheckDependencyNodeKeys(check: TaskGraphVer
     case "findings_from_scout_dependency":
     case "findings_cover_scout_candidates_gte": return [check.dependencyNodeKey]
     case "findings_from_scout_union":
-    case "findings_cover_scout_candidate_union_gte": return check.dependencyNodeKeys
+    case "findings_cover_scout_candidate_union_gte":
+    case "findings_cover_each_scout_candidates_gte": return check.dependencyNodeKeys
     default: return []
   }
 }
@@ -22,7 +23,8 @@ export function remapTaskGraphVerificationCheckDependencies(
   if (check.kind === "findings_from_scout_dependency" || check.kind === "findings_cover_scout_candidates_gte") {
     return { ...check, dependencyNodeKey: mapping.get(check.dependencyNodeKey) ?? check.dependencyNodeKey }
   }
-  if (check.kind === "findings_from_scout_union" || check.kind === "findings_cover_scout_candidate_union_gte") {
+  if (check.kind === "findings_from_scout_union" || check.kind === "findings_cover_scout_candidate_union_gte"
+    || check.kind === "findings_cover_each_scout_candidates_gte") {
     return { ...check, dependencyNodeKeys: check.dependencyNodeKeys.map(key => mapping.get(key) ?? key) }
   }
   return check
@@ -49,6 +51,36 @@ export function evaluateFindingsCoverScoutCandidateUnion(
     || !Number.isSafeInteger(minimumPercent) || minimumPercent < 1 || minimumPercent > 100
     || findings.some(jobId => !candidates.has(jobId))) return "criterion_not_met"
   return findings.length * 100 >= candidates.size * minimumPercent ? "passed" : "criterion_not_met"
+}
+
+/** Requires selected findings to meet the threshold independently for every nonempty Scout. */
+export function evaluateFindingsCoverEachScoutCandidates(
+  keys: readonly string[], findings: readonly string[],
+  parsedDeps: ReadonlyMap<string, TaskGraphVerificationParsedProjection>, minimumPercent: number,
+): "passed" | "criterion_not_met" {
+  const sources = selectedScoutCandidates(keys, parsedDeps)
+  if (!sources || sources.some(source => source.size === 0) || !uniqueFindings(findings)
+    || !Number.isSafeInteger(minimumPercent) || minimumPercent < 1 || minimumPercent > 100
+    || findings.some(jobId => !sources.some(source => source.has(jobId)))) return "criterion_not_met"
+  return sources.every(source => findings.filter(jobId => source.has(jobId)).length * 100 >= source.size * minimumPercent)
+    ? "passed" : "criterion_not_met"
+}
+
+function selectedScoutCandidates(
+  keys: readonly string[], parsedDeps: ReadonlyMap<string, TaskGraphVerificationParsedProjection>,
+): Set<string>[] | undefined {
+  if (keys.length < 2 || keys.length > MAX_SELECTED_SCOUTS
+    || keys.some(key => typeof key !== "string" || key.length < 1 || key.length > 128 || key.trim() !== key)
+    || new Set(keys).size !== keys.length) return undefined
+  const sources: Set<string>[] = []
+  for (const key of keys) {
+    const source = parsedDeps.get(key)
+    if (!source || source.role !== "scout") return undefined
+    const candidates = new Set(source.items.map(item => item.jobId))
+    if (candidates.size !== source.items.length) return undefined
+    sources.push(candidates)
+  }
+  return sources
 }
 
 function unionCandidates(

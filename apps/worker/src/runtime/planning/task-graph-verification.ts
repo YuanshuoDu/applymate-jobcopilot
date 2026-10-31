@@ -9,7 +9,7 @@ import {
 import type { TaskGraphVerificationDependencyEvidence, TaskGraphVerificationEvidenceProjection, TaskGraphVerificationParsedProjection } from "./task-graph-verification-cross-node.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "./task-graph-verification-contract.js"
 import type { TaskGraphVerificationCheck, TaskGraphVerificationContract, TaskGraphVerificationEvaluation, TaskGraphVerificationReasonCode } from "./task-graph-verification-contract.js"
-import { evaluateFindingsCoverScoutCandidateUnion, evaluateFindingsFromScoutUnion } from "./task-graph-verification-scout-union.js"
+import { evaluateFindingsCoverEachScoutCandidates, evaluateFindingsCoverScoutCandidateUnion, evaluateFindingsFromScoutUnion } from "./task-graph-verification-scout-union.js"
 
 export { TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, TASK_GRAPH_VERIFICATION_LIMITS, taskGraphVerificationDependencyNodeKeys, validateTaskGraphVerificationDependencySelectors } from "./task-graph-verification-cross-node.js"
 export type { TaskGraphVerificationCandidateProjection, TaskGraphEmptyDiscoveryReceiptProjection, TaskGraphVerificationDependencyEvidence, TaskGraphVerificationDependencyGraphNode, TaskGraphVerificationEvidenceProjection, TaskGraphVerificationFindingProjection } from "./task-graph-verification-cross-node.js"
@@ -67,7 +67,8 @@ function unverifiedEvaluation(contract: TaskGraphVerificationContract, reasonCod
 type CheckEvaluation = "passed" | "criterion_not_met" | "reported_score_below_minimum"
 function evaluateCheck(check: TaskGraphVerificationCheck, p: TaskGraphVerificationParsedProjection, verifiedEmptyDiscovery: boolean): CheckEvaluation {
   if (check.kind === "findings_from_scout_dependency" || check.kind === "findings_cover_scout_candidates_gte"
-    || check.kind === "findings_from_scout_union" || check.kind === "findings_cover_scout_candidate_union_gte") return "criterion_not_met"
+    || check.kind === "findings_from_scout_union" || check.kind === "findings_cover_scout_candidate_union_gte"
+    || check.kind === "findings_cover_each_scout_candidates_gte") return "criterion_not_met"
   if (check.kind === "candidate_count_gte") return p.role === "scout" && (p.items.length >= check.minimum || verifiedEmptyDiscovery && p.items.length === 0) ? "passed" : "criterion_not_met"
   if (check.kind === "finding_count_gte") return p.role === "analyst" && (p.items.length >= check.minimum || verifiedEmptyDiscovery && p.items.length === 0) ? "passed" : "criterion_not_met"
   if (check.kind === "evidence_count_gte") return (verifiedEmptyDiscovery ? 1 : p.emptyDiscoveryDigest ? 0 : p.evidenceIds.length) >= check.minimum ? "passed" : "criterion_not_met"
@@ -113,6 +114,8 @@ function evaluateTaskGraphVerificationInternal(contract: TaskGraphVerificationCo
             ? evaluateFindingsFromScoutUnion(check.dependencyNodeKeys, findingJobIds, dependencies)
             : check.kind === "findings_cover_scout_candidate_union_gte"
               ? evaluateFindingsCoverScoutCandidateUnion(check.dependencyNodeKeys, findingJobIds, dependencies, check.minimumPercent)
+              : check.kind === "findings_cover_each_scout_candidates_gte"
+                ? evaluateFindingsCoverEachScoutCandidates(check.dependencyNodeKeys, findingJobIds, dependencies, check.minimumPercent)
               : evaluateCheck(check, parsed.value, verifiedEmptyDiscovery)
       return result === "passed" ? { criterionId: c.id, status: "passed" as const, reasonCode: "criteria_met" as const } : { criterionId: c.id, status: "failed" as const, reasonCode: result }
     })

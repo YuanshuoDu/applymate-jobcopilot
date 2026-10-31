@@ -329,6 +329,67 @@ describe("TaskGraph durable evidence verification", () => {
       { criterionId: "membership-cd", status: "passed", reasonCode: "criteria_met" },
     ] })
   })
+
+  it("optionally requires independent coverage for each selected Scout without changing aggregate checks", () => {
+    const coverage = (minimumPercent: number) => validatedContract("analyst", [{ id: "each-source", check: {
+      kind: "findings_cover_each_scout_candidates_gte", dependencyNodeKeys: ["scout-a", "scout-b"], minimumPercent,
+    } }])
+    const disjoint: TaskGraphVerificationDependencyEvidence = new Map([
+      ["scout-a", projectionForScout(["a1", "a2", "a3", "a4"])],
+      ["scout-b", projectionForScout(["b1", "b2", "b3", "b4"])],
+    ])
+    expect(evaluateTaskGraphVerification(coverage(50), projectionForAnalyst(["a1", "a2", "a3", "a4"]), disjoint))
+      .toMatchObject({ status: "failed", reasonCode: "criterion_not_met" })
+    expect(evaluateTaskGraphVerification(coverage(50), projectionForAnalyst(["a1", "a2", "b1", "b2"]), disjoint))
+      .toMatchObject({ status: "passed" })
+
+    const overlap: TaskGraphVerificationDependencyEvidence = new Map([
+      ["scout-a", projectionForScout(["shared-1", "shared-2", "a-only-1", "a-only-2"])],
+      ["scout-b", projectionForScout(["shared-1", "shared-2", "b-only-1", "b-only-2"])],
+    ])
+    expect(evaluateTaskGraphVerification(coverage(50), projectionForAnalyst(["shared-1", "shared-2"]), overlap))
+      .toMatchObject({ status: "passed" })
+    const aggregateOverlap = validatedContract("analyst", [{ id: "aggregate", check: {
+      kind: "findings_cover_scout_candidate_union_gte", dependencyNodeKeys: ["scout-a", "scout-b"], minimumPercent: 50,
+    } }])
+    expect(evaluateTaskGraphVerification(aggregateOverlap, projectionForAnalyst(["shared-1", "shared-2"]), overlap))
+      .toMatchObject({ status: "failed", reasonCode: "criterion_not_met" })
+    const third: TaskGraphVerificationDependencyEvidence = new Map([
+      ["scout-a", projectionForScout(["one", "two", "three"])],
+      ["scout-b", projectionForScout(["other"])],
+    ])
+    expect(evaluateTaskGraphVerification(coverage(33), projectionForAnalyst(["one", "other"]), third))
+      .toMatchObject({ status: "passed" })
+    expect(evaluateTaskGraphVerification(coverage(34), projectionForAnalyst(["one", "other"]), third))
+      .toMatchObject({ status: "failed" })
+    expect(evaluateTaskGraphVerification(coverage(1), projectionForAnalyst(["a1"]), new Map([
+      ["scout-a", projectionForScout(["a1"])], ["scout-b", projectionForScout([])],
+    ]))).toMatchObject({ status: "failed" })
+    expect(evaluateTaskGraphVerification(coverage(1), projectionForAnalyst(["a1", "outsider"]), new Map([
+      ["scout-a", projectionForScout(["a1"])], ["scout-b", projectionForScout(["b1"])],
+    ]))).toMatchObject({ status: "failed" })
+    expect(evaluateTaskGraphVerification(coverage(1), projectionForAnalyst([]), new Map([
+      ["scout-a", projectionForScout(["a1"])], ["scout-b", projectionForScout(["b1"])],
+    ]))).toMatchObject({ status: "failed" })
+    expect(evaluateTaskGraphVerification(coverage(1), projectionForAnalyst(["a1"])))
+      .toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_invalid" })
+    expect(evaluateTaskGraphVerification(coverage(1), projectionForAnalyst(["a1"]), new Map([
+      ["scout-a", projectionForScout(["a1"])], ["scout-b", analystProjection()],
+    ]))).toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_invalid" })
+    const misboundScout: TaskGraphVerificationEvidenceProjection = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "scout",
+      candidates: [{ jobId: "b1", evidenceIds: ["read:job:wrong"] }], evidenceIds: ["read:job:wrong"],
+    }
+    expect(evaluateTaskGraphVerification(coverage(1), projectionForAnalyst(["a1"]), new Map([
+      ["scout-a", projectionForScout(["a1"])], ["scout-b", misboundScout],
+    ]))).toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_invalid" })
+
+    const aggregate = validatedContract("analyst", [{ id: "aggregate", check: {
+      kind: "findings_cover_scout_candidate_union_gte", dependencyNodeKeys: ["scout-a", "scout-b"], minimumPercent: 50,
+    } }])
+    expect(evaluateTaskGraphVerification(aggregate, projectionForAnalyst(["a1", "a2", "a3", "a4"]), disjoint))
+      .toMatchObject({ status: "passed" })
+  })
   it("keeps empty membership vacuous and leaves minimum counts as independent checks", () => {
     const typed = validatedContract("analyst", [
       { id: "minimum-findings", check: { kind: "finding_count_gte", minimum: 1 } },
