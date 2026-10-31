@@ -114,7 +114,8 @@ function fixture(options: FixtureOptions = {}) {
     if (sql.includes('FROM "agent_wait_conditions" AS wait JOIN "agent_steps" AS step') && sql.includes('wait."status" = \'waiting\'')) return options.registeredWait
       ? { rows: [{ ...wait, attempt: task.attemptCount, ordinal: 4, latestOrdinal: 4, stepStatus: options.waitStepStatus ?? "waiting_for_tool" }], rowCount: 1 } : { rows: [], rowCount: 0 }
     if (sql.includes('started."createdAt"') && sql.includes("FOR UPDATE OF task, step, call")) return options.preinsertWaitCall ? { rows: [{
-      eventId: "start-event", createdAt: new Date(checkedAt.getTime() - 5_000), role: task.role, allowedActions: ["wait_subagents"], stepId: "step-1",
+      eventId: "start-event", eventIdempotencyKey: `task:${task.id}:event:tool-started:wait-call-1`,
+      createdAt: new Date(checkedAt.getTime() - 5_000), role: task.role, allowedActions: ["wait_subagents"], stepId: "step-1",
       content: { toolCallId: "wait-call-1", toolName: "wait_subagents", toolVersion: "1", input: { idempotencyKey: "wait-key-1", mode: "any", taskIds: ["target-1"], timeoutMs: 10_000 } },
     }], rowCount: 1 } : { rows: [], rowCount: 0 }
     if (sql.includes('FROM "agent_items" AS call')) return { rows: [{ status: "started", content: {

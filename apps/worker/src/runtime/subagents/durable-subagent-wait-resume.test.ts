@@ -1,4 +1,7 @@
-import { describe, expect, it } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
+
+const sourceLifecycle = vi.hoisted(() => ({ reconcile: vi.fn() }))
+vi.mock("./child-resume-source-wait-lifecycle.js", () => ({ reconcileChildWaitSourceLifecycle: sourceLifecycle.reconcile }))
 
 import { commitDurableSubagentWaitResume, loadDurableSubagentWaitResume } from "./durable-subagent-wait-resume.js"
 
@@ -69,6 +72,9 @@ function fixture(options: { consumed?: boolean; nextStep?: boolean; laterOrdinal
 }
 
 describe("durable child wait resume", () => {
+  beforeEach(() => {
+    sourceLifecycle.reconcile.mockResolvedValue({ state: "waiting", toolCallId: "call-1", callItemId: "item-call-1", resultItemId: "item-result-1" })
+  })
   it("loads the exact resolved outcome and original result item without consuming it", async () => {
     const fake = fixture()
     await expect(loadDurableSubagentWaitResume(fake.pool as never, lease, now)).resolves.toMatchObject({
@@ -193,6 +199,21 @@ describe("durable child wait resume", () => {
     await expect(loadDurableSubagentWaitResume(arbitraryRecovery.pool as never, lease, now)).rejects.toMatchObject({ code: "wait_scope_error" })
   })
 
+  it("fences acknowledgement by the current owner after a same-attempt reissue", async () => {
+    const reissuedLease = { ...lease, ownerId: "expired-child-wait-worker-2" }
+    const reissued = fixture({ ownerId: reissuedLease.ownerId })
+    await expect(commitDurableSubagentWaitResume(reissued.pool as never, reissuedLease, { waitId: "wait-1", stepId: "step-1", nextStepOrdinal: 5, now }))
+      .resolves.toBe(true)
+
+    sourceLifecycle.reconcile.mockClear()
+    const stale = fixture({ ownerId: reissuedLease.ownerId })
+    const oldLease = { ...lease, ownerId: "expired-child-wait-worker-1" }
+    await expect(commitDurableSubagentWaitResume(stale.pool as never, oldLease, { waitId: "wait-1", stepId: "step-1", nextStepOrdinal: 5, now }))
+      .rejects.toMatchObject({ code: "wait_scope_error" })
+    expect(sourceLifecycle.reconcile).not.toHaveBeenCalled()
+    expect(stale.state.acknowledgements).toBe(0)
+  })
+
   it("acknowledges only after the same-attempt next step and immutable waiting receipt exist", async () => {
     const missingStep = fixture({ nextStep: false })
     await expect(commitDurableSubagentWaitResume(missingStep.pool as never, lease, { waitId: "wait-1", stepId: "step-1", nextStepOrdinal: 5, now }))
@@ -205,6 +226,7 @@ describe("durable child wait resume", () => {
       && call.sql.includes(`session."status" NOT IN ('aborted', 'archived')`))).toBe(true)
     expect(fake.state.consumedAt).toEqual(now)
     expect(fake.state.acknowledgements).toBe(1)
+    expect(sourceLifecycle.reconcile).toHaveBeenCalled()
     expect(fake.calls.some(call => call.sql.includes("outputMatches"))).toBe(false)
     await expect(commitDurableSubagentWaitResume(fake.pool as never, lease, { waitId: "wait-1", stepId: "step-1", nextStepOrdinal: 5, now })).resolves.toBe(true)
     expect(fake.state.acknowledgements).toBe(1)

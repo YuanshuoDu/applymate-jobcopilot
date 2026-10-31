@@ -9,6 +9,7 @@ import type { TurnEngineStep, TurnEngineToolCall, TurnEngineToolResult, ToolCall
 import type { ChildWaitClaimRecovery } from "../subagents/child-durable-wait-replay.js"
 import { STEERING_MARKER_EVENT_TYPE } from "../context/steering-marker.js"
 import { isSessionPauseRequestedError } from "../session-gate.js"
+import { projectWaitCallCompletionPayload } from "./turn-execution-wait-event-projection.js"
 
 type BatchAppendEntryBase = { correlationId: string; itemId: string | null; payload: unknown; key: string }
 export type BatchAppendEntry =
@@ -29,12 +30,12 @@ export class TurnExecutionEventWriter {
     const id = this.id(`event:${key}`)
     const causationId = this.causationId
     const mappedType = this.options.lifecycle?.mapEventType?.(type) ?? ownerEventType(this.options.identity.kind, type)
-    const event = await this.options.store.appendEvent({
-      identity: this.options.identity, id, itemId, type: mappedType, correlationId, causationId,
-      idempotencyKey: `${this.key}:event:${key}`, payload: toRepositoryJson(payload),
+    const safePayload = type === "item.completed" ? projectWaitCallCompletionPayload(payload, itemId) : toRepositoryJson(payload)
+    const event = await this.options.store.appendEvent({ identity: this.options.identity, id, itemId, type: mappedType, correlationId, causationId,
+      idempotencyKey: `${this.key}:event:${key}`, payload: safePayload,
     })
     this.causationId = event.id
-    await this.notify({ id: event.id, type: mappedType, itemId, correlationId, causationId, payload: toRepositoryJson(payload) })
+    await this.notify({ id: event.id, type: mappedType, itemId, correlationId, causationId, payload: safePayload })
     return event.id
   }
 
@@ -47,7 +48,7 @@ export class TurnExecutionEventWriter {
       if (entry.actor !== undefined && (entry.actor !== "system" || entry.type !== STEERING_MARKER_EVENT_TYPE)) throw new Error("system_actor_requires_steering_marker")
       const id = this.id(`event:${entry.key}`)
       const mappedType = entry.type === STEERING_MARKER_EVENT_TYPE ? STEERING_MARKER_EVENT_TYPE : this.options.lifecycle?.mapEventType?.(entry.type) ?? ownerEventType(this.options.identity.kind, entry.type)
-      const payload = toRepositoryJson(entry.payload)
+      const payload = entry.type === "item.completed" ? projectWaitCallCompletionPayload(entry.payload, entry.itemId) : toRepositoryJson(entry.payload)
       const event = { identity: this.options.identity, id, itemId: entry.itemId, type: mappedType, correlationId: entry.correlationId, causationId, idempotencyKey: `${this.key}:event:${entry.key}`, payload, ...(entry.actor ? { actor: entry.actor } : {}) }
       causationId = id
       return { ...entry, id, mappedType, payload, event, causationId: event.causationId }

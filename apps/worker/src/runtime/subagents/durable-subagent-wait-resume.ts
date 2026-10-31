@@ -1,12 +1,12 @@
-import type pg from "pg"
-
 import type { SubagentLease } from "./types.js"
 import { assertLease, dateValue, DurableSubagentWaitError, object, safeSubagentWaitJson, type DurableSubagentWaitResult } from "./durable-subagent-wait-store.js"
 import { markCanonicalSubagentWaitTargetIds } from "./subagent-wait-structural-ids.js"
 import { resolveDurableWaitOutcome } from "./child-resume-observations.js"
+import { reconcileChildWaitSourceLifecycle } from "./child-resume-source-wait-lifecycle.js"
+import type { TurnEngineQueryClient, TurnEnginePool } from "../turns/turn-engine-owner-sql.js"
 
-type Queryable = Pick<pg.PoolClient, "query">
-type Pool = Pick<pg.Pool, "connect">
+type Queryable = TurnEngineQueryClient
+type Pool = TurnEnginePool
 type Row = Record<string, unknown>
 type ResumeLease = Pick<SubagentLease, "id" | "userId" | "sessionId" | "turnId" | "rootTaskId" | "ownerId" | "attemptCount" | "leaseExpiresAt">
 const OPEN_SESSION = `session."status" NOT IN ('aborted', 'archived')`
@@ -207,24 +207,6 @@ export async function commitDurableSubagentWaitResume(pool: Pool, lease: ResumeL
     if (!exactTargets(ids, targets, lease)) throw new DurableSubagentWaitError("wait_scope_error", "Child wait targets changed scope")
     const currentMatched = targets.filter(target => TERMINAL.has(String(target.status))).map(target => String(target.id))
     const outcome = resolveDurableWaitOutcome(wait, ids, currentMatched, now)
-    const calls = (await client.query<Row>(`SELECT call."content" AS "callContent", call."status" AS "callStatus"
-      FROM "agent_items" AS call JOIN "agent_wait_conditions" AS wait ON wait."id" = $6 AND wait."stepId" = call."stepId"
-      WHERE call."sessionId" = $1 AND call."turnId" = $2 AND call."taskId" = $3 AND call."stepId" = $4
-        AND call."type" = 'tool_call' AND call."content"->>'toolName' = 'wait_subagents'
-        AND wait."parentTaskId" = $3 AND wait."userId" = $5
-      ORDER BY call."createdAt" DESC, call."id" DESC LIMIT 2 FOR UPDATE OF call`,
-    [lease.sessionId, lease.turnId, lease.id, input.stepId, lease.userId, input.waitId])).rows
-    if (calls.length !== 1 || !["started", "streaming", "completed"].includes(String(calls[0].callStatus))) {
-      throw new DurableSubagentWaitError("wait_scope_error", "Resolved wait tool call is unavailable")
-    }
-    const call = object(calls[0].callContent); const toolCallId = matchingWaitCall(call, wait, ids)
-    const results = toolCallId ? (await client.query<Row>(`SELECT "content", "status" FROM "agent_items"
-      WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = $4 AND "type" = 'tool_result' AND "content"->>'toolCallId' = $5
-      ORDER BY "createdAt" DESC, "id" DESC LIMIT 2 FOR SHARE`, [lease.sessionId, lease.turnId, lease.id, input.stepId, toolCallId])).rows : []
-    if (!toolCallId || results.length > 1 || results.length === 1 && (calls[0].callStatus !== "completed"
-      || results[0].status !== "completed" || !validReceipt(results[0].content, wait, ids, toolCallId))) {
-      throw new DurableSubagentWaitError("wait_scope_error", "Wait tool input does not match the acknowledged condition")
-    }
     const laterSteps = (await client.query<Row>(`SELECT "id", "ordinal", "attempt", "status" FROM "agent_steps"
       WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "attempt" = $4 AND "ordinal" > $5
       ORDER BY "ordinal" ASC, "id" ASC LIMIT 2 FOR SHARE`,
@@ -238,6 +220,7 @@ export async function commitDurableSubagentWaitResume(pool: Pool, lease: ResumeL
     if (Number(next.ordinal) !== input.nextStepOrdinal) {
       throw new DurableSubagentWaitError("wait_scope_error", "Acknowledged child wait does not match its first continuation step")
     }
+    await reconcileChildWaitSourceLifecycle(pool, client, lease, wait, input.stepId, outcome, now)
     if (wait.consumedAt !== null && wait.consumedAt !== undefined) return true
     const acknowledged = await client.query(`UPDATE "agent_wait_conditions" SET "consumedAt" = $1, "updatedAt" = $1
       WHERE "id" = $2 AND "userId" = $3 AND "sessionId" = $4 AND "turnId" = $5 AND "parentTaskId" = $6

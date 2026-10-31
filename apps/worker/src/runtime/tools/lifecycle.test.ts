@@ -160,7 +160,7 @@ async function verifiedReadOutput(toolCallId: string) {
         : query.includes("SELECT ref.*")
           ? [stored]
           : query.includes('FROM "agent_items" AS item')
-            ? [{ toolName: "jobs.search", taskAttemptCount: 1, role: "orchestrator", taskType: "root" }]
+            ? [{ toolName: "jobs.search", taskAttemptCount: 1, role: "orchestrator", taskType: "root", ownerKind: "turn" }]
             : []
       return { rows: rows as T[], rowCount: rows.length }
     },
@@ -191,7 +191,7 @@ function durableLifecyclePool(sourceCallId: string) {
       else if (query.includes('FROM "agent_steps"')) rows = [{ id: values[0] }]
       else if (query.includes('FROM "sub_agent_tasks" root')) rows = [{ id: "root-1" }]
       else if (query.includes('FROM "agent_items" AS item')) {
-        if (values[4] === sourceCallId) rows = [{ toolName: "jobs.search", taskAttemptCount: 1, role: "orchestrator", taskType: "root" }]
+        if (values[4] === sourceCallId) rows = [{ toolName: "jobs.search", taskAttemptCount: 1, role: "orchestrator", taskType: "root", ownerKind: "turn" }]
       } else if (query.includes('INSERT INTO "agent_tool_result_references"')) {
         stored = {
           id: values[0], userId: values[1], sessionId: values[2], turnId: values[3], stepId: values[4],
@@ -700,11 +700,13 @@ describe("ToolLifecycle", () => {
 
   it.each(["agent.wait", "wait_subagents"])("preserves a generated wait ID and redacts other fields for %s", async toolName => {
     const sink = new InMemoryToolLifecycleSink()
-    const lifecycle = new ToolLifecycle({ sink })
-    const output = await lifecycle.completed({ ...call, id: `call-${toolName}`, toolName }, durableWaitReceipt)
+    const lifecycle = new ToolLifecycle({ sink, resolveOwner: () => owner })
+    const waitId = durableWaitReceipt.waitId
+    const receipt = { ...durableWaitReceipt, waitId }
+    const output = await lifecycle.completed({ ...call, id: `call-${toolName}`, toolName }, receipt)
 
     expect(output).toMatchObject({
-      waitId: durableWaitReceipt.waitId,
+      waitId,
       status: "ready",
       taskIds: [spawnTaskId],
       matchedTaskIds: [spawnTaskId],
@@ -728,7 +730,7 @@ describe("ToolLifecycle", () => {
 
   it.each(["agent.wait", "wait_subagents"])("fails closed for malformed wait IDs on %s", async toolName => {
     const sink = new InMemoryToolLifecycleSink()
-    const lifecycle = new ToolLifecycle({ sink })
+    const lifecycle = new ToolLifecycle({ sink, resolveOwner: () => owner })
     await expect(lifecycle.completed({ ...call, id: `call-${toolName}-malformed`, toolName }, {
       waitId: "wait-123",
       status: "ready",
@@ -743,12 +745,23 @@ describe("ToolLifecycle", () => {
     { label: "missing", output: { status: "waiting", deadlineAt: "2026-09-29T12:00:00.000Z", matchedTaskIds: [] } },
   ])("rejects a $label wait ID before persisting a waiting receipt", async ({ output }) => {
     const sink = new InMemoryToolLifecycleSink()
-    const lifecycle = new ToolLifecycle({ sink })
+    const lifecycle = new ToolLifecycle({ sink, resolveOwner: () => owner })
 
     await expect(lifecycle.completed({ ...call, toolName: "agent.wait" }, output)).rejects.toMatchObject({
       code: "durable_wait_receipt_invalid",
     })
     expect(sink.events).toHaveLength(0)
+  })
+
+  it("routes the child wait alias by resolved owner provenance", async () => {
+    const sink = new InMemoryToolLifecycleSink()
+    const taskOwner = { kind: "task" } as unknown as ExecutionOwner
+    const lifecycle = new ToolLifecycle({ sink, resolveOwner: () => taskOwner })
+    const rawWaitId = "12345678-1234-4234-9234-123456789012"
+    const output = await lifecycle.completed({ ...call, id: "child-wait", toolName: "wait_subagents" }, { ...durableWaitReceipt, waitId: rawWaitId })
+    expect(output).toMatchObject({ waitId: rawWaitId })
+    await expect(lifecycle.completed({ ...call, id: "child-agent-wait", toolName: "agent.wait" }, durableWaitReceipt))
+      .rejects.toMatchObject({ code: "durable_wait_receipt_invalid" })
   })
 
   it("keeps generic redaction for canonical wait-shaped IDs on unrelated tools", async () => {

@@ -61,7 +61,9 @@ describe("archived durable wait control", () => {
     })
     await expect(lookupArchivedWaitControl({ toolName: "agent.wait", input: request, stepId: "step-1", output: reference, identity, now,
       reader: { readByInvocation }, stepAdmission: "fresh_streaming_root" })).resolves.toEqual({ waitId, status: "ready" })
-    expect(readByInvocation).toHaveBeenCalledTimes(1)
+    await expect(lookupArchivedWaitControl({ toolName: "wait_subagents", input: request, stepId: "step-1", output: reference, identity, now,
+      reader: { readByInvocation }, stepAdmission: "fresh_streaming_root" })).resolves.toEqual({ waitId, status: "ready" })
+    expect(readByInvocation).toHaveBeenCalledTimes(2)
     await expect(lookupArchivedWaitControl({ toolName: "agent.wait", input: request, stepId: "step-1", output: reference, identity, now,
       stepAdmission: "fresh_streaming_root" }))
       .rejects.toMatchObject({ code: "persistence_conflict" })

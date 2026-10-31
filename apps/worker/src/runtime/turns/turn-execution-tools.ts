@@ -3,11 +3,12 @@ import type { ModelStepResult } from "./turn-engine-model.js"
 import { findToolResultObservation, stableJson } from "./turn-engine-replay.js"
 import { toRepositoryJson, TurnEngineError, type TurnEngineResult, type TurnEngineStep, type ToolCallRecovery } from "./turn-engine-types.js"
 import { executeToolWithItems, persistRecoveredToolCall, TurnExecutionEventWriter } from "./turn-execution-events.js"
-import { executionId, type TurnExecutionOptions } from "./turn-execution-types.js"
+import { executionId, type TurnExecutionIdentity, type TurnExecutionOptions } from "./turn-execution-types.js"
 import { assertExecutionAlive } from "./turn-engine-helpers.js"
 import type { StepContext } from "../context/step-context-builder.js"
 import type { SteeringMarkerPayload } from "../context/steering-marker.js"
-import { isDurableWaitId } from "../tools/redaction.js"
+import { isDurableWaitId, prepareDurableWaitOutput } from "../tools/redaction.js"
+import { isCanonicalRawSubagentWaitId } from "../subagents/subagent-wait-structural-ids.js"
 import { nativeReceiptFromToolCall } from "../tools/task-graph-coordination-bridge.js"
 import { isSessionPauseRequestedError } from "../session-gate.js"
 import { executeNativeQuestionTool, nativeQuestionResultCall, PreparedQuestionRetryError, questionWaitResult, recoverableNativeQuestionCalls, rejectQuestionReplay } from "./turn-execution-question.js"
@@ -124,11 +125,11 @@ export async function executeTools(
         }
         await persistChildResumeReplay(options, writer, step, call, replayEntry.content as Record<string, unknown>, sourceResultItemId, now, onToolCallPersisted)
       }
-      const wait = dependencyWaitReceipt(replayed.status === "completed" ? replayed.output : null)
       if (replayed.status === "completed" && (call.name === "agent.wait" || call.name === "wait_subagents")
         && parseArchivedWaitReference(replayed.output)) {
         throw new TurnEngineError("persistence_conflict", "Archived wait replay is unavailable")
       }
+      const wait = replayed.status === "completed" ? dependencyWaitReceipt(replayed.output, call.name, options.identity.kind) : null
       if (wait && !hasResolvedWaitOutcome(snapshot, wait.waitId, replayed.input)) return { wait: { status: "waiting_for_dependency", waitId: wait.waitId, stepCount: 0, toolCallCount: 0 }, snapshot, steeringMarkerState: markerState }
       if (hasNativeCoordinationReceipt(call.name, replayed.status, replayed.output)) snapshot = await options.refreshTaskGraphAfterPlan?.(snapshot) ?? snapshot
       continue
@@ -156,8 +157,9 @@ export async function executeTools(
     if (questionCall) return { wait: await questionWaitResult(options, questionCall.stepId, questionCall.toolCallId, now, 0, 0), snapshot, steeringMarkerState: markerState }
     if (call.name === "agent.plan" && result.status === "completed" && hasAcceptedTaskGraphPlan(result.output)) snapshot = await options.refreshTaskGraphAfterPlan?.(snapshot) ?? snapshot
     else if (hasNativeCoordinationReceipt(call.name, result.status, result.output)) snapshot = await options.refreshTaskGraphAfterPlan?.(snapshot) ?? snapshot
-    else if (call.name === "agent.wait" && result.status === "completed" && isInlineReadyWait(result.output)) snapshot = await options.refreshTaskGraphAfterReadyWait?.(snapshot) ?? snapshot
-    const wait = dependencyWaitReceipt(result.status === "completed" ? result.output : null)
+    else if ((call.name === "agent.wait" || call.name === "wait_subagents") && options.identity.kind === "turn"
+      && result.status === "completed" && isInlineReadyWait(result.output)) snapshot = await options.refreshTaskGraphAfterReadyWait?.(snapshot) ?? snapshot
+    const wait = result.status === "completed" ? dependencyWaitReceipt(result.output, call.name, options.identity.kind) : null
     if (wait) return { wait: { status: "waiting_for_dependency", waitId: wait.waitId, stepCount: 0, toolCallCount: 0 }, snapshot, steeringMarkerState: markerState }
   }
   return { wait: null, snapshot, steeringMarkerState: markerState }
@@ -222,13 +224,22 @@ function hasAcceptedTaskGraphPlan(value: unknown): boolean {
   return status === "accepted" || status === "duplicate"
 }
 function isInlineReadyWait(value: unknown): boolean { return Boolean(value && typeof value === "object" && !Array.isArray(value) && (value as Record<string, unknown>).status === "ready") }
-function dependencyWaitReceipt(value: unknown): DependencyWaitReceipt | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null
-  const record = value as Record<string, unknown>
+function dependencyWaitReceipt(value: unknown, toolName: string, ownerKind: TurnExecutionIdentity["kind"]): DependencyWaitReceipt | null {
+  if (toolName !== "agent.wait" && toolName !== "wait_subagents") return null
+  let safeValue: unknown
+  try { safeValue = prepareDurableWaitOutput(value, toolName, ownerKind).safe }
+  catch { throw new TurnEngineError("invalid_output", "Durable wait receipt is invalid") }
+  if (!safeValue || typeof safeValue !== "object" || Array.isArray(safeValue)) throw new TurnEngineError("invalid_output", "Durable wait receipt is invalid")
+  const record = safeValue as Record<string, unknown>
   if (record.status !== "waiting") return null
-  if (!isDurableWaitId(record.waitId) || typeof record.deadlineAt !== "string" || !record.deadlineAt.trim()
+  const waitId = record.waitId
+  if (!validWaitIdForOwner(toolName, waitId, ownerKind) || typeof record.deadlineAt !== "string" || !record.deadlineAt.trim()
     || !Array.isArray(record.matchedTaskIds) || !record.matchedTaskIds.every(item => typeof item === "string" && item.trim().length > 0)) {
     throw new TurnEngineError("invalid_output", "Durable wait receipt is invalid")
   }
-  return { waitId: record.waitId, deadlineAt: record.deadlineAt, matchedTaskIds: record.matchedTaskIds }
+  return { waitId, deadlineAt: record.deadlineAt, matchedTaskIds: record.matchedTaskIds }
+}
+function validWaitIdForOwner(toolName: string, value: unknown, ownerKind: TurnExecutionIdentity["kind"]): value is string {
+  if (ownerKind === "turn") return (toolName === "agent.wait" || toolName === "wait_subagents") && isDurableWaitId(value)
+  return ownerKind === "task" && toolName === "wait_subagents" && isCanonicalRawSubagentWaitId(value)
 }
