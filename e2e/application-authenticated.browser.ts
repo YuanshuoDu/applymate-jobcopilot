@@ -116,9 +116,10 @@ test('real credentials carry a synthetic application through manual recording', 
   await expect(page.locator('.resume-top-save')).toContainText(/Saved just now|刚刚保存/)
 
   const requireFixture = createRequire(path.resolve('e2e/application-authenticated.browser.ts'))
-  const { seedSyntheticAudit, assertManualState, closeFixtureDb } = requireFixture('./application-authenticated-audit.cjs') as {
+  const { seedSyntheticAudit, assertManualState, readManualAppliedAt, closeFixtureDb } = requireFixture('./application-authenticated-audit.cjs') as {
     seedSyntheticAudit: (jobId: string, resumeId: string) => Promise<void>
     assertManualState: (jobId: string, resumeId: string, status: 'saved' | 'applied') => Promise<void>
+    readManualAppliedAt: (jobId: string, resumeId: string) => Promise<string>
     closeFixtureDb: () => Promise<void>
   }
   try {
@@ -198,10 +199,57 @@ test('real credentials carry a synthetic application through manual recording', 
     expect(employer.url()).toBe(fixture.url)
     await employer.close()
     await assertManualState(job.id, syntheticResume.id, 'saved')
+    const plansResponse = await page.request.get('/api/plans')
+    expect(plansResponse.status()).toBe(200)
+    const plans = await plansResponse.json() as { plans: { key: string; entitlements: string[] }[] }
+    expect(plans.plans.find(plan => plan.key === 'free')?.entitlements).toContain('applications:5/month')
 
-    const manual = page.waitForResponse(response => response.url().endsWith(`/api/jobs/${job.id}/apply`) && response.request().method() === 'POST')
-    await drawer.getByRole('button', { name: /Record that I submitted on the employer website|记录我已在雇主网站提交/ }).click()
-    expect((await manual).status()).toBe(200)
+    // Both tabs display the same saved state. Hold only their real network
+    // requests until both are sent, then let A finish before B reaches the API.
+    // Actual overlapping PostgreSQL row locks are covered by the separate PG test.
+    const otherTab = await first.newPage()
+    let releaseFirst = () => {}
+    let releaseSecond = () => {}
+    const firstGate = new Promise<void>(resolve => { releaseFirst = resolve })
+    const secondGate = new Promise<void>(resolve => { releaseSecond = resolve })
+    let arrivals = 0
+    try {
+      await otherTab.goto(`/?page=jobs&highlight=${job.id}`)
+      const secondDrawer = otherTab.getByRole('dialog')
+      await expect(secondDrawer).toContainText(fixture.title)
+      const recordName = /Record that I submitted on the employer website|记录我已在雇主网站提交/
+      const firstRecord = drawer.getByRole('button', { name: recordName })
+      const secondRecord = secondDrawer.getByRole('button', { name: recordName })
+      await expect(firstRecord).toBeEnabled()
+      await expect(secondRecord).toBeEnabled()
+      const routePattern = `**/api/jobs/${job.id}/apply`
+      await page.route(routePattern, async route => { arrivals++; await firstGate; await route.continue() })
+      await otherTab.route(routePattern, async route => { arrivals++; await secondGate; await route.continue() })
+      const firstResponse = page.waitForResponse(response => response.url().endsWith(`/api/jobs/${job.id}/apply`) && response.request().method() === 'POST')
+      const secondResponse = otherTab.waitForResponse(response => response.url().endsWith(`/api/jobs/${job.id}/apply`) && response.request().method() === 'POST')
+      await Promise.all([firstRecord.click(), secondRecord.click()])
+      await expect.poll(() => arrivals).toBe(2)
+      releaseFirst()
+      expect((await firstResponse).status()).toBe(200)
+      const recordedAt = await readManualAppliedAt(job.id, syntheticResume.id)
+      releaseSecond()
+      const conflict = await secondResponse
+      expect(conflict.status()).toBe(409)
+      expect(await conflict.json()).toEqual({ error: 'Application state changed. Refresh the application before recording.' })
+      await expect(firstRecord).toHaveCount(0)
+      const refreshRecord = secondDrawer.getByRole('button', { name: /Refresh record status|刷新记录状态/ })
+      await expect(refreshRecord).toBeVisible()
+      await expect(secondRecord).toHaveCount(0)
+      await refreshRecord.click()
+      await expect(otherTab.getByText(/A submission record exists, but this request is still unconfirmed|已有提交记录，但仍无法确认是否由本次请求产生/)).toBeVisible()
+      await expect(secondRecord).toHaveCount(0)
+      expect(await readManualAppliedAt(job.id, syntheticResume.id)).toBe(recordedAt)
+      expect(arrivals).toBe(2)
+    } finally {
+      releaseFirst()
+      releaseSecond()
+      await otherTab.close()
+    }
     await assertManualState(job.id, syntheticResume.id, 'applied')
     expect(requests.filter(value => value === `POST /api/jobs/${job.id}/apply`)).toHaveLength(1)
     expect(requests.filter(value => value === 'POST /api/ai/score')).toHaveLength(0)

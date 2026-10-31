@@ -48,4 +48,10 @@ async function assertManualState(jobId, resumeId, expectedStatus) {
   if (job.finalResumeId !== resumeId || job.finalCoverLetterId !== null) throw new Error('Unexpected selected materials')
 }
 
-module.exports = { seedSyntheticAudit, assertManualState, closeFixtureDb: () => db.$disconnect() }
+async function readManualAppliedAt(jobId, resumeId) {
+  await assertManualState(jobId, resumeId, 'applied')
+  const { job } = await checkedFixture(jobId, resumeId)
+  return job.appliedAt.toISOString()
+}
+
+module.exports = { seedSyntheticAudit, assertManualState, readManualAppliedAt, closeFixtureDb: () => db.$disconnect() }
