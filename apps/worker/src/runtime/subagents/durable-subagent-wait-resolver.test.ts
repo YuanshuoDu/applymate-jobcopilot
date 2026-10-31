@@ -12,17 +12,23 @@ const now = new Date("2026-10-22T10:00:00.000Z")
 
 type DispatchFixture = { id: string; topic: string; aggregateId: string; idempotencyKey: string; payload: Record<string, unknown>; attemptCount: number; publishedAt: Date | null }
 
-function fixture(input: { targetStatus?: string; targetIds?: string[]; request?: Record<string, unknown>; deadline?: Date; targetParent?: string; rootOwnedWait?: boolean; includeRootOwnedWaitInCandidateScan?: boolean; batchSize?: number; dispatchRow?: DispatchFixture | null; deadlineCrossesDuringResume?: boolean } = {}) {
+function fixture(input: { targetStatus?: string; targetIds?: string[]; request?: Record<string, unknown>; deadline?: Date; rawDeadlineShiftMs?: number; targetParent?: string; rootOwnedWait?: boolean; includeRootOwnedWaitInCandidateScan?: boolean; batchSize?: number; dispatchRow?: DispatchFixture | null; deadlineCrossesDuringResume?: boolean; deadlineCrossesAfterTargets?: boolean; scheduleUpdateMiss?: boolean; parentDeadlineExpiresDuringSchedule?: boolean } = {}) {
   const calls: { sql: string; params: unknown[] }[] = []
   const queryRowCounts = { candidateSessions: undefined as number | undefined, lockedWaits: undefined as number | undefined }
-  const state = { waitStatus: "waiting", parentStatus: "waiting", matched: [] as string[], outbox: input.dispatchRow ? 1 : 0,
+  const deadlineAt = input.deadline ?? new Date(now.getTime() + 30_000)
+  const state = { waitStatus: "waiting", parentStatus: "waiting", matched: [] as string[], nextReconcileAt: null as string | null, result: null as Record<string, unknown> | null,
+    resolvedAt: null as Date | null, waitUpdatedAt: null as Date | null, parentUpdatedAt: null as Date | null, outbox: input.dispatchRow ? 1 : 0,
     dispatchRow: input.dispatchRow ? structuredClone(input.dispatchRow) : null as DispatchFixture | null }
   let rollbackSnapshot: typeof state | undefined
-  const cloneState = () => ({ ...state, matched: [...state.matched], dispatchRow: state.dispatchRow ? structuredClone(state.dispatchRow) : null })
+  let candidateSnapshot: typeof state | undefined
+  let deadlineReads = 0
+  const cloneState = () => ({ ...state, matched: [...state.matched], result: state.result ? structuredClone(state.result) : null,
+    dispatchRow: state.dispatchRow ? structuredClone(state.dispatchRow) : null })
   const targetIds = input.targetIds ?? ["child-1", "child-2"]
   const wait = {
     id: "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: input.rootOwnedWait ? "root-1" : "parent-1", rootTaskId: "root-1", parentAttempt: 3,
-    targetTaskIds: targetIds, mode: "all", status: state.waitStatus, deadlineAt: input.deadline ?? new Date(now.getTime() + 30_000),
+    targetTaskIds: targetIds, mode: "all", status: state.waitStatus,
+    deadlineAt: new Date(deadlineAt.getTime() + (input.rawDeadlineShiftMs ?? 0)), deadlineAtUtc: deadlineAt.toISOString(),
     matchedTaskIds: [], result: { request: input.request ?? { targetTaskIds: targetIds, mode: "all", timeoutMs: 30_000 } },
   }
   const client = {
@@ -31,7 +37,21 @@ function fixture(input: { targetStatus?: string; targetIds?: string[]; request?:
       if (sql === "BEGIN") { rollbackSnapshot = cloneState(); return { rows: [], rowCount: 1 } }
       if (sql === "ROLLBACK") { if (rollbackSnapshot) Object.assign(state, rollbackSnapshot); rollbackSnapshot = undefined; return { rows: [], rowCount: 1 } }
       if (sql === "COMMIT") { rollbackSnapshot = undefined; return { rows: [], rowCount: 1 } }
+      if (sql === "SAVEPOINT child_wait_candidate") { candidateSnapshot = cloneState(); return { rows: [], rowCount: 1 } }
+      if (sql === "ROLLBACK TO SAVEPOINT child_wait_candidate") { if (candidateSnapshot) Object.assign(state, candidateSnapshot); return { rows: [], rowCount: 1 } }
+      if (sql === "RELEASE SAVEPOINT child_wait_candidate") { candidateSnapshot = undefined; return { rows: [], rowCount: 1 } }
       if (sql.includes("set_config")) return { rows: [], rowCount: 1 }
+      if (sql.startsWith('SELECT clock_timestamp() AS "checkedAt"')) return { rows: [{ checkedAt: now }], rowCount: 1 }
+      if (sql.includes('wait."deadlineAt" <= clock."checkedAt" AS "elapsed"')) {
+        const read = deadlineReads++
+        const elapsed = input.deadlineCrossesAfterTargets ? read > 0 : deadlineAt.getTime() <= now.getTime()
+        const checkedAt = input.deadlineCrossesAfterTargets && read > 0 ? new Date(deadlineAt.getTime() + 1) : now
+        return { rows: [{ elapsed, checkedAt: checkedAt.toISOString() }], rowCount: 1 }
+      }
+      if (sql.includes('parent."absoluteDeadlineAt" IS NOT NULL') && sql.includes('AS "expired"')) {
+        const rows = input.parentDeadlineExpiresDuringSchedule ? [{ expired: true }] : [{ expired: false }]
+        return { rows, rowCount: 1 }
+      }
       if (sql.startsWith('SELECT 1 FROM "sub_agent_tasks"')) {
         const live = !input.deadlineCrossesDuringResume
         return { rows: live ? [{}] : [], rowCount: live ? 1 : 0 }
@@ -43,7 +63,7 @@ function fixture(input: { targetStatus?: string; targetIds?: string[]; request?:
         queryRowCounts.candidateSessions = rows.length
         return { rows, rowCount: rows.length }
       }
-      if (sql.includes('SELECT wait."id", wait."userId"') && sql.includes('FOR UPDATE OF wait, parent')) {
+      if (sql.includes('SELECT wait."id", wait."userId"') && sql.includes('FOR UPDATE OF parent, step, wait')) {
         const excludesRootWait = input.rootOwnedWait && sql.includes('parent."parentTaskId" IS NOT NULL')
         const rows = excludesRootWait ? [] : [wait]
         queryRowCounts.lockedWaits = rows.length
@@ -54,8 +74,18 @@ function fixture(input: { targetStatus?: string; targetIds?: string[]; request?:
         status: index === 1 ? input.targetStatus ?? "completed" : "completed", role: index === 0 ? "writer" : "reviewer",
         result: index === 0 ? { title: "safe" } : { score: 1 }, failureReason: null,
       })), rowCount: targetIds.length }
-      if (sql.includes('UPDATE "agent_wait_conditions"')) { state.waitStatus = String(params[0]); state.matched = JSON.parse(String(params[1])); return { rows: [], rowCount: 1 } }
-      if (sql.includes('UPDATE "sub_agent_tasks"')) { state.parentStatus = "queued"; return { rows: [], rowCount: 1 } }
+      if (sql.includes('UPDATE "agent_wait_conditions"') && sql.includes('SET "nextReconcileAt"')) {
+        if (input.deadlineCrossesDuringResume) return { rows: [], rowCount: 0 }
+        if (input.scheduleUpdateMiss) return { rows: [], rowCount: 0 }
+        state.nextReconcileAt = "db-now-plus-five-seconds"; return { rows: [{ id: "wait-1" }], rowCount: 1 }
+      }
+      if (sql.includes('UPDATE "agent_wait_conditions"')) {
+        if (input.deadlineCrossesAfterTargets && params[0] === "ready") return { rows: [], rowCount: 0 }
+        state.waitStatus = String(params[0]); state.matched = JSON.parse(String(params[1])); state.result = JSON.parse(String(params[2])) as Record<string, unknown>
+        state.resolvedAt = params[3] as Date; state.waitUpdatedAt = params[3] as Date
+        return { rows: [], rowCount: 1 }
+      }
+      if (sql.includes('UPDATE "sub_agent_tasks"')) { state.parentStatus = "queued"; state.parentUpdatedAt = params[0] as Date; return { rows: [], rowCount: 1 } }
       if (sql.includes('FROM "agent_outbox" AS dispatch') && sql.includes('WHERE dispatch."idempotencyKey" = $1')) {
         return { rows: state.dispatchRow ? [structuredClone(state.dispatchRow)] : [], rowCount: state.dispatchRow ? 1 : 0 }
       }
@@ -97,7 +127,7 @@ describe("reconcileDurableSubagentWaits", () => {
     await expect(reconcileDurableSubagentWaits(fake.pool as never, { now, batchSize: 4, ownerId: "recover-1" })).resolves.toEqual({ scanned: 1, resolved: 1, woken: 1 })
     expect(fake.state).toMatchObject({ waitStatus: "ready", parentStatus: "queued", matched: ["child-1", "child-2"], outbox: 1 })
     const sessionLock = fake.calls.findIndex(call => call.sql.includes('SELECT session."id", session."userId"'))
-    const waitLock = fake.calls.findIndex(call => call.sql.includes('FOR UPDATE OF wait, parent'))
+    const waitLock = fake.calls.findIndex(call => call.sql.includes('FOR UPDATE OF parent, step, wait'))
     const targetRead = fake.calls.findIndex(call => call.sql.includes('ANY($1::text[])'))
     const waitUpdate = fake.calls.findIndex(call => call.sql.includes('UPDATE "agent_wait_conditions"'))
     const parentUpdate = fake.calls.find(call => call.sql.includes('UPDATE "sub_agent_tasks"'))
@@ -140,7 +170,10 @@ describe("reconcileDurableSubagentWaits", () => {
     await expect(reconcileDurableSubagentWaits(fake.pool as never, { now })).resolves.toEqual({ scanned: 1, resolved: 0, woken: 0 })
 
     expect(fake.state).toMatchObject({ waitStatus: "waiting", parentStatus: "waiting", outbox: 0 })
-    expect(fake.calls.some(call => call.sql.includes('UPDATE "agent_wait_conditions"'))).toBe(false)
+    const schedule = fake.calls.find(call => call.sql.includes('UPDATE "agent_wait_conditions"'))
+    expect(schedule?.sql).toContain('SET "nextReconcileAt"')
+    expect(schedule?.sql).not.toContain('SET "status"')
+    expect(fake.state.nextReconcileAt).toBe("db-now-plus-five-seconds")
     expect(fake.calls.some(call => call.sql.includes('UPDATE "sub_agent_tasks"'))).toBe(false)
     expect(fake.calls.some(call => call.sql.includes('INSERT INTO "agent_outbox"'))).toBe(false)
     expect(graphMocks.prepare).not.toHaveBeenCalled()
@@ -194,9 +227,9 @@ describe("reconcileDurableSubagentWaits", () => {
     expect(fake.state.dispatchRow?.payload.ownerId).toEqual(expect.any(String))
   })
 
-  it("rolls back wait acknowledgement, parent requeue, and dispatch when its deadline crosses", async () => {
+  it("rolls back one candidate when the parent deadline crosses without failing the whole scan", async () => {
     const fake = fixture({ deadlineCrossesDuringResume: true })
-    await expect(reconcileDurableSubagentWaits(fake.pool as never, { now })).rejects.toMatchObject({ code: "wait_scope_error" })
+    await expect(reconcileDurableSubagentWaits(fake.pool as never, { now })).resolves.toEqual({ scanned: 1, resolved: 0, woken: 0 })
 
     const waitUpdate = fake.calls.find(call => call.sql.includes('UPDATE "agent_wait_conditions"'))
     const parentUpdate = fake.calls.find(call => call.sql.includes('UPDATE "sub_agent_tasks"'))
@@ -204,8 +237,8 @@ describe("reconcileDurableSubagentWaits", () => {
     expect(parentUpdate?.sql).toContain('"absoluteDeadlineAt" IS NULL OR "absoluteDeadlineAt" > clock_timestamp()')
     expect(fake.state).toMatchObject({ waitStatus: "waiting", parentStatus: "waiting", outbox: 0 })
     expect(fake.calls.some(call => call.sql.includes('INSERT INTO "agent_outbox"'))).toBe(true)
-    expect(fake.calls.map(call => call.sql)).toContain("ROLLBACK")
-    expect(fake.calls.map(call => call.sql)).not.toContain("COMMIT")
+    expect(fake.calls.map(call => call.sql)).toContain("ROLLBACK TO SAVEPOINT child_wait_candidate")
+    expect(fake.calls.map(call => call.sql)).toContain("COMMIT")
   })
 
   it("leaves a nonterminal any/all wait parked until a child or timeout resolves it", async () => {
@@ -213,7 +246,70 @@ describe("reconcileDurableSubagentWaits", () => {
     await expect(reconcileDurableSubagentWaits(fake.pool as never, { now })).resolves.toEqual({ scanned: 1, resolved: 0, woken: 0 })
     expect(fake.state.waitStatus).toBe("waiting")
     expect(fake.state.parentStatus).toBe("waiting")
+    expect(fake.state.nextReconcileAt).toBe("db-now-plus-five-seconds")
     expect(fake.state.outbox).toBe(0)
+  })
+
+  it("fails the transaction when a still-live locked wait cannot advance its schedule", async () => {
+    const fake = fixture({ targetStatus: "running", scheduleUpdateMiss: true })
+    await expect(reconcileDurableSubagentWaits(fake.pool as never, { now }))
+      .rejects.toThrow("Child wait schedule update lost its eligibility fence")
+    expect(fake.calls.map(call => call.sql)).toContain("ROLLBACK")
+    expect(fake.calls.map(call => call.sql)).not.toContain("COMMIT")
+    expect(fake.state).toMatchObject({ waitStatus: "waiting", parentStatus: "waiting", outbox: 0, nextReconcileAt: null })
+  })
+
+  it("skips only the candidate whose exact parent deadline elapsed during schedule advancement", async () => {
+    const fake = fixture({ targetStatus: "running", scheduleUpdateMiss: true, parentDeadlineExpiresDuringSchedule: true })
+    await expect(reconcileDurableSubagentWaits(fake.pool as never, { now })).resolves.toEqual({ scanned: 1, resolved: 0, woken: 0 })
+    const deadlineCheck = fake.calls.find(call => call.sql.includes('AS "expired"'))
+    expect(deadlineCheck?.sql).toContain('wait."stepId" = $6')
+    expect(deadlineCheck?.sql).toContain('parent."absoluteDeadlineAt" <= timezone(\'UTC\', clock_timestamp())')
+    expect(fake.state).toMatchObject({ waitStatus: "waiting", parentStatus: "waiting", nextReconcileAt: null, outbox: 0 })
+    expect(fake.calls.map(call => call.sql)).toContain("COMMIT")
+    expect(fake.calls.map(call => call.sql)).not.toContain("ROLLBACK")
+  })
+
+  it("uses the database deadline result even when a caller supplies a stale process clock", async () => {
+    const fake = fixture({ targetStatus: "running", deadline: new Date(now.getTime() - 1) })
+    const stale = new Date(now.getTime() - 60_000)
+    await expect(reconcileDurableSubagentWaits(fake.pool as never, { now: stale })).resolves.toEqual({ scanned: 1, resolved: 1, woken: 1 })
+    expect(fake.state.waitStatus).toBe("timed_out")
+  })
+
+  it("builds the persisted receipt from the SQL-projected UTC deadline instead of the raw timestamp value", async () => {
+    const deadlineAt = new Date(now.getTime() + 30_000)
+    const fake = fixture({ deadline: deadlineAt, rawDeadlineShiftMs: -10 * 60 * 60 * 1000 })
+    await expect(reconcileDurableSubagentWaits(fake.pool as never, { now })).resolves.toEqual({ scanned: 1, resolved: 1, woken: 1 })
+    const write = fake.calls.find(call => call.sql.includes('UPDATE "agent_wait_conditions"') && !call.sql.includes('SET "nextReconcileAt"'))
+    const result = JSON.parse(String(write?.params[2])) as { outcome: { deadlineAt: string } }
+    expect(result.outcome.deadlineAt).toBe(deadlineAt.toISOString())
+  })
+
+  it("retries as timed out when the deadline crosses after target locking but before the ready write", async () => {
+    const fake = fixture({ deadlineCrossesAfterTargets: true })
+    const deadlineAt = new Date(now.getTime() + 30_000)
+    const transition = { event: { type: "task.queued" } }
+    graphMocks.prepare.mockResolvedValueOnce(transition)
+    const staleCallerClock = new Date(now.getTime() - 60_000)
+    await expect(reconcileDurableSubagentWaits(fake.pool as never, { now: staleCallerClock })).resolves.toEqual({ scanned: 1, resolved: 1, woken: 1 })
+    const targetLock = fake.calls.findIndex(call => call.sql.includes("ANY($1::text[])") && call.sql.includes("FOR SHARE OF task"))
+    const deadlineRead = fake.calls.findIndex(call => call.sql.includes('wait."deadlineAt" <= clock."checkedAt" AS "elapsed"'))
+    const waitWrites = fake.calls.filter(call => call.sql.includes('UPDATE "agent_wait_conditions"') && !call.sql.includes('SET "nextReconcileAt"'))
+    expect(targetLock).toBeGreaterThanOrEqual(0)
+    expect(deadlineRead).toBeGreaterThan(targetLock)
+    expect(fake.calls[deadlineRead]?.sql).toContain('to_char(clock."checkedAt"')
+    expect(fake.calls[deadlineRead]?.sql).toContain("WITH clock AS MATERIALIZED")
+    expect(waitWrites.map(call => call.params[0])).toEqual(["ready", "timed_out"])
+    expect(waitWrites[0]?.sql).toContain('"deadlineAt" > timezone')
+    expect(waitWrites[0]?.sql).toContain('"deadlineAt" <= timezone')
+    const outcome = fake.state.result?.outcome as Record<string, unknown> | undefined
+    expect(fake.state).toMatchObject({ waitStatus: "timed_out", parentStatus: "queued", matched: ["child-1", "child-2"], outbox: 1 })
+    expect(outcome).toMatchObject({ status: "timed_out", matchedTaskIds: ["child-1", "child-2"] })
+    expect(fake.state.resolvedAt?.getTime()).toBeGreaterThanOrEqual(deadlineAt.getTime())
+    expect(fake.state.waitUpdatedAt).toEqual(fake.state.resolvedAt)
+    expect(fake.state.parentUpdatedAt).toEqual(fake.state.resolvedAt)
+    expect(graphMocks.persist).toHaveBeenCalledWith(expect.anything(), transition, fake.state.resolvedAt)
   })
 
   it("times out exactly once and fails closed when a target is no longer a direct child", async () => {
@@ -267,16 +363,16 @@ describe("reconcileDurableSubagentWaits", () => {
     expect(graphMocks.persist).not.toHaveBeenCalled()
   })
 
-  it("fails closed and rolls back a malformed matching dispatch row", async () => {
+  it("defers a malformed matching dispatch row without changing wait, parent, or dispatch state", async () => {
     graphMocks.prepare.mockResolvedValueOnce({ blocked: true })
     const fake = fixture({ dispatchRow: {
       id: "dispatch-1", topic: "agent.subagent.dispatch", aggregateId: "session-1", idempotencyKey: "subagent-dispatch:parent-1",
       payload: { taskId: "other-task", sessionId: "session-1", rootTaskId: "root-1", ownerId: "stale-owner" }, attemptCount: 4, publishedAt: null,
     } })
 
-    await expect(reconcileDurableSubagentWaits(fake.pool as never, { now })).rejects.toMatchObject({ code: "wait_scope_error" })
+    await expect(reconcileDurableSubagentWaits(fake.pool as never, { now })).resolves.toEqual({ scanned: 1, resolved: 0, woken: 0 })
 
-    expect(fake.state).toMatchObject({ waitStatus: "waiting", parentStatus: "waiting", outbox: 1 })
+    expect(fake.state).toMatchObject({ waitStatus: "waiting", parentStatus: "waiting", nextReconcileAt: "db-now-plus-five-seconds", outbox: 1 })
     expect(fake.state.dispatchRow?.payload.taskId).toBe("other-task")
     expect(fake.calls.some(call => call.sql.includes('UPDATE "agent_outbox" AS dispatch'))).toBe(false)
   })

@@ -2416,24 +2416,26 @@ model AgentToolResultReference {
 // Durable wait intent. Runtime matching/consumption is intentionally owned by
 // the coordination phase and is not registered in the current tool runtime.
 model AgentWaitCondition {
-  id             String   @id @default(cuid())
-  userId         String
-  sessionId      String
-  turnId         String
-  parentTaskId   String
-  stepId         String
-  idempotencyKey String
-  targetTaskIds  Json
-  mode           String
-  status         String
-  deadlineAt     DateTime
-  matchedTaskIds Json     @default("[]")
-  result         Json?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
-  resolvedAt     DateTime?
-  suspendedAt    DateTime?
-  consumedAt     DateTime?
+  id              String   @id @default(cuid())
+  userId          String
+  sessionId       String
+  turnId          String
+  parentTaskId    String
+  stepId          String
+  idempotencyKey  String
+  targetTaskIds   Json
+  mode            String
+  status          String
+  deadlineAt      DateTime
+  matchedTaskIds  Json     @default("[]")
+  result          Json?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  resolvedAt      DateTime?
+  suspendedAt     DateTime?
+  // Effective due scheduling uses the migration-only partial COALESCE expression index.
+  nextReconcileAt DateTime? @db.Timestamp(3)
+  consumedAt      DateTime?
 
   user       User         @relation(fields: [userId], references: [id], onDelete: Cascade, map: "agent_wait_conditions_userId_fkey")
   session    AgentSession @relation(fields: [sessionId, userId], references: [id, userId], onDelete: Cascade, map: "agent_wait_conditions_sessionId_fkey")
