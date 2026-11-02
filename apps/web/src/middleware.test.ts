@@ -56,6 +56,31 @@ describe('web middleware entrypoint', () => {
     expect(response.headers.get('location')).toContain('/login?callbackUrl=%2Fdashboard')
   })
 
+  it.each(['/privacy', '/privacy/'])('allows anonymous readers to access the privacy policy at %s', async pathname => {
+    const response = await middleware(new NextRequest(`https://applymate.site${pathname}`))
+
+    expect(response.status).toBe(200)
+    expect(response.headers.get('x-middleware-next')).toBe('1')
+    expect(response.headers.get('location')).toBeNull()
+  })
+
+  it.each(['/privacy-settings', '/privacy/private', '/dashboard', '/jobs', '/resume'])('keeps %s protected without a session', async pathname => {
+    const response = await middleware(new NextRequest(`https://applymate.site${pathname}`))
+    const location = new URL(response.headers.get('location')!)
+
+    expect(response.status).toBe(307)
+    expect(location.origin).toBe('https://applymate.site')
+    expect(location.pathname).toBe('/login')
+    expect(location.searchParams.get('callbackUrl')).toBe(pathname)
+  })
+
+  it.each(['/privacy', '/privacy/'])('keeps %s off the administrator host', async pathname => {
+    const response = await middleware(new NextRequest(`https://admin.applymate.site${pathname}`))
+
+    expect(response.status).toBe(307)
+    expect(response.headers.get('location')).toBe('https://admin.applymate.site/admin')
+  })
+
   it('keeps the canonical Landing route public even with an active session', async () => {
     const request = new NextRequest('https://applymate.site/landing')
     request.cookies.set('authjs.session-token', 'present')

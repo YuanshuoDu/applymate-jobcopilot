@@ -5,6 +5,7 @@ import { isAgentPreviewRequestAllowed } from '@/lib/agent-preview-access'
 import { adminOrigin, isAdminApiPath, isAdminAuthApiPath, isAdminHost, isAdminInvitationPath, isAdminPath, isAuthPath, isLocalHost } from '@/lib/host-routing'
 
 const PUBLIC_ROUTES = ['/landing', '/login', '/register', '/forgot-password', '/reset-password', '/api/auth']
+const PUBLIC_DOCUMENT_ROUTES = new Set(['/privacy', '/privacy/'])
 const SESSION_COOKIE_NAMES = [
   'authjs.session-token',
   '__Secure-authjs.session-token',
@@ -81,7 +82,9 @@ export async function middleware(req: NextRequest) {
   }
 
   // ── Allow public routes through ────────────────────────────
-  if (PUBLIC_ROUTES.some(p => pathname.startsWith(p))) {
+  // Public policy documents must be readable without signing in. Match their
+  // exact routes so similarly named pages or descendants stay protected.
+  if (PUBLIC_DOCUMENT_ROUTES.has(pathname) || PUBLIC_ROUTES.some(p => pathname.startsWith(p))) {
     return NextResponse.next()
   }
 

@@ -25,6 +25,8 @@ import { useExtensionI18n } from '@/lib/i18n'
 import type { FormFieldSchema, FilledField, FormFillResponse } from '@/lib/form-filler/types'
 import type { PersonaField } from '@/lib/api'
 import { groupFieldIdsByFrame, groupFilledFieldsByFrame } from '@/lib/form-filler/frame-routing'
+import { scanDocumentFields } from '@/lib/form-filler/direct-scanner'
+import { filterSafeFormFields, filterSafeFormRevision, FORM_VALUE_TEXT_SELECTOR, SENSITIVE_FIELD_PATTERN } from '@/lib/form-filler/field-safety'
 
 type ViewState = 'idle' | 'scanning' | 'aiThinking' | 'review' | 'applying' | 'done' | 'error'
 type AnalysisPhase = 'fetchingPersona' | 'preparingPrompt' | 'waitingForAI' | 'processingResult'
@@ -72,102 +74,8 @@ async function scanFormDirectly(tabId: number): Promise<FormFieldSchema[]> {
   const results = await chrome.scripting.executeScript({
     target: { tabId, allFrames: true },
     world: 'ISOLATED',
-    func: () => {
-      const hash = (value: string) => {
-        let result = 0
-        for (let index = 0; index < value.length; index++) {
-          result = ((result << 5) - result) + value.charCodeAt(index)
-          result |= 0
-        }
-        return Math.abs(result).toString(36)
-      }
-      const clean = (value: string) => value.replace(/\s+/g, ' ').replace(/\*/g, '').trim()
-      const humanize = (value: string) => clean(value
-        .replace(/[-_.:[\]]+/g, ' ')
-        .replace(/([a-z])([A-Z])/g, '$1 $2'))
-      const labelFor = (element: HTMLElement) => {
-        const id = element.getAttribute('id')
-        if (id) {
-          const label = document.querySelector<HTMLLabelElement>(`label[for="${CSS.escape(id)}"]`)
-          if (label?.textContent) return clean(label.textContent)
-        }
-        const aria = element.getAttribute('aria-label')
-        if (aria) return clean(aria)
-        const labelledBy = element.getAttribute('aria-labelledby')
-        if (labelledBy) {
-          const label = document.getElementById(labelledBy.split(/\s+/)[0])
-          if (label?.textContent) return clean(label.textContent)
-        }
-        const container = element.closest(
-          '[data-automation-id^="formField-"], label, fieldset, [class*="form-field"], [class*="fieldWrapper"]',
-        )
-        const nearbyLabel = container?.querySelector('label, legend, [data-automation-id*="label"]')
-        if (nearbyLabel?.textContent) return clean(nearbyLabel.textContent)
-        const name = element.getAttribute('name')
-        if (name) return humanize(name)
-        const placeholder = element.getAttribute('placeholder')
-        return placeholder ? clean(placeholder) : ''
-      }
-
-      const selector =
-        'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="reset"]), ' +
-        'textarea, select, [contenteditable="true"], [role="combobox"], [role="textbox"], ' +
-        '[role="radiogroup"], [role="checkbox"], [role="switch"]'
-      const elements = Array.from(document.querySelectorAll<HTMLElement>(selector))
-      const seen = new Set<string>()
-
-      return elements.flatMap(element => {
-        const tag = element.tagName.toLowerCase()
-        const inputType = (element.getAttribute('type') ?? '').toLowerCase()
-        const role = (element.getAttribute('role') ?? '').toLowerCase()
-        const label = labelFor(element)
-        const name = element.getAttribute('name') ?? ''
-        const elementId = element.getAttribute('id') ?? ''
-        const rawId = name
-          ? `n-${hash(name)}`
-          : `l-${hash([elementId, label, inputType || tag].filter(Boolean).join('|'))}`
-        if (seen.has(rawId)) return []
-        seen.add(rawId)
-
-        let type = 'text'
-        if (tag === 'textarea' || role === 'textbox' || element.getAttribute('contenteditable') === 'true') type = 'textarea'
-        else if (tag === 'select' || role === 'combobox') type = 'select'
-        else if (role === 'radiogroup' || inputType === 'radio') type = 'radio'
-        else if (role === 'checkbox' || role === 'switch' || inputType === 'checkbox') type = 'checkbox'
-        else if (['email', 'tel', 'url', 'number', 'date', 'file'].includes(inputType)) type = inputType
-
-        let options: string[] | undefined
-        if (tag === 'select') {
-          options = Array.from((element as HTMLSelectElement).options)
-            .map(option => clean(option.textContent ?? option.value))
-            .filter(Boolean)
-        } else if (inputType === 'radio' && name) {
-          options = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="radio"]'))
-            .filter(input => input.name === name)
-            .map(input => labelFor(input) || input.value)
-            .filter(Boolean)
-        }
-
-        const input = element as HTMLInputElement
-        const currentValue = inputType === 'checkbox' || inputType === 'radio'
-          ? (input.checked ? input.value || 'true' : undefined)
-          : (input.value || element.textContent?.trim() || undefined)
-
-        return [{
-          id: rawId,
-          type,
-          label,
-          placeholder: element.getAttribute('placeholder') ?? undefined,
-          options,
-          required: element.hasAttribute('required') || element.getAttribute('aria-required') === 'true',
-          surroundingText: clean(element.closest(
-            '[data-automation-id^="formField-"], label, fieldset, [class*="field"], [class*="form"]',
-          )?.textContent ?? '').slice(0, 250),
-          groupName: name || undefined,
-          currentValue,
-        }]
-      })
-    },
+    func: scanDocumentFields,
+    args: [SENSITIVE_FIELD_PATTERN, FORM_VALUE_TEXT_SELECTOR],
   })
 
   const fields: FormFieldSchema[] = []
@@ -462,6 +370,9 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
   ) => {
     const activeSettings = overrideSettings ?? settings
     try {
+      formFields = filterSafeFormFields(formFields)
+      setFields(formFields)
+      if (formFields.length === 0) throw new Error('No supported application fields found. Passwords and other sensitive fields are excluded.')
       setViewState('aiThinking')
       setErrorMsg('')
 
@@ -604,10 +515,11 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
     if (!reviseInstruction.trim()) return
     setRevising(true)
     try {
-      const { persona } = await getPersona(settings)
+      const safeRevision = filterSafeFormRevision(fields, filledFields)
+      if (safeRevision.fields.length === 0) throw new Error('No supported application fields to revise.')
+      const { persona } = await getPersona(settings, 'form_fill')
       const result = await reviseFormFields(settings, {
-        fields,
-        previousFill: filledFields,
+        ...safeRevision,
         persona,
         instruction: reviseInstruction.trim(),
       })
@@ -811,7 +723,8 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
           </button>
           <span className="am-form-helper">
             Works with company career sites, Greenhouse, Lever, Workday, and more.
-            When you scan, ApplyMate reads field labels and any existing values on this page to prepare suggestions.
+            When you scan, ApplyMate reads supported field labels and existing values on this page.
+            Relevant form and profile data is sent to ApplyMate and the configured AI provider when needed to prepare or revise suggestions.
             Review everything before filling; it never submits the application.
             <a href="https://applymate.site/privacy" target="_blank" rel="noreferrer">{t('Privacy & data use')}</a>
           </span>
