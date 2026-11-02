@@ -8,6 +8,8 @@ describe('preview platform boundary', () => {
     expect(await platform.permissions.getAll()).toEqual({ origins: [], permissions: [] })
     await expect(platform.scripting.executeScript()).rejects.toThrow('requires the installed extension')
     await expect(platform.tabs.create()).rejects.toThrow('external navigation is disabled')
+    expect(platform.runtime.getURL('icons/icon128.png')).toMatch(/^data:image\/png;base64,/)
+    expect(platform.runtime.getURL('https://example.invalid/image.png')).toBe('#preview-only')
   })
 
   it('keeps sample storage isolated between preview sessions', async () => {

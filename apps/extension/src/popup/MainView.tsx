@@ -142,7 +142,7 @@ export function PopupMainView({ settings, onSettings, onLogout }: {
             <ActionRow icon={<Bookmark size={21} strokeWidth={1.8} />} title={savedJob ? labels.savedJob : labels.saveJob} subtitle={savedJob ? labels.syncedWorkspace : labels.saveJobSub} onClick={handleSave} loading={saving} success={!!savedJob || message === 'saved'} />
             <Divider />
             <ActionRow icon={<BarChart3 size={21} strokeWidth={1.8} />} title={labels.analyzeMatch} subtitle={analyzing ? labels.aiReviewing : labels.analyzeMatchSub} onClick={() => void handleAnalyze()} loading={analyzing} success={message === 'analyzed'} />
-            <div style={{ padding: 12 }}><button type="button" onClick={() => void handleOpenSidePanel('resume')} style={primaryAction}><Sparkles size={21} strokeWidth={1.8} /><span style={{ flex: 1, textAlign: 'left' }}><strong>{labels.prepare}</strong><small>{labels.prepareSub}</small></span><ChevronRight size={21} strokeWidth={2} /></button></div>
+            <div style={{ padding: 12 }}><button type="button" onClick={() => void handleOpenSidePanel('resume')} style={primaryAction}><Sparkles size={21} strokeWidth={1.8} /><span style={{ flex: 1, textAlign: 'left' }}><strong style={{ display: 'block', fontSize: 13 }}>{labels.prepare}</strong><small style={{ display: 'block', marginTop: 3, fontSize: 10, lineHeight: 1.35, opacity: 0.9 }}>{labels.prepareSub}</small></span><ChevronRight size={21} strokeWidth={2} /></button></div>
           </div>
           {message && message !== 'saved' && message !== 'analyzed' && <InlineMessage text={message} />}
         </> : <EmptyJob labels={labels} />}

@@ -20,7 +20,7 @@ button { font-family: inherit; }
 .sample-tags span { background: #f2f1fd; color: #6056bc; padding: 5px 9px; border-radius: 6px; font-size: 10px; }
 .store-note { margin-top: auto; color: #8b88a1; font-size: 9px; line-height: 1.7; }
 .store-product { padding-top: 37px; align-self: start; min-width: 0; }
-.store-product.popup { width: 390px; justify-self: center; padding-top: 75px; }
+.store-product.popup { width: 360px; justify-self: center; padding-top: 75px; }
 .store-product.panel { width: 570px; }
 .preview-switch { display: flex; gap: 5px; align-items: center; height: 30px; margin-bottom: 12px; }
 .preview-switch button { border: 0; border-radius: 6px; padding: 7px 11px; background: transparent; font-size: 10px; font-weight: 650; color: #76718e; cursor: pointer; }

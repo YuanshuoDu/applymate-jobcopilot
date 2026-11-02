@@ -50,6 +50,7 @@ The runtime did not permit opening Chrome's extension-management page. No altern
 - A separate preview imports actual popup/side-panel components with fictional in-memory fixtures. Login, AI, persistent writes, permissions, downloads, printing, external navigation and network calls are disabled.
 - Manifest version/version_name is 0.1.22; minimum Chrome is 116. Production removes unused contextMenus, localhost and the old Vercel host. Only development builds restore documented loopback origins.
 - The default extension test command now includes source-adjacent security tests.
+- Corrected the popup action title/subtitle layout. The isolated preview uses the original icon bytes and the actual 360-pixel popup width.
 
 ## Verification
 
@@ -81,8 +82,8 @@ Fictional PDF validation generated actual Resume.pdf and CoverLetter.pdf, each o
 ## Exact archive
 
 - Filename: ApplyMate-AI-0.1.22.zip
-- Size: 259585 bytes
-- SHA-256: dee3cf8c6965a7f9de89a5648ea8c2d7a049c96d169c97d1551876759a474384
+- Size: 259589 bytes
+- SHA-256: 1f27965b0b77ff7eb10a9d6b4d4165b63335bd76d122c0e1d269ef5bd9dc1ea7
 - Entries: 23, comprising 19 files and 4 directories.
 
 The existing build process embeds a fresh content-runtime marker. Rebuilding identical source can change the checksum; the value above identifies the delivered archive.
@@ -100,6 +101,6 @@ The existing build process embeds a fresh content-runtime marker. Rebuilding ide
 
 Before submission, verify the production privacy page, public demonstration, support contact and ordinary-account download flow. A preview build is not proof that the production domain changed. Keep deployment evidence against exact commit IDs.
 
-An earlier CI run for 9512544 failed an unrelated Worker PostgreSQL/Redis durable-child-wait recovery test: [run 41480976213, job 125398862393](https://github.com/YuanshuoDu/applymate-jobcopilot/actions/runs/41480976213/job/125398862393). Worker/CI files were unchanged from e57977d. This does not establish that the exact base had failing CI. The test was not weakened or changed here. Check the new head's actual results; local release tests do not establish full-repository CI success.
+An earlier CI run for 9512544 failed an unrelated Worker PostgreSQL/Redis durable-child-wait recovery test: [run 41480976213, job 125398862393](https://github.com/YuanshuoDu/applymate-jobcopilot/actions/runs/41480976213/job/125398862393). Worker/CI files were unchanged from e57977d. This does not establish that the exact base had failing CI. The test was not weakened or changed here. The subsequent code commit 7406321 passed CI run 41490652604, including the durable child-wait restart step. Record checks for any later visual-only follow-up separately; local release tests alone do not establish full-repository CI success.
 
 Publisher steps remain Google authentication, dedicated review access and sufficient AI limits, installed Chrome acceptance, contact verification, developer registration/security requirements, accurate data certifications, Trader/Non-Trader information and final store submission. The listing workbook explicitly covers Location, personal salary expectations and voluntarily supplied Health information.
