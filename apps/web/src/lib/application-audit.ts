@@ -1,4 +1,4 @@
-import type { ApplicationAudit, ApplicationAuditFinding, ApplicationAuditTarget } from '@/lib/types'
+import type { ApplicationAudit, ApplicationAuditFinding, ApplicationAuditTarget, Job } from '@/lib/types'
 
 export const AUDIT_ACTIVITY_PREFIX = '[Auditor] application-audit '
 
@@ -7,6 +7,7 @@ export type StoredApplicationAudit = {
   coverLetterId: string | null
   resumeUpdatedAt?: string
   coverLetterUpdatedAt?: string
+  receipt?: { version: 1; signature: string }
   audit: ApplicationAudit
 }
 
@@ -102,11 +103,10 @@ export function auditActivityText(
   resumeId: string,
   coverLetterId: string | null,
   audit: ApplicationAudit,
-  versions: Pick<StoredApplicationAudit, 'resumeUpdatedAt' | 'coverLetterUpdatedAt'> = {},
+  versions: Pick<StoredApplicationAudit, 'resumeUpdatedAt' | 'coverLetterUpdatedAt' | 'receipt'> = {},
 ) {
   return `${AUDIT_ACTIVITY_PREFIX}${JSON.stringify({ resumeId, coverLetterId, ...versions, audit })}`
 }
-
 export function parseStoredApplicationAudit(textValue: string): StoredApplicationAudit | null {
   if (!textValue.startsWith(AUDIT_ACTIVITY_PREFIX)) return null
   try {
@@ -116,4 +116,33 @@ export function parseStoredApplicationAudit(textValue: string): StoredApplicatio
   } catch {
     return null
   }
+}
+
+type Revision = { id: string; updatedAt: string | Date }
+type FinalSelection = Pick<Job, 'finalResumeId' | 'finalCoverLetterId'>
+
+function revisionTime(value: string | Date | undefined): number | null {
+  const timestamp = value instanceof Date ? value.getTime() : value ? Date.parse(value) : NaN
+  return Number.isFinite(timestamp) ? timestamp : null
+}
+
+/** An audit for the same IDs is stale after either document has been edited. */
+export function hasCurrentApplicationPackAudit(
+  stored: StoredApplicationAudit | null,
+  job: FinalSelection,
+  resume: Revision,
+  coverLetter: Revision | null,
+): stored is StoredApplicationAudit {
+  if (!stored || stored.audit.verdict !== 'pass' || !job.finalResumeId) return false
+  if (stored.resumeId !== job.finalResumeId || resume.id !== job.finalResumeId) return false
+  if (stored.coverLetterId !== job.finalCoverLetterId || (coverLetter?.id ?? null) !== job.finalCoverLetterId) return false
+  const resumeTime = revisionTime(stored.resumeUpdatedAt)
+  if (resumeTime === null || resumeTime !== revisionTime(resume.updatedAt)) return false
+  if (coverLetter) {
+    const coverLetterTime = revisionTime(stored.coverLetterUpdatedAt)
+    if (coverLetterTime === null || coverLetterTime !== revisionTime(coverLetter.updatedAt)) return false
+  }
+  const requiredAreas = coverLetter ? ['resume', 'cover_letter'] : ['resume']
+  return requiredAreas.every(area => stored.audit.findings.some(finding => finding.area === area && finding.severity === 'pass'))
+    && !stored.audit.findings.some(finding => finding.area !== 'job_match' && finding.severity !== 'pass')
 }

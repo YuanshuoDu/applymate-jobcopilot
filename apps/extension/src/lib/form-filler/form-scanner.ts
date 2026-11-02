@@ -1,5 +1,5 @@
 import type { FormFieldSchema } from './types'
-import { isSensitiveFormField, readStaticFormLabel } from './field-safety'
+import { isSensitiveFormField, readStaticFormLabel, readFormValueText } from './field-safety'
 
 /**
  * Aggressive full-page form scanner.
@@ -427,7 +427,7 @@ function readCurrentValue(el: HTMLElement): string | undefined {
     return extractLabel(el) || (el as HTMLInputElement).value || undefined
   }
   if (el.getAttribute('contenteditable') === 'true') {
-    const text = (el.textContent ?? '').trim()
+    const text = readFormValueText(el).trim()
     return text || undefined
   }
   const val = (el as HTMLInputElement).value?.trim()

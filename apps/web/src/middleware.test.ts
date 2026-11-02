@@ -64,7 +64,15 @@ describe('web middleware entrypoint', () => {
     expect(response.headers.get('location')).toBeNull()
   })
 
-  it.each(['/privacy-settings', '/privacy/private', '/dashboard', '/jobs', '/resume'])('keeps %s protected without a session', async pathname => {
+  it.each(['/extension-review', '/extension-review/', '/extension-review/frame', '/extension-review/frame/', '/extension-review/preview.html'])('allows the fictional public review page at %s', async pathname => {
+    const response = await middleware(new NextRequest(`https://applymate.site${pathname}`))
+
+    expect(response.status).toBe(200)
+    expect(response.headers.get('x-middleware-next')).toBe('1')
+    expect(response.headers.get('location')).toBeNull()
+  })
+
+  it.each(['/privacy-settings', '/privacy/private', '/privacy/private.html', '/extension-review-admin', '/extension-review/private', '/extension-review/frame/private', '/extension-review/preview.html/private', '/extension-review/other.html', '/dashboard', '/jobs', '/resume'])('keeps %s protected without a session', async pathname => {
     const response = await middleware(new NextRequest(`https://applymate.site${pathname}`))
     const location = new URL(response.headers.get('location')!)
 
@@ -74,7 +82,7 @@ describe('web middleware entrypoint', () => {
     expect(location.searchParams.get('callbackUrl')).toBe(pathname)
   })
 
-  it.each(['/privacy', '/privacy/'])('keeps %s off the administrator host', async pathname => {
+  it.each(['/privacy', '/privacy/', '/extension-review', '/extension-review/frame', '/extension-review/preview.html'])('keeps %s off the administrator host', async pathname => {
     const response = await middleware(new NextRequest(`https://admin.applymate.site${pathname}`))
 
     expect(response.status).toBe(307)

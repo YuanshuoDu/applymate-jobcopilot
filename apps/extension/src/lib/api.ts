@@ -1,10 +1,11 @@
 /**
  * API client for communicating with the ApplyMate Next.js backend.
- * Uses a long-lived JWT token stored in chrome.storage.sync.
+ * Uses the signed-in ApplyMate account token for extension requests.
  */
 import type { ScrapedJob, SavedJob, DashboardStats, ExtensionSettings, ResumeListItem, Resume, ScoreResult, Suggestion } from './types'
 import type { FormFillRequest, FormFillResponse, FormReviseRequest } from './form-filler/types'
 import { getCurrentResumeId, getSettings } from './storage'
+import { openApplicationPackPrintResponse, saveApplicationPackResponse } from './download-response'
 
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
@@ -35,11 +36,11 @@ async function refreshSettingsFromDashboard(): Promise<ExtensionSettings | null>
   }
 }
 
-async function request<T>(
+async function requestResponse(
   settings: ExtensionSettings,
   path: string,
   options: RequestInit & RequestExtras = {},
-): Promise<T> {
+): Promise<Response> {
   const { _timeoutMs = 15_000, _retry = true, _authRecovery = true, ...fetchOpts } = options
   const url = `${settings.apiBaseUrl.replace(/\/+$/, '')}${path}`
   const headers: Record<string, string> = {
@@ -64,8 +65,13 @@ async function request<T>(
         const body = await res.json().catch(() => ({ error: res.statusText }))
         if (res.status === 401 && _authRecovery && settings.apiToken) {
           const refreshed = await refreshSettingsFromDashboard()
-          if (refreshed?.apiToken && refreshed.apiToken !== settings.apiToken) {
-            return request<T>(refreshed, path, {
+          const sameAccount = refreshed?.apiBaseUrl === settings.apiBaseUrl
+            && Boolean(settings.userEmail.trim())
+            && refreshed.userEmail.trim().toLowerCase() === settings.userEmail.trim().toLowerCase()
+          // An in-flight write from account A must never be retried with a
+          // newly selected account B's token after dashboard synchronization.
+          if (sameAccount && refreshed?.apiToken && refreshed.apiToken !== settings.apiToken) {
+            return requestResponse(refreshed, path, {
               ...fetchOpts,
               _timeoutMs,
               _retry: false,
@@ -75,7 +81,7 @@ async function request<T>(
         }
         throw new ApiError(res.status, body.error ?? 'Request failed')
       }
-      return res.json()
+      return res
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err))
       if (err instanceof ApiError) throw err // Don't retry API errors
@@ -87,6 +93,10 @@ async function request<T>(
     }
   }
   throw lastError
+}
+
+async function request<T>(settings: ExtensionSettings, path: string, options: RequestInit & RequestExtras = {}): Promise<T> {
+  return (await requestResponse(settings, path, options)).json() as Promise<T>
 }
 
 // ── Auth ──────────────────────────────────────────────────────
@@ -150,10 +160,16 @@ export async function getRecentJobs(settings: ExtensionSettings): Promise<SavedJ
   return jobs
 }
 
-export async function exportApplicationPackLocally(settings: ExtensionSettings, jobId: string, openFolder = false): Promise<{ folderPath: string; opened: boolean }> {
-  return request(settings, `/api/jobs/${jobId}/export-local`, {
-    method: 'POST', body: JSON.stringify({ openFolder, openOnly: openFolder }), _timeoutMs: 120_000, _retry: false,
+export async function downloadApplicationPack(settings: ExtensionSettings, jobId: string): Promise<{ filename: string }> {
+  const response = await requestResponse(settings, `/api/jobs/${encodeURIComponent(jobId)}/application-pack`, {
+    method: 'POST', _timeoutMs: 120_000, _retry: false,
   })
+  return saveApplicationPackResponse(response)
+}
+
+export async function openApplicationPackPrint(settings: ExtensionSettings, jobId: string): Promise<void> {
+  const response = await requestResponse(settings, `/api/jobs/${encodeURIComponent(jobId)}/application-pack`, { _retry: false })
+  await openApplicationPackPrintResponse(response)
 }
 
 export async function updateJobStatus(
@@ -362,7 +378,13 @@ export async function prepareApplicationPack(
   onStage?: (stage: ApplicationPackStage) => void,
 ): Promise<{ job: SavedJob; audit: ApplicationAuditResult }> {
   if (job.finalResumeId && job.finalCoverLetterId) {
-    return { job, audit: { verdict: 'pass', summary: 'Application pack already confirmed.' } }
+    onStage?.('audit')
+    const audit = await request<ApplicationAuditResult>(settings, `/api/jobs/${job.id}/audit-application`, {
+      method: 'POST', body: JSON.stringify({ resumeId: job.finalResumeId, coverLetterId: job.finalCoverLetterId }),
+      _timeoutMs: 120_000, _retry: false,
+    })
+    if (audit.verdict !== 'pass') throw new Error(audit.summary || 'The application documents need review before downloading.')
+    return { job, audit }
   }
 
   const resumes = await listResumes(settings)
@@ -391,7 +413,6 @@ export async function prepareApplicationPack(
 
   const updatedJob = await assignApplicationPack(settings, job.id, {
     finalResumeId: tailored.adaptedResumeId,
-    finalCoverLetterId: coverLetter.id,
   })
   return { job: updatedJob, audit }
 }

@@ -51,4 +51,17 @@ describe('fallback form context safety', () => {
     expect(fields[0]).toMatchObject({ label: 'First name', currentValue: 'Candidate', surroundingText: '' })
     expect(fields[0].id).toMatch(/^iframe\|/)
   })
+
+  it('does not read nested controls as the current value of a contenteditable field', () => {
+    const secretReads = vi.fn(() => 'nested-otp-secret')
+    const attributes: Record<string, string> = { name: 'cover_letter', contenteditable: 'true', 'aria-label': 'Cover letter' }
+    const nested = { nodeType: 1, matches: () => true, get childNodes() { return [{ nodeType: 3, nodeValue: secretReads() }] } }
+    const editor = {
+      tagName: 'DIV', getAttribute: (name: string) => attributes[name] ?? null, closest: () => null,
+      childNodes: [{ nodeType: 3, nodeValue: 'Relevant experience' }, nested],
+      get textContent() { return `Relevant experience ${secretReads()}` },
+    } as unknown as HTMLElement
+    expect(classifyElement(editor)?.currentValue).toBe('Relevant experience')
+    expect(secretReads).not.toHaveBeenCalled()
+  })
 })

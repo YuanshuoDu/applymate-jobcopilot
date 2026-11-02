@@ -25,6 +25,11 @@ export function scanDocumentFields(sensitivePattern: string, valueTextSelector: 
       return node.nodeType === 1 ? labelText(node as Element) : ''
     }).join(' ')
   }
+  const valueText = (element: Element): string => Array.from(element.childNodes).map(node => {
+    if (node.nodeType === 3) return node.nodeValue ?? ''
+    if (node.nodeType !== 1 || (node as Element).matches(valueTextSelector)) return ''
+    return valueText(node as Element)
+  }).join('')
   const labelFor = (element: HTMLElement) => {
     const id = element.getAttribute('id')
     if (id) {
@@ -109,7 +114,7 @@ export function scanDocumentFields(sensitivePattern: string, valueTextSelector: 
     const currentValue = inputType === 'file' ? undefined
       : inputType === 'checkbox' || inputType === 'radio'
         ? (input.checked ? input.value || 'true' : undefined)
-        : (input.value || element.textContent?.trim() || undefined)
+        : (input.value || ((element.getAttribute('contenteditable') === 'true' || role === 'textbox') ? valueText(element).trim() : undefined) || undefined)
 
     return [{
       id: rawId,

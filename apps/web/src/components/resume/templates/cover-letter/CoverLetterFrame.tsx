@@ -23,6 +23,9 @@ export interface CoverLetterDocProps {
   templateVariant: 'modern' | 'classic' | 'minimal'
 }
 
+// Preserve the reviewed words when a PDF line wraps.
+const noHyphenation = (word: string) => [word]
+
 // Font sizes and spacing per density
 function getDensityScale(density?: string) {
   if (density === 'compact')    return { body: 9.5,  heading: 12, line: 1.4, margin: 28 }
@@ -50,8 +53,8 @@ export function CoverLetterDoc({
   const isClassic = templateVariant === 'classic'
   const isMinimal = templateVariant === 'minimal'
 
-  const pdfFontFamily = fontFamily === 'serif' ? 'Times-Roman' : 'Helvetica'
-  const pdfFontBold   = fontFamily === 'serif' ? 'Times-Bold'  : 'Helvetica-Bold'
+  const pdfFontFamily = fontFamily === 'serif' ? 'Times-Roman' : fontFamily === 'mono' ? 'Courier' : 'Helvetica'
+  const pdfFontBold   = fontFamily === 'serif' ? 'Times-Bold' : fontFamily === 'mono' ? 'Courier-Bold' : 'Helvetica-Bold'
 
   const styles = StyleSheet.create({
     page: {
@@ -130,35 +133,31 @@ export function CoverLetterDoc({
       <Page size="A4" style={styles.page}>
         {/* Header */}
         <View style={styles.header}>
-          <Text style={styles.name}>{applicant.name || 'Applicant'}</Text>
+          <Text hyphenationCallback={noHyphenation} style={styles.name}>{applicant.name || 'Applicant'}</Text>
           {contactParts.length > 0 && (
             <View style={styles.contactLine}>
               {contactParts.map((p, i) => (
-                <Text key={i} style={styles.contactItem}>{p}</Text>
+                <Text hyphenationCallback={noHyphenation} key={i} style={styles.contactItem}>{p}</Text>
               ))}
             </View>
           )}
         </View>
 
         {/* Date */}
-        <Text style={styles.date}>{dateStr}</Text>
+        <Text hyphenationCallback={noHyphenation} style={styles.date}>{dateStr}</Text>
 
         {/* Recipient */}
         {recipient && (
           <View style={styles.recipient}>
-            <Text style={styles.recipientName}>{recipient.company}</Text>
-            <Text style={styles.recipientRole}>{recipient.role}</Text>
+            <Text hyphenationCallback={noHyphenation} style={styles.recipientName}>{recipient.company}</Text>
+            <Text hyphenationCallback={noHyphenation} style={styles.recipientRole}>{recipient.role}</Text>
           </View>
         )}
 
         {/* Body */}
-        <Text style={styles.body}>{content}</Text>
+        <Text hyphenationCallback={noHyphenation} style={styles.body}>{content}</Text>
 
-        {/* Signature */}
-        <View style={styles.signature}>
-          <Text style={styles.sigClosing}>Sincerely,</Text>
-          <Text style={styles.sigName}>{applicant.name || 'Applicant'}</Text>
-        </View>
+        {/* The reviewed content already owns its greeting and sign-off. */}
       </Page>
     </Document>
   )

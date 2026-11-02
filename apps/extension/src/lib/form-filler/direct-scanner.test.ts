@@ -164,4 +164,17 @@ describe('injected direct form scanner', () => {
     expect(scanned[0]).toMatchObject({ label: 'First name', currentValue: 'Candidate', surroundingText: '' })
     expect(readSecretNodes).not.toHaveBeenCalled()
   })
+
+  it('reads only an editor’s own text without carrying nested OTP text into initial or revise data', () => {
+    const editor = control({ tag: 'div', attributes: { name: 'cover_letter', contenteditable: 'true', role: 'textbox' } })
+    const readSecret = vi.fn(() => 'nested-editor-secret')
+    const nestedOtp = { nodeType: 1, matches: () => true, get childNodes() { return [{ nodeType: 3, nodeValue: readSecret() }] } }
+    Object.assign(editor, { childNodes: [{ nodeType: 3, nodeValue: 'My experience fits this role.' }, nestedOtp] })
+    Object.defineProperty(editor, 'textContent', { get() { return `My experience fits this role. ${readSecret()}` } })
+    const scanned = injectScan([editor])
+    const revision = filterSafeFormRevision(scanned, scanned.map(field => ({ fieldId: field.id, value: field.currentValue ?? '', confidence: 1, reasoning: '', skip: false })))
+    expect(scanned[0].currentValue).toBe('My experience fits this role.')
+    expect(readSecret).not.toHaveBeenCalled()
+    expect(JSON.stringify({ scanned, revision })).not.toContain('nested-editor-secret')
+  })
 })

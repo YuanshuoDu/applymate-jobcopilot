@@ -15,6 +15,16 @@ export function readStaticFormLabel(element: Element | null): string {
   }).join(' ')
 }
 
+/** Read an editor's own text, excluding nested controls and hidden subtrees. */
+export function readFormValueText(element: Element): string {
+  const read = (node: Node): string => {
+    if (node.nodeType === 3) return node.nodeValue ?? ''
+    if (node.nodeType !== 1 || (node as Element).matches(FORM_VALUE_TEXT_SELECTOR)) return ''
+    return Array.from(node.childNodes).map(read).join('')
+  }
+  return Array.from(element.childNodes).map(read).join('')
+}
+
 interface FieldMetadata {
   type?: string
   label?: string
@@ -45,4 +55,23 @@ export function filterSafeFormRevision(fields: FormFieldSchema[], previousFill: 
     fields: safeFields,
     previousFill: previousFill.filter(field => safeIds.has(field.fieldId)),
   }
+}
+
+/** Remote responses provide values only for the safe field IDs we supplied. */
+export function mergeSafeFormAnswers(fields: FormFieldSchema[], previous: FilledField[], updates: unknown): FilledField[] {
+  const safe = filterSafeFormRevision(fields, previous)
+  const ids = new Set(safe.fields.map(field => field.id))
+  const answers = new Map(safe.previousFill.map(answer => [answer.fieldId, answer]))
+  for (const update of Array.isArray(updates) ? updates as unknown[] : []) {
+    if (!update || typeof update !== 'object') continue
+    const answer = update as Record<string, unknown>
+    if (typeof answer.fieldId !== 'string' || !ids.has(answer.fieldId) || typeof answer.value !== 'string') continue
+    answers.set(answer.fieldId, {
+      fieldId: answer.fieldId, value: answer.value,
+      confidence: typeof answer.confidence === 'number' && Number.isFinite(answer.confidence) ? Math.max(0, Math.min(1, answer.confidence)) : 0,
+      reasoning: typeof answer.reasoning === 'string' ? answer.reasoning : '',
+      skip: answer.skip === true, personaRelevant: answer.personaRelevant === true,
+    })
+  }
+  return safe.fields.flatMap(field => answers.has(field.id) ? [answers.get(field.id)!] : [])
 }

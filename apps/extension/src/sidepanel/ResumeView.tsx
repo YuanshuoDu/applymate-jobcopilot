@@ -27,7 +27,7 @@ import {
 import { getCurrentJob, getCurrentResumeId, setCurrentResumeId, setResumeDraft, clearResumeDraft } from '@/lib/storage'
 import {
   listResumes, getResume, updateResume, createResume,
-  getRecentJobs, saveJob, tailorResume, scoreResume, exportApplicationPackLocally,
+  getRecentJobs, saveJob, tailorResume, scoreResume, downloadApplicationPack, openApplicationPackPrint,
 } from '@/lib/api'
 import type { ExtensionSettings, ScrapedJob, ResumeListItem, Resume, ResumeContent, TemplateOptions, ScoreResult } from '@/lib/types'
 import { useExtensionI18n } from '@/lib/i18n'
@@ -126,7 +126,6 @@ export function ResumeView({ settings }: Props) {
   const [auditedResumeId, setAuditedResumeId] = useState<string | null>(null)
   const [packageStatus, setPackageStatus] = useState<'audited' | 'missing' | null>(null)
   const [savedJobId, setSavedJobId] = useState<string | null>(null)
-  const [exportedPackFolder, setExportedPackFolder] = useState<string | null>(null)
   const [exportingPack, setExportingPack] = useState(false)
   const [tailoring, setTailoring] = useState(false)
   const [tailorResult, setTailorResult] = useState<ScoreResult | null>(null)
@@ -148,7 +147,7 @@ export function ResumeView({ settings }: Props) {
     return () => chrome.runtime.onMessage.removeListener(handler)
   }, [settings.apiBaseUrl, settings.apiToken, settings.userEmail])
 
-  useEffect(() => { setAuditedResumeId(null); setPackageStatus(null); setSavedJobId(null); setExportedPackFolder(null); setTailorResult(null); setTailorError('') }, [currentJob?.url])
+  useEffect(() => { setAuditedResumeId(null); setPackageStatus(null); setSavedJobId(null); setTailorResult(null); setTailorError('') }, [currentJob?.url])
 
   // A job opened in Chrome may have a different reviewed application package
   // from the last resume viewed in the extension. Prefer the final, audited
@@ -299,15 +298,15 @@ export function ResumeView({ settings }: Props) {
     chrome.tabs.create({ url: `${apiBase}/resume/${activeId}/print` })
   }
 
-  async function handleExportApplicationPack() {
+  async function handleExportApplicationPack(printView = false) {
     if (!savedJobId || packageStatus !== 'audited') return handleOpenPrint()
     setExportingPack(true)
     try {
-      const result = await exportApplicationPackLocally(settings, savedJobId, Boolean(exportedPackFolder))
-      setExportedPackFolder(result.folderPath)
-      showToast(exportedPackFolder ? t('Opened job folder') : t('Audited PDFs saved to D:'))
+      if (printView) await openApplicationPackPrint(settings, savedJobId)
+      else await downloadApplicationPack(settings, savedJobId)
+      showToast(t(printView ? 'Print view opened' : 'Download started'))
     } catch (error) {
-      showToast(lang === 'zh' ? t('Could not save application PDFs') : error instanceof Error ? error.message : t('Could not save application PDFs'))
+      showToast(t(error instanceof Error ? error.message : 'Could not download application pack'))
     } finally {
       setExportingPack(false)
     }
@@ -519,11 +518,12 @@ export function ResumeView({ settings }: Props) {
            ═══════════════════════════════════════════════════════════════════════ */}
         <div className="am-resume-card am-resume-download-card">
           <div className="am-resume-card-title"><Download size={13} aria-hidden="true" /> {t('Download PDF')}</div>
-          <div className="am-resume-download-copy">{packageStatus === 'audited' ? 'Saves the audited resume and cover letter into this job’s D: folder' : 'Opens print view → save as PDF → drag to upload portal'}</div>
-          <button className="am-resume-download-button" type="button" onClick={handleExportApplicationPack} disabled={!activeId || exportingPack}>
+          <div className="am-resume-download-copy">{packageStatus === 'audited' ? t('Downloads your audited application documents as a ZIP.') : t('Opens print view → save as PDF → drag to upload portal')}</div>
+          <button className="am-resume-download-button" type="button" onClick={() => void handleExportApplicationPack()} disabled={!activeId || exportingPack}>
             <Download size={14} aria-hidden="true" />
-            {exportingPack ? 'Saving audited PDFs…' : exportedPackFolder ? 'Open job folder →' : packageStatus === 'audited' ? 'Save audited application PDFs →' : 'Print & Download PDF →'}
+            {exportingPack ? t('Preparing ZIP…') : packageStatus === 'audited' ? t('Download application pack (ZIP)') : t('Print & Download PDF')}
           </button>
+          {packageStatus === 'audited' && <button className="am-resume-download-button" type="button" onClick={() => void handleExportApplicationPack(true)} disabled={exportingPack}>{t('Print view / Save as PDF')}</button>}
         </div>
 
         {/* ── Sync status ── */}

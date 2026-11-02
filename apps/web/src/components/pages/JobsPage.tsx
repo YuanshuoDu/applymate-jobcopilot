@@ -10,7 +10,8 @@ import type { ApplicationAudit, ApplicationAuditFinding, CoverLetter, Job, JobSt
 import { apiMutate, fmtDate, fmtRelative, useApi } from '@/lib/hooks'
 import { setCachedApiResponse } from '@/lib/api-cache'
 import { useNav } from '@/lib/nav-context'
-import { exportApplicationPackLocally } from '@/lib/bundle'
+import { downloadApplicationPack } from '@/lib/bundle'
+import { hasCurrentApplicationPackAudit, type StoredApplicationAudit } from '@/lib/application-audit'
 import { assessApplicationPreflight } from '@/lib/agent/application-preflight'
 import { useI18n } from '@/lib/i18n'
 
@@ -456,12 +457,10 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
   const [selectedResumeId, setSelectedResumeId] = useState('')
   const [tailoringLoading, setTailoringLoading] = useState(false)
   const [downloadingPack, setDownloadingPack] = useState(false)
-  const [exportedPackFolder, setExportedPackFolder] = useState<string | null>(null)
   const [autoPreparing, setAutoPreparing] = useState(false)
   const [preparationStartedAt, setPreparationStartedAt] = useState<number | null>(null)
   const [preparationElapsed, setPreparationElapsed] = useState(0)
   const [packStage, setPackStage] = useState<'idle' | 'resume' | 'coverLetter' | 'audit' | 'review'>('idle')
-  const [auditedPackKey, setAuditedPackKey] = useState<string | null>(null)
   const [openPackItem, setOpenPackItem] = useState<'resume' | 'coverLetter' | 'audit' | null>(null)
   const [resumePreview, setResumePreview] = useState<Resume | null>(null)
   const [generatedCoverLetter, setGeneratedCoverLetter] = useState<CoverLetter | null>(null)
@@ -471,9 +470,8 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
   const [evidenceText, setEvidenceText] = useState('')
   const [savingEvidence, setSavingEvidence] = useState(false)
   const { data: coverLetters, refetch: refetchCoverLetters } = useApi<CoverLetter[]>(`/api/jobs/${job.id}/cover-letters`)
-  // The audit route is the canonical source because the activity feed is
-  // paginated and can omit an older audit after other job events are added.
-  const { data: canonicalAudit } = useApi<StoredApplicationAudit | null>(`/api/jobs/${job.id}/audit-application`)
+  // Only the audit endpoint verifies server receipts; ordinary activity is not authority.
+  const { data: canonicalAudit, refetch: refetchAudit } = useApi<StoredApplicationAudit | null>(`/api/jobs/${job.id}/audit-application`)
 
   // Load per-job activity on mount; reset interview prep when job changes
   useEffect(() => {
@@ -501,15 +499,12 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
     setSelectedResumeId(prev => prev && baseResumes.some(r => r.id === prev) ? prev : preferred.id)
   }, [baseResumes, resumeList])
   useEffect(() => {
-    const exportKey = `applymate:exported-pack:${job.id}`
-    setAuditedPackKey(null)
     setOpenPackItem(null)
     setResumePreview(null)
     setGeneratedCoverLetter(null)
     setLatestAudit(null)
     setDocumentPreview(null)
     setPackStage('idle')
-    try { setExportedPackFolder(window.sessionStorage.getItem(exportKey)) } catch { setExportedPackFolder(null) }
   }, [job.id])
   useEffect(() => {
     if (!preparationStartedAt) { setPreparationElapsed(0); return }
@@ -534,8 +529,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
     ? coverLetters?.find(letter => letter.id === job.finalCoverLetterId)
     : generatedCoverLetter
       ?? coverLetters?.find(letter => letter.resumeId === previewResumeId)
-  const persistedAudit = useMemo(() => findLatestApplicationAudit(activity), [activity])
-  const storedAudit = canonicalAudit ?? persistedAudit
+  const storedAudit = canonicalAudit ?? null
   const displayedAudit = latestAudit ?? storedAudit?.audit ?? null
   const applicationPreflight = useMemo(() => assessApplicationPreflight(job), [job])
   const evidenceGapFindings = (displayedAudit?.findings ?? []).filter(finding => finding.area !== 'job_match' && finding.resolution === 'evidence_needed')
@@ -638,18 +632,34 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
   async function downloadFinalPack() {
     setDownloadingPack(true)
     try {
-      const result = await exportApplicationPackLocally(job.id, Boolean(exportedPackFolder))
-      setExportedPackFolder(result.folderPath)
-      try { window.sessionStorage.setItem(`applymate:exported-pack:${job.id}`, result.folderPath) } catch { /* browser storage is optional */ }
-      toast.success(exportedPackFolder ? 'Folder opened' : 'Application PDFs saved', result.folderPath)
+      const result = await downloadApplicationPack(job.id)
+      toast.success('Download started', result.filename)
     } catch (error) {
-      if (exportedPackFolder) {
-        setExportedPackFolder(null)
-        try { window.sessionStorage.removeItem(`applymate:exported-pack:${job.id}`) } catch { /* browser storage is optional */ }
-      }
       toast.error('Could not download application pack', error instanceof Error ? error.message : 'Please try again')
     } finally {
       setDownloadingPack(false)
+    }
+  }
+
+  async function recheckFinalPack() {
+    if (!job.finalResumeId || autoPreparing) return
+    setAutoPreparing(true)
+    setPackStage('audit')
+    try {
+      const { data, error } = await apiMutate<ApplicationAudit>(
+        `/api/jobs/${job.id}/audit-application`, 'POST',
+        { resumeId: job.finalResumeId, coverLetterId: job.finalCoverLetterId },
+      )
+      if (!data || error) throw new Error(error ?? 'Independent audit could not run')
+      setLatestAudit(data)
+      void refetchAudit()
+      if (data.verdict !== 'pass') setOpenPackItem('audit')
+      else toast.success('Audit passed', 'Your selected application documents are ready to download.')
+    } catch (error) {
+      toast.error('Audit could not finish', error instanceof Error ? error.message : 'Please try again')
+    } finally {
+      setAutoPreparing(false)
+      setPackStage('idle')
     }
   }
 
@@ -736,10 +746,10 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
 
       setPackStage('review')
       const { data: confirmed, error: confirmError } = await apiMutate<Job>(
-        `/api/jobs/${job.id}/assign`, 'PATCH', { finalResumeId: adaptedResumeId, finalCoverLetterId: coverLetter.id },
+        `/api/jobs/${job.id}/assign`, 'PATCH', { finalResumeId: adaptedResumeId },
       )
       if (!confirmed || confirmError) throw new Error(confirmError ?? 'Could not confirm the audited package')
-      setAuditedPackKey(`${adaptedResumeId}:${coverLetter.id}`)
+      void refetchAudit()
       onUpdate(confirmed)
       toast.success('Audited application pack ready', 'The final resume and cover letter are now available in this job.')
     } catch (error) {
@@ -776,14 +786,12 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
   const drawerInputSt: React.CSSProperties = { ...INPUT_STYLE, fontSize: 11, padding: '5px 8px', borderRadius: 5 }
   const canTailorResume = Boolean(applicationPreflight.canPrepare && job.description && (baseResumes.length || existingTailoredResume || job.finalResumeId))
   const packActionDisabled = autoPreparing || !canTailorResume
-  // The final document pair is the shared source of truth used by My Jobs and
-  // the extension sidebar. The audit activity is still checked when available,
-  // but must not make a confirmed package look pending on one surface.
   const hasFinalApplicationPack = Boolean(job.finalResumeId && job.finalCoverLetterId)
-  const currentPackAudited = hasFinalApplicationPack || auditedPackKey === `${job.finalResumeId}:${job.finalCoverLetterId}`
-    || (storedAudit?.audit.verdict === 'pass'
-      && storedAudit.resumeId === job.finalResumeId
-      && storedAudit.coverLetterId === job.finalCoverLetterId)
+  const selectedFinalResume = resumeList?.find(item => item.id === job.finalResumeId)
+    ?? (resumePreview?.id === job.finalResumeId ? resumePreview : null)
+  const currentPackAudited = Boolean(selectedFinalResume && hasCurrentApplicationPackAudit(
+    storedAudit, job, selectedFinalResume, selectedCoverLetter ?? null,
+  ))
 
   return (
     <>
@@ -837,7 +845,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
               <Btn variant="primary" onClick={handleTailorResume} disabled={tailoringLoading}>{tailoringLoading ? t('jobs.pack.preparing') : t('jobs.pack.tailorInResume')}</Btn>
             </div>}
             <div style={{ display: 'flex', alignItems: 'center', gap: 12, color: 'var(--text-muted)', margin: '4px 0 20px' }}><span style={{ height: 1, background: 'var(--border)', flex: 1 }} /><span>{t('jobs.or')}</span><span style={{ height: 1, background: 'var(--border)', flex: 1 }} /></div>
-            <button onClick={() => auditNeedsEvidence ? setOpenPackItem('audit') : void autoTailorAndAudit()} disabled={packActionDisabled || currentPackAudited} style={{ width: '100%', minHeight: 56, padding: '14px', border: `2px solid ${packActionDisabled || currentPackAudited ? '#e2e8f0' : auditNeedsRepair ? '#dc2626' : '#2563eb'}`, borderRadius: 9, background: packActionDisabled || currentPackAudited ? '#f8fafc' : auditNeedsRepair ? '#fff7f7' : '#fff', color: packActionDisabled || currentPackAudited ? '#94a3b8' : auditNeedsRepair ? '#b42318' : '#2563eb', fontSize: 15, fontWeight: 700, cursor: packActionDisabled || currentPackAudited ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, textAlign: 'center' }}><Sparkles size={19} style={{ flexShrink: 0 }} />{currentPackAudited ? t('jobs.pack.ready') : autoPreparing ? t('jobs.pack.preparing') : auditNeedsEvidence ? t('jobs.pack.reviewEvidence') : auditRetryOnly ? t('jobs.pack.retryAudit') : auditNeedsRepair ? t('jobs.pack.fixAudit') : t('jobs.pack.prepareAutomatically')}</button>
+            <button onClick={() => auditNeedsEvidence ? setOpenPackItem('audit') : hasFinalApplicationPack && !auditNeedsRepair ? void recheckFinalPack() : void autoTailorAndAudit()} disabled={packActionDisabled} style={{ width: '100%', minHeight: 56, padding: '14px', border: `2px solid ${packActionDisabled ? '#e2e8f0' : auditNeedsRepair ? '#dc2626' : '#2563eb'}`, borderRadius: 9, background: packActionDisabled ? '#f8fafc' : auditNeedsRepair ? '#fff7f7' : '#fff', color: packActionDisabled ? '#94a3b8' : auditNeedsRepair ? '#b42318' : '#2563eb', fontSize: 15, fontWeight: 700, cursor: packActionDisabled ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10, textAlign: 'center' }}><Sparkles size={19} style={{ flexShrink: 0 }} />{autoPreparing ? t('jobs.pack.preparing') : hasFinalApplicationPack && !auditNeedsEvidence && !auditNeedsRepair ? t('jobs.pack.retryAudit') : auditNeedsEvidence ? t('jobs.pack.reviewEvidence') : auditRetryOnly ? t('jobs.pack.retryAudit') : auditNeedsRepair ? t('jobs.pack.fixAudit') : t('jobs.pack.prepareAutomatically')}</button>
             {autoPreparing && <PreparationProgress stage={packStage} elapsed={preparationElapsed} />}
             <div style={{ textAlign: 'center', fontSize: 13, lineHeight: 1.55, color: 'var(--text-muted)', margin: '12px 28px 28px' }}>{auditRetryOnly ? t('jobs.auditRetryHint') : auditNeedsEvidence ? t('jobs.auditEvidenceHint') : auditNeedsRepair ? t('jobs.auditRepairHint') : t('jobs.auditPrepareHint')}</div>
             <div style={{ borderTop: '1px solid var(--border)', paddingTop: 22, fontSize: 12, fontWeight: 700, letterSpacing: '0.03em', color: '#64748b' }}>{t('jobs.drawer.applicationPack')}</div>
@@ -851,7 +859,7 @@ function JobDetailDrawer({ job, onClose, onStatusChange, onUpdate, onDelete, onO
             <PackRow number="3" title={t('jobs.pack.audit')} detail={packStage === 'audit' ? t('jobs.pack.checkingChanges') : auditRetryOnly ? t('jobs.pack.retryResponse') : auditNeedsEvidence ? `${evidenceGapFindings.length} ${t('jobs.auditFactsCount')}` : auditNeedsRepair ? `${factualAuditFindings.length} ${t('jobs.auditIssuesCount')}` : displayedAudit ? t('jobs.pack.verifiedFacts') : t('jobs.pack.readyRun')} done={currentPackAudited} failed={auditNeedsRepair || auditNeedsEvidence || auditRetryOnly} active={packStage === 'audit'} open={openPackItem === 'audit'} onToggle={() => setOpenPackItem(current => current === 'audit' ? null : 'audit')}>
               <AuditPackPreview audit={displayedAudit} onRepair={() => void autoTailorAndAudit()} onAddEvidence={finding => { setEvidenceFinding(finding); setEvidenceText('') }} repairing={autoPreparing} />
             </PackRow>
-            {currentPackAudited && <button onClick={() => void downloadFinalPack()} disabled={downloadingPack} style={{ width: '100%', minHeight: 46, border: 0, borderRadius: 9, background: '#2563eb', color: '#fff', fontWeight: 700, cursor: 'pointer' }}>{downloadingPack ? (exportedPackFolder ? t('jobs.pack.openingFolder') : t('jobs.pack.savingPdfs')) : exportedPackFolder ? t('jobs.pack.openFolder') : t('jobs.pack.savePdfs')}</button>}
+            {currentPackAudited && <><button onClick={() => void downloadFinalPack()} disabled={downloadingPack} style={{ width: '100%', minHeight: 46, border: 0, borderRadius: 9, background: '#2563eb', color: '#fff', fontWeight: 700, cursor: 'pointer' }}>{downloadingPack ? t('jobs.pack.savingPdfs') : t('jobs.pack.savePdfs')}</button><a href={`/api/jobs/${encodeURIComponent(job.id)}/application-pack`} target="_blank" rel="noopener noreferrer" style={{ display: 'block', textAlign: 'center', marginTop: 8 }}>{t('jobs.pack.printView')}</a></>}
             <PackRow number="4" title={t('jobs.pack.openFill')} detail={applicationPreflight.canAutomate ? t('jobs.pack.availableComplete') : t('jobs.pack.requiresLink')} done={false} locked={!currentPackAudited || !applicationPreflight.canAutomate} last onClick={currentPackAudited && applicationPreflight.canAutomate && job.url ? () => window.open(job.url!, '_blank', 'noopener,noreferrer') : undefined} />
             <div style={{ borderTop: '1px solid var(--border)', marginTop: 8, paddingTop: 22 }}><div style={{ fontSize: 12, fontWeight: 700, color: '#64748b', marginBottom: 12 }}>{t('jobs.drawer.reviewSubmit')}</div><div style={{ border: '1px solid #bfdbfe', background: '#f8fbff', borderRadius: 9, padding: '14px 16px', display: 'flex', gap: 12, fontSize: 13, lineHeight: 1.55 }}><Info size={22} color="#2563eb" style={{ flexShrink: 0, marginTop: 1 }} /><span><strong>{t('jobs.pack.submitEmployer')}</strong><br /><span style={{ color: 'var(--text-muted)' }}>{t('jobs.pack.openWhenReady')}</span></span></div></div>
             <div style={{ borderTop: '1px solid var(--border)', marginTop: 28, paddingTop: 22 }}>
@@ -1067,26 +1075,6 @@ function renderSalary(salary: unknown): string {
   if (!salary) return ''
   if (typeof salary === 'string') return salary
   return String(salary)
-}
-
-type StoredApplicationAudit = {
-  resumeId: string
-  coverLetterId: string | null
-  audit: ApplicationAudit
-}
-
-function findLatestApplicationAudit(activity: Activity[]): StoredApplicationAudit | null {
-  for (const item of activity) {
-    const prefix = '[Auditor] application-audit '
-    if (!item.text.startsWith(prefix)) continue
-    try {
-      const parsed = JSON.parse(item.text.slice(prefix.length)) as StoredApplicationAudit
-      if (parsed.resumeId && parsed.coverLetterId !== undefined && parsed.audit?.verdict && Array.isArray(parsed.audit.findings)) return parsed
-    } catch {
-      // Ignore legacy or malformed activity entries rather than breaking the job drawer.
-    }
-  }
-  return null
 }
 
 const workflowDocumentButton: React.CSSProperties = {

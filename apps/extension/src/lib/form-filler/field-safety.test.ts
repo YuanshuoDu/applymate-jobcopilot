@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { filterSafeFormFields, filterSafeFormRevision, isSensitiveFormField, readStaticFormLabel } from './field-safety'
+import { filterSafeFormFields, filterSafeFormRevision, isSensitiveFormField, readStaticFormLabel, mergeSafeFormAnswers } from './field-safety'
 import type { FilledField, FormFieldSchema } from './types'
 
 const field = (id: string, label: string, currentValue?: string): FormFieldSchema => ({
@@ -67,5 +67,25 @@ describe('form data safety boundaries', () => {
       get textContent() { throw new Error('Mixed label text must not be read') },
     } as unknown as Element
     expect(readStaticFormLabel(label).trim()).toBe('First name')
+  })
+
+  it('keeps model responses within the supplied safe IDs and preserves unmodified reviewed answers', () => {
+    const fields = [field('frame|0|name', 'Full name'), field('frame|7|email', 'Email'), field('frame|0|password', 'Password')]
+    const answers = mergeSafeFormAnswers(fields, [fill('frame|0|name', 'Original name'), fill('frame|7|email', 'candidate@example.test')], [
+      fill('frame|7|email', 'revised@example.test'),
+      fill('unscanned-native-control', 'unexpected remote action'),
+      fill('frame|0|password', 'secret'),
+      fill('frame|0|email', 'wrong frame'),
+    ])
+    expect(answers.map(answer => [answer.fieldId, answer.value])).toEqual([
+      ['frame|0|name', 'Original name'], ['frame|7|email', 'revised@example.test'],
+    ])
+  })
+
+  it('treats malformed remote values as absent, without losing existing reviewed answers', () => {
+    const fields = [field('name', 'Full name')]
+    const previous = [fill('name', 'Original')]
+    expect(mergeSafeFormAnswers(fields, previous, [{ fieldId: 'name', value: { execute: 'anything' } }, null])).toEqual(previous)
+    expect(mergeSafeFormAnswers(fields, previous, { fields: [] })).toEqual(previous)
   })
 })
