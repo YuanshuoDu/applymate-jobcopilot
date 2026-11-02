@@ -50,6 +50,7 @@ The runtime did not permit opening Chrome's extension-management page. No altern
 - A separate preview imports actual popup/side-panel components with fictional in-memory fixtures. Login, AI, persistent writes, permissions, downloads, printing, external navigation and network calls are disabled.
 - Manifest version/version_name is 0.1.22; minimum Chrome is 116. Production removes unused contextMenus, localhost and the old Vercel host. Only development builds restore documented loopback origins.
 - The default extension test command now includes source-adjacent security tests.
+- Stabilized the translation callback across ordinary renders to stop the Profile loading effect from repeatedly fetching data. A real React root/effect regression covers asynchronous result updates, parent renders, unchanged-language polling and language changes.
 - Corrected the popup action title/subtitle layout. The isolated preview uses the original icon bytes and the actual 360-pixel popup width.
 
 ## Verification
@@ -57,7 +58,7 @@ The runtime did not permit opening Chrome's extension-management page. No altern
 | Check | Result |
 | --- | --- |
 | Extension TypeScript | Passed: tsc --noEmit --pretty false |
-| All extension tests | Passed: 24 files, 209 tests |
+| All extension tests | Passed: 24 files, 210 tests |
 | Web targeted release regressions | Passed: 22 files, 164 tests |
 | Final privacy copy | Existing 5 privacy tests rerun after the final bilingual disclosure text |
 | Full Web TypeScript | Passed: tsc --noEmit --incremental false --pretty false |
@@ -82,8 +83,8 @@ Fictional PDF validation generated actual Resume.pdf and CoverLetter.pdf, each o
 ## Exact archive
 
 - Filename: ApplyMate-AI-0.1.22.zip
-- Size: 259589 bytes
-- SHA-256: 1f27965b0b77ff7eb10a9d6b4d4165b63335bd76d122c0e1d269ef5bd9dc1ea7
+- Size: 259612 bytes
+- SHA-256: 2424fc3ae8c062865f86f6f09f8c56929df296a38c67c8a934924a1acd53587c
 - Entries: 23, comprising 19 files and 4 directories.
 
 The existing build process embeds a fresh content-runtime marker. Rebuilding identical source can change the checksum; the value above identifies the delivered archive.

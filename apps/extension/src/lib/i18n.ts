@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 
 export type ExtensionLang = 'en' | 'de' | 'fr' | 'es' | 'nl' | 'zh'
 
@@ -372,6 +372,8 @@ function getExtensionLang(): ExtensionLang {
 
 export function useExtensionI18n() {
   const [lang, setLang] = useState<ExtensionLang>(getExtensionLang)
+  // Consumers use t in effect dependencies; data loads must not recreate it.
+  const t = useCallback((english: string) => translateExtension(lang, english), [lang])
   useEffect(() => {
     const timer = window.setInterval(() => {
       const next = getExtensionLang()
@@ -381,7 +383,7 @@ export function useExtensionI18n() {
   }, [])
   return {
     lang,
-    t: (english: string) => translateExtension(lang, english),
+    t,
   }
 }
 
