@@ -77,7 +77,7 @@ describe("expired recovery SQL predicates", () => {
     expect(query).toHaveBeenCalledTimes(2)
     const [sql, values] = query.mock.calls[1] as [string, unknown[]]
     expect(values).toEqual([task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount,
-      task.leaseExpiresAt, task.userId, "ignored-event", "continuation-1", null, null])
+      task.leaseExpiresAt, task.userId, "ignored-event", "continuation-1", null, null, null, null, null])
     expectSqlBindings(sql, values)
     expectSqlBindings(query.mock.calls[0]![0] as string, query.mock.calls[0]![1] as unknown[])
     expect(sql).toContain('started."sessionId" = $1 AND started."taskId" = $2')
@@ -95,7 +95,8 @@ describe("expired recovery SQL predicates", () => {
   it("only allows the exact consumed-wait continuation claim through expiry recovery", async () => {
     const deadline = new Date("2026-10-06T10:00:00.000Z")
     const query = vi.fn()
-      .mockResolvedValueOnce({ rows: [{ toolCallId: "child-wait-call:415-555-0134" }] })
+      .mockResolvedValueOnce({ rows: [{ toolCallId: "child-wait-call:415-555-0134", callItemId: "source-call-item",
+        sourceStepId: "source-step", sourceAttempt: 1 }] })
       .mockResolvedValueOnce({ rows: [{ id: "claim-start", claimWaitId: "wait-1", waitDeadlineAt: deadline, outcomeDeadlineAt: deadline.toISOString(),
         sourceWaitKey: "child-wait:415-555-0134:attempt:1", continuationWaitKey: "child-wait:[REDACTED_PHONE]:attempt:1" }] })
     const client = { query }
@@ -103,10 +104,12 @@ describe("expired recovery SQL predicates", () => {
     expect(query).toHaveBeenCalledTimes(2)
     const [sql, values] = query.mock.calls[1] as [string, unknown[]]
     expect(values).toEqual([task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount,
-      task.leaseExpiresAt, task.userId, null, "continuation-1", "child-wait-call:415-555-0134", "child-wait-call:[REDACTED_PHONE]"])
+      task.leaseExpiresAt, task.userId, null, "continuation-1", "child-wait-call:415-555-0134", "child-wait-call:[REDACTED_PHONE]",
+      "source-call-item", "source-step", 1])
     expectSqlBindings(sql, values)
     expectSqlBindings(query.mock.calls[0]![0] as string, query.mock.calls[0]![1] as unknown[])
     expect(CHILD_WAIT_CLAIM_RECOVERY_SQL).toContain("$11::text IS NOT NULL AND $12::text IS NOT NULL")
+    expect(sql).toContain("$13::text IS NOT NULL AND $14::text IS NOT NULL AND $15::integer IS NOT NULL")
     expect(sql).toContain('LEFT JOIN LATERAL (SELECT latest_wait."id" AS "waitId"')
     expect(sql).toContain('FROM latest_wait WHERE started."type" = \'tool_call.started\' AND $10::text IS NOT NULL AND EXISTS (')
     expect(sql).toContain("started.\"idempotencyKey\" = 'task:' || owner.\"id\" || ':event:child-wait-claim:' || owner.\"attemptCount\"::text || ':' || continuation.\"id\"")

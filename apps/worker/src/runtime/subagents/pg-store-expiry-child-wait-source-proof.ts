@@ -7,7 +7,7 @@ export const CHILD_WAIT_SOURCE_CALL_PROJECTION_SQL = `WITH latest_wait AS MATERI
   WHERE wait."parentTaskId" = $2 AND wait."sessionId" = $1 AND wait."turnId" = $3 AND latestStep."attempt" BETWEEN 1 AND $6
   ORDER BY latestStep."attempt" DESC, latestStep."ordinal" DESC, wait."createdAt" DESC, wait."id" DESC LIMIT 1
 )
-SELECT sourceCall."content"->>'toolCallId' AS "toolCallId" FROM "sub_agent_tasks" AS owner
+SELECT sourceCall."content"->>'toolCallId' AS "toolCallId", sourceCall."id" AS "callItemId", source."id" AS "sourceStepId", source."attempt" AS "sourceAttempt" FROM "sub_agent_tasks" AS owner
 JOIN "agent_sessions" AS session ON session."id" = owner."sessionId" AND session."userId" = $8 JOIN "agent_turns" AS turn ON turn."id" = owner."turnId" AND turn."sessionId" = owner."sessionId" AND turn."userId" = session."userId" AND turn."rootTaskId" = owner."rootTaskId"
 JOIN latest_wait AS wait ON TRUE JOIN "agent_steps" AS source ON source."id" = wait."stepId" AND source."sessionId" = wait."sessionId" AND source."turnId" = wait."turnId" AND source."taskId" = owner."id"
 JOIN "agent_steps" AS continuation ON continuation."id" = $9 AND continuation."sessionId" = source."sessionId" AND continuation."turnId" = source."turnId" AND continuation."taskId" = source."taskId" AND continuation."attempt" = $6
@@ -19,19 +19,17 @@ WHERE owner."id" = $2 AND owner."sessionId" = $1 AND owner."turnId" = $3 AND own
   AND (SELECT COUNT(*) FROM "agent_items" AS sourceCallCandidate WHERE sourceCallCandidate."sessionId" = source."sessionId" AND sourceCallCandidate."turnId" = source."turnId" AND sourceCallCandidate."taskId" = source."taskId" AND sourceCallCandidate."stepId" = source."id" AND sourceCallCandidate."type" = 'tool_call' AND sourceCallCandidate."content"->>'toolName' = 'wait_subagents') = 1
 LIMIT 2`
 
-export type ChildWaitSourceCallProjection = Readonly<{ rawCallId: string; projectedCallId: string }>
+export type ChildWaitSourceCallProjection = Readonly<{ rawCallId: string; projectedCallId: string; callItemId: string; sourceStepId: string; sourceAttempt: number }>
 
 export async function readChildWaitSourceCallProjection(client: pg.PoolClient, task: Record<string, unknown>, continuationId: string): Promise<ChildWaitSourceCallProjection | null> {
-  const rows = await client.query<{ toolCallId: string | null }>(CHILD_WAIT_SOURCE_CALL_PROJECTION_SQL, [
-    task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount,
-    task.leaseExpiresAt, task.userId, continuationId,
-  ])
-  const rawCallId = rows.rows.length === 1 ? rows.rows[0]?.toolCallId : null
+  const rows = await client.query<{ toolCallId: string | null; callItemId: string | null; sourceStepId: string | null; sourceAttempt: number | null }>(
+    CHILD_WAIT_SOURCE_CALL_PROJECTION_SQL, [task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount, task.leaseExpiresAt, task.userId, continuationId])
+  const row = rows.rows.length === 1 ? rows.rows[0] : undefined; const rawCallId = row?.toolCallId
   if (typeof rawCallId !== "string" || rawCallId.length < 1 || rawCallId.length > 256 || rawCallId.trim() !== rawCallId) return null
-  const projected = projectWaitCallEventContent({ toolName: "wait_subagents", toolCallId: rawCallId })
-  if (projected === null || typeof projected !== "object" || Array.isArray(projected)) return null
-  const projectedCallId = (projected as Record<string, unknown>).toolCallId
-  return typeof projectedCallId === "string" ? { rawCallId, projectedCallId } : null
+  if (typeof row?.callItemId !== "string" || row.callItemId.length < 1 || row.callItemId.length > 1_024 || row.callItemId.trim() !== row.callItemId || typeof row.sourceStepId !== "string" || row.sourceStepId.length < 1 || row.sourceStepId.length > 1_024 || row.sourceStepId.trim() !== row.sourceStepId || typeof row.sourceAttempt !== "number" || !Number.isSafeInteger(row.sourceAttempt) || row.sourceAttempt < 1 || typeof task.attemptCount !== "number" || !Number.isSafeInteger(task.attemptCount) || task.attemptCount < row.sourceAttempt) return null
+  const projected = projectWaitCallEventContent({ toolName: "wait_subagents", toolCallId: rawCallId }); if (projected === null || typeof projected !== "object" || Array.isArray(projected)) return null
+  const projectedCallId = (projected as Record<string, unknown>).toolCallId; return typeof projectedCallId === "string"
+    ? { rawCallId, projectedCallId, callItemId: row.callItemId, sourceStepId: row.sourceStepId, sourceAttempt: row.sourceAttempt } : null
 }
 
 /** Exact crash cut for a registered source wait whose executor never returned. */

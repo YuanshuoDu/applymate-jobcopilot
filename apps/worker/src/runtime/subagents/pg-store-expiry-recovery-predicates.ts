@@ -240,7 +240,7 @@ export async function hasBlockingExternalCall(client: pg.PoolClient, task: Recor
           AND jsonb_array_length(CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN wait."targetTaskIds" ELSE '[]'::jsonb END) BETWEEN 1 AND 8
           AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN wait."targetTaskIds" ELSE '[]'::jsonb END) AS target("id")
             WHERE NOT EXISTS (SELECT 1 FROM "sub_agent_tasks" AS child WHERE child."id" = target."id" AND child."parentTaskId" = owner."id" AND child."rootTaskId" = $4 AND child."sessionId" = $1 AND child."turnId" = $3))))
-      AND ($9::text IS NULL OR started."id" <> $9) LIMIT 2`, [task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount, task.leaseExpiresAt, task.userId, ignoredEventId ?? null, continuationId ?? null, sourceCallProjection?.rawCallId ?? null, sourceCallProjection?.projectedCallId ?? null])
+      AND ($9::text IS NULL OR started."id" <> $9) LIMIT 2`, [task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount, task.leaseExpiresAt, task.userId, ignoredEventId ?? null, continuationId ?? null, sourceCallProjection?.rawCallId ?? null, sourceCallProjection?.projectedCallId ?? null, sourceCallProjection?.callItemId ?? null, sourceCallProjection?.sourceStepId ?? null, sourceCallProjection?.sourceAttempt ?? null])
   if (!result.rows.length) return false
   if (result.rows.length !== 1 || typeof result.rows[0]?.claimWaitId !== "string") return true
   const deadlineText = result.rows[0].outcomeDeadlineAt, waitDeadline = dateValue(result.rows[0].waitDeadlineAt), claimDeadline = typeof deadlineText === "string" ? dateValue(deadlineText) : null

@@ -84,6 +84,27 @@ export const CHILD_WAIT_CALL_LIFECYCLE_SQL = `(
   OR ${CHILD_WAIT_CALL_ITEM_COMPLETED_NO_EVENT_SQL}
 )`
 
+/** Exact safe event projection for the one raw source call proven by the current consumed-wait receipt. */
+const CHILD_WAIT_SOURCE_PROJECTED_COMPLETION_SQL = `(
+  $11::text IS NOT NULL AND $12::text IS NOT NULL AND $13::text IS NOT NULL AND $14::text IS NOT NULL AND $15::integer IS NOT NULL
+  AND callItem."content"->>'toolCallId' = $11::text AND started."correlationId" = $11::text
+  AND callItem."id" = $13::text AND callItem."stepId" = $14::text AND callStep."id" = $14::text
+  AND callStep."attempt" = $15::integer AND $15::integer BETWEEN 1 AND owner."attemptCount"
+  AND callItem."content"->>'status' = 'completed' AND callItem."content"->'errorCode' = 'null'::jsonb
+  AND jsonb_array_length(CASE WHEN jsonb_typeof(callItem."content"->'input'->'taskIds') = 'array'
+    THEN callItem."content"->'input'->'taskIds' ELSE '[]'::jsonb END) BETWEEN 1 AND 8
+  AND callItem."content"->'input'->>'mode' IN ('any', 'all')
+  AND jsonb_typeof(callItem."content"->'input'->'timeoutMs') = 'number'
+  AND callItem."content"->'input'->>'timeoutMs' ~ '^([1-9][0-9]{0,3}|[12][0-9]{4}|30000)$'
+  AND itemCompleted."payload" = jsonb_build_object('itemId', callItem."id", 'status', 'completed', 'content',
+    jsonb_build_object('toolName', 'wait_subagents', 'input', jsonb_build_object('idempotencyKey', '[REDACTED]',
+      'taskIds', (SELECT jsonb_agg(to_jsonb('[REDACTED]'::text) ORDER BY target.ordinal)
+        FROM generate_series(1, jsonb_array_length(CASE WHEN jsonb_typeof(callItem."content"->'input'->'taskIds') = 'array'
+          THEN callItem."content"->'input'->'taskIds' ELSE '[]'::jsonb END)) AS target(ordinal)),
+      'mode', callItem."content"->'input'->'mode', 'timeoutMs', callItem."content"->'input'->'timeoutMs'),
+      'toolCallId', $12::text, 'toolVersion', '1', 'status', 'completed', 'errorCode', NULL))
+)`
+
 /** Only an exact wait-call item/event lifecycle may settle its external start. */
 export const CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL = `(
   NOT (started."type" = 'tool_call.started' AND (
@@ -138,7 +159,8 @@ export const CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL = `(
       AND started."causationId" = itemStarted."id" AND itemStarted."sequence" < started."sequence"
       AND itemCompleted."actor" = 'subagent' AND itemCompleted."correlationId" = callItem."id"
       AND started."sequence" < itemCompleted."sequence"
-      AND itemCompleted."payload" = jsonb_build_object('itemId', callItem."id", 'status', 'completed', 'content', callItem."content")
+      AND (itemCompleted."payload" = jsonb_build_object('itemId', callItem."id", 'status', 'completed', 'content', callItem."content")
+        OR ${CHILD_WAIT_SOURCE_PROJECTED_COMPLETION_SQL})
       AND itemCompleted."idempotencyKey" = 'task:' || owner."id" || ':event:tool-call-completed:' || started."correlationId" || ':' || callItem."id" || ':1'
       AND itemCompleted."causationId" = started."id"
       AND settled."sessionId" = callItem."sessionId" AND settled."turnId" = callItem."turnId" AND settled."taskId" = callItem."taskId"

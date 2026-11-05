@@ -71,7 +71,11 @@ const waitAcknowledgementFailureReasons = new Map([
 ])
 const sourceLifecycleStages = new Set([
   "required_value", "resume_scope", "source_step", "source_call_count", "source_call_input", "source_item_set", "wait_record_shape",
-  "provenance_marker", "source_receipt_state", "source_event_chain", "reconciliation", "safe_result_shape", "source_start_event",
+  "provenance_marker", "source_receipt_missing", "source_marker_without_result", "source_recovered_receipt_mismatch", "source_waiting_content",
+  "source_waiting_output_shape", "source_waiting_identity", "source_waiting_targets", "source_waiting_matched_ids", "source_waiting_tasks",
+  "source_waiting_task_ids", "source_waiting_deadline", "source_initial_call_shape", "source_call_completion_state", "source_result_completion_state",
+  "source_call_completion_content", "source_result_completion_content", "source_waiting_output_missing", "source_event_chain", "reconciliation",
+  "safe_result_shape", "source_start_event",
 ])
 function waitAcknowledgementFailureDiagnostic(error) {
   const value = error && typeof error === "object" ? error : {}

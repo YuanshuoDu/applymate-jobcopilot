@@ -68,6 +68,22 @@ describe("completed child-wait claim call without item.completed", () => {
 })
 
 describe("child-wait terminal settlement", () => {
+  it("requires a repeated raw call ID to match the selected item, source step, and attempt", () => {
+    const source = { rawCallId: "same-source-call", callItemId: "source-call-attempt-1", sourceStepId: "source-step-attempt-1", sourceAttempt: 1 }
+    const decoys = [
+      { ...source, callItemId: "other-call-attempt-1" },
+      { ...source, sourceStepId: "other-step-attempt-1" },
+      { ...source, callItemId: "source-call-attempt-2", sourceStepId: "source-step-attempt-2", sourceAttempt: 2 },
+    ]
+    expect(decoys.every(candidate => candidate.rawCallId === source.rawCallId)).toBe(true)
+    expect(decoys.map(candidate => candidate.callItemId === source.callItemId
+      && candidate.sourceStepId === source.sourceStepId && candidate.sourceAttempt === source.sourceAttempt)).toEqual([false, false, false])
+    const sql = CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL.replace(/\s+/g, " ")
+    expect(sql).toContain('callItem."content"->>\'toolCallId\' = $11::text AND started."correlationId" = $11::text')
+    expect(sql).toContain('callItem."id" = $13::text AND callItem."stepId" = $14::text AND callStep."id" = $14::text')
+    expect(sql).toContain('callStep."attempt" = $15::integer AND $15::integer BETWEEN 1 AND owner."attemptCount"')
+  })
+
   it("keeps unrelated calls on the existing path and requires the complete causal lifecycle for waits", () => {
     const sql = CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL.replace(/\s+/g, " ")
     expect(sql).toContain("started.\"payload\"->>'toolName' = 'wait_subagents'")
@@ -89,6 +105,14 @@ describe("child-wait terminal settlement", () => {
     expect(sql).not.toContain("tool-recovered:")
     expect(sql).toContain("settled.\"type\" = 'tool_call.completed'")
     expect(sql).toContain("settled.\"type\" = 'tool_call.failed'")
+    expect(sql).toContain("$11::text IS NOT NULL AND $12::text IS NOT NULL AND $13::text IS NOT NULL AND $14::text IS NOT NULL AND $15::integer IS NOT NULL")
+    expect(sql).toContain("callItem.\"content\"->>'toolCallId' = $11::text AND started.\"correlationId\" = $11::text")
+    expect(sql).toContain('callItem."id" = $13::text AND callItem."stepId" = $14::text AND callStep."id" = $14::text')
+    expect(sql).toContain('callStep."attempt" = $15::integer AND $15::integer BETWEEN 1 AND owner."attemptCount"')
+    expect(sql).toContain("itemCompleted.\"payload\" = jsonb_build_object('itemId', callItem.\"id\", 'status', 'completed'")
+    expect(sql).toContain("'idempotencyKey', '[REDACTED]'")
+    expect(sql).toContain("'toolCallId', $12::text")
+    expect(sql).toContain("jsonb_array_length(CASE WHEN jsonb_typeof(callItem.\"content\"->'input'->'taskIds') = 'array'")
     expect(sql).toContain("terminal.\"type\" IN ('tool_call.completed', 'tool_call.failed', 'tool_call.interrupted')) = 1")
     expect(sql).toContain("extra.\"id\" NOT IN (itemStarted.\"id\", started.\"id\", itemCompleted.\"id\", settled.\"id\")")
   })

@@ -20,7 +20,7 @@ type Lease = Pick<SubagentLease, "id" | "userId" | "sessionId" | "turnId" | "roo
 type Lifecycle = Readonly<{ state: "unreconciled" | "waiting" | "recovered"; toolCallId: string; callItemId: string; sourceAttempt: number; resultItemId?: string }>
 type Provenance = Readonly<{ schemaVersion: "child-wait-source-lifecycle.v1"; userId: string; sessionId: string; turnId: string; rootTaskId: string; taskId: string; ownerId: string; attempt: number; stepId: string; waitId: string; toolCallId: string; callItemId: string; resultItemId: string }>
 type SourceLifecycleRejectStage = "required_value" | "resume_scope" | "source_step" | "source_call_count" | "source_call_input" | "source_item_set" | "wait_record_shape"
-  | "provenance_marker" | "source_receipt_state" | "source_event_chain" | "reconciliation" | "safe_result_shape" | "source_start_event"
+  | "provenance_marker" | "source_receipt_missing" | "source_marker_without_result" | "source_recovered_receipt_mismatch" | "source_waiting_content" | "source_waiting_output_shape" | "source_waiting_identity" | "source_waiting_targets" | "source_waiting_matched_ids" | "source_waiting_tasks" | "source_waiting_task_ids" | "source_waiting_deadline" | "source_initial_call_shape" | "source_call_completion_state" | "source_result_completion_state" | "source_call_completion_content" | "source_result_completion_content" | "source_waiting_output_missing" | "source_event_chain" | "reconciliation" | "safe_result_shape" | "source_start_event"
 const LIMIT = 16_384, VERSION = "child-wait-source-lifecycle.v1"
 function obj(value: unknown): Row { return value && typeof value === "object" && !Array.isArray(value) ? value as Row : {} }
 function exact(value: Row, keys: readonly string[]): boolean { const a = Object.keys(value).sort(), b = [...keys].sort(); return a.length === b.length && a.every((key, i) => key === b[i]) }
@@ -72,16 +72,18 @@ function safeResultContent(callId: string, output: DurableSubagentWaitResult): R
   safe.toolCallId = callId
   return toRepositoryJson(safe)
 }
-function validWaitingReceipt(result: Row | undefined, wait: Row, ids: readonly string[], callId: string): boolean {
+function waitingReceiptRejectStage(result: Row | undefined, wait: Row, ids: readonly string[], callId: string): SourceLifecycleRejectStage | undefined {
   const content = obj(result?.content), output = obj(content.output), outputIds = strictIds(output.taskIds)
   const tasks = Array.isArray(output.tasks) ? output.tasks.map(obj) : [], taskIds = tasks.map(task => task.taskId)
   const matched = output.matchedTaskIds
-  return !!result && content.toolCallId === callId && content.errorCode === null && exact(content, ["toolCallId", "output", "errorCode"])
-    && exact(output, ["waitId", "status", "taskIds", "deadlineAt", "matchedTaskIds", "tasks"])
-    && output.waitId === wait.id && output.status === "waiting" && !!outputIds && sameIds(outputIds, ids)
-    && Array.isArray(matched) && matched.length === 0 && tasks.length === ids.length && tasks.every(task => exact(task, ["taskId", "status", "role", "result", "failureReason"]))
-    && taskIds.every(id => typeof id === "string") && sameIds(taskIds as string[], ids)
-    && text(output.deadlineAt) && new Date(output.deadlineAt).getTime() === new Date(String(wait.deadlineAt)).getTime()
+  return !result ? "source_receipt_missing" : !exact(content, ["toolCallId", "output", "errorCode"]) || content.toolCallId !== callId || content.errorCode !== null ? "source_waiting_content"
+    : !exact(output, ["waitId", "status", "taskIds", "deadlineAt", "matchedTaskIds", "tasks"]) ? "source_waiting_output_shape"
+      : output.waitId !== wait.id || output.status !== "waiting" ? "source_waiting_identity"
+        : !outputIds || !sameIds(outputIds, ids) ? "source_waiting_targets"
+          : !Array.isArray(matched) || matched.length !== 0 ? "source_waiting_matched_ids"
+            : tasks.length !== ids.length || !tasks.every(task => exact(task, ["taskId", "status", "role", "result", "failureReason"])) ? "source_waiting_tasks"
+              : !taskIds.every(id => typeof id === "string") || !sameIds(taskIds as string[], ids) ? "source_waiting_task_ids"
+                : !text(output.deadlineAt) || new Date(output.deadlineAt).getTime() !== new Date(String(wait.deadlineAt)).getTime() ? "source_waiting_deadline" : undefined
 }
 function event(ownerFence: ExecutionOwnerFence, key: string, itemId: string, correlationId: string, type: string, payload: unknown): TurnEngineEventInput {
   return { owner: ownerFence, id: "event:" + randomUUID(), itemId, correlationId, causationId: null, type,
@@ -119,17 +121,16 @@ export async function inspectChildWaitSourceLifecycle(client: QueryClient, lease
   if (markerExists && resultItemId !== resultId(lease.id, waitId, callInfo.id)) return reject("provenance_marker")
   const rawOutput = result ? obj(obj(result.content).output) : {}
   const recovered = !!result && markerExists && sameJson(rawOutput, safeSubagentWaitJson(output, LIMIT))
-  const waiting = !markerExists && validWaitingReceipt(result, wait, ids, callInfo.id)
+  const waitingFailure = waitingReceiptRejectStage(result, wait, ids, callInfo.id)
+  const waiting = !markerExists && waitingFailure === undefined
   const initial = !result && !markerExists && callItem.status === "started" && Number(callItem.revision) === 0
-  if (!initial && !waiting && !recovered) return reject("source_receipt_state")
-  if (initial && (!exact(call, ["toolCallId", "toolName", "toolVersion", "input"]) || callItem.phase !== null)) return reject("source_receipt_state")
-  if (!initial && (callItem.status !== "completed" || Number(callItem.revision) !== 1 || !result || result.status !== "completed"
-    || Number(result.revision) !== 1 || callItem.phase !== null || result.phase !== null
-    || !exact(call, ["toolCallId", "toolName", "toolVersion", "status", "errorCode", "input"])
-    || call.status !== "completed" || call.errorCode !== null || !sameJson(call.input, callInfo.input)
-    || !exact(obj(result.content), ["toolCallId", "output", "errorCode"]) || obj(result.content).toolCallId !== callInfo.id
-    || obj(result.content).errorCode !== null)) return reject("source_receipt_state")
-  if (!initial && waiting && (markerExists || obj(result.content).output === undefined)) return reject("source_receipt_state")
+  if (!initial && !waiting && !recovered) return reject(markerExists ? result ? "source_recovered_receipt_mismatch" : "source_marker_without_result" : waitingFailure ?? "source_receipt_missing")
+  if (initial && (!exact(call, ["toolCallId", "toolName", "toolVersion", "input"]) || callItem.phase !== null)) return reject("source_initial_call_shape")
+  if (!initial && (callItem.status !== "completed" || Number(callItem.revision) !== 1 || callItem.phase !== null)) return reject("source_call_completion_state")
+  if (!initial && (!result || result.status !== "completed" || Number(result.revision) !== 1 || result.phase !== null)) return reject("source_result_completion_state")
+  if (!initial && (!exact(call, ["toolCallId", "toolName", "toolVersion", "status", "errorCode", "input"]) || call.status !== "completed" || call.errorCode !== null || !sameJson(call.input, callInfo.input))) return reject("source_call_completion_content")
+  if (!initial && (!exact(obj(result?.content), ["toolCallId", "output", "errorCode"]) || obj(result?.content).toolCallId !== callInfo.id || obj(result?.content).errorCode !== null)) return reject("source_result_completion_content")
+  if (!initial && waiting && (markerExists || obj(result?.content).output === undefined)) return reject("source_waiting_output_missing")
   if (!initial && recovered && !validMarker(savedMarker, expectedMarker)) return reject("provenance_marker")
   const expectedEvents = await validateEvents(client, lease, stepId, callItem, result, callInfo.id, resultItemId, output, initial, waiting)
   if (!expectedEvents) return reject("source_event_chain")

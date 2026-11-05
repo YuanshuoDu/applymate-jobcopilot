@@ -196,6 +196,19 @@ describe("child source wait lifecycle recovery", () => {
     expect(fake.wait.result).not.toHaveProperty("sourceLifecycleRecovery")
   })
 
+  it.each([
+    ["outer receipt identity", (output: Record<string, unknown>) => { output.status = "ready" }, "source_waiting_identity"],
+    ["target projection", (output: Record<string, unknown>) => { output.taskIds = ["other-target"] }, "source_waiting_targets"],
+    ["matched target list", (output: Record<string, unknown>) => { output.matchedTaskIds = ["target"] }, "source_waiting_matched_ids"],
+    ["deadline", (output: Record<string, unknown>) => { output.deadlineAt = "2026-10-30T10:00:06.000Z" }, "source_waiting_deadline"],
+  ] as const)("classifies a bounded source receipt mismatch as %s", async (_label, corrupt, stage) => {
+    const fake = waitingFixture("safe"), result = fake.items.find(item => item.type === "tool_result")!
+    const content = result.content as Record<string, unknown>, output = { ...(content.output as Record<string, unknown>) }
+    corrupt(output); content.output = output
+    await expect(inspectChildWaitSourceLifecycle(fake.client as never, lease, fake.wait, "step-1", fake.result as never))
+      .rejects.toMatchObject({ code: "wait_scope_error", message: "Child wait source lifecycle is inconsistent", sourceLifecycleStage: stage })
+  })
+
   it("rejects a waiting completion event that differs from both raw and safe projections", async () => {
     const fake = waitingFixture("malformed")
     const failure = await inspectChildWaitSourceLifecycle(fake.client as never, lease, fake.wait, "step-1", fake.result as never)

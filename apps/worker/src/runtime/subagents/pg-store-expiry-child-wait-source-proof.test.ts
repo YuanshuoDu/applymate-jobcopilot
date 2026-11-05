@@ -7,11 +7,12 @@ describe("registered child-wait source crash proof", () => {
     const task = { sessionId: "session", id: "task", turnId: "turn", rootTaskId: "root", leaseOwner: "owner",
       attemptCount: 2, leaseExpiresAt: new Date("2026-10-31T00:00:00.000Z"), userId: "user" }
     const rawCallId = "x".repeat(256)
-    const query = vi.fn().mockResolvedValue({ rows: [{ toolCallId: rawCallId }] })
+    const query = vi.fn().mockResolvedValue({ rows: [{ toolCallId: rawCallId, callItemId: "source-call-item", sourceStepId: "source-step", sourceAttempt: 1 }] })
     const projection = await readChildWaitSourceCallProjection({ query } as never, task, "continuation")
     const canonical = projectWaitCallEventContent({ toolName: "wait_subagents", toolCallId: rawCallId }) as Record<string, unknown>
     expect(rawCallId).toHaveLength(256)
-    expect(projection).toEqual({ rawCallId, projectedCallId: canonical.toolCallId })
+    expect(projection).toEqual({ rawCallId, projectedCallId: canonical.toolCallId, callItemId: "source-call-item",
+      sourceStepId: "source-step", sourceAttempt: 1 })
     expect(projection?.projectedCallId).toBe(rawCallId)
     const phoneProjection = projectWaitCallEventContent({ toolName: "wait_subagents", toolCallId: "child-wait-call:415-555-0134" }) as Record<string, unknown>
     expect(phoneProjection.toolCallId).toBe("child-wait-call:[REDACTED_PHONE]")
@@ -24,6 +25,8 @@ describe("registered child-wait source crash proof", () => {
     expect(waitProjection).toContain('wait."sessionId"')
     expect(waitProjection).toContain('wait."turnId"')
     expect(CHILD_WAIT_SOURCE_CALL_PROJECTION_SQL).toContain('owner."leaseOwner" = $5 AND owner."attemptCount" = $6')
+    expect(CHILD_WAIT_SOURCE_CALL_PROJECTION_SQL).toContain('sourceCall."id" AS "callItemId"')
+    expect(CHILD_WAIT_SOURCE_CALL_PROJECTION_SQL).toContain('source."id" AS "sourceStepId", source."attempt" AS "sourceAttempt"')
     expect(CHILD_WAIT_SOURCE_CALL_PROJECTION_SQL).toContain('LIMIT 2')
     const [sql, values] = query.mock.calls[0] as [string, unknown[]]
     expectSqlBindings(sql, values)
@@ -32,7 +35,9 @@ describe("registered child-wait source crash proof", () => {
   it("fails closed when the source-call pre-read is missing, duplicated, or outside the raw-ID bounds", async () => {
     const task = { sessionId: "session", id: "task", turnId: "turn", rootTaskId: "root", leaseOwner: "owner",
       attemptCount: 2, leaseExpiresAt: new Date("2026-10-31T00:00:00.000Z"), userId: "user" }
-    for (const rows of [[], [{ toolCallId: "x" }, { toolCallId: "x" }], [{ toolCallId: "x".repeat(257) }], [{ toolCallId: " x" }]]) {
+    for (const rows of [[], [{ toolCallId: "x" }, { toolCallId: "x" }], [{ toolCallId: "x".repeat(257) }], [{ toolCallId: " x" }],
+      [{ toolCallId: "x", callItemId: "", sourceStepId: "source-step", sourceAttempt: 1 }],
+      [{ toolCallId: "x", callItemId: "source-call", sourceStepId: "source-step", sourceAttempt: 3 }]]) {
       await expect(readChildWaitSourceCallProjection({ query: vi.fn().mockResolvedValue({ rows }) } as never, task, "continuation"))
         .resolves.toBeNull()
     }

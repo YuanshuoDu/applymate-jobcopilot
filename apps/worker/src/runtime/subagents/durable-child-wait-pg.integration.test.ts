@@ -23,6 +23,7 @@ import { actionList, asObject, INSERT_TASK, json } from "./pg-store-persistence.
 import type { SubagentLease } from "./types.js"
 import { CHILD_WAIT_CLAIM_RECOVERY_SQL, hasBlockingExternalCall } from "./pg-store-expiry-recovery-predicates.js"
 import { CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL, childWaitContinuationKeyMatchesSafeProjection } from "./pg-store-expiry-child-wait-claim-call-proof.js"
+import { readChildWaitSourceCallProjection } from "./pg-store-expiry-child-wait-source-proof.js"
 import { safeSubagentWaitJson } from "./subagent-wait-structural-ids.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
@@ -78,6 +79,17 @@ const WORKER_F_UNSETTLED_STARTS_SQL = `SELECT started."id", started."turnId", st
                OR (started."type" = 'model.started' AND settled."type" IN ('model.completed', 'model.failed')))
          )
        ORDER BY started."sequence" DESC LIMIT 17`
+const WORKER_F_UNSETTLED_STARTS_DIAGNOSTIC_SQL = WORKER_F_UNSETTLED_STARTS_SQL.replace(
+  /\$(1[1-5])\b/g, (_match, parameter: string) => `$${Number(parameter) - 8}`,
+)
+const WORKER_F_SAME_CALL_ID_TERMINAL_PROOF_SQL = `SELECT ${CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL.replace(
+  /\$(1[1-5])\b/g, (_match, parameter: string) => `$${Number(parameter) - 2}`,
+)} AS "settled" FROM "agent_events" AS started
+JOIN "agent_events" AS settled ON settled."sessionId" = started."sessionId" AND settled."turnId" = started."turnId"
+  AND settled."taskId" = started."taskId" AND settled."correlationId" = started."correlationId"
+WHERE $1::text IS NOT NULL AND $2::text IS NOT NULL AND $3::text IS NOT NULL AND $4::text IS NOT NULL
+  AND $5::text IS NOT NULL AND $6::integer IS NOT NULL AND $7::timestamptz IS NOT NULL AND $8::text IS NOT NULL
+  AND started."id" = $14 AND settled."id" = $15`
 
 function safeProjectedWaitKey(input: { taskIds: readonly string[]; mode: "any" | "all"; timeoutMs: number; idempotencyKey: string }): string {
   const projected = asObject(safeSubagentWaitJson(input, 1_024))
@@ -119,7 +131,10 @@ describe("worker restart blocker proof diagnostic bindings", () => {
     expectSqlBindings(CHANGE_RESULT_COMPLETE_SQL, 6)
   })
   it("binds the bounded unsettled-start diagnostic to the exact task scope", () => {
-    expectSqlBindings(WORKER_F_UNSETTLED_STARTS_SQL, 2)
+    expectSqlBindings(WORKER_F_UNSETTLED_STARTS_DIAGNOSTIC_SQL, 7)
+  })
+  it("binds the same-call-ID source item/step/attempt terminal canary without gaps", () => {
+    expectSqlBindings(WORKER_F_SAME_CALL_ID_TERMINAL_PROOF_SQL, 15)
   })
 })
 
@@ -369,8 +384,11 @@ async function diagnoseWorkerFStartCandidates(
   client: PoolClient, task: BlockingTaskSnapshot, continuationStepId: string,
   sourceCallId: string, claimCallId: string, blocker: boolean,
 ): Promise<Record<string, unknown>> {
+  const sourceProjection = await readChildWaitSourceCallProjection(client, task as unknown as Record<string, unknown>, continuationStepId)
   const starts = await client.query<{ id: string; turnId: string; type: string; correlationId: string }>(
-    WORKER_F_UNSETTLED_STARTS_SQL, [task.sessionId, task.id],
+    WORKER_F_UNSETTLED_STARTS_DIAGNOSTIC_SQL, [task.sessionId, task.id, sourceProjection?.rawCallId ?? null,
+      sourceProjection?.projectedCallId ?? null, sourceProjection?.callItemId ?? null, sourceProjection?.sourceStepId ?? null,
+      sourceProjection?.sourceAttempt ?? null],
   )
   const classified = []
   for (const [index, start] of starts.rows.slice(0, 16).entries()) {
@@ -441,7 +459,7 @@ async function diagnoseWorkerFClaimProof(
   const sourceCalls = await client.query<{ id: string; status: string; revision: number; content: Record<string, unknown> }>(
     `SELECT "id", "status", "revision", "content" FROM "agent_items"
      WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = $4
-       AND "type" = 'tool_call' AND "content"->>'toolName' = 'wait_subagents'`,
+       AND "type" = 'tool_call' AND "content"->>'toolName' = 'wait_subagents' LIMIT 2`,
     [task.sessionId, task.turnId, task.id, wait.stepId],
   )
   const sourceCall = sourceCalls.rows.length === 1 ? sourceCalls.rows[0] : undefined
@@ -452,7 +470,7 @@ async function diagnoseWorkerFClaimProof(
   }>(
     `SELECT "id", "status", "revision", "content" FROM "agent_items"
      WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = $4
-       AND "type" = 'tool_result' AND "content"->>'toolCallId' = $5`,
+       AND "type" = 'tool_result' AND "content"->>'toolCallId' = $5 LIMIT 2`,
     [task.sessionId, task.turnId, task.id, wait.stepId, sourceCallContent.toolCallId],
   ) : { rows: [] }
   const sourceResult = sourceResults.rows.length === 1 ? sourceResults.rows[0] : undefined
@@ -473,7 +491,7 @@ async function diagnoseWorkerFClaimProof(
   const continuationCalls = await client.query<{ status: string; revision: number; content: Record<string, unknown> }>(
     `SELECT "status", "revision", "content" FROM "agent_items"
      WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = $4
-       AND "type" = 'tool_call' AND "content"->>'toolName' = 'wait_subagents'`,
+       AND "type" = 'tool_call' AND "content"->>'toolName' = 'wait_subagents' LIMIT 2`,
     [task.sessionId, task.turnId, task.id, continuationStepId],
   )
   const claimCall = continuationCalls.rows.find(call => call.content.toolCallId === claimCallId)
@@ -1131,6 +1149,131 @@ async function expectCompletedClaimBeforeItemEventSafety(
         await client.query(`RELEASE SAVEPOINT ${name}`)
       }
     }
+    const exactSourceProjection = await readChildWaitSourceCallProjection(
+      client, task as unknown as Record<string, unknown>, continuationStepId,
+    )
+    if (!exactSourceProjection) throw new Error("source_call_projection_missing_for_same_id_decoy")
+    expect(exactSourceProjection).toMatchObject({ rawCallId: PHONE_SHAPED_WAIT_TOOL_CALL_ID,
+      callItemId: sourceCallItemId, sourceStepId, sourceAttempt: 1 })
+    const evaluateTerminalProof = async (startedId: string, settledId: string): Promise<boolean> => {
+      const proof = await client.query<{ settled: boolean }>(
+        WORKER_F_SAME_CALL_ID_TERMINAL_PROOF_SQL,
+        [task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount, task.leaseExpiresAt,
+          task.userId, exactSourceProjection.rawCallId, exactSourceProjection.projectedCallId, exactSourceProjection.callItemId,
+          exactSourceProjection.sourceStepId, exactSourceProjection.sourceAttempt, startedId, settledId],
+      )
+      return proof.rows[0]?.settled === true
+    }
+    const exactSourceStart = await client.query<{ id: string }>(
+      `SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+         AND "itemId" = $4 AND "type" = 'tool_call.started' AND "correlationId" = $5 LIMIT 2`,
+      [ids.sessionId, ids.turnId, ids.waiterTaskId, sourceCallItemId, PHONE_SHAPED_WAIT_TOOL_CALL_ID],
+    )
+    const exactSourceTerminal = await client.query<{ id: string }>(
+      `SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+         AND "itemId" = $4 AND "type" = 'tool_call.completed' AND "correlationId" = $5 AND "idempotencyKey" = $6 LIMIT 2`,
+      [ids.sessionId, ids.turnId, ids.waiterTaskId, sourceCallItemId, PHONE_SHAPED_WAIT_TOOL_CALL_ID,
+        `task:${ids.waiterTaskId}:event:tool-finished:${PHONE_SHAPED_WAIT_TOOL_CALL_ID}`],
+    )
+    expect(exactSourceStart.rows).toHaveLength(1)
+    expect(exactSourceTerminal.rows).toHaveLength(1)
+    expect(await evaluateTerminalProof(exactSourceStart.rows[0]!.id, exactSourceTerminal.rows[0]!.id),
+      "the server-selected source item, step and attempt must retain its valid completion proof").toBe(true)
+
+    await client.query("SAVEPOINT same_raw_call_id_different_item_step_attempt")
+    try {
+      const sourceStep = await client.query<{ ordinal: number; attempt: number }>(
+        `SELECT "ordinal", "attempt" FROM "agent_steps" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4`,
+        [sourceStepId, ids.sessionId, ids.turnId, ids.waiterTaskId],
+      )
+      expect(sourceStep.rows).toEqual([{ ordinal: expect.any(Number), attempt: exactSourceProjection.sourceAttempt }])
+      const decoyAttempt = Math.max(task.attemptCount, exactSourceProjection.sourceAttempt) + 1
+      const decoyStepId = `task:${task.id}:step:source-wait-decoy:attempt:${decoyAttempt}`
+      const decoyItemId = `task:${task.id}:item:tool-call:${PHONE_SHAPED_WAIT_TOOL_CALL_ID}:attempt:${decoyAttempt}`
+      const occupiedStep = await client.query<{ count: number }>(
+        `SELECT COUNT(*)::int AS "count" FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+           AND "ordinal" = $4 AND "attempt" = $5`,
+        [ids.sessionId, ids.turnId, ids.waiterTaskId, sourceStep.rows[0]!.ordinal, decoyAttempt],
+      )
+      expect(occupiedStep.rows[0]?.count).toBe(0)
+      const decoyStep = await client.query(
+        `INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status",
+           "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot", "startedAt", "completedAt")
+         VALUES ($1, $2, $3, $4, $5, $6, 'completed', 0, '[]'::jsonb, '{}'::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+        [decoyStepId, ids.sessionId, ids.turnId, ids.waiterTaskId, sourceStep.rows[0]!.ordinal, decoyAttempt],
+      )
+      expect(decoyStep.rowCount).toBe(1)
+      const decoyCallContent = { toolCallId: PHONE_SHAPED_WAIT_TOOL_CALL_ID, toolName: "wait_subagents", toolVersion: "1",
+        input: sourceInput, status: "completed", errorCode: null }
+      const decoyCall = await client.query(
+        `INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase",
+           "revision", "content", "startedAt", "completedAt", "updatedAt")
+         VALUES ($1, $2, $3, $4, $5, 'tool_call', 'completed', NULL, 1, $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+        [decoyItemId, ids.sessionId, ids.turnId, decoyStepId, ids.waiterTaskId, JSON.stringify(decoyCallContent)],
+      )
+      expect(decoyCall.rowCount).toBe(1)
+      const sourceStartId = exactSourceStart.rows[0]!.id
+      const sourceTerminalId = exactSourceTerminal.rows[0]!.id
+      const detachedSourceCorrelationId = `fixture-detached-source:${randomUUID()}`
+      const changedStart = await client.query(
+        `UPDATE "agent_events" SET "correlationId" = $1 WHERE "id" = $2 AND "sessionId" = $3 AND "turnId" = $4
+           AND "taskId" = $5 AND "itemId" = $6 AND "type" = 'tool_call.started' AND "correlationId" = $7`,
+        [detachedSourceCorrelationId, sourceStartId, ids.sessionId, ids.turnId, ids.waiterTaskId, sourceCallItemId,
+          PHONE_SHAPED_WAIT_TOOL_CALL_ID],
+      )
+      expect(changedStart.rowCount).toBe(1)
+      const priorEvent = await client.query<{ id: string }>(
+        `SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+           ORDER BY "sequence" DESC LIMIT 1`, [ids.sessionId, ids.turnId, ids.waiterTaskId],
+      )
+      expect(priorEvent.rows).toHaveLength(1)
+      const advancedSequence = await client.query<{ eventSequence: string }>(
+        `UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 4 WHERE "id" = $1 AND "userId" = $2
+           RETURNING "eventSequence"`, [ids.sessionId, ids.userId],
+      )
+      expect(advancedSequence.rows).toHaveLength(1)
+      const terminalSequence = BigInt(advancedSequence.rows[0]!.eventSequence)
+      const itemStartedId = `task:${task.id}:event:item-started:${decoyItemId}`
+      const callStartedId = `task:${task.id}:event:child-wait-claim:${decoyAttempt}:${decoyStepId}`
+      const itemCompletedId = `task:${task.id}:event:tool-call-completed:${PHONE_SHAPED_WAIT_TOOL_CALL_ID}:${decoyItemId}:1`
+      const sequences = [terminalSequence - 3n, terminalSequence - 2n, terminalSequence - 1n].map(String)
+      const insertDecoyEvent = (event: { id: string; itemId: string; sequence: string; type: string; correlationId: string;
+        causationId: string; idempotencyKey: string; payload: unknown }) => client.query(
+        `INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor",
+           "correlationId", "causationId", "idempotencyKey", "payload")
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'subagent', $8, $9, $10, $11::jsonb)`,
+        [event.id, ids.sessionId, ids.turnId, event.itemId, ids.waiterTaskId, event.sequence, event.type,
+          event.correlationId, event.causationId, event.idempotencyKey, JSON.stringify(event.payload)],
+      )
+      const itemStarted = await insertDecoyEvent({ id: itemStartedId, itemId: decoyItemId, sequence: sequences[0]!, type: "item.started",
+        correlationId: decoyStepId, causationId: priorEvent.rows[0]!.id, idempotencyKey: itemStartedId,
+        payload: { itemId: decoyItemId, type: "tool_call", phase: null } })
+      const callStarted = await insertDecoyEvent({ id: callStartedId, itemId: decoyItemId, sequence: sequences[1]!, type: "tool_call.started",
+        correlationId: PHONE_SHAPED_WAIT_TOOL_CALL_ID, causationId: itemStartedId,
+        idempotencyKey: callStartedId, payload: { toolCallId: PHONE_SHAPED_WAIT_TOOL_CALL_ID, toolName: "wait_subagents", taskId: task.id } })
+      expect(itemStarted.rowCount).toBe(1)
+      expect(callStarted.rowCount).toBe(1)
+      const decoyCompletionContent = projectWaitCallEventContent(decoyCallContent)
+      const itemCompleted = await insertDecoyEvent({ id: itemCompletedId, itemId: decoyItemId, sequence: sequences[2]!, type: "item.completed",
+        correlationId: decoyItemId, causationId: callStartedId,
+        idempotencyKey: itemCompletedId, payload: { itemId: decoyItemId, status: "completed", content: decoyCompletionContent } })
+      expect(itemCompleted.rowCount).toBe(1)
+      const changedTerminal = await client.query(
+        `UPDATE "agent_events" SET "itemId" = $1, "causationId" = $2, "sequence" = $3
+         WHERE "id" = $4 AND "sessionId" = $5 AND "turnId" = $6 AND "taskId" = $7 AND "itemId" = $8
+           AND "type" = 'tool_call.completed' AND "correlationId" = $9 AND "idempotencyKey" = $10`,
+        [decoyItemId, itemCompletedId, terminalSequence.toString(), sourceTerminalId, ids.sessionId, ids.turnId, ids.waiterTaskId,
+          sourceCallItemId, PHONE_SHAPED_WAIT_TOOL_CALL_ID, `task:${task.id}:event:tool-finished:${PHONE_SHAPED_WAIT_TOOL_CALL_ID}`],
+      )
+      expect(changedTerminal.rowCount).toBe(1)
+      expect(await evaluateTerminalProof(callStartedId, sourceTerminalId),
+        "same raw call ID must not let a different persisted item, step, and attempt reuse the source completion").toBe(false)
+    } finally {
+      await client.query("ROLLBACK TO SAVEPOINT same_raw_call_id_different_item_step_attempt")
+      await client.query("RELEASE SAVEPOINT same_raw_call_id_different_item_step_attempt")
+    }
+    expect(await blocking(task), "rolling back the decoy must leave the exact source/claim recovery valid").toBe(false)
+
     await remainsBlocked("recovered source marker bound to a different continuation step", async () => {
       await client.query(`UPDATE "agent_wait_conditions" SET "result" = jsonb_set("result", '{sourceLifecycleRecovery,stepId}', to_jsonb($1::text), false)
         WHERE "parentTaskId" = $2 AND "sessionId" = $3`, [`task:${ids.waiterTaskId}:step:99:attempt:${attempt}`, ids.waiterTaskId, ids.sessionId])
