@@ -72,9 +72,43 @@ async function inspectTurn(sessionId, turnId) {
     JOIN "agent_outbox" AS outbox ON outbox."idempotencyKey" = 'agent-event:' || event."id"
       AND outbox."topic" = 'agent.turn.wakeup' AND outbox."aggregateId" = event."sessionId"
     WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."type" = 'turn.wakeup'`, [sessionId, turnId])
+  const turnDispatchOutbox = await pool.query(`SELECT COUNT(*)::int AS count,
+    COUNT(*) FILTER (WHERE outbox."publishedAt" IS NOT NULL)::int AS "publishedCount",
+    COALESCE(MAX(outbox."attemptCount"), 0)::int AS "maxAttemptCount",
+    CASE
+      WHEN BOOL_OR(outbox."lastError" = 'queue_add_failed') THEN 'queue_add_failed'
+      WHEN BOOL_OR(outbox."lastError" = 'turn_dispatch_lineage_mismatch') THEN 'turn_dispatch_lineage_mismatch'
+      WHEN BOOL_OR(outbox."lastError" = 'schema_invalid_payload') THEN 'schema_invalid_payload'
+      WHEN BOOL_OR(outbox."lastError" IS NOT NULL) THEN 'other'
+      ELSE 'none'
+    END AS "lastErrorCategory"
+    FROM "agent_outbox" AS outbox
+    WHERE outbox."topic" = 'agent.turn.dispatch' AND outbox."aggregateId" = $1
+      AND outbox."idempotencyKey" = 'turn-dispatch:' || $2
+      AND outbox."payload"->>'sessionId' = $1 AND outbox."payload"->>'turnId' = $2`, [sessionId, turnId])
+  const turnDlq = await pool.query(`SELECT COUNT(*)::int AS count,
+    COALESCE(MAX(CASE WHEN outbox."payload"->>'attemptsMade' ~ '^[0-9]{1,6}$'
+      THEN LEAST((outbox."payload"->>'attemptsMade')::int, 1000) ELSE 0 END), 0)::int AS "maxAttemptCount",
+    COUNT(*) FILTER (WHERE outbox."payload"->>'reason_code' = 'schema_invalid_payload')::int AS "reasonSchemaInvalidPayload",
+    COUNT(*) FILTER (WHERE outbox."payload"->>'reason_code' = 'max_retries_exhausted')::int AS "reasonMaxRetriesExhausted",
+    COUNT(*) FILTER (WHERE outbox."payload"->>'reason_code' = 'execution_failed')::int AS "reasonExecutionFailed",
+    COUNT(*) FILTER (WHERE outbox."payload"->>'reason_code' = 'lease_lost')::int AS "reasonLeaseLost",
+    COUNT(*) FILTER (WHERE outbox."payload"->>'reason_code' = 'cognitive_agenda_resume_fence_invalid')::int AS "reasonResumeFenceInvalid",
+    COUNT(*) FILTER (WHERE COALESCE(outbox."payload"->>'reason_code', '') NOT IN
+      ('schema_invalid_payload', 'max_retries_exhausted', 'execution_failed', 'lease_lost', 'cognitive_agenda_resume_fence_invalid'))::int AS "reasonOther",
+    COUNT(*) FILTER (WHERE outbox."payload"->>'error_code' = 'invalid_payload')::int AS "errorInvalidPayload",
+    COUNT(*) FILTER (WHERE outbox."payload"->>'error_code' = 'turn_execution_error')::int AS "errorTurnExecution",
+    COUNT(*) FILTER (WHERE outbox."payload"->>'error_code' = 'lease_not_available')::int AS "errorLeaseNotAvailable",
+    COUNT(*) FILTER (WHERE outbox."payload"->>'error_code' = 'lease_lost')::int AS "errorLeaseLost",
+    COUNT(*) FILTER (WHERE outbox."payload"->>'error_code' = 'cognitive_agenda_resume_fence_invalid')::int AS "errorResumeFenceInvalid",
+    COUNT(*) FILTER (WHERE COALESCE(outbox."payload"->>'error_code', '') NOT IN
+      ('invalid_payload', 'turn_execution_error', 'lease_not_available', 'lease_lost', 'cognitive_agenda_resume_fence_invalid'))::int AS "errorOther"
+    FROM "agent_outbox" AS outbox
+    WHERE outbox."topic" = 'agent.turn.dlq' AND outbox."aggregateId" = $2
+      AND outbox."payload"->>'sessionId' = $1 AND outbox."payload"->>'turnId' = $2`, [sessionId, turnId])
   return { turn: row, questions: items.rows, eventTypes: events.rows.map(event => event.type), steps: steps.rows, tasks: tasks.rows,
     toolResultCount: toolResults.rows[0].count, toolResultQuestionRedacted: toolResults.rows[0].questionRedacted,
-    wakeupOutbox: wakeupOutbox.rows[0] }
+    wakeupOutbox: wakeupOutbox.rows[0], turnDispatchOutbox: turnDispatchOutbox.rows[0], turnDlq: turnDlq.rows[0] }
 }
 
 module.exports = { initializeFixtureSse, inspectTurn, closeFixtureDb: () => pool.end() }

@@ -40,6 +40,8 @@ async function logBoundedTurnDiagnostic(phase: 'awaiting_question' | 'after_answ
     toolResultCount: number
     toolResultQuestionRedacted: boolean | null
     wakeupOutbox: { count: number; publishedCount: number; maxAttemptCount: number }
+    turnDispatchOutbox: { count: number; publishedCount: number; maxAttemptCount: number; lastErrorCategory: string }
+    turnDlq: { count: number; maxAttemptCount: number; reasonSchemaInvalidPayload: number; reasonMaxRetriesExhausted: number; reasonExecutionFailed: number; reasonLeaseLost: number; reasonResumeFenceInvalid: number; reasonOther: number; errorInvalidPayload: number; errorTurnExecution: number; errorLeaseNotAvailable: number; errorLeaseLost: number; errorResumeFenceInvalid: number; errorOther: number }
   }>) {
   try {
     const state = await inspectTurn(sessionId, turnId)
@@ -65,6 +67,30 @@ async function logBoundedTurnDiagnostic(phase: 'awaiting_question' | 'after_answ
       wakeupOutboxPublished: state.wakeupOutbox.publishedCount > 0,
       wakeupOutboxPublishedCount: diagnosticCount(state.wakeupOutbox.publishedCount),
       wakeupOutboxMaxAttemptCount: diagnosticCount(state.wakeupOutbox.maxAttemptCount),
+      turnDispatchOutboxCount: diagnosticCount(state.turnDispatchOutbox.count),
+      turnDispatchOutboxPublished: state.turnDispatchOutbox.publishedCount > 0,
+      turnDispatchOutboxPublishedCount: diagnosticCount(state.turnDispatchOutbox.publishedCount),
+      turnDispatchOutboxMaxAttemptCount: diagnosticCount(state.turnDispatchOutbox.maxAttemptCount),
+      turnDispatchOutboxLastErrorCategory: ['none', 'queue_add_failed', 'turn_dispatch_lineage_mismatch', 'schema_invalid_payload'].includes(state.turnDispatchOutbox.lastErrorCategory)
+        ? state.turnDispatchOutbox.lastErrorCategory : 'other',
+      turnDlqCount: diagnosticCount(state.turnDlq.count),
+      turnDlqMaxAttemptCount: diagnosticCount(state.turnDlq.maxAttemptCount),
+      turnDlqReasonCounts: {
+        schemaInvalidPayload: diagnosticCount(state.turnDlq.reasonSchemaInvalidPayload),
+        maxRetriesExhausted: diagnosticCount(state.turnDlq.reasonMaxRetriesExhausted),
+        executionFailed: diagnosticCount(state.turnDlq.reasonExecutionFailed),
+        leaseLost: diagnosticCount(state.turnDlq.reasonLeaseLost),
+        resumeFenceInvalid: diagnosticCount(state.turnDlq.reasonResumeFenceInvalid),
+        other: diagnosticCount(state.turnDlq.reasonOther),
+      },
+      turnDlqErrorCounts: {
+        invalidPayload: diagnosticCount(state.turnDlq.errorInvalidPayload),
+        turnExecution: diagnosticCount(state.turnDlq.errorTurnExecution),
+        leaseNotAvailable: diagnosticCount(state.turnDlq.errorLeaseNotAvailable),
+        leaseLost: diagnosticCount(state.turnDlq.errorLeaseLost),
+        resumeFenceInvalid: diagnosticCount(state.turnDlq.errorResumeFenceInvalid),
+        other: diagnosticCount(state.turnDlq.errorOther),
+      },
       stepStatusCounts: statusCounts(state.steps, STEP_STATUSES),
       stepErrorPresentCount: diagnosticCount(state.steps.filter(step => Boolean(step.errorCode)).length),
       stepFinishReasonPresentCount: diagnosticCount(state.steps.filter(step => Boolean(step.finishReason)).length),
@@ -90,7 +116,7 @@ test('synthetic native question resumes the actual authenticated turn', async ({
   const requireFixture = createRequire(path.resolve('e2e/application-authenticated-agent.browser.ts'))
   const { initializeFixtureSse, inspectTurn, closeFixtureDb } = requireFixture('./application-authenticated-agent-db.cjs') as {
     initializeFixtureSse: () => Promise<void>
-    inspectTurn: (sessionId: string, turnId: string) => Promise<{ turn: { status: string; error: string | null; completedEvents: number; answeredEvents: number; finalResponse: string | null }; questions: { id: string; status: string; content: { questionId?: string; question?: string; answer?: string | null; toolCallId?: string } }[]; eventTypes: string[]; steps: { status: string; errorCode: string | null; finishReason: string | null }[]; tasks: { status: string; failureReason: string | null }[]; toolResultCount: number; toolResultQuestionRedacted: boolean | null; wakeupOutbox: { count: number; publishedCount: number; maxAttemptCount: number } }>
+    inspectTurn: (sessionId: string, turnId: string) => Promise<{ turn: { status: string; error: string | null; completedEvents: number; answeredEvents: number; finalResponse: string | null }; questions: { id: string; status: string; content: { questionId?: string; question?: string; answer?: string | null; toolCallId?: string } }[]; eventTypes: string[]; steps: { status: string; errorCode: string | null; finishReason: string | null }[]; tasks: { status: string; failureReason: string | null }[]; toolResultCount: number; toolResultQuestionRedacted: boolean | null; wakeupOutbox: { count: number; publishedCount: number; maxAttemptCount: number }; turnDispatchOutbox: { count: number; publishedCount: number; maxAttemptCount: number; lastErrorCategory: string }; turnDlq: { count: number; maxAttemptCount: number; reasonSchemaInvalidPayload: number; reasonMaxRetriesExhausted: number; reasonExecutionFailed: number; reasonLeaseLost: number; reasonResumeFenceInvalid: number; reasonOther: number; errorInvalidPayload: number; errorTurnExecution: number; errorLeaseNotAvailable: number; errorLeaseLost: number; errorResumeFenceInvalid: number; errorOther: number } }>
     closeFixtureDb: () => Promise<void>
   }
   try {
