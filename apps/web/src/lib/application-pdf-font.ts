@@ -60,13 +60,26 @@ export function assertApplicationPdfTreeSupported(node: React.ReactNode): void {
   }
 }
 
+export function applicationPdfFontRoot(cwd: string, exists: (path: string) => boolean): string {
+  const base = cwd.replace(/\\/g, '/').replace(/\/$/, '')
+  const projectPublic = `${base}/public/fonts`
+  const monorepoPublic = `${base}/apps/web/public/fonts`
+  for (const candidate of [projectPublic, monorepoPublic]) {
+    if (exists(`${candidate}/NotoSans-Regular.ttf`) && exists(`${candidate}/NotoSansSC-GB2312-Regular.ttf`)) return candidate
+  }
+  throw new Error('Application PDF fonts are unavailable')
+}
+
 export function registerApplicationPdfFonts(): void {
   if (registered) return
-  // PDFs run in the browser. The local path is also used by Node rendering tests.
+  // Browsers use the public URL; Node supports either a project or monorepo cwd.
+  const fs = typeof window === 'undefined' ? process.getBuiltinModule?.('node:fs') as typeof import('node:fs') | undefined : undefined
   const cwd = typeof window === 'undefined' ? process.cwd().replace(/\\/g, '/') : ''
-  const root = cwd && !cwd.endsWith('/apps/web') ? `${cwd}/apps/web` : cwd
-  Font.register({ family: families[0], src: `${root}/fonts/NotoSans-Regular.ttf`.replace('/apps/web/fonts/', '/apps/web/public/fonts/') })
-  Font.register({ family: families[1], src: `${root}/fonts/NotoSansSC-GB2312-Regular.ttf`.replace('/apps/web/fonts/', '/apps/web/public/fonts/') })
+  const root = typeof window === 'undefined'
+    ? fs ? applicationPdfFontRoot(cwd, fs.existsSync) : `${cwd}${cwd.endsWith('/apps/web') ? '' : '/apps/web'}/public/fonts`
+    : '/fonts'
+  Font.register({ family: families[0], src: `${root}/NotoSans-Regular.ttf` })
+  Font.register({ family: families[1], src: `${root}/NotoSansSC-GB2312-Regular.ttf` })
   registered = true
 }
 

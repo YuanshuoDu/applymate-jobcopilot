@@ -35,11 +35,12 @@ export async function renderResumeDoc(resume: Resume): Promise<React.ReactElemen
     role: { fontFamily: bold, fontSize: d.body, flexShrink: 1 }, period: { fontSize: d.body - 1, color: '#666' },
     bullet: { fontSize: d.body - 0.5, marginLeft: 8, marginTop: 1 }, sub: { fontSize: d.body - 0.5, color: '#555' },
   })
+  const noHyphenation = (word: string) => [word]
   const e = React.createElement
-  const text = (value: string, key?: string | number) => e(Text, { key, style: styles.sub }, value)
-  const bullets = (values: string[]) => values.filter(Boolean).map((value, i) => e(Text, { key: i, style: styles.bullet }, `• ${value}`))
-  const head = (title: string, period?: string) => e(View, { style: styles.head }, e(Text, { style: styles.role }, title), e(Text, { style: styles.period }, period ?? ''))
-  const section = (id: string, title: string, children: React.ReactNode[]) => e(View, { key: id, style: styles.section }, e(Text, { style: styles.secTitle }, title), ...children)
+  const text = (value: string, key?: string | number) => e(Text, { key, hyphenationCallback: noHyphenation, style: styles.sub }, value)
+  const bullets = (values: string[]) => values.filter(Boolean).map((value, i) => e(Text, { key: i, hyphenationCallback: noHyphenation, style: styles.bullet }, `• ${value}`))
+  const head = (title: string, period?: string) => e(View, { style: styles.head }, e(Text, { hyphenationCallback: noHyphenation, style: styles.role }, title), e(Text, { hyphenationCallback: noHyphenation, style: styles.period }, period ?? ''))
+  const section = (id: string, title: string, children: React.ReactNode[]) => e(View, { key: id, style: styles.section }, e(Text, { hyphenationCallback: noHyphenation, style: styles.secTitle, minPresenceAhead: 24 }, title), ...children)
   const sections = applicationPdfSectionOrder(c).flatMap(id => {
     if (id === 'summary' && c.summary) return [section(id, 'Summary', [text(c.summary)])]
     if (id === 'experience' && c.experience?.length) return [section(id, 'Experience', c.experience.map((item, i) => e(View, { key: i, style: styles.row }, head([item.role, item.company].filter(Boolean).join(' — '), item.period), ...bullets(item.bullets ?? []))))]
@@ -48,15 +49,13 @@ export async function renderResumeDoc(resume: Resume): Promise<React.ReactElemen
     if (id === 'certifications' && c.certifications?.length) return [section(id, 'Certifications', c.certifications.map((item, i) => e(View, { key: i, style: styles.row }, head([item.name, item.issuer].filter(Boolean).join(' — '), item.date), ...(item.url ? [text(item.url)] : []))))]
     if (id === 'education' && c.education?.length) return [section(id, 'Education', c.education.map((item, i) => e(View, { key: i, style: styles.row }, head(item.degree ?? '', item.year), text(item.institution ?? ''))))]
     if (id === 'languages' && c.languages?.length) return [section(id, 'Languages', [text(c.languages.map(item => [item.lang, item.level].filter(Boolean).join(': ')).join(' · '))])]
-    if (id.startsWith('custom_')) {
-      const custom = c.custom?.find(item => item.id === id)
-      if (custom) return [section(id, custom.title, custom.items.map((item, i) => e(View, { key: i, style: styles.row }, head([item.title, item.subtitle].filter(Boolean).join(' — '), item.period), ...bullets(item.bullets ?? []))))]
-    }
+    const custom = c.custom?.find(item => item.id === id)
+    if (custom) return [section(id, custom.title, custom.items.map((item, i) => e(View, { key: i, style: styles.row }, head([item.title, item.subtitle].filter(Boolean).join(' — '), item.period), ...bullets(item.bullets ?? []))))]
     return []
   })
   const contact = [c.contact?.email, c.contact?.phone, c.contact?.location, c.contact?.linkedin, c.contact?.github, c.contact?.website].filter(Boolean) as string[]
   const document = normalizeApplicationPdfTree(e(Document, null, e(Page, { size: 'A4', style: styles.page },
-    e(View, { style: styles.header }, e(Text, { style: styles.name }, c.contact?.name || 'Resume'), e(View, { style: styles.contact }, e(Text, null, contact.join(' · ')))),
+    e(View, { style: styles.header }, e(Text, { hyphenationCallback: noHyphenation, style: styles.name }, c.contact?.name || 'Resume'), e(View, { style: styles.contact }, e(Text, { hyphenationCallback: noHyphenation }, contact.join(' · ')))),
     ...sections,
   ))) as React.ReactElement
   assertApplicationPdfTreeSupported(document)

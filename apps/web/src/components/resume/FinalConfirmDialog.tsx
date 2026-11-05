@@ -35,6 +35,8 @@ type Props = {
   onReviewAudit: () => void
   onConfirm: (audit: ApplicationAudit) => Promise<boolean>
   onOpenApplication: () => void
+  onDownload: () => Promise<void>
+  downloadingPack: boolean
 }
 
 const icons = {
@@ -49,7 +51,7 @@ const icons = {
 export function FinalConfirmDialog({
   job, resumeName, templateName, pendingSuggestions, isDirty, packReady, resumeContent, templateId, templateOptions, coverLetterContent,
   initialAudit,
-  onClose, onReviewSuggestions, onCreateCoverLetter, onLinkJob, onReviewAudit, onConfirm, onOpenApplication,
+  onClose, onReviewSuggestions, onCreateCoverLetter, onLinkJob, onReviewAudit, onConfirm, onOpenApplication, onDownload, downloadingPack,
 }: Props) {
   const { t } = useI18n()
   const [audit, setAudit] = useState<ApplicationAudit | null>(initialAudit ?? null)
@@ -183,8 +185,12 @@ export function FinalConfirmDialog({
 
         <div className="final-confirm-footer">
           {showConfirmed ? <>
-            <div className="final-confirm-ready"><Check size={15} /> {t('resume.applicationPackConfirmed')}</div>
+            <div className="final-confirm-ready"><Check size={15} /> {t('resume.materialSelectionChanged')}</div>
             <button className="final-confirm-primary" onClick={onOpenApplication}><FileCheck2 size={16} /> {t('application.viewApplication')}</button>
+            {packReady ? <>
+              <button className="final-confirm-secondary" disabled={downloadingPack} onClick={() => void onDownload()}>{downloadingPack ? t('jobs.pack.savingPdfs') : t('resume.savePdfs')}</button>
+              {job && <a className="final-confirm-secondary" href={`/api/jobs/${encodeURIComponent(job.id)}/application-pack`} target="_blank" rel="noopener noreferrer">{t('jobs.pack.printView')}</a>}
+            </> : <span>{t('jobs.pack.auditPending')}</span>}
           </> : <>
             <button className="final-confirm-secondary" onClick={onClose}>{t('resume.backToEdit')}</button>
             <button className="final-confirm-primary" disabled={!ready || confirming} onClick={() => void handleConfirm()}>

@@ -11,12 +11,11 @@ import type { ApplicationAudit, ApplicationAuditFinding, CoverLetter, Job, JobSt
 import { apiMutate, fmtDate, fmtRelative, useApi } from '@/lib/hooks'
 import { setCachedApiResponse } from '@/lib/api-cache'
 import { useNav } from '@/lib/nav-context'
-import { downloadAuditedApplicationBundle } from '@/lib/bundle'
+import { BundleUnsupportedPdfError, downloadAuditedApplicationBundle } from '@/lib/bundle'
 import { assessApplicationPreflight } from '@/lib/agent/application-preflight'
 import { useI18n } from '@/lib/i18n'
-import { auditMatchesCurrentMaterials } from '@/lib/application-materials'
 import { applicationListUrl, loadLinkedApplication, readApplicationListState } from '@/lib/application-list-state'
-import type { StoredApplicationAudit } from '@/lib/application-audit'
+import { hasCurrentApplicationPackAudit, type StoredApplicationAudit } from '@/lib/application-audit'
 import { useApplicationTasks } from '@/components/jobs/useApplicationTasks'
 import { useApplicationCoverLetters } from '@/components/jobs/useApplicationCoverLetters'
 import { ApplicationProgress } from '@/components/jobs/application-progress'
@@ -643,8 +642,9 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   const [preparationStartedAt, setPreparationStartedAt] = useState<number | null>(null)
   const [preparationElapsed, setPreparationElapsed] = useState(0)
   const [packStage, setPackStage] = useState<'idle' | 'resume' | 'coverLetter' | 'audit' | 'review'>('idle')
-  const [latestAuditRecord, setLatestAuditRecord] = useState<StoredApplicationAudit | null>(null)
   const [preparationReviewRequired, setPreparationReviewRequired] = useState(false)
+  const [verifiedAudit, setVerifiedAudit] = useState<{ owner: string; jobId: string; audit: StoredApplicationAudit } | null>(null)
+  const auditReadEpoch = useRef(0)
   const [openPackItem, setOpenPackItem] = useState<'resume' | 'coverLetter' | 'audit' | null>(null)
   const [resumePreview, setResumePreview] = useState<Resume | null>(null)
   const [resumePreviewState, setResumePreviewState] = useState<{ id: string; status: 'loading' | 'unavailable' | 'ready' } | null>(null)
@@ -655,9 +655,37 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   const [documentPreview, setDocumentPreview] = useState<'resume' | 'coverLetter' | null>(null)
   const manualWorkAllowed = applicationTaskAllowsManualWork(task)
   const { letter: selectedCoverLetter, loading: coverLettersLoading, refetch: refetchCoverLetters, waitForLatest: waitForLatestCoverLetter, captureScope: captureLetterScope } = useApplicationCoverLetters(drawerUserId, job.id, job.userId, job.finalCoverLetterId)
-  // The audit route is the canonical source because the activity feed is
-  // paginated and can omit an older audit after other job events are added.
-  const { data: canonicalAudit } = useApi<StoredApplicationAudit | null>(`/api/jobs/${job.id}/audit-application`)
+  // GET verifies the signed receipt. Each request is scoped and ordered so an
+  // older response cannot overwrite a newer audit or a changed account.
+  const readCanonicalAudit = async (owner: string, jobId: string) => {
+    const epoch = ++auditReadEpoch.current
+    setVerifiedAudit(null)
+    const result = await readDescriptionScope(`/api/jobs/${encodeURIComponent(jobId)}/audit-application`)
+    if (auditReadEpoch.current !== epoch || !isCurrentDrawer(owner) || drawerJobIdRef.current !== jobId) return null
+    const candidate = result.ok && result.data && typeof result.data === 'object' ? result.data as Partial<StoredApplicationAudit> : null
+    const value = candidate && typeof candidate.resumeId === 'string'
+      && (candidate.coverLetterId === null || typeof candidate.coverLetterId === 'string')
+      && candidate.audit && typeof candidate.audit === 'object' && Array.isArray(candidate.audit.findings)
+      ? candidate as StoredApplicationAudit : null
+    return { epoch, value }
+  }
+  useEffect(() => {
+    const owner = drawerUserId
+    const jobId = job.id
+    if (!owner || owner !== job.userId) { auditReadEpoch.current += 1; setVerifiedAudit(null); return }
+    const refresh = () => {
+      if (preparationInFlight.current) return
+      setLatestAudit(null)
+      void readCanonicalAudit(owner, jobId).then(result => {
+        if (result?.value && auditReadEpoch.current === result.epoch) setVerifiedAudit({ owner, jobId, audit: result.value })
+      })
+    }
+    const visible = () => { if (document.visibilityState === 'visible') refresh() }
+    refresh()
+    window.addEventListener('focus', refresh)
+    document.addEventListener('visibilitychange', visible)
+    return () => { auditReadEpoch.current += 1; window.removeEventListener('focus', refresh); document.removeEventListener('visibilitychange', visible) }
+  }, [drawerUserId, job.id, job.userId])
 
   useEffect(() => {
     const origin = document.activeElement instanceof HTMLElement ? document.activeElement : null
@@ -748,15 +776,15 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     setSelectedResumeId(prev => prev && baseResumes.some(r => r.id === prev) ? prev : preferred?.id ?? '')
   }, [baseResumes, resumeListReady])
   useEffect(() => {
-    setLatestAuditRecord(null)
     setOpenPackItem(null)
     setResumePreview(null)
     setCreatedTailoredResumeId(null)
     setCoverLetterSelectionNeeded(false)
     setLatestAudit(null)
+    setPreparationReviewRequired(false)
     setDocumentPreview(null)
     setPackStage('idle')
-  }, [job.id])
+  }, [job.id, drawerUserId])
   useEffect(() => {
     if (!preparationStartedAt) { setPreparationElapsed(0); return }
     const update = () => setPreparationElapsed(Math.floor((Date.now() - preparationStartedAt) / 1000))
@@ -801,8 +829,8 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   // replace the confirmed version in the Application Pack preview.
   const selectedLetterUnavailable = Boolean(job.finalCoverLetterId && !selectedCoverLetter)
   const selectedLetterStatus = t(coverLettersLoading ? 'coverLetter.panel.loading' : 'application.selectedLetterUnavailable')
-  const persistedAudit = useMemo(() => findLatestApplicationAudit(activity), [activity])
-  const storedAudit = canonicalAudit ?? persistedAudit
+  const storedAudit = verifiedAudit?.owner === drawerUserId && verifiedAudit.jobId === job.id
+    ? verifiedAudit.audit : null
   const displayedAudit = latestAudit ?? storedAudit?.audit ?? null
   const applicationPreflight = useMemo(() => assessApplicationPreflight(job), [job])
   const evidenceGapFindings = (displayedAudit?.findings ?? []).filter(finding => finding.area !== 'job_match' && finding.resolution === 'evidence_needed')
@@ -971,7 +999,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
       if (isCurrent()) toast.success(t('application.downloadReady'))
     } catch (error) {
       if (isCurrent()) {
-        if (isApplicationPdfUnsupportedCharactersError(error)) toast.error(t('application.downloadUnsupportedTitle'), t('application.downloadUnsupportedDetail'))
+        if (error instanceof BundleUnsupportedPdfError || isApplicationPdfUnsupportedCharactersError(error)) toast.error(t('application.downloadUnsupportedTitle'), `${t('application.downloadUnsupportedDetail')} ${t('jobs.pack.printView')}`)
         else toast.error(t('application.downloadFailed'), t('application.downloadRetry'))
       }
     } finally {
@@ -1014,6 +1042,11 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     }
     setCoverLetterSelectionNeeded(false)
     preparationInFlight.current = true
+    // A new audit supersedes any previously verified receipt, even if it fails
+    // or the response is lost. Never unlock from a cached earlier pass.
+    setPreparationReviewRequired(true)
+    auditReadEpoch.current += 1
+    setVerifiedAudit(null)
     setAutoPreparing(true)
     setPreparationStartedAt(Date.now())
     try {
@@ -1160,10 +1193,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
         setPreparationReviewRequired(true)
         throw new Error(t('application.auditVersionMismatch'))
       }
-      setPreparationReviewRequired(false)
       setLatestAudit(audit)
-      setLatestAuditRecord({ resumeId: adaptedResumeId, coverLetterId: coverLetter?.id ?? null,
-        resumeUpdatedAt: audit.resumeUpdatedAt, coverLetterUpdatedAt: audit.coverLetterUpdatedAt, audit })
       if (audit.verdict !== 'pass') {
         setPackStage('idle')
         setOpenPackItem('audit')
@@ -1185,6 +1215,28 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
       }
       if (!confirmed || confirmError) throw new Error(confirmError ?? 'Could not confirm the audited package')
       publishJobUpdate(confirmed)
+      // Only the authenticated GET verifies the server-signed audit receipt.
+      // Check it represents this exact audit, not an older pass for these IDs.
+      const verified = await readCanonicalAudit(owner, job.id)
+      if (!isCurrentDrawer(owner) || drawerJobIdRef.current !== job.id) return
+      requireLetterScope()
+      const receipt = verified?.value
+      if (!verified || !receipt || receipt.resumeId !== adaptedResumeId
+        || receipt.coverLetterId !== (coverLetter?.id ?? null)
+        || receipt.resumeUpdatedAt !== audit.resumeUpdatedAt
+        || receipt.coverLetterUpdatedAt !== audit.coverLetterUpdatedAt
+        || receipt.audit?.auditedAt !== audit.auditedAt
+        || receipt.audit?.verdict !== audit.verdict
+        || receipt.audit?.summary !== audit.summary
+        || receipt.audit?.matchScore !== audit.matchScore
+        || receipt.audit?.source !== audit.source
+        || JSON.stringify(receipt.audit?.findings) !== JSON.stringify(audit.findings)) {
+        throw new Error(t('application.auditVersionMismatch'))
+      }
+      if (auditReadEpoch.current !== verified.epoch) return
+      setVerifiedAudit({ owner, jobId: job.id, audit: receipt })
+      setPreparationReviewRequired(false)
+      setLatestAudit(null)
       toast.success(t('application.materialsReadyTitle'), t(coverLetter ? 'application.materialsReadyWithLetter' : 'application.materialsReadyResumeOnly'))
     } catch (error) {
       if (isCurrentDrawer(owner)) {
@@ -1300,12 +1352,11 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   const drawerInputSt: React.CSSProperties = { ...INPUT_STYLE, fontSize: 11, padding: '5px 8px', borderRadius: 5 }
   const canTailorResume = Boolean(applicationPreflight.canPrepare && job.description && (existingTailoredResume || createdTailoredResumeId || job.finalResumeId || (resumeListReady && baseResumes.some(resume => resume.id === selectedResumeId))))
   const needsBaseResume = !previewResumeId
-  const currentRecord = latestAuditRecord ?? storedAudit
-  const currentPackAudited = !preparationReviewRequired && currentRecord?.audit.verdict === 'pass' && auditMatchesCurrentMaterials(
-    currentRecord, job.finalResumeId, job.finalCoverLetterId,
-    resumePreview?.id === job.finalResumeId ? resumePreview.updatedAt : null,
-    selectedCoverLetter?.updatedAt ?? null, false,
-  )
+  const currentRecord = storedAudit
+  const selectedFinalResume = evidenceResumeId && evidenceResumeId === job.finalResumeId ? resumePreview : null
+  const currentPackAudited = Boolean(drawerUserId && job.userId === drawerUserId) && !preparationReviewRequired && Boolean(selectedFinalResume && hasCurrentApplicationPackAudit(
+    currentRecord, job, selectedFinalResume, selectedCoverLetter ?? null,
+  ))
   const applicationRecorded = hasVisibleSubmissionRecord(job) || manualVisibleRecord
   const applicationRecordBlocked = blocksManualRecord(job) || manualVisibleRecord
   const manualReviewPrimary = manualWorkAllowed && Boolean(manualRecordLock && (manualRecordLock !== 'confirmed' || !applicationRecorded))
@@ -1416,6 +1467,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
               <AuditPackPreview audit={displayedAudit} onRepair={() => void autoTailorAndAudit()} onReviewEvidence={() => { if (evidenceResumeId) onOpenTailoredResume(evidenceResumeId) }} canReviewEvidence={Boolean(evidenceResumeId)} repairing={autoPreparing || !manualWorkAllowed || taskReadState !== 'ready' || Boolean(previewResumeId && !evidenceResumeId)} />
             </PackRow></div>
             {currentPackAudited && <button onClick={() => void downloadFinalPack()} disabled={downloadingPack} style={{ width: '100%', minHeight: 46, border: 0, borderRadius: 9, background: '#2563eb', color: '#fff', fontWeight: 700, cursor: 'pointer' }}>{downloadingPack ? t('application.downloadingZip') : t('application.downloadZip')}</button>}
+            {currentPackAudited && <a href={`/api/jobs/${encodeURIComponent(job.id)}/application-pack`} target="_blank" rel="noopener noreferrer" style={{ display: 'block', textAlign: 'center', marginTop: 8 }}>{t('jobs.pack.printView')}</a>}
             <div style={{ borderTop: '1px solid var(--border)', paddingTop: 16 }}>
               <strong style={{ fontSize: 13 }}>{t('application.method')}</strong>
               <p style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{applicationPreflight.canAutomate ? t('application.agentMethodHint') : t('application.manualMethodHint')}</p>
@@ -1648,20 +1700,6 @@ function renderSalary(salary: unknown): string {
   if (!salary) return ''
   if (typeof salary === 'string') return salary
   return String(salary)
-}
-
-function findLatestApplicationAudit(activity: Activity[]): StoredApplicationAudit | null {
-  for (const item of activity) {
-    const prefix = '[Auditor] application-audit '
-    if (!item.text.startsWith(prefix)) continue
-    try {
-      const parsed = JSON.parse(item.text.slice(prefix.length)) as StoredApplicationAudit
-      if (parsed.resumeId && parsed.coverLetterId !== undefined && parsed.audit?.verdict && Array.isArray(parsed.audit.findings)) return parsed
-    } catch {
-      // Ignore legacy or malformed activity entries rather than breaking the job drawer.
-    }
-  }
-  return null
 }
 
 function PackRow({ number, title, detail, done, failed = false, active = false, locked, onClick, onToggle, open, children, last = false, statusOverride }: {

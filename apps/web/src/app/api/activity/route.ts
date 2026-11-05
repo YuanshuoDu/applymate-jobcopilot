@@ -36,7 +36,10 @@ export async function POST(req: NextRequest) {
   if (!body) return err('Invalid JSON body')
 
   const { type, text, jobId, color } = body
-  if (!type || !text) return err('type and text are required')
+  if (!type || typeof text !== 'string' || !text.trim()) return err('type and text are required')
+  // Server audit records authorize reviewed downloads and corrections. Ordinary
+  // activity creation must never impersonate any reserved Auditor message.
+  if (text.trimStart().startsWith('[Auditor]')) return err('Audit activity can only be created by the independent auditor.', 400)
 
   // Validate jobId belongs to user
   if (jobId) {

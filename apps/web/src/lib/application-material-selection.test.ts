@@ -29,8 +29,21 @@ describe('application cover letter selection', () => {
     expect(selectApplicationCoverLetter({ ...selection, finalResumeId: null }, [{ ...letter, resumeId: 'other' }])).toBeNull()
   })
 
-  it('allows an available matching draft while preparing an unconfirmed resume', () => {
-    expect(selectApplicationCoverLetter({ ...selection, finalResumeId: null }, [letter])).toBe(letter)
+  it('does not implicitly select a draft while preparing an unconfirmed resume', () => {
+    expect(selectApplicationCoverLetter({ ...selection, finalResumeId: null }, [letter])).toBeNull()
+  })
+
+  it('reuses the selected ID for an unconfirmed resume only when the job and resume match', () => {
+    const selected = { ...selection, finalResumeId: null, finalCoverLetterId: 'c1' }
+    expect(selectApplicationCoverLetter(selected, [letter])).toBe(letter)
+    expect(selectApplicationCoverLetter(selected, [{ ...letter, jobId: 'other' }])).toBeNull()
+    expect(selectApplicationCoverLetter(selected, [{ ...letter, resumeId: 'other' }])).toBeNull()
+    expect(selectApplicationCoverLetter(selected, [{ ...letter, resumeId: null }])?.id).toBe('c1')
+  })
+
+  it('retains an explicitly saved edit for an unconfirmed resume', () => {
+    const edited = { ...letter, id: 'new-draft' }
+    expect(selectApplicationCoverLetter({ ...selection, finalResumeId: null }, [letter], edited)).toBe(edited)
   })
 })
 

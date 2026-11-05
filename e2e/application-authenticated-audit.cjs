@@ -1,12 +1,14 @@
 // Test-only database fixture. This does not run an AI audit or prove its result.
 const { createRequire } = require('node:module')
+const { execFileSync } = require('node:child_process')
 const path = require('node:path')
 const requireWeb = createRequire(path.resolve('apps/web/package.json'))
 const { PrismaClient } = requireWeb('@prisma/client')
 const expected = 'postgresql://fixture:fixture@db:5432/application_flow_fixture'
 if (process.env.CI !== 'true' || process.env.APPLICATION_AUTH_DISPOSABLE !== 'true' ||
     process.env.DATABASE_URL !== expected || process.env.DIRECT_URL !== expected ||
-    process.env.RLS_RUNTIME_MODE !== 'off' || process.env.AGENT_PREVIEW_FIXTURE) {
+    process.env.RLS_RUNTIME_MODE !== 'off' || process.env.AGENT_PREVIEW_FIXTURE ||
+    process.env.AUTH_SECRET !== 'fixture-only-secret-at-least-32-bytes') {
   throw new Error('Refusing fixture audit outside the isolated disposable database')
 }
 
@@ -30,8 +32,27 @@ async function seedSyntheticAudit(jobId, resumeId) {
       await db.activity.count({ where: { userId: user.id, jobId, text: { startsWith: '[Auditor] application-audit ' } } })) {
     throw new Error('Unexpected state before synthetic audit')
   }
-  const audit = { verdict: 'pass', summary: 'Synthetic fixture audit; no AI auditor was run.', findings: [], source: 'previous_version', auditedAt: new Date().toISOString(), matchScore: 80 }
-  const text = '[Auditor] application-audit ' + JSON.stringify({ resumeId, coverLetterId: null, resumeUpdatedAt: resume.updatedAt.toISOString(), audit })
+  const audit = { verdict: 'pass', summary: 'Synthetic fixture audit; no AI auditor was run.', findings: [{ area: 'resume', severity: 'pass', title: 'Synthetic fixture', evidence: 'Test data only', action: 'No action' }], source: 'previous_version', auditedAt: new Date().toISOString(), matchScore: 80 }
+  // Run the production signer and verifier in a separate process: tsx reads the
+  // web tsconfig there without changing Playwright's module resolution globally.
+  const script = `
+    const path = require('node:path')
+    const { createRequire } = require('node:module')
+    const web = createRequire(path.resolve('apps/web/package.json'))
+    web('tsx/cjs/api').register()
+    const { signedAuditActivityText, verifyApplicationAuditReceipt } = require(path.resolve('apps/web/src/lib/application-audit-receipt.ts'))
+    const { parseStoredApplicationAudit } = require(path.resolve('apps/web/src/lib/application-audit.ts'))
+    const input = JSON.parse(require('node:fs').readFileSync(0, 'utf8'))
+    const text = signedAuditActivityText(input.scope, input.resumeId, null, input.audit, { resumeUpdatedAt: input.resumeUpdatedAt })
+    const parsed = parseStoredApplicationAudit(text)
+    if (!verifyApplicationAuditReceipt(input.scope, parsed) || verifyApplicationAuditReceipt({ ...input.scope, jobId: 'other-job' }, parsed)) throw new Error('Fixture audit receipt verification failed')
+    process.stdout.write(text)
+  `
+  const text = execFileSync(process.execPath, ['-e', script], {
+    input: JSON.stringify({ scope: { userId: user.id, jobId }, resumeId, audit, resumeUpdatedAt: resume.updatedAt.toISOString() }),
+    encoding: 'utf8', timeout: 30_000,
+    env: { ...process.env, TSX_TSCONFIG_PATH: path.resolve('apps/web/tsconfig.json') },
+  })
   await db.activity.create({ data: { userId: user.id, jobId, type: 'agent_action', color: '#059669', text } })
 }
 

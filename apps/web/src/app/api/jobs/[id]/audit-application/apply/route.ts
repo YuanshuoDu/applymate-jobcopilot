@@ -3,7 +3,8 @@ import { db } from '@/lib/db'
 import { prepareAiRoute, requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { modelChat, parseAiJson } from '@/lib/model-router'
 import { buildPersona } from '@/lib/persona'
-import { auditActivityText, AUDIT_ACTIVITY_PREFIX, parseStoredApplicationAudit, sanitizeProposedValue, targetForAuditFinding } from '@/lib/application-audit'
+import { AUDIT_ACTIVITY_PREFIX, parseStoredApplicationAudit, sanitizeProposedValue, targetForAuditFinding } from '@/lib/application-audit'
+import { signedAuditActivityText, verifyApplicationAuditReceipt } from '@/lib/application-audit-receipt'
 import type { ApplicationAudit, ApplicationAuditFinding, ResumeContent } from '@/lib/types'
 
 type Params = { params: Promise<{ id: string }> }
@@ -14,7 +15,7 @@ function iso(value: unknown) {
 }
 
 function sameVersion(expected: string | undefined, actual: unknown) {
-  if (!expected) return true
+  if (!expected) return actual == null
   const actualIso = iso(actual)
   return Boolean(actualIso && actualIso === expected)
 }
@@ -83,7 +84,9 @@ export async function POST(req: NextRequest, { params }: Params) {
     orderBy: { createdAt: 'desc' }, select: { text: true },
   })
   const stored = parseStoredApplicationAudit(activity?.text ?? '')
-  if (!stored || stored.resumeId !== resumeId) return err('Run the independent audit again before applying a correction.', 409)
+  if (!verifyApplicationAuditReceipt({ userId: auth.userId, jobId }, stored) || stored.resumeId !== resumeId) {
+    return err('Run the independent audit again before applying a correction.', 409)
+  }
   const requestedCoverLetterId = body?.coverLetterId === undefined ? stored.coverLetterId : body.coverLetterId
   if ((requestedCoverLetterId ?? null) !== stored.coverLetterId) return err('The audit no longer matches this cover letter. Run it again.', 409)
 
@@ -139,7 +142,7 @@ export async function POST(req: NextRequest, { params }: Params) {
   await db.activity.create({
     data: {
       userId: auth.userId, jobId, type: 'agent_action', color: '#d97706',
-      text: auditActivityText(resumeId, stored.coverLetterId, updatedAudit, {
+      text: signedAuditActivityText({ userId: auth.userId, jobId }, resumeId, stored.coverLetterId, updatedAudit, {
         resumeUpdatedAt: iso(updatedResume?.updatedAt) ?? stored.resumeUpdatedAt,
         coverLetterUpdatedAt: iso(updatedCoverLetter?.updatedAt) ?? stored.coverLetterUpdatedAt,
       }),

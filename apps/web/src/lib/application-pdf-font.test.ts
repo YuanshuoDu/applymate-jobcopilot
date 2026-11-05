@@ -10,7 +10,7 @@ import { CoverLetterDoc } from '@/components/resume/templates/cover-letter/Cover
 import { renderCoverLetterDoc } from './cover-letter-pdf'
 import { renderResumeDoc } from './resume-pdf'
 import { APPLICATION_PDF_CMAP } from './application-pdf-coverage'
-import { assertApplicationPdfTextSupported, isApplicationPdfCharacterSupported, registerApplicationPdfFonts } from './application-pdf-font'
+import { applicationPdfFontRoot, assertApplicationPdfTextSupported, isApplicationPdfCharacterSupported, registerApplicationPdfFonts } from './application-pdf-font'
 import { isApplicationPdfUnsupportedCharactersError } from './application-pdf-errors'
 import type { Resume } from './types'
 
@@ -30,6 +30,15 @@ const resume = {
 } as Resume
 
 describe('offline multilingual PDF fonts', () => {
+  it('finds both bundled fonts from the project or monorepo working directory', () => {
+    const names = ['NotoSans-Regular.ttf', 'NotoSansSC-GB2312-Regular.ttf']
+    for (const [cwd, root] of [['/var/task', '/var/task/public/fonts'], ['/repo', '/repo/apps/web/public/fonts'], ['C:\\repo\\apps\\web', 'C:/repo/apps/web/public/fonts']]) {
+      const files = new Set(names.map(name => `${root}/${name}`))
+      expect(applicationPdfFontRoot(cwd, path => files.has(path))).toBe(root)
+      files.delete(`${root}/${names[1]}`)
+      expect(() => applicationPdfFontRoot(cwd, path => files.has(path))).toThrow('fonts are unavailable')
+    }
+  })
   it('accepts covered characters and rejects missing glyphs and controls', () => {
     expect(() => assertApplicationPdfTextSupported([multilingual])).not.toThrow()
     for (const unsupported of ['😀', '𠀀', '\u00ad', '\u0080', '\r', '\t', '\u0301', '\u200d', '\ufffc', '\ufffd']) {

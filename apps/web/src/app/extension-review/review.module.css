@@ -1,0 +1,61 @@
+.page { min-height: 100vh; background: #f6f7fb; color: #172033; padding: 0 36px 32px; font-family: system-ui, sans-serif; line-height: 1.55; }
+.page a { color: inherit; }
+.header { max-width: 1160px; margin: auto; min-height: 84px; display: flex; align-items: center; justify-content: space-between; gap: 24px; border-bottom: 1px solid #e2e6f0; }
+.brand { display: flex; align-items: center; gap: 10px; text-decoration: none; font-size: 18px; font-weight: 750; letter-spacing: -.04em; }
+.brandIcon { display: grid; place-items: center; width: 34px; height: 34px; background: #4f46e5; color: #fff; border-radius: 10px; font-size: 22px; }
+.reviewTag { margin-left: 4px; color: #64748b; border-left: 1px solid #cfd5e5; padding-left: 14px; font-size: 12px; font-weight: 500; letter-spacing: 0; }
+.header nav { display: flex; align-items: center; gap: 22px; font-size: 12px; color: #526078; }
+.header nav a { text-decoration: none; }
+.header nav a:last-child { padding: 9px 14px; background: #fff; border: 1px solid #dce1ee; border-radius: 9px; color: #4338ca; font-weight: 600; }
+.intro { max-width: 1160px; margin: 38px auto 22px; }
+.eyebrow { color: #6862bb; font-size: 10px; font-weight: 750; letter-spacing: .16em; }
+.intro h1 { margin: 8px 0; font-size: clamp(27px, 3.3vw, 42px); letter-spacing: -.045em; line-height: 1.18; font-weight: 760; }
+.intro p { color: #637089; margin: 10px 0 0; font-size: 14px; }
+.notice { max-width: 1160px; margin: 0 auto 24px; padding: 14px 17px; box-sizing: border-box; background: #eeedff; border: 1px solid #dedbf9; color: #57517e; border-radius: 12px; font-size: 11px; }
+.notice strong { color: #4b438c; }
+.grid { max-width: 1160px; display: grid; grid-template-columns: .94fr 1.06fr; align-items: start; gap: 24px; margin: 0 auto; }
+.column { min-width: 0; }
+.card { background: #fff; border: 1px solid #e3e7f1; box-shadow: 0 5px 18px #27376306; border-radius: 18px; padding: 24px; }
+.cardHeader { display: flex; gap: 12px; align-items: flex-start; margin-bottom: 24px; }
+.step { color: #7c73bb; border: 1px solid #e4e0f8; background: #f7f5ff; border-radius: 8px; display: grid; place-items: center; font-size: 11px; font-weight: 750; width: 32px; height: 32px; flex-shrink: 0; }
+.cardHeader h2 { font-size: 15px; margin: 0; font-weight: 700; letter-spacing: -.02em; }
+.cardHeader p { font-size: 11px; color: #718096; margin: 3px 0 0; }
+.jobHead { display: flex; gap: 13px; align-items: center; }
+.companyIcon { display: grid; place-items: center; width: 47px; height: 47px; flex-shrink: 0; border-radius: 12px; background: #dcefe9; color: #347861; font-size: 15px; font-weight: 800; }
+.company { font-size: 11px; font-weight: 650; margin: 0 0 4px; color: #526078; }
+.company span { font-weight: 400; color: #8490a4; }
+.jobHead h3 { margin: 0; font-size: 23px; letter-spacing: -.035em; line-height: 1.2; }
+.tags, .skillTags { display: flex; flex-wrap: wrap; gap: 7px; margin: 20px 0; }
+.tags span { color: #637089; background: #f5f7fa; padding: 5px 8px; border-radius: 6px; font-size: 10px; }
+.skillTags span { color: #5c558e; background: #f3f1fb; padding: 5px 10px; border-radius: 6px; font-size: 11px; }
+.jobDescription, .jobList { color: #647188; font-size: 12px; }
+.card h4 { margin: 22px 0 9px; font-size: 12px; font-weight: 650; }
+.jobList { padding-left: 18px; line-height: 1.9; margin: 6px 0; }
+.jumpLink { display: flex; justify-content: space-between; align-items: center; font-size: 12px; text-decoration: none; border-top: 1px solid #edf0f7; padding-top: 18px; margin-top: 24px; color: #4f46e5 !important; font-weight: 650; }
+.instructions { border: 1px solid #e3e7f1; border-radius: 13px; margin-top: 16px; background: #fff; padding: 15px 18px; font-size: 11px; color: #67758b; }
+.instructions summary { cursor: pointer; font-weight: 650; color: #4f5a72; }
+.instructions ol { padding-left: 18px; }
+.instructions li { margin: 7px 0; }
+.fields { display: flex; flex-direction: column; gap: 13px; }
+.fieldRow { display: grid; grid-template-columns: 1fr 1fr; gap: 13px; }
+.field { display: flex; flex-direction: column; gap: 6px; font-size: 11px; font-weight: 600; color: #526078; }
+.field input, .field select, .field textarea { box-sizing: border-box; width: 100%; border: 1px solid #dce2ed; background: #fff; color: #172033; border-radius: 8px; padding: 9px 11px; font: 12px system-ui, sans-serif; min-height: 37px; outline: none; }
+.field input:focus, .field select:focus, .field textarea:focus { border-color: #8c81e9; box-shadow: 0 0 0 3px #eeebff; }
+.field input::placeholder, .field textarea::placeholder { color: #a1aaba; }
+.field input[type="file"] { font-size: 10px; padding: 6px; }
+.field input::file-selector-button { border: 0; padding: 5px 9px; border-radius: 5px; color: #5e559d; background: #f1eefb; margin-right: 9px; font-size: 10px; }
+.field textarea { resize: vertical; }
+.optional { color: #94a0b2; font-weight: 400; }
+.hint { margin: 0; font-size: 10px; color: #8793a7; line-height: 1.5; }
+.reviewButton { display: flex; justify-content: space-between; align-items: center; border: 0; border-radius: 9px; padding: 11px 14px; background: #4f46e5; color: #fff; font: 600 12px system-ui, sans-serif; cursor: pointer; }
+.reviewButton:hover { background: #4338ca; }
+.reviewButton:focus-visible, .header a:focus-visible, .instructions summary:focus-visible, .jumpLink:focus-visible { outline: 3px solid #a9a3f5; outline-offset: 3px; }
+.success { color: #247258; margin: 0; font-size: 11px; }
+.embedded { max-width: 1160px; box-sizing: border-box; border: 1px solid #e3e7f1; border-radius: 18px; background: #fff; margin: 24px auto 0; padding: 24px; }
+.embedded .cardHeader { margin-bottom: 16px; }
+.frame { display: block; width: 100%; height: 270px; border: 1px solid #e7eaf4; border-radius: 10px; background: #fbfcfe; }
+.frameContent { padding: 17px; background: #fbfcfe; color: #172033; font-family: system-ui, sans-serif; }
+.frameNote { margin: 0 0 13px; color: #7b8496; font-size: 10px; }
+.footer { max-width: 1160px; margin: 28px auto 0; font-size: 10px; color: #8b95a8; }
+@media (max-width: 850px) { .page { padding: 0 20px 24px; } .grid { gap: 16px; grid-template-columns: 1fr; } .intro { margin-top: 26px; } .card { padding: 22px; } .header { min-height: 72px; } .header nav { gap: 12px; } .reviewTag { display: none; } .frame { height: 300px; } }
+@media (max-width: 480px) { .page { padding: 0 14px 20px; } .header nav a:first-child { display: none; } .header nav a:last-child { padding: 7px 10px; font-size: 10px; } .brand { font-size: 16px; } .fieldRow { grid-template-columns: 1fr; } .card { padding: 18px; } .frame { height: 360px; } }
