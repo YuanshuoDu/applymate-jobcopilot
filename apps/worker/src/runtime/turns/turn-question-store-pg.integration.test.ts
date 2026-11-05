@@ -13,6 +13,7 @@ import { buildScheduledTaskGraphContinuationReceipt } from "../subagents/schedul
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import type { TurnQuestionPool } from "./turn-question-store-guards.js"
 import type { TurnQuestionIntentEnvelope } from "./turn-question-contract.js"
+import { issueNativeQuestionControlReceipt } from "./native-question-attestation.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 function disposableUrl(): string | null {
@@ -55,6 +56,12 @@ const intent: TurnQuestionIntentEnvelope = {
   schemaVersion: "agent-harness.v2.ask-user-intent.v1", kind: "user_question", stage: "user_input",
   question: "Which region should I prioritize?", options: [{ label: "Berlin", value: "berlin" }],
 }
+const nativeQuestionReceipt = issueNativeQuestionControlReceipt({
+  identity: { userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, stepId: ids.step, taskId: owner.taskId, rootTaskId: owner.rootTaskId },
+  actorRole: "orchestrator", capabilities: ["canManageChildren"], toolCallId: callId, toolName: "agent.ask_user", toolVersion: "1",
+  requestInput: { question: intent.question, choices: intent.options },
+  effectiveInput: { question: intent.question, choices: intent.options }, toolOutput: intent,
+})!
 const scheduledSnapshot = { schemaVersion: "agent-harness.v2.scheduled-automation-snapshot.v1", targetRoles: ["Engineer"], targetLocations: ["Dublin"],
   minScore: 70, dailyCap: 10, requireApproval: true, autoApply: false }
 const scheduledSnapshotDigest = `sha256:${createHash("sha256").update(JSON.stringify([scheduledSnapshot.schemaVersion, scheduledSnapshot.targetRoles,
@@ -454,7 +461,16 @@ describePg("native durable user question persistence on disposable PostgreSQL", 
     expect(callCompleted.rowCount).toBe(1)
     await admin!.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "content", "startedAt", "completedAt", "updatedAt")
       VALUES ($1, $2, $3, $4, $5, 'tool_result', 'completed', 'commentary', $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-    [`question-result-item-${suffix}`, ids.session, ids.turn, ids.step, ids.root, JSON.stringify({ toolCallId: callId, output: intent, errorCode: null })])
+    [`question-result-item-${suffix}`, ids.session, ids.turn, ids.step, ids.root,
+      JSON.stringify({ toolCallId: callId, output: { question: "[REDACTED]", choices: [] }, errorCode: null, nativeQuestionAttestation: { ...nativeQuestionReceipt.attestation, turnId: "stale-turn" } })])
+    await expect(store.waitForQuestion({ owner, stepId: ids.step, toolCallId: callId, now }))
+      .rejects.toMatchObject({ code: "question_conflict" })
+    const untouched = await admin!.query<{ status: string }>(`SELECT "status" FROM "agent_turns" WHERE "id" = $1`, [ids.turn])
+    expect(untouched.rows[0]?.status).toBe("in_progress")
+    await admin!.query(`UPDATE "agent_items" SET "content" = $1::jsonb WHERE "id" = $2`, [
+      JSON.stringify({ toolCallId: callId, output: { question: "[REDACTED]", choices: [] }, errorCode: null, nativeQuestionAttestation: nativeQuestionReceipt.attestation }),
+      `question-result-item-${suffix}`,
+    ])
     const input = { owner, stepId: ids.step, toolCallId: callId, now }
     const receipts = await Promise.all([store.waitForQuestion(input), store.waitForQuestion(input)])
     expect(receipts.map(value => value.disposition).sort()).toEqual(["created", "replayed"])
@@ -467,6 +483,11 @@ describePg("native durable user question persistence on disposable PostgreSQL", 
       waitKind: "question", questionId: receipts[0]!.waitId, toolCallId: callId, stage: "user_input",
       question: intent.question, options: intent.options, answer: null, answerAvailable: false,
     } })
+    const privateToolResult = await admin!.query<{ content: Record<string, unknown> }>(`SELECT "content" FROM "agent_items" WHERE "id" = $1`, [`question-result-item-${suffix}`])
+    const privateReceipt = privateToolResult.rows[0]?.content?.nativeQuestionAttestation
+    expect(privateToolResult.rows[0]?.content?.output).toEqual({ question: "[REDACTED]", choices: [] })
+    expect(JSON.stringify(privateReceipt)).not.toContain(intent.question)
+    expect(JSON.stringify(privateReceipt)).not.toContain("berlin")
     const events = await admin!.query<{ type: string; actor: string; payload: Record<string, unknown> }>(`SELECT "type", "actor", "payload" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "sequence"`, [ids.session, ids.turn])
     expect(events.rows.map(row => row.type)).toEqual(["step.completed", "item.started"])
     expect(events.rows[1]).toMatchObject({ actor: "orchestrator", payload: { itemId: question.rows[0]!.id, waitKind: "question", questionId: receipts[0]!.waitId, toolCallId: callId } })

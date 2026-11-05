@@ -6,6 +6,14 @@ import { TurnExecutionEventWriter } from "./turn-execution-events.js"
 import type { TurnExecutionOptions, TurnExecutionStore } from "./turn-execution-types.js"
 import type { ToolCallRecovery } from "./turn-engine-types.js"
 import type { ChildWaitClaimRecovery } from "../subagents/child-durable-wait-replay.js"
+import { createAskUserTool } from "../tools/ask-user.js"
+import { InMemoryToolLifecycleSink, ToolLifecycle } from "../tools/lifecycle.js"
+import { InMemoryToolResultReferenceStore } from "../tools/redaction.js"
+import { ToolRegistry } from "../tools/registry.js"
+import { ToolRouter } from "../tools/router.js"
+import type { RuntimeToolDefinition } from "../tools/types.js"
+import { PolicyEngine } from "../policy/index.js"
+import { createToolRouterExecutor } from "./turn-engine-helpers.js"
 
 function execution(recovery: ToolCallRecovery, executeTool: TurnExecutionOptions["executeTool"], validateToolArguments?: TurnExecutionOptions["validateToolArguments"], additionalRecovery: readonly ToolCallRecovery[] = []) {
   const updates: Array<{ itemId: string; status: string; content: unknown }> = []
@@ -151,6 +159,70 @@ describe("recoverPersistedToolCalls", () => {
     expect(execute).toHaveBeenCalledOnce()
     expect(fixture.updates).toEqual([])
     expect(fixture.events).toEqual([])
+  })
+
+  it.each([
+    ["unrecorded result", "replay", undefined, undefined],
+    ["redacted lifecycle result", "reconcile", { question: "[REDACTED]", choices: [] }, { id: "ask-result", revision: 0 }],
+    ["missing lifecycle output", "reconcile", undefined, undefined],
+  ] as const)("replays a trusted ask_user after the %s crash cut and persists only private attestation", async (_label, action, durableOutput, resultItem) => {
+    const callInput = { question: "Where should the search focus?", choices: [{ label: "Dublin", value: "dublin" }] }
+    const intent = { schemaVersion: "agent-harness.v2.ask-user-intent.v1", kind: "user_question", stage: "user_input",
+      question: callInput.question, options: callInput.choices }
+    const ask: ToolCallRecovery = {
+      action, stepId: "step-1", toolVersion: "1", call: { id: "ask-1", name: "agent.ask_user", arguments: callInput },
+      callItem: { id: "ask-item", revision: 0 }, ...(resultItem ? { resultItem } : {}),
+      ...(action === "reconcile" ? { durableResult: { id: "ask-1", toolName: "agent.ask_user", toolVersion: "1", status: "completed",
+        ...(durableOutput === undefined ? {} : { output: durableOutput }), errorCode: null } } : {}),
+    } as ToolCallRecovery
+    const fixture = execution(ask, vi.fn() as never)
+    const lifecycleSink = new InMemoryToolLifecycleSink()
+    const policy = new PolicyEngine({ snapshot: { version: "policy.v1", rules: [{
+      id: "native-question-recovery-test", roles: ["orchestrator"], tools: ["agent.ask_user"], toolVersions: ["1"],
+      risks: ["internal_write"], domains: ["coordination"], requiredCapabilities: ["canManageChildren"],
+      outcome: "allow", reasonCode: "test_allow", reason: "Allow the trusted root question in this test",
+    }] } })
+    const router = new ToolRouter(new ToolRegistry([createAskUserTool() as RuntimeToolDefinition]), new ToolLifecycle({
+      sink: lifecycleSink, references: new InMemoryToolResultReferenceStore(),
+    }), policy)
+    const execute = vi.fn(createToolRouterExecutor(router))
+    Object.assign(fixture.options, {
+      scope: { userId: "user-1" }, actorRole: "orchestrator", capabilities: ["canManageChildren"], executeTool: execute,
+      store: { ...fixture.options.store, readPendingQuestion: async () => ({ status: "replayable", stepId: "step-1", toolCallId: "ask-1",
+        callItemId: "ask-item", intent }) },
+    })
+
+    const observations = await recoverPersistedToolCalls(fixture.options, fixture.writer, () => new Date("2026-11-05T12:00:00Z"))
+
+    expect(execute).toHaveBeenCalledOnce()
+    expect(observations).toEqual([{ id: "tool-result:ask-1", content: expect.objectContaining({ output: { question: "[REDACTED]", choices: [] } }) }])
+    const persisted = JSON.stringify(fixture.updates)
+    expect(persisted).toContain("nativeQuestionAttestation")
+    expect(persisted).toContain("Where should the search focus?")
+    expect(persisted).not.toContain('"output":{"question":"Where should the search focus?"')
+    const projected = JSON.stringify({ events: fixture.events, lifecycle: lifecycleSink.events })
+    expect(projected).not.toContain("Where should the search focus?")
+    expect(projected).not.toContain("Dublin")
+    expect(projected).not.toContain("dublin")
+    expect(projected).not.toContain("nativeQuestionAttestation")
+    expect(JSON.stringify(observations)).not.toContain("nativeQuestionAttestation")
+  })
+
+  it("fails closed when replay lacks the unforgeable built-in question receipt", async () => {
+    const callInput = { question: "Which city?", choices: [{ label: "Berlin", value: "berlin" }] }
+    const ask: ToolCallRecovery = { action: "reconcile", stepId: "step-1", toolVersion: "1", call: { id: "ask-1", name: "agent.ask_user", arguments: callInput },
+      callItem: { id: "ask-item", revision: 0 }, durableResult: { id: "ask-1", toolName: "agent.ask_user", toolVersion: "1", status: "completed",
+        output: { question: "[REDACTED]", choices: [] }, errorCode: null } }
+    const execute = vi.fn(async () => ({ id: "ask-1", toolName: "agent.ask_user", toolVersion: "1", status: "completed" as const,
+      output: { question: "[REDACTED]", choices: [] }, errorCode: null }))
+    const fixture = execution(ask, execute as never)
+    Object.assign(fixture.options, { store: { ...fixture.options.store, readPendingQuestion: async () => ({ status: "replayable", stepId: "step-1",
+      toolCallId: "ask-1", callItemId: "ask-item", intent: { schemaVersion: "agent-harness.v2.ask-user-intent.v1", kind: "user_question",
+        stage: "user_input", question: callInput.question, options: callInput.choices } }) } })
+
+    await expect(recoverPersistedToolCalls(fixture.options, fixture.writer, () => new Date())).rejects.toMatchObject({ code: "invalid_output" })
+    expect(fixture.updates).toEqual([])
+    expect(JSON.stringify(fixture.events)).not.toContain("nativeQuestionAttestation")
   })
 })
 
