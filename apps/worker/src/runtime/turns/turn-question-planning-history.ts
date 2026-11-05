@@ -12,11 +12,22 @@ import { steeringReconciliationId, steeringReconciliationSequence } from "../sub
 type Queryable = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
 type EventRow = Row & { id: string; idempotencyKey: string; payload: unknown }
+const QUESTION_ITEM_KEYS = ["answer", "answerAvailable", "options", "question", "questionId", "stage", "toolCallId", "waitKind"].sort().join(",")
+const ANSWERED_QUESTION_ITEM_KEYS = [...QUESTION_ITEM_KEYS.split(","), "answeredAt"].sort().join(",")
 function object(value: unknown): Row | null {
   if (typeof value === "string") { try { value = JSON.parse(value) as unknown } catch { return null } }
   if (!value || typeof value !== "object" || Array.isArray(value)) return null
   const prototype = Object.getPrototypeOf(value)
   return prototype === Object.prototype || prototype === null ? value as Row : null
+}
+function canonicalTimestamp(value: unknown): value is string {
+  return typeof value === "string" && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value
+}
+function validQuestionItemContent(content: Row | null, status: unknown): content is Row {
+  if (!content) return false
+  const keys = Object.keys(content).sort().join(",")
+  return keys === QUESTION_ITEM_KEYS
+    || keys === ANSWERED_QUESTION_ITEM_KEYS && status === "completed" && canonicalTimestamp(content.answeredAt)
 }
 function validOwner(owner: TurnQuestionPlanningReadOwner): boolean {
   return [owner.userId, owner.sessionId, owner.turnId, owner.rootTaskId].every(value => typeof value === "string" && value.trim() === value && value.length > 0)
@@ -68,7 +79,7 @@ async function validateQuestionLineage(client: TurnQuestionQueryClient, owner: T
     WHERE item."id" = $1 AND item."sessionId" = $2 AND item."turnId" = $3`, [wait.questionItemId, owner.sessionId, owner.turnId, owner.userId, owner.rootTaskId])
   const item = itemResult.rows[0], content = object(item?.content)
   if (itemResult.rows.length !== 1 || !item || item.stepId !== wait.stepId || item.taskId !== owner.rootTaskId || item.type !== "question"
-    || !content || Object.keys(content).sort().join(",") !== "answer,answerAvailable,options,question,questionId,stage,toolCallId,waitKind"
+    || !validQuestionItemContent(content, item.status)
     || content.questionId !== wait.waitId || content.toolCallId !== wait.toolCallId || content.waitKind !== "question" || content.stage !== "user_input") {
     throw questionConflict(`planning clarification wait ${wait.waitId}`)
   }
