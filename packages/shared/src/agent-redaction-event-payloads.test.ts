@@ -109,6 +109,40 @@ describe("approval cancellation redaction contracts", () => {
   })
 })
 
+describe("approval resolution availability redaction contract", () => {
+  const approvalId = "approval_1"
+  const itemId = `agent-wait:approval:${approvalId}`
+  const approvalRoute: AgentEventRoutingContext = {
+    ...route, itemId, taskId: null, actor: "user", correlationId: approvalId, causationId: itemId,
+  }
+  const resolved = {
+    waitKind: "approval", waitId: approvalId, itemId, turnId, toolCallId: "call_1",
+    status: "approved", nextTurnRevision: 5, answerAvailable: false,
+  }
+
+  it.each([null, "task_1"] as const)("preserves the false availability bit only on a canonical resolution with task lineage %s", taskId => {
+    expect(validatedPayloadFields("approval.resolved", resolved, { ...approvalRoute, taskId }, guards))
+      .toEqual(["sessionId", "waitId", "itemId", "turnId", "toolCallId", "answerAvailable"])
+  })
+
+  it("does not preserve the availability bit on malformed, extra, or misrouted payloads", () => {
+    const cases: Array<{ payload: Record<string, unknown>; route: AgentEventRoutingContext }> = [
+      { payload: { ...resolved, answerAvailable: true }, route: approvalRoute },
+      { payload: { ...resolved, answerAvailable: "[REDACTED]" }, route: approvalRoute },
+      { payload: { ...resolved, answerAvailable: null }, route: approvalRoute },
+      { payload: { ...resolved, answer: "candidate@example.test" }, route: approvalRoute },
+      { payload: { ...resolved, unexpected: "private" }, route: approvalRoute },
+      { payload: { ...resolved, turnId: "foreign_turn" }, route: approvalRoute },
+      { payload: resolved, route: { ...approvalRoute, correlationId: "foreign_approval" } },
+    ]
+
+    for (const entry of cases) {
+      const fields = validatedPayloadFields("approval.resolved", entry.payload, entry.route, guards)
+      expect(fields?.includes("answerAvailable") ?? false).toBe(false)
+    }
+  })
+})
+
 describe("question cancellation redaction contracts", () => {
   const questionId = "question_1"
   const itemId = `agent-wait:question:${questionId}`
