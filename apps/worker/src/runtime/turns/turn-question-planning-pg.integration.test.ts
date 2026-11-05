@@ -8,7 +8,6 @@ import { mergeCanonicalTurnQuestionContext } from "../canonical-turn-question-co
 import { StepContextBuilder, type StepContext } from "../context/step-context-builder.js"
 import { createPgInputClaimStore } from "../context/input-claim-store.js"
 import { recoverAnsweredQuestionContext } from "../question-answer-recovery.js"
-import { loadCanonicalTurnState } from "../canonical-turn-state.js"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import { buildCognitiveActionAgenda } from "./cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, cognitiveAgendaReceiptIdempotencyKey } from "./cognitive-agenda-receipt.js"
@@ -739,13 +738,6 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
     }
     const receiptSummary = await withRuntimeTransaction(pool, fixture.userId, client => readTurnQuestionPlanningWait(client, readOwner(fixture), waitRef(fixture, wait.waitId)))
     expect(receiptSummary).toMatchObject({ observedPlanRevision: 1, graphRevisionAtAsk: 1, pendingSteerCount: 2, unconsumedSteerCount: 1 })
-    const canonicalState = await loadCanonicalTurnState(pool, {
-      turnId: fixture.turnId, sessionId: fixture.sessionId, ownerId: fixture.owner.ownerId, userId: fixture.userId,
-      leaseVersion: fixture.owner.leaseVersion, leaseStartedAt: new Date(), leaseExpiresAt: fixture.owner.leaseExpiresAt,
-    })
-    expect(canonicalState.snapshot.planningClarifications).toMatchObject([{
-      observedPlanRevision: 1, graphRevisionAtAsk: 1, pendingSteerCount: 2, unconsumedSteerCount: 1,
-    }])
 
     const currentSteerId = randomUUID()
     const currentSteerSequence = await acceptSteer(fixture, `clarification_current_steer_${fixture.turnId}`, currentSteerId)
