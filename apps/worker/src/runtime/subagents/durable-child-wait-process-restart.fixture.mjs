@@ -69,13 +69,19 @@ const waitAcknowledgementFailureReasons = new Map([
   ["Child wait tool call does not match the durable wait", "wait_call_mismatch"],
   ["Child wait step ordinal is invalid", "source_step_ordinal_invalid"],
 ])
+const sourceLifecycleStages = new Set([
+  "required_value", "resume_scope", "source_step", "source_call_count", "source_call_input", "source_item_set", "wait_record_shape",
+  "provenance_marker", "source_receipt_state", "source_event_chain", "reconciliation", "safe_result_shape", "source_start_event",
+])
 function waitAcknowledgementFailureDiagnostic(error) {
   const value = error && typeof error === "object" ? error : {}
   const code = ["wait_scope_error", "wait_invalid", "wait_conflict"].includes(value.code) ? value.code : "other"
   const reason = value.name === "DurableSubagentWaitError" && typeof value.message === "string"
     ? waitAcknowledgementFailureReasons.get(value.message) ?? "unclassified_wait_error"
     : "non_wait_error"
-  return { stage: "continuation_ack", code, reason }
+  const sourceLifecycleStage = reason === "source_lifecycle" && sourceLifecycleStages.has(value.sourceLifecycleStage)
+    ? value.sourceLifecycleStage : null
+  return { stage: "continuation_ack", code, reason, sourceLifecycleStage }
 }
 const highPrecisionWaitModelCostUsd = 0.123456789
 const loopFixtureModelProfile = Object.freeze({ provider: "fixture", model: "durable-child-wait-fixture", nativeTools: true,

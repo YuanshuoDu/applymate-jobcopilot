@@ -198,8 +198,12 @@ describe("child source wait lifecycle recovery", () => {
 
   it("rejects a waiting completion event that differs from both raw and safe projections", async () => {
     const fake = waitingFixture("malformed")
-    await expect(inspectChildWaitSourceLifecycle(fake.client as never, lease, fake.wait, "step-1", fake.result as never))
-      .rejects.toMatchObject({ code: "wait_scope_error" })
+    const failure = await inspectChildWaitSourceLifecycle(fake.client as never, lease, fake.wait, "step-1", fake.result as never)
+      .catch((error: unknown) => error)
+    expect(failure).toBeInstanceOf(Error)
+    expect(failure).toMatchObject({ code: "wait_scope_error", message: "Child wait source lifecycle is inconsistent",
+      sourceLifecycleStage: "source_event_chain" })
+    expect(Object.keys(failure as object)).not.toContain("sourceLifecycleStage")
   })
 
   it("accepts reentry under a new owner or later lease attempt but rejects malformed provenance", async () => {
@@ -229,7 +233,7 @@ describe("child source wait lifecycle recovery", () => {
 
     const futureSource = fixture({ sourceAttempt: 3 })
     await expect(inspectChildWaitSourceLifecycle(futureSource.client as never, retryLease, futureSource.wait, "step-1", futureSource.result as never))
-      .rejects.toMatchObject({ code: "wait_scope_error" })
+      .rejects.toMatchObject({ code: "wait_scope_error", sourceLifecycleStage: "source_step" })
     const wrongMarker = fake.wait.result as Record<string, unknown>
     fake.wait.result = { ...wrongMarker, sourceLifecycleRecovery: { ...(wrongMarker.sourceLifecycleRecovery as Record<string, unknown>), attempt: 2 } }
     await expect(inspectChildWaitSourceLifecycle(fake.client as never, retryLease, fake.wait, "step-1", fake.result as never))

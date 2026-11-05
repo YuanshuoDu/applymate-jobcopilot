@@ -351,25 +351,10 @@ async function diagnoseWorkerFBlocker(
       attemptCount: row.attemptCount, leaseExpiresAt: row.leaseExpiresAt }
     const blocker = await hasBlockingExternalCall(client, task as unknown as Record<string, unknown>, undefined, continuationStepId)
     const claimProof = await diagnoseWorkerFClaimProof(client, task, continuationStepId, sourceCallId, claimCallId)
-    const starts = await client.query<{ id: string; turnId: string; type: string; correlationId: string }>(
-      WORKER_F_UNSETTLED_STARTS_SQL,
-      [ids.sessionId, ids.waiterTaskId],
-    )
-    const classified = []
-    for (const [index, start] of starts.rows.slice(0, 16).entries()) {
-      const blockedWhenOmitted = await hasBlockingExternalCall(client,
-        task as unknown as Record<string, unknown>, start.id, continuationStepId)
-      const lane = start.correlationId === sourceCallId ? "source_wait"
-        : start.correlationId === claimCallId ? "continuation_claim"
-          : start.correlationId === continuationStepId ? "continuation_model" : "other"
-      classified.push({ candidateOrdinal: index + 1, lane, kind: start.type === "tool_call.started" ? "tool_call" : "model_call",
-        sameTurn: start.turnId === ids.turnId, blockedWhenOmitted, isSoleBlocker: blocker && !blockedWhenOmitted })
-    }
+    const startDiagnostics = await diagnoseWorkerFStartCandidates(client, task, continuationStepId, sourceCallId, claimCallId, blocker)
     return { snapshot: "post_recovery_attempt_read_committed", taskRowCount: taskResult.rows.length,
       taskStatus: diagnosticTaskStatus(row.status), attemptCount: row.attemptCount,
-      leaseOwnerPresent: true, leaseExpired: row.leaseExpiresAt.getTime() <= Date.now(), claimProof,
-      blocker, examinedStartCount: classified.length, unsettledStartCandidateCount: starts.rows.length,
-      unsettledStartCandidatesTruncated: starts.rows.length > 16, starts: classified }
+      leaseOwnerPresent: true, leaseExpired: row.leaseExpiresAt.getTime() <= Date.now(), claimProof, blocker, ...startDiagnostics }
   } catch {
     return { snapshot: "post_recovery_attempt_read_committed", predicateProbe: "unavailable" }
   } finally {
@@ -378,6 +363,27 @@ async function diagnoseWorkerFBlocker(
       client.release()
     }
   }
+}
+
+async function diagnoseWorkerFStartCandidates(
+  client: PoolClient, task: BlockingTaskSnapshot, continuationStepId: string,
+  sourceCallId: string, claimCallId: string, blocker: boolean,
+): Promise<Record<string, unknown>> {
+  const starts = await client.query<{ id: string; turnId: string; type: string; correlationId: string }>(
+    WORKER_F_UNSETTLED_STARTS_SQL, [task.sessionId, task.id],
+  )
+  const classified = []
+  for (const [index, start] of starts.rows.slice(0, 16).entries()) {
+    const blockedWhenOmitted = await hasBlockingExternalCall(client,
+      task as unknown as Record<string, unknown>, start.id, continuationStepId)
+    const lane = start.correlationId === sourceCallId ? "source_wait"
+      : start.correlationId === claimCallId ? "continuation_claim"
+        : start.correlationId === continuationStepId ? "continuation_model" : "other"
+    classified.push({ candidateOrdinal: index + 1, lane, kind: start.type === "tool_call.started" ? "tool_call" : "model_call",
+      sameTurn: start.turnId === task.turnId, blockedWhenOmitted, isSoleBlocker: blocker && !blockedWhenOmitted })
+  }
+  return { examinedStartCount: classified.length, unsettledStartCandidateCount: starts.rows.length,
+    unsettledStartCandidatesTruncated: starts.rows.length > 16, starts: classified }
 }
 
 async function diagnoseWorkerFClaimProof(
@@ -3296,14 +3302,15 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       await waitForMarker(workerD, "WORKER_B_RECOVERED")
       await publishRecovery(recoveryCount)
       await waitForMarker(workerD, "WORKER_B_RESUMED")
-      const resumedLine = workerD.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_RESUMED "))
-      const resumed = JSON.parse(resumedLine!.slice("WORKER_B_RESUMED ".length)) as { result?: { finalText?: string } }
-      expect(resumed.result?.finalText).toBe(ids.finalText)
+      const loopSummaryLine = workerD.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_LOOP_RESUMED "))
+      const loopSummary = JSON.parse(loopSummaryLine!.slice("WORKER_B_LOOP_RESUMED ".length)) as Record<string, unknown> & { finalText?: string }
+      expect(typeof ids.finalText === "string" && loopSummary.finalText === ids.finalText).toBe(true)
       expect(workerD.stdoutText + workerD.stderrText).not.toContain(SOURCE_WAIT_SECRET_IDEMPOTENCY_KEY(ids.waiterTaskId))
-      const finished = await pool.query<{ status: string; attemptCount: number; leaseOwner: string | null }>(
-        `SELECT "status", "attemptCount", "leaseOwner" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`,
+      const finished = await pool.query<{ status: string; attemptCount: number; leaseOwner: string | null; result: unknown }>(
+        `SELECT "status", "attemptCount", "leaseOwner", "result" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`,
         [ids.waiterTaskId, ids.sessionId])
-      expect(finished.rows[0]).toMatchObject({ status: "completed", attemptCount: 1, leaseOwner: null })
+      expect(finished.rows[0]).toMatchObject({ status: "completed", attemptCount: 1, leaseOwner: null,
+        result: { finalText: ids.finalText } })
       const finalSource = await readSourceWaitLifecycle(pool, ids)
       expectReconciledSourceWait(finalSource, ids)
       expect(BigInt(finalSource.eventSequence!)).toBeGreaterThan(BigInt(repairedLifecycle.eventSequence!))
@@ -3313,8 +3320,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         outboxes: repairedLifecycle.outboxes })
       const finalClaim = await readWaitClaimState(pool, ids, legacy.continuationStepId, legacy.callId, 1)
       expect(finalClaim).toMatchObject({ callCount: 1, claimCount: 1, itemStartedCount: 1, resultCount: 1, claimOutboxCount: 1 })
-      const loopSummary = workerD.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_LOOP_RESUMED "))
-      expect(JSON.parse(loopSummary!.slice("WORKER_B_LOOP_RESUMED ".length))).toMatchObject({ phase: "final", status: "completed",
+      expect(loopSummary).toMatchObject({ phase: "final", status: "completed",
         invocations: [`task:${ids.waiterTaskId}:step:2:attempt:1`], executorCalls: 0, dispatcherCalls: 0,
         continuationStepId: legacy.continuationStepId, logicalStepOrdinal: 1 })
     } finally {
@@ -3566,8 +3572,11 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
           blockerClient, snapshot as unknown as Record<string, unknown>, undefined, continuationStep.id)
         const crossAttemptProof = await diagnoseWorkerFClaimProof(blockerClient, crossAttemptSnapshot,
           continuationStep.id, PHONE_SHAPED_WAIT_TOOL_CALL_ID, claimCallId)
-        expect(await blocking(crossAttemptSnapshot),
-          `a unique historical source may authorize its exact current claim: ${JSON.stringify(crossAttemptProof)}`).toBe(false)
+        const crossAttemptBlocked = await blocking(crossAttemptSnapshot)
+        const crossAttemptStarts = await diagnoseWorkerFStartCandidates(blockerClient, crossAttemptSnapshot,
+          continuationStep.id, PHONE_SHAPED_WAIT_TOOL_CALL_ID, claimCallId, crossAttemptBlocked)
+        expect(crossAttemptBlocked,
+          `a unique historical source may authorize its exact current claim: ${JSON.stringify({ claimProof: crossAttemptProof, ...crossAttemptStarts })}`).toBe(false)
         expect(await blocking({ ...crossAttemptSnapshot, leaseOwner: `${syntheticOwner}:stale` }),
           "a stale current lease owner must leave the attempt-2 claim blocking").toBe(true)
         expect(await blocking({ ...crossAttemptSnapshot, attemptCount: 1 }),
