@@ -1215,8 +1215,7 @@ for (const scenario of [
   { checkpoint: 'fill_outcome_uncertain', label: /Form-filling outcome unverified|表单填写结果待核实/, action: /View task activity|查看任务记录/ },
   { checkpoint: null, label: /Action needed|需要处理/, action: /View task activity|查看任务记录/ },
 ] as const) {
-  test(`waiting task ${scenario.checkpoint ?? 'unspecified'} has consistent guidance`, async ({ page }, testInfo) => {
-    test.skip(testInfo.project.name.startsWith('mobile-'), 'Checks desktop guidance in both languages')
+  test(`waiting task ${scenario.checkpoint ?? 'unspecified'} has consistent guidance`, async ({ page }) => {
     const state = await install(page, { taskStatus: 'waiting_for_user', taskCheckpoint: scenario.checkpoint })
     await page.goto(`${origin}/?page=dashboard`)
     const dashboardCard = page.getByRole('region', { name: 'Fixture Employer · Application flow engineer' })
