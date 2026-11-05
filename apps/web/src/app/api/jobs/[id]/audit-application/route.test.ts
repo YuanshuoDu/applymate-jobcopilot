@@ -1,4 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { parseStoredApplicationAudit } from '@/lib/application-audit'
+import { signedAuditActivityText, verifyApplicationAuditReceipt } from '@/lib/application-audit-receipt'
+import type { ApplicationAudit } from '@/lib/types'
+vi.mock('@/lib/auth-secret', () => ({ getAuthJwtSecret: () => new TextEncoder().encode('unit-test-independent-audit-key') }))
 
 const mocks = {
   jobFindFirst: vi.fn(), resumeFindFirst: vi.fn(), coverLetterFindFirst: vi.fn(),
@@ -68,6 +72,7 @@ describe('POST /api/jobs/[id]/audit-application', () => {
     expect(mocks.modelChat.mock.calls[0][0][0].content).toContain('current employment status or location')
     expect(mocks.modelChat.mock.calls[0][0][0].content).toContain('security-threat detection metrics')
     expect(mocks.activityCreate.mock.calls[0][0].data.text).toContain('[Auditor] application-audit')
+    expect(verifyApplicationAuditReceipt({ userId: 'user_1', jobId: 'job_1' }, parseStoredApplicationAudit(mocks.activityCreate.mock.calls[0][0].data.text))).toBe(true)
   })
 
   it('returns and persists the exact resume and cover-letter revisions that were audited', async () => {
@@ -238,7 +243,7 @@ describe('POST /api/jobs/[id]/audit-application', () => {
   })
 
   it('returns the latest persisted audit so each surface uses the same version', async () => {
-    mocks.activityFindFirst.mockResolvedValue({ text: '[Auditor] application-audit {"resumeId":"resume_final","coverLetterId":"cover_1","audit":{"verdict":"needs_review","summary":"Revise wording.","matchScore":72,"findings":[]}}' })
+    mocks.activityFindFirst.mockResolvedValue({ text: signedAuditActivityText({ userId: 'user_1', jobId: 'job_1' }, 'resume_final', 'cover_1', ({"resumeId":"resume_final","coverLetterId":"cover_1","audit":{"verdict":"needs_review","summary":"Revise wording.","matchScore":72,"source":"parent_resume","auditedAt":"2026-11-02T09:00:00.000Z","findings":[]}}).audit as ApplicationAudit) })
     const { GET } = await import('./route')
     const response = (await GET(new Request('http://localhost/api/jobs/job_1/audit-application') as never, { params: Promise.resolve({ id: 'job_1' }) }))!
     await expect(response.json()).resolves.toMatchObject({ resumeId: 'resume_final', coverLetterId: 'cover_1', audit: { verdict: 'needs_review' } })
@@ -246,10 +251,17 @@ describe('POST /api/jobs/[id]/audit-application', () => {
   })
 
   it('returns a persisted resume-only audit with a null cover-letter id', async () => {
-    mocks.activityFindFirst.mockResolvedValue({ text: '[Auditor] application-audit {"resumeId":"resume_final","coverLetterId":null,"audit":{"verdict":"pass","summary":"Resume supported.","matchScore":80,"findings":[]}}' })
+    mocks.activityFindFirst.mockResolvedValue({ text: signedAuditActivityText({ userId: 'user_1', jobId: 'job_1' }, 'resume_final', null, ({"resumeId":"resume_final","coverLetterId":null,"audit":{"verdict":"pass","summary":"Resume supported.","matchScore":80,"source":"parent_resume","auditedAt":"2026-11-02T09:00:00.000Z","findings":[]}}).audit as ApplicationAudit) })
     const { GET } = await import('./route')
     const response = (await GET(new Request('http://localhost/api/jobs/job_1/audit-application') as never, { params: Promise.resolve({ id: 'job_1' }) }))!
     await expect(response.json()).resolves.toMatchObject({ resumeId: 'resume_final', coverLetterId: null, audit: { verdict: 'pass' } })
+  })
+
+  it('hides unsigned historical activity until the independent audit is rerun', async () => {
+    mocks.activityFindFirst.mockResolvedValue({ text: '[Auditor] application-audit {"resumeId":"resume_final","coverLetterId":null,"audit":{"verdict":"pass","findings":[]}}' })
+    const { GET } = await import('./route')
+    const response = (await GET(new Request('http://localhost/api/jobs/job_1/audit-application') as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    await expect(response.json()).resolves.toBeNull()
   })
 
   it('does not report a completed audit when its canonical record could not be saved', async () => {

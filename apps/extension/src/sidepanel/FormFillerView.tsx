@@ -17,7 +17,7 @@ import {
   UserRound,
   WandSparkles,
 } from 'lucide-react'
-import { getSettings, saveSettings } from '@/lib/storage'
+import { saveSettings, normalizeApiBaseUrl } from '@/lib/storage'
 import { getPersona, analyzeForm, reviseFormFields, getPersonaFields, savePersonaFields } from '@/lib/api'
 import { getCurrentJob } from '@/lib/storage'
 import type { ExtensionSettings } from '@/lib/types'
@@ -25,174 +25,23 @@ import { useExtensionI18n } from '@/lib/i18n'
 import type { FormFieldSchema, FilledField, FormFillResponse } from '@/lib/form-filler/types'
 import type { PersonaField } from '@/lib/api'
 import { groupFieldIdsByFrame, groupFilledFieldsByFrame } from '@/lib/form-filler/frame-routing'
+import { filterSafeFormFields, filterSafeFormRevision, mergeSafeFormAnswers } from '@/lib/form-filler/field-safety'
+import { loadSiteAccess, requestSiteAccess, requestFrameInspection, removeBroadSiteAccess, assertActivePage, type SiteAccessSnapshot } from '@/lib/form-filler/site-access'
+import { scanAccessibleFrames, messageScannedDocument, type FormScanContext } from '@/lib/form-filler/frame-access'
 
 type ViewState = 'idle' | 'scanning' | 'aiThinking' | 'review' | 'applying' | 'done' | 'error'
 type AnalysisPhase = 'fetchingPersona' | 'preparingPrompt' | 'waitingForAI' | 'processingResult'
-const ALL_SITE_ORIGINS = ['https://*/*', 'http://*/*'] as const
-
-const contentScriptLoads = new Map<number, Promise<void>>()
-
-async function ensureContentScript(tabId: number): Promise<void> {
-  const pending = contentScriptLoads.get(tabId)
-  if (pending) return pending
-
-  const load = (async () => {
-    const probe = await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
-      world: 'ISOLATED',
-      func: () => {
-        const state = (globalThis as typeof globalThis & {
-          __applyMateContentScriptState?: 'loading' | 'ready'
-        }).__applyMateContentScriptState
-        return state === 'loading' || state === 'ready'
-      },
-    })
-
-    const missingFrameIds = probe
-      .filter(result => result.result !== true)
-      .map(result => result.frameId)
-    if (missingFrameIds.length === 0 && probe.length > 0) return
-
-    await chrome.scripting.executeScript({
-      target: missingFrameIds.length > 0 ? { tabId, frameIds: missingFrameIds } : { tabId, allFrames: true },
-      files: ['content.js'],
-      world: 'ISOLATED',
-    })
-  })()
-
-  contentScriptLoads.set(tabId, load)
-  try {
-    await load
-  } finally {
-    contentScriptLoads.delete(tabId)
-  }
-}
-
-async function scanFormDirectly(tabId: number): Promise<FormFieldSchema[]> {
-  const results = await chrome.scripting.executeScript({
-    target: { tabId, allFrames: true },
-    world: 'ISOLATED',
-    func: () => {
-      const hash = (value: string) => {
-        let result = 0
-        for (let index = 0; index < value.length; index++) {
-          result = ((result << 5) - result) + value.charCodeAt(index)
-          result |= 0
-        }
-        return Math.abs(result).toString(36)
-      }
-      const clean = (value: string) => value.replace(/\s+/g, ' ').replace(/\*/g, '').trim()
-      const humanize = (value: string) => clean(value
-        .replace(/[-_.:[\]]+/g, ' ')
-        .replace(/([a-z])([A-Z])/g, '$1 $2'))
-      const labelFor = (element: HTMLElement) => {
-        const id = element.getAttribute('id')
-        if (id) {
-          const label = document.querySelector<HTMLLabelElement>(`label[for="${CSS.escape(id)}"]`)
-          if (label?.textContent) return clean(label.textContent)
-        }
-        const aria = element.getAttribute('aria-label')
-        if (aria) return clean(aria)
-        const labelledBy = element.getAttribute('aria-labelledby')
-        if (labelledBy) {
-          const label = document.getElementById(labelledBy.split(/\s+/)[0])
-          if (label?.textContent) return clean(label.textContent)
-        }
-        const container = element.closest(
-          '[data-automation-id^="formField-"], label, fieldset, [class*="form-field"], [class*="fieldWrapper"]',
-        )
-        const nearbyLabel = container?.querySelector('label, legend, [data-automation-id*="label"]')
-        if (nearbyLabel?.textContent) return clean(nearbyLabel.textContent)
-        const name = element.getAttribute('name')
-        if (name) return humanize(name)
-        const placeholder = element.getAttribute('placeholder')
-        return placeholder ? clean(placeholder) : ''
-      }
-
-      const selector =
-        'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="reset"]), ' +
-        'textarea, select, [contenteditable="true"], [role="combobox"], [role="textbox"], ' +
-        '[role="radiogroup"], [role="checkbox"], [role="switch"]'
-      const elements = Array.from(document.querySelectorAll<HTMLElement>(selector))
-      const seen = new Set<string>()
-
-      return elements.flatMap(element => {
-        const tag = element.tagName.toLowerCase()
-        const inputType = (element.getAttribute('type') ?? '').toLowerCase()
-        const role = (element.getAttribute('role') ?? '').toLowerCase()
-        const label = labelFor(element)
-        const name = element.getAttribute('name') ?? ''
-        const elementId = element.getAttribute('id') ?? ''
-        const rawId = name
-          ? `n-${hash(name)}`
-          : `l-${hash([elementId, label, inputType || tag].filter(Boolean).join('|'))}`
-        if (seen.has(rawId)) return []
-        seen.add(rawId)
-
-        let type = 'text'
-        if (tag === 'textarea' || role === 'textbox' || element.getAttribute('contenteditable') === 'true') type = 'textarea'
-        else if (tag === 'select' || role === 'combobox') type = 'select'
-        else if (role === 'radiogroup' || inputType === 'radio') type = 'radio'
-        else if (role === 'checkbox' || role === 'switch' || inputType === 'checkbox') type = 'checkbox'
-        else if (['email', 'tel', 'url', 'number', 'date', 'file'].includes(inputType)) type = inputType
-
-        let options: string[] | undefined
-        if (tag === 'select') {
-          options = Array.from((element as HTMLSelectElement).options)
-            .map(option => clean(option.textContent ?? option.value))
-            .filter(Boolean)
-        } else if (inputType === 'radio' && name) {
-          options = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="radio"]'))
-            .filter(input => input.name === name)
-            .map(input => labelFor(input) || input.value)
-            .filter(Boolean)
-        }
-
-        const input = element as HTMLInputElement
-        const currentValue = inputType === 'checkbox' || inputType === 'radio'
-          ? (input.checked ? input.value || 'true' : undefined)
-          : (input.value || element.textContent?.trim() || undefined)
-
-        return [{
-          id: rawId,
-          type,
-          label,
-          placeholder: element.getAttribute('placeholder') ?? undefined,
-          options,
-          required: element.hasAttribute('required') || element.getAttribute('aria-required') === 'true',
-          surroundingText: clean(element.closest(
-            '[data-automation-id^="formField-"], label, fieldset, [class*="field"], [class*="form"]',
-          )?.textContent ?? '').slice(0, 250),
-          groupName: name || undefined,
-          currentValue,
-        }]
-      })
-    },
-  })
-
-  const fields: FormFieldSchema[] = []
-  for (const result of results) {
-    if (!Array.isArray(result.result)) continue
-    const frameId = result.frameId ?? 0
-    for (const field of result.result as FormFieldSchema[]) {
-      fields.push({ ...field, id: `frame|${frameId}|${field.id}`, frameId })
-    }
-  }
-  return fields
-}
-
 async function refreshAuthFromDashboard(
   current: ExtensionSettings,
 ): Promise<ExtensionSettings | null> {
+  const expectedOrigin = normalizeApiBaseUrl(current.apiBaseUrl)
+  if (!expectedOrigin || !current.userEmail?.trim()) return null
   const tabs = await chrome.tabs.query({})
   const dashboard = tabs.find(tab => {
     if (!tab.id || !tab.url) return false
     try {
       const url = new URL(tab.url)
-      return url.hostname === 'localhost' ||
-        url.hostname === 'applymate.site' ||
-        url.hostname === 'web-delta-ruddy-29.vercel.app' ||
-        url.hostname.endsWith('.applymate.ai')
+      return normalizeApiBaseUrl(url.origin) === expectedOrigin
     } catch {
       return false
     }
@@ -220,6 +69,7 @@ async function refreshAuthFromDashboard(
     data?: { token?: string; user?: { email?: string; name?: string } }
   } | undefined
   if (!auth?.ok || !auth.data?.token) return null
+  if (!current.userEmail?.trim() || auth.data.user?.email?.trim().toLowerCase() !== current.userEmail.trim().toLowerCase()) return null
 
   const refreshed: ExtensionSettings = {
     ...current,
@@ -232,21 +82,37 @@ async function refreshAuthFromDashboard(
   return refreshed
 }
 
-export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scanTrigger, onPersonaUpdated }: {
+interface FormFillerProps {
   settings: ExtensionSettings
   pendingFields?: FormFieldSchema[] | null
   onFieldsConsumed?: () => void
   scanTrigger: number
   personaUpdateTrigger?: number
   onPersonaUpdated?: () => void
-}) {
+}
+
+export function FormFillerView(props: FormFillerProps) {
+  // Account changes destroy the old scan and its in-flight callbacks; rotating
+  // a token for the same account preserves the user's reviewed answers.
+  const account = `${normalizeApiBaseUrl(props.settings.apiBaseUrl) ?? ''}|${props.settings.userEmail?.trim().toLowerCase() ?? ''}`
+  return <FormFillerSession key={account} {...props} />
+}
+
+function FormFillerSession({ settings, pendingFields, onFieldsConsumed, scanTrigger, onPersonaUpdated }: FormFillerProps) {
   const { lang, t } = useExtensionI18n()
   const [viewState, setViewState] = useState<ViewState>('idle')
   const [fields, setFields] = useState<FormFieldSchema[]>([])
   const [filledFields, setFilledFields] = useState<FilledField[]>([])
   const [errorMsg, setErrorMsg] = useState('')
-  const [allSitesAccess, setAllSitesAccess] = useState(false)
+  const [siteAccess, setSiteAccess] = useState<SiteAccessSnapshot | null>(null)
   const [requestingAccess, setRequestingAccess] = useState(false)
+  const [accessMessage, setAccessMessage] = useState('')
+  const [scanNotice, setScanNotice] = useState('')
+  const accessRef = useRef<SiteAccessSnapshot | null>(null)
+  const accessVersionRef = useRef(0)
+  const activeTabRef = useRef<{ id: number; windowId?: number } | null>(null)
+  const scanContextRef = useRef<FormScanContext | null>(null)
+  const scanGenerationRef = useRef(0)
   const [appliedCount, setAppliedCount] = useState(0)
   const [reviseInstruction, setReviseInstruction] = useState('')
   const [revising, setRevising] = useState(false)
@@ -264,27 +130,92 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
   }>>([])
   const [savingPersona, setSavingPersona] = useState(false)
 
-  useEffect(() => {
-    void chrome.permissions.contains({ origins: [...ALL_SITE_ORIGINS] })
-      .then(setAllSitesAccess)
-      .catch(() => setAllSitesAccess(false))
-  }, [])
-
-  const handleRequestAllSitesAccess = useCallback(async () => {
-    setRequestingAccess(true)
+  const refreshSiteAccess = useCallback(async (): Promise<SiteAccessSnapshot | null> => {
+    const version = ++accessVersionRef.current
+    accessRef.current = null
+    setSiteAccess(null)
     try {
-      const granted = await chrome.permissions.request({ origins: [...ALL_SITE_ORIGINS] })
-      setAllSitesAccess(granted)
-      if (granted) {
-        setErrorMsg('')
-        setViewState('idle')
-      }
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
+      if (tab?.id === undefined) throw new Error('Open a company application page first.')
+      activeTabRef.current = { id: tab.id, windowId: tab.windowId }
+      const snapshot = await loadSiteAccess(tab)
+      await assertActivePage(snapshot)
+      if (version !== accessVersionRef.current) return null
+      accessRef.current = snapshot
+      setSiteAccess(snapshot)
+      return snapshot
     } catch (error) {
-      console.warn('[FormFiller] all-site permission request failed:', error)
-    } finally {
-      setRequestingAccess(false)
+      if (version === accessVersionRef.current) setAccessMessage(error instanceof Error ? error.message : 'Site access could not be checked.')
+      return null
     }
   }, [])
+
+  const invalidateScan = useCallback(() => {
+    scanGenerationRef.current += 1
+    scanContextRef.current = null
+    setFields([])
+    setFilledFields([])
+    setViewState('idle')
+    setErrorMsg('')
+    setScanNotice('')
+    setPersonaMatches([])
+    setUploadedFiles({})
+  }, [])
+
+  useEffect(() => {
+    const changed = () => {
+      accessVersionRef.current += 1
+      accessRef.current = null
+      setSiteAccess(null)
+      invalidateScan()
+      void refreshSiteAccess()
+    }
+    const activated = (info: chrome.tabs.TabActiveInfo) => {
+      if (activeTabRef.current?.windowId !== undefined && info.windowId !== activeTabRef.current.windowId) return
+      changed()
+    }
+    const updated = (tabId: number, info: chrome.tabs.TabChangeInfo) => {
+      if (tabId === activeTabRef.current?.id && (info.url || info.status === 'loading')) changed()
+    }
+    chrome.tabs.onActivated.addListener(activated)
+    chrome.tabs.onUpdated.addListener(updated)
+    chrome.permissions.onAdded.addListener(changed)
+    chrome.permissions.onRemoved.addListener(changed)
+    void refreshSiteAccess()
+    return () => {
+      accessVersionRef.current += 1
+      accessRef.current = null
+      scanGenerationRef.current += 1
+      scanContextRef.current = null
+      chrome.tabs.onActivated.removeListener(activated)
+      chrome.tabs.onUpdated.removeListener(updated)
+      chrome.permissions.onAdded.removeListener(changed)
+      chrome.permissions.onRemoved.removeListener(changed)
+    }
+  }, [invalidateScan, refreshSiteAccess])
+
+  const handleAccessChange = useCallback((kind: 'site' | 'frames' | 'removeBroad', origin?: string) => {
+    const snapshot = siteAccess
+    if (!snapshot) return
+    try {
+      // Request synchronously in this click turn, before any promise or tab lookup.
+      const request = kind === 'site'
+        ? requestSiteAccess(snapshot, origin ?? '', accessRef.current)
+        : kind === 'frames' ? requestFrameInspection(snapshot, accessRef.current)
+          : removeBroadSiteAccess(snapshot, accessRef.current)
+      setRequestingAccess(true)
+      void request.then(async granted => {
+        invalidateScan()
+        setAccessMessage(granted
+          ? kind === 'removeBroad' ? 'Previous all-sites access removed. Built-in supported sites remain available; other sites need their own grant.' : 'Site access updated. Scan again to use the selected sites.'
+          : 'Permission was not granted. You can still scan sites that already have access.')
+        await refreshSiteAccess()
+      }).catch(error => setAccessMessage(error instanceof Error ? error.message : 'Permission could not be changed.'))
+        .finally(() => setRequestingAccess(false))
+    } catch (error) {
+      setAccessMessage(error instanceof Error ? error.message : 'Refresh site access and try again.')
+    }
+  }, [siteAccess, invalidateScan, refreshSiteAccess])
 
   /** Build a persona key from a field label (for dedup across sites) */
   function fieldToPersonaKey(label: string): string {
@@ -337,40 +268,46 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
 
   /** After apply succeeds: auto-detect persona fields via AI's personaRelevant flag */
   async function analyzePersonaMatches() {
+    const generation = scanGenerationRef.current
     try {
       const values = filledFields
         .filter(f => !f.skip && f.personaRelevant && f.value.trim())
         .map(f => ({ fieldId: f.fieldId, value: f.value }))
       const matches = await computePersonaMatches(values)
+      if (generation !== scanGenerationRef.current) return
       setPersonaMatches(matches)
     } catch { /* ignore */ }
   }
 
   /** Refresh: read current DOM values from the page, re-compare with persona */
   async function handleRefreshPersona() {
+    const generation = scanGenerationRef.current
     setSavingPersona(true)
     try {
-      const tabs = await chrome.tabs.query({ active: true, currentWindow: true })
-      const tabId = tabs[0]?.id
-      if (!tabId) return
+      const context = scanContextRef.current
+      if (!context) throw new Error('Scan the current page before reading its answers.')
 
       const fieldIds = filledFields.filter(f => !f.skip).map(f => f.fieldId)
       const grouped = groupFieldIdsByFrame(fieldIds, fields)
       const responses = await Promise.all([...grouped.entries()].map(async ([frameId, ids]) => {
         try {
-          return await chrome.tabs.sendMessage(tabId, { type: 'READ_FIELD_VALUES', fieldIds: ids }, { frameId }) as { type?: string; values?: Array<{ fieldId: string; value: string }> } | undefined
+          return await messageScannedDocument<{ type?: string; values?: Array<{ fieldId: string; value: string }> }>(context, frameId,
+            { type: 'READ_FIELD_VALUES', fieldIds: ids }, () => scanContextRef.current === context)
         } catch { return undefined }
       }))
       const values = responses.flatMap(response => response?.type === 'FIELD_VALUES_RESULT' ? response.values ?? [] : [])
       if (values.length === 0) return
+      if (generation !== scanGenerationRef.current) return
 
       const matches = await computePersonaMatches(values)
+      if (generation !== scanGenerationRef.current) return
       setPersonaMatches(matches)
-    } catch { /* ignore */ }
+    } catch (error) { setErrorMsg(error instanceof Error ? error.message : 'Scan the current page again.') }
     finally { setSavingPersona(false) }
   }
 
   async function handleSavePersonaMatches() {
+    const generation = scanGenerationRef.current
     setSavingPersona(true)
     try {
       const fields: PersonaField[] = personaMatches.map(m => ({
@@ -384,6 +321,7 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
         consentAt:  new Date().toISOString(),
       }))
       await savePersonaFields(settings, fields)
+      if (generation !== scanGenerationRef.current) return
       setPersonaMatches([])
       onPersonaUpdated?.()
     } catch { /* ignore */ }
@@ -420,11 +358,9 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
     if (prevTriggerRef.current === scanTrigger) return
     prevTriggerRef.current = scanTrigger
     // Reset to idle for the new page — user can scan again
-    setViewState('idle')
-    setFields([])
-    setFilledFields([])
-    setErrorMsg('')
-  }, [scanTrigger])
+    invalidateScan()
+    void refreshSiteAccess()
+  }, [scanTrigger, invalidateScan, refreshSiteAccess])
 
   useEffect(() => {
     const listener = (message: { type?: string; fieldId?: string; fileName?: string }) => {
@@ -439,8 +375,10 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
   // Process pending fields passed from SidePanel (avoids race condition on mount)
   useEffect(() => {
     if (pendingFields && pendingFields.length > 0) {
-      setFields(pendingFields)
-      analyzeFields(pendingFields)
+      // Legacy messages do not identify the document whose answers would be filled.
+      // A fresh explicit scan establishes that document binding before any AI use.
+      invalidateScan()
+      setAccessMessage('Click Scan current page to review fields from the current application page.')
       onFieldsConsumed?.()
     }
     // Intentionally only react to pendingFields changes
@@ -460,8 +398,12 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
     overrideSettings?: ExtensionSettings,
     allowAuthRefresh = true,
   ) => {
+    const generation = scanGenerationRef.current
     const activeSettings = overrideSettings ?? settings
     try {
+      formFields = filterSafeFormFields(formFields)
+      setFields(formFields)
+      if (formFields.length === 0) throw new Error('No supported application fields found. Passwords and other sensitive fields are excluded.')
       setViewState('aiThinking')
       setErrorMsg('')
 
@@ -501,6 +443,7 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
         ])
         persona = personaResult.persona
         personaFields = pFieldsResult.fields ?? []
+        if (generation !== scanGenerationRef.current) return
       } catch (e) {
         const msg = (e as Error).message
         if (msg.includes('timed out')) throw new Error('Profile fetch timed out. Check your network or server status.')
@@ -517,6 +460,7 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
           if (job.description) jobContext += `\nDescription: ${job.description.slice(0, 1500)}`
         }
       } catch { /* ignore */ }
+      if (generation !== scanGenerationRef.current) return
 
       // ── Phase 2: Persona matching — extract known answers, skip AI for obvious matches ──
       const knownAnswers = buildKnownAnswers(persona, personaFields)
@@ -566,6 +510,7 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
       let result: FormFillResponse
       try {
         result = await analyzeForm(activeSettings, { fields: needsAi, persona, jobContext })
+        if (generation !== scanGenerationRef.current) return
       } catch (e) {
         const msg = (e as Error).message
         if (msg.includes('timed out')) throw new Error(`AI analysis timed out after 3 min for ${needsAi.length} fields. Try with fewer fields or a faster model.`)
@@ -577,15 +522,17 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
       const fieldMap = new Map<string, FilledField>()
       for (const f of prefilledFields) fieldMap.set(f.fieldId, f)
       for (const f of personaMatchedFields) fieldMap.set(f.fieldId, f)
-      for (const f of result.fields) fieldMap.set(f.fieldId, f)
+      for (const f of mergeSafeFormAnswers(needsAi, [], result.fields)) fieldMap.set(f.fieldId, f)
       const merged = formFields.map(f => fieldMap.get(f.id)!).filter(Boolean)
       setFilledFields(merged)
       setViewState('review')
       notifyContentScript(true)
     } catch (e) {
+      if (generation !== scanGenerationRef.current) return
       const message = e instanceof Error ? e.message : String(e)
       if (allowAuthRefresh && /unauthorized|401/i.test(message)) {
         const refreshed = await refreshAuthFromDashboard(activeSettings).catch(() => null)
+        if (generation !== scanGenerationRef.current) return
         if (refreshed) {
           await analyzeFieldsRef.current(formFields, refreshed, false)
           return
@@ -603,17 +550,22 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
   const handleRevise = useCallback(async () => {
     if (!reviseInstruction.trim()) return
     setRevising(true)
+    const generation = scanGenerationRef.current
     try {
-      const { persona } = await getPersona(settings)
+      const safeRevision = filterSafeFormRevision(fields, filledFields)
+      if (safeRevision.fields.length === 0) throw new Error('No supported application fields to revise.')
+      const { persona } = await getPersona(settings, 'form_fill')
+      if (generation !== scanGenerationRef.current) return
       const result = await reviseFormFields(settings, {
-        fields,
-        previousFill: filledFields,
+        ...safeRevision,
         persona,
         instruction: reviseInstruction.trim(),
       })
-      setFilledFields(result.fields)
+      if (generation !== scanGenerationRef.current) return
+      setFilledFields(mergeSafeFormAnswers(safeRevision.fields, safeRevision.previousFill, result.fields))
       setReviseInstruction('')
     } catch (e) {
+      if (generation !== scanGenerationRef.current) return
       setErrorMsg((e as Error).message)
     } finally {
       setRevising(false)
@@ -626,24 +578,19 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
     setFailedFieldIds([])
 
     try {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
-      if (!tab?.id) {
-        setErrorMsg('Cannot access current tab for form filling.')
-        setViewState('error')
-        return
-      }
-      await ensureContentScript(tab.id)
+      const context = scanContextRef.current
+      if (!context) throw new Error('Scan the current page before filling answers.')
       const groups = groupFilledFieldsByFrame(filledFields, fields)
       const responses = await Promise.all(groups.map(async group => {
-        const response = await chrome.tabs.sendMessage(tab.id!, {
-          type: 'APPLY_FIELD_VALUES',
-          fields: group.fields,
-          schemas: group.schemas,
-        }, { frameId: group.frameId }) as { type?: string; failed?: string[] } | undefined
-        return response?.type === 'APPLY_RESULT'
-          ? response
-          : { failed: group.fields.filter(field => !field.skip).map(field => field.fieldId) }
+        try {
+          const response = await messageScannedDocument<{ type?: string; failed?: string[] }>(context, group.frameId, {
+            type: 'APPLY_FIELD_VALUES', fields: group.fields, schemas: group.schemas,
+          }, () => scanContextRef.current === context)
+          if (response?.type === 'APPLY_RESULT') return response
+        } catch { /* Keep successful frames usable; a navigated or blocked frame needs a new scan. */ }
+        return { failed: group.fields.filter(field => !field.skip).map(field => field.fieldId) }
       }))
+      if (scanContextRef.current !== context) return
       if (responses.length > 0) {
         const skipped = filledFields.filter(f => f.skip).length
         const failed = responses.flatMap(response => response.failed ?? [])
@@ -666,12 +613,14 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
   }, [filledFields, fields, analyzePersonaMatches])
 
   const handleUpload = useCallback(async (fieldId: string) => {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
-    if (!tab?.id) return
-    await ensureContentScript(tab.id)
-    const frameId = fields.find(field => field.id === fieldId)?.frameId ?? 0
-    const response = await chrome.tabs.sendMessage(tab.id, { type: 'OPEN_UPLOAD_PICKER', fieldId }, { frameId }) as { success?: boolean; error?: string } | undefined
-    if (!response?.success) setErrorMsg(response?.error ?? 'Could not open the file picker.')
+    try {
+      const context = scanContextRef.current
+      if (!context) throw new Error('Scan the current page before choosing an upload.')
+      const frameId = fields.find(field => field.id === fieldId)?.frameId ?? 0
+      const response = await messageScannedDocument<{ success?: boolean; error?: string }>(context, frameId,
+        { type: 'OPEN_UPLOAD_PICKER', fieldId }, () => scanContextRef.current === context)
+      if (!response?.success) setErrorMsg(response?.error ?? 'Could not open the file picker.')
+    } catch (error) { setErrorMsg(error instanceof Error ? error.message : 'Scan the current page again.') }
   }, [fields])
 
   const handleFieldEdit = useCallback((fieldId: string, value: string) => {
@@ -690,96 +639,98 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
   }, [])
 
   const handleScanPage = useCallback(async () => {
+    const requestedPage = accessRef.current
+    if (!requestedPage) {
+      setAccessMessage('Checking the active site. Click Scan current page again once the site is shown.')
+      await refreshSiteAccess()
+      return
+    }
+    if (!requestedPage.frames.some(frame => frame.origin && frame.granted)) {
+      setAccessMessage('Allow the current site or the embedded site hosting your form below, then click Scan current page.')
+      return
+    }
+    invalidateScan()
+    const generation = scanGenerationRef.current
     setViewState('scanning')
-    setErrorMsg('')
-
-    const tabs = await chrome.tabs.query({ active: true, currentWindow: true })
-    const tab = tabs[0]
-    if (!tab?.id) {
-      setErrorMsg('Cannot access current tab.')
-      setViewState('error')
-      return
-    }
-
-    // Check for restricted URLs where content scripts can never run
-    const url = tab.url ?? ''
-    if (url.startsWith('chrome://') || url.startsWith('chrome-extension://') || url.startsWith('about:')) {
-      setErrorMsg('Cannot scan Chrome system pages. Please navigate to a job application website first.')
-      setViewState('error')
-      return
-    }
-
-    /**
-     * The direct scanner runs in every accessible frame and supplies stable
-     * frame-qualified IDs. The content scanner remains a fallback for custom
-     * widgets that are not represented by the direct DOM selector.
-     */
-    async function tryScan(): Promise<{ ok: boolean; injectError?: string }> {
-      try {
-        await ensureContentScript(tab.id!)
-      } catch (e: unknown) {
-        const msg = (e as Error)?.message ?? String(e)
-        console.warn('[FormFiller] content script ensure failed:', msg)
-        return { ok: false, injectError: msg }
-      }
-      if (allSitesAccess) {
-        try {
-          await chrome.tabs.sendMessage(tab.id!, { type: 'ENABLE_JOB_SCRAPING' })
-        } catch {
-          // The scan can still proceed if the page's script was just starting.
-        }
-      }
-      try {
-        const directFields = await scanFormDirectly(tab.id!)
-        if (directFields.length > 0) {
-          console.log('[FormFiller] Direct scan found', directFields.length, 'fields')
-          setFields(directFields)
-          analyzeFields(directFields)
-          return { ok: true }
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
-        console.warn('[FormFiller] Direct scan failed:', message)
-        return { ok: false, injectError: message }
-      }
-
-      try {
-        const response = await chrome.tabs.sendMessage(tab.id!, { type: 'SCAN_FORM' })
-        if (response?.type === 'FORM_DETECTED' && response.fields?.length > 0) {
-          setFields(response.fields)
-          analyzeFields(response.fields)
-          return { ok: true }
-        }
-      } catch { /* content script not available yet */ }
-      return { ok: false }
-    }
-
-    const r2 = await tryScan()
-    if (r2.ok) return
-
-    // Build a diagnostic error message
-    const host = new URL(url).hostname
-    const isPermissionError = r2.injectError?.includes('permission') ||
-      r2.injectError?.includes('Cannot access') ||
-      r2.injectError?.includes('not allowed')
-
-    if (isPermissionError) {
-      setErrorMsg(`Chrome has not granted access to ${host}. Allow access to all websites once, then scan any company form without activating the extension for every new site.`)
-      setViewState('error')
-    } else if (r2.injectError) {
-      setErrorMsg(`Injection failed on ${host}: ${r2.injectError}`)
-      setViewState('error')
-    } else {
-      setErrorMsg(`No form fields detected on ${host}. Make sure you are on a page with an application form.`)
+    try {
+      await assertActivePage(requestedPage)
+      const snapshot = await refreshSiteAccess()
+      if (generation !== scanGenerationRef.current) return
+      if (!snapshot) throw new Error('Site access changed. Check the active page and try again.')
+      if (snapshot.tabId !== requestedPage.tabId || snapshot.tabUrl !== requestedPage.tabUrl) throw new Error('The active page changed. Scan the page you want to fill.')
+      const result = await scanAccessibleFrames(snapshot)
+      if (generation !== scanGenerationRef.current) return
+      scanContextRef.current = result.context
+      const notices = [
+        !snapshot.frameInspection ? 'Only the main page was inspected. Use Find embedded application frames if the form is inside another page.' : '',
+        snapshot.warning ?? '',
+        result.skippedFrames ? `${result.skippedFrames} page(s) have no site access or cannot be scanned. Only allow listed sites that host your application form.` : '',
+        result.failedFrames ? `${result.failedFrames} page(s) changed or could not be scanned. Refresh site access and scan again for those fields.` : '',
+      ].filter(Boolean)
+      setScanNotice(notices.join(' '))
+      if (!result.fields.length) throw new Error('No supported application fields were found in the pages you allowed. If this is an embedded form, find its site below, grant access, then scan again.')
+      setFields(result.fields)
+      await analyzeFields(result.fields)
+    } catch (error) {
+      if (generation !== scanGenerationRef.current) return
+      setErrorMsg(error instanceof Error ? error.message : 'Could not scan the current application page.')
       setViewState('error')
     }
-  }, [allSitesAccess, settings])
+  }, [refreshSiteAccess, invalidateScan, analyzeFields])
 
   const confidenceBadge = (conf: number) => {
     const pct = Math.round(conf * 100)
     const tone = pct >= 80 ? 'high' : pct >= 50 ? 'medium' : 'low'
     return { pct, tone }
   }
+
+  const mainSite = siteAccess?.frames.find(frame => frame.frameId === 0)
+  const hasSiteAccess = siteAccess?.frames.some(frame => frame.origin && frame.granted) ?? false
+  const embeddedSites = [...new Set(siteAccess?.frames.filter(frame => frame.frameId !== 0 && frame.origin !== mainSite?.origin).map(frame => frame.origin).filter((origin): origin is string => !!origin) ?? [])]
+  const changingAccess = requestingAccess || viewState === 'scanning' || viewState === 'aiThinking' || viewState === 'applying'
+  const accessControls = (
+    <div className="am-form-card">
+      <div className="am-form-card-title"><ShieldCheck size={14} /> Site access</div>
+      {mainSite?.origin ? (
+        <div className="am-form-access-card">
+          <div style={{ minWidth: 0 }}>
+            <strong style={{ overflowWrap: 'anywhere' }}>{mainSite.origin.slice(0, -2)}</strong>
+            <span>{mainSite.granted ? 'Current site allowed' : 'Allow this site to scan its application fields.'}</span>
+          </div>
+          {!mainSite.granted && <button className="am-form-button ghost small" disabled={changingAccess} onClick={() => handleAccessChange('site', mainSite.origin!)}>Allow this site</button>}
+        </div>
+      ) : <p>Checking the active page… Open an HTTP or HTTPS application page to continue.</p>}
+      {siteAccess && !siteAccess.frameInspection && (
+        <>
+          <p>Scanning currently covers the main page. If the form is embedded, you can let ApplyMate inspect this tab’s embedded page addresses and choose their sites below. These addresses stay local.</p>
+          <button className="am-form-button ghost small" disabled={changingAccess} onClick={() => handleAccessChange('frames')}>Find embedded application frames</button>
+        </>
+      )}
+      {siteAccess?.frameInspection && (
+        <>
+          <p>Embedded sites on this page are listed below. Allow only the site hosting your application form; other embedded content can stay blocked. An address alone does not identify a form.</p>
+          {embeddedSites.length === 0 && <p>No additional HTTP or HTTPS sites were found.</p>}
+          {embeddedSites.map(origin => {
+            const granted = siteAccess.frames.some(frame => frame.origin === origin && frame.granted)
+            return <div className="am-form-access-card" key={origin}>
+              <div style={{ minWidth: 0 }}><strong style={{ overflowWrap: 'anywhere' }}>{origin.slice(0, -2)}</strong><span>{granted ? 'Allowed' : 'Not scanned until you allow this site'}</span></div>
+              {!granted && <button className="am-form-button ghost small" disabled={changingAccess} onClick={() => handleAccessChange('site', origin)}>Allow this site</button>}
+            </div>
+          })}
+          <p>Restricted, sandboxed, blank, and unsupported embedded pages may still need manual entry. Refresh this list after an embedded page navigates.</p>
+        </>
+      )}
+      {siteAccess?.warning && <p role="status">{siteAccess.warning}</p>}
+      {!!siteAccess?.broadOrigins.length && <div className="am-form-callout warning">
+        <strong>Previous all-sites permission is still enabled</strong>
+        <p>An earlier version was granted broad website access. Remove it to use individual site grants. Built-in supported sites remain available.</p>
+        <button className="am-form-button ghost small" disabled={changingAccess} onClick={() => handleAccessChange('removeBroad')}>Remove previous all-sites access</button>
+      </div>}
+      {accessMessage && <p role="status">{accessMessage}</p>}
+      <button className="am-form-button ghost small" disabled={changingAccess} onClick={() => { invalidateScan(); void refreshSiteAccess() }}><RefreshCw size={12} /> Refresh site access</button>
+    </div>
+  )
+  const coverageNotice = scanNotice && <div className="am-form-callout warning" role="status"><p>{scanNotice}</p></div>
 
   // ── Render States ──────────────────────────────────────────
 
@@ -804,29 +755,22 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
               ? t('Looking for fields on the current application page.')
               : t('Find application fields and prepare answers from your ApplyMate profile.')}
           </p>
-          <button className="am-form-button primary" onClick={handleScanPage} disabled={scanning}>
+          <button className="am-form-button primary" onClick={handleScanPage} disabled={scanning || requestingAccess || !hasSiteAccess}>
             <ScanSearch size={15} />
             {scanning ? t('Scanning page') : t('Scan current page')}
             {!scanning && <ArrowRight size={14} />}
           </button>
           <span className="am-form-helper">
-            Works with company career sites, Greenhouse, Lever, Workday, and more.
-            When you scan, ApplyMate reads field labels and any existing values on this page to prepare suggestions.
-            Review everything before filling; it never submits the application.
+            {t('Works with company career sites, Greenhouse, Lever, Workday, and more.')}{' '}
+            {t('When you scan, ApplyMate reads supported field labels and existing values on this page.')}{' '}
+            {t('Relevant form and profile data is sent to ApplyMate and the configured AI provider when needed to prepare or revise suggestions.')}{' '}
+            {t('This can include location, salary expectations, and health or disability details you choose to provide.')}{' '}
+            {t('Review everything before filling; it never submits the application.')}{' '}
             <a href="https://applymate.site/privacy" target="_blank" rel="noreferrer">{t('Privacy & data use')}</a>
           </span>
-          <div className="am-form-access-card">
-            <div>
-              <strong>{allSitesAccess ? t('All websites access enabled') : t('Use on any company career site')}</strong>
-              <span>{allSitesAccess ? t('You can scan custom forms without activating the extension on each new domain.') : t('Grant once to scan custom forms, Workday, and other ATS pages.')}</span>
-            </div>
-            {!allSitesAccess && (
-              <button className="am-form-button ghost small" onClick={handleRequestAllSitesAccess} disabled={requestingAccess}>
-                {requestingAccess ? t('Waiting...') : t('Allow access')}
-              </button>
-            )}
-          </div>
         </div>
+
+        {accessControls}
 
         <div className="am-form-info-strip">
           <ShieldCheck size={15} />
@@ -848,20 +792,16 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
           <div className="am-form-state-icon"><AlertTriangle size={22} /></div>
           <span className="am-form-eyebrow">{t('FORM AUTO-FILL')}</span>
           <h2>{t('We could not scan this page')}</h2>
-          <p>{lang === 'zh' ? t('Something went wrong') : errorMsg}</p>
+          <p>{errorMsg}</p>
           <div className="am-form-actions">
-            <button className="am-form-button primary" onClick={() => fields.length > 0 ? analyzeFields(fields) : handleScanPage()}>
+            <button className="am-form-button primary" disabled={requestingAccess || !hasSiteAccess} onClick={handleScanPage}>
               <RefreshCw size={14} />
               {t('Retry')}
             </button>
-            {!allSitesAccess && (
-              <button className="am-form-button ghost" onClick={handleRequestAllSitesAccess} disabled={requestingAccess}>
-                <ShieldCheck size={14} />
-                {requestingAccess ? t('Waiting for permission') : t('Allow all websites')}
-              </button>
-            )}
           </div>
         </div>
+        {coverageNotice}
+        {accessControls}
       </div>
     )
   }
@@ -901,6 +841,8 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
               : `${appliedCount} ${t('fields filled')} — ${t('review and submit manually')}.`}
           </p>
         </div>
+
+        {coverageNotice}
 
         {failedFields.length > 0 && (
           <div className="am-form-callout warning">
@@ -999,6 +941,7 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
           {t('Scan next step')} <ArrowRight size={13} />
           </button>
         </div>
+        {accessControls}
       </div>
     )
   }
@@ -1019,6 +962,8 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
         </div>
         <div className="am-form-review-icon"><FileText size={18} /></div>
       </div>
+
+      {coverageNotice}
 
       <div className="am-form-summary">
         <span><strong>{filledFields.filter(f => f.confidence === 1.0 && f.reasoning?.includes('already filled')).length}</strong> {t('Pre-filled')}</span>
@@ -1119,6 +1064,7 @@ export function FormFillerView({ settings, pendingFields, onFieldsConsumed, scan
           <ScanSearch size={13} /> {t('Scan new step')}
         </button>
       </div>
+      {accessControls}
     </div>
   )
 }

@@ -1,9 +1,10 @@
 {
   "manifest_version": 3,
+  "minimum_chrome_version": "116",
   "name": "ApplyMate AI",
-  "version": "0.1.20",
-  "version_name": "0.1.20-web-store-ready",
-  "description": "AI-powered job application copilot — save jobs, match resumes, track progress",
+  "version": "0.1.22",
+  "version_name": "0.1.22",
+  "description": "Save jobs, organise applications and review AI-assisted form answers from your ApplyMate profile.",
   "homepage_url": "https://applymate.site",
   "icons": {
     "16":  "icons/icon16.png",
@@ -75,9 +76,6 @@
         "*://*.arbeitsagentur.de/jobsuche/*",
         "*://*.jobs.de/*",
         "*://*.irishjobs.ie/*",
-        "http://localhost:3000/*",
-        "http://localhost:5173/*",
-        "*://web-delta-ruddy-29.vercel.app/*",
         "https://applymate.site/*"
       ],
       "js":       ["src/content/index.ts"],
@@ -91,8 +89,10 @@
     "sidePanel",
     "activeTab",
     "scripting",
-    "tabs",
-    "contextMenus"
+    "tabs"
+  ],
+  "optional_permissions": [
+    "webNavigation"
   ],
   "commands": {
     "_execute_action": {
