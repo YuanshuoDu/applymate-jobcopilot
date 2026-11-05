@@ -53,15 +53,44 @@ const profile = {
   supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: null, costClass: 'low',
 }
 
-function writeResumeStage(stage, result) {
+// Exact source-defined messages only; database driver and new messages stay opaque.
+const stateLoadErrorMessagesByCategory = {
+  turn_fence: ['turn_not_owned', 'wait_consume_turn_fenced'],
+  snapshot: [
+    'context_snapshot_missing', 'context_snapshot_scope_mismatch', 'context_snapshot_sequence_mismatch', 'task_graph_snapshot_invalid',
+    'task_graph_snapshot_root_criteria_invalid', 'task_graph_snapshot_verification_invalid', 'task_graph_snapshot_verification_disposition_invalid',
+    'task_graph_snapshot_repair_invalid', 'task_graph_snapshot_native_delegation_invalid', 'task_graph_snapshot_registered_scout_envelope_invalid',
+    'task_graph_snapshot_duplicate', 'task_graph_snapshot_dependency_invalid', 'task_graph_snapshot_verification_dependency_invalid',
+    'task_graph_snapshot_cycle_invalid', 'task_graph_task_id_missing', 'task_graph_snapshot_template_unsupported', 'task_graph_snapshot_too_large', 'task_graph_revision_invalid', 'task_graph_task_missing', 'steering_marker_state_invalid',
+  ],
+  tool_receipt: ['tool_result_replay_uncertain', 'wait_consume_verification_report_invalid', 'wait_consume_repair_receipt_invalid', 'task_graph_verification_report_invalid', 'task_graph_verification_unverified', 'Archived wait result reference is invalid'],
+  question_lineage: [
+    'question_recovery_sequence_invalid', 'question_recovery_item_scope_invalid', 'question_recovery_tool_lineage_invalid', 'question_recovery_step_invalid', 'question_recovery_step_missing', 'question_recovery_history_duplicate',
+    'question_recovery_history_collision', 'question_recovery_history_order_invalid', 'question_recovery_history_pair_incomplete', 'question_recovery_start_lineage_invalid', 'question_recovery_answer_lineage_invalid', 'question_recovery_history_limit',
+    'question_recovery_item_id_invalid', 'question_recovery_event_history_limit', 'question_recovery_item_malformed', 'question_recovery_answer_event_ambiguous', 'question_recovery_start_event_ambiguous', 'question_recovery_event_scope_invalid',
+    'question_recovery_current_turn_scope_invalid', 'question_recovery_order_invalid', 'question_recovery_planning_summary_ambiguous', 'question_recovery_history_pair_invalid',
+  ],
+  wait_accounting: ['wait_consume_outcome_invalid', 'archived_wait_accounting_invalid', 'Archived wait control is unavailable', 'Archived wait recovery is unavailable'],
+  agenda: ['cognitive_agenda_scope_invalid', 'cognitive_agenda_sequence_invalid', 'cognitive_agenda_receipt_invalid', 'cognitive_agenda_resume_fence_invalid'], database: [],
+}
+
+function stateLoadErrorCategory(error) {
   try {
-    process.stdout.write(`SYNTHETIC_RESUME_STAGE ${stage} ${result}\n`)
+    const message = error && typeof error === 'object' ? error.message : undefined
+    return Object.entries(stateLoadErrorMessagesByCategory).find(([, messages]) => messages.includes(message))?.[0] ?? 'other'
+  } catch { return 'other' }
+}
+
+function writeResumeStage(stage, result, category) {
+  try {
+    const safeCategory = category === 'other' || Object.hasOwn(stateLoadErrorMessagesByCategory, category) ? ` ${category}` : ''
+    process.stdout.write(`SYNTHETIC_RESUME_STAGE ${stage} ${result}${safeCategory}\n`)
   } catch {
     // Diagnostic output must not change the fixture's runtime behavior.
   }
 }
 
-function withResumeStage(stage, operation) {
+function withResumeStage(stage, operation, classifyFailure) {
   return async function (...args) {
     writeResumeStage(stage, 'start')
     try {
@@ -69,7 +98,7 @@ function withResumeStage(stage, operation) {
       writeResumeStage(stage, 'pass')
       return result
     } catch (error) {
-      writeResumeStage(stage, 'fail')
+      writeResumeStage(stage, 'fail', classifyFailure?.(error))
       throw error
     }
   }
@@ -182,7 +211,7 @@ async function main() {
       const rootTasks = runtimeOptions.rootTaskStore ?? rootTaskStoreModule.createPgRootTaskStore(runtimePool)
       return canonical.createCanonicalTurnRuntime(runtimePool, {
         ...runtimeOptions,
-        stateLoader: withResumeStage('state_load', runtimeOptions.stateLoader ?? turnState.loadCanonicalTurnState),
+        stateLoader: withResumeStage('state_load', runtimeOptions.stateLoader ?? turnState.loadCanonicalTurnState, stateLoadErrorCategory),
         rootTaskStore: instrumentRootTaskStore(rootTasks),
       })
     },
