@@ -20,6 +20,9 @@ describe("registered child-wait source crash proof", () => {
       task.attemptCount, task.leaseExpiresAt, task.userId, "continuation"])
     expect(CHILD_WAIT_SOURCE_CALL_PROJECTION_SQL).toContain('ORDER BY latestStep."attempt" DESC, latestStep."ordinal" DESC, wait."createdAt" DESC, wait."id" DESC LIMIT 1')
     expect(CHILD_WAIT_SOURCE_CALL_PROJECTION_SQL).toContain('wait."consumedAt" IS NOT NULL')
+    const waitProjection = CHILD_WAIT_SOURCE_CALL_PROJECTION_SQL.match(/WITH latest_wait AS MATERIALIZED \(SELECT ([\s\S]*?) FROM "agent_wait_conditions" AS wait/)?.[1]
+    expect(waitProjection).toContain('wait."sessionId"')
+    expect(waitProjection).toContain('wait."turnId"')
     expect(CHILD_WAIT_SOURCE_CALL_PROJECTION_SQL).toContain('owner."leaseOwner" = $5 AND owner."attemptCount" = $6')
     expect(CHILD_WAIT_SOURCE_CALL_PROJECTION_SQL).toContain('LIMIT 2')
     const [sql, values] = query.mock.calls[0] as [string, unknown[]]

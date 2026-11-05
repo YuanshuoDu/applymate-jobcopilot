@@ -2,7 +2,7 @@ import type pg from "pg"
 import { projectWaitCallEventContent } from "../turns/turn-execution-wait-event-projection.js"
 
 /** Reads only the latest, current-owner continuation's one completed source wait call. */
-export const CHILD_WAIT_SOURCE_CALL_PROJECTION_SQL = `WITH latest_wait AS MATERIALIZED (SELECT wait."id", wait."stepId", wait."status", wait."suspendedAt", wait."consumedAt", wait."result" FROM "agent_wait_conditions" AS wait
+export const CHILD_WAIT_SOURCE_CALL_PROJECTION_SQL = `WITH latest_wait AS MATERIALIZED (SELECT wait."id", wait."stepId", wait."sessionId", wait."turnId", wait."status", wait."suspendedAt", wait."consumedAt", wait."result" FROM "agent_wait_conditions" AS wait
   JOIN "agent_steps" AS latestStep ON latestStep."id" = wait."stepId" AND latestStep."sessionId" = wait."sessionId" AND latestStep."turnId" = wait."turnId" AND latestStep."taskId" = wait."parentTaskId"
   WHERE wait."parentTaskId" = $2 AND wait."sessionId" = $1 AND wait."turnId" = $3 AND latestStep."attempt" BETWEEN 1 AND $6
   ORDER BY latestStep."attempt" DESC, latestStep."ordinal" DESC, wait."createdAt" DESC, wait."id" DESC LIMIT 1
