@@ -146,7 +146,18 @@ describe("Agent wait broker", () => {
     expect(persisted?.payload).toMatchObject({ status: decision, answerAvailable: false })
     const persistedOutbox = fake.outbox.find((event) => event.topic === "agent.session.event" && event.payload.type === "approval.resolved")
     expect(persistedOutbox?.payload.payload).toMatchObject({ status: decision, answerAvailable: false })
-    const timeline = persisted && projectApprovalLedgerRow(persisted, "session_1", value => redactSensitiveValue(value, null, 0, 6))
+    const timelineRow = persisted && {
+      id: persisted.id,
+      sessionId: persisted.sessionId,
+      turnId: persisted.turnId,
+      itemId: persisted.itemId,
+      taskId: persisted.taskId,
+      sequence: persisted.sequence,
+      type: persisted.type,
+      actor: persisted.actor,
+      payload: persisted.payload,
+    }
+    const timeline = timelineRow && projectApprovalLedgerRow(timelineRow, "session_1", value => redactSensitiveValue(value, null, 0, 6))
     expect(timeline?.payload).toMatchObject({ status: decision, answerAvailable: false })
     const requested = normalizeTimelineEvent({
       schemaVersion: "agent-harness.v2", id: "request_1", sessionId: "session_1", turnId: "turn_1", itemId: null, taskId,
