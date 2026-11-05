@@ -8,8 +8,8 @@ const audit = (type: string, actor: string, sequence: string, approvalId = 'appr
   type, actor, sequence, payload: { approvalId, action: 'submit_application', revision: 2, scopeHash: `sha256:${'a'.repeat(64)}`, ...payload },
 })
 
-const brokerResolved = (sequence: string, status: 'approved' | 'rejected', approvalId = 'approval-1') => ({
-  schemaVersion: 'agent-harness.v2', id: `resolved-${sequence}`, sessionId: 'session-1', turnId: 'turn-1', itemId: `item-${approvalId}`, taskId: null,
+const brokerResolved = (sequence: string, status: 'approved' | 'rejected', approvalId = 'approval-1', taskId: string | null = null) => ({
+  schemaVersion: 'agent-harness.v2', id: `resolved-${sequence}`, sessionId: 'session-1', turnId: 'turn-1', itemId: `item-${approvalId}`, taskId,
   type: 'approval.resolved', actor: 'user', sequence,
   payload: { waitKind: 'approval', waitId: approvalId, itemId: `item-${approvalId}`, turnId: 'turn-1', toolCallId: 'call-1', status, nextTurnRevision: 3, answerAvailable: false },
 })
@@ -65,10 +65,13 @@ describe('approval ledger reducer', () => {
   })
 
   it('rejects the same approval id when a later event changes turn or task lineage', () => {
-    const requested = audit('approval.requested', 'orchestrator', '1')
-    const foreignLineage = { ...audit('approval.resolved', 'user', '2'), turnId: 'turn-2', taskId: 'task-2' }
+    const requested = { ...audit('approval.requested', 'orchestrator', '1'), taskId: 'task-1' }
+    const foreignLineage = { ...brokerResolved('2', 'approved'), turnId: 'turn-2', taskId: 'task-2' }
     let state = reduceApprovalLedger(createApprovalLedgerState('session-1'), requested)
     expect(reduceApprovalLedger(state, foreignLineage)).toBe(state)
+    expect(reduceApprovalLedger(state, brokerResolved('2', 'approved', 'approval-1', null))).toBe(state)
+    state = reduceApprovalLedger(state, brokerResolved('2', 'approved', 'approval-1', 'task-1'))
+    expect(selectApprovalLedgerProjection(state).approvals[0]?.status).toBe('approved')
   })
 
   it.each(['approved', 'rejected'] as const)('clears pending actions for normalized broker %s and cannot reopen them', status => {

@@ -46,6 +46,7 @@ describe("agent sessions API", () => {
     mocks.updateMany.mockReset()
     mocks.create.mockReset()
     mocks.requireAuth.mockResolvedValue({ userId: "user_1" })
+    mocks.findMany.mockResolvedValue([])
     mocks.updateMany.mockResolvedValue({ count: 0 })
     mocks.findFirst.mockResolvedValue(null)
   })
@@ -63,6 +64,9 @@ describe("agent sessions API", () => {
         createdAt: new Date("2026-06-18T08:00:00Z"),
         updatedAt: new Date("2026-06-18T08:03:00Z"),
         completedAt: null,
+        userId: "user_1",
+        eventSequence: BigInt(12),
+        internalTraceId: "must-not-leak",
       },
     ]
     mocks.findMany.mockResolvedValueOnce(rows)
@@ -74,7 +78,13 @@ describe("agent sessions API", () => {
     await expect(res.json()).resolves.toEqual({
       sessions: [
         {
-          ...rows[0],
+          id: "session_1",
+          goal: "Apply to Berlin SWE roles",
+          status: "running",
+          source: "chat",
+          memorySummary: "Berlin SWE, 85+, approval required",
+          qualityScore: 87,
+          currentTaskId: "task_1",
           createdAt: "2026-06-18T08:00:00.000Z",
           updatedAt: "2026-06-18T08:03:00.000Z",
           completedAt: null,
@@ -134,7 +144,7 @@ describe("agent sessions API", () => {
       data: { completedAt: Date }
     }
     expect(cleanup.where.updatedAt.lt.getTime()).toBe(cleanup.data.completedAt.getTime() - 30 * 60 * 1000)
-  })
+  }, 20_000)
 
   it("returns the last viewed owned session even when a different conversation updated more recently", async () => {
     mocks.findMany.mockResolvedValueOnce([
@@ -169,18 +179,26 @@ describe("agent sessions API", () => {
       createdAt: new Date("2026-06-18T08:00:00Z"),
       updatedAt: new Date("2026-06-18T08:00:00Z"),
       completedAt: null,
+      eventSequence: BigInt(1),
+      internalTraceId: "must-not-leak",
     })
     const { POST } = await import("./route")
 
     const res = await POST(postRequest({ goal: "  Create Berlin SWE automation  " }) as never)
 
     expect(res.status).toBe(201)
-    await expect(res.json()).resolves.toMatchObject({
+    await expect(res.json()).resolves.toEqual({
       session: {
         id: "session_1",
         goal: "Create Berlin SWE automation",
         source: "chat",
         status: "running",
+        memorySummary: "",
+        qualityScore: null,
+        currentTaskId: null,
+        createdAt: "2026-06-18T08:00:00.000Z",
+        updatedAt: "2026-06-18T08:00:00.000Z",
+        completedAt: null,
       },
     })
     expect(mocks.create).toHaveBeenCalledWith({

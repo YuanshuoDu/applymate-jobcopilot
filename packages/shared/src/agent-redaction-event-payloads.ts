@@ -93,12 +93,20 @@ export function validatedPayloadFields(type: string, payload: Row, route: Route,
     && route.correlationId === route.turnId && route.causationId === null && route.outboxTopic === "agent.session.event") return ["turnId"]
   if (validLegacyApprovalRequested(type, payload, guards) && payload.approvalId === route.correlationId && route.actor === "orchestrator" && route.itemId === null
     && route.causationId === null && route.outboxTopic === "agent.session.event") return ["approvalId"]
-  if (type === "approval.resolved" && exactPayloadKeys(payload, ["waitKind", "waitId", "itemId", "toolCallId", "outcome", "reason"])
+  if (type === "approval.resolved" && exactPayloadKeys(payload, ["waitKind", "waitId", "itemId", "turnId", "toolCallId", "outcome", "reason"])
     && payload.waitKind === "approval" && guards.opaqueId(payload.waitId) && payload.itemId === route.itemId
-    && payload.itemId === `agent-wait:approval:${payload.waitId}` && guards.nullableId(payload.toolCallId)
-    && payload.outcome === "cancelled" && payload.reason === "interrupt" && route.itemId !== null && route.taskId === null
+    && payload.itemId === `agent-wait:approval:${payload.waitId}` && payload.turnId === route.turnId && guards.nullableId(payload.toolCallId)
+    && payload.outcome === "cancelled" && payload.reason === "interrupt" && route.itemId !== null
+    && guards.opaqueId(route.turnId) && guards.nullableId(route.taskId)
     && route.actor === "system" && route.outboxTopic === "agent.session.event" && route.correlationId === payload.waitId
-    && route.causationId !== null) return ["waitId", "itemId", "toolCallId"]
+    && route.causationId !== null && guards.opaqueId(route.causationId)) return ["waitId", "itemId", "turnId", "toolCallId"]
+  if (type === "question.cancelled" && exactPayloadKeys(payload, ["waitKind", "waitId", "itemId", "toolCallId", "outcome", "reason"])
+    && payload.waitKind === "question" && guards.opaqueId(payload.waitId) && payload.itemId === route.itemId
+    && payload.itemId === `agent-wait:question:${payload.waitId}` && guards.nullableId(payload.toolCallId)
+    && payload.outcome === "cancelled" && payload.reason === "interrupt" && route.itemId !== null
+    && route.taskId === null && guards.opaqueId(route.turnId) && route.actor === "system"
+    && route.outboxTopic === "agent.session.event" && route.correlationId === payload.waitId
+    && route.causationId !== null && guards.opaqueId(route.causationId)) return ["waitId", "itemId", "toolCallId"]
   return null
 }
 
