@@ -894,6 +894,7 @@ async function waitForChild(lease, crashAfterRegistration = false) {
   if (redactSensitiveText(toolCallId) === toolCallId) throw new Error("fixture_tool_call_id_is_not_phone_shaped")
   const input = { taskIds: [ids.targetTaskId], mode: "any", timeoutMs: 30_000, idempotencyKey: `api_key=source-wait-secret-${lease.id}-attempt-${lease.attemptCount}` }
   const now = new Date()
+  if (now.getUTCMilliseconds() === 0) now.setUTCMilliseconds(1)
   let wait
   const fixtureModel = loopFixtureModel(async ({ stepId: actualStepId }) => {
     if (actualStepId !== stepId) throw new Error("fixture_source_wait_step_id_mismatch")

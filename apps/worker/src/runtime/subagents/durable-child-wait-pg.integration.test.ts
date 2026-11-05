@@ -1621,6 +1621,8 @@ async function expectCompletedSourceWaitLifecycle(pool: Pool, ids: FixtureIds): 
   const call = items.rows.find(item => item.id === callItemId)
   const result = items.rows.find(item => item.id === resultItemId)
   const sourceWait = waits.rows[0]
+  expect(sourceWait?.deadlineAt).toBeInstanceOf(Date)
+  expect(sourceWait?.deadlineAt.getUTCMilliseconds()).not.toBe(0)
   const callContent = asObject(call?.content)
   const callInput = asObject(callContent.input)
   const waitRecord = asObject(sourceWait?.result)

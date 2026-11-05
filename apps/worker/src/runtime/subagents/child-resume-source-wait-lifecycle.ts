@@ -28,6 +28,7 @@ function text(value: unknown): value is string { return typeof value === "string
 function strictIds(value: unknown): string[] | undefined { return Array.isArray(value) && value.length > 0 && value.length <= 8 && value.every(text) && new Set(value).size === value.length ? value as string[] : undefined }
 function sameIds(a: readonly string[], b: readonly string[]): boolean { const left = [...a].sort(), right = [...b].sort(); return left.length === right.length && left.every((id, i) => id === right[i]) }
 function sameJson(a: unknown, b: unknown): boolean { try { return canonicalJson(a) === canonicalJson(b) } catch { return false } }
+function epochMillis(value: unknown): number | undefined { const parsed = value instanceof Date ? value.getTime() : new Date(String(value)).getTime(); return Number.isFinite(parsed) ? parsed : undefined }
 function reject(stage: SourceLifecycleRejectStage): never { const error = new DurableSubagentWaitError("wait_scope_error", "Child wait source lifecycle is inconsistent"); Object.defineProperty(error, "sourceLifecycleStage", { value: stage, enumerable: false }); throw error }
 function required(value: unknown, stage: SourceLifecycleRejectStage = "required_value"): string { if (!text(value)) return reject(stage); return value }
 function owner(lease: Lease): TaskExecutionOwnerFence { return { kind: "task", userId: lease.userId, sessionId: lease.sessionId, turnId: required(lease.turnId), taskId: lease.id, rootTaskId: required(lease.rootTaskId), ownerId: required(lease.ownerId), attemptCount: lease.attemptCount, leaseExpiresAt: lease.leaseExpiresAt } }
@@ -47,8 +48,8 @@ function validOutcome(value: unknown, wait: Row, ids: readonly string[]): value 
     || !tasks.every(task => exact(task, ["taskId", "status", "role", "result", "failureReason"])
       && typeof task.status === "string" && typeof task.role === "string" && !!task.role.trim()
       && (task.failureReason === null || typeof task.failureReason === "string"))) return false
-  const deadline = wait.deadlineAt instanceof Date ? wait.deadlineAt.getTime() : new Date(String(wait.deadlineAt)).getTime()
-  return Number.isFinite(deadline) && new Date(out.deadlineAt).getTime() === deadline
+  const deadline = epochMillis(wait.deadlineAt), resultDeadline = epochMillis(out.deadlineAt)
+  return deadline !== undefined && resultDeadline === deadline
     && markCanonicalSubagentWaitId(out, String(wait.id))
     && markCanonicalSubagentWaitTargetIds({ targetTaskIds: savedIds }, out as DurableSubagentWaitResult, savedIds)
 }
@@ -83,7 +84,7 @@ function waitingReceiptRejectStage(result: Row | undefined, wait: Row, ids: read
           : !Array.isArray(matched) || matched.length !== 0 ? "source_waiting_matched_ids"
             : tasks.length !== ids.length || !tasks.every(task => exact(task, ["taskId", "status", "role", "result", "failureReason"])) ? "source_waiting_tasks"
               : !taskIds.every(id => typeof id === "string") || !sameIds(taskIds as string[], ids) ? "source_waiting_task_ids"
-                : !text(output.deadlineAt) || new Date(output.deadlineAt).getTime() !== new Date(String(wait.deadlineAt)).getTime() ? "source_waiting_deadline" : undefined
+                : !text(output.deadlineAt) || epochMillis(output.deadlineAt) === undefined || epochMillis(output.deadlineAt) !== epochMillis(wait.deadlineAt) ? "source_waiting_deadline" : undefined
 }
 function event(ownerFence: ExecutionOwnerFence, key: string, itemId: string, correlationId: string, type: string, payload: unknown): TurnEngineEventInput {
   return { owner: ownerFence, id: "event:" + randomUUID(), itemId, correlationId, causationId: null, type,

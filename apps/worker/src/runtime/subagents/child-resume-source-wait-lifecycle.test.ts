@@ -23,7 +23,7 @@ vi.mock("../turns/turn-engine-event-batch.js", () => ({
 import { inspectChildWaitSourceLifecycle, reconcileChildWaitSourceLifecycle } from "./child-resume-source-wait-lifecycle.js"
 import { projectWaitCallEventContent } from "../turns/turn-execution-wait-event-projection.js"
 
-const now = new Date("2026-10-30T10:00:00.000Z")
+const now = new Date("2026-10-30T10:00:00.123Z")
 const lease = { id: "parent-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1",
   ownerId: "worker-1", attemptCount: 2, leaseExpiresAt: new Date(now.getTime() + 60_000) }
 const waitId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
@@ -196,11 +196,29 @@ describe("child source wait lifecycle recovery", () => {
     expect(fake.wait.result).not.toHaveProperty("sourceLifecycleRecovery")
   })
 
+  it("matches PG Date and canonical ISO deadlines without dropping milliseconds", async () => {
+    const dateBacked = waitingFixture("safe")
+    expect((dateBacked.wait.deadlineAt as Date).getUTCMilliseconds()).toBe(123)
+    await expect(inspectChildWaitSourceLifecycle(dateBacked.client as never, lease, dateBacked.wait, "step-1", dateBacked.result as never))
+      .resolves.toMatchObject({ state: "waiting" })
+    const stringBacked = waitingFixture("safe")
+    stringBacked.wait.deadlineAt = (stringBacked.wait.deadlineAt as Date).toISOString()
+    await expect(inspectChildWaitSourceLifecycle(stringBacked.client as never, lease, stringBacked.wait, "step-1", stringBacked.result as never))
+      .resolves.toMatchObject({ state: "waiting" })
+    const offsetBacked = waitingFixture("safe"), result = offsetBacked.items.find(item => item.type === "tool_result")!
+    const content = result.content as Record<string, unknown>, output = { ...(content.output as Record<string, unknown>) }
+    output.deadlineAt = "2026-10-30T10:00:05.123+00:00"
+    content.output = output
+    await expect(inspectChildWaitSourceLifecycle(offsetBacked.client as never, lease, offsetBacked.wait, "step-1", offsetBacked.result as never))
+      .resolves.toMatchObject({ state: "waiting" })
+  })
+
   it.each([
     ["outer receipt identity", (output: Record<string, unknown>) => { output.status = "ready" }, "source_waiting_identity"],
     ["target projection", (output: Record<string, unknown>) => { output.taskIds = ["other-target"] }, "source_waiting_targets"],
     ["matched target list", (output: Record<string, unknown>) => { output.matchedTaskIds = ["target"] }, "source_waiting_matched_ids"],
-    ["deadline", (output: Record<string, unknown>) => { output.deadlineAt = "2026-10-30T10:00:06.000Z" }, "source_waiting_deadline"],
+    ["deadline by one millisecond", (output: Record<string, unknown>) => { output.deadlineAt = "2026-10-30T10:00:05.124Z" }, "source_waiting_deadline"],
+    ["invalid deadline", (output: Record<string, unknown>) => { output.deadlineAt = "not-a-date" }, "source_waiting_deadline"],
   ] as const)("classifies a bounded source receipt mismatch as %s", async (_label, corrupt, stage) => {
     const fake = waitingFixture("safe"), result = fake.items.find(item => item.type === "tool_result")!
     const content = result.content as Record<string, unknown>, output = { ...(content.output as Record<string, unknown>) }
