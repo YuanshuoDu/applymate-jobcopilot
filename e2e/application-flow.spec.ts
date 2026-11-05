@@ -140,7 +140,7 @@ function audit(resumeUpdatedAt = time, hasCoverLetter = false) {
   return record as typeof record & { coverLetterUpdatedAt?: string }
 }
 
-async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unknown' | 'waiting_for_user' | 'waiting_for_authorization' | 'cancelled' | 'failed' | 'filling'; recordedInitially?: boolean; evidenceCase?: 'bound' | 'unbound' | 'unavailable'; previewMismatch?: 'owner' | 'id' | 'job'; malformedPreview?: 'content' | 'contact'; letterRaceProbe?: boolean; letterInvalid?: 'null' | 'owner' | 'job' | 'duplicate' | 'content'; letterAfterInitial?: 'changed' | 'failure' | 'hold' | 'manual-change' | 'audit-same' | 'audit-failure' | 'audit-hold'; auditVersion?: 'same' | 'resume-changed' | 'letter-changed' | 'resume-missing' | 'letter-missing'; holdAudit?: boolean; holdAssign?: boolean; externalLetterSelection?: boolean; failTailoredRead?: boolean; taskFailure?: boolean; taskLimited?: boolean; missing?: boolean; holdSelectedLetter?: boolean; selectedLetter?: boolean; firstPreparation?: boolean; descriptionMode?: 'success' | 'unknown' | 'audit' | 'two' | 'conflict' | 'hold-response' | 'hold-other'; initialDescription?: string | null; holdBaseSave?: boolean; failBaseSave?: boolean; baseList?: 'empty' | 'fail-once' | 'fail-once-hold' | 'hold-empty' | 'multiple' | 'single' | 'default'; failFirstAudit?: boolean; flowSave?: boolean; manualOutcome?: 'get-fails' | 'unknown'; search?: boolean; saveMode?: 'fail' | 'hold-success' | 'hold-fail'; twoResumes?: boolean; holdResumeContent?: boolean; snapshotResumeContent?: boolean; resumeRevalidationFails?: boolean; versionedScore?: boolean; holdOldAnalysis?: boolean; holdFirstAnalysisOnly?: boolean; auditCorrection?: boolean; holdAuditCorrection?: boolean; versions?: boolean; holdVersionRestore?: boolean; versionRestoreFails?: boolean; realAgent?: boolean; expiredApproval?: boolean; twoJobQuestions?: boolean; holdFirstTaskRead?: boolean; holdReturnOwnerA?: boolean; taskPerUser?: boolean; dashboardFourTasks?: boolean; agentJourney?: boolean } = {}) {
+async function install(page: Page, options: { stale?: boolean; taskCheckpoint?: string | null; taskStatus?: 'unknown' | 'waiting_for_user' | 'waiting_for_authorization' | 'cancelled' | 'failed' | 'filling'; recordedInitially?: boolean; evidenceCase?: 'bound' | 'unbound' | 'unavailable'; previewMismatch?: 'owner' | 'id' | 'job'; malformedPreview?: 'content' | 'contact'; letterRaceProbe?: boolean; letterInvalid?: 'null' | 'owner' | 'job' | 'duplicate' | 'content'; letterAfterInitial?: 'changed' | 'failure' | 'hold' | 'manual-change' | 'audit-same' | 'audit-failure' | 'audit-hold'; auditVersion?: 'same' | 'resume-changed' | 'letter-changed' | 'resume-missing' | 'letter-missing'; holdAudit?: boolean; holdAssign?: boolean; externalLetterSelection?: boolean; failTailoredRead?: boolean; taskFailure?: boolean; taskLimited?: boolean; missing?: boolean; holdSelectedLetter?: boolean; selectedLetter?: boolean; firstPreparation?: boolean; descriptionMode?: 'success' | 'unknown' | 'audit' | 'two' | 'conflict' | 'hold-response' | 'hold-other'; initialDescription?: string | null; holdBaseSave?: boolean; failBaseSave?: boolean; baseList?: 'empty' | 'fail-once' | 'fail-once-hold' | 'hold-empty' | 'multiple' | 'single' | 'default'; failFirstAudit?: boolean; flowSave?: boolean; manualOutcome?: 'get-fails' | 'unknown'; search?: boolean; saveMode?: 'fail' | 'hold-success' | 'hold-fail'; twoResumes?: boolean; holdResumeContent?: boolean; snapshotResumeContent?: boolean; resumeRevalidationFails?: boolean; versionedScore?: boolean; holdOldAnalysis?: boolean; holdFirstAnalysisOnly?: boolean; auditCorrection?: boolean; holdAuditCorrection?: boolean; versions?: boolean; holdVersionRestore?: boolean; versionRestoreFails?: boolean; realAgent?: boolean; expiredApproval?: boolean; twoJobQuestions?: boolean; holdFirstTaskRead?: boolean; holdReturnOwnerA?: boolean; taskPerUser?: boolean; dashboardFourTasks?: boolean; agentJourney?: boolean } = {}) {
   let releaseReturnOwnerA = () => {}
   const returnOwnerAGate = new Promise<void>(resolve => { releaseReturnOwnerA = resolve })
   let releaseStaleJob = () => {}
@@ -357,7 +357,7 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
         return
       }
       return json(route, { tasks: currentTaskStatus ? [{ id: 'task-1', userId: 'fixture-user', jobId: state.job.id, sessionId: 'original-session', status: currentTaskStatus,
-        checkpoint: currentTaskStatus === 'unknown' ? 'submission_uncertain' : currentTaskStatus === 'waiting_for_user' ? 'form_answer_required' : currentTaskStatus === 'cancelled' || currentTaskStatus === 'failed' ? 'turn_stopped_before_submit' : null, updatedAt: time, job: { company: state.job.company, role: state.job.role } }] : [] })
+        checkpoint: currentTaskStatus === 'unknown' ? 'submission_uncertain' : currentTaskStatus === 'waiting_for_user' ? (options.taskCheckpoint === undefined ? 'form_answer_required' : options.taskCheckpoint) : currentTaskStatus === 'cancelled' || currentTaskStatus === 'failed' ? 'turn_stopped_before_submit' : null, updatedAt: time, job: { company: state.job.company, role: state.job.role } }] : [] })
     }
     if (pathname === '/api/dashboard') return json(route, { stats: { total: 0, saved: 0, applied: 0, inProgress: 0, interviews: 0, offers: 0, rejected: 0, thisWeek: 0 }, savedJobs: options.dashboardFourTasks ? [{ id: 'job-4', company: 'Employer 4', role: 'Role 4', score: 60, createdAt: time, url: null }] : [], followUpsDue: options.dashboardFourTasks ? [{ id: 'job-4', company: 'Employer 4', role: 'Role 4', status: 'applied', followUpAt: time }] : [], activity: [], applicationDays: [], interviewsScheduled: [], todayRecommendations: [], agentConfig: null, hasResume: true })
     if (pathname === '/api/jobs') return json(route, { jobs: options.descriptionMode === 'two' ? [state.job, { ...state.job, id: 'job-2', role: 'Second fixture role', company: 'Second Employer' }] : url.searchParams.has('finalResumeId') || url.searchParams.get('pageSize') === '30' ? [state.job] : [], total: 80, statusCounts: { saved: 80, applied: 0, interview: 0, offer: 0, rejected: 0 } })
@@ -1087,14 +1087,14 @@ for (const surface of ['jobs', 'dashboard'] as const) {
       await expect.poll(() => state.taskReads).toBeGreaterThanOrEqual(2)
       const card = page.getByRole('region', { name: 'Fixture Employer · Application flow engineer' })
       await expect(card).toContainText(/Review needed|等待审核/)
-      await expect(card).not.toContainText(/Your input is needed|需要你补充信息/)
+      await expect(card).not.toContainText(/Your action is needed|需要你处理/)
       const oldResponse = page.waitForResponse(response => response.url().endsWith('/api/agent/application-tasks') && response.request().method() === 'GET')
       state.releaseFirstTaskRead()
       await oldResponse
       await expect.poll(() => state.firstTaskReadFinished).toBe(true)
       await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
       await expect(card).toContainText(/Review needed|等待审核/)
-      await expect(card).not.toContainText(/Your input is needed|需要你补充信息/)
+      await expect(card).not.toContainText(/Your action is needed|需要你处理/)
       expect(state.writes).toEqual([])
       expect(state.unexpected).toEqual([])
     } finally { state.releaseFirstTaskRead() }
@@ -1135,7 +1135,7 @@ for (const surface of ['jobs', 'dashboard'] as const) {
       await page.goto(`${origin}/?page=${surface}`)
       if (surface === 'jobs') await page.getByRole('button', { name: 'Needs your attention' }).click()
       const firstCard = page.getByRole('region', { name: 'Fixture Employer · Application flow engineer' })
-      await expect(firstCard).toContainText('Your input is needed')
+      await expect(firstCard).toContainText('Your action is needed')
       state.activeUserId = 'fixture-b'
       await fixtureSession(page, 'authenticated', 'fixture-b')
       await expect(page.getByRole('region', { name: 'Fixture B · Engineer B' })).toContainText('Review needed')
@@ -1145,9 +1145,9 @@ for (const surface of ['jobs', 'dashboard'] as const) {
         ;(window as unknown as { __taskLeak: string[] }).__taskLeak = values
         const observer = new MutationObserver(records => {
           for (const record of records) for (const node of record.addedNodes) {
-            if (node.textContent?.includes('Your input is needed')) values.push(node.textContent)
+            if (node.textContent?.includes('Your action is needed')) values.push(node.textContent)
           }
-          if (document.body.textContent?.includes('Your input is needed')) values.push('visible')
+          if (document.body.textContent?.includes('Your action is needed')) values.push('visible')
         })
         observer.observe(document.body, { subtree: true, childList: true, characterData: true })
       })
@@ -1162,7 +1162,7 @@ for (const surface of ['jobs', 'dashboard'] as const) {
       expect(leaks).toEqual([])
       state.releaseReturnOwnerA()
       await expect(firstCard).toContainText('Review needed')
-      await expect(firstCard).not.toContainText('Your input is needed')
+      await expect(firstCard).not.toContainText('Your action is needed')
       expect(await page.evaluate(() => (window as unknown as { __taskLeak: string[] }).__taskLeak)).toEqual([])
       expect(state.writes).toEqual([])
       expect(state.unexpected).toEqual([])
@@ -1207,6 +1207,32 @@ test('attention view opens a recent task application outside the current jobs pa
   expect(state.writes).toEqual([])
   expect(state.unexpected).toEqual([])
 })
+
+for (const scenario of [
+  { checkpoint: 'materials_ready', label: /Materials ready for review|材料已准备，等待审核/, action: /Review materials in Agent|前往 Agent 审核材料/ },
+  { checkpoint: 'user_takeover', label: /Your help is needed|需要你接手/, action: /Open handoff in Agent|前往 Agent 接手/ },
+  { checkpoint: 'form_answer_required', label: /Your action is needed|需要你处理/, action: /Continue in the original task|进入原任务处理/ },
+  { checkpoint: 'fill_outcome_uncertain', label: /Form-filling outcome unverified|表单填写结果待核实/, action: /View task activity|查看任务记录/ },
+  { checkpoint: null, label: /Action needed|需要处理/, action: /View task activity|查看任务记录/ },
+] as const) {
+  test(`waiting task ${scenario.checkpoint ?? 'unspecified'} has consistent guidance`, async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name.startsWith('mobile-'), 'Checks desktop guidance in both languages')
+    const state = await install(page, { taskStatus: 'waiting_for_user', taskCheckpoint: scenario.checkpoint })
+    await page.goto(`${origin}/?page=dashboard`)
+    const dashboardCard = page.getByRole('region', { name: 'Fixture Employer · Application flow engineer' })
+    await expect(dashboardCard).toContainText(scenario.label)
+    await expect(dashboardCard.getByRole('link', { name: scenario.action })).toHaveAttribute('href', '/?page=agent&sessionId=original-session')
+    await open(page)
+    const drawer = page.getByRole('dialog')
+    await expect(drawer).toContainText(scenario.label)
+    await expect(drawer.getByRole('link', { name: scenario.action })).toHaveAttribute('href', '/?page=agent&sessionId=original-session')
+    await expect(drawer.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ })).toHaveCount(0)
+    await drawer.getByRole('link', { name: scenario.action }).click()
+    await expect(page.getByTestId('agent-destination')).toHaveText('original-session')
+    expect(state.writes).toEqual([])
+    expect(state.unexpected).toEqual([])
+  })
+}
 
 test('uncertain outcomes link to the original session without retry or submission', async ({ page }) => {
   const state = await install(page, { taskStatus: 'unknown' })
@@ -3771,7 +3797,7 @@ test('identical questions on two applications remain scoped to their original se
   const state = await install(page, { realAgent: true, twoJobQuestions: true })
   await page.goto(`${origin}/?shell=1&page=jobs&highlight=outside-page`)
   await expect(page.getByRole('dialog')).toContainText('Application flow engineer')
-  await page.getByRole('link', { name: 'Answer in the original task' }).click()
+  await page.getByRole('link', { name: 'Continue in the original task' }).click()
   await expect(page).toHaveURL(/sessionId=session-a/)
   await page.getByRole('button', { name: /^Tasks & results/ }).click()
   const first = page.locator('[data-agent-question-card="true"]')
@@ -3781,7 +3807,7 @@ test('identical questions on two applications remain scoped to their original se
   await expect.poll(() => state.answeredJobA).toBe(true)
   await page.goto(`${origin}/?shell=1&page=jobs&highlight=job-2`)
   await expect(page.getByRole('dialog')).toContainText('Employer B')
-  await page.getByRole('link', { name: 'Answer in the original task' }).click()
+  await page.getByRole('link', { name: 'Continue in the original task' }).click()
   await expect(page).toHaveURL(/sessionId=session-b/)
   await page.getByRole('button', { name: /^Tasks & results/ }).click()
   const second = page.locator('[data-agent-question-card="true"]')
@@ -3801,7 +3827,7 @@ test('application follows original Agent question, review and an unverified outc
   const state = await install(page, { taskStatus: 'waiting_for_user', realAgent: true, agentJourney: true })
   await page.goto(`${origin}/?shell=1&page=jobs&highlight=outside-page`)
   await expect(page.getByRole('dialog')).toContainText('Application flow engineer')
-  await page.getByRole('link', { name: 'Answer in the original task' }).click()
+  await page.getByRole('link', { name: 'Continue in the original task' }).click()
   await expect(page).toHaveURL(/sessionId=original-session/)
   await page.getByRole('button', { name: /^Tasks & results/ }).click()
   const question = page.locator('[data-agent-question-card="true"]')
@@ -3816,7 +3842,7 @@ test('application follows original Agent question, review and an unverified outc
   const guidance = page.locator('.application-dashboard-guidance')
   const taskCard = guidance.getByRole('region', { name: 'Fixture Employer · Application flow engineer' })
   await expect(taskCard).toContainText('Review needed')
-  await expect(taskCard).not.toContainText('Your input is needed')
+  await expect(taskCard).not.toContainText('Your action is needed')
   await taskCard.getByRole('link', { name: 'Review in Agent' }).click()
   await expect(page).toHaveURL(/sessionId=original-session/)
   await page.getByRole('button', { name: /^Tasks & results/ }).click()

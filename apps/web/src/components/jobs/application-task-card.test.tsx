@@ -31,6 +31,14 @@ describe('application task card', () => {
     expect(html).not.toContain('<a ')
   })
 
+  it('shows unavailable session guidance for material review without fabricating a link', () => {
+    const html = renderToStaticMarkup(<ApplicationTaskCard task={{ ...task, checkpoint: 'materials_ready', sessionId: null }} />)
+    expect(html).toContain('jobs.task.needsMaterialsReview')
+    expect(html).toContain('jobs.task.sessionUnavailable')
+    expect(html).not.toContain('<a ')
+    expect(html).not.toContain('<button')
+  })
+
   it('labels authorization as review and leaves decisions in the existing session', () => {
     const html = renderToStaticMarkup(<ApplicationTaskCard task={{ ...task, status: 'waiting_for_authorization', checkpoint: 'form_filled' }} />)
     expect(html).toContain('jobs.task.openReview')

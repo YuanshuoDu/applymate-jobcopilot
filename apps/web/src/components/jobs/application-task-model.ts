@@ -9,7 +9,7 @@ export interface ApplicationTaskView {
   updatedAt: string
 }
 
-export type ApplicationTaskKind = 'preparing' | 'filling' | 'needsInput' | 'needsApproval' | 'submitting' | 'submitted' | 'unknown' | 'failed' | 'cancelled' | 'skipped' | 'unavailable'
+export type ApplicationTaskKind = 'preparing' | 'filling' | 'needsInput' | 'needsMaterialsReview' | 'needsHandoff' | 'needsUserAction' | 'fillUncertain' | 'needsApproval' | 'submitting' | 'submitted' | 'unknown' | 'failed' | 'cancelled' | 'skipped' | 'unavailable'
 
 export interface ApplicationTaskState {
   kind: ApplicationTaskKind
@@ -62,14 +62,18 @@ export function getApplicationTaskState(task: ApplicationTaskView): ApplicationT
   if (task.checkpoint === 'submission_uncertain' || task.status === 'unknown') kind = 'unknown'
   else if (task.status === 'submitted') kind = 'submitted'
   else if (task.checkpoint === 'submission_request_started') kind = 'submitting'
-  else if (task.status === 'waiting_for_user') kind = 'needsInput'
+  else if (task.status === 'waiting_for_user' && task.checkpoint === 'fill_outcome_uncertain') kind = 'fillUncertain'
+  else if (task.status === 'waiting_for_user' && task.checkpoint === 'materials_ready') kind = 'needsMaterialsReview'
+  else if (task.status === 'waiting_for_user' && task.checkpoint === 'user_takeover') kind = 'needsHandoff'
+  else if (task.status === 'waiting_for_user' && task.checkpoint === 'form_answer_required') kind = 'needsInput'
+  else if (task.status === 'waiting_for_user') kind = 'needsUserAction'
   else if (task.status === 'waiting_for_authorization') kind = 'needsApproval'
   else if (task.status === 'filling') kind = 'filling'
   else if (['discovered', 'analyzing', 'generating_materials'].includes(task.status)) kind = 'preparing'
   else if (task.status === 'failed' || task.status === 'cancelled' || task.status === 'skipped') kind = task.status
   else kind = 'unavailable'
-  const needsAttention = ['needsInput', 'needsApproval', 'unknown', 'failed'].includes(kind)
-  const action = kind === 'needsInput' ? 'openQuestion' : kind === 'needsApproval' ? 'openReview' : kind === 'unknown' ? 'checkOutcome' : 'viewActivity'
+  const needsAttention = ['needsInput', 'needsMaterialsReview', 'needsHandoff', 'needsUserAction', 'fillUncertain', 'needsApproval', 'unknown', 'failed'].includes(kind)
+  const action = kind === 'needsInput' ? 'openQuestion' : kind === 'needsMaterialsReview' ? 'openMaterialsReview' : kind === 'needsHandoff' ? 'openHandoff' : kind === 'needsApproval' ? 'openReview' : kind === 'unknown' ? 'checkOutcome' : 'viewActivity'
   return { kind, needsAttention, labelKey: `jobs.task.${kind}`, descriptionKey: `jobs.task.${kind}Hint`, actionKey: `jobs.task.${action}` }
 }
 

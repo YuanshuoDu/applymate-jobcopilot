@@ -47,6 +47,9 @@ describe('application task status and navigation', () => {
   it.each([
     ['generating_materials', null, 'preparing', false], ['filling', null, 'filling', false],
     ['waiting_for_user', 'form_answer_required', 'needsInput', true], ['waiting_for_authorization', 'form_filled', 'needsApproval', true],
+    ['waiting_for_user', 'materials_ready', 'needsMaterialsReview', true], ['waiting_for_user', 'user_takeover', 'needsHandoff', true],
+    ['waiting_for_user', 'fill_outcome_uncertain', 'fillUncertain', true],
+    ['waiting_for_user', 'review_requested', 'needsUserAction', true], ['waiting_for_user', null, 'needsUserAction', true],
     ['waiting_for_user', 'submission_uncertain', 'unknown', true], ['failed', 'submission_uncertain', 'unknown', true],
     ['submitted', 'submission_uncertain', 'unknown', true], ['unknown', null, 'unknown', true],
     ['filling', 'submission_request_started', 'submitting', false], ['submitted', 'submission_request_started', 'submitted', false],
@@ -54,6 +57,15 @@ describe('application task status and navigation', () => {
     ['unrecognized', null, 'unavailable', false],
   ])('projects %s / %s as %s without adding execution authority', (status, checkpoint, kind, needsAttention) => {
     expect(getApplicationTaskState(task({ status, checkpoint }))).toMatchObject({ kind, needsAttention })
+  })
+
+  it('describes material review, handoff and unspecified waits without implying submission approval or a question', () => {
+    expect(getApplicationTaskState(task({ checkpoint: 'materials_ready' }))).toMatchObject({
+      labelKey: 'jobs.task.needsMaterialsReview', descriptionKey: 'jobs.task.needsMaterialsReviewHint', actionKey: 'jobs.task.openMaterialsReview',
+    })
+    expect(getApplicationTaskState(task({ checkpoint: 'user_takeover' })).actionKey).toBe('jobs.task.openHandoff')
+    expect(getApplicationTaskState(task({ checkpoint: 'review_requested' })).actionKey).toBe('jobs.task.viewActivity')
+    expect(getApplicationTaskState(task()).actionKey).toBe('jobs.task.openQuestion')
   })
 
   it('opens only the persisted session and encodes the complete ID as a query value', () => {

@@ -66,6 +66,10 @@ Agent 负责原任务的执行和审批，招聘消息负责查看回复。
 4. 登录、验证码或 MFA 按原会话的交接说明处理；仅在现有系统允许时恢复。
 5. 结果待核实时先查看原会话和回执，不再次提交。
 
+任务等待时，材料待审核、人工接手、表单填写结果待核实和提交结果待核实分别提示。
+需要信息或验证时，进入原任务查看具体要求；状态不明确时不会猜测一定有问题可回答。
+审核材料与授权提交是不同操作，打开原任务本身不会授权提交。
+
 较早的隔离测试发现：新建会话可能在会话已创建后显示失败；相关修复已进入主线。
 如果遇到类似情况，
 先查看会话列表，确认是否已有对应会话，避免反复新建。测试中还发现，
@@ -314,6 +318,10 @@ trying again. New edits made during restoration are retained for manual comparis
 
 The Applications card is a read-only task projection. It never creates a task,
 answers a question, issues an approval nonce, grants consent, or retries execution.
+Waiting tasks distinguish prepared-material review, user handoff, an unverified
+form-filling outcome and an unverified submission outcome. A request for information
+may also require verification; an unspecified wait directs the user to the original
+task without guessing a question. Reviewing materials does not authorize submission.
 Without an associated task, Open Agent navigates to the generic workspace. It may
 restore the most recent unrelated conversation, so the user is told to start a new
 conversation and identify the job. It does not infer a session from job ID or send
