@@ -3,6 +3,7 @@
 // Its caller must verify the Docker network and fresh services independently.
 import { createRequire } from 'node:module'
 import path from 'node:path'
+import { classifyStateLoadError, safeStateLoadCategory, withStateLoadQueryDiagnostics } from './application-authenticated-state-diagnostics.mjs'
 
 const expectedDatabase = 'postgresql://fixture:fixture@db:5432/application_flow_fixture'
 const expectedRedis = 'redis://redis:6379/15'
@@ -53,37 +54,9 @@ const profile = {
   supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: null, costClass: 'low',
 }
 
-// Exact source messages plus exact allowlisted SQLSTATEs; no error details are logged.
-const stateLoadErrorMessagesByCategory = {
-  turn_fence: ['turn_not_owned', 'wait_consume_turn_fenced'],
-  snapshot: [
-    'context_snapshot_missing', 'context_snapshot_scope_mismatch', 'context_snapshot_sequence_mismatch', 'task_graph_snapshot_invalid', 'task_graph_snapshot_root_criteria_invalid', 'task_graph_snapshot_verification_invalid', 'task_graph_snapshot_verification_disposition_invalid', 'task_graph_snapshot_repair_invalid', 'task_graph_snapshot_native_delegation_invalid', 'task_graph_snapshot_registered_scout_envelope_invalid',
-    'task_graph_snapshot_duplicate', 'task_graph_snapshot_dependency_invalid', 'task_graph_snapshot_verification_dependency_invalid', 'task_graph_snapshot_cycle_invalid', 'task_graph_task_id_missing', 'task_graph_snapshot_template_unsupported', 'task_graph_snapshot_too_large', 'task_graph_revision_invalid', 'task_graph_task_missing', 'steering_marker_state_invalid',
-  ],
-  tool_receipt: ['tool_result_replay_uncertain', 'wait_consume_verification_report_invalid', 'wait_consume_repair_receipt_invalid', 'task_graph_verification_report_invalid', 'task_graph_verification_unverified', 'Archived wait result reference is invalid'],
-  question_lineage: [
-    'question_recovery_sequence_invalid', 'question_recovery_item_scope_invalid', 'question_recovery_tool_lineage_invalid', 'question_recovery_step_invalid', 'question_recovery_step_missing', 'question_recovery_history_duplicate', 'question_recovery_history_collision', 'question_recovery_history_order_invalid', 'question_recovery_history_pair_incomplete', 'question_recovery_start_lineage_invalid', 'question_recovery_answer_lineage_invalid',
-    'question_recovery_history_limit', 'question_recovery_item_id_invalid', 'question_recovery_event_history_limit', 'question_recovery_item_malformed', 'question_recovery_answer_event_ambiguous', 'question_recovery_start_event_ambiguous', 'question_recovery_event_scope_invalid', 'question_recovery_current_turn_scope_invalid', 'question_recovery_order_invalid', 'question_recovery_planning_summary_ambiguous', 'question_recovery_history_pair_invalid',
-  ],
-  wait_accounting: ['wait_consume_outcome_invalid', 'archived_wait_accounting_invalid', 'final_evidence_recovery_marker_invalid', 'Archived wait control is unavailable', 'Archived wait recovery is unavailable'],
-  agenda: ['cognitive_agenda_scope_invalid', 'cognitive_agenda_sequence_invalid', 'cognitive_agenda_receipt_invalid', 'cognitive_agenda_resume_fence_invalid'],
-  type_error: [], reference_error: [], database_schema: [], database_data: [], database_concurrency: [], database_other: [],
-}
-const postgresErrorCodesByCategory = { database_schema: new Set('3D000 3F000 42601 42602 42701 42702 42703 42704 42710 42712 42723 42725 42883 42P01 42P02'.split(' ')), database_data: new Set('22000 22001 22002 22003 22004 22007 22008 22012 22018 22021 22023 22P01 22P02 22P03 22P04 22P05 23000 23001 23502 23503 23505 23514 23P01'.split(' ')),
-  database_concurrency: new Set('40000 40001 40002 40003 40P01 55P03 55006'.split(' ')), database_other: new Set('08000 08001 08003 08004 08006 08007 08P01 0A000 53000 53100 53200 53300 53400 57000 57014 57P01 57P02 57P03 57P04 57P05 58000 58030 58P01 58P02 XX000 XX001 XX002'.split(' ')), }
-function stateLoadErrorCategory(error) {
-  try {
-    const message = error && typeof error === 'object' ? error.message : undefined
-    const category = Object.entries(stateLoadErrorMessagesByCategory).find(([, messages]) => messages.includes(message))?.[0]
-    const fixedErrorCategory = error instanceof TypeError ? 'type_error' : error instanceof ReferenceError ? 'reference_error' : error?.name === 'TurnQuestionStoreError' && error?.code === 'question_conflict' ? 'question_lineage' : error?.name === 'ContextSnapshotError' && error?.code === 'store_conflict' ? 'snapshot' : undefined
-    const databaseCategory = Object.entries(postgresErrorCodesByCategory).find(([, codes]) => codes.has(error?.code))?.[0]
-    return category ?? fixedErrorCategory ?? databaseCategory ?? 'other'
-  } catch { return 'other' }
-}
-
 function writeResumeStage(stage, result, category) {
   try {
-    const safeCategory = category === 'other' || Object.hasOwn(stateLoadErrorMessagesByCategory, category) ? ` ${category}` : ''
+    const safeCategory = category === undefined ? '' : ` ${safeStateLoadCategory(category)}`
     process.stdout.write(`SYNTHETIC_RESUME_STAGE ${stage} ${result}${safeCategory}\n`)
   } catch {
     // Diagnostic output must not change the fixture's runtime behavior.
@@ -211,7 +184,7 @@ async function main() {
       const rootTasks = runtimeOptions.rootTaskStore ?? rootTaskStoreModule.createPgRootTaskStore(runtimePool)
       return canonical.createCanonicalTurnRuntime(runtimePool, {
         ...runtimeOptions,
-        stateLoader: withResumeStage('state_load', runtimeOptions.stateLoader ?? turnState.loadCanonicalTurnState, stateLoadErrorCategory),
+        stateLoader: withResumeStage('state_load', withStateLoadQueryDiagnostics(runtimeOptions.stateLoader ?? turnState.loadCanonicalTurnState), classifyStateLoadError),
         rootTaskStore: instrumentRootTaskStore(rootTasks),
       })
     },
