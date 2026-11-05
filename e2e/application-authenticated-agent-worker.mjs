@@ -53,6 +53,38 @@ const profile = {
   supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: null, costClass: 'low',
 }
 
+function writeResumeStage(stage, result) {
+  try {
+    process.stdout.write(`SYNTHETIC_RESUME_STAGE ${stage} ${result}\n`)
+  } catch {
+    // Diagnostic output must not change the fixture's runtime behavior.
+  }
+}
+
+function withResumeStage(stage, operation) {
+  return async function (...args) {
+    writeResumeStage(stage, 'start')
+    try {
+      const result = await operation.apply(this, args)
+      writeResumeStage(stage, 'pass')
+      return result
+    } catch (error) {
+      writeResumeStage(stage, 'fail')
+      throw error
+    }
+  }
+}
+
+function instrumentRootTaskStore(store) {
+  return {
+    ...store,
+    ...(typeof store.reconcileTerminal === 'function'
+      ? { reconcileTerminal: withResumeStage('reconcile', store.reconcileTerminal.bind(store)) }
+      : {}),
+    ensure: withResumeStage('ensure', store.ensure.bind(store)),
+  }
+}
+
 async function main() {
   const database = await pool.query('SELECT current_database() AS name')
   const users = await pool.query('SELECT "id", "email" FROM "User" ORDER BY "email"')
@@ -76,7 +108,8 @@ async function main() {
 
   // Dynamic imports occur only after the disposable environment checks.
   const [worker, canonical, flagsModule, graph, graphTemplates, child, usage, production,
-    executionProjection, sessionProjection, wakeupModule, eventOutboxModule, redis] = await Promise.all([
+    executionProjection, sessionProjection, wakeupModule, eventOutboxModule, redis,
+    turnState, rootTaskStoreModule] = await Promise.all([
     import('../apps/worker/src/queue/production-worker-runtime.ts'),
     import('../apps/worker/src/runtime/canonical-turn-runtime.ts'),
     import('../apps/worker/src/runtime/production-agent-flags.ts'),
@@ -90,6 +123,8 @@ async function main() {
     import('../apps/worker/src/runtime/wakeup/consumer.ts'),
     import('../apps/worker/src/runtime/events/outbox-consumer.ts'),
     import('../apps/worker/src/redis.ts'),
+    import('../apps/worker/src/runtime/canonical-turn-state.ts'),
+    import('../apps/worker/src/runtime/subagents/root-task-store.ts'),
   ])
   redisModule = redis
   const flags = flagsModule.resolveProductionAgentFlags()
@@ -142,9 +177,15 @@ async function main() {
     startAgentRunWorker() {},
   }, {
     createOptionalProductionChildExecutor: child.createOptionalProductionChildExecutor,
-    createCanonicalTurnRuntime: (runtimePool, options) => canonical.createCanonicalTurnRuntime(runtimePool, {
-      ...options, ...graphTemplates.taskGraphRuntimeOptions(graphPort), modelRuntimeFactory,
-    }),
+    createCanonicalTurnRuntime: (runtimePool, options) => {
+      const runtimeOptions = { ...options, ...graphTemplates.taskGraphRuntimeOptions(graphPort), modelRuntimeFactory }
+      const rootTasks = runtimeOptions.rootTaskStore ?? rootTaskStoreModule.createPgRootTaskStore(runtimePool)
+      return canonical.createCanonicalTurnRuntime(runtimePool, {
+        ...runtimeOptions,
+        stateLoader: withResumeStage('state_load', runtimeOptions.stateLoader ?? turnState.loadCanonicalTurnState),
+        rootTaskStore: instrumentRootTaskStore(rootTasks),
+      })
+    },
     createWorkerUsageAuthorizer: (...args) => {
       const authorize = usage.createWorkerUsageAuthorizer(...args)
       return async input => {
