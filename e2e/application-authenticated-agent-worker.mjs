@@ -65,7 +65,7 @@ const stateLoadErrorMessagesByCategory = {
     'question_recovery_sequence_invalid', 'question_recovery_item_scope_invalid', 'question_recovery_tool_lineage_invalid', 'question_recovery_step_invalid', 'question_recovery_step_missing', 'question_recovery_history_duplicate', 'question_recovery_history_collision', 'question_recovery_history_order_invalid', 'question_recovery_history_pair_incomplete', 'question_recovery_start_lineage_invalid', 'question_recovery_answer_lineage_invalid',
     'question_recovery_history_limit', 'question_recovery_item_id_invalid', 'question_recovery_event_history_limit', 'question_recovery_item_malformed', 'question_recovery_answer_event_ambiguous', 'question_recovery_start_event_ambiguous', 'question_recovery_event_scope_invalid', 'question_recovery_current_turn_scope_invalid', 'question_recovery_order_invalid', 'question_recovery_planning_summary_ambiguous', 'question_recovery_history_pair_invalid',
   ],
-  wait_accounting: ['wait_consume_outcome_invalid', 'archived_wait_accounting_invalid', 'Archived wait control is unavailable', 'Archived wait recovery is unavailable'],
+  wait_accounting: ['wait_consume_outcome_invalid', 'archived_wait_accounting_invalid', 'final_evidence_recovery_marker_invalid', 'Archived wait control is unavailable', 'Archived wait recovery is unavailable'],
   agenda: ['cognitive_agenda_scope_invalid', 'cognitive_agenda_sequence_invalid', 'cognitive_agenda_receipt_invalid', 'cognitive_agenda_resume_fence_invalid'],
   type_error: [], reference_error: [], database_schema: [], database_data: [], database_concurrency: [], database_other: [],
 }
@@ -75,9 +75,9 @@ function stateLoadErrorCategory(error) {
   try {
     const message = error && typeof error === 'object' ? error.message : undefined
     const category = Object.entries(stateLoadErrorMessagesByCategory).find(([, messages]) => messages.includes(message))?.[0]
-    const runtimeCategory = error instanceof TypeError ? 'type_error' : error instanceof ReferenceError ? 'reference_error' : undefined
+    const fixedErrorCategory = error instanceof TypeError ? 'type_error' : error instanceof ReferenceError ? 'reference_error' : error?.name === 'TurnQuestionStoreError' && error?.code === 'question_conflict' ? 'question_lineage' : error?.name === 'ContextSnapshotError' && error?.code === 'store_conflict' ? 'snapshot' : undefined
     const databaseCategory = Object.entries(postgresErrorCodesByCategory).find(([, codes]) => codes.has(error?.code))?.[0]
-    return category ?? runtimeCategory ?? databaseCategory ?? 'other'
+    return category ?? fixedErrorCategory ?? databaseCategory ?? 'other'
   } catch { return 'other' }
 }
 
