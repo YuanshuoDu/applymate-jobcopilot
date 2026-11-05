@@ -47,6 +47,36 @@ const loopErrorCategories = new Set([
 function loopErrorCategory(errorCode) {
   return errorCode == null ? "none" : loopErrorCategories.has(errorCode) ? errorCode : "other"
 }
+const waitAcknowledgementFailureReasons = new Map([
+  ["Session is unavailable for resume acknowledgement", "session_unavailable"],
+  ["Child task is unavailable for resume acknowledgement", "task_unavailable"],
+  ["Child task tree is closed", "task_tree_closed"],
+  ["Source step does not precede the acknowledged resume step", "source_step_lineage"],
+  ["Resolved child wait is unavailable", "wait_unavailable"],
+  ["Child wait result target IDs changed scope", "result_scope"],
+  ["Child wait targets changed scope", "target_scope"],
+  ["Child wait has multiple continuation steps", "continuation_ambiguous"],
+  ["Acknowledged child wait has no continuation step", "continuation_missing"],
+  ["Acknowledged child wait does not match its first continuation step", "continuation_mismatch"],
+  ["Child wait acknowledgement was fenced", "acknowledgement_fenced"],
+  ["Child wait source lifecycle is inconsistent", "source_lifecycle"],
+  ["Persisted child wait result is invalid", "persisted_result_invalid"],
+  ["deadlineAt is invalid", "deadline_invalid"],
+  ["outcome.deadlineAt is invalid", "outcome_deadline_invalid"],
+  ["Resume acknowledgement is invalid", "acknowledgement_input_invalid"],
+  ["Child wait is unresolved or invalid", "wait_unresolved"],
+  ["Child wait tool call is unavailable", "wait_call_unavailable"],
+  ["Child wait tool call does not match the durable wait", "wait_call_mismatch"],
+  ["Child wait step ordinal is invalid", "source_step_ordinal_invalid"],
+])
+function waitAcknowledgementFailureDiagnostic(error) {
+  const value = error && typeof error === "object" ? error : {}
+  const code = ["wait_scope_error", "wait_invalid", "wait_conflict"].includes(value.code) ? value.code : "other"
+  const reason = value.name === "DurableSubagentWaitError" && typeof value.message === "string"
+    ? waitAcknowledgementFailureReasons.get(value.message) ?? "unclassified_wait_error"
+    : "non_wait_error"
+  return { stage: "continuation_ack", code, reason }
+}
 const highPrecisionWaitModelCostUsd = 0.123456789
 const loopFixtureModelProfile = Object.freeze({ provider: "fixture", model: "durable-child-wait-fixture", nativeTools: true,
   structuredOutput: true, streaming: true, continuationCursor: false, supportsParallelTools: true, supportsStreamingToolArgs: true,
@@ -329,9 +359,16 @@ async function runChildWaitLoop(lease, restored, responseForStep, hooks = {}) {
     } }
   } else {
     options.store = acknowledgeDurableWaitAtContinuationStart(options.store, lease, wait,
-      async (currentLease, durableWait, nextStepOrdinal) => commitDurableSubagentWaitResume(pool, currentLease, {
-        waitId: durableWait.waitId, stepId: durableWait.stepId, nextStepOrdinal, now: new Date(),
-      }), step => replay.acknowledgeContinuation(step))
+      async (currentLease, durableWait, nextStepOrdinal) => {
+        try {
+          return await commitDurableSubagentWaitResume(pool, currentLease, {
+            waitId: durableWait.waitId, stepId: durableWait.stepId, nextStepOrdinal, now: new Date(),
+          })
+        } catch (error) {
+          say(`WORKER_B_WAIT_ACK_REJECTED ${JSON.stringify(waitAcknowledgementFailureDiagnostic(error))}`)
+          throw error
+        }
+      }, step => replay.acknowledgeContinuation(step))
   }
   const result = await runTurnExecutionLoop(options)
   return { result, invocations: fixtureModel.invocations, executorCalls, dispatcherCalls }

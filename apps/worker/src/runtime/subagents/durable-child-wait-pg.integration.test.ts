@@ -22,7 +22,7 @@ import { createProductionChildResumeLoaders } from "./production-child-resume-lo
 import { actionList, asObject, INSERT_TASK, json } from "./pg-store-persistence.js"
 import type { SubagentLease } from "./types.js"
 import { CHILD_WAIT_CLAIM_RECOVERY_SQL, hasBlockingExternalCall } from "./pg-store-expiry-recovery-predicates.js"
-import { childWaitContinuationKeyMatchesSafeProjection } from "./pg-store-expiry-child-wait-claim-call-proof.js"
+import { CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL, childWaitContinuationKeyMatchesSafeProjection } from "./pg-store-expiry-child-wait-claim-call-proof.js"
 import { safeSubagentWaitJson } from "./subagent-wait-structural-ids.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
@@ -60,6 +60,24 @@ const WORKER_F_CLAIM_PROOF_SQL = `SELECT COUNT(*)::int AS "candidateCount",
        WHERE started."sessionId" = $1 AND started."turnId" = $3 AND started."taskId" = $2
          AND started."type" = 'tool_call.started' AND started."correlationId" = $13 AND $9::text IS NULL
        ORDER BY started."sequence" DESC LIMIT 2) AS started`
+const CHANGE_RESULT_COMPLETE_SQL = `UPDATE "agent_events" SET "correlationId" = $1, "idempotencyKey" = $2,
+        "payload" = jsonb_set("payload", '{itemId}', to_jsonb($1::text), false)
+        WHERE "sessionId" = $3 AND "turnId" = $4 AND "taskId" = $5 AND "itemId" = $1
+          AND "type" = 'item.completed' AND "idempotencyKey" = $6 RETURNING "id"`
+const WORKER_F_UNSETTLED_STARTS_SQL = `SELECT started."id", started."turnId", started."type", started."correlationId"
+       FROM "agent_events" AS started
+       WHERE started."sessionId" = $1 AND started."taskId" = $2
+         AND started."type" IN ('tool_call.started', 'model.started')
+         AND NOT EXISTS (
+           SELECT 1 FROM "agent_events" AS settled
+           WHERE settled."sessionId" = started."sessionId" AND settled."taskId" = started."taskId"
+             AND settled."correlationId" = started."correlationId"
+             AND ((started."type" = 'tool_call.started'
+                   AND settled."type" IN ('tool_call.completed', 'tool_call.failed', 'tool_call.interrupted')
+                   AND ${CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL})
+               OR (started."type" = 'model.started' AND settled."type" IN ('model.completed', 'model.failed')))
+         )
+       ORDER BY started."sequence" DESC LIMIT 17`
 
 function safeProjectedWaitKey(input: { taskIds: readonly string[]; mode: "any" | "all"; timeoutMs: number; idempotencyKey: string }): string {
   const projected = asObject(safeSubagentWaitJson(input, 1_024))
@@ -96,6 +114,12 @@ const withServices = databaseUrl && redisUrl && process.env.RUN_AGENT_TURN_REDIS
 describe("worker restart blocker proof diagnostic bindings", () => {
   it("binds the recovered-source predicate and exact call identity through $13", () => {
     expectSqlBindings(WORKER_F_CLAIM_PROOF_SQL, 13)
+  })
+  it("binds changed result-completion event identity without parameter gaps", () => {
+    expectSqlBindings(CHANGE_RESULT_COMPLETE_SQL, 6)
+  })
+  it("binds the bounded unsettled-start diagnostic to the exact task scope", () => {
+    expectSqlBindings(WORKER_F_UNSETTLED_STARTS_SQL, 2)
   })
 })
 
@@ -327,28 +351,25 @@ async function diagnoseWorkerFBlocker(
       attemptCount: row.attemptCount, leaseExpiresAt: row.leaseExpiresAt }
     const blocker = await hasBlockingExternalCall(client, task as unknown as Record<string, unknown>, undefined, continuationStepId)
     const claimProof = await diagnoseWorkerFClaimProof(client, task, continuationStepId, sourceCallId, claimCallId)
-    const starts = await client.query<{ id: string; type: string; correlationId: string }>(
-      `SELECT "id", "type", "correlationId" FROM "agent_events"
-       WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
-         AND "type" IN ('tool_call.started', 'model.started')
-         AND ("correlationId" = $4 OR "correlationId" = $5 OR "correlationId" = $6)
-       ORDER BY "sequence" DESC LIMIT 16`,
-      [ids.sessionId, ids.turnId, ids.waiterTaskId, sourceCallId, claimCallId, continuationStepId],
+    const starts = await client.query<{ id: string; turnId: string; type: string; correlationId: string }>(
+      WORKER_F_UNSETTLED_STARTS_SQL,
+      [ids.sessionId, ids.waiterTaskId],
     )
     const classified = []
-    for (const start of starts.rows) {
+    for (const [index, start] of starts.rows.slice(0, 16).entries()) {
       const blockedWhenOmitted = await hasBlockingExternalCall(client,
         task as unknown as Record<string, unknown>, start.id, continuationStepId)
       const lane = start.correlationId === sourceCallId ? "source_wait"
         : start.correlationId === claimCallId ? "continuation_claim"
           : start.correlationId === continuationStepId ? "continuation_model" : "other"
-      classified.push({ lane, kind: start.type === "tool_call.started" ? "tool_call" : "model_call",
-        blockedWhenOmitted })
+      classified.push({ candidateOrdinal: index + 1, lane, kind: start.type === "tool_call.started" ? "tool_call" : "model_call",
+        sameTurn: start.turnId === ids.turnId, blockedWhenOmitted, isSoleBlocker: blocker && !blockedWhenOmitted })
     }
     return { snapshot: "post_recovery_attempt_read_committed", taskRowCount: taskResult.rows.length,
       taskStatus: diagnosticTaskStatus(row.status), attemptCount: row.attemptCount,
       leaseOwnerPresent: true, leaseExpired: row.leaseExpiresAt.getTime() <= Date.now(), claimProof,
-      blocker, examinedStartCount: starts.rows.length, starts: classified }
+      blocker, examinedStartCount: classified.length, unsettledStartCandidateCount: starts.rows.length,
+      unsettledStartCandidatesTruncated: starts.rows.length > 16, starts: classified }
   } catch {
     return { snapshot: "post_recovery_attempt_read_committed", predicateProbe: "unavailable" }
   } finally {
@@ -1186,11 +1207,8 @@ async function expectCompletedClaimBeforeItemEventSafety(
           `task:${ids.waiterTaskId}:event:item-started:${changedResultItemId}`, changedResultItemId,
           ids.sessionId, ids.turnId, ids.waiterTaskId])
       expect(changedResultStart.rows).toHaveLength(1)
-      const changedResultComplete = await client.query(`UPDATE "agent_events" SET "correlationId" = $2, "idempotencyKey" = $3,
-        "payload" = jsonb_set("payload", '{itemId}', to_jsonb($2::text), false)
-        WHERE "sessionId" = $4 AND "turnId" = $5 AND "taskId" = $6 AND "itemId" = $2
-          AND "type" = 'item.completed' AND "idempotencyKey" = $7 RETURNING "id"`,
-        [recoveredResultItemId, changedResultItemId,
+      const changedResultComplete = await client.query(CHANGE_RESULT_COMPLETE_SQL,
+        [changedResultItemId,
           `task:${ids.waiterTaskId}:event:tool-result-completed:${PHONE_SHAPED_WAIT_TOOL_CALL_ID}:${changedResultItemId}:1`,
           ids.sessionId, ids.turnId, ids.waiterTaskId,
           `task:${ids.waiterTaskId}:event:tool-result-completed:${PHONE_SHAPED_WAIT_TOOL_CALL_ID}:${recoveredResultItemId}:1`])
