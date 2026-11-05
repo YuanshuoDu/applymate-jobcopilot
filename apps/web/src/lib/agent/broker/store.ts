@@ -104,6 +104,7 @@ async function finishWait(
     waitId: string
     itemId: string
     turnId: string
+    taskId: string | null
     itemRevision: number
     turnRevision: number
     toolCallId: string | null
@@ -138,7 +139,7 @@ async function finishWait(
     sessionId: input.sessionId,
     turnId: input.turnId,
     itemId: input.itemId,
-    taskId: null,
+    taskId: input.waitKind === "approval" ? input.taskId : null,
     type: input.waitKind === "approval" ? "approval.resolved" : "question.answered",
     actor: "user",
     correlationId: input.waitId,
@@ -209,6 +210,7 @@ export async function decideApproval(db: PrismaClient, input: ApprovalDecisionIn
     if (content.approvalId !== approval.id || content.toolCallId !== (approval.toolCallId ?? null) || content.scopeHash !== approval.scopeHash) throw waitScopeMismatch()
     return finishWait(tx, {
       sessionId: input.sessionId, userId: input.userId, waitKind: "approval", waitId: input.waitId, itemId, turnId: turn.id,
+      taskId: approval.taskId,
       itemRevision: item.revision, turnRevision: turn.revision, toolCallId: approval.toolCallId,
       status: input.decision, itemContent: { ...content, decision: input.decision, responseAvailable: true, respondedAt: now.toISOString() },
       clientMessageId: input.clientMessageId,
@@ -236,6 +238,7 @@ export async function answerQuestion(db: PrismaClient, input: QuestionAnswerInpu
     const toolCallId = typeof content.toolCallId === "string" ? content.toolCallId : null
     return finishWait(tx, {
       sessionId: input.sessionId, userId: input.userId, waitKind: "question", waitId: input.waitId, itemId, turnId: turn.id,
+      taskId: null,
       itemRevision: item.revision, turnRevision: turn.revision, toolCallId, status: "answered",
       itemContent: { ...content, answer, answerAvailable: true, answeredAt: (input.now ?? new Date()).toISOString() },
       clientMessageId: input.clientMessageId,

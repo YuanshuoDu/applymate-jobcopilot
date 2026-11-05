@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "vitest"
 
+import { createApprovalLedgerState, reduceApprovalLedger, selectApprovalLedgerProjection } from "../../../components/agent-workspace/v2/approval-ledger-view"
+import { normalizeTimelineEvent } from "../../../components/agent-workspace/v2/timeline-event-normalizer"
 import { cancelPendingWaitsInTransaction } from "./interrupt"
 
 type Row = Record<string, any> // Fixture rows intentionally model Prisma JSON records.
@@ -30,26 +32,38 @@ function matchesApplicationWhere(application: Row, where: Row): boolean {
 }
 
 describe("Agent wait interrupt cleanup", () => {
-  it("marks pending waits interrupted and cancels the approval in one transaction", async () => {
+  it.each(["task_1", null])("marks pending waits interrupted and preserves authorized approval taskId %s", async (taskId) => {
     const item: Row = {
       id: "agent-wait:approval:approval_1", type: "approval_request", revision: 0,
-      content: { approvalId: "approval_1", toolCallId: "call_1" },
+      content: { approvalId: "approval_1", toolCallId: taskId === null ? "call_1" : null, taskId: "forged_task" },
+    }
+    const approval: Row = {
+      id: "approval_1", sessionId: "session_1", userId: "user_1", turnId: "turn_1", taskId,
+      type: "review_application", status: "pending", scopeHash: "scope_1", revision: 1,
     }
     const events: Row[] = []
+    const outbox: Row[] = []
     const tx = {
       agentItem: {
         findMany: vi.fn(async () => [item]),
         updateMany: vi.fn(async ({ data }: { data: Row }) => { item.status = data.status; item.content = data.content; return { count: 1 } }),
       },
-      agentApproval: { findMany: vi.fn(async () => []), updateMany: vi.fn(async () => ({ count: 1 })) },
+      agentApproval: {
+        findMany: vi.fn(async ({ where }: { where: Row }) => {
+          if (where.id?.in) return [approval]
+          if (where.type?.in?.includes(approval.type) && matchesFilter(approval.status, where.status)) return [approval]
+          return []
+        }),
+        updateMany: vi.fn(async ({ data }: { data: Row }) => { Object.assign(approval, data); return { count: 1 } }),
+      },
       applicationTask: { findMany: vi.fn(async () => []), updateMany: vi.fn(async () => ({ count: 0 })) },
       agentRunQuestion: { deleteMany: vi.fn(async () => ({ count: 0 })) },
       agentEvent: {
         findFirst: vi.fn(async () => null),
-        create: vi.fn(async ({ data }: { data: Row }) => { events.push(data); return { ...data, sequence: BigInt(1) } }),
+        create: vi.fn(async ({ data }: { data: Row }) => { events.push(data); return { ...data, sequence: data.sequence } }),
       },
-      agentOutbox: { create: vi.fn(async () => ({ id: "outbox_1" })) },
-      $queryRaw: vi.fn(async () => [{ eventSequence: BigInt(1) }]),
+      agentOutbox: { create: vi.fn(async ({ data }: { data: Row }) => { outbox.push(data); return data }) },
+      $queryRaw: vi.fn(async () => [{ eventSequence: BigInt(2) }]),
     }
 
     await cancelPendingWaitsInTransaction(tx as never, { sessionId: "session_1", userId: "user_1", turnId: "turn_1", clientMessageId: "interrupt_1" })
@@ -57,7 +71,148 @@ describe("Agent wait interrupt cleanup", () => {
     expect(item.status).toBe("interrupted")
     expect(item.content).toMatchObject({ cancelled: true, cancellationReason: "interrupt" })
     expect(tx.agentApproval.updateMany).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ status: "pending" }), data: expect.objectContaining({ status: "rejected" }) }))
-    expect(events[0].payload).toMatchObject({ outcome: "cancelled", reason: "interrupt", toolCallId: "call_1" })
+    expect(events[0].payload).toMatchObject({ outcome: "cancelled", reason: "interrupt" })
+    expect(events[0].payload.toolCallId).toBe(taskId === null ? "call_1" : null)
+    expect(events[0]).toMatchObject({ type: "approval.resolved", sessionId: "session_1", turnId: "turn_1", taskId, correlationId: "approval_1" })
+    expect(events[0].payload).toMatchObject({ waitKind: "approval", waitId: "approval_1", itemId: item.id, turnId: "turn_1", outcome: "cancelled", reason: "interrupt" })
+    expect(tx.agentApproval.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ sessionId: "session_1", userId: "user_1", turnId: "turn_1", status: "pending" }),
+    }))
+    expect(outbox).toEqual(expect.arrayContaining([
+      expect.objectContaining({ topic: "agent.session.event", payload: expect.objectContaining({ type: "approval.resolved", taskId }) }),
+    ]))
+
+    const requested = normalizeTimelineEvent({
+      schemaVersion: "agent-harness.v2", id: "requested_approval_1", sessionId: "session_1", turnId: "turn_1", itemId: null, taskId,
+      type: "approval.requested", actor: "orchestrator", sequence: "1", correlationId: "approval_1", causationId: null,
+      idempotencyKey: "approval:approval_1:requested", payload: { approvalId: "approval_1", action: "review_application", scopeHash: `sha256:${"a".repeat(64)}`, revision: 1 },
+    })
+    const dispatched = outbox[0].payload as Row
+    expect(dispatched).toMatchObject({
+      eventId: events[0].id,
+      sessionId: events[0].sessionId,
+      turnId: events[0].turnId,
+      itemId: events[0].itemId,
+      taskId: events[0].taskId,
+      type: events[0].type,
+      actor: events[0].actor,
+      correlationId: events[0].correlationId,
+      causationId: events[0].causationId,
+      payload: events[0].payload,
+    })
+    const resolved = normalizeTimelineEvent({
+      schemaVersion: "agent-harness.v2",
+      id: dispatched.eventId,
+      sessionId: dispatched.sessionId,
+      turnId: dispatched.turnId,
+      itemId: dispatched.itemId,
+      taskId: dispatched.taskId,
+      type: dispatched.type,
+      actor: dispatched.actor,
+      sequence: dispatched.sequence,
+      correlationId: dispatched.correlationId,
+      causationId: dispatched.causationId,
+      idempotencyKey: dispatched.idempotencyKey,
+      payload: dispatched.payload,
+    })
+    expect(requested).not.toBeNull()
+    expect(resolved).not.toBeNull()
+    if (!requested || !resolved) throw new Error("Persisted approval events must satisfy the ledger parser")
+    let ledger = reduceApprovalLedger(createApprovalLedgerState("session_1"), requested)
+    expect(selectApprovalLedgerProjection(ledger).pendingCount).toBe(1)
+    ledger = reduceApprovalLedger(ledger, resolved)
+    expect(selectApprovalLedgerProjection(ledger)).toMatchObject({ pendingCount: 0, pendingActions: [], approvals: [{ status: "cancelled" }] })
+  })
+
+  it("interrupts a projected approval item without inventing a resolution when its scoped pending receipt is missing", async () => {
+    const item: Row = {
+      id: "agent-wait:approval:approval_missing", type: "approval_request", revision: 3, status: "started",
+      content: { approvalId: "approval_missing", taskId: "forged_task" },
+    }
+    const events: Row[] = []
+    const outbox: Row[] = []
+    const receiptUpdate = vi.fn(async () => ({ count: 0 }))
+    const tx = {
+      agentItem: {
+        findMany: vi.fn(async () => [item]),
+        updateMany: vi.fn(async ({ data }: { data: Row }) => { Object.assign(item, data); return { count: 1 } }),
+      },
+      agentApproval: { findMany: vi.fn(async () => []), updateMany: receiptUpdate },
+      applicationTask: { findMany: vi.fn(async () => []), updateMany: vi.fn(async () => ({ count: 0 })) },
+      agentRunQuestion: { deleteMany: vi.fn(async () => ({ count: 0 })) },
+      agentEvent: {
+        findFirst: vi.fn(async () => null),
+        create: vi.fn(async ({ data }: { data: Row }) => { events.push(data); return { ...data, sequence: data.sequence } }),
+      },
+      agentOutbox: { create: vi.fn(async ({ data }: { data: Row }) => { outbox.push(data); return data }) },
+      $queryRaw: vi.fn(async () => [{ eventSequence: BigInt(1) }]),
+    }
+
+    await cancelPendingWaitsInTransaction(tx as never, { sessionId: "session_1", userId: "user_1", turnId: "turn_1", clientMessageId: "interrupt_missing_receipt" })
+
+    expect(item).toMatchObject({ status: "interrupted", content: { cancelled: true, cancellationReason: "interrupt" } })
+    expect(receiptUpdate).not.toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ id: "approval_missing" }) }))
+    expect(events).toEqual([])
+    expect(outbox).toEqual([])
+  })
+
+  it("keeps question cancellation on its existing builder-to-normalizer contract", async () => {
+    const sessionId = "70463535-1444-4bba-ae3b-b80578d2dd0b"
+    const turnId = "70463535-1444-4bba-ae3b-b80578d2dd0c"
+    const questionId = "70463535-1444-4bba-ae3b-b80578d2dd0a"
+    const item: Row = {
+      id: `agent-wait:question:${questionId}`, type: "question", revision: 0, status: "started",
+      content: { questionId, toolCallId: null, question: "PRIVATE_QUESTION_BODY", options: ["PRIVATE_OPTION_LABEL"], answer: "PRIVATE_ANSWER" },
+    }
+    const outbox: Row[] = []
+    const tx = {
+      agentItem: {
+        findMany: vi.fn(async () => [item]),
+        updateMany: vi.fn(async ({ data }: { data: Row }) => { Object.assign(item, data); return { count: 1 } }),
+      },
+      agentApproval: {
+        findMany: vi.fn(async () => []),
+        updateMany: vi.fn(async () => ({ count: 0 })),
+      },
+      applicationTask: { findMany: vi.fn(async () => []), updateMany: vi.fn(async () => ({ count: 0 })) },
+      agentRunQuestion: { deleteMany: vi.fn(async () => ({ count: 0 })) },
+      agentEvent: {
+        findFirst: vi.fn(async () => null),
+        create: vi.fn(async ({ data }: { data: Row }) => data),
+      },
+      agentOutbox: { create: vi.fn(async ({ data }: { data: Row }) => { outbox.push(data); return data }) },
+      $queryRaw: vi.fn(async () => [{ eventSequence: BigInt(1) }]),
+    }
+
+    await cancelPendingWaitsInTransaction(tx as never, {
+      sessionId, userId: "user_1", turnId, clientMessageId: "70463535-1444-4bba-ae3b-b80578d2dd0e",
+    })
+
+    expect(outbox).toHaveLength(1)
+    const dispatched = outbox[0]!.payload as Row
+    expect(dispatched).toMatchObject({ type: "question.cancelled", taskId: null })
+    expect(dispatched.payload).toEqual({
+      waitKind: "question", waitId: questionId, itemId: item.id, toolCallId: null, outcome: "cancelled", reason: "interrupt",
+    })
+    expect(dispatched.payload).not.toHaveProperty("turnId")
+    expect(JSON.stringify(dispatched)).not.toMatch(/PRIVATE_QUESTION_BODY|PRIVATE_OPTION_LABEL|PRIVATE_ANSWER/)
+
+    const normalized = normalizeTimelineEvent({
+      schemaVersion: "agent-harness.v2",
+      id: dispatched.eventId,
+      sessionId: dispatched.sessionId,
+      turnId: dispatched.turnId,
+      itemId: dispatched.itemId,
+      taskId: dispatched.taskId,
+      type: dispatched.type,
+      actor: dispatched.actor,
+      sequence: dispatched.sequence,
+      correlationId: dispatched.correlationId,
+      causationId: dispatched.causationId,
+      idempotencyKey: dispatched.idempotencyKey,
+      payload: dispatched.payload,
+    })
+    expect(normalized).toMatchObject({ type: "question.cancelled", taskId: null, payload: dispatched.payload })
   })
 
   it("cancels an unprojected review receipt and its exact material-ready task after Stop", async () => {
