@@ -6,7 +6,7 @@ import type { AgentEventRoutingContext } from "./agent-event-routing"
 const guards: AgentEventPayloadGuards = {
   record: (value): Record<string, unknown> | null => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null,
   opaqueId: (value): value is string => typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value,
-  nullableId: (value): value is string | null => value === null || typeof value === "string",
+  nullableId: (value): value is string | null => value === null || typeof value === "string" && value.length > 0 && value.trim() === value,
   validTimestamp: (value): value is string => typeof value === "string" && Number.isFinite(Date.parse(value)),
   jsonValue: (value): value is import("@jobcopilot/agent-protocol").RepositoryJsonValue => value !== undefined,
   isNestedAgentItem: () => true,
@@ -54,5 +54,104 @@ describe("accepted input redaction contracts", () => {
       disposition: "queued_follow_up", targetAttemptCount: 2, item: {} }
     expect(validRootAcceptedInputPayload("input.accepted", taskPayload, taskRoute, guards)).toBe(false)
     expect(validatedPayloadFields("input.accepted", taskPayload, taskRoute, guards)).toEqual(["messageId"])
+  })
+})
+
+describe("approval cancellation redaction contracts", () => {
+  const approvalId = "approval_1"
+  const itemId = `agent-wait:approval:${approvalId}`
+  const cancellationRoute: AgentEventRoutingContext = {
+    ...route,
+    itemId,
+    taskId: null,
+    actor: "system",
+    correlationId: approvalId,
+    causationId: "interrupt_1",
+    outboxTopic: "agent.session.event",
+  }
+  const cancellation = {
+    waitKind: "approval",
+    waitId: approvalId,
+    itemId,
+    turnId,
+    toolCallId: null,
+    outcome: "cancelled",
+    reason: "interrupt",
+  }
+
+  it("preserves canonical cancellation IDs for null and task-bound routes", () => {
+    for (const taskId of [null, "task_1"]) {
+      expect(validatedPayloadFields("approval.resolved", cancellation, { ...cancellationRoute, taskId }, guards))
+        .toEqual(["waitId", "itemId", "turnId", "toolCallId"])
+    }
+  })
+
+  it("rejects malformed, extra, and route-mismatched cancellation fields", () => {
+    const cases: Array<{ payload: Record<string, unknown>; route: AgentEventRoutingContext }> = [
+      { payload: { ...cancellation, extra: true }, route: cancellationRoute },
+      { payload: { ...cancellation, turnId: "foreign_turn" }, route: cancellationRoute },
+      { payload: { ...cancellation, itemId: "agent-wait:approval:foreign_approval" }, route: cancellationRoute },
+      { payload: { ...cancellation, outcome: "rejected" }, route: cancellationRoute },
+      { payload: { ...cancellation, reason: "user" }, route: cancellationRoute },
+      { payload: cancellation, route: { ...cancellationRoute, turnId: "foreign_turn" } },
+      { payload: cancellation, route: { ...cancellationRoute, itemId: "agent-wait:approval:foreign_approval" } },
+      { payload: cancellation, route: { ...cancellationRoute, correlationId: "foreign_approval" } },
+      { payload: cancellation, route: { ...cancellationRoute, causationId: null } },
+      { payload: cancellation, route: { ...cancellationRoute, actor: "user" } },
+      { payload: cancellation, route: { ...cancellationRoute, outboxTopic: "agent.turn.wakeup" } },
+      { payload: cancellation, route: { ...cancellationRoute, taskId: "" } },
+    ]
+
+    for (const entry of cases) {
+      expect(validatedPayloadFields("approval.resolved", entry.payload, entry.route, guards)).toBeNull()
+    }
+    expect(validatedPayloadFields("task.updated", cancellation, cancellationRoute, guards)).toBeNull()
+  })
+})
+
+describe("question cancellation redaction contracts", () => {
+  const questionId = "question_1"
+  const itemId = `agent-wait:question:${questionId}`
+  const questionRoute: AgentEventRoutingContext = {
+    ...route,
+    itemId,
+    taskId: null,
+    actor: "system",
+    correlationId: questionId,
+    causationId: "interrupt_1",
+    outboxTopic: "agent.session.event",
+  }
+  const cancellation = {
+    waitKind: "question",
+    waitId: questionId,
+    itemId,
+    toolCallId: null,
+    outcome: "cancelled",
+    reason: "interrupt",
+  }
+
+  it("preserves only canonical question cancellation identifiers", () => {
+    expect(validatedPayloadFields("question.cancelled", cancellation, questionRoute, guards))
+      .toEqual(["waitId", "itemId", "toolCallId"])
+  })
+
+  it("rejects extra, malformed, and route-mismatched question cancellation fields", () => {
+    const cases: Array<{ payload: Record<string, unknown>; route: AgentEventRoutingContext }> = [
+      { payload: { ...cancellation, turnId }, route: questionRoute },
+      { payload: { ...cancellation, question: "private question" }, route: questionRoute },
+      { payload: { ...cancellation, options: ["private option"] }, route: questionRoute },
+      { payload: { ...cancellation, answer: "private answer" }, route: questionRoute },
+      { payload: { ...cancellation, itemId: "agent-wait:question:foreign_question" }, route: questionRoute },
+      { payload: { ...cancellation, outcome: "answered" }, route: questionRoute },
+      { payload: cancellation, route: { ...questionRoute, taskId: "task_1" } },
+      { payload: cancellation, route: { ...questionRoute, correlationId: "foreign_question" } },
+      { payload: cancellation, route: { ...questionRoute, actor: "user" } },
+      { payload: cancellation, route: { ...questionRoute, causationId: null } },
+      { payload: cancellation, route: { ...questionRoute, outboxTopic: "agent.turn.wakeup" } },
+    ]
+
+    for (const entry of cases) {
+      expect(validatedPayloadFields("question.cancelled", entry.payload, entry.route, guards)).toBeNull()
+    }
   })
 })

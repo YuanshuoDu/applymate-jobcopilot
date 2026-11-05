@@ -66,6 +66,22 @@ export async function cancelPendingWaitsInTransaction(
     where: { sessionId: input.sessionId, turnId: input.turnId, type: { in: ["approval_request", "question"] }, status: "started" },
     select: { id: true, type: true, revision: true, content: true },
   })
+  const approvalWaitIds = [...new Set(items.flatMap(item => {
+    if (item.type !== "approval_request") return []
+    const approvalId = record(item.content).approvalId
+    return typeof approvalId === "string" ? [approvalId] : []
+  }))]
+  const projectedApprovals = approvalWaitIds.length === 0 ? [] : await tx.agentApproval.findMany({
+    where: {
+      id: { in: approvalWaitIds },
+      sessionId: input.sessionId,
+      userId: input.userId,
+      turnId: input.turnId,
+      status: "pending",
+    },
+    select: { id: true, taskId: true },
+  })
+  const projectedApprovalTaskIds = new Map(projectedApprovals.map(receipt => [receipt.id, receipt.taskId] as const))
   for (const item of items) {
     const content = record(item.content)
     const waitKind = item.type === "approval_request" ? "approval" : "question"
@@ -76,6 +92,7 @@ export async function cancelPendingWaitsInTransaction(
       data: { status: "interrupted", revision: { increment: 1 }, content: json({ ...content, cancelled: true, cancellationReason: "interrupt" }), completedAt: now },
     })
     if (updated.count !== 1) continue
+    if (waitKind === "approval" && !projectedApprovalTaskIds.has(waitId)) continue
     projectedWaitIds.add(waitId)
     if (waitKind === "approval") {
       await tx.agentApproval.updateMany({
@@ -87,7 +104,7 @@ export async function cancelPendingWaitsInTransaction(
       sessionId: input.sessionId,
       turnId: input.turnId,
       itemId: item.id,
-      taskId: null,
+      taskId: waitKind === "approval" ? projectedApprovalTaskIds.get(waitId) ?? null : null,
       type: waitKind === "approval" ? "approval.resolved" : "question.cancelled",
       actor: "system",
       correlationId: waitId,
@@ -97,6 +114,7 @@ export async function cancelPendingWaitsInTransaction(
         waitKind,
         waitId,
         itemId: item.id,
+        ...(waitKind === "approval" ? { turnId: input.turnId } : {}),
         toolCallId: typeof content.toolCallId === "string" ? content.toolCallId : null,
         outcome: "cancelled",
         reason: "interrupt",
