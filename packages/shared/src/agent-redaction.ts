@@ -168,7 +168,7 @@ function preserveFields(safe: unknown, raw: JsonRecord, fields: readonly string[
 function redactWaitRouting(type: string, raw: unknown, safe: RepositoryJsonValue, route: RoutingTuple): RepositoryJsonValue {
   const payload = record(raw)
   if (!payload) return safe
-  const fields = validatedPayloadFields(type, payload, route)
+  const fields = validatedPayloadFields(type, payload, route); if (type === "question.cancelled" && !fields) return "[REDACTED]"
   let preserved = fields ? preserveFields(safe, payload, fields) : safe
   if (validQuestionSourceEnvelope(type, payload, route)) {
     const output = record(preserved), rawSource = record(payload.sourcePayload), safeSource = record(output?.sourcePayload)
