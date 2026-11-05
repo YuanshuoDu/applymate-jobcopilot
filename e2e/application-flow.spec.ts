@@ -2,7 +2,6 @@ import { expect, test, type Page, type Route } from '@playwright/test'
 import { createRequire } from 'node:module'
 import { createServer, type Server } from 'node:http'
 import { randomInt } from 'node:crypto'
-import { spawn } from 'node:child_process'
 import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -133,9 +132,11 @@ function resume() {
     content: { contact: { name: 'Fixture Candidate', email: 'fixture@example.invalid', location: 'Dublin' }, summary: 'Software engineer.',
       experience: [], education: [], skills: ['TypeScript'], languages: [], projects: [], certifications: [] } }
 }
-function audit(resumeUpdatedAt = time) {
+function audit(resumeUpdatedAt = time, hasCoverLetter = false) {
+  const findings = [{ area: 'resume', severity: 'pass', title: 'Verified', evidence: 'Supported', action: 'None' }]
+  if (hasCoverLetter) findings.push({ area: 'cover_letter', severity: 'pass', title: 'Verified', evidence: 'Supported', action: 'None' })
   const record = { resumeId: 'resume-1', coverLetterId: null, resumeUpdatedAt,
-    audit: { verdict: 'pass', summary: 'Fixture materials checked.', findings: [], matchScore: 82, source: 'independent', auditedAt: time } }
+    audit: { verdict: 'pass', summary: 'Fixture materials checked.', findings, matchScore: 82, source: 'independent', auditedAt: time } }
   return record as typeof record & { coverLetterUpdatedAt?: string }
 }
 
@@ -182,14 +183,14 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
   const lettersGate = new Promise<void>(resolve => { releaseLetters = resolve })
   const state = { job: { ...job(), description: job().description as string | null, followUpAt: null as string | null, appliedAt: null as string | null, finalCoverLetterId: options.holdSelectedLetter || options.selectedLetter ? 'selected-letter' : null, finalResumeId: options.firstPreparation ? null : 'resume-1' }, resume: resume(), audit: options.auditCorrection ? { ...audit(), audit: { ...audit().audit, verdict: 'revise', findings: [{ area: 'resume', target: 'summary', severity: 'warning', title: 'Fix summary', evidence: 'Outdated wording', action: 'Apply correction', proposedValue: 'Audited v2 summary' }] } } : audit(options.stale ? '2026-10-29T10:00:00.000Z' : time),
     secondResume: { ...resume(), id: 'resume-2', name: 'Second fixture resume', targetJobId: null as string | null, content: { ...resume().content, summary: 'Second resume content.' } },
-    answeredJobA: false, saveResponses: 0, armReturnOwnerA: false, returnOwnerAEntered: false, releaseReturnOwnerA, manualPosted: false, manualReadAvailable: false, hideResumeOnExport: false, malformedPreview: options.malformedPreview ?? null, selectedLetterAvailable: false, failNextDescriptionAudit: false, descriptionWriteStarted: false, otherJobUpdateStarted: false, releaseDescription, releaseOtherJobUpdate, savedBase: null as (Omit<ReturnType<typeof resume>, 'targetJobId'> & { targetJobId: string | null }) | null, baseSaveStarted: false, releaseBaseSave, baseListReads: 0, releaseBaseList, invalidLetter: options.letterInvalid ?? null, probeLetterReads: 0, selectedLetterReads: 0, changeLetterOnRead: false, auditStarted: false, assignStarted: false, releaseAudit, releaseAssign, releaseProbeLetter, fontRequests: [] as string[], activeUserId: 'fixture-user', agentStage: 'question' as 'question' | 'approval' | 'running' | 'unknown', requestOwners: [] as Array<{ path: string; method: string; userId: string }>, agentRequests: [] as Array<{ path: string; method: string; body?: unknown }>, writes: [] as Array<{ path: string; body: unknown }>, analysisRequests: [] as string[], analysisBodies: [] as unknown[], analysisCalls: [] as Array<{ path: string; body: unknown }>, unexpected: [] as string[], taskReads: 0, staleJobRequested: false, staleJobReturned: false, releaseStaleJob, taskStatusOverride: null as 'waiting_for_authorization' | null, firstTaskReadFinished: false, releaseFirstTaskRead, letterRequested: false, resumeContentRequested: false, releaseLetters, releaseSave, releaseResumeContent, releaseOldAnalysis, releaseAuditCorrection, releaseVersionRestore }
+    answeredJobA: false, saveResponses: 0, packRequests: 0, armReturnOwnerA: false, returnOwnerAEntered: false, releaseReturnOwnerA, manualPosted: false, manualReadAvailable: false, hideResumeOnExport: false, malformedPreview: options.malformedPreview ?? null, selectedLetterAvailable: false, failNextDescriptionAudit: false, descriptionWriteStarted: false, otherJobUpdateStarted: false, releaseDescription, releaseOtherJobUpdate, savedBase: null as (Omit<ReturnType<typeof resume>, 'targetJobId'> & { targetJobId: string | null }) | null, baseSaveStarted: false, releaseBaseSave, baseListReads: 0, releaseBaseList, invalidLetter: options.letterInvalid ?? null, probeLetterReads: 0, selectedLetterReads: 0, changeLetterOnRead: false, auditStarted: false, assignStarted: false, releaseAudit, releaseAssign, releaseProbeLetter, fontRequests: [] as string[], activeUserId: 'fixture-user', agentStage: 'question' as 'question' | 'approval' | 'running' | 'unknown', requestOwners: [] as Array<{ path: string; method: string; userId: string }>, agentRequests: [] as Array<{ path: string; method: string; body?: unknown }>, writes: [] as Array<{ path: string; body: unknown }>, analysisRequests: [] as string[], analysisBodies: [] as unknown[], analysisCalls: [] as Array<{ path: string; body: unknown }>, unexpected: [] as string[], taskReads: 0, staleJobRequested: false, staleJobReturned: false, releaseStaleJob, taskStatusOverride: null as 'waiting_for_authorization' | null, firstTaskReadFinished: false, releaseFirstTaskRead, letterRequested: false, resumeContentRequested: false, releaseLetters, releaseSave, releaseResumeContent, releaseOldAnalysis, releaseAuditCorrection, releaseVersionRestore }
   if (options.descriptionMode) state.job.description = options.initialDescription === undefined ? '' : options.initialDescription
   if (options.evidenceCase === 'unbound') state.job.finalResumeId = null
   if (options.previewMismatch === 'job') state.job.finalResumeId = null
   if (options.evidenceCase === 'unavailable') state.hideResumeOnExport = true
   if (options.failTailoredRead) state.hideResumeOnExport = true
   if (options.recordedInitially) state.job = { ...state.job, status: 'applied', workflowState: 'submitted' }
-  if (options.selectedLetter) state.audit = { ...state.audit, coverLetterId: 'selected-letter', coverLetterUpdatedAt: time }
+  if (options.selectedLetter) state.audit = { ...audit(options.stale ? '2026-10-29T10:00:00.000Z' : time, true), coverLetterId: 'selected-letter', coverLetterUpdatedAt: time }
   const json = (route: Route, value: unknown, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(value) })
   await page.context().route('**/*', async route => {
     const request = route.request(), url = new URL(request.url()), pathname = url.pathname
@@ -268,6 +269,11 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
     if (options.realAgent && pathname === '/api/me/agent-task-history-memory' && request.method() === 'GET') return json(route, { enabled: false, version: 0 })
     if (options.realAgent && pathname === '/api/agent') return json(route, { autoApply: false, requireApproval: true, isRunning: false })
     if (pathname === '/api/resume/intake' && request.method() === 'POST') return json(route, { parsed: resume().content })
+    // Synthetic response only: real ZIP generation and audit signatures are covered by isolated route tests.
+    if (request.method() === 'POST' && pathname.endsWith('/application-pack')) {
+      state.packRequests++
+      return route.fulfill({ status: 200, contentType: 'application/zip', headers: { 'Content-Disposition': "attachment; filename*=UTF-8''fixture-pack.zip" }, body: 'synthetic server ZIP response' })
+    }
     if (request.method() !== 'GET') {
       const body: unknown = request.postDataJSON()
       // Account for explicit analysis separately from application and submit writes.
@@ -329,7 +335,7 @@ async function install(page: Page, options: { stale?: boolean; taskStatus?: 'unk
       }
       if (pathname.endsWith('/tailor-resume')) return json(route, { adaptedResumeId: 'resume-1' })
       if (pathname === '/api/resume' && options.baseList === 'empty') { state.baseSaveStarted = true; if (options.holdBaseSave) await baseSaveGate; if (options.failBaseSave) return route.abort('failed'); const saved = body as { name: string; content: ReturnType<typeof resume>['content'] }; state.savedBase = { ...state.resume, id: 'base-created', kind: 'base', targetJobId: null, name: saved.name, content: saved.content }; return json(route, state.savedBase) }
-      if (pathname.endsWith('/audit-application')) { state.auditStarted = true; if (options.holdAudit) await auditGate; if (options.failFirstAudit && state.writes.filter(write => write.path.endsWith('/audit-application')).length === 1) return json(route, { error: 'Fixture audit unavailable' }, 500); const letterId = (body as { coverLetterId: string | null }).coverLetterId; state.audit = { ...audit(state.resume.updatedAt), coverLetterId: letterId, ...(letterId ? { coverLetterUpdatedAt: time } : {}) }; return json(route, { ...state.audit.audit, ...(options.auditVersion === 'resume-missing' ? {} : { resumeUpdatedAt: options.auditVersion === 'resume-changed' ? '2026-10-30T11:00:00.000Z' : state.resume.updatedAt }), ...(letterId && options.auditVersion !== 'letter-missing' ? { coverLetterUpdatedAt: options.auditVersion === 'letter-changed' ? '2026-10-30T11:00:00.000Z' : time } : {}) }) }
+      if (pathname.endsWith('/audit-application')) { state.auditStarted = true; if (options.holdAudit) await auditGate; if (options.failFirstAudit && state.writes.filter(write => write.path.endsWith('/audit-application')).length === 1) return json(route, { error: 'Fixture audit unavailable' }, 500); const letterId = (body as { coverLetterId: string | null }).coverLetterId; state.audit = { ...audit(state.resume.updatedAt, Boolean(letterId)), coverLetterId: letterId, ...(letterId ? { coverLetterUpdatedAt: time } : {}) }; return json(route, { ...state.audit.audit, ...(options.auditVersion === 'resume-missing' ? {} : { resumeUpdatedAt: options.auditVersion === 'resume-changed' ? '2026-10-30T11:00:00.000Z' : state.resume.updatedAt }), ...(letterId && options.auditVersion !== 'letter-missing' ? { coverLetterUpdatedAt: options.auditVersion === 'letter-changed' ? '2026-10-30T11:00:00.000Z' : time } : {}) }) }
       if (pathname.endsWith('/assign')) { state.assignStarted = true; if (options.holdAssign) await assignGate; Object.assign(state.job, body); return json(route, state.job) }
       if (pathname === '/api/jobs/outside-page/apply') { state.manualPosted = true; if (options.manualOutcome === 'unknown') return route.abort('failed'); Object.assign(state.job, { status: 'applied', workflowState: 'submitted', appliedAt: time }); return json(route, { applied: true }) }
       return json(route, { error: 'Unexpected mutation' }, 500)
@@ -540,7 +546,7 @@ for (const change of ['account', 'leave'] as const) {
       const late = page.waitForResponse(response => response.url().endsWith('/assign') && response.status() === 200)
       state.releaseAssign()
       await (await late).finished()
-      await expect(page.getByText(/Application pack confirmed|申请包已确认/)).toHaveCount(0)
+      await expect(page.getByText(/Application materials selected|已选择申请材料/)).toHaveCount(0)
       if (change === 'leave') await expect(page).toHaveURL(/page=jobs/)
       expect(state.writes.filter(write => write.path.endsWith('/assign'))).toHaveLength(1)
       expect(state.unexpected).toEqual([])
@@ -560,7 +566,7 @@ for (const mismatch of ['owner', 'job'] as const) {
     const dialog = page.getByRole('dialog', { name: /Confirm application materials|确认申请材料/ })
     await dialog.getByRole('button', { name: /Confirm application package|确认申请包/, exact: true }).click()
     await expect(page.getByText(/Could not confirm application pack|无法确认申请包/)).toBeVisible()
-    await expect(dialog.getByText(/Application pack confirmed|申请包已确认/)).toHaveCount(0)
+    await expect(dialog.getByText(/Application materials selected|已选择申请材料/)).toHaveCount(0)
     await expect(page).toHaveURL(/page=resume/)
     expect(state.unexpected).toEqual([])
   })
@@ -688,7 +694,7 @@ test('reopening confirmed materials reuses the current binding and audit without
   const dialog = page.getByRole('dialog', { name: /Confirm application materials|确认申请材料/ })
   for (let attempt = 0; attempt < 2; attempt++) {
     await openConfirmation.click()
-    await expect(dialog).toContainText(/Application pack confirmed|申请包已确认/)
+    await expect(dialog).toContainText(/Application materials selected|已选择申请材料/)
     await expect(dialog.getByRole('button', { name: /Confirm application package|确认申请包/, exact: true })).toHaveCount(0)
     await expect(dialog.getByRole('button', { name: /View this application|查看此申请/, exact: true })).toBeVisible()
     await dialog.getByRole('button', { name: /Close final confirmation|关闭最终确认/ }).click()
@@ -697,6 +703,97 @@ test('reopening confirmed materials reuses the current binding and audit without
   expect(state.analysisRequests).toEqual([])
   expect(state.unexpected).toEqual([])
 })
+
+for (const outcome of ['loading', 'failed'] as const) {
+  test(`Resume re-audit does not omit a selected cover letter while its read is ${outcome}`, async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop-en', 'Focused selected material regression')
+    const state = await install(page, { selectedLetter: true })
+    state.job.finalCoverLetterId = 'selected-letter'
+    state.audit = { ...audit(time, true), coverLetterId: 'selected-letter', coverLetterUpdatedAt: time }
+    let releaseLetters = () => {}
+    const lettersGate = new Promise<void>(resolve => { releaseLetters = resolve })
+    let lettersStarted = false
+    await page.route('**/api/jobs/outside-page/cover-letters', async route => {
+      lettersStarted = true
+      if (outcome === 'loading') await lettersGate
+      if (outcome === 'failed') return route.fulfill({ status: 500, json: { error: 'Fixture letter unavailable' } })
+      return route.fulfill({ json: [{ id: 'selected-letter', userId: 'fixture-user', jobId: 'outside-page', resumeId: 'resume-1', content: 'Selected letter', updatedAt: time }] })
+    })
+    const failedResponse = outcome === 'failed' ? page.waitForResponse(response => response.url().endsWith('/cover-letters') && response.status() === 500) : null
+    try {
+      await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+      await expect.poll(() => lettersStarted).toBe(true)
+      if (failedResponse) await failedResponse
+      await page.getByRole('button', { name: /Run independent audit|Run audit again|运行独立审核|再次运行审核/ }).click()
+      await expect(page.getByText(outcome === 'loading' ? /selected cover letter is still loading/i : /selected cover letter could not be loaded/i).first()).toBeVisible()
+      expect(state.writes.filter(write => write.path.endsWith('/audit-application'))).toHaveLength(0)
+      expect(state.job.finalCoverLetterId).toBe('selected-letter')
+    } finally { releaseLetters() }
+  })
+}
+
+for (const outcome of ['failed', 'verified', 'stale'] as const) {
+  test(`Resume re-audit ${outcome} does not reuse the previous passing receipt`, async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop-en', 'Focused Resume audit regression')
+    const state = await install(page)
+    const oldAudit = structuredClone(state.audit)
+    const newAudit = { ...oldAudit, audit: { ...oldAudit.audit, auditedAt: '2026-10-30T10:05:00.000Z', summary: 'New verified audit' } }
+    let postStarted = false
+    let canonicalStarted = false
+    let releasePost = () => {}
+    let releaseCanonical = () => {}
+    const postGate = new Promise<void>(resolve => { releasePost = resolve })
+    const canonicalGate = new Promise<void>(resolve => { releaseCanonical = resolve })
+    await page.route('**/api/jobs/outside-page/audit-application', async route => {
+      if (route.request().method() === 'POST') {
+        postStarted = true
+        await postGate
+        return outcome === 'failed'
+          ? route.fulfill({ status: 502, json: { error: 'Audit response unavailable' } })
+          : route.fulfill({ json: { ...newAudit.audit, resumeUpdatedAt: newAudit.resumeUpdatedAt } })
+      }
+      if (postStarted && outcome !== 'failed') {
+        canonicalStarted = true
+        await canonicalGate
+        return route.fulfill({ json: outcome === 'verified' ? newAudit : oldAudit })
+      }
+      return route.fulfill({ json: oldAudit })
+    })
+    try {
+      await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+      const openConfirmation = page.getByRole('button', { name: /Confirm application materials|确认申请材料/, exact: true })
+      const dialog = page.getByRole('dialog', { name: /Confirm application materials|确认申请材料/ })
+      await openConfirmation.click()
+      await expect(dialog).toContainText(/Application materials selected|已选择申请材料/)
+      await dialog.getByRole('button', { name: /Close final confirmation|关闭最终确认/ }).click()
+      await page.getByRole('button', { name: /Run independent audit|Run audit again|运行独立审核|再次运行审核/ }).click()
+      await expect.poll(() => postStarted).toBe(true)
+      await openConfirmation.click()
+      await expect(dialog).not.toContainText(/Application materials selected|已选择申请材料/)
+      await expect(dialog.getByRole('button', { name: /Download application materials|下载申请材料/ })).toHaveCount(0)
+      await dialog.getByRole('button', { name: /Close final confirmation|关闭最终确认/ }).click()
+      const postResponse = page.waitForResponse(response => response.url().endsWith('/audit-application') && response.request().method() === 'POST')
+      releasePost()
+      await postResponse
+      if (outcome !== 'failed') await expect.poll(() => canonicalStarted).toBe(true)
+      await openConfirmation.click()
+      await expect(dialog).not.toContainText(/Application materials selected|已选择申请材料/)
+      if (outcome === 'verified') {
+        releaseCanonical()
+        await expect(dialog).toContainText(/Application materials selected|已选择申请材料/)
+      } else if (outcome === 'stale') {
+        const staleResponse = page.waitForResponse(response => response.url().endsWith('/audit-application') && response.request().method() === 'GET')
+        releaseCanonical()
+        await staleResponse
+        await expect(dialog).not.toContainText(/Application materials selected|已选择申请材料/)
+        await expect(dialog.getByRole('button', { name: /Download application materials|下载申请材料/ })).toHaveCount(0)
+      } else {
+        await expect(page.getByText('Audit response unavailable').first()).toBeVisible()
+        await expect(dialog.getByRole('button', { name: /Download application materials|下载申请材料/ })).toHaveCount(0)
+      }
+    } finally { releasePost(); releaseCanonical() }
+  })
+}
 
 test('unconfirmed material assignment blocks another assignment and application navigation', async ({ page }, testInfo) => {
   test.skip(testInfo.project.name.startsWith('mobile-'), 'Exercises desktop resume controls')
@@ -2122,6 +2219,112 @@ test('checking an already selected letter preserves its binding', async ({ page 
   expect(state.unexpected).toEqual([])
 })
 
+for (const outcome of ['verified', 'unavailable'] as const) {
+  test(`current audit receipt ${outcome} gates readiness after the resume version changes`, async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop-en', 'Focused audit receipt regression')
+    const state = await install(page, { stale: true })
+    let releaseRead = () => {}
+    const readGate = new Promise<void>(resolve => { releaseRead = resolve })
+    let readStarted = false
+    await page.route('**/api/jobs/outside-page/audit-application', async route => {
+      if (route.request().method() === 'POST') {
+        const body = route.request().postDataJSON() as { resumeId: string; coverLetterId: string | null }
+        state.writes.push({ path: '/api/jobs/outside-page/audit-application', body })
+        state.audit = {
+          ...audit(state.resume.updatedAt),
+          audit: { ...audit().audit, findings: [{ area: 'resume', severity: 'pass', title: 'Verified', evidence: 'Supported', action: 'None' }] },
+        } as typeof state.audit
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...state.audit.audit, resumeUpdatedAt: state.resume.updatedAt }) })
+      }
+      if (state.writes.some(write => write.path === '/api/jobs/outside-page/assign')) {
+        readStarted = true
+        await readGate
+        return route.fulfill({ status: outcome === 'verified' ? 200 : 500, contentType: 'application/json', body: JSON.stringify(outcome === 'verified' ? state.audit : { error: 'Unavailable' }) })
+      }
+      return route.fallback()
+    })
+    try {
+      await open(page)
+      const prepare = page.getByRole('button', { name: /Check current materials|检查当前材料/, exact: true })
+      await expect(prepare).toBeVisible()
+      // The list still contains the older version; the preparation read gets this newer one.
+      state.resume = { ...state.resume, updatedAt: '2026-10-30T12:00:00.000Z' }
+      await prepare.click()
+      await expect.poll(() => readStarted).toBe(true)
+      await expect(page.getByRole('button', { name: /Download application materials|下载申请材料/ })).toHaveCount(0)
+      releaseRead()
+      if (outcome === 'verified') {
+        await expect(page.getByRole('button', { name: /Download application materials|下载申请材料/ })).toBeVisible()
+      } else {
+        await expect(page.getByText(/Preparation could not finish/)).toBeVisible()
+        await expect(page.getByRole('button', { name: /Download application materials|下载申请材料/ })).toHaveCount(0)
+      }
+    } finally { releaseRead() }
+  })
+}
+
+test('a newly failed audit cannot reuse an older passing receipt for the same version', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Focused audit receipt regression')
+  const state = await install(page, { stale: true })
+  state.audit = { ...state.audit, audit: { ...state.audit.audit, findings: [{ area: 'resume', severity: 'pass', title: 'Verified', evidence: 'Supported', action: 'None' }] } } as typeof state.audit
+  await page.route('**/api/jobs/outside-page/audit-application', async route => {
+    if (route.request().method() !== 'POST') return route.fallback()
+    const body = route.request().postDataJSON()
+    state.writes.push({ path: '/api/jobs/outside-page/audit-application', body })
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...state.audit.audit, verdict: 'revise', summary: 'New audit found an issue', findings: [{ area: 'resume', severity: 'warning', title: 'Verify this', evidence: 'Missing support', action: 'Review' }], resumeUpdatedAt: state.resume.updatedAt }) })
+  })
+  await open(page)
+  const prepare = page.getByRole('button', { name: /Check current materials|检查当前材料/, exact: true })
+  await expect(prepare).toBeVisible()
+  // Make the subsequent preparation read match the old passing receipt.
+  state.resume = { ...state.resume, updatedAt: state.audit.resumeUpdatedAt }
+  await prepare.click()
+  await expect(page.getByText('New audit found an issue')).toBeVisible()
+  await expect(page.getByRole('button', { name: /Download application materials|下载申请材料/ })).toHaveCount(0)
+})
+
+test('an older audit read cannot overwrite another tab’s newer audit', async ({ page, context }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Focused audit concurrency regression')
+  const state = await install(page)
+  state.audit = { ...state.audit, audit: { ...state.audit.audit, findings: [{ area: 'resume', severity: 'pass', title: 'Verified', evidence: 'Supported', action: 'None' }] } } as typeof state.audit
+  await open(page)
+  const download = page.getByRole('button', { name: /Download application materials|下载申请材料/ })
+  await expect(download).toBeVisible()
+  let releaseOld = () => {}
+  const oldGate = new Promise<void>(resolve => { releaseOld = resolve })
+  let reads = 0
+  await page.route('**/api/jobs/outside-page/audit-application', async route => {
+    if (route.request().method() !== 'GET') return route.fallback()
+    const read = ++reads
+    const snapshot = structuredClone(state.audit)
+    if (read === 1) await oldGate
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(snapshot) })
+  })
+  const other = await context.newPage()
+  await other.route('**/api/jobs/outside-page/audit-application', async route => {
+    if (route.request().method() !== 'POST') return route.fallback()
+    state.audit = { ...state.audit, audit: { ...state.audit.audit, verdict: 'revise', summary: 'Newer audit', findings: [{ area: 'resume', severity: 'warning', title: 'Verify this', evidence: 'Missing support', action: 'Review' }] } } as typeof state.audit
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(state.audit.audit) })
+  })
+  try {
+    await other.goto(`${origin}/?page=fixture-other`)
+    await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+    await expect.poll(() => reads).toBe(1)
+    await expect(download).toHaveCount(0)
+    expect(await other.evaluate(async () => (await fetch('/api/jobs/outside-page/audit-application', { method: 'POST' })).status)).toBe(200)
+    await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+    await expect.poll(() => reads).toBe(2)
+    await expect(page.getByText('Correct factual issues before applying')).toBeVisible()
+    await expect(download).toHaveCount(0)
+    const oldResponse = page.waitForResponse(response => response.url().endsWith('/audit-application') && response.request().method() === 'GET')
+    releaseOld()
+    await (await oldResponse).finished()
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+    await expect(page.getByText('Correct factual issues before applying')).toBeVisible()
+    await expect(download).toHaveCount(0)
+  } finally { releaseOld(); await other.close() }
+})
+
 for (const scenario of [
   { name: 'resume version changed', version: 'resume-changed', letter: true, accepted: false },
   { name: 'cover letter version changed', version: 'letter-changed', letter: true, accepted: false },
@@ -2478,22 +2681,9 @@ test('late automatic status read after a successful manual record preserves a ne
 })
 
 
-async function pdfText(bytes: Buffer): Promise<string> {
-  const webRequire = createRequire(path.resolve(__dirname, '../apps/web/package.json'))
-  const parser = webRequire.resolve('pdf-parse')
-  return new Promise((resolve, reject) => {
-    const script = `const parse=require(process.argv[1]);const chunks=[];process.stdin.on('data',b=>chunks.push(b));process.stdin.on('end',()=>{const raw=Buffer.concat(chunks);const exact=Uint8Array.from(raw);parse(exact).then(result=>process.stdout.write(result.text)).catch(error=>{console.error(error);process.exitCode=1})})`
-    const child = spawn(process.execPath, ['-e', script, parser], { stdio: ['pipe', 'pipe', 'pipe'] })
-    let output = '', errorOutput = ''
-    child.stdout.on('data', chunk => { output += chunk.toString() })
-    child.stderr.on('data', chunk => { errorOutput += chunk.toString() })
-    child.on('error', reject)
-    child.on('close', code => code === 0 ? resolve(output) : reject(new Error(errorOutput)))
-    child.stdin.end(bytes)
-  })
-}
-
-async function expectApplicationZip(page: Page, selectedLetter: boolean, expectedResumeText = 'Fixture Candidate') {
+// This fixture asserts browser delivery of a synthetic server response; it does not
+// claim that a real server produced a ZIP, a signed audit, or a PDF.
+async function expectApplicationZip(page: Page) {
   const downloadButton = page.getByRole('button', { name: /Download application materials|下载申请材料/ })
   await expect(downloadButton).toBeVisible()
   const downloadPromise = page.waitForEvent('download')
@@ -2502,58 +2692,28 @@ async function expectApplicationZip(page: Page, selectedLetter: boolean, expecte
   expect(download.suggestedFilename()).toMatch(/\.zip$/)
   const file = await download.path()
   expect(file).toBeTruthy()
-  const webRequire = createRequire(path.resolve(__dirname, '../apps/web/package.json'))
-  const JSZip = webRequire('jszip')
-  const archive = await JSZip.loadAsync(await readFile(file!))
-  const names: string[] = Object.keys(archive.files).filter(name => !archive.files[name].dir).sort()
-  expect(names).toEqual([
-    ...(selectedLetter ? ['Fixture Employer/Application flow engineer/CoverLetter.pdf'] : []),
-    'Fixture Employer/Application flow engineer/Resume.pdf',
-    'Fixture Employer/Application flow engineer/meta.json',
-  ])
-  const meta = JSON.parse(await archive.file('Fixture Employer/Application flow engineer/meta.json').async('string'))
-  expect(meta.resume.id).toBe('resume-1')
-  expect(meta.coverLetter?.id ?? null).toBe(selectedLetter ? 'selected-letter' : null)
-  const pdfBytes = await archive.file('Fixture Employer/Application flow engineer/Resume.pdf').async('nodebuffer')
-  expect(pdfBytes.subarray(0, 5).toString()).toBe('%PDF-')
-  expect(await pdfText(pdfBytes)).toContain(expectedResumeText)
-  if (selectedLetter) {
-    const letterBytes = await archive.file('Fixture Employer/Application flow engineer/CoverLetter.pdf').async('nodebuffer')
-    expect(letterBytes.subarray(0, 5).toString()).toBe('%PDF-')
-    expect(await pdfText(letterBytes)).toContain('TypeScript')
-  }
+  expect((await readFile(file!)).toString()).toBe('synthetic server ZIP response')
 }
 
 for (const selectedLetter of [false, true]) {
-  test(`downloads the audited browser ZIP with ${selectedLetter ? 'selected letter' : 'resume only'}`, async ({ page }) => {
+  test(`downloads the mocked application response with ${selectedLetter ? 'selected letter' : 'resume only'}`, async ({ page }) => {
     const state = await install(page, { selectedLetter })
     await open(page)
-    await expectApplicationZip(page, selectedLetter)
+    await expectApplicationZip(page)
+    expect(state.packRequests).toBe(1)
     expect(state.writes).toEqual([])
     expect(state.unexpected).toEqual([])
   })
 }
 
-
-test('browser PDF retains Chinese and European characters using same-origin fonts', async ({ page }) => {
+test('download failure from the server is not reported as a successful download', async ({ page }) => {
   const state = await install(page)
-  state.resume.content.summary = '软件工程师 Élodie Müller'
-  await open(page)
-  await expectApplicationZip(page, false, '软件工程师 Élodie Müller')
-  expect(state.fontRequests).toContain('/fonts/NotoSansSC-GB2312-Regular.ttf')
-  expect(state.fontRequests).toContain('/fonts/NotoSans-Regular.ttf')
-  expect(state.unexpected).toEqual([])
-})
-
-test('browser PDF rejects unsupported characters without a download and explains why', async ({ page }) => {
-  const state = await install(page)
-  state.resume.content.summary = 'Engineer 😀'
+  await page.route('**/api/jobs/outside-page/application-pack', route => route.fulfill({ status: 422, contentType: 'application/json', body: JSON.stringify({ error: 'Use print view for unsupported characters.' }) }))
   await open(page)
   const downloads: string[] = []
   page.on('download', item => downloads.push(item.suggestedFilename()))
   await page.getByRole('button', { name: /Download application materials|下载申请材料/ }).click()
   await expect(page.getByText(/Some characters cannot be included in the PDF|PDF 暂不支持部分字符/)).toBeVisible()
-  await expect(page.getByText(/use a tool that supports those characters|使用支持这些字符的工具导出/)).toBeVisible()
   expect(downloads).toEqual([])
   expect(state.writes).toEqual([])
   expect(state.unexpected).toEqual([])
@@ -2605,7 +2765,7 @@ test('complete manual journey keeps one application through discovery, editing, 
   expect(manualWrites()).toEqual([])
   await page.getByRole('button', { name: /Check current materials|检查当前材料/, exact: true }).click()
   await expect.poll(() => state.writes.filter(write => write.path.endsWith('/audit-application')).length).toBe(2)
-  await expectApplicationZip(page, false)
+  await expectApplicationZip(page)
   expect(manualWrites()).toEqual([])
   const popupPromise = page.waitForEvent('popup')
   await page.getByRole('button', { name: /Open employer website|前往雇主网站/, exact: true }).click()

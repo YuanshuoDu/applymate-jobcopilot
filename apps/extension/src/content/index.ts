@@ -9,13 +9,15 @@ import { startListModeInjector, isJobListPage, markJobSaved } from './list-injec
 import { tryInjectAutoFillButton, removeAutoFillButton, applyFieldValues, updateButtonState } from './form-injector'
 import { findDetailActionHost, mountDetailButtonContainer } from './detail-button-placement'
 import { detectAndScanForms } from '../lib/form-filler/detectors/detect'
-import { generateId } from '../lib/form-filler/form-scanner'
+import { scanShadowRoots } from '../lib/form-filler/form-scanner'
+import { readCurrentFieldValues } from '../lib/form-filler/live-fields'
 import { openUploadPicker } from '../lib/form-filler/auto-fill'
 import type { ExtensionSettings, SavedJob, ScrapedJob } from '@/lib/types'
 import { isJobReadyForTailoring, mergeJobDetails } from '@/lib/job-quality'
 import { getJobIdentity, isSameJob } from '@/lib/job-identity'
 import { sendRuntimeMessage } from '@/lib/runtime-messaging'
 import { getExtensionLanguage, translateExtension } from '@/lib/i18n'
+import { isPublicReviewJobPage } from './page-scope'
 
 function uiText(english: string): string {
   return translateExtension(getExtensionLanguage(), english)
@@ -54,8 +56,9 @@ const TOAST_ID    = 'applymate-toast'
 
 // The dashboard only needs auth synchronisation. Workday supports both job
 // discovery and form fill, so it must use the normal job-page bootstrap.
+const IS_PUBLIC_REVIEW_JOB_PAGE = isPublicReviewJobPage(window.location.href)
 const IS_DASHBOARD_PAGE =
-  window.location.hostname === 'applymate.site'
+  window.location.hostname === 'applymate.site' && !IS_PUBLIC_REVIEW_JOB_PAGE
 const IS_KNOWN_JOB_PAGE = [
   /(^|\.)linkedin\.com$/i,
   /(^|\.)indeed\.[a-z.]+$/i,
@@ -76,13 +79,12 @@ const IS_KNOWN_JOB_PAGE = [
   /(^|\.)arbeitsagentur\.de$/i,
   /(^|\.)jobs\.de$/i,
   /(^|\.)irishjobs\.ie$/i,
-].some(pattern => pattern.test(window.location.hostname)) ||
+].some(pattern => pattern.test(window.location.hostname)) || IS_PUBLIC_REVIEW_JOB_PAGE ||
   window.location.hostname === 'localhost' ||
-  window.location.hostname === '127.0.0.1' ||
-  window.location.hostname === 'web-delta-ruddy-29.vercel.app'
+  window.location.hostname === '127.0.0.1'
 
 // Generic company pages are injected on demand for form fill only. Keep the
-// job-board bootstrap limited to known sources so optional all-site access
+// job-board bootstrap limited to known sources so optional site access
 // never causes job scraping UI to appear on unrelated websites.
 let SHOULD_BOOTSTRAP_JOB_UI =
   IS_KNOWN_JOB_PAGE && !IS_DASHBOARD_PAGE
@@ -585,10 +587,9 @@ if (SHOULD_BOOTSTRAP_JOB_UI) {
 // ── Form Filler: Listen for scan & fill commands ──────────────────
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'ENABLE_JOB_SCRAPING') {
-    // Optional all-site access is granted by the Side Panel before this
-    // command is sent. Unknown company pages start with form-fill only and
-    // are promoted to the full job scraper only after that explicit grant.
-    if (!SHOULD_BOOTSTRAP_JOB_UI) {
+    // Compatibility command for older panels. Dashboard pages must never
+    // bootstrap job scraping even if an older panel sends this message.
+    if (!IS_DASHBOARD_PAGE && !SHOULD_BOOTSTRAP_JOB_UI) {
       SHOULD_BOOTSTRAP_JOB_UI = true
       void init()
       setTimeout(scheduleRetry, 1500)
@@ -666,7 +667,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === 'SCAN_FORM') {
-    const result = detectAndScanForms()
+    // A document-bound scan must not recurse into other iframe documents.
+    const result = msg.frameOnly
+      ? { fields: scanShadowRoots(), source: 'selected-frame', formCount: document.forms.length }
+      : detectAndScanForms()
     if (result && result.fields.length > 0) {
       const types = result.fields.reduce((acc, f) => { acc[f.type] = (acc[f.type] ?? 0) + 1; return acc }, {} as Record<string, number>)
       log('Form scan:', result.fields.length, 'fields on', result.source, '|', JSON.stringify(types))
@@ -761,7 +765,7 @@ if (IS_DASHBOARD_PAGE) {
 // Dashboard logout clears extension auth. Login is intentionally one-way:
 // an old extension token must never replace the active dashboard account.
 window.addEventListener('message', (e) => {
-  if (e.origin !== window.location.origin) return
+  if (!IS_DASHBOARD_PAGE || e.source !== window || e.origin !== window.location.origin) return
   if (e.data?.type === 'DASHBOARD_LOGOUT') {
     log('Dashboard logged out — clearing extension auth')
     const syncStorage = getSyncStorage()
@@ -1189,39 +1193,6 @@ function showToast(message: string, duration = 4000) {
   document.body.appendChild(toast)
   requestAnimationFrame(() => { toast.style.opacity = '1' })
   setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 300) }, duration)
-}
-
-// ── Read current form field values (for persona refresh) ────────────────
-
-const FIELD_S = 'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="reset"]), ' +
-  'textarea, select, [contenteditable="true"]'
-
-function readCurrentFieldValues(fieldIds: string[]): Array<{ fieldId: string; value: string }> {
-  const results: Array<{ fieldId: string; value: string }> = []
-  const targetIds = new Map(fieldIds.map(fieldId => [fieldId.replace(/^frame\|\d+\|/, '').replace(/^iframe\|[^|]+\|/, ''), fieldId]))
-  const docs: Document[] = [document]
-  for (const iframe of Array.from(document.querySelectorAll('iframe'))) {
-    try { const d = iframe.contentDocument; if (d) docs.push(d) } catch { /* x-origin */ }
-  }
-  for (const doc of docs) {
-    for (const el of Array.from(doc.querySelectorAll(FIELD_S))) {
-      const ht = el as HTMLElement
-      const gid = generateId(ht)
-      const originalId = targetIds.get(gid)
-      if (originalId) {
-        const tag = ht.tagName.toLowerCase()
-        const type = (ht as HTMLInputElement).type ?? ''
-        let val = ''
-        if (tag === 'select') { const s = ht as HTMLSelectElement; val = s.options[s.selectedIndex]?.text ?? s.value }
-        else if (type === 'checkbox') { val = (ht as HTMLInputElement).checked ? 'true' : 'false' }
-        else if (type === 'radio') { val = (ht as HTMLInputElement).checked ? ((ht as HTMLInputElement).value || 'true') : '' }
-        else if (ht.getAttribute('contenteditable') === 'true') { val = ht.textContent ?? '' }
-        else { val = (ht as HTMLInputElement).value ?? '' }
-        results.push({ fieldId: originalId, value: val })
-      }
-    }
-  }
-  return results
 }
 
 // ── Debug tool injected into MAIN world (accessible from devtools console) ──

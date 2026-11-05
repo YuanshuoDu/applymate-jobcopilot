@@ -118,10 +118,11 @@ import { UploadResumeModal } from '@/components/resume/UploadResumeModal'
 import { ResumeIntakeDialog } from '@/components/resume/ResumeIntakeDialog'
 import type { DragHandleProps } from '@/components/resume/SectionHeader'
 import type { AiFieldContext } from '@/components/resume/AiFieldSuggestion'
+import { BundleUnsupportedPdfError, downloadAuditedApplicationBundle } from '@/lib/bundle'
 import { downloadResumePdf } from '@/lib/resume-export'
 import { analysisTargetKey, replaceSectionSuggestions, shouldPreserveAnalysis } from '@/lib/resume-analysis-state'
 import { formatResumeChangeValue, type ResumeChange, type ResumeChangeSection, type ResumeChangeSource } from '@/lib/resume-change-diff'
-import { targetForAuditFinding } from '@/lib/application-audit'
+import { hasCurrentApplicationPackAudit, targetForAuditFinding } from '@/lib/application-audit'
 
 const AI_SUGGESTION_SECTIONS = ['summary', 'skills', 'experience', 'education', 'projects'] as const
 type AiSuggestionSection = (typeof AI_SUGGESTION_SECTIONS)[number]
@@ -816,6 +817,8 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   const [linkWriteState, setLinkWriteState] = useState<'idle' | 'pending' | 'unknown'>('idle')
   const confirmationWriteRef = useRef<'idle' | 'pending' | 'unknown'>('idle')
   const [confirmationWriteState, setConfirmationWriteState] = useState<'idle' | 'pending' | 'unknown'>('idle')
+  const [downloadingPack, setDownloadingPack] = useState(false)
+  const downloadingPackRef = useRef(false)
   const [showNewResume,   setShowNewResume]   = useState(false)
   const [renamingResume,  setRenamingResume]  = useState<ResumeListItem | null>(null)
   const [showUploadModal,   setShowUploadModal]   = useState(false)
@@ -1931,13 +1934,27 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   }
   const templateName = TEMPLATES.find(template => template.id === templateId)?.name ?? templateId
   const pendingSuggestions = suggestions.filter(suggestion => !isAuditSuggestion(suggestion) && !suggestion.applied).length
-  const { data: linkedCoverLetters, refetch: refetchLinkedCoverLetters } = useApi<CoverLetter[]>(`/api/jobs/${resumeLinkedJob?.id ?? '__none__'}/cover-letters`)
+  const { data: linkedCoverLetters, loading: linkedLettersLoading, error: linkedLettersError, refetch: refetchLinkedCoverLetters } = useApi<CoverLetter[]>(`/api/jobs/${resumeLinkedJob?.id ?? '__none__'}/cover-letters`, {
+    cache: false,
+    enabled: Boolean(resumeUserId && resumeLinkedJob && resumeLinkedJob.userId === resumeUserId),
+  })
   const finalCoverLetter = resumeLinkedJob && selectedResumeId ? selectApplicationCoverLetter({
     jobId: resumeLinkedJob.id,
     resumeId: selectedResumeId,
     finalResumeId: resumeLinkedJob.finalResumeId,
     finalCoverLetterId: resumeLinkedJob.finalCoverLetterId,
-  }, linkedCoverLetters ?? [], latestSavedCoverLetter) : null
+  }, Array.isArray(linkedCoverLetters) ? linkedCoverLetters : [], latestSavedCoverLetter) : null
+  const selectedLetterId = resumeLinkedJob?.finalCoverLetterId ?? null
+  const loadedSelectedLetter = Array.isArray(linkedCoverLetters) && selectedLetterId
+    ? linkedCoverLetters.find(letter => letter.id === selectedLetterId && letter.userId === resumeUserId && letter.jobId === resumeLinkedJob?.id
+      && typeof letter.content === 'string' && letter.content.trim().length > 0 && typeof letter.updatedAt === 'string' && Number.isFinite(Date.parse(letter.updatedAt))) ?? null
+    : null
+  const selectedLetterVerified = !selectedLetterId || Boolean(!linkedLettersLoading && !linkedLettersError && loadedSelectedLetter
+    && finalCoverLetter?.id === selectedLetterId && finalCoverLetter.userId === resumeUserId
+    && finalCoverLetter.jobId === resumeLinkedJob?.id && finalCoverLetter.updatedAt === loadedSelectedLetter.updatedAt)
+  const selectedLetterVerificationRef = useRef({ key: '', verified: false })
+  const selectedLetterVerificationKey = JSON.stringify([resumeUserId, resumeLinkedJob?.id ?? null, selectedLetterId, loadedSelectedLetter?.updatedAt ?? null])
+  selectedLetterVerificationRef.current = { key: selectedLetterVerificationKey, verified: selectedLetterVerified }
   const auditLetterScopeRef = useRef({ key: '', generation: 0 })
   const auditLetterScopeKey = JSON.stringify([finalCoverLetter?.id ?? null, finalCoverLetter?.updatedAt ?? null])
   if (auditLetterScopeRef.current.key !== auditLetterScopeKey) {
@@ -1952,25 +1969,47 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     return auditMaterialScopeRef.current
   }
   syncAuditMaterialScope()
+  // An uncertain audit write must not revive the previous passing receipt.
+  // Keep the fence per account and material selection, even when the
+  // user navigates away and returns to this selection.
+  type AuditFence = { epoch: number; expected: ApplicationAudit | null }
+  const auditFencesRef = useRef<Record<string, AuditFence>>({})
+  const auditFenceEpochRef = useRef(0)
+  const [auditFenceRevision, setAuditFenceRevision] = useState(0)
+  const auditFenceKey = JSON.stringify([resumeUserId, resumeLinkedJob?.id ?? null, selectedResumeId, finalCoverLetter?.id ?? null])
+  const auditFence = auditFencesRef.current[auditFenceKey]
   const [storedAuditScope, setStoredAuditScope] = useState<{ jobId: string; userId: string; generation: number; record: StoredApplicationAudit | null } | null>(null)
   const auditScopeGeneration = confirmationScopeRef.current.generation
   useEffect(() => {
     const jobId = resumeLinkedJob?.id
     const userId = resumeUserId
     if (!jobId || !userId || !resumeLinkedJob || resumeLinkedJob.userId !== userId) return
+    const fenceAtStart = auditFencesRef.current[auditFenceKey]
+    if (fenceAtStart && !fenceAtStart.expected) return
     const controller = new AbortController()
     void fetch(`/api/jobs/${encodeURIComponent(jobId)}/audit-application`, { signal: controller.signal })
       .then(response => { if (!response.ok) throw new Error('Audit unavailable'); return response.json() as Promise<StoredApplicationAudit | null> })
       .then(record => {
-        if (!controller.signal.aborted && confirmationScopeRef.current.generation === auditScopeGeneration) {
-          setStoredAuditScope({ jobId, userId, generation: auditScopeGeneration, record })
+        if (controller.signal.aborted || confirmationScopeRef.current.generation !== auditScopeGeneration
+          || auditFencesRef.current[auditFenceKey]?.epoch !== fenceAtStart?.epoch) return
+        if (fenceAtStart) {
+          const expected = fenceAtStart.expected
+          if (!expected || !record || record.audit.auditedAt !== expected.auditedAt
+            || record.audit.verdict !== expected.verdict || record.audit.summary !== expected.summary
+            || record.audit.matchScore !== expected.matchScore || record.audit.source !== expected.source
+            || JSON.stringify(record.audit.findings) !== JSON.stringify(expected.findings)
+            || !auditMatchesCurrentMaterials(record, selectedResumeId, finalCoverLetter?.id ?? null,
+              selectedResumeUpdatedAt, finalCoverLetter?.updatedAt ?? null, dirty || saving)) return
+          delete auditFencesRef.current[auditFenceKey]
+          setAuditFenceRevision(value => value + 1)
         }
+        setStoredAuditScope({ jobId, userId, generation: auditScopeGeneration, record })
       }).catch(() => { /* An unavailable audit is not a passing audit. */ })
     return () => controller.abort()
-  }, [resumeLinkedJob?.id, resumeUserId, auditScopeGeneration])
-  const storedApplicationAudit = storedAuditScope && resumeLinkedJob && storedAuditScope.jobId === resumeLinkedJob.id && storedAuditScope.userId === resumeUserId
+  }, [resumeLinkedJob?.id, resumeLinkedJob?.finalResumeId, resumeLinkedJob?.finalCoverLetterId, resumeUserId, auditScopeGeneration, latestApplicationAudit?.audit.auditedAt, auditFenceKey, auditFenceRevision, dirty, saving])
+  const storedApplicationAudit = !auditFence && storedAuditScope && resumeLinkedJob && storedAuditScope.jobId === resumeLinkedJob.id && storedAuditScope.userId === resumeUserId
     && storedAuditScope.generation === auditScopeGeneration ? storedAuditScope.record : null
-  const scopedLatestApplicationAudit = latestApplicationAudit && resumeLinkedJob && latestApplicationAudit.jobId === resumeLinkedJob.id && latestApplicationAudit.userId === resumeUserId
+  const scopedLatestApplicationAudit = !auditFence && latestApplicationAudit && resumeLinkedJob && latestApplicationAudit.jobId === resumeLinkedJob.id && latestApplicationAudit.userId === resumeUserId
     && latestApplicationAudit.scopeGeneration === auditScopeGeneration ? latestApplicationAudit : null
   const currentApplicationAuditRecord = auditMatchesCurrentMaterials(
     scopedLatestApplicationAudit,
@@ -1999,6 +2038,8 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   const applicationMaterialsConfirmed = Boolean(
     currentApplicationAudit?.verdict === 'pass'
     && !dirty && !saving
+    && resumeLinkedJob && selectedResume
+    && hasCurrentApplicationPackAudit(storedApplicationAudit, resumeLinkedJob, selectedResume, finalCoverLetter ?? null)
     && resumeLinkedJob?.finalResumeId === selectedResumeId
     && (resumeLinkedJob?.finalCoverLetterId ?? null) === (finalCoverLetter?.id ?? null),
   )
@@ -2061,6 +2102,13 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     }
     const owner = resumeUserIdRef.current
     if (!owner || resumeLinkedJob.userId !== owner) return null
+    if (!selectedLetterVerified) {
+      const message = t(linkedLettersLoading ? 'application.selectedLetterLoading' : 'application.selectedLetterUnavailable')
+      setAuditError(message)
+      toast.info(message)
+      return null
+    }
+    const requestSelectedLetterKey = selectedLetterVerificationKey
     const scope = confirmationScopeRef.current
     const requestLetterScope = auditLetterScopeRef.current
     const isCurrent = () => mountedRef.current && resumeUserIdRef.current === owner
@@ -2078,19 +2126,36 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       const saved = await handleSave()
       if (!saved || !isCurrent() || requestLetterScope !== auditLetterScopeRef.current) return null
     }
+    if (!selectedLetterVerificationRef.current.verified || selectedLetterVerificationRef.current.key !== requestSelectedLetterKey) {
+      const message = t('application.selectedLetterUnavailable')
+      setAuditError(message)
+      toast.info(message)
+      return null
+    }
     const requestMaterials = syncAuditMaterialScope()
     const requestEditRevision = editRevisionRef.current
+    const requestFenceKey = auditFenceKey
+    const requestFenceEpoch = ++auditFenceEpochRef.current
+    auditFencesRef.current[requestFenceKey] = { epoch: requestFenceEpoch, expected: null }
+    setAuditFenceRevision(value => value + 1)
+    setShowFinalConfirm(false)
     const { data, error } = await apiMutate<ApplicationAuditResponse>(`/api/jobs/${resumeLinkedJob.id}/audit-application`, 'POST', {
       resumeId: selectedResumeId,
       ...(finalCoverLetter ? { coverLetterId: finalCoverLetter.id } : {}),
     })
-    if (!isCurrent() || requestEditRevision !== editRevisionRef.current || requestMaterials !== syncAuditMaterialScope() || dirtyRef.current || isSavingRef.current) return null
+    if (!isCurrent() || !selectedLetterVerificationRef.current.verified || selectedLetterVerificationRef.current.key !== requestSelectedLetterKey
+      || requestEditRevision !== editRevisionRef.current || requestMaterials !== syncAuditMaterialScope() || dirtyRef.current || isSavingRef.current) return null
     if (!data || error) {
       const message = error ?? 'Please try again'
       setAuditError(message)
       toast.error('Audit could not run', message)
       return null
     }
+    if (!Number.isFinite(Date.parse(data.auditedAt))) return null
+    const { resumeUpdatedAt: _resumeUpdatedAt, coverLetterUpdatedAt: _coverLetterUpdatedAt, _model: _ignoredModel, ...expectedAudit } = data as ApplicationAuditResponse & { _model?: string }
+    if (auditFencesRef.current[requestFenceKey]?.epoch !== requestFenceEpoch) return null
+    auditFencesRef.current[requestFenceKey] = { epoch: requestFenceEpoch, expected: expectedAudit }
+    setAuditFenceRevision(value => value + 1)
     setAuditError(null)
     setLatestApplicationAudit({
       jobId: resumeLinkedJob.id,
@@ -2337,6 +2402,34 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
         setConfirmationWriteState(confirmationWriteRef.current)
         if (!verified) setShowFinalConfirm(false)
       }
+    }
+  }
+
+  async function downloadApplicationPack() {
+    const owner = resumeUserIdRef.current
+    const job = resumeLinkedJob
+    if (!owner || !job || job.userId !== owner || !applicationMaterialsConfirmed || downloadingPackRef.current) return
+    const scope = confirmationScopeRef.current
+    const resumeId = selectedResumeId
+    const revision = editRevisionRef.current
+    const isCurrent = () => mountedRef.current && resumeUserIdRef.current === owner
+      && confirmationScopeRef.current.generation === scope.generation
+      && confirmationScopeRef.current.jobId === job.id && selectedResumeIdRef.current === resumeId
+      && editRevisionRef.current === revision && !dirtyRef.current && !isSavingRef.current
+    if (!isCurrent()) return
+    downloadingPackRef.current = true
+    setDownloadingPack(true)
+    try {
+      await downloadAuditedApplicationBundle(job.id, owner, isCurrent)
+      if (isCurrent()) toast.success('Download started')
+    } catch (error) {
+      if (isCurrent()) {
+        if (error instanceof BundleUnsupportedPdfError) toast.error(t('application.downloadUnsupportedTitle'), `${t('application.downloadUnsupportedDetail')} ${t('jobs.pack.printView')}`)
+        else toast.error(t('application.downloadFailed'), t('application.downloadRetry'))
+      }
+    } finally {
+      downloadingPackRef.current = false
+      if (mountedRef.current) setDownloadingPack(false)
     }
   }
 
@@ -3013,6 +3106,8 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
           }}
           onConfirm={confirmApplicationPack}
           onOpenApplication={() => { if (resumeLinkedJob) void returnToApplication(resumeLinkedJob.id) }}
+          onDownload={downloadApplicationPack}
+          downloadingPack={downloadingPack}
         />
       )}
       {renamingResume && <RenameResumeModal resume={renamingResume} onClose={() => setRenamingResume(null)} onRename={name => handleRenameResume(renamingResume, name)} />}

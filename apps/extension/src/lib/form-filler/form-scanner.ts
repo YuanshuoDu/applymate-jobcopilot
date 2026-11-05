@@ -1,4 +1,5 @@
 import type { FormFieldSchema } from './types'
+import { isSensitiveFormField, readStaticFormLabel, readFormValueText } from './field-safety'
 
 /**
  * Aggressive full-page form scanner.
@@ -72,7 +73,7 @@ function deepScanCustomWidgets(fields: FormFieldSchema[], seen: Set<string>): vo
     )
     let label = ''
     for (const lc of labelCandidates) {
-      const t = (lc.textContent ?? '').replace(/\s+/g, ' ').trim()
+      const t = readStaticFormLabel(lc).replace(/\s+/g, ' ').trim()
       if (t.length > 1 && t.length < 200 && !t.match(/^(save|submit|cancel|back|next|clear|reset)$/i)) {
         label = t
         break
@@ -80,7 +81,7 @@ function deepScanCustomWidgets(fields: FormFieldSchema[], seen: Set<string>): vo
     }
     if (!label) {
       // Use the block's first significant text as label
-      const text = (block.textContent ?? '').replace(/\s+/g, ' ').trim()
+      const text = readStaticFormLabel(block).replace(/\s+/g, ' ').trim()
       if (text.length > 2 && text.length < 200) label = text
       else continue
     }
@@ -105,7 +106,7 @@ function deepScanCustomWidgets(fields: FormFieldSchema[], seen: Set<string>): vo
       type: 'textarea',
       label,
       required: !!block.querySelector('[aria-required="true"], .required, [class*="required"]'),
-      surroundingText: (block.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 250),
+      surroundingText: '',
     })
   }
 }
@@ -208,7 +209,7 @@ export function classifyElement(el: HTMLElement): FormFieldSchema | null {
     placeholder,
     options,
     required: isRequired,
-    surroundingText: extractSurroundingText(el),
+    surroundingText: '',
     groupName,
     currentValue: readCurrentValue(el),
   }
@@ -268,15 +269,13 @@ export function extractLabel(el: HTMLElement): string {
   const elId = el.getAttribute('id')
   if (elId) {
     const labelEl = document.querySelector<HTMLLabelElement>(`label[for="${CSS.escape(elId)}"]`)
-    if (labelEl) return clean(labelEl.textContent ?? '')
+    if (labelEl) return clean(readStaticFormLabel(labelEl))
   }
 
   // 2. Parent <label> wrapping
   const parentLabel = el.closest('label')
   if (parentLabel) {
-    const text = parentLabel.textContent ?? ''
-    const inputValue = (el as HTMLInputElement).value || ''
-    return clean(inputValue ? text.replace(inputValue, '') : text)
+    return clean(readStaticFormLabel(parentLabel))
   }
 
   // 3. aria-label / aria-labelledby
@@ -286,7 +285,7 @@ export function extractLabel(el: HTMLElement): string {
   const labelledBy = el.getAttribute('aria-labelledby')
   if (labelledBy) {
     const labelEl = document.getElementById(labelledBy.split(/\s+/)[0])
-    if (labelEl) return clean(labelEl.textContent ?? '')
+    if (labelEl) return clean(readStaticFormLabel(labelEl))
   }
 
   // 4. Placeholder
@@ -304,7 +303,7 @@ export function extractLabel(el: HTMLElement): string {
   // 7. Previous sibling text node
   const prevEl = el.previousElementSibling
   if (prevEl && prevEl.tagName !== 'INPUT' && prevEl.tagName !== 'TEXTAREA' && prevEl.tagName !== 'SELECT') {
-    const t = (prevEl.textContent ?? '').trim()
+    const t = readStaticFormLabel(prevEl).trim()
     if (t.length > 0 && t.length < 100) return clean(t)
   }
 
@@ -331,7 +330,7 @@ function findAdjacentText(el: HTMLElement): string | null {
       const candidates = parent.querySelectorAll(sel)
       for (const c of candidates) {
         if (!c.contains(el)) {
-          const t = (c.textContent ?? '').replace(/\s+/g, ' ').trim()
+          const t = readStaticFormLabel(c).replace(/\s+/g, ' ').trim()
           if (t.length > 1 && t.length < 120) return t
         }
       }
@@ -339,7 +338,7 @@ function findAdjacentText(el: HTMLElement): string | null {
   }
 
   // If parent is small enough, just use its text (minus input value)
-  const parentText = (parent.textContent ?? '').replace(/\s+/g, ' ').trim()
+  const parentText = readStaticFormLabel(parent).replace(/\s+/g, ' ').trim()
   if (parentText.length > 2 && parentText.length < 150) {
     return parentText
   }
@@ -402,18 +401,6 @@ function extractCheckboxOptions(name: string): string[] | undefined {
   return opts.length > 0 ? opts : undefined
 }
 
-// ── Surrounding Text ──────────────────────────────────────────
-
-function extractSurroundingText(el: HTMLElement): string {
-  const container = el.closest(
-    'div, fieldset, li, .form-group, .field, .application-field, .question, [class*="form"]',
-  ) ?? el.parentElement
-  if (!container) return ''
-
-  const text = (container.textContent ?? '').replace(/\s+/g, ' ').trim()
-  return text.length > 250 ? text.slice(0, 250) + '...' : text
-}
-
 /** Read the current user-filled value from a form element */
 function readCurrentValue(el: HTMLElement): string | undefined {
   if (isSensitiveField(el, extractLabel(el))) return undefined
@@ -440,23 +427,23 @@ function readCurrentValue(el: HTMLElement): string | undefined {
     return extractLabel(el) || (el as HTMLInputElement).value || undefined
   }
   if (el.getAttribute('contenteditable') === 'true') {
-    const text = (el.textContent ?? '').trim()
+    const text = readFormValueText(el).trim()
     return text || undefined
   }
   const val = (el as HTMLInputElement).value?.trim()
   return val || undefined
 }
 
-const SENSITIVE_FIELD = /password|passcode|one[-\s]?time|otp|token|secret|security[\s_-]?code|verification[\s_-]?code|cvv|cvc|card[\s_-]?number|social[\s_-]?security|\bssn\b|\bpin\b/i
-
 function isSensitiveField(el: HTMLElement, label: string): boolean {
-  const type = (el.getAttribute('type') ?? '').toLowerCase()
-  if (type === 'password') return true
-  const metadata = [
-    el.getAttribute('name'), el.getAttribute('id'), el.getAttribute('autocomplete'),
-    el.getAttribute('placeholder'), el.getAttribute('aria-label'), label,
-  ].filter(Boolean).join(' ')
-  return SENSITIVE_FIELD.test(metadata)
+  return isSensitiveFormField({
+    type: el.getAttribute('type') ?? '',
+    name: el.getAttribute('name') ?? '',
+    id: el.getAttribute('id') ?? '',
+    autocomplete: el.getAttribute('autocomplete') ?? '',
+    placeholder: el.getAttribute('placeholder') ?? '',
+    ariaLabel: el.getAttribute('aria-label') ?? '',
+    label,
+  })
 }
 
 // ── Shadow DOM ────────────────────────────────────────────────
@@ -605,7 +592,7 @@ function classifyElementInDoc(el: HTMLElement, doc: Document): FormFieldSchema |
     placeholder,
     options,
     required: isRequired,
-    surroundingText: extractSurroundingTextInDoc(el, doc),
+    surroundingText: '',
     groupName,
     currentValue: readCurrentValue(el),
   }
@@ -615,12 +602,11 @@ function extractLabelInDoc(el: HTMLElement, doc: Document): string {
   const elId = el.getAttribute('id')
   if (elId) {
     const labelEl = doc.querySelector<HTMLLabelElement>(`label[for="${CSS.escape(elId)}"]`)
-    if (labelEl) return clean(labelEl.textContent ?? '')
+    if (labelEl) return clean(readStaticFormLabel(labelEl))
   }
   const parentLabel = el.closest('label')
   if (parentLabel) {
-    const text = parentLabel.textContent ?? ''
-    return clean(text)
+    return clean(readStaticFormLabel(parentLabel))
   }
   const ariaLabel = el.getAttribute('aria-label')
   if (ariaLabel) return clean(ariaLabel)
@@ -633,13 +619,6 @@ function extractLabelInDoc(el: HTMLElement, doc: Document): string {
 
 function generateIdInDoc(el: HTMLElement, _doc: Document): string {
   return generateId(el) // Reuse main ID generation (DOM-path based)
-}
-
-function extractSurroundingTextInDoc(el: HTMLElement, _doc: Document): string {
-  const container = el.closest('div, fieldset, li, .form-group, .field')
-  if (!container) return ''
-  const text = (container.textContent ?? '').replace(/\s+/g, ' ').trim()
-  return text.length > 250 ? text.slice(0, 250) + '...' : text
 }
 
 // ── CAPTCHA ───────────────────────────────────────────────────

@@ -21,6 +21,13 @@ if (!bgFirstLine.startsWith('import ')) {
 
 // Read source manifest
 const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'manifest.json'), 'utf-8'))
+// Keep development dashboard access out of the store package. The Vite watch
+// command and an explicit development mode add only the documented loopback APIs.
+if (process.env.APPLYMATE_EXTENSION_BUILD_MODE === 'development') {
+  const developmentOrigins = ['http://localhost:3000/*', 'http://localhost:5173/*']
+  manifest.content_scripts[0].matches.push(...developmentOrigins)
+  manifest.host_permissions.push(...developmentOrigins)
+}
 
 // Remove old src dir from Vite
 const srcDir = path.join(DIST, 'src')

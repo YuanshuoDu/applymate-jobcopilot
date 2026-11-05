@@ -39,6 +39,8 @@ function renderDialog(initialAudit: ApplicationAudit | null, coverLetterContent:
       onReviewAudit={vi.fn()}
       onConfirm={vi.fn().mockResolvedValue(true)}
       onOpenApplication={vi.fn()}
+      onDownload={vi.fn().mockResolvedValue(undefined)}
+      downloadingPack={false}
       {...overrides}
     />,
   )
@@ -74,6 +76,8 @@ describe('FinalConfirmDialog audit state', () => {
     expect(markup).toContain('Optional — no cover letter selected')
     expect(markup).not.toMatch(/class="final-confirm-primary" disabled=""/)
     expect(markup).not.toContain('is-checking')
+    expect(markup).not.toContain('Download application pack (ZIP)')
+    expect(markup).not.toContain('/api/jobs/job-1/application-pack')
   })
 
   it.each([
@@ -91,6 +95,21 @@ describe('FinalConfirmDialog audit state', () => {
 
     expect(markup).not.toContain('class="final-confirm-ready"')
     expect(markup).not.toContain('final-material-preview')
+    expect(markup).not.toContain('/api/jobs/job-1/application-pack')
     expect(markup).toMatch(/class="final-confirm-primary" disabled=""/)
+  })
+
+  it('keeps return to the application primary while offering the audited package', () => {
+    const markup = renderDialog(audit)
+
+    expect(markup).toMatch(/class="final-confirm-primary"[^>]*>.*View (?:this )?application/i)
+    expect(markup).toContain('/api/jobs/job-1/application-pack')
+    expect(markup).toContain('Download application pack (ZIP)')
+  })
+
+  it('hides download and print when the audit is not passing, even if packReady is set', () => {
+    const markup = renderDialog({ ...audit, verdict: 'needs_review' }, null, { packReady: true })
+    expect(markup).not.toContain('Download application pack (ZIP)')
+    expect(markup).not.toContain('/api/jobs/job-1/application-pack')
   })
 })

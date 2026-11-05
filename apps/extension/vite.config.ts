@@ -3,12 +3,15 @@ import react from '@vitejs/plugin-react'
 import path from 'path'
 import { execSync } from 'child_process'
 
-function postBuild() {
+function postBuild(development: boolean) {
   return {
     name: 'postbuild',
     closeBundle() {
       try {
-        execSync('node build.cjs', { cwd: __dirname, stdio: 'inherit' })
+        execSync('node build.cjs', {
+          cwd: __dirname, stdio: 'inherit',
+          env: { ...process.env, APPLYMATE_EXTENSION_BUILD_MODE: development ? 'development' : 'production' },
+        })
       } catch (e) {
         console.error('postbuild error:', e)
         throw e
@@ -17,8 +20,8 @@ function postBuild() {
   }
 }
 
-export default defineConfig({
-  plugins: [react(), postBuild()],
+export default defineConfig(({ mode }) => ({
+  plugins: [react(), postBuild(mode === 'development' || process.argv.includes('--watch'))],
   resolve: {
     alias: {
       '@': path.resolve(__dirname, 'src'),
@@ -48,4 +51,4 @@ export default defineConfig({
       },
     },
   },
-})
+}))

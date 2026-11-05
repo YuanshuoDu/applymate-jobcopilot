@@ -32,7 +32,8 @@ import {
 import { getCurrentJob } from '@/lib/storage'
 import { isSameJob } from '@/lib/job-identity'
 import {
-  exportApplicationPackLocally,
+  downloadApplicationPack,
+  openApplicationPackPrint,
   getDashboard,
   prepareApplicationPack,
   scoreSavedJob,
@@ -662,13 +663,13 @@ function JobCard({ job, expanded, onToggle, settings, onScore, scoring, onPrepar
   const hasCoverLetter = Boolean(job.finalCoverLetterId)
   const packReady = hasResume && hasCoverLetter
 
-  async function handlePackDownload() {
+  async function handlePackDownload(printView = false) {
     if (!packReady || packExporting) return
     setPackExporting(true)
     setPackError('')
     try {
-      const result = await exportApplicationPackLocally(settings, job.id, true)
-      if (!result.opened) setPackError('Could not open the job folder')
+      if (printView) await openApplicationPackPrint(settings, job.id)
+      else await downloadApplicationPack(settings, job.id)
     } catch (error) {
       setPackError(error instanceof Error ? error.message : 'Download failed')
     } finally {
@@ -677,7 +678,7 @@ function JobCard({ job, expanded, onToggle, settings, onScore, scoring, onPrepar
   }
 
   async function handlePackPrepare() {
-    if (packReady || packPreparing) return
+    if (packPreparing) return
     setPackPreparing(true)
     setPackError('')
     try {
@@ -707,14 +708,14 @@ function JobCard({ job, expanded, onToggle, settings, onScore, scoring, onPrepar
         <button className="am-chevron" type="button" onMouseDown={event => { event.preventDefault(); event.currentTarget.blur() }} onClick={onToggle} aria-label={`${expanded ? t('Collapse') : t('Expand')} ${job.role}`}><ChevronDown size={16} className={expanded ? 'am-chevron-open' : ''} /></button>
       </div>
       {expanded && <div className="am-detail">
-        <div className="am-detail-grid"><div className="am-detail-box"><div className="am-detail-label">{t('Notes')}</div><div className="am-notes-meta"><span>{notesSaving ? <span className="am-saving">{t('Saving…')}</span> : notesError ? <span className="am-note-error">{lang === 'zh' ? t('Something went wrong') : notesError}</span> : notes ? <span className="am-saved">{t('Saved')}</span> : t('Add context for later')}</span></div><textarea className="am-notes" value={notes} onChange={event => { setNotes(event.target.value); setNotesError('') }} placeholder={t('Interview questions, salary, contact…')} /><ApplicationPackSummary hasResume={hasResume} hasCoverLetter={hasCoverLetter} ready={packReady} preparing={packPreparing} stage={packStage} exporting={packExporting} error={packError} onPrepare={() => void handlePackPrepare()} onDownload={() => void handlePackDownload()} /></div><div className="am-detail-box am-detail-insights"><div className="am-detail-label am-detail-label-icon"><Tags size={11} aria-hidden="true" /> {t('Key job tags')}</div>{keyTags.length > 0 ? <div className="am-key-tags">{keyTags.map(tag => <span key={tag} className="am-key-tag">{tag}</span>)}</div> : <div className="am-detail-text">{t('Score this role to extract its main skills and requirements.')}</div>}<div className="am-detail-label am-detail-score-label">{t('Match score')}</div><div className="am-detail-text">{job.score == null ? t('Not scored yet.') : `${t('Scored at')} ${job.score}% ${t('against your resume.')}`}</div>{!job.url && <div className="am-detail-text">{t('No original link saved.')}</div>}</div></div>
+        <div className="am-detail-grid"><div className="am-detail-box"><div className="am-detail-label">{t('Notes')}</div><div className="am-notes-meta"><span>{notesSaving ? <span className="am-saving">{t('Saving…')}</span> : notesError ? <span className="am-note-error">{lang === 'zh' ? t('Something went wrong') : notesError}</span> : notes ? <span className="am-saved">{t('Saved')}</span> : t('Add context for later')}</span></div><textarea className="am-notes" value={notes} onChange={event => { setNotes(event.target.value); setNotesError('') }} placeholder={t('Interview questions, salary, contact…')} /><ApplicationPackSummary hasResume={hasResume} hasCoverLetter={hasCoverLetter} ready={packReady} preparing={packPreparing} stage={packStage} exporting={packExporting} error={packError} onPrepare={() => void handlePackPrepare()} onDownload={() => void handlePackDownload()} onPrint={() => void handlePackDownload(true)} /></div><div className="am-detail-box am-detail-insights"><div className="am-detail-label am-detail-label-icon"><Tags size={11} aria-hidden="true" /> {t('Key job tags')}</div>{keyTags.length > 0 ? <div className="am-key-tags">{keyTags.map(tag => <span key={tag} className="am-key-tag">{tag}</span>)}</div> : <div className="am-detail-text">{t('Score this role to extract its main skills and requirements.')}</div>}<div className="am-detail-label am-detail-score-label">{t('Match score')}</div><div className="am-detail-text">{job.score == null ? t('Not scored yet.') : `${t('Scored at')} ${job.score}% ${t('against your resume.')}`}</div>{!job.url && <div className="am-detail-text">{t('No original link saved.')}</div>}</div></div>
         <div className="am-detail-actions">{job.url && <a className="am-detail-action" href={job.url} target="_blank" rel="noreferrer">{t('Open original')} <ExternalLink size={11} /></a>}<a className="am-detail-action primary" href={`${settings.apiBaseUrl}/?page=jobs&highlight=${job.id}`} target="_blank" rel="noreferrer">{t('Open in My Jobs')} <ArrowRight size={11} /></a></div>
       </div>}
     </article>
   )
 }
 
-function ApplicationPackSummary({ hasResume, hasCoverLetter, ready, preparing, stage, exporting, error, onPrepare, onDownload }: {
+function ApplicationPackSummary({ hasResume, hasCoverLetter, ready, preparing, stage, exporting, error, onPrepare, onDownload, onPrint }: {
   hasResume: boolean
   hasCoverLetter: boolean
   ready: boolean
@@ -724,6 +725,7 @@ function ApplicationPackSummary({ hasResume, hasCoverLetter, ready, preparing, s
   error: string
   onPrepare: () => void
   onDownload: () => void
+  onPrint: () => void
 }) {
   const { lang, t } = useExtensionI18n()
   const rows = [
@@ -737,8 +739,9 @@ function ApplicationPackSummary({ hasResume, hasCoverLetter, ready, preparing, s
     <div className="am-pack-heading"><span><Sparkles size={11} aria-hidden="true" /> {t('Application pack')}</span><span className={ready ? 'am-pack-ready' : 'am-pack-pending'}>{ready ? t('Ready') : t('Pending')}</span></div>
     <div className="am-pack-rows">{rows.map(({ label, icon: Icon, done }, index) => { const active = preparing && ((stage === 'resume' && index === 0) || (stage === 'coverLetter' && index === 1) || (stage === 'audit' && index === 2)); return <div className="am-pack-row" key={label}><span className={`am-pack-icon${done ? ' done' : active ? ' active' : ''}`}><Icon size={10} aria-hidden="true" /></span><span className="am-pack-row-label">{label}</span><span className={`am-pack-status${done ? ' done' : active ? ' active' : ''}`}>{done ? <><Check size={9} /> {t('Ready')}</> : active ? t('Working…') : t('Pending')}</span></div> })}</div>
     {preparing && <div className="am-pack-progress">{stageLabel}</div>}
-    <div className="am-pack-actions"><button className="am-pack-prepare" type="button" disabled={ready || preparing} onClick={onPrepare}>{preparing ? stageLabel : ready ? t('Pack ready') : t('Prepare full pack')} {!ready && !preparing && <ArrowRight size={10} />}</button><button className="am-pack-download" type="button" disabled={!ready || exporting} onClick={onDownload} aria-label={t('Download application pack')} title={ready ? t('Download application pack') : t('Complete the pack first')}><Download size={11} />{exporting ? '…' : t('Download')}</button></div>
-    {error && <div className="am-pack-error" role="status">{lang === 'zh' ? t('Something went wrong') : error}</div>}
+    <div className="am-pack-actions"><button className="am-pack-prepare" type="button" disabled={preparing} onClick={onPrepare}>{preparing ? stageLabel : ready ? t('Recheck audit') : t('Prepare full pack')} {!ready && !preparing && <ArrowRight size={10} />}</button><button className="am-pack-download" type="button" disabled={!ready || exporting} onClick={onDownload} aria-label={t('Download application pack')} title={ready ? t('Download application pack') : t('Complete the pack first')}><Download size={11} />{exporting ? '…' : t('Download')}</button></div>
+    {ready && <button className="am-pack-download" type="button" disabled={exporting} onClick={onPrint}>{t('Print view / Save as PDF')}</button>}
+    {error && <div className="am-pack-error" role="status">{t(error)}</div>}
   </div>
 }
 
