@@ -14,6 +14,13 @@ import type { TurnExecutionOwnerFence } from "../execution-owner.js"
 import type { TurnQuestionPool } from "./turn-question-store-guards.js"
 import type { TurnQuestionIntentEnvelope } from "./turn-question-contract.js"
 import { issueNativeQuestionControlReceipt } from "./native-question-attestation.js"
+import { InMemoryToolLifecycleSink, ToolLifecycle } from "../tools/lifecycle.js"
+import { PolicyEngine } from "../policy/engine.js"
+import { createAskUserTool } from "../tools/ask-user.js"
+import { ToolRegistry } from "../tools/registry.js"
+import { ToolRouter } from "../tools/router.js"
+import type { RuntimeToolDefinition } from "../tools/types.js"
+import { createToolRouterExecutor } from "./turn-engine-helpers.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 function disposableUrl(): string | null {
@@ -337,9 +344,14 @@ describePg("native durable user question persistence on disposable PostgreSQL", 
   it("replays an incomplete persisted ask_user call after restart without a pause event and commits the same question", async () => {
     await seedIncompleteCallRecovery(admin!)
     let modelCalls = 0
-    const executeTool = vi.fn(async ({ call }: { call: { id: string; toolName: string } }) => ({
-      id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed" as const, output: intent, errorCode: null,
-    }))
+    const questionPolicy = new PolicyEngine({ snapshot: { version: "policy.v1", rules: [{
+      id: "native-question-recovery-test", roles: ["orchestrator"], tools: ["agent.ask_user"], toolVersions: ["1"],
+      risks: ["internal_write"], domains: ["coordination"], requiredCapabilities: ["canManageChildren"],
+      outcome: "allow", reasonCode: "native_question_recovery_test", reason: "Allow the built-in native question in this integration test",
+    }] } })
+    const questionRouter = new ToolRouter(new ToolRegistry([createAskUserTool() as RuntimeToolDefinition]),
+      new ToolLifecycle({ sink: new InMemoryToolLifecycleSink() }), questionPolicy)
+    const executeTool = vi.fn(createToolRouterExecutor(questionRouter))
     const result = await new TurnEngine({
       lease: { turnId: recoveryIds.turn, sessionId: recoveryIds.session, ownerId: recoveryOwner.ownerId, userId: ids.user,
         leaseVersion: recoveryOwner.leaseVersion, leaseStartedAt: new Date(), leaseExpiresAt: recoveryOwner.leaseExpiresAt },
@@ -348,7 +360,8 @@ describePg("native durable user question persistence on disposable PostgreSQL", 
       contextBuilder: { build: async () => { throw new Error("context should not be rebuilt before the recovered wait") } },
       store: createPgTurnEngineStore(runtimePool(writer!)),
       model: { id: "must-not-run", profile: {}, async *stream() { modelCalls += 1; throw new Error("model was invoked during question recovery") } },
-      tools: [], executeTool: executeTool as never, now: () => new Date(), idFactory: (prefix: string) => prefix,
+      tools: [], executeTool, actorRole: "orchestrator", capabilities: ["canManageChildren"],
+      now: () => new Date(), idFactory: (prefix: string) => prefix,
       toolCallRecovery: [{ action: "replay", stepId: recoveryIds.step, toolVersion: "1",
         call: { id: recoveryIds.call, name: "agent.ask_user", arguments: { question: intent.question, choices: intent.options } },
         callItem: { id: recoveryIds.item, revision: 0 } }],
