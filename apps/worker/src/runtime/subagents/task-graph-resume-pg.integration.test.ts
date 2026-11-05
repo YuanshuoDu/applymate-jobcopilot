@@ -678,16 +678,30 @@ const LEASE_RECOVERY_ADAPTER_BRANCHES = new Set([
 const LEASE_RECOVERY_ADAPTER_STAGES = new Set([
   "not_started", "stream_entered", "branch_entered", "graph_checked", "outcome_checked",
   "database_checked", "tool_call_emitted", "completion_emitted", "final_output_emitted",
+  "repair_plan_node_keys", "repair_plan_source_status", "repair_plan_source_report",
+  "repair_plan_dependent_status", "repair_plan_wait_outcome", "repair_plan_waited_source",
+  "repair_plan_dependent_database", "repair_plan_dispatch_check", "repair_plan_cancel_check",
   "final_proof_graph_nodes", "final_proof_node_statuses", "final_proof_dependent_identity",
   "final_proof_dependent_report", "final_proof_repair_report", "final_proof_repair_receipt",
   "final_proof_wait_outcome", "final_proof_wait_task_statuses", "final_proof_repair_wait_report",
   "final_proof_dependent_wait_report",
+])
+const MULTI_SCOUT_CHILD_ADAPTER_STAGES = new Set([
+  "not_started", "stream_entered", "analyst_dependencies", "empty_analyst_receipts",
+  "empty_analyst_output", "scout_search", "other",
+])
+const STRUCTURED_RESULT_FAILURE_CATEGORIES = new Set([
+  "missing_final_output", "result_too_large", "result_shape_invalid", "evidence_binding_invalid",
 ])
 const LEASE_RECOVERY_STARTUP_STAGES = new Set([
   "not_started", "state_loading", "state_loaded", "selected_job_loading", "selected_job_loaded",
   "root_ensure_entered", "root_ensure_returned", "root_ensure_failed", "model_factory",
 ])
 const LEASE_RECOVERY_FAILURE_CLASSES = new Set(["none", "assertion", "coordination", "database", "generic", "other"])
+const LEASE_RECOVERY_RUNTIME_FAILURE_CATEGORIES = new Set([
+  "none", "database", "invalid_output", "tool_schema", "wait_receipt", "tool_replay",
+  "completion_gate", "task_graph", "execution", "other",
+])
 const PROCESS_RESTART_ROOT_STAGES = new Set([
   "not_started", "worker_ready", "model_failed", "graph_restored", "resume_context_ready",
   "follow_up_dependency_context_ready", "follow_up_graph_ready", "follow_up_graph_completed",
@@ -5418,10 +5432,22 @@ type LeaseRecoveryAdapterBranch = "not_started" | "initial_plan" | "initial_wait
 type LeaseRecoveryAdapterStage =
   | "not_started" | "stream_entered" | "branch_entered" | "graph_checked" | "outcome_checked"
   | "database_checked" | "tool_call_emitted" | "completion_emitted" | "final_output_emitted"
+  | "repair_plan_node_keys" | "repair_plan_source_status" | "repair_plan_source_report"
+  | "repair_plan_dependent_status" | "repair_plan_wait_outcome" | "repair_plan_waited_source"
+  | "repair_plan_dependent_database" | "repair_plan_dispatch_check" | "repair_plan_cancel_check"
   | "final_proof_graph_nodes" | "final_proof_node_statuses" | "final_proof_dependent_identity"
   | "final_proof_dependent_report" | "final_proof_repair_report" | "final_proof_repair_receipt"
   | "final_proof_wait_outcome" | "final_proof_wait_task_statuses" | "final_proof_repair_wait_report"
   | "final_proof_dependent_wait_report"
+type MultiScoutChildAdapterStage =
+  | "not_started" | "stream_entered" | "analyst_dependencies" | "empty_analyst_receipts"
+  | "empty_analyst_output" | "scout_search" | "other"
+type MultiScoutChildDiagnostics = {
+  streamInvocations: number
+  adapterFailureCount: number
+  firstAdapterFailureStage: MultiScoutChildAdapterStage
+  firstAdapterFailureClass: FailurePreflightErrorClass
+}
 type LeaseRecoveryModelResult = {
   resultStatus: "completed" | "failed" | "missing" | "other"
   isError: boolean | null
@@ -5432,15 +5458,27 @@ type LeaseRecoveryFixtureDiagnostics = {
   modelRuntimeFactoryInvocations: number
   adapterStreamInvocations: number
   runtimeExecuteInvocations: number
+  runtimeExecuteFailureCount: number
   runtimeExecuteFailureClass: FailurePreflightErrorClass
+  runtimeFailureResultCount: number
+  firstRuntimeFailureResultErrorCategory: LeaseRecoveryRuntimeFailureCategory
   startupStage: LeaseRecoveryStartupStage
   adapterExecutionOrdinal: number
   adapterRoundOrdinal: number
   adapterBranch: LeaseRecoveryAdapterBranch
   adapterStage: LeaseRecoveryAdapterStage
+  adapterFailureCount: number
+  firstAdapterFailureClass: FailurePreflightErrorClass
+  firstAdapterFailureExecutionOrdinal: number
+  firstAdapterFailureRoundOrdinal: number
+  firstAdapterFailureBranch: LeaseRecoveryAdapterBranch
+  firstAdapterFailureStage: LeaseRecoveryAdapterStage
   repairPlanResult: LeaseRecoveryModelResult
   repairWaitResult: LeaseRecoveryModelResult
 }
+type LeaseRecoveryRuntimeFailureCategory =
+  | "none" | "database" | "invalid_output" | "tool_schema" | "wait_receipt"
+  | "tool_replay" | "completion_gate" | "task_graph" | "execution" | "other"
 
 const LEASE_RECOVERY_MODEL_RESULT_STATUSES = new Set(["completed", "failed", "missing", "other"])
 const LEASE_RECOVERY_MODEL_OUTPUT_STATUSES = new Set([
@@ -5510,12 +5548,21 @@ function leaseRecoveryFixtureDiagnosticProjection(value: unknown): RecordValue |
     modelRuntimeFactoryInvocations: diagnosticBoundedCount(source.modelRuntimeFactoryInvocations),
     adapterStreamInvocations: diagnosticBoundedCount(source.adapterStreamInvocations),
     runtimeExecuteInvocations: diagnosticBoundedCount(source.runtimeExecuteInvocations),
+    runtimeExecuteFailureCount: diagnosticBoundedCount(source.runtimeExecuteFailureCount),
     runtimeExecuteFailureClass: diagnosticEnum(source.runtimeExecuteFailureClass, LEASE_RECOVERY_FAILURE_CLASSES) ?? "other",
+    runtimeFailureResultCount: diagnosticBoundedCount(source.runtimeFailureResultCount),
+    firstRuntimeFailureResultErrorCategory: diagnosticEnum(source.firstRuntimeFailureResultErrorCategory, LEASE_RECOVERY_RUNTIME_FAILURE_CATEGORIES) ?? "other",
     startupStage: diagnosticEnum(source.startupStage, LEASE_RECOVERY_STARTUP_STAGES) ?? "other",
     adapterExecutionOrdinal: ordinal(source.adapterExecutionOrdinal),
     adapterRoundOrdinal: ordinal(source.adapterRoundOrdinal),
     adapterBranch: diagnosticEnum(source.adapterBranch, LEASE_RECOVERY_ADAPTER_BRANCHES) ?? "other",
     adapterStage: diagnosticEnum(source.adapterStage, LEASE_RECOVERY_ADAPTER_STAGES) ?? "other",
+    adapterFailureCount: diagnosticBoundedCount(source.adapterFailureCount),
+    firstAdapterFailureClass: diagnosticEnum(source.firstAdapterFailureClass, LEASE_RECOVERY_FAILURE_CLASSES) ?? "other",
+    firstAdapterFailureExecutionOrdinal: ordinal(source.firstAdapterFailureExecutionOrdinal),
+    firstAdapterFailureRoundOrdinal: ordinal(source.firstAdapterFailureRoundOrdinal),
+    firstAdapterFailureBranch: diagnosticEnum(source.firstAdapterFailureBranch, LEASE_RECOVERY_ADAPTER_BRANCHES) ?? "other",
+    firstAdapterFailureStage: diagnosticEnum(source.firstAdapterFailureStage, LEASE_RECOVERY_ADAPTER_STAGES) ?? "other",
     ...(source.repairPlanResult === undefined ? {} : { repairPlanResult: leaseRecoveryModelResultProjection(source.repairPlanResult) }),
     ...(source.repairWaitResult === undefined ? {} : { repairWaitResult: leaseRecoveryModelResultProjection(source.repairWaitResult) }),
   }
@@ -6461,15 +6508,22 @@ describe("compact TaskGraph wait failure diagnostics", () => {
     const secret = "private goal, ID, or provider detail"
     const projected = leaseRecoveryFixtureDiagnosticProjection({
       modelRuntimeFactoryInvocations: 3, adapterStreamInvocations: 4, runtimeExecuteInvocations: 2,
-      runtimeExecuteFailureClass: "database", startupStage: "model_factory",
+      runtimeExecuteFailureCount: 1, runtimeExecuteFailureClass: "database", runtimeFailureResultCount: 2,
+      firstRuntimeFailureResultErrorCategory: "execution", startupStage: "model_factory",
       adapterExecutionOrdinal: 3, adapterRoundOrdinal: 1, adapterBranch: "final_proof",
       adapterStage: "outcome_checked", privateId: secret, error: secret,
+      adapterFailureCount: 2, firstAdapterFailureClass: "assertion",
+      firstAdapterFailureExecutionOrdinal: 2, firstAdapterFailureRoundOrdinal: 1,
+      firstAdapterFailureBranch: "repair_plan", firstAdapterFailureStage: "repair_plan_source_status",
     })
     expect(projected).toEqual({
       modelRuntimeFactoryInvocations: 3, adapterStreamInvocations: 4, runtimeExecuteInvocations: 2,
-      runtimeExecuteFailureClass: "database", startupStage: "model_factory",
+      runtimeExecuteFailureCount: 1, runtimeExecuteFailureClass: "database", runtimeFailureResultCount: 2,
+      firstRuntimeFailureResultErrorCategory: "execution", startupStage: "model_factory",
       adapterExecutionOrdinal: 3, adapterRoundOrdinal: 1, adapterBranch: "final_proof",
-      adapterStage: "outcome_checked",
+      adapterStage: "outcome_checked", adapterFailureCount: 2, firstAdapterFailureClass: "assertion",
+      firstAdapterFailureExecutionOrdinal: 2, firstAdapterFailureRoundOrdinal: 1,
+      firstAdapterFailureBranch: "repair_plan", firstAdapterFailureStage: "repair_plan_source_status",
     })
     const finalProofStage = leaseRecoveryFixtureDiagnosticProjection({
       adapterExecutionOrdinal: 3, adapterRoundOrdinal: 1, adapterBranch: "final_proof",
@@ -6479,10 +6533,16 @@ describe("compact TaskGraph wait failure diagnostics", () => {
     const invalid = leaseRecoveryFixtureDiagnosticProjection({
       adapterExecutionOrdinal: 8, adapterRoundOrdinal: -1, adapterBranch: secret, adapterStage: secret,
       startupStage: secret, runtimeExecuteFailureClass: secret, private: secret,
+      runtimeExecuteFailureCount: secret, runtimeFailureResultCount: secret, firstRuntimeFailureResultErrorCategory: secret,
+      adapterFailureCount: secret, firstAdapterFailureClass: secret, firstAdapterFailureExecutionOrdinal: secret,
+      firstAdapterFailureRoundOrdinal: secret, firstAdapterFailureBranch: secret, firstAdapterFailureStage: secret,
     })
     expect(invalid).toMatchObject({
       adapterExecutionOrdinal: null, adapterRoundOrdinal: null, adapterBranch: "other", adapterStage: "other",
-      startupStage: "other", runtimeExecuteFailureClass: "other",
+      startupStage: "other", runtimeExecuteFailureCount: null, runtimeExecuteFailureClass: "other",
+      runtimeFailureResultCount: null, firstRuntimeFailureResultErrorCategory: "other",
+      adapterFailureCount: null, firstAdapterFailureClass: "other", firstAdapterFailureExecutionOrdinal: null,
+      firstAdapterFailureRoundOrdinal: null, firstAdapterFailureBranch: "other", firstAdapterFailureStage: "other",
     })
     expect(JSON.stringify([projected, invalid])).not.toContain(secret)
   })
@@ -6515,9 +6575,12 @@ describe("compact TaskGraph wait failure diagnostics", () => {
     expect(missingResult).toEqual(missingLeaseRecoveryModelResult())
     expect(projected).toMatchObject({ repairPlanResult: planResult, repairWaitResult: waitResult })
     expect(Object.keys(projected ?? {}).sort()).toEqual([
-      "adapterBranch", "adapterExecutionOrdinal", "adapterRoundOrdinal", "adapterStage", "adapterStreamInvocations",
-      "modelRuntimeFactoryInvocations", "repairPlanResult", "repairWaitResult", "runtimeExecuteFailureClass",
-      "runtimeExecuteInvocations", "startupStage",
+      "adapterBranch", "adapterExecutionOrdinal", "adapterFailureCount", "adapterRoundOrdinal", "adapterStage", "adapterStreamInvocations",
+      "firstAdapterFailureBranch", "firstAdapterFailureClass", "firstAdapterFailureExecutionOrdinal",
+      "firstAdapterFailureRoundOrdinal", "firstAdapterFailureStage",
+      "firstRuntimeFailureResultErrorCategory", "modelRuntimeFactoryInvocations", "repairPlanResult", "repairWaitResult",
+      "runtimeExecuteFailureClass", "runtimeExecuteFailureCount", "runtimeExecuteInvocations",
+      "runtimeFailureResultCount", "startupStage",
     ])
     expect(malformed).toMatchObject({
       repairPlanResult: { resultStatus: "other", isError: null, outputStatus: "other", errorCategory: "other" },
@@ -14353,6 +14416,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         return { adapter, registry: {} as never, candidates: [] }
       },
     })
+    const childAdapterDiagnostics: MultiScoutChildDiagnostics = {
+      streamInvocations: 0, adapterFailureCount: 0,
+      firstAdapterFailureStage: "not_started", firstAdapterFailureClass: "none",
+    }
     const childExecutor = createProductionChildExecutor({
       pool: pool!, authorizeUsage: async () => ({ settle: async () => undefined }),
       modelRuntimeFactory: ({ task }) => {
@@ -14363,113 +14430,128 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           id: `p3-scout-union-${task.role}-child`, profile,
           async *stream(request) {
             round += 1
-            if (round === 1) {
-              if (task.role === "analyst") {
-                const dependencyContext = taskGraphDependencyContextFromModelRequest(request)
-                const items = Array.isArray(dependencyContext.items) ? dependencyContext.items.map(record) : []
-                expect(items.map(item => item?.dependencyKey)).toEqual(["scout-a", "scout-b"])
-                for (const [dependencyKey, candidateIds] of [
-                  ["scout-a", ids.slice(0, 2)], ["scout-b", ids.slice(1)],
-                ] as const) {
-                  const item = items.find(candidate => candidate?.dependencyKey === dependencyKey)
-                  expect(item).toMatchObject({ dependencyKey, role: "scout", taskStatus: "completed" })
-                  expect(record(item?.result)).toMatchObject({
-                    schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available",
-                    role: "scout", status: "completed", candidateCount: candidateIds.length, evidenceCount: candidateIds.length,
-                    candidates: candidateIds.map(jobId => ({ jobId, source: "greenhouse", evidenceKinds: ["job"] })),
-                  })
-                  const verification = record(item?.verification)
-                  expect(verification).toMatchObject({
-                    verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
-                    criteria: [{ criterionId: "candidate-count", status: "passed", reasonCode: "criteria_met" }],
-                  })
-                  expect(verification?.evidenceDigest).toMatch(/^[a-f0-9]{64}$/)
-                  expect(verification?.resultDigest).toMatch(/^[a-f0-9]{64}$/)
-                }
-                if (emptyAnalyst) {
-                  if (taskScopedOrphan) {
-                    const callId = `p3-empty-analyst-prior-call:${value.suffix}`
-                    const receiptScope = {
-                      userId: task.userId, sessionId: task.sessionId, turnId: task.turnId!, rootTaskId: task.rootTaskId,
-                      parentTaskId: task.parentTaskId!, taskId: task.id, attemptCount: task.attemptCount,
-                    }
-                    expect(await hasNoCurrentAttemptTaskGraphToolReceipts(pool!, receiptScope)).toBe(true)
-                    const priorBoundary = await pool!.query<{ startSequence: string; closeSequence: string }>(
-                      `SELECT startedEvent."sequence"::text AS "startSequence", closedEvent."sequence"::text AS "closeSequence"
-                       FROM "agent_events" AS startedEvent JOIN "agent_events" AS closedEvent
-                         ON closedEvent."sessionId" = startedEvent."sessionId" AND closedEvent."turnId" = startedEvent."turnId"
-                           AND closedEvent."taskId" = startedEvent."taskId"
-                       WHERE startedEvent."id" = $1 AND startedEvent."taskId" = $2 AND startedEvent."type" = 'step.started'
-                         AND closedEvent."id" = $3 AND closedEvent."type" = 'step.completed'`,
-                      ["p3-empty-analyst-prior-start:" + value.suffix, task.id, "p3-empty-analyst-prior-close:" + value.suffix])
-                    const boundary = priorBoundary.rows[0]
-                    if (!boundary) throw new Error("Empty Analyst prior Step boundary was unavailable")
-                    const spoofSequence = (BigInt(boundary.startSequence) + 2n).toString()
-                    if (BigInt(spoofSequence) >= BigInt(boundary.closeSequence)) throw new Error("Empty Analyst prefix spoof has no bounded sequence slot")
-                    const realPrefix = "task:" + task.id + ":tool-lifecycle:" + callId + ":"
-                    const sameLengthFakePrefix = "task:" + task.id + ":fool-lifecycle:" + callId + ":"
-                    expect(sameLengthFakePrefix).toHaveLength(realPrefix.length)
-                    const fakeEventId = "p3-empty-analyst-prefix-spoof:" + value.suffix
-                    const fakePayload = { toolCallId: callId, toolName: "jobs.search", toolVersion: "1", status: "started", input: { target: "prior-attempt" } }
-                    await pool!.query(`INSERT INTO "agent_events"
-                      ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload")
-                      VALUES ($1, $2, $3, NULL, $4, $5, 'tool_call.started', 'subagent', $6, NULL, $7, $8::jsonb)`, [
-                      fakeEventId, value.sessionId, value.turnId, task.id, spoofSequence, callId,
-                      sameLengthFakePrefix + "started:" + "a".repeat(24), JSON.stringify(fakePayload),
-                    ])
-                    try {
-                      expect(await hasNoCurrentAttemptTaskGraphToolReceipts(pool!, receiptScope)).toBe(false)
-                    } finally {
-                      const removed = await pool!.query(`DELETE FROM "agent_events" WHERE "id" = $1 AND "sessionId" = $2
-                        AND "turnId" = $3 AND "taskId" = $4 RETURNING "id"`, [fakeEventId, value.sessionId, value.turnId, task.id])
-                      expect(removed.rowCount).toBe(1)
-                    }
-                    expect(await hasNoCurrentAttemptTaskGraphToolReceipts(pool!, receiptScope)).toBe(true)
-                    const currentPayload = { toolCallId: callId, toolName: "jobs.search", toolVersion: "1", status: "started", input: { target: "current-attempt" } }
-                    const digest = createHash("sha256").update(JSON.stringify(currentPayload)).digest("hex").slice(0, 24)
-                    const currentSequence = await pool!.query<{ eventSequence: string }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1
-                      WHERE "id" = $1 AND "userId" = $2 RETURNING "eventSequence"`, [value.sessionId, value.userId])
-                    const sequence = currentSequence.rows[0]?.eventSequence
-                    if (!sequence) throw new Error("Empty Analyst current-attempt event could not reserve a sequence")
-                    await pool!.query(`INSERT INTO "agent_events"
-                      ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload")
-                      VALUES ($1, $2, $3, NULL, $4, $5, 'tool_call.started', 'subagent', $6, NULL, $7, $8::jsonb)`, [
-                      `tool-lifecycle:task:${task.id}:${callId}:started:${digest}`, value.sessionId, value.turnId, task.id, sequence, callId,
-                      `task:${task.id}:tool-lifecycle:${callId}:started:${digest}`, JSON.stringify(currentPayload),
-                    ])
-                    expect(await hasNoCurrentAttemptTaskGraphToolReceipts(pool!, receiptScope)).toBe(false)
+            childAdapterDiagnostics.streamInvocations += 1
+            let stage: MultiScoutChildAdapterStage = "stream_entered"
+            try {
+              if (round === 1) {
+                if (task.role === "analyst") {
+                  stage = "analyst_dependencies"
+                  const dependencyContext = taskGraphDependencyContextFromModelRequest(request)
+                  const items = Array.isArray(dependencyContext.items) ? dependencyContext.items.map(record) : []
+                  expect(items.map(item => item?.dependencyKey)).toEqual(["scout-a", "scout-b"])
+                  for (const [dependencyKey, candidateIds] of [
+                    ["scout-a", ids.slice(0, 2)], ["scout-b", ids.slice(1)],
+                  ] as const) {
+                    const item = items.find(candidate => candidate?.dependencyKey === dependencyKey)
+                    expect(item).toMatchObject({ dependencyKey, role: "scout", taskStatus: "completed" })
+                    expect(record(item?.result)).toMatchObject({
+                      schemaVersion: TASK_GRAPH_RESULT_PROJECTION_SCHEMA, trust: "untrusted", availability: "available",
+                      role: "scout", status: "completed", candidateCount: candidateIds.length, evidenceCount: candidateIds.length,
+                      candidates: candidateIds.map(jobId => ({ jobId, source: "greenhouse", evidenceKinds: ["job"] })),
+                    })
+                    const verification = record(item?.verification)
+                    expect(verification).toMatchObject({
+                      verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
+                      criteria: [{ criterionId: "candidate-count", status: "passed", reasonCode: "criteria_met" }],
+                    })
+                    expect(verification?.evidenceDigest).toMatch(/^[a-f0-9]{64}$/)
+                    expect(verification?.resultDigest).toMatch(/^[a-f0-9]{64}$/)
                   }
-                  const emptyResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
-                    findings: [], evidence: [], summary: "No candidates were returned for analysis" }
-                  yield { type: "text_delta", text: JSON.stringify(emptyResult) }
-                  yield { type: "completed", finishReason: "stop" }
-                  return
+                  if (emptyAnalyst) {
+                    stage = "empty_analyst_receipts"
+                    if (taskScopedOrphan) {
+                      const callId = `p3-empty-analyst-prior-call:${value.suffix}`
+                      const receiptScope = {
+                        userId: task.userId, sessionId: task.sessionId, turnId: task.turnId!, rootTaskId: task.rootTaskId,
+                        parentTaskId: task.parentTaskId!, taskId: task.id, attemptCount: task.attemptCount,
+                      }
+                      expect(await hasNoCurrentAttemptTaskGraphToolReceipts(pool!, receiptScope)).toBe(true)
+                      const priorBoundary = await pool!.query<{ startSequence: string; closeSequence: string }>(
+                        `SELECT startedEvent."sequence"::text AS "startSequence", closedEvent."sequence"::text AS "closeSequence"
+                         FROM "agent_events" AS startedEvent JOIN "agent_events" AS closedEvent
+                           ON closedEvent."sessionId" = startedEvent."sessionId" AND closedEvent."turnId" = startedEvent."turnId"
+                             AND closedEvent."taskId" = startedEvent."taskId"
+                         WHERE startedEvent."id" = $1 AND startedEvent."taskId" = $2 AND startedEvent."type" = 'step.started'
+                           AND closedEvent."id" = $3 AND closedEvent."type" = 'step.completed'`,
+                        ["p3-empty-analyst-prior-start:" + value.suffix, task.id, "p3-empty-analyst-prior-close:" + value.suffix])
+                      const boundary = priorBoundary.rows[0]
+                      if (!boundary) throw new Error("Empty Analyst prior Step boundary was unavailable")
+                      const spoofSequence = (BigInt(boundary.startSequence) + 2n).toString()
+                      if (BigInt(spoofSequence) >= BigInt(boundary.closeSequence)) throw new Error("Empty Analyst prefix spoof has no bounded sequence slot")
+                      const realPrefix = "task:" + task.id + ":tool-lifecycle:" + callId + ":"
+                      const sameLengthFakePrefix = "task:" + task.id + ":fool-lifecycle:" + callId + ":"
+                      expect(sameLengthFakePrefix).toHaveLength(realPrefix.length)
+                      const fakeEventId = "p3-empty-analyst-prefix-spoof:" + value.suffix
+                      const fakePayload = { toolCallId: callId, toolName: "jobs.search", toolVersion: "1", status: "started", input: { target: "prior-attempt" } }
+                      await pool!.query(`INSERT INTO "agent_events"
+                        ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload")
+                        VALUES ($1, $2, $3, NULL, $4, $5, 'tool_call.started', 'subagent', $6, NULL, $7, $8::jsonb)`, [
+                        fakeEventId, value.sessionId, value.turnId, task.id, spoofSequence, callId,
+                        sameLengthFakePrefix + "started:" + "a".repeat(24), JSON.stringify(fakePayload),
+                      ])
+                      try {
+                        expect(await hasNoCurrentAttemptTaskGraphToolReceipts(pool!, receiptScope)).toBe(false)
+                      } finally {
+                        const removed = await pool!.query(`DELETE FROM "agent_events" WHERE "id" = $1 AND "sessionId" = $2
+                          AND "turnId" = $3 AND "taskId" = $4 RETURNING "id"`, [fakeEventId, value.sessionId, value.turnId, task.id])
+                        expect(removed.rowCount).toBe(1)
+                      }
+                      expect(await hasNoCurrentAttemptTaskGraphToolReceipts(pool!, receiptScope)).toBe(true)
+                      const currentPayload = { toolCallId: callId, toolName: "jobs.search", toolVersion: "1", status: "started", input: { target: "current-attempt" } }
+                      const digest = createHash("sha256").update(JSON.stringify(currentPayload)).digest("hex").slice(0, 24)
+                      const currentSequence = await pool!.query<{ eventSequence: string }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1
+                        WHERE "id" = $1 AND "userId" = $2 RETURNING "eventSequence"`, [value.sessionId, value.userId])
+                      const sequence = currentSequence.rows[0]?.eventSequence
+                      if (!sequence) throw new Error("Empty Analyst current-attempt event could not reserve a sequence")
+                      await pool!.query(`INSERT INTO "agent_events"
+                        ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor", "correlationId", "causationId", "idempotencyKey", "payload")
+                        VALUES ($1, $2, $3, NULL, $4, $5, 'tool_call.started', 'subagent', $6, NULL, $7, $8::jsonb)`, [
+                        `tool-lifecycle:task:${task.id}:${callId}:started:${digest}`, value.sessionId, value.turnId, task.id, sequence, callId,
+                        `task:${task.id}:tool-lifecycle:${callId}:started:${digest}`, JSON.stringify(currentPayload),
+                      ])
+                      expect(await hasNoCurrentAttemptTaskGraphToolReceipts(pool!, receiptScope)).toBe(false)
+                    }
+                    stage = "empty_analyst_output"
+                    const emptyResult = { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
+                      findings: [], evidence: [], summary: "No candidates were returned for analysis" }
+                    yield { type: "text_delta", text: JSON.stringify(emptyResult) }
+                    yield { type: "completed", finishReason: "stop" }
+                    return
+                  }
                 }
+                stage = "scout_search"
+                expect(request.tools.map(tool => record(tool)?.name)).toContain("jobs.search")
+                yield { type: "tool_call_completed", callId, name: "jobs.search", arguments: searchInput }
+                yield { type: "completed", finishReason: "tool_calls" }
+                return
               }
-              expect(request.tools.map(tool => record(tool)?.name)).toContain("jobs.search")
-              yield { type: "tool_call_completed", callId, name: "jobs.search", arguments: searchInput }
-              yield { type: "completed", finishReason: "tool_calls" }
-              return
+              const pairedSearch = latestToolResultForExactToolInput(request, "jobs.search", searchInput)
+              const search = record(pairedSearch?.result)
+              const jobs = Array.isArray(search?.jobs) ? search.jobs.map(record).filter((job): job is RecordValue => job !== null) : []
+              const cohort = ids.map(id => jobs.find(job => job.id === id)).filter((job): job is RecordValue => job !== undefined)
+              if (cohort.length !== 4) throw new Error("Multi-Scout union child did not observe all fixture jobs")
+              const selected = task.role === "scout" ? cohort.slice(task.goal === scoutAGoal ? 0 : 1, task.goal === scoutAGoal ? 2 : 4) : cohort
+              const evidence = selected.map(job => ({ id: `read:job:${job.id}`, kind: "job", ref: job.id, source: "greenhouse" }))
+              const structuredResult = task.role === "scout"
+                ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
+                  candidates: selected.map((job, index) => ({ jobId: job.id as string, source: evidence[index]!.source, url: null, evidenceIds: [evidence[index]!.id] })),
+                  evidence, summary: "Evidence-bound multi-Scout candidate slice" }
+                : task.role === "analyst"
+                  ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
+                    findings: selected.map((job, index) => ({ jobId: job.id as string, score: 8, evidenceIds: [evidence[index]!.id] })),
+                    evidence, summary: "Every unique Scout union candidate was assessed" }
+                  : null
+              if (!structuredResult) throw new Error("Multi-Scout union fixture received an unsupported child role")
+              yield { type: "text_delta", text: JSON.stringify(structuredResult) }
+              yield { type: "completed", finishReason: "stop" }
+            } catch (error: unknown) {
+              childAdapterDiagnostics.adapterFailureCount += 1
+              if (childAdapterDiagnostics.firstAdapterFailureClass === "none") {
+                childAdapterDiagnostics.firstAdapterFailureStage = stage
+                childAdapterDiagnostics.firstAdapterFailureClass = safeFailurePreflightErrorClass(error)
+              }
+              throw error
             }
-            const pairedSearch = latestToolResultForExactToolInput(request, "jobs.search", searchInput)
-            const search = record(pairedSearch?.result)
-            const jobs = Array.isArray(search?.jobs) ? search.jobs.map(record).filter((job): job is RecordValue => job !== null) : []
-            const cohort = ids.map(id => jobs.find(job => job.id === id)).filter((job): job is RecordValue => job !== undefined)
-            if (cohort.length !== 4) throw new Error("Multi-Scout union child did not observe all fixture jobs")
-            const selected = task.role === "scout" ? cohort.slice(task.goal === scoutAGoal ? 0 : 1, task.goal === scoutAGoal ? 2 : 4) : cohort
-            const evidence = selected.map(job => ({ id: `read:job:${job.id}`, kind: "job", ref: job.id, source: "greenhouse" }))
-            const structuredResult = task.role === "scout"
-              ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "scout", status: "completed",
-                candidates: selected.map((job, index) => ({ jobId: job.id as string, source: evidence[index]!.source, url: null, evidenceIds: [evidence[index]!.id] })),
-                evidence, summary: "Evidence-bound multi-Scout candidate slice" }
-              : task.role === "analyst"
-                ? { schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
-                  findings: selected.map((job, index) => ({ jobId: job.id as string, score: 8, evidenceIds: [evidence[index]!.id] })),
-                  evidence, summary: "Every unique Scout union candidate was assessed" }
-                : null
-            if (!structuredResult) throw new Error("Multi-Scout union fixture received an unsupported child role")
-            yield { type: "text_delta", text: JSON.stringify(structuredResult) }
-            yield { type: "completed", finishReason: "stop" }
           },
         }
         return adapter
@@ -14492,7 +14574,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await waitForPersistedTaskWait(pool!, value.turnId, waitKey)
     expect(initialTaskIds).toHaveLength(3)
     const taskStore = new PgSubagentTaskStore(pool!)
-    const executeChild = async (taskId: string, ownerId: string) => {
+    const executeChild = async (taskId: string, ownerId: string, expectedFinishStatus: "completed" | "failed" = "completed") => {
       const claimed = await taskStore.claim({ taskId, sessionId: value.sessionId, ownerId, policy: defaultSubagentPolicy(), now: new Date() })
       if (!claimed) throw new Error("Multi-Scout union fixture child did not acquire its task")
       const leaseExpiresAt = claimed.leaseExpiresAt
@@ -14502,7 +14584,17 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       const finished = await taskStore.finish({ taskId, sessionId: value.sessionId, ownerId, attemptCount: claimed.attemptCount,
         status: result.status, result: result.result, failureReason: result.failureReason, retryDisposition: result.retryDisposition,
         mailboxMessageIds: result.mailboxMessageIds, now: new Date() })
-      expect(finished).toBe("completed")
+      const safeResult = record(result.result)
+      const diagnostic = {
+        childStatus: diagnosticEnum(result.status, CHILD_OUTCOME_STATUSES) ?? "other",
+        failureCategory: result.failureReason ? diagnosticErrorClass(result.failureReason) ?? "other" : "none",
+        structuredOutputFailureCategory: diagnosticEnum(safeResult?.structuredOutputFailureCategory, STRUCTURED_RESULT_FAILURE_CATEGORIES) ?? "none",
+        adapterStreamInvocations: diagnosticBoundedCount(childAdapterDiagnostics.streamInvocations),
+        adapterFailureCount: diagnosticBoundedCount(childAdapterDiagnostics.adapterFailureCount),
+        firstAdapterFailureStage: diagnosticEnum(childAdapterDiagnostics.firstAdapterFailureStage, MULTI_SCOUT_CHILD_ADAPTER_STAGES) ?? "other",
+        firstAdapterFailureClass: diagnosticEnum(childAdapterDiagnostics.firstAdapterFailureClass, LEASE_RECOVERY_FAILURE_CLASSES) ?? "other",
+      }
+      expect(finished, JSON.stringify(diagnostic)).toBe(expectedFinishStatus)
     }
     await executeChild(scoutATaskId, `p3-scout-union-a-${value.suffix}`)
     await executeChild(scoutBTaskId, `p3-scout-union-b-${value.suffix}`)
@@ -14564,7 +14656,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         event.id, value.sessionId, value.turnId, analystTaskId, event.sequence, event.type, event.correlationId, event.key, JSON.stringify(event.payload),
       ])
     }
-    await executeChild(analystTaskId, `p3-scout-union-analyst-${value.suffix}`)
+    await executeChild(analystTaskId, `p3-scout-union-analyst-${value.suffix}`, emptyAnalyst ? "failed" : "completed")
     await waitForTurnStatus(pool!, value.turnId, emptyAnalyst ? "failed" : "completed", 45_000, waitKey)
     expect(finalWaitReport).not.toBeNull()
     const turn = await pool!.query<{ status: string; rootTaskId: string | null; finalResponse: string | null }>(
@@ -15025,8 +15117,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const repairWaitCallId = `p3-lease-recovery-repair-wait:${value.turnId}`
     const fixtureInvocationCounters: LeaseRecoveryFixtureDiagnostics = {
       modelRuntimeFactoryInvocations: 0, adapterStreamInvocations: 0,
-      runtimeExecuteInvocations: 0, runtimeExecuteFailureClass: "none", startupStage: "not_started",
+      runtimeExecuteInvocations: 0, runtimeExecuteFailureCount: 0, runtimeExecuteFailureClass: "none",
+      runtimeFailureResultCount: 0, firstRuntimeFailureResultErrorCategory: "none", startupStage: "not_started",
       adapterExecutionOrdinal: 0, adapterRoundOrdinal: 0, adapterBranch: "not_started", adapterStage: "not_started",
+      adapterFailureCount: 0, firstAdapterFailureClass: "none", firstAdapterFailureExecutionOrdinal: 0,
+      firstAdapterFailureRoundOrdinal: 0, firstAdapterFailureBranch: "not_started", firstAdapterFailureStage: "not_started",
       repairPlanResult: missingLeaseRecoveryModelResult(), repairWaitResult: missingLeaseRecoveryModelResult(),
     }
     let initialWaitReportSeen = false
@@ -15085,157 +15180,178 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             fixtureInvocationCounters.adapterRoundOrdinal = Math.min(round, 7)
             fixtureInvocationCounters.adapterBranch = "unexpected"
             fixtureInvocationCounters.adapterStage = "stream_entered"
-            if (execution === 1 && round === 1) {
-              fixtureInvocationCounters.adapterBranch = "initial_plan"
-              fixtureInvocationCounters.adapterStage = "branch_entered"
-              fixtureInvocationCounters.adapterStage = "tool_call_emitted"
-              yield { type: "tool_call_completed", callId: planCallId, name: "agent.plan", arguments: {
-                expectedRevision: 0,
-                nodes: [
-                  { key: "scout", templateId: "scout", goal: sourceGoal, successCriteria: ["Return one evidence-bound candidate"], dependsOn: [], verification: SCOUT_VERIFICATION },
-                  { key: "dependent", templateId: "analyst", goal: dependentGoal, successCriteria: ["Wait for the exact repair receipt"], dependsOn: ["scout"], verification: ANALYST_VERIFICATION },
-                ],
-              } }
-              fixtureInvocationCounters.adapterStage = "completion_emitted"
-              yield { type: "completed", finishReason: "tool_calls" }
-              return
+            try {
+              if (execution === 1 && round === 1) {
+                fixtureInvocationCounters.adapterBranch = "initial_plan"
+                fixtureInvocationCounters.adapterStage = "branch_entered"
+                fixtureInvocationCounters.adapterStage = "tool_call_emitted"
+                yield { type: "tool_call_completed", callId: planCallId, name: "agent.plan", arguments: {
+                  expectedRevision: 0,
+                  nodes: [
+                    { key: "scout", templateId: "scout", goal: sourceGoal, successCriteria: ["Return one evidence-bound candidate"], dependsOn: [], verification: SCOUT_VERIFICATION },
+                    { key: "dependent", templateId: "analyst", goal: dependentGoal, successCriteria: ["Wait for the exact repair receipt"], dependsOn: ["scout"], verification: ANALYST_VERIFICATION },
+                  ],
+                } }
+                fixtureInvocationCounters.adapterStage = "completion_emitted"
+                yield { type: "completed", finishReason: "tool_calls" }
+                return
+              }
+              if (execution === 1 && round === 2) {
+                fixtureInvocationCounters.adapterBranch = "initial_wait"
+                fixtureInvocationCounters.adapterStage = "branch_entered"
+                const taskIds = planTaskIds(request, planCallId, 2)
+                if (taskIds.length !== 2) throw new Error("Lease recovery fixture plan did not persist its dependent task")
+                originalDependentTaskId = taskIds[1]!
+                fixtureInvocationCounters.adapterStage = "graph_checked"
+                fixtureInvocationCounters.adapterStage = "tool_call_emitted"
+                yield { type: "tool_call_completed", callId: `p3-lease-recovery-initial-wait:${value.turnId}`, name: "agent.wait", arguments: {
+                  idempotencyKey: initialWaitKey, taskIds: [taskIds[0]!], mode: "all", timeoutMs: 30_000,
+                } }
+                fixtureInvocationCounters.adapterStage = "completion_emitted"
+                yield { type: "completed", finishReason: "tool_calls" }
+                return
+              }
+              if (execution === 2 && round === 1) {
+                fixtureInvocationCounters.adapterBranch = "repair_plan"
+                fixtureInvocationCounters.adapterStage = "branch_entered"
+                const graph = currentGraphFromRequest(request)
+                const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+                const scout = nodes.find(node => node?.key === "scout")
+                const dependent = nodes.find(node => node?.key === "dependent")
+                fixtureInvocationCounters.adapterStage = "repair_plan_node_keys"
+                expect(nodes.map(node => node?.key)).toEqual(["scout", "dependent"])
+                fixtureInvocationCounters.adapterStage = "repair_plan_source_status"
+                expect(scout?.status).toBe("failed")
+                fixtureInvocationCounters.adapterStage = "repair_plan_source_report"
+                expectUnverifiedVerificationReport(scout?.verificationReport, "candidate-count")
+                fixtureInvocationCounters.adapterStage = "repair_plan_dependent_status"
+                expect(dependent).toMatchObject({ taskId: originalDependentTaskId, status: "waiting" })
+                fixtureInvocationCounters.adapterStage = "graph_checked"
+                fixtureInvocationCounters.adapterStage = "repair_plan_wait_outcome"
+                const outcome = waitOutcomeFromRequest(request, 1)
+                expect(outcome.status).toBe("ready")
+                const waitedScout = outcome.tasks.map(record).find(task => task?.role === "scout")
+                fixtureInvocationCounters.adapterStage = "repair_plan_waited_source"
+                expect(waitedScout?.status).toBe("failed")
+                expect(waitedScout?.taskId).toBe(scout?.taskId)
+                expectUnverifiedVerificationReport(waitedScout?.verificationReport, "candidate-count")
+                fixtureInvocationCounters.adapterStage = "outcome_checked"
+                fixtureInvocationCounters.adapterStage = "repair_plan_dependent_database"
+                const liveDependent = await pool!.query<{ id: string; status: string; turnStatus: string }>(
+                  "SELECT task.\"id\", task.\"status\", turn.\"status\" AS \"turnStatus\" FROM \"sub_agent_tasks\" AS task JOIN \"agent_turns\" AS turn ON turn.\"id\" = task.\"turnId\" AND turn.\"sessionId\" = task.\"sessionId\" WHERE task.\"sessionId\" = $1 AND task.\"turnId\" = $2 AND task.\"goal\" = $3",
+                  [value.sessionId, value.turnId, dependentGoal],
+                )
+                expect(liveDependent.rows).toHaveLength(1)
+                expect(liveDependent.rows[0]).toMatchObject({ id: originalDependentTaskId, status: "waiting" })
+                expect(["queued", "in_progress", "waiting"]).toContain(liveDependent.rows[0]?.turnStatus)
+                fixtureInvocationCounters.adapterStage = "repair_plan_dispatch_check"
+                const noDependentDispatch = await pool!.query(
+                  "SELECT \"id\" FROM \"agent_outbox\" WHERE \"aggregateId\" = $1 AND \"topic\" = $2 AND \"idempotencyKey\" = $3",
+                  [value.sessionId, "agent.subagent.dispatch", "subagent-dispatch:" + originalDependentTaskId],
+                )
+                expect(noDependentDispatch.rowCount).toBe(0)
+                fixtureInvocationCounters.adapterStage = "repair_plan_cancel_check"
+                const noPrematureCancellation = await pool!.query(
+                  "SELECT \"id\" FROM \"agent_events\" WHERE \"sessionId\" = $1 AND \"turnId\" = $2 AND \"taskId\" = $3 AND \"payload\"->>'kind' = $4 AND \"payload\"->'event'->>'type' = $5",
+                  [value.sessionId, value.turnId, originalDependentTaskId, "lifecycle", "task.cancelled"],
+                )
+                expect(noPrematureCancellation.rowCount).toBe(0)
+                fixtureInvocationCounters.adapterStage = "database_checked"
+                initialWaitReportSeen = true
+                const root = await pool!.query<{ rootTaskId: string | null }>(
+                  `SELECT "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
+                  [value.turnId, value.sessionId, value.userId],
+                )
+                const graphRootTaskId = root.rows[0]?.rootTaskId
+                if (!graphRootTaskId || !scout?.taskId || typeof graph?.revision !== "number") throw new Error("Lease recovery fixture lost its graph identity")
+                fixtureInvocationCounters.adapterStage = "tool_call_emitted"
+                yield { type: "tool_call_completed", callId: repairPlanCallId, name: "agent.plan", arguments: {
+                  expectedRevision: graph.revision,
+                  nodes: [{ key: "scout-repair", templateId: "scout", goal: repairGoal, successCriteria: ["Return one evidence-bound candidate"], dependsOn: [], verification: SCOUT_VERIFICATION,
+                    repairOf: { graphRootTaskId, nodeKey: "scout", taskId: scout.taskId, criterionIds: ["candidate-count"] } }],
+                } }
+                fixtureInvocationCounters.adapterStage = "completion_emitted"
+                yield { type: "completed", finishReason: "tool_calls" }
+                return
+              }
+              if (execution === 2 && round === 2) {
+                fixtureInvocationCounters.adapterBranch = "repair_wait"
+                fixtureInvocationCounters.adapterStage = "branch_entered"
+                const repairTaskIds = planTaskIds(request, repairPlanCallId, 1)
+                const graph = currentGraphFromRequest(request)
+                const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+                const repair = nodes.find(node => node?.key === "scout-repair")
+                const dependent = nodes.find(node => node?.key === "dependent")
+                expect(repairTaskIds).toHaveLength(1)
+                repairTaskId = repairTaskIds[0]!
+                expect(repair).toMatchObject({ status: "queued", repairOf: { nodeKey: "scout", criterionIds: ["candidate-count"] } })
+                expect(dependent).toMatchObject({ taskId: originalDependentTaskId, status: "waiting" })
+                fixtureInvocationCounters.adapterStage = "graph_checked"
+                repairPlanAccepted = true
+                fixtureInvocationCounters.adapterStage = "tool_call_emitted"
+                yield { type: "tool_call_completed", callId: repairWaitCallId, name: "agent.wait", arguments: {
+                  idempotencyKey: repairWaitKey, taskIds: [repairTaskIds[0]!, originalDependentTaskId], mode: "all", timeoutMs: 30_000,
+                } }
+                fixtureInvocationCounters.adapterStage = "completion_emitted"
+                yield { type: "completed", finishReason: "tool_calls" }
+                return
+              }
+              if (execution === 3 && round === 1) {
+                fixtureInvocationCounters.adapterBranch = "final_proof"
+                fixtureInvocationCounters.adapterStage = "branch_entered"
+                const graph = currentGraphFromRequest(request)
+                const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+                fixtureInvocationCounters.adapterStage = "final_proof_graph_nodes"
+                expect(nodes.map(node => node?.key)).toEqual(["scout", "dependent", "scout-repair"])
+                const scout = nodes.find(node => node?.key === "scout")
+                const dependent = nodes.find(node => node?.key === "dependent")
+                const repair = nodes.find(node => node?.key === "scout-repair")
+                fixtureInvocationCounters.adapterStage = "final_proof_node_statuses"
+                expect(nodes.map(node => node?.status)).toEqual(["failed", "completed", "completed"])
+                fixtureInvocationCounters.adapterStage = "final_proof_dependent_identity"
+                expect(dependent?.taskId).toBe(originalDependentTaskId)
+                fixtureInvocationCounters.adapterStage = "final_proof_dependent_report"
+                expectPassedVerificationReport(dependent?.verificationReport, "finding-count")
+                fixtureInvocationCounters.adapterStage = "final_proof_repair_report"
+                expectPassedVerificationReport(repair?.verificationReport, "candidate-count")
+                fixtureInvocationCounters.adapterStage = "graph_checked"
+                fixtureInvocationCounters.adapterStage = "final_proof_repair_receipt"
+                expect(record(repair?.repairReceipt)).toMatchObject({
+                  targetNodeKey: "scout", targetTaskId: scout?.taskId, criterionIds: ["candidate-count"],
+                  repairNodeKey: "scout-repair", repairTaskId: repair?.taskId,
+                })
+                fixtureInvocationCounters.adapterStage = "final_proof_wait_outcome"
+                const outcome = waitOutcomeFromRequest(request, 2)
+                expect(outcome.status).toBe("ready")
+                const waitTasks = outcome.tasks.map(record)
+                fixtureInvocationCounters.adapterStage = "final_proof_wait_task_statuses"
+                expect(waitTasks.map(task => task?.status)).toEqual(["completed", "completed"])
+                const repairWaitTask = waitTasks.find(task => task?.taskId === repair?.taskId)
+                const dependentWaitTask = waitTasks.find(task => task?.taskId === originalDependentTaskId)
+                fixtureInvocationCounters.adapterStage = "final_proof_repair_wait_report"
+                expectPassedVerificationReport(repairWaitTask?.verificationReport, "candidate-count")
+                fixtureInvocationCounters.adapterStage = "final_proof_dependent_wait_report"
+                expectPassedVerificationReport(dependentWaitTask?.verificationReport, "finding-count")
+                fixtureInvocationCounters.adapterStage = "outcome_checked"
+                rootCompletedAfterRepair = true
+                fixtureInvocationCounters.adapterStage = "final_output_emitted"
+                yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: "Lease recovery repair unlocked the original dependent" }) }
+                fixtureInvocationCounters.adapterStage = "completion_emitted"
+                yield { type: "completed", finishReason: "stop" }
+                return
+              }
+              throw new Error(`Unexpected lease recovery root turn ${execution}/${round}`)
+            } catch (error: unknown) {
+              fixtureInvocationCounters.adapterFailureCount += 1
+              if (fixtureInvocationCounters.firstAdapterFailureClass === "none") {
+                fixtureInvocationCounters.firstAdapterFailureClass = safeFailurePreflightErrorClass(error)
+                fixtureInvocationCounters.firstAdapterFailureExecutionOrdinal = Math.min(execution, 7)
+                fixtureInvocationCounters.firstAdapterFailureRoundOrdinal = Math.min(round, 7)
+                fixtureInvocationCounters.firstAdapterFailureBranch = fixtureInvocationCounters.adapterBranch
+                fixtureInvocationCounters.firstAdapterFailureStage = fixtureInvocationCounters.adapterStage
+              }
+              throw error
             }
-            if (execution === 1 && round === 2) {
-              fixtureInvocationCounters.adapterBranch = "initial_wait"
-              fixtureInvocationCounters.adapterStage = "branch_entered"
-              const taskIds = planTaskIds(request, planCallId, 2)
-              if (taskIds.length !== 2) throw new Error("Lease recovery fixture plan did not persist its dependent task")
-              originalDependentTaskId = taskIds[1]!
-              fixtureInvocationCounters.adapterStage = "graph_checked"
-              fixtureInvocationCounters.adapterStage = "tool_call_emitted"
-              yield { type: "tool_call_completed", callId: `p3-lease-recovery-initial-wait:${value.turnId}`, name: "agent.wait", arguments: {
-                idempotencyKey: initialWaitKey, taskIds: [taskIds[0]!], mode: "all", timeoutMs: 30_000,
-              } }
-              fixtureInvocationCounters.adapterStage = "completion_emitted"
-              yield { type: "completed", finishReason: "tool_calls" }
-              return
-            }
-            if (execution === 2 && round === 1) {
-              fixtureInvocationCounters.adapterBranch = "repair_plan"
-              fixtureInvocationCounters.adapterStage = "branch_entered"
-              const graph = currentGraphFromRequest(request)
-              const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
-              const scout = nodes.find(node => node?.key === "scout")
-              const dependent = nodes.find(node => node?.key === "dependent")
-              expect(nodes.map(node => node?.key)).toEqual(["scout", "dependent"])
-              expect(scout?.status).toBe("failed")
-              expectUnverifiedVerificationReport(scout?.verificationReport, "candidate-count")
-              expect(dependent).toMatchObject({ taskId: originalDependentTaskId, status: "waiting" })
-              fixtureInvocationCounters.adapterStage = "graph_checked"
-              const outcome = waitOutcomeFromRequest(request, 1)
-              expect(outcome.status).toBe("ready")
-              const waitedScout = outcome.tasks.map(record).find(task => task?.role === "scout")
-              expect(waitedScout?.status).toBe("failed")
-              expect(waitedScout?.taskId).toBe(scout?.taskId)
-              expectUnverifiedVerificationReport(waitedScout?.verificationReport, "candidate-count")
-              fixtureInvocationCounters.adapterStage = "outcome_checked"
-              const liveDependent = await pool!.query<{ id: string; status: string; turnStatus: string }>(
-                "SELECT task.\"id\", task.\"status\", turn.\"status\" AS \"turnStatus\" FROM \"sub_agent_tasks\" AS task JOIN \"agent_turns\" AS turn ON turn.\"id\" = task.\"turnId\" AND turn.\"sessionId\" = task.\"sessionId\" WHERE task.\"sessionId\" = $1 AND task.\"turnId\" = $2 AND task.\"goal\" = $3",
-                [value.sessionId, value.turnId, dependentGoal],
-              )
-              expect(liveDependent.rows).toHaveLength(1)
-              expect(liveDependent.rows[0]).toMatchObject({ id: originalDependentTaskId, status: "waiting" })
-              expect(["queued", "in_progress", "waiting"]).toContain(liveDependent.rows[0]?.turnStatus)
-              const noDependentDispatch = await pool!.query(
-                "SELECT \"id\" FROM \"agent_outbox\" WHERE \"aggregateId\" = $1 AND \"topic\" = $2 AND \"idempotencyKey\" = $3",
-                [value.sessionId, "agent.subagent.dispatch", "subagent-dispatch:" + originalDependentTaskId],
-              )
-              expect(noDependentDispatch.rowCount).toBe(0)
-              const noPrematureCancellation = await pool!.query(
-                "SELECT \"id\" FROM \"agent_events\" WHERE \"sessionId\" = $1 AND \"turnId\" = $2 AND \"taskId\" = $3 AND \"payload\"->>'kind' = $4 AND \"payload\"->'event'->>'type' = $5",
-                [value.sessionId, value.turnId, originalDependentTaskId, "lifecycle", "task.cancelled"],
-              )
-              expect(noPrematureCancellation.rowCount).toBe(0)
-              fixtureInvocationCounters.adapterStage = "database_checked"
-              initialWaitReportSeen = true
-              const root = await pool!.query<{ rootTaskId: string | null }>(
-                `SELECT "rootTaskId" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
-                [value.turnId, value.sessionId, value.userId],
-              )
-              const graphRootTaskId = root.rows[0]?.rootTaskId
-              if (!graphRootTaskId || !scout?.taskId || typeof graph?.revision !== "number") throw new Error("Lease recovery fixture lost its graph identity")
-              fixtureInvocationCounters.adapterStage = "tool_call_emitted"
-              yield { type: "tool_call_completed", callId: repairPlanCallId, name: "agent.plan", arguments: {
-                expectedRevision: graph.revision,
-                nodes: [{ key: "scout-repair", templateId: "scout", goal: repairGoal, successCriteria: ["Return one evidence-bound candidate"], dependsOn: [], verification: SCOUT_VERIFICATION,
-                  repairOf: { graphRootTaskId, nodeKey: "scout", taskId: scout.taskId, criterionIds: ["candidate-count"] } }],
-              } }
-              fixtureInvocationCounters.adapterStage = "completion_emitted"
-              yield { type: "completed", finishReason: "tool_calls" }
-              return
-            }
-            if (execution === 2 && round === 2) {
-              fixtureInvocationCounters.adapterBranch = "repair_wait"
-              fixtureInvocationCounters.adapterStage = "branch_entered"
-              const repairTaskIds = planTaskIds(request, repairPlanCallId, 1)
-              const graph = currentGraphFromRequest(request)
-              const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
-              const repair = nodes.find(node => node?.key === "scout-repair")
-              const dependent = nodes.find(node => node?.key === "dependent")
-              expect(repairTaskIds).toHaveLength(1)
-              repairTaskId = repairTaskIds[0]!
-              expect(repair).toMatchObject({ status: "queued", repairOf: { nodeKey: "scout", criterionIds: ["candidate-count"] } })
-              expect(dependent).toMatchObject({ taskId: originalDependentTaskId, status: "waiting" })
-              fixtureInvocationCounters.adapterStage = "graph_checked"
-              repairPlanAccepted = true
-              fixtureInvocationCounters.adapterStage = "tool_call_emitted"
-              yield { type: "tool_call_completed", callId: repairWaitCallId, name: "agent.wait", arguments: {
-                idempotencyKey: repairWaitKey, taskIds: [repairTaskIds[0]!, originalDependentTaskId], mode: "all", timeoutMs: 30_000,
-              } }
-              fixtureInvocationCounters.adapterStage = "completion_emitted"
-              yield { type: "completed", finishReason: "tool_calls" }
-              return
-            }
-            if (execution === 3 && round === 1) {
-              fixtureInvocationCounters.adapterBranch = "final_proof"
-              fixtureInvocationCounters.adapterStage = "branch_entered"
-              const graph = currentGraphFromRequest(request)
-              const nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
-              fixtureInvocationCounters.adapterStage = "final_proof_graph_nodes"
-              expect(nodes.map(node => node?.key)).toEqual(["scout", "dependent", "scout-repair"])
-              const scout = nodes.find(node => node?.key === "scout")
-              const dependent = nodes.find(node => node?.key === "dependent")
-              const repair = nodes.find(node => node?.key === "scout-repair")
-              fixtureInvocationCounters.adapterStage = "final_proof_node_statuses"
-              expect(nodes.map(node => node?.status)).toEqual(["failed", "completed", "completed"])
-              fixtureInvocationCounters.adapterStage = "final_proof_dependent_identity"
-              expect(dependent?.taskId).toBe(originalDependentTaskId)
-              fixtureInvocationCounters.adapterStage = "final_proof_dependent_report"
-              expectPassedVerificationReport(dependent?.verificationReport, "finding-count")
-              fixtureInvocationCounters.adapterStage = "final_proof_repair_report"
-              expectPassedVerificationReport(repair?.verificationReport, "candidate-count")
-              fixtureInvocationCounters.adapterStage = "graph_checked"
-              fixtureInvocationCounters.adapterStage = "final_proof_repair_receipt"
-              expect(record(repair?.repairReceipt)).toMatchObject({
-                targetNodeKey: "scout", targetTaskId: scout?.taskId, criterionIds: ["candidate-count"],
-                repairNodeKey: "scout-repair", repairTaskId: repair?.taskId,
-              })
-              fixtureInvocationCounters.adapterStage = "final_proof_wait_outcome"
-              const outcome = waitOutcomeFromRequest(request, 2)
-              expect(outcome.status).toBe("ready")
-              const waitTasks = outcome.tasks.map(record)
-              fixtureInvocationCounters.adapterStage = "final_proof_wait_task_statuses"
-              expect(waitTasks.map(task => task?.status)).toEqual(["completed", "completed"])
-              const repairWaitTask = waitTasks.find(task => task?.taskId === repair?.taskId)
-              const dependentWaitTask = waitTasks.find(task => task?.taskId === originalDependentTaskId)
-              fixtureInvocationCounters.adapterStage = "final_proof_repair_wait_report"
-              expectPassedVerificationReport(repairWaitTask?.verificationReport, "candidate-count")
-              fixtureInvocationCounters.adapterStage = "final_proof_dependent_wait_report"
-              expectPassedVerificationReport(dependentWaitTask?.verificationReport, "finding-count")
-              fixtureInvocationCounters.adapterStage = "outcome_checked"
-              rootCompletedAfterRepair = true
-              fixtureInvocationCounters.adapterStage = "final_output_emitted"
-              yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final", response: "Lease recovery repair unlocked the original dependent" }) }
-              fixtureInvocationCounters.adapterStage = "completion_emitted"
-              yield { type: "completed", finishReason: "stop" }
-              return
-            }
-            throw new Error(`Unexpected lease recovery root turn ${execution}/${round}`)
           },
         }
         return { adapter, registry: {} as never, candidates: [] }
@@ -15283,9 +15399,22 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       execute: async (input: Parameters<typeof runtimeResult.execute>[0]) => {
         fixtureInvocationCounters.runtimeExecuteInvocations += 1
         try {
-          return await runtimeResult.execute(input)
+          const result = await runtimeResult.execute(input)
+          if (record(result)?.status === "failed") {
+            fixtureInvocationCounters.runtimeFailureResultCount += 1
+            if (fixtureInvocationCounters.runtimeFailureResultCount === 1) {
+              const errorCode = record(result)?.errorCode
+              const errorCategory = typeof errorCode === "string" ? diagnosticErrorClass(errorCode) : null
+              fixtureInvocationCounters.firstRuntimeFailureResultErrorCategory = errorCategory === null ? "none"
+                : LEASE_RECOVERY_RUNTIME_FAILURE_CATEGORIES.has(errorCategory) ? errorCategory as LeaseRecoveryRuntimeFailureCategory : "other"
+            }
+          }
+          return result
         } catch (error: unknown) {
-          fixtureInvocationCounters.runtimeExecuteFailureClass = safeFailurePreflightErrorClass(error)
+          fixtureInvocationCounters.runtimeExecuteFailureCount += 1
+          if (fixtureInvocationCounters.runtimeExecuteFailureCount === 1) {
+            fixtureInvocationCounters.runtimeExecuteFailureClass = safeFailurePreflightErrorClass(error)
+          }
           throw error
         }
       },
