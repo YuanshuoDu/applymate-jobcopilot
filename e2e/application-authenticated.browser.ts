@@ -112,7 +112,8 @@ test('real credentials carry a synthetic application through manual recording', 
   await editor.locator('textarea').first().fill('Synthetic edited summary.')
   const saved = await save
   expect(saved.status()).toBe(200)
-  expect(await saved.json()).toMatchObject({ id: syntheticResume.id, content: { summary: 'Synthetic edited summary.' } })
+  const savedResume = await saved.json()
+  expect(savedResume).toMatchObject({ id: syntheticResume.id, content: { summary: 'Synthetic edited summary.' } })
   await expect(page.locator('.resume-top-save')).toContainText(/Saved just now|刚刚保存/)
 
   const requireFixture = createRequire(path.resolve('e2e/application-authenticated.browser.ts'))
@@ -136,6 +137,14 @@ test('real credentials carry a synthetic application through manual recording', 
     const drawer = page.getByRole('dialog')
     await expect(drawer).toContainText(fixture.title)
     await assertManualState(job.id, syntheticResume.id, 'saved')
+    const auditResponse = await page.request.get(`/api/jobs/${job.id}/audit-application`)
+    expect(auditResponse.status()).toBe(200)
+    const verifiedAudit = await auditResponse.json()
+    expect(verifiedAudit).toMatchObject({
+      resumeId: syntheticResume.id, coverLetterId: null,
+      resumeUpdatedAt: savedResume.updatedAt,
+      audit: { verdict: 'pass', summary: 'Synthetic fixture audit; no AI auditor was run.' },
+    })
 
     await page.evaluate(() => {
       const fixtureWindow = window as unknown as { downloadNotices: string[]; fixtureBlobUrls: number }
@@ -185,7 +194,13 @@ test('real credentials carry a synthetic application through manual recording', 
     expect(pdfName).toBeTruthy()
     expect(names.filter(name => name.toLowerCase().endsWith('.pdf'))).toHaveLength(1)
     const metadata = JSON.parse(await archive.files[metaName!].async('string') as string)
-    expect(metadata).toMatchObject({ company: fixture.company, role: fixture.title, jobUrl: fixture.url, resume: { id: syntheticResume.id }, coverLetter: null, appliedAt: null })
+    expect(metadata).toMatchObject({
+      job: { id: job.id, company: fixture.company, role: fixture.title, url: fixture.url },
+      resume: { id: syntheticResume.id, updatedAt: savedResume.updatedAt },
+      coverLetter: null,
+      audit: { verdict: 'pass', auditedAt: verifiedAudit.audit.auditedAt },
+    })
+    expect(Number.isFinite(Date.parse(metadata.exportedAt))).toBe(true)
     const pdfBytes = await archive.files[pdfName!].async('nodebuffer') as Buffer
     expect(pdfBytes.subarray(0, 5).toString()).toBe('%PDF-')
     const parsePdf = requireWeb('pdf-parse') as (bytes: Uint8Array) => Promise<{ text: string }>

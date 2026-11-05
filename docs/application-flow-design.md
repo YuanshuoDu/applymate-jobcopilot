@@ -31,16 +31,18 @@ Agent 负责原任务的执行和审批，招聘消息负责查看回复。
    需要修正求职信但尚未选择时，先选择。
 5. “确认申请材料”表示选择此职位使用的版本，不会授权向雇主提交。材料内容或
    选择变化后，检查当前版本；旧检查结果不代表新版本已通过。
-6. 材料检查通过且仍适用于当前版本后，点击下载申请材料 ZIP。浏览器在生成前读取
-   并核对所选材料和已通过的检查，生成后再次读取并比较；变化或读取失败时不会保存
-   ZIP，请刷新、核对并重新检查。此复核不是原子操作，下载后仍需自行检查文件。
+6. 材料检查通过且仍适用于当前版本后，点击下载申请材料 ZIP。服务器核验登录账号、
+   职位、所选材料版本与审核签名，再生成 ZIP。浏览器在请求前后读取并比较材料；
+   账号或材料变化、读取失败时不会保存文件，请刷新、核对并重新检查。多次读取并非
+   原子操作，下载后仍需自行检查文件。
 7. 打开 ZIP，逐页核对简历和所选求职信的文字、分页、字体和排版，再“前往雇主网站”
-   完成申请。PDF 排版可能与网页预览不同，字体覆盖有限，遇到不支持的字符时会阻止导出并提示；常见换行、制表符、
-   不间断空格和可组合音标会在 PDF 中规范化，原材料不变。
+   完成申请。PDF 排版可能与网页预览不同，字体覆盖有限；遇到不支持的字符时会阻止
+   下载并提示使用“打印视图／另存为 PDF”，同样需要通过服务器审核校验。保存前请
+   检查打印预览。常见换行、制表符、不间断空格和可组合音标会在 PDF 中规范化，原材料不变。
 8. 只有实际提交完成后，点击“记录我已在雇主网站提交”。这是用户报告的手动记录，
    不能替代雇主回执。若显示记录已接收但状态待刷新，或结果未知，点击“刷新记录状态”
-   会重新读取职位、申请历史和任务状态；若仍未确认，先核对申请历史及雇主回执，不重复记录。现有服务可能先更新
-   状态、后写历史；若历史记录缺失，不能仅凭状态判断记录来源。刷新发现已有申请记录，
+   会重新读取职位、申请历史和任务状态；若仍未确认，先核对申请历史及雇主回执，不重复记录。手动记录
+   的职位状态和来源历史在同一事务中写入；若历史记录缺失，不能仅凭状态判断记录来源。刷新发现已有申请记录，
    也不能证明它由哪一次请求产生；未知请求会继续保持锁定。
    如果记录或状态读取长时间没有响应，页面会结束等待并允许重新读取状态；
    请求超时不代表服务端没有处理，也不会自动重新发送记录。
@@ -64,7 +66,8 @@ Agent 负责原任务的执行和审批，招聘消息负责查看回复。
 4. 登录、验证码或 MFA 按原会话的交接说明处理；仅在现有系统允许时恢复。
 5. 结果待核实时先查看原会话和回执，不再次提交。
 
-隔离测试发现：新建会话可能在会话已创建后显示失败；如果遇到类似情况，
+较早的隔离测试发现：新建会话可能在会话已创建后显示失败；相关修复已进入主线。
+如果遇到类似情况，
 先查看会话列表，确认是否已有对应会话，避免反复新建。测试中还发现，
 原生问题可能无法显示并使任务失败；此时查看原任务状态，必要时使用上面的
 手动申请流程。上述问题记录在本次 PR 中，实际线上状态尚未验证，修复需要在
@@ -100,6 +103,9 @@ Agent 维护范围内单独处理。
 职位关联、材料确认或审核修正结果待核实时，先复制未保存的编辑，再重新加载并核对；
 页面会阻止相关重复操作。一次读取不能证明仍在处理的写入没有发生，页面内保护也不跨
 标签页或重载。切换简历后如读取失败，重试并确认所选版本，旧内容不会被作为新简历使用。
+材料审核请求结果未知时，不能凭刷新后看到的一次旧通过状态断定新请求已经结束；
+先核对最新审核记录及材料，避免重复启动审核。服务器下载会独立校验当前审核和材料，
+但现有接口不能证明此前在途审核不会晚到，跨刷新和跨页面的审核顺序仍需后续改进。
 草稿恢复到最新简历后，只有原来进入编辑器时存在可信的职位与返回列表上下文，才会
 恢复该职位和筛选条件；否则不会从当前其他账号的地址猜测关联。
 查看、返回或刷新简历不会自动启动 AI 分析；需要时请点击“分析匹配度”。
@@ -196,9 +202,16 @@ has not loaded is not treated as absent.
 | Current material check passed | Use the selected materials | Keep selection distinct from submit permission |
 | Employer requires manual submission | Open employer website | Open a link only |
 
-Jobs and Resume share the same current-material predicate: document IDs, saved
-revisions or conservative legacy audit times, and unsaved edits are checked.
-Missing or malformed revision information does not establish readiness.
+Jobs and Resume check document IDs, saved revisions and unsaved edits. A current
+application-pack download also requires the server to verify the signed audit
+receipt and the exact selected document versions. Missing or malformed revision
+information does not establish readiness.
+
+The in-page recheck guard does not establish a durable terminal state for an audit
+request after reload or across pages. A single read of an older passing record
+cannot prove an earlier request has stopped. The server separately validates the
+latest receipt and materials at download, but cannot establish that an in-flight
+audit will not write later; durable audit ordering remains follow-up work.
 
 An absent optional letter is distinct from a selected letter still loading.
 Confirming the same selected letter omits a redundant assignment, because that
@@ -236,12 +249,15 @@ Applied. That changes the status and records a generic status-change activity;
 it does not use the manual-submission record or add its source marker. A board
 status is user-maintained tracking information, not an employer receipt.
 
-The browser ZIP download reads the account-owned job, selected saved documents
-and existing passing audit before rendering. It then reads them again and compares
-the snapshot before saving; missing, changed or unreadable material prevents that
-download. These are read-only checks of an existing audit, not a new AI audit.
-The client-side checks and file save are not atomic with concurrent server changes;
-review each downloaded PDF before use. A ZIP contains the selected resume PDF,
+The browser reads the account-owned job, selected saved documents and existing
+passing audit before requesting the ZIP. The server validates ownership, the signed
+audit receipt and selected versions, then renders the ZIP. Before saving, the
+browser reads and compares the material snapshot again; missing, changed or
+unreadable material prevents saving. These checks do not start a new AI audit.
+The reads, server rendering and file save are not one atomic operation across
+concurrent changes; review each downloaded PDF before use. The same server gate
+protects Print view / Save as PDF, which offers an alternative when a PDF font
+cannot represent a character; inspect the print preview before saving. A ZIP contains the selected resume PDF,
 the selected cover letter PDF if present, and metadata. PDF pagination, layout
 and font rendering can differ from the web preview. Character and font coverage
 is limited to what is verified in the actual downloaded files. Unsupported glyphs,
@@ -348,7 +364,7 @@ Adding that association remains a separately scoped data requirement.
 | --- | --- |
 | Navigation and list restoration | `application-navigation`, `application-list-state` |
 | Material identity and freshness | `application-material-selection`, `application-materials`, `application-analysis-cache` |
-| Browser ZIP verification and rendering | `application-export-snapshot`, `bundle`, `resume-pdf`, `cover-letter-pdf` |
+| Audited server ZIP and browser snapshot checks | `application-export-snapshot`, `bundle`, `application-pack`, `application-audit-receipt`, `resume-pdf`, `cover-letter-pdf` |
 | Manual record status | `application-manual-record` |
 | Account-bound in-memory recovery | `application-recovery-draft`, `application-recovery-navigation` |
 | Saved-search identity and cancellation | `application-search-state`, `application-search-save` |
@@ -363,7 +379,7 @@ An isolated CI fixture also signs in with real synthetic credentials against a
 disposable database, saves a synthetic search result, opens and reloads its exact
 application, and checks that another account cannot read it. The fixture creates
 and links a synthetic resume through the real API, edits it in the UI, confirms
-materials using a seeded synthetic audit, checks the downloaded PDF text, opens
+materials using a signed, seeded synthetic audit, checks the downloaded PDF text, opens
 a mocked employer page and explicitly records a synthetic manual application.
 Database assertions distinguish the state before and after that record. Search,
 the audit and employer page are simulated, and database RLS is disabled; this
@@ -372,12 +388,12 @@ One fixture opens the original Agent session from an application, answers a mock
 question, reviews a mock approval and displays a simulated unverified outcome;
 its state changes are injected by the fixture and page reloads. These checks prove
 UI wiring, not Worker execution, authenticated database, live ATS or production behavior.
-An additional isolated real-authentication test found that session creation returned
-500 after persisting a session. Continuing with that unique test session reached
-the real usage authorization and synthetic model, but the native question failed:
-the stored tool result had its question redacted and the turn ended `invalid_output`.
-The real question, approval and execution journey remains unverified. These are
-disposable test observations, not verification of the deployed environment.
+An earlier isolated real-authentication test found that session creation returned
+500 after persisting a session; the session serialization fix was subsequently
+merged. Later isolated tests reached a synthetic turn, but the native question still
+failed with `invalid_output`, and approval could remain visible after its decision
+was recorded. The question, approval and execution journey remains unverified.
+These are disposable test observations, not verification of the deployed environment.
 
 Worker runtime, Agent-owned layout, protocol, policies, mutation APIs, schema and
 roadmap remain under their existing owners. No new state machine, persistent
