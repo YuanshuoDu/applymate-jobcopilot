@@ -10,6 +10,73 @@ const goal = 'Fixture native question round'
 const question = 'Which synthetic city should the fixture use?'
 const answer = 'Fixture Dublin'
 const finalText = 'Synthetic question was answered and the canonical turn resumed.'
+const MAX_DIAGNOSTIC_COUNT = 1_000
+const TURN_STATUSES = ['queued', 'in_progress', 'waiting_for_dependency', 'waiting_for_approval', 'waiting_for_user', 'interrupted', 'cancelled', 'failed', 'completed'] as const
+const QUESTION_STATUSES = ['queued', 'started', 'completed', 'failed', 'interrupted', 'cancelled'] as const
+const STEP_STATUSES = ['queued', 'streaming', 'waiting_for_tool', 'waiting_for_approval', 'waiting_for_user', 'completed', 'failed', 'interrupted'] as const
+const TASK_STATUSES = ['queued', 'running', 'waiting', 'waiting_for_user', 'completed', 'failed', 'interrupted', 'cancelled', 'closed', 'passed', 'retrying', 'skipped'] as const
+
+function diagnosticCount(value: number): number {
+  return Number.isSafeInteger(value) && value > 0 ? Math.min(value, MAX_DIAGNOSTIC_COUNT) : 0
+}
+
+function statusCounts(rows: { status: string }[], allowed: readonly string[]): Record<string, number> {
+  const counts: Record<string, number> = Object.fromEntries([...allowed, 'other'].map(status => [status, 0]))
+  for (const row of rows) counts[allowed.includes(row.status) ? row.status : 'other'] += 1
+  return Object.fromEntries(Object.entries(counts).map(([status, count]) => [status, diagnosticCount(count)]))
+}
+
+function statusCategory(value: string | null, allowed: readonly string[]): string {
+  return value === null ? 'absent' : allowed.includes(value) ? value : 'other'
+}
+
+async function logBoundedTurnDiagnostic(phase: 'awaiting_question' | 'after_answer', sessionId: string, turnId: string,
+  inspectTurn: (sessionId: string, turnId: string) => Promise<{
+    turn: { status: string; error: string | null; completedEvents: number; answeredEvents: number }
+    questions: { status: string; content: { answer?: string | null } }[]
+    eventTypes: string[]
+    steps: { status: string; errorCode: string | null; finishReason: string | null }[]
+    tasks: { status: string; failureReason: string | null }[]
+    toolResultCount: number
+    toolResultQuestionRedacted: boolean | null
+    wakeupOutbox: { count: number; publishedCount: number; maxAttemptCount: number }
+  }>) {
+  try {
+    const state = await inspectTurn(sessionId, turnId)
+    const countEvents = (type: string) => diagnosticCount(state.eventTypes.filter(eventType => eventType === type).length)
+    console.error('Synthetic turn bounded diagnostic', JSON.stringify({
+      phase,
+      stateAvailable: true,
+      turnStatus: statusCategory(state.turn.status, TURN_STATUSES),
+      turnErrorPresent: Boolean(state.turn.error),
+      questionCount: diagnosticCount(state.questions.length),
+      questionStatusCounts: statusCounts(state.questions, QUESTION_STATUSES),
+      questionAnswerPresent: state.questions.some(item => item.content.answer != null),
+      eventCounts: {
+        wakeup: countEvents('turn.wakeup'),
+        resumed: countEvents('turn.resumed'),
+        answered: countEvents('question.answered'),
+        completed: countEvents('turn.completed'),
+        failed: countEvents('turn.failed'),
+      },
+      completedEvents: diagnosticCount(state.turn.completedEvents),
+      answeredEvents: diagnosticCount(state.turn.answeredEvents),
+      wakeupOutboxCount: diagnosticCount(state.wakeupOutbox.count),
+      wakeupOutboxPublished: state.wakeupOutbox.publishedCount > 0,
+      wakeupOutboxPublishedCount: diagnosticCount(state.wakeupOutbox.publishedCount),
+      wakeupOutboxMaxAttemptCount: diagnosticCount(state.wakeupOutbox.maxAttemptCount),
+      stepStatusCounts: statusCounts(state.steps, STEP_STATUSES),
+      stepErrorPresentCount: diagnosticCount(state.steps.filter(step => Boolean(step.errorCode)).length),
+      stepFinishReasonPresentCount: diagnosticCount(state.steps.filter(step => Boolean(step.finishReason)).length),
+      taskStatusCounts: statusCounts(state.tasks, TASK_STATUSES),
+      taskFailurePresentCount: diagnosticCount(state.tasks.filter(task => Boolean(task.failureReason)).length),
+      toolResultCount: diagnosticCount(state.toolResultCount),
+      toolResultQuestionRedacted: state.toolResultQuestionRedacted,
+    }))
+  } catch {
+    console.error('Synthetic turn bounded diagnostic', JSON.stringify({ phase, stateAvailable: false }))
+  }
+}
 
 test('synthetic native question resumes the actual authenticated turn', async ({ browser }) => {
   if (process.env.CI !== 'true' || process.env.APPLICATION_AUTH_DISPOSABLE !== 'true'
@@ -23,7 +90,7 @@ test('synthetic native question resumes the actual authenticated turn', async ({
   const requireFixture = createRequire(path.resolve('e2e/application-authenticated-agent.browser.ts'))
   const { initializeFixtureSse, inspectTurn, closeFixtureDb } = requireFixture('./application-authenticated-agent-db.cjs') as {
     initializeFixtureSse: () => Promise<void>
-    inspectTurn: (sessionId: string, turnId: string) => Promise<{ turn: { status: string; error: string | null; completedEvents: number; answeredEvents: number; finalResponse: string | null }; questions: { id: string; status: string; content: { questionId?: string; question?: string; answer?: string | null; toolCallId?: string } }[]; eventTypes: string[]; steps: { status: string; errorCode: string | null; finishReason: string | null }[]; tasks: { status: string; failureReason: string | null }[]; toolResultCount: number; toolResultQuestionRedacted: boolean | null }>
+    inspectTurn: (sessionId: string, turnId: string) => Promise<{ turn: { status: string; error: string | null; completedEvents: number; answeredEvents: number; finalResponse: string | null }; questions: { id: string; status: string; content: { questionId?: string; question?: string; answer?: string | null; toolCallId?: string } }[]; eventTypes: string[]; steps: { status: string; errorCode: string | null; finishReason: string | null }[]; tasks: { status: string; failureReason: string | null }[]; toolResultCount: number; toolResultQuestionRedacted: boolean | null; wakeupOutbox: { count: number; publishedCount: number; maxAttemptCount: number } }>
     closeFixtureDb: () => Promise<void>
   }
   try {
@@ -74,16 +141,9 @@ test('synthetic native question resumes the actual authenticated turn', async ({
         const target = body.turns.find((turn: { id: string }) => turn.id === turnId)
         return `not-active:${target?.status ?? 'missing'}`
       }, { timeout: 60_000 }).toBe('waiting_for_user')
-    } catch (error) {
-      const diagnostic = await inspectTurn(sessionId, turnId)
-      const safeCode = (value: string | null) => value && /^[a-z0-9_.: -]{1,128}$/i.test(value)
-        ? value : value ? 'present-but-omitted' : null
-      console.error('Synthetic turn diagnostic', JSON.stringify({ status: diagnostic.turn.status, errorCode: safeCode(diagnostic.turn.error),
-        questionCount: diagnostic.questions.length, eventTypes: diagnostic.eventTypes,
-        toolResultCount: diagnostic.toolResultCount, toolResultQuestionRedacted: diagnostic.toolResultQuestionRedacted,
-        steps: diagnostic.steps.map(step => ({ status: step.status, errorCode: safeCode(step.errorCode), finishReason: safeCode(step.finishReason) })),
-        tasks: diagnostic.tasks.map(task => ({ status: task.status, failureReason: safeCode(task.failureReason) })) }))
-      throw error
+    } catch {
+      await logBoundedTurnDiagnostic('awaiting_question', sessionId, turnId, inspectTurn)
+      throw new Error('Turn did not reach the expected question wait state; see bounded diagnostics')
     }
     const waiting = await inspectTurn(sessionId, turnId)
     expect(waiting.turn.status).toBe('waiting_for_user')
@@ -111,12 +171,17 @@ test('synthetic native question resumes the actual authenticated turn', async ({
     const answered = await submitted
     expect(answered.status()).toBe(202)
     expect((await answered.json()).disposition).toBe('resolved')
-    await expect.poll(async () => {
-      const response = await page.request.get(turnsUrl)
-      if (!response.ok()) return 'unavailable'
-      const body = await response.json()
-      return body.turns.find((turn: { id: string }) => turn.id === turnId)?.status ?? 'missing'
-    }, { timeout: 60_000 }).toBe('completed')
+    try {
+      await expect.poll(async () => {
+        const response = await page.request.get(turnsUrl)
+        if (!response.ok()) return 'unavailable'
+        const body = await response.json()
+        return body.turns.find((turn: { id: string }) => turn.id === turnId)?.status ?? 'missing'
+      }, { timeout: 60_000 }).toBe('completed')
+    } catch {
+      await logBoundedTurnDiagnostic('after_answer', sessionId, turnId, inspectTurn)
+      throw new Error('Turn did not complete after the accepted answer; see bounded diagnostics')
+    }
     await expect(page.getByText(finalText, { exact: false })).toBeVisible({ timeout: 30_000 })
     const finished = await inspectTurn(sessionId, turnId)
     expect(finished.turn).toMatchObject({ status: 'completed', completedEvents: 1, answeredEvents: 1 })

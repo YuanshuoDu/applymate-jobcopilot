@@ -65,8 +65,16 @@ async function inspectTurn(sessionId, turnId) {
     BOOL_OR("content"->'output'->>'question' = '[REDACTED]') AS "questionRedacted"
     FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'tool_result'
       AND "content"->>'toolCallId' = 'fixture-native-question'`, [sessionId, turnId])
+  const wakeupOutbox = await pool.query(`SELECT COUNT(*)::int AS count,
+    COUNT(*) FILTER (WHERE outbox."publishedAt" IS NOT NULL)::int AS "publishedCount",
+    COALESCE(MAX(outbox."attemptCount"), 0)::int AS "maxAttemptCount"
+    FROM "agent_events" AS event
+    JOIN "agent_outbox" AS outbox ON outbox."idempotencyKey" = 'agent-event:' || event."id"
+      AND outbox."topic" = 'agent.turn.wakeup' AND outbox."aggregateId" = event."sessionId"
+    WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."type" = 'turn.wakeup'`, [sessionId, turnId])
   return { turn: row, questions: items.rows, eventTypes: events.rows.map(event => event.type), steps: steps.rows, tasks: tasks.rows,
-    toolResultCount: toolResults.rows[0].count, toolResultQuestionRedacted: toolResults.rows[0].questionRedacted }
+    toolResultCount: toolResults.rows[0].count, toolResultQuestionRedacted: toolResults.rows[0].questionRedacted,
+    wakeupOutbox: wakeupOutbox.rows[0] }
 }
 
 module.exports = { initializeFixtureSse, inspectTurn, closeFixtureDb: () => pool.end() }
