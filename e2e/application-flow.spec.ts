@@ -145,7 +145,7 @@ function audit(resumeUpdatedAt = time, hasCoverLetter = false) {
   return record as typeof record & { coverLetterUpdatedAt?: string }
 }
 
-async function install(page: Page, options: { stale?: boolean; taskCheckpoint?: string | null; taskStatus?: 'unknown' | 'waiting_for_user' | 'waiting_for_authorization' | 'cancelled' | 'failed' | 'filling'; recordedInitially?: boolean; evidenceCase?: 'bound' | 'unbound' | 'unavailable'; previewMismatch?: 'owner' | 'id' | 'job'; malformedPreview?: 'content' | 'contact'; letterRaceProbe?: boolean; letterInvalid?: 'null' | 'owner' | 'job' | 'duplicate' | 'content'; letterAfterInitial?: 'changed' | 'failure' | 'hold' | 'manual-change' | 'audit-same' | 'audit-failure' | 'audit-hold'; auditVersion?: 'same' | 'resume-changed' | 'letter-changed' | 'resume-missing' | 'letter-missing'; holdAudit?: boolean; holdAssign?: boolean; externalLetterSelection?: boolean; failTailoredRead?: boolean; taskFailure?: boolean; taskLimited?: boolean; missing?: boolean; holdSelectedLetter?: boolean; selectedLetter?: boolean; firstPreparation?: boolean; descriptionMode?: 'success' | 'unknown' | 'audit' | 'two' | 'conflict' | 'hold-response' | 'hold-other'; initialDescription?: string | null; holdBaseSave?: boolean; failBaseSave?: boolean; baseList?: 'empty' | 'fail-once' | 'fail-once-hold' | 'hold-empty' | 'multiple' | 'single' | 'default'; failFirstAudit?: boolean; flowSave?: boolean; manualOutcome?: 'get-fails' | 'unknown'; search?: boolean; saveMode?: 'fail' | 'hold-success' | 'hold-fail'; twoResumes?: boolean; holdResumeContent?: boolean; snapshotResumeContent?: boolean; resumeRevalidationFails?: boolean; versionedScore?: boolean; holdOldAnalysis?: boolean; holdFirstAnalysisOnly?: boolean; auditCorrection?: boolean; holdAuditCorrection?: boolean; versions?: boolean; holdVersionRestore?: boolean; versionRestoreFails?: boolean; realAgent?: boolean; expiredApproval?: boolean; twoJobQuestions?: boolean; holdFirstTaskRead?: boolean; holdReturnOwnerA?: boolean; taskPerUser?: boolean; dashboardFourTasks?: boolean; agentJourney?: boolean } = {}) {
+async function install(page: Page, options: { stale?: boolean; taskCheckpoint?: string | null; taskStatus?: 'unknown' | 'waiting_for_user' | 'waiting_for_authorization' | 'cancelled' | 'failed' | 'filling'; recordedInitially?: boolean; evidenceCase?: 'bound' | 'unbound' | 'unavailable'; previewMismatch?: 'owner' | 'id' | 'job'; malformedPreview?: 'content' | 'contact'; letterRaceProbe?: boolean; letterInvalid?: 'null' | 'owner' | 'job' | 'duplicate' | 'content'; letterAfterInitial?: 'changed' | 'failure' | 'hold' | 'manual-change' | 'audit-same' | 'audit-failure' | 'audit-hold'; auditVersion?: 'same' | 'resume-changed' | 'letter-changed' | 'resume-missing' | 'letter-missing'; holdAudit?: boolean; holdAssign?: boolean; externalLetterSelection?: boolean; failTailoredRead?: boolean; taskFailure?: boolean; taskLimited?: boolean; missing?: boolean; holdSelectedLetter?: boolean; selectedLetter?: boolean; firstPreparation?: boolean; descriptionMode?: 'success' | 'unknown' | 'audit' | 'two' | 'conflict' | 'hold-response' | 'hold-other'; initialDescription?: string | null; holdBaseSave?: boolean; failBaseSave?: boolean; baseList?: 'empty' | 'fail-once' | 'fail-once-hold' | 'hold-empty' | 'multiple' | 'single' | 'default'; failFirstAudit?: boolean; flowSave?: boolean; manualOutcome?: 'get-fails' | 'unknown'; search?: boolean; saveMode?: 'fail' | 'hold-success' | 'hold-fail'; twoResumes?: boolean; holdResumeContent?: boolean; snapshotResumeContent?: boolean; resumeRevalidationFails?: boolean; versionedScore?: boolean; holdOldAnalysis?: boolean; holdFirstAnalysisOnly?: boolean; auditCorrection?: boolean; holdAuditCorrection?: boolean; versions?: boolean; holdVersionRestore?: boolean; versionRestoreFails?: boolean; realAgent?: boolean; expiredApproval?: boolean; twoJobQuestions?: boolean; delayedQuestionTask?: boolean; holdFirstTaskRead?: boolean; holdReturnOwnerA?: boolean; taskPerUser?: boolean; dashboardFourTasks?: boolean; agentJourney?: boolean } = {}) {
   let releaseReturnOwnerA = () => {}
   const returnOwnerAGate = new Promise<void>(resolve => { releaseReturnOwnerA = resolve })
   let releaseStaleJob = () => {}
@@ -224,8 +224,8 @@ async function install(page: Page, options: { stale?: boolean; taskCheckpoint?: 
         }
         if (pathname === `${prefix}/tasks` && method === 'GET') return json(route, { tasks: [] })
         if (pathname === `${prefix}/timeline` && method === 'GET') {
-          const question = { schemaVersion: 'agent-harness.v2', id: `item-${questionId}`, sessionId: id, turnId, stepId: null, taskId: null, type: 'question', status: 'started', phase: 'commentary', revision: 0, startedAt: null, completedAt: null, createdAt: time, updatedAt: time, sequence: '1', content: { waitKind: 'question', questionId, stage: 'profile', question: 'Confirm the same fixture fact?', options: [{ value: 'yes', label: 'Yes' }], answerAvailable: false, pending: true } }
-          return json(route, { items: answered ? [] : [question], approvalEvents: [] })
+          const question = { schemaVersion: 'agent-harness.v2', id: `item-${questionId}`, sessionId: id, turnId, stepId: null, taskId: null, type: 'question', status: answered ? 'completed' : 'started', phase: 'commentary', revision: answered ? 1 : 0, startedAt: null, completedAt: answered ? time : null, createdAt: time, updatedAt: time, sequence: '1', content: { waitKind: 'question', questionId, stage: 'profile', question: 'Confirm the same fixture fact?', options: [{ value: 'yes', label: 'Yes' }], answerAvailable: answered, pending: !answered } }
+          return json(route, { items: [question], approvalEvents: [] })
         }
         if (pathname === `${prefix}/events` && method === 'GET') return route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': fixture waiting\n\n' })
         if (pathname === `${prefix}/questions/question-a` && method === 'POST' && id === 'session-a' && !state.answeredJobA) { state.answeredJobA = true; return json(route, { disposition: 'resolved' }, 202) }
@@ -350,7 +350,7 @@ async function install(page: Page, options: { stale?: boolean; taskCheckpoint?: 
       state.taskReads++
       if (options.taskFailure) return json(route, { error: 'Fixture unavailable' }, 500)
       if (options.taskLimited) return json(route, { tasks: Array.from({ length: 100 }, (_, i) => ({ id: `task-${i}`, userId: 'fixture-user', jobId: `other-job-${i}`, sessionId: `session-${i}`, status: 'filling', checkpoint: null, updatedAt: time, job: { company: 'Other employer', role: 'Other role' } })) })
-      if (options.twoJobQuestions) return json(route, { tasks: [{ id: 'task-a', userId: 'fixture-user', jobId: 'outside-page', sessionId: 'session-a', status: state.answeredJobA ? 'filling' : 'waiting_for_user', checkpoint: state.answeredJobA ? null : 'form_answer_required', updatedAt: time, job: { company: 'Fixture Employer', role: 'Application flow engineer' } }, { id: 'task-b', userId: 'fixture-user', jobId: 'job-2', sessionId: 'session-b', status: 'waiting_for_user', checkpoint: 'form_answer_required', updatedAt: time, job: { company: 'Employer B', role: 'Role B' } }] })
+      if (options.twoJobQuestions) return json(route, { tasks: [{ id: 'task-a', userId: 'fixture-user', jobId: 'outside-page', sessionId: 'session-a', status: state.answeredJobA && !options.delayedQuestionTask ? 'filling' : 'waiting_for_user', checkpoint: state.answeredJobA && !options.delayedQuestionTask ? null : 'form_answer_required', updatedAt: time, job: { company: 'Fixture Employer', role: 'Application flow engineer' } }, { id: 'task-b', userId: 'fixture-user', jobId: 'job-2', sessionId: 'session-b', status: 'waiting_for_user', checkpoint: 'form_answer_required', updatedAt: time, job: { company: 'Employer B', role: 'Role B' } }] })
       if (options.dashboardFourTasks) return json(route, { tasks: [1, 2, 3, 4].map(n => ({ id: `task-${n}`, userId: 'fixture-user', jobId: `job-${n}`, sessionId: `session-${n}`, status: 'waiting_for_user', checkpoint: 'form_answer_required', updatedAt: `2026-10-30T1${4 - n}:00:00.000Z`, job: { company: `Employer ${n}`, role: `Role ${n}` } })) })
       if (options.taskPerUser && state.activeUserId === 'fixture-b') return json(route, { tasks: [{ id: 'task-b', userId: 'fixture-b', jobId: 'job-b', sessionId: 'session-b', status: 'waiting_for_authorization', checkpoint: 'form_filled', updatedAt: time, job: { company: 'Fixture B', role: 'Engineer B' } }] })
       if (options.holdReturnOwnerA && state.activeUserId === 'fixture-user' && state.armReturnOwnerA) { state.returnOwnerAEntered = true; await returnOwnerAGate }
@@ -3132,6 +3132,40 @@ test('a failed delayed save keeps the original resume selected', async ({ page }
 })
 
 
+test('mobile keyboard opens an application, reviews its issue and returns focus to its card', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'mobile-zh', 'Exercises the narrow Chinese application list with a keyboard')
+  const state = await install(page, { descriptionMode: 'two', auditCorrection: true })
+  await page.goto(`${origin}/?page=jobs`)
+  const entry = page.getByRole('button', { name: 'View Application flow engineer at Fixture Employer', exact: true })
+  await expect(entry).toBeVisible()
+  let reachedEntry = false
+  for (let index = 0; index < 120; index++) {
+    await page.keyboard.press('Tab')
+    if (await entry.evaluate(element => document.activeElement === element)) { reachedEntry = true; break }
+  }
+  expect(reachedEntry).toBe(true)
+  await page.keyboard.press('Enter')
+  const drawer = page.getByRole('dialog')
+  await expect(drawer).toContainText('Application flow engineer')
+  await expect(drawer).toContainText('Fixture Employer')
+  await expect(page).toHaveURL(/highlight=outside-page/)
+  const review = drawer.getByRole('button', { name: /Review material issues|查看材料问题/, exact: true })
+  await expect(review).toBeVisible()
+  let reachedReview = false
+  for (let index = 0; index < 120; index++) {
+    await page.keyboard.press('Tab')
+    if (await review.evaluate(element => document.activeElement === element)) { reachedReview = true; break }
+  }
+  expect(reachedReview).toBe(true)
+  await page.keyboard.press('Enter')
+  await expect(drawer.getByText('Fix summary')).toBeVisible()
+  await page.keyboard.press('Escape')
+  await expect(drawer).toHaveCount(0)
+  await expect(entry).toBeFocused()
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
 test('application drawer traps keyboard focus and closes with Escape', async ({ page }) => {
   const state = await install(page)
   await open(page)
@@ -3964,9 +3998,9 @@ test('an uncertain version restore remains guarded against automatic save or ret
 })
 
 
-test('identical questions on two applications remain scoped to their original sessions', async ({ page }, testInfo) => {
+for (const taskState of ['updated', 'delayed'] as const) test(`answered question remains in its session while application task state is ${taskState}`, async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== 'desktop-en', 'Exercises the real desktop Agent shell')
-  const state = await install(page, { realAgent: true, twoJobQuestions: true })
+  const state = await install(page, { realAgent: true, twoJobQuestions: true, delayedQuestionTask: taskState === 'delayed' })
   await page.goto(`${origin}/?shell=1&page=jobs&highlight=outside-page`)
   await expect(page.getByRole('dialog')).toContainText('Application flow engineer')
   await page.getByRole('link', { name: 'Continue in the original task' }).click()
@@ -3977,6 +4011,28 @@ test('identical questions on two applications remain scoped to their original se
   await first.getByRole('button', { name: 'Yes', exact: true }).click()
   await first.getByRole('button', { name: 'Send answer', exact: true }).click()
   await expect.poll(() => state.answeredJobA).toBe(true)
+  const readsBeforeReturn = state.taskReads
+  await page.goto(`${origin}/?shell=1&page=jobs&highlight=outside-page`)
+  const application = page.getByRole('dialog')
+  await expect(application).toContainText('Application flow engineer')
+  await expect.poll(() => state.taskReads).toBeGreaterThan(readsBeforeReturn)
+  const task = application.getByRole('region', { name: 'Fixture Employer · Application flow engineer' })
+  await expect(task).toContainText(taskState === 'delayed' ? 'Your action is needed' : 'Filling application')
+  const taskLink = task.getByRole('link', { name: taskState === 'delayed' ? 'Continue in the original task' : 'View task activity' })
+  await expect(taskLink).toBeVisible()
+  const timelineResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/api/agent/sessions/session-a/timeline' && response.request().method() === 'GET')
+  await taskLink.click()
+  await expect(page).toHaveURL(/sessionId=session-a/)
+  const timeline = await (await timelineResponse).json()
+  expect(timeline.items).toEqual([expect.objectContaining({ id: 'item-question-a', sessionId: 'session-a', turnId: 'turn-a', status: 'completed', content: expect.objectContaining({ questionId: 'question-a', answerAvailable: true, pending: false }) })])
+  await page.getByRole('button', { name: /^Tasks & results/ }).click()
+  const history = page.locator('[data-agent-question-history="true"]')
+  await expect(history).toBeVisible()
+  await history.locator('summary').click()
+  await expect(history).toContainText('Confirm the same fixture fact?')
+  await expect(history.getByRole('button', { name: 'Send answer', exact: true })).toHaveCount(0)
+  await expect(history.getByRole('button', { name: 'Yes', exact: true })).toHaveCount(0)
+  await expect(page.locator('[data-agent-question-card="true"]').getByRole('button', { name: 'Send answer', exact: true })).toHaveCount(0)
   await page.goto(`${origin}/?shell=1&page=jobs&highlight=job-2`)
   await expect(page.getByRole('dialog')).toContainText('Employer B')
   await page.getByRole('link', { name: 'Continue in the original task' }).click()

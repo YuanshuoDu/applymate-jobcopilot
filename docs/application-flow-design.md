@@ -69,6 +69,8 @@ Agent 负责原任务的执行和审批，招聘消息负责查看回复。
 
 任务等待时，材料待审核、人工接手、表单填写结果待核实和提交结果待核实分别提示。
 需要信息或验证时，进入原任务查看具体要求；状态不明确时不会猜测一定有问题可回答。
+回答后，如果任务摘要更新较慢，申请页可能暂时仍显示需要处理；请回原任务核对
+问题记录，避免重复回答。模拟测试覆盖了这种情况，实际状态同步仍需 Agent 侧验证。
 审核材料与授权提交是不同操作，打开原任务本身不会授权提交。
 
 较早的隔离测试发现：新建会话可能在会话已创建后显示失败；相关修复已进入主线。
@@ -367,6 +369,10 @@ Waiting tasks distinguish prepared-material review, user handoff, an unverified
 form-filling outcome and an unverified submission outcome. A request for information
 may also require verification; an unspecified wait directs the user to the original
 task without guessing a question. Reviewing materials does not authorize submission.
+If the task summary lags behind an answer, the application may temporarily still
+show that action is needed. Check the question record in the original task instead
+of answering again. A mocked test covers this case; synchronization in the real
+Agent path remains to be verified.
 Without an associated task, Open Agent navigates to the generic workspace. It may
 restore the most recent unrelated conversation, so the user is told to start a new
 conversation and identify the job. It does not infer a session from job ID or send
