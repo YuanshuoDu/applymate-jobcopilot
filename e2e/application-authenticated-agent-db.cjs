@@ -111,4 +111,56 @@ async function inspectTurn(sessionId, turnId) {
     wakeupOutbox: wakeupOutbox.rows[0], turnDispatchOutbox: turnDispatchOutbox.rows[0], turnDlq: turnDlq.rows[0] }
 }
 
-module.exports = { initializeFixtureSse, inspectTurn, closeFixtureDb: () => pool.end() }
+const MAX_DIAGNOSTIC_COUNT = 1000
+const TURN_DIAGNOSTIC_STATUSES = ['queued', 'in_progress', 'waiting_for_dependency', 'waiting_for_approval', 'waiting_for_user', 'interrupted', 'cancelled', 'failed', 'completed']
+const ITEM_DIAGNOSTIC_STATUSES = ['queued', 'started', 'streaming', 'waiting_for_tool', 'waiting_for_approval', 'waiting_for_user', 'completed', 'failed', 'interrupted', 'cancelled']
+const STEP_DIAGNOSTIC_STATUSES = ['queued', 'streaming', 'waiting_for_tool', 'waiting_for_approval', 'waiting_for_user', 'completed', 'failed', 'interrupted']
+const TASK_DIAGNOSTIC_STATUSES = ['queued', 'running', 'waiting', 'waiting_for_user', 'completed', 'failed', 'interrupted', 'cancelled', 'closed', 'passed', 'retrying', 'skipped']
+const EVENT_DIAGNOSTIC_LABELS = {
+  'turn.wakeup': 'turnWakeup', 'turn.resumed': 'turnResumed', 'turn.completed': 'turnCompleted',
+  'turn.failed': 'turnFailed', 'question.answered': 'questionAnswered', 'item.completed': 'itemCompleted', 'item.failed': 'itemFailed',
+}
+
+async function inspectFinalVisibility(sessionId, turnId, timelineHttpCategory) {
+  const turnResult = await pool.query('SELECT turn."status", (turn."finalResponse" IS NOT NULL AND length(BTRIM(turn."finalResponse")) > 0) AS "finalResponsePresent" FROM "agent_turns" AS turn WHERE turn."sessionId" = $1 AND turn."id" = $2', [sessionId, turnId])
+  if (turnResult.rowCount !== 1) return { stateAvailable: false, timelineHttpCategory: safeTimelineHttpCategory(timelineHttpCategory) }
+  const [items, events, steps, tasks] = await Promise.all([
+    pool.query('SELECT "status", COUNT(*)::int AS "count" FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = \'agent_message\' AND "phase" = \'final_answer\' GROUP BY "status"', [sessionId, turnId]),
+    pool.query('SELECT "type", COUNT(*)::int AS "count" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 GROUP BY "type"', [sessionId, turnId]),
+    pool.query('SELECT "status", COUNT(*)::int AS "count" FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 GROUP BY "status"', [sessionId, turnId]),
+    pool.query('SELECT "status", COUNT(*)::int AS "count" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2 GROUP BY "status"', [sessionId, turnId]),
+  ])
+  const eventCounts = Object.fromEntries([...Object.values(EVENT_DIAGNOSTIC_LABELS), 'other'].map(label => [label, 0]))
+  for (const row of events.rows) {
+    const label = typeof row.type === 'string' && Object.prototype.hasOwnProperty.call(EVENT_DIAGNOSTIC_LABELS, row.type) ? EVENT_DIAGNOSTIC_LABELS[row.type] : 'other'
+    eventCounts[label] = Math.min(MAX_DIAGNOSTIC_COUNT, eventCounts[label] + boundedCount(row.count))
+  }
+  const turn = turnResult.rows[0]
+  return {
+    stateAvailable: true,
+    timelineHttpCategory: safeTimelineHttpCategory(timelineHttpCategory),
+    turnStatus: safeStatus(turn.status, TURN_DIAGNOSTIC_STATUSES),
+    finalResponsePresent: turn.finalResponsePresent === true,
+    finalItemStatusCounts: boundedStatusCounts(items.rows, ITEM_DIAGNOSTIC_STATUSES),
+    eventCounts,
+    stepStatusCounts: boundedStatusCounts(steps.rows, STEP_DIAGNOSTIC_STATUSES),
+    taskStatusCounts: boundedStatusCounts(tasks.rows, TASK_DIAGNOSTIC_STATUSES),
+  }
+}
+
+function boundedStatusCounts(rows, allowed) {
+  const counts = Object.fromEntries([...allowed, 'other'].map(status => [status, 0]))
+  for (const row of rows) {
+    const status = safeStatus(row.status, allowed)
+    counts[status] = Math.min(MAX_DIAGNOSTIC_COUNT, counts[status] + boundedCount(row.count))
+  }
+  return counts
+}
+
+function safeStatus(value, allowed) { return typeof value === 'string' && allowed.includes(value) ? value : 'other' }
+function boundedCount(value) { return Number.isSafeInteger(value) && value > 0 ? Math.min(value, MAX_DIAGNOSTIC_COUNT) : 0 }
+function safeTimelineHttpCategory(value) {
+  return ['ok', 'unauthorized', 'not_found', 'rate_limited', 'server_error', 'other', 'unavailable'].includes(value) ? value : 'other'
+}
+
+module.exports = { initializeFixtureSse, inspectTurn, inspectFinalVisibility, closeFixtureDb: () => pool.end() }

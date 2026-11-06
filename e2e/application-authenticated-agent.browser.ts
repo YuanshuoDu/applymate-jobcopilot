@@ -3,7 +3,7 @@
 import { randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
 import path from 'node:path'
-import { expect, test } from '@playwright/test'
+import { expect, test, type APIRequestContext } from '@playwright/test'
 
 const origin = 'http://127.0.0.1:3100'
 const goal = 'Fixture native question round'
@@ -104,6 +104,19 @@ async function logBoundedTurnDiagnostic(phase: 'awaiting_question' | 'after_answ
   }
 }
 
+async function logFinalVisibilityDiagnostic(sessionId: string, turnId: string, request: APIRequestContext,
+  inspect: (sessionId: string, turnId: string, timelineHttpCategory: string) => Promise<Record<string, unknown>>) {
+  let timelineHttpCategory = 'unavailable'
+  try {
+    const path = '/api/agent/sessions/' + encodeURIComponent(sessionId) + '/timeline?limit=100'
+    const response = await request.get(path, { timeout: 5_000, maxRedirects: 0 })
+    const status = response.status()
+    timelineHttpCategory = response.ok() ? 'ok' : status === 404 ? 'not_found' : status === 401 || status === 403 ? 'unauthorized' : status === 429 ? 'rate_limited' : status >= 500 ? 'server_error' : 'other'
+  } catch { /* The fixed category remains unavailable. */ }
+  try { console.error('Synthetic final visibility diagnostic', JSON.stringify(await inspect(sessionId, turnId, timelineHttpCategory))) }
+  catch { console.error('Synthetic final visibility diagnostic', JSON.stringify({ stateAvailable: false, timelineHttpCategory })) }
+}
+
 test('synthetic native question resumes the actual authenticated turn', async ({ browser }) => {
   if (process.env.CI !== 'true' || process.env.APPLICATION_AUTH_DISPOSABLE !== 'true'
     || process.env.APPLICATION_AUTH_AGENT_REVIEWED_EXECUTION !== 'true'
@@ -114,9 +127,10 @@ test('synthetic native question resumes the actual authenticated turn', async ({
 
   const context = await browser.newContext({ baseURL: origin })
   const requireFixture = createRequire(path.resolve('e2e/application-authenticated-agent.browser.ts'))
-  const { initializeFixtureSse, inspectTurn, closeFixtureDb } = requireFixture('./application-authenticated-agent-db.cjs') as {
+  const { initializeFixtureSse, inspectTurn, inspectFinalVisibility, closeFixtureDb } = requireFixture('./application-authenticated-agent-db.cjs') as {
     initializeFixtureSse: () => Promise<void>
     inspectTurn: (sessionId: string, turnId: string) => Promise<{ turn: { status: string; error: string | null; completedEvents: number; answeredEvents: number; finalResponse: string | null }; questions: { id: string; status: string; content: { questionId?: string; question?: string; answer?: string | null; toolCallId?: string } }[]; eventTypes: string[]; steps: { status: string; errorCode: string | null; finishReason: string | null }[]; tasks: { status: string; failureReason: string | null }[]; toolResultCount: number; toolResultQuestionRedacted: boolean | null; wakeupOutbox: { count: number; publishedCount: number; maxAttemptCount: number }; turnDispatchOutbox: { count: number; publishedCount: number; maxAttemptCount: number; lastErrorCategory: string }; turnDlq: { count: number; maxAttemptCount: number; reasonSchemaInvalidPayload: number; reasonMaxRetriesExhausted: number; reasonExecutionFailed: number; reasonLeaseLost: number; reasonResumeFenceInvalid: number; reasonOther: number; errorInvalidPayload: number; errorTurnExecution: number; errorLeaseNotAvailable: number; errorLeaseLost: number; errorResumeFenceInvalid: number; errorOther: number } }>
+    inspectFinalVisibility: (sessionId: string, turnId: string, timelineHttpCategory: string) => Promise<Record<string, unknown>>
     closeFixtureDb: () => Promise<void>
   }
   try {
@@ -208,7 +222,12 @@ test('synthetic native question resumes the actual authenticated turn', async ({
       await logBoundedTurnDiagnostic('after_answer', sessionId, turnId, inspectTurn)
       throw new Error('Turn did not complete after the accepted answer; see bounded diagnostics')
     }
-    await expect(page.getByText(finalText, { exact: false })).toBeVisible({ timeout: 30_000 })
+    try {
+      await expect(page.getByText(finalText, { exact: false })).toBeVisible({ timeout: 30_000 })
+    } catch {
+      await logFinalVisibilityDiagnostic(sessionId, turnId, page.request, inspectFinalVisibility)
+      throw new Error('Final response visibility assertion failed; see bounded diagnostics')
+    }
     const finished = await inspectTurn(sessionId, turnId)
     expect(finished.turn).toMatchObject({ status: 'completed', completedEvents: 1, answeredEvents: 1 })
     expect(finished.turn.finalResponse).toContain(finalText)
