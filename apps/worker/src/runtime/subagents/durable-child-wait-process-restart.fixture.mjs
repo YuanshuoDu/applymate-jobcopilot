@@ -53,7 +53,10 @@ const boundedLoopDiagnosticStages = new Set([
   "durable_wait_loader", "child_attempt_resume_loader", "restored_wait_validation", "execution_loop_recovery",
   "step_start", "step_started_event", "context_build", "agenda_build", "agenda_persist", "model_request",
   "model_started_event", "claim_recovery_loader", "live_resume_check", "persisted_cut_state", "next_step_state",
-  "model_invocation", "usage_lineage_cut", "loop_result",
+  "model_invocation", "usage_lineage_cut", "loop_result", "claim_loader_connection", "claim_loader_begin",
+  "claim_loader_user_scope", "claim_loader_step_query", "claim_loader_call_query", "claim_loader_result_query",
+  "claim_loader_event_query", "claim_loader_other_query", "claim_loader_commit", "claim_loader_rollback",
+  "claim_loader_query_error", "claim_loader_lineage_conflict", "claim_loader_other_exception",
 ])
 const boundedLoopDiagnosticPhases = new Set(["start", "pass", "fail"])
 const boundedLiveResumeClasses = new Set(["live_resume_expected_lineage", "other"])
@@ -83,6 +86,38 @@ function traceLiveResumeClass(value) {
 }
 function traceLoopFailure() {
   traceLoopStage(currentLoopDiagnosticStage, "fail")
+}
+function claimLoaderQueryStage(query) {
+  if (typeof query !== "string") return "claim_loader_other_query"
+  const sql = query.replace(/\s+/g, " ").trim()
+  if (sql === "BEGIN") return "claim_loader_begin"
+  if (/^SELECT set_config\(\$1, \$2, true\)$/i.test(sql)) return "claim_loader_user_scope"
+  if (sql === "COMMIT") return "claim_loader_commit"
+  if (sql === "ROLLBACK") return "claim_loader_rollback"
+  if (/^SELECT step\./i.test(sql) && /FROM "agent_steps" AS step/i.test(sql)) return "claim_loader_step_query"
+  if (/^SELECT item\./i.test(sql) && /JOIN "agent_steps" AS step/i.test(sql)) return "claim_loader_call_query"
+  if (/^SELECT item\./i.test(sql) && /item\."type" = 'tool_result'/i.test(sql)) return "claim_loader_result_query"
+  if (/^SELECT event\./i.test(sql) && /FROM "agent_events" AS event/i.test(sql)) return "claim_loader_event_query"
+  return "claim_loader_other_query"
+}
+function traceClaimLoaderQueryClient(client, queryFailure) {
+  return { query: async (...args) => {
+    const stage = claimLoaderQueryStage(args[0])
+    traceLoopStage(stage, "start")
+    try {
+      const result = await client.query(...args)
+      traceLoopStage(stage, "pass")
+      return result
+    } catch (error) {
+      queryFailure.value = true
+      traceLoopStage(stage, "fail")
+      throw error
+    }
+  } }
+}
+function claimLoaderExceptionStage(error, queryFailed) {
+  if (error instanceof Error && error.message === "child_resume_wait_tool_call_conflict") return "claim_loader_lineage_conflict"
+  return queryFailed ? "claim_loader_query_error" : "claim_loader_other_exception"
 }
 const waitAcknowledgementFailureReasons = new Map([
   ["Session is unavailable for resume acknowledgement", "session_unavailable"],
@@ -649,15 +684,27 @@ async function resumeChildThroughLoop(lease, phase, preloadedRestored) {
       const nextStepId = event.correlationId
       let claimRecovery
       traceLoopStage("claim_recovery_loader", "start")
+      const queryFailure = { value: false }
+      let claimClient
       try {
-        const claimClient = await pool.connect()
+        traceLoopStage("claim_loader_connection", "start")
         try {
-          await claimClient.query("BEGIN")
-          await claimClient.query("SELECT set_config($1, $2, true)", ["app.user_id", lease.userId])
-          claimRecovery = await loadChildWaitCallRecovery(claimClient, lease, wait)
-          await claimClient.query("COMMIT")
+          claimClient = await pool.connect()
+          traceLoopStage("claim_loader_connection", "pass")
         } catch (error) {
-          await claimClient.query("ROLLBACK").catch(() => undefined)
+          traceLoopStage("claim_loader_connection", "fail")
+          traceLoopStage(claimLoaderExceptionStage(error, false), "fail")
+          throw error
+        }
+        const tracedClaimClient = traceClaimLoaderQueryClient(claimClient, queryFailure)
+        try {
+          await tracedClaimClient.query("BEGIN")
+          await tracedClaimClient.query("SELECT set_config($1, $2, true)", ["app.user_id", lease.userId])
+          claimRecovery = await loadChildWaitCallRecovery(tracedClaimClient, lease, wait)
+          await tracedClaimClient.query("COMMIT")
+        } catch (error) {
+          traceLoopStage(claimLoaderExceptionStage(error, queryFailure.value), "fail")
+          await tracedClaimClient.query("ROLLBACK").catch(() => undefined)
           throw error
         } finally { claimClient.release() }
         traceLoopStage("claim_recovery_loader", "pass")

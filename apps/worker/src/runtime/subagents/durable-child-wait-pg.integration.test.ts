@@ -49,7 +49,10 @@ const BOUNDED_LOOP_DIAGNOSTIC_STAGES = new Set([
   "durable_wait_loader", "child_attempt_resume_loader", "restored_wait_validation", "execution_loop_recovery",
   "step_start", "step_started_event", "context_build", "agenda_build", "agenda_persist", "model_request",
   "model_started_event", "claim_recovery_loader", "live_resume_check", "persisted_cut_state", "next_step_state",
-  "model_invocation", "usage_lineage_cut", "loop_result", "other",
+  "model_invocation", "usage_lineage_cut", "loop_result", "claim_loader_connection", "claim_loader_begin",
+  "claim_loader_user_scope", "claim_loader_step_query", "claim_loader_call_query", "claim_loader_result_query",
+  "claim_loader_event_query", "claim_loader_other_query", "claim_loader_commit", "claim_loader_rollback",
+  "claim_loader_query_error", "claim_loader_lineage_conflict", "claim_loader_other_exception", "other",
 ])
 const BOUNDED_LOOP_DIAGNOSTIC_PHASES = new Set(["start", "pass", "fail", "other"])
 const BOUNDED_LOOP_LIVE_RESUME_CLASSES = new Set(["live_resume_expected_lineage", "other"])
@@ -165,6 +168,38 @@ describe("worker restart blocker proof diagnostic bindings", () => {
     ).join("\n")
     expect(parseBoundedLoopDiagnostics(overLimit)).toMatchObject({ overflow: true })
     expect(parseBoundedLoopDiagnostics(overLimit).records).toHaveLength(MAX_BOUNDED_LOOP_DIAGNOSTIC_STAGES)
+  })
+  it("parses fixed claim-loader query and failure categories without retaining unknown fields", () => {
+    const parsed = parseBoundedLoopDiagnostics([
+      { stage: "claim_loader_connection", phase: "start" },
+      { stage: "claim_loader_begin", phase: "pass" },
+      { stage: "claim_loader_user_scope", phase: "pass" },
+      { stage: "claim_loader_step_query", phase: "pass" },
+      { stage: "claim_loader_call_query", phase: "pass" },
+      { stage: "claim_loader_result_query", phase: "start" },
+      { stage: "claim_loader_event_query", phase: "fail" },
+      { stage: "claim_loader_other_query", phase: "fail" },
+      { stage: "claim_loader_commit", phase: "pass" },
+      { stage: "claim_loader_rollback", phase: "fail" },
+      { stage: "claim_loader_query_error", phase: "fail" },
+      { stage: "claim_loader_lineage_conflict", phase: "fail" },
+      { stage: "claim_loader_other_exception", phase: "fail" },
+      { stage: "private", phase: "fail", privateField: "synthetic-secret" },
+    ].map(value => `${BOUNDED_LOOP_STAGE_MARKER}${JSON.stringify({ ...value, liveResume: "other" })}`).join("\n"))
+    expect(parsed.records.map(({ stage, phase }) => [stage, phase])).toEqual([
+      ["claim_loader_connection", "start"], ["claim_loader_begin", "pass"],
+      ["claim_loader_user_scope", "pass"], ["claim_loader_step_query", "pass"],
+      ["claim_loader_call_query", "pass"], ["claim_loader_result_query", "start"],
+      ["claim_loader_event_query", "fail"], ["claim_loader_other_query", "fail"],
+      ["claim_loader_commit", "pass"], ["claim_loader_rollback", "fail"],
+      ["claim_loader_query_error", "fail"], ["claim_loader_lineage_conflict", "fail"],
+      ["claim_loader_other_exception", "fail"], ["other", "fail"],
+    ])
+    expect(parsed.records.every(record => record.liveResume === "other")).toBe(true)
+    expect(parsed.records.slice(0, -1).every(record => record.exactKeys)).toBe(true)
+    expect(parsed.records.at(-1)?.exactKeys).toBe(false)
+    expect(JSON.stringify(parsed)).not.toContain("synthetic-secret")
+    expect(parsed.overflow).toBe(false)
   })
 })
 
