@@ -95,6 +95,8 @@ describe("final historical wait receipt binding", () => {
     expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain("betweenAnchors.\"sequence\"::numeric BETWEEN")
     expect(HISTORICAL_SOURCE_STEP_BINDING_SQL).toContain("sourceStepPrefix")
     expect(HISTORICAL_SOURCE_STEP_BINDING_SQL).toContain("sourceStepHandoff")
+    expect(CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL).toContain(HISTORICAL_SOURCE_STEP_BINDING_SQL)
+    expect(sql.match(/CASE WHEN proof\.value \? 'sourceStepPrefix'/g) ?? []).toHaveLength(1)
     expect(sql).toContain("callStep.\"attempt\" = owner.\"attemptCount\"")
     expect(sql).toContain("callStep.\"status\" = 'completed'")
     expect(sql).toContain("= proof.value->'sourceWait'->>'claimKeyDigest') = 1")

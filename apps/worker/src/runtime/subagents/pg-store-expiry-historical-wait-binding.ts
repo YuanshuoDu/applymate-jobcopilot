@@ -1,4 +1,4 @@
-import { CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL, CHILD_WAIT_HISTORICAL_SOURCE_RESULT_RECEIPT_SQL, HISTORICAL_SOURCE_STEP_BINDING_SQL } from "./pg-store-expiry-historical-wait-event-binding.js"
+import { CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL, CHILD_WAIT_HISTORICAL_SOURCE_RESULT_RECEIPT_SQL } from "./pg-store-expiry-historical-wait-event-binding.js"
 import type { HistoricalSourceStepPrefix } from "./pg-store-expiry-historical-source-step-prefix.js"
 
 export type HistoricalWaitBinding = Readonly<{
@@ -171,7 +171,6 @@ export const CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL = `EXISTS (
     AND proof.value->>'projectedCallId' = proof.value->'sourceWait'->>'projectedSourceCallId'
     AND boundSourceResult."status" = 'completed' AND boundSourceResult."revision" = 1 AND boundSourceResult."phase" IS NULL
     AND ${CHILD_WAIT_HISTORICAL_SOURCE_RESULT_RECEIPT_SQL}
-    AND ${HISTORICAL_SOURCE_STEP_BINDING_SQL}
     AND ${CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL}
     AND (SELECT COUNT(*) FROM "agent_items" AS sameSourceCall WHERE sameSourceCall."sessionId" = boundSource."sessionId"
       AND sameSourceCall."turnId" = boundSource."turnId" AND sameSourceCall."taskId" = boundSource."taskId"
