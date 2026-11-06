@@ -1818,6 +1818,74 @@ test('reopening confirmed materials reuses the current binding and audit without
   expect(state.unexpected).toEqual([])
 })
 
+test('an unavailable audit during resume saving preserves the edit and refreshes to the current stale state', async ({ page }) => {
+  const state = await install(page)
+  let conflicting = false, saveStarted = false, saved = false, auditPosts = 0
+  let releaseSave = () => {}
+  const saveGate = new Promise<void>(resolve => { releaseSave = resolve })
+  const updatedAt = '2026-10-30T12:15:00.000Z'
+  await page.route('**/api/jobs/outside-page/audit-application', async route => {
+    if (route.request().method() !== 'GET') { auditPosts++; return route.fallback() }
+    if (conflicting) return route.fulfill({ status: 409, json: { error: 'The application materials are being changed. Refresh the review status.' } })
+    return route.fulfill({ json: saved ? { state: 'stale' } : state.audit })
+  })
+  await page.route('**/api/resume/resume-1', async route => {
+    if (route.request().method() !== 'PATCH') return route.fallback()
+    const body = route.request().postDataJSON() as { content: typeof state.resume.content }
+    state.writes.push({ path: '/api/resume/resume-1', body })
+    saveStarted = true
+    await saveGate
+    state.resume = { ...state.resume, content: body.content, updatedAt }
+    saved = true
+    return route.fulfill({ json: state.resume })
+  })
+  try {
+    await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    const editor = page.locator('[data-resume-editor]')
+    await expect(editor.getByText('Software engineer.', { exact: false }).first()).toBeVisible()
+    const confirm = page.getByRole('button', { name: /Confirm application materials|确认申请材料/, exact: true })
+    const dialog = page.getByRole('dialog', { name: /Confirm application materials|确认申请材料/ })
+    await confirm.click()
+    await expect(dialog).toContainText(/Application materials selected|已选择申请材料/)
+    await dialog.getByRole('button', { name: /Close final confirmation|关闭最终确认/ }).click()
+
+    conflicting = true
+    await editor.getByText('Software engineer.', { exact: false }).first().click()
+    const input = editor.locator('textarea').first()
+    await input.fill('Software engineer with verified TypeScript experience.')
+    await expect.poll(() => saveStarted).toBe(true)
+    // Keep the save in flight while forcing an audit read, as when NOWAIT
+    // detects a concurrent material write. This test simulates the HTTP result.
+    const conflictRead = page.waitForResponse(response => response.url().endsWith('/audit-application') && response.request().method() === 'GET' && response.status() === 409)
+    await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+    await conflictRead
+    const unavailable = page.getByRole('status').filter({ hasText: /The review status could not be verified|无法核实审核状态/ }).first()
+    await expect(unavailable).toBeVisible()
+    await expect(input).toHaveValue('Software engineer with verified TypeScript experience.')
+    expect(state.resume.content.summary).toBe('Software engineer.')
+    expect(auditPosts).toBe(0)
+
+    const saveResponse = page.waitForResponse(response => response.url().endsWith('/api/resume/resume-1') && response.request().method() === 'PATCH')
+    releaseSave()
+    expect((await saveResponse).status()).toBe(200)
+    await expect(page.locator('.resume-top-save')).toContainText(/Saved just now|刚刚保存/)
+    await expect(input).toHaveValue('Software engineer with verified TypeScript experience.')
+    expect(state.resume.content.summary).toBe('Software engineer with verified TypeScript experience.')
+    await expect(unavailable).toBeVisible()
+    conflicting = false
+    await unavailable.getByRole('button', { name: /Refresh status|刷新状态/, exact: true }).click()
+    await expect(page.getByRole('status').filter({ hasText: /The job or materials have changed, or this older review can no longer be verified|职位或材料已变化，或旧审核已无法核实/ }).first()).toBeVisible()
+    await expect(unavailable).toHaveCount(0)
+    await expect(editor.getByText('Software engineer with verified TypeScript experience.', { exact: false }).first()).toBeVisible()
+    await confirm.click()
+    await expect(dialog).not.toContainText(/Application materials selected|已选择申请材料/)
+    await expect(dialog.getByRole('button', { name: /Download application materials|下载申请材料/ })).toHaveCount(0)
+    expect(auditPosts).toBe(0)
+    expect(state.writes.map(write => write.path)).toEqual(['/api/resume/resume-1'])
+    expect(state.unexpected).toEqual([])
+  } finally { releaseSave() }
+})
+
 for (const surface of ['jobs', 'resume'] as const) {
   for (const status of ['pending', 'stale'] as const) test(`${surface} hides an old passing audit while the server reports ${status}`, async ({ page }) => {
     const state = await install(page)
