@@ -142,6 +142,13 @@ interface JobsListResponse {
 // to this section. Searches and filters intentionally remain uncached.
 let defaultJobsCache: JobsPageCache | null = null
 
+// Same-document coordination only: a page reload or a different tab has its own state.
+type StatusWrite = { userId: string; id: string; company: string; role: string }
+const pendingStatusWrites = new Map<string, StatusWrite>()
+const uncertainStatusWrites = new Map<string, StatusWrite>()
+const statusWriteListeners = new Set<(settledUserId?: string) => void>()
+function notifyStatusWrites(settledUserId?: string) { statusWriteListeners.forEach(listener => listener(settledUserId)) }
+
 type JobSortBy = 'createdAt' | 'score' | 'company' | 'role'
 type JobSortDirection = 'asc' | 'desc'
 
@@ -339,8 +346,10 @@ function MobileListView({ jobs, taskByJobId, onOpenSession, onRowClick, selected
 }
 
 // ── KanbanView ────────────────────────────────────────────────────────────────
-function KanbanView({ jobs, onStatusChange, onAddClick, onRowClick }: {
+function KanbanView({ jobs, pendingIds, uncertainIds, onStatusChange, onAddClick, onRowClick }: {
   jobs: Job[]
+  pendingIds: ReadonlySet<string>
+  uncertainIds: ReadonlySet<string>
   onStatusChange: (id: string, status: JobStatus) => void
   onAddClick: (status: JobStatus) => void
   onRowClick: (job: Job) => void
@@ -353,7 +362,7 @@ function KanbanView({ jobs, onStatusChange, onAddClick, onRowClick }: {
   function handleDrop(col: JobStatus) {
     if (dragId.current) {
       const job = jobs.find(j => j.id === dragId.current)
-      if (job && job.status !== col) {
+      if (job && job.status !== col && !pendingIds.has(job.id) && !uncertainIds.has(job.id)) {
         onStatusChange(dragId.current, col)
       }
       dragId.current = null
@@ -397,9 +406,9 @@ function KanbanView({ jobs, onStatusChange, onAddClick, onRowClick }: {
             </span>
           </div>
           {cols[col].map(job => (
-            <div key={job.id} draggable
-              onDragStart={() => { dragId.current = job.id }}
-              onTouchStart={() => { dragId.current = job.id }}
+            <div key={job.id} draggable={!pendingIds.has(job.id) && !uncertainIds.has(job.id)}
+              onDragStart={() => { dragId.current = pendingIds.has(job.id) || uncertainIds.has(job.id) ? null : job.id }}
+              onTouchStart={() => { dragId.current = pendingIds.has(job.id) || uncertainIds.has(job.id) ? null : job.id }}
               onTouchEnd={() => { dragId.current = null }}
               onMouseEnter={e => { e.currentTarget.style.borderColor = COL_COLORS[col]; e.currentTarget.style.boxShadow = `0 2px 8px ${COL_COLORS[col]}12` }}
               onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.boxShadow = 'none' }}
@@ -412,6 +421,8 @@ function KanbanView({ jobs, onStatusChange, onAddClick, onRowClick }: {
                 {job.score != null && <ScorePill score={job.score} />}
               </div>
               <div title={job.role} style={{ display: '-webkit-box', WebkitBoxOrient: 'vertical', WebkitLineClamp: 3, overflow: 'hidden', marginBottom: 6, color: 'var(--text)', fontSize: 14, fontWeight: 600, lineHeight: 1.45, letterSpacing: '0' }}>{job.role}</div>
+              {pendingIds.has(job.id) && <p role="status">{t('jobs.statusChangePending')}</p>}
+              {!pendingIds.has(job.id) && uncertainIds.has(job.id) && <p>{t('jobs.statusChangeNeedsReview')}</p>}
               {job.keywords ? (() => {
                 const kws = job.keywords.split(',').map(k => k.trim()).filter(Boolean).slice(0, 6)
                 return kws.length > 0 ? (
@@ -1956,6 +1967,7 @@ export function JobsPage() {
   const [showAdd,      setShowAdd     ] = useState(false)
   const [prefillStatus, setPrefillStatus] = useState<JobStatus | null>(null)
   const [jobs,         setJobs        ] = useState<Job[]>(() => cachedJobs?.jobs ?? [])
+  const [loadedJobsUserId, setLoadedJobsUserId] = useState<string | null>(() => cachedJobs ? userId : null)
   const [total,        setTotal       ] = useState(() => cachedJobs?.total ?? 0)
   const [statusCounts, setStatusCounts] = useState<JobStatusCounts>(() => cachedJobs?.statusCounts ?? EMPTY_STATUS_COUNTS)
   const [loading,      setLoading     ] = useState(() => cachedJobs === null)
@@ -1966,19 +1978,46 @@ export function JobsPage() {
   const [sortBy,       setSortBy      ] = useState<JobSortBy>(initialList.sortBy)
   const [sortDir,      setSortDir     ] = useState<JobSortDirection>(initialList.sortDir)
   const displayJobs = useMemo(() => sortJobs(jobs, sortBy, sortDir), [jobs, sortBy, sortDir])
-  const listContext = JSON.stringify([userId, page, pageSize, search, filterStatus])
-  const currentListContext = useRef(listContext)
-  currentListContext.current = listContext
   const currentUserId = useRef(userId)
   currentUserId.current = userId
-  const [statusChangeUncertain, setStatusChangeUncertain] = useState<string | null>(null)
-  const [selectedIds,  setSelectedIds ] = useState<Set<string>>(() => new Set())
+  const [uncertainStatuses, setUncertainStatuses] = useState<StatusWrite[]>(() => [...uncertainStatusWrites.values()])
+  const statusOwnerMounted = useRef(true)
+  const [pendingStatusKeys, setPendingStatusKeys] = useState<Set<string>>(() => new Set(pendingStatusWrites.keys()))
+  const pendingStatusIds = useMemo(() => new Set(jobs.filter(job => pendingStatusKeys.has(JSON.stringify([userId, job.id]))).map(job => job.id)), [jobs, pendingStatusKeys, userId])
+  const uncertainStatusIds = useMemo(() => new Set(uncertainStatuses.filter(item => item.userId === userId).map(item => item.id)), [uncertainStatuses, userId])
+  const listLoading = loading || !userId || loadedJobsUserId !== userId
+  useEffect(() => {
+    statusOwnerMounted.current = true
+    return () => { statusOwnerMounted.current = false }
+  }, [])
+  const [selection, setSelection] = useState<{ userId: string; ids: Set<string> }>(() => ({ userId, ids: new Set() }))
+  const selectedIds = selection.userId === userId ? selection.ids : new Set<string>()
+  function setSelectedIds(update: Set<string> | ((previous: Set<string>) => Set<string>)) {
+    setSelection(previous => {
+      const ids = previous.userId === userId ? previous.ids : new Set<string>()
+      return { userId, ids: typeof update === 'function' ? update(ids) : update }
+    })
+  }
   const [bulkDeleting, setBulkDeleting] = useState(false)
   const [scoringAll,   setScoringAll   ] = useState(false)
 
   // When navigating from Search page after a job save+score, force refresh
   const [refreshTick, setRefreshTick] = useState(0)
   const triggerRefresh = () => setRefreshTick(t => t + 1)
+  useEffect(() => {
+    const listener = (settledUserId?: string) => {
+      setPendingStatusKeys(new Set(pendingStatusWrites.keys()))
+      setUncertainStatuses([...uncertainStatusWrites.values()])
+      if (settledUserId && settledUserId === currentUserId.current) {
+        setLoading(true)
+        setFetchError(null)
+        setRefreshTick(value => value + 1)
+      }
+    }
+    statusWriteListeners.add(listener)
+    listener()
+    return () => { statusWriteListeners.delete(listener) }
+  }, [])
 
   // Reset page to 1 when search/filter/pageSize changes
   const doSearch = useCallback((q: string) => { setSearch(q); setPage(1) }, [])
@@ -1986,6 +2025,7 @@ export function JobsPage() {
 
   // Debounced fetch
   useEffect(() => {
+    if (!userId) return
     let cancelled = false
     const controller = new AbortController()
     const timer = setTimeout(async () => {
@@ -2005,12 +2045,13 @@ export function JobsPage() {
           const nextStatusCounts = json.statusCounts ?? EMPTY_STATUS_COUNTS
           if (isDefaultView) defaultJobsCache = { userId, jobs: rawJobs, total: nextTotal, statusCounts: nextStatusCounts }
           setJobs(rawJobs)
+          setLoadedJobsUserId(userId)
           setTotal(nextTotal)
           setStatusCounts(nextStatusCounts)
         }
       } catch (error) {
         if (error instanceof DOMException && error.name === 'AbortError') return
-        if (!cancelled) setFetchError('Failed to load jobs')
+        if (!cancelled) { setJobs([]); setTotal(0); setStatusCounts(EMPTY_STATUS_COUNTS); setLoadedJobsUserId(userId); setFetchError('Failed to load jobs') }
       } finally {
         if (!cancelled) setLoading(false)
       }
@@ -2103,40 +2144,32 @@ export function JobsPage() {
   }
 
   async function handleStatusChange(jobId: string, newStatus: JobStatus) {
-    const requestContext = listContext
     const requestUserId = userId
-    const previousStatus = jobs.find(job => job.id === jobId)?.status
-    // Optimistic update
-    setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: newStatus } : j))
-    if (previousStatus && previousStatus !== newStatus) {
-      setStatusCounts(previous => ({
-        ...previous,
-        [previousStatus]: Math.max(0, previous[previousStatus] - 1),
-        [newStatus]: previous[newStatus] + 1,
-      }))
-    }
+    if (!requestUserId || loadedJobsUserId !== requestUserId) return
+    const job = jobs.find(item => item.id === jobId && item.userId === requestUserId)
+    if (!job) return
+    const key = JSON.stringify([requestUserId, jobId])
+    if (pendingStatusWrites.has(key) || uncertainStatusWrites.has(key)) return
+    const entry = { userId: requestUserId, id: jobId, company: job.company, role: job.role }
+    pendingStatusWrites.set(key, entry)
+    notifyStatusWrites()
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      uncertainStatusWrites.set(key, entry)
+      if (defaultJobsCache?.userId === requestUserId) defaultJobsCache = null
+      notifyStatusWrites(requestUserId)
+    }, 15_000)
     const { error } = await apiMutate(`/api/jobs/${jobId}`, 'PATCH', { status: newStatus })
+    clearTimeout(timer)
+    pendingStatusWrites.delete(key)
     if (defaultJobsCache?.userId === requestUserId) defaultJobsCache = null
-    if (error && currentUserId.current === requestUserId) setStatusChangeUncertain(requestUserId)
+    if (error) uncertainStatusWrites.set(key, entry)
+    notifyStatusWrites(requestUserId)
+    if (!statusOwnerMounted.current) return
     if (currentUserId.current !== requestUserId) return
-    if (currentListContext.current !== requestContext) {
-      // The new view may have been read before this write finished. Refresh
-      // that view through its own cancellable request, never the old context.
-      setLoading(true)
-      setFetchError(null)
-      triggerRefresh()
-      return
-    }
-    if (error) {
-      toast.error('Error', error)
-      // The write may have reached the server. Hide the optimistic result and
-      // reload the active list; the normal effect cancels obsolete requests.
-      setLoading(true)
-      setFetchError(null)
-      triggerRefresh()
-    } else {
-      toast.success(t('jobs.moved'), `${t('jobs.movedTo')} ${colLabel(t, newStatus)}`)
-    }
+    if (error) toast.error('Error', error)
+    else if (!timedOut) toast.success(t('jobs.moved'), `${t('jobs.movedTo')} ${colLabel(t, newStatus)}`)
   }
 
   function toggleSelected(id: string) {
@@ -2209,7 +2242,7 @@ export function JobsPage() {
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 24, flexWrap: 'wrap' }}>
           <div style={{ flex: '1 1 360px', display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
             <h1 style={{ margin: 0, flexShrink: 0, fontSize: 22, fontWeight: 760, lineHeight: 1.1, letterSpacing: '-0.05em' }}>{t('jobs.title')}</h1>
-            <span style={{ flexShrink: 0, fontSize: 12, color: 'var(--primary)', background: 'rgba(79,70,229,0.09)', borderRadius: 999, padding: '4px 9px', fontWeight: 600 }}>{loading || fetchError ? '—' : total}</span>
+            <span style={{ flexShrink: 0, fontSize: 12, color: 'var(--primary)', background: 'rgba(79,70,229,0.09)', borderRadius: 999, padding: '4px 9px', fontWeight: 600 }}>{listLoading || fetchError ? '—' : total}</span>
             <span style={{ minWidth: 0, overflow: 'hidden', color: 'var(--text-muted)', fontSize: 12, textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t('jobs.description')}</span>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
@@ -2223,7 +2256,7 @@ export function JobsPage() {
                 <div style={{ height: 34, minWidth: 96, padding: '0 10px', display: 'inline-flex', alignItems: 'center', gap: 6, border: '1px solid var(--border)', borderRadius: 7, background: 'var(--bg)' }}>
                   <Icon size={14} color={color} strokeWidth={1.8} />
                   <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>{label}</span>
-                  <strong style={{ marginLeft: 'auto', color: 'var(--text)', fontSize: 12, fontWeight: 700 }}>{loading || fetchError ? '—' : count}</strong>
+                  <strong style={{ marginLeft: 'auto', color: 'var(--text)', fontSize: 12, fontWeight: 700 }}>{listLoading || fetchError ? '—' : count}</strong>
                 </div>
               </React.Fragment>
             ))}
@@ -2234,11 +2267,11 @@ export function JobsPage() {
       </header>
 
       <div className="jobs-page-content" style={{ padding: '16px 30px 30px', flex: 1 }}>
-        {statusChangeUncertain === userId && userId && <div role="status" style={{ marginBottom: 12 }}>
-          <p>{t('jobs.statusChangeUncertain')}</p>
+        {uncertainStatuses.filter(item => item.userId === userId).map(item => <div role="status" key={item.id} style={{ marginBottom: 12 }}>
+          <p>{item.company} · {item.role}: {t('jobs.statusChangeUncertain')}</p>
           <Btn variant="ghost" small onClick={triggerRefresh}>{t('application.refreshStatus')}</Btn>
-          <Btn variant="ghost" small onClick={() => setStatusChangeUncertain(null)}>{t('jobs.statusChangeChecked')}</Btn>
-        </div>}
+          <Btn variant="ghost" small onClick={() => { uncertainStatusWrites.delete(JSON.stringify([item.userId, item.id])); notifyStatusWrites() }}>{t('jobs.statusChangeChecked')}: {item.company} · {item.role}</Btn>
+        </div>)}
         <div role="group" aria-label={t('application.attentionViews')} style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
           <button type="button" aria-pressed={!attentionView} onClick={() => setAttentionView(false)}>{t('application.allApplications')}</button>
           <button type="button" aria-pressed={attentionView} onClick={() => setAttentionView(true)}>{t('application.attentionView')}</button>
@@ -2263,7 +2296,7 @@ export function JobsPage() {
             {([['list', List, 'jobs.listView'], ['kanban', LayoutGrid, 'jobs.kanbanView']] as const).map(([v, Icon, labelKey]) => <button key={v} onClick={() => setView(v)} aria-label={t(labelKey)} style={{ padding: '8px 12px', background: view === v ? 'var(--primary)' : 'var(--bg)', color: view === v ? '#fff' : 'var(--text-muted)', border: 'none', cursor: 'pointer', display: 'inline-flex' }}><Icon size={17} /></button>)}
           </div>
         </div>}
-{attentionView ? <ApplicationAttentionView tasks={applicationTasks.tasks} loading={applicationTasks.loading} error={applicationTasks.error} onOpenJob={id => openApplication(id, navigate)} onOpenSession={id => openApplicationSession(id, navigate)} onRefresh={() => void applicationTasks.refetch()} /> : loading ? (
+{attentionView ? <ApplicationAttentionView tasks={applicationTasks.tasks} loading={applicationTasks.loading} error={applicationTasks.error} onOpenJob={id => openApplication(id, navigate)} onOpenSession={id => openApplicationSession(id, navigate)} onRefresh={() => void applicationTasks.refetch()} /> : listLoading ? (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 60 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: 'var(--text-muted)', fontSize: 12 }}>
               <div style={{ width: 20, height: 20, border: '2px solid rgba(79,70,229,0.2)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
@@ -2297,7 +2330,7 @@ export function JobsPage() {
                 </div>
                 <MobileListView onOpenSession={id => openApplicationSession(id, navigate)} taskByJobId={applicationTasks.byJobId} jobs={displayJobs} onRowClick={selectApplication} selectedIds={selectedIds} onToggle={toggleSelected} />
               </>
-              : <KanbanView jobs={displayJobs} onStatusChange={handleStatusChange} onAddClick={col => { setPrefillStatus(col); setShowAdd(true) }} onRowClick={selectApplication} />}
+              : <KanbanView jobs={displayJobs} pendingIds={pendingStatusIds} uncertainIds={uncertainStatusIds} onStatusChange={handleStatusChange} onAddClick={col => { setPrefillStatus(col); setShowAdd(true) }} onRowClick={selectApplication} />}
 
             {/* ── Pagination bar ── */}
             {total > pageSize && (

@@ -512,6 +512,7 @@ test('Kanban cards retain drag-to-status after adding the application entry', as
   test.skip(testInfo.project.name.startsWith('mobile-'), 'Kanban desktop interaction')
   const state = await install(page, { descriptionMode: 'two' })
   const changes: unknown[] = []
+  await page.route('**/api/jobs?*', route => changes.length ? route.fulfill({ json: { jobs: [state.job, { ...state.job, id: 'job-2', company: 'Second Employer', role: 'Second fixture role', status: 'interview' }], total: 80, statusCounts: { saved: 79, applied: 0, interview: 1, offer: 0, rejected: 0 } } }) : route.fallback())
   await page.route('**/api/jobs/job-2', async route => {
     if (route.request().method() !== 'PATCH') return route.fallback()
     changes.push(route.request().postDataJSON())
@@ -671,6 +672,273 @@ for (const change of ['page', 'account'] as const) test(`late recovery read cann
     if (change === 'account') await expect(page.getByRole('status').filter({ hasText: /status update may still be processing|状态更新可能仍在处理中/ })).toHaveCount(0)
     expect(state.unexpected).toEqual([])
   } finally { releaseOldRead() }
+})
+
+test('pending Kanban update blocks duplicate moves until the original request finishes', async ({ page }, testInfo) => {
+  test.skip(!testInfo.project.name.startsWith('desktop-'), 'Exercises desktop Kanban')
+  const state = await install(page, { descriptionMode: 'two' })
+  const chinese = testInfo.project.metadata.appLocale === 'zh'
+  let release = () => {}
+  const gate = new Promise<void>(resolve => { release = resolve })
+  let writes = 0
+  let committed = false
+  await page.route('**/api/jobs?*', route => committed ? route.fulfill({ json: { jobs: [{ ...state.job, id: 'job-2', company: 'Second Employer', role: 'Second fixture role', status: 'interview' }], total: 1 } }) : route.fallback())
+  await page.route('**/api/jobs/job-2', async route => {
+    if (route.request().method() !== 'PATCH') return route.fallback()
+    writes++
+    await gate
+    committed = true
+    return route.fulfill({ json: { id: 'job-2', status: 'interview' } })
+  })
+  try {
+    await page.goto(`${origin}/?page=jobs&jobsView=kanban`)
+    await page.clock.install()
+    const card = page.locator('[data-col="saved"] [draggable]').filter({ hasText: 'Second fixture role' })
+    await card.dragTo(page.locator('[data-col="interview"]'))
+    await expect.poll(() => writes).toBe(1)
+    await expect(card).toHaveAttribute('draggable', 'false')
+    await expect(card).toContainText(chinese ? '正在更新状态' : 'Updating status')
+    await card.dispatchEvent('dragstart')
+    await page.locator('[data-col="applied"]').dispatchEvent('drop')
+    expect(writes).toBe(1)
+    await page.clock.fastForward(15_001)
+    await expect(page.getByText(chinese ? /状态更新可能仍在处理中/ : /status update may still be processing/)).toBeVisible()
+    await expect(card).toHaveAttribute('draggable', 'false')
+    await page.getByRole('button', { name: chinese ? /我已核对/ : /I have checked/ }).click()
+    await expect(card).toHaveAttribute('draggable', 'false')
+    await card.dispatchEvent('dragstart')
+    await page.locator('[data-col="applied"]').dispatchEvent('drop')
+    expect(writes).toBe(1)
+    release()
+    await expect(page.locator('[data-col="interview"]').getByText('Second fixture role')).toBeVisible()
+    expect(writes).toBe(1)
+    expect(state.unexpected).toEqual([])
+  } finally { release() }
+})
+
+for (const failure of ['http', 'network'] as const) test(`uncertain ${failure} status cannot be moved again until checked`, async ({ page }, testInfo) => {
+  test.skip(!testInfo.project.name.startsWith('desktop-'), 'Exercises desktop Kanban')
+  const state = await install(page, { descriptionMode: 'two' })
+  const chinese = testInfo.project.metadata.appLocale === 'zh'
+  let writes = 0, committed = false
+  await page.route('**/api/jobs?*', route => committed ? route.fulfill({ json: { jobs: [{ ...state.job, id: 'job-2', company: 'Second Employer', role: 'Second fixture role', status: 'interview' }], total: 1 } }) : route.fallback())
+  await page.route('**/api/jobs/job-2', route => {
+    if (route.request().method() !== 'PATCH') return route.fallback()
+    writes++
+    if (writes === 1) return failure === 'network' ? route.abort('failed') : route.fulfill({ status: 503, json: { error: 'Unavailable' } })
+    committed = true
+    return route.fulfill({ json: { id: 'job-2', status: 'interview' } })
+  })
+  await page.goto(`${origin}/?page=jobs&jobsView=kanban`)
+  const card = page.locator('[data-col="saved"] [draggable]').filter({ hasText: 'Second fixture role' })
+  await card.dragTo(page.locator('[data-col="interview"]'))
+  const notice = page.getByRole('status').filter({ hasText: chinese ? '状态更新可能仍在处理中' : 'status update may still be processing' })
+  await expect(notice).toBeVisible()
+  await expect(card).toHaveAttribute('draggable', 'false')
+  await expect(card).toContainText(chinese ? '请先核对上方状态更新' : 'Check this status update above')
+  await expect(card).not.toContainText(chinese ? '正在更新状态' : 'Updating status')
+  await card.dispatchEvent('dragstart')
+  await page.locator('[data-col="applied"]').dispatchEvent('drop')
+  expect(writes).toBe(1)
+  await notice.getByRole('button', { name: chinese ? /我已核对/ : /I have checked/ }).click()
+  await expect(card).toHaveAttribute('draggable', 'true')
+  await card.dragTo(page.locator('[data-col="interview"]'))
+  await expect(page.locator('[data-col="interview"]').getByText('Second fixture role')).toBeVisible()
+  expect(writes).toBe(2)
+  expect(state.unexpected).toEqual([])
+})
+
+test('uncertain status updates identify and dismiss each job separately', async ({ page }, testInfo) => {
+  test.skip(!testInfo.project.name.startsWith('desktop-'), 'Exercises desktop Kanban')
+  const state = await install(page, { descriptionMode: 'two' })
+  const chinese = testInfo.project.metadata.appLocale === 'zh'
+  let release = () => {}
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const writes: string[] = []
+  await page.route('**/api/jobs/*', async route => {
+    if (route.request().method() !== 'PATCH') return route.fallback()
+    writes.push(new URL(route.request().url()).pathname)
+    await gate
+    return route.fulfill({ status: 503, json: { error: 'Unavailable' } })
+  })
+  try {
+    await page.goto(`${origin}/?page=jobs&jobsView=kanban`)
+    await page.locator('[data-col="saved"] [draggable]').filter({ hasText: 'Application flow engineer' }).dragTo(page.locator('[data-col="interview"]'))
+    await page.locator('[data-col="saved"] [draggable]').filter({ hasText: 'Second fixture role' }).dragTo(page.locator('[data-col="interview"]'))
+    await expect.poll(() => writes.length).toBe(2)
+    release()
+    const notices = page.getByRole('status').filter({ hasText: chinese ? /状态更新可能仍在处理中/ : /status update may still be processing/ })
+    await expect(notices).toHaveCount(2)
+    await notices.filter({ hasText: 'Fixture Employer' }).getByRole('button', { name: chinese ? /我已核对/ : /I have checked/ }).click()
+    await expect(notices).toHaveCount(1)
+    await expect(notices.first()).toContainText('Second Employer')
+    expect(writes).toHaveLength(2)
+    expect(state.unexpected).toEqual([])
+  } finally { release() }
+})
+
+test('pending status lock survives leaving and returning within the same page', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop shell')
+  const state = await install(page, { descriptionMode: 'two' })
+  let release = () => {}, writes = 0, committed = false
+  const gate = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/jobs?*', route => committed ? route.fulfill({ json: { jobs: [{ ...state.job, id: 'job-2', company: 'Second Employer', role: 'Second fixture role', status: 'interview' }], total: 1 } }) : route.fallback())
+  await page.route('**/api/jobs/job-2', async route => {
+    if (route.request().method() !== 'PATCH') return route.fallback()
+    writes++
+    await gate
+    committed = true
+    return route.fulfill({ json: { id: 'job-2', status: 'interview' } })
+  })
+  try {
+    await page.goto(`${origin}/?shell=1&page=jobs&jobsView=kanban`)
+    const card = page.locator('[data-col="saved"] [draggable]').filter({ hasText: 'Second fixture role' })
+    await card.dragTo(page.locator('[data-col="interview"]'))
+    await expect.poll(() => writes).toBe(1)
+    await page.locator('#desktop-sidebar').getByRole('button', { name: 'Discover', exact: true }).click()
+    await page.locator('#desktop-sidebar').getByRole('button', { name: /^Applications(?:\s+\d+)?$/ }).click()
+    const returned = page.locator('[data-col="saved"] [draggable]').filter({ hasText: 'Second fixture role' })
+    await expect(returned).toHaveAttribute('draggable', 'false')
+    await returned.dispatchEvent('dragstart')
+    await page.locator('[data-col="applied"]').dispatchEvent('drop')
+    expect(writes).toBe(1)
+    release()
+    await expect(page.locator('[data-col="interview"]').getByText('Second fixture role')).toBeVisible()
+    expect(writes).toBe(1)
+    expect(state.unexpected).toEqual([])
+  } finally { release() }
+})
+
+test('a completed update invalidates cached list after leaving the page', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises the desktop shell')
+  const state = await install(page, { descriptionMode: 'two' })
+  let releaseWrite = () => {}, releaseRead = () => {}
+  const writeGate = new Promise<void>(resolve => { releaseWrite = resolve })
+  const readGate = new Promise<void>(resolve => { releaseRead = resolve })
+  let started = false, committed = false, readStarted = false
+  await page.route('**/api/jobs?*', async route => {
+    if (!committed) return route.fallback()
+    readStarted = true
+    await readGate
+    return route.fulfill({ json: { jobs: [{ ...state.job, id: 'job-2', company: 'Second Employer', role: 'Second fixture role', status: 'interview' }], total: 1 } })
+  })
+  await page.route('**/api/jobs/job-2', async route => {
+    if (route.request().method() !== 'PATCH') return route.fallback()
+    started = true
+    await writeGate
+    committed = true
+    return route.fulfill({ json: { id: 'job-2', status: 'interview' } })
+  })
+  try {
+    await page.goto(`${origin}/?shell=1&page=jobs&jobsView=kanban`)
+    const card = page.locator('[data-col="saved"] [draggable]').filter({ hasText: 'Second fixture role' })
+    await card.dragTo(page.locator('[data-col="interview"]'))
+    await expect.poll(() => started).toBe(true)
+    await page.locator('#desktop-sidebar').getByRole('button', { name: 'Discover', exact: true }).click()
+    await expect(page).toHaveURL(/page=search/)
+    const response = page.waitForResponse(r => new URL(r.url()).pathname === '/api/jobs/job-2' && r.request().method() === 'PATCH')
+    releaseWrite()
+    await response
+    await page.locator('#desktop-sidebar').getByRole('button', { name: /^Applications(?:\s+\d+)?$/ }).click()
+    await expect.poll(() => readStarted).toBe(true)
+    await expect(page.getByText('Second fixture role', { exact: true })).toHaveCount(0)
+    releaseRead()
+    await expect(page.locator('[data-col="interview"]').getByText('Second fixture role')).toBeVisible()
+    expect(state.unexpected).toEqual([])
+  } finally { releaseWrite(); releaseRead() }
+})
+
+test('a read started before a successful Kanban update cannot be the final list', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop Kanban')
+  const state = await install(page, { descriptionMode: 'two' })
+  let release = () => {}
+  const gate = new Promise<void>(resolve => { release = resolve })
+  let holdOld = false
+  let oldStarted = false
+  let committed = false
+  await page.route('**/api/jobs?*', async route => {
+    if (holdOld && !committed) {
+      oldStarted = true
+      await gate
+      try { await route.fulfill({ json: { jobs: [{ ...state.job, id: 'job-2', company: 'Second Employer', role: 'Second fixture role' }], total: 1 } }) } catch { /* superseded request may be aborted */ }
+      return
+    }
+    return committed ? route.fulfill({ json: { jobs: [{ ...state.job, id: 'job-2', company: 'Second Employer', role: 'Second fixture role', status: 'interview' }], total: 1 } }) : route.fallback()
+  })
+  await page.route('**/api/jobs/job-2', route => {
+    if (route.request().method() !== 'PATCH') return route.fallback()
+    committed = true
+    return route.fulfill({ json: { id: 'job-2', status: 'interview' } })
+  })
+  try {
+    await page.goto(`${origin}/?page=jobs&jobsView=kanban`)
+    const card = page.locator('[data-col="saved"] [draggable]').filter({ hasText: 'Second fixture role' })
+    await expect(card).toBeVisible()
+    holdOld = true
+    await page.evaluate(() => window.postMessage({ type: 'nav-refresh' }, '*'))
+    await expect.poll(() => oldStarted).toBe(true)
+    await card.dragTo(page.locator('[data-col="interview"]'))
+    await expect(page.locator('[data-col="interview"]').getByText('Second fixture role')).toBeVisible()
+    release()
+    await expect(page.locator('[data-col="saved"]').getByText('Second fixture role')).toHaveCount(0)
+  } finally { release() }
+})
+
+for (const nextSession of ['account', 'logout'] as const) test(`application list hides prior account during ${nextSession}`, async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises account isolation')
+  const state = await install(page, { descriptionMode: 'two' })
+  let release = () => {}
+  const gate = new Promise<void>(resolve => { release = resolve })
+  let newRead = false
+  await page.route('**/api/jobs?*', async route => {
+    if (state.activeUserId !== 'fixture-b') return route.fallback()
+    newRead = true
+    await gate
+    return route.fulfill({ json: { jobs: [{ ...state.job, id: 'job-b', userId: 'fixture-b', company: 'Account B employer' }], total: 1 } })
+  })
+  try {
+    await page.goto(`${origin}/?page=jobs&jobsSearch=Acme`)
+    await expect(page.getByText('Fixture Employer', { exact: true }).first()).toBeVisible()
+    await page.getByRole('table').getByRole('checkbox', { name: 'Select job: Fixture Employer · Application flow engineer' }).check()
+    await expect(page.getByRole('button', { name: 'Delete 1', exact: true })).toBeVisible()
+    state.activeUserId = 'fixture-b'
+    await fixtureSession(page, nextSession === 'logout' ? 'unauthenticated' : 'authenticated', 'fixture-b')
+    await expect(page.getByText('Fixture Employer', { exact: true })).toHaveCount(0)
+    await expect(page.locator('.jobs-page-header h1 + span')).toHaveText('—')
+    await expect(page.getByRole('button', { name: 'Delete 1', exact: true })).toHaveCount(0)
+    if (nextSession === 'account') {
+      await expect.poll(() => newRead).toBe(true)
+      release()
+      await expect(page.getByText('Account B employer', { exact: true }).first()).toBeVisible()
+    }
+  } finally { release() }
+})
+
+test('failed new-account read never exposes the prior account on retry', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises account isolation')
+  const state = await install(page, { descriptionMode: 'two' })
+  let release = () => {}, reads = 0
+  const gate = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/jobs?*', async route => {
+    if (state.activeUserId !== 'fixture-b') return route.fallback()
+    reads++
+    if (reads === 1) return route.fulfill({ status: 503, json: { error: 'Unavailable' } })
+    await gate
+    return route.fulfill({ json: { jobs: [{ ...state.job, id: 'job-b', userId: 'fixture-b', company: 'Account B employer' }], total: 1 } })
+  })
+  try {
+    await page.goto(`${origin}/?page=jobs`)
+    await expect(page.getByText('Fixture Employer', { exact: true }).first()).toBeVisible()
+    state.activeUserId = 'fixture-b'
+    await fixtureSession(page, 'authenticated', 'fixture-b')
+    await expect(page.getByText('Couldn’t load your jobs')).toBeVisible()
+    await expect(page.getByText('Fixture Employer', { exact: true })).toHaveCount(0)
+    await page.getByRole('button', { name: 'Retry', exact: true }).click()
+    await expect.poll(() => reads).toBeGreaterThan(1)
+    await expect(page.getByText('Fixture Employer', { exact: true })).toHaveCount(0)
+    release()
+    await expect(page.getByText('Account B employer', { exact: true }).first()).toBeVisible()
+  } finally { release() }
 })
 
 test('restores a highlighted job outside the current page and retains list context through the real Resume page', async ({ page }) => {
