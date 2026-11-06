@@ -566,6 +566,16 @@ a mocked employer page and explicitly records a synthetic manual application.
 Database assertions distinguish the state before and after that record. Search,
 the audit and employer page are simulated, and database RLS is disabled; this
 does not establish production permissions, a real AI audit or employer receipt.
+Separately, `e2e/application-authenticated-preparation.browser.ts` exercises one
+continuous manual journey with real synthetic-account login, real application
+routes and a disposable database: save the synthetic job, prepare and audit its
+materials, edit the selected resume, return to the same application, deliberately
+recheck the changed version, inspect the downloaded PDF, open a simulated employer
+page and explicitly record the application. Database assertions check that the
+job remains saved until the manual record. The [CI run for commit `b46daaa7`](https://github.com/YuanshuoDu/applymate-jobcopilot/actions/runs/42308879197/job/128205101154)
+passed this fixture. Its model responses and employer page are synthetic, and the
+disposable database does not establish production RLS or permissions; it does not
+prove a real provider response, employer submission or receipt.
 One fixture opens the original Agent session from an application, answers a mock
 question, reviews a mock approval and displays a simulated unverified outcome;
 its state changes are injected by the fixture and page reloads. These checks prove
