@@ -528,6 +528,151 @@ test('Kanban cards retain drag-to-status after adding the application entry', as
   expect(state.unexpected).toEqual([])
 })
 
+for (const reloadFails of [false, true]) test(`uncertain Kanban change reloads the active page when list ${reloadFails ? 'fails' : 'succeeds'}`, async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name.startsWith('mobile-'), 'Kanban desktop interaction')
+  const state = await install(page, { descriptionMode: 'two' })
+  const listRequests: string[] = []
+  let writeStarted = false
+  let writeCount = 0
+  await page.route('**/api/jobs?*', async route => {
+    listRequests.push(route.request().url())
+    if (writeStarted && reloadFails) return route.fulfill({ status: 503, json: { error: 'Unavailable' } })
+    return route.fulfill({ json: { jobs: writeStarted ? [] : [{ ...state.job, id: 'job-2', company: 'Second Employer', role: 'Second fixture role' }], total: 80, statusCounts: { saved: 79, interview: 1, applied: 0, offer: 0, rejected: 0 } } })
+  })
+  await page.route('**/api/jobs/job-2', async route => {
+    if (route.request().method() !== 'PATCH') return route.fallback()
+    writeCount++
+    writeStarted = true
+    return route.fulfill({ status: 503, json: { error: 'Unavailable' } })
+  })
+  await page.goto(`${origin}/?page=jobs&jobsView=kanban&jobsPage=3&jobsSize=20&jobsSearch=Acme&jobsStatus=saved`)
+  const card = page.locator('[data-col="saved"] [draggable="true"]').filter({ hasText: 'Second fixture role' })
+  await expect(card).toBeVisible()
+  await card.dragTo(page.locator('[data-col="interview"]'))
+  await expect.poll(() => listRequests.length).toBeGreaterThan(1)
+  const requested = new URL(listRequests.at(-1)!)
+  expect(Object.fromEntries(requested.searchParams)).toMatchObject({ page: '3', pageSize: '20', q: 'Acme', status: 'saved' })
+  await expect(page.getByRole('status').filter({ hasText: /status update may still be processing|状态更新可能仍在处理中/ })).toBeVisible()
+  if (reloadFails) {
+    await expect(page.getByText(/Check your connection and reload to confirm|请检查网络连接并重新加载/)).toBeVisible()
+    await expect(page.getByText(/applications are unchanged|申请未改变/)).toHaveCount(0)
+    await expect(page.locator('.jobs-page-header h1 + span')).toHaveText('—')
+  } else {
+    await expect(page.getByText('Second fixture role', { exact: true })).toHaveCount(0)
+  }
+  await page.getByRole('button', { name: /I have checked|我已核对/ }).click()
+  await expect(page.getByRole('status').filter({ hasText: /status update may still be processing|状态更新可能仍在处理中/ })).toHaveCount(0)
+  expect(writeCount).toBe(1)
+  expect(state.unexpected).toEqual([])
+})
+
+for (const change of ['page', 'account'] as const) for (const outcome of ['success', 'unknown'] as const) test(`late Kanban ${outcome} respects the new ${change} list`, async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name.startsWith('mobile-'), 'Kanban desktop interaction')
+  const state = await install(page, { descriptionMode: 'two' })
+  let releaseWrite = () => {}
+  const writeGate = new Promise<void>(resolve => { releaseWrite = resolve })
+  let writeStarted = false
+  let writeFinished = false
+  let writeCount = 0
+  const reads: Array<{ owner: string; url: string }> = []
+  await page.route('**/api/jobs?*', async route => {
+    const url = new URL(route.request().url())
+    const name = state.activeUserId === 'fixture-b' ? 'Account B employer' : url.searchParams.get('page') === '4' ? (writeFinished ? 'Updated page four employer' : 'Page four employer') : 'Second Employer'
+    reads.push({ owner: state.activeUserId, url: url.href })
+    return route.fulfill({ json: { jobs: [{ ...state.job, id: 'job-2', userId: state.activeUserId, company: name, role: 'Second fixture role' }], total: 80, statusCounts: { saved: 80, interview: 0, applied: 0, offer: 0, rejected: 0 } } })
+  })
+  await page.route('**/api/jobs/job-2', async route => {
+    if (route.request().method() !== 'PATCH') return route.fallback()
+    writeCount++
+    writeStarted = true
+    await writeGate
+    writeFinished = true
+    return outcome === 'success' ? route.fulfill({ json: { id: 'job-2', status: 'interview' } }) : route.fulfill({ status: 503, json: { error: 'Unavailable' } })
+  })
+  try {
+    await page.goto(`${origin}/?page=jobs&jobsView=kanban&jobsPage=3&jobsSize=20&jobsSearch=Acme&jobsStatus=saved`)
+    const card = page.locator('[data-col="saved"] [draggable="true"]').filter({ hasText: 'Second fixture role' })
+    await card.dragTo(page.locator('[data-col="interview"]'))
+    await expect.poll(() => writeStarted).toBe(true)
+    if (change === 'page') await page.getByRole('button', { name: '4', exact: true }).click()
+    else { state.activeUserId = 'fixture-b'; await fixtureSession(page, 'authenticated', 'fixture-b') }
+    const expected = change === 'page' ? 'Page four employer' : 'Account B employer'
+    await expect(page.getByText(expected, { exact: true })).toBeVisible()
+    const beforeRelease = reads.length
+    const writeResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/api/jobs/job-2' && response.request().method() === 'PATCH')
+    releaseWrite()
+    await writeResponse
+    if (change === 'page') {
+      await expect(page.getByText('Updated page four employer', { exact: true })).toBeVisible()
+      await expect.poll(() => reads.length).toBeGreaterThan(beforeRelease)
+      const refreshed = reads.at(-1)!
+      expect(refreshed.owner).toBe('fixture-user')
+      expect(Object.fromEntries(new URL(refreshed.url).searchParams)).toMatchObject({ page: '4', pageSize: '20', q: 'Acme', status: 'saved' })
+      if (outcome === 'unknown') await expect(page.getByRole('status').filter({ hasText: /status update may still be processing|状态更新可能仍在处理中/ })).toBeVisible()
+    } else {
+      await page.waitForTimeout(250)
+      await expect(page.getByText(expected, { exact: true })).toBeVisible()
+      expect(reads.length).toBe(beforeRelease)
+      await expect(page.getByRole('status').filter({ hasText: /status update may still be processing|状态更新可能仍在处理中/ })).toHaveCount(0)
+    }
+    expect(writeCount).toBe(1)
+    expect(state.unexpected).toEqual([])
+  } finally { releaseWrite() }
+})
+
+for (const change of ['page', 'account'] as const) test(`late recovery read cannot replace the new ${change} list`, async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name.startsWith('mobile-'), 'Kanban desktop interaction')
+  const state = await install(page, { descriptionMode: 'two' })
+  let releaseOldRead = () => {}
+  const oldReadGate = new Promise<void>(resolve => { releaseOldRead = resolve })
+  let patchCompleted = false
+  let oldReadStarted = false
+  let oldReadReturned = false
+  await page.route('**/api/jobs?*', async route => {
+    const url = new URL(route.request().url())
+    const owner = state.activeUserId
+    const oldPage = owner === 'fixture-user' && url.searchParams.get('page') === '3'
+    if (patchCompleted && oldPage) {
+      oldReadStarted = true
+      await oldReadGate
+      try {
+        await route.fulfill({ json: { jobs: [{ ...state.job, id: 'job-2', company: 'Late old employer', role: 'Second fixture role' }], total: 80 } })
+      } catch { /* The superseded request may already be aborted. */ }
+      oldReadReturned = true
+      return
+    }
+    const name = owner === 'fixture-b' ? 'Account B employer' : oldPage ? 'Original employer' : 'Page four employer'
+    return route.fulfill({ json: { jobs: [{ ...state.job, id: 'job-2', userId: owner, company: name, role: 'Second fixture role' }], total: 80, statusCounts: { saved: 80, interview: 0, applied: 0, offer: 0, rejected: 0 } } })
+  })
+  await page.route('**/api/jobs/job-2', async route => {
+    if (route.request().method() !== 'PATCH') return route.fallback()
+    patchCompleted = true
+    return route.fulfill({ status: 503, json: { error: 'Unavailable' } })
+  })
+  try {
+    await page.goto(`${origin}/?page=jobs&jobsView=kanban&jobsPage=3&jobsSize=20`)
+    const card = page.locator('[data-col="saved"] [draggable="true"]').filter({ hasText: 'Second fixture role' })
+    await card.dragTo(page.locator('[data-col="interview"]'))
+    await expect.poll(() => oldReadStarted).toBe(true)
+    if (change === 'page') {
+      await page.evaluate(() => {
+        const url = new URL(window.location.href)
+        url.searchParams.set('jobsPage', '4')
+        window.history.pushState({}, '', url)
+        window.dispatchEvent(new PopStateEvent('popstate'))
+      })
+    } else { state.activeUserId = 'fixture-b'; await fixtureSession(page, 'authenticated', 'fixture-b') }
+    const expected = change === 'page' ? 'Page four employer' : 'Account B employer'
+    await expect(page.getByText(expected, { exact: true })).toBeVisible()
+    releaseOldRead()
+    await expect.poll(() => oldReadReturned).toBe(true)
+    await expect(page.getByText(expected, { exact: true })).toBeVisible()
+    await expect(page.getByText('Late old employer', { exact: true })).toHaveCount(0)
+    if (change === 'account') await expect(page.getByRole('status').filter({ hasText: /status update may still be processing|状态更新可能仍在处理中/ })).toHaveCount(0)
+    expect(state.unexpected).toEqual([])
+  } finally { releaseOldRead() }
+})
+
 test('restores a highlighted job outside the current page and retains list context through the real Resume page', async ({ page }) => {
   const state = await install(page)
   await open(page, '&jobsPage=3&jobsSize=50&jobsSearch=Acme&jobsStatus=saved&jobsSort=score&jobsDirection=asc')

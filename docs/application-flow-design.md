@@ -57,6 +57,8 @@ Agent 负责原任务的执行和审批，招聘消息负责查看回复。
 明确时调整状态，并以雇主回执核对；看板状态本身不是回执。点击卡片上的“查看此申请”
 可打开对应职位，关闭后仍回到看板。直接移到“拒绝”或“录用”不自动证明已有提交记录；
 如果职位保留了过去的申请时间，即使移回“已保存”，也不会再次提供手动记录入口。
+如果拖动后的状态更新结果不明确，页面会重新读取当前列表并保留提示；稍候刷新并核对，
+确认后可关闭提示。一次读取只反映当时状态，不会自动重复发送更新。
 
 ### Agent 协助申请
 
@@ -302,6 +304,9 @@ The existing Kanban also permits a user to drag a job to another status, includi
 Applied. That changes the status and records a generic status-change activity;
 it does not use the manual-submission record or add its source marker. A board
 status is user-maintained tracking information, not an employer receipt.
+If the status update has an uncertain result, the current list is reloaded and a
+notice remains until the user checks and dismisses it. A read is only a snapshot;
+the update is not automatically sent again.
 
 The browser reads the account-owned job, selected saved documents and existing
 passing audit before requesting the ZIP. The server validates ownership, the signed

@@ -1966,6 +1966,12 @@ export function JobsPage() {
   const [sortBy,       setSortBy      ] = useState<JobSortBy>(initialList.sortBy)
   const [sortDir,      setSortDir     ] = useState<JobSortDirection>(initialList.sortDir)
   const displayJobs = useMemo(() => sortJobs(jobs, sortBy, sortDir), [jobs, sortBy, sortDir])
+  const listContext = JSON.stringify([userId, page, pageSize, search, filterStatus])
+  const currentListContext = useRef(listContext)
+  currentListContext.current = listContext
+  const currentUserId = useRef(userId)
+  currentUserId.current = userId
+  const [statusChangeUncertain, setStatusChangeUncertain] = useState<string | null>(null)
   const [selectedIds,  setSelectedIds ] = useState<Set<string>>(() => new Set())
   const [bulkDeleting, setBulkDeleting] = useState(false)
   const [scoringAll,   setScoringAll   ] = useState(false)
@@ -2097,6 +2103,8 @@ export function JobsPage() {
   }
 
   async function handleStatusChange(jobId: string, newStatus: JobStatus) {
+    const requestContext = listContext
+    const requestUserId = userId
     const previousStatus = jobs.find(job => job.id === jobId)?.status
     // Optimistic update
     setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: newStatus } : j))
@@ -2108,19 +2116,25 @@ export function JobsPage() {
       }))
     }
     const { error } = await apiMutate(`/api/jobs/${jobId}`, 'PATCH', { status: newStatus })
+    if (defaultJobsCache?.userId === requestUserId) defaultJobsCache = null
+    if (error && currentUserId.current === requestUserId) setStatusChangeUncertain(requestUserId)
+    if (currentUserId.current !== requestUserId) return
+    if (currentListContext.current !== requestContext) {
+      // The new view may have been read before this write finished. Refresh
+      // that view through its own cancellable request, never the old context.
+      setLoading(true)
+      setFetchError(null)
+      triggerRefresh()
+      return
+    }
     if (error) {
       toast.error('Error', error)
-      // Revert by re-fetching
-      const params = new URLSearchParams({ pageSize: '100' })
-      if (search)                params.set('q',      search)
-      if (filterStatus !== 'all') params.set('status', filterStatus)
-      fetch(`/api/jobs?${params}`).then(r => r.json()).then((json: JobsListResponse) => {
-        setJobs(json.jobs ?? [])
-        setTotal(json.total ?? 0)
-        setStatusCounts(json.statusCounts ?? EMPTY_STATUS_COUNTS)
-      })
+      // The write may have reached the server. Hide the optimistic result and
+      // reload the active list; the normal effect cancels obsolete requests.
+      setLoading(true)
+      setFetchError(null)
+      triggerRefresh()
     } else {
-      defaultJobsCache = null
       toast.success(t('jobs.moved'), `${t('jobs.movedTo')} ${colLabel(t, newStatus)}`)
     }
   }
@@ -2195,7 +2209,7 @@ export function JobsPage() {
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 24, flexWrap: 'wrap' }}>
           <div style={{ flex: '1 1 360px', display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
             <h1 style={{ margin: 0, flexShrink: 0, fontSize: 22, fontWeight: 760, lineHeight: 1.1, letterSpacing: '-0.05em' }}>{t('jobs.title')}</h1>
-            <span style={{ flexShrink: 0, fontSize: 12, color: 'var(--primary)', background: 'rgba(79,70,229,0.09)', borderRadius: 999, padding: '4px 9px', fontWeight: 600 }}>{total}</span>
+            <span style={{ flexShrink: 0, fontSize: 12, color: 'var(--primary)', background: 'rgba(79,70,229,0.09)', borderRadius: 999, padding: '4px 9px', fontWeight: 600 }}>{loading || fetchError ? '—' : total}</span>
             <span style={{ minWidth: 0, overflow: 'hidden', color: 'var(--text-muted)', fontSize: 12, textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t('jobs.description')}</span>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
@@ -2209,7 +2223,7 @@ export function JobsPage() {
                 <div style={{ height: 34, minWidth: 96, padding: '0 10px', display: 'inline-flex', alignItems: 'center', gap: 6, border: '1px solid var(--border)', borderRadius: 7, background: 'var(--bg)' }}>
                   <Icon size={14} color={color} strokeWidth={1.8} />
                   <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>{label}</span>
-                  <strong style={{ marginLeft: 'auto', color: 'var(--text)', fontSize: 12, fontWeight: 700 }}>{count}</strong>
+                  <strong style={{ marginLeft: 'auto', color: 'var(--text)', fontSize: 12, fontWeight: 700 }}>{loading || fetchError ? '—' : count}</strong>
                 </div>
               </React.Fragment>
             ))}
@@ -2220,6 +2234,11 @@ export function JobsPage() {
       </header>
 
       <div className="jobs-page-content" style={{ padding: '16px 30px 30px', flex: 1 }}>
+        {statusChangeUncertain === userId && userId && <div role="status" style={{ marginBottom: 12 }}>
+          <p>{t('jobs.statusChangeUncertain')}</p>
+          <Btn variant="ghost" small onClick={triggerRefresh}>{t('application.refreshStatus')}</Btn>
+          <Btn variant="ghost" small onClick={() => setStatusChangeUncertain(null)}>{t('jobs.statusChangeChecked')}</Btn>
+        </div>}
         <div role="group" aria-label={t('application.attentionViews')} style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
           <button type="button" aria-pressed={!attentionView} onClick={() => setAttentionView(false)}>{t('application.allApplications')}</button>
           <button type="button" aria-pressed={attentionView} onClick={() => setAttentionView(true)}>{t('application.attentionView')}</button>
