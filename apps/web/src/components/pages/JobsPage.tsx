@@ -142,7 +142,10 @@ interface JobsListResponse {
 // to this section. Searches and filters intentionally remain uncached.
 let defaultJobsCache: JobsPageCache | null = null
 
-function sortJobs(jobs: Job[], sortBy: 'createdAt' | 'score' | 'company' | 'role', sortDir: 'asc' | 'desc') {
+type JobSortBy = 'createdAt' | 'score' | 'company' | 'role'
+type JobSortDirection = 'asc' | 'desc'
+
+function sortJobs(jobs: Job[], sortBy: JobSortBy, sortDir: JobSortDirection) {
   return [...jobs].sort((a, b) => {
     let comparison = 0
     if (sortBy === 'score') comparison = (a.score ?? -1) - (b.score ?? -1)
@@ -150,9 +153,9 @@ function sortJobs(jobs: Job[], sortBy: 'createdAt' | 'score' | 'company' | 'role
     else if (sortBy === 'role') comparison = a.role.localeCompare(b.role)
 
     if (sortBy === 'createdAt' || comparison === 0) {
-      comparison = new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      comparison = new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
     }
-    return sortDir === 'desc' ? comparison : -comparison
+    return sortDir === 'desc' ? -comparison : comparison
   })
 }
 
@@ -187,7 +190,7 @@ export function toMobileJobCard(job: Job): MobileJobCardData {
 }
 
 // ── ListView ──────────────────────────────────────────────────────────────────
-function ListView({ jobs, taskByJobId, onOpenSession, onRowClick, selectedIds, onToggle, onToggleAll }: {
+function ListView({ jobs, taskByJobId, onOpenSession, onRowClick, selectedIds, onToggle, onToggleAll, sortBy, sortDir, onChangeSort }: {
   jobs: Job[]
   taskByJobId: ReadonlyMap<string, ApplicationTaskView>
   onOpenSession: (sessionId: string) => void
@@ -195,38 +198,25 @@ function ListView({ jobs, taskByJobId, onOpenSession, onRowClick, selectedIds, o
   selectedIds: Set<string>
   onToggle: (id: string) => void
   onToggleAll: (ids: string[]) => void
+  sortBy: JobSortBy
+  sortDir: JobSortDirection
+  onChangeSort: (by: JobSortBy, dir: JobSortDirection) => void
 }) {
   const { t } = useI18n()
-  const [sort, setSort] = useState<{ col: string; dir: 'asc' | 'desc' }>({ col: 'date', dir: 'desc' })
-
-  const sorted = useMemo(() => [...jobs].sort((a, b) => {
-    if (sort.col === 'score') {
-      const sa = a.score ?? 0, sb = b.score ?? 0
-      return sort.dir === 'desc' ? sb - sa : sa - sb
-    }
-    if (sort.col === 'company') {
-      return sort.dir === 'desc' ? b.company.localeCompare(a.company) : a.company.localeCompare(b.company)
-    }
-    // date: sort by createdAt
-    const da = new Date(a.createdAt).getTime()
-    const db = new Date(b.createdAt).getTime()
-    return sort.dir === 'desc' ? db - da : da - db
-  }), [jobs, sort])
-
-  function sortHeader(col: string, label: string) {
+  function sortHeader(col: JobSortBy, label: string) {
     return (
       <th
-        aria-sort={sort.col === col ? (sort.dir === 'desc' ? 'descending' : 'ascending') : undefined}
+        aria-sort={sortBy === col ? (sortDir === 'desc' ? 'descending' : 'ascending') : undefined}
         style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)', whiteSpace: 'nowrap' }}>
-        <button type="button" onClick={() => setSort(s => ({ col, dir: s.col === col && s.dir === 'desc' ? 'asc' : 'desc' }))}
+        <button type="button" onClick={() => onChangeSort(col, sortBy === col && sortDir === 'desc' ? 'asc' : 'desc')}
           style={{ padding: 0, border: 0, background: 'none', color: 'inherit', font: 'inherit', cursor: 'pointer' }}>
-          {label} <span aria-hidden="true">{sort.col === col ? (sort.dir === 'desc' ? '↓' : '↑') : ''}</span>
+          {label} <span aria-hidden="true">{sortBy === col ? (sortDir === 'desc' ? '↓' : '↑') : ''}</span>
         </button>
       </th>
     )
   }
 
-  const visibleIds = sorted.map(job => job.id)
+  const visibleIds = jobs.map(job => job.id)
   const allVisibleSelected = visibleIds.length > 0 && visibleIds.every(id => selectedIds.has(id))
 
   return (
@@ -238,19 +228,19 @@ function ListView({ jobs, taskByJobId, onOpenSession, onRowClick, selectedIds, o
               <input type="checkbox" aria-label={t('jobs.selectAll')} checked={allVisibleSelected} onChange={() => onToggleAll(visibleIds)} />
             </th>
             {sortHeader('company', t('jobs.companyLabel'))}
-            <th style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)' }}>{t('jobs.roleLabel')}</th>
+            {sortHeader('role', t('jobs.roleLabel'))}
             <th style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)' }}>{t('jobs.statusLabel')}</th>
             {sortHeader('score', t('jobs.match'))}
-            {sortHeader('date', t('jobs.added'))}
+            {sortHeader('createdAt', t('jobs.added'))}
             <th style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)' }}>{t('jobs.followUp')}</th>
             <th style={{ padding: '8px 16px', borderBottom: '0.5px solid var(--border)' }} />
           </tr>
         </thead>
         <tbody>
-          {sorted.map((j, i) => (
+          {jobs.map((j, i) => (
             <tr key={j.id}
               onClick={() => onRowClick(j)}
-              style={{ borderBottom: i < sorted.length - 1 ? '0.5px solid var(--border)' : 'none', cursor: 'pointer' }}
+              style={{ borderBottom: i < jobs.length - 1 ? '0.5px solid var(--border)' : 'none', cursor: 'pointer' }}
               onMouseEnter={e => (e.currentTarget.style.background = 'var(--bg-secondary)')}
               onMouseLeave={e => (e.currentTarget.style.background = '')}>
               <td style={{ padding: '10px 12px', textAlign: 'center' }} onClick={e => e.stopPropagation()}>
@@ -1799,10 +1789,10 @@ function JobDetail({ label, value, href }: { label: string; value: string; href?
 
 const PAGE_SIZE_OPTS = [20, 50]
 const SORT_OPTS: { value: string; label: string }[] = [
-  { value: 'createdAt', label: 'Date' },
-  { value: 'score',     label: 'Score' },
-  { value: 'company',   label: 'Company' },
-  { value: 'role',      label: 'Role' },
+  { value: 'createdAt', label: 'jobs.sort.date' },
+  { value: 'score',     label: 'jobs.sort.score' },
+  { value: 'company',   label: 'jobs.sort.company' },
+  { value: 'role',      label: 'jobs.sort.role' },
 ]
 
 function PaginationBar({
@@ -1811,9 +1801,10 @@ function PaginationBar({
 }: {
   total:        number; page: number; pageSize: number
   onChangePage: (p: number) => void; onChangeSize: (s: number) => void
-  sortBy:       string; sortDir: string
-  onChangeSort: (by: any, dir: any) => void
+  sortBy:       JobSortBy; sortDir: JobSortDirection
+  onChangeSort: (by: JobSortBy, dir: JobSortDirection) => void
 }) {
+  const { t } = useI18n()
   const totalPages = Math.ceil(total / pageSize)
   const from = (page - 1) * pageSize + 1
   const to   = Math.min(page * pageSize, total)
@@ -1845,12 +1836,12 @@ function PaginationBar({
 
       {/* Center: sort */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-        <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>Sort:</span>
-        <select value={sortBy} onChange={e => onChangeSort(e.target.value, sortDir)}
+        <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>{t('jobs.sort.currentPage')}</span>
+        <select aria-label={t('jobs.sort.currentPage')} value={sortBy} onChange={e => onChangeSort(e.target.value as JobSortBy, sortDir)}
           style={{ padding: '3px 6px', fontSize: 10, border: '0.5px solid var(--border)', borderRadius: 5, background: 'var(--bg)', color: 'var(--text)' }}>
-          {SORT_OPTS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+          {SORT_OPTS.map(o => <option key={o.value} value={o.value}>{t(o.label)}</option>)}
         </select>
-        <button onClick={() => onChangeSort(sortBy, sortDir === 'asc' ? 'desc' : 'asc')}
+        <button aria-label={t(sortDir === 'asc' ? 'jobs.sort.ascending' : 'jobs.sort.descending')} onClick={() => onChangeSort(sortBy, sortDir === 'asc' ? 'desc' : 'asc')}
           style={{ ...btnStyle(false), fontSize: 12, padding: '3px 7px' }}>
           {sortDir === 'asc' ? '↑' : '↓'}
         </button>
@@ -1972,10 +1963,9 @@ export function JobsPage() {
   const [selectedJob,  setSelectedJob ] = useState<Job | null>(null)
   const [page,         setPage        ] = useState(initialList.page)
   const [pageSize,     setPageSize    ] = useState(initialList.pageSize)
-  const [sortBy,       setSortBy      ] = useState<'createdAt' | 'score' | 'company' | 'role'>(initialList.sortBy)
-  const [sortDir,      setSortDir     ] = useState<'asc' | 'desc'>(initialList.sortDir)
-  const sortByRef = useRef(sortBy)
-  const sortDirRef = useRef(sortDir)
+  const [sortBy,       setSortBy      ] = useState<JobSortBy>(initialList.sortBy)
+  const [sortDir,      setSortDir     ] = useState<JobSortDirection>(initialList.sortDir)
+  const displayJobs = useMemo(() => sortJobs(jobs, sortBy, sortDir), [jobs, sortBy, sortDir])
   const [selectedIds,  setSelectedIds ] = useState<Set<string>>(() => new Set())
   const [bulkDeleting, setBulkDeleting] = useState(false)
   const [scoringAll,   setScoringAll   ] = useState(false)
@@ -2005,11 +1995,10 @@ export function JobsPage() {
         const json = await res.json() as JobsListResponse
         if (!cancelled) {
           const rawJobs: Job[] = json.jobs ?? []
-          const sorted = sortJobs(rawJobs, sortByRef.current, sortDirRef.current)
           const nextTotal = json.total ?? 0
           const nextStatusCounts = json.statusCounts ?? EMPTY_STATUS_COUNTS
-          if (isDefaultView) defaultJobsCache = { userId, jobs: sorted, total: nextTotal, statusCounts: nextStatusCounts }
-          setJobs(sorted)
+          if (isDefaultView) defaultJobsCache = { userId, jobs: rawJobs, total: nextTotal, statusCounts: nextStatusCounts }
+          setJobs(rawJobs)
           setTotal(nextTotal)
           setStatusCounts(nextStatusCounts)
         }
@@ -2022,14 +2011,6 @@ export function JobsPage() {
     }, search ? 300 : 0)
     return () => { cancelled = true; controller.abort(); clearTimeout(timer) }
   }, [search, filterStatus, page, pageSize, refreshTick, userId])
-
-  // Sorting is entirely local: avoid turning a simple UI operation into a
-  // round-trip to the jobs API.
-  useEffect(() => {
-    sortByRef.current = sortBy
-    sortDirRef.current = sortDir
-    setJobs(previous => sortJobs(previous, sortBy, sortDir))
-  }, [sortBy, sortDir])
 
   // When the component gains focus (user navigates back from Search), refresh
   useEffect(() => {
@@ -2293,11 +2274,11 @@ export function JobsPage() {
             {view === 'list'
               ? <>
                 <div className="jobs-desktop-list">
-                  <ListView onOpenSession={id => openApplicationSession(id, navigate)} taskByJobId={applicationTasks.byJobId} jobs={jobs} onRowClick={selectApplication} selectedIds={selectedIds} onToggle={toggleSelected} onToggleAll={toggleAllVisible} />
+                  <ListView onOpenSession={id => openApplicationSession(id, navigate)} taskByJobId={applicationTasks.byJobId} jobs={displayJobs} onRowClick={selectApplication} selectedIds={selectedIds} onToggle={toggleSelected} onToggleAll={toggleAllVisible} sortBy={sortBy} sortDir={sortDir} onChangeSort={(by, dir) => { setSortBy(by); setSortDir(dir) }} />
                 </div>
-                <MobileListView onOpenSession={id => openApplicationSession(id, navigate)} taskByJobId={applicationTasks.byJobId} jobs={jobs} onRowClick={selectApplication} selectedIds={selectedIds} onToggle={toggleSelected} />
+                <MobileListView onOpenSession={id => openApplicationSession(id, navigate)} taskByJobId={applicationTasks.byJobId} jobs={displayJobs} onRowClick={selectApplication} selectedIds={selectedIds} onToggle={toggleSelected} />
               </>
-              : <KanbanView jobs={jobs} onStatusChange={handleStatusChange} onAddClick={col => { setPrefillStatus(col); setShowAdd(true) }} onRowClick={selectApplication} />}
+              : <KanbanView jobs={displayJobs} onStatusChange={handleStatusChange} onAddClick={col => { setPrefillStatus(col); setShowAdd(true) }} onRowClick={selectApplication} />}
 
             {/* ── Pagination bar ── */}
             {total > pageSize && (

@@ -11,6 +11,7 @@ UI changes do not establish production rollout or actual employer submission.
 
 以“申请管理”为每个职位的中心。发现职位负责找工作，简历页负责编辑材料，
 Agent 负责原任务的执行和审批，招聘消息负责查看回复。
+申请列表的排序只作用于当前页；桌面表头和分页栏使用同一排序设置，返回后仍保留。
 
 ### 手动申请
 
@@ -150,6 +151,8 @@ Agent 维护范围内单独处理。
 
 Page IDs remain `search`, `jobs`, `resume`, `gmail`, and `agent`. Renaming labels
 does not invalidate existing links. Saving a job never counts as applying.
+Application list sorting applies to the current page only. The desktop headers
+and pagination controls share the same sort setting, which is retained on return.
 
 ## 2. Shared interaction rules
 

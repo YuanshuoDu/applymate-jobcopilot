@@ -3205,6 +3205,89 @@ test('desktop job sorting works by keyboard and retains focus', async ({ page },
   expect(state.unexpected).toEqual([])
 })
 
+test('current-page sort stays consistent across controls, application return and reload', async ({ page }, testInfo) => {
+  const state = await install(page, { descriptionMode: 'two' })
+  await page.goto(`${origin}/?page=jobs`)
+  const chinese = testInfo.project.metadata.appLocale === 'zh'
+  const mobile = testInfo.project.name.startsWith('mobile-')
+  const sortLabel = chinese ? '当前页排序：' : 'Sort current page:'
+  const select = page.getByRole('combobox', { name: sortLabel })
+  const rows = mobile ? page.locator('.jobs-mobile-list article') : page.locator('table tbody tr')
+  await expect(select).toBeVisible()
+  await select.selectOption('company')
+  await expect(rows.first()).toContainText('Second Employer')
+  if (!mobile) await expect(page.getByRole('columnheader', { name: chinese ? '公司' : 'Company', exact: true })).toHaveAttribute('aria-sort', 'descending')
+  await page.getByRole('button', { name: chinese ? '排序方向：降序；切换为升序' : 'Sort direction: descending; change to ascending' }).click()
+  await expect(rows.first()).toContainText('Fixture Employer')
+  await expect(page).toHaveURL(/jobsSort=company/)
+  await expect(page).toHaveURL(/jobsDirection=asc/)
+  if (!mobile) await expect(page.getByRole('columnheader', { name: chinese ? '公司' : 'Company', exact: true })).toHaveAttribute('aria-sort', 'ascending')
+  if (mobile) {
+    await rows.first().getByRole('button', { name: /Fixture Employer.*Application flow engineer/ }).click()
+  } else {
+    await rows.first().getByRole('button', { name: chinese ? '查看此申请' : 'View this application' }).click()
+  }
+  const drawer = page.getByRole('dialog')
+  await expect(drawer).toContainText('Fixture Employer')
+  await drawer.getByRole('button', { name: /Close application details|关闭申请详情/ }).click()
+  await expect(rows.first()).toContainText('Fixture Employer')
+  await page.reload()
+  await expect(select).toHaveValue('company')
+  await expect(rows.first()).toContainText('Fixture Employer')
+  await expect(page.getByRole('button', { name: chinese ? '排序方向：升序；切换为降序' : 'Sort direction: ascending; change to descending' })).toBeVisible()
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+test('current-page date, score and role sorting use the selected direction', async ({ page }, testInfo) => {
+  const state = await install(page, { descriptionMode: 'two' })
+  await page.route('**/api/jobs?*', route => route.fulfill({ json: {
+    jobs: [state.job, { ...state.job, id: 'job-2', company: 'Second Employer', role: 'Second fixture role', score: 12, createdAt: '2026-10-29T10:00:00.000Z' }],
+    total: 80, statusCounts: { saved: 80, applied: 0, interview: 0, offer: 0, rejected: 0 },
+  } }))
+  await page.goto(`${origin}/?page=jobs`)
+  const chinese = testInfo.project.metadata.appLocale === 'zh'
+  const rows = testInfo.project.name.startsWith('mobile-') ? page.locator('.jobs-mobile-list article') : page.locator('table tbody tr')
+  const select = page.getByRole('combobox', { name: chinese ? '当前页排序：' : 'Sort current page:' })
+  const descending = () => page.getByRole('button', { name: chinese ? '排序方向：降序；切换为升序' : 'Sort direction: descending; change to ascending' })
+  const ascending = () => page.getByRole('button', { name: chinese ? '排序方向：升序；切换为降序' : 'Sort direction: ascending; change to descending' })
+  await expect(rows.first()).toContainText('Fixture Employer')
+  await descending().click()
+  await expect(rows.first()).toContainText('Second Employer')
+  await select.selectOption('score')
+  await expect(rows.first()).toContainText('Second Employer')
+  await ascending().click()
+  await expect(rows.first()).toContainText('Fixture Employer')
+  await select.selectOption('role')
+  await expect(rows.first()).toContainText('Second Employer')
+  if (!testInfo.project.name.startsWith('mobile-')) await expect(page.getByRole('columnheader', { name: chinese ? '职位' : 'Role', exact: true })).toHaveAttribute('aria-sort', 'descending')
+  await descending().click()
+  await expect(rows.first()).toContainText('Fixture Employer')
+  if (!testInfo.project.name.startsWith('mobile-')) await expect(page.getByRole('columnheader', { name: chinese ? '职位' : 'Role', exact: true })).toHaveAttribute('aria-sort', 'ascending')
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+test('newly added application remains in the current sort order', async ({ page }, testInfo) => {
+  const state = await install(page, { descriptionMode: 'two' })
+  await page.goto(`${origin}/?page=jobs`)
+  const chinese = testInfo.project.metadata.appLocale === 'zh'
+  const rows = testInfo.project.name.startsWith('mobile-') ? page.locator('.jobs-mobile-list article') : page.locator('table tbody tr')
+  await page.getByRole('combobox', { name: chinese ? '当前页排序：' : 'Sort current page:' }).selectOption('company')
+  await page.getByRole('button', { name: chinese ? '排序方向：降序；切换为升序' : 'Sort direction: descending; change to ascending' }).click()
+  await page.getByRole('button', { name: chinese ? '+ 添加职位' : '+ Add Job', exact: true }).click()
+  const dialog = page.getByRole('dialog')
+  await dialog.getByLabel(chinese ? '公司 *' : 'Company *', { exact: true }).fill('Zulu Employer')
+  await dialog.getByLabel(chinese ? '职位 *' : 'Role *', { exact: true }).fill('New fixture role')
+  await dialog.getByRole('button', { name: chinese ? '添加职位' : 'Add Job', exact: true }).click()
+  await expect(dialog).toHaveCount(0)
+  await expect(rows).toHaveCount(3)
+  await expect(rows.first()).toContainText('Fixture Employer')
+  await expect(rows.last()).toContainText('Zulu Employer')
+  expect(state.writes.filter(item => item.path === '/api/jobs')).toHaveLength(1)
+  expect(state.unexpected).toEqual([])
+})
+
 test('application drawer traps keyboard focus and closes with Escape', async ({ page }) => {
   const state = await install(page)
   await open(page)
