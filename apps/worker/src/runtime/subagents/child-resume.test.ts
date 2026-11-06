@@ -40,7 +40,8 @@ function consumedWait(child: SubagentLease, targetId = "grandchild-1", note?: st
     matchedTaskIds: [targetId], tasks: [{ taskId: targetId, status: "completed", role: "scout", result: { jobs: [], ...(note ? { note } : {}) }, failureReason: null }] }
   const input = { idempotencyKey: "wait-key", taskIds: [targetId], mode: "all", timeoutMs: 5_000 }
   return { waitId: WAIT_ID, stepId: `task:${child.id}:step:0:attempt:${child.attemptCount}`, targetTaskIds: [targetId], idempotencyKey: "wait-key", mode: "all", status: "ready",
-    deadlineAt: output.deadlineAt, matchedTaskIds: [targetId], waitResult: { request: { targetTaskIds: [targetId], mode: "all", timeoutMs: 5_000 }, outcome: output }, attempt: child.attemptCount,
+    deadlineAt: output.deadlineAt, resolvedAt: new Date("2099-09-14T11:29:59.000Z"), matchedTaskIds: [targetId],
+    waitResult: { request: { targetTaskIds: [targetId], mode: "all", timeoutMs: 5_000 }, outcome: output }, attempt: child.attemptCount,
     ordinal: 0, continuationStepId: `task:${child.id}:step:1:attempt:${child.attemptCount}`, continuationOrdinal: 1, continuationLatestOrdinal: 1,
     callContent: { toolCallId: "wait-call", toolName: "wait_subagents", toolVersion: "1", input }, callStatus: "completed",
     resultContent: { toolCallId: "wait-call", output: { ...output, status: "waiting", matchedTaskIds: [] }, errorCode: null }, resultStatus: "completed",

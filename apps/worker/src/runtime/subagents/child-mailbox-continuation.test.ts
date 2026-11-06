@@ -40,11 +40,11 @@ function item(child: SubagentLease, overrides: Row = {}): Row {
 
 function consumedWait(child: SubagentLease, waitId: string, stepId: string, ordinal: number, continuationStepId: string, continuationOrdinal: number): Row {
   const persistedWaitId = waitId === "wait-1" ? WAIT_ONE : waitId === "wait-2" ? WAIT_TWO : WAIT_MISBOUND
-  const deadlineAt = new Date("2099-09-14T11:30:00.000Z"), targetTaskIds = ["leaf-1"]
+  const deadlineAt = new Date("2099-09-14T11:30:00.000Z"), resolvedAt = new Date(deadlineAt.getTime() - 1_000), targetTaskIds = ["leaf-1"]
   const waitResult = { request: { targetTaskIds, mode: "all", timeoutMs: 30_000 },
     outcome: { waitId: persistedWaitId, status: "ready", taskIds: targetTaskIds, deadlineAt: deadlineAt.toISOString(), matchedTaskIds: targetTaskIds,
       tasks: [{ taskId: "leaf-1", status: "completed", role: "analyst", result: { summary: "Evidence ready" }, failureReason: null }] } }
-  return { waitId: persistedWaitId, stepId, targetTaskIds, idempotencyKey: `key-${waitId}`, mode: "all", status: "ready", deadlineAt, matchedTaskIds: targetTaskIds,
+  return { waitId: persistedWaitId, stepId, targetTaskIds, idempotencyKey: `key-${waitId}`, mode: "all", status: "ready", deadlineAt, resolvedAt, matchedTaskIds: targetTaskIds,
     waitResult, attempt: child.attemptCount, ordinal, continuationStepId, continuationOrdinal, continuationLatestOrdinal: 2,
     callContent: { toolCallId: `call-${waitId}`, toolName: "wait_subagents", toolVersion: "1", input: { taskIds: targetTaskIds, idempotencyKey: `key-${waitId}`, mode: "all", timeoutMs: 30_000 } },
     callStatus: "completed", sourceItemId: `result-${persistedWaitId}`, resultContent: { toolCallId: `call-${waitId}`,
@@ -239,7 +239,7 @@ describe("same-attempt mailbox continuation", () => {
 
   it("restores a consumed same-attempt wait before a later final without replaying tools", async () => {
     const child = lease()
-    const deadlineAt = new Date("2099-09-14T11:30:00.000Z")
+    const deadlineAt = new Date("2099-09-14T11:30:00.000Z"), resolvedAt = new Date(deadlineAt.getTime() - 1_000)
     const waitResult = {
       request: { targetTaskIds: ["leaf-1"], mode: "all", timeoutMs: 30_000 },
       outcome: { waitId: WAIT_ONE, status: "ready", taskIds: ["leaf-1"], deadlineAt: deadlineAt.toISOString(), matchedTaskIds: ["leaf-1"],
@@ -258,7 +258,7 @@ describe("same-attempt mailbox continuation", () => {
         content: { toolCallId: "search-call", output: { jobs: [{ id: "job-1" }] }, errorCode: null } }),
       item(child, { id: "final-after-wait", stepId: "final-step", ordinal: 2, content: { text: "Found a role after wait" } }),
     ], currentRow(child), [], [], false, [{
-      waitId: WAIT_ONE, stepId: "wait-step", targetTaskIds: ["leaf-1"], idempotencyKey: "wait-key", mode: "all", status: "ready", deadlineAt,
+      waitId: WAIT_ONE, stepId: "wait-step", targetTaskIds: ["leaf-1"], idempotencyKey: "wait-key", mode: "all", status: "ready", deadlineAt, resolvedAt,
       matchedTaskIds: ["leaf-1"], waitResult, attempt: child.attemptCount, ordinal: 0, continuationStepId: "final-step", continuationOrdinal: 2,
       continuationLatestOrdinal: 2, callContent: waitCall, callStatus: "completed", sourceItemId: `result-${WAIT_ONE}`,
       resultContent: { toolCallId: "wait-call", output: { ...waitResult.outcome, status: "waiting", matchedTaskIds: [] }, errorCode: null }, resultStatus: "completed",
