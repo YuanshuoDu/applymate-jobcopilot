@@ -38,7 +38,7 @@ type RootTaskHistoryCheckMatrix = readonly (readonly (RootTaskHistoryCheckDescri
 
 const MAX_NODES = 8
 const EXECUTION_FAILURE_CATEGORIES: ReadonlySet<string> = new Set([
-  "execution_setup_unavailable", "resume_state_unavailable", "structured_output_invalid",
+  "execution_setup_unavailable", "resume_state_unavailable", "structured_output_invalid", "execution_deadline_exceeded",
 ])
 const REASONS = new Set<TaskGraphVerificationReasonCode>([
   "criterion_not_met", "reported_score_below_minimum", "contract_invalid", "projection_invalid", "role_mismatch",
