@@ -96,7 +96,7 @@ test.beforeAll(async () => {
     })().catch(error => { response.statusCode = 500; response.end(String(error)) })
   })
   // Bind directly within a browser-safe range; some Windows ephemeral ranges
-  // include Chromium's blocked ports (e.g. 6669).
+  // include Chromium's blocked ports (e.g. 6669) or reserved TCP ranges.
   for (let attempt = 0; attempt < 64; attempt++) {
     try {
       await new Promise<void>((resolve, reject) => {
@@ -108,7 +108,8 @@ test.beforeAll(async () => {
       origin = `http://127.0.0.1:${address.port}`
       break
     } catch (error) {
-      if (!(error instanceof Error) || !('code' in error) || error.code !== 'EADDRINUSE') throw error
+      if (!(error instanceof Error) || !('code' in error)
+        || (error.code !== 'EADDRINUSE' && !(process.platform === 'win32' && error.code === 'EACCES'))) throw error
     }
   }
   if (!origin) throw new Error('Fixture server could not obtain a browser-safe port')
@@ -4118,7 +4119,8 @@ test('an unverified quota response never releases an uncertain manual record', a
   await page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ }).click()
   await expect(page.getByRole('button', { name: /Refresh record status|刷新记录状态/ })).toBeVisible()
   await expect(page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ })).toHaveCount(0)
-  expect(await page.evaluate(() => sessionStorage.getItem('applymate:manual-record:fixture-user:outside-page'))).toBe('unknown')
+  await expect.poll(() => page.evaluate(() => sessionStorage.getItem('applymate:manual-record:fixture-user:outside-page'))).toBe('unknown')
+  await expect(page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ })).toHaveCount(0)
   expect(posts).toBe(1)
   expect(state.unexpected).toEqual([])
 })
