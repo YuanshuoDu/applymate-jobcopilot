@@ -11,7 +11,7 @@ import { defaultSubagentPolicy } from "./types.js"
 import { subagentDispatchJobId } from "./dispatch-identity.js"
 import { CHILD_WAIT_RESUMABLE_SQL } from "../../queue/subagent-dispatch-eligibility.js"
 import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
-import { projectWaitCallEventContent } from "../turns/turn-execution-wait-event-projection.js"
+import { projectWaitCallCompletionPayload, projectWaitCallEventContent } from "../turns/turn-execution-wait-event-projection.js"
 import { executionOwnerFence } from "../execution-owner.js"
 import { registerDurableSubagentWait } from "./durable-subagent-wait-store.js"
 import { reconcileDurableSubagentWaits } from "./durable-subagent-wait-resolver.js"
@@ -21,7 +21,7 @@ import { repairConsumedChildWaitSources } from "./child-resume-consumed-wait-rep
 import { createProductionChildResumeLoaders } from "./production-child-resume-loaders.js"
 import { actionList, asObject, INSERT_TASK, json } from "./pg-store-persistence.js"
 import type { SubagentLease } from "./types.js"
-import { CHILD_WAIT_CLAIM_RECOVERY_SQL, hasBlockingExternalCall } from "./pg-store-expiry-recovery-predicates.js"
+import { CHILD_WAIT_CLAIM_RECOVERY_SQL, CHILD_WAIT_CONSUMED_SQL, CHILD_WAIT_RESUMABLE_SQL as CHILD_WAIT_EXPIRY_RESUMABLE_SQL, hasBlockingExternalCall } from "./pg-store-expiry-recovery-predicates.js"
 import { CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL, childWaitContinuationKeyMatchesSafeProjection } from "./pg-store-expiry-child-wait-claim-call-proof.js"
 import { readChildWaitSourceCallProjection } from "./pg-store-expiry-child-wait-source-proof.js"
 import { safeSubagentWaitJson } from "./subagent-wait-structural-ids.js"
@@ -822,6 +822,108 @@ function boundedWorkerRecoveryDiagnostic(child: WorkerProcess, targetId: string)
   return JSON.stringify({ recoveryCompleted: Array.isArray(recovery.rows), targetReturned: Boolean(target), targetStatus,
     candidateSeen: predicate.targetSeen, rejectionStage: predicate.rejectionStage,
     childAttemptResumeLoader: parseLoopStagePhase(child, "child_attempt_resume_loader"), resumeFailureCategory: parseResumeFailureCategory(child) })
+}
+
+type BlockerCategory = "currentSourceWait" | "historicalWaitSource" | "currentClaim" | "modelStarted" | "otherToolCall"
+type BlockerCounts = Record<BlockerCategory, { starts: number; projectedCompletions: number; uniquelyBlocking: number }>
+function diagnosticJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(diagnosticJson).join(",")}]`
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>
+    return `{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${diagnosticJson(record[key])}`).join(",")}}`
+  }
+  return JSON.stringify(value) ?? "undefined"
+}
+
+async function boundedExternalCallBlockerDiagnostic(pool: Pool, ids: FixtureIds): Promise<Record<string, unknown>> {
+  const counts: BlockerCounts = {
+    currentSourceWait: { starts: 0, projectedCompletions: 0, uniquelyBlocking: 0 },
+    historicalWaitSource: { starts: 0, projectedCompletions: 0, uniquelyBlocking: 0 },
+    currentClaim: { starts: 0, projectedCompletions: 0, uniquelyBlocking: 0 },
+    modelStarted: { starts: 0, projectedCompletions: 0, uniquelyBlocking: 0 },
+    otherToolCall: { starts: 0, projectedCompletions: 0, uniquelyBlocking: 0 },
+  }
+  let client: PoolClient | undefined
+  try {
+    client = await pool.connect()
+    await client.query("BEGIN")
+    await client.query("SELECT set_config('app.user_id', $1, true)", [ids.userId])
+    const context = await client.query<Record<string, unknown>>(`SELECT task.*, session."userId" AS "userId",
+        ${CHILD_WAIT_EXPIRY_RESUMABLE_SQL} AS "childWaitResumable", ${CHILD_WAIT_CONSUMED_SQL} AS "childWaitContinuationId"
+      FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+      WHERE task."id" = $1 AND task."sessionId" = $2 AND session."userId" = $3 AND task."turnId" = $4`,
+    [ids.waiterTaskId, ids.sessionId, ids.userId, ids.turnId])
+    const task = context.rows[0]
+    if (!task) return { status: "context_missing" }
+    const continuationId = typeof task.childWaitContinuationId === "string" ? task.childWaitContinuationId : undefined
+    const sourceRows = await client.query<{ callItemId: string }>(`WITH latest_wait AS MATERIALIZED (
+        SELECT wait."stepId" FROM "agent_wait_conditions" AS wait
+        JOIN "agent_steps" AS source ON source."id" = wait."stepId" AND source."sessionId" = wait."sessionId"
+          AND source."turnId" = wait."turnId" AND source."taskId" = wait."parentTaskId"
+        WHERE wait."parentTaskId" = $1 AND wait."sessionId" = $2 AND wait."turnId" = $3
+          AND source."attempt" BETWEEN 1 AND $4
+        ORDER BY source."attempt" DESC, source."ordinal" DESC, wait."createdAt" DESC, wait."id" DESC LIMIT 1
+      )
+      SELECT call."id" AS "callItemId" FROM latest_wait AS wait
+      JOIN "agent_items" AS call ON call."stepId" = wait."stepId" AND call."sessionId" = $2 AND call."turnId" = $3
+        AND call."taskId" = $1 AND call."type" = 'tool_call' AND call."content"->>'toolName' = 'wait_subagents'
+      ORDER BY call."id" LIMIT 2`, [ids.waiterTaskId, ids.sessionId, ids.turnId, task.attemptCount])
+    const sourceCallItemId = sourceRows.rows.length === 1 ? sourceRows.rows[0]?.callItemId : undefined
+    const starts = await client.query<{
+      id: string; type: string; itemId: string | null; idempotencyKey: string | null; itemType: string | null
+      itemStepId: string | null; itemAttempt: number | null; itemContent: unknown; itemCompletedPayloads: unknown
+    }>(`SELECT started."id", started."type", started."itemId", started."idempotencyKey",
+        call."type" AS "itemType", call."stepId" AS "itemStepId", step."attempt" AS "itemAttempt",
+        call."content" AS "itemContent",
+        COALESCE((SELECT jsonb_agg(done."payload" ORDER BY done."sequence") FROM "agent_events" AS done
+          WHERE done."sessionId" = started."sessionId" AND done."turnId" = started."turnId" AND done."taskId" = started."taskId"
+            AND done."itemId" = call."id" AND done."type" = 'item.completed'), '[]'::jsonb) AS "itemCompletedPayloads"
+      FROM "agent_events" AS started
+      LEFT JOIN "agent_items" AS call ON call."id" = started."itemId" AND call."sessionId" = started."sessionId"
+        AND call."turnId" = started."turnId" AND call."taskId" = started."taskId"
+      LEFT JOIN "agent_steps" AS step ON step."id" = call."stepId" AND step."sessionId" = call."sessionId"
+        AND step."turnId" = call."turnId" AND step."taskId" = call."taskId"
+      WHERE started."sessionId" = $1 AND started."turnId" = $2 AND started."taskId" = $3
+        AND started."type" IN ('tool_call.started', 'model.started')
+      ORDER BY started."sequence" LIMIT 33`, [ids.sessionId, ids.turnId, ids.waiterTaskId])
+    const boundedStarts = starts.rows.slice(0, 32)
+    const categoryFor = (row: typeof boundedStarts[number]): BlockerCategory => {
+      if (row.type === "model.started") return "modelStarted"
+      const content = asObject(row.itemContent)
+      if (row.itemType !== "tool_call" || content.toolName !== "wait_subagents") return "otherToolCall"
+      if (typeof row.itemAttempt === "number" && typeof row.itemStepId === "string"
+        && row.idempotencyKey === `task:${ids.waiterTaskId}:event:child-wait-claim:${row.itemAttempt}:${row.itemStepId}`) return "currentClaim"
+      return row.itemId && row.itemId === sourceCallItemId ? "currentSourceWait" : "historicalWaitSource"
+    }
+    const baseBlocked = await hasBlockingExternalCall(client, task, undefined, continuationId)
+    for (const row of boundedStarts) {
+      const category = categoryFor(row)
+      counts[category].starts++
+      const content = asObject(row.itemContent)
+      if (category !== "modelStarted" && content.toolName === "wait_subagents" && row.itemId) {
+        const expected = projectWaitCallCompletionPayload({ itemId: row.itemId, status: "completed", content: row.itemContent }, row.itemId)
+        const payloads = Array.isArray(row.itemCompletedPayloads) ? row.itemCompletedPayloads : []
+        if (payloads.some(payload => diagnosticJson(payload) === diagnosticJson(expected))) counts[category].projectedCompletions++
+      }
+      if (baseBlocked && !await hasBlockingExternalCall(client, task, row.id, continuationId)) counts[category].uniquelyBlocking++
+    }
+    const uniqueBlockingCategories = (Object.keys(counts) as BlockerCategory[]).filter(category => counts[category].uniquelyBlocking > 0)
+    return {
+      status: "available", baseBlocked, candidateCount: boundedStarts.length, truncated: starts.rows.length > boundedStarts.length,
+      continuationPresent: continuationId !== undefined, sourceProjectionPresent: continuationId !== undefined
+        && Boolean(await readChildWaitSourceCallProjection(client, task, continuationId)),
+      childWaitResumable: task.childWaitResumable === true, uniqueBlockingCategories, counts,
+      attribution: !baseBlocked ? "none" : uniqueBlockingCategories.length === 1 ? uniqueBlockingCategories[0]
+        : uniqueBlockingCategories.length > 1 ? "multiple" : "multiple_or_unattributed",
+    }
+  } catch {
+    return { status: "unavailable" }
+  } finally {
+    if (client) {
+      await client.query("ROLLBACK").catch(() => undefined)
+      client.release()
+    }
+  }
 }
 
 function expectRestoredWaitObservation(child: WorkerProcess, state: RestoredWaitObservationSummary["state"]): void {
@@ -4263,6 +4365,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       )
       expect(lineageOutboxBeforeRecovery.rows).toHaveLength(1)
       expect(lineageOutboxBeforeRecovery.rows[0]?.publishedAt).toBeInstanceOf(Date)
+      console.info(`WORKER_D_BLOCKER_CLASSIFICATION ${JSON.stringify(await boundedExternalCallBlockerDiagnostic(pool, ids))}`)
       workerD = launchWorker("worker-b-loop-usage-lineage-reject", queueName, ids)
       await waitForBoundedLoopMarker(workerD, "WORKER_B_RECOVERED")
       const workerDRecovery = parseRecoveryMarker(workerD)
