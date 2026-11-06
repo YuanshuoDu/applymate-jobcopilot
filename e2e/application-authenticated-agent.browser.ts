@@ -154,7 +154,26 @@ test('synthetic native question resumes the actual authenticated turn', async ({
       const body = await response.json()
       return body.turns.find((turn: { id: string }) => turn.id === turnId)?.status ?? 'missing'
     }, { timeout: 60_000 }).toBe('completed')
-    await expect(page.getByText(finalText, { exact: false })).toBeVisible({ timeout: 30_000 })
+    try {
+      await expect(page.getByText(finalText, { exact: false })).toBeVisible({ timeout: 30_000 })
+    } catch (error) {
+      try {
+        const snapshot = await inspectTurn(sessionId, turnId)
+        console.error('Synthetic final response diagnostic', JSON.stringify({
+          turnCompleted: snapshot.turn.status === 'completed',
+          completedEventExactlyOne: snapshot.turn.completedEvents === 1,
+          answeredEventExactlyOne: snapshot.turn.answeredEvents === 1,
+          finalResponsePresent: snapshot.turn.finalResponse !== null,
+          finalResponseMatches: snapshot.turn.finalResponse?.includes(finalText) ?? false,
+          questionExactlyOne: snapshot.questions.length === 1,
+          questionCompleted: snapshot.questions.length === 1 && snapshot.questions[0].status === 'completed',
+          answerMatches: snapshot.questions.length === 1 && snapshot.questions[0].content.answer === answer,
+        }))
+      } catch {
+        console.error('Synthetic final response diagnostic unavailable')
+      }
+      throw error
+    }
     const finished = await inspectTurn(sessionId, turnId)
     expect(finished.turn).toMatchObject({ status: 'completed', completedEvents: 1, answeredEvents: 1 })
     expect(finished.turn.finalResponse).toContain(finalText)
