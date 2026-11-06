@@ -213,12 +213,15 @@ function ListView({ jobs, taskByJobId, onOpenSession, onRowClick, selectedIds, o
     return sort.dir === 'desc' ? db - da : da - db
   }), [jobs, sort])
 
-  function SortTh({ col, label }: { col: string; label: string }) {
+  function sortHeader(col: string, label: string) {
     return (
       <th
-        onClick={() => setSort(s => ({ col, dir: s.col === col && s.dir === 'desc' ? 'asc' : 'desc' }))}
-        style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)', cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap' }}>
-        {label} {sort.col === col ? (sort.dir === 'desc' ? '↓' : '↑') : ''}
+        aria-sort={sort.col === col ? (sort.dir === 'desc' ? 'descending' : 'ascending') : undefined}
+        style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)', whiteSpace: 'nowrap' }}>
+        <button type="button" onClick={() => setSort(s => ({ col, dir: s.col === col && s.dir === 'desc' ? 'asc' : 'desc' }))}
+          style={{ padding: 0, border: 0, background: 'none', color: 'inherit', font: 'inherit', cursor: 'pointer' }}>
+          {label} <span aria-hidden="true">{sort.col === col ? (sort.dir === 'desc' ? '↓' : '↑') : ''}</span>
+        </button>
       </th>
     )
   }
@@ -234,11 +237,11 @@ function ListView({ jobs, taskByJobId, onOpenSession, onRowClick, selectedIds, o
             <th style={{ width: 42, padding: '8px 12px', borderBottom: '0.5px solid var(--border)' }}>
               <input type="checkbox" aria-label={t('jobs.selectAll')} checked={allVisibleSelected} onChange={() => onToggleAll(visibleIds)} />
             </th>
-            <SortTh col="company" label={t('jobs.companyLabel')} />
+            {sortHeader('company', t('jobs.companyLabel'))}
             <th style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)' }}>{t('jobs.roleLabel')}</th>
             <th style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)' }}>{t('jobs.statusLabel')}</th>
-            <SortTh col="score" label="Match" />
-            <SortTh col="date"  label={t('jobs.added')} />
+            {sortHeader('score', t('jobs.match'))}
+            {sortHeader('date', t('jobs.added'))}
             <th style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)' }}>{t('jobs.followUp')}</th>
             <th style={{ padding: '8px 16px', borderBottom: '0.5px solid var(--border)' }} />
           </tr>
@@ -251,7 +254,7 @@ function ListView({ jobs, taskByJobId, onOpenSession, onRowClick, selectedIds, o
               onMouseEnter={e => (e.currentTarget.style.background = 'var(--bg-secondary)')}
               onMouseLeave={e => (e.currentTarget.style.background = '')}>
               <td style={{ padding: '10px 12px', textAlign: 'center' }} onClick={e => e.stopPropagation()}>
-                <input type="checkbox" aria-label={`Select ${j.role} at ${j.company}`} checked={selectedIds.has(j.id)} onChange={() => onToggle(j.id)} />
+                <input type="checkbox" aria-label={`${t('jobs.selectJob')}: ${j.company} · ${j.role}`} checked={selectedIds.has(j.id)} onChange={() => onToggle(j.id)} />
               </td>
               <td style={{ padding: '10px 16px' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -311,7 +314,7 @@ function MobileListView({ jobs, taskByJobId, onOpenSession, onRowClick, selected
           <article key={card.id} className="jobs-mobile-card">
             <input
               type="checkbox"
-              aria-label={`Select ${card.role} at ${card.company}`}
+              aria-label={`${t('jobs.selectJob')}: ${card.company} · ${card.role}`}
               checked={selectedIds.has(card.id)}
               onChange={() => onToggle(card.id)}
             />
@@ -320,7 +323,7 @@ function MobileListView({ jobs, taskByJobId, onOpenSession, onRowClick, selected
               type="button"
               className="jobs-mobile-card-main"
               onClick={() => onRowClick(job)}
-              aria-label={`View ${card.role} at ${card.company}`}
+              aria-label={`${t('application.viewApplication')}: ${card.company} · ${card.role}`}
             >
               <div className="jobs-mobile-card-heading">
                 <CompanyLogo logo={card.logo ?? card.company.slice(0, 2).toUpperCase()} size={28} />

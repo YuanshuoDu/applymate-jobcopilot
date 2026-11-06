@@ -3133,11 +3133,13 @@ test('a failed delayed save keeps the original resume selected', async ({ page }
 
 
 test('mobile keyboard opens an application, reviews its issue and returns focus to its card', async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== 'mobile-zh', 'Exercises the narrow Chinese application list with a keyboard')
+  test.skip(!testInfo.project.name.startsWith('mobile-'), 'Exercises the narrow application list with a keyboard')
   const state = await install(page, { descriptionMode: 'two', auditCorrection: true })
   await page.goto(`${origin}/?page=jobs`)
-  const entry = page.getByRole('button', { name: 'View Application flow engineer at Fixture Employer', exact: true })
+  const chinese = testInfo.project.metadata.appLocale === 'zh'
+  const entry = page.getByRole('button', { name: `${chinese ? '查看此申请' : 'View this application'}: Fixture Employer · Application flow engineer`, exact: true })
   await expect(entry).toBeVisible()
+  await expect(page.locator('.jobs-mobile-list').getByRole('checkbox', { name: `${chinese ? '选择职位' : 'Select job'}: Fixture Employer · Application flow engineer`, exact: true })).toBeVisible()
   let reachedEntry = false
   for (let index = 0; index < 120; index++) {
     await page.keyboard.press('Tab')
@@ -3162,6 +3164,43 @@ test('mobile keyboard opens an application, reviews its issue and returns focus 
   await page.keyboard.press('Escape')
   await expect(drawer).toHaveCount(0)
   await expect(entry).toBeFocused()
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+test('desktop job selection names its company and role in the current language', async ({ page }, testInfo) => {
+  test.skip(!testInfo.project.name.startsWith('desktop-'), 'Exercises desktop application selection')
+  const state = await install(page, { descriptionMode: 'two' })
+  await page.goto(`${origin}/?page=jobs`)
+  const chinese = testInfo.project.metadata.appLocale === 'zh'
+  await expect(page.getByRole('table').getByRole('checkbox', { name: `${chinese ? '选择职位' : 'Select job'}: Fixture Employer · Application flow engineer`, exact: true })).toBeVisible()
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+test('desktop job sorting works by keyboard and retains focus', async ({ page }, testInfo) => {
+  test.skip(!testInfo.project.name.startsWith('desktop-'), 'Exercises desktop application sorting')
+  const state = await install(page, { descriptionMode: 'two' })
+  await page.goto(`${origin}/?page=jobs`)
+  const table = page.getByRole('table')
+  const chinese = testInfo.project.metadata.appLocale === 'zh'
+  const header = table.getByRole('columnheader', { name: chinese ? '公司' : 'Company', exact: true })
+  const button = header.getByRole('button', { name: chinese ? '公司' : 'Company', exact: true })
+  await expect(button).toBeVisible()
+  let reachedSort = false
+  for (let index = 0; index < 120; index++) {
+    await page.keyboard.press('Tab')
+    if (await button.evaluate(element => document.activeElement === element)) { reachedSort = true; break }
+  }
+  expect(reachedSort).toBe(true)
+  await page.keyboard.press('Enter')
+  await expect(header).toHaveAttribute('aria-sort', 'descending')
+  await expect(table.locator('tbody tr').first()).toContainText('Second Employer')
+  await expect(button).toBeFocused()
+  await page.keyboard.press('Space')
+  await expect(header).toHaveAttribute('aria-sort', 'ascending')
+  await expect(table.locator('tbody tr').first()).toContainText('Fixture Employer')
+  await expect(button).toBeFocused()
   expect(state.writes).toEqual([])
   expect(state.unexpected).toEqual([])
 })
