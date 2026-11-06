@@ -2004,6 +2004,18 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       setLatestApplicationAudit(null)
       return
     }
+    // The current edit cannot match a persisted review yet. Avoid competing
+    // with its save for the material row; dirty/saving changes rerun this
+    // effect once the document is stable. A confirmed fence remains locked
+    // until the stable material and canonical review can be reconciled.
+    if (dirty || saving) {
+      if (local.state === 'confirmed') {
+        setAuditOperationView({ jobId, userId, generation: auditScopeGeneration, state: 'localPending' })
+        setStoredAuditScope({ jobId, userId, generation: auditScopeGeneration, record: null })
+        setLatestApplicationAudit(null)
+      }
+      return
+    }
     const controller = new AbortController()
     void fetch(`/api/jobs/${encodeURIComponent(jobId)}/audit-application`, { signal: controller.signal })
       .then(response => { if (!response.ok) throw new Error('Audit unavailable'); return response.json() as Promise<unknown> })
@@ -3082,7 +3094,8 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
           {auditOperationView && auditOperationView.jobId === resumeLinkedJob?.id && auditOperationView.userId === resumeUserId
             && auditOperationView.generation === auditScopeGeneration && <div role="status" style={{ fontSize: 12 }}>
               <p>{t(`application.auditState.${auditOperationView.state}`)}</p>
-              <button type="button" disabled={auditingApplication} onClick={() => setAuditStatusRefresh(value => value + 1)}>{t('application.refreshStatus')}</button>
+              {(dirty || saving) && <p>{t(localAuditFence.state === 'pending' || localAuditFence.state === 'unavailable' ? 'application.auditFenceAfterSave' : 'application.auditRefreshAfterSave')}</p>}
+              <button type="button" disabled={auditingApplication || dirty || saving} onClick={() => setAuditStatusRefresh(value => value + 1)}>{t('application.refreshStatus')}</button>
             </div>}
           {displayedApplicationAudit?.findings.some(finding => finding.area !== 'job_match' && finding.severity !== 'pass' && !finding.applied) &&
             <p role="note" style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{t('application.repairImpactGuidance')}</p>}
