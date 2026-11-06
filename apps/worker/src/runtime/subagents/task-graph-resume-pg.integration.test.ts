@@ -45,6 +45,7 @@ import { PgCoordinationStore } from "../mailbox/store.js"
 import { NATIVE_VERIFICATION_MODEL_REPORT_SCHEMA, parseNativeVerificationControl } from "./native-verification-contract.js"
 import { parseNativeVerificationPacket } from "./native-verification-packet.js"
 import { createPgNativeVerificationPort } from "./pg-native-verification-port.js"
+import { readNativeVerificationTerminalProofWithClient } from "./native-verification-pg-readback.js"
 import { TASK_GRAPH_TEMPLATES, taskGraphTemplatesForSelectedJob } from "./task-graph-templates.js"
 import { TASK_GRAPH_LIMITS } from "../planning/task-graph.js"
 import { ROLE_RESULT_SCHEMA, RoleResultValidationError, validateRoleResult, type StructuredRoleResult } from "./role-results.js"
@@ -3095,6 +3096,14 @@ const EMPTY_ANALYST_STATE_LOADER_ERROR_MESSAGES = new Map<string, string>([
 const EMPTY_ANALYST_ERROR_CODES = new Set([
   ...ERROR_DIAGNOSTIC_CODES, ...EMPTY_ANALYST_STATE_LOADER_ERROR_CODES, "task_graph_other", "none", "other",
 ])
+const EMPTY_ANALYST_ROOT_SETUP_ERROR_CODES = new Set([
+  ...EMPTY_ANALYST_ERROR_CODES, "native_verification_recovery_invalid", "native_coordination_receipt_conflict",
+  "native_coordination_receipt_invalid", "task_graph_current_state_invalid", "task_graph_native_coordination_missing",
+  "task_graph_runtime_dependencies_unavailable", "task_graph_state_missing", "task_graph_verification_report_invalid",
+])
+const EMPTY_ANALYST_ROOT_SETUP_ERROR_MESSAGES = new Map(
+  [...EMPTY_ANALYST_ROOT_SETUP_ERROR_CODES].map(code => [code, code] as const),
+)
 const EMPTY_ANALYST_PERSISTED_TURN_STATUSES = new Set([...TURN_DIAGNOSTIC_STATUSES, "missing_or_other"])
 const EMPTY_ANALYST_PERSISTED_TASK_STATUSES = new Set([...TASK_DIAGNOSTIC_STATUSES, "missing_or_other"])
 const EMPTY_ANALYST_PERSISTED_STEP_STATUSES = new Set([...STEP_DIAGNOSTIC_STATUSES, "missing_or_other"])
@@ -3129,10 +3138,23 @@ type EmptyAnalystRootResumeDiagnostics = {
   executions: EmptyAnalystExecutionObservation[]
   stateLoader: EmptyAnalystStateLoaderDiagnostic
   rootEnsure: EmptyAnalystBoundaryDiagnostic & { returnedStatus: string }
+  rootSetupReads: {
+    readCurrentForPlanning: EmptyAnalystRootSetupReadDiagnostic
+    readRecoverableGoal: EmptyAnalystRootSetupReadDiagnostic
+  }
   modelFactoryCalls: number
   adapterStreamCalls: number
   waitHandoff: EmptyAnalystBoundaryDiagnostic
 }
+type EmptyAnalystRootSetupReadDiagnostic = EmptyAnalystBoundaryDiagnostic & {
+  limitReached: boolean
+  firstFailureCall: number | null
+  firstFailureExecuteCall: number | null
+  firstFailureErrorClass: string
+  firstFailureErrorCode: string
+}
+
+const EMPTY_ANALYST_ROOT_SETUP_READ_LIMIT = 32
 
 function emptyAnalystRootResumeDiagnosticProjection(value: unknown): RecordValue | null {
   const source = record(value)
@@ -3145,6 +3167,20 @@ function emptyAnalystRootResumeDiagnosticProjection(value: unknown): RecordValue
       outcome: diagnosticEnum(boundary?.outcome, EMPTY_ANALYST_SETUP_OUTCOMES) ?? "other",
       errorClass: diagnosticEnum(boundary?.errorClass, EMPTY_ANALYST_ERROR_CLASSES) ?? "other",
       errorCode: diagnosticEnum(boundary?.errorCode, EMPTY_ANALYST_ERROR_CODES) ?? "other",
+    }
+  }
+  const setupRead = (candidate: unknown) => {
+    const boundary = record(candidate)
+    return {
+      ...stage(boundary),
+      errorCode: diagnosticEnum(boundary?.errorCode, EMPTY_ANALYST_ROOT_SETUP_ERROR_CODES) ?? "other",
+      limitReached: boundary?.limitReached === true,
+      firstFailureCall: diagnosticBoundedCount(boundary?.firstFailureCall),
+      firstFailureExecuteCall: diagnosticBoundedCount(boundary?.firstFailureExecuteCall),
+      firstFailureErrorClass: boundary?.firstFailureCall === null ? "none"
+        : diagnosticEnum(boundary?.firstFailureErrorClass, EMPTY_ANALYST_ERROR_CLASSES) ?? "other",
+      firstFailureErrorCode: boundary?.firstFailureCall === null ? "none"
+        : diagnosticEnum(boundary?.firstFailureErrorCode, EMPTY_ANALYST_ROOT_SETUP_ERROR_CODES) ?? "other",
     }
   }
   const loader = record(runtime?.stateLoader)
@@ -3180,6 +3216,10 @@ function emptyAnalystRootResumeDiagnosticProjection(value: unknown): RecordValue
       stateLoader,
       rootEnsure: { ...stage(runtime?.rootEnsure), returnedStatus:
         diagnosticEnum(record(runtime?.rootEnsure)?.returnedStatus, TASK_DIAGNOSTIC_STATUSES) ?? "other" },
+      rootSetupReads: {
+        readCurrentForPlanning: setupRead(record(runtime?.rootSetupReads)?.readCurrentForPlanning),
+        readRecoverableGoal: setupRead(record(runtime?.rootSetupReads)?.readRecoverableGoal),
+      },
       modelFactoryCalls: diagnosticBoundedCount(runtime?.modelFactoryCalls),
       adapterStreamCalls: diagnosticBoundedCount(runtime?.adapterStreamCalls),
       waitHandoff: stage(runtime?.waitHandoff),
@@ -3206,6 +3246,60 @@ function emptyAnalystErrorCode(error: unknown): string {
   if (error === null || error === undefined) return "none"
   if (error instanceof Error) return EMPTY_ANALYST_STATE_LOADER_ERROR_MESSAGES.get(error.message) ?? "other"
   return "other"
+}
+
+function emptyAnalystRootSetupErrorClass(error: unknown): string {
+  const fields = record(error)
+  if (typeof fields?.code === "string" && /^[0-9A-Z]{5}$/.test(fields.code)) return "database"
+  if (error instanceof Error && error.name === "TaskGraphCommandError") return "coordination"
+  return safeFailurePreflightErrorClass(error)
+}
+
+function emptyAnalystRootSetupErrorCode(error: unknown): string {
+  const code = record(error)?.code
+  if (typeof code === "string") {
+    if (EMPTY_ANALYST_ROOT_SETUP_ERROR_CODES.has(code)) return code
+    return diagnosticErrorCode(code) ?? "other"
+  }
+  if (error === null || error === undefined) return "none"
+  if (error instanceof Error) return EMPTY_ANALYST_ROOT_SETUP_ERROR_MESSAGES.get(error.message) ?? "other"
+  return "other"
+}
+
+function observeEmptyAnalystRootSetupRead<Args extends unknown[], Result>(input: Readonly<{
+  invoke: (...args: Args) => Promise<Result>
+  diagnostic: EmptyAnalystRootSetupReadDiagnostic
+  executeCalls: () => number
+}>): (...args: Args) => Promise<Result> {
+  return async (...args) => {
+    const diagnostic = input.diagnostic
+    if (diagnostic.calls >= EMPTY_ANALYST_ROOT_SETUP_READ_LIMIT) {
+      diagnostic.limitReached = true
+      return input.invoke(...args)
+    }
+    diagnostic.calls += 1
+    diagnostic.outcome = "started"
+    diagnostic.errorClass = "none"
+    diagnostic.errorCode = "none"
+    try {
+      const result = await input.invoke(...args)
+      diagnostic.outcome = "passed"
+      return result
+    } catch (error: unknown) {
+      const errorClass = emptyAnalystRootSetupErrorClass(error)
+      const errorCode = emptyAnalystRootSetupErrorCode(error)
+      diagnostic.outcome = "failed"
+      diagnostic.errorClass = errorClass
+      diagnostic.errorCode = errorCode
+      if (diagnostic.firstFailureCall === null) {
+        diagnostic.firstFailureCall = diagnostic.calls
+        diagnostic.firstFailureExecuteCall = diagnosticBoundedCount(input.executeCalls())
+        diagnostic.firstFailureErrorClass = errorClass
+        diagnostic.firstFailureErrorCode = errorCode
+      }
+      throw error
+    }
+  }
 }
 
 function repairChildOutcomeDiagnostic(role: unknown, outcome: unknown, ordinal: number): RecordValue {
@@ -7147,6 +7241,79 @@ describe("canonical verifier receipt diagnostics", () => {
 })
 
 describe("empty Analyst root continuation diagnostics", () => {
+  it("records bounded pre-model read failures without changing receiver, arguments, results, or thrown errors", async () => {
+    const marker = "private-root-read-message-id-sql"
+    const result = { value: marker }
+    const receiver: { seenThis?: unknown; seenArgument?: unknown } = {}
+    const original = async function(this: typeof receiver, scope: string) {
+      this.seenThis = this
+      this.seenArgument = scope
+      return result
+    }
+    const diagnostic = (): EmptyAnalystRootSetupReadDiagnostic => ({ calls: 0, outcome: "not_started", errorClass: "none", errorCode: "none",
+      limitReached: false, firstFailureCall: null, firstFailureExecuteCall: null, firstFailureErrorClass: "none", firstFailureErrorCode: "none" })
+    const passed = diagnostic()
+    const observed = observeEmptyAnalystRootSetupRead({ invoke: (...args: [string]) => original.apply(receiver, args), diagnostic: passed, executeCalls: () => 2 })
+    const observedResult = await observed(marker)
+    expect(observedResult).toBe(result)
+    expect(receiver).toMatchObject({ seenThis: receiver, seenArgument: marker })
+    expect(passed).toMatchObject({ calls: 1, outcome: "passed", errorClass: "none", errorCode: "none" })
+
+    const failure = Object.assign(new Error(marker), { name: "TaskGraphCommandError", code: "task_graph_verification_report_invalid" })
+    const failed = diagnostic()
+    const throwing = observeEmptyAnalystRootSetupRead({
+      invoke: async (..._args: [string]) => { throw failure }, diagnostic: failed, executeCalls: () => 3,
+    })
+    await expect(throwing(marker)).rejects.toBe(failure)
+    expect(failed).toMatchObject({ calls: 1, outcome: "failed", errorClass: "coordination",
+      errorCode: "task_graph_verification_report_invalid", firstFailureCall: 1, firstFailureExecuteCall: 3,
+      firstFailureErrorClass: "coordination", firstFailureErrorCode: "task_graph_verification_report_invalid" })
+
+    const unknown = diagnostic()
+    const unknownError = new Error(marker)
+    const unknownObserved = observeEmptyAnalystRootSetupRead({
+      invoke: async (..._args: [string]) => { throw unknownError }, diagnostic: unknown, executeCalls: () => 4,
+    })
+    await expect(unknownObserved(marker)).rejects.toBe(unknownError)
+    expect(unknown).toMatchObject({ errorClass: "generic", errorCode: "other", firstFailureErrorCode: "other" })
+    expect(JSON.stringify({ passed, failed, unknown })).not.toContain(marker)
+  })
+
+  it("stops recording after the fixed read-call limit while still passing through", async () => {
+    const marker = "unlogged-private-result"
+    const diagnostic: EmptyAnalystRootSetupReadDiagnostic = { calls: EMPTY_ANALYST_ROOT_SETUP_READ_LIMIT,
+      outcome: "passed", errorClass: "none", errorCode: "none", limitReached: false,
+      firstFailureCall: null, firstFailureExecuteCall: null, firstFailureErrorClass: "none", firstFailureErrorCode: "none" }
+    const result = { value: marker }
+    const observed = observeEmptyAnalystRootSetupRead({ invoke: async (_value: string) => result, diagnostic, executeCalls: () => 1 })
+    await expect(observed(marker)).resolves.toBe(result)
+    expect(diagnostic).toMatchObject({ calls: EMPTY_ANALYST_ROOT_SETUP_READ_LIMIT, limitReached: true, outcome: "passed" })
+    expect(JSON.stringify(diagnostic)).not.toContain(marker)
+  })
+
+  it("projects only fixed pre-model read stages and failure codes", () => {
+    const marker = "private-query-error-content-id"
+    const projected = emptyAnalystRootResumeDiagnosticProjection({ runtime: {
+      rootSetupReads: {
+        readCurrentForPlanning: { calls: 7, outcome: "failed", errorClass: "coordination",
+          errorCode: "task_graph_verification_report_invalid", firstFailureCall: 5, firstFailureExecuteCall: 2,
+          firstFailureErrorClass: "coordination", firstFailureErrorCode: "task_graph_verification_report_invalid",
+          message: marker, sql: marker, userId: marker },
+        readRecoverableGoal: { calls: 0, outcome: "not_started", errorClass: "none", errorCode: "none",
+          firstFailureCall: null, firstFailureErrorCode: marker, id: marker },
+      },
+    } })
+    const output = JSON.stringify(projected)
+    expect(projected).toMatchObject({ runtime: { rootSetupReads: {
+      readCurrentForPlanning: { calls: 7, outcome: "failed", errorClass: "coordination",
+        errorCode: "task_graph_verification_report_invalid", firstFailureCall: 5, firstFailureExecuteCall: 2,
+        firstFailureErrorCode: "task_graph_verification_report_invalid" },
+      readRecoverableGoal: { calls: 0, outcome: "not_started", errorClass: "none", errorCode: "none",
+        firstFailureCall: null, firstFailureExecuteCall: null, firstFailureErrorCode: "none" },
+    } } })
+    expect(output).not.toContain(marker)
+  })
+
   it("classifies exact source loader failures without emitting raw error text", () => {
     const marker = "private-loader-error-message"
     const observed = [
@@ -14565,6 +14732,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         consumeWaitOutcomesTrueCalls: 0, consumeWaitOutcomesFalseCalls: 0, firstFailureConsumeWaitOutcomes: null,
         firstFailureErrorClass: "none", firstFailureErrorCode: "none" },
       rootEnsure: { calls: 0, outcome: "not_started", returnedStatus: "none", errorClass: "none", errorCode: "none" },
+      rootSetupReads: {
+        readCurrentForPlanning: { calls: 0, outcome: "not_started", errorClass: "none", errorCode: "none", limitReached: false,
+          firstFailureCall: null, firstFailureExecuteCall: null, firstFailureErrorClass: "none", firstFailureErrorCode: "none" },
+        readRecoverableGoal: { calls: 0, outcome: "not_started", errorClass: "none", errorCode: "none", limitReached: false,
+          firstFailureCall: null, firstFailureExecuteCall: null, firstFailureErrorClass: "none", firstFailureErrorCode: "none" },
+      },
       modelFactoryCalls: 0, adapterStreamCalls: 0,
       waitHandoff: { calls: 0, outcome: "not_started", errorClass: "none", errorCode: "none" },
     }
@@ -14672,9 +14845,33 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     }
     const rootTaskStoreModule = await import("./root-task-store.js")
     const productionRootTaskStore = rootTaskStoreModule.createPgRootTaskStore(pool!)
+    const readCurrentForPlanning = taskGraphCommandPort.readCurrentForPlanning
+    const runtimeTaskGraphCommandPort = readCurrentForPlanning ? {
+      ...taskGraphCommandPort,
+      readCurrentForPlanning: observeEmptyAnalystRootSetupRead({
+        invoke: (...args: Parameters<typeof readCurrentForPlanning>) => readCurrentForPlanning.apply(taskGraphCommandPort, args),
+        diagnostic: emptyAnalystRuntimeDiagnostics.rootSetupReads.readCurrentForPlanning,
+        executeCalls: () => emptyAnalystRuntimeDiagnostics.executeCalls,
+      }),
+    } : taskGraphCommandPort
     const runtime = await canonical.createCanonicalTurnRuntime(pool!, {
       workerId: value.ownerId, productionFlags: flags,
-      taskGraphCommandPort,
+      taskGraphCommandPort: runtimeTaskGraphCommandPort,
+      nativeVerificationFactory: verificationPool => {
+        const nativePort = createPgNativeVerificationPort(verificationPool)
+        const readRecoverableGoal = nativePort.readRecoverableGoal
+        return {
+          port: {
+            ...nativePort,
+            readRecoverableGoal: observeEmptyAnalystRootSetupRead({
+              invoke: (...args: Parameters<typeof readRecoverableGoal>) => readRecoverableGoal.apply(nativePort, args),
+              diagnostic: emptyAnalystRuntimeDiagnostics.rootSetupReads.readRecoverableGoal,
+              executeCalls: () => emptyAnalystRuntimeDiagnostics.executeCalls,
+            }),
+          },
+          readTerminalProof: readNativeVerificationTerminalProofWithClient,
+        }
+      },
       taskGraphTemplates: { ...TASK_GRAPH_TEMPLATES }, authorizeUsage: async () => ({ settle: async () => undefined }),
       stateLoader: async (statePool, lease, now, loaderOptions) => {
         const boundary = emptyAnalystRuntimeDiagnostics.stateLoader
