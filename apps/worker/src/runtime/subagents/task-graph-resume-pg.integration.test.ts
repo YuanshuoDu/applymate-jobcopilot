@@ -7584,6 +7584,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
   const scoutUnionOwner = fixture()
   const emptyAnalystOwner = fixture()
   const emptyAnalystOrphanOwner = fixture()
+  const emptyAnalystCurrentReceiptOwner = fixture()
   const emptyAnalystMutationOwner = fixture()
   const archivedWaitOwner = fixture()
   const rootRecoveryScanSeed = fixture()
@@ -7642,6 +7643,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     await seed(pool, scoutUnionOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
     await seed(pool, emptyAnalystOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
     await seed(pool, emptyAnalystOrphanOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
+    await seed(pool, emptyAnalystCurrentReceiptOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
     await seed(pool, emptyAnalystMutationOwner, "waiting_for_user", TASK_GRAPH_FIXTURE_TURN_LIMITS)
     await seed(pool, archivedWaitOwner, "waiting_for_user", { maxSteps: 4, maxToolCalls: 3 })
     await seed(pool, rootRecoveryScanOwner, "waiting_for_user")
@@ -7669,7 +7671,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     }
     const fixtureOwners = [owner, resumeFailureOwner, failureOwner, operationalFailureOwner, operationalDeadlineOwner, operationalAppendOwner, stopOwner, restartOwner, artifactOwner, cancelledOwner, discoveryOwner,
       discoveryFailureOwner, discoveryRestartOwner, verificationRepairOwner, lateRepairOwner, leaseRecoveryOwner,
-      coverageRepairOwner, scoutUnionOwner, emptyAnalystOwner, emptyAnalystOrphanOwner, emptyAnalystMutationOwner, rootRecoveryScanOwner, archivedWaitOwner]
+      coverageRepairOwner, scoutUnionOwner, emptyAnalystOwner, emptyAnalystOrphanOwner, emptyAnalystCurrentReceiptOwner,
+      emptyAnalystMutationOwner, rootRecoveryScanOwner, archivedWaitOwner]
     const allFixtureWorkersExited = [...fixtureProcessChildren].every(processFixtureExited)
     if (!allFixtureWorkersExited) cleanupFailures.push("fixture process Workers are not proven exited; queue cleanup was refused")
     let ownerRowsMayBeDeleted = false
@@ -14237,7 +14240,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     ])
     const { createProductionChildExecutor } = await import("./production-child-runtime.js")
     const value = scenario === "verified union" ? scoutUnionOwner : taskScopedOrphan ? emptyAnalystOrphanOwner
-      : postPrecheckMutation ? emptyAnalystMutationOwner : emptyAnalystOwner
+      : currentAttemptReceipt ? emptyAnalystCurrentReceiptOwner
+        : postPrecheckMutation ? emptyAnalystMutationOwner : emptyAnalystOwner
     const ids = Array.from({ length: 4 }, (_, index) => fixtureJobId(value.suffix, index))
     turnQueueName = turnQueueModule.TURN_QUEUE_NAME
     childQueueName = (await import("../../queue/subagent-queue.js")).SUBAGENT_QUEUE_NAME
@@ -14660,7 +14664,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           FROM "sub_agent_tasks" AS task JOIN "agent_turns" AS turn ON turn."id" = task."turnId" AND turn."sessionId" = task."sessionId"
           WHERE task."id" = $3 AND task."sessionId" = $1 AND task."turnId" = $2 AND turn."userId" = $4`,
         [value.sessionId, value.turnId, taskId, value.userId])
-        expect(fenced.rows[0]).toEqual({ status: "running", resultNull: true, turnStatus: "in_progress", finalItemCount: 0, turnCompletedCount: 0 })
+        expect(fenced.rows[0]).toEqual({ status: "running", resultNull: true, turnStatus: "waiting_for_dependency", finalItemCount: 0, turnCompletedCount: 0 })
       }
       if (taskId === analystTaskId && postPrecheckMutation) {
         const revisionBefore = await pool!.query<{ revision: number }>(`SELECT "revision" FROM "agent_items"
@@ -14774,8 +14778,8 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     )
     expect(turn.rows[0]?.status).toBe(emptyAnalyst ? "failed" : "completed")
     if (!emptyAnalyst) expect(turn.rows[0]?.finalResponse).toContain("Both Scout sources passed")
-    const tasks = await pool!.query<{ id: string; goal: string; status: string; result: unknown }>(
-      `SELECT "id", "goal", "status", "result" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "parentTaskId" = $3`,
+    const tasks = await pool!.query<{ id: string; goal: string; status: string; result: unknown; failureReason: string | null }>(
+      `SELECT "id", "goal", "status", "result", "failureReason" FROM "sub_agent_tasks" WHERE "turnId" = $1 AND "sessionId" = $2 AND "parentTaskId" = $3`,
       [value.turnId, value.sessionId, turn.rows[0]?.rootTaskId],
     )
     const analyst = tasks.rows.find(task => task.id === analystTaskId)
