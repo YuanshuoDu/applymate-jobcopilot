@@ -94,7 +94,7 @@ test.beforeAll(async () => {
     absWorkingDir: webRoot, outfile: path.join(temporaryDirectory, 'fixture.js'), bundle: true, platform: 'browser',
     format: 'iife', jsx: 'automatic', target: 'es2022', alias: { '@': path.join(webRoot, 'src'), 'next-auth/react': authPath, 'next/dynamic': dynamicPath, 'next/navigation': navigationPath },
     plugins: [{ name: 'fixture-unused-pages', setup(build: { onResolve: (options: object, callback: () => object) => void }) { build.onResolve({ filter: /^@\/components\/pages\/(GmailPage|JobRecommendationsPage|AgentHistoryPage|SettingsPage|ObservabilityPage|ContactUsPage)$/ }, () => ({ path: unusedPagePath })) } }],
-    define: { 'process.env.NODE_ENV': '"production"' }, loader: { '.svg': 'dataurl', '.png': 'dataurl' }, logLevel: 'silent',
+    define: { 'process.env.NODE_ENV': '"production"', 'process.env': '{"NODE_ENV":"production"}' }, loader: { '.svg': 'dataurl', '.png': 'dataurl' }, logLevel: 'silent',
   })
   server = createServer((request, response) => {
     void (async () => {
@@ -3042,6 +3042,12 @@ test('dashboard limits recent task cards and opens the unfiltered Applications l
   const all = guidance.getByRole('link', { name: /^(All applications|全部申请)$/ })
   await expect(all).toHaveAttribute('href', '/?page=jobs')
   const originalUrl = page.url()
+  const newTab = page.context().waitForEvent('page')
+  await all.click({ modifiers: ['Control'] })
+  const openedTab = await newTab
+  await expect(openedTab).toHaveURL(/\?page=jobs$/)
+  await openedTab.close()
+  await expect(page).toHaveURL(originalUrl)
   await page.evaluate(() => { (window as unknown as { __fixtureBlockNavigation: boolean }).__fixtureBlockNavigation = true })
   await all.click()
   await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))

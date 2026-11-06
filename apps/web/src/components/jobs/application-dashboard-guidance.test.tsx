@@ -222,9 +222,14 @@ describe('Dashboard application guidance', () => {
     const html = renderToStaticMarkup(tree)
     expect(html).not.toContain('application.savedContinue')
     expect(html).toContain('application.dashboardMoreTasks')
-    const link = elements(tree).find(element => element.type === 'a' && element.props.href === '/?page=jobs')!
+    const link = elements(tree).find(element => element.props.href === '/?page=jobs')!
     ;(link.props.onClick as (event: object) => void)({ button: 0, preventDefault: vi.fn() })
     expect(input.onOpenApplications).toHaveBeenCalledOnce()
+    const preventDefault = vi.fn()
+    ;(link.props.onClick as (event: object) => void)({ button: 0, ctrlKey: true, preventDefault })
+    expect(preventDefault).not.toHaveBeenCalled()
+    expect(input.onOpenApplications).toHaveBeenCalledOnce()
+    expect(html).toContain('href="/?page=jobs"')
   })
 
   it('keeps a known terminal task visible in a limited snapshot without presenting suggestions', () => {

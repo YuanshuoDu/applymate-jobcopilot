@@ -1,6 +1,7 @@
 'use client'
 
 import React from 'react'
+import Link from 'next/link'
 import { ArrowRight } from 'lucide-react'
 import type { DashboardData } from '@/lib/types'
 import { ApplicationTaskCard } from './application-task-card'
@@ -56,11 +57,11 @@ export function ApplicationDashboardGuidance({ tasks, loading, error, limited, s
     {allAttention.length > 0 && <button type="button" onClick={onOpenAttention} style={{ minHeight: 36, marginTop: 8, padding: '4px 0', border: 0, background: 'transparent', color: 'var(--primary)', fontWeight: 600, cursor: 'pointer' }}>{t('application.viewRecentAttention')}</button>}
     {prioritizedTasks.length > cards.length && <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
       <p>{t('application.dashboardMoreTasks')}</p>
-      <a href="/?page=jobs" onClick={event => {
+      <Link href="/?page=jobs" onClick={event => {
         if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
         event.preventDefault()
         onOpenApplications()
-      }}>{t('application.allApplications')}</a>
+      }}>{t('application.allApplications')}</Link>
     </div>}
     <div className="application-dashboard-links">
       {suggestionsAvailable && followUp && <button type="button" onClick={() => onOpenApplication(followUp.id)}>
