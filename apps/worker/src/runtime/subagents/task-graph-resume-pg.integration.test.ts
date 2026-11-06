@@ -14558,6 +14558,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let rootExecution = 0, initialTaskIds: string[] = []
     let scoutATaskId = "", scoutBTaskId = "", analystTaskId = "", graphWitnessTaskId = "", finalWaitReport: RecordValue | null = null
     let rootResumeStage = "not_started", rootResumeExecution: number | null = null, rootResumeRound: number | null = null
+    let emptyAnalystReplayAttempted = false, emptyAnalystReplayFailure: unknown
     const emptyAnalystRuntimeDiagnostics: EmptyAnalystRootResumeDiagnostics = {
       executeCalls: 0, executions: [],
       stateLoader: { calls: 0, outcome: "not_started", errorClass: "none", errorCode: "none", passedCalls: 0, failedCalls: 0,
@@ -14571,6 +14572,89 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       if (scenario === "empty Analyst proof") {
         rootResumeStage = diagnosticEnum(stage, EMPTY_ANALYST_ROOT_RESUME_STAGES) ?? "not_started"
       }
+    }
+    const verifyConsumedEmptyAnalystWaitReplay = async (replayLease: TurnLease, rootTaskId: string) => {
+      const replay = async (misbind: boolean) => {
+        const client = await pool!.connect()
+        let transactionStarted = false
+        try {
+          await client.query("BEGIN")
+          transactionStarted = true
+          await client.query("SELECT set_config($1, $2, true)", ["app.user_id", value.userId])
+          const replayNow = new Date()
+          const turnResult = await client.query<RecordValue>(`SELECT * FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2
+            AND "userId" = $3 AND "leaseOwnerId" = $4 AND "leaseVersion" = $5 AND "leaseExpiresAt" > $6
+            AND "status" = 'in_progress' FOR UPDATE`, [replayLease.turnId, replayLease.sessionId, replayLease.userId,
+            replayLease.ownerId, replayLease.leaseVersion, replayNow])
+          const turn = turnResult.rows[0]
+          if (!turn) throw new Error("Empty Analyst replay lost the current owner-fenced Turn")
+          const waitResult = await client.query<RecordValue>(`SELECT "id", "status", "stepId", "targetTaskIds", "matchedTaskIds", "consumedAt", "result", xmin::text AS "tupleVersion"
+            FROM "agent_wait_conditions" WHERE "userId" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "parentTaskId" = $4
+              AND "idempotencyKey" = $5 AND "status" = 'ready' AND "suspendedAt" IS NOT NULL AND "consumedAt" IS NOT NULL FOR UPDATE`,
+          [value.userId, value.sessionId, value.turnId, rootTaskId, waitKey])
+          const wait = waitResult.rows[0]
+          if (!wait || !analystTaskId || !scoutATaskId || !scoutBTaskId) throw new Error("Empty Analyst consumed wait was unavailable for replay")
+          expect(wait.targetTaskIds).toEqual([analystTaskId])
+          expect(wait.matchedTaskIds).toEqual([analystTaskId])
+          expect(wait.consumedAt).toBeInstanceOf(Date)
+          expect(wait.tupleVersion).toMatch(/^\d+$/)
+          const archivedOutcome = record(record(wait.result)?.outcome)
+          if (!archivedOutcome) throw new Error("Empty Analyst consumed wait archive was unavailable for replay")
+          const stepResult = await client.query<RecordValue>(`SELECT "id", "taskId", "attempt", "status" FROM "agent_steps"
+            WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`, [wait.stepId, value.sessionId, value.turnId])
+          expect(stepResult.rows[0]).toMatchObject({ taskId: rootTaskId, attempt: 1, status: "waiting_for_tool" })
+          const before = { consumedAt: wait.consumedAt, result: wait.result, tupleVersion: wait.tupleVersion }
+          if (misbind) {
+            const analyst = await client.query<{ result: unknown }>(`SELECT "result" FROM "sub_agent_tasks" WHERE "id" = $1
+              AND "sessionId" = $2 AND "turnId" = $3 AND "rootTaskId" = $4 AND "status" = 'failed' FOR UPDATE`,
+            [analystTaskId, value.sessionId, value.turnId, rootTaskId])
+            const result = record(analyst.rows[0]?.result), report = record(result?.taskGraphVerificationReport)
+            const bindings = Array.isArray(report?.dependencyBindings) ? report.dependencyBindings.map(record) : []
+            if (!result || !report || bindings.length !== 2 || !bindings[0] || !bindings[1]) throw new Error("Empty Analyst private source bindings were unavailable for replay canary")
+            const scoutABindingIndex = bindings.findIndex(binding => binding?.taskId === scoutATaskId)
+            if (scoutABindingIndex < 0 || bindings.some(binding => binding?.taskId === scoutBTaskId)) throw new Error("Empty Analyst private source bindings did not match the expected Scout identities")
+            const changedResult = { ...result, taskGraphVerificationReport: { ...report, dependencyBindings: bindings.map((binding, index) =>
+              index === scoutABindingIndex ? { ...binding, taskId: scoutBTaskId } : binding) } }
+            const update = await client.query(`UPDATE "sub_agent_tasks" SET "result" = $1::jsonb WHERE "id" = $2 AND "sessionId" = $3
+              AND "turnId" = $4 AND "rootTaskId" = $5 AND "status" = 'failed'`,
+            [JSON.stringify(changedResult), analystTaskId, value.sessionId, value.turnId, rootTaskId])
+            expect(update.rowCount).toBe(1)
+          }
+          if (misbind) {
+            await expect(consumeDurableWaitOutcomes({ client, lease: replayLease, turn, now: replayNow }))
+              .rejects.toThrow(/wait_consume_(?:outcome|verification_report)_invalid/)
+          } else {
+            const projections = await consumeDurableWaitOutcomes({ client, lease: replayLease, turn, now: replayNow })
+            expect(projections).toHaveLength(1)
+            const envelope = record(projections[0]?.content), outcome = record(envelope?.output)
+            const tasks = Array.isArray(outcome?.tasks) ? outcome.tasks.map(record) : []
+            const report = record(tasks[0]?.verificationReport)
+            expect(outcome).toEqual(archivedOutcome)
+            expect(outcome).toMatchObject({ waitId: wait.id, status: "ready", targetTaskIds: [analystTaskId], matchedTaskIds: [analystTaskId] })
+            expect(tasks[0]).toMatchObject({ taskId: analystTaskId, status: "failed", role: "analyst" })
+            expect(report).toMatchObject({ verifierVersion: TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met" })
+            expect(Object.keys(report ?? {}).sort()).toEqual(["criteria", "evidenceDigest", "reasonCode", "resultDigest", "status", "verifierVersion"])
+            expect(JSON.stringify(projections[0]?.content)).not.toContain("dependencyBindings")
+            expect(JSON.stringify(projections[0]?.content)).not.toContain(scoutATaskId)
+            expect(JSON.stringify(projections[0]?.content)).not.toContain(scoutBTaskId)
+            expect(JSON.stringify(projections[0]?.content)).not.toContain("scout-a")
+            expect(JSON.stringify(projections[0]?.content)).not.toContain("scout-b")
+            expect(JSON.stringify(wait.result)).not.toContain("dependencyBindings")
+            expect(JSON.stringify(wait.result)).not.toContain(scoutATaskId)
+            expect(JSON.stringify(wait.result)).not.toContain(scoutBTaskId)
+            expect(JSON.stringify(wait.result)).not.toContain("scout-a")
+            expect(JSON.stringify(wait.result)).not.toContain("scout-b")
+          }
+          const after = await client.query<{ consumedAt: Date | null; result: unknown; tupleVersion: string }>(`SELECT "consumedAt", "result", xmin::text AS "tupleVersion" FROM "agent_wait_conditions"
+            WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "turnId" = $4`, [wait.id, value.userId, value.sessionId, value.turnId])
+          expect(after.rows[0]).toEqual(before)
+        } finally {
+          try { if (transactionStarted) await client.query("ROLLBACK") }
+          finally { client.release() }
+        }
+      }
+      await replay(false)
+      await replay(true)
     }
     const rootTaskStoreModule = await import("./root-task-store.js")
     const productionRootTaskStore = rootTaskStoreModule.createPgRootTaskStore(pool!)
@@ -14590,6 +14674,11 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           boundary.outcome = "passed"
           boundary.errorClass = "none"
           boundary.errorCode = "none"
+          if (scenario === "empty Analyst proof" && boundary.calls > 1 && !emptyAnalystReplayAttempted && state.rootTaskId) {
+            emptyAnalystReplayAttempted = true
+            try { await verifyConsumedEmptyAnalystWaitReplay(lease, state.rootTaskId) }
+            catch (error: unknown) { emptyAnalystReplayFailure = error }
+          }
           return state
         } catch (error: unknown) {
           const errorClass = safeFailurePreflightErrorClass(error)
@@ -15271,6 +15360,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         persisted: emptyAnalystResumeSnapshot,
       })
       : undefined
+    if (scenario === "empty Analyst proof") {
+      expect(emptyAnalystReplayAttempted).toBe(true)
+      if (emptyAnalystReplayFailure !== undefined) throw emptyAnalystReplayFailure
+    }
     expect(finalWaitReport, emptyAnalystFailureDiagnostic).not.toBeNull()
     const turn = await pool!.query<{ status: string; rootTaskId: string | null; finalResponse: string | null }>(
       `SELECT "status", "rootTaskId", "finalResponse" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
