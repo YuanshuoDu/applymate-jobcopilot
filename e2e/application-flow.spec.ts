@@ -1242,6 +1242,35 @@ test('an unavailable generated draft never flashes across an account and job swi
   } finally { release() }
 })
 
+for (const result of ['confirmed', 'unknown'] as const) test(`missing edited letter stays scoped after ${result} deletion`, async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop letter editor')
+  const state = await install(page)
+  let deleted = false, deletes = 0
+  const row = { userId: 'fixture-user', jobId: 'outside-page', tone: 'professional', createdAt: time }
+  const selected = { ...row, id: 'selected-letter', content: 'Selected A' }
+  const edited = { ...row, id: 'other-letter', content: 'Other B' }
+  await page.route('**/api/jobs/outside-page/cover-letters', route => route.fulfill({ json: deleted ? [selected] : [selected, edited] }))
+  await page.route('**/api/cover-letters/other-letter', route => {
+    deletes++; deleted = true
+    return result === 'confirmed' ? route.fulfill({ json: {} }) : route.abort('failed')
+  })
+  await page.goto(`${origin}/?page=multi-letter-panel-probe`)
+  const first = page.getByTestId('first-letter-panel')
+  const second = page.getByTestId('second-letter-panel')
+  await expect(first.locator('textarea')).toHaveValue('Selected A')
+  await expect(second.locator('textarea')).toHaveValue('Selected A')
+  await first.locator('select').first().selectOption('other-letter')
+  await second.locator('select').first().selectOption('other-letter')
+  await first.getByRole('button', { name: 'Delete', exact: true }).click()
+  await first.getByText('Delete cover letter?', { exact: true }).locator('../..').getByRole('button', { name: 'Delete', exact: true }).click()
+  await expect(second.getByRole('alert')).toBeVisible()
+  await expect(second.locator('textarea')).toHaveCount(0)
+  if (result === 'confirmed') await expect(first.locator('textarea')).toHaveValue('Selected A')
+  else { await expect(first.getByRole('alert')).toBeVisible(); await expect(first.locator('textarea')).toHaveCount(0) }
+  expect(deletes).toBe(1)
+  expect(state.unexpected).toEqual([])
+})
+
 test('completion of another letter deletion preserves the current version and its draft', async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop letter editor')
   const state = await install(page)

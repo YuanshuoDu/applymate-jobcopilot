@@ -167,7 +167,7 @@ export function CoverLetterPanel({ job, resumeId, resumeContent, resumeName, tem
         if (!Array.isArray(data) || data.some(cl => !cl || typeof cl.id !== 'string' || cl.userId !== owner || cl.jobId !== job.id || typeof cl.content !== 'string') || new Set(data.map(cl => cl.id)).size !== data.length) throw new Error('Unavailable')
         const list: CoverLetter[] = data
         if (job.finalCoverLetterId && !list.some(cl => cl.id === job.finalCoverLetterId)) throw new Error('Unavailable')
-        if (retainedId && !list.some(cl => cl.id === retainedId) && memoryDrafts.has(draftKey(retainedId))) throw new Error('Unavailable')
+        if (retainedId && !list.some(cl => cl.id === retainedId)) throw new Error('Unavailable')
         setCoverLetters(list)
         // A same-scope refresh keeps the version the user was editing.
         const initialId = (retainedId && list.some(cl => cl.id === retainedId) ? retainedId : null) ?? job.finalCoverLetterId ?? list[0]?.id ?? null
@@ -389,6 +389,7 @@ export function CoverLetterPanel({ job, resumeId, resumeContent, resumeName, tem
       setCoverLetters(next)
       const deletedSelected = id === job.finalCoverLetterId
       const nextActive = deletedSelected ? null : next[Math.max(0, idx - 1)]?.id ?? null
+      if (!deletedSelected) retainedVersionRef.current = nextActive ? { scope, id: nextActive } : null
       if (deletedSelected) { setLoadFailed(true); setFailedScope(scope); setLoadedScope('') }
       setActiveId(nextActive)
       if (nextActive) {
@@ -471,6 +472,7 @@ export function CoverLetterPanel({ job, resumeId, resumeContent, resumeName, tem
       setAutosaveStatus('idle')
       const updated = [saved, ...coverLetters]
       setCoverLetters(updated)
+      retainedVersionRef.current = { scope, id: saved.id }
       setActiveId(saved.id)
       setLocalContent(saved.content)
       setLocalTone((saved.tone as Tone) ?? localTone)
