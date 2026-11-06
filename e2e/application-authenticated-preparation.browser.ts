@@ -26,7 +26,33 @@ test('real login prepares and reviews a synthetic application through the actual
   })
   const page = await context.newPage()
   const writes: string[] = []
-  page.on('request', req => { if (req.method() !== 'GET') writes.push(`${req.method()} ${new URL(req.url()).pathname}`) })
+  type FixturePhase = 'setup' | 'preparation' | 'editing' | 'return' | 'reaudit' | 'download' | 'employer' | 'manual_record'
+  let phase: FixturePhase = 'setup'
+  const requestPhases = new WeakMap<object, FixturePhase>()
+  let loggedFailures = 0
+  page.on('request', req => {
+    requestPhases.set(req, phase)
+    if (req.method() !== 'GET') writes.push(`${req.method()} ${new URL(req.url()).pathname}`)
+  })
+  page.on('response', response => {
+    if (response.status() !== 409 && response.status() !== 503) return
+    const pathname = new URL(response.url()).pathname
+    const route = /^\/api\/jobs\/[^/]+\/audit-application(?:\/apply)?$/.test(pathname) ? 'audit'
+      : /^\/api\/jobs\/[^/]+\/tailor-resume$/.test(pathname) ? 'tailor'
+        : /^\/api\/jobs\/[^/]+\/assign$/.test(pathname) ? 'assign'
+          : /^\/api\/jobs\/[^/]+\/(?:application-pack|export-local)$/.test(pathname) ? 'download'
+            : /^\/api\/jobs\/[^/]+\/apply$/.test(pathname) ? 'application_record'
+              : /^\/api\/resume\/[^/]+$/.test(pathname) ? 'resume' : null
+    if (!route) return
+    loggedFailures++
+    if (loggedFailures > 20) {
+      if (loggedFailures === 21) console.log('Fixture material response diagnostics truncated')
+      return
+    }
+    const method = response.request().method()
+    console.log('Fixture material response', JSON.stringify({ phase: requestPhases.get(response.request()) ?? 'setup', route,
+      method: ['GET', 'POST', 'PATCH'].includes(method) ? method : 'OTHER', status: response.status() }))
+  })
   await page.goto('/login')
   await page.getByPlaceholder('you@example.com').fill('candidate-a@example.invalid')
   await page.locator('input[type="password"]').fill('Fixture-only-password-123')
@@ -62,6 +88,7 @@ test('real login prepares and reviews a synthetic application through the actual
   const tailorResponse = page.waitForResponse(r => r.url().endsWith(`/api/jobs/${job.id}/tailor-resume`) && r.request().method() === 'POST')
   const auditResponse = page.waitForResponse(r => r.url().endsWith(`/api/jobs/${job.id}/audit-application`) && r.request().method() === 'POST')
   const assignResponse = page.waitForResponse(r => r.url().endsWith(`/api/jobs/${job.id}/assign`) && r.request().method() === 'PATCH')
+  phase = 'preparation'
   await prepare.click()
   const tailor = await tailorResponse
   expect(tailor.status()).toBe(200)
@@ -123,6 +150,7 @@ test('real login prepares and reviews a synthetic application through the actual
   // Edit the same selected document using the application's real navigation.
   // Removing a period changes the material version without adding any fact.
   const resumedDrawer = page.getByRole('dialog')
+  phase = 'editing'
   await resumedDrawer.getByRole('button', { name: 'Show Resume details' }).click()
   await resumedDrawer.getByRole('button', { name: /Edit this resume|编辑此简历/, exact: true }).click()
   await expect(page).toHaveURL(/page=resume/)
@@ -136,6 +164,7 @@ test('real login prepares and reviews a synthetic application through the actual
   expect(edited).toMatchObject({ id: tailored.adaptedResumeId, content: { summary: 'Synthetic original summary' } })
   expect(edited.updatedAt).not.toBe(auditBody.resumeUpdatedAt)
   await expect(page.locator('.resume-top-save')).toContainText(/Saved just now|刚刚保存/)
+  phase = 'return'
   await page.getByRole('button', { name: /Back to this application|返回此申请/ }).click()
   await expect(page).toHaveURL(new RegExp(`highlight=${job.id}`))
   const returnedDrawer = page.getByRole('dialog')
@@ -151,6 +180,7 @@ test('real login prepares and reviews a synthetic application through the actual
   await expect(recheck).toBeEnabled()
   const secondAuditResponse = page.waitForResponse(r => r.url().endsWith(`/api/jobs/${job.id}/audit-application`) && r.request().method() === 'POST')
   const secondAssignResponse = page.waitForResponse(r => r.url().endsWith(`/api/jobs/${job.id}/assign`) && r.request().method() === 'PATCH')
+  phase = 'reaudit'
   await recheck.click()
   const secondAudit = await secondAuditResponse
   expect(secondAudit.status()).toBe(200)
@@ -197,6 +227,7 @@ test('real login prepares and reviews a synthetic application through the actual
     expect(JSON.parse(control.text.slice(prefix.length))).toMatchObject({ state: 'completed', operationId: secondAuditBody.operationId })
     await assertStillSaved()
 
+    phase = 'download'
     const downloadPromise = page.waitForEvent('download', { timeout: 30_000 })
     await returnedDrawer.getByRole('button', { name: /Download application materials|下载申请材料/ }).click()
     const download = await downloadPromise
@@ -220,6 +251,7 @@ test('real login prepares and reviews a synthetic application through the actual
     expect(pdfText).not.toMatch(/Synthetic\s+original\s+summary\s*\./)
     await assertStillSaved()
 
+    phase = 'employer'
     const popupPromise = context.waitForEvent('page')
     await returnedDrawer.getByRole('button', { name: /Open employer website|前往雇主网站/, exact: true }).click()
     const employer = await popupPromise
@@ -228,6 +260,7 @@ test('real login prepares and reviews a synthetic application through the actual
     await employer.close()
     await assertStillSaved()
 
+    phase = 'manual_record'
     const recordResponse = page.waitForResponse(response => response.url().endsWith(`/api/jobs/${job.id}/apply`) && response.request().method() === 'POST')
     await returnedDrawer.getByRole('button', { name: /Record that I submitted on the employer website|记录我已在雇主网站提交/ }).click()
     expect((await recordResponse).status()).toBe(200)
