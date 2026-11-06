@@ -104,7 +104,7 @@ export async function loadDurableSubagentWaitResume(pool: Pool, lease: ResumeLea
     if (laterSteps.length > 1 || next && (next.status !== "streaming" || typeof next.id !== "string" || !next.id.trim()
       || !Number.isSafeInteger(continuationOrdinal) || continuationOrdinal <= sourceOrdinal)) throw new DurableSubagentWaitError("wait_conflict", "Child wait has an ambiguous continuation")
 
-    const waits = (await client.query<Row>(`SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "idempotencyKey", "targetTaskIds", "mode", "status", "deadlineAt", "matchedTaskIds", "result", "suspendedAt", "consumedAt"
+    const waits = (await client.query<Row>(`SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "idempotencyKey", "targetTaskIds", "mode", "status", "deadlineAt", "resolvedAt", "matchedTaskIds", "result", "suspendedAt", "consumedAt"
       FROM "agent_wait_conditions" WHERE "id" IN (
         SELECT wait."id" FROM "agent_wait_conditions" AS wait
         WHERE wait."userId" = $1 AND wait."sessionId" = $2 AND wait."turnId" = $3 AND wait."parentTaskId" = $4
@@ -191,7 +191,7 @@ export async function commitDurableSubagentWaitResume(pool: Pool, lease: ResumeL
       || !Number.isSafeInteger(sourceOrdinal) || sourceOrdinal < 0 || sourceOrdinal >= input.nextStepOrdinal) {
       throw new DurableSubagentWaitError("wait_scope_error", "Source step does not precede the acknowledged resume step")
     }
-    const wait = (await client.query<Row>(`SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "idempotencyKey", "targetTaskIds", "mode", "status", "deadlineAt", "matchedTaskIds", "result", "suspendedAt", "consumedAt"
+    const wait = (await client.query<Row>(`SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "idempotencyKey", "targetTaskIds", "mode", "status", "deadlineAt", "resolvedAt", "matchedTaskIds", "result", "suspendedAt", "consumedAt"
       FROM "agent_wait_conditions" WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "turnId" = $4
         AND "parentTaskId" = $5 AND "stepId" = $6 AND "suspendedAt" IS NOT NULL AND "status" IN ('ready', 'timed_out')
         AND EXISTS (SELECT 1 FROM "agent_sessions" AS session WHERE session."id" = "agent_wait_conditions"."sessionId" AND ${OPEN_SESSION}) FOR UPDATE`,

@@ -2075,18 +2075,31 @@ async function expectCompletedSourceWaitLifecycle(pool: Pool, ids: FixtureIds, p
   const eventPayloads = JSON.stringify(events.rows.map(event => event.payload))
   expect(eventPayloads).not.toContain(SOURCE_WAIT_SECRET_IDEMPOTENCY_KEY(ids.waiterTaskId))
   expect(eventPayloads).toContain(FIXED_WAIT_TARGET_TASK_ID)
-  const resultEventContent = asObject(asObject(events.rows[5]?.payload).content)
+  const sourceCallCompletedEvents = events.rows.filter(event => event.itemId === callItemId && event.type === "tool_call.completed"
+    && event.correlationId === PHONE_SHAPED_WAIT_TOOL_CALL_ID
+    && asObject(event.payload).toolCallId === PHONE_SHAPED_WAIT_TOOL_CALL_ID)
+  expect(sourceCallCompletedEvents).toHaveLength(1)
+  const sourceResultStartedEvents = events.rows.filter(event => event.itemId === resultItemId && event.type === "item.started"
+    && event.correlationId === stepId && event.causationId === sourceCallCompletedEvents[0]!.id)
+  expect(sourceResultStartedEvents).toHaveLength(1)
+  const sourceResultCompletedEvents = events.rows.filter(event => event.itemId === resultItemId && event.type === "item.completed"
+    && event.correlationId === resultItemId && event.causationId === sourceResultStartedEvents[0]!.id)
+  expect(sourceResultCompletedEvents).toHaveLength(1)
+  const resultEventContent = asObject(asObject(sourceResultCompletedEvents[0]!.payload).content)
   expect(asObject(resultEventContent.output).taskIds).toEqual([FIXED_WAIT_TARGET_TASK_ID])
+  const sourceEventIds = sourceEvents.map(event => event.id)
+  expect(sourceEventIds).toHaveLength(6)
   const eventOutboxes = await pool.query<{ idempotencyKey: string; payload: Record<string, unknown> }>(
     `SELECT "idempotencyKey", "payload" FROM "agent_outbox" WHERE "aggregateId" = $1 AND "topic" = 'agent.events'
        AND "idempotencyKey" = ANY($2::text[])`,
-    [ids.sessionId, events.rows.map(event => `agent-event:${event.id}`)],
+    [ids.sessionId, sourceEventIds.map(id => `agent-event:${id}`)],
   )
-  expect(eventOutboxes.rows).toHaveLength(6)
+  expect(eventOutboxes.rows).toHaveLength(sourceEventIds.length)
+  expect(eventOutboxes.rows.map(row => row.payload.eventId).sort()).toEqual([...sourceEventIds].sort())
   const eventOutboxPayload = JSON.stringify(eventOutboxes.rows.map(row => row.payload))
   expect(eventOutboxPayload).not.toContain(SOURCE_WAIT_SECRET_IDEMPOTENCY_KEY(ids.waiterTaskId))
   expect(eventOutboxPayload).toContain(FIXED_WAIT_TARGET_TASK_ID)
-  const callCompletionOutbox = eventOutboxes.rows.find(row => row.payload.eventId === events.rows[2]?.id)
+  const callCompletionOutbox = eventOutboxes.rows.find(row => row.payload.eventId === sourceCallCompletedEvents[0]!.id)
   expect(callCompletionOutbox).toBeDefined()
   expect(JSON.stringify(callCompletionOutbox?.payload)).not.toContain(FIXED_WAIT_TARGET_TASK_ID)
 }

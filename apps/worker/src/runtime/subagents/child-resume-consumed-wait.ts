@@ -102,7 +102,7 @@ export async function loadChildConsumedWaitResume(client: QueryClient, lease: Su
       ${waitIdParam}
     ORDER BY candidateStep."attempt" DESC, candidateStep."ordinal" DESC, candidateWait."createdAt" DESC, candidateWait."id" DESC LIMIT 1
   )
-    SELECT wait."id" AS "waitId", wait."stepId", wait."targetTaskIds", wait."idempotencyKey", wait."mode", wait."status", wait."deadlineAt", wait."matchedTaskIds", wait."result" AS "waitResult", step."attempt", step."ordinal", next."id" AS "continuationStepId", next."ordinal" AS "continuationOrdinal", call."content" AS "callContent", call."status" AS "callStatus", result."id" AS "sourceItemId", result."content" AS "resultContent", result."status" AS "resultStatus"
+    SELECT wait."id" AS "waitId", wait."stepId", wait."targetTaskIds", wait."idempotencyKey", wait."mode", wait."status", wait."deadlineAt", wait."resolvedAt", wait."matchedTaskIds", wait."result" AS "waitResult", step."attempt", step."ordinal", next."id" AS "continuationStepId", next."ordinal" AS "continuationOrdinal", call."content" AS "callContent", call."status" AS "callStatus", result."id" AS "sourceItemId", result."content" AS "resultContent", result."status" AS "resultStatus"
     FROM "agent_wait_conditions" AS wait
     JOIN latest_wait ON latest_wait."id" = wait."id"
     JOIN "agent_steps" AS step ON step."id" = wait."stepId" AND step."sessionId" = wait."sessionId" AND step."turnId" = wait."turnId" AND step."taskId" = wait."parentTaskId"
@@ -140,7 +140,7 @@ export async function loadChildConsumedWaitResume(client: QueryClient, lease: Su
     || target.rootTaskId !== lease.rootTaskId || target.sessionId !== lease.sessionId || target.turnId !== lease.turnId || target.userId !== lease.userId)) throw new Error("child_resume_wait_lineage")
   const waitRow: Row = { id: row.waitId, userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId,
     parentTaskId: lease.id, stepId: row.stepId, idempotencyKey: row.idempotencyKey, targetTaskIds: row.targetTaskIds,
-    mode: row.mode, status: row.status, deadlineAt: row.deadlineAt, matchedTaskIds: row.matchedTaskIds, result: row.waitResult }
+    mode: row.mode, status: row.status, deadlineAt: row.deadlineAt, resolvedAt: row.resolvedAt, matchedTaskIds: row.matchedTaskIds, result: row.waitResult }
   const matched = strictIds(row.matchedTaskIds, 0)
   if (!matched || matched.some(id => !ids.includes(id)) || !validStoredOutcome(row, ids, matched)) throw new Error("child_resume_invalid_wait_result")
   const call = waitObject(row.callContent), input = waitObject(call.input), request = waitObject(waitObject(row.waitResult).request)

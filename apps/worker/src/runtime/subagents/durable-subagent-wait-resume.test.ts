@@ -27,7 +27,7 @@ function fixture(options: { consumed?: boolean; nextStep?: boolean; laterOrdinal
   const outcome = { waitId: "wait-1", status: waitStatus, taskIds: options.outcomeTaskIds ?? targetTaskIds, deadlineAt: deadlineAt.toISOString(), matchedTaskIds,
     tasks: snapshotTasks }
   const wait = { id: "wait-1", userId: "user-1", sessionId: "session-1", turnId: "turn-1", parentTaskId: "parent-1", stepId: "step-1",
-    idempotencyKey: "wait-key", targetTaskIds, mode: "any", status: waitStatus, deadlineAt, matchedTaskIds,
+    idempotencyKey: "wait-key", targetTaskIds, mode: "any", status: waitStatus, deadlineAt, resolvedAt: now, matchedTaskIds,
     result: { request: { targetTaskIds, mode, timeoutMs: 5_000 }, outcome }, suspendedAt: now, consumedAt: state.consumedAt }
   wait.mode = mode
   const currentTargets = [
@@ -81,6 +81,8 @@ describe("durable child wait resume", () => {
       waitId: "wait-1", stepId: "step-1", attempt: 3, ordinal: 4, toolCallId: "call-1", sourceItemId: "item-result-1",
       output: { status: "ready", taskIds: ["child-1"] },
     })
+    const waitRead = fake.calls.find(call => call.sql.includes('FROM "agent_wait_conditions"') && call.sql.includes('WHERE "id" IN'))
+    expect(waitRead?.sql).toContain('"resolvedAt"')
     expect(fake.state.consumedAt).toBeNull()
     expect(fake.calls.some(call => call.sql.includes('UPDATE "agent_wait_conditions"'))).toBe(false)
   })
@@ -222,6 +224,11 @@ describe("durable child wait resume", () => {
 
     const fake = fixture()
     await expect(commitDurableSubagentWaitResume(fake.pool as never, lease, { waitId: "wait-1", stepId: "step-1", nextStepOrdinal: 5, now })).resolves.toBe(true)
+    const acknowledgedWaitRead = fake.calls.find(call => call.sql.includes('FROM "agent_wait_conditions"')
+      && call.sql.includes('WHERE "id" = $1') && call.sql.includes("FOR UPDATE"))
+    expect(acknowledgedWaitRead?.sql).toContain('"resolvedAt"')
+    expect(sourceLifecycle.reconcile).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.anything(),
+      expect.objectContaining({ resolvedAt: now }), "step-1", expect.anything(), now)
     expect(fake.calls.some(call => call.sql.startsWith('SELECT "id", "userId", "status" FROM "agent_sessions" AS session')
       && call.sql.includes(`session."status" NOT IN ('aborted', 'archived')`))).toBe(true)
     expect(fake.state.consumedAt).toEqual(now)

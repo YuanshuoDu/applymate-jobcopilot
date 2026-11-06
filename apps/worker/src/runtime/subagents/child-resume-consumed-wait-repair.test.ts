@@ -32,7 +32,7 @@ function resolvedWait(id: string, stepId: string, sourceAttempt: number) {
   return {
     id, userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId, parentTaskId: lease.id, stepId,
     idempotencyKey: `wait-key:${id}`, targetTaskIds: [taskId], mode: "any", status: "ready", deadlineAt: new Date(deadlineAt),
-    matchedTaskIds: [taskId], result: { request: { targetTaskIds: [taskId], mode: "any", timeoutMs: 1000 }, outcome },
+    matchedTaskIds: [taskId], resolvedAt: now, result: { request: { targetTaskIds: [taskId], mode: "any", timeoutMs: 1000 }, outcome },
     suspendedAt: now, consumedAt: now, sourceAttempt,
   }
 }
@@ -95,6 +95,8 @@ describe("consumed child wait source repair", () => {
       .toBeLessThan(fake.queryLog.findIndex(sql => sql.includes("FOR UPDATE OF task")))
     expect(fake.queryLog.findIndex(sql => sql.includes('FROM "agent_steps"') && sql.includes('WHERE "id" = $1 FOR UPDATE')))
       .toBeLessThan(fake.queryLog.findIndex(sql => sql.includes('FROM "agent_wait_conditions"') && sql.includes('WHERE "id" = $1 FOR UPDATE')))
+    expect(fake.queryLog.find(sql => sql.includes('FROM "agent_wait_conditions"') && sql.includes('WHERE "id" = $1 FOR UPDATE')))
+      .toContain('"resolvedAt"')
   })
 
   it("repairs multiple distinct consumed source steps and leaves valid completed receipts untouched", async () => {

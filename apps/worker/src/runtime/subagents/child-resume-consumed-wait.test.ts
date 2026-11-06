@@ -35,7 +35,7 @@ function fixture(options: { ids?: string[]; targetIds?: unknown; inputIds?: unkn
     matchedTaskIds: options.outcomeMatchedIds ?? matchedIds, tasks: outcomeTasks }
   const input = { idempotencyKey: "wait-key", taskIds: options.inputIds ?? ids, mode: options.inputMode ?? mode, timeoutMs: options.inputTimeoutMs ?? 5_000 }
   const row: Row = {
-    waitId: "wait-1", stepId: "step-1", targetTaskIds: targetIds, idempotencyKey: "wait-key", mode, status, deadlineAt,
+    waitId: "wait-1", stepId: "step-1", targetTaskIds: targetIds, idempotencyKey: "wait-key", mode, status, deadlineAt, resolvedAt: now,
     matchedTaskIds: matchedIds, waitResult: { request: { targetTaskIds: options.requestIds ?? ids, mode: options.requestMode ?? mode,
       timeoutMs: options.requestTimeoutMs ?? 5_000 }, outcome, ...(options.sourceLifecycleMarker ? { sourceLifecycleRecovery: { ownerId: "private-marker" } } : {}) },
     attempt: options.sourceAttempt ?? 1, ordinal: 0, continuationStepId: "step-2", continuationOrdinal: 1, continuationLatestOrdinal: 1,
@@ -129,6 +129,15 @@ describe("consumed child wait resume", () => {
     expect(resumed).toMatchObject({ input: { taskIds: [phoneId] }, output: { taskIds: [phoneId], tasks: [{ taskId: phoneId }] } })
     expect(JSON.stringify(resumed)).toContain(phoneId)
     expect(JSON.stringify(resumed)).not.toContain("+353 87 123 4567")
+  })
+
+  it("passes the projected resolution timestamp into source lifecycle validation", async () => {
+    const fake = fixture()
+    await loadChildConsumedWaitResume(fake.client as never, child)
+
+    expect(fake.queries[0]).toContain('wait."resolvedAt"')
+    expect(sourceLifecycle.inspect).toHaveBeenCalledWith(fake.client, child,
+      expect.objectContaining({ resolvedAt: fake.row.resolvedAt }), "step-1", expect.anything())
   })
 
   it("compares a PostgreSQL Date deadline at millisecond precision", async () => {

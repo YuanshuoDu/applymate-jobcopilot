@@ -71,7 +71,7 @@ export async function repairConsumedChildWaitSources(pool: pg.Pool, lease: Lease
       if (continuation.length === 0 || continuation.length > 1 && Number(continuation[0]!.ordinal) === Number(continuation[1]!.ordinal)) {
         fail("Consumed child wait continuation is missing or ambiguous")
       }
-      const wait = (await client.query<Row>(`SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "idempotencyKey", "targetTaskIds", "mode", "status", "deadlineAt", "matchedTaskIds", "result", "suspendedAt", "consumedAt"
+      const wait = (await client.query<Row>(`SELECT "id", "userId", "sessionId", "turnId", "parentTaskId", "stepId", "idempotencyKey", "targetTaskIds", "mode", "status", "deadlineAt", "resolvedAt", "matchedTaskIds", "result", "suspendedAt", "consumedAt"
         FROM "agent_wait_conditions" WHERE "id" = $1 FOR UPDATE`, [waitId])).rows[0]
       if (!wait || wait.id !== waitId || wait.stepId !== stepId || wait.userId !== lease.userId || wait.sessionId !== lease.sessionId
         || wait.turnId !== lease.turnId || wait.parentTaskId !== lease.id || wait.consumedAt === null || wait.consumedAt === undefined
