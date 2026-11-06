@@ -3073,6 +3073,98 @@ const EMPTY_ANALYST_ROOT_RESUME_STAGES = new Set([
   "report_missing", "report_present", "report_assertions", "report_verified", "readback_started",
   "readback_verified", "final_output_emitting", "stream_completed",
 ])
+const EMPTY_ANALYST_SETUP_OUTCOMES = new Set(["not_started", "started", "passed", "failed"])
+const EMPTY_ANALYST_EXECUTION_PHASES = new Set(["initial", "resume", "retry", "extra"])
+const EMPTY_ANALYST_EXECUTION_OUTCOMES = new Set(["started", "returned", "threw"])
+const EMPTY_ANALYST_EXECUTION_STATUSES = new Set([...TURN_DIAGNOSTIC_STATUSES, "none", "other"])
+const EMPTY_ANALYST_ERROR_CLASSES = new Set(["none", "database", "assertion", "coordination", "generic", "other"])
+const EMPTY_ANALYST_ERROR_CODES = new Set([...ERROR_DIAGNOSTIC_CODES, "task_graph_other", "none", "other"])
+const EMPTY_ANALYST_PERSISTED_TURN_STATUSES = new Set([...TURN_DIAGNOSTIC_STATUSES, "missing_or_other"])
+const EMPTY_ANALYST_PERSISTED_TASK_STATUSES = new Set([...TASK_DIAGNOSTIC_STATUSES, "missing_or_other"])
+const EMPTY_ANALYST_PERSISTED_STEP_STATUSES = new Set([...STEP_DIAGNOSTIC_STATUSES, "missing_or_other"])
+const EMPTY_ANALYST_PERSISTED_WAIT_STATUSES = new Set([...WAIT_DIAGNOSTIC_STATUSES, "missing_or_other"])
+
+type EmptyAnalystBoundaryDiagnostic = {
+  calls: number
+  outcome: string
+  errorClass: string
+  errorCode: string
+}
+type EmptyAnalystExecutionObservation = {
+  ordinal: number
+  phase: string
+  outcome: string
+  resultStatus: string
+  waitIdPresent: boolean
+  errorClass: string
+  errorCode: string
+}
+type EmptyAnalystRootResumeDiagnostics = {
+  executeCalls: number
+  executions: EmptyAnalystExecutionObservation[]
+  stateLoader: EmptyAnalystBoundaryDiagnostic
+  rootEnsure: EmptyAnalystBoundaryDiagnostic & { returnedStatus: string }
+  modelFactoryCalls: number
+  adapterStreamCalls: number
+  waitHandoff: EmptyAnalystBoundaryDiagnostic
+}
+
+function emptyAnalystRootResumeDiagnosticProjection(value: unknown): RecordValue | null {
+  const source = record(value)
+  if (!source) return null
+  const runtime = record(source.runtime), persisted = record(source.persisted)
+  const stage = (candidate: unknown) => {
+    const boundary = record(candidate)
+    return {
+      calls: diagnosticBoundedCount(boundary?.calls),
+      outcome: diagnosticEnum(boundary?.outcome, EMPTY_ANALYST_SETUP_OUTCOMES) ?? "other",
+      errorClass: diagnosticEnum(boundary?.errorClass, EMPTY_ANALYST_ERROR_CLASSES) ?? "other",
+      errorCode: diagnosticEnum(boundary?.errorCode, EMPTY_ANALYST_ERROR_CODES) ?? "other",
+    }
+  }
+  const executeCalls = diagnosticBoundedCount(runtime?.executeCalls)
+  const executions = Array.isArray(runtime?.executions) ? runtime.executions.slice(0, 4).map((entry, index) => {
+    const observation = record(entry)
+    return {
+      ordinal: diagnosticBoundedCount(observation?.ordinal) ?? index + 1,
+      phase: diagnosticEnum(observation?.phase, EMPTY_ANALYST_EXECUTION_PHASES) ?? "other",
+      outcome: diagnosticEnum(observation?.outcome, EMPTY_ANALYST_EXECUTION_OUTCOMES) ?? "other",
+      resultStatus: diagnosticEnum(observation?.resultStatus, EMPTY_ANALYST_EXECUTION_STATUSES) ?? "other",
+      waitIdPresent: observation?.waitIdPresent === true,
+      errorClass: diagnosticEnum(observation?.errorClass, EMPTY_ANALYST_ERROR_CLASSES) ?? "other",
+      errorCode: diagnosticEnum(observation?.errorCode, EMPTY_ANALYST_ERROR_CODES) ?? "other",
+    }
+  }) : []
+  return {
+    runtime: {
+      executeCalls,
+      omittedExecutions: executeCalls === null ? null : Math.max(0, executeCalls - executions.length),
+      executions,
+      stateLoader: stage(runtime?.stateLoader),
+      rootEnsure: { ...stage(runtime?.rootEnsure), returnedStatus:
+        diagnosticEnum(record(runtime?.rootEnsure)?.returnedStatus, TASK_DIAGNOSTIC_STATUSES) ?? "other" },
+      modelFactoryCalls: diagnosticBoundedCount(runtime?.modelFactoryCalls),
+      adapterStreamCalls: diagnosticBoundedCount(runtime?.adapterStreamCalls),
+      waitHandoff: stage(runtime?.waitHandoff),
+    },
+    persisted: {
+      turnStatus: diagnosticEnum(persisted?.turnStatus, EMPTY_ANALYST_PERSISTED_TURN_STATUSES) ?? "missing_or_other",
+      turnLeaseOwnerPresent: typeof persisted?.turnLeaseOwnerPresent === "boolean" ? persisted.turnLeaseOwnerPresent : null,
+      rootStatus: diagnosticEnum(persisted?.rootStatus, EMPTY_ANALYST_PERSISTED_TASK_STATUSES) ?? "missing_or_other",
+      latestRootStepStatus: diagnosticEnum(persisted?.latestRootStepStatus, EMPTY_ANALYST_PERSISTED_STEP_STATUSES) ?? "missing_or_other",
+      waitStatus: diagnosticEnum(persisted?.waitStatus, EMPTY_ANALYST_PERSISTED_WAIT_STATUSES) ?? "missing_or_other",
+      waitResolved: persisted?.waitResolved === true,
+      waitConsumed: persisted?.waitConsumed === true,
+      failedEventCount: diagnosticBoundedCount(persisted?.failedEventCount),
+      finalItemCount: diagnosticBoundedCount(persisted?.finalItemCount),
+    },
+  }
+}
+
+function emptyAnalystErrorCode(error: unknown): string {
+  const code = record(error)?.code
+  return typeof code === "string" ? diagnosticErrorCode(code) ?? "other" : "none"
+}
 
 function repairChildOutcomeDiagnostic(role: unknown, outcome: unknown, ordinal: number): RecordValue {
   const value = record(outcome), result = record(value?.result)
@@ -7009,6 +7101,84 @@ describe("canonical verifier receipt diagnostics", () => {
     for (const secret of [scope.userId, scope.sessionId, scope.turnId, scope.ownerId, tasks[0]!.id, tasks[0]!.rootTaskId!, "private-step-id", "private-call-id", "private-job-id", "private-result-text"]) {
       expect(encoded).not.toContain(secret)
     }
+  })
+})
+
+describe("empty Analyst root continuation diagnostics", () => {
+  it("projects only bounded setup, execute, wait-handoff, and persisted lease facts", () => {
+    const marker = "private-root-error-id-message-sql"
+    const projected = emptyAnalystRootResumeDiagnosticProjection({
+      runtime: {
+        executeCalls: 9,
+        executions: [
+          { ordinal: 1, phase: "initial", outcome: "returned", resultStatus: "waiting_for_dependency", waitIdPresent: true, errorClass: "none", errorCode: "none", id: marker },
+          { ordinal: 2, phase: "resume", outcome: "threw", resultStatus: "none", waitIdPresent: false, errorClass: "generic", errorCode: "task_graph_state_missing", message: marker },
+          { ordinal: 3, phase: "retry", outcome: "threw", errorClass: "database", errorCode: "other", sql: marker },
+          { ordinal: 4, phase: "retry", outcome: "threw", errorClass: "database", errorCode: "other" },
+          { ordinal: 5, phase: "extra", outcome: "returned", resultStatus: "failed" },
+        ],
+        stateLoader: { calls: 3, outcome: "failed", errorClass: "generic", errorCode: "task_graph_state_missing", error: marker },
+        rootEnsure: { calls: 1, outcome: "passed", returnedStatus: "running", id: marker },
+        modelFactoryCalls: 1, adapterStreamCalls: 1,
+        waitHandoff: { calls: 1, outcome: "passed", errorClass: "none", errorCode: "none", waitId: marker },
+      },
+      persisted: {
+        turnStatus: "failed", turnLeaseOwnerPresent: false, rootStatus: "running", latestRootStepStatus: "waiting_for_tool",
+        waitStatus: "ready", waitResolved: true, waitConsumed: true, failedEventCount: 0, finalItemCount: 0,
+        error: marker, turnId: marker,
+      },
+    })
+    const output = JSON.stringify(projected)
+
+    expect(projected).toMatchObject({
+      runtime: {
+        executeCalls: 9, omittedExecutions: 5,
+        executions: [
+          { phase: "initial", outcome: "returned", resultStatus: "waiting_for_dependency", waitIdPresent: true },
+          { phase: "resume", outcome: "threw", errorClass: "generic", errorCode: "task_graph_state_missing" },
+          { phase: "retry", outcome: "threw", errorClass: "database", errorCode: "other" },
+          { phase: "retry", outcome: "threw", errorClass: "database", errorCode: "other" },
+        ],
+        stateLoader: { calls: 3, outcome: "failed", errorClass: "generic", errorCode: "task_graph_state_missing" },
+        rootEnsure: { calls: 1, outcome: "passed", returnedStatus: "running" },
+        modelFactoryCalls: 1, adapterStreamCalls: 1, waitHandoff: { calls: 1, outcome: "passed" },
+      },
+      persisted: {
+        turnStatus: "failed", turnLeaseOwnerPresent: false, rootStatus: "running", latestRootStepStatus: "waiting_for_tool",
+        waitStatus: "ready", waitResolved: true, waitConsumed: true, failedEventCount: 0, finalItemCount: 0,
+      },
+    })
+    expect(output).not.toContain(marker)
+    expect((projected?.runtime as RecordValue).executions).toHaveLength(4)
+  })
+
+  it("fails closed on unknown stages and caps unsafe counts", () => {
+    const marker = "unapproved-root-diagnostic-value"
+    const projected = emptyAnalystRootResumeDiagnosticProjection({
+      runtime: {
+        executeCalls: 10_001,
+        executions: [{ phase: marker, outcome: marker, resultStatus: marker, errorClass: marker, errorCode: marker, message: marker }],
+        stateLoader: { calls: marker, outcome: marker, errorClass: marker, errorCode: marker },
+        rootEnsure: { calls: 1, outcome: marker, returnedStatus: marker },
+        modelFactoryCalls: marker, adapterStreamCalls: marker,
+        waitHandoff: { calls: 1, outcome: marker, errorClass: marker, errorCode: marker },
+        secret: marker,
+      },
+      persisted: { turnStatus: marker, turnLeaseOwnerPresent: marker, rootStatus: marker, latestRootStepStatus: marker,
+        waitStatus: marker, waitResolved: marker, waitConsumed: marker, failedEventCount: marker, finalItemCount: marker, error: marker },
+    })
+    const output = JSON.stringify(projected)
+
+    expect(projected).toMatchObject({
+      runtime: {
+        executeCalls: null, omittedExecutions: null,
+        executions: [{ phase: "other", outcome: "other", resultStatus: "other", errorClass: "other", errorCode: "other" }],
+        stateLoader: { calls: null, outcome: "other", errorClass: "other", errorCode: "other" },
+        rootEnsure: { outcome: "other", returnedStatus: "other" }, waitHandoff: { outcome: "other" },
+      },
+      persisted: { turnStatus: "missing_or_other", turnLeaseOwnerPresent: null, rootStatus: "missing_or_other" },
+    })
+    expect(output).not.toContain(marker)
   })
 })
 
@@ -14323,21 +14493,66 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let rootExecution = 0, initialTaskIds: string[] = []
     let scoutATaskId = "", scoutBTaskId = "", analystTaskId = "", graphWitnessTaskId = "", finalWaitReport: RecordValue | null = null
     let rootResumeStage = "not_started", rootResumeExecution: number | null = null, rootResumeRound: number | null = null
+    const emptyAnalystRuntimeDiagnostics: EmptyAnalystRootResumeDiagnostics = {
+      executeCalls: 0, executions: [],
+      stateLoader: { calls: 0, outcome: "not_started", errorClass: "none", errorCode: "none" },
+      rootEnsure: { calls: 0, outcome: "not_started", returnedStatus: "none", errorClass: "none", errorCode: "none" },
+      modelFactoryCalls: 0, adapterStreamCalls: 0,
+      waitHandoff: { calls: 0, outcome: "not_started", errorClass: "none", errorCode: "none" },
+    }
     const setEmptyAnalystResumeStage = (stage: string) => {
       if (scenario === "empty Analyst proof") {
         rootResumeStage = diagnosticEnum(stage, EMPTY_ANALYST_ROOT_RESUME_STAGES) ?? "not_started"
       }
     }
+    const rootTaskStoreModule = await import("./root-task-store.js")
+    const productionRootTaskStore = rootTaskStoreModule.createPgRootTaskStore(pool!)
     const runtime = await canonical.createCanonicalTurnRuntime(pool!, {
       workerId: value.ownerId, productionFlags: flags,
       taskGraphCommandPort,
       taskGraphTemplates: { ...TASK_GRAPH_TEMPLATES }, authorizeUsage: async () => ({ settle: async () => undefined }),
+      stateLoader: async (statePool, lease, now, loaderOptions) => {
+        const boundary = emptyAnalystRuntimeDiagnostics.stateLoader
+        boundary.calls += 1
+        boundary.outcome = "started"
+        try {
+          const state = await loadCanonicalTurnState(statePool, lease, now, loaderOptions)
+          boundary.outcome = "passed"
+          return state
+        } catch (error: unknown) {
+          boundary.outcome = "failed"
+          boundary.errorClass = safeFailurePreflightErrorClass(error)
+          boundary.errorCode = emptyAnalystErrorCode(error)
+          throw error
+        }
+      },
+      rootTaskStore: {
+        ...productionRootTaskStore,
+        async ensure(input) {
+          const boundary = emptyAnalystRuntimeDiagnostics.rootEnsure
+          boundary.calls += 1
+          boundary.outcome = "started"
+          try {
+            const root = await productionRootTaskStore.ensure(input)
+            boundary.outcome = "passed"
+            boundary.returnedStatus = diagnosticEnum(root.status, TASK_DIAGNOSTIC_STATUSES) ?? "other"
+            return root
+          } catch (error: unknown) {
+            boundary.outcome = "failed"
+            boundary.errorClass = safeFailurePreflightErrorClass(error)
+            boundary.errorCode = emptyAnalystErrorCode(error)
+            throw error
+          }
+        },
+      },
       modelRuntimeFactory: () => {
+        emptyAnalystRuntimeDiagnostics.modelFactoryCalls += 1
         const execution = ++rootExecution
         let round = 0
         const adapter: ModelAdapter = {
           id: "p3-multi-scout-union-root-fixture", profile,
           async *stream(request) {
+            emptyAnalystRuntimeDiagnostics.adapterStreamCalls += 1
             round += 1
             if (scenario === "empty Analyst proof") {
               rootResumeExecution = diagnosticBoundedCount(execution)
@@ -14662,8 +14877,61 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         return adapter
       },
     })
+    const observedTurnQueueFactory: TurnQueueFactory = queueOptions => {
+      const execute = queueOptions.execute
+      const waitHandoff = queueOptions.waitHandoff
+      return turnQueueModule.createTurnQueue({
+        ...queueOptions,
+        execute: async input => {
+          const diagnostics = emptyAnalystRuntimeDiagnostics
+          diagnostics.executeCalls += 1
+          const ordinal = diagnostics.executeCalls
+          const observation: EmptyAnalystExecutionObservation = {
+            ordinal,
+            phase: ordinal === 1 ? "initial" : ordinal === 2 ? "resume" : ordinal <= 4 ? "retry" : "extra",
+            outcome: "started", resultStatus: "none", waitIdPresent: false, errorClass: "none", errorCode: "none",
+          }
+          const retained = diagnostics.executions.length < 4
+          if (retained) diagnostics.executions.push(observation)
+          try {
+            const result = await execute(input)
+            if (retained) {
+              const fields = record(result)
+              observation.outcome = "returned"
+              observation.resultStatus = diagnosticEnum(fields?.status, EMPTY_ANALYST_EXECUTION_STATUSES) ?? "other"
+              observation.waitIdPresent = typeof fields?.waitId === "string"
+              observation.errorCode = typeof fields?.summary === "string"
+                ? diagnosticErrorCode(fields.summary) ?? "other" : "none"
+            }
+            return result
+          } catch (error: unknown) {
+            if (retained) {
+              observation.outcome = "threw"
+              observation.errorClass = safeFailurePreflightErrorClass(error)
+              observation.errorCode = emptyAnalystErrorCode(error)
+            }
+            throw error
+          }
+        },
+        ...(waitHandoff ? { waitHandoff: async input => {
+          const boundary = emptyAnalystRuntimeDiagnostics.waitHandoff
+          boundary.calls += 1
+          boundary.outcome = "started"
+          try {
+            const result = await waitHandoff(input)
+            boundary.outcome = "passed"
+            return result
+          } catch (error: unknown) {
+            boundary.outcome = "failed"
+            boundary.errorClass = safeFailurePreflightErrorClass(error)
+            boundary.errorCode = emptyAnalystErrorCode(error)
+            throw error
+          }
+        } } : {}),
+      })
+    }
     bootstrap = await workerQueue.createProductionWorkerBootstrap({
-      pool: pool!, runtime, ownerId: value.ownerId, turnQueueFactory: turnQueueModule.createTurnQueue,
+      pool: pool!, runtime, ownerId: value.ownerId, turnQueueFactory: observedTurnQueueFactory,
       turnRecoveryIntervalMs: 100,
       waitResolver: { intervalMs: 10, batchSize: 10, ownerId: `p3-scout-union-resolver-${value.suffix}` },
       subagents: {
@@ -14842,6 +15110,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       try {
         const state = await pool!.query<{
           turnStatus: string | null; turnError: string | null; finalResponsePresent: boolean | null
+          turnLeaseOwnerPresent: boolean | null
           rootStatus: string | null; rootFailureReason: string | null; analystStatus: string | null
           analystFailureReason: string | null; reportStatus: string | null; reportReason: string | null
           waitStatus: string | null; waitResolved: boolean | null; waitConsumed: boolean | null
@@ -14849,6 +15118,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           completedEventCount: number | null; latestRootStepStatus: string | null
           rootStepCount: number | null; finalItemCount: number | null
         }>(`SELECT turn."status" AS "turnStatus", turn."error" AS "turnError",
+              turn."leaseOwnerId" IS NOT NULL AS "turnLeaseOwnerPresent",
               turn."finalResponse" IS NOT NULL AS "finalResponsePresent",
               root."status" AS "rootStatus", root."failureReason" AS "rootFailureReason",
               analyst."status" AS "analystStatus", analyst."failureReason" AS "analystFailureReason",
@@ -14882,6 +15152,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         emptyAnalystResumeSnapshot = {
           available: Boolean(row),
           turnStatus: diagnosticEnum(row?.turnStatus, TURN_DIAGNOSTIC_STATUSES) ?? "missing_or_other",
+          turnLeaseOwnerPresent: row?.turnLeaseOwnerPresent === true,
           turnErrorClass: row?.turnError ? diagnosticErrorClass(row.turnError) ?? "other" : "none",
           finalResponsePresent: row?.finalResponsePresent === true,
           rootStatus: diagnosticEnum(row?.rootStatus, TASK_DIAGNOSTIC_STATUSES) ?? "missing_or_other",
@@ -14905,12 +15176,17 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         emptyAnalystResumeSnapshot = { available: false }
       }
     }
+    const emptyAnalystRuntimeProjection = scenario === "empty Analyst proof" && finalWaitReport === null
+      ? emptyAnalystRootResumeDiagnosticProjection({ runtime: emptyAnalystRuntimeDiagnostics, persisted: emptyAnalystResumeSnapshot })
+      : null
     const emptyAnalystFailureDiagnostic = scenario === "empty Analyst proof" && finalWaitReport === null
       ? JSON.stringify({
         rootResumeStage: diagnosticEnum(rootResumeStage, EMPTY_ANALYST_ROOT_RESUME_STAGES) ?? "other",
         rootResumeExecution: diagnosticBoundedCount(rootResumeExecution),
         rootResumeRound: diagnosticBoundedCount(rootResumeRound),
         finalWaitReportPresent: finalWaitReport !== null,
+        rootExecute: emptyAnalystRuntimeProjection?.runtime,
+        turnReleaseObservation: emptyAnalystRuntimeProjection?.persisted,
         persisted: emptyAnalystResumeSnapshot,
       })
       : undefined
