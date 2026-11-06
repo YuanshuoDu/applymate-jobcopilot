@@ -459,7 +459,7 @@ async function runChildWaitLoop(lease, restored, responseForStep, hooks = {}) {
   const options = turnExecutionOptions(lease, owner, async input => {
     executorCalls += 1
     if (hooks.beforeReplayExecution) await hooks.beforeReplayExecution(input)
-    if (input.call.name === "fixture_noop") return { id: input.call.id, toolName: input.call.name,
+    if (input.call.toolName === "fixture_noop") return { id: input.call.id, toolName: input.call.toolName,
       toolVersion: "1", status: "completed", output: { accepted: true }, errorCode: null }
     const secondWaitCallId = `fixture-second-source-wait:${lease.id}:attempt:${lease.attemptCount}`
     if (ids.secondTargetTaskId && input.call.id === secondWaitCallId
@@ -467,7 +467,7 @@ async function runChildWaitLoop(lease, restored, responseForStep, hooks = {}) {
       const wait = await registerDurableSubagentWait(pool, { lease, stepId: input.stepId, targetTaskIds: [ids.secondTargetTaskId],
         mode: "any", timeoutMs: 30_000, idempotencyKey: `api_key=source-wait-secret-${lease.id}-attempt-${lease.attemptCount}-second`, now: new Date() })
       say(`WORKER_B_LOOP_SECOND_SOURCE_REGISTERED ${JSON.stringify({ waitId: wait.waitId, stepId: input.stepId, callId: input.call.id })}`)
-      return { id: input.call.id, toolName: input.call.name, toolVersion: "1", status: "completed", output: wait, errorCode: null }
+      return { id: input.call.id, toolName: input.call.toolName, toolVersion: "1", status: "completed", output: wait, errorCode: null }
     }
     const result = replay.execute(input)
     if (!result) {

@@ -165,9 +165,9 @@ export async function readChildWaitTerminalCallProjections(client: pg.PoolClient
     if (!resultPair || !isCanonicalWaitResultPair(terminal, resultPair.started, resultPair.completed, resultId, claimStepId, resultContent)) continue
     const { started: resultStarted, completed: resultCompleted, extra: nextEvent } = resultPair
     if (typeof resultStarted.id !== "string" || typeof resultCompleted.id !== "string") continue
-    const stepToolChainProof = await readCanonicalWaitStepToolChain(client, { id, sessionId, turnId },
+    const stepToolChain = await readCanonicalWaitStepToolChain(client, { id, sessionId, turnId },
       { stepId: claimStepId, attempt: claimAttempt, callItemId: claimCallItemId, callId: claimId, resultItemId: resultId })
-    if (!stepToolChainProof || typeof nextEvent?.id !== "string" || nextEvent.id !== stepToolChainProof.nextEventId) continue
+    if (!stepToolChain || typeof nextEvent?.id !== "string" || nextEvent.id !== stepToolChain.nextEventId) continue
     const claimProjection = waitCallProjection(claim.startEventId, claimId, claimCallItemId, claimStepId, claimAttempt,
       { ...binding, claimKeyDigest })
     if (claimProjection) {
@@ -175,7 +175,7 @@ export async function readChildWaitTerminalCallProjections(client: pg.PoolClient
       if (previousSource && previousSource !== sourceProjection.startEventId) ambiguousClaims.add(claimProjection.startEventId)
       claimSources.set(claimProjection.startEventId, sourceProjection.startEventId)
       projections.push({ ...claimProjection, sourceStepPrefix, resultItemId: resultId, resultStartedEventId: resultStarted.id,
-        resultCompletedEventId: resultCompleted.id, stepCompletedEventId: stepToolChainProof.stepCompletedEventId, stepToolChainProof })
+        resultCompletedEventId: resultCompleted.id, stepCompletedEventId: stepToolChain.stepCompletedEventId, stepToolChain })
     }
   }
   return projections.filter(projection => !projection.resultItemId || !ambiguousClaims.has(projection.startEventId))

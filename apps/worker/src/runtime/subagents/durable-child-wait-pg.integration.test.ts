@@ -82,7 +82,8 @@ const CHANGE_RESULT_COMPLETE_SQL = `UPDATE "agent_events" SET "correlationId" = 
         "payload" = jsonb_set("payload", '{itemId}', to_jsonb($1::text), false)
         WHERE "sessionId" = $3 AND "turnId" = $4 AND "taskId" = $5 AND "itemId" = $1
           AND "type" = 'item.completed' AND "idempotencyKey" = $6 RETURNING "id"`
-const WORKER_F_UNSETTLED_STARTS_SQL = `SELECT started."id", started."turnId", started."type", started."correlationId"
+const WORKER_F_UNSETTLED_STARTS_SQL = `SELECT started."id", started."turnId", started."type", started."correlationId",
+         ($11::text IS NOT NULL) AS "sourceProjectionBound", ($12::text IS NOT NULL) AS "projectedSourceProjectionBound"
        FROM "agent_events" AS started
        WHERE started."sessionId" = $1 AND started."taskId" = $2
          AND started."type" IN ('tool_call.started', 'model.started')
@@ -95,19 +96,25 @@ const WORKER_F_UNSETTLED_STARTS_SQL = `SELECT started."id", started."turnId", st
                    AND ${CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL})
                OR (started."type" = 'model.started' AND settled."type" IN ('model.completed', 'model.failed')))
          )
+         AND ($9::text IS NULL OR started."id" <> $9)
+         AND NOT (started."type" = 'model.started' AND $10::text IS NOT NULL AND started."actor" = 'subagent'
+           AND started."itemId" IS NULL AND started."turnId" = $3 AND started."correlationId" = $10
+           AND started."idempotencyKey" = 'task:' || $2 || ':event:model-started:' || $10
+           AND started."payload" = jsonb_build_object('taskId', $2, 'provider', started."payload"->>'provider', 'model', started."payload"->>'model')
+           AND jsonb_typeof(started."payload"->'provider') = 'string' AND jsonb_typeof(started."payload"->'model') = 'string')
        ORDER BY started."sequence" DESC LIMIT 17`
-const WORKER_F_UNSETTLED_STARTS_DIAGNOSTIC_SQL = WORKER_F_UNSETTLED_STARTS_SQL.replace(
-  /\$13::jsonb/g, `jsonb_build_array(jsonb_build_object('startEventId', started."id", 'rawCallId', $3::text,
-    'projectedCallId', $4::text, 'callItemId', $5::text, 'stepId', $6::text, 'attempt', $7::integer))`,
-)
-const WORKER_F_SAME_CALL_ID_TERMINAL_PROOF_SQL = `SELECT ${CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL.replace(
-  /\$13::jsonb/g, `jsonb_build_array(jsonb_build_object('startEventId', $14::text, 'rawCallId', $9::text,
-    'projectedCallId', $10::text, 'callItemId', $11::text, 'stepId', $12::text, 'attempt', $13::integer))`,
-)} AS "settled" FROM "agent_events" AS started
+const WORKER_F_UNSETTLED_STARTS_DIAGNOSTIC_SQL = WORKER_F_UNSETTLED_STARTS_SQL
+const WORKER_F_SAME_CALL_ID_TERMINAL_PROOF_SQL = `SELECT ${CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL} AS "settled" FROM "agent_events" AS started
 JOIN "agent_events" AS settled ON settled."sessionId" = started."sessionId" AND settled."turnId" = started."turnId"
   AND settled."taskId" = started."taskId" AND settled."correlationId" = started."correlationId"
 WHERE $1::text IS NOT NULL AND $2::text IS NOT NULL AND $3::text IS NOT NULL AND $4::text IS NOT NULL
   AND $5::text IS NOT NULL AND $6::integer IS NOT NULL AND $7::timestamptz IS NOT NULL AND $8::text IS NOT NULL
+  AND $9::text IS NOT NULL AND $10::text IS NOT NULL AND $11::text IS NOT NULL AND $12::text IS NOT NULL
+  AND jsonb_typeof($13::jsonb) = 'array'
+  AND EXISTS (SELECT 1 FROM jsonb_array_elements($13::jsonb) AS proof(value)
+    WHERE proof.value->>'startEventId' = $14::text AND proof.value->>'rawCallId' = $9::text
+      AND proof.value->>'projectedCallId' = $10::text AND proof.value->>'callItemId' = $11::text
+      AND proof.value->>'stepId' = $12::text)
   AND started."id" = $14 AND settled."id" = $15`
 
 function safeProjectedWaitKey(input: { taskIds: readonly string[]; mode: "any" | "all"; timeoutMs: number; idempotencyKey: string }): string {
@@ -150,7 +157,7 @@ describe("worker restart blocker proof diagnostic bindings", () => {
     expectSqlBindings(CHANGE_RESULT_COMPLETE_SQL, 6)
   })
   it("binds the bounded unsettled-start diagnostic to the exact task scope", () => {
-    expectSqlBindings(WORKER_F_UNSETTLED_STARTS_DIAGNOSTIC_SQL, 8)
+    expectSqlBindings(WORKER_F_UNSETTLED_STARTS_DIAGNOSTIC_SQL, 13)
   })
   it("binds the same-call-ID source item/step/attempt terminal canary without gaps", () => {
     expectSqlBindings(WORKER_F_SAME_CALL_ID_TERMINAL_PROOF_SQL, 15)
@@ -560,10 +567,12 @@ async function diagnoseWorkerFStartCandidates(
   sourceCallId: string, claimCallId: string, blocker: boolean,
 ): Promise<Record<string, unknown>> {
   const sourceProjection = await readChildWaitSourceCallProjection(client, task as unknown as Record<string, unknown>, continuationStepId)
-  const starts = await client.query<{ id: string; turnId: string; type: string; correlationId: string }>(
-    WORKER_F_UNSETTLED_STARTS_DIAGNOSTIC_SQL, [task.sessionId, task.id, sourceProjection?.rawCallId ?? null,
-      sourceProjection?.projectedCallId ?? null, sourceProjection?.callItemId ?? null, sourceProjection?.sourceStepId ?? null,
-      sourceProjection?.sourceAttempt ?? null],
+  const terminalCallProjections = await readChildWaitTerminalCallProjections(client, task as unknown as Record<string, unknown>)
+  const starts = await client.query<{ id: string; turnId: string; type: string; correlationId: string;
+    sourceProjectionBound: boolean; projectedSourceProjectionBound: boolean }>(
+    WORKER_F_UNSETTLED_STARTS_DIAGNOSTIC_SQL, [task.sessionId, task.id, task.turnId, task.rootTaskId,
+      task.leaseOwner, task.attemptCount, task.leaseExpiresAt, task.userId, null, continuationStepId,
+      sourceProjection?.rawCallId ?? null, sourceProjection?.projectedCallId ?? null, JSON.stringify(terminalCallProjections)],
   )
   const classified = []
   for (const [index, start] of starts.rows.slice(0, 16).entries()) {
@@ -573,7 +582,9 @@ async function diagnoseWorkerFStartCandidates(
       : start.correlationId === claimCallId ? "continuation_claim"
         : start.correlationId === continuationStepId ? "continuation_model" : "other"
     classified.push({ candidateOrdinal: index + 1, lane, kind: start.type === "tool_call.started" ? "tool_call" : "model_call",
-      sameTurn: start.turnId === task.turnId, blockedWhenOmitted, isSoleBlocker: blocker && !blockedWhenOmitted })
+      sameTurn: start.turnId === task.turnId,
+      sourceProjectionBound: start.sourceProjectionBound && start.projectedSourceProjectionBound,
+      blockedWhenOmitted, isSoleBlocker: blocker && !blockedWhenOmitted })
   }
   return { examinedStartCount: classified.length, unsettledStartCandidateCount: starts.rows.length,
     unsettledStartCandidatesTruncated: starts.rows.length > 16, starts: classified }
@@ -1493,15 +1504,6 @@ async function expectCompletedClaimBeforeItemEventSafety(
     if (!exactSourceProjection) throw new Error("source_call_projection_missing_for_same_id_decoy")
     expect(exactSourceProjection).toMatchObject({ rawCallId: PHONE_SHAPED_WAIT_TOOL_CALL_ID,
       callItemId: sourceCallItemId, sourceStepId, sourceAttempt: 1 })
-    const evaluateTerminalProof = async (startedId: string, settledId: string): Promise<boolean> => {
-      const proof = await client.query<{ settled: boolean }>(
-        WORKER_F_SAME_CALL_ID_TERMINAL_PROOF_SQL,
-        [task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount, task.leaseExpiresAt,
-          task.userId, exactSourceProjection.rawCallId, exactSourceProjection.projectedCallId, exactSourceProjection.callItemId,
-          exactSourceProjection.sourceStepId, exactSourceProjection.sourceAttempt, startedId, settledId],
-      )
-      return proof.rows[0]?.settled === true
-    }
     const exactSourceStart = await client.query<{ id: string }>(
       `SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
          AND "itemId" = $4 AND "type" = 'tool_call.started' AND "correlationId" = $5 LIMIT 2`,
@@ -1515,6 +1517,28 @@ async function expectCompletedClaimBeforeItemEventSafety(
     )
     expect(exactSourceStart.rows).toHaveLength(1)
     expect(exactSourceTerminal.rows).toHaveLength(1)
+    const sourceProofs = (await readChildWaitTerminalCallProjections(client, task as unknown as Record<string, unknown>))
+      .filter(projection => projection.startEventId === exactSourceStart.rows[0]!.id
+        && projection.rawCallId === exactSourceProjection.rawCallId
+        && projection.projectedCallId === exactSourceProjection.projectedCallId
+        && projection.callItemId === exactSourceProjection.callItemId
+        && projection.stepId === exactSourceProjection.sourceStepId
+        && projection.attempt === exactSourceProjection.sourceAttempt)
+    expect(sourceProofs, "the production projection must bind one complete source-wait proof to its exact item, step, and attempt").toHaveLength(1)
+    const exactSourceProof = sourceProofs[0]!
+    expect(exactSourceProof.sourceWait).toMatchObject({ sourceStepId: exactSourceProjection.sourceStepId,
+      sourceAttempt: exactSourceProjection.sourceAttempt, sourceCallItemId: exactSourceProjection.callItemId,
+      sourceCallId: exactSourceProjection.rawCallId, projectedSourceCallId: exactSourceProjection.projectedCallId })
+    expect(exactSourceProof.sourceStepPrefix).toBeDefined()
+    const evaluateTerminalProof = async (startedId: string, settledId: string): Promise<boolean> => {
+      const proof = await client.query<{ settled: boolean }>(
+        WORKER_F_SAME_CALL_ID_TERMINAL_PROOF_SQL,
+        [task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount, task.leaseExpiresAt,
+          task.userId, exactSourceProjection.rawCallId, exactSourceProjection.projectedCallId, exactSourceProjection.callItemId,
+          exactSourceProjection.sourceStepId, JSON.stringify([exactSourceProof]), startedId, settledId],
+      )
+      return proof.rows[0]?.settled === true
+    }
     expect(await evaluateTerminalProof(exactSourceStart.rows[0]!.id, exactSourceTerminal.rows[0]!.id),
       "the server-selected source item, step and attempt must retain its valid completion proof").toBe(true)
 

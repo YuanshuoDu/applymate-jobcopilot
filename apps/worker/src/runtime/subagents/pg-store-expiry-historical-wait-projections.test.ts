@@ -85,7 +85,13 @@ beforeEach(() => {
       resultItemId: `source-result:${String(row?.sourceCallId).replace("source-call-", "")}` }
   })
   mocks.chain.mockImplementation(async (_client, _scope, input: { stepId: string }) => ({
-    stepId: input.stepId, stepCompletedEventId: `step-done:${input.stepId}`, nextEventId: `step-done:${input.stepId}`,
+    stepId: input.stepId, attempt: task.attemptCount, waitCallItemId: `claim-item:${input.stepId}`, waitCallId: `claim-call:${input.stepId}`,
+    waitResultItemId: `claim-result:${input.stepId}`, stepStartedEventId: `step-start:${input.stepId}`, stepStartedPayload: {},
+    agendaEventId: `agenda:${input.stepId}`, agendaReceipt: {}, modelStartedEventId: `model-start:${input.stepId}`,
+    modelCompletedEventId: `model-done:${input.stepId}`, modelUsageEventId: `model-usage:${input.stepId}`,
+    stepCompletedEventId: `step-done:${input.stepId}`, nextEventId: `step-done:${input.stepId}`,
+    events: [{ id: `step-start:${input.stepId}`, sequence: "1", type: "step.started" }],
+    calls: [{ callItemId: `claim-item:${input.stepId}`, resultItemId: `claim-result:${input.stepId}` }],
   }))
   mocks.prefix.mockImplementation(async (_client: unknown, _scope: unknown, input: { stepId: string; attempt: number;
     callItemId: string; callId: string; resultItemId: string; waitKind: string }) => ({
@@ -105,6 +111,11 @@ describe("bounded historical wait projections", () => {
       ["wait-1", "task:owner:item:tool-call:claim-call-1:attempt:3", true],
       ["wait-2", "task:owner:item:tool-call:claim-call-2:attempt:3", true],
     ])
+    expect(completed[0]?.stepToolChain).toEqual(expect.objectContaining({
+      nextEventId: expect.any(String), events: expect.any(Array), calls: expect.any(Array),
+    }))
+    expect(completed[0]).not.toHaveProperty("stepToolChainProof")
+    expect(JSON.parse(JSON.stringify(completed[0]))).toHaveProperty("stepToolChain.nextEventId")
     expect(projections.filter(row => !row.resultItemId).map(row => row.sourceWait.waitId)).toEqual(["wait-1", "wait-2"])
     expect(completed.every(row => row.sourceStepPrefix?.waitKind === "recovered")).toBe(true)
     expect(mocks.prefix).toHaveBeenCalledTimes(2)

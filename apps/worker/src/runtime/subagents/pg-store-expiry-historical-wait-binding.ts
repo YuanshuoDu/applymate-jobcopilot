@@ -33,7 +33,7 @@ export type TerminalCallProjection = Readonly<{
   resultStartedEventId?: string
   resultCompletedEventId?: string
   stepCompletedEventId?: string
-  stepToolChainProof?: unknown
+  stepToolChain?: unknown
 }>
 
 const objectHasExactKeyCount = (expression: string, count: number) => `(CASE WHEN jsonb_typeof(${expression}) = 'object'
