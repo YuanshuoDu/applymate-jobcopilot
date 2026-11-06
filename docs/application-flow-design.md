@@ -107,9 +107,12 @@ Agent 维护范围内单独处理。
 职位关联、材料确认或审核修正结果待核实时，先复制未保存的编辑，再重新加载并核对；
 页面会阻止相关重复操作。一次读取不能证明仍在处理的写入没有发生，页面内保护也不跨
 标签页或重载。切换简历后如读取失败，重试并确认所选版本，旧内容不会被作为新简历使用。
-材料审核请求结果未知时，不能凭刷新后看到的一次旧通过状态断定新请求已经结束；
-先核对最新审核记录及材料，避免重复启动审核。服务器下载会独立校验当前审核和材料，
-但现有接口不能证明此前在途审核不会晚到，跨刷新和跨页面的审核顺序仍需后续改进。
+审核请求在服务器登记后，其他页面会看到“审核进行中或结果未知”，下载和打印会等待
+当前审核结果；用户主动启动新审核会替换此前审核，旧请求晚到不能发布结果。
+刷新可读取状态；如本地请求结果未知，单次读取不能证明它尚未到达服务器，仍应先核对再决定是否重新审核。
+旧审核缺少职位与材料内容依据，升级后需重新检查一次；职位内容、材料内容或模板变化后也需重新检查。
+这些保证从服务器登记提交后开始，混用旧版服务的部署及生产数据库权限尚未验证。
+审核结果目前不会随来源简历或职业资料事实的后续变化自动失效；如修改了依据，请重新检查。
 草稿恢复到最新简历后，只有原来进入编辑器时存在可信的职位与返回列表上下文，才会
 恢复该职位和筛选条件；否则不会从当前其他账号的地址猜测关联。
 查看、返回或刷新简历不会自动启动 AI 分析；需要时请点击“分析匹配度”。
@@ -211,11 +214,17 @@ application-pack download also requires the server to verify the signed audit
 receipt and the exact selected document versions. Missing or malformed revision
 information does not establish readiness.
 
-The in-page recheck guard does not establish a durable terminal state for an audit
-request after reload or across pages. A single read of an older passing record
-cannot prove an earlier request has stopped. The server separately validates the
-latest receipt and materials at download, but cannot establish that an in-flight
-audit will not write later; durable audit ordering remains follow-up work.
+Once the server commits a review registration, other pages see its pending or
+failed state and download/print cannot reuse an older pass. An explicitly started
+new review supersedes the previous operation; an older completion cannot publish.
+A local request with an unknown outcome may not yet have reached the server, so
+a single read does not prove that request has stopped. Older receipts lack job
+and material-content bases and require one new review; changes to job details,
+materials or their templates require a
+current check. Mixed-version rollout and production database permissions have not
+been verified. Ordinary material writers do not all share the correction lock. A
+later change to the source resume or confirmed Persona does not automatically
+invalidate the receipt; run a new review when the underlying evidence changes.
 
 An absent optional letter is distinct from a selected letter still loading.
 Confirming the same selected letter omits a redundant assignment, because that

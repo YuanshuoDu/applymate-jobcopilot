@@ -1,8 +1,7 @@
 import type { NextRequest } from 'next/server'
-import { db } from '@/lib/db'
 import { requireAuth, isErrorResponse, err } from '@/lib/api-helpers'
-import { AUDIT_ACTIVITY_PREFIX, parseStoredApplicationAudit } from '@/lib/application-audit'
-import { verifyApplicationAuditReceipt } from '@/lib/application-audit-receipt'
+import { auditJobBasisHash, auditMaterialBasisHash, readAuditOperation } from '@/lib/application-audit-operation'
+import { AuditMaterialBusyError, lockApplicationAuditMaterials, withApplicationAuditLock } from '@/lib/application-audit-transaction'
 import { hasCurrentApplicationPackAudit, renderApplicationPack } from '@/lib/application-pack'
 import { renderApplicationPackPrintHtml } from '@/lib/application-pack-print'
 import { UnsupportedPdfTextError } from '@/lib/pdf-text-support'
@@ -18,27 +17,34 @@ async function loadAuditedPack(req: NextRequest, { params }: Params) {
   const auth = await requireAuth(req)
   if (isErrorResponse(auth)) return auth
   const { id: jobId } = await params
-  const job = await db.job.findFirst({ where: { id: jobId, userId: auth.userId } })
-  if (!job) return err('Job not found.', 404)
-  if (!job.finalResumeId) return err('Select and audit a final resume before downloading.', 409)
-
-  const [resume, coverLetter, activity] = await Promise.all([
-    db.resume.findFirst({ where: { id: job.finalResumeId, userId: auth.userId } }),
-    job.finalCoverLetterId
-      ? db.coverLetter.findFirst({ where: { id: job.finalCoverLetterId, jobId, userId: auth.userId } })
-      : Promise.resolve(null),
-    db.activity.findFirst({
-      where: { userId: auth.userId, jobId, text: { startsWith: AUDIT_ACTIVITY_PREFIX } },
-      orderBy: { createdAt: 'desc' }, select: { text: true },
-    }),
-  ])
-  if (!resume || (job.finalCoverLetterId && !coverLetter)) return err('Final application documents could not be found.', 404)
-  const audit = parseStoredApplicationAudit(activity?.text ?? '')
-  if (!verifyApplicationAuditReceipt({ userId: auth.userId, jobId }, audit)
-    || !hasCurrentApplicationPackAudit(audit, job, resume, coverLetter)) {
-    return err('The selected document versions must pass a factual audit before downloading or printing. Recheck the audit after editing or if an older audit is no longer trusted.', 409)
+  const scope = { userId: auth.userId, jobId }
+  try {
+    const snapshot = await withApplicationAuditLock(scope, async tx => {
+      const job = await tx.job.findFirst({ where: { id: jobId, userId: auth.userId } })
+      if (!job) return err('Job not found.', 404)
+      if (!job.finalResumeId) return err('Select and audit a final resume before downloading.', 409)
+      if (!await lockApplicationAuditMaterials(tx, scope, job.finalResumeId, job.finalCoverLetterId)) {
+        return err('Final application documents could not be found.', 404)
+      }
+      const resume = await tx.resume.findFirst({ where: { id: job.finalResumeId, userId: auth.userId } })
+      const coverLetter = job.finalCoverLetterId
+        ? await tx.coverLetter.findFirst({ where: { id: job.finalCoverLetterId, jobId, userId: auth.userId } })
+        : null
+      if (!resume || (job.finalCoverLetterId && !coverLetter)) return err('Final application documents could not be found.', 404)
+      const operation = await readAuditOperation(tx, scope)
+      const audit = operation.kind === 'completed' && operation.jobBasisHash === auditJobBasisHash(job)
+        && operation.materialBasisHash === auditMaterialBasisHash(resume, coverLetter) ? operation.audit : null
+      if (!hasCurrentApplicationPackAudit(audit, job, resume, coverLetter)) {
+        return err('The selected document versions must pass a factual audit before downloading or printing. Recheck the audit after editing or if an older audit is no longer trusted.', 409)
+      }
+      return { job, resume: resume as unknown as Resume, coverLetter: coverLetter as unknown as CoverLetter | null, audit }
+    })
+    return snapshot ?? err('Job not found.', 404)
+  } catch (error) {
+    return error instanceof AuditMaterialBusyError
+      ? err('The application materials are being changed. Refresh before downloading or printing.', 409)
+      : err('Could not verify the application materials. Please refresh and try again.', 503)
   }
-  return { job, resume: resume as unknown as Resume, coverLetter: coverLetter as unknown as CoverLetter | null, audit }
 }
 
 export async function POST(req: NextRequest, params: Params) {

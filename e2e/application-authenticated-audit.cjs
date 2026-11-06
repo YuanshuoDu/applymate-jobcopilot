@@ -33,27 +33,37 @@ async function seedSyntheticAudit(jobId, resumeId) {
     throw new Error('Unexpected state before synthetic audit')
   }
   const audit = { verdict: 'pass', summary: 'Synthetic fixture audit; no AI auditor was run.', findings: [{ area: 'resume', severity: 'pass', title: 'Synthetic fixture', evidence: 'Test data only', action: 'No action' }], source: 'previous_version', auditedAt: new Date().toISOString(), matchScore: 80 }
-  // Run the production signer and verifier in a separate process: tsx reads the
-  // web tsconfig there without changing Playwright's module resolution globally.
+  // Seed a signed, job-bound synthetic control record through the same short
+  // transaction helpers. This is fixture data, not a real AI audit.
   const script = `
     const path = require('node:path')
     const { createRequire } = require('node:module')
     const web = createRequire(path.resolve('apps/web/package.json'))
     web('tsx/cjs/api').register()
-    const { signedAuditActivityText, verifyApplicationAuditReceipt } = require(path.resolve('apps/web/src/lib/application-audit-receipt.ts'))
-    const { parseStoredApplicationAudit } = require(path.resolve('apps/web/src/lib/application-audit.ts'))
+    const { withApplicationAuditLock } = require(path.resolve('apps/web/src/lib/application-audit-transaction.ts'))
+    const { registerAuditOperation, completeAuditOperation, readAuditOperation, auditJobBasisHash } = require(path.resolve('apps/web/src/lib/application-audit-operation.ts'))
+    const { db } = require(path.resolve('apps/web/src/lib/db.ts'))
     const input = JSON.parse(require('node:fs').readFileSync(0, 'utf8'))
-    const text = signedAuditActivityText(input.scope, input.resumeId, null, input.audit, { resumeUpdatedAt: input.resumeUpdatedAt })
-    const parsed = parseStoredApplicationAudit(text)
-    if (!verifyApplicationAuditReceipt(input.scope, parsed) || verifyApplicationAuditReceipt({ ...input.scope, jobId: 'other-job' }, parsed)) throw new Error('Fixture audit receipt verification failed')
-    process.stdout.write(text)
+    ;(async () => {
+      const result = await withApplicationAuditLock(input.scope, async tx => {
+        const job = await tx.job.findFirst({ where: { id: input.scope.jobId, userId: input.scope.userId } })
+        const resume = await tx.resume.findFirst({ where: { id: input.resumeId, userId: input.scope.userId } })
+        if (!job || !resume || resume.updatedAt.toISOString() !== input.resumeUpdatedAt || job.role !== input.jobBasis.role || job.company !== input.jobBasis.company || job.description !== input.jobBasis.description) throw new Error('Fixture material changed')
+        const operationId = await registerAuditOperation(tx, input.scope)
+        if (!await completeAuditOperation(tx, input.scope, operationId, { resumeId: input.resumeId, coverLetterId: null, audit: input.audit, jobBasis: input.jobBasis, materialBasis: { resume, coverLetter: null }, versions: { resumeUpdatedAt: input.resumeUpdatedAt } })) throw new Error('Fixture audit could not be recorded')
+        const current = await readAuditOperation(tx, input.scope)
+        if (current.kind !== 'completed' || current.jobBasisHash !== auditJobBasisHash(input.jobBasis)) throw new Error('Fixture audit verification failed')
+        return true
+      })
+      if (!result) throw new Error('Fixture job not found')
+      await db.$disconnect()
+    })().catch(async error => { await db.$disconnect(); console.error(error); process.exitCode = 1 })
   `
-  const text = execFileSync(process.execPath, ['-e', script], {
-    input: JSON.stringify({ scope: { userId: user.id, jobId }, resumeId, audit, resumeUpdatedAt: resume.updatedAt.toISOString() }),
+  execFileSync(process.execPath, ['-e', script], {
+    input: JSON.stringify({ scope: { userId: user.id, jobId }, resumeId, audit, resumeUpdatedAt: resume.updatedAt.toISOString(), jobBasis: { role: job.role, company: job.company, description: job.description } }),
     encoding: 'utf8', timeout: 30_000,
     env: { ...process.env, TSX_TSCONFIG_PATH: path.resolve('apps/web/tsconfig.json') },
   })
-  await db.activity.create({ data: { userId: user.id, jobId, type: 'agent_action', color: '#059669', text } })
 }
 
 async function assertManualState(jobId, resumeId, expectedStatus) {

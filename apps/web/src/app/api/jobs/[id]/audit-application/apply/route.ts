@@ -3,8 +3,9 @@ import { db } from '@/lib/db'
 import { prepareAiRoute, requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { modelChat, parseAiJson } from '@/lib/model-router'
 import { buildPersona } from '@/lib/persona'
-import { AUDIT_ACTIVITY_PREFIX, parseStoredApplicationAudit, sanitizeProposedValue, targetForAuditFinding } from '@/lib/application-audit'
-import { signedAuditActivityText, verifyApplicationAuditReceipt } from '@/lib/application-audit-receipt'
+import { sanitizeProposedValue, targetForAuditFinding } from '@/lib/application-audit'
+import { auditJobBasisHash, auditMaterialBasisHash, completeAuditOperation, readAuditOperation, registerAuditOperation } from '@/lib/application-audit-operation'
+import { AuditMaterialBusyError, lockApplicationAuditMaterials, withApplicationAuditLock } from '@/lib/application-audit-transaction'
 import type { ApplicationAudit, ApplicationAuditFinding, ResumeContent } from '@/lib/types'
 
 type Params = { params: Promise<{ id: string }> }
@@ -79,12 +80,13 @@ export async function POST(req: NextRequest, { params }: Params) {
   const findingIndex = Number.isInteger(body?.findingIndex) ? body.findingIndex as number : -1
   if (!resumeId || findingIndex < 0) return err('resumeId and findingIndex are required')
 
-  const activity = await db.activity.findFirst({
-    where: { userId: auth.userId, jobId, text: { startsWith: AUDIT_ACTIVITY_PREFIX } },
-    orderBy: { createdAt: 'desc' }, select: { text: true },
-  })
-  const stored = parseStoredApplicationAudit(activity?.text ?? '')
-  if (!verifyApplicationAuditReceipt({ userId: auth.userId, jobId }, stored) || stored.resumeId !== resumeId) {
+  const scope = { userId: auth.userId, jobId }
+  let original: Awaited<ReturnType<typeof readAuditOperation>> | null
+  try { original = await withApplicationAuditLock(scope, tx => readAuditOperation(tx, scope)) }
+  catch { return err('The review status could not be read. Refresh before applying a correction.', 503) }
+  if (!original) return err('Job not found', 404)
+  const stored = original.kind === 'completed' ? original.audit : null
+  if (!stored || stored.resumeId !== resumeId) {
     return err('Run the independent audit again before applying a correction.', 409)
   }
   const requestedCoverLetterId = body?.coverLetterId === undefined ? stored.coverLetterId : body.coverLetterId
@@ -102,6 +104,7 @@ export async function POST(req: NextRequest, { params }: Params) {
   ])
   if (!job) return err('Job not found', 404)
   if (!resume) return err('Resume not found', 404)
+  if (original.kind !== 'completed' || original.jobBasisHash !== auditJobBasisHash(job)) return err('The job changed or the audit is too old. Run the audit again.', 409)
   if (!sameVersion(stored.resumeUpdatedAt, resume.updatedAt)) return err('The resume changed after this audit. Run the audit again.', 409)
 
   const coverLetter = stored.coverLetterId
@@ -109,6 +112,7 @@ export async function POST(req: NextRequest, { params }: Params) {
     : null
   if (stored.coverLetterId && !coverLetter) return err('The audited cover letter is no longer available.', 409)
   if (!sameVersion(stored.coverLetterUpdatedAt, coverLetter?.updatedAt)) return err('The cover letter changed after this audit. Run the audit again.', 409)
+  if (original.materialBasisHash !== auditMaterialBasisHash(resume, coverLetter)) return err('The materials changed after this audit. Run it again.', 409)
 
   let proposedValue = sanitizeProposedValue(target, finding.proposedValue)
   if (proposedValue === null) {
@@ -118,44 +122,53 @@ export async function POST(req: NextRequest, { params }: Params) {
   }
   if (proposedValue === null || proposedValue === undefined) return err('No safe generated correction is available. Add confirmed Persona evidence or edit this item manually.', 422)
 
-  let updatedResume: typeof resume | null = null
-  let updatedCoverLetter: typeof coverLetter = null
-  if (target === 'cover_letter') {
-    if (!coverLetter) return err('A cover letter is not attached to this audit.', 409)
-    updatedCoverLetter = await db.coverLetter.update({ where: { id: coverLetter.id }, data: { content: proposedValue as string } })
-  } else {
-    const nextContent = { ...(resume.content as unknown as ResumeContent), [target]: proposedValue }
-    await db.resumeVersion.create({ data: { resumeId, userId: auth.userId, content: resume.content as object, name: resume.name } })
-    updatedResume = await db.resume.update({ where: { id: resumeId }, data: { content: nextContent } })
+  try {
+    const result = await withApplicationAuditLock(scope, async tx => {
+      const current = await readAuditOperation(tx, scope)
+      if (current.kind !== 'completed' || original.kind !== 'completed'
+        || current.operationId !== original.operationId || current.jobBasisHash !== original.jobBasisHash || current.materialBasisHash !== original.materialBasisHash
+        || current.audit.receipt?.signature !== stored.receipt?.signature) return err('The audit changed. Review the current result before applying a correction.', 409)
+      if (!await lockApplicationAuditMaterials(tx, scope, resumeId, stored.coverLetterId)) return err('The audited materials are no longer available.', 409)
+      const currentJob = await tx.job.findFirst({ where: { id: jobId, userId: auth.userId }, select: { role: true, company: true, description: true } })
+      const currentResume = await tx.resume.findFirst({ where: { id: resumeId, userId: auth.userId } })
+      const currentLetter = stored.coverLetterId ? await tx.coverLetter.findFirst({ where: { id: stored.coverLetterId, jobId, userId: auth.userId } }) : null
+      if (!currentJob || currentJob.role !== job.role || currentJob.company !== job.company || currentJob.description !== job.description
+        || !currentResume || !sameVersion(stored.resumeUpdatedAt, currentResume.updatedAt)
+        || (stored.coverLetterId && !currentLetter) || !sameVersion(stored.coverLetterUpdatedAt, currentLetter?.updatedAt)
+        || current.materialBasisHash !== auditMaterialBasisHash(currentResume, currentLetter)) {
+        return err('The application materials changed. Run the audit again.', 409)
+      }
+      let updatedResume: typeof resume | null = null
+      let updatedCoverLetter: typeof coverLetter = null
+      if (target === 'cover_letter') {
+        if (!currentLetter) return err('A cover letter is not attached to this audit.', 409)
+        updatedCoverLetter = await tx.coverLetter.update({ where: { id: currentLetter.id }, data: { content: proposedValue as string } })
+      } else {
+        const nextContent = { ...(currentResume.content as unknown as ResumeContent), [target]: proposedValue }
+        await tx.resumeVersion.create({ data: { resumeId, userId: auth.userId, content: currentResume.content as object, name: currentResume.name } })
+        updatedResume = await tx.resume.update({ where: { id: resumeId }, data: { content: nextContent } })
+      }
+      const appliedAt = new Date().toISOString()
+      const updatedAudit: ApplicationAudit = {
+        ...stored.audit, verdict: 'needs_review',
+        summary: 'A generated correction was applied. Run the independent audit again before final confirmation.',
+        auditedAt: appliedAt,
+        findings: stored.audit.findings.map((item, index) => index === findingIndex
+          ? { ...item, target, proposedValue, applied: true, appliedAt } : item),
+      }
+      const nextOperation = await registerAuditOperation(tx, scope)
+      const resumeUpdatedAt = iso(updatedResume?.updatedAt) ?? stored.resumeUpdatedAt
+      const coverLetterUpdatedAt = iso(updatedCoverLetter?.updatedAt) ?? stored.coverLetterUpdatedAt
+      if (!await completeAuditOperation(tx, scope, nextOperation, { resumeId, coverLetterId: stored.coverLetterId, audit: updatedAudit, jobBasis: currentJob,
+        materialBasis: { resume: updatedResume ?? currentResume, coverLetter: updatedCoverLetter ?? currentLetter }, versions: { resumeUpdatedAt, coverLetterUpdatedAt } })) {
+        throw new Error('Could not persist audit correction')
+      }
+      return ok({ audit: updatedAudit, target, appliedContent: proposedValue, resume: updatedResume, coverLetter: updatedCoverLetter, resumeUpdatedAt, coverLetterUpdatedAt })
+    })
+    return result ?? err('Job not found', 404)
+  } catch (error) {
+    return error instanceof AuditMaterialBusyError
+      ? err('The application materials are being changed. Refresh before applying a correction.', 409)
+      : err('The correction could not be confirmed. Reload and check the materials before trying again.', 503)
   }
-
-  const appliedAt = new Date().toISOString()
-  const updatedAudit: ApplicationAudit = {
-    ...stored.audit,
-    verdict: 'needs_review',
-    summary: 'A generated correction was applied. Run the independent audit again before final confirmation.',
-    auditedAt: appliedAt,
-    findings: stored.audit.findings.map((item, index) => index === findingIndex
-      ? { ...item, target, proposedValue, applied: true, appliedAt }
-      : item),
-  }
-  await db.activity.create({
-    data: {
-      userId: auth.userId, jobId, type: 'agent_action', color: '#d97706',
-      text: signedAuditActivityText({ userId: auth.userId, jobId }, resumeId, stored.coverLetterId, updatedAudit, {
-        resumeUpdatedAt: iso(updatedResume?.updatedAt) ?? stored.resumeUpdatedAt,
-        coverLetterUpdatedAt: iso(updatedCoverLetter?.updatedAt) ?? stored.coverLetterUpdatedAt,
-      }),
-    },
-  })
-
-  return ok({
-    audit: updatedAudit,
-    target,
-    appliedContent: proposedValue,
-    resume: updatedResume,
-    coverLetter: updatedCoverLetter,
-    resumeUpdatedAt: iso(updatedResume?.updatedAt) ?? stored.resumeUpdatedAt,
-    coverLetterUpdatedAt: iso(updatedCoverLetter?.updatedAt) ?? stored.coverLetterUpdatedAt,
-  })
 }
