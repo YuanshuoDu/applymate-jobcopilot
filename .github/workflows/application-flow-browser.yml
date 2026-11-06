@@ -1,0 +1,61 @@
+name: Application flow browser verification
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: application-flow-browser-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  browser:
+    name: Browser verification (${{ matrix.project }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [desktop-en, desktop-zh, mobile-en, mobile-zh]
+    env:
+      PROJECT: ${{ matrix.project }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Verify the configured project set
+        shell: bash
+        run: |
+          # Keep demo-account tests skipped and use only Playwright's fixture server.
+          unset E2E_BASE_URL DATABASE_URL DIRECT_URL AGENT_PLAN_LEDGER_TRACE_ARTIFACT_PATH AGENT_INTERACTIVE_DISCOVERY_TRACE_ARTIFACT_PATH
+          pnpm exec playwright test --list --reporter=json | node -e '
+          const report = JSON.parse(require("fs").readFileSync(0, "utf8"));
+          const actual = report.config.projects.map(project => project.name).sort();
+          const expected = ["desktop-en", "desktop-zh", "mobile-en", "mobile-zh"].sort();
+          if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+            throw new Error(`Playwright project set changed: ${actual.join(", ")}`);
+          }
+          '
+      - run: pnpm exec playwright install --with-deps chromium
+      - name: Run the complete project
+        shell: bash
+        run: |
+          unset E2E_BASE_URL DATABASE_URL DIRECT_URL AGENT_PLAN_LEDGER_TRACE_ARTIFACT_PATH AGENT_INTERACTIVE_DISCOVERY_TRACE_ARTIFACT_PATH
+          pnpm exec playwright test --project "$PROJECT"
+      - name: Upload Playwright traces and screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: application-flow-browser-${{ matrix.project }}
+          path: apps/web/tests/e2e/__artifacts__
+          if-no-files-found: ignore
+          retention-days: 14
