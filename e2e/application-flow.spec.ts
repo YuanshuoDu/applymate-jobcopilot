@@ -1,7 +1,7 @@
 import { expect, test, type Page, type Route } from '@playwright/test'
 import { createRequire } from 'node:module'
 import { createServer, type Server } from 'node:http'
-import { randomInt } from 'node:crypto'
+import { createHash, randomInt } from 'node:crypto'
 import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -438,10 +438,206 @@ async function open(page: Page, query = '') {
   await expect(page.getByText('Application flow engineer', { exact: true }).first()).toBeVisible()
 }
 
+// Model the browser's confirmed POST receipt independently of the helper under
+// test: an exact digest is required before a stale proof can permit recovery.
+function fixtureConfirmedFence(record: ReturnType<typeof audit>) {
+  const canonical = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(canonical)
+    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value)
+      .filter(([, item]) => item !== undefined).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+      .map(([key, item]) => [key, canonical(item)]))
+    return value
+  }
+  const a = record.audit
+  const digest = createHash('sha256').update(JSON.stringify(canonical([a.verdict, a.auditedAt, a.summary, a.matchScore, a.source, a.findings]))).digest('hex')
+  return { version: 1, state: 'confirmed', attemptId: '123e4567-e89b-42d3-a456-426614174001', resumeId: record.resumeId,
+    coverLetterId: record.coverLetterId, operationId: record.operationId, resumeUpdatedAt: record.resumeUpdatedAt,
+    coverLetterUpdatedAt: record.coverLetterUpdatedAt ?? null, digest }
+}
+
 test.beforeEach(async ({ page }, testInfo) => {
   page.on('pageerror', error => console.error('Mounted fixture browser error:', error.message))
   await page.addInitScript(locale => localStorage.setItem('applymate_lang', locale), testInfo.project.metadata.appLocale === 'zh' ? 'zh' : 'en')
 })
+
+for (const surface of ['jobs', 'resume'] as const) {
+  test(`${surface} only retries a confirmed stale review after explicit user action`, async ({ page }, testInfo) => {
+    test.skip(!['desktop-en', 'mobile-zh'].includes(testInfo.project.name), 'Checks English desktop and Chinese mobile')
+    const state = await install(page)
+    const completedProof = structuredClone(state.audit)
+    const fence = fixtureConfirmedFence(completedProof)
+    const fenceKey = 'applymate:audit-fence:fixture-user:outside-page'
+    state.resume = { ...state.resume, updatedAt: '2026-10-30T12:10:00.000Z' }
+    await page.addInitScript(({ fenceKey, fence }) => {
+      if (!sessionStorage.getItem(fenceKey)) sessionStorage.setItem(fenceKey, JSON.stringify(fence))
+    }, { fenceKey, fence })
+    const posts: Array<{ expected?: string; attempt?: string }> = []
+    await page.route('**/api/jobs/outside-page/audit-application', async route => {
+      if (route.request().method() === 'GET') return route.fulfill({ json: { state: 'stale', completedProof } })
+      const headers = route.request().headers()
+      posts.push({ expected: headers['x-expected-audit-operation-id'], attempt: headers['x-application-audit-attempt-id'] })
+      return route.fulfill({ status: 409, json: { code: 'AUDIT_PREDECESSOR_CHANGED', error: 'The predecessor review changed.' } })
+    })
+    if (surface === 'jobs') await open(page)
+    else await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    const marker = () => page.evaluate(key => JSON.parse(sessionStorage.getItem(key) ?? 'null'), fenceKey)
+    await expect.poll(async () => (await marker())?.state).toBe('retryable')
+    expect(await marker()).toMatchObject({ state: 'retryable', operationId: fixtureAuditOperation, digest: fence.digest })
+    expect(posts).toEqual([])
+    await page.reload()
+    await expect.poll(async () => (await marker())?.state).toBe('retryable')
+    if (surface === 'jobs') await page.getByRole('dialog').getByRole('button', { name: /Close application details|关闭申请详情/ }).click()
+    await page.getByRole('button', { name: surface === 'jobs' ? 'Fixture resume' : 'Fixture jobs' }).click()
+    await page.getByRole('button', { name: surface === 'jobs' ? 'Fixture jobs' : 'Fixture resume' }).click()
+    if (surface === 'jobs') await open(page)
+    await expect.poll(async () => (await marker())?.state).toBe('retryable')
+    expect(posts).toEqual([])
+    const trigger = surface === 'jobs' ? page.getByRole('button', { name: /Check current materials|检查当前材料/, exact: true })
+      : page.getByRole('button', { name: /Run independent audit|Run audit again|运行独立审核|再次运行审核/ })
+    await expect(trigger).toBeEnabled()
+    await trigger.click()
+    await expect.poll(() => posts.length).toBe(1)
+    expect(posts[0].expected).toBe(fixtureAuditOperation)
+    expect(posts[0].attempt).toMatch(/^[0-9a-f-]{36}$/i)
+    await expect.poll(async () => (await marker())?.state).toBe('pending')
+    expect(await marker()).toMatchObject({ state: 'pending', expectedOperationId: fixtureAuditOperation, attemptId: posts[0].attempt })
+    await page.reload()
+    await expect.poll(async () => (await marker())?.state).toBe('pending')
+    if (await trigger.isVisible() && await trigger.isEnabled()) await trigger.click()
+    expect(posts).toHaveLength(1)
+    expect(state.unexpected).toEqual([])
+  })
+
+  for (const selection of ['changed-resume', 'added-letter', 'changed-letter', 'removed-letter'] as const) {
+    test(`${surface} confirms ${selection} before retrying a completed stale review`, async ({ page }, testInfo) => {
+      test.skip(!['desktop-en', 'mobile-zh'].includes(testInfo.project.name), 'Checks English desktop and Chinese mobile')
+      const hasSelectedLetter = selection === 'added-letter' || selection === 'changed-letter'
+      const state = await install(page, { twoResumes: selection === 'changed-resume', selectedLetter: hasSelectedLetter })
+      const completedProof = selection === 'removed-letter' || selection === 'changed-letter'
+        ? { ...audit(time, true), coverLetterId: selection === 'changed-letter' ? 'old-letter' : 'selected-letter', coverLetterUpdatedAt: time }
+        : audit()
+      const fence = fixtureConfirmedFence(completedProof)
+      const fenceKey = 'applymate:audit-fence:fixture-user:outside-page'
+      const selectedResume = selection === 'changed-resume' ? 'resume-2' : 'resume-1'
+      const selectedLetter = hasSelectedLetter ? 'selected-letter' : null
+      if (selection === 'changed-resume') {
+        state.job.finalResumeId = 'resume-2'
+        state.secondResume = { ...state.secondResume, targetJobId: 'outside-page' }
+      }
+      state.job.finalCoverLetterId = selectedLetter
+      // The Resume page validates that the selected letter is bound to the
+      // chosen resume (or explicitly unbound), just like the real API row.
+      if (hasSelectedLetter) await page.route('**/api/jobs/outside-page/cover-letters', route => route.fulfill({ json: [{
+        id: 'selected-letter', userId: 'fixture-user', jobId: 'outside-page', resumeId: selectedResume,
+        content: 'I am excited to contribute my TypeScript experience.', tone: 'professional', createdAt: time, updatedAt: time,
+      }] }))
+      await page.addInitScript(({ fenceKey, fence }) => {
+        if (!sessionStorage.getItem(fenceKey)) sessionStorage.setItem(fenceKey, JSON.stringify(fence))
+      }, { fenceKey, fence })
+      const posts: Array<{ expected?: string; body: unknown }> = []
+      await page.route('**/api/jobs/outside-page/audit-application', async route => {
+        if (route.request().method() === 'GET') return route.fulfill({ json: { state: 'stale', completedProof } })
+        posts.push({ expected: route.request().headers()['x-expected-audit-operation-id'], body: route.request().postDataJSON() })
+        return route.fulfill({ status: 409, json: { code: 'AUDIT_PREDECESSOR_CHANGED', error: 'The predecessor review changed.' } })
+      })
+      const dialogs: string[] = []
+      let acceptSelection = false
+      page.on('dialog', async dialog => {
+        dialogs.push(dialog.message())
+        if (acceptSelection) await dialog.accept()
+        else await dialog.dismiss()
+      })
+      if (surface === 'jobs') await open(page)
+      else await page.goto(`${origin}/?page=resume&resumeId=${selectedResume}&returnToJobs=1&returnJobId=outside-page`)
+      const marker = () => page.evaluate(key => JSON.parse(sessionStorage.getItem(key) ?? 'null'), fenceKey)
+      await expect.poll(async () => (await marker())?.state).toBe('retryable')
+      const trigger = surface === 'jobs' ? page.getByRole('button', { name: /Check current materials|检查当前材料/, exact: true })
+        : page.getByRole('button', { name: /Run independent audit|Run audit again|运行独立审核|再次运行审核/ })
+      await expect(trigger).toBeEnabled()
+      await trigger.click()
+      await expect.poll(() => dialogs.length).toBe(1)
+      expect(dialogs[0]).toMatch(/The selected materials have changed since the previous review|所选材料与上次审核时不同/)
+      expect(dialogs[0]).toContain(selection === 'changed-resume' ? 'Second fixture resume' : 'Fixture role resume')
+      expect(dialogs[0]).toMatch(hasSelectedLetter ? /Selected|已选择/ : /Not selected|未选择/)
+      expect(dialogs[0]).toMatch(/Check the material preview|请先查看材料预览/)
+      if (hasSelectedLetter) expect(dialogs[0]).toContain('I am excited to contribute my TypeScript experience.')
+      expect(dialogs[0]).toMatch(/does not submit an application|不会提交申请/)
+      expect(posts).toEqual([])
+      expect(await marker()).toMatchObject({ state: 'retryable', operationId: fixtureAuditOperation })
+      acceptSelection = true
+      await trigger.click()
+      await expect.poll(() => posts.length).toBe(1)
+      expect(dialogs).toHaveLength(2)
+      expect(posts[0].expected).toBe(fixtureAuditOperation)
+      const body = posts[0].body as { resumeId?: string; coverLetterId?: string | null }
+      expect(body.resumeId).toBe(selectedResume)
+      expect(body.coverLetterId ?? null).toBe(selectedLetter)
+      await expect.poll(async () => (await marker())?.state).toBe('pending')
+      expect(await marker()).toMatchObject({ state: 'pending', resumeId: selectedResume, coverLetterId: selectedLetter, expectedOperationId: fixtureAuditOperation })
+      expect(state.writes.filter(write => write.path.endsWith('/tailor-resume'))).toEqual([])
+      expect(state.unexpected).toEqual([])
+    })
+  }
+
+  for (const mismatch of ['digest', 'operation', 'material-scope', 'no-proof', 'pending'] as const) {
+    test(`${surface} refuses stale recovery for ${mismatch}`, async ({ page }, testInfo) => {
+      test.skip(!['desktop-en', 'mobile-zh'].includes(testInfo.project.name), 'Checks English desktop and Chinese mobile')
+      const state = await install(page)
+      const completedProof = structuredClone(state.audit)
+      const confirmed = fixtureConfirmedFence(completedProof)
+      const marker = mismatch === 'pending'
+        ? { version: 1, state: 'pending', attemptId: confirmed.attemptId, resumeId: confirmed.resumeId, coverLetterId: null }
+        : mismatch === 'digest' ? { ...confirmed, digest: 'b'.repeat(64) } : confirmed
+      if (mismatch === 'operation') completedProof.operationId = '123e4567-e89b-42d3-a456-426614174099'
+      if (mismatch === 'material-scope') completedProof.resumeId = 'other-resume'
+      const fenceKey = 'applymate:audit-fence:fixture-user:outside-page'
+      await page.addInitScript(({ fenceKey, marker }) => {
+        if (!sessionStorage.getItem(fenceKey)) sessionStorage.setItem(fenceKey, JSON.stringify(marker))
+      }, { fenceKey, marker })
+      let gets = 0, posts = 0
+      await page.route('**/api/jobs/outside-page/audit-application', route => {
+        if (route.request().method() !== 'GET') { posts++; return route.fallback() }
+        gets++
+        return route.fulfill({ json: mismatch === 'no-proof' ? { state: 'stale' } : { state: 'stale', completedProof } })
+      })
+      if (surface === 'jobs') await open(page)
+      else await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+      const pending = page.getByText(/This tab has an unconfirmed review request|此标签页有一项尚未确认的审核请求/i).first()
+      await expect(pending).toBeVisible()
+      if (mismatch !== 'pending') await expect.poll(() => gets).toBeGreaterThan(0)
+      await expect.poll(() => page.evaluate(key => JSON.parse(sessionStorage.getItem(key) ?? 'null'), fenceKey)).toEqual(marker)
+      await page.reload()
+      await expect(pending).toBeVisible()
+      expect(await page.evaluate(key => JSON.parse(sessionStorage.getItem(key) ?? 'null'), fenceKey)).toEqual(marker)
+      expect(posts).toBe(0)
+      expect(state.unexpected).toEqual([])
+    })
+  }
+
+  test(`${surface} does not consume another job's confirmed review fence`, async ({ page }, testInfo) => {
+    test.skip(!['desktop-en', 'mobile-zh'].includes(testInfo.project.name), 'Checks English desktop and Chinese mobile')
+    const state = await install(page)
+    const completedProof = structuredClone(state.audit)
+    const fence = fixtureConfirmedFence(completedProof)
+    const foreignKey = 'applymate:audit-fence:fixture-user:other-job'
+    const currentKey = 'applymate:audit-fence:fixture-user:outside-page'
+    await page.addInitScript(({ foreignKey, fence }) => sessionStorage.setItem(foreignKey, JSON.stringify(fence)), { foreignKey, fence })
+    let gets = 0, posts = 0
+    await page.route('**/api/jobs/outside-page/audit-application', route => {
+      if (route.request().method() !== 'GET') { posts++; return route.fallback() }
+      gets++
+      return route.fulfill({ json: { state: 'stale', completedProof } })
+    })
+    if (surface === 'jobs') await open(page)
+    else await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    await expect.poll(() => gets).toBeGreaterThan(0)
+    await expect(page.getByText(/The job or materials have changed, or this older review can no longer be verified|职位或材料已变化，或旧审核已无法核实/i).first()).toBeVisible()
+    expect(await page.evaluate(key => sessionStorage.getItem(key), currentKey)).toBeNull()
+    expect(await page.evaluate(key => JSON.parse(sessionStorage.getItem(key) ?? 'null'), foreignKey)).toEqual(fence)
+    expect(posts).toBe(0)
+    expect(state.unexpected).toEqual([])
+  })
+}
 
 for (const scenario of [
   { reason: 'final_resume_too_long', en: 'The selected resume is too long to review in full. Shorten this version while keeping the facts accurate, then review it again.', zh: '所选简历内容过长，无法完整审核。请在保留真实事实的前提下精简此版本，然后重新审核。' },

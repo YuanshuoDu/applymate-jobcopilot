@@ -105,6 +105,53 @@ describe('POST /api/jobs/[id]/audit-application', () => {
     })
   })
 
+  it('rejects malformed predecessor IDs before registering an audit', async () => {
+    const { POST } = await import('./route')
+    const req = new Request('http://localhost/api/jobs/job_1/audit-application', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Expected-Audit-Operation-Id': 'not-a-uuid' },
+      body: JSON.stringify({ resumeId: 'resume_final' }),
+    })
+    const response = await POST(req as never, { params: Promise.resolve({ id: 'job_1' }) })
+    if (!(response instanceof Response)) throw new Error('Audit route did not respond')
+    expect(response.status).toBe(400)
+    expect(mocks.registerOperation).not.toHaveBeenCalled()
+  })
+
+  it.each(['pending', 'failed', 'stale', 'invalid', 'none', 'legacy', 'different-completed'] as const)(
+    'does not register after the expected predecessor becomes %s', async state => {
+      const expected = '123e4567-e89b-42d3-a456-426614174000'
+      mocks.readOperation.mockResolvedValue(state === 'different-completed'
+        ? { kind: 'completed', operationId: '123e4567-e89b-42d3-a456-426614174001' }
+        : { kind: state, operationId: expected })
+      const { POST } = await import('./route')
+      const req = new Request('http://localhost/api/jobs/job_1/audit-application', {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Expected-Audit-Operation-Id': expected, 'X-Application-Audit-Attempt-Id': '123e4567-e89b-42d3-a456-426614174002' },
+        body: JSON.stringify({ resumeId: 'resume_final' }),
+      })
+      const response = await POST(req as never, { params: Promise.resolve({ id: 'job_1' }) })
+      if (!(response instanceof Response)) throw new Error('Audit route did not respond')
+      expect(response.status).toBe(409)
+      expect(await response.json()).toEqual({ error: 'The review changed. Refresh its status before continuing.', code: 'AUDIT_PREDECESSOR_CHANGED' })
+      expect(mocks.registerOperation).not.toHaveBeenCalled()
+      expect(mocks.modelChat).not.toHaveBeenCalled()
+    },
+  )
+
+  it('allows a matching completed predecessor to register a new review', async () => {
+    const expected = '123e4567-e89b-42d3-a456-426614174000'
+    mocks.readOperation.mockResolvedValue({ kind: 'completed', operationId: expected })
+    mocks.modelChat.mockResolvedValue({ provider: 'minimax', model: 'MiniMax-M3', text: JSON.stringify({ summary: 'Supported.', matchScore: 80, findings: [{ area: 'resume', severity: 'pass', title: 'Supported', evidence: 'Fixture', action: 'None' }] }) })
+    const { POST } = await import('./route')
+    const req = new Request('http://localhost/api/jobs/job_1/audit-application', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Expected-Audit-Operation-Id': expected },
+      body: JSON.stringify({ resumeId: 'resume_final' }),
+    })
+    const response = await POST(req as never, { params: Promise.resolve({ id: 'job_1' }) })
+    if (!(response instanceof Response)) throw new Error('Audit route did not respond')
+    expect(response.status).toBe(200)
+    expect(mocks.registerOperation).toHaveBeenCalledOnce()
+  })
+
   it('audits final material against the tailored resume parent', async () => {
     mocks.resumeFindFirst.mockResolvedValueOnce({ id: 'resume_final', parentResumeId: 'resume_base', content: { contact: {}, summary: 'Final', experience: [], education: [], skills: [] } })
       .mockResolvedValueOnce({ content: { contact: {}, summary: 'Original', experience: [], education: [], skills: [] } })
@@ -371,7 +418,7 @@ describe('POST /api/jobs/[id]/audit-application', () => {
       audit: { resumeId: 'resume_final', coverLetterId: null, audit: { verdict: 'pass' } } })
     const { GET } = await import('./route')
     const response = await GET(new Request('http://localhost/api/jobs/job_1/audit-application') as never, { params: Promise.resolve({ id: 'job_1' }) })
-    await expect(response.json()).resolves.toEqual({ state: 'stale' })
+    await expect(response.json()).resolves.toMatchObject({ state: 'stale', completedProof: { operationId: 'fixture-operation', resumeId: 'resume_final' } })
   })
 
   it('marks a legacy signed audit stale because its job basis was not signed', async () => {
@@ -401,7 +448,7 @@ describe('POST /api/jobs/[id]/audit-application', () => {
     await expect(response.json()).resolves.toMatchObject({ resumeId: 'resume_final', coverLetterId: null, audit: { verdict: 'pass' } })
     mocks.txJobFindFirst.mockResolvedValue({ ...job, description: 'Changed' })
     const stale = (await GET(new Request('http://localhost/api/jobs/job_1/audit-application') as never, { params: Promise.resolve({ id: 'job_1' }) }))!
-    await expect(stale.json()).resolves.toEqual({ state: 'stale' })
+    await expect(stale.json()).resolves.toMatchObject({ state: 'stale', completedProof: { operationId: 'fixture-operation', resumeId: 'resume_final' } })
   })
 
   it('hides unsigned historical activity until the independent audit is rerun', async () => {
@@ -417,6 +464,14 @@ describe('POST /api/jobs/[id]/audit-application', () => {
     const response = (await GET(new Request('http://localhost/api/jobs/job_1/audit-application') as never, { params: Promise.resolve({ id: 'job_1' }) }))!
     expect(response.status).toBe(200)
     await expect(response.json()).resolves.toEqual({ state })
+  })
+
+  it.each(['pending', 'failed', 'stale', 'invalid', 'legacy'] as const)('does not expose a completion proof for %s', async state => {
+    mocks.readOperation.mockResolvedValue({ kind: state, operationId: '123e4567-e89b-42d3-a456-426614174000' })
+    const { GET } = await import('./route')
+    const response = await GET(new Request('http://localhost/api/jobs/job_1/audit-application') as never, { params: Promise.resolve({ id: 'job_1' }) })
+    expect(response.status).toBe(200)
+    expect(await response.json()).not.toHaveProperty('completedProof')
   })
 
   it.each(['none', 'pending', 'failed', 'invalid', 'legacy', 'completed', 'not-found', 'unauthenticated'] as const)('GET %s response is private and never cached', async state => {

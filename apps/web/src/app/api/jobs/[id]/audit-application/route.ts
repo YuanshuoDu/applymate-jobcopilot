@@ -51,12 +51,16 @@ export async function GET(req: NextRequest, { params }: Params) {
       const operation = await readAuditOperation(tx, scope)
       if (operation.kind === 'legacy') return { state: 'stale' as const }
       if (operation.kind !== 'completed') return operation
-      if (operation.jobBasisHash !== auditJobBasisHash(job)
-        || !await lockApplicationAuditMaterials(tx, scope, operation.audit.resumeId, operation.audit.coverLetterId)) return { state: 'stale' as const }
+      // readAuditOperation verifies both the scoped control MAC and the audit
+      // receipt. This is evidence of a completed old request, not readiness.
+      const staleProof = { state: 'stale' as const, completedProof: { ...operation.audit, operationId: operation.operationId } }
+      if (operation.jobBasisHash !== auditJobBasisHash(job)) return staleProof
+      if (!await lockApplicationAuditMaterials(tx, scope, operation.audit.resumeId, operation.audit.coverLetterId)) return staleProof
       const resume = await tx.resume.findFirst({ where: { id: operation.audit.resumeId, userId: auth.userId } })
       const letter = operation.audit.coverLetterId ? await tx.coverLetter.findFirst({ where: { id: operation.audit.coverLetterId, jobId, userId: auth.userId } }) : null
-      if (!resume || (operation.audit.coverLetterId && !letter) || !checkAuditDocumentLimits(resume.content, letter?.content ?? null, resume.name).ok
-        || operation.materialBasisHash !== auditMaterialBasisHash(resume, letter)) return { state: 'stale' as const }
+      if (!resume || (operation.audit.coverLetterId && !letter)) return staleProof
+      if (operation.materialBasisHash !== auditMaterialBasisHash(resume, letter)) return staleProof
+      if (!checkAuditDocumentLimits(resume.content, letter?.content ?? null, resume.name).ok) return { state: 'stale' as const }
       return operation
     })
     if (!snapshot) return noStore(err('Job not found.', 404))
@@ -75,6 +79,10 @@ export async function POST(req: NextRequest, { params }: Params) {
   const prep = await prepareAiRoute(req, 'autoApply')
   if ('error' in prep) return prep.error
   const { id: jobId } = await params
+  const expectedOperationId = req.headers.get('X-Expected-Audit-Operation-Id')
+  if (expectedOperationId !== null && !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(expectedOperationId)) {
+    return noStore(err('A valid expected review operation is required.', 400))
+  }
   const body = await req.json().catch(() => null)
   if (!body) return err('Invalid JSON body')
   const { resumeId, coverLetterId } = body as { resumeId?: string; coverLetterId?: string | null }
@@ -107,6 +115,10 @@ export async function POST(req: NextRequest, { params }: Params) {
     // Register after the basic ownership/version checks, before potentially
     // slow Persona, source-material or model work.
     const started = await withApplicationAuditLock(scope, async tx => {
+      if (expectedOperationId !== null) {
+        const current = await readAuditOperation(tx, scope)
+        if (current.kind !== 'completed' || current.operationId !== expectedOperationId) return { kind: 'predecessor-changed' as const }
+      }
       if (!await lockApplicationAuditMaterials(tx, scope, resume.id, coverLetterId ?? null)) return { kind: 'changed' as const }
       const currentJob = await tx.job.findFirst({ where: { id: jobId, userId: prep.userId }, select: { description: true, role: true, company: true } })
       const currentResume = await tx.resume.findFirst({ where: { id: resume.id, userId: prep.userId } })
@@ -118,6 +130,7 @@ export async function POST(req: NextRequest, { params }: Params) {
       return { kind: 'started' as const, operationId: await registerAuditOperation(tx, scope) }
     })
     if (!started) return err('Job not found.', 404)
+    if (started.kind === 'predecessor-changed') return noStore(Response.json({ error: 'The review changed. Refresh its status before continuing.', code: 'AUDIT_PREDECESSOR_CHANGED' }, { status: 409 }))
     if (started.kind === 'changed') return err('The application materials changed. Reload them before reviewing again.', 409)
     operationId = started.operationId
     const persona = await buildPersona(prep.userId, 'tailor')

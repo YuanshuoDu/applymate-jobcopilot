@@ -17,7 +17,7 @@ import { useI18n } from '@/lib/i18n'
 import { applicationListUrl, loadLinkedApplication, readApplicationListState } from '@/lib/application-list-state'
 import { AUDIT_ACTIVITY_PREFIX, hasCurrentApplicationPackAudit, type StoredApplicationAudit } from '@/lib/application-audit'
 import { parseApplicationAuditView } from '@/lib/application-audit-view'
-import { APPLICATION_AUDIT_FENCE_EVENT, auditFenceStorage, beginAuditFence, postApplicationAudit, readAuditFence, reconcileAuditFence, waitForAuditFencePost } from '@/lib/application-audit-fence'
+import { APPLICATION_AUDIT_FENCE_EVENT, auditFenceStorage, beginAuditFence, beginRetryableAuditFence, markAuditFenceRetryable, postApplicationAudit, readAuditFence, reconcileAuditFence, waitForAuditFencePost } from '@/lib/application-audit-fence'
 import { auditLimitMessageKey } from '@/lib/application-audit-limit-message'
 import { useApplicationTasks } from '@/components/jobs/useApplicationTasks'
 import { useApplicationCoverLetters } from '@/components/jobs/useApplicationCoverLetters'
@@ -677,6 +677,11 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     const epoch = ++auditReadEpoch.current
     setVerifiedAudit(null)
     const local = readAuditFence(auditFenceStorage(), owner, jobId)
+    if (local.state === 'retryable') {
+      setLatestAudit(null)
+      setAuditOperationView({ owner, jobId, state: 'stale' })
+      return { epoch, value: null }
+    }
     if (local.state === 'pending' || local.state === 'unavailable') {
       setLatestAudit(null)
       setAuditOperationView({ owner, jobId, state: local.state === 'pending' ? 'localPending' : 'localUnavailable' })
@@ -687,6 +692,8 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     const parsed = result.ok ? parseApplicationAuditView(result.data) : { state: 'unavailable' as const, record: null }
     const current = readAuditFence(auditFenceStorage(), owner, jobId)
     if (current.state !== 'none') {
+      if (current.state === 'confirmed' && parsed.state === 'stale' && result.ok
+        && await markAuditFenceRetryable(auditFenceStorage(), owner, jobId, result.data)) return null
       const reconciled = current.state === 'confirmed' && parsed.record && await reconcileAuditFence(auditFenceStorage(), owner, jobId, parsed.record)
       if (auditReadEpoch.current !== epoch || !isCurrentDrawer(owner) || drawerJobIdRef.current !== jobId) return null
       if (!reconciled) {
@@ -1044,16 +1051,28 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     const owner = drawerUserIdRef.current
     if (!owner || !isCurrentDrawer(owner) || job.userId !== owner) return
     const fence = readAuditFence(auditFenceStorage(), owner, job.id)
-    if (fence.state !== 'none') {
+    if (fence.state !== 'none' && fence.state !== 'retryable') {
       setAuditOperationView({ owner, jobId: job.id, state: fence.state === 'unavailable' ? 'localUnavailable' : 'localPending' })
       return
     }
     if (preparationInFlight.current || !manualWorkAllowed || taskReadState !== 'ready' || (previewResumeId && !evidenceResumeId)) return
+    // Recovery reviews an existing, verified selection; it never creates or
+    // repairs documents before checking the predecessor operation.
+    if (fence.state === 'retryable' && !evidenceResumeId) {
+      toast.info(t('application.auditChooseResume'))
+      return
+    }
     setAuditLimitNotice(null)
     if (job.finalCoverLetterId && !selectedCoverLetter) {
       setOpenPackItem('coverLetter')
       toast.info(t('application.selectedLetterLoading'))
       return
+    }
+    if (fence.state === 'retryable' && (evidenceResumeId !== fence.fence.resumeId
+      || (selectedCoverLetter?.id ?? null) !== fence.fence.coverLetterId)) {
+      const labels: Record<string, string> = { resume: resumePreview?.name ?? t('jobs.pack.resume'),
+        letter: selectedCoverLetter ? `${t('application.auditSelectedLetter')}: ${selectedCoverLetter.content.replace(/\s+/g, ' ').slice(0, 100)}` : t('application.coverLetterOptional') }
+      if (!window.confirm(t('application.auditChangedSelectionConfirm').replace(/\{(resume|letter)\}/g, (_, key: string) => labels[key]))) return
     }
     if ((!resumeListReady || !baseResumes.some(resume => resume.id === selectedResumeId)) && !existingTailoredResume && !createdTailoredResumeId && !job.finalResumeId) {
       toast.error('No base resume selected', 'Create or import a resume first.')
@@ -1205,7 +1224,9 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
 
       setPackStage('audit')
       const auditStorage = auditFenceStorage()
-      const attemptId = beginAuditFence(auditStorage, owner, job.id, adaptedResumeId, coverLetter?.id ?? null)
+      const attemptId = fence.state === 'retryable'
+        ? beginRetryableAuditFence(auditStorage, owner, job.id, adaptedResumeId, coverLetter?.id ?? null)
+        : beginAuditFence(auditStorage, owner, job.id, adaptedResumeId, coverLetter?.id ?? null)
       if (!attemptId) {
         const current = readAuditFence(auditStorage, owner, job.id).state
         const state = current === 'pending' || current === 'confirmed' ? 'localPending' : 'localUnavailable'
@@ -1432,8 +1453,18 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   const applicationRecorded = hasVisibleSubmissionRecord(job) || manualVisibleRecord
   const applicationRecordBlocked = blocksManualRecord(job) || manualVisibleRecord
   const manualReviewPrimary = manualWorkAllowed && Boolean(manualRecordLock && (manualRecordLock !== 'confirmed' || !applicationRecorded))
-  const auditStale = Boolean(currentRecord && !currentPackAudited && currentRecord.audit.verdict === 'pass')
+  const auditStale = localAuditFence.state === 'retryable' || Boolean(currentRecord && !currentPackAudited && currentRecord.audit.verdict === 'pass')
   const canReviewExistingIssues = !currentPackAudited && (auditNeedsEvidence || auditNeedsRepair || auditRetryOnly)
+  const openResumeLibraryForJob = () => {
+    try { sessionStorage.removeItem('applymate:resume-return') } catch { /* The resume page can open without stored context. */ }
+    const url = new URL(window.location.href)
+    url.searchParams.delete('resumeId')
+    url.searchParams.set('returnToJobs', '1')
+    url.searchParams.set('returnJobId', job.id)
+    url.searchParams.set('resumeStartEmpty', '1')
+    window.history.replaceState({}, '', url.toString())
+    navigate('resume')
+  }
   const openAudit = () => {
     setOpenPackItem('audit')
     window.setTimeout(() => auditSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 0)
@@ -1467,14 +1498,15 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
 
         {auditOperationView && auditOperationView.owner === drawerUserId && auditOperationView.jobId === job.id && <div role="status" style={{ margin: '18px 28px 0', fontSize: 12 }}>
           <p>{t(`application.auditState.${auditOperationView.state}`)}</p>
-          <Btn variant="ghost" small disabled={autoPreparing} onClick={() => {
+          {localAuditFence.state === 'retryable' && !evidenceResumeId && <><p>{t('application.auditChooseResume')}</p><Btn variant="ghost" small onClick={openResumeLibraryForJob}>{t('application.openResumeLibrary')}</Btn></>}
+          {localAuditFence.state !== 'retryable' && <Btn variant="ghost" small disabled={autoPreparing} onClick={() => {
             const owner = drawerUserId
             if (!owner) return
             setLatestAudit(null)
             void readCanonicalAudit(owner, job.id).then(result => {
               if (result?.value && auditReadEpoch.current === result.epoch) setVerifiedAudit({ owner, jobId: job.id, audit: result.value })
             })
-          }}>{t('application.refreshStatus')}</Btn>
+          }}>{t('application.refreshStatus')}</Btn>}
         </div>}
 
         {!applicationPreflight.canPrepare && applicationPreflight.issues.length > 0 && <div style={{ margin: '18px 28px 0', padding: '12px 14px', borderRadius: 9, border: '1px solid #fbbf24', background: '#fffbeb', color: '#78350f', fontSize: 12, lineHeight: 1.5 }}>
@@ -1513,20 +1545,11 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
               <Btn variant="primary" disabled={recordingSubmission || manualRecordRefreshing} onClick={() => { if (drawerUserId) void (manualRejection ? refreshAfterManualRejection(drawerUserId) : refreshManualRecord(drawerUserId)) }}>{t(manualRejection ? 'application.refreshStatus' : 'application.manualRefresh')}</Btn>
             </div> : applicationRecorded ? null : applicationRecordBlocked ? <Btn variant="ghost" onClick={() => { activitySectionRef.current?.focus(); activitySectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }}>{t('application.viewHistory')}</Btn> : taskReadState !== 'ready' ? <div role="status"><p>{t(taskReadState === 'limited' ? 'application.taskCoverage' : 'application.taskReadUnavailable')}</p><Btn variant="ghost" onClick={onRefreshTasks}>{t('application.refreshStatus')}</Btn></div> : <>
               {needsBaseResume && !resumeListReady && <div role="status"><p>{t(resumeListLoading ? 'application.baseResumeLoading' : 'application.baseResumeUnavailable')}</p>{!resumeListLoading && <Btn variant="ghost" onClick={() => void refreshResumeList()}>{t('application.refreshStatus')}</Btn>}</div>}
-              {needsBaseResume && resumeListReady && baseResumes.length === 0 && <div role="status"><p>{t('application.baseResumeEmpty')}</p><Btn variant="ghost" onClick={() => {
-                try { sessionStorage.removeItem('applymate:resume-return') } catch { /* The resume page can open without stored context. */ }
-                const url = new URL(window.location.href)
-                url.searchParams.delete('resumeId')
-                url.searchParams.set('returnToJobs', '1')
-                url.searchParams.set('returnJobId', job.id)
-                url.searchParams.set('resumeStartEmpty', '1')
-                window.history.replaceState({}, '', url.toString())
-                navigate('resume')
-              }}>{t('application.openResumeLibrary')}</Btn></div>}
+              {needsBaseResume && resumeListReady && baseResumes.length === 0 && <div role="status"><p>{t('application.baseResumeEmpty')}</p><Btn variant="ghost" onClick={openResumeLibraryForJob}>{t('application.openResumeLibrary')}</Btn></div>}
               {needsBaseResume && resumeListReady && baseResumes.length > 1 && <label style={{ fontSize: 12 }}>{t('application.baseResume')}
                 <select value={selectedResumeId} onChange={event => setSelectedResumeId(event.target.value)} style={{ ...drawerInputSt, width: '100%', margin: '6px 0 12px' }}><option value="">{t('application.chooseBaseResume')}</option>{baseResumes.map(resume => <option key={resume.id} value={resume.id}>{resume.isDefault ? `${t('jobs.defaultResume')} — ` : ''}{resume.name}</option>)}</select>
               </label>}
-              <Btn variant="primary" disabled={autoPreparing || localAuditFence.state !== 'none' || (!canReviewExistingIssues && (Boolean(previewResumeId && !evidenceResumeId) || (!currentPackAudited && !canTailorResume)))} onClick={() => {
+              <Btn variant="primary" disabled={autoPreparing || (localAuditFence.state !== 'none' && localAuditFence.state !== 'retryable') || (!canReviewExistingIssues && (Boolean(previewResumeId && !evidenceResumeId) || (!currentPackAudited && !canTailorResume)))} onClick={() => {
                 if (currentPackAudited) {
                   if (job.url && /^https?:\/\//i.test(job.url)) window.open(job.url, '_blank', 'noopener,noreferrer')
                   else setOpenPackItem('resume')

@@ -21,7 +21,7 @@ if (enabled) {
 }
 
 type LockEvidence = { pid?: number; startedAt?: Date; started: () => void; issued: () => void; beforeQuery?: Promise<void>; rawErrors?: unknown[] }
-type RequestScope = { client: PrismaClient; userId: string; summary?: string; gate?: ReturnType<typeof gate>; repair?: boolean; review?: boolean; tailor?: boolean; tailorModelDone?: boolean; updateGate?: ReturnType<typeof gate>; proposedValue?: string; letterId?: string; auditOperationId?: string; auditAttemptId?: string; evidence?: LockEvidence }
+type RequestScope = { client: PrismaClient; userId: string; summary?: string; gate?: ReturnType<typeof gate>; repair?: boolean; review?: boolean; tailor?: boolean; tailorModelDone?: boolean; updateGate?: ReturnType<typeof gate>; proposedValue?: string; letterId?: string; auditOperationId?: string; auditAttemptId?: string; expectedOperationId?: string; evidence?: LockEvidence }
 const requestScope = new AsyncLocalStorage<RequestScope>()
 function current(): RequestScope {
   const scope = requestScope.getStore()
@@ -211,7 +211,7 @@ integration('application audit ordering with disposable PostgreSQL', () => {
     const path = kind === 'repair' ? 'audit-application/apply' : kind === 'audit' || kind === 'read' ? 'audit-application' : 'application-pack'
     const method = kind === 'audit' || kind === 'download' || kind === 'repair' ? 'POST' : 'GET'
     const request = new NextRequest(`http://localhost/api/jobs/job-1/${path}`, {
-      method, ...(kind === 'audit' || kind === 'repair' ? { headers: { 'Content-Type': 'application/json', ...(scope.auditAttemptId ? { 'X-Application-Audit-Attempt-Id': scope.auditAttemptId } : {}) }, body: JSON.stringify({ resumeId: 'resume-1', ...(scope.letterId ? { coverLetterId: scope.letterId } : {}), ...(kind === 'repair' ? { findingIndex: 0, auditOperationId: scope.auditOperationId ?? lastAuditOperationId } : {}) }) } : {}),
+      method, ...(kind === 'audit' || kind === 'repair' ? { headers: { 'Content-Type': 'application/json', ...(scope.auditAttemptId ? { 'X-Application-Audit-Attempt-Id': scope.auditAttemptId } : {}), ...(scope.expectedOperationId ? { 'X-Expected-Audit-Operation-Id': scope.expectedOperationId } : {}) }, body: JSON.stringify({ resumeId: 'resume-1', ...(scope.letterId ? { coverLetterId: scope.letterId } : {}), ...(kind === 'repair' ? { findingIndex: 0, auditOperationId: scope.auditOperationId ?? lastAuditOperationId } : {}) }) } : {}),
     })
     const params = { params: Promise.resolve({ id: 'job-1' }) }
     const response = await requestScope.run(scope, () => kind === 'audit' ? postAudit(request, params) : kind === 'repair' ? postRepair(request, params)
@@ -260,12 +260,57 @@ integration('application audit ordering with disposable PostgreSQL', () => {
     } finally { running.release(); await within(Promise.allSettled([pending])) }
   }, 30_000)
 
+  it.each(['other-first', 'guarded-first'] as const)('keeps a newer pending audit when %s registers first', async order => {
+    const original = await (await invoke('read', { client: clientA, userId: 'owner-a' })).json()
+    expect(original.receipt.signature).toMatch(/^[a-f0-9]{64}$/)
+    await clientB.resume.update({ where: { id: 'resume-1' }, data: { content: { summary: 'Changed synthetic summary' } } })
+    const stale = await (await invoke('read', { client: clientA, userId: 'owner-a' })).json()
+    expect(stale).toMatchObject({ state: 'stale', completedProof: { operationId: original.operationId, receipt: original.receipt, resumeId: 'resume-1' } })
+    const foreign = await invoke('read', { client: clientB, userId: 'owner-b' })
+    expect(foreign.status).toBe(404)
+    const running = gate()
+    const first = invoke('audit', { client: clientB, userId: 'owner-a', gate: running,
+      ...(order === 'guarded-first' ? { expectedOperationId: original.operationId } : {}) })
+    try {
+      await within(running.reached)
+      expect(await (await invoke('read', { client: clientA, userId: 'owner-a' })).json()).toEqual({ state: 'pending' })
+      const rejected = await invoke('audit', { client: clientA, userId: 'owner-a', expectedOperationId: original.operationId,
+        auditAttemptId: '123e4567-e89b-42d3-a456-426614174002' })
+      expect(rejected.status).toBe(409)
+      expect(await rejected.json()).toEqual({ error: 'The review changed. Refresh its status before continuing.', code: 'AUDIT_PREDECESSOR_CHANGED' })
+      expect(await (await invoke('read', { client: clientA, userId: 'owner-a' })).json()).toEqual({ state: 'pending' })
+      running.release()
+      expect((await within(first)).status).toBe(200)
+      expect((await (await invoke('read', { client: clientA, userId: 'owner-a' })).json()).audit.summary).toBe('Fixture audit')
+    } finally { running.release(); await within(Promise.allSettled([first])) }
+  }, 30_000)
+
+  it('does not expose a stale proof or accept a predecessor from a tampered control', async () => {
+    const original = await (await invoke('read', { client: clientA, userId: 'owner-a' })).json()
+    const control = await clientA.activity.findFirstOrThrow({ where: { userId: 'owner-a', jobId: 'job-1', id: { startsWith: 'auditop_' } } })
+    expect(control.text).toContain('Old passing audit')
+    await clientA.activity.update({ where: { id: control.id }, data: { text: control.text.replace('Old passing audit', 'Tampered audit') } })
+    await clientA.job.update({ where: { id: 'job-1' }, data: { description: 'Changed synthetic job' } })
+    expect(await (await invoke('read', { client: clientA, userId: 'owner-a' })).json()).toEqual({ state: 'unavailable' })
+    const rejected = await invoke('audit', { client: clientA, userId: 'owner-a', expectedOperationId: original.operationId })
+    expect(rejected.status).toBe(409)
+    expect(await rejected.json()).toMatchObject({ code: 'AUDIT_PREDECESSOR_CHANGED' })
+    expect((await clientA.activity.findUniqueOrThrow({ where: { id: control.id } })).text).toContain('Tampered audit')
+  })
+
+  it('returns the signed old completion as stale proof when its selected resume is removed', async () => {
+    const original = await (await invoke('read', { client: clientA, userId: 'owner-a' })).json()
+    await clientA.resume.delete({ where: { id: 'resume-1' } })
+    const stale = await (await invoke('read', { client: clientA, userId: 'owner-a' })).json()
+    expect(stale).toMatchObject({ state: 'stale', completedProof: { operationId: original.operationId, receipt: original.receipt, resumeId: 'resume-1' } })
+  })
+
   it('rejects an oversized selected resume and does not reuse the earlier pass', async () => {
     await clientB.resume.update({ where: { id: 'resume-1' }, data: { content: { summary: 'x'.repeat(12_000) } } })
     const rejected = await invoke('audit', { client: clientA, userId: 'owner-a' })
     expect(rejected.status).toBe(422)
     expect((await rejected.json()).error).toContain('final resume')
-    expect(await (await invoke('read', { client: clientB, userId: 'owner-a' })).json()).toEqual({ state: 'stale' })
+    expect(await (await invoke('read', { client: clientB, userId: 'owner-a' })).json()).toMatchObject({ state: 'stale' })
     expect((await invoke('download', { client: clientB, userId: 'owner-a' })).status).toBe(409)
     expect((await invoke('print', { client: clientB, userId: 'owner-a' })).status).toBe(409)
   })
@@ -287,7 +332,7 @@ integration('application audit ordering with disposable PostgreSQL', () => {
     const after = await clientB.activity.findMany({ orderBy: { id: 'asc' } })
     expect(after).toHaveLength(before.length)
     expect(after).toEqual(before)
-    expect(await (await invoke('read', { client: clientB, userId: 'owner-a' })).json()).toEqual({ state: 'stale' })
+    expect(await (await invoke('read', { client: clientB, userId: 'owner-a' })).json()).toMatchObject({ state: 'stale' })
   })
 
   it('fences an earlier pass when the source evidence is too long to review', async () => {
@@ -341,7 +386,7 @@ integration('application audit ordering with disposable PostgreSQL', () => {
       text: signedAuditActivityText({ userId: 'owner-a', jobId: 'job-1' }, resume.id, null, audit, { resumeUpdatedAt: resume.updatedAt.toISOString() }) } })
     const read = await invoke('read', { client: clientB, userId: 'owner-a' })
     expect(read.status).toBe(200)
-    expect(await read.json()).toEqual({ state: 'stale' })
+    expect(await read.json()).toMatchObject({ state: 'stale' })
     expect((await invoke('download', { client: clientB, userId: 'owner-a' })).status).toBe(409)
     expect((await invoke('print', { client: clientB, userId: 'owner-a' })).status).toBe(409)
     expect((await invoke('repair', { client: clientB, userId: 'owner-a' })).status).toBe(409)
@@ -367,7 +412,7 @@ integration('application audit ordering with disposable PostgreSQL', () => {
     await clientB.job.update({ where: { id: 'job-1' }, data: { [field]: `Changed ${field}` } })
     const read = await invoke('read', { client: clientB, userId: 'owner-a' })
     expect(read.status).toBe(200)
-    expect(await read.json()).toEqual({ state: 'stale' })
+    expect(await read.json()).toMatchObject({ state: 'stale' })
     expect((await invoke('download', { client: clientB, userId: 'owner-a' })).status).toBe(409)
     expect((await invoke('print', { client: clientB, userId: 'owner-a' })).status).toBe(409)
 
@@ -432,7 +477,7 @@ integration('application audit ordering with disposable PostgreSQL', () => {
       await clientB.resume.update({ where: { id: resume.id }, data: { content: { summary: 'Different resume' }, updatedAt: resume.updatedAt } })
       expect((await clientB.resume.findUniqueOrThrow({ where: { id: resume.id } })).updatedAt).toEqual(resume.updatedAt)
     }
-    expect(await (await invoke('read', { client: clientB, userId: 'owner-a' })).json()).toEqual({ state: 'stale' })
+    expect(await (await invoke('read', { client: clientB, userId: 'owner-a' })).json()).toMatchObject({ state: 'stale' })
     expect((await invoke('download', { client: clientB, userId: 'owner-a' })).status).toBe(409)
     expect((await invoke('print', { client: clientB, userId: 'owner-a' })).status).toBe(409)
   })
@@ -532,6 +577,36 @@ integration('application audit ordering with disposable PostgreSQL', () => {
     expect((await invoke('audit', { client: clientA, userId: 'owner-a', summary: 'Review this summary', review: true, proposedValue })).status).toBe(200)
     return resume
   }
+
+  it('recovers the completed correction operation after a later material change', async () => {
+    await seedRepair('Synthetic corrected summary')
+    const review = await (await invoke('read', { client: clientA, userId: 'owner-a' })).json()
+    const corrected = await invoke('repair', { client: clientA, userId: 'owner-a', auditOperationId: review.operationId })
+    expect(corrected.status).toBe(200)
+    const correction = await corrected.json()
+    expect(correction.operationId).not.toBe(review.operationId)
+    const completed = await (await invoke('read', { client: clientB, userId: 'owner-a' })).json()
+    expect(completed).toMatchObject({ operationId: correction.operationId, resumeId: 'resume-1', audit: correction.audit })
+    expect(completed.receipt.signature).toMatch(/^[a-f0-9]{64}$/)
+    await clientB.resume.update({ where: { id: 'resume-1' }, data: { content: { summary: 'Later synthetic edit' } } })
+    const stale = await (await invoke('read', { client: clientA, userId: 'owner-a' })).json()
+    expect(stale).toMatchObject({ state: 'stale', completedProof: { operationId: correction.operationId, resumeId: 'resume-1', audit: correction.audit, receipt: completed.receipt } })
+    expect(stale.completedProof.operationId).not.toBe(review.operationId)
+    const outdated = await invoke('audit', { client: clientA, userId: 'owner-a', expectedOperationId: review.operationId })
+    expect(outdated.status).toBe(409)
+    expect(await outdated.json()).toMatchObject({ code: 'AUDIT_PREDECESSOR_CHANGED' })
+    const running = gate()
+    const first = invoke('audit', { client: clientA, userId: 'owner-a', expectedOperationId: correction.operationId, gate: running })
+    try {
+      await within(running.reached)
+      expect(await (await invoke('read', { client: clientB, userId: 'owner-a' })).json()).toEqual({ state: 'pending' })
+      const competing = await invoke('audit', { client: clientB, userId: 'owner-a', expectedOperationId: correction.operationId })
+      expect(competing.status).toBe(409)
+      expect(await competing.json()).toMatchObject({ code: 'AUDIT_PREDECESSOR_CHANGED' })
+      running.release()
+      expect((await within(first)).status).toBe(200)
+    } finally { running.release(); await within(Promise.allSettled([first])) }
+  }, 30_000)
 
   it('rejects review A finding index after B replaced it before the repair request', async () => {
     const reviewA = await invoke('audit', { client: clientA, userId: 'owner-a', review: true, summary: 'Review A', proposedValue: 'Correction A' })
@@ -783,7 +858,7 @@ integration('application audit ordering with disposable PostgreSQL', () => {
       expect((await within(repair)).status).toBe(200)
       expect((await within(audit)).status).toBe(409)
       expect(await clientB.resumeVersion.count({ where: { resumeId: 'resume-1' } })).toBe(1)
-      expect(await (await invoke('read', { client: clientB, userId: 'owner-a' })).json()).toEqual({ state: 'stale' })
+      expect(await (await invoke('read', { client: clientB, userId: 'owner-a' })).json()).toMatchObject({ state: 'stale' })
     } finally { aQuery.release(); bQuery.release(); update.release(); await within(Promise.allSettled([repair, ...(audit ? [audit] : [])])) }
   }, 30_000)
 

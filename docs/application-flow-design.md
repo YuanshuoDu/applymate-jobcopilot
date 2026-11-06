@@ -272,6 +272,21 @@ attempt deduplication, so it cannot rule out an externally duplicated request
 having written. Other tabs, devices and cleared browser storage do not share
 this protection.
 
+If a completed response was confirmed in this tab but its materials changed
+before reconciliation, the server can return the verified old completion as a
+stale proof. A matching proof permits a user-initiated review of the selected
+materials; it is never a current passing result. The new review checks the
+previous operation under the job lock. If another operation has replaced it,
+the request remains unconfirmed rather than being automatically retried or
+cleared using a single handler's response. A different material selection
+requires explicit confirmation. Legacy clients that do not send this condition
+can still supersede another review; there is no global attempt deduplication.
+The existing material-selection endpoint does not condition its write on the
+previously observed selection. A delayed assignment in one tab can therefore
+overwrite a selection made in another tab after the review was read. Protecting
+that write requires a separate selection comparison in the assignment transaction;
+the review-operation condition alone does not provide that guarantee.
+
 Reviews stop with guidance if a formatted final or source resume exceeds 12,000
 UTF-16 code units, a cover letter exceeds 8,000, or confirmed Persona text exceeds
 10,000. JSON formatting and escapes count toward the resume limit; a resume name

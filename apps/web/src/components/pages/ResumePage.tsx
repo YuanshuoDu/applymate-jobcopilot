@@ -9,7 +9,7 @@ import { openApplication, replaceApplicationHistory } from '@/lib/application-na
 import { readApplicationListState } from '@/lib/application-list-state'
 import { auditMatchesCurrentMaterials } from '@/lib/application-materials'
 import { parseApplicationAuditView } from '@/lib/application-audit-view'
-import { APPLICATION_AUDIT_FENCE_EVENT, auditFenceStorage, beginAuditFence, postApplicationAudit, postApplicationAuditCorrection, readAuditFence, reconcileAuditFence, waitForAuditFencePost } from '@/lib/application-audit-fence'
+import { APPLICATION_AUDIT_FENCE_EVENT, auditFenceStorage, beginAuditFence, beginRetryableAuditFence, markAuditFenceRetryable, postApplicationAudit, postApplicationAuditCorrection, readAuditFence, reconcileAuditFence, waitForAuditFencePost } from '@/lib/application-audit-fence'
 import { auditLimitMessageKey } from '@/lib/application-audit-limit-message'
 import { applicationMaterialAssignment, selectApplicationCoverLetter } from '@/lib/application-material-selection'
 import { sameApplicationAudit, type ApplicationAuditIdentity } from '@/lib/application-audit-identity'
@@ -1998,6 +1998,12 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     if (!jobId || !userId || !resumeLinkedJob || resumeLinkedJob.userId !== userId) return
     const local = readAuditFence(auditFenceStorage(), userId, jobId)
     if ((auditRunRef.current || applyingAuditRef.current) && local.state !== 'none') return
+    if (local.state === 'retryable') {
+      setAuditOperationView({ jobId, userId, generation: auditScopeGeneration, state: 'stale' })
+      setStoredAuditScope({ jobId, userId, generation: auditScopeGeneration, record: null })
+      setLatestApplicationAudit(null)
+      return
+    }
     if (local.state === 'pending' || local.state === 'unavailable') {
       setAuditOperationView({ jobId, userId, generation: auditScopeGeneration, state: local.state === 'pending' ? 'localPending' : 'localUnavailable' })
       setStoredAuditScope({ jobId, userId, generation: auditScopeGeneration, record: null })
@@ -2025,6 +2031,8 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
         const record = parsed.record
         const current = readAuditFence(auditFenceStorage(), userId, jobId)
         if (current.state !== 'none') {
+          if (current.state === 'confirmed' && parsed.state === 'stale'
+            && await markAuditFenceRetryable(auditFenceStorage(), userId, jobId, value)) return
           const reconciled = current.state === 'confirmed' && record
             && auditMatchesCurrentMaterials(record, selectedResumeId, finalCoverLetter?.id ?? null,
               selectedResumeUpdatedAt, finalCoverLetter?.updatedAt ?? null, dirty || saving)
@@ -2181,9 +2189,23 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     const requestMaterials = syncAuditMaterialScope()
     const requestEditRevision = editRevisionRef.current
     const auditStorage = auditFenceStorage()
-    const attemptId = beginAuditFence(auditStorage, owner, resumeLinkedJob.id, selectedResumeId, finalCoverLetter?.id ?? null)
+    const existingFence = readAuditFence(auditStorage, owner, resumeLinkedJob.id)
+    if (existingFence.state === 'retryable' && (selectedResumeId !== existingFence.fence.resumeId
+      || (finalCoverLetter?.id ?? null) !== existingFence.fence.coverLetterId)) {
+      const labels: Record<string, string> = { resume: selectedResume?.name ?? t('jobs.pack.resume'),
+        letter: finalCoverLetter ? `${t('application.auditSelectedLetter')}: ${finalCoverLetter.content.replace(/\s+/g, ' ').slice(0, 100)}` : t('application.coverLetterOptional') }
+      if (!window.confirm(t('application.auditChangedSelectionConfirm').replace(/\{(resume|letter)\}/g, (_, key: string) => labels[key]))) return null
+    }
+    const attemptId = existingFence.state === 'retryable'
+      ? beginRetryableAuditFence(auditStorage, owner, resumeLinkedJob.id, selectedResumeId, finalCoverLetter?.id ?? null)
+      : beginAuditFence(auditStorage, owner, resumeLinkedJob.id, selectedResumeId, finalCoverLetter?.id ?? null)
     if (!attemptId) {
       const current = readAuditFence(auditStorage, owner, resumeLinkedJob.id).state
+      if (current === 'retryable') {
+        setAuditError(t('application.auditVersionMismatch'))
+        setAuditOperationView({ jobId: resumeLinkedJob.id, userId: owner, generation: scope.generation, state: 'stale' })
+        return null
+      }
       const state = current === 'pending' || current === 'confirmed' ? 'localPending' : 'localUnavailable'
       setAuditError(t(`application.auditState.${state}`))
       setAuditOperationView({ jobId: resumeLinkedJob.id, userId: owner, generation: scope.generation, state })
@@ -3094,8 +3116,8 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
           {auditOperationView && auditOperationView.jobId === resumeLinkedJob?.id && auditOperationView.userId === resumeUserId
             && auditOperationView.generation === auditScopeGeneration && <div role="status" style={{ fontSize: 12 }}>
               <p>{t(`application.auditState.${auditOperationView.state}`)}</p>
-              {(dirty || saving) && <p>{t(localAuditFence.state === 'pending' || localAuditFence.state === 'unavailable' ? 'application.auditFenceAfterSave' : 'application.auditRefreshAfterSave')}</p>}
-              <button type="button" disabled={auditingApplication || dirty || saving} onClick={() => setAuditStatusRefresh(value => value + 1)}>{t('application.refreshStatus')}</button>
+              {(dirty || saving) && <p>{t(localAuditFence.state === 'pending' || localAuditFence.state === 'unavailable' || localAuditFence.state === 'retryable' ? 'application.auditFenceAfterSave' : 'application.auditRefreshAfterSave')}</p>}
+              {localAuditFence.state !== 'retryable' && <button type="button" disabled={auditingApplication || dirty || saving} onClick={() => setAuditStatusRefresh(value => value + 1)}>{t('application.refreshStatus')}</button>}
             </div>}
           {displayedApplicationAudit?.findings.some(finding => finding.area !== 'job_match' && finding.severity !== 'pass' && !finding.applied) &&
             <p role="note" style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{t('application.repairImpactGuidance')}</p>}

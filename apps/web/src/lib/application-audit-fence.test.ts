@@ -1,6 +1,6 @@
 import { webcrypto } from 'node:crypto'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { APPLICATION_AUDIT_FENCE_EVENT, beginAuditFence, confirmAuditFence, postApplicationAudit, postApplicationAuditCorrection, readAuditFence, reconcileAuditFence, waitForAuditFencePost, type AuditFencePost } from './application-audit-fence'
+import { APPLICATION_AUDIT_FENCE_EVENT, beginAuditFence, beginRetryableAuditFence, confirmAuditFence, markAuditFenceRetryable, postApplicationAudit, postApplicationAuditCorrection, readAuditFence, reconcileAuditFence, waitForAuditFencePost, type AuditFencePost } from './application-audit-fence'
 
 class MemoryStorage implements Storage {
   private values = new Map<string, string>()
@@ -43,6 +43,101 @@ describe('same-tab audit fence', () => {
     expect(readAuditFence(store, 'user-a', 'job-a').state).toBe('none')
   })
 
+  it('persists a matching stale completion for an explicit same-material retry', async () => {
+    const store = new MemoryStorage()
+    const attempt = beginAuditFence(store, 'user-a', 'job-a', 'resume-1', null)!
+    expect(await confirmAuditFence(store, 'user-a', 'job-a', attempt, audit)).toBe(true)
+    expect(await markAuditFenceRetryable(store, 'user-a', 'job-a', { state: 'stale', completedProof: receipt })).toBe(true)
+    // A fresh read models reload; only identifiers and the digest are stored.
+    expect(readAuditFence(store, 'user-a', 'job-a')).toMatchObject({ state: 'retryable', fence: { operationId, resumeId: 'resume-1' } })
+    expect(store.getItem(store.key(0)!)).not.toContain('Private')
+    expect(beginAuditFence(store, 'user-a', 'job-a', 'resume-1', null)).toBeNull()
+    expect(beginRetryableAuditFence(store, 'user-a', 'job-a', ' ', null)).toBeNull()
+    expect(beginRetryableAuditFence(store, 'user-a', 'job-a', 'resume-1', ' ')).toBeNull()
+    expect(beginRetryableAuditFence(store, 'user-b', 'job-a', 'resume-1', null)).toBeNull()
+    expect(beginRetryableAuditFence(store, 'user-a', 'job-b', 'resume-1', null)).toBeNull()
+    const retry = beginRetryableAuditFence(store, 'user-a', 'job-a', 'resume-1', null)!
+    expect(retry).not.toBe(attempt)
+    expect(readAuditFence(store, 'user-a', 'job-a')).toMatchObject({ state: 'pending', fence: { attemptId: retry, expectedOperationId: operationId } })
+    expect(await postApplicationAuditCorrection(store, 'user-a', 'job-a', retry, { resumeId: 'resume-1', coverLetterId: null, findingIndex: 0, auditOperationId: operationId })).toMatchObject({ data: null, preflightRejected: false })
+    const fetchMock = vi.fn().mockResolvedValue(Response.json({ error: 'Review changed', code: 'AUDIT_PREDECESSOR_CHANGED', auditAttemptId: retry }, { status: 409 }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      expect(await postApplicationAudit(store, 'user-a', 'job-a', retry, { resumeId: 'resume-1' })).toMatchObject({ data: null, preflightRejected: false })
+      expect(fetchMock).toHaveBeenCalledOnce()
+      expect(fetchMock.mock.calls[0][1].headers['X-Expected-Audit-Operation-Id']).toBe(operationId)
+      expect(readAuditFence(store, 'user-a', 'job-a')).toMatchObject({ state: 'pending', fence: { attemptId: retry, expectedOperationId: operationId } })
+    } finally { vi.unstubAllGlobals() }
+  })
+
+  it('does not use one retry handler precheck to release an uncertain duplicated attempt', async () => {
+    const store = new MemoryStorage()
+    const first = beginAuditFence(store, 'user-a', 'job-a', 'resume-1', null)!
+    expect(await confirmAuditFence(store, 'user-a', 'job-a', first, audit)).toBe(true)
+    expect(await markAuditFenceRetryable(store, 'user-a', 'job-a', { state: 'stale', completedProof: receipt })).toBe(true)
+    const retry = beginRetryableAuditFence(store, 'user-a', 'job-a', 'resume-1', null)!
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json({ error: 'Too long', code: 'AUDIT_PRECHECK_NOT_REGISTERED', auditRegistration: 'not_started', auditAttemptId: retry }, { status: 422 })))
+    try {
+      expect((await postApplicationAudit(store, 'user-a', 'job-a', retry, { resumeId: 'resume-1' })).preflightRejected).toBe(false)
+      expect(readAuditFence(store, 'user-a', 'job-a')).toMatchObject({ state: 'pending', fence: { attemptId: retry, expectedOperationId: operationId } })
+    } finally { vi.unstubAllGlobals() }
+  })
+
+  it('can confirm a successful retry without persisting the predecessor as its new identity', async () => {
+    const store = new MemoryStorage()
+    const first = beginAuditFence(store, 'user-a', 'job-a', 'resume-1', null)!
+    expect(await confirmAuditFence(store, 'user-a', 'job-a', first, audit)).toBe(true)
+    expect(await markAuditFenceRetryable(store, 'user-a', 'job-a', { state: 'stale', completedProof: receipt })).toBe(true)
+    const retry = beginRetryableAuditFence(store, 'user-a', 'job-a', 'resume-1', null)!
+    const result = { ...audit, operationId: '123e4567-e89b-42d3-a456-426614174001', resumeUpdatedAt: '2026-11-05T12:02:00.000Z' }
+    expect(await confirmAuditFence(store, 'user-a', 'job-a', retry, result)).toBe(true)
+    expect(readAuditFence(store, 'user-a', 'job-a')).toMatchObject({ state: 'confirmed', fence: { attemptId: retry, operationId: result.operationId } })
+    expect(store.getItem(store.key(0)!)).not.toContain('expectedOperationId')
+  })
+
+  it.each([
+    ['plain stale', { state: 'stale' }],
+    ['not stale', { state: 'pending', completedProof: receipt }],
+    ['wrong operation', { state: 'stale', completedProof: { ...receipt, operationId: '123e4567-e89b-42d3-a456-426614174001' } }],
+    ['wrong resume', { state: 'stale', completedProof: { ...receipt, resumeId: 'other' } }],
+    ['wrong letter', { state: 'stale', completedProof: { ...receipt, coverLetterId: 'other' } }],
+    ['wrong version', { state: 'stale', completedProof: { ...receipt, resumeUpdatedAt: '2026-11-05T12:02:00.000Z' } }],
+    ['wrong digest', { state: 'stale', completedProof: { ...receipt, audit: { ...audit, summary: 'Changed' } } }],
+    ['missing receipt', { state: 'stale', completedProof: { ...receipt, receipt: undefined } }],
+    ['bad receipt', { state: 'stale', completedProof: { ...receipt, receipt: { version: 1, signature: 'not-a-signature' } } }],
+  ])('retains the confirmed fence for %s', async (_label, proof) => {
+    const store = new MemoryStorage()
+    const attempt = beginAuditFence(store, 'user-a', 'job-a', 'resume-1', null)!
+    expect(await confirmAuditFence(store, 'user-a', 'job-a', attempt, audit)).toBe(true)
+    expect(await markAuditFenceRetryable(store, 'user-a', 'job-a', proof)).toBe(false)
+    expect(readAuditFence(store, 'user-a', 'job-a').state).toBe('confirmed')
+  })
+
+  it('does not release pending, unavailable, another scope, or a newer attempt', async () => {
+    const store = new MemoryStorage()
+    const attempt = beginAuditFence(store, 'user-a', 'job-a', 'resume-1', null)!
+    const proof = { state: 'stale', completedProof: receipt }
+    expect(await markAuditFenceRetryable(store, 'user-a', 'job-a', proof)).toBe(false)
+    expect(await markAuditFenceRetryable(null, 'user-a', 'job-a', proof)).toBe(false)
+    expect(await confirmAuditFence(store, 'user-a', 'job-a', attempt, audit)).toBe(true)
+    expect(await markAuditFenceRetryable(store, 'user-b', 'job-a', proof)).toBe(false)
+    expect(await markAuditFenceRetryable(store, 'user-a', 'job-b', proof)).toBe(false)
+    const late = markAuditFenceRetryable(store, 'user-a', 'job-a', proof)
+    store.clear()
+    const newer = beginAuditFence(store, 'user-a', 'job-a', 'resume-1', null)!
+    expect(await late).toBe(false)
+    expect(readAuditFence(store, 'user-a', 'job-a')).toMatchObject({ state: 'pending', fence: { attemptId: newer } })
+  })
+
+  it('preserves a confirmed fence if storing the retryable state fails', async () => {
+    const store = new MemoryStorage()
+    const attempt = beginAuditFence(store, 'user-a', 'job-a', 'resume-1', null)!
+    expect(await confirmAuditFence(store, 'user-a', 'job-a', attempt, audit)).toBe(true)
+    vi.spyOn(store, 'setItem').mockImplementation(() => { throw new Error('denied') })
+    expect(await markAuditFenceRetryable(store, 'user-a', 'job-a', { state: 'stale', completedProof: receipt })).toBe(false)
+    expect(readAuditFence(store, 'user-a', 'job-a').state).toBe('confirmed')
+  })
+
   it('does not let a late response overwrite a newer attempt', async () => {
     const store = new MemoryStorage()
     const old = beginAuditFence(store, 'user-a', 'job-a', 'resume-1', null)!
@@ -74,6 +169,43 @@ describe('same-tab audit fence', () => {
     expect(await confirmAuditFence(store, 'user-a', 'job-a', attempt, letterAudit)).toBe(true)
     expect(await reconcileAuditFence(store, 'user-a', 'job-a', { ...receipt, coverLetterId: 'letter-2', coverLetterUpdatedAt: letterAudit.coverLetterUpdatedAt })).toBe(false)
     expect(await reconcileAuditFence(store, 'user-a', 'job-a', { ...receipt, coverLetterId: 'letter-1', coverLetterUpdatedAt: letterAudit.coverLetterUpdatedAt })).toBe(true)
+  })
+
+  it('recovers a stale corrected letter only for its exact selected identity and version', async () => {
+    const store = new MemoryStorage()
+    const attempt = beginAuditFence(store, 'user-a', 'job-a', 'resume-1', 'letter-1')!
+    const result = { ...audit, coverLetterUpdatedAt: '2026-11-05T12:00:01.000Z' }
+    expect(await confirmAuditFence(store, 'user-a', 'job-a', attempt, result)).toBe(true)
+    const proof = { ...receipt, audit: result, coverLetterId: 'letter-1', coverLetterUpdatedAt: result.coverLetterUpdatedAt }
+    expect(await markAuditFenceRetryable(store, 'user-a', 'job-a', { state: 'stale', completedProof: { ...proof, coverLetterUpdatedAt: '2026-11-05T12:00:02.000Z' } })).toBe(false)
+    expect(await markAuditFenceRetryable(store, 'user-a', 'job-a', { state: 'stale', completedProof: proof })).toBe(true)
+    expect(beginRetryableAuditFence(store, 'user-a', 'job-a', 'resume-1', 'letter-1')).toBeTruthy()
+  })
+
+  it.each([
+    ['different resume', null, 'resume-2', null],
+    ['add letter', null, 'resume-1', 'letter-2'],
+    ['remove letter', 'letter-1', 'resume-1', null],
+    ['replace letter', 'letter-1', 'resume-1', 'letter-2'],
+  ] as const)('explicitly retries with %s while retaining the verified predecessor', async (_case, oldLetterId, nextResumeId, nextLetterId) => {
+    const store = new MemoryStorage()
+    const first = beginAuditFence(store, 'user-a', 'job-a', 'resume-1', oldLetterId)!
+    const result = oldLetterId ? { ...audit, coverLetterUpdatedAt: '2026-11-05T12:00:01.000Z' } : audit
+    expect(await confirmAuditFence(store, 'user-a', 'job-a', first, result)).toBe(true)
+    const proof = { ...receipt, audit: result, coverLetterId: oldLetterId, ...(oldLetterId ? { coverLetterUpdatedAt: result.coverLetterUpdatedAt } : {}) }
+    expect(await markAuditFenceRetryable(store, 'user-a', 'job-a', { state: 'stale', completedProof: proof })).toBe(true)
+    expect(beginAuditFence(store, 'user-a', 'job-a', nextResumeId, nextLetterId)).toBeNull()
+    expect(beginRetryableAuditFence(store, 'other-user', 'job-a', nextResumeId, nextLetterId)).toBeNull()
+    expect(beginRetryableAuditFence(store, 'user-a', 'other-job', nextResumeId, nextLetterId)).toBeNull()
+    const next = beginRetryableAuditFence(store, 'user-a', 'job-a', nextResumeId, nextLetterId)!
+    expect(next).toBeTruthy()
+    expect(readAuditFence(store, 'user-a', 'job-a')).toMatchObject({ state: 'pending', fence: { attemptId: next, resumeId: nextResumeId, coverLetterId: nextLetterId, expectedOperationId: operationId } })
+    expect(beginRetryableAuditFence(store, 'user-a', 'job-a', nextResumeId, nextLetterId)).toBeNull()
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json({ error: 'Review changed', code: 'AUDIT_PREDECESSOR_CHANGED', auditAttemptId: next }, { status: 409 })))
+    try {
+      expect((await postApplicationAudit(store, 'user-a', 'job-a', next, { resumeId: nextResumeId, coverLetterId: nextLetterId })).preflightRejected).toBe(false)
+      expect(readAuditFence(store, 'user-a', 'job-a')).toMatchObject({ state: 'pending', fence: { attemptId: next, expectedOperationId: operationId } })
+    } finally { vi.unstubAllGlobals() }
   })
 
   it('keeps an unresolved timeout fenced and records a late response without retrying', async () => {
