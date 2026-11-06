@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 import type { PrismaClient } from "@prisma/client"
+import type { ApprovalLedgerEventRow } from "@/components/agent-workspace/v2/approval-ledger-parser"
 
 import { answerQuestion, createQuestionWait, decideApproval } from "./store"
 import { redactSensitiveValue } from "@jobcopilot/shared"
@@ -8,6 +9,7 @@ import { createApprovalLedgerState, reduceApprovalLedger, selectApprovalLedgerPr
 import { normalizeTimelineEvent } from "@/components/agent-workspace/v2/timeline-event-normalizer"
 
 type Row = Record<string, any> // Test fixture rows mirror Prisma JSON records.
+type StoredAgentEvent = Row & ApprovalLedgerEventRow
 
 function fakeDb(taskId: string | null = null) {
   const turn: Row = { id: "turn_1", status: "in_progress", revision: 4 }
@@ -19,7 +21,7 @@ function fakeDb(taskId: string | null = null) {
     id: "approval_1", sessionId: "session_1", userId: "user_1", turnId: "turn_1", taskId, toolCallId: "call_approval",
     status: "pending", revision: 4, scopeHash: "scope_hash", expiresAt: new Date("2026-09-02T00:00:00.000Z"),
   }
-  const events: Row[] = []
+  const events: StoredAgentEvent[] = []
   const outbox: Row[] = []
   const tx = {
     $queryRaw: vi.fn(async (query: unknown) => {
@@ -50,7 +52,22 @@ function fakeDb(taskId: string | null = null) {
     },
     agentEvent: {
       findFirst: vi.fn(async ({ where }: { where: Row }) => events.find((event) => event.idempotencyKey === where.idempotencyKey) ?? null),
-      create: vi.fn(async ({ data }: { data: Row }) => { const event = { ...data, id: data.id ?? `event_${events.length + 1}`, sequence: BigInt(events.length + 10) }; events.push(event); return event }),
+      create: vi.fn(async ({ data }: { data: Row }) => {
+        const event: StoredAgentEvent = {
+          ...data,
+          id: data.id ?? `event_${events.length + 1}`,
+          sessionId: data.sessionId,
+          turnId: data.turnId,
+          itemId: data.itemId,
+          taskId: data.taskId,
+          sequence: BigInt(events.length + 10),
+          type: data.type,
+          actor: data.actor,
+          payload: data.payload,
+        }
+        events.push(event)
+        return event
+      }),
     },
     agentOutbox: { create: vi.fn(async ({ data }: { data: Row }) => { outbox.push(data); return data }) },
   }
