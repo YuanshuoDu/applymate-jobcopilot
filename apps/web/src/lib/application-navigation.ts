@@ -54,6 +54,17 @@ export async function openApplicationAttention(navigate: Navigate): Promise<bool
   return true
 }
 
+/** Open the general Applications list without stale filters or a selected job. */
+export async function openApplicationList(navigate: Navigate): Promise<boolean> {
+  if ((await navigate('jobs')) === false) return false
+  const url = new URL(window.location.href)
+  clearResumeContext(url)
+  for (const key of ['highlight', 'jobsAttention', 'jobsSearch', 'jobsStatus', 'jobsPage']) url.searchParams.delete(key)
+  replaceApplicationHistory(url.toString())
+  notifyApplicationNavigation()
+  return true
+}
+
 /** Attach the existing Agent page to a real session; never create a new run. */
 export async function openApplicationSession(sessionId: string, navigate: Navigate): Promise<boolean> {
   if (!sessionId.trim()) return false

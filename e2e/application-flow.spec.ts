@@ -78,7 +78,7 @@ test.beforeAll(async () => {
       }
       function Harness(){
         const [page,setPage]=useState(new URL(location.href).searchParams.get('page')||'jobs');
-        const navigate=(next)=>{const url=new URL(location.href);url.searchParams.set('page',next);history.pushState({},'',url);setPage(next)};
+        const navigate=(next)=>{if(globalThis.__fixtureBlockNavigation)return false;const url=new URL(location.href);url.searchParams.set('page',next);history.pushState({},'',url);setPage(next)};
         useEffect(()=>{const restore=()=>setPage(new URL(location.href).searchParams.get('page')||'jobs');addEventListener('popstate',restore);return()=>removeEventListener('popstate',restore)},[]);
         return <I18nProvider><ToastProvider><NavContext.Provider value={{navigate}}>
           <nav aria-label="Fixture navigation">{['jobs','resume','search','dashboard'].map(name=><button key={name} onClick={()=>navigate(name)}>Fixture {name}</button>)}</nav>
@@ -2977,6 +2977,125 @@ for (const surface of ['jobs', 'dashboard'] as const) {
     } finally { state.releaseReturnOwnerA() }
   })
 }
+
+for (const scenario of [
+  { status: 'submitted', label: /Submission recorded|已有提交记录/, session: true },
+  { status: 'cancelled', label: /Task cancelled|任务已取消/, session: true },
+  { status: 'skipped', label: /Application skipped|已跳过此申请/, session: true },
+  { status: 'unrecognized-status', label: /Status needs refreshing|状态待刷新/, session: true },
+  { status: 'submitted', label: /Submission recorded|已有提交记录/, session: false },
+  { status: 'unknown', label: /Submission outcome unverified|提交结果待核实/, session: false },
+] as const) {
+  test(`dashboard shows ${scenario.status} task with ${scenario.session ? 'the original session' : 'no session'}`, async ({ page }) => {
+    const state = await install(page)
+    await page.route('**/api/agent/application-tasks', route => route.fulfill({ json: { tasks: [{
+      id: 'task-1', userId: 'fixture-user', jobId: 'outside-page', sessionId: scenario.session ? 'original-session' : null,
+      status: scenario.status, checkpoint: null, updatedAt: time,
+      job: { company: 'Fixture Employer', role: 'Application flow engineer' },
+    }] } }))
+    await page.route('**/api/dashboard**', route => route.fulfill({ json: {
+      stats: { total: 1, saved: 1, applied: 0, inProgress: 0, interviews: 0, offers: 0, rejected: 0, thisWeek: 0 },
+      savedJobs: [{ id: 'outside-page', company: 'Fixture Employer', role: 'Application flow engineer', score: 82, createdAt: time, url: null }],
+      followUpsDue: scenario.status === 'submitted' ? [{ id: 'outside-page', company: 'Fixture Employer', role: 'Application flow engineer', status: 'applied', followUpAt: time }] : [],
+      activity: [], applicationDays: [], interviewsScheduled: [], todayRecommendations: [], agentConfig: null, hasResume: true,
+    } }))
+    await page.goto(`${origin}/?page=dashboard`)
+    const guidance = page.locator('.application-dashboard-guidance')
+    const card = guidance.getByRole('region', { name: 'Fixture Employer · Application flow engineer' })
+    await expect(card).toContainText(scenario.label)
+    await expect(guidance).not.toContainText(/Continue preparing this application|继续准备此申请/)
+    await expect(card).not.toContainText(/employer (?:confirmed|receipt)|雇主已确认|雇主回执/i)
+    if (scenario.status === 'submitted') await expect(guidance.getByRole('button', { name: /Follow-up due|待跟进/ })).toBeVisible()
+    if (scenario.session) {
+      const link = card.getByRole('link', { name: /View task activity|查看任务记录/ })
+      await expect(link).toHaveAttribute('href', '/?page=agent&sessionId=original-session')
+      await link.click()
+      await expect(page.getByTestId('agent-destination')).toHaveText('original-session')
+    } else {
+      await expect(card).toContainText(/The original session is unavailable|暂时无法打开原会话/)
+      await expect(card.getByRole('link')).toHaveCount(0)
+      const applicationLink = guidance.getByRole('link', { name: /View this application|查看此申请/ })
+      await expect(applicationLink).toHaveAttribute('href', '/?page=jobs&highlight=outside-page')
+      await applicationLink.click()
+      await expect(page).toHaveURL(/highlight=outside-page/)
+      await expect(page.getByRole('dialog')).toContainText('Application flow engineer')
+    }
+    expect(state.writes).toEqual([])
+    expect(state.unexpected).toEqual([])
+  })
+}
+
+test('dashboard limits recent task cards and opens the unfiltered Applications list', async ({ page }) => {
+  const state = await install(page)
+  await page.route('**/api/agent/application-tasks', route => route.fulfill({ json: { tasks: [
+    ['submitted', 'task-a', 'job-a', 'Employer A'],
+    ['waiting_for_user', 'task-b', 'job-b', 'Employer B'],
+    ['filling', 'task-c', 'job-c', 'Employer C'],
+    ['skipped', 'task-d', 'job-d', 'Employer D'],
+  ].map(([status, id, jobId, company]) => ({ id, userId: 'fixture-user', jobId, sessionId: `session-${id}`,
+    status, checkpoint: null, updatedAt: time, job: { company, role: 'Fixture Role' } })) } }))
+  await page.goto(`${origin}/?page=dashboard&jobsAttention=1&jobsSearch=NotFound&jobsStatus=interview&jobsPage=3&highlight=stale-job`)
+  const guidance = page.locator('.application-dashboard-guidance')
+  for (const company of ['Employer A', 'Employer B', 'Employer C']) await expect(guidance.getByRole('region', { name: `${company} · Fixture Role` })).toBeVisible()
+  await expect(guidance.getByRole('region', { name: 'Employer D · Fixture Role' })).toHaveCount(0)
+  await expect(guidance).toContainText(/Only three recent tasks are shown here|此处仅显示三个近期任务/)
+  const all = guidance.getByRole('link', { name: /^(All applications|全部申请)$/ })
+  await expect(all).toHaveAttribute('href', '/?page=jobs')
+  const originalUrl = page.url()
+  await page.evaluate(() => { (window as unknown as { __fixtureBlockNavigation: boolean }).__fixtureBlockNavigation = true })
+  await all.click()
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+  await expect(page).toHaveURL(originalUrl)
+  await expect(guidance).toBeVisible()
+  await page.evaluate(() => { (window as unknown as { __fixtureBlockNavigation: boolean }).__fixtureBlockNavigation = false })
+  await all.click()
+  await expect(page).toHaveURL(/page=jobs/)
+  const query = new URL(page.url()).searchParams
+  for (const key of ['highlight', 'jobsAttention', 'jobsSearch', 'jobsStatus', 'jobsPage']) {
+    if (key === 'jobsSearch') expect(query.get(key) ?? '').toBe('')
+    else if (key === 'jobsStatus') expect(query.get(key) ?? 'all').toBe('all')
+    else if (key === 'jobsPage') expect(query.get(key) ?? '1').toBe('1')
+    else expect(query.has(key)).toBe(false)
+  }
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+test('dashboard retains bounded coverage notice alongside a known terminal task', async ({ page }) => {
+  const state = await install(page)
+  await page.route('**/api/agent/application-tasks', route => route.fulfill({ json: { tasks: Array.from({ length: 100 }, (_, i) => ({
+    id: `task-${i}`, userId: 'fixture-user', jobId: `job-${i}`, sessionId: `session-${i}`,
+    status: 'submitted', checkpoint: null, updatedAt: time, job: { company: `Employer ${i}`, role: 'Fixture Role' },
+  })) } }))
+  await page.goto(`${origin}/?page=dashboard`)
+  const guidance = page.locator('.application-dashboard-guidance')
+  await expect(guidance.getByRole('region', { name: 'Employer 0 · Fixture Role' })).toContainText(/Submission recorded|已有提交记录/)
+  await expect(guidance).toContainText(/Some task statuses may be outside this list|部分任务状态可能不在此列表中/)
+  await expect(guidance).toContainText(/Only three recent tasks are shown here|此处仅显示三个近期任务/)
+  await expect(guidance).not.toContainText(/Continue preparing this application|继续准备此申请/)
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+test('dashboard refreshes its original task after returning from the Agent workspace', async ({ page }) => {
+  const state = await install(page)
+  let status = 'waiting_for_user'
+  await page.route('**/api/agent/application-tasks', route => route.fulfill({ json: { tasks: [{
+    id: 'task-1', userId: 'fixture-user', jobId: 'outside-page', sessionId: 'original-session', status,
+    checkpoint: status === 'waiting_for_user' ? 'form_answer_required' : null, updatedAt: time,
+    job: { company: 'Fixture Employer', role: 'Application flow engineer' },
+  }] } }))
+  await page.goto(`${origin}/?page=dashboard`)
+  const card = page.getByRole('region', { name: 'Fixture Employer · Application flow engineer' })
+  await card.getByRole('link', { name: /Continue in the original task|进入原任务处理/ }).click()
+  await expect(page.getByTestId('agent-destination')).toHaveText('original-session')
+  status = 'submitted'
+  await page.getByRole('button', { name: 'Fixture dashboard' }).click()
+  await expect(card).toContainText(/Submission recorded|已有提交记录/)
+  await expect(card.getByRole('link', { name: /View task activity|查看任务记录/ })).toHaveAttribute('href', '/?page=agent&sessionId=original-session')
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
 
 test('dashboard opens all recent attention tasks without a duplicate continuation', async ({ page }) => {
   const state = await install(page, { dashboardFourTasks: true })

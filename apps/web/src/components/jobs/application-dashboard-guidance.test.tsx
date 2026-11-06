@@ -22,7 +22,7 @@ function props() {
     tasks: [] as ApplicationTaskView[], loading: false, error: null, limited: false,
     savedJobs: [{ id: 'saved-27', company: 'Saved Inc', role: 'Engineer' }] as DashboardData['savedJobs'],
     followUps: [{ id: 'follow-19', company: 'Follow Inc', role: 'Developer' }] as DashboardData['followUpsDue'],
-    onOpenApplication: vi.fn(), onOpenSession: vi.fn(), onOpenAttention: vi.fn(), onRefresh: vi.fn(), onDiscover: vi.fn(),
+    onOpenApplication: vi.fn(), onOpenSession: vi.fn(), onOpenAttention: vi.fn(), onOpenApplications: vi.fn(), onRefresh: vi.fn(), onDiscover: vi.fn(),
     t: (key: string) => key,
   }
 }
@@ -167,6 +167,75 @@ describe('Dashboard application guidance', () => {
     const tree = ApplicationDashboardGuidance(input)
     expect(renderToStaticMarkup(tree)).not.toContain('dashboard.momentum.savePromising')
     expect(input.onDiscover).not.toHaveBeenCalled()
+  })
+
+  it.each(['submitted', 'cancelled', 'skipped', 'unrecognized-status', 'unknown'])(
+    'shows the known %s task and suppresses a contradictory saved-job suggestion', status => {
+      const input = { ...props(), tasks: [task('1', status)], followUps: [] }
+      input.savedJobs[0].id = 'job-1'
+      const tree = ApplicationDashboardGuidance(input)
+      const cards = elements(tree).filter(element => element.type === ApplicationTaskCard)
+      expect(cards).toHaveLength(1)
+      expect(cards[0].props.task).toMatchObject({ jobId: 'job-1', sessionId: 'session-1', status })
+      expect(cards[0].props.onOpenSession).toBe(input.onOpenSession)
+      const html = renderToStaticMarkup(tree)
+      expect(html).not.toContain('application.savedContinue')
+      expect(html).not.toContain('dashboard.momentum.savePromising')
+    },
+  )
+
+  it('shows unavailable original-session guidance without suggesting new preparation', () => {
+    const input = { ...props(), tasks: [{ ...task('1', 'submitted'), sessionId: null }], followUps: [] }
+    input.savedJobs[0].id = 'job-1'
+    const tree = ApplicationDashboardGuidance(input)
+    expect(elements(tree).filter(element => element.type === ApplicationTaskCard)[0].props.task).toMatchObject({ sessionId: null })
+    const html = renderToStaticMarkup(tree)
+    expect(html).not.toContain('application.savedContinue')
+    expect(html).not.toContain('dashboard.momentum.savePromising')
+    expect(html).not.toContain('/?page=agent')
+    const link = elements(tree).find(element => element.type === 'a' && element.props.href === '/?page=jobs&highlight=job-1')!
+    const preventDefault = vi.fn()
+    ;(link.props.onClick as (event: object) => void)({ button: 0, preventDefault })
+    expect(preventDefault).toHaveBeenCalledOnce()
+    expect(input.onOpenApplication).toHaveBeenCalledWith('job-1')
+  })
+
+  it('retains a real follow-up for a submitted task while suppressing its saved-job shortcut', () => {
+    const input = { ...props(), tasks: [task('1', 'submitted')] }
+    input.savedJobs[0].id = 'job-1'
+    input.followUps[0].id = 'job-1'
+    const tree = ApplicationDashboardGuidance(input)
+    const html = renderToStaticMarkup(tree)
+    expect(html).toContain('application.followUp')
+    expect(html).not.toContain('application.savedContinue')
+    const followUp = elements(tree).find(element => element.type === 'button')!
+    ;(followUp.props.onClick as () => void)()
+    expect(input.onOpenApplication).toHaveBeenCalledWith('job-1')
+  })
+
+  it('prioritizes attention and ongoing work over terminal tasks while suppressing all known jobs beyond the cap', () => {
+    const input = { ...props(), tasks: [task('1', 'submitted'), task('2', 'waiting_for_user'), task('3', 'filling'), task('4', 'waiting_for_authorization'), task('5', 'skipped')], followUps: [] }
+    input.savedJobs[0].id = 'job-5'
+    const tree = ApplicationDashboardGuidance(input)
+    const cards = elements(tree).filter(element => element.type === ApplicationTaskCard)
+    expect(cards.map(card => (card.props.task as ApplicationTaskView).id)).toEqual(['2', '4', '3'])
+    const html = renderToStaticMarkup(tree)
+    expect(html).not.toContain('application.savedContinue')
+    expect(html).toContain('application.dashboardMoreTasks')
+    const link = elements(tree).find(element => element.type === 'a' && element.props.href === '/?page=jobs')!
+    ;(link.props.onClick as (event: object) => void)({ button: 0, preventDefault: vi.fn() })
+    expect(input.onOpenApplications).toHaveBeenCalledOnce()
+  })
+
+  it('keeps a known terminal task visible in a limited snapshot without presenting suggestions', () => {
+    const input = { ...props(), limited: true, tasks: [task('1', 'submitted')] }
+    const tree = ApplicationDashboardGuidance(input)
+    expect(elements(tree).filter(element => element.type === ApplicationTaskCard)).toHaveLength(1)
+    const html = renderToStaticMarkup(tree)
+    expect(html).toContain('application.partialSuggestions')
+    expect(html).not.toContain('application.dashboardMoreTasks')
+    expect(html).not.toContain('application.savedContinue')
+    expect(html).not.toContain('application.followUp')
   })
 
   it('offers discovery only when the loaded snapshot has no continuation', () => {

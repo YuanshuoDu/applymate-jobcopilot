@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { applicationUrl, isApplicationNavigationEvent, openApplication, openApplicationAttention, openApplicationSession, openApplicationWhenSaved } from './application-navigation'
+import { applicationUrl, isApplicationNavigationEvent, openApplication, openApplicationAttention, openApplicationList, openApplicationSession, openApplicationWhenSaved } from './application-navigation'
 
 let href: string
 const replaceState = vi.fn((_state: unknown, _title: string, next: string) => { href = next })
@@ -112,6 +112,34 @@ describe('application navigation', () => {
     const original = href
     let finish!: (allowed: boolean) => void
     const result = openApplicationAttention(() => new Promise<boolean>(resolve => { finish = resolve }))
+    expect(replaceState).not.toHaveBeenCalled()
+    finish(false)
+    expect(await result).toBe(false)
+    expect(href).toBe(original)
+    expect(replaceState).not.toHaveBeenCalled()
+    expect(dispatchEvent).not.toHaveBeenCalled()
+  })
+
+  it('opens the general list after navigation and clears stale selection and filters', async () => {
+    const initial = new URL(href)
+    initial.searchParams.set('jobsAttention', '1')
+    initial.searchParams.set('highlight', 'old-job')
+    initial.searchParams.set('jobsSearch', 'old search')
+    initial.searchParams.set('jobsSort', 'score')
+    href = initial.toString()
+    expect(await openApplicationList(navigate)).toBe(true)
+    const result = new URL(href)
+    for (const key of ['highlight', 'jobsAttention', 'jobsSearch', 'jobsStatus', 'jobsPage', 'resumeId', 'returnToJobs', 'returnJobId']) expect(result.searchParams.has(key)).toBe(false)
+    expect(result.searchParams.get('jobsSort')).toBe('score')
+    expect(navigate).toHaveBeenCalledExactlyOnceWith('jobs')
+    expect(navigate.mock.invocationCallOrder[0]).toBeLessThan(replaceState.mock.invocationCallOrder[0])
+    expect(isApplicationNavigationEvent(dispatchEvent.mock.calls[0][0])).toBe(true)
+  })
+
+  it('retains the original URL while general-list navigation is pending or rejected', async () => {
+    const original = href
+    let finish!: (allowed: boolean) => void
+    const result = openApplicationList(() => new Promise<boolean>(resolve => { finish = resolve }))
     expect(replaceState).not.toHaveBeenCalled()
     finish(false)
     expect(await result).toBe(false)

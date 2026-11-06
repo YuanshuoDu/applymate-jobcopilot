@@ -16,19 +16,26 @@ type Props = {
   onOpenApplication: (jobId: string) => void
   onOpenSession: (sessionId: string) => void
   onOpenAttention: () => void
+  onOpenApplications: () => void
   onRefresh: () => void
   onDiscover: () => void
   t: (key: string) => string
 }
 
-export function ApplicationDashboardGuidance({ tasks, loading, error, limited, savedJobs, followUps, onOpenApplication, onOpenSession, onOpenAttention, onRefresh, onDiscover, t }: Props) {
+export function ApplicationDashboardGuidance({ tasks, loading, error, limited, savedJobs, followUps, onOpenApplication, onOpenSession, onOpenAttention, onOpenApplications, onRefresh, onDiscover, t }: Props) {
   const knownTasks = loading || error ? [] : tasks
   const allAttention = knownTasks.filter(task => getApplicationTaskState(task).needsAttention)
   const ongoing = knownTasks.filter(task => ['preparing', 'filling', 'submitting'].includes(getApplicationTaskState(task).kind))
-  const cards = [...allAttention, ...ongoing].slice(0, 3)
+  const otherTasks = knownTasks.filter(task => {
+    const state = getApplicationTaskState(task)
+    return !state.needsAttention && !['preparing', 'filling', 'submitting'].includes(state.kind)
+  })
+  const prioritizedTasks = [...allAttention, ...ongoing, ...otherTasks]
+  const cards = prioritizedTasks.slice(0, 3)
   const displayedOrOngoingIds = new Set([...allAttention, ...ongoing].map(task => task.jobId))
+  const knownTaskJobIds = new Set(knownTasks.map(task => task.jobId))
   const followUp = followUps.find(job => !displayedOrOngoingIds.has(job.id))
-  const savedJob = savedJobs.find(job => job.id !== followUp?.id && !displayedOrOngoingIds.has(job.id))
+  const savedJob = savedJobs.find(job => job.id !== followUp?.id && !knownTaskJobIds.has(job.id))
   const suggestionsAvailable = !loading && !error && !limited
   return <section className="application-dashboard-guidance" aria-labelledby="application-next-steps">
     <div className="application-dashboard-guidance-heading">
@@ -38,8 +45,23 @@ export function ApplicationDashboardGuidance({ tasks, loading, error, limited, s
     {loading && <p role="status">{t('dashboard.momentum.loading')}</p>}
     {error && <div role="status"><p>{t('dashboard.momentum.loadErrorDetail')}</p><button type="button" onClick={onRefresh}>{t('dashboard.momentum.tryAgain')}</button></div>}
     {limited && !loading && !error && <div role="status"><p>{t('application.partialSuggestions')}</p><button type="button" onClick={onRefresh}>{t('application.refreshStatus')}</button></div>}
-    {cards.length > 0 && <div className="application-dashboard-task-list">{cards.map(task => <ApplicationTaskCard key={task.id} task={task} onOpenSession={onOpenSession} />)}</div>}
+    {cards.length > 0 && <div className="application-dashboard-task-list">{cards.map(task => <div key={task.id}>
+      <ApplicationTaskCard task={task} onOpenSession={onOpenSession} />
+      {!task.sessionId && <a href={`/?page=jobs&highlight=${encodeURIComponent(task.jobId)}`} onClick={event => {
+        if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
+        event.preventDefault()
+        onOpenApplication(task.jobId)
+      }} style={{ display: 'inline-flex', alignItems: 'center', minHeight: 36 }}>{t('application.viewApplication')}</a>}
+    </div>)}</div>}
     {allAttention.length > 0 && <button type="button" onClick={onOpenAttention} style={{ minHeight: 36, marginTop: 8, padding: '4px 0', border: 0, background: 'transparent', color: 'var(--primary)', fontWeight: 600, cursor: 'pointer' }}>{t('application.viewRecentAttention')}</button>}
+    {prioritizedTasks.length > cards.length && <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+      <p>{t('application.dashboardMoreTasks')}</p>
+      <a href="/?page=jobs" onClick={event => {
+        if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
+        event.preventDefault()
+        onOpenApplications()
+      }}>{t('application.allApplications')}</a>
+    </div>}
     <div className="application-dashboard-links">
       {suggestionsAvailable && followUp && <button type="button" onClick={() => onOpenApplication(followUp.id)}>
         <span><small>{t('application.followUp')}</small><strong>{followUp.company} · {followUp.role}</strong></span><ArrowRight size={17} aria-hidden="true" />
