@@ -36,7 +36,7 @@ import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
 import { claimTurnLease, parseTurnJobPayload, releaseTurnLease, type TurnLease } from "../turns/lease.js"
 import { turnJobId } from "../turns/recovery-scanner.js"
 import { loadCanonicalTurnState } from "../canonical-turn-state.js"
-import { loadTaskGraphCurrentObservation } from "../canonical-turn-task-graph-context.js"
+import { loadTaskGraphCurrentObservation, mergeTaskGraphCurrentObservation } from "../canonical-turn-task-graph-context.js"
 import { createPgInputClaimStore } from "../context/input-claim-store.js"
 import { createPgContextOwnerFence, StepContextBuilder } from "../context/step-context-builder.js"
 import { checkTaskGraphTerminalVerification, TASK_GRAPH_VERIFICATION_BLOCKER } from "../turns/turn-execution-completion-gate.js"
@@ -15039,6 +15039,30 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 expect(currentGraph.nodes.find(node => node.key === "analysis")?.verificationReport).toMatchObject({
                   verifierVersion: TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION, status: "failed",
                 })
+                const planningRead = await taskGraphCommandPort.readCurrentForPlanning!(readScope)
+                const mergedCurrent = mergeTaskGraphCurrentObservation({
+                  system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: [],
+                }, planningRead.current)
+                const mergedContent = record(mergedCurrent.toolObservations.find(item => item.id === "task-graph-current")?.content)
+                const mergedNodes = Array.isArray(mergedContent?.nodes) ? mergedContent.nodes.map(record) : []
+                const mergedAnalyst = mergedNodes.find(node => node?.key === "analysis")
+                const mergedReport = record(mergedAnalyst?.verificationReport)
+                expect(mergedReport).toMatchObject({
+                  verifierVersion: TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION,
+                  status: "failed", reasonCode: "criterion_not_met",
+                  criteria: [
+                    { criterionId: "source-coverage", status: "failed", reasonCode: "criterion_not_met" },
+                    { criterionId: "finding-count", status: "failed", reasonCode: "criterion_not_met" },
+                  ],
+                })
+                expect(Object.keys(mergedReport ?? {}).sort()).toEqual([
+                  "criteria", "evidenceDigest", "reasonCode", "resultDigest", "status", "verifierVersion",
+                ])
+                expect(mergedReport?.evidenceDigest).toMatch(/^[a-f0-9]{64}$/)
+                expect(mergedReport?.resultDigest).toMatch(/^[a-f0-9]{64}$/)
+                expect(JSON.stringify(mergedReport)).not.toContain("dependencyBindings")
+                expect(JSON.stringify(mergedReport)).not.toContain(scoutATaskId)
+                expect(JSON.stringify(mergedReport)).not.toContain(scoutBTaskId)
                 const persisted = await pool!.query<{ id: string; role: string; result: unknown }>(
                   `SELECT "id", "role", "result" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2
                     AND "id" = ANY($3::text[])`, [value.sessionId, value.turnId, [analystTaskId, scoutATaskId]],
@@ -15060,6 +15084,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                   expect((await update(changed)).rowCount).toBe(1)
                   try {
                     await expect(taskGraphCommandPort.readCurrent(readScope)).rejects.toThrow("task_graph_verification_report_invalid")
+                    await expect(taskGraphCommandPort.readCurrentForPlanning!(readScope)).rejects.toThrow("task_graph_verification_report_invalid")
                   } finally {
                     expect((await update(original)).rowCount).toBe(1)
                   }

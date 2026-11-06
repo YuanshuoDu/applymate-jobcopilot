@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 import {
   TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION,
   TASK_GRAPH_VERIFIER_VERSION,
+  parseCurrentTaskGraphPublicVerificationReport,
   parseStoredTaskGraphVerificationReport,
   publicTaskGraphVerificationReport,
 } from "./task-graph-verification-report.js"
@@ -91,6 +92,36 @@ describe("TaskGraph verification report storage contract", () => {
     expect(parseStoredTaskGraphVerificationReport({ ...failedV2, dependencyBindings: [binding("scout-a")] }, ["in-scout"])).toBeUndefined()
   })
 
+  it("parses only the exact redacted failed v2 DTO for current observations", () => {
+    const stored = {
+      ...base, verifierVersion: TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION, status: "failed",
+      reasonCode: "criterion_not_met",
+      criteria: [{ criterionId: "in-scout", status: "failed", reasonCode: "criterion_not_met" }],
+      dependencyBindings: [binding("scout-a"), binding("scout-b")],
+    }
+    const privateReport = parseStoredTaskGraphVerificationReport(stored, ["in-scout"], ["scout-a", "scout-b"])
+    const publicReport = publicTaskGraphVerificationReport(privateReport!)
+    expect(parseCurrentTaskGraphPublicVerificationReport(publicReport, ["in-scout"])).toEqual(publicReport)
+    expect(parseStoredTaskGraphVerificationReport(publicReport, ["in-scout"])).toBeUndefined()
+    expect(JSON.stringify(parseCurrentTaskGraphPublicVerificationReport(publicReport, ["in-scout"]))).not.toContain("task-scout")
+
+    for (const malformed of [
+      { ...publicReport, dependencyBindings: stored.dependencyBindings },
+      { ...publicReport, unexpected: true },
+      { ...publicReport, verifierVersion: TASK_GRAPH_VERIFIER_VERSION },
+      { ...publicReport, status: "passed" },
+      { ...publicReport, reasonCode: "reported_score_below_minimum" },
+      { ...publicReport, evidenceDigest: "A".repeat(64) },
+      { ...publicReport, criteria: [{ criterionId: "in-scout", status: "unverified", reasonCode: "result_invalid" }] },
+      { ...publicReport, criteria: [{ criterionId: "in-scout", status: "failed", reasonCode: "reported_score_below_minimum" }] },
+    ]) expect(parseCurrentTaskGraphPublicVerificationReport(malformed, ["in-scout"])).toBeUndefined()
+
+    let getterCalls = 0
+    const accessor = { ...publicReport }
+    Object.defineProperty(accessor, "status", { enumerable: true, get() { getterCalls += 1; return "failed" } })
+    expect(parseCurrentTaskGraphPublicVerificationReport(accessor, ["in-scout"])).toBeUndefined()
+    expect(getterCalls).toBe(0)
+  })
   it("rejects duplicate, unsorted, malformed, or unverified private bindings", () => {
     const valid = { ...base, dependencyBindings: [binding("scout-a"), binding("scout-z")] }
     expect(parseStoredTaskGraphVerificationReport({ ...base, dependencyBindings: [binding("scout-a"), binding("scout-a")] }, ["in-scout"])).toBeUndefined()

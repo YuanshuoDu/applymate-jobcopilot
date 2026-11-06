@@ -83,6 +83,68 @@ function parseBindings(value: unknown): readonly TaskGraphVerificationDependency
   return output
 }
 
+function publicDataRecord(value: unknown): value is Record<string, unknown> {
+  try {
+    if (!record(value) || Object.getPrototypeOf(value) !== Object.prototype) return false
+    const descriptors = Object.getOwnPropertyDescriptors(value)
+    return Reflect.ownKeys(value).every(key => {
+      const descriptor = descriptors[key as string]
+      return Boolean(descriptor?.enumerable && Object.hasOwn(descriptor, "value"))
+    })
+  } catch { return false }
+}
+
+function publicDense(value: unknown, min: number, max: number): value is unknown[] {
+  try {
+    if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype
+      || value.length < min || value.length > max) return false
+    const descriptors = Object.getOwnPropertyDescriptors(value) as unknown as Record<string, PropertyDescriptor>
+    if (Reflect.ownKeys(value).length !== value.length + 1 || !descriptors.length || descriptors.length.enumerable) return false
+    return Array.from({ length: value.length }, (_, index) => {
+      const descriptor = descriptors[String(index)]
+      return Boolean(descriptor?.enumerable && Object.hasOwn(descriptor, "value"))
+    }).every(Boolean)
+  } catch { return false }
+}
+
+/** Parses the redacted v2 DTO only for current model observation; it grants no verification authority. */
+export function parseCurrentTaskGraphPublicVerificationReport(
+  value: unknown,
+  criterionIds: readonly string[],
+): TaskGraphVerificationReport | undefined {
+  if (!publicDataRecord(value) || !exact(value, "criteria,evidenceDigest,reasonCode,resultDigest,status,verifierVersion")
+    || value.verifierVersion !== TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION || value.status !== "failed"
+    || typeof value.reasonCode !== "string" || !REPORT_REASONS.has(value.reasonCode as TaskGraphVerificationReasonCode)
+    || typeof value.evidenceDigest !== "string" || !DIGEST.test(value.evidenceDigest)
+    || typeof value.resultDigest !== "string" || !DIGEST.test(value.resultDigest)
+    || !publicDense(value.criteria, 1, 8) || value.criteria.length !== criterionIds.length
+    || criterionIds.length < 1 || criterionIds.length > 8
+    || criterionIds.some((id, index) => typeof id !== "string" || !CRITERION_ID.test(id)
+      || index > 0 && criterionIds.indexOf(id) !== index)) return undefined
+
+  const criteria: NonNullable<TaskGraphVerificationReport["criteria"]>[number][] = []
+  for (let index = 0; index < value.criteria.length; index += 1) {
+    const item = value.criteria[index]
+    if (!publicDataRecord(item) || !exact(item, "criterionId,reasonCode,status")
+      || item.criterionId !== criterionIds[index] || typeof item.criterionId !== "string" || !CRITERION_ID.test(item.criterionId)
+      || typeof item.reasonCode !== "string" || !REPORT_REASONS.has(item.reasonCode as TaskGraphVerificationReasonCode)
+      || item.status !== "passed" && item.status !== "failed"
+      || item.status === "passed" && item.reasonCode !== "criteria_met"
+      || item.status === "failed" && item.reasonCode !== "criterion_not_met" && item.reasonCode !== "reported_score_below_minimum") return undefined
+    criteria.push({ criterionId: item.criterionId, status: item.status, reasonCode: item.reasonCode as TaskGraphVerificationReasonCode })
+  }
+  const reasonCode = value.reasonCode as TaskGraphVerificationReasonCode
+  if (!criteria.some(item => item.status === "failed")
+    || criteria.find(item => item.status === "failed")?.reasonCode !== reasonCode) return undefined
+  return {
+    verifierVersion: TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION,
+    status: "failed",
+    reasonCode,
+    criteria,
+    evidenceDigest: value.evidenceDigest,
+    resultDigest: value.resultDigest,
+  }
+}
 /** Parses the reserved server-owned report envelope; optional expected keys bind a typed cross-node contract. */
 export function parseStoredTaskGraphVerificationReport(
   value: unknown,
