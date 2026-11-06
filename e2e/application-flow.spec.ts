@@ -353,7 +353,10 @@ async function install(page: Page, options: { stale?: boolean; taskCheckpoint?: 
       if (options.auditCorrection && pathname.endsWith('/audit-application/apply')) {
         if (options.holdAuditCorrection) await auditCorrectionGate
         const updatedAt = '2026-10-30T12:00:00.000Z'
-        return json(route, { audit: { ...state.audit.audit, findings: [] }, target: 'summary', appliedContent: 'Audited v2 summary', resume: { ...state.resume, updatedAt, content: { ...state.resume.content, summary: 'Audited v2 summary' } }, coverLetter: null, resumeUpdatedAt: updatedAt })
+        const nextOperation = '123e4567-e89b-42d3-a456-426614174001'
+        state.resume = { ...state.resume, updatedAt, content: { ...state.resume.content, summary: 'Audited v2 summary' } }
+        state.audit = { ...state.audit, operationId: nextOperation, resumeUpdatedAt: updatedAt, receipt: { version: 1, signature: 'b'.repeat(64) }, audit: { ...state.audit.audit, verdict: 'needs_review', summary: 'A generated correction was applied. Run the independent audit again before final confirmation.', auditedAt: updatedAt, findings: state.audit.audit.findings.map(finding => ({ ...finding, applied: true, appliedAt: updatedAt })) } }
+        return json(route, { audit: state.audit.audit, operationId: nextOperation, target: 'summary', appliedContent: 'Audited v2 summary', resume: state.resume, coverLetter: null, resumeUpdatedAt: updatedAt })
       }
       if (pathname.endsWith('/tailor-resume')) return json(route, { adaptedResumeId: 'resume-1' })
       if (pathname === '/api/resume' && options.baseList === 'empty') { state.baseSaveStarted = true; if (options.holdBaseSave) await baseSaveGate; if (options.failBaseSave) return route.abort('failed'); const saved = body as { name: string; content: ReturnType<typeof resume>['content'] }; state.savedBase = { ...state.resume, id: 'base-created', kind: 'base', targetJobId: null, name: saved.name, content: saved.content }; return json(route, state.savedBase) }
@@ -500,9 +503,22 @@ for (const surface of ['jobs', 'resume'] as const) for (const proof of ['matchin
     if (proof === 'matching') await expect.poll(marker).toBeNull()
     else await expect.poll(marker).not.toBeNull()
     expect(posts).toBe(1)
-    await trigger.click()
-    if (proof === 'matching') await expect.poll(() => posts).toBe(2)
-    else { await expect(page.getByText(/unconfirmed review request|尚未确认的审核请求/).first()).toBeVisible(); expect(posts).toBe(1) }
+    if (proof === 'matching') {
+      await expect(trigger).toBeEnabled()
+      await trigger.click()
+      await expect.poll(() => posts).toBe(2)
+    } else {
+      const status = page.getByRole('status').filter({ hasText: /unconfirmed review request|尚未确认的审核请求/ }).first()
+      await expect(status).toBeVisible()
+      if (surface === 'jobs') {
+        await expect(trigger).toBeDisabled()
+        const refresh = status.getByRole('button', { name: /Refresh status|刷新状态/, exact: true })
+        await expect(refresh).toBeEnabled()
+        await refresh.click()
+        await expect(status).toBeVisible()
+      } else await trigger.click()
+      expect(posts).toBe(1)
+    }
     expect(state.unexpected).toEqual([])
   })
 }
@@ -1952,7 +1968,7 @@ for (const outcome of ['failed', 'verified', 'stale'] as const) {
     test.skip(testInfo.project.name !== 'desktop-en', 'Focused Resume audit regression')
     const state = await install(page)
     const oldAudit = structuredClone(state.audit)
-    const newAudit = { ...oldAudit, audit: { ...oldAudit.audit, auditedAt: '2026-10-30T10:05:00.000Z', summary: 'New verified audit' } }
+    const newAudit = { ...oldAudit, operationId: '123e4567-e89b-42d3-a456-426614174001', receipt: { version: 1 as const, signature: 'b'.repeat(64) }, audit: { ...oldAudit.audit, auditedAt: '2026-10-30T10:05:00.000Z', summary: 'New verified audit' } }
     let postStarted = false
     let canonicalStarted = false
     let releasePost = () => {}
@@ -2003,8 +2019,9 @@ for (const outcome of ['failed', 'verified', 'stale'] as const) {
         await expect(dialog).not.toContainText(/Application materials selected|已选择申请材料/)
         await expect(dialog.getByRole('button', { name: /Download application materials|下载申请材料/ })).toHaveCount(0)
       } else {
-        await expect(page.getByText('Audit response unavailable').first()).toBeVisible()
+        await expect(page.getByText(/This tab has an unconfirmed review request|此标签页有一项尚未确认的审核请求/i).first()).toBeVisible()
         await expect(dialog.getByRole('button', { name: /Download application materials|下载申请材料/ })).toHaveCount(0)
+        await expect(dialog).not.toContainText(/Application materials selected|已选择申请材料/)
       }
     } finally { releasePost(); releaseCanonical() }
   })
@@ -3525,7 +3542,7 @@ test('a selected letter and manual record arriving during a resume-only audit st
 })
 
 
-test('retrying preparation after the first audit fails reuses the generated resume', async ({ page }) => {
+test('an unknown first audit keeps the generated resume without repeating preparation', async ({ page }) => {
   const state = await install(page, { firstPreparation: true, failFirstAudit: true })
   await open(page)
   const prepare = page.getByRole('button', { name: /Prepare application materials|准备申请材料|Check current materials|检查当前材料/, exact: true })
@@ -3534,17 +3551,46 @@ test('retrying preparation after the first audit fails reuses the generated resu
     '/api/jobs/outside-page/tailor-resume', '/api/jobs/outside-page/audit-application',
   ])
   await expect(page.getByText(/Preparation could not finish|准备未完成/)).toBeVisible()
+  await expect(page.getByText(/This tab has an unconfirmed review request|此标签页有一项尚未确认的审核请求/i).first()).toBeVisible()
   expect(state.writes[1].body).toEqual({ resumeId: 'resume-1', coverLetterId: null })
   expect(state.job.finalResumeId).toBeNull()
-  await expect(prepare).toBeEnabled()
+  await expect(page.getByRole('button', { name: /Download application materials|下载申请材料/ })).toHaveCount(0)
+  await expect(prepare).toBeDisabled()
+  const status = page.getByRole('status').filter({ hasText: /This tab has an unconfirmed review request|此标签页有一项尚未确认的审核请求/i }).first()
+  const refresh = status.getByRole('button', { name: /Refresh status|刷新状态/, exact: true })
+  await expect(refresh).toBeEnabled()
+  await refresh.click()
+  await expect(status).toBeVisible()
+  await expect(prepare).toBeDisabled()
+  expect(state.writes.map(write => write.path)).toEqual(['/api/jobs/outside-page/tailor-resume', '/api/jobs/outside-page/audit-application'])
+  expect(state.job.finalResumeId).toBeNull()
+  await expect(page.getByText(/Application materials are ready|申请材料已准备好/, { exact: true })).toHaveCount(0)
+  expect(state.unexpected).toEqual([])
+})
+
+test('a certified no-write audit retry reuses the prepared resume', async ({ page }) => {
+  const state = await install(page, { firstPreparation: true })
+  let posts = 0
+  await page.route('**/api/jobs/outside-page/audit-application', route => {
+    if (route.request().method() !== 'POST') return route.fallback()
+    posts++
+    if (posts > 1) return route.fallback()
+    const attempt = route.request().headers()['x-application-audit-attempt-id']
+    return route.fulfill({ status: 422, json: { error: AUDIT_LIMIT_MESSAGES.final_resume_too_long, code: 'AUDIT_PRECHECK_NOT_REGISTERED', auditRegistration: 'not_started', auditAttemptId: attempt } })
+  })
+  await open(page)
+  const prepare = page.getByRole('button', { name: /Prepare application materials|准备申请材料|Check current materials|检查当前材料/, exact: true })
   await prepare.click()
-  await expect.poll(() => state.writes.map(write => write.path)).toEqual([
-    '/api/jobs/outside-page/tailor-resume', '/api/jobs/outside-page/audit-application',
-    '/api/jobs/outside-page/audit-application', '/api/jobs/outside-page/assign',
-  ])
-  expect(state.writes[2].body).toEqual({ resumeId: 'resume-1', coverLetterId: null })
-  expect(state.writes[3].body).toEqual({ finalResumeId: 'resume-1' })
-  expect(state.job.finalResumeId).toBe('resume-1')
+  await expect.poll(() => posts).toBe(1)
+  await expect(page.getByText(/selected resume is too long|所选简历内容过长/i).first()).toBeVisible()
+  expect(state.writes.filter(write => write.path.endsWith('/tailor-resume'))).toHaveLength(1)
+  expect(state.writes.filter(write => write.path.endsWith('/assign'))).toHaveLength(0)
+  await expect.poll(() => page.evaluate(() => sessionStorage.getItem('applymate:audit-fence:fixture-user:outside-page'))).toBeNull()
+  await prepare.click()
+  await expect.poll(() => posts).toBe(2)
+  await expect.poll(() => state.writes.filter(write => write.path.endsWith('/assign'))).toHaveLength(1)
+  expect(state.writes.filter(write => write.path.endsWith('/tailor-resume'))).toHaveLength(1)
+  expect(state.writes.find(write => write.path.endsWith('/assign'))?.body).toEqual({ finalResumeId: 'resume-1' })
   expect(state.unexpected).toEqual([])
 })
 
@@ -3685,7 +3731,8 @@ test('a newly failed audit cannot reuse an older passing receipt for the same ve
     if (route.request().method() !== 'POST') return route.fallback()
     const body = route.request().postDataJSON()
     state.writes.push({ path: '/api/jobs/outside-page/audit-application', body })
-    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...state.audit.audit, verdict: 'needs_review', summary: 'New audit found an issue', findings: [{ area: 'resume', severity: 'warning', title: 'Verify this', evidence: 'Missing support', action: 'Review' }], resumeUpdatedAt: state.resume.updatedAt }) })
+    state.audit = { ...state.audit, operationId: '123e4567-e89b-42d3-a456-426614174001', receipt: { version: 1, signature: 'b'.repeat(64) }, resumeUpdatedAt: state.resume.updatedAt, audit: { ...state.audit.audit, verdict: 'needs_review', summary: 'New audit found an issue', findings: [{ area: 'resume', severity: 'warning', title: 'Verify this', evidence: 'Missing support', action: 'Review' }] } }
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...state.audit.audit, operationId: state.audit.operationId, resumeUpdatedAt: state.resume.updatedAt }) })
   })
   await open(page)
   const prepare = page.getByRole('button', { name: /Check current materials|检查当前材料/, exact: true })
@@ -3759,9 +3806,25 @@ for (const scenario of [
         await expect(page.getByText(/Application materials are ready|申请材料已准备好/, { exact: true })).toBeVisible()
         expect(state.writes.filter(write => write.path.endsWith('/assign'))).toHaveLength(1)
       } else {
-        await expect(page.getByText(/audit could not be matched to the prepared material versions|无法确认审核所用版本与准备的材料一致/i)).toBeVisible()
+        const missingVersion = scenario.version === 'resume-missing' || scenario.version === 'letter-missing'
+        if (missingVersion) await expect(page.getByText(/audit response does not identify the prepared material versions.*do not start another review|审核响应未能确认所准备的材料版本.*请勿再次发起审核/i).first()).toBeVisible()
+        else await expect(page.getByText(/audit could not be matched to the prepared material versions|无法确认审核所用版本与准备的材料一致/i).first()).toBeVisible()
         expect(state.writes.filter(write => write.path.endsWith('/assign'))).toHaveLength(0)
         await expect(page.getByText(/Application materials are ready|申请材料已准备好/, { exact: true })).toHaveCount(0)
+        if (missingVersion) {
+          await expect(page.getByText(/This tab has an unconfirmed review request|此标签页有一项尚未确认的审核请求/i).first()).toBeVisible()
+          await expect.poll(() => page.evaluate(() => sessionStorage.getItem('applymate:audit-fence:fixture-user:outside-page'))).not.toBeNull()
+          const retry = page.getByRole('button', { name: /Check current materials|检查当前材料/, exact: true })
+          await expect(retry).toBeDisabled()
+          const status = page.getByRole('status').filter({ hasText: /This tab has an unconfirmed review request|此标签页有一项尚未确认的审核请求/i }).first()
+          const refresh = status.getByRole('button', { name: /Refresh status|刷新状态/, exact: true })
+          await expect(refresh).toBeEnabled()
+          await refresh.click()
+          await expect(status).toBeVisible()
+          await expect(retry).toBeDisabled()
+          await expect(page.getByRole('button', { name: /Download application materials|下载申请材料/ })).toHaveCount(0)
+          expect(state.writes.filter(write => write.path.endsWith('/assign'))).toHaveLength(0)
+        }
       }
       expect(state.writes.filter(write => write.path.endsWith('/audit-application'))).toHaveLength(1)
       expect(state.unexpected).toEqual([])

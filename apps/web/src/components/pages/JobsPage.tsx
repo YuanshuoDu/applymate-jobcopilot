@@ -1223,11 +1223,16 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
         setAuditLimitNotice(limitKey)
         throw new Error(limitKey ? t(limitKey) : auditError ?? t('application.auditVersionMismatch'))
       }
+      const versionUnconfirmed = Boolean(audit && (typeof audit.resumeUpdatedAt !== 'string' || !Number.isFinite(Date.parse(audit.resumeUpdatedAt))
+        || audit.resumeUpdatedAt !== tailored.updatedAt || (coverLetter
+          ? typeof audit.coverLetterUpdatedAt !== 'string' || !Number.isFinite(Date.parse(audit.coverLetterUpdatedAt)) || audit.coverLetterUpdatedAt !== coverLetter.updatedAt
+          : audit.coverLetterUpdatedAt != null)))
       const registered = readAuditFence(auditStorage, owner, job.id)
       if (!outcome || registered.state !== 'confirmed' || registered.fence.attemptId !== attemptId) {
         setAuditOperationView({ owner, jobId: job.id, state: registered.state === 'unavailable' ? 'localUnavailable' : 'localPending' })
         const limitKey = auditLimitMessageKey(auditError)
-        setAuditLimitNotice(limitKey)
+        if (versionUnconfirmed) setAuditLimitNotice('application.auditVersionUnconfirmed')
+        else if (limitKey) setAuditLimitNotice(limitKey)
         throw new Error(`${limitKey ? `${t(limitKey)} ` : ''}${t('application.auditState.localPending')}`)
       }
       requireLetterScope()
@@ -1521,7 +1526,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
               {needsBaseResume && resumeListReady && baseResumes.length > 1 && <label style={{ fontSize: 12 }}>{t('application.baseResume')}
                 <select value={selectedResumeId} onChange={event => setSelectedResumeId(event.target.value)} style={{ ...drawerInputSt, width: '100%', margin: '6px 0 12px' }}><option value="">{t('application.chooseBaseResume')}</option>{baseResumes.map(resume => <option key={resume.id} value={resume.id}>{resume.isDefault ? `${t('jobs.defaultResume')} — ` : ''}{resume.name}</option>)}</select>
               </label>}
-              <Btn variant="primary" disabled={autoPreparing || (!canReviewExistingIssues && (Boolean(previewResumeId && !evidenceResumeId) || (!currentPackAudited && !canTailorResume)))} onClick={() => {
+              <Btn variant="primary" disabled={autoPreparing || localAuditFence.state !== 'none' || (!canReviewExistingIssues && (Boolean(previewResumeId && !evidenceResumeId) || (!currentPackAudited && !canTailorResume)))} onClick={() => {
                 if (currentPackAudited) {
                   if (job.url && /^https?:\/\//i.test(job.url)) window.open(job.url, '_blank', 'noopener,noreferrer')
                   else setOpenPackItem('resume')
