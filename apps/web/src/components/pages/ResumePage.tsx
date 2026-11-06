@@ -1713,11 +1713,11 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   // Auto-save: 2 s debounce after any edit
   const autoSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   useEffect(() => {
-    if (!dirty) return
+    if (!dirty || !contentVerified) return
     if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current)
     autoSaveTimer.current = setTimeout(() => { handleSave() }, 2000)
     return () => { if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current) }
-  }, [content, sectionOrder, templateId, templateOptions, dirty])
+  }, [content, sectionOrder, templateId, templateOptions, dirty, contentVerified, selectedResumeId, resumeUserId])
 
   async function handleImportResume(imported: ResumeContent, mode: 'replace' | 'new') {
     if (mode === 'replace' && selectedResumeId) {

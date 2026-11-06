@@ -2035,12 +2035,13 @@ test('original application refresh retries resume verification without replacing
   try {
     await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
     const opportunity = page.locator('.resume-opportunity-card')
-    await expect(opportunity).toContainText(/This application is unavailable or you no longer have access|此申请不存在或你已无权访问/)
+    await expect(opportunity).toContainText('Fixture Employer')
+    await expect(opportunity).toContainText(/Could not refresh this resume|无法刷新简历/)
     const editor = page.locator('[data-resume-editor]')
     await editor.getByText('Software engineer.', { exact: false }).first().click()
     const field = editor.locator('textarea').first()
     await field.fill('Unsaved source verification edit')
-    await opportunity.getByRole('button', { name: /Refresh status|刷新状态/ }).click()
+    await opportunity.getByRole('button', { name: /Retry|重试/ }).click()
     await expect.poll(() => resumeReads).toBeGreaterThan(1)
     await expect(opportunity).toContainText('Fixture Employer')
     await expect(editor.getByText('Unsaved source verification edit', { exact: false }).first()).toBeVisible()
@@ -6053,6 +6054,28 @@ test('cached old resume revalidation never labels its analysis as the new versio
 })
 
 
+test('cached resume edit retains changes when the server version differs', async ({ page }) => {
+  const state = await install(page, { holdResumeContent: true })
+  await page.addInitScript(cached => sessionStorage.setItem('fixture_cached_resume', JSON.stringify(cached)), resume())
+  state.resume.updatedAt = '2026-10-30T12:00:00.000Z'
+  state.resume.content.summary = 'A newer server version.'
+  try {
+    await page.goto(`${origin}/?page=resume&resumeId=resume-1`)
+    await expect.poll(() => state.resumeContentRequested).toBe(true)
+    const editor = page.locator('[data-resume-editor]')
+    await editor.getByText('Software engineer.', { exact: false }).first().click()
+    await editor.locator('textarea').first().fill('Cached edit awaiting verification')
+    await page.waitForTimeout(2500)
+    expect(state.writes.filter(write => write.path === '/api/resume/resume-1')).toHaveLength(0)
+    state.releaseResumeContent()
+    await expect(page.getByText(/Copy unsaved edits, reload|复制未保存的编辑并重新加载/).first()).toBeVisible()
+    await page.waitForTimeout(2500)
+    expect(state.writes.filter(write => write.path === '/api/resume/resume-1')).toHaveLength(0)
+    await expect(editor.getByText('Cached edit awaiting verification', { exact: false }).first()).toBeVisible()
+    expect(state.unexpected).toEqual([])
+  } finally { state.releaseResumeContent() }
+})
+
 test('unverified cached resume edits are retained without issuing a save', async ({ page }) => {
   const state = await install(page, { holdResumeContent: true, resumeRevalidationFails: true })
   await page.addInitScript(cached => sessionStorage.setItem('fixture_cached_resume', JSON.stringify(cached)), resume())
@@ -6200,7 +6223,7 @@ test('a late older analysis cannot replace a newer version analysis', async ({ p
   } finally { state.releaseOldAnalysis() }
 })
 
-test('a delayed old resume GET cannot overwrite an edit already saved', async ({ page }) => {
+test('cached resume edits wait for matching verification before saving', async ({ page }) => {
   const state = await install(page, { holdResumeContent: true, snapshotResumeContent: true, saveMode: 'hold-success' })
   await page.addInitScript(cached => sessionStorage.setItem('fixture_cached_resume', JSON.stringify(cached)), resume())
   const newTime = '2026-10-30T12:00:00.000Z'
@@ -6209,6 +6232,12 @@ test('a delayed old resume GET cannot overwrite an edit already saved', async ({
     await expect.poll(() => state.resumeContentRequested).toBe(true)
     await page.getByText('Software engineer.', { exact: false }).first().click()
     await page.locator('textarea').first().fill('Saved while GET was pending')
+    await page.waitForTimeout(2300)
+    expect(state.writes.filter(item => item.path === '/api/resume/resume-1')).toHaveLength(0)
+    await expect(page.locator('textarea').first()).toHaveValue('Saved while GET was pending')
+    const verification = page.waitForResponse(response => response.url().endsWith('/api/resume/resume-1') && response.request().method() === 'GET')
+    state.releaseResumeContent()
+    await (await verification).finished()
     await expect.poll(() => state.writes.filter(item => item.path === '/api/resume/resume-1').length).toBeGreaterThan(0)
     state.resume.updatedAt = newTime
     const saveResponse = page.waitForResponse(response => response.url().endsWith('/api/resume/resume-1') && response.request().method() === 'PATCH')
@@ -6218,9 +6247,6 @@ test('a delayed old resume GET cannot overwrite an edit already saved', async ({
       const read = (window as unknown as { __fixtureGetCachedResume: () => { updatedAt?: string; content?: { summary?: string } } | null }).__fixtureGetCachedResume
       return read()
     })).toMatchObject({ updatedAt: newTime, content: { summary: 'Saved while GET was pending' } })
-    const oldGet = page.waitForResponse(response => response.url().endsWith('/api/resume/resume-1') && response.request().method() === 'GET')
-    state.releaseResumeContent()
-    await (await oldGet).finished()
     await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
     await expect(page.locator('textarea').first()).toHaveValue('Saved while GET was pending')
     await expect.poll(() => page.evaluate(() => {
