@@ -1,5 +1,5 @@
-// This uses real Web/Worker/database paths with a synthetic model; it is not
-// an application, approval, external submission, or employer receipt test.
+// This uses real Web/Worker/database paths with a synthetic model and a seeded
+// application/task link; it does not test approval, submission or a receipt.
 import { randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
 import path from 'node:path'
@@ -20,9 +20,19 @@ test('synthetic native question resumes the actual authenticated turn', async ({
     || process.env.AGENT_WEB_URL !== origin || process.env.AGENT_WORKER_SECRET !== 'fixture-only-worker-secret-at-least-32-bytes') throw new Error('Not the reviewed disposable fixture')
 
   const context = await browser.newContext({ baseURL: origin })
+  const applicationMutations: string[] = []
+  // Context request events observe browser traffic, not page.request calls
+  // such as session creation or the message that starts the Turn.
+  context.on('request', request => {
+    const pathname = new URL(request.url()).pathname
+    if (request.method() !== 'GET' && (pathname === '/api/jobs/fixture-question-job/apply'
+      || pathname === '/api/auto-apply' || pathname === '/api/agent/application-tasks')) applicationMutations.push(pathname)
+  })
   const requireFixture = createRequire(path.resolve('e2e/application-authenticated-agent.browser.ts'))
-  const { initializeFixtureSse, inspectTurn, closeFixtureDb } = requireFixture('./application-authenticated-agent-db.cjs') as {
+  const { initializeFixtureSse, attachFixtureApplication, inspectFixtureApplication, inspectTurn, closeFixtureDb } = requireFixture('./application-authenticated-agent-db.cjs') as {
     initializeFixtureSse: () => Promise<void>
+    attachFixtureApplication: (sessionId: string, turnId: string) => Promise<void>
+    inspectFixtureApplication: (sessionId: string) => Promise<{ jobStatus: string; taskStatus: string; sessionId: string; email: string }>
     inspectTurn: (sessionId: string, turnId: string) => Promise<{ turn: { status: string; error: string | null; completedEvents: number; answeredEvents: number; finalResponse: string | null }; questions: { id: string; status: string; content: { questionId?: string; question?: string; answer?: string | null; toolCallId?: string } }[]; eventTypes: string[]; steps: { status: string; errorCode: string | null; finishReason: string | null }[]; tasks: { status: string; failureReason: string | null }[]; toolResultCount: number; toolResultQuestionRedacted: boolean | null }>
     closeFixtureDb: () => Promise<void>
   }
@@ -91,10 +101,37 @@ test('synthetic native question resumes the actual authenticated turn', async ({
     expect(waiting.questions[0].status).toBe('started')
     expect(waiting.questions[0].content).toMatchObject({ question, toolCallId: 'fixture-native-question', answer: null })
     expect(waiting.questions[0].content.questionId).toBeTruthy()
+    const questionPath = `/api/agent/sessions/${encodeURIComponent(sessionId)}/questions/${encodeURIComponent(waiting.questions[0].content.questionId!)}`
+    let questionPosts = 0
+    context.on('request', request => {
+      const url = new URL(request.url())
+      if (request.method() === 'POST' && url.origin === origin && url.pathname === questionPath) questionPosts++
+    })
 
+    // The task link is fixture data, attached only after the real Turn has
+    // reached its real question. It is not a claim that application execution
+    // generated the question or that any employer submission took place.
+    await attachFixtureApplication(sessionId, turnId)
+    expect(await inspectFixtureApplication(sessionId)).toMatchObject({ jobStatus: 'saved', taskStatus: 'waiting_for_user', sessionId })
+    const taskResponse = await page.request.get('/api/agent/application-tasks')
+    expect(taskResponse.status()).toBe(200)
+    expect((await taskResponse.json()).tasks).toEqual(expect.arrayContaining([expect.objectContaining({
+      id: 'fixture-question-task', jobId: 'fixture-question-job', sessionId, status: 'waiting_for_user',
+    })]))
+    await page.goto('/?page=jobs')
+    await page.getByRole('button', { name: /Needs your attention|需要我处理/ }).click()
+    const attention = page.getByRole('region', { name: /Needs your attention|需要我处理/ })
+    await expect(attention).toContainText('Fixture Question Company · Fixture Question Engineer')
+    await attention.getByRole('link', { name: /View this application|查看此申请/ }).click()
+    await expect(page).toHaveURL(/highlight=fixture-question-job/)
+    const drawer = page.getByRole('dialog')
+    await expect(drawer).toContainText('Fixture Question Engineer')
+    await expect(drawer).toContainText('Fixture Question Company')
     const eventResponse = page.waitForResponse(response => response.request().method() === 'GET'
       && new URL(response.url()).pathname === `/api/agent/sessions/${encodeURIComponent(sessionId)}/events`)
-    await page.goto(`/?page=agent&sessionId=${encodeURIComponent(sessionId)}`)
+    await drawer.getByRole('link', { name: /Continue in the original task|进入原任务处理/ }).click()
+    await expect(page).toHaveURL(/page=agent/)
+    await expect(page).toHaveURL(new RegExp(`sessionId=${encodeURIComponent(sessionId)}`))
     const stream = await eventResponse
     expect(stream.status()).toBe(200)
     expect(stream.headers()['content-type']).toContain('text/event-stream')
@@ -106,7 +143,7 @@ test('synthetic native question resumes the actual authenticated turn', async ({
     await expect(card.getByText(question, { exact: true })).toBeVisible({ timeout: 30_000 })
     await card.getByRole('textbox', { name: question }).fill(answer)
     const submitted = page.waitForResponse(response => response.request().method() === 'POST'
-      && response.url().endsWith(`/api/agent/sessions/${encodeURIComponent(sessionId)}/questions/${encodeURIComponent(waiting.questions[0].content.questionId!)}`))
+      && new URL(response.url()).origin === origin && new URL(response.url()).pathname === questionPath)
     await card.getByRole('button', { name: /^(Send answer|发送回答)$/ }).click()
     const answered = await submitted
     expect(answered.status()).toBe(202)
@@ -123,6 +160,9 @@ test('synthetic native question resumes the actual authenticated turn', async ({
     expect(finished.turn.finalResponse).toContain(finalText)
     expect(finished.questions).toHaveLength(1)
     expect(finished.questions[0]).toMatchObject({ status: 'completed', content: { question, answer } })
+    // The synthetic link is not an application execution or a result receipt.
+    expect(await inspectFixtureApplication(sessionId)).toMatchObject({ jobStatus: 'saved', sessionId })
+    expect(applicationMutations).toEqual([])
 
     const other = await browser.newContext({ baseURL: origin })
     try {
@@ -134,6 +174,8 @@ test('synthetic native question resumes the actual authenticated turn', async ({
       await otherPage.getByRole('button', { name: /^(Sign in|Log in)$/ }).click()
       await otherPage.waitForURL(url => url.origin === origin && url.pathname === '/')
       expect((await otherPage.request.get(turnsUrl)).status()).toBe(404)
+      expect((await otherPage.request.get('/api/jobs/fixture-question-job')).status()).toBe(404)
     } finally { await other.close() }
+    expect(questionPosts).toBe(1)
   } finally { await context.close(); await closeFixtureDb() }
 })

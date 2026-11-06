@@ -438,6 +438,75 @@ async function open(page: Page, query = '') {
   await expect(page.getByText('Application flow engineer', { exact: true }).first()).toBeVisible()
 }
 
+for (const condition of ['saved', 'recorded', 'unavailable', 'limited'] as const) {
+  test(`application list explains ${condition} and opens the same job`, async ({ page }, testInfo) => {
+    const state = await install(page, { descriptionMode: 'two', recordedInitially: condition === 'recorded',
+      taskFailure: condition === 'unavailable', taskLimited: condition === 'limited' })
+    await page.goto(`${origin}/?page=jobs`)
+    const mobile = testInfo.project.name.startsWith('mobile')
+    const entry = mobile ? page.locator('.jobs-mobile-list article').filter({ hasText: 'Application flow engineer' })
+      : page.getByRole('row').filter({ hasText: 'Application flow engineer' })
+    const expected = condition === 'saved' ? /Saved for review.*next step|职位已保存.*下一步/
+      : condition === 'recorded' ? /submission record exists.*history|已有提交记录.*查看历史/
+        : condition === 'unavailable' ? /Task status is unavailable.*existing records|无法读取任务状态.*核对现有记录/
+          : /Task coverage is limited.*check its status|任务覆盖范围有限.*检查状态/
+    await expect(entry).toContainText(expected)
+    await expect(entry).not.toContainText(/audit passed|审核已通过|no related task|没有相关任务/i)
+    const action = entry.getByRole('button', { name: /View this application|查看此申请/ })
+    if (mobile) await expect(action).toHaveAccessibleDescription(expected)
+    await action.focus()
+    await page.keyboard.press('Enter')
+    await expect(page).toHaveURL(/highlight=outside-page/)
+    await expect(page.getByRole('dialog')).toContainText('Application flow engineer')
+    expect(state.writes).toEqual([])
+    expect(state.unexpected).toEqual([])
+  })
+}
+
+for (const status of ['applied', 'interview', 'offer', 'rejected'] as const) {
+  for (const coverage of ['ready', 'limited', 'unavailable'] as const) {
+    test(`application list treats ${status} with ${coverage} task coverage honestly`, async ({ page }, testInfo) => {
+      const state = await install(page, { descriptionMode: 'two', taskFailure: coverage === 'unavailable', taskLimited: coverage === 'limited' })
+      state.job.status = status
+      await page.goto(`${origin}/?page=jobs`)
+      const mobile = testInfo.project.name.startsWith('mobile')
+      const entry = mobile ? page.locator('.jobs-mobile-list article').filter({ hasText: 'Application flow engineer' })
+        : page.getByRole('row').filter({ hasText: 'Application flow engineer' })
+      const expected = coverage === 'unavailable' ? /Task status is unavailable.*existing records|无法读取任务状态.*核对现有记录/
+        : coverage === 'limited' ? /Task coverage is limited.*check its status|任务覆盖范围有限.*检查状态/
+          : status === 'applied' ? /submission record exists.*history|已有提交记录.*查看历史/
+            : /Check the application status and history|检查申请状态和历史/
+      await expect(entry).toContainText(expected)
+      await expect(entry).not.toContainText(/audit passed|审核已通过|no related task|没有相关任务/i)
+      const action = entry.getByRole('button', { name: /View this application|查看此申请/ })
+      if (mobile) await expect(action).toHaveAccessibleDescription(expected)
+      await action.focus()
+      await page.keyboard.press('Enter')
+      await expect(page).toHaveURL(/highlight=outside-page/)
+      await expect(page.getByRole('dialog')).toContainText('Application flow engineer')
+      expect(state.writes).toEqual([])
+      expect(state.unexpected).toEqual([])
+    })
+  }
+}
+
+test('application list shows loading and then the existing task without duplicating its action', async ({ page }, testInfo) => {
+  const state = await install(page, { descriptionMode: 'two', taskStatus: 'waiting_for_user', holdFirstTaskRead: true })
+  try {
+    await page.goto(`${origin}/?page=jobs`)
+    const entry = testInfo.project.name.startsWith('mobile') ? page.locator('.jobs-mobile-list article').filter({ hasText: 'Application flow engineer' })
+      : page.getByRole('row').filter({ hasText: 'Application flow engineer' })
+    await expect(entry).toContainText(/Checking related task status|正在检查相关任务状态/)
+    expect(state.taskReads).toBe(1)
+    state.releaseFirstTaskRead()
+    await expect(entry).toContainText(/Your action is needed|需要你处理/)
+    await expect(entry.getByRole('button', { name: /Continue in the original task|进入原任务处理/ })).toHaveCount(1)
+    await expect(entry).not.toContainText(/Saved for review.*next step|职位已保存.*下一步/)
+    expect(state.writes).toEqual([])
+    expect(state.unexpected).toEqual([])
+  } finally { state.releaseFirstTaskRead() }
+})
+
 // Model the browser's confirmed POST receipt independently of the helper under
 // test: an exact digest is required before a stale proof can permit recovery.
 function fixtureConfirmedFence(record: ReturnType<typeof audit>) {

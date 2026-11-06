@@ -198,9 +198,22 @@ export function toMobileJobCard(job: Job): MobileJobCardData {
 }
 
 // ── ListView ──────────────────────────────────────────────────────────────────
-function ListView({ jobs, taskByJobId, onOpenSession, onRowClick, selectedIds, onToggle, onToggleAll, sortBy, sortDir, onChangeSort }: {
+type TaskReadState = 'loading' | 'unavailable' | 'limited' | 'ready'
+
+function ApplicationListHint({ job, taskReadState, id }: { job: Job; taskReadState: TaskReadState; id?: string }) {
+  const { t } = useI18n()
+  const key = taskReadState === 'loading' ? 'application.listTaskLoading'
+    : taskReadState === 'unavailable' ? 'application.listTaskUnavailable'
+      : taskReadState === 'limited' ? 'application.listTaskLimited'
+        : hasVisibleSubmissionRecord(job) ? 'application.listRecorded'
+          : blocksManualRecord(job) ? 'application.listNeedsStatusCheck' : 'application.listSaved'
+  return <span id={id} style={{ display: 'block', marginTop: 5, color: 'var(--text-muted)', fontSize: 12, lineHeight: 1.4 }}>{t(key)}</span>
+}
+
+function ListView({ jobs, taskByJobId, taskReadState, onOpenSession, onRowClick, selectedIds, onToggle, onToggleAll, sortBy, sortDir, onChangeSort }: {
   jobs: Job[]
   taskByJobId: ReadonlyMap<string, ApplicationTaskView>
+  taskReadState: TaskReadState
   onOpenSession: (sessionId: string) => void
   onRowClick: (job: Job) => void
   selectedIds: Set<string>
@@ -276,7 +289,7 @@ function ListView({ jobs, taskByJobId, onOpenSession, onRowClick, selectedIds, o
                   ) : null
                 })() : null}
               </td>
-              <td style={{ padding: '10px 16px' }}><StatusBadge status={j.status} />{taskByJobId.get(j.id) && <ApplicationTaskSummary task={taskByJobId.get(j.id)!} onOpenSession={onOpenSession} />}</td>
+              <td style={{ padding: '10px 16px' }}><StatusBadge status={j.status} />{taskByJobId.get(j.id) ? <ApplicationTaskSummary task={taskByJobId.get(j.id)!} onOpenSession={onOpenSession} /> : <ApplicationListHint job={j} taskReadState={taskReadState} />}</td>
               <td style={{ padding: '10px 16px' }}><ScorePill score={j.score} /></td>
               <td style={{ padding: '10px 16px', fontSize: 11, color: 'var(--text-muted)' }}>
                 {fmtDate(j.appliedAt ?? j.createdAt)}
@@ -295,9 +308,10 @@ function ListView({ jobs, taskByJobId, onOpenSession, onRowClick, selectedIds, o
   )
 }
 
-function MobileListView({ jobs, taskByJobId, onOpenSession, onRowClick, selectedIds, onToggle }: {
+function MobileListView({ jobs, taskByJobId, taskReadState, onOpenSession, onRowClick, selectedIds, onToggle }: {
   jobs: Job[]
   taskByJobId: ReadonlyMap<string, ApplicationTaskView>
+  taskReadState: TaskReadState
   onOpenSession: (sessionId: string) => void
   onRowClick: (job: Job) => void
   selectedIds: Set<string>
@@ -308,6 +322,7 @@ function MobileListView({ jobs, taskByJobId, onOpenSession, onRowClick, selected
     <div className="jobs-mobile-list" aria-label={t('jobs.mobileList')}>
       {jobs.map(job => {
         const card = toMobileJobCard(job)
+        const hintId = `application-mobile-hint-${encodeURIComponent(job.id)}`
         return (
           <article key={card.id} className="jobs-mobile-card">
             <input
@@ -322,6 +337,7 @@ function MobileListView({ jobs, taskByJobId, onOpenSession, onRowClick, selected
               className="jobs-mobile-card-main"
               onClick={() => onRowClick(job)}
               aria-label={`${t('application.viewApplication')}: ${card.company} · ${card.role}`}
+              aria-describedby={!taskByJobId.has(job.id) ? hintId : undefined}
             >
               <div className="jobs-mobile-card-heading">
                 <CompanyLogo logo={card.logo ?? card.company.slice(0, 2).toUpperCase()} size={28} />
@@ -336,6 +352,8 @@ function MobileListView({ jobs, taskByJobId, onOpenSession, onRowClick, selected
                 <StatusBadge status={card.status} />
                 <span>{fmtDate(card.date)}</span>
               </div>
+              {!taskByJobId.has(job.id) && <ApplicationListHint job={job} taskReadState={taskReadState} id={hintId} />}
+              <span style={{ display: 'block', marginTop: 6, color: 'var(--primary)', fontSize: 12 }}>{t('application.viewApplication')}</span>
             </button>
             {taskByJobId.get(job.id) && <ApplicationTaskSummary task={taskByJobId.get(job.id)!} onOpenSession={onOpenSession} />}
             </div>
@@ -2065,6 +2083,7 @@ export function JobsPage() {
   const [confirm, ConfirmDialog] = useConfirm()
   const [initialList] = useState(() => readApplicationListState(typeof window === 'undefined' ? '/' : window.location.href))
   const applicationTasks = useApplicationTasks()
+  const taskReadState: TaskReadState = applicationTasks.loading ? 'loading' : applicationTasks.error ? 'unavailable' : applicationTasks.limited ? 'limited' : 'ready'
   const [attentionView, setAttentionView] = useState(() => typeof window !== 'undefined' && new URL(window.location.href).searchParams.get('jobsAttention') === '1')
   const listRef = useRef<HTMLDivElement>(null)
   const [highlightId, setHighlightId] = useState(() => typeof window === 'undefined' ? null : new URL(window.location.href).searchParams.get('highlight'))
@@ -2433,9 +2452,9 @@ export function JobsPage() {
             {view === 'list'
               ? <>
                 <div className="jobs-desktop-list">
-                  <ListView onOpenSession={id => openApplicationSession(id, navigate)} taskByJobId={applicationTasks.byJobId} jobs={displayJobs} onRowClick={selectApplication} selectedIds={selectedIds} onToggle={toggleSelected} onToggleAll={toggleAllVisible} sortBy={sortBy} sortDir={sortDir} onChangeSort={(by, dir) => { setSortBy(by); setSortDir(dir) }} />
+                  <ListView onOpenSession={id => openApplicationSession(id, navigate)} taskByJobId={applicationTasks.byJobId} taskReadState={taskReadState} jobs={displayJobs} onRowClick={selectApplication} selectedIds={selectedIds} onToggle={toggleSelected} onToggleAll={toggleAllVisible} sortBy={sortBy} sortDir={sortDir} onChangeSort={(by, dir) => { setSortBy(by); setSortDir(dir) }} />
                 </div>
-                <MobileListView onOpenSession={id => openApplicationSession(id, navigate)} taskByJobId={applicationTasks.byJobId} jobs={displayJobs} onRowClick={selectApplication} selectedIds={selectedIds} onToggle={toggleSelected} />
+                <MobileListView onOpenSession={id => openApplicationSession(id, navigate)} taskByJobId={applicationTasks.byJobId} taskReadState={taskReadState} jobs={displayJobs} onRowClick={selectApplication} selectedIds={selectedIds} onToggle={toggleSelected} />
               </>
               : <KanbanView jobs={displayJobs} pendingIds={pendingStatusIds} uncertainIds={uncertainStatusIds} onStatusChange={handleStatusChange} onAddClick={col => { setPrefillStatus(col); setShowAdd(true) }} onRowClick={selectApplication} />}
 
@@ -2470,7 +2489,7 @@ export function JobsPage() {
           key={selectedJob.id}
           job={selectedJob}
           task={applicationTasks.byJobId.get(selectedJob.id)}
-          taskReadState={applicationTasks.loading ? 'loading' : applicationTasks.error ? 'unavailable' : applicationTasks.limited ? 'limited' : 'ready'}
+          taskReadState={taskReadState}
           onRefreshTasks={() => void applicationTasks.refetch()}
           onClose={() => selectApplication(null)}
           onStatusChange={(id, status) => {

@@ -69,4 +69,41 @@ async function inspectTurn(sessionId, turnId) {
     toolResultCount: toolResults.rows[0].count, toolResultQuestionRedacted: toolResults.rows[0].questionRedacted }
 }
 
-module.exports = { initializeFixtureSse, inspectTurn, closeFixtureDb: () => pool.end() }
+// The application/task linkage is synthetic; the question and Turn must
+// already exist and be waiting through the real runtime before it is added.
+async function attachFixtureApplication(sessionId, turnId) {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const state = await client.query(`SELECT session."userId" AS owner
+      FROM "agent_sessions" session JOIN "agent_turns" turn
+        ON turn."sessionId" = session.id AND turn."userId" = session."userId"
+      JOIN "User" candidate ON candidate.id = session."userId"
+      WHERE session.id = $1 AND turn.id = $2 AND turn.status = 'waiting_for_user'
+        AND candidate.email = 'candidate-a@example.invalid'
+        AND (SELECT COUNT(*) FROM "agent_items" item WHERE item."sessionId" = session.id
+          AND item."turnId" = turn.id AND item.type = 'question' AND item.status = 'started') = 1`, [sessionId, turnId])
+    const empty = await client.query('SELECT (SELECT COUNT(*) FROM "Job")::int AS jobs, (SELECT COUNT(*) FROM "application_tasks")::int AS tasks')
+    if (state.rowCount !== 1 || empty.rows[0].jobs !== 0 || empty.rows[0].tasks !== 0) throw new Error('Expected the isolated waiting question and empty application state')
+    const owner = state.rows[0].owner
+    await client.query(`INSERT INTO "Job" (id, "userId", company, role, source, status, "createdAt", "updatedAt")
+      VALUES ('fixture-question-job', $1, 'Fixture Question Company', 'Fixture Question Engineer', 'fixture', 'saved', NOW(), NOW())`, [owner])
+    await client.query(`INSERT INTO "application_tasks" (id, "userId", "jobId", "sessionId", status, checkpoint, "createdAt", "updatedAt")
+      VALUES ('fixture-question-task', $1, 'fixture-question-job', $2, 'waiting_for_user', 'form_answer_required', NOW(), NOW())`, [owner, sessionId])
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally { client.release() }
+}
+
+async function inspectFixtureApplication(sessionId) {
+  const result = await pool.query(`SELECT job.status AS "jobStatus", task.status AS "taskStatus", task."sessionId", candidate.email
+    FROM "application_tasks" task JOIN "Job" job ON job.id = task."jobId" AND job."userId" = task."userId"
+    JOIN "User" candidate ON candidate.id = task."userId"
+    WHERE task.id = 'fixture-question-task' AND job.id = 'fixture-question-job' AND task."sessionId" = $1`, [sessionId])
+  if (result.rowCount !== 1 || result.rows[0].email !== 'candidate-a@example.invalid') throw new Error('Unexpected fixture application scope')
+  return result.rows[0]
+}
+
+module.exports = { initializeFixtureSse, attachFixtureApplication, inspectFixtureApplication, inspectTurn, closeFixtureDb: () => pool.end() }
