@@ -151,7 +151,10 @@ test('real login prepares and reviews a synthetic application through the actual
   // Removing a period changes the material version without adding any fact.
   const resumedDrawer = page.getByRole('dialog')
   phase = 'editing'
-  await resumedDrawer.getByRole('button', { name: 'Show Resume details' }).click()
+  const resumeDetails = resumedDrawer.getByRole('button').filter({ has: resumedDrawer.getByText('Resume', { exact: true }) })
+  await expect(resumeDetails).toHaveAttribute('aria-expanded', 'false')
+  await resumeDetails.click()
+  await expect(resumeDetails).toHaveAttribute('aria-expanded', 'true')
   await resumedDrawer.getByRole('button', { name: /Edit this resume|编辑此简历/, exact: true }).click()
   await expect(page).toHaveURL(/page=resume/)
   const editor = page.locator('[data-resume-editor]')

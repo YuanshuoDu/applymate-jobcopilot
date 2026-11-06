@@ -1868,6 +1868,40 @@ test('failed new-account read never exposes the prior account on retry', async (
   } finally { release() }
 })
 
+test('application resume round trip survives an unavailable optional return cache', async ({ page }) => {
+  const pageErrors: string[] = []
+  page.on('pageerror', error => pageErrors.push(error.message))
+  const state = await install(page)
+  await open(page, '&jobsPage=3&jobsSize=50&jobsSearch=Acme&jobsStatus=saved&jobsSort=score&jobsDirection=asc')
+  await page.evaluate(() => {
+    const set = Storage.prototype.setItem
+    const remove = Storage.prototype.removeItem
+    Storage.prototype.setItem = function (key, value) {
+      if (this === sessionStorage && key === 'applymate:resume-return') throw new Error('Optional cache unavailable')
+      return set.call(this, key, value)
+    }
+    Storage.prototype.removeItem = function (key) {
+      if (this === sessionStorage && key === 'applymate:resume-return') throw new Error('Optional cache unavailable')
+      return remove.call(this, key)
+    }
+  })
+  await page.getByRole('dialog').getByRole('button').filter({ has: page.getByText(/^(Resume|简历)$/) }).click()
+  await page.getByRole('button', { name: /Edit this resume|编辑此简历/ }).click()
+  await expect(page).toHaveURL(/page=resume/)
+  await expect(page).toHaveURL(/resumeId=resume-1/)
+  await expect(page).toHaveURL(/returnJobId=outside-page/)
+  await expect(page.getByRole('button', { name: /Back to this application|返回此申请/ })).toBeVisible()
+  await expect(page.locator('[data-resume-editor]')).toBeVisible()
+  await page.getByRole('button', { name: /Back to this application|返回此申请/ }).click()
+  await expect(page.getByRole('dialog')).toContainText('Application flow engineer')
+  const returned = new URL(page.url())
+  expect(Object.fromEntries(['page', 'highlight', 'jobsPage', 'jobsSize', 'jobsSearch', 'jobsStatus', 'jobsSort', 'jobsDirection'].map(key => [key, returned.searchParams.get(key)])))
+    .toEqual({ page: 'jobs', highlight: 'outside-page', jobsPage: '3', jobsSize: '50', jobsSearch: 'Acme', jobsStatus: 'saved', jobsSort: 'score', jobsDirection: 'asc' })
+  expect(pageErrors).toEqual([])
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
 test('restores a highlighted job outside the current page and retains list context through the real Resume page', async ({ page }) => {
   const state = await install(page)
   await open(page, '&jobsPage=3&jobsSize=50&jobsSearch=Acme&jobsStatus=saved&jobsSort=score&jobsDirection=asc')

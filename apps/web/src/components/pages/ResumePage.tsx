@@ -1062,7 +1062,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
         void selectResume(requestedResume.id, requestedResume).then(selected => {
           if (selected) {
             requestedResumeIdRef.current = null
-            sessionStorage.removeItem('applymate:resume-return')
+            try { sessionStorage.removeItem('applymate:resume-return') } catch { /* optional return cache */ }
           }
         })
       } else if (!requestedResumeId && !selectedResumeId) {

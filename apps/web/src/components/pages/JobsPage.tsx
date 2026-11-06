@@ -2539,7 +2539,9 @@ export function JobsPage() {
             window.dispatchEvent(new Event('applymate:jobs-changed'))
           }}
           onOpenTailoredResume={resumeId => {
-            sessionStorage.setItem('applymate:resume-return', JSON.stringify({ resumeId, jobId: selectedJob.id }))
+            if (!resumeId.trim() || !selectedJob.id.trim()) { toast.error(t('application.linkUnavailable')); return }
+            // This cache is optional: the URL below carries both identities and list context.
+            try { sessionStorage.setItem('applymate:resume-return', JSON.stringify({ resumeId, jobId: selectedJob.id })) } catch { /* URL context remains authoritative */ }
             const url = new URL(window.location.href)
             url.searchParams.delete('resumeStartEmpty')
             url.searchParams.set('resumeId', resumeId)
