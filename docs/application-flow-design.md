@@ -28,7 +28,8 @@ Agent 负责原任务的执行和审批，招聘消息负责查看回复。
    卡，选择“选择或创建求职信（可选）”，在简历页创建或选择，再返回申请确认。
    已选求职信尚未加载时，刷新并保留原选择；刷新只读取材料。准备期间若选材发生
    变化，按提示重新核对。已发出的材料绑定请求无法由页面撤销，请刷新申请确认结果。
-   需要修正求职信但尚未选择时，先选择。
+   求职信有事实问题时，进入本职位简历页，核对已选求职信并手动修改，等待保存后
+   返回此申请重新检查；申请详情不会自动覆盖整封信。未选择或无法读取时先检查选择。
 5. “确认申请材料”表示选择此职位使用的版本，不会授权向雇主提交。材料内容或
    选择变化后，检查当前版本；旧检查结果不代表新版本已通过。
 6. 材料检查通过且仍适用于当前版本后，点击下载申请材料 ZIP。服务器核验登录账号、
@@ -119,6 +120,9 @@ Agent 维护范围内单独处理。
 审核意见超过展示上限时不会判定通过；请重新检查。AI 审核也不能保证发现所有事实问题。
 自动修正会替换受影响的整段或整节；系统拒绝会被校验过程截断或丢字段的建议，
 但不能保证模型保留原节的每一条内容。请对照保存的历史版本检查修改，然后重新审核。
+从申请详情修正定制简历时，其余章节以当前选中版本为准；无法确定受影响章节时转为手动修改。
+若保存的简历内容、职位关联或来源在生成修正期间发生变化，本次修正会拒绝覆盖并提示刷新。该检查不约束修正
+完成后其他保存路径的写入，也不保证来源简历、职业资料或职位在生成期间没有变化。
 这些保证从服务器登记提交后开始，混用旧版服务的部署及生产数据库权限尚未验证。
 审核结果目前不会随来源简历或职业资料事实的后续变化自动失效；如修改了依据，请重新检查。
 草稿恢复到最新简历后，只有原来进入编辑器时存在可信的职位与返回列表上下文，才会
@@ -247,11 +251,21 @@ An automatic correction replaces its affected section. A suggestion that would
 be truncated or lose fields during validation is rejected, but the model may
 still omit information from the previous section. Compare the saved version
 history and review the corrected material before running a new audit.
+When the drawer repairs a tailored resume, untouched sections come from the
+selected version, and an ambiguous section requires manual editing. A conflicting
+save or change of the selected resume's job/source association during generation
+rejects the correction; it does not coordinate later
+writes or establish that the source resume, Persona or job stayed unchanged.
 
 An absent optional letter is distinct from a selected letter still loading.
 Confirming the same selected letter omits a redundant assignment, because that
 write would otherwise advance its saved revision. Selecting a different letter
 invalidates its old check and requires checking the newly saved selection.
+For a factual cover-letter issue, the application drawer opens the same job in
+Resume for the candidate to verify and edit the selected letter, then return and
+check again. It does not automatically overwrite the whole letter. Existing
+cover-letter editing does not provide cross-tab write coordination or an
+automatic history backup.
 
 Pending AI suggestions retain their existing blocking rules. Dividing them into
 required factual repairs and optional style improvements needs a separate

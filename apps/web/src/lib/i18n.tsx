@@ -6,6 +6,13 @@ export type Lang = 'en' | 'de' | 'fr' | 'es' | 'nl' | 'zh'
 // ── Translations dictionary ──────────────────────────────────────────────────
 const dict: Record<Lang, Record<string, string>> = {
   en: {
+    'application.repairResumeChanged': 'The resume changed during correction. Your saved edits were not overwritten by this correction. Refresh and review the latest resume before checking the materials again.',
+    'application.resumeRepairImpact': 'AI correction replaces the entire affected resume section and may omit other entries. Copy the current section first, check the previous version, and review the result before checking the materials again.',
+    'application.repairSectionUnclear': 'The affected section is unclear. Open this application’s resume, edit it manually, then return and check the materials again.',
+    'application.repairTooMany': 'There are too many resume issues to correct at once. Open this application’s resume, review and edit it manually, then return and check the materials again.',
+    'application.editLetterTitle': 'Review the selected cover letter',
+    'application.editLetterGuidance': 'In Resume, open Cover Letter and verify the selected letter. Edit it by hand, wait for it to save, then return to this application and check the materials again.',
+    'application.repairImpactGuidance': 'An automatic correction replaces the entire affected resume section or cover letter. Copy and check the current content first. Resume corrections save a previous version; cover letters are not backed up automatically. Run the check again after editing.',
     'application.viewRecentAttention': 'View recent tasks needing attention',
     'application.scopedEvidenceGuidance': 'Evidence for this application cannot yet be saved separately. Review and edit the materials, or remove or soften claims you cannot support. Add a fact to your profile only if you want it available across applications. Changes may require another audit.',
     'application.scopedEvidenceNoResume': 'The application resume is unavailable or still loading. Check your selected materials before editing.',
@@ -2846,6 +2853,13 @@ const dict: Record<Lang, Record<string, string>> = {
   es: { 'settings.usage': 'Uso y actividad', 'settings.keysConnections': 'Claves y conexiones' },
   nl: { 'settings.usage': 'Gebruik en activiteit', 'settings.keysConnections': 'Sleutels en verbindingen' },
   zh: {
+    'application.repairResumeChanged': '修正期间简历已发生变化，本次修正没有覆盖你保存的内容。请刷新并核对最新简历，再重新检查申请材料。',
+    'application.resumeRepairImpact': 'AI 修正会替换受影响的整段简历内容，也可能遗漏其他条目。请先复制当前章节并核对历史版本，修改后检查结果，再重新审核材料。',
+    'application.repairSectionUnclear': '无法确定受影响的简历章节。请打开此职位的简历，手动修改后返回，重新检查申请材料。',
+    'application.repairTooMany': '需要修正的简历问题过多，无法一次处理。请打开此职位的简历，手动核对并修改后返回，重新检查申请材料。',
+    'application.editLetterTitle': '核对已选求职信',
+    'application.editLetterGuidance': '请在简历页打开求职信，核对当前选中的信，手动修改并等待保存，然后返回此申请重新检查材料。',
+    'application.repairImpactGuidance': '自动修正会替换受影响的整段简历内容或整封求职信，请先复制并核对当前内容。简历修正会保存历史版本，求职信不会自动备份。修改后请重新检查。',
     'application.viewRecentAttention': '查看近期需要我处理的任务',
     'application.scopedEvidenceGuidance': '目前无法单独保存此申请的新增证据。请核对并编辑材料，或移除、弱化无法支持的表述。只有希望其他申请也使用的事实，才请自行添加到个人资料。修改后可能需要重新审核。',
     'application.scopedEvidenceNoResume': '申请简历不可用或仍在加载，请先检查所选材料。',
