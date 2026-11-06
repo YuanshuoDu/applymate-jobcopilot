@@ -3,6 +3,7 @@ import { AGENT_STREAM_SCHEMA_VERSION } from "@jobcopilot/agent-protocol"
 
 import { db } from "@/lib/db"
 import { isErrorResponse, ok, requireAuth } from "@/lib/api-helpers"
+import { waitItemId } from "@/lib/agent/broker/item-ids"
 import { redactStreamValue } from "@/lib/agent/session/stream-redaction"
 import { openPublicTimelineCursor, publicAgentEventId, publicToolCallId, projectPublicEventEnvelope, sealPublicTimelineCursor } from "@/lib/agent/session/public-tool-identity"
 import { APPROVAL_LEDGER_EVENT_TYPES, APPROVAL_LEDGER_MAX_EVENTS, projectApprovalLedgerRow } from "@/components/agent-workspace/v2/approval-ledger-parser"
@@ -37,12 +38,14 @@ interface AgendaQueryRow {
 }
 
 type SteeringMarkerQueryRow = Omit<AgendaQueryRow, "type"> & { type: string }
+interface ApprovalDecisionQueryRow { id: string; userId: string; sessionId: string; turnId: string | null; taskId: string | null; toolCallId: string | null; type: string; scopeHash: string | null; revision: number; status: string }
 
 const AGENDA_SELECT = {
   id: true, sessionId: true, turnId: true, itemId: true, taskId: true, sequence: true,
   type: true, actor: true, correlationId: true, causationId: true, idempotencyKey: true, payload: true,
 } as const
 
+const APPROVAL_DECISION_SELECT = { id: true, userId: true, sessionId: true, turnId: true, taskId: true, toolCallId: true, type: true, scopeHash: true, revision: true, status: true } as const
 const APPROVAL_LEDGER_QUERY_LIMIT = APPROVAL_LEDGER_MAX_EVENTS * 4
 const ITEM_QUERY_SELECT = {
   id: true, sessionId: true, turnId: true, stepId: true, taskId: true, type: true, status: true,
@@ -86,7 +89,7 @@ export async function GET(request: NextRequest, context: RouteContext) {
   const agendas = page.cursor === null ? await recentAgendas(sessionId) : []
   const agenda = page.cursor === null ? agendas[agendas.length - 1] ?? null : null
   const steeringMarkers = page.cursor === null ? await latestSteeringMarkers(sessionId) : []
-  const approvalEvents = page.cursor === null ? await recentApprovalEvents(sessionId) : []
+  const approvalEvents = page.cursor === null ? await recentApprovalEvents(sessionId, auth.userId) : []
   return ok({
     items: result.rows.map(itemDto),
     page: { ...result.page, nextCursor: result.page.nextCursor ? sealPublicTimelineCursor(sessionId, result.page.nextCursor) : null },
@@ -124,12 +127,18 @@ async function latestSteeringMarkers(sessionId: string): Promise<readonly Timeli
   return reduced.valid ? events : []
 }
 
-async function recentApprovalEvents(sessionId: string) {
-  const rows = await db.agentEvent.findMany({
-    where: { sessionId, type: { in: [...APPROVAL_LEDGER_EVENT_TYPES] } }, orderBy: { sequence: "desc" }, take: APPROVAL_LEDGER_QUERY_LIMIT, select: AGENDA_SELECT,
-  }) as AgendaQueryRow[]
+async function recentApprovalEvents(sessionId: string, userId: string) {
+  const rows = await db.agentEvent.findMany({ where: { sessionId, type: { in: [...APPROVAL_LEDGER_EVENT_TYPES] } },
+    orderBy: { sequence: "desc" }, take: APPROVAL_LEDGER_QUERY_LIMIT, select: AGENDA_SELECT }) as AgendaQueryRow[]
+  const ids = [...new Set(rows.flatMap(row => { const payload = isRecord(row.payload) ? row.payload : {}
+    return row.type === "approval.resolved" && row.actor === "user" && payload.waitKind === "approval" && payload.answerAvailable === "[REDACTED]" && safeTimelineId(payload.waitId) ? [payload.waitId] : []
+  }))]
+  const decisions = ids.length ? await db.agentApproval.findMany({ where: { id: { in: ids }, userId, sessionId }, select: APPROVAL_DECISION_SELECT }) as ApprovalDecisionQueryRow[] : []
+  const decisionsById = new Map<string, ApprovalDecisionQueryRow[]>()
+  for (const decision of decisions) decisionsById.set(decision.id, [...(decisionsById.get(decision.id) ?? []), decision])
   return rows.flatMap(row => {
-    const event = projectApprovalLedgerRow(row, sessionId, redactStreamValue)
+    const projectedRow = restoreLegacyRedactedAnswer(row, sessionId, userId, decisionsById, rows)
+    const event = projectApprovalLedgerRow(projectedRow, sessionId, redactStreamValue)
     if (!event) return []
     const payload = isRecord(event.payload) ? event.payload : {}
     return [{
@@ -140,7 +149,39 @@ async function recentApprovalEvents(sessionId: string) {
     }]
   }).sort((left, right) => compareDecimalSequence(left.sequence, right.sequence) || left.id.localeCompare(right.id))
 }
-
+function restoreLegacyRedactedAnswer(row: AgendaQueryRow, sessionId: string, userId: string, decisions: ReadonlyMap<string, readonly ApprovalDecisionQueryRow[]>, events: readonly AgendaQueryRow[]): AgendaQueryRow {
+  const payload = isRecord(row.payload) ? row.payload : null
+  if (row.sessionId !== sessionId || row.type !== "approval.resolved" || row.actor !== "user" || !payload ||
+    payload.waitKind !== "approval" || payload.answerAvailable !== "[REDACTED]" || !safeTimelineId(payload.waitId) ||
+    !safeTimelineId(payload.itemId) || !safeTimelineId(payload.turnId) || (payload.toolCallId !== null && !safeTimelineId(payload.toolCallId)) ||
+    (payload.status !== "approved" && payload.status !== "rejected")) return row
+  const matches = decisions.get(payload.waitId) ?? []
+  const decision = matches[0]
+  const itemId = waitItemId("approval", payload.waitId)
+  const consumed = relatedConsumedApprovals(events, payload.waitId)
+  const statusMatches = decision?.status === "consumed"
+    ? payload.status === "approved" && consumed.length === 1 && canonicalConsumedApproval(consumed[0]!, row, decision, sessionId)
+    : (decision?.status === "approved" || decision?.status === "rejected") && payload.status === decision.status && consumed.length === 0
+  if (matches.length !== 1 || !decision || decision.id !== payload.waitId || decision.userId !== userId || decision.sessionId !== sessionId ||
+    decision.turnId !== row.turnId || decision.taskId !== row.taskId || row.itemId !== itemId || payload.itemId !== itemId ||
+    payload.turnId !== row.turnId || row.correlationId !== payload.waitId || row.causationId !== itemId ||
+    payload.toolCallId !== decision.toolCallId || !statusMatches) return row
+  return { ...row, payload: { ...payload, answerAvailable: false } }
+}
+function relatedConsumedApprovals(events: readonly AgendaQueryRow[], approvalId: string): AgendaQueryRow[] {
+  const key = "approval:" + approvalId + ":consumed"
+  return events.filter(event => event.type === "approval.consumed" && (event.correlationId === approvalId || event.idempotencyKey === key ||
+    (isRecord(event.payload) && event.payload.approvalId === approvalId)))
+}
+function canonicalConsumedApproval(event: AgendaQueryRow, resolved: AgendaQueryRow, approval: ApprovalDecisionQueryRow, sessionId: string): boolean {
+  const payload = isRecord(event.payload) ? event.payload : null, keys = payload ? Object.keys(payload) : []
+  return !!payload && !!projectApprovalLedgerRow(event, sessionId, redactStreamValue) && event.sessionId === sessionId &&
+    event.turnId === approval.turnId && event.taskId === approval.taskId && event.itemId === null && event.actor === "system" &&
+    event.correlationId === approval.id && event.causationId === null && event.idempotencyKey === "approval:" + approval.id + ":consumed" &&
+    event.sequence > resolved.sequence && keys.length === 4 && ["approvalId", "action", "scopeHash", "revision"].every(key => keys.includes(key)) &&
+    (payload.approvalId === approval.id || payload.approvalId === "[REDACTED]") && payload.action === approval.type &&
+    typeof approval.scopeHash === "string" && payload.scopeHash === approval.scopeHash && payload.revision === approval.revision
+}
 function compareDecimalSequence(left: string, right: string): number {
   const leftValue = BigInt(left)
   const rightValue = BigInt(right)
