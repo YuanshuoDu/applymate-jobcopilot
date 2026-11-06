@@ -17,6 +17,7 @@ import {
   type TaskGraphRepairReceipt,
   type TaskGraphVerificationReport,
 } from "./subagents/task-graph-command-port.js"
+import { TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION, parseCurrentTaskGraphPublicVerificationReport } from "./subagents/task-graph-verification-report.js"
 
 export type TaskGraphCurrentVerificationMetadata = Readonly<{
   verificationCriterionIds?: string[]
@@ -28,6 +29,14 @@ export type TaskGraphCurrentVerificationMetadata = Readonly<{
 
 type OwnValue = Readonly<{ present: false }> | Readonly<{ present: true; value: unknown }>
 const ABSENT: OwnValue = { present: false }
+
+function record(value: unknown): Record<string, unknown> | null {
+  try {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null
+    const prototype = Object.getPrototypeOf(value)
+    return prototype === Object.prototype || prototype === null ? value as Record<string, unknown> : null
+  } catch { return null }
+}
 
 function ownValue(row: Record<string, unknown>, key: string): OwnValue | undefined {
   try {
@@ -74,8 +83,16 @@ export function parseTaskGraphCurrentVerificationMetadata(
       || parsed.contract.criteria.some((criterion, index) => criterion.id !== verificationCriterionIds[index])) return undefined
     verification = parsed.contract
   }
+  const reportRow = record(reportValue.present ? reportValue.value : undefined)
+  const reportVersion = reportRow ? ownValue(reportRow, "verifierVersion") : undefined
+  const isPublicEmptyAnalystReport = reportVersion?.present === true
+    && reportVersion.value === TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION
   const verificationReport = reportValue.present && verificationCriterionIds
-    ? parseTaskGraphVerificationReport(reportValue.value, verificationCriterionIds) : undefined
+    ? isPublicEmptyAnalystReport
+      ? templateId === "analyst" && row.status === "failed"
+        ? parseCurrentTaskGraphPublicVerificationReport(reportValue.value, verificationCriterionIds) : undefined
+      : reportVersion === undefined ? undefined : parseTaskGraphVerificationReport(reportValue.value, verificationCriterionIds)
+    : undefined
   const repairOf = repairValue.present ? parseTaskGraphRepairOf(repairValue.value) : undefined
   const repairReceipt = receiptValue.present ? parseTaskGraphRepairReceipt(receiptValue.value, {
     repairOf, repairNodeKey: nodeKey, repairTaskId: taskId, report: verificationReport,

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 
 import {
   evaluateTaskGraphVerification,
+  evaluateTaskGraphVerificationWithReverifiedEmptyAnalyst,
   evaluateTaskGraphVerificationWithVerifiedEmptyDiscovery,
   TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION,
   TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
@@ -389,6 +390,49 @@ describe("TaskGraph durable evidence verification", () => {
     } }])
     expect(evaluateTaskGraphVerification(aggregate, projectionForAnalyst(["a1", "a2", "a3", "a4"]), disjoint))
       .toMatchObject({ status: "passed" })
+  })
+
+  it("evaluates only an exact empty Analyst with ordinary criteria after explicit per-Scout coverage", () => {
+    const emptyAnalyst: TaskGraphVerificationEvidenceProjection = {
+      schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "analyst", findings: [], evidenceIds: [],
+    }
+    const dependencies: TaskGraphVerificationDependencyEvidence = new Map([
+      ["scout-a", projectionForScout(["a1", "a2"])], ["scout-b", projectionForScout(["b1", "b2"])],
+    ])
+    const typed = validatedContract("analyst", [
+      { id: "source-coverage", check: { kind: "findings_cover_each_scout_candidates_gte", dependencyNodeKeys: ["scout-a", "scout-b"], minimumPercent: 50 } },
+      { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
+      { id: "evidence-count", check: { kind: "evidence_count_gte", minimum: 1 } },
+      { id: "finding-evidence", check: { kind: "all_findings_have_evidence", minimumItems: 1 } },
+      { id: "score", check: { kind: "reported_score_gte", minimumScore: 7, minimumFindings: 1, aggregation: "any" } },
+      { id: "single-source-membership", check: { kind: "findings_from_scout_dependency", dependencyNodeKey: "scout-a" } },
+    ])
+
+    expect(evaluateTaskGraphVerificationWithReverifiedEmptyAnalyst(typed, emptyAnalyst, dependencies)).toEqual({
+      status: "failed", reasonCode: "criterion_not_met", criteria: [
+        { criterionId: "source-coverage", status: "failed", reasonCode: "criterion_not_met" },
+        { criterionId: "finding-count", status: "failed", reasonCode: "criterion_not_met" },
+        { criterionId: "evidence-count", status: "failed", reasonCode: "criterion_not_met" },
+        { criterionId: "finding-evidence", status: "failed", reasonCode: "criterion_not_met" },
+        { criterionId: "score", status: "failed", reasonCode: "criterion_not_met" },
+        { criterionId: "single-source-membership", status: "passed", reasonCode: "criteria_met" },
+      ],
+    })
+    expect(evaluateTaskGraphVerification(typed, emptyAnalyst, dependencies))
+      .toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_missing" })
+    expect(evaluateTaskGraphVerificationWithReverifiedEmptyAnalyst(
+      validatedContract("analyst", [{ id: "membership", check: { kind: "findings_from_scout_union", dependencyNodeKeys: ["scout-a", "scout-b"] } }]),
+      emptyAnalyst, dependencies,
+    )).toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_invalid" })
+    expect(evaluateTaskGraphVerificationWithReverifiedEmptyAnalyst(typed, emptyAnalyst, new Map([[
+      "scout-a", projectionForScout(["a1", "a2"]),
+    ]]))).toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_invalid" })
+    expect(evaluateTaskGraphVerificationWithReverifiedEmptyAnalyst(typed, {
+      ...emptyAnalyst, emptyDiscoveryReceipt: { digest: "a".repeat(64) },
+    }, dependencies)).toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_invalid" })
+    expect(evaluateTaskGraphVerificationWithReverifiedEmptyAnalyst(typed, {
+      ...emptyAnalyst, evidenceIds: ["read:source:jobs.discover:" + "a".repeat(64)],
+    }, dependencies)).toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_invalid" })
   })
   it("keeps empty membership vacuous and leaves minimum counts as independent checks", () => {
     const typed = validatedContract("analyst", [

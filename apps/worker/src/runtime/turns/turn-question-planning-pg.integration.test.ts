@@ -8,11 +8,16 @@ import { mergeCanonicalTurnQuestionContext } from "../canonical-turn-question-co
 import { StepContextBuilder, type StepContext } from "../context/step-context-builder.js"
 import { createPgInputClaimStore } from "../context/input-claim-store.js"
 import { recoverAnsweredQuestionContext } from "../question-answer-recovery.js"
+import { createPgRootTaskStore } from "../subagents/root-task-store.js"
+import type { PgSubagentPool } from "../subagents/types.js"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
+import { resumeAgentTurn } from "../wakeup/consumer.js"
+import { parseWakeup } from "../wakeup/types.js"
 import { buildCognitiveActionAgenda } from "./cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, cognitiveAgendaReceiptIdempotencyKey } from "./cognitive-agenda-receipt.js"
 import { taskGraphItemId, TASK_GRAPH_SNAPSHOT_VERSION } from "../subagents/task-graph-snapshot.js"
 import { buildModelRequest } from "./turn-engine-messages.js"
+import { claimTurnLease } from "./lease.js"
 import { createPgTurnQuestionStore } from "./turn-question-store.js"
 import { questionId, questionItemId, type TurnQuestionPool } from "./turn-question-store-guards.js"
 import type { TurnQuestionPlanningReadOwner, TurnQuestionPlanningWaitRef } from "./turn-question-planning-contract.js"
@@ -92,6 +97,41 @@ function readOwner(fixture: Fixture): TurnQuestionPlanningReadOwner {
 
 function waitRef(fixture: Fixture, id = questionId(fixture.owner, fixture.stepId, fixture.callId)): TurnQuestionPlanningWaitRef {
   return { stepId: fixture.stepId, toolCallId: fixture.callId, waitId: id, questionItemId: questionItemId(id) }
+}
+
+type PlanningHistoryMessage = Readonly<{ role: string; content: unknown }>
+type ParsedPlanningHistoryMessage = Readonly<{ index: number; trust: string; source: string; content: Record<string, unknown> }>
+
+function selectPlanningQuestionHistory(messages: readonly PlanningHistoryMessage[], question: string, waitId: string, answer: string) {
+  const entries = messages.flatMap((message, index): ParsedPlanningHistoryMessage[] => {
+    if (message.role !== "user" || !Array.isArray(message.content)) return []
+    const text = message.content.flatMap((part: unknown) => {
+      if (!part || typeof part !== "object" || Array.isArray(part)) return []
+      const value = part as Record<string, unknown>
+      return value.type === "text" && typeof value.text === "string" ? [value.text] : []
+    }).find(value => value.startsWith("[harness context layer=steer_history "))
+    const separator = text?.indexOf("\n") ?? -1
+    if (!text || separator < 0) return []
+    const header = text.slice(0, separator)
+    const trustPrefix = "[harness context layer=steer_history trust="
+    const sourceSeparator = header.indexOf(" source=")
+    if (!header.startsWith(trustPrefix) || sourceSeparator < 0 || !header.endsWith("]")) return []
+    const trust = header.slice(trustPrefix.length, sourceSeparator)
+    const source = header.slice(sourceSeparator + " source=".length, -1)
+    if (!trust || !source) return []
+    try {
+      const content: unknown = JSON.parse(text.slice(separator + 1))
+      return content && typeof content === "object" && !Array.isArray(content)
+        ? [{ index, trust, source, content: content as Record<string, unknown> }] : []
+    } catch { return [] }
+  })
+  return {
+    questions: entries.filter(entry => entry.content.role === "assistant" && entry.content.type === "question"
+      && entry.content.question === question),
+    answers: entries.filter(entry => entry.content.role === "user" && entry.content.type === "answer"
+      && entry.content.questionId === waitId && entry.content.text === answer),
+    summaries: entries.filter(entry => entry.trust === "internal_record" && entry.source === "native_question_recovery"),
+  }
 }
 
 function runtimePool(base: Pool, applicationName: string): TurnQuestionPool {
@@ -389,36 +429,31 @@ async function waitForLockWait(applicationName: string, blockerPid?: number): Pr
   throw new Error(`Planning clarification acceptance did not reach the expected Session lock: ${applicationName}`)
 }
 
-async function acceptQuestionAnswer(fixture: Fixture, waitId: string, answer: string): Promise<void> {
-  const itemId = questionItemId(waitId)
-  const client = await admin!.connect()
+async function acceptQuestionAnswer(fixture: Fixture, waitId: string, expectedRevision: number, answer: string): Promise<void> {
+  if (!databaseUrl) throw new Error("Planning clarification broker requires the validated disposable PostgreSQL URL")
+  const previousDatabaseUrl = process.env.DATABASE_URL
+  process.env.DATABASE_URL = databaseUrl
+  let webDatabase: { db: { $connect(): Promise<void>; $disconnect(): Promise<void> } } | undefined
+  const brokerModule = "@/lib/agent/broker/store"
   try {
-    await client.query("BEGIN")
-    await client.query("SELECT set_config('app.user_id', $1, true)", [fixture.userId])
-    await client.query(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 FOR UPDATE`, [fixture.sessionId, fixture.userId])
-    const turn = await client.query<{ revision: number }>(`SELECT "revision" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 FOR UPDATE`, [fixture.turnId, fixture.sessionId])
-    const nextRevision = Number(turn.rows[0]?.revision) + 1
-    const updated = await client.query(`UPDATE "agent_items" SET "status" = 'completed',
-      "content" = jsonb_set(jsonb_set("content", '{answer}', $2::jsonb), '{answerAvailable}', 'true'::jsonb),
-      "revision" = "revision" + 1, "completedAt" = CURRENT_TIMESTAMP, "updatedAt" = CURRENT_TIMESTAMP
-      WHERE "id" = $1 AND "sessionId" = $3 AND "turnId" = $4 AND "type" = 'question' AND "status" = 'started'`,
-    [itemId, JSON.stringify(answer), fixture.sessionId, fixture.turnId])
-    if (updated.rowCount !== 1) throw new Error("Planning clarification fixture could not seed an unanswered question")
-    await client.query(`UPDATE "agent_turns" SET "status" = 'in_progress', "revision" = $2, "completedAt" = NULL,
-      "updatedAt" = CURRENT_TIMESTAMP WHERE "id" = $1 AND "sessionId" = $3`, [fixture.turnId, nextRevision, fixture.sessionId])
-    const sequence = (await client.query<{ eventSequence: string | number }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1
-      WHERE "id" = $1 AND "userId" = $2 RETURNING "eventSequence"`, [fixture.sessionId, fixture.userId])).rows[0]?.eventSequence
-    if (sequence === undefined) throw new Error("Planning clarification fixture could not allocate the answer sequence")
-    await insertEvent(client, { fixture, sequence: Number(sequence), type: "question.answered", actor: "user", itemId, taskId: null,
-      correlationId: waitId, causationId: itemId, idempotencyKey: `agent-command:question-answer:${waitId}`,
-      payload: { waitKind: "question", waitId, itemId, turnId: fixture.turnId, toolCallId: fixture.callId,
-        status: "answered", nextTurnRevision: nextRevision, answerAvailable: true } })
-    await client.query("COMMIT")
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => undefined)
-    throw error
+    const dbModule = "@/lib/db"
+    webDatabase = await import(dbModule) as unknown as { db: { $connect(): Promise<void>; $disconnect(): Promise<void> } }
+    await webDatabase.db.$connect()
+    const broker = await import(brokerModule) as unknown as { answerQuestion(db: unknown, input: {
+      sessionId: string; userId: string; waitId: string; clientMessageId: string; expectedTurnId: string;
+      expectedRevision: number; answer: string; now: Date
+    }): Promise<{ disposition: string; status: string; waitId: string; turnId: string; nextTurnRevision: number }> }
+    await expect(broker.answerQuestion(webDatabase.db, { sessionId: fixture.sessionId, userId: fixture.userId, waitId,
+      clientMessageId: `planning-answer-${randomUUID()}`, expectedTurnId: fixture.turnId, expectedRevision, answer, now: new Date() }))
+      .resolves.toMatchObject({ disposition: "resolved", status: "answered", waitId, turnId: fixture.turnId,
+        nextTurnRevision: expectedRevision + 1 })
   } finally {
-    client.release()
+    try {
+      await webDatabase?.db.$disconnect()
+    } finally {
+      if (previousDatabaseUrl === undefined) delete process.env.DATABASE_URL
+      else process.env.DATABASE_URL = previousDatabaseUrl
+    }
   }
 }
 
@@ -465,6 +500,27 @@ async function withAdminClient<T>(work: (client: PoolClient) => Promise<T>): Pro
   }
 }
 
+describe("planning clarification Harness message selection", () => {
+  it("selects the answer record when its text also appears in the question options", () => {
+    const messages = [
+      { role: "user", content: [{ type: "text", text: '[harness context layer=steer_history trust=UNTRUSTED_DATA source=steer_history]\n{"options":[{"label":"Berlin","value":"berlin"}],"question":"Which region?","role":"assistant","type":"question"}' }] },
+      { role: "user", content: [{ type: "text", text: '[harness context layer=steer_history trust=UNTRUSTED_DATA source=steer_history]\n{"questionId":"question-1","role":"user","text":"berlin","type":"answer"}' }] },
+      { role: "user", content: [{ type: "text", text: '[harness context layer=steer_history trust=internal_record source=native_question_recovery]\n{"graphRevisionAtAsk":3}' }] },
+    ]
+    const selected = selectPlanningQuestionHistory(messages, "Which region?", "question-1", "berlin")
+    expect(selected.questions).toHaveLength(1)
+    expect(selected.answers).toHaveLength(1)
+    expect(selected.summaries).toHaveLength(1)
+    expect(selected.questions[0]?.index).toBe(0)
+    expect(selected.answers[0]?.index).toBe(selected.questions[0]!.index + 1)
+    expect(selected.summaries[0]?.index).toBe(selected.answers[0]!.index + 1)
+    expect(selected.questions[0]?.content).toMatchObject({
+      role: "assistant", type: "question", question: "Which region?", options: [{ label: "Berlin", value: "berlin" }],
+    })
+    expect(selected.answers[0]?.content).toEqual({ role: "user", type: "answer", questionId: "question-1", text: "berlin" })
+  })
+})
+
 describePg("planning clarification wait persistence on disposable PostgreSQL", () => {
   beforeAll(async () => {
     admin = new Pool({ connectionString: databaseUrl!, max: 10 })
@@ -476,7 +532,10 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
       public."agent_items", public."agent_events", public."agent_outbox", public."agent_inputs" TO "${role}"`)
     await admin.query(`GRANT UPDATE ("eventSequence") ON "agent_sessions" TO "${role}"`)
     await admin.query(`GRANT UPDATE ("status", "revision", "completedAt", "updatedAt") ON "agent_turns" TO "${role}"`)
-    await admin.query(`GRANT UPDATE ("attemptCount") ON public."sub_agent_tasks" TO "${role}"`)
+    await admin.query(`GRANT UPDATE ("attemptCount", "status", "leaseOwner", "leaseExpiresAt", "failureReason", "completedAt", "updatedAt", "allowedActions")
+      ON public."sub_agent_tasks" TO "${role}"`)
+    await admin.query(`GRANT UPDATE ("objectiveDigest", "canonicalOriginDigest", "objectiveIndexSemanticsVersion")
+      ON public."agent_turns" TO "${role}"`)
     await admin.query(`GRANT UPDATE ("status", "errorCode", "finishReason", "inputTokens", "outputTokens", "estimatedCostUsd", "completedAt", "inputThroughSequence", "consumedInputIds") ON "agent_steps" TO "${role}"`)
     await admin.query(`GRANT UPDATE ("status", "content", "revision", "completedAt", "updatedAt") ON "agent_items" TO "${role}"`)
     await admin.query(`GRANT UPDATE ("status", "consumedByStepId", "consumedAt") ON "agent_inputs" TO "${role}"`)
@@ -707,14 +766,40 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
     }
   }, 60_000)
 
-  it("projects SQL-seeded answered Q/A and the saved planning summary through StepContextBuilder into the Harness request", async () => {
+  it("projects broker-answered Q/A and the saved planning summary through StepContextBuilder into the Harness request", async () => {
     const fixture = await seedFixture(admin!, { name: "answer recovery with pending steering", pendingSteering: true })
     const pool = runtimePool(writer!, `clarification_answer_${fixture.turnId}`)
     const store = createPgTurnQuestionStore(pool)
     await stageAndCompleteQuestion(pool, fixture)
     const wait = await store.waitForQuestion({ owner: fixture.owner, stepId: fixture.stepId, toolCallId: fixture.callId, now: new Date() })
-    const answer = "ANSWER_PRIVATE_SENTINEL: Berlin"
-    await acceptQuestionAnswer(fixture, wait.waitId, answer)
+    const answer = "berlin"
+    const originalDatabaseUrl = process.env.DATABASE_URL
+    await acceptQuestionAnswer(fixture, wait.waitId, wait.nextTurnRevision, answer)
+    expect(process.env.DATABASE_URL === originalDatabaseUrl).toBe(true)
+    const answeredItemId = questionItemId(wait.waitId)
+    const answeredItem = await admin!.query<{ status: string; content: Record<string, unknown> }>(
+      `SELECT "status", "content" FROM "agent_items" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "type" = 'question'`,
+      [answeredItemId, fixture.sessionId, fixture.turnId])
+    expect(answeredItem.rows).toHaveLength(1)
+    expect(answeredItem.rows[0]).toMatchObject({ status: "completed", content: { answer, answerAvailable: true, answeredAt: expect.any(String) } })
+    const answeredAt = answeredItem.rows[0]?.content.answeredAt
+    expect(typeof answeredAt).toBe("string")
+    expect(new Date(answeredAt as string).toISOString()).toBe(answeredAt)
+
+    for (const mutation of [
+      `UPDATE "agent_items" SET "content" = jsonb_set("content", '{answeredAt}', '"2026-10-21T10:00:00Z"'::jsonb) WHERE "id" = $1`,
+      `UPDATE "agent_items" SET "content" = jsonb_set("content", '{unexpected}', 'true'::jsonb) WHERE "id" = $1`,
+    ]) {
+      await admin!.query(mutation, [answeredItemId])
+      try {
+        await expect(withRuntimeTransaction(pool, fixture.userId, client => readTurnQuestionPlanningHistory(client, readOwner(fixture), [waitRef(fixture, wait.waitId)])))
+          .rejects.toMatchObject({ code: "question_conflict" })
+      } finally {
+        const restored = await admin!.query(`UPDATE "agent_items" SET "content" = $2::jsonb WHERE "id" = $1 RETURNING "id"`,
+          [answeredItemId, JSON.stringify(answeredItem.rows[0]?.content)])
+        expect(restored.rowCount).toBe(1)
+      }
+    }
     const receiptSummary = await withRuntimeTransaction(pool, fixture.userId, client => readTurnQuestionPlanningWait(client, readOwner(fixture), waitRef(fixture, wait.waitId)))
     expect(receiptSummary).toMatchObject({ observedPlanRevision: 1, graphRevisionAtAsk: 1, pendingSteerCount: 2, unconsumedSteerCount: 1 })
 
@@ -722,6 +807,46 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
     const currentSteerSequence = await acceptSteer(fixture, `clarification_current_steer_${fixture.turnId}`, currentSteerId)
     const pendingBeforeBuild = await admin!.query<{ status: string; consumedByStepId: string | null }>(`SELECT "status", "consumedByStepId" FROM "agent_inputs" WHERE "id" = $1`, [currentSteerId])
     expect(pendingBeforeBuild.rows).toEqual([{ status: "accepted", consumedByStepId: null }])
+    const wakeupRows = await admin!.query<{ eventId: string; sessionId: string; turnId: string; itemId: string; type: string; payload: unknown }>(
+      `SELECT "id" AS "eventId", "sessionId", "turnId", "itemId", "type", "payload" FROM "agent_events"
+       WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3 AND "type" = 'turn.wakeup' AND "payload"->>'waitId' = $4`,
+      [fixture.sessionId, fixture.turnId, answeredItemId, wait.waitId])
+    expect(wakeupRows.rows).toHaveLength(1)
+    const wakeup = parseWakeup(wakeupRows.rows[0])
+    if (!wakeup) throw new Error("Planning clarification fixture has no valid broker wakeup")
+    await expect(resumeAgentTurn(admin!, wakeup)).resolves.toMatchObject({
+      status: "resumed", sessionId: fixture.sessionId, turnId: fixture.turnId, itemId: answeredItemId,
+    })
+    const resumedLease = await claimTurnLease(admin!, {
+      turnId: fixture.turnId, sessionId: fixture.sessionId, ownerId: `${fixture.owner.ownerId}-resumed`,
+    })
+    expect(resumedLease.leaseVersion).toBe(fixture.owner.leaseVersion + 1)
+    const resumedTurn = await admin!.query<{ status: string; leaseOwnerId: string; leaseVersion: number }>(
+      `SELECT "status", "leaseOwnerId", "leaseVersion" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`,
+      [fixture.turnId, fixture.sessionId])
+    expect(resumedTurn.rows).toEqual([{
+      status: "in_progress", leaseOwnerId: resumedLease.ownerId, leaseVersion: resumedLease.leaseVersion,
+    }])
+    const rootBeforeRebind = await admin!.query<{ goal: string; allowedActions: string[] }>(
+      `SELECT "goal", "allowedActions" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`,
+      [fixture.rootTaskId, fixture.sessionId, fixture.turnId])
+    expect(rootBeforeRebind.rows).toHaveLength(1)
+    const rootStore = createPgRootTaskStore(runtimePool(writer!, `clarification_root_resume_${fixture.turnId}`) as unknown as PgSubagentPool)
+    const reboundRoot = await rootStore.ensure({
+      lease: resumedLease, goal: rootBeforeRebind.rows[0]!.goal, allowedActions: rootBeforeRebind.rows[0]!.allowedActions,
+    })
+    expect(reboundRoot).toMatchObject({
+      id: fixture.rootTaskId, status: "running", leaseOwner: resumedLease.ownerId, attemptCount: 1,
+    })
+    expect(reboundRoot.leaseExpiresAt?.getTime()).toBe(resumedLease.leaseExpiresAt.getTime())
+    const rootLease = await admin!.query<{ status: string; leaseOwner: string; attemptCount: number; leaseExpiresAt: Date }>(
+      `SELECT "status", "leaseOwner", "attemptCount", "leaseExpiresAt" FROM "sub_agent_tasks"
+       WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`, [fixture.rootTaskId, fixture.sessionId, fixture.turnId])
+    expect(rootLease.rows).toHaveLength(1)
+    expect(rootLease.rows[0]).toMatchObject({ status: "running", leaseOwner: resumedLease.ownerId, attemptCount: 1 })
+    expect(rootLease.rows[0]!.leaseExpiresAt.getTime()).toBe(resumedLease.leaseExpiresAt.getTime())
+    expect(rootLease.rows[0]!.leaseExpiresAt.getTime()).toBeGreaterThan(Date.now())
+    if (reboundRoot.leaseOwner !== resumedLease.ownerId) throw new Error("Planning clarification fixture did not rebind its root owner")
     const resumedStepId = await seedResumedStep(fixture, currentSteerSequence - 1)
     const durableItems = await admin!.query(`SELECT "id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "content", "createdAt"
       FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" IN ('tool_call', 'question') ORDER BY "createdAt", "id"`,
@@ -758,13 +883,13 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
     expect(snapshot.planningClarificationHistoryPair).toEqual(historyPair)
     const inputStore = createPgInputClaimStore(pool, { userId: fixture.userId })
     const hydrationScope = { userId: fixture.userId, sessionId: fixture.sessionId, turnId: fixture.turnId,
-      rootTaskId: fixture.rootTaskId, parentTaskId: fixture.rootTaskId, turnLeaseOwner: fixture.owner.ownerId,
-      turnLeaseVersion: fixture.owner.leaseVersion, parentLeaseOwner: fixture.owner.ownerId, parentAttemptCount: 1 }
+      rootTaskId: fixture.rootTaskId, parentTaskId: fixture.rootTaskId, turnLeaseOwner: resumedLease.ownerId,
+      turnLeaseVersion: resumedLease.leaseVersion, parentLeaseOwner: reboundRoot.leaseOwner, parentAttemptCount: reboundRoot.attemptCount }
     const builder = new StepContextBuilder(inputStore, undefined, () => new Date(), hydrationScope)
     const buildInput = {
       scope: { userId: fixture.userId }, sessionId: fixture.sessionId, turnId: fixture.turnId, stepId: resumedStepId,
       snapshot, rootInputId: fixture.originalInputId, taskId: fixture.rootTaskId, mode: "new" as const,
-      lease: { ownerId: fixture.owner.ownerId, leaseVersion: fixture.owner.leaseVersion, now: new Date() },
+      lease: { ownerId: resumedLease.ownerId, leaseVersion: resumedLease.leaseVersion, now: new Date() },
     }
     const invalidSnapshot = { ...snapshot, planningClarifications: [
       recovered.planningClarifications[0]!, recovered.planningClarifications[0]!,
@@ -798,10 +923,17 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
     const messages = request.messages.map(message => JSON.stringify(message))
     const serializedMessages = messages.join("\n")
     const systemMessages = JSON.stringify(request.messages.filter(message => message.role === "system"))
-    const questionIndex = messages.findIndex(message => message.includes(intent.question))
-    const answerIndex = messages.findIndex(message => message.includes(answer))
-    const summaryIndex = messages.findIndex(message => message.includes("native_question_recovery"))
-    expect(questionIndex).toBeGreaterThanOrEqual(0)
+    const selectedHistory = selectPlanningQuestionHistory(request.messages, intent.question, wait.waitId, answer)
+    expect(selectedHistory.questions).toHaveLength(1)
+    expect(selectedHistory.answers).toHaveLength(1)
+    expect(selectedHistory.summaries).toHaveLength(1)
+    const questionEntry = selectedHistory.questions[0]!
+    const answerEntry = selectedHistory.answers[0]!
+    const questionIndex = questionEntry.index
+    const answerIndex = answerEntry.index
+    const summaryIndex = selectedHistory.summaries[0]!.index
+    expect(questionEntry.content).toMatchObject({ role: "assistant", type: "question", question: intent.question, options: intent.options })
+    expect(answerEntry.content).toEqual({ role: "user", type: "answer", questionId: wait.waitId, text: answer })
     expect(answerIndex).toBe(questionIndex + 1)
     expect(summaryIndex).toBe(answerIndex + 1)
     expect(serializedMessages).toContain("Accepted steer")

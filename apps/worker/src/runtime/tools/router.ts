@@ -11,10 +11,12 @@ import type {
 } from "./types.js"
 import { ToolExecutionError } from "./types.js"
 import { isSessionPauseRequestedError } from "../session-gate.js"
+import { issueNativeQuestionControlReceipt } from "../turns/native-question-attestation.js"
+import { isBuiltInAskUserTool } from "./ask-user.js"
 
 export type RuntimePolicyDecisionRecorder = (decision: RuntimePolicyDecision) => Promise<void>
 
-export type ToolRouterErrorCode = "runtime_scope_error" | "capability_denied" | "idempotency_conflict" | "timeout" | "cancelled" | "tool_execution_failed" | "policy_denied" | "policy_requires_approval" | "policy_requires_user_input" | "policy_version_unknown" | "policy_rewrite_expands_permissions"
+export type ToolRouterErrorCode = "runtime_scope_error" | "capability_denied" | "idempotency_conflict" | "timeout" | "cancelled" | "tool_execution_failed" | "policy_denied" | "policy_requires_approval" | "policy_requires_user_input" | "policy_version_unknown" | "policy_rewrite_expands_permissions" | "native_question_receipt_invalid"
 
 export class ToolRouterError extends Error {
   constructor(readonly code: ToolRouterErrorCode, message: string) {
@@ -64,13 +66,18 @@ export class ToolRouter {
       await this.lifecycle.failed(call, "cancelled", "cancelled", { message: "Tool execution was interrupted before it started" })
       return { ...request, status: "cancelled", errorCode: "cancelled" }
     }
-    await this.lifecycle.started(call, request.input)
+    const isAskUserRequest = request.toolName === "agent.ask_user"
+    await this.lifecycle.started(call, isAskUserRequest ? nativeQuestionLifecycleProjection() : request.input)
     let execution: ToolExecution | undefined
     try {
       if (!context.scope.userId.trim() || containsModelUserId(request.input)) {
         throw new ToolRouterError("runtime_scope_error", "Tenant userId must be supplied by runtime scope")
       }
       const definition = this.registry.resolve(request.toolName, request.toolVersion)
+      const isBuiltInNativeQuestion = isBuiltInAskUserTool(definition)
+      if (request.toolName === "agent.ask_user" && request.toolVersion === "1" && !isBuiltInNativeQuestion) {
+        throw new ToolRouterError("native_question_receipt_invalid", "Untrusted native user question definition")
+      }
       this.assertCapabilities(definition, context.capabilities ?? [])
       this.registry.validators.validate(definition.inputSchema, request.input, `${request.toolName} input`)
       const policyDecision = this.policy.evaluate({
@@ -99,8 +106,29 @@ export class ToolRouter {
       execution = this.createExecution(context, request, definition, effectiveInput)
       const output = await execution.run()
       this.registry.validators.validate(definition.outputSchema, output, `${request.toolName} output`)
-      const safeOutput = await this.lifecycle.completed(call, output, execution.signal)
-      return { ...request, status: "completed", output: safeOutput, errorCode: null }
+      const nativeQuestionReceipt = isBuiltInNativeQuestion
+        ? issueNativeQuestionControlReceipt({
+          identity: {
+            userId: context.scope.userId, sessionId: context.sessionId, turnId: context.turnId,
+            stepId: context.stepId, taskId: context.taskId ?? "", rootTaskId: context.rootTaskId,
+          },
+          actorRole: context.actorRole,
+          capabilities: context.capabilities ?? [],
+          toolCallId: request.id,
+          toolName: definition.name,
+          toolVersion: definition.version,
+          requestInput: request.input,
+          effectiveInput,
+          toolOutput: output,
+        })
+        : null
+      if (request.toolName === "agent.ask_user" && request.toolVersion === "1" && !nativeQuestionReceipt) {
+        throw new ToolRouterError("native_question_receipt_invalid", "Built-in user question failed its trusted receipt checks")
+      }
+      const safeOutput = await this.lifecycle.completed(call,
+        nativeQuestionReceipt ? nativeQuestionLifecycleProjection() : output, execution.signal)
+      return { ...request, status: "completed", output: safeOutput, errorCode: null,
+        ...(nativeQuestionReceipt ? { nativeQuestionReceipt } : {}) }
     } catch (error: unknown) {
       if (isSessionPauseRequestedError(error)) {
         await this.lifecycle.failed(call, "failed", error.code, { message: "Session work is fenced by a durable pause request" })
@@ -198,6 +226,10 @@ export class ToolRouter {
   private failure(request: ToolCallRequest, errorCode: string): ToolExecutionResult {
     return { ...request, status: errorCode === "cancelled" || errorCode === "timeout" ? "cancelled" : "failed", errorCode }
   }
+}
+
+function nativeQuestionLifecycleProjection(): { readonly question: string; readonly choices: readonly never[] } {
+  return { question: "[REDACTED]", choices: [] }
 }
 
 function stableJson(value: unknown): string {

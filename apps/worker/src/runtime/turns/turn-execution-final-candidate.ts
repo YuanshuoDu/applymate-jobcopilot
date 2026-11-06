@@ -20,6 +20,7 @@ import type { TaskGraphDenialCheckpoint } from "./task-graph-terminal-assessment
 import { TurnStateRefreshRetryError, isTurnStateRefreshRetryError } from "./turn-execution-question.js"
 import { isSessionPauseRequestedError } from "../session-gate.js"
 import { signalWasInterrupted } from "../interrupt/registry.js"
+import { completeEmptyAnalystCandidateOnly } from "../subagents/task-graph-empty-analyst-candidate.js"
 export type FinalCandidateOutcome =
   | Readonly<{ kind: "replan"; feedback: string; taskGraphDenialCheckpoint?: TaskGraphDenialCheckpoint }>
   | Readonly<{ kind: "wait"; result: TurnEngineResult }>
@@ -72,6 +73,8 @@ export async function completeTurnCandidate(input: Readonly<{
   const verification = verifyCandidateFinal({ goal: options.goal, candidate: { text: output.text, finishReason: output.finishReason },
     evidence, expectedEvidence: options.expectedEvidence, businessChecks: options.businessChecks })
   if (!verification.ok) {
+    const candidateOnly = verification.code === "evidence_missing" ? await completeEmptyAnalystCandidateOnly({ identity: options.identity, candidateText: output.text, authorize: options.authorizeEmptyAnalystCandidate, stepCount: input.stepCount, toolCallCount: input.toolCallCount, finishStep: () => finishStep(options, writer, step, output, now, input.onStepClosed) }) : null
+    if (candidateOnly) return { kind: "completed", result: candidateOnly }
     options.completionGate?.[RESET_NATIVE_SEMANTIC_PROGRESS]?.()
     if (verification.code === "evidence_missing" && canRecoverMissingEvidence({ options, snapshot, evidenceCount: evidence.length,
       evidenceRefs: verification.evidenceRefs, blocker: verification.blocker, stepCount: input.stepCount })) {
@@ -84,14 +87,10 @@ export async function completeTurnCandidate(input: Readonly<{
     await writer.append("final.rejected", step.id, null, { code: verification.code, blocker: verification.blocker, feedback: verification.feedback, taskId: options.identity.taskId }, `final-rejected:${step.id}`)
     throw new TurnEngineError(verification.code, verification.blocker)
   }
-  const gate = await assertCompletionAllowed(options, writer, step, signal, now, output.text,
-    output.provider !== "recovered" && output.provider !== "scheduled_recovery" && output.toolCalls.length === 0)
+  const gate = await assertCompletionAllowed(options, writer, step, signal, now, output.text, output.provider !== "recovered" && output.provider !== "scheduled_recovery" && output.toolCalls.length === 0)
   if (gate && "scheduledBlocker" in gate) {
-    await updateExecutionStep(options, { stepId: step.id, status: "waiting_for_tool", finishReason: output.finishReason,
-      errorCode: gate.scheduledBlocker, inputTokens: output.usage?.inputTokens ?? 0, outputTokens: output.usage?.outputTokens ?? 0,
-      estimatedCostUsd: output.usage?.estimatedCostUsd ?? 0, now: now() })
-    await writer.append("step.completed", step.id, null,
-      { stepId: step.id, status: "waiting_for_dependency", errorCode: gate.scheduledBlocker, taskId: options.identity.taskId }, `step-completed:${step.id}`)
+    await updateExecutionStep(options, { stepId: step.id, status: "waiting_for_tool", finishReason: output.finishReason, errorCode: gate.scheduledBlocker, inputTokens: output.usage?.inputTokens ?? 0, outputTokens: output.usage?.outputTokens ?? 0, estimatedCostUsd: output.usage?.estimatedCostUsd ?? 0, now: now() })
+    await writer.append("step.completed", step.id, null, { stepId: step.id, status: "waiting_for_dependency", errorCode: gate.scheduledBlocker, taskId: options.identity.taskId }, `step-completed:${step.id}`)
     input.onStepClosed()
     return { kind: "wait", result: { status: "waiting_for_dependency", errorCode: gate.scheduledBlocker, stepCount: input.stepCount, toolCallCount: input.toolCallCount } }
   }

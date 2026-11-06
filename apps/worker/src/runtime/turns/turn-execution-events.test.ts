@@ -187,6 +187,37 @@ describe("TurnExecutionEventWriter", () => {
     expect(events.every(event => event.identity.taskId === "root-1")).toBe(true)
   })
 
+  it("persists private item content while projecting only an explicit safe completion to event subscribers", async () => {
+    const persisted: unknown[] = [], events: Array<{ payload: RepositoryJsonValue }> = [], subscribed: unknown[] = []
+    const base = options(identity("turn", "root-1"), [])
+    const executionOptions: TurnExecutionOptions = {
+      ...base,
+      subscribe: event => { subscribed.push(event.payload) },
+      store: {
+        ...base.store,
+        createItem: async ({ itemId }) => ({ id: itemId, revision: 0 }),
+        updateItem: async ({ itemId, expectedRevision, content }) => {
+          persisted.push(content)
+          return { id: itemId, revision: expectedRevision + 1 }
+        },
+        appendEvent: async input => { events.push({ payload: input.payload }); return { id: input.id } },
+      },
+    }
+    const writer = new TurnExecutionEventWriter(executionOptions)
+    const item = await writer.startItem({ id: "private-call", stepId: "step-1", type: "tool_call", phase: null,
+      content: { toolCallId: "ask-1", input: { question: "Private question?" } }, now: new Date() })
+    await writer.completeItem(item, {
+      toolCallId: "ask-1", status: "completed", input: { question: "Private question?" },
+    }, new Date(), "private-call-completed", {
+      toolCallId: "ask-1", status: "completed", inputAvailable: true,
+    })
+
+    expect(JSON.stringify(persisted)).toContain("Private question?")
+    const projected = JSON.stringify({ events, subscribed })
+    expect(projected).not.toContain("Private question?")
+    expect(projected).toContain("inputAvailable")
+  })
+
   it("preserves completed tool-call input for replay after restoring persisted items", async () => {
     const events: Array<{ id: string; type: string; itemId: string | null; identity: TurnExecutionIdentity }> = []
     const items = new Map<string, { id: string; stepId: string | null; type: string; status: string; revision: number; content: unknown }>()

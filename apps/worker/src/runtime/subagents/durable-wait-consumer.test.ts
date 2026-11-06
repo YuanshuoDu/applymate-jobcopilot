@@ -5,6 +5,7 @@ import type { TurnLease } from "../turns/lease.js"
 import { TASK_GRAPH_SNAPSHOT_VERSION } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_VERIFICATION_SCHEMA_VERSION } from "../planning/task-graph-verification.js"
 import { TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION } from "./task-graph-command-port.js"
+import { TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION } from "./task-graph-verification-report.js"
 
 const { loadGraph, readFailureReport } = vi.hoisted(() => ({ loadGraph: vi.fn(), readFailureReport: vi.fn() }))
 vi.mock("./task-graph-pg-state.js", () => ({ loadTaskGraph: loadGraph }))
@@ -90,6 +91,22 @@ const dependencyReport = {
 } as const
 const boundDependencyReport = { ...dependencyReport, dependencyBindings: [{ nodeKey: "scout", taskId: "scout-task", attemptCount: 1,
   nodeDigest: "c".repeat(64), resultDigest: "d".repeat(64), evidenceDigest: "e".repeat(64), reportDigest: "f".repeat(64) }] }
+const emptyAnalystVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [
+  { id: "source-coverage", check: { kind: "findings_cover_each_scout_candidates_gte", dependencyNodeKeys: ["scout-a", "scout-b"], minimumPercent: 100 } },
+] } as const
+const emptyAnalystPrivateReport = {
+  verifierVersion: TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met",
+  criteria: [{ criterionId: "source-coverage", status: "failed", reasonCode: "criterion_not_met" }],
+  evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64), dependencyBindings: [
+    { nodeKey: "scout-a", taskId: "source-task-a", attemptCount: 1, nodeDigest: "c".repeat(64), resultDigest: "d".repeat(64), evidenceDigest: "e".repeat(64), reportDigest: "f".repeat(64) },
+    { nodeKey: "scout-b", taskId: "source-task-b", attemptCount: 1, nodeDigest: "1".repeat(64), resultDigest: "2".repeat(64), evidenceDigest: "3".repeat(64), reportDigest: "4".repeat(64) },
+  ],
+} as const
+const emptyAnalystPublicReport = {
+  verifierVersion: TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met",
+  criteria: [{ criterionId: "source-coverage", status: "failed", reasonCode: "criterion_not_met" }],
+  evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64),
+} as const
 function dependencySnapshot() {
   return { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
     { key: "scout", taskId: "scout-task", templateId: "scout", goal: "Search", successCriteria: ["Find"], dependsOn: [], depth: 1,
@@ -98,9 +115,22 @@ function dependencySnapshot() {
       verification: dependencyVerification, verificationDisposition: "typed" },
   ] }
 }
-function dependencyLoadedGraph(snapshot: ReturnType<typeof dependencySnapshot>, result: unknown) {
+function dependencyLoadedGraph<T>(snapshot: T, result: unknown, status = "completed") {
   return { rootTaskId: "root-1", item: { id: "task-graph:root-1", revision: 2, content: snapshot, createdAt: now }, snapshot, state: null,
-    tasks: new Map([["child-1", { id: "child-1", status: "completed", role: "analyst", failureReason: null, result }]]) }
+    tasks: new Map([["child-1", { id: "child-1", status, role: "analyst", failureReason: null, result }]]) }
+}
+function emptyAnalystDependencySnapshot() {
+  return { schemaVersion: TASK_GRAPH_SNAPSHOT_VERSION, nodes: [
+    ...["scout-a", "scout-b"].map(key => ({ key, taskId: `source-task-${key.slice(-1)}`, templateId: "scout", goal: "Search", successCriteria: ["Find"], dependsOn: [], depth: 1, verification: scoutVerification, verificationDisposition: "typed" as const })),
+    { key: "analyst", taskId: "child-1", templateId: "analyst", goal: "Assess", successCriteria: ["Coverage"], dependsOn: ["scout-a", "scout-b"], depth: 2, verification: emptyAnalystVerification, verificationDisposition: "typed" as const },
+  ] }
+}
+function consumedEmptyAnalystFixture(archivedReport: unknown, currentReport: unknown) {
+  const snapshot = emptyAnalystDependencySnapshot()
+  const result = { structuredResult: { schemaVersion: "agent-harness.v2.role-result.v1", role: "analyst", status: "completed", findings: [], evidence: [], summary: "Empty" }, taskGraphVerificationReport: currentReport }
+  loadGraph.mockResolvedValue(dependencyLoadedGraph(snapshot, result, "failed"))
+  return fixture({ consumed: true, snapshot, targetStatus: "failed", targetRole: "analyst", targetFailureReasons: [null],
+    archivedTargetStatuses: ["failed"], archivedTargetRole: "analyst", storedReport: archivedReport, targetResults: [result] })
 }
 
 describe("durable wait outcome consumer", () => {
@@ -215,6 +245,49 @@ describe("durable wait outcome consumer", () => {
     expect(loadGraph.mock.calls[0]?.[2]).toBe(false)
     expect(output.tasks[0]?.verificationReport).toEqual(dependencyReport)
     expect(JSON.stringify(output)).not.toContain("dependencyBindings")
+  })
+
+  it("replays the exact safe empty Analyst v2 report from its current private proof", async () => {
+    const snapshot = emptyAnalystDependencySnapshot(), result = {
+      structuredResult: { schemaVersion: "agent-harness.v2.role-result.v1", role: "analyst", status: "completed", findings: [], evidence: [], summary: "Empty" },
+      taskGraphVerificationReport: emptyAnalystPrivateReport,
+    }
+    loadGraph.mockResolvedValue(dependencyLoadedGraph(snapshot, result, "failed"))
+    const fake = fixture({ snapshot, targetStatus: "failed", targetRole: "analyst", targetFailureReasons: [null], targetResults: [result] })
+    const first = outputOf((await consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now }))[0]!.content)
+    expect(first.tasks[0]?.verificationReport).toEqual(emptyAnalystPublicReport)
+    expect(JSON.stringify(fake.state.result)).not.toContain("dependencyBindings")
+    expect(JSON.stringify(fake.state.result)).not.toContain("source-task-a")
+    expect(JSON.stringify(fake.state.result)).not.toContain("source-task-b")
+    const replayed = outputOf((await consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now }))[0]!.content)
+    expect(replayed.tasks[0]?.verificationReport).toEqual(emptyAnalystPublicReport)
+    expect(Object.keys(replayed.tasks[0]!.verificationReport as object).sort()).toEqual([
+      "criteria", "evidenceDigest", "reasonCode", "resultDigest", "status", "verifierVersion",
+    ])
+    expect(JSON.stringify(replayed)).not.toContain("dependencyBindings")
+    expect(JSON.stringify(replayed)).not.toContain("source-task-a")
+    expect(JSON.stringify(replayed)).not.toContain("source-task-b")
+    expect(fake.state.updates).toBe(1)
+    expect(loadGraph).toHaveBeenCalledTimes(2)
+  })
+
+  it("rejects altered public v2 reports and stale or mismatched current private proofs on replay", async () => {
+    const cases: Array<{ archived: unknown; current: unknown }> = [
+      { archived: { ...emptyAnalystPublicReport, evidenceDigest: "9".repeat(64) }, current: emptyAnalystPrivateReport },
+      { archived: { ...emptyAnalystPublicReport, unexpected: true }, current: emptyAnalystPrivateReport },
+      { archived: { ...emptyAnalystPublicReport, dependencyBindings: emptyAnalystPrivateReport.dependencyBindings }, current: emptyAnalystPrivateReport },
+      { archived: emptyAnalystPublicReport, current: { ...emptyAnalystPrivateReport, evidenceDigest: "9".repeat(64) } },
+      { archived: emptyAnalystPublicReport, current: { ...emptyAnalystPrivateReport, dependencyBindings: [
+        { ...emptyAnalystPrivateReport.dependencyBindings[0]!, nodeKey: "scout-c" },
+        { ...emptyAnalystPrivateReport.dependencyBindings[1]!, nodeKey: "scout-d" },
+      ] } },
+      { archived: emptyAnalystPublicReport, current: { ...emptyAnalystPrivateReport, dependencyBindings: [] } },
+    ]
+    for (const value of cases) {
+      const fake = consumedEmptyAnalystFixture(value.archived, value.current)
+      await expect(consumeDurableWaitOutcomes({ client: fake.client as never, lease, turn, now })).rejects.toThrow("wait_consume_outcome_invalid")
+      expect(fake.state.updates).toBe(0)
+    }
   })
 
   it("rejects a stale archived cross-node report even when the current source binding revalidates", async () => {

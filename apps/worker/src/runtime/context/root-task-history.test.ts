@@ -138,7 +138,7 @@ describe("root task history projection", () => {
       criterionFailures: [{ criterionOrdinal: 1, status: "failed", reasonCode: "criterion_not_met",
         check: { role: "scout", kind: "candidate_count_gte", minimum: 2 } }] } as const
     const categoryLesson = { ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
-      nodeOrdinal: 3, criterionFailures: [], executionFailureCategory: "execution_setup_unavailable" } as const
+      nodeOrdinal: 3, criterionFailures: [], executionFailureCategory: "execution_deadline_exceeded" } as const
     const source = outcome("cross-session-private", 18n, [repair, target, category])
     const resultProjection = { schemaVersion: "agent-harness.v2.task-graph.result-projection", trust: "untrusted",
       availability: "available", role: "scout", status: "partial", candidateCount: 1, evidenceCount: 1,
@@ -149,7 +149,7 @@ describe("root task history projection", () => {
     const currentTurn = projectRootTaskHistory([facts])
     expect(currentTurn?.content).not.toHaveProperty("historical")
     expect(currentTurn?.content).toMatchObject({ turns: [{ nodes: [
-      { taskKind: "analyst", lesson: { executionFailureCategory: "execution_setup_unavailable" } },
+      { taskKind: "analyst", lesson: { executionFailureCategory: "execution_deadline_exceeded" } },
       { taskKind: "scout", reportedOutput: { candidateCount: 1 }, lesson: { successfulRepairs: [{ targetNodeOrdinal: 1 }] } },
       { taskKind: "scout", lesson: { criterionFailures: [{ check: { kind: "candidate_count_gte", minimum: 2 } }] } },
     ] }] })
@@ -163,7 +163,7 @@ describe("root task history projection", () => {
     const historicalTurns = (historical?.content as { turns?: Array<{ nodes: Array<Record<string, unknown>> }> } | undefined)?.turns
     expect(historicalTurns).toHaveLength(2)
     expect(historicalTurns?.[0]?.nodes).toEqual(expect.arrayContaining([
-      expect.objectContaining({ taskKind: "analyst", lesson: expect.objectContaining({ executionFailureCategory: "execution_setup_unavailable" }) }),
+      expect.objectContaining({ taskKind: "analyst", lesson: expect.objectContaining({ executionFailureCategory: "execution_deadline_exceeded" }) }),
       expect.objectContaining({ taskKind: "scout", status: "completed", reportedOutput: { role: "scout", candidateCount: 1, resultStatus: "partial" },
         lesson: expect.objectContaining({ successfulRepairs: [{ targetNodeOrdinal: 1, targetCriterionOrdinals: [1], status: "passed" }] }) }),
     ]))

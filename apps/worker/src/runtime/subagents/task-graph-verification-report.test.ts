@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest"
 import {
+  TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION,
   TASK_GRAPH_VERIFIER_VERSION,
+  parseCurrentTaskGraphPublicVerificationReport,
   parseStoredTaskGraphVerificationReport,
   publicTaskGraphVerificationReport,
 } from "./task-graph-verification-report.js"
@@ -39,6 +41,87 @@ describe("TaskGraph verification report storage contract", () => {
     expect(parseStoredTaskGraphVerificationReport(base, ["in-scout"], ["scout-a"])).toBeUndefined()
   })
 
+  it("stores failed multi-source bindings privately while retaining v1 read behavior", () => {
+    expect(TASK_GRAPH_VERIFIER_VERSION).toBe("agent-harness.v2.task-graph-verifier.v1")
+    const failed = {
+      ...base,
+      status: "failed",
+      reasonCode: "criterion_not_met",
+      criteria: [{ criterionId: "in-scout", status: "failed", reasonCode: "criterion_not_met" }],
+      dependencyBindings: [binding("scout-a"), binding("scout-b")],
+    }
+    const parsed = parseStoredTaskGraphVerificationReport(failed, ["in-scout"], ["scout-b", "scout-a"])
+    expect(parsed).toMatchObject({ status: "failed", dependencyBindings: [{ nodeKey: "scout-a" }, { nodeKey: "scout-b" }] })
+    const publicReport = publicTaskGraphVerificationReport(parsed!)
+    expect(JSON.stringify(publicReport)).not.toContain("scout-a")
+    expect(JSON.stringify(publicReport)).not.toContain("task-scout")
+    expect(parseTaskGraphVerificationReport(failed, ["in-scout"])).toEqual(publicReport)
+
+    const oldUnverified = {
+      ...base,
+      status: "unverified",
+      reasonCode: "canonical_evidence_missing",
+      criteria: [{ criterionId: "in-scout", status: "unverified", reasonCode: "canonical_evidence_missing" }],
+      evidenceDigest: null,
+      resultDigest: null,
+    }
+    expect(parseStoredTaskGraphVerificationReport(oldUnverified, ["in-scout"], ["scout-a"])).toMatchObject({
+      verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status: "unverified", reasonCode: "canonical_evidence_missing",
+    })
+    expect(parseTaskGraphVerificationReport(oldUnverified, ["in-scout"])).toMatchObject({
+      verifierVersion: "agent-harness.v2.task-graph-verifier.v1", status: "unverified", reasonCode: "canonical_evidence_missing",
+    })
+    const failedV2 = { ...failed, verifierVersion: TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION }
+    const parsedV2 = parseStoredTaskGraphVerificationReport(failedV2, ["in-scout"], ["scout-b", "scout-a"])
+    expect(parsedV2).toMatchObject({ verifierVersion: TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION, status: "failed" })
+    const publicV2 = publicTaskGraphVerificationReport(parsedV2!)
+    expect(publicV2.verifierVersion).toBe(TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION)
+    expect(JSON.stringify(publicV2)).not.toContain("scout-a")
+    expect(parseTaskGraphVerificationReport(failedV2, ["in-scout"])).toEqual(publicV2)
+
+    // A #1068 reader only accepted its exact v1 identifier; it must reject the new semantic version.
+    const oldReader = (value: unknown) => {
+      if (!value || typeof value !== "object" || (value as { verifierVersion?: unknown }).verifierVersion !== TASK_GRAPH_VERIFIER_VERSION) return undefined
+      return parseStoredTaskGraphVerificationReport(value, ["in-scout"])
+    }
+    expect(oldReader(failedV2)).toBeUndefined()
+    expect(parseStoredTaskGraphVerificationReport({ ...oldUnverified, verifierVersion: TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION }, ["in-scout"], ["scout-a", "scout-b"])).toBeUndefined()
+    expect(parseStoredTaskGraphVerificationReport({ ...failedV2, dependencyBindings: undefined }, ["in-scout"])).toBeUndefined()
+    expect(parseStoredTaskGraphVerificationReport({ ...failedV2, status: "passed", reasonCode: "criteria_met",
+      criteria: [{ criterionId: "in-scout", status: "passed", reasonCode: "criteria_met" }] }, ["in-scout"])).toBeUndefined()
+    expect(parseStoredTaskGraphVerificationReport({ ...failedV2, dependencyBindings: [binding("scout-a")] }, ["in-scout"])).toBeUndefined()
+  })
+
+  it("parses only the exact redacted failed v2 DTO for current observations", () => {
+    const stored = {
+      ...base, verifierVersion: TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION, status: "failed",
+      reasonCode: "criterion_not_met",
+      criteria: [{ criterionId: "in-scout", status: "failed", reasonCode: "criterion_not_met" }],
+      dependencyBindings: [binding("scout-a"), binding("scout-b")],
+    }
+    const privateReport = parseStoredTaskGraphVerificationReport(stored, ["in-scout"], ["scout-a", "scout-b"])
+    const publicReport = publicTaskGraphVerificationReport(privateReport!)
+    expect(parseCurrentTaskGraphPublicVerificationReport(publicReport, ["in-scout"])).toEqual(publicReport)
+    expect(parseStoredTaskGraphVerificationReport(publicReport, ["in-scout"])).toBeUndefined()
+    expect(JSON.stringify(parseCurrentTaskGraphPublicVerificationReport(publicReport, ["in-scout"]))).not.toContain("task-scout")
+
+    for (const malformed of [
+      { ...publicReport, dependencyBindings: stored.dependencyBindings },
+      { ...publicReport, unexpected: true },
+      { ...publicReport, verifierVersion: TASK_GRAPH_VERIFIER_VERSION },
+      { ...publicReport, status: "passed" },
+      { ...publicReport, reasonCode: "reported_score_below_minimum" },
+      { ...publicReport, evidenceDigest: "A".repeat(64) },
+      { ...publicReport, criteria: [{ criterionId: "in-scout", status: "unverified", reasonCode: "result_invalid" }] },
+      { ...publicReport, criteria: [{ criterionId: "in-scout", status: "failed", reasonCode: "reported_score_below_minimum" }] },
+    ]) expect(parseCurrentTaskGraphPublicVerificationReport(malformed, ["in-scout"])).toBeUndefined()
+
+    let getterCalls = 0
+    const accessor = { ...publicReport }
+    Object.defineProperty(accessor, "status", { enumerable: true, get() { getterCalls += 1; return "failed" } })
+    expect(parseCurrentTaskGraphPublicVerificationReport(accessor, ["in-scout"])).toBeUndefined()
+    expect(getterCalls).toBe(0)
+  })
   it("rejects duplicate, unsorted, malformed, or unverified private bindings", () => {
     const valid = { ...base, dependencyBindings: [binding("scout-a"), binding("scout-z")] }
     expect(parseStoredTaskGraphVerificationReport({ ...base, dependencyBindings: [binding("scout-a"), binding("scout-a")] }, ["in-scout"])).toBeUndefined()

@@ -5,6 +5,7 @@ import { TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, TASK_GRAPH_VERIFICATIO
 import { SCHEDULED_AUTOMATION_SNAPSHOT_SCHEMA_VERSION } from "./scheduled-automation-snapshot.js"
 import { ROLE_RESULT_SCHEMA } from "./role-results.js"
 import { parseTaskGraphSnapshot, type StoredTaskGraphNode } from "./task-graph-snapshot.js"
+import { TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION } from "./task-graph-verification-report.js"
 import { TASK_GRAPH_VERIFIER_VERSION, verifyCompletedTaskGraphNodeEvidence, verifyTaskGraphNodeEvidence, type TaskGraphVerificationScope } from "./task-graph-pg-verification.js"
 
 const scope: TaskGraphVerificationScope = {
@@ -89,6 +90,63 @@ function emptyDiscoveryRows(output: unknown, options: { input?: unknown; turn?: 
   data.events[0] = { ...data.events[0]!, payload: common }
   data.events[1] = { ...data.events[1]!, payload: { ...common, status: "completed", output: outputValue, errorCode: null } }
   return data
+}
+
+function emptyAnalystCoverageRows(options: { currentItemProofRows?: Record<string, unknown>[]; currentEventProofRows?: Record<string, unknown>[] } = {}) {
+  const analystScope = { ...scope, taskId: "analyst-current-attempt" }
+  const emptyResult = {
+    schemaVersion: ROLE_RESULT_SCHEMA, role: "analyst", status: "completed",
+    findings: [], evidence: [], summary: "No candidates to analyze",
+  }
+  const scoutVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout" as const,
+    criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte" as const, minimum: 1 } }] }
+  const analystVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst" as const, criteria: [
+    { id: "source-coverage", check: { kind: "findings_cover_each_scout_candidates_gte" as const, dependencyNodeKeys: ["scout-a", "scout-b"], minimumPercent: 50 } },
+    { id: "finding-count", check: { kind: "finding_count_gte" as const, minimum: 1 } },
+    { id: "evidence-count", check: { kind: "evidence_count_gte" as const, minimum: 1 } },
+    { id: "finding-evidence", check: { kind: "all_findings_have_evidence" as const, minimumItems: 1 } },
+    { id: "reported-score", check: { kind: "reported_score_gte" as const, minimumScore: 7, minimumFindings: 1, aggregation: "any" as const } },
+    { id: "source-membership", check: { kind: "findings_from_scout_dependency" as const, dependencyNodeKey: "scout-a" } },
+  ] }
+  const graph = parseTaskGraphSnapshot({ schemaVersion: "agent-harness.v2.task-graph", nodes: [
+    { key: "scout-a", templateId: "scout", goal: "Find source A", successCriteria: ["Find jobs"], dependsOn: [], depth: 1,
+      taskId: "scout-a-task", verificationDisposition: "typed", verification: scoutVerification },
+    { key: "scout-b", templateId: "scout", goal: "Find source B", successCriteria: ["Find jobs"], dependsOn: [], depth: 1,
+      taskId: "scout-b-task", verificationDisposition: "typed", verification: scoutVerification },
+    { key: "analyst", templateId: "analyst", goal: "Analyze sources", successCriteria: ["Cover both"], dependsOn: ["scout-a", "scout-b"], depth: 2,
+      taskId: analystScope.taskId, verificationDisposition: "typed", verification: analystVerification },
+  ] })
+  const task = {
+    id: analystScope.taskId, sessionId: analystScope.sessionId, turnId: analystScope.turnId, rootTaskId: analystScope.rootTaskId,
+    parentTaskId: analystScope.parentTaskId, turnRootTaskId: analystScope.rootTaskId, attemptCount: analystScope.attemptCount,
+    status: "running", role: "analyst", userId: analystScope.userId, result: null,
+    turnSource: "chat", turnExecutionMode: "canonical_task_graph", turnInput: {},
+  }
+  const query = vi.fn(async (sql: string, _values?: unknown[]) => {
+    if (sql.includes('SELECT task."id"')) return { rows: [task], rowCount: 1 }
+    if (sql.startsWith('SELECT item."id" FROM "agent_items"')) {
+      return { rows: options.currentItemProofRows ?? [], rowCount: options.currentItemProofRows?.length ?? 0 }
+    }
+    if (sql.startsWith('SELECT item."id",') && sql.includes('FROM "agent_items"')) return { rows: [], rowCount: 0 }
+    if (sql.startsWith('SELECT item."id" FROM "agent_steps"')) return { rows: [], rowCount: 0 }
+    if (sql.includes('FROM "agent_events" AS event')) {
+      return { rows: options.currentEventProofRows ?? [], rowCount: options.currentEventProofRows?.length ?? 0 }
+    }
+    throw new Error("unexpected_empty_analyst_coverage_query")
+  })
+  const readScout = (jobId: string): TaskGraphVerificationEvidenceProjection => ({
+    schemaVersion: TASK_GRAPH_VERIFICATION_EVIDENCE_SCHEMA_VERSION, role: "scout",
+    candidates: [{ jobId, evidenceIds: [`read:job:${jobId}`] }], evidenceIds: [`read:job:${jobId}`],
+  })
+  const bindings = ["scout-a", "scout-b"].map((nodeKey, index) => ({
+    nodeKey, taskId: `${nodeKey}-task`, attemptCount: 1, nodeDigest: String(index + 1).repeat(64),
+    resultDigest: "b".repeat(64), evidenceDigest: "c".repeat(64), reportDigest: "d".repeat(64),
+  }))
+  const dependencies = new Map<string, TaskGraphVerificationEvidenceProjection>([
+    ["scout-a", readScout("job-a")], ["scout-b", readScout("job-b")],
+  ])
+  return { analystScope, graph, node: graph.nodes[2]!, emptyResult, dependencies, bindings, query,
+    client: { query } as unknown as Pick<pg.PoolClient, "query"> }
 }
 
 function replayData(options: { sourceResultItemId?: string; sourceSessionId?: string; sourceAttempt?: number; sourceInput?: unknown; sourceOutput?: unknown; currentOutput?: unknown; missingTerminalLink?: boolean; duplicateProof?: boolean } = {}) {
@@ -371,6 +429,72 @@ describe("TaskGraph PostgreSQL verification evidence", () => {
       evaluation: { status: "unverified", reasonCode: "canonical_evidence_missing" },
     })
     expect(result.projection).toBeUndefined()
+  })
+
+  it("fails an empty current Finish against every reverified Scout without fabricating Analyst evidence", async () => {
+    const data = emptyAnalystCoverageRows()
+    const result = await verifyTaskGraphNodeEvidence(data.client, {
+      scope: data.analystScope, snapshot: data.graph, node: data.node, structuredResult: data.emptyResult,
+      dependencies: data.dependencies, dependencyBindings: data.bindings, graphRevision: 9,
+    })
+    expect(result).toMatchObject({
+      verified: false, persistDependencyBindings: true,
+      report: { status: "failed", reasonCode: "criterion_not_met", verifierVersion: TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION },
+      evaluation: { status: "failed", reasonCode: "criterion_not_met" },
+      projection: { role: "analyst", findings: [], evidenceIds: [] },
+      structuredResult: data.emptyResult,
+    })
+    expect(result.projection).not.toHaveProperty("emptyDiscoveryReceipt")
+    expect(result.report.evidenceDigest).toMatch(/^[a-f0-9]{64}$/)
+    expect(result.report.resultDigest).toMatch(/^[a-f0-9]{64}$/)
+    expect(result.evaluation.criteria).toEqual([
+      { criterionId: "source-coverage", status: "failed", reasonCode: "criterion_not_met" },
+      { criterionId: "finding-count", status: "failed", reasonCode: "criterion_not_met" },
+      { criterionId: "evidence-count", status: "failed", reasonCode: "criterion_not_met" },
+      { criterionId: "finding-evidence", status: "failed", reasonCode: "criterion_not_met" },
+      { criterionId: "reported-score", status: "failed", reasonCode: "criterion_not_met" },
+      { criterionId: "source-membership", status: "passed", reasonCode: "criteria_met" },
+    ])
+    const eventQuery = data.query.mock.calls.find(([sql]) => sql.includes('FROM "agent_events" AS event'))
+    expect(eventQuery?.[0]).toContain('item."attempt" = $7')
+    expect(eventQuery?.[0]).toContain('event."correlationId" IN')
+    expect(eventQuery?.[0]).toContain('event."taskId" = $1 AND NOT EXISTS')
+    expect(eventQuery?.[1]?.[6]).toBe(data.analystScope.attemptCount)
+  })
+
+  it("keeps the empty Analyst unverified when any source binding or current-attempt receipt proof is unavailable", async () => {
+    const base = emptyAnalystCoverageRows()
+    const missingDependency = await verifyTaskGraphNodeEvidence(base.client, {
+      scope: base.analystScope, snapshot: base.graph, node: base.node, structuredResult: base.emptyResult,
+      dependencyBindings: base.bindings, graphRevision: 9,
+    })
+    expect(missingDependency.report).toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_missing", evidenceDigest: null })
+
+    const missingBinding = await verifyTaskGraphNodeEvidence(base.client, {
+      scope: base.analystScope, snapshot: base.graph, node: base.node, structuredResult: base.emptyResult,
+      dependencies: base.dependencies, graphRevision: 9,
+    })
+    expect(missingBinding.report).toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_missing", resultDigest: null })
+
+    const malformedBinding = await verifyTaskGraphNodeEvidence(base.client, {
+      scope: base.analystScope, snapshot: base.graph, node: base.node, structuredResult: base.emptyResult,
+      dependencies: base.dependencies, dependencyBindings: [{ ...base.bindings[0]!, taskId: "" }, base.bindings[1]!], graphRevision: 9,
+    })
+    expect(malformedBinding.report).toMatchObject({ status: "unverified", reasonCode: "canonical_evidence_missing" })
+
+    for (const proofRows of [
+      { currentItemProofRows: [{ id: "current-tool-item" }] },
+      { currentEventProofRows: [{ id: "current-tool-event" }] },
+    ]) {
+      const withReceipt = emptyAnalystCoverageRows(proofRows)
+      const rejected = await verifyTaskGraphNodeEvidence(withReceipt.client, {
+        scope: withReceipt.analystScope, snapshot: withReceipt.graph, node: withReceipt.node,
+        structuredResult: withReceipt.emptyResult, dependencies: withReceipt.dependencies,
+        dependencyBindings: withReceipt.bindings, graphRevision: 9,
+      })
+      expect(rejected).toMatchObject({ verified: false, report: { status: "unverified", reasonCode: "canonical_evidence_invalid", evidenceDigest: null } })
+      expect(rejected.projection).toBeUndefined()
+    }
   })
 
   it("persists independent candidate coverage over owner-scoped Scout dependencies", async () => {

@@ -9,6 +9,27 @@ function TranslationProbe() {
 }
 
 describe('AI settings translations', () => {
+  it('localizes manual application recording guidance and statuses in every supported language', () => {
+    const keys = [
+      'agent.applyNow',
+      'agent.manualRecordGuidance',
+      'agent.manualRecordAction',
+      'agent.manualRecordPending',
+      'agent.manualRecordUnknown',
+      'agent.manualRecordReported',
+    ]
+
+    for (const { value: language } of LANGUAGES) {
+      for (const key of keys) {
+        expect(hasTranslation(language, key), `${language}:${key}`).toBe(true)
+        expect(translate(language, key), `${language}:${key}`).not.toBe(key)
+      }
+    }
+    expect(translate('en', 'agent.manualRecordGuidance')).toContain('only opens the employer page')
+    expect(translate('zh', 'agent.manualRecordGuidance')).toContain('只会打开雇主页面')
+    expect(hasTranslation('en', 'agent.confirmDelivery')).toBe(false)
+  })
+
   it('renders a user-facing saved-key placeholder instead of the translation key', () => {
     const html = renderToStaticMarkup(
       <I18nProvider>
