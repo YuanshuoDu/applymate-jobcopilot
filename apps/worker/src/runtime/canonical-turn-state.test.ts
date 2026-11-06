@@ -78,6 +78,13 @@ function pool(rows: { turn?: Record<string, unknown>; steps?: Record<string, unk
     }
     if (sql.includes('FROM "agent_items" AS question')) return { rows: rows.priorQuestions ?? [], rowCount: rows.priorQuestions?.length ?? 0 }
     if (sql.includes('FROM "agent_items" AS call')) return { rows: rows.priorCalls ?? [], rowCount: rows.priorCalls?.length ?? 0 }
+    if (sql.startsWith('SELECT "id", "status", "content",') && sql.includes('FROM "agent_items"') && sql.includes('"type" = \'tool_call\'')) {
+      const exactAttempt = rows.steps?.some(step => step.id === values?.[2] && Number(step.attempt) === 1)
+      const result = exactAttempt ? (rows.items ?? []).filter(item => item.type === "tool_call" && item.stepId === values?.[2]
+        && item.taskId === values?.[3] && (item.content as Record<string, unknown> | undefined)?.toolCallId === values?.[4])
+        : []
+      return { rows: result, rowCount: result.length }
+    }
     if (sql.includes('FROM "agent_steps" AS step') && sql.includes('WHERE step."id" = $1')) {
       const result = (rows.steps ?? []).filter(step => step.id === values?.[0])
       return { rows: result, rowCount: result.length }

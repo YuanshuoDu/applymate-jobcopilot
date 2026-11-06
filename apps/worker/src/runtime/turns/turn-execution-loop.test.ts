@@ -4,7 +4,7 @@ import type pg from "pg"
 import { Value } from "@sinclair/typebox/value"
 import type { TenantScope } from "@jobcopilot/agent-protocol"
 import { AgentModelError, type HarnessModelRequest, type ModelAdapter, type ModelStreamEvent } from "@jobcopilot/agent-model"
-import type { PolicyEngine } from "@jobcopilot/agent-policy"
+import { PolicyEngine } from "../policy/index.js"
 import { StepContextBuilder, type StepContext } from "../context/step-context-builder.js"
 import type { InputClaimStore, InputClaimTransaction, StepCheckpoint, StoredAgentInput } from "../context/input-claim-store.js"
 import { mergeTaskGraphCurrentObservation } from "../canonical-turn-task-graph-context.js"
@@ -23,7 +23,8 @@ import { COGNITIVE_AGENDA_EVENT_TYPE } from "./cognitive-agenda-receipt.js"
 import { BudgetExceededError } from "../budget.js"
 import { SessionPauseRequestedError } from "../session-gate.js"
 import { classifyTurnFailure } from "./dlq.js"
-import { ToolExecutionError, type ToolExecutionContext } from "../tools/types.js"
+import { ToolExecutionError, type RuntimeToolDefinition, type ToolExecutionContext } from "../tools/types.js"
+import { createAskUserTool } from "../tools/ask-user.js"
 import { createTaskGraphPlanningTool } from "../tools/planning-executors.js"
 import type { TaskGraphCommandPort, TaskGraphCurrentState, TaskGraphScheduleReceipt } from "../subagents/task-graph-command-port.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "../subagents/task-graph-pg-verification.js"
@@ -35,6 +36,7 @@ import { createReadOnlyTools, type ReadToolDataSource } from "../tools/read-tool
 import { InMemoryToolLifecycleSink, ToolLifecycle } from "../tools/lifecycle.js"
 import { ToolRouter } from "../tools/router.js"
 import { ToolRegistry } from "../tools/registry.js"
+import { createToolRouterExecutor } from "./turn-engine-helpers.js"
 import { OrphanPauseUsageRecoveredError } from "./turn-question-store-events.js"
 import { questionConflict } from "./turn-question-store-guards.js"
 import { SCHEDULED_PIPELINE_COMPLETION } from "./turn-execution-types.js"
@@ -250,6 +252,12 @@ function nativeQuestionFixture(recovery: unknown = { status: "none" }, callId = 
   const stageQuestionUsage = vi.fn(async () => { timeline.push("stage") })
   const cancelPausedQuestion = vi.fn(async () => "cancelled" as const)
   const readPendingQuestion = vi.fn(async () => recovery as never)
+  const questionPolicy = new PolicyEngine({ snapshot: { version: "policy.v1", rules: [{
+    id: "native-question-test", roles: ["orchestrator"], tools: ["agent.ask_user"], toolVersions: ["1"],
+    risks: ["internal_write"], domains: ["coordination"], requiredCapabilities: ["canManageChildren"],
+    outcome: "allow", reasonCode: "native_question_test", reason: "Allow the built-in native question in this test",
+  }] } })
+  const questionRouter = new ToolRouter(new ToolRegistry([createAskUserTool() as RuntimeToolDefinition]), new ToolLifecycle({ sink: new InMemoryToolLifecycleSink() }), questionPolicy)
   const model: ModelAdapter = { id: "fixture-model", profile, async *stream(request: HarnessModelRequest) {
     root.requests.push(request)
     yield { type: "tool_call_completed", callId, name: "agent.ask_user", arguments: { question: "Which city?" } }
@@ -258,6 +266,7 @@ function nativeQuestionFixture(recovery: unknown = { status: "none" }, callId = 
   } }
   root.options = {
     ...root.options, model, tools: [{ name: "agent.ask_user", version: "1" }],
+    actorRole: "orchestrator", capabilities: ["canManageChildren"],
     store: { ...baseStore,
       appendEvent: async input => {
         const suffix = input.itemId?.includes(":item:tool-result:") ? ":result" : input.itemId?.includes(":item:tool-call:") ? ":call" : ""
@@ -266,7 +275,7 @@ function nativeQuestionFixture(recovery: unknown = { status: "none" }, callId = 
       },
       stageQuestionUsage, cancelPausedQuestion, waitForQuestion: async input => { timeline.push("wait"); return waitForQuestion(input) }, readPendingQuestion,
     },
-    executeTool: async ({ call }) => ({ id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed", output: intent, errorCode: null }),
+    executeTool: createToolRouterExecutor(questionRouter),
   }
   return { ...root, timeline, usage, waitForQuestion, stageQuestionUsage, cancelPausedQuestion, readPendingQuestion }
 }

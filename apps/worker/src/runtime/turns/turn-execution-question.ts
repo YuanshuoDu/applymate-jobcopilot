@@ -8,6 +8,7 @@ import { executionId, type TurnExecutionIdentity, type TurnExecutionOptions } fr
 import type { TurnExecutionEventWriter } from "./turn-execution-events.js"
 import { assertExecutionAlive } from "./turn-engine-helpers.js"
 import { OrphanPauseUsageRecoveredError } from "./turn-question-store-events.js"
+import { readTrustedNativeQuestionAttestation } from "./native-question-attestation.js"
 
 export class PreparedQuestionRetryError extends Error {
   readonly code = "prepared_question_wait_retry_required"
@@ -41,13 +42,26 @@ export function nativeQuestionResultMatches(input: unknown, output: unknown): bo
   return expected !== null && receipt !== null && JSON.stringify(expected) === JSON.stringify(receipt)
 }
 
+function isSafeIncompleteQuestionOutput(input: unknown, output: unknown): boolean {
+  if (output === undefined || output === null) return true
+  if (output && typeof output === "object" && !Array.isArray(output)) {
+    const projection = output as Record<string, unknown>
+    if (Object.keys(projection).sort().join(",") === "choices,question" && projection.question === "[REDACTED]"
+      && Array.isArray(projection.choices) && projection.choices.length === 0) return true
+  }
+  return nativeQuestionResultMatches(input, output)
+}
+
 export function rejectQuestionReplay(toolName: string): void {
   if (toolName === "agent.ask_user") throw new TurnEngineError("invalid_output", "A persisted question call cannot be replayed as a new question")
 }
 
-export function nativeQuestionResultCall(stepId: string, call: TurnEngineToolCall, result: TurnEngineToolResult): { readonly stepId: string; readonly toolCallId: string } | null {
+export function nativeQuestionResultCall(identity: TurnExecutionIdentity, stepId: string, call: TurnEngineToolCall, result: TurnEngineToolResult): { readonly stepId: string; readonly toolCallId: string } | null {
   if (call.name !== "agent.ask_user") return null
-  if (result.status !== "completed" || result.errorCode !== null || !nativeQuestionResultMatches(call.arguments, result.output)) {
+  const receipt = readTrustedNativeQuestionAttestation(result.nativeQuestionReceipt,
+    { userId: identity.userId, sessionId: identity.sessionId, turnId: identity.turnId, stepId, taskId: identity.taskId }, call.id, call.arguments)
+  if (result.id !== call.id || result.toolName !== "agent.ask_user" || result.toolVersion !== "1"
+    || result.status !== "completed" || result.errorCode !== null || !receipt) {
     throw new TurnEngineError("invalid_output", "Native user question result is invalid")
   }
   return { stepId, toolCallId: call.id }
@@ -79,15 +93,31 @@ export async function executeNativeQuestionTool(
     if (signalWasInterrupted(options.signal ?? new AbortController().signal) || isSessionPauseRequestedError(error)) throw error
     result = { id: call.id, toolName: call.name, toolVersion: "1", status: "failed", errorCode: "tool_execution_failed" }
   }
+  const receipt = result.status === "completed"
+    ? readTrustedNativeQuestionAttestation(result.nativeQuestionReceipt, {
+      userId: options.identity.userId, sessionId: options.identity.sessionId, turnId: options.identity.turnId,
+      stepId: step.id, taskId: options.identity.taskId,
+    }, call.id, call.arguments)
+    : null
+  if (result.status === "completed" && (!receipt || result.id !== call.id || result.toolName !== "agent.ask_user" || result.toolVersion !== "1")) {
+    result = { id: call.id, toolName: call.name, toolVersion: "1", status: "failed", errorCode: "native_question_receipt_invalid" }
+  }
+  const attestation = result.status === "completed" ? receipt : null
   await writer.completeItem(callItem, { toolCallId: call.id, toolName: call.name, toolVersion: result.toolVersion,
-    status: result.status, errorCode: result.errorCode, input: toRepositoryJson(call.arguments) }, now(), `tool-call-completed:${call.id}`)
+    status: result.status, errorCode: result.errorCode, input: toRepositoryJson(call.arguments) }, now(), `tool-call-completed:${call.id}`,
+  { toolCallId: call.id, toolName: call.name, toolVersion: result.toolVersion, status: result.status, errorCode: result.errorCode })
   await writer.append(result.status === "completed" ? "tool_call.completed" : "tool_call.failed", call.id, callItem.id,
     { toolCallId: call.id, toolName: call.name, status: result.status, errorCode: result.errorCode, taskId: options.identity.taskId }, `tool-finished:${call.id}`)
+  const safeOutput = attestation ? { question: "[REDACTED]", choices: [] } : null
+  const safeResult = { ...result, output: safeOutput }
+  const resultContent = { toolCallId: call.id, output: toRepositoryJson(safeOutput), errorCode: result.errorCode,
+    ...(attestation ? { nativeQuestionAttestation: toRepositoryJson(attestation) } : {}) }
   const resultItem = await writer.startItem({ id: options.idFactory?.(executionId(options.identity, `item:tool-result:${call.id}`))
       ?? `${executionId(options.identity, `item:tool-result:${call.id}`)}:${randomUUID()}`, stepId: step.id, type: "tool_result", phase: null,
-    content: { toolCallId: call.id, output: toRepositoryJson(result.output ?? null), errorCode: result.errorCode }, now: now() })
-  await writer.completeItem(resultItem, { toolCallId: call.id, output: toRepositoryJson(result.output ?? null), errorCode: result.errorCode }, now(), `tool-result-completed:${call.id}`)
-  return result
+    content: resultContent, now: now() })
+  await writer.completeItem(resultItem, resultContent, now(), `tool-result-completed:${call.id}`,
+    { toolCallId: call.id, output: toRepositoryJson(safeOutput), errorCode: result.errorCode })
+  return safeResult
 }
 
 function retryableStoreFailure(options: TurnExecutionOptions, error: unknown): boolean {
@@ -125,20 +155,25 @@ export async function recoverableNativeQuestionCalls(
   options: TurnExecutionOptions, calls: readonly ToolCallRecovery[], now: () => Date,
 ): Promise<readonly ToolCallRecovery[]> {
   if (!calls.some(item => item.call.name === "agent.ask_user")) return calls
+  if (options.identity.kind !== "turn" || options.identity.taskId !== options.identity.rootTaskId) throw new TurnStateRefreshRetryError()
   const pending = await readPendingNativeQuestion(options, now)
+  if (!pending) throw new TurnStateRefreshRetryError()
   if (pending?.status === "replayable") {
+    const askCalls = calls.filter(item => item.call.name === "agent.ask_user")
     const matching = calls.filter(item => item.call.name === "agent.ask_user" && item.call.id === pending.toolCallId
       && item.stepId === pending.stepId && item.callItem.id === pending.callItemId && item.toolVersion === "1"
       && nativeQuestionResultMatches(item.call.arguments, pending.intent)
       && (item.action === "replay" && item.durableResult == null
-        || item.action === "reconcile" && item.durableResult?.status === "completed" && item.durableResult.errorCode === null
-          && nativeQuestionResultMatches(item.call.arguments, item.durableResult.output)))
-    if (matching.length !== 1) throw new TurnStateRefreshRetryError()
-    return calls
+        || item.action === "reconcile" && item.durableResult?.id === item.call.id && item.durableResult.toolName === "agent.ask_user"
+          && item.durableResult.toolVersion === "1" && item.durableResult.status === "completed" && item.durableResult.errorCode === null
+          && isSafeIncompleteQuestionOutput(item.call.arguments, item.durableResult.output)))
+    if (askCalls.length !== 1 || matching.length !== 1) throw new TurnStateRefreshRetryError()
+    const replay = matching[0]!
+    return calls.map(item => item === replay && item.action === "reconcile" ? { ...item, action: "replay" } : item)
   }
-  return pending?.status === "none"
-    ? calls.filter(item => item.call.name !== "agent.ask_user")
-    : calls
+  if (pending.status === "none") return calls.filter(item => item.call.name !== "agent.ask_user")
+  if (calls.some(item => item.call.name === "agent.ask_user")) throw new TurnStateRefreshRetryError()
+  return calls
 }
 
 export async function recoverPendingNativeQuestion(
