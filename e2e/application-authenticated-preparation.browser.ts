@@ -1,6 +1,7 @@
 import { expect, test } from '@playwright/test'
 import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
+import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 
 const origin = 'http://127.0.0.1:3100'
@@ -18,6 +19,7 @@ test('real login prepares and reviews a synthetic application through the actual
   const context = await browser.newContext()
   await context.route('**/*', route => {
     const url = new URL(route.request().url())
+    if (url.href === jobFixture.url) return route.fulfill({ status: 200, contentType: 'text/html', body: '<h1>Synthetic employer fixture</h1>' })
     if (url.origin !== origin) return route.abort()
     if (url.pathname === '/api/search/unified') return route.fulfill({ json: { jobs: [jobFixture], meta: { sourcesUsed: ['fixture'], routing: 'fixture', totalRaw: 1, totalDeduped: 1, durationMs: 1 } } })
     return route.continue()
@@ -117,5 +119,124 @@ test('real login prepares and reviews a synthetic application through the actual
   expect(writes.filter(value => value === `POST /api/jobs/${job.id}/audit-application`)).toHaveLength(1)
   expect(writes.filter(value => value === `PATCH /api/jobs/${job.id}/assign`)).toHaveLength(1)
   expect(writes.filter(value => value === `POST /api/jobs/${job.id}/apply`)).toHaveLength(0)
+
+  // Edit the same selected document using the application's real navigation.
+  // Removing a period changes the material version without adding any fact.
+  const resumedDrawer = page.getByRole('dialog')
+  await resumedDrawer.getByRole('button', { name: 'Show Resume details' }).click()
+  await resumedDrawer.getByRole('button', { name: /Edit this resume|编辑此简历/, exact: true }).click()
+  await expect(page).toHaveURL(/page=resume/)
+  const editor = page.locator('[data-resume-editor]')
+  await editor.getByText('Synthetic original summary.', { exact: false }).first().click()
+  const saveResponse = page.waitForResponse(response => response.url().endsWith(`/api/resume/${tailored.adaptedResumeId}`) && response.request().method() === 'PATCH')
+  await editor.locator('textarea').first().fill('Synthetic original summary')
+  const savedEdit = await saveResponse
+  expect(savedEdit.status()).toBe(200)
+  const edited = await savedEdit.json()
+  expect(edited).toMatchObject({ id: tailored.adaptedResumeId, content: { summary: 'Synthetic original summary' } })
+  expect(edited.updatedAt).not.toBe(auditBody.resumeUpdatedAt)
+  await expect(page.locator('.resume-top-save')).toContainText(/Saved just now|刚刚保存/)
+  await page.getByRole('button', { name: /Back to this application|返回此申请/ }).click()
+  await expect(page).toHaveURL(new RegExp(`highlight=${job.id}`))
+  const returnedDrawer = page.getByRole('dialog')
+  await expect(returnedDrawer).toContainText(jobFixture.title)
+  const stale = await page.request.get(`/api/jobs/${job.id}/audit-application`)
+  expect(stale.status()).toBe(200)
+  expect(await stale.json()).toMatchObject({ state: 'stale' })
+  await expect(returnedDrawer.getByRole('button', { name: /Download application materials|下载申请材料/ })).toHaveCount(0)
+  expect(writes.filter(value => value === `POST /api/jobs/${job.id}/audit-application`)).toHaveLength(1)
+
+  // A second review is deliberate and uses the edited version, not a new resume.
+  const recheck = returnedDrawer.getByRole('button', { name: /Check current materials|检查当前材料/, exact: true })
+  await expect(recheck).toBeEnabled()
+  const secondAuditResponse = page.waitForResponse(r => r.url().endsWith(`/api/jobs/${job.id}/audit-application`) && r.request().method() === 'POST')
+  const secondAssignResponse = page.waitForResponse(r => r.url().endsWith(`/api/jobs/${job.id}/assign`) && r.request().method() === 'PATCH')
+  await recheck.click()
+  const secondAudit = await secondAuditResponse
+  expect(secondAudit.status()).toBe(200)
+  expect(secondAudit.request().postDataJSON()).toMatchObject({ resumeId: tailored.adaptedResumeId, coverLetterId: null })
+  const secondAuditBody = await secondAudit.json()
+  expect(secondAuditBody).toMatchObject({ verdict: 'pass', resumeUpdatedAt: edited.updatedAt, source: 'parent_resume' })
+  expect(secondAuditBody.operationId).not.toBe(auditBody.operationId)
+  const secondAssign = await secondAssignResponse
+  expect(secondAssign.status()).toBe(200)
+  expect(secondAssign.request().postDataJSON()).toMatchObject({ finalResumeId: tailored.adaptedResumeId })
+  const current = await page.request.get(`/api/jobs/${job.id}/audit-application`)
+  expect(current.status()).toBe(200)
+  const currentReceipt = await current.json()
+  expect(currentReceipt).toMatchObject({ operationId: secondAuditBody.operationId, resumeId: tailored.adaptedResumeId,
+    resumeUpdatedAt: edited.updatedAt, audit: { verdict: 'pass' } })
+  expect(currentReceipt.receipt.signature).toMatch(/^[a-f0-9]{64}$/)
+  await expect(returnedDrawer.getByRole('button', { name: /Download application materials|下载申请材料/ })).toBeVisible()
+  expect(writes.filter(value => value === `POST /api/jobs/${job.id}/tailor-resume`)).toHaveLength(1)
+  expect(writes.filter(value => value === `POST /api/jobs/${job.id}/audit-application`)).toHaveLength(2)
+  expect(writes.filter(value => value === `PATCH /api/jobs/${job.id}/assign`)).toHaveLength(2)
+  const finalReread = page.waitForResponse(r => r.url().endsWith(`/api/jobs/${job.id}/audit-application`) && r.request().method() === 'GET')
+  await page.reload()
+  await expect(page.getByRole('dialog')).toContainText(jobFixture.title)
+  const finalRereadResponse = await finalReread
+  expect(finalRereadResponse.status()).toBe(200)
+  expect((await finalRereadResponse.json()).operationId).toBe(secondAuditBody.operationId)
+  expect(writes.filter(value => value === `POST /api/jobs/${job.id}/tailor-resume`)).toHaveLength(1)
+  expect(writes.filter(value => value === `POST /api/jobs/${job.id}/audit-application`)).toHaveLength(2)
+  expect(writes.filter(value => value === `PATCH /api/jobs/${job.id}/assign`)).toHaveLength(2)
+
+  const finalDb = new PrismaClient()
+  try {
+    const user = await finalDb.user.findUniqueOrThrow({ where: { email: 'candidate-a@example.invalid' } })
+    const assertStillSaved = async () => {
+      const savedJob = await finalDb.job.findUniqueOrThrow({ where: { id: job.id } })
+      expect(savedJob).toMatchObject({ userId: user.id, status: 'saved', workflowState: 'draft', finalResumeId: tailored.adaptedResumeId, appliedAt: null })
+      expect(await finalDb.activity.count({ where: { userId: user.id, jobId: job.id, type: 'applied' } })).toBe(0)
+      expect(await finalDb.applyResult.count({ where: { userId: user.id, jobId: job.id } })).toBe(0)
+    }
+    const controlId = `auditop_${createHash('sha256').update(JSON.stringify(['applymate.audit-operation', 1, user.id, job.id])).digest('hex')}`
+    const control = await finalDb.activity.findUniqueOrThrow({ where: { id: controlId } })
+    const prefix = '[Auditor] application-audit operation-v1 '
+    expect(control.text.startsWith(prefix)).toBe(true)
+    expect(JSON.parse(control.text.slice(prefix.length))).toMatchObject({ state: 'completed', operationId: secondAuditBody.operationId })
+    await assertStillSaved()
+
+    const downloadPromise = page.waitForEvent('download', { timeout: 30_000 })
+    await returnedDrawer.getByRole('button', { name: /Download application materials|下载申请材料/ }).click()
+    const download = await downloadPromise
+    const archivePath = await download.path()
+    if (!archivePath) throw new Error('Fixture ZIP is unavailable')
+    const JSZip = requireWeb('jszip') as { loadAsync: (bytes: Buffer) => Promise<{ files: Record<string, { dir: boolean; async: (type: 'string' | 'nodebuffer') => Promise<string | Buffer> }> }> }
+    const archive = await JSZip.loadAsync(await readFile(archivePath))
+    const names = Object.keys(archive.files).filter(name => !archive.files[name].dir)
+    const metaName = names.find(name => name.endsWith('meta.json'))
+    const pdfs = names.filter(name => name.toLowerCase().endsWith('.pdf'))
+    expect(metaName).toBeTruthy()
+    expect(pdfs).toHaveLength(1)
+    const metadata = JSON.parse(await archive.files[metaName!].async('string') as string)
+    expect(metadata).toMatchObject({ job: { id: job.id, url: jobFixture.url },
+      resume: { id: tailored.adaptedResumeId, updatedAt: edited.updatedAt }, audit: { verdict: 'pass', auditedAt: currentReceipt.audit.auditedAt } })
+    const pdfBytes = await archive.files[pdfs[0]].async('nodebuffer') as Buffer
+    expect(pdfBytes.subarray(0, 5).toString()).toBe('%PDF-')
+    const parsePdf = requireWeb('pdf-parse') as (bytes: Uint8Array) => Promise<{ text: string }>
+    const pdfText = (await parsePdf(Uint8Array.from(pdfBytes))).text
+    expect(pdfText).toMatch(/Synthetic\s+original\s+summary/)
+    expect(pdfText).not.toMatch(/Synthetic\s+original\s+summary\s*\./)
+    await assertStillSaved()
+
+    const popupPromise = context.waitForEvent('page')
+    await returnedDrawer.getByRole('button', { name: /Open employer website|前往雇主网站/, exact: true }).click()
+    const employer = await popupPromise
+    await expect(employer.getByRole('heading', { name: 'Synthetic employer fixture' })).toBeVisible()
+    expect(employer.url()).toBe(jobFixture.url)
+    await employer.close()
+    await assertStillSaved()
+
+    const recordResponse = page.waitForResponse(response => response.url().endsWith(`/api/jobs/${job.id}/apply`) && response.request().method() === 'POST')
+    await returnedDrawer.getByRole('button', { name: /Record that I submitted on the employer website|记录我已在雇主网站提交/ }).click()
+    expect((await recordResponse).status()).toBe(200)
+    const recorded = await finalDb.job.findUniqueOrThrow({ where: { id: job.id } })
+    expect(recorded).toMatchObject({ userId: user.id, status: 'applied', workflowState: 'submitted', finalResumeId: tailored.adaptedResumeId })
+    expect(recorded.appliedAt).toBeTruthy()
+    expect(await finalDb.activity.count({ where: { userId: user.id, jobId: job.id, type: 'applied', text: { startsWith: 'You applied manually ' } } })).toBe(1)
+    expect(await finalDb.applyResult.count({ where: { userId: user.id, jobId: job.id } })).toBe(0)
+    expect(writes.filter(value => value === `POST /api/jobs/${job.id}/apply`)).toHaveLength(1)
+  } finally { await finalDb.$disconnect() }
   await context.close()
 })

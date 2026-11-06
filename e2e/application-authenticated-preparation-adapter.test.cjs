@@ -8,6 +8,11 @@ const url = 'https://api.minimax.io/v1/chat/completions'
 const init = prompt => ({ method: 'POST', headers: { Authorization: 'Bearer fixture-only-synthetic-model-key' },
   body: JSON.stringify({ model: 'MiniMax-M3', stream: false, messages: [{ role: 'user', content: prompt }] }) })
 const base = 'TARGET JOB: Fixture application engineer at Fixture Company\nSynthetic vacancy for isolated preparation and review.\nSynthetic original summary.'
+const source = { contact: { name: 'Fixture Candidate', email: 'candidate-a@example.invalid', location: 'Dublin' },
+  summary: 'Synthetic original summary.', experience: [], education: [], skills: ['TypeScript'], languages: [], projects: [], certifications: [] }
+function auditPrompt(sourceResume, finalResume) {
+  return `You are an independent application auditor.\n\nSOURCE RESUME (truth baseline):\n${JSON.stringify(sourceResume, null, 2)}\n\nCONFIRMED PERSONA (user-confirmed facts, also valid evidence):\nSynthetic fixture persona\n\nFINAL RESUME TO AUDIT:\n${JSON.stringify(finalResume, null, 2)}\n\n${base}\n\nNO FINAL COVER LETTER SUPPLIED (optional)`
+}
 // Mirrors the actual non-repair route's prompt assembly, including its
 // filter(Boolean): empty entries do not create blank separator lines.
 function tailorPrompt(section, value) {
@@ -31,11 +36,16 @@ async function main() {
     const response = await pinnedFetch(url, init(tailorPrompt(section, value)))
     assert.deepEqual(JSON.parse((await response.json()).choices[0].message.content).after, value)
   }
-  const audit = await pinnedFetch(url, init(`${base}\nSOURCE RESUME (truth baseline):\nFINAL RESUME TO AUDIT:\nNO FINAL COVER LETTER SUPPLIED (optional)`))
+  const audit = await pinnedFetch(url, init(auditPrompt(source, source)))
   assert.equal(JSON.parse((await audit.json()).choices[0].message.content).verdict, 'pass')
+  const revised = await pinnedFetch(url, init(auditPrompt(source, { ...source, summary: 'Synthetic original summary',
+    sectionOrder: ['summary', 'experience', 'skills', 'education', 'languages'] })))
+  assert.equal(JSON.parse((await revised.json()).choices[0].message.content).verdict, 'pass')
   await assert.rejects(pinnedFetch('https://different.invalid/chat/completions', init(base)))
   await assert.rejects(pinnedFetch(url, init('other candidate')))
   await assert.rejects(pinnedFetch(url, init(tailorPrompt('skills', ['invented']))))
+  await assert.rejects(pinnedFetch(url, init(auditPrompt(source, { ...source, summary: 'Invented facts' }))))
+  await assert.rejects(pinnedFetch(url, init(auditPrompt({ ...source, skills: ['invented'] }, source))))
   process.env.UNEXPECTED_API_KEY = 'must-not-be-accepted'
   await assert.rejects(pinnedFetch(url, init(base)))
   delete process.env.UNEXPECTED_API_KEY

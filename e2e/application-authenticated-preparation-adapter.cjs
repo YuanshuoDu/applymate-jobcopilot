@@ -1,6 +1,9 @@
 // Test-image-only transport. The production source is not modified.
 const expectedDb = 'postgresql://fixture:fixture@db:5432/application_flow_fixture'
 const fakeKey = 'fixture-only-synthetic-model-key'
+const { isDeepStrictEqual } = require('node:util')
+const syntheticSource = { contact: { name: 'Fixture Candidate', email: 'candidate-a@example.invalid', location: 'Dublin' },
+  summary: 'Synthetic original summary.', experience: [], education: [], skills: ['TypeScript'], languages: [], projects: [], certifications: [] }
 
 function requireFixture() {
   if (process.env.CI !== 'true' || process.env.APPLICATION_AUTH_DISPOSABLE !== 'true'
@@ -40,6 +43,17 @@ exports.pinnedFetch = async function pinnedFetch(url, init = {}) {
     answer = { after: value, reason: 'Synthetic fixture: preserve source content.' }
   } else if (prompt.includes('SOURCE RESUME (truth baseline):') && prompt.includes('FINAL RESUME TO AUDIT:')
     && prompt.includes('NO FINAL COVER LETTER SUPPLIED (optional)') && prompt.includes('Synthetic original summary.')) {
+    const documents = prompt.match(/SOURCE RESUME \(truth baseline\):\n([\s\S]*?)\n\nCONFIRMED PERSONA \(user-confirmed facts, also valid evidence\):\n[\s\S]*?\n\nFINAL RESUME TO AUDIT:\n([\s\S]*?)\n\nTARGET JOB:/)
+    if (!documents) throw new Error('Synthetic model refused unexpected audit documents')
+    const source = JSON.parse(documents[1])
+    const final = JSON.parse(documents[2])
+    // ResumePage persists its default display order along with the edited text.
+    const punctuationOnlyEdit = { ...syntheticSource, summary: 'Synthetic original summary',
+      sectionOrder: ['summary', 'experience', 'skills', 'education', 'languages'] }
+    if (!isDeepStrictEqual(source, syntheticSource)
+      || !(isDeepStrictEqual(final, syntheticSource) || isDeepStrictEqual(final, punctuationOnlyEdit))) {
+      throw new Error('Synthetic model refused unexpected audit material')
+    }
     answer = { verdict: 'pass', summary: 'Synthetic model audit; no real provider was called.', matchScore: 80,
       findings: [{ area: 'resume', severity: 'pass', title: 'Synthetic evidence', evidence: 'Fixture source matches.', action: 'None.' }] }
   } else throw new Error('Synthetic model refused an unexpected operation')
