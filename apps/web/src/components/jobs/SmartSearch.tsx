@@ -1,11 +1,12 @@
 'use client'
 
 import React, { useState, useRef, useCallback, useEffect } from 'react'
+import { useSession } from 'next-auth/react'
 import { CompanyLogo, ScorePill, useToast } from '@/components/ui'
-import { apiMutate } from '@/lib/hooks'
-import type { Job } from '@/lib/types'
 import { extractSearchQuery } from './search-query'
 import { useI18n } from '@/lib/i18n'
+import { saveDiscoveredApplication } from './application-search-save'
+import { createApplicationSaveGuard, readSavedApplications, searchResultKey, writeSavedApplications } from './application-search-state'
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -137,28 +138,6 @@ function loadRecent(): string[] { try { const r = localStorage.getItem(LS_RECENT
 function addRecent(q: string) { const p = loadRecent().filter(x => x.toLowerCase() !== q.toLowerCase()); try { localStorage.setItem(LS_RECENT, JSON.stringify([q, ...p].slice(0, 8))) } catch {} }
 function clearHistory() { try { localStorage.removeItem(LS_LAST); localStorage.removeItem(LS_RECENT) } catch {} }
 
-async function saveAndScore(r: JobResult, onSaved: (id: string, dbId: string) => void, onScored: (id: string, score: number) => void, onError: (msg: string) => void) {
-  const { data: job, error } = await apiMutate<Job>('/api/jobs', 'POST', {
-    company: r.company, role: r.title, location: r.location,
-    url: r.url, salary: r.salary ?? null, description: r.description,
-    source: r.source, status: 'saved', keySkills: r.keySkills ?? [],
-  })
-  if (error || !job) { onError(error ?? 'Save failed'); return }
-  onSaved(r.id, job.id)
-  if (!r.description) return
-  try {
-    // The default endpoint already falls back to a user's latest resume, so
-    // avoid serially loading the list and then the selected document.
-    const resumeResponse = await fetch('/api/resume/default'); if (!resumeResponse.ok) return
-    const full = await resumeResponse.json(); if (!full?.content) return
-    const sr = await fetch('/api/ai/score', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ resumeContent: full.content, jobTitle: r.title, jobDescription: r.description.slice(0, 2000), keySkills: r.keySkills ?? [] }) })
-    if (!sr.ok) return
-    const sd = await sr.json() as { score: number; matchedKeywords: string[]; missingKeywords: string[] }
-    await apiMutate(`/api/jobs/${job.id}`, 'PATCH', { score: sd.score, analysisNote: `Match: ${sd.score}%\nMatched: ${sd.matchedKeywords?.join(', ')||'—'}\nMissing: ${sd.missingKeywords?.join(', ')||'—'}` })
-    onScored(r.id, sd.score)
-  } catch {}
-}
-
 // ── Inline badge ──────────────────────────────────────────────────────────────
 function Badge({ children, color, bg, style }: { children: React.ReactNode; color: string; bg: string; style?: React.CSSProperties }) {
   return (
@@ -178,7 +157,40 @@ const glassInput: React.CSSProperties = {
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () => void; onOpenSettings?: () => void }) {
+export function SmartSearch({ onJobSaved, onOpenSettings, onOpenApplication }: { onJobSaved?: (jobId: string) => void; onOpenSettings?: () => void; onOpenApplication?: (jobId: string) => void }) {
+  const { data: session } = useSession()
+  const userId = session?.user?.id ?? null
+  const activeUserRef = useRef(userId)
+  activeUserRef.current = userId
+  const saveGuard = useRef(createApplicationSaveGuard())
+  const saveOperations = useRef(new Set<AbortController>())
+  const [savedState, setSavedState] = useState<{ owner: string | null; jobs: Record<string, string> }>({ owner: null, jobs: {} })
+  const savedApplications = savedState.owner === userId ? savedState.jobs : {}
+  useEffect(() => {
+    const reload = () => {
+      let jobs: Record<string, string> = {}
+      try { jobs = readSavedApplications(window.sessionStorage, userId) } catch { /* Storage is optional. */ }
+      setSavedState({ owner: userId, jobs })
+    }
+    const invalidate = () => {
+      for (const operation of saveOperations.current) operation.abort()
+      saveOperations.current.clear()
+    }
+    reload()
+    window.addEventListener('applymate:saved-search-changed', reload)
+    window.addEventListener('applymate:jobs-changed', reload)
+    window.addEventListener('applymate:identity-changed', invalidate)
+    return () => {
+      invalidate()
+      window.removeEventListener('applymate:saved-search-changed', reload)
+      window.removeEventListener('applymate:jobs-changed', reload)
+      window.removeEventListener('applymate:identity-changed', invalidate)
+    }
+  }, [userId])
+  useEffect(() => {
+    if (savedState.owner !== userId) return
+    try { writeSavedApplications(window.sessionStorage, userId, savedState.jobs) } catch { /* Storage is optional. */ }
+  }, [savedState, userId])
   const { t } = useI18n()
   const toast = useToast()
   const inputRef = useRef<HTMLInputElement>(null)
@@ -194,7 +206,6 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
   const [meta,        setMeta]        = useState<SearchMeta | null>(lastSearch.current?.meta ?? null)
   const [searched,    setSearched]    = useState(!!lastSearch.current)
   const [savingIds,   setSavingIds]   = useState(new Set<string>())
-  const [savedIds,    setSavedIds]    = useState(new Set<string>())
   const [scoringIds,  setScoringIds]  = useState(new Set<string>())
   const [scores,      setScores]      = useState<Record<string, number>>({})
   const [expandedId,  setExpandedId]  = useState<string | null>(null)
@@ -240,7 +251,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
     searchControllerRef.current?.abort()
     const controller = new AbortController()
     searchControllerRef.current = controller
-    setSearching(true); setSearched(true); setSavedIds(new Set()); setScores({}); setExpandedId(null); setPage(1)
+    setSearching(true); setSearched(true); setScores({}); setExpandedId(null); setPage(1)
     const p = new URLSearchParams({ q: query })
     if (f.location)           p.set('location', f.location)
     if (f.remote)             p.set('remote', '1')
@@ -301,12 +312,41 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
   }
 
   async function handleSave(r: JobResult) {
-    setSavingIds(prev => new Set(prev).add(r.id))
-    await saveAndScore(r,
-      (rid) => { setSavingIds(p => { const n = new Set(p); n.delete(rid); return n }); setSavedIds(p => new Set(p).add(rid)); setScoringIds(p => new Set(p).add(rid)); toast.success(t('smartSearch.saved'), `${r.company} — ${t('smartSearch.scoringMatch')}`); onJobSaved?.() },
-      (rid, score) => { setScoringIds(p => { const n = new Set(p); n.delete(rid); return n }); setScores(p => ({ ...p, [rid]: score })) },
-      (msg) => { setSavingIds(p => { const n = new Set(p); n.delete(r.id); return n }); toast.error('Save failed', msg) },
-    )
+    const resultKey = searchResultKey(r)
+    const guardKey = `${userId}:${resultKey}`
+    if (savedApplications[resultKey]) { onOpenApplication?.(savedApplications[resultKey]); return }
+    if (!userId || !saveGuard.current.acquire(guardKey)) return
+    const operation = new AbortController()
+    saveOperations.current.add(operation)
+    const isCurrent = () => !operation.signal.aborted && activeUserRef.current === userId
+    setSavingIds(prev => new Set(prev).add(resultKey))
+    try {
+      await saveDiscoveredApplication(r, {
+        userId, signal: operation.signal, isCurrent,
+        onSaved: (_rid, dbId) => {
+          if (!isCurrent()) return
+          setSavingIds(p => { const next = new Set(p); next.delete(resultKey); return next })
+          setSavedState(previous => {
+            const jobs = { ...(previous.owner === userId ? previous.jobs : {}), [resultKey]: dbId }
+            return { owner: userId, jobs }
+          })
+          setScoringIds(p => new Set(p).add(resultKey))
+          toast.success(t('smartSearch.saved'), t('application.savedHint'))
+          onJobSaved?.(dbId)
+        },
+        onScored: (_rid, score) => {
+          if (isCurrent()) setScores(p => ({ ...p, [resultKey]: score }))
+        },
+        onError: (msg) => { if (isCurrent()) toast.error('Save failed', msg) },
+      })
+    } finally {
+      saveGuard.current.release(guardKey)
+      saveOperations.current.delete(operation)
+      if (isCurrent()) {
+        setSavingIds(p => { const next = new Set(p); next.delete(resultKey); return next })
+        setScoringIds(p => { const next = new Set(p); next.delete(resultKey); return next })
+      }
+    }
   }
 
   async function handleTranslate(r: JobResult) {
@@ -644,6 +684,8 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
               {/* ── Job cards ── */}
               <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 8 }}>
                 {paged.map(r => {
+                  const resultKey = searchResultKey(r)
+                  const savedJobId = savedApplications[resultKey]
                   const src = SOURCE_STYLE[r.source] ?? { label: r.source, color: '#888', bg: 'rgba(100,100,100,0.10)' }
                   const exp = expandedId === r.id
                   const jt  = r.jobType ? JOB_TYPE_COLOR[r.jobType] : null
@@ -811,28 +853,26 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
 
                             {/* Actions */}
                             <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-                              <a href={r.url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '9px 22px', background: 'linear-gradient(135deg, #4F46E5, #7C3AED)', color: '#fff', borderRadius: 10, fontSize: 13, fontWeight: 700, textDecoration: 'none', boxShadow: '0 4px 14px rgba(79,70,229,0.40)' }}>
+                              <a href={r.url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '9px 22px', background: 'var(--glass-bg)', color: 'var(--text-muted)', border: '1px solid var(--border)', borderRadius: 10, fontSize: 13, fontWeight: 500, textDecoration: 'none' }}>
                                 <Icon.ExternalLink /> {t('jobs.viewPosting')}
                               </a>
 
-                              {savedIds.has(r.id) ? (
-                                scores[r.id] !== undefined
-                                  ? <ScorePill score={scores[r.id]} />
-                                  : <Badge color="#059669" bg="rgba(5,150,105,0.12)">✓ {t('jobs.savedBadge')}</Badge>
+                              {savedJobId ? (
+                                <button type="button" onClick={e => { e.stopPropagation(); onOpenApplication?.(savedJobId) }} disabled={!onOpenApplication} style={{ padding: '9px 18px', border: '1px solid var(--primary)', borderRadius: 10, background: 'var(--primary)', color: '#fff', fontSize: 13, fontWeight: 700, cursor: 'pointer' }}>{t('application.viewApplication')}</button>
                               ) : (
                                 <button
                                   onClick={e => { e.stopPropagation(); handleSave(r) }}
-                                  disabled={savingIds.has(r.id)}
-                                  style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '9px 18px', border: '1.5px solid var(--border)', borderRadius: 10, background: 'var(--glass-bg)', color: 'var(--text-muted)', fontSize: 13, fontWeight: 600, cursor: savingIds.has(r.id) ? 'not-allowed' : 'pointer', transition: 'all 0.15s' }}
-                                  onMouseEnter={e => { if (!savingIds.has(r.id)) { e.currentTarget.style.borderColor = 'rgba(79,70,229,0.35)'; e.currentTarget.style.color = 'var(--primary)' } }}
-                                  onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.color = 'var(--text-muted)' }}>
-                                  {savingIds.has(r.id)
+                                  disabled={savingIds.has(resultKey)}
+                                  style={{ display: 'inline-flex', alignItems: 'center', gap: 7, padding: '9px 18px', border: '1.5px solid var(--primary)', borderRadius: 10, background: 'var(--primary)', color: '#fff', fontSize: 13, fontWeight: 600, cursor: savingIds.has(resultKey) ? 'not-allowed' : 'pointer', transition: 'all 0.15s' }}
+                                  onMouseEnter={e => { if (!savingIds.has(resultKey)) e.currentTarget.style.opacity = '0.9' }}
+                                  onMouseLeave={e => { e.currentTarget.style.opacity = '1' }}>
+                                  {savingIds.has(resultKey)
                                     ? <><span style={{ width: 13, height: 13, border: '2px solid rgba(79,70,229,0.2)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} />{t('jobs.saving')}</>
                                   : <>{Icon.Bookmark()}{t('jobs.saveToTracker')}</>}
                                 </button>
                               )}
 
-                              {scoringIds.has(r.id) && (
+                              {scoringIds.has(resultKey) && (
                                 <span style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 5 }}>
                                   <span style={{ width: 12, height: 12, border: '2px solid rgba(79,70,229,0.18)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} />
                                   {t('jobs.aiScoring')}
@@ -847,27 +887,25 @@ export function SmartSearch({ onJobSaved, onOpenSettings }: { onJobSaved?: () =>
                       {!exp && (
                         <div style={{ display: 'flex', flexDirection: 'column', gap: 6, flexShrink: 0, alignItems: 'center' }}>
                           {/* Score if available */}
-                          {scores[r.id] !== undefined && <ScorePill score={scores[r.id]} />}
-                          {scoringIds.has(r.id) && <span style={{ width: 10, height: 10, border: '1.5px solid rgba(79,70,229,0.18)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} />}
+                          {scores[resultKey] !== undefined && <ScorePill score={scores[resultKey]} />}
+                          {scoringIds.has(resultKey) && <span style={{ width: 10, height: 10, border: '1.5px solid rgba(79,70,229,0.18)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} />}
 
                           {/* View button */}
-                          <a href={r.url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} title={t('jobs.viewPosting')} style={{ width: 34, height: 34, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 9, background: 'linear-gradient(135deg, #4F46E5, #7C3AED)', color: '#fff', textDecoration: 'none', boxShadow: '0 3px 10px rgba(79,70,229,0.35)', transition: 'all 0.15s' }}>
+                          <a href={r.url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} title={t('jobs.viewPosting')} style={{ width: 34, height: 34, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 9, background: 'var(--glass-bg)', color: 'var(--text-muted)', border: '1px solid var(--border)', textDecoration: 'none', transition: 'all 0.15s' }}>
                             <Icon.ExternalLink />
                           </a>
 
                           {/* Save button */}
-                          {!savedIds.has(r.id) && (
-                            <button onClick={e => { e.stopPropagation(); handleSave(r) }} disabled={savingIds.has(r.id)} title={t('jobs.saveTracker')} style={{ width: 34, height: 34, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 9, border: '1px solid var(--border)', background: 'var(--glass-bg)', color: 'var(--text-muted)', cursor: 'pointer', transition: 'all 0.15s' }}
+                          {!savedJobId && (
+                            <button onClick={e => { e.stopPropagation(); handleSave(r) }} disabled={savingIds.has(resultKey)} title={t('jobs.saveTracker')} style={{ width: 34, height: 34, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 9, border: '1px solid var(--border)', background: 'var(--glass-bg)', color: 'var(--text-muted)', cursor: 'pointer', transition: 'all 0.15s' }}
                               onMouseEnter={e => { e.currentTarget.style.borderColor = 'rgba(79,70,229,0.35)'; e.currentTarget.style.color = 'var(--primary)' }}
                               onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.color = 'var(--text-muted)' }}>
-                              {savingIds.has(r.id)
+                              {savingIds.has(resultKey)
                                 ? <span style={{ width: 12, height: 12, border: '2px solid rgba(79,70,229,0.2)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite', display: 'inline-block' }} />
                                 : Icon.Bookmark()}
                             </button>
                           )}
-                          {savedIds.has(r.id) && scores[r.id] === undefined && !scoringIds.has(r.id) && (
-                            <span title={t('jobs.savedBadge')} style={{ color: '#059669', display: 'flex' }}>✓</span>
-                          )}
+                          {savedJobId && <button type="button" onClick={e => { e.stopPropagation(); onOpenApplication?.(savedJobId) }} disabled={!onOpenApplication} aria-label={`${t('application.viewApplication')}: ${r.title}`} style={{ padding: '7px 10px', border: '1px solid var(--primary)', borderRadius: 9, background: 'var(--primary)', color: '#fff', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>{t('application.viewApplication')}</button>}
                         </div>
                       )}
                     </div>

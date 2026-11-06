@@ -2,7 +2,8 @@ import { createHash } from "node:crypto"
 import type { ModelStepResult } from "./turn-engine-model.js"
 import { findToolResultObservation, stableJson } from "./turn-engine-replay.js"
 import { toRepositoryJson, TurnEngineError, type TurnEngineResult, type TurnEngineStep, type ToolCallRecovery } from "./turn-engine-types.js"
-import { executeToolWithItems, persistRecoveredToolCall, TurnExecutionEventWriter } from "./turn-execution-events.js"
+import { executeToolWithItems, TurnExecutionEventWriter } from "./turn-execution-events.js"
+import { persistRecoveredToolCall } from "./turn-execution-tool-recovery.js"
 import { executionId, type TurnExecutionOptions } from "./turn-execution-types.js"
 import { assertExecutionAlive } from "./turn-engine-helpers.js"
 import type { StepContext } from "../context/step-context-builder.js"
@@ -138,7 +139,7 @@ export async function executeTools(
       ? await executeNativeQuestionTool(options, writer, step, call, output, now, onToolCallPersisted)
       : await executeToolWithItems(options, writer, step, call, now, onToolCallPersisted)
     assertExecutionAlive(options, signal)
-    const questionCall = nativeQuestionResultCall(step.id, call, result)
+    const questionCall = nativeQuestionResultCall(options.identity, step.id, call, result)
     if (result.status === "failed" && result.errorCode === "policy_requires_approval") return { wait: { status: "waiting_for_approval", stepCount: 0, toolCallCount: 0, errorCode: result.errorCode }, snapshot, steeringMarkerState: markerState }
     if (result.status === "failed" && (result.errorCode === "policy_requires_user_input" || result.errorCode === "gmail_oauth_required")) return { wait: { status: "waiting_for_user", stepCount: 0, toolCallCount: 0, errorCode: result.errorCode }, snapshot, steeringMarkerState: markerState }
     const failedWaitCall = result.status === "failed" && (call.name === "agent.wait" || call.name === "wait_subagents")
@@ -204,7 +205,7 @@ export async function recoverPersistedToolCalls(options: TurnExecutionOptions, w
       }
     }
     if (!result) result = { id: item.call.id, toolName: item.call.name, toolVersion: item.toolVersion, status: "failed", errorCode: item.action === "replay" ? "tool_recovery_aborted" : "tool_result_replay_uncertain" }
-    await persistRecoveredToolCall(options, writer, item, result, now)
+    result = await persistRecoveredToolCall(options, writer, item, result, now)
     observations.push({ id: `tool-result:${item.call.id}`, content: toRepositoryJson({
       toolCallId: item.call.id, toolName: item.call.name, input: item.call.arguments, status: result.status, output: result.output ?? null, errorCode: result.errorCode,
     }) })

@@ -50,24 +50,35 @@ function parseAfterValue(after: unknown): unknown {
   }
 }
 
+function sameSectionShape(before: unknown, after: unknown): boolean {
+  if (Array.isArray(before)) return Array.isArray(after)
+  if (before && typeof before === 'object') return Boolean(after && typeof after === 'object' && !Array.isArray(after))
+  return after !== null && typeof before === typeof after
+}
+
 function sectionsForAuditRepair(findings: ApplicationAuditFinding[]) {
-  const text = findings
-    .filter(finding => finding.area === 'resume' && finding.severity !== 'pass')
-    .map(finding => `${finding.title} ${finding.evidence} ${finding.action}`.toLowerCase())
-    .join(' ')
   const matches: Array<typeof SECTIONS[number]> = []
-  const add = (section: typeof SECTIONS[number], terms: string[]) => {
-    if (terms.some(term => text.includes(term))) matches.push(section)
+  for (const finding of findings.filter(item => item && item.area === 'resume' && item.severity !== 'pass')) {
+    if (finding.target) {
+      if (!SECTIONS.includes(finding.target as typeof SECTIONS[number])) return null
+      matches.push(finding.target as typeof SECTIONS[number])
+      continue
+    }
+    const text = `${finding.title} ${finding.evidence} ${finding.action}`.toLowerCase()
+    const inferred: Array<typeof SECTIONS[number]> = []
+    const add = (section: typeof SECTIONS[number], terms: string[]) => {
+      if (terms.some(term => text.includes(term))) inferred.push(section)
+    }
+    add('experience', ['experience', 'employer', 'employment', 'company', 'role', 'title', 'date', 'duration'])
+    add('summary', ['summary', 'profile', 'headline'])
+    add('skills', ['skill', 'technology', 'tooling'])
+    add('education', ['education', 'degree', 'university'])
+    add('projects', ['project', 'portfolio'])
+    add('certifications', ['certification', 'certificate', 'credential'])
+    if (inferred.length !== 1) return null
+    matches.push(inferred[0])
   }
-  add('experience', ['experience', 'employer', 'employment', 'company', 'role', 'title', 'date', 'duration'])
-  add('summary', ['summary', 'profile', 'headline'])
-  add('skills', ['skill', 'technology', 'tooling'])
-  add('education', ['education', 'degree', 'university'])
-  add('projects', ['project', 'portfolio'])
-  add('certifications', ['certification', 'certificate', 'credential'])
-  // When the auditor cannot identify a section, restrict the repair to the
-  // summary instead of re-writing every part of the candidate's resume.
-  return matches.length ? [...new Set(matches)] : ['summary']
+  return matches.length ? [...new Set(matches)] : null
 }
 
 export async function POST(req: NextRequest, { params }: Params) {
@@ -92,19 +103,28 @@ export async function POST(req: NextRequest, { params }: Params) {
     db.resume.findFirst({
       where: { userId: prep.userId, targetJobId: jobId, kind: 'adapted', origin: 'ai-adapted' },
       orderBy: { updatedAt: 'desc' },
-      select: { id: true, parentResumeId: true, content: true, name: true },
+      select: { id: true, parentResumeId: true, content: true, name: true, updatedAt: true },
     }),
   ])
 
   if (!resume) return err('Resume not found', 404)
   if (!job) return err('Job not found', 404)
   if (!job.description) return err('Job description is required')
+  // Repair must never mutate or create a different resume from the one selected.
+  if (forceRetailor && (!existing || existing.id !== resume.id)) {
+    return err('The selected resume cannot be repaired automatically for this application. Open it to edit or select the current tailored resume.', 409)
+  }
+  if (forceRetailor && (!Array.isArray(auditFindings)
+    || !auditFindings.some(finding => finding && finding.area === 'resume' && finding.severity !== 'pass'))) {
+    return err('Select a resume review issue before applying an automatic correction.', 400)
+  }
   if (existing && !forceRetailor) return ok({ adaptedResumeId: existing.id, changes: [], reused: true })
 
+  if (forceRetailor && !existing?.parentResumeId) return err('The original resume for this tailored version could not be found', 404)
   const sourceResume = forceRetailor && existing?.parentResumeId
     ? await db.resume.findFirst({ where: { id: existing.parentResumeId, userId: prep.userId } })
     : resume
-  if (!sourceResume) return err('The original resume for this tailored version could not be found', 404)
+  if (!sourceResume?.content) return err('The original resume for this tailored version could not be found', 404)
 
   requireLegacyPolicy({
     userId: prep.userId,
@@ -119,18 +139,20 @@ export async function POST(req: NextRequest, { params }: Params) {
     input: { jobId, resumeId, sourceResumeId: sourceResume.id, unknownSensitiveFacts: false },
   })
 
-  const resumeContent = sourceResume.content as Record<string, unknown>
+  // For repair, preserve the selected tailored document as the output base.
+  // The parent remains separate evidence; it must not replace unrelated edits.
+  const resumeContent = (forceRetailor ? existing?.content : sourceResume.content) as Record<string, unknown>
+  if (!resumeContent || typeof resumeContent !== 'object' || Array.isArray(resumeContent)) return err('The selected resume content is unavailable.', 409)
   const persona = await buildPersona(prep.userId, 'tailor')
   const evidence = await personaEvidenceContext(prep.userId, 'tailor', `${job.role} ${job.description}`).catch(() => '')
   const adaptedContent = cloneJson(resumeContent)
   const changes: ChangeDetail[] = []
-  const corrections = Array.isArray(auditFindings)
-    ? auditFindings.filter(finding => finding.area === 'resume' && finding.severity !== 'pass').slice(0, 6)
-      .map(finding => `- ${finding.area}: ${finding.title}. Required correction: ${finding.action}`)
-    : []
-  const sectionsToTailor = forceRetailor && corrections.length
-    ? sectionsForAuditRepair(auditFindings)
-    : SECTIONS
+  const resumeFindings = Array.isArray(auditFindings)
+    ? auditFindings.filter(finding => finding && finding.area === 'resume' && finding.severity !== 'pass') : []
+  if (forceRetailor && resumeFindings.length > 6) return err('Too many resume issues to correct at once. Open the resume and review them manually.', 422)
+  const corrections = resumeFindings.map(finding => `- ${finding.area}: ${finding.title}. Required correction: ${finding.action}`)
+  const sectionsToTailor = forceRetailor ? sectionsForAuditRepair(resumeFindings) : SECTIONS
+  if (!sectionsToTailor) return err('The affected resume section is unclear. Open the resume and edit it manually.', 422)
 
   for (const section of sectionsToTailor) {
     const currentValue = resumeContent[section]
@@ -145,6 +167,7 @@ export async function POST(req: NextRequest, { params }: Params) {
       '',
       `SECTION: ${section}`,
       `CURRENT SECTION JSON:\n${before}`,
+      ...(forceRetailor ? [`ORIGINAL RESUME EVIDENCE:\n${JSON.stringify(sourceResume.content, null, 2)}`] : []),
       '',
       `TARGET JOB: ${job.role} at ${job.company}`,
       job.keywords ? `KNOWN KEYWORDS: ${job.keywords}` : '',
@@ -163,6 +186,7 @@ export async function POST(req: NextRequest, { params }: Params) {
       if (parsed.after === undefined) continue
 
       const afterValue = parseAfterValue(parsed.after)
+      if (forceRetailor && !sameSectionShape(currentValue, afterValue)) continue
       adaptedContent[section] = afterValue
       changes.push({
         section,
@@ -178,14 +202,26 @@ export async function POST(req: NextRequest, { params }: Params) {
 
   if (changes.length === 0) return err('No resume sections could be tailored', 502)
 
-  const adapted = existing && forceRetailor
-    ? await (async () => {
-      await db.resumeVersion.create({
-        data: { resumeId: existing.id, userId: prep.userId, content: existing.content as Prisma.InputJsonValue, name: existing.name },
+  let adapted: { id: string; name: string }
+  if (existing && forceRetailor) {
+    if (!(existing.updatedAt instanceof Date) || !Number.isFinite(existing.updatedAt.getTime())) return err('The selected resume version is unavailable. Refresh before correcting it.', 409)
+    try {
+      const updated = await db.$transaction(async tx => {
+        const result = await tx.resume.updateMany({
+          where: { id: existing.id, userId: prep.userId, targetJobId: jobId, kind: 'adapted', origin: 'ai-adapted', parentResumeId: existing.parentResumeId, updatedAt: existing.updatedAt, content: { equals: existing.content as Prisma.InputJsonValue } },
+          data: { content: adaptedContent as Prisma.InputJsonValue },
+        })
+        if (result.count !== 1) return false
+        await tx.resumeVersion.create({ data: { resumeId: existing.id, userId: prep.userId, content: existing.content as Prisma.InputJsonValue, name: existing.name } })
+        return true
       })
-      return db.resume.update({ where: { id: existing.id }, data: { content: adaptedContent as Prisma.InputJsonValue } })
-    })()
-    : await db.resume.create({
+      if (!updated) return err('The resume changed during correction. Refresh and review the latest version.', 409)
+      adapted = existing
+    } catch {
+      return err('The correction could not be confirmed. Refresh and review the latest resume.', 503)
+    }
+  } else {
+    adapted = await db.resume.create({
       data: {
       userId:          prep.userId,
       name:            `Tailored for ${job.company} - ${job.role}`,
@@ -200,7 +236,8 @@ export async function POST(req: NextRequest, { params }: Params) {
       origin:          'ai-adapted',
       basicsDetached:  sourceResume.basicsDetached ?? false,
     },
-  })
+    })
+  }
 
   await db.activity.create({
     data: {

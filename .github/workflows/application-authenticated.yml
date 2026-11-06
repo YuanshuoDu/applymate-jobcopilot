@@ -1,0 +1,186 @@
+name: Isolated authenticated application flow
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  real-authenticated-save:
+    name: Real authentication and isolated manual application
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build and run in isolated disposable containers
+        shell: bash
+        run: |
+          set -euo pipefail
+          suffix="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          network="application-auth-${suffix}"
+          database="application-auth-db-${suffix}"
+          image="application-auth-test:${suffix}"
+          context="$(mktemp -d)"
+          created_network=false
+          created_db=false
+          created_image=false
+          cleanup() {
+            original_status=$?
+            trap - EXIT
+            cleanup_status=0
+            if "$created_db"; then docker rm -f "$database" || { echo '::error::Failed to remove fixture database container'; cleanup_status=1; }; fi
+            if "$created_network"; then docker network rm "$network" || { echo '::error::Failed to remove fixture network'; cleanup_status=1; }; fi
+            if "$created_image"; then docker image rm "$image" || { echo '::error::Failed to remove fixture image'; cleanup_status=1; }; fi
+            rm -rf -- "$context" || { echo '::error::Failed to remove fixture build context'; cleanup_status=1; }
+            if [ "$original_status" -ne 0 ]; then exit "$original_status"; fi
+            exit "$cleanup_status"
+          }
+          trap cleanup EXIT
+          ! docker network inspect "$network" >/dev/null 2>&1
+          ! docker container inspect "$database" >/dev/null 2>&1
+          ! docker image inspect "$image" >/dev/null 2>&1
+          git archive HEAD | tar -x -C "$context"
+          docker build -f "$context/e2e/application-authenticated.Dockerfile" -t "$image" "$context"
+          created_image=true
+          docker network create --internal "$network"
+          created_network=true
+          test "$(docker network inspect -f '{{.Internal}}' "$network")" = true
+          docker run -d --name "$database" --network "$network" --network-alias db \
+            -e POSTGRES_USER=fixture -e POSTGRES_PASSWORD=fixture -e POSTGRES_DB=application_flow_fixture \
+            pgvector/pgvector:pg16
+          created_db=true
+          for attempt in $(seq 1 60); do
+            if docker exec "$database" pg_isready -U fixture -d application_flow_fixture; then break; fi
+            test "$attempt" -lt 60
+            sleep 1
+          done
+          docker run --rm --network "$network" --cap-drop ALL --security-opt no-new-privileges \
+            -e CI=true -e APPLICATION_AUTH_DISPOSABLE=true -e RLS_RUNTIME_MODE=off \
+            -e AUTH_SECRET=fixture-only-secret-at-least-32-bytes -e AUTH_URL=http://127.0.0.1:3100 -e NEXTAUTH_URL=http://127.0.0.1:3100 \
+            -e DATABASE_URL=postgresql://fixture:fixture@db:5432/application_flow_fixture \
+            -e DIRECT_URL=postgresql://fixture:fixture@db:5432/application_flow_fixture \
+            "$image" sh e2e/application-authenticated-run.sh
+  synthetic-agent-question:
+    name: Isolated authenticated Agent question
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run synthetic question in isolated disposable containers
+        shell: bash
+        run: |
+          set -euo pipefail
+          suffix="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          network="application-agent-${suffix}"
+          database="application-agent-db-${suffix}"
+          redis="application-agent-redis-${suffix}"
+          image="application-agent-test:${suffix}"
+          context="$(mktemp -d)"
+          created_network=false
+          created_db=false
+          created_redis=false
+          created_image=false
+          cleanup() {
+            original_status=$?
+            trap - EXIT
+            cleanup_status=0
+            if "$created_redis"; then docker rm -f "$redis" || { echo '::error::Failed to remove fixture Redis'; cleanup_status=1; }; fi
+            if "$created_db"; then docker rm -f "$database" || { echo '::error::Failed to remove fixture database'; cleanup_status=1; }; fi
+            if "$created_network"; then docker network rm "$network" || { echo '::error::Failed to remove fixture network'; cleanup_status=1; }; fi
+            if "$created_image"; then docker image rm "$image" || { echo '::error::Failed to remove fixture image'; cleanup_status=1; }; fi
+            rm -rf -- "$context" || { echo '::error::Failed to remove fixture build context'; cleanup_status=1; }
+            if [ "$original_status" -ne 0 ]; then exit "$original_status"; fi
+            exit "$cleanup_status"
+          }
+          trap cleanup EXIT
+          ! docker network inspect "$network" >/dev/null 2>&1
+          ! docker container inspect "$database" >/dev/null 2>&1
+          ! docker container inspect "$redis" >/dev/null 2>&1
+          ! docker image inspect "$image" >/dev/null 2>&1
+          git archive HEAD | tar -x -C "$context"
+          docker build -f "$context/e2e/application-authenticated.Dockerfile" -t "$image" "$context"
+          created_image=true
+          docker network create --internal "$network"
+          created_network=true
+          test "$(docker network inspect -f '{{.Internal}}' "$network")" = true
+          docker run -d --name "$database" --network "$network" --network-alias db \
+            -e POSTGRES_USER=fixture -e POSTGRES_PASSWORD=fixture -e POSTGRES_DB=application_flow_fixture \
+            pgvector/pgvector:pg16
+          created_db=true
+          docker run -d --name "$redis" --network "$network" --network-alias redis redis:7.4-alpine
+          created_redis=true
+          for attempt in $(seq 1 60); do
+            if docker exec "$database" pg_isready -U fixture -d application_flow_fixture && docker exec "$redis" redis-cli ping | grep -qx PONG; then break; fi
+            test "$attempt" -lt 60
+            sleep 1
+          done
+          docker run --rm --network "$network" --cap-drop ALL --security-opt no-new-privileges \
+            -e CI=true -e APPLICATION_AUTH_DISPOSABLE=true -e APPLICATION_AUTH_AGENT_REVIEWED_EXECUTION=true \
+            -e RLS_RUNTIME_MODE=off -e PLATFORM_ENV=development \
+            -e AUTH_SECRET=fixture-only-secret-at-least-32-bytes -e AUTH_URL=http://127.0.0.1:3100 -e NEXTAUTH_URL=http://127.0.0.1:3100 \
+            -e DATABASE_URL=postgresql://fixture:fixture@db:5432/application_flow_fixture \
+            -e DIRECT_URL=postgresql://fixture:fixture@db:5432/application_flow_fixture \
+            -e REDIS_URL=redis://redis:6379/15 -e AGENT_WEB_URL=http://127.0.0.1:3100 \
+            -e AGENT_WORKER_SECRET=fixture-only-worker-secret-at-least-32-bytes \
+            -e ENABLE_AGENT_CHILD_EXECUTION=1 -e ENABLE_AGENT_WAIT_RESOLVER=1 -e ENABLE_AGENT_TASK_GRAPH_PLANNING=1 \
+            "$image" sh e2e/application-authenticated-agent-run.sh
+  synthetic-approval:
+    name: Isolated authenticated application approval
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run synthetic approval in isolated disposable containers
+        shell: bash
+        run: |
+          set -euo pipefail
+          suffix="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
+          network="application-approval-${suffix}"
+          database="application-approval-db-${suffix}"
+          image="application-approval-test:${suffix}"
+          context="$(mktemp -d)"
+          created_network=false
+          created_db=false
+          created_image=false
+          cleanup() {
+            original_status=$?
+            trap - EXIT
+            cleanup_status=0
+            if "$created_db"; then docker rm -f "$database" || { echo '::error::Failed to remove fixture database'; cleanup_status=1; }; fi
+            if "$created_network"; then docker network rm "$network" || { echo '::error::Failed to remove fixture network'; cleanup_status=1; }; fi
+            if "$created_image"; then docker image rm "$image" || { echo '::error::Failed to remove fixture image'; cleanup_status=1; }; fi
+            rm -rf -- "$context" || { echo '::error::Failed to remove fixture build context'; cleanup_status=1; }
+            if [ "$original_status" -ne 0 ]; then exit "$original_status"; fi
+            exit "$cleanup_status"
+          }
+          trap cleanup EXIT
+          ! docker network inspect "$network" >/dev/null 2>&1
+          ! docker container inspect "$database" >/dev/null 2>&1
+          ! docker image inspect "$image" >/dev/null 2>&1
+          git archive HEAD | tar -x -C "$context"
+          docker build -f "$context/e2e/application-authenticated.Dockerfile" -t "$image" "$context"
+          created_image=true
+          docker network create --internal "$network"
+          created_network=true
+          test "$(docker network inspect -f '{{.Internal}}' "$network")" = true
+          docker run -d --name "$database" --network "$network" --network-alias db \
+            -e POSTGRES_USER=fixture -e POSTGRES_PASSWORD=fixture -e POSTGRES_DB=application_flow_fixture \
+            pgvector/pgvector:pg16
+          created_db=true
+          for attempt in $(seq 1 60); do
+            if docker exec "$database" pg_isready -U fixture -d application_flow_fixture; then break; fi
+            test "$attempt" -lt 60
+            sleep 1
+          done
+          docker run --rm --network "$network" --cap-drop ALL --security-opt no-new-privileges \
+            -e CI=true -e APPLICATION_AUTH_DISPOSABLE=true -e APPLICATION_AUTH_APPROVAL_FIXTURE=true -e RLS_RUNTIME_MODE=off \
+            -e AUTH_SECRET=fixture-only-secret-at-least-32-bytes -e AUTH_URL=http://127.0.0.1:3100 -e NEXTAUTH_URL=http://127.0.0.1:3100 \
+            -e DATABASE_URL=postgresql://fixture:fixture@db:5432/application_flow_fixture \
+            -e DIRECT_URL=postgresql://fixture:fixture@db:5432/application_flow_fixture \
+            "$image" sh e2e/application-authenticated-approval-run.sh

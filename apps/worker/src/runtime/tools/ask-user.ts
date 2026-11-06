@@ -38,8 +38,14 @@ export const AskUserOutputSchema = Type.Object({
 export type AskUserInput = Static<typeof AskUserInputSchema>
 export type AskUserIntent = TurnQuestionIntentEnvelope
 
+const builtInAskUserTools = new WeakSet<object>()
+
+export function isBuiltInAskUserTool(definition: object): boolean {
+  return builtInAskUserTools.has(definition)
+}
+
 export function createAskUserTool(): RuntimeToolDefinition<AskUserInput, AskUserIntent> {
-  return {
+  const definition: RuntimeToolDefinition<AskUserInput, AskUserIntent> = {
     schemaVersion, name: "agent.ask_user", version: "1",
     description: "Ask the user for missing information and pause this Turn until they answer.",
     capabilities: ["coordination"], inputSchema: AskUserInputSchema, outputSchema: AskUserOutputSchema,
@@ -55,4 +61,7 @@ export function createAskUserTool(): RuntimeToolDefinition<AskUserInput, AskUser
       return input
     },
   }
+  Object.freeze(definition)
+  builtInAskUserTools.add(definition)
+  return definition
 }

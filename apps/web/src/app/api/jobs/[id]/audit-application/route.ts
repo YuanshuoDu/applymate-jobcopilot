@@ -9,78 +9,22 @@
 import { NextRequest } from 'next/server'
 import { db } from '@/lib/db'
 import { prepareAiRoute, requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
-import { modelChat, parseAiJson, withMiniMaxThinking, type AiConfig } from '@/lib/model-router'
+import { runParsedAudit } from '@/lib/application-audit-model'
 import { roleAiConfig } from '@/lib/agent/role-config'
 import { buildPersona } from '@/lib/persona'
-import { AUDIT_ACTIVITY_PREFIX, isApplicationAuditTarget, parseStoredApplicationAudit, sanitizeProposedValue, targetForAuditFinding } from '@/lib/application-audit'
-import { signedAuditActivityText, verifyApplicationAuditReceipt } from '@/lib/application-audit-receipt'
-import type { ApplicationAudit, ApplicationAuditFinding, ResumeContent } from '@/lib/types'
+import { auditJobBasisHash, auditMaterialBasisHash, completeAuditOperation, failAuditOperation, readAuditOperation, registerAuditOperation } from '@/lib/application-audit-operation'
+import { AUDIT_LIMIT_MESSAGES, auditCoverLetterFallbackName, checkAuditDocumentLimits, checkAuditEvidenceLimits } from '@/lib/application-audit-limits'
+import { AuditMaterialBusyError, lockApplicationAuditMaterials, withApplicationAuditLock } from '@/lib/application-audit-transaction'
+import type { ApplicationAudit, ResumeContent } from '@/lib/types'
 
 type Params = { params: Promise<{ id: string }> }
-type RawFinding = Partial<ApplicationAuditFinding>
-type RawAudit = {
-  verdict?: string
-  summary?: string
-  matchScore?: number
-  findings?: RawFinding[]
-}
-
-const AREAS = new Set<ApplicationAuditFinding['area']>(['resume', 'cover_letter', 'job_match'])
-const SEVERITIES = new Set<ApplicationAuditFinding['severity']>(['pass', 'warning', 'critical'])
-
 type ApplicationAuditResponse = ApplicationAudit & {
   resumeUpdatedAt?: string
   coverLetterUpdatedAt?: string
 }
 
 function toText(content: ResumeContent): string {
-  return JSON.stringify(content, null, 2).slice(0, 12_000)
-}
-
-function normalize(raw: RawAudit, source: ApplicationAudit['source'], includeCoverLetter: boolean): ApplicationAudit {
-  const findings: ApplicationAuditFinding[] = (Array.isArray(raw.findings) ? raw.findings : []).slice(0, 12).map(finding => {
-    const base: ApplicationAuditFinding = {
-      area: AREAS.has(finding.area as ApplicationAuditFinding['area']) ? finding.area as ApplicationAuditFinding['area'] : 'resume',
-      severity: SEVERITIES.has(finding.severity as ApplicationAuditFinding['severity']) ? finding.severity as ApplicationAuditFinding['severity'] : 'warning',
-      resolution: (finding.resolution === 'evidence_needed' ? 'evidence_needed' : 'contradiction') as ApplicationAuditFinding['resolution'],
-      title: String(finding.title ?? 'Review application material').slice(0, 120),
-      evidence: String(finding.evidence ?? 'The auditor could not establish enough evidence.').slice(0, 500),
-      action: String(finding.action ?? 'Review and correct this item before confirming.').slice(0, 300),
-    }
-    const target = base.severity !== 'pass' && base.area !== 'job_match'
-      ? (isApplicationAuditTarget(finding.target) ? finding.target : targetForAuditFinding(base))
-      : undefined
-    const proposedValue = target && finding.proposedValue !== undefined
-      ? sanitizeProposedValue(target, finding.proposedValue)
-      : null
-    return {
-      ...base,
-      ...(target ? { target } : {}),
-      ...(proposedValue !== null ? { proposedValue } : {}),
-    }
-  }).filter(finding => includeCoverLetter || finding.area !== 'cover_letter')
-  const auditedAreas = new Set(findings.map(finding => finding.area))
-  // The audit gate verifies factual integrity of the submitted documents.
-  // Job-fit gaps are useful advice, but absence of a requested skill is never
-  // evidence that the candidate fabricated a claim.
-  const requiredAreas = includeCoverLetter ? (['resume', 'cover_letter'] as const) : (['resume'] as const)
-  const incomplete = requiredAreas.filter(area => !auditedAreas.has(area))
-  if (incomplete.length) findings.push({
-    area: incomplete[0], severity: 'warning', title: 'Incomplete independent audit',
-    resolution: 'evidence_needed',
-    evidence: `The Auditor did not return a result for: ${incomplete.join(', ')}.`,
-    action: 'Run the audit again before confirming the application package.',
-  })
-  const hasCritical = findings.some(finding => finding.area !== 'job_match' && finding.severity === 'critical')
-  const hasFactualWarning = findings.some(finding => finding.area !== 'job_match' && finding.severity === 'warning')
-  return {
-    verdict: hasCritical ? 'blocked' : (hasFactualWarning || incomplete.length) ? 'needs_review' : 'pass',
-    summary: String(raw.summary ?? 'Independent audit completed. Review all findings before final confirmation.').slice(0, 600),
-    matchScore: Math.max(0, Math.min(100, Number(raw.matchScore) || 0)),
-    findings: findings.length ? findings : [{ area: 'resume', severity: 'warning', title: 'Audit needs review', evidence: 'The auditor returned no structured findings.', action: 'Run the audit again before final confirmation.' }],
-    source,
-    auditedAt: new Date().toISOString(),
-  }
+  return JSON.stringify(content, null, 2)
 }
 
 function toIso(value: unknown) {
@@ -88,83 +32,42 @@ function toIso(value: unknown) {
   return typeof value === 'string' ? value : undefined
 }
 
-function isAbortError(error: unknown) {
-  return error instanceof Error && error.name === 'AbortError'
-}
-
-function isMiniMaxReasoningExhausted(error: unknown, cfg: AiConfig) {
-  return cfg.provider === 'minimax'
-    && error instanceof Error
-    && error.message.includes('minimax returned no final content (finish reason: length)')
-}
-
-async function runAuditModel(prompt: string, cfg: AiConfig) {
-  let lastError: unknown
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      // Keep the audit output bounded for factual evidence review.
-      return await modelChat([{ role: 'user', content: prompt }], cfg, 4_096)
-    } catch (error) {
-      lastError = error
-      if (isMiniMaxReasoningExhausted(error, cfg)) {
-        // Retained M3 configurations can retry without private reasoning.
-        if (cfg.model === 'MiniMax-M3') {
-          return modelChat([{ role: 'user', content: prompt }], withMiniMaxThinking(cfg, 'disabled'), 4_096)
-        }
-        // Retry through the platform's M3 direct-answer mode.
-        return modelChat([{ role: 'user', content: prompt }], { ...cfg, model: 'MiniMax-M3', thinking: 'disabled' }, 3_600)
-      }
-      if (!isAbortError(error) || attempt === 1) throw error
-      await new Promise(resolve => setTimeout(resolve, 750))
-    }
-  }
-  throw lastError
-}
-
-function unavailableAudit(source: ApplicationAudit['source'], includeCoverLetter: boolean): ApplicationAudit {
-  return {
-    verdict: 'needs_review',
-    summary: 'The auditor did not return a structured result. No application documents were changed; retry the independent audit.',
-    matchScore: 0,
-    findings: [{
-      area: 'job_match', severity: 'warning', title: 'Audit response needs retry',
-      evidence: 'The AI response was not valid structured audit data.',
-      action: includeCoverLetter
-        ? 'Retry the independent audit. The existing resume and cover letter will be reused unchanged.'
-        : 'Retry the independent audit. The existing resume will be reused unchanged.',
-    }],
-    source,
-    auditedAt: new Date().toISOString(),
-  }
-}
-
-async function runParsedAudit(prompt: string, cfg: AiConfig, source: ApplicationAudit['source'], includeCoverLetter: boolean) {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const retryInstruction = attempt
-      ? '\n\nYour previous response was invalid. Return only the JSON object — no prose, markdown, or reasoning.'
-      : ''
-    const result = await runAuditModel(prompt + retryInstruction, cfg)
-    try {
-      return { result, audit: normalize(parseAiJson<RawAudit>(result.text), source, includeCoverLetter) }
-    } catch {
-      if (attempt === 1) return { result, audit: unavailableAudit(source, includeCoverLetter) }
-    }
-  }
-  throw new Error('Independent audit did not produce a result')
+function noStore(response: Response): Response {
+  response.headers.set('Cache-Control', 'no-store, private')
+  return response
 }
 
 /** The canonical persisted audit used by My Jobs, Resume, and the extension. */
 export async function GET(req: NextRequest, { params }: Params) {
   const auth = await requireAuth(req)
-  if (isErrorResponse(auth)) return auth
+  if (isErrorResponse(auth)) return noStore(auth)
   const { id: jobId } = await params
-  const activity = await db.activity.findFirst({
-    where: { userId: auth.userId, jobId, text: { startsWith: AUDIT_ACTIVITY_PREFIX } },
-    orderBy: { createdAt: 'desc' },
-    select: { text: true },
-  })
-  const stored = parseStoredApplicationAudit(activity?.text ?? '')
-  return ok(verifyApplicationAuditReceipt({ userId: auth.userId, jobId }, stored) ? stored : null)
+  const scope = { userId: auth.userId, jobId }
+  try {
+    const snapshot = await withApplicationAuditLock(scope, async tx => {
+      const job = await tx.job.findFirst({ where: { id: jobId, userId: auth.userId }, select: { role: true, company: true, description: true } })
+      if (!job) return null
+      const operation = await readAuditOperation(tx, scope)
+      if (operation.kind === 'legacy') return { state: 'stale' as const }
+      if (operation.kind !== 'completed') return operation
+      if (operation.jobBasisHash !== auditJobBasisHash(job)
+        || !await lockApplicationAuditMaterials(tx, scope, operation.audit.resumeId, operation.audit.coverLetterId)) return { state: 'stale' as const }
+      const resume = await tx.resume.findFirst({ where: { id: operation.audit.resumeId, userId: auth.userId } })
+      const letter = operation.audit.coverLetterId ? await tx.coverLetter.findFirst({ where: { id: operation.audit.coverLetterId, jobId, userId: auth.userId } }) : null
+      if (!resume || (operation.audit.coverLetterId && !letter) || !checkAuditDocumentLimits(resume.content, letter?.content ?? null, resume.name).ok
+        || operation.materialBasisHash !== auditMaterialBasisHash(resume, letter)) return { state: 'stale' as const }
+      return operation
+    })
+    if (!snapshot) return noStore(err('Job not found.', 404))
+    if ('state' in snapshot) return noStore(ok(snapshot))
+    if (snapshot.kind === 'completed') return noStore(ok(snapshot.audit))
+    if (snapshot.kind === 'none') return noStore(ok(null))
+    return noStore(ok({ state: snapshot.kind === 'invalid' ? 'unavailable' : snapshot.kind }))
+  } catch (error) {
+    return noStore(error instanceof AuditMaterialBusyError
+      ? err('The application materials are being changed. Refresh the review status.', 409)
+      : err('The review status could not be read. Please refresh.', 503))
+  }
 }
 
 export async function POST(req: NextRequest, { params }: Params) {
@@ -174,22 +77,41 @@ export async function POST(req: NextRequest, { params }: Params) {
   const body = await req.json().catch(() => null)
   if (!body) return err('Invalid JSON body')
   const { resumeId, coverLetterId } = body as { resumeId?: string; coverLetterId?: string | null }
-  if (!resumeId) return err('resumeId is required')
+  if (typeof resumeId !== 'string' || !resumeId || (coverLetterId != null && (typeof coverLetterId !== 'string' || !coverLetterId))) return err('A valid resume and optional cover letter are required')
 
-  const [job, resume, persona] = await Promise.all([
+  const [job, resume] = await Promise.all([
     db.job.findFirst({ where: { id: jobId, userId: prep.userId } }),
     db.resume.findFirst({ where: { id: resumeId, userId: prep.userId } }),
-    buildPersona(prep.userId, 'tailor'),
   ])
   if (!job) return err('Job not found', 404)
   if (!resume) return err('Resume not found', 404)
   if (!job.description) return err('A job description is required for an independent audit', 400)
-  const coverLetter = coverLetterId ? await db.coverLetter.findFirst({
-    where: { id: coverLetterId, jobId, userId: prep.userId },
-    select: { content: true, updatedAt: true },
-  }) : null
+  const coverLetter = coverLetterId ? await db.coverLetter.findFirst({ where: { id: coverLetterId, jobId, userId: prep.userId } }) : null
   if (coverLetterId && !coverLetter) return err('Final cover letter not found for this job', 404)
+  const documentCheck = checkAuditDocumentLimits(resume.content, coverLetter?.content ?? null, resume.name)
+  if (!documentCheck.ok) return err(AUDIT_LIMIT_MESSAGES[documentCheck.reason], 422)
   const includeCoverLetter = Boolean(coverLetter)
+
+  const scope = { userId: prep.userId, jobId }
+  let operationId: string | null = null
+  try {
+    // Register after the basic ownership/version checks, before potentially
+    // slow Persona, source-material or model work.
+    const started = await withApplicationAuditLock(scope, async tx => {
+      if (!await lockApplicationAuditMaterials(tx, scope, resume.id, coverLetterId ?? null)) return { kind: 'changed' as const }
+      const currentJob = await tx.job.findFirst({ where: { id: jobId, userId: prep.userId }, select: { description: true, role: true, company: true } })
+      const currentResume = await tx.resume.findFirst({ where: { id: resume.id, userId: prep.userId } })
+      const currentLetter = coverLetterId ? await tx.coverLetter.findFirst({ where: { id: coverLetterId, jobId, userId: prep.userId } }) : null
+      if (!currentJob || currentJob.description !== job.description || currentJob.role !== job.role || currentJob.company !== job.company || !currentResume
+        || !toIso(resume.updatedAt) || toIso(currentResume.updatedAt) !== toIso(resume.updatedAt)
+        || (coverLetterId && (!currentLetter || !toIso(coverLetter?.updatedAt) || toIso(currentLetter.updatedAt) !== toIso(coverLetter?.updatedAt)))
+        || auditMaterialBasisHash(currentResume, currentLetter) !== auditMaterialBasisHash(resume, coverLetter)) return { kind: 'changed' as const }
+      return { kind: 'started' as const, operationId: await registerAuditOperation(tx, scope) }
+    })
+    if (!started) return err('Job not found.', 404)
+    if (started.kind === 'changed') return err('The application materials changed. Reload them before reviewing again.', 409)
+    operationId = started.operationId
+    const persona = await buildPersona(prep.userId, 'tailor')
 
   let sourceContent = resume.content as unknown as ResumeContent
   let source: ApplicationAudit['source'] = 'current_resume'
@@ -203,7 +125,13 @@ export async function POST(req: NextRequest, { params }: Params) {
     if (prior) { sourceContent = prior.content as unknown as ResumeContent; source = 'previous_version' }
   }
   if (source === 'current_resume') {
+    await withApplicationAuditLock(scope, tx => failAuditOperation(tx, scope, operationId!))
     return err('No independent source resume is available. Save or import an original version before auditing AI changes.', 409)
+  }
+  const evidenceCheck = checkAuditEvidenceLimits(sourceContent, persona)
+  if (!evidenceCheck.ok) {
+    await withApplicationAuditLock(scope, tx => failAuditOperation(tx, scope, operationId!))
+    return err(AUDIT_LIMIT_MESSAGES[evidenceCheck.reason], 422)
   }
 
   const auditorRole = await db.agentRole.findFirst({
@@ -218,8 +146,9 @@ export async function POST(req: NextRequest, { params }: Params) {
     ? 'The FINAL RESUME and FINAL COVER LETTER may contain AI edits. Audit both documents.'
     : 'No final cover letter is supplied. A cover letter is optional, so audit the FINAL RESUME only and do not create a cover_letter finding.'
   const auditedAreas = coverLetter ? 'resume, cover_letter, and job_match' : 'resume and job_match'
+  const fallbackName = coverLetter ? auditCoverLetterFallbackName(resume.content, resume.name) : null
   const finalCoverLetterSection = coverLetter
-    ? `FINAL COVER LETTER TO AUDIT:\n${coverLetter.content.slice(0, 8_000)}`
+    ? `FINAL COVER LETTER TO AUDIT:\n${coverLetter.content}${fallbackName !== null ? `\n\nCOVER LETTER HEADER NAME (used when the resume contact name is missing):\n${fallbackName}` : ''}`
     : 'NO FINAL COVER LETTER SUPPLIED (optional)'
   const prompt = `${rolePrompt}
 
@@ -239,7 +168,7 @@ SOURCE RESUME (truth baseline):
 ${toText(sourceContent)}
 
 CONFIRMED PERSONA (user-confirmed facts, also valid evidence):
-${persona.slice(0, 10_000)}
+${persona}
 
 FINAL RESUME TO AUDIT:
 ${toText(resume.content as unknown as ResumeContent)}
@@ -250,18 +179,28 @@ ${job.description.slice(0, 8_000)}
 
 ${finalCoverLetterSection}`
 
-  try {
     const { result, audit } = await runParsedAudit(prompt, cfg, source, includeCoverLetter)
-    await db.activity.create({
-      data: {
-        userId: prep.userId, jobId, type: 'agent_action',
-        color: audit.verdict === 'pass' ? '#059669' : audit.verdict === 'blocked' ? '#dc2626' : '#d97706',
-        text: signedAuditActivityText({ userId: prep.userId, jobId }, resume.id, coverLetterId ?? null, audit, {
-          resumeUpdatedAt: toIso(resume.updatedAt),
-          coverLetterUpdatedAt: toIso(coverLetter?.updatedAt),
-        }),
-      },
+    const finished = await withApplicationAuditLock(scope, async tx => {
+      if (!await lockApplicationAuditMaterials(tx, scope, resume.id, coverLetterId ?? null)) {
+        await failAuditOperation(tx, scope, operationId!)
+        return false
+      }
+      const currentJob = await tx.job.findFirst({ where: { id: jobId, userId: prep.userId }, select: { description: true, role: true, company: true } })
+      const currentResume = await tx.resume.findFirst({ where: { id: resume.id, userId: prep.userId } })
+      const currentLetter = coverLetterId ? await tx.coverLetter.findFirst({ where: { id: coverLetterId, jobId, userId: prep.userId } }) : null
+      if (!currentJob || currentJob.description !== job.description || currentJob.role !== job.role || currentJob.company !== job.company
+        || !currentResume || toIso(currentResume.updatedAt) !== toIso(resume.updatedAt)
+        || (coverLetterId && (!currentLetter || toIso(currentLetter.updatedAt) !== toIso(coverLetter?.updatedAt)))
+        || auditMaterialBasisHash(currentResume, currentLetter) !== auditMaterialBasisHash(resume, coverLetter)) {
+        await failAuditOperation(tx, scope, operationId!)
+        return false
+      }
+      return completeAuditOperation(tx, scope, operationId!, {
+        resumeId: resume.id, coverLetterId: coverLetterId ?? null, audit, jobBasis: job, materialBasis: { resume: currentResume, coverLetter: currentLetter },
+        versions: { resumeUpdatedAt: toIso(resume.updatedAt), coverLetterUpdatedAt: toIso(coverLetter?.updatedAt) },
+      })
     })
+    if (!finished) return err('This review was superseded or the application materials changed. Check the current state.', 409)
     const response: ApplicationAuditResponse = {
       ...audit,
       ...(toIso(resume.updatedAt) ? { resumeUpdatedAt: toIso(resume.updatedAt) } : {}),
@@ -269,6 +208,10 @@ ${finalCoverLetterSection}`
     }
     return ok({ ...response, _model: `${result.provider}/${result.model}` })
   } catch (error) {
+    if (operationId) {
+      try { await withApplicationAuditLock(scope, tx => failAuditOperation(tx, scope, operationId!)) } catch { /* Keep an uncertain operation fenced until an explicit new review. */ }
+    }
+    if (error instanceof AuditMaterialBusyError) return err('The application materials are being changed. Refresh before reviewing again.', 409)
     console.error('[/api/jobs/audit-application]', error)
     return err(`Application audit failed: ${(error as Error).message}`, 502)
   }

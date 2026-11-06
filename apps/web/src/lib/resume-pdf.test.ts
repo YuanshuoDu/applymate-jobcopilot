@@ -1,7 +1,24 @@
 import { describe, expect, it } from 'vitest'
+import { renderToBuffer } from '@react-pdf/renderer'
 import { renderResumeDoc } from './resume-pdf'
-import { UnsupportedPdfTextError } from './pdf-text-support'
-import type { Resume, ResumeContent } from './types'
+import type { Resume } from './types'
+
+describe('resume PDF rendering', () => {
+  it('renders custom, reordered sections and long text into a real PDF', async () => {
+    const resume = { name: 'Fixture', templateId: 'clean', templateOptions: { fontFamily: 'mono' }, content: {
+      contact: { name: 'Fixture Candidate', email: 'fixture@example.invalid', location: 'Dublin', github: 'https://github.invalid/fixture' },
+      summary: 'Hidden summary', experience: [{ role: 'Engineer', company: 'Example', period: '2025', bullets: Array.from({ length: 80 }, (_, i) => `Evidence ${i}`) }],
+      education: [{ institution: 'Example University', degree: 'Engineering', year: '2024' }], skills: ['TypeScript'],
+      sectionOrder: ['skills', 'custom_awards', 'experience', 'education'], custom: [{ id: 'custom_awards', title: 'Awards', items: [{ title: 'Prize', bullets: ['Honour'] }] }],
+    } } as Resume
+    const bytes = await renderToBuffer(await renderResumeDoc(resume) as never)
+    expect(bytes.subarray(0, 5).toString()).toBe('%PDF-')
+    expect(bytes.length).toBeGreaterThan(3000)
+  }, 30000)
+})
+
+import { ApplicationPdfUnsupportedCharactersError } from './application-pdf-errors'
+import type { ResumeContent } from './types'
 
 const content: ResumeContent = {
   contact: { name: 'Renée Example', email: 'sample@example.invalid', location: 'Dublin', phone: '+353 123', linkedin: 'linkedin.example.invalid', github: 'github.example.invalid', website: 'portfolio.example.invalid' },
@@ -51,8 +68,8 @@ describe('PDF resume content preservation', () => {
   })
 
   it('never silently substitutes unsupported visible glyphs and ignores intentionally hidden text', async () => {
-    await expect(render({ summary: '中文' })).rejects.toThrow(UnsupportedPdfTextError)
-    await expect(render({ summary: '中文', sectionOrder: [] })).resolves.not.toContain('中文')
-    await expect(render({ contact: { ...content.contact, name: 'Олена' } })).rejects.toThrow(UnsupportedPdfTextError)
+    await expect(render({ summary: '🦄' })).rejects.toThrow(ApplicationPdfUnsupportedCharactersError)
+    await expect(render({ summary: '🦄', sectionOrder: [] })).resolves.not.toContain('🦄')
+    await expect(render({ contact: { ...content.contact, name: '🦄' } })).rejects.toThrow(ApplicationPdfUnsupportedCharactersError)
   })
 })

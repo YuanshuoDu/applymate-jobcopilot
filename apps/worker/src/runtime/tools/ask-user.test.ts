@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { AskUserInputSchema, AskUserOutputSchema, createAskUserTool } from "./ask-user.js"
+import { AskUserInputSchema, AskUserOutputSchema, createAskUserTool, isBuiltInAskUserTool } from "./ask-user.js"
 import type { ToolExecutionContext } from "./types.js"
 
 const root: ToolExecutionContext = {
@@ -11,6 +11,13 @@ const root: ToolExecutionContext = {
 
 describe("agent.ask_user", () => {
   const tool = createAskUserTool()
+
+  it("binds built-in authority to the frozen factory definition object", () => {
+    expect(isBuiltInAskUserTool(tool)).toBe(true)
+    expect(Object.isFrozen(tool)).toBe(true)
+    expect(isBuiltInAskUserTool({ ...tool })).toBe(false)
+    expect(Reflect.set(tool, "execute", async () => null)).toBe(false)
+  })
 
   it("returns a bounded broker intent without any server-selected identity", async () => {
     await expect(tool.execute(root, { question: "  Which location?  ", choices: [{ label: "Berlin", value: " berlin " }] })).resolves.toEqual({

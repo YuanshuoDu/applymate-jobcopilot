@@ -933,6 +933,29 @@ describe("agent event redaction", () => {
     }
   })
 
+  it("preserves only canonical approval availability metadata while redacting answer material", () => {
+    const payload = {
+      waitKind: "approval", waitId, itemId: waitItemId("approval"), turnId, toolCallId,
+      status: "approved", nextTurnRevision: 9, answerAvailable: false,
+    }
+    const valid = redactAgentEvent({ type: "approval.resolved", body: "", data: payload, routing: route("approval.resolved", payload) }).data as Record<string, unknown>
+    expect(valid.answerAvailable).toBe(false)
+
+    const privateAnswer = redactAgentEvent({ type: "approval.resolved", body: "", data: {
+      ...payload, answer: "candidate@example.test", privateAnswer: "Bearer secret-token",
+    }, routing: route("approval.resolved", payload) }).data as Record<string, unknown>
+    expect(privateAnswer.answerAvailable).toBe("[REDACTED]")
+    expect(privateAnswer.answer).toBe("[REDACTED]")
+    expect(privateAnswer.privateAnswer).toBe("[REDACTED]")
+    expect(JSON.stringify(privateAnswer)).not.toContain("candidate@example.test")
+    expect(JSON.stringify(privateAnswer)).not.toContain("secret-token")
+
+    const foreign = redactAgentEvent({ type: "approval.resolved", body: "", data: payload,
+      routing: { ...route("approval.resolved", payload), correlationId: "foreign_approval" } }).data as Record<string, unknown>
+    expect(foreign.answerAvailable).toBe("[REDACTED]")
+    expect(foreign.waitId).not.toBe(waitId)
+  })
+
   it("redacts malformed, foreign, unknown, phone-like, and secret-looking routing values", () => {
     const payload = { waitKind: "question", waitId, itemId: waitItemId("question"), turnId, toolCallId, status: "answered", nextTurnRevision: 2 }
     const validRoute = route("question.answered", payload)

@@ -154,3 +154,15 @@
 
 @media (max-width: 900px) { .momentum-layout { flex-direction: column; width: 100%; min-width: 0; } .momentum-primary-column { width: 100%; min-width: 0; } .momentum-secondary-column { display: grid; width: 100%; flex-basis: auto; grid-template-columns: 1fr 1fr; } }
 @media (max-width: 650px) { .momentum-content { padding: 24px 16px 40px; } .momentum-header { align-items: flex-start; } .momentum-header h1 { font-size: 24px; } .momentum-date-picker { padding: 9px; font-size: 0; } .momentum-date-picker svg:last-child { margin-left: 0; } .momentum-date-menu { right: 0; } .momentum-week-goal { align-items: center; flex-direction: column; padding: 25px 20px; } .momentum-week-copy { width: 100%; } .momentum-secondary-column { display: flex; } .momentum-coach-document { display: none; } .momentum-row time, .momentum-row-more { display: none; } }
+
+.application-dashboard-guidance { margin-bottom: 24px; padding: 20px; border: 1px solid var(--border); border-radius: 14px; background: var(--glass-card); }
+.application-dashboard-guidance-heading h2 { margin: 0; font-size: 18px; color: var(--text); }
+.application-dashboard-guidance-heading p { margin: 7px 0 16px; font-size: 12px; color: var(--text-muted); line-height: 1.5; }
+.application-dashboard-task-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 235px), 1fr)); gap: 10px; }
+.application-dashboard-links { display: flex; flex-wrap: wrap; gap: 10px; }
+.application-dashboard-links:not(:first-child) { margin-top: 12px; }
+.application-dashboard-links button { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex: 1 1 240px; min-width: 0; padding: 12px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg-secondary); color: var(--text); text-align: left; cursor: pointer; }
+.application-dashboard-links button > span { min-width: 0; }
+.application-dashboard-links small { display: block; margin-bottom: 5px; color: var(--text-muted); font-size: 11px; }
+.application-dashboard-links strong { display: block; font-size: 12px; overflow-wrap: anywhere; }
+.application-dashboard-guidance button:focus-visible, .application-dashboard-guidance a:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }

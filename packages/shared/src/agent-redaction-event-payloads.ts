@@ -83,6 +83,10 @@ export function validQuestionSourceEnvelope(type: string, payload: Row, route: R
 
 export function validatedPayloadFields(type: string, payload: Row, route: Route, guards: AgentEventPayloadGuards): string[] | null {
   const known = knownAgentEventPayloadFields(type, payload, route, guards.opaqueId)
+  // Only the exact broker receipt contract may whitelist its false availability bit.
+  if (type === "approval.resolved" && payload.waitKind === "approval" && payload.answerAvailable === false
+    && exactPayloadKeys(payload, ["waitKind", "waitId", "itemId", "turnId", "toolCallId", "status", "nextTurnRevision", "answerAvailable"])
+    && known) return [...known, "answerAvailable"]
   if (known) return known
   if (validRootAcceptedInputPayload(type, payload, route, guards)) return ["inputId"]
   if (validFollowUpPayload(type, payload, route, guards)) return ["messageId"]
