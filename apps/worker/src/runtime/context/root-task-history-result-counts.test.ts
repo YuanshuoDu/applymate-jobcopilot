@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { parseRootTaskHistoryReportedOutput } from "./root-task-history-result-counts.js"
+import { parseRootTaskHistoryReportedOutput, parseRootTaskHistoryReportedOutputsFromGraph } from "./root-task-history-result-counts.js"
 
 const schemaVersion = "agent-harness.v2.task-graph.result-projection"
 const candidate = { jobId: "job-1", source: "other", evidenceKinds: ["job"] }
@@ -61,5 +61,41 @@ describe("root task history reported output counts", () => {
     for (const forbidden of ["job-1", "score", "evidence", "findings", "summary", "sample"]) {
       expect(JSON.stringify(output)).not.toContain(forbidden)
     }
+  })
+
+  it("derives ordered count facts from completed role nodes in the same graph", () => {
+    const graph = { revision: 9, nodes: [
+      { templateId: "scout", status: "completed", resultProjection: scout() },
+      { templateId: "analyst", status: "completed", resultProjection: analyst() },
+      { templateId: "scout", status: "completed", resultProjection: scout({ candidateCount: 0, evidenceCount: 0, candidates: [] }) },
+    ] }
+    const outputs = parseRootTaskHistoryReportedOutputsFromGraph(graph)
+    expect(outputs).toEqual([
+      { role: "scout", candidateCount: 5, resultStatus: "completed" },
+      { role: "analyst", findingCount: 4, resultStatus: "partial" },
+      { role: "scout", candidateCount: 0, resultStatus: "completed" },
+    ])
+    for (const forbidden of ["job-1", "source", "score", "evidence", "candidates", "findings"]) {
+      expect(JSON.stringify(outputs)).not.toContain(forbidden)
+    }
+  })
+
+  it("omits noncompleted, unavailable, malformed, and role-mismatched graph projections", () => {
+    expect(parseRootTaskHistoryReportedOutputsFromGraph({ revision: 1, nodes: [
+      { templateId: "scout", status: "failed", resultProjection: scout() },
+      { templateId: "scout", status: "completed", resultProjection: analyst() },
+      { templateId: "analyst", status: "completed", resultProjection: analyst({ availability: "unavailable" }) },
+      { templateId: "analyst", status: "completed", resultProjection: analyst({ extra: true }) },
+    ] })).toEqual([undefined, undefined, undefined, undefined])
+    expect(parseRootTaskHistoryReportedOutputsFromGraph({ revision: 1, nodes: [], extra: true })).toBeUndefined()
+  })
+
+  it("does not invoke accessors while inspecting a historical graph", () => {
+    let reads = 0
+    const node = Object.defineProperty({ templateId: "scout", status: "completed" }, "resultProjection", {
+      enumerable: true, get: () => { reads += 1; return scout() },
+    })
+    expect(parseRootTaskHistoryReportedOutputsFromGraph({ revision: 1, nodes: [node] })).toEqual([undefined])
+    expect(reads).toBe(0)
   })
 })
