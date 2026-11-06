@@ -3061,6 +3061,18 @@ const REPAIR_DIAGNOSTIC_RETRY_DISPOSITIONS = new Set(["terminal", "retryable"])
 const REPAIR_DIAGNOSTIC_STRUCTURED_FAILURES = new Set([
   "missing_final_output", "result_too_large", "result_shape_invalid", "evidence_binding_invalid",
 ])
+const REPAIR_CHILD_EXECUTION_STAGES = new Set([
+  "not_started", "factory_created", "stream_entered", "tool_visibility_check", "tool_calls_emitting",
+  "tool_round_completed", "wait_for_persisted_wait", "wait_persisted", "tool_result_inspection",
+  "tool_results_paired", "owner_scoped_selection", "structured_result_build", "final_output_emitting",
+  "stream_completed",
+])
+const EMPTY_ANALYST_ROOT_RESUME_STAGES = new Set([
+  "not_started", "resume_entered", "unexpected_resume_round", "graph_loaded", "graph_assertions",
+  "graph_verified", "wait_outcome_read", "wait_ready_verified", "wait_task_verified", "report_captured",
+  "report_missing", "report_present", "report_assertions", "report_verified", "readback_started",
+  "readback_verified", "final_output_emitting", "stream_completed",
+])
 
 function repairChildOutcomeDiagnostic(role: unknown, outcome: unknown, ordinal: number): RecordValue {
   const value = record(outcome), result = record(value?.result)
@@ -13623,6 +13635,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     }
     const repairChildOutcomeDiagnostics: RecordValue[] = []
     const repairToolLookupDiagnostics: RecordValue[] = []
+    const repairChildExecutionStages = new Map<string, string>()
     const repairTaskOrdinals = new Map<string, Readonly<{ role: string; ordinal: number }>>()
     const repairRoleOrdinals = new Map<string, number>()
     const repairDiagnosticSlotForTask = (taskId: string, roleValue: unknown) => {
@@ -13641,6 +13654,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
       modelRuntimeFactory: ({ task }) => {
         const diagnosticSlot = repairDiagnosticSlotForTask(task.id, task.role)
         let round = 0
+        const setExecutionStage = (stage: string) => {
+          repairChildExecutionStages.set(task.id, diagnosticEnum(stage, REPAIR_CHILD_EXECUTION_STAGES) ?? "not_started")
+        }
+        setExecutionStage("factory_created")
         const leasedTask = childLeaseByTaskId.get(task.id)
         if (task.goal === "Find at least two owner jobs") {
           initialScoutReadDiagnostic.taskUserMatchesFixture = task.userId === value.userId
@@ -13655,13 +13672,16 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           id: "p3-verifier-repair-" + task.role + "-child-fixture", profile,
           async *stream(request) {
             round += 1
+            setExecutionStage("stream_entered")
             if (task.goal === "Find at least two owner jobs") {
               initialScoutReadDiagnostic.modelTaskMatchesLease = leasedTask && typeof request.metadata.taskId === "string"
                 ? request.metadata.taskId === leasedTask.id
                 : null
             }
             if (round === 1) {
+              setExecutionStage("tool_visibility_check")
               expect(request.tools.map(tool => record(tool)?.name)).toContain("jobs.get")
+              setExecutionStage("tool_calls_emitting")
               for (const [index, callId] of callIds.entries()) {
                 yield {
                   type: "tool_call_completed", callId, name: "jobs.get",
@@ -13669,16 +13689,21 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 }
               }
               yield { type: "completed", finishReason: "tool_calls" }
+              setExecutionStage("tool_round_completed")
               return
             }
             const waitKey = task.goal === "Find at least two owner jobs"
               ? `p3-verifier-repair-initial-wait:${value.turnId}`
               : `p3-verifier-repair-wait:${value.turnId}`
+            setExecutionStage("wait_for_persisted_wait")
             await waitForPersistedTaskWait(pool!, value.turnId, waitKey)
+            setExecutionStage("wait_persisted")
+            setExecutionStage("tool_result_inspection")
             const inspections = jobIds.map(expectedJobId =>
               inspectToolResultForExactToolInput(request, "jobs.get", { jobId: expectedJobId }))
             const pairedResults = inspections.map(inspection =>
               inspection.status === "paired" ? inspection.pair : null)
+            setExecutionStage("tool_results_paired")
             if (!hardExecutorFailure) {
               inspections.forEach((inspection, index) => {
                 repairToolLookupDiagnostics.push(repairToolLookupDiagnostic(
@@ -13701,6 +13726,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               const job = record(parsedResults[index]?.job)
               return job?.id === expectedJobId ? job : null
             }).filter((job): job is RecordValue => job !== null)
+            setExecutionStage("owner_scoped_selection")
             if (task.goal === "Find at least two owner jobs") {
               initialScoutReadDiagnostic.resolvedLookupCount = selected.length
               initialScoutReadDiagnostic.expectedJobPresent = selected.length === jobIds.length
@@ -13732,9 +13758,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 })),
                 evidence, summary: "Scored canonical owner-job evidence",
               }
+            setExecutionStage("structured_result_build")
             if (task.goal === "Find at least two owner jobs") initialScoutReadDiagnostic.structuredResultEmitted = true
+            setExecutionStage("final_output_emitting")
             yield { type: "text_delta", text: JSON.stringify(structuredResult) }
             yield { type: "completed", finishReason: "stop" }
+            setExecutionStage("stream_completed")
           },
         }
         return adapter
@@ -13748,9 +13777,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         const diagnosticSlot = repairDiagnosticSlotForTask(lease.id, lease.role)
         const recordChildOutcome = (outcome: unknown) => {
           if (!hardExecutorFailure) {
-            repairChildOutcomeDiagnostics.push(repairChildOutcomeDiagnostic(
-              diagnosticSlot.role, outcome, diagnosticSlot.ordinal,
-            ))
+            repairChildOutcomeDiagnostics.push({
+              ...repairChildOutcomeDiagnostic(diagnosticSlot.role, outcome, diagnosticSlot.ordinal),
+              adapterStage: repairChildExecutionStages.get(lease.id) ?? "not_started",
+            })
             if (repairChildOutcomeDiagnostics.length > 16) repairChildOutcomeDiagnostics.shift()
           }
         }
@@ -13789,9 +13819,10 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           return outcome
         } catch (error: unknown) {
           if (!hardExecutorFailure) {
-            repairChildOutcomeDiagnostics.push(repairChildExceptionDiagnostic(
-              diagnosticSlot.role, diagnosticSlot.ordinal,
-            ))
+            repairChildOutcomeDiagnostics.push({
+              ...repairChildExceptionDiagnostic(diagnosticSlot.role, diagnosticSlot.ordinal),
+              adapterStage: repairChildExecutionStages.get(lease.id) ?? "not_started",
+            })
             if (repairChildOutcomeDiagnostics.length > 16) repairChildOutcomeDiagnostics.shift()
           }
           throw error
@@ -13842,6 +13873,16 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             : terminalGateLease ? "terminal_gate_preflight" : initialWaitSent ? "initial_wait_sent" : "initial_plan_sent"
       const privateWaitRead = privateWaitDiagnostics.latest()
       throw new Error(combineFailureDiagnostics([
+        { label: "failedChildAdapterStages", value: "", safeValue: JSON.stringify(
+          repairChildOutcomeDiagnostics.filter(outcome => outcome.status === "failed" || outcome.status === "threw")
+            .slice(-4).map(outcome => ({
+              role: diagnosticEnum(outcome.role, REPAIR_DIAGNOSTIC_ROLES) ?? "other",
+              ordinal: diagnosticBoundedCount(outcome.ordinal),
+              status: diagnosticEnum(outcome.status, REPAIR_DIAGNOSTIC_OUTCOMES) ?? "other",
+              failureReason: diagnosticEnum(outcome.failureReason, CHILD_OUTCOME_FAILURE_CODES) ?? "other",
+              adapterStage: diagnosticEnum(outcome.adapterStage, REPAIR_CHILD_EXECUTION_STAGES) ?? "other",
+            })),
+        ) },
         { label: "childExecutionEvidence", value: "", safeValue: JSON.stringify({
           outcomes: repairChildOutcomeDiagnostics.slice(-8),
           lookups: repairToolLookupDiagnostics.slice(-8),
@@ -14281,6 +14322,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     const waitKey = `p3-scout-union-wait:${value.turnId}`
     let rootExecution = 0, initialTaskIds: string[] = []
     let scoutATaskId = "", scoutBTaskId = "", analystTaskId = "", graphWitnessTaskId = "", finalWaitReport: RecordValue | null = null
+    let rootResumeStage = "not_started", rootResumeExecution: number | null = null, rootResumeRound: number | null = null
+    const setEmptyAnalystResumeStage = (stage: string) => {
+      if (scenario === "empty Analyst proof") {
+        rootResumeStage = diagnosticEnum(stage, EMPTY_ANALYST_ROOT_RESUME_STAGES) ?? "not_started"
+      }
+    }
     const runtime = await canonical.createCanonicalTurnRuntime(pool!, {
       workerId: value.ownerId, productionFlags: flags,
       taskGraphCommandPort,
@@ -14292,6 +14339,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
           id: "p3-multi-scout-union-root-fixture", profile,
           async *stream(request) {
             round += 1
+            if (scenario === "empty Analyst proof") {
+              rootResumeExecution = diagnosticBoundedCount(execution)
+              rootResumeRound = diagnosticBoundedCount(round)
+              if (execution > 1) setEmptyAnalystResumeStage(execution === 2 && round === 1
+                ? "resume_entered" : "unexpected_resume_round")
+            }
             if (execution === 1 && round === 1) {
               yield { type: "tool_call_completed", callId: planCallId, name: "agent.plan", arguments: {
                 expectedRevision: 0, nodes: [
@@ -14320,7 +14373,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
               return
             }
             if (execution === 2 && round === 1) {
+              setEmptyAnalystResumeStage("graph_loaded")
               const graph = currentGraphFromRequest(request), nodes = Array.isArray(graph?.nodes) ? graph.nodes.map(record) : []
+              setEmptyAnalystResumeStage("graph_assertions")
               expect(nodes.map(node => node?.key)).toEqual(postPrecheckMutation
                 ? ["scout-a", "scout-b", "analysis", "post-precheck-witness"] : ["scout-a", "scout-b", "analysis"])
               expect(nodes.map(node => node?.status)).toEqual(postPrecheckMutation ? ["completed", "completed", "failed", "completed"]
@@ -14339,10 +14394,15 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                   ],
                 })
               else expectPassedVerificationReport(nodes[2]?.verificationReport, "union-membership", "union-coverage")
+              setEmptyAnalystResumeStage("graph_verified")
+              setEmptyAnalystResumeStage("wait_outcome_read")
               const outcome = waitOutcomeFromRequest(request, 1, "analyst")
               expect(outcome.status).toBe("ready")
+              setEmptyAnalystResumeStage("wait_ready_verified")
               expect(record(outcome.tasks[0])).toMatchObject({ taskId: analystTaskId, status: emptyAnalyst ? "failed" : "completed", role: "analyst" })
+              setEmptyAnalystResumeStage("wait_task_verified")
               finalWaitReport = record(record(outcome.tasks[0])?.verificationReport)
+              setEmptyAnalystResumeStage(finalWaitReport ? "report_present" : "report_missing")
               if (taskScopedOrphan || currentAttemptReceipt) expect(finalWaitReport).toMatchObject({
                 verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "unverified", reasonCode: "canonical_evidence_invalid",
               })
@@ -14353,9 +14413,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                   verifierVersion: TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met",
                 })
               else expectPassedVerificationReport(finalWaitReport, "union-membership", "union-coverage")
+              setEmptyAnalystResumeStage("report_assertions")
               expect(Object.keys(finalWaitReport ?? {}).sort()).toEqual(["criteria", "evidenceDigest", "reasonCode", "resultDigest", "status", "verifierVersion"])
               expect(JSON.stringify(finalWaitReport)).not.toContain("dependencyBindings")
+              setEmptyAnalystResumeStage("report_verified")
               if (scenario === "empty Analyst proof") {
+                setEmptyAnalystResumeStage("readback_started")
                 const ownerRows = await pool!.query<{
                   rootTaskId: string; turnLeaseOwner: string; turnLeaseVersion: number; parentLeaseOwner: string
                   parentAttemptCount: number; stepId: string
@@ -14423,7 +14486,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                 await expectReadbackRejectsMutation(scoutATaskId, sourceResult, {
                   ...sourceResult, structuredResult: { ...sourceStructured, candidates: changedCandidates },
                 })
+                setEmptyAnalystResumeStage("readback_verified")
               }
+              setEmptyAnalystResumeStage("final_output_emitting")
               yield { type: "text_delta", text: JSON.stringify({ schemaVersion: "agent-harness.v2.final",
                 response: taskScopedOrphan ? "The empty Analyst result was unverified after an unpaired prior-attempt event"
                   : currentAttemptReceipt ? "The empty Analyst result was not authorized after a current-attempt tool receipt"
@@ -14431,6 +14496,7 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
                     : emptyAnalyst ? "The empty Analyst result did not satisfy either Scout coverage or finding minimum"
                     : "Both Scout sources passed the current union checks" }) }
               yield { type: "completed", finishReason: "stop" }
+              setEmptyAnalystResumeStage("stream_completed")
               return
             }
             throw new Error(`Unexpected multi-Scout union root round ${execution}/${round}`)
@@ -14771,7 +14837,84 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     }
     await executeChild(analystTaskId, `p3-scout-union-analyst-${value.suffix}`, emptyAnalyst ? "failed" : "completed")
     await waitForTurnStatus(pool!, value.turnId, emptyAnalyst ? "failed" : "completed", 45_000, waitKey)
-    expect(finalWaitReport).not.toBeNull()
+    let emptyAnalystResumeSnapshot: RecordValue = { available: false }
+    if (scenario === "empty Analyst proof" && finalWaitReport === null) {
+      try {
+        const state = await pool!.query<{
+          turnStatus: string | null; turnError: string | null; finalResponsePresent: boolean | null
+          rootStatus: string | null; rootFailureReason: string | null; analystStatus: string | null
+          analystFailureReason: string | null; reportStatus: string | null; reportReason: string | null
+          waitStatus: string | null; waitResolved: boolean | null; waitConsumed: boolean | null
+          targetCount: number | null; matchedCount: number | null; failedEventCount: number | null
+          completedEventCount: number | null; latestRootStepStatus: string | null
+          rootStepCount: number | null; finalItemCount: number | null
+        }>(`SELECT turn."status" AS "turnStatus", turn."error" AS "turnError",
+              turn."finalResponse" IS NOT NULL AS "finalResponsePresent",
+              root."status" AS "rootStatus", root."failureReason" AS "rootFailureReason",
+              analyst."status" AS "analystStatus", analyst."failureReason" AS "analystFailureReason",
+              analyst."result"->'taskGraphVerificationReport'->>'status' AS "reportStatus",
+              analyst."result"->'taskGraphVerificationReport'->>'reasonCode' AS "reportReason",
+              wait."status" AS "waitStatus", wait."resolvedAt" IS NOT NULL AS "waitResolved",
+              wait."consumedAt" IS NOT NULL AS "waitConsumed",
+              CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN jsonb_array_length(wait."targetTaskIds") ELSE 0 END AS "targetCount",
+              CASE WHEN jsonb_typeof(wait."matchedTaskIds") = 'array' THEN jsonb_array_length(wait."matchedTaskIds") ELSE 0 END AS "matchedCount",
+              (SELECT COUNT(*)::int FROM "agent_events" AS event WHERE event."turnId" = turn."id"
+                AND event."taskId" = turn."rootTaskId" AND event."type" = 'turn.failed') AS "failedEventCount",
+              (SELECT COUNT(*)::int FROM "agent_events" AS event WHERE event."turnId" = turn."id"
+                AND event."taskId" = turn."rootTaskId" AND event."type" = 'turn.completed') AS "completedEventCount",
+              (SELECT step."status" FROM "agent_steps" AS step WHERE step."turnId" = turn."id"
+                AND step."sessionId" = turn."sessionId" AND step."taskId" = turn."rootTaskId"
+                ORDER BY step."ordinal" DESC LIMIT 1) AS "latestRootStepStatus",
+              (SELECT COUNT(*)::int FROM "agent_steps" AS step WHERE step."turnId" = turn."id"
+                AND step."sessionId" = turn."sessionId" AND step."taskId" = turn."rootTaskId") AS "rootStepCount",
+              (SELECT COUNT(*)::int FROM "agent_items" AS item WHERE item."turnId" = turn."id"
+                AND item."sessionId" = turn."sessionId" AND item."taskId" = turn."rootTaskId"
+                AND item."type" = 'agent_message' AND item."phase" = 'final_answer') AS "finalItemCount"
+           FROM "agent_turns" AS turn
+           LEFT JOIN "sub_agent_tasks" AS root ON root."id" = turn."rootTaskId" AND root."sessionId" = turn."sessionId"
+           LEFT JOIN "sub_agent_tasks" AS analyst ON analyst."id" = $4 AND analyst."sessionId" = turn."sessionId"
+             AND analyst."turnId" = turn."id"
+           LEFT JOIN "agent_wait_conditions" AS wait ON wait."sessionId" = turn."sessionId"
+             AND wait."turnId" = turn."id" AND wait."idempotencyKey" = $5
+           WHERE turn."id" = $1 AND turn."sessionId" = $2 AND turn."userId" = $3`,
+        [value.turnId, value.sessionId, value.userId, analystTaskId, waitKey])
+        const row = state.rows[0]
+        emptyAnalystResumeSnapshot = {
+          available: Boolean(row),
+          turnStatus: diagnosticEnum(row?.turnStatus, TURN_DIAGNOSTIC_STATUSES) ?? "missing_or_other",
+          turnErrorClass: row?.turnError ? diagnosticErrorClass(row.turnError) ?? "other" : "none",
+          finalResponsePresent: row?.finalResponsePresent === true,
+          rootStatus: diagnosticEnum(row?.rootStatus, TASK_DIAGNOSTIC_STATUSES) ?? "missing_or_other",
+          rootFailureClass: row?.rootFailureReason ? diagnosticErrorClass(row.rootFailureReason) ?? "other" : "none",
+          analystStatus: diagnosticEnum(row?.analystStatus, TASK_DIAGNOSTIC_STATUSES) ?? "missing_or_other",
+          analystFailureClass: row?.analystFailureReason ? diagnosticErrorClass(row.analystFailureReason) ?? "other" : "none",
+          reportStatus: diagnosticEnum(row?.reportStatus, TASK_GRAPH_VERIFICATION_STATUSES) ?? "missing_or_other",
+          reportReason: diagnosticEnum(row?.reportReason, TASK_GRAPH_VERIFICATION_REASONS) ?? "missing_or_other",
+          waitStatus: diagnosticEnum(row?.waitStatus, WAIT_DIAGNOSTIC_STATUSES) ?? "missing_or_other",
+          waitResolved: row?.waitResolved === true,
+          waitConsumed: row?.waitConsumed === true,
+          waitTargetCount: diagnosticBoundedCount(row?.targetCount),
+          waitMatchedCount: diagnosticBoundedCount(row?.matchedCount),
+          failedEventCount: diagnosticBoundedCount(row?.failedEventCount),
+          completedEventCount: diagnosticBoundedCount(row?.completedEventCount),
+          latestRootStepStatus: diagnosticEnum(row?.latestRootStepStatus, STEP_DIAGNOSTIC_STATUSES) ?? "missing_or_other",
+          rootStepCount: diagnosticBoundedCount(row?.rootStepCount),
+          finalItemCount: diagnosticBoundedCount(row?.finalItemCount),
+        }
+      } catch {
+        emptyAnalystResumeSnapshot = { available: false }
+      }
+    }
+    const emptyAnalystFailureDiagnostic = scenario === "empty Analyst proof" && finalWaitReport === null
+      ? JSON.stringify({
+        rootResumeStage: diagnosticEnum(rootResumeStage, EMPTY_ANALYST_ROOT_RESUME_STAGES) ?? "other",
+        rootResumeExecution: diagnosticBoundedCount(rootResumeExecution),
+        rootResumeRound: diagnosticBoundedCount(rootResumeRound),
+        finalWaitReportPresent: finalWaitReport !== null,
+        persisted: emptyAnalystResumeSnapshot,
+      })
+      : undefined
+    expect(finalWaitReport, emptyAnalystFailureDiagnostic).not.toBeNull()
     const turn = await pool!.query<{ status: string; rootTaskId: string | null; finalResponse: string | null }>(
       `SELECT "status", "rootTaskId", "finalResponse" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3`,
       [value.turnId, value.sessionId, value.userId],
