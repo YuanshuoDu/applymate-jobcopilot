@@ -94,6 +94,41 @@ function waitRef(fixture: Fixture, id = questionId(fixture.owner, fixture.stepId
   return { stepId: fixture.stepId, toolCallId: fixture.callId, waitId: id, questionItemId: questionItemId(id) }
 }
 
+type PlanningHistoryMessage = Readonly<{ role: string; content: unknown }>
+type ParsedPlanningHistoryMessage = Readonly<{ index: number; trust: string; source: string; content: Record<string, unknown> }>
+
+function selectPlanningQuestionHistory(messages: readonly PlanningHistoryMessage[], question: string, waitId: string, answer: string) {
+  const entries = messages.flatMap((message, index): ParsedPlanningHistoryMessage[] => {
+    if (message.role !== "user" || !Array.isArray(message.content)) return []
+    const text = message.content.flatMap((part: unknown) => {
+      if (!part || typeof part !== "object" || Array.isArray(part)) return []
+      const value = part as Record<string, unknown>
+      return value.type === "text" && typeof value.text === "string" ? [value.text] : []
+    }).find(value => value.startsWith("[harness context layer=steer_history "))
+    const separator = text?.indexOf("\n") ?? -1
+    if (!text || separator < 0) return []
+    const header = text.slice(0, separator)
+    const trustPrefix = "[harness context layer=steer_history trust="
+    const sourceSeparator = header.indexOf(" source=")
+    if (!header.startsWith(trustPrefix) || sourceSeparator < 0 || !header.endsWith("]")) return []
+    const trust = header.slice(trustPrefix.length, sourceSeparator)
+    const source = header.slice(sourceSeparator + " source=".length, -1)
+    if (!trust || !source) return []
+    try {
+      const content: unknown = JSON.parse(text.slice(separator + 1))
+      return content && typeof content === "object" && !Array.isArray(content)
+        ? [{ index, trust, source, content: content as Record<string, unknown> }] : []
+    } catch { return [] }
+  })
+  return {
+    questions: entries.filter(entry => entry.content.role === "assistant" && entry.content.type === "question"
+      && entry.content.question === question),
+    answers: entries.filter(entry => entry.content.role === "user" && entry.content.type === "answer"
+      && entry.content.questionId === waitId && entry.content.text === answer),
+    summaries: entries.filter(entry => entry.trust === "internal_record" && entry.source === "native_question_recovery"),
+  }
+}
+
 function runtimePool(base: Pool, applicationName: string): TurnQuestionPool {
   return {
     async connect() {
@@ -460,6 +495,27 @@ async function withAdminClient<T>(work: (client: PoolClient) => Promise<T>): Pro
   }
 }
 
+describe("planning clarification Harness message selection", () => {
+  it("selects the answer record when its text also appears in the question options", () => {
+    const messages = [
+      { role: "user", content: [{ type: "text", text: '[harness context layer=steer_history trust=UNTRUSTED_DATA source=steer_history]\n{"options":[{"label":"Berlin","value":"berlin"}],"question":"Which region?","role":"assistant","type":"question"}' }] },
+      { role: "user", content: [{ type: "text", text: '[harness context layer=steer_history trust=UNTRUSTED_DATA source=steer_history]\n{"questionId":"question-1","role":"user","text":"berlin","type":"answer"}' }] },
+      { role: "user", content: [{ type: "text", text: '[harness context layer=steer_history trust=internal_record source=native_question_recovery]\n{"graphRevisionAtAsk":3}' }] },
+    ]
+    const selected = selectPlanningQuestionHistory(messages, "Which region?", "question-1", "berlin")
+    expect(selected.questions).toHaveLength(1)
+    expect(selected.answers).toHaveLength(1)
+    expect(selected.summaries).toHaveLength(1)
+    expect(selected.questions[0]?.index).toBe(0)
+    expect(selected.answers[0]?.index).toBe(selected.questions[0]!.index + 1)
+    expect(selected.summaries[0]?.index).toBe(selected.answers[0]!.index + 1)
+    expect(selected.questions[0]?.content).toMatchObject({
+      role: "assistant", type: "question", question: "Which region?", options: [{ label: "Berlin", value: "berlin" }],
+    })
+    expect(selected.answers[0]?.content).toEqual({ role: "user", type: "answer", questionId: "question-1", text: "berlin" })
+  })
+})
+
 describePg("planning clarification wait persistence on disposable PostgreSQL", () => {
   beforeAll(async () => {
     admin = new Pool({ connectionString: databaseUrl!, max: 10 })
@@ -819,10 +875,17 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
     const messages = request.messages.map(message => JSON.stringify(message))
     const serializedMessages = messages.join("\n")
     const systemMessages = JSON.stringify(request.messages.filter(message => message.role === "system"))
-    const questionIndex = messages.findIndex(message => message.includes(intent.question))
-    const answerIndex = messages.findIndex(message => message.includes(answer))
-    const summaryIndex = messages.findIndex(message => message.includes("native_question_recovery"))
-    expect(questionIndex).toBeGreaterThanOrEqual(0)
+    const selectedHistory = selectPlanningQuestionHistory(request.messages, intent.question, wait.waitId, answer)
+    expect(selectedHistory.questions).toHaveLength(1)
+    expect(selectedHistory.answers).toHaveLength(1)
+    expect(selectedHistory.summaries).toHaveLength(1)
+    const questionEntry = selectedHistory.questions[0]!
+    const answerEntry = selectedHistory.answers[0]!
+    const questionIndex = questionEntry.index
+    const answerIndex = answerEntry.index
+    const summaryIndex = selectedHistory.summaries[0]!.index
+    expect(questionEntry.content).toMatchObject({ role: "assistant", type: "question", question: intent.question, options: intent.options })
+    expect(answerEntry.content).toEqual({ role: "user", type: "answer", questionId: wait.waitId, text: answer })
     expect(answerIndex).toBe(questionIndex + 1)
     expect(summaryIndex).toBe(answerIndex + 1)
     expect(serializedMessages).toContain("Accepted steer")
