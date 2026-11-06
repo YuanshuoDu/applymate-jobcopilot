@@ -3,8 +3,10 @@ import { db } from '@/lib/db'
 import { prepareAiRoute, requireAuth, isErrorResponse, ok, err } from '@/lib/api-helpers'
 import { modelChat, parseAiJson } from '@/lib/model-router'
 import { buildPersona } from '@/lib/persona'
-import { sanitizeProposedValue, targetForAuditFinding } from '@/lib/application-audit'
+import { targetForAuditFinding } from '@/lib/application-audit'
+import { sanitizeLosslessProposedValue } from '@/lib/application-audit-repair-safety'
 import { auditJobBasisHash, auditMaterialBasisHash, completeAuditOperation, readAuditOperation, registerAuditOperation } from '@/lib/application-audit-operation'
+import { AUDIT_LIMIT_MESSAGES, checkAuditEvidenceLimits } from '@/lib/application-audit-limits'
 import { AuditMaterialBusyError, lockApplicationAuditMaterials, withApplicationAuditLock } from '@/lib/application-audit-transaction'
 import type { ApplicationAudit, ApplicationAuditFinding, ResumeContent } from '@/lib/types'
 
@@ -23,7 +25,7 @@ function sameVersion(expected: string | undefined, actual: unknown) {
 
 function sectionText(content: ResumeContent, target: ApplicationAuditFinding['target']) {
   if (!target || target === 'cover_letter') return ''
-  return JSON.stringify(content[target], null, 2).slice(0, 10_000)
+  return JSON.stringify(content[target], null, 2)
 }
 
 async function generateRepair(
@@ -43,9 +45,12 @@ async function generateRepair(
       ? db.resume.findFirst({ where: { id: resume.parentResumeId, userId: prep.userId }, select: { content: true } })
       : db.resumeVersion.findFirst({ where: { resumeId: resume.id, userId: prep.userId }, orderBy: { createdAt: 'desc' }, select: { content: true } }),
   ])
+  if (!sourceResume?.content) return { error: err('The source resume is no longer available. Restore it and run the review again.', 409) }
+  const evidenceCheck = checkAuditEvidenceLimits(sourceResume.content, persona)
+  if (!evidenceCheck.ok) return { error: err(AUDIT_LIMIT_MESSAGES[evidenceCheck.reason], 422) }
   const currentContent = resume.content as unknown as ResumeContent
   const current = target === 'cover_letter' ? coverLetter?.content ?? '' : sectionText(currentContent, target)
-  const source = sourceResume?.content ? JSON.stringify(sourceResume.content, null, 2).slice(0, 10_000) : 'No separate source section was available.'
+  const source = JSON.stringify(sourceResume.content, null, 2)
   const prompt = [
     'You are a careful resume and application editor applying exactly one independent-audit correction.',
     'Return ONLY JSON: {"proposedValue": <complete replacement value>}.',
@@ -54,7 +59,7 @@ async function generateRepair(
     `TARGET SECTION: ${target}`,
     `CURRENT TARGET CONTENT:\n${current}`,
     `SOURCE RESUME EVIDENCE:\n${source}`,
-    `CONFIRMED PERSONA:\n${persona.slice(0, 9_000)}`,
+    `CONFIRMED PERSONA:\n${persona}`,
     `JOB: ${job.role} at ${job.company}\n${job.description?.slice(0, 5_000) ?? ''}`,
     `AUDIT FINDING:\nTitle: ${finding.title}\nEvidence: ${finding.evidence}\nRecommended fix: ${finding.action}`,
     target === 'cover_letter'
@@ -64,7 +69,7 @@ async function generateRepair(
   try {
     const result = await modelChat([{ role: 'user', content: prompt }], prep.cfg, target === 'cover_letter' ? 4_096 : 2_500)
     const parsed = parseAiJson<GeneratedRepair>(result.text)
-    const proposedValue = sanitizeProposedValue(target, parsed.proposedValue)
+    const proposedValue = sanitizeLosslessProposedValue(target, parsed.proposedValue)
     return proposedValue === null ? { error: err('The AI did not return a safe generated correction.', 502) } : { proposedValue }
   } catch (error) {
     return { error: err(`Could not generate a safe correction: ${(error as Error).message}`, 502) }
@@ -114,7 +119,7 @@ export async function POST(req: NextRequest, { params }: Params) {
   if (!sameVersion(stored.coverLetterUpdatedAt, coverLetter?.updatedAt)) return err('The cover letter changed after this audit. Run the audit again.', 409)
   if (original.materialBasisHash !== auditMaterialBasisHash(resume, coverLetter)) return err('The materials changed after this audit. Run it again.', 409)
 
-  let proposedValue = sanitizeProposedValue(target, finding.proposedValue)
+  let proposedValue = sanitizeLosslessProposedValue(target, finding.proposedValue)
   if (proposedValue === null) {
     const generated = await generateRepair(req, { ...job, description: job.description }, { id: resume.id, content: resume.content, parentResumeId: resume.parentResumeId }, finding, target, coverLetter)
     if ('error' in generated) return generated.error

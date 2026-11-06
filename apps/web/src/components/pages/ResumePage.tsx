@@ -9,6 +9,7 @@ import { openApplication, replaceApplicationHistory } from '@/lib/application-na
 import { readApplicationListState } from '@/lib/application-list-state'
 import { auditMatchesCurrentMaterials } from '@/lib/application-materials'
 import { parseApplicationAuditView } from '@/lib/application-audit-view'
+import { auditLimitMessageKey } from '@/lib/application-audit-limit-message'
 import { applicationMaterialAssignment, selectApplicationCoverLetter } from '@/lib/application-material-selection'
 import { sameApplicationAudit, type ApplicationAuditIdentity } from '@/lib/application-audit-identity'
 import { guardApplicationUnload } from '@/lib/application-unload-guard'
@@ -2180,7 +2181,8 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     if (!isCurrent() || !selectedLetterVerificationRef.current.verified || selectedLetterVerificationRef.current.key !== requestSelectedLetterKey
       || requestEditRevision !== editRevisionRef.current || requestMaterials !== syncAuditMaterialScope() || dirtyRef.current || isSavingRef.current) return null
     if (!data || error) {
-      const message = error ?? 'Please try again'
+      const limitKey = auditLimitMessageKey(error)
+      const message = limitKey ? t(limitKey) : error ?? 'Please try again'
       setAuditError(message)
       toast.error('Audit could not run', message)
       return null
@@ -2302,7 +2304,9 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
         correctionConflictRef.current = true
         setCorrectionOutcomeUnknown(true)
         setContentChangedSinceAnalysis(true)
-        toast.warning(t('resume.correctionChangedTitle'), t('resume.correctionChangedDetail'))
+        const limitKey = auditLimitMessageKey(error)
+        if (limitKey) setAuditError(`${t(limitKey)} ${t('resume.correctionChangedDetail')}`)
+        toast.warning(limitKey ? t(limitKey) : t('resume.correctionChangedTitle'), t('resume.correctionChangedDetail'))
         return
       }
 

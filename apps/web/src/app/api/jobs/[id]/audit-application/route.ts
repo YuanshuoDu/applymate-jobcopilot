@@ -13,6 +13,7 @@ import { runParsedAudit } from '@/lib/application-audit-model'
 import { roleAiConfig } from '@/lib/agent/role-config'
 import { buildPersona } from '@/lib/persona'
 import { auditJobBasisHash, auditMaterialBasisHash, completeAuditOperation, failAuditOperation, readAuditOperation, registerAuditOperation } from '@/lib/application-audit-operation'
+import { AUDIT_LIMIT_MESSAGES, auditCoverLetterFallbackName, checkAuditDocumentLimits, checkAuditEvidenceLimits } from '@/lib/application-audit-limits'
 import { AuditMaterialBusyError, lockApplicationAuditMaterials, withApplicationAuditLock } from '@/lib/application-audit-transaction'
 import type { ApplicationAudit, ResumeContent } from '@/lib/types'
 
@@ -23,7 +24,7 @@ type ApplicationAuditResponse = ApplicationAudit & {
 }
 
 function toText(content: ResumeContent): string {
-  return JSON.stringify(content, null, 2).slice(0, 12_000)
+  return JSON.stringify(content, null, 2)
 }
 
 function toIso(value: unknown) {
@@ -53,7 +54,8 @@ export async function GET(req: NextRequest, { params }: Params) {
         || !await lockApplicationAuditMaterials(tx, scope, operation.audit.resumeId, operation.audit.coverLetterId)) return { state: 'stale' as const }
       const resume = await tx.resume.findFirst({ where: { id: operation.audit.resumeId, userId: auth.userId } })
       const letter = operation.audit.coverLetterId ? await tx.coverLetter.findFirst({ where: { id: operation.audit.coverLetterId, jobId, userId: auth.userId } }) : null
-      if (!resume || (operation.audit.coverLetterId && !letter) || operation.materialBasisHash !== auditMaterialBasisHash(resume, letter)) return { state: 'stale' as const }
+      if (!resume || (operation.audit.coverLetterId && !letter) || !checkAuditDocumentLimits(resume.content, letter?.content ?? null, resume.name).ok
+        || operation.materialBasisHash !== auditMaterialBasisHash(resume, letter)) return { state: 'stale' as const }
       return operation
     })
     if (!snapshot) return noStore(err('Job not found.', 404))
@@ -86,6 +88,8 @@ export async function POST(req: NextRequest, { params }: Params) {
   if (!job.description) return err('A job description is required for an independent audit', 400)
   const coverLetter = coverLetterId ? await db.coverLetter.findFirst({ where: { id: coverLetterId, jobId, userId: prep.userId } }) : null
   if (coverLetterId && !coverLetter) return err('Final cover letter not found for this job', 404)
+  const documentCheck = checkAuditDocumentLimits(resume.content, coverLetter?.content ?? null, resume.name)
+  if (!documentCheck.ok) return err(AUDIT_LIMIT_MESSAGES[documentCheck.reason], 422)
   const includeCoverLetter = Boolean(coverLetter)
 
   const scope = { userId: prep.userId, jobId }
@@ -124,6 +128,11 @@ export async function POST(req: NextRequest, { params }: Params) {
     await withApplicationAuditLock(scope, tx => failAuditOperation(tx, scope, operationId!))
     return err('No independent source resume is available. Save or import an original version before auditing AI changes.', 409)
   }
+  const evidenceCheck = checkAuditEvidenceLimits(sourceContent, persona)
+  if (!evidenceCheck.ok) {
+    await withApplicationAuditLock(scope, tx => failAuditOperation(tx, scope, operationId!))
+    return err(AUDIT_LIMIT_MESSAGES[evidenceCheck.reason], 422)
+  }
 
   const auditorRole = await db.agentRole.findFirst({
     where: { userId: prep.userId, role: 'auditor' }, select: { enabled: true, provider: true, model: true, apiKey: true, systemPrompt: true },
@@ -137,8 +146,9 @@ export async function POST(req: NextRequest, { params }: Params) {
     ? 'The FINAL RESUME and FINAL COVER LETTER may contain AI edits. Audit both documents.'
     : 'No final cover letter is supplied. A cover letter is optional, so audit the FINAL RESUME only and do not create a cover_letter finding.'
   const auditedAreas = coverLetter ? 'resume, cover_letter, and job_match' : 'resume and job_match'
+  const fallbackName = coverLetter ? auditCoverLetterFallbackName(resume.content, resume.name) : null
   const finalCoverLetterSection = coverLetter
-    ? `FINAL COVER LETTER TO AUDIT:\n${coverLetter.content.slice(0, 8_000)}`
+    ? `FINAL COVER LETTER TO AUDIT:\n${coverLetter.content}${fallbackName !== null ? `\n\nCOVER LETTER HEADER NAME (used when the resume contact name is missing):\n${fallbackName}` : ''}`
     : 'NO FINAL COVER LETTER SUPPLIED (optional)'
   const prompt = `${rolePrompt}
 
@@ -158,7 +168,7 @@ SOURCE RESUME (truth baseline):
 ${toText(sourceContent)}
 
 CONFIRMED PERSONA (user-confirmed facts, also valid evidence):
-${persona.slice(0, 10_000)}
+${persona}
 
 FINAL RESUME TO AUDIT:
 ${toText(resume.content as unknown as ResumeContent)}

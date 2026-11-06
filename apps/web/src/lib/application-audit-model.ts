@@ -1,5 +1,6 @@
 import { modelChat, parseAiJson, withMiniMaxThinking, type AiConfig } from './model-router'
-import { isApplicationAuditTarget, sanitizeProposedValue, targetForAuditFinding } from './application-audit'
+import { isApplicationAuditTarget, targetForAuditFinding } from './application-audit'
+import { sanitizeLosslessProposedValue } from './application-audit-repair-safety'
 import type { ApplicationAudit, ApplicationAuditFinding } from './types'
 
 type RawFinding = Partial<ApplicationAuditFinding>
@@ -14,7 +15,9 @@ const AREAS = new Set<ApplicationAuditFinding['area']>(['resume', 'cover_letter'
 const SEVERITIES = new Set<ApplicationAuditFinding['severity']>(['pass', 'warning', 'critical'])
 
 function normalize(raw: RawAudit, source: ApplicationAudit['source'], includeCoverLetter: boolean): ApplicationAudit {
-  const findings: ApplicationAuditFinding[] = (Array.isArray(raw.findings) ? raw.findings : []).slice(0, 12).map(finding => {
+  const rawFindings = Array.isArray(raw.findings) ? raw.findings : []
+  const overflow = rawFindings.length > 12
+  const findings: ApplicationAuditFinding[] = rawFindings.slice(0, 12).map(finding => {
     const base: ApplicationAuditFinding = {
       area: AREAS.has(finding.area as ApplicationAuditFinding['area']) ? finding.area as ApplicationAuditFinding['area'] : 'resume',
       severity: SEVERITIES.has(finding.severity as ApplicationAuditFinding['severity']) ? finding.severity as ApplicationAuditFinding['severity'] : 'warning',
@@ -27,7 +30,7 @@ function normalize(raw: RawAudit, source: ApplicationAudit['source'], includeCov
       ? (isApplicationAuditTarget(finding.target) ? finding.target : targetForAuditFinding(base))
       : undefined
     const proposedValue = target && finding.proposedValue !== undefined
-      ? sanitizeProposedValue(target, finding.proposedValue)
+      ? sanitizeLosslessProposedValue(target, finding.proposedValue)
       : null
     return {
       ...base,
@@ -41,19 +44,31 @@ function normalize(raw: RawAudit, source: ApplicationAudit['source'], includeCov
   // evidence that the candidate fabricated a claim.
   const requiredAreas = includeCoverLetter ? (['resume', 'cover_letter'] as const) : (['resume'] as const)
   const incomplete = requiredAreas.filter(area => !auditedAreas.has(area))
-  if (incomplete.length) findings.push({
+  const notices: ApplicationAuditFinding[] = []
+  if (incomplete.length) notices.push({
     area: incomplete[0], severity: 'warning', title: 'Incomplete independent audit',
     resolution: 'evidence_needed',
     evidence: `The Auditor did not return a result for: ${incomplete.join(', ')}.`,
     action: 'Run the audit again before confirming the application package.',
   })
-  const hasCritical = findings.some(finding => finding.area !== 'job_match' && finding.severity === 'critical')
+  if (overflow) notices.push({
+    area: 'resume', severity: 'warning', title: 'Audit results exceed the display limit',
+    resolution: 'evidence_needed',
+    evidence: 'The auditor returned more findings than can be displayed safely.',
+    action: 'Run the independent audit again and review the complete result before confirming.',
+  })
+  // Include a critical finding even if it falls outside the display limit.
+  // Ignore job-fit advice and findings for an optional, absent cover letter.
+  const hasCritical = rawFindings.some(finding => finding && finding.severity === 'critical'
+    && finding.area !== 'job_match' && (includeCoverLetter || finding.area !== 'cover_letter'))
   const hasFactualWarning = findings.some(finding => finding.area !== 'job_match' && finding.severity === 'warning')
+  const displayedFindings = [...findings.slice(0, 12 - notices.length), ...notices]
   return {
-    verdict: hasCritical ? 'blocked' : (hasFactualWarning || incomplete.length) ? 'needs_review' : 'pass',
-    summary: String(raw.summary ?? 'Independent audit completed. Review all findings before final confirmation.').slice(0, 600),
+    verdict: hasCritical ? 'blocked' : (hasFactualWarning || incomplete.length || overflow) ? 'needs_review' : 'pass',
+    summary: overflow ? 'The audit returned too many findings to display completely. Run it again before confirming.'
+      : String(raw.summary ?? 'Independent audit completed. Review all findings before final confirmation.').slice(0, 600),
     matchScore: Math.max(0, Math.min(100, Number(raw.matchScore) || 0)),
-    findings: findings.length ? findings : [{ area: 'resume', severity: 'warning', title: 'Audit needs review', evidence: 'The auditor returned no structured findings.', action: 'Run the audit again before final confirmation.' }],
+    findings: displayedFindings.length ? displayedFindings : [{ area: 'resume', severity: 'warning', title: 'Audit needs review', evidence: 'The auditor returned no structured findings.', action: 'Run the audit again before final confirmation.' }],
     source,
     auditedAt: new Date().toISOString(),
   }

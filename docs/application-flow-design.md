@@ -110,7 +110,15 @@ Agent 维护范围内单独处理。
 审核请求在服务器登记后，其他页面会看到“审核进行中或结果未知”，下载和打印会等待
 当前审核结果；用户主动启动新审核会替换此前审核，旧请求晚到不能发布结果。
 刷新可读取状态；如本地请求结果未知，单次读取不能证明它尚未到达服务器，仍应先核对再决定是否重新审核。
-旧审核缺少职位与材料内容依据，升级后需重新检查一次；职位内容、材料内容或模板变化后也需重新检查。
+旧审核缺少完整审核输入或职位与材料内容依据，升级后需重新检查一次；职位内容、材料内容或模板变化后也需重新检查。
+为避免把未送入审核的内容当作已检查，最终简历或来源简历的格式化 JSON 超过 12,000 个字符、
+求职信超过 8,000 个字符或已确认职业资料超过 10,000 个字符时，审核会停止并说明需要精简的部分。
+字符数按 JavaScript UTF-16 单元计算，简历的格式字符和转义也计入；求职信使用简历名称作为
+备用姓名时，该姓名也会送入审核并计入简历长度。精简时保留真实事实。
+自动修正使用完整来源和目标内容；职位描述仍只提供前 8,000 个字符，匹配信息不能视作完整职位分析。
+审核意见超过展示上限时不会判定通过；请重新检查。AI 审核也不能保证发现所有事实问题。
+自动修正会替换受影响的整段或整节；系统拒绝会被校验过程截断或丢字段的建议，
+但不能保证模型保留原节的每一条内容。请对照保存的历史版本检查修改，然后重新审核。
 这些保证从服务器登记提交后开始，混用旧版服务的部署及生产数据库权限尚未验证。
 审核结果目前不会随来源简历或职业资料事实的后续变化自动失效；如修改了依据，请重新检查。
 草稿恢复到最新简历后，只有原来进入编辑器时存在可信的职位与返回列表上下文，才会
@@ -218,13 +226,27 @@ Once the server commits a review registration, other pages see its pending or
 failed state and download/print cannot reuse an older pass. An explicitly started
 new review supersedes the previous operation; an older completion cannot publish.
 A local request with an unknown outcome may not yet have reached the server, so
-a single read does not prove that request has stopped. Older receipts lack job
-and material-content bases and require one new review; changes to job details,
+a single read does not prove that request has stopped. Older receipts may lack
+complete review inputs or job and material-content bases and require one new review; changes to job details,
 materials or their templates require a
 current check. Mixed-version rollout and production database permissions have not
 been verified. Ordinary material writers do not all share the correction lock. A
 later change to the source resume or confirmed Persona does not automatically
 invalidate the receipt; run a new review when the underlying evidence changes.
+
+Reviews stop with guidance if a formatted final or source resume exceeds 12,000
+UTF-16 code units, a cover letter exceeds 8,000, or confirmed Persona text exceeds
+10,000. JSON formatting and escapes count toward the resume limit; a resume name
+used as the cover-letter header fallback is also reviewed and counted. Shorten the
+identified input without changing facts, then explicitly review again; automatic
+correction uses the full source and target content. The job description still
+uses only its first 8,000 characters, so match information is not a complete job
+analysis. A result with more findings than the display limit cannot pass; review
+again. A model review cannot guarantee every factual issue is detected.
+An automatic correction replaces its affected section. A suggestion that would
+be truncated or lose fields during validation is rejected, but the model may
+still omit information from the previous section. Compare the saved version
+history and review the corrected material before running a new audit.
 
 An absent optional letter is distinct from a selected letter still loading.
 Confirming the same selected letter omits a redundant assignment, because that
