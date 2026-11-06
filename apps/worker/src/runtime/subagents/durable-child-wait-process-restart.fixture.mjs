@@ -47,6 +47,10 @@ const loopErrorCategories = new Set([
 function loopErrorCategory(errorCode) {
   return errorCode == null ? "none" : loopErrorCategories.has(errorCode) ? errorCode : "other"
 }
+function workerFailureReasonCategory(error) {
+  const code = error && typeof error.message === "string" ? error.message : ""
+  return workerFailureReasonCategories.has(code) ? code : "other"
+}
 const boundedLoopDiagnosticModes = new Set(["worker-b-loop-usage-lineage-cut", "worker-b-loop-usage-lineage-reject"])
 const maxBoundedLoopDiagnosticStages = 64
 const boundedLoopDiagnosticStages = new Set([
@@ -618,12 +622,15 @@ async function resumeChildThroughLoop(lease, phase, preloadedRestored) {
   }
   catch (error) {
     traceLoopStage("child_attempt_resume_loader", "fail")
+    if (phase === "usage-lineage-reject") {
+      say(`WORKER_B_LOOP_RESUME_FAILURE ${JSON.stringify({ category: workerFailureReasonCategory(error) })}`)
+    }
     if (phase === "multi-reject") {
       say(`WORKER_B_LOOP_MULTI_REJECTED ${JSON.stringify({ error: error?.message ?? String(error), modelCalls: 0, executorCalls: 0, dispatcherCalls: 0 })}`)
       return { status: "failed", failureReason: error?.message ?? "child_resume_wait_tool_call_conflict", retryDisposition: "terminal" }
     }
     if (phase === "usage-lineage-reject" && error?.message === "child_resume_wait_step_lineage") {
-      say(`WORKER_B_LOOP_USAGE_LINEAGE_REJECTED ${JSON.stringify({ error: error.message, modelCalls: 0, executorCalls: 0, dispatcherCalls: 0 })}`)
+      say(`WORKER_B_LOOP_USAGE_LINEAGE_REJECTED ${JSON.stringify({ category: "child_resume_wait_step_lineage", modelCalls: 0, executorCalls: 0, dispatcherCalls: 0 })}`)
       return { status: "failed", failureReason: error.message, retryDisposition: "terminal" }
     }
     throw error

@@ -201,6 +201,32 @@ describe("worker restart blocker proof diagnostic bindings", () => {
     expect(JSON.stringify(parsed)).not.toContain("synthetic-secret")
     expect(parsed.overflow).toBe(false)
   })
+  it("reports workerD recovery with only bounded booleans, statuses, stages, and failure codes", () => {
+    const privateId = "fixture-private-target-id", privateError = "fixture-private-error-text"
+    const child = { stdoutText: [
+      `WORKER_B_RECOVERED ${JSON.stringify({ reclaimed: 0, terminal: 0, rows: [{ id: privateId, status: "running", detail: privateError }] })}`,
+      `WORKER_B_RECOVERY_PREDICATE_TRACE ${JSON.stringify({ pages: [{ targetSeen: true, cursorUsed: false }],
+        rejectionStage: "unsettled_external_call_rejected", taskId: privateId, detail: privateError })}`,
+      `WORKER_B_LOOP_STAGE ${JSON.stringify({ stage: "child_attempt_resume_loader", phase: "fail", private: privateError })}`,
+      `WORKER_B_LOOP_RESUME_FAILURE ${JSON.stringify({ category: "child_resume_wait_step_lineage", error: privateError })}`,
+    ].join("\n") } as unknown as WorkerProcess
+    const diagnostic = boundedWorkerRecoveryDiagnostic(child, privateId)
+    expect(JSON.parse(diagnostic)).toEqual({ recoveryCompleted: true, targetReturned: true, targetStatus: "running",
+      candidateSeen: true, rejectionStage: "unsettled_external_call_rejected", childAttemptResumeLoader: "fail",
+      resumeFailureCategory: "child_resume_wait_step_lineage" })
+    expect(diagnostic).not.toContain(privateId)
+    expect(diagnostic).not.toContain(privateError)
+
+    const unknown = { stdoutText: [
+      `WORKER_B_RECOVERY_PREDICATE_TRACE ${JSON.stringify({ pages: [], rejectionStage: privateError })}`,
+      `WORKER_B_LOOP_RESUME_FAILURE ${JSON.stringify({ category: privateError, error: privateError })}`,
+    ].join("\n") } as unknown as WorkerProcess
+    expect(JSON.parse(boundedWorkerRecoveryDiagnostic(unknown, privateId))).toMatchObject({
+      recoveryCompleted: false, targetReturned: false, targetStatus: "absent", candidateSeen: false,
+      rejectionStage: "other", childAttemptResumeLoader: "not_seen", resumeFailureCategory: "other",
+    })
+    expect(boundedWorkerRecoveryDiagnostic(unknown, privateId)).not.toContain(privateError)
+  })
 })
 
 function parseBoundedLoopDiagnostics(text: string): { overflow: boolean; records: Array<{
@@ -317,7 +343,7 @@ function launchWorker(mode: "worker-a" | "worker-a-crash" | "worker-b-crash-befo
   const child = spawn(process.execPath, ["--import", "tsx", fixturePath, mode, queueName, JSON.stringify(ids)], {
     cwd: workerCwd,
     env: { ...process.env, DATABASE_URL: databaseUrl!, AGENT_RUNTIME_PG_TEST_URL: databaseUrl!, AGENT_TURN_REDIS_TEST_URL: redisUrl!,
-      ...(mode === "worker-b-crash-resume" || mode === "worker-b-loop-claim-item-completed-cut"
+      ...(mode === "worker-b-crash-resume" || mode === "worker-b-loop-claim-item-completed-cut" || mode === "worker-b-loop-usage-lineage-reject"
         ? { AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID: ids.waiterTaskId } : {}) },
     stdio: ["ignore", "pipe", "pipe"],
   }) as WorkerProcess
@@ -735,6 +761,67 @@ function parseRecoveryMarker(child: WorkerProcess): { reclaimed?: number; termin
     return { reclaimed: typeof marker.reclaimed === "number" && Number.isSafeInteger(marker.reclaimed) ? marker.reclaimed : undefined,
       terminal: typeof marker.terminal === "number" && Number.isSafeInteger(marker.terminal) ? marker.terminal : undefined, rows }
   } catch { return {} }
+}
+
+const recoveryRejectionStages = new Set([
+  "candidate_not_seen", "candidate_seen", "session_lock_mismatch", "turn_lock_mismatch", "expiry_preview_rejected",
+  "root_turn_not_recoverable", "task_lock_parity_mismatch", "recovery_clock_missing", "lease_expiry_fence_mismatch",
+  "unsettled_external_call_rejected", "durable_wait_graph_blocked", "task_graph_transition_blocked", "task_graph_finish_blocked",
+  "task_update_rejected",
+])
+const recoveryStatuses = new Set(["queued", "running", "completed", "failed", "cancelled", "interrupted"])
+const resumeFailureCodes = new Set([
+  "child_resume_wait_tool_call_conflict", "child_resume_wait_step_lineage", "child_resume_wait_lineage",
+  "child_resume_wait_owner_mismatch", "child_resume_wait_commit_unavailable", "child_resume_wait_commit_pending",
+])
+
+function parseRecoveryPredicateDiagnostic(child: WorkerProcess): { targetSeen: boolean; rejectionStage: string } {
+  const prefix = "WORKER_B_RECOVERY_PREDICATE_TRACE "
+  const line = child.stdoutText.split(/\r?\n/).find(candidate => candidate.startsWith(prefix))
+  if (!line) return { targetSeen: false, rejectionStage: "not_emitted" }
+  try {
+    const trace = JSON.parse(line.slice(prefix.length)) as { pages?: unknown; rejectionStage?: unknown }
+    const pages = Array.isArray(trace.pages) ? trace.pages.slice(0, 16) : []
+    const targetSeen = pages.some(page => page && typeof page === "object" && !Array.isArray(page)
+      && (page as Record<string, unknown>).targetSeen === true)
+    const rejectionStage = typeof trace.rejectionStage === "string" && recoveryRejectionStages.has(trace.rejectionStage)
+      ? trace.rejectionStage : "other"
+    return { targetSeen, rejectionStage }
+  } catch { return { targetSeen: false, rejectionStage: "malformed" } }
+}
+
+function parseLoopStagePhase(child: WorkerProcess, expectedStage: string): "start" | "pass" | "fail" | "not_seen" {
+  const prefix = "WORKER_B_LOOP_STAGE "
+  const lines = child.stdoutText.split(/\r?\n/).filter(line => line.startsWith(prefix)).slice(0, 64)
+  let phase: "start" | "pass" | "fail" | "not_seen" = "not_seen"
+  for (const line of lines) {
+    try {
+      const marker = JSON.parse(line.slice(prefix.length)) as { stage?: unknown; phase?: unknown }
+      if (marker.stage !== expectedStage) continue
+      phase = marker.phase === "start" || marker.phase === "pass" || marker.phase === "fail" ? marker.phase : "fail"
+    } catch { phase = "fail" }
+  }
+  return phase
+}
+
+function parseResumeFailureCategory(child: WorkerProcess): string {
+  const prefix = "WORKER_B_LOOP_RESUME_FAILURE "
+  const line = child.stdoutText.split(/\r?\n/).find(candidate => candidate.startsWith(prefix))
+  if (!line) return "none"
+  try {
+    const marker = JSON.parse(line.slice(prefix.length)) as { category?: unknown }
+    return typeof marker.category === "string" && resumeFailureCodes.has(marker.category) ? marker.category : "other"
+  } catch { return "other" }
+}
+
+function boundedWorkerRecoveryDiagnostic(child: WorkerProcess, targetId: string): string {
+  const recovery = parseRecoveryMarker(child)
+  const target = recovery.rows?.find(row => row.id === targetId)
+  const targetStatus = typeof target?.status === "string" && recoveryStatuses.has(target.status) ? target.status : "absent"
+  const predicate = parseRecoveryPredicateDiagnostic(child)
+  return JSON.stringify({ recoveryCompleted: Array.isArray(recovery.rows), targetReturned: Boolean(target), targetStatus,
+    candidateSeen: predicate.targetSeen, rejectionStage: predicate.rejectionStage,
+    childAttemptResumeLoader: parseLoopStagePhase(child, "child_attempt_resume_loader"), resumeFailureCategory: parseResumeFailureCategory(child) })
 }
 
 function expectRestoredWaitObservation(child: WorkerProcess, state: RestoredWaitObservationSummary["state"]): void {
@@ -4180,7 +4267,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       await waitForBoundedLoopMarker(workerD, "WORKER_B_RECOVERED")
       const workerDRecovery = parseRecoveryMarker(workerD)
       expect(workerDRecovery.reclaimed).toBe(0)
-      expect(workerDRecovery.terminal).toBe(1)
+      expect(workerDRecovery.terminal, boundedWorkerRecoveryDiagnostic(workerD, ids.waiterTaskId)).toBe(1)
       expect(workerDRecovery.rows?.find(row => row.id === ids.waiterTaskId)?.status).toBe("failed")
       await stopWorker(workerD)
       const workerDExit = await workerD.exited
