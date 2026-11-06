@@ -3078,7 +3078,23 @@ const EMPTY_ANALYST_EXECUTION_PHASES = new Set(["initial", "resume", "retry", "e
 const EMPTY_ANALYST_EXECUTION_OUTCOMES = new Set(["started", "returned", "threw"])
 const EMPTY_ANALYST_EXECUTION_STATUSES = new Set([...TURN_DIAGNOSTIC_STATUSES, "none", "other"])
 const EMPTY_ANALYST_ERROR_CLASSES = new Set(["none", "database", "assertion", "coordination", "generic", "other"])
-const EMPTY_ANALYST_ERROR_CODES = new Set([...ERROR_DIAGNOSTIC_CODES, "task_graph_other", "none", "other"])
+const EMPTY_ANALYST_STATE_LOADER_ERROR_CODES = new Set([
+  "turn_not_owned", "turn_goal_missing", "context_snapshot_missing", "steering_marker_state_invalid",
+  "wait_consume_turn_fenced", "wait_consume_outcome_invalid", "wait_consume_verification_report_invalid",
+  "wait_consume_repair_receipt_invalid", "wait_consume_result_invalid", "tool_result_replay_uncertain",
+  "question_recovery_order_invalid", "question_recovery_item_id_invalid", "question_recovery_planning_summary_ambiguous",
+  "question_recovery_history_pair_invalid", "question_recovery_history_collision",
+  "cognitive_agenda_scope_invalid", "cognitive_agenda_sequence_invalid", "cognitive_agenda_receipt_invalid",
+  "cognitive_agenda_resume_fence_invalid", "archived_wait_accounting_invalid", "final_evidence_recovery_marker_invalid",
+])
+const EMPTY_ANALYST_STATE_LOADER_ERROR_MESSAGES = new Map<string, string>([
+  ...[...EMPTY_ANALYST_STATE_LOADER_ERROR_CODES].map(code => [code, code] as const),
+  ["circular result", "wait_consume_result_invalid"],
+  ["result is not JSON", "wait_consume_result_invalid"],
+])
+const EMPTY_ANALYST_ERROR_CODES = new Set([
+  ...ERROR_DIAGNOSTIC_CODES, ...EMPTY_ANALYST_STATE_LOADER_ERROR_CODES, "task_graph_other", "none", "other",
+])
 const EMPTY_ANALYST_PERSISTED_TURN_STATUSES = new Set([...TURN_DIAGNOSTIC_STATUSES, "missing_or_other"])
 const EMPTY_ANALYST_PERSISTED_TASK_STATUSES = new Set([...TASK_DIAGNOSTIC_STATUSES, "missing_or_other"])
 const EMPTY_ANALYST_PERSISTED_STEP_STATUSES = new Set([...STEP_DIAGNOSTIC_STATUSES, "missing_or_other"])
@@ -3089,6 +3105,15 @@ type EmptyAnalystBoundaryDiagnostic = {
   outcome: string
   errorClass: string
   errorCode: string
+}
+type EmptyAnalystStateLoaderDiagnostic = EmptyAnalystBoundaryDiagnostic & {
+  passedCalls: number
+  failedCalls: number
+  consumeWaitOutcomesTrueCalls: number
+  consumeWaitOutcomesFalseCalls: number
+  firstFailureConsumeWaitOutcomes: boolean | null
+  firstFailureErrorClass: string
+  firstFailureErrorCode: string
 }
 type EmptyAnalystExecutionObservation = {
   ordinal: number
@@ -3102,7 +3127,7 @@ type EmptyAnalystExecutionObservation = {
 type EmptyAnalystRootResumeDiagnostics = {
   executeCalls: number
   executions: EmptyAnalystExecutionObservation[]
-  stateLoader: EmptyAnalystBoundaryDiagnostic
+  stateLoader: EmptyAnalystStateLoaderDiagnostic
   rootEnsure: EmptyAnalystBoundaryDiagnostic & { returnedStatus: string }
   modelFactoryCalls: number
   adapterStreamCalls: number
@@ -3122,6 +3147,18 @@ function emptyAnalystRootResumeDiagnosticProjection(value: unknown): RecordValue
       errorCode: diagnosticEnum(boundary?.errorCode, EMPTY_ANALYST_ERROR_CODES) ?? "other",
     }
   }
+  const loader = record(runtime?.stateLoader)
+  const stateLoader = {
+    ...stage(loader),
+    passedCalls: diagnosticBoundedCount(loader?.passedCalls),
+    failedCalls: diagnosticBoundedCount(loader?.failedCalls),
+    consumeWaitOutcomesTrueCalls: diagnosticBoundedCount(loader?.consumeWaitOutcomesTrueCalls),
+    consumeWaitOutcomesFalseCalls: diagnosticBoundedCount(loader?.consumeWaitOutcomesFalseCalls),
+    firstFailureConsumeWaitOutcomes: typeof loader?.firstFailureConsumeWaitOutcomes === "boolean"
+      ? loader.firstFailureConsumeWaitOutcomes : null,
+    firstFailureErrorClass: diagnosticEnum(loader?.firstFailureErrorClass, EMPTY_ANALYST_ERROR_CLASSES) ?? "other",
+    firstFailureErrorCode: diagnosticEnum(loader?.firstFailureErrorCode, EMPTY_ANALYST_ERROR_CODES) ?? "other",
+  }
   const executeCalls = diagnosticBoundedCount(runtime?.executeCalls)
   const executions = Array.isArray(runtime?.executions) ? runtime.executions.slice(0, 4).map((entry, index) => {
     const observation = record(entry)
@@ -3140,7 +3177,7 @@ function emptyAnalystRootResumeDiagnosticProjection(value: unknown): RecordValue
       executeCalls,
       omittedExecutions: executeCalls === null ? null : Math.max(0, executeCalls - executions.length),
       executions,
-      stateLoader: stage(runtime?.stateLoader),
+      stateLoader,
       rootEnsure: { ...stage(runtime?.rootEnsure), returnedStatus:
         diagnosticEnum(record(runtime?.rootEnsure)?.returnedStatus, TASK_DIAGNOSTIC_STATUSES) ?? "other" },
       modelFactoryCalls: diagnosticBoundedCount(runtime?.modelFactoryCalls),
@@ -3163,7 +3200,12 @@ function emptyAnalystRootResumeDiagnosticProjection(value: unknown): RecordValue
 
 function emptyAnalystErrorCode(error: unknown): string {
   const code = record(error)?.code
-  return typeof code === "string" ? diagnosticErrorCode(code) ?? "other" : "none"
+  if (typeof code === "string") {
+    return EMPTY_ANALYST_STATE_LOADER_ERROR_CODES.has(code) ? code : diagnosticErrorCode(code) ?? "other"
+  }
+  if (error === null || error === undefined) return "none"
+  if (error instanceof Error) return EMPTY_ANALYST_STATE_LOADER_ERROR_MESSAGES.get(error.message) ?? "other"
+  return "other"
 }
 
 function repairChildOutcomeDiagnostic(role: unknown, outcome: unknown, ordinal: number): RecordValue {
@@ -7105,6 +7147,21 @@ describe("canonical verifier receipt diagnostics", () => {
 })
 
 describe("empty Analyst root continuation diagnostics", () => {
+  it("classifies exact source loader failures without emitting raw error text", () => {
+    const marker = "private-loader-error-message"
+    const observed = [
+      emptyAnalystErrorCode(new Error("turn_not_owned")),
+      emptyAnalystErrorCode(new Error("wait_consume_outcome_invalid")),
+      emptyAnalystErrorCode(new Error("question_recovery_history_pair_invalid")),
+      emptyAnalystErrorCode(new Error(marker)),
+    ]
+
+    expect(observed).toEqual([
+      "turn_not_owned", "wait_consume_outcome_invalid", "question_recovery_history_pair_invalid", "other",
+    ])
+    expect(JSON.stringify(observed)).not.toContain(marker)
+  })
+
   it("projects only bounded setup, execute, wait-handoff, and persisted lease facts", () => {
     const marker = "private-root-error-id-message-sql"
     const projected = emptyAnalystRootResumeDiagnosticProjection({
@@ -7117,7 +7174,9 @@ describe("empty Analyst root continuation diagnostics", () => {
           { ordinal: 4, phase: "retry", outcome: "threw", errorClass: "database", errorCode: "other" },
           { ordinal: 5, phase: "extra", outcome: "returned", resultStatus: "failed" },
         ],
-        stateLoader: { calls: 3, outcome: "failed", errorClass: "generic", errorCode: "task_graph_state_missing", error: marker },
+        stateLoader: { calls: 3, outcome: "failed", errorClass: "generic", errorCode: "task_graph_state_missing", error: marker,
+          passedCalls: 2, failedCalls: 1, consumeWaitOutcomesTrueCalls: 1, consumeWaitOutcomesFalseCalls: 2,
+          firstFailureConsumeWaitOutcomes: false, firstFailureErrorClass: "generic", firstFailureErrorCode: "turn_not_owned" },
         rootEnsure: { calls: 1, outcome: "passed", returnedStatus: "running", id: marker },
         modelFactoryCalls: 1, adapterStreamCalls: 1,
         waitHandoff: { calls: 1, outcome: "passed", errorClass: "none", errorCode: "none", waitId: marker },
@@ -7139,7 +7198,9 @@ describe("empty Analyst root continuation diagnostics", () => {
           { phase: "retry", outcome: "threw", errorClass: "database", errorCode: "other" },
           { phase: "retry", outcome: "threw", errorClass: "database", errorCode: "other" },
         ],
-        stateLoader: { calls: 3, outcome: "failed", errorClass: "generic", errorCode: "task_graph_state_missing" },
+        stateLoader: { calls: 3, outcome: "failed", errorClass: "generic", errorCode: "task_graph_state_missing",
+          passedCalls: 2, failedCalls: 1, consumeWaitOutcomesTrueCalls: 1, consumeWaitOutcomesFalseCalls: 2,
+          firstFailureConsumeWaitOutcomes: false, firstFailureErrorClass: "generic", firstFailureErrorCode: "turn_not_owned" },
         rootEnsure: { calls: 1, outcome: "passed", returnedStatus: "running" },
         modelFactoryCalls: 1, adapterStreamCalls: 1, waitHandoff: { calls: 1, outcome: "passed" },
       },
@@ -7158,7 +7219,9 @@ describe("empty Analyst root continuation diagnostics", () => {
       runtime: {
         executeCalls: 10_001,
         executions: [{ phase: marker, outcome: marker, resultStatus: marker, errorClass: marker, errorCode: marker, message: marker }],
-        stateLoader: { calls: marker, outcome: marker, errorClass: marker, errorCode: marker },
+        stateLoader: { calls: marker, outcome: marker, errorClass: marker, errorCode: marker,
+          passedCalls: marker, failedCalls: marker, consumeWaitOutcomesTrueCalls: marker, consumeWaitOutcomesFalseCalls: marker,
+          firstFailureConsumeWaitOutcomes: marker, firstFailureErrorClass: marker, firstFailureErrorCode: marker },
         rootEnsure: { calls: 1, outcome: marker, returnedStatus: marker },
         modelFactoryCalls: marker, adapterStreamCalls: marker,
         waitHandoff: { calls: 1, outcome: marker, errorClass: marker, errorCode: marker },
@@ -7173,7 +7236,9 @@ describe("empty Analyst root continuation diagnostics", () => {
       runtime: {
         executeCalls: null, omittedExecutions: null,
         executions: [{ phase: "other", outcome: "other", resultStatus: "other", errorClass: "other", errorCode: "other" }],
-        stateLoader: { calls: null, outcome: "other", errorClass: "other", errorCode: "other" },
+        stateLoader: { calls: null, outcome: "other", errorClass: "other", errorCode: "other", passedCalls: null, failedCalls: null,
+          consumeWaitOutcomesTrueCalls: null, consumeWaitOutcomesFalseCalls: null, firstFailureConsumeWaitOutcomes: null,
+          firstFailureErrorClass: "other", firstFailureErrorCode: "other" },
         rootEnsure: { outcome: "other", returnedStatus: "other" }, waitHandoff: { outcome: "other" },
       },
       persisted: { turnStatus: "missing_or_other", turnLeaseOwnerPresent: null, rootStatus: "missing_or_other" },
@@ -14495,7 +14560,9 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
     let rootResumeStage = "not_started", rootResumeExecution: number | null = null, rootResumeRound: number | null = null
     const emptyAnalystRuntimeDiagnostics: EmptyAnalystRootResumeDiagnostics = {
       executeCalls: 0, executions: [],
-      stateLoader: { calls: 0, outcome: "not_started", errorClass: "none", errorCode: "none" },
+      stateLoader: { calls: 0, outcome: "not_started", errorClass: "none", errorCode: "none", passedCalls: 0, failedCalls: 0,
+        consumeWaitOutcomesTrueCalls: 0, consumeWaitOutcomesFalseCalls: 0, firstFailureConsumeWaitOutcomes: null,
+        firstFailureErrorClass: "none", firstFailureErrorCode: "none" },
       rootEnsure: { calls: 0, outcome: "not_started", returnedStatus: "none", errorClass: "none", errorCode: "none" },
       modelFactoryCalls: 0, adapterStreamCalls: 0,
       waitHandoff: { calls: 0, outcome: "not_started", errorClass: "none", errorCode: "none" },
@@ -14515,14 +14582,28 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         const boundary = emptyAnalystRuntimeDiagnostics.stateLoader
         boundary.calls += 1
         boundary.outcome = "started"
+        if (loaderOptions?.consumeWaitOutcomes === true) boundary.consumeWaitOutcomesTrueCalls += 1
+        else if (loaderOptions?.consumeWaitOutcomes === false) boundary.consumeWaitOutcomesFalseCalls += 1
         try {
           const state = await loadCanonicalTurnState(statePool, lease, now, loaderOptions)
+          boundary.passedCalls += 1
           boundary.outcome = "passed"
+          boundary.errorClass = "none"
+          boundary.errorCode = "none"
           return state
         } catch (error: unknown) {
+          const errorClass = safeFailurePreflightErrorClass(error)
+          const errorCode = emptyAnalystErrorCode(error)
+          if (boundary.failedCalls === 0) {
+            const consumeWaitOutcomes = loaderOptions?.consumeWaitOutcomes
+            boundary.firstFailureConsumeWaitOutcomes = typeof consumeWaitOutcomes === "boolean" ? consumeWaitOutcomes : null
+            boundary.firstFailureErrorClass = errorClass
+            boundary.firstFailureErrorCode = errorCode
+          }
+          boundary.failedCalls += 1
           boundary.outcome = "failed"
-          boundary.errorClass = safeFailurePreflightErrorClass(error)
-          boundary.errorCode = emptyAnalystErrorCode(error)
+          boundary.errorClass = errorClass
+          boundary.errorCode = errorCode
           throw error
         }
       },
