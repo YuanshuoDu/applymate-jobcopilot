@@ -221,6 +221,26 @@ integration('application audit ordering with disposable PostgreSQL', () => {
     } finally { running.release(); await within(Promise.allSettled([pending])) }
   }, 30_000)
 
+  it('rejects an oversized selected resume and does not reuse the earlier pass', async () => {
+    await clientB.resume.update({ where: { id: 'resume-1' }, data: { content: { summary: 'x'.repeat(12_000) } } })
+    const rejected = await invoke('audit', { client: clientA, userId: 'owner-a' })
+    expect(rejected.status).toBe(422)
+    expect((await rejected.json()).error).toContain('final resume')
+    expect(await (await invoke('read', { client: clientB, userId: 'owner-a' })).json()).toEqual({ state: 'stale' })
+    expect((await invoke('download', { client: clientB, userId: 'owner-a' })).status).toBe(409)
+    expect((await invoke('print', { client: clientB, userId: 'owner-a' })).status).toBe(409)
+  })
+
+  it('fences an earlier pass when the source evidence is too long to review', async () => {
+    await clientB.resume.update({ where: { id: 'source-1' }, data: { content: { summary: 'x'.repeat(12_000) } } })
+    const rejected = await invoke('audit', { client: clientA, userId: 'owner-a' })
+    expect(rejected.status).toBe(422)
+    expect((await rejected.json()).error).toContain('source resume')
+    expect(await (await invoke('read', { client: clientB, userId: 'owner-a' })).json()).toEqual({ state: 'failed' })
+    expect((await invoke('download', { client: clientB, userId: 'owner-a' })).status).toBe(409)
+    expect((await invoke('print', { client: clientB, userId: 'owner-a' })).status).toBe(409)
+  })
+
   it('prevents a superseded audit from publishing late or restoring its result', async () => {
     const firstGate = gate()
     const first = invoke('audit', { client: clientA, userId: 'owner-a', summary: 'Older result', gate: firstGate })

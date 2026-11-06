@@ -1,6 +1,7 @@
 import type { NextRequest } from 'next/server'
 import { requireAuth, isErrorResponse, err } from '@/lib/api-helpers'
 import { auditJobBasisHash, auditMaterialBasisHash, readAuditOperation } from '@/lib/application-audit-operation'
+import { AUDIT_LIMIT_MESSAGES, checkAuditDocumentLimits } from '@/lib/application-audit-limits'
 import { AuditMaterialBusyError, lockApplicationAuditMaterials, withApplicationAuditLock } from '@/lib/application-audit-transaction'
 import { hasCurrentApplicationPackAudit, renderApplicationPack } from '@/lib/application-pack'
 import { renderApplicationPackPrintHtml } from '@/lib/application-pack-print'
@@ -31,6 +32,8 @@ async function loadAuditedPack(req: NextRequest, { params }: Params) {
         ? await tx.coverLetter.findFirst({ where: { id: job.finalCoverLetterId, jobId, userId: auth.userId } })
         : null
       if (!resume || (job.finalCoverLetterId && !coverLetter)) return err('Final application documents could not be found.', 404)
+      const documentCheck = checkAuditDocumentLimits(resume.content, coverLetter?.content ?? null, resume.name)
+      if (!documentCheck.ok) return err(AUDIT_LIMIT_MESSAGES[documentCheck.reason], 409)
       const operation = await readAuditOperation(tx, scope)
       const audit = operation.kind === 'completed' && operation.jobBasisHash === auditJobBasisHash(job)
         && operation.materialBasisHash === auditMaterialBasisHash(resume, coverLetter) ? operation.audit : null

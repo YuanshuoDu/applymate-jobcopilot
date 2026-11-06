@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { createHash } from 'node:crypto'
 import { parseStoredApplicationAudit } from '@/lib/application-audit'
 import { signedAuditActivityText, verifyApplicationAuditReceipt } from '@/lib/application-audit-receipt'
 import type { ApplicationAudit } from '@/lib/types'
@@ -123,6 +124,18 @@ describe('POST /api/jobs/[id]/audit-application', () => {
     expect(mocks.modelChat.mock.calls[0][0][0].content).toContain('security-threat detection metrics')
     expect(mocks.activityCreate.mock.calls[0][0].data.text).toContain('[Auditor] application-audit')
     expect(verifyApplicationAuditReceipt({ userId: 'user_1', jobId: 'job_1' }, parseStoredApplicationAudit(mocks.activityCreate.mock.calls[0][0].data.text))).toBe(true)
+  })
+
+  it('includes the actual fallback name used in the printed cover-letter header', async () => {
+    mocks.resumeFindFirst.mockResolvedValueOnce({ id: 'resume_final', name: 'Fallback Candidate', parentResumeId: 'resume_base', content: { contact: {}, summary: 'Final' } })
+      .mockResolvedValueOnce({ content: { contact: { name: 'Fallback Candidate' }, summary: 'Original' } })
+    mocks.modelChat.mockResolvedValue({ provider: 'fixture', model: 'fixture', text: JSON.stringify({ findings: [
+      { area: 'resume', severity: 'pass' }, { area: 'cover_letter', severity: 'pass' },
+    ] }) })
+    const { POST } = await import('./route')
+    const response = (await POST(request({ resumeId: 'resume_final', coverLetterId: 'cover_1' }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    expect(response.status).toBe(200)
+    expect(mocks.modelChat.mock.calls[0][0][0].content).toContain('COVER LETTER HEADER NAME (used when the resume contact name is missing):\nFallback Candidate')
   })
 
   it('returns and persists the exact resume and cover-letter revisions that were audited', async () => {
@@ -290,6 +303,50 @@ describe('POST /api/jobs/[id]/audit-application', () => {
     const response = (await POST(request({ resumeId: 'resume_final', coverLetterId: 'cover_1' }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
     expect(response.status).toBe(409)
     expect(mocks.modelChat).not.toHaveBeenCalled()
+  })
+
+  it.each(['final resume', 'cover letter', 'source resume', 'persona'] as const)(
+    'does not call the model or issue a receipt when the %s would be truncated', async area => {
+      const final = { id: 'resume_final', parentResumeId: 'resume_base', content: { summary: area === 'final resume' ? 'x'.repeat(12_000) : 'Final' } }
+      const source = { content: { summary: area === 'source resume' ? 'x'.repeat(12_000) : 'Original' } }
+      mocks.resumeFindFirst.mockReset().mockImplementation(async (args: { select?: { content?: boolean } }) => args.select?.content ? source : final)
+      if (area === 'cover letter') mocks.coverLetterFindFirst.mockResolvedValue({ content: 'x'.repeat(8_001) })
+      if (area === 'persona') mocks.buildPersona.mockResolvedValue('x'.repeat(10_001))
+      const { POST } = await import('./route')
+      const response = (await POST(request({ resumeId: 'resume_final', coverLetterId: 'cover_1' }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+      expect(response.status).toBe(422)
+      expect((await response.json()).error).toContain(area === 'persona' ? 'profile' : area)
+      expect(mocks.modelChat).not.toHaveBeenCalled()
+      expect(mocks.completeOperation).not.toHaveBeenCalled()
+      if (area === 'source resume' || area === 'persona') expect(mocks.failOperation).toHaveBeenCalledWith(expect.anything(), { userId: 'user_1', jobId: 'job_1' }, 'fixture-operation')
+      else expect(mocks.registerOperation).not.toHaveBeenCalled()
+    },
+  )
+
+  it('does not expose a passing receipt for an oversized final resume', async () => {
+    const { auditJobBasisHash, auditMaterialBasisHash } = await import('@/lib/application-audit-operation')
+    const job = { role: 'Engineer', company: 'Acme', description: 'Build TypeScript systems.' }
+    const resume = { id: 'resume_final', name: 'Fixture', content: { summary: 'x'.repeat(12_000) }, templateId: null, templateOptions: null }
+    mocks.txResumeFindFirst.mockResolvedValue(resume)
+    mocks.readOperation.mockResolvedValue({ kind: 'completed', operationId: 'fixture-operation', jobBasisHash: auditJobBasisHash(job), materialBasisHash: auditMaterialBasisHash(resume, null),
+      audit: { resumeId: 'resume_final', coverLetterId: null, audit: { verdict: 'pass' } } })
+    const { GET } = await import('./route')
+    const response = await GET(new Request('http://localhost/api/jobs/job_1/audit-application') as never, { params: Promise.resolve({ id: 'job_1' }) })
+    await expect(response.json()).resolves.toEqual({ state: 'stale' })
+  })
+
+  it('requires a fresh review for an older receipt that could have used truncated evidence', async () => {
+    const { auditJobBasisHash } = await import('@/lib/application-audit-operation')
+    const job = { role: 'Engineer', company: 'Acme', description: 'Build TypeScript systems.' }
+    const resume = { id: 'resume_final', name: 'Fixture', content: { summary: 'Current' }, templateId: null, templateOptions: null }
+    const oldPayload = ['applymate.audit-material-basis', 1, [resume.id, resume.name, resume.content, null, null], null]
+    const oldHash = createHash('sha256').update(JSON.stringify(oldPayload)).digest('hex')
+    mocks.txResumeFindFirst.mockResolvedValue(resume)
+    mocks.readOperation.mockResolvedValue({ kind: 'completed', operationId: 'fixture-operation', jobBasisHash: auditJobBasisHash(job), materialBasisHash: oldHash,
+      audit: { resumeId: 'resume_final', coverLetterId: null, audit: { verdict: 'pass' } } })
+    const { GET } = await import('./route')
+    const response = await GET(new Request('http://localhost/api/jobs/job_1/audit-application') as never, { params: Promise.resolve({ id: 'job_1' }) })
+    await expect(response.json()).resolves.toEqual({ state: 'stale' })
   })
 
   it('marks a legacy signed audit stale because its job basis was not signed', async () => {

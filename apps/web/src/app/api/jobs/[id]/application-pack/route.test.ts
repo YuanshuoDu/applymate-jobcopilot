@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { createHash } from 'node:crypto'
 import { auditActivityText as unsignedAuditActivityText, parseStoredApplicationAudit } from '@/lib/application-audit'
 import { signedAuditActivityText, verifyApplicationAuditReceipt } from '@/lib/application-audit-receipt'
 import { AUDIT_ACTIVITY_PREFIX } from '@/lib/application-audit'
@@ -70,6 +71,41 @@ describe('authenticated application ZIP download', () => {
       return verifyApplicationAuditReceipt(scope, stored) ? { kind: 'completed', audit: stored, jobBasisHash: auditJobBasisHash(job), materialBasisHash: auditMaterialBasisHash(auditedResume, stored.coverLetterId ? auditedLetter : null) } : { kind: 'invalid', source: 'legacy' }
     })
     mocks.render.mockResolvedValue({ bytes: new Uint8Array([80, 75, 3, 4]), filename: 'Acme_Engineer_application-pack.zip' })
+  })
+
+  it.each(['resume', 'coverLetter'] as const)('blocks ZIP and print for oversized %s even with a signed passing audit', async area => {
+    if (area === 'resume') {
+      auditedResume = { ...resume, content: { contact: { name: 'x'.repeat(12_000) } } }
+      mocks.resume.mockResolvedValue(auditedResume)
+    } else {
+      auditedLetter = { ...coverLetter, content: 'x'.repeat(8_001) }
+      mocks.coverLetter.mockResolvedValue(auditedLetter)
+    }
+    expect((await invoke()).status).toBe(409)
+    expect((await invokePrint()).status).toBe(409)
+    expect(mocks.render).not.toHaveBeenCalled()
+  })
+
+  it('blocks ZIP and print for an earlier receipt that could have used truncated evidence', async () => {
+    const oldPayload = ['applymate.audit-material-basis', 1,
+      [resume.id, resume.name, resume.content, resume.templateId, resume.templateOptions],
+      [coverLetter.id, coverLetter.content, coverLetter.tone, coverLetter.templateId, coverLetter.templateOptions]]
+    const oldHash = createHash('sha256').update(JSON.stringify(oldPayload)).digest('hex')
+    const activity = parseStoredApplicationAudit(auditActivityText('resume_1', 'letter_1', audit, { resumeUpdatedAt: revision, coverLetterUpdatedAt: revision }))
+    mocks.operation.mockResolvedValue({ kind: 'completed', audit: activity, jobBasisHash: auditJobBasisHash(job), materialBasisHash: oldHash })
+    expect((await invoke()).status).toBe(409)
+    expect((await invokePrint()).status).toBe(409)
+    expect(mocks.render).not.toHaveBeenCalled()
+  })
+
+  it('passes the audited fallback header name to ZIP and displays it in print', async () => {
+    auditedResume = { ...resume, name: 'Fallback Candidate', content: { contact: { name: '' } } }
+    mocks.resume.mockResolvedValue(auditedResume)
+    expect((await invoke()).status).toBe(200)
+    expect(mocks.render).toHaveBeenCalledWith(job, auditedResume, coverLetter, expect.anything())
+    const print = await invokePrint()
+    expect(print.status).toBe(200)
+    expect(await print.text()).toContain('<h1>Fallback Candidate</h1>')
   })
 
   it.each(['pending', 'failed', 'invalid'] as const)('blocks ZIP and print while audit state is %s', async kind => {

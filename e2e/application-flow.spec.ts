@@ -5,6 +5,7 @@ import { randomInt } from 'node:crypto'
 import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { AUDIT_LIMIT_MESSAGES } from '../apps/web/src/lib/application-audit-limits'
 
 // Mounted production components with mocked identity/API responses. This is not
 // proof of authentication, database behavior, Agent execution or real submission.
@@ -181,7 +182,7 @@ async function install(page: Page, options: { stale?: boolean; taskCheckpoint?: 
   const baseListGate = new Promise<void>(resolve => { releaseBaseList = resolve })
   let releaseLetters = () => {}
   const lettersGate = new Promise<void>(resolve => { releaseLetters = resolve })
-  const state = { job: { ...job(), description: job().description as string | null, followUpAt: null as string | null, appliedAt: null as string | null, finalCoverLetterId: options.holdSelectedLetter || options.selectedLetter ? 'selected-letter' : null, finalResumeId: options.firstPreparation ? null : 'resume-1' }, resume: resume(), audit: options.auditCorrection ? { ...audit(), audit: { ...audit().audit, verdict: 'revise', findings: [{ area: 'resume', target: 'summary', severity: 'warning', title: 'Fix summary', evidence: 'Outdated wording', action: 'Apply correction', proposedValue: 'Audited v2 summary' }] } } : audit(options.stale ? '2026-10-29T10:00:00.000Z' : time),
+  const state = { job: { ...job(), description: job().description as string | null, followUpAt: null as string | null, appliedAt: null as string | null, finalCoverLetterId: options.holdSelectedLetter || options.selectedLetter ? 'selected-letter' : null, finalResumeId: options.firstPreparation ? null : 'resume-1' }, resume: resume(), audit: options.auditCorrection ? { ...audit(), audit: { ...audit().audit, verdict: 'needs_review', findings: [{ area: 'resume', target: 'summary', severity: 'warning', title: 'Fix summary', evidence: 'Outdated wording', action: 'Apply correction', proposedValue: 'Audited v2 summary' }] } } : audit(options.stale ? '2026-10-29T10:00:00.000Z' : time),
     secondResume: { ...resume(), id: 'resume-2', name: 'Second fixture resume', targetJobId: null as string | null, content: { ...resume().content, summary: 'Second resume content.' } },
     answeredJobA: false, saveResponses: 0, packRequests: 0, armReturnOwnerA: false, returnOwnerAEntered: false, releaseReturnOwnerA, manualPosted: false, manualReadAvailable: false, hideResumeOnExport: false, malformedPreview: options.malformedPreview ?? null, selectedLetterAvailable: false, failNextDescriptionAudit: false, descriptionWriteStarted: false, otherJobUpdateStarted: false, releaseDescription, releaseOtherJobUpdate, savedBase: null as (Omit<ReturnType<typeof resume>, 'targetJobId'> & { targetJobId: string | null }) | null, baseSaveStarted: false, releaseBaseSave, baseListReads: 0, releaseBaseList, invalidLetter: options.letterInvalid ?? null, probeLetterReads: 0, selectedLetterReads: 0, changeLetterOnRead: false, auditStarted: false, assignStarted: false, releaseAudit, releaseAssign, releaseProbeLetter, fontRequests: [] as string[], activeUserId: 'fixture-user', agentStage: 'question' as 'question' | 'approval' | 'running' | 'unknown', requestOwners: [] as Array<{ path: string; method: string; userId: string }>, agentRequests: [] as Array<{ path: string; method: string; body?: unknown }>, writes: [] as Array<{ path: string; body: unknown }>, analysisRequests: [] as string[], analysisBodies: [] as unknown[], analysisCalls: [] as Array<{ path: string; body: unknown }>, unexpected: [] as string[], taskReads: 0, staleJobRequested: false, staleJobReturned: false, releaseStaleJob, taskStatusOverride: null as 'waiting_for_authorization' | null, firstTaskReadFinished: false, releaseFirstTaskRead, letterRequested: false, resumeContentRequested: false, releaseLetters, releaseSave, releaseResumeContent, releaseOldAnalysis, releaseAuditCorrection, releaseVersionRestore }
   if (options.descriptionMode) state.job.description = options.initialDescription === undefined ? '' : options.initialDescription
@@ -421,6 +422,43 @@ test.beforeEach(async ({ page }, testInfo) => {
 test.afterEach(async ({ page }, testInfo) => {
   if (testInfo.status === 'passed') await page.screenshot({ path: testInfo.outputPath('mounted-success.png'), fullPage: true })
 })
+
+for (const scenario of [
+  { reason: 'final_resume_too_long', en: 'The selected resume is too long to review in full. Shorten this version while keeping the facts accurate, then review it again.', zh: '所选简历内容过长，无法完整审核。请在保留真实事实的前提下精简此版本，然后重新审核。' },
+  { reason: 'cover_letter_too_long', en: 'The selected cover letter is too long to review in full. Shorten it while keeping the facts accurate, then review it again.', zh: '所选求职信内容过长，无法完整审核。请在保留真实事实的前提下精简，然后重新审核。' },
+  { reason: 'source_resume_too_long', en: 'The source resume is too long to review in full. Check whether other applications use it, then shorten it while keeping the facts accurate and review again.', zh: '作为依据的原始简历内容过长，无法完整审核。请先确认它是否用于其他申请，再在保留真实事实的前提下精简并重新审核。' },
+  { reason: 'persona_too_long', en: 'The confirmed profile information is too long to review in full. Check for irrelevant or repeated details, retain accurate facts, then review again.', zh: '已确认的职业资料内容过长，无法完整审核。请检查无关或重复内容，保留真实事实后重新审核。' },
+  { reason: 'invalid_content', en: 'The review content could not be read. Check the selected materials, then try the review again.', zh: '无法读取审核内容。请检查所选材料，然后重新审核。' },
+] as const) for (const surface of ['jobs', 'resume'] as const) {
+  test(`audit limit ${scenario.reason} gives ${surface} guidance without retry`, async ({ page }, testInfo) => {
+    test.skip(!['desktop-en', 'mobile-zh'].includes(testInfo.project.name), 'Checks English desktop and Chinese mobile')
+    const state = await install(page, { stale: true })
+    let auditPosts = 0
+    await page.route('**/api/jobs/outside-page/audit-application', async route => {
+      if (route.request().method() !== 'POST') return route.fallback()
+      auditPosts++
+      return route.fulfill({ status: 422, json: { error: AUDIT_LIMIT_MESSAGES[scenario.reason] } })
+    })
+    if (surface === 'jobs') {
+      await open(page)
+      await page.getByRole('button', { name: /Check current materials|检查当前材料/, exact: true }).click()
+    } else {
+      await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+      await expect(page.locator('.resume-opportunity-card')).toContainText('Application flow engineer')
+      await page.getByRole('button', { name: /Run independent audit|Run audit again|运行独立审核|再次运行审核/ }).click()
+    }
+    const expected = testInfo.project.name === 'mobile-zh' ? scenario.zh : scenario.en
+    await expect(page.getByText(expected, { exact: true }).first()).toBeVisible()
+    if (surface === 'resume') await expect(page.locator('.resume-audit-card-error')).toHaveText(expected)
+    await expect(page).toHaveURL(/outside-page/)
+    await expect(page.getByRole('button', { name: /Download application materials|下载申请材料/ })).toHaveCount(0)
+    await expect(page.getByText(/Application materials are ready|申请材料已准备好/, { exact: true })).toHaveCount(0)
+    expect(auditPosts).toBe(1)
+    expect(state.writes.filter(write => write.path.endsWith('/assign'))).toEqual([])
+    expect(state.packRequests).toBe(0)
+    expect(state.unexpected).toEqual([])
+  })
+}
 
 test('a failed jobs refresh shows an error and retry restores the list', async ({ page }) => {
   const state = await install(page, { descriptionMode: 'two' })
@@ -2346,7 +2384,7 @@ test('a newly failed audit cannot reuse an older passing receipt for the same ve
     if (route.request().method() !== 'POST') return route.fallback()
     const body = route.request().postDataJSON()
     state.writes.push({ path: '/api/jobs/outside-page/audit-application', body })
-    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...state.audit.audit, verdict: 'revise', summary: 'New audit found an issue', findings: [{ area: 'resume', severity: 'warning', title: 'Verify this', evidence: 'Missing support', action: 'Review' }], resumeUpdatedAt: state.resume.updatedAt }) })
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...state.audit.audit, verdict: 'needs_review', summary: 'New audit found an issue', findings: [{ area: 'resume', severity: 'warning', title: 'Verify this', evidence: 'Missing support', action: 'Review' }], resumeUpdatedAt: state.resume.updatedAt }) })
   })
   await open(page)
   const prepare = page.getByRole('button', { name: /Check current materials|检查当前材料/, exact: true })
@@ -2378,7 +2416,7 @@ test('an older audit read cannot overwrite another tab’s newer audit', async (
   const other = await context.newPage()
   await other.route('**/api/jobs/outside-page/audit-application', async route => {
     if (route.request().method() !== 'POST') return route.fallback()
-    state.audit = { ...state.audit, audit: { ...state.audit.audit, verdict: 'revise', summary: 'Newer audit', findings: [{ area: 'resume', severity: 'warning', title: 'Verify this', evidence: 'Missing support', action: 'Review' }] } } as typeof state.audit
+    state.audit = { ...state.audit, audit: { ...state.audit.audit, verdict: 'needs_review', summary: 'Newer audit', findings: [{ area: 'resume', severity: 'warning', title: 'Verify this', evidence: 'Missing support', action: 'Review' }] } } as typeof state.audit
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(state.audit.audit) })
   })
   try {
@@ -4041,6 +4079,7 @@ test('a rejected manual record stays blocked when refresh fails or finds a later
 })
 
 test('a stalled manual recording becomes unknown and can be checked without a second POST', async ({ page }) => {
+  await page.clock.install()
   const state = await install(page)
   let release = () => {}
   const gate = new Promise<void>(resolve => { release = resolve })
@@ -4054,6 +4093,10 @@ test('a stalled manual recording becomes unknown and can be checked without a se
     await open(page)
     await page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ }).click()
     const refresh = page.getByRole('button', { name: /Refresh record status|刷新记录状态/ })
+    await expect.poll(() => posts).toBe(1)
+    await expect(refresh).toBeDisabled()
+    expect(await page.evaluate(() => sessionStorage.getItem('applymate:manual-record:fixture-user:outside-page'))).toBe('pending')
+    await page.clock.fastForward(15_001)
     await expect(refresh).toBeEnabled({ timeout: 25_000 })
     expect(await page.evaluate(() => sessionStorage.getItem('applymate:manual-record:fixture-user:outside-page'))).toBe('unknown')
     await refresh.click()
@@ -4066,6 +4109,7 @@ test('a stalled manual recording becomes unknown and can be checked without a se
 })
 
 test('a stalled record-status read returns control without accepting a late response', async ({ page }) => {
+  await page.clock.install()
   const state = await install(page, { manualOutcome: 'unknown' })
   let release = () => {}
   const gate = new Promise<void>(resolve => { release = resolve })
@@ -4085,6 +4129,9 @@ test('a stalled record-status read returns control without accepting a late resp
     holdRead = true
     await refresh.click()
     await expect.poll(() => entered).toBe(true)
+    await expect(refresh).toBeDisabled()
+    expect(await page.evaluate(() => sessionStorage.getItem('applymate:manual-record:fixture-user:outside-page'))).toBe('unknown')
+    await page.clock.fastForward(15_001)
     await expect(refresh).toBeEnabled({ timeout: 25_000 })
     release()
     await expect(page.getByText(/A submission record exists, but this request is still unconfirmed|已有提交记录，但仍无法确认是否由本次请求产生/)).toHaveCount(0)

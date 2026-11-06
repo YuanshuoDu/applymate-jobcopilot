@@ -17,6 +17,7 @@ import { useI18n } from '@/lib/i18n'
 import { applicationListUrl, loadLinkedApplication, readApplicationListState } from '@/lib/application-list-state'
 import { AUDIT_ACTIVITY_PREFIX, hasCurrentApplicationPackAudit, type StoredApplicationAudit } from '@/lib/application-audit'
 import { parseApplicationAuditView } from '@/lib/application-audit-view'
+import { auditLimitMessageKey } from '@/lib/application-audit-limit-message'
 import { useApplicationTasks } from '@/components/jobs/useApplicationTasks'
 import { useApplicationCoverLetters } from '@/components/jobs/useApplicationCoverLetters'
 import { ApplicationProgress } from '@/components/jobs/application-progress'
@@ -1186,7 +1187,10 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
         if (!isCurrentDrawer(owner)) return
         if (!checkedLetter) return
       }
-      if (!audit || auditError) throw new Error(auditError ?? 'Independent audit could not run')
+      if (!audit || auditError) {
+        const limitKey = auditLimitMessageKey(auditError)
+        throw new Error(limitKey ? t(limitKey) : auditError ?? 'Independent audit could not run')
+      }
       if (audit.resumeUpdatedAt !== tailored.updatedAt || (coverLetter
         ? audit.coverLetterUpdatedAt !== coverLetter.updatedAt
         : audit.coverLetterUpdatedAt != null)) {

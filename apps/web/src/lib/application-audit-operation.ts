@@ -60,7 +60,9 @@ export function auditMaterialBasisHash(resume: AuditMaterialResume, coverLetter:
       || typeof coverLetter.tone !== 'string' || !(coverLetter.templateId === null || typeof coverLetter.templateId === 'string') || coverLetter.templateOptions === undefined))) {
     throw new Error('Incomplete audit material basis')
   }
-  const payload = ['applymate.audit-material-basis', 1,
+  // Version 2 invalidates earlier receipts whose model prompt could have
+  // silently truncated the evidence or final documents.
+  const payload = ['applymate.audit-material-basis', 2,
     [resume.id, resume.name, resume.content, resume.templateId, resume.templateOptions],
     coverLetter === null ? null : [coverLetter.id, coverLetter.content, coverLetter.tone, coverLetter.templateId, coverLetter.templateOptions]]
   return createHash('sha256').update(JSON.stringify(canonicalJson(payload))).digest('hex')

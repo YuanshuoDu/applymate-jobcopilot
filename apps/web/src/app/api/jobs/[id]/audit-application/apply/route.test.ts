@@ -246,6 +246,38 @@ describe('POST /api/jobs/[id]/audit-application/apply', () => {
     expect(mocks.buildPersona).toHaveBeenCalledWith('user_1', 'tailor')
   })
 
+  it('does not write a generated replacement that would be truncated', async () => {
+    await seedCurrentAudit(audit({ findings: [{
+      area: 'resume', severity: 'warning', resolution: 'evidence_needed', target: 'summary',
+      title: 'Unsupported summary', evidence: 'Not confirmed.', action: 'Use supported wording.',
+    }] }))
+    mocks.modelChat.mockResolvedValue({ text: JSON.stringify({ proposedValue: 'x'.repeat(12_001) }) })
+    const { POST } = await import('./route')
+    const response = (await POST(request({ resumeId: 'resume_final', findingIndex: 0 }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    expect(response.status).toBe(502)
+    expect(mocks.resumeUpdate).not.toHaveBeenCalled()
+    expect(mocks.resumeVersionCreate).not.toHaveBeenCalled()
+    expect(mocks.coverLetterUpdate).not.toHaveBeenCalled()
+  })
+
+  it.each(['source', 'persona'] as const)('does not generate a replacement when %s evidence would be truncated', async area => {
+    const storedAudit = audit({ findings: [{
+      area: 'resume', severity: 'warning', resolution: 'evidence_needed', target: 'summary',
+      title: 'Unsupported summary', evidence: 'Not confirmed.', action: 'Use supported wording.',
+    }] })
+    await seedCurrentAudit(storedAudit)
+    mocks.resumeFindFirst.mockImplementation(async (args: { select?: { content?: boolean } }) =>
+      args.select?.content ? { content: { summary: area === 'source' ? 'x'.repeat(12_000) : 'Source' } } : resumeRow)
+    if (area === 'persona') mocks.buildPersona.mockResolvedValue('x'.repeat(10_001))
+    const { POST } = await import('./route')
+    const response = (await POST(request({ resumeId: 'resume_final', coverLetterId: null, findingIndex: 0 }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    expect(response.status).toBe(422)
+    expect((await response.json()).error).toContain(area === 'source' ? 'source resume' : 'profile')
+    expect(mocks.modelChat).not.toHaveBeenCalled()
+    expect(mocks.resumeUpdate).not.toHaveBeenCalled()
+    expect(mocks.resumeVersionCreate).not.toHaveBeenCalled()
+  })
+
   it('does not write a correction or resume history when a new audit supersedes it', async () => {
     await seedCurrentAudit(audit())
     const normalLock = mocks.withLock.getMockImplementation()!
