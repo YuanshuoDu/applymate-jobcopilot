@@ -47,6 +47,43 @@ const loopErrorCategories = new Set([
 function loopErrorCategory(errorCode) {
   return errorCode == null ? "none" : loopErrorCategories.has(errorCode) ? errorCode : "other"
 }
+const boundedLoopDiagnosticModes = new Set(["worker-b-loop-usage-lineage-cut", "worker-b-loop-usage-lineage-reject"])
+const maxBoundedLoopDiagnosticStages = 64
+const boundedLoopDiagnosticStages = new Set([
+  "durable_wait_loader", "child_attempt_resume_loader", "restored_wait_validation", "execution_loop_recovery",
+  "step_start", "step_started_event", "context_build", "agenda_build", "agenda_persist", "model_request",
+  "model_started_event", "claim_recovery_loader", "live_resume_check", "persisted_cut_state", "next_step_state",
+  "model_invocation", "usage_lineage_cut", "loop_result",
+])
+const boundedLoopDiagnosticPhases = new Set(["start", "pass", "fail"])
+const boundedLiveResumeClasses = new Set(["live_resume_expected_lineage", "other"])
+let liveResumeClass = "other"
+let currentLoopDiagnosticStage = "durable_wait_loader"
+let currentLoopDiagnosticPhase = "start"
+let loopDiagnosticStageCount = 0
+let loopDiagnosticLimitReported = false
+function traceLoopStage(stage, phase) {
+  if (!boundedLoopDiagnosticModes.has(mode)) return
+  const safeStage = boundedLoopDiagnosticStages.has(stage) ? stage : "other"
+  const safePhase = boundedLoopDiagnosticPhases.has(phase) ? phase : "fail"
+  currentLoopDiagnosticStage = safeStage
+  currentLoopDiagnosticPhase = safePhase
+  if (loopDiagnosticStageCount >= maxBoundedLoopDiagnosticStages) {
+    if (!loopDiagnosticLimitReported) {
+      loopDiagnosticLimitReported = true
+      say(`WORKER_B_LOOP_STAGE_LIMIT ${JSON.stringify({ overflow: true, emitted: maxBoundedLoopDiagnosticStages })}`)
+    }
+    return
+  }
+  loopDiagnosticStageCount += 1
+  say(`WORKER_B_LOOP_STAGE ${JSON.stringify({ stage: safeStage, phase: safePhase, liveResume: liveResumeClass })}`)
+}
+function traceLiveResumeClass(value) {
+  liveResumeClass = boundedLiveResumeClasses.has(value) ? value : "other"
+}
+function traceLoopFailure() {
+  traceLoopStage(currentLoopDiagnosticStage, "fail")
+}
 const waitAcknowledgementFailureReasons = new Map([
   ["Session is unavailable for resume acknowledgement", "session_unavailable"],
   ["Child task is unavailable for resume acknowledgement", "task_unavailable"],
@@ -263,6 +300,24 @@ function executionStore(owner, hooks = {}) {
     const write = () => turnStore[method]({ ...rest, owner: identity })
     const before = method === "appendEvent" ? hooks.beforeAppendEvent
       : method === "updateItem" ? hooks.beforeUpdateItem : undefined
+    const stage = method === "appendEvent" && input.type === "step.started" ? "step_started_event"
+      : method === "appendEvent" && input.type === "cognitive.agenda" ? "agenda_persist"
+        : method === "appendEvent" && input.type === "model.started" ? "model_started_event" : null
+    if (stage) return (async () => {
+      if (stage === "agenda_persist") traceLoopStage("agenda_build", "pass")
+      if (stage === "model_started_event") traceLoopStage("model_request", "pass")
+      traceLoopStage(stage, "start")
+      try {
+        if (before) await before(input)
+        const result = await write()
+        traceLoopStage(stage, "pass")
+        if (stage === "agenda_persist") traceLoopStage("model_request", "start")
+        return result
+      } catch (error) {
+        if (currentLoopDiagnosticPhase !== "fail") traceLoopStage(stage, "fail")
+        throw error
+      }
+    })()
     return before ? Promise.resolve(before(input)).then(write) : write()
   }
   return {
@@ -315,10 +370,21 @@ function loopFixtureModel(reply) {
     id: "durable-child-wait-fixture-model",
     profile: loopFixtureModelProfile,
     async *stream(request) {
+      traceLoopStage("model_invocation", "start")
       const stepId = request.metadata?.stepId
-      if (typeof stepId !== "string" || !stepId) throw new Error("fixture_model_step_id_missing")
+      if (typeof stepId !== "string" || !stepId) {
+        traceLoopStage("model_invocation", "fail")
+        throw new Error("fixture_model_step_id_missing")
+      }
       invocations.push(stepId)
-      const response = await reply({ request, stepId, invocation: invocations.length })
+      let response
+      try {
+        response = await reply({ request, stepId, invocation: invocations.length })
+        traceLoopStage("model_invocation", "pass")
+      } catch (error) {
+        traceLoopStage("model_invocation", "fail")
+        throw error
+      }
       const usage = response.usage ?? { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }
       yield { type: "usage", ...usage, provider: "fixture", model: "durable-child-wait-fixture" }
       for (const call of response.toolCalls ?? []) {
@@ -335,6 +401,7 @@ async function runChildWaitLoop(lease, restored, responseForStep, hooks = {}) {
   const owner = executionOwnerFence({ kind: "task", lease })
   const wait = restored?.durableWait
   if (!wait) throw new Error("fixture_child_wait_loop_resume_missing")
+  traceLoopStage("execution_loop_recovery", "start")
   const replay = createChildDurableWaitReplay(lease, wait, restored.observations, restored.childWaitClaimRecovery)
   let executorCalls = 0, dispatcherCalls = 0
   const fixtureModel = loopFixtureModel(responseForStep)
@@ -380,7 +447,39 @@ async function runChildWaitLoop(lease, restored, responseForStep, hooks = {}) {
         }
       }, step => replay.acknowledgeContinuation(step))
   }
+  const startStep = options.store.startStep
+  options.store = { ...options.store, startStep: async input => {
+    traceLoopStage("execution_loop_recovery", "pass")
+    traceLoopStage("step_start", "start")
+    try {
+      const step = await startStep(input)
+      traceLoopStage("step_start", "pass")
+      return step
+    } catch (error) {
+      traceLoopStage("step_start", "fail")
+      throw error
+    }
+  } }
+  const buildContext = options.contextBuilder.build
+  options.contextBuilder = { ...options.contextBuilder, build: async input => {
+    traceLoopStage("context_build", "start")
+    try {
+      const context = await buildContext(input)
+      traceLoopStage("context_build", "pass")
+      traceLoopStage("agenda_build", "start")
+      return context
+    } catch (error) {
+      traceLoopStage("context_build", "fail")
+      throw error
+    }
+  } }
   const result = await runTurnExecutionLoop(options)
+  if (result.status === "failed") {
+    if (currentLoopDiagnosticPhase !== "fail") traceLoopStage(currentLoopDiagnosticStage, "fail")
+  } else {
+    traceLoopStage("loop_result", "start")
+    traceLoopStage("loop_result", "pass")
+  }
   return { result, invocations: fixtureModel.invocations, executorCalls, dispatcherCalls }
 }
 
@@ -467,10 +566,23 @@ async function seedLegacyConsumedWait(lease, stopBeforeModel = false) {
 
 async function resumeChildThroughLoop(lease, phase, preloadedRestored) {
   const now = new Date()
-  const pendingWait = preloadedRestored ? undefined : await loadDurableSubagentWaitResume(pool, lease, now)
+  traceLoopStage("durable_wait_loader", "start")
+  let pendingWait
+  try {
+    pendingWait = preloadedRestored ? undefined : await loadDurableSubagentWaitResume(pool, lease, now)
+    traceLoopStage("durable_wait_loader", "pass")
+  } catch (error) {
+    traceLoopStage("durable_wait_loader", "fail")
+    throw error
+  }
   let restored
-  try { restored = preloadedRestored ?? await loadChildAttemptResume(pool, lease, now, pendingWait) }
+  traceLoopStage("child_attempt_resume_loader", "start")
+  try {
+    restored = preloadedRestored ?? await loadChildAttemptResume(pool, lease, now, pendingWait)
+    traceLoopStage("child_attempt_resume_loader", "pass")
+  }
   catch (error) {
+    traceLoopStage("child_attempt_resume_loader", "fail")
     if (phase === "multi-reject") {
       say(`WORKER_B_LOOP_MULTI_REJECTED ${JSON.stringify({ error: error?.message ?? String(error), modelCalls: 0, executorCalls: 0, dispatcherCalls: 0 })}`)
       return { status: "failed", failureReason: error?.message ?? "child_resume_wait_tool_call_conflict", retryDisposition: "terminal" }
@@ -481,7 +593,12 @@ async function resumeChildThroughLoop(lease, phase, preloadedRestored) {
     }
     throw error
   }
-  if (!restored?.durableWait) throw new Error("fixture_child_wait_loop_durable_wait_missing")
+  traceLoopStage("restored_wait_validation", "start")
+  if (!restored?.durableWait) {
+    traceLoopStage("restored_wait_validation", "fail")
+    throw new Error("fixture_child_wait_loop_durable_wait_missing")
+  }
+  traceLoopStage("restored_wait_validation", "pass")
   const wait = restored.durableWait
   const owner = executionOwnerFence({ kind: "task", lease })
   const recovery = restored.childWaitOrphanRecovery ?? restored.childWaitClaimRecovery
@@ -530,57 +647,86 @@ async function resumeChildThroughLoop(lease, phase, preloadedRestored) {
       && event.correlationId === `task:${lease.id}:step:${logicalStepOrdinal + 1}:attempt:${lease.attemptCount}`) {
       const completedStepId = recovery.stepId
       const nextStepId = event.correlationId
-      const claimClient = await pool.connect()
       let claimRecovery
+      traceLoopStage("claim_recovery_loader", "start")
       try {
-        await claimClient.query("BEGIN")
-        await claimClient.query("SELECT set_config($1, $2, true)", ["app.user_id", lease.userId])
-        claimRecovery = await loadChildWaitCallRecovery(claimClient, lease, wait)
-        await claimClient.query("COMMIT")
+        const claimClient = await pool.connect()
+        try {
+          await claimClient.query("BEGIN")
+          await claimClient.query("SELECT set_config($1, $2, true)", ["app.user_id", lease.userId])
+          claimRecovery = await loadChildWaitCallRecovery(claimClient, lease, wait)
+          await claimClient.query("COMMIT")
+        } catch (error) {
+          await claimClient.query("ROLLBACK").catch(() => undefined)
+          throw error
+        } finally { claimClient.release() }
+        traceLoopStage("claim_recovery_loader", "pass")
       } catch (error) {
-        await claimClient.query("ROLLBACK").catch(() => undefined)
+        traceLoopStage("claim_recovery_loader", "fail")
         throw error
-      } finally { claimClient.release() }
+      }
       if (!claimRecovery?.claim || claimRecovery.claim.stepStatus !== "completed"
         || claimRecovery.claim.modelUsage.estimatedCostUsd !== highPrecisionWaitModelCostUsd) {
+        traceLoopStage("claim_recovery_loader", "fail")
         throw new Error("fixture_pg_claim_loader_did_not_accept_rounded_usage")
       }
       let liveResumeError = null
+      traceLoopStage("live_resume_check", "start")
       try { await loadChildAttemptResume(pool, lease, new Date(), wait) }
       catch (error) { liveResumeError = error?.message ?? String(error) }
+      const liveResumeExpected = liveResumeError === "child_resume_wait_step_lineage"
+      traceLiveResumeClass(liveResumeExpected ? "live_resume_expected_lineage" : "other")
+      traceLoopStage("live_resume_check", liveResumeExpected ? "pass" : "fail")
       if (liveResumeError !== "child_resume_wait_step_lineage") {
         throw new Error(`fixture_live_step2_lineage_not_rejected:${liveResumeError ?? "no_error"}`)
       }
-      const [stepState, usageState, callState] = await Promise.all([
-        pool.query(`SELECT "status", "ordinal", "inputTokens", "outputTokens", "estimatedCostUsd"::text AS "estimatedCostUsd"
-          FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = $4`,
-        [lease.sessionId, lease.turnId, lease.id, completedStepId]),
-        pool.query(`SELECT "payload"->'usage'->>'estimatedCostUsd' AS "receiptCost" FROM "agent_events"
-          WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "correlationId" = $4 AND "type" = 'model.usage'`,
-        [lease.sessionId, lease.turnId, lease.id, completedStepId]),
-        pool.query(`SELECT
-            (SELECT COUNT(*)::int FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
-              AND "idempotencyKey" = $4) AS "claimCount",
-            (SELECT COUNT(*)::int FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
-              AND "stepId" = $5 AND "type" = 'tool_result' AND "content"->>'toolCallId' = $6) AS "resultCount",
-            (SELECT COUNT(*)::int FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
-              AND "correlationId" = $7 AND "type" = 'model.started') AS "nextModelStartCount"`,
-        [lease.sessionId, lease.turnId, lease.id, expectedClaimKey, completedStepId, recovery.call.id, nextStepId]),
-      ])
-      const completed = stepState.rows[0]
-      const receipt = usageState.rows[0]
-      const lifecycle = callState.rows[0]
-      if (!completed || completed.status !== "completed" || completed.inputTokens !== 37 || completed.outputTokens !== 13
-        || completed.estimatedCostUsd !== "0.12345679" || receipt?.receiptCost !== "0.123456789"
-        || lifecycle?.claimCount !== 1 || lifecycle?.resultCount !== 1 || lifecycle?.nextModelStartCount !== 0) {
-        throw new Error("fixture_rounded_usage_lineage_cut_state_invalid")
+      let completed, receipt, lifecycle
+      traceLoopStage("persisted_cut_state", "start")
+      try {
+        const [stepState, usageState, callState] = await Promise.all([
+          pool.query(`SELECT "status", "ordinal", "inputTokens", "outputTokens", "estimatedCostUsd"::text AS "estimatedCostUsd"
+            FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = $4`,
+          [lease.sessionId, lease.turnId, lease.id, completedStepId]),
+          pool.query(`SELECT "payload"->'usage'->>'estimatedCostUsd' AS "receiptCost" FROM "agent_events"
+            WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "correlationId" = $4 AND "type" = 'model.usage'`,
+          [lease.sessionId, lease.turnId, lease.id, completedStepId]),
+          pool.query(`SELECT
+              (SELECT COUNT(*)::int FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+                AND "idempotencyKey" = $4) AS "claimCount",
+              (SELECT COUNT(*)::int FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+                AND "stepId" = $5 AND "type" = 'tool_result' AND "content"->>'toolCallId' = $6) AS "resultCount",
+              (SELECT COUNT(*)::int FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+                AND "correlationId" = $7 AND "type" = 'model.started') AS "nextModelStartCount"`,
+          [lease.sessionId, lease.turnId, lease.id, expectedClaimKey, completedStepId, recovery.call.id, nextStepId]),
+        ])
+        completed = stepState.rows[0]
+        receipt = usageState.rows[0]
+        lifecycle = callState.rows[0]
+        if (!completed || completed.status !== "completed" || completed.inputTokens !== 37 || completed.outputTokens !== 13
+          || completed.estimatedCostUsd !== "0.12345679" || receipt?.receiptCost !== "0.123456789"
+          || lifecycle?.claimCount !== 1 || lifecycle?.resultCount !== 1 || lifecycle?.nextModelStartCount !== 0) {
+          throw new Error("fixture_rounded_usage_lineage_cut_state_invalid")
+        }
+        traceLoopStage("persisted_cut_state", "pass")
+      } catch (error) {
+        traceLoopStage("persisted_cut_state", "fail")
+        throw error
       }
-      const nextStep = await pool.query(`SELECT "status", "ordinal" FROM "agent_steps"
-        WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = $4`,
-      [lease.sessionId, lease.turnId, lease.id, nextStepId])
-      if (nextStep.rows[0]?.status !== "streaming" || nextStep.rows[0]?.ordinal !== 3) {
-        throw new Error("fixture_rounded_usage_next_step_not_streaming")
+      traceLoopStage("next_step_state", "start")
+      let nextStep
+      try {
+        nextStep = await pool.query(`SELECT "status", "ordinal" FROM "agent_steps"
+          WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = $4`,
+        [lease.sessionId, lease.turnId, lease.id, nextStepId])
+        if (nextStep.rows[0]?.status !== "streaming" || nextStep.rows[0]?.ordinal !== 3) {
+          throw new Error("fixture_rounded_usage_next_step_not_streaming")
+        }
+        traceLoopStage("next_step_state", "pass")
+      } catch (error) {
+        traceLoopStage("next_step_state", "fail")
+        throw error
       }
+      traceLoopStage("usage_lineage_cut", "pass")
       say(`WORKER_B_LOOP_ROUNDED_USAGE_LINEAGE_CUT ${JSON.stringify({ callId: recovery.call.id,
         completedStepId, completedStepStatus: completed.status, physicalStepOrdinal: completed.ordinal,
         persistedCostUsd: completed.estimatedCostUsd, receiptCostUsd: receipt.receiptCost,
@@ -993,10 +1139,16 @@ async function resumeChild(lease, crashBeforeWaitAck = false, crashAfterWaitAck 
 async function stop(code) {
   if (stopped) return
   stopped = true
-  try { await resolver?.close() } catch (error) { process.stderr.write(`resolver_close_failed:${String(error)}\n`) }
-  try { await worker.close() } catch (error) { process.stderr.write(`worker_close_failed:${String(error)}\n`) }
+  try { await resolver?.close() } catch (error) {
+    if (!boundedLoopDiagnosticModes.has(mode)) process.stderr.write(`resolver_close_failed:${String(error)}\n`)
+  }
+  try { await worker.close() } catch (error) {
+    if (!boundedLoopDiagnosticModes.has(mode)) process.stderr.write(`worker_close_failed:${String(error)}\n`)
+  }
   try { await redis.quit() } catch { redis.disconnect() }
-  try { await pool.end() } catch (error) { process.stderr.write(`pool_close_failed:${String(error)}\n`) }
+  try { await pool.end() } catch (error) {
+    if (!boundedLoopDiagnosticModes.has(mode)) process.stderr.write(`pool_close_failed:${String(error)}\n`)
+  }
   process.exit(code)
 }
 
@@ -1034,7 +1186,8 @@ const worker = new Worker(queueName, async job => {
   const executeWithDiagnostics = async input => {
     try { return await execute(input) }
     catch (error) {
-      if (crashCutModes.has(mode)) process.stderr.write(`CRASH_CUT_EXECUTOR_ERROR ${JSON.stringify({ mode, ...boundedErrorDetails(error) })}\n`)
+      if (boundedLoopDiagnosticModes.has(mode)) traceLoopFailure()
+      else if (crashCutModes.has(mode)) process.stderr.write(`CRASH_CUT_EXECUTOR_ERROR ${JSON.stringify({ mode, ...boundedErrorDetails(error) })}\n`)
       throw error
     }
   }
@@ -1045,7 +1198,8 @@ const worker = new Worker(queueName, async job => {
 worker.on("completed", (job, result) => {
   void (async () => {
     if (job.data.taskId !== ids.waiterTaskId) {
-      process.stderr.write(`UNEXPECTED_COMPLETED_SUBAGENT_TASK ${JSON.stringify({ taskId: job.data.taskId })}\n`)
+      if (boundedLoopDiagnosticModes.has(mode)) traceLoopStage("other", "fail")
+      else process.stderr.write(`UNEXPECTED_COMPLETED_SUBAGENT_TASK ${JSON.stringify({ taskId: job.data.taskId })}\n`)
       await stop(1)
       return
     }
@@ -1074,16 +1228,19 @@ worker.on("completed", (job, result) => {
           return
         }
       } catch (error) {
-        process.stderr.write(`STALE_DISPATCH_LOOKUP_FAILED ${JSON.stringify({ code: typeof error?.code === "string" ? error.code : "unknown" })}\n`)
+        if (boundedLoopDiagnosticModes.has(mode)) traceLoopStage("other", "fail")
+        else process.stderr.write(`STALE_DISPATCH_LOOKUP_FAILED ${JSON.stringify({ code: typeof error?.code === "string" ? error.code : "unknown" })}\n`)
         await stop(1)
         return
       }
-      process.stderr.write(`UNEXPECTED_DISPATCH_IDENTITY_MISMATCH ${JSON.stringify({ taskId: job.data.taskId, dispatchGeneration })}\n`)
+      if (boundedLoopDiagnosticModes.has(mode)) traceLoopStage("other", "fail")
+      else process.stderr.write(`UNEXPECTED_DISPATCH_IDENTITY_MISMATCH ${JSON.stringify({ taskId: job.data.taskId, dispatchGeneration })}\n`)
       await stop(1)
       return
     }
     if (crashCutModes.has(mode)) {
-      process.stderr.write(`UNEXPECTED_CRASH_CUT_COMPLETION ${JSON.stringify({ mode, result, taskId: ids.waiterTaskId })}\n`)
+      if (boundedLoopDiagnosticModes.has(mode)) traceLoopFailure()
+      else process.stderr.write(`UNEXPECTED_CRASH_CUT_COMPLETION ${JSON.stringify({ mode, result, taskId: ids.waiterTaskId })}\n`)
       await stop(1)
       return
     }
@@ -1093,19 +1250,21 @@ worker.on("completed", (job, result) => {
       markerResult.failureReasonCategory = typeof result?.failureReason !== "string" ? "missing"
         : workerFailureReasonCategories.has(result.failureReason) ? result.failureReason : "other"
     }
-    const markerPayload = mode === "worker-a"
+    const markerPayload = mode === "worker-a" || boundedLoopDiagnosticModes.has(mode)
       ? { result: markerResult }
       : { result, taskId: ids.waiterTaskId, dispatchGeneration }
     say(`${marker} ${JSON.stringify(markerPayload)}`)
     await stop(0)
   })().catch(error => {
-    process.stderr.write(`UNEXPECTED_COMPLETION_HANDLER_ERROR ${JSON.stringify({ code: typeof error?.code === "string" ? error.code : "unknown" })}\n`)
+    if (boundedLoopDiagnosticModes.has(mode)) traceLoopStage("other", "fail")
+    else process.stderr.write(`UNEXPECTED_COMPLETION_HANDLER_ERROR ${JSON.stringify({ code: typeof error?.code === "string" ? error.code : "unknown" })}\n`)
     void stop(1)
   })
 })
 worker.on("failed", (job, error) => {
   if (job?.data.taskId !== ids.waiterTaskId) return
-  process.stderr.write(`WORKER_FAILED ${error.message}\n`)
+  if (boundedLoopDiagnosticModes.has(mode)) traceLoopFailure()
+  else process.stderr.write(`WORKER_FAILED ${error.message}\n`)
   void stop(1)
 })
 
@@ -1149,6 +1308,7 @@ try {
     })
   }
 } catch (error) {
-  process.stderr.write(`WORKER_START_FAILED ${String(error)}\n`)
+  if (boundedLoopDiagnosticModes.has(mode)) traceLoopStage("other", "fail")
+  else process.stderr.write(`WORKER_START_FAILED ${String(error)}\n`)
   await stop(1)
 }

@@ -42,6 +42,17 @@ const REISSUED_WAIT_TOOL_CALL_PREFIX = "child-wait-reissue:"
 const TARGET_RESULT_TEXT = "durable-child-result-after-process-restart; phone +1 (415) 555-0134; email child-wait@example.invalid"
 const REDACTED_TARGET_RESULT_TEXT = "durable-child-result-after-process-restart; phone [REDACTED_PHONE]; email [REDACTED_EMAIL]"
 const RESTORED_WAIT_OBSERVATION_MARKER = "WORKER_B_RESTORED_WAIT_OBSERVATION "
+const BOUNDED_LOOP_STAGE_MARKER = "WORKER_B_LOOP_STAGE "
+const BOUNDED_LOOP_STAGE_LIMIT_MARKER = "WORKER_B_LOOP_STAGE_LIMIT "
+const MAX_BOUNDED_LOOP_DIAGNOSTIC_STAGES = 64
+const BOUNDED_LOOP_DIAGNOSTIC_STAGES = new Set([
+  "durable_wait_loader", "child_attempt_resume_loader", "restored_wait_validation", "execution_loop_recovery",
+  "step_start", "step_started_event", "context_build", "agenda_build", "agenda_persist", "model_request",
+  "model_started_event", "claim_recovery_loader", "live_resume_check", "persisted_cut_state", "next_step_state",
+  "model_invocation", "usage_lineage_cut", "loop_result", "other",
+])
+const BOUNDED_LOOP_DIAGNOSTIC_PHASES = new Set(["start", "pass", "fail", "other"])
+const BOUNDED_LOOP_LIVE_RESUME_CLASSES = new Set(["live_resume_expected_lineage", "other"])
 const SOURCE_LIFECYCLE_CRASH_STAGES = [
   "after-call-item-update",
   "after-result-item-insert",
@@ -136,7 +147,79 @@ describe("worker restart blocker proof diagnostic bindings", () => {
   it("binds the same-call-ID source item/step/attempt terminal canary without gaps", () => {
     expectSqlBindings(WORKER_F_SAME_CALL_ID_TERMINAL_PROOF_SQL, 15)
   })
+  it("parses loop-stage diagnostics into fixed enums and drops unknown fields", () => {
+    const parsed = parseBoundedLoopDiagnostics(
+      `${BOUNDED_LOOP_STAGE_MARKER}{"stage":"context_build","phase":"pass","liveResume":"other"}\n`
+      + `${BOUNDED_LOOP_STAGE_MARKER}{"stage":"private","phase":"fail","liveResume":"private","payload":"test-only"}`,
+    )
+    expect(parsed).toEqual({ overflow: false, records: [
+      { stage: "context_build", phase: "pass", liveResume: "other", exactKeys: true },
+      { stage: "other", phase: "fail", liveResume: "other", exactKeys: false },
+    ] })
+    const overLimit = Array.from({ length: MAX_BOUNDED_LOOP_DIAGNOSTIC_STAGES + 1 }, () =>
+      `${BOUNDED_LOOP_STAGE_MARKER}{"stage":"context_build","phase":"pass","liveResume":"other"}`,
+    ).join("\n")
+    expect(parseBoundedLoopDiagnostics(overLimit)).toMatchObject({ overflow: true })
+    expect(parseBoundedLoopDiagnostics(overLimit).records).toHaveLength(MAX_BOUNDED_LOOP_DIAGNOSTIC_STAGES)
+  })
 })
+
+function parseBoundedLoopDiagnostics(text: string): { overflow: boolean; records: Array<{
+  stage: string; phase: string; liveResume: string; exactKeys: boolean
+}> } {
+  const allLines = text.split(/\r?\n/)
+  const lines = allLines.filter(line => line.startsWith(BOUNDED_LOOP_STAGE_MARKER)).slice(0, MAX_BOUNDED_LOOP_DIAGNOSTIC_STAGES + 1)
+  const records = lines.slice(0, MAX_BOUNDED_LOOP_DIAGNOSTIC_STAGES).map(line => {
+    let row: Record<string, unknown>
+    try { row = asObject(JSON.parse(line.slice(BOUNDED_LOOP_STAGE_MARKER.length)) as unknown) }
+    catch { row = {} }
+    const keys = Object.keys(row).sort()
+    return {
+      stage: typeof row.stage === "string" && BOUNDED_LOOP_DIAGNOSTIC_STAGES.has(row.stage) ? row.stage : "other",
+      phase: typeof row.phase === "string" && BOUNDED_LOOP_DIAGNOSTIC_PHASES.has(row.phase) ? row.phase : "other",
+      liveResume: typeof row.liveResume === "string" && BOUNDED_LOOP_LIVE_RESUME_CLASSES.has(row.liveResume)
+        ? row.liveResume : "other",
+      exactKeys: keys.length === 3 && keys[0] === "liveResume" && keys[1] === "phase" && keys[2] === "stage",
+    }
+  })
+  return { overflow: lines.length > MAX_BOUNDED_LOOP_DIAGNOSTIC_STAGES
+    || allLines.some(line => line.startsWith(BOUNDED_LOOP_STAGE_LIMIT_MARKER)), records }
+}
+
+function expectUsageLineageCutStages(child: WorkerProcess): void {
+  const { overflow, records } = parseBoundedLoopDiagnostics(child.stdoutText)
+  expect(overflow).toBe(false)
+  expect(records.length).toBeLessThanOrEqual(MAX_BOUNDED_LOOP_DIAGNOSTIC_STAGES)
+  expect(records.every(record => record.exactKeys)).toBe(true)
+  const expectedSequence: Array<[string, string]> = [
+    ["durable_wait_loader", "start"], ["durable_wait_loader", "pass"],
+    ["child_attempt_resume_loader", "start"], ["child_attempt_resume_loader", "pass"],
+    ["restored_wait_validation", "start"], ["restored_wait_validation", "pass"],
+    ["execution_loop_recovery", "start"], ["execution_loop_recovery", "pass"],
+    ["step_start", "start"], ["step_start", "pass"],
+    ["step_started_event", "start"], ["step_started_event", "pass"],
+    ["context_build", "start"], ["context_build", "pass"],
+    ["agenda_build", "start"], ["agenda_build", "pass"],
+    ["agenda_persist", "start"], ["agenda_persist", "pass"],
+    ["model_request", "start"], ["model_request", "pass"],
+    ["model_started_event", "start"],
+    ["claim_recovery_loader", "start"], ["claim_recovery_loader", "pass"],
+    ["live_resume_check", "start"], ["live_resume_check", "pass"],
+    ["persisted_cut_state", "start"], ["persisted_cut_state", "pass"],
+    ["next_step_state", "start"], ["next_step_state", "pass"],
+    ["usage_lineage_cut", "pass"],
+  ]
+  let previousIndex = -1
+  for (const [stage, phase] of expectedSequence) {
+    const index = records.findIndex((record, candidate) => candidate > previousIndex
+      && record.stage === stage && record.phase === phase)
+    expect(index, `stage=${stage}; phase=${phase}`).toBeGreaterThan(previousIndex)
+    previousIndex = index
+  }
+  expect(records.some(record => record.stage === "live_resume_check" && record.phase === "pass"
+    && record.liveResume === "live_resume_expected_lineage")).toBe(true)
+  expect(records.some(record => record.stage === "model_invocation")).toBe(false)
+}
 
 function expectSqlBindings(sql: string, parameterCount: number): void {
   const indices = [...new Set(Array.from(sql.matchAll(/\$(\d+)/g), match => Number(match[1])))].sort((a, b) => a - b)
@@ -216,6 +299,16 @@ async function waitForMarker(child: WorkerProcess, marker: string, timeoutMs = 2
     await new Promise(resolve => setTimeout(resolve, 25))
   }
   throw new Error(`Timed out waiting for ${marker}; stdout: ${child.stdoutText}; stderr: ${child.stderrText}`)
+}
+
+async function waitForBoundedLoopMarker(child: WorkerProcess, marker: string, timeoutMs = 20_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (child.stdoutText.includes(marker)) return
+    if (child.exitCode !== null || child.signalCode !== null) throw new Error("bounded_loop_marker_missing")
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+  throw new Error("bounded_loop_marker_timeout")
 }
 
 function workerResultStatus(child: WorkerProcess, marker: "WORKER_A_WAITING"): WorkerResultStatus | null {
@@ -3977,7 +4070,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(orphanExpired.rowCount).toBe(1)
 
       workerC = launchWorker("worker-b-loop-usage-lineage-cut", queueName, ids)
-      await waitForMarker(workerC, "WORKER_B_RECOVERED")
+      await waitForBoundedLoopMarker(workerC, "WORKER_B_RECOVERED")
       const claimCutDispatch = await pool.query<{ status: string; attemptCount: number; leaseOwner: string | null }>(
         `SELECT "status", "attemptCount", "leaseOwner" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`,
         [ids.waiterTaskId, ids.sessionId],
@@ -3989,7 +4082,8 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       )
       expect(claimCutOutbox.rows[0]?.publishedAt).toBeNull()
       await expect(dispatchPendingSubagentOutbox(pool as never, queue, 50, ids.sessionId)).resolves.toBe(1)
-      await waitForMarker(workerC, "WORKER_B_LOOP_ROUNDED_USAGE_LINEAGE_CUT")
+      await waitForBoundedLoopMarker(workerC, "WORKER_B_LOOP_ROUNDED_USAGE_LINEAGE_CUT")
+      expectUsageLineageCutStages(workerC)
       const cutMarker = workerC.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_LOOP_ROUNDED_USAGE_LINEAGE_CUT "))
       expect(JSON.parse(cutMarker!.slice("WORKER_B_LOOP_ROUNDED_USAGE_LINEAGE_CUT ".length))).toMatchObject({
         callId: orphanCallId, completedStepId: continuationStepId, completedStepStatus: "completed",
@@ -4033,7 +4127,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(lineageOutboxBeforeRecovery.rows).toHaveLength(1)
       expect(lineageOutboxBeforeRecovery.rows[0]?.publishedAt).toBeInstanceOf(Date)
       workerD = launchWorker("worker-b-loop-usage-lineage-reject", queueName, ids)
-      await waitForMarker(workerD, "WORKER_B_RECOVERED")
+      await waitForBoundedLoopMarker(workerD, "WORKER_B_RECOVERED")
       const workerDRecovery = parseRecoveryMarker(workerD)
       expect(workerDRecovery.reclaimed).toBe(0)
       expect(workerDRecovery.terminal).toBe(1)
