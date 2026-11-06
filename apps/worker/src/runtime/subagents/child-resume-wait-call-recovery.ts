@@ -1,6 +1,7 @@
 import type pg from "pg"
 import { canonicalJson } from "@jobcopilot/shared"
 
+import { projectWaitCallCompletionPayload } from "../turns/turn-execution-wait-event-projection.js"
 import { childWaitClaimEventKey, isExactChildWaitInput, type ChildWaitCallRecovery, type ChildWaitClaimRecovery, type ChildWaitOrphanRecovery } from "./child-durable-wait-replay.js"
 import { childWaitRecoveryCausallyAfter, childWaitRecoveryEventKey, childWaitRecoveryEventSequence, childWaitRecoveryLogicalStepOrdinal,
   childWaitRecoveryValidEvent, parseChildWaitModelUsageReceipt, parseChildWaitModelUsage, type ChildWaitModelReceipt } from "./child-resume-wait-call-contract.js"
@@ -82,13 +83,18 @@ function recoverClaim(
     { toolCallId: callId, toolName: "wait_subagents", taskId: lease.id })) throw new Error("child_resume_wait_tool_call_conflict")
   const finish = callEvents.filter(event => event.type === "tool_call.completed"), complete = callEvents.filter(event => event.type === "item.completed")
   const finishKey = childWaitRecoveryEventKey(lease, `tool-finished:${callId}`), completeKey = childWaitRecoveryEventKey(lease, `tool-call-completed:${callId}:${callItemId}:${revision}`)
+  const rawCompletionPayload = { itemId: callItemId, status: "completed", content: { toolCallId: callId, toolName: "wait_subagents",
+    toolVersion: "1", input: content.input, status: "completed", errorCode: null } }
+  const projectedCompletionPayload = projectWaitCallCompletionPayload(rawCompletionPayload, callItemId)
   if (callEvents.filter(event => event.type === "tool_call.started").length !== 1
     || callEvents.some(event => !["item.started", "tool_call.started", "item.completed", "tool_call.completed"].includes(String(event.type))
       || event.type === "tool_call.failed" || event.type === "item.failed")
     || status === "started" && (finish.length > 0 || complete.length > 0) || finish.length > 1 || complete.length > 1
-    || complete.length === 1 && !childWaitRecoveryValidEvent(complete[0]!, lease, { type: "item.completed", itemId: callItemId,
-      correlationId: callItemId, causationId: claim.id, idempotencyKey: completeKey },
-    { itemId: callItemId, status: "completed", content: { toolCallId: callId, toolName: "wait_subagents", toolVersion: "1", input: content.input, status: "completed", errorCode: null } })
+    || complete.length === 1 && !(
+      childWaitRecoveryValidEvent(complete[0]!, lease, { type: "item.completed", itemId: callItemId,
+        correlationId: callItemId, causationId: claim.id, idempotencyKey: completeKey }, projectedCompletionPayload)
+      || childWaitRecoveryValidEvent(complete[0]!, lease, { type: "item.completed", itemId: callItemId,
+        correlationId: callItemId, causationId: claim.id, idempotencyKey: completeKey }, rawCompletionPayload))
     || finish.length === 1 && (!complete.length || !childWaitRecoveryValidEvent(finish[0]!, lease, { type: "tool_call.completed", itemId: callItemId,
       correlationId: callId, causationId: complete[0]!.id, idempotencyKey: finishKey },
     { toolCallId: callId, toolName: "wait_subagents", status: "completed", errorCode: null, taskId: lease.id }))) {
