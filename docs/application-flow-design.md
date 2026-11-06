@@ -454,7 +454,12 @@ is a snapshot and does not by itself prevent concurrent changes in another tab.
 | Submission started | View original progress | Do not enqueue another application |
 | Submission uncertain | Check original records and receipt | Keep unknown distinct from failed or submitted |
 | Task cancelled | Read the last recorded state | Navigation does not resume it |
-| Historical application has a result | Read history and follow up | Editing a resume does not erase the historical result |
+| Historical application has a result | Read history and follow up | Editing a resume does not erase the historical result. The materials shown are current versions; the view cannot establish the exact versions submitted |
+
+The current application record points to mutable resume and cover-letter records.
+It does not provide a reliable, submission-bound snapshot of both documents.
+Preserving and retrieving the exact historical materials requires a separate
+storage and lifecycle design; do not present the current preview as that snapshot.
 
 ## 9. Dashboard and Inbox
 

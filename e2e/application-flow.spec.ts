@@ -2548,6 +2548,16 @@ test('a saved job with a historical applied date cannot be recorded again', asyn
   expect(state.unexpected).toEqual([])
 })
 
+test('recorded applications identify displayed materials as current versions', async ({ page }) => {
+  const state = await install(page, { recordedInitially: true, stale: true })
+  await open(page)
+  await expect(page.getByText(/This application has a recorded result|此申请已有结果记录/).first()).toBeVisible()
+  await expect(page.getByText(/materials shown below are their current versions.*cannot confirm they match|下方显示的是材料的当前版本.*无法确认它们与提交时的版本一致/)).toBeVisible()
+  await expect(page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ })).toHaveCount(0)
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
 
 
 for (const status of ['cancelled', 'failed'] as const) {
