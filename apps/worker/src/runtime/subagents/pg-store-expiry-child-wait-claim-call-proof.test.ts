@@ -47,6 +47,39 @@ describe("claim terminal settlement event descendants", () => {
   })
 })
 
+function matchingSqlCloseParen(sql: string, openIndex: number): number {
+  let depth = 0
+  let quote: "'" | '"' | null = null
+  for (let index = openIndex; index < sql.length; index += 1) {
+    const character = sql[index]
+    if (quote) {
+      if (character === quote) {
+        if (sql[index + 1] === quote) { index += 1; continue }
+        quote = null
+      }
+      continue
+    }
+    if (character === "'" || character === '"') { quote = character; continue }
+    if (character === "(") depth += 1
+    if (character === ")" && --depth === 0) return index
+  }
+  return -1
+}
+
+describe("historical source proof SQL scope", () => {
+  it("keeps the source result binding inside the projected proof EXISTS", () => {
+    const sql = CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL
+    const binding = sql.indexOf("boundSourceResult.\"id\" = proof.value->'sourceWait'->>'sourceResultItemId'")
+    const alias = sql.lastIndexOf("AS proof(value)", binding)
+    const exists = sql.lastIndexOf("EXISTS (", alias)
+    const close = matchingSqlCloseParen(sql, exists + "EXISTS ".length)
+
+    expect(binding).toBeGreaterThan(0)
+    expect(alias).toBeGreaterThan(0)
+    expect(exists).toBeGreaterThan(0)
+    expect(close).toBeGreaterThan(binding)
+  })
+})
 describe("canonical historical child-wait outcome", () => {
   function fixture() {
     const deadlineAt = new Date("2026-11-06T10:00:00.123Z")

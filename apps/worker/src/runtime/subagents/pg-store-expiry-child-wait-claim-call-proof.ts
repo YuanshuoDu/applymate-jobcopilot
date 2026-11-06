@@ -145,9 +145,9 @@ const CHILD_WAIT_SOURCE_PROJECTED_COMPLETION_SQL = `(
         FROM generate_series(1, jsonb_array_length(CASE WHEN jsonb_typeof(callItem."content"->'input'->'taskIds') = 'array'
           THEN callItem."content"->'input'->'taskIds' ELSE '[]'::jsonb END)) AS target(ordinal)),
       'mode', callItem."content"->'input'->'mode', 'timeoutMs', callItem."content"->'input'->'timeoutMs'),
-      'toolCallId', proof.value->>'projectedCallId', 'toolVersion', '1', 'status', 'completed', 'errorCode', NULL)))
+      'toolCallId', proof.value->>'projectedCallId', 'toolVersion', '1', 'status', 'completed', 'errorCode', NULL))
   AND ${CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL}
-)`
+))`
 
 /** Only an exact wait-call item/event lifecycle may settle its external start. */
 export const CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL = `(
