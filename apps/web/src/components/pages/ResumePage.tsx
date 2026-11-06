@@ -26,6 +26,29 @@ import './ResumePage.css'
 // completed result or accidentally displays another resume's result.
 const LS_KEY = 'applymate_last_analysis'
 const AUDIT_SUGGESTION_PREFIX = '[Audit] '
+type RenameFences = Record<string, string>
+function readRenameFences(userId: string): RenameFences | null {
+  try {
+    const raw = window.sessionStorage.getItem(`applymate:resume-rename:${encodeURIComponent(userId)}`)
+    if (raw === null) return {}
+    const value: unknown = JSON.parse(raw)
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+    if (Object.entries(value).some(([id, attempt]) => !id || typeof attempt !== 'string' || !attempt)) return null
+    return value as RenameFences
+  } catch { return null }
+}
+function writeRenameFence(userId: string, resumeId: string, attempt: string, clear: boolean): boolean {
+  try {
+    const current = readRenameFences(userId)
+    if (!current || (clear ? current[resumeId] !== attempt : Boolean(current[resumeId]))) return false
+    const next = { ...current }
+    if (clear) delete next[resumeId]
+    else next[resumeId] = attempt
+    window.sessionStorage.setItem(`applymate:resume-rename:${encodeURIComponent(userId)}`, JSON.stringify(next))
+    const checked = readRenameFences(userId)
+    return Boolean(checked && (clear ? !(resumeId in checked) : checked[resumeId] === attempt))
+  } catch { return false }
+}
 type AnalysisCacheEntry = { resumeId: string; jobId: string; resumeUpdatedAt: string | null; score: ScoreResult | null; suggs: Suggestion[] }
 let _cachedAnalyses: Record<string, AnalysisCacheEntry> | null = null
 
@@ -246,15 +269,17 @@ function NewResumeModal({ onClose, onCreate }: { onClose: () => void; onCreate: 
   )
 }
 
-function RenameResumeModal({ resume, onClose, onRename }: { resume: ResumeListItem; onClose: () => void; onRename: (name: string) => void }) {
-  const { t } = useI18n()
+function RenameResumeModal({ resume, onClose, onRename, pending, blocked, failure }: { resume: ResumeListItem; onClose: () => void; onRename: (name: string) => void; pending: boolean; blocked: boolean; failure: boolean }) {
+  const { t, lang } = useI18n()
   const [name, setName] = useState(resume.name)
-  return <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.3)', zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={e => { if (e.target === e.currentTarget) onClose() }}>
+  return <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.3)', zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={e => { if (!pending && e.target === e.currentTarget) onClose() }}>
     <div style={{ background: 'var(--bg)', border: '0.5px solid var(--border)', borderRadius: 10, padding: 20, width: 340, boxShadow: '0 8px 32px rgba(0,0,0,0.15)' }}>
       <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 6 }}>{t('resume.renameTitle')}</div>
       <div style={{ color: 'var(--text-muted)', fontSize: 11, marginBottom: 12 }}>{t('resume.renameHint')}</div>
-      <input autoFocus value={name} onChange={e => setName(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && name.trim()) onRename(name.trim()); if (e.key === 'Escape') onClose() }} style={{ width: '100%', fontSize: 13, padding: '8px 10px', border: '0.5px solid var(--primary)', borderRadius: 6, outline: 'none', boxSizing: 'border-box', color: 'var(--text)', background: 'var(--bg)' }} />
-      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 14 }}><Btn small variant="ghost" onClick={onClose}>{t('resume.cancel')}</Btn><Btn small variant="primary" onClick={() => name.trim() && onRename(name.trim())} disabled={!name.trim()}>{t('resume.saveName')}</Btn></div>
+      <input autoFocus value={name} onChange={e => setName(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && name.trim() && !pending) onRename(name.trim()); if (e.key === 'Escape' && !pending) onClose() }} style={{ width: '100%', fontSize: 13, padding: '8px 10px', border: '0.5px solid var(--primary)', borderRadius: 6, outline: 'none', boxSizing: 'border-box', color: 'var(--text)', background: 'var(--bg)' }} />
+      {pending && <p role="status">{t('resume.toastSaving')}</p>}
+      {(blocked || failure) && <p role="status">{lang === 'zh' ? '无法安全确认重命名状态，请关闭窗口并核对提示。' : 'The rename status cannot be safely confirmed. Close this window and review the notice.'}</p>}
+      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 14 }}><Btn small variant="ghost" onClick={onClose} disabled={pending}>{t('resume.cancel')}</Btn><Btn small variant="primary" onClick={() => name.trim() && onRename(name.trim())} disabled={!name.trim() || pending || blocked}>{t('resume.saveName')}</Btn></div>
     </div>
   </div>
 }
@@ -721,6 +746,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   const [contentValidated, setContentValidated] = useState(false)
   const [contentVerified, setContentVerifiedState] = useState(false)
   const [verifiedResumeTarget, setVerifiedResumeTarget] = useState<{ userId: string; resumeId: string; targetJobId: string | null } | null>(null)
+  const [cachedResumeTarget, setCachedResumeTarget] = useState<{ userId: string; resumeId: string; targetJobId: string | null } | null>(null)
   const contentVerifiedRef = useRef(false)
   function setContentVerified(value: boolean) {
     contentVerifiedRef.current = value
@@ -812,6 +838,16 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     const userId = resumeUserIdRef.current
     const resumeId = selectedResumeIdRef.current
     return Boolean(userId && resumeId && unknownResumeSaveScopesRef.current.has(resumeSaveScopeKey(userId, resumeId)))
+  }
+  const renameFenceFor = (resumeId: string) => {
+    const userId = resumeUserIdRef.current
+    const fences = userId ? readRenameFences(userId) : null
+    return !fences || Boolean(fences[resumeId])
+  }
+  const hasRenameFence = () => {
+    const userId = resumeUserIdRef.current
+    const fences = userId ? readRenameFences(userId) : null
+    return !fences || Object.keys(fences).length > 0
   }
   const versionRestoreIntentRef = useRef(false)
   const versionRestoreUnknownRef = useRef(false)
@@ -1126,6 +1162,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     const cached = getCachedApiResponse<Resume & { userId?: string }>(resumeUrl, requestUserId)
     const cachedResume = cached?.id === selectedResumeId && cached.userId === requestUserId
       && typeof cached.updatedAt === 'string' && Number.isFinite(Date.parse(cached.updatedAt)) ? cached : null
+    setCachedResumeTarget(cachedResume && requestUserId ? { userId: requestUserId, resumeId: selectedResumeId, targetJobId: typeof cachedResume.targetJobId === 'string' ? cachedResume.targetJobId : null } : null)
     const preserveEdits = sameContext && (dirtyRef.current || isSavingRef.current)
     loadedResumeContextRef.current = { userId: resumeUserId, resumeId: selectedResumeId }
     if (!preserveEdits) setContentResumeId(null)
@@ -1154,7 +1191,9 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
         return resume
       })
       .then(resume => {
-        if (!controller.signal.aborted && requestUserId && requestUserId === resumeUserIdRef.current && selectedResumeId === selectedResumeIdRef.current) {
+        if (!controller.signal.aborted && requestUserId && requestUserId === resumeUserIdRef.current && selectedResumeId === selectedResumeIdRef.current
+          && typeof resume.updatedAt === 'string' && Number.isFinite(Date.parse(resume.updatedAt))
+          && (!dirtyRef.current || Boolean(contentRevisionRef.current && contentRevisionRef.current === resume.updatedAt))) {
           validated = true
           setVerifiedResumeTarget({ userId: requestUserId, resumeId: selectedResumeId, targetJobId: typeof resume.targetJobId === 'string' ? resume.targetJobId : null })
         }
@@ -1224,20 +1263,24 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   }, [returnJobKey, returnJobEpoch, originalApplicationId, resumeUserId, returnJobRetry])
   const verifiedResumeScope = contentVerified && verifiedResumeTarget?.userId === resumeUserId && verifiedResumeTarget.resumeId === selectedResumeId
     ? verifiedResumeTarget : null
+  const analysisResumeScope = verifiedResumeScope ?? (contentValidated && !contentVerified && cachedResumeTarget?.userId === resumeUserId && cachedResumeTarget.resumeId === selectedResumeId ? cachedResumeTarget : null)
   const currentReturnRead = returnJobRead?.key === returnJobKey && returnJobRead.epoch === returnJobEpoch ? returnJobRead : null
   const verifiedReturnJob = currentReturnRead?.status === 'ready' && currentReturnRead.job && verifiedResumeScope
     && (currentReturnRead.job.finalResumeId === selectedResumeId || (currentReturnRead.job.finalResumeId === null && verifiedResumeScope.targetJobId === currentReturnRead.job.id))
     ? currentReturnRead.job : null
+  const analysisReturnJob = verifiedReturnJob ?? (currentReturnRead?.status === 'ready' && currentReturnRead.job && analysisResumeScope && currentReturnRead.job.finalResumeId === selectedResumeId ? currentReturnRead.job : null)
+  const displayReturnJob = currentReturnRead?.status === 'ready' && currentReturnRead.job?.finalResumeId === selectedResumeId ? currentReturnRead.job : null
+  const analysisReturnJobId = (analysisReturnJob ?? displayReturnJob)?.id ?? null
   const returnJobLoading = Boolean(originalApplicationId && (!currentReturnRead || currentReturnRead.status === 'loading' || (!contentValidated && !contentVerified)))
   const returnJobSelectionChanged = Boolean(currentReturnRead?.status === 'ready' && currentReturnRead.job && verifiedResumeScope
     && currentReturnRead.job.finalResumeId && currentReturnRead.job.finalResumeId !== selectedResumeId)
 
   useEffect(() => {
-    if (originalApplicationId) { setSelectedJobId(verifiedReturnJob?.id ?? null); return }
-    if (!selectedResumeId || !verifiedResumeScope) return
-    const linkedJobId = verifiedResumeScope.targetJobId ?? jobs.find(job => job.userId === resumeUserId && job.finalResumeId === selectedResumeId)?.id ?? null
+    if (originalApplicationId) { setSelectedJobId(analysisReturnJobId); return }
+    if (!selectedResumeId || !analysisResumeScope) return
+    const linkedJobId = analysisResumeScope.targetJobId ?? jobs.find(job => job.userId === resumeUserId && job.finalResumeId === selectedResumeId)?.id ?? null
     if (linkedJobId) setSelectedJobId(linkedJobId)
-  }, [jobs, selectedResumeId, resumeUserId, originalApplicationId, verifiedReturnJob?.id, verifiedResumeScope])
+  }, [jobs, selectedResumeId, resumeUserId, originalApplicationId, analysisReturnJobId, analysisResumeScope])
 
   useEffect(() => {
     const targetKey = analysisTargetKey(selectedResumeId, selectedJobId)
@@ -1248,7 +1291,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       setScoring(false)
       setSuggesting(false)
     }
-    if (!verifiedResumeScope || !contentValidated || contentResumeId !== selectedResumeId) return
+    if (!analysisResumeScope || !contentValidated || contentResumeId !== selectedResumeId) return
     const cached = getAnalysisCache(selectedResumeId, selectedJobId, contentRevision)
     if (cached) {
       setScoreResult(cached.score)
@@ -1263,7 +1306,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     setScoreResult(null)
     setSuggestions([])
     analysisTargetRef.current = null
-  }, [selectedJobId, selectedResumeId, contentRevision, contentResumeId, contentValidated, verifiedResumeScope])
+  }, [selectedJobId, selectedResumeId, contentRevision, contentResumeId, contentValidated, analysisResumeScope])
 
   const [flashField, setFlashField] = useState('')
 
@@ -1366,7 +1409,8 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     if (regeneratingSection) return
     const requestUserId = resumeUserIdRef.current
     if (!requestUserId || !selectedResumeId) return
-    const job = jobs.find(j => j.id === jobId); if (!job) return
+    const job = selectedJob?.id === jobId && selectedJob.userId === requestUserId ? selectedJob : null
+    if (!job) return
     // Epoch guard: if a newer analysis starts before this one finishes, discard this result
     const epoch = ++analysisEpochRef.current
     const editRevision = editRevisionRef.current
@@ -1485,6 +1529,11 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   const mountedRef            = useRef(true)
   const pendingSaveRef        = useRef(false) // new edits arrived while saving
   const savePromiseRef        = useRef<Promise<boolean> | null>(null)
+  const renameWriteRef        = useRef<{ userId: string; resumeId: string } | null>(null)
+  const [renamingPending, setRenamingPending] = useState(false)
+  const [renameStorageFailure, setRenameStorageFailure] = useState(false)
+  const [renameFenceChecked, setRenameFenceChecked] = useState(false)
+  useEffect(() => { setRenameFenceChecked(true) }, [])
   const resumeLocationRef     = useRef(typeof window === 'undefined' ? '' : window.location.href)
   if (typeof window !== 'undefined') resumeLocationRef.current = window.location.href
   useEffect(() => {
@@ -1534,6 +1583,15 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
 
   function handleSave(): Promise<boolean> {
     if (hasUnknownResumeSave()) return Promise.resolve(false)
+    if (!hasValidatedCurrentResume()) {
+      toast.warning(lang === 'zh' ? '无法确认当前简历版本' : 'Cannot verify the current resume version', lang === 'zh' ? '请复制未保存的编辑，重新加载并核对最新版本。' : 'Copy unsaved edits, reload and review the latest version.')
+      return Promise.resolve(false)
+    }
+    if (selectedResumeIdRef.current && renameFenceFor(selectedResumeIdRef.current)) {
+      toast.warning(lang === 'zh' ? '无法安全保存简历' : 'Cannot safely save the resume', lang === 'zh' ? '请先复制未保存的编辑，并核对重命名状态或此标签页的存储设置。' : 'Copy unsaved edits and check the rename status or this tab’s storage settings.')
+      return Promise.resolve(false)
+    }
+    if (renameWriteRef.current) return Promise.resolve(false)
     if (correctionConflictRef.current) {
       toast.warning(t(versionRestoreUnknownRef.current ? 'resume.restoreUnknownTitle' : 'resume.correctionChangedTitle'),
         t(versionRestoreUnknownRef.current ? 'resume.restoreUnknownDetail' : 'resume.correctionChangedDetail'))
@@ -1626,10 +1684,10 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   const saveForNavigationRef = useRef(handleSave)
   saveForNavigationRef.current = handleSave
   useEffect(() => registerNavigationGuard?.({
-    needsSave: () => dirtyRef.current || isSavingRef.current || hasUnknownResumeSave() || applyingAuditRef.current || correctionConflictRef.current || versionRestoreIntentRef.current || resumeEntryWriteRef.current
+    needsSave: () => dirtyRef.current || isSavingRef.current || hasUnknownResumeSave() || Boolean(renameWriteRef.current) || applyingAuditRef.current || correctionConflictRef.current || versionRestoreIntentRef.current || resumeEntryWriteRef.current
       || linkWriteRef.current !== 'idle' || confirmationWriteRef.current !== 'idle',
     save: async () => {
-      if (linkWriteRef.current !== 'idle' || confirmationWriteRef.current !== 'idle') return false
+      if (linkWriteRef.current !== 'idle' || confirmationWriteRef.current !== 'idle' || renameWriteRef.current) return false
       if (resumeEntryWriteRef.current) {
         toast.info(t('resume.toastSaving'), t('resume.toastSavingDetail'))
         return false
@@ -1645,7 +1703,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   }), [registerNavigationGuard])
   useEffect(() => {
     const onBeforeUnload = (event: BeforeUnloadEvent) => {
-      guardApplicationUnload(event, dirtyRef.current || isSavingRef.current || hasUnknownResumeSave() || applyingAuditRef.current || correctionConflictRef.current || resumeEntryWriteRef.current
+      guardApplicationUnload(event, dirtyRef.current || isSavingRef.current || hasUnknownResumeSave() || Boolean(renameWriteRef.current) || applyingAuditRef.current || correctionConflictRef.current || resumeEntryWriteRef.current
         || linkWriteRef.current !== 'idle' || confirmationWriteRef.current !== 'idle')
     }
     window.addEventListener('beforeunload', onBeforeUnload)
@@ -1714,7 +1772,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   async function restoreVersion(versionId: string) {
     const requestResumeId = selectedResumeIdRef.current
     const requestUserId = resumeUserIdRef.current
-    if (!requestResumeId || !requestUserId || versionRestoreIntentRef.current || applyingAuditRef.current) return
+    if (!requestResumeId || !requestUserId || versionRestoreIntentRef.current || applyingAuditRef.current || renameWriteRef.current || renameFenceFor(requestResumeId)) return
     if (correctionConflictRef.current) {
       toast.warning(t(versionRestoreUnknownRef.current ? 'resume.restoreUnknownTitle' : 'resume.correctionChangedTitle'),
         t(versionRestoreUnknownRef.current ? 'resume.restoreUnknownDetail' : 'resume.correctionChangedDetail'))
@@ -1950,8 +2008,8 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       ?? jobs.find(j => j.userId === resumeUserId && j.finalResumeId === selectedResumeId)
       ?? null : null
   const selectedJob = originalApplicationId
-    ? (selectedJobId === resumeLinkedJob?.id ? resumeLinkedJob : null)
-    : verifiedResumeScope ? jobs.find(j => j.userId === resumeUserId && j.id === selectedJobId) ?? null : null
+    ? (selectedJobId === (analysisReturnJob ?? displayReturnJob)?.id ? (analysisReturnJob ?? displayReturnJob) : null)
+    : analysisResumeScope ? jobs.find(j => j.userId === resumeUserId && j.id === selectedJobId) ?? null : null
   const confirmationScopeRef = useRef({ userId: resumeUserId, resumeId: selectedResumeId, jobId: resumeLinkedJob?.id ?? null, selectedJobId, generation: 0 })
   const confirmationScope = confirmationScopeRef.current
   if (confirmationScope.userId !== resumeUserId || confirmationScope.resumeId !== selectedResumeId
@@ -2167,7 +2225,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   } : {}
 
   async function linkResumeToJob(jobId: string) {
-    if (!selectedResumeId) return
+    if (!selectedResumeId || renameWriteRef.current || renameFenceFor(selectedResumeId)) return
     const owner = resumeUserIdRef.current
     const scope = confirmationScopeRef.current
     if (!owner || !hasValidatedCurrentResume() || !verifiedResumeScope || hasUnknownResumeSave() || linkWriteRef.current !== 'idle' || auditRunRef.current || applyingAuditRef.current || confirmationWriteRef.current !== 'idle'
@@ -2195,7 +2253,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   }
 
   async function auditApplicationPack(): Promise<ApplicationAudit | null> {
-    if (linkWriteRef.current !== 'idle' || confirmationWriteRef.current !== 'idle' || hasUnknownResumeSave()) return null
+    if (linkWriteRef.current !== 'idle' || confirmationWriteRef.current !== 'idle' || hasUnknownResumeSave() || renameWriteRef.current || (selectedResumeId && renameFenceFor(selectedResumeId))) return null
     if (!hasValidatedCurrentResume()) { toast.info(t('resume.analysisLoadingTitle'), t('resume.analysisLoadingDetail')); return null }
     setAuditError(null)
     if (!selectedResumeId || !resumeLinkedJob) {
@@ -2352,7 +2410,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   }
 
   async function applyAuditFinding(index: number) {
-    if (linkWriteRef.current !== 'idle' || confirmationWriteRef.current !== 'idle' || hasUnknownResumeSave()) return
+    if (linkWriteRef.current !== 'idle' || confirmationWriteRef.current !== 'idle' || hasUnknownResumeSave() || renameWriteRef.current || (selectedResumeId && renameFenceFor(selectedResumeId))) return
     if (!hasValidatedCurrentResume()) { toast.info(t('resume.analysisLoadingTitle'), t('resume.analysisLoadingDetail')); return }
     if (!selectedResumeId || !resumeLinkedJob || !displayedApplicationAuditRecord || auditStale) {
       toast.info('Run the audit again first', 'The current resume or cover letter changed after this audit.')
@@ -2515,7 +2573,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   }
 
   async function confirmApplicationPack(audit: ApplicationAudit): Promise<boolean> {
-    if (linkWriteRef.current !== 'idle' || confirmationWriteRef.current !== 'idle' || hasUnknownResumeSave()) return false
+    if (linkWriteRef.current !== 'idle' || confirmationWriteRef.current !== 'idle' || hasUnknownResumeSave() || renameWriteRef.current || (selectedResumeId && renameFenceFor(selectedResumeId))) return false
     if (!hasValidatedCurrentResume()) { toast.info(t('resume.analysisLoadingTitle'), t('resume.analysisLoadingDetail')); return false }
     if (!selectedResumeId || !resumeLinkedJob) return false
     const owner = resumeUserIdRef.current
@@ -2651,15 +2709,96 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
 
   async function handleRenameResume(resume: ResumeListItem, name: string) {
     if (!name || name === resume.name) { setRenamingResume(null); return }
-    const { data, error } = await apiMutate<Resume>(`/api/resume/${resume.id}`, 'PATCH', { name })
-    if (!data) return toast.error('Rename failed', error ?? 'Could not rename resume')
-    setResumes(prev => prev.map(item => item.id === resume.id ? { ...item, name: data.name, updatedAt: data.updatedAt } : item))
-    if (resume.id === selectedResumeId) setResumeName(data.name)
-    toast.success('Resume renamed', data.name)
-    setRenamingResume(null)
+    const owner = resumeUserIdRef.current
+    setRenameStorageFailure(false)
+    if (!owner || renameWriteRef.current || auditRunRef.current || applyingAuditRef.current || versionRestoreIntentRef.current
+      || linkWriteRef.current !== 'idle' || confirmationWriteRef.current !== 'idle'
+      || unknownResumeSaveScopesRef.current.has(resumeSaveScopeKey(owner, resume.id)) || renameFenceFor(resume.id)) return
+    const selectedAtStart = selectedResumeIdRef.current
+    const scope = resumeSaveScopeRef.current.generation
+    const pendingSave = savePromiseRef.current
+    renameWriteRef.current = { userId: owner, resumeId: resume.id }
+    setRenamingPending(true)
+    let verified = false
+    let started = false
+    try {
+      if (pendingSave) {
+        const waited = await settleResumeEntryWrite(pendingSave.then(data => ({ data, error: null })))
+        if (waited.data !== true) {
+          if (mountedRef.current && owner === resumeUserIdRef.current) setRenameStorageFailure(true)
+          return
+        }
+      }
+      if (!mountedRef.current || owner !== resumeUserIdRef.current || selectedAtStart !== selectedResumeIdRef.current
+        || scope !== resumeSaveScopeRef.current.generation || hasUnknownResumeSave()) return
+      const attempt = crypto.randomUUID()
+      if (!writeRenameFence(owner, resume.id, attempt, false)) {
+        setRenameStorageFailure(true)
+        toast.warning(lang === 'zh' ? '无法安全保存名称' : 'Cannot safely save the name', lang === 'zh' ? '请检查此标签页的存储设置后重试。' : 'Check this tab’s storage settings and try again.')
+        return
+      }
+      started = true
+      const operation = apiMutate<Resume & { userId?: string }>(`/api/resume/${resume.id}`, 'PATCH', { name })
+      const { data, error } = await settleResumeEntryWrite(operation)
+      if (error === 'Save result unknown') {
+        void operation.then(result => {
+          const late = result.data
+          if (result.error || !late || late.id !== resume.id || late.userId !== owner || late.name !== name
+            || typeof late.updatedAt !== 'string' || !Number.isFinite(Date.parse(late.updatedAt))
+            || !writeRenameFence(owner, resume.id, attempt, true)) return
+          if (!mountedRef.current || owner !== resumeUserIdRef.current) return
+          setUnknownResumeSaveRevision(value => value + 1)
+          const lateVersion = Date.parse(late.updatedAt)
+          setResumes(previous => previous.map(item => {
+            if (item.id !== resume.id) return item
+            const currentVersion = Date.parse(item.updatedAt ?? '')
+            return Number.isFinite(currentVersion) && (currentVersion < lateVersion || (currentVersion === lateVersion && item.name === late.name))
+              ? { ...item, name: late.name, updatedAt: late.updatedAt } : item
+          }))
+          if (selectedResumeIdRef.current === resume.id && scope === resumeSaveScopeRef.current.generation) {
+            const currentVersion = Date.parse(contentRevisionRef.current ?? '')
+            if (Number.isFinite(currentVersion) && (currentVersion < lateVersion || (currentVersion === lateVersion && latestResumeName.current === late.name))) {
+              latestResumeName.current = late.name
+              setResumeName(late.name)
+              setContentRevision(late.updatedAt)
+            }
+            if (dirtyRef.current) void handleSave()
+          }
+        }).catch(() => undefined)
+        return
+      }
+      if (!data || error || data.id !== resume.id || data.userId !== owner || data.name !== name
+        || typeof data.updatedAt !== 'string' || !Number.isFinite(Date.parse(data.updatedAt))) return
+      if (!writeRenameFence(owner, resume.id, attempt, true)) return
+      verified = true
+      if (!mountedRef.current || owner !== resumeUserIdRef.current || selectedAtStart !== selectedResumeIdRef.current
+        || scope !== resumeSaveScopeRef.current.generation) return
+      setResumes(prev => prev.map(item => item.id === resume.id ? { ...item, name: data.name, updatedAt: data.updatedAt } : item))
+      if (resume.id === selectedResumeIdRef.current) {
+        latestResumeName.current = data.name
+        setResumeName(data.name)
+        setContentRevision(data.updatedAt)
+      }
+      toast.success('Resume renamed', data.name)
+      setRenamingResume(null)
+    } catch {
+      // A failed request cannot prove whether the rename committed.
+    } finally {
+      renameWriteRef.current = null
+      if (mountedRef.current) {
+        setRenamingPending(false)
+        if (started && !verified) {
+          setUnknownResumeSaveRevision(value => value + 1)
+          if (owner === resumeUserIdRef.current) setRenamingResume(null)
+        }
+        if ((verified || resume.id !== selectedAtStart) && owner === resumeUserIdRef.current && selectedAtStart === selectedResumeIdRef.current
+          && scope === resumeSaveScopeRef.current.generation && dirtyRef.current) void handleSave()
+      }
+    }
   }
 
   async function handleSetDefaultResume(resume: ResumeListItem) {
+    if (renameWriteRef.current || renameFenceFor(resume.id)) return
     const { data, error } = await apiMutate<Resume>(`/api/resume/${resume.id}`, 'PATCH', { isDefault: true })
     if (!data || error) { toast.error('Could not set default', error ?? 'Please try again'); return }
     setResumes(previous => previous.map(item => ({ ...item, isDefault: item.id === resume.id })))
@@ -2667,13 +2806,14 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   }
 
   async function handleUnlinkResume(resume: ResumeListItem) {
+    if (renameWriteRef.current || renameFenceFor(resume.id)) return
     const ok = await confirm({
       title: 'Cancel job link?',
       message: 'This will remove the job connection and clear its Final status. Your resume and cover letter files will stay intact.',
       danger: true,
       confirmLabel: 'Cancel link',
     })
-    if (!ok) return
+    if (!ok || renameWriteRef.current) return
 
     const { data, error } = await apiMutate<Resume>(`/api/resume/${resume.id}`, 'PATCH', { unlinkJob: true })
     if (!data || error) { toast.error('Could not cancel link', error ?? 'Please try again'); return }
@@ -2704,9 +2844,10 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   }
 
   async function handleDeleteResume(resume: ResumeListItem) {
+    if (renameWriteRef.current || renameFenceFor(resume.id)) return
     if (resumes.length <= 1) return toast.error('Keep one resume', 'Create another version before deleting this resume.')
     const approved = await confirm({ title: 'Delete resume?', message: `Delete “${resume.name}”? This cannot be undone.`, danger: true, confirmLabel: 'Delete' })
-    if (!approved) return
+    if (!approved || renameWriteRef.current) return
     if (resume.id === selectedResumeIdRef.current && (dirtyRef.current || isSavingRef.current)) {
       if (!(await handleSave()) || dirtyRef.current || isSavingRef.current) return
     }
@@ -2826,7 +2967,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   async function selectResume(id: string, suppliedTarget?: ResumeListItem): Promise<boolean> {
     const attempt = ++resumeSelectionAttempt.current
     if (id === selectedResumeIdRef.current) return true
-    if (hasUnknownResumeSave()) return false
+    if (hasUnknownResumeSave() || renameWriteRef.current) return false
     if (applyingAuditRef.current || versionRestoreIntentRef.current) {
       toast.info(t('resume.toastSaving'), t('resume.toastSavingDetail'))
       return false
@@ -2906,8 +3047,11 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       {hasUnknownResumeSave() && <p role="status">{lang === 'zh'
         ? '简历保存结果待核实。请复制未保存的编辑，重新加载并核对最新内容；一次读取不能证明之前的保存没有发生。'
         : 'The resume save is unconfirmed. Copy unsaved edits, reload and review the latest content; one read cannot prove the earlier save did not happen.'}</p>}
+      {renameFenceChecked && !renamingPending && hasRenameFence() && <p role="status">{lang === 'zh'
+        ? '某份简历的重命名结果无法确认，或此标签页的保护存储不可用。请复制未保存的编辑并核对简历；该保护不会因单次读取自动解除。'
+        : 'A resume rename is unconfirmed, or this tab’s protective storage is unavailable. Copy unsaved edits and review the resume; a single read cannot automatically clear this protection.'}</p>}
       {!loadingCont && selectedResumeId && contentResumeId === selectedResumeId && !contentVerified && <p role="status">
-        {lang === 'zh' ? '无法确认最新简历；请保留编辑并重新加载，确认后再审核材料。' : 'The latest resume could not be verified. Keep your edits and reload before reviewing materials.'}
+        {lang === 'zh' ? '无法确认最新简历版本；请复制未保存的编辑并重新加载核对，确认后再保存或审核材料。' : 'The latest resume version could not be verified. Copy unsaved edits, reload and review it before saving or checking materials.'}
         <button type="button" onClick={() => setResumeReadAttempt(value => value + 1)}>{t('common.retry')}</button>
       </p>}
 
@@ -3157,11 +3301,16 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
           {rightPanel === 'persona' ? <PersonaPanel isDefault={selectedResume?.isDefault ?? false} onEditResume={setEditSection} onUseAsProfile={() => { if (selectedResume) void handleSetDefaultResume(selectedResume) }} /> : <>
           <div className="resume-opportunity-card">
             <span className="resume-opportunity-eyebrow">{t('resume.linkedOpportunity')}</span>
-            {originalApplicationId && !verifiedReturnJob ? <div role="status">
+            {originalApplicationId && !verifiedReturnJob && !analysisReturnJob ? <div role="status">
+              {displayReturnJob && <><strong>{displayReturnJob.role}</strong><span>{displayReturnJob.company}</span></>}
               <p>{returnJobLoading ? t('jobs.loadingDetail') : returnJobSelectionChanged
                 ? (lang === 'zh' ? '此申请已选择另一份简历。请返回申请核对当前材料。' : 'This application has a different selected resume. Return to the application to review its current materials.')
                 : t('application.linkUnavailable')}</p>
               {!returnJobLoading && <button type="button" onClick={() => { setReturnJobRetry(value => value + 1); if (!verifiedResumeScope) setResumeReadAttempt(value => value + 1) }}>{t('application.refreshStatus')}</button>}
+            </div> : !verifiedResumeScope && selectedJob && analysisResumeScope ? <div role="status">
+              <strong>{selectedJob.role}</strong><span>{selectedJob.company}</span>
+              <p>{t('resume.cachedVersionDetail')}</p>
+              <button type="button" onClick={() => setResumeReadAttempt(value => value + 1)}>{t('common.retry')}</button>
             </div> : !verifiedResumeScope ? <div role="status">
               <p>{t(selectedResumeId ? 'resume.analysisLoadingTitle' : 'resume.selectFirst')}</p>
               {selectedResumeId && contentValidated && !contentVerified && <button type="button" onClick={() => setResumeReadAttempt(value => value + 1)}>{t('common.retry')}</button>}
@@ -3331,7 +3480,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
           downloadingPack={downloadingPack}
         />
       )}
-      {renamingResume && <RenameResumeModal resume={renamingResume} onClose={() => setRenamingResume(null)} onRename={name => handleRenameResume(renamingResume, name)} />}
+      {renamingResume && <RenameResumeModal resume={renamingResume} pending={renamingPending} blocked={renameFenceFor(renamingResume.id)} failure={renameStorageFailure} onClose={() => { setRenamingResume(null); setRenameStorageFailure(false) }} onRename={name => handleRenameResume(renamingResume, name)} />}
       {showUploadModal && (
         <UploadResumeModal onClose={() => setShowUploadModal(false)} onImport={handleImportResume} />
       )}

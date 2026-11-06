@@ -1931,6 +1931,19 @@ for (const placement of ['in-list', 'cross-page'] as const) {
   })
 }
 
+test('cross-page original application is used for score and suggestions', async ({ page }) => {
+  const state = await install(page, { versionedScore: true })
+  Object.assign(state.resume, { targetJobId: null })
+  const other = { ...state.job, id: 'other-job', company: 'Other Employer', role: 'Other Role' }
+  await page.route('**/api/jobs?*', route => route.fulfill({ json: { jobs: [other], total: 2 } }))
+  await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+  await expect(page.locator('.resume-opportunity-card')).toContainText('Fixture Employer')
+  await page.getByRole('button', { name: /Analyze match|分析匹配度/ }).first().click()
+  await expect.poll(() => state.analysisCalls.length).toBe(2)
+  for (const call of state.analysisCalls) expect(call.body).toMatchObject({ jobTitle: 'Application flow engineer', jobCompany: 'Fixture Employer' })
+  expect(state.unexpected).toEqual([])
+})
+
 for (const outcome of ['unavailable', 'wrong-owner', 'unrelated', 'missing-binding', 'missing-letter', 'invalid-letter'] as const) {
   test(`original application ${outcome} cannot fall back to another shared-resume job`, async ({ page }) => {
     const state = await install(page)
@@ -2075,6 +2088,332 @@ for (const outcome of ['delayed', 'failed'] as const) {
     } finally { release() }
   })
 }
+
+test('resume rename serializes around saves and preserves edits made while pending', async ({ page }) => {
+  const state = await install(page, { twoResumes: true })
+  let releaseSave = () => {}, releaseRename = () => {}
+  const saveGate = new Promise<void>(resolve => { releaseSave = resolve })
+  const renameGate = new Promise<void>(resolve => { releaseRename = resolve })
+  const writes: Array<{ name?: string; content?: { summary?: string } }> = []
+  await page.route('**/api/resume/resume-1', async route => {
+    if (route.request().method() !== 'PATCH') return route.fallback()
+    const body = route.request().postDataJSON() as { name?: string; content?: { summary?: string } }
+    writes.push(body)
+    if (body.content && writes.length === 1) await saveGate
+    if (!body.content) await renameGate
+    Object.assign(state.resume, body, { updatedAt: '2026-10-30T12:00:00.000Z' })
+    await route.fulfill({ json: state.resume }).catch(() => undefined)
+  })
+  try {
+    await page.goto(`${origin}/?page=resume&resumeId=resume-1`)
+    const editor = page.locator('[data-resume-editor]')
+    await editor.getByText('Software engineer.', { exact: false }).first().click()
+    await editor.locator('textarea').first().fill('First saved edit')
+    await expect.poll(() => writes.length).toBe(1)
+    await page.getByRole('button', { name: 'More actions for Fixture role resume' }).click()
+    await page.getByRole('button', { name: /^(Rename|重命名)$/ }).click()
+    const rename = page.getByText(/Choose a clear name for this version|为此版本选择一个清晰的名称/).locator('..')
+    await rename.locator('input').fill('Renamed fixture')
+    await rename.getByRole('button', { name: /Save name|保存名称/ }).click()
+    await expect(rename.getByRole('button', { name: /Save name|保存名称/ })).toBeDisabled()
+    expect(writes).toHaveLength(1)
+    releaseSave()
+    await expect.poll(() => writes.length).toBe(2)
+    expect(writes[1]).toEqual({ name: 'Renamed fixture' })
+    await expect(rename.getByRole('button', { name: /Cancel|取消/ })).toBeDisabled()
+    await editor.getByText('First saved edit', { exact: false }).first().dispatchEvent('click')
+    await editor.locator('textarea').first().fill('Second edit during rename')
+    await page.locator('.resume-library-item').filter({ hasText: 'Second fixture resume' }).dispatchEvent('click')
+    await expect(editor.getByText('Second edit during rename', { exact: false }).first()).toBeVisible()
+    await page.waitForTimeout(2200)
+    expect(writes).toHaveLength(2)
+    releaseRename()
+    await expect.poll(() => writes.length).toBe(3)
+    expect(writes[2].name).toBe('Renamed fixture')
+    expect(writes[2].content?.summary).toBe('Second edit during rename')
+    await expect.poll(() => state.resume.name).toBe('Renamed fixture')
+    await expect.poll(() => state.resume.content.summary).toBe('Second edit during rename')
+  } finally { releaseSave(); releaseRename() }
+})
+
+test('rename stops waiting for a hanging prior save without issuing another write', async ({ page }) => {
+  await install(page, { twoResumes: true })
+  let release = () => {}, writes = 0
+  const gate = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/resume/resume-1', async route => {
+    if (route.request().method() !== 'PATCH') return route.fallback()
+    writes++
+    await gate
+    await route.abort('failed').catch(() => undefined)
+  })
+  try {
+    await page.goto(`${origin}/?page=resume&resumeId=resume-1`)
+    const editor = page.locator('[data-resume-editor]')
+    await editor.getByText('Software engineer.', { exact: false }).first().click()
+    await editor.locator('textarea').first().fill('Keep this pending edit')
+    await expect.poll(() => writes).toBe(1)
+    await page.clock.install()
+    await page.getByRole('button', { name: 'More actions for Fixture role resume' }).click()
+    await page.getByRole('button', { name: /^(Rename|重命名)$/ }).click()
+    const rename = page.getByText(/Choose a clear name for this version|为此版本选择一个清晰的名称/).locator('..')
+    await rename.locator('input').fill('Never sent rename')
+    await rename.getByRole('button', { name: /Save name|保存名称/ }).click()
+    await page.clock.fastForward(30_001)
+    await expect(rename.getByText(/rename status cannot be safely confirmed|无法安全确认重命名状态/)).toBeVisible()
+    await rename.getByRole('button', { name: /Cancel|取消/ }).click()
+    await expect(editor.getByText('Keep this pending edit', { exact: false }).first()).toBeVisible()
+    expect(writes).toBe(1)
+  } finally { release() }
+})
+
+test('unknown rename for another resume preserves the current edit and remains locked after reload', async ({ page }) => {
+  const state = await install(page, { twoResumes: true })
+  const writes: Array<{ id: string; body: { name?: string; content?: { summary?: string } } }> = []
+  await page.route('**/api/resume/resume-*', async route => {
+    if (route.request().method() !== 'PATCH') return route.fallback()
+    const id = new URL(route.request().url()).pathname.split('/').pop()!
+    const body = route.request().postDataJSON() as { name?: string; content?: { summary?: string } }
+    writes.push({ id, body })
+    if (id === 'resume-2') return route.abort('failed')
+    Object.assign(state.resume, body, { updatedAt: '2026-10-30T12:00:00.000Z' })
+    return route.fulfill({ json: state.resume })
+  })
+  await page.goto(`${origin}/?shell=1&page=resume&resumeId=resume-1`)
+  await page.getByRole('button', { name: 'More actions for Second fixture resume' }).click()
+  await page.getByRole('button', { name: /^(Rename|重命名)$/ }).click()
+  const rename = page.getByText(/Choose a clear name for this version|为此版本选择一个清晰的名称/).locator('..')
+  await rename.locator('input').fill('Unconfirmed other name')
+  await rename.getByRole('button', { name: /Save name|保存名称/ }).click()
+  await expect(page.getByText(/A resume rename is unconfirmed|某份简历的重命名结果无法确认/)).toBeVisible()
+  const editor = page.locator('[data-resume-editor]')
+  await editor.getByText('Software engineer.', { exact: false }).first().dispatchEvent('click')
+  await editor.locator('textarea').first().fill('Current resume safe edit')
+  await expect.poll(() => writes.some(write => write.id === 'resume-1' && write.body.content?.summary === 'Current resume safe edit')).toBe(true)
+  expect(writes.filter(write => write.id === 'resume-2')).toHaveLength(1)
+  await page.locator('#desktop-sidebar button').filter({ hasText: /^(Discover|发现|发现职位|Ontdekken)$/ }).dispatchEvent('click')
+  await expect(page).toHaveURL(/page=search/)
+  await page.goto(`${origin}/?page=resume&resumeId=resume-1`)
+  await expect(page.getByText(/A resume rename is unconfirmed|某份简历的重命名结果无法确认/)).toBeVisible()
+  page.on('dialog', dialog => void dialog.accept())
+  await page.reload()
+  await expect(page.getByText(/A resume rename is unconfirmed|某份简历的重命名结果无法确认/)).toBeVisible()
+  await page.getByRole('button', { name: 'More actions for Second fixture resume' }).click()
+  await page.getByRole('button', { name: /^(Rename|重命名)$/ }).click()
+  const retry = page.getByText(/Choose a clear name for this version|为此版本选择一个清晰的名称/).locator('..')
+  await retry.locator('input').fill('Another name')
+  await expect(retry.getByRole('button', { name: /Save name|保存名称/ })).toBeDisabled()
+  await expect(retry.getByText(/rename status cannot be safely confirmed|无法安全确认重命名状态/)).toBeVisible()
+  expect(writes.filter(write => write.id === 'resume-2')).toHaveLength(1)
+})
+
+test('late rename failure remains scoped to its original account', async ({ page }) => {
+  const state = await install(page, { twoResumes: true })
+  let release = () => {}, entered = false
+  const gate = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/resume/resume-2', async route => {
+    if (route.request().method() !== 'PATCH') return route.fallback()
+    entered = true
+    await gate
+    await route.abort('failed').catch(() => undefined)
+  })
+  try {
+    await page.goto(`${origin}/?page=resume&resumeId=resume-1`)
+    await page.getByRole('button', { name: 'More actions for Second fixture resume' }).click()
+    await page.getByRole('button', { name: /^(Rename|重命名)$/ }).click()
+    const rename = page.getByText(/Choose a clear name for this version|为此版本选择一个清晰的名称/).locator('..')
+    await rename.locator('input').fill('Account A unconfirmed name')
+    await rename.getByRole('button', { name: /Save name|保存名称/ }).click()
+    await expect.poll(() => entered).toBe(true)
+    state.activeUserId = 'fixture-b'
+    await fixtureSession(page, 'authenticated', 'fixture-b')
+    release()
+    await expect.poll(() => page.evaluate(() => sessionStorage.getItem('applymate:resume-rename:fixture-user'))).toContain('resume-2')
+    expect(await page.evaluate(() => sessionStorage.getItem('applymate:resume-rename:fixture-b'))).toBeNull()
+    await expect(page.getByText('Account A unconfirmed name')).toHaveCount(0)
+    state.activeUserId = 'fixture-user'
+    await fixtureSession(page, 'authenticated', 'fixture-user')
+    await expect(page.getByText(/A resume rename is unconfirmed|某份简历的重命名结果无法确认/)).toBeVisible()
+  } finally { release() }
+})
+
+test('hanging rename becomes unconfirmed and does not retry after navigation', async ({ page }) => {
+  const state = await install(page, { twoResumes: true })
+  let release = () => {}, writes = 0
+  const gate = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/resume/resume-2', async route => {
+    if (route.request().method() !== 'PATCH') return route.fallback()
+    writes++
+    await gate
+    await route.fulfill({ json: { ...state.secondResume, name: 'Hanging rename' } }).catch(() => undefined)
+  })
+  try {
+    await page.goto(`${origin}/?shell=1&page=resume&resumeId=resume-1`)
+    await expect(page.locator('.resume-opportunity-card')).toContainText('Fixture Employer')
+    await page.clock.install()
+    await page.getByRole('button', { name: 'More actions for Second fixture resume' }).click()
+    await page.getByRole('button', { name: /^(Rename|重命名)$/ }).click()
+    const rename = page.getByText(/Choose a clear name for this version|为此版本选择一个清晰的名称/).locator('..')
+    await rename.locator('input').fill('Hanging rename')
+    await rename.getByRole('button', { name: /Save name|保存名称/ }).click()
+    await expect.poll(() => writes).toBe(1)
+    await page.clock.fastForward(30_001)
+    await expect(page.getByText(/A resume rename is unconfirmed|某份简历的重命名结果无法确认/)).toBeVisible()
+    await expect(page.getByText(/Choose a clear name for this version|为此版本选择一个清晰的名称/)).toHaveCount(0)
+    await page.locator('#desktop-sidebar button').filter({ hasText: /^(Discover|发现|发现职位|Ontdekken)$/ }).dispatchEvent('click')
+    await expect(page).toHaveURL(/page=search/)
+    release()
+    expect(writes).toBe(1)
+    await expect.poll(() => page.evaluate(() => sessionStorage.getItem('applymate:resume-rename:fixture-user'))).not.toContain('resume-2')
+  } finally { release() }
+})
+
+test('late rename success cannot clear a different attempt', async ({ page }) => {
+  const state = await install(page, { twoResumes: true })
+  let release = () => {}, writes = 0
+  const gate = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/resume/resume-2', async route => {
+    if (route.request().method() !== 'PATCH') return route.fallback()
+    writes++
+    await gate
+    await route.fulfill({ json: { ...state.secondResume, name: 'Late rename' } }).catch(() => undefined)
+  })
+  try {
+    await page.goto(`${origin}/?page=resume&resumeId=resume-1`)
+    await expect(page.locator('.resume-opportunity-card')).toContainText('Fixture Employer')
+    await page.clock.install()
+    await page.getByRole('button', { name: 'More actions for Second fixture resume' }).click()
+    await page.getByRole('button', { name: /^(Rename|重命名)$/ }).click()
+    const rename = page.getByText(/Choose a clear name for this version|为此版本选择一个清晰的名称/).locator('..')
+    await rename.locator('input').fill('Late rename')
+    await rename.getByRole('button', { name: /Save name|保存名称/ }).click()
+    await expect.poll(() => writes).toBe(1)
+    await page.clock.fastForward(30_001)
+    await expect(page.getByText(/A resume rename is unconfirmed|某份简历的重命名结果无法确认/)).toBeVisible()
+    await page.evaluate(() => sessionStorage.setItem('applymate:resume-rename:fixture-user', JSON.stringify({ 'resume-2': 'different-attempt' })))
+    const response = page.waitForResponse(response => response.url().endsWith('/api/resume/resume-2') && response.request().method() === 'PATCH')
+    release()
+    await response
+    await expect.poll(() => page.evaluate(() => sessionStorage.getItem('applymate:resume-rename:fixture-user'))).toContain('different-attempt')
+    expect(writes).toBe(1)
+  } finally { release() }
+})
+
+test('late rename success stays scoped to its original account', async ({ page }) => {
+  const state = await install(page, { twoResumes: true })
+  let release = () => {}, writes = 0
+  const gate = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/resume/resume-2', async route => {
+    if (route.request().method() !== 'PATCH') return route.fallback()
+    writes++
+    await gate
+    await route.fulfill({ json: { ...state.secondResume, name: 'Account A late rename' } }).catch(() => undefined)
+  })
+  try {
+    await page.goto(`${origin}/?page=resume&resumeId=resume-1`)
+    await expect(page.locator('.resume-opportunity-card')).toContainText('Fixture Employer')
+    await page.clock.install()
+    await page.getByRole('button', { name: 'More actions for Second fixture resume' }).click()
+    await page.getByRole('button', { name: /^(Rename|重命名)$/ }).click()
+    const rename = page.getByText(/Choose a clear name for this version|为此版本选择一个清晰的名称/).locator('..')
+    await rename.locator('input').fill('Account A late rename')
+    await rename.getByRole('button', { name: /Save name|保存名称/ }).click()
+    await expect.poll(() => writes).toBe(1)
+    await page.clock.fastForward(30_001)
+    await expect(page.getByText(/A resume rename is unconfirmed|某份简历的重命名结果无法确认/)).toBeVisible()
+    state.activeUserId = 'fixture-b'
+    await fixtureSession(page, 'authenticated', 'fixture-b')
+    const response = page.waitForResponse(response => response.url().endsWith('/api/resume/resume-2') && response.request().method() === 'PATCH')
+    release()
+    await response
+    await expect.poll(() => page.evaluate(() => sessionStorage.getItem('applymate:resume-rename:fixture-user'))).not.toContain('resume-2')
+    expect(await page.evaluate(() => sessionStorage.getItem('applymate:resume-rename:fixture-b'))).toBeNull()
+    await expect(page.getByText('Account A late rename')).toHaveCount(0)
+  } finally { release() }
+})
+
+test('late rename success cannot replace a newer displayed resume revision', async ({ page }) => {
+  const state = await install(page, { twoResumes: true })
+  let release = () => {}, writes = 0
+  const gate = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/resume/resume-2', async route => {
+    if (route.request().method() !== 'PATCH') return route.fallback()
+    writes++
+    await gate
+    await route.fulfill({ json: { ...state.secondResume, name: 'Older rename', updatedAt: '2026-10-30T11:00:00.000Z' } }).catch(() => undefined)
+  })
+  try {
+    await page.goto(`${origin}/?page=resume&resumeId=resume-1`)
+    await expect(page.locator('.resume-opportunity-card')).toContainText('Fixture Employer')
+    await page.clock.install()
+    await page.getByRole('button', { name: 'More actions for Second fixture resume' }).click()
+    await page.getByRole('button', { name: /^(Rename|重命名)$/ }).click()
+    const rename = page.getByText(/Choose a clear name for this version|为此版本选择一个清晰的名称/).locator('..')
+    await rename.locator('input').fill('Older rename')
+    await rename.getByRole('button', { name: /Save name|保存名称/ }).click()
+    await expect.poll(() => writes).toBe(1)
+    await page.clock.fastForward(30_001)
+    Object.assign(state.secondResume, { name: 'Newer revision', updatedAt: '2026-10-30T12:00:00.000Z' })
+    state.activeUserId = 'fixture-b'
+    await fixtureSession(page, 'authenticated', 'fixture-b')
+    state.activeUserId = 'fixture-user'
+    await fixtureSession(page, 'authenticated', 'fixture-user')
+    await expect(page.getByText('Newer revision', { exact: true })).toBeVisible()
+    release()
+    await expect.poll(() => page.evaluate(() => sessionStorage.getItem('applymate:resume-rename:fixture-user'))).not.toContain('resume-2')
+    await expect(page.getByText('Newer revision', { exact: true })).toBeVisible()
+    await expect(page.getByText('Older rename', { exact: true })).toHaveCount(0)
+  } finally { release() }
+})
+
+test('unavailable rename storage permits clean navigation but protects dirty edits', async ({ page }) => {
+  const state = await install(page)
+  await page.addInitScript(() => {
+    const get = Storage.prototype.getItem
+    Storage.prototype.getItem = function (key) {
+      if (this === sessionStorage && key.startsWith('applymate:resume-rename:')) throw new Error('Storage unavailable')
+      return get.call(this, key)
+    }
+  })
+  await page.goto(`${origin}/?shell=1&page=resume&resumeId=resume-1`)
+  await expect(page.getByText(/protective storage is unavailable|保护存储不可用/)).toBeVisible()
+  await page.locator('#desktop-sidebar button').filter({ hasText: /^(Discover|发现|发现职位|Ontdekken)$/ }).dispatchEvent('click')
+  await expect(page).toHaveURL(/page=search/)
+  await page.goto(`${origin}/?shell=1&page=resume&resumeId=resume-1`)
+  const editor = page.locator('[data-resume-editor]')
+  await editor.getByText('Software engineer.', { exact: false }).first().dispatchEvent('click')
+  await editor.locator('textarea').first().fill('Keep unsaved storage edit')
+  await page.waitForTimeout(2300)
+  expect(state.writes.filter(write => write.path.includes('/api/resume/resume-1'))).toHaveLength(0)
+  await page.locator('#desktop-sidebar button').filter({ hasText: /^(Discover|发现|发现职位|Ontdekken)$/ }).dispatchEvent('click')
+  await expect(page).toHaveURL(/page=resume/)
+  await expect(editor.getByText('Keep unsaved storage edit', { exact: false }).first()).toBeVisible()
+})
+
+test('rename does not write when its protective storage cannot be saved', async ({ page }) => {
+  const state = await install(page, { twoResumes: true })
+  let writes = 0
+  await page.route('**/api/resume/resume-2', async route => {
+    if (route.request().method() !== 'PATCH') return route.fallback()
+    writes++
+    return route.fulfill({ json: state.secondResume })
+  })
+  await page.goto(`${origin}/?page=resume&resumeId=resume-1`)
+  await expect(page.locator('.resume-opportunity-card')).toContainText('Fixture Employer')
+  await page.evaluate(() => {
+    const set = Storage.prototype.setItem
+    Storage.prototype.setItem = function (key, value) {
+      if (this === sessionStorage && key.startsWith('applymate:resume-rename:')) throw new Error('Storage unavailable')
+      return set.call(this, key, value)
+    }
+  })
+  await page.getByRole('button', { name: 'More actions for Second fixture resume' }).click()
+  await page.getByRole('button', { name: /^(Rename|重命名)$/ }).click()
+  const rename = page.getByText(/Choose a clear name for this version|为此版本选择一个清晰的名称/).locator('..')
+  await rename.locator('input').fill('Unsafe name')
+  await rename.getByRole('button', { name: /Save name|保存名称/ }).click()
+  await expect(rename.getByText(/rename status cannot be safely confirmed|无法安全确认重命名状态/)).toBeVisible()
+  expect(writes).toBe(0)
+})
 
 test('a late original job read cannot override the explicitly switched resume context', async ({ page }) => {
   const state = await install(page, { twoResumes: true })
@@ -2773,7 +3112,7 @@ test('pending and unconfirmed job link blocks another link, review and return', 
     return route.abort('failed')
   })
   try {
-    await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    await page.goto(`${origin}/?shell=1&page=resume&resumeId=resume-1`)
     const card = page.locator('.resume-opportunity-card')
     const select = card.locator('select')
     await select.selectOption('outside-page')
@@ -2784,12 +3123,14 @@ test('pending and unconfirmed job link blocks another link, review and return', 
     await select.selectOption('job-2')
     await expect(link).toBeDisabled()
     await expect(page.getByRole('button', { name: /Confirm application materials|确认申请材料/, exact: true })).toBeDisabled()
-    await expect(page.getByRole('button', { name: /Back to this application|返回此申请/ })).toBeDisabled()
+    await page.locator('#desktop-sidebar').getByRole('button', { name: /^(Discover|发现|发现职位|Ontdekken)$/ }).click()
+    await expect(page).toHaveURL(/page=resume/)
     release()
     await expect(page.getByText(/The job link is unconfirmed|职位关联结果待核实/)).toBeVisible()
     await expect(link).toBeDisabled()
     await expect(page.getByRole('button', { name: /Confirm application materials|确认申请材料/, exact: true })).toBeDisabled()
-    await expect(page.getByRole('button', { name: /Back to this application|返回此申请/ })).toBeDisabled()
+    await page.locator('#desktop-sidebar').getByRole('button', { name: /^(Discover|发现|发现职位|Ontdekken)$/ }).click()
+    await expect(page).toHaveURL(/page=resume/)
     expect(requests).toEqual([{ targetJobId: 'outside-page' }])
     expect(state.writes).toEqual([])
     expect(state.unexpected).toEqual([])
@@ -5712,6 +6053,23 @@ test('cached old resume revalidation never labels its analysis as the new versio
 })
 
 
+test('unverified cached resume edits are retained without issuing a save', async ({ page }) => {
+  const state = await install(page, { holdResumeContent: true, resumeRevalidationFails: true })
+  await page.addInitScript(cached => sessionStorage.setItem('fixture_cached_resume', JSON.stringify(cached)), resume())
+  try {
+    await page.goto(`${origin}/?page=resume&resumeId=resume-1`)
+    await expect.poll(() => state.resumeContentRequested).toBe(true)
+    const editor = page.locator('[data-resume-editor]')
+    await editor.getByText('Software engineer.', { exact: false }).first().click()
+    await editor.locator('textarea').first().fill('Unsaved cached edit')
+    state.releaseResumeContent()
+    await expect(page.getByText(/Copy unsaved edits, reload|复制未保存的编辑并重新加载/).first()).toBeVisible()
+    await page.waitForTimeout(2500)
+    expect(state.writes.filter(write => write.path.includes('/api/resume/resume-1'))).toHaveLength(0)
+    await expect(editor.getByText('Unsaved cached edit', { exact: false }).first()).toBeVisible()
+  } finally { state.releaseResumeContent() }
+})
+
 test('failed resume revalidation keeps cached analysis bound to the old version', async ({ page }) => {
   const state = await install(page, { holdResumeContent: true, resumeRevalidationFails: true, versionedScore: true })
   const oldResume = resume()
@@ -5925,14 +6283,14 @@ for (const pending of ['resume GET', 'analysis'] as const) {
         await expect.poll(() => state.analysisCalls.filter(call => (call.body as { resumeContent?: { summary?: string } }).resumeContent?.summary === 'Software engineer.').length).toBe(2)
       }
       await expect(page.locator('[data-resume-editor]').getByText('Software engineer.', { exact: false }).first()).toBeVisible()
-      await page.getByRole('button', { name: 'Apply generated fix', exact: true }).click()
       if (pending === 'resume GET') {
+        await expect(page.getByRole('button', { name: 'Apply generated fix', exact: true })).toHaveCount(0)
         expect(state.writes.map(write => write.path)).not.toContain('/api/jobs/outside-page/audit-application/apply')
         const currentRead = page.waitForResponse(response => response.url().endsWith('/api/resume/resume-1') && response.request().method() === 'GET')
         state.releaseResumeContent()
         await (await currentRead).finished()
-        await page.getByRole('button', { name: 'Apply generated fix', exact: true }).click()
       }
+      await page.getByRole('button', { name: 'Apply generated fix', exact: true }).click()
       await expect.poll(() => state.writes.map(write => write.path)).toContain('/api/jobs/outside-page/audit-application/apply')
       await expect(page.locator('[data-resume-editor]').getByText('Audited v2 summary', { exact: false }).first()).toBeVisible()
       await expect.poll(() => page.evaluate(() => {

@@ -424,6 +424,14 @@ a page holding a draft, but a confirmed close or reload
 removes that in-memory copy. Real authentication and cross-device recovery have not
 been verified by the mocked browser tests.
 
+Resume renaming waits for an in-flight save, and edits made during a rename remain
+pending for the next save. This tab stores an account- and resume-scoped marker
+before the rename request. An unknown outcome retains the marker and prevents
+overwriting that resume; a matching late response can settle its own marker.
+The marker contains no resume name or content and does not protect other tabs or
+devices, or survive clearing this tab's storage. If protective storage is
+unavailable, the page explains the restriction and asks the user to preserve edits.
+
 If an audit correction and a new local edit overlap, automatic saving is paused.
 The user is asked to copy the local edits, reload and compare the latest saved
 content. There is no automatic merge or complete draft recovery for this conflict.
