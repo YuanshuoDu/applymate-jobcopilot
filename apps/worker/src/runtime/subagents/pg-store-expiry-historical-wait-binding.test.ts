@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL } from "./pg-store-expiry-historical-wait-binding.js"
-import { CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL, CHILD_WAIT_HISTORICAL_SOURCE_RESULT_RECEIPT_SQL } from "./pg-store-expiry-historical-wait-event-binding.js"
+import { CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL, CHILD_WAIT_HISTORICAL_SOURCE_RESULT_RECEIPT_SQL,
+  HISTORICAL_SOURCE_STEP_BINDING_SQL, HISTORICAL_SOURCE_WAIT_HANDOFF_SQL } from "./pg-store-expiry-historical-wait-event-binding.js"
 import { HISTORICAL_SOURCE_STEP_PREFIX_SQL } from "./pg-store-expiry-historical-source-step-prefix.js"
 
 const sql = CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL.replace(/\s+/g, " ")
@@ -25,10 +26,14 @@ describe("final historical wait receipt binding", () => {
     const events = sqlDiagnosis(CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL)
     const receipt = sqlDiagnosis(CHILD_WAIT_HISTORICAL_SOURCE_RESULT_RECEIPT_SQL)
     const prefix = sqlDiagnosis(HISTORICAL_SOURCE_STEP_PREFIX_SQL)
+    const handoff = sqlDiagnosis(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL)
+    const stepBinding = sqlDiagnosis(HISTORICAL_SOURCE_STEP_BINDING_SQL)
     expect(events.balance, `event quote ${events.quoteAt}: ${JSON.stringify(CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL.slice(Math.max(0, (events.quoteAt ?? 0) - 20), (events.quoteAt ?? 0) + 80))}`).toBe(0)
     expect(binding.balance, `binding quote ${binding.quoteAt}`).toBe(0)
     expect(receipt.balance).toBe(0)
     expect(prefix.balance).toBe(0)
+    expect(handoff.balance).toBe(0)
+    expect(stepBinding.balance).toBe(0)
   })
   it("revalidates the same receipt under the current owner and tenant fence", () => {
     expect(sql).toContain("boundWait.\"id\" = proof.value->'sourceWait'->>'waitId'")
@@ -53,6 +58,14 @@ describe("final historical wait receipt binding", () => {
     expect(sql).toContain("boundSourceResult.\"content\" = jsonb_build_object")
   })
 
+  it("rechecks the validated recovered marker owner digest against the current receipt", () => {
+    expect(CHILD_WAIT_HISTORICAL_SOURCE_RESULT_RECEIPT_SQL).toContain("sourceLifecycleRecoveryOwnerDigest")
+    expect(CHILD_WAIT_HISTORICAL_SOURCE_RESULT_RECEIPT_SQL).toContain("encode(sha256(convert_to(")
+    expect(CHILD_WAIT_HISTORICAL_SOURCE_RESULT_RECEIPT_SQL).toContain("boundWait.\"result\"->'sourceLifecycleRecovery'->>'ownerId'")
+    expect(CHILD_WAIT_HISTORICAL_SOURCE_RESULT_RECEIPT_SQL).toContain("proof.value->'sourceWait'->'sourceLifecycleRecoveryOwnerDigest' = 'null'::jsonb")
+    expect(sql).toContain("sourceLifecycleRecoveryOwnerDigest")
+  })
+
   it("uses safe array fallbacks and rejects malformed JSON without unsafe array operations", () => {
     expect(sql).toContain("CASE WHEN jsonb_typeof(boundWait.\"targetTaskIds\") = 'array'")
     expect(sql).toContain("CASE WHEN jsonb_typeof(boundWait.\"matchedTaskIds\") = 'array'")
@@ -72,5 +85,18 @@ describe("final historical wait receipt binding", () => {
 
   it("parenthesizes JSON text extraction operands after PostgreSQL concatenation", () => {
     expect(CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL).not.toMatch(unparenthesizedJsonExtractionAfterConcat)
+  })
+
+  it("accepts recovered handoff only as source evidence while retaining the complete claim proof", () => {
+    expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain("recovered_wait_handoff.v1")
+    expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain('boundSource."status" = \'waiting_for_tool\'')
+    expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain('sourceStepDone."type" = \'step.completed\'')
+    expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain('AND sourceItem."stepId" = boundSource."id") = 2')
+    expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain("betweenAnchors.\"sequence\"::numeric BETWEEN")
+    expect(HISTORICAL_SOURCE_STEP_BINDING_SQL).toContain("sourceStepPrefix")
+    expect(HISTORICAL_SOURCE_STEP_BINDING_SQL).toContain("sourceStepHandoff")
+    expect(sql).toContain("callStep.\"attempt\" = owner.\"attemptCount\"")
+    expect(sql).toContain("callStep.\"status\" = 'completed'")
+    expect(sql).toContain("= proof.value->'sourceWait'->>'claimKeyDigest') = 1")
   })
 })

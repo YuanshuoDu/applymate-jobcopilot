@@ -1,4 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import { createHash } from "node:crypto"
+import { buildCognitiveActionAgenda } from "../turns/cognitive-action-agenda.js"
+import { buildCognitiveAgendaReceipt, cognitiveAgendaReceiptIdempotencyKey } from "../turns/cognitive-agenda-receipt.js"
+import type { StepContext } from "../context/step-context-builder.js"
 
 const mocks = vi.hoisted(() => ({ inspect: vi.fn(), chain: vi.fn(), prefix: vi.fn() }))
 vi.mock("./child-resume-source-wait-lifecycle.js", () => ({ inspectChildWaitSourceLifecycle: mocks.inspect }))
@@ -11,7 +15,7 @@ vi.mock("./pg-store-expiry-historical-source-step-prefix.js", async importOrigin
   return { ...actual, readCanonicalHistoricalSourceStepPrefix: mocks.prefix }
 })
 
-import { safeSubagentWaitJson } from "./durable-subagent-wait-store.js"
+import { DurableSubagentWaitError, safeSubagentWaitJson } from "./durable-subagent-wait-store.js"
 import { MAX_HISTORICAL_SOURCE_WAITS, readChildWaitTerminalCallProjections } from "./pg-store-expiry-historical-wait-projections.js"
 import { CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL } from "./pg-store-expiry-historical-wait-binding.js"
 
@@ -27,8 +31,34 @@ function wait(index: number, sourceWaitCount = 1) {
     stepId: `source-step-${index}`, mode: "any", status: "ready", deadlineAt, resolvedAt: new Date("2026-01-01T00:00:00.000Z"),
     consumedAt: new Date(), suspendedAt: new Date(), matchedTaskIds: taskIds, targetTaskIds: taskIds, idempotencyKey: `source-key-${index}`,
     sourceWaitCount, sourceCallItemId: `source-call-item-${index}`, sourceCallId: `source-call-${index}`,
+    sourceStepStatus: "waiting_for_tool" as string, sourceStepOrdinal: 0,
     result: { request: { targetTaskIds: taskIds, mode: "any", timeoutMs: 100 }, outcome,
-      sourceLifecycleRecovery: { resultItemId: `source-result-${index}` } } }
+      sourceLifecycleRecovery: { resultItemId: `source-result-${index}`, ownerId: "historical-source-owner" } } }
+}
+
+function recoveredHandoffData(source: ReturnType<typeof wait>) {
+  const stepId = source.stepId, callItemId = source.sourceCallItemId, resultItemId = `source-result:${String(source.id).slice(5)}`
+  const context: StepContext = { schemaVersion: "agent-harness.v2", sessionId: task.sessionId, turnId: task.turnId, stepId,
+    inputThroughSequence: 1n, consumedInputIds: [], blocks: [], canonicalJson: "{}" }
+  const agenda = buildCognitiveAgendaReceipt({ sessionId: task.sessionId, turnId: task.turnId, taskId: task.id, stepId,
+    agenda: buildCognitiveActionAgenda(context) })
+  const agendaKey = cognitiveAgendaReceiptIdempotencyKey(stepId)
+  if (!agenda || !agendaKey) throw new Error("fixture_agenda_invalid")
+  const types = ["step.started", "cognitive.agenda", "model.started", "model.completed", "model.usage", "item.started"]
+  const keys = [`task:${task.id}:event:step-started:${stepId}`, `task:${task.id}:event:${agendaKey}`,
+    `task:${task.id}:event:model-started:${stepId}`, `task:${task.id}:event:model-completed:${stepId}`,
+    `task:${task.id}:event:model-usage:${stepId}`, `task:${task.id}:event:item-started:${callItemId}`]
+  const payloads = [{ stepId, ordinal: 0, taskId: task.id }, agenda,
+    { taskId: task.id, provider: "fixture", model: "test-model" },
+    { taskId: task.id, provider: "fixture", model: "test-model", toolCallCount: 1 },
+    { taskId: task.id, provider: "fixture", model: "test-model", usage: { inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0 } },
+    { itemId: callItemId, type: "tool_call", phase: null }]
+  const events = types.map((type, index) => ({ id: `handoff-event-${source.id}-${index}`, sequence: String(index + 1), type,
+    actor: "subagent", itemId: index === 5 ? callItemId : null, correlationId: stepId,
+    causationId: index === 0 ? null : `handoff-event-${source.id}-${index - 1}`, idempotencyKey: keys[index],
+    payload: payloads[index], payloadDigest: "a".repeat(64) }))
+  return { items: [{ id: callItemId, type: "tool_call" }, { id: resultItemId, type: "tool_result" }], events,
+    completed: false, rangeCount: 6 }
 }
 
 function completedClaim(source: ReturnType<typeof wait>, index: number, taskIds = source.targetTaskIds) {
@@ -55,10 +85,14 @@ function completedClaim(source: ReturnType<typeof wait>, index: number, taskIds 
     resultStatus: "completed", resultRevision: 1, resultPhase: null }, terminal, resultEvents: [started, completed, next] }
 }
 
-function client(rows: Record<string, unknown>[], claims: ReturnType<typeof completedClaim>[] = []) {
+function client(rows: Record<string, unknown>[], claims: ReturnType<typeof completedClaim>[] = [], handoff?: ReturnType<typeof recoveredHandoffData>) {
   const query = vi.fn(async (sql: string, values: unknown[] = []) => {
     if (sql.includes("SELECT wait.*")) return { rows }
     if (sql.includes("FROM unnest($1::text[])")) return { rows: (values[0] as string[]).map(id => ({ id })) }
+    if (sql.includes(`"type" = 'step.completed'`)) return { rows: handoff?.completed ? [{ id: "step-completed" }] : [] }
+    if (sql.includes("idempotencyKey\" = ANY($4::text[]) LIMIT 7")) return { rows: handoff?.events ?? [] }
+    if (sql.includes("FROM \"agent_items\"") && sql.includes("ORDER BY \"id\" LIMIT 3")) return { rows: handoff?.items ?? [] }
+    if (sql.includes("COUNT(*)::int AS \"count\" FROM \"agent_events\"")) return { rows: [{ count: handoff?.rangeCount ?? 0 }] }
     if (sql.startsWith('SELECT "id" FROM "agent_events"')) return { rows: [{ id: `source-start:${values[3] as string}` }] }
     if (sql.includes('SELECT claimStep."id"')) return { rows: claims.filter(claim => claim.waitId === values[8]).map(claim => claim.row) }
     if (sql.includes('idempotencyKey" = $4 LIMIT 2')) {
@@ -142,6 +176,57 @@ describe("bounded historical wait projections", () => {
     const db = client([wait(1, 2)])
     await expect(readChildWaitTerminalCallProjections(db as never, task)).resolves.toEqual([])
     expect(mocks.inspect).not.toHaveBeenCalled()
+  })
+
+  it("carries recovered handoff source evidence without replacing the independent claim chain", async () => {
+    const source = wait(1), handoff = recoveredHandoffData(source)
+    mocks.prefix.mockResolvedValue(null)
+    const projections = await readChildWaitTerminalCallProjections(client([source], [completedClaim(source, 1)], handoff) as never, task)
+    const sourceProjection = projections.find(row => row.callItemId === source.sourceCallItemId)
+    const claimProjection = projections.find(row => row.sourceWait.claimKeyDigest !== null)
+    expect(sourceProjection?.sourceStepHandoff).toMatchObject({ schemaVersion: "recovered_wait_handoff.v1",
+      waitId: source.id, stepId: source.stepId, sourceCallItemId: source.sourceCallItemId, events: expect.any(Array) })
+    expect(sourceProjection).not.toHaveProperty("sourceStepPrefix")
+    expect(claimProjection?.sourceStepHandoff).toEqual(sourceProjection?.sourceStepHandoff)
+    expect(claimProjection?.stepToolChain).toEqual(expect.objectContaining({ nextEventId: expect.any(String), calls: expect.any(Array) }))
+    expect(claimProjection?.resultCompletedEventId).toEqual(expect.any(String))
+  })
+
+  it("does not hand off a receipt rejected by the source lifecycle validator", async () => {
+    const source = wait(1)
+    source.result = { ...source.result, sourceLifecycleRecovery: { resultItemId: "forged-result", ownerId: "forged-owner" } }
+    mocks.prefix.mockResolvedValue(null)
+    mocks.inspect.mockRejectedValue(new DurableSubagentWaitError("wait_scope_error", "invalid source marker"))
+    await expect(readChildWaitTerminalCallProjections(client([source], [], recoveredHandoffData(source)) as never, task)).resolves.toEqual([])
+  })
+
+  it("detects a marker owner swap after projection without exposing the owner value", async () => {
+    const source = wait(1), projections = await readChildWaitTerminalCallProjections(client([source]) as never, task)
+    const proof = projections[0]?.sourceWait, originalDigest = proof?.sourceLifecycleRecoveryOwnerDigest
+    expect(originalDigest).toBe(createHash("sha256").update("historical-source-owner").digest("hex"))
+    expect(JSON.stringify(projections)).not.toContain("historical-source-owner")
+    source.result.sourceLifecycleRecovery.ownerId = "different-valid-historical-owner"
+    expect(createHash("sha256").update(source.result.sourceLifecycleRecovery.ownerId).digest("hex")).not.toBe(originalDigest)
+    expect(CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL).toContain("sourceLifecycleRecoveryOwnerDigest' = encode(sha256(convert_to(")
+  })
+
+  it.each([
+    ["streaming source step", (source: ReturnType<typeof wait>, data: ReturnType<typeof recoveredHandoffData>) => { source.sourceStepStatus = "streaming" }],
+    ["completed source step", (source: ReturnType<typeof wait>, data: ReturnType<typeof recoveredHandoffData>) => { source.sourceStepStatus = "completed" }],
+    ["extra source tool call", (_source: ReturnType<typeof wait>, data: ReturnType<typeof recoveredHandoffData>) => { data.items.push({ id: "extra-call", type: "tool_call" }) }],
+    ["step completion", (_source: ReturnType<typeof wait>, data: ReturnType<typeof recoveredHandoffData>) => { data.completed = true }],
+    ["missing anchor", (_source: ReturnType<typeof wait>, data: ReturnType<typeof recoveredHandoffData>) => { data.events.splice(2, 1) }],
+    ["duplicate anchor", (_source: ReturnType<typeof wait>, data: ReturnType<typeof recoveredHandoffData>) => { data.events.push({ ...data.events[0]!, id: "duplicate-anchor" }) }],
+    ["broken causation", (_source: ReturnType<typeof wait>, data: ReturnType<typeof recoveredHandoffData>) => { data.events[5]!.causationId = "detached" }],
+    ["extra event in prelude", (_source: ReturnType<typeof wait>, data: ReturnType<typeof recoveredHandoffData>) => { data.rangeCount += 1 }],
+    ["multiple model calls", (_source: ReturnType<typeof wait>, data: ReturnType<typeof recoveredHandoffData>) => {
+      Object.assign(data.events[3]!, { payload: { ...(data.events[3]!.payload as Record<string, unknown>), toolCallCount: 2 } })
+    }],
+  ])("fails closed on %s in the recovered handoff", async (_label, corrupt) => {
+    const source = wait(1), handoff = recoveredHandoffData(source)
+    mocks.prefix.mockResolvedValue(null)
+    corrupt(source, handoff)
+    await expect(readChildWaitTerminalCallProjections(client([source], [], handoff) as never, task)).resolves.toEqual([])
   })
 
   it("revalidates the same historical receipt and current owner fence in final SQL", () => {

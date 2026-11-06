@@ -1,5 +1,5 @@
-import { CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL, CHILD_WAIT_HISTORICAL_SOURCE_RESULT_RECEIPT_SQL } from "./pg-store-expiry-historical-wait-event-binding.js"
-import { HISTORICAL_SOURCE_STEP_PREFIX_SQL, type HistoricalSourceStepPrefix } from "./pg-store-expiry-historical-source-step-prefix.js"
+import { CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL, CHILD_WAIT_HISTORICAL_SOURCE_RESULT_RECEIPT_SQL, HISTORICAL_SOURCE_STEP_BINDING_SQL } from "./pg-store-expiry-historical-wait-event-binding.js"
+import type { HistoricalSourceStepPrefix } from "./pg-store-expiry-historical-source-step-prefix.js"
 
 export type HistoricalWaitBinding = Readonly<{
   waitId: string
@@ -10,6 +10,7 @@ export type HistoricalWaitBinding = Readonly<{
   projectedSourceCallId: string
   sourceResultItemId: string
   sourceKeyDigest: string
+  sourceLifecycleRecoveryOwnerDigest: string | null
   claimKeyDigest: string | null
   sourceKind: "normal_waiting" | "recovered"
   deadlineAt: string
@@ -18,6 +19,18 @@ export type HistoricalWaitBinding = Readonly<{
   targetTaskIds: readonly string[]
   matchedTaskIds: readonly string[]
   timeoutMs: number
+}>
+
+export type RecoveredWaitHandoff = Readonly<{
+  schemaVersion: "recovered_wait_handoff.v1"
+  waitId: string
+  stepId: string
+  attempt: number
+  sourceCallItemId: string
+  sourceCallId: string
+  sourceResultItemId: string
+  events: readonly Readonly<{ id: string; sequence: string; type: string; actor: string; itemId: string | null;
+    correlationId: string; causationId: string | null; idempotencyKey: string; payloadDigest: string }>[]
 }>
 
 export type TerminalCallProjection = Readonly<{
@@ -29,6 +42,7 @@ export type TerminalCallProjection = Readonly<{
   attempt: number
   sourceWait: HistoricalWaitBinding
   sourceStepPrefix?: HistoricalSourceStepPrefix
+  sourceStepHandoff?: RecoveredWaitHandoff
   resultItemId?: string
   resultStartedEventId?: string
   resultCompletedEventId?: string
@@ -58,9 +72,9 @@ export const CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL = `EXISTS (
     AND boundSourceResult."id" = proof.value->'sourceWait'->>'sourceResultItemId'
   WHERE jsonb_typeof(proof.value->'sourceWait') = 'object'
     AND CASE WHEN jsonb_typeof(proof.value->'sourceWait') = 'object'
-      THEN (SELECT COUNT(*) FROM jsonb_object_keys(proof.value->'sourceWait')) = 16 ELSE FALSE END
+      THEN (SELECT COUNT(*) FROM jsonb_object_keys(proof.value->'sourceWait')) = 17 ELSE FALSE END
     AND proof.value->'sourceWait' ?& ARRAY['waitId', 'sourceStepId', 'sourceAttempt', 'sourceCallItemId', 'sourceCallId',
-      'projectedSourceCallId', 'sourceResultItemId', 'sourceKeyDigest', 'claimKeyDigest', 'deadlineAt', 'status', 'mode',
+      'projectedSourceCallId', 'sourceResultItemId', 'sourceKeyDigest', 'sourceLifecycleRecoveryOwnerDigest', 'claimKeyDigest', 'deadlineAt', 'status', 'mode',
       'targetTaskIds', 'matchedTaskIds', 'timeoutMs', 'sourceKind']
     AND boundWait."id" = proof.value->'sourceWait'->>'waitId'
     AND boundWait."parentTaskId" = owner."id" AND boundWait."sessionId" = owner."sessionId"
@@ -157,7 +171,7 @@ export const CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL = `EXISTS (
     AND proof.value->>'projectedCallId' = proof.value->'sourceWait'->>'projectedSourceCallId'
     AND boundSourceResult."status" = 'completed' AND boundSourceResult."revision" = 1 AND boundSourceResult."phase" IS NULL
     AND ${CHILD_WAIT_HISTORICAL_SOURCE_RESULT_RECEIPT_SQL}
-    AND ${HISTORICAL_SOURCE_STEP_PREFIX_SQL}
+    AND ${HISTORICAL_SOURCE_STEP_BINDING_SQL}
     AND ${CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL}
     AND (SELECT COUNT(*) FROM "agent_items" AS sameSourceCall WHERE sameSourceCall."sessionId" = boundSource."sessionId"
       AND sameSourceCall."turnId" = boundSource."turnId" AND sameSourceCall."taskId" = boundSource."taskId"

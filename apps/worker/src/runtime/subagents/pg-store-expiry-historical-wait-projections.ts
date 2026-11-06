@@ -4,12 +4,13 @@ import { canonicalJson } from "@jobcopilot/shared"
 import { dateValue } from "./pg-store-persistence.js"
 import { childWaitContinuationKeyMatchesSafeProjection } from "./pg-store-expiry-child-wait-claim-call-proof.js"
 import { projectWaitCallEventContent } from "../turns/turn-execution-wait-event-projection.js"
+import { cognitiveAgendaReceiptIdempotencyKey, parseCognitiveAgendaReceipt } from "../turns/cognitive-agenda-receipt.js"
 import { DurableSubagentWaitError, safeSubagentWaitJson, type DurableSubagentWaitResult } from "./durable-subagent-wait-store.js"
 import { inspectChildWaitSourceLifecycle } from "./child-resume-source-wait-lifecycle.js"
 import { isCanonicalWaitResultPair, partitionWaitResultEvents } from "./pg-store-expiry-step-completion-proof.js"
 import { exactKeys, readCanonicalWaitStepToolChain, record } from "./pg-store-expiry-step-tool-chain-proof.js"
 import { readCanonicalHistoricalSourceStepPrefix } from "./pg-store-expiry-historical-source-step-prefix.js"
-import type { HistoricalWaitBinding, TerminalCallProjection } from "./pg-store-expiry-historical-wait-binding.js"
+import type { HistoricalWaitBinding, RecoveredWaitHandoff, TerminalCallProjection } from "./pg-store-expiry-historical-wait-binding.js"
 
 export const MAX_HISTORICAL_SOURCE_WAITS = 16
 function sameJson(left: unknown, right: unknown): boolean { try { return canonicalJson(left) === canonicalJson(right) } catch { return false } }
@@ -34,18 +35,76 @@ function digest(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value
     ? createHash("sha256").update(value).digest("hex") : null
 }
+async function readRecoveredWaitHandoff(client: pg.PoolClient, scope: { id: string; sessionId: string; turnId: string }, wait: Record<string, unknown>,
+  attempt: number, callItemId: string, callId: string, resultItemId: string): Promise<RecoveredWaitHandoff | null> {
+  const stepId = wait.stepId, ordinal = Number(wait.sourceStepOrdinal)
+  if (wait.sourceStepStatus !== "waiting_for_tool" || typeof stepId !== "string" || !Number.isSafeInteger(ordinal) || ordinal < 0
+    || ![scope.id, scope.sessionId, scope.turnId, wait.id, callItemId, callId, resultItemId].every(value => typeof value === "string" && value.length > 0)
+    || !Number.isSafeInteger(attempt) || attempt < 1 || !cognitiveAgendaReceiptIdempotencyKey(stepId)) return null
+  const agendaKey = cognitiveAgendaReceiptIdempotencyKey(stepId)!, prefix = `task:${scope.id}:event:`
+  const keys = [prefix + `step-started:${stepId}`, prefix + agendaKey, prefix + `model-started:${stepId}`,
+    prefix + `model-completed:${stepId}`, prefix + `model-usage:${stepId}`, prefix + `item-started:${callItemId}`]
+  const [items, anchors, completed] = await Promise.all([
+    client.query<{ id: string; type: string }>(`SELECT "id", "type" FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = $4 ORDER BY "id" LIMIT 3`,
+      [scope.sessionId, scope.turnId, scope.id, stepId]),
+    client.query<Record<string, unknown>>(`SELECT "id", "sequence"::text AS "sequence", "type", "actor", "itemId", "correlationId", "causationId", "idempotencyKey", "payload",
+        encode(sha256(convert_to("payload"::text, 'UTF8')), 'hex') AS "payloadDigest" FROM "agent_events"
+      WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "idempotencyKey" = ANY($4::text[]) LIMIT 7`,
+      [scope.sessionId, scope.turnId, scope.id, keys]),
+    client.query(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+      AND "type" = 'step.completed' AND "correlationId" = $4 LIMIT 1`, [scope.sessionId, scope.turnId, scope.id, stepId]),
+  ])
+  if (items.rows.length !== 2 || new Set(items.rows.map(item => item.id)).size !== 2 || !items.rows.some(item => item.id === callItemId && item.type === "tool_call")
+    || !items.rows.some(item => item.id === resultItemId && item.type === "tool_result") || completed.rows.length
+    || anchors.rows.length !== keys.length) return null
+  const byKey = new Map(anchors.rows.map(event => [event.idempotencyKey, event])), events = keys.map(key => byKey.get(key))
+  if (byKey.size !== keys.length || events.some(event => !event)) return null
+  const proof = events as Record<string, unknown>[], start = proof[0]!, agenda = proof[1]!, modelStart = proof[2]!, modelDone = proof[3]!, usage = proof[4]!, itemStart = proof[5]!
+  const sequences = proof.map(event => typeof event.sequence === "string" && /^[1-9][0-9]*$/.test(event.sequence) ? BigInt(event.sequence) : 0n)
+  if (sequences.some((value, index) => value < 1n || index > 0 && value <= sequences[index - 1]!)) return null
+  const expectedTypes = ["step.started", "cognitive.agenda", "model.started", "model.completed", "model.usage", "item.started"]
+  if (proof.some((event, index) => typeof event.id !== "string" || !event.id.trim() || event.type !== expectedTypes[index] || event.actor !== "subagent"
+    || event.correlationId !== stepId || event.itemId !== (index === 5 ? callItemId : null)
+    || event.idempotencyKey !== keys[index] || !/^[0-9a-f]{64}$/.test(String(event.payloadDigest)))) return null
+  if (agenda.causationId !== start.id || modelStart.causationId !== agenda.id || modelDone.causationId !== modelStart.id
+    || usage.causationId !== modelDone.id || itemStart.causationId !== usage.id
+    || !sameJson(start.payload, { stepId, ordinal, taskId: scope.id })
+    || !parseCognitiveAgendaReceipt(agenda.payload, { sessionId: scope.sessionId, turnId: scope.turnId, taskId: scope.id, stepId })) return null
+  const started = record(modelStart.payload), done = record(modelDone.payload), usagePayload = record(usage.payload), usageValue = usagePayload.usage
+  if (!exactKeys(started, ["taskId", "provider", "model"]) || started.taskId !== scope.id
+    || typeof started.provider !== "string" || !started.provider || started.provider.trim() !== started.provider || started.provider.length > 256
+    || typeof started.model !== "string" || !started.model || started.model.trim() !== started.model || started.model.length > 256
+    || !exactKeys(done, ["taskId", "provider", "model", "toolCallCount"]) || done.taskId !== scope.id
+    || done.provider !== started.provider || done.model !== started.model || done.toolCallCount !== 1
+    || !exactKeys(usagePayload, ["taskId", "provider", "model", "usage"]) || usagePayload.taskId !== scope.id
+    || usagePayload.provider !== started.provider || usagePayload.model !== started.model
+    || usageValue !== null && (!exactKeys(record(usageValue), ["inputTokens", "outputTokens", "estimatedCostUsd"])
+      || ![record(usageValue).inputTokens, record(usageValue).outputTokens, record(usageValue).estimatedCostUsd].every(value => typeof value === "number" && Number.isFinite(value) && value >= 0))
+    || !sameJson(itemStart.payload, { itemId: callItemId, type: "tool_call", phase: null })) return null
+  const boundedRange = await client.query<{ count: number }>(`SELECT COUNT(*)::int AS "count" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
+    AND "taskId" = $3 AND "sequence" BETWEEN $4::bigint AND $5::bigint`,
+  [scope.sessionId, scope.turnId, scope.id, sequences[0]!.toString(), sequences[5]!.toString()])
+  if (Number(boundedRange.rows[0]?.count) !== keys.length) return null
+  return { schemaVersion: "recovered_wait_handoff.v1", waitId: String(wait.id), stepId, attempt,
+    sourceCallItemId: callItemId, sourceCallId: callId, sourceResultItemId: resultItemId,
+    events: proof.map(event => ({ id: String(event.id), sequence: String(event.sequence), type: String(event.type), actor: String(event.actor),
+      itemId: typeof event.itemId === "string" ? event.itemId : null, correlationId: String(event.correlationId),
+      causationId: typeof event.causationId === "string" ? event.causationId : null, idempotencyKey: String(event.idempotencyKey),
+      payloadDigest: String(event.payloadDigest) })) }
+}
 function sourceWaitBinding(wait: Record<string, unknown>, lifecycle: { state: "unreconciled" | "waiting" | "recovered"; callItemId: string; toolCallId: string; sourceAttempt: number; resultItemId?: string },
   projectedCallId: string, claimKeyDigest: string | null = null): HistoricalWaitBinding | null {
   const state = lifecycle.state
   const request = record(record(wait.result).request), ids = strictWaitIds(wait.targetTaskIds), matched = strictWaitIds(wait.matchedTaskIds, true)
   const deadline = wait.deadlineAt instanceof Date ? wait.deadlineAt : new Date(String(wait.deadlineAt))
   const timeoutMs = request.timeoutMs, sourceKeyDigest = digest(wait.idempotencyKey)
+  const recoveryOwnerDigest = state === "recovered" ? digest(record(record(wait.result).sourceLifecycleRecovery).ownerId) : null
   if (state === "unreconciled" || typeof wait.id !== "string" || typeof wait.stepId !== "string" || !ids || !matched || !deadline || !Number.isFinite(deadline.getTime())
     || !lifecycle.resultItemId || !sourceKeyDigest || !Number.isSafeInteger(timeoutMs) || Number(timeoutMs) < 1 || Number(timeoutMs) > 30_000
-    || !["ready", "timed_out"].includes(String(wait.status)) || !["any", "all"].includes(String(wait.mode))) return null
+    || state === "recovered" && !recoveryOwnerDigest || !["ready", "timed_out"].includes(String(wait.status)) || !["any", "all"].includes(String(wait.mode))) return null
   return { waitId: wait.id, sourceStepId: wait.stepId, sourceAttempt: lifecycle.sourceAttempt, sourceCallItemId: lifecycle.callItemId,
     sourceCallId: lifecycle.toolCallId, projectedSourceCallId: projectedCallId, sourceResultItemId: lifecycle.resultItemId,
-    sourceKeyDigest, claimKeyDigest, sourceKind: state === "waiting" ? "normal_waiting" : "recovered",
+    sourceKeyDigest, sourceLifecycleRecoveryOwnerDigest: recoveryOwnerDigest, claimKeyDigest, sourceKind: state === "waiting" ? "normal_waiting" : "recovered",
     deadlineAt: deadline.toISOString(), status: wait.status as "ready" | "timed_out",
     mode: wait.mode as "any" | "all", targetTaskIds: ids, matchedTaskIds: matched, timeoutMs: Number(timeoutMs) }
 }
@@ -59,7 +118,8 @@ export async function readChildWaitTerminalCallProjections(client: pg.PoolClient
     || typeof attemptCount !== "number" || !Number.isSafeInteger(attemptCount) || attemptCount < 1 || !leaseExpiresAt) return []
   const waits = await client.query<Record<string, unknown>>(`SELECT wait.*,
       (SELECT COUNT(*)::int FROM "agent_wait_conditions" AS duplicateWait WHERE duplicateWait."parentTaskId" = owner."id"
-        AND duplicateWait."sessionId" = owner."sessionId" AND duplicateWait."turnId" = owner."turnId" AND duplicateWait."stepId" = wait."stepId") AS "sourceWaitCount"
+        AND duplicateWait."sessionId" = owner."sessionId" AND duplicateWait."turnId" = owner."turnId" AND duplicateWait."stepId" = wait."stepId") AS "sourceWaitCount",
+      source."status" AS "sourceStepStatus", source."ordinal" AS "sourceStepOrdinal"
     FROM "sub_agent_tasks" AS owner JOIN "agent_sessions" AS session ON session."id" = owner."sessionId" AND session."userId" = $5
     JOIN "agent_turns" AS turn ON turn."id" = owner."turnId" AND turn."sessionId" = owner."sessionId" AND turn."userId" = session."userId" AND turn."rootTaskId" = owner."rootTaskId"
     JOIN "agent_wait_conditions" AS wait ON wait."parentTaskId" = owner."id" AND wait."sessionId" = owner."sessionId" AND wait."turnId" = owner."turnId" AND wait."userId" = session."userId"
@@ -106,10 +166,14 @@ export async function readChildWaitTerminalCallProjections(client: pg.PoolClient
       stepId, attempt: lifecycle.sourceAttempt, callItemId: lifecycle.callItemId, callId: lifecycle.toolCallId,
       resultItemId: lifecycle.resultItemId, waitKind: binding.sourceKind,
     })
-    if (!sourceStepPrefix) continue
+    const sourceStepHandoff = sourceStepPrefix || binding.sourceKind !== "recovered" ? null
+      : await readRecoveredWaitHandoff(client, { id, sessionId, turnId }, wait, lifecycle.sourceAttempt,
+        lifecycle.callItemId, lifecycle.toolCallId, lifecycle.resultItemId)
+    if (!sourceStepPrefix && !sourceStepHandoff) continue
+    const sourceStepEvidence = sourceStepPrefix ? { sourceStepPrefix } : { sourceStepHandoff: sourceStepHandoff! }
     const sourceProjection = waitCallProjection(sourceStart.rows[0]?.id, lifecycle.toolCallId, lifecycle.callItemId, stepId, lifecycle.sourceAttempt, binding)
     if (!sourceProjection) continue
-    projections.push({ ...sourceProjection, sourceStepPrefix })
+    projections.push({ ...sourceProjection, ...sourceStepEvidence })
     const claimRows: { rows: Record<string, unknown>[] } = await client.query<Record<string, unknown>>(`SELECT claimStep."id" AS "stepId", claimStep."attempt", claimStep."status" AS "stepStatus",
         call."id" AS "callItemId", call."content" AS "callContent", call."status" AS "callStatus", call."revision" AS "callRevision", call."phase" AS "callPhase",
         callStart."id" AS "startEventId", callStart."sequence" AS "startSequence", sourceCall."content"->'input' AS "sourceInput",
@@ -174,7 +238,7 @@ export async function readChildWaitTerminalCallProjections(client: pg.PoolClient
       const previousSource = claimSources.get(claimProjection.startEventId)
       if (previousSource && previousSource !== sourceProjection.startEventId) ambiguousClaims.add(claimProjection.startEventId)
       claimSources.set(claimProjection.startEventId, sourceProjection.startEventId)
-      projections.push({ ...claimProjection, sourceStepPrefix, resultItemId: resultId, resultStartedEventId: resultStarted.id,
+      projections.push({ ...claimProjection, ...sourceStepEvidence, resultItemId: resultId, resultStartedEventId: resultStarted.id,
         resultCompletedEventId: resultCompleted.id, stepCompletedEventId: stepToolChain.stepCompletedEventId, stepToolChain })
     }
   }

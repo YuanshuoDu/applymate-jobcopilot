@@ -24,6 +24,7 @@ import type { SubagentLease } from "./types.js"
 import { CHILD_WAIT_CLAIM_RECOVERY_SQL, CHILD_WAIT_CONSUMED_SQL, CHILD_WAIT_RESUMABLE_SQL as CHILD_WAIT_EXPIRY_RESUMABLE_SQL, hasBlockingExternalCall } from "./pg-store-expiry-recovery-predicates.js"
 import { CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL, childWaitContinuationKeyMatchesSafeProjection } from "./pg-store-expiry-child-wait-claim-call-proof.js"
 import { readChildWaitSourceCallProjection } from "./pg-store-expiry-child-wait-source-proof.js"
+import { CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL } from "./pg-store-expiry-historical-wait-binding.js"
 import { buildCognitiveAgendaReceipt, cognitiveAgendaReceiptIdempotencyKey } from "../turns/cognitive-agenda-receipt.js"
 import { readChildWaitTerminalCallProjections } from "./pg-store-expiry-historical-wait-projections.js"
 import { readCanonicalWaitStepToolChain } from "./pg-store-expiry-step-tool-chain-proof.js"
@@ -1123,6 +1124,24 @@ type BlockingTaskSnapshot = {
   leaseOwner: string | null; attemptCount: number; leaseExpiresAt: Date | null
 }
 type BlockingTaskRow = Omit<BlockingTaskSnapshot, "userId">
+
+async function historicalWaitBindingAccepts(client: PoolClient, task: BlockingTaskSnapshot, projection: unknown): Promise<boolean> {
+  const result = await client.query<{ accepted: boolean }>(`WITH proof AS (SELECT $9::jsonb AS value)
+    SELECT ${CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL} AS "accepted"
+    FROM proof
+    JOIN "sub_agent_tasks" AS owner ON owner."id" = $2 AND owner."sessionId" = $1 AND owner."turnId" = $3
+      AND owner."rootTaskId" = $4 AND owner."leaseOwner" = $5 AND owner."attemptCount" = $6 AND owner."leaseExpiresAt" = $7
+    JOIN "agent_sessions" AS session ON session."id" = owner."sessionId" AND session."userId" = $8
+    JOIN "agent_turns" AS turn ON turn."id" = owner."turnId" AND turn."sessionId" = owner."sessionId"
+      AND turn."userId" = session."userId" AND turn."rootTaskId" = owner."rootTaskId"
+    JOIN "agent_steps" AS callStep ON callStep."id" = proof.value->>'stepId' AND callStep."sessionId" = owner."sessionId"
+      AND callStep."turnId" = owner."turnId" AND callStep."taskId" = owner."id"
+    JOIN "agent_items" AS callItem ON callItem."id" = proof.value->>'callItemId' AND callItem."sessionId" = owner."sessionId"
+      AND callItem."turnId" = owner."turnId" AND callItem."taskId" = owner."id"`,
+  [task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount, task.leaseExpiresAt,
+    task.userId, JSON.stringify(projection)])
+  return result.rows.length === 1 && result.rows[0]?.accepted === true
+}
 
 async function expectAbsentSourceResultClaimSafety(pool: Pool, ids: FixtureIds, continuationStepId: string): Promise<void> {
   const client = await pool.connect()
@@ -2316,9 +2335,16 @@ async function finishLoopWaitTarget(pool: Pool, taskStore: PgSubagentTaskStore, 
     leaseExpiresAt: targetLease.leaseExpiresAt, signal: new AbortController().signal }
   const owner = executionOwnerFence({ kind: "task", lease })
   const turnStore = createPgTurnEngineStore(pool)
+  const previousOrdinal = await pool.query<{ ordinal: number | string | null }>(`SELECT MAX("ordinal") AS "ordinal"
+    FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2`, [ids.sessionId, ids.turnId])
+  const previousMaxOrdinal = previousOrdinal.rows[0]?.ordinal === null || previousOrdinal.rows[0]?.ordinal === undefined
+    ? -1 : Number(previousOrdinal.rows[0].ordinal)
+  if (!Number.isSafeInteger(previousMaxOrdinal) || previousMaxOrdinal < 0) throw new Error("Loop fixture turn ordinal baseline is unavailable")
   const step = await turnStore.startStep({ owner, stepId: `loop-child-target-step:${targetTaskId}`, ordinal: 0,
     attempt: lease.attemptCount, inputThroughSequence: 0n, consumedInputIds: [], modelProfileSnapshot: {}, now: new Date() })
-  if (step.ordinal !== 1) throw new Error("Loop fixture target did not create the Turn-global ordinal gap")
+  if (step.ordinal !== previousMaxOrdinal + 1 || step.ordinal <= previousMaxOrdinal) {
+    throw new Error("Loop fixture target did not preserve the Turn-global ordinal gap")
+  }
   await turnStore.updateStep({ owner, stepId: step.id, status: "completed", finishReason: "stop", errorCode: null,
     inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0, now: new Date() })
   const finished = await taskStore.finish({ taskId: targetTaskId, sessionId: ids.sessionId, ownerId: lease.ownerId,
@@ -5261,6 +5287,138 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
           [ids.sessionId, ids.turnId, ids.waiterTaskId, PHONE_SHAPED_WAIT_TOOL_CALL_ID, sourceMarker.resultItemId])
         expect(sourceResultRows.rows).toHaveLength(1)
         const sourceResult = sourceResultRows.rows[0]!
+        const sourceWaitStep = await settlementClient.query<{ status: string; attempt: number; ordinal: number }>(
+          `SELECT source."status", source."attempt", source."ordinal" FROM "agent_wait_conditions" AS wait
+           JOIN "agent_steps" AS source ON source."id" = wait."stepId" AND source."sessionId" = wait."sessionId"
+             AND source."turnId" = wait."turnId" AND source."taskId" = wait."parentTaskId"
+           WHERE wait."id" = $1 AND wait."sessionId" = $2 AND wait."turnId" = $3 AND wait."parentTaskId" = $4`,
+          [wait.rows[0]!.id, ids.sessionId, ids.turnId, ids.waiterTaskId])
+        expect(sourceWaitStep.rows).toEqual([{ status: "waiting_for_tool", attempt: 1, ordinal: 0 }])
+        const realSourceProjections = await readChildWaitTerminalCallProjections(settlementClient, snapshot as unknown as Record<string, unknown>)
+        const handoffSource = realSourceProjections.find(projection => projection.sourceWait.waitId === wait.rows[0]!.id
+          && projection.sourceWait.claimKeyDigest === null)
+        expect(handoffSource, "a recovered waiting source must produce its exact terminal projection").toBeDefined()
+        expect(Object.prototype.hasOwnProperty.call(handoffSource, "sourceStepPrefix")).toBe(false)
+        expect(handoffSource?.sourceStepHandoff?.schemaVersion).toBe("recovered_wait_handoff.v1")
+        expect(handoffSource?.sourceStepHandoff?.waitId === wait.rows[0]!.id).toBe(true)
+        expect(handoffSource?.sourceStepHandoff?.stepId === handoffSource?.stepId).toBe(true)
+        expect(handoffSource?.sourceStepHandoff?.attempt === handoffSource?.attempt).toBe(true)
+        expect(handoffSource?.sourceStepHandoff?.sourceCallItemId === handoffSource?.callItemId).toBe(true)
+        expect(handoffSource?.sourceStepHandoff?.sourceCallId === PHONE_SHAPED_WAIT_TOOL_CALL_ID).toBe(true)
+        expect(handoffSource?.sourceStepHandoff?.sourceResultItemId === sourceResult.itemId).toBe(true)
+        expect(handoffSource?.sourceStepHandoff?.events).toHaveLength(6)
+        if (!handoffSource?.sourceStepHandoff) throw new Error("historical_wait_handoff_projection_missing")
+        await expect(historicalWaitBindingAccepts(settlementClient, snapshot, handoffSource),
+          "the final PostgreSQL binding must accept the exact producer handoff proof").resolves.toBe(true)
+
+        await expect(historicalWaitBindingAccepts(settlementClient, { ...snapshot, leaseOwner: `${snapshot.leaseOwner}:stale` }, handoffSource),
+          "the same handoff proof must not transfer to a stale lease").resolves.toBe(false)
+        await expect(historicalWaitBindingAccepts(settlementClient, { ...snapshot, leaseExpiresAt: new Date(snapshot.leaseExpiresAt!.getTime() + 1) }, handoffSource),
+          "the same handoff proof must not transfer to a changed lease expiry").resolves.toBe(false)
+        await expect(historicalWaitBindingAccepts(settlementClient, { ...snapshot, attemptCount: snapshot.attemptCount + 1 }, handoffSource),
+          "the same handoff proof must not transfer to another attempt").resolves.toBe(false)
+        await expect(historicalWaitBindingAccepts(settlementClient, { ...snapshot, userId: `${snapshot.userId}:wrong` }, handoffSource),
+          "the same handoff proof must not transfer to another tenant").resolves.toBe(false)
+
+        const forgedHandoffProjection = JSON.parse(JSON.stringify(handoffSource)) as Record<string, unknown>
+        const forgedHandoff = asObject(forgedHandoffProjection.sourceStepHandoff)
+        forgedHandoffProjection.sourceStepHandoff = { ...forgedHandoff, schemaVersion: "recovered_wait_handoff.forged" }
+        await expect(historicalWaitBindingAccepts(settlementClient, snapshot, forgedHandoffProjection),
+          "the final PostgreSQL binding must reject a forged in-memory handoff marker").resolves.toBe(false)
+        const duplicateAnchorProjection = JSON.parse(JSON.stringify(handoffSource)) as Record<string, unknown>
+        const duplicateAnchorHandoff = asObject(duplicateAnchorProjection.sourceStepHandoff)
+        const proofEvents = Array.isArray(duplicateAnchorHandoff.events) ? duplicateAnchorHandoff.events : []
+        expect(proofEvents).toHaveLength(6)
+        duplicateAnchorProjection.sourceStepHandoff = { ...duplicateAnchorHandoff, events: [...proofEvents.slice(0, 5), proofEvents[0]] }
+        await expect(historicalWaitBindingAccepts(settlementClient, snapshot, duplicateAnchorProjection),
+          "the final PostgreSQL binding must reject duplicate handoff event anchors").resolves.toBe(false)
+        const missingAnchorProjection = JSON.parse(JSON.stringify(handoffSource)) as Record<string, unknown>
+        const missingAnchorHandoff = asObject(missingAnchorProjection.sourceStepHandoff)
+        const missingProofEvents = Array.isArray(missingAnchorHandoff.events) ? missingAnchorHandoff.events : []
+        missingAnchorProjection.sourceStepHandoff = { ...missingAnchorHandoff, events: missingProofEvents.slice(0, 5) }
+        await expect(historicalWaitBindingAccepts(settlementClient, snapshot, missingAnchorProjection),
+          "the final PostgreSQL binding must reject a handoff missing an event anchor").resolves.toBe(false)
+
+        const expectHandoffProducerRejected = async (label: string, mutate: () => Promise<{ rowCount: number | null }>) => {
+          await settlementClient.query("SAVEPOINT historical_wait_handoff_tamper")
+          try {
+            const changed = await mutate()
+            expect(changed.rowCount, `${label} fixture mutation`).toBe(1)
+            const afterTamper = await readChildWaitTerminalCallProjections(settlementClient, snapshot as unknown as Record<string, unknown>)
+            expect(afterTamper.filter(projection => projection.sourceWait.waitId === wait.rows[0]!.id).length,
+              `${label} must not produce a historical source or claim proof`).toBe(0)
+            await expect(blocking(), `${label} must leave the source wait blocking`).resolves.toBe(true)
+          } finally {
+            await settlementClient.query("ROLLBACK TO SAVEPOINT historical_wait_handoff_tamper")
+            await settlementClient.query("RELEASE SAVEPOINT historical_wait_handoff_tamper")
+          }
+        }
+
+        await expectHandoffProducerRejected("forged persisted source lifecycle marker", () => settlementClient.query(
+          `UPDATE "agent_wait_conditions" SET "result" = jsonb_set("result", '{sourceLifecycleRecovery,taskId}', to_jsonb($5::text), false)
+            WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "parentTaskId" = $4 RETURNING "id"`,
+          [wait.rows[0]!.id, ids.sessionId, ids.turnId, ids.waiterTaskId, `forged-task-${randomUUID()}`]))
+
+        const extraSourceToolId = `fixture-extra-source-tool:${randomUUID()}`
+        await expectHandoffProducerRejected("additional source-step tool call", () => settlementClient.query(
+          `INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "revision", "content", "startedAt", "updatedAt")
+           VALUES ($1, $2, $3, $4, $5, 'tool_call', 'started', NULL, 0, $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+          [`task:${ids.waiterTaskId}:item:tool-call:${extraSourceToolId}:attempt:1`, ids.sessionId, ids.turnId,
+            handoffSource.stepId, ids.waiterTaskId, JSON.stringify({ toolCallId: extraSourceToolId,
+              toolName: "jobs.search", toolVersion: "1", input: { query: "fixture" } })]))
+
+        const missingHandoffAnchor = handoffSource.sourceStepHandoff.events.find(event => event.type === "model.usage")
+        if (!missingHandoffAnchor) throw new Error("historical_wait_handoff_usage_anchor_missing")
+        await expectHandoffProducerRejected("missing recovered-step event anchor", () => settlementClient.query(
+          `UPDATE "agent_events" SET "idempotencyKey" = "idempotencyKey" || ':tampered'
+            WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 RETURNING "id"`,
+          [missingHandoffAnchor.id, ids.sessionId, ids.turnId, ids.waiterTaskId]))
+
+        const duplicateAnchor = handoffSource.sourceStepHandoff.events.find(event => event.type === "item.started"
+          && event.itemId === handoffSource.callItemId)
+        if (!duplicateAnchor) throw new Error("historical_wait_handoff_item_anchor_missing")
+        await expectHandoffProducerRejected("duplicate source item-started anchor", async () => {
+          const original = await settlementClient.query<{ payload: Record<string, unknown>; causationId: string | null;
+            correlationId: string; itemId: string | null }>(`SELECT "payload", "causationId", "correlationId", "itemId"
+              FROM "agent_events" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4`,
+          [duplicateAnchor.id, ids.sessionId, ids.turnId, ids.waiterTaskId])
+          expect(original.rowCount).toBe(1)
+          const sequence = await settlementClient.query<{ eventSequence: string }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1
+            WHERE "id" = $1 AND "userId" = $2 RETURNING "eventSequence"::text AS "eventSequence"`, [ids.sessionId, ids.userId])
+          expect(sequence.rows).toHaveLength(1)
+          return settlementClient.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor",
+              "correlationId", "causationId", "idempotencyKey", "payload")
+            VALUES ($1, $2, $3, $4, $5, $6::bigint, 'item.started', 'subagent', $7, $8, $9, $10::jsonb)`,
+          [`fixture-duplicate-source-anchor:${randomUUID()}`, ids.sessionId, ids.turnId, original.rows[0]!.itemId, ids.waiterTaskId,
+            sequence.rows[0]!.eventSequence, original.rows[0]!.correlationId, original.rows[0]!.causationId,
+            `${duplicateAnchor.idempotencyKey}:duplicate:${randomUUID()}`, JSON.stringify(original.rows[0]!.payload)])
+        })
+
+        const wrongCauseAnchor = handoffSource.sourceStepHandoff.events.find(event => event.type === "model.completed")
+        if (!wrongCauseAnchor) throw new Error("historical_wait_handoff_model_completion_anchor_missing")
+        await expectHandoffProducerRejected("wrong recovered-step event causation", () => settlementClient.query(
+          `UPDATE "agent_events" SET "causationId" = $5 WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 RETURNING "id"`,
+          [wrongCauseAnchor.id, ids.sessionId, ids.turnId, ids.waiterTaskId, `unrelated-cause:${randomUUID()}`]))
+
+        await settlementClient.query("SAVEPOINT historical_handoff_marker_owner_toctou")
+        try {
+          const changedMarker = await settlementClient.query(`UPDATE "agent_wait_conditions"
+            SET "result" = jsonb_set("result", '{sourceLifecycleRecovery,ownerId}', to_jsonb($5::text), false)
+            WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "parentTaskId" = $4 RETURNING "id"`,
+          [wait.rows[0]!.id, ids.sessionId, ids.turnId, ids.waiterTaskId, `different-owner-${randomUUID()}`])
+          expect(changedMarker.rowCount).toBe(1)
+          await expect(historicalWaitBindingAccepts(settlementClient, snapshot, handoffSource),
+            "the final PostgreSQL binding must reject a lifecycle owner marker changed after projection read").resolves.toBe(false)
+          const postTamperProjections = await readChildWaitTerminalCallProjections(settlementClient, snapshot as unknown as Record<string, unknown>)
+          expect(postTamperProjections.filter(projection => projection.sourceWait.waitId === wait.rows[0]!.id).length).toBe(0)
+          await expect(blocking(), "a changed lifecycle owner marker must keep the wait blocking").resolves.toBe(true)
+        } finally {
+          await settlementClient.query("ROLLBACK TO SAVEPOINT historical_handoff_marker_owner_toctou")
+          await settlementClient.query("RELEASE SAVEPOINT historical_handoff_marker_owner_toctou")
+        }
+
+        // The source projection above is the real recovered handoff for this same PG fixture;
+        // these canonical outcome checks therefore exercise handoff settlement, not a prefix mock.
         const expectSelfConsistentOutcomeRejected = async (label: string, status: "ready" | "timed_out", matchedTaskIds: string[], outcome: Record<string, unknown>) => {
           await settlementClient.query("SAVEPOINT self_consistent_malformed_wait_outcome")
           try {
