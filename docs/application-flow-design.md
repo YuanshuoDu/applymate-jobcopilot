@@ -121,7 +121,7 @@ Agent 维护范围内单独处理。
 自动修正会替换受影响的整段或整节；系统拒绝会被校验过程截断或丢字段的建议，
 但不能保证模型保留原节的每一条内容。请对照保存的历史版本检查修改，然后重新审核。
 从申请详情修正定制简历时，其余章节以当前选中版本为准；无法确定受影响章节时转为手动修改。
-若保存的简历在生成修正期间发生变化，本次修正会拒绝覆盖并提示刷新。该检查不约束修正
+若保存的简历内容、职位关联或来源在生成修正期间发生变化，本次修正会拒绝覆盖并提示刷新。该检查不约束修正
 完成后其他保存路径的写入，也不保证来源简历、职业资料或职位在生成期间没有变化。
 这些保证从服务器登记提交后开始，混用旧版服务的部署及生产数据库权限尚未验证。
 审核结果目前不会随来源简历或职业资料事实的后续变化自动失效；如修改了依据，请重新检查。
@@ -253,7 +253,8 @@ still omit information from the previous section. Compare the saved version
 history and review the corrected material before running a new audit.
 When the drawer repairs a tailored resume, untouched sections come from the
 selected version, and an ambiguous section requires manual editing. A conflicting
-save during generation rejects the correction; it does not coordinate later
+save or change of the selected resume's job/source association during generation
+rejects the correction; it does not coordinate later
 writes or establish that the source resume, Persona or job stayed unchanged.
 
 An absent optional letter is distinct from a selected letter still loading.

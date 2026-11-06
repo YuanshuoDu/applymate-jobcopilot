@@ -544,6 +544,34 @@ integration('application audit ordering with disposable PostgreSQL', () => {
     } finally { model.release(); await within(Promise.allSettled([pending])) }
   }, 30_000)
 
+  it.each(['targetJobId', 'parentResumeId'] as const)('rejects forced repair when %s changes during model work without a timestamp or content change', async field => {
+    const before = await seedTailoredResume()
+    // Both alternative references really exist and belong to the same account.
+    // The disposable fixture schema does not itself enforce foreign keys.
+    await clientA.job.create({ data: { id: 'job-2', userId: 'owner-a', role: 'Other role', company: 'Fixture', description: 'Other synthetic role' } })
+    await clientA.resume.create({ data: { id: 'source-2', userId: 'owner-a', name: 'Other source', content: before.content as object } })
+    const alternate = field === 'targetJobId' ? 'job-2' : 'source-2'
+    const originalVersions = await clientB.resumeVersion.count({ where: { resumeId: before.id, userId: 'owner-a' } })
+    const model = gate()
+    const pending = invokeTailor({ client: clientA, userId: 'owner-a', gate: model })
+    try {
+      await within(model.reached)
+      await clientB.resume.update({ where: { id: before.id }, data: { [field]: alternate, updatedAt: before.updatedAt } })
+      const saved = await clientB.resume.findUniqueOrThrow({ where: { id: before.id } })
+      expect(saved[field]).toBe(alternate)
+      expect(saved.content).toEqual(before.content)
+      expect(saved.updatedAt).toEqual(before.updatedAt)
+      model.release()
+      const response = await within(pending)
+      expect(response.status).toBe(409)
+      const after = await clientB.resume.findUniqueOrThrow({ where: { id: before.id } })
+      expect(after[field]).toBe(alternate)
+      expect(after.content).toEqual(before.content)
+      expect(after.updatedAt).toEqual(before.updatedAt)
+      expect(await clientB.resumeVersion.count({ where: { resumeId: before.id, userId: 'owner-a' } })).toBe(originalVersions)
+    } finally { model.release(); await within(Promise.allSettled([pending])) }
+  }, 30_000)
+
   it('saves forced repair with unrelated sections preserved and one pre-change history snapshot', async () => {
     const before = await seedTailoredResume()
     const response = await invokeTailor({ client: clientA, userId: 'owner-a' })

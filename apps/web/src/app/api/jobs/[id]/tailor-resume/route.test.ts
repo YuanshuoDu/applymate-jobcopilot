@@ -174,7 +174,7 @@ describe('tailor resume API', () => {
     expect(mocks.modelChat.mock.calls[0][0][0].content).toContain(`CURRENT SECTION JSON:\n${JSON.stringify(current.experience, null, 2)}`)
     expect(mocks.modelChat.mock.calls[0][0][0].content).toContain(`ORIGINAL RESUME EVIDENCE:\n${JSON.stringify(source, null, 2)}`)
     expect(mocks.resumeVersionCreate).toHaveBeenCalledWith({ data: { resumeId: 'resume_tailored', userId: 'user_1', content: current, name: 'Tailored' } })
-    expect(mocks.resumeUpdateMany).toHaveBeenCalledWith({ where: { id: 'resume_tailored', userId: 'user_1', updatedAt: new Date('2026-01-01T00:00:00Z'), content: { equals: current } }, data: { content: { ...current, experience: [{ role: 'Developer' }, { role: 'Supported second role' }] } } })
+    expect(mocks.resumeUpdateMany).toHaveBeenCalledWith({ where: { id: 'resume_tailored', userId: 'user_1', targetJobId: 'job_1', kind: 'adapted', origin: 'ai-adapted', parentResumeId: 'resume_base', updatedAt: new Date('2026-01-01T00:00:00Z'), content: { equals: current } }, data: { content: { ...current, experience: [{ role: 'Developer' }, { role: 'Supported second role' }] } } })
     expect(mocks.resumeCreate).not.toHaveBeenCalled()
   })
 
@@ -252,7 +252,7 @@ describe('tailor resume API', () => {
     expect(response?.status).toBe(200)
     expect(mocks.modelChat).toHaveBeenCalledTimes(1)
     expect(mocks.modelChat.mock.calls[0][0][0].content).toContain('SECTION: summary')
-    expect(mocks.resumeUpdateMany).toHaveBeenCalledWith({ where: { id: 'resume_tailored', userId: 'user_1', updatedAt: new Date('2026-01-01T00:00:00Z'), content: { equals: current } }, data: { content: { ...current, summary: 'Corrected summary' } } })
+    expect(mocks.resumeUpdateMany).toHaveBeenCalledWith({ where: { id: 'resume_tailored', userId: 'user_1', targetJobId: 'job_1', kind: 'adapted', origin: 'ai-adapted', parentResumeId: 'resume_base', updatedAt: new Date('2026-01-01T00:00:00Z'), content: { equals: current } }, data: { content: { ...current, summary: 'Corrected summary' } } })
   })
 
   it('does not replace an experience array with a differently shaped AI result', async () => {
@@ -274,10 +274,10 @@ describe('tailor resume API', () => {
     expect(mocks.resumeUpdate).not.toHaveBeenCalled()
   })
 
-  it.each(['content conflict', 'version conflict', 'history failure', 'success'] as const)('protects the read-to-write interleaving: %s', async scenario => {
+  it.each(['content conflict', 'version conflict', 'job conflict', 'kind conflict', 'origin conflict', 'parent conflict', 'history failure', 'success'] as const)('protects the read-to-write interleaving: %s', async scenario => {
     const originalContent = { summary: 'Original', skills: ['TypeScript'] }
     const originalTime = new Date('2026-01-01T00:00:00Z')
-    let persisted = { id: 'resume_tailored', userId: 'user_1', content: structuredClone(originalContent), updatedAt: originalTime }
+    let persisted = { id: 'resume_tailored', userId: 'user_1', targetJobId: 'job_1', kind: 'adapted', origin: 'ai-adapted', parentResumeId: 'resume_base', content: structuredClone(originalContent), updatedAt: originalTime }
     const history: unknown[] = []
     const observed = { id: persisted.id, parentResumeId: 'resume_base', name: 'Tailored', content: structuredClone(originalContent), updatedAt: originalTime }
     mocks.resumeFindFirst.mockResolvedValueOnce({ ...persisted }).mockResolvedValueOnce(observed)
@@ -294,8 +294,9 @@ describe('tailor resume API', () => {
       let staged = structuredClone(persisted)
       const stagedHistory: unknown[] = []
       const result = await callback({
-        resume: { updateMany: async ({ where, data }: { where: { id: string; userId: string; updatedAt: Date; content: { equals: unknown } }; data: { content: typeof originalContent } }) => {
+        resume: { updateMany: async ({ where, data }: { where: { id: string; userId: string; targetJobId: string; kind: string; origin: string; parentResumeId: string; updatedAt: Date; content: { equals: unknown } }; data: { content: typeof originalContent } }) => {
           const matches = staged.id === where.id && staged.userId === where.userId && staged.updatedAt.getTime() === where.updatedAt.getTime()
+            && staged.targetJobId === where.targetJobId && staged.kind === where.kind && staged.origin === where.origin && staged.parentResumeId === where.parentResumeId
             && JSON.stringify(staged.content) === JSON.stringify(where.content.equals)
           if (!matches) return { count: 0 }
           staged = { ...staged, content: structuredClone(data.content), updatedAt: new Date('2026-01-02T00:00:00Z') }
@@ -319,6 +320,10 @@ describe('tailor resume API', () => {
       await entered
       if (scenario === 'content conflict') persisted = { ...persisted, content: { ...persisted.content, skills: ['Concurrent edit'] } }
       if (scenario === 'version conflict') persisted = { ...persisted, updatedAt: new Date('2026-01-01T00:00:01Z') }
+      if (scenario === 'job conflict') persisted = { ...persisted, targetJobId: 'job_2' }
+      if (scenario === 'kind conflict') persisted = { ...persisted, kind: 'base' }
+      if (scenario === 'origin conflict') persisted = { ...persisted, origin: 'manual' }
+      if (scenario === 'parent conflict') persisted = { ...persisted, parentResumeId: 'resume_other' }
     } finally { releaseModel() }
     const response = await pending
     expect(response?.status).toBe(scenario === 'success' ? 200 : scenario === 'history failure' ? 503 : 409)

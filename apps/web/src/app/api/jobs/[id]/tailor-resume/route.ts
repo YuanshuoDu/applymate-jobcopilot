@@ -208,7 +208,7 @@ export async function POST(req: NextRequest, { params }: Params) {
     try {
       const updated = await db.$transaction(async tx => {
         const result = await tx.resume.updateMany({
-          where: { id: existing.id, userId: prep.userId, updatedAt: existing.updatedAt, content: { equals: existing.content as Prisma.InputJsonValue } },
+          where: { id: existing.id, userId: prep.userId, targetJobId: jobId, kind: 'adapted', origin: 'ai-adapted', parentResumeId: existing.parentResumeId, updatedAt: existing.updatedAt, content: { equals: existing.content as Prisma.InputJsonValue } },
           data: { content: adaptedContent as Prisma.InputJsonValue },
         })
         if (result.count !== 1) return false
