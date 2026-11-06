@@ -763,7 +763,7 @@ for (const surface of ['jobs', 'resume'] as const) {
     }
     blocked = true
     await page.evaluate(() => window.dispatchEvent(new Event('focus')))
-    const warning = status === 'pending' ? /A review is still in progress or its result is unknown|审核仍在进行或结果尚未确认/ : /The job has changed, or this older review is missing job details|职位信息已变化，或旧审核缺少职位依据/
+    const warning = status === 'pending' ? /A review is still in progress or its result is unknown|审核仍在进行或结果尚未确认/ : /The job or materials have changed, or this older review can no longer be verified|职位或材料已变化，或旧审核已无法核实/
     await expect(page.getByText(warning)).toBeVisible()
     if (surface === 'jobs') await expect(page.getByRole('button', { name: /Download application materials|下载申请材料/ })).toHaveCount(0)
     else {
