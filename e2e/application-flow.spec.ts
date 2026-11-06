@@ -4963,6 +4963,41 @@ test('a failed delayed save keeps the original resume selected', async ({ page }
 })
 
 
+test('application material details have one keyboard-operated expandable control', async ({ page }, testInfo) => {
+  const state = await install(page, { auditCorrection: true })
+  await open(page)
+  const drawer = page.getByRole('dialog')
+  const chinese = testInfo.project.metadata.appLocale === 'zh'
+  const titles = chinese ? ['简历', '求职信', '独立审核'] : ['Resume', 'Cover letter', 'Independent audit']
+  for (const title of titles) {
+    const toggle = drawer.getByRole('button').filter({ has: page.getByText(title, { exact: true }) })
+    await expect(toggle).toHaveCount(1)
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    const panelId = await toggle.getAttribute('aria-controls')
+    expect(panelId).toBeTruthy()
+    const panel = drawer.locator(`[id="${panelId}"]`)
+    await expect(panel).toBeHidden()
+    let reached = false
+    for (let index = 0; index < 120; index++) {
+      await page.keyboard.press('Tab')
+      if (await toggle.evaluate(element => document.activeElement === element)) { reached = true; break }
+    }
+    expect(reached).toBe(true)
+    await page.keyboard.press('Enter')
+    await expect(toggle).toBeFocused()
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true')
+    await expect(panel).toBeVisible()
+    if (title === 'Independent audit' || title === '独立审核') await expect(panel).toContainText('Fix summary')
+    await page.keyboard.press('Space')
+    await expect(toggle).toBeFocused()
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    await expect(panel).toBeHidden()
+  }
+  await expect(drawer.getByRole('button', { name: /^Show .* details$/ })).toHaveCount(0)
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
 test('mobile keyboard opens an application, reviews its issue and returns focus to its card', async ({ page }, testInfo) => {
   test.skip(!testInfo.project.name.startsWith('mobile-'), 'Exercises the narrow application list with a keyboard')
   const state = await install(page, { descriptionMode: 'two', auditCorrection: true })

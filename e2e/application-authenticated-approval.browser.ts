@@ -76,19 +76,30 @@ test('authenticated application opens its original session and decides a synthet
     const tasks = await page.request.get('/api/agent/application-tasks')
     expect(tasks.status()).toBe(200)
     expect((await tasks.json()).tasks).toEqual(expect.arrayContaining([expect.objectContaining({ id: 'fixture-approval-task', jobId, sessionId, status: 'waiting_for_authorization' })]))
+    let browserApprovalPosts = 0
+    context.on('request', request => {
+      const url = new URL(request.url())
+      if (request.method() === 'POST' && url.origin === origin && url.pathname === approvalPath) browserApprovalPosts++
+    })
     await page.goto(`/?page=jobs&highlight=${jobId}`)
     await expect(page.getByRole('dialog')).toContainText('Fixture Approval Engineer')
+    expect(await state()).toEqual(initial)
+    expect(browserApprovalPosts).toBe(0)
     await page.getByRole('link', { name: /Review in Agent|前往 Agent 审核/ }).click()
     await expect(page).toHaveURL(/page=agent/)
     await expect(page).toHaveURL(new RegExp(`sessionId=${sessionId}`))
     await page.getByRole('button', { name: /^(Tasks & results|任务与结果)/ }).click()
     const ledger = page.locator('[data-agent-approval-ledger="true"]')
     await expect(ledger).toBeVisible()
+    // Opening the original session and its approval view must not authorize it.
+    expect(await state()).toEqual(initial)
+    expect(browserApprovalPosts).toBe(0)
     const submitted = page.waitForResponse(response => new URL(response.url()).pathname === approvalPath && response.request().method() === 'POST')
     await ledger.getByRole('button', { name: /^(Approve|批准)$/ }).click()
     const response = await submitted
     expect(response.status()).toBe(202)
     expect(await response.json()).toMatchObject({ disposition: 'resolved', status: 'approved', turnId })
+    expect(browserApprovalPosts).toBe(1)
     expect(await state()).toEqual([{ approval_status: 'approved', turn_status: 'waiting_for_approval', turn_revision: 2,
       item_status: 'completed', job_status: 'saved', task_status: 'waiting_for_authorization', resolved: 1, wakeups: 1, reservations: 0 }])
     const lineage = await pool.query(`SELECT
@@ -106,6 +117,7 @@ test('authenticated application opens its original session and decides a synthet
     await expect(reloadedLedger).toBeVisible()
     await expect(reloadedLedger.getByRole('button', { name: /^(Approve|批准)$/ })).toHaveCount(0)
     await expect(reloadedLedger.getByText(/^(Approved|已批准)$/)).toBeVisible()
+    expect(browserApprovalPosts).toBe(1)
     expect(applicationMutations).toEqual([])
   } finally {
     await context.close()

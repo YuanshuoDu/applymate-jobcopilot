@@ -1835,6 +1835,7 @@ function PackRow({ number, title, detail, done, failed = false, active = false, 
   active?: boolean; onToggle?: () => void; open?: boolean; children?: React.ReactNode; last?: boolean
 }) {
   const { t } = useI18n()
+  const contentId = React.useId()
   const status = statusOverride ?? t(locked ? 'application.locked' : active ? 'application.inProgress' : failed ? 'application.needsCorrection'
     : done ? number === '3' ? 'application.checkPassed' : 'application.materialAvailable' : number === '2' ? 'application.notSelected' : 'application.notComplete')
   return <div style={{ display: 'grid', gridTemplateColumns: '42px 1fr', gap: 12, position: 'relative' }}>
@@ -1843,13 +1844,13 @@ function PackRow({ number, title, detail, done, failed = false, active = false, 
       <span style={{ position: 'relative', zIndex: 1, marginTop: 15, width: 32, height: 32, display: 'grid', placeItems: 'center', borderRadius: '50%', background: done ? '#3b8c1a' : failed ? '#dc2626' : active ? '#2563eb' : '#eef1f6', color: done || active || failed ? '#fff' : '#64748b', fontWeight: 700, animation: active ? 'pack-pulse 1.15s ease-in-out infinite' : undefined }}>{done ? <Check size={18} strokeWidth={3} /> : number}</span>
     </div>
     <div style={{ borderBottom: last ? 'none' : '1px solid var(--border)', padding: '15px 0' }}>
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 10, alignItems: 'center' }}>
-        <button onClick={onClick ?? onToggle} disabled={!onClick && !onToggle} style={{ border: 'none', padding: 0, background: 'transparent', color: 'var(--text)', textAlign: 'left', cursor: onClick || onToggle ? 'pointer' : 'default' }}>
-          <span style={{ display: 'block', fontSize: 15, fontWeight: 700 }}>{title}</span><span style={{ display: 'block', marginTop: 3, fontSize: 13, color: 'var(--text-muted)', fontWeight: 400, lineHeight: 1.4 }}>{detail}</span>
-        </button>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}><span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, borderRadius: 999, padding: '5px 10px', fontSize: 11, color: done ? '#3b8c1a' : failed ? '#b42318' : active ? '#2563eb' : '#64748b', background: done ? '#e9f7e5' : failed ? '#fee2e2' : active ? '#eff6ff' : '#eef1f6' }}>{locked && <Lock size={12} />}{status}</span>{onToggle && <button aria-label={`Show ${title} details`} onClick={onToggle} style={{ border: 'none', padding: 3, color: '#334155', background: 'transparent', cursor: 'pointer' }}><ChevronDown size={18} style={{ transform: open ? 'rotate(180deg)' : 'none', transition: 'transform .18s ease' }} /></button>}</div>
-      </div>
-      {open && children && <div style={{ marginTop: 14, padding: 14, borderRadius: 10, background: '#f8fafc', border: '1px solid #e5eaf1', animation: 'pack-line-grow .2s ease-out both', transformOrigin: 'top' }}>{children}</div>}
+      <button type="button" onClick={onClick ?? onToggle} disabled={!onClick && !onToggle}
+        aria-expanded={onToggle && !onClick ? Boolean(open) : undefined} aria-controls={onToggle && !onClick ? contentId : undefined}
+        style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 10, alignItems: 'center', width: '100%', border: 'none', padding: 0, background: 'transparent', color: 'var(--text)', textAlign: 'left', cursor: onClick || onToggle ? 'pointer' : 'default' }}>
+        <span><span style={{ display: 'block', fontSize: 15, fontWeight: 700 }}>{title}</span><span style={{ display: 'block', marginTop: 3, fontSize: 13, color: 'var(--text-muted)', fontWeight: 400, lineHeight: 1.4 }}>{detail}</span></span>
+        <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}><span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, borderRadius: 999, padding: '5px 10px', fontSize: 11, color: done ? '#3b8c1a' : failed ? '#b42318' : active ? '#2563eb' : '#64748b', background: done ? '#e9f7e5' : failed ? '#fee2e2' : active ? '#eff6ff' : '#eef1f6' }}>{locked && <Lock size={12} aria-hidden="true" />}{status}</span>{onToggle && <ChevronDown size={18} aria-hidden="true" style={{ color: '#334155', transform: open ? 'rotate(180deg)' : 'none', transition: 'transform .18s ease' }} />}</span>
+      </button>
+      <div id={contentId} hidden={!open} style={{ marginTop: 14, padding: 14, borderRadius: 10, background: '#f8fafc', border: '1px solid #e5eaf1', animation: 'pack-line-grow .2s ease-out both', transformOrigin: 'top' }}>{open && children}</div>
     </div>
   </div>
 }
