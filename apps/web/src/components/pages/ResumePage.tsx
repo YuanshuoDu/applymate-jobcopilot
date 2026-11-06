@@ -3016,6 +3016,8 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
               <p>{t(`application.auditState.${auditOperationView.state}`)}</p>
               <button type="button" disabled={auditingApplication} onClick={() => setAuditStatusRefresh(value => value + 1)}>{t('application.refreshStatus')}</button>
             </div>}
+          {displayedApplicationAudit?.findings.some(finding => finding.area !== 'job_match' && finding.severity !== 'pass' && !finding.applied) &&
+            <p role="note" style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{t('application.repairImpactGuidance')}</p>}
           <AiPanel
             selectedJob={selectedJob}
             scoreResult={scoreResult}

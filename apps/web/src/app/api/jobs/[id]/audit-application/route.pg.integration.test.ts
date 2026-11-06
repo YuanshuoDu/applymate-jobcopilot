@@ -20,7 +20,7 @@ if (enabled) {
 }
 
 type LockEvidence = { pid?: number; startedAt?: Date; started: () => void; issued: () => void; beforeQuery?: Promise<void>; rawErrors?: unknown[] }
-type RequestScope = { client: PrismaClient; userId: string; summary?: string; gate?: ReturnType<typeof gate>; repair?: boolean; review?: boolean; proposedValue?: string; letterId?: string; evidence?: LockEvidence }
+type RequestScope = { client: PrismaClient; userId: string; summary?: string; gate?: ReturnType<typeof gate>; repair?: boolean; review?: boolean; tailor?: boolean; proposedValue?: string; letterId?: string; evidence?: LockEvidence }
 const requestScope = new AsyncLocalStorage<RequestScope>()
 function current(): RequestScope {
   const scope = requestScope.getStore()
@@ -52,6 +52,7 @@ integration('application audit ordering with disposable PostgreSQL', () => {
   let getPack: typeof import('../application-pack/route').GET
   let postPack: typeof import('../application-pack/route').POST
   let postRepair: typeof import('./apply/route').POST
+  let postTailor: typeof import('../tailor-resume/route').POST
   let signedAuditActivityText: typeof import('@/lib/application-audit-receipt').signedAuditActivityText
   let registerAuditOperation: typeof import('@/lib/application-audit-operation').registerAuditOperation
 
@@ -68,7 +69,7 @@ integration('application audit ordering with disposable PostgreSQL', () => {
     await clientB.$connect()
     await clientA.$executeRawUnsafe(`CREATE TYPE "${schema}"."JobStatus" AS ENUM ('saved', 'applied', 'interview', 'offer', 'rejected')`)
     await clientA.$executeRawUnsafe(`CREATE TYPE "${schema}"."JobWorkflowState" AS ENUM ('draft', 'ready_to_apply', 'queued', 'submitting', 'submitted')`)
-    await clientA.$executeRawUnsafe(`CREATE TYPE "${schema}"."ActivityType" AS ENUM ('agent_action')`)
+    await clientA.$executeRawUnsafe(`CREATE TYPE "${schema}"."ActivityType" AS ENUM ('agent_action', 'resume_tailored')`)
     await clientA.$executeRawUnsafe(`CREATE TABLE "${schema}"."Job" (
       "id" TEXT PRIMARY KEY, "userId" TEXT NOT NULL, "company" TEXT NOT NULL, "logo" TEXT, "role" TEXT NOT NULL,
       "location" TEXT, "status" "${schema}"."JobStatus" NOT NULL DEFAULT 'saved', "score" INTEGER, "url" TEXT,
@@ -139,6 +140,9 @@ integration('application audit ordering with disposable PostgreSQL', () => {
     } }) }))
     vi.doMock('@/lib/auth-secret', () => ({ getAuthJwtSecret: () => 'disposable-audit-fixture-secret-32-bytes' }))
     vi.doMock('@/lib/persona', () => ({ buildPersona: async () => 'Synthetic confirmed fixture facts' }))
+    vi.doMock('@/lib/persona-evidence', () => ({ personaEvidenceContext: async () => 'Synthetic fixture evidence' }))
+    vi.doMock('@/lib/entitlements', () => ({ hasEffectiveEntitlement: async () => true }))
+    vi.doMock('@/lib/agent/policy/legacy', () => ({ requireLegacyPolicy: () => undefined }))
     vi.doMock('@/lib/agent/role-config', () => ({ roleAiConfig: (_role: string, _row: unknown, cfg: unknown) => cfg }))
     vi.doMock('@/lib/model-router', () => ({
       modelChat: async () => {
@@ -146,6 +150,7 @@ integration('application audit ordering with disposable PostgreSQL', () => {
         request.gate?.entered()
         await request.gate?.waiting
         if (request.repair) return { provider: 'fixture', model: 'fixture', text: JSON.stringify({ proposedValue: 'Synthetic corrected summary' }) }
+        if (request.tailor) return { provider: 'fixture', model: 'fixture', text: JSON.stringify({ after: 'Synthetic corrected summary', reason: 'Fixture correction' }) }
         return { provider: 'fixture', model: 'fixture', text: JSON.stringify({
           summary: request.summary ?? 'Fixture audit', matchScore: 80,
           findings: [request.review
@@ -164,6 +169,7 @@ integration('application audit ordering with disposable PostgreSQL', () => {
     postPack = pack.POST
     getPack = pack.GET
     postRepair = (await import('./apply/route')).POST
+    postTailor = (await import('../tailor-resume/route')).POST
     signedAuditActivityText = (await import('@/lib/application-audit-receipt')).signedAuditActivityText
     registerAuditOperation = (await import('@/lib/application-audit-operation')).registerAuditOperation
   }, 30_000)
@@ -183,7 +189,7 @@ integration('application audit ordering with disposable PostgreSQL', () => {
   })
 
   afterAll(async () => {
-    for (const name of ['@/lib/api-helpers', '@/lib/db', '@/lib/auth-secret', '@/lib/persona', '@/lib/agent/role-config', '@/lib/model-router']) vi.doUnmock(name)
+    for (const name of ['@/lib/api-helpers', '@/lib/db', '@/lib/auth-secret', '@/lib/persona', '@/lib/persona-evidence', '@/lib/entitlements', '@/lib/agent/policy/legacy', '@/lib/agent/role-config', '@/lib/model-router']) vi.doUnmock(name)
     vi.resetModules()
     await clientA?.$disconnect()
     await clientB?.$disconnect()
@@ -202,6 +208,22 @@ integration('application audit ordering with disposable PostgreSQL', () => {
       : kind === 'read' ? getAudit(request, params) : kind === 'download' ? postPack(request, params) : getPack(request, params))
     if (!(response instanceof Response)) throw new Error('Route did not return a response')
     return response
+  }
+
+  async function invokeTailor(scope: RequestScope): Promise<Response> {
+    const request = new NextRequest('http://localhost/api/jobs/job-1/tailor-resume', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ resumeId: 'resume-1', forceRetailor: true, auditFindings: [
+        { area: 'resume', severity: 'warning', target: 'summary', title: 'Review summary', evidence: 'Synthetic', action: 'Correct' },
+      ] }),
+    })
+    const response = await requestScope.run({ ...scope, tailor: true }, () => postTailor(request, { params: Promise.resolve({ id: 'job-1' }) }))
+    if (!(response instanceof Response)) throw new Error('Tailor route did not return a response')
+    return response
+  }
+
+  async function seedTailoredResume() {
+    return clientA.resume.update({ where: { id: 'resume-1' }, data: { kind: 'adapted', origin: 'ai-adapted', targetJobId: 'job-1' } })
   }
 
   it('hides an old pass while a new audit is running and rejects pack and print', async () => {
@@ -498,5 +520,52 @@ integration('application audit ordering with disposable PostgreSQL', () => {
       expect(await clientB.resumeVersion.count({ where: { resumeId: before.id } })).toBe(0)
       expect((await (await invoke('read', { client: clientB, userId: 'owner-a' })).json()).audit.summary).toBe('Review this summary')
     } finally { await clientA.$executeRawUnsafe(`ALTER TABLE "${schema}"."Activity" DROP CONSTRAINT reject_audit_control`) }
+  }, 30_000)
+
+  it.each(['changed timestamp', 'same timestamp'] as const)('does not overwrite another saved resume during forced repair with %s', async mode => {
+    const before = await seedTailoredResume()
+    const model = gate()
+    const pending = invokeTailor({ client: clientA, userId: 'owner-a', gate: model })
+    try {
+      await within(model.reached)
+      const editedContent = { ...(before.content as object), summary: 'User saved a different summary', skills: ['User-preserved skill'] }
+      const savedAt = mode === 'same timestamp' ? before.updatedAt : new Date(before.updatedAt.getTime() + 10_000)
+      await clientB.resume.update({ where: { id: before.id }, data: { content: editedContent, updatedAt: savedAt } })
+      const saved = await clientB.resume.findUniqueOrThrow({ where: { id: before.id } })
+      expect(saved.content).toEqual(editedContent)
+      expect(saved.updatedAt).toEqual(savedAt)
+      model.release()
+      const response = await within(pending)
+      expect(response.status).toBe(409)
+      const after = await clientB.resume.findUniqueOrThrow({ where: { id: before.id } })
+      expect(after.content).toEqual(editedContent)
+      expect(after.updatedAt).toEqual(savedAt)
+      expect(await clientB.resumeVersion.count({ where: { resumeId: before.id, userId: 'owner-a' } })).toBe(0)
+    } finally { model.release(); await within(Promise.allSettled([pending])) }
+  }, 30_000)
+
+  it('saves forced repair with unrelated sections preserved and one pre-change history snapshot', async () => {
+    const before = await seedTailoredResume()
+    const response = await invokeTailor({ client: clientA, userId: 'owner-a' })
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({ adaptedResumeId: before.id, revised: true })
+    const after = await clientB.resume.findUniqueOrThrow({ where: { id: before.id } })
+    expect(after.content).toEqual({ ...(before.content as object), summary: 'Synthetic corrected summary' })
+    const versions = await clientB.resumeVersion.findMany({ where: { resumeId: before.id, userId: 'owner-a' } })
+    expect(versions).toHaveLength(1)
+    expect(versions[0]).toMatchObject({ name: before.name, content: before.content })
+  }, 30_000)
+
+  it('rolls back the forced repair if its history snapshot cannot be saved', async () => {
+    const before = await seedTailoredResume()
+    await clientA.$executeRawUnsafe(`ALTER TABLE "${schema}"."ResumeVersion" ADD CONSTRAINT reject_tailor_history CHECK ("name" <> 'Tailored')`)
+    try {
+      const response = await invokeTailor({ client: clientA, userId: 'owner-a' })
+      expect(response.status).toBe(503)
+      const after = await clientB.resume.findUniqueOrThrow({ where: { id: before.id } })
+      expect(after.content).toEqual(before.content)
+      expect(after.updatedAt).toEqual(before.updatedAt)
+      expect(await clientB.resumeVersion.count({ where: { resumeId: before.id, userId: 'owner-a' } })).toBe(0)
+    } finally { await clientA.$executeRawUnsafe(`ALTER TABLE "${schema}"."ResumeVersion" DROP CONSTRAINT reject_tailor_history`) }
   }, 30_000)
 })

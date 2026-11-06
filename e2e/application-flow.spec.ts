@@ -9,6 +9,9 @@ import { AUDIT_LIMIT_MESSAGES } from '../apps/web/src/lib/application-audit-limi
 
 // Mounted production components with mocked identity/API responses. This is not
 // proof of authentication, database behavior, Agent execution or real submission.
+// Keep failure screenshots and retry traces without recording every successful
+// case twice; the full matrix otherwise exceeds its CI time limit.
+test.use({ screenshot: 'only-on-failure', trace: 'on-first-retry' })
 let temporaryDirectory: string
 let server: Server
 let origin: string
@@ -417,10 +420,6 @@ async function open(page: Page, query = '') {
 test.beforeEach(async ({ page }, testInfo) => {
   page.on('pageerror', error => console.error('Mounted fixture browser error:', error.message))
   await page.addInitScript(locale => localStorage.setItem('applymate_lang', locale), testInfo.project.metadata.appLocale === 'zh' ? 'zh' : 'en')
-})
-
-test.afterEach(async ({ page }, testInfo) => {
-  if (testInfo.status === 'passed') await page.screenshot({ path: testInfo.outputPath('mounted-success.png'), fullPage: true })
 })
 
 for (const scenario of [
@@ -2049,6 +2048,92 @@ test('first preparation audits only the resume without generating or binding a c
   expect(state.job.finalCoverLetterId).toBeNull()
   expect(state.unexpected).toEqual([])
 })
+
+for (const issueCase of ['letter', 'mixed'] as const) {
+  test(`letter factual ${issueCase} repair opens current Resume without writes`, async ({ page }) => {
+    const state = await install(page, { selectedLetter: true })
+    const letterIssue = { area: 'cover_letter', severity: 'critical', resolution: 'contradiction', title: 'Incorrect letter claim', evidence: 'Not supported', action: 'Edit the letter' }
+    const resumeIssue = { area: 'resume', severity: 'warning', resolution: 'contradiction', title: 'Incorrect resume claim', evidence: 'Not supported', action: 'Edit the resume' }
+    state.audit = { ...state.audit, audit: { ...state.audit.audit, verdict: 'needs_review', findings: [letterIssue, ...(issueCase === 'mixed' ? [resumeIssue] : [])] } } as typeof state.audit
+    await open(page)
+    await page.getByRole('button', { name: /Review material issues|查看材料问题/, exact: true }).click()
+    await expect(page.getByText(/open Cover Letter and verify the selected letter|打开求职信，核对当前选中的信/).first()).toBeVisible()
+    await page.getByRole('button', { name: /Review the selected cover letter|核对已选求职信/, exact: true }).click()
+    await expect(page).toHaveURL(/page=resume/)
+    await expect(page).toHaveURL(/resumeId=resume-1/)
+    await expect(page).toHaveURL(/returnJobId=outside-page/)
+    expect(state.writes).toEqual([])
+    expect(state.unexpected).toEqual([])
+  })
+}
+
+test('letter evidence guidance names the selected cover letter and opens the same application', async ({ page }) => {
+  const state = await install(page, { selectedLetter: true })
+  state.audit = { ...state.audit, audit: { ...state.audit.audit, verdict: 'needs_review', findings: [
+    { area: 'cover_letter', severity: 'warning', resolution: 'evidence_needed', title: 'Letter evidence needed', evidence: 'No support', action: 'Review the letter' },
+  ] } } as typeof state.audit
+  await open(page)
+  await page.getByRole('button', { name: /Provide missing information|补充信息/, exact: true }).click()
+  const card = page.getByText('Letter evidence needed').locator('..')
+  await card.getByRole('button', { name: /Review the selected cover letter|核对已选求职信/, exact: true }).click()
+  await expect(page).toHaveURL(/page=resume/)
+  await expect(page).toHaveURL(/returnJobId=outside-page/)
+  expect(state.writes).toEqual([])
+})
+
+test('unavailable selected letter prevents factual repair navigation and writing', async ({ page }) => {
+  const state = await install(page, { holdSelectedLetter: true })
+  state.audit = { ...state.audit, coverLetterId: 'selected-letter', coverLetterUpdatedAt: time, audit: { ...state.audit.audit, verdict: 'needs_review', findings: [{ area: 'cover_letter', severity: 'critical', title: 'Incorrect letter claim', evidence: 'Not supported', action: 'Edit the letter' }] } } as typeof state.audit
+  await open(page)
+  await page.getByRole('button').filter({ has: page.getByText(/^(Cover letter|求职信)$/) }).click()
+  state.releaseLetters()
+  const unavailable = page.getByRole('status').filter({ hasText: /selected cover letter could not be loaded|无法加载已选求职信/i }).first()
+  await expect(unavailable).toBeVisible()
+  await unavailable.getByRole('button', { name: /Refresh status|刷新状态/ }).click()
+  await expect(page).toHaveURL(/page=jobs/)
+  expect(state.writes).toEqual([])
+})
+
+test('retry-only audit checks the existing selected materials without navigating', async ({ page }) => {
+  const state = await install(page, { selectedLetter: true })
+  state.audit = { ...state.audit, audit: { ...state.audit.audit, verdict: 'needs_review', findings: [{ area: 'job_match', severity: 'warning', title: 'Audit response needs retry', evidence: 'Retry needed', action: 'Retry' }] } } as typeof state.audit
+  await open(page)
+  await page.getByRole('button', { name: /Review material issues|查看材料问题/, exact: true }).click()
+  await page.getByRole('button', { name: /Retry independent audit|重试独立审核/, exact: true }).click()
+  await expect.poll(() => state.writes.some(write => write.path.endsWith('/audit-application'))).toBe(true)
+  expect(state.writes.some(write => write.path.endsWith('/cover-letters/generate') || write.path.endsWith('/tailor-resume'))).toBe(false)
+  await expect(page).toHaveURL(/page=jobs/)
+})
+
+test('Resume explains the replacement scope and backup limits before repair', async ({ page }) => {
+  const state = await install(page, { auditCorrection: true })
+  await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+  await expect(page.getByRole('note').filter({ hasText: /replaces the entire affected resume section or cover letter|替换受影响的整段简历内容或整封求职信/ })).toBeVisible()
+  expect(state.writes).toEqual([])
+})
+
+for (const repairError of ['unclear', 'too-many', 'conflict', 'other'] as const) {
+  test(`resume repair ${repairError} failure keeps the application and explains the next step`, async ({ page }) => {
+    const state = await install(page)
+    state.audit = { ...state.audit, audit: { ...state.audit.audit, verdict: 'needs_review', findings: [{ area: 'resume', severity: 'warning', resolution: 'contradiction', title: 'Incorrect resume claim', evidence: 'Not supported', action: 'Edit the resume' }] } } as typeof state.audit
+    const error = repairError === 'unclear' ? 'The affected resume section is unclear. Open the resume and edit it manually.'
+      : repairError === 'too-many' ? 'Too many resume issues to correct at once. Open the resume and review them manually.'
+        : repairError === 'conflict' ? 'The resume changed during correction. Refresh and review the latest version.' : 'Other fixture error'
+    let attempts = 0
+    await page.route('**/api/jobs/outside-page/tailor-resume', async route => { attempts++; await route.fulfill({ status: repairError === 'conflict' ? 409 : 422, json: { error } }) })
+    await open(page)
+    await page.getByRole('button', { name: /Review material issues|查看材料问题/, exact: true }).click()
+    await expect(page.getByText(/entire affected resume section|受影响的整段简历内容/)).toBeVisible()
+    await page.getByRole('button', { name: /Fix with AI and re-audit|使用 AI 修复并重新审核/, exact: true }).click()
+    const expected = repairError === 'unclear' ? /affected section is unclear.*this application’s resume|无法确定受影响的简历章节.*此职位的简历/
+      : repairError === 'too-many' ? /too many resume issues.*this application’s resume|需要修正的简历问题过多.*此职位的简历/
+        : repairError === 'conflict' ? /resume changed during correction.*refresh|修正期间简历已发生变化.*刷新/i : /Other fixture error|请重试。/
+    await expect(page.getByText(expected)).toBeVisible()
+    expect(attempts).toBe(1)
+    expect(state.writes.some(write => write.path.endsWith('/audit-application') || write.path.endsWith('/assign'))).toBe(false)
+    await expect(page).toHaveURL(/page=jobs/)
+  })
+}
 
 test('selected cover letter distinguishes loading and unavailable and refreshes without writes', async ({ page }) => {
   const state = await install(page, { holdSelectedLetter: true })
