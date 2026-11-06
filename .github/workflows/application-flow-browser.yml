@@ -32,6 +32,8 @@ jobs:
           node-version: 20
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Build test-discovery dependencies
+        run: pnpm --filter @jobcopilot/agent-protocol build && pnpm --filter @jobcopilot/shared build && pnpm --filter @jobcopilot/agent-model build && pnpm --filter @jobcopilot/agent-policy build
       - name: Verify the configured project set
         shell: bash
         run: |
@@ -39,6 +41,7 @@ jobs:
           unset E2E_BASE_URL DATABASE_URL DIRECT_URL AGENT_PLAN_LEDGER_TRACE_ARTIFACT_PATH AGENT_INTERACTIVE_DISCOVERY_TRACE_ARTIFACT_PATH
           pnpm exec playwright test --list --reporter=json | node -e '
           const report = JSON.parse(require("fs").readFileSync(0, "utf8"));
+          if (report.errors?.length) throw new Error("Playwright test discovery failed; inspect test imports and dependency builds.");
           const actual = report.config.projects.map(project => project.name).sort();
           const expected = ["desktop-en", "desktop-zh", "mobile-en", "mobile-zh"].sort();
           if (JSON.stringify(actual) !== JSON.stringify(expected)) {
