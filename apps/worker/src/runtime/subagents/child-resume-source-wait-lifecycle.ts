@@ -9,6 +9,7 @@ import type { TurnEnginePool, TurnEngineQueryClient } from "../turns/turn-engine
 import type { TurnEngineEventInput } from "../turns/turn-engine-types.js"
 import { projectWaitCallEventContent } from "../turns/turn-execution-wait-event-projection.js"
 import { toRepositoryJson } from "../turns/turn-engine-types.js"
+import { isCanonicalChildWaitOutcome } from "./pg-store-expiry-child-wait-claim-call-proof.js"
 import { DurableSubagentWaitError, safeSubagentWaitJson, type DurableSubagentWaitResult } from "./durable-subagent-wait-store.js"
 import { markCanonicalSubagentWaitId, markCanonicalSubagentWaitTargetIds } from "./subagent-wait-structural-ids.js"
 import type { SubagentLease } from "./types.js"
@@ -39,17 +40,8 @@ function marker(lease: Lease, sourceAttempt: number, stepId: string, waitId: str
 }
 function validMarker(value: unknown, expected: Provenance): boolean { const saved = obj(value); return exact(saved, Object.keys(expected)) && text(saved.ownerId) && sameJson({ ...saved, ownerId: expected.ownerId }, expected) }
 function validOutcome(value: unknown, wait: Row, ids: readonly string[]): value is DurableSubagentWaitResult {
-  const out = obj(value), tasks = Array.isArray(out.tasks) ? out.tasks.map(obj) : [], savedIds = strictIds(out.taskIds)
-  if (!exact(out, ["waitId", "status", "taskIds", "deadlineAt", "matchedTaskIds", "tasks"]) || out.waitId !== wait.id
-    || out.status !== wait.status || !(out.status === "ready" || out.status === "timed_out") || !savedIds || !sameIds(savedIds, ids)
-    || !Array.isArray(out.matchedTaskIds) || out.matchedTaskIds.some(id => typeof id !== "string" || !ids.includes(id))
-    || new Set(out.matchedTaskIds).size !== out.matchedTaskIds.length || tasks.length !== ids.length
-    || !sameIds(tasks.map(task => required(task.taskId)), ids) || !text(out.deadlineAt)
-    || !tasks.every(task => exact(task, ["taskId", "status", "role", "result", "failureReason"])
-      && typeof task.status === "string" && typeof task.role === "string" && !!task.role.trim()
-      && (task.failureReason === null || typeof task.failureReason === "string"))) return false
-  const deadline = epochMillis(wait.deadlineAt), resultDeadline = epochMillis(out.deadlineAt)
-  return deadline !== undefined && resultDeadline === deadline
+  const out = obj(value), savedIds = strictIds(out.taskIds)
+  return !!savedIds && sameIds(savedIds, ids) && isCanonicalChildWaitOutcome(wait, value)
     && markCanonicalSubagentWaitId(out, String(wait.id))
     && markCanonicalSubagentWaitTargetIds({ targetTaskIds: savedIds }, out as DurableSubagentWaitResult, savedIds)
 }

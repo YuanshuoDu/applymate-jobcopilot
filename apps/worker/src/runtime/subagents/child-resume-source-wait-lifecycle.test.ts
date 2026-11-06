@@ -42,7 +42,7 @@ function fixture(options: { wrongCause?: boolean; wrongItemStartCause?: boolean;
     input: { idempotencyKey: secretKey, taskIds: [taskId], mode: "any", timeoutMs: 1_000 } }
   const wait: Record<string, unknown> = { id: waitId, userId: lease.userId, sessionId: lease.sessionId, turnId: lease.turnId,
     parentTaskId: lease.id, stepId: "step-1", idempotencyKey: secretKey, targetTaskIds: [taskId], mode: "any", status: "ready",
-    deadlineAt: new Date(result.deadlineAt), matchedTaskIds: [taskId],
+    deadlineAt: new Date(result.deadlineAt), matchedTaskIds: [taskId], resolvedAt: now,
     result: { request: { targetTaskIds: [taskId], mode: "any", timeoutMs: 1_000 }, outcome: result }, consumedAt: null }
   const items: Record<string, unknown>[] = [{ id: callItemId, revision: 0, stepId: "step-1", taskId: lease.id, type: "tool_call",
     phase: null, status: "started", content: callContent }]
@@ -211,6 +211,28 @@ describe("child source wait lifecycle recovery", () => {
     content.output = output
     await expect(inspectChildWaitSourceLifecycle(offsetBacked.client as never, lease, offsetBacked.wait, "step-1", offsetBacked.result as never))
       .resolves.toMatchObject({ state: "waiting" })
+  })
+
+  it.each([
+    ["unknown task status", (wait: Record<string, unknown>, result: Record<string, unknown>) => {
+      ((result.tasks as Record<string, unknown>[])[0]!).status = "unknown"
+    }],
+    ["empty ready match", (_wait: Record<string, unknown>, result: Record<string, unknown>) => { result.matchedTaskIds = [] }],
+    ["mismatched target match", (wait: Record<string, unknown>, result: Record<string, unknown>) => {
+      wait.matchedTaskIds = result.matchedTaskIds = ["other-target"]
+    }],
+    ["invalid mode", (wait: Record<string, unknown>) => { wait.mode = "first" }],
+    ["future timeout", (wait: Record<string, unknown>, result: Record<string, unknown>) => {
+      wait.status = result.status = "timed_out"
+      wait.resolvedAt = new Date(new Date(String(result.deadlineAt)).getTime() - 1)
+    }],
+    ["altered deadline", (_wait: Record<string, unknown>, result: Record<string, unknown>) => { result.deadlineAt = "2026-10-30T10:00:05.124Z" }],
+  ] as const)("rejects malformed persisted outcome: %s", async (_label, corrupt) => {
+    const fake = fixture(), persisted = fake.wait.result as Record<string, unknown>
+    const result = persisted.outcome as Record<string, unknown>
+    corrupt(fake.wait, result)
+    await expect(inspectChildWaitSourceLifecycle(fake.client as never, lease, fake.wait, "step-1", fake.result as never))
+      .rejects.toMatchObject({ code: "wait_scope_error", sourceLifecycleStage: "resume_scope" })
   })
 
   it.each([

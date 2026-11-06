@@ -3,6 +3,7 @@ import {
   childWaitContinuationKeyMatchesSafeProjection,
   CHILD_WAIT_CLAIM_KEY_COLUMNS_SQL,
   CHILD_WAIT_CALL_ITEM_COMPLETED_NO_EVENT_SQL, CHILD_WAIT_CALL_LIFECYCLE_SQL, CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL,
+  isCanonicalChildWaitOutcome,
 } from "./pg-store-expiry-child-wait-claim-call-proof.js"
 
 describe("child-wait continuation key projection", () => {
@@ -33,6 +34,71 @@ describe("child-wait continuation key projection", () => {
     expect(sql).toContain("':attempt:' || $6::text")
     expect(sql).not.toContain("':attempt:' || latest_wait.\"attempt\"::text")
     expect(sql).toContain('CASE WHEN COUNT(*) = 1 THEN MAX(')
+  })
+})
+
+describe("claim terminal settlement event descendants", () => {
+  it("only exempts the exact writer-bound step completion after its claim result", () => {
+    expect(CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL).toContain("proof.value->'stepToolChain'->>'stepCompletedEventId'")
+    expect(CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL).toContain("resultExtra.\"causationId\" = proof.value->>'resultCompletedEventId'")
+    expect(CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL).toContain("ordered.\"sequence\" <= ordered.\"previousSequence\"")
+    expect(CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL).toContain("modelDone.\"causationId\" = modelStart.\"id\"")
+    expect(CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL).toContain("stepDone.\"payload\" = jsonb_build_object('stepId'")
+  })
+})
+
+describe("canonical historical child-wait outcome", () => {
+  function fixture() {
+    const deadlineAt = new Date("2026-11-06T10:00:00.123Z")
+    const wait = { id: "wait-1", status: "ready", mode: "any", targetTaskIds: ["child-1", "child-2"],
+      matchedTaskIds: ["child-1"], deadlineAt, resolvedAt: new Date("2026-11-06T09:59:00.000Z") }
+    const outcome = { waitId: wait.id, status: wait.status, taskIds: wait.targetTaskIds, deadlineAt: deadlineAt.toISOString(),
+      matchedTaskIds: wait.matchedTaskIds, tasks: [
+        { taskId: "child-1", status: "completed", role: "writer", result: null, failureReason: null },
+        { taskId: "child-2", status: "running", role: "analyst", result: null, failureReason: null },
+      ] }
+    return { wait, outcome }
+  }
+
+  it("accepts a canonical ready snapshot without consulting mutable current child rows", () => {
+    const { wait, outcome } = fixture()
+    const currentChildStatuses = ["completed", "queued"]
+    expect(isCanonicalChildWaitOutcome(wait, outcome)).toBe(true)
+    expect(currentChildStatuses).not.toEqual(outcome.tasks.map(task => task.status))
+  })
+
+  it.each([
+    ["unknown task status", (wait: Record<string, unknown>, outcome: Record<string, unknown>) => {
+      (outcome.tasks as Record<string, unknown>[])[0]!.status = "unknown"
+    }],
+    ["empty ready match", (_wait: Record<string, unknown>, outcome: Record<string, unknown>) => { outcome.matchedTaskIds = [] }],
+    ["misbound match", (_wait: Record<string, unknown>, outcome: Record<string, unknown>) => { outcome.matchedTaskIds = ["other-child"] }],
+    ["invalid mode", (wait: Record<string, unknown>) => { wait.mode = "first" }],
+    ["noncanonical offset deadline", (_wait: Record<string, unknown>, outcome: Record<string, unknown>) => {
+      outcome.deadlineAt = "2026-11-06T10:00:00.123+00:00"
+    }],
+    ["altered deadline", (_wait: Record<string, unknown>, outcome: Record<string, unknown>) => {
+      outcome.deadlineAt = "2026-11-06T10:00:00.124Z"
+    }],
+    ["timeout before deadline", (wait: Record<string, unknown>, outcome: Record<string, unknown>) => {
+      wait.status = outcome.status = "timed_out"
+      wait.resolvedAt = new Date("2026-11-06T10:00:00.122Z")
+    }],
+    ["ready at or after deadline", (wait: Record<string, unknown>) => { wait.resolvedAt = wait.deadlineAt }],
+  ] as const)("rejects %s", (_label, corrupt) => {
+    const { wait, outcome } = fixture()
+    corrupt(wait, outcome)
+    expect(isCanonicalChildWaitOutcome(wait, outcome)).toBe(false)
+  })
+
+  it("requires every target for ready all-mode and a terminal snapshot for each match", () => {
+    const { wait, outcome } = fixture()
+    wait.mode = "all"
+    expect(isCanonicalChildWaitOutcome(wait, outcome)).toBe(false)
+    ;(outcome.tasks[1] as Record<string, unknown>).status = "failed"
+    outcome.matchedTaskIds = ["child-1", "child-2"]
+    wait.matchedTaskIds = ["child-1", "child-2"]
+    expect(isCanonicalChildWaitOutcome(wait, outcome)).toBe(true)
   })
 })
 
@@ -79,9 +145,11 @@ describe("child-wait terminal settlement", () => {
     expect(decoys.map(candidate => candidate.callItemId === source.callItemId
       && candidate.sourceStepId === source.sourceStepId && candidate.sourceAttempt === source.sourceAttempt)).toEqual([false, false, false])
     const sql = CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL.replace(/\s+/g, " ")
-    expect(sql).toContain('callItem."content"->>\'toolCallId\' = $11::text AND started."correlationId" = $11::text')
-    expect(sql).toContain('callItem."id" = $13::text AND callItem."stepId" = $14::text AND callStep."id" = $14::text')
-    expect(sql).toContain('callStep."attempt" = $15::integer AND $15::integer BETWEEN 1 AND owner."attemptCount"')
+    expect(sql).not.toContain('jsonb_array_length(wait."targetTaskIds")')
+    expect(sql).not.toContain('jsonb_array_elements_text(wait."matchedTaskIds")')
+    expect(sql).toContain('proof.value->>\'rawCallId\' = callItem."content"->>\'toolCallId\' AND started."correlationId" = proof.value->>\'rawCallId\'')
+    expect(sql).toContain('proof.value->>\'callItemId\' = callItem."id" AND proof.value->>\'stepId\' = callItem."stepId"')
+    expect(sql).toContain('proof.value->>\'attempt\' = callStep."attempt"::text AND callStep."attempt" BETWEEN 1 AND owner."attemptCount"')
   })
 
   it("keeps unrelated calls on the existing path and requires the complete causal lifecycle for waits", () => {
@@ -100,18 +168,25 @@ describe("child-wait terminal settlement", () => {
     expect(sql).toContain("prior.\"id\" = itemStarted.\"causationId\"")
     expect(sql).toContain("itemCompleted.\"causationId\" = started.\"id\"")
     expect(sql).toContain("extra.\"correlationId\" = callItem.\"id\"")
+    expect(sql).toContain("proof.value->>'resultStartedEventId' IS NOT NULL")
+    expect(sql).toContain("proof.value->>'resultCompletedEventId' IS NOT NULL")
+    expect(sql).toContain("resultExtra.\"causationId\" IN (proof.value->>'resultStartedEventId', proof.value->>'resultCompletedEventId')")
+    expect(sql).toContain("resultExtra.\"id\" <> proof.value->>'resultCompletedEventId'")
     expect(sql).toContain("settled.\"causationId\" = itemCompleted.\"id\"")
     expect(sql).not.toContain("tool-call-recovered:")
     expect(sql).not.toContain("tool-recovered:")
     expect(sql).toContain("settled.\"type\" = 'tool_call.completed'")
     expect(sql).toContain("settled.\"type\" = 'tool_call.failed'")
-    expect(sql).toContain("$11::text IS NOT NULL AND $12::text IS NOT NULL AND $13::text IS NOT NULL AND $14::text IS NOT NULL AND $15::integer IS NOT NULL")
-    expect(sql).toContain("callItem.\"content\"->>'toolCallId' = $11::text AND started.\"correlationId\" = $11::text")
-    expect(sql).toContain('callItem."id" = $13::text AND callItem."stepId" = $14::text AND callStep."id" = $14::text')
-    expect(sql).toContain('callStep."attempt" = $15::integer AND $15::integer BETWEEN 1 AND owner."attemptCount"')
+    expect(sql).toContain("jsonb_array_elements(CASE WHEN jsonb_typeof($13::jsonb) = 'array' THEN $13::jsonb ELSE '[]'::jsonb END)")
+    expect(sql).toContain("proof.value->>'startEventId' = started.\"id\"")
+    expect(sql).toContain("proof.value->>'rawCallId' = callItem.\"content\"->>'toolCallId'")
+    expect(sql).toContain("proof.value->>'projectedCallId' IS NOT NULL")
+    expect(sql).toContain("proof.value->>'callItemId' = callItem.\"id\"")
+    expect(sql).toContain("proof.value->>'stepId' = callItem.\"stepId\"")
+    expect(sql).toContain("proof.value->>'attempt' = callStep.\"attempt\"::text")
     expect(sql).toContain("itemCompleted.\"payload\" = jsonb_build_object('itemId', callItem.\"id\", 'status', 'completed'")
     expect(sql).toContain("'idempotencyKey', '[REDACTED]'")
-    expect(sql).toContain("'toolCallId', $12::text")
+    expect(sql).toContain("'toolCallId', proof.value->>'projectedCallId'")
     expect(sql).toContain("jsonb_array_length(CASE WHEN jsonb_typeof(callItem.\"content\"->'input'->'taskIds') = 'array'")
     expect(sql).toContain("terminal.\"type\" IN ('tool_call.completed', 'tool_call.failed', 'tool_call.interrupted')) = 1")
     expect(sql).toContain("extra.\"id\" NOT IN (itemStarted.\"id\", started.\"id\", itemCompleted.\"id\", settled.\"id\")")

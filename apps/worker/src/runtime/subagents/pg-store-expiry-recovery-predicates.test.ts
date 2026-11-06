@@ -71,13 +71,13 @@ describe("expired recovery SQL predicates", () => {
   })
 
   it("keeps unresolved external calls fenced by event correlation and exact wait ownership", async () => {
-    const query = vi.fn().mockResolvedValue({ rows: [{ id: "unsettled-start" }] })
+    const query = vi.fn().mockResolvedValue({ rows: [{ id: "unsettled-start", waitCallCandidate: false }] })
     const client = { query }
     await expect(hasBlockingExternalCall(client as never, task, "ignored-event", "continuation-1")).resolves.toBe(true)
     expect(query).toHaveBeenCalledTimes(2)
     const [sql, values] = query.mock.calls[1] as [string, unknown[]]
     expect(values).toEqual([task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount,
-      task.leaseExpiresAt, task.userId, "ignored-event", "continuation-1", null, null, null, null, null])
+      task.leaseExpiresAt, task.userId, "ignored-event", "continuation-1", null, null, "[]"])
     expectSqlBindings(sql, values)
     expectSqlBindings(query.mock.calls[0]![0] as string, query.mock.calls[0]![1] as unknown[])
     expect(sql).toContain('started."sessionId" = $1 AND started."taskId" = $2')
@@ -98,18 +98,17 @@ describe("expired recovery SQL predicates", () => {
       .mockResolvedValueOnce({ rows: [{ toolCallId: "child-wait-call:415-555-0134", callItemId: "source-call-item",
         sourceStepId: "source-step", sourceAttempt: 1 }] })
       .mockResolvedValueOnce({ rows: [{ id: "claim-start", claimWaitId: "wait-1", waitDeadlineAt: deadline, outcomeDeadlineAt: deadline.toISOString(),
-        sourceWaitKey: "child-wait:415-555-0134:attempt:1", continuationWaitKey: "child-wait:[REDACTED_PHONE]:attempt:1" }] })
+        sourceWaitKey: "child-wait:415-555-0134:attempt:1", continuationWaitKey: "child-wait:[REDACTED_PHONE]:attempt:1", waitCallCandidate: true }] })
     const client = { query }
     await expect(hasBlockingExternalCall(client as never, task, undefined, "continuation-1")).resolves.toBe(false)
     expect(query).toHaveBeenCalledTimes(2)
     const [sql, values] = query.mock.calls[1] as [string, unknown[]]
     expect(values).toEqual([task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount,
-      task.leaseExpiresAt, task.userId, null, "continuation-1", "child-wait-call:415-555-0134", "child-wait-call:[REDACTED_PHONE]",
-      "source-call-item", "source-step", 1])
+      task.leaseExpiresAt, task.userId, null, "continuation-1", "child-wait-call:415-555-0134", "child-wait-call:[REDACTED_PHONE]", "[]"])
     expectSqlBindings(sql, values)
     expectSqlBindings(query.mock.calls[0]![0] as string, query.mock.calls[0]![1] as unknown[])
     expect(CHILD_WAIT_CLAIM_RECOVERY_SQL).toContain("$11::text IS NOT NULL AND $12::text IS NOT NULL")
-    expect(sql).toContain("$13::text IS NOT NULL AND $14::text IS NOT NULL AND $15::integer IS NOT NULL")
+    expect(sql).toContain("jsonb_array_elements(CASE WHEN jsonb_typeof($13::jsonb) = 'array' THEN $13::jsonb ELSE '[]'::jsonb END)")
     expect(sql).toContain('LEFT JOIN LATERAL (SELECT latest_wait."id" AS "waitId"')
     expect(sql).toContain('FROM latest_wait WHERE started."type" = \'tool_call.started\' AND $10::text IS NOT NULL AND EXISTS (')
     expect(sql).toContain("started.\"idempotencyKey\" = 'task:' || owner.\"id\" || ':event:child-wait-claim:' || owner.\"attemptCount\"::text || ':' || continuation.\"id\"")
@@ -143,7 +142,9 @@ describe("expired recovery SQL predicates", () => {
     expect(sql).toContain("jsonb_typeof(sourceResult.\"content\"->'output'->'taskIds') = 'array'")
     expect(sql).toContain('AS receiptTarget(id) ORDER BY id)) = (SELECT ARRAY(SELECT id FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(wait."targetTaskIds")')
     expect(sql).toContain("wait.\"result\"->'outcome'->>'deadlineAt' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T")
-    expect(sql).toContain("clock_timestamp() AT TIME ZONE 'UTC'")
+    expect(sql).toContain("to_char(wait.\"deadlineAt\" AT TIME ZONE 'UTC'")
+    expect(sql).toContain('wait."resolvedAt" >= wait."deadlineAt"')
+    expect(sql).toContain('wait."resolvedAt" < wait."deadlineAt"')
     expect(sql).toContain("jsonb_typeof(wait.\"result\"->'outcome'->'tasks') = 'array'")
     expect(sql).toContain("SELECT COUNT(*) FROM jsonb_object_keys(saved.value)")
     expect(sql).toContain("jsonb_typeof(saved.value->'failureReason') IN ('null', 'string')")

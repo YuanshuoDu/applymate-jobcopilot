@@ -171,6 +171,8 @@ const loopFixtureModelProfile = Object.freeze({ provider: "fixture", model: "dur
 const readyMarkerByMode = {
   "worker-a": "WORKER_A_READY",
   "worker-a-crash": "WORKER_A_READY",
+  "worker-a-prior-tool": "WORKER_A_READY",
+  "worker-a-prior-tool-failed": "WORKER_A_READY",
   "worker-b-crash-before-resume": "WORKER_B_READY",
   "worker-b-crash-resume": "WORKER_B_READY",
   "worker-b-crash-source-lifecycle": "WORKER_B_READY",
@@ -185,6 +187,8 @@ const readyMarkerByMode = {
   "worker-b-loop-usage-lineage-cut": "WORKER_B_READY",
   "worker-b-loop-usage-lineage-reject": "WORKER_B_READY",
   "worker-b-loop-multi-preclaim": "WORKER_B_READY",
+  "worker-b-loop-multi-complete-cut": "WORKER_B_READY",
+  "worker-b-loop-two-waits": "WORKER_B_READY",
   "worker-b-loop-multi-reject": "WORKER_B_READY",
   "worker-b-legacy-consumed-seed": "WORKER_B_READY",
   "worker-b-legacy-consumed-source-only": "WORKER_B_READY",
@@ -192,6 +196,7 @@ const readyMarkerByMode = {
   "worker-b-legacy-consumed-final": "WORKER_B_READY",
   "worker-b": "WORKER_B_READY",
 }
+const sourceWaitWorkerModes = new Set(["worker-a", "worker-a-crash", "worker-a-prior-tool", "worker-a-prior-tool-failed"])
 const workerStartGateKey = `fixture:durable-child-wait:start:${ids.waiterTaskId}`
 const crashCutModes = new Set([
   "worker-a-crash",
@@ -339,6 +344,7 @@ function executionStore(owner, hooks = {}) {
     const write = () => turnStore[method]({ ...rest, owner: identity })
     const before = method === "appendEvent" ? hooks.beforeAppendEvent
       : method === "updateItem" ? hooks.beforeUpdateItem : undefined
+    const after = method === "appendEvent" ? hooks.afterAppendEvent : undefined
     const stage = method === "appendEvent" && input.type === "step.started" ? "step_started_event"
       : method === "appendEvent" && input.type === "cognitive.agenda" ? "agenda_persist"
         : method === "appendEvent" && input.type === "model.started" ? "model_started_event" : null
@@ -349,6 +355,7 @@ function executionStore(owner, hooks = {}) {
       try {
         if (before) await before(input)
         const result = await write()
+        if (after) await after(input, result)
         traceLoopStage(stage, "pass")
         if (stage === "agenda_persist") traceLoopStage("model_request", "start")
         return result
@@ -357,7 +364,12 @@ function executionStore(owner, hooks = {}) {
         throw error
       }
     })()
-    return before ? Promise.resolve(before(input)).then(write) : write()
+    return (async () => {
+      if (before) await before(input)
+      const result = await write()
+      if (after) await after(input, result)
+      return result
+    })()
   }
   return {
     startStep: bind("startStep"), updateStep: bind("updateStep"),
@@ -447,6 +459,16 @@ async function runChildWaitLoop(lease, restored, responseForStep, hooks = {}) {
   const options = turnExecutionOptions(lease, owner, async input => {
     executorCalls += 1
     if (hooks.beforeReplayExecution) await hooks.beforeReplayExecution(input)
+    if (input.call.name === "fixture_noop") return { id: input.call.id, toolName: input.call.name,
+      toolVersion: "1", status: "completed", output: { accepted: true }, errorCode: null }
+    const secondWaitCallId = `fixture-second-source-wait:${lease.id}:attempt:${lease.attemptCount}`
+    if (ids.secondTargetTaskId && input.call.id === secondWaitCallId
+      && input.stepId !== `task:${lease.id}:step:0:attempt:${lease.attemptCount}`) {
+      const wait = await registerDurableSubagentWait(pool, { lease, stepId: input.stepId, targetTaskIds: [ids.secondTargetTaskId],
+        mode: "any", timeoutMs: 30_000, idempotencyKey: `api_key=source-wait-secret-${lease.id}-attempt-${lease.attemptCount}-second`, now: new Date() })
+      say(`WORKER_B_LOOP_SECOND_SOURCE_REGISTERED ${JSON.stringify({ waitId: wait.waitId, stepId: input.stepId, callId: input.call.id })}`)
+      return { id: input.call.id, toolName: input.call.name, toolVersion: "1", status: "completed", output: wait, errorCode: null }
+    }
     const result = replay.execute(input)
     if (!result) {
       dispatcherCalls += 1
@@ -456,8 +478,10 @@ async function runChildWaitLoop(lease, restored, responseForStep, hooks = {}) {
       status: result.status, output: result.output, errorCode: result.errorCode }
   }, {
     observations: restored.observations, contextBuilder: loopContextBuilder(), model: fixtureModel.model,
-    tools: [{ name: "wait_subagents", version: "1", inputSchema: { type: "object" } }],
-    resume: restored.resume, beforeAppendEvent: hooks.beforeAppendEvent, beforeUpdateItem: hooks.beforeUpdateItem,
+    tools: [{ name: "wait_subagents", version: "1", inputSchema: { type: "object" } },
+      { name: "fixture_noop", version: "1", inputSchema: { type: "object" } }],
+    resume: restored.resume, beforeAppendEvent: hooks.beforeAppendEvent, afterAppendEvent: hooks.afterAppendEvent,
+    beforeUpdateItem: hooks.beforeUpdateItem,
     childWaitCallStartKey: (stepId, call) => replay.childWaitCallStartKey(stepId, call),
     childWaitCallStarted: (stepId, call, eventId) => {
       replay.childWaitCallStarted(stepId, call, eventId)
@@ -646,7 +670,9 @@ async function resumeChildThroughLoop(lease, phase, preloadedRestored) {
   const recovery = restored.childWaitOrphanRecovery ?? restored.childWaitClaimRecovery
   const continuationStepId = recovery?.stepId ?? wait.continuationStepId ?? `task:${lease.id}:step:${restored.resume.nextOrdinal}:attempt:${lease.attemptCount}`
   const logicalStepOrdinal = recovery?.stepOrdinal ?? restored.resume.nextOrdinal
-  const callId = recovery?.call.id ?? `${ids.loopCallPrefix ?? "child-wait-loop"}:${lease.id}:attempt:${lease.attemptCount}`
+  const callId = recovery?.call.id ?? (ids.waitScopedClaimCallIds
+    ? `${ids.loopCallPrefix ?? "child-wait-loop"}:${wait.waitId}:attempt:${lease.attemptCount}`
+    : `${ids.loopCallPrefix ?? "child-wait-loop"}:${lease.id}:attempt:${lease.attemptCount}`)
   const callItemId = `task:${lease.id}:item:tool-call:${callId}:attempt:${lease.attemptCount}`
   say(`WORKER_B_RESTORED_WAIT_OBSERVATION ${JSON.stringify(restoredWaitObservationSummary(restored, wait, pendingWait, owner, continuationStepId))}`)
   if (phase === "multi-reject" && (restored.childWaitOrphanRecovery || restored.childWaitClaimRecovery)) {
@@ -669,6 +695,27 @@ async function resumeChildThroughLoop(lease, phase, preloadedRestored) {
       const calls = [{ id: callId, name: "wait_subagents", arguments: wait.input }]
       if (phase === "multi-preclaim") calls.push({ id: `${callId}:second`, name: "fixture_noop", arguments: {} })
       return { usage: { inputTokens: 37, outputTokens: 13, estimatedCostUsd: highPrecisionWaitModelCostUsd }, toolCalls: calls }
+    }
+    if (phase === "multi-complete-cut" && stepId === continuationStepId) {
+      return { usage: { inputTokens: 37, outputTokens: 13, estimatedCostUsd: highPrecisionWaitModelCostUsd }, toolCalls: [
+        { id: callId, name: "wait_subagents", arguments: wait.input },
+        { id: `${callId}:sibling`, name: "fixture_noop", arguments: {} },
+      ] }
+    }
+    if (phase === "two-waits" && stepId === continuationStepId) {
+      return { usage: { inputTokens: 37, outputTokens: 13, estimatedCostUsd: highPrecisionWaitModelCostUsd }, toolCalls: [
+        { id: callId, name: "wait_subagents", arguments: wait.input },
+        { id: `${callId}:sibling`, name: "fixture_noop", arguments: {} },
+      ] }
+    }
+    if (phase === "two-waits" && stepId === `task:${lease.id}:step:${logicalStepOrdinal + 1}:attempt:${lease.attemptCount}`) {
+      if (!ids.secondTargetTaskId) throw new Error("fixture_second_wait_target_missing")
+      return { usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }, toolCalls: [{
+        id: `fixture-second-source-wait:${lease.id}:attempt:${lease.attemptCount}`, name: "wait_subagents", arguments: {
+          taskIds: [ids.secondTargetTaskId], mode: "any", timeoutMs: 30_000,
+          idempotencyKey: `api_key=source-wait-secret-${lease.id}-attempt-${lease.attemptCount}-second`,
+        },
+      }] }
     }
     if (stepId === continuationStepId) {
       throw new Error("fixture_orphan_step_model_reinvoked")
@@ -816,6 +863,29 @@ async function resumeChildThroughLoop(lease, phase, preloadedRestored) {
       await new Promise(() => {})
     }
   }
+  const afterAppendEvent = async event => {
+    if (phase !== "multi-complete-cut" || event.type !== "step.completed" || event.correlationId !== continuationStepId) return
+    const persisted = await pool.query(`SELECT
+        (SELECT COUNT(*)::int FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+          AND "idempotencyKey" = $5 AND "type" = 'step.completed') AS "stepCompletedCount",
+        (SELECT "status" FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = $4) AS "stepStatus",
+        (SELECT COUNT(*)::int FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+          AND "stepId" = $4 AND "type" = 'tool_call') AS "toolCallCount",
+        (SELECT COUNT(*)::int FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+          AND "stepId" = $4 AND "type" = 'tool_call' AND "status" = 'completed' AND "revision" = 1) AS "completedCallCount",
+        (SELECT COUNT(*)::int FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+          AND "stepId" = $4 AND "type" = 'tool_result') AS "toolResultCount",
+        (SELECT COUNT(*)::int FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+          AND "stepId" = $4 AND "type" = 'tool_result' AND "status" = 'completed' AND "revision" = 1) AS "completedResultCount"`,
+    [lease.sessionId, lease.turnId, lease.id, continuationStepId, `task:${lease.id}:event:step-completed:${continuationStepId}`])
+    const state = persisted.rows[0]
+    if (state?.stepCompletedCount !== 1 || state.stepStatus !== "completed" || state.toolCallCount !== 2
+      || state.completedCallCount !== 2 || state.toolResultCount !== 2 || state.completedResultCount !== 2) {
+      throw new Error("fixture_multi_tool_step_not_durable")
+    }
+    say(`WORKER_B_LOOP_MULTI_STEP_DURABLE ${JSON.stringify({ stepCompleted: true, completedCalls: 2, completedResults: 2 })}`)
+    await new Promise(() => {})
+  }
   const beforeUpdateItem = async input => {
     if (phase !== "claim-recovery-cut" || input.itemId !== callItemId || input.status !== "completed") return
     const state = await pool.query(`SELECT item."status", item."revision",
@@ -835,12 +905,18 @@ async function resumeChildThroughLoop(lease, phase, preloadedRestored) {
       claimCount: state.rows[0].claimCount, resultCount: state.rows[0].resultCount })}`)
     await new Promise(() => {})
   }
-  const loop = await runChildWaitLoop(lease, restored, modelResponse, { beforeAppendEvent, beforeUpdateItem })
+  const loop = await runChildWaitLoop(lease, restored, modelResponse, { beforeAppendEvent, afterAppendEvent, beforeUpdateItem })
   say(`WORKER_B_LOOP_RESUMED ${JSON.stringify({ phase, status: loop.result.status, stepCount: loop.result.stepCount,
     toolCallCount: loop.result.toolCallCount, finalText: loop.result.finalText ?? null,
     invocations: loop.invocations, executorCalls: loop.executorCalls, dispatcherCalls: loop.dispatcherCalls,
     errorCodeCategory: loopErrorCategory(loop.result.errorCode),
     continuationStepId, logicalStepOrdinal, physicalContinuationOrdinal: wait.continuationOrdinal ?? null })}`)
+  if (phase === "two-waits") {
+    if (loop.result.status !== "waiting_for_dependency" || !ids.secondTargetTaskId || loop.dispatcherCalls !== 0) {
+      throw new Error("fixture_two_historical_waits_unexpected_result")
+    }
+    return { status: "waiting", result: { waitId: loop.result.waitId } }
+  }
   if (phase !== "final" || loop.result.status !== "completed" || loop.dispatcherCalls !== 0) {
     throw new Error("fixture_child_wait_loop_unexpected_completion")
   }
@@ -1087,23 +1163,39 @@ async function recoverClaimedWait(lease, owner, restored, crashAfterResult) {
   return content
 }
 
-async function waitForChild(lease, crashAfterRegistration = false) {
+async function waitForChild(lease, { crashAfterRegistration = false, priorTool = false, priorToolFailure = false } = {}) {
   const owner = executionOwnerFence({ kind: "task", lease })
   const stepId = `task:${lease.id}:step:0:attempt:${lease.attemptCount}`
   const toolCallId = phoneShapedToolCallId
+  const priorToolCallId = "fixture-noop-before-child-wait"
   if (redactSensitiveText(toolCallId) === toolCallId) throw new Error("fixture_tool_call_id_is_not_phone_shaped")
   const input = { taskIds: [ids.targetTaskId], mode: "any", timeoutMs: 30_000, idempotencyKey: `api_key=source-wait-secret-${lease.id}-attempt-${lease.attemptCount}` }
   const now = new Date()
   if (now.getUTCMilliseconds() === 0) now.setUTCMilliseconds(1)
-  let wait
+  let wait, noopExecutions = 0, waitRegistrations = 0
+  const executionOrder = []
   const fixtureModel = loopFixtureModel(async ({ stepId: actualStepId }) => {
     if (actualStepId !== stepId) throw new Error("fixture_source_wait_step_id_mismatch")
-    return { toolCalls: [{ id: toolCallId, name: "wait_subagents", arguments: input }],
+    return { toolCalls: [
+      ...(priorTool ? [{ id: priorToolCallId, name: "fixture_noop", arguments: priorToolFailure ? { privateInput: "fixture-private-failure-input" } : {} }] : []),
+      { id: toolCallId, name: "wait_subagents", arguments: input },
+    ],
       usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 } }
   })
   const options = turnExecutionOptions(lease, owner, async ({ call }) => {
+    if (call.toolName === "fixture_noop") {
+      if (!priorTool || call.id !== priorToolCallId) throw new Error("fixture_prior_tool_unexpected")
+      noopExecutions += 1
+      executionOrder.push(call.toolName)
+      if (priorToolFailure) throw new Error("fixture_generic_tool_failure")
+      return { id: call.id, toolName: call.toolName, toolVersion: "1", status: "completed", output: { accepted: true }, errorCode: null }
+    }
+    if (call.toolName !== "wait_subagents") throw new Error("fixture_child_wait_unexpected_tool")
+    if (priorTool && executionOrder.join(",") !== "fixture_noop") throw new Error("fixture_prior_tool_not_completed_before_wait")
+    executionOrder.push(call.toolName)
     wait = await registerDurableSubagentWait(pool, { lease, stepId, targetTaskIds: call.input.taskIds, mode: call.input.mode,
       timeoutMs: call.input.timeoutMs, idempotencyKey: call.input.idempotencyKey, now })
+    waitRegistrations += 1
     if (crashAfterRegistration) {
       say(`WORKER_A_REGISTERED ${JSON.stringify({ waitId: wait.waitId, stepId, callStatus: "started", receiptPersisted: false })}`)
       return new Promise(() => {})
@@ -1112,10 +1204,17 @@ async function waitForChild(lease, crashAfterRegistration = false) {
   }, {
     contextBuilder: loopContextBuilder(),
     model: fixtureModel.model,
-    tools: [{ name: "wait_subagents", version: "1", inputSchema: { type: "object" } }],
+    tools: [
+      ...(priorTool ? [{ name: "fixture_noop", version: "1", inputSchema: { type: "object" } }] : []),
+      { name: "wait_subagents", version: "1", inputSchema: { type: "object" } },
+    ],
   })
   const result = await runTurnExecutionLoop(options)
-  if (!wait || result.status !== "waiting_for_dependency" || result.waitId !== wait.waitId || fixtureModel.invocations.length !== 1) {
+  const expectedExecutionOrder = priorTool ? ["fixture_noop", "wait_subagents"] : ["wait_subagents"]
+  const expectedNoopExecutions = priorTool ? 1 : 0
+  if (!wait || result.status !== "waiting_for_dependency" || result.waitId !== wait.waitId || fixtureModel.invocations.length !== 1
+    || waitRegistrations !== 1 || noopExecutions !== expectedNoopExecutions
+    || executionOrder.join(",") !== expectedExecutionOrder.join(",")) {
     const loopStatuses = new Set(["waiting_for_dependency", "waiting_for_user", "waiting_for_approval", "completed", "failed", "interrupted"])
     const invocationCountCategory = fixtureModel.invocations.length === 0 ? "zero"
       : fixtureModel.invocations.length === 1 ? "one" : "multiple"
@@ -1194,14 +1293,14 @@ async function stop(code) {
   if (stopped) return
   stopped = true
   try { await resolver?.close() } catch (error) {
-    if (!boundedLoopDiagnosticModes.has(mode)) process.stderr.write(`resolver_close_failed:${String(error)}\n`)
+    if (!boundedLoopDiagnosticModes.has(mode) && !sourceWaitWorkerModes.has(mode)) process.stderr.write(`resolver_close_failed:${String(error)}\n`)
   }
   try { await worker.close() } catch (error) {
-    if (!boundedLoopDiagnosticModes.has(mode)) process.stderr.write(`worker_close_failed:${String(error)}\n`)
+    if (!boundedLoopDiagnosticModes.has(mode) && !sourceWaitWorkerModes.has(mode)) process.stderr.write(`worker_close_failed:${String(error)}\n`)
   }
   try { await redis.quit() } catch { redis.disconnect() }
   try { await pool.end() } catch (error) {
-    if (!boundedLoopDiagnosticModes.has(mode)) process.stderr.write(`pool_close_failed:${String(error)}\n`)
+    if (!boundedLoopDiagnosticModes.has(mode) && !sourceWaitWorkerModes.has(mode)) process.stderr.write(`pool_close_failed:${String(error)}\n`)
   }
   process.exit(code)
 }
@@ -1211,7 +1310,9 @@ const worker = new Worker(queueName, async job => {
   const identity = parseSubagentDispatchJobId(job.id, job.data.taskId)
   if (!identity) throw new Error("invalid_subagent_dispatch_identity")
   const execute = mode === "worker-a" ? ({ lease }) => waitForChild(lease)
-    : mode === "worker-a-crash" ? ({ lease }) => waitForChild(lease, true)
+    : mode === "worker-a-prior-tool" ? ({ lease }) => waitForChild(lease, { priorTool: true })
+      : mode === "worker-a-prior-tool-failed" ? ({ lease }) => waitForChild(lease, { priorTool: true, priorToolFailure: true })
+      : mode === "worker-a-crash" ? ({ lease }) => waitForChild(lease, { crashAfterRegistration: true })
       : mode === "worker-b-crash-before-resume" ? ({ lease }) => {
         say(`WORKER_B_RESUME_NOT_STARTED ${JSON.stringify({ taskId: lease.id, attemptCount: lease.attemptCount })}`)
         return new Promise(() => {})
@@ -1230,6 +1331,8 @@ const worker = new Worker(queueName, async job => {
       : mode === "worker-b-loop-usage-lineage-reject" ? ({ lease }) => resumeChildThroughLoop(lease, "usage-lineage-reject")
       : mode === "worker-b-loop-final" ? ({ lease }) => resumeChildThroughLoop(lease, "final")
       : mode === "worker-b-loop-multi-preclaim" ? ({ lease }) => resumeChildThroughLoop(lease, "multi-preclaim")
+      : mode === "worker-b-loop-multi-complete-cut" ? ({ lease }) => resumeChildThroughLoop(lease, "multi-complete-cut")
+      : mode === "worker-b-loop-two-waits" ? ({ lease }) => resumeChildThroughLoop(lease, "two-waits")
       : mode === "worker-b-loop-multi-reject" ? ({ lease }) => resumeChildThroughLoop(lease, "multi-reject")
       : mode === "worker-b-legacy-consumed-seed" ? ({ lease }) => seedLegacyConsumedWait(lease)
       : mode === "worker-b-legacy-consumed-source-only" ? ({ lease }) => seedLegacyConsumedWait(lease, true)
@@ -1253,6 +1356,7 @@ worker.on("completed", (job, result) => {
   void (async () => {
     if (job.data.taskId !== ids.waiterTaskId) {
       if (boundedLoopDiagnosticModes.has(mode)) traceLoopStage("other", "fail")
+      else if (sourceWaitWorkerModes.has(mode)) process.stderr.write("UNEXPECTED_COMPLETED_SUBAGENT_TASK {\"category\":\"scope_mismatch\"}\n")
       else process.stderr.write(`UNEXPECTED_COMPLETED_SUBAGENT_TASK ${JSON.stringify({ taskId: job.data.taskId })}\n`)
       await stop(1)
       return
@@ -1288,6 +1392,7 @@ worker.on("completed", (job, result) => {
         return
       }
       if (boundedLoopDiagnosticModes.has(mode)) traceLoopStage("other", "fail")
+      else if (sourceWaitWorkerModes.has(mode)) process.stderr.write("UNEXPECTED_DISPATCH_IDENTITY_MISMATCH {\"category\":\"identity_mismatch\"}\n")
       else process.stderr.write(`UNEXPECTED_DISPATCH_IDENTITY_MISMATCH ${JSON.stringify({ taskId: job.data.taskId, dispatchGeneration })}\n`)
       await stop(1)
       return
@@ -1298,19 +1403,20 @@ worker.on("completed", (job, result) => {
       await stop(1)
       return
     }
-    const marker = mode === "worker-a" ? "WORKER_A_WAITING" : "WORKER_B_RESUMED"
+    const marker = sourceWaitWorkerModes.has(mode) ? "WORKER_A_WAITING" : "WORKER_B_RESUMED"
     const markerResult = { status: workerResultStatuses.has(result?.status) ? result.status : "invalid" }
     if (markerResult.status === "failed") {
       markerResult.failureReasonCategory = typeof result?.failureReason !== "string" ? "missing"
         : workerFailureReasonCategories.has(result.failureReason) ? result.failureReason : "other"
     }
-    const markerPayload = mode === "worker-a" || boundedLoopDiagnosticModes.has(mode)
+    const markerPayload = sourceWaitWorkerModes.has(mode) || boundedLoopDiagnosticModes.has(mode)
       ? { result: markerResult }
       : { result, taskId: ids.waiterTaskId, dispatchGeneration }
     say(`${marker} ${JSON.stringify(markerPayload)}`)
     await stop(0)
   })().catch(error => {
     if (boundedLoopDiagnosticModes.has(mode)) traceLoopStage("other", "fail")
+    else if (sourceWaitWorkerModes.has(mode)) process.stderr.write(`UNEXPECTED_COMPLETION_HANDLER_ERROR ${JSON.stringify({ category: workerFailureReasonCategory(error) })}\n`)
     else process.stderr.write(`UNEXPECTED_COMPLETION_HANDLER_ERROR ${JSON.stringify({ code: typeof error?.code === "string" ? error.code : "unknown" })}\n`)
     void stop(1)
   })
@@ -1318,6 +1424,7 @@ worker.on("completed", (job, result) => {
 worker.on("failed", (job, error) => {
   if (job?.data.taskId !== ids.waiterTaskId) return
   if (boundedLoopDiagnosticModes.has(mode)) traceLoopFailure()
+  else if (sourceWaitWorkerModes.has(mode)) process.stderr.write(`WORKER_FAILED ${JSON.stringify({ category: workerFailureReasonCategory(error) })}\n`)
   else process.stderr.write(`WORKER_FAILED ${error.message}\n`)
   void stop(1)
 })
@@ -1363,6 +1470,7 @@ try {
   }
 } catch (error) {
   if (boundedLoopDiagnosticModes.has(mode)) traceLoopStage("other", "fail")
+  else if (sourceWaitWorkerModes.has(mode)) process.stderr.write(`WORKER_START_FAILED ${JSON.stringify({ category: workerFailureReasonCategory(error) })}\n`)
   else process.stderr.write(`WORKER_START_FAILED ${String(error)}\n`)
   await stop(1)
 }
