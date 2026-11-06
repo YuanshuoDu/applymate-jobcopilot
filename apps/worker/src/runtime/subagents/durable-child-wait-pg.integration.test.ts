@@ -156,6 +156,10 @@ describe("worker restart blocker proof diagnostic bindings", () => {
       { stage: "context_build", phase: "pass", liveResume: "other", exactKeys: true },
       { stage: "other", phase: "fail", liveResume: "other", exactKeys: false },
     ] })
+    expect(summarizeBoundedLoopTrace(
+      `${BOUNDED_LOOP_STAGE_MARKER}{"stage":"persisted_cut_state","phase":"fail","liveResume":"other","payload":"test-only"}`,
+    )).toEqual({ stageCount: 1, overflow: false, exactKeys: false,
+      stages: [{ stage: "persisted_cut_state", phase: "fail", liveResume: "other" }] })
     const overLimit = Array.from({ length: MAX_BOUNDED_LOOP_DIAGNOSTIC_STAGES + 1 }, () =>
       `${BOUNDED_LOOP_STAGE_MARKER}{"stage":"context_build","phase":"pass","liveResume":"other"}`,
     ).join("\n")
@@ -184,6 +188,15 @@ function parseBoundedLoopDiagnostics(text: string): { overflow: boolean; records
   })
   return { overflow: lines.length > MAX_BOUNDED_LOOP_DIAGNOSTIC_STAGES
     || allLines.some(line => line.startsWith(BOUNDED_LOOP_STAGE_LIMIT_MARKER)), records }
+}
+
+function summarizeBoundedLoopTrace(text: string): {
+  stageCount: number; overflow: boolean; exactKeys: boolean;
+  stages: Array<{ stage: string; phase: string; liveResume: string }>
+} {
+  const { overflow, records } = parseBoundedLoopDiagnostics(text)
+  return { stageCount: records.length, overflow, exactKeys: records.every(record => record.exactKeys),
+    stages: records.map(({ stage, phase, liveResume }) => ({ stage, phase, liveResume })) }
 }
 
 function expectUsageLineageCutStages(child: WorkerProcess): void {
@@ -305,10 +318,12 @@ async function waitForBoundedLoopMarker(child: WorkerProcess, marker: string, ti
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     if (child.stdoutText.includes(marker)) return
-    if (child.exitCode !== null || child.signalCode !== null) throw new Error("bounded_loop_marker_missing")
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`bounded_loop_marker_missing:${JSON.stringify(summarizeBoundedLoopTrace(child.stdoutText))}`)
+    }
     await new Promise(resolve => setTimeout(resolve, 25))
   }
-  throw new Error("bounded_loop_marker_timeout")
+  throw new Error(`bounded_loop_marker_timeout:${JSON.stringify(summarizeBoundedLoopTrace(child.stdoutText))}`)
 }
 
 function workerResultStatus(child: WorkerProcess, marker: "WORKER_A_WAITING"): WorkerResultStatus | null {
