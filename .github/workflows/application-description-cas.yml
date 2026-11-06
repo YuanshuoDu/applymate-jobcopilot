@@ -11,6 +11,54 @@ permissions:
   contents: read
 
 jobs:
+  application-audit-postgres:
+    name: Application audit ordering on disposable PostgreSQL
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: applymate_application_audit_test
+          POSTGRES_USER: audit_fixture
+          POSTGRES_PASSWORD: audit_fixture_only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U audit_fixture -d applymate_application_audit_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - name: Install frozen dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Generate Prisma client
+        env:
+          DATABASE_URL: postgresql://audit_fixture:audit_fixture_only@127.0.0.1:5432/applymate_application_audit_test
+        run: pnpm --filter @jobcopilot/web exec prisma generate --schema prisma/schema.prisma
+      - name: Verify audit ordering on the disposable database
+        env:
+          DATABASE_URL: postgresql://audit_fixture:audit_fixture_only@127.0.0.1:5432/applymate_application_audit_test
+          APPLICATION_AUDIT_PG_TEST_URL: postgresql://audit_fixture:audit_fixture_only@127.0.0.1:5432/applymate_application_audit_test
+          APPLICATION_AUDIT_PG_TEST_DISPOSABLE: 'true'
+          RLS_RUNTIME_MODE: 'off'
+        run: |
+          test "$CI" = "true"
+          test "$APPLICATION_AUDIT_PG_TEST_DISPOSABLE" = "true"
+          test "$APPLICATION_AUDIT_PG_TEST_URL" = "postgresql://audit_fixture:audit_fixture_only@127.0.0.1:5432/applymate_application_audit_test"
+          test "$DATABASE_URL" = "$APPLICATION_AUDIT_PG_TEST_URL"
+          test "$RLS_RUNTIME_MODE" = "off"
+          pnpm --filter @jobcopilot/web exec vitest run --no-file-parallelism \
+            'src/app/api/jobs/[id]/audit-application/route.pg.integration.test.ts'
+
   description-cas-postgres:
     name: Description CAS on disposable PostgreSQL
     runs-on: ubuntu-24.04

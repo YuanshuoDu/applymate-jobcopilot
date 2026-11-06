@@ -8,6 +8,7 @@ import { useNav } from '@/lib/nav-context'
 import { openApplication, replaceApplicationHistory } from '@/lib/application-navigation'
 import { readApplicationListState } from '@/lib/application-list-state'
 import { auditMatchesCurrentMaterials } from '@/lib/application-materials'
+import { parseApplicationAuditView } from '@/lib/application-audit-view'
 import { applicationMaterialAssignment, selectApplicationCoverLetter } from '@/lib/application-material-selection'
 import { sameApplicationAudit, type ApplicationAuditIdentity } from '@/lib/application-audit-identity'
 import { guardApplicationUnload } from '@/lib/application-unload-guard'
@@ -1979,19 +1980,46 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   const auditFenceKey = JSON.stringify([resumeUserId, resumeLinkedJob?.id ?? null, selectedResumeId, finalCoverLetter?.id ?? null])
   const auditFence = auditFencesRef.current[auditFenceKey]
   const [storedAuditScope, setStoredAuditScope] = useState<{ jobId: string; userId: string; generation: number; record: StoredApplicationAudit | null } | null>(null)
+  const [auditOperationView, setAuditOperationView] = useState<{ jobId: string; userId: string; generation: number; state: 'pending' | 'failed' | 'stale' | 'unavailable' } | null>(null)
+  const [auditStatusRefresh, setAuditStatusRefresh] = useState(0)
   const auditScopeGeneration = confirmationScopeRef.current.generation
+  useEffect(() => {
+    if (!resumeLinkedJob?.id || !resumeUserId) return
+    const refresh = () => setAuditStatusRefresh(value => value + 1)
+    const visible = () => { if (document.visibilityState === 'visible') refresh() }
+    window.addEventListener('focus', refresh)
+    document.addEventListener('visibilitychange', visible)
+    return () => { window.removeEventListener('focus', refresh); document.removeEventListener('visibilitychange', visible) }
+  }, [resumeLinkedJob?.id, resumeUserId])
   useEffect(() => {
     const jobId = resumeLinkedJob?.id
     const userId = resumeUserId
     if (!jobId || !userId || !resumeLinkedJob || resumeLinkedJob.userId !== userId) return
     const fenceAtStart = auditFencesRef.current[auditFenceKey]
-    if (fenceAtStart && !fenceAtStart.expected) return
+    if (fenceAtStart && !fenceAtStart.expected && auditRunRef.current) return
     const controller = new AbortController()
     void fetch(`/api/jobs/${encodeURIComponent(jobId)}/audit-application`, { signal: controller.signal })
-      .then(response => { if (!response.ok) throw new Error('Audit unavailable'); return response.json() as Promise<StoredApplicationAudit | null> })
-      .then(record => {
+      .then(response => { if (!response.ok) throw new Error('Audit unavailable'); return response.json() as Promise<unknown> })
+      .then(value => {
         if (controller.signal.aborted || confirmationScopeRef.current.generation !== auditScopeGeneration
           || auditFencesRef.current[auditFenceKey]?.epoch !== fenceAtStart?.epoch) return
+        const parsed = parseApplicationAuditView(value)
+        const record = parsed.record
+        if (fenceAtStart && !fenceAtStart.expected) {
+          // A read cannot prove a locally unconfirmed request will not arrive
+          // later. Keep the fence until the user explicitly starts a new review.
+          setAuditOperationView({ jobId, userId, generation: auditScopeGeneration, state: parsed.state === 'unavailable' ? 'unavailable' : 'pending' })
+          setStoredAuditScope({ jobId, userId, generation: auditScopeGeneration, record: null })
+          setLatestApplicationAudit(null)
+          return
+        }
+        if (parsed.state === 'pending' || parsed.state === 'failed' || parsed.state === 'stale' || parsed.state === 'unavailable') {
+          setAuditOperationView({ jobId, userId, generation: auditScopeGeneration, state: parsed.state })
+          setStoredAuditScope({ jobId, userId, generation: auditScopeGeneration, record: null })
+          setLatestApplicationAudit(null)
+          return
+        }
+        setAuditOperationView(null)
         if (fenceAtStart) {
           const expected = fenceAtStart.expected
           if (!expected || !record || record.audit.auditedAt !== expected.auditedAt
@@ -2004,9 +2032,14 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
           setAuditFenceRevision(value => value + 1)
         }
         setStoredAuditScope({ jobId, userId, generation: auditScopeGeneration, record })
-      }).catch(() => { /* An unavailable audit is not a passing audit. */ })
+      }).catch(() => {
+        if (controller.signal.aborted || confirmationScopeRef.current.generation !== auditScopeGeneration) return
+        setAuditOperationView({ jobId, userId, generation: auditScopeGeneration, state: 'unavailable' })
+        setStoredAuditScope({ jobId, userId, generation: auditScopeGeneration, record: null })
+        setLatestApplicationAudit(null)
+      })
     return () => controller.abort()
-  }, [resumeLinkedJob?.id, resumeLinkedJob?.finalResumeId, resumeLinkedJob?.finalCoverLetterId, resumeUserId, auditScopeGeneration, latestApplicationAudit?.audit.auditedAt, auditFenceKey, auditFenceRevision, dirty, saving])
+  }, [resumeLinkedJob?.id, resumeLinkedJob?.finalResumeId, resumeLinkedJob?.finalCoverLetterId, resumeUserId, auditScopeGeneration, latestApplicationAudit?.audit.auditedAt, auditFenceKey, auditFenceRevision, auditStatusRefresh, dirty, saving])
   const storedApplicationAudit = !auditFence && storedAuditScope && resumeLinkedJob && storedAuditScope.jobId === resumeLinkedJob.id && storedAuditScope.userId === resumeUserId
     && storedAuditScope.generation === auditScopeGeneration ? storedAuditScope.record : null
   const scopedLatestApplicationAudit = !auditFence && latestApplicationAudit && resumeLinkedJob && latestApplicationAudit.jobId === resumeLinkedJob.id && latestApplicationAudit.userId === resumeUserId
@@ -2137,6 +2170,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     const requestFenceKey = auditFenceKey
     const requestFenceEpoch = ++auditFenceEpochRef.current
     auditFencesRef.current[requestFenceKey] = { epoch: requestFenceEpoch, expected: null }
+    setAuditOperationView({ jobId: resumeLinkedJob.id, userId: owner, generation: scope.generation, state: 'pending' })
     setAuditFenceRevision(value => value + 1)
     setShowFinalConfirm(false)
     const { data, error } = await apiMutate<ApplicationAuditResponse>(`/api/jobs/${resumeLinkedJob.id}/audit-application`, 'POST', {
@@ -2973,6 +3007,11 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
               }}>{t('resume.linkResume')}</button>
             </>}
           </div>
+          {auditOperationView && auditOperationView.jobId === resumeLinkedJob?.id && auditOperationView.userId === resumeUserId
+            && auditOperationView.generation === auditScopeGeneration && <div role="status" style={{ fontSize: 12 }}>
+              <p>{t(`application.auditState.${auditOperationView.state}`)}</p>
+              <button type="button" disabled={auditingApplication} onClick={() => setAuditStatusRefresh(value => value + 1)}>{t('application.refreshStatus')}</button>
+            </div>}
           <AiPanel
             selectedJob={selectedJob}
             scoreResult={scoreResult}

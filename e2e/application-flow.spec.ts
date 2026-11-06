@@ -705,6 +705,41 @@ test('reopening confirmed materials reuses the current binding and audit without
   expect(state.unexpected).toEqual([])
 })
 
+for (const surface of ['jobs', 'resume'] as const) {
+  for (const status of ['pending', 'stale'] as const) test(`${surface} hides an old passing audit while the server reports ${status}`, async ({ page }) => {
+    const state = await install(page)
+    let blocked = false
+    await page.route('**/api/jobs/outside-page/audit-application', async route => {
+      if (route.request().method() !== 'GET') return route.fallback()
+      return route.fulfill({ json: blocked ? { state: status } : state.audit })
+    })
+    if (surface === 'jobs') {
+      await open(page)
+      await expect(page.getByRole('button', { name: /Download application materials|下载申请材料/ })).toBeVisible()
+    } else {
+      await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+      await expect(page.locator('.resume-opportunity-card')).toContainText('Application flow engineer')
+      await page.getByRole('button', { name: /Confirm application materials|确认申请材料/, exact: true }).click()
+      await expect(page.getByRole('dialog')).toContainText(/Application materials selected|已选择申请材料/)
+      await page.getByRole('button', { name: /Close final confirmation|关闭最终确认/ }).click()
+    }
+    blocked = true
+    await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+    const warning = status === 'pending' ? /A review is still in progress or its result is unknown|审核仍在进行或结果尚未确认/ : /The job has changed, or this older review is missing job details|职位信息已变化，或旧审核缺少职位依据/
+    await expect(page.getByText(warning)).toBeVisible()
+    if (surface === 'jobs') await expect(page.getByRole('button', { name: /Download application materials|下载申请材料/ })).toHaveCount(0)
+    else {
+      await page.getByRole('button', { name: /Confirm application materials|确认申请材料/, exact: true }).click()
+      await expect(page.getByRole('dialog')).not.toContainText(/Application materials selected|已选择申请材料/)
+      await page.getByRole('button', { name: /Close final confirmation|关闭最终确认/ }).click()
+    }
+    await page.reload()
+    await expect(page.getByText(warning)).toBeVisible()
+    expect(state.writes).toEqual([])
+    expect(state.unexpected).toEqual([])
+  })
+}
+
 for (const outcome of ['loading', 'failed'] as const) {
   test(`Resume re-audit does not omit a selected cover letter while its read is ${outcome}`, async ({ page }, testInfo) => {
     test.skip(testInfo.project.name !== 'desktop-en', 'Focused selected material regression')
@@ -1571,6 +1606,20 @@ test('an existing audit prevents adding a missing job description', async ({ pag
   await expect(page.getByLabel(/^(Job description|职位描述)$/)).toHaveValue('A proposed description requiring a fresh audit.')
   expect(state.writes).toEqual([])
   expect(state.unexpected).toEqual([])
+})
+
+test('a pending audit is not mistaken for no audit when saving a missing description', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Focused pending-audit regression')
+  const state = await install(page, { descriptionMode: 'audit' })
+  await page.route('**/api/jobs/outside-page/audit-application', route => route.fulfill({ json: { state: 'pending' } }))
+  await open(page)
+  await page.getByRole('button', { name: 'Add job description', exact: true }).click()
+  const description = page.getByLabel('Job description', { exact: true })
+  await description.fill('A description that must wait until the audit is resolved.')
+  await page.getByRole('button', { name: 'Save description', exact: true }).click()
+  await expect(page.getByText('An existing audit prevents adding a description here')).toBeVisible()
+  await expect(description).toHaveValue('A description that must wait until the audit is resolved.')
+  expect(state.writes).toEqual([])
 })
 
 test('a failed audit check retains an editable description until the user retries', async ({ page }) => {

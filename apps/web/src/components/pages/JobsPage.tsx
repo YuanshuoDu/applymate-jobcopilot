@@ -15,7 +15,8 @@ import { BundleUnsupportedPdfError, downloadAuditedApplicationBundle } from '@/l
 import { assessApplicationPreflight } from '@/lib/agent/application-preflight'
 import { useI18n } from '@/lib/i18n'
 import { applicationListUrl, loadLinkedApplication, readApplicationListState } from '@/lib/application-list-state'
-import { hasCurrentApplicationPackAudit, type StoredApplicationAudit } from '@/lib/application-audit'
+import { AUDIT_ACTIVITY_PREFIX, hasCurrentApplicationPackAudit, type StoredApplicationAudit } from '@/lib/application-audit'
+import { parseApplicationAuditView } from '@/lib/application-audit-view'
 import { useApplicationTasks } from '@/components/jobs/useApplicationTasks'
 import { useApplicationCoverLetters } from '@/components/jobs/useApplicationCoverLetters'
 import { ApplicationProgress } from '@/components/jobs/application-progress'
@@ -644,6 +645,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   const [packStage, setPackStage] = useState<'idle' | 'resume' | 'coverLetter' | 'audit' | 'review'>('idle')
   const [preparationReviewRequired, setPreparationReviewRequired] = useState(false)
   const [verifiedAudit, setVerifiedAudit] = useState<{ owner: string; jobId: string; audit: StoredApplicationAudit } | null>(null)
+  const [auditOperationView, setAuditOperationView] = useState<{ owner: string; jobId: string; state: 'pending' | 'failed' | 'stale' | 'unavailable' } | null>(null)
   const auditReadEpoch = useRef(0)
   const [openPackItem, setOpenPackItem] = useState<'resume' | 'coverLetter' | 'audit' | null>(null)
   const [resumePreview, setResumePreview] = useState<Resume | null>(null)
@@ -662,17 +664,15 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     setVerifiedAudit(null)
     const result = await readDescriptionScope(`/api/jobs/${encodeURIComponent(jobId)}/audit-application`)
     if (auditReadEpoch.current !== epoch || !isCurrentDrawer(owner) || drawerJobIdRef.current !== jobId) return null
-    const candidate = result.ok && result.data && typeof result.data === 'object' ? result.data as Partial<StoredApplicationAudit> : null
-    const value = candidate && typeof candidate.resumeId === 'string'
-      && (candidate.coverLetterId === null || typeof candidate.coverLetterId === 'string')
-      && candidate.audit && typeof candidate.audit === 'object' && Array.isArray(candidate.audit.findings)
-      ? candidate as StoredApplicationAudit : null
-    return { epoch, value }
+    const parsed = result.ok ? parseApplicationAuditView(result.data) : { state: 'unavailable' as const, record: null }
+    setAuditOperationView(parsed.state === 'pending' || parsed.state === 'failed' || parsed.state === 'stale' || parsed.state === 'unavailable' ? { owner, jobId, state: parsed.state } : null)
+    if (parsed.state !== 'complete') setLatestAudit(null)
+    return { epoch, value: parsed.record }
   }
   useEffect(() => {
     const owner = drawerUserId
     const jobId = job.id
-    if (!owner || owner !== job.userId) { auditReadEpoch.current += 1; setVerifiedAudit(null); return }
+    if (!owner || owner !== job.userId) { auditReadEpoch.current += 1; setVerifiedAudit(null); setAuditOperationView(null); return }
     const refresh = () => {
       if (preparationInFlight.current) return
       setLatestAudit(null)
@@ -1391,6 +1391,18 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
 
         <ApplicationProgress hasMaterials={Boolean(evidenceResumeId)} checked={Boolean(currentPackAudited)} recorded={applicationRecorded} task={task} />
 
+        {auditOperationView && auditOperationView.owner === drawerUserId && auditOperationView.jobId === job.id && <div role="status" style={{ margin: '18px 28px 0', fontSize: 12 }}>
+          <p>{t(`application.auditState.${auditOperationView.state}`)}</p>
+          <Btn variant="ghost" small disabled={autoPreparing} onClick={() => {
+            const owner = drawerUserId
+            if (!owner) return
+            setLatestAudit(null)
+            void readCanonicalAudit(owner, job.id).then(result => {
+              if (result?.value && auditReadEpoch.current === result.epoch) setVerifiedAudit({ owner, jobId: job.id, audit: result.value })
+            })
+          }}>{t('application.refreshStatus')}</Btn>
+        </div>}
+
         {!applicationPreflight.canPrepare && applicationPreflight.issues.length > 0 && <div style={{ margin: '18px 28px 0', padding: '12px 14px', borderRadius: 9, border: '1px solid #fbbf24', background: '#fffbeb', color: '#78350f', fontSize: 12, lineHeight: 1.5 }}>
           <strong>{applicationPreflight.canPrepare ? t('jobs.drawer.manualOnly') : t('jobs.drawer.dataNeedsCorrection')}</strong>
           <div style={{ marginTop: 4 }}>{applicationPreflight.issues.map(issue => issue.message).join(' ')}</div>
@@ -1608,8 +1620,8 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
                       {i < activity.length - 1 && <div style={{ width: 1, flex: 1, background: 'var(--border)', marginTop: 3 }} />}
                     </div>
                     <div style={{ paddingBottom: i < activity.length - 1 ? 6 : 0 }}>
-                      <div style={{ fontSize: 11, color: 'var(--text)' }}>{a.text}</div>
-                      <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 1 }}>{fmtRelative(a.createdAt)}</div>
+                      <div style={{ fontSize: 11, color: 'var(--text)' }}>{a.text.startsWith(`${AUDIT_ACTIVITY_PREFIX}operation-v1 `) ? t('application.auditHistoryCurrent') : a.text.startsWith(AUDIT_ACTIVITY_PREFIX) ? t('application.auditHistory') : a.text}</div>
+                      {!a.text.startsWith(`${AUDIT_ACTIVITY_PREFIX}operation-v1 `) && <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 1 }}>{fmtRelative(a.createdAt)}</div>}
                     </div>
                   </div>
                 ))}
