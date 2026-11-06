@@ -6,6 +6,7 @@ import type { ApplicationAudit } from '@/lib/types'
 
 vi.mock('@/lib/auth-secret', () => ({ getAuthJwtSecret: () => new TextEncoder().encode('unit-test-audit-repair-key') }))
 const scope = { userId: 'user_1', jobId: 'job_1' }
+let fixtureOperationId = '11111111-1111-4111-8111-111111111111'
 const auditActivityText = (...args: Parameters<typeof unsignedAuditActivityText>) => signedAuditActivityText(scope, ...args)
 
 const mocks = {
@@ -45,9 +46,9 @@ const resumeContent = {
 const resumeRow = { id: 'resume_final', userId: 'user_1', name: 'Final', parentResumeId: 'resume_base', updatedAt: new Date('2026-09-22T10:01:00.000Z'), content: resumeContent, templateId: null, templateOptions: null }
 const letterRow = { id: 'cover_1', content: 'Old letter', tone: 'professional', templateId: null, templateOptions: null, updatedAt: new Date('2026-09-22T10:01:30.000Z') }
 
-function request(body: unknown) {
+function request(body: Record<string, unknown>, attemptId?: string) {
   return new Request('http://localhost/api/jobs/job_1/audit-application/apply', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    method: 'POST', headers: { 'Content-Type': 'application/json', ...(attemptId === undefined ? {} : { 'X-Application-Audit-Attempt-Id': attemptId }) }, body: JSON.stringify({ auditOperationId: fixtureOperationId, ...body }),
   })
 }
 
@@ -66,6 +67,7 @@ function audit(overrides: Partial<ApplicationAudit> = {}): ApplicationAudit {
 async function seedCurrentAudit(value: ApplicationAudit, coverLetterId: string | null = null, versions = { resumeUpdatedAt: '2026-09-22T10:01:00.000Z', coverLetterUpdatedAt: undefined as string | undefined }) {
   await mocks.withLock(scope, async (tx: Parameters<typeof registerAuditOperation>[0]) => {
     const op = await registerAuditOperation(tx, scope)
+    fixtureOperationId = op
     expect(await completeAuditOperation(tx, scope, op, { resumeId: 'resume_final', coverLetterId, audit: value, jobBasis: { role: 'Engineer', company: 'Acme', description: 'Build TypeScript systems.' }, materialBasis: { resume: resumeRow, coverLetter: coverLetterId ? letterRow : null }, versions })).toBe(true)
   })
   for (const mock of [mocks.withLock, mocks.activityCreate, mocks.activityUpsert, mocks.activityUpdate, mocks.activityFindUnique]) mock.mockClear()
@@ -73,6 +75,7 @@ async function seedCurrentAudit(value: ApplicationAudit, coverLetterId: string |
 
 describe('POST /api/jobs/[id]/audit-application/apply', () => {
   beforeEach(() => {
+    fixtureOperationId = '11111111-1111-4111-8111-111111111111'
     vi.clearAllMocks()
     Object.values(mocks).forEach(mock => mock.mockReset())
     let control: { userId: string; jobId: string; text: string } | null = null
@@ -99,6 +102,77 @@ describe('POST /api/jobs/[id]/audit-application/apply', () => {
     mocks.buildPersona.mockResolvedValue('CONFIRMED PERSONA')
   })
 
+  it.each([undefined, '', 'not-a-uuid'])('rejects missing or invalid operation ID before reading or writing: %s', async operationId => {
+    await seedCurrentAudit(audit())
+    const { POST } = await import('./route')
+    const response = (await POST(request({ resumeId: 'resume_final', findingIndex: 0, auditOperationId: operationId }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    expect(response.status).toBe(409)
+    expect(mocks.modelChat).not.toHaveBeenCalled()
+    expect(mocks.resumeUpdate).not.toHaveBeenCalled()
+    expect(mocks.resumeVersionCreate).not.toHaveBeenCalled()
+  })
+
+  it('rejects the finding index of review A after review B replaced it before the request', async () => {
+    await seedCurrentAudit(audit())
+    const operationA = fixtureOperationId
+    await seedCurrentAudit(audit({ summary: 'Different review B', findings: [{ area: 'resume', severity: 'warning', target: 'summary', title: 'B issue', evidence: 'B evidence', action: 'B correction', proposedValue: 'B wording' }] }))
+    expect(fixtureOperationId).not.toBe(operationA)
+    const { POST } = await import('./route')
+    const response = (await POST(request({ resumeId: 'resume_final', findingIndex: 0, auditOperationId: operationA }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    expect(response.status).toBe(409)
+    expect(mocks.modelChat).not.toHaveBeenCalled()
+    expect(mocks.resumeUpdate).not.toHaveBeenCalled()
+    expect(mocks.resumeVersionCreate).not.toHaveBeenCalled()
+    expect(mocks.activityUpsert).not.toHaveBeenCalled()
+  })
+
+  it.each(['missing', 'invalid', 'valid'] as const)('certifies an operation mismatch only for a valid attempt header: %s', async header => {
+    await seedCurrentAudit(audit())
+    const attemptId = '22222222-2222-4222-8222-222222222222'
+    const { POST } = await import('./route')
+    const response = (await POST(request({ resumeId: 'resume_final', findingIndex: 0, auditOperationId: '33333333-3333-4333-8333-333333333333' }, header === 'missing' ? undefined : header === 'invalid' ? 'invalid' : attemptId) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    expect(response.status).toBe(409)
+    const body = await response.json()
+    if (header === 'valid') {
+      expect(body).toMatchObject({ code: 'AUDIT_CORRECTION_NOT_STARTED', auditAttemptId: attemptId, correctionWrite: 'not_started' })
+      expect(response.headers.get('Cache-Control')).toBe('no-store, private')
+    } else expect(body).toEqual({ error: 'Run the independent audit again before applying a correction.' })
+    expect(mocks.modelChat).not.toHaveBeenCalled()
+    expect(mocks.resumeUpdate).not.toHaveBeenCalled()
+    expect(mocks.coverLetterUpdate).not.toHaveBeenCalled()
+    expect(mocks.resumeVersionCreate).not.toHaveBeenCalled()
+  })
+
+  it('does not certify an unrelated precondition failure even with an attempt header', async () => {
+    await seedCurrentAudit(audit())
+    const { POST } = await import('./route')
+    const response = (await POST(request({ resumeId: 'another-resume', findingIndex: 0 }, '22222222-2222-4222-8222-222222222222') as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    expect(response.status).toBe(409)
+    expect(await response.json()).not.toHaveProperty('code')
+    expect(mocks.resumeUpdate).not.toHaveBeenCalled()
+  })
+
+  it('does not certify an unavailable locked read as not started', async () => {
+    await seedCurrentAudit(audit())
+    mocks.withLock.mockRejectedValueOnce(new Error('Database unavailable'))
+    const { POST } = await import('./route')
+    const response = (await POST(request({ resumeId: 'resume_final', findingIndex: 0 }, '22222222-2222-4222-8222-222222222222') as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    expect(response.status).toBe(503)
+    expect(await response.json()).not.toHaveProperty('code')
+  })
+
+  it('certifies a non-completed review after the initial locked read', async () => {
+    await seedCurrentAudit(audit())
+    mocks.activityFindUnique.mockResolvedValueOnce(null)
+    const { POST } = await import('./route')
+    const attemptId = '22222222-2222-4222-8222-222222222222'
+    const response = (await POST(request({ resumeId: 'resume_final', findingIndex: 0 }, attemptId) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    expect(response.status).toBe(409)
+    expect(await response.json()).toMatchObject({ code: 'AUDIT_CORRECTION_NOT_STARTED', auditAttemptId: attemptId, correctionWrite: 'not_started' })
+    expect(mocks.modelChat).not.toHaveBeenCalled()
+    expect(mocks.resumeUpdate).not.toHaveBeenCalled()
+  })
+
   it('applies a generated resume section, snapshots the old version, and marks the finding applied', async () => {
     const storedAudit = audit()
     await seedCurrentAudit(storedAudit)
@@ -114,6 +188,7 @@ describe('POST /api/jobs/[id]/audit-application/apply', () => {
     const stored = await readAuditOperation({ activity: { findFirst: mocks.activityFindFirst, findUnique: mocks.activityFindUnique } } as never, scope)
     expect(stored.kind).toBe('completed')
     if (stored.kind !== 'completed') throw new Error('Expected completed correction')
+    expect(body.operationId).toBe(stored.operationId)
     expect(stored.audit.audit.findings[0].applied).toBe(true)
     expect(verifyApplicationAuditReceipt(scope, stored.audit)).toBe(true)
   })
@@ -164,8 +239,9 @@ describe('POST /api/jobs/[id]/audit-application/apply', () => {
   it('rejects a previously signed legacy audit without a job basis', async () => {
     mocks.activityFindFirst.mockResolvedValue({ text: auditActivityText('resume_final', null, audit(), { resumeUpdatedAt: '2026-09-22T10:01:00.000Z' }) })
     const { POST } = await import('./route')
-    const response = (await POST(request({ resumeId: 'resume_final', findingIndex: 0 }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    const response = (await POST(request({ resumeId: 'resume_final', findingIndex: 0 }, '22222222-2222-4222-8222-222222222222') as never, { params: Promise.resolve({ id: 'job_1' }) }))!
     expect(response.status).toBe(409)
+    expect(await response.json()).toMatchObject({ code: 'AUDIT_CORRECTION_NOT_STARTED', auditAttemptId: '22222222-2222-4222-8222-222222222222', correctionWrite: 'not_started' })
     expect(mocks.resumeUpdate).not.toHaveBeenCalled()
     expect(mocks.resumeVersionCreate).not.toHaveBeenCalled()
   })
@@ -286,8 +362,9 @@ describe('POST /api/jobs/[id]/audit-application/apply', () => {
       return callback(tx)
     }))
     const { POST } = await import('./route')
-    const response = (await POST(request({ resumeId: 'resume_final', findingIndex: 0 }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    const response = (await POST(request({ resumeId: 'resume_final', findingIndex: 0 }, '22222222-2222-4222-8222-222222222222') as never, { params: Promise.resolve({ id: 'job_1' }) }))!
     expect(response.status).toBe(409)
+    expect(await response.json()).not.toHaveProperty('code')
     expect(mocks.resumeVersionCreate).not.toHaveBeenCalled()
     expect(mocks.resumeUpdate).not.toHaveBeenCalled()
     expect(mocks.coverLetterUpdate).not.toHaveBeenCalled()

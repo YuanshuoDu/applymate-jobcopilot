@@ -11,6 +11,7 @@ UI changes do not establish production rollout or actual employer submission.
 
 以“申请管理”为每个职位的中心。发现职位负责找工作，简历页负责编辑材料，
 Agent 负责原任务的执行和审批，招聘消息负责查看回复。
+申请列表的排序只作用于当前页；桌面表头和分页栏使用同一排序设置，返回后仍保留。
 
 ### 手动申请
 
@@ -30,6 +31,9 @@ Agent 负责原任务的执行和审批，招聘消息负责查看回复。
    变化，按提示重新核对。已发出的材料绑定请求无法由页面撤销，请刷新申请确认结果。
    求职信有事实问题时，进入本职位简历页，核对已选求职信并手动修改，等待保存后
    返回此申请重新检查；申请详情不会自动覆盖整封信。未选择或无法读取时先检查选择。
+   编辑器读不到已选版本时会提示重新读取，不会自动打开另一份草稿。保存结果未知时，
+   可先复制本地内容，再明确选择放弃本地草稿并重新读取、核对已保存版本；不会自动重发保存。
+   未保存草稿仅保留在当前页面内存，刷新或关闭页面前会提示，确认离开后无法保证恢复。
 5. “确认申请材料”表示选择此职位使用的版本，不会授权向雇主提交。材料内容或
    选择变化后，检查当前版本；旧检查结果不代表新版本已通过。
 6. 材料检查通过且仍适用于当前版本后，点击下载申请材料 ZIP。服务器核验登录账号、
@@ -56,6 +60,13 @@ Agent 负责原任务的执行和审批，招聘消息负责查看回复。
 明确时调整状态，并以雇主回执核对；看板状态本身不是回执。点击卡片上的“查看此申请”
 可打开对应职位，关闭后仍回到看板。直接移到“拒绝”或“录用”不自动证明已有提交记录；
 如果职位保留了过去的申请时间，即使移回“已保存”，也不会再次提供手动记录入口。
+如果拖动后的状态更新结果不明确，页面会重新读取当前列表并保留提示；稍候刷新并核对，
+确认后可关闭提示。一次读取只反映当时状态，不会自动重复发送更新。
+多个职位的提示分别核对、分别关闭。
+结果未知的职位在用户明确核对并关闭提示前不能再次移动；若原请求仍在进行，
+即使关闭提示也要等它结束。
+同一浏览器页面内，即使切换栏目返回，该职位的更新尚未返回时也不能再次拖动；
+等待超时后仍需等待原请求结束。整页重新加载或其他标签页不受此保护。
 
 ### Agent 协助申请
 
@@ -69,6 +80,8 @@ Agent 负责原任务的执行和审批，招聘消息负责查看回复。
 
 任务等待时，材料待审核、人工接手、表单填写结果待核实和提交结果待核实分别提示。
 需要信息或验证时，进入原任务查看具体要求；状态不明确时不会猜测一定有问题可回答。
+回答后，如果任务摘要更新较慢，申请页可能暂时仍显示需要处理；请回原任务核对
+问题记录，避免重复回答。模拟测试覆盖了这种情况，实际状态同步仍需 Agent 侧验证。
 审核材料与授权提交是不同操作，打开原任务本身不会授权提交。
 
 较早的隔离测试发现：新建会话可能在会话已创建后显示失败；相关修复已进入主线。
@@ -111,6 +124,9 @@ Agent 维护范围内单独处理。
 审核请求在服务器登记后，其他页面会看到“审核进行中或结果未知”，下载和打印会等待
 当前审核结果；用户主动启动新审核会替换此前审核，旧请求晚到不能发布结果。
 刷新可读取状态；如本地请求结果未知，单次读取不能证明它尚未到达服务器，仍应先核对再决定是否重新审核。
+同一标签页会在发送审核或单项修正前保存待确认标记；切换栏目或刷新后仍会阻止复用旧审核。
+只有原请求返回且其操作、材料版本和审核结果与服务器读取一致时才解除标记；超时、未知结果或浏览器存储
+不可用时保持待确认，不自动重发。如果服务器明确证实本次审核在登记前因长度限制被拒绝，或本次单项修正因审核已替换而在写入前被拒绝，且响应中的本次标识与待确认标记一致，则解除该标记并提示核对；不会自动重发。该证明只描述返回证明的 HTTP 请求，服务端没有按请求标识持久去重，不能据此排除外部重复发送的同一请求已写入。该保护不覆盖其他标签页、设备或被清除的浏览器存储。
 旧审核缺少完整审核输入或职位与材料内容依据，升级后需重新检查一次；职位内容、材料内容或模板变化后也需重新检查。
 为避免把未送入审核的内容当作已检查，最终简历或来源简历的格式化 JSON 超过 12,000 个字符、
 求职信超过 8,000 个字符或已确认职业资料超过 10,000 个字符时，审核会停止并说明需要精简的部分。
@@ -121,9 +137,13 @@ Agent 维护范围内单独处理。
 自动修正会替换受影响的整段或整节；系统拒绝会被校验过程截断或丢字段的建议，
 但不能保证模型保留原节的每一条内容。请对照保存的历史版本检查修改，然后重新审核。
 从申请详情修正定制简历时，其余章节以当前选中版本为准；无法确定受影响章节时转为手动修改。
-若保存的简历内容、职位关联或来源在生成修正期间发生变化，本次修正会拒绝覆盖并提示刷新。该检查不约束修正
-完成后其他保存路径的写入，也不保证来源简历、职业资料或职位在生成期间没有变化。
+自动修正仅使用服务器当前签名审核中的问题，并在生成前和保存事务中核对审核操作、职位和材料版本；
+审核被替换或相关材料、职位及选择发生变化时，须重新检查，旧审核不能再次用于修正。
+保存使用职位、简历、求职信的数据库行锁与条件更新；该检查不约束修正完成后其他路径的写入，
+也不保证来源简历或职业资料在生成期间没有变化。
 这些保证从服务器登记提交后开始，混用旧版服务的部署及生产数据库权限尚未验证。
+回滚或混用旧部署时，旧代码可能把新写入的“已失效”状态显示为审核不可用，需要重新审核。
+新版页面也要求审核响应包含本次操作标识；连接旧版服务时即使返回通过结果，也不能确认该结果属于本次审核。
 审核结果目前不会随来源简历或职业资料事实的后续变化自动失效；如修改了依据，请重新检查。
 草稿恢复到最新简历后，只有原来进入编辑器时存在可信的职位与返回列表上下文，才会
 恢复该职位和筛选条件；否则不会从当前其他账号的地址猜测关联。
@@ -148,6 +168,8 @@ Agent 维护范围内单独处理。
 
 Page IDs remain `search`, `jobs`, `resume`, `gmail`, and `agent`. Renaming labels
 does not invalidate existing links. Saving a job never counts as applying.
+Application list sorting applies to the current page only. The desktop headers
+and pagination controls share the same sort setting, which is retained on return.
 
 ## 2. Shared interaction rules
 
@@ -238,6 +260,18 @@ been verified. Ordinary material writers do not all share the correction lock. A
 later change to the source resume or confirmed Persona does not automatically
 invalidate the receipt; run a new review when the underlying evidence changes.
 
+Before a review or individual correction, the tab stores a scoped pending marker.
+It blocks reuse of an older review across in-app navigation and same-tab reload.
+Only the original response matched against the signed server record and material
+versions clears it; timeout, unknown response or unavailable storage remain
+unconfirmed without an automatic retry. A matching pre-registration length rejection,
+or a matching correction rejection before any write because the review changed,
+can release that attempt and prompt the user to check the current review. The
+certificate describes that HTTP handler only; there is no persistent server-side
+attempt deduplication, so it cannot rule out an externally duplicated request
+having written. Other tabs, devices and cleared browser storage do not share
+this protection.
+
 Reviews stop with guidance if a formatted final or source resume exceeds 12,000
 UTF-16 code units, a cover letter exceeds 8,000, or confirmed Persona text exceeds
 10,000. JSON formatting and escapes count toward the resume limit; a resume name
@@ -252,10 +286,17 @@ be truncated or lose fields during validation is rejected, but the model may
 still omit information from the previous section. Compare the saved version
 history and review the corrected material before running a new audit.
 When the drawer repairs a tailored resume, untouched sections come from the
-selected version, and an ambiguous section requires manual editing. A conflicting
-save or change of the selected resume's job/source association during generation
-rejects the correction; it does not coordinate later
-writes or establish that the source resume, Persona or job stayed unchanged.
+selected version, and an ambiguous section requires manual editing. Repair uses
+findings from the current signed operation and checks the operation, job and
+material versions before generation and again under the Job, Resume and optional
+CoverLetter row locks in the save transaction. A changed selection, superseding
+review or conflicting material rejects the correction. A successful repair marks
+the old review stale; older deployments may interpret this new signed state as
+unavailable and require a fresh review. Newer pages also require an operation ID
+in the review response; a response from an older service cannot establish that
+its result belongs to the current review. This does not coordinate later writes or
+prove that the source resume or Persona remained unchanged. Mixed-version rollout,
+production RLS and Worker runtime behavior remain unverified.
 
 An absent optional letter is distinct from a selected letter still loading.
 Confirming the same selected letter omits a redundant assignment, because that
@@ -265,7 +306,11 @@ For a factual cover-letter issue, the application drawer opens the same job in
 Resume for the candidate to verify and edit the selected letter, then return and
 check again. It does not automatically overwrite the whole letter. Existing
 cover-letter editing does not provide cross-tab write coordination or an
-automatic history backup.
+automatic history backup. If the selected letter cannot be read, the editor
+offers a reload instead of opening another draft. For an uncertain save, copy
+the local text, then explicitly discard the local draft and reload to inspect
+the saved version. Unsaved text is retained only in the current document's memory; a
+browser warning precedes reload or close, but recovery after leaving is not guaranteed.
 
 Pending AI suggestions retain their existing blocking rules. Dividing them into
 required factual repairs and optional style improvements needs a separate
@@ -297,6 +342,15 @@ The existing Kanban also permits a user to drag a job to another status, includi
 Applied. That changes the status and records a generic status-change activity;
 it does not use the manual-submission record or add its source marker. A board
 status is user-maintained tracking information, not an employer receipt.
+If the status update has an uncertain result, the current list is reloaded and a
+notice remains until the user checks and dismisses it. A read is only a snapshot;
+the update is not automatically sent again. Notices for different jobs are checked
+and dismissed separately.
+An uncertain job cannot be moved again until the user checks and dismisses its
+notice; if its original request is still pending, the lock remains until it ends.
+Within the same browser document, that job cannot be moved again while its request
+remains pending, including after a timeout and navigation between sections. A full
+page reload or another tab does not share this protection.
 
 The browser reads the account-owned job, selected saved documents and existing
 passing audit before requesting the ZIP. The server validates ownership, the signed
@@ -367,6 +421,10 @@ Waiting tasks distinguish prepared-material review, user handoff, an unverified
 form-filling outcome and an unverified submission outcome. A request for information
 may also require verification; an unspecified wait directs the user to the original
 task without guessing a question. Reviewing materials does not authorize submission.
+If the task summary lags behind an answer, the application may temporarily still
+show that action is needed. Check the question record in the original task instead
+of answering again. A mocked test covers this case; synchronization in the real
+Agent path remains to be verified.
 Without an associated task, Open Agent navigates to the generic workspace. It may
 restore the most recent unrelated conversation, so the user is told to start a new
 conversation and identify the job. It does not infer a session from job ID or send

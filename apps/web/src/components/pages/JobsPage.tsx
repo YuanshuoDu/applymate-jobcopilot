@@ -17,6 +17,7 @@ import { useI18n } from '@/lib/i18n'
 import { applicationListUrl, loadLinkedApplication, readApplicationListState } from '@/lib/application-list-state'
 import { AUDIT_ACTIVITY_PREFIX, hasCurrentApplicationPackAudit, type StoredApplicationAudit } from '@/lib/application-audit'
 import { parseApplicationAuditView } from '@/lib/application-audit-view'
+import { APPLICATION_AUDIT_FENCE_EVENT, auditFenceStorage, beginAuditFence, postApplicationAudit, readAuditFence, reconcileAuditFence, waitForAuditFencePost } from '@/lib/application-audit-fence'
 import { auditLimitMessageKey } from '@/lib/application-audit-limit-message'
 import { useApplicationTasks } from '@/components/jobs/useApplicationTasks'
 import { useApplicationCoverLetters } from '@/components/jobs/useApplicationCoverLetters'
@@ -142,7 +143,17 @@ interface JobsListResponse {
 // to this section. Searches and filters intentionally remain uncached.
 let defaultJobsCache: JobsPageCache | null = null
 
-function sortJobs(jobs: Job[], sortBy: 'createdAt' | 'score' | 'company' | 'role', sortDir: 'asc' | 'desc') {
+// Same-document coordination only: a page reload or a different tab has its own state.
+type StatusWrite = { userId: string; id: string; company: string; role: string }
+const pendingStatusWrites = new Map<string, StatusWrite>()
+const uncertainStatusWrites = new Map<string, StatusWrite>()
+const statusWriteListeners = new Set<(settledUserId?: string) => void>()
+function notifyStatusWrites(settledUserId?: string) { statusWriteListeners.forEach(listener => listener(settledUserId)) }
+
+type JobSortBy = 'createdAt' | 'score' | 'company' | 'role'
+type JobSortDirection = 'asc' | 'desc'
+
+function sortJobs(jobs: Job[], sortBy: JobSortBy, sortDir: JobSortDirection) {
   return [...jobs].sort((a, b) => {
     let comparison = 0
     if (sortBy === 'score') comparison = (a.score ?? -1) - (b.score ?? -1)
@@ -150,9 +161,9 @@ function sortJobs(jobs: Job[], sortBy: 'createdAt' | 'score' | 'company' | 'role
     else if (sortBy === 'role') comparison = a.role.localeCompare(b.role)
 
     if (sortBy === 'createdAt' || comparison === 0) {
-      comparison = new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      comparison = new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
     }
-    return sortDir === 'desc' ? comparison : -comparison
+    return sortDir === 'desc' ? -comparison : comparison
   })
 }
 
@@ -187,7 +198,7 @@ export function toMobileJobCard(job: Job): MobileJobCardData {
 }
 
 // ── ListView ──────────────────────────────────────────────────────────────────
-function ListView({ jobs, taskByJobId, onOpenSession, onRowClick, selectedIds, onToggle, onToggleAll }: {
+function ListView({ jobs, taskByJobId, onOpenSession, onRowClick, selectedIds, onToggle, onToggleAll, sortBy, sortDir, onChangeSort }: {
   jobs: Job[]
   taskByJobId: ReadonlyMap<string, ApplicationTaskView>
   onOpenSession: (sessionId: string) => void
@@ -195,35 +206,25 @@ function ListView({ jobs, taskByJobId, onOpenSession, onRowClick, selectedIds, o
   selectedIds: Set<string>
   onToggle: (id: string) => void
   onToggleAll: (ids: string[]) => void
+  sortBy: JobSortBy
+  sortDir: JobSortDirection
+  onChangeSort: (by: JobSortBy, dir: JobSortDirection) => void
 }) {
   const { t } = useI18n()
-  const [sort, setSort] = useState<{ col: string; dir: 'asc' | 'desc' }>({ col: 'date', dir: 'desc' })
-
-  const sorted = useMemo(() => [...jobs].sort((a, b) => {
-    if (sort.col === 'score') {
-      const sa = a.score ?? 0, sb = b.score ?? 0
-      return sort.dir === 'desc' ? sb - sa : sa - sb
-    }
-    if (sort.col === 'company') {
-      return sort.dir === 'desc' ? b.company.localeCompare(a.company) : a.company.localeCompare(b.company)
-    }
-    // date: sort by createdAt
-    const da = new Date(a.createdAt).getTime()
-    const db = new Date(b.createdAt).getTime()
-    return sort.dir === 'desc' ? db - da : da - db
-  }), [jobs, sort])
-
-  function SortTh({ col, label }: { col: string; label: string }) {
+  function sortHeader(col: JobSortBy, label: string) {
     return (
       <th
-        onClick={() => setSort(s => ({ col, dir: s.col === col && s.dir === 'desc' ? 'asc' : 'desc' }))}
-        style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)', cursor: 'pointer', userSelect: 'none', whiteSpace: 'nowrap' }}>
-        {label} {sort.col === col ? (sort.dir === 'desc' ? '↓' : '↑') : ''}
+        aria-sort={sortBy === col ? (sortDir === 'desc' ? 'descending' : 'ascending') : undefined}
+        style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)', whiteSpace: 'nowrap' }}>
+        <button type="button" onClick={() => onChangeSort(col, sortBy === col && sortDir === 'desc' ? 'asc' : 'desc')}
+          style={{ padding: 0, border: 0, background: 'none', color: 'inherit', font: 'inherit', cursor: 'pointer' }}>
+          {label} <span aria-hidden="true">{sortBy === col ? (sortDir === 'desc' ? '↓' : '↑') : ''}</span>
+        </button>
       </th>
     )
   }
 
-  const visibleIds = sorted.map(job => job.id)
+  const visibleIds = jobs.map(job => job.id)
   const allVisibleSelected = visibleIds.length > 0 && visibleIds.every(id => selectedIds.has(id))
 
   return (
@@ -234,24 +235,24 @@ function ListView({ jobs, taskByJobId, onOpenSession, onRowClick, selectedIds, o
             <th style={{ width: 42, padding: '8px 12px', borderBottom: '0.5px solid var(--border)' }}>
               <input type="checkbox" aria-label={t('jobs.selectAll')} checked={allVisibleSelected} onChange={() => onToggleAll(visibleIds)} />
             </th>
-            <SortTh col="company" label={t('jobs.companyLabel')} />
-            <th style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)' }}>{t('jobs.roleLabel')}</th>
+            {sortHeader('company', t('jobs.companyLabel'))}
+            {sortHeader('role', t('jobs.roleLabel'))}
             <th style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)' }}>{t('jobs.statusLabel')}</th>
-            <SortTh col="score" label="Match" />
-            <SortTh col="date"  label={t('jobs.added')} />
+            {sortHeader('score', t('jobs.match'))}
+            {sortHeader('createdAt', t('jobs.added'))}
             <th style={{ padding: '8px 16px', textAlign: 'left', fontSize: 10, color: 'var(--text-muted)', fontWeight: 500, borderBottom: '0.5px solid var(--border)' }}>{t('jobs.followUp')}</th>
             <th style={{ padding: '8px 16px', borderBottom: '0.5px solid var(--border)' }} />
           </tr>
         </thead>
         <tbody>
-          {sorted.map((j, i) => (
+          {jobs.map((j, i) => (
             <tr key={j.id}
               onClick={() => onRowClick(j)}
-              style={{ borderBottom: i < sorted.length - 1 ? '0.5px solid var(--border)' : 'none', cursor: 'pointer' }}
+              style={{ borderBottom: i < jobs.length - 1 ? '0.5px solid var(--border)' : 'none', cursor: 'pointer' }}
               onMouseEnter={e => (e.currentTarget.style.background = 'var(--bg-secondary)')}
               onMouseLeave={e => (e.currentTarget.style.background = '')}>
               <td style={{ padding: '10px 12px', textAlign: 'center' }} onClick={e => e.stopPropagation()}>
-                <input type="checkbox" aria-label={`Select ${j.role} at ${j.company}`} checked={selectedIds.has(j.id)} onChange={() => onToggle(j.id)} />
+                <input type="checkbox" aria-label={`${t('jobs.selectJob')}: ${j.company} · ${j.role}`} checked={selectedIds.has(j.id)} onChange={() => onToggle(j.id)} />
               </td>
               <td style={{ padding: '10px 16px' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -311,7 +312,7 @@ function MobileListView({ jobs, taskByJobId, onOpenSession, onRowClick, selected
           <article key={card.id} className="jobs-mobile-card">
             <input
               type="checkbox"
-              aria-label={`Select ${card.role} at ${card.company}`}
+              aria-label={`${t('jobs.selectJob')}: ${card.company} · ${card.role}`}
               checked={selectedIds.has(card.id)}
               onChange={() => onToggle(card.id)}
             />
@@ -320,7 +321,7 @@ function MobileListView({ jobs, taskByJobId, onOpenSession, onRowClick, selected
               type="button"
               className="jobs-mobile-card-main"
               onClick={() => onRowClick(job)}
-              aria-label={`View ${card.role} at ${card.company}`}
+              aria-label={`${t('application.viewApplication')}: ${card.company} · ${card.role}`}
             >
               <div className="jobs-mobile-card-heading">
                 <CompanyLogo logo={card.logo ?? card.company.slice(0, 2).toUpperCase()} size={28} />
@@ -346,8 +347,10 @@ function MobileListView({ jobs, taskByJobId, onOpenSession, onRowClick, selected
 }
 
 // ── KanbanView ────────────────────────────────────────────────────────────────
-function KanbanView({ jobs, onStatusChange, onAddClick, onRowClick }: {
+function KanbanView({ jobs, pendingIds, uncertainIds, onStatusChange, onAddClick, onRowClick }: {
   jobs: Job[]
+  pendingIds: ReadonlySet<string>
+  uncertainIds: ReadonlySet<string>
   onStatusChange: (id: string, status: JobStatus) => void
   onAddClick: (status: JobStatus) => void
   onRowClick: (job: Job) => void
@@ -360,7 +363,7 @@ function KanbanView({ jobs, onStatusChange, onAddClick, onRowClick }: {
   function handleDrop(col: JobStatus) {
     if (dragId.current) {
       const job = jobs.find(j => j.id === dragId.current)
-      if (job && job.status !== col) {
+      if (job && job.status !== col && !pendingIds.has(job.id) && !uncertainIds.has(job.id)) {
         onStatusChange(dragId.current, col)
       }
       dragId.current = null
@@ -404,9 +407,9 @@ function KanbanView({ jobs, onStatusChange, onAddClick, onRowClick }: {
             </span>
           </div>
           {cols[col].map(job => (
-            <div key={job.id} draggable
-              onDragStart={() => { dragId.current = job.id }}
-              onTouchStart={() => { dragId.current = job.id }}
+            <div key={job.id} draggable={!pendingIds.has(job.id) && !uncertainIds.has(job.id)}
+              onDragStart={() => { dragId.current = pendingIds.has(job.id) || uncertainIds.has(job.id) ? null : job.id }}
+              onTouchStart={() => { dragId.current = pendingIds.has(job.id) || uncertainIds.has(job.id) ? null : job.id }}
               onTouchEnd={() => { dragId.current = null }}
               onMouseEnter={e => { e.currentTarget.style.borderColor = COL_COLORS[col]; e.currentTarget.style.boxShadow = `0 2px 8px ${COL_COLORS[col]}12` }}
               onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.boxShadow = 'none' }}
@@ -419,6 +422,8 @@ function KanbanView({ jobs, onStatusChange, onAddClick, onRowClick }: {
                 {job.score != null && <ScorePill score={job.score} />}
               </div>
               <div title={job.role} style={{ display: '-webkit-box', WebkitBoxOrient: 'vertical', WebkitLineClamp: 3, overflow: 'hidden', marginBottom: 6, color: 'var(--text)', fontSize: 14, fontWeight: 600, lineHeight: 1.45, letterSpacing: '0' }}>{job.role}</div>
+              {pendingIds.has(job.id) && <p role="status">{t('jobs.statusChangePending')}</p>}
+              {!pendingIds.has(job.id) && uncertainIds.has(job.id) && <p>{t('jobs.statusChangeNeedsReview')}</p>}
               {job.keywords ? (() => {
                 const kws = job.keywords.split(',').map(k => k.trim()).filter(Boolean).slice(0, 6)
                 return kws.length > 0 ? (
@@ -646,7 +651,15 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   const [packStage, setPackStage] = useState<'idle' | 'resume' | 'coverLetter' | 'audit' | 'review'>('idle')
   const [preparationReviewRequired, setPreparationReviewRequired] = useState(false)
   const [verifiedAudit, setVerifiedAudit] = useState<{ owner: string; jobId: string; audit: StoredApplicationAudit } | null>(null)
-  const [auditOperationView, setAuditOperationView] = useState<{ owner: string; jobId: string; state: 'pending' | 'failed' | 'stale' | 'unavailable' } | null>(null)
+  const [auditOperationView, setAuditOperationView] = useState<{ owner: string; jobId: string; state: 'pending' | 'failed' | 'stale' | 'unavailable' | 'localPending' | 'localUnavailable' } | null>(null)
+  const [auditLimitNotice, setAuditLimitNotice] = useState<string | null>(null)
+  const [, setAuditFenceRevision] = useState(0)
+  useEffect(() => {
+    const changed = () => setAuditFenceRevision(value => value + 1)
+    window.addEventListener(APPLICATION_AUDIT_FENCE_EVENT, changed)
+    return () => window.removeEventListener(APPLICATION_AUDIT_FENCE_EVENT, changed)
+  }, [])
+  const localAuditFence = drawerUserId ? readAuditFence(auditFenceStorage(), drawerUserId, job.id) : { state: 'unavailable' as const }
   const auditReadEpoch = useRef(0)
   const [openPackItem, setOpenPackItem] = useState<'resume' | 'coverLetter' | 'audit' | null>(null)
   const [resumePreview, setResumePreview] = useState<Resume | null>(null)
@@ -663,9 +676,25 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   const readCanonicalAudit = async (owner: string, jobId: string) => {
     const epoch = ++auditReadEpoch.current
     setVerifiedAudit(null)
+    const local = readAuditFence(auditFenceStorage(), owner, jobId)
+    if (local.state === 'pending' || local.state === 'unavailable') {
+      setLatestAudit(null)
+      setAuditOperationView({ owner, jobId, state: local.state === 'pending' ? 'localPending' : 'localUnavailable' })
+      return { epoch, value: null }
+    }
     const result = await readDescriptionScope(`/api/jobs/${encodeURIComponent(jobId)}/audit-application`)
     if (auditReadEpoch.current !== epoch || !isCurrentDrawer(owner) || drawerJobIdRef.current !== jobId) return null
     const parsed = result.ok ? parseApplicationAuditView(result.data) : { state: 'unavailable' as const, record: null }
+    const current = readAuditFence(auditFenceStorage(), owner, jobId)
+    if (current.state !== 'none') {
+      const reconciled = current.state === 'confirmed' && parsed.record && await reconcileAuditFence(auditFenceStorage(), owner, jobId, parsed.record)
+      if (auditReadEpoch.current !== epoch || !isCurrentDrawer(owner) || drawerJobIdRef.current !== jobId) return null
+      if (!reconciled) {
+        setLatestAudit(null)
+        setAuditOperationView({ owner, jobId, state: current.state === 'unavailable' ? 'localUnavailable' : 'localPending' })
+        return { epoch, value: null }
+      }
+    }
     setAuditOperationView(parsed.state === 'pending' || parsed.state === 'failed' || parsed.state === 'stale' || parsed.state === 'unavailable' ? { owner, jobId, state: parsed.state } : null)
     if (parsed.state !== 'complete') setLatestAudit(null)
     return { epoch, value: parsed.record }
@@ -684,8 +713,9 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     const visible = () => { if (document.visibilityState === 'visible') refresh() }
     refresh()
     window.addEventListener('focus', refresh)
+    window.addEventListener(APPLICATION_AUDIT_FENCE_EVENT, refresh)
     document.addEventListener('visibilitychange', visible)
-    return () => { auditReadEpoch.current += 1; window.removeEventListener('focus', refresh); document.removeEventListener('visibilitychange', visible) }
+    return () => { auditReadEpoch.current += 1; window.removeEventListener('focus', refresh); window.removeEventListener(APPLICATION_AUDIT_FENCE_EVENT, refresh); document.removeEventListener('visibilitychange', visible) }
   }, [drawerUserId, job.id, job.userId])
 
   useEffect(() => {
@@ -830,9 +860,9 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   // replace the confirmed version in the Application Pack preview.
   const selectedLetterUnavailable = Boolean(job.finalCoverLetterId && !selectedCoverLetter)
   const selectedLetterStatus = t(coverLettersLoading ? 'coverLetter.panel.loading' : 'application.selectedLetterUnavailable')
-  const storedAudit = verifiedAudit?.owner === drawerUserId && verifiedAudit.jobId === job.id
+  const storedAudit = localAuditFence.state === 'none' && verifiedAudit?.owner === drawerUserId && verifiedAudit.jobId === job.id
     ? verifiedAudit.audit : null
-  const displayedAudit = latestAudit ?? storedAudit?.audit ?? null
+  const displayedAudit = localAuditFence.state === 'none' ? latestAudit ?? storedAudit?.audit ?? null : null
   const applicationPreflight = useMemo(() => assessApplicationPreflight(job), [job])
   const evidenceGapFindings = (displayedAudit?.findings ?? []).filter(finding => finding.area !== 'job_match' && finding.resolution === 'evidence_needed')
   const factualAuditFindings = (displayedAudit?.findings ?? []).filter(finding => finding.area !== 'job_match' && finding.severity !== 'pass' && finding.resolution !== 'evidence_needed')
@@ -1013,7 +1043,13 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   async function autoTailorAndAudit() {
     const owner = drawerUserIdRef.current
     if (!owner || !isCurrentDrawer(owner) || job.userId !== owner) return
+    const fence = readAuditFence(auditFenceStorage(), owner, job.id)
+    if (fence.state !== 'none') {
+      setAuditOperationView({ owner, jobId: job.id, state: fence.state === 'unavailable' ? 'localUnavailable' : 'localPending' })
+      return
+    }
     if (preparationInFlight.current || !manualWorkAllowed || taskReadState !== 'ready' || (previewResumeId && !evidenceResumeId)) return
+    setAuditLimitNotice(null)
     if (job.finalCoverLetterId && !selectedCoverLetter) {
       setOpenPackItem('coverLetter')
       toast.info(t('application.selectedLetterLoading'))
@@ -1038,6 +1074,15 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     const coverLetterRepairs = [
       ...(auditNeedsRepair ? factualAuditFindings.filter(finding => finding.area === 'cover_letter') : []),
     ]
+    const auditReceiptSignature = storedAudit?.receipt?.signature
+    const auditOperationId = storedAudit?.operationId
+    if (resumeRepairs.length && (!auditReceiptSignature || !/^[a-f0-9]{64}$/.test(auditReceiptSignature)
+      || !auditOperationId || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(auditOperationId))) {
+      setLatestAudit(null)
+      setPreparationReviewRequired(true)
+      toast.error(t('application.auditVersionMismatch'))
+      return
+    }
     if (coverLetterRepairs.length) {
       if (!job.finalCoverLetterId || !selectedCoverLetter || !evidenceResumeId) {
         setCoverLetterSelectionNeeded(!job.finalCoverLetterId)
@@ -1074,7 +1119,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
         setPackStage('resume')
         const { data, error } = await apiMutate<{ adaptedResumeId: string }>(
           `/api/jobs/${job.id}/tailor-resume`, 'POST',
-          { resumeId: adaptedResumeId, forceRetailor: true, auditFindings: resumeRepairs },
+          { resumeId: adaptedResumeId, forceRetailor: true, auditReceiptSignature, auditOperationId },
         )
         if (!isCurrentDrawer(owner)) return
         requireLetterScope()
@@ -1159,10 +1204,37 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
       }
 
       setPackStage('audit')
-      const { data: audit, error: auditError } = await apiMutate<ApplicationAudit & Pick<StoredApplicationAudit, 'resumeUpdatedAt' | 'coverLetterUpdatedAt'>>(
-        `/api/jobs/${job.id}/audit-application`, 'POST', { resumeId: adaptedResumeId, coverLetterId: coverLetter?.id ?? null },
-      )
+      const auditStorage = auditFenceStorage()
+      const attemptId = beginAuditFence(auditStorage, owner, job.id, adaptedResumeId, coverLetter?.id ?? null)
+      if (!attemptId) {
+        const current = readAuditFence(auditStorage, owner, job.id).state
+        const state = current === 'pending' || current === 'confirmed' ? 'localPending' : 'localUnavailable'
+        setAuditOperationView({ owner, jobId: job.id, state })
+        throw new Error(t(`application.auditState.${state}`))
+      }
+      const outcome = await waitForAuditFencePost(postApplicationAudit(auditStorage, owner, job.id, attemptId,
+        { resumeId: adaptedResumeId, coverLetterId: coverLetter?.id ?? null }), auditStorage, owner, job.id, attemptId)
+      const audit = outcome?.data ?? null
+      const auditError = outcome?.error ?? null
       if (!isCurrentDrawer(owner)) return
+      if (outcome?.preflightRejected) {
+        setAuditOperationView(null)
+        const limitKey = auditLimitMessageKey(auditError)
+        setAuditLimitNotice(limitKey)
+        throw new Error(limitKey ? t(limitKey) : auditError ?? t('application.auditVersionMismatch'))
+      }
+      const versionUnconfirmed = Boolean(audit && (typeof audit.resumeUpdatedAt !== 'string' || !Number.isFinite(Date.parse(audit.resumeUpdatedAt))
+        || audit.resumeUpdatedAt !== tailored.updatedAt || (coverLetter
+          ? typeof audit.coverLetterUpdatedAt !== 'string' || !Number.isFinite(Date.parse(audit.coverLetterUpdatedAt)) || audit.coverLetterUpdatedAt !== coverLetter.updatedAt
+          : audit.coverLetterUpdatedAt != null)))
+      const registered = readAuditFence(auditStorage, owner, job.id)
+      if (!outcome || registered.state !== 'confirmed' || registered.fence.attemptId !== attemptId) {
+        setAuditOperationView({ owner, jobId: job.id, state: registered.state === 'unavailable' ? 'localUnavailable' : 'localPending' })
+        const limitKey = auditLimitMessageKey(auditError)
+        if (versionUnconfirmed) setAuditLimitNotice('application.auditVersionUnconfirmed')
+        else if (limitKey) setAuditLimitNotice(limitKey)
+        throw new Error(`${limitKey ? `${t(limitKey)} ` : ''}${t('application.auditState.localPending')}`)
+      }
       requireLetterScope()
       const auditWaitDeadline = Date.now() + 30_000
       while (checkedLetter && (checkedLetter.kind !== 'ready' || !checkedLetter.current())) {
@@ -1174,14 +1246,36 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
         const limitKey = auditLimitMessageKey(auditError)
         throw new Error(limitKey ? t(limitKey) : auditError ?? 'Independent audit could not run')
       }
-      if (audit.resumeUpdatedAt !== tailored.updatedAt || (coverLetter
+      if (!audit.operationId || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(audit.operationId)
+        || audit.resumeUpdatedAt !== tailored.updatedAt || (coverLetter
         ? audit.coverLetterUpdatedAt !== coverLetter.updatedAt
         : audit.coverLetterUpdatedAt != null)) {
         setPreparationReviewRequired(true)
         throw new Error(t('application.auditVersionMismatch'))
       }
       setLatestAudit(audit)
+      const matchesReview = (receipt: StoredApplicationAudit | null) => Boolean(receipt
+        && receipt.operationId === audit.operationId && receipt.resumeId === adaptedResumeId
+        && receipt.coverLetterId === (coverLetter?.id ?? null)
+        && receipt.resumeUpdatedAt === audit.resumeUpdatedAt && receipt.coverLetterUpdatedAt === audit.coverLetterUpdatedAt
+        && receipt.audit?.auditedAt === audit.auditedAt && receipt.audit?.verdict === audit.verdict
+        && receipt.audit?.summary === audit.summary && receipt.audit?.matchScore === audit.matchScore
+        && receipt.audit?.source === audit.source && JSON.stringify(receipt.audit?.findings) === JSON.stringify(audit.findings))
+      const initialVerification = await readCanonicalAudit(owner, job.id)
+      if (!isCurrentDrawer(owner) || drawerJobIdRef.current !== job.id) return
+      requireLetterScope()
+      const initialReceipt = initialVerification?.value ?? null
+      if (!initialVerification || !matchesReview(initialReceipt) || auditReadEpoch.current !== initialVerification.epoch) {
+        setLatestAudit(null)
+        throw new Error(t('application.auditVersionMismatch'))
+      }
       if (audit.verdict !== 'pass') {
+        if (!initialReceipt?.receipt?.signature || !/^[a-f0-9]{64}$/.test(initialReceipt.receipt.signature)) {
+          setLatestAudit(null)
+          throw new Error(t('application.auditVersionMismatch'))
+        }
+        setVerifiedAudit({ owner, jobId: job.id, audit: initialReceipt })
+        setLatestAudit(null)
         setPackStage('idle')
         setOpenPackItem('audit')
         toast.warning('Audit needs targeted corrections', audit.summary)
@@ -1208,16 +1302,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
       if (!isCurrentDrawer(owner) || drawerJobIdRef.current !== job.id) return
       requireLetterScope()
       const receipt = verified?.value
-      if (!verified || !receipt || receipt.resumeId !== adaptedResumeId
-        || receipt.coverLetterId !== (coverLetter?.id ?? null)
-        || receipt.resumeUpdatedAt !== audit.resumeUpdatedAt
-        || receipt.coverLetterUpdatedAt !== audit.coverLetterUpdatedAt
-        || receipt.audit?.auditedAt !== audit.auditedAt
-        || receipt.audit?.verdict !== audit.verdict
-        || receipt.audit?.summary !== audit.summary
-        || receipt.audit?.matchScore !== audit.matchScore
-        || receipt.audit?.source !== audit.source
-        || JSON.stringify(receipt.audit?.findings) !== JSON.stringify(audit.findings)) {
+      if (!verified || !receipt || !matchesReview(receipt)) {
         throw new Error(t('application.auditVersionMismatch'))
       }
       if (auditReadEpoch.current !== verified.epoch) return
@@ -1378,6 +1463,8 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
 
         <ApplicationProgress hasMaterials={Boolean(evidenceResumeId)} checked={Boolean(currentPackAudited)} recorded={applicationRecorded} task={task} />
 
+        {auditLimitNotice && <p role="status" style={{ margin: '18px 28px 0', fontSize: 12 }}>{t(auditLimitNotice)}</p>}
+
         {auditOperationView && auditOperationView.owner === drawerUserId && auditOperationView.jobId === job.id && <div role="status" style={{ margin: '18px 28px 0', fontSize: 12 }}>
           <p>{t(`application.auditState.${auditOperationView.state}`)}</p>
           <Btn variant="ghost" small disabled={autoPreparing} onClick={() => {
@@ -1439,7 +1526,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
               {needsBaseResume && resumeListReady && baseResumes.length > 1 && <label style={{ fontSize: 12 }}>{t('application.baseResume')}
                 <select value={selectedResumeId} onChange={event => setSelectedResumeId(event.target.value)} style={{ ...drawerInputSt, width: '100%', margin: '6px 0 12px' }}><option value="">{t('application.chooseBaseResume')}</option>{baseResumes.map(resume => <option key={resume.id} value={resume.id}>{resume.isDefault ? `${t('jobs.defaultResume')} — ` : ''}{resume.name}</option>)}</select>
               </label>}
-              <Btn variant="primary" disabled={autoPreparing || (!canReviewExistingIssues && (Boolean(previewResumeId && !evidenceResumeId) || (!currentPackAudited && !canTailorResume)))} onClick={() => {
+              <Btn variant="primary" disabled={autoPreparing || localAuditFence.state !== 'none' || (!canReviewExistingIssues && (Boolean(previewResumeId && !evidenceResumeId) || (!currentPackAudited && !canTailorResume)))} onClick={() => {
                 if (currentPackAudited) {
                   if (job.url && /^https?:\/\//i.test(job.url)) window.open(job.url, '_blank', 'noopener,noreferrer')
                   else setOpenPackItem('resume')
@@ -1796,10 +1883,10 @@ function JobDetail({ label, value, href }: { label: string; value: string; href?
 
 const PAGE_SIZE_OPTS = [20, 50]
 const SORT_OPTS: { value: string; label: string }[] = [
-  { value: 'createdAt', label: 'Date' },
-  { value: 'score',     label: 'Score' },
-  { value: 'company',   label: 'Company' },
-  { value: 'role',      label: 'Role' },
+  { value: 'createdAt', label: 'jobs.sort.date' },
+  { value: 'score',     label: 'jobs.sort.score' },
+  { value: 'company',   label: 'jobs.sort.company' },
+  { value: 'role',      label: 'jobs.sort.role' },
 ]
 
 function PaginationBar({
@@ -1808,9 +1895,10 @@ function PaginationBar({
 }: {
   total:        number; page: number; pageSize: number
   onChangePage: (p: number) => void; onChangeSize: (s: number) => void
-  sortBy:       string; sortDir: string
-  onChangeSort: (by: any, dir: any) => void
+  sortBy:       JobSortBy; sortDir: JobSortDirection
+  onChangeSort: (by: JobSortBy, dir: JobSortDirection) => void
 }) {
+  const { t } = useI18n()
   const totalPages = Math.ceil(total / pageSize)
   const from = (page - 1) * pageSize + 1
   const to   = Math.min(page * pageSize, total)
@@ -1842,12 +1930,12 @@ function PaginationBar({
 
       {/* Center: sort */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-        <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>Sort:</span>
-        <select value={sortBy} onChange={e => onChangeSort(e.target.value, sortDir)}
+        <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>{t('jobs.sort.currentPage')}</span>
+        <select aria-label={t('jobs.sort.currentPage')} value={sortBy} onChange={e => onChangeSort(e.target.value as JobSortBy, sortDir)}
           style={{ padding: '3px 6px', fontSize: 10, border: '0.5px solid var(--border)', borderRadius: 5, background: 'var(--bg)', color: 'var(--text)' }}>
-          {SORT_OPTS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+          {SORT_OPTS.map(o => <option key={o.value} value={o.value}>{t(o.label)}</option>)}
         </select>
-        <button onClick={() => onChangeSort(sortBy, sortDir === 'asc' ? 'desc' : 'asc')}
+        <button aria-label={t(sortDir === 'asc' ? 'jobs.sort.ascending' : 'jobs.sort.descending')} onClick={() => onChangeSort(sortBy, sortDir === 'asc' ? 'desc' : 'asc')}
           style={{ ...btnStyle(false), fontSize: 12, padding: '3px 7px' }}>
           {sortDir === 'asc' ? '↑' : '↓'}
         </button>
@@ -1962,6 +2050,7 @@ export function JobsPage() {
   const [showAdd,      setShowAdd     ] = useState(false)
   const [prefillStatus, setPrefillStatus] = useState<JobStatus | null>(null)
   const [jobs,         setJobs        ] = useState<Job[]>(() => cachedJobs?.jobs ?? [])
+  const [loadedJobsUserId, setLoadedJobsUserId] = useState<string | null>(() => cachedJobs ? userId : null)
   const [total,        setTotal       ] = useState(() => cachedJobs?.total ?? 0)
   const [statusCounts, setStatusCounts] = useState<JobStatusCounts>(() => cachedJobs?.statusCounts ?? EMPTY_STATUS_COUNTS)
   const [loading,      setLoading     ] = useState(() => cachedJobs === null)
@@ -1969,17 +2058,49 @@ export function JobsPage() {
   const [selectedJob,  setSelectedJob ] = useState<Job | null>(null)
   const [page,         setPage        ] = useState(initialList.page)
   const [pageSize,     setPageSize    ] = useState(initialList.pageSize)
-  const [sortBy,       setSortBy      ] = useState<'createdAt' | 'score' | 'company' | 'role'>(initialList.sortBy)
-  const [sortDir,      setSortDir     ] = useState<'asc' | 'desc'>(initialList.sortDir)
-  const sortByRef = useRef(sortBy)
-  const sortDirRef = useRef(sortDir)
-  const [selectedIds,  setSelectedIds ] = useState<Set<string>>(() => new Set())
+  const [sortBy,       setSortBy      ] = useState<JobSortBy>(initialList.sortBy)
+  const [sortDir,      setSortDir     ] = useState<JobSortDirection>(initialList.sortDir)
+  const displayJobs = useMemo(() => sortJobs(jobs, sortBy, sortDir), [jobs, sortBy, sortDir])
+  const currentUserId = useRef(userId)
+  currentUserId.current = userId
+  const [uncertainStatuses, setUncertainStatuses] = useState<StatusWrite[]>(() => [...uncertainStatusWrites.values()])
+  const statusOwnerMounted = useRef(true)
+  const [pendingStatusKeys, setPendingStatusKeys] = useState<Set<string>>(() => new Set(pendingStatusWrites.keys()))
+  const pendingStatusIds = useMemo(() => new Set(jobs.filter(job => pendingStatusKeys.has(JSON.stringify([userId, job.id]))).map(job => job.id)), [jobs, pendingStatusKeys, userId])
+  const uncertainStatusIds = useMemo(() => new Set(uncertainStatuses.filter(item => item.userId === userId).map(item => item.id)), [uncertainStatuses, userId])
+  const listLoading = loading || !userId || loadedJobsUserId !== userId
+  useEffect(() => {
+    statusOwnerMounted.current = true
+    return () => { statusOwnerMounted.current = false }
+  }, [])
+  const [selection, setSelection] = useState<{ userId: string; ids: Set<string> }>(() => ({ userId, ids: new Set() }))
+  const selectedIds = selection.userId === userId ? selection.ids : new Set<string>()
+  function setSelectedIds(update: Set<string> | ((previous: Set<string>) => Set<string>)) {
+    setSelection(previous => {
+      const ids = previous.userId === userId ? previous.ids : new Set<string>()
+      return { userId, ids: typeof update === 'function' ? update(ids) : update }
+    })
+  }
   const [bulkDeleting, setBulkDeleting] = useState(false)
   const [scoringAll,   setScoringAll   ] = useState(false)
 
   // When navigating from Search page after a job save+score, force refresh
   const [refreshTick, setRefreshTick] = useState(0)
   const triggerRefresh = () => setRefreshTick(t => t + 1)
+  useEffect(() => {
+    const listener = (settledUserId?: string) => {
+      setPendingStatusKeys(new Set(pendingStatusWrites.keys()))
+      setUncertainStatuses([...uncertainStatusWrites.values()])
+      if (settledUserId && settledUserId === currentUserId.current) {
+        setLoading(true)
+        setFetchError(null)
+        setRefreshTick(value => value + 1)
+      }
+    }
+    statusWriteListeners.add(listener)
+    listener()
+    return () => { statusWriteListeners.delete(listener) }
+  }, [])
 
   // Reset page to 1 when search/filter/pageSize changes
   const doSearch = useCallback((q: string) => { setSearch(q); setPage(1) }, [])
@@ -1987,6 +2108,7 @@ export function JobsPage() {
 
   // Debounced fetch
   useEffect(() => {
+    if (!userId) return
     let cancelled = false
     const controller = new AbortController()
     const timer = setTimeout(async () => {
@@ -2002,31 +2124,23 @@ export function JobsPage() {
         const json = await res.json() as JobsListResponse
         if (!cancelled) {
           const rawJobs: Job[] = json.jobs ?? []
-          const sorted = sortJobs(rawJobs, sortByRef.current, sortDirRef.current)
           const nextTotal = json.total ?? 0
           const nextStatusCounts = json.statusCounts ?? EMPTY_STATUS_COUNTS
-          if (isDefaultView) defaultJobsCache = { userId, jobs: sorted, total: nextTotal, statusCounts: nextStatusCounts }
-          setJobs(sorted)
+          if (isDefaultView) defaultJobsCache = { userId, jobs: rawJobs, total: nextTotal, statusCounts: nextStatusCounts }
+          setJobs(rawJobs)
+          setLoadedJobsUserId(userId)
           setTotal(nextTotal)
           setStatusCounts(nextStatusCounts)
         }
       } catch (error) {
         if (error instanceof DOMException && error.name === 'AbortError') return
-        if (!cancelled) setFetchError('Failed to load jobs')
+        if (!cancelled) { setJobs([]); setTotal(0); setStatusCounts(EMPTY_STATUS_COUNTS); setLoadedJobsUserId(userId); setFetchError('Failed to load jobs') }
       } finally {
         if (!cancelled) setLoading(false)
       }
     }, search ? 300 : 0)
     return () => { cancelled = true; controller.abort(); clearTimeout(timer) }
   }, [search, filterStatus, page, pageSize, refreshTick, userId])
-
-  // Sorting is entirely local: avoid turning a simple UI operation into a
-  // round-trip to the jobs API.
-  useEffect(() => {
-    sortByRef.current = sortBy
-    sortDirRef.current = sortDir
-    setJobs(previous => sortJobs(previous, sortBy, sortDir))
-  }, [sortBy, sortDir])
 
   // When the component gains focus (user navigates back from Search), refresh
   useEffect(() => {
@@ -2113,32 +2227,32 @@ export function JobsPage() {
   }
 
   async function handleStatusChange(jobId: string, newStatus: JobStatus) {
-    const previousStatus = jobs.find(job => job.id === jobId)?.status
-    // Optimistic update
-    setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: newStatus } : j))
-    if (previousStatus && previousStatus !== newStatus) {
-      setStatusCounts(previous => ({
-        ...previous,
-        [previousStatus]: Math.max(0, previous[previousStatus] - 1),
-        [newStatus]: previous[newStatus] + 1,
-      }))
-    }
+    const requestUserId = userId
+    if (!requestUserId || loadedJobsUserId !== requestUserId) return
+    const job = jobs.find(item => item.id === jobId && item.userId === requestUserId)
+    if (!job) return
+    const key = JSON.stringify([requestUserId, jobId])
+    if (pendingStatusWrites.has(key) || uncertainStatusWrites.has(key)) return
+    const entry = { userId: requestUserId, id: jobId, company: job.company, role: job.role }
+    pendingStatusWrites.set(key, entry)
+    notifyStatusWrites()
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      uncertainStatusWrites.set(key, entry)
+      if (defaultJobsCache?.userId === requestUserId) defaultJobsCache = null
+      notifyStatusWrites(requestUserId)
+    }, 15_000)
     const { error } = await apiMutate(`/api/jobs/${jobId}`, 'PATCH', { status: newStatus })
-    if (error) {
-      toast.error('Error', error)
-      // Revert by re-fetching
-      const params = new URLSearchParams({ pageSize: '100' })
-      if (search)                params.set('q',      search)
-      if (filterStatus !== 'all') params.set('status', filterStatus)
-      fetch(`/api/jobs?${params}`).then(r => r.json()).then((json: JobsListResponse) => {
-        setJobs(json.jobs ?? [])
-        setTotal(json.total ?? 0)
-        setStatusCounts(json.statusCounts ?? EMPTY_STATUS_COUNTS)
-      })
-    } else {
-      defaultJobsCache = null
-      toast.success(t('jobs.moved'), `${t('jobs.movedTo')} ${colLabel(t, newStatus)}`)
-    }
+    clearTimeout(timer)
+    pendingStatusWrites.delete(key)
+    if (defaultJobsCache?.userId === requestUserId) defaultJobsCache = null
+    if (error) uncertainStatusWrites.set(key, entry)
+    notifyStatusWrites(requestUserId)
+    if (!statusOwnerMounted.current) return
+    if (currentUserId.current !== requestUserId) return
+    if (error) toast.error('Error', error)
+    else if (!timedOut) toast.success(t('jobs.moved'), `${t('jobs.movedTo')} ${colLabel(t, newStatus)}`)
   }
 
   function toggleSelected(id: string) {
@@ -2211,7 +2325,7 @@ export function JobsPage() {
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 24, flexWrap: 'wrap' }}>
           <div style={{ flex: '1 1 360px', display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
             <h1 style={{ margin: 0, flexShrink: 0, fontSize: 22, fontWeight: 760, lineHeight: 1.1, letterSpacing: '-0.05em' }}>{t('jobs.title')}</h1>
-            <span style={{ flexShrink: 0, fontSize: 12, color: 'var(--primary)', background: 'rgba(79,70,229,0.09)', borderRadius: 999, padding: '4px 9px', fontWeight: 600 }}>{total}</span>
+            <span style={{ flexShrink: 0, fontSize: 12, color: 'var(--primary)', background: 'rgba(79,70,229,0.09)', borderRadius: 999, padding: '4px 9px', fontWeight: 600 }}>{listLoading || fetchError ? '—' : total}</span>
             <span style={{ minWidth: 0, overflow: 'hidden', color: 'var(--text-muted)', fontSize: 12, textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t('jobs.description')}</span>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
@@ -2225,7 +2339,7 @@ export function JobsPage() {
                 <div style={{ height: 34, minWidth: 96, padding: '0 10px', display: 'inline-flex', alignItems: 'center', gap: 6, border: '1px solid var(--border)', borderRadius: 7, background: 'var(--bg)' }}>
                   <Icon size={14} color={color} strokeWidth={1.8} />
                   <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>{label}</span>
-                  <strong style={{ marginLeft: 'auto', color: 'var(--text)', fontSize: 12, fontWeight: 700 }}>{count}</strong>
+                  <strong style={{ marginLeft: 'auto', color: 'var(--text)', fontSize: 12, fontWeight: 700 }}>{listLoading || fetchError ? '—' : count}</strong>
                 </div>
               </React.Fragment>
             ))}
@@ -2236,6 +2350,11 @@ export function JobsPage() {
       </header>
 
       <div className="jobs-page-content" style={{ padding: '16px 30px 30px', flex: 1 }}>
+        {uncertainStatuses.filter(item => item.userId === userId).map(item => <div role="status" key={item.id} style={{ marginBottom: 12 }}>
+          <p>{item.company} · {item.role}: {t('jobs.statusChangeUncertain')}</p>
+          <Btn variant="ghost" small onClick={triggerRefresh}>{t('application.refreshStatus')}</Btn>
+          <Btn variant="ghost" small onClick={() => { uncertainStatusWrites.delete(JSON.stringify([item.userId, item.id])); notifyStatusWrites() }}>{t('jobs.statusChangeChecked')}: {item.company} · {item.role}</Btn>
+        </div>)}
         <div role="group" aria-label={t('application.attentionViews')} style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
           <button type="button" aria-pressed={!attentionView} onClick={() => setAttentionView(false)}>{t('application.allApplications')}</button>
           <button type="button" aria-pressed={attentionView} onClick={() => setAttentionView(true)}>{t('application.attentionView')}</button>
@@ -2260,7 +2379,7 @@ export function JobsPage() {
             {([['list', List, 'jobs.listView'], ['kanban', LayoutGrid, 'jobs.kanbanView']] as const).map(([v, Icon, labelKey]) => <button key={v} onClick={() => setView(v)} aria-label={t(labelKey)} style={{ padding: '8px 12px', background: view === v ? 'var(--primary)' : 'var(--bg)', color: view === v ? '#fff' : 'var(--text-muted)', border: 'none', cursor: 'pointer', display: 'inline-flex' }}><Icon size={17} /></button>)}
           </div>
         </div>}
-{attentionView ? <ApplicationAttentionView tasks={applicationTasks.tasks} loading={applicationTasks.loading} error={applicationTasks.error} onOpenJob={id => openApplication(id, navigate)} onOpenSession={id => openApplicationSession(id, navigate)} onRefresh={() => void applicationTasks.refetch()} /> : loading ? (
+{attentionView ? <ApplicationAttentionView tasks={applicationTasks.tasks} loading={applicationTasks.loading} error={applicationTasks.error} onOpenJob={id => openApplication(id, navigate)} onOpenSession={id => openApplicationSession(id, navigate)} onRefresh={() => void applicationTasks.refetch()} /> : listLoading ? (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 60 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: 'var(--text-muted)', fontSize: 12 }}>
               <div style={{ width: 20, height: 20, border: '2px solid rgba(79,70,229,0.2)', borderTopColor: 'var(--primary)', borderRadius: '50%', animation: 'spin 0.7s linear infinite' }} />
@@ -2290,11 +2409,11 @@ export function JobsPage() {
             {view === 'list'
               ? <>
                 <div className="jobs-desktop-list">
-                  <ListView onOpenSession={id => openApplicationSession(id, navigate)} taskByJobId={applicationTasks.byJobId} jobs={jobs} onRowClick={selectApplication} selectedIds={selectedIds} onToggle={toggleSelected} onToggleAll={toggleAllVisible} />
+                  <ListView onOpenSession={id => openApplicationSession(id, navigate)} taskByJobId={applicationTasks.byJobId} jobs={displayJobs} onRowClick={selectApplication} selectedIds={selectedIds} onToggle={toggleSelected} onToggleAll={toggleAllVisible} sortBy={sortBy} sortDir={sortDir} onChangeSort={(by, dir) => { setSortBy(by); setSortDir(dir) }} />
                 </div>
-                <MobileListView onOpenSession={id => openApplicationSession(id, navigate)} taskByJobId={applicationTasks.byJobId} jobs={jobs} onRowClick={selectApplication} selectedIds={selectedIds} onToggle={toggleSelected} />
+                <MobileListView onOpenSession={id => openApplicationSession(id, navigate)} taskByJobId={applicationTasks.byJobId} jobs={displayJobs} onRowClick={selectApplication} selectedIds={selectedIds} onToggle={toggleSelected} />
               </>
-              : <KanbanView jobs={jobs} onStatusChange={handleStatusChange} onAddClick={col => { setPrefillStatus(col); setShowAdd(true) }} onRowClick={selectApplication} />}
+              : <KanbanView jobs={displayJobs} pendingIds={pendingStatusIds} uncertainIds={uncertainStatusIds} onStatusChange={handleStatusChange} onAddClick={col => { setPrefillStatus(col); setShowAdd(true) }} onRowClick={selectApplication} />}
 
             {/* ── Pagination bar ── */}
             {total > pageSize && (

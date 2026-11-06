@@ -14,6 +14,8 @@ import { personaEvidenceContext } from '@/lib/persona-evidence'
 import { hasEffectiveEntitlement } from '@/lib/entitlements'
 import type { ApplicationAuditFinding } from '@/lib/types'
 import { requireLegacyPolicy } from '@/lib/agent/policy/legacy'
+import { auditJobBasisHash, auditMaterialBasisHash, readAuditOperation, registerAuditOperation, staleAuditOperation } from '@/lib/application-audit-operation'
+import { AuditMaterialBusyError, lockApplicationAuditMaterials, withApplicationAuditLock } from '@/lib/application-audit-transaction'
 
 type Params = { params: Promise<{ id: string }> }
 
@@ -28,6 +30,28 @@ type ChangeDetail = {
 type TailoredSection = {
   after?: unknown
   reason?: string
+}
+
+// Caller holds the scoped Job lock. Material rows are locked after it, in the
+// same order as audit generation and individual correction.
+async function guardedRepairBasis(tx: Prisma.TransactionClient, scope: { userId: string; jobId: string }, resumeId: string, signature: string, operationId: string) {
+  const operation = await readAuditOperation(tx, scope)
+  if (operation.kind !== 'completed' || operation.operationId !== operationId || operation.audit.receipt?.signature !== signature || operation.audit.resumeId !== resumeId) return null
+  if (!await lockApplicationAuditMaterials(tx, scope, resumeId, operation.audit.coverLetterId)) return null
+  const [job, resume, letter] = await Promise.all([
+    tx.job.findFirst({ where: { id: scope.jobId, userId: scope.userId } }),
+    tx.resume.findFirst({ where: { id: resumeId, userId: scope.userId } }),
+    operation.audit.coverLetterId ? tx.coverLetter.findFirst({ where: { id: operation.audit.coverLetterId, jobId: scope.jobId, userId: scope.userId } }) : null,
+  ])
+  const iso = (value: Date | undefined) => value instanceof Date && Number.isFinite(value.getTime()) ? value.toISOString() : null
+  if (!job || !resume || (operation.audit.coverLetterId && !letter)
+    || (job.finalResumeId && job.finalResumeId !== resumeId)
+    || (job.finalCoverLetterId ?? null) !== operation.audit.coverLetterId
+    || !operation.audit.resumeUpdatedAt || iso(resume.updatedAt) !== operation.audit.resumeUpdatedAt
+    || (letter ? !operation.audit.coverLetterUpdatedAt || iso(letter.updatedAt) !== operation.audit.coverLetterUpdatedAt : Boolean(operation.audit.coverLetterUpdatedAt))
+    || operation.jobBasisHash !== auditJobBasisHash(job)
+    || operation.materialBasisHash !== auditMaterialBasisHash(resume, letter)) return null
+  return { operation, job, resume, letter }
 }
 
 const SECTIONS = ['summary', 'skills', 'experience', 'education', 'projects', 'certifications'] as const
@@ -90,10 +114,11 @@ export async function POST(req: NextRequest, { params }: Params) {
   const body = await req.json().catch(() => null)
   if (!body) return err('Invalid JSON body')
 
-  const { resumeId, forceRetailor = false, auditFindings = [] } = body as {
+  const { resumeId, forceRetailor = false, auditReceiptSignature, auditOperationId } = body as {
     resumeId?: string
     forceRetailor?: boolean
-    auditFindings?: ApplicationAuditFinding[]
+    auditReceiptSignature?: string
+    auditOperationId?: string
   }
   if (!resumeId) return err('resumeId is required')
 
@@ -114,11 +139,18 @@ export async function POST(req: NextRequest, { params }: Params) {
   if (forceRetailor && (!existing || existing.id !== resume.id)) {
     return err('The selected resume cannot be repaired automatically for this application. Open it to edit or select the current tailored resume.', 409)
   }
-  if (forceRetailor && (!Array.isArray(auditFindings)
-    || !auditFindings.some(finding => finding && finding.area === 'resume' && finding.severity !== 'pass'))) {
-    return err('Select a resume review issue before applying an automatic correction.', 400)
-  }
   if (existing && !forceRetailor) return ok({ adaptedResumeId: existing.id, changes: [], reused: true })
+
+  const scope = { userId: prep.userId, jobId }
+  let repairBasis: Awaited<ReturnType<typeof guardedRepairBasis>> = null
+  if (forceRetailor) {
+    if (typeof auditReceiptSignature !== 'string' || !/^[a-f0-9]{64}$/.test(auditReceiptSignature)
+      || typeof auditOperationId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(auditOperationId)) return err('Run the independent audit again before applying a correction.', 409)
+    try { repairBasis = await withApplicationAuditLock(scope, tx => guardedRepairBasis(tx, scope, resumeId, auditReceiptSignature, auditOperationId)) }
+    catch (error) { return error instanceof AuditMaterialBusyError ? err('The application materials are being changed. Refresh before applying a correction.', 409) : err('The review status could not be read. Refresh before applying a correction.', 503) }
+    if (!repairBasis || repairBasis.resume.updatedAt.getTime() !== resume.updatedAt.getTime()
+      || auditJobBasisHash(repairBasis.job) !== auditJobBasisHash(job) || repairBasis.job.keywords !== job.keywords) return err('The audit or application materials changed. Run the audit again.', 409)
+  }
 
   if (forceRetailor && !existing?.parentResumeId) return err('The original resume for this tailored version could not be found', 404)
   const sourceResume = forceRetailor && existing?.parentResumeId
@@ -147,8 +179,9 @@ export async function POST(req: NextRequest, { params }: Params) {
   const evidence = await personaEvidenceContext(prep.userId, 'tailor', `${job.role} ${job.description}`).catch(() => '')
   const adaptedContent = cloneJson(resumeContent)
   const changes: ChangeDetail[] = []
-  const resumeFindings = Array.isArray(auditFindings)
-    ? auditFindings.filter(finding => finding && finding.area === 'resume' && finding.severity !== 'pass') : []
+  const resumeFindings: ApplicationAuditFinding[] = repairBasis
+    ? repairBasis.operation.audit.audit.findings.filter(finding => finding.area === 'resume' && finding.severity !== 'pass' && finding.resolution !== 'evidence_needed' && !finding.applied) : []
+  if (forceRetailor && !resumeFindings.length) return err('Select a resume review issue before applying an automatic correction.', 400)
   if (forceRetailor && resumeFindings.length > 6) return err('Too many resume issues to correct at once. Open the resume and review them manually.', 422)
   const corrections = resumeFindings.map(finding => `- ${finding.area}: ${finding.title}. Required correction: ${finding.action}`)
   const sectionsToTailor = forceRetailor ? sectionsForAuditRepair(resumeFindings) : SECTIONS
@@ -206,13 +239,18 @@ export async function POST(req: NextRequest, { params }: Params) {
   if (existing && forceRetailor) {
     if (!(existing.updatedAt instanceof Date) || !Number.isFinite(existing.updatedAt.getTime())) return err('The selected resume version is unavailable. Refresh before correcting it.', 409)
     try {
-      const updated = await db.$transaction(async tx => {
+      const updated = await withApplicationAuditLock(scope, async tx => {
+        const current = await guardedRepairBasis(tx, scope, existing.id, auditReceiptSignature!, auditOperationId!)
+        if (!current || !repairBasis || current.operation.operationId !== repairBasis.operation.operationId
+          || current.job.keywords !== job.keywords || current.job.finalResumeId !== repairBasis.job.finalResumeId) return false
         const result = await tx.resume.updateMany({
           where: { id: existing.id, userId: prep.userId, targetJobId: jobId, kind: 'adapted', origin: 'ai-adapted', parentResumeId: existing.parentResumeId, updatedAt: existing.updatedAt, content: { equals: existing.content as Prisma.InputJsonValue } },
           data: { content: adaptedContent as Prisma.InputJsonValue },
         })
         if (result.count !== 1) return false
         await tx.resumeVersion.create({ data: { resumeId: existing.id, userId: prep.userId, content: existing.content as Prisma.InputJsonValue, name: existing.name } })
+        const invalidation = await registerAuditOperation(tx, scope)
+        if (!await staleAuditOperation(tx, scope, invalidation)) throw new Error('Could not invalidate the previous audit')
         return true
       })
       if (!updated) return err('The resume changed during correction. Refresh and review the latest version.', 409)

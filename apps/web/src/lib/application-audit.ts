@@ -3,6 +3,8 @@ import type { ApplicationAudit, ApplicationAuditFinding, ApplicationAuditTarget,
 export const AUDIT_ACTIVITY_PREFIX = '[Auditor] application-audit '
 
 export type StoredApplicationAudit = {
+  /** Current operation identity returned by the authenticated audit GET. */
+  operationId?: string
   resumeId: string
   coverLetterId: string | null
   resumeUpdatedAt?: string

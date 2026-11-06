@@ -117,6 +117,7 @@ describe('POST /api/jobs/[id]/audit-application', () => {
     const response = (await POST(request({ resumeId: 'resume_final', coverLetterId: 'cover_1' }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
     const body = await response.json()
     expect(response.status).toBe(200)
+    expect(body.operationId).toBe('fixture-operation')
     expect(body.source).toBe('parent_resume')
     expect(body.verdict).toBe('pass')
     expect(mocks.modelChat.mock.calls[0][0][0].content).toContain('SOURCE RESUME')
@@ -322,6 +323,30 @@ describe('POST /api/jobs/[id]/audit-application', () => {
       else expect(mocks.registerOperation).not.toHaveBeenCalled()
     },
   )
+
+  it('certifies only the matching request when final materials fail before audit registration', async () => {
+    mocks.resumeFindFirst.mockResolvedValue({ id: 'resume_final', parentResumeId: 'resume_base', content: { summary: 'x'.repeat(12_000) } })
+    const attempt = '123e4567-e89b-42d3-a456-426614174000'
+    const req = new Request('http://localhost/api/jobs/job_1/audit-application', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Application-Audit-Attempt-Id': attempt }, body: JSON.stringify({ resumeId: 'resume_final' }) })
+    const { POST } = await import('./route')
+    const response = (await POST(req as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    expect(response.status).toBe(422)
+    expect(await response.json()).toMatchObject({ code: 'AUDIT_PRECHECK_NOT_REGISTERED', auditAttemptId: attempt, auditRegistration: 'not_started' })
+    expect(response.headers.get('Cache-Control')).toContain('no-store')
+    expect(mocks.registerOperation).not.toHaveBeenCalled()
+  })
+
+  it('does not certify an invalid attempt or a source-limit rejection after registration', async () => {
+    const { POST } = await import('./route')
+    mocks.resumeFindFirst.mockResolvedValue({ id: 'resume_final', parentResumeId: 'resume_base', content: { summary: 'x'.repeat(12_000) } })
+    const invalid = new Request('http://localhost/api/jobs/job_1/audit-application', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Application-Audit-Attempt-Id': 'invalid' }, body: JSON.stringify({ resumeId: 'resume_final' }) })
+    expect(await (await POST(invalid as never, { params: Promise.resolve({ id: 'job_1' }) }))!.json()).not.toHaveProperty('auditRegistration')
+    mocks.resumeFindFirst.mockReset().mockImplementation(async (args: { select?: { content?: boolean } }) => args.select?.content
+      ? { content: { summary: 'x'.repeat(12_000) } } : { id: 'resume_final', parentResumeId: 'resume_base', content: { summary: 'Final' } })
+    const afterRegistration = new Request('http://localhost/api/jobs/job_1/audit-application', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Application-Audit-Attempt-Id': '123e4567-e89b-42d3-a456-426614174000' }, body: JSON.stringify({ resumeId: 'resume_final' }) })
+    expect(await (await POST(afterRegistration as never, { params: Promise.resolve({ id: 'job_1' }) }))!.json()).not.toHaveProperty('auditRegistration')
+    expect(mocks.registerOperation).toHaveBeenCalledTimes(1)
+  })
 
   it('does not expose a passing receipt for an oversized final resume', async () => {
     const { auditJobBasisHash, auditMaterialBasisHash } = await import('@/lib/application-audit-operation')

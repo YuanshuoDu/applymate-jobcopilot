@@ -12,13 +12,13 @@ export type AuditOperationScope = { userId: string; jobId: string }
 export type AuditJobBasis = { role: string; company: string; description: string | null }
 export type AuditMaterialResume = { id: string; name: string; content: Prisma.JsonValue; templateId: string | null; templateOptions: Prisma.JsonValue | null }
 export type AuditMaterialLetter = { id: string; content: string; tone: string; templateId: string | null; templateOptions: Prisma.JsonValue | null }
-type State = 'pending' | 'completed' | 'failed'
+type State = 'pending' | 'completed' | 'failed' | 'stale'
 type Control = { version: 1; state: State; operationId: string; auditText: string | null; jobBasisHash: string | null; materialBasisHash: string | null; signature: string }
 export type AuditOperationRead =
   | { kind: 'none' }
   | { kind: 'invalid'; source: 'control' | 'legacy' }
   | { kind: 'legacy'; audit: StoredApplicationAudit }
-  | { kind: 'pending' | 'failed'; operationId: string }
+  | { kind: 'pending' | 'failed' | 'stale'; operationId: string }
   | { kind: 'completed'; operationId: string; audit: StoredApplicationAudit; jobBasisHash: string; materialBasisHash: string }
 export type AuditOperationResult = {
   resumeId: string
@@ -91,7 +91,7 @@ function parseControl(scope: AuditOperationScope, text: string): AuditOperationR
     if (!value || typeof value !== 'object' || Array.isArray(value)) return { kind: 'invalid', source: 'control' }
     const v = value as Record<string, unknown>
     if (Object.keys(v).sort().join(',') !== 'auditText,jobBasisHash,materialBasisHash,operationId,signature,state,version'
-      || v.version !== 1 || !['pending', 'completed', 'failed'].includes(String(v.state))
+      || v.version !== 1 || !['pending', 'completed', 'failed', 'stale'].includes(String(v.state))
       || typeof v.operationId !== 'string' || !uuid.test(v.operationId)
       || typeof v.signature !== 'string' || !/^[a-f0-9]{64}$/.test(v.signature)
       || (v.state === 'completed' ? typeof v.auditText !== 'string' || typeof v.jobBasisHash !== 'string' || !/^[a-f0-9]{64}$/.test(v.jobBasisHash)
@@ -177,5 +177,13 @@ export async function failAuditOperation(tx: Tx, scope: AuditOperationScope, ope
   const current = await readControl(tx, scope)
   if (current?.kind !== 'pending' || current.operationId !== operationId) return false
   await tx.activity.update({ where: { id: auditOperationActivityId(scope) }, data: { text: controlText(scope, 'failed', operationId, null, null, null) } })
+  return true
+}
+
+/** A successful material correction supersedes the previous review. */
+export async function staleAuditOperation(tx: Tx, scope: AuditOperationScope, operationId: string): Promise<boolean> {
+  const current = await readControl(tx, scope)
+  if (current?.kind !== 'pending' || current.operationId !== operationId) return false
+  await tx.activity.update({ where: { id: auditOperationActivityId(scope) }, data: { text: controlText(scope, 'stale', operationId, null, null, null) } })
   return true
 }
