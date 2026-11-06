@@ -56,6 +56,7 @@ describe("agent.plan proposal schema construction", () => {
         criteria: [
           { id: "union-membership", check: { kind: "findings_from_scout_union", dependencyNodeKeys: ["scout-b", "scout-a"] } },
           { id: "union-coverage", check: { kind: "findings_cover_scout_candidate_union_gte", dependencyNodeKeys: ["scout-a", "scout-b"], minimumPercent: 75 } },
+          { id: "each-source", check: { kind: "findings_cover_each_scout_candidates_gte", dependencyNodeKeys: ["scout-b", "scout-a"], minimumPercent: 50 } },
         ],
       },
     }
@@ -75,6 +76,20 @@ describe("agent.plan proposal schema construction", () => {
       ] } }
       expect(Value.Check(schema, { expectedRevision: 0, nodes: [invalid] })).toBe(false)
     }
+    for (const [dependencyNodeKeys, minimumPercent] of [
+      [["scout-a", "scout-a"], 50], [["scout-a"], 50], [["scout-a", "scout-b"], 0], [["scout-a", "scout-b"], 101],
+      [["scout-a", "scout-b"], 50.5],
+    ] as const) {
+      const invalid = { ...analyst, verification: { ...analyst.verification, criteria: [
+        { id: "each-source", check: { kind: "findings_cover_each_scout_candidates_gte", dependencyNodeKeys, minimumPercent } },
+      ] } }
+      expect(Value.Check(schema, { expectedRevision: 0, nodes: [invalid] })).toBe(false)
+    }
+    expect(Value.Check(schema, { expectedRevision: 0, nodes: [{ ...analyst, verification: {
+      ...analyst.verification, criteria: [{ id: "each-source", check: {
+        kind: "findings_cover_each_scout_candidates_gte", dependencyNodeKeys: ["scout-a", "scout-b"], minimumPercent: 50, extra: true,
+      } }],
+    } }] })).toBe(false)
     expect(Value.Check(schema, { expectedRevision: 0, nodes: [{ ...analyst, verification: {
       ...analyst.verification, criteria: [{ id: "union-membership", check: {
         kind: "findings_from_scout_union", dependencyNodeKeys: ["scout-a", "scout-b"], extra: true,

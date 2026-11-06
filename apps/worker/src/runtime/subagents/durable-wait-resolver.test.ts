@@ -30,6 +30,34 @@ function fixture(input: { turnStatus?: string; waitStatus?: string; waitParentTa
     query: async (sql: string, params?: unknown[]) => {
       calls.push(sql)
       if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 1 }
+      if (sql.includes('SELECT clock_timestamp() AS "checkedAt"')) return { rows: [{ checkedAt: now }], rowCount: 1 }
+      if (sql.includes('MIN(COALESCE(wait."nextReconcileAt", wait."suspendedAt"))')) {
+        // Root waits are handled by the turn scanner above; this new child scanner only sees nested-task waits.
+        const childWaits = state.waits.filter(candidate => candidate.status === "waiting" && !candidate.consumedAt
+          && candidate.parentTaskId === "child-1" && state.turns.some(turn => turn.sessionId === candidate.sessionId
+            && ["in_progress", "waiting_for_dependency"].includes(turn.status))
+          && !["aborted", "archived"].includes(state.sessionStatus))
+        const sessions = [...new Map(childWaits.map(wait => [wait.sessionId, {
+          id: wait.sessionId, userId: wait.userId,
+        }])).values()]
+        return { rows: sessions.slice(0, Number(params?.[0])), rowCount: sessions.length }
+      }
+      if (sql.includes('ORDER BY COALESCE(wait."nextReconcileAt", wait."suspendedAt")')
+        && sql.includes('LIMIT 1 FOR UPDATE OF parent, step, wait SKIP LOCKED')) {
+        const found = state.waits.find(candidate => candidate.sessionId === String(params?.[0])
+          && candidate.userId === String(params?.[2]) && candidate.parentTaskId === "child-1"
+          && candidate.status === "waiting" && !candidate.consumedAt
+          && state.turns.some(turn => turn.sessionId === candidate.sessionId
+            && ["in_progress", "waiting_for_dependency"].includes(turn.status)))
+        if (!found) return { rows: [], rowCount: 0 }
+        const turn = state.turns.find(candidate => candidate.sessionId === found.sessionId)
+        return { rows: [{ ...found, rootTaskId: turn?.rootTaskId, parentAttempt: 1, deadlineAtUtc: found.deadlineAt.toISOString() }], rowCount: 1 }
+      }
+      if (sql.includes('WITH clock AS MATERIALIZED') && sql.includes('AS "elapsed"')) {
+        const found = state.waits.find(candidate => candidate.id === String(params?.[0]))
+        return found ? { rows: [{ elapsed: found.deadlineAt <= now, checkedAt: now.toISOString() }], rowCount: 1 } : { rows: [], rowCount: 0 }
+      }
+      if (sql.includes('UPDATE "agent_wait_conditions" AS wait SET "nextReconcileAt"')) return { rows: [{ id: String(params?.[0]) }], rowCount: 1 }
       if (sql.includes('SELECT turn."id"') && sql.includes('JOIN "agent_turns" AS turn')) {
         if (["aborted", "archived", "missing"].includes(state.sessionStatus)) {
           if (!sql.includes(SESSION_FENCE)) throw new Error("missing session-state fence")
@@ -37,7 +65,7 @@ function fixture(input: { turnStatus?: string; waitStatus?: string; waitParentTa
         }
         return { rows: state.turns.filter(candidate => candidate.status === "in_progress" || candidate.status === "waiting_for_dependency"), rowCount: state.turns.length }
       }
-      if (sql.includes('FROM "agent_wait_conditions"')) {
+      if (sql.includes('FROM "agent_wait_conditions"') && sql.includes('ORDER BY "createdAt"')) {
         const turnId = String(params?.[2]); const limit = Number(params?.[3])
         return { rows: state.waits.filter(candidate => candidate.turnId === turnId && !candidate.consumedAt && ["waiting", "ready", "timed_out"].includes(candidate.status)).slice(0, limit), rowCount: 1 }
       }
@@ -319,12 +347,12 @@ describe("durable wait resolver", () => {
   it("honors the finite batch and closes an opt-in scanner", async () => {
     const fake = fixture({ turnCount: 2 })
     await expect(reconcileDurableWaits(fake.pool as never, { now, batchSize: 1 })).resolves.toEqual({ scanned: 1, resolved: 1, woken: 0 })
-    const childScan = fake.calls.find(sql => sql.includes('JOIN "sub_agent_tasks" AS parent') && sql.includes('parent."status" = \'waiting\'')) ?? ""
+    const childScan = fake.calls.find(sql => sql.includes('MIN(COALESCE(wait."nextReconcileAt", wait."suspendedAt"))') && sql.includes('parent."status" = \'waiting\'')) ?? ""
     expect(childScan).toContain('wait."suspendedAt" IS NOT NULL')
     expect(fake.calls.indexOf(childScan)).toBeGreaterThan(fake.calls.indexOf("COMMIT"))
     const empty = fixture({ turnStatus: "queued" })
     const scanner = startDurableWaitResolver(empty.pool as never, { intervalMs: 60_000, batchSize: 1 })
     await scanner.close()
-    expect(empty.calls.some(sql => sql.includes('JOIN "sub_agent_tasks" AS parent') && sql.includes('parent."status" = \'waiting\''))).toBe(true)
+    expect(empty.calls.some(sql => sql.includes('MIN(COALESCE(wait."nextReconcileAt", wait."suspendedAt"))') && sql.includes('parent."status" = \'waiting\''))).toBe(true)
   })
 })

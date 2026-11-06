@@ -173,6 +173,11 @@ class IntegrationPg {
     this.calls.push(sql)
     const trimmed = sql.trim()
     if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(trimmed) || sql.includes("set_config")) return { rows: [], rowCount: 0 }
+    if (sql.includes('SELECT clock_timestamp() AS "checkedAt"')) return { rows: [{ checkedAt: NOW }], rowCount: 1 }
+    if (sql.includes('MIN(COALESCE(wait."nextReconcileAt", wait."suspendedAt"))')) {
+      // This end-to-end fixture contains only the root task's wait; nested child waits are exercised separately.
+      return { rows: [], rowCount: 0 }
+    }
     if (sql.includes('SELECT item."content" FROM "agent_items" AS item JOIN "agent_turns" AS turn ON turn."id" = item."turnId" AND turn."sessionId" = item."sessionId" JOIN "agent_sessions" AS session ON session."id" = item."sessionId"')
       && sql.includes('WHERE item."id" = $1 AND item."sessionId" = $2 AND item."turnId" = $3 AND item."taskId" = $4 AND item."type" =')
       && sql.includes("'task_graph' AND turn.\"userId\" = $5 AND session.\"userId\" = $5")

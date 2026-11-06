@@ -3,11 +3,8 @@
  * native HTML, React, Vue, Svelte, Angular, and custom components.
  */
 import type { FormFieldSchema, FilledField } from './types'
-import { generateId, extractLabel } from './form-scanner'
-
-function stripFramePrefix(fieldId: string): string {
-  return fieldId.replace(/^frame\|\d+\|/, '').replace(/^iframe\|[^|]+\|/, '')
-}
+import { extractLabel } from './form-scanner'
+import { findCurrentField, isSafeLiveField } from './live-fields'
 
 export interface FillResult {
   fieldId: string
@@ -16,7 +13,7 @@ export interface FillResult {
 }
 
 export function fillField(field: FormFieldSchema, value: string): FillResult {
-  const el = resolveElement(field)
+  const el = findCurrentField(field.id, field)
   if (!el) return { fieldId: field.id, success: false, error: 'Element not found' }
 
   try {
@@ -36,8 +33,6 @@ export function fillFields(
   let filled = 0
 
   console.log('[ApplyMate] fillFields: starting', fields.length, 'fields,', fields.filter(f => !f.skip).length, 'non-skip')
-  const docs = getAllDocs()
-  console.log('[ApplyMate] fillFields: accessible documents:', docs.length)
 
   for (const field of fields) {
     if (field.skip) continue
@@ -49,7 +44,7 @@ export function fillFields(
       const schema = schemas.find(candidate => candidate.id === field.fieldId)
       const result = schema
         ? fillField(schema, field.value)
-        : fillFieldById(field.fieldId, field.value)
+        : { fieldId: field.fieldId, success: false, error: 'Field was not included in the reviewed scan' }
       if (result.success) filled++
       else {
         console.warn('[ApplyMate] fillFieldById failed:', field.fieldId, result.error)
@@ -71,95 +66,20 @@ export function fillFields(
  * the candidate chooses the reviewed PDF in this picker.
  */
 export function openUploadPicker(fieldId: string, onSelected: (fileName: string) => void): FillResult {
-  const cleanId = stripFramePrefix(fieldId)
-  for (const doc of getAllDocs()) {
-    for (const candidate of Array.from(doc.querySelectorAll('input[type="file"]'))) {
-      const input = candidate as HTMLInputElement
-      const id = generateId(input)
-      if (id !== fieldId && id !== cleanId) continue
-      input.addEventListener('change', () => onSelected(input.files?.[0]?.name ?? ''), { once: true })
-      input.click()
-      highlightElement(input)
-      return { fieldId, success: true }
-    }
+  const input = findCurrentField(fieldId) as HTMLInputElement | null
+  if (input?.tagName === 'INPUT' && input.type === 'file' && isSafeLiveField(input)) {
+    input.addEventListener('change', () => onSelected(input.files?.[0]?.name ?? ''), { once: true })
+    input.click()
+    highlightElement(input)
+    return { fieldId, success: true }
   }
   return { fieldId, success: false, error: 'Upload field not found' }
-}
-
-// ── Element Resolution ────────────────────────────────────────
-
-/**
- * Get all accessible documents: main document + same-origin iframe documents.
- */
-function getAllDocs(): Document[] {
-  const docs: Document[] = [document]
-  const iframes = document.querySelectorAll('iframe')
-  for (const iframe of Array.from(iframes)) {
-    try {
-      const doc = iframe.contentDocument
-      if (doc) docs.push(doc)
-    } catch { /* cross-origin */ }
-  }
-  return docs
-}
-
-const INPUT_SELECTOR = 'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="reset"]), ' +
-  'textarea, select, [contenteditable="true"], [role="combobox"], [role="textbox"]'
-
-function resolveElement(field: FormFieldSchema): HTMLElement | null {
-  // Strip iframe prefix from ID if present (fields scanned in iframes)
-  const cleanId = stripFramePrefix(field.id)
-
-  for (const doc of getAllDocs()) {
-    const candidates = doc.querySelectorAll(INPUT_SELECTOR)
-    for (const el of Array.from(candidates)) {
-      const ht = el as HTMLElement
-      if (generateId(ht) === field.id) return ht
-      if (cleanId !== field.id && generateId(ht) === cleanId) return ht
-    }
-  }
-
-  // Fuzzy match by label text + type (search all docs)
-  if (field.label) {
-    for (const doc of getAllDocs()) {
-      const candidates = doc.querySelectorAll(INPUT_SELECTOR)
-      for (const el of Array.from(candidates)) {
-        const ht = el as HTMLElement
-        const lbl = extractLabel(ht)
-        if (lbl && lbl.toLowerCase() === field.label.toLowerCase()) return ht
-      }
-    }
-  }
-
-  return null
-}
-
-function fillFieldById(fieldId: string, value: string): FillResult {
-  const cleanId = stripFramePrefix(fieldId)
-
-  for (const doc of getAllDocs()) {
-    const candidates = doc.querySelectorAll(INPUT_SELECTOR)
-    for (const el of Array.from(candidates)) {
-      const ht = el as HTMLElement
-      const gid = generateId(ht)
-      if (gid === fieldId || gid === cleanId) {
-        try {
-          setElementValueGeneric(ht, value)
-          highlightElement(ht)
-          return { fieldId, success: true }
-        } catch (e) {
-          return { fieldId, success: false, error: (e as Error).message }
-        }
-      }
-    }
-  }
-
-  return { fieldId, success: false, error: 'Element not found' }
 }
 
 // ── Core Value Setter ─────────────────────────────────────────
 
 export function setElementValue(el: HTMLElement, value: string, field?: FormFieldSchema): void {
+  if (!isSafeLiveField(el)) throw new Error('Field changed or is not safe to fill. Scan again.')
   const tag = el.tagName.toLowerCase()
   const type = (el as HTMLInputElement).type ?? ''
 
@@ -193,33 +113,6 @@ export function setElementValue(el: HTMLElement, value: string, field?: FormFiel
 
   // Standard <input> or <textarea>
   fillTextInput(el as HTMLInputElement | HTMLTextAreaElement, value)
-}
-
-/** Generic setter used when we only have fieldId (no FormFieldSchema) */
-function setElementValueGeneric(el: HTMLElement, value: string): void {
-  const tag = el.tagName.toLowerCase()
-  const type = (el as HTMLInputElement).type ?? ''
-
-  if (tag === 'select') {
-    fillSelectElement(el as HTMLSelectElement, value)
-  } else if (type === 'checkbox') {
-    fillCheckbox(el as HTMLInputElement, value)
-  } else if (type === 'radio') {
-    fillRadio(el as HTMLInputElement, value)
-  } else if (el.getAttribute('contenteditable') === 'true') {
-    el.textContent = value
-    el.dispatchEvent(new Event('input', { bubbles: true }))
-  } else {
-    const nestedInput = el.querySelector('input, textarea, select') as HTMLElement | null
-    if (nestedInput && nestedInput !== el) {
-      setElementValueGeneric(nestedInput, value)
-      return
-    }
-    if (el.getAttribute('role') === 'combobox' || el.getAttribute('role') === 'textbox') {
-      throw new Error('Custom form control needs review')
-    }
-    fillTextInput(el as HTMLInputElement | HTMLTextAreaElement, value)
-  }
 }
 
 // ── Specialized Fillers ──────────────────────────────────────
@@ -304,6 +197,7 @@ function fillRadio(el: HTMLInputElement, value: string): void {
   )
 
   for (const radio of Array.from(radios)) {
+    if (!isSafeLiveField(radio)) continue
     const rLabel = extractLabel(radio) || radio.value
     if (rLabel.toLowerCase() === value.toLowerCase() ||
         radio.value.toLowerCase() === value.toLowerCase()) {
@@ -315,6 +209,7 @@ function fillRadio(el: HTMLInputElement, value: string): void {
 
   // Fuzzy match
   for (const radio of Array.from(radios)) {
+    if (!isSafeLiveField(radio)) continue
     const rLabel = extractLabel(radio) || radio.value
     if (simpleSimilarity(value.toLowerCase(), rLabel.toLowerCase()) > 0.6) {
       radio.checked = true

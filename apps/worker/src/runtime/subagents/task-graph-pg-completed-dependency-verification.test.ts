@@ -182,10 +182,10 @@ describe("verifyCompletedScoutDependencies", () => {
     const base = graph()
     const sourceA = { ...base.snapshot.nodes[0]!, key: "scout-a", taskId: "scout-a-task" }
     const sourceB = { ...base.snapshot.nodes[0]!, key: "scout-b", taskId: "scout-b-task" }
-    const unionVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [
-      { id: "membership", check: { kind: "findings_from_scout_union", dependencyNodeKeys: ["scout-b", "scout-a"] } },
+    const perSourceVerification = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [
+      { id: "each-source", check: { kind: "findings_cover_each_scout_candidates_gte", dependencyNodeKeys: ["scout-b", "scout-a"], minimumPercent: 50 } },
     ] }
-    const analystNode = { ...base.analyst, dependsOn: ["scout-b", "scout-a"], verification: unionVerification }
+    const analystNode = { ...base.analyst, dependsOn: ["scout-b", "scout-a"], verification: perSourceVerification }
     const snapshot = parseTaskGraphSnapshot({ schemaVersion: "agent-harness.v2.task-graph", nodes: [sourceA, sourceB, analystNode] })
     const analyst = snapshot.nodes[2]!
     const emptyDigest = "c".repeat(64)

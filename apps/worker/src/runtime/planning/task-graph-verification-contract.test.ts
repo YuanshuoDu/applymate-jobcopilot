@@ -37,6 +37,26 @@ describe("TaskGraph verification contract", () => {
     } })
   })
 
+  it("accepts explicit per-Scout coverage with the same strict selector and integer bounds", () => {
+    const check = { kind: "findings_cover_each_scout_candidates_gte", dependencyNodeKeys: ["scout-b", "scout-a"], minimumPercent: 33 }
+    expect(validateTaskGraphVerificationContract(contract("analyst", [check]), "analyst")).toEqual({ ok: true, contract: {
+      schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [{ id: "check-1", check }],
+    } })
+    for (const malformed of [
+      { ...check, dependencyNodeKeys: ["scout-a"] },
+      { ...check, dependencyNodeKeys: ["scout-a", "scout-a"] },
+      { ...check, dependencyNodeKeys: ["scout-a", " scout-b"] },
+      { ...check, dependencyNodeKeys: Array.from({ length: 9 }, (_, index) => `scout-${index}`) },
+      { ...check, minimumPercent: 0 }, { ...check, minimumPercent: 101 }, { ...check, minimumPercent: 33.5 },
+      { ...check, extra: true },
+    ]) expect(validateTaskGraphVerificationContract(contract("analyst", [malformed]), "analyst"))
+      .toMatchObject({ ok: false, error: { code: "invalid_shape" } })
+    expect(validateTaskGraphVerificationContract(contract("scout", [check]), "scout"))
+      .toMatchObject({ ok: false, error: { code: "unknown_check" } })
+    const eight = { ...check, dependencyNodeKeys: Array.from({ length: 8 }, (_, index) => `scout-${index}`) }
+    expect(validateTaskGraphVerificationContract(contract("analyst", [eight]), "analyst")).toMatchObject({ ok: true })
+  })
+
   it("rejects wrong-role, malformed, duplicate, and out-of-range union selectors", () => {
     const validKeys = ["scout-a", "scout-b"]
     const malformed: unknown[] = [

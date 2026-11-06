@@ -208,11 +208,11 @@ describe("ordinary passed criteria lesson schema", () => {
 })
 
 describe("historical execution failure category lessons", () => {
-  const categories = ["execution_setup_unavailable", "resume_state_unavailable", "structured_output_invalid"] as const
+  const categories = ["execution_setup_unavailable", "resume_state_unavailable", "structured_output_invalid", "execution_deadline_exceeded"] as const
   const lesson = (executionFailureCategory: string) => ({ ordinalScope: "source_graph_local", advisoryOnly: true,
     notCurrentEvidence: true, nodeOrdinal: 1, criterionFailures: [], executionFailureCategory })
 
-  it("accepts only the three exact categories in a failed category-only lesson", () => {
+  it("accepts only the four exact categories in a failed category-only lesson", () => {
     for (const category of categories) {
       expect(parseRootTaskHistoryNodeLesson(lesson(category), undefined, "failed")).toEqual({
         ordinalScope: "source_graph_local", advisoryOnly: true, notCurrentEvidence: true,
@@ -220,6 +220,7 @@ describe("historical execution failure category lessons", () => {
       })
     }
     expect(parseRootTaskHistoryNodeLesson(lesson("setup_unavailable"), undefined, "failed")).toBeUndefined()
+    expect(parseRootTaskHistoryNodeLesson(lesson("task_graph_child_deadline_exceeded"), undefined, "failed")).toBeUndefined()
     expect(parseRootTaskHistoryNodeLesson(lesson(categories[0]), undefined, "completed")).toBeUndefined()
     expect(parseRootTaskHistoryNodeLesson(lesson(categories[0]), undefined, "running")).toBeUndefined()
     expect(parseRootTaskHistoryNodeLesson(lesson(categories[0]))?.executionFailureCategory).toBe(categories[0])

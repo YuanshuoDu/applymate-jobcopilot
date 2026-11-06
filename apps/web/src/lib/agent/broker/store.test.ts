@@ -2,17 +2,21 @@ import { describe, expect, it, vi } from "vitest"
 import type { PrismaClient } from "@prisma/client"
 
 import { answerQuestion, createQuestionWait, decideApproval } from "./store"
+import { redactSensitiveValue } from "@jobcopilot/shared"
+import { projectApprovalLedgerRow } from "@/components/agent-workspace/v2/approval-ledger-parser"
+import { createApprovalLedgerState, reduceApprovalLedger, selectApprovalLedgerProjection } from "@/components/agent-workspace/v2/approval-ledger-view"
+import { normalizeTimelineEvent } from "@/components/agent-workspace/v2/timeline-event-normalizer"
 
 type Row = Record<string, any> // Test fixture rows mirror Prisma JSON records.
 
-function fakeDb() {
+function fakeDb(taskId: string | null = null) {
   const turn: Row = { id: "turn_1", status: "in_progress", revision: 4 }
   const item: Row = {
     id: "agent-wait:question:question_1", status: "started", revision: 0,
     content: { waitKind: "question", questionId: "question_1", toolCallId: "call_1", stage: "profile", question: "Work authorisation?", options: [{ value: "yes", label: "Yes" }], answerAvailable: false },
   }
   const approval: Row = {
-    id: "approval_1", sessionId: "session_1", userId: "user_1", turnId: "turn_1", toolCallId: "call_approval",
+    id: "approval_1", sessionId: "session_1", userId: "user_1", turnId: "turn_1", taskId, toolCallId: "call_approval",
     status: "pending", revision: 4, scopeHash: "scope_hash", expiresAt: new Date("2026-09-02T00:00:00.000Z"),
   }
   const events: Row[] = []
@@ -80,7 +84,14 @@ describe("Agent wait broker", () => {
     expect(fake.item.content.answer).toBe("yes")
     expect(JSON.stringify(fake.events.map((event) => event.payload))).not.toContain("yes")
     expect(JSON.stringify(fake.outbox)).not.toContain("yes")
-    expect(fake.events.some((event) => event.type === "turn.wakeup")).toBe(true)
+    expect(fake.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "question.answered", taskId: null }),
+      expect.objectContaining({ type: "turn.wakeup", taskId: null }),
+    ]))
+    expect(fake.outbox).toEqual(expect.arrayContaining([
+      expect.objectContaining({ topic: "agent.session.event", payload: expect.objectContaining({ type: "question.answered", taskId: null }) }),
+      expect.objectContaining({ topic: "agent.turn.wakeup", payload: expect.objectContaining({ type: "turn.wakeup", taskId: null }) }),
+    ]))
   })
 
   it("returns an idempotent duplicate and does not attempt a second answer", async () => {
@@ -101,8 +112,13 @@ describe("Agent wait broker", () => {
     expect(fake.tx.agentItem.updateMany).toHaveBeenCalledTimes(1)
   })
 
-  it("resolves a scoped approval without creating a new Turn", async () => {
-    const fake = fakeDb()
+  it.each([
+    { decision: "approved" as const, taskId: "task_approval" },
+    { decision: "rejected" as const, taskId: "task_approval" },
+    { decision: "approved" as const, taskId: null },
+    { decision: "rejected" as const, taskId: null },
+  ])("resolves a scoped $decision approval with persisted task lineage $taskId", async ({ decision, taskId }) => {
+    const fake = fakeDb(taskId)
     fake.turn.status = "waiting_for_approval"
     fake.turn.revision = 5
     fake.item.id = "agent-wait:approval:approval_1"
@@ -111,11 +127,48 @@ describe("Agent wait broker", () => {
     fake.item.content = { waitKind: "approval", approvalId: "approval_1", toolCallId: "call_approval", scopeHash: "scope_hash" }
     const result = await decideApproval(fake.db, {
       waitId: "approval_1", sessionId: "session_1", userId: "user_1", expectedTurnId: "turn_1", expectedRevision: 5,
-      clientMessageId: "approval_1_decision", decision: "approved", now: new Date("2026-09-01T00:00:00.000Z"),
+      clientMessageId: `approval_1_${decision}_${taskId ?? "turn"}`, decision, now: new Date("2026-09-01T00:00:00.000Z"),
     })
 
-    expect(result).toMatchObject({ status: "approved", turnId: "turn_1", toolCallId: "call_approval" })
-    expect(fake.approval.status).toBe("approved")
+    expect(result).toMatchObject({ status: decision, turnId: "turn_1", toolCallId: "call_approval" })
+    expect(fake.approval.status).toBe(decision)
     expect(fake.turn.id).toBe("turn_1")
+    expect(fake.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "approval.resolved", taskId }),
+      expect.objectContaining({ type: "turn.wakeup", taskId: null }),
+    ]))
+    expect(fake.outbox).toEqual(expect.arrayContaining([
+      expect.objectContaining({ topic: "agent.session.event", payload: expect.objectContaining({ type: "approval.resolved", taskId }) }),
+      expect.objectContaining({ topic: "agent.turn.wakeup", payload: expect.objectContaining({ type: "turn.wakeup", taskId: null }) }),
+    ]))
+
+    const persisted = fake.events.find((event) => event.type === "approval.resolved")
+    expect(persisted?.payload).toMatchObject({ status: decision, answerAvailable: false })
+    const persistedOutbox = fake.outbox.find((event) => event.topic === "agent.session.event" && event.payload.type === "approval.resolved")
+    expect(persistedOutbox?.payload.payload).toMatchObject({ status: decision, answerAvailable: false })
+    const timelineRow = persisted && {
+      id: persisted.id,
+      sessionId: persisted.sessionId,
+      turnId: persisted.turnId,
+      itemId: persisted.itemId,
+      taskId: persisted.taskId,
+      sequence: persisted.sequence,
+      type: persisted.type,
+      actor: persisted.actor,
+      payload: persisted.payload,
+    }
+    const timeline = timelineRow && projectApprovalLedgerRow(timelineRow, "session_1", value => redactSensitiveValue(value, null, 0, 6))
+    expect(timeline?.payload).toMatchObject({ status: decision, answerAvailable: false })
+    const requested = normalizeTimelineEvent({
+      schemaVersion: "agent-harness.v2", id: "request_1", sessionId: "session_1", turnId: "turn_1", itemId: null, taskId,
+      type: "approval.requested", actor: "orchestrator", sequence: "9",
+      payload: { approvalId: "approval_1", action: "submit_application", revision: 4, scopeHash: `sha256:${"a".repeat(64)}` },
+    })
+    const resolved = timeline && normalizeTimelineEvent(timeline)
+    expect(requested).not.toBeNull()
+    expect(resolved).not.toBeNull()
+    let state = reduceApprovalLedger(createApprovalLedgerState("session_1"), requested)
+    state = reduceApprovalLedger(state, resolved)
+    expect(selectApprovalLedgerProjection(state)).toMatchObject({ pendingCount: 0, approvals: [{ status: decision }] })
   })
 })

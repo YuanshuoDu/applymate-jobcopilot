@@ -4,6 +4,7 @@ import { validatedStructuredResult } from "./coordination-result-aggregate.js"
 import { lifecycleTarget, visibleTask } from "./coordination-visibility.js"
 import { projectNativeVerificationResult } from "./native-verification-feedback-projection.js"
 import { parseTaskGraphVerificationCriterionIds, parseTaskGraphVerificationReport } from "../subagents/task-graph-command-port.js"
+import { TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION } from "../subagents/task-graph-verification-report.js"
 import { sanitizeLifecyclePreview } from "./redaction.js"
 import type { ToolExecutionContext } from "./types.js"
 
@@ -98,7 +99,8 @@ function projectTaskGraphVerificationResult(value: unknown): unknown {
   const criteria = report && typeof report === "object" && !Array.isArray(report) ? report.criteria : null
   const ids = Array.isArray(criteria) ? parseTaskGraphVerificationCriterionIds(criteria.map(item =>
     item && typeof item === "object" && !Array.isArray(item) ? (item as Record<string, unknown>).criterionId : undefined)) : undefined
-  const parsed = ids && parseTaskGraphVerificationReport(report, ids)
+  const requiresCurrentGraphReadback = report?.verifierVersion === TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION
+  const parsed = ids && !requiresCurrentGraphReadback ? parseTaskGraphVerificationReport(report, ids) : undefined
   const { taskGraphVerificationReport: _private, ...safe } = result
   return parsed ? { ...safe, taskGraphVerificationReport: parsed } : safe
 }

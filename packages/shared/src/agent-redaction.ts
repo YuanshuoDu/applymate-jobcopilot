@@ -162,13 +162,13 @@ function preserveFields(safe: unknown, raw: JsonRecord, fields: readonly string[
   const output = record(safe)
   if (!output) return safe as RepositoryJsonValue
   const result = { ...output } as Record<string, RepositoryJsonValue>
-  for (const field of fields) { const value = raw[field]; if (value === null || opaqueId(value)) result[field] = value }
+  for (const field of fields) { const value = raw[field]; if (value === null || opaqueId(value) || (field === "answerAvailable" && value === false)) result[field] = value }
   return result
 }
 function redactWaitRouting(type: string, raw: unknown, safe: RepositoryJsonValue, route: RoutingTuple): RepositoryJsonValue {
   const payload = record(raw)
   if (!payload) return safe
-  const fields = validatedPayloadFields(type, payload, route)
+  const fields = validatedPayloadFields(type, payload, route); if (type === "question.cancelled" && !fields) return "[REDACTED]"
   let preserved = fields ? preserveFields(safe, payload, fields) : safe
   if (validQuestionSourceEnvelope(type, payload, route)) {
     const output = record(preserved), rawSource = record(payload.sourcePayload), safeSource = record(output?.sourcePayload)

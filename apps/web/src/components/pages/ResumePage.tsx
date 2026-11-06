@@ -93,12 +93,9 @@ function auditMatchesCurrentMaterials(
   const auditedAt = Date.parse(record.audit.auditedAt)
   if (!Number.isFinite(auditedAt)) return false
 
-  // New records carry exact document revisions. Legacy activity records only
-  // have auditedAt, so use it as a conservative lower-bound check instead.
-  if (record.resumeUpdatedAt && resumeUpdatedAt && record.resumeUpdatedAt !== resumeUpdatedAt) return false
-  if (record.coverLetterUpdatedAt && coverLetterUpdatedAt && record.coverLetterUpdatedAt !== coverLetterUpdatedAt) return false
-  if (!record.resumeUpdatedAt && resumeUpdatedAt && auditedAt < Date.parse(resumeUpdatedAt)) return false
-  if (!record.coverLetterUpdatedAt && coverLetterUpdatedAt && auditedAt < Date.parse(coverLetterUpdatedAt)) return false
+  // A review is current only for the exact material revisions it inspected.
+  if (!record.resumeUpdatedAt || !resumeUpdatedAt || record.resumeUpdatedAt !== resumeUpdatedAt) return false
+  if (coverLetterId && (!record.coverLetterUpdatedAt || !coverLetterUpdatedAt || record.coverLetterUpdatedAt !== coverLetterUpdatedAt)) return false
   return true
 }
 
@@ -126,7 +123,7 @@ import { UploadResumeModal } from '@/components/resume/UploadResumeModal'
 import { ResumeIntakeDialog } from '@/components/resume/ResumeIntakeDialog'
 import type { DragHandleProps } from '@/components/resume/SectionHeader'
 import type { AiFieldContext } from '@/components/resume/AiFieldSuggestion'
-import { exportApplicationPackLocally } from '@/lib/bundle'
+import { downloadApplicationPack as downloadApplicationPackZip } from '@/lib/bundle'
 import { downloadResumePdf } from '@/lib/resume-export'
 import { analysisTargetKey, replaceSectionSuggestions, shouldPreserveAnalysis, shouldStartAutomaticAnalysis } from '@/lib/resume-analysis-state'
 import { formatResumeChangeValue, type ResumeChange, type ResumeChangeSection, type ResumeChangeSource } from '@/lib/resume-change-diff'
@@ -709,7 +706,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     // the independent audit again before the application pack can be confirmed.
     setApplicationPackReadyResumeId(previous => previous === selectedResumeId ? null : previous)
   }, [dirty, selectedResumeId])
-  const [exportedPackFolder, setExportedPackFolder] = useState<string | null>(null)
+  const [downloadingPack, setDownloadingPack] = useState(false)
   const [showNewResume,   setShowNewResume]   = useState(false)
   const [renamingResume,  setRenamingResume]  = useState<ResumeListItem | null>(null)
   const [showUploadModal,   setShowUploadModal]   = useState(false)
@@ -1770,13 +1767,15 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   }
 
   async function downloadApplicationPack() {
-    if (!confirmedJob) return
+    if (!confirmedJob || downloadingPack) return
+    setDownloadingPack(true)
     try {
-      const result = await exportApplicationPackLocally(confirmedJob.id, Boolean(exportedPackFolder))
-      setExportedPackFolder(result.folderPath)
-      toast.success(exportedPackFolder ? 'Job folder opened' : 'Application PDFs saved', result.folderPath)
+      const result = await downloadApplicationPackZip(confirmedJob.id)
+      toast.success('Download started', result.filename)
     } catch (error) {
-      toast.error('Could not create application pack', error instanceof Error ? error.message : 'Please try again')
+      toast.error('Could not download application pack', error instanceof Error ? error.message : 'Please try again')
+    } finally {
+      setDownloadingPack(false)
     }
   }
 
@@ -2405,7 +2404,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
           }}
           onConfirm={confirmApplicationPack}
           onDownload={downloadApplicationPack}
-          exportedPackFolder={exportedPackFolder}
+          downloadingPack={downloadingPack}
         />
       )}
       {renamingResume && <RenameResumeModal resume={renamingResume} onClose={() => setRenamingResume(null)} onRename={name => handleRenameResume(renamingResume, name)} />}

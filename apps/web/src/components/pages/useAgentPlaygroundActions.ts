@@ -1,14 +1,17 @@
 'use client'
 
-import { useCallback, type Dispatch, type SetStateAction } from 'react'
+import { useCallback, useRef, type Dispatch, type SetStateAction } from 'react'
+import { useSession } from 'next-auth/react'
 import { useToast } from '@/components/ui'
 import { apiMutate } from '@/lib/hooks'
-import { useI18n } from '@/lib/i18n'
+import { useI18n, type Lang } from '@/lib/i18n'
 import type { ApplyReadyJob } from '@/components/agent-workspace/ApplyJobCard'
+import { manualRecordLabel, type ManualRecordStatus } from '@/components/agent-workspace/apply-job-actions'
 import type { LogEntry, QuestionOption } from '@/components/agent-workspace/live-run-types'
 
 type ToastApi = ReturnType<typeof useToast>
 type WaitingQuestion = { id: string; question: string; options: QuestionOption[] }
+type ApplyMutation = (url: string, method: 'POST', body: unknown) => Promise<{ data: unknown | null; error: string | null }>
 
 interface UseAgentPlaygroundActionsOptions {
   toast: ToastApi
@@ -18,10 +21,50 @@ interface UseAgentPlaygroundActionsOptions {
   setApplyQueue: Dispatch<SetStateAction<ApplyReadyJob[]>>
 }
 
+export interface RecordManualApplicationOptions {
+  jobId: string
+  userId: string
+  getActiveUserId: () => string | null
+  job: ApplyReadyJob
+  toast: ToastApi
+  setApplyQueue: Dispatch<SetStateAction<ApplyReadyJob[]>>
+  lang: Lang
+  mutate?: ApplyMutation
+}
+
+export async function recordManualApplication({
+  jobId, userId, getActiveUserId, job, toast, setApplyQueue, lang, mutate = apiMutate,
+}: RecordManualApplicationOptions) {
+  const isCurrentUser = () => getActiveUserId() === userId
+  const setStatus = (status: ManualRecordStatus) => {
+    setApplyQueue(prev => prev.map(item => item.jobId === jobId
+      ? { ...item, manualRecordStatuses: { ...item.manualRecordStatuses, [userId]: status } }
+      : item))
+  }
+
+  if (!isCurrentUser()) throw new Error('The signed-in account changed before recording.')
+  setStatus('pending')
+  try {
+    const { error } = await mutate(`/api/jobs/${jobId}/apply`, 'POST', {})
+    if (error) throw new Error(error)
+    setStatus('reported')
+    if (isCurrentUser()) toast.success(manualRecordLabel(lang, 'reported'), `${job.company} · ${job.role}`)
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : 'Request outcome could not be verified'
+    setStatus('unknown')
+    if (isCurrentUser()) toast.error(manualRecordLabel(lang, 'unknown'), detail)
+    throw error instanceof Error ? error : new Error(detail)
+  }
+}
+
 export function useAgentPlaygroundActions({
   toast, addLog, setRunLog, setWaitingQuestion, setApplyQueue,
 }: UseAgentPlaygroundActionsOptions) {
-  const { t } = useI18n()
+  const { t, lang } = useI18n()
+  const { data: authSession, status: authStatus } = useSession()
+  const userId = authStatus === 'authenticated' ? authSession?.user?.id ?? null : null
+  const activeUserIdRef = useRef(userId)
+  activeUserIdRef.current = userId
 
   const handleAnswerQuestion = useCallback(async (entry: LogEntry, opt: QuestionOption) => {
     if (opt.action) {
@@ -76,14 +119,12 @@ export function useAgentPlaygroundActions({
   }, [addLog, setRunLog, setWaitingQuestion, t, toast])
 
   const handleApplied = useCallback(async (jobId: string, job: ApplyReadyJob) => {
-    const { error } = await apiMutate(`/api/jobs/${jobId}/apply`, 'POST', {})
-    if (error) {
-      toast.error(t('agent.deliveryFailed'), error)
-      throw new Error(error)
-    }
-    setApplyQueue(prev => prev.map(j => j.jobId === jobId ? { ...j, url: `_applied_${j.url}` } : j))
-    toast.success(t('agent.markedForDelivery'), `${job.company} · ${job.role}`)
-  }, [setApplyQueue, t, toast])
+    if (!userId) throw new Error('Sign in before recording an application.')
+    await recordManualApplication({
+      jobId, userId, getActiveUserId: () => activeUserIdRef.current,
+      job, toast, setApplyQueue, lang,
+    })
+  }, [lang, setApplyQueue, toast, userId])
 
   return { handleAnswerQuestion, handleAnswerOrchestrator, handleApplied }
 }

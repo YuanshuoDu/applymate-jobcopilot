@@ -1,6 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { auditActivityText } from '@/lib/application-audit'
+import { auditActivityText as unsignedAuditActivityText, parseStoredApplicationAudit } from '@/lib/application-audit'
+import { signedAuditActivityText, verifyApplicationAuditReceipt } from '@/lib/application-audit-receipt'
 import type { ApplicationAudit } from '@/lib/types'
+
+vi.mock('@/lib/auth-secret', () => ({ getAuthJwtSecret: () => new TextEncoder().encode('unit-test-audit-repair-key') }))
+const scope = { userId: 'user_1', jobId: 'job_1' }
+const auditActivityText = (...args: Parameters<typeof unsignedAuditActivityText>) => signedAuditActivityText(scope, ...args)
 
 const mocks = {
   jobFindFirst: vi.fn(), resumeFindFirst: vi.fn(), resumeUpdate: vi.fn(),
@@ -80,6 +85,7 @@ describe('POST /api/jobs/[id]/audit-application/apply', () => {
     expect(mocks.resumeVersionCreate).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ resumeId: 'resume_final', content: resumeContent }) }))
     expect(mocks.resumeUpdate).toHaveBeenCalledWith(expect.objectContaining({ data: { content: { ...resumeContent, summary: 'Supported summary.' } } }))
     expect(mocks.activityCreate).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ text: expect.stringContaining('"applied":true') }) }))
+    expect(verifyApplicationAuditReceipt(scope, parseStoredApplicationAudit(mocks.activityCreate.mock.calls[0][0].data.text))).toBe(true)
   })
 
   it('applies a cover-letter correction without changing the resume', async () => {
@@ -114,6 +120,15 @@ describe('POST /api/jobs/[id]/audit-application/apply', () => {
     expect(response.status).toBe(409)
     expect(mocks.resumeUpdate).not.toHaveBeenCalled()
     expect(mocks.resumeVersionCreate).not.toHaveBeenCalled()
+  })
+
+  it('rejects unsigned historical corrections before modifying a document', async () => {
+    mocks.activityFindFirst.mockResolvedValue({ text: unsignedAuditActivityText('resume_final', null, audit(), { resumeUpdatedAt: '2026-09-22T10:01:00.000Z' }) })
+    const { POST } = await import('./route')
+    const response = (await POST(request({ resumeId: 'resume_final', coverLetterId: null, findingIndex: 0 }) as never, { params: Promise.resolve({ id: 'job_1' }) }))!
+    expect(response.status).toBe(409)
+    expect(mocks.resumeUpdate).not.toHaveBeenCalled()
+    expect(mocks.coverLetterUpdate).not.toHaveBeenCalled()
   })
 
   it('generates a safe replacement when the audit did not provide one', async () => {

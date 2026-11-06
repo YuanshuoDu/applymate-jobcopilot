@@ -12,7 +12,8 @@ import { prepareAiRoute, requireAuth, isErrorResponse, ok, err } from '@/lib/api
 import { modelChat, parseAiJson, withMiniMaxThinking, type AiConfig } from '@/lib/model-router'
 import { roleAiConfig } from '@/lib/agent/role-config'
 import { buildPersona } from '@/lib/persona'
-import { auditActivityText, AUDIT_ACTIVITY_PREFIX, isApplicationAuditTarget, parseStoredApplicationAudit, sanitizeProposedValue, targetForAuditFinding } from '@/lib/application-audit'
+import { AUDIT_ACTIVITY_PREFIX, isApplicationAuditTarget, parseStoredApplicationAudit, sanitizeProposedValue, targetForAuditFinding } from '@/lib/application-audit'
+import { signedAuditActivityText, verifyApplicationAuditReceipt } from '@/lib/application-audit-receipt'
 import type { ApplicationAudit, ApplicationAuditFinding, ResumeContent } from '@/lib/types'
 
 type Params = { params: Promise<{ id: string }> }
@@ -162,7 +163,8 @@ export async function GET(req: NextRequest, { params }: Params) {
     orderBy: { createdAt: 'desc' },
     select: { text: true },
   })
-  return ok(parseStoredApplicationAudit(activity?.text ?? '') ?? null)
+  const stored = parseStoredApplicationAudit(activity?.text ?? '')
+  return ok(verifyApplicationAuditReceipt({ userId: auth.userId, jobId }, stored) ? stored : null)
 }
 
 export async function POST(req: NextRequest, { params }: Params) {
@@ -254,7 +256,7 @@ ${finalCoverLetterSection}`
       data: {
         userId: prep.userId, jobId, type: 'agent_action',
         color: audit.verdict === 'pass' ? '#059669' : audit.verdict === 'blocked' ? '#dc2626' : '#d97706',
-        text: auditActivityText(resume.id, coverLetterId ?? null, audit, {
+        text: signedAuditActivityText({ userId: prep.userId, jobId }, resume.id, coverLetterId ?? null, audit, {
           resumeUpdatedAt: toIso(resume.updatedAt),
           coverLetterUpdatedAt: toIso(coverLetter?.updatedAt),
         }),

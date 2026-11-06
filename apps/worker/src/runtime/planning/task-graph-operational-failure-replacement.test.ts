@@ -26,6 +26,7 @@ const analystUnionVerification = (dependencyNodeKeys: readonly string[]) => ({
   role: "analyst" as const,
   criteria: [
     { id: "from-scout-union", check: { kind: "findings_from_scout_union" as const, dependencyNodeKeys: [...dependencyNodeKeys] } },
+    { id: "each-source", check: { kind: "findings_cover_each_scout_candidates_gte" as const, dependencyNodeKeys: [...dependencyNodeKeys], minimumPercent: 75 } },
     { id: "finding-count", check: { kind: "finding_count_gte" as const, minimum: 1 } },
   ],
 })
@@ -141,6 +142,9 @@ describe("operational failure replacement graph validation", () => {
     if (!result.ok) return
     expect(result.value.replacementNodes[1]?.verification?.criteria[0]?.check).toEqual({
       kind: "findings_from_scout_union", dependencyNodeKeys: ["foundation", "scout-new"],
+    })
+    expect(result.value.replacementNodes[1]?.verification?.criteria[1]?.check).toEqual({
+      kind: "findings_cover_each_scout_candidates_gte", dependencyNodeKeys: ["foundation", "scout-new"], minimumPercent: 75,
     })
   })
 

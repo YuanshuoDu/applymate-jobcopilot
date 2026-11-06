@@ -1,8 +1,13 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 
 export type ExtensionLang = 'en' | 'de' | 'fr' | 'es' | 'nl' | 'zh'
 
 const zh: Record<string, string> = {
+  'Works with company career sites, Greenhouse, Lever, Workday, and more.': '支持公司招聘页面、Greenhouse、Lever、Workday 等兼容表单。',
+  'When you scan, ApplyMate reads supported field labels and existing values on this page.': '扫描时，ApplyMate 会读取本页支持的字段标签和已有值。',
+  'Relevant form and profile data is sent to ApplyMate and the configured AI provider when needed to prepare or revise suggestions.': '准备或修改建议需要 AI 时，相关表单和个人资料会发送至 ApplyMate 及配置的 AI 服务商。',
+  'This can include location, salary expectations, and health or disability details you choose to provide.': '其中可能包括你选择提供的所在地、薪资期望，以及健康或残障信息。',
+  'Review everything before filling; it never submits the application.': '填写前请逐项审核；扩展不会提交申请。',
   'Loading resumes': '正在加载简历',
   'ApplyMate navigation': 'ApplyMate 导航',
   'Open original': '打开原职位页面',
@@ -337,9 +342,18 @@ const zh: Record<string, string> = {
   'Upload failed': '上传失败',
   'Section added': '已添加部分',
   Custom: '自定义',
-  'Opened job folder': '已打开职位文件夹',
-  'Audited PDFs saved to D:': '已审核的 PDF 已保存到 D 盘',
-  'Could not save application PDFs': '无法保存申请 PDF',
+  'Download started': '已开始下载',
+  'Recheck audit': '重新审核',
+  'Could not download application pack': '无法下载申请包',
+  'Downloads your audited application documents as a ZIP.': '将已审核的申请材料下载为 ZIP 文件。',
+  'Print view / Save as PDF': '打印预览 / 另存为 PDF',
+  'Print view opened': '已打开打印预览',
+  'The PDF fonts cannot represent every character in these documents. Use Print view / Save as PDF and check the preview before saving.': 'PDF 字体无法完整显示这些材料中的文字。请使用“打印预览 / 另存为 PDF”，检查文字后保存。',
+  'The selected document versions must pass a factual audit before downloading or printing. Recheck the audit after editing or if an older audit is no longer trusted.': '下载或打印前，选定的材料版本必须通过事实审核。编辑材料后或旧审核不可验证时，请点击“重新审核”。',
+  'Preparing ZIP…': '正在准备 ZIP……',
+  'Download application pack (ZIP)': '下载申请包（ZIP）',
+  'Print & Download PDF': '打印并下载 PDF',
+  'Opens print view → save as PDF → drag to upload portal': '打开打印预览 → 保存为 PDF → 拖到上传页面',
   'Resume tailored for this job': '已为此职位定制简历',
   'Tailoring failed': '定制失败',
   'Something went wrong': '出了点问题，请重试',
@@ -358,6 +372,8 @@ function getExtensionLang(): ExtensionLang {
 
 export function useExtensionI18n() {
   const [lang, setLang] = useState<ExtensionLang>(getExtensionLang)
+  // Consumers use t in effect dependencies; data loads must not recreate it.
+  const t = useCallback((english: string) => translateExtension(lang, english), [lang])
   useEffect(() => {
     const timer = window.setInterval(() => {
       const next = getExtensionLang()
@@ -367,7 +383,7 @@ export function useExtensionI18n() {
   }, [])
   return {
     lang,
-    t: (english: string) => translateExtension(lang, english),
+    t,
   }
 }
 

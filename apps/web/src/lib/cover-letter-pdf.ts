@@ -2,6 +2,7 @@
 import type { CoverLetterDocProps } from '@/components/resume/templates/cover-letter/CoverLetterFrame'
 import type { TemplateOptions } from '@/lib/types'
 import { safeAccentColor } from '@/lib/template-options'
+import { assertPdfTextSupported } from '@/lib/pdf-text-support'
 
 /**
  * Select the right CL template based on resume templateId
@@ -14,6 +15,9 @@ export async function renderCoverLetterDoc(
   applicant: CoverLetterDocProps['applicant'],
   recipient?: CoverLetterDocProps['recipient'],
 ): Promise<React.ReactElement> {
+  for (const value of [clContent, applicant.name, applicant.email, applicant.phone, applicant.location, applicant.linkedin, recipient?.company, recipient?.role]) {
+    if (value) assertPdfTextSupported(value)
+  }
   const variant: CoverLetterDocProps['templateVariant'] =
     resumeTemplateId === 'executive' || resumeTemplateId === 'sidebar'
       ? 'classic'
@@ -37,18 +41,8 @@ export async function renderCoverLetterDoc(
     templateVariant: variant,
   }
 
-  if (variant === 'classic') {
-    const { ClassicCoverLetter } = await import('@/components/resume/templates/cover-letter/ClassicCoverLetter')
-    const React = (await import('react')).default
-    return React.createElement(ClassicCoverLetter, props)
-  }
-  if (variant === 'minimal') {
-    const { MinimalCoverLetter } = await import('@/components/resume/templates/cover-letter/MinimalCoverLetter')
-    const React = (await import('react')).default
-    return React.createElement(MinimalCoverLetter, props)
-  }
-  // default: modern
-  const { ModernCoverLetter } = await import('@/components/resume/templates/cover-letter/ModernCoverLetter')
-  const React = (await import('react')).default
-  return React.createElement(ModernCoverLetter, props)
+  const [{ CoverLetterDoc }, { default: React }] = await Promise.all([
+    import('@/components/resume/templates/cover-letter/CoverLetterFrame'), import('react'),
+  ])
+  return React.createElement(CoverLetterDoc, props)
 }

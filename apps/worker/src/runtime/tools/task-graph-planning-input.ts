@@ -67,6 +67,12 @@ function verificationCheckSchema(role: TaskGraphVerificationRole): TSchema {
           { minItems: 2, maxItems: 8, uniqueItems: true }),
         minimumPercent: Type.Integer({ minimum: 1, maximum: 100 }),
       }, { additionalProperties: false }),
+      Type.Object({
+        kind: Type.Literal("findings_cover_each_scout_candidates_gte"),
+        dependencyNodeKeys: Type.Array(Type.String({ minLength: 1, maxLength: TASK_GRAPH_LIMITS.maxKeyLength, pattern: DEPENDENCY_SELECTOR_PATTERN }),
+          { minItems: 2, maxItems: 8, uniqueItems: true }),
+        minimumPercent: Type.Integer({ minimum: 1, maximum: 100 }),
+      }, { additionalProperties: false }),
     ]
   return Type.Union([evidence, ...roleChecks] as [TSchema, ...TSchema[]])
 }

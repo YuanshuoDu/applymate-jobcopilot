@@ -33,6 +33,11 @@ const coverageContract: TaskGraphVerificationContract = {
   role: "analyst",
   criteria: [{ id: "coverage", check: { kind: "findings_cover_scout_candidates_gte", dependencyNodeKey: "scout-a", minimumPercent: 75 } }],
 }
+const perSourceCoverageContract: TaskGraphVerificationContract = {
+  schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION,
+  role: "analyst",
+  criteria: [{ id: "coverage", check: { kind: "findings_cover_each_scout_candidates_gte", dependencyNodeKeys: ["scout-b", "scout-a"], minimumPercent: 75 } }],
+}
 
 function scout(key: string): TaskGraphVerificationDependencyGraphNode {
   return { key, templateId: "scout", dependsOn: [], verificationDisposition: "typed", verification: scoutContract }
@@ -68,6 +73,21 @@ describe("TaskGraph cross-node verification selectors", () => {
     expect(validateTaskGraphVerificationDependencySelectors([
       scout("scout-a"), scout("scout-b"), { ...scout("scout-c"), verificationDisposition: "legacy_unverified", verification: undefined },
       unionAnalyst(["scout-a", "scout-b", "scout-c"]),
+    ])).toBe(false)
+  })
+
+  it("collects every per-source selector and requires each to be a direct typed Scout", () => {
+    const sourceAnalyst = (dependsOn: readonly string[]): TaskGraphVerificationDependencyGraphNode => ({
+      key: "analyst", templateId: "analyst", dependsOn, verificationDisposition: "typed", verification: perSourceCoverageContract,
+    })
+    expect(taskGraphVerificationDependencyNodeKeys(perSourceCoverageContract)).toEqual(["scout-a", "scout-b"])
+    expect(validateTaskGraphVerificationDependencySelectors([scout("scout-a"), scout("scout-b"), sourceAnalyst(["scout-a", "scout-b"])]))
+      .toBe(true)
+    expect(validateTaskGraphVerificationDependencySelectors([scout("scout-a"), scout("scout-b"), sourceAnalyst(["scout-a"])]))
+      .toBe(false)
+    expect(validateTaskGraphVerificationDependencySelectors([
+      scout("scout-a"), { ...scout("scout-b"), verificationDisposition: "legacy_unverified", verification: undefined },
+      sourceAnalyst(["scout-a", "scout-b"]),
     ])).toBe(false)
   })
   it("accepts zero Scout and Analyst results only when both bind the verified empty-search receipt", () => {

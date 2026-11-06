@@ -41,20 +41,24 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
           where: { id: finalCoverLetterId, jobId: id, userId: auth.userId },
         })
         if (!cl) throw new Error('CoverLetter not found')
-        // Set new final
-        await tx.coverLetter.update({
-          where: { id: finalCoverLetterId },
-          data:  { isFinal: true },
-        })
+        // Selection metadata does not edit the audited document. Preserve its
+        // content revision, without masking a concurrent content edit.
+        if (!cl.isFinal) {
+          const selected = await tx.coverLetter.updateMany({
+            where: { id: finalCoverLetterId, jobId: id, userId: auth.userId, updatedAt: cl.updatedAt },
+            data: { isFinal: true, updatedAt: cl.updatedAt },
+          })
+          if (selected.count !== 1) throw new Error('CoverLetter changed during selection')
+        }
         // Clear siblings
         await tx.coverLetter.updateMany({
-          where: { jobId: id, id: { not: finalCoverLetterId } },
+          where: { jobId: id, userId: auth.userId, id: { not: finalCoverLetterId }, isFinal: true },
           data:  { isFinal: false },
         })
       } else {
         // Clearing final — unset all
         await tx.coverLetter.updateMany({
-          where: { jobId: id },
+          where: { jobId: id, userId: auth.userId, isFinal: true },
           data:  { isFinal: false },
         })
       }
@@ -65,7 +69,14 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
     if ('finalCoverLetterId' in body) data.finalCoverLetterId = finalCoverLetterId ?? null
 
     return tx.job.update({ where: { id }, data })
+  }).catch((error: unknown) => {
+    if (error instanceof Error && error.message === 'CoverLetter changed during selection') {
+      return err('The cover letter changed while selecting it. Review it and run the audit again.', 409)
+    }
+    if (error instanceof Error && error.message === 'CoverLetter not found') return err('Cover letter not found', 404)
+    throw error
   })
 
+  if (isErrorResponse(updated)) return updated
   return ok(updated)
 }

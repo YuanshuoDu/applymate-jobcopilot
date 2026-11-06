@@ -18,6 +18,7 @@ export type TaskGraphVerificationCheck =
   | Readonly<{ kind: "findings_cover_scout_candidates_gte"; dependencyNodeKey: string; minimumPercent: number }>
   | Readonly<{ kind: "findings_from_scout_union"; dependencyNodeKeys: readonly string[] }>
   | Readonly<{ kind: "findings_cover_scout_candidate_union_gte"; dependencyNodeKeys: readonly string[]; minimumPercent: number }>
+  | Readonly<{ kind: "findings_cover_each_scout_candidates_gte"; dependencyNodeKeys: readonly string[]; minimumPercent: number }>
 
 export type TaskGraphVerificationCriterion = Readonly<{ id: string; check: TaskGraphVerificationCheck }>
 export type TaskGraphVerificationContract = Readonly<{
@@ -95,20 +96,19 @@ function positiveBoundedInteger(value: unknown): value is number {
 }
 
 function parseUnionCheck(
-  value: unknown, kind: "findings_from_scout_union" | "findings_cover_scout_candidate_union_gte",
+  value: unknown, kind: "findings_from_scout_union" | "findings_cover_scout_candidate_union_gte" | "findings_cover_each_scout_candidates_gte",
   role: TaskGraphVerificationRole, path: string,
 ): TaskGraphVerificationCheck | TaskGraphVerificationValidationError {
   if (role !== "analyst") return { code: "unknown_check", path }
-  const withPercent = kind === "findings_cover_scout_candidate_union_gte"
+  const withPercent = kind !== "findings_from_scout_union"
   const row = exactRecord(value, withPercent ? "dependencyNodeKeys,kind,minimumPercent" : "dependencyNodeKeys,kind")
   const dependencyNodeKeys = row && densePlainSelectorList(row.dependencyNodeKeys)
   if (!row || !dependencyNodeKeys || withPercent
     && (!Number.isSafeInteger(row.minimumPercent) || Number(row.minimumPercent) < 1 || Number(row.minimumPercent) > 100)) {
     return { code: "invalid_shape", path }
   }
-  return withPercent
-    ? { kind, dependencyNodeKeys, minimumPercent: Number(row.minimumPercent) }
-    : { kind, dependencyNodeKeys }
+  if (kind === "findings_from_scout_union") return { kind, dependencyNodeKeys }
+  return { kind, dependencyNodeKeys, minimumPercent: Number(row.minimumPercent) }
 }
 
 function parseCheck(value: unknown, role: TaskGraphVerificationRole, path: string): TaskGraphVerificationCheck | TaskGraphVerificationValidationError {
@@ -155,7 +155,8 @@ function parseCheck(value: unknown, role: TaskGraphVerificationRole, path: strin
   }
   if (kind === "findings_from_scout_dependency") return parseFindingsFromScoutDependencyCheck(value, role, path)
   if (kind === "findings_cover_scout_candidates_gte") return parseFindingsCoverScoutCandidatesCheck(value, role, path)
-  if (kind === "findings_from_scout_union" || kind === "findings_cover_scout_candidate_union_gte") return parseUnionCheck(value, kind, role, path)
+  if (kind === "findings_from_scout_union" || kind === "findings_cover_scout_candidate_union_gte"
+    || kind === "findings_cover_each_scout_candidates_gte") return parseUnionCheck(value, kind, role, path)
   return { code: "unknown_check", path }
 }
 

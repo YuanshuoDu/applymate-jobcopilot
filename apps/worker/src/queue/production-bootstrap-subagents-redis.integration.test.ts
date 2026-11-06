@@ -186,6 +186,11 @@ function createSqlFixture(input: { tasks: Map<string, SubagentTaskRecord>; rootT
       if (sql === "BEGIN") { transactionOpen = true; transactionBoundaries.push(sql); return { rows: [], rowCount: 1 } }
       if (sql === "COMMIT" || sql === "ROLLBACK") { transactionOpen = false; transactionBoundaries.push(sql); return { rows: [], rowCount: 1 } }
       if (sql.includes("set_config")) return { rows: [], rowCount: 1 }
+      if (sql.includes('SELECT clock_timestamp() AS "checkedAt"')) return { rows: [{ checkedAt: new Date() }], rowCount: 1 }
+      if (sql.includes('MIN(COALESCE(wait."nextReconcileAt", wait."suspendedAt"))')) {
+        // This composition fixture exercises a root wait; the fairness scanner handles nested child waits only.
+        return { rows: [], rowCount: 0 }
+      }
 
       if (sql.includes('SELECT dispatch."id" AS "dispatchId"') && sql.includes('dispatch."publishedAt" <= CURRENT_TIMESTAMP')) {
         const rows = outbox.flatMap(row => {

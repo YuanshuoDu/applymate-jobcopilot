@@ -509,26 +509,62 @@ describe("agent event redaction", () => {
     const itemId = waitItemId("approval")
     const cancellationRouting: AgentEventRoutingContext = { sessionId, turnId, itemId, taskId: null,
       actor: "system", correlationId: waitId, causationId: "client_70463535-1444-4bba-ae3b-b80578d2dd0e", outboxTopic: "agent.session.event" }
-    const cancellation = { waitKind: "approval", waitId, itemId, toolCallId, outcome: "cancelled", reason: "interrupt" }
-    const cancelled = redactAgentEvent({ type: "approval.resolved", body: "", data: cancellation, routing: cancellationRouting }).data as typeof cancellation
-    expect(cancelled).toEqual(cancellation)
+    const cancellation = { waitKind: "approval", waitId, itemId, turnId, toolCallId, outcome: "cancelled", reason: "interrupt" }
+    for (const taskId of [null, "70463535-1444-4bba-ae3b-b80578d2dd0e"]) {
+      const cancelled = redactAgentEvent({ type: "approval.resolved", body: "", data: cancellation,
+        routing: { ...cancellationRouting, taskId } }).data as typeof cancellation
+      expect(cancelled).toEqual(cancellation)
+    }
 
-    for (const unsafeToolCallId of ["4155550123", "sk_test_private_secret"]) {
-      const unsafe = redactAgentEvent({ type: "approval.resolved", body: "", data: { ...cancellation, toolCallId: unsafeToolCallId }, routing: cancellationRouting }).data as Record<string, unknown>
-      expect(unsafe.waitId).toBe("[REDACTED]")
-      expect(unsafe.itemId).toBe("[REDACTED]")
-      expect(unsafe.toolCallId).toBe("[REDACTED]")
+    const taskScopedRouting = { ...cancellationRouting, taskId: "70463535-1444-4bba-ae3b-b80578d2dd0e" }
+    for (const invalidPayload of [
+      { ...cancellation, extra: true },
+      { ...cancellation, turnId: sessionId },
+      { ...cancellation, itemId: waitItemId("question") },
+      { ...cancellation, toolCallId: "4155550123" },
+      { ...cancellation, toolCallId: "sk_test_private_secret" },
+    ]) {
+      const invalid = redactAgentEvent({ type: "approval.resolved", body: "", data: invalidPayload, routing: taskScopedRouting }).data as Record<string, unknown>
+      expect(invalid.waitId).toBe("[REDACTED]")
+      expect(invalid.itemId).toBe("[REDACTED]")
+      expect(invalid.turnId).toBe("[REDACTED]")
+      expect(invalid.toolCallId).toBe("[REDACTED]")
     }
     for (const wrongRoute of [
       { ...cancellationRouting, actor: "user" as const },
+      { ...cancellationRouting, turnId: "70463535-1444-4bba-ae3b-b80578d2dd10" },
       { ...cancellationRouting, correlationId: "other_approval" },
       { ...cancellationRouting, causationId: null },
+      { ...cancellationRouting, outboxTopic: "agent.turn.wakeup" },
     ]) {
       const invalid = redactAgentEvent({ type: "approval.resolved", body: "", data: cancellation, routing: wrongRoute }).data as typeof cancellation
       expect(invalid.waitId).toBe("[REDACTED]")
       expect(invalid.itemId).toBe("[REDACTED]")
+      expect(invalid.turnId).toBe("[REDACTED]")
       expect(invalid.toolCallId).toBe("[REDACTED]")
     }
+  })
+
+  it("preserves only canonical question cancellation identifiers and rejects private additions", () => {
+    const questionId = "70463535-1444-4bba-ae3b-b80578d2dd0a"
+    const itemId = `agent-wait:question:${questionId}`
+    const cancellation = { waitKind: "question", waitId: questionId, itemId, toolCallId: null, outcome: "cancelled", reason: "interrupt" }
+    const routing: AgentEventRoutingContext = { sessionId: "70463535-1444-4bba-ae3b-b80578d2dd0b", turnId: "70463535-1444-4bba-ae3b-b80578d2dd0c", itemId, taskId: null, actor: "system",
+      correlationId: questionId, causationId: "70463535-1444-4bba-ae3b-b80578d2dd0e", outboxTopic: "agent.session.event" }
+
+    expect(redactAgentEvent({ type: "question.cancelled", body: "", data: cancellation, routing }).data).toEqual(cancellation)
+    for (const invalid of [
+      { ...cancellation, turnId: routing.turnId },
+      { ...cancellation, question: "PRIVATE_QUESTION_BODY" },
+      { ...cancellation, options: ["PRIVATE_OPTION_LABEL"] },
+      { ...cancellation, answer: "PRIVATE_ANSWER" },
+    ]) {
+      const redacted = redactAgentEvent({ type: "question.cancelled", body: "", data: invalid, routing }).data
+      expect(redacted).toBe("[REDACTED]")
+      expect(JSON.stringify(redacted)).not.toMatch(/PRIVATE_QUESTION_BODY|PRIVATE_OPTION_LABEL|PRIVATE_ANSWER/)
+    }
+    expect(redactAgentEvent({ type: "question.cancelled", body: "", data: cancellation,
+      routing: { ...routing, actor: "user" } }).data).toBe("[REDACTED]")
   })
 
   it("redacts IDs from a partial v2 item-shaped object", () => {
@@ -895,6 +931,29 @@ describe("agent event redaction", () => {
       expect(data.toolCallId).toBe(testCase.payload.toolCallId)
       if (testCase.type === "question.answered") expect(data.answer).toBe("[REDACTED]")
     }
+  })
+
+  it("preserves only canonical approval availability metadata while redacting answer material", () => {
+    const payload = {
+      waitKind: "approval", waitId, itemId: waitItemId("approval"), turnId, toolCallId,
+      status: "approved", nextTurnRevision: 9, answerAvailable: false,
+    }
+    const valid = redactAgentEvent({ type: "approval.resolved", body: "", data: payload, routing: route("approval.resolved", payload) }).data as Record<string, unknown>
+    expect(valid.answerAvailable).toBe(false)
+
+    const privateAnswer = redactAgentEvent({ type: "approval.resolved", body: "", data: {
+      ...payload, answer: "candidate@example.test", privateAnswer: "Bearer secret-token",
+    }, routing: route("approval.resolved", payload) }).data as Record<string, unknown>
+    expect(privateAnswer.answerAvailable).toBe("[REDACTED]")
+    expect(privateAnswer.answer).toBe("[REDACTED]")
+    expect(privateAnswer.privateAnswer).toBe("[REDACTED]")
+    expect(JSON.stringify(privateAnswer)).not.toContain("candidate@example.test")
+    expect(JSON.stringify(privateAnswer)).not.toContain("secret-token")
+
+    const foreign = redactAgentEvent({ type: "approval.resolved", body: "", data: payload,
+      routing: { ...route("approval.resolved", payload), correlationId: "foreign_approval" } }).data as Record<string, unknown>
+    expect(foreign.answerAvailable).toBe("[REDACTED]")
+    expect(foreign.waitId).not.toBe(waitId)
   })
 
   it("redacts malformed, foreign, unknown, phone-like, and secret-looking routing values", () => {
