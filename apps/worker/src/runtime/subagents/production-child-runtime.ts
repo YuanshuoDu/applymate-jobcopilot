@@ -34,6 +34,7 @@ import { createPrivateSelectedJobToolExecutor, registerProductionChildWaitTool }
 import { createScheduledGateChildExecutor, isScheduledGateTask } from "./scheduled-gate-child-runtime.js"
 import { SCHEDULED_GATE_TASK_TYPE } from "./scheduled-gate-contract.js"
 import { createScheduledAuditChildExecutor, isScheduledAuditCandidate } from "./scheduled-audit-child-runtime.js"
+import { createEmptyAnalystCandidateAuthorizer } from "./task-graph-empty-analyst-candidate.js"
 export { createProductionChildPolicy } from "./production-child-policy.js"
 
 export type ProductionChildRuntimeOptions = {
@@ -191,8 +192,6 @@ async function defaultTools(pool: pg.Pool, store: TurnEngineStore, task: Subagen
 
 export function childExecutionEnabled(value = process.env.ENABLE_AGENT_CHILD_EXECUTION): boolean { return value === "1" }
 function defaultMailboxReader(pool: pg.Pool): ChildExecutorOptions["mailboxReader"] | undefined {
-  // Keep lightweight construction fixtures usable; a real pg.Pool exposes
-  // both methods and therefore gets the server-owned reader.
   const candidate = pool as unknown as { readonly connect?: unknown; readonly query?: unknown }
   if (typeof candidate.connect !== "function" || typeof candidate.query !== "function") return undefined
   return new PgCoordinationStore(pool)
@@ -231,6 +230,7 @@ export function createProductionChildExecutor(options: ProductionChildRuntimeOpt
       const authorizeUsage = options.authorizeUsage ?? createWorkerUsageAuthorizer()
       genericExecutor = createChildExecutor({
         store: bindStore(engineStore), treeBudget, authorizeUsage,
+        authorizeEmptyAnalystCandidate: createEmptyAnalystCandidateAuthorizer(options.pool),
         modelRuntimeFactory: options.modelRuntimeFactory,
         toolRuntimeFactory: options.toolRuntimeFactory ?? (({ task, lease: childLease, owner }) => defaultTools(options.pool, engineStore, task, childLease, owner, options.jobDiscoveryClient, {
           authorizeUsage, treeBudget, modelRuntimeFactory: options.modelRuntimeFactory,
