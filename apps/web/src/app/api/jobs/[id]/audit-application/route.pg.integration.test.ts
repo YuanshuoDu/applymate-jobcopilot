@@ -284,13 +284,28 @@ integration('application audit ordering with disposable PostgreSQL', () => {
   }, 30_000)
 
   it.each(['role', 'company', 'description'] as const)('marks an existing audit stale after the job %s changes', async field => {
+    const originalJob = await clientA.job.findUniqueOrThrow({ where: { id: 'job-1' } })
     await clientB.job.update({ where: { id: 'job-1' }, data: { [field]: `Changed ${field}` } })
     const read = await invoke('read', { client: clientB, userId: 'owner-a' })
     expect(read.status).toBe(200)
     expect(await read.json()).toEqual({ state: 'stale' })
     expect((await invoke('download', { client: clientB, userId: 'owner-a' })).status).toBe(409)
     expect((await invoke('print', { client: clientB, userId: 'owner-a' })).status).toBe(409)
+
+    // Use an actually repairable result so a 409 proves the job-basis gate,
+    // rather than the earlier 400 guard for pass findings.
+    await clientB.job.update({ where: { id: 'job-1' }, data: { [field]: originalJob[field] } })
+    const review = await invoke('audit', { client: clientA, userId: 'owner-a', review: true, proposedValue: 'Synthetic corrected summary' })
+    expect(review.status).toBe(200)
+    expect((await review.json()).findings[0]).toMatchObject({ area: 'resume', severity: 'warning', target: 'summary', proposedValue: 'Synthetic corrected summary' })
+    const beforeResume = await clientA.resume.findUniqueOrThrow({ where: { id: 'resume-1' } })
+    const beforeVersions = await clientA.resumeVersion.count({ where: { resumeId: 'resume-1', userId: 'owner-a' } })
+    await clientB.job.update({ where: { id: 'job-1' }, data: { [field]: `Changed ${field}` } })
     expect((await invoke('repair', { client: clientB, userId: 'owner-a' })).status).toBe(409)
+    const afterResume = await clientA.resume.findUniqueOrThrow({ where: { id: 'resume-1' } })
+    expect(afterResume.content).toEqual(beforeResume.content)
+    expect(afterResume.updatedAt).toEqual(beforeResume.updatedAt)
+    expect(await clientA.resumeVersion.count({ where: { resumeId: 'resume-1', userId: 'owner-a' } })).toBe(beforeVersions)
   })
 
   async function seedLetter() {
