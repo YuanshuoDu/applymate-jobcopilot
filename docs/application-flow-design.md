@@ -461,6 +461,35 @@ It does not provide a reliable, submission-bound snapshot of both documents.
 Preserving and retrieving the exact historical materials requires a separate
 storage and lifecycle design; do not present the current preview as that snapshot.
 
+### Follow-up design: historical application materials
+
+This is a proposed, separate design, not an implemented capability of this PR.
+The current scope excludes schema and Agent/Worker changes. A future design
+must capture immutable document content and presentation settings, or durable
+content-addressed files, and bind them to the specific user, job, application
+record and relevant task or submission attempt. Store the material identity,
+capture time, source and a content digest alongside each reference; authorize
+retrieval within the same user and application scope.
+
+For a manual application, a snapshot at the time the user records a submission
+can establish only what was selected in ApplyMate at that moment. The user may
+have uploaded different files on the employer's website. Label that distinction
+clearly; record what was actually uploaded only when supported by explicit user
+evidence. Opening a website or downloading a file remains distinct from submission.
+For an Agent application, bind materials to the real upload and approval lineage
+using the existing execution ownership and authorization boundaries; an approval
+or selected document ID alone does not establish which bytes were uploaded.
+
+Concurrent edits and captures need an atomic version decision with cooperating
+writers, so a later edit cannot silently change a recorded snapshot. Define
+fail-closed handling for missing, stale, failed or uncertain capture without
+automatically retrying submission or inventing a receipt. Historical records
+without sufficient evidence must remain unknown rather than being reconstructed
+from current materials. The design must also specify retention and user deletion,
+privacy settings, access control, and what remains visible when a referenced
+document or application is deleted; no content should be retained merely to
+claim a history that was never captured.
+
 ## 9. Dashboard and Inbox
 
 Dashboard puts recent task attention before Momentum. It shows at most three
