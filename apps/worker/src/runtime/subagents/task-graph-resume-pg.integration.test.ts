@@ -14611,8 +14611,22 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
             const result = record(analyst.rows[0]?.result), report = record(result?.taskGraphVerificationReport)
             const bindings = Array.isArray(report?.dependencyBindings) ? report.dependencyBindings.map(record) : []
             if (!result || !report || bindings.length !== 2 || !bindings[0] || !bindings[1]) throw new Error("Empty Analyst private source bindings were unavailable for replay canary")
-            const scoutABindingIndex = bindings.findIndex(binding => binding?.taskId === scoutATaskId)
-            if (scoutABindingIndex < 0 || bindings.some(binding => binding?.taskId === scoutBTaskId)) throw new Error("Empty Analyst private source bindings did not match the expected Scout identities")
+            const extantScouts = await client.query<{ id: string }>(`SELECT task."id" FROM "sub_agent_tasks" AS task
+              JOIN "agent_sessions" AS session ON session."id" = task."sessionId"
+              WHERE task."id" = ANY($1::text[]) AND task."sessionId" = $2 AND task."turnId" = $3 AND task."rootTaskId" = $4
+                AND task."parentTaskId" = $4 AND task."status" = 'completed' AND session."userId" = $5` ,
+            [[scoutATaskId, scoutBTaskId], value.sessionId, value.turnId, rootTaskId, value.userId])
+            const extantScoutIds = extantScouts.rows.map(row => row.id), expectedScoutIds = [scoutATaskId, scoutBTaskId].sort()
+            const scoutABindings = bindings.map((binding, index) => ({ binding, index }))
+              .filter(entry => entry.binding?.nodeKey === "scout-a" && entry.binding.taskId === scoutATaskId)
+            const scoutBBindings = bindings.filter(binding => binding?.nodeKey === "scout-b" && binding.taskId === scoutBTaskId)
+            if (scoutATaskId === scoutBTaskId || new Set(extantScoutIds).size !== 2
+              || extantScoutIds.sort().some((id, index) => id !== expectedScoutIds[index])
+              || extantScoutIds.length !== expectedScoutIds.length
+              || scoutABindings.length !== 1 || scoutBBindings.length !== 1) {
+              throw new Error("Empty Analyst private source bindings did not uniquely match the extant Scout identities")
+            }
+            const scoutABindingIndex = scoutABindings[0]!.index
             const changedResult = { ...result, taskGraphVerificationReport: { ...report, dependencyBindings: bindings.map((binding, index) =>
               index === scoutABindingIndex ? { ...binding, taskId: scoutBTaskId } : binding) } }
             const update = await client.query(`UPDATE "sub_agent_tasks" SET "result" = $1::jsonb WHERE "id" = $2 AND "sessionId" = $3
