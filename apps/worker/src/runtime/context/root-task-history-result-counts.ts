@@ -1,5 +1,6 @@
 const PROJECTION_SCHEMA = "agent-harness.v2.task-graph.result-projection"
 const MAX_SAMPLES = 3
+const MAX_HISTORY_NODES = 8
 const SOURCES = new Set(["greenhouse", "lever", "workday", "smartrecruiters", "personio", "other"])
 const EVIDENCE_KINDS = new Set(["job", "persona", "resume", "source"])
 const SAFE_JOB_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/
@@ -16,6 +17,21 @@ function exactDataRecord(value: unknown, keys: string): Row | undefined {
     const prototype = Object.getPrototypeOf(value), own = Reflect.ownKeys(value)
     if ((prototype !== Object.prototype && prototype !== null) || own.some(key => typeof key !== "string")
       || [...own].sort().join(",") !== keys) return undefined
+    const descriptors = Object.getOwnPropertyDescriptors(value), result: Row = Object.create(null) as Row
+    for (const key of own as string[]) {
+      const descriptor = descriptors[key]
+      if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) return undefined
+      result[key] = descriptor.value
+    }
+    return result
+  } catch { return undefined }
+}
+
+function dataRecord(value: unknown): Row | undefined {
+  try {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
+    const prototype = Object.getPrototypeOf(value), own = Reflect.ownKeys(value)
+    if ((prototype !== Object.prototype && prototype !== null) || own.some(key => typeof key !== "string")) return undefined
     const descriptors = Object.getOwnPropertyDescriptors(value), result: Row = Object.create(null) as Row
     for (const key of own as string[]) {
       const descriptor = descriptors[key]
@@ -82,4 +98,23 @@ export function parseRootTaskHistoryReportedOutput(
   const findings = safeArray(item.findings, MAX_SAMPLES)
   if (!findings || findings.length !== Math.min(item.findingCount, MAX_SAMPLES) || findings.some(value => !analystSample(value))) return undefined
   return { role: "analyst", findingCount: item.findingCount, resultStatus: item.status }
+}
+
+
+/** Derives closed role/count facts from the same validated historical graph. */
+export function parseRootTaskHistoryReportedOutputsFromGraph(
+  value: unknown,
+): readonly (RootTaskHistoryReportedOutput | undefined)[] | undefined {
+  const graph = exactDataRecord(value, "nodes,revision")
+    ?? exactDataRecord(value, "discoveryTurnEligibility,nodes,revision")
+  if (!graph || !Number.isSafeInteger(graph.revision) || Number(graph.revision) < 0
+    || Object.hasOwn(graph, "discoveryTurnEligibility") && graph.discoveryTurnEligibility !== "ordinary") return undefined
+  const nodes = safeArray(graph.nodes, MAX_HISTORY_NODES)
+  if (!nodes || nodes.length < 1) return undefined
+  return nodes.map(value => {
+    const node = dataRecord(value)
+    if (!node || node.status !== "completed") return undefined
+    const role = node.templateId === "scout" || node.templateId === "analyst" ? node.templateId : undefined
+    return role ? parseRootTaskHistoryReportedOutput(node.resultProjection, role) : undefined
+  })
 }
