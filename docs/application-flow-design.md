@@ -548,12 +548,14 @@ One fixture opens the original Agent session from an application, answers a mock
 question, reviews a mock approval and displays a simulated unverified outcome;
 its state changes are injected by the fixture and page reloads. These checks prove
 UI wiring, not Worker execution, authenticated database, live ATS or production behavior.
-An earlier isolated real-authentication test found that session creation returned
-500 after persisting a session; the session serialization fix was subsequently
-merged. Later isolated tests reached a synthetic turn, but the native question still
-failed with `invalid_output`, and approval could remain visible after its decision
-was recorded. The question, approval and execution journey remains unverified.
-These are disposable test observations, not verification of the deployed environment.
+Separate isolated real-authentication fixtures now exercise a synthetic Agent
+question and an approval against a disposable database. The question fixture also
+opens the original session from a synthetically linked application and answers the
+question in that same session. The link is seeded by the fixture; it does not prove
+that a real application task produced the question. Earlier runs exposed session
+serialization, question and approval failures; passing later fixtures does not
+establish their causes. The full continuous application-to-execution journey, a
+real model or ATS, production behavior and an employer receipt remain unverified.
 
 Worker runtime, Agent-owned layout, protocol, policies, mutation APIs, schema and
 roadmap remain under their existing owners. No new state machine, persistent

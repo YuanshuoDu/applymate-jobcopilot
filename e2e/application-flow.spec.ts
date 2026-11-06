@@ -2764,6 +2764,91 @@ test('unavailable task state does not expose a new preparation action', async ({
   expect(state.unexpected).toEqual([])
 })
 
+for (const coverage of ['loading', 'unavailable', 'limited'] as const) {
+  test(`application next action reflects ${coverage} task coverage`, async ({ page }) => {
+    const state = await install(page, { firstPreparation: true, holdFirstTaskRead: coverage === 'loading',
+      taskStatus: coverage === 'loading' ? 'waiting_for_user' : undefined,
+      taskFailure: coverage === 'unavailable', taskLimited: coverage === 'limited' })
+    try {
+      await open(page)
+      const drawer = page.getByRole('dialog')
+      const title = coverage === 'loading' ? /^(Checking task status|正在检查任务状态)$/
+        : coverage === 'unavailable' ? /^(Task status unavailable|暂时无法读取任务状态)$/
+          : /^(Task coverage is limited|任务覆盖范围有限)$/
+      await expect(drawer.getByText(title, { exact: true })).toBeVisible()
+      await expect(drawer.getByText(/^(Tailor your resume for this job|为该职位定制简历)$/)).toHaveCount(0)
+      await expect(drawer.getByRole('button', { name: /^(Prepare application materials|准备申请材料)$/ })).toHaveCount(0)
+      if (coverage === 'loading') {
+        await expect(drawer.getByText(/Checking the latest task status\. Please wait|正在检查最新任务状态，请稍候/).first()).toBeVisible()
+        await expect(drawer.getByText(title, { exact: true }).locator('..').locator(':scope > div[role="status"]').getByRole('button')).toHaveCount(0)
+        await expect(drawer.getByRole('button', { name: /^(Refresh task status|刷新任务状态)$/ })).toHaveCount(0)
+        state.releaseFirstTaskRead()
+        await expect(drawer.getByText(/^(Application progress|申请进展)$/)).toBeVisible()
+        await expect(drawer.getByRole('link', { name: /Continue in the original task|进入原任务处理/ })).toHaveCount(1)
+      } else {
+        const readsBefore = state.taskReads
+        await drawer.getByRole('button', { name: /^(Refresh status|刷新状态)$/ }).first().click()
+        await expect.poll(() => state.taskReads).toBeGreaterThan(readsBefore)
+        await expect(drawer.getByText(title, { exact: true })).toBeVisible()
+      }
+      expect(state.writes).toEqual([])
+      expect(state.agentRequests.filter(item => item.method === 'POST')).toEqual([])
+      expect(state.unexpected).toEqual([])
+    } finally { state.releaseFirstTaskRead() }
+  })
+}
+
+test('recorded application keeps its existing record as the next action when task status is unavailable', async ({ page }) => {
+  const state = await install(page, { recordedInitially: true, taskFailure: true })
+  await open(page)
+  const drawer = page.getByRole('dialog')
+  await expect(drawer.getByText(/^(Application record|申请记录)$/)).toBeVisible()
+  await expect(drawer.getByText(/^(Task status unavailable|暂时无法读取任务状态)$/)).toHaveCount(0)
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+for (const status of ['applied', 'interview'] as const) {
+  for (const coverage of ['unavailable', 'limited'] as const) {
+    test(`${status} application can refresh ${coverage} task status without changing its record`, async ({ page }) => {
+      const state = await install(page, { taskFailure: coverage === 'unavailable', taskLimited: coverage === 'limited' })
+      state.job.status = status
+      await open(page)
+      const drawer = page.getByRole('dialog')
+      const title = status === 'applied' ? /^(Application record|申请记录)$/ : /^(Review application status|核对申请状态)$/
+      await expect(drawer.getByText(title)).toBeVisible()
+      await expect(drawer).toContainText(/The Agent task status cannot be confirmed|无法确认此职位的 Agent 任务状态/)
+      const refresh = drawer.getByRole('button', { name: /^(Refresh task status|刷新任务状态)$/ })
+      const readsBefore = state.taskReads
+      await refresh.click()
+      await expect.poll(() => state.taskReads).toBeGreaterThan(readsBefore)
+      await expect(drawer.getByText(title)).toBeVisible()
+      await expect(refresh).toBeVisible()
+      await expect(drawer).not.toContainText(/No Agent task is linked to this job|此职位没有关联的 Agent 任务/)
+      expect(state.writes).toEqual([])
+      expect(state.agentRequests.filter(item => item.method === 'POST')).toEqual([])
+      expect(state.unexpected).toEqual([])
+    })
+  }
+}
+
+test('known task remains the next action when recent task coverage is limited', async ({ page }) => {
+  const state = await install(page)
+  await page.route('**/api/agent/application-tasks', route => route.fulfill({ json: { tasks: Array.from({ length: 100 }, (_, i) => ({
+    id: `task-${i}`, userId: 'fixture-user', jobId: i === 0 ? 'outside-page' : `other-job-${i}`,
+    sessionId: `session-${i}`, status: i === 0 ? 'waiting_for_user' : 'filling',
+    checkpoint: i === 0 ? 'form_answer_required' : null, updatedAt: time,
+    job: { company: 'Fixture Employer', role: 'Application flow engineer' },
+  })) } }))
+  await open(page)
+  const drawer = page.getByRole('dialog')
+  await expect(drawer.getByText(/^(Application progress|申请进展)$/)).toBeVisible()
+  await expect(drawer.getByRole('link', { name: /Continue in the original task|进入原任务处理/ })).toHaveCount(1)
+  await expect(drawer.getByText(/^(Task coverage is limited|任务覆盖范围有限)$/)).toHaveCount(0)
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
 for (const surface of ['jobs', 'dashboard'] as const) {
   test(`${surface} keeps the newer task status when an older read finishes last`, async ({ page }) => {
     const state = await install(page, { taskStatus: 'waiting_for_user', holdFirstTaskRead: true })
@@ -6178,6 +6263,8 @@ for (const previousTaskState of ['unavailable', 'limited'] as const) {
     await open(page)
     await failureRead
     expect(taskReads).toBeGreaterThanOrEqual(2)
+    await expect(page.getByRole('button', { name: /^(Refresh task status|刷新任务状态)$/ })).toHaveCount(0)
+    await expect(page.getByRole('button', { name: /Refresh record status|刷新记录状态/ })).toHaveCount(1)
     phase = 2
     const recoveredRead = page.waitForResponse(response => response.url().includes('/api/agent/application-tasks'))
     await page.getByRole('button', { name: /Refresh record status|刷新记录状态/ }).click()
