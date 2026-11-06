@@ -85,7 +85,7 @@ export const CHILD_WAIT_STEP_TOOL_CHAIN_EXCEPTION_SQL = `(
     AND toolResult."turnId" = callItem."turnId" AND toolResult."taskId" = callItem."taskId"
     AND toolResult."stepId" = proof.value->'stepToolChain'->>'stepId' AND toolResult."type" = 'tool_result')
     = jsonb_array_length(${calls})
-  AND (SELECT COUNT(DISTINCT row."id") FROM jsonb_array_elements(${calls}) AS callProof(value)
+  AND (SELECT COUNT(DISTINCT proofCall."id") FROM jsonb_array_elements(${calls}) AS callProof(value)
     JOIN "agent_items" AS proofCall ON proofCall."id" = callProof.value->>'callItemId' AND proofCall."sessionId" = callItem."sessionId"
       AND proofCall."turnId" = callItem."turnId" AND proofCall."taskId" = callItem."taskId" AND proofCall."stepId" = proof.value->'stepToolChain'->>'stepId'
       AND proofCall."type" = 'tool_call' AND proofCall."content"->>'toolCallId' = callProof.value->>'toolCallId')

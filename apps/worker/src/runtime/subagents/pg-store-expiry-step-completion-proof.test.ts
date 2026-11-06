@@ -31,6 +31,11 @@ describe("wait claim result event set", () => {
     expect(CHILD_WAIT_STEP_TOOL_CHAIN_EXCEPTION_SQL).toContain("jsonb_array_length(CASE WHEN jsonb_typeof(proof.value->'stepToolChain'->'calls') = 'array'")
   })
 
+  it("counts distinct proof calls through the scoped call item alias", () => {
+    expect(CHILD_WAIT_STEP_TOOL_CHAIN_EXCEPTION_SQL).toContain('SELECT COUNT(DISTINCT proofCall."id") FROM jsonb_array_elements')
+    expect(CHILD_WAIT_STEP_TOOL_CHAIN_EXCEPTION_SQL).toContain("JOIN \"agent_items\" AS proofCall ON proofCall.\"id\" = callProof.value->>'callItemId'")
+    expect(CHILD_WAIT_STEP_TOOL_CHAIN_EXCEPTION_SQL).not.toContain('COUNT(DISTINCT row."id")')
+  })
   it("selects only one canonical pair and at most one direct descendant", () => {
     expect(partitionWaitResultEvents([resultStarted, resultCompleted], [resultStarted.idempotencyKey, resultCompleted.idempotencyKey]))
       .toEqual({ started: resultStarted, completed: resultCompleted })
