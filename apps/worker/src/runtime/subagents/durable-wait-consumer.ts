@@ -198,20 +198,21 @@ async function storedOutcome(client: Queryable, scope: Parameters<typeof readDur
     const node = snapshot?.nodes.find(candidate => candidate.taskId === task.taskId), hasReport = Object.prototype.hasOwnProperty.call(task, "verificationReport"), hasReceipt = Object.prototype.hasOwnProperty.call(task, "repairReceipt")
     let criterionIds: readonly string[] | undefined = node?.verificationDisposition === "typed" && node.verification ? node.verification.criteria.map(item => item.id) : undefined, historicalReport: TaskGraphVerificationReport | undefined
     if (!node && hasReport && !hasReceipt && childStatus === "failed" && rowStatus === "failed") {
-      const proof = await readConsumedTaskGraphFailureReport(client, { scope, task: authoritative, archivedReport: task.verificationReport })
-      if (!proof) return null; criterionIds = proof.criterionIds; historicalReport = proof.report
+      const proof = await readConsumedTaskGraphFailureReport(client, { scope, task: authoritative, archivedReport: task.verificationReport }); if (!proof) return null; criterionIds = proof.criterionIds; historicalReport = proof.report
     }
-    const verificationReport = hasReport && criterionIds ? parseTaskGraphVerificationReport(task.verificationReport, criterionIds) : undefined
-    if (hasReport && !verificationReport) return null
-    if (historicalReport && canonicalTaskGraphJson(verificationReport) !== canonicalTaskGraphJson(historicalReport)) return null
-    if (hasReport && !taskGraphVerificationReportMatchesStatus(verificationReport!, childStatus)
-      || criterionIds && (childStatus === "completed" || childStatus === "failed") && !verificationReport) return null
-    if (dependencyTaskIds.has(task.taskId) && hasReport && (childStatus !== rowStatus || !verificationReport
-      || !durableWaitReportMatchesCurrent(snapshot, task.taskId, task.verificationReport, authoritative.result))) return null
+    const currentPrivateReport = dependencyTaskIds.has(task.taskId) && hasReport ? record(record(authoritative.result)?.taskGraphVerificationReport) : null,
+      currentPublicReport = currentPrivateReport && criterionIds ? parseTaskGraphVerificationReport(currentPrivateReport, criterionIds) : undefined,
+      archivedReport = hasReport && criterionIds ? parseTaskGraphVerificationReport(task.verificationReport, criterionIds) : undefined,
+      verificationReport = currentPublicReport ?? archivedReport
+    if (hasReport && (!verificationReport || !taskGraphVerificationReportMatchesStatus(verificationReport, childStatus))
+      || criterionIds && (childStatus === "completed" || childStatus === "failed") && !verificationReport
+      || historicalReport && canonicalTaskGraphJson(verificationReport) !== canonicalTaskGraphJson(historicalReport)) return null
+    if (dependencyTaskIds.has(task.taskId) && hasReport && (childStatus !== rowStatus || !currentPrivateReport || !currentPublicReport
+      || canonicalTaskGraphJson(record(task.verificationReport)) !== canonicalTaskGraphJson(currentPublicReport)
+      || !durableWaitReportMatchesCurrent(snapshot, task.taskId, currentPrivateReport, authoritative.result))) return null
     const repairOf = node?.repairOf?.graphRootTaskId === rootTaskId ? node.repairOf : undefined
     const repairReceipt = hasReceipt && node ? parseTaskGraphRepairReceipt(task.repairReceipt, { repairOf, repairNodeKey: node.key, repairTaskId: node.taskId, report: verificationReport }) : undefined
-    if (hasReceipt && !repairReceipt) return null
-    if (node?.repairOf && childStatus === "completed" && verificationReport?.status === "passed" && !repairReceipt) return null
+    if (hasReceipt && !repairReceipt || node?.repairOf && childStatus === "completed" && verificationReport?.status === "passed" && !repairReceipt) return null
     states.push({ taskId: task.taskId, status: childStatus, role, result: resultInfo(Object.prototype.hasOwnProperty.call(task, "result") ? task.result : null), failureReason: failure(task.failureReason), ...(verificationReport ? { verificationReport } : {}), ...(repairReceipt ? { repairReceipt } : {}) })
   }
   return seen.size === targetIds.length ? makeOutcome(waitId, status, targetIds, matchedIds, states, currentMode) : null

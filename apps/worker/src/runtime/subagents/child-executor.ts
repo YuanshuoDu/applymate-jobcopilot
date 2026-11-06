@@ -48,6 +48,7 @@ export type ChildExecutorOptions = {
   readonly durableWaitResumeCommitter?: (lease: SubagentLease, wait: DurableWaitResume, nextStepOrdinal: number) => Promise<boolean | void>
   /** Restores only durable checkpoints from a completed step in this exact attempt. */
   readonly sameAttemptContinuationLoader?: ChildSameAttemptResumeLoader
+  readonly authorizeEmptyAnalystCandidate?: import("./task-graph-empty-analyst-candidate.js").EmptyAnalystCandidateLeaseAuthorizer
   readonly now?: () => Date
 }
 
@@ -193,25 +194,22 @@ export function createChildExecutor(options: ChildExecutorOptions): (input: { le
       }
       return toolResult
     }
-    const contextBuilder = createChildContextBuilder(
-      lease, snapshot, options.mailboxReader,
+    const contextBuilder = createChildContextBuilder(lease, snapshot, options.mailboxReader,
       lease.role === "writer" || lease.role === "reviewer" ? runtime.selectedJobArtifactContext?.transientSources : undefined,
-      lease.role === "writer" ? runtime.writerReviewRevision?.feedback : undefined,
-      continuation?.missingMessageIds ?? [],
-    )
+      lease.role === "writer" ? runtime.writerReviewRevision?.feedback : undefined, continuation?.missingMessageIds ?? [])
     const result = await runTurnExecutionLoop({
       identity: owner, scope: { userId: lease.userId }, goal: lease.goal, snapshot,
       contextBuilder, store: acknowledgeDurableWaitAtContinuationStart(safeStore, lease, durableWaitResume, options.durableWaitResumeCommitter, step => durableWaitReplay?.acknowledgeContinuation(step)), model, tools: definitions,
       executeTool, actorRole: policy.actorRole, capabilities: policy.capabilities,
       validateToolArguments: runtime.validateArguments, signal: lease.signal, now: options.now, publishReasoningSummary: false,
       budget,
-      // A retry is a new durable attempt. Keep IDs deterministic within that
-      // attempt while preventing attempt 1 and attempt 2 collisions.
+      // A retry is a new durable attempt, so generated IDs include its attempt number.
       idFactory: prefix => `${prefix}:attempt:${lease.attemptCount}`,
       resume, ...childWaitReplayExecutionOptions(durableWaitReplay, restored?.childWaitClaimRecovery, restored?.childWaitOrphanRecovery),
       isOwnershipLost: (error, signal) => signal.aborted || error instanceof SubagentLeaseError,
       signalError: () => new Error("subagent_lease_lost"),
       ...(adapter.profile.nativeTools && adapter.profile.structuredOutput && structuredRole ? { outputSchema: structuredResultOutputSchema(structuredRole) } : {}),
+      ...(structuredRole === "analyst" && options.authorizeEmptyAnalystCandidate ? { authorizeEmptyAnalystCandidate: input => options.authorizeEmptyAnalystCandidate!({ lease: executionLease, ...input }) } : {}),
     })
     const childResult = {
       status: result.status,

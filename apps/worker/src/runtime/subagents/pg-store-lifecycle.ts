@@ -127,14 +127,16 @@ export async function prepareTaskGraphFinish(client: pg.PoolClient, input: { tas
   }
   const evidence = node.verificationDisposition === "typed" && node.verification
     ? await verifyTaskGraphNodeEvidence(client, { scope: { ...graph.scope, taskId: input.taskId, attemptCount: input.attemptCount }, snapshot: graph.snapshot, node, structuredResult,
-      ...(dependencyKeys.length && dependencyProof ? { dependencies: dependencyProof.projections } : {}) })
+      ...(dependencyKeys.length && dependencyProof ? { dependencies: dependencyProof.projections, dependencyBindings: dependencyProof.bindings } : {}),
+      graphRevision: graph.expectedRevision })
     : { verified: false, report: unverifiedFailureReport(node) }
   const typedPass = node.verificationDisposition === "typed" && evidence.verified && evidence.report.status === "passed"
   const repairReceipt = typedPass && node.repairOf ? await validateRepairTarget(client, graph, node, input.taskId, evidence.report) : null
   const repairRejected = typedPass && Boolean(node.repairOf) && !repairReceipt
   const report = repairRejected ? { ...evidence.report, status: "unverified" as const, reasonCode: "repair_target_unresolved", evidenceDigest: null } : evidence.report
   const boundResult = "structuredResult" in evidence ? evidence.structuredResult : undefined
-  const reportWithDependencies = typedPass && !repairRejected && dependencyKeys.length && dependencyProof
+  const persistDependencyBindings = "persistDependencyBindings" in evidence && evidence.persistDependencyBindings === true
+  const reportWithDependencies = (typedPass || persistDependencyBindings) && !repairRejected && dependencyKeys.length && dependencyProof
     ? { ...report, dependencyBindings: dependencyProof.bindings } : report
   const safeResult = taskGraphVerificationResult(safeInputResult, reportWithDependencies, boundResult, repairReceipt)
   if (typedPass && !repairRejected) return { graph, status: input.status, failureReason: input.failureReason, result: finalizedResult(safeResult, input.status), reconcileDependents: true }

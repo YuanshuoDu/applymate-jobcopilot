@@ -10,6 +10,7 @@ import type { InputClaimStore, InputClaimTransaction } from "./context/input-cla
 import { buildModelRequest } from "./turns/turn-engine-messages.js"
 import type { TurnLease } from "./turns/lease.js"
 import { TASK_GRAPH_VERIFIER_VERSION } from "./subagents/task-graph-pg-verification.js"
+import { TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION } from "./subagents/task-graph-verification-report.js"
 import { TASK_GRAPH_CHILD_DEADLINE_FAILURE_REASON } from "./subagents/task-graph-child-deadline.js"
 import { TASK_GRAPH_REPAIR_RECEIPT_SCHEMA_VERSION } from "./subagents/task-graph-command-port.js"
 import { applyCompletionRecovery, tagTaskGraphRepairRecovery } from "./turns/completion-recovery-context.js"
@@ -835,6 +836,51 @@ describe("TaskGraph turn observation", () => {
       .toThrow("task_graph_current_verification_too_large")
   })
 
+  it("projects only the exact redacted empty-Analyst v2 report as an untrusted current observation", () => {
+    const scoutVerification: TaskGraphVerificationContract = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "scout",
+      criteria: [{ id: "candidate-count", check: { kind: "candidate_count_gte", minimum: 1 } }] }
+    const analystVerification: TaskGraphVerificationContract = { schemaVersion: TASK_GRAPH_VERIFICATION_SCHEMA_VERSION, role: "analyst", criteria: [
+      { id: "source-coverage", check: { kind: "findings_cover_each_scout_candidates_gte", dependencyNodeKeys: ["scout-a", "scout-b"], minimumPercent: 100 } },
+      { id: "finding-count", check: { kind: "finding_count_gte", minimum: 1 } },
+    ] }
+    const scoutReport = { verifierVersion: TASK_GRAPH_VERIFIER_VERSION, status: "passed", reasonCode: "criteria_met",
+      criteria: [{ criterionId: "candidate-count", status: "passed", reasonCode: "criteria_met" }], evidenceDigest: "a".repeat(64), resultDigest: "b".repeat(64) } as const
+    const publicReport = { verifierVersion: TASK_GRAPH_EMPTY_ANALYST_VERIFIER_VERSION, status: "failed", reasonCode: "criterion_not_met",
+      criteria: [
+        { criterionId: "source-coverage", status: "failed", reasonCode: "criterion_not_met" },
+        { criterionId: "finding-count", status: "failed", reasonCode: "criterion_not_met" },
+      ], evidenceDigest: "c".repeat(64), resultDigest: "d".repeat(64) } as const
+    const sourceNode = (key: string, taskId: string) => ({
+      ...state.nodes[0]!, key, taskId, templateId: "scout", dependsOn: [], status: "completed" as const, readiness: "terminal" as const,
+      verificationCriterionIds: ["candidate-count"], verification: scoutVerification, verificationReport: scoutReport,
+    })
+    const analystNode = {
+      ...state.nodes[0]!, key: "analysis", taskId: "task-analyst", templateId: "analyst", dependsOn: ["scout-a", "scout-b"],
+      status: "failed" as const, readiness: "terminal" as const,
+      verificationCriterionIds: ["source-coverage", "finding-count"], verification: analystVerification, verificationReport: publicReport,
+    }
+    const current = { revision: 9, nodes: [sourceNode("scout-a", "task-scout-a"), sourceNode("scout-b", "task-scout-b"), analystNode] } as TaskGraphCurrentState
+    const merged = mergeTaskGraphCurrentObservation(snapshot(), current)
+    const observation = merged.toolObservations.find(item => item.id === "task-graph-current")?.content as { nodes: Array<Record<string, unknown>> }
+    const projected = observation.nodes.find(node => node.key === "analysis")!
+    const report = projected.verificationReport as Record<string, unknown>
+    expect(report).toEqual(publicReport)
+    expect(Object.keys(report).sort()).toEqual(["criteria", "evidenceDigest", "reasonCode", "resultDigest", "status", "verifierVersion"])
+    expect(JSON.stringify(report)).not.toContain("dependencyBindings")
+    expect(JSON.stringify(report)).not.toContain("task-scout-a")
+    expect(JSON.stringify(report)).not.toContain("task-scout-b")
+
+    const reject = (verificationReport: unknown) => mergeTaskGraphCurrentObservation(snapshot(), {
+      ...current, nodes: [current.nodes[0]!, current.nodes[1]!, { ...analystNode, verificationReport } as never],
+    })
+    expect(() => reject({ ...publicReport, dependencyBindings: [] })).toThrow("task_graph_current_state_invalid:verification")
+    expect(() => reject({ ...publicReport, unexpected: true })).toThrow("task_graph_current_state_invalid:verification")
+    expect(() => reject({ ...publicReport, status: "passed" })).toThrow("task_graph_current_state_invalid:verification")
+    expect(() => reject({ ...publicReport, reasonCode: "reported_score_below_minimum" })).toThrow("task_graph_current_state_invalid:verification")
+    expect(() => mergeTaskGraphCurrentObservation(snapshot(), { ...current,
+      nodes: [current.nodes[0]!, current.nodes[1]!, { ...analystNode, templateId: "scout" } as never],
+    })).toThrow("task_graph_current_state_invalid:verification")
+  })
   it("keeps repair receipts separate and bound to a passing repair report", () => {
     const report = { ...state.nodes[0]!.verificationReport!, status: "passed" as const, reasonCode: "criteria_met" as const, criteria: [{ criterionId: "candidate-count", status: "passed" as const, reasonCode: "criteria_met" as const }], evidenceDigest: "b".repeat(64) }
     const repairOf = { graphRootTaskId: "root-1", nodeKey: "original", taskId: "target-1", criterionIds: ["candidate-count"] }
