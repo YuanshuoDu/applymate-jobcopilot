@@ -255,6 +255,13 @@ application-pack download also requires the server to verify the signed audit
 receipt and the exact selected document versions. Missing or malformed revision
 information does not establish readiness.
 
+When Resume is opened from an application, the original job and resume are
+verified together before showing job-specific checks or allowing confirmation.
+If another job shares that resume, it is not substituted for the original; if
+the original job or its selected materials cannot be verified, the user can
+refresh or return to the application. This read-time check does not close the
+separate cross-tab race between reading a material selection and writing it.
+
 Once the server commits a review registration, other pages see its pending or
 failed state and download/print cannot reuse an older pass. An explicitly started
 new review supersedes the previous operation; an older completion cannot publish.

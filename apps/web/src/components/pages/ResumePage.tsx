@@ -720,6 +720,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   }
   const [contentValidated, setContentValidated] = useState(false)
   const [contentVerified, setContentVerifiedState] = useState(false)
+  const [verifiedResumeTarget, setVerifiedResumeTarget] = useState<{ userId: string; resumeId: string; targetJobId: string | null } | null>(null)
   const contentVerifiedRef = useRef(false)
   function setContentVerified(value: boolean) {
     contentVerifiedRef.current = value
@@ -1153,7 +1154,10 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
         return resume
       })
       .then(resume => {
-        if (!controller.signal.aborted && requestUserId === resumeUserIdRef.current && selectedResumeId === selectedResumeIdRef.current) validated = true
+        if (!controller.signal.aborted && requestUserId && requestUserId === resumeUserIdRef.current && selectedResumeId === selectedResumeIdRef.current) {
+          validated = true
+          setVerifiedResumeTarget({ userId: requestUserId, resumeId: selectedResumeId, targetJobId: typeof resume.targetJobId === 'string' ? resume.targetJobId : null })
+        }
         if (!mayApplyResumeRevalidation({
           resumeId: selectedResumeId,
           currentResumeId: selectedResumeIdRef.current,
@@ -1185,12 +1189,55 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
 
   useEffect(() => { if (jobData?.jobs) setJobs(jobData.jobs) }, [jobData])
 
+  // An application entry is scoped to its original job only while its original
+  // resume is selected. Never substitute another job that shares that resume.
+  const originalApplicationId = returnToJobs && returnJobId && selectedResumeId === returnResumeId ? returnJobId : null
+  const returnJobKey = originalApplicationId && resumeUserId && selectedResumeId
+    ? JSON.stringify([resumeUserId, selectedResumeId, originalApplicationId]) : null
+  const returnJobScopeRef = useRef<{ key: string | null; epoch: number }>({ key: null, epoch: 0 })
+  if (returnJobScopeRef.current.key !== returnJobKey) returnJobScopeRef.current = { key: returnJobKey, epoch: returnJobScopeRef.current.epoch + 1 }
+  const returnJobEpoch = returnJobScopeRef.current.epoch
+  const [returnJobRetry, setReturnJobRetry] = useState(0)
+  const [returnJobRead, setReturnJobRead] = useState<{ key: string; epoch: number; status: 'loading' | 'ready' | 'unavailable'; job: Job | null } | null>(null)
   useEffect(() => {
-    if (!selectedResumeId || jobs.length === 0) return
-    const resume = resumes.find(item => item.id === selectedResumeId)
-    const linkedJobId = resume?.targetJobId ?? jobs.find(job => job.finalResumeId === selectedResumeId)?.id ?? null
+    if (!returnJobKey || !originalApplicationId || !resumeUserId) return
+    const controller = new AbortController()
+    const current = () => !controller.signal.aborted && returnJobScopeRef.current.key === returnJobKey && returnJobScopeRef.current.epoch === returnJobEpoch
+    setReturnJobRead({ key: returnJobKey, epoch: returnJobEpoch, status: 'loading', job: null })
+    const timer = window.setTimeout(() => {
+      if (!current()) return
+      controller.abort()
+      setReturnJobRead({ key: returnJobKey, epoch: returnJobEpoch, status: 'unavailable', job: null })
+    }, 30_000)
+    void fetch(`/api/jobs/${encodeURIComponent(originalApplicationId)}`, { signal: controller.signal, cache: 'no-store' })
+      .then(async response => {
+        if (!response.ok) throw new Error('Application unavailable')
+        const job = await response.json() as Job
+        if (!job || job.id !== originalApplicationId || job.userId !== resumeUserId
+          || (job.finalResumeId !== null && (typeof job.finalResumeId !== 'string' || !job.finalResumeId.trim()))
+          || (job.finalCoverLetterId !== null && (typeof job.finalCoverLetterId !== 'string' || !job.finalCoverLetterId.trim()))) throw new Error('Application unavailable')
+        if (current()) setReturnJobRead({ key: returnJobKey, epoch: returnJobEpoch, status: 'ready', job })
+      })
+      .catch(() => { if (current()) setReturnJobRead({ key: returnJobKey, epoch: returnJobEpoch, status: 'unavailable', job: null }) })
+      .finally(() => window.clearTimeout(timer))
+    return () => { controller.abort(); window.clearTimeout(timer) }
+  }, [returnJobKey, returnJobEpoch, originalApplicationId, resumeUserId, returnJobRetry])
+  const verifiedResumeScope = contentVerified && verifiedResumeTarget?.userId === resumeUserId && verifiedResumeTarget.resumeId === selectedResumeId
+    ? verifiedResumeTarget : null
+  const currentReturnRead = returnJobRead?.key === returnJobKey && returnJobRead.epoch === returnJobEpoch ? returnJobRead : null
+  const verifiedReturnJob = currentReturnRead?.status === 'ready' && currentReturnRead.job && verifiedResumeScope
+    && (currentReturnRead.job.finalResumeId === selectedResumeId || (currentReturnRead.job.finalResumeId === null && verifiedResumeScope.targetJobId === currentReturnRead.job.id))
+    ? currentReturnRead.job : null
+  const returnJobLoading = Boolean(originalApplicationId && (!currentReturnRead || currentReturnRead.status === 'loading' || (!contentValidated && !contentVerified)))
+  const returnJobSelectionChanged = Boolean(currentReturnRead?.status === 'ready' && currentReturnRead.job && verifiedResumeScope
+    && currentReturnRead.job.finalResumeId && currentReturnRead.job.finalResumeId !== selectedResumeId)
+
+  useEffect(() => {
+    if (originalApplicationId) { setSelectedJobId(verifiedReturnJob?.id ?? null); return }
+    if (!selectedResumeId || !verifiedResumeScope) return
+    const linkedJobId = verifiedResumeScope.targetJobId ?? jobs.find(job => job.userId === resumeUserId && job.finalResumeId === selectedResumeId)?.id ?? null
     if (linkedJobId) setSelectedJobId(linkedJobId)
-  }, [jobs, resumes, selectedResumeId])
+  }, [jobs, selectedResumeId, resumeUserId, originalApplicationId, verifiedReturnJob?.id, verifiedResumeScope])
 
   useEffect(() => {
     const targetKey = analysisTargetKey(selectedResumeId, selectedJobId)
@@ -1201,7 +1248,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       setScoring(false)
       setSuggesting(false)
     }
-    if (!contentValidated || contentResumeId !== selectedResumeId) return
+    if (!verifiedResumeScope || !contentValidated || contentResumeId !== selectedResumeId) return
     const cached = getAnalysisCache(selectedResumeId, selectedJobId, contentRevision)
     if (cached) {
       setScoreResult(cached.score)
@@ -1216,7 +1263,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     setScoreResult(null)
     setSuggestions([])
     analysisTargetRef.current = null
-  }, [selectedJobId, selectedResumeId, contentRevision, contentResumeId, contentValidated])
+  }, [selectedJobId, selectedResumeId, contentRevision, contentResumeId, contentValidated, verifiedResumeScope])
 
   const [flashField, setFlashField] = useState('')
 
@@ -1897,11 +1944,14 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
 
   // ── Job context for AI ────────────────────────────────────────────────────
 
-  const selectedJob  = jobs.find(j => j.id === selectedJobId) ?? null
   const selectedResume = resumes.find(r => r.id === selectedResumeId) ?? null
-  const resumeLinkedJob = jobs.find(j => j.id === selectedResume?.targetJobId)
-    ?? jobs.find(j => j.finalResumeId === selectedResumeId)
-    ?? null
+  const resumeLinkedJob = originalApplicationId ? verifiedReturnJob : verifiedResumeScope
+    ? jobs.find(j => j.userId === resumeUserId && j.id === verifiedResumeScope.targetJobId)
+      ?? jobs.find(j => j.userId === resumeUserId && j.finalResumeId === selectedResumeId)
+      ?? null : null
+  const selectedJob = originalApplicationId
+    ? (selectedJobId === resumeLinkedJob?.id ? resumeLinkedJob : null)
+    : verifiedResumeScope ? jobs.find(j => j.userId === resumeUserId && j.id === selectedJobId) ?? null : null
   const confirmationScopeRef = useRef({ userId: resumeUserId, resumeId: selectedResumeId, jobId: resumeLinkedJob?.id ?? null, selectedJobId, generation: 0 })
   const confirmationScope = confirmationScopeRef.current
   if (confirmationScope.userId !== resumeUserId || confirmationScope.resumeId !== selectedResumeId
@@ -1912,23 +1962,22 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
   // a previously selected job kept stale opportunity details visible after a
   // resume switch or after cancelling a link.
   const linkedJob = resumeLinkedJob
-  const linkedJobId = selectedResume?.targetJobId ?? resumeLinkedJob?.id
-    ?? (selectedResumeId === returnResumeId ? returnJobId : null)
+  const linkedJobId = originalApplicationId ?? verifiedResumeScope?.targetJobId ?? resumeLinkedJob?.id ?? null
   useEffect(() => {
-    if (!linkedJobId || jobs.some(job => job.id === linkedJobId)) return
+    if (originalApplicationId || !resumeUserId || !linkedJobId || jobs.some(job => job.id === linkedJobId && job.userId === resumeUserId)) return
     let cancelled = false
     // The linked opportunity may be outside the first page of the job list.
     void fetch(`/api/jobs/${encodeURIComponent(linkedJobId)}`)
       .then(response => response.ok ? response.json() as Promise<Job> : null)
       .then(job => {
-        if (!cancelled && job?.id === linkedJobId
-          && (selectedResume?.targetJobId === job.id || job.finalResumeId === selectedResumeId)) {
+        if (!cancelled && job?.id === linkedJobId && job.userId === resumeUserId
+          && (verifiedResumeScope?.targetJobId === job.id || job.finalResumeId === selectedResumeId)) {
           setJobs(previous => previous.some(item => item.id === job.id) ? previous : [...previous, job])
         }
       })
       .catch(() => undefined)
     return () => { cancelled = true }
-  }, [linkedJobId, jobs, selectedResume?.targetJobId, selectedResumeId])
+  }, [linkedJobId, jobs, originalApplicationId, resumeUserId, verifiedResumeScope?.targetJobId, selectedResumeId])
 
   async function returnToApplication(jobId: string) {
     if (linkWriteRef.current !== 'idle' || confirmationWriteRef.current !== 'idle') return
@@ -2121,7 +2170,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     if (!selectedResumeId) return
     const owner = resumeUserIdRef.current
     const scope = confirmationScopeRef.current
-    if (!owner || hasUnknownResumeSave() || linkWriteRef.current !== 'idle' || auditRunRef.current || applyingAuditRef.current || confirmationWriteRef.current !== 'idle'
+    if (!owner || !hasValidatedCurrentResume() || !verifiedResumeScope || hasUnknownResumeSave() || linkWriteRef.current !== 'idle' || auditRunRef.current || applyingAuditRef.current || confirmationWriteRef.current !== 'idle'
       || !jobs.some(job => job.id === jobId && job.userId === owner)) return
     linkWriteRef.current = 'pending'
     setLinkWriteState('pending')
@@ -2132,6 +2181,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
         || selectedJobIdRef.current !== scope.selectedJobId || confirmationScopeRef.current.generation !== scope.generation) return
       if (!data || error || data.id !== selectedResumeId || data.userId !== owner || data.targetJobId !== jobId) return
       verified = true
+      setVerifiedResumeTarget({ userId: owner, resumeId: selectedResumeId, targetJobId: jobId })
       setResumes(prev => prev.map(resume => resume.id === selectedResumeId ? { ...resume, targetJobId: jobId, updatedAt: data.updatedAt } : resume))
       setSelectedJobId(jobId)
       const job = jobs.find(item => item.id === jobId)
@@ -2508,6 +2558,8 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     confirmationWriteRef.current = 'idle'
     setConfirmationWriteState('idle')
     setJobs(previous => previous.map(job => job.id === data.id ? data : job))
+    setReturnJobRead(previous => previous?.key === returnJobKey && previous.epoch === returnJobEpoch
+      ? { ...previous, status: 'ready', job: data } : previous)
     if (assignment.finalCoverLetterId) {
       setInvalidatedAudit({ jobId: resumeLinkedJob.id, resumeId: selectedResumeId, auditedAt: audit.auditedAt })
       // Selecting a different letter changes its server revision. Reload it
@@ -2630,6 +2682,19 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
       : item))
     setJobs(previous => previous.map(job => job.finalResumeId === resume.id ? { ...job, finalResumeId: null } : job))
     if (resume.id === selectedResumeId) {
+      const owner = resumeUserIdRef.current
+      const verified = data as Resume & { userId?: string }
+      if (owner && verified.id === resume.id && verified.userId === owner && verified.targetJobId === null) {
+        setVerifiedResumeTarget({ userId: owner, resumeId: resume.id, targetJobId: null })
+      } else {
+        setVerifiedResumeTarget(null)
+        setResumeReadAttempt(value => value + 1)
+      }
+      if (originalApplicationId) {
+        setReturnJobRead(previous => previous?.key === returnJobKey && previous.epoch === returnJobEpoch
+          ? { ...previous, status: 'loading', job: null } : previous)
+        setReturnJobRetry(value => value + 1)
+      }
       setSelectedJobId(null)
       setScoreResult(null)
       setSuggestions([])
@@ -2774,7 +2839,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
     setShowFinalConfirm(false)
     if (target) setResumeName(target.name)
     setSelectedResumeId(id)
-    setSelectedJobId(target?.targetJobId ?? jobs.find(job => job.finalResumeId === id)?.id ?? null)
+    setSelectedJobId(null)
     return true
   }
 
@@ -2821,7 +2886,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
         <Btn variant="ghost" onClick={() => { if (!selectedResumeId) { toast.info(t('resume.selectFirst')); return }; fetchVersions(); setShowVersions(true) }}><History size={15} />{t('resume.history')}</Btn>
         <span className="resume-toolbar-divider" />
         <Btn variant="ghost" onClick={() => void exportCurrentResumePdf()} disabled={exportingPdf}><FileDown size={15} />{exportingPdf ? t('resume.exportPreparing') : t('resume.exportPdf')}</Btn>
-        <div className="resume-final-confirm-trigger"><Btn variant="toolbar" disabled={linkWriteState !== 'idle' || confirmationWriteState !== 'idle'} onClick={() => {
+        <div className="resume-final-confirm-trigger"><Btn variant="toolbar" disabled={linkWriteState !== 'idle' || confirmationWriteState !== 'idle' || Boolean(originalApplicationId && !verifiedReturnJob)} onClick={() => {
           if (!selectedResumeId || !content) { toast.info('Select a resume first'); return }
           if (!hasValidatedCurrentResume()) { toast.info(t('resume.analysisLoadingTitle'), t('resume.analysisLoadingDetail')); return }
           setShowFinalConfirm(true)
@@ -3092,7 +3157,15 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
           {rightPanel === 'persona' ? <PersonaPanel isDefault={selectedResume?.isDefault ?? false} onEditResume={setEditSection} onUseAsProfile={() => { if (selectedResume) void handleSetDefaultResume(selectedResume) }} /> : <>
           <div className="resume-opportunity-card">
             <span className="resume-opportunity-eyebrow">{t('resume.linkedOpportunity')}</span>
-            {linkedJob ? <>
+            {originalApplicationId && !verifiedReturnJob ? <div role="status">
+              <p>{returnJobLoading ? t('jobs.loadingDetail') : returnJobSelectionChanged
+                ? (lang === 'zh' ? '此申请已选择另一份简历。请返回申请核对当前材料。' : 'This application has a different selected resume. Return to the application to review its current materials.')
+                : t('application.linkUnavailable')}</p>
+              {!returnJobLoading && <button type="button" onClick={() => { setReturnJobRetry(value => value + 1); if (!verifiedResumeScope) setResumeReadAttempt(value => value + 1) }}>{t('application.refreshStatus')}</button>}
+            </div> : !verifiedResumeScope ? <div role="status">
+              <p>{t(selectedResumeId ? 'resume.analysisLoadingTitle' : 'resume.selectFirst')}</p>
+              {selectedResumeId && contentValidated && !contentVerified && <button type="button" onClick={() => setResumeReadAttempt(value => value + 1)}>{t('common.retry')}</button>}
+            </div> : linkedJob ? <>
               <strong>{linkedJob.role}</strong>
               <span>{linkedJob.company}</span>
               <small>{selectedResume?.targetJobId ? 'Tailored version linked' : 'Selected resume linked'}</small>
@@ -3107,7 +3180,7 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
                 <option value="">{t('resume.chooseSavedJob')}</option>
                 {jobs.map(job => <option key={job.id} value={job.id}>{job.company} · {job.role}</option>)}
               </select>
-              <button className="resume-opportunity-link" disabled={linkWriteState !== 'idle' || confirmationWriteState !== 'idle'} onClick={() => {
+              <button className="resume-opportunity-link" disabled={!verifiedResumeScope || linkWriteState !== 'idle' || confirmationWriteState !== 'idle'} onClick={() => {
                 if (!selectedJobId) { toast.info('Select a saved job first', 'Choose the opportunity this resume should be used for'); return }
                 linkResumeToJob(selectedJobId)
               }}>{t('resume.linkResume')}</button>
@@ -3127,14 +3200,14 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
             suggestions={suggestions}
             scoring={scoring}
             suggesting={suggesting}
-            noJobSelected={!selectedJobId}
+            noJobSelected={!selectedJob}
             onApplySuggestion={applySuggestion}
             onAnalyze={() => {
-              if (!content || !selectedJobId) {
+              if (!content || !selectedJob) {
                 toast.info(t('resume.analysisLoadingTitle'), t('resume.analysisLoadingDetail'))
                 return
               }
-              void runAnalysis(content, selectedJobId)
+              void runAnalysis(content, selectedJob.id)
             }}
             onAddKeyword={kw => patch(p => ({ ...p, skills: [...(p.skills ?? []), kw] }), 'skills')}
             onApplyTargeted={applyTargeted}

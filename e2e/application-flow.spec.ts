@@ -1902,6 +1902,209 @@ test('application resume round trip survives an unavailable optional return cach
   expect(state.unexpected).toEqual([])
 })
 
+for (const placement of ['in-list', 'cross-page'] as const) {
+  test(`shared resume retains the original application ${placement} and its return filters`, async ({ page }) => {
+    const state = await install(page)
+    Object.assign(state.resume, { targetJobId: null })
+    const other = { ...state.job, id: 'other-job', company: 'Other Employer', role: 'Other Role' }
+    const auditReads: string[] = []
+    page.on('request', request => { if (request.method() === 'GET' && request.url().includes('/audit-application')) auditReads.push(new URL(request.url()).pathname) })
+    await page.route('**/api/jobs?*', route => route.fulfill({ json: { jobs: placement === 'in-list' ? [other, state.job] : [other], total: 2 } }))
+    await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page&jobsPage=3&jobsSearch=Fixture`)
+    const opportunity = page.locator('.resume-opportunity-card')
+    await expect(opportunity).toContainText('Fixture Employer')
+    await expect(opportunity).toContainText('Application flow engineer')
+    await expect(opportunity).not.toContainText('Other Employer')
+    await expect.poll(() => auditReads.includes('/api/jobs/outside-page/audit-application')).toBe(true)
+    expect(auditReads).not.toContain('/api/jobs/other-job/audit-application')
+    await page.getByRole('button', { name: /Confirm application materials|确认申请材料/, exact: true }).click()
+    const dialog = page.getByRole('dialog', { name: /Confirm application materials|确认申请材料/ })
+    await expect(dialog).toContainText('Fixture Employer')
+    await expect(dialog).toContainText('Application flow engineer')
+    await dialog.getByRole('button', { name: /View this application|查看此申请/, exact: true }).click()
+    await expect(page).toHaveURL(/highlight=outside-page/)
+    await expect(page).toHaveURL(/jobsPage=3/)
+    await expect(page).toHaveURL(/jobsSearch=Fixture/)
+    await expect(page.getByRole('dialog')).toContainText('Application flow engineer')
+    expect(state.writes).toEqual([])
+    expect(state.unexpected).toEqual([])
+  })
+}
+
+for (const outcome of ['unavailable', 'wrong-owner', 'unrelated', 'missing-binding', 'missing-letter', 'invalid-letter'] as const) {
+  test(`original application ${outcome} cannot fall back to another shared-resume job`, async ({ page }) => {
+    const state = await install(page)
+    Object.assign(state.resume, { targetJobId: outcome === 'missing-binding' ? 'outside-page' : null })
+    const other = { ...state.job, id: 'other-job', company: 'Other Employer', role: 'Other Role' }
+    const audits: string[] = []
+    page.on('request', request => { if (request.url().includes('/audit-application')) audits.push(new URL(request.url()).pathname) })
+    await page.route('**/api/jobs?*', route => route.fulfill({ json: { jobs: [other, state.job], total: 2 } }))
+    let reads = 0
+    await page.route('**/api/jobs/outside-page', route => {
+      reads++
+      if (outcome === 'unavailable') return route.fulfill({ status: 404, json: { error: 'Not found' } })
+      if (outcome === 'missing-binding') { const { finalResumeId: _missing, ...partial } = state.job; return route.fulfill({ json: partial }) }
+      if (outcome === 'missing-letter') { const { finalCoverLetterId: _missing, ...partial } = state.job; return route.fulfill({ json: partial }) }
+      if (outcome === 'invalid-letter') return route.fulfill({ json: { ...state.job, finalCoverLetterId: '' } })
+      return route.fulfill({ json: { ...state.job, ...(outcome === 'wrong-owner' ? { userId: 'fixture-b' } : { finalResumeId: 'other-resume' }) } })
+    })
+    await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    const opportunity = page.locator('.resume-opportunity-card')
+    const message = outcome === 'unrelated' ? /This application has a different selected resume|此申请已选择另一份简历/ : /This application is unavailable or you no longer have access|此申请不存在或你已无权访问/
+    await expect(opportunity).toContainText(message)
+    await expect(opportunity).not.toContainText('Other Employer')
+    await expect(opportunity.getByRole('combobox')).toHaveCount(0)
+    await expect(page.getByRole('button', { name: /Confirm application materials|确认申请材料/, exact: true })).toBeDisabled()
+    await expect(page.getByRole('button', { name: /Back to this application|返回此申请/ })).toBeVisible()
+    const before = reads
+    await opportunity.getByRole('button', { name: /Refresh status|刷新状态/ }).click()
+    await expect.poll(() => reads).toBeGreaterThan(before)
+    await expect(opportunity).toContainText(message)
+    expect(audits).toEqual([])
+    expect(state.writes).toEqual([])
+    expect(state.unexpected).toEqual([])
+  })
+}
+
+test('a different selected resume on the original application blocks stale confirmation', async ({ page }) => {
+  const state = await install(page)
+  state.job.finalResumeId = 'another-resume'
+  const other = { ...state.job, id: 'other-job', company: 'Other Employer', role: 'Other Role', finalResumeId: 'resume-1' }
+  const audits: string[] = []
+  page.on('request', request => { if (request.url().includes('/audit-application')) audits.push(new URL(request.url()).pathname) })
+  await page.route('**/api/jobs?*', route => route.fulfill({ json: { jobs: [other, state.job], total: 2 } }))
+  await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+  const opportunity = page.locator('.resume-opportunity-card')
+  await expect(opportunity).toContainText(/This application has a different selected resume|此申请已选择另一份简历/)
+  await expect(opportunity).not.toContainText('Other Employer')
+  await expect(page.getByRole('button', { name: /Confirm application materials|确认申请材料/, exact: true })).toBeDisabled()
+  expect(audits).toEqual([])
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+test('an unbound draft verifies, audits and confirms only its original application', async ({ page }) => {
+  const state = await install(page)
+  state.job.finalResumeId = null
+  const other = { ...state.job, id: 'other-job', company: 'Other Employer', role: 'Other Role', finalResumeId: 'resume-1' }
+  await page.route('**/api/jobs?*', route => route.fulfill({ json: { jobs: [other, state.job], total: 2 } }))
+  await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+  await expect(page.locator('.resume-opportunity-card')).toContainText('Fixture Employer')
+  const audit = page.getByRole('button', { name: /Run independent audit|Run audit again|运行独立审核|再次运行审核/ })
+  await audit.click()
+  await expect.poll(() => state.writes.filter(write => write.path.endsWith('/audit-application')).length).toBe(1)
+  expect(state.writes.find(write => write.path.endsWith('/audit-application'))?.path).toBe('/api/jobs/outside-page/audit-application')
+  const openConfirm = page.getByRole('button', { name: /Confirm application materials|确认申请材料/, exact: true })
+  await openConfirm.click()
+  const dialog = page.getByRole('dialog', { name: /Confirm application materials|确认申请材料/ })
+  await expect(dialog).toContainText('Fixture Employer')
+  const confirm = dialog.getByRole('button', { name: /Confirm application package|确认申请包/, exact: true })
+  await expect(confirm).toBeEnabled()
+  await confirm.click()
+  await expect.poll(() => state.writes.filter(write => write.path.endsWith('/assign')).length).toBe(1)
+  expect(state.writes.find(write => write.path.endsWith('/assign'))?.path).toBe('/api/jobs/outside-page/assign')
+  await expect(page).toHaveURL(/highlight=outside-page/)
+  expect(state.unexpected).toEqual([])
+})
+
+test('original application refresh retries resume verification without replacing unsaved edits', async ({ page }) => {
+  const state = await install(page, { saveMode: 'hold-success' })
+  Object.assign(state.resume, { targetJobId: null })
+  const other = { ...state.job, id: 'other-job', company: 'Other Employer', role: 'Other Role' }
+  let resumeReads = 0
+  await page.addInitScript(value => sessionStorage.setItem('fixture_cached_resume', JSON.stringify(value)), state.resume)
+  await page.route('**/api/jobs?*', route => route.fulfill({ json: { jobs: [other], total: 1 } }))
+  await page.route('**/api/resume/resume-1', route => {
+    if (route.request().method() !== 'GET') return route.fallback()
+    resumeReads++
+    return resumeReads === 1 ? route.fulfill({ status: 500, json: { error: 'unavailable' } }) : route.fulfill({ json: state.resume })
+  })
+  try {
+    await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    const opportunity = page.locator('.resume-opportunity-card')
+    await expect(opportunity).toContainText(/This application is unavailable or you no longer have access|此申请不存在或你已无权访问/)
+    const editor = page.locator('[data-resume-editor]')
+    await editor.getByText('Software engineer.', { exact: false }).first().click()
+    const field = editor.locator('textarea').first()
+    await field.fill('Unsaved source verification edit')
+    await opportunity.getByRole('button', { name: /Refresh status|刷新状态/ }).click()
+    await expect.poll(() => resumeReads).toBeGreaterThan(1)
+    await expect(opportunity).toContainText('Fixture Employer')
+    await expect(editor.getByText('Unsaved source verification edit', { exact: false }).first()).toBeVisible()
+    expect(state.writes.filter(write => /audit-application|\/assign$/.test(write.path))).toEqual([])
+    expect(state.unexpected).toEqual([])
+  } finally { state.releaseSave() }
+})
+
+for (const outcome of ['delayed', 'failed'] as const) {
+  test(`ordinary resume linking waits for ${outcome} verification before allowing a job change`, async ({ page }) => {
+    const state = await install(page)
+    Object.assign(state.resume, { targetJobId: null })
+    state.job.finalResumeId = null
+    await page.addInitScript(value => sessionStorage.setItem('fixture_cached_resume', JSON.stringify(value)), state.resume)
+    let release = () => {}, reads = 0
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const writes: unknown[] = []
+    await page.route('**/api/resume/resume-1', async route => {
+      if (route.request().method() === 'PATCH') {
+        const body = route.request().postDataJSON() as { targetJobId?: string }
+        writes.push(body)
+        return route.fulfill({ json: { ...state.resume, targetJobId: body.targetJobId } })
+      }
+      reads++
+      if (outcome === 'delayed' && reads === 1) await gate
+      if (outcome === 'failed' && reads === 1) return route.fulfill({ status: 500, json: { error: 'unavailable' } })
+      return route.fulfill({ json: state.resume })
+    })
+    try {
+      await page.goto(`${origin}/?page=resume&resumeId=resume-1`)
+      const opportunity = page.locator('.resume-opportunity-card')
+      await expect.poll(() => reads).toBe(1)
+      await expect(opportunity.getByRole('combobox')).toHaveCount(0)
+      await expect(opportunity.getByRole('button', { name: /Link resume|关联简历/ })).toHaveCount(0)
+      expect(writes).toEqual([])
+      if (outcome === 'delayed') release()
+      else await opportunity.getByRole('button', { name: /Retry|重试/ }).click()
+      const choose = opportunity.getByRole('combobox')
+      await expect(choose).toBeVisible()
+      await choose.selectOption('outside-page')
+      await opportunity.getByRole('button', { name: /Link resume|关联简历/ }).click()
+      await expect(opportunity).toContainText('Fixture Employer')
+      expect(writes).toEqual([{ targetJobId: 'outside-page' }])
+      expect(state.unexpected).toEqual([])
+    } finally { release() }
+  })
+}
+
+test('a late original job read cannot override the explicitly switched resume context', async ({ page }) => {
+  const state = await install(page, { twoResumes: true })
+  Object.assign(state.resume, { targetJobId: null })
+  state.secondResume.targetJobId = 'other-job'
+  const other = { ...state.job, id: 'other-job', company: 'Other Employer', role: 'Other Role' }
+  let release = () => {}
+  const gate = new Promise<void>(resolve => { release = resolve })
+  let started = false, originalReads = 0
+  await page.route('**/api/jobs?*', route => route.fulfill({ json: { jobs: [other], total: 1 } }))
+  await page.route('**/api/jobs/outside-page', async route => { started = true; originalReads++; await gate; await route.fulfill({ json: state.job }).catch(() => undefined) })
+  try {
+    await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    await expect.poll(() => started).toBe(true)
+    await page.locator('.resume-library-item').filter({ hasText: 'Second fixture resume' }).click()
+    await expect(page.locator('[data-resume-editor]').getByText('Second resume content.', { exact: false }).first()).toBeVisible()
+    await expect(page.locator('.resume-opportunity-card')).toContainText('Other Employer')
+    release()
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+    await expect(page.locator('.resume-opportunity-card')).toContainText('Other Employer')
+    await expect(page.locator('.resume-opportunity-card')).not.toContainText('Fixture Employer')
+    await page.locator('.resume-library-item').filter({ hasText: 'Fixture role resume' }).click()
+    await expect.poll(() => originalReads).toBeGreaterThan(1)
+    await expect(page.locator('.resume-opportunity-card')).toContainText('Fixture Employer')
+    await expect(page.locator('.resume-opportunity-card')).not.toContainText('Other Employer')
+    expect(state.writes).toEqual([])
+    expect(state.unexpected).toEqual([])
+  } finally { release() }
+})
+
 test('restores a highlighted job outside the current page and retains list context through the real Resume page', async ({ page }) => {
   const state = await install(page)
   await open(page, '&jobsPage=3&jobsSize=50&jobsSearch=Acme&jobsStatus=saved&jobsSort=score&jobsDirection=asc')
@@ -3671,6 +3874,8 @@ test('empty base resume list opens the resume library and returns to the same ap
   })
   await page.getByRole('button', { name: /Open resume library|打开简历库/ }).click()
   await expect(page.getByRole('button', { name: /Back to this application|返回此申请/ })).toBeVisible()
+  await expect(page.getByText(/Select or create a resume to get started|选择或创建简历以开始使用/)).toBeVisible()
+  await expect(page.getByText(/Resume is refreshing|正在刷新简历/)).toHaveCount(0)
   const url = new URL(page.url())
   expect(url.searchParams.get('returnJobId')).toBe('outside-page')
   expect(url.searchParams.get('jobsSearch')).toBe('fixture')
