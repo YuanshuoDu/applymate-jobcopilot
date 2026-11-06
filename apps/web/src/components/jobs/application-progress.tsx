@@ -14,6 +14,7 @@ export function ApplicationProgress({ hasMaterials, checked, recorded, task }: {
 }) {
   const { t } = useI18n()
   const state = task ? getApplicationTaskState(task) : null
+  const separateRecord = Boolean(recorded && task && state?.kind !== 'submitted' && !applicationTaskAllowsManualWork(task))
   const steps = [
     { key: 'application.materials', complete: hasMaterials },
     { key: 'application.materialCheck', complete: checked },
@@ -23,6 +24,7 @@ export function ApplicationProgress({ hasMaterials, checked, recorded, task }: {
     {steps.map(step => <li key={step.key} style={{ fontSize: 12, color: 'var(--text-muted)', textAlign: 'center' }}>
       <strong style={{ display: 'block', marginBottom: 6, color: step.complete ? 'var(--c-success)' : 'var(--text)' }}>{t(step.key)}</strong>
       <span>{t(step.complete ? 'application.recordAvailable' : 'application.notComplete')}</span>
+      {step.key === 'application.submission' && separateRecord && <span style={{ display: 'block', marginTop: 6, lineHeight: 1.4 }}>{t('application.recordMayDifferFromTask')}</span>}
     </li>)}
   </ol>
 }

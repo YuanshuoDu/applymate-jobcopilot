@@ -201,6 +201,13 @@ action logic. Similar question wording does not authorize sharing answers
 between jobs. Application-specific answers are not automatically permanent
 career facts.
 
+Discover keeps the executed search and recent queries under the signed-in
+account. When opening a saved application, it also remembers the result page,
+sort and expanded job for that account and result set; if storage is unavailable
+or the snapshot no longer matches, the position defaults to the first page. Older
+unscoped browser caches are not automatically restored because their account
+ownership cannot be verified. They are not deleted by this change.
+
 ## 4. Applications list and detail
 
 The list keeps the user's existing lifecycle status. When a related recent Agent

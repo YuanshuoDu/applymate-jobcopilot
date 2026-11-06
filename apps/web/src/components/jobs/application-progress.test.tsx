@@ -15,14 +15,17 @@ describe('application progress evidence', () => {
     const task = { status: 'unknown', checkpoint: 'submission_uncertain' } as ApplicationTaskView
     const html = renderToStaticMarkup(<ApplicationProgress hasMaterials checked recorded task={task} />)
     expect(html.match(/application.recordAvailable/g)).toHaveLength(2)
+    expect(html).toContain('application.recordMayDifferFromTask')
   })
   it.each(['cancelled', 'failed'])('shows a later manual record after %s before submission', status => {
     const task = { status, checkpoint: 'turn_stopped_before_submit' } as ApplicationTaskView
     const html = renderToStaticMarkup(<ApplicationProgress hasMaterials checked recorded task={task} />)
     expect(html.match(/application.recordAvailable/g)).toHaveLength(3)
+    expect(html).not.toContain('application.recordMayDifferFromTask')
   })
   it.each([
     ['unknown', 'submission_uncertain'],
+    ['submitted', 'submission_uncertain'],
     ['filling', 'form_filling'],
     ['failed', 'submission_request_started'],
     ['cancelled', null],
@@ -31,5 +34,17 @@ describe('application progress evidence', () => {
     const html = renderToStaticMarkup(<ApplicationProgress hasMaterials checked recorded task={task} />)
     expect(html.match(/application.recordAvailable/g)).toHaveLength(2)
     expect(html).toContain('application.notComplete')
+    expect(html).toContain('application.recordMayDifferFromTask')
+  })
+  it('does not invent a historical record for an unknown task without record evidence', () => {
+    const task = { status: 'unknown', checkpoint: 'submission_uncertain' } as ApplicationTaskView
+    const html = renderToStaticMarkup(<ApplicationProgress hasMaterials checked recorded={false} task={task} />)
+    expect(html).not.toContain('application.recordMayDifferFromTask')
+  })
+  it('does not warn that a record differs when the known task is submitted', () => {
+    const task = { status: 'submitted', checkpoint: null } as ApplicationTaskView
+    const html = renderToStaticMarkup(<ApplicationProgress hasMaterials checked recorded task={task} />)
+    expect(html.match(/application.recordAvailable/g)).toHaveLength(3)
+    expect(html).not.toContain('application.recordMayDifferFromTask')
   })
 })

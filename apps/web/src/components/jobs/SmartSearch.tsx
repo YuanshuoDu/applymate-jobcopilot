@@ -1,10 +1,12 @@
 'use client'
 
 import React, { useState, useRef, useCallback, useEffect } from 'react'
+import Link from 'next/link'
 import { useSession } from 'next-auth/react'
 import { CompanyLogo, ScorePill, useToast } from '@/components/ui'
 import { extractSearchQuery } from './search-query'
 import { useI18n } from '@/lib/i18n'
+import { userScopedStorageKey } from '@/lib/user-scoped-storage'
 import { saveDiscoveredApplication } from './application-search-save'
 import { createApplicationSaveGuard, readSavedApplications, searchResultKey, writeSavedApplications } from './application-search-state'
 
@@ -132,11 +134,46 @@ const LS_LAST   = 'applymate_last_search'
 const LS_RECENT = 'applymate_recent_searches'
 
 interface StoredSearch { q: string; filters: Filters; results: JobResult[]; meta: SearchMeta | null }
-function loadLast(): StoredSearch | null { try { const r = localStorage.getItem(LS_LAST); return r ? JSON.parse(r) : null } catch { return null } }
-function saveLast(s: StoredSearch) { try { localStorage.setItem(LS_LAST, JSON.stringify(s)) } catch {} }
-function loadRecent(): string[] { try { const r = localStorage.getItem(LS_RECENT); return r ? JSON.parse(r) : [] } catch { return [] } }
-function addRecent(q: string) { const p = loadRecent().filter(x => x.toLowerCase() !== q.toLowerCase()); try { localStorage.setItem(LS_RECENT, JSON.stringify([q, ...p].slice(0, 8))) } catch {} }
-function clearHistory() { try { localStorage.removeItem(LS_LAST); localStorage.removeItem(LS_RECENT) } catch {} }
+function cachedRecord(value: unknown): Record<string, unknown> | null { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null }
+function cachedStrings(value: unknown): boolean { return Array.isArray(value) && value.every(item => typeof item === 'string') }
+function optionalString(value: unknown): boolean { return value == null || typeof value === 'string' }
+function validCachedSearch(value: unknown): value is StoredSearch {
+  const data = cachedRecord(value), filters = cachedRecord(data?.filters)
+  if (!data || typeof data.q !== 'string' || !filters || typeof filters.remote !== 'boolean'
+    || !['location', 'jobType', 'datePosted', 'experience', 'salaryMin', 'salaryMax'].every(key => typeof filters[key] === 'string')
+    || !Array.isArray(data.results)) return false
+  for (const item of data.results) {
+    const row = cachedRecord(item)
+    if (!row || !['id', 'source', 'url', 'title', 'company'].every(key => typeof row[key] === 'string')
+      || !['location', 'description', 'salary', 'postedAt', 'jobType', 'logo', 'seniority', 'workArrangement', 'experienceLevel'].every(key => optionalString(row[key]))
+      || (row.keySkills != null && !cachedStrings(row.keySkills))
+      || (row.score != null && (typeof row.score !== 'number' || !Number.isFinite(row.score)))
+      || (row.directApply != null && typeof row.directApply !== 'boolean')) return false
+    if (row.hiringManager != null) {
+      const manager = cachedRecord(row.hiringManager)
+      if (!manager || !['name', 'title', 'email', 'linkedinUrl'].every(key => optionalString(manager[key]))) return false
+    }
+  }
+  if (data.meta != null) {
+    const meta = cachedRecord(data.meta)
+    if (!meta || !cachedStrings(meta.sourcesUsed) || typeof meta.routing !== 'string'
+      || (meta.topSkills != null && !cachedStrings(meta.topSkills))) return false
+    if (meta.salaryContext != null) {
+      const salary = cachedRecord(meta.salaryContext)
+      if (!salary || typeof salary.currency !== 'string' || typeof salary.median !== 'number' || !Number.isFinite(salary.median)) return false
+    }
+    if (meta.apiKeys != null) {
+      const keys = cachedRecord(meta.apiKeys)
+      if (!keys || typeof keys.rapidapi !== 'boolean') return false
+    }
+  }
+  return true
+}
+function loadLast(userId: string | null): StoredSearch | null { try { const key = userScopedStorageKey(LS_LAST, userId); const r = key && localStorage.getItem(key); const value: unknown = r ? JSON.parse(r) : null; return validCachedSearch(value) ? value : null } catch { return null } }
+function saveLast(userId: string | null, s: StoredSearch) { try { const key = userScopedStorageKey(LS_LAST, userId); if (key) localStorage.setItem(key, JSON.stringify(s)) } catch {} }
+function loadRecent(userId: string | null): string[] { try { const key = userScopedStorageKey(LS_RECENT, userId); const r = key && localStorage.getItem(key); const value: unknown = r ? JSON.parse(r) : []; return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string').slice(0, 8) : [] } catch { return [] } }
+function addRecent(userId: string | null, q: string) { const p = loadRecent(userId).filter(x => x.toLowerCase() !== q.toLowerCase()); try { const key = userScopedStorageKey(LS_RECENT, userId); if (key) localStorage.setItem(key, JSON.stringify([q, ...p].slice(0, 8))) } catch {} }
+function clearHistory(userId: string | null) { try { for (const prefix of [LS_LAST, LS_RECENT]) { const key = userScopedStorageKey(prefix, userId); if (key) localStorage.removeItem(key) } } catch {} }
 
 // ── Inline badge ──────────────────────────────────────────────────────────────
 function Badge({ children, color, bg, style }: { children: React.ReactNode; color: string; bg: string; style?: React.CSSProperties }) {
@@ -158,9 +195,11 @@ const glassInput: React.CSSProperties = {
 // ── Main component ────────────────────────────────────────────────────────────
 
 export function SmartSearch({ onJobSaved, onOpenSettings, onOpenApplication }: { onJobSaved?: (jobId: string) => void; onOpenSettings?: () => void; onOpenApplication?: (jobId: string) => void }) {
-  const { data: session } = useSession()
-  const userId = session?.user?.id ?? null
+  const { data: session, status: sessionStatus } = useSession()
+  const userId = sessionStatus === 'authenticated' ? session?.user?.id || null : null
   const activeUserRef = useRef(userId)
+  const identityEpoch = useRef(0)
+  if (activeUserRef.current !== userId) identityEpoch.current += 1
   activeUserRef.current = userId
   const saveGuard = useRef(createApplicationSaveGuard())
   const saveOperations = useRef(new Set<AbortController>())
@@ -194,17 +233,17 @@ export function SmartSearch({ onJobSaved, onOpenSettings, onOpenApplication }: {
   const { t } = useI18n()
   const toast = useToast()
   const inputRef = useRef<HTMLInputElement>(null)
-  const lastSearch = useRef(loadLast())
+  const [searchOwner, setSearchOwner] = useState<string | null>(null)
   const searchControllerRef = useRef<AbortController | null>(null)
   const searchRequestRef = useRef(0)
 
-  const [q,           setQ]           = useState(lastSearch.current?.q ?? '')
-  const [filters,     setFilters]     = useState<Filters>(lastSearch.current?.filters ?? DEFAULT_FILTERS)
+  const [q,           setQ]           = useState('')
+  const [filters,     setFilters]     = useState<Filters>(DEFAULT_FILTERS)
   const [showFilters, setShowFilters] = useState(false)
   const [searching,   setSearching]   = useState(false)
-  const [results,     setResults]     = useState<JobResult[]>(lastSearch.current?.results ?? [])
-  const [meta,        setMeta]        = useState<SearchMeta | null>(lastSearch.current?.meta ?? null)
-  const [searched,    setSearched]    = useState(!!lastSearch.current)
+  const [results,     setResults]     = useState<JobResult[]>([])
+  const [meta,        setMeta]        = useState<SearchMeta | null>(null)
+  const [searched,    setSearched]    = useState(false)
   const [savingIds,   setSavingIds]   = useState(new Set<string>())
   const [scoringIds,  setScoringIds]  = useState(new Set<string>())
   const [scores,      setScores]      = useState<Record<string, number>>({})
@@ -216,13 +255,50 @@ export function SmartSearch({ onJobSaved, onOpenSettings, onOpenApplication }: {
   const [translated,  setTranslated]  = useState<Record<string, { text: string; lang: string }>>({})
   const [tgtLang,     setTgtLang]     = useState('de')
   const [descExp,     setDescExp]     = useState(new Set<string>())
-  const [recent,      setRecent]      = useState(loadRecent)
+  const [recent,      setRecent]      = useState<string[]>([])
   const [searchFocus, setSearchFocus] = useState(false)
 
   // Track what params were used in the last executed search for stale detection
-  const lastSearchedRef = useRef<{ q: string; filters: Filters } | null>(
-    lastSearch.current ? { q: lastSearch.current.q, filters: lastSearch.current.filters } : null
-  )
+  const lastSearchedRef = useRef<{ q: string; filters: Filters } | null>(null)
+
+  // Remember a position only for the same account and the same executed result set.
+  const searchPositionScope = (query: { q: string; filters: Filters }, rows: JobResult[]) =>
+    JSON.stringify([query.q, query.filters, rows.map(searchResultKey)])
+  useEffect(() => {
+    searchRequestRef.current += 1
+    searchControllerRef.current?.abort()
+    const savedSearch = loadLast(userId)
+    lastSearchedRef.current = savedSearch ? { q: savedSearch.q, filters: savedSearch.filters } : null
+    setQ(savedSearch?.q ?? ''); setFilters(savedSearch?.filters ?? DEFAULT_FILTERS)
+    setResults(savedSearch?.results ?? []); setMeta(savedSearch?.meta ?? null); setSearched(Boolean(savedSearch))
+    setRecent(loadRecent(userId)); setSearching(false); setScores({})
+    setTranslated({}); setDescExp(new Set()); setTranslating(new Set()); setSavingIds(new Set()); setScoringIds(new Set())
+    setPage(1); setPageSize(20); setSortDir('desc'); setExpandedId(null)
+    setSearchOwner(userId)
+    const key = userScopedStorageKey('applymate:discover-position', userId)
+    const search = lastSearchedRef.current
+    if (!key || !search) return
+    try {
+      const saved = JSON.parse(window.sessionStorage.getItem(key) ?? 'null') as Record<string, unknown> | null
+      const rows = savedSearch?.results ?? []
+      if (!saved || saved.scope !== searchPositionScope(search, rows)) return
+      const size = saved.pageSize === 50 ? 50 : 20
+      const maxPage = Math.max(1, Math.ceil(rows.length / size))
+      if (!Number.isInteger(saved.page) || Number(saved.page) < 1 || Number(saved.page) > maxPage) return
+      const expanded = typeof saved.expandedId === 'string' && rows.some(result => result.id === saved.expandedId) ? saved.expandedId : null
+      setPageSize(size); setPage(Number(saved.page)); setSortDir(saved.sortDir === 'asc' ? 'asc' : 'desc'); setExpandedId(expanded)
+    } catch { /* Storage is optional; fall back to the first page. */ }
+  }, [userId]) // Restore only on account change, never after a new search.
+
+  function openSavedApplication(jobId: string) {
+    const key = userScopedStorageKey('applymate:discover-position', userId)
+    if (key && lastSearchedRef.current && !searching) {
+      try {
+        window.sessionStorage.setItem(key, JSON.stringify({ scope: searchPositionScope(lastSearchedRef.current, results), page, pageSize, sortDir, expandedId }))
+      } catch { /* Navigation remains available when storage is unavailable. */ }
+    }
+    onOpenApplication?.(jobId)
+  }
 
   const isStale = searched && !!lastSearchedRef.current && (
     q.trim() !== lastSearchedRef.current.q ||
@@ -246,12 +322,15 @@ export function SmartSearch({ onJobSaved, onOpenSettings, onOpenApplication }: {
 
   const runSearch = useCallback(async (query: string, f: Filters) => {
     if (!query.trim()) return
+    const positionKey = userScopedStorageKey('applymate:discover-position', userId)
+    if (positionKey) { try { window.sessionStorage.removeItem(positionKey) } catch { /* Storage is optional. */ } }
     const requestId = searchRequestRef.current + 1
+    const ownerEpoch = identityEpoch.current
     searchRequestRef.current = requestId
     searchControllerRef.current?.abort()
     const controller = new AbortController()
     searchControllerRef.current = controller
-    setSearching(true); setSearched(true); setScores({}); setExpandedId(null); setPage(1)
+    setSearching(true); setSearched(true); setScores({}); setTranslated({}); setDescExp(new Set()); setTranslating(new Set()); setExpandedId(null); setPage(1)
     const p = new URLSearchParams({ q: query })
     if (f.location)           p.set('location', f.location)
     if (f.remote)             p.set('remote', '1')
@@ -264,22 +343,22 @@ export function SmartSearch({ onJobSaved, onOpenSettings, onOpenApplication }: {
       const res = await fetch(`/api/search/unified?${p}`, { signal: controller.signal })
       const json = await res.json()
       if (!res.ok) throw new Error(json.error ?? 'Search failed')
-      if (requestId !== searchRequestRef.current) return
+      if (controller.signal.aborted || requestId !== searchRequestRef.current || activeUserRef.current !== userId || identityEpoch.current !== ownerEpoch) return
       setResults(json.jobs ?? [])
       setMeta(json.meta ?? null)
       lastSearchedRef.current = { q: query.trim(), filters: f }
-      saveLast({ q: query.trim(), filters: f, results: json.jobs ?? [], meta: json.meta ?? null })
-      addRecent(query.trim())
-      setRecent(loadRecent())
+      saveLast(userId, { q: query.trim(), filters: f, results: json.jobs ?? [], meta: json.meta ?? null })
+      addRecent(userId, query.trim())
+      setRecent(loadRecent(userId))
     } catch (e) {
       if (e instanceof DOMException && e.name === 'AbortError') return
-      if (requestId !== searchRequestRef.current) return
+      if (controller.signal.aborted || requestId !== searchRequestRef.current || activeUserRef.current !== userId || identityEpoch.current !== ownerEpoch) return
       toast.error('Search failed', (e as Error).message)
       setResults([])
     } finally {
-      if (requestId === searchRequestRef.current) setSearching(false)
+      if (!controller.signal.aborted && requestId === searchRequestRef.current && activeUserRef.current === userId && identityEpoch.current === ownerEpoch) setSearching(false)
     }
-  }, [toast])
+  }, [toast, userId])
 
   // triggerSearch: stable reference used by pill removal callbacks
   const triggerSearch = useCallback((searchQ: string, f: Filters) => {
@@ -314,11 +393,13 @@ export function SmartSearch({ onJobSaved, onOpenSettings, onOpenApplication }: {
   async function handleSave(r: JobResult) {
     const resultKey = searchResultKey(r)
     const guardKey = `${userId}:${resultKey}`
-    if (savedApplications[resultKey]) { onOpenApplication?.(savedApplications[resultKey]); return }
+    if (savedApplications[resultKey]) { openSavedApplication(savedApplications[resultKey]); return }
     if (!userId || !saveGuard.current.acquire(guardKey)) return
     const operation = new AbortController()
+    const ownerEpoch = identityEpoch.current
+    const searchEpoch = searchRequestRef.current
     saveOperations.current.add(operation)
-    const isCurrent = () => !operation.signal.aborted && activeUserRef.current === userId
+    const isCurrent = () => !operation.signal.aborted && activeUserRef.current === userId && identityEpoch.current === ownerEpoch
     setSavingIds(prev => new Set(prev).add(resultKey))
     try {
       await saveDiscoveredApplication(r, {
@@ -335,7 +416,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings, onOpenApplication }: {
           onJobSaved?.(dbId)
         },
         onScored: (_rid, score) => {
-          if (isCurrent()) setScores(p => ({ ...p, [resultKey]: score }))
+          if (isCurrent() && searchRequestRef.current === searchEpoch) setScores(p => ({ ...p, [resultKey]: score }))
         },
         onError: (msg) => { if (isCurrent()) toast.error('Save failed', msg) },
       })
@@ -351,11 +432,15 @@ export function SmartSearch({ onJobSaved, onOpenSettings, onOpenApplication }: {
 
   async function handleTranslate(r: JobResult) {
     if (!r.description) return
+    const owner = userId
+    const ownerEpoch = identityEpoch.current
+    const searchEpoch = searchRequestRef.current
+    const isCurrent = () => activeUserRef.current === owner && identityEpoch.current === ownerEpoch && searchRequestRef.current === searchEpoch
     setTranslating(prev => new Set(prev).add(r.id))
     try {
       const res = await fetch('/api/ai/translate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: r.description, targetLang: tgtLang }) })
-      if (res.ok) { const j = await res.json(); if (j.translated) setTranslated(p => ({ ...p, [r.id]: { text: j.translated, lang: tgtLang } })) }
-    } catch {} finally { setTranslating(prev => { const n = new Set(prev); n.delete(r.id); return n }) }
+      if (res.ok) { const j = await res.json(); if (isCurrent() && j.translated) setTranslated(p => ({ ...p, [r.id]: { text: j.translated, lang: tgtLang } })) }
+    } catch {} finally { if (isCurrent()) setTranslating(prev => { const n = new Set(prev); n.delete(r.id); return n }) }
   }
 
   const sorted     = [...results].sort((a, b) => sortDir === 'desc' ? b.score - a.score : a.score - b.score)
@@ -364,6 +449,9 @@ export function SmartSearch({ onJobSaved, onOpenSettings, onOpenApplication }: {
   const totalPages = Math.max(1, Math.ceil(results.length / pageSize))
 
   // ── Render ────────────────────────────────────────────────────────────────
+
+  if (sessionStatus === 'loading' || (userId && searchOwner !== userId)) return <p role="status">{t('dashboard.momentum.loading')}</p>
+  if (!userId) return <p role="status"><Link href="/login">{t('toast.signInAgain')}</Link></p>
 
   return (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 0, maxWidth: 1000, margin: '0 auto', width: '100%' }}>
@@ -585,7 +673,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings, onOpenApplication }: {
             </button>
           ))}
           <button
-            onClick={() => { clearHistory(); setRecent([]); setQ(''); setResults([]); setMeta(null); setSearched(false); setFilters(DEFAULT_FILTERS) }}
+            onClick={() => { clearHistory(userId); setRecent([]); setQ(''); setResults([]); setMeta(null); setSearched(false); setFilters(DEFAULT_FILTERS) }}
             style={{ fontSize: 10, color: '#DC2626', background: 'none', border: 'none', cursor: 'pointer', marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 4 }}>
             <Icon.Trash /> Clear
           </button>
@@ -858,7 +946,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings, onOpenApplication }: {
                               </a>
 
                               {savedJobId ? (
-                                <button type="button" onClick={e => { e.stopPropagation(); onOpenApplication?.(savedJobId) }} disabled={!onOpenApplication} style={{ padding: '9px 18px', border: '1px solid var(--primary)', borderRadius: 10, background: 'var(--primary)', color: '#fff', fontSize: 13, fontWeight: 700, cursor: 'pointer' }}>{t('application.viewApplication')}</button>
+                                <button type="button" onClick={e => { e.stopPropagation(); openSavedApplication(savedJobId) }} disabled={!onOpenApplication} style={{ padding: '9px 18px', border: '1px solid var(--primary)', borderRadius: 10, background: 'var(--primary)', color: '#fff', fontSize: 13, fontWeight: 700, cursor: 'pointer' }}>{t('application.viewApplication')}</button>
                               ) : (
                                 <button
                                   onClick={e => { e.stopPropagation(); handleSave(r) }}
@@ -905,7 +993,7 @@ export function SmartSearch({ onJobSaved, onOpenSettings, onOpenApplication }: {
                                 : Icon.Bookmark()}
                             </button>
                           )}
-                          {savedJobId && <button type="button" onClick={e => { e.stopPropagation(); onOpenApplication?.(savedJobId) }} disabled={!onOpenApplication} aria-label={`${t('application.viewApplication')}: ${r.title}`} style={{ padding: '7px 10px', border: '1px solid var(--primary)', borderRadius: 9, background: 'var(--primary)', color: '#fff', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>{t('application.viewApplication')}</button>}
+                          {savedJobId && <button type="button" onClick={e => { e.stopPropagation(); openSavedApplication(savedJobId) }} disabled={!onOpenApplication} aria-label={`${t('application.viewApplication')}: ${r.title}`} style={{ padding: '7px 10px', border: '1px solid var(--primary)', borderRadius: 9, background: 'var(--primary)', color: '#fff', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>{t('application.viewApplication')}</button>}
                         </div>
                       )}
                     </div>

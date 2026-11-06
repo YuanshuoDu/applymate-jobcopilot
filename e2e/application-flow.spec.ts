@@ -3262,6 +3262,37 @@ test('recorded applications identify displayed materials as current versions', a
 
 
 
+for (const scenario of [
+  { status: 'submitted', checkpoint: null, recorded: true },
+  { status: 'submitted', checkpoint: 'submission_uncertain', recorded: false },
+  { status: 'unknown', checkpoint: 'submission_uncertain', recorded: false },
+  { status: 'filling', checkpoint: null, recorded: false },
+] as const) {
+  test(`saved application shows historical material limits only for confirmed task state ${scenario.status} / ${scenario.checkpoint ?? 'none'}`, async ({ page }) => {
+    const state = await install(page)
+    await page.route('**/api/agent/application-tasks', route => route.fulfill({ json: { tasks: [{
+      id: 'task-1', userId: 'fixture-user', jobId: 'outside-page', sessionId: 'original-session',
+      status: scenario.status, checkpoint: scenario.checkpoint, updatedAt: time,
+      job: { company: 'Fixture Employer', role: 'Application flow engineer' },
+    }] } }))
+    await open(page)
+    const drawer = page.getByRole('dialog')
+    const task = drawer.getByRole('region', { name: 'Fixture Employer · Application flow engineer' })
+    await expect(task).toBeVisible()
+    const submission = drawer.getByRole('list', { name: /Application progress|申请进度/ }).locator('li').filter({ hasText: /Submission record|提交记录/ })
+    await expect(submission).toContainText(scenario.recorded ? /Recorded|已有记录/ : /Not confirmed|尚未确认/)
+    const warning = drawer.getByText(/materials shown below are their current versions.*cannot confirm they match|下方显示的是材料的当前版本.*无法确认它们与提交时的版本一致/)
+    await expect(warning).toHaveCount(scenario.recorded ? 1 : 0)
+    const originalSession = task.getByRole('link')
+    await expect(originalSession).toHaveAttribute('href', '/?page=agent&sessionId=original-session')
+    await originalSession.click()
+    await expect(page.getByTestId('agent-destination')).toHaveText('original-session')
+    expect(state.job.status).toBe('saved')
+    expect(state.writes).toEqual([])
+    expect(state.unexpected).toEqual([])
+  })
+}
+
 for (const status of ['cancelled', 'failed'] as const) {
   test(`manual record is reflected in submission progress after ${status} before submit`, async ({ page }) => {
     const state = await install(page, { taskStatus: status })
@@ -3273,6 +3304,7 @@ for (const status of ['cancelled', 'failed'] as const) {
     await expect.poll(() => state.writes.filter(write => write.path.endsWith('/apply')).length).toBe(1)
     await expect(page.getByText(/This application has a recorded result|此申请已有结果记录/).first()).toBeVisible()
     await expect(submission).toContainText(/Recorded|已有记录/)
+    await expect(submission).not.toContainText(/may not be for this task|不一定属于当前任务/)
     expect(state.unexpected).toEqual([])
   })
 }
@@ -3283,6 +3315,7 @@ for (const status of ['unknown', 'filling'] as const) {
     await open(page)
     const submission = page.getByRole('list', { name: /Application progress|申请进度/ }).locator('li').filter({ hasText: /Submission record|提交记录/ })
     await expect(submission).toContainText(/Not confirmed|尚未确认/)
+    await expect(submission).toContainText(/An application record exists, but may not be for this task.*submission is not confirmed|已有申请记录，但不一定属于当前任务.*提交尚未确认/)
     await expect(page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ })).toHaveCount(0)
     expect(state.writes).toEqual([])
     expect(state.unexpected).toEqual([])
@@ -6609,4 +6642,281 @@ for (const proof of ['matching', 'wrong-attempt', 'late-matching'] as const) tes
     }
     expect(state.unexpected).toEqual([])
   } finally { release() }
+})
+
+test('Discover restores the same account and search position after opening a saved application', async ({ page }) => {
+  const state = await install(page, { search: true })
+  let searches = 0
+  await page.route('**/api/search/unified?*', route => {
+    searches++
+    const jobs = Array.from({ length: 25 }, (_, i) => ({ id: `position-${i + 1}`, title: `Position role ${i + 1}`, company: 'Position employer', location: 'Dublin', url: `https://example.invalid/${i + 1}`, description: '', source: 'manual', score: 100 - i }))
+    return route.fulfill({ json: { jobs, meta: null } })
+  })
+  await page.goto(`${origin}/?page=search`)
+  const search = page.getByRole('textbox', { name: /Search jobs|搜索职位/ })
+  await search.fill('Position engineer')
+  await search.press('Enter')
+  await expect(page.getByText('1–20 of 25')).toBeVisible()
+  await page.getByRole('button', { name: '2', exact: true }).click()
+  await expect(page.getByText('21–25 of 25')).toBeVisible()
+  await page.getByText('Position role 21', { exact: true }).click()
+  await page.getByTitle(/Save to My Jobs|保存到我的职位/).first().click()
+  await page.getByRole('button', { name: /View this application|查看此申请/ }).first().click()
+  await expect(page).toHaveURL(/highlight=outside-page/)
+  await page.goBack()
+  await expect(page.getByText('21–25 of 25')).toBeVisible()
+  await expect(page.getByText('Position role 21', { exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: /View this application|查看此申请/ }).first()).toBeVisible()
+  expect(searches).toBe(1)
+  expect(state.writes.filter(write => write.path === '/api/jobs')).toHaveLength(1)
+  await page.getByRole('button', { name: /View this application|查看此申请/ }).first().click()
+  await expect(page).toHaveURL(/highlight=outside-page/)
+  await page.goBack()
+  await expect(page.getByText('21–25 of 25')).toBeVisible()
+  expect(searches).toBe(1)
+  expect(state.writes.filter(write => write.path === '/api/jobs')).toHaveLength(1)
+  await page.getByRole('textbox', { name: /Search jobs|搜索职位/ }).fill('New search')
+  await page.getByRole('textbox', { name: /Search jobs|搜索职位/ }).press('Enter')
+  await expect(page.getByText('1–20 of 25')).toBeVisible()
+  expect(searches).toBe(2)
+})
+
+test('Discover never loads unowned or another account search history', async ({ page }) => {
+  const state = await install(page, { search: true })
+  await page.addInitScript(() => {
+    localStorage.setItem('applymate_last_search', JSON.stringify({ q: 'Legacy private search', filters: {}, results: [], meta: null }))
+    localStorage.setItem('applymate_recent_searches', JSON.stringify(['Legacy private search']))
+  })
+  await page.goto(`${origin}/?page=search`)
+  const search = page.getByRole('textbox', { name: /Search jobs|搜索职位/ })
+  await expect(search).toHaveValue('')
+  await expect(page.getByText('Legacy private search')).toHaveCount(0)
+  await search.fill('Account A query')
+  await search.press('Enter')
+  await expect(page.getByText('Application flow engineer', { exact: true })).toBeVisible()
+  await fixtureSession(page, 'loading')
+  await expect(search).toHaveCount(0)
+  await fixtureSession(page, 'unauthenticated', '')
+  await expect(page.getByRole('link', { name: /Sign in again to continue|请重新登录以继续/ })).toHaveAttribute('href', '/login')
+  await fixtureSession(page, 'authenticated', '')
+  await expect(page.getByRole('link', { name: /Sign in again to continue|请重新登录以继续/ })).toBeVisible()
+  state.activeUserId = 'fixture-b'
+  await fixtureSession(page, 'authenticated', 'fixture-b')
+  await expect(search).toHaveValue('')
+  await expect(page.getByText('Application flow engineer', { exact: true })).toHaveCount(0)
+  await expect(page.getByText('Account A query', { exact: true })).toHaveCount(0)
+  state.activeUserId = 'fixture-user'
+  await fixtureSession(page, 'authenticated', 'fixture-user')
+  await expect(search).toHaveValue('Account A query')
+  await expect(page.getByText('Application flow engineer', { exact: true })).toBeVisible()
+})
+
+test('Discover falls back safely when position storage is unavailable', async ({ page }) => {
+  const state = await install(page, { search: true })
+  let searches = 0
+  await page.addInitScript(() => {
+    const original = Storage.prototype.setItem
+    Storage.prototype.setItem = function(key, value) {
+      if (this === sessionStorage && key.startsWith('applymate:discover-position:')) throw new Error('fixture storage unavailable')
+      return original.call(this, key, value)
+    }
+  })
+  await page.route('**/api/search/unified?*', route => {
+    searches++
+    return route.fulfill({ json: { jobs: Array.from({ length: 25 }, (_, i) => ({ id: `unavailable-${i + 1}`, title: `Unavailable role ${i + 1}`, company: 'Fixture employer', location: 'Dublin', url: `https://example.invalid/${i}`, description: '', source: 'manual', score: 100 - i })), meta: null } })
+  })
+  await page.goto(`${origin}/?page=search`)
+  const search = page.getByRole('textbox', { name: /Search jobs|搜索职位/ })
+  await search.fill('Unavailable position')
+  await search.press('Enter')
+  await page.getByRole('button', { name: '2', exact: true }).click()
+  await page.getByText('Unavailable role 21', { exact: true }).click()
+  await page.getByTitle(/Save to My Jobs|保存到我的职位/).first().click()
+  await page.getByRole('button', { name: /View this application|查看此申请/ }).first().click()
+  await expect(page).toHaveURL(/highlight=outside-page/)
+  await page.goBack()
+  await expect(page.getByText('1–20 of 25')).toBeVisible()
+  expect(searches).toBe(1)
+  expect(state.writes.filter(write => write.path === '/api/jobs')).toHaveLength(1)
+})
+
+test('Discover discards a late translation when account identity changes', async ({ page }) => {
+  const state = await install(page, { search: true })
+  let release = () => {}, started = false
+  const gate = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/search/unified?*', route => route.fulfill({ json: { jobs: [{ id: 'shared-result', title: 'Shared result', company: 'Fixture employer', location: 'Dublin', url: 'https://example.invalid/shared', description: 'Original job description', source: 'manual', score: 88 }], meta: null } }))
+  await page.route('**/api/ai/translate', async route => { started = true; await gate; await route.fulfill({ json: { translated: 'Old account translation' } }) })
+  try {
+    await page.goto(`${origin}/?page=search`)
+    const input = page.getByRole('textbox', { name: /Search jobs|搜索职位/ })
+    await input.fill('Shared query')
+    await input.press('Enter')
+    await page.getByText('Shared result', { exact: true }).click()
+    await page.getByRole('button', { name: /^(Translate|翻译)$/ }).click()
+    await expect.poll(() => started).toBe(true)
+    state.activeUserId = 'fixture-b'
+    await fixtureSession(page, 'authenticated', 'fixture-b')
+    await expect(input).toHaveValue('')
+    await input.fill('Other query')
+    await input.press('Enter')
+    await page.getByText('Shared result', { exact: true }).click()
+    await expect(page.getByText('Original job description')).toBeVisible()
+    state.activeUserId = 'fixture-user'
+    await fixtureSession(page, 'authenticated', 'fixture-user')
+    await expect(input).toHaveValue('Shared query')
+    await page.getByText('Shared result', { exact: true }).click()
+    await expect(page.getByText('Original job description')).toBeVisible()
+    const oldResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/api/ai/translate')
+    release()
+    await oldResponse
+    await expect(page.getByText('Old account translation')).toHaveCount(0)
+    await expect(page.getByText('Original job description')).toBeVisible()
+    await expect(page.getByRole('button', { name: /^(Translate|翻译)$/ })).toBeEnabled()
+  } finally { release() }
+})
+
+test('Discover initial unresolved identity does not reveal cached search', async ({ page }) => {
+  await install(page, { search: true })
+  await page.addInitScript(() => {
+    localStorage.setItem('applymate_last_search', JSON.stringify({ q: 'Unowned old search', filters: {}, results: [], meta: null }))
+    localStorage.setItem('applymate_last_search:fixture-user', JSON.stringify({ q: 'Account private search', filters: { location: '', remote: false, jobType: '', datePosted: 'any', experience: '', salaryMin: '', salaryMax: '' }, results: [], meta: null }))
+    let setter: ((status: string, id: string) => void) | undefined
+    Object.defineProperty(globalThis, '__fixtureSetSession', { configurable: true, get: () => setter,
+      set: value => { setter = value; setter?.('loading', '') } })
+  })
+  await page.goto(`${origin}/?page=search`)
+  await expect(page.getByRole('textbox', { name: /Search jobs|搜索职位/ })).toHaveCount(0)
+  await expect(page.getByText('Unowned old search')).toHaveCount(0)
+  await expect(page.getByText('Account private search')).toHaveCount(0)
+  await fixtureSession(page, 'authenticated', 'fixture-user')
+  await expect(page.getByRole('textbox', { name: /Search jobs|搜索职位/ })).toHaveValue('Account private search')
+})
+
+test('Discover ignores a stale or malformed position for another result set', async ({ page }) => {
+  const state = await install(page, { search: true })
+  let searches = 0
+  await page.route('**/api/search/unified?*', route => {
+    searches++
+    return route.fulfill({ json: { jobs: Array.from({ length: 25 }, (_, i) => ({ id: `scope-${i}`, title: `Scope role ${i}`, company: 'Fixture employer', location: 'Dublin', url: `https://example.invalid/${i}`, description: '', source: 'manual', score: 100 - i })), meta: null } })
+  })
+  await page.goto(`${origin}/?page=search`)
+  const input = page.getByRole('textbox', { name: /Search jobs|搜索职位/ })
+  await input.fill('Scope query')
+  await input.press('Enter')
+  await expect(page.getByText('1–20 of 25')).toBeVisible()
+  await page.evaluate(() => sessionStorage.setItem('applymate:discover-position:fixture-user', JSON.stringify({ scope: 'other result set', page: 2, pageSize: 20, expandedId: 'scope-20' })))
+  await page.getByRole('button', { name: 'Fixture jobs' }).click()
+  await page.getByRole('button', { name: 'Fixture search' }).click()
+  await expect(page.getByText('1–20 of 25')).toBeVisible()
+  await page.evaluate(() => sessionStorage.setItem('applymate:discover-position:fixture-user', '{malformed'))
+  await page.getByRole('button', { name: 'Fixture jobs' }).click()
+  await page.getByRole('button', { name: 'Fixture search' }).click()
+  await expect(page.getByText('1–20 of 25')).toBeVisible()
+  expect(searches).toBe(1)
+  expect(state.writes.filter(write => write.path === '/api/jobs')).toHaveLength(0)
+})
+
+test('Discover remains usable when scoped search storage is unavailable', async ({ page }) => {
+  await install(page, { search: true })
+  await page.addInitScript(() => {
+    const get = Storage.prototype.getItem, set = Storage.prototype.setItem
+    Storage.prototype.getItem = function(key) { if (this === localStorage && /^(applymate_last_search|applymate_recent_searches):/.test(key)) throw new Error('fixture unavailable'); return get.call(this, key) }
+    Storage.prototype.setItem = function(key, value) { if (this === localStorage && /^(applymate_last_search|applymate_recent_searches):/.test(key)) throw new Error('fixture unavailable'); return set.call(this, key, value) }
+  })
+  await page.goto(`${origin}/?page=search`)
+  const input = page.getByRole('textbox', { name: /Search jobs|搜索职位/ })
+  await input.fill('Storage unavailable query')
+  await input.press('Enter')
+  await expect(page.getByText('Application flow engineer', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: 'Fixture jobs' }).click()
+  await page.getByRole('button', { name: 'Fixture search' }).click()
+  await expect(input).toHaveValue('')
+  await expect(page.getByText('Application flow engineer', { exact: true })).toHaveCount(0)
+})
+
+test('Discover account cache exposes accessible controls and configuration guidance', async ({ page }) => {
+  await install(page, { search: true })
+  await page.addInitScript(() => {
+    const filters = { location: 'Amsterdam', remote: false, jobType: '', datePosted: 'any', experience: '', salaryMin: '', salaryMax: '' }
+    localStorage.setItem('applymate_last_search', JSON.stringify({ q: 'Unowned stale history', filters, results: [], meta: null }))
+    localStorage.setItem('applymate_last_search:fixture-user', JSON.stringify({ q: 'Scoped engineer search', filters, results: [], meta: { sourcesUsed: [], routing: 'NL → adzuna + ats + linkedin', totalRaw: 0, totalDeduped: 0, durationMs: 3, apiKeys: { rapidapi: false, adzuna: false, reed: false, careerjet: false, cleanjobdata: false } } }))
+  })
+  await page.goto(`${origin}/?page=search`)
+  await expect(page.getByRole('textbox', { name: /Search jobs|搜索职位/ })).toHaveValue('Scoped engineer search')
+  const filters = page.getByRole('button', { name: /Show search filters|显示搜索筛选/ })
+  await expect(filters).toHaveAttribute('aria-controls', 'search-filters')
+  await expect(page.getByText(/Some sources need a connection|部分来源需要连接/)).toBeVisible()
+  await expect(page.getByText('Unowned stale history')).toHaveCount(0)
+  await expect(page.getByText('NL → adzuna + ats + linkedin')).toHaveCount(0)
+  await expect(page.getByText('search API Not configured')).toHaveCount(0)
+  await page.getByRole('button', { name: /Open API key settings|打开 API 密钥设置/ }).click()
+  await expect(page).toHaveURL(/page=settings/)
+  await expect(page).toHaveURL(/tab=apiKeys/)
+})
+
+test('Discover account cache renders the CleanJobData source label', async ({ page }) => {
+  await install(page, { search: true })
+  await page.addInitScript(() => {
+    const filters = { location: '', remote: false, jobType: '', datePosted: 'any', experience: '', salaryMin: '', salaryMax: '' }
+    localStorage.setItem('applymate_last_search:fixture-user', JSON.stringify({ q: 'Scoped source', filters, results: [{ id: 'source-1', title: 'Scoped source role', company: 'Fixture employer', location: 'Dublin', url: 'https://example.invalid/source', description: '', source: 'cleanjobdata', score: 88 }], meta: { sourcesUsed: ['cleanjobdata'], routing: '', totalRaw: 1, totalDeduped: 1, durationMs: 3 } }))
+  })
+  await page.goto(`${origin}/?page=search`)
+  await expect(page.getByRole('textbox', { name: /Search jobs|搜索职位/ })).toHaveValue('Scoped source')
+  await expect(page.getByText('Scoped source role', { exact: true })).toBeVisible()
+  await expect(page.getByText('CleanJobData', { exact: true }).first()).toBeVisible()
+})
+
+for (const invalid of ['meta', 'skills', 'filters'] as const) {
+  test(`Discover ignores malformed scoped ${invalid} cache`, async ({ page }) => {
+    await install(page, { search: true })
+    await page.addInitScript(invalid => {
+      const filters: Record<string, unknown> = { location: '', remote: false, jobType: '', datePosted: 'any', experience: '', salaryMin: '', salaryMax: '' }
+      const result: Record<string, unknown> = { id: 'bad-row', title: 'Bad cached role', company: 'Fixture', location: 'Dublin', url: 'https://example.invalid/', description: '', source: 'manual', score: 80 }
+      const meta: Record<string, unknown> = { sourcesUsed: ['manual'], routing: '', totalRaw: 1, totalDeduped: 1, durationMs: 1 }
+      if (invalid === 'meta') meta.sourcesUsed = 'not-an-array'
+      if (invalid === 'skills') result.keySkills = 'not-an-array'
+      if (invalid === 'filters') filters.remote = 'not-a-boolean'
+      localStorage.setItem('applymate_last_search:fixture-user', JSON.stringify({ q: 'Broken cached query', filters, results: [result], meta }))
+    }, invalid)
+    await page.goto(`${origin}/?page=search`)
+    const input = page.getByRole('textbox', { name: /Search jobs|搜索职位/ })
+    await expect(input).toHaveValue('')
+    await expect(page.getByText('Bad cached role')).toHaveCount(0)
+    await input.fill('Recovery query')
+    await input.press('Enter')
+    await expect(page.getByText('Application flow engineer', { exact: true })).toBeVisible()
+  })
+}
+
+test('Discover ignores a late search after its component was unmounted', async ({ page }) => {
+  await install(page, { search: true })
+  await page.addInitScript(() => {
+    const original = window.fetch.bind(window)
+    window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (!url.includes('/api/search/unified?') || new URL(url, location.origin).searchParams.get('q') !== 'Old query') return original(input, init)
+      return await new Promise<Response>(resolve => {
+        ;(globalThis as typeof globalThis & { __releaseOldSearch: () => void }).__releaseOldSearch = () => {
+          const response = new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+          response.json = async () => { (globalThis as typeof globalThis & { __oldSearchRead?: boolean }).__oldSearchRead = true; return { jobs: [{ id: 'old-result', title: 'Old delayed role', company: 'Fixture', location: 'Dublin', url: 'https://example.invalid/old', description: '', source: 'manual', score: 1 }], meta: null } }
+          resolve(response)
+        }
+      })
+    }) as typeof fetch
+  })
+  await page.goto(`${origin}/?page=search`)
+  const input = page.getByRole('textbox', { name: /Search jobs|搜索职位/ })
+  await input.fill('Old query')
+  await input.press('Enter')
+  await expect.poll(() => page.evaluate(() => typeof (globalThis as typeof globalThis & { __releaseOldSearch?: () => void }).__releaseOldSearch)).toBe('function')
+  await page.getByRole('button', { name: 'Fixture jobs' }).click()
+  await page.getByRole('button', { name: 'Fixture search' }).click()
+  await input.fill('New query')
+  await input.press('Enter')
+  await expect(page.getByText('Application flow engineer', { exact: true })).toBeVisible()
+  await page.evaluate(() => (globalThis as typeof globalThis & { __releaseOldSearch: () => void }).__releaseOldSearch())
+  await expect.poll(() => page.evaluate(() => (globalThis as typeof globalThis & { __oldSearchRead?: boolean }).__oldSearchRead)).toBe(true)
+  await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('applymate_last_search:fixture-user') ?? '{}').q)).toBe('New query')
+  await expect(page.getByText('Old delayed role')).toHaveCount(0)
+  await expect(page.getByText('Application flow engineer', { exact: true })).toBeVisible()
 })
