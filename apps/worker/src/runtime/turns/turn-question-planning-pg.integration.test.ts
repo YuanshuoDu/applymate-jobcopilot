@@ -8,11 +8,16 @@ import { mergeCanonicalTurnQuestionContext } from "../canonical-turn-question-co
 import { StepContextBuilder, type StepContext } from "../context/step-context-builder.js"
 import { createPgInputClaimStore } from "../context/input-claim-store.js"
 import { recoverAnsweredQuestionContext } from "../question-answer-recovery.js"
+import { createPgRootTaskStore } from "../subagents/root-task-store.js"
+import type { PgSubagentPool } from "../subagents/types.js"
 import type { TurnExecutionOwnerFence } from "../execution-owner.js"
+import { resumeAgentTurn } from "../wakeup/consumer.js"
+import { parseWakeup } from "../wakeup/types.js"
 import { buildCognitiveActionAgenda } from "./cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, cognitiveAgendaReceiptIdempotencyKey } from "./cognitive-agenda-receipt.js"
 import { taskGraphItemId, TASK_GRAPH_SNAPSHOT_VERSION } from "../subagents/task-graph-snapshot.js"
 import { buildModelRequest } from "./turn-engine-messages.js"
+import { claimTurnLease } from "./lease.js"
 import { createPgTurnQuestionStore } from "./turn-question-store.js"
 import { questionId, questionItemId, type TurnQuestionPool } from "./turn-question-store-guards.js"
 import type { TurnQuestionPlanningReadOwner, TurnQuestionPlanningWaitRef } from "./turn-question-planning-contract.js"
@@ -471,7 +476,10 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
       public."agent_items", public."agent_events", public."agent_outbox", public."agent_inputs" TO "${role}"`)
     await admin.query(`GRANT UPDATE ("eventSequence") ON "agent_sessions" TO "${role}"`)
     await admin.query(`GRANT UPDATE ("status", "revision", "completedAt", "updatedAt") ON "agent_turns" TO "${role}"`)
-    await admin.query(`GRANT UPDATE ("attemptCount") ON public."sub_agent_tasks" TO "${role}"`)
+    await admin.query(`GRANT UPDATE ("attemptCount", "status", "leaseOwner", "leaseExpiresAt", "failureReason", "completedAt", "updatedAt", "allowedActions")
+      ON public."sub_agent_tasks" TO "${role}"`)
+    await admin.query(`GRANT UPDATE ("objectiveDigest", "canonicalOriginDigest", "objectiveIndexSemanticsVersion")
+      ON public."agent_turns" TO "${role}"`)
     await admin.query(`GRANT UPDATE ("status", "errorCode", "finishReason", "inputTokens", "outputTokens", "estimatedCostUsd", "completedAt", "inputThroughSequence", "consumedInputIds") ON "agent_steps" TO "${role}"`)
     await admin.query(`GRANT UPDATE ("status", "content", "revision", "completedAt", "updatedAt") ON "agent_items" TO "${role}"`)
     await admin.query(`GRANT UPDATE ("status", "consumedByStepId", "consumedAt") ON "agent_inputs" TO "${role}"`)
@@ -743,6 +751,46 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
     const currentSteerSequence = await acceptSteer(fixture, `clarification_current_steer_${fixture.turnId}`, currentSteerId)
     const pendingBeforeBuild = await admin!.query<{ status: string; consumedByStepId: string | null }>(`SELECT "status", "consumedByStepId" FROM "agent_inputs" WHERE "id" = $1`, [currentSteerId])
     expect(pendingBeforeBuild.rows).toEqual([{ status: "accepted", consumedByStepId: null }])
+    const wakeupRows = await admin!.query<{ eventId: string; sessionId: string; turnId: string; itemId: string; type: string; payload: unknown }>(
+      `SELECT "id" AS "eventId", "sessionId", "turnId", "itemId", "type", "payload" FROM "agent_events"
+       WHERE "sessionId" = $1 AND "turnId" = $2 AND "itemId" = $3 AND "type" = 'turn.wakeup' AND "payload"->>'waitId' = $4`,
+      [fixture.sessionId, fixture.turnId, answeredItemId, wait.waitId])
+    expect(wakeupRows.rows).toHaveLength(1)
+    const wakeup = parseWakeup(wakeupRows.rows[0])
+    if (!wakeup) throw new Error("Planning clarification fixture has no valid broker wakeup")
+    await expect(resumeAgentTurn(admin!, wakeup)).resolves.toMatchObject({
+      status: "resumed", sessionId: fixture.sessionId, turnId: fixture.turnId, itemId: answeredItemId,
+    })
+    const resumedLease = await claimTurnLease(admin!, {
+      turnId: fixture.turnId, sessionId: fixture.sessionId, ownerId: `${fixture.owner.ownerId}-resumed`,
+    })
+    expect(resumedLease.leaseVersion).toBe(fixture.owner.leaseVersion + 1)
+    const resumedTurn = await admin!.query<{ status: string; leaseOwnerId: string; leaseVersion: number }>(
+      `SELECT "status", "leaseOwnerId", "leaseVersion" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2`,
+      [fixture.turnId, fixture.sessionId])
+    expect(resumedTurn.rows).toEqual([{
+      status: "in_progress", leaseOwnerId: resumedLease.ownerId, leaseVersion: resumedLease.leaseVersion,
+    }])
+    const rootBeforeRebind = await admin!.query<{ goal: string; allowedActions: string[] }>(
+      `SELECT "goal", "allowedActions" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`,
+      [fixture.rootTaskId, fixture.sessionId, fixture.turnId])
+    expect(rootBeforeRebind.rows).toHaveLength(1)
+    const rootStore = createPgRootTaskStore(runtimePool(writer!, `clarification_root_resume_${fixture.turnId}`) as unknown as PgSubagentPool)
+    const reboundRoot = await rootStore.ensure({
+      lease: resumedLease, goal: rootBeforeRebind.rows[0]!.goal, allowedActions: rootBeforeRebind.rows[0]!.allowedActions,
+    })
+    expect(reboundRoot).toMatchObject({
+      id: fixture.rootTaskId, status: "running", leaseOwner: resumedLease.ownerId, attemptCount: 1,
+    })
+    expect(reboundRoot.leaseExpiresAt?.getTime()).toBe(resumedLease.leaseExpiresAt.getTime())
+    const rootLease = await admin!.query<{ status: string; leaseOwner: string; attemptCount: number; leaseExpiresAt: Date }>(
+      `SELECT "status", "leaseOwner", "attemptCount", "leaseExpiresAt" FROM "sub_agent_tasks"
+       WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3`, [fixture.rootTaskId, fixture.sessionId, fixture.turnId])
+    expect(rootLease.rows).toHaveLength(1)
+    expect(rootLease.rows[0]).toMatchObject({ status: "running", leaseOwner: resumedLease.ownerId, attemptCount: 1 })
+    expect(rootLease.rows[0]!.leaseExpiresAt.getTime()).toBe(resumedLease.leaseExpiresAt.getTime())
+    expect(rootLease.rows[0]!.leaseExpiresAt.getTime()).toBeGreaterThan(Date.now())
+    if (reboundRoot.leaseOwner !== resumedLease.ownerId) throw new Error("Planning clarification fixture did not rebind its root owner")
     const resumedStepId = await seedResumedStep(fixture, currentSteerSequence - 1)
     const durableItems = await admin!.query(`SELECT "id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "content", "createdAt"
       FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" IN ('tool_call', 'question') ORDER BY "createdAt", "id"`,
@@ -779,13 +827,13 @@ describePg("planning clarification wait persistence on disposable PostgreSQL", (
     expect(snapshot.planningClarificationHistoryPair).toEqual(historyPair)
     const inputStore = createPgInputClaimStore(pool, { userId: fixture.userId })
     const hydrationScope = { userId: fixture.userId, sessionId: fixture.sessionId, turnId: fixture.turnId,
-      rootTaskId: fixture.rootTaskId, parentTaskId: fixture.rootTaskId, turnLeaseOwner: fixture.owner.ownerId,
-      turnLeaseVersion: fixture.owner.leaseVersion, parentLeaseOwner: fixture.owner.ownerId, parentAttemptCount: 1 }
+      rootTaskId: fixture.rootTaskId, parentTaskId: fixture.rootTaskId, turnLeaseOwner: resumedLease.ownerId,
+      turnLeaseVersion: resumedLease.leaseVersion, parentLeaseOwner: reboundRoot.leaseOwner, parentAttemptCount: reboundRoot.attemptCount }
     const builder = new StepContextBuilder(inputStore, undefined, () => new Date(), hydrationScope)
     const buildInput = {
       scope: { userId: fixture.userId }, sessionId: fixture.sessionId, turnId: fixture.turnId, stepId: resumedStepId,
       snapshot, rootInputId: fixture.originalInputId, taskId: fixture.rootTaskId, mode: "new" as const,
-      lease: { ownerId: fixture.owner.ownerId, leaseVersion: fixture.owner.leaseVersion, now: new Date() },
+      lease: { ownerId: resumedLease.ownerId, leaseVersion: resumedLease.leaseVersion, now: new Date() },
     }
     const invalidSnapshot = { ...snapshot, planningClarifications: [
       recovered.planningClarifications[0]!, recovered.planningClarifications[0]!,
