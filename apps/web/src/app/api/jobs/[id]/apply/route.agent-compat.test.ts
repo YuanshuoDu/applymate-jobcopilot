@@ -46,8 +46,7 @@ function mount() {
   }
   renderToString(React.createElement(SessionProvider, {
     session: { user: { id: 'user-1', name: 'Fixture User', email: 'fixture@example.invalid', plan: 'free' }, expires: '2099-01-01T00:00:00.000Z' },
-    children: React.createElement(Harness),
-  }))
+  } as React.ComponentProps<typeof SessionProvider>, React.createElement(Harness)))
   const getActions = (): ReturnType<typeof useAgentPlaygroundActions> | undefined => actions
   const renderedActions = getActions()
   if (!renderedActions) throw new Error('hook did not mount')
