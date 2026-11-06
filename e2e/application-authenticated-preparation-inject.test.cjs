@@ -1,5 +1,8 @@
 const assert = require('node:assert/strict')
-const { fixtureChecks } = require('./application-authenticated-preparation-inject.cjs')
+const fs = require('node:fs')
+const { createRequire } = require('node:module')
+const path = require('node:path')
+const { fixtureChecks, renderConfig } = require('./application-authenticated-preparation-inject.cjs')
 const db = 'postgresql://fixture:fixture@db:5432/application_flow_fixture'
 const fixtureEnv = { CI: 'true', APPLICATION_AUTH_PREPARATION_BUILD: 'true', DATABASE_URL: db }
 const paths = new Set(['/workspace/apps/web/next.config.ts', '/workspace/e2e/application-authenticated-preparation-adapter.cjs'])
@@ -19,4 +22,13 @@ assert.equal(check('/workspace', { ...fixtureEnv, OTHER_API_KEY: 'do-not-use' })
 assert.equal(check('/workspace', fixtureEnv, { ...filesystem, existsSync: () => true }).noGitCheckout, false)
 assert.equal(check('/workspace', fixtureEnv, { ...filesystem, realpathSync: () => '/outside' }).expectedRegularFiles, false)
 assert.equal(check('/workspace', fixtureEnv, { ...filesystem, lstatSync: () => ({ isFile: () => true, isSymbolicLink: () => true }) }).expectedRegularFiles, false)
+const originalConfig = fs.readFileSync(path.resolve('apps/web/next.config.ts'), 'utf8')
+const rendered = renderConfig(originalConfig)
+const exactAlias = `config.resolve.alias['@jobcopilot/shared/pinned-outbound$'] = "/workspace/e2e/application-authenticated-preparation-adapter.cjs"`
+assert.equal(rendered.split(exactAlias).length, 2)
+assert.equal(rendered.split('serverExternalPackages:').length, 2)
+assert.throws(() => renderConfig(rendered), /Unexpected Next configuration/)
+const typescript = createRequire(path.resolve('apps/web/package.json'))('typescript')
+const parsed = typescript.createSourceFile('next.config.ts', rendered, typescript.ScriptTarget.Latest, true, typescript.ScriptKind.TS)
+assert.deepEqual(parsed.parseDiagnostics.map(diagnostic => diagnostic.messageText), [])
 console.log('Synthetic build guard: fixture and refusal checks passed')

@@ -26,18 +26,22 @@ function fixtureChecks(cwd, env, filesystem) {
   }
 }
 
+function renderConfig(config) {
+  const marker = '  reactStrictMode: true,'
+  if (config.split(marker).length !== 2 || config.includes('APPLICATION_PREPARATION_TEST_ALIAS')) throw new Error('Unexpected Next configuration')
+  const replacement = `${marker}\n  // APPLICATION_PREPARATION_TEST_ALIAS: disposable test image only.\n  webpack: (config) => {\n    config.resolve.alias['@jobcopilot/shared/pinned-outbound$'] = ${JSON.stringify(adapterPath)}\n    return config\n  },`
+  // Replacement text contains "$'", which String.replace treats specially.
+  return config.replace(marker, () => replacement)
+}
+
 function inject() {
   const checks = fixtureChecks(process.cwd(), process.env, fs)
   if (!Object.values(checks).every(Boolean)) {
     console.error(`Synthetic build guard: ${JSON.stringify(checks)}`)
     throw new Error('Refusing to inject outside the disposable build context')
   }
-  const config = fs.readFileSync(configPath, 'utf8')
-  const marker = '  reactStrictMode: true,'
-  if (config.split(marker).length !== 2 || config.includes('APPLICATION_PREPARATION_TEST_ALIAS')) throw new Error('Unexpected Next configuration')
-  const replacement = `${marker}\n  // APPLICATION_PREPARATION_TEST_ALIAS: disposable test image only.\n  webpack: (config) => {\n    config.resolve.alias['@jobcopilot/shared/pinned-outbound$'] = ${JSON.stringify(adapterPath)}\n    return config\n  },`
-  fs.writeFileSync(configPath, config.replace(marker, replacement))
+  fs.writeFileSync(configPath, renderConfig(fs.readFileSync(configPath, 'utf8')))
 }
 
 if (require.main === module) inject()
-module.exports = { fixtureChecks }
+module.exports = { fixtureChecks, renderConfig }
