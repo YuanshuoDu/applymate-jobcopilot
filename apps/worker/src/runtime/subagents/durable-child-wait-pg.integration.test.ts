@@ -568,6 +568,8 @@ async function diagnoseWorkerFStartCandidates(
 ): Promise<Record<string, unknown>> {
   const sourceProjection = await readChildWaitSourceCallProjection(client, task as unknown as Record<string, unknown>, continuationStepId)
   const terminalCallProjections = await readChildWaitTerminalCallProjections(client, task as unknown as Record<string, unknown>)
+  const sourceProjections = terminalCallProjections.filter(projection => projection.sourceWait.claimKeyDigest === null)
+  const claimProjections = terminalCallProjections.filter(projection => projection.sourceWait.claimKeyDigest !== null)
   const starts = await client.query<{ id: string; turnId: string; type: string; correlationId: string;
     sourceProjectionBound: boolean; projectedSourceProjectionBound: boolean }>(
     WORKER_F_UNSETTLED_STARTS_DIAGNOSTIC_SQL, [task.sessionId, task.id, task.turnId, task.rootTaskId,
@@ -581,13 +583,41 @@ async function diagnoseWorkerFStartCandidates(
     const lane = start.correlationId === sourceCallId ? "source_wait"
       : start.correlationId === claimCallId ? "continuation_claim"
         : start.correlationId === continuationStepId ? "continuation_model" : "other"
-    classified.push({ candidateOrdinal: index + 1, lane, kind: start.type === "tool_call.started" ? "tool_call" : "model_call",
+    const projection = terminalCallProjections.find(candidate => candidate.startEventId === start.id)
+    classified.push({ candidateOrdinal: index + 1, lane, type: start.type,
+      kind: start.type === "tool_call.started" ? "tool_call" : "model_call",
       sameTurn: start.turnId === task.turnId,
       sourceProjectionBound: start.sourceProjectionBound && start.projectedSourceProjectionBound,
+      projectionBound: !!projection, sourcePrefixBound: !!projection?.sourceStepPrefix,
+      claimChainBound: !!projection?.stepToolChain,
       blockedWhenOmitted, isSoleBlocker: blocker && !blockedWhenOmitted })
   }
   return { examinedStartCount: classified.length, unsettledStartCandidateCount: starts.rows.length,
-    unsettledStartCandidatesTruncated: starts.rows.length > 16, starts: classified }
+    unsettledStartCandidatesTruncated: starts.rows.length > 16,
+    sourceProjectionCount: sourceProjections.length, claimProjectionCount: claimProjections.length,
+    sourcePrefixCount: sourceProjections.filter(projection => !!projection.sourceStepPrefix).length,
+    claimPrefixCount: claimProjections.filter(projection => !!projection.sourceStepPrefix).length,
+    claimChainCount: claimProjections.filter(projection => !!projection.stepToolChain).length,
+    sourceCallProjectionInputsPresent: !!sourceProjection?.rawCallId && !!sourceProjection.projectedCallId,
+    starts: classified }
+}
+
+async function expectHistoricalWaitUnblocked(client: PoolClient, task: BlockingTaskSnapshot,
+  continuationStepId: string, sourceCallId: string, claimCallId: string, message: string): Promise<void> {
+  try {
+    await expect(hasBlockingExternalCall(client, task as unknown as Record<string, unknown>, undefined, continuationStepId), message)
+      .resolves.toBe(false)
+  } catch (error: unknown) {
+    let diagnostic: Record<string, unknown> = { probeAvailable: false }
+    try { diagnostic = await diagnoseWorkerFStartCandidates(client, task, continuationStepId, sourceCallId, claimCallId, true) }
+    catch { /* retain the strict assertion failure without exposing query errors */ }
+    const suffix = `; redacted historical-wait diagnostic=${JSON.stringify(diagnostic)}`
+    if (error instanceof Error) {
+      error.message += suffix
+      throw error
+    }
+    throw new Error(`${message}${suffix}`)
+  }
 }
 
 async function diagnoseWorkerFClaimProof(
@@ -4047,6 +4077,14 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expectReconciledSourceWait(repaired, ids, syntheticOwner)
       expect(repaired.wait?.consumedAt).toEqual(preRepair.wait?.consumedAt)
       expect(repaired.eventSequence).not.toBe(preRepair.eventSequence)
+      const repairedSourceStep = await pool.query<{ id: string; attempt: number; ordinal: number | string; status: string }>(
+        `SELECT "id", "attempt", "ordinal", "status" FROM "agent_steps"
+         WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4`,
+        [sourceOnly.sourceStepId, ids.sessionId, ids.turnId, ids.waiterTaskId],
+      )
+      expect(repairedSourceStep.rows).toHaveLength(1)
+      expect(repairedSourceStep.rows[0]).toMatchObject({ id: sourceOnly.sourceStepId, attempt: 1, status: "waiting_for_tool" })
+      expect(Number(repairedSourceStep.rows[0]!.ordinal)).toBe(sourceOnly.sourcePhysicalOrdinal)
       expect(workerB.stdoutText + workerB.stderrText).not.toContain(SOURCE_WAIT_SECRET_IDEMPOTENCY_KEY(ids.waiterTaskId))
       const [dispatchState, waitCalls] = await Promise.all([
         pool.query<{ attemptCount: number; count: number }>(`SELECT "attemptCount", COUNT(*)::int AS "count"
@@ -4391,8 +4429,9 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         if (!owner) throw new Error("multi_tool_live_owner_missing")
         expect(owner.leaseOwner).toEqual(expect.any(String))
         expect(owner.leaseExpiresAt).toBeInstanceOf(Date)
-        await expect(hasBlockingExternalCall(checkClient, { ...owner, userId: ids.userId }, undefined, continuationStepId),
-          "real writer events for the complete two-tool step must settle its historical wait claim").resolves.toBe(false)
+        await expectHistoricalWaitUnblocked(checkClient, { ...owner, userId: ids.userId }, continuationStepId,
+          PHONE_SHAPED_WAIT_TOOL_CALL_ID, `${ids.loopCallPrefix}:${ids.waiterTaskId}:attempt:1`,
+          "real writer events for the complete two-tool step must settle its historical wait claim")
         await checkClient.query("COMMIT")
       } catch (error) {
         await checkClient.query("ROLLBACK").catch(() => undefined)
@@ -4461,7 +4500,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
     const suffix = randomUUID()
     const ids: FixtureIds = { userId: `durable-child-wait-two-user-${suffix}`, sessionId: `durable-child-wait-two-session-${suffix}`,
       turnId: `durable-child-wait-two-turn-${suffix}`, rootTaskId: "", waiterTaskId: "", targetTaskId: "",
-      secondTargetTaskId: `subagent-second-${suffix}`, waitScopedClaimCallIds: true,
+      secondTargetTaskId: `subagent-${suffix}`, waitScopedClaimCallIds: true,
       loopCallPrefix: `two-wait-call-${suffix}`, finalText: FINAL_MARKER }
     const queueName = `agent-child-wait-two-${suffix}`
     const queueRedis = new Redis(redisUrl!, { maxRetriesPerRequest: null })
@@ -4509,7 +4548,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(secondWait?.stepId.endsWith(":attempt:1")).toBe(true)
       const resumed = workerB.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_LOOP_RESUMED "))
       expect(resumed ? JSON.parse(resumed.slice("WORKER_B_LOOP_RESUMED ".length)) : null).toMatchObject({
-        phase: "two-waits", status: "waiting_for_dependency", executorCalls: 2, dispatcherCalls: 0,
+        phase: "two-waits", status: "waiting_for_dependency", executorCalls: 3, dispatcherCalls: 0,
       })
       expect(await workerB.exited).toMatchObject({ code: 0, signal: null })
 
@@ -5057,7 +5096,9 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         const snapshot: BlockingTaskSnapshot = { ...lockedTask, userId: ids.userId }
         const blocking = (value: BlockingTaskSnapshot = snapshot, ignoredEventId?: string) => hasBlockingExternalCall(
           settlementClient, value as unknown as Record<string, unknown>, ignoredEventId, continuationStepId)
-        await expect(blocking(), "exact source and claim evidence should settle after the next step starts").resolves.toBe(false)
+        await expectHistoricalWaitUnblocked(settlementClient, snapshot, continuationStepId,
+          PHONE_SHAPED_WAIT_TOOL_CALL_ID, orphanCallId,
+          "exact source and claim evidence should settle after the next step starts")
         await expect(blocking({ ...snapshot, leaseOwner: `${snapshot.leaseOwner}:stale` }),
           "a stale owner must not borrow historical settlement proof").resolves.toBe(true)
         await expect(blocking({ ...snapshot, attemptCount: snapshot.attemptCount + 1 }),
