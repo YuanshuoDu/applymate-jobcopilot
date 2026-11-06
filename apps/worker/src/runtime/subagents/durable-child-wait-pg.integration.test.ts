@@ -1444,9 +1444,9 @@ async function expectCompletedClaimBeforeItemEventSafety(
     const task: BlockingTaskSnapshot = { ...row, userId: session.rows[0]!.userId }
     const callItemId = `task:${ids.waiterTaskId}:item:tool-call:${callId}:attempt:${attempt}`
     const sourceCallItemId = `task:${ids.waiterTaskId}:item:tool-call:${PHONE_SHAPED_WAIT_TOOL_CALL_ID}:attempt:1`
-    const recoveredSource = await client.query<{ result: Record<string, unknown>; targetTaskIds: unknown; sourceCallContent: Record<string, unknown>;
+    const recoveredSource = await client.query<{ waitId: string; result: Record<string, unknown>; targetTaskIds: unknown; sourceCallContent: Record<string, unknown>;
       sourceStatus: string; sourceRevision: number; resultStatus: string; resultRevision: number; resultContent: Record<string, unknown> }>(
-      `SELECT wait."result", wait."targetTaskIds", sourceCall."content" AS "sourceCallContent",
+      `SELECT wait."id" AS "waitId", wait."result", wait."targetTaskIds", sourceCall."content" AS "sourceCallContent",
           sourceCall."status" AS "sourceStatus", sourceCall."revision" AS "sourceRevision",
           sourceResult."status" AS "resultStatus", sourceResult."revision" AS "resultRevision", sourceResult."content" AS "resultContent"
        FROM "agent_wait_conditions" AS wait
@@ -1578,7 +1578,12 @@ async function expectCompletedClaimBeforeItemEventSafety(
     expect(exactSourceProof.sourceWait).toMatchObject({ sourceStepId: exactSourceProjection.sourceStepId,
       sourceAttempt: exactSourceProjection.sourceAttempt, sourceCallItemId: exactSourceProjection.callItemId,
       sourceCallId: exactSourceProjection.rawCallId, projectedSourceCallId: exactSourceProjection.projectedCallId })
-    expect(exactSourceProof.sourceStepPrefix).toBeDefined()
+    expect(exactSourceProof).not.toHaveProperty("sourceStepPrefix")
+    expect(exactSourceProof.sourceStepHandoff).toMatchObject({ schemaVersion: "recovered_wait_handoff.v1",
+      waitId: recoveredRow.waitId, stepId: sourceStepId, attempt: exactSourceProjection.sourceAttempt,
+      sourceCallItemId: exactSourceProjection.callItemId, sourceCallId: exactSourceProjection.rawCallId,
+      sourceResultItemId: recoveredResultItemId, events: expect.any(Array) })
+    expect(exactSourceProof.sourceStepHandoff?.events).toHaveLength(6)
     const evaluateTerminalProof = async (startedId: string, settledId: string): Promise<boolean> => {
       const proof = await client.query<{ settled: boolean }>(
         WORKER_F_SAME_CALL_ID_TERMINAL_PROOF_SQL,
