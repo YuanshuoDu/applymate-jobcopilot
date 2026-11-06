@@ -14586,8 +14586,12 @@ describeWithServices("production TaskGraph lifecycle and root resume (disposable
         mailboxMessageIds: result.mailboxMessageIds, now: new Date() })
       const safeResult = record(result.result)
       const diagnostic = {
+        finishedStatus: diagnosticEnum(finished, TASK_DIAGNOSTIC_STATUSES) ?? "other",
         childStatus: diagnosticEnum(result.status, CHILD_OUTCOME_STATUSES) ?? "other",
         failureCategory: result.failureReason ? diagnosticErrorClass(result.failureReason) ?? "other" : "none",
+        failureReasonCodeCategory: typeof result.failureReason === "string" && result.failureReason.length > 0
+          ? diagnosticEnum(result.failureReason, CHILD_OUTCOME_FAILURE_CODES) ?? "other" : "none",
+        retryDisposition: diagnosticEnum(result.retryDisposition, CHILD_OUTCOME_RETRY_DISPOSITIONS) ?? "none",
         structuredOutputFailureCategory: diagnosticEnum(safeResult?.structuredOutputFailureCategory, STRUCTURED_RESULT_FAILURE_CATEGORIES) ?? "none",
         adapterStreamInvocations: diagnosticBoundedCount(childAdapterDiagnostics.streamInvocations),
         adapterFailureCount: diagnosticBoundedCount(childAdapterDiagnostics.adapterFailureCount),
