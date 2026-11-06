@@ -84,6 +84,8 @@ export async function POST(req: NextRequest, { params }: Params) {
   const resumeId = typeof body?.resumeId === 'string' ? body.resumeId : ''
   const findingIndex = Number.isInteger(body?.findingIndex) ? body.findingIndex as number : -1
   if (!resumeId || findingIndex < 0) return err('resumeId and findingIndex are required')
+  const auditOperationId = typeof body?.auditOperationId === 'string' ? body.auditOperationId : ''
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(auditOperationId)) return err('Run the independent audit again before applying a correction.', 409)
 
   const scope = { userId: auth.userId, jobId }
   let original: Awaited<ReturnType<typeof readAuditOperation>> | null
@@ -91,6 +93,13 @@ export async function POST(req: NextRequest, { params }: Params) {
   catch { return err('The review status could not be read. Refresh before applying a correction.', 503) }
   if (!original) return err('Job not found', 404)
   const stored = original.kind === 'completed' ? original.audit : null
+  if (original.kind !== 'completed' || original.operationId !== auditOperationId) {
+    const attemptId = req.headers.get('X-Application-Audit-Attempt-Id')
+    if (attemptId && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(attemptId)) {
+      return Response.json({ error: 'Run the independent audit again before applying a correction.', code: 'AUDIT_CORRECTION_NOT_STARTED', auditAttemptId: attemptId, correctionWrite: 'not_started' }, { status: 409, headers: { 'Cache-Control': 'no-store, private' } })
+    }
+    return err('Run the independent audit again before applying a correction.', 409)
+  }
   if (!stored || stored.resumeId !== resumeId) {
     return err('Run the independent audit again before applying a correction.', 409)
   }
@@ -168,7 +177,7 @@ export async function POST(req: NextRequest, { params }: Params) {
         materialBasis: { resume: updatedResume ?? currentResume, coverLetter: updatedCoverLetter ?? currentLetter }, versions: { resumeUpdatedAt, coverLetterUpdatedAt } })) {
         throw new Error('Could not persist audit correction')
       }
-      return ok({ audit: updatedAudit, target, appliedContent: proposedValue, resume: updatedResume, coverLetter: updatedCoverLetter, resumeUpdatedAt, coverLetterUpdatedAt })
+      return ok({ audit: updatedAudit, operationId: nextOperation, target, appliedContent: proposedValue, resume: updatedResume, coverLetter: updatedCoverLetter, resumeUpdatedAt, coverLetterUpdatedAt })
     })
     return result ?? err('Job not found', 404)
   } catch (error) {

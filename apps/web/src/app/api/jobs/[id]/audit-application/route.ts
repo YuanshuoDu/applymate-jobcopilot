@@ -19,6 +19,7 @@ import type { ApplicationAudit, ResumeContent } from '@/lib/types'
 
 type Params = { params: Promise<{ id: string }> }
 type ApplicationAuditResponse = ApplicationAudit & {
+  operationId: string
   resumeUpdatedAt?: string
   coverLetterUpdatedAt?: string
 }
@@ -60,7 +61,7 @@ export async function GET(req: NextRequest, { params }: Params) {
     })
     if (!snapshot) return noStore(err('Job not found.', 404))
     if ('state' in snapshot) return noStore(ok(snapshot))
-    if (snapshot.kind === 'completed') return noStore(ok(snapshot.audit))
+    if (snapshot.kind === 'completed') return noStore(ok({ ...snapshot.audit, operationId: snapshot.operationId }))
     if (snapshot.kind === 'none') return noStore(ok(null))
     return noStore(ok({ state: snapshot.kind === 'invalid' ? 'unavailable' : snapshot.kind }))
   } catch (error) {
@@ -89,7 +90,15 @@ export async function POST(req: NextRequest, { params }: Params) {
   const coverLetter = coverLetterId ? await db.coverLetter.findFirst({ where: { id: coverLetterId, jobId, userId: prep.userId } }) : null
   if (coverLetterId && !coverLetter) return err('Final cover letter not found for this job', 404)
   const documentCheck = checkAuditDocumentLimits(resume.content, coverLetter?.content ?? null, resume.name)
-  if (!documentCheck.ok) return err(AUDIT_LIMIT_MESSAGES[documentCheck.reason], 422)
+  if (!documentCheck.ok) {
+    const attempt = req.headers.get('X-Application-Audit-Attempt-Id')
+    // Only this pre-registration branch can certify that this handler did not
+    // register an audit. Older clients retain the existing error response.
+    if (attempt && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(attempt)) {
+      return noStore(Response.json({ error: AUDIT_LIMIT_MESSAGES[documentCheck.reason], code: 'AUDIT_PRECHECK_NOT_REGISTERED', auditAttemptId: attempt, auditRegistration: 'not_started' }, { status: 422 }))
+    }
+    return err(AUDIT_LIMIT_MESSAGES[documentCheck.reason], 422)
+  }
   const includeCoverLetter = Boolean(coverLetter)
 
   const scope = { userId: prep.userId, jobId }
@@ -203,6 +212,7 @@ ${finalCoverLetterSection}`
     if (!finished) return err('This review was superseded or the application materials changed. Check the current state.', 409)
     const response: ApplicationAuditResponse = {
       ...audit,
+      operationId,
       ...(toIso(resume.updatedAt) ? { resumeUpdatedAt: toIso(resume.updatedAt) } : {}),
       ...(toIso(coverLetter?.updatedAt) ? { coverLetterUpdatedAt: toIso(coverLetter?.updatedAt) } : {}),
     }

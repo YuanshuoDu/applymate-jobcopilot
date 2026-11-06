@@ -17,6 +17,7 @@ import { useI18n } from '@/lib/i18n'
 import { applicationListUrl, loadLinkedApplication, readApplicationListState } from '@/lib/application-list-state'
 import { AUDIT_ACTIVITY_PREFIX, hasCurrentApplicationPackAudit, type StoredApplicationAudit } from '@/lib/application-audit'
 import { parseApplicationAuditView } from '@/lib/application-audit-view'
+import { APPLICATION_AUDIT_FENCE_EVENT, auditFenceStorage, beginAuditFence, postApplicationAudit, readAuditFence, reconcileAuditFence, waitForAuditFencePost } from '@/lib/application-audit-fence'
 import { auditLimitMessageKey } from '@/lib/application-audit-limit-message'
 import { useApplicationTasks } from '@/components/jobs/useApplicationTasks'
 import { useApplicationCoverLetters } from '@/components/jobs/useApplicationCoverLetters'
@@ -650,7 +651,15 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   const [packStage, setPackStage] = useState<'idle' | 'resume' | 'coverLetter' | 'audit' | 'review'>('idle')
   const [preparationReviewRequired, setPreparationReviewRequired] = useState(false)
   const [verifiedAudit, setVerifiedAudit] = useState<{ owner: string; jobId: string; audit: StoredApplicationAudit } | null>(null)
-  const [auditOperationView, setAuditOperationView] = useState<{ owner: string; jobId: string; state: 'pending' | 'failed' | 'stale' | 'unavailable' } | null>(null)
+  const [auditOperationView, setAuditOperationView] = useState<{ owner: string; jobId: string; state: 'pending' | 'failed' | 'stale' | 'unavailable' | 'localPending' | 'localUnavailable' } | null>(null)
+  const [auditLimitNotice, setAuditLimitNotice] = useState<string | null>(null)
+  const [, setAuditFenceRevision] = useState(0)
+  useEffect(() => {
+    const changed = () => setAuditFenceRevision(value => value + 1)
+    window.addEventListener(APPLICATION_AUDIT_FENCE_EVENT, changed)
+    return () => window.removeEventListener(APPLICATION_AUDIT_FENCE_EVENT, changed)
+  }, [])
+  const localAuditFence = drawerUserId ? readAuditFence(auditFenceStorage(), drawerUserId, job.id) : { state: 'unavailable' as const }
   const auditReadEpoch = useRef(0)
   const [openPackItem, setOpenPackItem] = useState<'resume' | 'coverLetter' | 'audit' | null>(null)
   const [resumePreview, setResumePreview] = useState<Resume | null>(null)
@@ -667,9 +676,25 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   const readCanonicalAudit = async (owner: string, jobId: string) => {
     const epoch = ++auditReadEpoch.current
     setVerifiedAudit(null)
+    const local = readAuditFence(auditFenceStorage(), owner, jobId)
+    if (local.state === 'pending' || local.state === 'unavailable') {
+      setLatestAudit(null)
+      setAuditOperationView({ owner, jobId, state: local.state === 'pending' ? 'localPending' : 'localUnavailable' })
+      return { epoch, value: null }
+    }
     const result = await readDescriptionScope(`/api/jobs/${encodeURIComponent(jobId)}/audit-application`)
     if (auditReadEpoch.current !== epoch || !isCurrentDrawer(owner) || drawerJobIdRef.current !== jobId) return null
     const parsed = result.ok ? parseApplicationAuditView(result.data) : { state: 'unavailable' as const, record: null }
+    const current = readAuditFence(auditFenceStorage(), owner, jobId)
+    if (current.state !== 'none') {
+      const reconciled = current.state === 'confirmed' && parsed.record && await reconcileAuditFence(auditFenceStorage(), owner, jobId, parsed.record)
+      if (auditReadEpoch.current !== epoch || !isCurrentDrawer(owner) || drawerJobIdRef.current !== jobId) return null
+      if (!reconciled) {
+        setLatestAudit(null)
+        setAuditOperationView({ owner, jobId, state: current.state === 'unavailable' ? 'localUnavailable' : 'localPending' })
+        return { epoch, value: null }
+      }
+    }
     setAuditOperationView(parsed.state === 'pending' || parsed.state === 'failed' || parsed.state === 'stale' || parsed.state === 'unavailable' ? { owner, jobId, state: parsed.state } : null)
     if (parsed.state !== 'complete') setLatestAudit(null)
     return { epoch, value: parsed.record }
@@ -688,8 +713,9 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     const visible = () => { if (document.visibilityState === 'visible') refresh() }
     refresh()
     window.addEventListener('focus', refresh)
+    window.addEventListener(APPLICATION_AUDIT_FENCE_EVENT, refresh)
     document.addEventListener('visibilitychange', visible)
-    return () => { auditReadEpoch.current += 1; window.removeEventListener('focus', refresh); document.removeEventListener('visibilitychange', visible) }
+    return () => { auditReadEpoch.current += 1; window.removeEventListener('focus', refresh); window.removeEventListener(APPLICATION_AUDIT_FENCE_EVENT, refresh); document.removeEventListener('visibilitychange', visible) }
   }, [drawerUserId, job.id, job.userId])
 
   useEffect(() => {
@@ -834,9 +860,9 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   // replace the confirmed version in the Application Pack preview.
   const selectedLetterUnavailable = Boolean(job.finalCoverLetterId && !selectedCoverLetter)
   const selectedLetterStatus = t(coverLettersLoading ? 'coverLetter.panel.loading' : 'application.selectedLetterUnavailable')
-  const storedAudit = verifiedAudit?.owner === drawerUserId && verifiedAudit.jobId === job.id
+  const storedAudit = localAuditFence.state === 'none' && verifiedAudit?.owner === drawerUserId && verifiedAudit.jobId === job.id
     ? verifiedAudit.audit : null
-  const displayedAudit = latestAudit ?? storedAudit?.audit ?? null
+  const displayedAudit = localAuditFence.state === 'none' ? latestAudit ?? storedAudit?.audit ?? null : null
   const applicationPreflight = useMemo(() => assessApplicationPreflight(job), [job])
   const evidenceGapFindings = (displayedAudit?.findings ?? []).filter(finding => finding.area !== 'job_match' && finding.resolution === 'evidence_needed')
   const factualAuditFindings = (displayedAudit?.findings ?? []).filter(finding => finding.area !== 'job_match' && finding.severity !== 'pass' && finding.resolution !== 'evidence_needed')
@@ -1017,7 +1043,13 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
   async function autoTailorAndAudit() {
     const owner = drawerUserIdRef.current
     if (!owner || !isCurrentDrawer(owner) || job.userId !== owner) return
+    const fence = readAuditFence(auditFenceStorage(), owner, job.id)
+    if (fence.state !== 'none') {
+      setAuditOperationView({ owner, jobId: job.id, state: fence.state === 'unavailable' ? 'localUnavailable' : 'localPending' })
+      return
+    }
     if (preparationInFlight.current || !manualWorkAllowed || taskReadState !== 'ready' || (previewResumeId && !evidenceResumeId)) return
+    setAuditLimitNotice(null)
     if (job.finalCoverLetterId && !selectedCoverLetter) {
       setOpenPackItem('coverLetter')
       toast.info(t('application.selectedLetterLoading'))
@@ -1042,6 +1074,15 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
     const coverLetterRepairs = [
       ...(auditNeedsRepair ? factualAuditFindings.filter(finding => finding.area === 'cover_letter') : []),
     ]
+    const auditReceiptSignature = storedAudit?.receipt?.signature
+    const auditOperationId = storedAudit?.operationId
+    if (resumeRepairs.length && (!auditReceiptSignature || !/^[a-f0-9]{64}$/.test(auditReceiptSignature)
+      || !auditOperationId || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(auditOperationId))) {
+      setLatestAudit(null)
+      setPreparationReviewRequired(true)
+      toast.error(t('application.auditVersionMismatch'))
+      return
+    }
     if (coverLetterRepairs.length) {
       if (!job.finalCoverLetterId || !selectedCoverLetter || !evidenceResumeId) {
         setCoverLetterSelectionNeeded(!job.finalCoverLetterId)
@@ -1078,7 +1119,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
         setPackStage('resume')
         const { data, error } = await apiMutate<{ adaptedResumeId: string }>(
           `/api/jobs/${job.id}/tailor-resume`, 'POST',
-          { resumeId: adaptedResumeId, forceRetailor: true, auditFindings: resumeRepairs },
+          { resumeId: adaptedResumeId, forceRetailor: true, auditReceiptSignature, auditOperationId },
         )
         if (!isCurrentDrawer(owner)) return
         requireLetterScope()
@@ -1163,10 +1204,32 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
       }
 
       setPackStage('audit')
-      const { data: audit, error: auditError } = await apiMutate<ApplicationAudit & Pick<StoredApplicationAudit, 'resumeUpdatedAt' | 'coverLetterUpdatedAt'>>(
-        `/api/jobs/${job.id}/audit-application`, 'POST', { resumeId: adaptedResumeId, coverLetterId: coverLetter?.id ?? null },
-      )
+      const auditStorage = auditFenceStorage()
+      const attemptId = beginAuditFence(auditStorage, owner, job.id, adaptedResumeId, coverLetter?.id ?? null)
+      if (!attemptId) {
+        const current = readAuditFence(auditStorage, owner, job.id).state
+        const state = current === 'pending' || current === 'confirmed' ? 'localPending' : 'localUnavailable'
+        setAuditOperationView({ owner, jobId: job.id, state })
+        throw new Error(t(`application.auditState.${state}`))
+      }
+      const outcome = await waitForAuditFencePost(postApplicationAudit(auditStorage, owner, job.id, attemptId,
+        { resumeId: adaptedResumeId, coverLetterId: coverLetter?.id ?? null }), auditStorage, owner, job.id, attemptId)
+      const audit = outcome?.data ?? null
+      const auditError = outcome?.error ?? null
       if (!isCurrentDrawer(owner)) return
+      if (outcome?.preflightRejected) {
+        setAuditOperationView(null)
+        const limitKey = auditLimitMessageKey(auditError)
+        setAuditLimitNotice(limitKey)
+        throw new Error(limitKey ? t(limitKey) : auditError ?? t('application.auditVersionMismatch'))
+      }
+      const registered = readAuditFence(auditStorage, owner, job.id)
+      if (!outcome || registered.state !== 'confirmed' || registered.fence.attemptId !== attemptId) {
+        setAuditOperationView({ owner, jobId: job.id, state: registered.state === 'unavailable' ? 'localUnavailable' : 'localPending' })
+        const limitKey = auditLimitMessageKey(auditError)
+        setAuditLimitNotice(limitKey)
+        throw new Error(`${limitKey ? `${t(limitKey)} ` : ''}${t('application.auditState.localPending')}`)
+      }
       requireLetterScope()
       const auditWaitDeadline = Date.now() + 30_000
       while (checkedLetter && (checkedLetter.kind !== 'ready' || !checkedLetter.current())) {
@@ -1178,14 +1241,36 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
         const limitKey = auditLimitMessageKey(auditError)
         throw new Error(limitKey ? t(limitKey) : auditError ?? 'Independent audit could not run')
       }
-      if (audit.resumeUpdatedAt !== tailored.updatedAt || (coverLetter
+      if (!audit.operationId || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(audit.operationId)
+        || audit.resumeUpdatedAt !== tailored.updatedAt || (coverLetter
         ? audit.coverLetterUpdatedAt !== coverLetter.updatedAt
         : audit.coverLetterUpdatedAt != null)) {
         setPreparationReviewRequired(true)
         throw new Error(t('application.auditVersionMismatch'))
       }
       setLatestAudit(audit)
+      const matchesReview = (receipt: StoredApplicationAudit | null) => Boolean(receipt
+        && receipt.operationId === audit.operationId && receipt.resumeId === adaptedResumeId
+        && receipt.coverLetterId === (coverLetter?.id ?? null)
+        && receipt.resumeUpdatedAt === audit.resumeUpdatedAt && receipt.coverLetterUpdatedAt === audit.coverLetterUpdatedAt
+        && receipt.audit?.auditedAt === audit.auditedAt && receipt.audit?.verdict === audit.verdict
+        && receipt.audit?.summary === audit.summary && receipt.audit?.matchScore === audit.matchScore
+        && receipt.audit?.source === audit.source && JSON.stringify(receipt.audit?.findings) === JSON.stringify(audit.findings))
+      const initialVerification = await readCanonicalAudit(owner, job.id)
+      if (!isCurrentDrawer(owner) || drawerJobIdRef.current !== job.id) return
+      requireLetterScope()
+      const initialReceipt = initialVerification?.value ?? null
+      if (!initialVerification || !matchesReview(initialReceipt) || auditReadEpoch.current !== initialVerification.epoch) {
+        setLatestAudit(null)
+        throw new Error(t('application.auditVersionMismatch'))
+      }
       if (audit.verdict !== 'pass') {
+        if (!initialReceipt?.receipt?.signature || !/^[a-f0-9]{64}$/.test(initialReceipt.receipt.signature)) {
+          setLatestAudit(null)
+          throw new Error(t('application.auditVersionMismatch'))
+        }
+        setVerifiedAudit({ owner, jobId: job.id, audit: initialReceipt })
+        setLatestAudit(null)
         setPackStage('idle')
         setOpenPackItem('audit')
         toast.warning('Audit needs targeted corrections', audit.summary)
@@ -1212,16 +1297,7 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
       if (!isCurrentDrawer(owner) || drawerJobIdRef.current !== job.id) return
       requireLetterScope()
       const receipt = verified?.value
-      if (!verified || !receipt || receipt.resumeId !== adaptedResumeId
-        || receipt.coverLetterId !== (coverLetter?.id ?? null)
-        || receipt.resumeUpdatedAt !== audit.resumeUpdatedAt
-        || receipt.coverLetterUpdatedAt !== audit.coverLetterUpdatedAt
-        || receipt.audit?.auditedAt !== audit.auditedAt
-        || receipt.audit?.verdict !== audit.verdict
-        || receipt.audit?.summary !== audit.summary
-        || receipt.audit?.matchScore !== audit.matchScore
-        || receipt.audit?.source !== audit.source
-        || JSON.stringify(receipt.audit?.findings) !== JSON.stringify(audit.findings)) {
+      if (!verified || !receipt || !matchesReview(receipt)) {
         throw new Error(t('application.auditVersionMismatch'))
       }
       if (auditReadEpoch.current !== verified.epoch) return
@@ -1381,6 +1457,8 @@ function JobDetailDrawer({ job, task, taskReadState, onRefreshTasks, onClose, on
         </div>
 
         <ApplicationProgress hasMaterials={Boolean(evidenceResumeId)} checked={Boolean(currentPackAudited)} recorded={applicationRecorded} task={task} />
+
+        {auditLimitNotice && <p role="status" style={{ margin: '18px 28px 0', fontSize: 12 }}>{t(auditLimitNotice)}</p>}
 
         {auditOperationView && auditOperationView.owner === drawerUserId && auditOperationView.jobId === job.id && <div role="status" style={{ margin: '18px 28px 0', fontSize: 12 }}>
           <p>{t(`application.auditState.${auditOperationView.state}`)}</p>

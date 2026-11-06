@@ -14,7 +14,13 @@ describe('application audit response', () => {
   })
 
   it('retains a correctly shaped audit response', () => {
-    const record = { resumeId: 'resume', coverLetterId: null, audit: { verdict: 'pass', auditedAt: '2026-11-05T12:00:00.000Z', findings: [] } }
+    const record = { resumeId: 'resume', coverLetterId: null, operationId: '123e4567-e89b-42d3-a456-426614174000', audit: { verdict: 'pass', auditedAt: '2026-11-05T12:00:00.000Z', findings: [] } }
     expect(parseApplicationAuditView(record)).toEqual({ state: 'complete', record })
+  })
+
+  it('fails closed when a completed response lacks a valid operation identity', () => {
+    const record = { resumeId: 'resume', coverLetterId: null, audit: { verdict: 'pass', auditedAt: '2026-11-05T12:00:00.000Z', findings: [] } }
+    expect(parseApplicationAuditView(record)).toEqual({ state: 'unavailable', record: null })
+    expect(parseApplicationAuditView({ ...record, operationId: 'invalid' })).toEqual({ state: 'unavailable', record: null })
   })
 })

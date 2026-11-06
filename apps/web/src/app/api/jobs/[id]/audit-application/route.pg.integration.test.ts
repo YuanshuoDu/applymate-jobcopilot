@@ -3,6 +3,7 @@ import { randomBytes } from 'node:crypto'
 import { PrismaClient } from '@prisma/client'
 import { NextRequest } from 'next/server'
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { AUDIT_LIMIT_MESSAGES } from '@/lib/application-audit-limits'
 
 // Refuse all but an explicitly opted-in, separately named loopback database.
 // Tables live in a random schema; no migrations or production data are touched.
@@ -20,7 +21,7 @@ if (enabled) {
 }
 
 type LockEvidence = { pid?: number; startedAt?: Date; started: () => void; issued: () => void; beforeQuery?: Promise<void>; rawErrors?: unknown[] }
-type RequestScope = { client: PrismaClient; userId: string; summary?: string; gate?: ReturnType<typeof gate>; repair?: boolean; review?: boolean; tailor?: boolean; proposedValue?: string; letterId?: string; evidence?: LockEvidence }
+type RequestScope = { client: PrismaClient; userId: string; summary?: string; gate?: ReturnType<typeof gate>; repair?: boolean; review?: boolean; tailor?: boolean; tailorModelDone?: boolean; updateGate?: ReturnType<typeof gate>; proposedValue?: string; letterId?: string; auditOperationId?: string; auditAttemptId?: string; evidence?: LockEvidence }
 const requestScope = new AsyncLocalStorage<RequestScope>()
 function current(): RequestScope {
   const scope = requestScope.getStore()
@@ -110,16 +111,24 @@ integration('application audit ordering with disposable PostgreSQL', () => {
     vi.doMock('@/lib/db', () => ({ db: new Proxy({}, { get(_target, key) {
       if (key === 'agentRole') return { findFirst: async () => null }
       if (key === '$transaction') return (callback: (tx: unknown) => Promise<unknown>) => {
-        const { client, evidence } = current()
+        const request = current()
+        const { client } = request
+        const evidence = request.tailor && !request.tailorModelDone ? undefined : request.evidence
         return client.$transaction(async tx => {
-          if (!evidence) return callback(tx)
-          const rows = await tx.$queryRaw<Array<{ pid: number; startedAt: Date }>>`SELECT pg_backend_pid() AS pid, transaction_timestamp() AS "startedAt"`
-          evidence.pid = rows[0].pid
-          evidence.startedAt = rows[0].startedAt
-          evidence.started()
+          if (!evidence && !request.updateGate) return callback(tx)
+          if (evidence) {
+            const rows = await tx.$queryRaw<Array<{ pid: number; startedAt: Date }>>`SELECT pg_backend_pid() AS pid, transaction_timestamp() AS "startedAt"`
+            evidence.pid = rows[0].pid
+            evidence.startedAt = rows[0].startedAt
+            evidence.started()
+          }
           let first = true
           const observed = new Proxy(tx, { get(target, property, receiver) {
-            if (property === '$queryRaw') return async (...args: unknown[]) => {
+            if (property === 'resume' && request.tailorModelDone && request.updateGate) return new Proxy(target.resume, { get(delegate, key, delegateReceiver) {
+              if (key === 'updateMany') return async (...args: unknown[]) => { request.updateGate!.entered(); await request.updateGate!.waiting; return Reflect.apply(delegate.updateMany, delegate, args) }
+              return Reflect.get(delegate, key, delegateReceiver)
+            } })
+            if (property === '$queryRaw' && evidence) return async (...args: unknown[]) => {
               if (first) {
                 first = false
                 await evidence.beforeQuery
@@ -150,7 +159,7 @@ integration('application audit ordering with disposable PostgreSQL', () => {
         request.gate?.entered()
         await request.gate?.waiting
         if (request.repair) return { provider: 'fixture', model: 'fixture', text: JSON.stringify({ proposedValue: 'Synthetic corrected summary' }) }
-        if (request.tailor) return { provider: 'fixture', model: 'fixture', text: JSON.stringify({ after: 'Synthetic corrected summary', reason: 'Fixture correction' }) }
+        if (request.tailor) { request.tailorModelDone = true; return { provider: 'fixture', model: 'fixture', text: JSON.stringify({ after: 'Synthetic corrected summary', reason: 'Fixture correction' }) } }
         return { provider: 'fixture', model: 'fixture', text: JSON.stringify({
           summary: request.summary ?? 'Fixture audit', matchScore: 80,
           findings: [request.review
@@ -197,23 +206,29 @@ integration('application audit ordering with disposable PostgreSQL', () => {
     await admin?.$disconnect()
   }, 30_000)
 
+  let lastAuditOperationId = '11111111-1111-4111-8111-111111111111'
   async function invoke(kind: 'audit' | 'read' | 'download' | 'print' | 'repair', scope: RequestScope): Promise<Response> {
     const path = kind === 'repair' ? 'audit-application/apply' : kind === 'audit' || kind === 'read' ? 'audit-application' : 'application-pack'
     const method = kind === 'audit' || kind === 'download' || kind === 'repair' ? 'POST' : 'GET'
     const request = new NextRequest(`http://localhost/api/jobs/job-1/${path}`, {
-      method, ...(kind === 'audit' || kind === 'repair' ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ resumeId: 'resume-1', ...(scope.letterId ? { coverLetterId: scope.letterId } : {}), ...(kind === 'repair' ? { findingIndex: 0 } : {}) }) } : {}),
+      method, ...(kind === 'audit' || kind === 'repair' ? { headers: { 'Content-Type': 'application/json', ...(scope.auditAttemptId ? { 'X-Application-Audit-Attempt-Id': scope.auditAttemptId } : {}) }, body: JSON.stringify({ resumeId: 'resume-1', ...(scope.letterId ? { coverLetterId: scope.letterId } : {}), ...(kind === 'repair' ? { findingIndex: 0, auditOperationId: scope.auditOperationId ?? lastAuditOperationId } : {}) }) } : {}),
     })
     const params = { params: Promise.resolve({ id: 'job-1' }) }
     const response = await requestScope.run(scope, () => kind === 'audit' ? postAudit(request, params) : kind === 'repair' ? postRepair(request, params)
       : kind === 'read' ? getAudit(request, params) : kind === 'download' ? postPack(request, params) : getPack(request, params))
     if (!(response instanceof Response)) throw new Error('Route did not return a response')
+    if (kind === 'audit' && response.ok) {
+      const data: unknown = await response.clone().json()
+      if (data && typeof data === 'object' && 'operationId' in data && typeof data.operationId === 'string') lastAuditOperationId = data.operationId
+    }
     return response
   }
 
-  async function invokeTailor(scope: RequestScope): Promise<Response> {
+  async function invokeTailor(scope: RequestScope, captured?: { receipt: { signature: string }; operationId: string }): Promise<Response> {
+    const audit = captured ?? await (await invoke('read', { client: scope.client, userId: scope.userId })).json()
     const request = new NextRequest('http://localhost/api/jobs/job-1/tailor-resume', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ resumeId: 'resume-1', forceRetailor: true, auditFindings: [
+      body: JSON.stringify({ resumeId: 'resume-1', forceRetailor: true, auditReceiptSignature: audit.receipt?.signature, auditOperationId: audit.operationId, auditFindings: [
         { area: 'resume', severity: 'warning', target: 'summary', title: 'Review summary', evidence: 'Synthetic', action: 'Correct' },
       ] }),
     })
@@ -223,7 +238,9 @@ integration('application audit ordering with disposable PostgreSQL', () => {
   }
 
   async function seedTailoredResume() {
-    return clientA.resume.update({ where: { id: 'resume-1' }, data: { kind: 'adapted', origin: 'ai-adapted', targetJobId: 'job-1' } })
+    const resume = await clientA.resume.update({ where: { id: 'resume-1' }, data: { kind: 'adapted', origin: 'ai-adapted', targetJobId: 'job-1' } })
+    expect((await invoke('audit', { client: clientA, userId: 'owner-a', review: true })).status).toBe(200)
+    return resume
   }
 
   it('hides an old pass while a new audit is running and rejects pack and print', async () => {
@@ -251,6 +268,26 @@ integration('application audit ordering with disposable PostgreSQL', () => {
     expect(await (await invoke('read', { client: clientB, userId: 'owner-a' })).json()).toEqual({ state: 'stale' })
     expect((await invoke('download', { client: clientB, userId: 'owner-a' })).status).toBe(409)
     expect((await invoke('print', { client: clientB, userId: 'owner-a' })).status).toBe(409)
+  })
+
+  it('echoes an oversized-document attempt without changing an existing audit control', async () => {
+    const before = await clientB.activity.findMany({ orderBy: { id: 'asc' } })
+    expect(before.length).toBeGreaterThan(0)
+    await clientB.resume.update({ where: { id: 'resume-1' }, data: { content: { summary: 'x'.repeat(12_000) } } })
+    const attempt = 'be8fcfd3-6ce5-4e17-9d59-fde9f7b85a56'
+    const request = new NextRequest('http://localhost/api/jobs/job-1/audit-application', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Application-Audit-Attempt-Id': attempt },
+      body: JSON.stringify({ resumeId: 'resume-1' }),
+    })
+    const rejected = await requestScope.run({ client: clientA, userId: 'owner-a' }, () => postAudit(request, { params: Promise.resolve({ id: 'job-1' }) }))
+    if (!rejected) throw new Error('Audit route did not return a response')
+    expect(rejected.status).toBe(422)
+    expect(await rejected.json()).toEqual({ error: AUDIT_LIMIT_MESSAGES.final_resume_too_long, code: 'AUDIT_PRECHECK_NOT_REGISTERED', auditAttemptId: attempt, auditRegistration: 'not_started' })
+    const after = await clientB.activity.findMany({ orderBy: { id: 'asc' } })
+    expect(after).toHaveLength(before.length)
+    expect(after).toEqual(before)
+    expect(await (await invoke('read', { client: clientB, userId: 'owner-a' })).json()).toEqual({ state: 'stale' })
   })
 
   it('fences an earlier pass when the source evidence is too long to review', async () => {
@@ -496,6 +533,35 @@ integration('application audit ordering with disposable PostgreSQL', () => {
     return resume
   }
 
+  it('rejects review A finding index after B replaced it before the repair request', async () => {
+    const reviewA = await invoke('audit', { client: clientA, userId: 'owner-a', review: true, summary: 'Review A', proposedValue: 'Correction A' })
+    expect(reviewA.status).toBe(200)
+    const operationA = (await reviewA.json()).operationId as string
+    const reviewB = await invoke('audit', { client: clientB, userId: 'owner-a', review: true, summary: 'Review B', proposedValue: 'Correction B' })
+    expect(reviewB.status).toBe(200)
+    const operationB = (await reviewB.json()).operationId as string
+    expect(operationB).not.toBe(operationA)
+    const before = await clientA.resume.findUniqueOrThrow({ where: { id: 'resume-1' } })
+    const beforeVersions = await clientA.resumeVersion.findMany({ where: { resumeId: 'resume-1' }, orderBy: { id: 'asc' } })
+    const beforeActivities = await clientA.activity.findMany({ orderBy: { id: 'asc' } })
+    const beforeLetters = await clientA.coverLetter.findMany({ orderBy: { id: 'asc' } })
+    const attemptId = '22222222-2222-4222-8222-222222222222'
+    const rejected = await invoke('repair', { client: clientA, userId: 'owner-a', auditOperationId: operationA, auditAttemptId: attemptId })
+    expect(rejected.status).toBe(409)
+    expect(rejected.headers.get('Cache-Control')).toBe('no-store, private')
+    expect(await rejected.json()).toMatchObject({ code: 'AUDIT_CORRECTION_NOT_STARTED', auditAttemptId: attemptId, correctionWrite: 'not_started' })
+    expect(await clientB.resume.findUniqueOrThrow({ where: { id: 'resume-1' } })).toEqual(before)
+    expect(await clientB.resumeVersion.findMany({ where: { resumeId: 'resume-1' }, orderBy: { id: 'asc' } })).toEqual(beforeVersions)
+    expect(await clientB.activity.findMany({ orderBy: { id: 'asc' } })).toEqual(beforeActivities)
+    expect(await clientB.coverLetter.findMany({ orderBy: { id: 'asc' } })).toEqual(beforeLetters)
+    const accepted = await invoke('repair', { client: clientB, userId: 'owner-a', auditOperationId: operationB })
+    expect(accepted.status).toBe(200)
+    const response = await accepted.json()
+    expect(response.appliedContent).toBe('Correction B')
+    expect(response.operationId).not.toBe(operationB)
+    expect((await (await invoke('read', { client: clientA, userId: 'owner-a' })).json()).operationId).toBe(response.operationId)
+  }, 30_000)
+
   it('does not write a correction whose generation overlaps a newer audit', async () => {
     const before = await seedRepair()
     const model = gate()
@@ -572,9 +638,159 @@ integration('application audit ordering with disposable PostgreSQL', () => {
     } finally { model.release(); await within(Promise.allSettled([pending])) }
   }, 30_000)
 
+  it('rejects forced repair when the audited resume changed before the request', async () => {
+    const before = await seedTailoredResume()
+    const receipt = await (await invoke('read', { client: clientA, userId: 'owner-a' })).json()
+    const edited = { ...(before.content as object), summary: 'Already corrected by user' }
+    await clientB.resume.update({ where: { id: before.id }, data: { content: edited } })
+    expect((await invokeTailor({ client: clientA, userId: 'owner-a' }, receipt)).status).toBe(409)
+    expect((await clientB.resume.findUniqueOrThrow({ where: { id: before.id } })).content).toEqual(edited)
+    expect(await clientB.resumeVersion.count({ where: { resumeId: before.id } })).toBe(0)
+  })
+
+  it('rejects forced repair when the audited cover letter changed before the request', async () => {
+    const before = await seedTailoredResume()
+    const letter = await seedLetter()
+    expect((await invoke('audit', { client: clientA, userId: 'owner-a', review: true, letterId: letter.id })).status).toBe(200)
+    const receipt = await (await invoke('read', { client: clientA, userId: 'owner-a' })).json()
+    await clientB.coverLetter.update({ where: { id: letter.id }, data: { content: 'Edited after review' } })
+    expect((await invokeTailor({ client: clientA, userId: 'owner-a' }, receipt)).status).toBe(409)
+    expect((await clientB.resume.findUniqueOrThrow({ where: { id: before.id } })).content).toEqual(before.content)
+    expect(await clientB.resumeVersion.count({ where: { resumeId: before.id } })).toBe(0)
+  })
+
+  it('allows a reviewed tailored resume before final selection', async () => {
+    const before = await seedTailoredResume()
+    await clientA.job.update({ where: { id: 'job-1' }, data: { finalResumeId: null } })
+    const receipt = await (await invoke('read', { client: clientA, userId: 'owner-a' })).json()
+    expect((await invokeTailor({ client: clientA, userId: 'owner-a' }, receipt)).status).toBe(200)
+    expect((await clientB.resume.findUniqueOrThrow({ where: { id: before.id } })).content).toMatchObject({ summary: 'Synthetic corrected summary' })
+  })
+
+  it('rejects forced repair superseded by a newer audit while the model runs', async () => {
+    const before = await seedTailoredResume()
+    const receipt = await (await invoke('read', { client: clientA, userId: 'owner-a' })).json()
+    const model = gate()
+    const pending = invokeTailor({ client: clientA, userId: 'owner-a', gate: model }, receipt)
+    try {
+      await within(model.reached)
+      expect((await invoke('audit', { client: clientB, userId: 'owner-a', review: true, summary: 'Replacement review' })).status).toBe(200)
+      model.release()
+      expect((await within(pending)).status).toBe(409)
+      expect((await clientB.resume.findUniqueOrThrow({ where: { id: before.id } })).content).toEqual(before.content)
+      expect(await clientB.resumeVersion.count({ where: { resumeId: before.id } })).toBe(0)
+    } finally { model.release(); await within(Promise.allSettled([pending])) }
+  }, 30_000)
+
+  it('rejects an old operation even when a newer signed audit is byte-for-byte identical', async () => {
+    const before = await seedTailoredResume()
+    const old = await (await invoke('read', { client: clientA, userId: 'owner-a' })).json()
+    const { completeAuditOperation } = await import('@/lib/application-audit-operation')
+    await clientB.$transaction(async tx => {
+      await tx.$queryRaw`SELECT "id" FROM "Job" WHERE "id" = 'job-1' AND "userId" = 'owner-a' FOR UPDATE`
+      const job = await tx.job.findUniqueOrThrow({ where: { id: 'job-1' } })
+      const resume = await tx.resume.findUniqueOrThrow({ where: { id: before.id } })
+      const scope = { userId: 'owner-a', jobId: 'job-1' }
+      const id = await registerAuditOperation(tx, scope)
+      expect(await completeAuditOperation(tx, scope, id, { resumeId: before.id, coverLetterId: null, audit: old.audit, jobBasis: job,
+        materialBasis: { resume, coverLetter: null }, versions: { resumeUpdatedAt: old.resumeUpdatedAt } })).toBe(true)
+    })
+    const replacement = await (await invoke('read', { client: clientB, userId: 'owner-a' })).json()
+    expect(replacement.receipt.signature).toBe(old.receipt.signature)
+    expect(replacement.operationId).not.toBe(old.operationId)
+    expect((await invokeTailor({ client: clientA, userId: 'owner-a' }, old)).status).toBe(409)
+    expect((await clientB.resume.findUniqueOrThrow({ where: { id: before.id } })).content).toEqual(before.content)
+    expect(await clientB.resumeVersion.count({ where: { resumeId: before.id } })).toBe(0)
+  })
+
+  it.each(['unselect', 'select'] as const)('rejects forced repair if the final resume selection changes during model work: %s', async direction => {
+    const before = await seedTailoredResume()
+    if (direction === 'select') await clientA.job.update({ where: { id: 'job-1' }, data: { finalResumeId: null } })
+    const receipt = await (await invoke('read', { client: clientA, userId: 'owner-a' })).json()
+    const model = gate()
+    const pending = invokeTailor({ client: clientA, userId: 'owner-a', gate: model }, receipt)
+    try {
+      await within(model.reached)
+      await clientB.job.update({ where: { id: 'job-1' }, data: { finalResumeId: direction === 'select' ? before.id : null } })
+      model.release()
+      expect((await within(pending)).status).toBe(409)
+      expect((await clientB.resume.findUniqueOrThrow({ where: { id: before.id } })).content).toEqual(before.content)
+      expect(await clientB.resumeVersion.count({ where: { resumeId: before.id } })).toBe(0)
+    } finally { model.release(); await within(Promise.allSettled([pending])) }
+  }, 30_000)
+
+  it('waits for a newly registered audit holding the Job lock, then rejects the old repair', async () => {
+    const before = await seedTailoredResume()
+    const receipt = await (await invoke('read', { client: clientA, userId: 'owner-a' })).json()
+    const model = gate(), hold = gate(), started = gate(), issued = gate(), query = gate()
+    const evidence: LockEvidence = { started: started.entered, issued: issued.entered, beforeQuery: query.waiting }
+    const pending = invokeTailor({ client: clientA, userId: 'owner-a', gate: model, evidence }, receipt)
+    let holderPid = 0
+    let holder: Promise<unknown> | undefined
+    try {
+      await within(model.reached)
+      holder = clientB.$transaction(async tx => {
+        holderPid = (await tx.$queryRaw<Array<{ pid: number }>>`SELECT pg_backend_pid() AS pid`)[0].pid
+        await tx.$queryRaw`SELECT "id" FROM "Job" WHERE "id" = 'job-1' AND "userId" = 'owner-a' FOR UPDATE`
+        await registerAuditOperation(tx, { userId: 'owner-a', jobId: 'job-1' })
+        hold.entered()
+        await hold.waiting
+      }, { timeout: 15_000 })
+      await within(hold.reached)
+      model.release()
+      await within(started.reached)
+      query.release()
+      await within(issued.reached)
+      let blocked = false
+      const deadline = Date.now() + 8_000
+      while (!blocked && Date.now() < deadline) {
+        blocked = (await admin.$queryRaw<Array<{ blocked: boolean }>>`SELECT ${holderPid}::int = ANY(pg_blocking_pids(${evidence.pid!}::int)) AS blocked`)[0].blocked
+        if (!blocked) await new Promise(resolve => setTimeout(resolve, 50))
+      }
+      expect(blocked).toBe(true)
+      hold.release()
+      await within(holder)
+      expect((await within(pending)).status).toBe(409)
+      expect((await clientB.resume.findUniqueOrThrow({ where: { id: before.id } })).content).toEqual(before.content)
+      expect(await clientB.resumeVersion.count({ where: { resumeId: before.id } })).toBe(0)
+    } finally { model.release(); query.release(); hold.release(); await within(Promise.allSettled([pending, ...(holder ? [holder] : [])])) }
+  }, 30_000)
+
+  it('holds the Job lock through the repair commit before a competing audit may register', async () => {
+    await seedTailoredResume()
+    const receipt = await (await invoke('read', { client: clientA, userId: 'owner-a' })).json()
+    const update = gate(), aStarted = gate(), aIssued = gate(), aQuery = gate()
+    const aEvidence: LockEvidence = { started: aStarted.entered, issued: aIssued.entered, beforeQuery: aQuery.waiting }
+    const bStarted = gate(), bIssued = gate(), bQuery = gate()
+    const bEvidence: LockEvidence = { started: bStarted.entered, issued: bIssued.entered, beforeQuery: bQuery.waiting }
+    aQuery.release()
+    const repair = invokeTailor({ client: clientA, userId: 'owner-a', updateGate: update, evidence: aEvidence }, receipt)
+    let audit: Promise<Response> | undefined
+    try {
+      await within(update.reached)
+      audit = invoke('audit', { client: clientB, userId: 'owner-a', review: true, evidence: bEvidence })
+      await within(bStarted.reached)
+      bQuery.release()
+      await within(bIssued.reached)
+      let blocked = false
+      const deadline = Date.now() + 8_000
+      while (!blocked && Date.now() < deadline) {
+        blocked = (await admin.$queryRaw<Array<{ blocked: boolean }>>`SELECT ${aEvidence.pid!}::int = ANY(pg_blocking_pids(${bEvidence.pid!}::int)) AS blocked`)[0].blocked
+        if (!blocked) await new Promise(resolve => setTimeout(resolve, 50))
+      }
+      expect(blocked).toBe(true)
+      update.release()
+      expect((await within(repair)).status).toBe(200)
+      expect((await within(audit)).status).toBe(409)
+      expect(await clientB.resumeVersion.count({ where: { resumeId: 'resume-1' } })).toBe(1)
+      expect(await (await invoke('read', { client: clientB, userId: 'owner-a' })).json()).toEqual({ state: 'stale' })
+    } finally { aQuery.release(); bQuery.release(); update.release(); await within(Promise.allSettled([repair, ...(audit ? [audit] : [])])) }
+  }, 30_000)
+
   it('saves forced repair with unrelated sections preserved and one pre-change history snapshot', async () => {
     const before = await seedTailoredResume()
-    const response = await invokeTailor({ client: clientA, userId: 'owner-a' })
+    const receipt = await (await invoke('read', { client: clientA, userId: 'owner-a' })).json()
+    const response = await invokeTailor({ client: clientA, userId: 'owner-a' }, receipt)
     expect(response.status).toBe(200)
     expect(await response.json()).toMatchObject({ adaptedResumeId: before.id, revised: true })
     const after = await clientB.resume.findUniqueOrThrow({ where: { id: before.id } })
@@ -582,6 +798,8 @@ integration('application audit ordering with disposable PostgreSQL', () => {
     const versions = await clientB.resumeVersion.findMany({ where: { resumeId: before.id, userId: 'owner-a' } })
     expect(versions).toHaveLength(1)
     expect(versions[0]).toMatchObject({ name: before.name, content: before.content })
+    expect((await invokeTailor({ client: clientA, userId: 'owner-a' }, receipt)).status).toBe(409)
+    expect(await clientB.resumeVersion.count({ where: { resumeId: before.id } })).toBe(1)
   }, 30_000)
 
   it('rolls back the forced repair if its history snapshot cannot be saved', async () => {

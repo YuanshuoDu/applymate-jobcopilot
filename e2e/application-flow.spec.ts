@@ -48,6 +48,8 @@ test.beforeAll(async () => {
       import {ResumePage} from '@/components/pages/ResumePage';
       import {SearchPage} from '@/components/pages/SearchPage';
       import {DashboardPage} from '@/components/pages/DashboardPage';
+      import {CoverLetterPanel} from '@/components/coverletter/CoverLetterPanel';
+      import {useSession} from 'next-auth/react';
       import {useApplicationCoverLetters} from '@/components/jobs/useApplicationCoverLetters';
       import {I18nProvider} from '@/lib/i18n';
       import {ToastProvider} from '@/components/ui';
@@ -60,6 +62,20 @@ test.beforeAll(async () => {
         const value=useApplicationCoverLetters(owner,job,owner,'selected-letter');
         return <div><button onClick={()=>void value.refetch().then(result=>(globalThis.__fixtureLetterOutcomes ||= []).push(result.kind))}>Probe refresh</button><button onClick={()=>setOwner(v=>v==='fixture-user'?'fixture-b':'fixture-user')}>Probe owner</button><button onClick={()=>setJob(v=>v==='outside-page'?'other-job':'outside-page')}>Probe job</button><p data-testid="letter-probe">{value.loading?'loading':value.letter?.content||'unavailable'}</p></div>
       }
+      function LetterPanelProbe(){
+        const [jobId,setJobId]=useState('outside-page'); const [selected,setSelected]=useState<string|null>('selected-letter'); const [shown,setShown]=useState(true);
+        return <><button onClick={()=>setJobId(v=>v==='outside-page'?'other-job':'outside-page')}>Switch panel job</button><button onClick={()=>setSelected('other-selected')}>Switch selected letter</button><button onClick={()=>setSelected(null)}>Clear selected letter</button><button onClick={()=>setShown(v=>!v)}>Toggle panel</button>{shown && <CoverLetterPanel job={{id:jobId,userId:'fixture-user',role:'Fixture role',company:'Fixture Employer',finalCoverLetterId:selected}} resumeContent={{contact:{name:'Fixture'}}} resumeName="Fixture" templateId="clean" templateOptions={{}} onClose={()=>{globalThis.__fixturePanelCloseCalls=(globalThis.__fixturePanelCloseCalls||0)+1}} />}</>
+      }
+      function MultiLetterPanelProbe(){
+        const [first,setFirst]=useState(true);const job={id:'outside-page',userId:'fixture-user',role:'Fixture role',company:'Fixture Employer',finalCoverLetterId:'selected-letter'};
+        const panel=()=> <CoverLetterPanel job={job} resumeContent={{contact:{name:'Fixture'}}} resumeName="Fixture" templateId="clean" templateOptions={{}} onClose={()=>{}}/>;
+        return <><button onClick={()=>setFirst(false)}>Hide first letter panel</button>{first&&<div data-testid="first-letter-panel">{panel()}</div>}<div data-testid="second-letter-panel">{panel()}</div></>
+      }
+      function OwnerLetterPanelProbe(){
+        const {data}=useSession(); const [shown,setShown]=useState(true); const owner=data?.user?.id||'fixture-user';
+        const job={id:owner==='fixture-b'?'other-job':'outside-page',userId:owner,role:owner==='fixture-b'?'Fixture B Role':'Fixture A Role',company:'Fixture Employer',finalCoverLetterId:'selected-letter'};
+        return <><button onClick={()=>setShown(v=>!v)}>Toggle owner panel</button>{shown&&<CoverLetterPanel job={job} resumeContent={{contact:{name:'Fixture'}}} resumeName="Fixture" templateId="clean" templateOptions={{}} onClose={()=>{}}/>}</>
+      }
       function Harness(){
         const [page,setPage]=useState(new URL(location.href).searchParams.get('page')||'jobs');
         const navigate=(next)=>{const url=new URL(location.href);url.searchParams.set('page',next);history.pushState({},'',url);setPage(next)};
@@ -67,7 +83,7 @@ test.beforeAll(async () => {
         return <I18nProvider><ToastProvider><NavContext.Provider value={{navigate}}>
           <nav aria-label="Fixture navigation">{['jobs','resume','search','dashboard'].map(name=><button key={name} onClick={()=>navigate(name)}>Fixture {name}</button>)}</nav>
           <main style={{display:'flex',height:'calc(100vh - 32px)',minWidth:0}}>
-          {page==='jobs'?<JobsPage/>:page==='resume'?<ResumePage/>:page==='search'?<SearchPage/>:page==='dashboard'?<DashboardPage/>:page==='letter-probe'?<LetterProbe/>:<AgentDestination/>}
+          {page==='jobs'?<JobsPage/>:page==='resume'?<ResumePage/>:page==='search'?<SearchPage/>:page==='dashboard'?<DashboardPage/>:page==='letter-probe'?<LetterProbe/>:page==='letter-panel-probe'?<LetterPanelProbe/>:page==='multi-letter-panel-probe'?<MultiLetterPanelProbe/>:page==='owner-letter-panel-probe'?<OwnerLetterPanelProbe/>:<AgentDestination/>}
           </main></NavContext.Provider></ToastProvider></I18nProvider>
       }
       globalThis.__fixtureGetCachedResume = () => getCachedApiResponse('/api/resume/resume-1', 'fixture-user');
@@ -125,6 +141,7 @@ test.afterAll(async () => {
 })
 
 const time = '2026-10-30T10:00:00.000Z'
+const fixtureAuditOperation = '123e4567-e89b-42d3-a456-426614174000'
 function job(id = 'outside-page') {
   return { id, userId: 'fixture-user', company: 'Fixture Employer', role: 'Application flow engineer', logo: 'FE', location: 'Dublin', status: 'saved', score: 82,
     url: 'https://employer.invalid/apply', description: 'Build TypeScript services with PostgreSQL.', salary: 'EUR 45000', source: 'manual', notes: '',
@@ -140,7 +157,7 @@ function resume() {
 function audit(resumeUpdatedAt = time, hasCoverLetter = false) {
   const findings = [{ area: 'resume', severity: 'pass', title: 'Verified', evidence: 'Supported', action: 'None' }]
   if (hasCoverLetter) findings.push({ area: 'cover_letter', severity: 'pass', title: 'Verified', evidence: 'Supported', action: 'None' })
-  const record = { resumeId: 'resume-1', coverLetterId: null, resumeUpdatedAt,
+  const record = { resumeId: 'resume-1', coverLetterId: null, resumeUpdatedAt, operationId: fixtureAuditOperation, receipt: { version: 1 as const, signature: 'a'.repeat(64) },
     audit: { verdict: 'pass', summary: 'Fixture materials checked.', findings, matchScore: 82, source: 'independent', auditedAt: time } }
   return record as typeof record & { coverLetterUpdatedAt?: string }
 }
@@ -340,7 +357,7 @@ async function install(page: Page, options: { stale?: boolean; taskCheckpoint?: 
       }
       if (pathname.endsWith('/tailor-resume')) return json(route, { adaptedResumeId: 'resume-1' })
       if (pathname === '/api/resume' && options.baseList === 'empty') { state.baseSaveStarted = true; if (options.holdBaseSave) await baseSaveGate; if (options.failBaseSave) return route.abort('failed'); const saved = body as { name: string; content: ReturnType<typeof resume>['content'] }; state.savedBase = { ...state.resume, id: 'base-created', kind: 'base', targetJobId: null, name: saved.name, content: saved.content }; return json(route, state.savedBase) }
-      if (pathname.endsWith('/audit-application')) { state.auditStarted = true; if (options.holdAudit) await auditGate; if (options.failFirstAudit && state.writes.filter(write => write.path.endsWith('/audit-application')).length === 1) return json(route, { error: 'Fixture audit unavailable' }, 500); const letterId = (body as { coverLetterId?: string | null }).coverLetterId ?? null; state.audit = { ...audit(state.resume.updatedAt, Boolean(letterId)), coverLetterId: letterId, ...(letterId ? { coverLetterUpdatedAt: time } : {}) }; return json(route, { ...state.audit.audit, ...(options.auditVersion === 'resume-missing' ? {} : { resumeUpdatedAt: options.auditVersion === 'resume-changed' ? '2026-10-30T11:00:00.000Z' : state.resume.updatedAt }), ...(letterId && options.auditVersion !== 'letter-missing' ? { coverLetterUpdatedAt: options.auditVersion === 'letter-changed' ? '2026-10-30T11:00:00.000Z' : time } : {}) }) }
+      if (pathname.endsWith('/audit-application')) { state.auditStarted = true; if (options.holdAudit) await auditGate; if (options.failFirstAudit && state.writes.filter(write => write.path.endsWith('/audit-application')).length === 1) return json(route, { error: 'Fixture audit unavailable' }, 500); const letterId = (body as { coverLetterId?: string | null }).coverLetterId ?? null; state.audit = { ...audit(state.resume.updatedAt, Boolean(letterId)), coverLetterId: letterId, ...(letterId ? { coverLetterUpdatedAt: time } : {}) }; return json(route, { ...state.audit.audit, operationId: state.audit.operationId, ...(options.auditVersion === 'resume-missing' ? {} : { resumeUpdatedAt: options.auditVersion === 'resume-changed' ? '2026-10-30T11:00:00.000Z' : state.resume.updatedAt }), ...(letterId && options.auditVersion !== 'letter-missing' ? { coverLetterUpdatedAt: options.auditVersion === 'letter-changed' ? '2026-10-30T11:00:00.000Z' : time } : {}) }) }
       if (pathname.endsWith('/assign')) { state.assignStarted = true; if (options.holdAssign) await assignGate; Object.assign(state.job, body); return json(route, state.job) }
       if (pathname === '/api/jobs/outside-page/apply') { state.manualPosted = true; if (options.manualOutcome === 'unknown') return route.abort('failed'); Object.assign(state.job, { status: 'applied', workflowState: 'submitted', appliedAt: time }); return json(route, { applied: true }) }
       return json(route, { error: 'Unexpected mutation' }, 500)
@@ -448,14 +465,44 @@ for (const scenario of [
       await page.getByRole('button', { name: /Run independent audit|Run audit again|运行独立审核|再次运行审核/ }).click()
     }
     const expected = testInfo.project.name === 'mobile-zh' ? scenario.zh : scenario.en
-    await expect(page.getByText(expected, { exact: true }).first()).toBeVisible()
-    if (surface === 'resume') await expect(page.locator('.resume-audit-card-error')).toHaveText(expected)
+    await expect(page.getByText(expected, { exact: false }).first()).toBeVisible()
+    if (surface === 'resume') await expect(page.locator('.resume-audit-card-error')).toContainText(expected)
     await expect(page).toHaveURL(/outside-page/)
     await expect(page.getByRole('button', { name: /Download application materials|下载申请材料/ })).toHaveCount(0)
     await expect(page.getByText(/Application materials are ready|申请材料已准备好/, { exact: true })).toHaveCount(0)
     expect(auditPosts).toBe(1)
     expect(state.writes.filter(write => write.path.endsWith('/assign'))).toEqual([])
     expect(state.packRequests).toBe(0)
+    expect(state.unexpected).toEqual([])
+  })
+}
+
+for (const surface of ['jobs', 'resume'] as const) for (const proof of ['matching', 'wrong-attempt'] as const) {
+  test(`${surface} only releases a certified pre-registration limit for its own attempt: ${proof}`, async ({ page }, testInfo) => {
+    test.skip(!['desktop-en', 'mobile-zh'].includes(testInfo.project.name), 'Checks English desktop and Chinese mobile')
+    const state = await install(page, { stale: true })
+    let posts = 0
+    await page.route('**/api/jobs/outside-page/audit-application', route => {
+      if (route.request().method() !== 'POST') return route.fallback()
+      posts++
+      if (posts > 1) return route.fallback()
+      const attempt = route.request().headers()['x-application-audit-attempt-id']
+      return route.fulfill({ status: 422, json: { error: AUDIT_LIMIT_MESSAGES.final_resume_too_long, code: 'AUDIT_PRECHECK_NOT_REGISTERED', auditRegistration: 'not_started', auditAttemptId: proof === 'matching' ? attempt : '123e4567-e89b-42d3-a456-426614174099' } })
+    })
+    if (surface === 'jobs') await open(page)
+    else await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    const trigger = surface === 'jobs' ? page.getByRole('button', { name: /Check current materials|检查当前材料/, exact: true }) : page.getByRole('button', { name: /Run independent audit|Run audit again|运行独立审核|再次运行审核/ })
+    await trigger.click()
+    await expect.poll(() => posts).toBe(1)
+    const message = testInfo.project.name === 'mobile-zh' ? /所选简历内容过长/ : /selected resume is too long/i
+    await expect(page.getByText(message, { exact: false }).first()).toBeVisible()
+    const marker = () => page.evaluate(() => sessionStorage.getItem('applymate:audit-fence:fixture-user:outside-page'))
+    if (proof === 'matching') await expect.poll(marker).toBeNull()
+    else await expect.poll(marker).not.toBeNull()
+    expect(posts).toBe(1)
+    await trigger.click()
+    if (proof === 'matching') await expect.poll(() => posts).toBe(2)
+    else { await expect(page.getByText(/unconfirmed review request|尚未确认的审核请求/).first()).toBeVisible(); expect(posts).toBe(1) }
     expect(state.unexpected).toEqual([])
   })
 }
@@ -527,6 +574,605 @@ test('Kanban cards retain drag-to-status after adding the application entry', as
   await expect(destination.locator('[draggable="true"]').filter({ hasText: 'Second fixture role' })).toBeVisible()
   expect(state.writes).toEqual([])
   expect(state.unexpected).toEqual([])
+})
+
+for (const mode of ['missing', 'error', 'misbound'] as const) test(`selected cover letter is never replaced by another draft when ${mode}`, async ({ page }, testInfo) => {
+  test.skip(!testInfo.project.name.startsWith('desktop-'), 'Exercises desktop editor')
+  const state = await install(page)
+  let retried = false
+  const other = { id: 'other-letter', userId: 'fixture-user', jobId: 'outside-page', content: 'Wrong draft', tone: 'professional', createdAt: time }
+  const selected = { ...other, id: 'selected-letter', content: 'Selected letter' }
+  await page.route('**/api/jobs/outside-page/cover-letters', route => {
+    if (retried) return route.fulfill({ json: [other, selected] })
+    if (mode === 'error') return route.fulfill({ status: 503, json: { error: 'Unavailable' } })
+    return route.fulfill({ json: mode === 'missing' ? [other] : [other, { ...selected, userId: 'fixture-b' }] })
+  })
+  await page.goto(`${origin}/?page=letter-panel-probe`)
+  await expect(page.getByRole('alert')).toContainText(/selected cover letter could not be loaded|无法加载已选求职信/)
+  await expect(page.locator('textarea')).toHaveCount(0)
+  await expect(page.getByText('Wrong draft')).toHaveCount(0)
+  retried = true
+  await page.getByRole('button', { name: /Try again|重试/i }).click()
+  await expect(page.locator('textarea')).toHaveValue('Selected letter')
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+test('late cover letter load cannot cross job or account scope', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop editor scope')
+  const state = await install(page)
+  let release = () => {}
+  const gate = new Promise<void>(resolve => { release = resolve })
+  let started = false
+  await page.route('**/api/jobs/*/cover-letters', async route => {
+    const id = new URL(route.request().url()).pathname.split('/')[3]
+    if (id === 'outside-page') { started = true; await gate }
+    try { await route.fulfill({ json: [{ id: 'selected-letter', userId: 'fixture-user', jobId: id, content: id === 'outside-page' ? 'Old job letter' : 'New job letter', tone: 'professional', createdAt: time }] }) } catch { /* an old read may be cancelled */ }
+  })
+  try {
+    await page.goto(`${origin}/?page=letter-panel-probe`)
+    await expect.poll(() => started).toBe(true)
+    await page.getByRole('button', { name: 'Switch panel job' }).dispatchEvent('click')
+    await expect(page.locator('textarea')).toHaveValue('New job letter')
+    release()
+    await expect(page.locator('textarea')).toHaveValue('New job letter')
+    await fixtureSession(page, 'authenticated', 'fixture-b')
+    await expect(page.locator('textarea')).toHaveCount(0)
+    expect(state.writes).toEqual([])
+    expect(state.unexpected).toEqual([])
+  } finally { release() }
+})
+
+test('failed cover letter save prevents version switching and retains the editable draft', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop letter editor')
+  const state = await install(page)
+  let writes = 0
+  const row = { userId: 'fixture-user', jobId: 'outside-page', tone: 'professional', createdAt: time }
+  await page.route('**/api/jobs/outside-page/cover-letters', route => route.fulfill({ json: [{ ...row, id: 'selected-letter', content: 'Original' }, { ...row, id: 'other-letter', content: 'Other' }] }))
+  await page.route('**/api/cover-letters/selected-letter', route => { writes++; return route.fulfill({ status: 503, json: { error: 'Unavailable' } }) })
+  await page.goto(`${origin}/?page=letter-panel-probe`)
+  const editor = page.locator('textarea')
+  await expect(editor).toHaveValue('Original')
+  await editor.fill('Private unsaved edit')
+  await page.locator('select').first().selectOption('other-letter')
+  await expect(editor).toHaveValue('Private unsaved edit')
+  await expect(page.locator('select').first()).toHaveValue('selected-letter')
+  await expect.poll(() => writes).toBe(1)
+  await page.waitForTimeout(1200)
+  expect(writes).toBe(1)
+  expect(await page.evaluate(() => { const e = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(e); return e.defaultPrevented })).toBe(true)
+  expect(state.unexpected).toEqual([])
+})
+
+test('cover letter draft survives switching job and account without cross-account display or retry', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop letter editor')
+  const state = await install(page)
+  let writes = 0
+  await page.route('**/api/jobs/*/cover-letters', route => { const id = new URL(route.request().url()).pathname.split('/')[3]; return route.fulfill({ json: [{ id: 'selected-letter', userId: 'fixture-user', jobId: id, content: id === 'other-job' ? 'Other job' : 'Original', tone: 'professional', createdAt: time }] }) })
+  await page.route('**/api/cover-letters/*', route => { writes++; return route.fulfill({ status: 503, json: { error: 'Unavailable' } }) })
+  await page.goto(`${origin}/?page=letter-panel-probe`)
+  const editor = page.locator('textarea')
+  await expect(editor).toHaveValue('Original')
+  await editor.fill('Private unsaved edit')
+  await page.getByRole('button', { name: 'Switch panel job' }).dispatchEvent('click')
+  await expect(editor).toHaveValue('Other job')
+  await fixtureSession(page, 'authenticated', 'fixture-b')
+  await expect(editor).toHaveCount(0)
+  await fixtureSession(page, 'authenticated', 'fixture-user')
+  await expect(editor).toHaveValue('Other job')
+  await page.getByRole('button', { name: 'Switch panel job' }).dispatchEvent('click')
+  await expect(editor).toHaveValue('Private unsaved edit')
+  await page.waitForTimeout(1200)
+  expect(writes).toBe(0)
+  expect(await page.evaluate(() => { const e = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(e); return e.defaultPrevented })).toBe(true)
+  expect(state.unexpected).toEqual([])
+})
+
+test('a late failed letter save stays with its original account without retry', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop letter editor')
+  const state = await install(page)
+  let release = () => {}, writes = 0
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const letter = { id: 'selected-letter', userId: 'fixture-user', jobId: 'outside-page', content: 'Original', tone: 'professional', createdAt: time }
+  await page.route('**/api/jobs/outside-page/cover-letters', route => route.fulfill({ json: [letter] }))
+  await page.route('**/api/cover-letters/selected-letter', async route => { writes++; await gate; return route.fulfill({ status: 503, json: { error: 'Unavailable' } }) })
+  try {
+    await page.goto(`${origin}/?page=letter-panel-probe`)
+    const editor = page.locator('textarea')
+    await expect(editor).toHaveValue('Original')
+    await editor.fill('Account A pending edit')
+    await expect.poll(() => writes).toBe(1)
+    await fixtureSession(page, 'authenticated', 'fixture-b')
+    await expect(editor).toHaveCount(0)
+    await expect(page.getByText('Account A pending edit')).toHaveCount(0)
+    const response = page.waitForResponse(r => new URL(r.url()).pathname === '/api/cover-letters/selected-letter' && r.request().method() === 'PATCH')
+    release()
+    await response
+    await expect(editor).toHaveCount(0)
+    await fixtureSession(page, 'authenticated', 'fixture-user')
+    await expect(editor).toHaveValue('Account A pending edit')
+    await expect(page.getByText(/Your local edits were kept/)).toBeVisible()
+    await page.waitForTimeout(1200)
+    expect(writes).toBe(1)
+    expect(await page.evaluate(() => { const e = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(e); return e.defaultPrevented })).toBe(true)
+    expect(state.unexpected).toEqual([])
+  } finally { release() }
+})
+
+test('a late successful letter save cannot discard a newer edit after switching jobs', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop letter editor')
+  const state = await install(page)
+  let release = () => {}, writes = 0
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const letter = { id: 'selected-letter', userId: 'fixture-user', tone: 'professional', createdAt: time }
+  await page.route('**/api/jobs/*/cover-letters', route => { const jobId = new URL(route.request().url()).pathname.split('/')[3]; return route.fulfill({ json: [{ ...letter, jobId, content: jobId === 'outside-page' ? 'Original' : 'Other job letter' }] }) })
+  await page.route('**/api/cover-letters/selected-letter', async route => { writes++; await gate; return route.fulfill({ json: { ...letter, jobId: 'outside-page', content: 'First saved edit' } }) })
+  try {
+    await page.goto(`${origin}/?page=letter-panel-probe`)
+    const editor = page.locator('textarea')
+    await expect(editor).toHaveValue('Original')
+    await editor.fill('First saved edit')
+    await expect.poll(() => writes).toBe(1)
+    await editor.fill('Newer local edit')
+    await page.getByRole('button', { name: 'Switch panel job' }).dispatchEvent('click')
+    await expect(editor).toHaveValue('Other job letter')
+    await page.getByRole('button', { name: 'Switch panel job' }).dispatchEvent('click')
+    await expect(editor).toHaveValue('Newer local edit')
+    const response = page.waitForResponse(r => new URL(r.url()).pathname === '/api/cover-letters/selected-letter' && r.request().method() === 'PATCH')
+    release()
+    await response
+    await expect(editor).toHaveValue('Newer local edit')
+    await page.waitForTimeout(1200)
+    expect(writes).toBe(1)
+    expect(await page.evaluate(() => { const e = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(e); return e.defaultPrevented })).toBe(true)
+    expect(state.unexpected).toEqual([])
+  } finally { release() }
+})
+
+test('failed generated cover letter save is separate from the selected letter', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop letter editor')
+  const state = await install(page)
+  let patches = 0
+  await page.route('**/api/jobs/outside-page/cover-letters', route => route.request().method() === 'POST' ? route.fulfill({ status: 503, json: { error: 'Unavailable' } }) : route.fulfill({ json: [{ id: 'selected-letter', userId: 'fixture-user', jobId: 'outside-page', content: 'Original selected letter', tone: 'professional', createdAt: time }] }))
+  await page.route('**/api/ai/cover-letter', route => route.fulfill({ json: { coverLetter: 'Generated unsaved text' } }))
+  await page.route('**/api/cover-letters/*', route => { patches++; return route.fulfill({ status: 503 }) })
+  await page.goto(`${origin}/?page=letter-panel-probe`)
+  await expect(page.locator('textarea')).toHaveValue('Original selected letter')
+  await page.getByRole('button', { name: 'Generate letter', exact: true }).click()
+  const generated = page.getByRole('alert').locator('textarea')
+  await expect(generated).toHaveValue('Generated unsaved text')
+  await expect(generated).toHaveAttribute('readonly', '')
+  expect(patches).toBe(0)
+  expect(await page.evaluate(() => { const e = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(e); return e.defaultPrevented })).toBe(true)
+  expect(state.unexpected).toEqual([])
+})
+
+test('a first generated letter whose save fails remains visible, copyable and discardable', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop letter editor')
+  const state = await install(page)
+  await page.route('**/api/jobs/outside-page/cover-letters', route => route.request().method() === 'POST' ? route.fulfill({ status: 503, json: { error: 'Unavailable' } }) : route.fulfill({ json: [] }))
+  await page.route('**/api/ai/cover-letter', route => route.fulfill({ json: { coverLetter: 'First unsaved generated letter' } }))
+  await page.addInitScript(() => { Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async (value: string) => { (window as unknown as { copiedLetter: string }).copiedLetter = value } } }) })
+  await page.goto(`${origin}/?page=letter-panel-probe`)
+  await page.getByRole('button', { name: 'Clear selected letter' }).dispatchEvent('click')
+  await page.getByRole('button', { name: 'Generate letter', exact: true }).click()
+  const notice = page.getByRole('alert')
+  await expect(notice.locator('textarea')).toHaveValue('First unsaved generated letter')
+  await notice.getByRole('button', { name: 'Copy', exact: true }).click()
+  await expect.poll(() => page.evaluate(() => (window as unknown as { copiedLetter?: string }).copiedLetter)).toBe('First unsaved generated letter')
+  await notice.getByRole('button', { name: 'Delete', exact: true }).click()
+  await expect(page.getByText('No cover letters yet. Generate one tailored to this job.')).toBeVisible()
+  expect(await page.evaluate(() => { const e = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(e); return e.defaultPrevented })).toBe(false)
+  await page.getByRole('button', { name: '✕', exact: true }).click()
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __fixturePanelCloseCalls?: number }).__fixturePanelCloseCalls ?? 0)).toBe(1)
+  expect(state.unexpected).toEqual([])
+})
+
+test('closing while letter generation is pending retains text without sending a create request', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop letter editor')
+  const state = await install(page)
+  let release = () => {}, started = false, creates = 0
+  const gate = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/jobs/outside-page/cover-letters', route => { if (route.request().method() === 'POST') { creates++; return route.fulfill({ json: {} }) }; return route.fulfill({ json: [{ id: 'selected-letter', userId: 'fixture-user', jobId: 'outside-page', content: 'Original', tone: 'professional', createdAt: time }] }) })
+  await page.route('**/api/ai/cover-letter', async route => { started = true; await gate; return route.fulfill({ json: { coverLetter: 'Generated after close' } }) })
+  try {
+    await page.goto(`${origin}/?page=letter-panel-probe`)
+    await expect(page.locator('textarea')).toHaveValue('Original')
+    await page.getByRole('button', { name: 'Generate letter', exact: true }).click()
+    await expect.poll(() => started).toBe(true)
+    await page.clock.install()
+    await page.getByRole('button', { name: '✕', exact: true }).click()
+    const response = page.waitForResponse(r => new URL(r.url()).pathname === '/api/ai/cover-letter')
+    release()
+    await response
+    await expect.poll(() => page.evaluate(() => { const e = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(e); return e.defaultPrevented })).toBe(true)
+    await page.clock.fastForward(250)
+    expect(creates).toBe(0)
+    expect(state.unexpected).toEqual([])
+  } finally { release() }
+})
+
+test('a lost create response survives remount without duplicate letter generation', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop letter editor')
+  const state = await install(page)
+  let release = () => {}, creates = 0, modelCalls = 0, created = false
+  const gate = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/jobs/outside-page/cover-letters', async route => {
+    if (route.request().method() === 'POST') { creates++; created = true; await gate; return route.abort('failed') }
+    return route.fulfill({ json: created ? [{ id: 'created-letter', userId: 'fixture-user', jobId: 'outside-page', content: 'Created but response lost', tone: 'professional', createdAt: time }] : [] })
+  })
+  await page.route('**/api/ai/cover-letter', route => { modelCalls++; return route.fulfill({ json: { coverLetter: 'Created but response lost' } }) })
+  try {
+    await page.goto(`${origin}/?page=letter-panel-probe`)
+    await page.getByRole('button', { name: 'Clear selected letter' }).dispatchEvent('click')
+    await page.getByRole('button', { name: 'Generate letter', exact: true }).click()
+    await expect.poll(() => creates).toBe(1)
+    await page.getByRole('button', { name: 'Toggle panel' }).dispatchEvent('click')
+    await page.getByRole('button', { name: 'Toggle panel' }).dispatchEvent('click')
+    await expect(page.getByRole('button', { name: /Generat/i }).first()).toBeDisabled()
+    release()
+    await expect(page.getByRole('alert').locator('textarea')).toHaveValue('Created but response lost')
+    expect(creates).toBe(1)
+    expect(modelCalls).toBe(1)
+    expect(state.unexpected).toEqual([])
+  } finally { release() }
+})
+
+test('a letter created after a remounted panel reads is displayed without a second create', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop letter editor')
+  const state = await install(page)
+  let release = () => {}, creates = 0, reads = 0, created = false
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const saved = { id: 'created-letter', userId: 'fixture-user', jobId: 'outside-page', content: 'Created after remount', tone: 'professional', createdAt: time }
+  await page.route('**/api/jobs/outside-page/cover-letters', async route => {
+    if (route.request().method() === 'POST') { creates++; await gate; created = true; return route.fulfill({ json: saved }) }
+    reads++
+    return route.fulfill({ json: created ? [saved] : [] })
+  })
+  await page.route('**/api/ai/cover-letter', route => route.fulfill({ json: { coverLetter: 'Created after remount' } }))
+  try {
+    await page.goto(`${origin}/?page=letter-panel-probe`)
+    await page.getByRole('button', { name: 'Clear selected letter' }).dispatchEvent('click')
+    await page.getByRole('button', { name: 'Generate letter', exact: true }).click()
+    await expect.poll(() => creates).toBe(1)
+    const oldReads = reads
+    await page.getByRole('button', { name: 'Toggle panel' }).dispatchEvent('click')
+    await page.getByRole('button', { name: 'Toggle panel' }).dispatchEvent('click')
+    await expect.poll(() => reads).toBeGreaterThan(oldReads)
+    await expect(page.getByRole('button', { name: /Generat/i }).first()).toBeDisabled()
+    release()
+    await expect(page.locator('textarea')).toHaveValue('Created after remount')
+    expect(creates).toBe(1)
+    expect(state.unexpected).toEqual([])
+  } finally { release() }
+})
+
+for (const removeEdited of [false, true]) test(`background letter refresh ${removeEdited ? 'retains a missing draft for copying' : 'preserves the edited version'}`, async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop letter editor')
+  const state = await install(page)
+  let release = () => {}, creates = 0, created = false, completedRefreshes = 0
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const row = { userId: 'fixture-user', jobId: 'outside-page', tone: 'professional', createdAt: time }
+  const original = { ...row, id: 'selected-letter', content: 'Selected A' }
+  const other = { ...row, id: 'other-letter', content: 'Other B' }
+  const added = { ...row, id: 'new-letter', content: 'Generated letter' }
+  await page.route('**/api/jobs/outside-page/cover-letters', async route => {
+    if (route.request().method() === 'POST') { creates++; await gate; created = true; return route.fulfill({ json: added }) }
+    const afterCreate = created
+    await route.fulfill({ json: afterCreate ? [original, ...(removeEdited ? [] : [{ ...other, tone: 'concise' }]), added] : [original, other] })
+    if (afterCreate) completedRefreshes++
+  })
+  await page.route('**/api/ai/cover-letter', route => route.fulfill({ json: { coverLetter: 'Generated letter' } }))
+  try {
+    await page.goto(`${origin}/?page=multi-letter-panel-probe`)
+    const first = page.getByTestId('first-letter-panel')
+    const second = page.getByTestId('second-letter-panel')
+    await expect(first.locator('textarea')).toHaveValue('Selected A')
+    await expect(second.locator('textarea')).toHaveValue('Selected A')
+    await page.clock.install()
+    await second.locator('select').first().selectOption('other-letter')
+    await second.locator('textarea').fill('Unsaved B draft')
+    await first.getByRole('button', { name: 'Generate letter', exact: true }).dispatchEvent('click')
+    await expect.poll(() => creates).toBe(1)
+    await page.getByRole('button', { name: 'Hide first letter panel' }).dispatchEvent('click')
+    release()
+    await expect.poll(() => completedRefreshes).toBeGreaterThan(0)
+    if (removeEdited) {
+      await expect(second.getByRole('alert').locator('textarea')).toHaveValue('Unsaved B draft')
+      await expect(second.getByRole('alert').locator('textarea')).toHaveAttribute('readonly', '')
+    } else {
+      await expect(second.locator('textarea')).toHaveValue('Unsaved B draft')
+      await expect(second.locator('select').first()).toHaveValue('other-letter')
+      await expect(second.locator('select').first().locator('option[value="other-letter"]')).toContainText('concise')
+    }
+    expect(await page.evaluate(() => { const e = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(e); return e.defaultPrevented })).toBe(true)
+    expect(creates).toBe(1)
+    expect(state.unexpected).toEqual([])
+  } finally { release() }
+})
+
+test('unavailable selected letter still offers the same-job generated text for copying', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop letter editor')
+  const state = await install(page)
+  let release = () => {}, creates = 0, unavailable = false
+  const gate = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/jobs/outside-page/cover-letters', async route => {
+    if (route.request().method() === 'POST') { creates++; await gate; return route.fulfill({ status: 503, json: { error: 'Unavailable' } }) }
+    return route.fulfill({ json: unavailable ? [] : [{ id: 'selected-letter', userId: 'fixture-user', jobId: 'outside-page', content: 'Selected A', tone: 'professional', createdAt: time }] })
+  })
+  await page.route('**/api/ai/cover-letter', route => route.fulfill({ json: { coverLetter: 'Recover generated text' } }))
+  try {
+    await page.goto(`${origin}/?page=letter-panel-probe`)
+    await expect(page.locator('textarea')).toHaveValue('Selected A')
+    await page.getByRole('button', { name: 'Generate letter', exact: true }).click()
+    await expect.poll(() => creates).toBe(1)
+    await page.getByRole('button', { name: 'Toggle panel' }).dispatchEvent('click')
+    unavailable = true
+    release()
+    await page.getByRole('button', { name: 'Toggle panel' }).dispatchEvent('click')
+    const notice = page.getByRole('alert')
+    await expect(notice).toContainText('selected cover letter could not be loaded')
+    await expect(notice.locator('textarea')).toHaveValue('Recover generated text')
+    await expect(notice.getByRole('button', { name: 'Copy', exact: true })).toBeVisible()
+    expect(creates).toBe(1)
+    expect(state.unexpected).toEqual([])
+  } finally { release() }
+})
+
+test('an unavailable generated draft never flashes across an account and job switch', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises account isolation in the letter editor')
+  const state = await install(page)
+  let release = () => {}, missingA = false, startedB = false
+  const gate = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/jobs/*/cover-letters', async route => {
+    const jobId = new URL(route.request().url()).pathname.split('/')[3]
+    if (route.request().method() === 'POST') return route.fulfill({ status: 503, json: { error: 'Unavailable' } })
+    if (jobId === 'other-job') { startedB = true; await gate; return route.fulfill({ json: [{ id: 'selected-letter', userId: 'fixture-b', jobId, content: 'Account B letter', tone: 'professional', createdAt: time }] }) }
+    return route.fulfill({ json: missingA ? [] : [{ id: 'selected-letter', userId: 'fixture-user', jobId, content: 'Account A letter', tone: 'professional', createdAt: time }] })
+  })
+  await page.route('**/api/ai/cover-letter', route => route.fulfill({ json: { coverLetter: 'Private generated A text' } }))
+  try {
+    await page.goto(`${origin}/?page=owner-letter-panel-probe`)
+    await expect(page.locator('textarea')).toHaveValue('Account A letter')
+    await page.getByRole('button', { name: 'Generate letter', exact: true }).click()
+    await expect(page.getByRole('alert').locator('textarea')).toHaveValue('Private generated A text')
+    missingA = true
+    await page.getByRole('button', { name: 'Toggle owner panel' }).dispatchEvent('click')
+    await page.getByRole('button', { name: 'Toggle owner panel' }).dispatchEvent('click')
+    await expect(page.getByRole('alert').locator('textarea')).toHaveValue('Private generated A text')
+    await page.evaluate(() => {
+      const target = window as unknown as { fixtureCrossAccountLeak: boolean; fixtureLeakObserver: MutationObserver }
+      target.fixtureCrossAccountLeak = false
+      target.fixtureLeakObserver = new MutationObserver(() => {
+        if (document.body.textContent?.includes('Fixture B Role') && [...document.querySelectorAll('textarea')].some(element => element.value.includes('Private generated A text'))) target.fixtureCrossAccountLeak = true
+      })
+      target.fixtureLeakObserver.observe(document.body, { childList: true, subtree: true, characterData: true })
+    })
+    state.activeUserId = 'fixture-b'
+    await fixtureSession(page, 'authenticated', 'fixture-b')
+    await expect.poll(() => startedB).toBe(true)
+    await expect(page.getByText('Fixture B Role')).toBeVisible()
+    await expect(page.locator('textarea')).toHaveCount(0)
+    expect(await page.evaluate(() => (window as unknown as { fixtureCrossAccountLeak: boolean }).fixtureCrossAccountLeak)).toBe(false)
+    release()
+    await expect(page.locator('textarea')).toHaveValue('Account B letter')
+    expect(await page.evaluate(() => (window as unknown as { fixtureCrossAccountLeak: boolean }).fixtureCrossAccountLeak)).toBe(false)
+    expect(state.unexpected).toEqual([])
+  } finally { release() }
+})
+
+test('completion of another letter deletion preserves the current version and its draft', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop letter editor')
+  const state = await install(page)
+  let release = () => {}, deletes = 0, deleted = false, completedRefreshes = 0
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const row = { userId: 'fixture-user', jobId: 'outside-page', tone: 'professional', createdAt: time }
+  const original = { ...row, id: 'selected-letter', content: 'Selected A' }
+  const other = { ...row, id: 'other-letter', content: 'Other B' }
+  const removing = { ...row, id: 'removing-letter', content: 'Removing C' }
+  await page.route('**/api/jobs/outside-page/cover-letters', async route => { const afterDelete = deleted; await route.fulfill({ json: afterDelete ? [original, { ...other, tone: 'concise' }] : [original, other, removing] }); if (afterDelete) completedRefreshes++ })
+  await page.route('**/api/cover-letters/removing-letter', async route => { deletes++; await gate; deleted = true; return route.fulfill({ json: {} }) })
+  try {
+    await page.goto(`${origin}/?page=multi-letter-panel-probe`)
+    const first = page.getByTestId('first-letter-panel')
+    const second = page.getByTestId('second-letter-panel')
+    await expect(first.locator('textarea')).toHaveValue('Selected A')
+    await expect(second.locator('textarea')).toHaveValue('Selected A')
+    await page.clock.install()
+    await first.locator('select').first().selectOption('removing-letter')
+    await second.locator('select').first().selectOption('other-letter')
+    await second.locator('textarea').fill('Unsaved B draft')
+    await first.getByRole('button', { name: 'Delete', exact: true }).dispatchEvent('click')
+    await first.getByText('Delete cover letter?', { exact: true }).locator('../..').getByRole('button', { name: 'Delete', exact: true }).dispatchEvent('click')
+    await expect.poll(() => deletes).toBe(1)
+    release()
+    await expect.poll(() => completedRefreshes).toBeGreaterThanOrEqual(2)
+    await expect(second.locator('textarea')).toHaveValue('Unsaved B draft')
+    await expect(second.locator('select').first()).toHaveValue('other-letter')
+    await expect(second.locator('select').first().locator('option[value="other-letter"]')).toContainText('concise')
+    expect(await page.evaluate(() => { const e = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(e); return e.defaultPrevented })).toBe(true)
+    expect(deletes).toBe(1)
+    expect(state.unexpected).toEqual([])
+  } finally { release() }
+})
+
+test('a pending delete remains locked across a panel remount and refreshes the selected letter', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop letter editor')
+  const state = await install(page)
+  let release = () => {}, deletes = 0, deleted = false
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const letter = { id: 'selected-letter', userId: 'fixture-user', jobId: 'outside-page', content: 'Original', tone: 'professional', createdAt: time }
+  await page.route('**/api/jobs/outside-page/cover-letters', route => route.fulfill({ json: deleted ? [] : [letter] }))
+  await page.route('**/api/cover-letters/selected-letter', async route => { if (route.request().method() !== 'DELETE') return route.fallback(); deletes++; await gate; deleted = true; return route.fulfill({ json: {} }) })
+  try {
+    await page.goto(`${origin}/?page=letter-panel-probe`)
+    await expect(page.locator('textarea')).toHaveValue('Original')
+    await page.getByRole('button', { name: 'Delete', exact: true }).click()
+    await page.getByText('Delete cover letter?', { exact: true }).locator('../..').getByRole('button', { name: 'Delete', exact: true }).click()
+    await expect.poll(() => deletes).toBe(1)
+    await page.getByRole('button', { name: 'Toggle panel' }).dispatchEvent('click')
+    await page.getByRole('button', { name: 'Toggle panel' }).dispatchEvent('click')
+    await expect(page.locator('textarea')).toBeDisabled()
+    await expect(page.getByRole('button', { name: 'Delete', exact: true })).toBeDisabled()
+    await expect(page.getByRole('button', { name: 'Generate letter', exact: true })).toBeDisabled()
+    release()
+    await expect(page.getByRole('alert')).toContainText('selected cover letter could not be loaded')
+    expect(deletes).toBe(1)
+    expect(state.unexpected).toEqual([])
+  } finally { release() }
+})
+
+test('missing selected letter shows a usable retry on a narrow screen', async ({ page }, testInfo) => {
+  test.skip(!testInfo.project.name.startsWith('mobile-'), 'Exercises narrow letter editor')
+  const state = await install(page)
+  const chinese = testInfo.project.metadata.appLocale === 'zh'
+  let retry = false
+  await page.route('**/api/jobs/outside-page/cover-letters', route => route.fulfill({ json: retry ? [{ id: 'selected-letter', userId: 'fixture-user', jobId: 'outside-page', content: 'Selected letter', tone: 'professional', createdAt: time }] : [] }))
+  await page.goto(`${origin}/?page=letter-panel-probe`)
+  const notice = page.getByRole('alert')
+  await expect(notice).toContainText(chinese ? '无法加载已选求职信' : 'selected cover letter could not be loaded')
+  const button = notice.getByRole('button', { name: chinese ? '重试' : 'Try again' })
+  await expect(button).toBeInViewport()
+  retry = true
+  await button.click()
+  await expect(page.locator('textarea')).toHaveValue('Selected letter')
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
+
+test('discarding an uncertain letter draft does not confirm an in-flight save', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop letter editor')
+  const state = await install(page)
+  let release = () => {}, writes = 0
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const letter = { id: 'selected-letter', userId: 'fixture-user', jobId: 'outside-page', content: 'Original', tone: 'professional', createdAt: time }
+  await page.route('**/api/jobs/outside-page/cover-letters', route => route.fulfill({ json: [letter] }))
+  await page.route('**/api/cover-letters/selected-letter', async route => { writes++; await gate; return route.fulfill({ json: { ...letter, content: 'Private pending edit' } }) })
+  try {
+    await page.goto(`${origin}/?page=letter-panel-probe`)
+    const editor = page.locator('textarea')
+    await expect(editor).toHaveValue('Original')
+    await page.clock.install()
+    await editor.fill('Private pending edit')
+    await page.clock.fastForward(1000)
+    await expect.poll(() => writes).toBe(1)
+    await page.clock.fastForward(15_001)
+    await page.getByRole('button', { name: 'Discard local draft and reload' }).click()
+    await expect(editor).toHaveValue('Original')
+    await expect(editor).toBeDisabled()
+    const checked = page.getByRole('button', { name: 'I checked the saved version' })
+    await expect(checked).toBeDisabled()
+    release()
+    await expect(checked).toBeEnabled()
+    await checked.click()
+    await expect(editor).toBeEnabled()
+    await page.clock.fastForward(2000)
+    expect(writes).toBe(1)
+    expect(state.unexpected).toEqual([])
+  } finally { release() }
+})
+
+test('letter generation keeps the selected version fixed until the new draft is resolved', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop letter editor')
+  const state = await install(page)
+  let release = () => {}
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const row = { userId: 'fixture-user', jobId: 'outside-page', tone: 'professional', createdAt: time }
+  await page.route('**/api/jobs/outside-page/cover-letters', route => route.request().method() === 'POST' ? route.fulfill({ status: 503, json: { error: 'Unavailable' } }) : route.fulfill({ json: [{ ...row, id: 'selected-letter', content: 'Original' }, { ...row, id: 'other-letter', content: 'Other' }] }))
+  await page.route('**/api/ai/cover-letter', async route => { await gate; return route.fulfill({ json: { coverLetter: 'Generated unsaved text' } }) })
+  try {
+    await page.goto(`${origin}/?page=letter-panel-probe`)
+    await expect(page.locator('textarea')).toHaveValue('Original')
+    await page.getByRole('button', { name: 'Generate letter', exact: true }).click()
+    await expect(page.locator('select').first()).toBeDisabled()
+    release()
+    await expect(page.getByRole('alert').locator('textarea')).toHaveValue('Generated unsaved text')
+    await page.getByRole('alert').getByRole('button', { name: 'Delete', exact: true }).click()
+    await expect(page.locator('textarea')).toHaveValue('Original')
+    expect(await page.evaluate(() => { const e = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(e); return e.defaultPrevented })).toBe(false)
+    expect(state.unexpected).toEqual([])
+  } finally { release() }
+})
+
+for (const mode of ['close', 'discard'] as const) test(`late ${mode} animation cannot close a new letter scope`, async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop letter editor')
+  const state = await install(page)
+  await page.route('**/api/jobs/*/cover-letters', route => { const jobId = new URL(route.request().url()).pathname.split('/')[3]; return route.fulfill({ json: [{ id: 'selected-letter', userId: 'fixture-user', jobId, content: jobId === 'outside-page' ? 'Old job letter' : 'New job letter', tone: 'professional', createdAt: time }] }) })
+  await page.route('**/api/cover-letters/selected-letter', route => route.fulfill({ status: 503, json: { error: 'Unavailable' } }))
+  await page.goto(`${origin}/?page=letter-panel-probe`)
+  await expect(page.locator('textarea')).toHaveValue('Old job letter')
+  if (mode === 'discard') {
+    await page.locator('textarea').fill('Unsaved old draft')
+    await expect(page.getByRole('button', { name: 'Discard local draft and close' })).toBeVisible()
+  }
+  await page.clock.install()
+  await page.getByRole('button', { name: mode === 'close' ? '✕' : 'Discard local draft and close', exact: true }).click()
+  await page.getByRole('button', { name: 'Switch panel job' }).dispatchEvent('click')
+  await expect(page.locator('textarea')).toHaveValue('New job letter')
+  await page.clock.fastForward(250)
+  expect(await page.evaluate(() => (window as unknown as { __fixturePanelCloseCalls?: number }).__fixturePanelCloseCalls ?? 0)).toBe(0)
+  await expect(page.locator('textarea')).toBeVisible()
+  expect(state.unexpected).toEqual([])
+})
+
+test('a late cover letter PDF render cannot download the previous job after a scope change', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop letter editor')
+  const state = await install(page)
+  let release = () => {}, fontStarted = false
+  const gate = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/jobs/*/cover-letters', route => { const jobId = new URL(route.request().url()).pathname.split('/')[3]; return route.fulfill({ json: [{ id: 'selected-letter', userId: 'fixture-user', jobId, content: jobId === 'outside-page' ? 'Old job letter' : 'New job letter', tone: 'professional', createdAt: time }] }) })
+  await page.route('**/fonts/*', async route => { fontStarted = true; await gate; try { await route.continue() } catch { /* request can be cancelled */ } })
+  await page.addInitScript(() => {
+    const original = URL.createObjectURL.bind(URL)
+    URL.createObjectURL = value => { (window as unknown as { fixtureUrls: number }).fixtureUrls = ((window as unknown as { fixtureUrls: number }).fixtureUrls || 0) + 1; return original(value) }
+    const BaseBlob = window.Blob
+    window.Blob = class extends BaseBlob {
+      constructor(parts?: BlobPart[], options?: BlobPropertyBag) { super(parts, options); if (options?.type === 'application/pdf') (window as unknown as { fixturePdfBlobs: number }).fixturePdfBlobs = ((window as unknown as { fixturePdfBlobs: number }).fixturePdfBlobs || 0) + 1 }
+    }
+  })
+  try {
+    await page.goto(`${origin}/?page=letter-panel-probe`)
+    await expect(page.locator('textarea')).toHaveValue('Old job letter')
+    await page.getByRole('button', { name: 'Download PDF', exact: true }).first().click()
+    await expect.poll(() => fontStarted).toBe(true)
+    await page.getByRole('button', { name: 'Switch panel job' }).dispatchEvent('click')
+    await expect(page.locator('textarea')).toHaveValue('New job letter')
+    release()
+    await expect.poll(() => page.evaluate(() => (window as unknown as { fixturePdfBlobs?: number }).fixturePdfBlobs ?? 0), { timeout: 15_000 }).toBeGreaterThan(0)
+    expect(await page.evaluate(() => (window as unknown as { fixtureUrls?: number }).fixtureUrls ?? 0)).toBe(0)
+    await expect(page.getByRole('button', { name: 'Download PDF', exact: true }).first()).toBeEnabled()
+    expect(state.unexpected).toEqual([])
+  } finally { release() }
+})
+
+for (const change of ['edit', 'version'] as const) test(`a late PDF render cannot download after a letter ${change}`, async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop letter editor')
+  const state = await install(page)
+  let release = () => {}, started = false
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const row = { userId: 'fixture-user', jobId: 'outside-page', tone: 'professional', createdAt: time }
+  await page.route('**/api/jobs/outside-page/cover-letters', route => route.fulfill({ json: [{ ...row, id: 'selected-letter', content: 'Original letter' }, { ...row, id: 'other-letter', content: 'Other version' }] }))
+  await page.route('**/api/cover-letters/selected-letter', route => route.fulfill({ json: { ...row, id: 'selected-letter', content: 'Edited letter' } }))
+  await page.route('**/fonts/*', async route => { started = true; await gate; try { await route.continue() } catch { /* request can be cancelled */ } })
+  await page.addInitScript(() => {
+    const original = URL.createObjectURL.bind(URL)
+    URL.createObjectURL = value => { (window as unknown as { fixtureUrls: number }).fixtureUrls = ((window as unknown as { fixtureUrls: number }).fixtureUrls || 0) + 1; return original(value) }
+    const BaseBlob = window.Blob
+    window.Blob = class extends BaseBlob { constructor(parts?: BlobPart[], options?: BlobPropertyBag) { super(parts, options); if (options?.type === 'application/pdf') (window as unknown as { fixturePdfBlobs: number }).fixturePdfBlobs = ((window as unknown as { fixturePdfBlobs: number }).fixturePdfBlobs || 0) + 1 } }
+  })
+  try {
+    await page.goto(`${origin}/?page=letter-panel-probe`)
+    await expect(page.locator('textarea')).toHaveValue('Original letter')
+    await page.getByRole('button', { name: 'Download PDF', exact: true }).first().click()
+    await expect.poll(() => started).toBe(true)
+    if (change === 'edit') await page.locator('textarea').fill('Edited letter')
+    else { await page.locator('select').first().selectOption('other-letter'); await expect(page.locator('textarea')).toHaveValue('Other version') }
+    release()
+    await expect.poll(() => page.evaluate(() => (window as unknown as { fixturePdfBlobs?: number }).fixturePdfBlobs ?? 0), { timeout: 15_000 }).toBeGreaterThan(0)
+    expect(await page.evaluate(() => (window as unknown as { fixtureUrls?: number }).fixtureUrls ?? 0)).toBe(0)
+    await expect(page.getByRole('button', { name: 'Download PDF', exact: true }).first()).toBeEnabled()
+    expect(state.unexpected).toEqual([])
+  } finally { release() }
 })
 
 for (const reloadFails of [false, true]) test(`uncertain Kanban change reloads the active page when list ${reloadFails ? 'fails' : 'succeeds'}`, async ({ page }, testInfo) => {
@@ -1191,6 +1837,49 @@ for (const surface of ['jobs', 'resume'] as const) {
   })
 }
 
+for (const transition of ['switch', 'reload'] as const) test(`unregistered Resume review remains fenced after ${transition}`, async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises authenticated-style shell navigation with synthetic APIs')
+  const state = await install(page, { descriptionMode: 'two' })
+  let release = () => {}, posted = false, registered = false, postCount = 0
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const nextOperation = '123e4567-e89b-42d3-a456-426614174001'
+  const oldAudit = state.audit
+  const reviewed = { ...state.audit, operationId: nextOperation, audit: { ...state.audit.audit, summary: 'Newly completed review' } }
+  await page.route('**/api/jobs/outside-page/audit-application', async route => {
+    if (route.request().method() === 'GET') return route.fulfill({ json: registered ? reviewed : oldAudit })
+    posted = true; postCount++
+    await gate
+    registered = true
+    try { await route.fulfill({ json: { ...reviewed.audit, operationId: nextOperation, resumeUpdatedAt: reviewed.resumeUpdatedAt } }) } catch { /* navigation may cancel the client request */ }
+  })
+  try {
+    await page.goto(`${origin}/?shell=1&page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    await expect(page.locator('.resume-opportunity-card')).toContainText('Application flow engineer')
+    await page.getByRole('button', { name: /Run independent audit|Run audit again/ }).click()
+    await expect.poll(() => posted).toBe(true)
+    if (transition === 'switch') {
+      await page.locator('#desktop-sidebar').getByRole('button', { name: /^Applications(?:\s+\d+)?$/ }).click()
+      const row = page.getByRole('row').filter({ hasText: 'Application flow engineer' })
+      await row.getByRole('button', { name: 'View this application' }).click()
+      await expect(page.getByRole('dialog')).toContainText('This tab has an unconfirmed review request')
+      await expect(page.getByRole('dialog').getByRole('button', { name: 'Download application materials' })).toHaveCount(0)
+      await page.goBack()
+    } else await page.reload()
+    await expect(page.getByText('This tab has an unconfirmed review request', { exact: false }).first()).toBeVisible()
+    await page.getByRole('button', { name: 'Confirm application materials', exact: true }).click()
+    await expect(page.getByRole('dialog')).not.toContainText('Application materials selected')
+    await page.getByRole('button', { name: 'Close final confirmation' }).click()
+    expect(postCount).toBe(1)
+    if (transition === 'switch') {
+      release()
+      await expect.poll(() => registered).toBe(true)
+      await expect(page.getByText('Newly completed review', { exact: false }).first()).toBeVisible()
+    }
+    expect(postCount).toBe(1)
+    expect(state.unexpected).toEqual([])
+  } finally { release() }
+})
+
 for (const outcome of ['loading', 'failed'] as const) {
   test(`Resume re-audit does not omit a selected cover letter while its read is ${outcome}`, async ({ page }, testInfo) => {
     test.skip(testInfo.project.name !== 'desktop-en', 'Focused selected material regression')
@@ -1219,6 +1908,45 @@ for (const outcome of ['loading', 'failed'] as const) {
   })
 }
 
+for (const reviewCase of ['verified', 'different-operation', 'missing-post-operation', 'invalid-post-operation'] as const) {
+  test(`Resume review binds its canonical response to the submitted operation: ${reviewCase}`, async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop-en', 'Exercises Resume audit operation handoff')
+    const state = await install(page)
+    let posted = false
+    let canonicalReads = 0
+    await page.route('**/api/jobs/outside-page/audit-application', async route => {
+      if (route.request().method() === 'POST') {
+        posted = true
+        state.writes.push({ path: '/api/jobs/outside-page/audit-application', body: route.request().postDataJSON() })
+        return route.fulfill({ json: { ...state.audit.audit, resumeUpdatedAt: state.audit.resumeUpdatedAt,
+          ...(reviewCase === 'missing-post-operation' ? {} : { operationId: reviewCase === 'invalid-post-operation' ? 'invalid' : fixtureAuditOperation }) } })
+      }
+      if (posted) canonicalReads++
+      return route.fulfill({ json: { ...state.audit, operationId: posted && reviewCase === 'different-operation' ? '123e4567-e89b-42d3-a456-426614174001' : fixtureAuditOperation } })
+    })
+    await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    const openConfirmation = page.getByRole('button', { name: /Confirm application materials|确认申请材料/, exact: true })
+    const dialog = page.getByRole('dialog', { name: /Confirm application materials|确认申请材料/ })
+    await expect(openConfirmation).toBeVisible()
+    await page.getByRole('button', { name: /Run independent audit|Run audit again|运行独立审核|再次运行审核/ }).click()
+    await expect.poll(() => posted).toBe(true)
+    if (reviewCase === 'missing-post-operation' || reviewCase === 'invalid-post-operation') {
+      await expect(page.getByText(/This tab has an unconfirmed review request|此标签页有一项尚未确认的审核请求/i).first()).toBeVisible()
+    } else {
+      await expect.poll(() => canonicalReads).toBeGreaterThan(0)
+      if (reviewCase === 'different-operation') await expect(page.getByText(/This tab has an unconfirmed review request|此标签页有一项尚未确认的审核请求/i).first()).toBeVisible()
+    }
+    await openConfirmation.click()
+    if (reviewCase === 'verified') await expect(dialog).toContainText(/Application materials selected|已选择申请材料/)
+    else {
+      await expect(dialog).not.toContainText(/Application materials selected|已选择申请材料/)
+      await expect(dialog.getByRole('button', { name: /Download application materials|下载申请材料/ })).toHaveCount(0)
+    }
+    expect(state.writes.filter(write => write.path.endsWith('/audit-application'))).toHaveLength(1)
+    expect(state.unexpected).toEqual([])
+  })
+}
+
 for (const outcome of ['failed', 'verified', 'stale'] as const) {
   test(`Resume re-audit ${outcome} does not reuse the previous passing receipt`, async ({ page }, testInfo) => {
     test.skip(testInfo.project.name !== 'desktop-en', 'Focused Resume audit regression')
@@ -1237,7 +1965,7 @@ for (const outcome of ['failed', 'verified', 'stale'] as const) {
         await postGate
         return outcome === 'failed'
           ? route.fulfill({ status: 502, json: { error: 'Audit response unavailable' } })
-          : route.fulfill({ json: { ...newAudit.audit, resumeUpdatedAt: newAudit.resumeUpdatedAt } })
+          : route.fulfill({ json: { ...newAudit.audit, operationId: newAudit.operationId, resumeUpdatedAt: newAudit.resumeUpdatedAt } })
       }
       if (postStarted && outcome !== 'failed') {
         canonicalStarted = true
@@ -2529,7 +3257,7 @@ test('Resume explains the replacement scope and backup limits before repair', as
 for (const repairError of ['unclear', 'too-many', 'conflict', 'other'] as const) {
   test(`resume repair ${repairError} failure keeps the application and explains the next step`, async ({ page }) => {
     const state = await install(page)
-    state.audit = { ...state.audit, audit: { ...state.audit.audit, verdict: 'needs_review', findings: [{ area: 'resume', severity: 'warning', resolution: 'contradiction', title: 'Incorrect resume claim', evidence: 'Not supported', action: 'Edit the resume' }] } } as typeof state.audit
+    state.audit = { ...state.audit, operationId: '123e4567-e89b-42d3-a456-426614174000', receipt: { version: 1, signature: 'a'.repeat(64) }, audit: { ...state.audit.audit, verdict: 'needs_review', findings: [{ area: 'resume', severity: 'warning', resolution: 'contradiction', title: 'Incorrect resume claim', evidence: 'Not supported', action: 'Edit the resume' }] } } as typeof state.audit
     const error = repairError === 'unclear' ? 'The affected resume section is unclear. Open the resume and edit it manually.'
       : repairError === 'too-many' ? 'Too many resume issues to correct at once. Open the resume and review them manually.'
         : repairError === 'conflict' ? 'The resume changed during correction. Refresh and review the latest version.' : 'Other fixture error'
@@ -2846,7 +3574,7 @@ for (const outcome of ['verified', 'unavailable'] as const) {
           ...audit(state.resume.updatedAt),
           audit: { ...audit().audit, findings: [{ area: 'resume', severity: 'pass', title: 'Verified', evidence: 'Supported', action: 'None' }] },
         } as typeof state.audit
-        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...state.audit.audit, resumeUpdatedAt: state.resume.updatedAt }) })
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...state.audit.audit, operationId: state.audit.operationId, resumeUpdatedAt: state.resume.updatedAt }) })
       }
       if (state.writes.some(write => write.path === '/api/jobs/outside-page/assign')) {
         readStarted = true
@@ -2874,6 +3602,80 @@ for (const outcome of ['verified', 'unavailable'] as const) {
     } finally { releaseRead() }
   })
 }
+
+for (const receiptCase of ['verified', 'mismatch', 'unsigned', 'missing-operation', 'different-operation', 'missing-post-operation'] as const) test(`new review findings require the matching signed receipt before correction: ${receiptCase}`, async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises application review receipt handoff')
+  const state = await install(page, { stale: true })
+  const signature = 'a'.repeat(64)
+  const operationId = '123e4567-e89b-42d3-a456-426614174000'
+  const findings = [{ area: 'resume', target: 'summary', severity: 'warning', resolution: 'contradiction', title: 'Incorrect summary claim', evidence: 'Not supported', action: 'Correct summary' }]
+  const newAudit = { ...state.audit.audit, verdict: 'needs_review', summary: 'New review found an issue', findings }
+  let reviewed = false, readsAfterReview = 0
+  await page.route('**/api/jobs/outside-page/audit-application', async route => {
+    if (route.request().method() === 'POST') {
+      reviewed = true
+      state.writes.push({ path: '/api/jobs/outside-page/audit-application', body: route.request().postDataJSON() })
+      return route.fulfill({ json: { ...newAudit, resumeUpdatedAt: state.resume.updatedAt, ...(receiptCase === 'missing-post-operation' ? {} : { operationId }) } })
+    }
+    if (!reviewed) return route.fallback()
+    readsAfterReview++
+    const stored = { ...state.audit, resumeUpdatedAt: state.resume.updatedAt, audit: receiptCase === 'mismatch' ? { ...newAudit, summary: 'Different review result' } : newAudit,
+      receipt: receiptCase === 'unsigned' ? undefined : { version: 1, signature }, operationId: receiptCase === 'missing-operation' ? undefined : receiptCase === 'different-operation' ? '123e4567-e89b-42d3-a456-426614174001' : operationId }
+    return route.fulfill({ json: stored })
+  })
+  await open(page)
+  const prepare = page.getByRole('button', { name: /Check current materials|检查当前材料/, exact: true })
+  await expect(prepare).toBeVisible()
+  await prepare.click()
+  if (receiptCase !== 'missing-post-operation') await expect.poll(() => readsAfterReview, { timeout: 6000 }).toBeGreaterThan(0)
+  if (receiptCase === 'verified') {
+    await expect(page.getByText('New review found an issue')).toBeVisible()
+    await page.getByRole('button', { name: /Fix with AI and re-audit|使用 AI 修复并重新审核/, exact: true }).click()
+    await expect.poll(() => state.writes.find(write => write.path.endsWith('/tailor-resume'))).toMatchObject({ body: { resumeId: 'resume-1', forceRetailor: true, auditReceiptSignature: signature, auditOperationId: operationId } })
+  } else {
+    await expect(page.getByText(/Preparation could not finish|准备未完成/)).toBeVisible()
+    await expect(page.getByRole('button', { name: /Fix with AI and re-audit|使用 AI 修复并重新审核/, exact: true })).toHaveCount(0)
+    expect(state.writes.some(write => write.path.endsWith('/tailor-resume'))).toBe(false)
+  }
+  expect(state.unexpected).toEqual([])
+})
+
+for (const receiptCase of ['verified', 'different-operation', 'missing-post-operation'] as const) test(`passing review requires the same operation after confirmation: ${receiptCase}`, async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises application review operation handoff')
+  const state = await install(page, { stale: true })
+  let reviewed = false
+  await page.route('**/api/jobs/outside-page/audit-application', async route => {
+    if (route.request().method() === 'POST') {
+      reviewed = true
+      const body = route.request().postDataJSON()
+      state.writes.push({ path: '/api/jobs/outside-page/audit-application', body })
+      state.audit = audit(state.resume.updatedAt)
+      return route.fulfill({ json: { ...state.audit.audit, resumeUpdatedAt: state.resume.updatedAt, ...(receiptCase === 'missing-post-operation' ? {} : { operationId: fixtureAuditOperation }) } })
+    }
+    if (!reviewed) return route.fallback()
+    return route.fulfill({ json: { ...state.audit, receipt: { version: 1, signature: 'a'.repeat(64) }, operationId: receiptCase === 'different-operation' ? '123e4567-e89b-42d3-a456-426614174001' : fixtureAuditOperation } })
+  })
+  await open(page)
+  await page.getByRole('button', { name: /Check current materials|检查当前材料/, exact: true }).click()
+  if (receiptCase === 'verified') await expect(page.getByRole('button', { name: /Download application materials|下载申请材料/ })).toBeVisible()
+  else {
+    await expect(page.getByText(/Preparation could not finish|准备未完成/)).toBeVisible()
+    await expect(page.getByRole('button', { name: /Download application materials|下载申请材料/ })).toHaveCount(0)
+  }
+  expect(state.unexpected).toEqual([])
+})
+
+test('an old completed review without an operation ID cannot establish readiness', async ({ page }, testInfo) => {
+  const state = await install(page)
+  await page.route('**/api/jobs/outside-page/audit-application', route => route.request().method() === 'GET'
+    ? route.fulfill({ json: { ...state.audit, operationId: undefined, receipt: { version: 1, signature: 'a'.repeat(64) } } })
+    : route.fallback())
+  await open(page)
+  await expect(page.getByRole('status').filter({ hasText: /review status|审核状态/ }).first()).toBeVisible()
+  await expect(page.getByRole('button', { name: /Download application materials|下载申请材料/ })).toHaveCount(0)
+  expect(state.writes).toEqual([])
+  expect(state.unexpected).toEqual([])
+})
 
 test('a newly failed audit cannot reuse an older passing receipt for the same version', async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== 'desktop-en', 'Focused audit receipt regression')
@@ -4886,3 +5688,113 @@ for (const result of ['confirmed', 'rejected'] as const) {
     expect(state.unexpected).toEqual([])
   })
 }
+
+test('late confirmed Resume review reconciles after its deadline', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises the same-tab review deadline')
+  await page.clock.install()
+  const state = await install(page)
+  let release = () => {}, posts = 0, registered = false
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const reviewed = { ...state.audit, operationId: '123e4567-e89b-42d3-a456-426614174001', audit: { ...state.audit.audit, summary: 'Late confirmed review' } }
+  await page.route('**/api/jobs/outside-page/audit-application', async route => {
+    if (route.request().method() === 'GET') return route.fulfill({ json: registered ? reviewed : state.audit })
+    posts++
+    await gate
+    registered = true
+    return route.fulfill({ json: { ...reviewed.audit, operationId: reviewed.operationId, resumeUpdatedAt: reviewed.resumeUpdatedAt } })
+  })
+  try {
+    await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    await page.getByRole('button', { name: /Run independent audit|Run audit again/ }).click()
+    await expect.poll(() => posts).toBe(1)
+    await page.clock.fastForward(30_001)
+    await expect(page.getByText('This tab has an unconfirmed review request', { exact: false }).first()).toBeVisible()
+    release()
+    await expect(page.getByText('Late confirmed review', { exact: false }).first()).toBeVisible()
+    await expect.poll(() => page.evaluate(() => sessionStorage.getItem('applymate:audit-fence:fixture-user:outside-page'))).toBeNull()
+    expect(posts).toBe(1)
+    expect(state.unexpected).toEqual([])
+  } finally { release() }
+})
+
+for (const result of ['matching', 'different-operation'] as const) test(`Resume correction requires matching new review operation: ${result}`, async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop correction controls')
+  const state = await install(page, { auditCorrection: true })
+  const initialOperation = state.audit.operationId
+  const nextOperation = '123e4567-e89b-42d3-a456-426614174002'
+  const otherOperation = '123e4567-e89b-42d3-a456-426614174003'
+  const original = state.audit.audit.findings[0]
+  state.audit = { ...state.audit, audit: { ...state.audit.audit, findings: [original, { ...original, target: 'summary', title: 'Second fix', proposedValue: 'Next summary' }] } }
+  let corrected = false
+  const requests: Array<{ auditOperationId: string; findingIndex: number }> = []
+  await page.route('**/api/jobs/outside-page/audit-application', route => {
+    if (route.request().method() !== 'GET') return route.fallback()
+    return route.fulfill({ json: corrected && result === 'different-operation' ? { ...state.audit, operationId: otherOperation } : state.audit })
+  })
+  await page.route('**/api/jobs/outside-page/audit-application/apply', route => {
+    requests.push(route.request().postDataJSON())
+    if (requests.length > 1) return route.abort('failed')
+    const updatedAt = '2026-10-30T12:00:00.000Z'
+    state.resume = { ...state.resume, updatedAt, content: { ...state.resume.content, summary: 'Audited v2 summary' } }
+    state.audit = { ...state.audit, operationId: nextOperation, resumeUpdatedAt: updatedAt, audit: { ...state.audit.audit, findings: [{ ...original, applied: true }, state.audit.audit.findings[1]] } }
+    corrected = true
+    return route.fulfill({ json: { audit: state.audit.audit, operationId: nextOperation, target: 'summary', appliedContent: 'Audited v2 summary', resume: state.resume, coverLetter: null, resumeUpdatedAt: updatedAt } })
+  })
+  await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+  await page.getByRole('button', { name: 'Apply generated fix', exact: true }).first().click()
+  await expect.poll(() => requests.length).toBe(1)
+  expect(requests[0].auditOperationId).toBe(initialOperation)
+  if (result === 'matching') {
+    await expect(page.getByText('Second fix', { exact: false }).first()).toBeVisible()
+    await page.getByRole('button', { name: 'Apply generated fix', exact: true }).last().click()
+    await expect.poll(() => requests.length).toBe(2)
+    expect(requests[1].auditOperationId).toBe(nextOperation)
+  } else {
+    await expect(page.getByText('This tab has an unconfirmed review request', { exact: false }).first()).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Apply generated fix', exact: true })).toHaveCount(0)
+    expect(requests.length).toBe(1)
+  }
+  expect(state.unexpected).toEqual([])
+})
+
+for (const proof of ['matching', 'wrong-attempt', 'late-matching'] as const) test(`Resume safely handles a correction no-write certificate: ${proof}`, async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-en', 'Exercises desktop correction recovery')
+  if (proof === 'late-matching') await page.clock.install()
+  const state = await install(page, { auditCorrection: true })
+  const nextOperation = '123e4567-e89b-42d3-a456-426614174002'
+  let release = () => {}, posts = 0
+  const gate = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/jobs/outside-page/audit-application/apply', async route => {
+    posts++
+    if (posts > 1) return route.abort('failed')
+    const attempt = route.request().headers()['x-application-audit-attempt-id']
+    state.audit = { ...state.audit, operationId: nextOperation, audit: { ...state.audit.audit, findings: [{ ...state.audit.audit.findings[0], title: 'Updated review finding' }] } }
+    if (proof === 'late-matching') await gate
+    return route.fulfill({ status: 409, json: { error: 'Review changed', code: 'AUDIT_CORRECTION_NOT_STARTED', correctionWrite: 'not_started', auditAttemptId: proof === 'wrong-attempt' ? '123e4567-e89b-42d3-a456-426614174009' : attempt } })
+  })
+  try {
+    await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+    await page.getByRole('button', { name: 'Apply generated fix', exact: true }).click()
+    await expect.poll(() => posts).toBe(1)
+    if (proof === 'late-matching') {
+      await page.clock.fastForward(30_001)
+      await expect(page.getByText(/The correction result is unconfirmed/)).toBeVisible()
+      release()
+    }
+    const marker = () => page.evaluate(() => sessionStorage.getItem('applymate:audit-fence:fixture-user:outside-page'))
+    if (proof === 'wrong-attempt') {
+      await expect(page.getByText('This tab has an unconfirmed review request', { exact: false }).first()).toBeVisible()
+      await expect.poll(marker).not.toBeNull()
+      await expect(page.getByRole('button', { name: 'Apply generated fix', exact: true })).toHaveCount(0)
+      expect(posts).toBe(1)
+    } else {
+      await expect(page.getByText('The review changed before this correction started', { exact: false }).first()).toBeVisible()
+      await expect.poll(marker).toBeNull()
+      await expect(page.getByText('Updated review finding', { exact: false }).first()).toBeVisible()
+      expect(posts).toBe(1)
+      await page.getByRole('button', { name: 'Apply generated fix', exact: true }).click()
+      await expect.poll(() => posts).toBe(2)
+    }
+    expect(state.unexpected).toEqual([])
+  } finally { release() }
+})

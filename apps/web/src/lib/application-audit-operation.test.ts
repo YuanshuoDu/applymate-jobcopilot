@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { auditActivityText, AUDIT_ACTIVITY_PREFIX, parseStoredApplicationAudit } from './application-audit'
 import { signedAuditActivityText } from './application-audit-receipt'
-import { auditJobBasisHash, auditMaterialBasisHash, auditOperationActivityId, auditReceiptIdentity, completeAuditOperation, failAuditOperation, readAuditOperation, registerAuditOperation } from './application-audit-operation'
+import { auditJobBasisHash, auditMaterialBasisHash, auditOperationActivityId, auditReceiptIdentity, completeAuditOperation, failAuditOperation, readAuditOperation, registerAuditOperation, staleAuditOperation } from './application-audit-operation'
 import type { ApplicationAudit } from './types'
 
 const secrets = vi.hoisted(() => ({ current: 'audit-control-test-key' }))
@@ -81,6 +81,16 @@ describe('application audit operation control', () => {
     const id = await registerAuditOperation(f.tx, scope)
     expect(await failAuditOperation(f.tx, scope, id)).toBe(true)
     expect(await readAuditOperation(f.tx, scope)).toEqual({ kind: 'failed', operationId: id })
+    expect(f.activity.findFirst).not.toHaveBeenCalled()
+  })
+
+  it('marks an invalidated review stale without falling back to an old pass', async () => {
+    const f = fixture()
+    f.setLegacy(signedAuditActivityText(scope, result.resumeId, null, audit, result.versions))
+    const id = await registerAuditOperation(f.tx, scope)
+    expect(await staleAuditOperation(f.tx, scope, id)).toBe(true)
+    expect(await readAuditOperation(f.tx, scope)).toEqual({ kind: 'stale', operationId: id })
+    expect(await staleAuditOperation(f.tx, scope, id)).toBe(false)
     expect(f.activity.findFirst).not.toHaveBeenCalled()
   })
 
