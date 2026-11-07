@@ -126,7 +126,7 @@ export const CHILD_WAIT_CALL_LIFECYCLE_SQL = `(
 )`
 
 /** Accept only a projection pre-read from an exact owner-scoped durable source or claim receipt. */
-const CHILD_WAIT_SOURCE_PROJECTED_COMPLETION_SQL = `(
+export const CHILD_WAIT_SOURCE_PROJECTED_COMPLETION_SQL = `(
   EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof($13::jsonb) = 'array' THEN $13::jsonb ELSE '[]'::jsonb END) AS proof(value)
     WHERE proof.value->>'startEventId' = started."id"
   AND proof.value->>'rawCallId' = callItem."content"->>'toolCallId' AND started."correlationId" = proof.value->>'rawCallId'

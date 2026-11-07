@@ -3,7 +3,7 @@ import {
   childWaitContinuationKeyMatchesSafeProjection,
   CHILD_WAIT_CLAIM_KEY_COLUMNS_SQL,
   CHILD_WAIT_CALL_ITEM_COMPLETED_NO_EVENT_SQL, CHILD_WAIT_CALL_LIFECYCLE_SQL, CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL,
-  isCanonicalChildWaitOutcome,
+  CHILD_WAIT_SOURCE_PROJECTED_COMPLETION_SQL, isCanonicalChildWaitOutcome,
 } from "./pg-store-expiry-child-wait-claim-call-proof.js"
 
 describe("child-wait continuation key projection", () => {
@@ -44,6 +44,11 @@ describe("claim terminal settlement event descendants", () => {
     expect(CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL).toContain("ordered.\"sequence\" <= ordered.\"previousSequence\"")
     expect(CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL).toContain("modelDone.\"causationId\" = modelStart.\"id\"")
     expect(CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL).toContain("stepDone.\"payload\" = jsonb_build_object('stepId'")
+  })
+
+  it("keeps the exported diagnostic components in the production SQL assembly", () => {
+    expect(CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL).toContain(CHILD_WAIT_SOURCE_PROJECTED_COMPLETION_SQL)
+    expect(CHILD_WAIT_CALL_LIFECYCLE_SQL).toContain(CHILD_WAIT_CALL_ITEM_COMPLETED_NO_EVENT_SQL)
   })
 })
 

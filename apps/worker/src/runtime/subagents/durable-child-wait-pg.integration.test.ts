@@ -23,7 +23,9 @@ import { createProductionChildResumeLoaders } from "./production-child-resume-lo
 import { actionList, asObject, INSERT_TASK, json } from "./pg-store-persistence.js"
 import type { SubagentLease } from "./types.js"
 import { CHILD_WAIT_CLAIM_RECOVERY_SQL, CHILD_WAIT_CONSUMED_SQL, CHILD_WAIT_RESUMABLE_SQL as CHILD_WAIT_EXPIRY_RESUMABLE_SQL, hasBlockingExternalCall } from "./pg-store-expiry-recovery-predicates.js"
-import { CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL, childWaitContinuationKeyMatchesSafeProjection } from "./pg-store-expiry-child-wait-claim-call-proof.js"
+import { CHILD_WAIT_CALL_ITEM_COMPLETED_NO_EVENT_SQL, CHILD_WAIT_CALL_LIFECYCLE_SQL,
+  CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL, CHILD_WAIT_SOURCE_PROJECTED_COMPLETION_SQL,
+  childWaitContinuationKeyMatchesSafeProjection } from "./pg-store-expiry-child-wait-claim-call-proof.js"
 import { CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL, CHILD_WAIT_HISTORICAL_SOURCE_RESULT_RECEIPT_SQL,
   HISTORICAL_SOURCE_STEP_BINDING_SQL, HISTORICAL_SOURCE_STEP_PREFIX_SQL } from "./pg-store-expiry-historical-wait-event-binding.js"
 import { readChildWaitSourceCallProjection } from "./pg-store-expiry-child-wait-source-proof.js"
@@ -33,7 +35,8 @@ import { diagnoseChildWaitTerminalCallProjections, readChildWaitTerminalCallProj
 import { historicalSourceStepCallChainBinding, historicalSourceStepCallCountBinding, historicalSourceStepEventChainBinding,
   readCanonicalHistoricalSourceStepPrefix } from "./pg-store-expiry-historical-source-step-prefix.js"
 import { historicalSourceStepCallChainDiagnosticSql } from "./pg-store-expiry-historical-source-step-call-binding-diagnostics.js"
-import { MAX_STEP_TOOL_CALLS, readCanonicalWaitStepToolChain } from "./pg-store-expiry-step-tool-chain-proof.js"
+import { CHILD_WAIT_STEP_TOOL_CHAIN_EXCEPTION_SQL } from "./pg-store-expiry-step-completion-proof.js"
+import { MAX_STEP_CHAIN_EVENTS, MAX_STEP_TOOL_CALLS, readCanonicalWaitStepToolChain } from "./pg-store-expiry-step-tool-chain-proof.js"
 import { safeSubagentWaitJson } from "./subagent-wait-structural-ids.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
@@ -123,6 +126,63 @@ WHERE $1::text IS NOT NULL AND $2::text IS NOT NULL AND $3::text IS NOT NULL AND
       AND proof.value->>'projectedCallId' = $10::text AND proof.value->>'callItemId' = $11::text
       AND proof.value->>'stepId' = $12::text)
   AND started."id" = $14 AND settled."id" = $15`
+const WORKER_F_CLAIM_COMPONENTS_SQL = `WITH params AS MATERIALIZED (
+  SELECT $1::text AS "sessionId", $2::text AS "taskId", $3::text AS "turnId", $4::text AS "rootTaskId",
+    $5::text AS "leaseOwner", $6::integer AS "attemptCount", $7::timestamptz AS "leaseExpiresAt", $8::text AS "userId",
+    $9::text AS "rawCallId", $10::text AS "projectedCallId", $11::text AS "startEventId", $12::text AS "callItemId",
+    $13::jsonb AS "proofRows", $14::text AS "sourceCallId", $15::text AS "continuationStepId"
+), proof AS MATERIALIZED (
+  SELECT candidate.value FROM params
+  CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(params."proofRows") = 'array' THEN params."proofRows" ELSE '[]'::jsonb END) AS candidate(value)
+  WHERE candidate.value->>'startEventId' = params."startEventId" AND candidate.value->>'rawCallId' = params."rawCallId"
+    AND candidate.value->>'projectedCallId' = params."projectedCallId" AND candidate.value->>'callItemId' = params."callItemId"
+    AND candidate.value->'sourceWait'->>'sourceCallId' = params."sourceCallId"
+    AND candidate.value->'sourceWait'->'claimKeyDigest' <> 'null'::jsonb
+    AND candidate.value->>'attempt' = params."attemptCount"::text
+    AND candidate.value->>'stepId' = params."continuationStepId"
+)
+SELECT (${CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL}) AS "historicalWaitBinding",
+  (${CHILD_WAIT_SOURCE_PROJECTED_COMPLETION_SQL}) AS "projectedCompletion",
+  (${CHILD_WAIT_CALL_ITEM_COMPLETED_NO_EVENT_SQL}) AS "callItemCompletedNoEvent",
+  (${CHILD_WAIT_CALL_LIFECYCLE_SQL}) AS "callLifecycle",
+  (${CHILD_WAIT_STEP_TOOL_CHAIN_EXCEPTION_SQL}) AS "stepToolChainException",
+  CASE WHEN jsonb_typeof(proof.value->'stepToolChain'->'events') = 'array'
+    THEN LEAST(jsonb_array_length(proof.value->'stepToolChain'->'events'), ${MAX_STEP_CHAIN_EVENTS + 1}) ELSE 0 END AS "chainEventCount",
+  CASE WHEN jsonb_typeof(proof.value->'stepToolChain'->'calls') = 'array'
+    THEN LEAST(jsonb_array_length(proof.value->'stepToolChain'->'calls'), ${MAX_STEP_TOOL_CALLS + 1}) ELSE 0 END AS "chainCallCount",
+  (jsonb_typeof(proof.value->'stepToolChain'->'events') = 'array'
+    AND jsonb_array_length(proof.value->'stepToolChain'->'events') BETWEEN 12 AND ${MAX_STEP_CHAIN_EVENTS}) AS "chainEventCountValid"
+FROM params
+JOIN "sub_agent_tasks" AS owner ON owner."id" = params."taskId" AND owner."sessionId" = params."sessionId"
+  AND owner."turnId" = params."turnId" AND owner."rootTaskId" = params."rootTaskId" AND owner."parentTaskId" IS NOT NULL
+  AND owner."status" = 'running' AND owner."leaseOwner" = params."leaseOwner" AND owner."attemptCount" = params."attemptCount"
+  AND owner."leaseExpiresAt" = params."leaseExpiresAt" AND owner."interruptRequestedAt" IS NULL
+JOIN "agent_sessions" AS session ON session."id" = owner."sessionId" AND session."userId" = params."userId"
+JOIN "agent_turns" AS turn ON turn."id" = owner."turnId" AND turn."sessionId" = owner."sessionId"
+  AND turn."userId" = session."userId" AND turn."rootTaskId" = owner."rootTaskId"
+JOIN proof ON TRUE
+JOIN "agent_events" AS started ON started."id" = proof.value->>'startEventId'
+  AND started."sessionId" = params."sessionId" AND started."turnId" = params."turnId" AND started."taskId" = params."taskId"
+  AND started."itemId" = proof.value->>'callItemId' AND started."correlationId" = proof.value->>'rawCallId'
+  AND started."type" = 'tool_call.started'
+JOIN "agent_items" AS callItem ON callItem."id" = proof.value->>'callItemId'
+  AND callItem."sessionId" = params."sessionId" AND callItem."turnId" = params."turnId" AND callItem."taskId" = params."taskId"
+  AND callItem."type" = 'tool_call'
+JOIN "agent_items" AS claimedCall ON claimedCall."id" = callItem."id"
+JOIN "agent_steps" AS callStep ON callStep."id" = proof.value->>'stepId'
+  AND callStep."sessionId" = params."sessionId" AND callStep."turnId" = params."turnId" AND callStep."taskId" = params."taskId"
+  AND callStep."id" = params."continuationStepId"
+JOIN "agent_steps" AS continuation ON continuation."id" = callStep."id" AND continuation."attempt" = params."attemptCount"
+JOIN "agent_events" AS itemStarted ON itemStarted."sessionId" = callItem."sessionId"
+  AND itemStarted."turnId" = callItem."turnId" AND itemStarted."taskId" = callItem."taskId"
+  AND itemStarted."itemId" = callItem."id" AND itemStarted."type" = 'item.started'
+LEFT JOIN "agent_events" AS itemCompleted ON itemCompleted."sessionId" = callItem."sessionId"
+  AND itemCompleted."turnId" = callItem."turnId" AND itemCompleted."taskId" = callItem."taskId"
+  AND itemCompleted."itemId" = callItem."id" AND itemCompleted."type" = 'item.completed'
+LEFT JOIN "agent_events" AS resultExtra ON resultExtra."sessionId" = callItem."sessionId"
+  AND resultExtra."turnId" = callItem."turnId" AND resultExtra."taskId" = callItem."taskId"
+  AND resultExtra."id" = proof.value->'stepToolChain'->>'nextEventId'
+LIMIT 2`
 
 function safeProjectedWaitKey(input: { taskIds: readonly string[]; mode: "any" | "all"; timeoutMs: number; idempotencyKey: string }): string {
   const projected = asObject(safeSubagentWaitJson(input, 1_024))
@@ -174,6 +234,9 @@ describe("worker restart blocker proof diagnostic bindings", () => {
   })
   it("binds the same-call-ID source item/step/attempt terminal canary without gaps", () => {
     expectSqlBindings(WORKER_F_SAME_CALL_ID_TERMINAL_PROOF_SQL, 15)
+  })
+  it("binds claim-only component diagnostics without gaps", () => {
+    expectSqlBindings(WORKER_F_CLAIM_COMPONENTS_SQL, 15)
   })
   it("selects the exclusive top-level prefix or nested handoff prefix in binding diagnostics", () => {
     const path = historicalSourceStepPrefixPath("proof.value")
@@ -739,8 +802,10 @@ async function expectHistoricalWaitUnblocked(client: PoolClient, task: BlockingT
       const starts = await diagnoseWorkerFStartCandidates(client, task, continuationStepId, sourceCallId, claimCallId, true)
       const sourceReader = await diagnoseHistoricalWaitSourceProjection(client, task, sourceCallId)
       const finalBinding = await diagnoseHistoricalSourceFinalBinding(client, task, continuationStepId, sourceCallId)
-      return { ...starts, sourceReader, finalBinding }
-    }) ?? { probeAvailable: false, sourceReader: { outcome: "unknown" }, finalBinding: { outcome: "unknown" } }
+      const claimFinal = await diagnoseHistoricalClaimFinal(client, task, continuationStepId, sourceCallId, claimCallId)
+      return { ...starts, sourceReader, finalBinding, claimFinal }
+    }) ?? { probeAvailable: false, sourceReader: { outcome: "unknown" }, finalBinding: { outcome: "unknown" },
+      claimFinal: { outcome: "unknown" } }
     const suffix = `; redacted historical-wait diagnostic=${JSON.stringify(diagnostic)}`
     if (error instanceof Error) {
       error.message += suffix
@@ -1073,6 +1138,92 @@ async function diagnoseWorkerFClaimProof(
       && claimCall.content.toolCallId === claimCallId && claimCall.content.toolName === "wait_subagents",
     claimHasNoItemCompletedEvent: (claimEvents.rows[0]?.count ?? 0) === 0,
   }
+}
+
+async function diagnoseHistoricalClaimFinal(client: PoolClient, task: BlockingTaskSnapshot,
+  continuationStepId: string, sourceCallId: string, claimCallId: string): Promise<Record<string, unknown>> {
+  const projections = await readChildWaitTerminalCallProjections(client, task as unknown as Record<string, unknown>)
+  const claims = projections.filter(projection => projection.sourceWait.claimKeyDigest !== null
+    && projection.rawCallId === claimCallId && projection.sourceWait.sourceCallId === sourceCallId
+    && projection.stepId === continuationStepId && projection.attempt === task.attemptCount)
+  if (claims.length !== 1) return { outcome: claims.length === 0 ? "missing" : "ambiguous",
+    acceptedClaimProjectionCount: Math.min(claims.length, 17), recovery: { outcome: "not_evaluated" },
+    historicalWaitBinding: null, projectedCompletion: null, callItemCompletedNoEvent: null,
+    callLifecycle: null, resultExtraStepToolChainException: null, terminalSettlement: null }
+
+  const claim = claims[0]!
+  const chain = asObject(claim.stepToolChain)
+  const events = Array.isArray(chain.events) ? chain.events : []
+  const calls = Array.isArray(chain.calls) ? chain.calls : []
+  const componentRows = await client.query<Record<string, unknown>>(WORKER_F_CLAIM_COMPONENTS_SQL, [
+    task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount,
+    task.leaseExpiresAt, task.userId, claim.rawCallId, claim.projectedCallId, claim.startEventId,
+    claim.callItemId, JSON.stringify([claim]), sourceCallId, continuationStepId,
+  ])
+  const recovery = await diagnoseWorkerFClaimProof(client, task, continuationStepId, sourceCallId, claimCallId)
+  const component = componentRows.rows.length === 1 ? componentRows.rows[0] : undefined
+  const terminal = await diagnoseAcceptedClaimTerminalSettlement(client, task, claim)
+  const boundedCount = (value: unknown, maximum: number): number => typeof value === "number"
+    && Number.isSafeInteger(value) && value >= 0 ? Math.min(value, maximum + 1) : 0
+  const enumValue = (value: unknown, allowed: readonly string[]): string =>
+    typeof value === "string" && allowed.includes(value) ? value : "unknown"
+  const recoveryCandidateCount = boundedCount(recovery.sqlCandidateCount, 2)
+  const recoveryMatchCount = boundedCount(recovery.sqlMatchCount, 2)
+  const chainEventCount = boundedCount(events.length, MAX_STEP_CHAIN_EVENTS)
+  const chainCallCount = boundedCount(calls.length, MAX_STEP_TOOL_CALLS)
+  const componentFlag = (key: string): boolean | null => component?.[key] === true ? true
+    : component?.[key] === false ? false : null
+  const recoverySummary = { candidateCount: recoveryCandidateCount, matchCount: recoveryMatchCount,
+    exactMatch: recovery.exactSqlProofMatched === true,
+    ownerLeaseAttemptFenceMatched: recovery.exactSqlProofMatched === true,
+    attemptRelation: enumValue(recovery.attemptRelation, ["same", "prior", "future"]),
+    sourceReceiptFinished: recovery.sourceReceiptFinished === true,
+    safeKeyProjectionMatched: recovery.safeKeyProjectionMatched === true,
+    deadlineCanonicalAndMatched: recovery.deadlineCanonicalAndMatched === true,
+    claimCallFinishedRevision1: recovery.claimCallFinishedRevision1 === true,
+    claimHasNoItemCompletedEvent: recovery.claimHasNoItemCompletedEvent === true }
+  return { outcome: "evaluated", acceptedClaimProjectionCount: 1,
+    claimResultPairPresent: typeof claim.resultStartedEventId === "string" && !!claim.resultStartedEventId
+      && typeof claim.resultCompletedEventId === "string" && !!claim.resultCompletedEventId,
+    claimStepToolChainPresent: Object.keys(chain).length > 0,
+    chainEventCount, chainCallCount,
+    chainEventCountValid: Array.isArray(chain.events) && events.length >= 12 && events.length <= MAX_STEP_CHAIN_EVENTS,
+    recovery: recoverySummary, componentOutcome: component ? "evaluated" : "unknown",
+    historicalWaitBinding: componentFlag("historicalWaitBinding"),
+    projectedCompletion: componentFlag("projectedCompletion"),
+    callItemCompletedNoEvent: componentFlag("callItemCompletedNoEvent"),
+    callLifecycle: componentFlag("callLifecycle"),
+    resultExtraStepToolChainException: componentFlag("stepToolChainException"),
+    terminalSettlement: terminal.settlement, terminalCandidateCount: terminal.candidateCount,
+    terminalCandidateCountTruncated: terminal.truncated, terminalSettlementMatchedCount: terminal.matchedCount }
+}
+
+async function diagnoseAcceptedClaimTerminalSettlement(client: PoolClient, task: BlockingTaskSnapshot,
+  claim: Awaited<ReturnType<typeof readChildWaitTerminalCallProjections>>[number]): Promise<{
+    settlement: boolean | null; candidateCount: number; matchedCount: number; truncated: boolean
+  }> {
+  const candidates = await client.query<{ id: string }>(`SELECT terminal."id" FROM "agent_events" AS started
+    JOIN LATERAL (SELECT settled."id", settled."sequence" FROM "agent_events" AS settled
+      WHERE settled."sessionId" = started."sessionId" AND settled."turnId" = started."turnId"
+        AND settled."taskId" = started."taskId" AND settled."correlationId" = started."correlationId"
+        AND settled."type" IN ('tool_call.completed', 'tool_call.failed', 'tool_call.interrupted')
+      ORDER BY settled."sequence" DESC, settled."id" DESC LIMIT 17) AS terminal ON TRUE
+    WHERE started."id" = $1 AND started."sessionId" = $2 AND started."turnId" = $3 AND started."taskId" = $4
+      AND started."type" = 'tool_call.started' AND started."itemId" = $5 AND started."correlationId" = $6
+    ORDER BY terminal."sequence" DESC, terminal."id" DESC LIMIT 17`,
+  [claim.startEventId, task.sessionId, task.turnId, task.id, claim.callItemId, claim.rawCallId])
+  let matchedCount = 0
+  for (const terminal of candidates.rows) {
+    const proof = await client.query<{ settled: boolean }>(WORKER_F_SAME_CALL_ID_TERMINAL_PROOF_SQL, [
+      task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount,
+      task.leaseExpiresAt, task.userId, claim.rawCallId, claim.projectedCallId, claim.callItemId,
+      claim.stepId, JSON.stringify([claim]), claim.startEventId, terminal.id,
+    ])
+    if (proof.rows.length === 1 && proof.rows[0]?.settled === true) matchedCount += 1
+  }
+  const candidateCount = candidates.rows.length
+  return { settlement: matchedCount > 0 ? true : candidateCount === 17 ? null : false,
+    candidateCount, matchedCount, truncated: candidateCount === 17 }
 }
 
 function sameJsonValue(left: unknown, right: unknown): boolean {
