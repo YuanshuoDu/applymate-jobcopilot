@@ -13,9 +13,10 @@ type Item = Row & { id: string; sessionId: string; turnId: string; taskId: strin
 type EventBinding = Readonly<{ id: string; sequence: string; type: string; actor: string; itemId: string | null;
   correlationId: string; causationId: string | null; idempotencyKey: string; payloadDigest: string; status?: "completed" | "failed" | "cancelled"; errorCode?: string | null }>
 type ItemBinding = Readonly<{ id: string; type: string; status: string; revision: number; phase: string | null; contentDigest: string }>
+type TerminalMode = "step_completed" | "recovered_handoff"
 export type HistoricalSourceStepPrefix = Readonly<{ stepId: string; attempt: number; sourceCallItemId: string; sourceCallId: string;
-  sourceResultItemId: string; waitKind: "normal_waiting" | "recovered"; stepStartedEventId: string; stepCompletedEventId: string; events: readonly EventBinding[]; items: readonly ItemBinding[] }>
-
+  sourceResultItemId: string; waitKind: "normal_waiting" | "recovered"; terminalMode: TerminalMode; stepStartedEventId: string;
+  stepCompletedEventId: string | null; events: readonly EventBinding[]; items: readonly ItemBinding[] }>
 const MAX_EVENTS = MAX_STEP_TOOL_CALLS * 9 + 16
 const EARLY_STOP_ERROR_CODES = new Set(["policy_requires_approval", "policy_requires_user_input", "gmail_oauth_required", "session_pause_requested"])
 const validText = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value
@@ -41,13 +42,24 @@ const itemBinding = (item: Item): ItemBinding => ({ id: item.id, type: item.type
 /** Reads a bounded, same-owner writer prefix through one durable waiting tool result. */
 export async function readCanonicalHistoricalSourceStepPrefix(client: pg.PoolClient, task: Scope,
   input: { readonly stepId: string; readonly attempt: number; readonly callItemId: string; readonly callId: string;
-    readonly resultItemId: string; readonly waitKind: "normal_waiting" | "recovered" }): Promise<HistoricalSourceStepPrefix | null> {
+    readonly resultItemId: string; readonly waitKind: "normal_waiting" | "recovered"; readonly terminalMode?: TerminalMode }): Promise<HistoricalSourceStepPrefix | null> {
   if (![task.id, task.sessionId, task.turnId, input.stepId, input.callItemId, input.callId, input.resultItemId].every(validText)
     || !Number.isSafeInteger(input.attempt) || input.attempt < 1) return null
+  const terminalMode = input.terminalMode ?? "step_completed"
   const agendaKey = cognitiveAgendaReceiptIdempotencyKey(input.stepId)
   if (!agendaKey) return null
+  if (terminalMode === "recovered_handoff") {
+    const step = await client.query<{ status: string }>(`SELECT "status" FROM "agent_steps"
+      WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 AND "attempt" = $5`,
+    [input.stepId, task.sessionId, task.turnId, task.id, input.attempt])
+    const completed = await client.query(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+      AND "type" = 'step.completed' AND ("correlationId" = $4 OR "idempotencyKey" = $5) LIMIT 1`,
+    [task.sessionId, task.turnId, task.id, input.stepId, `task:${task.id}:event:step-completed:${input.stepId}`])
+    if (step.rows.length !== 1 || step.rows[0]?.status !== "waiting_for_tool" || completed.rows.length !== 0) return null
+  }
   const prefix = `task:${task.id}:event:`, keys = [prefix + `step-started:${input.stepId}`, prefix + `model-started:${input.stepId}`,
-    prefix + `model-completed:${input.stepId}`, prefix + `model-usage:${input.stepId}`, prefix + `step-completed:${input.stepId}`, prefix + agendaKey]
+    prefix + `model-completed:${input.stepId}`, prefix + `model-usage:${input.stepId}`,
+    terminalMode === "step_completed" ? prefix + `step-completed:${input.stepId}` : prefix + `tool-result-completed:${input.callId}:${input.resultItemId}:1`, prefix + agendaKey]
   const anchors = await client.query<Event>(`SELECT "id", "sequence"::text AS "sequence", "type", "actor", "itemId", "correlationId", "causationId", "idempotencyKey", "payload",
       encode(sha256(convert_to("payload"::text, 'UTF8')), 'hex') AS "payloadDigest"
     FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "idempotencyKey" = ANY($4::text[]) LIMIT 7`,
@@ -72,11 +84,11 @@ export async function readCanonicalHistoricalSourceStepPrefix(client: pg.PoolCli
     [task.sessionId, task.turnId, task.id, input.stepId]),
   ])
   if (eventRows.rows.length > MAX_EVENTS || itemRows.rows.length > MAX_STEP_TOOL_CALLS * 2 + 2) return null
-  return provePrefix(task, input, eventRows.rows, itemRows.rows, keys)
+  return provePrefix(task, { ...input, terminalMode }, eventRows.rows, itemRows.rows, keys)
 }
 function provePrefix(task: Scope, input: { stepId: string; attempt: number; callItemId: string; callId: string; resultItemId: string;
-  waitKind: "normal_waiting" | "recovered" }, events: readonly Event[], items: readonly Item[], keys: readonly string[]): HistoricalSourceStepPrefix | null {
-  if (events.length < 12 || events.length > MAX_EVENTS) return null
+  waitKind: "normal_waiting" | "recovered"; terminalMode: TerminalMode }, events: readonly Event[], items: readonly Item[], keys: readonly string[]): HistoricalSourceStepPrefix | null {
+  if (events.length < (input.terminalMode === "step_completed" ? 12 : 11) || events.length > MAX_EVENTS) return null
   const itemMap = new Map(items.map(item => [item.id, item])), byKey = new Map(events.map(event => [event.idempotencyKey, event]))
   if (itemMap.size !== items.length || byKey.size !== events.length || items.some(item => item.sessionId !== task.sessionId
     || item.turnId !== task.turnId || item.taskId !== task.id || item.stepId !== input.stepId)) return null
@@ -85,18 +97,18 @@ function provePrefix(task: Scope, input: { stepId: string; attempt: number; call
   if (!calls.length || calls.length > MAX_STEP_TOOL_CALLS || results.length !== calls.length || comments.length > 2
     || items.length !== calls.length * 2 + comments.length || items.some(item => !["tool_call", "tool_result", "agent_message", "reasoning_summary"].includes(item.type))) return null
   const start = byKey.get(keys[0]!), agenda = byKey.get(keys[5]!), modelStart = byKey.get(keys[1]!), modelDone = byKey.get(keys[2]!)
-  const usage = byKey.get(keys[3]!), stepDone = byKey.get(keys[4]!), startPayload = record(start?.payload)
+  const usage = byKey.get(keys[3]!), terminalEvent = byKey.get(keys[4]!), startPayload = record(start?.payload)
   const startModel = record(modelStart?.payload), doneModel = record(modelDone?.payload), usagePayload = record(usage?.payload)
   const agendaReceipt = parseCognitiveAgendaReceipt(agenda?.payload, { sessionId: task.sessionId, turnId: task.turnId, taskId: task.id, stepId: input.stepId })
   const callCount = doneModel.toolCallCount
-  if (!start || !agenda || !modelStart || !modelDone || !usage || !stepDone) return null
-  if ([start, agenda, modelStart, modelDone, usage, stepDone].some(event => !event || event.actor !== "subagent" || event.itemId !== null
+  if (!start || !agenda || !modelStart || !modelDone || !usage || !terminalEvent) return null
+  if ([start, agenda, modelStart, modelDone, usage].some(event => !event || event.actor !== "subagent" || event.itemId !== null
     || event.correlationId !== input.stepId) || !agendaReceipt || start?.idempotencyKey !== keys[0] || agenda?.idempotencyKey !== keys[5]
     || !exactKeys(startPayload, ["stepId", "ordinal", "taskId"]) || startPayload.stepId !== input.stepId || startPayload.taskId !== task.id
     || typeof startPayload.ordinal !== "number" || !Number.isSafeInteger(startPayload.ordinal) || startPayload.ordinal < 0
     || agenda.causationId !== start.id || modelStart?.causationId !== agenda.id || modelDone?.causationId !== modelStart.id
     || usage?.causationId !== modelDone.id || modelStart.idempotencyKey !== keys[1] || modelDone.idempotencyKey !== keys[2]
-    || usage.idempotencyKey !== keys[3] || stepDone.idempotencyKey !== keys[4]
+    || usage.idempotencyKey !== keys[3] || terminalEvent.idempotencyKey !== keys[4]
     || !exactKeys(startModel, ["taskId", "provider", "model"]) || startModel.taskId !== task.id
     || !validText(startModel.provider) || !validText(startModel.model)
     || !exactKeys(doneModel, ["taskId", "provider", "model", "toolCallCount"]) || doneModel.taskId !== task.id
@@ -104,8 +116,8 @@ function provePrefix(task: Scope, input: { stepId: string; attempt: number; call
     || !Number.isSafeInteger(callCount) || callCount < calls.length || callCount > MAX_STEP_TOOL_CALLS
     || !exactKeys(usagePayload, ["taskId", "provider", "model", "usage"]) || usagePayload.taskId !== task.id
     || usagePayload.provider !== startModel.provider || usagePayload.model !== startModel.model || !safeUsage(usagePayload.usage)
-    || !same(stepDone.payload, { stepId: input.stepId, status: "waiting_for_dependency", toolCallCount: callCount, taskId: task.id })) return null
-
+    || input.terminalMode === "step_completed" && (terminalEvent.type !== "step.completed"
+      || !same(terminalEvent.payload, { stepId: input.stepId, status: "waiting_for_dependency", toolCallCount: callCount, taskId: task.id }))) return null
   const cursor = { value: 0 }, proof: Event[] = []
   let previous: Event | undefined
   const take = (type: string, key: string, correlation: string, itemId: string | null, payload?: unknown): Event | null => {
@@ -157,15 +169,18 @@ function provePrefix(task: Scope, input: { stepId: string; attempt: number; call
     if (!resultStart || !resultDone || resultDone.causationId !== resultStart.id) return null
     callProofs.push({ callItemId: call.id, resultItemId: result[0]!.id, resultCompletedId: resultDone.id })
   }
-  if (callProofs.at(-1)?.callItemId !== input.callItemId || !take("step.completed", keys[4]!, input.stepId, null, stepDone.payload)
-    || cursor.value !== events.length || proof[proof.length - 2]?.id !== callProofs.at(-1)?.resultCompletedId) return null
+  const terminalValid = input.terminalMode === "step_completed"
+    ? take("step.completed", keys[4]!, input.stepId, null, terminalEvent.payload)?.id === terminalEvent.id
+    : terminalEvent.type === "item.completed" && terminalEvent.itemId === input.resultItemId
+      && proof.at(-1)?.id === terminalEvent.id
+  if (callProofs.at(-1)?.callItemId !== input.callItemId || !terminalValid || cursor.value !== events.length || input.terminalMode === "step_completed" && proof[proof.length - 2]?.id !== callProofs.at(-1)?.resultCompletedId || input.terminalMode === "recovered_handoff" && proof.at(-1)?.id !== callProofs.at(-1)?.resultCompletedId) return null
   const seq = proof.map(event => BigInt(event.sequence))
   if (seq.some((value, index) => index > 0 && value <= seq[index - 1]!)) return null
   return { stepId: input.stepId, attempt: input.attempt, sourceCallItemId: input.callItemId, sourceCallId: input.callId,
-    sourceResultItemId: input.resultItemId, waitKind: input.waitKind, stepStartedEventId: start.id, stepCompletedEventId: stepDone.id,
+    sourceResultItemId: input.resultItemId, waitKind: input.waitKind, terminalMode: input.terminalMode,
+    stepStartedEventId: start.id, stepCompletedEventId: input.terminalMode === "step_completed" ? terminalEvent.id : null,
     events: proof.map(binding), items: items.map(itemBinding) }
 }
-
 function plain(value: unknown): value is Record<string, unknown> { return Boolean(value) && typeof value === "object" && !Array.isArray(value) }
 function eventOrder(events: readonly Event[], left: string, right: string): number {
   const find = (id: string) => sequence(events.find(event => event.type === "item.started" && event.itemId === id)?.sequence) ?? 0n
@@ -185,66 +200,38 @@ function appendCommentProof(take: (type: string, key: string, correlation: strin
     { itemId: item.id, status: "completed", content })
   return Boolean(started && updated && completed)
 }
-const jsonArray = (path: string) => `CASE WHEN jsonb_typeof(${path}) = 'array' THEN ${path} ELSE '[]'::jsonb END`
-const prefixEvents = jsonArray("proof.value->'sourceStepPrefix'->'events'")
-const prefixItems = jsonArray("proof.value->'sourceStepPrefix'->'items'")
-/** Rebinds only safe signatures/digests; source text and tool payloads are never copied into the final query proof. */
-export const HISTORICAL_SOURCE_STEP_PREFIX_SQL = `CASE WHEN jsonb_typeof(proof.value->'sourceStepPrefix') = 'object' THEN
-  CASE WHEN (SELECT COUNT(*) FROM jsonb_object_keys(proof.value->'sourceStepPrefix')) = 10
-    AND proof.value->'sourceStepPrefix' ?& ARRAY['stepId','attempt','sourceCallItemId','sourceCallId','sourceResultItemId','waitKind','stepStartedEventId','stepCompletedEventId','events','items']
-    AND proof.value->'sourceStepPrefix'->>'stepId' = boundSource."id"
-    AND proof.value->'sourceStepPrefix'->>'attempt' = boundSource."attempt"::text
-    AND proof.value->'sourceStepPrefix'->>'sourceCallItemId' = boundSourceCall."id"
-    AND proof.value->'sourceStepPrefix'->>'sourceCallId' = boundSourceCall."content"->>'toolCallId'
-    AND proof.value->'sourceStepPrefix'->>'sourceResultItemId' = boundSourceResult."id"
-    AND proof.value->'sourceStepPrefix'->>'waitKind' = proof.value->'sourceWait'->>'sourceKind'
-    AND jsonb_array_length(${prefixEvents}) BETWEEN 12 AND ${MAX_EVENTS}
-    AND jsonb_array_length(${prefixItems}) BETWEEN 2 AND ${MAX_STEP_TOOL_CALLS * 2 + 2}
-    AND (SELECT COUNT(*) FROM jsonb_array_elements(${prefixEvents}) AS expected(value)
-      JOIN "agent_events" AS exactEvent ON exactEvent."id" = expected.value->>'id'
-        AND exactEvent."sessionId" = boundSource."sessionId" AND exactEvent."turnId" = boundSource."turnId" AND exactEvent."taskId" = boundSource."taskId"
-      WHERE exactEvent."sequence"::text = expected.value->>'sequence' AND exactEvent."type" = expected.value->>'type'
-        AND exactEvent."actor" = expected.value->>'actor' AND exactEvent."itemId" IS NOT DISTINCT FROM expected.value->>'itemId'
-        AND exactEvent."correlationId" = expected.value->>'correlationId' AND exactEvent."causationId" IS NOT DISTINCT FROM expected.value->>'causationId'
-        AND exactEvent."idempotencyKey" = expected.value->>'idempotencyKey'
-        AND CASE WHEN exactEvent."type" IN ('tool_call.completed', 'tool_call.failed') THEN exactEvent."payload" ? 'status'
-          AND exactEvent."payload"->>'status' = expected.value->>'status' AND exactEvent."payload" ? 'errorCode'
-          AND exactEvent."payload"->'errorCode' = expected.value->'errorCode' ELSE NOT (expected.value ? 'status' OR expected.value ? 'errorCode') END
-        AND encode(sha256(convert_to(exactEvent."payload"::text, 'UTF8')), 'hex') = expected.value->>'payloadDigest') = jsonb_array_length(${prefixEvents})
-    AND (SELECT COUNT(*) FROM jsonb_array_elements(${prefixEvents}) AS expected(value)
-      WHERE CASE WHEN jsonb_typeof(expected.value) = 'object' THEN
-        CASE WHEN expected.value->>'type' IN ('tool_call.completed', 'tool_call.failed') THEN
-          (SELECT COUNT(*) FROM jsonb_object_keys(expected.value)) = 11 AND expected.value ?& ARRAY['id','sequence','type','actor','itemId','correlationId','causationId','idempotencyKey','payloadDigest','status','errorCode']
-          AND ((expected.value->>'type' = 'tool_call.completed' AND expected.value->>'status' = 'completed' AND expected.value->'errorCode' = 'null'::jsonb)
-            OR (expected.value->>'type' = 'tool_call.failed' AND expected.value->>'status' IN ('failed','cancelled')
-              AND jsonb_typeof(expected.value->'errorCode') IN ('null','string') AND (expected.value->'errorCode' = 'null'::jsonb
-                OR expected.value->>'errorCode' ~ '^[A-Za-z0-9_.:-]{1,128}$') AND COALESCE(expected.value->>'errorCode','')
-                NOT IN ('policy_requires_approval','policy_requires_user_input','gmail_oauth_required','session_pause_requested')))
-        ELSE (SELECT COUNT(*) FROM jsonb_object_keys(expected.value)) = 9
-          AND expected.value ?& ARRAY['id','sequence','type','actor','itemId','correlationId','causationId','idempotencyKey','payloadDigest']
-          AND NOT (expected.value ? 'status' OR expected.value ? 'errorCode') END
-        ELSE FALSE END AND expected.value->>'payloadDigest' ~ '^[0-9a-f]{64}$'
-        AND expected.value->>'sequence' ~ '^[1-9][0-9]{0,18}$') = jsonb_array_length(${prefixEvents})
-    AND (SELECT COUNT(*) FROM "agent_events" AS scoped WHERE scoped."sessionId" = boundSource."sessionId"
-      AND scoped."turnId" = boundSource."turnId" AND scoped."taskId" = boundSource."taskId"
-      AND (scoped."id" IN (SELECT expected.value->>'id' FROM jsonb_array_elements(${prefixEvents}) AS expected(value))
-        OR scoped."causationId" IN (SELECT expected.value->>'id' FROM jsonb_array_elements(${prefixEvents}) AS expected(value)))) = jsonb_array_length(${prefixEvents})
-    AND (SELECT COUNT(*) FROM "agent_events" AS ordered WHERE ordered."sessionId" = boundSource."sessionId"
-      AND ordered."turnId" = boundSource."turnId" AND ordered."taskId" = boundSource."taskId"
-      AND ordered."sequence" BETWEEN (proof.value->'sourceStepPrefix'->'events'->0->>'sequence')::bigint
-        AND (proof.value->'sourceStepPrefix'->'events'->(jsonb_array_length(${prefixEvents}) - 1)->>'sequence')::bigint) = jsonb_array_length(${prefixEvents})
-    AND (SELECT COUNT(*) FROM jsonb_array_elements(${prefixItems}) AS expected(value)
-      JOIN "agent_items" AS exactItem ON exactItem."id" = expected.value->>'id' AND exactItem."sessionId" = boundSource."sessionId"
-        AND exactItem."turnId" = boundSource."turnId" AND exactItem."taskId" = boundSource."taskId" AND exactItem."stepId" = boundSource."id"
-      WHERE exactItem."type" = expected.value->>'type' AND exactItem."status" = expected.value->>'status'
-        AND exactItem."revision"::text = expected.value->>'revision' AND exactItem."phase" IS NOT DISTINCT FROM expected.value->>'phase'
-        AND encode(sha256(convert_to(exactItem."content"::text, 'UTF8')), 'hex') = expected.value->>'contentDigest') = jsonb_array_length(${prefixItems})
-    AND (SELECT COUNT(*) FROM jsonb_array_elements(${prefixItems}) AS expected(value)
-      WHERE CASE WHEN jsonb_typeof(expected.value) = 'object' THEN
-        (SELECT COUNT(*) FROM jsonb_object_keys(expected.value)) = 6 AND expected.value ?& ARRAY['id','type','status','revision','phase','contentDigest']
-        ELSE FALSE END AND expected.value->>'contentDigest' ~ '^[0-9a-f]{64}$') = jsonb_array_length(${prefixItems})
-    AND jsonb_array_length(${prefixItems}) = (SELECT COUNT(*) FROM "agent_items" AS scopedItem
-      WHERE scopedItem."sessionId" = boundSource."sessionId" AND scopedItem."turnId" = boundSource."turnId"
-        AND scopedItem."taskId" = boundSource."taskId" AND scopedItem."stepId" = boundSource."id")
-  THEN TRUE ELSE FALSE END
-ELSE FALSE END`
+export { historicalSourceStepEventChainBinding } from "./pg-store-expiry-historical-source-step-parent-binding.js"
+export { historicalSourceStepCallChainBinding } from "./pg-store-expiry-historical-source-step-call-binding.js"
+export function historicalSourceStepCallCountBinding(path: string): string {
+  const events = `(CASE WHEN jsonb_typeof(${path}->'events') = 'array' THEN ${path}->'events' ELSE '[]'::jsonb END)`
+  const scopedCalls = `callItem."sessionId" = boundSource."sessionId" AND callItem."turnId" = boundSource."turnId"
+    AND callItem."taskId" = boundSource."taskId" AND callItem."stepId" = boundSource."id" AND callItem."type" = 'tool_call'`
+  const calls = `(SELECT COUNT(*) FROM "agent_items" AS callItem WHERE ${scopedCalls})`
+  const distinctCalls = `(SELECT COUNT(DISTINCT callItem."content"->>'toolCallId') FROM "agent_items" AS callItem WHERE ${scopedCalls})`
+  const firstEvent = `(${events}->0->>'id')`, lastEvent = `(${events}->(jsonb_array_length(${events}) - 1)->>'id')`
+  const scopedStarts = `started."sessionId" = boundSource."sessionId" AND started."turnId" = boundSource."turnId"
+    AND started."taskId" = boundSource."taskId" AND started."type" = 'tool_call.started'
+    AND started."sequence" BETWEEN (SELECT anchor."sequence" FROM "agent_events" AS anchor WHERE anchor."id" = ${firstEvent}
+      AND anchor."sessionId" = boundSource."sessionId" AND anchor."turnId" = boundSource."turnId" AND anchor."taskId" = boundSource."taskId")
+      AND (SELECT anchor."sequence" FROM "agent_events" AS anchor WHERE anchor."id" = ${lastEvent}
+        AND anchor."sessionId" = boundSource."sessionId" AND anchor."turnId" = boundSource."turnId" AND anchor."taskId" = boundSource."taskId")`
+  const started = `(SELECT COUNT(*) FROM "agent_events" AS started WHERE ${scopedStarts})`
+  const distinctStarts = `(SELECT COUNT(DISTINCT started."correlationId") FROM "agent_events" AS started WHERE ${scopedStarts})`
+  const startedCalls = `(SELECT COUNT(DISTINCT started."correlationId") FROM "agent_events" AS started JOIN "agent_items" AS callItem
+    ON callItem."id" = started."itemId" AND ${scopedCalls} WHERE ${scopedStarts}
+      AND started."actor" = 'subagent' AND started."correlationId" = callItem."content"->>'toolCallId'
+      AND started."idempotencyKey" = 'task:' || owner."id" || ':event:tool-started:' || (callItem."content"->>'toolCallId')
+      AND started."payload" = jsonb_build_object('toolCallId', callItem."content"->>'toolCallId', 'toolName', callItem."content"->>'toolName', 'taskId', owner."id"))`
+  const finalSourceStart = `(SELECT MAX(sourceStart."sequence") FROM "agent_events" AS sourceStart WHERE sourceStart."sessionId" = boundSource."sessionId"
+    AND sourceStart."turnId" = boundSource."turnId" AND sourceStart."taskId" = boundSource."taskId" AND sourceStart."type" = 'tool_call.started'
+    AND sourceStart."actor" = 'subagent' AND sourceStart."itemId" = boundSourceCall."id"
+    AND sourceStart."correlationId" = boundSourceCall."content"->>'toolCallId'
+    AND sourceStart."idempotencyKey" = 'task:' || boundSource."taskId" || ':event:tool-started:' || (boundSourceCall."content"->>'toolCallId'))`
+  return `(SELECT COUNT(*) FROM jsonb_array_elements(${events}) AS projected(value) JOIN "agent_events" AS modelDone ON modelDone."id" = projected.value->>'id'
+    AND modelDone."sessionId" = boundSource."sessionId" AND modelDone."turnId" = boundSource."turnId" AND modelDone."taskId" = boundSource."taskId"
+      AND modelDone."type" = 'model.completed' WHERE jsonb_typeof(modelDone."payload"->'toolCallCount') = 'number'
+      AND CASE WHEN modelDone."payload"->>'toolCallCount' ~ '^(0|[1-9][0-9]?)$'
+        THEN (modelDone."payload"->>'toolCallCount')::integer BETWEEN ${calls} AND ${MAX_STEP_TOOL_CALLS} ELSE FALSE END
+      AND ${calls} = ${distinctCalls} AND ${started} = ${calls} AND ${distinctStarts} = ${calls} AND ${startedCalls} = ${calls}
+      AND (SELECT MAX(started."sequence") FROM "agent_events" AS started WHERE ${scopedStarts}) = ${finalSourceStart}) = 1`
+}

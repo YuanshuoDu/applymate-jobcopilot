@@ -415,7 +415,7 @@ function loopContextBuilder() {
   }) }
 }
 
-function loopFixtureModel(reply) {
+function loopFixtureModel(reply, onInvocation) {
   const invocations = []
   const model = {
     id: "durable-child-wait-fixture-model",
@@ -428,6 +428,7 @@ function loopFixtureModel(reply) {
         throw new Error("fixture_model_step_id_missing")
       }
       invocations.push(stepId)
+      onInvocation?.()
       let response
       try {
         response = await reply({ request, stepId, invocation: invocations.length })
@@ -454,10 +455,14 @@ async function runChildWaitLoop(lease, restored, responseForStep, hooks = {}) {
   if (!wait) throw new Error("fixture_child_wait_loop_resume_missing")
   traceLoopStage("execution_loop_recovery", "start")
   const replay = createChildDurableWaitReplay(lease, wait, restored.observations, restored.childWaitClaimRecovery)
-  let executorCalls = 0, dispatcherCalls = 0
-  const fixtureModel = loopFixtureModel(responseForStep)
+  const activityCounts = hooks.activityCounts ?? { modelCalls: 0, executorCalls: 0,
+    priorNoopExecutorCalls: 0, dispatcherCalls: 0 }
+  const fixtureModel = loopFixtureModel(responseForStep, () => { activityCounts.modelCalls += 1 })
   const options = turnExecutionOptions(lease, owner, async input => {
-    executorCalls += 1
+    activityCounts.executorCalls += 1
+    if (input.call.toolName === "fixture_noop" && input.call.id === "fixture-noop-before-child-wait") {
+      activityCounts.priorNoopExecutorCalls += 1
+    }
     if (hooks.beforeReplayExecution) await hooks.beforeReplayExecution(input)
     if (input.call.toolName === "fixture_noop") return { id: input.call.id, toolName: input.call.toolName,
       toolVersion: "1", status: "completed", output: { accepted: true }, errorCode: null }
@@ -471,7 +476,7 @@ async function runChildWaitLoop(lease, restored, responseForStep, hooks = {}) {
     }
     const result = replay.execute(input)
     if (!result) {
-      dispatcherCalls += 1
+      activityCounts.dispatcherCalls += 1
       throw new Error("fixture_child_wait_loop_dispatcher_reached")
     }
     return { id: result.id, toolName: result.toolName, toolVersion: result.toolVersion,
@@ -543,7 +548,7 @@ async function runChildWaitLoop(lease, restored, responseForStep, hooks = {}) {
     traceLoopStage("loop_result", "start")
     traceLoopStage("loop_result", "pass")
   }
-  return { result, invocations: fixtureModel.invocations, executorCalls, dispatcherCalls }
+  return { result, invocations: fixtureModel.invocations, ...activityCounts }
 }
 
 async function seedLegacyConsumedWait(lease, stopBeforeModel = false) {
@@ -689,6 +694,7 @@ async function resumeChildThroughLoop(lease, phase, preloadedRestored) {
   }
   const expectedClaimKey = `task:${lease.id}:event:child-wait-claim:${lease.attemptCount}:${continuationStepId}`
   const expectedStepId = `task:${lease.id}:step:${restored.resume.nextOrdinal}:attempt:${lease.attemptCount}`
+  const activityCounts = { modelCalls: 0, executorCalls: 0, priorNoopExecutorCalls: 0, dispatcherCalls: 0 }
   const modelResponse = ({ stepId }) => {
     if (phase === "preclaim" || phase === "multi-preclaim") {
       if (stepId !== expectedStepId) throw new Error("fixture_unexpected_preclaim_step_id")
@@ -857,7 +863,7 @@ async function resumeChildThroughLoop(lease, phase, preloadedRestored) {
         throw new Error("fixture_claim_completed_item_cut_state_invalid")
       }
       say(`WORKER_B_LOOP_CLAIM_ITEM_COMPLETED_BEFORE_EVENT ${JSON.stringify({ callId: recovery.call.id, stepId: recovery.stepId,
-        waitId: wait.waitId, modelCalls: 0, executorCalls: 0, dispatcherCalls: 0, callStatus: state.rows[0].status,
+        waitId: wait.waitId, ...activityCounts, callStatus: state.rows[0].status,
         callRevision: state.rows[0].revision, claimCount: state.rows[0].claimCount,
         itemCompletedEventCount: state.rows[0].itemCompletedEventCount, resultCount: state.rows[0].resultCount })}`)
       await new Promise(() => {})
@@ -905,7 +911,9 @@ async function resumeChildThroughLoop(lease, phase, preloadedRestored) {
       claimCount: state.rows[0].claimCount, resultCount: state.rows[0].resultCount })}`)
     await new Promise(() => {})
   }
-  const loop = await runChildWaitLoop(lease, restored, modelResponse, { beforeAppendEvent, afterAppendEvent, beforeUpdateItem })
+  const loop = await runChildWaitLoop(lease, restored, modelResponse, {
+    activityCounts, beforeAppendEvent, afterAppendEvent, beforeUpdateItem,
+  })
   say(`WORKER_B_LOOP_RESUMED ${JSON.stringify({ phase, status: loop.result.status, stepCount: loop.result.stepCount,
     toolCallCount: loop.result.toolCallCount, finalText: loop.result.finalText ?? null,
     invocations: loop.invocations, executorCalls: loop.executorCalls, dispatcherCalls: loop.dispatcherCalls,
@@ -936,8 +944,7 @@ async function resumeLegacyConsumedWait(lease, phase) {
     sourceStepId: restored.durableWait.stepId, sourceAttempt: restored.durableWait.attempt,
     currentAttempt: lease.attemptCount, continuationStepId: restored.durableWait.continuationStepId ?? null,
     orphanCallId: restored.childWaitOrphanRecovery?.call.id ?? null,
-    claimCallId: restored.childWaitClaimRecovery?.call.id ?? null, repeatedRepairCount: repeatRepairCount,
-    executorCalls: 0, dispatcherCalls: 0 })}`)
+    claimCallId: restored.childWaitClaimRecovery?.call.id ?? null, repeatedRepairCount: repeatRepairCount })}`)
   return resumeChildThroughLoop(lease, phase, restored)
 }
 
@@ -1312,7 +1319,7 @@ const worker = new Worker(queueName, async job => {
   const execute = mode === "worker-a" ? ({ lease }) => waitForChild(lease)
     : mode === "worker-a-prior-tool" ? ({ lease }) => waitForChild(lease, { priorTool: true })
       : mode === "worker-a-prior-tool-failed" ? ({ lease }) => waitForChild(lease, { priorTool: true, priorToolFailure: true })
-      : mode === "worker-a-crash" ? ({ lease }) => waitForChild(lease, { crashAfterRegistration: true })
+      : mode === "worker-a-crash" ? ({ lease }) => waitForChild(lease, { crashAfterRegistration: true, priorTool: ids.sourcePriorTool === true })
       : mode === "worker-b-crash-before-resume" ? ({ lease }) => {
         say(`WORKER_B_RESUME_NOT_STARTED ${JSON.stringify({ taskId: lease.id, attemptCount: lease.attemptCount })}`)
         return new Promise(() => {})

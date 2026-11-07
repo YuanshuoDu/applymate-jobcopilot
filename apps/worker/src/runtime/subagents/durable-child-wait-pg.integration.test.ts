@@ -14,6 +14,7 @@ import { createPgTurnEngineStore } from "../turns/turn-engine-store.js"
 import { projectWaitCallCompletionPayload, projectWaitCallEventContent } from "../turns/turn-execution-wait-event-projection.js"
 import { executionOwnerFence } from "../execution-owner.js"
 import { registerDurableSubagentWait } from "./durable-subagent-wait-store.js"
+import { inspectChildWaitSourceLifecycle } from "./child-resume-source-wait-lifecycle.js"
 import { reconcileDurableSubagentWaits } from "./durable-subagent-wait-resolver.js"
 import { commitDurableSubagentWaitResume, loadDurableSubagentWaitResume } from "./durable-subagent-wait-resume.js"
 import { loadChildAttemptResume } from "./child-resume.js"
@@ -27,7 +28,8 @@ import { readChildWaitSourceCallProjection } from "./pg-store-expiry-child-wait-
 import { CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL } from "./pg-store-expiry-historical-wait-binding.js"
 import { buildCognitiveAgendaReceipt, cognitiveAgendaReceiptIdempotencyKey } from "../turns/cognitive-agenda-receipt.js"
 import { readChildWaitTerminalCallProjections } from "./pg-store-expiry-historical-wait-projections.js"
-import { readCanonicalWaitStepToolChain } from "./pg-store-expiry-step-tool-chain-proof.js"
+import { readCanonicalHistoricalSourceStepPrefix } from "./pg-store-expiry-historical-source-step-prefix.js"
+import { MAX_STEP_TOOL_CALLS, readCanonicalWaitStepToolChain } from "./pg-store-expiry-step-tool-chain-proof.js"
 import { safeSubagentWaitJson } from "./subagent-wait-structural-ids.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
@@ -316,6 +318,7 @@ type FixtureIds = { userId: string; sessionId: string; turnId: string; rootTaskI
   secondTargetTaskId?: string; waitScopedClaimCallIds?: boolean;
   finalText?: string; loopCallPrefix?: string; recoveryTargetPageRank?: number; recoveryCandidateCount?: number;
   recoveryFixtureBlockerCount?: number; recoveryCandidateObservedAt?: string;
+  sourcePriorTool?: boolean;
   sourceLifecycleCrashStage?: (typeof SOURCE_LIFECYCLE_CRASH_STAGES)[number] }
 type FixedWaitTargetParent = {
   id: string; sessionId: string; turnId: string; rootTaskId: string; path: string; depth: number;
@@ -619,6 +622,101 @@ async function expectHistoricalWaitUnblocked(client: PoolClient, task: BlockingT
     }
     throw new Error(`${message}${suffix}`)
   }
+}
+
+async function diagnoseHistoricalWaitSourceProjection(client: PoolClient, task: BlockingTaskSnapshot,
+  sourceCallId: string): Promise<Record<string, unknown>> {
+  const projections = await readChildWaitTerminalCallProjections(client, task as unknown as Record<string, unknown>)
+  let sourceProjectionCount = 0
+  const waits = await client.query<Record<string, unknown>>(`SELECT wait.*,
+      source."status" AS "sourceStepStatus",
+      (SELECT COUNT(*)::int FROM "agent_wait_conditions" AS duplicateWait WHERE duplicateWait."parentTaskId" = wait."parentTaskId"
+        AND duplicateWait."sessionId" = wait."sessionId" AND duplicateWait."turnId" = wait."turnId" AND duplicateWait."stepId" = wait."stepId") AS "sourceWaitCount"
+    FROM "agent_wait_conditions" AS wait
+    JOIN "agent_steps" AS source ON source."id" = wait."stepId" AND source."sessionId" = wait."sessionId"
+      AND source."turnId" = wait."turnId" AND source."taskId" = wait."parentTaskId"
+    JOIN "agent_items" AS sourceCall ON sourceCall."sessionId" = wait."sessionId" AND sourceCall."turnId" = wait."turnId"
+      AND sourceCall."taskId" = wait."parentTaskId" AND sourceCall."stepId" = wait."stepId"
+      AND sourceCall."type" = 'tool_call' AND sourceCall."content"->>'toolCallId' = $5
+    WHERE wait."parentTaskId" = $1 AND wait."sessionId" = $2 AND wait."turnId" = $3 AND wait."userId" = $4
+    LIMIT 2`, [task.id, task.sessionId, task.turnId, task.userId, sourceCallId])
+  if (waits.rows.length !== 1) return { sourceProjectionCount, sourceWaitCount: waits.rows.length, rejectStage: "source_wait_match" }
+
+  const wait = waits.rows[0]!, stepId = wait.stepId
+  sourceProjectionCount = typeof wait.id === "string"
+    ? projections.filter(projection => projection.sourceWait.waitId === wait.id && projection.sourceWait.claimKeyDigest === null).length : 0
+  const sourceWaitMultiplicity = Number(wait.sourceWaitCount)
+  const markerPresent = Object.hasOwn(asObject(wait.result), "sourceLifecycleRecovery")
+  if (typeof stepId !== "string") return { sourceProjectionCount, sourceKind: markerPresent ? "recovered" : "normal_waiting",
+    sourceStepStatus: wait.sourceStepStatus, sourceWaitMultiplicity, markerPresent, markerValidationPassed: false, stepItemCount: 0, anchorCount: 0,
+    rejectStage: "source_step_identity" }
+  const [items, callRows] = await Promise.all([
+    client.query<{ count: number }>(`SELECT COUNT(*)::int AS "count" FROM "agent_items"
+      WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = $4`,
+    [task.sessionId, task.turnId, task.id, stepId]),
+    client.query<{ id: string }>(`SELECT "id" FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+      AND "stepId" = $4 AND "type" = 'tool_call' AND "content"->>'toolCallId' = $5 LIMIT 2`,
+    [task.sessionId, task.turnId, task.id, stepId, sourceCallId]),
+  ])
+  const stepItemCount = Number(items.rows[0]?.count ?? 0)
+  if (callRows.rows.length !== 1) return { sourceProjectionCount, sourceKind: markerPresent ? "recovered" : "normal_waiting",
+    sourceStepStatus: wait.sourceStepStatus, sourceWaitMultiplicity, markerPresent, markerValidationPassed: false, stepItemCount, anchorCount: 0,
+    rejectStage: "source_call_match" }
+
+  let lifecycle: Awaited<ReturnType<typeof inspectChildWaitSourceLifecycle>> | undefined
+  let lifecycleRejectStage: string | undefined
+  try {
+    lifecycle = await inspectChildWaitSourceLifecycle(client, { id: task.id, sessionId: task.sessionId, turnId: task.turnId,
+      rootTaskId: task.rootTaskId, userId: task.userId, ownerId: task.leaseOwner, attemptCount: task.attemptCount,
+      leaseExpiresAt: task.leaseExpiresAt } as never, wait, stepId, asObject(wait.result).outcome as never)
+  } catch (error: unknown) {
+    lifecycleRejectStage = error && typeof error === "object" && "sourceLifecycleStage" in error
+      ? String(error.sourceLifecycleStage) : "unknown"
+  }
+  const markerValidationPassed = lifecycle !== undefined
+    && (markerPresent ? lifecycle.state === "recovered" : lifecycle.state === "waiting")
+  const sourceKind = lifecycle?.state === "waiting" ? "normal_waiting" : lifecycle?.state ?? (markerPresent ? "recovered" : "normal_waiting")
+  const callItemId = lifecycle?.callItemId ?? callRows.rows[0]!.id
+  const agendaKey = cognitiveAgendaReceiptIdempotencyKey(stepId)
+  const anchorKeys = agendaKey ? [
+    `task:${task.id}:event:step-started:${stepId}`, `task:${task.id}:event:${agendaKey}`,
+    `task:${task.id}:event:model-started:${stepId}`, `task:${task.id}:event:model-completed:${stepId}`,
+    `task:${task.id}:event:model-usage:${stepId}`, `task:${task.id}:event:item-started:${callItemId}`,
+  ] : []
+  const anchorRows = anchorKeys.length ? await client.query<{ count: number }>(`SELECT COUNT(*)::int AS "count" FROM "agent_events"
+    WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "idempotencyKey" = ANY($4::text[])`,
+  [task.sessionId, task.turnId, task.id, anchorKeys]) : { rows: [{ count: 0 }] }
+  const anchorCount = Number(anchorRows.rows[0]?.count ?? 0)
+  const sourceStart = await client.query<{ count: number }>(`SELECT COUNT(*)::int AS "count" FROM "agent_events"
+    WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "itemId" = $4 AND "type" = 'tool_call.started'
+      AND "actor" = 'subagent' AND "correlationId" = $5 AND "idempotencyKey" = 'task:' || $3 || ':event:tool-started:' || $5
+      AND "payload" = jsonb_build_object('toolCallId', $5, 'toolName', 'wait_subagents', 'taskId', $3)`,
+  [task.sessionId, task.turnId, task.id, callItemId, sourceCallId])
+  let prefixAvailable = false
+  if (lifecycle?.resultItemId && lifecycle.state !== "unreconciled") {
+    try {
+      const prefixInput = lifecycle.state === "recovered"
+        ? { stepId, attempt: lifecycle.sourceAttempt, callItemId: lifecycle.callItemId, callId: lifecycle.toolCallId,
+            resultItemId: lifecycle.resultItemId, waitKind: "recovered" as const, terminalMode: "recovered_handoff" as const }
+        : { stepId, attempt: lifecycle.sourceAttempt, callItemId: lifecycle.callItemId, callId: lifecycle.toolCallId,
+            resultItemId: lifecycle.resultItemId, waitKind: "normal_waiting" as const }
+      prefixAvailable = Boolean(await readCanonicalHistoricalSourceStepPrefix(client,
+        { id: task.id, sessionId: task.sessionId, turnId: task.turnId }, prefixInput))
+    } catch { prefixAvailable = false }
+  }
+  let rejectStage = "none"
+  const sourceStartCount = Number(sourceStart.rows[0]?.count ?? 0)
+  if (!markerValidationPassed) rejectStage = `source_lifecycle:${lifecycleRejectStage ?? "marker_state"}`
+  else if (sourceWaitMultiplicity !== 1) rejectStage = "source_wait_multiplicity"
+  else if (sourceStartCount !== 1) rejectStage = "source_start_event"
+  else if (prefixAvailable) rejectStage = sourceProjectionCount ? "none" : "source_projection_shape"
+  else if (sourceKind !== "recovered") rejectStage = "historical_source_step_prefix"
+  else if (wait.sourceStepStatus !== "waiting_for_tool") rejectStage = "recovered_handoff_step_status"
+  else if (stepItemCount < 2 || stepItemCount > MAX_STEP_TOOL_CALLS * 2 + 2) rejectStage = "recovered_handoff_item_count"
+  else if (anchorCount !== 6) rejectStage = "recovered_handoff_anchor_count"
+  else rejectStage = "recovered_handoff_event_chain_or_payload"
+  return { sourceProjectionCount, sourceKind, sourceStepStatus: wait.sourceStepStatus, sourceWaitMultiplicity, markerPresent,
+    markerValidationPassed, sourceStartCount, stepItemCount, anchorCount, prefixAvailable, rejectStage }
 }
 
 async function diagnoseWorkerFClaimProof(
@@ -3860,11 +3958,11 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       const repairedMarker = workerC.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_LEGACY_SOURCE_REPAIRED "))
       const repaired = JSON.parse(repairedMarker!.slice("WORKER_B_LEGACY_SOURCE_REPAIRED ".length)) as {
         waitId: string; sourceStepId: string; sourceAttempt: number; currentAttempt: number; continuationStepId: string;
-        orphanCallId: string | null; claimCallId: string | null; repeatedRepairCount: number; executorCalls: number; dispatcherCalls: number
+        orphanCallId: string | null; claimCallId: string | null; repeatedRepairCount: number
       }
       expect(repaired).toMatchObject({ waitId: legacy.waitId, sourceStepId: legacy.sourceStepId, sourceAttempt: 1,
         currentAttempt: 1, continuationStepId: legacy.continuationStepId, orphanCallId: null, claimCallId: legacy.callId,
-        repeatedRepairCount: 0, executorCalls: 0, dispatcherCalls: 0 })
+        repeatedRepairCount: 0 })
       const repairedLifecycle = await readSourceWaitLifecycle(pool, ids)
       expectReconciledSourceWait(repairedLifecycle, ids)
       expect(repairedLifecycle.wait?.consumedAt).toEqual(preRepair.wait?.consumedAt)
@@ -3880,7 +3978,8 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       const claimCutMarker = workerC.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_LOOP_CLAIM_ITEM_COMPLETED_BEFORE_EVENT "))
       expect(JSON.parse(claimCutMarker!.slice("WORKER_B_LOOP_CLAIM_ITEM_COMPLETED_BEFORE_EVENT ".length))).toMatchObject({
         callId: legacy.callId, stepId: legacy.continuationStepId, waitId: legacy.waitId,
-        modelCalls: 0, executorCalls: 0, dispatcherCalls: 0, callStatus: "completed", callRevision: 1,
+        modelCalls: expect.any(Number), executorCalls: expect.any(Number), priorNoopExecutorCalls: 0, dispatcherCalls: 0,
+        callStatus: "completed", callRevision: 1,
         claimCount: 1, itemCompletedEventCount: 0, resultCount: 0,
       })
       const currentTask = await taskStore.get(ids.waiterTaskId, ids.sessionId)
@@ -4599,6 +4698,9 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(claimSteps.rows).toHaveLength(2)
       expect(claimSteps.rows.map(row => row.waitId).sort()).toEqual([firstWait.rows[0]!.id, secondWait!.waitId].sort())
       expect(claimSteps.rows.find(row => row.waitId === secondWait!.waitId)?.sourceStepId).toBe(secondWait!.stepId)
+      const firstClaimOrdinal = claimSteps.rows.find(row => row.waitId === firstWait.rows[0]!.id)?.claimOrdinal
+      if (firstClaimOrdinal === undefined) throw new Error("two_historical_wait_first_claim_step_missing")
+      const firstClaimStepId = "task:" + ids.waiterTaskId + ":step:" + firstClaimOrdinal + ":attempt:1"
       const claimStepIds = claimSteps.rows.map(row => `task:${ids.waiterTaskId}:step:${row.claimOrdinal}:attempt:1`)
       const secondClaimOrdinal = claimSteps.rows.find(row => row.waitId === secondWait!.waitId)?.claimOrdinal
       if (secondClaimOrdinal === undefined) throw new Error("two_historical_wait_second_claim_step_missing")
@@ -4641,8 +4743,96 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         expect(failedPrefix?.items).toHaveLength(4)
         expect(failedPrefix?.events).toEqual(expect.arrayContaining([expect.objectContaining({ type: "tool_call.failed", status: "failed",
           errorCode: "tool_execution_failed" })]))
-        expect(projections.find(projection => projection.sourceWait.waitId === secondWait!.waitId)?.sourceStepPrefix?.items).toHaveLength(2)
+        const secondSourceProjection = projections.find(projection => projection.sourceWait.waitId === secondWait!.waitId
+          && projection.sourceWait.claimKeyDigest === null && projection.sourceStepPrefix)
+        expect(secondSourceProjection?.sourceStepPrefix?.items).toHaveLength(2)
+        if (!secondSourceProjection) throw new Error("two_historical_wait_second_source_projection_missing")
+        const earlierCompletedTool = await checkClient.query<{ sourceOrdinal: number; sourceAttempt: number; earlierOrdinal: number;
+          earlierAttempt: number; callId: string; toolName: string; callStatus: string; resultStatus: string }>(
+        "SELECT source.\"ordinal\" AS \"sourceOrdinal\", source.\"attempt\" AS \"sourceAttempt\", " +
+          "earlier.\"ordinal\" AS \"earlierOrdinal\", earlier.\"attempt\" AS \"earlierAttempt\", " +
+          "call.\"content\"->>'toolCallId' AS \"callId\", call.\"content\"->>'toolName' AS \"toolName\", " +
+          "call.\"status\" AS \"callStatus\", result.\"status\" AS \"resultStatus\" " +
+          "FROM \"agent_steps\" AS source " +
+          "JOIN \"agent_steps\" AS earlier ON earlier.\"id\" = $5 AND earlier.\"sessionId\" = source.\"sessionId\" " +
+          "AND earlier.\"turnId\" = source.\"turnId\" AND earlier.\"taskId\" = source.\"taskId\" " +
+          "AND earlier.\"attempt\" = source.\"attempt\" AND earlier.\"ordinal\" < source.\"ordinal\" AND earlier.\"status\" = 'completed' " +
+          "JOIN \"agent_items\" AS call ON call.\"sessionId\" = earlier.\"sessionId\" AND call.\"turnId\" = earlier.\"turnId\" " +
+          "AND call.\"taskId\" = earlier.\"taskId\" AND call.\"stepId\" = earlier.\"id\" AND call.\"type\" = 'tool_call' " +
+          "AND call.\"status\" = 'completed' AND call.\"revision\" = 1 AND call.\"content\"->>'toolName' = 'wait_subagents' " +
+          "AND call.\"content\"->>'status' = 'completed' " +
+          "JOIN \"agent_items\" AS result ON result.\"sessionId\" = call.\"sessionId\" AND result.\"turnId\" = call.\"turnId\" " +
+          "AND result.\"taskId\" = call.\"taskId\" AND result.\"stepId\" = call.\"stepId\" AND result.\"type\" = 'tool_result' " +
+          "AND result.\"status\" = 'completed' AND result.\"revision\" = 1 " +
+          "AND result.\"content\"->>'toolCallId' = call.\"content\"->>'toolCallId' " +
+          "JOIN \"agent_events\" AS resultCompleted ON resultCompleted.\"sessionId\" = result.\"sessionId\" " +
+          "AND resultCompleted.\"turnId\" = result.\"turnId\" AND resultCompleted.\"taskId\" = result.\"taskId\" " +
+          "AND resultCompleted.\"itemId\" = result.\"id\" AND resultCompleted.\"type\" = 'item.completed' " +
+          "AND resultCompleted.\"idempotencyKey\" = 'task:' || result.\"taskId\" || ':event:tool-result-completed:' " +
+          "|| (call.\"content\"->>'toolCallId') || ':' || result.\"id\" || ':1' " +
+          "JOIN \"agent_events\" AS sourceStarted ON sourceStarted.\"sessionId\" = source.\"sessionId\" " +
+          "AND sourceStarted.\"turnId\" = source.\"turnId\" AND sourceStarted.\"taskId\" = source.\"taskId\" " +
+          "AND sourceStarted.\"correlationId\" = source.\"id\" AND sourceStarted.\"type\" = 'step.started' " +
+          "AND sourceStarted.\"idempotencyKey\" = 'task:' || source.\"taskId\" || ':event:step-started:' || source.\"id\" " +
+          "WHERE source.\"id\" = $1 AND source.\"sessionId\" = $2 AND source.\"turnId\" = $3 AND source.\"taskId\" = $4 " +
+          "AND resultCompleted.\"sequence\" < sourceStarted.\"sequence\" LIMIT 1",
+        [secondWait!.stepId, ids.sessionId, ids.turnId, ids.waiterTaskId, firstClaimStepId])
+        expect(earlierCompletedTool.rows).toHaveLength(1)
+        const earlierTool = earlierCompletedTool.rows[0]!
+        expect(earlierTool.sourceAttempt).toBe(1)
+        expect(earlierTool.earlierAttempt).toBe(earlierTool.sourceAttempt)
+        expect(earlierTool.earlierOrdinal).toBeLessThan(earlierTool.sourceOrdinal)
+        expect(earlierTool).toMatchObject({ toolName: "wait_subagents", callStatus: "completed", resultStatus: "completed" })
+        expect(claimsBeforeRestart.find(row => row.stepId === firstClaimStepId && row.callId === earlierTool.callId))
+          .toMatchObject({ startCount: 1, terminalCount: 1, resultCount: 1 })
+        await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, secondSourceProjection),
+          "final PG binding accepts the consumed second source first call despite an earlier completed tool in the same attempt").resolves.toBe(true)
         expect(JSON.stringify(projections)).not.toContain("fixture-private-failure-input")
+
+        const firstSourceProjection = projections.find(projection => projection.sourceWait.waitId === firstWait.rows[0]!.id
+          && projection.sourceWait.claimKeyDigest === null && projection.sourceStepPrefix)
+        if (!firstSourceProjection?.sourceStepPrefix) throw new Error("two_historical_wait_source_prefix_missing")
+        const sourcePrefixEvents = [...firstSourceProjection.sourceStepPrefix.events]
+        expect(sourcePrefixEvents[5]?.type).toBe("item.started")
+        expect(sourcePrefixEvents[6]?.type).toBe("tool_call.started")
+        expect(sourcePrefixEvents[5]?.itemId).not.toBe(firstSourceProjection.sourceWait.sourceCallItemId)
+        expect(sourcePrefixEvents[6]?.itemId).not.toBe(firstSourceProjection.sourceWait.sourceCallItemId)
+        const reorderedPrefix = { ...firstSourceProjection.sourceStepPrefix, events: sourcePrefixEvents.map((event, index) =>
+          index === 5 ? sourcePrefixEvents[6]! : index === 6 ? sourcePrefixEvents[5]! : event) }
+        await expect(historicalWaitBindingAccepts(checkClient, scopedOwner,
+          { ...firstSourceProjection, sourceStepPrefix: reorderedPrefix }),
+        "final binding must reject reordered non-anchor source events without changing persisted rows or digests").resolves.toBe(false)
+        const persistedAfterReorder = await readChildWaitTerminalCallProjections(checkClient, scopedOwner)
+        expect(persistedAfterReorder.find(projection => projection.sourceWait.waitId === firstWait.rows[0]!.id
+          && projection.sourceWait.claimKeyDigest === null)?.sourceStepPrefix?.events).toEqual(sourcePrefixEvents)
+
+        await checkClient.query("SAVEPOINT source_step_ordinal_mismatch")
+        const sourceStartOrdinal = await checkClient.query<{ stepOrdinal: number; eventOrdinal: number }>(`SELECT source."ordinal" AS "stepOrdinal",
+          (started."payload"->>'ordinal')::integer AS "eventOrdinal" FROM "agent_steps" AS source
+          JOIN "agent_events" AS started ON started."sessionId" = source."sessionId" AND started."turnId" = source."turnId"
+            AND started."taskId" = source."taskId" AND started."correlationId" = source."id" AND started."type" = 'step.started'
+            AND started."idempotencyKey" = 'task:' || source."taskId" || ':event:step-started:' || source."id"
+          WHERE source."id" = $1 AND source."sessionId" = $2 AND source."turnId" = $3 AND source."taskId" = $4`,
+        [firstSourceProjection.stepId, ids.sessionId, ids.turnId, ids.waiterTaskId])
+        expect(sourceStartOrdinal.rows).toHaveLength(1)
+        expect(sourceStartOrdinal.rows[0]?.stepOrdinal).toBe(sourceStartOrdinal.rows[0]?.eventOrdinal)
+        const changedOrdinal = await checkClient.query(`UPDATE "agent_steps" SET "ordinal" = "ordinal" + 1000
+          WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4`,
+        [firstSourceProjection.stepId, ids.sessionId, ids.turnId, ids.waiterTaskId])
+        expect(changedOrdinal.rowCount).toBe(1)
+        const mismatchedOrdinal = await checkClient.query<{ stepOrdinal: number; eventOrdinal: number }>(`SELECT source."ordinal" AS "stepOrdinal",
+          (started."payload"->>'ordinal')::integer AS "eventOrdinal" FROM "agent_steps" AS source
+          JOIN "agent_events" AS started ON started."sessionId" = source."sessionId" AND started."turnId" = source."turnId"
+            AND started."taskId" = source."taskId" AND started."correlationId" = source."id" AND started."type" = 'step.started'
+            AND started."idempotencyKey" = 'task:' || source."taskId" || ':event:step-started:' || source."id"
+          WHERE source."id" = $1 AND source."sessionId" = $2 AND source."turnId" = $3 AND source."taskId" = $4`,
+        [firstSourceProjection.stepId, ids.sessionId, ids.turnId, ids.waiterTaskId])
+        expect(mismatchedOrdinal.rows).toHaveLength(1)
+        expect(mismatchedOrdinal.rows[0]?.stepOrdinal).not.toBe(mismatchedOrdinal.rows[0]?.eventOrdinal)
+        await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, firstSourceProjection),
+          "final binding must reject a source step whose database ordinal differs from step.started").resolves.toBe(false)
+        await checkClient.query("ROLLBACK TO SAVEPOINT source_step_ordinal_mismatch")
+        await checkClient.query("RELEASE SAVEPOINT source_step_ordinal_mismatch")
 
         const claimItems = await checkClient.query<{ id: string; content: Record<string, unknown> }>(`SELECT "id", "content" FROM "agent_items"
           WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = ANY($4::text[])
@@ -4973,6 +5163,375 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
     }
   }, 90_000)
 
+  it("rejects reordered nested prefix events for a recovered wait with a real prior noop", async () => {
+    const suffix = randomUUID()
+    const ids: FixtureIds = { userId: `durable-child-wait-prior-crash-user-${suffix}`,
+      sessionId: `durable-child-wait-prior-crash-session-${suffix}`, turnId: `durable-child-wait-prior-crash-turn-${suffix}`,
+      rootTaskId: "", waiterTaskId: "", targetTaskId: "", sourcePriorTool: true }
+    const queueName = `agent-child-wait-prior-crash-${suffix}`
+    const queueRedis = new Redis(redisUrl!, { maxRetriesPerRequest: null })
+    const queue = new Queue(queueName, { connection: queueRedis, skipVersionCheck: true })
+    const policy = { ...defaultSubagentPolicy(), maxAttempts: 1 }
+    const taskStore = new PgSubagentTaskStore(pool, 30_000)
+    let workerA: WorkerProcess | undefined, workerB: WorkerProcess | undefined, workerC: WorkerProcess | undefined
+    let queuePaused = false
+    const originalRedisUrl = process.env.REDIS_URL
+    let closeSharedRedisConnections: (() => Promise<void>) | undefined
+    const pauseQueue = async () => { if (!queuePaused) { await queue.pause(); queuePaused = true } }
+    const dispatchRecovery = async () => {
+      const pending = await waitFor(async () => {
+        const row = await pool.query<{ status: string; publishedAt: Date | null }>(`SELECT task."status", dispatch."publishedAt"
+          FROM "sub_agent_tasks" AS task JOIN "agent_outbox" AS dispatch ON dispatch."aggregateId" = task."sessionId"
+            AND dispatch."topic" = 'agent.subagent.dispatch' AND dispatch."idempotencyKey" = 'subagent-dispatch:' || task."id"
+          WHERE task."id" = $1 AND task."sessionId" = $2`, [ids.waiterTaskId, ids.sessionId])
+        return row.rows[0]?.status === "queued" && row.rows[0]?.publishedAt === null ? row.rows[0] : null
+      })
+      const { dispatchPendingSubagentOutbox } = await import("../../queue/subagent-queue.js")
+      await expect(dispatchPendingSubagentOutbox(pool as never, queue, 50, ids.sessionId)).resolves.toBe(1)
+      expect(pending.status).toBe("queued")
+      await queue.resume()
+      queuePaused = false
+    }
+
+    try {
+      await queue.waitUntilReady()
+      process.env.REDIS_URL = redisUrl!
+      const redisRuntime = await import("../../redis.js")
+      closeSharedRedisConnections = redisRuntime.closeSharedRedisConnections
+      const { dispatchPendingSubagentOutbox } = await import("../../queue/subagent-queue.js")
+      await seedLoopWaitScenario(pool, taskStore, ids, suffix, policy)
+
+      workerA = launchWorker("worker-a-crash", queueName, ids)
+      await waitForMarker(workerA, "WORKER_A_READY")
+      await expect(dispatchPendingSubagentOutbox(pool as never, queue, 50, ids.sessionId)).resolves.toBe(1)
+      await waitForMarker(workerA, "WORKER_A_REGISTERED")
+      const sourceStepId = `task:${ids.waiterTaskId}:step:0:attempt:1`
+      const noopCallId = "fixture-noop-before-child-wait"
+      const noopCallItemId = `task:${ids.waiterTaskId}:item:tool-call:${noopCallId}:attempt:1`
+      const noopResultItemId = `task:${ids.waiterTaskId}:item:tool-result:${noopCallId}:attempt:1`
+      const noopItems = await pool.query<{ id: string; type: string; status: string; revision: number }>(`SELECT "id", "type", "status", "revision"
+        FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = $4
+          AND (("type" = 'tool_call' AND "content"->>'toolName' = 'fixture_noop')
+            OR ("type" = 'tool_result' AND "content"->>'toolCallId' = $5)) ORDER BY "type"`,
+      [ids.sessionId, ids.turnId, ids.waiterTaskId, sourceStepId, noopCallId])
+      expect(noopItems.rows).toEqual([
+        { id: noopResultItemId, type: "tool_result", status: "completed", revision: 1 },
+        { id: noopCallItemId, type: "tool_call", status: "completed", revision: 1 },
+      ].sort((left, right) => left.type.localeCompare(right.type)))
+      const noopEvents = await pool.query<{ id: string; sequence: string; type: string; itemId: string | null; causationId: string | null }>(
+        `SELECT "id", "sequence"::text AS "sequence", "type", "itemId", "causationId" FROM "agent_events"
+         WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND ("itemId" IN ($4, $5) OR "correlationId" = $6)
+         ORDER BY "sequence"`, [ids.sessionId, ids.turnId, ids.waiterTaskId, noopCallItemId, noopResultItemId, noopCallId])
+      expect(noopEvents.rows.map(event => event.type)).toEqual([
+        "item.started", "tool_call.started", "item.completed", "tool_call.completed", "item.started", "item.completed",
+      ])
+      expect(noopEvents.rows.slice(1).map(event => event.causationId)).toEqual(noopEvents.rows.slice(0, -1).map(event => event.id))
+      const waitingSource = await readSourceWaitLifecycle(pool, ids)
+      expect(waitingSource.call).toMatchObject({ status: "started", revision: 0 })
+      expect(waitingSource.results).toHaveLength(0)
+      expect(waitingSource.events[0]?.causationId).toBe(noopEvents.rows[5]?.id)
+      expect(workerA.stdoutText + workerA.stderrText).not.toContain(SOURCE_WAIT_SECRET_IDEMPOTENCY_KEY(ids.waiterTaskId))
+      await stopWorker(workerA)
+      expect(await workerA.exited).toMatchObject({ code: null, signal: "SIGKILL" })
+      const ownerA = await pool.query<{ leaseOwner: string | null }>(`SELECT "leaseOwner" FROM "sub_agent_tasks"
+        WHERE "id" = $1 AND "sessionId" = $2`, [ids.waiterTaskId, ids.sessionId])
+      expect(ownerA.rows[0]?.leaseOwner).toEqual(expect.any(String))
+      expect((await pool.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = clock_timestamp() - interval '1 second'
+        WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running' AND "attemptCount" = 1 AND "leaseOwner" = $3 RETURNING "id"`,
+      [ids.waiterTaskId, ids.sessionId, ownerA.rows[0]!.leaseOwner])).rowCount).toBe(1)
+
+      await pauseQueue()
+      workerB = launchWorker("worker-b-legacy-consumed-seed", queueName, ids)
+      await waitForMarker(workerB, "WORKER_B_RECOVERED")
+      expect((await pool.query<{ status: string }>(`SELECT "status" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`,
+        [ids.waiterTaskId, ids.sessionId])).rows[0]?.status).toBe("waiting")
+      await finishLoopWaitTarget(pool, taskStore, ids, policy)
+      await reconcileDurableSubagentWaits(pool)
+      await dispatchRecovery()
+      await waitForMarker(workerB, "WORKER_B_LEGACY_CONSUMED_CLAIMED")
+      await stopWorker(workerB)
+      expect(await workerB.exited).toMatchObject({ code: null, signal: "SIGKILL" })
+      const beforeRepair = await readSourceWaitLifecycle(pool, ids)
+      expect(beforeRepair.wait?.consumedAt).toEqual(expect.any(Date))
+      expect(beforeRepair.wait?.result).not.toHaveProperty("sourceLifecycleRecovery")
+      expect(beforeRepair.call).toMatchObject({ status: "started", revision: 0 })
+      expect(beforeRepair.results).toHaveLength(0)
+      const ownerB = await pool.query<{ leaseOwner: string | null }>(`SELECT "leaseOwner" FROM "sub_agent_tasks"
+        WHERE "id" = $1 AND "sessionId" = $2`, [ids.waiterTaskId, ids.sessionId])
+      expect((await pool.query(`UPDATE "sub_agent_tasks" SET "leaseExpiresAt" = clock_timestamp() - interval '1 second'
+        WHERE "id" = $1 AND "sessionId" = $2 AND "status" = 'running' AND "attemptCount" = 1 AND "leaseOwner" = $3 RETURNING "id"`,
+      [ids.waiterTaskId, ids.sessionId, ownerB.rows[0]?.leaseOwner])).rowCount).toBe(1)
+
+      await pauseQueue()
+      workerC = launchWorker("worker-b-legacy-consumed-recovery", queueName, ids)
+      await waitForMarker(workerC, "WORKER_B_RECOVERED")
+      await dispatchRecovery()
+      await waitForMarker(workerC, "WORKER_B_LEGACY_SOURCE_REPAIRED")
+      const repairLine = workerC.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_LEGACY_SOURCE_REPAIRED "))
+      expect(repairLine).toBeDefined()
+      expect(JSON.parse(repairLine!.slice("WORKER_B_LEGACY_SOURCE_REPAIRED ".length))).toMatchObject({
+        sourceStepId, sourceAttempt: 1, currentAttempt: 1, repeatedRepairCount: 0,
+      })
+      await waitForMarker(workerC, "WORKER_B_LOOP_CLAIM_ITEM_COMPLETED_BEFORE_EVENT")
+      const claimCutLine = workerC.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_LOOP_CLAIM_ITEM_COMPLETED_BEFORE_EVENT "))
+      expect(JSON.parse(claimCutLine!.slice("WORKER_B_LOOP_CLAIM_ITEM_COMPLETED_BEFORE_EVENT ".length))).toMatchObject({
+        modelCalls: expect.any(Number), executorCalls: expect.any(Number), priorNoopExecutorCalls: 0, dispatcherCalls: 0,
+      })
+      const repaired = await readSourceWaitLifecycle(pool, ids)
+      expectReconciledSourceWait(repaired, ids)
+      expect(workerB.stdoutText + workerB.stderrText + workerC.stdoutText + workerC.stderrText)
+        .not.toContain(SOURCE_WAIT_SECRET_IDEMPOTENCY_KEY(ids.waiterTaskId))
+
+      const current = await pool.query<BlockingTaskRow>(`SELECT task."id", task."sessionId", task."turnId", task."rootTaskId",
+          task."leaseOwner", task."attemptCount", task."leaseExpiresAt" FROM "sub_agent_tasks" AS task
+        JOIN "agent_sessions" AS session ON session."id" = task."sessionId" AND session."userId" = $3
+        WHERE task."id" = $1 AND task."sessionId" = $2 AND task."status" = 'running'`, [ids.waiterTaskId, ids.sessionId, ids.userId])
+      expect(current.rows).toHaveLength(1)
+      const row = current.rows[0]
+      if (!row?.leaseOwner || !row.leaseExpiresAt) throw new Error("prior-tool recovered source live owner missing")
+      const snapshot: BlockingTaskSnapshot = { ...row, userId: ids.userId }
+      const checkClient = await pool.connect()
+      try {
+        await checkClient.query("BEGIN")
+        await checkClient.query("SELECT set_config('app.user_id', $1, true)", [ids.userId])
+        expect((await checkClient.query(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 FOR UPDATE`,
+          [ids.sessionId, ids.userId])).rows).toHaveLength(1)
+        const projections = await readChildWaitTerminalCallProjections(checkClient, snapshot as unknown as Record<string, unknown>)
+        const sourceWaitId = repaired.wait?.id
+        const handoffSource = projections.find(projection => projection.sourceWait.waitId === sourceWaitId
+          && projection.sourceWait.claimKeyDigest === null)
+        expect(handoffSource?.sourceStepHandoff?.schemaVersion).toBe("recovered_wait_handoff.v1")
+        expect(handoffSource?.sourceStepHandoff?.sourceStepPrefix.items).toHaveLength(4)
+        if (!handoffSource?.sourceStepHandoff) throw new Error("prior-tool recovered handoff projection missing")
+        const fullEvents = [...handoffSource.sourceStepHandoff.sourceStepPrefix.events]
+        const noopStartedIndex = fullEvents.findIndex(event => event.idempotencyKey === `task:${ids.waiterTaskId}:event:item-started:${noopCallItemId}`)
+        const noopCallStartedIndex = fullEvents.findIndex(event => event.idempotencyKey === `task:${ids.waiterTaskId}:event:tool-started:${noopCallId}`)
+        expect(noopStartedIndex).toBe(5)
+        expect(noopCallStartedIndex).toBe(6)
+        expect(fullEvents.findIndex(event => event.idempotencyKey === `task:${ids.waiterTaskId}:event:tool-started:${PHONE_SHAPED_WAIT_TOOL_CALL_ID}`))
+          .toBeGreaterThan(noopCallStartedIndex)
+        const anchorIds = new Set(handoffSource.sourceStepHandoff.events.map(event => event.id))
+        expect(anchorIds.has(fullEvents[noopStartedIndex]!.id)).toBe(false)
+        expect(anchorIds.has(fullEvents[noopCallStartedIndex]!.id)).toBe(false)
+        await expect(historicalWaitBindingAccepts(checkClient, snapshot, handoffSource),
+          "the exact recovered handoff with a prior noop must bind").resolves.toBe(true)
+
+        const priorToolCounts = await checkClient.query<{ requestedCount: number; callCount: number; resultCount: number; itemCount: number }>(`SELECT
+            (SELECT ("payload"->>'toolCallCount')::int FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
+              AND "taskId" = $3 AND "idempotencyKey" = $5) AS "requestedCount",
+            (SELECT COUNT(*)::int FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+              AND "stepId" = $4 AND "type" = 'tool_call') AS "callCount",
+            (SELECT COUNT(*)::int FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+              AND "stepId" = $4 AND "type" = 'tool_result') AS "resultCount",
+            (SELECT COUNT(*)::int FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+              AND "stepId" = $4) AS "itemCount"`,
+        [ids.sessionId, ids.turnId, ids.waiterTaskId, sourceStepId, `task:${ids.waiterTaskId}:event:model-completed:${sourceStepId}`])
+        expect(priorToolCounts.rows[0]).toEqual({ requestedCount: 2, callCount: 2, resultCount: 2, itemCount: 4 })
+
+        await checkClient.query("SAVEPOINT recovered_source_orphan_noop_items")
+        try {
+          const removedNoopItems = await checkClient.query<{ id: string }>(`DELETE FROM "agent_items"
+            WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = $4 AND "id" = ANY($5::text[])
+            RETURNING "id"`, [ids.sessionId, ids.turnId, ids.waiterTaskId, sourceStepId, [noopCallItemId, noopResultItemId]])
+          expect(removedNoopItems.rows.map(item => item.id).sort()).toEqual([noopCallItemId, noopResultItemId].sort())
+
+          const orphanEventIds = noopEvents.rows.map(event => event.id)
+          const orphanRows = await checkClient.query<{ id: string; type: string; itemId: string | null }>(`SELECT "id", "type", "itemId"
+            FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+              AND "sequence" BETWEEN $4::bigint AND $5::bigint AND "id" = ANY($6::text[]) ORDER BY "sequence"`,
+          [ids.sessionId, ids.turnId, ids.waiterTaskId, fullEvents[0]!.sequence, fullEvents.at(-1)!.sequence, orphanEventIds])
+          expect(orphanRows.rows).toEqual(noopEvents.rows.map(event => ({ id: event.id, type: event.type, itemId: null })))
+          const reducedCounts = await checkClient.query<{ requestedCount: number; callCount: number; resultCount: number; itemCount: number }>(`SELECT
+              (SELECT ("payload"->>'toolCallCount')::int FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
+                AND "taskId" = $3 AND "idempotencyKey" = $5) AS "requestedCount",
+              (SELECT COUNT(*)::int FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+                AND "stepId" = $4 AND "type" = 'tool_call') AS "callCount",
+              (SELECT COUNT(*)::int FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+                AND "stepId" = $4 AND "type" = 'tool_result') AS "resultCount",
+              (SELECT COUNT(*)::int FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+                AND "stepId" = $4) AS "itemCount"`,
+          [ids.sessionId, ids.turnId, ids.waiterTaskId, sourceStepId, `task:${ids.waiterTaskId}:event:model-completed:${sourceStepId}`])
+          expect(reducedCounts.rows[0]).toEqual({ requestedCount: 2, callCount: 1, resultCount: 1, itemCount: 2 })
+
+          const afterNoopItemRemoval = await readChildWaitTerminalCallProjections(checkClient, snapshot as unknown as Record<string, unknown>)
+          expect(afterNoopItemRemoval.filter(projection => projection.sourceWait.waitId === sourceWaitId
+            && projection.sourceWait.claimKeyDigest === null)).toHaveLength(0)
+
+          const orphanedProjection = JSON.parse(JSON.stringify(handoffSource)) as Record<string, unknown>
+          const orphanedHandoff = asObject(orphanedProjection.sourceStepHandoff)
+          const orphanedPrefix = asObject(orphanedHandoff.sourceStepPrefix)
+          const removedIds = new Set([noopCallItemId, noopResultItemId])
+          const projectedItems = Array.isArray(orphanedPrefix.items) ? orphanedPrefix.items : []
+          expect(projectedItems.filter(item => removedIds.has(String(asObject(item).id))).map(item => String(asObject(item).id)).sort())
+            .toEqual([noopCallItemId, noopResultItemId].sort())
+          const projectedEvents = Array.isArray(orphanedPrefix.events) ? orphanedPrefix.events : []
+          const orphanedEventIds = new Set(orphanEventIds)
+          const orphanedEvents = projectedEvents.map(event => {
+            const value = asObject(event)
+            return orphanedEventIds.has(String(value.id)) ? { ...value, itemId: null } : event
+          })
+          expect(orphanedEvents.filter(event => orphanedEventIds.has(String(asObject(event).id))
+            && asObject(event).itemId === null)).toHaveLength(6)
+          orphanedProjection.sourceStepHandoff = { ...orphanedHandoff, sourceStepPrefix: {
+            ...orphanedPrefix, items: projectedItems.filter(item => !removedIds.has(String(asObject(item).id))), events: orphanedEvents,
+          } }
+          await expect(historicalWaitBindingAccepts(checkClient, snapshot, orphanedProjection),
+            "the final binding must reject orphaned noop call events when their items are absent").resolves.toBe(false)
+        } finally {
+          await checkClient.query("ROLLBACK TO SAVEPOINT recovered_source_orphan_noop_items")
+          await checkClient.query("RELEASE SAVEPOINT recovered_source_orphan_noop_items")
+        }
+
+        const restoredNoopItems = await checkClient.query<{ id: string }>(`SELECT "id" FROM "agent_items"
+          WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = $4 AND "id" = ANY($5::text[])
+          ORDER BY "id"`, [ids.sessionId, ids.turnId, ids.waiterTaskId, sourceStepId, [noopCallItemId, noopResultItemId]])
+        expect(restoredNoopItems.rows.map(item => item.id)).toEqual([noopCallItemId, noopResultItemId].sort())
+        const restoredOrphanEventRows = await checkClient.query<{ id: string; type: string; itemId: string | null }>(`SELECT "id", "type", "itemId"
+          FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = ANY($4::text[])
+          ORDER BY "sequence"`, [ids.sessionId, ids.turnId, ids.waiterTaskId, noopEvents.rows.map(event => event.id)])
+        expect(restoredOrphanEventRows.rows).toEqual(noopEvents.rows.map(event => ({ id: event.id, type: event.type, itemId: event.itemId })))
+        const restoredProjections = await readChildWaitTerminalCallProjections(checkClient, snapshot as unknown as Record<string, unknown>)
+        const restoredHandoff = restoredProjections.find(projection => projection.sourceWait.waitId === sourceWaitId
+          && projection.sourceWait.claimKeyDigest === null)
+        expect(restoredHandoff?.sourceStepHandoff?.sourceStepPrefix.items).toEqual(handoffSource.sourceStepHandoff.sourceStepPrefix.items)
+        expect(restoredHandoff?.sourceStepHandoff?.sourceStepPrefix.events).toEqual(fullEvents)
+        await expect(historicalWaitBindingAccepts(checkClient, snapshot, handoffSource),
+          "the original handoff must bind again after rollback restores its items").resolves.toBe(true)
+
+        const noopResultEvents = noopEvents.rows.filter(event => event.itemId === noopResultItemId)
+        expect(noopResultEvents.map(event => event.type)).toEqual(["item.started", "item.completed"])
+        await checkClient.query("SAVEPOINT recovered_source_orphan_noop_result")
+        try {
+          const removedNoopResult = await checkClient.query<{ id: string }>(`DELETE FROM "agent_items"
+            WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = $4 AND "id" = $5
+            RETURNING "id"`, [ids.sessionId, ids.turnId, ids.waiterTaskId, sourceStepId, noopResultItemId])
+          expect(removedNoopResult.rows).toEqual([{ id: noopResultItemId }])
+          const resultOnlyCounts = await checkClient.query<{ requestedCount: number; callCount: number; resultCount: number; itemCount: number }>(`SELECT
+              (SELECT ("payload"->>'toolCallCount')::int FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
+                AND "taskId" = $3 AND "idempotencyKey" = $5) AS "requestedCount",
+              (SELECT COUNT(*)::int FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+                AND "stepId" = $4 AND "type" = 'tool_call') AS "callCount",
+              (SELECT COUNT(*)::int FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+                AND "stepId" = $4 AND "type" = 'tool_result') AS "resultCount",
+              (SELECT COUNT(*)::int FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+                AND "stepId" = $4) AS "itemCount"`,
+          [ids.sessionId, ids.turnId, ids.waiterTaskId, sourceStepId, `task:${ids.waiterTaskId}:event:model-completed:${sourceStepId}`])
+          expect(resultOnlyCounts.rows[0]).toEqual({ requestedCount: 2, callCount: 2, resultCount: 1, itemCount: 3 })
+          const orphanResultEventIds = noopResultEvents.map(event => event.id)
+          const orphanResultRows = await checkClient.query<{ id: string; type: string; itemId: string | null }>(`SELECT "id", "type", "itemId"
+            FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = ANY($4::text[])
+            ORDER BY "sequence"`, [ids.sessionId, ids.turnId, ids.waiterTaskId, orphanResultEventIds])
+          expect(orphanResultRows.rows).toEqual(noopResultEvents.map(event => ({ id: event.id, type: event.type, itemId: null })))
+
+          const afterResultItemRemoval = await readChildWaitTerminalCallProjections(checkClient, snapshot as unknown as Record<string, unknown>)
+          expect(afterResultItemRemoval.filter(projection => projection.sourceWait.waitId === sourceWaitId
+            && projection.sourceWait.claimKeyDigest === null)).toHaveLength(0)
+
+          const orphanedResultProjection = JSON.parse(JSON.stringify(handoffSource)) as Record<string, unknown>
+          const orphanedResultHandoff = asObject(orphanedResultProjection.sourceStepHandoff)
+          const orphanedResultPrefix = asObject(orphanedResultHandoff.sourceStepPrefix)
+          const resultOnlyItems = Array.isArray(orphanedResultPrefix.items) ? orphanedResultPrefix.items : []
+          expect(resultOnlyItems.filter(item => asObject(item).id === noopResultItemId)).toHaveLength(1)
+          const resultOnlyEvents = Array.isArray(orphanedResultPrefix.events) ? orphanedResultPrefix.events : []
+          const orphanedResultEventIdSet = new Set(orphanResultEventIds)
+          const nullItemResultEvents = resultOnlyEvents.map(event => {
+            const value = asObject(event)
+            return orphanedResultEventIdSet.has(String(value.id)) ? { ...value, itemId: null } : event
+          })
+          expect(nullItemResultEvents.filter(event => orphanedResultEventIdSet.has(String(asObject(event).id))
+            && asObject(event).itemId === null)).toHaveLength(2)
+          orphanedResultProjection.sourceStepHandoff = { ...orphanedResultHandoff, sourceStepPrefix: {
+            ...orphanedResultPrefix,
+            items: resultOnlyItems.filter(item => asObject(item).id !== noopResultItemId),
+            events: nullItemResultEvents,
+          } }
+          await expect(historicalWaitBindingAccepts(checkClient, snapshot, orphanedResultProjection),
+            "the final binding must reject orphaned noop result events while retaining its call item").resolves.toBe(false)
+        } finally {
+          await checkClient.query("ROLLBACK TO SAVEPOINT recovered_source_orphan_noop_result")
+          await checkClient.query("RELEASE SAVEPOINT recovered_source_orphan_noop_result")
+        }
+
+        const restoredResultOnlyItems = await checkClient.query<{ id: string }>(`SELECT "id" FROM "agent_items"
+          WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = $4 AND "id" = ANY($5::text[])
+          ORDER BY "id"`, [ids.sessionId, ids.turnId, ids.waiterTaskId, sourceStepId, [noopCallItemId, noopResultItemId]])
+        expect(restoredResultOnlyItems.rows.map(item => item.id)).toEqual([noopCallItemId, noopResultItemId].sort())
+        const restoredResultOnlyEvents = await checkClient.query<{ id: string; type: string; itemId: string | null }>(`SELECT "id", "type", "itemId"
+          FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = ANY($4::text[])
+          ORDER BY "sequence"`, [ids.sessionId, ids.turnId, ids.waiterTaskId, noopResultEvents.map(event => event.id)])
+        expect(restoredResultOnlyEvents.rows).toEqual(noopResultEvents.map(event => ({ id: event.id, type: event.type, itemId: event.itemId })))
+        const restoredResultOnlyProjections = await readChildWaitTerminalCallProjections(checkClient, snapshot as unknown as Record<string, unknown>)
+        const restoredResultOnlyHandoff = restoredResultOnlyProjections.find(projection => projection.sourceWait.waitId === sourceWaitId
+          && projection.sourceWait.claimKeyDigest === null)
+        expect(restoredResultOnlyHandoff?.sourceStepHandoff?.sourceStepPrefix.items)
+          .toEqual(handoffSource.sourceStepHandoff.sourceStepPrefix.items)
+        expect(restoredResultOnlyHandoff?.sourceStepHandoff?.sourceStepPrefix.events).toEqual(fullEvents)
+        await expect(historicalWaitBindingAccepts(checkClient, snapshot, handoffSource),
+          "the original handoff must bind again after rollback restores the noop result").resolves.toBe(true)
+
+        await checkClient.query("SAVEPOINT wrong_correlation_step_completed")
+        try {
+          const sequence = await checkClient.query<{ value: string }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1
+            WHERE "id" = $1 AND "userId" = $2 RETURNING "eventSequence"::text AS "value"`, [ids.sessionId, ids.userId])
+          expect(sequence.rows).toHaveLength(1)
+          const completedKey = `task:${ids.waiterTaskId}:event:step-completed:${handoffSource.stepId}`
+          const wrongCorrelation = `unrelated-correlation:${randomUUID()}`
+          const inserted = await checkClient.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor",
+              "correlationId", "causationId", "idempotencyKey", "payload")
+            VALUES ($1, $2, $3, NULL, $4, $5::bigint, 'step.completed', 'subagent', $6, $7, $8, $9::jsonb) RETURNING "id"`,
+          [`fixture-wrong-step-completed-correlation:${suffix}`, ids.sessionId, ids.turnId, ids.waiterTaskId, sequence.rows[0]!.value,
+            wrongCorrelation, fullEvents.at(-1)!.id, completedKey, JSON.stringify({ stepId: handoffSource.stepId, status: "completed",
+              toolCallCount: 2, taskId: ids.waiterTaskId })])
+          expect(inserted.rowCount).toBe(1)
+          const afterWrongCorrelation = await readChildWaitTerminalCallProjections(checkClient, snapshot as unknown as Record<string, unknown>)
+          expect(afterWrongCorrelation.filter(projection => projection.sourceWait.waitId === sourceWaitId)).toHaveLength(0)
+          await expect(historicalWaitBindingAccepts(checkClient, snapshot, handoffSource),
+            "the final binding must reject a canonical step-completed key with a wrong correlation").resolves.toBe(false)
+        } finally {
+          await checkClient.query("ROLLBACK TO SAVEPOINT wrong_correlation_step_completed")
+          await checkClient.query("RELEASE SAVEPOINT wrong_correlation_step_completed")
+        }
+
+        const reorderedProjection = JSON.parse(JSON.stringify(handoffSource)) as Record<string, unknown>
+        const nestedHandoff = asObject(reorderedProjection.sourceStepHandoff)
+        const nestedPrefix = asObject(nestedHandoff.sourceStepPrefix)
+        const reorderedEvents = fullEvents.map((event, index) => index === noopStartedIndex ? fullEvents[noopCallStartedIndex]!
+          : index === noopCallStartedIndex ? fullEvents[noopStartedIndex]! : event)
+        reorderedProjection.sourceStepHandoff = { ...nestedHandoff, sourceStepPrefix: { ...nestedPrefix, events: reorderedEvents } }
+        await expect(historicalWaitBindingAccepts(checkClient, snapshot, reorderedProjection),
+          "the final binding must reject reordered non-anchor events in a real recovered multi-tool prefix").resolves.toBe(false)
+        const afterSwap = await readChildWaitTerminalCallProjections(checkClient, snapshot as unknown as Record<string, unknown>)
+        expect(afterSwap.find(projection => projection.sourceWait.waitId === sourceWaitId && projection.sourceWait.claimKeyDigest === null)
+          ?.sourceStepHandoff?.sourceStepPrefix.events).toEqual(fullEvents)
+
+        const noopRowsAfterRecovery = await checkClient.query<{ count: number; eventCount: number }>(`SELECT
+            (SELECT COUNT(*)::int FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+              AND "stepId" = $4 AND "type" = 'tool_call' AND "content"->>'toolName' = 'fixture_noop') AS "count",
+            (SELECT COUNT(*)::int FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+              AND ("itemId" IN ($5, $6) OR "correlationId" = $7)) AS "eventCount"`,
+        [ids.sessionId, ids.turnId, ids.waiterTaskId, sourceStepId, noopCallItemId, noopResultItemId, noopCallId])
+        expect(noopRowsAfterRecovery.rows).toEqual([{ count: 1, eventCount: 6 }])
+        await checkClient.query("COMMIT")
+      } catch (error) {
+        await checkClient.query("ROLLBACK").catch(() => undefined)
+        throw error
+      } finally { checkClient.release() }
+    } finally {
+      await stopWorker(workerA)
+      await stopWorker(workerB)
+      await stopWorker(workerC)
+      if (queuePaused) await queue.resume().catch(() => undefined)
+      await queue.obliterate({ force: true }).catch(() => undefined)
+      await queue.close().catch(() => undefined)
+      if (closeSharedRedisConnections) await closeSharedRedisConnections().catch(() => undefined)
+      if (originalRedisUrl === undefined) delete process.env.REDIS_URL
+      else process.env.REDIS_URL = originalRedisUrl
+      try { await pool.query(`DELETE FROM "agent_sessions" WHERE "id" = $1`, [ids.sessionId]) } catch { /* preserve the original failure */ }
+      try { await pool.query(`DELETE FROM "User" WHERE "id" = $1`, [ids.userId]) } catch { /* preserve the original failure */ }
+      await queueRedis.quit().catch(() => queueRedis.disconnect())
+    }
+  }, 150_000)
+
   it("accepts PG-scale-8 receipt usage before failing closed on a later streaming step", async () => {
     const suffix = randomUUID()
     const ids: FixtureIds = {
@@ -5127,9 +5686,20 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         const snapshot: BlockingTaskSnapshot = { ...lockedTask, userId: ids.userId }
         const blocking = (value: BlockingTaskSnapshot = snapshot, ignoredEventId?: string) => hasBlockingExternalCall(
           settlementClient, value as unknown as Record<string, unknown>, ignoredEventId, continuationStepId)
-        await expectHistoricalWaitUnblocked(settlementClient, snapshot, continuationStepId,
-          PHONE_SHAPED_WAIT_TOOL_CALL_ID, orphanCallId,
-          "exact source and claim evidence should settle after the next step starts")
+        try {
+          await expectHistoricalWaitUnblocked(settlementClient, snapshot, continuationStepId,
+            PHONE_SHAPED_WAIT_TOOL_CALL_ID, orphanCallId,
+            "exact source and claim evidence should settle after the next step starts")
+        } catch (error: unknown) {
+          let sourceDiagnostic: Record<string, unknown> = { rejectStage: "diagnostic_unavailable" }
+          try { sourceDiagnostic = await diagnoseHistoricalWaitSourceProjection(settlementClient, snapshot, PHONE_SHAPED_WAIT_TOOL_CALL_ID) }
+          catch { /* preserve the original assertion if the bounded diagnostic itself is unavailable */ }
+          if (error instanceof Error) {
+            error.message += `; redacted source-reader diagnostic=${JSON.stringify(sourceDiagnostic)}`
+            throw error
+          }
+          throw new Error(`historical wait source projection failed; redacted source-reader diagnostic=${JSON.stringify(sourceDiagnostic)}`)
+        }
         await expect(blocking({ ...snapshot, leaseOwner: `${snapshot.leaseOwner}:stale` }),
           "a stale owner must not borrow historical settlement proof").resolves.toBe(true)
         await expect(blocking({ ...snapshot, attemptCount: snapshot.attemptCount + 1 }),
@@ -5315,6 +5885,21 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         if (!handoffSource?.sourceStepHandoff) throw new Error("historical_wait_handoff_projection_missing")
         await expect(historicalWaitBindingAccepts(settlementClient, snapshot, handoffSource),
           "the final PostgreSQL binding must accept the exact producer handoff proof").resolves.toBe(true)
+
+        const reorderedNestedProjection = JSON.parse(JSON.stringify(handoffSource)) as Record<string, unknown>
+        const nestedHandoff = asObject(reorderedNestedProjection.sourceStepHandoff)
+        const nestedSourcePrefix = asObject(nestedHandoff.sourceStepPrefix)
+        const nestedEvents = Array.isArray(nestedSourcePrefix.events) ? nestedSourcePrefix.events : []
+        const nestedHandoffEvents = Array.isArray(nestedHandoff.events) ? nestedHandoff.events : []
+        expect(nestedEvents[6]).toMatchObject({ type: "tool_call.started" })
+        expect(nestedEvents[7]).toMatchObject({ type: "item.completed" })
+        expect(nestedHandoffEvents.map(event => asObject(event).id)).not.toContain(asObject(nestedEvents[6]).id)
+        expect(nestedHandoffEvents.map(event => asObject(event).id)).not.toContain(asObject(nestedEvents[7]).id)
+        const reorderedNestedPrefix = { ...nestedSourcePrefix, events: nestedEvents.map((event, index) =>
+          index === 6 ? nestedEvents[7] : index === 7 ? nestedEvents[6] : event) }
+        reorderedNestedProjection.sourceStepHandoff = { ...nestedHandoff, sourceStepPrefix: reorderedNestedPrefix }
+        await expect(historicalWaitBindingAccepts(settlementClient, snapshot, reorderedNestedProjection),
+          "the final PostgreSQL binding must reject reordered non-anchor events inside recovered handoff sourceStepPrefix").resolves.toBe(false)
 
         await expect(historicalWaitBindingAccepts(settlementClient, { ...snapshot, leaseOwner: `${snapshot.leaseOwner}:stale` }, handoffSource),
           "the same handoff proof must not transfer to a stale lease").resolves.toBe(false)

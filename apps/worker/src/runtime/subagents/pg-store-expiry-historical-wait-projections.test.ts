@@ -61,6 +61,21 @@ function recoveredHandoffData(source: ReturnType<typeof wait>) {
     completed: false, rangeCount: 6 }
 }
 
+function mockedRecoveredPrefix(source: ReturnType<typeof wait>, data: ReturnType<typeof recoveredHandoffData>) {
+  const stepId = source.stepId, resultItemId = `source-result:${String(source.id).slice(5)}`
+  if (data.completed || source.sourceStepStatus !== "waiting_for_tool" || data.items.length !== 2 || data.events.length !== 6
+    || data.rangeCount !== 6 || data.events.some((event, index) => index > 0
+      && (event.causationId !== data.events[index - 1]?.id || Number(event.sequence) <= Number(data.events[index - 1]?.sequence)))) return null
+  const completedModel = data.events.find(event => event.type === "model.completed")
+  if ((completedModel?.payload as { toolCallCount?: unknown } | undefined)?.toolCallCount !== 1) return null
+  const events = data.events.map(({ payload: _payload, ...event }) => event)
+  if (new Set(events.map(event => event.idempotencyKey)).size !== 6 || new Set(events.map(event => event.id)).size !== 6) return null
+  return { stepId, attempt: 1, sourceCallItemId: source.sourceCallItemId, sourceCallId: source.sourceCallId,
+    sourceResultItemId: resultItemId, waitKind: "recovered" as const, terminalMode: "recovered_handoff" as const,
+    stepStartedEventId: events[0]!.id, stepCompletedEventId: null, events,
+    items: data.items.map(item => ({ id: item.id, type: item.type, status: "completed", revision: 1, phase: null, contentDigest: "a".repeat(64) })) }
+}
+
 function completedClaim(source: ReturnType<typeof wait>, index: number, taskIds = source.targetTaskIds) {
   const callId = `claim-call-${index}`, stepId = `claim-step-${index}`
   const callItemId = `task:${task.id}:item:tool-call:${callId}:attempt:${task.attemptCount}`
@@ -127,12 +142,11 @@ beforeEach(() => {
     events: [{ id: `step-start:${input.stepId}`, sequence: "1", type: "step.started" }],
     calls: [{ callItemId: `claim-item:${input.stepId}`, resultItemId: `claim-result:${input.stepId}` }],
   }))
-  mocks.prefix.mockImplementation(async (_client: unknown, _scope: unknown, input: { stepId: string; attempt: number;
-    callItemId: string; callId: string; resultItemId: string; waitKind: string }) => ({
-    stepId: input.stepId, attempt: input.attempt, sourceCallItemId: input.callItemId, sourceCallId: input.callId,
-    sourceResultItemId: input.resultItemId, waitKind: input.waitKind, stepStartedEventId: `step-start:${input.stepId}`,
-    stepCompletedEventId: `step-done:${input.stepId}`, events: [], items: [],
-  }))
+  mocks.prefix.mockImplementation(async (_client: unknown, _scope: unknown, input: { stepId: string; terminalMode?: string }) => {
+    if (input.terminalMode !== "recovered_handoff") return null
+    const index = Number(input.stepId.slice("source-step-".length)), source = wait(index)
+    return mockedRecoveredPrefix(source, recoveredHandoffData(source))
+  })
 })
 
 describe("bounded historical wait projections", () => {
@@ -151,8 +165,9 @@ describe("bounded historical wait projections", () => {
     expect(completed[0]).not.toHaveProperty("stepToolChainProof")
     expect(JSON.parse(JSON.stringify(completed[0]))).toHaveProperty("stepToolChain.nextEventId")
     expect(projections.filter(row => !row.resultItemId).map(row => row.sourceWait.waitId)).toEqual(["wait-1", "wait-2"])
-    expect(completed.every(row => row.sourceStepPrefix?.waitKind === "recovered")).toBe(true)
-    expect(mocks.prefix).toHaveBeenCalledTimes(2)
+    expect(completed.every(row => row.sourceStepHandoff?.sourceStepPrefix.waitKind === "recovered")).toBe(true)
+    expect(completed.every(row => !row.sourceStepPrefix && row.sourceStepHandoff)).toBe(true)
+    expect(mocks.prefix).toHaveBeenCalledTimes(4)
     expect(db.query.mock.calls[0]?.[0]).toContain('owner."sessionId" = $2')
     expect(db.query.mock.calls[0]?.[0]).toContain(`LIMIT ${MAX_HISTORICAL_SOURCE_WAITS + 1}`)
     expect(db.query.mock.calls.map(([sql]) => sql).join("\n")).not.toMatch(unparenthesizedJsonExtractionAfterConcat)
@@ -180,7 +195,8 @@ describe("bounded historical wait projections", () => {
 
   it("carries recovered handoff source evidence without replacing the independent claim chain", async () => {
     const source = wait(1), handoff = recoveredHandoffData(source)
-    mocks.prefix.mockResolvedValue(null)
+    mocks.prefix.mockImplementation(async (_client: unknown, _scope: unknown, input: { terminalMode?: string }) =>
+      input.terminalMode === "recovered_handoff" ? mockedRecoveredPrefix(source, handoff) : null)
     const projections = await readChildWaitTerminalCallProjections(client([source], [completedClaim(source, 1)], handoff) as never, task)
     const sourceProjection = projections.find(row => row.callItemId === source.sourceCallItemId)
     const claimProjection = projections.find(row => row.sourceWait.claimKeyDigest !== null)
@@ -224,8 +240,9 @@ describe("bounded historical wait projections", () => {
     }],
   ])("fails closed on %s in the recovered handoff", async (_label, corrupt) => {
     const source = wait(1), handoff = recoveredHandoffData(source)
-    mocks.prefix.mockResolvedValue(null)
     corrupt(source, handoff)
+    mocks.prefix.mockImplementation(async (_client: unknown, _scope: unknown, input: { terminalMode?: string }) =>
+      input.terminalMode === "recovered_handoff" ? mockedRecoveredPrefix(source, handoff) : null)
     await expect(readChildWaitTerminalCallProjections(client([source], [], handoff) as never, task)).resolves.toEqual([])
   })
 

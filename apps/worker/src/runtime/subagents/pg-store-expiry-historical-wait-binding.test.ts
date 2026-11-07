@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest"
 import { CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL } from "./pg-store-expiry-historical-wait-binding.js"
 import { CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL, CHILD_WAIT_HISTORICAL_SOURCE_RESULT_RECEIPT_SQL,
   HISTORICAL_SOURCE_STEP_BINDING_SQL, HISTORICAL_SOURCE_WAIT_HANDOFF_SQL } from "./pg-store-expiry-historical-wait-event-binding.js"
-import { HISTORICAL_SOURCE_STEP_PREFIX_SQL } from "./pg-store-expiry-historical-source-step-prefix.js"
+import { HISTORICAL_SOURCE_STEP_PREFIX_SQL } from "./pg-store-expiry-historical-wait-event-binding.js"
 
 const sql = CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL.replace(/\s+/g, " ")
 const unparenthesizedJsonExtractionAfterConcat = /\|\|\s*(?:[a-z_][\w]*\.)?(?:"[^"]+"|[a-z_][\w]*)(?:\s*->>?\s*(?:'[^']+'|"[^"]+"))+/i
@@ -91,8 +91,11 @@ describe("final historical wait receipt binding", () => {
     expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain("recovered_wait_handoff.v1")
     expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain('boundSource."status" = \'waiting_for_tool\'')
     expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain('sourceStepDone."type" = \'step.completed\'')
-    expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain('AND sourceItem."stepId" = boundSource."id") = 2')
-    expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain("betweenAnchors.\"sequence\"::numeric BETWEEN")
+    expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain('scopedItem."stepId" = boundSource."id")')
+    expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain("ordered.\"sequence\" BETWEEN")
+    expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain("WITH ORDINALITY AS expected(value, ordinality)")
+    expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain("'ordinal', boundSource.\"ordinal\"")
+    expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain("toolCallCount")
     expect(HISTORICAL_SOURCE_STEP_BINDING_SQL).toContain("sourceStepPrefix")
     expect(HISTORICAL_SOURCE_STEP_BINDING_SQL).toContain("sourceStepHandoff")
     expect(CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL).toContain(HISTORICAL_SOURCE_STEP_BINDING_SQL)

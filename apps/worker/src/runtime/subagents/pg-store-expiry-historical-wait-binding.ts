@@ -31,6 +31,7 @@ export type RecoveredWaitHandoff = Readonly<{
   sourceResultItemId: string
   events: readonly Readonly<{ id: string; sequence: string; type: string; actor: string; itemId: string | null;
     correlationId: string; causationId: string | null; idempotencyKey: string; payloadDigest: string }>[]
+  sourceStepPrefix: HistoricalSourceStepPrefix
 }>
 
 export type TerminalCallProjection = Readonly<{
