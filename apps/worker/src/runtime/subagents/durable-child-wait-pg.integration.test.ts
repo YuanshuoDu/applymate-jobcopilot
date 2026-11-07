@@ -24,11 +24,15 @@ import { actionList, asObject, INSERT_TASK, json } from "./pg-store-persistence.
 import type { SubagentLease } from "./types.js"
 import { CHILD_WAIT_CLAIM_RECOVERY_SQL, CHILD_WAIT_CONSUMED_SQL, CHILD_WAIT_RESUMABLE_SQL as CHILD_WAIT_EXPIRY_RESUMABLE_SQL, hasBlockingExternalCall } from "./pg-store-expiry-recovery-predicates.js"
 import { CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL, childWaitContinuationKeyMatchesSafeProjection } from "./pg-store-expiry-child-wait-claim-call-proof.js"
+import { CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL, CHILD_WAIT_HISTORICAL_SOURCE_RESULT_RECEIPT_SQL,
+  HISTORICAL_SOURCE_STEP_BINDING_SQL, HISTORICAL_SOURCE_STEP_PREFIX_SQL,
+  HISTORICAL_SOURCE_WAIT_HANDOFF_SQL } from "./pg-store-expiry-historical-wait-event-binding.js"
 import { readChildWaitSourceCallProjection } from "./pg-store-expiry-child-wait-source-proof.js"
 import { CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL } from "./pg-store-expiry-historical-wait-binding.js"
 import { buildCognitiveAgendaReceipt, cognitiveAgendaReceiptIdempotencyKey } from "../turns/cognitive-agenda-receipt.js"
 import { readChildWaitTerminalCallProjections } from "./pg-store-expiry-historical-wait-projections.js"
-import { readCanonicalHistoricalSourceStepPrefix } from "./pg-store-expiry-historical-source-step-prefix.js"
+import { historicalSourceStepCallChainBinding, historicalSourceStepCallCountBinding, historicalSourceStepEventChainBinding,
+  readCanonicalHistoricalSourceStepPrefix } from "./pg-store-expiry-historical-source-step-prefix.js"
 import { MAX_STEP_TOOL_CALLS, readCanonicalWaitStepToolChain } from "./pg-store-expiry-step-tool-chain-proof.js"
 import { safeSubagentWaitJson } from "./subagent-wait-structural-ids.js"
 
@@ -126,6 +130,12 @@ function safeProjectedWaitKey(input: { taskIds: readonly string[]; mode: "any" |
   return projected.idempotencyKey
 }
 
+function historicalSourceStepPrefixPath(proof: string): string {
+  return `(CASE WHEN ${proof} ? 'sourceStepPrefix' AND NOT (${proof} ? 'sourceStepHandoff') THEN ${proof}->'sourceStepPrefix'
+    WHEN ${proof} ? 'sourceStepHandoff' AND NOT (${proof} ? 'sourceStepPrefix')
+      THEN ${proof}->'sourceStepHandoff'->'sourceStepPrefix' ELSE '{}'::jsonb END)`
+}
+
 function disposableDatabaseUrl(): string | null {
   const value = process.env.AGENT_RUNTIME_PG_TEST_URL
   if (!value) return null
@@ -164,6 +174,13 @@ describe("worker restart blocker proof diagnostic bindings", () => {
   })
   it("binds the same-call-ID source item/step/attempt terminal canary without gaps", () => {
     expectSqlBindings(WORKER_F_SAME_CALL_ID_TERMINAL_PROOF_SQL, 15)
+  })
+  it("selects the exclusive top-level prefix or nested handoff prefix in binding diagnostics", () => {
+    const path = historicalSourceStepPrefixPath("proof.value")
+    expect(path).toContain("proof.value->'sourceStepPrefix'")
+    expect(path).toContain("proof.value->'sourceStepHandoff'->'sourceStepPrefix'")
+    expect(HISTORICAL_SOURCE_STEP_BINDING_SQL).toContain("proof.value ? 'sourceStepPrefix' AND NOT (proof.value ? 'sourceStepHandoff')")
+    expect(HISTORICAL_SOURCE_STEP_BINDING_SQL).toContain("proof.value ? 'sourceStepHandoff' AND NOT (proof.value ? 'sourceStepPrefix')")
   })
   it("parses loop-stage diagnostics into fixed enums and drops unknown fields", () => {
     const parsed = parseBoundedLoopDiagnostics(
@@ -600,10 +617,99 @@ async function diagnoseWorkerFStartCandidates(
     unsettledStartCandidatesTruncated: starts.rows.length > 16,
     sourceProjectionCount: sourceProjections.length, claimProjectionCount: claimProjections.length,
     sourcePrefixCount: sourceProjections.filter(projection => !!projection.sourceStepPrefix).length,
+    sourceHandoffCount: sourceProjections.filter(projection => !!projection.sourceStepHandoff).length,
+    hasSourceProjection: sourceProjections.length === 1,
+    hasSourcePrefix: sourceProjections.length === 1 && !!sourceProjections[0]?.sourceStepPrefix,
+    hasSourceHandoff: sourceProjections.length === 1 && !!sourceProjections[0]?.sourceStepHandoff,
     claimPrefixCount: claimProjections.filter(projection => !!projection.sourceStepPrefix).length,
     claimChainCount: claimProjections.filter(projection => !!projection.stepToolChain).length,
     sourceCallProjectionInputsPresent: !!sourceProjection?.rawCallId && !!sourceProjection.projectedCallId,
     starts: classified }
+}
+
+async function diagnoseHistoricalSourceFinalBinding(client: PoolClient, task: BlockingTaskSnapshot,
+  continuationStepId: string, sourceCallId: string): Promise<Record<string, unknown>> {
+  const sourceProjection = await readChildWaitSourceCallProjection(client, task as unknown as Record<string, unknown>, continuationStepId)
+  const projections = await readChildWaitTerminalCallProjections(client, task as unknown as Record<string, unknown>)
+  const sourceProjections = projections.filter(projection => projection.sourceWait.claimKeyDigest === null
+    && projection.rawCallId === sourceCallId)
+  const path = historicalSourceStepPrefixPath("proof.value")
+  const sql = `WITH typed_params AS MATERIALIZED (SELECT $1::text, $2::text, $3::text, $4::text, $5::text,
+      $6::integer, $7::timestamptz, $8::text, $9::text, $10::text, $11::text, $12::text, $13::jsonb, $14::text)
+    SELECT
+      (proof.value->>'startEventId' = started."id" AND proof.value->>'rawCallId' = started."correlationId"
+        AND proof.value->>'callItemId' = callItem."id" AND proof.value->>'stepId' = callItem."stepId"
+        AND proof.value->>'attempt' = callStep."attempt"::text) AS "sourceProjectionMatch",
+      (owner."id" = $2 AND owner."sessionId" = $1 AND owner."turnId" = $3 AND owner."rootTaskId" = $4
+        AND owner."parentTaskId" IS NOT NULL AND owner."status" = 'running' AND owner."leaseOwner" = $5
+        AND owner."attemptCount" = $6 AND owner."leaseExpiresAt" = $7 AND owner."interruptRequestedAt" IS NULL
+        AND session."userId" = $8 AND turn."sessionId" = owner."sessionId" AND turn."userId" = session."userId"
+        AND turn."rootTaskId" = owner."rootTaskId") AS "ownerLeaseFence",
+      (${CHILD_WAIT_HISTORICAL_SOURCE_RESULT_RECEIPT_SQL}) AS "sourceReceiptBinding",
+      (${CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL}) AS "sourceEventBinding",
+      CASE WHEN proof.value ? 'sourceStepPrefix' AND NOT (proof.value ? 'sourceStepHandoff')
+        THEN (${HISTORICAL_SOURCE_STEP_PREFIX_SQL}) ELSE FALSE END AS "sourceStepPrefixBinding",
+      CASE WHEN proof.value ? 'sourceStepHandoff' AND NOT (proof.value ? 'sourceStepPrefix')
+        THEN (${HISTORICAL_SOURCE_WAIT_HANDOFF_SQL}) ELSE FALSE END AS "sourceHandoffBinding",
+      (${HISTORICAL_SOURCE_STEP_BINDING_SQL}) AS "sourceStepBinding",
+      (${historicalSourceStepEventChainBinding(path)}) AS "sourceEventChain",
+      (${historicalSourceStepCallChainBinding(path)}) AS "sourceCallChain",
+      (${historicalSourceStepCallCountBinding(path)}) AS "sourceCallCount",
+      (${CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL}) AS "historicalWaitBinding",
+      CASE WHEN settled."id" IS NULL THEN FALSE ELSE (${CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL}) END AS "terminalSettlement"
+    FROM typed_params
+    JOIN "sub_agent_tasks" AS owner ON owner."id" = $2
+    LEFT JOIN "agent_sessions" AS session ON session."id" = owner."sessionId"
+    LEFT JOIN "agent_turns" AS turn ON turn."id" = owner."turnId" AND turn."sessionId" = owner."sessionId"
+    CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof($13::jsonb) = 'array' THEN $13::jsonb ELSE '[]'::jsonb END) AS proof(value)
+    JOIN "agent_events" AS started ON started."id" = proof.value->>'startEventId'
+      AND started."sessionId" = $1 AND started."turnId" = $3 AND started."taskId" = $2
+    JOIN "agent_items" AS callItem ON callItem."id" = started."itemId" AND callItem."sessionId" = started."sessionId"
+      AND callItem."turnId" = started."turnId" AND callItem."taskId" = started."taskId" AND callItem."type" = 'tool_call'
+    JOIN "agent_steps" AS callStep ON callStep."id" = callItem."stepId" AND callStep."sessionId" = callItem."sessionId"
+      AND callStep."turnId" = callItem."turnId" AND callStep."taskId" = callItem."taskId"
+    LEFT JOIN "agent_wait_conditions" AS boundWait ON boundWait."id" = proof.value->'sourceWait'->>'waitId'
+      AND boundWait."parentTaskId" = $2 AND boundWait."sessionId" = $1 AND boundWait."turnId" = $3 AND boundWait."userId" = $8
+    LEFT JOIN "agent_steps" AS boundSource ON boundSource."id" = proof.value->'sourceWait'->>'sourceStepId'
+      AND boundSource."sessionId" = $1 AND boundSource."turnId" = $3 AND boundSource."taskId" = $2
+      AND boundSource."id" = boundWait."stepId"
+    LEFT JOIN "agent_items" AS boundSourceCall ON boundSourceCall."id" = proof.value->'sourceWait'->>'sourceCallItemId'
+      AND boundSourceCall."sessionId" = $1 AND boundSourceCall."turnId" = $3 AND boundSourceCall."taskId" = $2
+      AND boundSourceCall."stepId" = boundSource."id" AND boundSourceCall."type" = 'tool_call'
+    LEFT JOIN "agent_items" AS boundSourceResult ON boundSourceResult."id" = proof.value->'sourceWait'->>'sourceResultItemId'
+      AND boundSourceResult."sessionId" = $1 AND boundSourceResult."turnId" = $3 AND boundSourceResult."taskId" = $2
+      AND boundSourceResult."type" = 'tool_result'
+    LEFT JOIN "agent_events" AS itemStarted ON itemStarted."sessionId" = callItem."sessionId"
+      AND itemStarted."turnId" = callItem."turnId" AND itemStarted."taskId" = callItem."taskId"
+      AND itemStarted."itemId" = callItem."id" AND itemStarted."type" = 'item.started'
+    LEFT JOIN "agent_events" AS itemCompleted ON itemCompleted."sessionId" = callItem."sessionId"
+      AND itemCompleted."turnId" = callItem."turnId" AND itemCompleted."taskId" = callItem."taskId"
+      AND itemCompleted."itemId" = callItem."id" AND itemCompleted."type" = 'item.completed'
+    LEFT JOIN "agent_events" AS sourceResultCompleted ON sourceResultCompleted."sessionId" = $1
+      AND sourceResultCompleted."turnId" = $3 AND sourceResultCompleted."taskId" = $2
+      AND sourceResultCompleted."itemId" = boundSourceResult."id" AND sourceResultCompleted."type" = 'item.completed'
+    LEFT JOIN "agent_events" AS settled ON settled."sessionId" = started."sessionId"
+      AND settled."turnId" = started."turnId" AND settled."taskId" = started."taskId"
+      AND settled."correlationId" = started."correlationId"
+      AND settled."type" IN ('tool_call.completed', 'tool_call.failed', 'tool_call.interrupted')
+    WHERE proof.value->>'rawCallId' = $14 AND proof.value->>'callItemId' = callItem."id"
+      AND proof.value->>'stepId' = callStep."id" AND proof.value->'sourceWait'->'claimKeyDigest' = 'null'::jsonb
+      AND callItem."content"->>'toolCallId' = $14
+    LIMIT 2`
+  const rows = await client.query<Record<string, unknown>>(sql, [task.sessionId, task.id, task.turnId, task.rootTaskId,
+    task.leaseOwner, task.attemptCount, task.leaseExpiresAt, task.userId, null, continuationStepId,
+    sourceProjection?.rawCallId ?? null, sourceProjection?.projectedCallId ?? null, JSON.stringify(projections), sourceCallId])
+  if (sourceProjections.length !== 1 || rows.rows.length !== 1) return { outcome: "unknown",
+    sourceProjectionCount: sourceProjections.length, bindingRowCount: rows.rows.length }
+  const row = rows.rows[0]!
+  const flag = (key: string) => row[key] === true
+  return { outcome: "evaluated", sourceProjectionCount: 1,
+    sourceProjectionMatch: flag("sourceProjectionMatch"), ownerLeaseFence: flag("ownerLeaseFence"),
+    sourceReceiptBinding: flag("sourceReceiptBinding"), sourceEventBinding: flag("sourceEventBinding"),
+    sourceStepPrefixBinding: flag("sourceStepPrefixBinding"), sourceHandoffBinding: flag("sourceHandoffBinding"),
+    sourceStepBinding: flag("sourceStepBinding"), sourceEventChain: flag("sourceEventChain"),
+    sourceCallChain: flag("sourceCallChain"), sourceCallCount: flag("sourceCallCount"),
+    historicalWaitBinding: flag("historicalWaitBinding"), terminalSettlement: flag("terminalSettlement") }
 }
 
 async function expectHistoricalWaitUnblocked(client: PoolClient, task: BlockingTaskSnapshot,
@@ -615,6 +721,13 @@ async function expectHistoricalWaitUnblocked(client: PoolClient, task: BlockingT
     let diagnostic: Record<string, unknown> = { probeAvailable: false }
     try { diagnostic = await diagnoseWorkerFStartCandidates(client, task, continuationStepId, sourceCallId, claimCallId, true) }
     catch { /* retain the strict assertion failure without exposing query errors */ }
+    let sourceReader: Record<string, unknown> = { outcome: "unknown" }
+    try { sourceReader = await diagnoseHistoricalWaitSourceProjection(client, task, sourceCallId) }
+    catch { /* keep the diagnostic redacted if the source reader probe is unavailable */ }
+    let finalBinding: Record<string, unknown> = { outcome: "unknown" }
+    try { finalBinding = await diagnoseHistoricalSourceFinalBinding(client, task, continuationStepId, sourceCallId) }
+    catch { /* keep the original assertion and redacted diagnostics if SQL probing fails */ }
+    diagnostic = { ...diagnostic, sourceReader, finalBinding }
     const suffix = `; redacted historical-wait diagnostic=${JSON.stringify(diagnostic)}`
     if (error instanceof Error) {
       error.message += suffix
