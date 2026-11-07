@@ -309,6 +309,9 @@ function boundedIds(value) {
     ? value.map(id => typeof id === "string" ? id.slice(0, 256) : null)
     : null
 }
+function toolCallIdRequiresProjection(value) {
+  return redactSensitiveText(value) !== value || /^toolcall[a-p]{64}[a-z]+$/.test(value)
+}
 
 function restoredWaitObservationSummary(restored, wait, pendingWait, owner, stepId) {
   const matches = restored.observations.filter(item => item?.content?.toolCallId === wait.toolCallId
@@ -321,7 +324,9 @@ function restoredWaitObservationSummary(restored, wait, pendingWait, owner, step
     && (item.content.toolCallId === wait.toolCallId || projection.aliasToCanonical.get(item.content.toolCallId) === wait.toolCallId))
   if (projectedMatches.length !== 1) throw new Error("durable_child_wait_projected_observation_binding_invalid")
   const projectedId = projectedMatches[0].content.toolCallId
-  const projectedCanonicalId = projection.aliasToCanonical.get(projectedId) ?? projectedId
+  const projectedAliasTarget = projection.aliasToCanonical.get(projectedId)
+  const projectedIdWasAliased = projectedAliasTarget === wait.toolCallId
+  const projectedCanonicalId = projectedAliasTarget ?? projectedId
   const blocks = projection.snapshot.toolObservations.map(item => ({ ...item,
     layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent" }))
   const messages = contextToModelMessages({ blocks })
@@ -334,13 +339,19 @@ function restoredWaitObservationSummary(restored, wait, pendingWait, owner, step
   const repeatedMatches = repeated.snapshot.toolObservations.filter(item => item?.content?.toolName === "wait_subagents"
     && (item.content.toolCallId === wait.toolCallId || repeated.aliasToCanonical.get(item.content.toolCallId) === wait.toolCallId))
   const repeatedId = repeatedMatches.length === 1 ? repeatedMatches[0].content.toolCallId : undefined
-  const repeatedCanonicalId = repeated.aliasToCanonical.get(repeatedId) ?? repeatedId
+  const repeatedAliasTarget = repeated.aliasToCanonical.get(repeatedId)
+  const repeatedIdWasAliased = repeatedAliasTarget === wait.toolCallId
+  const repeatedCanonicalId = repeatedAliasTarget ?? repeatedId
   const serializedMessages = JSON.stringify(messages)
+  const originalIdRequiresProjection = toolCallIdRequiresProjection(wait.toolCallId)
+  const originalIdAppearsInMessages = serializedMessages.includes(wait.toolCallId)
   if (projectedCanonicalId !== wait.toolCallId || redactSensitiveText(projectedId) !== projectedId
     || toolUses.length !== 1 || toolResults.length !== 1
     || !toolUse || !toolResult || toolUse.id !== toolResult.toolUseId
-    || toolUse.id !== projectedId || serializedMessages.includes(wait.toolCallId)
-    || repeatedMatches.length !== 1 || repeatedId !== projectedId || repeatedCanonicalId !== wait.toolCallId) {
+    || toolUse.id !== projectedId || originalIdRequiresProjection !== projectedIdWasAliased
+    || (projectedIdWasAliased ? projectedId === wait.toolCallId || originalIdAppearsInMessages : projectedId !== wait.toolCallId)
+    || repeatedMatches.length !== 1 || repeatedId !== projectedId || repeatedCanonicalId !== wait.toolCallId
+    || repeatedIdWasAliased !== projectedIdWasAliased) {
     throw new Error("durable_child_wait_model_projection_invalid")
   }
   const output = content.output
@@ -350,7 +361,7 @@ function restoredWaitObservationSummary(restored, wait, pendingWait, owner, step
   return {
     state: pendingWait ? "unconsumed" : "consumed",
     canonicalCallIdPreserved: content.toolCallId === wait.toolCallId,
-    modelContextSafe: !serializedMessages.includes(wait.toolCallId),
+    modelContextSafe: !projectedIdWasAliased || !originalIdAppearsInMessages,
     modelToolPairBound: toolUse.id === toolResult.toolUseId,
     deterministicProjection: repeatedId === projectedId,
     providerInvoked: false,
@@ -496,7 +507,7 @@ async function runChildWaitLoop(lease, restored, responseForStep, hooks = {}) {
     if (hooks.beforeReplayExecution) await hooks.beforeReplayExecution(input)
     if (input.call.toolName === "fixture_noop") return { id: input.call.id, toolName: input.call.toolName,
       toolVersion: "1", status: "completed", output: { accepted: true }, errorCode: null }
-    const secondWaitCallId = `fixture-second-source-wait:${lease.id}:attempt:${lease.attemptCount}`
+    const secondWaitCallId = "fixture-second-source-wait-call"
     if (ids.secondTargetTaskId && input.call.id === secondWaitCallId
       && input.stepId !== `task:${lease.id}:step:0:attempt:${lease.attemptCount}`) {
       const wait = await registerDurableSubagentWait(pool, { lease, stepId: input.stepId, targetTaskIds: [ids.secondTargetTaskId],
@@ -766,7 +777,7 @@ async function resumeChildThroughLoop(lease, phase, preloadedRestored) {
     if (phase === "two-waits" && stepId === `task:${lease.id}:step:${logicalStepOrdinal + 1}:attempt:${lease.attemptCount}`) {
       if (!ids.secondTargetTaskId) throw new Error("fixture_second_wait_target_missing")
       return { usage: { inputTokens: 0, outputTokens: 0, estimatedCostUsd: 0 }, toolCalls: [{
-        id: `fixture-second-source-wait:${lease.id}:attempt:${lease.attemptCount}`, name: "wait_subagents", arguments: {
+        id: "fixture-second-source-wait-call", name: "wait_subagents", arguments: {
           taskIds: [ids.secondTargetTaskId], mode: "any", timeoutMs: 30_000,
           idempotencyKey: `api_key=source-wait-secret-${lease.id}-attempt-${lease.attemptCount}-second`,
         },

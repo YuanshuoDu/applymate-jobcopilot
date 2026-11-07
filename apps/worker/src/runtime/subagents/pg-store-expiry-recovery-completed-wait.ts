@@ -7,7 +7,7 @@ type Row = Record<string, unknown>
 type Scope = Readonly<{ id: string; userId: string; sessionId: string; turnId: string; rootTaskId: string; ownerId: string; attemptCount: number; leaseExpiresAt: Date }>
 type Candidate = Readonly<{ waitId: string; sourceStepId: string; sourceAttempt: number; continuationStepId: string; continuationOrdinal: number; continuationWaitCallCount: number }>
 
-function completedStepEventSql(owner: "owner" | "task"): string { return `(SELECT COUNT(*) FROM "agent_events" AS completedEvent
+function completedStepEventSql(owner: "owner" | "task"): string { return `((SELECT COUNT(*) FROM "agent_events" AS completedEvent
   WHERE completedEvent."sessionId" = ${owner}."sessionId" AND completedEvent."turnId" = ${owner}."turnId" AND completedEvent."taskId" = ${owner}."id"
     AND completedEvent."type" = 'step.completed' AND completedEvent."actor" = 'subagent' AND completedEvent."itemId" IS NULL
     AND completedEvent."correlationId" = continuation."id"
@@ -18,7 +18,7 @@ function completedStepEventSql(owner: "owner" | "task"): string { return `(SELEC
         AND completedEvent."payload"->>'toolCallCount' ~ '^(0|[1-9][0-9]?)$'
         AND (completedEvent."payload"->>'toolCallCount')::integer BETWEEN 0 AND 32
         AND completedEvent."payload" = jsonb_build_object('stepId', continuation."id", 'status', 'completed',
-          'toolCallCount', completedEvent."payload"->'toolCallCount', 'taskId', ${owner}."id"))) = 1)` }
+          'toolCallCount', completedEvent."payload"->'toolCallCount', 'taskId', ${owner}."id")))) = 1)` }
 
 const COMPLETED_SUCCESSOR_SQL = `EXISTS (SELECT 1 FROM "agent_wait_conditions" AS completedWait
   JOIN "agent_steps" AS source ON source."id" = completedWait."stepId" AND source."sessionId" = completedWait."sessionId"

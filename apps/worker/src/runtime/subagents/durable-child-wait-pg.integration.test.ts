@@ -1597,6 +1597,109 @@ type BlockingTaskSnapshot = {
   leaseOwner: string | null; attemptCount: number; leaseExpiresAt: Date | null
 }
 type BlockingTaskRow = Omit<BlockingTaskSnapshot, "userId">
+type RecoveredHandoffDiagnosticEvent = { id: string; sequence: string; type: string; actor: string; itemId: string | null;
+  correlationId: string; causationId: string | null; idempotencyKey: string }
+
+async function diagnoseRecoveredHandoffProjection(client: PoolClient, task: BlockingTaskSnapshot,
+  projections: Awaited<ReturnType<typeof readChildWaitTerminalCallProjections>>, waitId: string | undefined,
+  sourceStepId: string, continuationStepId: string, sourceCallId: string, sourceCallItemId: string, sourceResultItemId: string) {
+  const matching = projections.filter(projection => projection.sourceWait.waitId === waitId && projection.sourceWait.claimKeyDigest === null)
+  const projectionKind = matching.length !== 1 ? matching.length === 0 ? "missing" : "ambiguous"
+    : matching[0]?.sourceStepHandoff ? "handoff" : matching[0]?.sourceStepPrefix ? "prefix" : "no_prefix"
+  const args = { stepId: sourceStepId, attempt: 1, callItemId: sourceCallItemId, callId: sourceCallId,
+    resultItemId: sourceResultItemId, waitKind: "recovered" as const }
+  const sourceScope = { ...task, leaseOwner: task.leaseOwner ?? undefined, leaseExpiresAt: task.leaseExpiresAt ?? undefined }
+  let defaultPrefixPresent = false, recoveredPrefixPresent = false, nestedContinuationPresent = false
+  try { defaultPrefixPresent = Boolean(await readCanonicalHistoricalSourceStepPrefix(client, sourceScope, args)) } catch { /* fixed diagnostic only */ }
+  let recoveredPrefix: Awaited<ReturnType<typeof readCanonicalHistoricalSourceStepPrefix>> = null
+  try {
+    recoveredPrefix = await readCanonicalHistoricalSourceStepPrefix(client, sourceScope, { ...args, terminalMode: "recovered_handoff" })
+    recoveredPrefixPresent = Boolean(recoveredPrefix)
+    nestedContinuationPresent = Boolean(recoveredPrefix?.continuationPrefix)
+  } catch { /* fixed diagnostic only */ }
+
+  const [steps, items, anchors, parentRows] = await Promise.all([
+    client.query<{ sourceStatus: string | null; continuationStatus: string | null; sourceCount: number; continuationCount: number }>(
+      `SELECT (SELECT "status" FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = $4) AS "sourceStatus",
+        (SELECT "status" FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = $5) AS "continuationStatus",
+        (SELECT COUNT(*)::int FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = $4) AS "sourceCount",
+        (SELECT COUNT(*)::int FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = $5) AS "continuationCount"`,
+      [task.sessionId, task.turnId, task.id, sourceStepId, continuationStepId]),
+    client.query<{ id: string; content: unknown }>(`SELECT "id", "content" FROM "agent_items"
+      WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = $4 AND "type" = 'tool_call'
+      ORDER BY "createdAt", "id" LIMIT 3`, [task.sessionId, task.turnId, task.id, continuationStepId]),
+    client.query<RecoveredHandoffDiagnosticEvent>(`SELECT "id", "sequence"::text AS "sequence", "type", "actor", "itemId",
+        "correlationId", "causationId", "idempotencyKey" FROM "agent_events"
+      WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "idempotencyKey" = ANY($4::text[]) LIMIT 2`,
+    [task.sessionId, task.turnId, task.id, [`task:${task.id}:event:step-started:${sourceStepId}`,
+      `task:${task.id}:event:tool-result-completed:${sourceCallId}:${sourceResultItemId}:1`]]),
+    client.query<RecoveredHandoffDiagnosticEvent>(`SELECT "id", "sequence"::text AS "sequence", "type", "actor", "itemId",
+        "correlationId", "causationId", "idempotencyKey" FROM "agent_events"
+      WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "idempotencyKey" = $4 LIMIT 2`,
+    [task.sessionId, task.turnId, task.id, `task:${task.id}:event:turn-started`]),
+  ])
+  const source = steps.rows[0], sourceCount = Number(source?.sourceCount ?? 0), continuationCount = Number(source?.continuationCount ?? 0)
+  const statusClass = (value: string | null | undefined): "waiting_for_tool" | "streaming" | "completed" | "other" | "missing" =>
+    value === "waiting_for_tool" || value === "streaming" || value === "completed" ? value : value ? "other" : "missing"
+  const sourceStatus = statusClass(source?.sourceStatus), continuationStatus = statusClass(source?.continuationStatus)
+  const continuationItemCount = items.rows.length
+  const call = items.rows.length === 1 ? asObject(items.rows[0]?.content) : {}
+  const continuationCallId = typeof call.toolCallId === "string" ? call.toolCallId : null
+  const agendaKey = cognitiveAgendaReceiptIdempotencyKey(continuationStepId)
+  const continuationItemId = items.rows.length === 1 ? items.rows[0]?.id : null
+  const continuationKeys = continuationCallId && continuationItemId && agendaKey ? [
+    `task:${task.id}:event:step-started:${continuationStepId}`, `task:${task.id}:event:${agendaKey}`,
+    `task:${task.id}:event:model-started:${continuationStepId}`, `task:${task.id}:event:model-completed:${continuationStepId}`,
+    `task:${task.id}:event:model-usage:${continuationStepId}`, `task:${task.id}:event:item-started:${continuationItemId}`,
+    `task:${task.id}:event:child-wait-claim:${task.attemptCount}:${continuationStepId}`,
+  ] : []
+  let sourceWindowEvents: RecoveredHandoffDiagnosticEvent[] = []
+  let sourceWindowAnchored = false
+  const startEvent = anchors.rows.find(event => event.idempotencyKey === `task:${task.id}:event:step-started:${sourceStepId}`)
+  const endEvent = anchors.rows.find(event => event.idempotencyKey === `task:${task.id}:event:tool-result-completed:${sourceCallId}:${sourceResultItemId}:1`)
+  try {
+    if (anchors.rows.length === 2 && startEvent && endEvent && BigInt(startEvent.sequence) < BigInt(endEvent.sequence)) {
+      const window = await client.query<RecoveredHandoffDiagnosticEvent>(`SELECT event."id", event."sequence"::text AS "sequence", event."type", event."actor", event."itemId",
+          event."correlationId", event."causationId", event."idempotencyKey" FROM "agent_events" AS event
+        WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."taskId" = $3 AND event."sequence" BETWEEN $4::bigint AND $5::bigint
+        ORDER BY event."sequence" LIMIT 320`, [task.sessionId, task.turnId, task.id, startEvent.sequence, endEvent.sequence])
+      sourceWindowEvents = window.rows
+      sourceWindowAnchored = sourceWindowEvents[0]?.id === startEvent.id && sourceWindowEvents.at(-1)?.id === endEvent.id
+    }
+  } catch { /* fixed diagnostic only */ }
+  const globalKeyRows = continuationKeys.length ? await client.query<{ idempotencyKey: string; boundedCount: number }>(`SELECT event."idempotencyKey",
+      LEAST(COUNT(*), 2)::int AS "boundedCount" FROM "agent_events" AS event
+    WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."taskId" = $3 AND event."idempotencyKey" = ANY($4::text[])
+    GROUP BY event."idempotencyKey"`, [task.sessionId, task.turnId, task.id, continuationKeys])
+    : { rows: [] as Array<{ idempotencyKey: string; boundedCount: number }> }
+  const uniquePersistedKeyCount = continuationKeys.filter(key =>
+    globalKeyRows.rows.find(row => row.idempotencyKey === key)?.boundedCount === 1).length
+  const windowKeyRows = continuationKeys.map(key => sourceWindowEvents.filter(event => event.idempotencyKey === key))
+  const uniqueWindowKeyCount = windowKeyRows.filter(rows => rows.length === 1).length
+  const continuationEvents = windowKeyRows.map(rows => rows[0]).filter((event): event is RecoveredHandoffDiagnosticEvent => Boolean(event))
+  const orderedContinuationChain = continuationEvents.length === continuationKeys.length
+    && continuationEvents.every((event, index) => index === 0 || BigInt(event.sequence) > BigInt(continuationEvents[index - 1]!.sequence))
+  const continuationCausationChain = continuationEvents.length === continuationKeys.length
+    && continuationEvents.slice(1).every((event, index) => event.causationId === continuationEvents[index]!.id)
+  const taskParent = parentRows.rows.length === 1 ? parentRows.rows[0] : null
+  const continuationStartsAtTaskParent = Boolean(taskParent && continuationEvents[0]?.causationId === taskParent.id)
+  const continuationIdSet = new Set(continuationEvents.map(event => event.id))
+  const unexpectedContinuationWindowEvents = sourceWindowEvents.filter(event => (event.correlationId === continuationStepId
+    || Boolean(continuationItemId && event.itemId === continuationItemId)
+    || Boolean(continuationCallId && event.correlationId === continuationCallId)
+    || continuationIdSet.has(event.causationId ?? "")) && !continuationIdSet.has(event.id)).length
+  const allowedStatuses = new Set(["waiting_for_tool", "streaming", "completed", "missing"])
+  return {
+    projectionKind, defaultPrefixPresent, recoveredPrefixPresent, nestedContinuationPresent,
+    sourceStepCount: sourceCount, sourceStatus: allowedStatuses.has(sourceStatus) ? sourceStatus : "other",
+    continuationStepCount: continuationCount, continuationStatus: allowedStatuses.has(continuationStatus) ? continuationStatus : "other",
+    continuationItemCount, continuationKeyCount: continuationKeys.length, uniquePersistedKeyCount, uniqueWindowKeyCount,
+    sourceWindowEventCount: sourceWindowEvents.length, sourceWindowAnchored,
+    orderedContinuationChain, continuationCausationChain, continuationStartsAtTaskParent,
+    unexpectedContinuationWindowEventCount: unexpectedContinuationWindowEvents,
+  }
+}
+
 let historicalWaitDiagnosticSavepointOrdinal = 0
 
 async function withHistoricalWaitDiagnosticSavepoint<T>(client: PoolClient, probe: () => Promise<T>): Promise<T | undefined> {
@@ -5788,7 +5891,15 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         const sourceWaitId = repaired.wait?.id
         const handoffSource = projections.find(projection => projection.sourceWait.waitId === sourceWaitId
           && projection.sourceWait.claimKeyDigest === null)
-        expect(handoffSource?.sourceStepHandoff?.schemaVersion).toBe("recovered_wait_handoff.v2")
+        let handoffDiagnostic: unknown
+        if (handoffSource?.sourceStepHandoff?.schemaVersion !== "recovered_wait_handoff.v2") {
+          try {
+            handoffDiagnostic = await diagnoseRecoveredHandoffProjection(checkClient, snapshot, projections, sourceWaitId, sourceStepId,
+              continuationStepId, PHONE_SHAPED_WAIT_TOOL_CALL_ID, repaired.call!.id, repaired.results[0]!.id)
+          } catch { handoffDiagnostic = { diagnosticStatus: "unavailable" } }
+        }
+        expect(handoffSource?.sourceStepHandoff?.schemaVersion,
+          `bounded recovered-handoff diagnostic: ${JSON.stringify(handoffDiagnostic)}`).toBe("recovered_wait_handoff.v2")
         expect(handoffSource?.sourceStepHandoff?.sourceStepPrefix.items).toHaveLength(4)
         if (!handoffSource?.sourceStepHandoff) throw new Error("prior-tool recovered handoff projection missing")
         expect(handoffSource.stepId).toBe(sourceStepId)
