@@ -94,7 +94,7 @@ export const HISTORICAL_SOURCE_WAIT_HANDOFF_SQL = `CASE WHEN jsonb_typeof(${hand
     AND proof.value->'sourceWait'->>'sourceKind' = 'recovered'
     AND ${sourcePrefixBinding(`${handoff}->'sourceStepPrefix'`)}
     AND (SELECT COUNT(*) FROM jsonb_array_elements(${handoffEvents}) AS anchor(value)
-      JOIN jsonb_array_elements(${sourcePrefixEventsInHandoff}) AS full(value) ON anchor.value = full.value) = 6
+      JOIN jsonb_array_elements(${sourcePrefixEventsInHandoff}) AS fullEvent(value) ON anchor.value = fullEvent.value) = 6
     AND ${handoffEvents}->0->>'type' = 'step.started' AND ${handoffEvents}->0->>'idempotencyKey' = ${anchorKey('step-started:')}
     AND ${handoffEvents}->1->>'type' = 'cognitive.agenda' AND ${handoffEvents}->1->>'idempotencyKey' = 'task:' || owner."id" || ':event:' || ${agendaKey}
     AND ${handoffEvents}->2->>'type' = 'model.started' AND ${handoffEvents}->2->>'idempotencyKey' = ${anchorKey('model-started:')}

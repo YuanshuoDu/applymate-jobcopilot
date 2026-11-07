@@ -30,6 +30,8 @@ describe("historical source lifecycle SQL binding", () => {
     expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain("chain.value->>'causationId' = chain.\"previousId\"")
     expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain("'ordinal', boundSource.\"ordinal\"")
     expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain("modelDone.\"payload\"->>'toolCallCount'")
+    expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain("AS fullEvent(value) ON anchor.value = fullEvent.value")
+    expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).not.toContain("AS full(value)")
     expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain("COUNT(DISTINCT callItem.\"content\"->>'toolCallId')")
     expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain("COUNT(DISTINCT started.\"correlationId\")")
     expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain("sourceItemStarted.\"id\"")
