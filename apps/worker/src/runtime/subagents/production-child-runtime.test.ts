@@ -1008,11 +1008,18 @@ describe("production child runtime", () => {
   it("uses the server-owned default resume loader for a recovered attempt", async () => {
     const child = { ...lease(), attemptCount: 2, leaseExpiresAt: new Date("2099-09-14T12:00:00.000Z") }
     const client = {
-      query: vi.fn(async (sql: string) => {
+      query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
         if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK" || sql.includes("set_config")) return { rows: [], rowCount: 0 }
-        if (sql.includes('SELECT task."id"')) return {
-          rows: [{ id: child.id, userId: child.userId, sessionId: child.sessionId, turnId: child.turnId, rootTaskId: child.rootTaskId, status: "running", leaseOwner: child.ownerId, attemptCount: child.attemptCount, leaseExpiresAt: child.leaseExpiresAt, interruptRequestedAt: null, turnStatus: "in_progress", rootStatus: "running" }], rowCount: 1,
-        }
+        if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return values[0] === child.sessionId && values[1] === child.userId
+          ? { rows: [{ id: child.sessionId }], rowCount: 1 } : { rows: [], rowCount: 0 }
+        if (sql.includes('SELECT task."id"')) return values[0] === child.id && values[1] === child.sessionId && values[2] === child.turnId
+          && values[3] === child.rootTaskId && values[4] === child.userId ? {
+          rows: [{ id: child.id, userId: child.userId, sessionId: child.sessionId, turnId: child.turnId, rootTaskId: child.rootTaskId, parentTaskId: child.parentTaskId, status: "running", leaseOwner: child.ownerId, attemptCount: child.attemptCount, leaseExpiresAt: child.leaseExpiresAt, interruptRequestedAt: null, turnStatus: "in_progress", rootStatus: "running" }], rowCount: 1,
+        } : { rows: [], rowCount: 0 }
+        if (sql.includes('SELECT "id", "stepId" FROM "agent_wait_conditions"')) return { rows: [], rowCount: 0 }
+        if (sql.includes('SELECT "id" FROM "sub_agent_tasks"') && sql.includes("FOR UPDATE")) return values[0] === child.id && values[1] === child.sessionId
+          && values[2] === child.turnId && values[3] === child.rootTaskId && values[4] === child.ownerId && values[5] === child.attemptCount
+          ? { rows: [{ id: child.id }], rowCount: 1 } : { rows: [], rowCount: 0 }
         if (sql.includes('FROM "agent_steps"')) return { rows: [], rowCount: 0 }
         throw new Error(`unexpected resume query: ${sql}`)
       }),
@@ -1041,8 +1048,18 @@ describe("production child runtime", () => {
     })
     if (!executor) throw new Error("child executor was not created")
     await expect(executor({ lease: child })).resolves.toMatchObject({ status: "completed" })
-    expect(poolWithConnect.connect).toHaveBeenCalledTimes(2)
+    expect(poolWithConnect.connect).toHaveBeenCalledTimes(3)
     expect(client.query.mock.calls.map(([sql]) => sql)).toContain("SELECT set_config($1, $2, true)")
+    const queries = client.query.mock.calls.map(([sql]) => sql)
+    const sessionLock = queries.findIndex(sql => sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE"))
+    const taskLock = queries.findIndex(sql => sql.includes('SELECT task."id"') && sql.includes('task."parentTaskId"'))
+    const consumedWaitScan = queries.findIndex(sql => sql.includes('SELECT "id", "stepId" FROM "agent_wait_conditions"'))
+    expect(sessionLock).toBeGreaterThan(-1)
+    expect(taskLock).toBeGreaterThan(sessionLock)
+    expect(consumedWaitScan).toBeGreaterThan(taskLock)
+    expect(client.query.mock.calls[sessionLock]?.[1]).toEqual([child.sessionId, child.userId])
+    expect(client.query.mock.calls[taskLock]?.[1]).toEqual([child.id, child.sessionId, child.turnId, child.rootTaskId, child.userId])
+    expect(client.query.mock.calls[consumedWaitScan]?.[1]).toEqual([child.id, 257])
   })
 
   it("uses the server-owned same-attempt loader and forwards mailbox continuation in production", async () => {
@@ -1064,11 +1081,19 @@ describe("production child runtime", () => {
       query: vi.fn(async (sql: string, values: readonly unknown[] = []) => {
         queries.push({ sql, values })
         if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql) || sql.includes("set_config")) return { rows: [], rowCount: 0 }
-        if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR SHARE")) return { rows: [{ id: child.sessionId }], rowCount: 1 }
+        if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR UPDATE")) return values[0] === child.sessionId && values[1] === child.userId
+          ? { rows: [{ id: child.sessionId }], rowCount: 1 } : { rows: [], rowCount: 0 }
+        if (sql.includes('FROM "agent_sessions"') && sql.includes("FOR SHARE")) return values[0] === child.sessionId && values[1] === child.userId
+          ? { rows: [{ id: child.sessionId }], rowCount: 1 } : { rows: [], rowCount: 0 }
+        if (sql.includes('SELECT "id", "stepId" FROM "agent_wait_conditions"')) return { rows: [], rowCount: 0 }
         if (sql.includes('FROM "agent_wait_conditions" AS wait')) return { rows: [], rowCount: 0 }
-        if (sql.includes('SELECT task."id"')) return { rows: [{ id: child.id, userId: child.userId, sessionId: child.sessionId, turnId: child.turnId,
-          rootTaskId: child.rootTaskId, status: "running", leaseOwner: child.ownerId, attemptCount: child.attemptCount, leaseExpiresAt: refreshedExpiry,
-          interruptRequestedAt: null, turnStatus: "in_progress", rootStatus: "running" }], rowCount: 1 }
+        if (sql.includes('SELECT task."id"')) return values[0] === child.id && values[1] === child.sessionId && values[2] === child.turnId
+          && values[3] === child.rootTaskId && values[4] === child.userId ? { rows: [{ id: child.id, userId: child.userId, sessionId: child.sessionId, turnId: child.turnId,
+            rootTaskId: child.rootTaskId, parentTaskId: child.parentTaskId, status: "running", leaseOwner: child.ownerId, attemptCount: child.attemptCount, leaseExpiresAt: refreshedExpiry,
+            interruptRequestedAt: null, turnStatus: "in_progress", rootStatus: "running" }], rowCount: 1 } : { rows: [], rowCount: 0 }
+        if (sql.includes('SELECT "id" FROM "sub_agent_tasks"') && sql.includes("FOR UPDATE")) return values[0] === child.id && values[1] === child.sessionId
+          && values[2] === child.turnId && values[3] === child.rootTaskId && values[4] === child.ownerId && values[5] === child.attemptCount
+          ? { rows: [{ id: child.id }], rowCount: 1 } : { rows: [], rowCount: 0 }
         if (sql.includes('FROM "agent_steps" AS step')) return { rows: sql.includes('step."attempt" = $6') ? [currentStep] : [], rowCount: sql.includes('step."attempt" = $6') ? 1 : 0 }
         if (sql.includes('FROM "agent_items" AS item')) return { rows: sql.includes('step."attempt" = $6') ? [completedCall, completedResult, finalItem] : [], rowCount: sql.includes('step."attempt" = $6') ? 3 : 0 }
         throw new Error(`unexpected same-attempt continuation query: ${sql}`)
@@ -1100,8 +1125,17 @@ describe("production child runtime", () => {
     if (!executor) throw new Error("child executor was not created")
     const continued = await executor({ lease: child, continuation: { kind: "mailbox_input_pending", missingMessageIds: [mailbox.id], observedMessageIds: [] } })
     if (continued.status !== "completed") throw new Error(`same-attempt continuation outcome: ${JSON.stringify(continued)}`)
-    expect(poolConnect).toHaveBeenCalledOnce()
+    expect(poolConnect).toHaveBeenCalledTimes(2)
     expect(queries.some(query => query.sql.includes("FOR SHARE"))).toBe(true)
+    const sessionLock = queries.findIndex(query => query.sql.includes('FROM "agent_sessions"') && query.sql.includes("FOR UPDATE"))
+    const taskLock = queries.findIndex(query => query.sql.includes('SELECT task."id"') && query.sql.includes('task."parentTaskId"'))
+    const consumedWaitScan = queries.findIndex(query => query.sql.includes('SELECT "id", "stepId" FROM "agent_wait_conditions"'))
+    expect(sessionLock).toBeGreaterThan(-1)
+    expect(taskLock).toBeGreaterThan(sessionLock)
+    expect(consumedWaitScan).toBeGreaterThan(taskLock)
+    expect(queries[sessionLock]?.values).toEqual([child.sessionId, child.userId])
+    expect(queries[taskLock]?.values).toEqual([child.id, child.sessionId, child.turnId, child.rootTaskId, child.userId])
+    expect(queries[consumedWaitScan]?.values).toEqual([child.id, 257])
     expect(queries.find(query => query.sql.includes('FROM "agent_steps" AS step') && query.sql.includes('step."attempt" = $6'))?.values)
       .toEqual([child.id, child.sessionId, child.turnId, child.userId, child.rootTaskId, child.attemptCount])
     expect(ordinals).toEqual([1])

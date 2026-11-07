@@ -160,7 +160,7 @@ function replayMatches(row: Row, input: RegisterDurableSubagentWaitInput, ids: r
 
 export type ExpiredWaitRegistration = Readonly<{ registered: true } | { rejectedCallId: string }>
 export async function recoverExpiredWaitRegistration(client: Queryable, lease: RegisterDurableSubagentWaitInput["lease"], now: Date): Promise<ExpiredWaitRegistration | undefined> {
-  const rows = (await client.query<Row>(`SELECT started."id" AS "eventId", started."createdAt", task."role", task."allowedActions", step."id" AS "stepId", call."content"
+  const rows = (await client.query<Row>(`SELECT started."id" AS "eventId", started."createdAt", started."idempotencyKey" AS "eventIdempotencyKey", task."role", task."allowedActions", step."id" AS "stepId", call."content"
     FROM "sub_agent_tasks" AS task JOIN "agent_sessions" AS session ON session."id" = task."sessionId" AND session."userId" = $2 AND ${OPEN_SESSION} JOIN "agent_steps" AS step ON step."taskId" = task."id" AND step."sessionId" = task."sessionId" AND step."turnId" = task."turnId" JOIN "agent_items" AS call ON call."stepId" = step."id" AND call."taskId" = task."id" AND call."sessionId" = task."sessionId" JOIN "agent_events" AS started ON started."itemId" = call."id" AND started."sessionId" = task."sessionId" AND started."turnId" = task."turnId" AND started."taskId" = task."id"
     WHERE task."id" = $1 AND task."sessionId" = $3 AND task."turnId" = $4 AND task."rootTaskId" = $5 AND task."parentTaskId" IS NOT NULL AND task."status" = 'running' AND task."leaseOwner" = $6 AND task."attemptCount" = $7 AND task."leaseExpiresAt" = $8 AND task."leaseExpiresAt" <= $9 AND task."interruptRequestedAt" IS NULL
       AND step."attempt" = $7 AND step."status" = 'streaming' AND step."ordinal" = (SELECT MAX(current."ordinal") FROM "agent_steps" AS current WHERE current."taskId" = $1 AND current."sessionId" = $3 AND current."turnId" = $4 AND current."attempt" = $7)
@@ -171,6 +171,9 @@ export async function recoverExpiredWaitRegistration(client: Queryable, lease: R
   [lease.id, lease.userId, lease.sessionId, lease.turnId, lease.rootTaskId, lease.ownerId, lease.attemptCount, lease.leaseExpiresAt, now])).rows
   if (rows.length !== 1) return undefined
   const row = rows[0]!, call = object(row.content), input = object(call.input), eventId = String(row.eventId), reject = (): ExpiredWaitRegistration => ({ rejectedCallId: eventId })
+  const claimKey = `task:${lease.id}:event:child-wait-claim:${lease.attemptCount}:${String(row.stepId)}`
+  if (row.eventIdempotencyKey === claimKey || typeof call.toolCallId !== "string" || !call.toolCallId.trim()
+    || row.eventIdempotencyKey !== `task:${lease.id}:event:tool-started:${call.toolCallId}`) return undefined
   if (!canManageChildrenWithWaitAction(getSubagentRolePolicy(String(row.role)), row.allowedActions) || Object.keys(input).sort().join(",") !== "idempotencyKey,mode,taskIds,timeoutMs"
     || typeof input.idempotencyKey !== "string" || !(input.mode === "any" || input.mode === "all") || !Number.isSafeInteger(input.timeoutMs)
     || Number(input.timeoutMs) < 1 || Number(input.timeoutMs) > MAX_WAIT_MS || !Array.isArray(input.taskIds) || input.taskIds.some(id => typeof id !== "string")) return reject()

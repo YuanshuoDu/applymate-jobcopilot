@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
 
+import { projectWaitCallCompletionPayload } from "../turns/turn-execution-wait-event-projection.js"
 import { childWaitClaimEventKey } from "./child-durable-wait-replay.js"
 import { loadChildWaitCallRecovery } from "./child-resume-wait-call-recovery.js"
 import type { DurableWaitResume } from "./child-resume-observations.js"
@@ -22,7 +23,7 @@ const wait: DurableWaitResume = {
 
 function fixture(options: { claimed?: boolean; extraCall?: boolean; orphanResult?: boolean; orphanStartedEvent?: boolean;
   modelCallCount?: number; completedCallWithoutEvent?: boolean; missingItemStarted?: boolean; completeLifecycle?: boolean;
-  modelCost?: number; storedCost?: number } = {}) {
+  projectedCompletion?: boolean; modelCost?: number; storedCost?: number } = {}) {
   const calls: Row[] = [], results: Row[] = [], events: Row[] = []
   const stepId = wait.continuationStepId!, claimKey = `task:${lease.id}:event:${childWaitClaimEventKey(wait.attempt, stepId)}`
   const step = { id: stepId, status: options.completeLifecycle ? "completed" : "streaming", attempt: wait.attempt, ordinal: wait.continuationOrdinal,
@@ -57,11 +58,13 @@ function fixture(options: { claimed?: boolean; extraCall?: boolean; orphanResult
       events.push(claimEvent)
     }
     if (options.completeLifecycle) {
+      const rawPayload = { itemId: id, status: "completed", content: { toolCallId: callId, toolName: "wait_subagents", toolVersion: "1",
+        input: wait.input, status: "completed", errorCode: null } }
+      const payload = options.projectedCompletion ? projectWaitCallCompletionPayload(rawPayload, id) : rawPayload
       const completeItem: Row = { id: `event-${callId}-item-completed`, sequence: String(events.length + 1), sessionId: lease.sessionId,
         turnId: lease.turnId, taskId: lease.id, itemId: id, type: "item.completed", actor: "subagent", correlationId: id,
         causationId: claimEvent!.id, idempotencyKey: `task:${lease.id}:event:tool-call-completed:${callId}:${id}:1`,
-        payload: { itemId: id, status: "completed", content: { toolCallId: callId, toolName: "wait_subagents", toolVersion: "1",
-          input: wait.input, status: "completed", errorCode: null } } }
+        payload }
       events.push(completeItem)
       const finished: Row = { id: `event-${callId}-tool-finished`, sequence: String(events.length + 1), sessionId: lease.sessionId,
         turnId: lease.turnId, taskId: lease.id, itemId: id, type: "tool_call.completed", actor: "subagent", correlationId: callId,
@@ -129,7 +132,35 @@ describe("child resume wait-call recovery", () => {
     expect(fake.events.some(event => event.type === "item.completed" && event.itemId === fake.claimedId)).toBe(false)
   })
 
-  it("matches a completed step against the PostgreSQL-rounded receipt cost", async () => {
+  it("accepts the canonical projected completion payload while keeping private call input exact", async () => {
+    const fake = fixture({ claimed: true, completeLifecycle: true, projectedCompletion: true, modelCost: 0.0042, storedCost: 0.0042 })
+    const restored = await loadChildWaitCallRecovery(fake.client as never, lease, wait)
+    expect(restored?.claim).toMatchObject({ call: { id: fake.callId }, callItem: { status: "completed", revision: 1 } })
+    const completion = fake.events.find(event => event.type === "item.completed" && event.itemId === fake.claimedId)!
+    expect(completion.payload).toMatchObject({ content: { input: {
+      idempotencyKey: "[REDACTED]", taskIds: ["[REDACTED]", "[REDACTED]"], mode: "all", timeoutMs: 5_000,
+    } } })
+    expect(JSON.stringify(completion.payload)).not.toContain("wait-key")
+    expect(JSON.stringify(completion.payload)).not.toContain("leaf-a")
+    expect(fake.calls[0]?.content).toMatchObject({ input: wait.input })
+  })
+
+  it("rejects a tampered canonical completion payload or misbound completion event", async () => {
+    const tampered = fixture({ claimed: true, completeLifecycle: true, projectedCompletion: true, modelCost: 0.0042, storedCost: 0.0042 })
+    const tamperedEvent = tampered.events.find(event => event.type === "item.completed" && event.itemId === tampered.claimedId)!
+    const payload = tamperedEvent.payload as Row
+    const content = payload.content as Row
+    const input = content.input as Row
+    content.input = { ...input, mode: "any" }
+    await expect(loadChildWaitCallRecovery(tampered.client as never, lease, wait)).rejects.toThrow("child_resume_wait_tool_call_conflict")
+
+    const misbound = fixture({ claimed: true, completeLifecycle: true, projectedCompletion: true, modelCost: 0.0042, storedCost: 0.0042 })
+    const misboundEvent = misbound.events.find(event => event.type === "item.completed" && event.itemId === misbound.claimedId)!
+    misboundEvent.causationId = "unrelated-event"
+    await expect(loadChildWaitCallRecovery(misbound.client as never, lease, wait)).rejects.toThrow("child_resume_wait_tool_call_conflict")
+  })
+
+  it("accepts the exact historical raw completion payload and matches PostgreSQL-rounded receipt cost", async () => {
     const fake = fixture({ claimed: true, completeLifecycle: true, modelCost: 0.123456789, storedCost: 0.12345679 })
     const restored = await loadChildWaitCallRecovery(fake.client as never, lease, wait)
     expect(restored?.claim?.modelUsage.estimatedCostUsd).toBe(0.123456789)

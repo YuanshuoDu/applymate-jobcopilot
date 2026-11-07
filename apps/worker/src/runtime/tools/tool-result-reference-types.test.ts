@@ -65,6 +65,28 @@ function largeScheduledPrepareReceipt(): RepositoryJsonValue {
 }
 
 describe("tool result reference runtime contract", () => {
+  it.each([
+    ["agent.wait", "wait-12345678-1234-4234-9234-123456789012", "turn"],
+    ["wait_subagents", "wait-12345678-1234-4234-9234-123456789012", "turn"],
+    ["wait_subagents", "12345678-1234-4234-9234-123456789012", "task"],
+  ] as const)("keeps the validated structural wait ID for %s owned by %s", (toolName, waitId, ownerKind) => {
+    const taskId = "subagent-12345678-1234-4234-9234-123456789012"
+    const source = toolName as CanonicalToolSourceName
+    const receipt = { waitId, status: "waiting", taskIds: [taskId], deadlineAt: "2026-10-30T12:00:00.000Z",
+      matchedTaskIds: [], tasks: [{ taskId, status: "waiting", role: "scout", result: null, failureReason: null }] }
+    expect(prepareToolResultJson(receipt, source, undefined, undefined, ownerKind).value).toMatchObject({ waitId })
+    const swapped = waitId.startsWith("wait-") ? "12345678-1234-4234-9234-123456789012" : "wait-12345678-1234-4234-9234-123456789012"
+    expect(() => prepareToolResultJson({ ...receipt, waitId: swapped }, source, undefined, undefined, ownerKind)).toThrowError(
+      expect.objectContaining({ code: "tool_result_invalid_json" }),
+    )
+  })
+
+  it("requires explicit owner provenance for durable wait references", () => {
+    const source = "wait_subagents" as CanonicalToolSourceName
+    const receipt = { waitId: "wait-12345678-1234-4234-9234-123456789012" }
+    expect(() => prepareToolResultJson(receipt, source)).toThrowError(expect.objectContaining({ code: "tool_result_invalid_json" }))
+  })
+
   it("canonicalizes source-sanitized bytes and verifies the stored digest before read", () => {
     const id = "00000000-0000-4000-8000-000000000001"
     const source = "jobs.search" as CanonicalToolSourceName
