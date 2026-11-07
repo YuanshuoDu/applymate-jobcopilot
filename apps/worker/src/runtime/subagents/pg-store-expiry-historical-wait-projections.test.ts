@@ -4,7 +4,7 @@ import { buildCognitiveActionAgenda } from "../turns/cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, cognitiveAgendaReceiptIdempotencyKey } from "../turns/cognitive-agenda-receipt.js"
 import type { StepContext } from "../context/step-context-builder.js"
 
-const mocks = vi.hoisted(() => ({ inspect: vi.fn(), chain: vi.fn(), prefix: vi.fn() }))
+const mocks = vi.hoisted(() => ({ inspect: vi.fn(), chain: vi.fn(), prefix: vi.fn(), pairDiagnostic: vi.fn() }))
 vi.mock("./child-resume-source-wait-lifecycle.js", () => ({ inspectChildWaitSourceLifecycle: mocks.inspect }))
 vi.mock("./pg-store-expiry-step-tool-chain-proof.js", async importOriginal => {
   const actual = await importOriginal<typeof import("./pg-store-expiry-step-tool-chain-proof.js")>()
@@ -14,9 +14,17 @@ vi.mock("./pg-store-expiry-historical-source-step-prefix.js", async importOrigin
   const actual = await importOriginal<typeof import("./pg-store-expiry-historical-source-step-prefix.js")>()
   return { ...actual, readCanonicalHistoricalSourceStepPrefix: mocks.prefix }
 })
+vi.mock("./pg-store-expiry-historical-wait-result-pair.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("./pg-store-expiry-historical-wait-result-pair.js")>()
+  return { ...actual, diagnoseWaitResultPair: (...args: Parameters<typeof actual.diagnoseWaitResultPair>) => {
+    mocks.pairDiagnostic(...args)
+    return actual.diagnoseWaitResultPair(...args)
+  } }
+})
 
 import { DurableSubagentWaitError, safeSubagentWaitJson } from "./durable-subagent-wait-store.js"
 import { MAX_HISTORICAL_SOURCE_WAITS, diagnoseChildWaitTerminalCallProjections, readChildWaitTerminalCallProjections } from "./pg-store-expiry-historical-wait-projections.js"
+import { CHILD_WAIT_RESULT_EVENTS_QUERY_SQL } from "./pg-store-expiry-historical-wait-result-pair.js"
 import { CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL } from "./pg-store-expiry-historical-wait-binding.js"
 
 const task = { id: "owner", sessionId: "session", turnId: "turn", rootTaskId: "root", userId: "user", leaseOwner: "lease-owner",
@@ -128,6 +136,7 @@ beforeEach(() => {
   mocks.inspect.mockClear()
   mocks.chain.mockReset()
   mocks.prefix.mockReset()
+  mocks.pairDiagnostic.mockClear()
   mocks.inspect.mockImplementation(async (...args: unknown[]) => {
     const row = args.find(value => !!value && typeof value === "object" && "sourceCallId" in value) as Record<string, unknown> | undefined
     return { state: "recovered", toolCallId: row?.sourceCallId, callItemId: row?.sourceCallItemId, sourceAttempt: 1,
@@ -166,6 +175,22 @@ describe("bounded historical wait projections", () => {
     expect(JSON.stringify(diagnostic)).not.toContain(source.idempotencyKey)
   })
 
+  it("reports result-pair rejection gates without persisted IDs or payloads", async () => {
+    const source = wait(1), claim = completedClaim(source, 1)
+    claim.resultEvents = [claim.resultEvents[0]!, { ...claim.resultEvents[0]!, id: "duplicate-start" }, claim.resultEvents[1]!]
+    const diagnostic = await diagnoseChildWaitTerminalCallProjections(client([source], [claim]) as never, task)
+    expect(mocks.pairDiagnostic).toHaveBeenCalledTimes(1)
+    expect(diagnostic.claimStages).toEqual([{ candidateOrdinal: 1, stage: "claim_result_pair_invalid", resultPair: {
+      eventCount: 3, startedKeyMatches: 2, completedKeyMatches: 1, otherKeyMatches: 0,
+      partitionValid: false, canonicalPairValid: false, eventIdsValid: false, startedIdentity: false, completedIdentity: true,
+      startedPayload: false, completedPayload: true, startedCausation: false, completedCausation: false, numericOrder: false,
+    } }])
+    const serialized = JSON.stringify(diagnostic)
+    expect(serialized).not.toContain(source.idempotencyKey)
+    expect(serialized).not.toContain(claim.row.resultItemId)
+    expect(serialized).not.toContain(JSON.stringify(claim.row.resultContent))
+  })
+
   it("projects two exact source waits and their independent completed claims", async () => {
     const sources = [wait(1), wait(2)], claims = sources.map((source, index) => completedClaim(source, index + 1))
     const db = client(sources, claims)
@@ -185,6 +210,12 @@ describe("bounded historical wait projections", () => {
     expect(completed.every(row => !row.sourceStepPrefix && row.sourceStepHandoff)).toBe(true)
     expect(mocks.prefix).toHaveBeenCalledTimes(4)
     expect(db.query.mock.calls[0]?.[0]).toContain('owner."sessionId" = $2')
+    expect(db.query.mock.calls.some(([sql]) => sql === CHILD_WAIT_RESULT_EVENTS_QUERY_SQL)).toBe(true)
+    const acceptedDiagnostic = await diagnoseChildWaitTerminalCallProjections(client(sources, claims) as never, task)
+    expect(acceptedDiagnostic.claimStages).toEqual([
+      { candidateOrdinal: 1, stage: "claim_accepted" }, { candidateOrdinal: 2, stage: "claim_accepted" },
+    ])
+    expect(mocks.pairDiagnostic).not.toHaveBeenCalled()
     expect(db.query.mock.calls[0]?.[0]).toContain(`LIMIT ${MAX_HISTORICAL_SOURCE_WAITS + 1}`)
     expect(db.query.mock.calls.map(([sql]) => sql).join("\n")).not.toMatch(unparenthesizedJsonExtractionAfterConcat)
   })

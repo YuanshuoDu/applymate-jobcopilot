@@ -1,47 +1,8 @@
-import { canonicalJson } from "@jobcopilot/shared"
 import { MAX_STEP_CHAIN_EVENTS, MAX_STEP_TOOL_CALLS, STEP_TOOL_CHAIN_AGENDA_JOIN_SQL, STEP_TOOL_CHAIN_AGENDA_WHERE_SQL,
   STEP_TOOL_CHAIN_MODEL_START_JOIN_SQL, STEP_TOOL_CHAIN_MODEL_START_WHERE_SQL, type StepToolChainProof } from "./pg-store-expiry-step-tool-chain-proof.js"
-type Event = Readonly<Record<string, unknown>>
+export { isCanonicalWaitResultPair, partitionWaitResultEvents } from "./pg-store-expiry-historical-wait-result-pair.js"
 const events = `CASE WHEN jsonb_typeof(proof.value->'stepToolChain'->'events') = 'array' THEN proof.value->'stepToolChain'->'events' ELSE '[]'::jsonb END`
 const calls = `CASE WHEN jsonb_typeof(proof.value->'stepToolChain'->'calls') = 'array' THEN proof.value->'stepToolChain'->'calls' ELSE '[]'::jsonb END`
-
-function record(value: unknown): Record<string, unknown> {
-  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
-}
-function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
-  const actual = Object.keys(value).sort(), expected = [...keys].sort()
-  return actual.length === expected.length && actual.every((key, index) => key === expected[index])
-}
-function sequence(value: unknown): bigint | null {
-  if (typeof value !== "string" || !/^\d+$/.test(value)) return null
-  try { return BigInt(value) } catch { return null }
-}
-function boundedString(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value
-}
-function sameJson(left: unknown, right: unknown): boolean {
-  try { return canonicalJson(left) === canonicalJson(right) } catch { return false }
-}
-export function partitionWaitResultEvents(rows: readonly Event[], keys: readonly string[]): { started: Event; completed: Event; extra?: Event } | null {
-  if (keys.length !== 2 || rows.length < 2 || rows.length > 3) return null
-  const started = rows.filter(row => row.idempotencyKey === keys[0]), completed = rows.filter(row => row.idempotencyKey === keys[1])
-  const extra = rows.filter(row => row.idempotencyKey !== keys[0] && row.idempotencyKey !== keys[1])
-  return started.length === 1 && completed.length === 1 && extra.length <= 1
-    ? { started: started[0]!, completed: completed[0]!, ...(extra[0] ? { extra: extra[0] } : {}) } : null
-}
-
-export function isCanonicalWaitResultPair(terminal: Event, started: Event, completed: Event,
-  resultItemId: string, stepId: string, content: Record<string, unknown>): boolean {
-  const terminalAt = sequence(terminal.sequence), startAt = sequence(started.sequence), completeAt = sequence(completed.sequence)
-  return boundedString(terminal.id) && boundedString(started.id) && boundedString(completed.id) && started.id !== completed.id
-    && terminal.type === "tool_call.completed" && started.type === "item.started" && started.actor === "subagent"
-    && started.itemId === resultItemId && started.correlationId === stepId && started.causationId === terminal.id
-    && sameJson(started.payload, { itemId: resultItemId, type: "tool_result", phase: null })
-    && completed.type === "item.completed" && completed.actor === "subagent" && completed.itemId === resultItemId
-    && completed.correlationId === resultItemId && completed.causationId === started.id
-    && sameJson(completed.payload, { itemId: resultItemId, status: "completed", content })
-    && Boolean(terminalAt && startAt && completeAt && terminalAt < startAt && startAt < completeAt)
-}
 
 const objectHasExactKeyCount = (expression: string, count: number) => `(CASE WHEN jsonb_typeof(${expression}) = 'object'
   THEN (SELECT COUNT(*) FROM jsonb_object_keys(${expression})) = ${count} ELSE FALSE END)`

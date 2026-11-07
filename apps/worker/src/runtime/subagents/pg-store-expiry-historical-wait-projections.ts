@@ -7,7 +7,8 @@ import { projectWaitCallEventContent } from "../turns/turn-execution-wait-event-
 import { cognitiveAgendaReceiptIdempotencyKey } from "../turns/cognitive-agenda-receipt.js"
 import { DurableSubagentWaitError, safeSubagentWaitJson, type DurableSubagentWaitResult } from "./durable-subagent-wait-store.js"
 import { inspectChildWaitSourceLifecycle } from "./child-resume-source-wait-lifecycle.js"
-import { isCanonicalWaitResultPair, partitionWaitResultEvents } from "./pg-store-expiry-step-completion-proof.js"
+import { CHILD_WAIT_RESULT_EVENTS_QUERY_SQL, diagnoseWaitResultPair, isCanonicalWaitResultPair, partitionWaitResultEvents,
+  type WaitResultPairDiagnostic } from "./pg-store-expiry-historical-wait-result-pair.js"
 import { exactKeys, readCanonicalWaitStepToolChain, record } from "./pg-store-expiry-step-tool-chain-proof.js"
 import { readCanonicalHistoricalSourceStepPrefix } from "./pg-store-expiry-historical-source-step-prefix.js"
 import type { HistoricalWaitBinding, RecoveredWaitHandoff, TerminalCallProjection } from "./pg-store-expiry-historical-wait-binding.js"
@@ -17,7 +18,7 @@ export const MAX_HISTORICAL_SOURCE_WAITS = 16
 export type HistoricalWaitClaimStage = Readonly<{ candidateOrdinal: number; stage:
   | "claim_rows_missing" | "claim_rows_ambiguous" | "claim_input_invalid" | "claim_call_identity_invalid"
   | "claim_result_invalid" | "claim_terminal_invalid" | "claim_result_pair_invalid"
-  | "claim_step_tool_chain_invalid" | "claim_projection_invalid" | "claim_accepted" }>
+  | "claim_step_tool_chain_invalid" | "claim_projection_invalid" | "claim_accepted"; resultPair?: WaitResultPairDiagnostic }>
 function sameJson(left: unknown, right: unknown): boolean { try { return canonicalJson(left) === canonicalJson(right) } catch { return false } }
 function strictWaitIds(value: unknown, allowEmpty = false): string[] | null {
   return Array.isArray(value) && value.length <= 8 && (allowEmpty || value.length > 0) && value.every(id => typeof id === "string" && id.length > 0 && id.length <= 256 && id.trim() === id)
@@ -89,15 +90,15 @@ export async function diagnoseChildWaitTerminalCallProjections(client: pg.PoolCl
   sourceProjectionCount: number; claimProjectionCount: number; claimStages: readonly HistoricalWaitClaimStage[]
 }> {
   const claimStages: HistoricalWaitClaimStage[] = []
-  const projections = await readChildWaitTerminalCallProjectionsCore(client, task, (candidateOrdinal, stage) => {
-    if (claimStages.length < MAX_HISTORICAL_SOURCE_WAITS) claimStages.push({ candidateOrdinal, stage })
+  const projections = await readChildWaitTerminalCallProjectionsCore(client, task, (candidateOrdinal, stage, resultPair) => {
+    if (claimStages.length < MAX_HISTORICAL_SOURCE_WAITS) claimStages.push({ candidateOrdinal, stage, ...(resultPair ? { resultPair } : {}) })
   })
   return { sourceProjectionCount: projections.filter(row => row.sourceWait.claimKeyDigest === null).length,
     claimProjectionCount: projections.filter(row => row.sourceWait.claimKeyDigest !== null).length, claimStages }
 }
 
 async function readChildWaitTerminalCallProjectionsCore(client: pg.PoolClient, task: Record<string, unknown>,
-  observeClaimStage?: (candidateOrdinal: number, stage: HistoricalWaitClaimStage["stage"]) => void): Promise<TerminalCallProjection[]> {
+  observeClaimStage?: (candidateOrdinal: number, stage: HistoricalWaitClaimStage["stage"], resultPair?: WaitResultPairDiagnostic) => void): Promise<TerminalCallProjection[]> {
   const id = task.id, sessionId = task.sessionId, turnId = task.turnId, rootTaskId = task.rootTaskId, userId = task.userId
   const ownerId = task.leaseOwner, attemptCount = task.attemptCount, leaseExpiresAt = dateValue(task.leaseExpiresAt)
   if (typeof id !== "string" || !id || typeof sessionId !== "string" || !sessionId || typeof turnId !== "string" || !turnId
@@ -163,7 +164,8 @@ async function readChildWaitTerminalCallProjectionsCore(client: pg.PoolClient, t
     if (!sourceProjection) continue
     projections.push({ ...sourceProjection, ...sourceStepEvidence })
     const candidateOrdinal = ++claimCandidateOrdinal
-    const reportClaimStage = (stage: HistoricalWaitClaimStage["stage"]): void => observeClaimStage?.(candidateOrdinal, stage)
+    const reportClaimStage = (stage: HistoricalWaitClaimStage["stage"], resultPair?: WaitResultPairDiagnostic): void =>
+      observeClaimStage?.(candidateOrdinal, stage, resultPair)
     const claimRows: { rows: Record<string, unknown>[] } = await client.query<Record<string, unknown>>(`SELECT claimStep."id" AS "stepId", claimStep."attempt", claimStep."status" AS "stepStatus",
         call."id" AS "callItemId", call."content" AS "callContent", call."status" AS "callStatus", call."revision" AS "callRevision", call."phase" AS "callPhase",
         callStart."id" AS "startEventId", callStart."sequence" AS "startSequence", sourceCall."content"->'input' AS "sourceInput",
@@ -214,13 +216,13 @@ async function readChildWaitTerminalCallProjectionsCore(client: pg.PoolClient, t
       reportClaimStage("claim_terminal_invalid"); continue
     }
     const resultKeys = [`task:${id}:event:item-started:${resultId}`, `task:${id}:event:tool-result-completed:${claimId}:${resultId}:1`]
-    const resultEvents = await client.query<Record<string, unknown>>(`SELECT "id", "type", "actor", "itemId", "correlationId", "causationId", "sequence", "idempotencyKey", "payload" FROM "agent_events"
-      WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND ("itemId" = $4 OR "correlationId" = $4 OR "idempotencyKey" = ANY($5::text[])
-        OR "causationId" IN (SELECT anchor."id" FROM "agent_events" AS anchor WHERE anchor."sessionId" = $1 AND anchor."turnId" = $2 AND anchor."taskId" = $3 AND anchor."idempotencyKey" = ANY($5::text[]))) ORDER BY "sequence" LIMIT 4`,
+    const resultEvents = await client.query<Record<string, unknown>>(CHILD_WAIT_RESULT_EVENTS_QUERY_SQL,
     [sessionId, turnId, id, resultId, resultKeys])
     const resultPair = partitionWaitResultEvents(resultEvents.rows, resultKeys)
     if (!resultPair || !isCanonicalWaitResultPair(terminal, resultPair.started, resultPair.completed, resultId, claimStepId, resultContent)) {
-      reportClaimStage("claim_result_pair_invalid"); continue
+      reportClaimStage("claim_result_pair_invalid", observeClaimStage
+        ? diagnoseWaitResultPair(resultEvents.rows, resultKeys, terminal, resultId, claimStepId, resultContent) : undefined)
+      continue
     }
     const { started: resultStarted, completed: resultCompleted, extra: nextEvent } = resultPair
     if (typeof resultStarted.id !== "string" || typeof resultCompleted.id !== "string") {
