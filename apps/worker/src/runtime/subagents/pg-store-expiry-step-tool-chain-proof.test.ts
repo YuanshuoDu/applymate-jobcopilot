@@ -87,6 +87,33 @@ function fixture(withCommentary = true, commentaryText = "private commentary") {
   return { events, items, anchorRows }
 }
 
+function longWriterFixture() {
+  const value = fixture(), taskId = "subagent-12345678-1234-4234-9234-123456789abc"
+  const attempt = 2_147_483_647, callId = "c".repeat(256)
+  const nextTask = { ...task, id: taskId }
+  const nextStepId = `task:${taskId}:step:2:attempt:${attempt}`
+  const callItemId = `task:${taskId}:item:tool-call:${callId}:attempt:${attempt}`
+  const resultItemId = `task:${taskId}:item:tool-result:${callId}:attempt:${attempt}`
+  const replacements = [
+    [`child-wait-claim:3:${stepId}`, `child-wait-claim:${attempt}:${nextStepId}`],
+    [claimItemId, callItemId], [claimResultId, resultItemId], [stepId, nextStepId], [claimCallId, callId], [task.id, taskId],
+  ] as const
+  const rewrite = (input: unknown): unknown => {
+    if (typeof input === "string") return replacements.reduce((text, [from, to]) => text.replaceAll(from, to), input)
+    if (Array.isArray(input)) return input.map(rewrite)
+    if (input && typeof input === "object") return Object.fromEntries(Object.entries(input).map(([key, item]) => [key, rewrite(item)]))
+    return input
+  }
+  for (const item of value.items) Object.assign(item, rewrite(item) as Record<string, unknown>)
+  for (const event of value.events) Object.assign(event, rewrite(event) as Record<string, unknown>)
+  const firstCause = value.events[0]?.causationId ?? null
+  value.events.forEach((event, index) => {
+    event.id = `${event.idempotencyKey}:attempt:${attempt}`
+    event.causationId = index === 0 ? firstCause : value.events[index - 1]!.id
+  })
+  return { value, task: nextTask, stepId: nextStepId, callId, callItemId, resultItemId, attempt }
+}
+
 function mockClient(value: ReturnType<typeof fixture>, queries: string[] = []) {
   const query = async (sql: string) => {
     queries.push(sql)
@@ -134,6 +161,43 @@ describe("ordered wait claim step tool-chain proof", () => {
     expect(proof?.nextEventId).toBe(proof?.calls[2]?.itemStartedEventId)
     expect(JSON.stringify(proof)).not.toContain("private commentary")
     expect(JSON.stringify(proof)).not.toContain("secret-key")
+  })
+
+  it("accepts maximum bounded child-writer item and event IDs", async () => {
+    const value = longWriterFixture()
+    const proof = await readCanonicalWaitStepToolChain(mockClient(value.value), value.task, { stepId: value.stepId,
+      attempt: value.attempt, callItemId: value.callItemId, callId: value.callId, resultItemId: value.resultItemId })
+    expect(value.callItemId.length).toBe(341)
+    expect(value.resultItemId.length).toBe(343)
+    expect(value.value.events.some(event => event.id.length === 700)).toBe(true)
+    expect(proof).toMatchObject({ stepId: value.stepId, waitCallItemId: value.callItemId, waitCallId: value.callId,
+      waitResultItemId: value.resultItemId })
+  })
+
+  it("rejects persisted event and item IDs beyond their separate bounds", async () => {
+    const overlongEvent = longWriterFixture()
+    const completed = overlongEvent.value.events.find(event => event.idempotencyKey.endsWith(
+      `tool-result-completed:${overlongEvent.callId}:${overlongEvent.resultItemId}:1`))!
+    completed.id = "e".repeat(1025)
+    const next = overlongEvent.value.events[overlongEvent.value.events.indexOf(completed) + 1]
+    if (next) next.causationId = completed.id
+    await expect(readCanonicalWaitStepToolChain(mockClient(overlongEvent.value), overlongEvent.task, { stepId: overlongEvent.stepId,
+      attempt: overlongEvent.attempt, callItemId: overlongEvent.callItemId, callId: overlongEvent.callId,
+      resultItemId: overlongEvent.resultItemId })).resolves.toBeNull()
+
+    const overlongItem = longWriterFixture()
+    const tooLongItemId = `${overlongItem.resultItemId}${"i".repeat(170)}`
+    await expect(readCanonicalWaitStepToolChain(mockClient(overlongItem.value), overlongItem.task, { stepId: overlongItem.stepId,
+      attempt: overlongItem.attempt, callItemId: overlongItem.callItemId, callId: overlongItem.callId,
+      resultItemId: tooLongItemId })).resolves.toBeNull()
+  })
+
+  it("rejects an over-limit item ID returned by the database with canonical input", async () => {
+    const value = longWriterFixture(), queries: string[] = []
+    value.value.items.find(item => item.id === value.resultItemId)!.id = "i".repeat(513)
+    await expect(readCanonicalWaitStepToolChain(mockClient(value.value, queries), value.task, { stepId: value.stepId,
+      attempt: value.attempt, callItemId: value.callItemId, callId: value.callId, resultItemId: value.resultItemId })).resolves.toBeNull()
+    expect(queries.some(sql => sql.includes('FROM "agent_items"'))).toBe(true)
   })
 
   it("accepts whitespace commentary because the writer publishes every truthy text value", async () => {

@@ -21,12 +21,13 @@ export type WaitResultPairDiagnostic = Readonly<{
 }>
 
 const boundedCount = (value: number) => Math.min(Math.max(value, 0), 4)
+const MAX_PERSISTED_EVENT_ID_LENGTH = 1024
 function sequence(value: unknown): bigint | null {
   if (typeof value !== "string" || !/^\d+$/.test(value)) return null
   try { return BigInt(value) } catch { return null }
 }
 function boundedString(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value
+  return typeof value === "string" && value.length > 0 && value.length <= MAX_PERSISTED_EVENT_ID_LENGTH && value.trim() === value
 }
 function sameJson(left: unknown, right: unknown): boolean {
   try { return canonicalJson(left) === canonicalJson(right) } catch { return false }

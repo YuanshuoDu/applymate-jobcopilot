@@ -18,8 +18,12 @@ export type HistoricalSourceStepPrefix = Readonly<{ stepId: string; attempt: num
   sourceResultItemId: string; waitKind: "normal_waiting" | "recovered"; terminalMode: TerminalMode; stepStartedEventId: string;
   stepCompletedEventId: string | null; events: readonly EventBinding[]; items: readonly ItemBinding[] }>
 const MAX_EVENTS = MAX_STEP_TOOL_CALLS * 9 + 16
+const MAX_PERSISTED_EVENT_ID_LENGTH = 1024
+const MAX_PERSISTED_ITEM_ID_LENGTH = 512
 const EARLY_STOP_ERROR_CODES = new Set(["policy_requires_approval", "policy_requires_user_input", "gmail_oauth_required", "session_pause_requested"])
 const validText = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value
+const validEventId = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= MAX_PERSISTED_EVENT_ID_LENGTH && value.trim() === value
+const validItemId = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= MAX_PERSISTED_ITEM_ID_LENGTH && value.trim() === value
 const validErrorCode = (value: unknown): value is string => typeof value === "string" && /^[A-Za-z0-9_.:-]{1,128}$/.test(value)
 const same = (left: unknown, right: unknown): boolean => { try { return canonicalJson(left) === canonicalJson(right) } catch { return false } }
 const sequence = (value: unknown): bigint | null => {
@@ -43,7 +47,8 @@ const itemBinding = (item: Item): ItemBinding => ({ id: item.id, type: item.type
 export async function readCanonicalHistoricalSourceStepPrefix(client: pg.PoolClient, task: Scope,
   input: { readonly stepId: string; readonly attempt: number; readonly callItemId: string; readonly callId: string;
     readonly resultItemId: string; readonly waitKind: "normal_waiting" | "recovered"; readonly terminalMode?: TerminalMode }): Promise<HistoricalSourceStepPrefix | null> {
-  if (![task.id, task.sessionId, task.turnId, input.stepId, input.callItemId, input.callId, input.resultItemId].every(validText)
+  if (![task.id, task.sessionId, task.turnId, input.stepId, input.callId].every(validText)
+    || !validItemId(input.callItemId) || !validItemId(input.resultItemId)
     || !Number.isSafeInteger(input.attempt) || input.attempt < 1) return null
   const terminalMode = input.terminalMode ?? "step_completed"
   const agendaKey = cognitiveAgendaReceiptIdempotencyKey(input.stepId)
@@ -91,7 +96,7 @@ function provePrefix(task: Scope, input: { stepId: string; attempt: number; call
   waitKind: "normal_waiting" | "recovered"; terminalMode: TerminalMode }, events: readonly Event[], items: readonly Item[], keys: readonly string[]): HistoricalSourceStepPrefix | null {
   if (events.length < (input.terminalMode === "step_completed" ? 12 : 11) || events.length > MAX_EVENTS) return null
   const itemMap = new Map(items.map(item => [item.id, item])), byKey = new Map(events.map(event => [event.idempotencyKey, event]))
-  if (itemMap.size !== items.length || byKey.size !== events.length || items.some(item => item.sessionId !== task.sessionId
+  if (itemMap.size !== items.length || byKey.size !== events.length || items.some(item => !validItemId(item.id) || item.sessionId !== task.sessionId
     || item.turnId !== task.turnId || item.taskId !== task.id || item.stepId !== input.stepId)) return null
   const calls = items.filter(item => item.type === "tool_call").sort((a, b) => eventOrder(events, a.id, b.id))
   const results = items.filter(item => item.type === "tool_result"), comments = items.filter(item => item.type === "agent_message" || item.type === "reasoning_summary")
@@ -124,7 +129,7 @@ function provePrefix(task: Scope, input: { stepId: string; attempt: number; call
   const take = (type: string, key: string, correlation: string, itemId: string | null, payload?: unknown): Event | null => {
     const event = events[cursor.value++]
     if (!event || event.type !== type || event.actor !== "subagent" || event.idempotencyKey !== key || event.correlationId !== correlation
-      || event.itemId !== itemId || !validText(event.id) || !sequence(event.sequence) || previous && event.causationId !== previous.id
+      || event.itemId !== itemId || !validEventId(event.id) || !sequence(event.sequence) || previous && event.causationId !== previous.id
       || payload !== undefined && !same(event.payload, payload)) return null
     proof.push(event); previous = event; return event
   }
@@ -143,7 +148,7 @@ function provePrefix(task: Scope, input: { stepId: string; attempt: number; call
       && (errorCode === null || validErrorCode(errorCode))
       && !EARLY_STOP_ERROR_CODES.has(String(errorCode))
     const result = results.filter(item => record(item.content).toolCallId === callId)
-    if (result.length !== 1 || !validText(call.id) || !validText(callId) || !validText(name) || !validText(result[0]!.id)
+    if (result.length !== 1 || !validItemId(call.id) || !validText(callId) || !validText(name) || !validItemId(result[0]!.id)
       || !exactKeys(content, ["toolCallId", "toolName", "toolVersion", "status", "errorCode", "input"])
       || content.toolVersion !== "1" || (!completed && !safelyTerminal) || !plain(content.input)
       || !exactKeys(record(result[0]!.content), ["toolCallId", "output", "errorCode"])

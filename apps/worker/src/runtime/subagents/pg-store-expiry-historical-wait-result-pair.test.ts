@@ -39,6 +39,38 @@ describe("historical wait result-pair diagnostics", () => {
     expect(JSON.stringify(diagnostic)).not.toContain("waiting")
   })
 
+  it("accepts event IDs composed by the child writer beyond the protocol text bound", () => {
+    const taskId = "subagent-12345678-1234-4234-9234-123456789abc"
+    const callId = "c".repeat(256), attempt = 2_147_483_647, revision = 1
+    const itemId = `task:${taskId}:item:tool-result:${callId}:attempt:${attempt}`
+    const sourceStepId = `task:${taskId}:step:0:attempt:${attempt}`
+    const terminalEvent = { id: `task:${taskId}:event:tool-finished:${callId}:attempt:${attempt}`,
+      sequence: "10", type: "tool_call.completed" }
+    const startedEvent = { ...started, id: `task:${taskId}:event:item-started:${itemId}:attempt:${attempt}`,
+      itemId, correlationId: sourceStepId, causationId: terminalEvent.id,
+      idempotencyKey: `task:${taskId}:event:item-started:${itemId}`,
+      payload: { itemId, type: "tool_result", phase: null } }
+    const completedEvent = { ...completed,
+      id: `task:${taskId}:event:tool-result-completed:${callId}:${itemId}:${revision}:attempt:${attempt}`,
+      itemId, correlationId: itemId, causationId: startedEvent.id,
+      idempotencyKey: `task:${taskId}:event:tool-result-completed:${callId}:${itemId}:${revision}`,
+      payload: { itemId, status: "completed", content: { toolCallId: callId, output: { status: "waiting" }, errorCode: null } } }
+    const longContent = { toolCallId: callId, output: { status: "waiting" }, errorCode: null }
+    expect(completedEvent.id.length).toBe(700)
+    expect(itemId.length).toBe(343)
+    expect(isCanonicalWaitResultPair(terminalEvent, startedEvent, completedEvent, itemId, sourceStepId, longContent)).toBe(true)
+  })
+
+  it("rejects over-limit and duplicate persisted event IDs", () => {
+    const overLimit = { ...completed, id: "e".repeat(1025) }
+    const duplicate = { ...completed, id: started.id }
+    expect(diagnoseWaitResultPair([started, overLimit], keys, terminal, resultItemId, stepId, content).eventIdsValid).toBe(false)
+    expect(isCanonicalWaitResultPair(terminal, started, overLimit, resultItemId, stepId, content)).toBe(false)
+    expect(isCanonicalWaitResultPair(terminal, started, duplicate, resultItemId, stepId, content)).toBe(false)
+    expect(isCanonicalWaitResultPair(terminal, started, { ...completed, id: " padded " }, resultItemId, stepId, content)).toBe(false)
+    expect(isCanonicalWaitResultPair(terminal, started, { ...completed, id: "" }, resultItemId, stepId, content)).toBe(false)
+  })
+
   it("distinguishes an event partition count/uniqueness failure", () => {
     const result = diagnoseWaitResultPair([started, { ...started, id: "duplicate-start" }, completed], keys,
       terminal, resultItemId, stepId, content)

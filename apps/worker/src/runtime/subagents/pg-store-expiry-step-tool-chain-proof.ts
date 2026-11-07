@@ -6,6 +6,8 @@ import { projectWaitCallCompletionPayload } from "../turns/turn-execution-wait-e
 export const MAX_STEP_TOOL_CALLS = 32
 export const MAX_STEP_CHAIN_EVENTS = MAX_STEP_TOOL_CALLS * 6 + 9
 const MAX_STEP_ITEMS = MAX_STEP_TOOL_CALLS * 2 + 1
+const MAX_PERSISTED_EVENT_ID_LENGTH = 1024
+const MAX_PERSISTED_ITEM_ID_LENGTH = 512
 type JsonRecord = Record<string, unknown>
 type Scope = Readonly<{ id: string; sessionId: string; turnId: string }>
 type ProofEvent = JsonRecord & { id: string; sequence: string; type: string; actor: string; itemId: string | null;
@@ -45,6 +47,8 @@ export function exactKeys(value: JsonRecord, keys: readonly string[]): boolean {
 }
 function sameJson(left: unknown, right: unknown): boolean { try { return canonicalJson(left) === canonicalJson(right) } catch { return false } }
 function validText(value: unknown): value is string { return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value }
+function validEventId(value: unknown): value is string { return typeof value === "string" && value.length > 0 && value.length <= MAX_PERSISTED_EVENT_ID_LENGTH && value.trim() === value }
+function validItemId(value: unknown): value is string { return typeof value === "string" && value.length > 0 && value.length <= MAX_PERSISTED_ITEM_ID_LENGTH && value.trim() === value }
 function sequence(value: unknown): bigint | null {
   if (typeof value !== "string" || !/^\d+$/.test(value)) return null
   try { return BigInt(value) } catch { return null }
@@ -64,7 +68,8 @@ function signature(event: ProofEvent): EventSignature {
 export async function readCanonicalWaitStepToolChain(client: pg.PoolClient, task: Scope, input: {
   readonly stepId: string; readonly attempt: number; readonly callItemId: string; readonly callId: string; readonly resultItemId: string
 }): Promise<StepToolChainProof | null> {
-  if (![task.id, task.sessionId, task.turnId, input.stepId, input.callItemId, input.callId, input.resultItemId].every(validText)
+  if (![task.id, task.sessionId, task.turnId, input.stepId, input.callId].every(validText)
+    || !validItemId(input.callItemId) || !validItemId(input.resultItemId)
     || !Number.isSafeInteger(input.attempt) || input.attempt < 1) return null
   const agendaKey = cognitiveAgendaReceiptIdempotencyKey(input.stepId)
   if (!agendaKey) return null
@@ -102,7 +107,7 @@ function proveWaitStepToolChain(task: Scope, input: { stepId: string; attempt: n
   events: readonly ProofEvent[], items: readonly ProofItem[], keys: readonly string[], agendaReceipt: unknown): StepToolChainProof | null {
   if (events.length < 12 || events.length > MAX_STEP_CHAIN_EVENTS) return null
   const itemMap = new Map(items.map(item => [item.id, item]))
-  if (itemMap.size !== items.length || items.some(item => item.sessionId !== task.sessionId || item.turnId !== task.turnId
+  if (itemMap.size !== items.length || items.some(item => !validItemId(item.id) || item.sessionId !== task.sessionId || item.turnId !== task.turnId
     || item.taskId !== task.id || item.stepId !== input.stepId)) return null
   const calls = items.filter(item => item.type === "tool_call").sort((a, b) => eventOrder(events, a.id, b.id))
   const results = items.filter(item => item.type === "tool_result")
@@ -117,9 +122,9 @@ function proveWaitStepToolChain(task: Scope, input: { stepId: string; attempt: n
   const modelStartPayload = record(started?.payload), modelDonePayload = record(completed?.payload), usagePayload = record(usage?.payload)
   const count = modelDonePayload.toolCallCount
   const parsedAgenda = parseCognitiveAgendaReceipt(agendaReceipt, { sessionId: task.sessionId, turnId: task.turnId, taskId: task.id, stepId: input.stepId })
-  if (!stepStarted || !agenda || !started || !completed || !usage || !stepDone || !validText(stepStarted.id) || !validText(agenda.id)
-    || !validText(started.id) || !validText(completed.id) || !validText(usage.id)
-    || !validText(stepDone.id) || started.type !== "model.started" || completed.type !== "model.completed" || usage.type !== "model.usage"
+  if (!stepStarted || !agenda || !started || !completed || !usage || !stepDone || !validEventId(stepStarted.id) || !validEventId(agenda.id)
+    || !validEventId(started.id) || !validEventId(completed.id) || !validEventId(usage.id)
+    || !validEventId(stepDone.id) || started.type !== "model.started" || completed.type !== "model.completed" || usage.type !== "model.usage"
     || stepStarted.type !== "step.started" || agenda.type !== COGNITIVE_AGENDA_EVENT_TYPE || stepDone.type !== "step.completed"
     || [stepStarted, agenda, started, completed, usage, stepDone].some(event => event.actor !== "subagent")
     || [stepStarted, agenda, started, completed, usage, stepDone].some(event => event.itemId !== null)
@@ -147,7 +152,7 @@ function proveWaitStepToolChain(task: Scope, input: { stepId: string; attempt: n
     const event = events[cursor++]
     const sequenceValue = sequence(event?.sequence), previousSequence = sequence(previous?.sequence)
     if (!event || event.type !== type || event.actor !== "subagent" || event.idempotencyKey !== key
-      || event.correlationId !== correlationId || event.itemId !== itemId || !validText(event.id)
+      || event.correlationId !== correlationId || event.itemId !== itemId || !validEventId(event.id)
       || !sequenceValue || previousSequence !== null && previousSequence !== undefined && sequenceValue <= previousSequence
       || previous && event.causationId !== previous.id || cause !== undefined && event.causationId !== cause
       || payload !== undefined && !sameJson(event.payload, payload)) return null
@@ -179,7 +184,7 @@ function proveWaitStepToolChain(task: Scope, input: { stepId: string; attempt: n
     const content = record(call.content), callId = content.toolCallId, name = content.toolName
     const result = results.find(item => record(item.content).toolCallId === callId)
     const resultContent = record(result?.content)
-    if (!result || !validText(result.id) || usedCallIds.has(String(callId)) || usedResultIds.has(result.id) || !validText(call.id) || !validText(callId)
+    if (!result || !validItemId(result.id) || usedCallIds.has(String(callId)) || usedResultIds.has(result.id) || !validItemId(call.id) || !validText(callId)
       || !validText(name) || !exactKeys(content, ["toolCallId", "toolName", "toolVersion", "status", "errorCode", "input"])
       || content.toolVersion !== "1" || content.status !== "completed" || content.errorCode !== null
       || !content.input || typeof content.input !== "object" || Array.isArray(content.input)

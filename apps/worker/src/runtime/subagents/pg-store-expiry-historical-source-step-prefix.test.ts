@@ -96,6 +96,30 @@ function fixture(priorTool: { name?: string; status?: "completed" | "failed" | "
     stepStatus: priorTool.stepStatus ?? (priorTool.handoff ? "waiting_for_tool" : "completed") }
 }
 
+function longWriterFixture() {
+  const value = fixture(), taskId = "subagent-12345678-1234-4234-9234-123456789abc"
+  const attempt = 2_147_483_647, callId = "w".repeat(256)
+  const nextTask = { ...task, id: taskId }
+  const nextStepId = `task:${taskId}:step:0:attempt:${attempt}`
+  const callItemId = `task:${taskId}:item:tool-call:${callId}:attempt:${attempt}`
+  const resultItemId = `task:${taskId}:item:tool-result:${callId}:attempt:${attempt}`
+  const replacements = [[waitItemId, callItemId], [waitResultId, resultItemId], [stepId, nextStepId], [waitCallId, callId], [task.id, taskId]] as const
+  const rewrite = (input: unknown): unknown => {
+    if (typeof input === "string") return replacements.reduce((text, [from, to]) => text.replaceAll(from, to), input)
+    if (Array.isArray(input)) return input.map(rewrite)
+    if (input && typeof input === "object") return Object.fromEntries(Object.entries(input).map(([key, item]) => [key, rewrite(item)]))
+    return input
+  }
+  for (const item of value.items) Object.assign(item, rewrite(item) as Record<string, unknown>)
+  for (const event of value.events) Object.assign(event, rewrite(event) as Record<string, unknown>)
+  const firstCause = value.events[0]?.causationId ?? null
+  value.events.forEach((event, index) => {
+    event.id = `${event.idempotencyKey}:attempt:${attempt}`
+    event.causationId = index === 0 ? firstCause : value.events[index - 1]!.id
+  })
+  return { value, task: nextTask, stepId: nextStepId, callId, callItemId, resultItemId, attempt }
+}
+
 function mockClient(value: ReturnType<typeof fixture>, queries: string[] = []) {
   return { query: async (sql: string, parameters?: readonly unknown[]) => {
     queries.push(sql)
@@ -150,6 +174,45 @@ describe("historical source wait step prefix", () => {
     expect(JSON.stringify(proof)).not.toContain("private source commentary")
     expect(JSON.stringify(proof)).not.toContain("api_key=private-source-key")
     expect(JSON.stringify(proof)).not.toContain("do-not-copy")
+  })
+
+  it("accepts maximum bounded child-writer item and event IDs", async () => {
+    const value = longWriterFixture()
+    const proof = await readCanonicalHistoricalSourceStepPrefix(mockClient(value.value), value.task, { stepId: value.stepId,
+      attempt: value.attempt, callItemId: value.callItemId, callId: value.callId, resultItemId: value.resultItemId,
+      waitKind: "normal_waiting" })
+    expect(value.callItemId.length).toBe(341)
+    expect(value.resultItemId.length).toBe(343)
+    expect(value.value.events.some(event => event.id.length === 700)).toBe(true)
+    expect(proof).toMatchObject({ stepId: value.stepId, sourceCallItemId: value.callItemId, sourceCallId: value.callId,
+      sourceResultItemId: value.resultItemId })
+  })
+
+  it("rejects persisted event and item IDs beyond their separate bounds", async () => {
+    const overlongEvent = longWriterFixture()
+    const completed = overlongEvent.value.events.find(event => event.idempotencyKey.endsWith(
+      `tool-result-completed:${overlongEvent.callId}:${overlongEvent.resultItemId}:1`))!
+    completed.id = "e".repeat(1025)
+    const next = overlongEvent.value.events[overlongEvent.value.events.indexOf(completed) + 1]
+    if (next) next.causationId = completed.id
+    await expect(readCanonicalHistoricalSourceStepPrefix(mockClient(overlongEvent.value), overlongEvent.task, { stepId: overlongEvent.stepId,
+      attempt: overlongEvent.attempt, callItemId: overlongEvent.callItemId, callId: overlongEvent.callId,
+      resultItemId: overlongEvent.resultItemId, waitKind: "normal_waiting" })).resolves.toBeNull()
+
+    const overlongItem = longWriterFixture()
+    const tooLongItemId = `${overlongItem.resultItemId}${"i".repeat(170)}`
+    await expect(readCanonicalHistoricalSourceStepPrefix(mockClient(overlongItem.value), overlongItem.task, { stepId: overlongItem.stepId,
+      attempt: overlongItem.attempt, callItemId: overlongItem.callItemId, callId: overlongItem.callId,
+      resultItemId: tooLongItemId, waitKind: "normal_waiting" })).resolves.toBeNull()
+  })
+
+  it("rejects an over-limit item ID returned by the database with canonical input", async () => {
+    const value = longWriterFixture(), queries: string[] = []
+    value.value.items.find(item => item.id === value.resultItemId)!.id = "i".repeat(513)
+    await expect(readCanonicalHistoricalSourceStepPrefix(mockClient(value.value, queries), value.task, { stepId: value.stepId,
+      attempt: value.attempt, callItemId: value.callItemId, callId: value.callId, resultItemId: value.resultItemId,
+      waitKind: "normal_waiting" })).resolves.toBeNull()
+    expect(queries.some(sql => sql.includes('FROM "agent_items"'))).toBe(true)
   })
 
   it("proves a bounded recovered handoff after a fully persisted prior tool", async () => {
