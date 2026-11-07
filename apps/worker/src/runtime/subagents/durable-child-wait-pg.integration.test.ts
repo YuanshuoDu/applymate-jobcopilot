@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url"
 import { Queue, Worker } from "bullmq"
 import { Pool, type PoolClient } from "pg"
 import { Redis } from "ioredis"
+import { canonicalJson } from "@jobcopilot/shared"
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 import { AgentTreeManager } from "./manager.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
@@ -30,10 +31,11 @@ import { CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL, CHILD_WAIT_HISTORICAL_S
   HISTORICAL_SOURCE_STEP_BINDING_SQL, HISTORICAL_SOURCE_STEP_PREFIX_SQL } from "./pg-store-expiry-historical-wait-event-binding.js"
 import { readChildWaitSourceCallProjection } from "./pg-store-expiry-child-wait-source-proof.js"
 import { CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL } from "./pg-store-expiry-historical-wait-binding.js"
-import { buildCognitiveAgendaReceipt, cognitiveAgendaReceiptIdempotencyKey } from "../turns/cognitive-agenda-receipt.js"
+import { buildCognitiveAgendaReceipt, cognitiveAgendaReceiptIdempotencyKey, parseCognitiveAgendaReceipt } from "../turns/cognitive-agenda-receipt.js"
 import { diagnoseChildWaitTerminalCallProjections, readChildWaitTerminalCallProjections } from "./pg-store-expiry-historical-wait-projections.js"
 import { historicalSourceStepCallChainBinding, historicalSourceStepCallCountBinding, historicalSourceStepEventChainBinding,
   readCanonicalHistoricalSourceStepPrefix } from "./pg-store-expiry-historical-source-step-prefix.js"
+import { readCanonicalHistoricalSourceStepContinuationPrefix } from "./pg-store-expiry-historical-source-step-continuation-prefix.js"
 import { historicalSourceStepCallChainDiagnosticSql } from "./pg-store-expiry-historical-source-step-call-binding-diagnostics.js"
 import { CHILD_WAIT_STEP_TOOL_CHAIN_EXCEPTION_SQL } from "./pg-store-expiry-step-completion-proof.js"
 import { MAX_STEP_CHAIN_EVENTS, MAX_STEP_TOOL_CALLS, readCanonicalWaitStepToolChain } from "./pg-store-expiry-step-tool-chain-proof.js"
@@ -1599,6 +1601,24 @@ type BlockingTaskSnapshot = {
 type BlockingTaskRow = Omit<BlockingTaskSnapshot, "userId">
 type RecoveredHandoffDiagnosticEvent = { id: string; sequence: string; type: string; actor: string; itemId: string | null;
   correlationId: string; causationId: string | null; idempotencyKey: string }
+type RecoveredHandoffProofEvent = RecoveredHandoffDiagnosticEvent & { sessionId: string; turnId: string; taskId: string;
+  payload: unknown; payloadDigest: string }
+function diagnosticExactKeys(value: unknown, keys: readonly string[]): boolean {
+  const actual = Object.keys(asObject(value)).sort(), expected = [...keys].sort()
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index])
+}
+function diagnosticSameJson(left: unknown, right: unknown): boolean {
+  try { return canonicalJson(left) === canonicalJson(right) } catch { return false }
+}
+function diagnosticWaitInput(value: unknown): boolean {
+  const input = asObject(value), ids = input.taskIds
+  return diagnosticExactKeys(input, ["idempotencyKey", "taskIds", "mode", "timeoutMs"])
+    && typeof input.idempotencyKey === "string" && input.idempotencyKey.length > 0 && input.idempotencyKey.length <= 256
+    && input.idempotencyKey.trim() === input.idempotencyKey && (input.mode === "any" || input.mode === "all")
+    && Number.isSafeInteger(input.timeoutMs) && Number(input.timeoutMs) >= 1 && Number(input.timeoutMs) <= 30_000
+    && Array.isArray(ids) && ids.length > 0 && ids.length <= 8 && ids.every(id => typeof id === "string" && id.length > 0 && id.length <= 256 && id.trim() === id)
+    && new Set(ids).size === ids.length
+}
 
 async function diagnoseRecoveredHandoffProjection(client: PoolClient, task: BlockingTaskSnapshot,
   projections: Awaited<ReturnType<typeof readChildWaitTerminalCallProjections>>, waitId: string | undefined,
@@ -1618,25 +1638,40 @@ async function diagnoseRecoveredHandoffProjection(client: PoolClient, task: Bloc
     nestedContinuationPresent = Boolean(recoveredPrefix?.continuationPrefix)
   } catch { /* fixed diagnostic only */ }
 
-  const [steps, items, anchors, parentRows] = await Promise.all([
-    client.query<{ sourceStatus: string | null; continuationStatus: string | null; sourceCount: number; continuationCount: number }>(
+  const [steps, items, anchors, parentRows, sourceCallRows] = await Promise.all([
+    client.query<{ sourceStatus: string | null; continuationStatus: string | null; sourceCount: number; continuationCount: number;
+      sourceOrdinal: number | null; sourceAttempt: number | null; continuationOrdinal: number | null; continuationAttempt: number | null }>(
       `SELECT (SELECT "status" FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = $4) AS "sourceStatus",
         (SELECT "status" FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = $5) AS "continuationStatus",
         (SELECT COUNT(*)::int FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = $4) AS "sourceCount",
-        (SELECT COUNT(*)::int FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = $5) AS "continuationCount"`,
+        (SELECT COUNT(*)::int FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = $5) AS "continuationCount",
+        (SELECT "ordinal" FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = $4) AS "sourceOrdinal",
+        (SELECT "attempt" FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = $4) AS "sourceAttempt",
+        (SELECT "ordinal" FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = $5) AS "continuationOrdinal",
+        (SELECT "attempt" FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "id" = $5) AS "continuationAttempt"`,
       [task.sessionId, task.turnId, task.id, sourceStepId, continuationStepId]),
-    client.query<{ id: string; content: unknown }>(`SELECT "id", "content" FROM "agent_items"
+    client.query<{ id: string; sessionId: string; turnId: string; taskId: string; stepId: string; type: string; status: string;
+      revision: number; phase: string | null; content: unknown }>(`SELECT "id", "sessionId", "turnId", "taskId", "stepId", "type", "status", "revision", "phase", "content" FROM "agent_items"
       WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = $4 AND "type" = 'tool_call'
       ORDER BY "createdAt", "id" LIMIT 3`, [task.sessionId, task.turnId, task.id, continuationStepId]),
-    client.query<RecoveredHandoffDiagnosticEvent>(`SELECT "id", "sequence"::text AS "sequence", "type", "actor", "itemId",
-        "correlationId", "causationId", "idempotencyKey" FROM "agent_events"
-      WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "idempotencyKey" = ANY($4::text[]) LIMIT 2`,
+    client.query<{ idempotencyKey: string; matchCount: number; id: string | null; sequence: string | null }>(`SELECT expected."idempotencyKey",
+        LEAST(COUNT(event."id"), 2)::int AS "matchCount",
+        CASE WHEN COUNT(event."id") = 1 THEN MIN(event."id") ELSE NULL END AS "id",
+        CASE WHEN COUNT(event."id") = 1 THEN MIN(event."sequence")::text ELSE NULL END AS "sequence"
+      FROM unnest($4::text[]) AS expected("idempotencyKey")
+      LEFT JOIN "agent_events" AS event ON event."sessionId" = $1 AND event."turnId" = $2 AND event."taskId" = $3
+        AND event."idempotencyKey" = expected."idempotencyKey"
+      GROUP BY expected."idempotencyKey"`,
     [task.sessionId, task.turnId, task.id, [`task:${task.id}:event:step-started:${sourceStepId}`,
       `task:${task.id}:event:tool-result-completed:${sourceCallId}:${sourceResultItemId}:1`]]),
-    client.query<RecoveredHandoffDiagnosticEvent>(`SELECT "id", "sequence"::text AS "sequence", "type", "actor", "itemId",
-        "correlationId", "causationId", "idempotencyKey" FROM "agent_events"
+    client.query<RecoveredHandoffProofEvent>(`SELECT "id", "sessionId", "turnId", "taskId", "sequence"::text AS "sequence", "type", "actor", "itemId",
+        "correlationId", "causationId", "idempotencyKey", "payload",
+        encode(sha256(convert_to("payload"::text, 'UTF8')), 'hex') AS "payloadDigest" FROM "agent_events"
       WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "idempotencyKey" = $4 LIMIT 2`,
     [task.sessionId, task.turnId, task.id, `task:${task.id}:event:turn-started`]),
+    client.query<{ content: unknown }>(`SELECT "content" FROM "agent_items"
+      WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = $4 AND "id" = $5 AND "type" = 'tool_call' LIMIT 2`,
+    [task.sessionId, task.turnId, task.id, sourceStepId, sourceCallItemId]),
   ])
   const source = steps.rows[0], sourceCount = Number(source?.sourceCount ?? 0), continuationCount = Number(source?.continuationCount ?? 0)
   const statusClass = (value: string | null | undefined): "waiting_for_tool" | "streaming" | "completed" | "other" | "missing" =>
@@ -1653,14 +1688,25 @@ async function diagnoseRecoveredHandoffProjection(client: PoolClient, task: Bloc
     `task:${task.id}:event:model-usage:${continuationStepId}`, `task:${task.id}:event:item-started:${continuationItemId}`,
     `task:${task.id}:event:child-wait-claim:${task.attemptCount}:${continuationStepId}`,
   ] : []
-  let sourceWindowEvents: RecoveredHandoffDiagnosticEvent[] = []
+  let sourceWindowEvents: RecoveredHandoffProofEvent[] = []
   let sourceWindowAnchored = false
-  const startEvent = anchors.rows.find(event => event.idempotencyKey === `task:${task.id}:event:step-started:${sourceStepId}`)
-  const endEvent = anchors.rows.find(event => event.idempotencyKey === `task:${task.id}:event:tool-result-completed:${sourceCallId}:${sourceResultItemId}:1`)
+  const startKey = `task:${task.id}:event:step-started:${sourceStepId}`
+  const endKey = `task:${task.id}:event:tool-result-completed:${sourceCallId}:${sourceResultItemId}:1`
+  const startAnchor = anchors.rows.find(event => event.idempotencyKey === startKey)
+  const endAnchor = anchors.rows.find(event => event.idempotencyKey === endKey)
+  const canonicalAnchorsUnique = anchors.rows.length === 2 && anchors.rows.every(event => event.matchCount === 1
+    && typeof event.id === "string" && typeof event.sequence === "string")
+  const startEvent = startAnchor?.matchCount === 1 && typeof startAnchor.id === "string" && typeof startAnchor.sequence === "string"
+    ? { id: startAnchor.id, sequence: startAnchor.sequence, idempotencyKey: startAnchor.idempotencyKey } : undefined
+  const endEvent = endAnchor?.matchCount === 1 && typeof endAnchor.id === "string" && typeof endAnchor.sequence === "string"
+    ? { id: endAnchor.id, sequence: endAnchor.sequence, idempotencyKey: endAnchor.idempotencyKey } : undefined
   try {
-    if (anchors.rows.length === 2 && startEvent && endEvent && BigInt(startEvent.sequence) < BigInt(endEvent.sequence)) {
-      const window = await client.query<RecoveredHandoffDiagnosticEvent>(`SELECT event."id", event."sequence"::text AS "sequence", event."type", event."actor", event."itemId",
-          event."correlationId", event."causationId", event."idempotencyKey" FROM "agent_events" AS event
+    if (canonicalAnchorsUnique && startEvent && endEvent && startEvent.idempotencyKey === startKey && endEvent.idempotencyKey === endKey
+      && BigInt(startEvent.sequence) < BigInt(endEvent.sequence)) {
+      const window = await client.query<RecoveredHandoffProofEvent>(`SELECT event."id", event."sessionId", event."turnId", event."taskId",
+          event."sequence"::text AS "sequence", event."type", event."actor", event."itemId", event."correlationId", event."causationId",
+          event."idempotencyKey", event."payload", encode(sha256(convert_to(event."payload"::text, 'UTF8')), 'hex') AS "payloadDigest"
+        FROM "agent_events" AS event
         WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."taskId" = $3 AND event."sequence" BETWEEN $4::bigint AND $5::bigint
         ORDER BY event."sequence" LIMIT 320`, [task.sessionId, task.turnId, task.id, startEvent.sequence, endEvent.sequence])
       sourceWindowEvents = window.rows
@@ -1676,9 +1722,11 @@ async function diagnoseRecoveredHandoffProjection(client: PoolClient, task: Bloc
     globalKeyRows.rows.find(row => row.idempotencyKey === key)?.boundedCount === 1).length
   const windowKeyRows = continuationKeys.map(key => sourceWindowEvents.filter(event => event.idempotencyKey === key))
   const uniqueWindowKeyCount = windowKeyRows.filter(rows => rows.length === 1).length
-  const continuationEvents = windowKeyRows.map(rows => rows[0]).filter((event): event is RecoveredHandoffDiagnosticEvent => Boolean(event))
+  const continuationEvents = windowKeyRows.map(rows => rows[0]).filter((event): event is RecoveredHandoffProofEvent => Boolean(event))
   const orderedContinuationChain = continuationEvents.length === continuationKeys.length
-    && continuationEvents.every((event, index) => index === 0 || BigInt(event.sequence) > BigInt(continuationEvents[index - 1]!.sequence))
+    && continuationEvents.every((event, index) => {
+      try { return index === 0 || BigInt(event.sequence) > BigInt(continuationEvents[index - 1]!.sequence) } catch { return false }
+    })
   const continuationCausationChain = continuationEvents.length === continuationKeys.length
     && continuationEvents.slice(1).every((event, index) => event.causationId === continuationEvents[index]!.id)
   const taskParent = parentRows.rows.length === 1 ? parentRows.rows[0] : null
@@ -1686,17 +1734,141 @@ async function diagnoseRecoveredHandoffProjection(client: PoolClient, task: Bloc
   const continuationIdSet = new Set(continuationEvents.map(event => event.id))
   const unexpectedContinuationWindowEvents = sourceWindowEvents.filter(event => (event.correlationId === continuationStepId
     || Boolean(continuationItemId && event.itemId === continuationItemId)
+    || Boolean(continuationItemId && event.correlationId === `task:${task.id}:item:tool-result:${continuationCallId}:attempt:${task.attemptCount}`)
     || Boolean(continuationCallId && event.correlationId === continuationCallId)
     || continuationIdSet.has(event.causationId ?? "")) && !continuationIdSet.has(event.id)).length
+  const continuationRow = items.rows.length === 1 ? items.rows[0] : null
+  const continuationContent = asObject(continuationRow?.content)
+  const sourceCallInput = asObject(sourceCallRows.rows.length === 1 ? asObject(sourceCallRows.rows[0]?.content).input : null)
+  const continuationStateValid = Boolean(continuationRow && continuationRow.phase === null
+    && (continuationRow.status === "started" && continuationRow.revision === 0
+      || continuationRow.status === "completed" && continuationRow.revision === 1))
+  const continuationContentShapeValid = Boolean(continuationRow && (continuationRow.status === "completed"
+    ? diagnosticExactKeys(continuationContent, ["toolCallId", "toolName", "toolVersion", "input", "status", "errorCode"])
+      && continuationContent.status === "completed" && continuationContent.errorCode === null
+    : diagnosticExactKeys(continuationContent, ["toolCallId", "toolName", "toolVersion", "input"])))
+  const continuationItemIdentityValid = Boolean(continuationRow && continuationRow.sessionId === task.sessionId && continuationRow.turnId === task.turnId
+    && continuationRow.taskId === task.id && continuationRow.stepId === continuationStepId && continuationRow.type === "tool_call"
+    && typeof continuationCallId === "string" && continuationCallId.length > 0 && continuationCallId.length <= 256
+    && continuationCallId.trim() === continuationCallId
+    && continuationRow.id === `task:${task.id}:item:tool-call:${continuationCallId}:attempt:${task.attemptCount}`
+    && continuationCallId !== sourceCallId && continuationRow.id !== sourceCallItemId)
+  const continuationInputValid = Boolean(continuationContent.toolName === "wait_subagents" && continuationContent.toolVersion === "1"
+    && diagnosticWaitInput(continuationContent.input) && diagnosticWaitInput(sourceCallInput)
+    && diagnosticSameJson(continuationContent.input, sourceCallInput))
+  const continuationSequenceOrderValid = continuationEvents.length === continuationKeys.length && continuationEvents.every((event, index) => {
+    try { return index === 0 || BigInt(event.sequence) > BigInt(continuationEvents[index - 1]!.sequence) } catch { return false }
+  })
+  const continuationEventFieldsValid = continuationEvents.length === 7 && continuationEvents.every((event, index) => {
+    const types = ["step.started", "cognitive.agenda", "model.started", "model.completed", "model.usage", "item.started", "tool_call.started"]
+    const correlation = index === 6 ? continuationCallId : continuationStepId
+    const expectedItemId = index >= 5 ? continuationItemId : null
+    const expectedCause = index === 0 ? taskParent?.id : continuationEvents[index - 1]?.id
+    return event.type === types[index] && event.actor === "subagent" && event.correlationId === correlation
+      && event.itemId === expectedItemId && event.idempotencyKey === continuationKeys[index]
+      && event.causationId === expectedCause && /^[0-9a-f]{64}$/.test(event.payloadDigest)
+  }) && continuationSequenceOrderValid
+  let agendaReceiptValid = false
+  try { agendaReceiptValid = continuationEvents.length === 7 && Boolean(parseCognitiveAgendaReceipt(continuationEvents[1]!.payload,
+    { sessionId: task.sessionId, turnId: task.turnId, taskId: task.id, stepId: continuationStepId })) } catch { /* fixed diagnostic only */ }
+  const startModelPayload = asObject(continuationEvents[2]?.payload)
+  const doneModelPayload = asObject(continuationEvents[3]?.payload)
+  const usagePayload = asObject(continuationEvents[4]?.payload)
+  const usage = usagePayload.usage, usageObject = asObject(usage)
+  const modelIdentityValid = typeof startModelPayload.provider === "string" && startModelPayload.provider.length > 0
+    && startModelPayload.provider.length <= 256 && startModelPayload.provider.trim() === startModelPayload.provider
+    && typeof startModelPayload.model === "string" && startModelPayload.model.length > 0 && startModelPayload.model.length <= 256
+    && startModelPayload.model.trim() === startModelPayload.model
+  const continuationUsageValid = usage === null || diagnosticExactKeys(usageObject, ["inputTokens", "outputTokens", "estimatedCostUsd"])
+    && [usageObject.inputTokens, usageObject.outputTokens, usageObject.estimatedCostUsd]
+      .every(value => typeof value === "number" && Number.isFinite(value) && value >= 0)
+  const continuationPayloadsValid = continuationEvents.length === 7 && agendaReceiptValid && modelIdentityValid && continuationUsageValid
+    && diagnosticSameJson(continuationEvents[0]!.payload, { stepId: continuationStepId, ordinal: source?.continuationOrdinal, taskId: task.id })
+    && diagnosticExactKeys(startModelPayload, ["taskId", "provider", "model"]) && startModelPayload.taskId === task.id
+    && diagnosticExactKeys(doneModelPayload, ["taskId", "provider", "model", "toolCallCount"]) && doneModelPayload.taskId === task.id
+    && doneModelPayload.provider === startModelPayload.provider && doneModelPayload.model === startModelPayload.model
+    && typeof doneModelPayload.toolCallCount === "number" && Number.isSafeInteger(doneModelPayload.toolCallCount)
+    && doneModelPayload.toolCallCount >= 1 && doneModelPayload.toolCallCount <= MAX_STEP_TOOL_CALLS
+    && diagnosticExactKeys(usagePayload, ["taskId", "provider", "model", "usage"]) && usagePayload.taskId === task.id
+    && usagePayload.provider === startModelPayload.provider && usagePayload.model === startModelPayload.model
+    && diagnosticSameJson(continuationEvents[5]!.payload, { itemId: continuationItemId, type: "tool_call", phase: null })
+    && diagnosticSameJson(continuationEvents[6]!.payload, { toolCallId: continuationCallId, toolName: "wait_subagents", taskId: task.id })
+  const parentPayload = asObject(taskParent?.payload)
+  let taskParentPrecedes = false
+  try { taskParentPrecedes = Boolean(taskParent && continuationEvents[0] && BigInt(taskParent.sequence) < BigInt(continuationEvents[0]!.sequence)) }
+  catch { /* fixed diagnostic only */ }
+  const taskParentExact = Boolean(taskParent && taskParent.sessionId === task.sessionId && taskParent.turnId === task.turnId
+    && taskParent.taskId === task.id && taskParent.type === "task.started" && taskParent.actor === "subagent" && taskParent.itemId === null
+    && taskParent.correlationId === task.turnId && taskParent.causationId === null
+    && taskParent.idempotencyKey === `task:${task.id}:event:turn-started` && diagnosticExactKeys(parentPayload, ["goal", "taskId", "rootTaskId"])
+    && typeof parentPayload.goal === "string" && parentPayload.goal.length > 0 && parentPayload.goal.trim() === parentPayload.goal
+    && parentPayload.taskId === task.id && parentPayload.rootTaskId === task.rootTaskId
+    && /^[0-9a-f]{64}$/.test(taskParent.payloadDigest) && continuationEvents.length === 7 && taskParentPrecedes)
+  const continuationReaderTrace: Array<{ stage: string; rowCount: number }> = []
+  const traceClient = { query: async (sql: string, values?: unknown[]) => {
+    const stage = sql.includes('FROM "sub_agent_tasks"') ? "step_scope"
+      : sql.includes('FROM "agent_items"') ? "continuation_item_rows"
+        : sql.includes('parent."idempotencyKey" = $4') ? "task_parent"
+          : sql.includes("'step.completed'") ? "terminal_events" : "other"
+    const result = await client.query(sql, values as never)
+    continuationReaderTrace.push({ stage, rowCount: result.rows.length })
+    return result
+  } } as unknown as PoolClient
+  const directSourceCallItem = asObject(sourceCallRows.rows.length === 1 ? sourceCallRows.rows[0]?.content : null)
+  let directContinuationProof: Awaited<ReturnType<typeof readCanonicalHistoricalSourceStepContinuationPrefix>> = null
+  let directContinuationReaderError = false
+  try {
+    if (sourceWindowAnchored && startEvent && endEvent && sourceCallRows.rows.length === 1) directContinuationProof =
+      await readCanonicalHistoricalSourceStepContinuationPrefix(traceClient, sourceScope, {
+        sourceStepId, sourceAttempt: 1, sourceCallItemId, sourceCallId, sourceCallInput: directSourceCallItem.input,
+        windowEvents: sourceWindowEvents as never, windowStartEventId: startEvent.id, windowEndEventId: endEvent.id,
+      })
+  } catch { directContinuationReaderError = true }
+  const lastContinuationRead = continuationReaderTrace.at(-1)
+  const continuationRejectStage = directContinuationReaderError ? "query_exception" : directContinuationProof ? "accepted"
+    : !lastContinuationRead ? "input_or_window_gate"
+      : lastContinuationRead.stage === "step_scope" ? lastContinuationRead.rowCount === 1 ? "step_row_validation" : "step_scope_rows"
+        : lastContinuationRead.stage === "continuation_item_rows" ? lastContinuationRead.rowCount === 1 ? "item_identity_content_or_window" : "item_row_count"
+          : lastContinuationRead.stage === "task_parent" ? lastContinuationRead.rowCount === 1 ? "event_fields_parent_payload_or_window" : "parent_row_count"
+            : lastContinuationRead.stage === "terminal_events" ? lastContinuationRead.rowCount ? "terminal_event_found" : "terminal_probe_empty_rejected"
+              : "reader_other"
+  let sourceOnlyProof: Awaited<ReturnType<typeof readCanonicalHistoricalSourceStepPrefix>> = null
+  if (continuationEvents.length === 7 && new Set(continuationEvents.map(event => event.id)).size === 7) {
+    const continuationEventIds = new Set(continuationEvents.map(event => event.id))
+    const sourceOnlyClient = { query: async (sql: string, values?: unknown[]) => {
+      const result = await client.query(sql, values as never)
+      if (!sql.includes('FROM "agent_events" AS sourceEvent')) return result
+      return { ...result, rows: result.rows.filter((event: { id: string }) => !continuationEventIds.has(event.id)) }
+    } } as unknown as PoolClient
+    try { sourceOnlyProof = await readCanonicalHistoricalSourceStepPrefix(sourceOnlyClient, sourceScope, { ...args, terminalMode: "recovered_handoff" }) }
+    catch { sourceOnlyProof = null }
+  }
+  const sourceOnlyProofIds = new Set(sourceOnlyProof?.events.map(event => event.id) ?? [])
+  const continuationProofIds = new Set(directContinuationProof?.events.map(event => event.id) ?? [])
+  const proofUnionIds = new Set([...sourceOnlyProofIds, ...continuationProofIds])
+  const unionSequencesDisjoint = directContinuationProof && sourceOnlyProof
+    ? !sourceOnlyProof.events.some(event => continuationProofIds.has(event.id))
+      && !sourceOnlyProof.events.some(event => directContinuationProof!.events.some(next => next.sequence === event.sequence)) : false
+  const sourceProofRecheckPassed = Boolean(sourceOnlyProof)
+  const proofUnionExact = Boolean(directContinuationProof && sourceOnlyProof && unionSequencesDisjoint
+    && proofUnionIds.size === sourceOnlyProof.events.length + directContinuationProof.events.length
+    && proofUnionIds.size === sourceWindowEvents.length && sourceWindowEvents.every(event => proofUnionIds.has(event.id)))
   const allowedStatuses = new Set(["waiting_for_tool", "streaming", "completed", "missing"])
   return {
     projectionKind, defaultPrefixPresent, recoveredPrefixPresent, nestedContinuationPresent,
     sourceStepCount: sourceCount, sourceStatus: allowedStatuses.has(sourceStatus) ? sourceStatus : "other",
     continuationStepCount: continuationCount, continuationStatus: allowedStatuses.has(continuationStatus) ? continuationStatus : "other",
     continuationItemCount, continuationKeyCount: continuationKeys.length, uniquePersistedKeyCount, uniqueWindowKeyCount,
-    sourceWindowEventCount: sourceWindowEvents.length, sourceWindowAnchored,
+    sourceWindowEventCount: sourceWindowEvents.length, canonicalAnchorsUnique, sourceWindowAnchored,
     orderedContinuationChain, continuationCausationChain, continuationStartsAtTaskParent,
     unexpectedContinuationWindowEventCount: unexpectedContinuationWindowEvents,
+    continuationStateValid, continuationItemIdentityValid, continuationContentShapeValid, continuationInputValid,
+    continuationEventFieldsValid, continuationPayloadsValid, taskParentExact,
+    continuationReaderStage: continuationRejectStage,
+    sourceProofRecheckStage: sourceProofRecheckPassed ? "source_only_pass" : "source_only_reject",
+    sourceProofEventCount: sourceOnlyProof?.events.length ?? 0,
+    continuationProofEventCount: directContinuationProof?.events.length ?? 0,
+    proofUnionExact,
   }
 }
 
@@ -4074,7 +4246,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
            AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${waiter.id}`],
         )
         resultCutGeneration = resultCutOutbox.rows[0]!.attemptCount
-        expect(resultCutGeneration).toBe(abandonedClaimRecoveryGeneration + 1)
+        expect(resultCutGeneration).toBe(abandonedClaimRecoveryGeneration + 2)
         expect(resultCutOutbox.rows[0]?.publishedAt).toBeNull()
         await expect(dispatchPendingSubagentOutbox(pool as never, queue, 50, ids.sessionId)).resolves.toBe(1)
         const resultCutDispatchPublished = await pool.query<{ attemptCount: number; publishedAt: Date | null }>(
@@ -5303,22 +5475,47 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       workerC = launchWorker("worker-b-loop-multi-complete-cut", queueName, ids)
       await waitForMarker(workerC, "WORKER_B_READY")
       await waitForMarker(workerC, "WORKER_B_LOOP_MULTI_STEP_DURABLE")
-      const claimSteps = await pool.query<{ waitId: string; sourceStepId: string; claimOrdinal: number }>(`SELECT wait."id" AS "waitId",
-        source."id" AS "sourceStepId", source."ordinal" + 1 AS "claimOrdinal" FROM "agent_wait_conditions" AS wait
+      const sourceWaitSteps = await pool.query<{ waitId: string; sourceStepId: string; sourceOrdinal: number; sourceAttempt: number }>(`SELECT wait."id" AS "waitId",
+        source."id" AS "sourceStepId", source."ordinal" AS "sourceOrdinal", source."attempt" AS "sourceAttempt"
+        FROM "agent_wait_conditions" AS wait
         JOIN "agent_steps" AS source ON source."id" = wait."stepId" AND source."sessionId" = wait."sessionId"
           AND source."turnId" = wait."turnId" AND source."taskId" = wait."parentTaskId"
         WHERE wait."id" = ANY($1::text[]) AND wait."parentTaskId" = $2 AND wait."sessionId" = $3 AND wait."turnId" = $4
         ORDER BY source."ordinal"`, [[firstWait.rows[0]!.id, secondWait!.waitId], ids.waiterTaskId, ids.sessionId, ids.turnId])
-      expect(claimSteps.rows).toHaveLength(2)
-      expect(claimSteps.rows.map(row => row.waitId).sort()).toEqual([firstWait.rows[0]!.id, secondWait!.waitId].sort())
-      expect(claimSteps.rows.find(row => row.waitId === secondWait!.waitId)?.sourceStepId).toBe(secondWait!.stepId)
-      const firstClaimOrdinal = claimSteps.rows.find(row => row.waitId === firstWait.rows[0]!.id)?.claimOrdinal
-      if (firstClaimOrdinal === undefined) throw new Error("two_historical_wait_first_claim_step_missing")
-      const firstClaimStepId = "task:" + ids.waiterTaskId + ":step:" + firstClaimOrdinal + ":attempt:1"
-      const claimStepIds = claimSteps.rows.map(row => `task:${ids.waiterTaskId}:step:${row.claimOrdinal}:attempt:1`)
-      const secondClaimOrdinal = claimSteps.rows.find(row => row.waitId === secondWait!.waitId)?.claimOrdinal
-      if (secondClaimOrdinal === undefined) throw new Error("two_historical_wait_second_claim_step_missing")
-      const secondClaimStepId = `task:${ids.waiterTaskId}:step:${secondClaimOrdinal}:attempt:1`
+      expect(sourceWaitSteps.rows).toHaveLength(2)
+      expect(sourceWaitSteps.rows.map(row => row.waitId).sort()).toEqual([firstWait.rows[0]!.id, secondWait!.waitId].sort())
+      expect(sourceWaitSteps.rows.find(row => row.waitId === secondWait!.waitId)?.sourceStepId).toBe(secondWait!.stepId)
+      const claimSteps: Array<{ waitId: string; sourceStepId: string; sourceOrdinal: number; claimStepId: string; claimOrdinal: number }> = []
+      for (const source of sourceWaitSteps.rows) {
+        const sourceMatch = new RegExp(`^task:${ids.waiterTaskId}:step:(0|[1-9]\\d*):attempt:(1|[1-9]\\d*)$`).exec(source.sourceStepId)
+        if (!sourceMatch || !Number.isSafeInteger(Number(sourceMatch[1])) || Number(sourceMatch[2]) !== source.sourceAttempt
+          || !Number.isSafeInteger(Number(sourceMatch[1]) + 1)) throw new Error("two_historical_wait_source_logical_step_invalid")
+        const expectedClaimStepId = `task:${ids.waiterTaskId}:step:${Number(sourceMatch[1]) + 1}:attempt:${source.sourceAttempt}`
+        const firstLaterClaim = await pool.query<{ claimStepId: string; claimOrdinal: number }>(`SELECT next."id" AS "claimStepId", next."ordinal" AS "claimOrdinal"
+          FROM "agent_wait_conditions" AS wait
+          JOIN "agent_steps" AS source ON source."id" = wait."stepId" AND source."sessionId" = wait."sessionId"
+            AND source."turnId" = wait."turnId" AND source."taskId" = wait."parentTaskId"
+          JOIN "agent_steps" AS next ON next."id" = $6 AND next."sessionId" = source."sessionId"
+            AND next."turnId" = source."turnId" AND next."taskId" = source."taskId" AND next."attempt" = source."attempt"
+            AND next."ordinal" > source."ordinal"
+            AND next."ordinal" = (SELECT MIN(later."ordinal") FROM "agent_steps" AS later
+              WHERE later."sessionId" = source."sessionId" AND later."turnId" = source."turnId" AND later."taskId" = source."taskId"
+                AND later."attempt" = source."attempt" AND later."ordinal" > source."ordinal")
+          WHERE wait."id" = $1 AND wait."parentTaskId" = $2 AND wait."sessionId" = $3 AND wait."turnId" = $4
+            AND source."id" = $5 AND source."ordinal" = $7 AND source."attempt" = $8`,
+        [source.waitId, ids.waiterTaskId, ids.sessionId, ids.turnId, source.sourceStepId, expectedClaimStepId, source.sourceOrdinal, source.sourceAttempt])
+        expect(firstLaterClaim.rows).toHaveLength(1)
+        expect(firstLaterClaim.rows[0]?.claimStepId).toBe(expectedClaimStepId)
+        claimSteps.push({ waitId: source.waitId, sourceStepId: source.sourceStepId, sourceOrdinal: source.sourceOrdinal,
+          claimStepId: firstLaterClaim.rows[0]!.claimStepId, claimOrdinal: firstLaterClaim.rows[0]!.claimOrdinal })
+      }
+      const firstClaimStepId = claimSteps.find(row => row.waitId === firstWait.rows[0]!.id)?.claimStepId
+      if (firstClaimStepId === undefined) throw new Error("two_historical_wait_first_claim_step_missing")
+      const claimStepIds = claimSteps.map(row => row.claimStepId)
+      const secondClaim = claimSteps.find(row => row.waitId === secondWait!.waitId)
+      if (!secondClaim) throw new Error("two_historical_wait_second_claim_step_missing")
+      const secondClaimStepId = secondClaim.claimStepId
+      const secondClaimOrdinal = secondClaim.claimOrdinal
       const readClaimLifecycle = async () => (await pool.query<{ callId: string; stepId: string; startCount: number; terminalCount: number; resultCount: number }>(
         `SELECT call."content"->>'toolCallId' AS "callId", call."stepId", (SELECT COUNT(*)::int FROM "agent_events" AS started
           WHERE started."sessionId" = call."sessionId" AND started."turnId" = call."turnId" AND started."taskId" = call."taskId"
@@ -5333,7 +5530,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
           ORDER BY call."stepId"`, [ids.sessionId, ids.turnId, ids.waiterTaskId, claimStepIds])).rows
       const readClaimLocationDiagnostic = async (): Promise<unknown> => {
         try {
-          const expected = claimSteps.rows.slice(0, 2).map(row => ({ sourceOrdinal: row.claimOrdinal - 1,
+          const expected = claimSteps.slice(0, 2).map(row => ({ sourceOrdinal: row.sourceOrdinal,
             expectedClaimOrdinal: row.claimOrdinal,
             callId: `${ids.loopCallPrefix}:${row.waitId}:attempt:1` }))
           const result = await pool.query<{ sourceOrdinal: number; expectedClaimOrdinal: number; matchedClaimOrdinal: number | null;
