@@ -1,5 +1,12 @@
 /** Rebinds every persisted call/result pair to its exact six-event writer chain. */
 export function historicalSourceStepCallChainBinding(path: string): string {
+  return historicalSourceStepCallChainSql(path).binding
+}
+
+export function historicalSourceStepCallChainSql(path: string): Readonly<{
+  binding: string; itemCardinality: string; allItems: string; commentCardinality: string; eventCardinality: string
+  anchorChain: string; finalClose: string; validCallCount: string; callCount: string; callScope: string; validCallItem: string; chain: string
+}> {
   const items = `(CASE WHEN jsonb_typeof(${path}->'items') = 'array' THEN ${path}->'items' ELSE '[]'::jsonb END)`
   const events = `(CASE WHEN jsonb_typeof(${path}->'events') = 'array' THEN ${path}->'events' ELSE '[]'::jsonb END)`
   const firstEvent = `(${events}->0->>'id')`, lastEvent = `(${events}->(jsonb_array_length(${events}) - 1)->>'id')`
@@ -125,8 +132,7 @@ export function historicalSourceStepCallChainBinding(path: string): string {
       AND closeEvent."id" = ${events}->(jsonb_array_length(${events}) - 1)->>'id'
       AND closeEvent."payload" = jsonb_build_object('stepId', boundSource."id", 'status', 'waiting_for_dependency',
         'toolCallCount', modelDone."payload"->'toolCallCount', 'taskId', boundSource."taskId")) ELSE TRUE END)`
-  const validCalls = `(SELECT COUNT(*) FROM "agent_items" AS callItem WHERE ${callScope}
-    AND CASE WHEN jsonb_typeof(callItem."content") = 'object' THEN (SELECT COUNT(*) FROM jsonb_object_keys(callItem."content")) = 6
+  const validCallItem = `CASE WHEN jsonb_typeof(callItem."content") = 'object' THEN (SELECT COUNT(*) FROM jsonb_object_keys(callItem."content")) = 6
       AND callItem."content" ?& ARRAY['toolCallId','toolName','toolVersion','status','errorCode','input'] ELSE FALSE END
     AND callItem."status" = 'completed' AND callItem."revision" = 1 AND callItem."phase" IS NULL
     AND jsonb_typeof(callItem."content"->'input') = 'object' AND callItem."content"->>'toolVersion' = '1'
@@ -144,7 +150,9 @@ export function historicalSourceStepCallChainBinding(path: string): string {
       OR (callItem."content"->>'status' IN ('failed','cancelled')
         AND jsonb_typeof(callItem."content"->'errorCode') IN ('null','string')
         AND (callItem."content"->'errorCode' = 'null'::jsonb OR callItem."content"->>'errorCode' ~ '^[A-Za-z0-9_.:-]{1,128}$')
-        AND COALESCE(callItem."content"->>'errorCode','') NOT IN ('policy_requires_approval','policy_requires_user_input','gmail_oauth_required','session_pause_requested')))
+        AND COALESCE(callItem."content"->>'errorCode','') NOT IN ('policy_requires_approval','policy_requires_user_input','gmail_oauth_required','session_pause_requested')))`
+  const validCalls = `(SELECT COUNT(*) FROM "agent_items" AS callItem WHERE ${callScope}
+    AND ${validCallItem}
     AND (SELECT COUNT(*) FROM "agent_items" AS resultItem WHERE ${resultScope} AND ${resultForCall}) = 1
     AND ${chain})`
   const validComments = `(SELECT COUNT(*) FROM "agent_items" AS commentItem WHERE ${commentScope}
@@ -219,10 +227,13 @@ export function historicalSourceStepCallChainBinding(path: string): string {
             THEN (modelUsage."payload"->'usage'->>'outputTokens')::numeric >= 0 ELSE FALSE END
           AND CASE WHEN jsonb_typeof(modelUsage."payload"->'usage'->'estimatedCostUsd') = 'number'
             THEN (modelUsage."payload"->'usage'->>'estimatedCostUsd')::numeric >= 0 ELSE FALSE END ELSE FALSE END))`
-  return `(${calls} = ${results} AND ${projectedCalls} = ${calls} AND ${projectedResults} = ${results}
-    AND ${allItems} = ${calls} + ${results} + ${comments} AND ${comments} <= 2
-    AND ${projectedComments} = ${comments} AND ${validComments} = ${comments} AND ${anchorChain} AND ${finalClose}
-    AND jsonb_array_length(${events}) = 5 + ${calls} * 6 + ${comments} * 3 + CASE WHEN ${path}->>'terminalMode' = 'step_completed' THEN 1 ELSE 0 END
-    AND (SELECT COUNT(DISTINCT projected.value->>'idempotencyKey') FROM jsonb_array_elements(${events}) AS projected(value)) = jsonb_array_length(${events})
+  const itemCardinality = `${calls} = ${results} AND ${projectedCalls} = ${calls} AND ${projectedResults} = ${results}`
+  const allItemsValid = `${allItems} = ${calls} + ${results} + ${comments}`
+  const commentCardinality = `${comments} <= 2 AND ${projectedComments} = ${comments} AND ${validComments} = ${comments}`
+  const eventCardinality = `jsonb_array_length(${events}) = 5 + ${calls} * 6 + ${comments} * 3 + CASE WHEN ${path}->>'terminalMode' = 'step_completed' THEN 1 ELSE 0 END
+    AND (SELECT COUNT(DISTINCT projected.value->>'idempotencyKey') FROM jsonb_array_elements(${events}) AS projected(value)) = jsonb_array_length(${events})`
+  const binding = `(${itemCardinality} AND ${allItemsValid} AND ${commentCardinality} AND ${anchorChain} AND ${finalClose} AND ${eventCardinality}
     AND ${validCalls} = ${calls})`
+  return { binding, itemCardinality, allItems: allItemsValid, commentCardinality, eventCardinality, anchorChain, finalClose,
+    validCallCount: validCalls, callCount: calls, callScope, validCallItem, chain }
 }

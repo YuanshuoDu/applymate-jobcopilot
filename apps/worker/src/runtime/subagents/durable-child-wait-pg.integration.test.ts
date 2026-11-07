@@ -32,6 +32,7 @@ import { buildCognitiveAgendaReceipt, cognitiveAgendaReceiptIdempotencyKey } fro
 import { readChildWaitTerminalCallProjections } from "./pg-store-expiry-historical-wait-projections.js"
 import { historicalSourceStepCallChainBinding, historicalSourceStepCallCountBinding, historicalSourceStepEventChainBinding,
   readCanonicalHistoricalSourceStepPrefix } from "./pg-store-expiry-historical-source-step-prefix.js"
+import { historicalSourceStepCallChainDiagnosticSql } from "./pg-store-expiry-historical-source-step-call-binding-diagnostics.js"
 import { MAX_STEP_TOOL_CALLS, readCanonicalWaitStepToolChain } from "./pg-store-expiry-step-tool-chain-proof.js"
 import { safeSubagentWaitJson } from "./subagent-wait-structural-ids.js"
 
@@ -635,6 +636,7 @@ async function diagnoseHistoricalSourceFinalBinding(client: PoolClient, task: Bl
   const sourceProjections = projections.filter(projection => projection.sourceWait.claimKeyDigest === null
     && projection.rawCallId === sourceCallId)
   const path = historicalSourceStepPrefixPath("proof.value")
+  const callSegments = historicalSourceStepCallChainDiagnosticSql(path)
   const sql = `WITH typed_params AS MATERIALIZED (SELECT $1::text, $2::text, $3::text, $4::text, $5::text,
       $6::integer, $7::timestamptz, $8::text, $9::text, $10::text, $11::text, $12::text, $13::jsonb, $14::text)
     SELECT
@@ -652,6 +654,14 @@ async function diagnoseHistoricalSourceFinalBinding(client: PoolClient, task: Bl
         THEN (${HISTORICAL_SOURCE_STEP_PREFIX_SQL}) ELSE FALSE END AS "sourceStepPrefixBinding",
       (${historicalSourceStepEventChainBinding(path)}) AS "sourceEventChain",
       (${historicalSourceStepCallChainBinding(path)}) AS "sourceCallChain",
+      (${callSegments.itemCardinality}) AS "callItemCardinality",
+      (${callSegments.allItems}) AS "callAllItems",
+      (${callSegments.commentCardinality}) AS "callCommentCardinality",
+      (${callSegments.eventCardinality}) AS "callEventCardinality",
+      (${callSegments.anchorChain}) AS "callChainAnchor",
+      (${callSegments.finalClose}) AS "callChainFinalClose",
+      (${callSegments.validCallCount} = ${callSegments.callCount}) AS "callRowsValid",
+      ${callSegments.perCallChecks} AS "perCallChecks",
       (${historicalSourceStepCallCountBinding(path)}) AS "sourceCallCount",
       (${CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL}) AS "historicalWaitBinding",
       CASE WHEN settled."id" IS NULL THEN FALSE ELSE (${CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL}) END AS "terminalSettlement"
@@ -701,11 +711,21 @@ async function diagnoseHistoricalSourceFinalBinding(client: PoolClient, task: Bl
     sourceProjectionCount: sourceProjections.length, bindingRowCount: rows.rows.length }
   const row = rows.rows[0]!
   const flag = (key: string) => row[key] === true
+  const rawCallChecks = Array.isArray(row.perCallChecks) ? row.perCallChecks.slice(0, 17) : []
+  const perCallChecks = rawCallChecks.map(value => {
+    const fields = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
+    return { isSourceWait: fields.isSourceWait === true, contentValid: fields.contentValid === true, eventChainValid: fields.eventChainValid === true }
+  })
   return { outcome: "evaluated", sourceProjectionCount: 1,
     sourceProjectionMatch: flag("sourceProjectionMatch"), ownerLeaseFence: flag("ownerLeaseFence"),
     sourceReceiptBinding: flag("sourceReceiptBinding"), sourceEventAndStepBinding: flag("sourceEventAndStepBinding"),
     sourceStepPrefixBinding: flag("sourceStepPrefixBinding"), sourceEventChain: flag("sourceEventChain"),
-    sourceCallChain: flag("sourceCallChain"), sourceCallCount: flag("sourceCallCount"),
+    sourceCallChain: flag("sourceCallChain"), callItemCardinality: flag("callItemCardinality"),
+    callAllItems: flag("callAllItems"),
+    callCommentCardinality: flag("callCommentCardinality"), callEventCardinality: flag("callEventCardinality"),
+    callChainAnchor: flag("callChainAnchor"),
+    callChainFinalClose: flag("callChainFinalClose"), callRowsValid: flag("callRowsValid"), perCallChecks,
+    sourceCallCount: flag("sourceCallCount"),
     historicalWaitBinding: flag("historicalWaitBinding"), terminalSettlement: flag("terminalSettlement") }
 }
 
