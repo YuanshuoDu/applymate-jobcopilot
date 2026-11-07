@@ -3870,41 +3870,75 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
           validWaitResult, malformed.label, malformed.corrupt)
       }
 
-      workerF = launchWorker("worker-b-loop-claim-item-completed-cut", queueName, ids)
-      await waitForMarker(workerF, "WORKER_B_RECOVERED")
-      const workerFRecovery = parseRecoveryMarker(workerF)
-      const workerFWaiter = workerFRecovery.rows?.find(row => row.id === waiter.id)
-      const workerFTrace = boundedRecoveryTrace(workerF)
-      const workerFRecoveryReason = workerFWaiter
-        ? workerFWaiter.status === "queued" ? null : "waiter_reclaimed_with_nonqueued_status"
-        : typeof workerFTrace?.rejectionStage === "string" ? workerFTrace.rejectionStage
-          : workerFRecovery.rows ? "waiter_not_in_reclaimed_rows" : "reclaimed_rows_missing_or_unparseable"
-      const workerFBlockerDiagnostic = workerFWaiter?.status === "queued" ? null
-        : await diagnoseWorkerFBlocker(pool, ids, acknowledged!.continuationStepId, PHONE_SHAPED_WAIT_TOOL_CALL_ID, orphanCallId)
-      expect(workerFWaiter?.status, `WorkerF did not reclaim the waiter: ${JSON.stringify({
-        targetReclaimed: Boolean(workerFWaiter), targetStatus: workerFWaiter?.status ?? null,
-        reason: workerFRecoveryReason, reclaimedRowCount: workerFRecovery.rows?.length ?? null, trace: workerFTrace,
-        blockerDiagnostic: workerFBlockerDiagnostic,
-      })}`).toBe("queued")
-      const resultCutDispatch = await pool.query<{ taskStatus: string; attemptCount: number; leaseOwner: string | null }>(
-        `SELECT task."status" AS "taskStatus", task."attemptCount", task."leaseOwner" FROM "sub_agent_tasks" AS task
-         WHERE task."id" = $1 AND task."sessionId" = $2`, [waiter.id, ids.sessionId],
-      )
-      expect(resultCutDispatch.rows[0]).toMatchObject({ taskStatus: "queued", attemptCount: 1, leaseOwner: null })
-      const resultCutOutbox = await pool.query<{ attemptCount: number; publishedAt: Date | null }>(
-        `SELECT "attemptCount", "publishedAt" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch'
-         AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${waiter.id}`],
-      )
-      const resultCutGeneration = resultCutOutbox.rows[0]!.attemptCount
-      expect(resultCutOutbox.rows[0]?.publishedAt).toBeNull()
-      await expect(dispatchPendingSubagentOutbox(pool as never, queue, 50, ids.sessionId)).resolves.toBe(1)
-      const resultCutDispatchPublished = await pool.query<{ attemptCount: number; publishedAt: Date | null }>(
-        `SELECT "attemptCount", "publishedAt" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch'
-         AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${waiter.id}`],
-      )
-      expect(resultCutDispatchPublished.rows[0]).toMatchObject({ attemptCount: resultCutGeneration + 1 })
-      expect(resultCutDispatchPublished.rows[0]?.publishedAt).toBeInstanceOf(Date)
+      let resultCutGeneration: number
+      let resultCutPublishedAttemptCount: number
+      const abandonedClaimRecoveryGeneration = postAckGeneration
+      const abandonedClaimRecoveryJob = await queue.getJob(subagentDispatchJobId(waiter.id, abandonedClaimRecoveryGeneration))
+      expect(abandonedClaimRecoveryJob).toBeDefined()
+      expect(await abandonedClaimRecoveryJob!.getState()).toBe("active")
+      // Publish the replacement before BullMQ redelivers the killed worker's older generation.
+      await queue.pause()
+      queuePaused = true
+      try {
+        workerF = launchWorker("worker-b-loop-claim-item-completed-cut", queueName, ids)
+        await waitForMarker(workerF, "WORKER_B_RECOVERED")
+        let abandonedClaimRecoveryState: string | null = null
+        await waitFor(async () => {
+          abandonedClaimRecoveryState = await abandonedClaimRecoveryJob!.getState()
+          return abandonedClaimRecoveryState === "waiting" ? abandonedClaimRecoveryState : null
+        }, 45_000)
+        expect(await queue.isPaused()).toBe(true)
+        expect(abandonedClaimRecoveryState).toBe("waiting")
+        const workerFRecovery = parseRecoveryMarker(workerF)
+        const workerFWaiter = workerFRecovery.rows?.find(row => row.id === waiter.id)
+        const workerFTrace = boundedRecoveryTrace(workerF)
+        const workerFRecoveryReason = workerFWaiter
+          ? workerFWaiter.status === "queued" ? null : "waiter_reclaimed_with_nonqueued_status"
+          : typeof workerFTrace?.rejectionStage === "string" ? workerFTrace.rejectionStage
+            : workerFRecovery.rows ? "waiter_not_in_reclaimed_rows" : "reclaimed_rows_missing_or_unparseable"
+        const workerFBlockerDiagnostic = workerFWaiter?.status === "queued" ? null
+          : await diagnoseWorkerFBlocker(pool, ids, acknowledged!.continuationStepId, PHONE_SHAPED_WAIT_TOOL_CALL_ID, orphanCallId)
+        expect(workerFWaiter?.status, `WorkerF did not reclaim the waiter: ${JSON.stringify({
+          targetReclaimed: Boolean(workerFWaiter), targetStatus: workerFWaiter?.status ?? null,
+          reason: workerFRecoveryReason, reclaimedRowCount: workerFRecovery.rows?.length ?? null, trace: workerFTrace,
+          blockerDiagnostic: workerFBlockerDiagnostic,
+        })}`).toBe("queued")
+        const resultCutDispatch = await pool.query<{ taskStatus: string; attemptCount: number; leaseOwner: string | null }>(
+          `SELECT task."status" AS "taskStatus", task."attemptCount", task."leaseOwner" FROM "sub_agent_tasks" AS task
+           WHERE task."id" = $1 AND task."sessionId" = $2`, [waiter.id, ids.sessionId],
+        )
+        expect(resultCutDispatch.rows[0]).toMatchObject({ taskStatus: "queued", attemptCount: 1, leaseOwner: null })
+        const resultCutOutbox = await pool.query<{ attemptCount: number; publishedAt: Date | null }>(
+          `SELECT "attemptCount", "publishedAt" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch'
+           AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${waiter.id}`],
+        )
+        resultCutGeneration = resultCutOutbox.rows[0]!.attemptCount
+        expect(resultCutGeneration).toBe(abandonedClaimRecoveryGeneration + 1)
+        expect(resultCutOutbox.rows[0]?.publishedAt).toBeNull()
+        await expect(dispatchPendingSubagentOutbox(pool as never, queue, 50, ids.sessionId)).resolves.toBe(1)
+        const resultCutDispatchPublished = await pool.query<{ attemptCount: number; publishedAt: Date | null }>(
+          `SELECT "attemptCount", "publishedAt" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch'
+           AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${waiter.id}`],
+        )
+        resultCutPublishedAttemptCount = resultCutDispatchPublished.rows[0]!.attemptCount
+        expect(resultCutDispatchPublished.rows[0]).toMatchObject({ attemptCount: resultCutGeneration + 1 })
+        expect(resultCutDispatchPublished.rows[0]?.publishedAt).toBeInstanceOf(Date)
+        expect(resultCutDispatchPublished.rows[0]!.attemptCount - 1).toBe(resultCutGeneration)
+        expect(abandonedClaimRecoveryGeneration).toBeLessThan(resultCutDispatchPublished.rows[0]!.attemptCount - 1)
+        await queue.resume()
+        queuePaused = false
+      } finally {
+        if (queuePaused) {
+          await queue.resume()
+          queuePaused = false
+        }
+      }
       await waitForMarker(workerF, "WORKER_B_LOOP_CLAIM_ITEM_COMPLETED_BEFORE_EVENT")
+      await waitForMarker(workerF, "WORKER_B_STALE_DISPATCH_SKIPPED")
+      const preCutStaleLine = workerF.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_STALE_DISPATCH_SKIPPED "))
+      expect(JSON.parse(preCutStaleLine!.slice("WORKER_B_STALE_DISPATCH_SKIPPED ".length))).toEqual({
+        dispatchGeneration: abandonedClaimRecoveryGeneration, currentPublishedGeneration: resultCutGeneration,
+      })
       expectRestoredWaitObservation(workerF, "consumed")
       const callRowCut = await readWaitClaimState(pool, ids, acknowledged!.continuationStepId, orphanCallId, acknowledged!.sourceAttempt)
       expect(callRowCut.call).toMatchObject({ status: "completed", revision: 1, content: { toolCallId: orphanCallId } })
@@ -3947,7 +3981,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
          AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${waiter.id}`],
       )
       const completedRecoveryGeneration = completedRecoveryOutbox.rows[0]!.attemptCount
-      expect(completedRecoveryGeneration).toBe(resultCutDispatchPublished.rows[0]!.attemptCount + 1)
+      expect(completedRecoveryGeneration).toBe(resultCutPublishedAttemptCount + 1)
       expect(completedRecoveryOutbox.rows[0]?.publishedAt).toBeNull()
       expect(await abandonedBullJob!.getState()).toBe("active")
       await expect(dispatchPendingSubagentOutbox(pool as never, queue, 50, ids.sessionId)).resolves.toBe(1)
@@ -4104,7 +4138,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(finalGeneration).toBeGreaterThan(generation)
       expect(postAckGeneration).toBeGreaterThan(finalGeneration)
       expect(finalDispatch.rows[0]!.attemptCount - 1).toBe(postAckGeneration)
-      expect(resultCutDispatchPublished.rows[0]!.attemptCount - 1).toBe(resultCutGeneration)
+      expect(resultCutPublishedAttemptCount - 1).toBe(resultCutGeneration)
       expect(completedRecoveryPublished.rows[0]!.attemptCount - 1).toBe(completedRecoveryGeneration)
       const finalResumeJob = await queue.getJob(subagentDispatchJobId(waiter.id, completedRecoveryGeneration))
       expect(finalResumeJob).toBeDefined()
@@ -6248,8 +6282,9 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         await expect(blocking({ ...snapshot, userId: `${snapshot.userId}:wrong` }),
           "a different user scope must not borrow historical settlement proof").resolves.toBe(true)
 
-        const wait = await settlementClient.query<{ id: string; stepId: string; result: Record<string, unknown>; deadlineAt: Date; resolvedAt: Date;
+        const wait = await settlementClient.query<{ id: string; stepId: string; mode: "any" | "all"; result: Record<string, unknown>; deadlineAt: Date; resolvedAt: Date;
           matchedTaskIds: string[]; sourceCallItemId: string; sourceStartEventId: string; claimStartEventId: string }>(`SELECT wait."id", wait."stepId", wait."result", wait."deadlineAt", wait."resolvedAt", wait."matchedTaskIds",
+            wait."mode",
             sourceCall."id" AS "sourceCallItemId", sourceStart."id" AS "sourceStartEventId", claimStart."id" AS "claimStartEventId"
           FROM "agent_wait_conditions" AS wait
           JOIN "agent_items" AS sourceCall ON sourceCall."sessionId" = wait."sessionId" AND sourceCall."turnId" = wait."turnId"
@@ -6579,8 +6614,13 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         await expectOutcomeRejected(`UPDATE "agent_wait_conditions" SET "matchedTaskIds" = to_jsonb(ARRAY[$5::text]),
             "result" = jsonb_set("result", '{outcome,matchedTaskIds}', to_jsonb(ARRAY[$5::text]), false) ${waitScope}`,
           [wait.rows[0]!.id, ids.sessionId, ids.turnId, ids.waiterTaskId, "misbound-target"], "misbound matched IDs")
-        await expectOutcomeRejected(`UPDATE "agent_wait_conditions" SET "mode" = 'invalid' ${waitScope}`,
-          [wait.rows[0]!.id, ids.sessionId, ids.turnId, ids.waiterTaskId], "invalid wait mode")
+        const originalWaitMode = wait.rows[0]!.mode
+        expect(["any", "all"]).toContain(originalWaitMode)
+        expect(asObject(wait.rows[0]!.result.request).mode).toBe(originalWaitMode)
+        const otherValidWaitMode = originalWaitMode === "any" ? "all" : "any"
+        expect(otherValidWaitMode).not.toBe(originalWaitMode)
+        await expectOutcomeRejected(`UPDATE "agent_wait_conditions" SET "mode" = $5 ${waitScope}`,
+          [wait.rows[0]!.id, ids.sessionId, ids.turnId, ids.waiterTaskId, otherValidWaitMode], "misbound legal wait mode")
         await expectOutcomeRejected(`UPDATE "agent_wait_conditions" SET "status" = 'timed_out', "resolvedAt" = "deadlineAt" - interval '1 millisecond',
             "result" = jsonb_set("result", '{outcome,status}', to_jsonb('timed_out'::text), false) ${waitScope}`,
           [wait.rows[0]!.id, ids.sessionId, ids.turnId, ids.waiterTaskId], "timeout before deadline")
