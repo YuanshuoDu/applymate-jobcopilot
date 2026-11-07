@@ -1,12 +1,14 @@
 import { describe, expect, it, vi } from "vitest"
 import type pg from "pg"
 const graphMocks = vi.hoisted(() => ({ prepare: vi.fn(), persist: vi.fn(), reconcile: vi.fn() }))
+const completedWaitMocks = vi.hoisted(() => ({ prove: vi.fn() }))
 vi.mock("./task-graph-pg-lifecycle.js", async importOriginal => ({
   ...await importOriginal<typeof import("./task-graph-pg-lifecycle.js")>(),
   prepareGraphTransition: graphMocks.prepare,
   persistGraphTransition: graphMocks.persist,
   reconcileGraphDependents: graphMocks.reconcile,
 }))
+vi.mock("./pg-store-expiry-recovery-completed-wait.js", () => ({ hasProvenCompletedConsumedWait: completedWaitMocks.prove }))
 import { recoverExpired } from "./pg-store-expiry-recovery.js"
 import type { PgSubagentPool } from "./types.js"
 import { taskGraphLifecycleKey } from "./task-graph-snapshot.js"
@@ -614,6 +616,20 @@ describe("expired subagent recovery fence", () => {
     expect(fake.task.status).toBe("running")
     expect(fake.client.query.mock.calls.some(([sql]) => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))).toBe(false)
     expect(fake.client.query.mock.calls.some(([sql]) => sql.startsWith('UPDATE "agent_outbox" SET "payload"'))).toBe(false)
+  })
+
+  it("does not repair a proven completed consumed wait or bypass a separate unmatched tool call", async () => {
+    completedWaitMocks.prove.mockReset()
+    completedWaitMocks.prove.mockResolvedValueOnce(true)
+    const fake = fixture({ child: true, childWaitResumable: true, pendingToolStart: true })
+    await expect(recoverExpired(fake.pool as PgSubagentPool, { now: checkedAt, limit: 10 })).resolves.toEqual([])
+    expect(completedWaitMocks.prove).toHaveBeenCalledOnce()
+    expect(fake.calls.some(sql => sql.startsWith('SELECT wait.*, task."status" AS "repairTaskStatus"'))).toBe(false)
+    expect(fake.calls.some(sql => sql.includes('FROM "agent_events" AS started'))).toBe(true)
+    const blocker = fake.client.query.mock.calls.find(([sql]) => sql.includes('FROM "agent_events" AS started'))
+    expect(blocker?.[1]?.[9]).toBeNull()
+    expect(fake.calls.some(sql => sql.startsWith('UPDATE "agent_wait_conditions"'))).toBe(false)
+    expect(fake.calls.some(sql => sql.startsWith('UPDATE "sub_agent_tasks" SET "status" = $3'))).toBe(false)
   })
 
   it("does not grant attempt-neutral replay to a prior-attempt consumed wait", async () => {

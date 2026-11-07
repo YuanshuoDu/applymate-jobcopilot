@@ -1,6 +1,6 @@
 import { MAX_STEP_TOOL_CALLS } from "./pg-store-expiry-step-tool-chain-proof.js"
-import { historicalSourceStepCallChainBinding, historicalSourceStepCallCountBinding, historicalSourceStepEventChainBinding } from "./pg-store-expiry-historical-source-step-prefix.js"
-
+import { historicalSourceStepCallChainBinding, historicalSourceStepEventChainBinding } from "./pg-store-expiry-historical-source-step-prefix.js"
+import { historicalSourceStepCallCountBinding, historicalSourceStepContinuationBinding, historicalSourceStepWindowUnionBinding } from "./pg-store-expiry-historical-source-step-continuation-binding.js"
 const targets = `CASE WHEN jsonb_typeof(boundWait."targetTaskIds") = 'array' THEN boundWait."targetTaskIds" ELSE '[]'::jsonb END`
 const handoff = "proof.value->'sourceStepHandoff'", handoffEvents = `(CASE WHEN jsonb_typeof(${handoff}->'events') = 'array' THEN ${handoff}->'events' ELSE '[]'::jsonb END)`
 const handoffKeys = "'schemaVersion','waitId','stepId','attempt','sourceCallItemId','sourceCallId','sourceResultItemId','events','sourceStepPrefix'"
@@ -11,7 +11,8 @@ const sourcePrefixBinding = (path: string) => {
   const prefixEvents = `(CASE WHEN jsonb_typeof(${path}->'events') = 'array' THEN ${path}->'events' ELSE '[]'::jsonb END)`
   const prefixItems = `(CASE WHEN jsonb_typeof(${path}->'items') = 'array' THEN ${path}->'items' ELSE '[]'::jsonb END)`
   return `CASE WHEN jsonb_typeof(${path}) = 'object' THEN
-    (SELECT COUNT(*) FROM jsonb_object_keys(${path})) = 11 AND ${path} ?& ARRAY['stepId','attempt','sourceCallItemId','sourceCallId',
+    (SELECT COUNT(*) FROM jsonb_object_keys(${path})) = CASE WHEN ${path} ? 'continuationPrefix' THEN 12 ELSE 11 END
+    AND ${path} ?& ARRAY['stepId','attempt','sourceCallItemId','sourceCallId',
       'sourceResultItemId','waitKind','terminalMode','stepStartedEventId','stepCompletedEventId','events','items']
     AND ${path}->>'stepId' = boundSource."id" AND ${path}->>'attempt' = boundSource."attempt"::text
     AND ${path}->>'sourceCallItemId' = boundSourceCall."id" AND ${path}->>'sourceCallId' = boundSourceCall."content"->>'toolCallId'
@@ -44,6 +45,9 @@ const sourcePrefixBinding = (path: string) => {
           AND exactEvent."payload"->'errorCode' = expected.value->'errorCode' ELSE NOT (expected.value ? 'status' OR expected.value ? 'errorCode') END
         AND encode(sha256(convert_to(exactEvent."payload"::text,'UTF8')),'hex') = expected.value->>'payloadDigest') = jsonb_array_length(${prefixEvents})
     AND ${historicalSourceStepEventChainBinding(path)} AND ${historicalSourceStepCallChainBinding(path)} AND ${historicalSourceStepCallCountBinding(path)}
+    AND (NOT (${path} ? 'continuationPrefix') OR (${path}->>'terminalMode' = 'recovered_handoff'
+      AND ${historicalSourceStepContinuationBinding(path)}))
+    AND ${historicalSourceStepWindowUnionBinding(path)}
     AND (SELECT COUNT(DISTINCT expected.value->>'id') FROM jsonb_array_elements(${prefixEvents}) AS expected(value)) = jsonb_array_length(${prefixEvents})
     AND (SELECT COUNT(*) FROM jsonb_array_elements(${prefixEvents}) AS expected(value) WHERE CASE WHEN jsonb_typeof(expected.value) = 'object' THEN
       CASE WHEN expected.value->>'type' IN ('tool_call.completed','tool_call.failed') THEN
@@ -57,10 +61,6 @@ const sourcePrefixBinding = (path: string) => {
         AND expected.value ?& ARRAY['id','sequence','type','actor','itemId','correlationId','causationId','idempotencyKey','payloadDigest']
         AND NOT (expected.value ? 'status' OR expected.value ? 'errorCode') END ELSE FALSE END
       AND expected.value->>'payloadDigest' ~ '^[0-9a-f]{64}$' AND expected.value->>'sequence' ~ '^[1-9][0-9]{0,18}$') = jsonb_array_length(${prefixEvents})
-    AND (SELECT COUNT(*) FROM "agent_events" AS ordered WHERE ordered."sessionId" = boundSource."sessionId"
-      AND ordered."turnId" = boundSource."turnId" AND ordered."taskId" = boundSource."taskId"
-      AND ordered."sequence" BETWEEN (${prefixEvents}->0->>'sequence')::bigint
-        AND (${prefixEvents}->(jsonb_array_length(${prefixEvents}) - 1)->>'sequence')::bigint) = jsonb_array_length(${prefixEvents})
     AND NOT EXISTS (SELECT 1 FROM "agent_events" AS extra WHERE extra."sessionId" = boundSource."sessionId"
       AND extra."turnId" = boundSource."turnId" AND extra."taskId" = boundSource."taskId"
       AND (extra."correlationId" = boundSource."id" OR extra."itemId" IN (SELECT item."id" FROM "agent_items" AS item
@@ -87,7 +87,7 @@ const sourcePrefixEventsInHandoff = `(CASE WHEN jsonb_typeof(${handoff}->'source
   THEN ${handoff}->'sourceStepPrefix'->'events' ELSE '[]'::jsonb END)`
 export const HISTORICAL_SOURCE_WAIT_HANDOFF_SQL = `CASE WHEN jsonb_typeof(${handoff}) = 'object' THEN
   CASE WHEN (SELECT COUNT(*) FROM jsonb_object_keys(${handoff})) = 9 AND ${handoff} ?& ARRAY[${handoffKeys}]
-    AND ${handoff}->>'schemaVersion' = 'recovered_wait_handoff.v1' AND ${handoff}->>'waitId' = boundWait."id"
+    AND ${handoff}->>'schemaVersion' = 'recovered_wait_handoff.v2' AND ${handoff}->>'waitId' = boundWait."id"
     AND ${handoff}->>'stepId' = boundSource."id" AND ${handoff}->>'attempt' = boundSource."attempt"::text
     AND ${handoff}->>'sourceCallItemId' = boundSourceCall."id" AND ${handoff}->>'sourceCallId' = boundSourceCall."content"->>'toolCallId'
     AND ${handoff}->>'sourceResultItemId' = boundSourceResult."id" AND jsonb_array_length(${handoffEvents}) = 6

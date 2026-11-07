@@ -3,9 +3,12 @@ import { canonicalJson } from "@jobcopilot/shared"
 import { cognitiveAgendaReceiptIdempotencyKey, parseCognitiveAgendaReceipt } from "../turns/cognitive-agenda-receipt.js"
 import { projectWaitCallCompletionPayload } from "../turns/turn-execution-wait-event-projection.js"
 import { MAX_STEP_TOOL_CALLS, exactKeys, record } from "./pg-store-expiry-step-tool-chain-proof.js"
+import { HISTORICAL_CONTINUATION_PREFIX_EVENT_COUNT, readCanonicalHistoricalSourceStepContinuationPrefix,
+  type HistoricalSourceStepContinuationPrefix } from "./pg-store-expiry-historical-source-step-continuation-prefix.js"
 
 type Row = Record<string, unknown>
-type Scope = Readonly<{ id: string; sessionId: string; turnId: string }>
+type Scope = Readonly<{ id: string; sessionId: string; turnId: string; rootTaskId?: string; userId?: string; leaseOwner?: string;
+  attemptCount?: number; leaseExpiresAt?: Date }>
 type Event = Row & { id: string; sequence: string; type: string; actor: string; itemId: string | null; correlationId: string;
   causationId: string | null; idempotencyKey: string; payload: unknown; payloadDigest: string }
 type Item = Row & { id: string; sessionId: string; turnId: string; taskId: string; stepId: string; type: string; status: string;
@@ -16,8 +19,10 @@ type ItemBinding = Readonly<{ id: string; type: string; status: string; revision
 type TerminalMode = "step_completed" | "recovered_handoff"
 export type HistoricalSourceStepPrefix = Readonly<{ stepId: string; attempt: number; sourceCallItemId: string; sourceCallId: string;
   sourceResultItemId: string; waitKind: "normal_waiting" | "recovered"; terminalMode: TerminalMode; stepStartedEventId: string;
+  continuationPrefix?: HistoricalSourceStepContinuationPrefix;
   stepCompletedEventId: string | null; events: readonly EventBinding[]; items: readonly ItemBinding[] }>
 const MAX_EVENTS = MAX_STEP_TOOL_CALLS * 9 + 16
+const MAX_EVENT_WINDOW = MAX_EVENTS + HISTORICAL_CONTINUATION_PREFIX_EVENT_COUNT
 const MAX_PERSISTED_EVENT_ID_LENGTH = 1024
 const MAX_PERSISTED_ITEM_ID_LENGTH = 512
 const EARLY_STOP_ERROR_CODES = new Set(["policy_requires_approval", "policy_requires_user_input", "gmail_oauth_required", "session_pause_requested"])
@@ -77,11 +82,11 @@ export async function readCanonicalHistoricalSourceStepPrefix(client: pg.PoolCli
   const from = sequence(start.sequence), through = sequence(stepDone.sequence)
   if (!from || !through || from >= through) return null
   const [eventRows, itemRows] = await Promise.all([
-    client.query<Event>(`SELECT "id", "sequence"::text AS "sequence", "type", "actor", "itemId", "correlationId", "causationId", "idempotencyKey", "payload",
+    client.query<Event>(`SELECT "id", "sessionId", "turnId", "taskId", "sequence"::text AS "sequence", "type", "actor", "itemId", "correlationId", "causationId", "idempotencyKey", "payload",
         encode(sha256(convert_to("payload"::text, 'UTF8')), 'hex') AS "payloadDigest"
       FROM "agent_events" AS sourceEvent WHERE sourceEvent."sessionId" = $1 AND sourceEvent."turnId" = $2 AND sourceEvent."taskId" = $3
         AND sourceEvent."sequence" BETWEEN $4::bigint AND $5::bigint
-      ORDER BY sourceEvent."sequence" LIMIT ${MAX_EVENTS + 1}`,
+      ORDER BY sourceEvent."sequence" LIMIT ${MAX_EVENT_WINDOW + 1}`,
     [task.sessionId, task.turnId, task.id, from.toString(), through.toString()]),
     client.query<Item>(`SELECT "id", "sessionId", "turnId", "taskId", "stepId", "type", "status", "revision", "phase", "content",
         encode(sha256(convert_to("content"::text, 'UTF8')), 'hex') AS "contentDigest"
@@ -89,8 +94,22 @@ export async function readCanonicalHistoricalSourceStepPrefix(client: pg.PoolCli
       ORDER BY "createdAt", "id" LIMIT ${MAX_STEP_TOOL_CALLS * 2 + 3}`,
     [task.sessionId, task.turnId, task.id, input.stepId]),
   ])
-  if (eventRows.rows.length > MAX_EVENTS || itemRows.rows.length > MAX_STEP_TOOL_CALLS * 2 + 2) return null
-  return provePrefix(task, { ...input, terminalMode }, eventRows.rows, itemRows.rows, keys)
+  if (eventRows.rows.length > MAX_EVENT_WINDOW || itemRows.rows.length > MAX_STEP_TOOL_CALLS * 2 + 2) return null
+  const sourcePrefix = provePrefix(task, { ...input, terminalMode }, eventRows.rows, itemRows.rows, keys)
+  if (sourcePrefix || terminalMode !== "recovered_handoff") return sourcePrefix
+  const sourceCall = itemRows.rows.find(item => item.id === input.callItemId)
+  if (!sourceCall || task.attemptCount === undefined) return null
+  const continuationPrefix = await readCanonicalHistoricalSourceStepContinuationPrefix(client, task, {
+    sourceStepId: input.stepId, sourceAttempt: input.attempt, sourceCallItemId: input.callItemId, sourceCallId: input.callId,
+    sourceCallInput: record(sourceCall.content).input, windowEvents: eventRows.rows,
+    windowStartEventId: start.id, windowEndEventId: stepDone.id,
+  })
+  if (!continuationPrefix) return null
+  const continuationEventIds = new Set(continuationPrefix.events.map(event => event.id))
+  const sourceEvents = eventRows.rows.filter(event => !continuationEventIds.has(event.id))
+  const provedSource = provePrefix(task, { ...input, terminalMode }, sourceEvents, itemRows.rows, keys)
+  if (!provedSource || provedSource.events.length + continuationPrefix.events.length !== eventRows.rows.length) return null
+  return { ...provedSource, continuationPrefix }
 }
 function provePrefix(task: Scope, input: { stepId: string; attempt: number; callItemId: string; callId: string; resultItemId: string;
   waitKind: "normal_waiting" | "recovered"; terminalMode: TerminalMode }, events: readonly Event[], items: readonly Item[], keys: readonly string[]): HistoricalSourceStepPrefix | null {
@@ -208,36 +227,4 @@ function appendCommentProof(take: (type: string, key: string, correlation: strin
 }
 export { historicalSourceStepEventChainBinding } from "./pg-store-expiry-historical-source-step-parent-binding.js"
 export { historicalSourceStepCallChainBinding } from "./pg-store-expiry-historical-source-step-call-binding.js"
-export function historicalSourceStepCallCountBinding(path: string): string {
-  const events = `(CASE WHEN jsonb_typeof(${path}->'events') = 'array' THEN ${path}->'events' ELSE '[]'::jsonb END)`
-  const scopedCalls = `callItem."sessionId" = boundSource."sessionId" AND callItem."turnId" = boundSource."turnId"
-    AND callItem."taskId" = boundSource."taskId" AND callItem."stepId" = boundSource."id" AND callItem."type" = 'tool_call'`
-  const calls = `(SELECT COUNT(*) FROM "agent_items" AS callItem WHERE ${scopedCalls})`
-  const distinctCalls = `(SELECT COUNT(DISTINCT callItem."content"->>'toolCallId') FROM "agent_items" AS callItem WHERE ${scopedCalls})`
-  const firstEvent = `(${events}->0->>'id')`, lastEvent = `(${events}->(jsonb_array_length(${events}) - 1)->>'id')`
-  const scopedStarts = `started."sessionId" = boundSource."sessionId" AND started."turnId" = boundSource."turnId"
-    AND started."taskId" = boundSource."taskId" AND started."type" = 'tool_call.started'
-    AND started."sequence" BETWEEN (SELECT anchor."sequence" FROM "agent_events" AS anchor WHERE anchor."id" = ${firstEvent}
-      AND anchor."sessionId" = boundSource."sessionId" AND anchor."turnId" = boundSource."turnId" AND anchor."taskId" = boundSource."taskId")
-      AND (SELECT anchor."sequence" FROM "agent_events" AS anchor WHERE anchor."id" = ${lastEvent}
-        AND anchor."sessionId" = boundSource."sessionId" AND anchor."turnId" = boundSource."turnId" AND anchor."taskId" = boundSource."taskId")`
-  const started = `(SELECT COUNT(*) FROM "agent_events" AS started WHERE ${scopedStarts})`
-  const distinctStarts = `(SELECT COUNT(DISTINCT started."correlationId") FROM "agent_events" AS started WHERE ${scopedStarts})`
-  const startedCalls = `(SELECT COUNT(DISTINCT started."correlationId") FROM "agent_events" AS started JOIN "agent_items" AS callItem
-    ON callItem."id" = started."itemId" AND ${scopedCalls} WHERE ${scopedStarts}
-      AND started."actor" = 'subagent' AND started."correlationId" = callItem."content"->>'toolCallId'
-      AND started."idempotencyKey" = 'task:' || owner."id" || ':event:tool-started:' || (callItem."content"->>'toolCallId')
-      AND started."payload" = jsonb_build_object('toolCallId', callItem."content"->>'toolCallId', 'toolName', callItem."content"->>'toolName', 'taskId', owner."id"))`
-  const finalSourceStart = `(SELECT MAX(sourceStart."sequence") FROM "agent_events" AS sourceStart WHERE sourceStart."sessionId" = boundSource."sessionId"
-    AND sourceStart."turnId" = boundSource."turnId" AND sourceStart."taskId" = boundSource."taskId" AND sourceStart."type" = 'tool_call.started'
-    AND sourceStart."actor" = 'subagent' AND sourceStart."itemId" = boundSourceCall."id"
-    AND sourceStart."correlationId" = boundSourceCall."content"->>'toolCallId'
-    AND sourceStart."idempotencyKey" = 'task:' || boundSource."taskId" || ':event:tool-started:' || (boundSourceCall."content"->>'toolCallId'))`
-  return `(SELECT COUNT(*) FROM jsonb_array_elements(${events}) AS projected(value) JOIN "agent_events" AS modelDone ON modelDone."id" = projected.value->>'id'
-    AND modelDone."sessionId" = boundSource."sessionId" AND modelDone."turnId" = boundSource."turnId" AND modelDone."taskId" = boundSource."taskId"
-      AND modelDone."type" = 'model.completed' WHERE jsonb_typeof(modelDone."payload"->'toolCallCount') = 'number'
-      AND CASE WHEN modelDone."payload"->>'toolCallCount' ~ '^(0|[1-9][0-9]?)$'
-        THEN (modelDone."payload"->>'toolCallCount')::integer BETWEEN ${calls} AND ${MAX_STEP_TOOL_CALLS} ELSE FALSE END
-      AND ${calls} = ${distinctCalls} AND ${started} = ${calls} AND ${distinctStarts} = ${calls} AND ${startedCalls} = ${calls}
-      AND (SELECT MAX(started."sequence") FROM "agent_events" AS started WHERE ${scopedStarts}) = ${finalSourceStart}) = 1`
-}
+export { historicalSourceStepCallCountBinding } from "./pg-store-expiry-historical-source-step-continuation-binding.js"

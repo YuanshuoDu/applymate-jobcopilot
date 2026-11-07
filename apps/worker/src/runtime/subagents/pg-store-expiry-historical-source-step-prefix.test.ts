@@ -379,7 +379,7 @@ describe("historical source wait step prefix", () => {
     expect(sqlBalance(HISTORICAL_SOURCE_STEP_PREFIX_SQL)).toBe(0)
     expect(HISTORICAL_SOURCE_STEP_PREFIX_SQL).toContain("exactEvent.\"sessionId\" = boundSource.\"sessionId\"")
     expect(HISTORICAL_SOURCE_STEP_PREFIX_SQL).toContain("exactItem.\"taskId\" = boundSource.\"taskId\"")
-    expect(HISTORICAL_SOURCE_STEP_PREFIX_SQL).toContain('ordered."sequence" BETWEEN')
+    expect(HISTORICAL_SOURCE_STEP_PREFIX_SQL).toContain('windowEvent."sequence" BETWEEN')
     expect(HISTORICAL_SOURCE_STEP_PREFIX_SQL).toContain("CASE WHEN jsonb_typeof(expected.value) = 'object'")
     expect(HISTORICAL_SOURCE_STEP_PREFIX_SQL).toContain("BETWEEN 2 AND")
     expect(HISTORICAL_SOURCE_STEP_PREFIX_SQL).toContain('exactEvent."payload"->>\'status\' = expected.value->>\'status\'')

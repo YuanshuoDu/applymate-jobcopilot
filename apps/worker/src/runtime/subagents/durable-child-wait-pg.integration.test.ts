@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto"
 import { spawn, type ChildProcess } from "node:child_process"
 import { fileURLToPath } from "node:url"
-import { Queue } from "bullmq"
+import { Queue, Worker } from "bullmq"
 import { Pool, type PoolClient } from "pg"
 import { Redis } from "ioredis"
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
@@ -2082,7 +2082,7 @@ async function expectCompletedClaimBeforeItemEventSafety(
       sourceAttempt: exactSourceProjection.sourceAttempt, sourceCallItemId: exactSourceProjection.callItemId,
       sourceCallId: exactSourceProjection.rawCallId, projectedSourceCallId: exactSourceProjection.projectedCallId })
     expect(exactSourceProof).not.toHaveProperty("sourceStepPrefix")
-    expect(exactSourceProof.sourceStepHandoff).toMatchObject({ schemaVersion: "recovered_wait_handoff.v1",
+    expect(exactSourceProof.sourceStepHandoff).toMatchObject({ schemaVersion: "recovered_wait_handoff.v2",
       waitId: recoveredRow.waitId, stepId: sourceStepId, attempt: exactSourceProjection.sourceAttempt,
       sourceCallItemId: exactSourceProjection.callItemId, sourceCallId: exactSourceProjection.rawCallId,
       sourceResultItemId: recoveredResultItemId, events: expect.any(Array) })
@@ -3119,6 +3119,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
     let workerF: WorkerProcess | undefined
     let workerG: WorkerProcess | undefined
     let workerH: WorkerProcess | undefined
+    let stalledRecoveryWorker: Worker<unknown, unknown> | undefined
     let queuePaused = false
     const originalRedisUrl = process.env.REDIS_URL
     let closeSharedRedisConnections: (() => Promise<void>) | undefined
@@ -3880,15 +3881,27 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       await queue.pause()
       queuePaused = true
       try {
+        const stalledRecoveryMonitor = new Worker<unknown, unknown>(queueName, async (): Promise<unknown> => {
+          throw new Error("stalled-recovery-monitor-must-not-process-jobs")
+        }, { connection: queueRedis.duplicate(), concurrency: 1, lockDuration: 15_000, stalledInterval: 250,
+          autorun: false, skipVersionCheck: true })
+        stalledRecoveryWorker = stalledRecoveryMonitor
+        try {
+          await stalledRecoveryMonitor.waitUntilReady()
+          await stalledRecoveryMonitor.startStalledCheckTimer()
+          let abandonedClaimRecoveryState: string | null = null
+          await waitFor(async () => {
+            abandonedClaimRecoveryState = await abandonedClaimRecoveryJob!.getState()
+            return abandonedClaimRecoveryState === "waiting" ? abandonedClaimRecoveryState : null
+          }, 45_000)
+          expect(await queue.isPaused()).toBe(true)
+          expect(abandonedClaimRecoveryState).toBe("waiting")
+        } finally {
+          await stalledRecoveryMonitor.close(true)
+          stalledRecoveryWorker = undefined
+        }
         workerF = launchWorker("worker-b-loop-claim-item-completed-cut", queueName, ids)
         await waitForMarker(workerF, "WORKER_B_RECOVERED")
-        let abandonedClaimRecoveryState: string | null = null
-        await waitFor(async () => {
-          abandonedClaimRecoveryState = await abandonedClaimRecoveryJob!.getState()
-          return abandonedClaimRecoveryState === "waiting" ? abandonedClaimRecoveryState : null
-        }, 45_000)
-        expect(await queue.isPaused()).toBe(true)
-        expect(abandonedClaimRecoveryState).toBe("waiting")
         const workerFRecovery = parseRecoveryMarker(workerF)
         const workerFWaiter = workerFRecovery.rows?.find(row => row.id === waiter.id)
         const workerFTrace = boundedRecoveryTrace(workerF)
@@ -4152,6 +4165,8 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       await stopWorker(workerF)
       await stopWorker(workerG)
       await stopWorker(workerH)
+      await stalledRecoveryWorker?.close(true).catch(() => undefined)
+      stalledRecoveryWorker = undefined
       await queueRedis.del(workerStartGateKey(ids)).catch(() => undefined)
       if (queuePaused) await queue.resume().catch(() => undefined)
       await queue.obliterate({ force: true }).catch(() => undefined)
@@ -5773,7 +5788,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         const sourceWaitId = repaired.wait?.id
         const handoffSource = projections.find(projection => projection.sourceWait.waitId === sourceWaitId
           && projection.sourceWait.claimKeyDigest === null)
-        expect(handoffSource?.sourceStepHandoff?.schemaVersion).toBe("recovered_wait_handoff.v1")
+        expect(handoffSource?.sourceStepHandoff?.schemaVersion).toBe("recovered_wait_handoff.v2")
         expect(handoffSource?.sourceStepHandoff?.sourceStepPrefix.items).toHaveLength(4)
         if (!handoffSource?.sourceStepHandoff) throw new Error("prior-tool recovered handoff projection missing")
         expect(handoffSource.stepId).toBe(sourceStepId)
@@ -5804,9 +5819,9 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
 
         const forgedHandoffProjection = JSON.parse(JSON.stringify(handoffSource)) as Record<string, unknown>
         const forgedHandoff = asObject(forgedHandoffProjection.sourceStepHandoff)
-        forgedHandoffProjection.sourceStepHandoff = { ...forgedHandoff, schemaVersion: "recovered_wait_handoff.forged" }
+        forgedHandoffProjection.sourceStepHandoff = { ...forgedHandoff, schemaVersion: "recovered_wait_handoff.v1" }
         await expect(historicalWaitBindingAccepts(checkClient, snapshot, forgedHandoffProjection),
-          "the final PostgreSQL binding must reject a forged in-memory recovered handoff marker").resolves.toBe(false)
+          "the final PostgreSQL binding must reject a legacy v1 recovered handoff marker").resolves.toBe(false)
         const duplicateAnchorProjection = JSON.parse(JSON.stringify(handoffSource)) as Record<string, unknown>
         const duplicateAnchorHandoff = asObject(duplicateAnchorProjection.sourceStepHandoff)
         const handoffProofEvents = Array.isArray(duplicateAnchorHandoff.events) ? duplicateAnchorHandoff.events : []
@@ -6633,10 +6648,12 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
             to_jsonb(to_char("deadlineAt" AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS') || '+00:00'), false) ${waitScope}`,
           [wait.rows[0]!.id, ids.sessionId, ids.turnId, ids.waiterTaskId], "noncanonical UTC deadline")
 
-        await expectOutcomeRejected('UPDATE "agent_wait_conditions" SET "targetTaskIds" = \'{}\'::jsonb ' + waitScope,
-          [wait.rows[0]!.id, ids.sessionId, ids.turnId, ids.waiterTaskId], "non-array target IDs")
-        await expectOutcomeRejected('UPDATE "agent_wait_conditions" SET "matchedTaskIds" = \'{}\'::jsonb ' + waitScope,
-          [wait.rows[0]!.id, ids.sessionId, ids.turnId, ids.waiterTaskId], "non-array matched IDs")
+        const misboundTargetTaskId = `subagent-${randomUUID()}`
+        await expectOutcomeRejected(`UPDATE "agent_wait_conditions" SET "targetTaskIds" = to_jsonb(ARRAY[$5::text]) ${waitScope}`,
+          [wait.rows[0]!.id, ids.sessionId, ids.turnId, ids.waiterTaskId, misboundTargetTaskId], "misbound target IDs")
+        const misboundMatchedTaskId = `subagent-${randomUUID()}`
+        await expectOutcomeRejected(`UPDATE "agent_wait_conditions" SET "matchedTaskIds" = to_jsonb(ARRAY[$5::text]) ${waitScope}`,
+          [wait.rows[0]!.id, ids.sessionId, ids.turnId, ids.waiterTaskId, misboundMatchedTaskId], "misbound matched IDs")
         await settlementClient.query("SAVEPOINT historical_wait_missing_deadline")
         try {
           const changed = await settlementClient.query(`UPDATE "agent_wait_conditions" SET "result" = jsonb_set("result", '{outcome}', ("result"->'outcome') - 'deadlineAt', false)

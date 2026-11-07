@@ -22,7 +22,7 @@ export type HistoricalWaitBinding = Readonly<{
 }>
 
 export type RecoveredWaitHandoff = Readonly<{
-  schemaVersion: "recovered_wait_handoff.v1"
+  schemaVersion: "recovered_wait_handoff.v2"
   waitId: string
   stepId: string
   attempt: number

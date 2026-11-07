@@ -41,7 +41,8 @@ function digest(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value
     ? createHash("sha256").update(value).digest("hex") : null
 }
-async function readRecoveredWaitHandoff(client: pg.PoolClient, scope: { id: string; sessionId: string; turnId: string }, wait: Record<string, unknown>,
+async function readRecoveredWaitHandoff(client: pg.PoolClient, scope: { id: string; sessionId: string; turnId: string; rootTaskId: string;
+  userId: string; leaseOwner: string; attemptCount: number; leaseExpiresAt: Date }, wait: Record<string, unknown>,
   attempt: number, callItemId: string, callId: string, resultItemId: string): Promise<RecoveredWaitHandoff | null> {
   const stepId = wait.stepId
   if (wait.sourceStepStatus !== "waiting_for_tool" || typeof stepId !== "string"
@@ -57,7 +58,7 @@ async function readRecoveredWaitHandoff(client: pg.PoolClient, scope: { id: stri
     prefix + `model-completed:${stepId}`, prefix + `model-usage:${stepId}`, prefix + `item-started:${callItemId}`]
   const events = keys.map(key => sourceStepPrefix.events.find(event => event.idempotencyKey === key))
   if (events.some(event => !event) || new Set(events.map(event => event?.id)).size !== keys.length) return null
-  return { schemaVersion: "recovered_wait_handoff.v1", waitId: String(wait.id), stepId, attempt,
+  return { schemaVersion: "recovered_wait_handoff.v2", waitId: String(wait.id), stepId, attempt,
     sourceCallItemId: callItemId, sourceCallId: callId, sourceResultItemId: resultItemId,
     events: events.map(event => ({ id: event!.id, sequence: event!.sequence, type: event!.type, actor: event!.actor,
       itemId: event!.itemId, correlationId: event!.correlationId, causationId: event!.causationId,
@@ -151,12 +152,13 @@ async function readChildWaitTerminalCallProjectionsCore(client: pg.PoolClient, t
     if (!projectedSourceCallId) continue
     const binding = sourceWaitBinding(wait, lifecycle, projectedSourceCallId)
     if (!binding) continue
-    const sourceStepPrefix = await readCanonicalHistoricalSourceStepPrefix(client, { id, sessionId, turnId }, {
+    const sourceScope = { id, sessionId, turnId, rootTaskId, userId, leaseOwner: ownerId, attemptCount, leaseExpiresAt }
+    const sourceStepPrefix = await readCanonicalHistoricalSourceStepPrefix(client, sourceScope, {
       stepId, attempt: lifecycle.sourceAttempt, callItemId: lifecycle.callItemId, callId: lifecycle.toolCallId,
       resultItemId: lifecycle.resultItemId, waitKind: binding.sourceKind,
     })
     const sourceStepHandoff = sourceStepPrefix || binding.sourceKind !== "recovered" ? null
-      : await readRecoveredWaitHandoff(client, { id, sessionId, turnId }, wait, lifecycle.sourceAttempt,
+      : await readRecoveredWaitHandoff(client, sourceScope, wait, lifecycle.sourceAttempt,
         lifecycle.callItemId, lifecycle.toolCallId, lifecycle.resultItemId)
     if (!sourceStepPrefix && !sourceStepHandoff) continue
     const sourceStepEvidence = sourceStepPrefix ? { sourceStepPrefix } : { sourceStepHandoff: sourceStepHandoff! }

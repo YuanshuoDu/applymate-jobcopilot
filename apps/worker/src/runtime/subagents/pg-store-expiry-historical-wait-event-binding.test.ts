@@ -38,7 +38,7 @@ describe("historical source lifecycle SQL binding", () => {
     expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain("sourceStepPrefix")
     expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain("sourceStepDone.\"correlationId\" = boundSource.\"id\"")
     expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain("sourceStepDone.\"idempotencyKey\" = 'task:' || boundSource.\"taskId\" || ':event:step-completed:' || boundSource.\"id\"")
-    expect(CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL).toContain("recovered_wait_handoff.v1")
+    expect(CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL).toContain("recovered_wait_handoff.v2")
     expect(CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL).not.toMatch(unparenthesizedJsonExtractionAfterConcat)
   })
 })

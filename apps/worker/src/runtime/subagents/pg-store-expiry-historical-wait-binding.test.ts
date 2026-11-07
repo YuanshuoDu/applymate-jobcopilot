@@ -105,11 +105,11 @@ describe("final historical wait receipt binding", () => {
   })
 
   it("accepts recovered handoff only as source evidence while retaining the complete claim proof", () => {
-    expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain("recovered_wait_handoff.v1")
+    expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain("recovered_wait_handoff.v2")
     expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain('boundSource."status" = \'waiting_for_tool\'')
     expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain('sourceStepDone."type" = \'step.completed\'')
     expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain('scopedItem."stepId" = boundSource."id")')
-    expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain("ordered.\"sequence\" BETWEEN")
+    expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain("windowEvent.\"sequence\" BETWEEN")
     expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain("WITH ORDINALITY AS expected(value, ordinality)")
     expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain("'ordinal', boundSource.\"ordinal\"")
     expect(HISTORICAL_SOURCE_WAIT_HANDOFF_SQL).toContain("toolCallCount")

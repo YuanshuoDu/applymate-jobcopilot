@@ -247,7 +247,7 @@ describe("bounded historical wait projections", () => {
     const projections = await readChildWaitTerminalCallProjections(client([source], [completedClaim(source, 1)], handoff) as never, task)
     const sourceProjection = projections.find(row => row.callItemId === source.sourceCallItemId)
     const claimProjection = projections.find(row => row.sourceWait.claimKeyDigest !== null)
-    expect(sourceProjection?.sourceStepHandoff).toMatchObject({ schemaVersion: "recovered_wait_handoff.v1",
+    expect(sourceProjection?.sourceStepHandoff).toMatchObject({ schemaVersion: "recovered_wait_handoff.v2",
       waitId: source.id, stepId: source.stepId, sourceCallItemId: source.sourceCallItemId, events: expect.any(Array) })
     expect(sourceProjection).not.toHaveProperty("sourceStepPrefix")
     expect(claimProjection?.sourceStepHandoff).toEqual(sourceProjection?.sourceStepHandoff)
