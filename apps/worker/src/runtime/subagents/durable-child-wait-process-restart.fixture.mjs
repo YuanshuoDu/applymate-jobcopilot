@@ -94,7 +94,7 @@ function traceLoopFailure() {
 const restoredWaitDiagnosticStages = new Set(["owner_fence", "observation_projection"])
 const restoredWaitDiagnosticPhases = new Set(["start", "pass", "fail"])
 const restoredWaitDiagnosticFailures = new Set([
-  "owner_fence_rejected", "observation_missing", "projected_observation_missing", "model_projection_invalid", "other",
+  "owner_fence_rejected", "observation_missing", "projected_observation_binding_invalid", "model_projection_invalid", "other",
 ])
 let restoredWaitDiagnosticCount = 0
 function traceRestoredWaitDiagnostic(stage, phase, failure) {
@@ -108,7 +108,7 @@ function traceRestoredWaitDiagnostic(stage, phase, failure) {
 function restoredWaitDiagnosticFailure(error) {
   if (!(error instanceof Error)) return "other"
   if (error.message === "durable_child_wait_restored_observation_missing") return "observation_missing"
-  if (error.message === "durable_child_wait_projected_observation_missing") return "projected_observation_missing"
+  if (error.message === "durable_child_wait_projected_observation_binding_invalid") return "projected_observation_binding_invalid"
   if (error.message === "durable_child_wait_model_projection_invalid") return "model_projection_invalid"
   return "other"
 }
@@ -317,21 +317,30 @@ function restoredWaitObservationSummary(restored, wait, pendingWait, owner, step
   const content = matches[0].content
   const snapshot = { system: [], profile: [], steerHistory: [], businessRefs: [], toolObservations: restored.observations }
   const projection = projectChildToolCallIdsForModelContext(snapshot, owner, stepId)
-  const projectedMatches = projection.snapshot.toolObservations.filter(item => item?.content?.toolName === "wait_subagents")
-  if (projectedMatches.length !== 1) throw new Error("durable_child_wait_projected_observation_missing")
+  const projectedMatches = projection.snapshot.toolObservations.filter(item => item?.content?.toolName === "wait_subagents"
+    && (item.content.toolCallId === wait.toolCallId || projection.aliasToCanonical.get(item.content.toolCallId) === wait.toolCallId))
+  if (projectedMatches.length !== 1) throw new Error("durable_child_wait_projected_observation_binding_invalid")
   const projectedId = projectedMatches[0].content.toolCallId
+  const projectedCanonicalId = projection.aliasToCanonical.get(projectedId) ?? projectedId
   const blocks = projection.snapshot.toolObservations.map(item => ({ ...item,
     layer: "tool_observation", role: "data", trust: "external_untrusted", source: "tool_or_subagent" }))
   const messages = contextToModelMessages({ blocks })
   const parts = messages.flatMap(message => Array.isArray(message.content) ? message.content : [])
-  const toolUse = parts.find(part => part?.type === "tool_use" && part.name === "wait_subagents")
-  const toolResult = parts.find(part => part?.type === "tool_result" && part.toolUseId === projectedId)
+  const toolUses = parts.filter(part => part?.type === "tool_use" && part.name === "wait_subagents" && part.id === projectedId)
+  const toolResults = parts.filter(part => part?.type === "tool_result" && part.toolUseId === projectedId)
+  const toolUse = toolUses[0]
+  const toolResult = toolResults[0]
   const repeated = projectChildToolCallIdsForModelContext(snapshot, owner, stepId)
-  const repeatedId = repeated.snapshot.toolObservations.find(item => item?.content?.toolName === "wait_subagents")?.content?.toolCallId
+  const repeatedMatches = repeated.snapshot.toolObservations.filter(item => item?.content?.toolName === "wait_subagents"
+    && (item.content.toolCallId === wait.toolCallId || repeated.aliasToCanonical.get(item.content.toolCallId) === wait.toolCallId))
+  const repeatedId = repeatedMatches.length === 1 ? repeatedMatches[0].content.toolCallId : undefined
+  const repeatedCanonicalId = repeated.aliasToCanonical.get(repeatedId) ?? repeatedId
   const serializedMessages = JSON.stringify(messages)
-  if (projectedId === wait.toolCallId || projection.aliasToCanonical.get(projectedId) !== wait.toolCallId
-    || redactSensitiveText(projectedId) !== projectedId || !toolUse || !toolResult || toolUse.id !== toolResult.toolUseId
-    || toolUse.id !== projectedId || serializedMessages.includes(wait.toolCallId) || repeatedId !== projectedId) {
+  if (projectedCanonicalId !== wait.toolCallId || redactSensitiveText(projectedId) !== projectedId
+    || toolUses.length !== 1 || toolResults.length !== 1
+    || !toolUse || !toolResult || toolUse.id !== toolResult.toolUseId
+    || toolUse.id !== projectedId || serializedMessages.includes(wait.toolCallId)
+    || repeatedMatches.length !== 1 || repeatedId !== projectedId || repeatedCanonicalId !== wait.toolCallId) {
     throw new Error("durable_child_wait_model_projection_invalid")
   }
   const output = content.output
