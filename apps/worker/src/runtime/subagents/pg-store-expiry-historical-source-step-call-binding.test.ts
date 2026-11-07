@@ -43,4 +43,9 @@ describe("historical source step call binding", () => {
     expect(sql).toContain('AS commentStarted')
     expect(sql).toContain('AS agenda')
   })
+
+  it("binds the agenda anchor to the task event writer's complete canonical key", () => {
+    expect(sql).toContain(`agenda."idempotencyKey" = 'task:' || boundSource."taskId" || ':event:' || (CASE WHEN octet_length(convert_to('cognitive.agenda:' || boundSource."id", 'UTF8')) <= 256`)
+    expect(sql).toContain("ELSE 'cognitive.agenda:sha256:' || encode(sha256(convert_to(boundSource.\"id\", 'UTF8')), 'hex') END)")
+  })
 })

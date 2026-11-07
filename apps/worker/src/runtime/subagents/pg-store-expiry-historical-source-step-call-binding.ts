@@ -194,7 +194,7 @@ export function historicalSourceStepCallChainSql(path: string): Readonly<{
     JOIN "agent_events" AS modelUsage ON modelUsage."causationId" = modelDone."id"
     WHERE agenda."sessionId" = boundSource."sessionId" AND agenda."turnId" = boundSource."turnId" AND agenda."taskId" = boundSource."taskId"
       AND agenda."type" = 'cognitive.agenda' AND agenda."actor" = 'subagent' AND agenda."itemId" IS NULL
-      AND agenda."correlationId" = boundSource."id" AND agenda."idempotencyKey" = ${agendaKey}
+      AND agenda."correlationId" = boundSource."id" AND agenda."idempotencyKey" = 'task:' || boundSource."taskId" || ':event:' || ${agendaKey}
       AND agenda."causationId" = ${events}->0->>'id'
       AND agenda."payload"->>'sessionId' = boundSource."sessionId" AND agenda."payload"->>'turnId' = boundSource."turnId"
       AND agenda."payload"->>'taskId' = boundSource."taskId" AND agenda."payload"->>'stepId' = boundSource."id"
