@@ -51,7 +51,7 @@ function workerFailureReasonCategory(error) {
   const code = error && typeof error.message === "string" ? error.message : ""
   return workerFailureReasonCategories.has(code) ? code : "other"
 }
-const boundedLoopDiagnosticModes = new Set(["worker-b-loop-usage-lineage-cut", "worker-b-loop-usage-lineage-reject"])
+const boundedLoopDiagnosticModes = new Set(["worker-b-loop-usage-lineage-cut", "worker-b-loop-usage-lineage-reject", "worker-b-loop-multi-complete-cut"])
 const maxBoundedLoopDiagnosticStages = 64
 const boundedLoopDiagnosticStages = new Set([
   "durable_wait_loader", "child_attempt_resume_loader", "restored_wait_validation", "execution_loop_recovery",
@@ -641,6 +641,7 @@ async function resumeChildThroughLoop(lease, phase, preloadedRestored) {
     traceLoopStage("durable_wait_loader", "pass")
   } catch (error) {
     traceLoopStage("durable_wait_loader", "fail")
+    if (phase === "multi-complete-cut") say(`WORKER_B_LOOP_RESUME_FAILURE ${JSON.stringify({ stage: "durable_wait_loader", category: workerFailureReasonCategory(error) })}`)
     throw error
   }
   let restored
@@ -651,6 +652,7 @@ async function resumeChildThroughLoop(lease, phase, preloadedRestored) {
   }
   catch (error) {
     traceLoopStage("child_attempt_resume_loader", "fail")
+    if (phase === "multi-complete-cut") say(`WORKER_B_LOOP_RESUME_FAILURE ${JSON.stringify({ stage: "child_attempt_resume_loader", category: workerFailureReasonCategory(error) })}`)
     if (phase === "usage-lineage-reject") {
       say(`WORKER_B_LOOP_RESUME_FAILURE ${JSON.stringify({ category: workerFailureReasonCategory(error) })}`)
     }
