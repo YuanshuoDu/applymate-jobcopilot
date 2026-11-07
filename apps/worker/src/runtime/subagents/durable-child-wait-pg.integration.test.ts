@@ -25,8 +25,7 @@ import type { SubagentLease } from "./types.js"
 import { CHILD_WAIT_CLAIM_RECOVERY_SQL, CHILD_WAIT_CONSUMED_SQL, CHILD_WAIT_RESUMABLE_SQL as CHILD_WAIT_EXPIRY_RESUMABLE_SQL, hasBlockingExternalCall } from "./pg-store-expiry-recovery-predicates.js"
 import { CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL, childWaitContinuationKeyMatchesSafeProjection } from "./pg-store-expiry-child-wait-claim-call-proof.js"
 import { CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL, CHILD_WAIT_HISTORICAL_SOURCE_RESULT_RECEIPT_SQL,
-  HISTORICAL_SOURCE_STEP_BINDING_SQL, HISTORICAL_SOURCE_STEP_PREFIX_SQL,
-  HISTORICAL_SOURCE_WAIT_HANDOFF_SQL } from "./pg-store-expiry-historical-wait-event-binding.js"
+  HISTORICAL_SOURCE_STEP_BINDING_SQL, HISTORICAL_SOURCE_STEP_PREFIX_SQL } from "./pg-store-expiry-historical-wait-event-binding.js"
 import { readChildWaitSourceCallProjection } from "./pg-store-expiry-child-wait-source-proof.js"
 import { CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL } from "./pg-store-expiry-historical-wait-binding.js"
 import { buildCognitiveAgendaReceipt, cognitiveAgendaReceiptIdempotencyKey } from "../turns/cognitive-agenda-receipt.js"
@@ -181,6 +180,8 @@ describe("worker restart blocker proof diagnostic bindings", () => {
     expect(path).toContain("proof.value->'sourceStepHandoff'->'sourceStepPrefix'")
     expect(HISTORICAL_SOURCE_STEP_BINDING_SQL).toContain("proof.value ? 'sourceStepPrefix' AND NOT (proof.value ? 'sourceStepHandoff')")
     expect(HISTORICAL_SOURCE_STEP_BINDING_SQL).toContain("proof.value ? 'sourceStepHandoff' AND NOT (proof.value ? 'sourceStepPrefix')")
+    expect(CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL).toContain('FROM "agent_events" AS sourceItemStarted')
+    expect(CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL).toContain(HISTORICAL_SOURCE_STEP_BINDING_SQL)
   })
   it("parses loop-stage diagnostics into fixed enums and drops unknown fields", () => {
     const parsed = parseBoundedLoopDiagnostics(
@@ -646,12 +647,9 @@ async function diagnoseHistoricalSourceFinalBinding(client: PoolClient, task: Bl
         AND session."userId" = $8 AND turn."sessionId" = owner."sessionId" AND turn."userId" = session."userId"
         AND turn."rootTaskId" = owner."rootTaskId") AS "ownerLeaseFence",
       (${CHILD_WAIT_HISTORICAL_SOURCE_RESULT_RECEIPT_SQL}) AS "sourceReceiptBinding",
-      (${CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL}) AS "sourceEventBinding",
+      (${CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL}) AS "sourceEventAndStepBinding",
       CASE WHEN proof.value ? 'sourceStepPrefix' AND NOT (proof.value ? 'sourceStepHandoff')
         THEN (${HISTORICAL_SOURCE_STEP_PREFIX_SQL}) ELSE FALSE END AS "sourceStepPrefixBinding",
-      CASE WHEN proof.value ? 'sourceStepHandoff' AND NOT (proof.value ? 'sourceStepPrefix')
-        THEN (${HISTORICAL_SOURCE_WAIT_HANDOFF_SQL}) ELSE FALSE END AS "sourceHandoffBinding",
-      (${HISTORICAL_SOURCE_STEP_BINDING_SQL}) AS "sourceStepBinding",
       (${historicalSourceStepEventChainBinding(path)}) AS "sourceEventChain",
       (${historicalSourceStepCallChainBinding(path)}) AS "sourceCallChain",
       (${historicalSourceStepCallCountBinding(path)}) AS "sourceCallCount",
@@ -705,9 +703,8 @@ async function diagnoseHistoricalSourceFinalBinding(client: PoolClient, task: Bl
   const flag = (key: string) => row[key] === true
   return { outcome: "evaluated", sourceProjectionCount: 1,
     sourceProjectionMatch: flag("sourceProjectionMatch"), ownerLeaseFence: flag("ownerLeaseFence"),
-    sourceReceiptBinding: flag("sourceReceiptBinding"), sourceEventBinding: flag("sourceEventBinding"),
-    sourceStepPrefixBinding: flag("sourceStepPrefixBinding"), sourceHandoffBinding: flag("sourceHandoffBinding"),
-    sourceStepBinding: flag("sourceStepBinding"), sourceEventChain: flag("sourceEventChain"),
+    sourceReceiptBinding: flag("sourceReceiptBinding"), sourceEventAndStepBinding: flag("sourceEventAndStepBinding"),
+    sourceStepPrefixBinding: flag("sourceStepPrefixBinding"), sourceEventChain: flag("sourceEventChain"),
     sourceCallChain: flag("sourceCallChain"), sourceCallCount: flag("sourceCallCount"),
     historicalWaitBinding: flag("historicalWaitBinding"), terminalSettlement: flag("terminalSettlement") }
 }
@@ -718,16 +715,12 @@ async function expectHistoricalWaitUnblocked(client: PoolClient, task: BlockingT
     await expect(hasBlockingExternalCall(client, task as unknown as Record<string, unknown>, undefined, continuationStepId), message)
       .resolves.toBe(false)
   } catch (error: unknown) {
-    let diagnostic: Record<string, unknown> = { probeAvailable: false }
-    try { diagnostic = await diagnoseWorkerFStartCandidates(client, task, continuationStepId, sourceCallId, claimCallId, true) }
-    catch { /* retain the strict assertion failure without exposing query errors */ }
-    let sourceReader: Record<string, unknown> = { outcome: "unknown" }
-    try { sourceReader = await diagnoseHistoricalWaitSourceProjection(client, task, sourceCallId) }
-    catch { /* keep the diagnostic redacted if the source reader probe is unavailable */ }
-    let finalBinding: Record<string, unknown> = { outcome: "unknown" }
-    try { finalBinding = await diagnoseHistoricalSourceFinalBinding(client, task, continuationStepId, sourceCallId) }
-    catch { /* keep the original assertion and redacted diagnostics if SQL probing fails */ }
-    diagnostic = { ...diagnostic, sourceReader, finalBinding }
+    const diagnostic = await withHistoricalWaitDiagnosticSavepoint(client, async () => {
+      const starts = await diagnoseWorkerFStartCandidates(client, task, continuationStepId, sourceCallId, claimCallId, true)
+      const sourceReader = await diagnoseHistoricalWaitSourceProjection(client, task, sourceCallId)
+      const finalBinding = await diagnoseHistoricalSourceFinalBinding(client, task, continuationStepId, sourceCallId)
+      return { ...starts, sourceReader, finalBinding }
+    }) ?? { probeAvailable: false, sourceReader: { outcome: "unknown" }, finalBinding: { outcome: "unknown" } }
     const suffix = `; redacted historical-wait diagnostic=${JSON.stringify(diagnostic)}`
     if (error instanceof Error) {
       error.message += suffix
@@ -1404,6 +1397,21 @@ type BlockingTaskSnapshot = {
   leaseOwner: string | null; attemptCount: number; leaseExpiresAt: Date | null
 }
 type BlockingTaskRow = Omit<BlockingTaskSnapshot, "userId">
+let historicalWaitDiagnosticSavepointOrdinal = 0
+
+async function withHistoricalWaitDiagnosticSavepoint<T>(client: PoolClient, probe: () => Promise<T>): Promise<T | undefined> {
+  const name = `historical_wait_diagnostic_${++historicalWaitDiagnosticSavepointOrdinal}`
+  try { await client.query(`SAVEPOINT ${name}`) } catch { return undefined }
+  try {
+    const result = await probe()
+    await client.query(`RELEASE SAVEPOINT ${name}`)
+    return result
+  } catch {
+    await client.query(`ROLLBACK TO SAVEPOINT ${name}`).catch(() => undefined)
+    await client.query(`RELEASE SAVEPOINT ${name}`).catch(() => undefined)
+    return undefined
+  }
+}
 
 async function historicalWaitBindingAccepts(client: PoolClient, task: BlockingTaskSnapshot, projection: unknown): Promise<boolean> {
   const result = await client.query<{ accepted: boolean }>(`WITH proof AS (SELECT $9::jsonb AS value)
@@ -1873,8 +1881,13 @@ async function expectCompletedClaimBeforeItemEventSafety(
       )
       return proof.rows[0]?.settled === true
     }
-    expect(await evaluateTerminalProof(exactSourceStart.rows[0]!.id, exactSourceTerminal.rows[0]!.id),
-      "the server-selected source item, step and attempt must retain its valid completion proof").toBe(true)
+    const exactSourceProofAccepted = await evaluateTerminalProof(exactSourceStart.rows[0]!.id, exactSourceTerminal.rows[0]!.id)
+    const exactSourceProofDiagnostic = exactSourceProofAccepted ? undefined
+      : await withHistoricalWaitDiagnosticSavepoint(client, () => diagnoseHistoricalSourceFinalBinding(
+        client, task, continuationStepId, exactSourceProjection.rawCallId)) ?? { outcome: "unknown" }
+    expect(exactSourceProofAccepted,
+      `the server-selected source item, step and attempt must retain its valid completion proof${exactSourceProofDiagnostic
+        ? `; redacted final-binding diagnostic=${JSON.stringify(exactSourceProofDiagnostic)}` : ""}`).toBe(true)
 
     await client.query("SAVEPOINT same_raw_call_id_different_item_step_attempt")
     try {
@@ -5869,20 +5882,9 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         const snapshot: BlockingTaskSnapshot = { ...lockedTask, userId: ids.userId }
         const blocking = (value: BlockingTaskSnapshot = snapshot, ignoredEventId?: string) => hasBlockingExternalCall(
           settlementClient, value as unknown as Record<string, unknown>, ignoredEventId, continuationStepId)
-        try {
-          await expectHistoricalWaitUnblocked(settlementClient, snapshot, continuationStepId,
-            PHONE_SHAPED_WAIT_TOOL_CALL_ID, orphanCallId,
-            "exact source and claim evidence should settle after the next step starts")
-        } catch (error: unknown) {
-          let sourceDiagnostic: Record<string, unknown> = { rejectStage: "diagnostic_unavailable" }
-          try { sourceDiagnostic = await diagnoseHistoricalWaitSourceProjection(settlementClient, snapshot, PHONE_SHAPED_WAIT_TOOL_CALL_ID) }
-          catch { /* preserve the original assertion if the bounded diagnostic itself is unavailable */ }
-          if (error instanceof Error) {
-            error.message += `; redacted source-reader diagnostic=${JSON.stringify(sourceDiagnostic)}`
-            throw error
-          }
-          throw new Error(`historical wait source projection failed; redacted source-reader diagnostic=${JSON.stringify(sourceDiagnostic)}`)
-        }
+        await expectHistoricalWaitUnblocked(settlementClient, snapshot, continuationStepId,
+          PHONE_SHAPED_WAIT_TOOL_CALL_ID, orphanCallId,
+          "exact source and claim evidence should settle after the next step starts")
         await expect(blocking({ ...snapshot, leaseOwner: `${snapshot.leaseOwner}:stale` }),
           "a stale owner must not borrow historical settlement proof").resolves.toBe(true)
         await expect(blocking({ ...snapshot, attemptCount: snapshot.attemptCount + 1 }),
