@@ -324,6 +324,23 @@ describe("worker restart blocker proof diagnostic bindings", () => {
     })
     expect(boundedWorkerRecoveryDiagnostic(unknown, privateId)).not.toContain(privateError)
   })
+  it("allowlists recovery trace strings and reads the requested stream only", () => {
+    const privateValue = "private-task-or-payload-value"
+    const trace = `WORKER_B_RECOVERY_PREDICATE_TRACE ${JSON.stringify({
+      rejectionStage: "unsettled_external_call_rejected", waitProjectionDisposition: "rejected",
+      waitProjectionStage: "call_contract_validation", privateValue,
+    })}`
+    const stdout = { stdoutText: trace, stderrText: "" } as unknown as WorkerProcess
+    expect(boundedRecoveryTrace(stdout, true)).toMatchObject({ rejectionStage: "unsettled_external_call_rejected",
+      waitProjectionDisposition: "rejected", waitProjectionStage: "call_contract_validation" })
+    const unknown = { stdoutText: trace.replace("unsettled_external_call_rejected", privateValue)
+      .replace("rejected", privateValue).replace("call_contract_validation", privateValue), stderrText: "" } as unknown as WorkerProcess
+    const parsed = boundedRecoveryTrace(unknown, true)
+    expect(parsed).toMatchObject({ rejectionStage: "other", waitProjectionDisposition: "other", waitProjectionStage: "other" })
+    expect(JSON.stringify(parsed)).not.toContain(privateValue)
+    const stderrOnly = { stdoutText: "", stderrText: trace } as unknown as WorkerProcess
+    expect(boundedRecoveryTrace(stderrOnly, true)).toBeNull()
+  })
 })
 
 function parseBoundedLoopDiagnostics(text: string): { overflow: boolean; records: Array<{
@@ -571,9 +588,10 @@ function diagnosticTaskStatus(value: unknown): string | null {
   return DIAGNOSTIC_TASK_STATUSES.has(value) ? value : "other"
 }
 
-function boundedRecoveryTrace(child: WorkerProcess): Record<string, unknown> | null {
+function boundedRecoveryTrace(child: WorkerProcess, stdoutOnly = false): Record<string, unknown> | null {
   const prefix = "WORKER_B_RECOVERY_PREDICATE_TRACE "
-  const line = [...child.stdoutText.split(/\r?\n/), ...child.stderrText.split(/\r?\n/)]
+  const output = stdoutOnly ? [child.stdoutText] : [child.stdoutText, child.stderrText]
+  const line = output.flatMap(stream => stream.split(/\r?\n/))
     .find(candidate => candidate.startsWith(prefix))
   if (!line) return null
   let parsed: unknown
@@ -586,6 +604,8 @@ function boundedRecoveryTrace(child: WorkerProcess): Record<string, unknown> | n
     ? trace.dispatch as Record<string, unknown> : null
   const flags = dispatch ? Object.fromEntries(["present", "payloadValid", "task", "session", "root", "owner", "generation", "published"]
     .filter(key => typeof dispatch[key] === "boolean").map(key => [key, dispatch[key]])) : null
+  const safeEnum = (value: unknown, allowed: ReadonlySet<string>): string | null => typeof value !== "string"
+    ? null : allowed.has(value) ? value : "other"
   return {
     pageCount: safeInteger(trace.pageCount),
     pages: Array.isArray(trace.pages) ? trace.pages.slice(0, 16).map(value => {
@@ -596,9 +616,9 @@ function boundedRecoveryTrace(child: WorkerProcess): Record<string, unknown> | n
         cursorUsed: typeof page.cursorUsed === "boolean" ? page.cursorUsed : null }
     }) : null,
     pagesTruncated: typeof trace.pagesTruncated === "boolean" ? trace.pagesTruncated : null,
-    rejectionStage: typeof trace.rejectionStage === "string" ? trace.rejectionStage.slice(0, 64) : null,
-    waitProjectionDisposition: typeof trace.waitProjectionDisposition === "string" ? trace.waitProjectionDisposition.slice(0, 32) : null,
-    waitProjectionStage: typeof trace.waitProjectionStage === "string" ? trace.waitProjectionStage.slice(0, 64) : null,
+    rejectionStage: safeEnum(trace.rejectionStage, recoveryRejectionStages),
+    waitProjectionDisposition: safeEnum(trace.waitProjectionDisposition, recoveryWaitProjectionDispositions),
+    waitProjectionStage: safeEnum(trace.waitProjectionStage, recoveryWaitProjectionStages),
     childWaitResumable: typeof trace.childWaitResumable === "boolean" ? trace.childWaitResumable : null,
     waitRegistrationFound: typeof trace.waitRegistrationFound === "boolean" ? trace.waitRegistrationFound : null,
     waitRegistrationRejected: typeof trace.waitRegistrationRejected === "boolean" ? trace.waitRegistrationRejected : null,
@@ -1264,6 +1284,12 @@ const recoveryRejectionStages = new Set([
   "unsettled_external_call_rejected", "durable_wait_graph_blocked", "task_graph_transition_blocked", "task_graph_finish_blocked",
   "task_update_rejected",
 ])
+const recoveryWaitProjectionDispositions = new Set(["skipped", "repaired", "already_current", "rejected"])
+const recoveryWaitProjectionStages = new Set([
+  "invalid_input", "wait_row_count", "wait_validation", "lease_fence_validation", "wait_timestamp_validation", "timeout_validation",
+  "target_validation", "target_match_validation", "call_result_validation", "call_timestamp_validation", "call_contract_validation",
+  "safe_serialization_validation", "optimistic_update_missed",
+])
 const recoveryStatuses = new Set(["queued", "running", "completed", "failed", "cancelled", "interrupted"])
 const resumeFailureCodes = new Set([
   "child_resume_wait_tool_call_conflict", "child_resume_wait_step_lineage", "child_resume_wait_lineage",
@@ -1614,7 +1640,7 @@ async function historicalWaitBindingAccepts(client: PoolClient, task: BlockingTa
         THEN 'task:' || owner."id" || ':event:tool-started:' || (callItem."content"->>'toolCallId')
         ELSE 'task:' || owner."id" || ':event:child-wait-claim:' || callStep."attempt"::text || ':' || callStep."id" END
       AND started."payload" = jsonb_build_object('toolCallId', callItem."content"->>'toolCallId',
-        'toolName', 'wait_subagents', 'taskId', owner."id')`,
+        'toolName', 'wait_subagents', 'taskId', owner."id")`,
   [task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount, task.leaseExpiresAt,
     task.userId, JSON.stringify(projection)])
   return result.rows.length === 1 && result.rows[0]?.accepted === true
@@ -4969,7 +4995,14 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       const restoredTask = await pool.query<{ status: string; attemptCount: number; leaseOwner: string | null }>(
         `SELECT "status", "attemptCount", "leaseOwner" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`,
         [ids.waiterTaskId, ids.sessionId])
-      expect(restoredTask.rows[0]).toMatchObject({ status: "queued", attemptCount: 1, leaseOwner: null })
+      try {
+        expect(restoredTask.rows[0]).toMatchObject({ status: "queued", attemptCount: 1, leaseOwner: null })
+      } catch (error: unknown) {
+        const trace = boundedRecoveryTrace(workerC, true)
+        const failure = error instanceof Error ? error : new Error("recovered task did not return to queued state")
+        failure.message += `; workerC bounded recovery trace=${JSON.stringify(trace ?? { available: false })}`
+        throw failure
+      }
       const dispatch = await pool.query<{ publishedAt: Date | null }>(`SELECT "publishedAt" FROM "agent_outbox"
         WHERE "topic" = 'agent.subagent.dispatch' AND "aggregateId" = $1 AND "idempotencyKey" = $2`,
       [ids.sessionId, `subagent-dispatch:${ids.waiterTaskId}`])

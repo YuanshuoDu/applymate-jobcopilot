@@ -91,6 +91,27 @@ function traceLiveResumeClass(value) {
 function traceLoopFailure() {
   traceLoopStage(currentLoopDiagnosticStage, "fail")
 }
+const restoredWaitDiagnosticStages = new Set(["owner_fence", "observation_projection"])
+const restoredWaitDiagnosticPhases = new Set(["start", "pass", "fail"])
+const restoredWaitDiagnosticFailures = new Set([
+  "owner_fence_rejected", "observation_missing", "projected_observation_missing", "model_projection_invalid", "other",
+])
+let restoredWaitDiagnosticCount = 0
+function traceRestoredWaitDiagnostic(stage, phase, failure) {
+  if (mode !== "worker-b-loop-multi-complete-cut" || !restoredWaitDiagnosticStages.has(stage)
+    || !restoredWaitDiagnosticPhases.has(phase) || restoredWaitDiagnosticCount >= 8) return
+  restoredWaitDiagnosticCount += 1
+  const record = { stage, phase }
+  if (phase === "fail") record.failure = restoredWaitDiagnosticFailures.has(failure) ? failure : "other"
+  say(`WORKER_B_LOOP_RESTORED_CHECK ${JSON.stringify(record)}`)
+}
+function restoredWaitDiagnosticFailure(error) {
+  if (!(error instanceof Error)) return "other"
+  if (error.message === "durable_child_wait_restored_observation_missing") return "observation_missing"
+  if (error.message === "durable_child_wait_projected_observation_missing") return "projected_observation_missing"
+  if (error.message === "durable_child_wait_model_projection_invalid") return "model_projection_invalid"
+  return "other"
+}
 function claimLoaderQueryStage(query) {
   if (typeof query !== "string") return "claim_loader_other_query"
   const sql = query.replace(/\s+/g, " ").trim()
@@ -673,7 +694,15 @@ async function resumeChildThroughLoop(lease, phase, preloadedRestored) {
   }
   traceLoopStage("restored_wait_validation", "pass")
   const wait = restored.durableWait
-  const owner = executionOwnerFence({ kind: "task", lease })
+  let owner
+  traceRestoredWaitDiagnostic("owner_fence", "start")
+  try {
+    owner = executionOwnerFence({ kind: "task", lease })
+    traceRestoredWaitDiagnostic("owner_fence", "pass")
+  } catch (error) {
+    traceRestoredWaitDiagnostic("owner_fence", "fail", "owner_fence_rejected")
+    throw error
+  }
   const recovery = restored.childWaitOrphanRecovery ?? restored.childWaitClaimRecovery
   const continuationStepId = recovery?.stepId ?? wait.continuationStepId ?? `task:${lease.id}:step:${restored.resume.nextOrdinal}:attempt:${lease.attemptCount}`
   const logicalStepOrdinal = recovery?.stepOrdinal ?? restored.resume.nextOrdinal
@@ -681,7 +710,16 @@ async function resumeChildThroughLoop(lease, phase, preloadedRestored) {
     ? `${ids.loopCallPrefix ?? "child-wait-loop"}:${wait.waitId}:attempt:${lease.attemptCount}`
     : `${ids.loopCallPrefix ?? "child-wait-loop"}:${lease.id}:attempt:${lease.attemptCount}`)
   const callItemId = `task:${lease.id}:item:tool-call:${callId}:attempt:${lease.attemptCount}`
-  say(`WORKER_B_RESTORED_WAIT_OBSERVATION ${JSON.stringify(restoredWaitObservationSummary(restored, wait, pendingWait, owner, continuationStepId))}`)
+  let observationSummary
+  traceRestoredWaitDiagnostic("observation_projection", "start")
+  try {
+    observationSummary = restoredWaitObservationSummary(restored, wait, pendingWait, owner, continuationStepId)
+    traceRestoredWaitDiagnostic("observation_projection", "pass")
+  } catch (error) {
+    traceRestoredWaitDiagnostic("observation_projection", "fail", restoredWaitDiagnosticFailure(error))
+    throw error
+  }
+  say(`WORKER_B_RESTORED_WAIT_OBSERVATION ${JSON.stringify(observationSummary)}`)
   if (phase === "multi-reject" && (restored.childWaitOrphanRecovery || restored.childWaitClaimRecovery)) {
     throw new Error("fixture_multi_tool_receipt_was_not_rejected")
   }
