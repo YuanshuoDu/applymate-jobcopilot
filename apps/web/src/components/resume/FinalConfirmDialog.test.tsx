@@ -18,7 +18,7 @@ const audit: ApplicationAudit = {
   findings: [], source: 'parent_resume', auditedAt: '2026-09-17T10:00:00.000Z',
 }
 
-function renderDialog(initialAudit: ApplicationAudit | null, coverLetterContent: string | null = 'Dear Acme') {
+function renderDialog(initialAudit: ApplicationAudit | null, coverLetterContent: string | null = 'Dear Acme', overrides: Partial<React.ComponentProps<typeof FinalConfirmDialog>> = {}) {
   return renderToStaticMarkup(
     <FinalConfirmDialog
       job={job}
@@ -38,8 +38,10 @@ function renderDialog(initialAudit: ApplicationAudit | null, coverLetterContent:
       onLinkJob={vi.fn()}
       onReviewAudit={vi.fn()}
       onConfirm={vi.fn().mockResolvedValue(true)}
+      onOpenApplication={vi.fn()}
       onDownload={vi.fn().mockResolvedValue(undefined)}
       downloadingPack={false}
+      {...overrides}
     />,
   )
 }
@@ -52,13 +54,12 @@ describe('FinalConfirmDialog audit state', () => {
     expect(markup).not.toContain('Compares the final resume and cover letter')
   })
 
-  it('routes unresolved audits back to Resume instead of running a second audit here', async () => {
-    const source = await import('node:fs').then(fs => fs.readFileSync(new URL('./FinalConfirmDialog.tsx', import.meta.url), 'utf8'))
+  it('shows one actionable audit entry when a finding needs review', () => {
+    const markup = renderDialog({ ...audit, verdict: 'needs_review' }, null, { packReady: false })
 
-    expect(source).toContain('className="final-confirm-status-action"')
-    expect(source).toContain('onClick={onReviewAudit}')
-    expect(source).not.toContain('onAudit: () => Promise<ApplicationAudit | null>')
-    expect(source).not.toContain('async function runAudit()')
+    expect(markup.match(/class="final-confirm-status-action"/g)).toHaveLength(1)
+    expect(markup).toMatch(/class="final-confirm-primary" disabled=""/)
+    expect(markup).not.toContain('final-material-preview')
   })
 
   it('treats a missing cover letter as optional in final confirmation', () => {
@@ -67,5 +68,48 @@ describe('FinalConfirmDialog audit state', () => {
     expect(markup).toContain('Optional — no cover letter selected')
     expect(markup).toContain('Run the independent audit from Resume before final confirmation.')
     expect(markup).not.toContain('Select a final cover letter made for this resume version before confirming')
+  })
+
+  it('enables material confirmation immediately for a current passing resume-only audit', () => {
+    const markup = renderDialog(audit, null, { packReady: false })
+
+    expect(markup).toContain('Optional — no cover letter selected')
+    expect(markup).not.toMatch(/class="final-confirm-primary" disabled=""/)
+    expect(markup).not.toContain('is-checking')
+    expect(markup).not.toContain('Download application pack (ZIP)')
+    expect(markup).not.toContain('/api/jobs/job-1/application-pack')
+  })
+
+  it.each([
+    ['missing audit', { initialAudit: null }],
+    ['unsaved material changes', { isDirty: true }],
+    ['missing job', { job: null }],
+    ['unreviewed suggestions', { pendingSuggestions: 1 }],
+  ] as const)('keeps confirmation blocked for %s', (_reason, overrides) => {
+    const markup = renderDialog(audit, null, { packReady: false, ...overrides })
+    expect(markup).toMatch(/class="final-confirm-primary" disabled=""/)
+  })
+
+  it('does not display a previously confirmed package as ready after an edit', () => {
+    const markup = renderDialog(audit, null, { packReady: true, isDirty: true })
+
+    expect(markup).not.toContain('class="final-confirm-ready"')
+    expect(markup).not.toContain('final-material-preview')
+    expect(markup).not.toContain('/api/jobs/job-1/application-pack')
+    expect(markup).toMatch(/class="final-confirm-primary" disabled=""/)
+  })
+
+  it('keeps return to the application primary while offering the audited package', () => {
+    const markup = renderDialog(audit)
+
+    expect(markup).toMatch(/class="final-confirm-primary"[^>]*>.*View (?:this )?application/i)
+    expect(markup).toContain('/api/jobs/job-1/application-pack')
+    expect(markup).toContain('Download application pack (ZIP)')
+  })
+
+  it('hides download and print when the audit is not passing, even if packReady is set', () => {
+    const markup = renderDialog({ ...audit, verdict: 'needs_review' }, null, { packReady: true })
+    expect(markup).not.toContain('Download application pack (ZIP)')
+    expect(markup).not.toContain('/api/jobs/job-1/application-pack')
   })
 })

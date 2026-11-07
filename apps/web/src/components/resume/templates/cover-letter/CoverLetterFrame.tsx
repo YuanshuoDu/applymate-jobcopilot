@@ -2,6 +2,7 @@
 import React from 'react'
 import { Document, Page, Text, View, StyleSheet } from '@react-pdf/renderer'
 import { safeAccentColor } from '@/lib/template-options'
+import { applicationPdfFontFamily, assertApplicationPdfTreeSupported, normalizeApplicationPdfTree, registerApplicationPdfFonts } from '@/lib/application-pdf-font'
 
 export interface CoverLetterDocProps {
   content:      string          // the letter body text
@@ -43,6 +44,7 @@ export function CoverLetterDoc({
   date,
   templateVariant,
 }: CoverLetterDocProps) {
+  registerApplicationPdfFonts()
   const d       = getDensityScale(density)
   const color   = safeAccentColor(accentColor)
   const dateStr = date
@@ -53,8 +55,8 @@ export function CoverLetterDoc({
   const isClassic = templateVariant === 'classic'
   const isMinimal = templateVariant === 'minimal'
 
-  const pdfFontFamily = fontFamily === 'serif' ? 'Times-Roman' : fontFamily === 'mono' ? 'Courier' : 'Helvetica'
-  const pdfFontBold   = fontFamily === 'serif' ? 'Times-Bold' : fontFamily === 'mono' ? 'Courier-Bold' : 'Helvetica-Bold'
+  const pdfFontFamily = applicationPdfFontFamily(fontFamily === 'serif' ? 'Times-Roman' : fontFamily === 'mono' ? 'Courier' : 'Helvetica')
+  const pdfFontBold   = applicationPdfFontFamily(fontFamily === 'serif' ? 'Times-Bold' : fontFamily === 'mono' ? 'Courier-Bold' : 'Helvetica-Bold')
 
   const styles = StyleSheet.create({
     page: {
@@ -107,18 +109,6 @@ export function CoverLetterDoc({
       lineHeight: d.line,
       ...(isMinimal ? { color: '#333' } : {}),
     },
-    signature: {
-      marginTop: 20,
-    },
-    sigClosing: {
-      fontSize:     d.body,
-      color:        '#333',
-      marginBottom: 4,
-    },
-    sigName: {
-      fontFamily: pdfFontBold,
-      fontSize:   d.body,
-    },
   })
 
   const contactParts = [
@@ -128,7 +118,7 @@ export function CoverLetterDoc({
     applicant.linkedin,
   ].filter(Boolean) as string[]
 
-  return (
+  const document = normalizeApplicationPdfTree((
     <Document>
       <Page size="A4" style={styles.page}>
         {/* Header */}
@@ -157,8 +147,9 @@ export function CoverLetterDoc({
         {/* Body */}
         <Text hyphenationCallback={noHyphenation} style={styles.body}>{content}</Text>
 
-        {/* The reviewed content already owns its greeting and sign-off. */}
       </Page>
     </Document>
-  )
+  )) as React.ReactElement
+  assertApplicationPdfTreeSupported(document)
+  return document
 }
