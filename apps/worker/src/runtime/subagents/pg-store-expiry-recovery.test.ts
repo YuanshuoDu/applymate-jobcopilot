@@ -118,7 +118,7 @@ function fixture(options: FixtureOptions = {}) {
       createdAt: new Date(checkedAt.getTime() - 5_000), role: task.role, allowedActions: ["wait_subagents"], stepId: "step-1",
       content: { toolCallId: "wait-call-1", toolName: "wait_subagents", toolVersion: "1", input: { idempotencyKey: "wait-key-1", mode: "any", taskIds: ["target-1"], timeoutMs: 10_000 } },
     }], rowCount: 1 } : { rows: [], rowCount: 0 }
-    if (sql.includes('FROM "agent_items" AS call')) return { rows: [{ status: "started", content: {
+    if (sql.startsWith('SELECT call."status", call."content" FROM "agent_items" AS call')) return { rows: [{ status: "started", content: {
       toolCallId: "wait-call-1", toolName: "wait_subagents", toolVersion: "1",
       input: { idempotencyKey: options.callMatches === false ? "other-key" : wait.idempotencyKey, mode: wait.mode,
         taskIds: wait.targetTaskIds, timeoutMs: 10_000 },
@@ -635,10 +635,10 @@ describe("expired subagent recovery fence", () => {
     expect(fake.task).toMatchObject({ status: "waiting", attemptCount: 3 })
     expect(fake.wait).toMatchObject({ status: "waiting", suspendedAt: checkedAt, consumedAt: null })
     expect(fake.wait.result).toMatchObject({ request: { targetTaskIds: ["target-1"], mode: "any", timeoutMs: 10_000 }, outcome: { waitId: "wait-1", status: "waiting" } })
-    const persistedCallRead = fake.client.query.mock.calls.find(([sql]) => sql.includes('FROM "agent_items" AS call'))
+    const persistedCallRead = fake.client.query.mock.calls.find(([sql]) => sql.startsWith('SELECT call."status", call."content" FROM "agent_items" AS call'))
     expect(persistedCallRead?.[0]).toContain('call."type" = \'tool_call\'')
     expect(persistedCallRead?.[0]).toContain('call."stepId" = $4')
-    expect(fake.client.query.mock.calls.filter(([sql]) => sql.includes('FROM "agent_items" AS call'))).toHaveLength(1)
+    expect(fake.client.query.mock.calls.filter(([sql]) => sql.startsWith('SELECT call."status", call."content" FROM "agent_items" AS call'))).toHaveLength(1)
     const external = fake.calls.find(sql => sql.includes('FROM "agent_events" AS started')) ?? ""
     expect(external).toContain('wait."consumedAt" IS NULL')
     expect(external).toContain('source."status" IN (\'streaming\', \'waiting_for_tool\')')
