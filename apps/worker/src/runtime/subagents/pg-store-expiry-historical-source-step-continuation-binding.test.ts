@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest"
 import { historicalSourceStepCallCountBinding, historicalSourceStepContinuationBinding } from "./pg-store-expiry-historical-source-step-continuation-binding.js"
+import { CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL } from "./pg-store-expiry-child-wait-claim-call-proof.js"
 
 const path = "proof.value->'sourceStepPrefix'"
+const boundedEventIndex = "(CASE WHEN expected.ordinality BETWEEN 2 AND 7 THEN (expected.ordinality - 2)::integer ELSE NULL::integer END)"
+function occurrences(sql: string, fragment: string): number { return sql.split(fragment).length - 1 }
 function balance(sql: string): number {
   let depth = 0, quote: "'" | '"' | null = null
   for (let index = 0; index < sql.length; index += 1) {
@@ -40,6 +43,13 @@ describe("historical source step continuation SQL", () => {
     expect(sql).toContain(`AND NOT EXISTS (SELECT 1 FROM "agent_events" AS terminal`)
     expect(sql).toContain(`AND NOT EXISTS (SELECT 1 FROM "agent_events" AS extra`)
     expect(sql).toContain("tool_call.interrupted")
+  })
+
+  it("uses guarded int4 indexes for every prior continuation event lookup", () => {
+    const sql = historicalSourceStepContinuationBinding(path)
+    expect(sql).toContain("WHERE expected.ordinality BETWEEN 1 AND 7")
+    expect(occurrences(sql, boundedEventIndex)).toBe(3)
+    expect(occurrences(CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL, boundedEventIndex)).toBe(6)
   })
 
   it("keeps the original call count and admits only the one separately proved continuation call", () => {

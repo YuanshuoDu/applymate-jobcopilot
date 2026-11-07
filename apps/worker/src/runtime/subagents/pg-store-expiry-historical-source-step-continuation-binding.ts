@@ -53,6 +53,7 @@ export function historicalSourceStepContinuationBinding(path: string): string {
   const parent = `(${continuation}->'parent')`, parentId = `${parent}->>'id'`
   const stepId = `${continuation}->>'stepId'`, callId = `${continuation}->>'callId'`, itemId = `${continuation}->>'callItemId'`
   const eventPrefix = `'task:' || boundSource."taskId" || ':event:'`
+  const priorEventIndex = `CASE WHEN expected.ordinality BETWEEN 2 AND 7 THEN (expected.ordinality - 2)::integer ELSE NULL::integer END`
   const agendaKey = `CASE WHEN octet_length(convert_to('cognitive.agenda:' || (${stepId}), 'UTF8')) <= 256
     THEN 'cognitive.agenda:' || (${stepId}) ELSE 'cognitive.agenda:sha256:' || encode(sha256(convert_to((${stepId}), 'UTF8')), 'hex') END`
   const expectedKey = `CASE expected.ordinality
@@ -120,7 +121,7 @@ export function historicalSourceStepContinuationBinding(path: string): string {
       AND expected.value->'itemId' IS NOT DISTINCT FROM CASE WHEN expected.ordinality >= 6
         THEN to_jsonb(${itemId}) ELSE 'null'::jsonb END
       AND expected.value->'causationId' IS NOT DISTINCT FROM CASE WHEN expected.ordinality = 1
-        THEN to_jsonb(${parentId}) ELSE to_jsonb(${events}->(expected.ordinality - 2)->>'id') END
+        THEN to_jsonb(${parentId}) ELSE to_jsonb(${events}->(${priorEventIndex})->>'id') END
       AND actual."sequence"::text = expected.value->>'sequence'
       AND actual."type" = CASE expected.ordinality WHEN 1 THEN 'step.started' WHEN 2 THEN 'cognitive.agenda'
         WHEN 3 THEN 'model.started' WHEN 4 THEN 'model.completed' WHEN 5 THEN 'model.usage'
@@ -128,11 +129,11 @@ export function historicalSourceStepContinuationBinding(path: string): string {
       AND actual."actor" = 'subagent' AND actual."itemId" IS NOT DISTINCT FROM expected.value->>'itemId'
       AND actual."correlationId" = CASE WHEN expected.ordinality = 7 THEN ${callId} ELSE ${stepId} END
       AND (expected.ordinality = 1 OR actual."sequence" > (SELECT previous."sequence" FROM "agent_events" AS previous
-        WHERE previous."id" = (${events}->(expected.ordinality - 2)->>'id')
+        WHERE previous."id" = (${events}->(${priorEventIndex})->>'id')
           AND previous."sessionId" = boundSource."sessionId" AND previous."turnId" = boundSource."turnId"
           AND previous."taskId" = boundSource."taskId"))
       AND actual."causationId" IS NOT DISTINCT FROM CASE WHEN expected.ordinality = 1 THEN ${parentId}
-        ELSE (${events}->(expected.ordinality - 2)->>'id') END
+        ELSE (${events}->(${priorEventIndex})->>'id') END
       AND actual."idempotencyKey" = ${expectedKey} AND expected.value->>'idempotencyKey' = ${expectedKey}
       AND expected.value->>'payloadDigest' ~ '^[0-9a-f]{64}$'
       AND encode(sha256(convert_to(actual."payload"::text,'UTF8')),'hex') = expected.value->>'payloadDigest'

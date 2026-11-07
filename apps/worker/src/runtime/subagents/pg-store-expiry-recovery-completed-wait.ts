@@ -11,8 +11,8 @@ function completedStepEventSql(owner: "owner" | "task"): string { return `(SELEC
   WHERE completedEvent."sessionId" = ${owner}."sessionId" AND completedEvent."turnId" = ${owner}."turnId" AND completedEvent."taskId" = ${owner}."id"
     AND completedEvent."type" = 'step.completed' AND completedEvent."actor" = 'subagent' AND completedEvent."itemId" IS NULL
     AND completedEvent."correlationId" = continuation."id"
-    AND completedEvent."idempotencyKey" = 'task:' || owner."id" || ':event:step-completed:' || continuation."id"
-    AND (completedEvent."payload" = jsonb_build_object('stepId', continuation."id", 'status', 'completed', 'taskId', owner."id')
+    AND completedEvent."idempotencyKey" = 'task:' || ${owner}."id" || ':event:step-completed:' || continuation."id"
+    AND (completedEvent."payload" = jsonb_build_object('stepId', continuation."id", 'status', 'completed', 'taskId', ${owner}."id")
       OR (jsonb_typeof(completedEvent."payload") = 'object'
         AND jsonb_typeof(completedEvent."payload"->'toolCallCount') = 'number'
         AND completedEvent."payload"->>'toolCallCount' ~ '^(0|[1-9][0-9]?)$'
