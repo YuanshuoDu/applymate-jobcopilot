@@ -51,6 +51,14 @@ describe('AI settings translations', () => {
     expect(translate('en', 'nav.dashboard')).not.toBe(translate('zh', 'nav.dashboard'))
   })
 
+  it('uses consistent application and discovery navigation labels in English and Chinese', () => {
+    expect(translate('zh', 'nav.jobs')).toBe(translate('zh', 'jobs.title'))
+    expect(translate('zh', 'nav.jobs')).toBe('申请管理')
+    expect(translate('zh', 'nav.search')).toBe('发现职位')
+    expect(translate('en', 'nav.jobs')).toBe('Applications')
+    expect(translate('en', 'nav.search')).toBe('Discover')
+  })
+
   it('provides both language values for the primary user surfaces', () => {
     const keys = [
       'dashboard.momentum.title',

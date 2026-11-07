@@ -3,71 +3,36 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
-  apiMutate: vi.fn(),
+  session: { data: { user: { id: 'candidate-1' } } as { user: { id: string } } | null, status: 'authenticated' },
   toast: { error: vi.fn(), success: vi.fn() },
 }))
-
-vi.mock('@/lib/hooks', () => ({ apiMutate: mocks.apiMutate }))
-vi.mock('@/components/ui', () => ({
-  CompanyLogo: () => null,
-  ScorePill: () => null,
-  useToast: () => mocks.toast,
-}))
+vi.mock('next-auth/react', () => ({ useSession: () => mocks.session }))
+vi.mock('@/components/ui', () => ({ CompanyLogo: () => null, ScorePill: () => null, useToast: () => mocks.toast }))
 
 import { SmartSearch } from './SmartSearch'
 
-function setStoredSearch(meta: Record<string, unknown>) {
-  const storage = new Map<string, string>([['applymate_last_search', JSON.stringify({
-    q: 'Software Engineer Amsterdam',
-    filters: { location: 'Amsterdam', remote: false, jobType: '', datePosted: 'any', experience: '', salaryMin: '', salaryMax: '' },
-    results: [],
-    meta,
-  })]])
+// The interactive search controls, source labels and configuration links are
+// verified after effects run in e2e/application-flow.spec.ts.
+describe('SmartSearch initial identity boundary', () => {
+  beforeEach(() => { mocks.session.data = { user: { id: 'candidate-1' } }; mocks.session.status = 'authenticated' })
 
-  Object.defineProperty(globalThis, 'localStorage', {
-    configurable: true,
-    value: {
-      getItem: (key: string) => storage.get(key) ?? null,
-      setItem: (key: string, value: string) => storage.set(key, value),
-      removeItem: (key: string) => storage.delete(key),
-    },
-  })
-}
-
-describe('SmartSearch', () => {
-  beforeEach(() => {
-    delete (globalThis as { localStorage?: unknown }).localStorage
-  })
-
-  it('gives search controls distinct accessible names', () => {
+  it('does not render a previous search during unresolved authentication', () => {
+    mocks.session.data = null; mocks.session.status = 'loading'
     const html = renderToStaticMarkup(React.createElement(SmartSearch))
-
-    expect(html).toContain('aria-label="Search jobs"')
-    expect(html).toContain('aria-label="Show search filters"')
-    expect(html).toContain('aria-controls="search-filters"')
+    expect(html).toContain('role="status"')
+    expect(html).not.toContain('aria-label="Search jobs"')
   })
 
-  it('shows an English configuration path without internal routing diagnostics', () => {
-    setStoredSearch({
-      sourcesUsed: [],
-      routing: 'NL → adzuna + ats + linkedin',
-      totalRaw: 0,
-      totalDeduped: 0,
-      durationMs: 3,
-      apiKeys: { rapidapi: false, adzuna: false, reed: false, careerjet: false, cleanjobdata: false },
-    })
-
-    const html = renderToStaticMarkup(React.createElement(SmartSearch, { onOpenSettings: vi.fn() }))
-
-    expect(html).toContain('Some sources need a connection')
-    expect(html).toContain('Open API key settings')
-    expect(html).not.toContain('search API Not configured')
-    expect(html).not.toContain('routing: ')
-    expect(html).not.toContain('NL → adzuna + ats + linkedin')
-  })
-
-  it('renders the CleanJobData source label', () => {
+  it('waits for account-scoped state even when authentication is already known', () => {
     const html = renderToStaticMarkup(React.createElement(SmartSearch))
-    expect(html).toContain('CleanJobData')
+    expect(html).toContain('role="status"')
+    expect(html).not.toContain('aria-label="Search jobs"')
+  })
+
+  it('offers sign-in when no account is available', () => {
+    mocks.session.data = null; mocks.session.status = 'unauthenticated'
+    const html = renderToStaticMarkup(React.createElement(SmartSearch))
+    expect(html).toContain('href="/login"')
+    expect(html).toContain('Sign in again to continue')
   })
 })
