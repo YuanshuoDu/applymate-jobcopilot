@@ -1599,7 +1599,22 @@ async function historicalWaitBindingAccepts(client: PoolClient, task: BlockingTa
     JOIN "agent_steps" AS callStep ON callStep."id" = proof.value->>'stepId' AND callStep."sessionId" = owner."sessionId"
       AND callStep."turnId" = owner."turnId" AND callStep."taskId" = owner."id"
     JOIN "agent_items" AS callItem ON callItem."id" = proof.value->>'callItemId' AND callItem."sessionId" = owner."sessionId"
-      AND callItem."turnId" = owner."turnId" AND callItem."taskId" = owner."id"`,
+      AND callItem."turnId" = owner."turnId" AND callItem."taskId" = owner."id" AND callItem."stepId" = callStep."id"
+    JOIN "agent_events" AS itemStarted ON itemStarted."sessionId" = owner."sessionId" AND itemStarted."turnId" = owner."turnId"
+      AND itemStarted."taskId" = owner."id" AND itemStarted."itemId" = callItem."id" AND itemStarted."type" = 'item.started'
+      AND itemStarted."actor" = 'subagent' AND itemStarted."correlationId" = callStep."id"
+      AND itemStarted."idempotencyKey" = 'task:' || owner."id" || ':event:item-started:' || callItem."id"
+      AND itemStarted."payload" = jsonb_build_object('itemId', callItem."id", 'type', 'tool_call', 'phase', NULL)
+    JOIN "agent_events" AS started ON started."id" = proof.value->>'startEventId' AND started."sessionId" = owner."sessionId"
+      AND started."turnId" = owner."turnId" AND started."taskId" = owner."id" AND started."itemId" = callItem."id"
+      AND started."type" = 'tool_call.started' AND started."actor" = 'subagent'
+      AND started."correlationId" = callItem."content"->>'toolCallId' AND started."causationId" = itemStarted."id"
+      AND started."sequence" > itemStarted."sequence"
+      AND started."idempotencyKey" = CASE WHEN proof.value->'sourceWait'->'claimKeyDigest' = 'null'::jsonb
+        THEN 'task:' || owner."id" || ':event:tool-started:' || (callItem."content"->>'toolCallId')
+        ELSE 'task:' || owner."id" || ':event:child-wait-claim:' || callStep."attempt"::text || ':' || callStep."id" END
+      AND started."payload" = jsonb_build_object('toolCallId', callItem."content"->>'toolCallId',
+        'toolName', 'wait_subagents', 'taskId', owner."id')`,
   [task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount, task.leaseExpiresAt,
     task.userId, JSON.stringify(projection)])
   return result.rows.length === 1 && result.rows[0]?.accepted === true
@@ -5116,6 +5131,25 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
           && projection.sourceWait.claimKeyDigest === null && projection.sourceStepPrefix)
         expect(secondSourceProjection?.sourceStepPrefix?.items).toHaveLength(2)
         if (!secondSourceProjection) throw new Error("two_historical_wait_second_source_projection_missing")
+        const secondClaimProjection = projections.find(projection => projection.sourceWait.waitId === secondWait!.waitId
+          && projection.sourceWait.claimKeyDigest !== null)
+        if (!secondClaimProjection) throw new Error("two_historical_wait_second_claim_projection_missing")
+        await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, secondSourceProjection),
+          "real PG binding accepts source identity from its top-level and nested sourceWait fields").resolves.toBe(true)
+        await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, secondClaimProjection),
+          "real PG binding accepts a claim top-level identity while separately binding its nested sourceWait").resolves.toBe(true)
+        await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, { ...secondSourceProjection,
+          callItemId: secondClaimProjection.callItemId, rawCallId: secondClaimProjection.rawCallId,
+          projectedCallId: secondClaimProjection.projectedCallId }),
+        "a source projection cannot borrow the continuation claim's top-level identity").resolves.toBe(false)
+        await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, { ...secondClaimProjection,
+          callItemId: secondSourceProjection.callItemId, rawCallId: secondSourceProjection.rawCallId,
+          projectedCallId: secondSourceProjection.projectedCallId }),
+        "a claim projection cannot substitute the historical source's top-level identity").resolves.toBe(false)
+        await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, { ...secondClaimProjection,
+          sourceWait: { ...secondClaimProjection.sourceWait, sourceCallItemId: secondClaimProjection.callItemId,
+            sourceCallId: secondClaimProjection.rawCallId, projectedSourceCallId: secondClaimProjection.projectedCallId } }),
+        "a claim cannot rebind the nested sourceWait to its continuation call").resolves.toBe(false)
         const earlierCompletedTool = await checkClient.query<{ sourceOrdinal: number; sourceAttempt: number; earlierOrdinal: number;
           earlierAttempt: number; callId: string; toolName: string; callStatus: string; resultStatus: string }>(
         "SELECT source.\"ordinal\" AS \"sourceOrdinal\", source.\"attempt\" AS \"sourceAttempt\", " +

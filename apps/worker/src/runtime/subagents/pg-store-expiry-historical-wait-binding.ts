@@ -168,8 +168,13 @@ export const CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL = `EXISTS (
     AND boundSourceCall."content"->'input' = jsonb_build_object('idempotencyKey', boundWait."idempotencyKey",
       'taskIds', boundWait."targetTaskIds", 'mode', boundWait."mode", 'timeoutMs', boundWait."result"->'request'->'timeoutMs')
     AND encode(sha256(convert_to(boundWait."idempotencyKey", 'UTF8')), 'hex') = proof.value->'sourceWait'->>'sourceKeyDigest'
-    AND boundSourceCall."id" = proof.value->>'callItemId' AND boundSourceCall."content"->>'toolCallId' = proof.value->>'rawCallId'
-    AND proof.value->>'projectedCallId' = proof.value->'sourceWait'->>'projectedSourceCallId'
+    AND proof.value->>'callItemId' = callItem."id" AND proof.value->>'rawCallId' = callItem."content"->>'toolCallId'
+    AND proof.value->>'stepId' = callStep."id" AND proof.value->>'attempt' = callStep."attempt"::text
+    AND callItem."stepId" = callStep."id"
+    AND CASE WHEN proof.value->'sourceWait'->'claimKeyDigest' = 'null'::jsonb THEN
+      boundSourceCall."id" = proof.value->>'callItemId' AND boundSourceCall."content"->>'toolCallId' = proof.value->>'rawCallId'
+      AND proof.value->>'projectedCallId' = proof.value->'sourceWait'->>'projectedSourceCallId'
+    ELSE callItem."id" <> boundSourceCall."id" END
     AND boundSourceResult."status" = 'completed' AND boundSourceResult."revision" = 1 AND boundSourceResult."phase" IS NULL
     AND ${CHILD_WAIT_HISTORICAL_SOURCE_RESULT_RECEIPT_SQL}
     AND ${CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL}

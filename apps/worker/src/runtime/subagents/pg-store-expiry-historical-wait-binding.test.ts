@@ -83,6 +83,23 @@ describe("final historical wait receipt binding", () => {
     expect(sql).toContain("= proof.value->'sourceWait'->>'claimKeyDigest') = 1")
   })
 
+  it("binds top-level identity to the current call while source identity stays in sourceWait", () => {
+    const branchStart = sql.indexOf("AND CASE WHEN proof.value->'sourceWait'->'claimKeyDigest' = 'null'::jsonb THEN")
+    const branchEnd = sql.indexOf("AND boundSourceResult.\"status\"", branchStart)
+    const identityBranch = sql.slice(branchStart, branchEnd)
+    expect(sql).toContain("boundSourceCall.\"id\" = proof.value->'sourceWait'->>'sourceCallItemId'")
+    expect(sql).toContain("boundSourceCall.\"content\"->>'toolCallId' = proof.value->'sourceWait'->>'sourceCallId'")
+    expect(sql).toContain("proof.value->>'callItemId' = callItem.\"id\"")
+    expect(sql).toContain("proof.value->>'rawCallId' = callItem.\"content\"->>'toolCallId'")
+    expect(sql).toContain("proof.value->>'stepId' = callStep.\"id\"")
+    expect(sql).toContain("proof.value->>'attempt' = callStep.\"attempt\"::text")
+    expect(identityBranch).toContain("boundSourceCall.\"id\" = proof.value->>'callItemId'")
+    expect(identityBranch).toContain("proof.value->>'projectedCallId' = proof.value->'sourceWait'->>'projectedSourceCallId'")
+    expect(identityBranch).toContain("ELSE callItem.\"id\" <> boundSourceCall.\"id\" END")
+    expect(branchStart).toBeGreaterThanOrEqual(0)
+    expect(branchEnd).toBeGreaterThan(branchStart)
+  })
+
   it("parenthesizes JSON text extraction operands after PostgreSQL concatenation", () => {
     expect(CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL).not.toMatch(unparenthesizedJsonExtractionAfterConcat)
   })
