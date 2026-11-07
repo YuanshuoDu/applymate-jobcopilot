@@ -203,7 +203,8 @@ export const CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL = `EXISTS (
             AND claimCandidateStep."turnId" = claimCandidate."turnId" AND claimCandidateStep."taskId" = claimCandidate."taskId"
           WHERE claimCandidate."sessionId" = owner."sessionId" AND claimCandidate."turnId" = owner."turnId"
             AND claimCandidate."taskId" = owner."id" AND claimCandidateStep."attempt" = owner."attemptCount"
-            AND claimCandidate."type" = 'tool_call' AND claimCandidate."content"->>'toolName' = 'wait_subagents'
+            AND claimCandidate."type" = 'tool_call'
+            AND claimCandidate."id" <> boundSourceCall."id" AND claimCandidate."content"->>'toolName' = 'wait_subagents'
             AND encode(sha256(convert_to(claimCandidate."content"->'input'->>'idempotencyKey', 'UTF8')), 'hex') = proof.value->'sourceWait'->>'claimKeyDigest') = 1
       END
 )`

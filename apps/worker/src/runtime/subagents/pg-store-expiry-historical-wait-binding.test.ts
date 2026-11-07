@@ -83,6 +83,36 @@ describe("final historical wait receipt binding", () => {
     expect(sql).toContain("= proof.value->'sourceWait'->>'claimKeyDigest') = 1")
   })
 
+  it("excludes only the exact nested source item from claim-key uniqueness", () => {
+    const start = sql.indexOf('(SELECT COUNT(*) FROM "agent_items" AS claimCandidate')
+    const end = sql.indexOf('= proof.value->\'sourceWait\'->>\'claimKeyDigest\') = 1', start)
+    const candidateCount = sql.slice(start, end)
+    expect(sql).toContain('boundSourceCall."id" = proof.value->\'sourceWait\'->>\'sourceCallItemId\'')
+    expect(candidateCount).toContain('claimCandidate."id" <> boundSourceCall."id"')
+    expect(candidateCount).toContain('claimCandidateStep."attempt" = owner."attemptCount"')
+    expect(candidateCount).not.toMatch(/claimCandidateStep\."id"\s*<>/)
+    expect(start).toBeGreaterThanOrEqual(0)
+    expect(end).toBeGreaterThan(start)
+
+    const digest = "a".repeat(64)
+    const source = { itemId: "source-item", sessionId: "session", turnId: "turn", taskId: "task", attempt: 1,
+      toolName: "wait_subagents", digest }
+    const firstClaim = { ...source, itemId: "claim-item-1" }
+    const candidates = [source, firstClaim]
+    const remainingClaims = candidates.filter(candidate => candidate.sessionId === source.sessionId
+      && candidate.turnId === source.turnId && candidate.taskId === source.taskId && candidate.attempt === source.attempt
+      && candidate.toolName === "wait_subagents" && candidate.digest === digest && candidate.itemId !== source.itemId)
+    expect(firstClaim.itemId).not.toBe(source.itemId)
+    expect(firstClaim).toMatchObject({ sessionId: source.sessionId, turnId: source.turnId, taskId: source.taskId, attempt: source.attempt })
+    expect(remainingClaims).toEqual([firstClaim])
+
+    const duplicateClaim = { ...source, itemId: "claim-item-3" }
+    const withThirdClaim = [...candidates, duplicateClaim].filter(candidate => candidate.sessionId === source.sessionId
+      && candidate.turnId === source.turnId && candidate.taskId === source.taskId && candidate.attempt === source.attempt
+      && candidate.toolName === "wait_subagents" && candidate.digest === digest && candidate.itemId !== source.itemId)
+    expect(withThirdClaim).toHaveLength(2)
+    expect(withThirdClaim.map(candidate => candidate.itemId)).toEqual([firstClaim.itemId, duplicateClaim.itemId])
+  })
   it("binds top-level identity to the current call while source identity stays in sourceWait", () => {
     const branchStart = sql.indexOf("AND CASE WHEN proof.value->'sourceWait'->'claimKeyDigest' = 'null'::jsonb THEN")
     const branchEnd = sql.indexOf("AND boundSourceResult.\"status\"", branchStart)

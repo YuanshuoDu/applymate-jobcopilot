@@ -268,6 +268,40 @@ describe("worker restart blocker proof diagnostic bindings", () => {
     expect(parseBoundedLoopDiagnostics(overLimit)).toMatchObject({ overflow: true })
     expect(parseBoundedLoopDiagnostics(overLimit).records).toHaveLength(MAX_BOUNDED_LOOP_DIAGNOSTIC_STAGES)
   })
+  it("summarizes final loop failures without retaining invocation ids or output text", () => {
+    const privateId = "fixture-private-invocation-id", privateText = "fixture-private-output", privateError = "fixture-private-error"
+    const child = { stdoutText: [
+      `${BOUNDED_LOOP_STAGE_MARKER}${JSON.stringify({ stage: "model_invocation", phase: "fail", liveResume: "other" })}`,
+      `WORKER_B_LOOP_RESUMED ${JSON.stringify({ phase: "final", status: "failed", finalText: privateText,
+        invocations: [privateId, `${privateId}:2`], executorCalls: 2, dispatcherCalls: 1, toolCallCount: 3,
+        errorCodeCategory: "unsettled_external_call_rejected", privateError })}`,
+    ].join("\n") } as unknown as WorkerProcess
+    const diagnostic = boundedLoopFailureDiagnostic(child)
+    expect(diagnostic).toEqual({ trace: { stageCount: 1, overflow: false, exactKeys: true,
+      stages: [{ stage: "model_invocation", phase: "fail", liveResume: "other" }] },
+    outcome: { phase: "final", status: "failed", finalTextMatchesExpected: false,
+      errorCodeCategory: "unsettled_external_call_rejected", executorCalls: 2, dispatcherCalls: 1, modelCalls: 2, toolCallCount: 3 } })
+    expect(JSON.stringify(diagnostic)).not.toContain(privateId)
+    expect(JSON.stringify(diagnostic)).not.toContain(privateText)
+    expect(JSON.stringify(diagnostic)).not.toContain(privateError)
+    const resumeFailure = { stdoutText: [
+      `${BOUNDED_LOOP_STAGE_MARKER}${JSON.stringify({ stage: "claim_recovery_loader", phase: "fail", liveResume: "other" })}`,
+      `WORKER_B_LOOP_FINAL_RESUME_FAILURE ${JSON.stringify({ stage: "claim_recovery_check", category: "child_resume_wait_lineage", taskId: privateId })}`,
+    ].join("\n") } as unknown as WorkerProcess
+    const failureSummary = boundedLoopFailureDiagnostic(resumeFailure)
+    expect(failureSummary.outcome).toMatchObject({ phase: "missing", status: "missing", errorCodeCategory: "child_resume_wait_lineage" })
+    expect(JSON.stringify(failureSummary)).not.toContain(privateId)
+  })
+  it("waits for the exact abandoned dispatch even when an older stale marker appears first", async () => {
+    const child = { stdoutText: [
+      `${STALE_DISPATCH_SKIPPED_MARKER}${JSON.stringify({ dispatchGeneration: 31, currentPublishedGeneration: 40, taskId: "private-task" })}`,
+      `${STALE_DISPATCH_SKIPPED_MARKER}${JSON.stringify({ dispatchGeneration: 39, currentPublishedGeneration: 40, taskId: "private-task" })}`,
+    ].join("\n"), exitCode: null, signalCode: null } as unknown as WorkerProcess
+    await expect(waitForExactStaleDispatchObservation(child, 39, 40, 40)).resolves.toBeUndefined()
+    const malformed = { stdoutText: `${STALE_DISPATCH_SKIPPED_MARKER}${JSON.stringify({ dispatchGeneration: 40,
+      currentPublishedGeneration: 40, taskId: "private-task" })}`, exitCode: null, signalCode: null } as unknown as WorkerProcess
+    await expect(waitForExactStaleDispatchObservation(malformed, 40, 40, 40)).rejects.toThrow("stale_dispatch_generation_invariant_failed")
+  })
   it("parses fixed claim-loader query and failure categories without retaining unknown fields", () => {
     const parsed = parseBoundedLoopDiagnostics([
       { stage: "claim_loader_connection", phase: "start" },
@@ -376,6 +410,45 @@ function summarizeBoundedLoopTrace(text: string): {
     stages: records.map(({ stage, phase, liveResume }) => ({ stage, phase, liveResume })) }
 }
 
+function boundedLoopOutcomeSummary(child: WorkerProcess): {
+  phase: string; status: string; finalTextMatchesExpected: boolean | null; errorCodeCategory: string;
+  executorCalls: number | null; dispatcherCalls: number | null; modelCalls: number | null; toolCallCount: number | null
+} {
+  const prefix = "WORKER_B_LOOP_RESUMED "
+  const line = child.stdoutText.split(/\r?\n/).filter(value => value.startsWith(prefix)).at(-1)
+  let row: Record<string, unknown> = {}
+  if (line) { try { row = asObject(JSON.parse(line.slice(prefix.length)) as unknown) } catch { row = {} } }
+  const safeCount = (value: unknown): number | null => Number.isSafeInteger(value) && Number(value) >= 0
+    ? Math.min(Number(value), 1_000) : null
+  const invocationCount = Array.isArray(row.invocations) ? row.invocations.length : null
+  let errorCodeCategory = typeof row.errorCodeCategory === "string" && BOUNDED_LOOP_ERROR_CATEGORIES.has(row.errorCodeCategory)
+    ? row.errorCodeCategory : line ? "other" : "missing"
+  if (errorCodeCategory === "other" || errorCodeCategory === "missing") {
+    const failurePrefixes = ["WORKER_B_LOOP_RESUME_FAILURE ", "WORKER_B_LOOP_FINAL_RESUME_FAILURE "]
+    const failureLine = child.stdoutText.split(/\r?\n/).filter(line => failurePrefixes.some(prefix => line.startsWith(prefix))).at(-1)
+    if (failureLine) {
+      const failurePrefix = failurePrefixes.find(value => failureLine.startsWith(value))!
+      try {
+        const failure = asObject(JSON.parse(failureLine.slice(failurePrefix.length)) as unknown)
+        if (typeof failure.category === "string" && BOUNDED_LOOP_ERROR_CATEGORIES.has(failure.category)) errorCodeCategory = failure.category
+      } catch { /* diagnostics remain bounded on malformed markers */ }
+    }
+  }
+  return {
+    phase: typeof row.phase === "string" && BOUNDED_LOOP_PHASES.has(row.phase) ? row.phase : line ? "other" : "missing",
+    status: typeof row.status === "string" && WORKER_RESULT_STATUSES.includes(row.status as WorkerResultStatus)
+      ? row.status : line ? "other" : "missing",
+    finalTextMatchesExpected: typeof row.finalText === "string" ? row.finalText === FINAL_MARKER : null,
+    errorCodeCategory,
+    executorCalls: safeCount(row.executorCalls), dispatcherCalls: safeCount(row.dispatcherCalls),
+    modelCalls: safeCount(row.modelCalls) ?? safeCount(invocationCount), toolCallCount: safeCount(row.toolCallCount),
+  }
+}
+
+function boundedLoopFailureDiagnostic(child: WorkerProcess) {
+  return { trace: summarizeBoundedLoopTrace(child.stdoutText), outcome: boundedLoopOutcomeSummary(child) }
+}
+
 function expectUsageLineageCutStages(child: WorkerProcess): void {
   const { overflow, records } = parseBoundedLoopDiagnostics(child.stdoutText)
   expect(overflow).toBe(false)
@@ -441,6 +514,13 @@ const WORKER_FAILURE_REASON_CATEGORIES = [
   "turn_execution_failed", "fixture_source_wait_call_receipt_invalid", "missing", "other",
 ] as const
 type WorkerFailureReasonCategory = typeof WORKER_FAILURE_REASON_CATEGORIES[number]
+const BOUNDED_LOOP_PHASES = new Set(["final", "claim-recovery-cut", "claim-item-completed-cut", "multi-complete-cut",
+  "multi-preclaim", "multi-reject", "two-waits", "usage-lineage-cut", "usage-lineage-reject"])
+const BOUNDED_LOOP_ERROR_CATEGORIES = new Set([
+  ...WORKER_FAILURE_REASON_CATEGORIES, "none", "invalid_output", "persistence_conflict", "model_execution_failed",
+  "no_progress", "budget_exhausted", "step_limit", "final_unverified", "model_incomplete", "evidence_missing",
+  "evidence_conflict", "business_precondition_failed", "discovery_memory_overflow", "tool_result_replay_uncertain",
+])
 const DIAGNOSTIC_TASK_STATUSES = new Set(["queued", "running", "waiting", "waiting_for_user", "retrying",
   "completed", "failed", "interrupted", "cancelled", "closed"])
 type RestoredWaitObservationSummary = {
@@ -491,6 +571,55 @@ async function waitForMarker(child: WorkerProcess, marker: string, timeoutMs = 2
     await new Promise(resolve => setTimeout(resolve, 25))
   }
   throw new Error(`Timed out waiting for ${marker}; stdout: ${child.stdoutText}; stderr: ${child.stderrText}`)
+}
+
+const STALE_DISPATCH_SKIPPED_MARKER = "WORKER_B_STALE_DISPATCH_SKIPPED "
+const MAX_STALE_DISPATCH_OBSERVATIONS = 32
+type StaleDispatchObservation = Readonly<{ dispatchGeneration: number | null; currentPublishedGeneration: number | null }>
+function boundedStaleDispatchObservations(child: WorkerProcess): { overflow: boolean; records: StaleDispatchObservation[] } {
+  const lines = child.stdoutText.split(/\r?\n/).filter(line => line.startsWith(STALE_DISPATCH_SKIPPED_MARKER))
+  const records = lines.slice(0, MAX_STALE_DISPATCH_OBSERVATIONS).map(line => {
+    let row: Record<string, unknown>
+    try { row = asObject(JSON.parse(line.slice(STALE_DISPATCH_SKIPPED_MARKER.length)) as unknown) }
+    catch { row = {} }
+    return {
+      dispatchGeneration: Number.isSafeInteger(row.dispatchGeneration) && Number(row.dispatchGeneration) >= 0
+        ? Number(row.dispatchGeneration) : null,
+      currentPublishedGeneration: Number.isSafeInteger(row.currentPublishedGeneration) && Number(row.currentPublishedGeneration) >= 0
+        ? Number(row.currentPublishedGeneration) : null,
+    }
+  })
+  return { overflow: lines.length > MAX_STALE_DISPATCH_OBSERVATIONS, records }
+}
+
+async function waitForExactStaleDispatchObservation(child: WorkerProcess, abandonedGeneration: number,
+  currentPublishedGeneration: number, replacementGeneration: number, timeoutMs = 45_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const observed = boundedStaleDispatchObservations(child)
+    const exact = observed.records.some(row => row.dispatchGeneration === abandonedGeneration
+      && row.currentPublishedGeneration === currentPublishedGeneration)
+    if (exact) {
+      const ordered = observed.records.every(row => row.dispatchGeneration !== null && row.currentPublishedGeneration !== null
+        && row.dispatchGeneration < row.currentPublishedGeneration && row.dispatchGeneration < replacementGeneration)
+      if (observed.overflow || !ordered || currentPublishedGeneration !== replacementGeneration) {
+        throw new Error(`stale_dispatch_generation_invariant_failed:${JSON.stringify({
+          overflow: observed.overflow, ordered, abandonedGeneration, currentPublishedGeneration, replacementGeneration, records: observed.records,
+        })}`)
+      }
+      return
+    }
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`stale_dispatch_generation_not_observed:${JSON.stringify({
+        abandonedGeneration, currentPublishedGeneration, replacementGeneration, ...observed,
+      })}`)
+    }
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+  const observed = boundedStaleDispatchObservations(child)
+  throw new Error(`stale_dispatch_generation_timeout:${JSON.stringify({
+    abandonedGeneration, currentPublishedGeneration, replacementGeneration, ...observed,
+  })}`)
 }
 
 async function waitForBoundedLoopMarker(child: WorkerProcess, marker: string, timeoutMs = 20_000): Promise<void> {
@@ -4176,6 +4305,10 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         expect(finalDispatch.rows[0]).toMatchObject({ attemptCount: postAckGeneration + 1 })
         expect(finalDispatch.rows[0]?.publishedAt).toBeInstanceOf(Date)
         finalPublishedAttemptCount = finalDispatch.rows[0]!.attemptCount
+        expect(finalPublishedAttemptCount - 1).toBe(postAckGeneration)
+        const postAckReplacementJob = await queue.getJob(subagentDispatchJobId(waiter.id, postAckGeneration))
+        expect(postAckReplacementJob).toBeDefined()
+        expect(await postAckReplacementJob!.getState()).toBe("waiting")
         await queue.resume()
         queuePaused = false
       } finally {
@@ -4184,11 +4317,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
           queuePaused = false
         }
       }
-      await waitForMarker(workerE!, "WORKER_B_STALE_DISPATCH_SKIPPED")
-      const staleAckRecoveryLine = workerE!.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_STALE_DISPATCH_SKIPPED "))
-      expect(JSON.parse(staleAckRecoveryLine!.slice("WORKER_B_STALE_DISPATCH_SKIPPED ".length))).toEqual({
-        dispatchGeneration: abandonedAckRecoveryGeneration, currentPublishedGeneration: postAckGeneration,
-      })
+      await waitForExactStaleDispatchObservation(workerE!, abandonedAckRecoveryGeneration, postAckGeneration, finalPublishedAttemptCount - 1)
       await waitForMarker(workerE!, "WORKER_B_LOOP_RESTORED")
       const recoveryWorkerE = workerE!
       const orphanRestoredMarker = recoveryWorkerE.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_LOOP_RESTORED "))
@@ -4401,6 +4530,9 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         expect(resultCutDispatchPublished.rows[0]?.publishedAt).toBeInstanceOf(Date)
         expect(resultCutDispatchPublished.rows[0]!.attemptCount - 1).toBe(resultCutGeneration)
         expect(abandonedClaimRecoveryGeneration).toBeLessThan(resultCutDispatchPublished.rows[0]!.attemptCount - 1)
+        const resultCutReplacementJob = await queue.getJob(subagentDispatchJobId(waiter.id, resultCutGeneration))
+        expect(resultCutReplacementJob).toBeDefined()
+        expect(await resultCutReplacementJob!.getState()).toBe("waiting")
         await queue.resume()
         queuePaused = false
       } finally {
@@ -4410,11 +4542,8 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         }
       }
       await waitForMarker(workerF, "WORKER_B_LOOP_CLAIM_ITEM_COMPLETED_BEFORE_EVENT")
-      await waitForMarker(workerF, "WORKER_B_STALE_DISPATCH_SKIPPED")
-      const preCutStaleLine = workerF.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_STALE_DISPATCH_SKIPPED "))
-      expect(JSON.parse(preCutStaleLine!.slice("WORKER_B_STALE_DISPATCH_SKIPPED ".length))).toEqual({
-        dispatchGeneration: abandonedClaimRecoveryGeneration, currentPublishedGeneration: resultCutGeneration,
-      })
+      await waitForExactStaleDispatchObservation(workerF, abandonedClaimRecoveryGeneration, resultCutGeneration,
+        resultCutPublishedAttemptCount - 1)
       expectRestoredWaitObservation(workerF, "consumed")
       const callRowCut = await readWaitClaimState(pool, ids, acknowledged!.continuationStepId, orphanCallId, acknowledged!.sourceAttempt)
       expect(callRowCut.call).toMatchObject({ status: "completed", revision: 1, content: { toolCallId: orphanCallId } })
@@ -4467,6 +4596,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       )
       expect(completedRecoveryPublished.rows[0]).toMatchObject({ attemptCount: completedRecoveryGeneration + 1 })
       expect(completedRecoveryPublished.rows[0]?.publishedAt).toBeInstanceOf(Date)
+      expect(completedRecoveryPublished.rows[0]!.attemptCount - 1).toBe(completedRecoveryGeneration)
       const currentDispatchJob = await queue.getJob(subagentDispatchJobId(waiter.id, completedRecoveryGeneration))
       expect(currentDispatchJob).toBeDefined()
       expect(await currentDispatchJob!.getState()).toBe("waiting")
@@ -4491,11 +4621,8 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       const resumedLine = workerG.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_RESUMED "))
       const resumedOutcome = JSON.parse(resumedLine!.slice("WORKER_B_RESUMED ".length)) as { dispatchGeneration?: number }
       expect(resumedOutcome.dispatchGeneration).toBe(completedRecoveryGeneration)
-      const staleDispatchLines = workerG.stdoutText.split(/\r?\n/).filter(line => line.startsWith("WORKER_B_STALE_DISPATCH_SKIPPED "))
-      for (const line of staleDispatchLines) {
-        const stale = JSON.parse(line.slice("WORKER_B_STALE_DISPATCH_SKIPPED ".length)) as { dispatchGeneration?: number }
-        expect(stale.dispatchGeneration).toBe(resultCutGeneration)
-      }
+      await waitForExactStaleDispatchObservation(workerG, resultCutGeneration, completedRecoveryGeneration,
+        completedRecoveryPublished.rows[0]!.attemptCount - 1)
       const finalExit = await workerG.exited
       expect(finalExit.code).toBe(0)
       expect(finalExit.signal).toBeNull()
@@ -5524,9 +5651,10 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       await waitForMarker(workerC, "WORKER_B_PROCESSING_RELEASED")
       await waitForMarker(workerC, "WORKER_B_LOOP_RESTORED")
       await waitForMarker(workerC, "WORKER_B_LOOP_RESUMED")
-      const finalMarker = workerC.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_LOOP_RESUMED "))
-      expect(JSON.parse(finalMarker!.slice("WORKER_B_LOOP_RESUMED ".length))).toMatchObject({
-        phase: "final", status: "completed", finalText: FINAL_MARKER, executorCalls: 0, dispatcherCalls: 0,
+      const boundedFinalDiagnostic = boundedLoopFailureDiagnostic(workerC)
+      expect(boundedFinalDiagnostic.outcome,
+        `bounded multi-tool final diagnostic=${JSON.stringify(boundedFinalDiagnostic)}`).toMatchObject({
+        phase: "final", status: "completed", finalTextMatchesExpected: true, executorCalls: 0, dispatcherCalls: 0,
       })
       expect(await readCompletedChain()).toEqual(callChainBeforeRestart)
       const stepEventsAfterRestart = await pool.query<{ type: string; count: number }>(`SELECT event."type", COUNT(*)::int AS "count"
@@ -6467,17 +6595,26 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
 
         await checkClient.query("SAVEPOINT recovered_handoff_marker_owner_toctou")
         try {
+          const tamperedOwnerId = `different-owner-${randomUUID()}`
           const changedMarker = await checkClient.query(`UPDATE "agent_wait_conditions"
             SET "result" = jsonb_set("result", '{sourceLifecycleRecovery,ownerId}', to_jsonb($5::text), false)
             WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "parentTaskId" = $4 RETURNING "id"`,
-          [sourceWaitId, ids.sessionId, ids.turnId, ids.waiterTaskId, `different-owner-${randomUUID()}`])
+          [sourceWaitId, ids.sessionId, ids.turnId, ids.waiterTaskId, tamperedOwnerId])
           expect(changedMarker.rowCount).toBe(1)
           await expect(historicalWaitBindingAccepts(checkClient, snapshot, handoffSource),
             "the final PostgreSQL binding must reject a lifecycle owner marker changed after projection read").resolves.toBe(false)
           const postTamperProjections = await readChildWaitTerminalCallProjections(checkClient, snapshot as unknown as Record<string, unknown>)
-          expect(postTamperProjections.filter(projection => projection.sourceWait.waitId === sourceWaitId).length).toBe(0)
+          const freshSourceProjection = postTamperProjections.find(projection => projection.sourceWait.waitId === sourceWaitId
+            && projection.sourceWait.claimKeyDigest === null)
+          // A fresh digest only mirrors the marker observed now; it does not authenticate who originally wrote ownerId.
+          if (freshSourceProjection) {
+            expect(freshSourceProjection.sourceWait.sourceLifecycleRecoveryOwnerDigest)
+              .toBe(createHash("sha256").update(tamperedOwnerId).digest("hex"))
+            expect(freshSourceProjection.sourceWait.sourceLifecycleRecoveryOwnerDigest)
+              .not.toBe(handoffSource.sourceWait.sourceLifecycleRecoveryOwnerDigest)
+          }
           await expect(hasBlockingExternalCall(checkClient, snapshot as unknown as Record<string, unknown>, undefined, continuationStepId),
-            "a changed lifecycle owner marker must keep the wait blocking").resolves.toBe(true)
+            "the incomplete continuation claim must remain blocking after the source marker changes").resolves.toBe(true)
         } finally {
           await checkClient.query("ROLLBACK TO SAVEPOINT recovered_handoff_marker_owner_toctou")
           await checkClient.query("RELEASE SAVEPOINT recovered_handoff_marker_owner_toctou")

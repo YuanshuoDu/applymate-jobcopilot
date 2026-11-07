@@ -64,7 +64,7 @@ function reportFinalResumeDiagnosticFailure(stage, error) {
   try { say(`WORKER_B_LOOP_FINAL_RESUME_FAILURE ${JSON.stringify({ stage, category })}`) }
   catch { /* diagnostics must not replace the original failure */ }
 }
-const boundedLoopDiagnosticModes = new Set(["worker-b-loop-usage-lineage-cut", "worker-b-loop-usage-lineage-reject", "worker-b-loop-multi-complete-cut"])
+const boundedLoopDiagnosticModes = new Set(["worker-b-loop-usage-lineage-cut", "worker-b-loop-usage-lineage-reject", "worker-b-loop-multi-complete-cut", "worker-b-loop-final"])
 const maxBoundedLoopDiagnosticStages = 64
 const boundedLoopDiagnosticStages = new Set([
   "durable_wait_loader", "child_attempt_resume_loader", "restored_wait_validation", "execution_loop_recovery",
