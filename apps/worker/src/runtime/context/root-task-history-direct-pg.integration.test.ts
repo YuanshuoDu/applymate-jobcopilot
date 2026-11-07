@@ -17,6 +17,47 @@ const SOURCE_SEQUENCE_STRIDE = 6
 const CURRENT_START_SEQUENCE = 10_000
 const FIXTURE_EVENT_SEQUENCE = 20_000
 const SCHEDULED_FIXTURE_EVENT_SEQUENCE = 30_000
+type RootHistoryDiagnosticStage =
+  | "manual_pool_connect"
+  | "manual_begin"
+  | "manual_limits"
+  | "manual_user_scope"
+  | "manual_fence"
+  | "manual_witness_lookup"
+  | "manual_page_first"
+  | "manual_page_second"
+  | "manual_page_empty"
+  | "manual_witness_count"
+  | "manual_rollback"
+  | "manual_release"
+  | "wrapped_store_load"
+  | "diagnostic_pool_close"
+  | "wrapped_pool_connect"
+  | "wrapped_begin"
+  | "wrapped_limits"
+  | "wrapped_fence"
+  | "wrapped_index_readiness"
+  | "wrapped_cross_session_page"
+  | "wrapped_graph_load"
+  | "wrapped_other_query"
+type RootHistoryDiagnosticFailure = "lock_timeout" | "statement_cancelled" | "client_query_timeout" | "pool_close_timeout" | "other"
+type RootHistoryDiagnosticLeaseReporter = (cancel: (() => void) | undefined) => void
+const ROOT_HISTORY_DIAGNOSTIC_ABORT = new Error("root_history_diagnostic_client_discarded")
+const MAX_ROOT_HISTORY_DIAGNOSTIC_EVENTS = 64
+let rootHistoryDiagnosticEventCount = 0
+
+function writeRootHistoryDiagnostic(
+  event: "start" | "pass" | "near_timeout" | "failure",
+  stage: RootHistoryDiagnosticStage,
+  failure?: RootHistoryDiagnosticFailure,
+): void {
+  if (rootHistoryDiagnosticEventCount >= MAX_ROOT_HISTORY_DIAGNOSTIC_EVENTS
+    && event !== "near_timeout" && event !== "failure") return
+  if (rootHistoryDiagnosticEventCount < MAX_ROOT_HISTORY_DIAGNOSTIC_EVENTS) rootHistoryDiagnosticEventCount += 1
+  const kind = failure ? ` kind=${failure}` : ""
+  process.stderr.write(`[root-history-pg] ${event} stage=${stage}${kind}\n`)
+}
+
 function disposableUrl(): string | null {
   const required = process.env.AGENT_RUNTIME_PG_TEST_REQUIRED === "true", value = process.env.AGENT_RUNTIME_PG_TEST_URL
   if (process.env.CI !== "true" && !required) return null
@@ -97,21 +138,59 @@ function queryLevelDuplicateWitnessSql(sql: string, witnessIdParameter: number):
     CROSS JOIN (SELECT $3::text) AS "root_task_history_parameter_type_anchor"`
 }
 
-function queryLevelDuplicateWitnessPool(pool: PgPool, witnessId: string): Pick<PgPool, "connect"> {
+function queryLevelDuplicateWitnessPool(
+  pool: PgPool,
+  witnessId: string,
+  onStage: (stage: RootHistoryDiagnosticStage) => void,
+  onLease: RootHistoryDiagnosticLeaseReporter,
+): Pick<PgPool, "connect"> {
   return {
     connect: async () => {
+      onStage("wrapped_pool_connect")
       const client = await pool.connect()
       const originalQuery = client.query.bind(client)
+      const originalRelease = client.release.bind(client)
+      let released = false
+      let queryFailed = false
+      const release = (error?: Error | boolean) => {
+        if (released) return
+        released = true
+        onLease(undefined)
+        originalRelease(error ?? (queryFailed ? ROOT_HISTORY_DIAGNOSTIC_ABORT : undefined))
+      }
+      const forceRelease = () => release(ROOT_HISTORY_DIAGNOSTIC_ABORT)
+      onLease(forceRelease)
       const query = async (sql: string, values?: readonly unknown[]) => {
-        if (!sql.includes("WITH terminal_window AS MATERIALIZED (") || !sql.includes('event."sessionId" <> $1')) {
-          return originalQuery(sql, values ? [...values] : undefined)
+        try {
+          if (sql === "BEGIN") {
+            onStage("wrapped_begin")
+            const result = await originalQuery(sql)
+            onStage("wrapped_limits")
+            await originalQuery("SET LOCAL lock_timeout = '2000ms'")
+            await originalQuery("SET LOCAL statement_timeout = '8000ms'")
+            return result
+          }
+          if (sql.includes("FOR UPDATE")) onStage("wrapped_fence")
+          else if (sql.includes('FROM "agent_objective_history_index_readiness"')) onStage("wrapped_index_readiness")
+          else if (sql.includes("WITH terminal_window AS MATERIALIZED (") && sql.includes('event."sessionId" <> $1')) {
+            onStage("wrapped_cross_session_page")
+          } else if (sql.includes('FROM "agent_items" AS item')) onStage("wrapped_graph_load")
+          else onStage("wrapped_other_query")
+          const result = !sql.includes("WITH terminal_window AS MATERIALIZED (") || !sql.includes('event."sessionId" <> $1')
+            ? await originalQuery(sql, values ? [...values] : undefined)
+            : await originalQuery(queryLevelDuplicateWitnessSql(sql, (values?.length ?? 0) + 1),
+              [...(values ?? []), witnessId])
+          if (sql === "ROLLBACK" || sql === "COMMIT") queryFailed = false
+          return result
+        } catch (error: unknown) {
+          queryFailed = true
+          throw error
         }
-        const witnessIdParameter = (values?.length ?? 0) + 1
-        return originalQuery(queryLevelDuplicateWitnessSql(sql, witnessIdParameter), [...(values ?? []), witnessId])
       }
       return new Proxy(client, {
         get(target, property) {
           if (property === "query") return query
+          if (property === "release") return release
           const value = Reflect.get(target, property, target)
           return typeof value === "function" ? value.bind(target) : value
         },
@@ -122,6 +201,14 @@ function queryLevelDuplicateWitnessPool(pool: PgPool, witnessId: string): Pick<P
 
 function errorCode(error: unknown): string | undefined {
   return error && typeof error === "object" && "code" in error && typeof error.code === "string" ? error.code : undefined
+}
+
+function rootHistoryDiagnosticFailure(error: unknown): RootHistoryDiagnosticFailure {
+  const code = errorCode(error)
+  if (error && typeof error === "object" && "message" in error && error.message === "Query read timeout") {
+    return "client_query_timeout"
+  }
+  return code === "55P03" ? "lock_timeout" : code === "57014" ? "statement_cancelled" : "other"
 }
 
 function queryRecords(rows: readonly unknown[] | undefined): Array<Record<string, unknown>> {
@@ -850,84 +937,198 @@ describePg("direct Root-task history PostgreSQL source validation", () => {
   it("keeps full cross-session witness multiplicity across keyset pages without weakening table constraints", async () => {
     const input: DirectRootTaskHistoryLoadInput = { lease, rootTaskId: currentRootTaskId,
       rootAttemptCount: 2, stepId: currentStepId, now: new Date(), crossSessionRootTaskHistoryEnabled: true }
-    const client = await pool!.connect()
+    let diagnosticPool: PgPool | undefined
+    let activeClientCancel: (() => void) | undefined
     let baseWitnessId: string | undefined
-    try {
-      await client.query("BEGIN")
-      await client.query("SELECT set_config($1,$2,true)", ["app.user_id", userId])
-      const fence = await readRootTaskHistoryFence(client, input)
-      expect(fence?.currentStartWitness?.xid8).toBeTruthy()
-      expect(fence?.currentOrigin).toBeTruthy()
-      if (!fence?.currentStartWitness || !fence.currentOrigin) throw new Error("Cross-session fence is unavailable")
-      const witness = await client.query<{ id: string }>(`SELECT "id" FROM "agent_events"
-        WHERE "sessionId" = $1 AND "turnId" = $2 AND "causationId" = $3
-          AND "type" = 'agent.plan.root_task_history_chronology_witness'`,
-      [otherSessionId, equalCutoff.turnId, terminalEventKey(equalCutoff)])
-      expect(witness.rows).toHaveLength(1)
-      baseWitnessId = witness.rows[0]?.id
-      expect(baseWitnessId).toBeTruthy()
-      if (!baseWitnessId) throw new Error("Cross-session terminal witness is unavailable")
-
-      const window: RootTaskHistoryCrossSessionWindowInput = {
-        currentSessionId: input.lease.sessionId, userId: input.lease.userId, currentTurnId: input.lease.turnId,
-        currentStartXid8: fence.currentStartWitness.xid8,
-        scheduledCriteria: fence.scheduledAutomationCriteria ? JSON.stringify(fence.scheduledAutomationCriteria) : null,
-        objectiveDigest: fence.objectiveDigest, semanticsVersion: OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION,
-        canonicalOrigin: fence.currentOrigin, limit: 1,
+    let activeStage: RootHistoryDiagnosticStage = "manual_pool_connect"
+    let failureStage: RootHistoryDiagnosticStage | undefined
+    let failureKind: RootHistoryDiagnosticFailure | undefined
+    const timeoutDiagnostic = setTimeout(() => {
+      writeRootHistoryDiagnostic("near_timeout", activeStage)
+      activeClientCancel?.()
+    }, 50_000)
+    const runStage = async <T>(stage: RootHistoryDiagnosticStage, run: () => Promise<T>): Promise<T> => {
+      activeStage = stage
+      writeRootHistoryDiagnostic("start", stage)
+      try {
+        const result = await run()
+        writeRootHistoryDiagnostic("pass", stage)
+        return result
+      } catch (error: unknown) {
+        failureStage ??= activeStage
+        failureKind ??= rootHistoryDiagnosticFailure(error)
+        throw error
       }
-      const readPage = async (afterCursor?: RootTaskHistoryCrossSessionWindowInput["afterCursor"]) => {
-        const query = buildRootTaskHistoryCrossSessionWindow({ ...window, ...(afterCursor ? { afterCursor } : {}) })
-        const result = await client.query<Record<string, unknown>>(
-          queryLevelDuplicateWitnessSql(query.sql, query.values.length + 1), [...query.values, baseWitnessId])
-        const pageRows = result.rows.filter(row => row.isPageWatermark !== true)
-        const watermarks = result.rows.filter(row => row.isPageWatermark === true)
-        expect(watermarks).toHaveLength(1)
-        return { pageRows, watermark: watermarks[0] }
-      }
-
-      const first = await readPage()
-      expect(first.pageRows).toHaveLength(1)
-      expect(first.pageRows[0]?.terminalEventId).toBe(terminalEventKey(equalCutoff))
-      expect(Number(first.pageRows[0]?.terminalWitnessCount)).toBe(2)
-      expect(first.pageRows[0]?.terminalWitnessEventId).toBe(`${baseWitnessId}:query-duplicate`)
-      expect(first.watermark?.pageRawRowCount).toBe(1)
-      expect(first.watermark?.pageCursorXid8).toBe(first.pageRows[0]?.terminalWitnessXid8)
-      expect(first.watermark?.pageCursorTurnId).toBe(first.pageRows[0]?.turnId)
-      expect(first.watermark?.pageCursorTerminalEventId).toBe(first.pageRows[0]?.terminalEventId)
-      expect(first.watermark?.pageCursorWitnessEventId).toBe(first.pageRows[0]?.terminalWitnessEventId)
-      const cursor = {
-        xid8: String(first.watermark?.pageCursorXid8), turnId: String(first.watermark?.pageCursorTurnId),
-        terminalEventId: String(first.watermark?.pageCursorTerminalEventId),
-        witnessEventId: String(first.watermark?.pageCursorWitnessEventId),
-      }
-      const second = await readPage(cursor)
-      expect(second.pageRows).toHaveLength(1)
-      expect(second.pageRows[0]?.terminalEventId).toBe(terminalEventKey(equalCutoff))
-      expect(second.pageRows[0]?.terminalWitnessEventId).toBe(baseWitnessId)
-      expect(Number(second.pageRows[0]?.terminalWitnessCount)).toBe(2)
-      expect(second.watermark?.pageRawRowCount).toBe(1)
-
-      const empty = await readPage({ xid8: "1", turnId: "", terminalEventId: "", witnessEventId: "" })
-      expect(empty.pageRows).toHaveLength(0)
-      expect(empty.watermark?.pageRawRowCount).toBe(0)
-      expect(empty.watermark?.pageCursorXid8).toBeNull()
-      expect(empty.watermark?.pageCursorTurnId).toBeNull()
-      expect(empty.watermark?.pageCursorTerminalEventId).toBeNull()
-      expect(empty.watermark?.pageCursorWitnessEventId).toBeNull()
-      const persistedWitnesses = await client.query<{ count: string }>(`SELECT COUNT(*)::text AS "count" FROM "agent_events"
-        WHERE "sessionId" = $1 AND "turnId" = $2 AND "causationId" = $3
-          AND "type" = 'agent.plan.root_task_history_chronology_witness'`,
-      [otherSessionId, equalCutoff.turnId, terminalEventKey(equalCutoff)])
-      expect(persistedWitnesses.rows[0]?.count).toBe("1")
-    } finally {
-      await client.query("ROLLBACK").catch(() => undefined)
-      client.release()
     }
+    try {
+      diagnosticPool = new PgPool({ connectionString: databaseUrl!, max: 1, connectionTimeoutMillis: 5_000,
+        query_timeout: 10_000, statement_timeout: 8_000, options: "-c lock_timeout=2000ms", allowExitOnIdle: true })
+      const manualClient = await runStage("manual_pool_connect", () => diagnosticPool!.connect())
+      let manualClientReleased = false
+      let manualQueryFailed = false
+      const releaseManualClient = (error?: Error) => {
+        if (manualClientReleased) return
+        manualClientReleased = true
+        if (activeClientCancel === forceReleaseManualClient) activeClientCancel = undefined
+        manualClient.release(error ?? (manualQueryFailed ? ROOT_HISTORY_DIAGNOSTIC_ABORT : undefined))
+      }
+      const forceReleaseManualClient = () => releaseManualClient(ROOT_HISTORY_DIAGNOSTIC_ABORT)
+      activeClientCancel = forceReleaseManualClient
+      const runManualStage = async <T>(stage: RootHistoryDiagnosticStage, run: () => Promise<T>): Promise<T> => {
+        try {
+          return await runStage(stage, run)
+        } catch (error: unknown) {
+          manualQueryFailed = true
+          throw error
+        }
+      }
+      let manualBodyFailed = false
+      let manualRollbackFailed = false
+      try {
+        await runManualStage("manual_begin", () => manualClient.query("BEGIN"))
+        await runManualStage("manual_limits", async () => {
+          await manualClient.query("SET LOCAL lock_timeout = '2000ms'")
+          await manualClient.query("SET LOCAL statement_timeout = '8000ms'")
+        })
+        await runManualStage("manual_user_scope", () => manualClient.query("SELECT set_config($1,$2,true)", ["app.user_id", userId]))
+        const fence = await runManualStage("manual_fence", () => readRootTaskHistoryFence(manualClient, input))
+        expect(fence?.currentStartWitness?.xid8).toBeTruthy()
+        expect(fence?.currentOrigin).toBeTruthy()
+        if (!fence?.currentStartWitness || !fence.currentOrigin) throw new Error("Cross-session fence is unavailable")
+        const witness = await runManualStage("manual_witness_lookup", () => manualClient.query<{ id: string }>(`SELECT "id" FROM "agent_events"
+          WHERE "sessionId" = $1 AND "turnId" = $2 AND "causationId" = $3
+            AND "type" = 'agent.plan.root_task_history_chronology_witness'`,
+        [otherSessionId, equalCutoff.turnId, terminalEventKey(equalCutoff)]))
+        expect(witness.rows).toHaveLength(1)
+        baseWitnessId = witness.rows[0]?.id
+        expect(baseWitnessId).toBeTruthy()
+        if (!baseWitnessId) throw new Error("Cross-session terminal witness is unavailable")
 
-    const historyWithShadowWitness = await createPgDirectRootTaskHistoryStore(
-      queryLevelDuplicateWitnessPool(pool!, baseWitnessId!)).load(input)
-    expect(historyWithShadowWitness.some(item => item.sourceTurnId === equalCutoff.turnId)).toBe(false)
-    expect(historyWithShadowWitness.map(item => item.sourceTurnId)).toContain(otherSession.turnId)
+        const window: RootTaskHistoryCrossSessionWindowInput = {
+          currentSessionId: input.lease.sessionId, userId: input.lease.userId, currentTurnId: input.lease.turnId,
+          currentStartXid8: fence.currentStartWitness.xid8,
+          scheduledCriteria: fence.scheduledAutomationCriteria ? JSON.stringify(fence.scheduledAutomationCriteria) : null,
+          objectiveDigest: fence.objectiveDigest, semanticsVersion: OBJECTIVE_HISTORY_INDEX_SEMANTICS_VERSION,
+          canonicalOrigin: fence.currentOrigin, limit: 1,
+        }
+        const readPage = async (
+          stage: RootHistoryDiagnosticStage,
+          afterCursor?: RootTaskHistoryCrossSessionWindowInput["afterCursor"],
+        ) => runManualStage(stage, async () => {
+          const query = buildRootTaskHistoryCrossSessionWindow({ ...window, ...(afterCursor ? { afterCursor } : {}) })
+          const result = await manualClient.query<Record<string, unknown>>(
+            queryLevelDuplicateWitnessSql(query.sql, query.values.length + 1), [...query.values, baseWitnessId])
+          const pageRows = result.rows.filter(row => row.isPageWatermark !== true)
+          const watermarks = result.rows.filter(row => row.isPageWatermark === true)
+          expect(watermarks).toHaveLength(1)
+          return { pageRows, watermark: watermarks[0] }
+        })
+
+        const first = await readPage("manual_page_first")
+        expect(first.pageRows).toHaveLength(1)
+        expect(first.pageRows[0]?.terminalEventId).toBe(terminalEventKey(equalCutoff))
+        expect(Number(first.pageRows[0]?.terminalWitnessCount)).toBe(2)
+        expect(first.pageRows[0]?.terminalWitnessEventId).toBe(`${baseWitnessId}:query-duplicate`)
+        expect(first.watermark?.pageRawRowCount).toBe(1)
+        expect(first.watermark?.pageCursorXid8).toBe(first.pageRows[0]?.terminalWitnessXid8)
+        expect(first.watermark?.pageCursorTurnId).toBe(first.pageRows[0]?.turnId)
+        expect(first.watermark?.pageCursorTerminalEventId).toBe(first.pageRows[0]?.terminalEventId)
+        expect(first.watermark?.pageCursorWitnessEventId).toBe(first.pageRows[0]?.terminalWitnessEventId)
+        const cursor = {
+          xid8: String(first.watermark?.pageCursorXid8), turnId: String(first.watermark?.pageCursorTurnId),
+          terminalEventId: String(first.watermark?.pageCursorTerminalEventId),
+          witnessEventId: String(first.watermark?.pageCursorWitnessEventId),
+        }
+        const second = await readPage("manual_page_second", cursor)
+        expect(second.pageRows).toHaveLength(1)
+        expect(second.pageRows[0]?.terminalEventId).toBe(terminalEventKey(equalCutoff))
+        expect(second.pageRows[0]?.terminalWitnessEventId).toBe(baseWitnessId)
+        expect(Number(second.pageRows[0]?.terminalWitnessCount)).toBe(2)
+        expect(second.watermark?.pageRawRowCount).toBe(1)
+
+        const empty = await readPage("manual_page_empty", { xid8: "1", turnId: "", terminalEventId: "", witnessEventId: "" })
+        expect(empty.pageRows).toHaveLength(0)
+        expect(empty.watermark?.pageRawRowCount).toBe(0)
+        expect(empty.watermark?.pageCursorXid8).toBeNull()
+        expect(empty.watermark?.pageCursorTurnId).toBeNull()
+        expect(empty.watermark?.pageCursorTerminalEventId).toBeNull()
+        expect(empty.watermark?.pageCursorWitnessEventId).toBeNull()
+        const persistedWitnesses = await runManualStage("manual_witness_count", () => manualClient.query<{ count: string }>(`SELECT COUNT(*)::text AS "count" FROM "agent_events"
+          WHERE "sessionId" = $1 AND "turnId" = $2 AND "causationId" = $3
+            AND "type" = 'agent.plan.root_task_history_chronology_witness'`,
+        [otherSessionId, equalCutoff.turnId, terminalEventKey(equalCutoff)]))
+        expect(persistedWitnesses.rows[0]?.count).toBe("1")
+      } catch (error: unknown) {
+        manualBodyFailed = true
+        failureStage ??= activeStage
+        failureKind ??= rootHistoryDiagnosticFailure(error)
+        throw error
+      } finally {
+        if (!manualClientReleased) {
+          activeStage = "manual_rollback"
+          writeRootHistoryDiagnostic("start", "manual_rollback")
+          try {
+            await manualClient.query("ROLLBACK")
+            manualQueryFailed = false
+            writeRootHistoryDiagnostic("pass", "manual_rollback")
+          } catch (error: unknown) {
+            manualQueryFailed = true
+            manualRollbackFailed = true
+            writeRootHistoryDiagnostic("failure", "manual_rollback", rootHistoryDiagnosticFailure(error))
+            if (!manualBodyFailed) {
+              failureStage ??= "manual_rollback"
+              failureKind ??= rootHistoryDiagnosticFailure(error)
+            }
+          }
+          activeStage = "manual_release"
+          writeRootHistoryDiagnostic("start", activeStage)
+          releaseManualClient()
+          writeRootHistoryDiagnostic("pass", activeStage)
+        }
+      }
+      if (manualRollbackFailed && !manualBodyFailed) throw new Error("root_history_manual_rollback_failed")
+
+      let wrappedStage: RootHistoryDiagnosticStage | undefined
+      const historyWithShadowWitness = await runStage("wrapped_store_load", async () => {
+        const store = createPgDirectRootTaskHistoryStore(queryLevelDuplicateWitnessPool(diagnosticPool!, baseWitnessId!, stage => {
+          if (wrappedStage) writeRootHistoryDiagnostic("pass", wrappedStage)
+          wrappedStage = stage
+          activeStage = stage
+          writeRootHistoryDiagnostic("start", stage)
+        }, cancel => { activeClientCancel = cancel }))
+        const result = await store.load(input)
+        if (wrappedStage) writeRootHistoryDiagnostic("pass", wrappedStage)
+        return result
+      })
+      expect(historyWithShadowWitness.some(item => item.sourceTurnId === equalCutoff.turnId)).toBe(false)
+      expect(historyWithShadowWitness.map(item => item.sourceTurnId)).toContain(otherSession.turnId)
+    } catch (error: unknown) {
+      failureStage ??= activeStage
+      failureKind ??= rootHistoryDiagnosticFailure(error)
+      writeRootHistoryDiagnostic("failure", failureStage ?? activeStage, failureKind ?? rootHistoryDiagnosticFailure(error))
+      throw error
+    } finally {
+      clearTimeout(timeoutDiagnostic)
+      activeClientCancel?.()
+      if (diagnosticPool) {
+        activeStage = "diagnostic_pool_close"
+        writeRootHistoryDiagnostic("start", activeStage)
+        let closeTimer: ReturnType<typeof setTimeout> | undefined
+        const closeResult = await Promise.race([
+          diagnosticPool.end().then(() => "closed" as const, () => "failed" as const),
+          new Promise<"timeout">(resolve => { closeTimer = setTimeout(() => resolve("timeout"), 5_000) }),
+        ])
+        if (closeTimer) clearTimeout(closeTimer)
+        if (closeResult === "closed") writeRootHistoryDiagnostic("pass", activeStage)
+        else {
+          const failure = closeResult === "timeout" ? "pool_close_timeout" : "other"
+          failureStage ??= "diagnostic_pool_close"
+          failureKind ??= failure
+          writeRootHistoryDiagnostic("failure", "diagnostic_pool_close", failure)
+          if (failureStage === "diagnostic_pool_close") throw new Error("root_history_diagnostic_pool_close_failed")
+        }
+      }
+    }
   }, 60_000)
 
   it("reloads owner-scoped history and merges only witnessed terminal-before-start outcomes by xid8", async () => {
