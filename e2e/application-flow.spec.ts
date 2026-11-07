@@ -1332,20 +1332,24 @@ test('a pending delete remains locked across a panel remount and refreshes the s
   } finally { release() }
 })
 
-test('missing selected letter shows a usable retry on a narrow screen', async ({ page }, testInfo) => {
+test('missing selected letter never falls back and shows a usable retry on a narrow screen', async ({ page }, testInfo) => {
   test.skip(!testInfo.project.name.startsWith('mobile-'), 'Exercises narrow letter editor')
   const state = await install(page)
   const chinese = testInfo.project.metadata.appLocale === 'zh'
   let retry = false
-  await page.route('**/api/jobs/outside-page/cover-letters', route => route.fulfill({ json: retry ? [{ id: 'selected-letter', userId: 'fixture-user', jobId: 'outside-page', content: 'Selected letter', tone: 'professional', createdAt: time }] : [] }))
+  const selected = { id: 'selected-letter', userId: 'fixture-user', jobId: 'outside-page', content: 'Selected letter', tone: 'professional', createdAt: time }
+  const other = { ...selected, id: 'other-letter', content: 'A different draft' }
+  await page.route('**/api/jobs/outside-page/cover-letters', route => route.fulfill({ json: retry ? [selected, other] : [other] }))
   await page.goto(`${origin}/?page=letter-panel-probe`)
   const notice = page.getByRole('alert')
   await expect(notice).toContainText(chinese ? '无法加载已选求职信' : 'selected cover letter could not be loaded')
+  await expect(page.locator('textarea')).toHaveCount(0)
   const button = notice.getByRole('button', { name: chinese ? '重试' : 'Try again' })
   await expect(button).toBeInViewport()
   retry = true
   await button.click()
   await expect(page.locator('textarea')).toHaveValue('Selected letter')
+  await expect(page.locator('select').first()).toHaveValue('selected-letter')
   expect(state.writes).toEqual([])
   expect(state.unexpected).toEqual([])
 })
