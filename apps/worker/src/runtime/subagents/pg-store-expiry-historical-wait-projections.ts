@@ -14,6 +14,10 @@ import type { HistoricalWaitBinding, RecoveredWaitHandoff, TerminalCallProjectio
 import type { HistoricalSourceStepPrefix } from "./pg-store-expiry-historical-source-step-prefix.js"
 
 export const MAX_HISTORICAL_SOURCE_WAITS = 16
+export type HistoricalWaitClaimStage = Readonly<{ candidateOrdinal: number; stage:
+  | "claim_rows_missing" | "claim_rows_ambiguous" | "claim_input_invalid" | "claim_call_identity_invalid"
+  | "claim_result_invalid" | "claim_terminal_invalid" | "claim_result_pair_invalid"
+  | "claim_step_tool_chain_invalid" | "claim_projection_invalid" | "claim_accepted" }>
 function sameJson(left: unknown, right: unknown): boolean { try { return canonicalJson(left) === canonicalJson(right) } catch { return false } }
 function strictWaitIds(value: unknown, allowEmpty = false): string[] | null {
   return Array.isArray(value) && value.length <= 8 && (allowEmpty || value.length > 0) && value.every(id => typeof id === "string" && id.length > 0 && id.length <= 256 && id.trim() === id)
@@ -77,6 +81,23 @@ function sourceWaitBinding(wait: Record<string, unknown>, lifecycle: { state: "u
 
 /** Returns only individually proven consumed waits; omitted or ambiguous starts remain blockers. */
 export async function readChildWaitTerminalCallProjections(client: pg.PoolClient, task: Record<string, unknown>): Promise<TerminalCallProjection[]> {
+  return readChildWaitTerminalCallProjectionsCore(client, task)
+}
+
+/** Fixed, bounded claim-stage diagnostics for failure-only tests; contains no persisted identity or payload. */
+export async function diagnoseChildWaitTerminalCallProjections(client: pg.PoolClient, task: Record<string, unknown>): Promise<{
+  sourceProjectionCount: number; claimProjectionCount: number; claimStages: readonly HistoricalWaitClaimStage[]
+}> {
+  const claimStages: HistoricalWaitClaimStage[] = []
+  const projections = await readChildWaitTerminalCallProjectionsCore(client, task, (candidateOrdinal, stage) => {
+    if (claimStages.length < MAX_HISTORICAL_SOURCE_WAITS) claimStages.push({ candidateOrdinal, stage })
+  })
+  return { sourceProjectionCount: projections.filter(row => row.sourceWait.claimKeyDigest === null).length,
+    claimProjectionCount: projections.filter(row => row.sourceWait.claimKeyDigest !== null).length, claimStages }
+}
+
+async function readChildWaitTerminalCallProjectionsCore(client: pg.PoolClient, task: Record<string, unknown>,
+  observeClaimStage?: (candidateOrdinal: number, stage: HistoricalWaitClaimStage["stage"]) => void): Promise<TerminalCallProjection[]> {
   const id = task.id, sessionId = task.sessionId, turnId = task.turnId, rootTaskId = task.rootTaskId, userId = task.userId
   const ownerId = task.leaseOwner, attemptCount = task.attemptCount, leaseExpiresAt = dateValue(task.leaseExpiresAt)
   if (typeof id !== "string" || !id || typeof sessionId !== "string" || !sessionId || typeof turnId !== "string" || !turnId
@@ -99,6 +120,7 @@ export async function readChildWaitTerminalCallProjections(client: pg.PoolClient
   if (!waits.rows.length || waits.rows.length > MAX_HISTORICAL_SOURCE_WAITS) return []
   const projections: TerminalCallProjection[] = []
   const claimSources = new Map<string, string>(), ambiguousClaims = new Set<string>()
+  let claimCandidateOrdinal = 0
   for (const wait of waits.rows) {
     const waitResult = record(wait.result), outcome = waitResult.outcome, targetIds = strictWaitIds(wait.targetTaskIds), stepId = wait.stepId
     if (Number(wait.sourceWaitCount) !== 1 || !targetIds || typeof stepId !== "string"
@@ -140,6 +162,8 @@ export async function readChildWaitTerminalCallProjections(client: pg.PoolClient
     const sourceProjection = waitCallProjection(sourceStart.rows[0]?.id, lifecycle.toolCallId, lifecycle.callItemId, stepId, lifecycle.sourceAttempt, binding)
     if (!sourceProjection) continue
     projections.push({ ...sourceProjection, ...sourceStepEvidence })
+    const candidateOrdinal = ++claimCandidateOrdinal
+    const reportClaimStage = (stage: HistoricalWaitClaimStage["stage"]): void => observeClaimStage?.(candidateOrdinal, stage)
     const claimRows: { rows: Record<string, unknown>[] } = await client.query<Record<string, unknown>>(`SELECT claimStep."id" AS "stepId", claimStep."attempt", claimStep."status" AS "stepStatus",
         call."id" AS "callItemId", call."content" AS "callContent", call."status" AS "callStatus", call."revision" AS "callRevision", call."phase" AS "callPhase",
         callStart."id" AS "startEventId", callStart."sequence" AS "startSequence", sourceCall."content"->'input' AS "sourceInput",
@@ -162,7 +186,7 @@ export async function readChildWaitTerminalCallProjections(client: pg.PoolClient
         AND call."id" = 'task:' || owner."id" || ':item:tool-call:' || (call."content"->>'toolCallId') || ':attempt:' || claimStep."attempt"::text
         AND call."status" = 'completed' AND call."revision" = 1 AND call."phase" IS NULL LIMIT 3`,
     [id, sessionId, turnId, rootTaskId, userId, ownerId, attemptCount, leaseExpiresAt, wait.id])
-    if (claimRows.rows.length !== 1) continue
+    if (claimRows.rows.length !== 1) { reportClaimStage(claimRows.rows.length ? "claim_rows_ambiguous" : "claim_rows_missing"); continue }
     const claim: Record<string, unknown> = claimRows.rows[0]!, claimContent = record(claim.callContent), input = record(claimContent.input), sourceInput = record(claim.sourceInput)
     const claimId = claimContent.toolCallId, claimStepId = claim.stepId, claimAttempt: unknown = claim.attempt, claimCallItemId = claim.callItemId
     const claimKeyDigest = digest(input.idempotencyKey)
@@ -171,33 +195,42 @@ export async function readChildWaitTerminalCallProjections(client: pg.PoolClient
       && exactKeys(input, ["idempotencyKey", "taskIds", "mode", "timeoutMs"]) && input.mode === wait.mode
       && input.timeoutMs === record(waitResult.request).timeoutMs && sameJson(input.taskIds, targetIds)
       && typeof sourceInput.idempotencyKey === "string" && childWaitContinuationKeyMatchesSafeProjection(sourceInput.idempotencyKey, input.idempotencyKey)
-    if (!claimInputValid || typeof claimId !== "string" || typeof claimStepId !== "string" || typeof claimAttempt !== "number"
+    if (!claimInputValid) { reportClaimStage("claim_input_invalid"); continue }
+    if (typeof claimId !== "string" || typeof claimStepId !== "string" || typeof claimAttempt !== "number"
       || typeof claimCallItemId !== "string" || !claimCallItemId || claimAttempt !== attemptCount || !claimKeyDigest
       || !waitCallProjection(claim.startEventId, claimId, claimCallItemId, claimStepId, claimAttempt,
-        { ...binding, claimKeyDigest })) continue
+        { ...binding, claimKeyDigest })) { reportClaimStage("claim_call_identity_invalid"); continue }
     const resultId = `task:${id}:item:tool-result:${claimId}:attempt:${claimAttempt}`, resultContent = record(claim.resultContent)
     const safeOutcome = safeSubagentWaitJson(outcome, 16_384)
     if (claim.resultItemId !== resultId || claim.resultStatus !== "completed" || claim.resultRevision !== 1 || claim.resultPhase !== null
       || !exactKeys(resultContent, ["toolCallId", "output", "errorCode"]) || resultContent.toolCallId !== claimId || resultContent.errorCode !== null
-      || !sameJson(resultContent.output, safeOutcome)) continue
+      || !sameJson(resultContent.output, safeOutcome)) { reportClaimStage("claim_result_invalid"); continue }
     const callTerminal = await client.query<Record<string, unknown>>(`SELECT "id", "sequence", "type", "actor", "itemId", "correlationId", "payload" FROM "agent_events"
       WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "idempotencyKey" = $4 LIMIT 2`,
     [sessionId, turnId, id, `task:${id}:event:tool-finished:${claimId}`])
     const terminal = callTerminal.rows[0]
     if (callTerminal.rows.length !== 1 || terminal?.type !== "tool_call.completed" || terminal.actor !== "subagent" || terminal.itemId !== claim.callItemId
-      || terminal.correlationId !== claimId || !sameJson(terminal.payload, { toolCallId: claimId, toolName: "wait_subagents", status: "completed", errorCode: null, taskId: id })) continue
+      || terminal.correlationId !== claimId || !sameJson(terminal.payload, { toolCallId: claimId, toolName: "wait_subagents", status: "completed", errorCode: null, taskId: id })) {
+      reportClaimStage("claim_terminal_invalid"); continue
+    }
     const resultKeys = [`task:${id}:event:item-started:${resultId}`, `task:${id}:event:tool-result-completed:${claimId}:${resultId}:1`]
     const resultEvents = await client.query<Record<string, unknown>>(`SELECT "id", "type", "actor", "itemId", "correlationId", "causationId", "sequence", "idempotencyKey", "payload" FROM "agent_events"
       WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND ("itemId" = $4 OR "correlationId" = $4 OR "idempotencyKey" = ANY($5::text[])
         OR "causationId" IN (SELECT anchor."id" FROM "agent_events" AS anchor WHERE anchor."sessionId" = $1 AND anchor."turnId" = $2 AND anchor."taskId" = $3 AND anchor."idempotencyKey" = ANY($5::text[]))) ORDER BY "sequence" LIMIT 4`,
     [sessionId, turnId, id, resultId, resultKeys])
     const resultPair = partitionWaitResultEvents(resultEvents.rows, resultKeys)
-    if (!resultPair || !isCanonicalWaitResultPair(terminal, resultPair.started, resultPair.completed, resultId, claimStepId, resultContent)) continue
+    if (!resultPair || !isCanonicalWaitResultPair(terminal, resultPair.started, resultPair.completed, resultId, claimStepId, resultContent)) {
+      reportClaimStage("claim_result_pair_invalid"); continue
+    }
     const { started: resultStarted, completed: resultCompleted, extra: nextEvent } = resultPair
-    if (typeof resultStarted.id !== "string" || typeof resultCompleted.id !== "string") continue
+    if (typeof resultStarted.id !== "string" || typeof resultCompleted.id !== "string") {
+      reportClaimStage("claim_result_pair_invalid"); continue
+    }
     const stepToolChain = await readCanonicalWaitStepToolChain(client, { id, sessionId, turnId },
       { stepId: claimStepId, attempt: claimAttempt, callItemId: claimCallItemId, callId: claimId, resultItemId: resultId })
-    if (!stepToolChain || typeof nextEvent?.id !== "string" || nextEvent.id !== stepToolChain.nextEventId) continue
+    if (!stepToolChain || typeof nextEvent?.id !== "string" || nextEvent.id !== stepToolChain.nextEventId) {
+      reportClaimStage("claim_step_tool_chain_invalid"); continue
+    }
     const claimProjection = waitCallProjection(claim.startEventId, claimId, claimCallItemId, claimStepId, claimAttempt,
       { ...binding, claimKeyDigest })
     if (claimProjection) {
@@ -206,7 +239,8 @@ export async function readChildWaitTerminalCallProjections(client: pg.PoolClient
       claimSources.set(claimProjection.startEventId, sourceProjection.startEventId)
       projections.push({ ...claimProjection, ...sourceStepEvidence, resultItemId: resultId, resultStartedEventId: resultStarted.id,
         resultCompletedEventId: resultCompleted.id, stepCompletedEventId: stepToolChain.stepCompletedEventId, stepToolChain })
-    }
+      reportClaimStage("claim_accepted")
+    } else reportClaimStage("claim_projection_invalid")
   }
   return projections.filter(projection => !projection.resultItemId || !ambiguousClaims.has(projection.startEventId))
 }

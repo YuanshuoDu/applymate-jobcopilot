@@ -16,7 +16,7 @@ vi.mock("./pg-store-expiry-historical-source-step-prefix.js", async importOrigin
 })
 
 import { DurableSubagentWaitError, safeSubagentWaitJson } from "./durable-subagent-wait-store.js"
-import { MAX_HISTORICAL_SOURCE_WAITS, readChildWaitTerminalCallProjections } from "./pg-store-expiry-historical-wait-projections.js"
+import { MAX_HISTORICAL_SOURCE_WAITS, diagnoseChildWaitTerminalCallProjections, readChildWaitTerminalCallProjections } from "./pg-store-expiry-historical-wait-projections.js"
 import { CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL } from "./pg-store-expiry-historical-wait-binding.js"
 
 const task = { id: "owner", sessionId: "session", turnId: "turn", rootTaskId: "root", userId: "user", leaseOwner: "lease-owner",
@@ -150,6 +150,22 @@ beforeEach(() => {
 })
 
 describe("bounded historical wait projections", () => {
+  it("reports only fixed bounded stages when a claim row is absent", async () => {
+    const source = wait(1), diagnostic = await diagnoseChildWaitTerminalCallProjections(client([source]) as never, task)
+    expect(diagnostic).toEqual({ sourceProjectionCount: 1, claimProjectionCount: 0,
+      claimStages: [{ candidateOrdinal: 1, stage: "claim_rows_missing" }] })
+    expect(JSON.stringify(diagnostic)).not.toContain(source.idempotencyKey)
+  })
+
+  it("reports the canonical step-chain gate without exposing persisted values", async () => {
+    const source = wait(1)
+    mocks.chain.mockResolvedValue(null)
+    const diagnostic = await diagnoseChildWaitTerminalCallProjections(client([source], [completedClaim(source, 1)]) as never, task)
+    expect(diagnostic).toEqual({ sourceProjectionCount: 1, claimProjectionCount: 0,
+      claimStages: [{ candidateOrdinal: 1, stage: "claim_step_tool_chain_invalid" }] })
+    expect(JSON.stringify(diagnostic)).not.toContain(source.idempotencyKey)
+  })
+
   it("projects two exact source waits and their independent completed claims", async () => {
     const sources = [wait(1), wait(2)], claims = sources.map((source, index) => completedClaim(source, index + 1))
     const db = client(sources, claims)

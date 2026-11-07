@@ -29,7 +29,7 @@ import { CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL, CHILD_WAIT_HISTORICAL_S
 import { readChildWaitSourceCallProjection } from "./pg-store-expiry-child-wait-source-proof.js"
 import { CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL } from "./pg-store-expiry-historical-wait-binding.js"
 import { buildCognitiveAgendaReceipt, cognitiveAgendaReceiptIdempotencyKey } from "../turns/cognitive-agenda-receipt.js"
-import { readChildWaitTerminalCallProjections } from "./pg-store-expiry-historical-wait-projections.js"
+import { diagnoseChildWaitTerminalCallProjections, readChildWaitTerminalCallProjections } from "./pg-store-expiry-historical-wait-projections.js"
 import { historicalSourceStepCallChainBinding, historicalSourceStepCallCountBinding, historicalSourceStepEventChainBinding,
   readCanonicalHistoricalSourceStepPrefix } from "./pg-store-expiry-historical-source-step-prefix.js"
 import { historicalSourceStepCallChainDiagnosticSql } from "./pg-store-expiry-historical-source-step-call-binding-diagnostics.js"
@@ -752,6 +752,7 @@ async function expectHistoricalWaitUnblocked(client: PoolClient, task: BlockingT
 
 async function diagnoseHistoricalWaitSourceProjection(client: PoolClient, task: BlockingTaskSnapshot,
   sourceCallId: string): Promise<Record<string, unknown>> {
+  const claimStageDiagnostics = await diagnoseChildWaitTerminalCallProjections(client, task as unknown as Record<string, unknown>)
   const projections = await readChildWaitTerminalCallProjections(client, task as unknown as Record<string, unknown>)
   let sourceProjectionCount = 0
   const waits = await client.query<Record<string, unknown>>(`SELECT wait.*,
@@ -766,14 +767,15 @@ async function diagnoseHistoricalWaitSourceProjection(client: PoolClient, task: 
       AND sourceCall."type" = 'tool_call' AND sourceCall."content"->>'toolCallId' = $5
     WHERE wait."parentTaskId" = $1 AND wait."sessionId" = $2 AND wait."turnId" = $3 AND wait."userId" = $4
     LIMIT 2`, [task.id, task.sessionId, task.turnId, task.userId, sourceCallId])
-  if (waits.rows.length !== 1) return { sourceProjectionCount, sourceWaitCount: waits.rows.length, rejectStage: "source_wait_match" }
+  if (waits.rows.length !== 1) return { sourceProjectionCount, sourceWaitCount: waits.rows.length,
+    claimStageDiagnostics, rejectStage: "source_wait_match" }
 
   const wait = waits.rows[0]!, stepId = wait.stepId
   sourceProjectionCount = typeof wait.id === "string"
     ? projections.filter(projection => projection.sourceWait.waitId === wait.id && projection.sourceWait.claimKeyDigest === null).length : 0
   const sourceWaitMultiplicity = Number(wait.sourceWaitCount)
   const markerPresent = Object.hasOwn(asObject(wait.result), "sourceLifecycleRecovery")
-  if (typeof stepId !== "string") return { sourceProjectionCount, sourceKind: markerPresent ? "recovered" : "normal_waiting",
+  if (typeof stepId !== "string") return { sourceProjectionCount, claimStageDiagnostics, sourceKind: markerPresent ? "recovered" : "normal_waiting",
     sourceStepStatus: wait.sourceStepStatus, sourceWaitMultiplicity, markerPresent, markerValidationPassed: false, stepItemCount: 0, anchorCount: 0,
     rejectStage: "source_step_identity" }
   const [items, callRows] = await Promise.all([
@@ -785,7 +787,7 @@ async function diagnoseHistoricalWaitSourceProjection(client: PoolClient, task: 
     [task.sessionId, task.turnId, task.id, stepId, sourceCallId]),
   ])
   const stepItemCount = Number(items.rows[0]?.count ?? 0)
-  if (callRows.rows.length !== 1) return { sourceProjectionCount, sourceKind: markerPresent ? "recovered" : "normal_waiting",
+  if (callRows.rows.length !== 1) return { sourceProjectionCount, claimStageDiagnostics, sourceKind: markerPresent ? "recovered" : "normal_waiting",
     sourceStepStatus: wait.sourceStepStatus, sourceWaitMultiplicity, markerPresent, markerValidationPassed: false, stepItemCount, anchorCount: 0,
     rejectStage: "source_call_match" }
 
@@ -903,6 +905,7 @@ async function diagnoseHistoricalWaitSourceProjection(client: PoolClient, task: 
   } else if (sourceKind === "recovered") prefixRejectStage = rejectStage
   else prefixRejectStage = "source_lifecycle"
   return { sourceProjectionCount, sourceKind, sourceStepStatus: wait.sourceStepStatus, sourceWaitMultiplicity, markerPresent,
+    claimStageDiagnostics,
     markerValidationPassed, sourceStartCount, stepItemCount, anchorCount, prefixAvailable, rejectStage, prefixRejectStage,
     stepStartedExactAnchorCount: stepStartedExact.length, stepCompletedCandidateCount: stepCompletedAnchors.rows.length,
     stepCompletedCanonicalKeyCount: stepCompletedCanonicalCount, stepCompletedExactAnchorCount: stepCompletedExact.length,
