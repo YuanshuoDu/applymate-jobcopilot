@@ -3797,48 +3797,93 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(staleOwnerWriteAccepted).toBe(false)
       expect(await readSourceWaitLifecycle(pool, ids)).toEqual(beforeStaleOwnerWrite)
 
-      workerE = launchWorker("worker-b-loop-claim-recovery-cut", queueName, ids)
-      await waitForMarker(workerE, "WORKER_B_RECOVERED")
-      const acknowledgedRecovery = await pool.query<{ taskStatus: string; attemptCount: number; leaseOwner: string | null;
-        sourceStepId: string; sourceAttempt: number; sourceOrdinal: number;
-        waitStatus: string; consumedAt: Date | null; continuationStepId: string; continuationOrdinal: number; continuationStatus: string }>(
-        `SELECT task."status" AS "taskStatus", task."attemptCount", task."leaseOwner", source."id" AS "sourceStepId",
-          source."attempt" AS "sourceAttempt", source."ordinal" AS "sourceOrdinal", wait."status" AS "waitStatus", wait."consumedAt",
-          next."id" AS "continuationStepId", next."ordinal" AS "continuationOrdinal", next."status" AS "continuationStatus"
-         FROM "sub_agent_tasks" AS task JOIN "agent_wait_conditions" AS wait ON wait."parentTaskId" = task."id" AND wait."sessionId" = task."sessionId"
-         JOIN "agent_steps" AS source ON source."id" = wait."stepId" AND source."taskId" = task."id" AND source."sessionId" = task."sessionId"
-         JOIN "agent_steps" AS next ON next."taskId" = source."taskId" AND next."sessionId" = source."sessionId" AND next."turnId" = source."turnId"
-           AND next."attempt" = source."attempt" AND next."ordinal" = (SELECT MIN(later."ordinal") FROM "agent_steps" AS later
-             WHERE later."taskId" = source."taskId" AND later."sessionId" = source."sessionId" AND later."turnId" = source."turnId"
-               AND later."attempt" = source."attempt" AND later."ordinal" > source."ordinal")
-         WHERE task."id" = $1 AND task."sessionId" = $2`, [waiter.id, ids.sessionId],
-      )
-      expect(acknowledgedRecovery.rows[0]).toMatchObject({ taskStatus: "queued", attemptCount: 1, leaseOwner: null,
-        sourceStepId: acknowledged!.sourceStepId, sourceAttempt: acknowledged!.sourceAttempt, sourceOrdinal: acknowledged!.sourceOrdinal,
-        continuationStepId: acknowledged!.continuationStepId, continuationOrdinal: 2, continuationStatus: "streaming", waitStatus: "ready" })
-      expect(acknowledgedRecovery.rows[0]?.consumedAt).toEqual(acknowledgedAt)
-      const acknowledgedDispatch = await pool.query<{ attemptCount: number; publishedAt: Date | null }>(
-        `SELECT "attemptCount", "publishedAt" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch'
-          AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${waiter.id}`],
-      )
-      expect(acknowledgedDispatch.rows[0]).toMatchObject({ attemptCount: finalGeneration + 2, publishedAt: null })
-      const postAckGeneration = acknowledgedDispatch.rows[0]!.attemptCount
-      await expect(dispatchPendingSubagentOutbox(pool as never, queue, 50, ids.sessionId)).resolves.toBe(1)
-      const finalDispatch = await pool.query<{ attemptCount: number; publishedAt: Date | null }>(
-        `SELECT "attemptCount", "publishedAt" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch'
-          AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${waiter.id}`],
-      )
-      expect(finalDispatch.rows[0]).toMatchObject({ attemptCount: postAckGeneration + 1 })
-      expect(finalDispatch.rows[0]?.publishedAt).toBeInstanceOf(Date)
-      await waitForMarker(workerE, "WORKER_B_LOOP_RESTORED")
-      const orphanRestoredMarker = workerE.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_LOOP_RESTORED "))
+      const abandonedAckRecoveryGeneration = finalGeneration
+      const abandonedAckRecoveryJob = await queue.getJob(subagentDispatchJobId(waiter.id, abandonedAckRecoveryGeneration))
+      expect(abandonedAckRecoveryJob).toBeDefined()
+      expect(await abandonedAckRecoveryJob!.getState()).toBe("active")
+      // Keep the killed worker's real stalled delivery queued until its replacement is durably published.
+      await queue.pause()
+      queuePaused = true
+      let postAckGeneration = 0
+      let finalPublishedAttemptCount = 0
+      try {
+        const stalledRecoveryMonitor = new Worker<unknown, unknown>(queueName, async (): Promise<unknown> => {
+          throw new Error("stalled-recovery-monitor-must-not-process-jobs")
+        }, { connection: queueRedis.duplicate(), concurrency: 1, lockDuration: 15_000, stalledInterval: 250,
+          autorun: false, skipVersionCheck: true })
+        stalledRecoveryWorker = stalledRecoveryMonitor
+        try {
+          await stalledRecoveryMonitor.waitUntilReady()
+          await stalledRecoveryMonitor.startStalledCheckTimer()
+          let abandonedAckRecoveryState: string | null = null
+          await waitFor(async () => {
+            abandonedAckRecoveryState = await abandonedAckRecoveryJob!.getState()
+            return abandonedAckRecoveryState === "waiting" ? abandonedAckRecoveryState : null
+          }, 45_000)
+          expect(await queue.isPaused()).toBe(true)
+          expect(abandonedAckRecoveryState).toBe("waiting")
+        } finally {
+          await stalledRecoveryMonitor.close(true)
+          stalledRecoveryWorker = undefined
+        }
+
+        workerE = launchWorker("worker-b-loop-claim-recovery-cut", queueName, ids)
+        await waitForMarker(workerE, "WORKER_B_RECOVERED")
+        const acknowledgedRecovery = await pool.query<{ taskStatus: string; attemptCount: number; leaseOwner: string | null;
+          sourceStepId: string; sourceAttempt: number; sourceOrdinal: number;
+          waitStatus: string; consumedAt: Date | null; continuationStepId: string; continuationOrdinal: number; continuationStatus: string }>(
+          `SELECT task."status" AS "taskStatus", task."attemptCount", task."leaseOwner", source."id" AS "sourceStepId",
+            source."attempt" AS "sourceAttempt", source."ordinal" AS "sourceOrdinal", wait."status" AS "waitStatus", wait."consumedAt",
+            next."id" AS "continuationStepId", next."ordinal" AS "continuationOrdinal", next."status" AS "continuationStatus"
+           FROM "sub_agent_tasks" AS task JOIN "agent_wait_conditions" AS wait ON wait."parentTaskId" = task."id" AND wait."sessionId" = task."sessionId"
+           JOIN "agent_steps" AS source ON source."id" = wait."stepId" AND source."taskId" = task."id" AND source."sessionId" = task."sessionId"
+           JOIN "agent_steps" AS next ON next."taskId" = source."taskId" AND next."sessionId" = source."sessionId" AND next."turnId" = source."turnId"
+             AND next."attempt" = source."attempt" AND next."ordinal" = (SELECT MIN(later."ordinal") FROM "agent_steps" AS later
+               WHERE later."taskId" = source."taskId" AND later."sessionId" = source."sessionId" AND later."turnId" = source."turnId"
+                 AND later."attempt" = source."attempt" AND later."ordinal" > source."ordinal")
+           WHERE task."id" = $1 AND task."sessionId" = $2`, [waiter.id, ids.sessionId],
+        )
+        expect(acknowledgedRecovery.rows[0]).toMatchObject({ taskStatus: "queued", attemptCount: 1, leaseOwner: null,
+          sourceStepId: acknowledged!.sourceStepId, sourceAttempt: acknowledged!.sourceAttempt, sourceOrdinal: acknowledged!.sourceOrdinal,
+          continuationStepId: acknowledged!.continuationStepId, continuationOrdinal: 2, continuationStatus: "streaming", waitStatus: "ready" })
+        expect(acknowledgedRecovery.rows[0]?.consumedAt).toEqual(acknowledgedAt)
+        const acknowledgedDispatch = await pool.query<{ attemptCount: number; publishedAt: Date | null }>(
+          `SELECT "attemptCount", "publishedAt" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch'
+            AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${waiter.id}`],
+        )
+        expect(acknowledgedDispatch.rows[0]).toMatchObject({ attemptCount: finalGeneration + 2, publishedAt: null })
+        postAckGeneration = acknowledgedDispatch.rows[0]!.attemptCount
+        await expect(dispatchPendingSubagentOutbox(pool as never, queue, 50, ids.sessionId)).resolves.toBe(1)
+        const finalDispatch = await pool.query<{ attemptCount: number; publishedAt: Date | null }>(
+          `SELECT "attemptCount", "publishedAt" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch'
+            AND "aggregateId" = $1 AND "idempotencyKey" = $2`, [ids.sessionId, `subagent-dispatch:${waiter.id}`],
+        )
+        expect(finalDispatch.rows[0]).toMatchObject({ attemptCount: postAckGeneration + 1 })
+        expect(finalDispatch.rows[0]?.publishedAt).toBeInstanceOf(Date)
+        finalPublishedAttemptCount = finalDispatch.rows[0]!.attemptCount
+        await queue.resume()
+        queuePaused = false
+      } finally {
+        if (queuePaused) {
+          await queue.resume()
+          queuePaused = false
+        }
+      }
+      await waitForMarker(workerE!, "WORKER_B_STALE_DISPATCH_SKIPPED")
+      const staleAckRecoveryLine = workerE!.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_STALE_DISPATCH_SKIPPED "))
+      expect(JSON.parse(staleAckRecoveryLine!.slice("WORKER_B_STALE_DISPATCH_SKIPPED ".length))).toEqual({
+        dispatchGeneration: abandonedAckRecoveryGeneration, currentPublishedGeneration: postAckGeneration,
+      })
+      await waitForMarker(workerE!, "WORKER_B_LOOP_RESTORED")
+      const recoveryWorkerE = workerE!
+      const orphanRestoredMarker = recoveryWorkerE.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_LOOP_RESTORED "))
       expect(JSON.parse(orphanRestoredMarker!.slice("WORKER_B_LOOP_RESTORED ".length))).toMatchObject({
         phase: "claim-recovery-cut", waitId: acknowledged!.waitId, recoveryCallId: orphanCallId,
         recoveryStepId: acknowledged!.continuationStepId, logicalStepOrdinal: 1, physicalContinuationOrdinal: 2,
         resumeNextOrdinal: 2, orphanCallIds: [orphanCallId],
       })
-      expectRestoredWaitObservation(workerE, "consumed")
-      await waitForMarker(workerE, "WORKER_B_LOOP_CLAIM_BEFORE_RESULT")
+      expectRestoredWaitObservation(recoveryWorkerE, "consumed")
+      await waitForMarker(recoveryWorkerE, "WORKER_B_LOOP_CLAIM_BEFORE_RESULT")
       const claimState = await readWaitClaimState(pool, ids, acknowledged!.continuationStepId, claimedWaitCallId, acknowledged!.sourceAttempt)
       expect(claimState.callCount).toBe(1)
       expect(claimState.claimCount).toBe(1)
@@ -3862,7 +3907,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(waitsAtClaim.rows).toHaveLength(1)
       expect(waitsAtClaim.rows[0]).toMatchObject({ id: acknowledged!.waitId, status: "ready" })
       expect(waitsAtClaim.rows[0]?.consumedAt).toEqual(acknowledgedAt)
-      const claimMarker = workerE.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_LOOP_CLAIM_BEFORE_RESULT "))
+      const claimMarker = recoveryWorkerE.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_LOOP_CLAIM_BEFORE_RESULT "))
       expect(JSON.parse(claimMarker!.slice("WORKER_B_LOOP_CLAIM_BEFORE_RESULT ".length))).toMatchObject({ callId: orphanCallId,
         stepId: acknowledged!.continuationStepId, waitId: acknowledged!.waitId, modelCalls: 0,
         executorCalls: 0, dispatcherCalls: 0, callStatus: "started", callRevision: 0, claimCount: 1, resultCount: 0 })
@@ -3933,14 +3978,14 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       } catch { /* replacement owner must fence the previous lease */ }
       expect(replacedOwnerWriteAccepted).toBe(false)
       expect(await readSourceWaitLifecycle(pool, ids)).toEqual(reenteredSourceLifecycle)
-      expect(workerE.stdoutText).not.toContain(SOURCE_WAIT_SECRET_IDEMPOTENCY_KEY(waiter.id))
-      expect(workerD.stdoutText + workerE.stdoutText).not.toContain("sourceLifecycleRecovery")
+      expect(recoveryWorkerE.stdoutText).not.toContain(SOURCE_WAIT_SECRET_IDEMPOTENCY_KEY(waiter.id))
+      expect(workerD.stdoutText + recoveryWorkerE.stdoutText).not.toContain("sourceLifecycleRecovery")
       const sessionOutboxPrivacy = await pool.query<{ topic: string; payload: unknown }>(
         `SELECT "topic", "payload" FROM "agent_outbox" WHERE "aggregateId" = $1`, [ids.sessionId],
       )
       expect(JSON.stringify(sessionOutboxPrivacy.rows)).not.toContain(SOURCE_WAIT_SECRET_IDEMPOTENCY_KEY(waiter.id))
-      await stopWorker(workerE)
-      const claimCutExit = await workerE.exited
+      await stopWorker(recoveryWorkerE)
+      const claimCutExit = await recoveryWorkerE.exited
       expect(claimCutExit.code).toBeNull()
       expect(claimCutExit.signal).toBe("SIGKILL")
       const claimCutLease = await pool.query<{ leaseOwner: string | null }>(`SELECT "leaseOwner" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`,
@@ -4253,7 +4298,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       }])
       expect(finalGeneration).toBeGreaterThan(generation)
       expect(postAckGeneration).toBeGreaterThan(finalGeneration)
-      expect(finalDispatch.rows[0]!.attemptCount - 1).toBe(postAckGeneration)
+      expect(finalPublishedAttemptCount - 1).toBe(postAckGeneration)
       expect(resultCutPublishedAttemptCount - 1).toBe(resultCutGeneration)
       expect(completedRecoveryPublished.rows[0]!.attemptCount - 1).toBe(completedRecoveryGeneration)
       const finalResumeJob = await queue.getJob(subagentDispatchJobId(waiter.id, completedRecoveryGeneration))
@@ -5286,8 +5331,74 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
           FROM "agent_items" AS call WHERE call."sessionId" = $1 AND call."turnId" = $2 AND call."taskId" = $3
             AND call."stepId" = ANY($4::text[]) AND call."type" = 'tool_call' AND call."content"->>'toolName' = 'wait_subagents'
           ORDER BY call."stepId"`, [ids.sessionId, ids.turnId, ids.waiterTaskId, claimStepIds])).rows
+      const readClaimLocationDiagnostic = async (): Promise<unknown> => {
+        try {
+          const expected = claimSteps.rows.slice(0, 2).map(row => ({ sourceOrdinal: row.claimOrdinal - 1,
+            expectedClaimOrdinal: row.claimOrdinal,
+            callId: `${ids.loopCallPrefix}:${row.waitId}:attempt:1` }))
+          const result = await pool.query<{ sourceOrdinal: number; expectedClaimOrdinal: number; matchedClaimOrdinal: number | null;
+            claimMatchCount: number; waitClaimCount: number; toolNameClass: string | null; callStatus: string | null; stepStatus: string | null; startEventCount: number;
+            terminalEventCount: number; resultCount: number }>(`WITH expected AS (
+              SELECT * FROM jsonb_to_recordset($4::jsonb) AS expectedInput("sourceOrdinal" integer, "expectedClaimOrdinal" integer, "callId" text)
+            ), matches AS (
+              SELECT expected."sourceOrdinal", expected."expectedClaimOrdinal", call."id" AS "callItemId",
+                step."ordinal" AS "matchedClaimOrdinal", call."status" AS "callStatus", step."status" AS "stepStatus",
+                CASE WHEN call."id" IS NULL THEN NULL WHEN call."content"->>'toolName' = 'wait_subagents' THEN 'wait_subagents'
+                  WHEN call."content"->>'toolName' IS NULL THEN 'missing' ELSE 'other' END AS "toolNameClass",
+                (SELECT LEAST(COUNT(*), 2)::int FROM "agent_events" AS started WHERE started."sessionId" = $1
+                  AND started."turnId" = $2 AND started."taskId" = $3 AND started."itemId" = call."id"
+                  AND started."type" = 'tool_call.started') AS "startEventCount",
+                (SELECT LEAST(COUNT(*), 2)::int FROM "agent_events" AS terminal WHERE terminal."sessionId" = $1
+                  AND terminal."turnId" = $2 AND terminal."taskId" = $3 AND terminal."itemId" = call."id"
+                  AND terminal."type" = 'tool_call.completed') AS "terminalEventCount",
+                (SELECT LEAST(COUNT(*), 2)::int FROM "agent_items" AS result WHERE result."sessionId" = $1
+                  AND result."turnId" = $2 AND result."taskId" = $3 AND result."stepId" = call."stepId"
+                  AND result."type" = 'tool_result' AND result."content"->>'toolCallId' = expected."callId") AS "resultCount"
+              FROM expected LEFT JOIN "agent_items" AS call ON call."sessionId" = $1 AND call."turnId" = $2 AND call."taskId" = $3
+                AND call."type" = 'tool_call'
+                AND call."content"->>'toolCallId' = expected."callId"
+              LEFT JOIN "agent_steps" AS step ON step."id" = call."stepId" AND step."sessionId" = $1
+                AND step."turnId" = $2 AND step."taskId" = $3 AND step."attempt" = 1
+            )
+            SELECT "sourceOrdinal", "expectedClaimOrdinal",
+              CASE WHEN COUNT("callItemId") = 1 THEN MAX("matchedClaimOrdinal") ELSE NULL END AS "matchedClaimOrdinal",
+              LEAST(COUNT("callItemId"), 2)::int AS "claimMatchCount",
+              LEAST(COUNT(*) FILTER (WHERE "toolNameClass" = 'wait_subagents'), 2)::int AS "waitClaimCount",
+              CASE WHEN COUNT("callItemId") = 1 THEN MAX("toolNameClass")
+                WHEN COUNT("callItemId") = 0 THEN 'missing' ELSE 'ambiguous' END AS "toolNameClass",
+              CASE WHEN COUNT("callItemId") = 1 THEN MAX("callStatus") ELSE NULL END AS "callStatus",
+              CASE WHEN COUNT("callItemId") = 1 THEN MAX("stepStatus") ELSE NULL END AS "stepStatus",
+              CASE WHEN COUNT("callItemId") = 1 THEN MAX("startEventCount") ELSE 0 END AS "startEventCount",
+              CASE WHEN COUNT("callItemId") = 1 THEN MAX("terminalEventCount") ELSE 0 END AS "terminalEventCount",
+              CASE WHEN COUNT("callItemId") = 1 THEN MAX("resultCount") ELSE 0 END AS "resultCount"
+            FROM matches GROUP BY "sourceOrdinal", "expectedClaimOrdinal" ORDER BY "sourceOrdinal"`,
+          [ids.sessionId, ids.turnId, ids.waiterTaskId, JSON.stringify(expected)])
+          const callStatuses = new Set(["started", "completed", "failed"])
+          const stepStatuses = new Set(["queued", "streaming", "completed", "waiting_for_tool", "waiting_for_approval", "waiting_for_user", "failed", "interrupted"])
+          return result.rows.slice(0, 2).map(row => ({
+            sourceOrdinal: Number.isSafeInteger(row.sourceOrdinal) ? row.sourceOrdinal : null,
+            expectedClaimOrdinal: Number.isSafeInteger(row.expectedClaimOrdinal) ? row.expectedClaimOrdinal : null,
+            matchedClaimOrdinal: row.claimMatchCount === 1 && Number.isSafeInteger(row.matchedClaimOrdinal)
+              ? row.matchedClaimOrdinal : null,
+            claimMatchCount: Math.min(2, Math.max(0, Number.isSafeInteger(row.claimMatchCount) ? row.claimMatchCount : 0)),
+            waitClaimCount: Math.min(2, Math.max(0, Number.isSafeInteger(row.waitClaimCount) ? row.waitClaimCount : 0)),
+            toolNameClass: row.toolNameClass === "wait_subagents" || row.toolNameClass === "other"
+              || row.toolNameClass === "ambiguous" || row.toolNameClass === "missing" ? row.toolNameClass : "other",
+            callStatus: row.claimMatchCount === 0 ? "missing" : row.claimMatchCount > 1 ? "ambiguous"
+              : row.callStatus && callStatuses.has(row.callStatus) ? row.callStatus : row.callStatus ? "other" : "missing",
+            stepStatus: row.claimMatchCount !== 1 ? "unresolved"
+              : row.stepStatus && stepStatuses.has(row.stepStatus) ? row.stepStatus : row.stepStatus ? "other" : "missing",
+            startEventCount: Math.min(2, Math.max(0, Number.isSafeInteger(row.startEventCount) ? row.startEventCount : 0)),
+            terminalEventCount: Math.min(2, Math.max(0, Number.isSafeInteger(row.terminalEventCount) ? row.terminalEventCount : 0)),
+            resultCount: Math.min(2, Math.max(0, Number.isSafeInteger(row.resultCount) ? row.resultCount : 0)),
+          }))
+        } catch {
+          return { diagnosticStatus: "unavailable" }
+        }
+      }
       const claimsBeforeRestart = await readClaimLifecycle()
-      expect(claimsBeforeRestart).toHaveLength(2)
+      const claimLocationDiagnostic = claimsBeforeRestart.length !== 2 ? await readClaimLocationDiagnostic() : undefined
+      expect(claimsBeforeRestart, `bounded two-wait claim diagnostic: ${JSON.stringify(claimLocationDiagnostic)}`).toHaveLength(2)
       expect(claimsBeforeRestart.map(row => [row.startCount, row.terminalCount, row.resultCount])).toEqual([[1, 1, 1], [1, 1, 1]])
       expect(new Set(claimsBeforeRestart.map(row => row.callId)).size).toBe(2)
 

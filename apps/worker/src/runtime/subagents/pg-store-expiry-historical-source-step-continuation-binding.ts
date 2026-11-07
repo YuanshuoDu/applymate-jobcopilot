@@ -50,9 +50,8 @@ function callsExpression(): string {
 export function historicalSourceStepContinuationBinding(path: string): string {
   const continuation = `(${path}->'continuationPrefix')`
   const events = `(CASE WHEN jsonb_typeof(${continuation}->'events') = 'array' THEN ${continuation}->'events' ELSE '[]'::jsonb END)`
-  const parent = `(${continuation}->'parent')`, parentId = `${parent}->>'id'`
-  const stepId = `${continuation}->>'stepId'`, callId = `${continuation}->>'callId'`, itemId = `${continuation}->>'callItemId'`
-  const eventPrefix = `'task:' || boundSource."taskId" || ':event:'`
+  const parent = `(${continuation}->'parent')`, parentId = `${parent}->>'id'`, stepId = `${continuation}->>'stepId'`, callId = `${continuation}->>'callId'`, itemId = `${continuation}->>'callItemId'`
+  const resultItemId = `'task:' || boundSource."taskId" || ':item:tool-result:' || (${callId}) || ':attempt:' || owner."attemptCount"::text`, eventPrefix = `'task:' || boundSource."taskId" || ':event:'`
   const priorEventIndex = `CASE WHEN expected.ordinality BETWEEN 2 AND 7 THEN (expected.ordinality - 2)::integer ELSE NULL::integer END`
   const agendaKey = `CASE WHEN octet_length(convert_to('cognitive.agenda:' || (${stepId}), 'UTF8')) <= 256
     THEN 'cognitive.agenda:' || (${stepId}) ELSE 'cognitive.agenda:sha256:' || encode(sha256(convert_to((${stepId}), 'UTF8')), 'hex') END`
@@ -192,25 +191,34 @@ export function historicalSourceStepContinuationBinding(path: string): string {
       AND EXISTS (SELECT 1 FROM "agent_items" AS continuationItem WHERE continuationItem."id" = ${itemId}
         AND continuationItem."sessionId" = successor."sessionId" AND continuationItem."turnId" = successor."turnId"
         AND continuationItem."taskId" = successor."taskId" AND continuationItem."stepId" = successor."id"
-        AND continuationItem."type" = 'tool_call' AND continuationItem."status" = 'started'
-        AND continuationItem."revision" = 0 AND continuationItem."phase" IS NULL
+        AND continuationItem."type" = 'tool_call' AND continuationItem."phase" IS NULL
+        AND ((continuationItem."status" = 'started' AND continuationItem."revision" = 0)
+          OR (continuationItem."status" = 'completed' AND continuationItem."revision" = 1))
         AND continuationItem."id" = 'task:' || boundSource."taskId" || ':item:tool-call:' || (${callId}) || ':attempt:' || owner."attemptCount"::text
         AND (SELECT COUNT(*) FROM "agent_items" AS onlyItem WHERE onlyItem."sessionId" = successor."sessionId"
           AND onlyItem."turnId" = successor."turnId" AND onlyItem."taskId" = successor."taskId" AND onlyItem."stepId" = successor."id") = 1
-        AND CASE WHEN jsonb_typeof(continuationItem."content") = 'object' THEN
-          (SELECT COUNT(*) FROM jsonb_object_keys(continuationItem."content")) = 4
-          AND continuationItem."content" ?& ARRAY['toolCallId','toolName','toolVersion','input'] ELSE FALSE END
         AND continuationItem."content"->>'toolCallId' = ${callId} AND continuationItem."content"->>'toolName' = 'wait_subagents'
         AND continuationItem."content"->>'toolVersion' = '1'
         AND continuationItem."content"->'input' = boundSourceCall."content"->'input'
         AND continuationItem."content"->>'toolCallId' <> boundSourceCall."content"->>'toolCallId'
         AND continuationItem."id" <> boundSourceCall."id"
+        AND CASE WHEN jsonb_typeof(continuationItem."content") = 'object' THEN
+          ((continuationItem."status" = 'started' AND continuationItem."revision" = 0
+            AND (SELECT COUNT(*) FROM jsonb_object_keys(continuationItem."content")) = 4
+            AND continuationItem."content" ?& ARRAY['toolCallId','toolName','toolVersion','input'])
+          OR (continuationItem."status" = 'completed' AND continuationItem."revision" = 1
+            AND (SELECT COUNT(*) FROM jsonb_object_keys(continuationItem."content")) = 6
+            AND continuationItem."content" ?& ARRAY['toolCallId','toolName','toolVersion','input','status','errorCode']
+            AND continuationItem."content"->>'status' = 'completed' AND continuationItem."content"->'errorCode' = 'null'::jsonb))
+          ELSE FALSE END
+        AND ${continuation}->'item'->>'status' = continuationItem."status" AND ${continuation}->'item'->>'revision' = continuationItem."revision"::text
         AND encode(sha256(convert_to(continuationItem."content"::text,'UTF8')),'hex') = (${continuation}->'item'->>'contentDigest')))
     AND CASE WHEN jsonb_typeof(${continuation}->'item') = 'object' THEN
       (SELECT COUNT(*) FROM jsonb_object_keys(${continuation}->'item')) = 6
       AND ${continuation}->'item' ?& ARRAY['id','type','status','revision','phase','contentDigest'] ELSE FALSE END
     AND ${continuation}->'item'->>'id' = ${itemId} AND ${continuation}->'item'->>'type' = 'tool_call'
-    AND ${continuation}->'item'->>'status' = 'started' AND ${continuation}->'item'->>'revision' = '0'
+    AND ((${continuation}->'item'->>'status' = 'started' AND ${continuation}->'item'->>'revision' = '0')
+      OR (${continuation}->'item'->>'status' = 'completed' AND ${continuation}->'item'->>'revision' = '1'))
     AND ${continuation}->'item'->'phase' = 'null'::jsonb
     AND ${continuation}->'item'->>'contentDigest' ~ '^[0-9a-f]{64}$' AND ${parentBinding} AND ${arrayChain}
     AND NOT EXISTS (SELECT 1 FROM "agent_events" AS terminal WHERE terminal."sessionId" = boundSource."sessionId"
@@ -218,8 +226,11 @@ export function historicalSourceStepContinuationBinding(path: string): string {
       AND ((terminal."type" = 'step.completed' AND (terminal."correlationId" = ${stepId}
           OR terminal."idempotencyKey" = 'task:' || boundSource."taskId" || ':event:step-completed:' || (${stepId})))
         OR (terminal."type" IN ('tool_call.completed','tool_call.failed','tool_call.interrupted')
-          AND (terminal."correlationId" = ${callId} OR terminal."itemId" = ${itemId}))
-        OR (terminal."type" IN ('item.completed','item.failed') AND terminal."itemId" = ${itemId})))
+          AND (terminal."correlationId" = ${callId} OR terminal."itemId" = ${itemId}
+            OR terminal."idempotencyKey" = (${eventPrefix} || 'tool-finished:' || (${callId}))))
+        OR (terminal."type" IN ('item.completed','item.failed','item.interrupted') AND terminal."itemId" = ${itemId})
+        OR terminal."itemId" = ${resultItemId} OR terminal."correlationId" = ${resultItemId}
+        OR terminal."idempotencyKey" IN (${eventPrefix} || 'tool-call-completed:' || (${callId}) || ':' || (${itemId}) || ':1', ${eventPrefix} || 'item-started:' || (${resultItemId}), ${eventPrefix} || 'tool-result-completed:' || (${callId}) || ':' || (${resultItemId}) || ':1')))
     AND (SELECT COUNT(DISTINCT value->>'id') FROM jsonb_array_elements(${events}) AS event(value)) = 7
     AND (SELECT COUNT(DISTINCT value->>'idempotencyKey') FROM jsonb_array_elements(${events}) AS event(value)) = 7
     AND (SELECT COUNT(DISTINCT event."sequence") FROM jsonb_array_elements(${events}) AS expected(value)
@@ -228,13 +239,12 @@ export function historicalSourceStepContinuationBinding(path: string): string {
     AND NOT EXISTS (SELECT 1 FROM "agent_events" AS extra WHERE extra."sessionId" = boundSource."sessionId"
       AND extra."turnId" = boundSource."turnId" AND extra."taskId" = boundSource."taskId"
       AND (extra."causationId" IN (SELECT event.value->>'id' FROM jsonb_array_elements(${events}) AS event(value))
-        OR extra."correlationId" = ${stepId} OR extra."correlationId" = ${callId} OR extra."itemId" = ${itemId})
+        OR extra."correlationId" = ${stepId} OR extra."correlationId" IN (${callId}, ${resultItemId}) OR extra."itemId" IN (${itemId}, ${resultItemId}))
       AND extra."id" NOT IN (SELECT event.value->>'id' FROM jsonb_array_elements(${events}) AS event(value)))
     AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(${events}) AS expected(value)
       JOIN "agent_events" AS descendant ON descendant."sessionId" = boundSource."sessionId"
         AND descendant."turnId" = boundSource."turnId" AND descendant."taskId" = boundSource."taskId"
         AND descendant."causationId" = expected.value->>'id'
       WHERE NOT (descendant."id" IN (SELECT event.value->>'id' FROM jsonb_array_elements(${events}) AS event(value))))
-  ELSE FALSE END`
+   ELSE FALSE END`
 }
-

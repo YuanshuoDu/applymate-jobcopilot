@@ -51,6 +51,19 @@ function workerFailureReasonCategory(error) {
   const code = error && typeof error.message === "string" ? error.message : ""
   return workerFailureReasonCategories.has(code) ? code : "other"
 }
+const finalResumeDiagnosticStages = new Set([
+  "durable_wait_loader", "child_attempt_resume_loader", "restored_wait_validation",
+  "owner_fence", "observation_projection", "claim_recovery_check",
+])
+let finalResumeDiagnosticEmitted = false
+function reportFinalResumeDiagnosticFailure(stage, error) {
+  if (mode !== "worker-b-loop-final" || !finalResumeDiagnosticStages.has(stage) || finalResumeDiagnosticEmitted) return
+  finalResumeDiagnosticEmitted = true
+  let category = "other"
+  try { category = workerFailureReasonCategory(error) } catch { /* diagnostics must not replace the original failure */ }
+  try { say(`WORKER_B_LOOP_FINAL_RESUME_FAILURE ${JSON.stringify({ stage, category })}`) }
+  catch { /* diagnostics must not replace the original failure */ }
+}
 const boundedLoopDiagnosticModes = new Set(["worker-b-loop-usage-lineage-cut", "worker-b-loop-usage-lineage-reject", "worker-b-loop-multi-complete-cut"])
 const maxBoundedLoopDiagnosticStages = 64
 const boundedLoopDiagnosticStages = new Set([
@@ -682,6 +695,7 @@ async function resumeChildThroughLoop(lease, phase, preloadedRestored) {
     traceLoopStage("durable_wait_loader", "pass")
   } catch (error) {
     traceLoopStage("durable_wait_loader", "fail")
+    reportFinalResumeDiagnosticFailure("durable_wait_loader", error)
     if (phase === "multi-complete-cut") say(`WORKER_B_LOOP_RESUME_FAILURE ${JSON.stringify({ stage: "durable_wait_loader", category: workerFailureReasonCategory(error) })}`)
     throw error
   }
@@ -693,6 +707,7 @@ async function resumeChildThroughLoop(lease, phase, preloadedRestored) {
   }
   catch (error) {
     traceLoopStage("child_attempt_resume_loader", "fail")
+    reportFinalResumeDiagnosticFailure("child_attempt_resume_loader", error)
     if (phase === "multi-complete-cut") say(`WORKER_B_LOOP_RESUME_FAILURE ${JSON.stringify({ stage: "child_attempt_resume_loader", category: workerFailureReasonCategory(error) })}`)
     if (phase === "usage-lineage-reject") {
       say(`WORKER_B_LOOP_RESUME_FAILURE ${JSON.stringify({ category: workerFailureReasonCategory(error) })}`)
@@ -710,7 +725,9 @@ async function resumeChildThroughLoop(lease, phase, preloadedRestored) {
   traceLoopStage("restored_wait_validation", "start")
   if (!restored?.durableWait) {
     traceLoopStage("restored_wait_validation", "fail")
-    throw new Error("fixture_child_wait_loop_durable_wait_missing")
+    const error = new Error("fixture_child_wait_loop_durable_wait_missing")
+    reportFinalResumeDiagnosticFailure("restored_wait_validation", error)
+    throw error
   }
   traceLoopStage("restored_wait_validation", "pass")
   const wait = restored.durableWait
@@ -721,6 +738,7 @@ async function resumeChildThroughLoop(lease, phase, preloadedRestored) {
     traceRestoredWaitDiagnostic("owner_fence", "pass")
   } catch (error) {
     traceRestoredWaitDiagnostic("owner_fence", "fail", "owner_fence_rejected")
+    reportFinalResumeDiagnosticFailure("owner_fence", error)
     throw error
   }
   const recovery = restored.childWaitOrphanRecovery ?? restored.childWaitClaimRecovery
@@ -737,6 +755,7 @@ async function resumeChildThroughLoop(lease, phase, preloadedRestored) {
     traceRestoredWaitDiagnostic("observation_projection", "pass")
   } catch (error) {
     traceRestoredWaitDiagnostic("observation_projection", "fail", restoredWaitDiagnosticFailure(error))
+    reportFinalResumeDiagnosticFailure("observation_projection", error)
     throw error
   }
   say(`WORKER_B_RESTORED_WAIT_OBSERVATION ${JSON.stringify(observationSummary)}`)
@@ -745,7 +764,11 @@ async function resumeChildThroughLoop(lease, phase, preloadedRestored) {
   }
   if (phase === "claim-recovery-cut" && !restored.childWaitOrphanRecovery) throw new Error("fixture_child_wait_orphan_recovery_missing")
   if (phase === "claim-item-completed-cut" && !restored.childWaitClaimRecovery) throw new Error("fixture_child_wait_claim_recovery_missing")
-  if (phase === "final" && !restored.childWaitClaimRecovery) throw new Error("fixture_child_wait_claim_recovery_missing")
+  if (phase === "final" && !restored.childWaitClaimRecovery) {
+    const error = new Error("fixture_child_wait_claim_recovery_missing")
+    reportFinalResumeDiagnosticFailure("claim_recovery_check", error)
+    throw error
+  }
   if (phase === "claim-recovery-cut" || phase === "claim-item-completed-cut" || phase === "final") {
     say(`WORKER_B_LOOP_RESTORED ${JSON.stringify({ phase, waitId: wait.waitId, recoveryCallId: recovery?.call.id ?? null,
       recoveryStepId: recovery?.stepId ?? null, logicalStepOrdinal: recovery?.stepOrdinal ?? null,

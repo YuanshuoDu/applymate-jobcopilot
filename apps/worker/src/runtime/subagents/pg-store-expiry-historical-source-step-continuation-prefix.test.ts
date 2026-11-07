@@ -13,6 +13,8 @@ const continuationStepId = "task:task-1:step:1:attempt:2", continuationCallId = 
 const continuationItemId = `task:${task.id}:item:tool-call:${continuationCallId}:attempt:2`
 type Event = Record<string, unknown> & { id: string; sequence: string; type: string; actor: string; itemId: string | null;
   correlationId: string; causationId: string | null; idempotencyKey: string; payload: unknown; payloadDigest: string }
+type TerminalRow = { id: string; sessionId: string; turnId: string; taskId: string; sequence: string; type: string;
+  correlationId: string; itemId: string | null; idempotencyKey: string }
 
 function fixture() {
   const events: Event[] = []
@@ -53,23 +55,47 @@ function fixture() {
   const sourceEnd = { id: "source-end", sequence: "9", type: "item.completed", actor: "subagent", itemId: "source-result",
     correlationId: "source-result", causationId: null, idempotencyKey: `task:${task.id}:event:tool-result-completed:source-call:source-result:1`,
     payload: {}, payloadDigest: "c".repeat(64) }
-  const item = { id: continuationItemId, sessionId: task.sessionId, turnId: task.turnId, taskId: task.id, stepId: continuationStepId,
+  const item: { id: string; sessionId: string; turnId: string; taskId: string; stepId: string; type: string; status: string;
+    revision: number; phase: null; content: Record<string, unknown>; contentDigest: string } = {
+    id: continuationItemId, sessionId: task.sessionId, turnId: task.turnId, taskId: task.id, stepId: continuationStepId,
     type: "tool_call", status: "started", revision: 0, phase: null, content: itemContent,
     contentDigest: createHash("sha256").update(JSON.stringify(itemContent)).digest("hex") }
+  const itemRows = [item], terminalRows: TerminalRow[] = []
   const windowEvents = [sourceStart, started, agendaEvent, modelStarted, modelCompleted, usage, itemStarted, callStarted, sourceEnd]
   windowEvents.forEach((event, index) => { event.sequence = String(index + 2) })
-  const client = { query: async (sql: string) => {
+  const client = { query: async (sql: string, values?: unknown[]) => {
     if (sql.includes('FROM "sub_agent_tasks"')) return { rows: [{ sourceStepId, sourceOrdinal: 0, sourceAttempt: 1,
       sourceStatus: "waiting_for_tool", stepId: continuationStepId, ordinal: 1, attempt: 2, stepStatus: "streaming",
       sourceSessionId: task.sessionId, sourceTurnId: task.turnId, sourceTaskId: task.id,
       sessionId: task.sessionId, turnId: task.turnId, taskId: task.id }] }
-    if (sql.includes('FROM "agent_items"')) return { rows: [item] }
+    if (sql.includes('FROM "agent_items"')) return { rows: itemRows }
     if (sql.includes("parent.\"idempotencyKey\" = $4")) return { rows: parentRows.filter(event => event.sessionId === task.sessionId
       && event.turnId === task.turnId && event.taskId === task.id && event.idempotencyKey === `task:${task.id}:event:turn-started`) }
-    if (sql.includes("'step.completed'")) return { rows: [] }
+    if (sql.includes("'step.completed'")) {
+      const [sessionId, turnId, taskId, stepId, stepKey, callId, itemId, finishKey, resultItemId, callCompletedKey, resultStartKey, resultCompleteKey] = values ?? []
+      const callTerminals = ["tool_call.completed", "tool_call.failed", "tool_call.interrupted"]
+      const itemTerminals = ["item.completed", "item.failed", "item.interrupted"]
+      return { rows: terminalRows.filter(row => row.sessionId === sessionId && row.turnId === turnId && row.taskId === taskId
+        && ((row.type === "step.completed" && (row.correlationId === stepId || row.idempotencyKey === stepKey))
+          || (callTerminals.includes(row.type) && (row.correlationId === callId || row.itemId === itemId || row.idempotencyKey === finishKey))
+          || (itemTerminals.includes(row.type) && [itemId, resultItemId].includes(row.itemId)) || row.correlationId === resultItemId
+          || [callCompletedKey, resultStartKey, resultCompleteKey].includes(row.idempotencyKey))).map(({ id }) => ({ id })) }
+    }
     return { rows: [] }
   } } as never
-  return { client, windowEvents, item, itemContent, parent, parentRows, started, agendaEvent, modelStarted, modelCompleted, usage, itemStarted, callStarted }
+  return { client, windowEvents, item, itemRows, terminalRows, itemContent, parent, parentRows, started, agendaEvent, modelStarted, modelCompleted, usage, itemStarted, callStarted }
+}
+
+function terminalRow(patch: Partial<TerminalRow> = {}): TerminalRow {
+  return { id: "terminal-event", sessionId: task.sessionId, turnId: task.turnId, taskId: task.id, sequence: "1000",
+    type: "item.completed", correlationId: "foreign-call", itemId: null, idempotencyKey: "foreign-key", ...patch }
+}
+
+function persistCompletedItemBeforeEvent(value: ReturnType<typeof fixture>, patch: Record<string, unknown> = {}) {
+  value.item.status = "completed"
+  value.item.revision = 1
+  value.item.content = { ...value.itemContent, status: "completed", errorCode: null, ...patch }
+  value.item.contentDigest = createHash("sha256").update(JSON.stringify(value.item.content)).digest("hex")
 }
 
 function input(value: ReturnType<typeof fixture>) {
@@ -87,6 +113,45 @@ describe("historical source step continuation prefix", () => {
     expect(proof?.events.map(event => event.type)).toEqual([
       "step.started", "cognitive.agenda", "model.started", "model.completed", "model.usage", "item.started", "tool_call.started",
     ])
+  })
+
+  it("accepts the exact completed-item-before-event crash cut", async () => {
+    const value = fixture(); persistCompletedItemBeforeEvent(value)
+    const proof = await readCanonicalHistoricalSourceStepContinuationPrefix(value.client, task, input(value))
+    expect(proof?.item).toMatchObject({ id: continuationItemId, type: "tool_call", status: "completed", revision: 1, phase: null })
+    expect(proof?.events.map(event => event.type)).toEqual([
+      "step.started", "cognitive.agenda", "model.started", "model.completed", "model.usage", "item.started", "tool_call.started",
+    ])
+    expect(proof?.events.at(-1)).toMatchObject({ correlationId: continuationCallId,
+      idempotencyKey: `task:${task.id}:event:child-wait-claim:2:${continuationStepId}` })
+    expect(value.terminalRows).toHaveLength(0)
+  })
+
+  it.each([
+    ["a mismatched item revision", (value: ReturnType<typeof fixture>) => { persistCompletedItemBeforeEvent(value); value.item.revision = 2 }],
+    ["a non-completed call content status", (value: ReturnType<typeof fixture>) => { persistCompletedItemBeforeEvent(value, { status: "failed" }) }],
+    ["a non-null call error", (value: ReturnType<typeof fixture>) => { persistCompletedItemBeforeEvent(value, { errorCode: "tool_execution_failed" }) }],
+    ["an extra completion-content field", (value: ReturnType<typeof fixture>) => { persistCompletedItemBeforeEvent(value, { output: { ok: true } }) }],
+    ["a persisted completion event", (value: ReturnType<typeof fixture>) => {
+      persistCompletedItemBeforeEvent(value); value.terminalRows.push(terminalRow({ itemId: value.item.id }))
+    }],
+    ["a second continuation item", (value: ReturnType<typeof fixture>) => {
+      persistCompletedItemBeforeEvent(value); value.itemRows.push({ ...value.item, id: "extra-item" })
+    }],
+  ])("rejects %s", async (_label, corrupt) => {
+    const value = fixture(); corrupt(value)
+    await expect(readCanonicalHistoricalSourceStepContinuationPrefix(value.client, task, input(value))).resolves.toBeNull()
+  })
+
+  it.each([
+    ["a wrong-associated tool finish key", `task:${task.id}:event:tool-finished:${continuationCallId}`, "tool_call.completed"],
+    ["a wrong-associated call completion key", `task:${task.id}:event:tool-call-completed:${continuationCallId}:${continuationItemId}:1`, "commentary"],
+  ])("rejects %s even when it is outside the ordered proof window", async (_label, idempotencyKey, type) => {
+    const value = fixture(); persistCompletedItemBeforeEvent(value)
+    const row = terminalRow({ idempotencyKey, type })
+    expect(BigInt(row.sequence)).toBeGreaterThan(BigInt(value.windowEvents.at(-1)!.sequence))
+    value.terminalRows.push(row)
+    await expect(readCanonicalHistoricalSourceStepContinuationPrefix(value.client, task, input(value))).resolves.toBeNull()
   })
 
   it.each([

@@ -97,9 +97,13 @@ export async function readCanonicalHistoricalSourceStepContinuationPrefix(client
   if (itemRows.rows.length !== 1) return null
   const item = itemRows.rows[0]!, content = record(item.content), callId = content.toolCallId
   const callItemId = `task:${scope.id}:item:tool-call:${String(callId)}:attempt:${currentAttempt}`
+  const startedItem = item.status === "started" && item.revision === 0 && exactKeys(content, ["toolCallId", "toolName", "toolVersion", "input"])
+  const completedBeforeEvent = item.status === "completed" && item.revision === 1
+    && exactKeys(content, ["toolCallId", "toolName", "toolVersion", "input", "status", "errorCode"])
+    && content.status === "completed" && content.errorCode === null
   if (item.sessionId !== scope.sessionId || item.turnId !== scope.turnId || item.taskId !== scope.id || item.stepId !== stepId
-    || item.id !== callItemId || item.type !== "tool_call" || item.status !== "started" || item.revision !== 0 || item.phase !== null
-    || !exactKeys(content, ["toolCallId", "toolName", "toolVersion", "input"]) || !validText(callId) || callId === input.sourceCallId
+    || item.id !== callItemId || item.type !== "tool_call" || item.phase !== null || !(startedItem || completedBeforeEvent)
+    || !validText(callId) || callId === input.sourceCallId
     || content.toolName !== "wait_subagents" || content.toolVersion !== "1" || !validWaitInput(content.input)
     || !same(content.input, input.sourceCallInput) || item.id === input.sourceCallItemId) return null
   const agendaKey = cognitiveAgendaReceiptIdempotencyKey(stepId)
@@ -162,11 +166,11 @@ export async function readCanonicalHistoricalSourceStepContinuationPrefix(client
     || !same(callStarted.payload, { toolCallId: callId, toolName: "wait_subagents", taskId: scope.id })) return null
   const selectedIds = new Set(events.map(event => event.id)), resultItemId = `task:${scope.id}:item:tool-result:${callId}:attempt:${currentAttempt}`
   if (input.windowEvents.some(event => (event.correlationId === stepId || event.itemId === item.id || event.itemId === resultItemId
-    || event.correlationId === callId || selectedIds.has(event.causationId ?? "")) && !selectedIds.has(event.id))) return null
+    || event.correlationId === callId || event.correlationId === resultItemId || selectedIds.has(event.causationId ?? "")) && !selectedIds.has(event.id))) return null
   const terminalRows = await client.query<{ id: string }>(`SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
     AND (("type" = 'step.completed' AND ("correlationId" = $4 OR "idempotencyKey" = $5))
       OR ("type" IN ('tool_call.completed','tool_call.failed','tool_call.interrupted') AND ("correlationId" = $6 OR "itemId" = $7 OR "idempotencyKey" = $8))
-      OR ("type" IN ('item.completed','item.failed','item.interrupted') AND "itemId" IN ($7, $9))
+      OR ("type" IN ('item.completed','item.failed','item.interrupted') AND "itemId" IN ($7, $9)) OR "correlationId" = $9
       OR "idempotencyKey" IN ($10, $11, $12)) LIMIT 1`,
   [scope.sessionId, scope.turnId, scope.id, stepId, prefix + `step-completed:${stepId}`, callId, item.id,
     prefix + `tool-finished:${callId}`, resultItemId, prefix + `tool-call-completed:${callId}:${item.id}:1`,
