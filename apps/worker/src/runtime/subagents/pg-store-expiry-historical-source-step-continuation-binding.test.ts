@@ -20,6 +20,7 @@ describe("historical source step continuation SQL", () => {
     const sql = historicalSourceStepContinuationBinding(path)
     expect(balance(sql)).toBe(0)
     expect(sql).toContain("continuationPrefix")
+    expect(sql).toContain(`WHEN 1 THEN 'task:' || boundSource."taskId" || ':event:' || 'step-started:' ||`)
     expect(sql).toContain(`'child-wait-claim:' || owner."attemptCount"::text`)
     expect(sql).toContain(`successor."attempt" = owner."attemptCount"`)
     expect(sql).toContain(`successor."status" = 'streaming'`)

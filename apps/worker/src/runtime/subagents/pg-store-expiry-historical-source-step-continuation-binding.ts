@@ -52,7 +52,7 @@ export function historicalSourceStepContinuationBinding(path: string): string {
   const events = `(CASE WHEN jsonb_typeof(${continuation}->'events') = 'array' THEN ${continuation}->'events' ELSE '[]'::jsonb END)`
   const parent = `(${continuation}->'parent')`, parentId = `${parent}->>'id'`
   const stepId = `${continuation}->>'stepId'`, callId = `${continuation}->>'callId'`, itemId = `${continuation}->>'callItemId'`
-  const eventPrefix = `task:' || boundSource."taskId" || ':event:'`
+  const eventPrefix = `'task:' || boundSource."taskId" || ':event:'`
   const agendaKey = `CASE WHEN octet_length(convert_to('cognitive.agenda:' || (${stepId}), 'UTF8')) <= 256
     THEN 'cognitive.agenda:' || (${stepId}) ELSE 'cognitive.agenda:sha256:' || encode(sha256(convert_to((${stepId}), 'UTF8')), 'hex') END`
   const expectedKey = `CASE expected.ordinality
