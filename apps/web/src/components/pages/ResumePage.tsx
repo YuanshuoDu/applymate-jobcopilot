@@ -3342,7 +3342,10 @@ export function ResumePage({ sidebarCollapsed = false, onToggleSidebar }: Resume
               {localAuditFence.state !== 'retryable' && <button type="button" disabled={auditingApplication || dirty || saving} onClick={() => setAuditStatusRefresh(value => value + 1)}>{t('application.refreshStatus')}</button>}
             </div>}
           {displayedApplicationAudit?.findings.some(finding => finding.area !== 'job_match' && finding.severity !== 'pass' && !finding.applied) &&
-            <p role="note" style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--text-muted)' }}>{t('application.repairImpactGuidance')}</p>}
+            <details className="resume-repair-guidance">
+              <summary>{t('application.repairImpactSummary')}</summary>
+              <p>{t('application.repairImpactGuidance')}</p>
+            </details>}
           <AiPanel
             selectedJob={selectedJob}
             scoreResult={scoreResult}

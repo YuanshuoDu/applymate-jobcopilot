@@ -4592,7 +4592,31 @@ test('retry-only audit checks the existing selected materials without navigating
 test('Resume explains the replacement scope and backup limits before repair', async ({ page }) => {
   const state = await install(page, { auditCorrection: true })
   await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
-  await expect(page.getByRole('note').filter({ hasText: /replaces the entire affected resume section or cover letter|替换受影响的整段简历内容或整封求职信/ })).toBeVisible()
+  const guidance = page.locator('.resume-repair-guidance')
+  const summary = guidance.locator('summary')
+  const details = guidance.locator('p')
+  await expect(guidance).toBeVisible()
+  await expect(summary).toHaveText(/Automatic fixes replace a full resume section or letter|自动修正会替换整段简历或整封求职信/)
+  await expect(guidance).not.toHaveAttribute('open', '')
+  await expect(details).toBeHidden()
+  await summary.focus()
+  await page.keyboard.press('Enter')
+  await expect(guidance).toHaveAttribute('open', '')
+  await expect(details).toBeVisible()
+  await expect(details).toContainText(/replaces the entire affected resume section or cover letter|替换受影响的整段简历内容或整封求职信/)
+  await page.keyboard.press('Space')
+  await expect(details).toBeHidden()
+  expect(state.writes).toEqual([])
+})
+
+test('Resume hides replacement guidance when there are no unresolved material findings', async ({ page }) => {
+  const state = await install(page, { auditCorrection: true })
+  state.audit = { ...state.audit, audit: { ...state.audit.audit, findings: [
+    { area: 'job_match', severity: 'warning', title: 'Position match', evidence: 'Not a material issue', action: 'Review position' },
+    { area: 'resume', severity: 'pass', title: 'Supported claim', evidence: 'Resume evidence matches', action: 'Keep' },
+  ] } } as typeof state.audit
+  await page.goto(`${origin}/?page=resume&resumeId=resume-1&returnToJobs=1&returnJobId=outside-page`)
+  await expect(page.locator('.resume-repair-guidance')).toHaveCount(0)
   expect(state.writes).toEqual([])
 })
 
