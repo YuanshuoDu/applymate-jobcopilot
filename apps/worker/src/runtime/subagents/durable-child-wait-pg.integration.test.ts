@@ -1921,6 +1921,160 @@ async function historicalWaitBindingAccepts(client: PoolClient, task: BlockingTa
   return result.rows.length === 1 && result.rows[0]?.accepted === true
 }
 
+type HistoricalWaitBindingDiagnosticStage = "owner_fence" | "claim_rows" | "claim_start_lifecycle" | "nested_source_binding"
+  | "source_claim_separation" | "claim_step_binding" | "claim_call_shape" | "claim_key_binding" | "claim_result_chain" | "other_final_guard"
+type HistoricalWaitBindingDiagnostic = Readonly<{
+  diagnosticStatus: "evaluated"
+  stage: HistoricalWaitBindingDiagnosticStage
+  ownerFence: boolean
+  sourceProjectionBound: boolean
+  nestedSourceMatches: boolean
+  sourceClaimSeparated: boolean
+  topLevelClaimRowCount: number
+  claimStartLifecycle: boolean
+  claimStepFirstLater: boolean
+  claimCallShape: boolean
+  claimKeyMatches: boolean
+  claimKeyCandidateCount: number
+  claimResultChainPresent: boolean
+  stepChainEventCount: number
+  stepChainCallCount: number
+} | { diagnosticStatus: "unavailable" }>
+
+/** Failure-only, de-identified stages for the final claim binding; never returns IDs, keys, payloads, SQL, or exceptions. */
+async function diagnoseHistoricalWaitBinding(client: PoolClient, task: BlockingTaskSnapshot, claimProjection: unknown,
+  sourceProjection: unknown): Promise<HistoricalWaitBindingDiagnostic> {
+  try {
+    const claim = asObject(claimProjection), claimWait = asObject(claim.sourceWait)
+    const sourceWait = asObject(asObject(sourceProjection).sourceWait)
+    const nestedSourceMatches = canonicalJson(claimWait) === canonicalJson(sourceWait)
+    const sourceProjectionBound = await historicalWaitBindingAccepts(client, task, sourceProjection)
+    const sourceClaimSeparated = claimWait.claimKeyDigest !== null && claimWait.claimKeyDigest !== undefined
+      && claim.callItemId !== claimWait.sourceCallItemId && claim.rawCallId !== claimWait.sourceCallId
+      && claim.stepId !== claimWait.sourceStepId && nestedSourceMatches
+    const resultItemId = claim.resultItemId
+    const resultStartedEventId = claim.resultStartedEventId
+    const resultCompletedEventId = claim.resultCompletedEventId
+    const stepCompletedEventId = claim.stepCompletedEventId
+    const chain = asObject(claim.stepToolChain)
+    const chainEvents = Array.isArray(chain.events) ? chain.events : []
+    const chainCalls = Array.isArray(chain.calls) ? chain.calls : []
+    const stepChainEventCount = Math.min(chainEvents.length, MAX_STEP_CHAIN_EVENTS + 1)
+    const stepChainCallCount = Math.min(chainCalls.length, MAX_STEP_TOOL_CALLS + 1)
+    const claimResultChainPresent = [resultItemId, resultStartedEventId, resultCompletedEventId, stepCompletedEventId]
+      .every(value => typeof value === "string" && value.length > 0)
+      && chain.stepId === claim.stepId && chain.attempt === claim.attempt && chain.waitCallItemId === claim.callItemId
+      && chain.waitCallId === claim.rawCallId && chain.waitResultItemId === resultItemId
+      && chain.stepCompletedEventId === stepCompletedEventId
+      && stepChainEventCount >= 12 && stepChainEventCount <= MAX_STEP_CHAIN_EVENTS
+      && stepChainCallCount >= 1 && stepChainCallCount <= MAX_STEP_TOOL_CALLS
+    const result = await client.query<{
+      ownerFenceCount: number; topLevelClaimRowCount: number; claimStartLifecycle: boolean; claimStepFirstLater: boolean
+      claimCallShape: boolean; claimKeyMatches: boolean; claimKeyCandidateCount: number
+    }>(`WITH proof AS (SELECT $9::jsonb AS value), owner AS MATERIALIZED (
+        SELECT owner."id", owner."sessionId", owner."turnId", owner."rootTaskId", owner."attemptCount", owner."leaseOwner", owner."leaseExpiresAt"
+        FROM "sub_agent_tasks" AS owner JOIN "agent_sessions" AS session ON session."id" = owner."sessionId" AND session."userId" = $8
+        JOIN "agent_turns" AS turn ON turn."id" = owner."turnId" AND turn."sessionId" = owner."sessionId"
+          AND turn."userId" = session."userId" AND turn."rootTaskId" = owner."rootTaskId"
+        WHERE owner."id" = $2 AND owner."sessionId" = $1 AND owner."turnId" = $3 AND owner."rootTaskId" = $4
+          AND owner."status" = 'running' AND owner."parentTaskId" IS NOT NULL AND owner."leaseOwner" = $5
+          AND owner."attemptCount" = $6 AND owner."leaseExpiresAt" = $7 AND owner."interruptRequestedAt" IS NULL
+      ), claimRows AS MATERIALIZED (
+        SELECT proof.value, owner."id" AS "taskId", owner."sessionId", owner."turnId", owner."attemptCount",
+          callStep."id" AS "stepId", callStep."attempt", callStep."status" AS "stepStatus", callItem."id" AS "callItemId",
+          callItem."content" AS "callContent", callItem."status" AS "callStatus", callItem."revision" AS "callRevision", callItem."phase" AS "callPhase"
+        FROM proof CROSS JOIN owner
+        JOIN "agent_steps" AS callStep ON callStep."id" = proof.value->>'stepId' AND callStep."sessionId" = owner."sessionId"
+          AND callStep."turnId" = owner."turnId" AND callStep."taskId" = owner."id"
+        JOIN "agent_items" AS callItem ON callItem."id" = proof.value->>'callItemId' AND callItem."sessionId" = owner."sessionId"
+          AND callItem."turnId" = owner."turnId" AND callItem."taskId" = owner."id" AND callItem."stepId" = callStep."id"
+        WHERE proof.value->>'attempt' = callStep."attempt"::text
+          AND proof.value->>'rawCallId' = callItem."content"->>'toolCallId'
+      )
+      SELECT (SELECT LEAST(COUNT(*), 2)::int FROM owner) AS "ownerFenceCount",
+        (SELECT LEAST(COUNT(*), 2)::int FROM claimRows) AS "topLevelClaimRowCount",
+        EXISTS (SELECT 1 FROM claimRows AS claim
+          JOIN "agent_events" AS itemStarted ON itemStarted."sessionId" = claim."sessionId" AND itemStarted."turnId" = claim."turnId"
+            AND itemStarted."taskId" = claim."taskId" AND itemStarted."itemId" = claim."callItemId" AND itemStarted."type" = 'item.started'
+            AND itemStarted."actor" = 'subagent' AND itemStarted."correlationId" = claim."stepId"
+            AND itemStarted."idempotencyKey" = 'task:' || claim."taskId" || ':event:item-started:' || claim."callItemId"
+            AND itemStarted."payload" = jsonb_build_object('itemId', claim."callItemId", 'type', 'tool_call', 'phase', NULL)
+          JOIN "agent_events" AS started ON started."id" = claim."value"->>'startEventId' AND started."sessionId" = claim."sessionId"
+            AND started."turnId" = claim."turnId" AND started."taskId" = claim."taskId" AND started."itemId" = claim."callItemId"
+            AND started."type" = 'tool_call.started' AND started."actor" = 'subagent'
+            AND started."correlationId" = claim."callContent"->>'toolCallId'
+            AND started."causationId" = itemStarted."id" AND itemStarted."sequence" < started."sequence"
+            AND started."idempotencyKey" = 'task:' || claim."taskId" || ':event:child-wait-claim:' || claim."attempt"::text || ':' || claim."stepId"
+            AND started."payload" = jsonb_build_object('toolCallId', claim."callContent"->>'toolCallId', 'toolName', 'wait_subagents', 'taskId', claim."taskId")
+          WHERE EXISTS (SELECT 1 FROM "agent_events" AS prior WHERE prior."id" = itemStarted."causationId"
+            AND prior."sessionId" = itemStarted."sessionId" AND prior."turnId" = itemStarted."turnId"
+            AND prior."taskId" = itemStarted."taskId" AND prior."sequence" < itemStarted."sequence")) AS "claimStartLifecycle",
+        EXISTS (SELECT 1 FROM claimRows AS claim
+          JOIN "agent_wait_conditions" AS wait ON wait."id" = claim."value"->'sourceWait'->>'waitId'
+            AND wait."parentTaskId" = claim."taskId" AND wait."sessionId" = claim."sessionId" AND wait."turnId" = claim."turnId"
+          JOIN "agent_steps" AS source ON source."id" = wait."stepId" AND source."sessionId" = wait."sessionId"
+            AND source."turnId" = wait."turnId" AND source."taskId" = wait."parentTaskId"
+          WHERE source."attempt"::text = claim."value"->'sourceWait'->>'sourceAttempt'
+            AND claim."attempt" = claim."attemptCount" AND claim."stepStatus" = 'completed'
+            AND claim."stepId" = (SELECT nextStep."id" FROM "agent_steps" AS nextStep
+              WHERE nextStep."sessionId" = source."sessionId" AND nextStep."turnId" = source."turnId"
+                AND nextStep."taskId" = source."taskId" AND nextStep."attempt" = claim."attemptCount"
+                AND nextStep."ordinal" > source."ordinal" ORDER BY nextStep."ordinal", nextStep."id" LIMIT 1)) AS "claimStepFirstLater",
+        EXISTS (SELECT 1 FROM claimRows AS claim
+          JOIN "agent_wait_conditions" AS wait ON wait."id" = claim."value"->'sourceWait'->>'waitId'
+            AND wait."parentTaskId" = claim."taskId" AND wait."sessionId" = claim."sessionId" AND wait."turnId" = claim."turnId"
+          WHERE claim."callItemId" = 'task:' || claim."taskId" || ':item:tool-call:' || (claim."callContent"->>'toolCallId')
+              || ':attempt:' || claim."attempt"::text
+            AND claim."callStatus" = 'completed' AND claim."callRevision" = 1 AND claim."callPhase" IS NULL
+            AND claim."callContent"->>'toolName' = 'wait_subagents' AND claim."callContent"->>'toolVersion' = '1'
+            AND claim."callContent"->>'status' = 'completed' AND claim."callContent"->'errorCode' = 'null'::jsonb
+            AND (SELECT COUNT(*) FROM jsonb_object_keys(claim."callContent")) = 6
+            AND claim."callContent" ?& ARRAY['toolCallId', 'toolName', 'toolVersion', 'input', 'status', 'errorCode']
+            AND (SELECT COUNT(*) FROM jsonb_object_keys(claim."callContent"->'input')) = 4
+            AND claim."callContent"->'input' ?& ARRAY['idempotencyKey', 'taskIds', 'mode', 'timeoutMs']
+            AND claim."callContent"->'input'->'taskIds' = wait."targetTaskIds"
+            AND claim."callContent"->'input'->>'mode' = wait."mode"
+            AND claim."callContent"->'input'->'timeoutMs' = wait."result"->'request'->'timeoutMs') AS "claimCallShape",
+        EXISTS (SELECT 1 FROM claimRows AS claim
+          WHERE claim."value"->'sourceWait'->>'claimKeyDigest' ~ '^[0-9a-f]{64}$'
+            AND encode(sha256(convert_to(claim."callContent"->'input'->>'idempotencyKey', 'UTF8')), 'hex')
+              = claim."value"->'sourceWait'->>'claimKeyDigest') AS "claimKeyMatches",
+        (SELECT LEAST(COUNT(*), 2)::int FROM claimRows AS claim
+          JOIN "agent_items" AS candidate ON candidate."sessionId" = claim."sessionId" AND candidate."turnId" = claim."turnId"
+            AND candidate."taskId" = claim."taskId" AND candidate."type" = 'tool_call' AND candidate."content"->>'toolName' = 'wait_subagents'
+          JOIN "agent_steps" AS candidateStep ON candidateStep."id" = candidate."stepId" AND candidateStep."sessionId" = candidate."sessionId"
+            AND candidateStep."turnId" = candidate."turnId" AND candidateStep."taskId" = candidate."taskId"
+          WHERE candidateStep."attempt" = claim."attemptCount"
+            AND encode(sha256(convert_to(candidate."content"->'input'->>'idempotencyKey', 'UTF8')), 'hex')
+              = claim."value"->'sourceWait'->>'claimKeyDigest') AS "claimKeyCandidateCount"`,
+    [task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount,
+      task.leaseExpiresAt, task.userId, JSON.stringify(claimProjection)])
+    const row = result.rows[0]
+    if (!row) return { diagnosticStatus: "unavailable" }
+    const boundedCount = (value: unknown): number => typeof value === "number" && Number.isSafeInteger(value)
+      ? Math.min(2, Math.max(0, value)) : 0
+    const ownerFence = boundedCount(row.ownerFenceCount) === 1
+    const topLevelClaimRowCount = boundedCount(row.topLevelClaimRowCount)
+    const claimStartLifecycle = row.claimStartLifecycle === true
+    const claimStepFirstLater = row.claimStepFirstLater === true
+    const claimCallShape = row.claimCallShape === true
+    const claimKeyMatches = row.claimKeyMatches === true
+    const claimKeyCandidateCount = boundedCount(row.claimKeyCandidateCount)
+    const stage: HistoricalWaitBindingDiagnosticStage = !ownerFence ? "owner_fence"
+      : topLevelClaimRowCount !== 1 ? "claim_rows"
+        : !claimStartLifecycle ? "claim_start_lifecycle"
+          : !sourceProjectionBound || !nestedSourceMatches ? "nested_source_binding"
+            : !sourceClaimSeparated ? "source_claim_separation"
+              : !claimStepFirstLater ? "claim_step_binding"
+                : !claimCallShape ? "claim_call_shape"
+                  : !claimKeyMatches || claimKeyCandidateCount !== 1 ? "claim_key_binding"
+                    : !claimResultChainPresent ? "claim_result_chain" : "other_final_guard"
+    return { diagnosticStatus: "evaluated", stage, ownerFence, sourceProjectionBound, nestedSourceMatches, sourceClaimSeparated,
+      topLevelClaimRowCount, claimStartLifecycle, claimStepFirstLater, claimCallShape, claimKeyMatches, claimKeyCandidateCount,
+      claimResultChainPresent, stepChainEventCount, stepChainCallCount }
+  } catch { return { diagnosticStatus: "unavailable" } }
+}
+
 async function expectAbsentSourceResultClaimSafety(pool: Pool, ids: FixtureIds, continuationStepId: string): Promise<void> {
   const client = await pool.connect()
   try {
@@ -2741,20 +2895,9 @@ async function expectCompletedClaimBeforeItemEventSafety(
         terminalCausation, terminalKey, JSON.stringify(payload), callId,
       ])
     }
-    const allowsSettlement = async (label: string, mutate: () => Promise<void>): Promise<void> => {
-      const name = `claim_terminal_positive_${savepoint++}`
-      await client.query(`SAVEPOINT ${name}`)
-      try {
-        await mutate()
-        expect(await blocking(task), label).toBe(false)
-      } finally {
-        await client.query(`ROLLBACK TO SAVEPOINT ${name}`)
-        await client.query(`RELEASE SAVEPOINT ${name}`)
-      }
-    }
-    await allowsSettlement("exact child claim recovery lifecycle settles its start", () =>
+    await remainsBlocked("completed child claim without a durable result pair and step closure remains blocking", () =>
       insertSettledLifecycle("completed"))
-    await allowsSettlement("exact failed child claim lifecycle settles its start", () =>
+    await remainsBlocked("failed child claim without a durable result pair and step closure remains blocking", () =>
       insertSettledLifecycle("failed"))
     await remainsBlocked("terminal with correct provider call ID but wrong item ID", () =>
       insertSettledLifecycle("completed", "item_id"))
@@ -5629,8 +5772,12 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         if (!secondClaimProjection) throw new Error("two_historical_wait_second_claim_projection_missing")
         await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, secondSourceProjection),
           "real PG binding accepts source identity from its top-level and nested sourceWait fields").resolves.toBe(true)
-        await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, secondClaimProjection),
-          "real PG binding accepts a claim top-level identity while separately binding its nested sourceWait").resolves.toBe(true)
+        const secondClaimBindingAccepted = await historicalWaitBindingAccepts(checkClient, scopedOwner, secondClaimProjection)
+        const secondClaimBindingDiagnostic = secondClaimBindingAccepted ? undefined
+          : await diagnoseHistoricalWaitBinding(checkClient, scopedOwner, secondClaimProjection, secondSourceProjection)
+        await expect(Promise.resolve(secondClaimBindingAccepted),
+          `real PG binding accepts a claim top-level identity while separately binding its nested sourceWait${secondClaimBindingDiagnostic
+            ? `; bounded diagnostic=${JSON.stringify(secondClaimBindingDiagnostic)}` : ""}`).resolves.toBe(true)
         await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, { ...secondSourceProjection,
           callItemId: secondClaimProjection.callItemId, rawCallId: secondClaimProjection.rawCallId,
           projectedCallId: secondClaimProjection.projectedCallId }),

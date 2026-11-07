@@ -3,11 +3,13 @@ import { describe, expect, it } from "vitest"
 import { buildCognitiveActionAgenda } from "../turns/cognitive-action-agenda.js"
 import { buildCognitiveAgendaReceipt, cognitiveAgendaReceiptIdempotencyKey } from "../turns/cognitive-agenda-receipt.js"
 import type { StepContext } from "../context/step-context-builder.js"
+import { markCanonicalSubagentWaitTargetIds, safeSubagentWaitJson } from "./subagent-wait-structural-ids.js"
 import { readCanonicalHistoricalSourceStepContinuationPrefix } from "./pg-store-expiry-historical-source-step-continuation-prefix.js"
 
 const task = { id: "task-1", sessionId: "session-1", turnId: "turn-1", rootTaskId: "root-1", userId: "user-1",
   leaseOwner: "lease-1", attemptCount: 2, leaseExpiresAt: new Date("2026-11-07T00:00:00.000Z") }
-const sourceStepId = "task:task-1:step:0:attempt:1", sourceCallId = "source-call", sourceCallItemId = "source-item"
+const sourceStepId = "task:task-1:step:0:attempt:1", sourceCallId = "source-call"
+const sourceCallItemId = `task:${task.id}:item:tool-call:${sourceCallId}:attempt:1`
 const callInput = { idempotencyKey: "source-key", taskIds: ["child-1"], mode: "any", timeoutMs: 30_000 }
 const continuationStepId = "task:task-1:step:1:attempt:2", continuationCallId = "claim-call"
 const continuationItemId = `task:${task.id}:item:tool-call:${continuationCallId}:attempt:2`
@@ -16,7 +18,15 @@ type Event = Record<string, unknown> & { id: string; sequence: string; type: str
 type TerminalRow = { id: string; sessionId: string; turnId: string; taskId: string; sequence: string; type: string;
   correlationId: string; itemId: string | null; idempotencyKey: string }
 
-function fixture() {
+function digest(value: unknown): string { return createHash("sha256").update(JSON.stringify(value)).digest("hex") }
+function safeInput(value: Record<string, unknown>) {
+  const ids = value.taskIds as string[], markerOutcome = { taskIds: ids, matchedTaskIds: [] as string[], tasks: ids.map(taskId => ({ taskId })) }
+  if (!markCanonicalSubagentWaitTargetIds({ targetTaskIds: ids }, markerOutcome, ids)) throw new Error("fixture_wait_ids_invalid")
+  return safeSubagentWaitJson(value, 8_192)
+}
+
+function fixture(options: { sourceInput?: Record<string, unknown>; continuationInput?: unknown } = {}) {
+  const sourceInput = options.sourceInput ?? callInput, continuationInput = options.continuationInput ?? sourceInput
   const events: Event[] = []
   let sequence = 0, previous: string | null = null
   const add = (type: string, key: string, correlationId: string, itemId: string | null, payload: unknown, cause: string | null = previous): Event => {
@@ -47,7 +57,12 @@ function fixture() {
     { taskId: task.id, provider: "fixture", model: "test-model", toolCallCount: 2 }, modelStarted.id)
   const usage = add("model.usage", `model-usage:${continuationStepId}`, continuationStepId, null,
     { taskId: task.id, provider: "fixture", model: "test-model", usage: { inputTokens: 1, outputTokens: 1, estimatedCostUsd: 0 } }, modelCompleted.id)
-  const itemContent = { toolCallId: continuationCallId, toolName: "wait_subagents", toolVersion: "1", input: callInput }
+  const sourceContent = { toolCallId: sourceCallId, toolName: "wait_subagents", toolVersion: "1", input: sourceInput,
+    status: "completed", errorCode: null }
+  const sourceItem = { id: sourceCallItemId, sessionId: task.sessionId, turnId: task.turnId, taskId: task.id, stepId: sourceStepId,
+    type: "tool_call", status: "completed", revision: 1, phase: null, content: sourceContent,
+    contentDigest: digest(sourceContent), sourceInputDigest: digest(sourceInput) }
+  const itemContent = { toolCallId: continuationCallId, toolName: "wait_subagents", toolVersion: "1", input: continuationInput }
   const itemStarted = add("item.started", `item-started:${continuationItemId}`, continuationStepId, continuationItemId,
     { itemId: continuationItemId, type: "tool_call", phase: null }, usage.id)
   const callStarted = add("tool_call.started", `child-wait-claim:2:${continuationStepId}`, continuationCallId, continuationItemId,
@@ -56,10 +71,11 @@ function fixture() {
     correlationId: "source-result", causationId: null, idempotencyKey: `task:${task.id}:event:tool-result-completed:source-call:source-result:1`,
     payload: {}, payloadDigest: "c".repeat(64) }
   const item: { id: string; sessionId: string; turnId: string; taskId: string; stepId: string; type: string; status: string;
-    revision: number; phase: null; content: Record<string, unknown>; contentDigest: string } = {
+    revision: number; phase: null; content: Record<string, unknown>; contentDigest: string; inputDigest: string } = {
     id: continuationItemId, sessionId: task.sessionId, turnId: task.turnId, taskId: task.id, stepId: continuationStepId,
     type: "tool_call", status: "started", revision: 0, phase: null, content: itemContent,
-    contentDigest: createHash("sha256").update(JSON.stringify(itemContent)).digest("hex") }
+    contentDigest: digest(itemContent), inputDigest: digest(continuationInput) }
+  const sourceRows = [sourceItem]
   const itemRows = [item], terminalRows: TerminalRow[] = []
   const windowEvents = [sourceStart, started, agendaEvent, modelStarted, modelCompleted, usage, itemStarted, callStarted, sourceEnd]
   windowEvents.forEach((event, index) => { event.sequence = String(index + 2) })
@@ -68,7 +84,8 @@ function fixture() {
       sourceStatus: "waiting_for_tool", stepId: continuationStepId, ordinal: 1, attempt: 2, stepStatus: "streaming",
       sourceSessionId: task.sessionId, sourceTurnId: task.turnId, sourceTaskId: task.id,
       sessionId: task.sessionId, turnId: task.turnId, taskId: task.id }] }
-    if (sql.includes('FROM "agent_items"')) return { rows: itemRows }
+    if (sql.includes('FROM "agent_items" AS sourceCall')) return { rows: sourceRows }
+    if (sql.includes('FROM "agent_items" AS continuationItem')) return { rows: itemRows }
     if (sql.includes("parent.\"idempotencyKey\" = $4")) return { rows: parentRows.filter(event => event.sessionId === task.sessionId
       && event.turnId === task.turnId && event.taskId === task.id && event.idempotencyKey === `task:${task.id}:event:turn-started`) }
     if (sql.includes("'step.completed'")) {
@@ -83,7 +100,8 @@ function fixture() {
     }
     return { rows: [] }
   } } as never
-  return { client, windowEvents, item, itemRows, terminalRows, itemContent, parent, parentRows, started, agendaEvent, modelStarted, modelCompleted, usage, itemStarted, callStarted }
+  return { client, windowEvents, item, itemRows, sourceItem, sourceRows, sourceInput, terminalRows, itemContent, parent, parentRows,
+    started, agendaEvent, modelStarted, modelCompleted, usage, itemStarted, callStarted }
 }
 
 function terminalRow(patch: Partial<TerminalRow> = {}): TerminalRow {
@@ -95,11 +113,12 @@ function persistCompletedItemBeforeEvent(value: ReturnType<typeof fixture>, patc
   value.item.status = "completed"
   value.item.revision = 1
   value.item.content = { ...value.itemContent, status: "completed", errorCode: null, ...patch }
-  value.item.contentDigest = createHash("sha256").update(JSON.stringify(value.item.content)).digest("hex")
+  value.item.contentDigest = digest(value.item.content)
+  value.item.inputDigest = digest(value.item.content.input)
 }
 
 function input(value: ReturnType<typeof fixture>) {
-  return { sourceStepId, sourceAttempt: 1, sourceCallItemId, sourceCallId, sourceCallInput: callInput,
+  return { sourceStepId, sourceAttempt: 1, sourceCallItemId, sourceCallId, sourceCallInput: value.sourceInput,
     windowEvents: value.windowEvents as never, windowStartEventId: "source-start", windowEndEventId: "source-end" }
 }
 
@@ -113,6 +132,27 @@ describe("historical source step continuation prefix", () => {
     expect(proof?.events.map(event => event.type)).toEqual([
       "step.started", "cognitive.agenda", "model.started", "model.completed", "model.usage", "item.started", "tool_call.started",
     ])
+  })
+
+  it("proves the exact safe projection of a sensitive source key without exposing the raw value", async () => {
+    const rawInput = { ...callInput, idempotencyKey: "api_key=fixture-secret-value" }
+    const value = fixture({ sourceInput: rawInput, continuationInput: safeInput(rawInput) })
+    const proof = await readCanonicalHistoricalSourceStepContinuationPrefix(value.client, task, input(value))
+    expect(proof).toMatchObject({ sourceCallContentDigest: value.sourceItem.contentDigest,
+      sourceInputDigest: value.sourceItem.sourceInputDigest, redactedInputDigest: value.item.inputDigest })
+    expect(JSON.stringify(proof)).not.toContain(rawInput.idempotencyKey)
+  })
+
+  it.each([
+    ["a changed redacted key", (raw: Record<string, unknown>) => ({ ...safeInput(raw) as object, idempotencyKey: "api_key=[REDACTED]-changed" })],
+    ["changed target IDs", (raw: Record<string, unknown>) => ({ ...safeInput(raw) as object, taskIds: ["other-child"] })],
+    ["a changed mode", (raw: Record<string, unknown>) => ({ ...safeInput(raw) as object, mode: "all" })],
+    ["a changed timeout", (raw: Record<string, unknown>) => ({ ...safeInput(raw) as object, timeoutMs: 29_999 })],
+    ["the unredacted source key", (raw: Record<string, unknown>) => raw],
+  ])("rejects %s for a redacted source input", async (_label, continuationInput) => {
+    const rawInput = { ...callInput, idempotencyKey: "api_key=fixture-secret-value" }
+    const value = fixture({ sourceInput: rawInput, continuationInput: continuationInput(rawInput) })
+    await expect(readCanonicalHistoricalSourceStepContinuationPrefix(value.client, task, input(value))).resolves.toBeNull()
   })
 
   it("accepts the exact completed-item-before-event crash cut", async () => {

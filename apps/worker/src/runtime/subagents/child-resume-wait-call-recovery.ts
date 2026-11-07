@@ -4,8 +4,10 @@ import { canonicalJson } from "@jobcopilot/shared"
 import { projectWaitCallCompletionPayload } from "../turns/turn-execution-wait-event-projection.js"
 import { childWaitClaimEventKey, isExactChildWaitInput, type ChildWaitCallRecovery, type ChildWaitClaimRecovery, type ChildWaitOrphanRecovery } from "./child-durable-wait-replay.js"
 import { childWaitRecoveryCausallyAfter, childWaitRecoveryEventKey, childWaitRecoveryEventSequence, childWaitRecoveryLogicalStepOrdinal,
-  childWaitRecoveryValidEvent, parseChildWaitModelUsageReceipt, parseChildWaitModelUsage, type ChildWaitModelReceipt } from "./child-resume-wait-call-contract.js"
+  childWaitRecoveryNextLogicalStepId, childWaitRecoveryValidEvent, childWaitRecoveryValidNextStepStarted,
+  childWaitRecoveryProofContainsRows, parseChildWaitModelUsageReceipt, parseChildWaitModelUsage, type ChildWaitModelReceipt } from "./child-resume-wait-call-contract.js"
 import { childWaitPgCost, childWaitStoredCostMatchesReceipt } from "./child-resume-wait-cost.js"
+import { MAX_STEP_CHAIN_EVENTS, MAX_STEP_TOOL_CALLS, readCanonicalWaitStepToolChain } from "./pg-store-expiry-step-tool-chain-proof.js"
 import type { DurableWaitResume } from "./child-resume-observations.js"
 import type { SubagentLease } from "./types.js"
 
@@ -141,6 +143,8 @@ export async function loadChildWaitCallRecovery(
 ): Promise<ChildWaitCallRecoveryState | undefined> {
   const stepId = wait.continuationStepId, ordinal = wait.continuationOrdinal
   if (wait.attempt !== lease.attemptCount || !stepId || !Number.isSafeInteger(ordinal)) return undefined
+  const turnId = lease.turnId
+  if (turnId === null) throw new Error("child_resume_wait_tool_call_conflict")
   const claimKey = childWaitRecoveryEventKey(lease, childWaitClaimEventKey(wait.attempt, stepId))
   const steps = (await client.query<Row>(`SELECT step."id", step."status", step."attempt", step."ordinal", step."inputTokens", step."outputTokens", step."estimatedCostUsd"
     FROM "agent_steps" AS step WHERE step."id" = $1 AND step."sessionId" = $2 AND step."turnId" = $3 AND step."taskId" = $4 FOR SHARE` ,
@@ -152,25 +156,25 @@ export async function loadChildWaitCallRecovery(
   const calls = (await client.query<Row>(`SELECT item."id", item."status", item."revision", item."content", item."stepId", step."attempt", step."ordinal"
     FROM "agent_items" AS item JOIN "agent_steps" AS step ON step."id" = item."stepId" AND step."sessionId" = item."sessionId" AND step."turnId" = item."turnId" AND step."taskId" = item."taskId"
     WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3 AND item."stepId" = $4 AND item."type" = 'tool_call'
-      AND step."attempt" = $5 AND step."ordinal" = $6 ORDER BY item."id" LIMIT 3 FOR SHARE OF item, step`,
+      AND step."attempt" = $5 AND step."ordinal" = $6 ORDER BY item."id" LIMIT ${MAX_STEP_TOOL_CALLS + 1} FOR SHARE OF item, step`,
   [lease.sessionId, lease.turnId, lease.id, stepId, wait.attempt, ordinal])).rows
-  if (calls.length > 1) throw new Error("child_resume_wait_tool_call_conflict")
+  if (calls.length > MAX_STEP_TOOL_CALLS) throw new Error("child_resume_wait_tool_call_conflict")
   const ids = calls.map(callIdOf), callItemIds = ids.map(id => itemId(lease, "call", id)), resultItemIds = ids.map(id => itemId(lease, "result", id))
   const results = ids.length ? (await client.query<Row>(`SELECT item."id", item."status", item."revision", item."content", item."stepId"
     FROM "agent_items" AS item WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3 AND item."stepId" = $4
-      AND item."type" = 'tool_result' AND item."content"->>'toolCallId' = ANY($5::text[]) ORDER BY item."id" LIMIT 3 FOR SHARE`,
+      AND item."type" = 'tool_result' AND item."content"->>'toolCallId' = ANY($5::text[]) ORDER BY item."id" LIMIT ${MAX_STEP_TOOL_CALLS + 1} FOR SHARE`,
   [lease.sessionId, lease.turnId, lease.id, stepId, ids])).rows : []
   const modelKeys = ["model-started", "model-completed", "model-usage"].map(key => childWaitRecoveryEventKey(lease, `${key}:${stepId}`))
   const stepCompleteKey = childWaitRecoveryEventKey(lease, `step-completed:${stepId}`)
+  const association = (alias: string) => `${alias}."idempotencyKey" = ANY($4::text[]) OR ${alias}."itemId" = ANY($5::text[])
+    OR ${alias}."correlationId" = ANY($6::text[]) OR ${alias}."correlationId" = $7
+    OR ${alias}."itemId" IN (SELECT item."id" FROM "agent_items" AS item WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3 AND item."stepId" = $7)
+    OR ${alias}."correlationId" IN (SELECT item."id" FROM "agent_items" AS item WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3 AND item."stepId" = $7)`
   const events = (await client.query<Row>(`SELECT event."id", event."sequence", event."sessionId", event."turnId", event."taskId", event."itemId", event."type", event."actor", event."correlationId", event."causationId", event."idempotencyKey", event."payload"
     FROM "agent_events" AS event WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."taskId" = $3
-      AND (event."idempotencyKey" = ANY($4::text[]) OR event."itemId" = ANY($5::text[])
-        OR event."correlationId" = ANY($6::text[]) OR event."correlationId" = $7
-        OR event."itemId" IN (SELECT item."id" FROM "agent_items" AS item WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3 AND item."stepId" = $7)
-        OR event."correlationId" IN (SELECT item."id" FROM "agent_items" AS item WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3 AND item."stepId" = $7))
-    ORDER BY event."sequence" LIMIT 64`, [lease.sessionId, lease.turnId, lease.id,
-    [claimKey, ...modelKeys, stepCompleteKey], [...callItemIds, ...resultItemIds], ids, stepId])).rows
-  if (events.length >= 64) throw new Error("child_resume_wait_tool_call_conflict")
+      AND (${association("event")}) ORDER BY event."sequence" LIMIT ${MAX_STEP_CHAIN_EVENTS + 1}`,
+  [lease.sessionId, lease.turnId, lease.id, [claimKey, ...modelKeys, stepCompleteKey], [...callItemIds, ...resultItemIds], ids, stepId])).rows
+  if (events.length > MAX_STEP_CHAIN_EVENTS) throw new Error("child_resume_wait_tool_call_conflict")
   const claims = events.filter(event => event.idempotencyKey === claimKey)
   if (claims.length > 1) throw new Error("child_resume_wait_tool_call_conflict")
   const hasModelEvidence = events.some(event => ["model.started", "model.completed", "model.usage"].includes(String(event.type))
@@ -180,7 +184,45 @@ export async function loadChildWaitCallRecovery(
     if (hasModelEvidence || stepCompletions.length > 0) throw new Error("child_resume_wait_tool_call_conflict")
     return undefined
   }
-  const model = parseChildWaitModelUsageReceipt(events, lease, stepId)
+  const claimedId = claims.length === 1 ? object(claims[0]!.payload)?.toolCallId : undefined
+  const claimedRows = calls.filter((row, index) => ids[index] === claimedId)
+  if (calls.length > 1) {
+    if (step.status !== "completed" || claims.length !== 1 || typeof claimedId !== "string" || claimedRows.length !== 1) {
+      throw new Error("child_resume_wait_tool_call_conflict")
+    }
+    const claimedCall = claimedRows[0]!
+    const proof = await readCanonicalWaitStepToolChain(client as pg.PoolClient,
+      { id: lease.id, sessionId: lease.sessionId, turnId },
+      { stepId, attempt: wait.attempt, callItemId: String(claimedCall.id), callId: claimedId,
+        resultItemId: itemId(lease, "result", claimedId) })
+    if (!proof || proof.calls.length !== calls.length) throw new Error("child_resume_wait_tool_call_conflict")
+    const causalParents = proof.events.filter(event => event.id !== proof.stepCompletedEventId).map(event => event.id)
+    if (causalParents.length > MAX_STEP_CHAIN_EVENTS) throw new Error("child_resume_wait_tool_call_conflict")
+    const causalChildren = (await client.query<Row>(`SELECT event."id", event."sequence", event."sessionId", event."turnId", event."taskId", event."itemId", event."type", event."actor", event."correlationId", event."causationId", event."idempotencyKey", event."payload"
+      FROM "agent_events" AS event WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."taskId" = $3
+        AND event."causationId" = ANY($4::text[]) ORDER BY event."sequence" LIMIT ${MAX_STEP_CHAIN_EVENTS + 1}`,
+    [lease.sessionId, turnId, lease.id, causalParents])).rows
+    if (causalChildren.length > MAX_STEP_CHAIN_EVENTS || !childWaitRecoveryProofContainsRows(proof.events, [...events, ...causalChildren])) {
+      throw new Error("child_resume_wait_tool_call_conflict")
+    }
+    const terminalRows = events.filter(event => event.id === proof.stepCompletedEventId); if (terminalRows.length !== 1) throw new Error("child_resume_wait_tool_call_conflict"); const terminalEvent = terminalRows[0]!
+    const terminalChildren = (await client.query<Row>(`SELECT event."id", event."sequence", event."sessionId", event."turnId", event."taskId", event."itemId", event."type", event."actor", event."correlationId", event."causationId", event."idempotencyKey", event."payload"
+      FROM "agent_events" AS event WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."causationId" = $3 LIMIT 2 FOR SHARE OF event`,
+    [lease.sessionId, turnId, proof.stepCompletedEventId])).rows
+    // Two rows are enough to prove the terminal parent has an unexpected extra child; never accept a truncated set.
+    if (terminalChildren.length > 1) throw new Error("child_resume_wait_tool_call_conflict")
+    if (terminalChildren.length === 1) {
+      const successorId = childWaitRecoveryNextLogicalStepId(stepId, lease)
+      if (!successorId) throw new Error("child_resume_wait_tool_call_conflict")
+      const successorRows = (await client.query<Row>(`SELECT step."id", step."sessionId", step."turnId", step."taskId", step."attempt", step."ordinal", step."status"
+        FROM "agent_steps" AS step WHERE step."id" = $1 AND step."sessionId" = $2 AND step."turnId" = $3 AND step."taskId" = $4 AND step."attempt" = $5 FOR SHARE OF step`,
+      [successorId, lease.sessionId, turnId, lease.id, wait.attempt])).rows
+      if (successorRows.length !== 1 || !childWaitRecoveryValidNextStepStarted(
+        terminalChildren[0]!, lease, terminalEvent, stepId, step, successorRows[0]!,
+      )) throw new Error("child_resume_wait_tool_call_conflict")
+    }
+  }
+  const model = parseChildWaitModelUsageReceipt(events, lease, stepId, calls.length)
   if (childWaitPgCost(model.usage.estimatedCostUsd) === undefined) throw new Error("child_resume_wait_tool_call_conflict")
   const storedUsage = parseChildWaitModelUsage({ inputTokens: Number(step.inputTokens), outputTokens: Number(step.outputTokens),
     estimatedCostUsd: Number(step.estimatedCostUsd) })
@@ -189,22 +231,19 @@ export async function loadChildWaitCallRecovery(
       || !childWaitStoredCostMatchesReceipt(storedUsage.estimatedCostUsd, model.usage.estimatedCostUsd))) {
     throw new Error("child_resume_wait_tool_call_conflict")
   }
-  const claimedId = claims.length === 1 ? object(claims[0]!.payload)?.toolCallId : undefined
-  const claimedRows = calls.filter((row, index) => ids[index] === claimedId)
   if (claims.length === 1 && (typeof claimedId !== "string" || claimedRows.length !== 1)) throw new Error("child_resume_wait_tool_call_conflict")
-  if (calls.length !== 1) throw new Error("child_resume_wait_tool_call_conflict")
   const orphanCallIds: string[] = []
-  for (let index = 0; index < calls.length; index += 1) {
-    if (claimedId === ids[index]) continue
-    const callResults = results.filter(result => object(result.content)?.toolCallId === ids[index])
-    const orphan = validOrphan(calls[index]!, ids[index]!, wait, lease, callResults, events, step, model, stepOrdinal)
+  if (calls.length === 1 && claimedId !== ids[0]) {
+    const callResults = results.filter(result => object(result.content)?.toolCallId === ids[0])
+    const orphan = validOrphan(calls[0]!, ids[0]!, wait, lease, callResults, events, step, model, stepOrdinal)
     if (!orphan || stepCompletions.length > 0) throw new Error("child_resume_wait_tool_call_conflict")
-    orphanCallIds.push(ids[index]!)
+    orphanCallIds.push(ids[0]!)
     if (claims.length === 0) {
-      if (calls.length !== 1 || orphanCallIds.length !== 1) throw new Error("child_resume_wait_tool_call_conflict")
       return { orphan, orphanCallIds }
     }
+    throw new Error("child_resume_wait_tool_call_conflict")
   }
+  if (calls.length > 1 && claimedRows.length !== 1) throw new Error("child_resume_wait_tool_call_conflict")
   const claimed = claimedRows[0]!, callId = claimedId as string
   const claim = recoverClaim(claimed, claims[0]!, callId, wait, lease, results.filter(result => object(result.content)?.toolCallId === callId), events, step, model, stepOrdinal)
   return { claim, orphanCallIds }

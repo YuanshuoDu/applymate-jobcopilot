@@ -33,6 +33,18 @@ export function childWaitRecoveryValidEvent(row: ChildWaitRecoveryRow, lease: Su
   } catch { return false }
 }
 
+type StepProofEvent = Readonly<{ id: string; sequence: string; type: string; actor: string; itemId: string | null;
+  correlationId: string; causationId: string | null; idempotencyKey: string }>
+export function childWaitRecoveryProofContainsRows(proofEvents: readonly StepProofEvent[], rows: readonly ChildWaitRecoveryRow[]): boolean {
+  const byId = new Map(proofEvents.map(event => [event.id, event]))
+  return byId.size === proofEvents.length && rows.every(row => {
+    const event = typeof row.id === "string" ? byId.get(row.id) : undefined
+    return !!event && row.sequence === event.sequence && row.type === event.type && row.actor === event.actor
+      && row.itemId === event.itemId && row.correlationId === event.correlationId && row.causationId === event.causationId
+      && row.idempotencyKey === event.idempotencyKey
+  })
+}
+
 export function childWaitRecoveryCausallyAfter(row: ChildWaitRecoveryRow, ancestorId: string, events: readonly ChildWaitRecoveryRow[]): boolean {
   let cause = row.causationId
   for (let depth = 0; depth < 32 && typeof cause === "string"; depth += 1) {
@@ -49,6 +61,34 @@ export function childWaitRecoveryLogicalStepOrdinal(stepId: string, lease: Subag
   if (!/^(0|[1-9][0-9]*)$/.test(raw)) return undefined
   const ordinal = Number(raw)
   return Number.isSafeInteger(ordinal) ? ordinal : undefined
+}
+
+export function childWaitRecoveryNextLogicalStepId(stepId: string, lease: SubagentLease): string | undefined {
+  const ordinal = childWaitRecoveryLogicalStepOrdinal(stepId, lease)
+  if (ordinal === undefined || ordinal >= Number.MAX_SAFE_INTEGER) return undefined
+  return `task:${lease.id}:step:${ordinal + 1}:attempt:${lease.attemptCount}`
+}
+
+export function childWaitRecoveryValidNextStepStarted(
+  event: ChildWaitRecoveryRow, lease: SubagentLease, terminal: ChildWaitRecoveryRow, sourceStepId: string,
+  sourceStep: ChildWaitRecoveryRow, step: ChildWaitRecoveryRow,
+): boolean {
+  const stepId = childWaitRecoveryNextLogicalStepId(sourceStepId, lease)
+  const ordinal = step.ordinal, sourceOrdinal = sourceStep.ordinal
+  const terminalSequence = childWaitRecoveryEventSequence(terminal), eventSequence = childWaitRecoveryEventSequence(event)
+  if (!stepId || lease.turnId === null || step.id !== stepId || step.sessionId !== lease.sessionId || step.turnId !== lease.turnId
+    || step.taskId !== lease.id || step.attempt !== lease.attemptCount || typeof ordinal !== "number" || typeof sourceOrdinal !== "number"
+    || !Number.isSafeInteger(ordinal) || ordinal < 0 || !Number.isSafeInteger(sourceOrdinal) || sourceOrdinal < 0 || ordinal <= sourceOrdinal
+    || !["streaming", "completed", "failed", "interrupted",
+      "waiting_for_tool", "waiting_for_approval", "waiting_for_user"].includes(String(step.status))
+    || sourceStep.id !== sourceStepId || sourceStep.attempt !== lease.attemptCount || typeof terminal.id !== "string" || !terminal.id.trim()
+    || terminal.type !== "step.completed" || terminal.actor !== "subagent" || terminal.itemId !== null
+    || terminal.correlationId !== sourceStepId || terminal.idempotencyKey !== childWaitRecoveryEventKey(lease, `step-completed:${sourceStepId}`)
+    || terminalSequence === undefined || eventSequence === undefined || eventSequence <= terminalSequence) return false
+  return childWaitRecoveryValidEvent(event, lease, {
+    type: "step.started", itemId: null, correlationId: stepId, causationId: terminal.id,
+    idempotencyKey: childWaitRecoveryEventKey(lease, `step-started:${stepId}`),
+  }, { stepId, ordinal, taskId: lease.id })
 }
 
 export function childWaitResumeCursorIsValid(
@@ -121,8 +161,11 @@ export function parseChildWaitModelUsage(value: unknown): ChildWaitModelUsage | 
 }
 
 export function parseChildWaitModelUsageReceipt(
-  events: readonly ChildWaitRecoveryRow[], lease: SubagentLease, stepId: string,
+  events: readonly ChildWaitRecoveryRow[], lease: SubagentLease, stepId: string, expectedToolCallCount = 1,
 ): ChildWaitModelReceipt {
+  if (!Number.isSafeInteger(expectedToolCallCount) || expectedToolCallCount < 1 || expectedToolCallCount > 32) {
+    throw new Error("child_resume_wait_tool_call_conflict")
+  }
   const keys = ["model-started", "model-completed", "model-usage"].map(key => childWaitRecoveryEventKey(lease, `${key}:${stepId}`))
   const rows = events.filter(event => String(event.type).startsWith("model.") || keys.includes(String(event.idempotencyKey)))
   const ofType = (type: string, key: string) => rows.filter(event => event.type === type || event.idempotencyKey === key)
@@ -138,7 +181,7 @@ export function parseChildWaitModelUsageReceipt(
   const sequence = [started, completed, used].map(childWaitRecoveryEventSequence)
   if (!startPayload || !childWaitRecoveryExactKeys(startPayload, ["taskId", "provider", "model"]) || startPayload.taskId !== lease.id
     || !completedReceipt || !childWaitRecoveryExactKeys(completedPayload ?? {}, ["taskId", "provider", "model", "toolCallCount"])
-    || completedReceipt.taskId !== lease.id || completedReceipt.toolCallCount !== 1
+    || completedReceipt.taskId !== lease.id || completedReceipt.toolCallCount !== expectedToolCallCount
     || !usagePayload || !childWaitRecoveryExactKeys(usagePayload, ["taskId", "provider", "model", "usage"]) || usagePayload.taskId !== lease.id
     || !modelUsage || !base(started, "model.started", keys[0]!, startPayload)
     || !base(completed, "model.completed", keys[1]!, completedPayload) || !base(used, "model.usage", keys[2]!, usagePayload)

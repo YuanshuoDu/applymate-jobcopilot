@@ -32,3 +32,16 @@ export function historicalSourceStepWindowUnionBinding(path: string): string {
     AND ${noOverlap} AND ${noUnknown}
   ELSE ${allWindowCount} = jsonb_array_length(${source}) AND ${noUnknown} END`
 }
+
+/** Rechecks reader-bound source and sanitized continuation input digests under the locked owner scope. */
+export function historicalSourceStepContinuationInputBinding(path: string): string {
+  const continuation = `(${path}->'continuationPrefix')`
+  const sourceContent = `${continuation}->>'sourceCallContentDigest'`
+  const sourceInput = `${continuation}->>'sourceInputDigest'`
+  const redactedInput = `${continuation}->>'redactedInputDigest'`
+  return `(${sourceContent} ~ '^[0-9a-f]{64}$' AND ${sourceInput} ~ '^[0-9a-f]{64}$'
+    AND ${redactedInput} ~ '^[0-9a-f]{64}$'
+    AND encode(sha256(convert_to(boundSourceCall."content"::text,'UTF8')),'hex') = ${sourceContent}
+    AND encode(sha256(convert_to((boundSourceCall."content"->'input')::text,'UTF8')),'hex') = ${sourceInput}
+    AND encode(sha256(convert_to((continuationItem."content"->'input')::text,'UTF8')),'hex') = ${redactedInput})`
+}

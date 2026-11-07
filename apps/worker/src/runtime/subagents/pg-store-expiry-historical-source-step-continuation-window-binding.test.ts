@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { historicalSourceStepWindowUnionBinding } from "./pg-store-expiry-historical-source-step-continuation-window-binding.js"
+import { historicalSourceStepContinuationInputBinding, historicalSourceStepWindowUnionBinding } from "./pg-store-expiry-historical-source-step-continuation-window-binding.js"
 
 const path = "proof.value->'sourceStepPrefix'"
 function balance(sql: string): number {
@@ -25,5 +25,16 @@ describe("historical source continuation window SQL", () => {
     expect(sql).toContain("USING (sequence)")
     expect(sql).toContain(`outsideProof."id" = ANY`)
     expect(sql).not.toContain(`sequence"::text BETWEEN`)
+  })
+
+  it("rechecks both source raw and continuation sanitized input digests in scope", () => {
+    const sql = historicalSourceStepContinuationInputBinding(path)
+    expect(sql).toContain("sourceCallContentDigest")
+    expect(sql).toContain("sourceInputDigest")
+    expect(sql).toContain("redactedInputDigest")
+    expect(sql).toContain('boundSourceCall."content"::text')
+    expect(sql).toContain('(boundSourceCall."content"->\'input\')::text')
+    expect(sql).toContain('(continuationItem."content"->\'input\')::text')
+    expect(sql).toContain("^[0-9a-f]{64}$")
   })
 })

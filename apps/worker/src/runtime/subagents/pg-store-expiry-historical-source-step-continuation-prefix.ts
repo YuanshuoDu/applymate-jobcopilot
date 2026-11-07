@@ -1,6 +1,7 @@
 import type pg from "pg"
 import { canonicalJson } from "@jobcopilot/shared"
 import { cognitiveAgendaReceiptIdempotencyKey, parseCognitiveAgendaReceipt } from "../turns/cognitive-agenda-receipt.js"
+import { markCanonicalSubagentWaitTargetIds, safeSubagentWaitJson } from "./subagent-wait-structural-ids.js"
 import { exactKeys, record, MAX_STEP_TOOL_CALLS } from "./pg-store-expiry-step-tool-chain-proof.js"
 
 type Scope = Readonly<{ id: string; sessionId: string; turnId: string; rootTaskId?: string; userId?: string;
@@ -14,7 +15,8 @@ export type HistoricalContinuationEvent = Readonly<Pick<Event, "id" | "sequence"
 export type HistoricalContinuationItem = Readonly<Pick<Item, "id" | "type" | "status" | "revision" | "phase" | "contentDigest">>
 export type HistoricalContinuationParent = Readonly<Pick<Event, "id" | "sequence" | "payloadDigest">>
 export type HistoricalSourceStepContinuationPrefix = Readonly<{ stepId: string; attempt: number; ordinal: number; callItemId: string;
-  callId: string; parent: HistoricalContinuationParent; events: readonly HistoricalContinuationEvent[]; item: HistoricalContinuationItem }>
+  callId: string; parent: HistoricalContinuationParent; sourceCallContentDigest: string; sourceInputDigest: string;
+  redactedInputDigest: string; events: readonly HistoricalContinuationEvent[]; item: HistoricalContinuationItem }>
 export const HISTORICAL_CONTINUATION_PREFIX_EVENT_COUNT = 7
 
 const validText = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value
@@ -87,10 +89,32 @@ export async function readCanonicalHistoricalSourceStepContinuationPrefix(client
     || !validText(stepId) || stepId === input.sourceStepId || typeof ordinal !== "number" || !Number.isSafeInteger(ordinal)
     || typeof sourceOrdinal !== "number" || !Number.isSafeInteger(sourceOrdinal) || ordinal <= sourceOrdinal
     || attempt !== currentAttempt || step.stepStatus !== "streaming") return null
-  const itemRows = await client.query<Item>(`SELECT continuationItem."id", continuationItem."sessionId", continuationItem."turnId",
+  const sourceRows = await client.query<Item & { sourceInputDigest: string }>(`SELECT sourceCall."id", sourceCall."sessionId", sourceCall."turnId",
+      sourceCall."taskId", sourceCall."stepId", sourceCall."type", sourceCall."status", sourceCall."revision", sourceCall."phase", sourceCall."content",
+      encode(sha256(convert_to(sourceCall."content"::text, 'UTF8')), 'hex') AS "contentDigest",
+      encode(sha256(convert_to((sourceCall."content"->'input')::text, 'UTF8')), 'hex') AS "sourceInputDigest"
+    FROM "agent_items" AS sourceCall WHERE sourceCall."sessionId" = $1 AND sourceCall."turnId" = $2
+      AND sourceCall."taskId" = $3 AND sourceCall."stepId" = $4 AND sourceCall."id" = $5 AND sourceCall."type" = 'tool_call' LIMIT 2`,
+  [scope.sessionId, scope.turnId, scope.id, input.sourceStepId, input.sourceCallItemId])
+  if (sourceRows.rows.length !== 1) return null
+  const sourceItem = sourceRows.rows[0]!, sourceContent = record(sourceItem.content), sourceInput = record(sourceContent.input)
+  if (sourceItem.id !== input.sourceCallItemId || sourceItem.sessionId !== scope.sessionId || sourceItem.turnId !== scope.turnId
+    || sourceItem.taskId !== scope.id || sourceItem.stepId !== input.sourceStepId || sourceItem.type !== "tool_call"
+    || sourceContent.toolCallId !== input.sourceCallId || sourceContent.toolName !== "wait_subagents" || sourceContent.toolVersion !== "1"
+    || !validWaitInput(sourceInput) || !same(sourceInput, input.sourceCallInput)
+    || !/^[0-9a-f]{64}$/.test(sourceItem.contentDigest) || !/^[0-9a-f]{64}$/.test(sourceItem.sourceInputDigest)) return null
+  const targetIds = sourceInput.taskIds as string[]
+  const markedInput = { ...sourceInput, taskIds: [...targetIds] }
+  const markedIds = markedInput.taskIds as string[]
+  const markerOutcome = { taskIds: markedIds, matchedTaskIds: [] as string[], tasks: markedIds.map(taskId => ({ taskId })) }
+  if (!markCanonicalSubagentWaitTargetIds({ targetTaskIds: markedIds }, markerOutcome, markedIds)) return null
+  const expectedInput = safeSubagentWaitJson(markedInput, 8_192)
+  if (!validWaitInput(expectedInput)) return null
+  const itemRows = await client.query<Item & { inputDigest: string }>(`SELECT continuationItem."id", continuationItem."sessionId", continuationItem."turnId",
       continuationItem."taskId", continuationItem."stepId", continuationItem."type", continuationItem."status",
       continuationItem."revision", continuationItem."phase", continuationItem."content",
-      encode(sha256(convert_to(continuationItem."content"::text, 'UTF8')), 'hex') AS "contentDigest"
+      encode(sha256(convert_to(continuationItem."content"::text, 'UTF8')), 'hex') AS "contentDigest",
+      encode(sha256(convert_to((continuationItem."content"->'input')::text, 'UTF8')), 'hex') AS "inputDigest"
     FROM "agent_items" AS continuationItem WHERE continuationItem."sessionId" = $1 AND continuationItem."turnId" = $2
       AND continuationItem."taskId" = $3 AND continuationItem."stepId" = $4 ORDER BY continuationItem."createdAt", continuationItem."id" LIMIT 2`,
   [scope.sessionId, scope.turnId, scope.id, stepId])
@@ -105,7 +129,8 @@ export async function readCanonicalHistoricalSourceStepContinuationPrefix(client
     || item.id !== callItemId || item.type !== "tool_call" || item.phase !== null || !(startedItem || completedBeforeEvent)
     || !validText(callId) || callId === input.sourceCallId
     || content.toolName !== "wait_subagents" || content.toolVersion !== "1" || !validWaitInput(content.input)
-    || !same(content.input, input.sourceCallInput) || item.id === input.sourceCallItemId) return null
+    || !same(content.input, expectedInput) || item.id === input.sourceCallItemId
+    || !/^[0-9a-f]{64}$/.test(item.inputDigest)) return null
   const agendaKey = cognitiveAgendaReceiptIdempotencyKey(stepId)
   if (!agendaKey) return null
   const prefix = `task:${scope.id}:event:`, keys = [prefix + `step-started:${stepId}`, prefix + agendaKey,
@@ -176,5 +201,7 @@ export async function readCanonicalHistoricalSourceStepContinuationPrefix(client
     prefix + `tool-finished:${callId}`, resultItemId, prefix + `tool-call-completed:${callId}:${item.id}:1`,
     prefix + `item-started:${resultItemId}`, prefix + `tool-result-completed:${callId}:${resultItemId}:1`])
   if (terminalRows.rows.length) return null
-  return { stepId, attempt: currentAttempt!, ordinal, callItemId: item.id, callId, parent: parentSignature(parent), events: events.map(signature), item: itemSignature(item) }
+  return { stepId, attempt: currentAttempt!, ordinal, callItemId: item.id, callId, parent: parentSignature(parent),
+    sourceCallContentDigest: sourceItem.contentDigest, sourceInputDigest: sourceItem.sourceInputDigest,
+    redactedInputDigest: item.inputDigest, events: events.map(signature), item: itemSignature(item) }
 }

@@ -1,14 +1,15 @@
 import { MAX_STEP_TOOL_CALLS } from "./pg-store-expiry-step-tool-chain-proof.js"
+import { historicalSourceStepContinuationInputBinding } from "./pg-store-expiry-historical-source-step-continuation-window-binding.js"
 export { historicalSourceStepWindowUnionBinding } from "./pg-store-expiry-historical-source-step-continuation-window-binding.js"
 
 /** Preserves the source-step call-count fence when a bounded successor is present. */
 export function historicalSourceStepCallCountBinding(path: string): string {
   const events = `(CASE WHEN jsonb_typeof(${path}->'events') = 'array' THEN ${path}->'events' ELSE '[]'::jsonb END)`
   const continuation = `(${path}->'continuationPrefix')`
-  const callTarget = `${callsExpression()} + CASE WHEN jsonb_typeof(${continuation}) = 'object' THEN 1 ELSE 0 END`
   const scopedCalls = `callItem."sessionId" = boundSource."sessionId" AND callItem."turnId" = boundSource."turnId"
     AND callItem."taskId" = boundSource."taskId" AND callItem."stepId" = boundSource."id" AND callItem."type" = 'tool_call'`
   const calls = `(SELECT COUNT(*) FROM "agent_items" AS callItem WHERE ${scopedCalls})`
+  const callTarget = `${calls} + CASE WHEN jsonb_typeof(${continuation}) = 'object' THEN 1 ELSE 0 END`
   const distinctCalls = `(SELECT COUNT(DISTINCT callItem."content"->>'toolCallId') FROM "agent_items" AS callItem WHERE ${scopedCalls})`
   const firstEvent = `(${events}->0->>'id')`, lastEvent = `(${events}->(jsonb_array_length(${events}) - 1)->>'id')`
   const scopedStarts = `started."sessionId" = boundSource."sessionId" AND started."turnId" = boundSource."turnId"
@@ -40,18 +41,13 @@ export function historicalSourceStepCallCountBinding(path: string): string {
         ELSE (SELECT MAX(started."sequence") FROM "agent_events" AS started WHERE ${scopedStarts}) = ${finalSourceStart} END) = 1`
 }
 
-function callsExpression(): string {
-  const scopedCalls = `callItem."sessionId" = boundSource."sessionId" AND callItem."turnId" = boundSource."turnId"
-    AND callItem."taskId" = boundSource."taskId" AND callItem."stepId" = boundSource."id" AND callItem."type" = 'tool_call'`
-  return `(SELECT COUNT(*) FROM "agent_items" AS callItem WHERE ${scopedCalls})`
-}
-
 /** Rechecks the exact seven-event current-attempt streaming wait claim and its sole item. */
 export function historicalSourceStepContinuationBinding(path: string): string {
   const continuation = `(${path}->'continuationPrefix')`
   const events = `(CASE WHEN jsonb_typeof(${continuation}->'events') = 'array' THEN ${continuation}->'events' ELSE '[]'::jsonb END)`
   const parent = `(${continuation}->'parent')`, parentId = `${parent}->>'id'`, stepId = `${continuation}->>'stepId'`, callId = `${continuation}->>'callId'`, itemId = `${continuation}->>'callItemId'`
   const resultItemId = `'task:' || boundSource."taskId" || ':item:tool-result:' || (${callId}) || ':attempt:' || owner."attemptCount"::text`, eventPrefix = `'task:' || boundSource."taskId" || ':event:'`
+  const inputBinding = historicalSourceStepContinuationInputBinding(path)
   const priorEventIndex = `CASE WHEN expected.ordinality BETWEEN 2 AND 7 THEN (expected.ordinality - 2)::integer ELSE NULL::integer END`
   const agendaKey = `CASE WHEN octet_length(convert_to('cognitive.agenda:' || (${stepId}), 'UTF8')) <= 256
     THEN 'cognitive.agenda:' || (${stepId}) ELSE 'cognitive.agenda:sha256:' || encode(sha256(convert_to((${stepId}), 'UTF8')), 'hex') END`
@@ -170,8 +166,8 @@ export function historicalSourceStepContinuationBinding(path: string): string {
       AND duplicateParent."idempotencyKey" = 'task:' || boundSource."taskId" || ':event:turn-started') = 1
   ELSE FALSE END`
   return `CASE WHEN jsonb_typeof(${continuation}) = 'object' THEN
-    (SELECT COUNT(*) FROM jsonb_object_keys(${continuation})) = 8
-    AND ${continuation} ?& ARRAY['stepId','attempt','ordinal','callItemId','callId','parent','events','item']
+    (SELECT COUNT(*) FROM jsonb_object_keys(${continuation})) = 11
+    AND ${continuation} ?& ARRAY['stepId','attempt','ordinal','callItemId','callId','parent','events','item','sourceCallContentDigest','sourceInputDigest','redactedInputDigest']
     AND jsonb_array_length(${events}) = 7 AND ${continuation}->>'attempt' = owner."attemptCount"::text
     AND char_length(${stepId}) BETWEEN 1 AND 256 AND ${stepId} = btrim(${stepId}) AND ${stepId} <> boundSource."id"
     AND char_length(${callId}) BETWEEN 1 AND 256 AND ${callId} = btrim(${callId})
@@ -199,7 +195,7 @@ export function historicalSourceStepContinuationBinding(path: string): string {
           AND onlyItem."turnId" = successor."turnId" AND onlyItem."taskId" = successor."taskId" AND onlyItem."stepId" = successor."id") = 1
         AND continuationItem."content"->>'toolCallId' = ${callId} AND continuationItem."content"->>'toolName' = 'wait_subagents'
         AND continuationItem."content"->>'toolVersion' = '1'
-        AND continuationItem."content"->'input' = boundSourceCall."content"->'input'
+        AND ${inputBinding}
         AND continuationItem."content"->>'toolCallId' <> boundSourceCall."content"->>'toolCallId'
         AND continuationItem."id" <> boundSourceCall."id"
         AND CASE WHEN jsonb_typeof(continuationItem."content") = 'object' THEN
