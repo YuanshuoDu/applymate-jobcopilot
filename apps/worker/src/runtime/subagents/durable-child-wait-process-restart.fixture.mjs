@@ -1416,9 +1416,13 @@ worker.on("completed", (job, result) => {
       markerResult.failureReasonCategory = typeof result?.failureReason !== "string" ? "missing"
         : workerFailureReasonCategories.has(result.failureReason) ? result.failureReason : "other"
     }
-    const markerPayload = sourceWaitWorkerModes.has(mode) || boundedLoopDiagnosticModes.has(mode)
-      ? { result: markerResult }
-      : { result, taskId: ids.waiterTaskId, dispatchGeneration }
+    const boundedStage = boundedLoopDiagnosticModes.has(mode) && boundedLoopDiagnosticStages.has(currentLoopDiagnosticStage)
+      ? currentLoopDiagnosticStage : "unknown"
+    const markerPayload = markerResult.status === "failed"
+      ? { result: { status: "failed", failureReasonCategory: markerResult.failureReasonCategory, boundedStage } }
+      : sourceWaitWorkerModes.has(mode) || boundedLoopDiagnosticModes.has(mode)
+        ? { result: markerResult }
+        : { result, taskId: ids.waiterTaskId, dispatchGeneration }
     say(`${marker} ${JSON.stringify(markerPayload)}`)
     await stop(0)
   })().catch(error => {
@@ -1431,8 +1435,9 @@ worker.on("completed", (job, result) => {
 worker.on("failed", (job, error) => {
   if (job?.data.taskId !== ids.waiterTaskId) return
   if (boundedLoopDiagnosticModes.has(mode)) traceLoopFailure()
-  else if (sourceWaitWorkerModes.has(mode)) process.stderr.write(`WORKER_FAILED ${JSON.stringify({ category: workerFailureReasonCategory(error) })}\n`)
-  else process.stderr.write(`WORKER_FAILED ${error.message}\n`)
+  else process.stderr.write(`WORKER_FAILED ${JSON.stringify({ category: workerFailureReasonCategory(error),
+    boundedStage: boundedLoopDiagnosticModes.has(mode) && boundedLoopDiagnosticStages.has(currentLoopDiagnosticStage)
+      ? currentLoopDiagnosticStage : "unknown" })}\n`)
   void stop(1)
 })
 

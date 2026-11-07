@@ -84,9 +84,10 @@ export async function readCanonicalWaitStepToolChain(client: pg.PoolClient, task
   if (!from || !through || from >= through) return null
   const [eventRows, itemRows] = await Promise.all([
     client.query<ProofEvent>(`SELECT "id", "sessionId", "turnId", "taskId", "sequence"::text AS "sequence", "type", "actor",
-        "itemId", "correlationId", "causationId", "idempotencyKey", "payload" FROM "agent_events"
-      WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "sequence" BETWEEN $4::bigint AND $5::bigint
-      ORDER BY "sequence" LIMIT ${MAX_STEP_CHAIN_EVENTS + 1}`,
+        "itemId", "correlationId", "causationId", "idempotencyKey", "payload" FROM "agent_events" AS chainEvent
+      WHERE chainEvent."sessionId" = $1 AND chainEvent."turnId" = $2 AND chainEvent."taskId" = $3
+        AND chainEvent."sequence" BETWEEN $4::bigint AND $5::bigint
+      ORDER BY chainEvent."sequence" LIMIT ${MAX_STEP_CHAIN_EVENTS + 1}`,
     [task.sessionId, task.turnId, task.id, from.toString(), through.toString()]),
     client.query<ProofItem>(`SELECT "id", "sessionId", "turnId", "taskId", "stepId", "type", "status", "revision", "phase", "content"
       FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "stepId" = $4

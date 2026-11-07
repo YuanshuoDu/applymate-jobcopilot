@@ -96,12 +96,15 @@ function fixture(priorTool: { name?: string; status?: "completed" | "failed" | "
     stepStatus: priorTool.stepStatus ?? (priorTool.handoff ? "waiting_for_tool" : "completed") }
 }
 
-function mockClient(value: ReturnType<typeof fixture>) {
-  return { query: async (sql: string, parameters?: readonly unknown[]) => sql.includes('FROM "agent_items"') ? { rows: value.items }
-    : sql.includes('FROM "agent_steps"') ? { rows: [{ status: value.stepStatus }] }
-      : sql.includes(`"type" = 'step.completed'`) ? { rows: value.events.filter(event => event.type === "step.completed"
-        && (event.correlationId === parameters?.[3] || event.idempotencyKey === parameters?.[4])) }
-        : sql.includes('"sequence" BETWEEN') ? { rows: value.events } : { rows: value.anchors } } as never
+function mockClient(value: ReturnType<typeof fixture>, queries: string[] = []) {
+  return { query: async (sql: string, parameters?: readonly unknown[]) => {
+    queries.push(sql)
+    return sql.includes('FROM "agent_items"') ? { rows: value.items }
+      : sql.includes('FROM "agent_steps"') ? { rows: [{ status: value.stepStatus }] }
+        : sql.includes(`"type" = 'step.completed'`) ? { rows: value.events.filter(event => event.type === "step.completed"
+          && (event.correlationId === parameters?.[3] || event.idempotencyKey === parameters?.[4])) }
+          : sql.includes('"sequence" BETWEEN') ? { rows: value.events } : { rows: value.anchors }
+  } } as never
 }
 function sqlBalance(sql: string): number {
   let depth = 0, quote: "'" | '"' | null = null
@@ -117,6 +120,16 @@ function sqlBalance(sql: string): number {
 }
 
 describe("historical source wait step prefix", () => {
+  it("orders the text-projected event window by its native bigint sequence", async () => {
+    const queries: string[] = []
+    await readCanonicalHistoricalSourceStepPrefix(mockClient(fixture(), queries), task, {
+      stepId, attempt: 1, callItemId: waitItemId, callId: waitCallId, resultItemId: waitResultId, waitKind: "normal_waiting",
+    })
+    const eventWindowQuery = queries.find(sql => sql.includes('"sequence" BETWEEN'))
+    expect(eventWindowQuery).toContain('ORDER BY sourceEvent."sequence"')
+    expect(eventWindowQuery).not.toContain('ORDER BY "sequence"')
+  })
+
   it("accepts the minimum writer shape with only the wait call and result items", async () => {
     const value = fixture({ omitPriorTool: true, omitCommentary: true })
     const proof = await readCanonicalHistoricalSourceStepPrefix(mockClient(value), task, {

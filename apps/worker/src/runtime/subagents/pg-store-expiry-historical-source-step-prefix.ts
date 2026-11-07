@@ -74,8 +74,9 @@ export async function readCanonicalHistoricalSourceStepPrefix(client: pg.PoolCli
   const [eventRows, itemRows] = await Promise.all([
     client.query<Event>(`SELECT "id", "sequence"::text AS "sequence", "type", "actor", "itemId", "correlationId", "causationId", "idempotencyKey", "payload",
         encode(sha256(convert_to("payload"::text, 'UTF8')), 'hex') AS "payloadDigest"
-      FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "sequence" BETWEEN $4::bigint AND $5::bigint
-      ORDER BY "sequence" LIMIT ${MAX_EVENTS + 1}`,
+      FROM "agent_events" AS sourceEvent WHERE sourceEvent."sessionId" = $1 AND sourceEvent."turnId" = $2 AND sourceEvent."taskId" = $3
+        AND sourceEvent."sequence" BETWEEN $4::bigint AND $5::bigint
+      ORDER BY sourceEvent."sequence" LIMIT ${MAX_EVENTS + 1}`,
     [task.sessionId, task.turnId, task.id, from.toString(), through.toString()]),
     client.query<Item>(`SELECT "id", "sessionId", "turnId", "taskId", "stepId", "type", "status", "revision", "phase", "content",
         encode(sha256(convert_to("content"::text, 'UTF8')), 'hex') AS "contentDigest"

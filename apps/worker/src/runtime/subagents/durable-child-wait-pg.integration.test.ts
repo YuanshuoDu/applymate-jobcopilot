@@ -687,6 +687,44 @@ async function diagnoseHistoricalWaitSourceProjection(client: PoolClient, task: 
     WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "idempotencyKey" = ANY($4::text[])`,
   [task.sessionId, task.turnId, task.id, anchorKeys]) : { rows: [{ count: 0 }] }
   const anchorCount = Number(anchorRows.rows[0]?.count ?? 0)
+  const [stepStartedAnchors, stepCompletedAnchors] = await Promise.all([
+    client.query<{ sequence: string; exactAnchor: boolean; canonicalKey: boolean }>(`SELECT event."sequence"::text AS "sequence",
+        event."idempotencyKey" = $4 AS "canonicalKey",
+        (event."actor" = 'subagent' AND event."itemId" IS NULL AND event."correlationId" = $5
+          AND event."idempotencyKey" = $4) AS "exactAnchor"
+      FROM "agent_events" AS event WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."taskId" = $3
+        AND event."type" = 'step.started' AND (event."correlationId" = $5 OR event."idempotencyKey" = $4) LIMIT 4`,
+    [task.sessionId, task.turnId, task.id, `task:${task.id}:event:step-started:${stepId}`, stepId]),
+    client.query<{ sequence: string; exactAnchor: boolean; canonicalKey: boolean }>(`SELECT event."sequence"::text AS "sequence",
+        event."idempotencyKey" = $4 AS "canonicalKey",
+        (event."actor" = 'subagent' AND event."itemId" IS NULL AND event."correlationId" = $5
+          AND event."idempotencyKey" = $4 AND event."payload"->>'stepId' = $5
+          AND event."payload"->>'status' = 'waiting_for_dependency' AND event."payload"->>'taskId' = $3
+          AND jsonb_typeof(event."payload"->'toolCallCount') = 'number') AS "exactAnchor"
+      FROM "agent_events" AS event WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."taskId" = $3
+        AND event."type" = 'step.completed' AND (event."correlationId" = $5 OR event."idempotencyKey" = $4) LIMIT 4`,
+    [task.sessionId, task.turnId, task.id, `task:${task.id}:event:step-completed:${stepId}`, stepId]),
+  ])
+  const stepStartedExact = stepStartedAnchors.rows.filter(row => row.exactAnchor)
+  const stepCompletedCanonicalCount = stepCompletedAnchors.rows.filter(row => row.canonicalKey).length
+  const stepCompletedExact = stepCompletedAnchors.rows.filter(row => row.exactAnchor)
+  let prefixWindowBoundaryAvailable = false
+  let prefixWindowEventCount: number | null = null
+  if (sourceKind === "normal_waiting" && stepStartedExact.length === 1 && stepCompletedExact.length === 1) {
+    try {
+      const from = BigInt(stepStartedExact[0]!.sequence), through = BigInt(stepCompletedExact[0]!.sequence)
+      if (from < through) {
+        prefixWindowBoundaryAvailable = true
+        const eventWindow = await client.query<{ count: number }>(`SELECT COUNT(*)::int AS "count" FROM (
+            SELECT sourceEvent."id" FROM "agent_events" AS sourceEvent
+            WHERE sourceEvent."sessionId" = $1 AND sourceEvent."turnId" = $2 AND sourceEvent."taskId" = $3
+              AND sourceEvent."sequence" BETWEEN $4::bigint AND $5::bigint
+            ORDER BY sourceEvent."sequence" LIMIT ${MAX_STEP_TOOL_CALLS * 9 + 17}) AS boundedSourceEvents`,
+        [task.sessionId, task.turnId, task.id, from.toString(), through.toString()])
+        prefixWindowEventCount = Number(eventWindow.rows[0]?.count ?? 0)
+      }
+    } catch { prefixWindowBoundaryAvailable = false }
+  }
   const sourceStart = await client.query<{ count: number }>(`SELECT COUNT(*)::int AS "count" FROM "agent_events"
     WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "itemId" = $4 AND "type" = 'tool_call.started'
       AND "actor" = 'subagent' AND "correlationId" = $5 AND "idempotencyKey" = 'task:' || $3 || ':event:tool-started:' || $5
@@ -706,7 +744,14 @@ async function diagnoseHistoricalWaitSourceProjection(client: PoolClient, task: 
   }
   let rejectStage = "none"
   const sourceStartCount = Number(sourceStart.rows[0]?.count ?? 0)
-  if (!markerValidationPassed) rejectStage = `source_lifecycle:${lifecycleRejectStage ?? "marker_state"}`
+  const knownLifecycleStages = new Set(["required_value", "resume_scope", "source_step", "source_call_count", "source_call_input",
+    "source_item_set", "wait_record_shape", "provenance_marker", "source_receipt_missing", "source_marker_without_result",
+    "source_recovered_receipt_mismatch", "source_waiting_content", "source_waiting_output_shape", "source_waiting_identity",
+    "source_waiting_targets", "source_waiting_matched_ids", "source_waiting_tasks", "source_waiting_task_ids", "source_waiting_deadline",
+    "source_initial_call_shape", "source_call_completion_state", "source_result_completion_state", "source_call_completion_content",
+    "source_result_completion_content", "source_waiting_output_missing", "source_event_chain", "reconciliation", "safe_result_shape", "source_start_event"])
+  const safeLifecycleRejectStage = lifecycleRejectStage && knownLifecycleStages.has(lifecycleRejectStage) ? lifecycleRejectStage : "unknown"
+  if (!markerValidationPassed) rejectStage = `source_lifecycle:${safeLifecycleRejectStage}`
   else if (sourceWaitMultiplicity !== 1) rejectStage = "source_wait_multiplicity"
   else if (sourceStartCount !== 1) rejectStage = "source_start_event"
   else if (prefixAvailable) rejectStage = sourceProjectionCount ? "none" : "source_projection_shape"
@@ -715,8 +760,32 @@ async function diagnoseHistoricalWaitSourceProjection(client: PoolClient, task: 
   else if (stepItemCount < 2 || stepItemCount > MAX_STEP_TOOL_CALLS * 2 + 2) rejectStage = "recovered_handoff_item_count"
   else if (anchorCount !== 6) rejectStage = "recovered_handoff_anchor_count"
   else rejectStage = "recovered_handoff_event_chain_or_payload"
+  let prefixRejectStage = "unknown"
+  if (!markerValidationPassed) prefixRejectStage = "source_lifecycle"
+  else if (sourceWaitMultiplicity !== 1) prefixRejectStage = "source_wait_multiplicity"
+  else if (sourceStartCount !== 1) prefixRejectStage = "source_call_start_event"
+  else if (prefixAvailable) prefixRejectStage = sourceProjectionCount ? "accepted" : "source_projection_shape"
+  else if (sourceKind === "normal_waiting") {
+    if (stepStartedExact.length !== 1) prefixRejectStage = "step_started_anchor"
+    else if (stepCompletedCanonicalCount === 0) prefixRejectStage = "step_completed_anchor_missing"
+    else if (stepCompletedExact.length !== 1) prefixRejectStage = "step_completed_anchor_invalid_or_duplicate"
+    else if (!prefixWindowBoundaryAvailable) prefixRejectStage = "prefix_window_boundary"
+    else if (prefixWindowEventCount === null || prefixWindowEventCount < 12 || prefixWindowEventCount > MAX_STEP_TOOL_CALLS * 9 + 16)
+      prefixRejectStage = "prefix_window_event_count"
+    else if (stepItemCount < 2 || stepItemCount > MAX_STEP_TOOL_CALLS * 2 + 2) prefixRejectStage = "prefix_window_item_count"
+    else prefixRejectStage = "prefix_event_chain_or_payload"
+  } else if (sourceKind === "recovered") prefixRejectStage = rejectStage
+  else prefixRejectStage = "source_lifecycle"
   return { sourceProjectionCount, sourceKind, sourceStepStatus: wait.sourceStepStatus, sourceWaitMultiplicity, markerPresent,
-    markerValidationPassed, sourceStartCount, stepItemCount, anchorCount, prefixAvailable, rejectStage }
+    markerValidationPassed, sourceStartCount, stepItemCount, anchorCount, prefixAvailable, rejectStage, prefixRejectStage,
+    stepStartedExactAnchorCount: stepStartedExact.length, stepCompletedCandidateCount: stepCompletedAnchors.rows.length,
+    stepCompletedCanonicalKeyCount: stepCompletedCanonicalCount, stepCompletedExactAnchorCount: stepCompletedExact.length,
+    prefixWindowBoundaryAvailable, prefixWindowEventCount, prefixWindowItemCount: stepItemCount,
+    prefixChecks: { lifecyclePassed: markerValidationPassed, sourceWaitUnique: sourceWaitMultiplicity === 1,
+      sourceCallStartUnique: sourceStartCount === 1, stepStartedAnchorUnique: stepStartedExact.length === 1,
+      stepCompletedAnchorUnique: stepCompletedExact.length === 1, prefixWindowBounded: prefixWindowEventCount !== null
+        && prefixWindowEventCount >= 12 && prefixWindowEventCount <= MAX_STEP_TOOL_CALLS * 9 + 16,
+      prefixItemsBounded: stepItemCount >= 2 && stepItemCount <= MAX_STEP_TOOL_CALLS * 2 + 2, prefixAccepted: prefixAvailable } }
 }
 
 async function diagnoseWorkerFClaimProof(
@@ -5219,9 +5288,10 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         { id: noopCallItemId, type: "tool_call", status: "completed", revision: 1 },
       ].sort((left, right) => left.type.localeCompare(right.type)))
       const noopEvents = await pool.query<{ id: string; sequence: string; type: string; itemId: string | null; causationId: string | null }>(
-        `SELECT "id", "sequence"::text AS "sequence", "type", "itemId", "causationId" FROM "agent_events"
-         WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND ("itemId" IN ($4, $5) OR "correlationId" = $6)
-         ORDER BY "sequence"`, [ids.sessionId, ids.turnId, ids.waiterTaskId, noopCallItemId, noopResultItemId, noopCallId])
+        `SELECT "id", event."sequence"::text AS "sequence", "type", "itemId", "causationId" FROM "agent_events" AS event
+         WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."taskId" = $3
+           AND (event."itemId" IN ($4, $5) OR event."correlationId" = $6)
+         ORDER BY event."sequence"`, [ids.sessionId, ids.turnId, ids.waiterTaskId, noopCallItemId, noopResultItemId, noopCallId])
       expect(noopEvents.rows.map(event => event.type)).toEqual([
         "item.started", "tool_call.started", "item.completed", "tool_call.completed", "item.started", "item.completed",
       ])

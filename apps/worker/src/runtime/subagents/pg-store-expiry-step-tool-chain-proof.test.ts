@@ -87,11 +87,14 @@ function fixture(withCommentary = true, commentaryText = "private commentary") {
   return { events, items, anchorRows }
 }
 
-function mockClient(value: ReturnType<typeof fixture>) {
-  const query = async (sql: string) => sql.includes('FROM "agent_items"')
-    ? { rows: value.items }
-    : sql.includes('"sequence" BETWEEN') ? { rows: value.events }
-      : { rows: value.anchorRows }
+function mockClient(value: ReturnType<typeof fixture>, queries: string[] = []) {
+  const query = async (sql: string) => {
+    queries.push(sql)
+    return sql.includes('FROM "agent_items"')
+      ? { rows: value.items }
+      : sql.includes('"sequence" BETWEEN') ? { rows: value.events }
+        : { rows: value.anchorRows }
+  }
   return { query } as never
 }
 function sqlBalance(sql: string): number {
@@ -108,6 +111,15 @@ function sqlBalance(sql: string): number {
 }
 
 describe("ordered wait claim step tool-chain proof", () => {
+  it("orders the text-projected event window by its native bigint sequence", async () => {
+    const queries: string[] = []
+    await readCanonicalWaitStepToolChain(mockClient(fixture(), queries), task, { stepId, attempt: 3,
+      callItemId: claimItemId, callId: claimCallId, resultItemId: claimResultId })
+    const eventWindowQuery = queries.find(sql => sql.includes('"sequence" BETWEEN'))
+    expect(eventWindowQuery).toContain('ORDER BY chainEvent."sequence"')
+    expect(eventWindowQuery).not.toContain('ORDER BY "sequence"')
+  })
+
   it("parenthesizes JSON text extraction operands in PostgreSQL concatenation", () => {
     expect(STEP_TOOL_CHAIN_MODEL_START_WHERE_SQL).not.toMatch(unparenthesizedJsonExtractionAfterConcat)
     expect(CHILD_WAIT_STEP_TOOL_CHAIN_EXCEPTION_SQL).not.toMatch(unparenthesizedJsonExtractionAfterConcat)
