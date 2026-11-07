@@ -5609,6 +5609,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       await expect(dispatchPendingSubagentOutbox(pool as never, queue, 50, ids.sessionId)).resolves.toBe(1)
       await waitForMarker(workerA, "WORKER_A_REGISTERED")
       const sourceStepId = `task:${ids.waiterTaskId}:step:0:attempt:1`
+      const continuationStepId = `task:${ids.waiterTaskId}:step:1:attempt:1`
       const noopCallId = "fixture-noop-before-child-wait"
       const noopCallItemId = `task:${ids.waiterTaskId}:item:tool-call:${noopCallId}:attempt:1`
       const noopResultItemId = `task:${ids.waiterTaskId}:item:tool-result:${noopCallId}:attempt:1`
@@ -5678,7 +5679,8 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       })
       await waitForMarker(workerC, "WORKER_B_LOOP_CLAIM_ITEM_COMPLETED_BEFORE_EVENT")
       const claimCutLine = workerC.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_LOOP_CLAIM_ITEM_COMPLETED_BEFORE_EVENT "))
-      expect(JSON.parse(claimCutLine!.slice("WORKER_B_LOOP_CLAIM_ITEM_COMPLETED_BEFORE_EVENT ".length))).toMatchObject({
+      const claimCut = JSON.parse(claimCutLine!.slice("WORKER_B_LOOP_CLAIM_ITEM_COMPLETED_BEFORE_EVENT ".length)) as Record<string, unknown>
+      expect(claimCut).toMatchObject({ waitId: beforeRepair.wait?.id, stepId: continuationStepId,
         modelCalls: expect.any(Number), executorCalls: expect.any(Number), priorNoopExecutorCalls: 0, dispatcherCalls: 0,
       })
       const repaired = await readSourceWaitLifecycle(pool, ids)
@@ -5707,6 +5709,10 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         expect(handoffSource?.sourceStepHandoff?.schemaVersion).toBe("recovered_wait_handoff.v1")
         expect(handoffSource?.sourceStepHandoff?.sourceStepPrefix.items).toHaveLength(4)
         if (!handoffSource?.sourceStepHandoff) throw new Error("prior-tool recovered handoff projection missing")
+        expect(handoffSource.stepId).toBe(sourceStepId)
+        expect(handoffSource.sourceWait.sourceStepId).toBe(sourceStepId)
+        expect(handoffSource.sourceStepHandoff.stepId).toBe(sourceStepId)
+        expect(handoffSource.sourceStepHandoff.sourceStepPrefix.stepId).toBe(sourceStepId)
         const fullEvents = [...handoffSource.sourceStepHandoff.sourceStepPrefix.events]
         const noopStartedIndex = fullEvents.findIndex(event => event.idempotencyKey === `task:${ids.waiterTaskId}:event:item-started:${noopCallItemId}`)
         const noopCallStartedIndex = fullEvents.findIndex(event => event.idempotencyKey === `task:${ids.waiterTaskId}:event:tool-started:${noopCallId}`)
@@ -5719,6 +5725,115 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         expect(anchorIds.has(fullEvents[noopCallStartedIndex]!.id)).toBe(false)
         await expect(historicalWaitBindingAccepts(checkClient, snapshot, handoffSource),
           "the exact recovered handoff with a prior noop must bind").resolves.toBe(true)
+        await expect(historicalWaitBindingAccepts(checkClient, { ...snapshot, leaseOwner: `${snapshot.leaseOwner}:stale` }, handoffSource),
+          "a recovered handoff must not transfer to a stale lease owner").resolves.toBe(false)
+        await expect(historicalWaitBindingAccepts(checkClient,
+          { ...snapshot, leaseExpiresAt: new Date(snapshot.leaseExpiresAt!.getTime() + 1) }, handoffSource),
+        "a recovered handoff must not transfer to a changed lease expiry").resolves.toBe(false)
+        await expect(historicalWaitBindingAccepts(checkClient, { ...snapshot, attemptCount: snapshot.attemptCount + 1 }, handoffSource),
+          "a recovered handoff must not transfer to another attempt").resolves.toBe(false)
+        await expect(historicalWaitBindingAccepts(checkClient, { ...snapshot, userId: `${snapshot.userId}:wrong` }, handoffSource),
+          "a recovered handoff must not transfer to another tenant").resolves.toBe(false)
+
+        const forgedHandoffProjection = JSON.parse(JSON.stringify(handoffSource)) as Record<string, unknown>
+        const forgedHandoff = asObject(forgedHandoffProjection.sourceStepHandoff)
+        forgedHandoffProjection.sourceStepHandoff = { ...forgedHandoff, schemaVersion: "recovered_wait_handoff.forged" }
+        await expect(historicalWaitBindingAccepts(checkClient, snapshot, forgedHandoffProjection),
+          "the final PostgreSQL binding must reject a forged in-memory recovered handoff marker").resolves.toBe(false)
+        const duplicateAnchorProjection = JSON.parse(JSON.stringify(handoffSource)) as Record<string, unknown>
+        const duplicateAnchorHandoff = asObject(duplicateAnchorProjection.sourceStepHandoff)
+        const handoffProofEvents = Array.isArray(duplicateAnchorHandoff.events) ? duplicateAnchorHandoff.events : []
+        expect(handoffProofEvents).toHaveLength(6)
+        duplicateAnchorProjection.sourceStepHandoff = { ...duplicateAnchorHandoff, events: [...handoffProofEvents.slice(0, 5), handoffProofEvents[0]] }
+        await expect(historicalWaitBindingAccepts(checkClient, snapshot, duplicateAnchorProjection),
+          "the final PostgreSQL binding must reject duplicate recovered handoff event anchors").resolves.toBe(false)
+        const missingAnchorProjection = JSON.parse(JSON.stringify(handoffSource)) as Record<string, unknown>
+        const missingAnchorHandoff = asObject(missingAnchorProjection.sourceStepHandoff)
+        const missingHandoffEvents = Array.isArray(missingAnchorHandoff.events) ? missingAnchorHandoff.events : []
+        missingAnchorProjection.sourceStepHandoff = { ...missingAnchorHandoff, events: missingHandoffEvents.slice(0, 5) }
+        await expect(historicalWaitBindingAccepts(checkClient, snapshot, missingAnchorProjection),
+          "the final PostgreSQL binding must reject a recovered handoff missing an event anchor").resolves.toBe(false)
+
+        const expectHandoffProducerRejected = async (label: string, mutate: () => Promise<{ rowCount: number | null }>) => {
+          await checkClient.query("SAVEPOINT recovered_handoff_source_tamper")
+          try {
+            const changed = await mutate()
+            expect(changed.rowCount, `${label} fixture mutation`).toBe(1)
+            const afterTamper = await readChildWaitTerminalCallProjections(checkClient, snapshot as unknown as Record<string, unknown>)
+            expect(afterTamper.filter(projection => projection.sourceWait.waitId === sourceWaitId).length,
+              `${label} must not produce a recovered source or claim proof`).toBe(0)
+            await expect(historicalWaitBindingAccepts(checkClient, snapshot, handoffSource),
+              `${label} must fail the final PostgreSQL binding for the previously valid handoff`).resolves.toBe(false)
+            await expect(hasBlockingExternalCall(checkClient, snapshot as unknown as Record<string, unknown>, undefined, continuationStepId),
+              `${label} must leave the source wait blocking`).resolves.toBe(true)
+          } finally {
+            await checkClient.query("ROLLBACK TO SAVEPOINT recovered_handoff_source_tamper")
+            await checkClient.query("RELEASE SAVEPOINT recovered_handoff_source_tamper")
+          }
+        }
+
+        await expectHandoffProducerRejected("forged persisted recovered source marker", () => checkClient.query(
+          `UPDATE "agent_wait_conditions" SET "result" = jsonb_set("result", '{sourceLifecycleRecovery,taskId}', to_jsonb($5::text), false)
+            WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "parentTaskId" = $4 RETURNING "id"`,
+          [sourceWaitId, ids.sessionId, ids.turnId, ids.waiterTaskId, `forged-task-${randomUUID()}`]))
+
+        const extraRecoveredToolCallId = `fixture-extra-recovered-source-tool:${randomUUID()}`
+        await expectHandoffProducerRejected("additional recovered source-step tool call", () => checkClient.query(
+          `INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "revision", "content", "startedAt", "updatedAt")
+           VALUES ($1, $2, $3, $4, $5, 'tool_call', 'started', NULL, 0, $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+          [`task:${ids.waiterTaskId}:item:tool-call:${extraRecoveredToolCallId}:attempt:1`, ids.sessionId, ids.turnId,
+            sourceStepId, ids.waiterTaskId, JSON.stringify({ toolCallId: extraRecoveredToolCallId,
+              toolName: "jobs.search", toolVersion: "1", input: { query: "fixture" } })]))
+
+        const missingRecoveredAnchor = fullEvents.find(event => event.type === "model.usage")
+        if (!missingRecoveredAnchor) throw new Error("recovered_handoff_model_usage_anchor_missing")
+        await expectHandoffProducerRejected("missing recovered source model.usage anchor", () => checkClient.query(
+          `UPDATE "agent_events" SET "idempotencyKey" = "idempotencyKey" || ':tampered'
+            WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 RETURNING "id"`,
+          [missingRecoveredAnchor.id, ids.sessionId, ids.turnId, ids.waiterTaskId]))
+
+        const duplicateRecoveredAnchor = fullEvents.find(event => event.type === "item.started" && event.itemId === handoffSource.callItemId)
+        if (!duplicateRecoveredAnchor) throw new Error("recovered_handoff_source_item_started_anchor_missing")
+        await expectHandoffProducerRejected("duplicate recovered source item.started anchor", async () => {
+          const original = await checkClient.query<{ payload: Record<string, unknown>; causationId: string | null;
+            correlationId: string; itemId: string | null }>(`SELECT "payload", "causationId", "correlationId", "itemId"
+              FROM "agent_events" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4`,
+          [duplicateRecoveredAnchor.id, ids.sessionId, ids.turnId, ids.waiterTaskId])
+          expect(original.rowCount).toBe(1)
+          const sequence = await checkClient.query<{ eventSequence: string }>(`UPDATE "agent_sessions" SET "eventSequence" = "eventSequence" + 1
+            WHERE "id" = $1 AND "userId" = $2 RETURNING "eventSequence"::text AS "eventSequence"`, [ids.sessionId, ids.userId])
+          expect(sequence.rows).toHaveLength(1)
+          return checkClient.query(`INSERT INTO "agent_events" ("id", "sessionId", "turnId", "itemId", "taskId", "sequence", "type", "actor",
+              "correlationId", "causationId", "idempotencyKey", "payload")
+            VALUES ($1, $2, $3, $4, $5, $6::bigint, 'item.started', 'subagent', $7, $8, $9, $10::jsonb)`,
+          [`fixture-duplicate-recovered-source-anchor:${randomUUID()}`, ids.sessionId, ids.turnId, original.rows[0]!.itemId, ids.waiterTaskId,
+            sequence.rows[0]!.eventSequence, original.rows[0]!.correlationId, original.rows[0]!.causationId,
+            `${duplicateRecoveredAnchor.idempotencyKey}:duplicate:${randomUUID()}`, JSON.stringify(original.rows[0]!.payload)])
+        })
+
+        const wrongRecoveredCause = fullEvents.find(event => event.type === "model.completed")
+        if (!wrongRecoveredCause) throw new Error("recovered_handoff_model_completed_anchor_missing")
+        await expectHandoffProducerRejected("wrong recovered source model.completed causation", () => checkClient.query(
+          `UPDATE "agent_events" SET "causationId" = $5 WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 RETURNING "id"`,
+          [wrongRecoveredCause.id, ids.sessionId, ids.turnId, ids.waiterTaskId, `unrelated-cause:${randomUUID()}`]))
+
+        await checkClient.query("SAVEPOINT recovered_handoff_marker_owner_toctou")
+        try {
+          const changedMarker = await checkClient.query(`UPDATE "agent_wait_conditions"
+            SET "result" = jsonb_set("result", '{sourceLifecycleRecovery,ownerId}', to_jsonb($5::text), false)
+            WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "parentTaskId" = $4 RETURNING "id"`,
+          [sourceWaitId, ids.sessionId, ids.turnId, ids.waiterTaskId, `different-owner-${randomUUID()}`])
+          expect(changedMarker.rowCount).toBe(1)
+          await expect(historicalWaitBindingAccepts(checkClient, snapshot, handoffSource),
+            "the final PostgreSQL binding must reject a lifecycle owner marker changed after projection read").resolves.toBe(false)
+          const postTamperProjections = await readChildWaitTerminalCallProjections(checkClient, snapshot as unknown as Record<string, unknown>)
+          expect(postTamperProjections.filter(projection => projection.sourceWait.waitId === sourceWaitId).length).toBe(0)
+          await expect(hasBlockingExternalCall(checkClient, snapshot as unknown as Record<string, unknown>, undefined, continuationStepId),
+            "a changed lifecycle owner marker must keep the wait blocking").resolves.toBe(true)
+        } finally {
+          await checkClient.query("ROLLBACK TO SAVEPOINT recovered_handoff_marker_owner_toctou")
+          await checkClient.query("RELEASE SAVEPOINT recovered_handoff_marker_owner_toctou")
+        }
 
         const priorToolCounts = await checkClient.query<{ requestedCount: number; callCount: number; resultCount: number; itemCount: number }>(`SELECT
             (SELECT ("payload"->>'toolCallCount')::int FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2
@@ -6100,9 +6215,9 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         await expect(blocking({ ...snapshot, userId: `${snapshot.userId}:wrong` }),
           "a different user scope must not borrow historical settlement proof").resolves.toBe(true)
 
-        const wait = await settlementClient.query<{ id: string; result: Record<string, unknown>; deadlineAt: Date; resolvedAt: Date;
-          matchedTaskIds: string[]; sourceStartEventId: string; claimStartEventId: string }>(`SELECT wait."id", wait."result", wait."deadlineAt", wait."resolvedAt", wait."matchedTaskIds",
-            sourceStart."id" AS "sourceStartEventId", claimStart."id" AS "claimStartEventId"
+        const wait = await settlementClient.query<{ id: string; stepId: string; result: Record<string, unknown>; deadlineAt: Date; resolvedAt: Date;
+          matchedTaskIds: string[]; sourceCallItemId: string; sourceStartEventId: string; claimStartEventId: string }>(`SELECT wait."id", wait."stepId", wait."result", wait."deadlineAt", wait."resolvedAt", wait."matchedTaskIds",
+            sourceCall."id" AS "sourceCallItemId", sourceStart."id" AS "sourceStartEventId", claimStart."id" AS "claimStartEventId"
           FROM "agent_wait_conditions" AS wait
           JOIN "agent_items" AS sourceCall ON sourceCall."sessionId" = wait."sessionId" AND sourceCall."turnId" = wait."turnId"
             AND sourceCall."taskId" = wait."parentTaskId" AND sourceCall."stepId" = wait."stepId" AND sourceCall."type" = 'tool_call'
@@ -6243,16 +6358,20 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
           await settlementClient.query("RELEASE SAVEPOINT ordered_multi_tool_step")
         }
 
-        const sourceMarker = asObject(asObject(wait.rows[0]!.result).sourceLifecycleRecovery)
-        expect(typeof sourceMarker.resultItemId).toBe("string")
         const sourceResultRows = await settlementClient.query<{ itemId: string; content: Record<string, unknown>; eventId: string; eventPayload: Record<string, unknown> }>(
           `SELECT result."id" AS "itemId", result."content", completed."id" AS "eventId", completed."payload" AS "eventPayload"
-           FROM "agent_items" AS result JOIN "agent_events" AS completed ON completed."sessionId" = result."sessionId"
+           FROM "agent_items" AS sourceCall JOIN "agent_items" AS result ON result."sessionId" = sourceCall."sessionId"
+             AND result."turnId" = sourceCall."turnId" AND result."taskId" = sourceCall."taskId" AND result."stepId" = sourceCall."stepId"
+             AND result."type" = 'tool_result' AND result."content"->>'toolCallId' = sourceCall."content"->>'toolCallId'
+           JOIN "agent_events" AS completed ON completed."sessionId" = result."sessionId"
              AND completed."turnId" = result."turnId" AND completed."taskId" = result."taskId" AND completed."itemId" = result."id"
              AND completed."type" = 'item.completed' AND completed."idempotencyKey" = 'task:' || result."taskId" || ':event:tool-result-completed:'
                || $4 || ':' || result."id" || ':1'
-           WHERE result."id" = $5 AND result."sessionId" = $1 AND result."turnId" = $2 AND result."taskId" = $3 AND result."type" = 'tool_result'`,
-          [ids.sessionId, ids.turnId, ids.waiterTaskId, PHONE_SHAPED_WAIT_TOOL_CALL_ID, sourceMarker.resultItemId])
+           WHERE sourceCall."id" = $5 AND sourceCall."sessionId" = $1 AND sourceCall."turnId" = $2 AND sourceCall."taskId" = $3
+             AND sourceCall."stepId" = $6 AND sourceCall."type" = 'tool_call' AND sourceCall."status" = 'completed'
+             AND sourceCall."revision" = 1 AND sourceCall."content"->>'toolName' = 'wait_subagents'
+             AND sourceCall."content"->>'toolCallId' = $4 AND result."status" = 'completed' AND result."revision" = 1`,
+          [ids.sessionId, ids.turnId, ids.waiterTaskId, PHONE_SHAPED_WAIT_TOOL_CALL_ID, wait.rows[0]!.sourceCallItemId, wait.rows[0]!.stepId])
         expect(sourceResultRows.rows).toHaveLength(1)
         const sourceResult = sourceResultRows.rows[0]!
         const sourceWaitStep = await settlementClient.query<{ status: string; attempt: number; ordinal: number }>(
@@ -6263,67 +6382,44 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
           [wait.rows[0]!.id, ids.sessionId, ids.turnId, ids.waiterTaskId])
         expect(sourceWaitStep.rows).toEqual([{ status: "waiting_for_tool", attempt: 1, ordinal: 0 }])
         const realSourceProjections = await readChildWaitTerminalCallProjections(settlementClient, snapshot as unknown as Record<string, unknown>)
-        const handoffSource = realSourceProjections.find(projection => projection.sourceWait.waitId === wait.rows[0]!.id
+        const sourceProjection = realSourceProjections.find(projection => projection.sourceWait.waitId === wait.rows[0]!.id
           && projection.sourceWait.claimKeyDigest === null)
-        expect(handoffSource, "a recovered waiting source must produce its exact terminal projection").toBeDefined()
-        expect(Object.prototype.hasOwnProperty.call(handoffSource, "sourceStepPrefix")).toBe(false)
-        expect(handoffSource?.sourceStepHandoff?.schemaVersion).toBe("recovered_wait_handoff.v1")
-        expect(handoffSource?.sourceStepHandoff?.waitId === wait.rows[0]!.id).toBe(true)
-        expect(handoffSource?.sourceStepHandoff?.stepId === handoffSource?.stepId).toBe(true)
-        expect(handoffSource?.sourceStepHandoff?.attempt === handoffSource?.attempt).toBe(true)
-        expect(handoffSource?.sourceStepHandoff?.sourceCallItemId === handoffSource?.callItemId).toBe(true)
-        expect(handoffSource?.sourceStepHandoff?.sourceCallId === PHONE_SHAPED_WAIT_TOOL_CALL_ID).toBe(true)
-        expect(handoffSource?.sourceStepHandoff?.sourceResultItemId === sourceResult.itemId).toBe(true)
-        expect(handoffSource?.sourceStepHandoff?.events).toHaveLength(6)
-        if (!handoffSource?.sourceStepHandoff) throw new Error("historical_wait_handoff_projection_missing")
-        await expect(historicalWaitBindingAccepts(settlementClient, snapshot, handoffSource),
-          "the final PostgreSQL binding must accept the exact producer handoff proof").resolves.toBe(true)
+        expect(sourceProjection, "a normal waiting source must produce its exact terminal projection").toBeDefined()
+        expect(Object.prototype.hasOwnProperty.call(sourceProjection, "sourceStepHandoff")).toBe(false)
+        expect(sourceProjection?.sourceStepPrefix?.waitKind).toBe("normal_waiting")
+        expect(sourceProjection?.sourceStepPrefix?.terminalMode).toBe("step_completed")
+        expect(sourceProjection?.sourceStepPrefix?.stepId).toBe(sourceProjection?.stepId)
+        expect(sourceProjection?.sourceStepPrefix?.attempt).toBe(sourceProjection?.attempt)
+        expect(sourceProjection?.sourceStepPrefix?.sourceCallItemId).toBe(sourceProjection?.callItemId)
+        expect(sourceProjection?.sourceStepPrefix?.sourceCallId).toBe(PHONE_SHAPED_WAIT_TOOL_CALL_ID)
+        expect(sourceProjection?.sourceStepPrefix?.sourceResultItemId).toBe(sourceResult.itemId)
+        expect(sourceProjection?.sourceStepPrefix?.items).toHaveLength(2)
+        expect(sourceProjection?.sourceStepPrefix?.events).toHaveLength(12)
+        if (!sourceProjection?.sourceStepPrefix) throw new Error("historical_wait_source_prefix_projection_missing")
+        await expect(historicalWaitBindingAccepts(settlementClient, snapshot, sourceProjection),
+          "the final PostgreSQL binding must accept the exact normal source prefix proof").resolves.toBe(true)
 
-        const reorderedNestedProjection = JSON.parse(JSON.stringify(handoffSource)) as Record<string, unknown>
-        const nestedHandoff = asObject(reorderedNestedProjection.sourceStepHandoff)
-        const nestedSourcePrefix = asObject(nestedHandoff.sourceStepPrefix)
-        const nestedEvents = Array.isArray(nestedSourcePrefix.events) ? nestedSourcePrefix.events : []
-        const nestedHandoffEvents = Array.isArray(nestedHandoff.events) ? nestedHandoff.events : []
-        expect(nestedEvents[6]).toMatchObject({ type: "tool_call.started" })
-        expect(nestedEvents[7]).toMatchObject({ type: "item.completed" })
-        expect(nestedHandoffEvents.map(event => asObject(event).id)).not.toContain(asObject(nestedEvents[6]).id)
-        expect(nestedHandoffEvents.map(event => asObject(event).id)).not.toContain(asObject(nestedEvents[7]).id)
-        const reorderedNestedPrefix = { ...nestedSourcePrefix, events: nestedEvents.map((event, index) =>
-          index === 6 ? nestedEvents[7] : index === 7 ? nestedEvents[6] : event) }
-        reorderedNestedProjection.sourceStepHandoff = { ...nestedHandoff, sourceStepPrefix: reorderedNestedPrefix }
-        await expect(historicalWaitBindingAccepts(settlementClient, snapshot, reorderedNestedProjection),
-          "the final PostgreSQL binding must reject reordered non-anchor events inside recovered handoff sourceStepPrefix").resolves.toBe(false)
+        const reorderedPrefixProjection = JSON.parse(JSON.stringify(sourceProjection)) as Record<string, unknown>
+        const sourcePrefix = asObject(reorderedPrefixProjection.sourceStepPrefix)
+        const sourceEvents = Array.isArray(sourcePrefix.events) ? sourcePrefix.events : []
+        expect(sourceEvents[6]).toMatchObject({ type: "tool_call.started" })
+        expect(sourceEvents[7]).toMatchObject({ type: "item.completed" })
+        reorderedPrefixProjection.sourceStepPrefix = { ...sourcePrefix, events: sourceEvents.map((event, index) =>
+          index === 6 ? sourceEvents[7] : index === 7 ? sourceEvents[6] : event) }
+        await expect(historicalWaitBindingAccepts(settlementClient, snapshot, reorderedPrefixProjection),
+          "the final PostgreSQL binding must reject reordered non-anchor events inside a normal source prefix").resolves.toBe(false)
 
-        await expect(historicalWaitBindingAccepts(settlementClient, { ...snapshot, leaseOwner: `${snapshot.leaseOwner}:stale` }, handoffSource),
-          "the same handoff proof must not transfer to a stale lease").resolves.toBe(false)
-        await expect(historicalWaitBindingAccepts(settlementClient, { ...snapshot, leaseExpiresAt: new Date(snapshot.leaseExpiresAt!.getTime() + 1) }, handoffSource),
-          "the same handoff proof must not transfer to a changed lease expiry").resolves.toBe(false)
-        await expect(historicalWaitBindingAccepts(settlementClient, { ...snapshot, attemptCount: snapshot.attemptCount + 1 }, handoffSource),
-          "the same handoff proof must not transfer to another attempt").resolves.toBe(false)
-        await expect(historicalWaitBindingAccepts(settlementClient, { ...snapshot, userId: `${snapshot.userId}:wrong` }, handoffSource),
-          "the same handoff proof must not transfer to another tenant").resolves.toBe(false)
+        await expect(historicalWaitBindingAccepts(settlementClient, { ...snapshot, leaseOwner: `${snapshot.leaseOwner}:stale` }, sourceProjection),
+          "the same source proof must not transfer to a stale lease").resolves.toBe(false)
+        await expect(historicalWaitBindingAccepts(settlementClient, { ...snapshot, leaseExpiresAt: new Date(snapshot.leaseExpiresAt!.getTime() + 1) }, sourceProjection),
+          "the same source proof must not transfer to a changed lease expiry").resolves.toBe(false)
+        await expect(historicalWaitBindingAccepts(settlementClient, { ...snapshot, attemptCount: snapshot.attemptCount + 1 }, sourceProjection),
+          "the same source proof must not transfer to another attempt").resolves.toBe(false)
+        await expect(historicalWaitBindingAccepts(settlementClient, { ...snapshot, userId: `${snapshot.userId}:wrong` }, sourceProjection),
+          "the same source proof must not transfer to another tenant").resolves.toBe(false)
 
-        const forgedHandoffProjection = JSON.parse(JSON.stringify(handoffSource)) as Record<string, unknown>
-        const forgedHandoff = asObject(forgedHandoffProjection.sourceStepHandoff)
-        forgedHandoffProjection.sourceStepHandoff = { ...forgedHandoff, schemaVersion: "recovered_wait_handoff.forged" }
-        await expect(historicalWaitBindingAccepts(settlementClient, snapshot, forgedHandoffProjection),
-          "the final PostgreSQL binding must reject a forged in-memory handoff marker").resolves.toBe(false)
-        const duplicateAnchorProjection = JSON.parse(JSON.stringify(handoffSource)) as Record<string, unknown>
-        const duplicateAnchorHandoff = asObject(duplicateAnchorProjection.sourceStepHandoff)
-        const proofEvents = Array.isArray(duplicateAnchorHandoff.events) ? duplicateAnchorHandoff.events : []
-        expect(proofEvents).toHaveLength(6)
-        duplicateAnchorProjection.sourceStepHandoff = { ...duplicateAnchorHandoff, events: [...proofEvents.slice(0, 5), proofEvents[0]] }
-        await expect(historicalWaitBindingAccepts(settlementClient, snapshot, duplicateAnchorProjection),
-          "the final PostgreSQL binding must reject duplicate handoff event anchors").resolves.toBe(false)
-        const missingAnchorProjection = JSON.parse(JSON.stringify(handoffSource)) as Record<string, unknown>
-        const missingAnchorHandoff = asObject(missingAnchorProjection.sourceStepHandoff)
-        const missingProofEvents = Array.isArray(missingAnchorHandoff.events) ? missingAnchorHandoff.events : []
-        missingAnchorProjection.sourceStepHandoff = { ...missingAnchorHandoff, events: missingProofEvents.slice(0, 5) }
-        await expect(historicalWaitBindingAccepts(settlementClient, snapshot, missingAnchorProjection),
-          "the final PostgreSQL binding must reject a handoff missing an event anchor").resolves.toBe(false)
-
-        const expectHandoffProducerRejected = async (label: string, mutate: () => Promise<{ rowCount: number | null }>) => {
-          await settlementClient.query("SAVEPOINT historical_wait_handoff_tamper")
+        const expectSourceProducerRejected = async (label: string, mutate: () => Promise<{ rowCount: number | null }>) => {
+          await settlementClient.query("SAVEPOINT historical_wait_source_tamper")
           try {
             const changed = await mutate()
             expect(changed.rowCount, `${label} fixture mutation`).toBe(1)
@@ -6332,35 +6428,30 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
               `${label} must not produce a historical source or claim proof`).toBe(0)
             await expect(blocking(), `${label} must leave the source wait blocking`).resolves.toBe(true)
           } finally {
-            await settlementClient.query("ROLLBACK TO SAVEPOINT historical_wait_handoff_tamper")
-            await settlementClient.query("RELEASE SAVEPOINT historical_wait_handoff_tamper")
+            await settlementClient.query("ROLLBACK TO SAVEPOINT historical_wait_source_tamper")
+            await settlementClient.query("RELEASE SAVEPOINT historical_wait_source_tamper")
           }
         }
 
-        await expectHandoffProducerRejected("forged persisted source lifecycle marker", () => settlementClient.query(
-          `UPDATE "agent_wait_conditions" SET "result" = jsonb_set("result", '{sourceLifecycleRecovery,taskId}', to_jsonb($5::text), false)
-            WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "parentTaskId" = $4 RETURNING "id"`,
-          [wait.rows[0]!.id, ids.sessionId, ids.turnId, ids.waiterTaskId, `forged-task-${randomUUID()}`]))
-
         const extraSourceToolId = `fixture-extra-source-tool:${randomUUID()}`
-        await expectHandoffProducerRejected("additional source-step tool call", () => settlementClient.query(
+        await expectSourceProducerRejected("additional source-step tool call", () => settlementClient.query(
           `INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "revision", "content", "startedAt", "updatedAt")
            VALUES ($1, $2, $3, $4, $5, 'tool_call', 'started', NULL, 0, $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
           [`task:${ids.waiterTaskId}:item:tool-call:${extraSourceToolId}:attempt:1`, ids.sessionId, ids.turnId,
-            handoffSource.stepId, ids.waiterTaskId, JSON.stringify({ toolCallId: extraSourceToolId,
+            sourceProjection.stepId, ids.waiterTaskId, JSON.stringify({ toolCallId: extraSourceToolId,
               toolName: "jobs.search", toolVersion: "1", input: { query: "fixture" } })]))
 
-        const missingHandoffAnchor = handoffSource.sourceStepHandoff.events.find(event => event.type === "model.usage")
-        if (!missingHandoffAnchor) throw new Error("historical_wait_handoff_usage_anchor_missing")
-        await expectHandoffProducerRejected("missing recovered-step event anchor", () => settlementClient.query(
+        const missingSourceAnchor = sourceProjection.sourceStepPrefix.events.find(event => event.type === "model.usage")
+        if (!missingSourceAnchor) throw new Error("historical_wait_source_usage_anchor_missing")
+        await expectSourceProducerRejected("missing source-step event anchor", () => settlementClient.query(
           `UPDATE "agent_events" SET "idempotencyKey" = "idempotencyKey" || ':tampered'
             WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 RETURNING "id"`,
-          [missingHandoffAnchor.id, ids.sessionId, ids.turnId, ids.waiterTaskId]))
+          [missingSourceAnchor.id, ids.sessionId, ids.turnId, ids.waiterTaskId]))
 
-        const duplicateAnchor = handoffSource.sourceStepHandoff.events.find(event => event.type === "item.started"
-          && event.itemId === handoffSource.callItemId)
-        if (!duplicateAnchor) throw new Error("historical_wait_handoff_item_anchor_missing")
-        await expectHandoffProducerRejected("duplicate source item-started anchor", async () => {
+        const duplicateAnchor = sourceProjection.sourceStepPrefix.events.find(event => event.type === "item.started"
+          && event.itemId === sourceProjection.callItemId)
+        if (!duplicateAnchor) throw new Error("historical_wait_source_item_anchor_missing")
+        await expectSourceProducerRejected("duplicate source item-started anchor", async () => {
           const original = await settlementClient.query<{ payload: Record<string, unknown>; causationId: string | null;
             correlationId: string; itemId: string | null }>(`SELECT "payload", "causationId", "correlationId", "itemId"
               FROM "agent_events" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4`,
@@ -6377,31 +6468,14 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
             `${duplicateAnchor.idempotencyKey}:duplicate:${randomUUID()}`, JSON.stringify(original.rows[0]!.payload)])
         })
 
-        const wrongCauseAnchor = handoffSource.sourceStepHandoff.events.find(event => event.type === "model.completed")
-        if (!wrongCauseAnchor) throw new Error("historical_wait_handoff_model_completion_anchor_missing")
-        await expectHandoffProducerRejected("wrong recovered-step event causation", () => settlementClient.query(
+        const wrongCauseAnchor = sourceProjection.sourceStepPrefix.events.find(event => event.type === "model.completed")
+        if (!wrongCauseAnchor) throw new Error("historical_wait_source_model_completion_anchor_missing")
+        await expectSourceProducerRejected("wrong source-step event causation", () => settlementClient.query(
           `UPDATE "agent_events" SET "causationId" = $5 WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 RETURNING "id"`,
           [wrongCauseAnchor.id, ids.sessionId, ids.turnId, ids.waiterTaskId, `unrelated-cause:${randomUUID()}`]))
 
-        await settlementClient.query("SAVEPOINT historical_handoff_marker_owner_toctou")
-        try {
-          const changedMarker = await settlementClient.query(`UPDATE "agent_wait_conditions"
-            SET "result" = jsonb_set("result", '{sourceLifecycleRecovery,ownerId}', to_jsonb($5::text), false)
-            WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "parentTaskId" = $4 RETURNING "id"`,
-          [wait.rows[0]!.id, ids.sessionId, ids.turnId, ids.waiterTaskId, `different-owner-${randomUUID()}`])
-          expect(changedMarker.rowCount).toBe(1)
-          await expect(historicalWaitBindingAccepts(settlementClient, snapshot, handoffSource),
-            "the final PostgreSQL binding must reject a lifecycle owner marker changed after projection read").resolves.toBe(false)
-          const postTamperProjections = await readChildWaitTerminalCallProjections(settlementClient, snapshot as unknown as Record<string, unknown>)
-          expect(postTamperProjections.filter(projection => projection.sourceWait.waitId === wait.rows[0]!.id).length).toBe(0)
-          await expect(blocking(), "a changed lifecycle owner marker must keep the wait blocking").resolves.toBe(true)
-        } finally {
-          await settlementClient.query("ROLLBACK TO SAVEPOINT historical_handoff_marker_owner_toctou")
-          await settlementClient.query("RELEASE SAVEPOINT historical_handoff_marker_owner_toctou")
-        }
-
-        // The source projection above is the real recovered handoff for this same PG fixture;
-        // these canonical outcome checks therefore exercise handoff settlement, not a prefix mock.
+        // The source projection above is the real normal waiting prefix for this same PG fixture;
+        // these canonical outcome checks exercise normal-source settlement, not a prefix mock.
         const expectSelfConsistentOutcomeRejected = async (label: string, status: "ready" | "timed_out", matchedTaskIds: string[], outcome: Record<string, unknown>) => {
           await settlementClient.query("SAVEPOINT self_consistent_malformed_wait_outcome")
           try {

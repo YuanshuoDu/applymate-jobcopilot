@@ -1452,7 +1452,19 @@ try {
       throw new Error(`recovery_pre_snapshot_query_failed:${before.code ?? "unknown"}`)
     }
     const recoveryStartedAt = diagnosticsEnabled ? new Date().toISOString() : undefined
-    const recovered = await manager.recover()
+    const recoveryTraceTaskIdKey = "AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID"
+    const previousRecoveryTraceTaskId = process.env[recoveryTraceTaskIdKey]
+    const predicateTraceEnabled = mode === "worker-b-loop-final"
+    if (predicateTraceEnabled) process.env[recoveryTraceTaskIdKey] = ids.waiterTaskId
+    let recovered
+    try {
+      recovered = await manager.recover()
+    } finally {
+      if (predicateTraceEnabled) {
+        if (previousRecoveryTraceTaskId === undefined) delete process.env[recoveryTraceTaskIdKey]
+        else process.env[recoveryTraceTaskIdKey] = previousRecoveryTraceTaskId
+      }
+    }
     const recoveryCompletedAt = diagnosticsEnabled ? new Date().toISOString() : undefined
     if (diagnosticsEnabled && !recovered.rows.some(row => row.id === ids.waiterTaskId)) {
       const after = await readRecoveryStateSnapshot(pool, ids)
