@@ -1603,6 +1603,7 @@ worker.on("completed", (job, result) => {
           && Number.isSafeInteger(attemptCount) && attemptCount >= 1
           && identity.generation < attemptCount - 1) {
           say(`WORKER_B_STALE_DISPATCH_SKIPPED ${JSON.stringify({ dispatchGeneration, currentPublishedGeneration: attemptCount - 1 })}`)
+          if (mode === "worker-b-loop-final") await stop(0)
           return
         }
       } catch (error) {
@@ -1639,6 +1640,7 @@ worker.on("completed", (job, result) => {
         ? { result: markerResult }
         : { result, taskId: ids.waiterTaskId, dispatchGeneration }
     say(`${marker} ${JSON.stringify(markerPayload)}`)
+    if (mode === "worker-b-loop-final") return
     await stop(0)
   })().catch(error => {
     if (boundedLoopDiagnosticModes.has(mode)) traceLoopStage("other", "fail")

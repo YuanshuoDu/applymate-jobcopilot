@@ -6470,7 +6470,8 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
             AND call."type" = 'tool_call' AND call."content"->>'toolName' = 'wait_subagents'
             AND encode(sha256(convert_to(call."content"->'input'->>'idempotencyKey', 'UTF8')), 'hex') = $5`,
         [ids.sessionId, ids.turnId, ids.waiterTaskId, owner.attemptCount, claimKeyDigest])
-        expect(sameDigestClaimCount.rows).toEqual([{ count: 1, stepCount: 1 }])
+        // Both historical source waits intentionally reuse the task-scoped claim key.
+        expect(sameDigestClaimCount.rows).toEqual([{ count: 2, stepCount: 2 }])
         const differentDigestSameWaitCount = await checkClient.query<{ count: number; stepCount: number }>(`SELECT COUNT(*)::int AS "count", COUNT(DISTINCT call."stepId")::int AS "stepCount"
           FROM "agent_items" AS call JOIN "agent_steps" AS step ON step."id" = call."stepId"
             AND step."sessionId" = call."sessionId" AND step."turnId" = call."turnId" AND step."taskId" = call."taskId"
