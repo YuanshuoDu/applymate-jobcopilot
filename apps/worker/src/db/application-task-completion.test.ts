@@ -4,6 +4,7 @@ import { hashApprovalScope } from "@jobcopilot/agent-protocol"
 import { hashAgentReceiptValue } from "@jobcopilot/shared"
 import { protocolScope, type ApprovalScopeInput } from "../runtime/approval/types.js"
 import { hashArtifactContent } from "../runtime/subagents/artifact-adapters.js"
+import * as artifactAdapters from "../runtime/subagents/artifact-adapters.js"
 import type { SubagentLease } from "../runtime/subagents/types.js"
 import { acknowledgeApplicationFillCancellation, completeApplicationFillForReview, failApplicationFillBeforeBrowser, persistApplicationFillWait } from "./application-task-completion.js"
 
@@ -40,7 +41,7 @@ async function approvalFixture(
     id: `application-fill:${task.id}:turn-a`, userId: "user-a", sessionId: "session-a", turnId: "turn-a", jobId: task.jobId,
     type: "submit_application", taskId: "filler-task", status, toolCallId: `application-submit:${task.id}`,
     payload: artifact.payload, resourceHash: artifact.hash.slice("sha256:".length), materialHash: artifact.materialHash, answersHash: artifact.answersHash,
-    nonceHash: "sha256:fixture-nonce-hash", revision, expiresAt: new Date("2099-11-01T00:00:00.000Z"), scopeHash: "",
+    nonceHash: "d".repeat(64), revision, expiresAt: new Date("2099-11-01T00:00:00.000Z"), scopeHash: "",
   }
   if (mismatch === "turn") row.turnId = "foreign-turn"
   if (mismatch === "user") row.userId = "foreign-user"
@@ -140,6 +141,18 @@ function fixture(options: {
 }
 
 describe("ApplicationTask fill completion", () => {
+  it("rejects malformed artifact hashes and rolls back before issuing an approval", async () => {
+    const test = fixture()
+    const hash = vi.spyOn(artifactAdapters, "hashArtifactContent").mockReturnValueOnce(`sha256:${"a".repeat(64)}\n`)
+
+    try {
+      await expect(completeApplicationFillForReview(test.pool, { lease: test.lease })).rejects.toThrow("Application submission artifact hash is invalid")
+    } finally { hash.mockRestore() }
+
+    expect(test.calls.some(call => call.sql.includes('INSERT INTO "agent_approvals"'))).toBe(false)
+    expect(test.calls.some(call => call.sql === "ROLLBACK")).toBe(true)
+  })
+
   it("commits the exact bound Turn, task, artifact, approval wait, and session on one client in lock order", async () => {
     const test = fixture()
     const now = new Date()

@@ -101,7 +101,10 @@ function exactSubmissionPayload(value: unknown, expected: ReturnType<typeof subm
 
 function date(value: Date | string | null): Date | undefined { if (!value) return undefined; const parsed = value instanceof Date ? value : new Date(value); return Number.isFinite(parsed.getTime()) ? parsed : undefined }
 
-function approvalResourceHash(value: string): string | undefined { return /^sha256:([a-f0-9]{64})$/.exec(value)?.[1] }
+function approvalResourceHash(value: string): string | undefined {
+  const match = /^sha256:([a-f0-9]{64})$/.exec(value)
+  return match?.[0] === value ? match[1] : undefined
+}
 
 async function existingCompletion(client: Client, lease: SubagentLease, task: ApplicationRow, turn: TurnRow, approvedOnly = false): Promise<boolean> {
   const payload = submissionPayload(task), turnId = lease.turnId
