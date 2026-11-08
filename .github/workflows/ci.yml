@@ -278,7 +278,8 @@ jobs:
           CSR_PATH="$TLS_DIR/boards.greenhouse.io.csr"
           EXT_PATH="$TLS_DIR/boards.greenhouse.io.ext"
 
-          sudo useradd --system --uid "$TEST_UID" --user-group --no-create-home --home-dir "$TEST_HOME" --shell /usr/sbin/nologin "$TEST_USER"
+          TEST_RUNNER_GROUP="$(id -gn)"
+          sudo useradd --system --uid "$TEST_UID" --user-group --groups "$TEST_RUNNER_GROUP" --no-create-home --home-dir "$TEST_HOME" --shell /usr/sbin/nologin "$TEST_USER"
           TEST_USER_CREATED=true
           TEST_GID="$(id -g "$TEST_USER")"
           mkdir -p "$TEST_HOME" "$TEST_TMPDIR" "$PROFILE_DIR" "$TLS_DIR"
@@ -309,7 +310,7 @@ jobs:
           sudo chmod 700 "$TEST_ROOT" "$TEST_HOME" "$TEST_TMPDIR" "$PROFILE_DIR" "$TLS_DIR"
           sudo install -d -o "$TEST_UID" -g "$TEST_GID" -m 700 "$TEST_HOME/.pki" "$NSS_DIR"
           echo "NSS diagnostic: starting dedicated-user path/access probe"
-          sudo -u "$TEST_USER" -- env PATH="$PATH" HOME="$TEST_HOME" NSS_DIR="$NSS_DIR" sh -eu -c '
+          sudo -u "$TEST_USER" -- env PATH="$PATH" HOME="$TEST_HOME" NSS_DIR="$NSS_DIR" GITHUB_WORKSPACE="$GITHUB_WORKSPACE" sh -eu -c '
             id
             printf "HOME=%s\nNSS_DIR=%s\n" "$HOME" "$NSS_DIR"
             namei -l "$NSS_DIR"
@@ -319,6 +320,10 @@ jobs:
             probe_path="$(mktemp "$NSS_DIR/.applymate-nss-probe.XXXXXX")"
             rm -- "$probe_path"
             echo "NSS diagnostic: dedicated-user path/access probe passed"
+            package_path="$GITHUB_WORKSPACE/apps/worker/node_modules/cloakbrowser/package.json"
+            test -r "$package_path"
+            cat "$package_path" >/dev/null
+            echo "NSS diagnostic: dedicated-user CloakBrowser package read passed"
           '
           echo "NSS diagnostic: starting certutil -N database initialization"
           sudo -u "$TEST_USER" -- env PATH="$PATH" HOME="$TEST_HOME" \
