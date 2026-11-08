@@ -115,6 +115,7 @@ function spawnFixture(mode: "site" | "worker"): Child {
       AGENT_TURN_REDIS_TEST_DISPOSABLE: "true", RUN_AGENT_TURN_REDIS_INTEGRATION: "1",
       CLOAK_PROXY_URL: "http://127.0.0.1:9443", APPLICATION_TASK_FULL_LOOP_SOCKET_PATH: socketPath,
       BULLMQ_STALLED_INTERVAL_MS: "30000",
+      ...(mode === "worker" ? { APPLICATION_TASK_FULL_LOOP_USER_ID: ids.user } : {}),
     },
     stdio: ["pipe", "pipe", "pipe"],
   }) as Child
@@ -328,8 +329,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     site = spawnFixture("site")
     await waitLine(site, "FIXTURE_READY")
     worker = spawnFixture("worker")
-    await waitLine(worker, "WORKER_READY")
-  }, 60_000)
+    await waitLine(worker, "WORKER_READY", 90_000)
+  }, 120_000)
 
   afterAll(async () => {
     let cleanupError: unknown
@@ -559,7 +560,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     worker!.kill("SIGKILL")
     expect(await waitExit(worker!, 5_000)).toBe(true)
     worker = spawnFixture("worker")
-    await waitLine(worker, "WORKER_READY")
+    await waitLine(worker, "WORKER_READY", 90_000)
     const redeliveryEvent = await waitForWorkerRedelivery(worker, String(intent.workerTaskId))
     const fixtureStats = await requestFixtureStats()
     expect(fixtureStats.submitCount).toBe(1)

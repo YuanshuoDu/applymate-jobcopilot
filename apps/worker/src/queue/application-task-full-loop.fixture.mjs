@@ -165,6 +165,8 @@ function fixtureModel() {
 }
 
 async function startWorker() {
+  const userId = required("APPLICATION_TASK_FULL_LOOP_USER_ID")
+  if (!userId.startsWith("full-loop-user-")) throw new Error("application_task_full_loop_synthetic_user_required")
   const databaseUrl = required("AGENT_RUNTIME_PG_TEST_URL")
   const redisUrl = required("AGENT_TURN_REDIS_TEST_URL")
   if (databaseUrl !== process.env.DATABASE_URL || redisUrl !== process.env.REDIS_URL
@@ -177,11 +179,11 @@ async function startWorker() {
   const noOpProjection = { start: async () => undefined, finish: async () => undefined }
   const [{ createCanonicalTurnRuntime }, { createOptionalProductionChildExecutor }, { startProductionAgentRuntime },
     { startProductionWorkerRuntime }, { resolveProductionAgentFlags }, taskGraphCommandPortModule,
-    taskGraphTemplatesModule, queue, outbox, { closeAllSlots }, redis] = await Promise.all([
+    taskGraphTemplatesModule, queue, outbox, { withCloakContext, closeAllSlots }, redis] = await Promise.all([
     import("../runtime/canonical-turn-runtime.ts"), import("../runtime/subagents/production-child-runtime.ts"),
     import("./production-bootstrap.ts"), import("./production-worker-runtime.ts"), import("../runtime/production-agent-flags.ts"),
     import("../runtime/subagents/pg-task-graph-command-port.ts"), import("../runtime/subagents/task-graph-templates.ts"),
-    import("./apply-queue.ts"), import("./application-submit-outbox.ts"), import("../cloak/pool.ts"), import("../redis.ts"),
+    import("./apply-queue.ts"), import("./application-submit-outbox.ts"), import("../cloak/pool.js"), import("../redis.ts"),
   ])
   const flags = { ...resolveProductionAgentFlags(), taskGraphPlanningEnabled: true, childExecutionEnabled: true,
     coordinationEnabled: true, consumeWaitOutcomes: true, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false }
@@ -189,6 +191,11 @@ async function startWorker() {
     ? taskGraphCommandPortModule.createPgTaskGraphCommandPort(pool) : undefined
   const authorizeUsage = async () => ({ settle: async () => undefined })
   let bootstrap
+  await withCloakContext(userId, async page => {
+    const response = await page.goto("https://boards.greenhouse.io/example/jobs/1")
+    if (response?.status() !== 200) throw new Error("application_task_full_loop_browser_warmup_http_status_unexpected")
+    if (await page.title() !== "Fixture Application") throw new Error("application_task_full_loop_browser_warmup_title_unexpected")
+  })
   await startProductionWorkerRuntime({ pool, workerId: `application-full-loop-${process.pid}`, productionFlags: flags,
     onBootstrapReady: value => { bootstrap = value }, startAgentRunWorker() {} }, {
     createOptionalProductionChildExecutor: options => options.enabled
