@@ -5919,11 +5919,49 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         expect(firstClaimProjection.sourceWait.claimKeyDigest).toBe(secondClaimProjection.sourceWait.claimKeyDigest)
         expect(firstClaimProjection.sourceWait.waitId).not.toBe(secondClaimProjection.sourceWait.waitId)
         expect(firstClaimProjection.callItemId).not.toBe(secondClaimProjection.callItemId)
+        if (!firstClaimProjection.resultItemId) throw new Error("two_historical_wait_first_claim_result_missing")
+        const firstClaimOutcome = await checkClient.query<{ sourceOutput: unknown; claimOutput: unknown; durableOutcome: unknown }>(
+          `SELECT sourceResult."content"->'output' AS "sourceOutput", claimResult."content"->'output' AS "claimOutput",
+            boundWait."result"->'outcome' AS "durableOutcome"
+           FROM "agent_wait_conditions" AS boundWait
+           JOIN "agent_items" AS sourceResult ON sourceResult."id" = $2 AND sourceResult."sessionId" = boundWait."sessionId"
+             AND sourceResult."turnId" = boundWait."turnId" AND sourceResult."taskId" = boundWait."parentTaskId"
+             AND sourceResult."type" = 'tool_result'
+           JOIN "agent_items" AS claimResult ON claimResult."id" = $3 AND claimResult."sessionId" = boundWait."sessionId"
+             AND claimResult."turnId" = boundWait."turnId" AND claimResult."taskId" = boundWait."parentTaskId"
+             AND claimResult."type" = 'tool_result'
+           WHERE boundWait."id" = $1 AND boundWait."parentTaskId" = $4 AND boundWait."sessionId" = $5
+             AND boundWait."turnId" = $6`,
+        [firstClaimProjection.sourceWait.waitId, firstClaimProjection.sourceWait.sourceResultItemId,
+          firstClaimProjection.resultItemId, ids.waiterTaskId, ids.sessionId, ids.turnId])
+        expect(firstClaimOutcome.rows).toHaveLength(1)
+        expect(asObject(firstClaimOutcome.rows[0]?.sourceOutput).status).toBe("waiting")
+        expect(firstClaimOutcome.rows[0]?.claimOutput).toEqual(firstClaimOutcome.rows[0]?.durableOutcome)
+        expect(firstClaimOutcome.rows[0]?.claimOutput).not.toEqual(firstClaimOutcome.rows[0]?.sourceOutput)
         await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, secondSourceProjection),
           "real PG binding accepts source identity from its top-level and nested sourceWait fields").resolves.toBe(true)
         const firstClaimBindingAccepted = await historicalWaitBindingAccepts(checkClient, scopedOwner, firstClaimProjection, projections)
         await expect(Promise.resolve(firstClaimBindingAccepted),
           "real PG binding accepts the first of two independently source-bound claims with the same projected digest").resolves.toBe(true)
+        if (!firstClaimProjection.resultCompletedEventId) throw new Error("two_historical_wait_first_claim_result_event_missing")
+        await checkClient.query("SAVEPOINT first_claim_output_mismatch")
+        const mismatchedClaimOutput = await checkClient.query<{ content: unknown }>(`UPDATE "agent_items" SET "content" =
+            jsonb_set("content", '{output,tasks}', '[]'::jsonb, false)
+          WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 AND "type" = 'tool_result'
+          RETURNING "content"`,
+        [firstClaimProjection.resultItemId, ids.sessionId, ids.turnId, ids.waiterTaskId])
+        expect(mismatchedClaimOutput.rows).toHaveLength(1)
+        const mismatchedClaimCompletion = await checkClient.query(`UPDATE "agent_events" SET "payload" =
+            jsonb_set("payload", '{content}', $5::jsonb, false)
+          WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4
+            AND "itemId" = $6 AND "type" = 'item.completed' RETURNING "id"`,
+        [firstClaimProjection.resultCompletedEventId, ids.sessionId, ids.turnId, ids.waiterTaskId,
+          JSON.stringify(mismatchedClaimOutput.rows[0]!.content), firstClaimProjection.resultItemId])
+        expect(mismatchedClaimCompletion.rowCount).toBe(1)
+        await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, firstClaimProjection, projections),
+          "final SQL rejects a claim result that differs from its resolved durable wait outcome").resolves.toBe(false)
+        await checkClient.query("ROLLBACK TO SAVEPOINT first_claim_output_mismatch")
+        await checkClient.query("RELEASE SAVEPOINT first_claim_output_mismatch")
         const secondClaimBindingAccepted = await historicalWaitBindingAccepts(checkClient, scopedOwner, secondClaimProjection, projections)
         const secondClaimBindingDiagnostic = secondClaimBindingAccepted ? undefined
           : await diagnoseHistoricalWaitBinding(checkClient, scopedOwner, secondClaimProjection, secondSourceProjection)
@@ -5962,6 +6000,15 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
           sourceWait: { ...secondClaimProjection.sourceWait, sourceCallItemId: secondClaimProjection.callItemId,
             sourceCallId: secondClaimProjection.rawCallId, projectedSourceCallId: secondClaimProjection.projectedCallId } }, projections),
         "a claim cannot rebind the nested sourceWait to its continuation call").resolves.toBe(false)
+        await checkClient.query("SAVEPOINT two_wait_scalar_claim_content")
+        const scalarClaimContent = await checkClient.query(`UPDATE "agent_items" SET "content" = 'null'::jsonb
+          WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4 AND "type" = 'tool_call'`,
+        [secondClaimProjection.callItemId, ids.sessionId, ids.turnId, ids.waiterTaskId])
+        expect(scalarClaimContent.rowCount).toBe(1)
+        await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, secondClaimProjection, projections),
+          "final SQL rejects scalar persisted claim content without a JSON shape error").resolves.toBe(false)
+        await checkClient.query("ROLLBACK TO SAVEPOINT two_wait_scalar_claim_content")
+        await checkClient.query("RELEASE SAVEPOINT two_wait_scalar_claim_content")
         const firstClaimCompletionKey = `task:${ids.waiterTaskId}:event:tool-call-completed:${firstClaimProjection.rawCallId}:${firstClaimProjection.callItemId}:1`
         const firstClaimCompletion = await checkClient.query<{ id: string }>(`SELECT "id" FROM "agent_events"
           WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "itemId" = $4

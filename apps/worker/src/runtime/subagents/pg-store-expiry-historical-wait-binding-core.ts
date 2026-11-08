@@ -145,7 +145,8 @@ export function buildHistoricalWaitBindingSql(extraPredicate: string): string { 
             AND nextStep."taskId" = owner."id" AND nextStep."attempt" = owner."attemptCount"
             AND nextStep."ordinal" > boundSource."ordinal" ORDER BY nextStep."ordinal", nextStep."id" LIMIT 1)
         AND callItem."id" = 'task:' || owner."id" || ':item:tool-call:' || (callItem."content"->>'toolCallId') || ':attempt:' || callStep."attempt"::text
-        AND (SELECT COUNT(*) FROM jsonb_object_keys(callItem."content")) = 6
+        AND CASE WHEN jsonb_typeof(callItem."content") = 'object'
+          THEN (SELECT COUNT(*) FROM jsonb_object_keys(callItem."content")) = 6 ELSE FALSE END
         AND callItem."content" = jsonb_build_object('toolCallId', callItem."content"->>'toolCallId', 'toolName', 'wait_subagents',
           'toolVersion', '1', 'input', callItem."content"->'input', 'status', 'completed', 'errorCode', NULL)
         AND callItem."content"->>'status' = 'completed'

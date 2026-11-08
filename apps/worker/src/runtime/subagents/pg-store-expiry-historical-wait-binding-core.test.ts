@@ -40,6 +40,11 @@ describe("historical wait core binding", () => {
     expect(balanced(sql)).toBe(true)
   })
 
+  it("rejects scalar claim content before enumerating object keys", () => {
+    const sql = CHILD_WAIT_HISTORICAL_WAIT_CORE_BINDING_SQL.replace(/\s+/g, " ")
+    expect(sql).toContain('CASE WHEN jsonb_typeof(callItem."content") = \'object\' THEN (SELECT COUNT(*) FROM jsonb_object_keys(callItem."content")) = 6 ELSE FALSE END')
+  })
+
   it("matches only canonical positive JSON int4 source attempts without casting untrusted text", () => {
     const sql = CHILD_WAIT_HISTORICAL_WAIT_CORE_BINDING_SQL
     expect(sql).toContain("jsonb_typeof(proof.value->'sourceWait'->'sourceAttempt') = 'number'")

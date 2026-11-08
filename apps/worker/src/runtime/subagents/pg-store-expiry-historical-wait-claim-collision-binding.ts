@@ -120,7 +120,7 @@ function claimResultBinding(wait: string): string {
       AND CASE WHEN jsonb_typeof(claimResult."content"->'output') = 'object' THEN
         (SELECT COUNT(*) FROM jsonb_object_keys(claimResult."content"->'output')) = 6
           AND claimResult."content"->'output' ?& ARRAY['waitId', 'status', 'taskIds', 'deadlineAt', 'matchedTaskIds', 'tasks'] ELSE FALSE END
-      AND claimResult."content"->'output' = sourceResult."content"->'output'
+      AND claimResult."content"->'output' = ${wait}."result"->'outcome'
       AND claimResult."content"->'output'->>'waitId' = ${wait}."id"
       AND claimResult."content"->'output'->>'status' = ${wait}."status"
       AND claimResult."content"->'output'->>'deadlineAt' = proof.value->'sourceWait'->>'deadlineAt'

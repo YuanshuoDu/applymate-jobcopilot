@@ -43,6 +43,13 @@ describe("historical wait claim collision final binding", () => {
     expect(balanced(compact)).toBe(true)
   })
 
+  it("binds each continuation result to its resolved wait outcome, separately from the source receipt", () => {
+    expect(compact).toContain('claimResult."content"->\'output\' = boundWait."result"->\'outcome\'')
+    expect(compact).toContain('claimResult."content"->\'output\' = peerWait."result"->\'outcome\'')
+    expect(compact).not.toContain('claimResult."content"->\'output\' = sourceResult."content"->\'output\'')
+    expect(compact).toContain('sourceResult."id" = proof.value->\'sourceWait\'->>\'sourceResultItemId\'')
+  })
+
   it("requires a one-to-one peer reference and proof set and fails closed on missing or duplicate proof", () => {
     expect(compact).toContain("COUNT(DISTINCT ref.value #>> '{}')")
     expect(compact).toContain("COUNT(DISTINCT currentProof.value->>'callItemId')")
