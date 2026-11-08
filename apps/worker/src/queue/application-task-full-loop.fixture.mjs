@@ -151,7 +151,7 @@ function fixtureModel() {
         if (round === 2) {
           yield { type: "tool_call_completed", callId: `full-loop-wait-${process.pid}`, name: "agent.wait", arguments: {
             idempotencyKey: `application-task-full-loop:${process.pid}:${round}`,
-            taskIds: [taskIdFromPlan(request)], mode: "all", timeoutMs: 120_000,
+            taskIds: [taskIdFromPlan(request)], mode: "all", timeoutMs: 30_000,
           } }
           yield { type: "completed", finishReason: "tool_calls" }
           return
