@@ -218,7 +218,7 @@ jobs:
             if [ "$TEST_USER_CREATED" = "true" ]; then sudo userdel "$TEST_USER" || cleanup_errors=1; fi
             if [ -n "$TEST_ROOT" ]; then
               case "$TEST_ROOT" in
-                "$RUNNER_TEMP"/applymate-full-loop.*) sudo rm -rf -- "$TEST_ROOT" || cleanup_errors=1 ;;
+                /tmp/applymate-full-loop.*) sudo rm -rf -- "$TEST_ROOT" || cleanup_errors=1 ;;
                 *) echo "Refusing to remove unexpected temporary path: $TEST_ROOT" >&2; result=1 ;;
               esac
             fi
@@ -261,9 +261,9 @@ jobs:
             exit 1
           fi
 
-          TEST_ROOT="$(mktemp -d "$RUNNER_TEMP/applymate-full-loop.XXXXXX")"
+          TEST_ROOT="$(mktemp -d /tmp/applymate-full-loop.XXXXXX)"
           case "$TEST_ROOT" in
-            "$RUNNER_TEMP"/applymate-full-loop.*) ;;
+            /tmp/applymate-full-loop.*) ;;
             *) echo "Unexpected temporary path: $TEST_ROOT" >&2; exit 1 ;;
           esac
           TEST_HOME="$TEST_ROOT/home"
