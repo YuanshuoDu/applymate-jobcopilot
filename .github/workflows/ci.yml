@@ -308,12 +308,26 @@ jobs:
           sudo chown -R "$TEST_UID:$TEST_GID" "$TEST_ROOT"
           sudo chmod 700 "$TEST_ROOT" "$TEST_HOME" "$TEST_TMPDIR" "$PROFILE_DIR" "$TLS_DIR"
           sudo install -d -o "$TEST_UID" -g "$TEST_GID" -m 700 "$TEST_HOME/.pki" "$NSS_DIR"
+          echo "NSS diagnostic: starting certutil -N database initialization"
           sudo -u "$TEST_USER" -- env PATH="$PATH" HOME="$TEST_HOME" \
             certutil -N --empty-password -d "sql:$NSS_DIR"
+          echo "NSS diagnostic: certutil -N passed"
+          sudo -u "$TEST_USER" -- env PATH="$PATH" HOME="$TEST_HOME" \
+            stat -c 'NSS database path=%n type=%F owner=%U:%G mode=%a' "$NSS_DIR"
+          sudo -u "$TEST_USER" -- env PATH="$PATH" HOME="$TEST_HOME" \
+            find "$NSS_DIR" -mindepth 1 -maxdepth 1 -printf 'NSS database entry=%f type=%y owner=%u:%g mode=%m\n' | sort
+          echo "NSS diagnostic: starting empty-database certutil -L read"
+          sudo -u "$TEST_USER" -- env PATH="$PATH" HOME="$TEST_HOME" \
+            certutil -L -d "sql:$NSS_DIR" >/dev/null
+          echo "NSS diagnostic: empty-database certutil -L passed"
+          echo "NSS diagnostic: starting certutil -A -a PEM CA import"
           sudo -u "$TEST_USER" -- env PATH="$PATH" HOME="$TEST_HOME" \
             certutil -A -a -d "sql:$NSS_DIR" -n applymate-full-loop-test-ca -t "C,," -i "$CA_PATH"
+          echo "NSS diagnostic: certutil -A PEM import passed"
+          echo "NSS diagnostic: starting named CA certutil -L read"
           sudo -u "$TEST_USER" -- env PATH="$PATH" HOME="$TEST_HOME" \
             certutil -L -d "sql:$NSS_DIR" -n applymate-full-loop-test-ca >/dev/null
+          echo "NSS diagnostic: named CA certutil -L passed"
 
           if sudo iptables -S "$CHAIN4" >/dev/null 2>&1 || sudo ip6tables -S "$CHAIN6" >/dev/null 2>&1; then
             echo "Refusing to reuse an existing egress chain" >&2
