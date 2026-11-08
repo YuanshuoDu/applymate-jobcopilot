@@ -3427,8 +3427,10 @@ for (const status of ['applied', 'interview'] as const) {
     test(`${status} application can refresh ${coverage} task status without changing its record`, async ({ page }) => {
       const state = await install(page, { taskFailure: coverage === 'unavailable', taskLimited: coverage === 'limited' })
       state.job.status = status
-      state.job.appliedAt = time
-      state.job.workflowState = 'submitted'
+      if (status === 'applied') {
+        state.job.appliedAt = time
+        state.job.workflowState = 'submitted'
+      }
       await open(page)
       const drawer = page.getByRole('dialog')
       const title = status === 'applied' ? /^(Application record|申请记录)$/ : /^(Review application status|核对申请状态)$/
