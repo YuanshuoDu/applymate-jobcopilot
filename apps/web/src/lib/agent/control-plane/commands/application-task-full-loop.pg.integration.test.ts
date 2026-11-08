@@ -245,6 +245,7 @@ async function answerResumeFailureCategory(response: Response): Promise<string> 
     const error = (await jsonResponse(response.clone())).error
     if (typeof error !== "string") return "unclassified"
     switch (error) {
+      case "A complete job description is required before materials can be generated.": return "job_description_required"
       case "Application fill materials are unavailable for this task": return "command_preflight_materials_unavailable"
       case "Agent session is no longer waiting for user input": return "session_status_compare_and_set"
       case "Application fill attempt was claimed by another request": return "application_task_claim_compare_and_set"
@@ -686,7 +687,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     createdUsers.push(foreignUser.id)
     const job = await testDb.job.create({ data: {
       id: ids.job, userId: ids.user, company: "ApplyMate Synthetic Fixture Employer", role: "Software Engineer", location: "Dublin",
-      url: "https://boards.greenhouse.io/example/jobs/1", description: "", keywords: "TypeScript", score: 92,
+      url: "https://boards.greenhouse.io/example/jobs/1", description: "Synthetic role description for isolated form-fill testing.", keywords: "TypeScript", score: 92,
       workflowState: "ready_to_apply", status: "saved",
     } })
     const resume = await testDb.resume.create({ data: {
