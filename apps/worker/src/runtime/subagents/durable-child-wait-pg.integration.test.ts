@@ -6144,7 +6144,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         [ids.sessionId, ids.turnId, ids.waiterTaskId, claimStepIds])
         expect(claimItems.rows).toHaveLength(2)
         const firstClaimItem = claimItems.rows.find(item => item.id.includes(`:${ids.loopCallPrefix}:${firstWait.rows[0]!.id}:`))
-        const secondClaimItemId = `task:${ids.waiterTaskId}:item:tool-call:${ids.loopCallPrefix}:${secondWait!.waitId}:attempt:1`
+        const secondClaimItemId = secondClaimProjection.callItemId
         expect(firstClaimItem).toBeDefined()
         expect(claimItems.rows.map(item => item.id)).toContain(secondClaimItemId)
 

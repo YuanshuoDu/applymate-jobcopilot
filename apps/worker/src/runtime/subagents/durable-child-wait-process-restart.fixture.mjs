@@ -1530,7 +1530,9 @@ try {
   if (mode.startsWith("worker-b")) {
     const diagnosticsEnabled = mode === "worker-b-crash-resume"
     const processStartedAt = diagnosticsEnabled ? new Date().toISOString() : undefined
+    if (diagnosticsEnabled) say("WORKER_B_RECOVERY_STAGE snapshot_started")
     const before = diagnosticsEnabled ? await readRecoveryStateSnapshot(pool, ids) : undefined
+    if (diagnosticsEnabled) say("WORKER_B_RECOVERY_STAGE snapshot_completed")
     if (before?.diagnostic === "query_failed") {
       throw new Error(`recovery_pre_snapshot_query_failed:${before.code ?? "unknown"}`)
     }
@@ -1541,7 +1543,9 @@ try {
     if (predicateTraceEnabled) process.env[recoveryTraceTaskIdKey] = ids.waiterTaskId
     let recovered
     try {
+      if (diagnosticsEnabled) say("WORKER_B_RECOVERY_STAGE manager_recover_started")
       recovered = await manager.recover()
+      if (diagnosticsEnabled) say("WORKER_B_RECOVERY_STAGE manager_recover_completed")
     } finally {
       if (predicateTraceEnabled) {
         if (previousRecoveryTraceTaskId === undefined) delete process.env[recoveryTraceTaskIdKey]
