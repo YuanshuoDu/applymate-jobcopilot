@@ -139,6 +139,8 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with: { node-version: 20, cache: pnpm }
@@ -171,6 +173,7 @@ jobs:
           AGENT_TURN_REDIS_TEST_URL: redis://127.0.0.1:6379/15
           REDIS_URL: redis://127.0.0.1:6379/15
           CLOAK_PROXY_URL: http://127.0.0.1:9443
+          CLOAKBROWSER_AUTO_UPDATE: "false"
         shell: bash
         run: |
           set -euo pipefail
@@ -325,6 +328,30 @@ jobs:
             cat "$package_path" >/dev/null
             echo "NSS diagnostic: dedicated-user CloakBrowser package read passed"
           '
+          echo "CloakBrowser diagnostic: installing the package-pinned binary before egress lockdown"
+          sudo -u "$TEST_USER" -- env PATH="$PATH" HOME="$TEST_HOME" \
+            CLOAKBROWSER_AUTO_UPDATE="$CLOAKBROWSER_AUTO_UPDATE" \
+            "$PNPM_BIN" --filter @jobcopilot/worker exec cloakbrowser install
+          BROWSER_INFO="$(sudo -u "$TEST_USER" -- env PATH="$PATH" HOME="$TEST_HOME" \
+            CLOAKBROWSER_AUTO_UPDATE="$CLOAKBROWSER_AUTO_UPDATE" \
+            "$PNPM_BIN" --filter @jobcopilot/worker exec node --input-type=module -e '
+              import { binaryInfo } from "cloakbrowser";
+              const info = binaryInfo();
+              if (!info.installed) throw new Error("CloakBrowser binary is not installed");
+              if (info.platform !== "linux-x64") throw new Error(`Unexpected platform: ${info.platform}`);
+              console.log(`version=${info.version}`);
+              console.log(`platform=${info.platform}`);
+              console.log(`binary=${info.binaryPath}`);
+            ')"
+          printf '%s\n' "$BROWSER_INFO"
+          CLOAKBROWSER_BINARY_PATH="$(printf '%s\n' "$BROWSER_INFO" | sed -n 's/^binary=//p')"
+          test -n "$CLOAKBROWSER_BINARY_PATH"
+          sudo -u "$TEST_USER" -- /usr/bin/test -r "$CLOAKBROWSER_BINARY_PATH"
+          sudo -u "$TEST_USER" -- /usr/bin/test -x "$CLOAKBROWSER_BINARY_PATH"
+          sudo -u "$TEST_USER" -- env PATH="$PATH" HOME="$TEST_HOME" \
+            CLOAKBROWSER_AUTO_UPDATE="$CLOAKBROWSER_AUTO_UPDATE" \
+            "$CLOAKBROWSER_BINARY_PATH" --version
+          echo "CloakBrowser diagnostic: cached binary version, path, and read/execute checks passed"
           echo "NSS diagnostic: starting certutil -N database initialization"
           sudo -u "$TEST_USER" -- env PATH="$PATH" HOME="$TEST_HOME" \
             certutil -d "sql:$NSS_DIR" -N --empty-password
@@ -376,7 +403,8 @@ jobs:
           (
             cd "$GITHUB_WORKSPACE/apps/worker"
             sudo -u "$TEST_USER" -- env PATH="$PATH" HOME="$TEST_HOME" TMPDIR="$TEST_TMPDIR" \
-              CLOAK_PROFILES_DIR="$PROFILE_DIR" "$NODE_BIN" --input-type=module -e '
+              CLOAK_PROFILES_DIR="$PROFILE_DIR" CLOAKBROWSER_AUTO_UPDATE="$CLOAKBROWSER_AUTO_UPDATE" \
+              "$NODE_BIN" --input-type=module -e '
                 const { launchPersistentContext } = await import("cloakbrowser");
                 const context = await launchPersistentContext({
                   headless: true,
@@ -394,6 +422,7 @@ jobs:
           export APPLICATION_TASK_FULL_LOOP_EGRESS_ISOLATED=true
 
           sudo -u "$TEST_USER" -- env PATH="$PATH" HOME="$TEST_HOME" TMPDIR="$TEST_TMPDIR" \
+            CLOAKBROWSER_AUTO_UPDATE="$CLOAKBROWSER_AUTO_UPDATE" \
             CLOAK_PROFILES_DIR="$PROFILE_DIR" \
             APPLICATION_TASK_FULL_LOOP_EGRESS_ISOLATED="$APPLICATION_TASK_FULL_LOOP_EGRESS_ISOLATED" \
             AGENT_TEST_TLS_CERT_PATH="$AGENT_TEST_TLS_CERT_PATH" \
