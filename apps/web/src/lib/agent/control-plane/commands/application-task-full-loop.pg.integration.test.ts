@@ -976,7 +976,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       type: "approval_response", approvalId: expiredApprovalId, decision: "approved", receiptNonce: expiredReceiptNonce,
     }), { params: Promise.resolve({ id: ids.session }) })
     expect(expiredReceipt.status).toBe(409)
-    await expect(jsonResponse(expiredReceipt)).resolves.toMatchObject({ error: expect.stringContaining("expired") })
+    await expect(jsonResponse(expiredReceipt)).resolves.toMatchObject({ error: expect.stringContaining("expiry") })
     expect(await testDb.agentApproval.count({ where: { id: submitApproval.id, status: "pending" } })).toBe(1)
     expect(await testDb.agentApproval.count({ where: { id: expiredApprovalId, status: "pending" } })).toBe(1)
     await assertNoSubmitBeforeApproval()
