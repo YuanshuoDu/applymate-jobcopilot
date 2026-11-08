@@ -20,6 +20,8 @@ vi.mock("@/lib/safe-auth", () => ({ safeAuth: async () => null }))
 const DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci"
 const REDIS_URL = "redis://127.0.0.1:6379/15"
 const runId = randomUUID().replaceAll("-", "")
+const candidateName = "A B"
+const candidateEmail = `a${runId.slice(0, 4)}@b.co`
 const ids = {
   user: `full-loop-user-${runId}`,
   foreignUser: `full-loop-foreign-${runId}`,
@@ -28,6 +30,30 @@ const ids = {
   execution: `full-loop-execution-${runId}`,
   job: `full-loop-job-${runId}`,
   resume: `full-loop-resume-${runId}`,
+}
+const SAFE_DIAGNOSTIC_ERROR_CODES = new Set([
+  "turn_execution_failed",
+  "model_execution_failed",
+  "application_fill_state_invalid",
+  "application_fill_binding_invalid",
+  "application_fill_material_unavailable",
+  "application_fill_fixture_model_validation_failed",
+  "application_fill_tool_transcript_invalid",
+  "application_fill_tool_use_id_invalid",
+  "application_fill_plan_receipt_missing_ready_task",
+  "application_fill_plan_receipt_invalid",
+  "application_fill_wait_limit_exceeded",
+  "application_fill_wait_output_missing",
+  "application_fill_wait_output_invalid",
+  "application_fill_wait_scope_or_status_invalid",
+  "application_fill_wait_terminal_interrupted",
+  "application_fill_wait_terminal_closed",
+  "application_fill_child_terminal_status_invalid",
+])
+
+function diagnosticMachineErrorCode(value: unknown): string | null {
+  if (value === null || value === undefined) return null
+  return typeof value === "string" && SAFE_DIAGNOSTIC_ERROR_CODES.has(value) ? value : "present"
 }
 
 function serviceUrl(value: string | undefined, kind: "postgres" | "redis"): string | null {
@@ -329,7 +355,7 @@ async function taskRuntimeDiagnostics(task: ApplicationTaskRow | null) {
     turnQueueJobs: sessionTurns.flatMap((turnRow, index) => sessionTurnJobs[index]!.map(job => ({ turnId: turnRow.id, ...job }))),
     taskGraph: taskGraph.map(node => ({
       id: node.id, rootTaskId: node.rootTaskId, parentTaskId: node.parentTaskId, role: node.role, taskType: node.taskType,
-      status: node.status, failureReasonPresent: Boolean(node.failureReason), attemptCount: node.attemptCount,
+      status: node.status, failureReasonCode: diagnosticMachineErrorCode(node.failureReason), attemptCount: node.attemptCount,
       leaseOwner: node.leaseOwner, leaseExpiresAt: node.leaseExpiresAt, createdAt: node.createdAt, updatedAt: node.updatedAt,
     })),
     subagentDispatches: childDispatches.map(({ idempotencyKey, publishedAt, attemptCount, lastError }) => ({
@@ -337,7 +363,7 @@ async function taskRuntimeDiagnostics(task: ApplicationTaskRow | null) {
     })),
     subagentQueueJobs: sessionSubagents.flatMap((taskRow, index) => sessionSubagentJobs[index]!.map(job => ({ taskId: taskRow.id, ...job }))),
     turnSteps: turnSteps.map(step => ({
-      id: step.id, ordinal: step.ordinal, status: step.status, errorCodePresent: Boolean(step.errorCode),
+      id: step.id, ordinal: step.ordinal, status: step.status, errorCode: diagnosticMachineErrorCode(step.errorCode),
       createdAt: step.createdAt, completedAt: step.completedAt,
     })),
     applicationTaskEvents: applicationTaskEvents.map(({ data, ...event }) => {
@@ -622,9 +648,9 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     ])
     expect(db).toBeDefined()
     const primaryUser = await testDb.user.create({ data: {
-      id: ids.user, email: `${ids.user}@example.test`, name: "Synthetic Candidate", plan: "pro",
+      id: ids.user, email: candidateEmail, name: candidateName, plan: "pro",
       phone: "+353000000000", location: "Dublin", personaFields: [
-        { key: "firstName", value: "Synthetic" }, { key: "lastName", value: "Candidate" },
+        { key: "firstName", value: "A" }, { key: "lastName", value: "B" },
       ],
     } })
     createdUsers = [primaryUser.id]
@@ -637,7 +663,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     } })
     const resume = await testDb.resume.create({ data: {
       id: ids.resume, userId: ids.user, name: "Synthetic Resume", isDefault: true,
-      content: { basics: { name: "Synthetic Candidate", email: primaryUser.email }, experience: [], education: [], skills: [] },
+      content: { basics: { name: candidateName, email: primaryUser.email }, experience: [], education: [], skills: [] },
     } })
     await testDb.agentSession.create({ data: { id: ids.session, userId: ids.user, goal: "Create and safely complete a synthetic job application", status: "running", source: "application_full_loop" } })
     await testDb.agentTurn.create({ data: {
