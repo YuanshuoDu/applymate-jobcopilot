@@ -31,11 +31,14 @@ async function startSite() {
   if (!SOCKET) throw new Error("APPLICATION_TASK_FULL_LOOP_SOCKET_PATH_required")
   await unlink(SOCKET).catch(() => undefined)
   let submitCount = 0
+  const requests = []
   const blocked = []
   const held = new Set()
   const siteSockets = new Set()
   const proxySockets = new Set()
   const site = createHttpsServer(await tls(), (request, response) => {
+    requests.push(`${request.method ?? "GET"} ${request.url ?? "/"}`)
+    if (requests.length > 20) requests.shift()
     if (request.method === "GET" && request.url === "/example/jobs/1") {
       response.writeHead(200, { "content-type": "text/html; charset=utf-8" })
       response.end(`<!doctype html><title>Fixture Application</title><form method="post" action="/example/jobs/1">
@@ -99,7 +102,7 @@ async function startSite() {
     const lines = buffer.split("\n")
     buffer = lines.pop() ?? ""
     for (const line of lines.map(value => value.trim())) {
-      if (line === "stats") say(`FIXTURE_STATE ${JSON.stringify({ submitCount, blocked })}`)
+      if (line === "stats") say(`FIXTURE_STATE ${JSON.stringify({ submitCount, blocked, requests })}`)
       if (line === "shutdown") {
         process.stdin.pause()
         for (const response of held) response.destroy()

@@ -244,6 +244,9 @@ async function taskRuntimeDiagnostics(task: ApplicationTaskRow | null) {
     subagentDispatches: childDispatches,
     subagentQueueJobs: taskIds.flatMap((id, index) => subagentJobs[index]!.map(job => ({ taskId: id, ...job }))),
     recentEvents: recentEvents.map(event => ({ ...event, sequence: event.sequence.toString() })),
+    fixtureStats: await requestFixtureStats().catch((error: unknown) => ({
+      error: error instanceof Error ? error.message : String(error),
+    })),
     workerExited: worker ? exited(worker) : null,
     workerLines: worker?.lines.slice(-30) ?? [], workerErrors: worker?.errors.slice(-30) ?? [],
   }
@@ -419,6 +422,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     const waitingTask = await waitForTask(task => task.status === "waiting_for_user" && task.checkpoint === "form_answer_required")
     expect(waitingTask.id).toBe(gateTaskId)
     expect(waitingTask.fillTurnId).toBe(firstFillTurnId)
+    expect((await requestFixtureStats()).requests.filter(request => request === "GET /example/jobs/1").length).toBeGreaterThanOrEqual(2)
     const question = waitingTask.question as { waitId?: unknown; missing?: Array<{ key: string | null; label: string }>; sensitive?: Array<{ key: string | null; label: string }> }
     expect(typeof question.waitId).toBe("string")
     const field = [...(question.missing ?? []), ...(question.sensitive ?? [])].find(value => value.label.includes("authorized to work"))
@@ -581,14 +585,14 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
   }, 300_000)
 })
 
-async function requestFixtureStats(): Promise<{ submitCount: number; blocked: string[] }> {
+async function requestFixtureStats(): Promise<{ submitCount: number; blocked: string[]; requests: string[] }> {
   if (!site?.stdin) throw new Error("Fixture site is unavailable")
   const previous = site.lines.filter(line => line.startsWith("FIXTURE_STATE ")).length
   site.stdin.write("stats\n")
   const until = Date.now() + 5_000
   while (Date.now() < until) {
     const lines = site.lines.filter(line => line.startsWith("FIXTURE_STATE "))
-    if (lines.length > previous) return JSON.parse(lines[lines.length - 1]!.slice("FIXTURE_STATE ".length)) as { submitCount: number; blocked: string[] }
+    if (lines.length > previous) return JSON.parse(lines[lines.length - 1]!.slice("FIXTURE_STATE ".length)) as { submitCount: number; blocked: string[]; requests: string[] }
     await delay(20)
   }
   throw new Error("Fixture site did not return its request count")
