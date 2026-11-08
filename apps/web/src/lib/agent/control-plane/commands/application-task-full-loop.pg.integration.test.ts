@@ -21,7 +21,7 @@ const DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:5432/applymate_ag
 const REDIS_URL = "redis://127.0.0.1:6379/15"
 const runId = randomUUID().replaceAll("-", "")
 const candidateName = "A B"
-const candidateEmail = `a${runId.slice(0, 4)}@b.co`
+const candidateEmail = `${runId.slice(0, 1)}@${runId.slice(1, 3)}.co`
 const ids = {
   user: `full-loop-user-${runId}`,
   foreignUser: `full-loop-foreign-${runId}`,
