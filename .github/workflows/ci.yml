@@ -110,6 +110,274 @@ jobs:
           AGENT_TURN_REDIS_TEST_DISPOSABLE: "true"
           AGENT_TURN_REDIS_TEST_URL: redis://127.0.0.1:6379/15
         run: pnpm --filter @jobcopilot/worker exec vitest run src/queue/production-bootstrap-subagents-redis.integration.test.ts
+  application-task-full-loop:
+    name: ApplicationTask full-loop isolated integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: applymate_agent_brain_ci
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d applymate_agent_brain_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: pnpm }
+      - name: Install dependencies before the isolated run
+        run: pnpm install --frozen-lockfile
+      - name: Apply migrations to the disposable PostgreSQL service
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+        run: pnpm --filter @jobcopilot/web exec prisma migrate deploy --schema prisma/schema.prisma
+      - name: Generate the Web Prisma client
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+        run: pnpm --filter @jobcopilot/web exec prisma generate --schema prisma/schema.prisma
+      - name: Build the Worker fixture dependencies
+        run: pnpm turbo build --filter=@jobcopilot/worker
+      - name: Install browser and isolation prerequisites before egress lockdown
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y iptables libnss3-tools
+          pnpm exec playwright install-deps chromium
+      - name: Run the full lifecycle integration with UID-scoped egress lockdown
+        env:
+          CI: "true"
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true"
+          AGENT_RUNTIME_PG_TEST_REQUIRED: "true"
+          RUN_AGENT_TURN_REDIS_INTEGRATION: "1"
+          AGENT_TURN_REDIS_TEST_DISPOSABLE: "true"
+          AGENT_TURN_REDIS_TEST_URL: redis://127.0.0.1:6379/15
+          REDIS_URL: redis://127.0.0.1:6379/15
+          CLOAK_PROXY_URL: http://127.0.0.1:9443
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TEST_USER=applymate-full-loop
+          TEST_UID=64013
+          CHAIN4=AM1095_OUT
+          CHAIN6=AM1095_OUT6
+          FIREWALL_CLEANUP=false
+          TEST_USER_CREATED=false
+          TEST_ROOT=
+
+          cleanup() {
+            local result=$?
+            local cleanup_errors=0
+            trap - EXIT INT TERM
+            set +e
+
+            if [ "$TEST_USER_CREATED" = "true" ]; then
+              sudo pkill -TERM -u "$TEST_UID" 2>/dev/null
+              for _ in 1 2 3 4 5; do
+                if ! pgrep -u "$TEST_UID" >/dev/null 2>&1; then break; fi
+                sleep 1
+              done
+              sudo pkill -KILL -u "$TEST_UID" 2>/dev/null
+            fi
+
+            if [ "$FIREWALL_CLEANUP" = "true" ]; then
+              while sudo iptables -C OUTPUT -m owner --uid-owner "$TEST_UID" -j "$CHAIN4" 2>/dev/null; do
+                sudo iptables -D OUTPUT -m owner --uid-owner "$TEST_UID" -j "$CHAIN4" || cleanup_errors=1
+              done
+              while sudo ip6tables -C OUTPUT -m owner --uid-owner "$TEST_UID" -j "$CHAIN6" 2>/dev/null; do
+                sudo ip6tables -D OUTPUT -m owner --uid-owner "$TEST_UID" -j "$CHAIN6" || cleanup_errors=1
+              done
+              if sudo iptables -S "$CHAIN4" >/dev/null 2>&1; then
+                sudo iptables -F "$CHAIN4" || cleanup_errors=1
+                sudo iptables -X "$CHAIN4" || cleanup_errors=1
+              fi
+              if sudo ip6tables -S "$CHAIN6" >/dev/null 2>&1; then
+                sudo ip6tables -F "$CHAIN6" || cleanup_errors=1
+                sudo ip6tables -X "$CHAIN6" || cleanup_errors=1
+              fi
+            fi
+
+            if [ "$TEST_USER_CREATED" = "true" ]; then sudo userdel "$TEST_USER" || cleanup_errors=1; fi
+            if [ -n "$TEST_ROOT" ]; then
+              case "$TEST_ROOT" in
+                "$RUNNER_TEMP"/applymate-full-loop.*) sudo rm -rf -- "$TEST_ROOT" || cleanup_errors=1 ;;
+                *) echo "Refusing to remove unexpected temporary path: $TEST_ROOT" >&2; result=1 ;;
+              esac
+            fi
+            if [ "$cleanup_errors" -ne 0 ]; then
+              echo "One or more isolated CI cleanup steps failed" >&2
+              result=1
+            fi
+            exit "$result"
+          }
+          trap cleanup EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          readonly EXPECTED_PG_URL=postgresql://postgres:postgres@127.0.0.1:5432/applymate_agent_brain_ci
+          readonly EXPECTED_REDIS_URL=redis://127.0.0.1:6379/15
+          test "$CI" = "true"
+          test "$DATABASE_URL" = "$EXPECTED_PG_URL"
+          test "$AGENT_RUNTIME_PG_TEST_URL" = "$EXPECTED_PG_URL"
+          test "$AGENT_RUNTIME_PG_TEST_DISPOSABLE" = "true"
+          test "$AGENT_RUNTIME_PG_TEST_REQUIRED" = "true"
+          test "$RUN_AGENT_TURN_REDIS_INTEGRATION" = "1"
+          test "$AGENT_TURN_REDIS_TEST_DISPOSABLE" = "true"
+          test "$AGENT_TURN_REDIS_TEST_URL" = "$EXPECTED_REDIS_URL"
+          test "$REDIS_URL" = "$EXPECTED_REDIS_URL"
+          test "$CLOAK_PROXY_URL" = "http://127.0.0.1:9443"
+          test -d "$RUNNER_TEMP"
+          command -v sudo >/dev/null
+          command -v iptables >/dev/null
+          command -v ip6tables >/dev/null
+          command -v certutil >/dev/null
+          command -v openssl >/dev/null
+          command -v pgrep >/dev/null
+
+          NODE_BIN="$(command -v node)"
+          PNPM_BIN="$(command -v pnpm)"
+          test -x "$NODE_BIN"
+          test -x "$PNPM_BIN"
+          if getent passwd "$TEST_UID" >/dev/null || id "$TEST_USER" >/dev/null 2>&1; then
+            echo "Dedicated test UID or user is already in use" >&2
+            exit 1
+          fi
+
+          TEST_ROOT="$(mktemp -d "$RUNNER_TEMP/applymate-full-loop.XXXXXX")"
+          case "$TEST_ROOT" in
+            "$RUNNER_TEMP"/applymate-full-loop.*) ;;
+            *) echo "Unexpected temporary path: $TEST_ROOT" >&2; exit 1 ;;
+          esac
+          TEST_HOME="$TEST_ROOT/home"
+          TEST_TMPDIR="$TEST_ROOT/tmp"
+          PROFILE_DIR="$TEST_ROOT/profiles"
+          TLS_DIR="$TEST_ROOT/tls"
+          NSS_DIR="$TEST_HOME/.pki/nssdb"
+          CA_PATH="$TLS_DIR/fixture-ca.pem"
+          CA_KEY_PATH="$TLS_DIR/fixture-ca.key"
+          CERT_PATH="$TLS_DIR/boards.greenhouse.io.pem"
+          KEY_PATH="$TLS_DIR/boards.greenhouse.io.key"
+          CSR_PATH="$TLS_DIR/boards.greenhouse.io.csr"
+          EXT_PATH="$TLS_DIR/boards.greenhouse.io.ext"
+
+          sudo useradd --system --uid "$TEST_UID" --user-group --no-create-home --home-dir "$TEST_HOME" --shell /usr/sbin/nologin "$TEST_USER"
+          TEST_USER_CREATED=true
+          TEST_GID="$(id -g "$TEST_USER")"
+          mkdir -p "$TEST_HOME" "$TEST_TMPDIR" "$PROFILE_DIR" "$TLS_DIR"
+          chmod 700 "$TEST_ROOT" "$TEST_HOME" "$TEST_TMPDIR" "$PROFILE_DIR" "$TLS_DIR"
+
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout "$CA_KEY_PATH" -out "$CA_PATH" -days 2 \
+            -subj "/CN=ApplyMate Full Loop Test CA" \
+            -addext "basicConstraints=critical,CA:TRUE" \
+            -addext "keyUsage=critical,keyCertSign,cRLSign" \
+            -addext "subjectKeyIdentifier=hash"
+          openssl req -new -newkey rsa:2048 -nodes -keyout "$KEY_PATH" -out "$CSR_PATH" \
+            -subj "/CN=boards.greenhouse.io"
+          cat > "$EXT_PATH" <<'CERT_EXTENSIONS'
+          basicConstraints=critical,CA:FALSE
+          keyUsage=critical,digitalSignature,keyEncipherment
+          extendedKeyUsage=serverAuth
+          subjectAltName=DNS:boards.greenhouse.io
+          authorityKeyIdentifier=keyid,issuer
+          CERT_EXTENSIONS
+          openssl x509 -req -in "$CSR_PATH" -CA "$CA_PATH" -CAkey "$CA_KEY_PATH" -CAcreateserial \
+            -out "$CERT_PATH" -days 1 -sha256 -extfile "$EXT_PATH"
+          rm -f "$CA_KEY_PATH" "$CSR_PATH" "$EXT_PATH" "$CA_PATH.srl"
+          export AGENT_TEST_TLS_CERT_PATH="$CERT_PATH"
+          export AGENT_TEST_TLS_KEY_PATH="$KEY_PATH"
+          export AGENT_TEST_TLS_CA_PATH="$CA_PATH"
+
+          sudo chown -R "$TEST_UID:$TEST_GID" "$TEST_ROOT"
+          sudo chmod 700 "$TEST_ROOT" "$TEST_HOME" "$TEST_TMPDIR" "$PROFILE_DIR" "$TLS_DIR"
+          sudo install -d -o "$TEST_UID" -g "$TEST_GID" -m 700 "$TEST_HOME/.pki" "$NSS_DIR"
+          sudo -u "$TEST_USER" -- env PATH="$PATH" HOME="$TEST_HOME" \
+            certutil -N --empty-password -d "sql:$NSS_DIR"
+          sudo -u "$TEST_USER" -- env PATH="$PATH" HOME="$TEST_HOME" \
+            certutil -A -d "sql:$NSS_DIR" -n applymate-full-loop-test-ca -t "C,," -i "$CA_PATH"
+
+          if sudo iptables -S "$CHAIN4" >/dev/null 2>&1 || sudo ip6tables -S "$CHAIN6" >/dev/null 2>&1; then
+            echo "Refusing to reuse an existing egress chain" >&2
+            exit 1
+          fi
+          FIREWALL_CLEANUP=true
+          sudo iptables -N "$CHAIN4"
+          sudo iptables -A "$CHAIN4" -o lo -d 127.0.0.1/32 -p tcp -m conntrack --ctstate ESTABLISHED --ctdir REPLY --ctorigdstport 5432 -j ACCEPT
+          sudo iptables -A "$CHAIN4" -o lo -d 127.0.0.1/32 -p tcp -m conntrack --ctstate ESTABLISHED --ctdir REPLY --ctorigdstport 6379 -j ACCEPT
+          sudo iptables -A "$CHAIN4" -o lo -d 127.0.0.1/32 -p tcp -m conntrack --ctstate ESTABLISHED --ctdir REPLY --ctorigdstport 9443 -j ACCEPT
+          sudo iptables -A "$CHAIN4" -o lo -d 127.0.0.1/32 -p tcp -m multiport --dports 5432,6379,9443 -j ACCEPT
+          sudo iptables -A "$CHAIN4" -m limit --limit 10/min --limit-burst 10 -j LOG --log-prefix "applymate1095-egress4 " --log-level 4
+          sudo iptables -A "$CHAIN4" -j DROP
+          sudo iptables -I OUTPUT 1 -m owner --uid-owner "$TEST_UID" -j "$CHAIN4"
+
+          sudo ip6tables -N "$CHAIN6"
+          sudo ip6tables -A "$CHAIN6" -o lo -d ::1/128 -p tcp -m conntrack --ctstate ESTABLISHED --ctdir REPLY --ctorigdstport 5432 -j ACCEPT
+          sudo ip6tables -A "$CHAIN6" -o lo -d ::1/128 -p tcp -m conntrack --ctstate ESTABLISHED --ctdir REPLY --ctorigdstport 6379 -j ACCEPT
+          sudo ip6tables -A "$CHAIN6" -o lo -d ::1/128 -p tcp -m conntrack --ctstate ESTABLISHED --ctdir REPLY --ctorigdstport 9443 -j ACCEPT
+          sudo ip6tables -A "$CHAIN6" -o lo -d ::1/128 -p tcp -m multiport --dports 5432,6379,9443 -j ACCEPT
+          sudo ip6tables -A "$CHAIN6" -m limit --limit 10/min --limit-burst 10 -j LOG --log-prefix "applymate1095-egress6 " --log-level 4
+          sudo ip6tables -A "$CHAIN6" -j DROP
+          sudo ip6tables -I OUTPUT 1 -m owner --uid-owner "$TEST_UID" -j "$CHAIN6"
+          sudo iptables -C OUTPUT -m owner --uid-owner "$TEST_UID" -j "$CHAIN4"
+          sudo ip6tables -C OUTPUT -m owner --uid-owner "$TEST_UID" -j "$CHAIN6"
+
+          sudo install -d -o "$TEST_UID" -g "$TEST_GID" -m 700 \
+            "$GITHUB_WORKSPACE/apps/web/node_modules/.vite/vitest"
+          (
+            cd "$GITHUB_WORKSPACE/apps/worker"
+            sudo -u "$TEST_USER" -- env PATH="$PATH" HOME="$TEST_HOME" TMPDIR="$TEST_TMPDIR" \
+              CLOAK_PROFILES_DIR="$PROFILE_DIR" "$NODE_BIN" --input-type=module -e '
+                const { launchPersistentContext } = await import("cloakbrowser");
+                const context = await launchPersistentContext({
+                  headless: true,
+                  humanize: true,
+                  userDataDir: `${process.env.CLOAK_PROFILES_DIR}/preflight`,
+                });
+                try {
+                  const page = await context.newPage();
+                  await page.goto("about:blank");
+                } finally {
+                  await context.close();
+                }
+              '
+          )
+          export APPLICATION_TASK_FULL_LOOP_EGRESS_ISOLATED=true
+
+          sudo -u "$TEST_USER" -- env PATH="$PATH" HOME="$TEST_HOME" TMPDIR="$TEST_TMPDIR" \
+            CLOAK_PROFILES_DIR="$PROFILE_DIR" \
+            APPLICATION_TASK_FULL_LOOP_EGRESS_ISOLATED="$APPLICATION_TASK_FULL_LOOP_EGRESS_ISOLATED" \
+            AGENT_TEST_TLS_CERT_PATH="$AGENT_TEST_TLS_CERT_PATH" \
+            AGENT_TEST_TLS_KEY_PATH="$AGENT_TEST_TLS_KEY_PATH" \
+            AGENT_TEST_TLS_CA_PATH="$AGENT_TEST_TLS_CA_PATH" \
+            CI="$CI" \
+            DATABASE_URL="$DATABASE_URL" \
+            AGENT_RUNTIME_PG_TEST_URL="$AGENT_RUNTIME_PG_TEST_URL" \
+            AGENT_RUNTIME_PG_TEST_DISPOSABLE="$AGENT_RUNTIME_PG_TEST_DISPOSABLE" \
+            AGENT_RUNTIME_PG_TEST_REQUIRED="$AGENT_RUNTIME_PG_TEST_REQUIRED" \
+            RUN_AGENT_TURN_REDIS_INTEGRATION="$RUN_AGENT_TURN_REDIS_INTEGRATION" \
+            AGENT_TURN_REDIS_TEST_DISPOSABLE="$AGENT_TURN_REDIS_TEST_DISPOSABLE" \
+            AGENT_TURN_REDIS_TEST_URL="$AGENT_TURN_REDIS_TEST_URL" \
+            REDIS_URL="$REDIS_URL" \
+            CLOAK_PROXY_URL="$CLOAK_PROXY_URL" \
+            "$PNPM_BIN" --filter @jobcopilot/web exec vitest run --no-file-parallelism \
+              src/lib/agent/control-plane/commands/application-task-full-loop.pg.integration.test.ts
   agent-runtime-postgres:
     name: Agent runtime PostgreSQL integration
     runs-on: ubuntu-24.04

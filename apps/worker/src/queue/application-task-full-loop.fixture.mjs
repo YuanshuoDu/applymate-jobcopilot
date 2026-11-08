@@ -1,0 +1,226 @@
+import { createServer as createHttpsServer } from "node:https"
+import { createServer as createHttpServer } from "node:http"
+import { connect as connectTcp } from "node:net"
+import { readFile } from "node:fs/promises"
+import { unlink } from "node:fs/promises"
+import { Pool } from "pg"
+
+const [, , mode] = process.argv
+const HOST = "boards.greenhouse.io:443"
+const SOCKET = process.env.APPLICATION_TASK_FULL_LOOP_SOCKET_PATH
+const tls = async () => {
+  const cert = await readFile(required("AGENT_TEST_TLS_CERT_PATH"))
+  const key = await readFile(required("AGENT_TEST_TLS_KEY_PATH"))
+  await readFile(required("AGENT_TEST_TLS_CA_PATH"))
+  return { cert, key }
+}
+function required(name) {
+  const value = process.env[name]
+  if (!value) throw new Error(`${name}_required`)
+  return value
+}
+function say(value) { process.stdout.write(`${value}\n`) }
+function listen(server, ...args) {
+  return new Promise((resolve, reject) => {
+    server.once("error", reject)
+    server.listen(...args, () => { server.off("error", reject); resolve() })
+  })
+}
+
+async function startSite() {
+  if (!SOCKET) throw new Error("APPLICATION_TASK_FULL_LOOP_SOCKET_PATH_required")
+  await unlink(SOCKET).catch(() => undefined)
+  let submitCount = 0
+  const blocked = []
+  const held = new Set()
+  const siteSockets = new Set()
+  const proxySockets = new Set()
+  const site = createHttpsServer(await tls(), (request, response) => {
+    if (request.method === "GET" && request.url === "/example/jobs/1") {
+      response.writeHead(200, { "content-type": "text/html; charset=utf-8" })
+      response.end(`<!doctype html><title>Fixture Application</title><form method="post" action="/example/jobs/1">
+        <label for="first_name">First name</label><input id="first_name" name="first_name" required>
+        <label for="last_name">Last name</label><input id="last_name" name="last_name" required>
+        <label for="email">Email</label><input id="email" name="email" type="email" required>
+        <label for="work_authorization">Are you legally authorized to work in Ireland?</label>
+        <input id="work_authorization" name="work_authorization" required>
+        <button id="submit-app" type="submit">Submit application</button></form>`)
+      return
+    }
+    if (request.method === "POST" && request.url === "/example/jobs/1") {
+      submitCount += 1
+      held.add(response)
+      request.resume()
+      say(`SUBMIT_REQUEST ${submitCount}`)
+      response.on("close", () => held.delete(response))
+      return
+    }
+    response.writeHead(404).end("fixture route not found")
+  })
+  site.on("connection", socket => {
+    siteSockets.add(socket)
+    socket.once("close", () => siteSockets.delete(socket))
+  })
+  await listen(site, SOCKET)
+  const proxy = createHttpServer((request, response) => {
+    blocked.push(String(request.url ?? "missing"))
+    response.writeHead(405).end("CONNECT required")
+  })
+  proxy.on("connection", socket => {
+    proxySockets.add(socket)
+    socket.once("close", () => proxySockets.delete(socket))
+  })
+  proxy.on("connect", (request, client, head) => {
+    if (request.url !== HOST) {
+      blocked.push(String(request.url ?? "missing"))
+      client.end("HTTP/1.1 403 Forbidden\r\n\r\n")
+      return
+    }
+    const upstream = connectTcp(SOCKET, () => {
+      client.write("HTTP/1.1 200 Connection Established\r\n\r\n")
+      if (head.length) upstream.write(head)
+      client.pipe(upstream).pipe(client)
+    })
+    const closeTunnel = () => {
+      if (!client.destroyed) client.destroy()
+      if (!upstream.destroyed) upstream.destroy()
+    }
+    upstream.on("error", closeTunnel)
+    client.on("error", closeTunnel)
+    client.once("close", () => { if (!upstream.destroyed) upstream.destroy() })
+    upstream.once("close", () => { if (!client.destroyed) client.destroy() })
+  })
+  await listen(proxy, 9443, "127.0.0.1")
+  say("FIXTURE_READY")
+  process.stdin.setEncoding("utf8")
+  let buffer = ""
+  process.stdin.on("data", chunk => {
+    buffer += chunk
+    const lines = buffer.split("\n")
+    buffer = lines.pop() ?? ""
+    for (const line of lines.map(value => value.trim())) {
+      if (line === "stats") say(`FIXTURE_STATE ${JSON.stringify({ submitCount, blocked })}`)
+      if (line === "shutdown") {
+        process.stdin.pause()
+        for (const response of held) response.destroy()
+        for (const socket of proxySockets) socket.destroy()
+        for (const socket of siteSockets) socket.destroy()
+        void Promise.all([
+          new Promise(resolve => proxy.close(() => resolve())),
+          new Promise(resolve => site.close(() => resolve())),
+        ]).then(() => unlink(SOCKET)).catch(error => {
+          process.stderr.write(`FIXTURE_SHUTDOWN_FAILED ${error instanceof Error ? error.message : String(error)}\n`)
+        })
+      }
+    }
+  })
+}
+
+function modelProfile() {
+  return { provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true,
+    continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: true,
+    supportsReasoningSummary: true, supportsResponseContinuation: false, supportsProviderConversation: false,
+    supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: null, costClass: "low" }
+}
+function taskIdFromPlan(request) {
+  for (const message of request.messages ?? []) for (const part of message.content ?? []) {
+    if (part.type !== "tool_result" || typeof part.content !== "string") continue
+    try {
+      const result = JSON.parse(part.content)
+      if (Array.isArray(result.readyTaskIds) && typeof result.readyTaskIds[0] === "string") return result.readyTaskIds[0]
+    } catch { /* another tool result */ }
+  }
+  throw new Error("application_fill_plan_receipt_missing_ready_task")
+}
+function fixtureModel() {
+  let round = 0
+  return {
+    adapter: {
+      id: "application-task-full-loop-model", profile: modelProfile(),
+      async *stream(request) {
+        round += 1
+        if (round === 1) {
+          yield { type: "tool_call_completed", callId: `full-loop-plan-${process.pid}`, name: "agent.plan", arguments: {
+            expectedRevision: 0,
+            nodes: [{ key: "application-fill", templateId: "application_filler", goal: "Fill the selected application for review",
+              successCriteria: ["Observe the required synthetic work authorization field"], dependsOn: [] }],
+          } }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        if (round === 2) {
+          yield { type: "tool_call_completed", callId: `full-loop-wait-${process.pid}`, name: "agent.wait", arguments: {
+            idempotencyKey: `application-task-full-loop:${process.pid}:${round}`,
+            taskIds: [taskIdFromPlan(request)], mode: "all", timeoutMs: 120_000,
+          } }
+          yield { type: "completed", finishReason: "tool_calls" }
+          return
+        }
+        yield { type: "text_delta", text: "The synthetic application fill reached its durable review boundary." }
+        yield { type: "completed", finishReason: "stop" }
+      },
+    },
+    registry: {}, candidates: [],
+  }
+}
+
+async function startWorker() {
+  const databaseUrl = required("AGENT_RUNTIME_PG_TEST_URL")
+  const redisUrl = required("AGENT_TURN_REDIS_TEST_URL")
+  if (databaseUrl !== process.env.DATABASE_URL || redisUrl !== process.env.REDIS_URL
+    || process.env.AGENT_RUNTIME_PG_TEST_DISPOSABLE !== "true"
+    || process.env.AGENT_RUNTIME_PG_TEST_REQUIRED !== "true"
+    || process.env.AGENT_TURN_REDIS_TEST_DISPOSABLE !== "true"
+    || process.env.APPLICATION_TASK_FULL_LOOP_EGRESS_ISOLATED !== "true"
+    || process.env.CLOAK_PROXY_URL !== "http://127.0.0.1:9443") throw new Error("application_task_full_loop_service_guard_failed")
+  const pool = new Pool({ connectionString: databaseUrl, max: 8 })
+  const noOpProjection = { start: async () => undefined, finish: async () => undefined }
+  const [{ createCanonicalTurnRuntime }, { createOptionalProductionChildExecutor }, { startProductionAgentRuntime },
+    { startProductionWorkerRuntime }, { resolveProductionAgentFlags }, queue, outbox, { closeAllSlots }, redis] = await Promise.all([
+    import("../runtime/canonical-turn-runtime.ts"), import("../runtime/subagents/production-child-runtime.ts"),
+    import("./production-bootstrap.ts"), import("./production-worker-runtime.ts"), import("../runtime/production-agent-flags.ts"),
+    import("./apply-queue.ts"), import("./application-submit-outbox.ts"), import("../cloak/pool.ts"), import("../redis.ts"),
+  ])
+  const flags = { ...resolveProductionAgentFlags(), taskGraphPlanningEnabled: true, childExecutionEnabled: true,
+    coordinationEnabled: true, consumeWaitOutcomes: true, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false }
+  const authorizeUsage = async () => ({ settle: async () => undefined })
+  let bootstrap
+  await startProductionWorkerRuntime({ pool, workerId: `application-full-loop-${process.pid}`, productionFlags: flags,
+    onBootstrapReady: value => { bootstrap = value }, startAgentRunWorker() {} }, {
+    createOptionalProductionChildExecutor: options => options.enabled
+      ? createOptionalProductionChildExecutor({ ...options, authorizeUsage }) : undefined,
+    createCanonicalTurnRuntime: (runtimePool, productionOptions) => createCanonicalTurnRuntime(runtimePool, {
+      ...productionOptions, modelRuntimeFactory: () => fixtureModel(), authorizeUsage,
+    }),
+    createWorkerUsageAuthorizer: () => authorizeUsage,
+    createCanonicalExecutionProjection: () => noOpProjection,
+    createCanonicalSessionProjection: () => noOpProjection,
+    startProductionAgentRuntime: options => startProductionAgentRuntime(options),
+  })
+  const publisher = outbox.startApplicationSubmitOutboxPublisher(pool, queue.applyQueue, { pollMs: 250 })
+  queue.applyWorker.on("active", job => say(`APPLY_JOB_ACTIVE ${job?.id ?? "unknown"} attemptsMade=${job?.attemptsMade ?? -1} attemptsStarted=${job?.attemptsStarted ?? -1} stalledCounter=${job?.stalledCounter ?? -1}`))
+  queue.applyWorker.on("stalled", (jobId, previousState) => say(`APPLY_JOB_STALLED ${jobId} previousState=${previousState}`))
+  queue.applyWorker.on("failed", (job, error) => say(`APPLY_JOB_FAILED ${job?.id ?? "unknown"} ${error.message}`))
+  say("WORKER_READY")
+  process.stdin.setEncoding("utf8")
+  let buffer = ""
+  await new Promise(resolve => process.stdin.on("data", chunk => {
+    buffer += chunk
+    const lines = buffer.split("\n")
+    buffer = lines.pop() ?? ""
+    if (lines.some(line => line.trim() === "shutdown")) { process.stdin.pause(); resolve() }
+  }))
+  await publisher.close()
+  await bootstrap?.close()
+  await queue.applyWorker.close()
+  await queue.applyQueue.close()
+  await closeAllSlots()
+  const { getPool } = await import("../db/apply-results.ts")
+  await getPool().end()
+  await pool.end()
+  await redis.closeSharedRedisConnections()
+}
+
+if (mode === "site") await startSite()
+else if (mode === "worker") await startWorker()
+else throw new Error("fixture_mode_must_be_site_or_worker")
