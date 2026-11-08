@@ -114,6 +114,7 @@ let turnQueue: InstanceType<typeof Queue> | undefined
 let subagentQueue: InstanceType<typeof Queue> | undefined
 let createdUsers: string[] = []
 let dbConnected = false
+let priorApplicationFillTaskGraph: string | undefined
 
 function checkTlsAndIsolation(): void {
   if (!enabled) return
@@ -589,6 +590,9 @@ async function assertNoSubmitBeforeApproval(): Promise<void> {
 
 describeWithServices("ApplicationTask production full-loop PostgreSQL integration", () => {
   beforeAll(async () => {
+    // This fixture creates a TaskGraph-bound fill; exercise the matching production PATCH route.
+    priorApplicationFillTaskGraph = process.env.ENABLE_APPLICATION_FILL_TASKGRAPH
+    process.env.ENABLE_APPLICATION_FILL_TASKGRAPH = "1"
     checkTlsAndIsolation()
     if (!enabled) return
     await Promise.all(tlsPaths.map(name => access(process.env[name]!)))
@@ -614,6 +618,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     try { await closeQueueWithinDeadline(turnQueue, queueCloseDeadline) } catch (error) { cleanupError ??= error }
     try { await closeQueueWithinDeadline(subagentQueue, queueCloseDeadline) } catch (error) { cleanupError ??= error }
     try { await testDb.$disconnect(); dbConnected = false } catch (error) { cleanupError ??= error }
+    if (priorApplicationFillTaskGraph === undefined) delete process.env.ENABLE_APPLICATION_FILL_TASKGRAPH
+    else process.env.ENABLE_APPLICATION_FILL_TASKGRAPH = priorApplicationFillTaskGraph
     if (cleanupError) throw cleanupError
   }, 60_000)
 
