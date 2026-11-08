@@ -889,7 +889,8 @@ async function diagnoseHistoricalSourceFinalBinding(client: PoolClient, task: Bl
     JOIN "sub_agent_tasks" AS owner ON owner."id" = $2
     LEFT JOIN "agent_sessions" AS session ON session."id" = owner."sessionId"
     LEFT JOIN "agent_turns" AS turn ON turn."id" = owner."turnId" AND turn."sessionId" = owner."sessionId"
-    CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof($13::jsonb) = 'array' THEN $13::jsonb ELSE '[]'::jsonb END) AS proof(value)
+    CROSS JOIN LATERAL jsonb_array_elements(${historicalWaitProjectionsSql('$13::jsonb')}) AS proof(value)
+    CROSS JOIN LATERAL (SELECT ${historicalWaitClaimProofsSql('$13::jsonb')} AS "claimCollisionProofs") AS proofBundle
     JOIN "agent_events" AS started ON started."id" = proof.value->>'startEventId'
       AND started."sessionId" = $1 AND started."turnId" = $3 AND started."taskId" = $2
     JOIN "agent_items" AS callItem ON callItem."id" = started."itemId" AND callItem."sessionId" = started."sessionId"
@@ -926,7 +927,8 @@ async function diagnoseHistoricalSourceFinalBinding(client: PoolClient, task: Bl
     LIMIT 2`
   const rows = await client.query<Record<string, unknown>>(sql, [task.sessionId, task.id, task.turnId, task.rootTaskId,
     task.leaseOwner, task.attemptCount, task.leaseExpiresAt, task.userId, null, continuationStepId,
-    sourceProjection?.rawCallId ?? null, sourceProjection?.projectedCallId ?? null, JSON.stringify(projections), sourceCallId])
+    sourceProjection?.rawCallId ?? null, sourceProjection?.projectedCallId ?? null,
+    JSON.stringify(historicalWaitClaimProofBundle(projections)), sourceCallId])
   if (sourceProjections.length !== 1 || rows.rows.length !== 1) return { outcome: "unknown",
     sourceProjectionCount: sourceProjections.length, bindingRowCount: rows.rows.length }
   const row = rows.rows[0]!

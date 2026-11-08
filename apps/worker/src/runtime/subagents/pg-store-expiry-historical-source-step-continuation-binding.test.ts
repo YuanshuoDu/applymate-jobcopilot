@@ -5,6 +5,11 @@ import { CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL } from "./pg-store-expiry-child
 const path = "proof.value->'sourceStepPrefix'"
 const boundedEventIndex = "(CASE WHEN expected.ordinality BETWEEN 2 AND 7 THEN (expected.ordinality - 2)::integer ELSE NULL::integer END)"
 function occurrences(sql: string, fragment: string): number { return sql.split(fragment).length - 1 }
+function expectGuardedOrdinalityIndexes(sql: string): void {
+  const int4IndexCasts = occurrences(sql, "(expected.ordinality - 2)::integer")
+  expect(int4IndexCasts).toBeGreaterThan(0)
+  expect(occurrences(sql, boundedEventIndex)).toBe(int4IndexCasts)
+}
 function balance(sql: string): number {
   let depth = 0, quote: "'" | '"' | null = null
   for (let index = 0; index < sql.length; index += 1) {
@@ -67,8 +72,8 @@ describe("historical source step continuation SQL", () => {
   it("uses guarded int4 indexes for every prior continuation event lookup", () => {
     const sql = historicalSourceStepContinuationBinding(path)
     expect(sql).toContain("WHERE expected.ordinality BETWEEN 1 AND 7")
-    expect(occurrences(sql, boundedEventIndex)).toBe(3)
-    expect(occurrences(CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL, boundedEventIndex)).toBe(6)
+    expectGuardedOrdinalityIndexes(sql)
+    expectGuardedOrdinalityIndexes(CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL)
   })
 
   it("keeps the original call count and admits only the one separately proved continuation call", () => {
