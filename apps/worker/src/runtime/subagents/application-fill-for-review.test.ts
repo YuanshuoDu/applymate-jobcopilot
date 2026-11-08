@@ -13,7 +13,7 @@ import { executeBrowserFill } from "../../flows/index.js"
 import { evaluateUnattendedApplyControl } from "../../queue/unattended-apply-control.js"
 import { checkRateLimit } from "../../rate-limit.js"
 import type { SubagentLease } from "./types.js"
-import { executeApplicationFillForReview } from "./application-fill-for-review.js"
+import { executeApplicationFillForReview, type ApplicationFillStageObservation } from "./application-fill-for-review.js"
 
 vi.mock("node:fs", () => ({ unlinkSync: vi.fn() }))
 vi.mock("../../cloak/pool.js", () => ({ withCloakContext: vi.fn() }))
@@ -115,6 +115,37 @@ describe("executeApplicationFillForReview", () => {
     expect(result).toMatchObject({ status: "failed", failureReason: "fill_role_invalid" })
     expect(connects).not.toHaveBeenCalled()
     expect(withCloakContext).not.toHaveBeenCalled()
+  })
+
+  it("emits only the fixed entry-validation stage fields and swallows observer errors", async () => {
+    const { pool } = poolFor(context({ taskStatus: "waiting_for_authorization", checkpoint: "form_filled", sessionStatus: "waiting_for_user", turnStatus: "waiting_for_approval" }))
+    const observations: ApplicationFillStageObservation[] = []
+    const stageObserver = vi.fn((event: ApplicationFillStageObservation) => { observations.push(event); throw new Error("private observer failure") })
+
+    const result = await executeApplicationFillForReview({ pool, lease: lease(), stageObserver })
+
+    expect(result).toMatchObject({ status: "completed", result: { status: "filled_for_user_review" } })
+    expect(stageObserver).toHaveBeenCalledWith({ stage: "entry_validation", outcome: "accepted", leaseLost: false, signalAborted: false })
+    expect(stageObserver).toHaveBeenCalledWith({ stage: "completion", outcome: "completed", leaseLost: false, signalAborted: false })
+    expect(Object.keys(observations[0]!).sort()).toEqual(["leaseLost", "outcome", "signalAborted", "stage"])
+  })
+
+  it("distinguishes wait-persistence stale results from completion stale results", async () => {
+    const stageObserver = vi.fn()
+    const waitPool = poolFor(context({ checkpoint: "browser_active" })).pool
+    vi.mocked(persistApplicationFillWait).mockResolvedValue({ status: "stale" })
+
+    await expect(executeApplicationFillForReview({ pool: waitPool, lease: lease(), stageObserver }))
+      .resolves.toMatchObject({ status: "failed", failureReason: "lease_lost" })
+    expect(stageObserver).toHaveBeenCalledWith({ stage: "wait_persistence", outcome: "stale", leaseLost: true, signalAborted: false })
+
+    stageObserver.mockClear()
+    vi.mocked(completeApplicationFillForReview).mockResolvedValue({ status: "stale" })
+    const completionPool = poolFor(context({ taskStatus: "waiting_for_authorization", checkpoint: "form_filled", sessionStatus: "waiting_for_user", turnStatus: "waiting_for_approval" })).pool
+
+    await expect(executeApplicationFillForReview({ pool: completionPool, lease: lease(), stageObserver }))
+      .resolves.toMatchObject({ status: "failed", failureReason: "lease_lost" })
+    expect(stageObserver).toHaveBeenCalledWith({ stage: "completion", outcome: "stale", leaseLost: true, signalAborted: false })
   })
 
   it.each([

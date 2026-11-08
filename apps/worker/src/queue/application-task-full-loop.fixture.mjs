@@ -5,10 +5,11 @@ import { readFile } from "node:fs/promises"
 import { unlink } from "node:fs/promises"
 import { Pool } from "pg"
 import { HOST, fixtureModel, required, safeBlockedTarget } from "./application-task-full-loop.fixture-support.mjs"
-import { traceApplicationFillExecutor } from "./application-task-full-loop.trace-support.mjs"
+import { applicationFillStageTrace, traceApplicationFillExecutor } from "./application-task-full-loop.trace-support.mjs"
 
 const [, , mode] = process.argv
 const SOCKET = process.env.APPLICATION_TASK_FULL_LOOP_SOCKET_PATH
+const stageObserver = process.env.APPLICATION_TASK_FULL_LOOP_STAGE_OBSERVER_TEST === "true" ? applicationFillStageTrace() : undefined
 const tls = async () => {
   const cert = await readFile(required("AGENT_TEST_TLS_CERT_PATH"))
   const key = await readFile(required("AGENT_TEST_TLS_KEY_PATH"))
@@ -184,7 +185,7 @@ async function startWorker() {
   await startProductionWorkerRuntime({ pool, workerId: `application-full-loop-${process.pid}`, productionFlags: flags,
     onBootstrapReady: value => { bootstrap = value }, startAgentRunWorker() {} }, {
     createOptionalProductionChildExecutor: options => traceApplicationFillExecutor(options.enabled
-      ? createOptionalProductionChildExecutor({ ...options, authorizeUsage }) : undefined),
+      ? createOptionalProductionChildExecutor({ ...options, authorizeUsage, ...(stageObserver ? { applicationFillStageObserver: stageObserver } : {}) }) : undefined),
     createCanonicalTurnRuntime: (runtimePool, productionOptions) => createCanonicalTurnRuntime(runtimePool, {
       ...productionOptions, ...taskGraphTemplatesModule.taskGraphRuntimeOptions(taskGraphCommandPort),
       modelRuntimeFactory: () => fixtureModel(), authorizeUsage,

@@ -129,6 +129,7 @@ type ApplicationFillExecutorTrace = {
   leaseSignalAbortedAtStart: boolean
   leaseSignalAbortedAtEnd: boolean
 }
+type ApplicationFillStageTrace = { entryValidation: boolean; waitPersistence: boolean; completion: boolean; accepted: boolean; rejected: boolean; waiting: boolean; completed: boolean; stale: boolean; conflict: boolean; failed: boolean; cancelled: boolean; unavailable: boolean; leaseLost: boolean; signalAborted: boolean }
 type ApplicationTaskRow = {
   id: string; userId: string; jobId: string; sessionId: string | null; fillTurnId: string | null
   status: string; checkpoint: string | null; question: unknown; confirmedAnswers: unknown
@@ -190,6 +191,7 @@ function spawnFixture(mode: "site" | "worker"): Child {
       AGENT_RUNTIME_PG_TEST_DISPOSABLE: "true", AGENT_RUNTIME_PG_TEST_REQUIRED: "true",
       AGENT_TURN_REDIS_TEST_DISPOSABLE: "true", RUN_AGENT_TURN_REDIS_INTEGRATION: "1",
       CLOAK_PROXY_URL: "http://127.0.0.1:9443", APPLICATION_TASK_FULL_LOOP_SOCKET_PATH: socketPath,
+      APPLICATION_TASK_FULL_LOOP_STAGE_OBSERVER_TEST: mode === "worker" ? "true" : "false",
       BULLMQ_STALLED_INTERVAL_MS: "30000",
       ...(mode === "worker" ? { APPLICATION_TASK_FULL_LOOP_USER_ID: ids.user } : {}),
     },
@@ -268,6 +270,23 @@ function applicationFillExecutorTraces(child: Child | undefined): Array<Applicat
     }
   }
   return traces.slice(-12)
+}
+
+function applicationFillStageTraces(child: Child | undefined): Array<ApplicationFillStageTrace | { traceInvalid: true }> {
+  const prefix = "APPLICATION_FILL_STAGE_TRACE ", keys = ["entryValidation", "waitPersistence", "completion", "accepted", "rejected", "waiting", "completed", "stale", "conflict", "failed", "cancelled", "unavailable", "leaseLost", "signalAborted"]
+  const traces: Array<ApplicationFillStageTrace | { traceInvalid: true }> = []
+  for (const line of child?.lines ?? []) {
+    if (!line.startsWith(prefix)) continue
+    try {
+      const row = jsonRecord(JSON.parse(line.slice(prefix.length)))
+      if (!row || Object.keys(row).sort().join(",") !== [...keys].sort().join(",") || keys.some(key => typeof row[key] !== "boolean")) {
+        traces.push({ traceInvalid: true })
+        continue
+      }
+      traces.push(Object.fromEntries(keys.map(key => [key, row[key] === true])) as ApplicationFillStageTrace)
+    } catch { traces.push({ traceInvalid: true }) }
+  }
+  return traces.slice(-24)
 }
 
 async function waitLine(child: Child, expected: string, timeoutMs = 30_000): Promise<string> {
@@ -484,6 +503,7 @@ async function taskRuntimeDiagnostics(task: ApplicationTaskRow | null) {
     recentEvents: recentEvents.map(event => ({ ...event, sequence: event.sequence.toString() })),
     fixtureStats,
     applicationFillExecutorTraces: applicationFillExecutorTraces(worker),
+    applicationFillStageTraces: applicationFillStageTraces(worker),
     workerExited: worker ? exited(worker) : null,
     workerLineCount: worker?.lines.length ?? 0, workerErrorCount: worker?.errors.length ?? 0,
   }
@@ -741,6 +761,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
             dbConnected,
             fixtureStats: await requestFixtureStats().then(fixtureStatsSummary).catch(() => ({ errorPresent: true })),
             applicationFillExecutorTraces: applicationFillExecutorTraces(worker),
+            applicationFillStageTraces: applicationFillStageTraces(worker),
             workerExited: worker ? exited(worker) : null,
             worker: worker ? childSummary(worker) : null,
             site: site ? childSummary(site) : null,

@@ -39,3 +39,23 @@ export function traceApplicationFillExecutor(executor) {
     }
   }
 }
+
+export function applicationFillStageTrace() {
+  return event => {
+    try {
+      const stages = ["entry_validation", "wait_persistence", "completion"]
+      const outcomes = ["accepted", "rejected", "waiting", "completed", "stale", "conflict", "failed", "cancelled", "unavailable"]
+      if (!event || !stages.includes(event.stage) || !outcomes.includes(event.outcome)
+        || typeof event.leaseLost !== "boolean" || typeof event.signalAborted !== "boolean") return
+      process.stdout.write(`APPLICATION_FILL_STAGE_TRACE ${JSON.stringify({
+        entryValidation: event.stage === "entry_validation", waitPersistence: event.stage === "wait_persistence", completion: event.stage === "completion",
+        accepted: event.outcome === "accepted", rejected: event.outcome === "rejected", waiting: event.outcome === "waiting",
+        completed: event.outcome === "completed", stale: event.outcome === "stale", conflict: event.outcome === "conflict",
+        failed: event.outcome === "failed", cancelled: event.outcome === "cancelled",
+        unavailable: event.outcome === "unavailable", leaseLost: event.leaseLost, signalAborted: event.signalAborted,
+      })}\n`)
+    } catch {
+      // Diagnostics must never affect fixture execution.
+    }
+  }
+}
