@@ -32,13 +32,24 @@ async function startSite() {
   await unlink(SOCKET).catch(() => undefined)
   let submitCount = 0
   const requests = []
+  const browserTrace = []
   const blocked = []
   const held = new Set()
   const siteSockets = new Set()
   const proxySockets = new Set()
   const site = createHttpsServer(await tls(), (request, response) => {
-    requests.push(`${request.method ?? "GET"} ${request.url ?? "/"}`)
+    const requestUrl = new URL(request.url ?? "/", "https://boards.greenhouse.io")
+    requests.push(`${request.method ?? "GET"} ${requestUrl.pathname}`)
     if (requests.length > 20) requests.shift()
+    if (request.method === "POST" && requestUrl.pathname === "/__trace") {
+      const event = requestUrl.searchParams.get("event")
+      const field = requestUrl.searchParams.get("field")
+      if (event === "dom_ready") browserTrace.push("dom_ready")
+      else if (event === "input" && ["first_name", "last_name", "email", "work_authorization"].includes(field)) browserTrace.push(`input:${field}`)
+      if (browserTrace.length > 20) browserTrace.shift()
+      response.writeHead(204).end()
+      return
+    }
     if (request.method === "GET" && request.url === "/example/jobs/1") {
       response.writeHead(200, { "content-type": "text/html; charset=utf-8" })
       response.end(`<!doctype html><title>Fixture Application</title><form method="post" action="/example/jobs/1">
@@ -47,7 +58,13 @@ async function startSite() {
         <label for="email">Email</label><input id="email" name="email" type="email" required>
         <label for="work_authorization">Are you legally authorized to work in Ireland?</label>
         <input id="work_authorization" name="work_authorization" required>
-        <button id="submit-app" type="submit">Submit application</button></form>`)
+        <button id="submit-app" type="submit">Submit application</button></form>
+        <script>
+          fetch('/__trace?event=dom_ready', { method: 'POST', keepalive: true }).catch(() => {});
+          document.querySelectorAll('input').forEach(field => field.addEventListener('input', () => {
+            fetch('/__trace?event=input&field=' + encodeURIComponent(field.name), { method: 'POST', keepalive: true }).catch(() => {});
+          }));
+        </script>`)
       return
     }
     if (request.method === "POST" && request.url === "/example/jobs/1") {
@@ -102,7 +119,7 @@ async function startSite() {
     const lines = buffer.split("\n")
     buffer = lines.pop() ?? ""
     for (const line of lines.map(value => value.trim())) {
-      if (line === "stats") say(`FIXTURE_STATE ${JSON.stringify({ submitCount, blocked, requests })}`)
+      if (line === "stats") say(`FIXTURE_STATE ${JSON.stringify({ submitCount, blocked, requests, browserTrace })}`)
       if (line === "shutdown") {
         process.stdin.pause()
         for (const response of held) response.destroy()
