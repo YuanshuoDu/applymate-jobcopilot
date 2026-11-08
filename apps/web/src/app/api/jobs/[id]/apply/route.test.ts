@@ -82,7 +82,8 @@ describe('POST manual application record', () => {
     const response = await POST(request(), context)
     expect(response.status).toBe(200)
     expect(await response.json()).toEqual({ applied: true })
-    expect(mocks.update).toHaveBeenCalledWith({ where: { id: 'job-1', userId: 'user-1', status: 'saved', workflowState: { in: ['draft', 'ready_to_apply'] }, appliedAt: null }, data: { status: 'applied', workflowState: 'submitted', appliedAt: expect.any(Date) } })
+    expect(mocks.count).toHaveBeenCalledWith({ where: { userId: 'user-1', appliedAt: { gte: expect.any(Date) } } })
+    expect(mocks.update).toHaveBeenCalledWith({ where: { id: 'job-1', userId: 'user-1', status: { in: ['saved', 'applied'] }, workflowState: { in: ['draft', 'ready_to_apply'] }, appliedAt: null }, data: { status: 'applied', workflowState: 'submitted', appliedAt: expect.any(Date) } })
     expect(mocks.activityCreate).toHaveBeenCalledWith({ data: { userId: 'user-1', jobId: 'job-1', type: 'applied', text: 'You applied manually Example · Engineer', color: '#059669' } })
     expect(mocks.purge).toHaveBeenCalledWith('user-1', 'job-1')
   })
@@ -146,17 +147,19 @@ describe('POST manual application record', () => {
 
   it.each([
     ['saved', 'draft', null, 200], ['saved', 'ready_to_apply', null, 200],
+    ['applied', 'draft', null, 200], ['applied', 'ready_to_apply', null, 200],
     ['saved', 'queued', null, 409], ['saved', 'submitting', null, 409],
     ['saved', 'submitted', null, 409], ['saved', 'draft', new Date('2024-01-01'), 409],
-    ['applied', 'submitted', new Date('2024-01-01'), 409], ['interview', 'submitted', null, 409],
+    ['applied', 'submitted', new Date('2024-01-01'), 409], ['applied', 'submitted', null, 409],
+    ['applied', 'draft', new Date('2024-01-01'), 409], ['interview', 'submitted', null, 409],
     ['offer', 'submitted', null, 409], ['rejected', 'submitted', null, 409],
   ])('guards actual state %s / %s / %s for the legacy caller', async (status, workflowState, appliedAt, expected) => {
     const state = { status, workflowState, appliedAt }
     mocks.update.mockImplementation(async ({ where, data }: {
-      where: { status: string; workflowState: { in: string[] }; appliedAt: null }
+      where: { status: { in: string[] }; workflowState: { in: string[] }; appliedAt: null }
       data: { status: string; workflowState: string; appliedAt: Date }
     }) => {
-      if (state.status !== where.status || !where.workflowState.in.includes(state.workflowState) || state.appliedAt !== where.appliedAt) return { count: 0 }
+      if (!where.status.in.includes(state.status) || !where.workflowState.in.includes(state.workflowState) || state.appliedAt !== where.appliedAt) return { count: 0 }
       Object.assign(state, data)
       return { count: 1 }
     })

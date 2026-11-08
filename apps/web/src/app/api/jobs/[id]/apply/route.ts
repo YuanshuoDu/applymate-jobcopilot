@@ -23,7 +23,8 @@ export async function POST(
   const monthStart = new Date()
   monthStart.setUTCDate(1)
   monthStart.setUTCHours(0, 0, 0, 0)
-  const usage = await db.job.count({ where: { userId: auth.userId, status: 'applied', appliedAt: { gte: monthStart } } })
+  // Kanban status is editable tracking; entitlement usage follows persisted records.
+  const usage = await db.job.count({ where: { userId: auth.userId, appliedAt: { gte: monthStart } } })
   const quota = await checkEntitlementLimit(auth.userId, 'applications', usage)
   if (!quota.allowed) {
     const limitReached = quota.reason === 'limit_reached'
@@ -39,7 +40,7 @@ export async function POST(
   const recorded = await db.$transaction(async tx => {
     // This conditional write is the decision point for competing manual records.
     const result = await tx.job.updateMany({
-      where: { id, userId: auth.userId, status: 'saved', workflowState: { in: ['draft', 'ready_to_apply'] }, appliedAt: null },
+      where: { id, userId: auth.userId, status: { in: ['saved', 'applied'] }, workflowState: { in: ['draft', 'ready_to_apply'] }, appliedAt: null },
       data: { status: 'applied', workflowState: 'submitted', appliedAt: new Date() },
     })
     if (result.count !== 1) return false

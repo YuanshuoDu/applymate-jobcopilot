@@ -233,9 +233,21 @@ describe('submission evidence and duplicate protection', () => {
     expect(blocksManualRecord(job)).toBe(true)
   })
 
-  it('recognizes an explicit applied status as a record', () => {
-    const job = { ...saved, status: 'applied' as const }
+  it.each(['draft', 'ready_to_apply'] as const)('keeps tracking-only Applied eligible for explicit recording in %s', workflowState => {
+    const job = { ...saved, status: 'applied' as const, workflowState }
+    expect(hasVisibleSubmissionRecord(job)).toBe(false)
+    expect(blocksManualRecord(job)).toBe(false)
+  })
+
+  it('uses a valid applied timestamp, rather than the Kanban status, as record evidence', () => {
+    const job = { ...saved, status: 'applied' as const, appliedAt: '2026-10-30T10:00:00.000Z' }
     expect(hasVisibleSubmissionRecord(job)).toBe(true)
+    expect(blocksManualRecord(job)).toBe(true)
+  })
+
+  it('blocks an Applied status with submitted workflow but no timestamp as uncertain', () => {
+    const job = { ...saved, status: 'applied' as const, workflowState: 'submitted' as const }
+    expect(hasVisibleSubmissionRecord(job)).toBe(false)
     expect(blocksManualRecord(job)).toBe(true)
   })
 

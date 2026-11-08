@@ -67,10 +67,9 @@ export async function PATCH(req: NextRequest, { params }: Params) {
     return err('Invalid job status')
   }
 
-  if (data.status === 'applied' && !existing.appliedAt) {
-    data.appliedAt = new Date()
-  }
-  if (data.status) data.workflowState = data.status === 'saved' ? 'draft' : 'submitted'
+  // Kanban status is tracking only. A manual submission record is created by
+  // the canonical /apply endpoint after the candidate explicitly confirms it.
+  if (data.status && data.status !== 'applied') data.workflowState = data.status === 'saved' ? 'draft' : 'submitted'
 
   const job = await db.job.update({ where: { id }, data })
 
