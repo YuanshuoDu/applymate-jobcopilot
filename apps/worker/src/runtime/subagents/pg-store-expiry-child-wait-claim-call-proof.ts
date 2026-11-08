@@ -3,6 +3,11 @@ import { CHILD_WAIT_STEP_TOOL_CHAIN_EXCEPTION_SQL } from "./pg-store-expiry-step
 import { CHILD_WAIT_SOURCE_RECOVERED_RESULT_SQL, CHILD_WAIT_SOURCE_STARTED_NO_RESULT_SQL } from "./pg-store-expiry-child-wait-source-proof.js"
 import { CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL } from "./pg-store-expiry-historical-wait-binding.js"
 import { historicalWaitClaimProofsSql, historicalWaitProjectionsSql } from "./pg-store-expiry-historical-wait-claim-collision.js"
+const CHILD_WAIT_HISTORICAL_WAIT_BINDING_WITH_LEGACY_RAW_SQL = CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL.replace(
+  /AND sourceCallCompleted\."payload" = ([\s\S]*?)\s+AND sourceTerminal\."itemId" = boundSourceCall\."id"/g,
+  (_match, projected: string) => `AND (sourceCallCompleted."payload" = ${projected.trim()} OR (proof.value->'sourceWait'->>'sourceKind' = 'normal_waiting' AND sourceCallCompleted."payload" = jsonb_build_object('itemId', boundSourceCall."id", 'status', 'completed', 'content', boundSourceCall."content"))) AND sourceTerminal."itemId" = boundSourceCall."id"`,
+)
+if (CHILD_WAIT_HISTORICAL_WAIT_BINDING_WITH_LEGACY_RAW_SQL === CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL) throw new Error("historical_wait_source_completion_predicate_missing")
 /** Match a persisted continuation key only to the redacted projection of its exact source key. */
 export function childWaitContinuationKeyMatchesSafeProjection(sourceKey: unknown, continuationKey: unknown): boolean {
   if (typeof sourceKey !== "string" || typeof continuationKey !== "string"
@@ -141,14 +146,16 @@ export const CHILD_WAIT_SOURCE_PROJECTED_COMPLETION_SQL = `(
   AND callItem."content"->'input'->>'mode' IN ('any', 'all')
   AND jsonb_typeof(callItem."content"->'input'->'timeoutMs') = 'number'
   AND callItem."content"->'input'->>'timeoutMs' ~ '^([1-9][0-9]{0,3}|[12][0-9]{4}|30000)$'
-  AND itemCompleted."payload" = jsonb_build_object('itemId', callItem."id", 'status', 'completed', 'content',
+  AND (itemCompleted."payload" = jsonb_build_object('itemId', callItem."id", 'status', 'completed', 'content',
     jsonb_build_object('toolName', 'wait_subagents', 'input', jsonb_build_object('idempotencyKey', '[REDACTED]',
       'taskIds', (SELECT jsonb_agg(to_jsonb('[REDACTED]'::text) ORDER BY target.ordinal)
         FROM generate_series(1, jsonb_array_length(CASE WHEN jsonb_typeof(callItem."content"->'input'->'taskIds') = 'array'
           THEN callItem."content"->'input'->'taskIds' ELSE '[]'::jsonb END)) AS target(ordinal)),
       'mode', callItem."content"->'input'->'mode', 'timeoutMs', callItem."content"->'input'->'timeoutMs'),
       'toolCallId', proof.value->>'projectedCallId', 'toolVersion', '1', 'status', 'completed', 'errorCode', NULL))
-  AND ${CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL}
+    OR (proof.value->'sourceWait'->>'sourceKind' = 'normal_waiting'
+      AND itemCompleted."payload" = jsonb_build_object('itemId', callItem."id", 'status', 'completed', 'content', callItem."content")))
+  AND ${CHILD_WAIT_HISTORICAL_WAIT_BINDING_WITH_LEGACY_RAW_SQL}
 ))`
 
 /** Only an exact wait-call item/event lifecycle may settle its external start. */

@@ -4266,6 +4266,50 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       const staleOwnerTask = await taskStore.get(waiter.id, ids.sessionId)
       const staleOwnerExpiry = acknowledged!.leaseExpiresAt
       if (!staleOwnerTask || !(staleOwnerExpiry instanceof Date)) throw new Error("fixture_stale_source_owner_snapshot_missing")
+      const blockerSnapshot: BlockingTaskSnapshot = { id: waiter.id, userId: ids.userId, sessionId: ids.sessionId,
+        turnId: ids.turnId, rootTaskId: ids.rootTaskId, leaseOwner: staleOwnerTask.leaseOwner,
+        attemptCount: staleOwnerTask.attemptCount, leaseExpiresAt: staleOwnerTask.leaseExpiresAt }
+      if (!(blockerSnapshot.leaseExpiresAt instanceof Date)) throw new Error("fixture_expired_blocker_snapshot_missing")
+      const blockerProbe = await pool.connect()
+      try {
+        await blockerProbe.query("BEGIN")
+        await blockerProbe.query("SELECT set_config('app.user_id', $1, true)", [ids.userId])
+        const sourceCall = await blockerProbe.query<{ id: string; content: Record<string, unknown> }>(
+          `SELECT "id", "content" FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+             AND "stepId" = $4 AND "type" = 'tool_call' AND "content"->>'toolCallId' = $5`,
+          [ids.sessionId, ids.turnId, waiter.id, acknowledged!.sourceStepId, PHONE_SHAPED_WAIT_TOOL_CALL_ID],
+        )
+        expect(sourceCall.rows).toHaveLength(1)
+        const sourceCallItem = sourceCall.rows[0]!
+        const completionEvent = await blockerProbe.query<{ id: string }>(
+          `SELECT "id" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3
+             AND "itemId" = $4 AND "type" = 'item.completed' AND "idempotencyKey" = $5`,
+          [ids.sessionId, ids.turnId, waiter.id, sourceCallItem.id,
+            `task:${waiter.id}:event:tool-call-completed:${PHONE_SHAPED_WAIT_TOOL_CALL_ID}:${sourceCallItem.id}:1`],
+        )
+        expect(completionEvent.rows).toHaveLength(1)
+        const completionId = completionEvent.rows[0]!.id
+        const safePayload = projectWaitCallCompletionPayload({ itemId: sourceCallItem.id, status: "completed", content: sourceCallItem.content },
+          sourceCallItem.id)
+        const rawPayload = { itemId: sourceCallItem.id, status: "completed", content: sourceCallItem.content }
+        const setPayload = (payload: unknown) => blockerProbe.query(
+          `UPDATE "agent_events" SET "payload" = $2::jsonb WHERE "id" = $1 AND "sessionId" = $3 AND "turnId" = $4 AND "taskId" = $5`,
+          [completionId, JSON.stringify(payload), ids.sessionId, ids.turnId, waiter.id],
+        )
+        const sourceWaitBlocksRecovery = () => hasBlockingExternalCall(blockerProbe, blockerSnapshot as unknown as Record<string, unknown>,
+          undefined, acknowledged!.continuationStepId)
+
+        await setPayload(safePayload)
+        await expect(sourceWaitBlocksRecovery()).resolves.toBe(false)
+        await setPayload(rawPayload)
+        await expect(sourceWaitBlocksRecovery()).resolves.toBe(false)
+        const tamperedContent = { ...sourceCallItem.content, input: { ...asObject(sourceCallItem.content.input), taskIds: ["different-child"] } }
+        await setPayload({ itemId: sourceCallItem.id, status: "completed", content: tamperedContent })
+        await expect(sourceWaitBlocksRecovery()).resolves.toBe(true)
+      } finally {
+        await blockerProbe.query("ROLLBACK").catch(() => undefined)
+        blockerProbe.release()
+      }
       const staleOwnerLease: SubagentLease = { ...staleOwnerTask, ownerId: acknowledgedOwner!, leaseExpiresAt: staleOwnerExpiry,
         signal: new AbortController().signal }
       const beforeStaleOwnerWrite = await readSourceWaitLifecycle(pool, ids)

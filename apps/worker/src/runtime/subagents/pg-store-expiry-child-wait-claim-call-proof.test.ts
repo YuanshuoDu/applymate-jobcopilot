@@ -103,6 +103,30 @@ describe("historical source proof SQL scope", () => {
     expect(close).toBeGreaterThan(binding)
   })
 })
+
+describe("historical wait completion event compatibility", () => {
+  const sql = CHILD_WAIT_SOURCE_PROJECTED_COMPLETION_SQL.replace(/\s+/g, " ")
+
+  it("accepts an exact raw completion only for a validated normal waiting receipt", () => {
+    expect(sql).toContain("proof.value->'sourceWait'->>'sourceKind' = 'normal_waiting'")
+    expect(sql).toContain(`itemCompleted."payload" = jsonb_build_object('itemId', callItem."id", 'status', 'completed', 'content', callItem."content")`)
+    expect(sql).toContain(`sourceCallCompleted."payload" = jsonb_build_object('itemId', boundSourceCall."id", 'status', 'completed', 'content', boundSourceCall."content")`)
+  })
+
+  it("retains the exact safe projected completion derived from the durable receipt", () => {
+    expect(sql).toContain(`itemCompleted."payload" = jsonb_build_object('itemId', callItem."id", 'status', 'completed', 'content', jsonb_build_object('toolName', 'wait_subagents'`)
+    expect(sql).toContain(`'toolCallId', proof.value->>'projectedCallId'`)
+    expect(sql).toContain(`sourceCallCompleted."payload" = jsonb_build_object('itemId', boundSourceCall."id"`)
+    expect(sql).toContain(`proof.value->'sourceWait'->>'projectedSourceCallId'`)
+  })
+
+  it("requires full payload equality so altered or mismatched raw content cannot settle the call", () => {
+    expect(sql).toContain(`itemCompleted."payload" = jsonb_build_object('itemId', callItem."id", 'status', 'completed', 'content', callItem."content")`)
+    expect(sql).toContain(`sourceCallCompleted."payload" = jsonb_build_object('itemId', boundSourceCall."id", 'status', 'completed', 'content', boundSourceCall."content")`)
+    expect(sql).not.toContain(`itemCompleted."payload" @>`)
+    expect(sql).not.toContain(`sourceCallCompleted."payload" @>`)
+  })
+})
 describe("canonical historical child-wait outcome", () => {
   function fixture() {
     const deadlineAt = new Date("2026-11-06T10:00:00.123Z")
