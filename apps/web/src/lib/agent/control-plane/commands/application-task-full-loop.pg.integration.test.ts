@@ -10,7 +10,7 @@ import { setTimeout as delay } from "node:timers/promises"
 import { Prisma, PrismaClient } from "@prisma/client"
 import { SignJWT } from "jose"
 import { NextRequest } from "next/server"
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
+import { afterAll, beforeAll, describe, expect, it, onTestFailed, vi } from "vitest"
 
 import { EXTENSION_TOKEN_AUDIENCE, EXTENSION_TOKEN_ISSUER, getAuthJwtSecret } from "@/lib/auth-secret"
 import type { ApplicationPackage, PipelineCtx } from "@/lib/agent/types"
@@ -56,6 +56,13 @@ const enabled = databaseUrl !== null && redisUrl !== null
 const describeWithServices = enabled ? describe : describe.skip
 
 type Child = ChildProcess & { readonly lines: string[]; readonly errors: string[] }
+type FixtureStats = {
+  submitCount: number
+  blocked: string[]
+  requests: string[]
+  browserTrace: string[]
+  browserProgress: Array<{ event: string; elapsedMs: number; length?: number }>
+}
 type ApplicationTaskRow = {
   id: string; userId: string; jobId: string; sessionId: string | null; fillTurnId: string | null
   status: string; checkpoint: string | null; question: unknown; confirmedAnswers: unknown
@@ -70,7 +77,9 @@ const workerRequire = createRequire(new URL("../../../../../../worker/package.js
 const { Queue } = workerRequire("bullmq") as { Queue: new (name: string, options: { connection: { host: string; port: number; db: number } }) => {
   getJobs(states: readonly string[], start: number, end: number): Promise<Array<{ id?: string; data: unknown; attemptsMade: number; attemptsStarted: number; stalledCounter: number; getState(): Promise<string>; remove(): Promise<void> }>>
   getJob(id: string): Promise<{ id?: string; data: unknown; attemptsMade: number; attemptsStarted: number; stalledCounter: number; getState(): Promise<string>; remove(): Promise<void> } | undefined>
+  add(name: string, data: unknown, options: { jobId: string }): Promise<{ id?: string; getState(): Promise<string> }>
   close(): Promise<void>
+  disconnect(): Promise<void>
 } }
 let site: Child | undefined
 let worker: Child | undefined
@@ -135,15 +144,34 @@ function spawnFixture(mode: "site" | "worker"): Child {
 
 function exited(child: Child): boolean { return child.exitCode !== null || child.signalCode !== null }
 
+function childSummary(child: Child) {
+  return {
+    exitCode: child.exitCode,
+    signalCode: child.signalCode,
+    stdoutLineCount: child.lines.length,
+    stderrLineCount: child.errors.length,
+  }
+}
+
+function fixtureStatsSummary(stats: FixtureStats) {
+  return {
+    submitCount: stats.submitCount,
+    blockedCount: stats.blocked.length,
+    requestCount: stats.requests.length,
+    browserTrace: stats.browserTrace,
+    browserProgress: stats.browserProgress,
+  }
+}
+
 async function waitLine(child: Child, expected: string, timeoutMs = 30_000): Promise<string> {
   const until = Date.now() + timeoutMs
   while (Date.now() < until) {
     const line = child.lines.find(value => value === expected || value.startsWith(`${expected} `))
     if (line) return line
-    if (exited(child)) throw new Error(`Fixture exited before ${expected}: ${child.errors.join("\n")}`)
+    if (exited(child)) throw new Error(`Fixture exited before ${expected}; child=${JSON.stringify(childSummary(child))}`)
     await delay(25)
   }
-  throw new Error(`Fixture line ${expected} missing; stdout=${child.lines.slice(-20).join(" | ")}; stderr=${child.errors.slice(-20).join(" | ")}`)
+  throw new Error(`Fixture line ${expected} missing; child=${JSON.stringify(childSummary(child))}`)
 }
 
 async function waitExit(child: Child, timeoutMs: number): Promise<boolean> {
@@ -162,7 +190,7 @@ async function stopFixture(child: Child | undefined): Promise<void> {
     await waitExit(child, 1_000)
     throw new Error("Fixture did not shut down cleanly")
   }
-  if (child.exitCode !== 0) throw new Error(`Fixture exited ${child.exitCode}: ${child.errors.join("\n")}`)
+  if (child.exitCode !== 0) throw new Error(`Fixture exited with nonzero status; child=${JSON.stringify(childSummary(child))}`)
 }
 
 async function signedBearer(userId: string): Promise<string> {
@@ -190,13 +218,13 @@ async function waitForTask(predicate: (task: ApplicationTaskRow) => boolean, tim
   while (Date.now() < until) {
     const task = await testDb.applicationTask.findUnique({ where: { id: gateTaskId! } }) as ApplicationTaskRow | null
     if (task && predicate(task)) return task
-    if (worker && exited(worker)) throw new Error(`Worker exited while waiting for task state: ${worker.errors.join("\n")}`)
+    if (worker && exited(worker)) throw new Error(`Worker exited while waiting for task state; child=${JSON.stringify(childSummary(worker))}`)
     await delay(100)
   }
   const current = await testDb.applicationTask.findUnique({ where: { id: gateTaskId! } })
   let diagnostics: string
   try { diagnostics = JSON.stringify(await taskRuntimeDiagnostics(current as ApplicationTaskRow | null)) }
-  catch (error: unknown) { diagnostics = `diagnostics_unavailable:${error instanceof Error ? error.message : String(error)}` }
+  catch { diagnostics = "diagnostics_unavailable" }
   throw new Error(`ApplicationTask state timeout: ${diagnostics}`)
 }
 
@@ -209,10 +237,36 @@ async function matchingQueueJobs(queue: InstanceType<typeof Queue> | undefined, 
   })))
 }
 
+async function waitForStableTurnQueueJobs(turnId: string, stableMs = 750, timeoutMs = 30_000) {
+  const until = Date.now() + timeoutMs
+  let signature = ""
+  let stableSince = Date.now()
+  let latest: Awaited<ReturnType<typeof matchingQueueJobs>> = []
+  while (Date.now() < until) {
+    const [dispatch, jobs] = await Promise.all([
+      testDb.agentOutbox.findUnique({
+        where: { idempotencyKey: `turn-dispatch:${turnId}` },
+        select: { publishedAt: true },
+      }),
+      matchingQueueJobs(turnQueue, "turnId", turnId),
+    ])
+    latest = jobs
+    const nextSignature = JSON.stringify([...jobs].sort((left, right) => String(left.id).localeCompare(String(right.id))))
+    if (nextSignature !== signature) {
+      signature = nextSignature
+      stableSince = Date.now()
+    } else if (dispatch?.publishedAt && jobs.length > 0 && Date.now() - stableSince >= stableMs) {
+      return jobs
+    }
+    await delay(100)
+  }
+  throw new Error(`Successor Turn queue publication did not stabilize; turnId=${turnId}; jobs=${JSON.stringify(latest)}`)
+}
+
 async function taskRuntimeDiagnostics(task: ApplicationTaskRow | null) {
-  if (!task) return { task: null, workerLines: worker?.lines.slice(-30) ?? [], workerErrors: worker?.errors.slice(-30) ?? [] }
-  const turnId = task.fillTurnId
-  const [turn, turnDispatch, taskGraph, turnSteps, recentEvents, childDispatches] = await Promise.all([
+  const turnId = task?.fillTurnId ?? null
+  const taskId = task?.id ?? gateTaskId ?? null
+  const [turn, turnDispatch, taskGraph, turnSteps, recentEvents, childDispatches, applicationTaskEvents, submitOutbox, applyJobs, sessionTurns, sessionSubagents] = await Promise.all([
     turnId ? testDb.agentTurn.findUnique({ where: { id: turnId }, select: {
       id: true, source: true, status: true, rootTaskId: true, revision: true, error: true,
       leaseOwnerId: true, leaseExpiresAt: true, startedAt: true, completedAt: true,
@@ -233,22 +287,74 @@ async function taskRuntimeDiagnostics(task: ApplicationTaskRow | null) {
     testDb.agentOutbox.findMany({ where: { aggregateId: ids.session, topic: "agent.subagent.dispatch" }, orderBy: { createdAt: "asc" }, select: {
       idempotencyKey: true, publishedAt: true, attemptCount: true, lastError: true,
     } }),
+    taskId ? testDb.applicationTaskEvent.findMany({ where: { taskId }, orderBy: { createdAt: "asc" }, select: {
+      id: true, type: true, actor: true, createdAt: true, data: true,
+    } }) : [],
+    testDb.agentOutbox.findMany({ where: { aggregateId: ids.session, topic: "application.submit.dispatch" }, orderBy: { createdAt: "asc" }, select: {
+      idempotencyKey: true, aggregateId: true, payload: true, publishedAt: true, attemptCount: true, lastError: true,
+    } }),
+    applyQueue ? applyQueue.getJobs(["waiting", "active", "delayed", "completed", "failed", "paused", "waiting-children", "prioritized"], 0, -1) : [],
+    testDb.agentTurn.findMany({ where: { sessionId: ids.session }, select: { id: true } }),
+    testDb.subAgentTask.findMany({ where: { sessionId: ids.session }, select: { id: true } }),
   ])
-  const taskIds = taskGraph.map(node => node.id)
-  const subagentJobs = await Promise.all(taskIds.map(id => matchingQueueJobs(subagentQueue, "taskId", id)))
-  const turnJobs = turnId ? await matchingQueueJobs(turnQueue, "turnId", turnId) : []
+  const [sessionTurnJobs, sessionSubagentJobs] = await Promise.all([
+    Promise.all(sessionTurns.map(turnRow => matchingQueueJobs(turnQueue, "turnId", turnRow.id))),
+    Promise.all(sessionSubagents.map(taskRow => matchingQueueJobs(subagentQueue, "taskId", taskRow.id))),
+  ])
+  const ownedApplyJobIds = new Set(submitOutbox.map(row => jsonString(row.payload, "workerTaskId")).filter((id): id is string => Boolean(id)))
+  if (task?.workerTaskId) ownedApplyJobIds.add(task.workerTaskId)
+  const applyQueueJobs = await Promise.all(applyJobs.filter(job => {
+    const applicationTaskId = jsonString(job.data, "applicationTaskId")
+    return (Boolean(job.id) && ownedApplyJobIds.has(job.id!)) || (taskId !== null && applicationTaskId === taskId)
+  }).map(async job => ({
+    id: job.id ?? null, state: await job.getState(), attemptsMade: job.attemptsMade,
+    attemptsStarted: job.attemptsStarted, stalledCounter: job.stalledCounter,
+  })))
+  const fixtureStats = await requestFixtureStats().then(fixtureStatsSummary).catch(() => ({ errorPresent: true }))
   return {
-    task: { id: task.id, fillTurnId: turnId, status: task.status, checkpoint: task.checkpoint, workerTaskId: task.workerTaskId ?? null, error: task.error ?? null },
-    turn, turnDispatch, turnQueueJobs: turnJobs, turnSteps: turnSteps.map(step => ({ ...step })),
-    taskGraph: taskGraph.map(node => ({ ...node })),
-    subagentDispatches: childDispatches,
-    subagentQueueJobs: taskIds.flatMap((id, index) => subagentJobs[index]!.map(job => ({ taskId: id, ...job }))),
-    recentEvents: recentEvents.map(event => ({ ...event, sequence: event.sequence.toString() })),
-    fixtureStats: await requestFixtureStats().catch((error: unknown) => ({
-      error: error instanceof Error ? error.message : String(error),
+    task: task ? {
+      id: task.id, userId: task.userId, jobId: task.jobId, sessionId: task.sessionId, fillTurnId: turnId,
+      status: task.status, checkpoint: task.checkpoint, waitId: jsonRecord(task.question)?.waitId ?? null,
+      workerTaskId: task.workerTaskId ?? null, errorPresent: Boolean(task.error),
+    } : null,
+    turn: turn ? {
+      id: turn.id, source: turn.source, status: turn.status, rootTaskId: turn.rootTaskId, revision: turn.revision,
+      errorPresent: Boolean(turn.error), leaseOwnerId: turn.leaseOwnerId, leaseExpiresAt: turn.leaseExpiresAt,
+      startedAt: turn.startedAt, completedAt: turn.completedAt,
+    } : null,
+    turnDispatch: turnDispatch ? {
+      id: turnDispatch.id, publishedAt: turnDispatch.publishedAt, attemptCount: turnDispatch.attemptCount,
+      lastErrorPresent: Boolean(turnDispatch.lastError),
+    } : null,
+    turnQueueJobs: sessionTurns.flatMap((turnRow, index) => sessionTurnJobs[index]!.map(job => ({ turnId: turnRow.id, ...job }))),
+    taskGraph: taskGraph.map(node => ({
+      id: node.id, rootTaskId: node.rootTaskId, parentTaskId: node.parentTaskId, role: node.role, taskType: node.taskType,
+      status: node.status, failureReasonPresent: Boolean(node.failureReason), attemptCount: node.attemptCount,
+      leaseOwner: node.leaseOwner, leaseExpiresAt: node.leaseExpiresAt, createdAt: node.createdAt, updatedAt: node.updatedAt,
     })),
+    subagentDispatches: childDispatches.map(({ idempotencyKey, publishedAt, attemptCount, lastError }) => ({
+      idempotencyKey, publishedAt, attemptCount, lastErrorPresent: Boolean(lastError),
+    })),
+    subagentQueueJobs: sessionSubagents.flatMap((taskRow, index) => sessionSubagentJobs[index]!.map(job => ({ taskId: taskRow.id, ...job }))),
+    turnSteps: turnSteps.map(step => ({
+      id: step.id, ordinal: step.ordinal, status: step.status, errorCodePresent: Boolean(step.errorCode),
+      createdAt: step.createdAt, completedAt: step.completedAt,
+    })),
+    applicationTaskEvents: applicationTaskEvents.map(({ data, ...event }) => {
+      const safeData = jsonRecord(data)
+      return { ...event, dataKeys: Object.keys(safeData ?? {}).sort(), waitIdPresent: typeof safeData?.waitId === "string" }
+    }),
+    submitOutbox: submitOutbox.map(({ idempotencyKey, aggregateId, payload, publishedAt, attemptCount, lastError }) => ({
+      idempotencyKey, aggregateId, publishedAt, attemptCount,
+      workerTaskId: jsonString(payload, "workerTaskId") ?? null,
+      payloadKeys: Object.keys(jsonRecord(payload) ?? {}).sort(), lastErrorPresent: Boolean(lastError),
+    })),
+    applyQueueJobs,
+    sessionTurnIds: sessionTurns.map(turnRow => turnRow.id), sessionSubagentTaskIds: sessionSubagents.map(taskRow => taskRow.id),
+    recentEvents: recentEvents.map(event => ({ ...event, sequence: event.sequence.toString() })),
+    fixtureStats,
     workerExited: worker ? exited(worker) : null,
-    workerLines: worker?.lines.slice(-30) ?? [], workerErrors: worker?.errors.slice(-30) ?? [],
+    workerLineCount: worker?.lines.length ?? 0, workerErrorCount: worker?.errors.length ?? 0,
   }
 }
 
@@ -268,16 +374,147 @@ async function waitForWorkerRedelivery(child: Child, jobId: string, timeoutMs = 
       return Number.isFinite(attemptsStarted) && attemptsStarted >= 2
     })
     if (redelivery) return redelivery
-    if (exited(child)) throw new Error(`Worker exited before BullMQ redelivered ${jobId}: ${child.errors.join("\n")}`)
+    if (exited(child)) throw new Error(`Worker exited before BullMQ redelivered ${jobId}; child=${JSON.stringify(childSummary(child))}`)
     await delay(50)
   }
-  throw new Error(`BullMQ did not redeliver ${jobId}; worker events=${child.lines.filter(line => line.includes(jobId)).join(" | ")}`)
+  const matchingEvents = child.lines.filter(line => line.startsWith(prefix))
+  const observedAttempts = matchingEvents.map(line => Number(/(?:^| )attemptsStarted=(\d+)/.exec(line)?.[1]))
+    .filter(Number.isFinite)
+  const maxAttemptsStarted = observedAttempts.length ? Math.max(...observedAttempts) : null
+  throw new Error(`BullMQ did not redeliver ${jobId}; matchingEventCount=${matchingEvents.length}; maxAttemptsStarted=${maxAttemptsStarted}`)
 }
 
 function jsonString(value: unknown, key: string): string | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
-  const field = (value as Record<string, unknown>)[key]
+  const field = jsonRecord(value)?.[key]
   return typeof field === "string" ? field : undefined
+}
+
+function jsonRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
+}
+
+const ALL_QUEUE_STATES = ["waiting", "active", "delayed", "completed", "failed", "paused", "waiting-children", "prioritized"] as const
+const CLEANUP_DEADLINE_EXCEEDED = "Scoped BullMQ cleanup deadline exceeded"
+const queueDisconnects = new WeakMap<object, Promise<void>>()
+
+function beforeDeadline<T>(operation: () => Promise<T>, deadlineAt: number): Promise<T> {
+  const remainingMs = deadlineAt - Date.now()
+  if (remainingMs <= 0) return Promise.reject(new Error(CLEANUP_DEADLINE_EXCEEDED))
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(CLEANUP_DEADLINE_EXCEEDED)), remainingMs)
+  })
+  let pending: Promise<T>
+  try {
+    pending = operation()
+  } catch (error) {
+    if (timer) clearTimeout(timer)
+    return Promise.reject(error)
+  }
+  return Promise.race([pending, deadline]).finally(() => {
+    if (timer) clearTimeout(timer)
+  })
+}
+
+function disconnectQueue(queue: InstanceType<typeof Queue>): Promise<void> {
+  const existing = queueDisconnects.get(queue)
+  if (existing) return existing
+  const disconnecting = Promise.resolve().then(() => queue.disconnect()).catch(() => undefined)
+  queueDisconnects.set(queue, disconnecting)
+  return disconnecting
+}
+
+async function queueOperationBeforeDeadline<T>(
+  queue: InstanceType<typeof Queue>,
+  operation: () => Promise<T>,
+  deadlineAt: number,
+): Promise<T> {
+  try {
+    return await beforeDeadline(operation, deadlineAt)
+  } catch (error) {
+    if (error instanceof Error && error.message === CLEANUP_DEADLINE_EXCEEDED) void disconnectQueue(queue)
+    throw error
+  }
+}
+
+async function closeQueueWithinDeadline(
+  queue: InstanceType<typeof Queue> | undefined,
+  deadlineAt: number,
+): Promise<void> {
+  if (!queue) return
+  try {
+    await queueOperationBeforeDeadline(queue, () => queue.close(), deadlineAt)
+  } catch (error) {
+    await Promise.race([disconnectQueue(queue), delay(1_000)])
+    throw error
+  }
+}
+
+async function ownedQueueStateSnapshot(): Promise<Array<{ queue: string; id: string; state: string }>> {
+  const [turns, subagentTasks, applyJobs, turnJobs, subagentJobs] = await Promise.all([
+    testDb.agentTurn.findMany({ where: { sessionId: ids.session }, select: { id: true } }),
+    testDb.subAgentTask.findMany({ where: { sessionId: ids.session }, select: { id: true } }),
+    applyQueue?.getJobs(ALL_QUEUE_STATES, 0, -1) ?? Promise.resolve([]),
+    turnQueue?.getJobs(ALL_QUEUE_STATES, 0, -1) ?? Promise.resolve([]),
+    subagentQueue?.getJobs(ALL_QUEUE_STATES, 0, -1) ?? Promise.resolve([]),
+  ])
+  const turnIds = new Set(turns.map(row => row.id))
+  const subagentTaskIds = new Set(subagentTasks.map(row => row.id))
+  const owned = [
+    { queue: "apply", jobs: applyJobs.filter(job => jsonString(job.data, "applicationTaskId") === gateTaskId) },
+    { queue: "turn", jobs: turnJobs.filter(job => {
+      const turnId = jsonString(job.data, "turnId")
+      return turnId !== undefined && turnIds.has(turnId)
+    }) },
+    { queue: "subagent", jobs: subagentJobs.filter(job => {
+      const taskId = jsonString(job.data, "taskId")
+      return taskId !== undefined && subagentTaskIds.has(taskId)
+    }) },
+  ]
+  const snapshots = await Promise.all(owned.flatMap(({ queue, jobs }) => jobs
+    .filter((job): job is typeof job & { id: string } => Boolean(job.id))
+    .map(async job => ({ queue, id: job.id, state: await job.getState() }))))
+  return snapshots.sort((left, right) => left.queue.localeCompare(right.queue) || left.id.localeCompare(right.id))
+}
+
+async function waitForStableOwnedQueueState(stableMs = 750, timeoutMs = 15_000) {
+  const until = Date.now() + timeoutMs
+  let signature: string | undefined
+  let stableSince = Date.now()
+  let latest: Awaited<ReturnType<typeof ownedQueueStateSnapshot>> = []
+  while (Date.now() < until) {
+    latest = await ownedQueueStateSnapshot()
+    const nextSignature = JSON.stringify(latest)
+    if (nextSignature !== signature) {
+      signature = nextSignature
+      stableSince = Date.now()
+    } else if (Date.now() - stableSince >= stableMs) {
+      return latest
+    }
+    await delay(100)
+  }
+  throw new Error(`Owned BullMQ state did not stabilize; jobCount=${latest.length}`)
+}
+
+async function removeScopedQueueJobs(
+  queue: InstanceType<typeof Queue> | undefined,
+  isOwned: (job: { id?: string; data: unknown }) => boolean,
+  deadlineAt: number,
+): Promise<void> {
+  if (!queue) return
+  let pendingJobs = (await queueOperationBeforeDeadline(queue, () => queue.getJobs(ALL_QUEUE_STATES, 0, -1), deadlineAt))
+    .filter(job => Boolean(job.id) && isOwned(job))
+  while (pendingJobs.length > 0) {
+    const results = await Promise.allSettled(pendingJobs.map(job => queueOperationBeforeDeadline(queue, () => job.remove(), deadlineAt)))
+    pendingJobs = pendingJobs.filter((_, index) => results[index]?.status === "rejected")
+    if (pendingJobs.length === 0) return
+    const remainingMs = deadlineAt - Date.now()
+    if (remainingMs <= 0) break
+    await delay(Math.min(500, remainingMs))
+  }
+  if (pendingJobs.length > 0) throw new Error(CLEANUP_DEADLINE_EXCEEDED)
 }
 
 async function cleanRunArtifacts(): Promise<void> {
@@ -285,30 +522,36 @@ async function cleanRunArtifacts(): Promise<void> {
     await unlink(socketPath).catch(() => undefined)
     return
   }
-  if (applyQueue) {
-    const [jobs, outbox, task] = await Promise.all([
-      applyQueue.getJobs(["waiting", "active", "delayed", "completed", "failed", "paused", "waiting-children", "prioritized"], 0, -1),
-      testDb.agentOutbox.findMany({ where: { aggregateId: ids.session, topic: "application.submit.dispatch" }, select: { payload: true } }),
-      gateTaskId ? testDb.applicationTask.findUnique({ where: { id: gateTaskId }, select: { workerTaskId: true } }) : Promise.resolve(null),
-    ])
-    const ownedJobIds = new Set(outbox.map(row => jsonString(row.payload, "workerTaskId")).filter((id): id is string => Boolean(id)))
-    if (task?.workerTaskId) ownedJobIds.add(task.workerTaskId)
-    for (const job of jobs) {
+  const [submitOutbox, task, sessionTurns, sessionSubagents] = await Promise.all([
+    testDb.agentOutbox.findMany({ where: { aggregateId: ids.session, topic: "application.submit.dispatch" }, select: { payload: true } }),
+    gateTaskId ? testDb.applicationTask.findUnique({ where: { id: gateTaskId }, select: { workerTaskId: true } }) : Promise.resolve(null),
+    testDb.agentTurn.findMany({ where: { sessionId: ids.session }, select: { id: true } }),
+    testDb.subAgentTask.findMany({ where: { sessionId: ids.session }, select: { id: true } }),
+  ])
+  const ownedSubmitJobIds = new Set(submitOutbox.map(row => jsonString(row.payload, "workerTaskId")).filter((id): id is string => Boolean(id)))
+  if (task?.workerTaskId) ownedSubmitJobIds.add(task.workerTaskId)
+  const ownedTurnIds = new Set(sessionTurns.map(turnRow => turnRow.id))
+  const ownedSubagentTaskIds = new Set(sessionSubagents.map(taskRow => taskRow.id))
+  const queueCleanupDeadline = Date.now() + 20_000
+  const queueCleanup = await Promise.allSettled([
+    removeScopedQueueJobs(applyQueue, job => {
       const applicationTaskId = jsonString(job.data, "applicationTaskId")
-      if (!job.id || (!ownedJobIds.has(job.id) && (!gateTaskId || applicationTaskId !== gateTaskId))) continue
-      let removed = false
-      for (let attempt = 0; attempt < 36 && !removed; attempt += 1) {
-        try { await job.remove(); removed = true }
-        catch (error) {
-          if (attempt === 35) throw error
-          await delay(1_000)
-        }
-      }
-    }
-  }
+      return Boolean(job.id && ownedSubmitJobIds.has(job.id)) || (gateTaskId !== undefined && applicationTaskId === gateTaskId)
+    }, queueCleanupDeadline),
+    removeScopedQueueJobs(turnQueue, job => {
+      const turnId = jsonString(job.data, "turnId")
+      return turnId !== undefined && ownedTurnIds.has(turnId)
+    }, queueCleanupDeadline),
+    removeScopedQueueJobs(subagentQueue, job => {
+      const taskId = jsonString(job.data, "taskId")
+      return taskId !== undefined && ownedSubagentTaskIds.has(taskId)
+    }, queueCleanupDeadline),
+  ])
+  const failedQueueCleanup = queueCleanup.some(result => result.status === "rejected")
   await testDb.agentOutbox.deleteMany({ where: { aggregateId: ids.session } })
   if (createdUsers.length) await testDb.user.deleteMany({ where: { id: { in: createdUsers } } })
   await unlink(socketPath).catch(() => undefined)
+  if (failedQueueCleanup) throw new Error("Scoped BullMQ cleanup left owned jobs behind")
 }
 
 async function assertNoSubmitBeforeApproval(): Promise<void> {
@@ -340,14 +583,37 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     try { await stopFixture(worker) } catch (error) { cleanupError = error }
     try { await stopFixture(site) } catch (error) { cleanupError ??= error }
     try { await cleanRunArtifacts() } catch (error) { cleanupError ??= error }
-    try { await applyQueue?.close() } catch (error) { cleanupError ??= error }
-    try { await turnQueue?.close() } catch (error) { cleanupError ??= error }
-    try { await subagentQueue?.close() } catch (error) { cleanupError ??= error }
+    const queueCloseDeadline = Date.now() + 4_000
+    try { await closeQueueWithinDeadline(applyQueue, queueCloseDeadline) } catch (error) { cleanupError ??= error }
+    try { await closeQueueWithinDeadline(turnQueue, queueCloseDeadline) } catch (error) { cleanupError ??= error }
+    try { await closeQueueWithinDeadline(subagentQueue, queueCloseDeadline) } catch (error) { cleanupError ??= error }
     try { await testDb.$disconnect(); dbConnected = false } catch (error) { cleanupError ??= error }
     if (cleanupError) throw cleanupError
   }, 60_000)
 
   it("runs Gate → authenticated form answer → scoped submit approval → durable BullMQ/Worker with uncertain-submit no-replay", async () => {
+    onTestFailed(async () => {
+      let snapshot: unknown
+      try {
+        if (dbConnected) {
+          const current = gateTaskId
+            ? await testDb.applicationTask.findUnique({ where: { id: gateTaskId } }) as ApplicationTaskRow | null
+            : null
+          snapshot = await taskRuntimeDiagnostics(current)
+        } else {
+          snapshot = {
+            dbConnected,
+            fixtureStats: await requestFixtureStats().then(fixtureStatsSummary).catch(() => ({ errorPresent: true })),
+            workerExited: worker ? exited(worker) : null,
+            worker: worker ? childSummary(worker) : null,
+            site: site ? childSummary(site) : null,
+          }
+        }
+      } catch {
+        snapshot = { diagnosticErrorPresent: true }
+      }
+      process.stderr.write(`APPLICATION_TASK_FULL_LOOP_FAILURE ${JSON.stringify(snapshot)}\n`)
+    })
     checkTlsAndIsolation()
     const [{ db }, { runGate }, { AgentCommandService }, { formAnswerKeyForSelector }] = await Promise.all([
       import("@/lib/db"), import("@/lib/agent/stages/gate"),
@@ -425,9 +691,19 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect((await requestFixtureStats()).requests.filter(request => request === "GET /example/jobs/1").length).toBeGreaterThanOrEqual(2)
     const question = waitingTask.question as { waitId?: unknown; missing?: Array<{ key: string | null; label: string }>; sensitive?: Array<{ key: string | null; label: string }> }
     expect(typeof question.waitId).toBe("string")
+    expect(question.waitId).not.toBe("")
     const field = [...(question.missing ?? []), ...(question.sensitive ?? [])].find(value => value.label.includes("authorized to work"))
     expect(field?.key).toBe(formAnswerKeyForSelector("work_authorization", "work_authorization"))
-    expect(await testDb.applicationTaskEvent.count({ where: { taskId: gateTaskId, type: "form_answer_required" } })).toBe(1)
+    const formAnswerEvents = await testDb.applicationTaskEvent.findMany({
+      where: { taskId: gateTaskId, type: "form_answer_required" },
+      select: { id: true, taskId: true, type: true, actor: true, data: true },
+    })
+    expect(formAnswerEvents).toHaveLength(1)
+    expect(formAnswerEvents[0]).toMatchObject({ taskId: gateTaskId, type: "form_answer_required", actor: "worker" })
+    const formAnswerEventData = jsonRecord(formAnswerEvents[0]!.data)
+    if (formAnswerEventData && Object.prototype.hasOwnProperty.call(formAnswerEventData, "waitId")) {
+      expect(formAnswerEventData.waitId).toBe(question.waitId)
+    }
     expect(await testDb.agentTurn.findUnique({ where: { id: firstFillTurnId }, select: { status: true } })).toMatchObject({ status: "waiting_for_user" })
     await assertNoSubmitBeforeApproval()
 
@@ -437,6 +713,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     const answerPath = "/api/agent/application-tasks"
     const baselineEvents = await testDb.applicationTaskEvent.count({ where: { taskId: gateTaskId } })
     const baselineTurns = await testDb.agentTurn.count({ where: { sessionId: ids.session } })
+    const queuesBeforeRejectedAnswers = await waitForStableOwnedQueueState()
     const taskBeforeRejectedAnswers = await testDb.applicationTask.findUnique({ where: { id: gateTaskId } })
     expect(taskBeforeRejectedAnswers).not.toBeNull()
     const stale = await answerApplicationTask(apiRequest(answerPath, ownerToken, "PATCH", {
@@ -444,11 +721,13 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     }))
     expect(stale.status).toBe(409)
     expect(await testDb.applicationTask.findUnique({ where: { id: gateTaskId } })).toEqual(taskBeforeRejectedAnswers)
+    expect(await ownedQueueStateSnapshot()).toEqual(queuesBeforeRejectedAnswers)
     const foreign = await answerApplicationTask(apiRequest(answerPath, foreignToken, "PATCH", {
       id: gateTaskId, action: "answer_and_resume", waitId: question.waitId, answers: { [field!.key!]: "Ireland" },
     }))
     expect([404, 409]).toContain(foreign.status)
     expect(await testDb.applicationTask.findUnique({ where: { id: gateTaskId } })).toEqual(taskBeforeRejectedAnswers)
+    expect(await ownedQueueStateSnapshot()).toEqual(queuesBeforeRejectedAnswers)
     expect(await testDb.applicationTaskEvent.count({ where: { taskId: gateTaskId } })).toBe(baselineEvents)
     expect(await testDb.agentTurn.count({ where: { sessionId: ids.session } })).toBe(baselineTurns)
     expect(await testDb.agentOutbox.count({ where: { aggregateId: ids.session, topic: "agent.turn.dispatch" } })).toBe(0)
@@ -467,12 +746,63 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(duplicate.status).toBe(200)
     expect(await testDb.agentTurn.count({ where: { sessionId: ids.session, id: successorTurnId } })).toBe(1)
     expect(await testDb.agentOutbox.count({ where: { aggregateId: ids.session, topic: "agent.turn.dispatch", idempotencyKey: `turn-dispatch:${successorTurnId}` } })).toBe(1)
+    expect(await testDb.agentTurn.count({ where: { sessionId: ids.session } })).toBe(baselineTurns + 1)
+    const successorTurnJobs = await waitForStableTurnQueueJobs(successorTurnId)
+    expect(successorTurnJobs).toHaveLength(1)
+    expect(successorTurnJobs[0]?.id).toBeTruthy()
     expect(await testDb.applicationTaskEvent.count({ where: { taskId: gateTaskId, type: "user_answers_confirmed" } })).toBe(1)
 
     const completedTask = await waitForTask(task => task.status === "waiting_for_authorization" && task.checkpoint === "form_filled", 180_000)
     expect(completedTask.id).toBe(gateTaskId)
     expect(completedTask.fillTurnId).toBe(successorTurnId)
     expect((await requestFixtureStats()).browserTrace).toContain("input:work_authorization")
+    expect(await testDb.agentApproval.count({ where: { userId: ids.user, sessionId: ids.session, turnId: successorTurnId,
+      taskId: { not: null }, type: "submit_application", status: "pending" } })).toBe(1)
+    await assertNoSubmitBeforeApproval()
+
+    const originalTurnJobId = successorTurnJobs[0]?.id
+    if (!originalTurnJobId) throw new Error("Successor Turn dispatch is missing its BullMQ job ID")
+    const originalTurnCompletion = await waitLine(
+      worker!, `TURN_JOB_COMPLETED ${originalTurnJobId} turnId=${successorTurnId}`, 30_000,
+    )
+    expect(originalTurnCompletion).toContain("status=")
+    const originalTurnJob = await turnQueue!.getJob(originalTurnJobId)
+    expect(originalTurnJob).toBeDefined()
+    expect(await originalTurnJob!.getState()).toBe("completed")
+
+    const turnDispatch = await testDb.agentOutbox.findUniqueOrThrow({
+      where: { idempotencyKey: `turn-dispatch:${successorTurnId}` }, select: { payload: true },
+    })
+    const turnDispatchPayload = jsonRecord(turnDispatch.payload)
+    expect(Object.keys(turnDispatchPayload ?? {}).sort()).toEqual(["ownerId", "sessionId", "turnId"])
+    if (jsonString(turnDispatchPayload, "turnId") !== successorTurnId
+      || jsonString(turnDispatchPayload, "sessionId") !== ids.session
+      || !jsonString(turnDispatchPayload, "ownerId")) {
+      throw new Error("Successor Turn dispatch payload is incomplete or mismatched")
+    }
+    const turnBeforeDuplicate = await testDb.agentTurn.findUniqueOrThrow({
+      where: { id: successorTurnId },
+      select: { status: true, revision: true, leaseOwnerId: true, leaseExpiresAt: true, completedAt: true },
+    })
+    const taskBeforeDuplicate = await testDb.applicationTask.findUniqueOrThrow({
+      where: { id: gateTaskId }, select: { status: true, checkpoint: true, fillTurnId: true },
+    })
+    const duplicateTurnJobId = `test-duplicate-${successorTurnId}`
+    await turnQueue!.add("turn", turnDispatch.payload, { jobId: duplicateTurnJobId })
+    const duplicateTurnCompletion = await waitLine(
+      worker!, `TURN_JOB_COMPLETED ${duplicateTurnJobId} turnId=${successorTurnId}`, 30_000,
+    )
+    expect(duplicateTurnCompletion).toContain("status=skipped")
+    const duplicateTurnJob = await turnQueue!.getJob(duplicateTurnJobId)
+    expect(duplicateTurnJob).toBeDefined()
+    expect(await duplicateTurnJob!.getState()).toBe("completed")
+    expect(await testDb.agentTurn.findUniqueOrThrow({
+      where: { id: successorTurnId },
+      select: { status: true, revision: true, leaseOwnerId: true, leaseExpiresAt: true, completedAt: true },
+    })).toEqual(turnBeforeDuplicate)
+    expect(await testDb.applicationTask.findUniqueOrThrow({
+      where: { id: gateTaskId }, select: { status: true, checkpoint: true, fillTurnId: true },
+    })).toEqual(taskBeforeDuplicate)
     expect(await testDb.agentApproval.count({ where: { userId: ids.user, sessionId: ids.session, turnId: successorTurnId,
       taskId: { not: null }, type: "submit_application", status: "pending" } })).toBe(1)
     await assertNoSubmitBeforeApproval()
@@ -586,26 +916,14 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
   }, 300_000)
 })
 
-async function requestFixtureStats(): Promise<{
-  submitCount: number
-  blocked: string[]
-  requests: string[]
-  browserTrace: string[]
-  browserProgress: Array<{ event: string; elapsedMs: number; length?: number }>
-}> {
+async function requestFixtureStats(): Promise<FixtureStats> {
   if (!site?.stdin) throw new Error("Fixture site is unavailable")
   const previous = site.lines.filter(line => line.startsWith("FIXTURE_STATE ")).length
   site.stdin.write("stats\n")
   const until = Date.now() + 5_000
   while (Date.now() < until) {
     const lines = site.lines.filter(line => line.startsWith("FIXTURE_STATE "))
-    if (lines.length > previous) return JSON.parse(lines[lines.length - 1]!.slice("FIXTURE_STATE ".length)) as {
-      submitCount: number
-      blocked: string[]
-      requests: string[]
-      browserTrace: string[]
-      browserProgress: Array<{ event: string; elapsedMs: number; length?: number }>
-    }
+    if (lines.length > previous) return JSON.parse(lines[lines.length - 1]!.slice("FIXTURE_STATE ".length)) as FixtureStats
     await delay(20)
   }
   throw new Error("Fixture site did not return its request count")

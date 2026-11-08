@@ -448,6 +448,43 @@ jobs:
             CLOAK_PROXY_URL="$CLOAK_PROXY_URL" \
             "$PNPM_BIN" --filter @jobcopilot/web exec vitest run --no-file-parallelism \
               src/lib/agent/control-plane/commands/application-task-full-loop.pg.integration.test.ts
+      - name: Collect sanitized UID-scoped egress-deny kernel evidence
+        if: always()
+        shell: bash
+        env:
+          TEST_UID: "64013"
+        run: |
+          set -euo pipefail
+          if ! sanitized_entries="$(sudo dmesg --color=never 2>/dev/null | awk -v owner_uid="$TEST_UID" '
+            /applymate1095-egress[46] / {
+              family = index($0, "applymate1095-egress6 ") ? "ipv6" : "ipv4"
+              destination = protocol = destination_port = ""
+              for (i = 1; i <= NF; i++) {
+                if (substr($i, 1, 4) == "DST=") destination = substr($i, 5)
+                else if (substr($i, 1, 6) == "PROTO=") protocol = substr($i, 7)
+                else if (substr($i, 1, 4) == "DPT=") destination_port = substr($i, 5)
+              }
+              if (destination !~ /^[[:xdigit:].:]+$/ ||
+                  protocol !~ /^[[:alpha:]]+$/ ||
+                  (destination_port != "" && destination_port !~ /^[0-9]+$/)) next
+              if (destination_port == "") destination_port = "-"
+              printf "family=%s owner_uid=%s protocol=%s destination=%s destination_port=%s\n", \
+                family, owner_uid, protocol, destination, destination_port
+              count++
+            }
+            END {
+              if (count == 0) {
+                printf "No matching IPv4/IPv6 egress-deny entries captured for owner UID %s.\n", owner_uid
+              } else {
+                printf "Captured %d rate-limited kernel egress-deny entries for owner UID %s.\n", count, owner_uid
+              }
+            }
+          ')"; then
+            echo "Unable to read kernel logs; sanitized egress evidence is unavailable." >&2
+            exit 1
+          fi
+          echo "Sanitized kernel egress evidence (network-header fields only; raw log lines omitted):"
+          printf '%s\n' "$sanitized_entries"
   agent-runtime-postgres:
     name: Agent runtime PostgreSQL integration
     runs-on: ubuntu-24.04

@@ -63,6 +63,25 @@ describe("application-fill preparation", () => {
     expect(test.calls.some(call => /^(UPDATE|INSERT)/.test(call.sql))).toBe(false)
   })
 
+  it("withholds preparation for an exactly bound browser-active fill without reading materials", async () => {
+    const test = fixture([{ ...boundTask, checkpoint: "browser_active" }])
+
+    await expect(loadApplicationFillPreparation(test.pool, test.lease)).resolves.toBeUndefined()
+    expect(test.calls.some(call => call.sql.includes('FROM "application_tasks"'))).toBe(false)
+    expect(test.calls.some(call => call.sql === "COMMIT")).toBe(true)
+    expect(test.calls.some(call => call.sql === "ROLLBACK")).toBe(false)
+    expect(test.client.release).toHaveBeenCalledOnce()
+  })
+
+  it("rejects a browser-active fill whose persisted turn binding does not match the live lease", async () => {
+    const test = fixture([{ ...boundTask, checkpoint: "browser_active", fillTurnSessionId: "different-session" }])
+
+    await expect(loadApplicationFillPreparation(test.pool, test.lease)).rejects.toThrow("application_fill_binding_invalid")
+    expect(test.calls.some(call => call.sql.includes('FROM "application_tasks"'))).toBe(false)
+    expect(test.calls.some(call => call.sql === "ROLLBACK")).toBe(true)
+    expect(test.calls.some(call => call.sql === "COMMIT")).toBe(false)
+  })
+
   it("rejects a bound task outside the queued fill state instead of treating it as an ordinary Turn", async () => {
     const test = fixture([{ ...boundTask, status: "failed", checkpoint: "fill_prestart_failed" }])
 

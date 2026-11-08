@@ -4,20 +4,15 @@ import { connect as connectTcp } from "node:net"
 import { readFile } from "node:fs/promises"
 import { unlink } from "node:fs/promises"
 import { Pool } from "pg"
+import { HOST, fixtureModel, required, safeBlockedTarget } from "./application-task-full-loop.fixture-support.mjs"
 
 const [, , mode] = process.argv
-const HOST = "boards.greenhouse.io:443"
 const SOCKET = process.env.APPLICATION_TASK_FULL_LOOP_SOCKET_PATH
 const tls = async () => {
   const cert = await readFile(required("AGENT_TEST_TLS_CERT_PATH"))
   const key = await readFile(required("AGENT_TEST_TLS_KEY_PATH"))
   await readFile(required("AGENT_TEST_TLS_CA_PATH"))
   return { cert, key }
-}
-function required(name) {
-  const value = process.env[name]
-  if (!value) throw new Error(`${name}_required`)
-  return value
 }
 function say(value) { process.stdout.write(`${value}\n`) }
 function listen(server, ...args) {
@@ -99,7 +94,7 @@ async function startSite() {
   })
   await listen(site, SOCKET)
   const proxy = createHttpServer((request, response) => {
-    blocked.push(String(request.url ?? "missing"))
+    blocked.push(safeBlockedTarget(request.url))
     response.writeHead(405).end("CONNECT required")
   })
   proxy.on("connection", socket => {
@@ -108,7 +103,7 @@ async function startSite() {
   })
   proxy.on("connect", (request, client, head) => {
     if (request.url !== HOST) {
-      blocked.push(String(request.url ?? "missing"))
+      blocked.push(safeBlockedTarget(request.url))
       client.end("HTTP/1.1 403 Forbidden\r\n\r\n")
       return
     }
@@ -150,54 +145,6 @@ async function startSite() {
       }
     }
   })
-}
-
-function modelProfile() {
-  return { provider: "fixture", model: "fixture-model", nativeTools: true, structuredOutput: true, streaming: true,
-    continuationCursor: false, supportsParallelTools: false, supportsStreamingToolArgs: true,
-    supportsReasoningSummary: true, supportsResponseContinuation: false, supportsProviderConversation: false,
-    supportsBackgroundResponse: false, maxContextTokens: null, maxOutputTokens: null, costClass: "low" }
-}
-function taskIdFromPlan(request) {
-  for (const message of request.messages ?? []) for (const part of message.content ?? []) {
-    if (part.type !== "tool_result" || typeof part.content !== "string") continue
-    try {
-      const result = JSON.parse(part.content)
-      if (Array.isArray(result.readyTaskIds) && typeof result.readyTaskIds[0] === "string") return result.readyTaskIds[0]
-    } catch { /* another tool result */ }
-  }
-  throw new Error("application_fill_plan_receipt_missing_ready_task")
-}
-function fixtureModel() {
-  let round = 0
-  return {
-    adapter: {
-      id: "application-task-full-loop-model", profile: modelProfile(),
-      async *stream(request) {
-        round += 1
-        if (round === 1) {
-          yield { type: "tool_call_completed", callId: `full-loop-plan-${process.pid}`, name: "agent.plan", arguments: {
-            expectedRevision: 0,
-            nodes: [{ key: "application-fill", templateId: "application_filler", goal: "Fill the selected application for review",
-              successCriteria: ["Observe the required synthetic work authorization field"], dependsOn: [] }],
-          } }
-          yield { type: "completed", finishReason: "tool_calls" }
-          return
-        }
-        if (round === 2) {
-          yield { type: "tool_call_completed", callId: `full-loop-wait-${process.pid}`, name: "agent.wait", arguments: {
-            idempotencyKey: `application-task-full-loop:${process.pid}:${round}`,
-            taskIds: [taskIdFromPlan(request)], mode: "all", timeoutMs: 30_000,
-          } }
-          yield { type: "completed", finishReason: "tool_calls" }
-          return
-        }
-        yield { type: "text_delta", text: "The synthetic application fill reached its durable review boundary." }
-        yield { type: "completed", finishReason: "stop" }
-      },
-    },
-    registry: {}, candidates: [],
-  }
 }
 
 async function startWorker() {
