@@ -274,6 +274,9 @@ jobs:
           PROFILE_DIR="$TEST_ROOT/profiles"
           TLS_DIR="$TEST_ROOT/tls"
           NSS_DIR="$TEST_HOME/.pki/nssdb"
+          CHROME_CONFIG_HOME="$TEST_HOME/.config"
+          XDG_CONFIG_HOME="$CHROME_CONFIG_HOME"
+          XDG_CACHE_HOME="$TEST_HOME/.cache"
           CA_PATH="$TLS_DIR/fixture-ca.pem"
           CA_KEY_PATH="$TLS_DIR/fixture-ca.key"
           CERT_PATH="$TLS_DIR/boards.greenhouse.io.pem"
@@ -311,7 +314,8 @@ jobs:
 
           sudo chown -R "$TEST_UID:$TEST_GID" "$TEST_ROOT"
           sudo chmod 700 "$TEST_ROOT" "$TEST_HOME" "$TEST_TMPDIR" "$PROFILE_DIR" "$TLS_DIR"
-          sudo install -d -o "$TEST_UID" -g "$TEST_GID" -m 700 "$TEST_HOME/.pki" "$NSS_DIR"
+          sudo install -d -o "$TEST_UID" -g "$TEST_GID" -m 700 \
+            "$TEST_HOME/.pki" "$NSS_DIR" "$CHROME_CONFIG_HOME" "$XDG_CACHE_HOME"
           echo "NSS diagnostic: starting dedicated-user path/access probe"
           sudo -u "$TEST_USER" -- env PATH="$PATH" HOME="$TEST_HOME" NSS_DIR="$NSS_DIR" GITHUB_WORKSPACE="$GITHUB_WORKSPACE" sh -eu -c '
             id
@@ -403,6 +407,8 @@ jobs:
           (
             cd "$GITHUB_WORKSPACE/apps/worker"
             sudo -u "$TEST_USER" -- env PATH="$PATH" HOME="$TEST_HOME" TMPDIR="$TEST_TMPDIR" \
+              CHROME_CONFIG_HOME="$CHROME_CONFIG_HOME" XDG_CONFIG_HOME="$XDG_CONFIG_HOME" \
+              XDG_CACHE_HOME="$XDG_CACHE_HOME" \
               CLOAK_PROFILES_DIR="$PROFILE_DIR" CLOAKBROWSER_AUTO_UPDATE="$CLOAKBROWSER_AUTO_UPDATE" \
               "$NODE_BIN" --input-type=module -e '
                 const { launchPersistentContext } = await import("cloakbrowser");
@@ -422,6 +428,8 @@ jobs:
           export APPLICATION_TASK_FULL_LOOP_EGRESS_ISOLATED=true
 
           sudo -u "$TEST_USER" -- env PATH="$PATH" HOME="$TEST_HOME" TMPDIR="$TEST_TMPDIR" \
+            CHROME_CONFIG_HOME="$CHROME_CONFIG_HOME" XDG_CONFIG_HOME="$XDG_CONFIG_HOME" \
+            XDG_CACHE_HOME="$XDG_CACHE_HOME" \
             CLOAKBROWSER_AUTO_UPDATE="$CLOAKBROWSER_AUTO_UPDATE" \
             CLOAK_PROFILES_DIR="$PROFILE_DIR" \
             APPLICATION_TASK_FULL_LOOP_EGRESS_ISOLATED="$APPLICATION_TASK_FULL_LOOP_EGRESS_ISOLATED" \
