@@ -311,7 +311,9 @@ jobs:
           sudo -u "$TEST_USER" -- env PATH="$PATH" HOME="$TEST_HOME" \
             certutil -N --empty-password -d "sql:$NSS_DIR"
           sudo -u "$TEST_USER" -- env PATH="$PATH" HOME="$TEST_HOME" \
-            certutil -A -d "sql:$NSS_DIR" -n applymate-full-loop-test-ca -t "C,," -i "$CA_PATH"
+            certutil -A -a -d "sql:$NSS_DIR" -n applymate-full-loop-test-ca -t "C,," -i "$CA_PATH"
+          sudo -u "$TEST_USER" -- env PATH="$PATH" HOME="$TEST_HOME" \
+            certutil -L -d "sql:$NSS_DIR" -n applymate-full-loop-test-ca >/dev/null
 
           if sudo iptables -S "$CHAIN4" >/dev/null 2>&1 || sudo ip6tables -S "$CHAIN6" >/dev/null 2>&1; then
             echo "Refusing to reuse an existing egress chain" >&2
