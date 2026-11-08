@@ -200,7 +200,19 @@ async function startWorker() {
     createWorkerUsageAuthorizer: () => authorizeUsage,
     createCanonicalExecutionProjection: () => noOpProjection,
     createCanonicalSessionProjection: () => noOpProjection,
-    startProductionAgentRuntime: options => startProductionAgentRuntime(options),
+    startProductionAgentRuntime: options => startProductionAgentRuntime({
+      ...options,
+      bootstrapOptions: runtime => {
+        const bootstrapOptions = (typeof options.bootstrapOptions === "function"
+          ? options.bootstrapOptions(runtime)
+          : options.bootstrapOptions) ?? {}
+        const subagents = bootstrapOptions.subagents
+        return {
+          ...bootstrapOptions,
+          ...(subagents ? { subagents: { ...subagents, intervalMs: 250 } } : {}),
+        }
+      },
+    }),
   })
   const publisher = outbox.startApplicationSubmitOutboxPublisher(pool, queue.applyQueue, { pollMs: 250 })
   queue.applyWorker.on("active", job => say(`APPLY_JOB_ACTIVE ${job?.id ?? "unknown"} attemptsMade=${job?.attemptsMade ?? -1} attemptsStarted=${job?.attemptsStarted ?? -1} stalledCounter=${job?.stalledCounter ?? -1}`))
