@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL } from "./pg-store-expiry-historical-wait-binding.js"
+import { CHILD_WAIT_HISTORICAL_WAIT_CORE_BINDING_SQL } from "./pg-store-expiry-historical-wait-binding-core.js"
 import { CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL, CHILD_WAIT_HISTORICAL_SOURCE_RESULT_RECEIPT_SQL,
   HISTORICAL_SOURCE_STEP_BINDING_SQL, HISTORICAL_SOURCE_WAIT_HANDOFF_SQL } from "./pg-store-expiry-historical-wait-event-binding.js"
 import { HISTORICAL_SOURCE_STEP_PREFIX_SQL } from "./pg-store-expiry-historical-wait-event-binding.js"
@@ -74,44 +75,37 @@ describe("final historical wait receipt binding", () => {
     expect(sql).not.toContain('jsonb_array_elements(boundWait."matchedTaskIds")')
   })
 
-  it("requires the unique completed continuation claim for this receipt and current attempt", () => {
+  it("keeps a core-only source proof and one exact first-later claim", () => {
     expect(sql).toContain("callStep.\"attempt\" = owner.\"attemptCount\"")
     expect(sql).toContain("callStep.\"status\" = 'completed'")
     expect(sql).toContain("nextStep.\"attempt\" = owner.\"attemptCount\"")
-    expect(sql).toContain("claimCandidate.\"type\" = 'tool_call'")
-    expect(sql).toContain("claimCandidate.\"content\"->>'toolName' = 'wait_subagents'")
-    expect(sql).toContain("= proof.value->'sourceWait'->>'claimKeyDigest') = 1")
+    expect(CHILD_WAIT_HISTORICAL_WAIT_CORE_BINDING_SQL).toContain('nextStep."ordinal" > boundSource."ordinal"')
+    expect(CHILD_WAIT_HISTORICAL_WAIT_CORE_BINDING_SQL).not.toContain("claimCollisionPeerIds")
+    expect(CHILD_WAIT_HISTORICAL_WAIT_CORE_BINDING_SQL).not.toContain("claimCandidate")
   })
 
-  it("excludes only the exact nested source item from claim-key uniqueness", () => {
-    const start = sql.indexOf('(SELECT COUNT(*) FROM "agent_items" AS claimCandidate')
-    const end = sql.indexOf('= proof.value->\'sourceWait\'->>\'claimKeyDigest\') = 1', start)
-    const candidateCount = sql.slice(start, end)
+  it("scopes digest uniqueness to the persisted result wait and independently rebinds peer core proofs", () => {
     expect(sql).toContain('boundSourceCall."id" = proof.value->\'sourceWait\'->>\'sourceCallItemId\'')
-    expect(candidateCount).toContain('claimCandidate."id" <> boundSourceCall."id"')
-    expect(candidateCount).toContain('claimCandidateStep."attempt" = owner."attemptCount"')
-    expect(candidateCount).not.toMatch(/claimCandidateStep\."id"\s*<>/)
-    expect(start).toBeGreaterThanOrEqual(0)
-    expect(end).toBeGreaterThan(start)
-
-    const digest = "a".repeat(64)
-    const source = { itemId: "source-item", sessionId: "session", turnId: "turn", taskId: "task", attempt: 1,
-      toolName: "wait_subagents", digest }
-    const firstClaim = { ...source, itemId: "claim-item-1" }
-    const candidates = [source, firstClaim]
-    const remainingClaims = candidates.filter(candidate => candidate.sessionId === source.sessionId
-      && candidate.turnId === source.turnId && candidate.taskId === source.taskId && candidate.attempt === source.attempt
-      && candidate.toolName === "wait_subagents" && candidate.digest === digest && candidate.itemId !== source.itemId)
-    expect(firstClaim.itemId).not.toBe(source.itemId)
-    expect(firstClaim).toMatchObject({ sessionId: source.sessionId, turnId: source.turnId, taskId: source.taskId, attempt: source.attempt })
-    expect(remainingClaims).toEqual([firstClaim])
-
-    const duplicateClaim = { ...source, itemId: "claim-item-3" }
-    const withThirdClaim = [...candidates, duplicateClaim].filter(candidate => candidate.sessionId === source.sessionId
-      && candidate.turnId === source.turnId && candidate.taskId === source.taskId && candidate.attempt === source.attempt
-      && candidate.toolName === "wait_subagents" && candidate.digest === digest && candidate.itemId !== source.itemId)
-    expect(withThirdClaim).toHaveLength(2)
-    expect(withThirdClaim.map(candidate => candidate.itemId)).toEqual([firstClaim.itemId, duplicateClaim.itemId])
+    expect(sql).toContain('sameWaitResult."content"->\'output\'->>\'waitId\' = boundWait."id"')
+    expect(sql).toContain('peerWait."id" <> boundWait."id"')
+    expect(sql).toContain('peer.value->\'sourceWait\'->>\'claimKeyDigest\' = proofCurrent.value->\'sourceWait\'->>\'claimKeyDigest\'')
+    expect(sql).toContain('claimResult."content"->\'output\'->>\'waitId\' = peerWait."id"')
+    expect(sql).toContain('claimResult."content"->\'output\' = sourceResult."content"->\'output\'')
+    expect(sql).toContain('callCompleted."sequence" > started."sequence"')
+    expect(sql).toContain("callCompleted.\"payload\" = jsonb_build_object('itemId', callItem.\"id\", 'status', 'completed', 'content'")
+    expect(sql).toContain("'toolCallId', proof.value->>'projectedCallId'")
+    expect(sql).toContain("jsonb_agg(to_jsonb('[REDACTED]'::text) ORDER BY target.ordinal)")
+    expect(sql).toContain("'[REDACTED]'")
+    expect(sql).toContain("LIMIT 17")
+    expect(sql).toContain("COUNT(*) <= 16")
+    expect(sql).toContain('currentProof.value = proof.value')
+    expect(sql).toContain('COUNT(DISTINCT ref.value #>> \'{}\')')
+    expect(sql).toContain('END IS NULL OR CASE WHEN jsonb_typeof(claimCandidate.')
+    expect(sql).toContain(`AND ${CHILD_WAIT_HISTORICAL_WAIT_CORE_BINDING_SQL}`.replace(/\s+/g, " "))
+    expect(sql).toContain('proofBundle."claimCollisionProofs"')
+    expect(sql).toContain('proof.value->\'sourceWait\'->\'claimKeyDigest\' = \'null\'::jsonb')
+    expect(sql).toContain('END IS NULL OR CASE WHEN jsonb_typeof(claimCandidate.')
+    expect(sql).toContain('THEN TRUE ELSE NOT (SELECT COUNT(*) = 1 FROM jsonb_array_elements')
   })
   it("binds top-level identity to the current call while source identity stays in sourceWait", () => {
     const branchStart = sql.indexOf("AND CASE WHEN proof.value->'sourceWait'->'claimKeyDigest' = 'null'::jsonb THEN")
@@ -146,9 +140,10 @@ describe("final historical wait receipt binding", () => {
     expect(HISTORICAL_SOURCE_STEP_BINDING_SQL).toContain("sourceStepPrefix")
     expect(HISTORICAL_SOURCE_STEP_BINDING_SQL).toContain("sourceStepHandoff")
     expect(CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL).toContain(HISTORICAL_SOURCE_STEP_BINDING_SQL)
-    expect(sql.match(/CASE WHEN proof\.value \? 'sourceStepPrefix'/g) ?? []).toHaveLength(1)
+    expect(sql.match(/CASE WHEN proof\.value \? 'sourceStepPrefix'/g) ?? []).toHaveLength(3)
     expect(sql).toContain("callStep.\"attempt\" = owner.\"attemptCount\"")
     expect(sql).toContain("callStep.\"status\" = 'completed'")
-    expect(sql).toContain("= proof.value->'sourceWait'->>'claimKeyDigest') = 1")
+    expect(sql).toContain('sameWaitResult."content"->\'output\'->>\'waitId\' = boundWait."id"')
+    expect(sql).toContain('claimResult."content"->\'output\'->>\'waitId\' = boundWait."id"')
   })
 })

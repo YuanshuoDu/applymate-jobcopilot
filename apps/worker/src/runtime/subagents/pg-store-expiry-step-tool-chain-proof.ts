@@ -201,10 +201,12 @@ function proveWaitStepToolChain(task: Scope, input: { stepId: string; attempt: n
     const callStarted = take("tool_call.started", isClaim ? `task:${task.id}:event:child-wait-claim:${input.attempt}:${input.stepId}`
       : `task:${task.id}:event:tool-started:${callId}`, callId, call.id,
     { toolCallId: callId, toolName: name, taskId: task.id })
-    const projectedCallCompletion = projectWaitCallCompletionPayload({ itemId: call.id, status: "completed", content }, call.id)
+    const rawCallCompletion = { itemId: call.id, status: "completed", content }
+    const projectedCallCompletion = projectWaitCallCompletionPayload(rawCallCompletion, call.id)
     const callCompleted = take("item.completed", `task:${task.id}:event:tool-call-completed:${callId}:${call.id}:1`, call.id, call.id,
-      projectedCallCompletion, callStarted?.id)
-    if (!itemStarted || !callStarted || !callCompleted || !sameJson(callCompleted.payload, projectedCallCompletion)) return null
+      undefined, callStarted?.id)
+    if (!itemStarted || !callStarted || !callCompleted
+      || ![projectedCallCompletion, rawCallCompletion].some(payload => sameJson(callCompleted.payload, payload))) return null
     const terminal = take("tool_call.completed", `task:${task.id}:event:tool-finished:${callId}`, callId, call.id,
       { toolCallId: callId, toolName: name, status: "completed", errorCode: null, taskId: task.id }, callCompleted.id)
     const resultStarted = take("item.started", `task:${task.id}:event:item-started:${result.id}`, input.stepId, result.id,

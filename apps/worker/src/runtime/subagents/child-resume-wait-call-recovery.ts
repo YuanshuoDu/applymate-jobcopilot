@@ -186,10 +186,10 @@ export async function loadChildWaitCallRecovery(
   }
   const claimedId = claims.length === 1 ? object(claims[0]!.payload)?.toolCallId : undefined
   const claimedRows = calls.filter((row, index) => ids[index] === claimedId)
-  if (calls.length > 1) {
-    if (step.status !== "completed" || claims.length !== 1 || typeof claimedId !== "string" || claimedRows.length !== 1) {
-      throw new Error("child_resume_wait_tool_call_conflict")
-    }
+  const requiresTerminalProof = calls.length > 1 || step.status === "completed"
+  if (calls.length > 1 && step.status !== "completed") throw new Error("child_resume_wait_tool_call_conflict")
+  if (requiresTerminalProof) {
+    if (claims.length !== 1 || typeof claimedId !== "string" || claimedRows.length !== 1) throw new Error("child_resume_wait_tool_call_conflict")
     const claimedCall = claimedRows[0]!
     const proof = await readCanonicalWaitStepToolChain(client as pg.PoolClient,
       { id: lease.id, sessionId: lease.sessionId, turnId },

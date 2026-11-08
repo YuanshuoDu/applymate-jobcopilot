@@ -5,6 +5,7 @@ import {
   CHILD_WAIT_CALL_ITEM_COMPLETED_NO_EVENT_SQL, CHILD_WAIT_CALL_LIFECYCLE_SQL, CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL,
   CHILD_WAIT_SOURCE_PROJECTED_COMPLETION_SQL, isCanonicalChildWaitOutcome,
 } from "./pg-store-expiry-child-wait-claim-call-proof.js"
+import { historicalWaitClaimProofsSql, historicalWaitProjectionsSql } from "./pg-store-expiry-historical-wait-claim-collision.js"
 
 describe("child-wait continuation key projection", () => {
   it.each([
@@ -49,6 +50,23 @@ describe("claim terminal settlement event descendants", () => {
   it("keeps the exported diagnostic components in the production SQL assembly", () => {
     expect(CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL).toContain(CHILD_WAIT_SOURCE_PROJECTED_COMPLETION_SQL)
     expect(CHILD_WAIT_CALL_LIFECYCLE_SQL).toContain(CHILD_WAIT_CALL_ITEM_COMPLETED_NO_EVENT_SQL)
+  })
+
+  it("accepts legacy projection arrays and reads projections and collision proofs from the new envelope", () => {
+    const envelope = "$13::jsonb"
+    const projections = historicalWaitProjectionsSql(envelope).replace(/\s+/g, " ")
+    const collisionProofs = historicalWaitClaimProofsSql(envelope).replace(/\s+/g, " ")
+    const sourceSql = CHILD_WAIT_SOURCE_PROJECTED_COMPLETION_SQL.replace(/\s+/g, " ")
+    const terminalSql = CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL.replace(/\s+/g, " ")
+
+    expect(projections).toBe("CASE WHEN jsonb_typeof($13::jsonb) = 'array' THEN $13::jsonb WHEN jsonb_typeof(($13::jsonb)->'projections') = 'array' THEN ($13::jsonb)->'projections' ELSE '[]'::jsonb END")
+    expect(collisionProofs).toBe("CASE WHEN jsonb_typeof(($13::jsonb)->'claimCollisionProofs') = 'array' THEN ($13::jsonb)->'claimCollisionProofs' ELSE '[]'::jsonb END")
+    expect(sourceSql).toContain(`jsonb_array_elements(${projections}) AS proof(value)`)
+    expect(sourceSql).toContain(`CROSS JOIN LATERAL (SELECT ${collisionProofs} AS "claimCollisionProofs") AS proofBundle`)
+    expect(terminalSql).toContain(`jsonb_array_elements(${projections}) AS proof(value)`)
+    expect(sourceSql).toContain("proof.value->>'startEventId' = started.\"id\"")
+    expect(sourceSql).toContain("proof.value->>'callItemId' = callItem.\"id\"")
+    expect(sourceSql).toContain("proof.value->>'attempt' = callStep.\"attempt\"::text")
   })
 })
 
@@ -215,7 +233,7 @@ describe("child-wait terminal settlement", () => {
     expect(sql).not.toContain("tool-recovered:")
     expect(sql).toContain("settled.\"type\" = 'tool_call.completed'")
     expect(sql).toContain("settled.\"type\" = 'tool_call.failed'")
-    expect(sql).toContain("jsonb_array_elements(CASE WHEN jsonb_typeof($13::jsonb) = 'array' THEN $13::jsonb ELSE '[]'::jsonb END)")
+    expect(sql).toContain(`jsonb_array_elements(${historicalWaitProjectionsSql("$13::jsonb").replace(/\s+/g, " ")})`)
     expect(sql).toContain("proof.value->>'startEventId' = started.\"id\"")
     expect(sql).toContain("proof.value->>'rawCallId' = callItem.\"content\"->>'toolCallId'")
     expect(sql).toContain("proof.value->>'projectedCallId' IS NOT NULL")

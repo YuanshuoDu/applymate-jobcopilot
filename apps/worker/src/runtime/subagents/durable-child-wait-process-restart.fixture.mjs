@@ -1503,6 +1503,8 @@ worker.on("completed", (job, result) => {
       ? currentLoopDiagnosticStage : "unknown"
     const markerPayload = markerResult.status === "failed"
       ? { result: { status: "failed", failureReasonCategory: markerResult.failureReasonCategory, boundedStage } }
+      : mode === "worker-b-loop-final"
+        ? { result: markerResult, dispatchGeneration: Number.isSafeInteger(dispatchGeneration) && dispatchGeneration >= 0 ? dispatchGeneration : null }
       : sourceWaitWorkerModes.has(mode) || boundedLoopDiagnosticModes.has(mode)
         ? { result: markerResult }
         : { result, taskId: ids.waiterTaskId, dispatchGeneration }

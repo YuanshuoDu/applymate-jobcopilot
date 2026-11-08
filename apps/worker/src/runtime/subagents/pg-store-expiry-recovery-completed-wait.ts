@@ -1,6 +1,7 @@
 import type pg from "pg"
 import { CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL, type TerminalCallProjection } from "./pg-store-expiry-historical-wait-binding.js"
 import { readChildWaitTerminalCallProjections } from "./pg-store-expiry-historical-wait-projections.js"
+import { historicalWaitClaimProjectionEnvelope } from "./pg-store-expiry-historical-wait-claim-collision.js"
 
 type Client = Pick<pg.PoolClient, "query">
 type Row = Record<string, unknown>
@@ -14,9 +15,8 @@ function completedStepEventSql(owner: "owner" | "task"): string { return `((SELE
     AND completedEvent."idempotencyKey" = 'task:' || ${owner}."id" || ':event:step-completed:' || continuation."id"
     AND (completedEvent."payload" = jsonb_build_object('stepId', continuation."id", 'status', 'completed', 'taskId', ${owner}."id")
       OR (jsonb_typeof(completedEvent."payload") = 'object'
-        AND jsonb_typeof(completedEvent."payload"->'toolCallCount') = 'number'
-        AND completedEvent."payload"->>'toolCallCount' ~ '^(0|[1-9][0-9]?)$'
-        AND (completedEvent."payload"->>'toolCallCount')::integer BETWEEN 0 AND 32
+        AND CASE WHEN jsonb_typeof(completedEvent."payload"->'toolCallCount') = 'number'
+          THEN completedEvent."payload"->>'toolCallCount' ~ '^(0|[1-9]|[12][0-9]|3[0-2])$' ELSE FALSE END
         AND completedEvent."payload" = jsonb_build_object('stepId', continuation."id", 'status', 'completed',
           'toolCallCount', completedEvent."payload"->'toolCallCount', 'taskId', ${owner}."id")))) = 1)` }
 
@@ -33,7 +33,11 @@ const COMPLETED_SUCCESSOR_SQL = `EXISTS (SELECT 1 FROM "agent_wait_conditions" A
     AND completedWait."turnId" = owner."turnId" AND completedWait."userId" = session."userId"
     AND completedWait."status" IN ('ready', 'timed_out') AND completedWait."suspendedAt" IS NOT NULL AND completedWait."consumedAt" IS NOT NULL
     AND source."id" = proof.value->'sourceWait'->>'sourceStepId' AND source."attempt" = owner."attemptCount"
-    AND source."attempt" = (proof.value->'sourceWait'->>'sourceAttempt')::integer
+    AND CASE WHEN jsonb_typeof(proof.value->'sourceWait'->'sourceAttempt') = 'number'
+      AND proof.value->'sourceWait'->>'sourceAttempt' ~ '^[1-9][0-9]{0,9}$'
+      AND (char_length(proof.value->'sourceWait'->>'sourceAttempt') < 10 OR
+        (proof.value->'sourceWait'->>'sourceAttempt' COLLATE "C") <= ('2147483647'::text COLLATE "C"))
+      THEN source."attempt"::text = proof.value->'sourceWait'->>'sourceAttempt' ELSE FALSE END
     AND source."status" IN ('waiting_for_tool', 'completed')
     AND continuation."attempt" = owner."attemptCount" AND continuation."status" = 'completed'
     AND continuation."ordinal" = (SELECT MAX(current."ordinal") FROM "agent_steps" AS current
@@ -53,7 +57,7 @@ const COMPLETED_SUCCESSOR_SQL = `EXISTS (SELECT 1 FROM "agent_wait_conditions" A
 
 const CANDIDATE_SQL = `SELECT wait."id" AS "waitId", source."id" AS "sourceStepId", source."attempt" AS "sourceAttempt",
     continuation."id" AS "continuationStepId", continuation."ordinal" AS "continuationOrdinal",
-    (SELECT COUNT(*)::int FROM "agent_items" AS waitCall WHERE waitCall."sessionId" = continuation."sessionId"
+    (SELECT COUNT(*) FROM "agent_items" AS waitCall WHERE waitCall."sessionId" = continuation."sessionId"
       AND waitCall."turnId" = continuation."turnId" AND waitCall."taskId" = continuation."taskId"
       AND waitCall."stepId" = continuation."id" AND waitCall."type" = 'tool_call'
       AND waitCall."content"->>'toolName' = 'wait_subagents') AS "continuationWaitCallCount"
@@ -122,10 +126,14 @@ function exactSourceProjections(projections: readonly TerminalCallProjection[], 
   return { source, claim, valid: source !== null && claimValid }
 }
 
-async function historicalBindingAccepts(client: Client, scope: Scope, projection: TerminalCallProjection): Promise<boolean> {
-  const result = await client.query<{ accepted: boolean }>(`WITH proof AS (SELECT $9::jsonb AS value)
+async function historicalBindingAccepts(client: Client, scope: Scope, projection: TerminalCallProjection,
+  projections: readonly TerminalCallProjection[]): Promise<boolean> {
+  const result = await client.query<{ accepted: boolean }>(`WITH envelope AS (SELECT $9::jsonb AS value),
+    proof AS (SELECT envelope.value->'projection' AS value FROM envelope),
+    proofBundle AS (SELECT CASE WHEN jsonb_typeof(envelope.value->'claimCollisionProofs') = 'array'
+      THEN envelope.value->'claimCollisionProofs' ELSE '[]'::jsonb END AS "claimCollisionProofs" FROM envelope)
     SELECT ((${CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL}) AND ${COMPLETED_SUCCESSOR_SQL}) AS "accepted"
-    FROM proof JOIN "sub_agent_tasks" AS owner ON owner."id" = $2 AND owner."sessionId" = $1 AND owner."turnId" = $3
+    FROM proof CROSS JOIN proofBundle JOIN "sub_agent_tasks" AS owner ON owner."id" = $2 AND owner."sessionId" = $1 AND owner."turnId" = $3
       AND owner."rootTaskId" = $4 AND owner."leaseOwner" = $5 AND owner."attemptCount" = $6 AND owner."leaseExpiresAt" = $7
     JOIN "agent_sessions" AS session ON session."id" = owner."sessionId" AND session."userId" = $8
     JOIN "agent_turns" AS turn ON turn."id" = owner."turnId" AND turn."sessionId" = owner."sessionId"
@@ -152,7 +160,7 @@ async function historicalBindingAccepts(client: Client, scope: Scope, projection
     WHERE owner."status" = 'running' AND owner."parentTaskId" IS NOT NULL AND owner."interruptRequestedAt" IS NULL
       AND owner."leaseExpiresAt" <= clock_timestamp() AND (owner."nextAttemptAt" IS NULL OR owner."nextAttemptAt" <= clock_timestamp())`,
   [scope.sessionId, scope.id, scope.turnId, scope.rootTaskId, scope.ownerId, scope.attemptCount, scope.leaseExpiresAt,
-    scope.userId, JSON.stringify(projection)])
+    scope.userId, JSON.stringify(historicalWaitClaimProjectionEnvelope(projection, projections))])
   return result.rows.length === 1 && result.rows[0]?.accepted === true
 }
 
@@ -173,7 +181,7 @@ export async function hasProvenCompletedConsumedWait(client: Client, task: Row, 
     continuationOrdinal: Number(candidate.continuationOrdinal), continuationWaitCallCount: Number(candidate.continuationWaitCallCount) }
   const projections = await readChildWaitTerminalCallProjections(client as pg.PoolClient, task)
   const selected = exactSourceProjections(projections, normalized)
-  if (!selected.valid || !selected.source || !await historicalBindingAccepts(client, scope, selected.source)) return false
-  if (selected.claim && !await historicalBindingAccepts(client, scope, selected.claim)) return false
+  if (!selected.valid || !selected.source || !await historicalBindingAccepts(client, scope, selected.source, projections)) return false
+  if (selected.claim && !await historicalBindingAccepts(client, scope, selected.claim, projections)) return false
   return true
 }

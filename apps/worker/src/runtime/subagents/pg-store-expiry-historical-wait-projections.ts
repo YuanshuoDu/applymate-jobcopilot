@@ -13,12 +13,12 @@ import { exactKeys, readCanonicalWaitStepToolChain, record } from "./pg-store-ex
 import { readCanonicalHistoricalSourceStepPrefix } from "./pg-store-expiry-historical-source-step-prefix.js"
 import type { HistoricalWaitBinding, RecoveredWaitHandoff, TerminalCallProjection } from "./pg-store-expiry-historical-wait-binding.js"
 import type { HistoricalSourceStepPrefix } from "./pg-store-expiry-historical-source-step-prefix.js"
-
+import { bindHistoricalWaitClaimCandidates } from "./pg-store-expiry-historical-wait-claim-collision.js"
 export const MAX_HISTORICAL_SOURCE_WAITS = 16
 export type HistoricalWaitClaimStage = Readonly<{ candidateOrdinal: number; stage:
   | "claim_rows_missing" | "claim_rows_ambiguous" | "claim_input_invalid" | "claim_call_identity_invalid"
   | "claim_result_invalid" | "claim_terminal_invalid" | "claim_result_pair_invalid"
-  | "claim_step_tool_chain_invalid" | "claim_projection_invalid" | "claim_accepted"; resultPair?: WaitResultPairDiagnostic }>
+  | "claim_step_tool_chain_invalid" | "claim_projection_invalid" | "claim_accepted" | "claim_collision_ambiguous"; resultPair?: WaitResultPairDiagnostic }>
 function sameJson(left: unknown, right: unknown): boolean { try { return canonicalJson(left) === canonicalJson(right) } catch { return false } }
 function strictWaitIds(value: unknown, allowEmpty = false): string[] | null {
   return Array.isArray(value) && value.length <= 8 && (allowEmpty || value.length > 0) && value.every(id => typeof id === "string" && id.length > 0 && id.length <= 256 && id.trim() === id)
@@ -80,24 +80,24 @@ function sourceWaitBinding(wait: Record<string, unknown>, lifecycle: { state: "u
     deadlineAt: deadline.toISOString(), status: wait.status as "ready" | "timed_out",
     mode: wait.mode as "any" | "all", targetTaskIds: ids, matchedTaskIds: matched, timeoutMs: Number(timeoutMs) }
 }
-
 /** Returns only individually proven consumed waits; omitted or ambiguous starts remain blockers. */
 export async function readChildWaitTerminalCallProjections(client: pg.PoolClient, task: Record<string, unknown>): Promise<TerminalCallProjection[]> {
-  return readChildWaitTerminalCallProjectionsCore(client, task)
+  return bindHistoricalWaitClaimCandidates(client, task, await readChildWaitTerminalCallProjectionsCore(client, task))
 }
-
 /** Fixed, bounded claim-stage diagnostics for failure-only tests; contains no persisted identity or payload. */
 export async function diagnoseChildWaitTerminalCallProjections(client: pg.PoolClient, task: Record<string, unknown>): Promise<{
   sourceProjectionCount: number; claimProjectionCount: number; claimStages: readonly HistoricalWaitClaimStage[]
 }> {
   const claimStages: HistoricalWaitClaimStage[] = []
-  const projections = await readChildWaitTerminalCallProjectionsCore(client, task, (candidateOrdinal, stage, resultPair) => {
+  const raw = await readChildWaitTerminalCallProjectionsCore(client, task, (candidateOrdinal, stage, resultPair) => {
     if (claimStages.length < MAX_HISTORICAL_SOURCE_WAITS) claimStages.push({ candidateOrdinal, stage, ...(resultPair ? { resultPair } : {}) })
+  })
+  const projections = await bindHistoricalWaitClaimCandidates(client, task, raw, () => {
+    if (claimStages.length < MAX_HISTORICAL_SOURCE_WAITS) claimStages.push({ candidateOrdinal: claimStages.length + 1, stage: "claim_collision_ambiguous" })
   })
   return { sourceProjectionCount: projections.filter(row => row.sourceWait.claimKeyDigest === null).length,
     claimProjectionCount: projections.filter(row => row.sourceWait.claimKeyDigest !== null).length, claimStages }
 }
-
 async function readChildWaitTerminalCallProjectionsCore(client: pg.PoolClient, task: Record<string, unknown>,
   observeClaimStage?: (candidateOrdinal: number, stage: HistoricalWaitClaimStage["stage"], resultPair?: WaitResultPairDiagnostic) => void): Promise<TerminalCallProjection[]> {
   const id = task.id, sessionId = task.sessionId, turnId = task.turnId, rootTaskId = task.rootTaskId, userId = task.userId

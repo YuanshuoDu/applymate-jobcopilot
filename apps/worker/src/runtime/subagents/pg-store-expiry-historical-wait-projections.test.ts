@@ -26,6 +26,7 @@ import { DurableSubagentWaitError, safeSubagentWaitJson } from "./durable-subage
 import { MAX_HISTORICAL_SOURCE_WAITS, diagnoseChildWaitTerminalCallProjections, readChildWaitTerminalCallProjections } from "./pg-store-expiry-historical-wait-projections.js"
 import { CHILD_WAIT_RESULT_EVENTS_QUERY_SQL } from "./pg-store-expiry-historical-wait-result-pair.js"
 import { CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL } from "./pg-store-expiry-historical-wait-binding.js"
+import { HISTORICAL_WAIT_CLAIM_CANDIDATES_SQL } from "./pg-store-expiry-historical-wait-claim-collision.js"
 
 const task = { id: "owner", sessionId: "session", turnId: "turn", rootTaskId: "root", userId: "user", leaseOwner: "lease-owner",
   attemptCount: 3, leaseExpiresAt: new Date("2099-01-01T00:00:00.000Z") }
@@ -110,6 +111,12 @@ function completedClaim(source: ReturnType<typeof wait>, index: number, taskIds 
 
 function client(rows: Record<string, unknown>[], claims: ReturnType<typeof completedClaim>[] = [], handoff?: ReturnType<typeof recoveredHandoffData>) {
   const query = vi.fn(async (sql: string, values: unknown[] = []) => {
+    if (sql === HISTORICAL_WAIT_CLAIM_CANDIDATES_SQL) return { rows: claims.map(entry => ({
+      callItemId: entry.row.callItemId, stepId: entry.row.stepId, attempt: entry.row.attempt,
+      claimKeyDigest: createHash("sha256").update(String((entry.row.callContent as Record<string, unknown>).input
+        && ((entry.row.callContent as Record<string, unknown>).input as Record<string, unknown>).idempotencyKey)).digest("hex"),
+      resultItemCount: 1, resultItemId: entry.row.resultItemId, resultWaitId: entry.waitId,
+    })) }
     if (sql.includes("SELECT wait.*")) return { rows }
     if (sql.includes("FROM unnest($1::text[])")) return { rows: (values[0] as string[]).map(id => ({ id })) }
     if (sql.includes(`"type" = 'step.completed'`)) return { rows: handoff?.completed ? [{ id: "step-completed" }] : [] }

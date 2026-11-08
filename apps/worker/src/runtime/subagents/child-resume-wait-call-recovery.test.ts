@@ -171,6 +171,13 @@ function addStepCompleted(fake: ReturnType<typeof fixture>): string {
   return id
 }
 
+function setStreamingStep(fake: ReturnType<typeof fixture>): void {
+  fake.step.status = "streaming"
+  fake.step.inputTokens = 0
+  fake.step.outputTokens = 0
+  fake.step.estimatedCostUsd = 0
+}
+
 function setNextStepRow(fake: ReturnType<typeof fixture>): string {
   const stepId = `task:${lease.id}:step:6:attempt:${lease.attemptCount}`
   const ordinal = 10
@@ -234,8 +241,10 @@ describe("child resume wait-call recovery", () => {
 
   it("accepts the canonical projected completion payload while keeping private call input exact", async () => {
     const fake = fixture({ claimed: true, completeLifecycle: true, projectedCompletion: true, modelCost: 0.0042, storedCost: 0.0042 })
+    addStepCompleted(fake)
+    runtimeMocks.readTerminalChain.mockResolvedValue(terminalProof(fake))
     const restored = await loadChildWaitCallRecovery(fake.client as never, lease, wait)
-    expect(restored?.claim).toMatchObject({ call: { id: fake.callId }, callItem: { status: "completed", revision: 1 } })
+    expect(restored?.claim).toMatchObject({ call: { id: fake.callId }, callItem: { status: "completed", revision: 1 }, stepStatus: "completed" })
     const completion = fake.events.find(event => event.type === "item.completed" && event.itemId === fake.claimedId)!
     expect(completion.payload).toMatchObject({ content: { input: {
       idempotencyKey: "[REDACTED]", taskIds: ["[REDACTED]", "[REDACTED]"], mode: "all", timeoutMs: 5_000,
@@ -243,6 +252,15 @@ describe("child resume wait-call recovery", () => {
     expect(JSON.stringify(completion.payload)).not.toContain("wait-key")
     expect(JSON.stringify(completion.payload)).not.toContain("leaf-a")
     expect(fake.calls[0]?.content).toMatchObject({ input: wait.input })
+  })
+
+  it("rejects a completed single-call step without the canonical terminal proof", async () => {
+    const fake = fixture({ claimed: true, completeLifecycle: true, projectedCompletion: true, modelCost: 0.0042, storedCost: 0.0042 })
+    addStepCompleted(fake)
+    runtimeMocks.readTerminalChain.mockResolvedValue(null)
+
+    await expect(loadChildWaitCallRecovery(fake.client as never, lease, wait)).rejects.toThrow("child_resume_wait_tool_call_conflict")
+    expect(runtimeMocks.readTerminalChain).toHaveBeenCalledTimes(1)
   })
 
   it("accepts a completed claim cut before any event follows its terminal proof", async () => {
@@ -345,6 +363,7 @@ describe("child resume wait-call recovery", () => {
 
   it("rejects a tampered canonical completion payload or misbound completion event", async () => {
     const tampered = fixture({ claimed: true, completeLifecycle: true, projectedCompletion: true, modelCost: 0.0042, storedCost: 0.0042 })
+    setStreamingStep(tampered)
     const tamperedEvent = tampered.events.find(event => event.type === "item.completed" && event.itemId === tampered.claimedId)!
     const payload = tamperedEvent.payload as Row
     const content = payload.content as Row
@@ -353,6 +372,7 @@ describe("child resume wait-call recovery", () => {
     await expect(loadChildWaitCallRecovery(tampered.client as never, lease, wait)).rejects.toThrow("child_resume_wait_tool_call_conflict")
 
     const misbound = fixture({ claimed: true, completeLifecycle: true, projectedCompletion: true, modelCost: 0.0042, storedCost: 0.0042 })
+    setStreamingStep(misbound)
     const misboundEvent = misbound.events.find(event => event.type === "item.completed" && event.itemId === misbound.claimedId)!
     misboundEvent.causationId = "unrelated-event"
     await expect(loadChildWaitCallRecovery(misbound.client as never, lease, wait)).rejects.toThrow("child_resume_wait_tool_call_conflict")
@@ -360,12 +380,16 @@ describe("child resume wait-call recovery", () => {
 
   it("accepts the exact historical raw completion payload and matches PostgreSQL-rounded receipt cost", async () => {
     const fake = fixture({ claimed: true, completeLifecycle: true, modelCost: 0.123456789, storedCost: 0.12345679 })
+    addStepCompleted(fake)
+    runtimeMocks.readTerminalChain.mockResolvedValue(terminalProof(fake))
     const restored = await loadChildWaitCallRecovery(fake.client as never, lease, wait)
     expect(restored?.claim?.modelUsage.estimatedCostUsd).toBe(0.123456789)
   })
 
   it("fails closed when completed-step cost differs or receipt cost overflows the database type", async () => {
     const mismatch = fixture({ claimed: true, completeLifecycle: true, modelCost: 0.123456789, storedCost: 0.12345678 })
+    addStepCompleted(mismatch)
+    runtimeMocks.readTerminalChain.mockResolvedValue(terminalProof(mismatch))
     await expect(loadChildWaitCallRecovery(mismatch.client as never, lease, wait)).rejects.toThrow("child_resume_wait_tool_call_conflict")
     const overflow = fixture({ modelCost: 9999.999999995 })
     await expect(loadChildWaitCallRecovery(overflow.client as never, lease, wait)).rejects.toThrow("child_resume_wait_tool_call_conflict")

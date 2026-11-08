@@ -163,6 +163,32 @@ describe("ordered wait claim step tool-chain proof", () => {
     expect(JSON.stringify(proof)).not.toContain("secret-key")
   })
 
+  it("accepts an exact legacy raw wait-call completion without returning its private payload", async () => {
+    const value = fixture()
+    const call = value.items.find(item => item.id === claimItemId)!
+    const completion = value.events.find(event => event.type === "item.completed" && event.itemId === claimItemId)!
+    completion.payload = { itemId: call.id, status: "completed", content: call.content }
+
+    const proof = await readCanonicalWaitStepToolChain(mockClient(value), task, { stepId, attempt: 3, callItemId: claimItemId,
+      callId: claimCallId, resultItemId: claimResultId })
+
+    expect(proof).toMatchObject({ waitCallItemId: claimItemId, waitCallId: claimCallId, waitResultItemId: claimResultId })
+    expect(JSON.stringify(proof)).not.toContain("secret-key")
+  })
+
+  it("rejects a legacy raw wait-call completion whose payload differs from the persisted call item", async () => {
+    const value = fixture()
+    const call = value.items.find(item => item.id === claimItemId)!
+    const completion = value.events.find(event => event.type === "item.completed" && event.itemId === claimItemId)!
+    const content = call.content as Record<string, unknown>
+    const payload = { itemId: call.id, status: "completed", content: { ...content, input: { ...(content.input as Record<string, unknown>) } } }
+    payload.content.input.idempotencyKey = "mutated-secret"
+    completion.payload = payload
+
+    await expect(readCanonicalWaitStepToolChain(mockClient(value), task, { stepId, attempt: 3, callItemId: claimItemId,
+      callId: claimCallId, resultItemId: claimResultId })).resolves.toBeNull()
+  })
+
   it("accepts maximum bounded child-writer item and event IDs", async () => {
     const value = longWriterFixture()
     const proof = await readCanonicalWaitStepToolChain(mockClient(value.value), value.task, { stepId: value.stepId,

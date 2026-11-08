@@ -31,6 +31,41 @@ describe("wait claim result event set", () => {
     expect(CHILD_WAIT_STEP_TOOL_CHAIN_EXCEPTION_SQL).toContain("jsonb_array_length(CASE WHEN jsonb_typeof(proof.value->'stepToolChain'->'calls') = 'array'")
   })
 
+  it("guards first and last JSON event sequences before signed bigint casts", () => {
+    const sql = CHILD_WAIT_STEP_TOOL_CHAIN_EXCEPTION_SQL
+    const rangeStart = sql.indexOf('FROM "agent_events" AS inRange')
+    const rangeEnd = sql.indexOf('AND (SELECT COUNT(*) FROM (SELECT actual."id"', rangeStart)
+    expect(rangeStart).toBeGreaterThanOrEqual(0)
+    expect(rangeEnd).toBeGreaterThan(rangeStart)
+    const range = sql.slice(rangeStart, rangeEnd)
+    expect(range).toContain("AND CASE WHEN (jsonb_typeof(")
+    expect(range).toContain("~ '^[1-9][0-9]{0,18}$'")
+    expect(range.split("~ '^[1-9][0-9]{0,18}$'")).toHaveLength(3)
+    expect(range).toContain("->0->'sequence'")
+    expect(range).toContain("->(jsonb_array_length(")
+    expect(range).toContain("'9223372036854775807'::text COLLATE \"C\"")
+    const thenAt = range.indexOf('THEN inRange."sequence" BETWEEN')
+    expect(thenAt).toBeGreaterThanOrEqual(0)
+    const casts = [...range.matchAll(/::bigint/g)].map(match => match.index ?? -1)
+    expect(casts).toHaveLength(2)
+    expect(casts.every(index => index > thenAt)).toBe(true)
+    expect(range.slice(0, thenAt)).not.toContain("::bigint")
+    expect(range).toContain("ELSE FALSE END")
+
+    const isSafeSequence = (jsonType: string, value: string) => jsonType === "string"
+      && /^[1-9][0-9]{0,18}$/.test(value)
+      && (value.length < 19 || value <= "9223372036854775807")
+    expect(isSafeSequence("string", "1")).toBe(true)
+    expect(isSafeSequence("string", "9223372036854775807")).toBe(true)
+    expect(isSafeSequence("string", "0")).toBe(false)
+    expect(isSafeSequence("string", "9223372036854775808")).toBe(false)
+    expect(isSafeSequence("string", "99999999999999999999")).toBe(false)
+    expect(isSafeSequence("string", "01")).toBe(false)
+    expect(isSafeSequence("string", "1.0")).toBe(false)
+    expect(isSafeSequence("string", "not-a-sequence")).toBe(false)
+    expect(isSafeSequence("number", "13")).toBe(false)
+  })
+
   it("counts distinct proof calls through the scoped call item alias", () => {
     expect(CHILD_WAIT_STEP_TOOL_CHAIN_EXCEPTION_SQL).toContain('SELECT COUNT(DISTINCT proofCall."id") FROM jsonb_array_elements')
     expect(CHILD_WAIT_STEP_TOOL_CHAIN_EXCEPTION_SQL).toContain("JOIN \"agent_items\" AS proofCall ON proofCall.\"id\" = callProof.value->>'callItemId'")

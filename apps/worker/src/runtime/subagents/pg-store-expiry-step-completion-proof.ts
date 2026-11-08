@@ -3,6 +3,13 @@ import { MAX_STEP_CHAIN_EVENTS, MAX_STEP_TOOL_CALLS, STEP_TOOL_CHAIN_AGENDA_JOIN
 export { isCanonicalWaitResultPair, partitionWaitResultEvents } from "./pg-store-expiry-historical-wait-result-pair.js"
 const events = `CASE WHEN jsonb_typeof(proof.value->'stepToolChain'->'events') = 'array' THEN proof.value->'stepToolChain'->'events' ELSE '[]'::jsonb END`
 const calls = `CASE WHEN jsonb_typeof(proof.value->'stepToolChain'->'calls') = 'array' THEN proof.value->'stepToolChain'->'calls' ELSE '[]'::jsonb END`
+const firstEventSequence = `((${events})->0->>'sequence')`
+const firstEventSequenceJson = `((${events})->0->'sequence')`
+const lastEventSequence = `((${events})->(jsonb_array_length(${events}) - 1)->>'sequence')`
+const lastEventSequenceJson = `((${events})->(jsonb_array_length(${events}) - 1)->'sequence')`
+const safeBigintSequence = (json: string, text: string) => `(jsonb_typeof(${json}) = 'string'
+  AND ${text} ~ '^[1-9][0-9]{0,18}$'
+  AND (char_length(${text}) < 19 OR (${text} COLLATE "C") <= ('9223372036854775807'::text COLLATE "C")))`
 
 const objectHasExactKeyCount = (expression: string, count: number) => `(CASE WHEN jsonb_typeof(${expression}) = 'object'
   THEN (SELECT COUNT(*) FROM jsonb_object_keys(${expression})) = ${count} ELSE FALSE END)`
@@ -28,8 +35,10 @@ export const CHILD_WAIT_STEP_TOOL_CHAIN_EXCEPTION_SQL = `(
       AND actual."idempotencyKey" = expected.value->>'idempotencyKey') = jsonb_array_length(${events})
   AND (SELECT COUNT(*) FROM "agent_events" AS inRange
     WHERE inRange."sessionId" = callItem."sessionId" AND inRange."turnId" = callItem."turnId" AND inRange."taskId" = callItem."taskId"
-      AND inRange."sequence" BETWEEN ((${events})->0->>'sequence')::bigint
-        AND ((${events})->(jsonb_array_length(${events}) - 1)->>'sequence')::bigint)
+      AND CASE WHEN ${safeBigintSequence(firstEventSequenceJson, firstEventSequence)}
+        AND ${safeBigintSequence(lastEventSequenceJson, lastEventSequence)}
+        THEN inRange."sequence" BETWEEN ${firstEventSequence}::bigint AND ${lastEventSequence}::bigint
+        ELSE FALSE END)
     = jsonb_array_length(${events})
   AND (SELECT COUNT(*) FROM (SELECT actual."id", actual."causationId", actual."sequence",
       lag(expected.value->>'id') OVER (ORDER BY expected.ordinal) AS "previousId",

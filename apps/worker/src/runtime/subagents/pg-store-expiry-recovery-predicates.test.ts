@@ -8,6 +8,7 @@ import {
 import {
   CHILD_WAIT_SOURCE_RECOVERED_RESULT_SQL,
 } from "./pg-store-expiry-child-wait-source-proof.js"
+import { historicalWaitProjectionsSql } from "./pg-store-expiry-historical-wait-claim-collision.js"
 
 const task = {
   id: "parent-1",
@@ -108,7 +109,7 @@ describe("expired recovery SQL predicates", () => {
     expectSqlBindings(sql, values)
     expectSqlBindings(query.mock.calls[0]![0] as string, query.mock.calls[0]![1] as unknown[])
     expect(CHILD_WAIT_CLAIM_RECOVERY_SQL).toContain("$11::text IS NOT NULL AND $12::text IS NOT NULL")
-    expect(sql).toContain("jsonb_array_elements(CASE WHEN jsonb_typeof($13::jsonb) = 'array' THEN $13::jsonb ELSE '[]'::jsonb END)")
+    expect(sql).toContain(`jsonb_array_elements(${historicalWaitProjectionsSql("$13::jsonb")})`)
     expect(sql).toContain('LEFT JOIN LATERAL (SELECT latest_wait."id" AS "waitId"')
     expect(sql).toContain('FROM latest_wait WHERE started."type" = \'tool_call.started\' AND $10::text IS NOT NULL AND EXISTS (')
     expect(sql).toContain("started.\"idempotencyKey\" = 'task:' || owner.\"id\" || ':event:child-wait-claim:' || owner.\"attemptCount\"::text || ':' || continuation.\"id\"")

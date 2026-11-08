@@ -4,6 +4,7 @@ import { CHILD_WAIT_CALL_LIFECYCLE_SQL, CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL,
 import { readChildWaitSourceCallProjection } from "./pg-store-expiry-child-wait-source-proof.js"
 import type { TerminalCallProjection } from "./pg-store-expiry-historical-wait-binding.js"
 import { readChildWaitTerminalCallProjections } from "./pg-store-expiry-historical-wait-projections.js"
+import { historicalWaitClaimProofBundle } from "./pg-store-expiry-historical-wait-claim-collision.js"
 
 export { CHILD_WAIT_CLAIM_RECOVERY_SQL } from "./pg-store-expiry-child-wait-claim-call-proof.js"
 export const CHILD_WAIT_RESUMABLE_SQL = `(SELECT COUNT(*) = 1
@@ -103,7 +104,8 @@ export async function hasBlockingExternalCall(client: pg.PoolClient, task: Recor
           AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(wait."targetTaskIds") = 'array' THEN wait."targetTaskIds" ELSE '[]'::jsonb END) AS target("id")
             WHERE NOT EXISTS (SELECT 1 FROM "sub_agent_tasks" AS child WHERE child."id" = target."id" AND child."parentTaskId" = owner."id" AND child."rootTaskId" = $4 AND child."sessionId" = $1 AND child."turnId" = $3))))
       AND ($9::text IS NULL OR started."id" <> $9) LIMIT 2`, [task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount, task.leaseExpiresAt, task.userId, ignoredEventId ?? null, continuationId ?? null,
-    sourceCallProjection?.rawCallId ?? null, sourceCallProjection?.projectedCallId ?? null, JSON.stringify(projections)])
+    sourceCallProjection?.rawCallId ?? null, sourceCallProjection?.projectedCallId ?? null,
+    JSON.stringify(projections.length ? historicalWaitClaimProofBundle(projections) : [])])
   const result = await run([])
   if (!result.rows.length) return false
   const validClaim = (rows: typeof result.rows) => rows.length === 1 && typeof rows[0]?.claimWaitId === "string"

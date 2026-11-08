@@ -31,6 +31,9 @@ import { CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL, CHILD_WAIT_HISTORICAL_S
   HISTORICAL_SOURCE_STEP_BINDING_SQL, HISTORICAL_SOURCE_STEP_PREFIX_SQL } from "./pg-store-expiry-historical-wait-event-binding.js"
 import { readChildWaitSourceCallProjection } from "./pg-store-expiry-child-wait-source-proof.js"
 import { CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL } from "./pg-store-expiry-historical-wait-binding.js"
+import type { TerminalCallProjection } from "./pg-store-expiry-historical-wait-binding.js"
+import { historicalWaitClaimProofBundle, historicalWaitClaimProjectionEnvelope,
+  historicalWaitClaimProofsSql, historicalWaitProjectionsSql } from "./pg-store-expiry-historical-wait-claim-collision.js"
 import { buildCognitiveAgendaReceipt, cognitiveAgendaReceiptIdempotencyKey, parseCognitiveAgendaReceipt } from "../turns/cognitive-agenda-receipt.js"
 import { diagnoseChildWaitTerminalCallProjections, readChildWaitTerminalCallProjections } from "./pg-store-expiry-historical-wait-projections.js"
 import { historicalSourceStepCallChainBinding, historicalSourceStepCallCountBinding, historicalSourceStepEventChainBinding,
@@ -133,9 +136,11 @@ const WORKER_F_CLAIM_COMPONENTS_SQL = `WITH params AS MATERIALIZED (
     $5::text AS "leaseOwner", $6::integer AS "attemptCount", $7::timestamptz AS "leaseExpiresAt", $8::text AS "userId",
     $9::text AS "rawCallId", $10::text AS "projectedCallId", $11::text AS "startEventId", $12::text AS "callItemId",
     $13::jsonb AS "proofRows", $14::text AS "sourceCallId", $15::text AS "continuationStepId"
+), proofBundle AS MATERIALIZED (
+  SELECT ${historicalWaitClaimProofsSql('params."proofRows"')} AS "claimCollisionProofs" FROM params
 ), proof AS MATERIALIZED (
   SELECT candidate.value FROM params
-  CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(params."proofRows") = 'array' THEN params."proofRows" ELSE '[]'::jsonb END) AS candidate(value)
+  CROSS JOIN LATERAL jsonb_array_elements(${historicalWaitProjectionsSql('params."proofRows"')}) AS candidate(value)
   WHERE candidate.value->>'startEventId' = params."startEventId" AND candidate.value->>'rawCallId' = params."rawCallId"
     AND candidate.value->>'projectedCallId' = params."projectedCallId" AND candidate.value->>'callItemId' = params."callItemId"
     AND candidate.value->'sourceWait'->>'sourceCallId' = params."sourceCallId"
@@ -163,6 +168,7 @@ JOIN "agent_sessions" AS session ON session."id" = owner."sessionId" AND session
 JOIN "agent_turns" AS turn ON turn."id" = owner."turnId" AND turn."sessionId" = owner."sessionId"
   AND turn."userId" = session."userId" AND turn."rootTaskId" = owner."rootTaskId"
 JOIN proof ON TRUE
+CROSS JOIN proofBundle
 JOIN "agent_events" AS started ON started."id" = proof.value->>'startEventId'
   AND started."sessionId" = params."sessionId" AND started."turnId" = params."turnId" AND started."taskId" = params."taskId"
   AND started."itemId" = proof.value->>'callItemId' AND started."correlationId" = proof.value->>'rawCallId'
@@ -1309,7 +1315,7 @@ async function diagnoseHistoricalClaimFinal(client: PoolClient, task: BlockingTa
   const componentRows = await client.query<Record<string, unknown>>(WORKER_F_CLAIM_COMPONENTS_SQL, [
     task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount,
     task.leaseExpiresAt, task.userId, claim.rawCallId, claim.projectedCallId, claim.startEventId,
-    claim.callItemId, JSON.stringify([claim]), sourceCallId, continuationStepId,
+    claim.callItemId, JSON.stringify(historicalWaitClaimProofBundle([claim])), sourceCallId, continuationStepId,
   ])
   const recovery = await diagnoseWorkerFClaimProof(client, task, continuationStepId, sourceCallId, claimCallId)
   const component = componentRows.rows.length === 1 ? componentRows.rows[0] : undefined
@@ -2017,10 +2023,16 @@ async function withHistoricalWaitDiagnosticSavepoint<T>(client: PoolClient, prob
   }
 }
 
-async function historicalWaitBindingAccepts(client: PoolClient, task: BlockingTaskSnapshot, projection: unknown): Promise<boolean> {
-  const result = await client.query<{ accepted: boolean }>(`WITH proof AS (SELECT $9::jsonb AS value)
+async function historicalWaitBindingAccepts(client: PoolClient, task: BlockingTaskSnapshot, projection: unknown,
+  collisionProjections: readonly TerminalCallProjection[] = [projection as TerminalCallProjection],
+  envelopeOverride?: Record<string, unknown>): Promise<boolean> {
+  const envelope = envelopeOverride ?? historicalWaitClaimProjectionEnvelope(projection as TerminalCallProjection, collisionProjections)
+  const result = await client.query<{ accepted: boolean }>(`WITH input AS (SELECT $9::jsonb AS value),
+    proof AS (SELECT input.value->'projection' AS value FROM input),
+    proofBundle AS (SELECT CASE WHEN jsonb_typeof(input.value->'claimCollisionProofs') = 'array'
+      THEN input.value->'claimCollisionProofs' ELSE '[]'::jsonb END AS "claimCollisionProofs" FROM input)
     SELECT ${CHILD_WAIT_HISTORICAL_WAIT_BINDING_SQL} AS "accepted"
-    FROM proof
+  FROM proof CROSS JOIN proofBundle
     JOIN "sub_agent_tasks" AS owner ON owner."id" = $2 AND owner."sessionId" = $1 AND owner."turnId" = $3
       AND owner."rootTaskId" = $4 AND owner."leaseOwner" = $5 AND owner."attemptCount" = $6 AND owner."leaseExpiresAt" = $7
     JOIN "agent_sessions" AS session ON session."id" = owner."sessionId" AND session."userId" = $8
@@ -2046,7 +2058,7 @@ async function historicalWaitBindingAccepts(client: PoolClient, task: BlockingTa
       AND started."payload" = jsonb_build_object('toolCallId', callItem."content"->>'toolCallId',
         'toolName', 'wait_subagents', 'taskId', owner."id")`,
   [task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount, task.leaseExpiresAt,
-    task.userId, JSON.stringify(projection)])
+    task.userId, JSON.stringify(envelope)])
   return result.rows.length === 1 && result.rows[0]?.accepted === true
 }
 
@@ -5898,26 +5910,95 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         const secondClaimProjection = projections.find(projection => projection.sourceWait.waitId === secondWait!.waitId
           && projection.sourceWait.claimKeyDigest !== null)
         if (!secondClaimProjection) throw new Error("two_historical_wait_second_claim_projection_missing")
+        const firstClaimProjection = projections.find(projection => projection.sourceWait.waitId === firstWait.rows[0]!.id
+          && projection.sourceWait.claimKeyDigest !== null)
+        if (!firstClaimProjection) throw new Error("two_historical_wait_first_claim_projection_missing")
+        expect(firstClaimProjection.sourceWait.sourceKeyDigest).not.toBe(secondClaimProjection.sourceWait.sourceKeyDigest)
+        expect(firstClaimProjection.sourceWait.claimKeyDigest).toBe(secondClaimProjection.sourceWait.claimKeyDigest)
+        expect(firstClaimProjection.sourceWait.waitId).not.toBe(secondClaimProjection.sourceWait.waitId)
+        expect(firstClaimProjection.callItemId).not.toBe(secondClaimProjection.callItemId)
         await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, secondSourceProjection),
           "real PG binding accepts source identity from its top-level and nested sourceWait fields").resolves.toBe(true)
-        const secondClaimBindingAccepted = await historicalWaitBindingAccepts(checkClient, scopedOwner, secondClaimProjection)
+        const firstClaimBindingAccepted = await historicalWaitBindingAccepts(checkClient, scopedOwner, firstClaimProjection, projections)
+        await expect(Promise.resolve(firstClaimBindingAccepted),
+          "real PG binding accepts the first of two independently source-bound claims with the same projected digest").resolves.toBe(true)
+        const secondClaimBindingAccepted = await historicalWaitBindingAccepts(checkClient, scopedOwner, secondClaimProjection, projections)
         const secondClaimBindingDiagnostic = secondClaimBindingAccepted ? undefined
           : await diagnoseHistoricalWaitBinding(checkClient, scopedOwner, secondClaimProjection, secondSourceProjection)
         await expect(Promise.resolve(secondClaimBindingAccepted),
           `real PG binding accepts a claim top-level identity while separately binding its nested sourceWait${secondClaimBindingDiagnostic
             ? `; bounded diagnostic=${JSON.stringify(secondClaimBindingDiagnostic)}` : ""}`).resolves.toBe(true)
+        const secondClaimEnvelope = historicalWaitClaimProjectionEnvelope(secondClaimProjection, projections)
+        const secondClaimEnvelopeProjection = asObject(secondClaimEnvelope.projection)
+        const secondClaimPeerIds = Array.isArray(secondClaimEnvelopeProjection.claimCollisionPeerIds)
+          ? secondClaimEnvelopeProjection.claimCollisionPeerIds.filter((id): id is string => typeof id === "string") : []
+        const collisionProofRows = Array.isArray(secondClaimEnvelope.claimCollisionProofs)
+          ? secondClaimEnvelope.claimCollisionProofs : []
+        expect(secondClaimPeerIds).toEqual([firstClaimProjection.callItemId])
+        await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, secondClaimProjection, projections, {
+          ...secondClaimEnvelope, projection: { ...secondClaimEnvelopeProjection, claimCollisionPeerIds: [...secondClaimPeerIds, "unknown-peer-ref"] },
+        }), "final SQL rejects a collision reference that has no database candidate or proof").resolves.toBe(false)
+        await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, secondClaimProjection, projections, {
+          ...secondClaimEnvelope, projection: { ...secondClaimEnvelopeProjection, claimCollisionPeerIds: [...secondClaimPeerIds, firstClaimProjection.callItemId] },
+        }), "final SQL rejects duplicate collision references").resolves.toBe(false)
+        await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, secondClaimProjection, projections, {
+          ...secondClaimEnvelope, claimCollisionProofs: [...collisionProofRows,
+            { ...firstClaimProjection, callItemId: "unreferenced-peer-proof" }],
+        }), "final SQL rejects an unreferenced same-digest proof").resolves.toBe(false)
+        await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, secondClaimProjection, projections, {
+          ...secondClaimEnvelope, claimCollisionProofs: [...collisionProofRows, firstClaimProjection],
+        }), "final SQL rejects duplicate proof identities").resolves.toBe(false)
         await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, { ...secondSourceProjection,
           callItemId: secondClaimProjection.callItemId, rawCallId: secondClaimProjection.rawCallId,
-          projectedCallId: secondClaimProjection.projectedCallId }),
+          projectedCallId: secondClaimProjection.projectedCallId }, projections),
         "a source projection cannot borrow the continuation claim's top-level identity").resolves.toBe(false)
         await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, { ...secondClaimProjection,
           callItemId: secondSourceProjection.callItemId, rawCallId: secondSourceProjection.rawCallId,
-          projectedCallId: secondSourceProjection.projectedCallId }),
+          projectedCallId: secondSourceProjection.projectedCallId }, projections),
         "a claim projection cannot substitute the historical source's top-level identity").resolves.toBe(false)
         await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, { ...secondClaimProjection,
           sourceWait: { ...secondClaimProjection.sourceWait, sourceCallItemId: secondClaimProjection.callItemId,
-            sourceCallId: secondClaimProjection.rawCallId, projectedSourceCallId: secondClaimProjection.projectedCallId } }),
+            sourceCallId: secondClaimProjection.rawCallId, projectedSourceCallId: secondClaimProjection.projectedCallId } }, projections),
         "a claim cannot rebind the nested sourceWait to its continuation call").resolves.toBe(false)
+        const firstClaimCompletionKey = `task:${ids.waiterTaskId}:event:tool-call-completed:${firstClaimProjection.rawCallId}:${firstClaimProjection.callItemId}:1`
+        const firstClaimCompletion = await checkClient.query<{ id: string }>(`SELECT "id" FROM "agent_events"
+          WHERE "sessionId" = $1 AND "turnId" = $2 AND "taskId" = $3 AND "itemId" = $4
+            AND "type" = 'item.completed' AND "idempotencyKey" = $5`,
+        [ids.sessionId, ids.turnId, ids.waiterTaskId, firstClaimProjection.callItemId, firstClaimCompletionKey])
+        expect(firstClaimCompletion.rows).toHaveLength(1)
+        await checkClient.query("SAVEPOINT two_wait_peer_key_projection_mismatch")
+        const changedPeerKeyProjection = await checkClient.query(`UPDATE "agent_events" SET "payload" = jsonb_set("payload",
+          '{content,input,idempotencyKey}', '"[ALTERED]"'::jsonb, false)
+          WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4`,
+        [firstClaimCompletion.rows[0]!.id, ids.sessionId, ids.turnId, ids.waiterTaskId])
+        expect(changedPeerKeyProjection.rowCount).toBe(1)
+        await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, secondClaimProjection, projections),
+          "final binding rejects a peer completion whose redacted key projection changed").resolves.toBe(false)
+        await checkClient.query("ROLLBACK TO SAVEPOINT two_wait_peer_key_projection_mismatch")
+        await checkClient.query("RELEASE SAVEPOINT two_wait_peer_key_projection_mismatch")
+        await checkClient.query("SAVEPOINT two_wait_peer_target_projection_mismatch")
+        const changedPeerTargetProjection = await checkClient.query(`UPDATE "agent_events" SET "payload" = jsonb_set("payload",
+          '{content,input,taskIds}', '[]'::jsonb, false)
+          WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4`,
+        [firstClaimCompletion.rows[0]!.id, ids.sessionId, ids.turnId, ids.waiterTaskId])
+        expect(changedPeerTargetProjection.rowCount).toBe(1)
+        await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, secondClaimProjection, projections),
+          "final binding rejects a peer completion whose redacted target projection changed").resolves.toBe(false)
+        await checkClient.query("ROLLBACK TO SAVEPOINT two_wait_peer_target_projection_mismatch")
+        await checkClient.query("RELEASE SAVEPOINT two_wait_peer_target_projection_mismatch")
+        const tamperedPeerProjectionId = projections.map(projection => projection.callItemId === firstClaimProjection.callItemId
+          ? { ...projection, projectedCallId: `${projection.projectedCallId}:tampered` } : projection)
+        await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, secondClaimProjection, tamperedPeerProjectionId),
+          "final binding rejects a peer proof whose projected call id no longer matches its stored completion event").resolves.toBe(false)
+        await checkClient.query("SAVEPOINT two_wait_wrong_claim_result_wait")
+        const reboundClaimResult = await checkClient.query(`UPDATE "agent_items" SET "content" = jsonb_set("content", '{output,waitId}', to_jsonb($2::text), false)
+          WHERE "id" = $1 AND "sessionId" = $3 AND "turnId" = $4 AND "taskId" = $5 AND "type" = 'tool_result'`,
+        [secondClaimProjection.resultItemId, firstWait.rows[0]!.id, ids.sessionId, ids.turnId, ids.waiterTaskId])
+        expect(reboundClaimResult.rowCount).toBe(1)
+        await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, secondClaimProjection, projections),
+          "final binding rejects a claim result whose waitId was rebound to another exact wait").resolves.toBe(false)
+        await checkClient.query("ROLLBACK TO SAVEPOINT two_wait_wrong_claim_result_wait")
+        await checkClient.query("RELEASE SAVEPOINT two_wait_wrong_claim_result_wait")
         const earlierCompletedTool = await checkClient.query<{ sourceOrdinal: number; sourceAttempt: number; earlierOrdinal: number;
           earlierAttempt: number; callId: string; toolName: string; callStatus: string; resultStatus: string }>(
         "SELECT source.\"ordinal\" AS \"sourceOrdinal\", source.\"attempt\" AS \"sourceAttempt\", " +
@@ -5958,7 +6039,10 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
           .toMatchObject({ startCount: 1, terminalCount: 1, resultCount: 1 })
         await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, secondSourceProjection),
           "final PG binding accepts the consumed second source first call despite an earlier completed tool in the same attempt").resolves.toBe(true)
+        const serializedCollisionProofs = JSON.stringify(historicalWaitClaimProofBundle(projections))
         expect(JSON.stringify(projections)).not.toContain("fixture-private-failure-input")
+        expect(serializedCollisionProofs).not.toContain(SOURCE_WAIT_SECRET_IDEMPOTENCY_KEY(ids.waiterTaskId))
+        expect(serializedCollisionProofs).not.toContain(`${SOURCE_WAIT_SECRET_IDEMPOTENCY_KEY(ids.waiterTaskId)}-second`)
 
         const firstSourceProjection = projections.find(projection => projection.sourceWait.waitId === firstWait.rows[0]!.id
           && projection.sourceWait.claimKeyDigest === null && projection.sourceStepPrefix)
@@ -6155,11 +6239,41 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         const canonicalBaseline = await readChildWaitTerminalCallProjections(checkClient, scopedOwner)
         expect(canonicalBaseline).toHaveLength(4)
         await expect(hasBlockingExternalCall(checkClient, scopedOwner, undefined, secondClaimStepId)).resolves.toBe(false)
+        await checkClient.query("SAVEPOINT malformed_null_digest_wait_claim")
+        const malformedOrdinal = await checkClient.query<{ ordinal: number }>(`SELECT (COALESCE(MAX("ordinal"), -1) + 1)::int AS "ordinal"
+          FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2`, [ids.sessionId, ids.turnId])
+        expect(malformedOrdinal.rows).toHaveLength(1)
+        const malformedStepId = `task:${ids.waiterTaskId}:step:null-digest-claim:${suffix}:attempt:1`
+        const malformedCallId = `fixture-null-digest-claim:${suffix}`
+        const malformedCallItemId = `task:${ids.waiterTaskId}:item:tool-call:${malformedCallId}:attempt:1`
+        const sourceInput = asObject(originalCallContent.input)
+        const malformedCallContent = { ...originalCallContent, toolCallId: malformedCallId, input: {
+          taskIds: sourceInput.taskIds, mode: sourceInput.mode, timeoutMs: sourceInput.timeoutMs,
+        } }
+        const insertedMalformedStep = await checkClient.query(`INSERT INTO "agent_steps" ("id", "sessionId", "turnId", "taskId", "ordinal", "attempt", "status",
+            "inputThroughSequence", "consumedInputIds", "modelProfileSnapshot", "startedAt", "completedAt", "finishReason", "errorCode", "inputTokens", "outputTokens", "estimatedCostUsd")
+          VALUES ($1, $2, $3, $4, $5, 1, 'completed', 0, '[]'::jsonb, $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 'tool_calls', NULL, 0, 0, 0)`,
+        [malformedStepId, ids.sessionId, ids.turnId, ids.waiterTaskId, malformedOrdinal.rows[0]!.ordinal,
+          JSON.stringify(LOOP_FIXTURE_MODEL_PROFILE_SNAPSHOT)])
+        expect(insertedMalformedStep.rowCount).toBe(1)
+        await checkClient.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "revision", "content", "startedAt", "completedAt", "updatedAt")
+          VALUES ($1, $2, $3, $4, $5, 'tool_call', 'completed', NULL, 1, $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+        [malformedCallItemId, ids.sessionId, ids.turnId, malformedStepId, ids.waiterTaskId, JSON.stringify(malformedCallContent)])
+        const afterNullDigestCandidate = await readChildWaitTerminalCallProjections(checkClient, scopedOwner)
+        expect(afterNullDigestCandidate.filter(projection => projection.sourceWait.claimKeyDigest !== null)).toHaveLength(0)
+        expect(afterNullDigestCandidate.filter(projection => projection.sourceWait.claimKeyDigest === null)).toHaveLength(2)
+        await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, secondClaimProjection, projections),
+          "final SQL must block same-attempt wait calls with no claim-key digest").resolves.toBe(false)
+        await checkClient.query("ROLLBACK TO SAVEPOINT malformed_null_digest_wait_claim")
+        await checkClient.query("RELEASE SAVEPOINT malformed_null_digest_wait_claim")
+        expect(await readChildWaitTerminalCallProjections(checkClient, scopedOwner)).toHaveLength(4)
         await checkClient.query("SAVEPOINT canonical_duplicate_claim")
         const claimInput = asObject(originalCallContent.input)
         const claimInputKey = claimInput.idempotencyKey
         if (typeof claimInputKey !== "string") throw new Error("two_historical_wait_claim_input_key_missing")
         const claimKeyDigest = createHash("sha256").update(claimInputKey).digest("hex")
+        const differentWaitKeyDigest = createHash("sha256").update(`${claimInputKey}:different-wait-claim`).digest("hex")
+        expect(differentWaitKeyDigest).not.toBe(claimKeyDigest)
         const canonicalDuplicateStepId = `task:${ids.waiterTaskId}:step:canonical-duplicate-claim:${suffix}:attempt:1`
         const nextOrdinal = await checkClient.query<{ ordinal: number }>(`SELECT (COALESCE(MAX("ordinal"), -1) + 1)::int AS "ordinal"
           FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2`, [ids.sessionId, ids.turnId])
@@ -6174,7 +6288,9 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         const canonicalDuplicateCallId = `fixture-canonical-duplicate-claim:${suffix}`
         const canonicalDuplicateCallItemId = `task:${ids.waiterTaskId}:item:tool-call:${canonicalDuplicateCallId}:attempt:1`
         const canonicalDuplicateResultItemId = `task:${ids.waiterTaskId}:item:tool-result:${canonicalDuplicateCallId}:attempt:1`
-        const canonicalDuplicateCallContent = { ...originalCallContent, toolCallId: canonicalDuplicateCallId }
+        const canonicalDuplicateCallContent = { ...originalCallContent, toolCallId: canonicalDuplicateCallId, input: {
+          ...claimInput, idempotencyKey: `${claimInputKey}:different-wait-claim`,
+        } }
         const canonicalDuplicateResultContent = { ...asObject(originalResult.rows[0]!.content), toolCallId: canonicalDuplicateCallId }
         await checkClient.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "revision", "content", "startedAt", "completedAt", "updatedAt")
           VALUES ($1, $2, $3, $4, $5, 'tool_call', 'completed', NULL, 1, $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, [
@@ -6271,17 +6387,71 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         expect(canonicalDuplicateChain).toMatchObject({ stepId: canonicalDuplicateStepId, attempt: 1,
           waitCallItemId: canonicalDuplicateCallItemId, waitCallId: canonicalDuplicateCallId, waitResultItemId: canonicalDuplicateResultItemId })
         expect(canonicalDuplicateChain?.calls).toHaveLength(1)
-        const duplicateClaimCount = await checkClient.query<{ count: number; stepCount: number }>(`SELECT COUNT(*)::int AS "count", COUNT(DISTINCT call."stepId")::int AS "stepCount" FROM "agent_items" AS call
+        const sameDigestClaimCount = await checkClient.query<{ count: number; stepCount: number }>(`SELECT COUNT(*)::int AS "count", COUNT(DISTINCT call."stepId")::int AS "stepCount" FROM "agent_items" AS call
           JOIN "agent_steps" AS step ON step."id" = call."stepId" AND step."sessionId" = call."sessionId" AND step."turnId" = call."turnId" AND step."taskId" = call."taskId"
           WHERE call."sessionId" = $1 AND call."turnId" = $2 AND call."taskId" = $3 AND step."attempt" = $4
             AND call."type" = 'tool_call' AND call."content"->>'toolName' = 'wait_subagents'
             AND encode(sha256(convert_to(call."content"->'input'->>'idempotencyKey', 'UTF8')), 'hex') = $5`,
         [ids.sessionId, ids.turnId, ids.waiterTaskId, owner.attemptCount, claimKeyDigest])
-        expect(duplicateClaimCount.rows).toEqual([{ count: 2, stepCount: 2 }])
+        expect(sameDigestClaimCount.rows).toEqual([{ count: 1, stepCount: 1 }])
+        const differentDigestSameWaitCount = await checkClient.query<{ count: number; stepCount: number }>(`SELECT COUNT(*)::int AS "count", COUNT(DISTINCT call."stepId")::int AS "stepCount"
+          FROM "agent_items" AS call JOIN "agent_steps" AS step ON step."id" = call."stepId"
+            AND step."sessionId" = call."sessionId" AND step."turnId" = call."turnId" AND step."taskId" = call."taskId"
+          JOIN "agent_items" AS result ON result."sessionId" = call."sessionId" AND result."turnId" = call."turnId"
+            AND result."taskId" = call."taskId" AND result."stepId" = call."stepId" AND result."type" = 'tool_result'
+            AND result."content"->>'toolCallId' = call."content"->>'toolCallId'
+          WHERE call."sessionId" = $1 AND call."turnId" = $2 AND call."taskId" = $3 AND step."attempt" = $4
+            AND call."type" = 'tool_call' AND call."content"->>'toolName' = 'wait_subagents'
+            AND result."content"->'output'->>'waitId' = $5
+            AND encode(sha256(convert_to(call."content"->'input'->>'idempotencyKey', 'UTF8')), 'hex') <> $6`,
+        [ids.sessionId, ids.turnId, ids.waiterTaskId, owner.attemptCount, secondWait!.waitId, claimKeyDigest])
+        expect(differentDigestSameWaitCount.rows).toEqual([{ count: 1, stepCount: 1 }])
+        const currentClaimCount = await checkClient.query<{ count: number }>(`SELECT COUNT(*)::int AS "count" FROM "agent_items" AS call
+          JOIN "agent_steps" AS step ON step."id" = call."stepId" AND step."sessionId" = call."sessionId"
+            AND step."turnId" = call."turnId" AND step."taskId" = call."taskId"
+          JOIN "agent_items" AS result ON result."sessionId" = call."sessionId" AND result."turnId" = call."turnId"
+            AND result."taskId" = call."taskId" AND result."stepId" = call."stepId" AND result."type" = 'tool_result'
+            AND result."content"->>'toolCallId' = call."content"->>'toolCallId'
+          WHERE call."sessionId" = $1 AND call."turnId" = $2 AND call."taskId" = $3 AND step."attempt" = $4
+            AND call."id" = $5 AND result."content"->'output'->>'waitId' = $6`,
+        [ids.sessionId, ids.turnId, ids.waiterTaskId, owner.attemptCount, secondClaimProjection.callItemId, secondWait!.waitId])
+        expect(currentClaimCount.rows).toEqual([{ count: 1 }])
         const validProofsBeforeSql = await readChildWaitTerminalCallProjections(checkClient, scopedOwner)
         expect(validProofsBeforeSql).toHaveLength(4)
         expect(validProofsBeforeSql.find(projection => projection.sourceWait.waitId === secondWait!.waitId && projection.resultItemId)
           ?.sourceWait.claimKeyDigest).toBe(claimKeyDigest)
+        await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, secondClaimProjection, validProofsBeforeSql),
+          "final SQL rejects a later same-wait claim with a different non-null key digest").resolves.toBe(false)
+        const differentDigestResultId = `task:${ids.waiterTaskId}:item:tool-result:${canonicalDuplicateCallId}:attempt:1:extra`
+        await checkClient.query("SAVEPOINT different_digest_multiple_results")
+        const extraDigestResult = await checkClient.query(`INSERT INTO "agent_items" ("id", "sessionId", "turnId", "stepId", "taskId", "type", "status", "phase", "revision", "content", "startedAt", "completedAt", "updatedAt")
+          VALUES ($1, $2, $3, $4, $5, 'tool_result', 'completed', NULL, 1, $6::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, [
+          differentDigestResultId, ids.sessionId, ids.turnId, canonicalDuplicateStepId, ids.waiterTaskId, JSON.stringify(canonicalDuplicateResultContent),
+        ])
+        expect(extraDigestResult.rowCount).toBe(1)
+        await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, secondClaimProjection, validProofsBeforeSql),
+          "final SQL rejects a same-wait candidate with multiple result rows").resolves.toBe(false)
+        await checkClient.query("ROLLBACK TO SAVEPOINT different_digest_multiple_results")
+        await checkClient.query("RELEASE SAVEPOINT different_digest_multiple_results")
+        await checkClient.query("SAVEPOINT different_digest_unknown_wait")
+        const unknownWaitResult = await checkClient.query(`UPDATE "agent_items" SET "content" = jsonb_set("content", '{output,waitId}', to_jsonb($2::text), false)
+          WHERE "id" = $1 AND "sessionId" = $3 AND "turnId" = $4 AND "taskId" = $5`, [
+          canonicalDuplicateResultItemId, `fixture-unknown-wait:${suffix}`, ids.sessionId, ids.turnId, ids.waiterTaskId,
+        ])
+        expect(unknownWaitResult.rowCount).toBe(1)
+        await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, secondClaimProjection, validProofsBeforeSql),
+          "final SQL rejects a different-digest wait call whose result has unknown ownership").resolves.toBe(false)
+        await checkClient.query("ROLLBACK TO SAVEPOINT different_digest_unknown_wait")
+        await checkClient.query("RELEASE SAVEPOINT different_digest_unknown_wait")
+        await checkClient.query("SAVEPOINT different_digest_missing_result")
+        const missingWaitResult = await checkClient.query(`DELETE FROM "agent_items" WHERE "id" = $1 AND "sessionId" = $2 AND "turnId" = $3 AND "taskId" = $4`, [
+          canonicalDuplicateResultItemId, ids.sessionId, ids.turnId, ids.waiterTaskId,
+        ])
+        expect(missingWaitResult.rowCount).toBe(1)
+        await expect(historicalWaitBindingAccepts(checkClient, scopedOwner, secondClaimProjection, validProofsBeforeSql),
+          "final SQL rejects a different-digest wait call with no result item").resolves.toBe(false)
+        await checkClient.query("ROLLBACK TO SAVEPOINT different_digest_missing_result")
+        await checkClient.query("RELEASE SAVEPOINT different_digest_missing_result")
         await expect(hasBlockingExternalCall(checkClient, scopedOwner, undefined, secondClaimStepId)).resolves.toBe(true)
         await checkClient.query("ROLLBACK TO SAVEPOINT canonical_duplicate_claim")
         await checkClient.query("RELEASE SAVEPOINT canonical_duplicate_claim")
