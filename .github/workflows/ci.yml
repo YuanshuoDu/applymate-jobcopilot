@@ -308,6 +308,18 @@ jobs:
           sudo chown -R "$TEST_UID:$TEST_GID" "$TEST_ROOT"
           sudo chmod 700 "$TEST_ROOT" "$TEST_HOME" "$TEST_TMPDIR" "$PROFILE_DIR" "$TLS_DIR"
           sudo install -d -o "$TEST_UID" -g "$TEST_GID" -m 700 "$TEST_HOME/.pki" "$NSS_DIR"
+          echo "NSS diagnostic: starting dedicated-user path/access probe"
+          sudo -u "$TEST_USER" -- env PATH="$PATH" HOME="$TEST_HOME" NSS_DIR="$NSS_DIR" sh -eu -c '
+            id
+            printf "HOME=%s\nNSS_DIR=%s\n" "$HOME" "$NSS_DIR"
+            namei -l "$NSS_DIR"
+            test -r "$NSS_DIR"
+            test -w "$NSS_DIR"
+            test -x "$NSS_DIR"
+            probe_path="$(mktemp "$NSS_DIR/.applymate-nss-probe.XXXXXX")"
+            rm -- "$probe_path"
+            echo "NSS diagnostic: dedicated-user path/access probe passed"
+          '
           echo "NSS diagnostic: starting certutil -N database initialization"
           sudo -u "$TEST_USER" -- env PATH="$PATH" HOME="$TEST_HOME" \
             certutil -d "sql:$NSS_DIR" -N --empty-password
