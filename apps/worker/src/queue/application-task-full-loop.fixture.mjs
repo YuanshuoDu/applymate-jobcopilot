@@ -21,7 +21,6 @@ function listen(server, ...args) {
     server.listen(...args, () => { server.off("error", reject); resolve() })
   })
 }
-
 async function startSite() {
   if (!SOCKET) throw new Error("APPLICATION_TASK_FULL_LOOP_SOCKET_PATH_required")
   await unlink(SOCKET).catch(() => undefined)
@@ -38,19 +37,22 @@ async function startSite() {
     requests.push(`${request.method ?? "GET"} ${requestUrl.pathname}`)
     if (requests.length > 20) requests.shift()
     if (request.method === "POST" && requestUrl.pathname === "/__trace") {
-      const event = requestUrl.searchParams.get("event")
-      const field = requestUrl.searchParams.get("field")
-      const elapsedValue = requestUrl.searchParams.get("elapsedMs")
-      const lengthValue = requestUrl.searchParams.get("length")
-      const elapsedMs = elapsedValue === null ? Number.NaN : Number(elapsedValue)
-      const length = lengthValue === null ? Number.NaN : Number(lengthValue)
-      if (event === "dom_ready") {
-        browserTrace.push("dom_ready")
-        if (Number.isFinite(elapsedMs) && elapsedMs >= 0) browserProgress.push({ event, elapsedMs })
-      } else if (event === "input" && ["first_name", "last_name", "email", "work_authorization"].includes(field)) {
-        browserTrace.push(`input:${field}`)
-        if (Number.isFinite(elapsedMs) && elapsedMs >= 0 && Number.isSafeInteger(length) && length >= 0) {
-          browserProgress.push({ event: `input:${field}`, elapsedMs, length })
+      const batch = requestUrl.searchParams.get("batch")
+      let traces = [Object.fromEntries(requestUrl.searchParams)]
+      try { if (batch) traces = JSON.parse(batch) } catch { traces = [] }
+      for (const trace of Array.isArray(traces) ? traces : []) {
+        if (!trace || typeof trace !== "object") continue
+        const { event, field } = trace
+        const elapsedMs = Number(trace.elapsedMs)
+        const length = Number(trace.length)
+        if (event === "dom_ready") {
+          browserTrace.push("dom_ready")
+          if (Number.isFinite(elapsedMs) && elapsedMs >= 0) browserProgress.push({ event, elapsedMs })
+        } else if (event === "input" && ["first_name", "last_name", "email", "work_authorization"].includes(field)) {
+          browserTrace.push(`input:${field}`)
+          if (Number.isFinite(elapsedMs) && elapsedMs >= 0 && Number.isSafeInteger(length) && length >= 0) {
+            browserProgress.push({ event: `input:${field}`, elapsedMs, length })
+          }
         }
       }
       if (browserTrace.length > 20) browserTrace.shift()
@@ -68,12 +70,13 @@ async function startSite() {
         <input id="work_authorization" name="work_authorization" required>
         <button id="submit-app" type="submit">Submit application</button></form>
         <script>
+          const traces = new Map();
+          window.addEventListener('pagehide', () => { if (traces.size) fetch('/__trace?batch=' + encodeURIComponent(JSON.stringify([...traces.values()])), { method: 'POST', keepalive: true }).catch(() => {}); });
           document.addEventListener('DOMContentLoaded', () => {
             fetch('/__trace?event=dom_ready&elapsedMs=' + Math.round(performance.now()), { method: 'POST', keepalive: true }).catch(() => {});
           });
           document.querySelectorAll('input').forEach(field => field.addEventListener('input', () => {
-            const trace = new URLSearchParams({ event: 'input', field: field.name, elapsedMs: String(Math.round(performance.now())), length: String(field.value.length) });
-            fetch('/__trace?' + trace.toString(), { method: 'POST', keepalive: true }).catch(() => {});
+            traces.set(field.name, { event: 'input', field: field.name, elapsedMs: Math.round(performance.now()), length: field.value.length });
           }));
         </script>`)
       return
