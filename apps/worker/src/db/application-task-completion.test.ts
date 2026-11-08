@@ -39,7 +39,7 @@ async function approvalFixture(
   const row = {
     id: `application-fill:${task.id}:turn-a`, userId: "user-a", sessionId: "session-a", turnId: "turn-a", jobId: task.jobId,
     type: "submit_application", taskId: "filler-task", status, toolCallId: `application-submit:${task.id}`,
-    payload: artifact.payload, resourceHash: artifact.hash, materialHash: artifact.materialHash, answersHash: artifact.answersHash,
+    payload: artifact.payload, resourceHash: artifact.hash.slice("sha256:".length), materialHash: artifact.materialHash, answersHash: artifact.answersHash,
     nonceHash: "sha256:fixture-nonce-hash", revision, expiresAt: new Date("2099-11-01T00:00:00.000Z"), scopeHash: "",
   }
   if (mismatch === "turn") row.turnId = "foreign-turn"
@@ -154,7 +154,12 @@ describe("ApplicationTask fill completion", () => {
     expect(test.pool.connect).toHaveBeenCalledOnce()
     expect(test.calls.filter(call => call.sql === "BEGIN")).toHaveLength(1)
     expect(test.calls.some(call => call.sql.includes("ON CONFLICT DO NOTHING RETURNING"))).toBe(true)
-    expect(test.calls.some(call => call.sql.includes('INSERT INTO "agent_approvals"') && call.values?.[4] === "turn-a")).toBe(true)
+    const approvalInsert = test.calls.find(call => call.sql.includes('INSERT INTO "agent_approvals"'))
+    const artifactInsert = test.calls.find(call => call.sql.includes('INSERT INTO "agent_artifact"'))
+    expect(approvalInsert?.values?.[4]).toBe("turn-a")
+    expect(approvalInsert?.values?.[12]).toMatch(/^[a-f0-9]{64}$/)
+    expect(approvalInsert?.values?.[12]).toBe(String(artifactInsert?.values?.[4]).slice("sha256:".length))
+    expect(artifactInsert?.values?.[4]).toMatch(/^sha256:[a-f0-9]{64}$/)
     expect(test.calls.some(call => call.sql.includes('INSERT INTO "application_task_events"') && call.sql.includes("'form_filled'") && call.values?.[1] === "application-a")).toBe(true)
     expect(test.calls.some(call => call.sql.includes('FROM "application_tasks"') && call.values?.slice(0, 3).join(",") === "turn-a,session-a,user-a")).toBe(true)
     expect(test.calls.some(call => call.sql.includes('UPDATE "agent_sessions" SET "status" = \'waiting_for_user\''))).toBe(true)

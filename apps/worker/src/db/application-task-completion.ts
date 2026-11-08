@@ -101,6 +101,8 @@ function exactSubmissionPayload(value: unknown, expected: ReturnType<typeof subm
 
 function date(value: Date | string | null): Date | undefined { if (!value) return undefined; const parsed = value instanceof Date ? value : new Date(value); return Number.isFinite(parsed.getTime()) ? parsed : undefined }
 
+function approvalResourceHash(value: string): string | undefined { return /^sha256:([a-f0-9]{64})$/.exec(value)?.[1] }
+
 async function existingCompletion(client: Client, lease: SubagentLease, task: ApplicationRow, turn: TurnRow, approvedOnly = false): Promise<boolean> {
   const payload = submissionPayload(task), turnId = lease.turnId
   if (!turnId) return false
@@ -120,17 +122,19 @@ async function existingCompletion(client: Client, lease: SubagentLease, task: Ap
     || artifact.baseHash !== artifactHash || artifact.hash !== artifactHash || artifact.constraintHash !== hashArtifactContent({ applicationTaskId: task.id, jobId: task.jobId })
     || !refsMatch(artifact.provenanceRefs) || !refsMatch(artifact.evidenceRefs) || artifact.previousHash !== null || artifact.version !== 1
     || contentHash !== artifactHash) return false
+  const resourceHash = approvalResourceHash(artifactHash)
+  if (!resourceHash) return false
   const found = await client.query<ExistingApprovalRow>(`SELECT "id", "userId", "sessionId", "turnId", "jobId", "type", "taskId", "status", "toolCallId", "payload", "resourceHash", "materialHash", "answersHash", "scopeHash", "nonceHash", "revision", "expiresAt" FROM "agent_approvals" WHERE "id" = $1 AND "userId" = $2 AND "status" IN ('pending', 'approved')`, [`application-fill:${task.id}:${turnId}`, lease.userId])
   const approval = found.rows[0], expiresAt = approval && date(approval.expiresAt)
   if (found.rows.length !== 1 || !approval || !expiresAt || !approval.nonceHash || !approval.scopeHash
     || !["pending", "approved"].includes(approval.status) || (approvedOnly && approval.status !== "approved")
     || approval.userId !== lease.userId || approval.sessionId !== lease.sessionId || approval.turnId !== turnId
     || approval.jobId !== task.jobId || approval.taskId !== lease.id || approval.type !== "submit_application"
-    || approval.toolCallId !== `application-submit:${task.id}` || approval.resourceHash !== artifactHash
+    || approval.toolCallId !== `application-submit:${task.id}` || approval.resourceHash !== resourceHash
     || approval.materialHash !== materialHash || approval.answersHash !== answersHash || !exactSubmissionPayload(approval.payload, payload)
     || !Number.isSafeInteger(approval.revision) || approval.revision + 1 !== turn.revision) return false
   const scope: ApprovalScopeInput = { userId: approval.userId, sessionId: approval.sessionId, turnId, jobId: task.jobId,
-    toolCallId: `application-submit:${task.id}`, action: "submit_application", resourceHash: artifactHash, materialHash, answersHash, revision: approval.revision, expiresAt }
+    toolCallId: `application-submit:${task.id}`, action: "submit_application", resourceHash, materialHash, answersHash, revision: approval.revision, expiresAt }
   return await hashApprovalScope(protocolScope(scope, approval.nonceHash)) === approval.scopeHash
 }
 
@@ -153,9 +157,11 @@ export async function completeApplicationFillForReview(pool: Pool, input: { read
       VALUES ($1, $2, 'form_filled', 'worker', $3, $4::jsonb, $5)`, [randomUUID(), task.id, "Form filled without submission; final user authorization requested.", JSON.stringify({ turnId: lease.turnId }), now])
     const answersHash = await hashAgentReceiptValue("answers", task.confirmedAnswers ?? null)
     const artifact = await ensureSubmissionArtifactWithClient(client, { applicationTaskId: task.id, userId: lease.userId, jobId: task.jobId, resumeId: task.resumeId, coverLetterId: task.coverLetterId, answersHash })
+    const resourceHash = approvalResourceHash(artifact.hash)
+    if (!resourceHash) throw new Error("Application submission artifact hash is invalid")
     const payload = submissionPayload(task)
     const approvalInput: IssueApprovalReceiptInput = { approvalId: `application-fill:${task.id}:${turnId}`, taskId: lease.id,
-      scope: { userId: lease.userId, sessionId: lease.sessionId, turnId, jobId: task.jobId, toolCallId: `application-submit:${task.id}`, action: "submit_application", resourceHash: artifact.hash,
+      scope: { userId: lease.userId, sessionId: lease.sessionId, turnId, jobId: task.jobId, toolCallId: `application-submit:${task.id}`, action: "submit_application", resourceHash,
         materialHash: await hashAgentReceiptValue("material", payload), answersHash, revision: turn.revision, expiresAt: new Date(now.getTime() + 15 * 60 * 1000) },
       title: COMPLETION_TITLE, body: COMPLETION_BODY, impact: { externalSubmission: true, jobId: task.jobId }, payload, nonce: createApprovalNonce() }
     const receipt = await createPgApprovalStore(pool, { userId: lease.userId }).issueInTransaction(client, approvalInput)
