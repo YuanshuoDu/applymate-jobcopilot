@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 import {
   childWaitContinuationKeyMatchesSafeProjection,
   CHILD_WAIT_CLAIM_KEY_COLUMNS_SQL,
+  CHILD_WAIT_CLAIM_RECOVERY_SQL,
   CHILD_WAIT_CALL_ITEM_COMPLETED_NO_EVENT_SQL, CHILD_WAIT_CALL_LIFECYCLE_SQL, CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL,
   CHILD_WAIT_SOURCE_PROJECTED_COMPLETION_SQL, isCanonicalChildWaitOutcome,
 } from "./pg-store-expiry-child-wait-claim-call-proof.js"
@@ -50,6 +51,12 @@ describe("claim terminal settlement event descendants", () => {
   it("keeps the exported diagnostic components in the production SQL assembly", () => {
     expect(CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL).toContain(CHILD_WAIT_SOURCE_PROJECTED_COMPLETION_SQL)
     expect(CHILD_WAIT_CALL_LIFECYCLE_SQL).toContain(CHILD_WAIT_CALL_ITEM_COMPLETED_NO_EVENT_SQL)
+  })
+
+  it("requires exact source wait terminal history before accepting a continuation claim", () => {
+    const sql = CHILD_WAIT_CLAIM_RECOVERY_SQL.replace(/\s+/g, " ")
+    expect(sql).toContain('started."itemId" = sourceCall."id"')
+    expect(sql).toContain(CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL.replace(/\s+/g, " "))
   })
 
   it("accepts legacy projection arrays and reads projections and collision proofs from the new envelope", () => {
