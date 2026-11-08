@@ -5,6 +5,7 @@ import { readFile } from "node:fs/promises"
 import { unlink } from "node:fs/promises"
 import { Pool } from "pg"
 import { HOST, fixtureModel, required, safeBlockedTarget } from "./application-task-full-loop.fixture-support.mjs"
+import { traceApplicationFillExecutor } from "./application-task-full-loop.trace-support.mjs"
 
 const [, , mode] = process.argv
 const SOCKET = process.env.APPLICATION_TASK_FULL_LOOP_SOCKET_PATH
@@ -182,8 +183,8 @@ async function startWorker() {
   })
   await startProductionWorkerRuntime({ pool, workerId: `application-full-loop-${process.pid}`, productionFlags: flags,
     onBootstrapReady: value => { bootstrap = value }, startAgentRunWorker() {} }, {
-    createOptionalProductionChildExecutor: options => options.enabled
-      ? createOptionalProductionChildExecutor({ ...options, authorizeUsage }) : undefined,
+    createOptionalProductionChildExecutor: options => traceApplicationFillExecutor(options.enabled
+      ? createOptionalProductionChildExecutor({ ...options, authorizeUsage }) : undefined),
     createCanonicalTurnRuntime: (runtimePool, productionOptions) => createCanonicalTurnRuntime(runtimePool, {
       ...productionOptions, ...taskGraphTemplatesModule.taskGraphRuntimeOptions(taskGraphCommandPort),
       modelRuntimeFactory: () => fixtureModel(), authorizeUsage,

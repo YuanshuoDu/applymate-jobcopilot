@@ -116,6 +116,19 @@ type FixtureStats = {
   browserTrace: string[]
   browserProgress: Array<{ event: string; elapsedMs: number; length?: number }>
 }
+type ApplicationFillExecutorTrace = {
+  attemptCount: number | null
+  elapsedMs: number
+  returned: boolean
+  threw: boolean
+  statusCompleted: boolean
+  statusWaiting: boolean
+  statusWaitingForUser: boolean
+  statusFailed: boolean
+  failureReasonLeaseLost: boolean
+  leaseSignalAbortedAtStart: boolean
+  leaseSignalAbortedAtEnd: boolean
+}
 type ApplicationTaskRow = {
   id: string; userId: string; jobId: string; sessionId: string | null; fillTurnId: string | null
   status: string; checkpoint: string | null; question: unknown; confirmedAnswers: unknown
@@ -215,6 +228,46 @@ function fixtureStatsSummary(stats: FixtureStats) {
     browserTrace: stats.browserTrace,
     browserProgress: stats.browserProgress,
   }
+}
+
+function applicationFillExecutorTraces(child: Child | undefined): Array<ApplicationFillExecutorTrace | { traceInvalid: true }> {
+  const prefix = "APPLICATION_FILL_EXEC_TRACE "
+  const traces: Array<ApplicationFillExecutorTrace | { traceInvalid: true }> = []
+  for (const line of child?.lines ?? []) {
+    if (!line.startsWith(prefix)) continue
+    try {
+      const row = jsonRecord(JSON.parse(line.slice(prefix.length)))
+      if (!row) {
+        traces.push({ traceInvalid: true })
+        continue
+      }
+      const attemptCount = row.attemptCount
+      const elapsedMs = row.elapsedMs
+      const booleans = [row.returned, row.threw, row.statusCompleted, row.statusWaiting, row.statusWaitingForUser,
+        row.statusFailed, row.failureReasonLeaseLost, row.leaseSignalAbortedAtStart, row.leaseSignalAbortedAtEnd]
+      if (!(attemptCount === null || typeof attemptCount === "number" && Number.isSafeInteger(attemptCount) && attemptCount >= 1)
+        || typeof elapsedMs !== "number" || !Number.isSafeInteger(elapsedMs) || elapsedMs < 0
+        || booleans.some(value => typeof value !== "boolean")) {
+        traces.push({ traceInvalid: true })
+        continue
+      }
+      traces.push({
+        attemptCount, elapsedMs,
+        returned: row.returned === true,
+        threw: row.threw === true,
+        statusCompleted: row.statusCompleted === true,
+        statusWaiting: row.statusWaiting === true,
+        statusWaitingForUser: row.statusWaitingForUser === true,
+        statusFailed: row.statusFailed === true,
+        failureReasonLeaseLost: row.failureReasonLeaseLost === true,
+        leaseSignalAbortedAtStart: row.leaseSignalAbortedAtStart === true,
+        leaseSignalAbortedAtEnd: row.leaseSignalAbortedAtEnd === true,
+      })
+    } catch {
+      traces.push({ traceInvalid: true })
+    }
+  }
+  return traces.slice(-12)
 }
 
 async function waitLine(child: Child, expected: string, timeoutMs = 30_000): Promise<string> {
@@ -430,6 +483,7 @@ async function taskRuntimeDiagnostics(task: ApplicationTaskRow | null) {
     sessionTurnIds: sessionTurns.map(turnRow => turnRow.id), sessionSubagentTaskIds: sessionSubagents.map(taskRow => taskRow.id),
     recentEvents: recentEvents.map(event => ({ ...event, sequence: event.sequence.toString() })),
     fixtureStats,
+    applicationFillExecutorTraces: applicationFillExecutorTraces(worker),
     workerExited: worker ? exited(worker) : null,
     workerLineCount: worker?.lines.length ?? 0, workerErrorCount: worker?.errors.length ?? 0,
   }
@@ -686,6 +740,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
           snapshot = {
             dbConnected,
             fixtureStats: await requestFixtureStats().then(fixtureStatsSummary).catch(() => ({ errorPresent: true })),
+            applicationFillExecutorTraces: applicationFillExecutorTraces(worker),
             workerExited: worker ? exited(worker) : null,
             worker: worker ? childSummary(worker) : null,
             site: site ? childSummary(site) : null,
