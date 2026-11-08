@@ -3966,6 +3966,28 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       await queue.pause()
       workerC = launchWorker("worker-b-crash-resume", queueName, ids)
       await waitForMarker(workerC, "WORKER_B_RECOVERED")
+      const recoveryProgress = workerC.stdoutText.split(/\r?\n/)
+        .filter(line => line.startsWith("WORKER_B_RECOVERY_PROGRESS "))
+        .map(line => JSON.parse(line.slice("WORKER_B_RECOVERY_PROGRESS ".length)) as Record<string, unknown>)
+      const progressKeys = new Set(["ordinal", "stage", "phase", "pageOrdinal", "candidateOrdinal", "elapsedMs", "rowCount", "target"])
+      const progressStages = new Set(["recovery_page_select", "recovery_candidate", "candidate_session_lock", "candidate_turn_lock", "candidate_expiry_preview"])
+      expect(recoveryProgress.length).toBeGreaterThan(0)
+      expect(recoveryProgress.length).toBeLessThanOrEqual(784)
+      expect(recoveryProgress.every((record, index) => Object.keys(record).every(key => progressKeys.has(key))
+        && record.ordinal === index + 1 && progressStages.has(String(record.stage))
+        && ["start", "done", "fail"].includes(String(record.phase))
+        && Number.isSafeInteger(record.elapsedMs) && Number(record.elapsedMs) >= 0 && Number(record.elapsedMs) <= 86_400_000
+        && Number.isSafeInteger(record.rowCount) && Number(record.rowCount) >= 0 && Number(record.rowCount) <= 50
+        && (record.pageOrdinal === undefined || Number.isSafeInteger(record.pageOrdinal))
+        && (record.candidateOrdinal === undefined || Number.isSafeInteger(record.candidateOrdinal))
+        && (record.target === undefined || record.target === true)
+        && !JSON.stringify(record).includes(ids.waiterTaskId))).toBe(true)
+      expect(recoveryProgress).toEqual(expect.arrayContaining([
+        expect.objectContaining({ stage: "recovery_page_select", phase: "done", target: true }),
+        expect.objectContaining({ stage: "candidate_session_lock", phase: "done", target: true }),
+        expect.objectContaining({ stage: "candidate_turn_lock", phase: "done", target: true }),
+        expect.objectContaining({ stage: "candidate_expiry_preview", phase: "done", target: true }),
+      ]))
       const recoveryDiagnostic = workerC.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_RECOVERY_DIAGNOSTIC "))
       const predicateTrace = workerC.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_RECOVERY_PREDICATE_TRACE "))
       expect(workerC.stdoutText, `Worker C missed the waiter; ${recoveryDiagnostic ?? "diagnostic missing"}; ${predicateTrace ?? "predicate trace missing"}`)
@@ -6150,10 +6172,12 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
 
         await checkClient.query("SAVEPOINT wrong_wait_binding")
         const rewritten = await checkClient.query<{ content: Record<string, unknown> }>(`UPDATE "agent_items" AS claim
-          SET "content" = jsonb_set(claim."content", '{input,idempotencyKey}', source."content"->'input'->'idempotencyKey')
-          FROM "agent_items" AS source WHERE claim."id" = $1 AND claim."sessionId" = $3 AND claim."turnId" = $4 AND claim."taskId" = $5
-            AND source."id" = $2 AND source."sessionId" = claim."sessionId" AND source."turnId" = claim."turnId" AND source."taskId" = claim."taskId"
-          RETURNING claim."content"`, [secondClaimItemId, firstClaimItem!.id, ids.sessionId, ids.turnId, ids.waiterTaskId])
+          SET "content" = jsonb_set(claim."content", '{input,idempotencyKey}', to_jsonb(source."idempotencyKey"))
+          FROM "agent_wait_conditions" AS source WHERE claim."id" = $1 AND claim."sessionId" = $3 AND claim."turnId" = $4 AND claim."taskId" = $5
+            AND source."id" = $2 AND source."sessionId" = claim."sessionId" AND source."turnId" = claim."turnId"
+            AND source."parentTaskId" = claim."taskId" AND source."userId" = $6
+            AND source."idempotencyKey" IS DISTINCT FROM (claim."content"->'input'->>'idempotencyKey')
+          RETURNING claim."content"`, [secondClaimItemId, firstWait.rows[0]!.id, ids.sessionId, ids.turnId, ids.waiterTaskId, ids.userId])
         expect(rewritten.rows).toHaveLength(1)
         const rewrittenContent = asObject(rewritten.rows[0]!.content), rewrittenCallId = rewrittenContent.toolCallId
         if (typeof rewrittenCallId !== "string") throw new Error("two_historical_wait_tampered_claim_id_missing")

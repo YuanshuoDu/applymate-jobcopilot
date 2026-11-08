@@ -261,7 +261,137 @@ const sourceLifecycleCrashStages = new Set([
   "after-provenance-update",
   "after-consumed-update",
 ])
-const pool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 6 })
+function poolWithRecoveryProgress(basePool, targetTaskId) {
+  const maxProgressRecords = 768, maxTargetProgressRecords = 16, maxPageOrdinal = 64, maxCandidateOrdinal = 64
+  let progressOrdinal = 0, targetProgressRecords = 0, pageOrdinal = 0, candidateOrdinal = 0, pendingTargetCandidates = []
+  const emit = (stage, phase, fields = {}, isTarget = false) => {
+    if (progressOrdinal >= maxProgressRecords && (!isTarget || targetProgressRecords >= maxTargetProgressRecords)) return
+    progressOrdinal += 1
+    if (isTarget) targetProgressRecords += 1
+    say(`WORKER_B_RECOVERY_PROGRESS ${JSON.stringify({ ordinal: progressOrdinal, stage, phase, ...fields })}`)
+  }
+  const rowCount = result => Math.min(50, Array.isArray(result.rows) ? result.rows.length : 0)
+  const elapsedMs = startedAt => Math.min(86_400_000, Math.max(0, Date.now() - startedAt))
+  const observe = async (stage, fields, isTarget, run) => {
+    const startedAt = Date.now()
+    emit(stage, "start", { ...fields, elapsedMs: 0, rowCount: 0, ...(isTarget ? { target: true } : {}) }, isTarget)
+    try {
+      const result = await run()
+      emit(stage, "done", { ...fields, elapsedMs: elapsedMs(startedAt), rowCount: rowCount(result), ...(isTarget ? { target: true } : {}) }, isTarget)
+      return result
+    } catch (error) {
+      emit(stage, "fail", { ...fields, elapsedMs: elapsedMs(startedAt), rowCount: 0, ...(isTarget ? { target: true } : {}) }, isTarget)
+      throw error
+    }
+  }
+  const recoveryPageQuery = statement => statement.startsWith('SELECT task."id", task."sessionId", task."rootTaskId", task."turnId", session."userId"')
+    && statement.includes('task."leaseExpiresAt" <= $1') && statement.includes("LIMIT $8")
+  const candidateStage = (statement, candidate) => {
+    if (!candidate) return undefined
+    if (candidate.nextStage === "session" && statement.startsWith('SELECT "id", "userId", "status" FROM "agent_sessions"')
+      && statement.includes("FOR UPDATE")) {
+      candidate.nextStage = "turn"
+      return "candidate_session_lock"
+    }
+    if (candidate.nextStage === "turn" && statement.startsWith('SELECT "id" FROM "agent_turns"') && statement.includes("FOR UPDATE")) {
+      candidate.nextStage = "preview"
+      return "candidate_turn_lock"
+    }
+    if (candidate.nextStage === "preview" && statement.startsWith('SELECT task.*, session."userId" AS "userId"')
+      && statement.includes('task."leaseExpiresAt" <= clock_timestamp()')) {
+      candidate.nextStage = "done"
+      return "candidate_expiry_preview"
+    }
+    return undefined
+  }
+  const wrapClient = client => {
+    let currentCandidate
+    return new Proxy(client, { get(target, property) {
+      if (property === "query") return async (...args) => {
+        const statement = typeof args[0] === "string" ? args[0].replace(/\s+/g, " ").trim() : ""
+        if (recoveryPageQuery(statement)) {
+          const page = ++pageOrdinal, startedAt = Date.now()
+          if (page <= maxPageOrdinal) emit("recovery_page_select", "start", { pageOrdinal: page, elapsedMs: 0, rowCount: 0 })
+          try {
+            const result = await target.query(...args)
+            pendingTargetCandidates = result.rows.map(row => row.id === targetTaskId)
+            const targetSeen = pendingTargetCandidates.includes(true)
+            if (page <= maxPageOrdinal || targetSeen) emit("recovery_page_select", "done", {
+              pageOrdinal: page, elapsedMs: elapsedMs(startedAt), rowCount: rowCount(result), ...(targetSeen ? { target: true } : {}),
+            }, targetSeen)
+            return result
+          } catch (error) {
+            if (page <= maxPageOrdinal) emit("recovery_page_select", "fail", { pageOrdinal: page, elapsedMs: elapsedMs(startedAt), rowCount: 0 })
+            throw error
+          }
+        }
+        if (statement === "SAVEPOINT subagent_expiry_recovery_candidate") {
+          candidateOrdinal += 1
+          currentCandidate = { ordinal: candidateOrdinal, target: pendingTargetCandidates.shift() === true, startedAt: Date.now(), nextStage: "session" }
+          if (candidateOrdinal <= maxCandidateOrdinal || currentCandidate.target) emit("recovery_candidate", "start", {
+            candidateOrdinal, elapsedMs: 0, rowCount: 0, ...(currentCandidate.target ? { target: true } : {}),
+          }, currentCandidate.target)
+          try { return await target.query(...args) } catch (error) {
+            if (candidateOrdinal <= maxCandidateOrdinal || currentCandidate.target) emit("recovery_candidate", "fail", {
+              candidateOrdinal, elapsedMs: elapsedMs(currentCandidate.startedAt), rowCount: 0,
+              ...(currentCandidate.target ? { target: true } : {}),
+            }, currentCandidate.target)
+            currentCandidate = undefined
+            throw error
+          }
+        }
+        const stage = candidateStage(statement, currentCandidate)
+        if (stage) {
+          const candidate = currentCandidate, visible = candidate.ordinal <= maxCandidateOrdinal || candidate.target
+          try {
+            return visible
+              ? await observe(stage, { candidateOrdinal: candidate.ordinal }, candidate.target, () => target.query(...args))
+              : await target.query(...args)
+          } catch (error) {
+            if (visible) emit("recovery_candidate", "fail", {
+              candidateOrdinal: candidate.ordinal, elapsedMs: elapsedMs(candidate.startedAt), rowCount: 0,
+              ...(candidate.target ? { target: true } : {}),
+            }, candidate.target)
+            currentCandidate = undefined
+            throw error
+          }
+        }
+        try {
+          const result = await target.query(...args)
+          if (statement === "RELEASE SAVEPOINT subagent_expiry_recovery_candidate" && currentCandidate) {
+            const candidate = currentCandidate
+            if (candidate.ordinal <= maxCandidateOrdinal || candidate.target) emit("recovery_candidate", "done", {
+              candidateOrdinal: candidate.ordinal, elapsedMs: elapsedMs(candidate.startedAt), rowCount: 0,
+              ...(candidate.target ? { target: true } : {}),
+            }, candidate.target)
+            currentCandidate = undefined
+          }
+          return result
+        } catch (error) {
+          if (currentCandidate && (currentCandidate.ordinal <= maxCandidateOrdinal || currentCandidate.target)) emit("recovery_candidate", "fail", {
+            candidateOrdinal: currentCandidate.ordinal, elapsedMs: elapsedMs(currentCandidate.startedAt), rowCount: 0,
+            ...(currentCandidate.target ? { target: true } : {}),
+          }, currentCandidate.target)
+          currentCandidate = undefined
+          throw error
+        }
+      }
+      const member = Reflect.get(target, property, target)
+      return typeof member === "function" ? member.bind(target) : member
+    } })
+  }
+  return new Proxy(basePool, { get(target, property) {
+    if (property === "connect") return async (...args) => wrapClient(await target.connect(...args))
+    const member = Reflect.get(target, property, target)
+    return typeof member === "function" ? member.bind(target) : member
+  } })
+}
+
+const recoveryTraceTaskId = process.env.NODE_ENV === "test" && mode === "worker-b-crash-resume"
+  && process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID === ids.waiterTaskId
+  ? process.env.AGENT_RUNTIME_PG_TEST_RECOVERY_TRACE_TASK_ID : undefined
+const basePool = new Pool({ connectionString: process.env.AGENT_RUNTIME_PG_TEST_URL, max: 6 })
+const pool = recoveryTraceTaskId ? poolWithRecoveryProgress(basePool, recoveryTraceTaskId) : basePool
 const redis = new Redis(process.env.AGENT_TURN_REDIS_TEST_URL, { maxRetriesPerRequest: null })
 const store = new PgSubagentTaskStore(pool, 30_000)
 const manager = new AgentTreeManager(store, { heartbeatMs: 2_000 })
