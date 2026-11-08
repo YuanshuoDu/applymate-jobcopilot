@@ -740,6 +740,26 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     const baselineEvents = await testDb.applicationTaskEvent.count({ where: { taskId: gateTaskId } })
     const baselineTurns = await testDb.agentTurn.count({ where: { sessionId: ids.session } })
     const queuesBeforeRejectedAnswers = await waitForStableOwnedQueueState()
+    const turnDispatchWhere = { aggregateId: ids.session, topic: "agent.turn.dispatch" }
+    const turnDispatchSnapshot = () => testDb.agentOutbox.findMany({
+      where: turnDispatchWhere,
+      orderBy: { createdAt: "asc" },
+      select: {
+        id: true, aggregateId: true, topic: true, idempotencyKey: true, payload: true,
+        publishedAt: true, attemptCount: true, lastError: true, createdAt: true,
+      },
+    })
+    const baselineTurnDispatches = await turnDispatchSnapshot()
+    expect(baselineTurnDispatches).toHaveLength(1)
+    expect(baselineTurnDispatches[0]).toMatchObject({
+      aggregateId: ids.session,
+      topic: "agent.turn.dispatch",
+      idempotencyKey: `turn-dispatch:${firstFillTurnId}`,
+      payload: { turnId: firstFillTurnId, sessionId: ids.session },
+      publishedAt: expect.any(Date),
+      attemptCount: expect.any(Number),
+      lastError: null,
+    })
     const taskBeforeRejectedAnswers = await testDb.applicationTask.findUnique({ where: { id: gateTaskId } })
     expect(taskBeforeRejectedAnswers).not.toBeNull()
     const stale = await answerApplicationTask(apiRequest(answerPath, ownerToken, "PATCH", {
@@ -748,15 +768,16 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(stale.status).toBe(409)
     expect(await testDb.applicationTask.findUnique({ where: { id: gateTaskId } })).toEqual(taskBeforeRejectedAnswers)
     expect(await ownedQueueStateSnapshot()).toEqual(queuesBeforeRejectedAnswers)
+    expect(await turnDispatchSnapshot()).toEqual(baselineTurnDispatches)
     const foreign = await answerApplicationTask(apiRequest(answerPath, foreignToken, "PATCH", {
       id: gateTaskId, action: "answer_and_resume", waitId: question.waitId, answers: { [field!.key!]: "Ireland" },
     }))
     expect([404, 409]).toContain(foreign.status)
     expect(await testDb.applicationTask.findUnique({ where: { id: gateTaskId } })).toEqual(taskBeforeRejectedAnswers)
     expect(await ownedQueueStateSnapshot()).toEqual(queuesBeforeRejectedAnswers)
+    expect(await turnDispatchSnapshot()).toEqual(baselineTurnDispatches)
     expect(await testDb.applicationTaskEvent.count({ where: { taskId: gateTaskId } })).toBe(baselineEvents)
     expect(await testDb.agentTurn.count({ where: { sessionId: ids.session } })).toBe(baselineTurns)
-    expect(await testDb.agentOutbox.count({ where: { aggregateId: ids.session, topic: "agent.turn.dispatch" } })).toBe(0)
     expect(await submitQueueJobs()).toHaveLength(0)
 
     const answerBody = { id: gateTaskId, action: "answer_and_resume", waitId: question.waitId, answers: { [field!.key!]: "Ireland" } }
