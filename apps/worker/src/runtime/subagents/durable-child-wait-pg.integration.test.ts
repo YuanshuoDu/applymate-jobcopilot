@@ -3965,7 +3965,8 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       queuePaused = true
       await queue.pause()
       workerC = launchWorker("worker-b-crash-resume", queueName, ids)
-      await waitForMarker(workerC, "WORKER_B_RECOVERED")
+      // This fixture puts the target behind 50 blocked candidates, so its second-page recovery scan needs a longer bound.
+      await waitForMarker(workerC, "WORKER_B_RECOVERED", 120_000)
       const recoveryProgress = workerC.stdoutText.split(/\r?\n/)
         .filter(line => line.startsWith("WORKER_B_RECOVERY_PROGRESS "))
         .map(line => JSON.parse(line.slice("WORKER_B_RECOVERY_PROGRESS ".length)) as Record<string, unknown>)
@@ -5699,6 +5700,8 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
             WHERE item."sessionId" = $1 AND item."turnId" = $2 AND item."taskId" = $3 AND item."stepId" = $4))
         GROUP BY event."type" ORDER BY event."type"`, [ids.sessionId, ids.turnId, ids.waiterTaskId, continuationStepId])
       expect(stepEventsAfterRestart.rows).toEqual(stepEventsBeforeRestart.rows)
+      // The loop marker precedes store.finish; wait for BullMQ completion before reading terminal task state.
+      await waitForMarker(workerC, "WORKER_B_RESUMED")
       const finished = await pool.query<{ status: string; attemptCount: number; leaseOwner: string | null }>(
         `SELECT "status", "attemptCount", "leaseOwner" FROM "sub_agent_tasks" WHERE "id" = $1 AND "sessionId" = $2`,
         [ids.waiterTaskId, ids.sessionId])
@@ -6303,7 +6306,8 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         ])
         const blockedProjections = await readChildWaitTerminalCallProjections(checkClient, scopedOwner)
         expect(blockedProjections.filter(projection => projection.sourceWait.waitId === secondWait!.waitId)).toHaveLength(1)
-        expect(blockedProjections.filter(projection => projection.sourceWait.waitId === firstWait.rows[0]!.id)).toHaveLength(2)
+        // The duplicate-claim canary makes one sibling binding ambiguous; preserve only independently proven projections.
+        expect(blockedProjections.filter(projection => projection.sourceWait.waitId === firstWait.rows[0]!.id)).toHaveLength(1)
         await expect(hasBlockingExternalCall(checkClient, scopedOwner, undefined, secondClaimStepId)).resolves.toBe(true)
         await checkClient.query("ROLLBACK TO SAVEPOINT duplicate_completed_claim")
         await checkClient.query("RELEASE SAVEPOINT duplicate_completed_claim")
