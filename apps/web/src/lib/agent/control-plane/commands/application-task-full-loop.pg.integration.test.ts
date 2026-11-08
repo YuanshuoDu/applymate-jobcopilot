@@ -240,6 +240,28 @@ async function jsonResponse(response: Response): Promise<Record<string, unknown>
   return value as Record<string, unknown>
 }
 
+async function answerResumeFailureCategory(response: Response): Promise<string> {
+  try {
+    const error = (await jsonResponse(response.clone())).error
+    if (typeof error !== "string") return "unclassified"
+    switch (error) {
+      case "Application fill materials are unavailable for this task": return "command_preflight_materials_unavailable"
+      case "Agent session is no longer waiting for user input": return "session_status_compare_and_set"
+      case "Application fill attempt was claimed by another request": return "application_task_claim_compare_and_set"
+      case "Application task is not ready to resume after persisted user answers": return "resume_task_not_ready"
+      case "Application task is not waiting for persisted form answers": return "resume_answers_not_ready"
+      case "The bound fill Turn has no durable form-answer wait": return "resume_wait_missing"
+      case "Persist form answers for this wait before resuming": return "resume_answer_event_missing"
+      case "The bound fill Turn is not durably waiting for user input": return "resume_turn_not_waiting"
+      case "The prior fill Turn still owns an active execution lease": return "resume_turn_lease_active"
+      case "The application filler must be durably waiting with no live browser lease": return "resume_filler_not_waiting"
+      default: return "unclassified"
+    }
+  } catch {
+    return "invalid_error_response"
+  }
+}
+
 async function waitForTask(predicate: (task: ApplicationTaskRow) => boolean, timeoutMs = 120_000): Promise<ApplicationTaskRow> {
   const until = Date.now() + timeoutMs
   while (Date.now() < until) {
@@ -788,7 +810,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
 
     const answerBody = { id: gateTaskId, action: "answer_and_resume", waitId: question.waitId, answers: { [field!.key!]: "Ireland" } }
     const answered = await answerApplicationTask(apiRequest(answerPath, ownerToken, "PATCH", answerBody))
-    expect(answered.status).toBe(200)
+    const answerFailureCategory = answered.status === 200 ? "none" : await answerResumeFailureCategory(answered)
+    expect(answered.status, `answer_resume_error_category=${answerFailureCategory}`).toBe(200)
     const answeredJson = await jsonResponse(answered)
     expect(answeredJson).toMatchObject({ resumed: true })
     const confirmedTask = await waitForTask(task => task.status === "filling" && task.checkpoint === "taskgraph_fill_queued" && task.fillTurnId !== firstFillTurnId)
