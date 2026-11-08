@@ -792,14 +792,14 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     const taskBeforeRejectedAnswers = await testDb.applicationTask.findUnique({ where: { id: gateTaskId } })
     expect(taskBeforeRejectedAnswers).not.toBeNull()
     const stale = await answerApplicationTask(apiRequest(answerPath, ownerToken, "PATCH", {
-      id: gateTaskId, action: "answer_and_resume", waitId: `${String(question.waitId)}-stale`, answers: { [field!.key!]: "Ireland" },
+      id: gateTaskId, action: "answer_and_resume", waitId: `${String(question.waitId)}-stale`, answers: { [field!.key!]: "Yes" },
     }))
     expect(stale.status).toBe(409)
     expect(await testDb.applicationTask.findUnique({ where: { id: gateTaskId } })).toEqual(taskBeforeRejectedAnswers)
     expect(await ownedQueueStateSnapshot()).toEqual(queuesBeforeRejectedAnswers)
     expect(await turnDispatchSnapshot()).toEqual(baselineTurnDispatches)
     const foreign = await answerApplicationTask(apiRequest(answerPath, foreignToken, "PATCH", {
-      id: gateTaskId, action: "answer_and_resume", waitId: question.waitId, answers: { [field!.key!]: "Ireland" },
+      id: gateTaskId, action: "answer_and_resume", waitId: question.waitId, answers: { [field!.key!]: "Yes" },
     }))
     expect([404, 409]).toContain(foreign.status)
     expect(await testDb.applicationTask.findUnique({ where: { id: gateTaskId } })).toEqual(taskBeforeRejectedAnswers)
@@ -809,7 +809,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(await testDb.agentTurn.count({ where: { sessionId: ids.session } })).toBe(baselineTurns)
     expect(await submitQueueJobs()).toHaveLength(0)
 
-    const answerBody = { id: gateTaskId, action: "answer_and_resume", waitId: question.waitId, answers: { [field!.key!]: "Ireland" } }
+    const answerBody = { id: gateTaskId, action: "answer_and_resume", waitId: question.waitId, answers: { [field!.key!]: "Yes" } }
     const answered = await answerApplicationTask(apiRequest(answerPath, ownerToken, "PATCH", answerBody))
     const answerFailureCategory = answered.status === 200 ? "none" : await answerResumeFailureCategory(answered)
     expect(answered.status, `answer_resume_error_category=${answerFailureCategory}`).toBe(200)
@@ -817,8 +817,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(answeredJson).toMatchObject({ resumed: true })
     const confirmedTask = await waitForTask(task => task.status === "filling" && task.checkpoint === "taskgraph_fill_queued" && task.fillTurnId !== firstFillTurnId)
     const successorTurnId = confirmedTask.fillTurnId!
-    expect(confirmedTask.confirmedAnswers).toMatchObject({ [field!.key!]: "Ireland" })
-    expect(JSON.stringify(await testDb.applicationTaskEvent.findMany({ where: { taskId: gateTaskId, type: "user_answers_confirmed" }, select: { data: true } }))).not.toContain("Ireland")
+    expect(confirmedTask.confirmedAnswers).toMatchObject({ [field!.key!]: "Yes" })
+    expect(JSON.stringify(await testDb.applicationTaskEvent.findMany({ where: { taskId: gateTaskId, type: "user_answers_confirmed" }, select: { data: true } }))).not.toContain("Yes")
     const duplicate = await answerApplicationTask(apiRequest(answerPath, ownerToken, "PATCH", answerBody))
     expect(duplicate.status).toBe(200)
     expect(await testDb.agentTurn.count({ where: { sessionId: ids.session, id: successorTurnId } })).toBe(1)
@@ -832,6 +832,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     const completedTask = await waitForTask(task => task.status === "waiting_for_authorization" && task.checkpoint === "form_filled", 180_000)
     expect(completedTask.id).toBe(gateTaskId)
     expect(completedTask.fillTurnId).toBe(successorTurnId)
+    expect((await requestFixtureStats()).browserTrace).toContain("input:first_name")
     expect((await requestFixtureStats()).browserTrace).toContain("input:work_authorization")
     expect(await testDb.agentApproval.count({ where: { userId: ids.user, sessionId: ids.session, turnId: successorTurnId,
       taskId: { not: null }, type: "submit_application", status: "pending" } })).toBe(1)

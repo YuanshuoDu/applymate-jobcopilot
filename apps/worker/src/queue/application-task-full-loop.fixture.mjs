@@ -48,7 +48,7 @@ async function startSite() {
         if (event === "dom_ready") {
           browserTrace.push("dom_ready")
           if (Number.isFinite(elapsedMs) && elapsedMs >= 0) browserProgress.push({ event, elapsedMs })
-        } else if (event === "input" && ["first_name", "last_name", "email", "work_authorization"].includes(field)) {
+        } else if (event === "input" && ["first_name", "work_authorization"].includes(field)) {
           browserTrace.push(`input:${field}`)
           if (Number.isFinite(elapsedMs) && elapsedMs >= 0 && Number.isSafeInteger(length) && length >= 0) {
             browserProgress.push({ event: `input:${field}`, elapsedMs, length })
@@ -64,8 +64,6 @@ async function startSite() {
       response.writeHead(200, { "content-type": "text/html; charset=utf-8" })
       response.end(`<!doctype html><title>Fixture Application</title><form method="post" action="/example/jobs/1">
         <label for="first_name">First name</label><input id="first_name" name="first_name" required>
-        <label for="last_name">Last name</label><input id="last_name" name="last_name" required>
-        <label for="email">Email</label><input id="email" name="email" type="email" required>
         <label for="work_authorization">Are you legally authorized to work in Ireland?</label>
         <input id="work_authorization" name="work_authorization" required>
         <button id="submit-app" type="submit">Submit application</button></form>
