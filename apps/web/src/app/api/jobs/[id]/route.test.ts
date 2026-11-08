@@ -87,12 +87,32 @@ describe('PATCH job description when originally empty', () => {
     expect(mocks.updateMany).not.toHaveBeenCalled()
   })
 
-  it('keeps the existing status transition and activity for ordinary PATCH requests', async () => {
-    mocks.update.mockResolvedValue({ id: 'job-1', status: 'applied' })
+  it('keeps an Applied Kanban transition tracking-only and records generic status activity', async () => {
+    mocks.findUnique.mockResolvedValue({ id: 'job-1', userId: 'user-1', company: 'Fixture', status: 'saved', appliedAt: null, workflowState: 'draft' })
+    mocks.update.mockResolvedValue({ id: 'job-1', status: 'applied', appliedAt: null, workflowState: 'draft' })
     const response = await PATCH(request({ status: 'applied', notes: 'Sent manually' }), context)
     expect(response.status).toBe(200)
-    expect(mocks.update).toHaveBeenCalledWith({ where: { id: 'job-1' }, data: { status: 'applied', notes: 'Sent manually', appliedAt: expect.any(Date), workflowState: 'submitted' } })
-    expect(mocks.activityCreate).toHaveBeenCalledOnce()
+    expect(await response.json()).toMatchObject({ status: 'applied', appliedAt: null, workflowState: 'draft' })
+    expect(mocks.update).toHaveBeenCalledWith({ where: { id: 'job-1' }, data: { status: 'applied', notes: 'Sent manually' } })
+    expect(mocks.activityCreate).toHaveBeenCalledWith({ data: { userId: 'user-1', jobId: 'job-1', type: 'status_changed', text: 'Fixture moved to Applied', color: '#854F0B' } })
     expect(mocks.updateMany).not.toHaveBeenCalled()
+  })
+
+  it('preserves an existing manual record when the Kanban moves a job back to Applied', async () => {
+    const appliedAt = new Date('2026-10-30T10:00:00.000Z')
+    mocks.findUnique.mockResolvedValue({ id: 'job-1', userId: 'user-1', company: 'Fixture', status: 'interview', appliedAt, workflowState: 'submitted' })
+    mocks.update.mockResolvedValue({ id: 'job-1', status: 'applied', appliedAt, workflowState: 'submitted' })
+    const response = await PATCH(request({ status: 'applied' }), context)
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({ status: 'applied', appliedAt: appliedAt.toISOString(), workflowState: 'submitted' })
+    expect(mocks.update).toHaveBeenCalledWith({ where: { id: 'job-1' }, data: { status: 'applied' } })
+    expect(mocks.activityCreate).toHaveBeenCalledWith({ data: expect.objectContaining({ type: 'status_changed' }) })
+  })
+
+  it('retains existing workflow mapping for other status transitions', async () => {
+    mocks.update.mockResolvedValue({ id: 'job-1', status: 'rejected', workflowState: 'submitted' })
+    const response = await PATCH(request({ status: 'rejected' }), context)
+    expect(response.status).toBe(200)
+    expect(mocks.update).toHaveBeenCalledWith({ where: { id: 'job-1' }, data: { status: 'rejected', workflowState: 'submitted' } })
   })
 })

@@ -211,7 +211,7 @@ async function install(page: Page, options: { stale?: boolean; taskCheckpoint?: 
   if (options.previewMismatch === 'job') state.job.finalResumeId = null
   if (options.evidenceCase === 'unavailable') state.hideResumeOnExport = true
   if (options.failTailoredRead) state.hideResumeOnExport = true
-  if (options.recordedInitially) state.job = { ...state.job, status: 'applied', workflowState: 'submitted' }
+  if (options.recordedInitially) state.job = { ...state.job, status: 'applied', workflowState: 'submitted', appliedAt: time }
   if (options.selectedLetter) state.audit = { ...audit(options.stale ? '2026-10-29T10:00:00.000Z' : time, true), coverLetterId: 'selected-letter', coverLetterUpdatedAt: time }
   const json = (route: Route, value: unknown, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(value) })
   await page.context().route('**/*', async route => {
@@ -438,18 +438,20 @@ async function open(page: Page, query = '') {
   await expect(page.getByText('Application flow engineer', { exact: true }).first()).toBeVisible()
 }
 
-for (const condition of ['saved', 'recorded', 'unavailable', 'limited'] as const) {
+for (const condition of ['saved', 'applied-tracking', 'recorded', 'unavailable', 'limited'] as const) {
   test(`application list explains ${condition} and opens the same job`, async ({ page }, testInfo) => {
     const state = await install(page, { descriptionMode: 'two', recordedInitially: condition === 'recorded',
       taskFailure: condition === 'unavailable', taskLimited: condition === 'limited' })
+    if (condition === 'applied-tracking') state.job.status = 'applied'
     await page.goto(`${origin}/?page=jobs`)
     const mobile = testInfo.project.name.startsWith('mobile')
     const entry = mobile ? page.locator('.jobs-mobile-list article').filter({ hasText: 'Application flow engineer' })
       : page.getByRole('row').filter({ hasText: 'Application flow engineer' })
     const expected = condition === 'saved' ? /Saved for review.*next step|职位已保存.*下一步/
-      : condition === 'recorded' ? /submission record exists.*history|已有提交记录.*查看历史/
-        : condition === 'unavailable' ? /Task status is unavailable.*existing records|无法读取任务状态.*核对现有记录/
-          : /Task coverage is limited.*check its status|任务覆盖范围有限.*检查状态/
+      : condition === 'applied-tracking' ? /Tracked as Applied.*submit on the employer site|已标记为“已申请”.*雇主网站提交后再记录/
+        : condition === 'recorded' ? /submission record exists.*history|已有提交记录.*查看历史/
+          : condition === 'unavailable' ? /Task status is unavailable.*existing records|无法读取任务状态.*核对现有记录/
+            : /Task coverage is limited.*check its status|任务覆盖范围有限.*检查状态/
     await expect(entry).toContainText(expected)
     await expect(entry).not.toContainText(/audit passed|审核已通过|no related task|没有相关任务/i)
     const action = entry.getByRole('button', { name: /View this application|查看此申请/ })
@@ -474,7 +476,7 @@ for (const status of ['applied', 'interview', 'offer', 'rejected'] as const) {
         : page.getByRole('row').filter({ hasText: 'Application flow engineer' })
       const expected = coverage === 'unavailable' ? /Task status is unavailable.*existing records|无法读取任务状态.*核对现有记录/
         : coverage === 'limited' ? /Task coverage is limited.*check its status|任务覆盖范围有限.*检查状态/
-          : status === 'applied' ? /submission record exists.*history|已有提交记录.*查看历史/
+          : status === 'applied' ? /Tracked as Applied.*submit on the employer site|已标记为“已申请”.*雇主网站提交后再记录/
             : /Check the application status and history|检查申请状态和历史/
       await expect(entry).toContainText(expected)
       await expect(entry).not.toContainText(/audit passed|审核已通过|no related task|没有相关任务/i)
@@ -3425,6 +3427,8 @@ for (const status of ['applied', 'interview'] as const) {
     test(`${status} application can refresh ${coverage} task status without changing its record`, async ({ page }) => {
       const state = await install(page, { taskFailure: coverage === 'unavailable', taskLimited: coverage === 'limited' })
       state.job.status = status
+      state.job.appliedAt = time
+      state.job.workflowState = 'submitted'
       await open(page)
       const drawer = page.getByRole('dialog')
       const title = status === 'applied' ? /^(Application record|申请记录)$/ : /^(Review application status|核对申请状态)$/
@@ -3786,6 +3790,22 @@ test('records a manual submission only after the explicit recording action', asy
   await record.click()
   await expect.poll(() => state.writes.map(write => write.path)).toEqual(['/api/jobs/outside-page/apply'])
   expect(state.job.status).toBe('applied')
+  await expect(record).toHaveCount(0)
+  expect(state.unexpected).toEqual([])
+})
+
+test('tracking-only Applied remains explicitly recordable', async ({ page }) => {
+  const state = await install(page)
+  state.job.status = 'applied'
+  state.job.workflowState = 'draft'
+  await open(page)
+  const record = page.getByRole('button', { name: /Record that I submitted|记录我已在雇主网站提交/ })
+  await expect(record).toBeVisible()
+  expect(state.job.appliedAt).toBeNull()
+  expect(state.writes).toEqual([])
+  await record.click()
+  await expect.poll(() => state.writes.map(write => write.path)).toEqual(['/api/jobs/outside-page/apply'])
+  expect(state.job).toMatchObject({ status: 'applied', workflowState: 'submitted', appliedAt: time })
   await expect(record).toHaveCount(0)
   expect(state.unexpected).toEqual([])
 })

@@ -6,13 +6,14 @@ type ManualRecordEvidence = Pick<Job, 'status' | 'workflowState' | 'appliedAt'>
 
 /** A user-reported or system-recorded application, not an employer receipt. */
 export function hasVisibleSubmissionRecord(job: ManualRecordEvidence): boolean {
-  return job.status === 'applied' || (typeof job.appliedAt === 'string'
-    && job.appliedAt.trim().length > 0 && Number.isFinite(Date.parse(job.appliedAt)))
+  return typeof job.appliedAt === 'string'
+    && job.appliedAt.trim().length > 0 && Number.isFinite(Date.parse(job.appliedAt))
 }
 
 /** Preserve the duplicate guard when historical status or timestamp is uncertain. */
 export function blocksManualRecord(job: ManualRecordEvidence): boolean {
-  return job.status !== 'saved' || !['draft', 'ready_to_apply'].includes(job.workflowState) || job.appliedAt !== null
+  return (job.status !== 'saved' && job.status !== 'applied')
+    || !['draft', 'ready_to_apply'].includes(job.workflowState) || job.appliedAt !== null
 }
 
 function key(userId: string, jobId: string): string {

@@ -206,7 +206,8 @@ function ApplicationListHint({ job, taskReadState, id }: { job: Job; taskReadSta
     : taskReadState === 'unavailable' ? 'application.listTaskUnavailable'
       : taskReadState === 'limited' ? 'application.listTaskLimited'
         : hasVisibleSubmissionRecord(job) ? 'application.listRecorded'
-          : blocksManualRecord(job) ? 'application.listNeedsStatusCheck' : 'application.listSaved'
+          : blocksManualRecord(job) ? 'application.listNeedsStatusCheck'
+            : job.status === 'applied' ? 'application.listAppliedTracking' : 'application.listSaved'
   return <span id={id} style={{ display: 'block', marginTop: 5, color: 'var(--text-muted)', fontSize: 12, lineHeight: 1.4 }}>{t(key)}</span>
 }
 
