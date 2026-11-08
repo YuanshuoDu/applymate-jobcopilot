@@ -45,8 +45,10 @@ async function startSite() {
     if (request.method === "POST" && requestUrl.pathname === "/__trace") {
       const event = requestUrl.searchParams.get("event")
       const field = requestUrl.searchParams.get("field")
-      const elapsedMs = Number(requestUrl.searchParams.get("elapsedMs"))
-      const length = Number(requestUrl.searchParams.get("length"))
+      const elapsedValue = requestUrl.searchParams.get("elapsedMs")
+      const lengthValue = requestUrl.searchParams.get("length")
+      const elapsedMs = elapsedValue === null ? Number.NaN : Number(elapsedValue)
+      const length = lengthValue === null ? Number.NaN : Number(lengthValue)
       if (event === "dom_ready") {
         browserTrace.push("dom_ready")
         if (Number.isFinite(elapsedMs) && elapsedMs >= 0) browserProgress.push({ event, elapsedMs })
@@ -71,7 +73,9 @@ async function startSite() {
         <input id="work_authorization" name="work_authorization" required>
         <button id="submit-app" type="submit">Submit application</button></form>
         <script>
-          fetch('/__trace?event=dom_ready&elapsedMs=' + Math.round(performance.now()), { method: 'POST', keepalive: true }).catch(() => {});
+          document.addEventListener('DOMContentLoaded', () => {
+            fetch('/__trace?event=dom_ready&elapsedMs=' + Math.round(performance.now()), { method: 'POST', keepalive: true }).catch(() => {});
+          });
           document.querySelectorAll('input').forEach(field => field.addEventListener('input', () => {
             const trace = new URLSearchParams({ event: 'input', field: field.name, elapsedMs: String(Math.round(performance.now())), length: String(field.value.length) });
             fetch('/__trace?' + trace.toString(), { method: 'POST', keepalive: true }).catch(() => {});
