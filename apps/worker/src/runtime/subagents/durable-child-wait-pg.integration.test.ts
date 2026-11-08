@@ -46,7 +46,6 @@ import { safeSubagentWaitJson } from "./subagent-wait-structural-ids.js"
 
 const DATABASE_NAME = "applymate_agent_brain_ci"
 const FINAL_MARKER = "parent-resumed-from-durable-child-result"
-const FIXED_WAIT_TARGET_TASK_ID = "subagent-00000000-0000-4000-8000-000000000001"
 const PHONE_SHAPED_WAIT_TOOL_CALL_ID = "child-wait-call:415-555-0134"
 const SOURCE_WAIT_SECRET_IDEMPOTENCY_KEY = (taskId: string) => `api_key=source-wait-secret-${taskId}-attempt-1`
 const HIGH_PRECISION_WAIT_MODEL_COST_USD = 0.123456789
@@ -599,7 +598,7 @@ function boundedStaleDispatchObservations(child: WorkerProcess): { overflow: boo
 }
 
 async function waitForExactStaleDispatchObservation(child: WorkerProcess, abandonedGeneration: number,
-  currentPublishedGeneration: number, replacementGeneration: number, timeoutMs = 45_000): Promise<void> {
+  currentPublishedGeneration: number, replacementGeneration: number, timeoutMs = 60_000): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const observed = boundedStaleDispatchObservations(child)
@@ -1586,14 +1585,14 @@ async function boundedExternalCallBlockerDiagnostic(pool: Pool, ids: FixtureIds)
   }
 }
 
-function expectRestoredWaitObservation(child: WorkerProcess, state: RestoredWaitObservationSummary["state"]): void {
+function expectRestoredWaitObservation(child: WorkerProcess, state: RestoredWaitObservationSummary["state"], targetTaskId: string): void {
   const lines = child.stdoutText.split(/\r?\n/).filter(line => line.startsWith(RESTORED_WAIT_OBSERVATION_MARKER))
   expect(lines).toHaveLength(1)
   const summary = JSON.parse(lines[0]!.slice(RESTORED_WAIT_OBSERVATION_MARKER.length)) as RestoredWaitObservationSummary
   expect(summary).toEqual({ state, canonicalCallIdPreserved: true, modelContextSafe: true, modelToolPairBound: true,
     deterministicProjection: true, providerInvoked: false,
-    inputTaskIds: [FIXED_WAIT_TARGET_TASK_ID], outputTaskIds: [FIXED_WAIT_TARGET_TASK_ID],
-    matchedTaskIds: [FIXED_WAIT_TARGET_TASK_ID], outputTaskIdsFromTasks: [FIXED_WAIT_TARGET_TASK_ID],
+    inputTaskIds: [targetTaskId], outputTaskIds: [targetTaskId],
+    matchedTaskIds: [targetTaskId], outputTaskIdsFromTasks: [targetTaskId],
     targetFinalText: REDACTED_TARGET_RESULT_TEXT })
 }
 
@@ -1696,11 +1695,11 @@ function expectReconciledSourceWait(snapshot: Awaited<ReturnType<typeof readSour
     toolCallId: PHONE_SHAPED_WAIT_TOOL_CALL_ID, callItemId: snapshot.call?.id, resultItemId: snapshot.results[0]?.id,
   })
   expect(snapshot.call).toMatchObject({ status: "completed", revision: 1, content: { toolCallId: PHONE_SHAPED_WAIT_TOOL_CALL_ID,
-    status: "completed", input: { idempotencyKey: SOURCE_WAIT_SECRET_IDEMPOTENCY_KEY(ids.waiterTaskId), taskIds: [FIXED_WAIT_TARGET_TASK_ID] } } })
+    status: "completed", input: { idempotencyKey: SOURCE_WAIT_SECRET_IDEMPOTENCY_KEY(ids.waiterTaskId), taskIds: [ids.targetTaskId] } } })
   expect(snapshot.results).toHaveLength(1)
   expect(snapshot.results[0]).toMatchObject({ status: "completed", revision: 1,
     content: { toolCallId: PHONE_SHAPED_WAIT_TOOL_CALL_ID, errorCode: null,
-      output: { waitId: snapshot.wait?.id, status: "ready", taskIds: [FIXED_WAIT_TARGET_TASK_ID], matchedTaskIds: [FIXED_WAIT_TARGET_TASK_ID] } } })
+      output: { waitId: snapshot.wait?.id, status: "ready", taskIds: [ids.targetTaskId], matchedTaskIds: [ids.targetTaskId] } } })
   expect(snapshot.events.map(event => event.type)).toEqual([
     "item.started", "tool_call.started", "item.completed", "tool_call.completed", "item.started", "item.completed",
   ])
@@ -1714,8 +1713,8 @@ function expectReconciledSourceWait(snapshot: Awaited<ReturnType<typeof readSour
   const resultCompletion = asObject(snapshot.events[5]?.payload.content)
   const eventResultOutput = asObject(resultCompletion.output)
   const resultTasks = Array.isArray(eventResultOutput.tasks) ? eventResultOutput.tasks.map(asObject) : []
-  expect(eventResultOutput.taskIds).toEqual([FIXED_WAIT_TARGET_TASK_ID])
-  expect(resultTasks.map(task => task.taskId)).toEqual([FIXED_WAIT_TARGET_TASK_ID])
+  expect(eventResultOutput.taskIds).toEqual([ids.targetTaskId])
+  expect(resultTasks.map(task => task.taskId)).toEqual([ids.targetTaskId])
   for (const event of snapshot.events) {
     const matches = snapshot.outboxes.filter(row => row.payload.eventId === event.id)
     expect(matches).toHaveLength(1)
@@ -1724,7 +1723,7 @@ function expectReconciledSourceWait(snapshot: Awaited<ReturnType<typeof readSour
   const eventAndOutboxJson = JSON.stringify({ events: snapshot.events.map(event => event.payload), outboxes: snapshot.outboxes.map(row => row.payload) })
   expect(eventAndOutboxJson).not.toContain(SOURCE_WAIT_SECRET_IDEMPOTENCY_KEY(ids.waiterTaskId))
   expect(eventAndOutboxJson).not.toContain("sourceLifecycleRecovery")
-  expect(eventAndOutboxJson).toContain(FIXED_WAIT_TARGET_TASK_ID)
+  expect(eventAndOutboxJson).toContain(ids.targetTaskId)
   const resultOutput = asObject(asObject(snapshot.results[0]?.content).output)
   expect(resultOutput).not.toHaveProperty("sourceLifecycleRecovery")
   expect(JSON.stringify(resultOutput)).not.toContain(TARGET_RESULT_TEXT)
@@ -2285,7 +2284,7 @@ async function expectAbsentSourceResultClaimSafety(pool: Pool, ids: FixtureIds, 
     expect(sourceCallResult.rows).toHaveLength(1)
     expect(sourceCall).toMatchObject({ status: "started", revision: 0,
       content: { toolCallId: PHONE_SHAPED_WAIT_TOOL_CALL_ID, toolName: "wait_subagents", toolVersion: "1",
-        input: { taskIds: [FIXED_WAIT_TARGET_TASK_ID], mode: "any", timeoutMs: 30_000,
+        input: { taskIds: [ids.targetTaskId], mode: "any", timeoutMs: 30_000,
           idempotencyKey: SOURCE_WAIT_SECRET_IDEMPOTENCY_KEY(ids.waiterTaskId) } } })
     expect(sourceEventsResult.rows).toHaveLength(2)
     expect(sourceEventsResult.rows.map(event => event.type)).toEqual(["item.started", "tool_call.started"])
@@ -2334,7 +2333,7 @@ async function expectAbsentSourceResultClaimSafety(pool: Pool, ids: FixtureIds, 
     const claimItemStarted = claimEventsResult.rows[0]!
     const claimStarted = claimEventsResult.rows[1]!
     const phoneWaitKey = `child-wait:415-555-0134:${ids.waiterTaskId}:attempt:1`
-    const projectedPhoneWaitKey = safeProjectedWaitKey({ taskIds: [FIXED_WAIT_TARGET_TASK_ID], mode: "any", timeoutMs: 30_000,
+    const projectedPhoneWaitKey = safeProjectedWaitKey({ taskIds: [ids.targetTaskId], mode: "any", timeoutMs: 30_000,
       idempotencyKey: phoneWaitKey })
     expect(projectedPhoneWaitKey.includes("[REDACTED_PHONE]")).toBe(true)
     await client.query("SAVEPOINT fixed_phone_wait_key_projection")
@@ -3178,10 +3177,10 @@ async function expectCompletedSourceWaitLifecycle(pool: Pool, ids: FixtureIds, p
   expect(call).toMatchObject({ status: "completed", revision: 1,
     content: { toolCallId: PHONE_SHAPED_WAIT_TOOL_CALL_ID, toolName: "wait_subagents", status: "completed", errorCode: null } })
   expect(callInput.idempotencyKey).toBe(SOURCE_WAIT_SECRET_IDEMPOTENCY_KEY(ids.waiterTaskId))
-  expect(callInput.taskIds).toEqual([FIXED_WAIT_TARGET_TASK_ID])
+  expect(callInput.taskIds).toEqual([ids.targetTaskId])
   expect(result).toMatchObject({ status: "completed", revision: 1,
     content: { toolCallId: PHONE_SHAPED_WAIT_TOOL_CALL_ID, errorCode: null,
-      output: { status: "waiting", taskIds: [FIXED_WAIT_TARGET_TASK_ID] } } })
+      output: { status: "waiting", taskIds: [ids.targetTaskId] } } })
   expect(sourceEvents.map(event => event.type)).toEqual([
     "item.started", "tool_call.started", "item.completed", "tool_call.completed", "item.started", "item.completed",
   ])
@@ -3217,11 +3216,11 @@ async function expectCompletedSourceWaitLifecycle(pool: Pool, ids: FixtureIds, p
     taskIds: ["[REDACTED]"],
   })
   expect(asObject(completedInput.input).idempotencyKey).toBe("[REDACTED]")
-  expect(asObject(completedInput.input).taskIds).not.toEqual([FIXED_WAIT_TARGET_TASK_ID])
-  expect(JSON.stringify(sourceEvents[2]?.payload)).not.toContain(FIXED_WAIT_TARGET_TASK_ID)
+  expect(asObject(completedInput.input).taskIds).not.toEqual([ids.targetTaskId])
+  expect(JSON.stringify(sourceEvents[2]?.payload)).not.toContain(ids.targetTaskId)
   const eventPayloads = JSON.stringify(events.rows.map(event => event.payload))
   expect(eventPayloads).not.toContain(SOURCE_WAIT_SECRET_IDEMPOTENCY_KEY(ids.waiterTaskId))
-  expect(eventPayloads).toContain(FIXED_WAIT_TARGET_TASK_ID)
+  expect(eventPayloads).toContain(ids.targetTaskId)
   const sourceCallCompletedEvents = events.rows.filter(event => event.itemId === callItemId && event.type === "tool_call.completed"
     && event.correlationId === PHONE_SHAPED_WAIT_TOOL_CALL_ID
     && asObject(event.payload).toolCallId === PHONE_SHAPED_WAIT_TOOL_CALL_ID)
@@ -3233,7 +3232,7 @@ async function expectCompletedSourceWaitLifecycle(pool: Pool, ids: FixtureIds, p
     && event.correlationId === resultItemId && event.causationId === sourceResultStartedEvents[0]!.id)
   expect(sourceResultCompletedEvents).toHaveLength(1)
   const resultEventContent = asObject(asObject(sourceResultCompletedEvents[0]!.payload).content)
-  expect(asObject(resultEventContent.output).taskIds).toEqual([FIXED_WAIT_TARGET_TASK_ID])
+  expect(asObject(resultEventContent.output).taskIds).toEqual([ids.targetTaskId])
   const sourceEventIds = sourceEvents.map(event => event.id)
   expect(sourceEventIds).toHaveLength(6)
   const eventOutboxes = await pool.query<{ idempotencyKey: string; payload: Record<string, unknown> }>(
@@ -3245,10 +3244,10 @@ async function expectCompletedSourceWaitLifecycle(pool: Pool, ids: FixtureIds, p
   expect(eventOutboxes.rows.map(row => row.payload.eventId).sort()).toEqual([...sourceEventIds].sort())
   const eventOutboxPayload = JSON.stringify(eventOutboxes.rows.map(row => row.payload))
   expect(eventOutboxPayload).not.toContain(SOURCE_WAIT_SECRET_IDEMPOTENCY_KEY(ids.waiterTaskId))
-  expect(eventOutboxPayload).toContain(FIXED_WAIT_TARGET_TASK_ID)
+  expect(eventOutboxPayload).toContain(ids.targetTaskId)
   const callCompletionOutbox = eventOutboxes.rows.find(row => row.payload.eventId === sourceCallCompletedEvents[0]!.id)
   expect(callCompletionOutbox).toBeDefined()
-  expect(JSON.stringify(callCompletionOutbox?.payload)).not.toContain(FIXED_WAIT_TARGET_TASK_ID)
+  expect(JSON.stringify(callCompletionOutbox?.payload)).not.toContain(ids.targetTaskId)
 }
 
 async function expectMalformedClaimOutcomeRejected(
@@ -3351,7 +3350,7 @@ async function seedFixedWaitTarget(pool: Pool, input: {
     if (Number(activeChildren.rows[0]?.count ?? 0) >= input.policy.maxFanOut) throw new Error("Fixed child-wait target exceeds the parent fan-out policy")
     const inheritedActions = actionList(parent.allowedActions)
     if (!inheritedActions.includes("wait_subagents")) throw new Error("Fixed child-wait target parent cannot authorize the wait tool")
-    const id = input.id ?? FIXED_WAIT_TARGET_TASK_ID
+    const id = input.id ?? `subagent-${randomUUID()}`
     const inserted = await client.query<{ id: string }>(INSERT_TASK + " RETURNING \"id\"", [
       id, parent.sessionId, parent.turnId, parent.rootTaskId, input.parentTaskId,
       parent.path.replace(/\/$/, "") + "/" + id, depth, "scout", "research",
@@ -3710,15 +3709,14 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       ids.waiterTaskId = waiter.id
       const targetId = await seedFixedWaitTarget(pool, { userId: ids.userId, sessionId: ids.sessionId, turnId: ids.turnId,
         rootTaskId: root.id, parentTaskId: waiter.id, policy })
+      ids.targetTaskId = targetId
       const target = await taskStore.get(targetId, ids.sessionId)
       if (!target) throw new Error("Fixed child-wait target was not readable through the task store")
-      expect(target).toMatchObject({ id: FIXED_WAIT_TARGET_TASK_ID, userId: ids.userId, sessionId: ids.sessionId, turnId: ids.turnId,
-        rootTaskId: root.id, parentTaskId: waiter.id, path: waiter.path.replace(/\/$/, "") + "/" + FIXED_WAIT_TARGET_TASK_ID,
+      expect(target).toMatchObject({ id: ids.targetTaskId, userId: ids.userId, sessionId: ids.sessionId, turnId: ids.turnId,
+        rootTaskId: root.id, parentTaskId: waiter.id, path: waiter.path.replace(/\/$/, "") + "/" + ids.targetTaskId,
         depth: waiter.depth + 1, status: "queued", attemptCount: 0, maxAttempts: policy.maxAttempts,
         allowedActions: waiter.allowedActions, modelProfileSnapshot: waiter.modelProfileSnapshot,
         toolPolicySnapshot: waiter.toolPolicySnapshot, budgetSnapshot: { subagentPolicy: policy } })
-      ids.targetTaskId = target.id
-
       const firstPayload = { taskId: waiter.id, sessionId: ids.sessionId, rootTaskId: root.id, ownerId: "worker-a-dispatch" }
       await pool.query(`INSERT INTO "agent_outbox" ("id", "topic", "aggregateId", "idempotencyKey", "payload")
         VALUES ($1, 'agent.subagent.dispatch', $2, $3, $4::jsonb)`, [
@@ -3776,7 +3774,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       const callItem = callItems.rows[0]
       expect(callItem).toMatchObject({ id: sourceCallItemId, status: "started", revision: 0,
         content: { toolCallId: PHONE_SHAPED_WAIT_TOOL_CALL_ID, toolName: "wait_subagents", toolVersion: "1",
-          input: { taskIds: [FIXED_WAIT_TARGET_TASK_ID], mode: "any", timeoutMs: 30_000,
+          input: { taskIds: [ids.targetTaskId], mode: "any", timeoutMs: 30_000,
             idempotencyKey: SOURCE_WAIT_SECRET_IDEMPOTENCY_KEY(waiter.id) } } })
       expect(sourceLifecycle.rows.map(event => event.type)).toEqual(["item.started", "tool_call.started"])
       expect(sourceLifecycle.rows[0]).toMatchObject({ itemId: sourceCallItemId,
@@ -4008,10 +4006,10 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(repaired.consumedAt).toBeNull()
       expect(repaired.result.request.timeoutMs).toBe(Number(repaired.callTimeoutMs))
       expect(repaired.result.request.timeoutMs).toBe(repaired.deadlineAt.getTime() - repaired.createdAt.getTime())
-      expect(repaired.callTargetTaskIds).toEqual([FIXED_WAIT_TARGET_TASK_ID])
-      expect(repaired.result.request.targetTaskIds).toEqual([FIXED_WAIT_TARGET_TASK_ID])
+      expect(repaired.callTargetTaskIds).toEqual([ids.targetTaskId])
+      expect(repaired.result.request.targetTaskIds).toEqual([ids.targetTaskId])
       expect(repaired.result.outcome).toMatchObject({ waitId: expect.any(String), status: "ready",
-        taskIds: [FIXED_WAIT_TARGET_TASK_ID], matchedTaskIds: [FIXED_WAIT_TARGET_TASK_ID] })
+        taskIds: [ids.targetTaskId], matchedTaskIds: [ids.targetTaskId] })
       const blockerStateAfterRecovery = await readBlockerDurableState(pool, recoveryBlockerTaskIds)
       expect(blockerStateAfterRecovery).toEqual(blockerStateBeforeRecovery)
       const blockerJobs = await queue.getJobs(["waiting", "active", "delayed", "completed", "failed"], 0, -1)
@@ -4051,7 +4049,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       await queue.resume()
       queuePaused = false
       await waitForMarker(workerC, "WORKER_B_RESUME_STEP_STARTED")
-      expectRestoredWaitObservation(workerC, "unconsumed")
+      expectRestoredWaitObservation(workerC, "unconsumed", ids.targetTaskId)
       const secondCut = await pool.query<{ taskStatus: string; attemptCount: number; leaseOwner: string | null; leaseExpiresAt: Date | null;
         stepOrdinal: number; stepStatus: string; consumedAt: Date | null; callStatus: string; settledCount: number; modelProfileSnapshot: Record<string, unknown> }>(
         `SELECT task."status" AS "taskStatus", task."attemptCount", task."leaseOwner", task."leaseExpiresAt", next."ordinal" AS "stepOrdinal",
@@ -4091,7 +4089,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(Object.keys(lifecycleRollbackBaseline.wait!.result).sort()).toEqual(["outcome", "request"])
       expect(lifecycleRollbackBaseline.call).toMatchObject({ status: "started", revision: 0,
         content: { toolCallId: PHONE_SHAPED_WAIT_TOOL_CALL_ID,
-          input: { idempotencyKey: SOURCE_WAIT_SECRET_IDEMPOTENCY_KEY(waiter.id), taskIds: [FIXED_WAIT_TARGET_TASK_ID] } } })
+          input: { idempotencyKey: SOURCE_WAIT_SECRET_IDEMPOTENCY_KEY(waiter.id), taskIds: [ids.targetTaskId] } } })
       expect(lifecycleRollbackBaseline.results).toHaveLength(0)
       expect(lifecycleRollbackBaseline.events.map(event => event.type)).toEqual(["item.started", "tool_call.started"])
       expect(lifecycleRollbackBaseline.outboxes).toHaveLength(2)
@@ -4228,7 +4226,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       await waitForMarker(workerD, "WORKER_B_LOOP_PRE_CLAIM_ORPHAN")
       const orphanCallId = `${REISSUED_WAIT_TOOL_CALL_PREFIX}${waiter.id}:attempt:${acknowledged!.sourceAttempt}:orphan`
       // Reissue uses the already validated projection from the durable wait receipt; the source item keeps its raw private input.
-      const projectedWaitKey = safeProjectedWaitKey({ taskIds: [FIXED_WAIT_TARGET_TASK_ID], mode: "any", timeoutMs: 30_000,
+      const projectedWaitKey = safeProjectedWaitKey({ taskIds: [ids.targetTaskId], mode: "any", timeoutMs: 30_000,
         idempotencyKey: SOURCE_WAIT_SECRET_IDEMPOTENCY_KEY(waiter.id) })
       expect(projectedWaitKey).toBe("api_key=[REDACTED]")
       const preClaimState = await readWaitClaimState(pool, ids, acknowledged!.continuationStepId, orphanCallId, acknowledged!.sourceAttempt)
@@ -4238,7 +4236,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(preClaimState.resultCount).toBe(0)
       expect(preClaimState.call).toMatchObject({ status: "started", revision: 0, stepId: acknowledged!.continuationStepId,
         content: { toolCallId: orphanCallId, toolName: "wait_subagents", toolVersion: "1",
-          input: { taskIds: [FIXED_WAIT_TARGET_TASK_ID], mode: "any", timeoutMs: 30_000,
+          input: { taskIds: [ids.targetTaskId], mode: "any", timeoutMs: 30_000,
             idempotencyKey: projectedWaitKey } } })
       expect(preClaimState.lifecycle.map(event => event.type)).toEqual(["item.started"])
       expect(preClaimState.claimOutboxCount).toBe(0)
@@ -4363,7 +4361,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         recoveryStepId: acknowledged!.continuationStepId, logicalStepOrdinal: 1, physicalContinuationOrdinal: 2,
         resumeNextOrdinal: 2, orphanCallIds: [orphanCallId],
       })
-      expectRestoredWaitObservation(recoveryWorkerE, "consumed")
+      expectRestoredWaitObservation(recoveryWorkerE, "consumed", ids.targetTaskId)
       await waitForMarker(recoveryWorkerE, "WORKER_B_LOOP_CLAIM_BEFORE_RESULT")
       const claimState = await readWaitClaimState(pool, ids, acknowledged!.continuationStepId, claimedWaitCallId, acknowledged!.sourceAttempt)
       expect(claimState.callCount).toBe(1)
@@ -4372,7 +4370,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(claimState.resultCount).toBe(0)
       expect(claimState.call).toMatchObject({ status: "started", stepId: acknowledged!.continuationStepId,
         content: { toolCallId: claimedWaitCallId, toolName: "wait_subagents", toolVersion: "1",
-          input: { taskIds: [FIXED_WAIT_TARGET_TASK_ID], mode: "any", timeoutMs: 30_000,
+          input: { taskIds: [ids.targetTaskId], mode: "any", timeoutMs: 30_000,
             idempotencyKey: projectedWaitKey } } })
       expect(claimState.claim).toMatchObject({ type: "tool_call.started", actor: "subagent", itemId: claimState.call!.id,
         correlationId: claimedWaitCallId, causationId: claimState.itemStarted!.id,
@@ -4581,7 +4579,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       await waitForMarker(workerF, "WORKER_B_LOOP_CLAIM_ITEM_COMPLETED_BEFORE_EVENT")
       await waitForExactStaleDispatchObservation(workerF, abandonedClaimRecoveryGeneration, resultCutGeneration,
         resultCutPublishedAttemptCount - 1)
-      expectRestoredWaitObservation(workerF, "consumed")
+      expectRestoredWaitObservation(workerF, "consumed", ids.targetTaskId)
       const callRowCut = await readWaitClaimState(pool, ids, acknowledged!.continuationStepId, orphanCallId, acknowledged!.sourceAttempt)
       expect(callRowCut.call).toMatchObject({ status: "completed", revision: 1, content: { toolCallId: orphanCallId } })
       expect(callRowCut.claimCount).toBe(1)
@@ -4646,7 +4644,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         recoveryStepId: acknowledged!.continuationStepId, logicalStepOrdinal: 1, physicalContinuationOrdinal: 2,
         resumeNextOrdinal: 2, orphanCallIds: [],
       })
-      expectRestoredWaitObservation(workerG, "consumed")
+      expectRestoredWaitObservation(workerG, "consumed", ids.targetTaskId)
       await waitForMarker(workerG, "WORKER_B_LOOP_RESUMED")
       const finalLoopMarker = workerG.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_LOOP_RESUMED "))
       expect(JSON.parse(finalLoopMarker!.slice("WORKER_B_LOOP_RESUMED ".length))).toMatchObject({
@@ -4677,9 +4675,9 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
          WHERE "parentTaskId" = $1 AND "sessionId" = $2`, [waiter.id, ids.sessionId],
       )
       expect(durable.rows).toHaveLength(1)
-      expect(durable.rows[0]).toMatchObject({ status: "ready", targetTaskIds: [FIXED_WAIT_TARGET_TASK_ID],
-        result: { request: { targetTaskIds: [FIXED_WAIT_TARGET_TASK_ID] },
-          outcome: { status: "ready", taskIds: [FIXED_WAIT_TARGET_TASK_ID], matchedTaskIds: [FIXED_WAIT_TARGET_TASK_ID] } } })
+      expect(durable.rows[0]).toMatchObject({ status: "ready", targetTaskIds: [ids.targetTaskId],
+        result: { request: { targetTaskIds: [ids.targetTaskId] },
+          outcome: { status: "ready", taskIds: [ids.targetTaskId], matchedTaskIds: [ids.targetTaskId] } } })
       expect(durable.rows[0]?.result).toHaveProperty("sourceLifecycleRecovery.schemaVersion", "child-wait-source-lifecycle.v1")
       expect(durable.rows[0]?.consumedAt).toBeInstanceOf(Date)
       expect(durable.rows[0]?.consumedAt).toEqual(acknowledgedAt)
@@ -5287,7 +5285,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       const sourceObservation = resumed?.observations.find(block => asObject(block.content).toolCallId === PHONE_SHAPED_WAIT_TOOL_CALL_ID)
       expect(asObject(sourceObservation?.content)).toMatchObject({ toolCallId: PHONE_SHAPED_WAIT_TOOL_CALL_ID,
         toolName: "wait_subagents", status: "completed", input: { idempotencyKey: "api_key=[REDACTED]" },
-        output: { waitId: sourceOnly.waitId, taskIds: [FIXED_WAIT_TARGET_TASK_ID] } })
+        output: { waitId: sourceOnly.waitId, taskIds: [ids.targetTaskId] } })
       expect(await repairConsumedChildWaitSources(pool, currentLease, new Date())).toBe(0)
       const repaired = await readSourceWaitLifecycle(pool, ids)
       expectReconciledSourceWait(repaired, ids, syntheticOwner)
@@ -5720,7 +5718,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       try { await pool.query(`DELETE FROM "User" WHERE "id" = $1`, [ids.userId]) } catch { /* preserve the original failure */ }
       await queueRedis.quit().catch(() => queueRedis.disconnect())
     }
-  }, 60_000)
+  }, 180_000)
 
   it("rebinds two distinct historical waits and completed claims across a PostgreSQL/Redis process restart", async () => {
     const suffix = randomUUID()

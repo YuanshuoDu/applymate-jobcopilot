@@ -1570,6 +1570,7 @@ const worker = new Worker(queueName, async job => {
   }
   return runSubagentQueueJob(pool, manager, executeWithDiagnostics, job.data, identity)
 }, { connection: redis, concurrency: 1, lockDuration: 15_000, skipVersionCheck: true,
+  ...(mode === "worker-b-loop-final" ? { stalledInterval: 5_000 } : {}),
   autorun: mode !== "worker-b-loop-final" })
 
 worker.on("completed", (job, result) => {
