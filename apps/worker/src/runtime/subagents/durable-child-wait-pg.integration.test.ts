@@ -495,6 +495,7 @@ function expectSqlBindings(sql: string, parameterCount: number): void {
 }
 type FixtureIds = { userId: string; sessionId: string; turnId: string; rootTaskId: string; waiterTaskId: string; targetTaskId: string;
   secondTargetTaskId?: string; waitScopedClaimCallIds?: boolean;
+  holdFinalWorkerForStaleDispatch?: boolean;
   finalText?: string; loopCallPrefix?: string; recoveryTargetPageRank?: number; recoveryCandidateCount?: number;
   recoveryFixtureBlockerCount?: number; recoveryCandidateObservedAt?: string;
   sourcePriorTool?: boolean;
@@ -3664,6 +3665,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       rootTaskId: "",
       waiterTaskId: "",
       targetTaskId: "",
+      holdFinalWorkerForStaleDispatch: true,
       finalText: FINAL_MARKER,
     }
     const queueName = `agent-child-wait-${suffix}`
@@ -4609,6 +4611,29 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(abandonedBullJob).toBeDefined()
       expect(await abandonedBullJob!.getState()).toBe("active")
 
+      // Requeue the killed generation before the current generation can complete the task.
+      await queue.pause()
+      queuePaused = true
+      const finalStalledMonitor = new Worker<unknown, unknown>(queueName, async (): Promise<unknown> => {
+        throw new Error("final-stalled-monitor-must-not-process-jobs")
+      }, { connection: queueRedis.duplicate(), concurrency: 1, lockDuration: 15_000, stalledInterval: 250,
+        autorun: false, skipVersionCheck: true })
+      stalledRecoveryWorker = finalStalledMonitor
+      try {
+        await finalStalledMonitor.waitUntilReady()
+        await finalStalledMonitor.startStalledCheckTimer()
+        let abandonedState: string | null = null
+        await waitFor(async () => {
+          abandonedState = await abandonedBullJob!.getState()
+          return abandonedState === "waiting" ? abandonedState : null
+        }, 45_000)
+        expect(await queue.isPaused()).toBe(true)
+        expect(abandonedState).toBe("waiting")
+      } finally {
+        await finalStalledMonitor.close(true)
+        stalledRecoveryWorker = undefined
+      }
+
       workerG = launchWorker("worker-b-loop-final", queueName, ids)
       await waitForMarker(workerG, "WORKER_B_RECOVERED")
       const completedRecoveryDispatch = await pool.query<{ taskStatus: string; attemptCount: number; leaseOwner: string | null }>(
@@ -4623,7 +4648,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       const completedRecoveryGeneration = completedRecoveryOutbox.rows[0]!.attemptCount
       expect(completedRecoveryGeneration).toBe(resultCutPublishedAttemptCount + 1)
       expect(completedRecoveryOutbox.rows[0]?.publishedAt).toBeNull()
-      expect(await abandonedBullJob!.getState()).toBe("active")
+      expect(await abandonedBullJob!.getState()).toBe("waiting")
       await expect(dispatchPendingSubagentOutbox(pool as never, queue, 50, ids.sessionId)).resolves.toBe(1)
       const completedRecoveryPublished = await pool.query<{ attemptCount: number; publishedAt: Date | null }>(
         `SELECT "attemptCount", "publishedAt" FROM "agent_outbox" WHERE "topic" = 'agent.subagent.dispatch'
@@ -4637,6 +4662,10 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
       expect(await currentDispatchJob!.getState()).toBe("waiting")
       await queueRedis.set(workerStartGateKey(ids), "start", "EX", 60)
       await waitForMarker(workerG, "WORKER_B_PROCESSING_RELEASED")
+      expect(await queue.isPaused()).toBe(true)
+      expect(await abandonedBullJob!.getState()).toBe("waiting")
+      await queue.resume()
+      queuePaused = false
       await waitForMarker(workerG, "WORKER_B_LOOP_RESTORED")
       const finalRestoredMarker = workerG.stdoutText.split(/\r?\n/).find(line => line.startsWith("WORKER_B_LOOP_RESTORED "))
       expect(JSON.parse(finalRestoredMarker!.slice("WORKER_B_LOOP_RESTORED ".length))).toMatchObject({
@@ -6470,6 +6499,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         [ids.sessionId, ids.turnId, ids.waiterTaskId, owner.attemptCount, claimKeyDigest])
         // Both historical source waits intentionally reuse the task-scoped claim key.
         expect(sameDigestClaimCount.rows).toEqual([{ count: 2, stepCount: 2 }])
+        // Exclude the second wait's source call, whose independently issued key is naturally different.
         const differentDigestSameWaitCount = await checkClient.query<{ count: number; stepCount: number }>(`SELECT COUNT(*)::int AS "count", COUNT(DISTINCT call."stepId")::int AS "stepCount"
           FROM "agent_items" AS call JOIN "agent_steps" AS step ON step."id" = call."stepId"
             AND step."sessionId" = call."sessionId" AND step."turnId" = call."turnId" AND step."taskId" = call."taskId"
@@ -6477,10 +6507,11 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
             AND result."taskId" = call."taskId" AND result."stepId" = call."stepId" AND result."type" = 'tool_result'
             AND result."content"->>'toolCallId' = call."content"->>'toolCallId'
           WHERE call."sessionId" = $1 AND call."turnId" = $2 AND call."taskId" = $3 AND step."attempt" = $4
+            AND step."ordinal" > $7
             AND call."type" = 'tool_call' AND call."content"->>'toolName' = 'wait_subagents'
             AND result."content"->'output'->>'waitId' = $5
             AND encode(sha256(convert_to(call."content"->'input'->>'idempotencyKey', 'UTF8')), 'hex') <> $6`,
-        [ids.sessionId, ids.turnId, ids.waiterTaskId, owner.attemptCount, secondWait!.waitId, claimKeyDigest])
+        [ids.sessionId, ids.turnId, ids.waiterTaskId, owner.attemptCount, secondWait!.waitId, claimKeyDigest, secondClaimOrdinal])
         expect(differentDigestSameWaitCount.rows).toEqual([{ count: 1, stepCount: 1 }])
         const currentClaimCount = await checkClient.query<{ count: number }>(`SELECT COUNT(*)::int AS "count" FROM "agent_items" AS call
           JOIN "agent_steps" AS step ON step."id" = call."stepId" AND step."sessionId" = call."sessionId"

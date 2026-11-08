@@ -28,6 +28,9 @@ import { readRecoveryStateSnapshot } from "./durable-child-wait-recovery-diagnos
 
 const [, , mode, queueName, rawIds] = process.argv
 const ids = JSON.parse(rawIds)
+const holdFinalWorkerForStaleDispatch = mode === "worker-b-loop-final" && ids.holdFinalWorkerForStaleDispatch === true
+let finalStaleDispatchObserved = false
+let finalCurrentExecutionCompleted = false
 const phoneShapedToolCallId = "child-wait-call:415-555-0134"
 const workerResultStatuses = new Set(["completed", "failed", "interrupted", "lease_lost", "retrying", "skipped", "waiting", "waiting_for_user"])
 const workerFailureReasonCategories = new Set([
@@ -1570,7 +1573,7 @@ const worker = new Worker(queueName, async job => {
   }
   return runSubagentQueueJob(pool, manager, executeWithDiagnostics, job.data, identity)
 }, { connection: redis, concurrency: 1, lockDuration: 15_000, skipVersionCheck: true,
-  ...(mode === "worker-b-loop-final" ? { stalledInterval: 5_000 } : {}),
+  ...(holdFinalWorkerForStaleDispatch ? { stalledInterval: 5_000 } : {}),
   autorun: mode !== "worker-b-loop-final" })
 
 worker.on("completed", (job, result) => {
@@ -1604,7 +1607,8 @@ worker.on("completed", (job, result) => {
           && Number.isSafeInteger(attemptCount) && attemptCount >= 1
           && identity.generation < attemptCount - 1) {
           say(`WORKER_B_STALE_DISPATCH_SKIPPED ${JSON.stringify({ dispatchGeneration, currentPublishedGeneration: attemptCount - 1 })}`)
-          if (mode === "worker-b-loop-final") await stop(0)
+          finalStaleDispatchObserved = true
+          if (mode === "worker-b-loop-final" && (!holdFinalWorkerForStaleDispatch || finalCurrentExecutionCompleted)) await stop(0)
           return
         }
       } catch (error) {
@@ -1641,7 +1645,16 @@ worker.on("completed", (job, result) => {
         ? { result: markerResult }
         : { result, taskId: ids.waiterTaskId, dispatchGeneration }
     say(`${marker} ${JSON.stringify(markerPayload)}`)
-    if (mode === "worker-b-loop-final") return
+    if (mode === "worker-b-loop-final") {
+      if (holdFinalWorkerForStaleDispatch) {
+        if (markerResult.status !== "completed") await stop(1)
+        else {
+          finalCurrentExecutionCompleted = true
+          if (finalStaleDispatchObserved) await stop(0)
+        }
+      } else await stop(markerResult.status === "completed" ? 0 : 1)
+      return
+    }
     await stop(0)
   })().catch(error => {
     if (boundedLoopDiagnosticModes.has(mode)) traceLoopStage("other", "fail")
