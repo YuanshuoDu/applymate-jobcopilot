@@ -59,6 +59,7 @@ type Child = ChildProcess & { readonly lines: string[]; readonly errors: string[
 type ApplicationTaskRow = {
   id: string; userId: string; jobId: string; sessionId: string | null; fillTurnId: string | null
   status: string; checkpoint: string | null; question: unknown; confirmedAnswers: unknown
+  workerTaskId?: string | null; error?: string | null
 }
 const workerCwd = resolve(process.cwd(), "../worker")
 const fixturePath = resolve(workerCwd, "src/queue/application-task-full-loop.fixture.mjs")
@@ -74,6 +75,8 @@ const { Queue } = workerRequire("bullmq") as { Queue: new (name: string, options
 let site: Child | undefined
 let worker: Child | undefined
 let applyQueue: InstanceType<typeof Queue> | undefined
+let turnQueue: InstanceType<typeof Queue> | undefined
+let subagentQueue: InstanceType<typeof Queue> | undefined
 let createdUsers: string[] = []
 let dbConnected = false
 
@@ -190,7 +193,59 @@ async function waitForTask(predicate: (task: ApplicationTaskRow) => boolean, tim
     await delay(100)
   }
   const current = await testDb.applicationTask.findUnique({ where: { id: gateTaskId! } })
-  throw new Error(`ApplicationTask state timeout: ${JSON.stringify(current)}`)
+  let diagnostics: string
+  try { diagnostics = JSON.stringify(await taskRuntimeDiagnostics(current as ApplicationTaskRow | null)) }
+  catch (error: unknown) { diagnostics = `diagnostics_unavailable:${error instanceof Error ? error.message : String(error)}` }
+  throw new Error(`ApplicationTask state timeout: ${diagnostics}`)
+}
+
+async function matchingQueueJobs(queue: InstanceType<typeof Queue> | undefined, field: "turnId" | "taskId", id: string) {
+  if (!queue) return []
+  const jobs = await queue.getJobs(["waiting", "active", "delayed", "completed", "failed", "paused", "waiting-children", "prioritized"], 0, -1)
+  return Promise.all(jobs.filter(job => jsonString(job.data, field) === id).map(async job => ({
+    id: job.id ?? null, state: await job.getState(), attemptsMade: job.attemptsMade,
+    attemptsStarted: job.attemptsStarted, stalledCounter: job.stalledCounter,
+  })))
+}
+
+async function taskRuntimeDiagnostics(task: ApplicationTaskRow | null) {
+  if (!task) return { task: null, workerLines: worker?.lines.slice(-30) ?? [], workerErrors: worker?.errors.slice(-30) ?? [] }
+  const turnId = task.fillTurnId
+  const [turn, turnDispatch, taskGraph, turnSteps, recentEvents, childDispatches] = await Promise.all([
+    turnId ? testDb.agentTurn.findUnique({ where: { id: turnId }, select: {
+      id: true, source: true, status: true, rootTaskId: true, revision: true, error: true,
+      leaseOwnerId: true, leaseExpiresAt: true, startedAt: true, completedAt: true,
+    } }) : null,
+    turnId ? testDb.agentOutbox.findUnique({ where: { idempotencyKey: `turn-dispatch:${turnId}` }, select: {
+      id: true, publishedAt: true, attemptCount: true, lastError: true,
+    } }) : null,
+    turnId ? testDb.subAgentTask.findMany({ where: { sessionId: ids.session, turnId }, orderBy: { createdAt: "asc" }, select: {
+      id: true, rootTaskId: true, parentTaskId: true, role: true, taskType: true, status: true,
+      failureReason: true, attemptCount: true, leaseOwner: true, leaseExpiresAt: true, createdAt: true, updatedAt: true,
+    } }) : [],
+    turnId ? testDb.agentStep.findMany({ where: { sessionId: ids.session, turnId }, orderBy: { ordinal: "asc" }, select: {
+      id: true, ordinal: true, status: true, errorCode: true, createdAt: true, completedAt: true,
+    } }) : [],
+    turnId ? testDb.agentEvent.findMany({ where: { sessionId: ids.session, turnId }, orderBy: { sequence: "desc" }, take: 12, select: {
+      sequence: true, type: true, actor: true, taskId: true, itemId: true, correlationId: true, createdAt: true,
+    } }) : [],
+    testDb.agentOutbox.findMany({ where: { aggregateId: ids.session, topic: "agent.subagent.dispatch" }, orderBy: { createdAt: "asc" }, select: {
+      idempotencyKey: true, publishedAt: true, attemptCount: true, lastError: true,
+    } }),
+  ])
+  const taskIds = taskGraph.map(node => node.id)
+  const subagentJobs = await Promise.all(taskIds.map(id => matchingQueueJobs(subagentQueue, "taskId", id)))
+  const turnJobs = turnId ? await matchingQueueJobs(turnQueue, "turnId", turnId) : []
+  return {
+    task: { id: task.id, fillTurnId: turnId, status: task.status, checkpoint: task.checkpoint, workerTaskId: task.workerTaskId ?? null, error: task.error ?? null },
+    turn, turnDispatch, turnQueueJobs: turnJobs, turnSteps: turnSteps.map(step => ({ ...step })),
+    taskGraph: taskGraph.map(node => ({ ...node })),
+    subagentDispatches: childDispatches,
+    subagentQueueJobs: taskIds.flatMap((id, index) => subagentJobs[index]!.map(job => ({ taskId: id, ...job }))),
+    recentEvents: recentEvents.map(event => ({ ...event, sequence: event.sequence.toString() })),
+    workerExited: worker ? exited(worker) : null,
+    workerLines: worker?.lines.slice(-30) ?? [], workerErrors: worker?.errors.slice(-30) ?? [],
+  }
 }
 
 let gateTaskId: string | undefined
@@ -266,6 +321,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     await Promise.all(tlsPaths.map(name => access(process.env[name]!)))
     await assertEgressBlocked()
     applyQueue = new Queue("apply-tasks", { connection: { host: "127.0.0.1", port: 6379, db: 15 } })
+    turnQueue = new Queue("agent-turns", { connection: { host: "127.0.0.1", port: 6379, db: 15 } })
+    subagentQueue = new Queue("agent-subagents", { connection: { host: "127.0.0.1", port: 6379, db: 15 } })
     await testDb.$connect()
     dbConnected = true
     site = spawnFixture("site")
@@ -280,6 +337,8 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     try { await stopFixture(site) } catch (error) { cleanupError ??= error }
     try { await cleanRunArtifacts() } catch (error) { cleanupError ??= error }
     try { await applyQueue?.close() } catch (error) { cleanupError ??= error }
+    try { await turnQueue?.close() } catch (error) { cleanupError ??= error }
+    try { await subagentQueue?.close() } catch (error) { cleanupError ??= error }
     try { await testDb.$disconnect(); dbConnected = false } catch (error) { cleanupError ??= error }
     if (cleanupError) throw cleanupError
   }, 60_000)

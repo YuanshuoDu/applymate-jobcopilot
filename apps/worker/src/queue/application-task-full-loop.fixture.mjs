@@ -176,13 +176,17 @@ async function startWorker() {
   const pool = new Pool({ connectionString: databaseUrl, max: 8 })
   const noOpProjection = { start: async () => undefined, finish: async () => undefined }
   const [{ createCanonicalTurnRuntime }, { createOptionalProductionChildExecutor }, { startProductionAgentRuntime },
-    { startProductionWorkerRuntime }, { resolveProductionAgentFlags }, queue, outbox, { closeAllSlots }, redis] = await Promise.all([
+    { startProductionWorkerRuntime }, { resolveProductionAgentFlags }, taskGraphCommandPortModule,
+    taskGraphTemplatesModule, queue, outbox, { closeAllSlots }, redis] = await Promise.all([
     import("../runtime/canonical-turn-runtime.ts"), import("../runtime/subagents/production-child-runtime.ts"),
     import("./production-bootstrap.ts"), import("./production-worker-runtime.ts"), import("../runtime/production-agent-flags.ts"),
+    import("../runtime/subagents/pg-task-graph-command-port.ts"), import("../runtime/subagents/task-graph-templates.ts"),
     import("./apply-queue.ts"), import("./application-submit-outbox.ts"), import("../cloak/pool.ts"), import("../redis.ts"),
   ])
   const flags = { ...resolveProductionAgentFlags(), taskGraphPlanningEnabled: true, childExecutionEnabled: true,
     coordinationEnabled: true, consumeWaitOutcomes: true, canonicalAutomationEnabled: false, turnBoundaryCompactionEnabled: false }
+  const taskGraphCommandPort = flags.taskGraphPlanningEnabled
+    ? taskGraphCommandPortModule.createPgTaskGraphCommandPort(pool) : undefined
   const authorizeUsage = async () => ({ settle: async () => undefined })
   let bootstrap
   await startProductionWorkerRuntime({ pool, workerId: `application-full-loop-${process.pid}`, productionFlags: flags,
@@ -190,7 +194,8 @@ async function startWorker() {
     createOptionalProductionChildExecutor: options => options.enabled
       ? createOptionalProductionChildExecutor({ ...options, authorizeUsage }) : undefined,
     createCanonicalTurnRuntime: (runtimePool, productionOptions) => createCanonicalTurnRuntime(runtimePool, {
-      ...productionOptions, modelRuntimeFactory: () => fixtureModel(), authorizeUsage,
+      ...productionOptions, ...taskGraphTemplatesModule.taskGraphRuntimeOptions(taskGraphCommandPort),
+      modelRuntimeFactory: () => fixtureModel(), authorizeUsage,
     }),
     createWorkerUsageAuthorizer: () => authorizeUsage,
     createCanonicalExecutionProjection: () => noOpProjection,
@@ -201,6 +206,20 @@ async function startWorker() {
   queue.applyWorker.on("active", job => say(`APPLY_JOB_ACTIVE ${job?.id ?? "unknown"} attemptsMade=${job?.attemptsMade ?? -1} attemptsStarted=${job?.attemptsStarted ?? -1} stalledCounter=${job?.stalledCounter ?? -1}`))
   queue.applyWorker.on("stalled", (jobId, previousState) => say(`APPLY_JOB_STALLED ${jobId} previousState=${previousState}`))
   queue.applyWorker.on("failed", (job, error) => say(`APPLY_JOB_FAILED ${job?.id ?? "unknown"} ${error.message}`))
+  const turns = bootstrap?.turns.worker
+  turns?.on("active", job => say(`TURN_JOB_ACTIVE ${job?.id ?? "unknown"} turnId=${job?.data?.turnId ?? "unknown"}`))
+  turns?.on("completed", (job, result) => say(`TURN_JOB_COMPLETED ${job?.id ?? "unknown"} turnId=${job?.data?.turnId ?? "unknown"} status=${result?.status ?? "unknown"}`))
+  turns?.on("failed", (job, error) => say(`TURN_JOB_FAILED ${job?.id ?? "unknown"} turnId=${job?.data?.turnId ?? "unknown"} ${error.message}`))
+  turns?.on("error", error => say(`TURN_WORKER_ERROR ${error.message}`))
+  turns?.on("stalled", jobId => say(`TURN_JOB_STALLED ${jobId}`))
+  const subagents = bootstrap?.subagents?.queue.worker
+  subagents?.on("active", job => say(`SUBAGENT_JOB_ACTIVE ${job?.id ?? "unknown"} taskId=${job?.data?.taskId ?? "unknown"}`))
+  subagents?.on("completed", (job, result) => say(`SUBAGENT_JOB_COMPLETED ${job?.id ?? "unknown"} taskId=${job?.data?.taskId ?? "unknown"} status=${result?.status ?? "unknown"}`))
+  subagents?.on("failed", (job, error) => say(`SUBAGENT_JOB_FAILED ${job?.id ?? "unknown"} taskId=${job?.data?.taskId ?? "unknown"} ${error.message}`))
+  subagents?.on("error", error => say(`SUBAGENT_WORKER_ERROR ${error.message}`))
+  subagents?.on("stalled", jobId => say(`SUBAGENT_JOB_STALLED ${jobId}`))
+  if (!turns || !subagents) throw new Error("canonical_turn_or_subagent_consumer_missing")
+  say("CANONICAL_TURN_AND_SUBAGENT_CONSUMERS_READY")
   say("WORKER_READY")
   process.stdin.setEncoding("utf8")
   let buffer = ""
