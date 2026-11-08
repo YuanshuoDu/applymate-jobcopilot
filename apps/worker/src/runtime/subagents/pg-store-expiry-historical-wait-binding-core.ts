@@ -1,4 +1,5 @@
 import { CHILD_WAIT_HISTORICAL_SOURCE_EVENT_BINDING_SQL, CHILD_WAIT_HISTORICAL_SOURCE_RESULT_RECEIPT_SQL } from "./pg-store-expiry-historical-wait-event-binding.js"
+import { safeSubagentWaitJson } from "./subagent-wait-structural-ids.js"
 
 const objectHasExactKeyCount = (expression: string, count: number) => `(CASE WHEN jsonb_typeof(${expression}) = 'object'
   THEN (SELECT COUNT(*) FROM jsonb_object_keys(${expression})) = ${count} ELSE FALSE END)`
@@ -7,6 +8,14 @@ const terminal = "'completed', 'failed', 'interrupted', 'cancelled', 'closed', '
 const targetIds = array('boundWait."targetTaskIds"'), matchedIds = array('boundWait."matchedTaskIds"')
 const taskSnapshots = array('boundWait."result"->\'outcome\'->\'tasks\'')
 
+/** Match a persisted continuation key only to the redacted projection of its exact source key. */
+export function childWaitContinuationKeyMatchesSafeProjection(sourceKey: unknown, continuationKey: unknown): boolean {
+  if (typeof sourceKey !== "string" || typeof continuationKey !== "string"
+    || sourceKey.length < 1 || sourceKey.length > 256 || sourceKey.trim() !== sourceKey
+    || continuationKey.length < 1 || continuationKey.length > 256 || continuationKey.trim() !== continuationKey) return false
+  const projected = safeSubagentWaitJson(sourceKey, 16_384)
+  return typeof projected === "string" && projected === continuationKey
+}
 /** Final settlement re-reads the bound receipt and all durable source/result rows under the locked session. */
 export function buildHistoricalWaitBindingSql(extraPredicate: string): string { return `EXISTS (
   SELECT 1 FROM "agent_wait_conditions" AS boundWait

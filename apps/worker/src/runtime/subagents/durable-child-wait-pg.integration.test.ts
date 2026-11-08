@@ -90,7 +90,7 @@ const WORKER_F_CLAIM_PROOF_SQL = `SELECT COUNT(*)::int AS "candidateCount",
        COUNT(*) FILTER (WHERE ${CHILD_WAIT_CLAIM_RECOVERY_SQL})::int AS "matchedCount"
      FROM (SELECT started.* FROM "agent_events" AS started
        WHERE started."sessionId" = $1 AND started."turnId" = $3 AND started."taskId" = $2
-         AND started."type" = 'tool_call.started' AND started."correlationId" = $13 AND $9::text IS NULL
+         AND started."type" = 'tool_call.started' AND started."correlationId" = $14 AND $9::text IS NULL
        ORDER BY started."sequence" DESC LIMIT 2) AS started`
 const CHANGE_RESULT_COMPLETE_SQL = `UPDATE "agent_events" SET "correlationId" = $1, "idempotencyKey" = $2,
         "payload" = jsonb_set("payload", '{itemId}', to_jsonb($1::text), false)
@@ -230,8 +230,8 @@ const redisUrl = disposableRedisUrl()
 const withServices = databaseUrl && redisUrl && process.env.RUN_AGENT_TURN_REDIS_INTEGRATION === "1" ? describe : describe.skip
 
 describe("worker restart blocker proof diagnostic bindings", () => {
-  it("binds the recovered-source predicate and exact call identity through $13", () => {
-    expectSqlBindings(WORKER_F_CLAIM_PROOF_SQL, 13)
+  it("binds the recovered-source predicate and exact call identity through $14", () => {
+    expectSqlBindings(WORKER_F_CLAIM_PROOF_SQL, 14)
   })
   it("binds changed result-completion event identity without parameter gaps", () => {
     expectSqlBindings(CHANGE_RESULT_COMPLETE_SQL, 6)
@@ -1147,10 +1147,12 @@ async function diagnoseWorkerFClaimProof(
   const projectedSourceContent = projectWaitCallEventContent({ toolName: "wait_subagents", toolCallId: sourceCallId })
   const projectedSourceCallId = projectedSourceContent && typeof projectedSourceContent === "object" && !Array.isArray(projectedSourceContent)
     ? (projectedSourceContent as Record<string, unknown>).toolCallId : null
+  const sourceProjections = await readChildWaitTerminalCallProjections(client, task as unknown as Record<string, unknown>)
   const proof = await client.query<{ candidateCount: number; matchedCount: number }>(WORKER_F_CLAIM_PROOF_SQL,
     [task.sessionId, task.id, task.turnId, task.rootTaskId, task.leaseOwner, task.attemptCount,
       task.leaseExpiresAt, task.userId, null, continuationStepId, sourceCallId,
-      typeof projectedSourceCallId === "string" ? projectedSourceCallId : null, claimCallId],
+      typeof projectedSourceCallId === "string" ? projectedSourceCallId : null,
+      JSON.stringify(historicalWaitClaimProofBundle(sourceProjections)), claimCallId],
   )
   const waits = await client.query<{ id: string; stepId: string; sourceAttempt: number; continuationAttempt: number;
     status: string; deadlineAt: Date; idempotencyKey: string; mode: string; targetTaskIds: unknown; matchedTaskIds: unknown; result: unknown }>(
@@ -2438,6 +2440,18 @@ async function expectAbsentSourceResultClaimSafety(pool: Pool, ids: FixtureIds, 
         `fixture-source-terminal:${randomUUID()}`,
         JSON.stringify({ toolCallId: PHONE_SHAPED_WAIT_TOOL_CALL_ID, toolName: "wait_subagents", status: "completed", errorCode: null, taskId: ids.waiterTaskId }),
       ])
+    })
+    await remainsBlocked("source completion with both identity fields altered but canonical start causation", async () => {
+      if (!callStarted) throw new Error("fixture_source_call_start_event_missing")
+      await insertClaimEvent({
+        type: "tool_call.completed",
+        itemId: null,
+        correlationId: "fixture-tampered-source-call:" + randomUUID(),
+        causationId: callStarted.id,
+        idempotencyKey: "fixture-source-terminal-causation:" + randomUUID(),
+        payload: { toolCallId: PHONE_SHAPED_WAIT_TOOL_CALL_ID, toolName: "wait_subagents", status: "completed",
+          errorCode: null, taskId: ids.waiterTaskId },
+      })
     })
     await remainsBlocked("second source wait call", async () => {
       const originalContent = sourceCall!.content

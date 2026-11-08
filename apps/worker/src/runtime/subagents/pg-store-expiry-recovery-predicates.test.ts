@@ -111,6 +111,8 @@ describe("expired recovery SQL predicates", () => {
     expect(CHILD_WAIT_CLAIM_RECOVERY_SQL).toContain("$11::text IS NOT NULL AND $12::text IS NOT NULL")
     expect(sql).toContain(`jsonb_array_elements(${historicalWaitProjectionsSql("$13::jsonb")})`)
     expect(sql).toContain('LEFT JOIN LATERAL (SELECT latest_wait."id" AS "waitId"')
+    expect(sql).toContain("call.\"status\" IN ('started', 'streaming')")
+    expect(sql).not.toContain("call.\"status\" IN ('started', 'streaming', 'completed')")
     expect(sql).toContain('FROM latest_wait WHERE started."type" = \'tool_call.started\' AND $10::text IS NOT NULL AND EXISTS (')
     expect(sql).toContain("started.\"idempotencyKey\" = 'task:' || owner.\"id\" || ':event:child-wait-claim:' || owner.\"attemptCount\"::text || ':' || continuation.\"id\"")
     expect(sql).toContain('started."causationId" = itemStarted."id"')

@@ -3,6 +3,15 @@ import { projectWaitCallEventContent } from "../turns/turn-execution-wait-event-
 import { CHILD_WAIT_SOURCE_CALL_PROJECTION_SQL, CHILD_WAIT_SOURCE_RECOVERED_RESULT_SQL, CHILD_WAIT_SOURCE_STARTED_NO_RESULT_SQL, readChildWaitSourceCallProjection } from "./pg-store-expiry-child-wait-source-proof.js"
 
 describe("registered child-wait source crash proof", () => {
+  it("includes causal descendants of the exact source start in the extra-event scan", () => {
+    const sql = CHILD_WAIT_SOURCE_STARTED_NO_RESULT_SQL.replace(/\s+/g, " ")
+    expect(sql).toContain('OR sourceExtra."causationId" IN (SELECT sourceStart."id" FROM "agent_events" AS sourceStart')
+    expect(sql).toContain('sourceStart."sessionId" = sourceCall."sessionId" AND sourceStart."turnId" = sourceCall."turnId" AND sourceStart."taskId" = sourceCall."taskId"')
+    expect(sql).toContain('sourceStart."itemId" = sourceCall."id" AND sourceStart."type" = \'tool_call.started\' AND sourceStart."actor" = \'subagent\'')
+    expect(sql).toContain('sourceStart."correlationId" = sourceCall."content"->>\'toolCallId\'')
+    expect(sql).toContain('sourceStart."idempotencyKey" = \'task:\' || owner."id" || \':event:tool-started:\'')
+  })
+
   it("reads only the latest scoped source call and reuses the canonical event projector at the 256-character boundary", async () => {
     const task = { sessionId: "session", id: "task", turnId: "turn", rootTaskId: "root", leaseOwner: "owner",
       attemptCount: 2, leaseExpiresAt: new Date("2026-10-31T00:00:00.000Z"), userId: "user" }

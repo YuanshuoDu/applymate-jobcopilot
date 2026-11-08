@@ -7,6 +7,7 @@ import {
   CHILD_WAIT_SOURCE_PROJECTED_COMPLETION_SQL, isCanonicalChildWaitOutcome,
 } from "./pg-store-expiry-child-wait-claim-call-proof.js"
 import { historicalWaitClaimProofsSql, historicalWaitProjectionsSql } from "./pg-store-expiry-historical-wait-claim-collision.js"
+import { CHILD_WAIT_SOURCE_STARTED_NO_RESULT_SQL } from "./pg-store-expiry-child-wait-source-proof.js"
 
 describe("child-wait continuation key projection", () => {
   it.each([
@@ -53,9 +54,11 @@ describe("claim terminal settlement event descendants", () => {
     expect(CHILD_WAIT_CALL_LIFECYCLE_SQL).toContain(CHILD_WAIT_CALL_ITEM_COMPLETED_NO_EVENT_SQL)
   })
 
-  it("requires exact source wait terminal history before accepting a continuation claim", () => {
+  it("requires exact source wait terminal history unless the exact started-without-result cut applies", () => {
     const sql = CHILD_WAIT_CLAIM_RECOVERY_SQL.replace(/\s+/g, " ")
+    const noResult = CHILD_WAIT_SOURCE_STARTED_NO_RESULT_SQL.replace(/\s+/g, " ")
     expect(sql).toContain('started."itemId" = sourceCall."id"')
+    expect(sql).toContain("CASE WHEN " + noResult + " THEN TRUE ELSE EXISTS (")
     expect(sql).toContain(CHILD_WAIT_CALL_TERMINAL_SETTLEMENT_SQL.replace(/\s+/g, " "))
   })
 

@@ -69,7 +69,9 @@ export const CHILD_WAIT_SOURCE_STARTED_NO_RESULT_SQL = `(
   AND NOT EXISTS (SELECT 1 FROM "agent_events" AS sourceExtra
     WHERE sourceExtra."sessionId" = sourceCall."sessionId" AND sourceExtra."turnId" = sourceCall."turnId"
       AND sourceExtra."taskId" = sourceCall."taskId"
-      AND (sourceExtra."itemId" = sourceCall."id" OR sourceExtra."correlationId" = sourceCall."content"->>'toolCallId')
+      AND (sourceExtra."itemId" = sourceCall."id" OR sourceExtra."correlationId" = sourceCall."content"->>'toolCallId' OR sourceExtra."causationId" IN (SELECT sourceStart."id" FROM "agent_events" AS sourceStart WHERE sourceStart."sessionId" = sourceCall."sessionId" AND sourceStart."turnId" = sourceCall."turnId" AND sourceStart."taskId" = sourceCall."taskId"
+        AND sourceStart."itemId" = sourceCall."id" AND sourceStart."type" = 'tool_call.started' AND sourceStart."actor" = 'subagent' AND sourceStart."correlationId" = sourceCall."content"->>'toolCallId'
+        AND sourceStart."idempotencyKey" = 'task:' || owner."id" || ':event:tool-started:' || (sourceCall."content"->>'toolCallId') AND sourceStart."payload" = jsonb_build_object('toolCallId', sourceCall."content"->>'toolCallId', 'toolName', 'wait_subagents', 'taskId', owner."id")))
       AND NOT (
         (sourceExtra."type" = 'item.started' AND sourceExtra."actor" = 'subagent'
           AND sourceExtra."itemId" = sourceCall."id" AND sourceExtra."correlationId" = source."id"
