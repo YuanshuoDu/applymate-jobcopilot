@@ -59,6 +59,23 @@ async function inspectTurn(sessionId, turnId) {
   const items = await pool.query(`SELECT "id", "status", "content" FROM "agent_items"
     WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'question'`, [sessionId, turnId])
   const events = await pool.query(`SELECT "type" FROM "agent_events" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "sequence"`, [sessionId, turnId])
+  const finalAnswer = await pool.query(`SELECT
+    (SELECT COUNT(*) = 1 FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2
+      AND "type" = 'agent_message' AND "phase" = 'final_answer') AS "exactlyOneFinalAssistantItem",
+    EXISTS (SELECT 1 FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2
+      AND "type" = 'agent_message' AND "phase" = 'final_answer' AND "status" = 'completed') AS "finalAssistantItemCompleted",
+    EXISTS (SELECT 1 FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2
+      AND "type" = 'agent_message' AND "phase" = 'final_answer' AND COALESCE("content"->>'text', '') <> '') AS "finalAssistantItemHasText",
+    EXISTS (SELECT 1 FROM "agent_events" AS event JOIN "agent_items" AS item
+      ON item."id" = event."itemId" AND item."sessionId" = event."sessionId" AND item."turnId" = event."turnId"
+      WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."type" = 'item.completed'
+        AND event."payload"->>'itemId' = event."itemId" AND event."payload"->>'status' = 'completed'
+        AND item."type" = 'agent_message' AND item."phase" = 'final_answer' AND item."status" = 'completed') AS "itemCompletedEventPersistsFinalAnswer",
+    EXISTS (SELECT 1 FROM "agent_events" AS event JOIN "agent_items" AS item
+      ON item."id" = event."itemId" AND item."sessionId" = event."sessionId" AND item."turnId" = event."turnId"
+      WHERE event."sessionId" = $1 AND event."turnId" = $2 AND event."type" = 'turn.completed'
+        AND event."payload"->>'finalItemId' = event."itemId" AND item."type" = 'agent_message'
+        AND item."phase" = 'final_answer' AND item."status" = 'completed') AS "completionEventTargetsFinalAnswer"`, [sessionId, turnId])
   const steps = await pool.query(`SELECT "status", "errorCode", "finishReason" FROM "agent_steps" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "ordinal", "attempt"`, [sessionId, turnId])
   const tasks = await pool.query(`SELECT "status", "failureReason" FROM "sub_agent_tasks" WHERE "sessionId" = $1 AND "turnId" = $2 ORDER BY "createdAt"`, [sessionId, turnId])
   const toolResults = await pool.query(`SELECT COUNT(*)::int AS count,
@@ -66,7 +83,7 @@ async function inspectTurn(sessionId, turnId) {
     FROM "agent_items" WHERE "sessionId" = $1 AND "turnId" = $2 AND "type" = 'tool_result'
       AND "content"->>'toolCallId' = 'fixture-native-question'`, [sessionId, turnId])
   return { turn: row, questions: items.rows, eventTypes: events.rows.map(event => event.type), steps: steps.rows, tasks: tasks.rows,
-    toolResultCount: toolResults.rows[0].count, toolResultQuestionRedacted: toolResults.rows[0].questionRedacted }
+    finalAnswer: finalAnswer.rows[0], toolResultCount: toolResults.rows[0].count, toolResultQuestionRedacted: toolResults.rows[0].questionRedacted }
 }
 
 // The application/task linkage is synthetic; the question and Turn must
