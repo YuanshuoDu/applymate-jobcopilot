@@ -8,11 +8,13 @@ import { join, resolve } from "node:path"
 import { setTimeout as delay } from "node:timers/promises"
 
 import { Prisma, PrismaClient } from "@prisma/client"
+import { hashApprovalNonce, hashApprovalScope } from "@jobcopilot/agent-protocol"
 import { SignJWT } from "jose"
 import { NextRequest } from "next/server"
 import { afterAll, beforeAll, describe, expect, it, onTestFailed, vi } from "vitest"
 
 import { EXTENSION_TOKEN_AUDIENCE, EXTENSION_TOKEN_ISSUER, getAuthJwtSecret } from "@/lib/auth-secret"
+import { protocolScope, type ApprovalScopeInput } from "@/lib/agent/approval/types"
 import type { ApplicationPackage, PipelineCtx } from "@/lib/agent/types"
 
 vi.mock("@/lib/safe-auth", () => ({ safeAuth: async () => null }))
@@ -955,18 +957,23 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect(mismatchedReceipt.status).toBe(409)
     await assertNoSubmitBeforeApproval()
     const expiredApprovalId = `expired-submit-${runId}`
+    const expiredAt = new Date(Date.now() - 60_000), expiredReceiptNonce = `expired-submit-receipt-${runId}`
+    const expiredNonceHash = await hashApprovalNonce(expiredReceiptNonce)
+    const expiredScope: ApprovalScopeInput = { userId: ids.user, sessionId: ids.session, turnId: successorTurnId, jobId: ids.job,
+      toolCallId: submitApproval.toolCallId!, action: "submit_application", resourceHash: submitApproval.resourceHash!,
+      materialHash: submitApproval.materialHash!, answersHash: submitApproval.answersHash!, revision: submitApproval.revision, expiresAt: expiredAt }
+    const expiredScopeHash = await hashApprovalScope(protocolScope(expiredScope, expiredNonceHash))
     await testDb.agentApproval.create({ data: {
       id: expiredApprovalId, sessionId: submitApproval.sessionId, taskId: submitApproval.taskId,
       userId: submitApproval.userId, turnId: submitApproval.turnId, toolCallId: submitApproval.toolCallId,
       jobId: submitApproval.jobId, type: submitApproval.type, status: "pending", title: submitApproval.title,
       body: submitApproval.body, payload: submitApproval.payload as Prisma.InputJsonValue,
-      resourceHash: submitApproval.resourceHash, materialHash: submitApproval.materialHash,
-      answersHash: submitApproval.answersHash, scopeHash: submitApproval.scopeHash,
-      nonceHash: `expired-submit-receipt-${runId}`, revision: submitApproval.revision,
-      expiresAt: new Date(Date.now() - 60_000),
+      resourceHash: expiredScope.resourceHash, materialHash: expiredScope.materialHash,
+      answersHash: expiredScope.answersHash, scopeHash: expiredScopeHash,
+      nonceHash: expiredNonceHash, revision: expiredScope.revision, expiresAt: expiredAt,
     } })
     const expiredReceipt = await approvalAction(apiRequest(actionPath, ownerToken, "POST", {
-      type: "approval_response", approvalId: expiredApprovalId, decision: "approved", receiptNonce,
+      type: "approval_response", approvalId: expiredApprovalId, decision: "approved", receiptNonce: expiredReceiptNonce,
     }), { params: Promise.resolve({ id: ids.session }) })
     expect(expiredReceipt.status).toBe(409)
     await expect(jsonResponse(expiredReceipt)).resolves.toMatchObject({ error: expect.stringContaining("expired") })
