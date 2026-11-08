@@ -33,6 +33,7 @@ async function startSite() {
   let submitCount = 0
   const requests = []
   const browserTrace = []
+  const browserProgress = []
   const blocked = []
   const held = new Set()
   const siteSockets = new Set()
@@ -44,9 +45,19 @@ async function startSite() {
     if (request.method === "POST" && requestUrl.pathname === "/__trace") {
       const event = requestUrl.searchParams.get("event")
       const field = requestUrl.searchParams.get("field")
-      if (event === "dom_ready") browserTrace.push("dom_ready")
-      else if (event === "input" && ["first_name", "last_name", "email", "work_authorization"].includes(field)) browserTrace.push(`input:${field}`)
+      const elapsedMs = Number(requestUrl.searchParams.get("elapsedMs"))
+      const length = Number(requestUrl.searchParams.get("length"))
+      if (event === "dom_ready") {
+        browserTrace.push("dom_ready")
+        if (Number.isFinite(elapsedMs) && elapsedMs >= 0) browserProgress.push({ event, elapsedMs })
+      } else if (event === "input" && ["first_name", "last_name", "email", "work_authorization"].includes(field)) {
+        browserTrace.push(`input:${field}`)
+        if (Number.isFinite(elapsedMs) && elapsedMs >= 0 && Number.isSafeInteger(length) && length >= 0) {
+          browserProgress.push({ event: `input:${field}`, elapsedMs, length })
+        }
+      }
       if (browserTrace.length > 20) browserTrace.shift()
+      if (browserProgress.length > 40) browserProgress.shift()
       response.writeHead(204).end()
       return
     }
@@ -60,9 +71,10 @@ async function startSite() {
         <input id="work_authorization" name="work_authorization" required>
         <button id="submit-app" type="submit">Submit application</button></form>
         <script>
-          fetch('/__trace?event=dom_ready', { method: 'POST', keepalive: true }).catch(() => {});
+          fetch('/__trace?event=dom_ready&elapsedMs=' + Math.round(performance.now()), { method: 'POST', keepalive: true }).catch(() => {});
           document.querySelectorAll('input').forEach(field => field.addEventListener('input', () => {
-            fetch('/__trace?event=input&field=' + encodeURIComponent(field.name), { method: 'POST', keepalive: true }).catch(() => {});
+            const trace = new URLSearchParams({ event: 'input', field: field.name, elapsedMs: String(Math.round(performance.now())), length: String(field.value.length) });
+            fetch('/__trace?' + trace.toString(), { method: 'POST', keepalive: true }).catch(() => {});
           }));
         </script>`)
       return
@@ -119,7 +131,7 @@ async function startSite() {
     const lines = buffer.split("\n")
     buffer = lines.pop() ?? ""
     for (const line of lines.map(value => value.trim())) {
-      if (line === "stats") say(`FIXTURE_STATE ${JSON.stringify({ submitCount, blocked, requests, browserTrace })}`)
+      if (line === "stats") say(`FIXTURE_STATE ${JSON.stringify({ submitCount, blocked, requests, browserTrace, browserProgress })}`)
       if (line === "shutdown") {
         process.stdin.pause()
         for (const response of held) response.destroy()

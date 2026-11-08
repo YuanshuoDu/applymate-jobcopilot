@@ -472,6 +472,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     const completedTask = await waitForTask(task => task.status === "waiting_for_authorization" && task.checkpoint === "form_filled", 180_000)
     expect(completedTask.id).toBe(gateTaskId)
     expect(completedTask.fillTurnId).toBe(successorTurnId)
+    expect((await requestFixtureStats()).browserTrace).toContain("input:work_authorization")
     expect(await testDb.agentApproval.count({ where: { userId: ids.user, sessionId: ids.session, turnId: successorTurnId,
       taskId: { not: null }, type: "submit_application", status: "pending" } })).toBe(1)
     await assertNoSubmitBeforeApproval()
@@ -585,14 +586,26 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
   }, 300_000)
 })
 
-async function requestFixtureStats(): Promise<{ submitCount: number; blocked: string[]; requests: string[]; browserTrace: string[] }> {
+async function requestFixtureStats(): Promise<{
+  submitCount: number
+  blocked: string[]
+  requests: string[]
+  browserTrace: string[]
+  browserProgress: Array<{ event: string; elapsedMs: number; length?: number }>
+}> {
   if (!site?.stdin) throw new Error("Fixture site is unavailable")
   const previous = site.lines.filter(line => line.startsWith("FIXTURE_STATE ")).length
   site.stdin.write("stats\n")
   const until = Date.now() + 5_000
   while (Date.now() < until) {
     const lines = site.lines.filter(line => line.startsWith("FIXTURE_STATE "))
-    if (lines.length > previous) return JSON.parse(lines[lines.length - 1]!.slice("FIXTURE_STATE ".length)) as { submitCount: number; blocked: string[]; requests: string[]; browserTrace: string[] }
+    if (lines.length > previous) return JSON.parse(lines[lines.length - 1]!.slice("FIXTURE_STATE ".length)) as {
+      submitCount: number
+      blocked: string[]
+      requests: string[]
+      browserTrace: string[]
+      browserProgress: Array<{ event: string; elapsedMs: number; length?: number }>
+    }
     await delay(20)
   }
   throw new Error("Fixture site did not return its request count")
