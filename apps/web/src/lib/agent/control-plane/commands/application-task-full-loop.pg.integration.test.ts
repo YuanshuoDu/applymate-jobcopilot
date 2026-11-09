@@ -450,8 +450,8 @@ async function stopFixture(child: Child | undefined): Promise<void> {
   child.stdin?.write("shutdown\n")
   if (!await waitExit(child, 10_000)) {
     child.kill("SIGKILL")
-    await waitExit(child, 1_000)
-    throw new Error("Fixture did not shut down cleanly")
+    if (!await waitExit(child, 1_000)) throw new Error("Fixture did not shut down cleanly")
+    return
   }
   if (child.exitCode !== 0) throw new Error(`Fixture exited with nonzero status; child=${JSON.stringify(childSummary(child))}`)
 }
