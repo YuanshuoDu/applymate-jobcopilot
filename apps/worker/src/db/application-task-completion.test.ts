@@ -189,6 +189,34 @@ describe("ApplicationTask fill completion", () => {
     expect(test.calls.filter(call => call.sql.startsWith("BEGIN"))).toHaveLength(1)
   })
 
+  it("completes a queued Turn only under the exact live child lease and creates the review approval", async () => {
+    const now = new Date()
+    const test = fixture({ turnStatus: "queued" })
+    test.lease.leaseExpiresAt = new Date(now.getTime() + 60_000)
+
+    await expect(completeApplicationFillForReview(test.pool, { lease: test.lease, now })).resolves.toEqual({ status: "completed" })
+
+    const locks = test.calls.filter(call => call.sql.includes("FOR UPDATE")).map(call => call.sql)
+    expect(locks.findIndex(sql => sql.includes('FROM "agent_turns"'))).toBeLessThan(locks.findIndex(sql => sql.includes('FROM "sub_agent_tasks"')))
+    expect(locks.findIndex(sql => sql.includes('FROM "sub_agent_tasks"'))).toBeLessThan(locks.findIndex(sql => sql.includes('FROM "application_tasks"')))
+    const childLeaseLock = test.calls.find(call => call.sql.includes('FROM "sub_agent_tasks" AS "subtask"'))
+    expect(childLeaseLock?.sql).toContain('"subtask"."id" = $1 AND "subtask"."sessionId" = $2 AND "subtask"."turnId" = $3')
+    expect(childLeaseLock?.sql).toContain('"subtask"."leaseOwner" = $4')
+    expect(childLeaseLock?.sql).toContain('"subtask"."attemptCount" = $5')
+    expect(childLeaseLock?.sql).toContain('"subtask"."leaseExpiresAt" > GREATEST($6::timestamptz, clock_timestamp())')
+    expect(childLeaseLock?.sql).toContain('"subtask"."interruptRequestedAt" IS NULL')
+    expect(childLeaseLock?.values).toEqual([test.lease.id, test.lease.sessionId, test.lease.turnId, test.lease.ownerId, test.lease.attemptCount, now, test.lease.userId])
+    expect(test.lease.leaseExpiresAt.getTime()).toBeGreaterThan(now.getTime())
+    expect(test.calls.some(call => call.sql.includes("'form_filled'") && call.sql.includes('INSERT INTO "application_task_events"'))).toBe(true)
+    expect(test.calls.filter(call => call.sql.includes('INSERT INTO "agent_approvals"'))).toHaveLength(1)
+    expect(test.turn.status).toBe("waiting_for_approval")
+
+    const lostLease = fixture({ turnStatus: "queued", subtaskLive: false })
+    lostLease.lease.leaseExpiresAt = new Date(now.getTime() + 60_000)
+    await expect(completeApplicationFillForReview(lostLease.pool, { lease: lostLease.lease, now })).resolves.toEqual({ status: "stale" })
+    expect(lostLease.calls.some(call => /^(UPDATE|INSERT)/.test(call.sql))).toBe(false)
+  })
+
   it("does not write a task, artifact, approval, or wait when the lease attempt is stale", async () => {
     const test = fixture({ subtaskLive: false })
     const onStaleGate = vi.fn(() => { throw new Error("private diagnostic failure") })
@@ -225,7 +253,6 @@ describe("ApplicationTask fill completion", () => {
 
   it.each([
     ["turn_row_unavailable", undefined, true],
-    ["turn_status_queued", "queued", false],
     ["turn_status_interrupted", "interrupted", false],
     ["turn_status_terminal", "completed", false],
     ["turn_status_terminal", "failed", false],
@@ -392,6 +419,16 @@ describe("ApplicationTask fill completion", () => {
 
     expect(test.calls.some(call => call.sql.startsWith('UPDATE "application_tasks"'))).toBe(false)
     expect(test.calls.some(call => call.sql.includes('INSERT INTO "application_task_events"'))).toBe(false)
+  })
+
+  it("keeps a queued Turn stale for wait persistence without writing", async () => {
+    const test = fixture({ turnStatus: "queued" })
+
+    await expect(persistApplicationFillWait(test.pool, {
+      lease: test.lease, checkpoint: "form_answer_required", detail: "required_field",
+    })).resolves.toEqual({ status: "stale" })
+
+    expect(test.calls.some(call => /^(UPDATE|INSERT)/.test(call.sql))).toBe(false)
   })
 
   it("persists a browser-start uncertainty as a wait without creating another artifact or approval", async () => {

@@ -33,14 +33,14 @@ function validLease(lease: SubagentLease, now: Date, cancellation = false): bool
     && (cancellation || (lease.interruptRequestedAt === null && !lease.signal.aborted)) && now instanceof Date && Number.isFinite(now.getTime()))
 }
 
-async function lockFillScope(client: Client, lease: SubagentLease, now: Date, cancellation = false, onStaleGate?: StaleGateObserver): Promise<{ turn: TurnRow; task: ApplicationRow } | null> {
+async function lockFillScope(client: Client, lease: SubagentLease, now: Date, cancellation = false, onStaleGate?: StaleGateObserver, allowQueuedCompletion = false): Promise<{ turn: TurnRow; task: ApplicationRow } | null> {
   if (!validLease(lease, now, cancellation)) { if (onStaleGate) reportStaleGate(onStaleGate, "lease_input_invalid"); return null }
   const sessionStates = cancellation ? "'running', 'waiting_for_user', 'paused', 'aborted'" : "'running', 'waiting_for_user'"
   const session = await client.query(`SELECT "id" FROM "agent_sessions" WHERE "id" = $1 AND "userId" = $2 AND "status" IN (${sessionStates}) FOR UPDATE`, [lease.sessionId, lease.userId])
   if (!session.rows[0]) { if (onStaleGate) reportStaleGate(onStaleGate, "session_scope"); return null }
   const turnResult = await client.query<TurnRow>(`SELECT "id", "status", "revision" FROM "agent_turns" WHERE "id" = $1 AND "sessionId" = $2 AND "userId" = $3 FOR UPDATE`, [lease.turnId, lease.sessionId, lease.userId])
   const turn = turnResult.rows[0]
-  if (!turn || !(cancellation ? ["in_progress", "waiting_for_user", "waiting_for_approval", "waiting_for_dependency", "interrupted"] : ["in_progress", "waiting_for_user", "waiting_for_approval", "waiting_for_dependency"]).includes(turn.status)) { if (onStaleGate) reportStaleGate(onStaleGate, !turn ? "turn_row_unavailable" : turn.status === "queued" ? "turn_status_queued" : turn.status === "interrupted" ? "turn_status_interrupted" : ["completed", "failed", "cancelled"].includes(turn.status) ? "turn_status_terminal" : "turn_status_other"); return null }
+  if (!turn || (!(cancellation ? ["in_progress", "waiting_for_user", "waiting_for_approval", "waiting_for_dependency", "interrupted"] : ["in_progress", "waiting_for_user", "waiting_for_approval", "waiting_for_dependency"]).includes(turn.status) && !(allowQueuedCompletion && turn.status === "queued"))) { if (onStaleGate) reportStaleGate(onStaleGate, !turn ? "turn_row_unavailable" : turn.status === "queued" ? "turn_status_queued" : turn.status === "interrupted" ? "turn_status_interrupted" : ["completed", "failed", "cancelled"].includes(turn.status) ? "turn_status_terminal" : "turn_status_other"); return null }
   const interruptCheck = cancellation ? "IS NOT NULL" : "IS NULL"
   const subtask = await client.query(`SELECT "subtask"."id" FROM "sub_agent_tasks" AS "subtask"
       INNER JOIN "agent_sessions" AS "session" ON "session"."id" = "subtask"."sessionId" AND "session"."userId" = $7
@@ -147,13 +147,13 @@ export async function completeApplicationFillForReview(pool: Pool, input: { read
   if (!validLease(lease, now) || !lease.turnId) { if (input.onStaleGate) reportStaleGate(input.onStaleGate, "lease_input_invalid"); return { status: "stale" } }
   const turnId = lease.turnId
   return inTransaction(pool, lease.userId, async client => {
-    const locked = await lockFillScope(client, lease, now, false, input.onStaleGate)
+    const locked = await lockFillScope(client, lease, now, false, input.onStaleGate, true)
     if (!locked) return { status: "stale" }
     const { turn, task } = locked
     const awaitingApproval = task.status === "waiting_for_authorization" && task.checkpoint === "form_filled", authorizedForSubmission = task.status === "filling" && task.checkpoint === "submission_authorized", queueRetry = task.status === "waiting_for_authorization" && task.checkpoint === "queue_retry"
     if (awaitingApproval || authorizedForSubmission || queueRetry) return turn.status === "waiting_for_approval"
       ? { status: await existingCompletion(client, lease, task, turn, authorizedForSubmission || queueRetry) ? "completed" : "conflict" } : { status: "conflict" }
-    if (task.status !== "filling" || task.checkpoint !== "browser_active" || !["in_progress", "waiting_for_dependency"].includes(turn.status)) return { status: "conflict" }
+    if (task.status !== "filling" || task.checkpoint !== "browser_active" || !["in_progress", "waiting_for_dependency", "queued"].includes(turn.status)) return { status: "conflict" }
     const transitioned = await client.query(`UPDATE "application_tasks" SET "status" = 'waiting_for_authorization', "checkpoint" = 'form_filled', "error" = NULL, "updatedAt" = $4 WHERE "id" = $1 AND "userId" = $2 AND "sessionId" = $3 AND "status" = 'filling' AND "checkpoint" = 'browser_active' RETURNING "id"`, [task.id, lease.userId, lease.sessionId, now])
     if (transitioned.rowCount !== 1) return { status: "conflict" }
     await client.query(`INSERT INTO "application_task_events" ("id", "taskId", "type", "actor", "body", "data", "createdAt")
