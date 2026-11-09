@@ -1,10 +1,9 @@
 /** CANONICAL Phase 9 timeline state root — do not duplicate. See #459. */
 
-import { AGENT_STREAM_SCHEMA_VERSION } from '@jobcopilot/agent-protocol'
-import { isCanonicalTaskGraphSourceManifestWeb, projectFinalAnswerWithTaskGraphSources } from '@/lib/agent/session/final-task-graph-source-manifest'
-import { normalizeTimelineEvent, normalizeTimelineItem, type TimelineAction } from './timeline-reducer'
-import { createQuestionHydrationPump, filterQuestionHydrationValues, type FinalItemHydrationTarget } from './question-hydration'
+import { normalizeTimelineEvent, type TimelineAction } from './timeline-reducer'
+import { createQuestionHydrationPump, filterQuestionHydrationValues, hydrateFinalItemFromResponse, type FinalItemHydrationTarget } from './question-hydration'
 import { hasAllTimelineTargetItems, sortTimelineTailEvents } from './timeline-hydration-order'
+import { getFinalAnswerDiagnostics, isRecord, observeFinalTurnCompleted, type FinalItemHydrationDiagnostic } from './timeline-reducer-utils'
 
 interface TimelinePageResponse {
   items?: unknown[]
@@ -28,7 +27,6 @@ export interface TimelineStreamClientOptions {
 
 const DEFAULT_RETRY_DELAY_MS = 250
 const DEFAULT_PAGE_SIZE = 100
-const SAFE_FINAL_ITEM_FIELDS = ['schemaVersion', 'id', 'sessionId', 'turnId', 'stepId', 'taskId', 'type', 'status', 'phase', 'revision', 'content', 'startedAt', 'completedAt', 'createdAt', 'updatedAt']
 type TimelineHydrationOptions = Pick<TimelineStreamClientOptions, 'sessionId' | 'dispatch' | 'signal' | 'fetcher' | 'pageSize'> & {
   targetItemIds?: readonly string[]
   finalItemTarget?: FinalItemHydrationTarget
@@ -38,13 +36,28 @@ type TimelineHydrationOptions = Pick<TimelineStreamClientOptions, 'sessionId' | 
 export async function hydrateTimeline(options: TimelineHydrationOptions): Promise<void> {
   const fetcher = options.fetcher ?? fetch
   if (options.finalItemTarget) {
+    const diagnostics = getFinalAnswerDiagnostics()
+    const summary: FinalItemHydrationDiagnostic = { requestStarted: true, responseReceived: false, responseCategory: 'unavailable',
+      jsonParsed: false, itemCountCategory: 'unavailable', itemAccepted: false, projectionAccepted: false, replayDispatched: false }
     const query = new URLSearchParams({ itemId: options.finalItemTarget.itemId })
-    const response = await fetcher(`/api/agent/sessions/${encodeURIComponent(options.sessionId)}/timeline?${query}`, { signal: options.signal })
-    if (!response.ok) throw new Error(`Timeline restore failed (${response.status})`)
-    const page = await response.json() as TimelinePageResponse
-    if (options.signal?.aborted) return
-    const item = await finalItemFromResponse(page.items, options.finalItemTarget, options.sessionId)
-    if (item) options.dispatch({ type: 'replay', items: [item] })
+    let response: Response
+    try { response = await fetcher(`/api/agent/sessions/${encodeURIComponent(options.sessionId)}/timeline?${query}`, { signal: options.signal }) }
+    catch (error) { diagnostics?.recordFinalItemHydration(summary); throw error }
+    summary.responseReceived = true
+    summary.responseCategory = response.ok ? 'ok' : 'non_ok'
+    if (!response.ok) { diagnostics?.recordFinalItemHydration(summary); throw new Error(`Timeline restore failed (${response.status})`) }
+    let page: TimelinePageResponse
+    try { page = await response.json() as TimelinePageResponse }
+    catch (error) { diagnostics?.recordFinalItemHydration(summary); throw error }
+    summary.jsonParsed = true
+    summary.itemCountCategory = Array.isArray(page.items) ? page.items.length === 0 ? 'zero' : page.items.length === 1 ? 'one' : 'many' : 'unavailable'
+    if (options.signal?.aborted) { diagnostics?.recordFinalItemHydration(summary); return }
+    let projectionAccepted = false
+    const item = await hydrateFinalItemFromResponse(page.items, options.finalItemTarget, options.sessionId, () => { projectionAccepted = true })
+    summary.itemAccepted = Boolean(item)
+    summary.projectionAccepted = projectionAccepted
+    if (item) { options.dispatch({ type: 'replay', items: [item] }); summary.replayDispatched = true }
+    diagnostics?.recordFinalItemHydration(summary)
     return
   }
   const items: unknown[] = []
@@ -139,6 +152,7 @@ export async function streamAgentTimeline(options: TimelineStreamClientOptions):
     try {
       await readSseBody(response.body, frame => {
         const event = normalizeTimelineEvent(frame.data)
+        observeFinalTurnCompleted(frame.event, frame.data, event, options.sessionId)
         if (!event || event.sessionId !== options.sessionId) return
         if (event.sequence !== null) {
           const sequence = BigInt(event.sequence)
@@ -165,25 +179,6 @@ export async function streamAgentTimeline(options: TimelineStreamClientOptions):
     }
   }
 }
-
-async function finalItemFromResponse(items: unknown[] | undefined, target: FinalItemHydrationTarget, sessionId: string) {
-  if (!items || items.length !== 1 || !isRecord(items[0]) || items[0].schemaVersion !== AGENT_STREAM_SCHEMA_VERSION || !hasExactKeys(items[0], SAFE_FINAL_ITEM_FIELDS)) return null
-  const item = normalizeTimelineItem(items[0]), content = item?.content
-  if (!item || !safeId(target.itemId) || !safeId(target.turnId) || item.id !== target.itemId || item.sessionId !== sessionId ||
-    item.turnId !== target.turnId || item.type !== 'agent_message' || item.status !== 'completed' || item.phase !== 'final_answer' || !isRecord(content)) return null
-  const projectedContent = projectFinalAnswerWithTaskGraphSources(content)
-  if (!projectedContent) return null
-  const { taskGraphSources, ...answerContent } = projectedContent
-  const safeContent = taskGraphSources && await isCanonicalTaskGraphSourceManifestWeb(item.id, taskGraphSources)
-    ? { ...answerContent, taskGraphSources } : answerContent
-  return { ...item, content: safeContent }
-}
-
-function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean { return Object.keys(value).length === keys.length && keys.every(key => Object.prototype.hasOwnProperty.call(value, key)) }
-
-function safeId(value: unknown): value is string { return typeof value === 'string' && value.length > 0 && value.trim() === value && value.length <= 256 && !/[\u0000-\u001f\u007f]/.test(value) }
-
-function isRecord(value: unknown): value is Record<string, unknown> { return Boolean(value) && typeof value === 'object' && !Array.isArray(value) }
 
 function isEventStream(response: Response): boolean {
   return response.headers.get('content-type')?.toLowerCase().includes('text/event-stream') === true

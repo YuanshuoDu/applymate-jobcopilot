@@ -438,6 +438,11 @@ describe('V2 timeline stream client', () => {
     let state: TimelineState = createTimelineState('session-1')
     let targetedFinalHydrationCompleted = false
     let disconnectedAfterTargetedHydration = false
+    const diagnostics = {
+      matchesTarget: vi.fn((sessionId: unknown, turnId: unknown) => sessionId === 'session-1' && turnId === 'turn-1'),
+      recordTurnCompleted: vi.fn(), recordFinalItemTarget: vi.fn(), recordFinalItemHydration: vi.fn(),
+    }
+    vi.stubGlobal('window', { __applymateFinalDiagnostics: diagnostics })
     const dispatch = (action: TimelineAction) => {
       state = timelineReducer(state, action)
       if (action.type === 'replay' && action.items.some(value => isRecord(value) && value.id === FINAL_ITEM_ID)) targetedFinalHydrationCompleted = true
@@ -451,13 +456,24 @@ describe('V2 timeline stream client', () => {
       .mockResolvedValueOnce(new Response(streamFrom(sparseEvents.map(event => sseEvent(event, event.type)).join('')), { headers: { 'Content-Type': 'text/event-stream' } }))
       .mockResolvedValueOnce(new Response(JSON.stringify({ items: [finalMessageDto({ content: finalContent })] })))
 
-    await streamAgentTimeline({ sessionId: 'session-1', dispatch, fetcher, signal: controller.signal, retryDelayMs: 0 })
+    try { await streamAgentTimeline({ sessionId: 'session-1', dispatch, fetcher, signal: controller.signal, retryDelayMs: 0 }) }
+    finally { vi.unstubAllGlobals() }
 
     const finalAnswers = selectTimelineItems(state).filter(value =>
       value.type === 'agent_message' && value.status === 'completed' && value.phase === 'final_answer')
     expect(disconnectedAfterTargetedHydration).toBe(true)
     expect(finalAnswers).toHaveLength(1)
     expect(finalAnswers[0]).toMatchObject({ id: FINAL_ITEM_ID, content: { text: syntheticDisplayText } })
+    expect(diagnostics.recordTurnCompleted).toHaveBeenCalledWith(expect.objectContaining({
+      eventNameMatches: true, rawTypeMatches: true, rawSessionMatches: true, rawTurnMatches: true,
+      rawPayloadRecord: true, rawPayloadTurnMatches: true, rawFinalItemMatchesEventItem: true,
+      normalized: true, normalizedSessionMatches: true, normalizedTurnMatches: true,
+    }))
+    expect(diagnostics.recordFinalItemTarget).toHaveBeenCalledWith(expect.objectContaining({ targetAccepted: true }))
+    expect(diagnostics.recordFinalItemHydration).toHaveBeenCalledWith({
+      requestStarted: true, responseReceived: true, responseCategory: 'ok', jsonParsed: true, itemCountCategory: 'one',
+      itemAccepted: true, projectionAccepted: true, replayDispatched: true,
+    })
     expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual([
       '/api/agent/sessions/session-1/timeline?limit=100',
       '/api/agent/sessions/session-1/events',

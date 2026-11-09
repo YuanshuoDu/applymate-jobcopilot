@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { createQuestionHydrationPump, filterQuestionHydrationValues, type FinalItemHydrationTarget } from './question-hydration'
+import { createQuestionHydrationPump, filterQuestionHydrationValues, hydrateFinalItemFromResponse, type FinalItemHydrationTarget } from './question-hydration'
 
 function questionStub(questionId: string, overrides: Record<string, unknown> = {}) {
   return {
@@ -19,6 +19,15 @@ function finalStub(overrides: Record<string, unknown> = {}) {
   }
 }
 
+function finalItemDto(overrides: Record<string, unknown> = {}) {
+  return {
+    schemaVersion: 'agent-harness.v2', id: 'turn:turn-1:item:final:step-1', sessionId: 'session-1', turnId: 'turn-1',
+    stepId: 'step-1', taskId: 'task-1', type: 'agent_message', status: 'completed', phase: 'final_answer', revision: 1,
+    content: { text: 'Synthetic final answer.' }, startedAt: null, completedAt: '2026-09-03T00:00:00.000Z',
+    createdAt: '2026-09-03T00:00:00.000Z', updatedAt: '2026-09-03T00:00:00.000Z', ...overrides,
+  }
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void
   let reject!: (reason: unknown) => void
@@ -27,6 +36,37 @@ function deferred<T>() {
 }
 
 describe('question hydration pump', () => {
+  it('projects a strictly bound canonical final item before replay dispatch', async () => {
+    const onProjection = vi.fn()
+    const target = { itemId: 'turn:turn-1:item:final:step-1', turnId: 'turn-1' }
+    const item = await hydrateFinalItemFromResponse([finalItemDto()], target, 'session-1', onProjection)
+    expect(item).toMatchObject({ id: target.itemId, turnId: target.turnId, type: 'agent_message', status: 'completed', phase: 'final_answer' })
+    expect(onProjection).toHaveBeenCalledOnce()
+    expect(await hydrateFinalItemFromResponse([finalItemDto({ turnId: 'turn-2' })], target, 'session-1', onProjection)).toBeNull()
+    expect(onProjection).toHaveBeenCalledOnce()
+  })
+
+  it('reports only bounded booleans for an accepted target completion', async () => {
+    const diagnostics = {
+      matchesTarget: vi.fn((sessionId: unknown, turnId: unknown) => sessionId === 'session-1' && turnId === 'turn-1'),
+      recordTurnCompleted: vi.fn(), recordFinalItemTarget: vi.fn(), recordFinalItemHydration: vi.fn(),
+    }
+    vi.stubGlobal('window', { __applymateFinalDiagnostics: diagnostics })
+    try {
+      const pump = createQuestionHydrationPump({ sessionId: 'session-1', hydrate: vi.fn().mockResolvedValue(undefined),
+        hydrateFinalItem: vi.fn().mockResolvedValue(undefined) })
+      pump.request(finalStub())
+      expect(diagnostics.recordFinalItemTarget).toHaveBeenCalledWith({
+        targetSessionMatches: true, targetTurnMatches: true, actorMatches: true, sequencePresent: true, itemPresent: true,
+        payloadRecord: true, payloadTurnMatches: true, payloadTaskMatches: true, finalItemMatchesEventItem: true, targetAccepted: true,
+      })
+      await Promise.resolve()
+      const current = pump.current()
+      if (current) await current
+      expect(JSON.stringify(diagnostics.recordFinalItemTarget.mock.calls)).not.toContain('turn:turn-1')
+    } finally { vi.unstubAllGlobals() }
+  })
+
   it('coalesces synchronous stubs into one hydration and loops newly queued keys', async () => {
     const first = deferred<void>()
     const hydrate = vi.fn<(itemIds: readonly string[]) => Promise<void>>()
