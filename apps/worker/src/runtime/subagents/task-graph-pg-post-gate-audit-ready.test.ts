@@ -61,9 +61,10 @@ function fixture(overrides: Readonly<{ auditNode?: Record<string, unknown>; audi
   return { loaded, node: selectedNode, task: auditTask, receipt: overrides.receipt === undefined ? receipt : overrides.receipt }
 }
 
-function client(overrides: Readonly<{ turnLeaseOwner?: string; turnLeaseVersion?: number }> = {}) {
-  return { query: vi.fn(async () => ({ rows: [{ attemptCount: 3, parentLeaseOwner: "parent-lease",
-    turnLeaseOwner: overrides.turnLeaseOwner ?? "turn-lease", turnLeaseVersion: overrides.turnLeaseVersion ?? 8 }], rowCount: 1 })) }
+function client(overrides: Readonly<{ attemptCount?: number; turnLeaseOwner?: string; turnLeaseVersion?: number; unavailable?: boolean }> = {}) {
+  const rows = overrides.unavailable ? [] : [{ attemptCount: overrides.attemptCount ?? 3, parentLeaseOwner: "parent-lease",
+    turnLeaseOwner: overrides.turnLeaseOwner ?? "turn-lease", turnLeaseVersion: overrides.turnLeaseVersion ?? 8 }]
+  return { query: vi.fn(async () => ({ rows, rowCount: rows.length })) }
 }
 
 beforeEach(() => {
@@ -108,12 +109,39 @@ describe("Post-Gate Audit dependency context promotion", () => {
     expect(contextMocks.materialize).toHaveBeenCalledTimes(1)
   })
 
+  it("allows the current Turn lease to refresh while the immutable handoff keeps the same Root attempt", async () => {
+    const current = fixture(), db = client({ turnLeaseOwner: "refreshed-turn-lease", turnLeaseVersion: 9 })
+    handoffMocks.read.mockImplementation(async () => current.receipt)
+
+    await expect(readyTaskDependencyContext(db as never, scope, current.loaded, current.node, current.task))
+      .resolves.toEqual({})
+
+    expect(handoffMocks.validate).toHaveBeenCalledTimes(1)
+    expect(handoffMocks.validate.mock.calls[0]?.[1]).toMatchObject({
+      ...scope, parentAttemptCount: 3, turnLeaseOwner: "refreshed-turn-lease", turnLeaseVersion: 9,
+    })
+    expect(contextMocks.load).not.toHaveBeenCalled()
+    expect(contextMocks.materialize).not.toHaveBeenCalled()
+  })
+
+  it("keeps generic materialization when the current Root attempt differs from the immutable handoff", async () => {
+    const current = fixture(), db = client({ attemptCount: 4 })
+    handoffMocks.read.mockImplementation(async () => current.receipt)
+
+    await expect(readyTaskDependencyContext(db as never, scope, current.loaded, current.node, current.task))
+      .resolves.toEqual({ generic: "dependency-context" })
+
+    expect(handoffMocks.validate).not.toHaveBeenCalled()
+    expect(contextMocks.load).toHaveBeenCalledTimes(1)
+    expect(contextMocks.materialize).toHaveBeenCalledTimes(1)
+  })
+
   it.each([
-    ["owner ID", { owner: { ...receipt.owner, turnLeaseOwnerId: "different-turn-lease" } }],
-    ["lease version", { owner: { ...receipt.owner, turnLeaseVersion: receipt.owner.turnLeaseVersion + 1 } }],
-  ] as const)("keeps generic materialization when the current Turn %s differs from the handoff", async (_label, owner) => {
-    const mismatchedReceipt = { ...receipt, owner: owner.owner } as ScheduledPostGateHandoff
-    const current = fixture({ receipt: mismatchedReceipt }), db = client()
+    ["owner ID", { turnLeaseOwner: "" }],
+    ["lease version", { turnLeaseVersion: 0 }],
+    ["unavailable", { unavailable: true }],
+  ] as const)("keeps generic materialization when the current Turn lease %s is invalid or unavailable", async (_label, lease) => {
+    const current = fixture(), db = client(lease)
     handoffMocks.read.mockImplementation(async () => current.receipt)
 
     await expect(readyTaskDependencyContext(db as never, scope, current.loaded, current.node, current.task))

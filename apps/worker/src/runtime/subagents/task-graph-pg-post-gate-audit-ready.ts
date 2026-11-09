@@ -7,7 +7,7 @@ import { readScheduledPostGateReceipt, validateScheduledPostGateHandoff } from "
 import {
   SCHEDULED_POST_GATE_AUDIT_CRITERIA, SCHEDULED_POST_GATE_AUDIT_GOAL, SCHEDULED_POST_GATE_AUDIT_OUTPUT_SCHEMA,
   SCHEDULED_POST_GATE_AUDIT_ROLE, SCHEDULED_POST_GATE_AUDIT_TASK_TYPE, SCHEDULED_POST_GATE_AUDIT_TEMPLATE_ID,
-  SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID, scheduledPostGateScopeMatchesOwner,
+  SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID,
 } from "./scheduled-post-gate-contract.js"
 import { isScheduledTaskGraphSpecializedEnvelope } from "./task-graph-pg-specialized-envelope.js"
 import type { GraphIdentityScope, GraphTaskRow, LoadedGraph } from "./task-graph-pg-state.js"
@@ -76,7 +76,9 @@ async function isServerOwnedPostGateAuditReady(
     parentLeaseOwner: typeof owner.parentLeaseOwner === "string" ? owner.parentLeaseOwner : "",
     turnLeaseOwner: owner.turnLeaseOwner, turnLeaseVersion: Number(owner.turnLeaseVersion),
   }
-  if (!scheduledPostGateScopeMatchesOwner(validationScope, receipt.owner)) return false
+  if (receipt.owner.userId !== scope.userId || receipt.owner.sessionId !== scope.sessionId
+    || receipt.owner.turnId !== scope.turnId || receipt.owner.rootTaskId !== scope.rootTaskId
+    || receipt.owner.rootAttemptCount !== validationScope.parentAttemptCount) return false
   return validateScheduledPostGateHandoff(client, validationScope, loaded, receipt)
 }
 
