@@ -4316,7 +4316,7 @@ withServices("durable child wait across PostgreSQL/Redis Worker process restart"
         await setPayload(safePayload)
         await expect(sourceWaitBlocksRecovery()).resolves.toBe(false)
         await setPayload(rawPayload)
-        await expect(sourceWaitBlocksRecovery()).resolves.toBe(false)
+        await expect(sourceWaitBlocksRecovery()).resolves.toBe(true)
         const tamperedContent = { ...sourceCallItem.content, input: { ...asObject(sourceCallItem.content.input), taskIds: ["different-child"] } }
         await setPayload({ itemId: sourceCallItem.id, status: "completed", content: tamperedContent })
         await expect(sourceWaitBlocksRecovery()).resolves.toBe(true)
