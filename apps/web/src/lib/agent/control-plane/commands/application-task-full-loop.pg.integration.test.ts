@@ -1239,6 +1239,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     const fixtureStats = await requestFixtureStats()
     expect(fixtureStats.submitCount).toBe(1)
     expect(fixtureStats.blocked).toEqual([])
+    await waitForTask(task => task.status === "waiting_for_user" && task.checkpoint === "submission_uncertain")
     const restartedTask = await testDb.applicationTask.findUniqueOrThrow({ where: { id: gateTaskId }, select: {
       id: true, userId: true, jobId: true, sessionId: true, fillTurnId: true, workerTaskId: true, status: true, checkpoint: true,
     } })
