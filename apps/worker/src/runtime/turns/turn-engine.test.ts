@@ -167,7 +167,7 @@ describe("TurnEngine", () => {
     const options: TurnEngineOptions = {
       ...fixture.options, contextBuilder, executeTool,
       model: { ...model, async *stream(request) {
-        requestedToolNames.push(request.tools.map(tool => tool.name))
+        requestedToolNames.push(request.tools.flatMap(tool => isRecord(tool) && typeof tool.name === "string" ? [tool.name] : []))
         yield* model.stream(request)
       } },
     }
