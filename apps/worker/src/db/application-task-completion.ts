@@ -132,7 +132,7 @@ async function existingCompletion(client: Client, lease: SubagentLease, task: Ap
   if (found.rows.length !== 1 || !approval || !expiresAt || !approval.nonceHash || !approval.scopeHash
     || !["pending", "approved"].includes(approval.status) || (approvedOnly && approval.status !== "approved")
     || approval.userId !== lease.userId || approval.sessionId !== lease.sessionId || approval.turnId !== turnId
-    || approval.jobId !== task.jobId || approval.taskId !== lease.id || approval.type !== "submit_application"
+    || approval.jobId !== task.jobId || approval.taskId !== task.id || approval.type !== "submit_application"
     || approval.toolCallId !== `application-submit:${task.id}` || approval.resourceHash !== resourceHash
     || approval.materialHash !== materialHash || approval.answersHash !== answersHash || !exactSubmissionPayload(approval.payload, payload)
     || !Number.isSafeInteger(approval.revision) || approval.revision + 1 !== turn.revision) return false
@@ -163,7 +163,7 @@ export async function completeApplicationFillForReview(pool: Pool, input: { read
     const resourceHash = approvalResourceHash(artifact.hash)
     if (!resourceHash) throw new Error("Application submission artifact hash is invalid")
     const payload = submissionPayload(task)
-    const approvalInput: IssueApprovalReceiptInput = { approvalId: `application-fill:${task.id}:${turnId}`, taskId: lease.id,
+    const approvalInput: IssueApprovalReceiptInput = { approvalId: `application-fill:${task.id}:${turnId}`, taskId: task.id,
       scope: { userId: lease.userId, sessionId: lease.sessionId, turnId, jobId: task.jobId, toolCallId: `application-submit:${task.id}`, action: "submit_application", resourceHash,
         materialHash: await hashAgentReceiptValue("material", payload), answersHash, revision: turn.revision, expiresAt: new Date(now.getTime() + 15 * 60 * 1000) },
       title: COMPLETION_TITLE, body: COMPLETION_BODY, impact: { externalSubmission: true, jobId: task.jobId }, payload, nonce: createApprovalNonce() }

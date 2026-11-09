@@ -1026,7 +1026,7 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
     expect((await requestFixtureStats()).browserTrace).toContain("input:first_name")
     expect((await requestFixtureStats()).browserTrace).toContain("input:work_authorization")
     expect(await testDb.agentApproval.count({ where: { userId: ids.user, sessionId: ids.session, turnId: successorTurnId,
-      taskId: { not: null }, type: "submit_application", status: "pending" } })).toBe(1)
+      taskId: gateTaskId, type: "submit_application", status: "pending" } })).toBe(1)
     await assertNoSubmitBeforeApproval()
 
     const originalTurnJobId = successorTurnJobs[0]?.id
@@ -1073,16 +1073,16 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       where: { id: gateTaskId }, select: { status: true, checkpoint: true, fillTurnId: true },
     })).toEqual(taskBeforeDuplicate)
     expect(await testDb.agentApproval.count({ where: { userId: ids.user, sessionId: ids.session, turnId: successorTurnId,
-      taskId: { not: null }, type: "submit_application", status: "pending" } })).toBe(1)
+      taskId: gateTaskId, type: "submit_application", status: "pending" } })).toBe(1)
     await assertNoSubmitBeforeApproval()
 
     const submitApproval = await testDb.agentApproval.findFirstOrThrow({ where: {
       userId: ids.user, sessionId: ids.session, turnId: successorTurnId,
-      taskId: { not: null }, type: "submit_application", status: "pending",
+      taskId: gateTaskId, type: "submit_application", status: "pending",
     } })
     expect(submitApproval).toMatchObject({ userId: ids.user, sessionId: ids.session, turnId: successorTurnId,
       jobId: ids.job, type: "submit_application", status: "pending" })
-    expect(submitApproval.taskId).toBeTruthy()
+    expect(submitApproval.taskId).toBe(gateTaskId)
     expect(submitApproval.payload).toMatchObject({ applicationTaskId: gateTaskId, jobId: ids.job, resumeId: ids.resume })
     const { GET: getApproval } = await import("@/app/api/agent/sessions/[id]/approvals/[approvalId]/route")
     const nonceResponse = await getApproval(apiRequest(`/api/agent/sessions/${ids.session}/approvals/${submitApproval.id}`, ownerToken, "GET"), {

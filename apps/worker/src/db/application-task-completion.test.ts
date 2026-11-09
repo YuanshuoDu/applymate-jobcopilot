@@ -9,7 +9,7 @@ import type { SubagentLease } from "../runtime/subagents/types.js"
 import { acknowledgeApplicationFillCancellation, completeApplicationFillForReview, failApplicationFillBeforeBrowser, persistApplicationFillWait } from "./application-task-completion.js"
 
 type FillTaskFixture = { id: string; jobId: string; resumeId: string | null; coverLetterId: string | null; confirmedAnswers: unknown }
-type ApprovalMismatch = "turn" | "user" | "session" | "task" | "job" | "scope" | "payload" | "consumed"
+type ApprovalMismatch = "turn" | "user" | "session" | "task" | "legacy_child" | "job" | "scope" | "payload" | "consumed"
 type ApprovalFixtureRow = {
   id: string; userId: string; sessionId: string; turnId: string; jobId: string; type: string; taskId: string
   status: string; toolCallId: string; payload: unknown; resourceHash: string; materialHash: string
@@ -39,7 +39,7 @@ async function approvalFixture(
   const artifact = await artifactFixture(task, "user-a")
   const row = {
     id: `application-fill:${task.id}:turn-a`, userId: "user-a", sessionId: "session-a", turnId: "turn-a", jobId: task.jobId,
-    type: "submit_application", taskId: "filler-task", status, toolCallId: `application-submit:${task.id}`,
+    type: "submit_application", taskId: task.id, status, toolCallId: `application-submit:${task.id}`,
     payload: artifact.payload, resourceHash: artifact.hash.slice("sha256:".length), materialHash: artifact.materialHash, answersHash: artifact.answersHash,
     nonceHash: "d".repeat(64), revision, expiresAt: new Date("2099-11-01T00:00:00.000Z"), scopeHash: "",
   }
@@ -47,6 +47,7 @@ async function approvalFixture(
   if (mismatch === "user") row.userId = "foreign-user"
   if (mismatch === "session") row.sessionId = "foreign-session"
   if (mismatch === "task") row.taskId = "foreign-task"
+  if (mismatch === "legacy_child") row.taskId = "filler-task"
   if (mismatch === "job") row.jobId = "foreign-job"
   if (mismatch === "scope") row.resourceHash = "sha256:foreign-resource-hash"
   if (mismatch === "payload") row.payload = { ...artifact.payload, applicationTaskId: "foreign-application" }
@@ -170,6 +171,7 @@ describe("ApplicationTask fill completion", () => {
     expect(test.calls.some(call => call.sql.includes("ON CONFLICT DO NOTHING RETURNING"))).toBe(true)
     const approvalInsert = test.calls.find(call => call.sql.includes('INSERT INTO "agent_approvals"'))
     const artifactInsert = test.calls.find(call => call.sql.includes('INSERT INTO "agent_artifact"'))
+    expect(approvalInsert?.values?.[2]).toBe("application-a")
     expect(approvalInsert?.values?.[4]).toBe("turn-a")
     expect(approvalInsert?.values?.[12]).toMatch(/^[a-f0-9]{64}$/)
     expect(approvalInsert?.values?.[12]).toBe(String(artifactInsert?.values?.[4]).slice("sha256:".length))
@@ -369,7 +371,7 @@ describe("ApplicationTask fill completion", () => {
     expect(test.calls.some(call => /^(UPDATE|INSERT)/.test(call.sql))).toBe(false)
   })
 
-  it.each(["turn", "user", "session", "task", "job", "scope", "payload", "consumed"] as const)(
+  it.each(["turn", "user", "session", "task", "legacy_child", "job", "scope", "payload", "consumed"] as const)(
     "rejects recovery when approval %s binding differs or was consumed", async mismatch => {
       const status = mismatch === "consumed" ? "consumed" : "approved"
       const test = fixture({
