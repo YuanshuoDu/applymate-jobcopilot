@@ -514,6 +514,44 @@ async function waitForTask(predicate: (task: ApplicationTaskRow) => boolean, tim
   throw new Error(`ApplicationTask state timeout: ${diagnostics}`)
 }
 
+async function waitForSubmissionTerminalProof(expected: {
+  taskId: string
+  userId: string
+  jobId: string
+  sessionId: string
+  fillTurnId: string
+  workerTaskId: string
+  approvalId: string
+  constraintHash: unknown
+}, timeoutMs = 120_000) {
+  const until = Date.now() + timeoutMs
+  let latestCount = 0
+  while (Date.now() < until) {
+    const proofs = await testDb.applicationTaskEvent.findMany({ where: {
+      taskId: expected.taskId, type: "submission_terminal_observed", actor: "worker",
+    }, select: { id: true, taskId: true, type: true, actor: true, data: true } })
+    latestCount = proofs.length
+    const proof = proofs[0]
+    const data = jsonRecord(proof?.data)
+    const attemptsMade = data?.attemptsMade
+    const attempts = data?.attempts
+    const exactProof = proofs.length === 1 && proof?.taskId === expected.taskId
+      && proof.type === "submission_terminal_observed" && proof.actor === "worker"
+      && data?.applicationTaskId === expected.taskId && data.userId === expected.userId
+      && data.jobId === expected.jobId && data.sessionId === expected.sessionId
+      && data.fillTurnId === expected.fillTurnId && data.workerTaskId === expected.workerTaskId
+      && data.approvalId === expected.approvalId && data.receiptId === expected.approvalId
+      && data.constraintHash === expected.constraintHash
+      && (data.terminalState === "completed" || data.terminalState === "failed")
+      && typeof attemptsMade === "number" && Number.isSafeInteger(attemptsMade) && attemptsMade >= 0
+      && typeof attempts === "number" && Number.isSafeInteger(attempts) && attempts >= 1
+      && (data.terminalState !== "failed" || attemptsMade >= attempts)
+    if (exactProof) return proofs
+    await delay(100)
+  }
+  throw new Error(`Timed out waiting for one exact Worker submission terminal proof; count=${latestCount}`)
+}
+
 async function matchingQueueJobs(queue: InstanceType<typeof Queue> | undefined, field: "turnId" | "taskId", id: string) {
   if (!queue) return []
   const jobs = await queue.getJobs(["waiting", "active", "delayed", "completed", "failed", "paused", "waiting-children", "prioritized"], 0, -1)
@@ -1253,9 +1291,11 @@ describeWithServices("ApplicationTask production full-loop PostgreSQL integratio
       idempotencyKey: outbox[0]!.idempotencyKey, aggregateId: ids.session, topic: "application.submit.dispatch",
       payload: intent, publishedAt: expect.any(Date),
     })
-    const terminalProofs = await testDb.applicationTaskEvent.findMany({ where: {
-      taskId: gateTaskId, type: "submission_terminal_observed", actor: "worker",
-    }, select: { id: true, taskId: true, type: true, actor: true, data: true } })
+    const terminalProofs = await waitForSubmissionTerminalProof({
+      taskId: gateTaskId!, userId: ids.user, jobId: ids.job, sessionId: ids.session,
+      fillTurnId: successorTurnId, workerTaskId, approvalId: submitApproval.id,
+      constraintHash: intent.constraintHash,
+    })
     expect(terminalProofs).toHaveLength(1)
     const terminalProof = terminalProofs[0]!
     expect(terminalProof).toMatchObject({ taskId: gateTaskId, type: "submission_terminal_observed", actor: "worker" })
