@@ -16,16 +16,22 @@ import { createScheduledGateChildExecutor } from "./scheduled-gate-child-runtime
 import { createScheduledPostGateChildExecutor } from "./scheduled-post-gate-child-runtime.js"
 import { PgSubagentTaskStore } from "./pg-store.js"
 import { policyFromTask } from "./manager-task-scope.js"
-import { SCHEDULED_GATE_TEMPLATE_ID } from "./scheduled-gate-contract.js"
+import { parseScheduledGateTaskEnvelope, scheduledGatePreparedJobIds, SCHEDULED_GATE_NODE_CRITERIA,
+  SCHEDULED_GATE_NODE_GOAL, SCHEDULED_GATE_OUTPUT_SCHEMA, SCHEDULED_GATE_ROLE, SCHEDULED_GATE_TASK_TYPE,
+  SCHEDULED_GATE_TEMPLATE_ID } from "./scheduled-gate-contract.js"
+import { scheduledGateResultDigest, verifyPersistedScheduledPreparePrefix } from "./pg-scheduled-task-graph-gate-verification.js"
+import { parseScheduledPostGatePlan } from "./scheduled-post-gate-plan.js"
 import { SCHEDULED_POST_GATE_AUDIT_CRITERIA, SCHEDULED_POST_GATE_AUDIT_GOAL,
-  SCHEDULED_POST_GATE_AUDIT_TEMPLATE_ID, SCHEDULED_POST_GATE_EXECUTE_CRITERIA,
-  SCHEDULED_POST_GATE_EXECUTE_GOAL, SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID } from "./scheduled-post-gate-contract.js"
+  SCHEDULED_POST_GATE_AUDIT_OUTPUT_SCHEMA, SCHEDULED_POST_GATE_AUDIT_ROLE, SCHEDULED_POST_GATE_AUDIT_TASK_TYPE,
+  SCHEDULED_POST_GATE_AUDIT_TEMPLATE_ID, SCHEDULED_POST_GATE_EXECUTE_CRITERIA, SCHEDULED_POST_GATE_EXECUTE_GOAL,
+  SCHEDULED_POST_GATE_EXECUTE_OUTPUT_SCHEMA, SCHEDULED_POST_GATE_EXECUTE_ROLE, SCHEDULED_POST_GATE_EXECUTE_TASK_TYPE,
+  SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID, scheduledPostGateDigest, type ScheduledPostGateHandoff } from "./scheduled-post-gate-contract.js"
 import { readScheduledPostGateReceipt, validateScheduledPostGateHandoff } from "./scheduled-post-gate-handoff.js"
-import { loadTaskGraph, lockTaskGraphScope } from "./task-graph-pg-state.js"
+import { currentTaskGraph, loadTaskGraph, lockTaskGraphScope } from "./task-graph-pg-state.js"
 import type { TaskGraphReadScope } from "./task-graph-command-port.js"
 import { projectScheduledPipelineGraphAtCurrentStage } from "./scheduled-pipeline-graph-shape.js"
 import { canonicalTaskGraphJson, parseTaskGraphSnapshot, taskGraphFingerprint, taskGraphItemId,
-  taskGraphProposalKey } from "./task-graph-snapshot.js"
+  taskGraphLifecycleKey, taskGraphProposalKey } from "./task-graph-snapshot.js"
 import { TASK_GRAPH_TEMPLATES } from "./task-graph-templates.js"
 import { executionKey } from "../turns/turn-execution-types.js"
 import type { TaskGraphProposal } from "../planning/task-graph.js"
@@ -209,6 +215,8 @@ describeWithServices("scheduled post-Gate TaskGraph handoff in disposable Postgr
 type ScheduledPostGateReplayDiagnostic = Readonly<{
   available: boolean
   handoffValid: boolean
+  stages?: Readonly<{ ownerProof: boolean; gateRow: boolean; gateEvent: boolean; gateEnvelope: boolean; preparePrefix: boolean;
+    suffixShape: boolean; proposalDigestParse: boolean; taskRows: boolean; gateEventCount: number }>
   acceptedPlan?: Readonly<{ eventCount: number; identity: boolean; fingerprint: boolean; receipt: boolean; nodes: boolean; readyTaskIds: boolean }>
 }>
 
@@ -224,11 +232,12 @@ async function diagnoseScheduledPostGateReplay(pool: Pool, scope: TaskGraphReadS
     const receipt = await readScheduledPostGateReceipt(client, scope)
     if (!receipt || !loaded.snapshot || !loaded.state) return { available: true, handoffValid: false }
     const handoffValid = await validateScheduledPostGateHandoff(client, scope, loaded, receipt)
+    const stageDetails = await diagnoseScheduledPostGateHandoffStages(client, scope, loaded, receipt)
     const gateIndex = loaded.snapshot.nodes.findIndex(node => node.key === SCHEDULED_GATE_TEMPLATE_ID)
-    const proposal = { expectedRevision: receipt.gateGraphRevision, nodes: loaded.snapshot.nodes.slice(gateIndex + 1).map(node => ({
+    const proposal = gateIndex >= 0 ? { expectedRevision: receipt.gateGraphRevision, nodes: loaded.snapshot.nodes.slice(gateIndex + 1).map(node => ({
       key: node.key, templateId: node.templateId, goal: node.goal, successCriteria: node.successCriteria, dependsOn: node.dependsOn,
       ...(node.packageRefs === undefined ? {} : { packageRefs: node.packageRefs }),
-    })) }
+    })) } : null
     const key = taskGraphProposalKey(scope.rootTaskId, receipt.gateGraphRevision)
     const result = await client.query<Record<string, unknown>>(`SELECT event."itemId", event."taskId", event."actor",
       event."idempotencyKey", event."payload" FROM "agent_events" AS event
@@ -247,11 +256,11 @@ async function diagnoseScheduledPostGateReplay(pool: Pool, scope: TaskGraphReadS
       identity: Boolean(single && event && event.itemId === taskGraphItemId(scope.rootTaskId)
         && event.taskId === scope.rootTaskId && event.actor === "orchestrator" && event.idempotencyKey === key
         && payload?.kind === "proposal" && payload.revision === receipt.graphRevision),
-      fingerprint: Boolean(payload && safeDiagnosticSame(payload.fingerprint, taskGraphFingerprint(proposal))),
+      fingerprint: Boolean(payload && proposal && safeDiagnosticSame(payload.fingerprint, taskGraphFingerprint(proposal))),
       receipt: Boolean(planReceipt && planReceipt.status === "accepted" && planReceipt.revision === receipt.graphRevision),
       nodes: Boolean(planNodes && safeDiagnosticSame(planNodes, expectedNodes)),
       readyTaskIds: Boolean(planReceipt && safeDiagnosticSame(planReceipt.readyTaskIds, receipt.executeNodes.map(node => node.taskId))),
-    } }
+    }, stages: stageDetails }
   } catch {
     return { available: false, handoffValid: false }
   } finally {
@@ -260,6 +269,101 @@ async function diagnoseScheduledPostGateReplay(pool: Pool, scope: TaskGraphReadS
       client.release()
     }
   }
+}
+
+async function diagnoseScheduledPostGateHandoffStages(client: PoolClient, scope: TaskGraphReadScope,
+  loaded: Awaited<ReturnType<typeof loadTaskGraph>>, receipt: ScheduledPostGateHandoff): Promise<NonNullable<ScheduledPostGateReplayDiagnostic["stages"]>> {
+  const snapshot = loaded.snapshot, state = loaded.state
+  const proofOwner = receipt.gateProof.prepareProof.receipt.owner
+  const ownerProof = Boolean(snapshot && state && receipt.owner.userId === scope.userId
+    && receipt.owner.sessionId === scope.sessionId && receipt.owner.turnId === scope.turnId
+    && receipt.owner.rootTaskId === scope.rootTaskId && receipt.owner.rootAttemptCount === scope.parentAttemptCount
+    && receipt.graphRevision <= state.revision && safeScheduledPostGateDigest(receipt.gateProof) === receipt.gateProofDigest
+    && receipt.gateResultDigest === receipt.gateProof.gate.resultDigest
+    && receipt.gateGraphRevision === receipt.gateProof.graphRevision
+    && receipt.gateCompletedEventRevision === receipt.gateProof.gate.completedEventRevision
+    && receipt.snapshotDigest === receipt.gateProof.prepareProof.receipt.snapshotDigest
+    && receipt.continuationKey === receipt.gateProof.prepareProof.receipt.continuationKey
+    && receipt.owner.userId === proofOwner.userId && receipt.owner.sessionId === proofOwner.sessionId
+    && receipt.owner.turnId === proofOwner.turnId && receipt.owner.rootTaskId === proofOwner.rootTaskId
+    && receipt.owner.rootAttemptCount === proofOwner.rootAttemptCount
+    && receipt.owner.turnLeaseOwnerId === proofOwner.turnLeaseOwnerId
+    && receipt.owner.turnLeaseVersion === proofOwner.turnLeaseVersion
+    && receipt.owner.executionId === proofOwner.executionId
+    && receipt.owner.executionAttemptCount === proofOwner.executionAttemptCount)
+
+  const gateNode = snapshot?.nodes.find(node => node.key === SCHEDULED_GATE_TEMPLATE_ID)
+  const gateTask = gateNode && loaded.tasks.get(gateNode.taskId)
+  const gateRow = Boolean(gateNode && gateTask && gateNode.taskId === receipt.gateTaskId
+    && gateNode.templateId === SCHEDULED_GATE_TEMPLATE_ID && gateNode.depth === 4
+    && gateNode.verificationDisposition === "specialized" && gateNode.verification === undefined
+    && gateNode.goal === SCHEDULED_GATE_NODE_GOAL && safeDiagnosticSame(gateNode.successCriteria, SCHEDULED_GATE_NODE_CRITERIA)
+    && safeDiagnosticSame(gateNode.dependsOn, ["prepare"]) && gateTask.status === "completed"
+    && gateTask.attemptCount === receipt.gateAttemptCount && gateTask.failureReason === null
+    && gateTask.role === SCHEDULED_GATE_ROLE && gateTask.taskType === SCHEDULED_GATE_TASK_TYPE
+    && safeDiagnosticSame(gateTask.expectedOutputSchema, SCHEDULED_GATE_OUTPUT_SCHEMA)
+    && safeDiagnosticSame(gateTask.allowedActions, []) && gateTask.contextIsEmpty === true
+    && scheduledGateResultDigest(gateTask.result) === receipt.gateResultDigest)
+  const gateEvents = state?.appliedEvents.filter(event => event.nodeKey === SCHEDULED_GATE_TEMPLATE_ID && event.type === "task.completed"
+    && event.idempotencyKey === taskGraphLifecycleKey(scope.rootTaskId, SCHEDULED_GATE_TEMPLATE_ID, receipt.gateAttemptCount, "task.completed")) ?? []
+  const gateEvent = Boolean(state && gateEvents.length === 1
+    && gateEvents[0]?.expectedRevision + 1 === receipt.gateCompletedEventRevision
+    && receipt.gateCompletedEventRevision === receipt.gateGraphRevision)
+  const preparedIds = scheduledGatePreparedJobIds(receipt.gateProof.prepareProof)
+  const envelope = preparedIds && gateTask ? parseScheduledGateTaskEnvelope(gateTask.result, gateTask.status, preparedIds) : null
+  const gateEnvelope = Boolean(envelope && envelope.structuredResult.status === "completed"
+    && safeDiagnosticSame(envelope.structuredResult.approvedJobIds, receipt.packageRefs))
+  const preparePrefix = Boolean(gateEnvelope && snapshot && state
+    && await verifyPersistedScheduledPreparePrefix(client, scope, loaded, receipt.gateProof.prepareProof))
+
+  const gateIndex = snapshot?.nodes.findIndex(node => node.key === SCHEDULED_GATE_TEMPLATE_ID) ?? -1
+  const suffix = snapshot && gateIndex >= 0 ? snapshot.nodes.slice(gateIndex + 1) : []
+  const executeNodes = receipt.executeNodes.map(reference => {
+    const node = suffix.find(value => value.key === reference.key)
+    return node && node.taskId === reference.taskId && node.templateId === SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID
+      && node.depth === 5 && node.verificationDisposition === "specialized" && node.verification === undefined
+      && node.packageRefs !== undefined && safeDiagnosticSame(node.packageRefs, reference.packageRefs)
+      && safeDiagnosticSame(node.dependsOn, [SCHEDULED_GATE_TEMPLATE_ID]) ? node : null
+  })
+  const auditNode = suffix.at(-1)
+  const suffixShape = Boolean(gateIndex >= 0 && suffix.length === receipt.executeNodes.length + 1
+    && executeNodes.every(node => node !== null) && auditNode && auditNode.key === SCHEDULED_POST_GATE_AUDIT_TEMPLATE_ID
+    && auditNode.templateId === SCHEDULED_POST_GATE_AUDIT_TEMPLATE_ID && auditNode.taskId === receipt.auditTaskId
+    && auditNode.depth === 6 && auditNode.verificationDisposition === "specialized" && auditNode.verification === undefined
+    && auditNode.goal === SCHEDULED_POST_GATE_AUDIT_GOAL
+    && safeDiagnosticSame(auditNode.successCriteria, SCHEDULED_POST_GATE_AUDIT_CRITERIA)
+    && sameDiagnosticSet(auditNode.dependsOn, receipt.executeNodes.map(node => node.key)))
+  const proposal = gateIndex >= 0 ? { expectedRevision: receipt.gateGraphRevision, nodes: suffix.map(node => ({ key: node.key,
+    templateId: node.templateId, goal: node.goal, successCriteria: node.successCriteria, dependsOn: node.dependsOn,
+    ...(node.packageRefs === undefined ? {} : { packageRefs: node.packageRefs }) })) } : null
+  const proposalDigestParse = Boolean(proposal && safeScheduledPostGateDigest(proposal) === receipt.proposalDigest
+    && parseScheduledPostGatePlan(proposal, receipt.gateGraphRevision, receipt.packageRefs))
+  const current = currentTaskGraph(loaded)
+  const taskRows = Boolean(suffixShape && [...executeNodes, auditNode].every(node => node !== null && node !== undefined
+    && diagnosticPostGateTaskMatches(node, loaded, current.nodes)))
+  return { ownerProof, gateRow, gateEvent, gateEnvelope, preparePrefix, suffixShape, proposalDigestParse, taskRows,
+    gateEventCount: Math.min(gateEvents.length, 2) }
+}
+
+function diagnosticPostGateTaskMatches(node: NonNullable<Awaited<ReturnType<typeof loadTaskGraph>>["snapshot"]>["nodes"][number],
+  loaded: Awaited<ReturnType<typeof loadTaskGraph>>, currentNodes: ReturnType<typeof currentTaskGraph>["nodes"]): boolean {
+  const task = loaded.tasks.get(node.taskId), current = currentNodes.find(value => value.key === node.key)
+  if (!task || task.id !== node.taskId || task.status !== current?.status || task.failureReason !== current?.failureReason) return false
+  return node.templateId === SCHEDULED_POST_GATE_EXECUTE_TEMPLATE_ID
+    ? task.role === SCHEDULED_POST_GATE_EXECUTE_ROLE && task.taskType === SCHEDULED_POST_GATE_EXECUTE_TASK_TYPE
+      && safeDiagnosticSame(task.expectedOutputSchema, SCHEDULED_POST_GATE_EXECUTE_OUTPUT_SCHEMA)
+      && safeDiagnosticSame(task.allowedActions, []) && task.contextIsEmpty === true
+    : task.role === SCHEDULED_POST_GATE_AUDIT_ROLE && task.taskType === SCHEDULED_POST_GATE_AUDIT_TASK_TYPE
+      && safeDiagnosticSame(task.expectedOutputSchema, SCHEDULED_POST_GATE_AUDIT_OUTPUT_SCHEMA)
+      && safeDiagnosticSame(task.allowedActions, []) && task.contextIsEmpty === true
+}
+
+function safeScheduledPostGateDigest(value: unknown): string | null {
+  try { return scheduledPostGateDigest(value) } catch { return null }
+}
+
+function sameDiagnosticSet(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && new Set(left).size === left.length && left.every(value => right.includes(value))
 }
 
 function diagnosticDenseArray(value: unknown): unknown[] | null {

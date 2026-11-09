@@ -21,6 +21,7 @@ import { parseScheduledAuditTaskEnvelope } from "./scheduled-audit-contract.js"
 import { parseScheduledPostGatePlan } from "./scheduled-post-gate-plan.js"
 import { readScheduledPostGateReceipt, validateScheduledPostGateHandoff } from "./scheduled-post-gate-handoff.js"
 import { taskGraphLifecycleKey } from "./task-graph-snapshot.js"
+import { projectScheduledPipelineGraphAtCurrentStage } from "./scheduled-pipeline-graph-shape.js"
 import {
   SCHEDULED_POST_GATE_AUDIT_CRITERIA, SCHEDULED_POST_GATE_AUDIT_GOAL, SCHEDULED_POST_GATE_AUDIT_OUTPUT_SCHEMA,
   SCHEDULED_POST_GATE_AUDIT_ROLE, SCHEDULED_POST_GATE_AUDIT_TASK_TYPE, SCHEDULED_POST_GATE_AUDIT_TEMPLATE_ID,
@@ -44,9 +45,13 @@ export async function readScheduledPostGatePlanningContext(client: Queryable,
   const loaded = await loadTaskGraph(client, input.scope, true)
   if (!loaded.snapshot || !loaded.state || !loaded.item) return { status: "not_applicable" }
   if (loaded.discoveryTurnEligibility !== "scheduled") return { status: "not_applicable" }
+  const graphStage = projectScheduledPipelineGraphAtCurrentStage(loaded.snapshot.nodes)
+  if (!graphStage) return { status: "invalid" }
   const receipt = await readScheduledPostGateReceipt(client, input.scope)
-  if (receipt) return await validateScheduledPostGateHandoff(client, input.scope, loaded, receipt)
+  if (receipt) return graphStage.version === "v2" && graphStage.projection.stage === "audit"
+    && await validateScheduledPostGateHandoff(client, input.scope, loaded, receipt)
     ? { status: "planned", receipt, graphRevision: loaded.state.revision } : { status: "invalid" }
+  if (graphStage.version === "v1") return { status: "not_applicable" }
   return awaitingPostGatePlan(client, input.scope, loaded)
 }
 
@@ -57,7 +62,9 @@ export async function verifyScheduledPostGateCompletion(client: Queryable,
   await client.query(`SELECT set_config('app.user_id', $1, true)`, [scope.userId])
   await lockTaskGraphScope(client, scope)
   const loaded = await loadTaskGraph(client, scope, true), receipt = await readScheduledPostGateReceipt(client, scope)
-  if (!receipt || !loaded.snapshot || !loaded.state || !await validateScheduledPostGateHandoff(client, scope, loaded, receipt)) return null
+  const graphStage = loaded.snapshot && projectScheduledPipelineGraphAtCurrentStage(loaded.snapshot.nodes)
+  if (!receipt || !loaded.snapshot || !loaded.state || graphStage?.version !== "v2" || graphStage.projection.stage !== "audit"
+    || !await validateScheduledPostGateHandoff(client, scope, loaded, receipt)) return null
   const current = currentTaskGraph(loaded), execute = [] as Array<{ taskId: string; attemptCount: number; resultDigest: string; completedEventRevision: number }>
   for (const reference of receipt.executeNodes) {
     const node = loaded.snapshot.nodes.find(value => value.key === reference.key), task = loaded.tasks.get(reference.taskId)
@@ -101,6 +108,8 @@ export async function appendScheduledPostGatePlan(client: Queryable,
   if (!loaded.snapshot || !loaded.state || !loaded.item) throw invalid("graph_missing")
   const existing = await readScheduledPostGateReceipt(client, scope)
   if (existing) {
+    const graphStage = projectScheduledPipelineGraphAtCurrentStage(loaded.snapshot.nodes)
+    if (graphStage?.version !== "v2" || graphStage.projection.stage !== "audit") throw invalid("receipt_invalid")
     if (!await validateScheduledPostGateHandoff(client, scope, loaded, existing)) throw invalid("receipt_invalid")
     if (existing.proposalDigest !== scheduledPostGateDigest(input.proposal)) throw invalid("idempotency_conflict")
     return duplicateReceipt(loaded, existing)
@@ -173,8 +182,14 @@ export async function appendScheduledPostGatePlan(client: Queryable,
 
 async function awaitingPostGatePlan(client: Queryable, scope: TaskGraphReadScope,
   loaded: Awaited<ReturnType<typeof loadTaskGraph>>): Promise<ScheduledPostGatePlanningContext> {
+  if (!loaded.snapshot || !loaded.state) return { status: "not_applicable" }
+  const graphStage = projectScheduledPipelineGraphAtCurrentStage(loaded.snapshot.nodes)
+  if (!graphStage) return { status: "invalid" }
+  if (graphStage.version === "v1") return { status: "not_applicable" }
   const legacyAudit = loaded.snapshot?.nodes.some(node => node.key === "scheduled_audit" || node.templateId === "scheduled_audit")
-  if (legacyAudit || !loaded.snapshot || !loaded.state) return { status: "not_applicable" }
+  if (legacyAudit) return { status: "not_applicable" }
+  if (graphStage.projection.stage === "audit") return { status: "invalid" }
+  if (graphStage.projection.stage !== "gate") return { status: "not_applicable" }
   const recovery = await readScheduledAuditGateContinuationContext(client, scope, loaded, loadPersistedScheduledPrepareProof)
   if (recovery.status !== "gate_continuation") return recovery.status === "invalid" ? { status: "invalid" } : { status: "not_applicable" }
   const gateNode = loaded.snapshot.nodes.find(node => node.key === "gate"), gateTask = gateNode && loaded.tasks.get(gateNode.taskId)

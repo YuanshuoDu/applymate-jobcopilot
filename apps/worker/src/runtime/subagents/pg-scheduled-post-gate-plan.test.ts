@@ -59,10 +59,12 @@ const digest = `sha256:${"a".repeat(64)}`
 const gateProof = { graphRevision: 5, gate: { taskId: "gate-task", attemptCount: 1, completedEventRevision: 5, resultDigest: digest },
   prepareProof: { receipt: { owner: { turnLeaseOwnerId: "original-turn-lease", turnLeaseVersion: 2 }, snapshotDigest: digest } } }
 
-function baseState(): TaskGraphState {
+function baseState(scoutCount = 2): TaskGraphState {
+  const scouts = Array.from({ length: scoutCount }, (_, index) => graphNode(index === 0 ? "scout" : `scout-${index + 1}`,
+    "scout", `scout-task-${index + 1}`, [], 1, "completed"))
   const nodes = [
-    graphNode("scout", "scout", "scout-task", [], 1, "completed"),
-    graphNode("analyst", "analyst", "analyst-task", ["scout"], 2, "completed"),
+    ...scouts,
+    graphNode("analyst", "analyst", "analyst-task", scouts.map(node => node.key), 2, "completed"),
     graphNode("prepare", "prepare", "prepare-task", ["analyst"], 3, "completed"),
     graphNode("gate", "gate", "gate-task", ["prepare"], 4, "completed"),
   ]
@@ -86,6 +88,12 @@ function plan(packageRefs = refs): TaskGraphProposal {
     { key: SCHEDULED_POST_GATE_AUDIT_TEMPLATE_ID, templateId: SCHEDULED_POST_GATE_AUDIT_TEMPLATE_ID, goal: SCHEDULED_POST_GATE_AUDIT_GOAL,
       successCriteria: SCHEDULED_POST_GATE_AUDIT_CRITERIA, dependsOn: ["execute-a", "execute-b"] },
   ] }
+}
+function plannedState(): TaskGraphState {
+  const base = baseState(), plannedNodes = plan().nodes.map((node, index) => ({ ...node,
+    taskId: index === 0 ? "execute-task-a" : index === 1 ? "execute-task-b" : "audit-task",
+    depth: index === 2 ? 6 : 5, status: index === 2 ? "waiting" as const : "queued" as const }))
+  return { ...base, revision: 6, nodes: [...base.nodes, ...plannedNodes] }
 }
 function input(proposal: TaskGraphProposal = plan()) {
   const callId = "plan-call"
@@ -139,6 +147,39 @@ describe("scheduled post-Gate PG plan command", () => {
 
     await expect(readScheduledPostGatePlanningContext(db as never, { scope } as never))
       .resolves.toEqual({ status: "not_applicable" })
+    expect(mocks.receipt).not.toHaveBeenCalled()
+    expect(mocks.readGate).not.toHaveBeenCalled()
+  })
+
+  it("keeps a persisted single-Scout V1 Gate graph on the legacy scheduled Audit path", async () => {
+    const db = client()
+    mocks.load.mockResolvedValue({ ...loaded(baseState(1)), discoveryTurnEligibility: "scheduled" })
+
+    await expect(readScheduledPostGatePlanningContext(db as never, { scope } as never))
+      .resolves.toEqual({ status: "not_applicable" })
+    expect(mocks.receipt).toHaveBeenCalledOnce()
+    expect(mocks.readGate).not.toHaveBeenCalled()
+  })
+
+  it("fails closed when a single-Scout V1 graph has a persisted Post-Gate handoff", async () => {
+    const db = client()
+    mocks.load.mockResolvedValue({ ...loaded(baseState(1)), discoveryTurnEligibility: "scheduled" })
+    mocks.receipt.mockResolvedValue({} as never)
+
+    await expect(readScheduledPostGatePlanningContext(db as never, { scope } as never))
+      .resolves.toEqual({ status: "invalid" })
+    expect(mocks.receipt).toHaveBeenCalledOnce()
+    expect(mocks.validate).not.toHaveBeenCalled()
+    expect(mocks.readGate).not.toHaveBeenCalled()
+  })
+
+  it("fails closed when the persisted scheduled TaskGraph has no valid version and stage", async () => {
+    const db = client(), state = baseState()
+    const malformed = { ...state, nodes: state.nodes.map(node => node.key === "gate" ? { ...node, dependsOn: ["scout"] } : node) }
+    mocks.load.mockResolvedValue({ ...loaded(malformed), discoveryTurnEligibility: "scheduled" })
+
+    await expect(readScheduledPostGatePlanningContext(db as never, { scope } as never))
+      .resolves.toEqual({ status: "invalid" })
     expect(mocks.receipt).not.toHaveBeenCalled()
     expect(mocks.readGate).not.toHaveBeenCalled()
   })
@@ -206,6 +247,7 @@ describe("scheduled post-Gate PG plan command", () => {
 
   it("rejects an idempotency replay with a different proposal digest", async () => {
     const db = client(), value = input()
+    mocks.load.mockResolvedValue(loaded(plannedState()))
     mocks.receipt.mockResolvedValue({ proposalDigest: scheduledPostGateDigest({ expectedRevision: 5, nodes: [] }) })
     await expect(appendScheduledPostGatePlan(db as never, value as never))
       .rejects.toMatchObject({ code: "scheduled_post_gate_idempotency_conflict" })
@@ -268,7 +310,7 @@ describe("scheduled post-Gate PG plan command", () => {
         ["execute-a", "execute-b"], 6, "waiting"),
     ] }
     replayGraph.nodes[1] = { ...replayGraph.nodes[1]!, readiness: "ready" } as typeof replayGraph.nodes[number]
-    mocks.load.mockResolvedValue({ ...loaded(), state: { ...baseState(), revision: 6 } })
+    mocks.load.mockResolvedValue(loaded(plannedState()))
     mocks.receipt.mockResolvedValue(storedHandoff)
     mocks.current.mockReturnValue(replayGraph)
     const duplicate = await appendScheduledPostGatePlan(db as never, value as never)
