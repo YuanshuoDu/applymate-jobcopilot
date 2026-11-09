@@ -1,12 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
+import type { Mock } from "vitest"
+import { SCHEDULED_PIPELINE_ATTESTATION_V1_SCHEMA, type ScheduledPipelineAttestation } from "@jobcopilot/agent-protocol"
 import { createScheduledPostGateChildExecutor, isScheduledPostGateCandidate, isScheduledPostGateLease } from "./scheduled-post-gate-child-runtime.js"
 import { SCHEDULED_POST_GATE_AUDIT_OUTPUT_SCHEMA, SCHEDULED_POST_GATE_AUDIT_ROLE, SCHEDULED_POST_GATE_AUDIT_TASK_TYPE,
   SCHEDULED_POST_GATE_EXECUTE_OUTPUT_SCHEMA, SCHEDULED_POST_GATE_EXECUTE_ROLE, SCHEDULED_POST_GATE_EXECUTE_TASK_TYPE } from "./scheduled-post-gate-contract.js"
-import type { ScheduledPostGateChildContext } from "./scheduled-post-gate-context.js"
+import type { readScheduledPostGateChildContext, ScheduledPostGateChildContext } from "./scheduled-post-gate-context.js"
 import type { SubagentLease } from "./types.js"
 
-type ScheduledPostGateContextReader = typeof import("./scheduled-post-gate-context.js").readScheduledPostGateChildContext
-const mocks = vi.hoisted(() => ({ context: vi.fn<ScheduledPostGateContextReader>() }))
+const mocks = vi.hoisted((): { context: Mock<typeof readScheduledPostGateChildContext> } => ({
+  context: vi.fn<typeof readScheduledPostGateChildContext>(),
+}))
 vi.mock("./scheduled-post-gate-context.js", async importOriginal => ({
   ...await importOriginal<typeof import("./scheduled-post-gate-context.js")>(), readScheduledPostGateChildContext: mocks.context,
 }))
@@ -15,12 +18,17 @@ const owner = { userId: "user-1", sessionId: "session-1", turnId: "turn-1", root
   turnLeaseOwnerId: "root-lease", turnLeaseVersion: 3, executionId: "execution-1", executionAttemptCount: 2 }
 const digest = `sha256:${"a".repeat(64)}`
 const handoff = { owner, snapshotDigest: digest, continuationKey: `scheduled-taskgraph:sha256:${"b".repeat(64)}` }
-const attestation = { schemaVersion: "agent-harness.v2.scheduled-pipeline-attestation.v1", snapshotDigest: digest, owner: {
+const refs = ["pkg-a", "pkg-b"]
+const attestation = { schemaVersion: SCHEDULED_PIPELINE_ATTESTATION_V1_SCHEMA, snapshotDigest: digest, owner: {
   userId: owner.userId, sessionId: owner.sessionId, turnId: owner.turnId, rootTaskId: owner.rootTaskId,
   rootAttemptCount: owner.rootAttemptCount, turnLeaseOwnerId: owner.turnLeaseOwnerId, turnLeaseVersion: owner.turnLeaseVersion },
-  graphRevision: 4, evidenceDigest: "c".repeat(64), scout: {}, analyst: {} }
+  graphRevision: 4, evidenceDigest: "c".repeat(64),
+  scout: { taskId: "scout-1", attemptCount: 1, status: "completed", verification: "passed", resultDigest: "d".repeat(64),
+    candidateJobIds: refs, discoveryReceipt: { status: "complete", taskId: "scout-1", attemptCount: 1, completedCalls: 1,
+      candidateCount: refs.length, providerFailures: 0, materializationFailures: 0, hasMore: false, receiptDigest: "e".repeat(64) } },
+  analyst: { taskId: "analyst-1", attemptCount: 1, status: "completed", verification: "passed", resultDigest: "f".repeat(64),
+    dependsOnTaskIds: ["scout-1"], jobIds: refs } } satisfies ScheduledPipelineAttestation
 const actor = { taskId: "execute-1", attemptCount: 1, leaseOwner: "child-lease" }
-const refs = ["pkg-a", "pkg-b"]
 const report = { processed: 2, applied: 0, queued: 1, pending: 1, skipped: 0, failed: 0, durationMs: 22 }
 
 function lease(kind: "execute" | "audit", overrides: Partial<SubagentLease> = {}): SubagentLease {

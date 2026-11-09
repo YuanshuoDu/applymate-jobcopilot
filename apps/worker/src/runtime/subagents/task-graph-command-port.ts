@@ -35,21 +35,11 @@ import type {
   TaskGraphScheduledPrepareInput,
 } from "./scheduled-gate-contract.js"
 export type {
-  ScheduledAnalyzeCheckpointHandoff,
-  ScheduledTaskGraphExecutionOwner,
-  TaskGraphScheduledGateCompletionInput,
-  TaskGraphScheduledGateInput,
-  TaskGraphScheduledGateResumeInput,
-  TaskGraphScheduledGateResumeReceipt,
-  TaskGraphScheduledPrepareInput,
+  ScheduledAnalyzeCheckpointHandoff, ScheduledTaskGraphExecutionOwner, TaskGraphScheduledGateCompletionInput,
+  TaskGraphScheduledGateInput, TaskGraphScheduledGateResumeInput, TaskGraphScheduledGateResumeReceipt, TaskGraphScheduledPrepareInput,
 } from "./scheduled-gate-contract.js"
-export type {
-  ScheduledPostGateCompletionProof,
-  ScheduledPostGatePlanningContext,
-  ScheduledPostGateScheduleReceipt,
-  TaskGraphScheduledPostGatePlanInput,
-  TaskGraphScheduledPostGatePlanReadInput,
-} from "./scheduled-post-gate-contract.js"
+export type { ScheduledPostGateCompletionProof, ScheduledPostGatePlanningContext, ScheduledPostGateScheduleReceipt,
+  TaskGraphScheduledPostGatePlanInput, TaskGraphScheduledPostGatePlanReadInput } from "./scheduled-post-gate-contract.js"
 export type {
   TaskGraphNativeChildReceipt,
   TaskGraphNativeCommandReceipt,

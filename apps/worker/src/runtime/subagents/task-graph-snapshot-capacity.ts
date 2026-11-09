@@ -54,4 +54,3 @@ function exactKeys(value: Record<string, unknown>, expected: string): boolean {
   const keys = Reflect.ownKeys(value)
   return keys.every((key): key is string => typeof key === "string") && keys.sort().join(",") === expected
 }
-
